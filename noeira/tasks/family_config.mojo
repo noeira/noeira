@@ -111,6 +111,8 @@ from .task_hooks import (
     repark_inactive_slots, write_task_obs, write_task_obs_host,
 )
 from .predicates import OP_NEAR, OP_ABOVE, OP_ON, OP_IN
+from .tape import TERM_WORDS
+from .shaping import near_transport_shortfall
 from noeira.envs.dm_control.rewards import (
     tolerance, SIGMOID_GAUSSIAN, DEFAULT_VALUE_AT_MARGIN,
 )
@@ -1282,7 +1284,36 @@ struct So101FamilyConfig[
         var mode = Int(rebind[Scalar[DTYPE]](meta[env, META_IDX_REWARD_MODE]))
         if mode == 1:
             var hh = Scalar[DTYPE](1) if holds else Scalar[DTYPE](0)
-            var phi = w_goal * goal_t
+            # ⚠ A SINGLE `Near` GOAL IS MEASURED AS A TRANSPORT DISTANCE here
+            # (`shaping.near_transport_shortfall`): the 3D shortfall the
+            # legacy term uses pays negative for lifting the brick off the
+            # desk, which `cube_in_bowl` needs to clear the bowl's rim.
+            var goal_pot = goal_t
+            var op_near = Int(
+                rebind[Scalar[DTYPE]](meta[env, META_IDX_TASK_PARAM_0])
+            )
+            var op_next = Int(
+                rebind[Scalar[DTYPE]](meta[env, META_IDX_TASK_PARAM_0 + TERM_WORDS])
+            )
+            if op_near == OP_NEAR and op_next < 0:
+                var na = Int(rebind[Scalar[DTYPE]](meta[env, META_IDX_TASK_PARAM_0 + 1]))
+                var nb = Int(rebind[Scalar[DTYPE]](meta[env, META_IDX_TASK_PARAM_0 + 2]))
+                var nr = rebind[Scalar[DTYPE]](meta[env, META_IDX_TASK_PARAM_0 + 3])
+                var tsf = near_transport_shortfall[DTYPE](
+                    rebind[Scalar[DTYPE]](xpos[env, na * 3]) - rebind[Scalar[DTYPE]](xpos[env, nb * 3]),
+                    rebind[Scalar[DTYPE]](xpos[env, na * 3 + 1]) - rebind[Scalar[DTYPE]](xpos[env, nb * 3 + 1]),
+                    rebind[Scalar[DTYPE]](xpos[env, na * 3 + 2]) - rebind[Scalar[DTYPE]](xpos[env, nb * 3 + 2]),
+                    nr,
+                )
+                goal_pot = tolerance[
+                    SIGMOID_GAUSSIAN, DEFAULT_VALUE_AT_MARGIN, DTYPE
+                ](
+                    tsf,
+                    Scalar[DTYPE](0),
+                    Scalar[DTYPE](Self.GOAL_RADIUS),
+                    m_goal,
+                )
+            var phi = w_goal * goal_pot
             var wsum = w_goal
             if has_hand:
                 var rt = reach_t if reach_t > hh else hh
