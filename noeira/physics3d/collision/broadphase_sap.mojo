@@ -24,6 +24,7 @@ differs from O(N^2), which would shift existing bit-exact gates)."""
 
 from std.time import perf_counter_ns
 from std.math import sqrt, abs
+from std.bit import count_trailing_zeros
 from max.gpu import thread_idx, block_idx, block_dim
 from max.gpu.host import DeviceContext
 from layout import Layout, LayoutTensor
@@ -3461,13 +3462,33 @@ def _detect_contacts_sap_block_kernel[
         DTYPE, Layout.row_major(_KIND_MAX), MutAnyOrigin,
         address_space=AddressSpace.SHARED,
     ].stack_allocation()
-    # the plane gate's verdict per geom, for the plane being listed
+    # the plane gate's verdict per geom, for the plane being listed; then
+    # the sweep's per-row survivor count and first candidate slot
     var pf_sh = LayoutTensor[
         DTYPE, Layout.row_major(NG), MutAnyOrigin,
         address_space=AddressSpace.SHARED,
     ].stack_allocation()
+    # [0] ncand [1] overflow [2] n_sig [3] n_out; the sweep's hand-over:
+    # [4] sap_n [5] candidates listed before it [6] their overflow
+    # [7] candidates it lists, uncapped
     var ctrl_sh = LayoutTensor[
-        DTYPE, Layout.row_major(4), MutAnyOrigin,
+        DTYPE, Layout.row_major(8), MutAnyOrigin,
+        address_space=AddressSpace.SHARED,
+    ].stack_allocation()
+    # the sweep's survivors, one bit per sorted (i, j), row-major
+    comptime MW = (NG + 31) // 32
+    var mask_sh = LayoutTensor[
+        DType.uint32, Layout.row_major(NG * MW), MutAnyOrigin,
+        address_space=AddressSpace.SHARED,
+    ].stack_allocation()
+    # phase 3's sort key per candidate: its body pair
+    var sk_sh = LayoutTensor[
+        DTYPE, Layout.row_major(NC), MutAnyOrigin,
+        address_space=AddressSpace.SHARED,
+    ].stack_allocation()
+    # `COLL_CAND_REPORT`'s per-thread sweep counters, summed by thread 0
+    var rep_sh = LayoutTensor[
+        DTYPE, Layout.row_major(4 * COLL_TPB), MutAnyOrigin,
         address_space=AddressSpace.SHARED,
     ].stack_allocation()
     # `<exclude>` signatures, sorted once per block by thread 0 (they are a
@@ -3672,71 +3693,150 @@ def _detect_contacts_sap_block_kernel[
                 continue
             idx_sh[sap_n] = Scalar[DTYPE](g)
             sap_n += 1
-        # 4b. insertion sort by aabb_min_x
-        for i in range(1, sap_n):
-            var key = Int(rebind[Scalar[DTYPE]](idx_sh[i]))
-            var key_val = rebind[Scalar[DTYPE]](ab_sh[0 * NG + key])
-            var j = i - 1
-            while j >= 0 and rebind[Scalar[DTYPE]](
-                ab_sh[0 * NG + Int(rebind[Scalar[DTYPE]](idx_sh[j]))]
-            ) > key_val:
-                idx_sh[j + 1] = idx_sh[j]
-                j -= 1
-                comptime if COLL_CAND_REPORT:
-                    rep_shifts += 1
-            idx_sh[j + 1] = Scalar[DTYPE](key)
         comptime if COLL_CAND_REPORT:
             rep_sap_n = sap_n
-        # 4c. the sweep: AABB tests and the break only
-        for i in range(sap_n):
-            var si = Int(rebind[Scalar[DTYPE]](idx_sh[i]))
-            var si_max_x = rebind[Scalar[DTYPE]](ab_sh[1 * NG + si])
-            var si_type = Int(rebind[Scalar[DTYPE]](gf_sh[0 * NG + si]))
-            var si_rank = mj_geom_type_rank(si_type)
-            for j in range(i + 1, sap_n):
+        ctrl_sh[4] = Scalar[DTYPE](sap_n)
+        ctrl_sh[5] = Scalar[DTYPE](ncand)
+        ctrl_sh[6] = Scalar[DTYPE](overflow)
+    barrier()
+    # ⚠ 4b-4c RUN ON EVERY THREAD, AND LIST WHAT THREAD 0's SERIAL SWEEP
+    # LISTED, IN ITS ORDER (2026-09-26). The serial sweep was ~106 us of the
+    # tower's ~220 us mean env (`COLL_TIMING`), most of it the listing filter's
+    # global loads, one pair after another on thread 0.
+    var sap_n = Int(rebind[Scalar[DTYPE]](ctrl_sh[4]))
+    # 4b. the sweep order by aabb_min_x: a RANK sort, into `idx_sh[NG ..]`
+    # (the list build above is done with it). A geom's rank counts the
+    # smaller keys and the EQUAL keys listed before it — the order the
+    # insertion sort leaves, which shifts only past a strictly greater key.
+    for i in range(tid, sap_n, COLL_TPB):
+        var g_i = Int(rebind[Scalar[DTYPE]](idx_sh[i]))
+        var v_i = rebind[Scalar[DTYPE]](ab_sh[0 * NG + g_i])
+        var r = 0
+        for k in range(sap_n):
+            var v_k = rebind[Scalar[DTYPE]](
+                ab_sh[0 * NG + Int(rebind[Scalar[DTYPE]](idx_sh[k]))]
+            )
+            if v_k < v_i or (v_k == v_i and k < i):
+                r += 1
+            comptime if COLL_CAND_REPORT:
+                # the insertion sort's shifts are the inversions
+                if k < i and v_k > v_i:
+                    rep_shifts += 1
+        idx_sh[NG + r] = Scalar[DTYPE](g_i)
+    barrier()
+    # 4c. the sweep, one sorted row `i` per thread: the AABB tests, the break
+    # and the listing filter. The survivors are marked in row i's bit mask
+    # and counted; a prefix over the rows (thread 0) gives each row its
+    # first candidate slot, and each row lists its marks in `j` order — so
+    # the list is the serial `_push` order, (i, j) lexicographic, after the
+    # plane candidates.
+    for i in range(tid, sap_n, COLL_TPB):
+        for w in range(MW):
+            mask_sh[i * MW + w] = 0
+        var si = Int(rebind[Scalar[DTYPE]](idx_sh[NG + i]))
+        var si_max_x = rebind[Scalar[DTYPE]](ab_sh[1 * NG + si])
+        var si_type = Int(rebind[Scalar[DTYPE]](gf_sh[0 * NG + si]))
+        var cnt_i = 0
+        for j in range(i + 1, sap_n):
+            comptime if COLL_CAND_REPORT:
+                rep_tests += 1
+            var sj = Int(rebind[Scalar[DTYPE]](idx_sh[NG + j]))
+            if rebind[Scalar[DTYPE]](ab_sh[0 * NG + sj]) > si_max_x:
+                break
+            if (
+                rebind[Scalar[DTYPE]](ab_sh[2 * NG + sj]) > rebind[Scalar[DTYPE]](ab_sh[3 * NG + si])
+                or rebind[Scalar[DTYPE]](ab_sh[2 * NG + si]) > rebind[Scalar[DTYPE]](ab_sh[3 * NG + sj])
+            ):
+                continue
+            if (
+                rebind[Scalar[DTYPE]](ab_sh[4 * NG + sj]) > rebind[Scalar[DTYPE]](ab_sh[5 * NG + si])
+                or rebind[Scalar[DTYPE]](ab_sh[4 * NG + si]) > rebind[Scalar[DTYPE]](ab_sh[5 * NG + sj])
+            ):
+                continue
+            comptime if COLL_CAND_REPORT or COLL_PREFILTER:
+                var keep = _sap_pair_listable[DTYPE, EX_CAP=EX_CAP](
+                    si, sj, si_type,
+                    Int(rebind[Scalar[DTYPE]](gf_sh[0 * NG + sj])),
+                    Int(rebind[Scalar[DTYPE]](gf_sh[1 * NG + si])),
+                    Int(rebind[Scalar[DTYPE]](gf_sh[1 * NG + sj])),
+                    Int(rebind[Scalar[DTYPE]](gf_sh[2 * NG + si])),
+                    Int(rebind[Scalar[DTYPE]](gf_sh[3 * NG + si])),
+                    Int(rebind[Scalar[DTYPE]](gf_sh[2 * NG + sj])),
+                    Int(rebind[Scalar[DTYPE]](gf_sh[3 * NG + sj])),
+                    dims, pairs, mmeta, bodies, excludes, ex_sig, n_sig,
+                    nbody,
+                )
                 comptime if COLL_CAND_REPORT:
-                    rep_tests += 1
-                var sj = Int(rebind[Scalar[DTYPE]](idx_sh[j]))
-                if rebind[Scalar[DTYPE]](ab_sh[0 * NG + sj]) > si_max_x:
-                    break
-                if (
-                    rebind[Scalar[DTYPE]](ab_sh[2 * NG + sj]) > rebind[Scalar[DTYPE]](ab_sh[3 * NG + si])
-                    or rebind[Scalar[DTYPE]](ab_sh[2 * NG + si]) > rebind[Scalar[DTYPE]](ab_sh[3 * NG + sj])
-                ):
-                    continue
-                if (
-                    rebind[Scalar[DTYPE]](ab_sh[4 * NG + sj]) > rebind[Scalar[DTYPE]](ab_sh[5 * NG + si])
-                    or rebind[Scalar[DTYPE]](ab_sh[4 * NG + si]) > rebind[Scalar[DTYPE]](ab_sh[5 * NG + sj])
-                ):
-                    continue
-                var sj_rank = mj_geom_type_rank(
-                    Int(rebind[Scalar[DTYPE]](gf_sh[0 * NG + sj]))
-                )
-                var key = (
-                    si_rank * 8 + sj_rank if si_rank <= sj_rank
-                    else sj_rank * 8 + si_rank
-                )
-                comptime if COLL_CAND_REPORT or COLL_PREFILTER:
-                    var keep = _sap_pair_listable[DTYPE, EX_CAP=EX_CAP](
-                        si, sj, si_type,
-                        Int(rebind[Scalar[DTYPE]](gf_sh[0 * NG + sj])),
-                        Int(rebind[Scalar[DTYPE]](gf_sh[1 * NG + si])),
-                        Int(rebind[Scalar[DTYPE]](gf_sh[1 * NG + sj])),
-                        Int(rebind[Scalar[DTYPE]](gf_sh[2 * NG + si])),
-                        Int(rebind[Scalar[DTYPE]](gf_sh[3 * NG + si])),
-                        Int(rebind[Scalar[DTYPE]](gf_sh[2 * NG + sj])),
-                        Int(rebind[Scalar[DTYPE]](gf_sh[3 * NG + sj])),
-                        dims, pairs, mmeta, bodies, excludes, ex_sig, n_sig,
-                        nbody,
+                    rep_aabb_all += 1
+                    if keep:
+                        rep_survive += 1
+                comptime if COLL_PREFILTER:
+                    if not keep:
+                        continue
+            mask_sh[i * MW + j // 32] = mask_sh[i * MW + j // 32] | (
+                UInt32(1) << UInt32(j % 32)
+            )
+            cnt_i += 1
+        pf_sh[i] = Scalar[DTYPE](cnt_i)
+    barrier()
+    if tid == 0:
+        var run = Int(rebind[Scalar[DTYPE]](ctrl_sh[5]))
+        for i in range(sap_n):
+            var c_i = Int(rebind[Scalar[DTYPE]](pf_sh[i]))
+            pf_sh[i] = Scalar[DTYPE](run)
+            run += c_i
+        ctrl_sh[7] = Scalar[DTYPE](run)
+    barrier()
+    for i in range(tid, sap_n, COLL_TPB):
+        var si = Int(rebind[Scalar[DTYPE]](idx_sh[NG + i]))
+        var si_type = Int(rebind[Scalar[DTYPE]](gf_sh[0 * NG + si]))
+        var si_rank = mj_geom_type_rank(si_type)
+        var pos = Int(rebind[Scalar[DTYPE]](pf_sh[i]))
+        for w in range(MW):
+            var bits = rebind[UInt32](mask_sh[i * MW + w])
+            while bits != 0:
+                var j = w * 32 + Int(count_trailing_zeros(bits))
+                bits = bits & (bits - 1)
+                # Past the cap the serial `_push` drops the pair and flags
+                # the env for the serial fallback — `total` below.
+                if pos < NC:
+                    var sj = Int(rebind[Scalar[DTYPE]](idx_sh[NG + j]))
+                    var sj_rank = mj_geom_type_rank(
+                        Int(rebind[Scalar[DTYPE]](gf_sh[0 * NG + sj]))
                     )
-                    comptime if COLL_CAND_REPORT:
-                        rep_aabb_all += 1
-                        if keep:
-                            rep_survive += 1
-                    comptime if COLL_PREFILTER:
-                        if not keep:
-                            continue
-                _push(si, sj, si_type, key)
+                    var key = (
+                        si_rank * 8 + sj_rank if si_rank <= sj_rank
+                        else sj_rank * 8 + si_rank
+                    )
+                    cand_sh[0 * NC + pos] = Scalar[DTYPE](si)
+                    cand_sh[1 * NC + pos] = Scalar[DTYPE](sj)
+                    cand_sh[2 * NC + pos] = Scalar[DTYPE](si_type)
+                    cand_sh[3 * NC + pos] = Scalar[DTYPE](pos * COLL_STAGE_MAXC)
+                    cand_sh[4 * NC + pos] = Scalar[DTYPE](key)
+                    cand_sh[5 * NC + pos] = Scalar[DTYPE](0)
+                pos += 1
+    comptime if COLL_CAND_REPORT:
+        rep_sh[4 * tid + 0] = Scalar[DTYPE](rep_tests)
+        rep_sh[4 * tid + 1] = Scalar[DTYPE](rep_shifts)
+        rep_sh[4 * tid + 2] = Scalar[DTYPE](rep_aabb_all)
+        rep_sh[4 * tid + 3] = Scalar[DTYPE](rep_survive)
+    barrier()
+    if tid == 0:
+        var total = Int(rebind[Scalar[DTYPE]](ctrl_sh[7]))
+        ncand = total if total < NC else NC
+        overflow = Int(rebind[Scalar[DTYPE]](ctrl_sh[6]))
+        if total > NC:
+            overflow = 1
+        comptime if COLL_CAND_REPORT:
+            rep_tests = 0
+            rep_shifts = 0
+            rep_aabb_all = 0
+            rep_survive = 0
+            for t in range(COLL_TPB):
+                rep_tests += Int(rebind[Scalar[DTYPE]](rep_sh[4 * t + 0]))
+                rep_shifts += Int(rebind[Scalar[DTYPE]](rep_sh[4 * t + 1]))
+                rep_aabb_all += Int(rebind[Scalar[DTYPE]](rep_sh[4 * t + 2]))
+                rep_survive += Int(rebind[Scalar[DTYPE]](rep_sh[4 * t + 3]))
         # 5. the kind order: a counting sort on the keys, stable, so two
         # candidates of one kind keep their emission order.
         for k in range(_KIND_MAX):
@@ -3874,7 +3974,7 @@ def _detect_contacts_sap_block_kernel[
             smeta[env, META_IDX_NUM_CONTACTS] = Scalar[DTYPE](0)
         return
 
-    # ── phase 3: offsets (thread 0), cooperative copy, the sort, ncon ─────
+    # ── phase 3: offsets (thread 0), the sort as ranks, the copy, ncon ────
     if tid == 0:
         if Int(rebind[Scalar[DTYPE]](ctrl_sh[1])) != 0:
             # ⚠ THE FALLBACK IS A SECOND LAUNCH, NOT A CALL. Calling the
@@ -3905,9 +4005,46 @@ def _detect_contacts_sap_block_kernel[
                 n += cnt
             ctrl_sh[3] = Scalar[DTYPE](n)
     barrier()
+    # ⚠ THE MuJoCo-ORDER SORT IS A RANK, NOT AN INSERTION SORT ON THREAD 0
+    # (2026-09-26). `sort_contacts_mujoco_order` orders the compacted array
+    # STABLY by body pair; every contact of a candidate carries the same pair
+    # (one geom pair), so that order is the candidates' own, stably by pair,
+    # each keeping its records in narrow-phase order. So each candidate's
+    # destination is the count of contacts of the candidates ahead of it —
+    # smaller pair, or the same pair listed earlier — and the copy lands the
+    # records sorted. Thread 0 moved whole records in global memory, O(n^2)
+    # on a crowded env (152 us at the tower's worst). The key is read from
+    # the candidate's first staged record, the field the sort itself reads.
+    var fb = Int(rebind[Scalar[DTYPE]](ctrl_sh[1])) != 0
+    if not fb:
+        for c in range(tid, ncand, COLL_TPB):
+            var key = Scalar[DTYPE](-1)
+            if Int(rebind[Scalar[DTYPE]](cand_sh[5 * NC + c])) > 0:
+                var r0 = Int(rebind[Scalar[DTYPE]](cand_sh[3 * NC + c])) * CONTACT_SIZE
+                var ba = Int(rebind[Scalar[DTYPE]](stage[env, r0 + CONTACT_IDX_BODY_A]))
+                var bb = Int(rebind[Scalar[DTYPE]](stage[env, r0 + CONTACT_IDX_BODY_B]))
+                if ba < 0:
+                    ba = 0
+                if bb < 0:
+                    bb = 0
+                var lo = ba if ba < bb else bb
+                var hi = bb if ba < bb else ba
+                key = Scalar[DTYPE](lo * (nbody + 1) + hi)
+            sk_sh[c] = key
+    barrier()
+    if not fb:
+        for c in range(tid, ncand, COLL_TPB):
+            var k_c = rebind[Scalar[DTYPE]](sk_sh[c])
+            var dst = 0
+            for c2 in range(ncand):
+                var k2 = rebind[Scalar[DTYPE]](sk_sh[c2])
+                if k2 < k_c or (k2 == k_c and c2 < c):
+                    dst += Int(rebind[Scalar[DTYPE]](cand_sh[5 * NC + c2]))
+            cand_sh[4 * NC + c] = Scalar[DTYPE](dst)
+    barrier()
     # Every thread copies records; the order is fixed by the offsets.
     var n_out = Int(rebind[Scalar[DTYPE]](ctrl_sh[3]))
-    if Int(rebind[Scalar[DTYPE]](ctrl_sh[1])) == 0:
+    if not fb:
         for c in range(ncand):
             var start = Int(rebind[Scalar[DTYPE]](cand_sh[3 * NC + c]))
             var cnt = Int(rebind[Scalar[DTYPE]](cand_sh[5 * NC + c]))
@@ -3919,8 +4056,7 @@ def _detect_contacts_sap_block_kernel[
                     Scalar[DTYPE]
                 ](stage[env, (start + k) * CONTACT_SIZE + f])
     barrier()
-    if tid == 0 and Int(rebind[Scalar[DTYPE]](ctrl_sh[1])) == 0:
-        sort_contacts_mujoco_order[DTYPE](env, contacts, n_out)
+    if tid == 0 and not fb:
         smeta[env, META_IDX_NUM_CONTACTS] = Scalar[DTYPE](n_out)
     comptime if COLL_TIMING:
         if tid == 0:
