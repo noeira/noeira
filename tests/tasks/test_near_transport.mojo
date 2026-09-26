@@ -17,13 +17,18 @@ reward in `test_tower_reward_potential.mojo`):
 4. it is 0 at a brick resting in the bowl (the predicate holds);
 5. the brick pushed against the bowl's outside ranks WORSE than the brick
    held over the bowl — the local optimum the 3D measure created;
-6. THE HOOK USES IT: on `so101_tower_cube_in_bowl`, through
-   `family_reward_host` (the kernel's own function), with the jaw away from
-   the brick (no grasp, no close term) the mode-1 potential minus the legacy
-   reward at the SAME state is exactly `w_goal (tol(transport) - tol(3D))`,
-   at rest and with the brick lifted 6 cm; the lift leaves the potential's
-   goal term unchanged where the legacy one drops; on the lift task (`Above`)
-   the difference stays 0.
+6. THE HOOK USES IT, GATED ON THE GRASP: on `so101_tower_cube_in_bowl`,
+   through `family_reward_host` (the kernel's own function), with the jaw
+   away from the brick (no close term), the mode-1 potential minus the
+   legacy reward at the SAME state is
+   - `-w_goal tol(3D)` with no grasp: the goal term is 0, so a PUSH earns
+     nothing (both PPO arms' 2 % were pushes);
+   - `w_goal (tol(transport) - tol(3D))` with both jaws' contacts on the
+     brick injected into `contacts` (the rung the kernel reads);
+   at rest and with the brick lifted 6 cm (the lift leaves the grasped goal
+   term unchanged where the legacy one drops); with the brick at the bowl
+   (the goal holds, no grasp) the potential is the full budget W; on the
+   lift task (`Above`) the difference stays 0.
 """
 
 from std.math import sqrt, abs
@@ -39,7 +44,8 @@ from noeira.envs.phyics3d_env import Phyics3dEnv
 from noeira.physics3d.gpu.constants import (
     META_IDX_REWARD_MODE, META_IDX_SUCCESS_BONUS, META_IDX_PHI_PREV,
     META_IDX_EPISODE_FLAGS, META_IDX_TASK_PARAM_0, META_IDX_SHAPE_W_GOAL,
-    META_IDX_GOAL_MARGIN, MODEL_CURRICULUM_SIZE,
+    META_IDX_GOAL_MARGIN, MODEL_CURRICULUM_SIZE, META_IDX_NUM_CONTACTS,
+    CONTACT_SIZE, CONTACT_IDX_BODY_A, CONTACT_IDX_BODY_B,
 )
 from noeira.physics3d.parser.runtime_load import parse_model_runtime
 from noeira.tasks.eval import region_sites, region_rects, region_half_heights
@@ -85,6 +91,18 @@ def _setup(mut env: E, task: String) raises:
     for k in range(len(mw[0])):
         env.d.meta.data[mw[0][k]] = Float64(mw[1][k])
     env.d.meta.data[META_IDX_SUCCESS_BONUS] = 0.0
+
+
+def _grasp(mut env: E, brick: Int, on: Bool):
+    """Both jaws touching the brick, as `contacts` + the count word say."""
+    if not on:
+        env.d.meta.data[META_IDX_NUM_CONTACTS] = 0.0
+        return
+    env.d.meta.data[META_IDX_NUM_CONTACTS] = 2.0
+    env.d.contacts.data[CONTACT_IDX_BODY_A] = Float64(brick)
+    env.d.contacts.data[CONTACT_IDX_BODY_B] = Float64(CFG.GRIPPER_BODY)
+    env.d.contacts.data[CONTACT_SIZE + CONTACT_IDX_BODY_A] = Float64(CFG.JAW_BODY)
+    env.d.contacts.data[CONTACT_SIZE + CONTACT_IDX_BODY_B] = Float64(brick)
 
 
 def _legacy(mut env: E) raises -> Float64:
@@ -157,19 +175,50 @@ def _hook_section() raises:
         var q = q0.copy()
         q[So101TowerPlacement.free_qadr(jb) + 2] += 0.06 * Float64(k)
         _ = env.obs_at(q, v0)
+        var g = _goal_terms(env)
+        var what = "lifted 6 cm" if k == 1 else "at rest    "
+        # no grasp: the goal term is gated to 0
+        _grasp(env, brick, False)
         var l = _legacy(env)
         var p = _phi(env)
-        var g = _goal_terms(env)
-        assert_almost_equal(p - l, wg * (g[1] - g[0]), atol=1e-12,
-                            msg="Phi - L = w_goal (tol(transport) - tol(3D))")
-        print("  6. cube_in_bowl", "lifted 6 cm" if k == 1 else "at rest    ",
-              ": 3D goal", g[0], " transport goal", g[1], " Phi - L", p - l)
+        assert_almost_equal(p - l, -wg * g[0], atol=1e-12,
+                            msg="ungrasped: Phi - L = -w_goal tol(3D)")
+        # grasped: the transport term
+        _grasp(env, brick, True)
+        var lg = _legacy(env)
+        var pg = _phi(env)
+        assert_true(lg > l, "the injected grasp reached the grasp rung")
+        assert_almost_equal(pg - lg, wg * (g[1] - g[0]), atol=1e-12,
+                            msg="grasped: Phi - L = w_goal (tol(tr) - tol(3D))")
+        _grasp(env, brick, False)
+        print("  6. cube_in_bowl", what, ": 3D goal", g[0], " transport goal",
+              g[1], " Phi-L ungrasped", p - l, " grasped", pg - lg)
         if k == 0:
             at_rest = g
         else:
             assert_true(g[0] < at_rest[0], "the 3D goal term drops on the lift")
             assert_almost_equal(g[1], at_rest[1], atol=1e-12,
                                 msg="the transport goal term does not")
+    # the brick at the bowl: the goal holds, the gate opens with no grasp
+    var bowl = Int(env.d.meta.data[META_IDX_TASK_PARAM_0 + 2])
+    var qh = q0.copy()
+    var adr = So101TowerPlacement.free_qadr(jb)
+    qh[adr] += Float64(env.d.xpos.data[bowl * 3] - env.d.xpos.data[brick * 3])
+    qh[adr + 1] += Float64(env.d.xpos.data[bowl * 3 + 1] - env.d.xpos.data[brick * 3 + 1])
+    qh[adr + 2] += Float64(env.d.xpos.data[bowl * 3 + 2] - env.d.xpos.data[brick * 3 + 2]) + 0.02
+    _ = env.obs_at(qh, v0)
+    env.d.meta.data[META_IDX_REWARD_MODE] = 1.0
+    env.d.meta.data[META_IDX_EPISODE_FLAGS] = 0.0
+    var zero = List[Float64](length=ACT, fill=0.0)
+    var rh = family_reward_host[CFG, DType.float64, E.MD, ACT](
+        env.d, env.mf, zero, 0, env.frame_skip, So101TowerModel.TIMESTEP
+    )
+    assert_true(rh[1], "the brick 2 cm above the bowl's origin holds Near")
+    var wsum = CFG.SHAPE_W_GOAL + CFG.SHAPE_W_REACH + CFG.GRASP_W + CFG.CLOSE_W
+    assert_almost_equal(Float64(env.d.meta.data[META_IDX_PHI_PREV]), wsum,
+                        atol=1e-12, msg="holding: Phi is the full budget")
+    print("  6. cube_in_bowl brick at the bowl: holds, Phi =",
+          env.d.meta.data[META_IDX_PHI_PREV], "= W")
     # the lift task is `Above`: untouched
     _ = env.reset()
     comptime LIFT = "so101_tower_lift_brick"

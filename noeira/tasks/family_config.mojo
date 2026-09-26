@@ -1313,6 +1313,17 @@ struct So101FamilyConfig[
                     Scalar[DTYPE](Self.GOAL_RADIUS),
                     m_goal,
                 )
+                # ⚠⚠ AND IT COUNTS ONLY WHILE THE BRICK IS GRASPED (or the
+                # goal holds) — ManiSkill's `place x grasped`. Ungated, a
+                # PUSH moves the brick toward the bowl as well as a carry
+                # does and is far easier: both PPO arms (26 Sep, 5M) lifted
+                # the brick in 9 and 7 of 1024 greedy episodes and reached
+                # over the bowl in NONE, their ~2 % "success" being pushes
+                # that grazed the radius (3 and 6 still held at the end).
+                comptime if Self.GRASP_W > 0.0:
+                    if has_hand:
+                        var gate = grasp_b if grasp_b > hh else hh
+                        goal_pot = goal_pot * gate
             var phi = w_goal * goal_pot
             var wsum = w_goal
             if has_hand:
