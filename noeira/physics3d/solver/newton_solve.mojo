@@ -166,6 +166,7 @@ from .primal import (
 )
 from ..constraints.contact_solve import (
     _init_common_normal_ws,
+    _init_common_normal_scalars,
     _precompute_contact_normal,
     _precompute_contact_friction,
 )
@@ -4746,16 +4747,8 @@ def _newton_blocked_fields_kernel[
         # bit-identical at 1x, 2x, 4x and 8x `MAX_CONTACTS` threads WITH the
         # guards in place, which is the property F3 step 2 depends on.
         if contact_tid < MC:
-            _init_common_normal_ws[
+            _init_common_normal_scalars[
                 DTYPE](env, contact_tid, Dims[nq=NQ, nv=NV, nbody=NBODY, njoint=NJOINT, max_contacts=MAX_CONTACTS, ngeom=NGEOM, nequality=NEQUALITY, ntendon=NTENDON, nsite=NSITE](), solver)
-            # ⚠ ALL `2*(dim-1)` EDGE BLOCKS, not the four this used to zero.
-            # The producer re-zeros every edge of a non-penetrating contact
-            # itself, which is the only reason the short version was survivable.
-            for e in range(NE_ZERO):
-                for d in range(NV):
-                    solver[
-                        env, ws_Jt_idx + e * MC * NV + contact_tid * NV + d
-                    ] = 0
             comptime if CONE_TYPE == ConeType.ELLIPTIC:
                 for t in range(NT):
                     solver[env, ws_ell_dt + t * MC + contact_tid] = 0
@@ -4764,7 +4757,27 @@ def _newton_blocked_fields_kernel[
                 solver[env, ws_ell_mu + contact_tid] = 0
                 solver[env, ws_ell_dn + contact_tid] = 0
                 solver[env, ws_ell_ntc + contact_tid] = 0
-
+        # ⚠⚠ THE SLOTS' ROWS, ZEROED BY THE WHOLE THREADGROUP, COALESCED
+        # (2026-09-26). Each slot's thread used to zero its own `nv`-wide runs
+        # — J_n / MinvJn (`_init_common_normal_rows`) and its `NE_ZERO`
+        # tangential blocks — so a warp's store landed on 32 runs `nv` floats
+        # apart, ~96 scattered stores per thread. Timed in the kernel on
+        # so101_tower at 1024 lanes (RTX 5090) this stage was ~35 us of every
+        # env's setup. The slots' runs tile two contiguous ranges exactly, so
+        # a stride over them writes the same zeros with adjacent lanes on
+        # adjacent floats. The per-slot scalar fields stay per slot (already
+        # `k*MC + slot`, contiguous across lanes).
+        # ⚠ ALL `2*(dim-1)` EDGE BLOCKS (pyramidal; `NT` elliptic), not the four
+        # this used to zero — the producer re-zeros every edge of a
+        # non-penetrating contact itself, which is the only reason the short
+        # version was survivable.
+        for q in range(tid, 2 * MC * NV, THREADS):
+            solver[env, 15 * MC + q] = 0
+        for q in range(tid, NE_ZERO * MC * NV, THREADS):
+            solver[env, ws_Jt_idx + q] = 0
+    # Every slot's stage-2 producer writes into ranges another thread just
+    # zeroed.
+    barrier()
     comptime if NEWTON_STOP_AFTER == 1:
         return
 
