@@ -22,6 +22,7 @@ from .ccd_workspace import (
     CCD_WS_SPX,
     CCD_WS_SPX2,
     SPX_STRIDE,
+    EPA_V_STRIDE,
 )
 from .epa import (
     ev,
@@ -868,6 +869,7 @@ def _support_mesh[
         best_z = rebind[Scalar[DTYPE]](mesh_verts[vert_adr + imax, 2])
     else:
         var best_dot: Scalar[DTYPE] = -1e30
+        var best_i = -1
         for i in range(num_verts):
             var vx = rebind[Scalar[DTYPE]](mesh_verts[vert_adr + i, 0])
             var vy = rebind[Scalar[DTYPE]](mesh_verts[vert_adr + i, 1])
@@ -878,6 +880,14 @@ def _support_mesh[
                 best_x = vx
                 best_y = vy
                 best_z = vz
+                best_i = i
+        # ⚠ THE SCAN IGNORES `warm` AS A SEED BUT STILL REPORTS WHERE IT LANDED.
+        # EPA stores `warm` as the vertex's support index and multicontact
+        # reads it back instead of re-scanning the hull (`gjk_epa_witness`'s
+        # `wfi`); left stale here, a small hull's index would name the
+        # PREVIOUS support vertex. Nothing else reads it on this arm: a mesh
+        # takes the same arm on every call.
+        warm = best_i
 
     var world_pt = local_to_global[DTYPE](
         _mm[0], _mm[1], _mm[2], _mm[3], _mm[4], _mm[5], _mm[6], _mm[7], _mm[8],
@@ -1424,13 +1434,13 @@ def _gjk_intersect[
             # Built in `CCD_WS_SPX2` first: the permutation can read a slot
             # it has already overwritten, so it cannot be done in place. That
             # is the reference's own `Vertex simplex[4]` local.
-            for c in range(9):
+            for c in range(SPX_STRIDE):
                 set_sv(ws, wrow, CCD_WS_SPX2, 0, c, sv(ws, wrow, base, sidx0, c))
                 set_sv(ws, wrow, CCD_WS_SPX2, 1, c, sv(ws, wrow, base, sidx1, c))
                 set_sv(ws, wrow, CCD_WS_SPX2, 2, c, sv(ws, wrow, base, sidx2, c))
                 set_sv(ws, wrow, CCD_WS_SPX2, 3, c, sv(ws, wrow, base, sidx3, c))
             for v in range(4):
-                for c in range(9):
+                for c in range(SPX_STRIDE):
                     set_sv(
                         ws, wrow, base, v, c, sv(ws, wrow, CCD_WS_SPX2, v, c)
                     )
@@ -1479,6 +1489,8 @@ def _gjk_intersect[
         set_sv(ws, wrow, base, tgt, 6, w[6])
         set_sv(ws, wrow, base, tgt, 7, w[7])
         set_sv(ws, wrow, base, tgt, 8, w[8])
+        set_sv(ws, wrow, base, tgt, 9, Scalar[DTYPE](warm1))
+        set_sv(ws, wrow, base, tgt, 10, Scalar[DTYPE](warm2))
 
         # separation certificate
         if nx * w[0] + ny * w[1] + nz * w[2] < Scalar[DTYPE](0):
@@ -1559,6 +1571,7 @@ def gjk_epa_witness[
     mut wf2: Array[Scalar[DTYPE], 9],
     mut wx: Array[Scalar[DTYPE], 6],
     mut wf_ok: Int,
+    mut wfi: Array[Int, 6],
     # ⚠ EPA'S POLYTOPE — MuJoCo's `config->buffer`. `ws[wrow, ...]` is the
     # caller's scratch row and is written unconditionally; nothing in it is
     # read across calls, so no caller has to clear it. One row per ENV is what
@@ -1626,6 +1639,11 @@ def gjk_epa_witness[
             var f2 = rebind[Scalar[DTYPE]](ws[hrow, off + 1])
             if f2 >= Scalar[DTYPE](0) and f2 < Scalar[DTYPE](1e8):
                 warm2 = Int(f2)
+    # The winning face's support indices (hull vertex / box corner code) for
+    # object 1 then object 2; -1 wherever EPA did not produce one. Constant
+    # indices only — see `feedback_metal_wide_per_thread_inlinearray_miscompute`.
+    wfi[0] = -1; wfi[1] = -1; wfi[2] = -1
+    wfi[3] = -1; wfi[4] = -1; wfi[5] = -1
     var r = _gjk_epa_witness_run[DTYPE, NPRISM=NPRISM](
         type1,
         p1x,
@@ -1664,6 +1682,7 @@ def gjk_epa_witness[
         wf2,
         wx,
         wf_ok,
+        wfi,
         ws,
         wrow,
         warm1,
@@ -1734,6 +1753,7 @@ def _gjk_epa_witness_run[
     mut wf2: Array[Scalar[DTYPE], 9],
     mut wx: Array[Scalar[DTYPE], 6],
     mut wf_ok: Int,
+    mut wfi: Array[Int, 6],
     # ⚠ EPA'S POLYTOPE — MuJoCo's `config->buffer`. `ws[wrow, ...]` is the
     # caller's scratch row and is written unconditionally; nothing in it is
     # read across calls, so no caller has to clear it. One row per ENV is what
@@ -2077,6 +2097,8 @@ def _gjk_epa_witness_run[
             set_sv(ws, wrow, SPX, si, 6, sn[6])
             set_sv(ws, wrow, SPX, si, 7, sn[7])
             set_sv(ws, wrow, SPX, si, 8, sn[8])
+            set_sv(ws, wrow, SPX, si, 9, Scalar[DTYPE](warm1))
+            set_sv(ws, wrow, SPX, si, 10, Scalar[DTYPE](warm2))
 
             var fw_gap = v_dot_v - (sn[0] * vx + sn[1] * vy + sn[2] * vz)
             if fw_gap < _gjk_epsilon[DTYPE](
@@ -2187,7 +2209,7 @@ def _gjk_epa_witness_run[
                 if lam[i] == Scalar[DTYPE](0):
                     continue
                 if keep != i:
-                    for c in range(9):
+                    for c in range(SPX_STRIDE):
                         set_sv(
                             ws, wrow, SPX, keep, c, sv(ws, wrow, SPX, i, c)
                         )
@@ -2415,19 +2437,18 @@ def _gjk_epa_witness_run[
 
     # ── polytope4 — GJK ended enclosing the origin ────────────────────────
     elif nsimplex >= 4:
+        # ⚠ STAGE B (2026-09-26): the seeds carry their support indices.
+        # MuJoCo's `insertVertex` copies `index1`/`index2` out of the GJK
+        # simplex; ours was nine floats wide and the seeds got -1 here, which
+        # left multicontact scanning the whole hull for every seed vertex of a
+        # winning face. The simplex is now eleven wide, laid out exactly like
+        # an EPA vertex, so this copy carries them — the same at polytope2/3.
+        comptime assert SPX_STRIDE == EPA_V_STRIDE, (
+            "a simplex vertex must copy into an EPA vertex slot for slot"
+        )
         for i in range(4):
-            for k in range(9):
+            for k in range(SPX_STRIDE):
                 set_ev(ws, wrow, i, k, sv(ws, wrow, SPX, i, k))
-            # ⚠ STAGE A: the seed vertices carry no support index. MuJoCo's
-            # `insertVertex` copies `index1`/`index2` out of the GJK simplex,
-            # which would mean widening the simplex from 9 floats to 11 and
-            # permuting the two extra columns through the whole subdistance.
-            # -1 is the value `mjc_initCCDObj` starts them at and can never
-            # equal a real box corner or hull vertex, so the discrete
-            # repeated-support break below is blind to a repeat of a SEED
-            # vertex and correct for every other pair.
-            set_ev(ws, wrow, i, 9, Scalar[DTYPE](-1))
-            set_ev(ws, wrow, i, 10, Scalar[DTYPE](-1))
         nverts = 4
         var c4x = Scalar[DTYPE](0)
         var c4y = Scalar[DTYPE](0)
@@ -2492,14 +2513,14 @@ def _gjk_epa_witness_run[
                 ra = 3
                 rb = 2
                 rc = 1
-            var tmp = Array[Scalar[DTYPE], 9](fill=Scalar[DTYPE](0))
-            for k in range(9):
+            var tmp = Array[Scalar[DTYPE], SPX_STRIDE](fill=Scalar[DTYPE](0))
+            for k in range(SPX_STRIDE):
                 tmp[k] = sv(ws, wrow, SPX, rc, k)
-            for k in range(9):
+            for k in range(SPX_STRIDE):
                 set_sv(ws, wrow, SPX, 0, k, sv(ws, wrow, SPX, ra, k))
-            for k in range(9):
+            for k in range(SPX_STRIDE):
                 set_sv(ws, wrow, SPX, 1, k, sv(ws, wrow, SPX, rb, k))
-            for k in range(9):
+            for k in range(SPX_STRIDE):
                 set_sv(ws, wrow, SPX, 2, k, tmp[k])
             nsimplex = 3
             nverts = 0
@@ -2560,10 +2581,8 @@ def _gjk_epa_witness_run[
         var d3z = rm[6] * d2x + rm[7] * d2y + rm[8] * d2z
 
         for i in range(2):
-            for k in range(9):
+            for k in range(SPX_STRIDE):
                 set_ev(ws, wrow, i, k, sv(ws, wrow, SPX, i, k))
-            set_ev(ws, wrow, i, 9, Scalar[DTYPE](-1))
-            set_ev(ws, wrow, i, 10, Scalar[DTYPE](-1))
         nverts = 2
 
         for s in range(3):
@@ -2672,11 +2691,11 @@ def _gjk_epa_witness_run[
                 sa = 1
                 sb = 4
                 sc = 3
-            for k in range(9):
+            for k in range(SPX_STRIDE):
                 set_sv(ws, wrow, SPX, 0, k, ev(ws, wrow, sa, k))
-            for k in range(9):
+            for k in range(SPX_STRIDE):
                 set_sv(ws, wrow, SPX, 1, k, ev(ws, wrow, sb, k))
-            for k in range(9):
+            for k in range(SPX_STRIDE):
                 set_sv(ws, wrow, SPX, 2, k, ev(ws, wrow, sc, k))
             nsimplex = 3
             nverts = 0
@@ -2731,10 +2750,8 @@ def _gjk_epa_witness_run[
             ret = 3  # mjEPA_P3_BAD_NORMAL
         else:
             for i in range(3):
-                for k in range(9):
+                for k in range(SPX_STRIDE):
                     set_ev(ws, wrow, i, k, sv(ws, wrow, SPX, i, k))
-                set_ev(ws, wrow, i, 9, Scalar[DTYPE](-1))
-                set_ev(ws, wrow, i, 10, Scalar[DTYPE](-1))
             nverts = 3
 
             # ⚠ v5 IS INSERTED BEFORE v4. The reference calls
@@ -3026,6 +3043,16 @@ def _gjk_epa_witness_run[
         wf2[6] = ev(ws, wrow, i2, 6)
         wf2[7] = ev(ws, wrow, i2, 7)
         wf2[8] = ev(ws, wrow, i2, 8)
+        # Every polytope vertex carries its support indices, seeds included
+        # (the simplex is laid out like an EPA vertex, "STAGE B" in
+        # `polytope4`). A mesh's is its hull vertex, which is what
+        # multicontact used to recover by scanning the whole hull.
+        wfi[0] = Int(ev(ws, wrow, i0, 9))
+        wfi[1] = Int(ev(ws, wrow, i1, 9))
+        wfi[2] = Int(ev(ws, wrow, i2, 9))
+        wfi[3] = Int(ev(ws, wrow, i0, 10))
+        wfi[4] = Int(ev(ws, wrow, i1, 10))
+        wfi[5] = Int(ev(ws, wrow, i2, 10))
         wx[0] = wit[0]
         wx[1] = wit[1]
         wx[2] = wit[2]
@@ -3166,6 +3193,7 @@ def gjk_epa[
     var wf2 = Array[Scalar[DTYPE], 9](fill=Scalar[DTYPE](0))
     var wx = Array[Scalar[DTYPE], 6](fill=Scalar[DTYPE](0))
     var wf_ok = 0
+    var wfi = Array[Int, 6](fill=-1)
     return gjk_epa_witness[DTYPE, NPRISM=NPRISM](
         type1,
         p1x, p1y, p1z, q1x, q1y, q1z, q1w,
@@ -3175,7 +3203,7 @@ def gjk_epa[
         p2x, p2y, p2z, q2x, q2y, q2z, q2w,
         r2, hl2, hx2, hy2, hz2,
         va2, mnv2,
-        wf1, wf2, wx, wf_ok,
+        wf1, wf2, wx, wf_ok, wfi,
         ws, wrow,
         ccd_tol, ccd_iter, ccd_margin,
         dist_cutoff,

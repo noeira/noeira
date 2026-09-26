@@ -2172,6 +2172,7 @@ def _sap_pair_narrow[
                 fill=Scalar[DTYPE](0)
             )
             var wf_ok = 0
+            var wfi = Array[Int, 6](fill=-1)
             # The pair's warm slot for the mesh hill climb (ccd_workspace.mojo):
             # a hash of the sorted geom pair, so the state follows the PAIR
             # across steps whatever the candidate set does around it.
@@ -2194,6 +2195,7 @@ def _sap_pair_narrow[
                         fill=Scalar[DTYPE](0)
                     )
                     var qf_ok = 0
+                    var qfi = Array[Int, 6](fill=-1)
                     var rq = gjk_epa_witness[DTYPE](
                         gi_type,
                         pi_x, pi_y, pi_z, qi_x, qi_y, qi_z, qi_w,
@@ -2203,7 +2205,7 @@ def _sap_pair_narrow[
                         pj_x, pj_y, pj_z, qj_x, qj_y, qj_z, qj_w,
                         rj, hlj, hxj, hyj, hzj,
                         va2, mnv2,
-                        qf1, qf2, qxx, qf_ok,
+                        qf1, qf2, qxx, qf_ok, qfi,
                         ws, wrow,
                         ccd_tol, ccd_iter, cm,
                         cm,
@@ -2221,7 +2223,7 @@ def _sap_pair_narrow[
                 pj_x, pj_y, pj_z, qj_x, qj_y, qj_z, qj_w,
                 rj, hlj, hxj, hyj, hzj,
                 va2, mnv2,
-                wf1, wf2, wxx, wf_ok,
+                wf1, wf2, wxx, wf_ok, wfi,
                 ws, wrow,
                 ccd_tol, ccd_iter, cm,
                 # Opt in to the cutoff exit: `dist` below is read ONLY
@@ -2297,7 +2299,7 @@ def _sap_pair_narrow[
                     dims,
                     mesh_verts, mesh_polys, mesh_polyvert,
                     mesh_polymap, mesh_vert_polymap,
-                    wf1, wf2, wxx,
+                    wf1, wf2, wxx, wfi,
                     dist, cm, cf, cfs, cfr, cdim,
                     False,
                     contacts, ws, wrow, num_contacts,

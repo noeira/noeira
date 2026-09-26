@@ -303,9 +303,12 @@ def _mesh_vertex_index[
     """Nearest hull vertex to a local-frame support point, or -1 if none.
 
     The support point IS one of these vertices, so this is an identity lookup
-    that happens to be written as a search — the price of not carrying support
-    indices through EPA. Runs at most three times per geom per contact, against
-    a support function that EPA already called dozens of times.
+    written as a search. ⚠ IT IS NOW ONLY A FALLBACK: EPA carries each
+    vertex's support index (GJK's simplex included) and `gjk_epa_witness`
+    hands the winning face's out as `wfi`, so for a mesh this runs only if an
+    index is missing. Measured on so101_tower at 1024 lanes (RTX 5090,
+    2026-09-26) one pass of these scans was ~1.08 ms of a 2.23 ms collision
+    launch — a serial walk over thousands of hull vertices.
     """
     var best = -1
     var bestd = Scalar[DTYPE](1e30)
@@ -1383,6 +1386,9 @@ def native_multicontact_contacts[
     wf1: Array[Scalar[DTYPE], 9],
     wf2: Array[Scalar[DTYPE], 9],
     wx: Array[Scalar[DTYPE], 6],
+    # The witness face's support indices from `gjk_epa_witness` (object 1's
+    # three, then object 2's), -1 where EPA had none.
+    wfi: Array[Int, 6],
     dist0: Scalar[DTYPE],
     contact_margin: Scalar[DTYPE],
     contact_friction: Scalar[DTYPE],
@@ -1452,12 +1458,16 @@ def native_multicontact_contacts[
     var a1x = wf1[0]; var a1y = wf1[1]; var a1z = wf1[2]
     var b1x = wf1[3]; var b1y = wf1[4]; var b1z = wf1[5]
     var c1x = wf1[6]; var c1y = wf1[7]; var c1z = wf1[8]
+    # The carried support indices move WITH their points through the
+    # reordering below, or a collapsed face would name the wrong vertex.
+    var k1a = wfi[0]; var k1b = wfi[1]; var k1c = wfi[2]
     var nface1 = 3
     if _same_point[DTYPE](a1x, a1y, a1z, b1x, b1y, b1z, scale):
         if _same_point[DTYPE](a1x, a1y, a1z, c1x, c1y, c1z, scale):
             nface1 = 1
         else:
             b1x = c1x; b1y = c1y; b1z = c1z
+            k1b = k1c
             nface1 = 2
     elif _same_point[DTYPE](c1x, c1y, c1z, a1x, a1y, a1z, scale) or _same_point[
         DTYPE
@@ -1467,12 +1477,14 @@ def native_multicontact_contacts[
     var a2x = wf2[0]; var a2y = wf2[1]; var a2z = wf2[2]
     var b2x = wf2[3]; var b2y = wf2[4]; var b2z = wf2[5]
     var c2x = wf2[6]; var c2y = wf2[7]; var c2z = wf2[8]
+    var k2a = wfi[3]; var k2b = wfi[4]; var k2c = wfi[5]
     var nface2 = 3
     if _same_point[DTYPE](a2x, a2y, a2z, b2x, b2y, b2z, scale):
         if _same_point[DTYPE](a2x, a2y, a2z, c2x, c2y, c2z, scale):
             nface2 = 1
         else:
             b2x = c2x; b2y = c2y; b2z = c2z
+            k2b = k2c
             nface2 = 2
     elif _same_point[DTYPE](c2x, c2y, c2z, a2x, a2y, a2z, scale) or _same_point[
         DTYPE
@@ -1489,13 +1501,13 @@ def native_multicontact_contacts[
         i1b = _box_corner_index[DTYPE](l1b[0], l1b[1], l1b[2])
         i1c = _box_corner_index[DTYPE](l1c[0], l1c[1], l1c[2])
     else:
-        i1a = _mesh_vertex_index[DTYPE](
+        i1a = k1a if k1a >= 0 else _mesh_vertex_index[DTYPE](
             l1a[0], l1a[1], l1a[2], mesh_verts, va1, mnv1
         )
-        i1b = _mesh_vertex_index[DTYPE](
+        i1b = k1b if k1b >= 0 else _mesh_vertex_index[DTYPE](
             l1b[0], l1b[1], l1b[2], mesh_verts, va1, mnv1
         )
-        i1c = _mesh_vertex_index[DTYPE](
+        i1c = k1c if k1c >= 0 else _mesh_vertex_index[DTYPE](
             l1c[0], l1c[1], l1c[2], mesh_verts, va1, mnv1
         )
         if i1a < 0 or i1b < 0 or i1c < 0:
@@ -1510,13 +1522,13 @@ def native_multicontact_contacts[
         i2b = _box_corner_index[DTYPE](l2b[0], l2b[1], l2b[2])
         i2c = _box_corner_index[DTYPE](l2c[0], l2c[1], l2c[2])
     else:
-        i2a = _mesh_vertex_index[DTYPE](
+        i2a = k2a if k2a >= 0 else _mesh_vertex_index[DTYPE](
             l2a[0], l2a[1], l2a[2], mesh_verts, va2, mnv2
         )
-        i2b = _mesh_vertex_index[DTYPE](
+        i2b = k2b if k2b >= 0 else _mesh_vertex_index[DTYPE](
             l2b[0], l2b[1], l2b[2], mesh_verts, va2, mnv2
         )
-        i2c = _mesh_vertex_index[DTYPE](
+        i2c = k2c if k2c >= 0 else _mesh_vertex_index[DTYPE](
             l2c[0], l2c[1], l2c[2], mesh_verts, va2, mnv2
         )
         if i2a < 0 or i2b < 0 or i2c < 0:
