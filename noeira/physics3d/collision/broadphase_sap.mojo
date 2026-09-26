@@ -23,7 +23,7 @@ The fields integrators are NOT rewired to auto here (SAP emission ORDER
 differs from O(N^2), which would shift existing bit-exact gates)."""
 
 from std.time import perf_counter_ns
-from std.math import sqrt
+from std.math import sqrt, abs
 from max.gpu import thread_idx, block_idx, block_dim
 from max.gpu.host import DeviceContext
 from layout import Layout, LayoutTensor
@@ -1202,6 +1202,122 @@ def _sap_plane_narrow[
 
 
 @always_inline
+def _obb_separated[
+    DTYPE: DType
+](
+    pix: Scalar[DTYPE], piy: Scalar[DTYPE], piz: Scalar[DTYPE],
+    qix: Scalar[DTYPE], qiy: Scalar[DTYPE], qiz: Scalar[DTYPE],
+    qiw: Scalar[DTYPE],
+    a0: Scalar[DTYPE], a1: Scalar[DTYPE], a2: Scalar[DTYPE],
+    pjx: Scalar[DTYPE], pjy: Scalar[DTYPE], pjz: Scalar[DTYPE],
+    qjx: Scalar[DTYPE], qjy: Scalar[DTYPE], qjz: Scalar[DTYPE],
+    qjw: Scalar[DTYPE],
+    b0: Scalar[DTYPE], b1: Scalar[DTYPE], b2: Scalar[DTYPE],
+) -> Bool:
+    """True when two oriented boxes are provably apart — MuJoCo's
+    `mj_collideOBB` midphase test, the 15-axis separating-axis theorem in
+    Ericson's form (Real-Time Collision Detection 4.4.1). Box i has
+    half-sizes `a*` and box j `b*`, each centred on its geom frame; the
+    caller inflates `a*` by the pair's cutoff, which is conservative (an
+    inflated box contains the margin-inflated shape).
+
+    Written out with scalars: a per-thread array indexed at runtime is the
+    Metal miscompile of `feedback_metal_wide_per_thread_inlinearray_miscompute`.
+    """
+    comptime ONE = Scalar[DTYPE](1)
+    comptime TWO = Scalar[DTYPE](2)
+    # Column k of each rotation is that box's k-th axis in the world.
+    var A00 = ONE - TWO * (qiy * qiy + qiz * qiz)
+    var A10 = TWO * (qix * qiy + qiz * qiw)
+    var A20 = TWO * (qix * qiz - qiy * qiw)
+    var A01 = TWO * (qix * qiy - qiz * qiw)
+    var A11 = ONE - TWO * (qix * qix + qiz * qiz)
+    var A21 = TWO * (qiy * qiz + qix * qiw)
+    var A02 = TWO * (qix * qiz + qiy * qiw)
+    var A12 = TWO * (qiy * qiz - qix * qiw)
+    var A22 = ONE - TWO * (qix * qix + qiy * qiy)
+    var B00 = ONE - TWO * (qjy * qjy + qjz * qjz)
+    var B10 = TWO * (qjx * qjy + qjz * qjw)
+    var B20 = TWO * (qjx * qjz - qjy * qjw)
+    var B01 = TWO * (qjx * qjy - qjz * qjw)
+    var B11 = ONE - TWO * (qjx * qjx + qjz * qjz)
+    var B21 = TWO * (qjy * qjz + qjx * qjw)
+    var B02 = TWO * (qjx * qjz + qjy * qjw)
+    var B12 = TWO * (qjy * qjz - qjx * qjw)
+    var B22 = ONE - TWO * (qjx * qjx + qjy * qjy)
+    # R[r][c] = A_r . B_c ; t = the centre offset in A's frame.
+    var R00 = A00 * B00 + A10 * B10 + A20 * B20
+    var R01 = A00 * B01 + A10 * B11 + A20 * B21
+    var R02 = A00 * B02 + A10 * B12 + A20 * B22
+    var R10 = A01 * B00 + A11 * B10 + A21 * B20
+    var R11 = A01 * B01 + A11 * B11 + A21 * B21
+    var R12 = A01 * B02 + A11 * B12 + A21 * B22
+    var R20 = A02 * B00 + A12 * B10 + A22 * B20
+    var R21 = A02 * B01 + A12 * B11 + A22 * B21
+    var R22 = A02 * B02 + A12 * B12 + A22 * B22
+    var dx = pjx - pix
+    var dy = pjy - piy
+    var dz = pjz - piz
+    var t0 = A00 * dx + A10 * dy + A20 * dz
+    var t1 = A01 * dx + A11 * dy + A21 * dz
+    var t2 = A02 * dx + A12 * dy + A22 * dz
+    # ⚠ THE EPSILON ONLY MAKES A REJECT HARDER. Near-parallel edges give a
+    # cross-product axis of ~zero length, where rounding alone can fake a
+    # gap; RTCD adds it to |R| for exactly that.
+    comptime EPS = Scalar[DTYPE](1e-6)
+    var E00 = abs(R00) + EPS
+    var E01 = abs(R01) + EPS
+    var E02 = abs(R02) + EPS
+    var E10 = abs(R10) + EPS
+    var E11 = abs(R11) + EPS
+    var E12 = abs(R12) + EPS
+    var E20 = abs(R20) + EPS
+    var E21 = abs(R21) + EPS
+    var E22 = abs(R22) + EPS
+
+    @always_inline
+    def apart(x: Scalar[DTYPE], r: Scalar[DTYPE]) -> Bool:
+        # A relative slack on every test: rejecting a touching pair would drop
+        # a contact, keeping an apart one only costs the narrow phase.
+        return abs(x) > r * Scalar[DTYPE](1.0001) + Scalar[DTYPE](1e-6)
+
+    # A's face axes.
+    if apart(t0, a0 + b0 * E00 + b1 * E01 + b2 * E02):
+        return True
+    if apart(t1, a1 + b0 * E10 + b1 * E11 + b2 * E12):
+        return True
+    if apart(t2, a2 + b0 * E20 + b1 * E21 + b2 * E22):
+        return True
+    # B's face axes.
+    if apart(t0 * R00 + t1 * R10 + t2 * R20, a0 * E00 + a1 * E10 + a2 * E20 + b0):
+        return True
+    if apart(t0 * R01 + t1 * R11 + t2 * R21, a0 * E01 + a1 * E11 + a2 * E21 + b1):
+        return True
+    if apart(t0 * R02 + t1 * R12 + t2 * R22, a0 * E02 + a1 * E12 + a2 * E22 + b2):
+        return True
+    # The nine edge-edge axes A_i x B_j.
+    if apart(t2 * R10 - t1 * R20, a1 * E20 + a2 * E10 + b1 * E02 + b2 * E01):
+        return True
+    if apart(t2 * R11 - t1 * R21, a1 * E21 + a2 * E11 + b0 * E02 + b2 * E00):
+        return True
+    if apart(t2 * R12 - t1 * R22, a1 * E22 + a2 * E12 + b0 * E01 + b1 * E00):
+        return True
+    if apart(t0 * R20 - t2 * R00, a0 * E20 + a2 * E00 + b1 * E12 + b2 * E11):
+        return True
+    if apart(t0 * R21 - t2 * R01, a0 * E21 + a2 * E01 + b0 * E12 + b2 * E10):
+        return True
+    if apart(t0 * R22 - t2 * R02, a0 * E22 + a2 * E02 + b0 * E11 + b1 * E10):
+        return True
+    if apart(t1 * R00 - t0 * R10, a0 * E10 + a1 * E00 + b1 * E22 + b2 * E21):
+        return True
+    if apart(t1 * R01 - t0 * R11, a0 * E11 + a1 * E01 + b0 * E22 + b2 * E20):
+        return True
+    if apart(t1 * R02 - t0 * R12, a0 * E12 + a1 * E02 + b0 * E21 + b1 * E20):
+        return True
+    return False
+
+
+@always_inline
 def _sap_pair_filter_rejects[
     DTYPE: DType,
     EX_CAP: Int,
@@ -1530,6 +1646,34 @@ def _sap_pair_narrow[
         var sfz = pi_z - pj_z
         var sfb = rbound_i + rbound_j + cm
         if sfx * sfx + sfy * sfy + sfz * sfz > sfb * sfb:
+            return
+    # ── ORIENTED-BOX REJECT — MuJoCo's midphase `mj_collideOBB` ─────────
+    # MuJoCo tests every geom pair of two multi-geom bodies box-against-box
+    # (`mj_collideTree`, engine_collision_driver.c:1079) before the narrow
+    # phase; we ran GJK on them. Measured on so101_tower with MuJoCo's own
+    # trajectories: of the box/mesh pairs that pass the sphere test above,
+    # 27.3 per env per step, the oriented boxes reject all but 3.1 — and none
+    # of the 0.10 that are in contact.
+    #
+    # ⚠ THE BOX IS `geom_size`, CENTRED ON THE GEOM FRAME: exact for a box,
+    # and for a mesh the smallest origin-centred box holding the hull
+    # (`compute_mesh_half_extents_at`), looser than MuJoCo's off-centre
+    # `geom_aabb` but still a bound. Box i is inflated by the cutoff `cm`, so
+    # a pair within its margin is never rejected. Only box/mesh pairs with
+    # nonzero sizes: a record whose sizes were never filled must not reject.
+    if (
+        (gi_type == GEOM_BOX or gi_type == GEOM_MESH)
+        and (gj_type == GEOM_BOX or gj_type == GEOM_MESH)
+        and hxi > Scalar[DTYPE](0) and hyi > Scalar[DTYPE](0)
+        and hzi > Scalar[DTYPE](0) and hxj > Scalar[DTYPE](0)
+        and hyj > Scalar[DTYPE](0) and hzj > Scalar[DTYPE](0)
+    ):
+        if _obb_separated[DTYPE](
+            pi_x, pi_y, pi_z, qi_x, qi_y, qi_z, qi_w,
+            hxi + cm, hyi + cm, hzi + cm,
+            pj_x, pj_y, pj_z, qj_x, qj_y, qj_z, qj_w,
+            hxj, hyj, hzj,
+        ):
             return
 
     # ⚠⚠ THE CONTACT-PARAMETER MIX RUNS **AFTER** THE SPHERE
@@ -3038,6 +3182,17 @@ def _detect_contacts_sap_fields_kernel[
 # scene (2026-09-07; the 21/22/23 sub-stops of that bisect split the old
 # cheap-thread / CCD-lane assignment and went with it, 2026-09-11).
 comptime COLL_STOP_AFTER: Int = 0
+# ⚠ A TIMING INSTRUMENT, OFF IN PRODUCTION. True makes the block kernel read
+# the device clock (`perf_counter_ns`, the global timer) at its phase
+# boundaries on thread 0, and per lane around the narrow phase, and write them
+# into the `COLL_REPORT_BASE` tail of the env's `stage` row — the region
+# `COLL_CAND_REPORT` uses, so the two are exclusive. Layout from that base:
+#     [0..3] pose/AABB, sweep, narrow phase, output (ns)   [4] total
+#     [8 + 4*l ..] lane l: narrow-phase ns, candidates run, slowest
+#                  candidate's ns, its kind key
+# It answers what a repeat probe cannot: the CRITICAL PATH of each env, whose
+# slowest lane is what the launch waits for. Results are unchanged.
+comptime COLL_TIMING: Bool = False
 
 # Candidate KIND keys for the block kernel's phase-2 order: a geom pair is
 # `rank_lo * 8 + rank_hi` (`mj_geom_type_rank`, 0..7), a plane candidate is
@@ -3240,6 +3395,15 @@ def _detect_contacts_sap_block_kernel[
     serial kernel and this kernel compiles the heightfield branch out."""
     var env = Int(block_idx.x)
     var tid = Int(thread_idx.x)
+    var _tt0: Int = 0
+    var _tt1: Int = 0
+    var _tt2: Int = 0
+    var _tt3: Int = 0
+    comptime if COLL_TIMING:
+        comptime assert not COLL_CAND_REPORT, (
+            "COLL_TIMING and COLL_CAND_REPORT write the same stage tail"
+        )
+        _tt0 = perf_counter_ns()
     if env >= BATCH:
         return
     comptime NG = NGEOM if NGEOM > 0 else 1
@@ -3351,6 +3515,8 @@ def _detect_contacts_sap_block_kernel[
         ab_sh[4 * NG + g] = pz - he[2] - gm
         ab_sh[5 * NG + g] = pz + he[2] + gm
     barrier()
+    comptime if COLL_TIMING:
+        _tt1 = perf_counter_ns()
     comptime if COLL_STOP_AFTER == 1:
         if tid == 0:
             smeta[env, META_IDX_NUM_CONTACTS] = Scalar[DTYPE](0)
@@ -3584,6 +3750,8 @@ def _detect_contacts_sap_block_kernel[
     # From here every thread reads the block's count, not its own copy.
     ncand = Int(rebind[Scalar[DTYPE]](ctrl_sh[0]))
     overflow = Int(rebind[Scalar[DTYPE]](ctrl_sh[1]))
+    comptime if COLL_TIMING:
+        _tt2 = perf_counter_ns()
     comptime if COLL_STOP_AFTER == 2:
         if tid == 0:
             smeta[env, META_IDX_NUM_CONTACTS] = Scalar[DTYPE](0)
@@ -3611,8 +3779,17 @@ def _detect_contacts_sap_block_kernel[
         var wrow = env * COLL_CCD_LANES + tid
         var hw_row = env * COLL_CCD_LANES
         var full = 0
+        var _lane_t0: Int = 0
+        var _lane_n = 0
+        var _lane_max: Int = 0
+        var _lane_max_key = -1
+        comptime if COLL_TIMING:
+            _lane_t0 = perf_counter_ns()
         for p in range(tid, ncand, COLL_TPB):
             var c = Int(rebind[Scalar[DTYPE]](ord_sh[p]))
+            var _c_t0: Int = 0
+            comptime if COLL_TIMING:
+                _c_t0 = perf_counter_ns()
             var a = Int(rebind[Scalar[DTYPE]](cand_sh[0 * NC + c]))
             var b = Int(rebind[Scalar[DTYPE]](cand_sh[1 * NC + c]))
             var t = Int(rebind[Scalar[DTYPE]](cand_sh[2 * NC + c]))
@@ -3666,9 +3843,22 @@ def _detect_contacts_sap_block_kernel[
             if cnt >= COLL_STAGE_MAXC:
                 full = 1
             cand_sh[5 * NC + c] = Scalar[DTYPE](cnt)
+            comptime if COLL_TIMING:
+                var _c_dt = perf_counter_ns() - _c_t0
+                _lane_n += 1
+                if _c_dt > _lane_max:
+                    _lane_max = _c_dt
+                    _lane_max_key = Int(rebind[Scalar[DTYPE]](cand_sh[4 * NC + c]))
+        comptime if COLL_TIMING:
+            stage[env, COLL_REPORT_BASE + 8 + 4 * tid + 0] = Scalar[DTYPE](Int(perf_counter_ns() - _lane_t0))
+            stage[env, COLL_REPORT_BASE + 8 + 4 * tid + 1] = Scalar[DTYPE](_lane_n)
+            stage[env, COLL_REPORT_BASE + 8 + 4 * tid + 2] = Scalar[DTYPE](Int(_lane_max))
+            stage[env, COLL_REPORT_BASE + 8 + 4 * tid + 3] = Scalar[DTYPE](_lane_max_key)
         if full == 1:
             ctrl_sh[1] = Scalar[DTYPE](1)
     barrier()
+    comptime if COLL_TIMING:
+        _tt3 = perf_counter_ns()
     comptime if COLL_STOP_AFTER == 3:
         if tid == 0:
             smeta[env, META_IDX_NUM_CONTACTS] = Scalar[DTYPE](0)
@@ -3722,6 +3912,14 @@ def _detect_contacts_sap_block_kernel[
     if tid == 0 and Int(rebind[Scalar[DTYPE]](ctrl_sh[1])) == 0:
         sort_contacts_mujoco_order[DTYPE](env, contacts, n_out)
         smeta[env, META_IDX_NUM_CONTACTS] = Scalar[DTYPE](n_out)
+    comptime if COLL_TIMING:
+        if tid == 0:
+            var _tt4 = perf_counter_ns()
+            stage[env, COLL_REPORT_BASE + 0] = Scalar[DTYPE](Int(_tt1 - _tt0))
+            stage[env, COLL_REPORT_BASE + 1] = Scalar[DTYPE](Int(_tt2 - _tt1))
+            stage[env, COLL_REPORT_BASE + 2] = Scalar[DTYPE](Int(_tt3 - _tt2))
+            stage[env, COLL_REPORT_BASE + 3] = Scalar[DTYPE](Int(_tt4 - _tt3))
+            stage[env, COLL_REPORT_BASE + 4] = Scalar[DTYPE](Int(_tt4 - _tt0))
 
     # ── `COLL_CAND_REPORT`: the candidate list, into the dead staging tail ──
     # After the compaction above nothing reads `stage` until the next
