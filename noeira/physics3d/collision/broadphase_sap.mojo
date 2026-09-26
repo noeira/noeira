@@ -3190,8 +3190,18 @@ comptime COLL_STOP_AFTER: Int = 0
 #     [0..3] pose/AABB, sweep, narrow phase, output (ns)   [4] total
 #     [8 + 4*l ..] lane l: narrow-phase ns, candidates run, slowest
 #                  candidate's ns, its kind key
-# It answers what a repeat probe cannot: the CRITICAL PATH of each env, whose
-# slowest lane is what the launch waits for. Results are unchanged.
+# Results are unchanged.
+#
+# ⚠⚠ TRUST THE PHASE SPLIT, NOT THE PER-LANE ATTRIBUTION. The four phases are
+# block-wide (thread 0, between barriers) and sound. The per-lane numbers are
+# not what they look like: the 32 lanes of a warp run their candidates in
+# lockstep, so while lanes take different branches (box/box on some, GJK on
+# others) EVERY lane's timer spans the serialized total. On so101_tower
+# (2026-09-26) that made "the slowest candidate on the critical lane" read
+# box/box in all 1024 envs — an artifact of the kind-sorted candidate order
+# (lane 0 holds the first kind), refuted by skipping kinds: the GJK kinds
+# were ~83% of the narrow phase, box/box ~8%. To price a kind, SKIP it
+# (timing-only build) and compare launches; do not read it off a lane.
 comptime COLL_TIMING: Bool = False
 
 # Candidate KIND keys for the block kernel's phase-2 order: a geom pair is
