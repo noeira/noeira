@@ -5817,24 +5817,31 @@ def _newton_blocked_fields_kernel[
             tid, COOP, env, NV, M, qacc_sh, Mv_sh, seg0_sh, seg1_sh
         )
     barrier()
-    # ⚠⚠ THE ELLIPTIC WARM-START TRIAL COSTS RUN IN WARP 0 (2026-09-26). Each
-    # is a full cost: every penetrating contact's rows dotted with the trial
-    # acceleration (`Je` spills to global memory on a many-contact model) and
-    # every dense row. Serial on thread 0 they were ~56 us of every env's
-    # setup on so101_tower at 1024 lanes (RTX 5090). Contacts and rows are
-    # strided over the warp's lanes and `warp.sum`med, re-broadcast from lane
-    # 0; thread 0 — lane 0 — takes the two values into its warm-start choice
-    # below. The inputs are complete here: `qacc_sh` (= `qacc_smooth`) and the
-    # rows were published before the barrier above, `ctrl_sh[0]` holds
-    # `num_edges`, and the warm start is read straight from `qacc_warmstart`.
+    # ⚠⚠ THE WARM-START TRIAL COSTS RUN IN WARP 0 (2026-09-26), BOTH CONES.
+    # Each is a full cost: on the elliptic cone every penetrating contact's
+    # rows dotted with the trial acceleration (`Je` spills to global memory on
+    # a many-contact model), and on both cones every dense row — which on the
+    # pyramidal cone is every row (`dense0 == 0`). Serial on thread 0 the
+    # elliptic pair was ~56 us of every env's setup on so101_tower at 1024
+    # lanes (RTX 5090). Contacts and rows are strided over the warp's lanes and
+    # `warp.sum`med, re-broadcast from lane 0; thread 0 — lane 0 — takes the
+    # two values into its warm-start choice below. The inputs are complete
+    # here: `qacc_sh` (= `qacc_smooth`) and the rows were published before the
+    # barrier above, `ctrl_sh[0]` holds `num_edges`, and the warm start is read
+    # straight from `qacc_warmstart`.
+    #
+    # ⚠ THE PYRAMIDAL SMOOTH COST USED THREAD 0's STORED `jar` AND STATES,
+    # built later in this setup from the same `bias + sum_i Je[e,i]*qacc[i]`
+    # in the same order — so each row's term here is the same number; only
+    # the sum across rows is reordered.
     # ⚠ NOT BIT-EXACT with the serial sum, like the line search; a near-tie
     # between the two candidates can resolve the other way.
-    var ell_cost_s = Scalar[DTYPE](0)
-    var ell_cost_w = Scalar[DTYPE](0)
-    comptime if IS_ELL:
-        @always_inline
-        def _ell_trial_cost_warp(warm: Bool, ne: Int) {imm} -> Scalar[DTYPE]:
-            var acc = Scalar[DTYPE](0)
+    var trial_cost_s = Scalar[DTYPE](0)
+    var trial_cost_w = Scalar[DTYPE](0)
+    @always_inline
+    def _trial_cost_warp(warm: Bool, ne: Int) {imm} -> Scalar[DTYPE]:
+        var acc = Scalar[DTYPE](0)
+        comptime if IS_ELL:
             var jar_t = Scratch[Scalar[DTYPE], NT](NT, fill=Scalar[DTYPE](0))
             var D_t = Scratch[Scalar[DTYPE], NT](NT, fill=Scalar[DTYPE](0))
             var fr = Scratch[Scalar[DTYPE], NT](NT, fill=Scalar[DTYPE](0))
@@ -5862,37 +5869,37 @@ def _newton_blocked_fields_kernel[
                     nt_c, jn, jar_t, rebind[Scalar[DTYPE]](mu_sh[c]),
                     rebind[Scalar[DTYPE]](De_sh[row0]), D_t, fr,
                 )
-            for e_idx in range(dense0 + tid, ne, WARP_SIZE):
-                var jar_w = rebind[Scalar[DTYPE]](bias_e_sh[e_idx])
-                for i in range(NV):
-                    var qa_i = (
-                        rebind[Scalar[DTYPE]](qacc_warmstart[env, i]) if warm
-                        else rebind[Scalar[DTYPE]](qacc_sh[i])
-                    )
-                    jar_w += rebind[Scalar[DTYPE]](Je_sh[e_idx * NV + i]) * qa_i
-                var st_w = scalar_row_state[DTYPE](
-                    Int(rebind[Scalar[DTYPE]](kind_e_sh[e_idx])),
-                    jar_w,
-                    rebind[Scalar[DTYPE]](R_e_sh[e_idx]),
-                    rebind[Scalar[DTYPE]](floss_e_sh[e_idx]),
+        for e_idx in range(dense0 + tid, ne, WARP_SIZE):
+            var jar_w = rebind[Scalar[DTYPE]](bias_e_sh[e_idx])
+            for i in range(NV):
+                var qa_i = (
+                    rebind[Scalar[DTYPE]](qacc_warmstart[env, i]) if warm
+                    else rebind[Scalar[DTYPE]](qacc_sh[i])
                 )
-                acc += scalar_row_cost[DTYPE](
-                    st_w,
-                    jar_w,
-                    rebind[Scalar[DTYPE]](De_sh[e_idx]),
-                    rebind[Scalar[DTYPE]](R_e_sh[e_idx]),
-                    rebind[Scalar[DTYPE]](floss_e_sh[e_idx]),
-                )
-            return warp.shuffle_idx(warp.sum(acc), 0)
-        var ne_w = Int(rebind[Scalar[DTYPE]](ctrl_sh[0]))
-        if (
-            valid_env
-            and tid < WARP_SIZE
-            and mmeta[MODEL_META_IDX_WARMSTART_DISABLED] == Scalar[DTYPE](0)
-            and ne_w > 0
-        ):
-            ell_cost_s = _ell_trial_cost_warp(False, ne_w)
-            ell_cost_w = _ell_trial_cost_warp(True, ne_w)
+                jar_w += rebind[Scalar[DTYPE]](Je_sh[e_idx * NV + i]) * qa_i
+            var st_w = scalar_row_state[DTYPE](
+                Int(rebind[Scalar[DTYPE]](kind_e_sh[e_idx])),
+                jar_w,
+                rebind[Scalar[DTYPE]](R_e_sh[e_idx]),
+                rebind[Scalar[DTYPE]](floss_e_sh[e_idx]),
+            )
+            acc += scalar_row_cost[DTYPE](
+                st_w,
+                jar_w,
+                rebind[Scalar[DTYPE]](De_sh[e_idx]),
+                rebind[Scalar[DTYPE]](R_e_sh[e_idx]),
+                rebind[Scalar[DTYPE]](floss_e_sh[e_idx]),
+            )
+        return warp.shuffle_idx(warp.sum(acc), 0)
+    var ne_w = Int(rebind[Scalar[DTYPE]](ctrl_sh[0]))
+    if (
+        valid_env
+        and tid < WARP_SIZE
+        and mmeta[MODEL_META_IDX_WARMSTART_DISABLED] == Scalar[DTYPE](0)
+        and ne_w > 0
+    ):
+        trial_cost_s = _trial_cost_warp(False, ne_w)
+        trial_cost_w = _trial_cost_warp(True, ne_w)
     if valid_env and tid == 0:
         for i in range(NV):
             Ma[i] = rebind[Scalar[DTYPE]](Mv_sh[i])
@@ -5960,18 +5967,7 @@ def _newton_blocked_fields_kernel[
             mmeta[MODEL_META_IDX_WARMSTART_DISABLED] == Scalar[DTYPE](0)
             and num_edges > 0
         ):
-            ws_cost_s = 0
-            comptime if CONE_TYPE == ConeType.PYRAMIDAL:
-                for e_idx in range(num_edges):
-                    ws_cost_s += scalar_row_cost[DTYPE](
-                        Int(rebind[Scalar[DTYPE]](state_e_sh[e_idx])),
-                        jar[e_idx],
-                        rebind[Scalar[DTYPE]](De_sh[e_idx]),
-                        rebind[Scalar[DTYPE]](R_e_sh[e_idx]),
-                        rebind[Scalar[DTYPE]](floss_e_sh[e_idx]),
-                    )
-            else:
-                ws_cost_s = ell_cost_s
+            ws_cost_s = trial_cost_s
             # The trial acceleration goes to threadgroup memory for the
             # cooperative matvec after the cut (`search_sh` is free until the
             # loop).
@@ -5984,30 +5980,7 @@ def _newton_blocked_fields_kernel[
                         ctrl_sh[2] = Scalar[DTYPE](0)
             for i in range(NV):
                 search_sh[i] = rebind[Scalar[DTYPE]](qacc_warmstart[env, i])
-            ws_cost_w = 0
-            comptime if CONE_TYPE == ConeType.PYRAMIDAL:
-                for e_idx in range(num_edges):
-                    var jar_w = rebind[Scalar[DTYPE]](bias_e_sh[e_idx])
-                    for i in range(NV):
-                        jar_w += (
-                            rebind[Scalar[DTYPE]](Je_sh[e_idx * NV + i])
-                            * rebind[Scalar[DTYPE]](search_sh[i])
-                        )
-                    var st_w = scalar_row_state[DTYPE](
-                        Int(rebind[Scalar[DTYPE]](kind_e_sh[e_idx])),
-                        jar_w,
-                        rebind[Scalar[DTYPE]](R_e_sh[e_idx]),
-                        rebind[Scalar[DTYPE]](floss_e_sh[e_idx]),
-                    )
-                    ws_cost_w += scalar_row_cost[DTYPE](
-                        st_w,
-                        jar_w,
-                        rebind[Scalar[DTYPE]](De_sh[e_idx]),
-                        rebind[Scalar[DTYPE]](R_e_sh[e_idx]),
-                        rebind[Scalar[DTYPE]](floss_e_sh[e_idx]),
-                    )
-            else:
-                ws_cost_w = ell_cost_w
+            ws_cost_w = trial_cost_w
             # The warmstart trial's `Ma = M*qacc_w` — the second NV^2 serial
             # matvec in this setup block, same block restriction and the same
             # exact-zero argument as the one above.
