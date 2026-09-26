@@ -88,7 +88,7 @@ from noeira.nn.primitives.activations import Tanh
 from noeira.nn.primitives.linear import Linear
 from noeira.physics3d.gpu.constants import (
     METADATA_SIZE, MODEL_CURRICULUM_SIZE, META_IDX_GOAL_HELD,
-    META_IDX_STEP_COUNT, META_IDX_REWARD_MODE,
+    META_IDX_STEP_COUNT, META_IDX_REWARD_MODE, META_IDX_TASK_PARAM_0,
 )
 from noeira.physics3d.model import ModelDefLike
 from noeira.physics3d.parser.runtime_load import parse_model_runtime
@@ -790,6 +790,15 @@ def run_ppo[M: ModelDefLike, C: Phyics3dEnvConfig](
             ctx.enqueue_copy(raw_h, obs_dev)
             ctx.synchronize()
             var held = List[Bool](length=N_ENVS, fill=False)
+            # ⚠ WHERE EPISODES STOP, not only whether they succeed: the brick
+            # (term 0's `a`) rising, reaching over `b`, and the closest
+            # horizontal gap. A success rate cannot tell "never grasps" from
+            # "carries and drops at the rim".
+            var z0 = List[Float64](length=N_ENVS, fill=0.0)
+            var rise = List[Float64](length=N_ENVS, fill=0.0)
+            var hmin = List[Float64](length=N_ENVS, fill=1e9)
+            var over = List[Bool](length=N_ENVS, fill=False)
+            var held_end = List[Bool](length=N_ENVS, fill=False)
             for t in range(C.MAX_STEPS - 1):
                 var rq = mptr(raw_h.unsafe_ptr())
                 for e in range(N_ENVS):
@@ -815,14 +824,57 @@ def run_ppo[M: ModelDefLike, C: Phyics3dEnvConfig](
                 ctx.enqueue_copy(raw_h, obs_dev)
                 env.d.meta.download(ctx)
                 ctx.synchronize()
+                env.d.xpos.download(ctx)
+                ctx.synchronize()
                 for e in range(N_ENVS):
-                    if env.d.meta.data[e * METADATA_SIZE + META_IDX_GOAL_HELD] > Scalar[DT](0.5):
+                    var hb = env.d.meta.data[e * METADATA_SIZE + META_IDX_GOAL_HELD] > Scalar[DT](0.5)
+                    if hb:
                         held[e] = True
+                    held_end[e] = hb
+                    var mb = e * METADATA_SIZE + META_IDX_TASK_PARAM_0
+                    var ia = Int(env.d.meta.data[mb + 1])
+                    var ib = Int(env.d.meta.data[mb + 2])
+                    var xb = e * M.NBODY * 3
+                    var ex = Float64(env.d.xpos.data[xb + ia * 3] - env.d.xpos.data[xb + ib * 3])
+                    var ey = Float64(env.d.xpos.data[xb + ia * 3 + 1] - env.d.xpos.data[xb + ib * 3 + 1])
+                    var za = Float64(env.d.xpos.data[xb + ia * 3 + 2])
+                    if t == 0:
+                        z0[e] = za
+                    var dz = za - z0[e]
+                    if dz > rise[e]:
+                        rise[e] = dz
+                    var h = sqrt(ex * ex + ey * ey)
+                    if h < hmin[e]:
+                        hmin[e] = h
+                    if dz > 0.02 and h < 0.045:
+                        over[e] = True
             var ok = 0
+            var n_lift = 0
+            var n_over = 0
+            var n_end = 0
+            var n_h45 = 0
+            var n_h80 = 0
+            var n_h150 = 0
             for e in range(N_ENVS):
                 if held[e]:
                     ok += 1
-            print("  greedy eval round", rnd, ":", ok, "/", N_ENVS)
+                if rise[e] > 0.02:
+                    n_lift += 1
+                if over[e]:
+                    n_over += 1
+                if held_end[e]:
+                    n_end += 1
+                if hmin[e] < 0.045:
+                    n_h45 += 1
+                if hmin[e] < 0.08:
+                    n_h80 += 1
+                if hmin[e] < 0.15:
+                    n_h150 += 1
+            print("  greedy eval round", rnd, ":", ok, "/", N_ENVS,
+                  "| held at the end", n_end, "| lifted >2cm", n_lift,
+                  "| over b while lifted", n_over,
+                  "| closest horizontal <4.5cm", n_h45, "<8cm", n_h80,
+                  "<15cm", n_h150)
             eval_ok += ok
             eval_n += N_ENVS
         var eval_rate = Float64(eval_ok) / Float64(eval_n) if eval_n > 0 else 0.0
