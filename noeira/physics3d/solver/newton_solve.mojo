@@ -6246,6 +6246,7 @@ def _newton_blocked_fields_kernel[
                 # is safe only because nothing reads them; it is NOT the same
                 # property as `L_sh` below, where zero is load-bearing.
                 var bp = 0
+                var base = 0
                 while bp < NV:
                     var be = Int(rebind[Scalar[DTYPE]](seg1_sh[bp]))
                     # A malformed partition would hang the walk; a runaway is worse
@@ -6271,9 +6272,27 @@ def _newton_blocked_fields_kernel[
                                             * rebind[Scalar[DTYPE]](Je_sh[e * NV + pj])
                                         )
                                 L_sh[pidx] = ph
-                    for q in range(tid, bn * bn, COOP):
-                        var i = bp + q // bn
-                        var j = bp + q % bn
+                    # ⚠⚠ THE LOWER TRIANGLE ONLY, AND EVERY BLOCK IN ONE STRIDE
+                    # (2026-09-26). The factor reads `[j*nv+j]` and `[i*nv+j]`
+                    # with i > j (audited above), and the triangular solve only
+                    # the lower triangle, so the upper entries were dead writes
+                    # — half the build. And a thread used to take block `bp`'s
+                    # `bn*bn` entries on a stride of COOP and then WAIT for the
+                    # next block: on so101_tower (three 6-dof trees) that was
+                    # 36 entries on 64 threads, three times over. Numbering
+                    # the lower triangles of all blocks as ONE list (`base`
+                    # counts entries before this block) puts 63 entries on 64
+                    # threads in a single pass. Each entry's arithmetic is
+                    # unchanged, so the factor sees the same bits.
+                    var cnt = bn * (bn + 1) // 2
+                    var first = base + (((tid - base) % COOP) + COOP) % COOP
+                    for q in range(first, base + cnt, COOP):
+                        var r = q - base
+                        var ra = 0
+                        while (ra + 1) * (ra + 2) // 2 <= r:
+                            ra += 1
+                        var i = bp + ra
+                        var j = bp + (r - ra * (ra + 1) // 2)
                         var idx = i * NV + j
                         var h = rebind[Scalar[DTYPE]](M[env, idx])
                         # The rank-deficient retry: what `_chol_factor_coop`
@@ -6314,6 +6333,7 @@ def _newton_blocked_fields_kernel[
                             if chol_attempt == 1 and i == j:
                                 h += Scalar[DTYPE](1e-6)
                         L_sh[idx] = h
+                    base += cnt
                     bp = be
             barrier()
 
