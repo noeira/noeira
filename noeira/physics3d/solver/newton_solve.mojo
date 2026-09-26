@@ -87,7 +87,12 @@ from .cholesky import (
     chol_factor_inline, chol_solve_inline, chol_factor_seg, chol_solve_seg,
     chol_solve_seg_p, _dot_seg, chol_update_seg,
 )
-from .newton_blocks import build_dof_segments, build_dof_segments_p
+from .newton_blocks import (
+    build_dof_segments_p,
+    dof_segments_init_p,
+    dof_segments_mark_p,
+    dof_segments_finish_p,
+)
 
 # MuJoCo's `mjMINVAL`; see `cholesky.mojo` on why `1e-10` was not the
 # reference's number for this guard.
@@ -5781,24 +5786,8 @@ def _newton_blocked_fields_kernel[
         # Publish num_edges to shared for all threads.
         ctrl_sh[0] = Scalar[DTYPE](num_edges)
 
-        # ── H's diagonal blocks, from the rows just built ────────────────
-        #
-        # ⚠ HERE AND NOT INSIDE THE ITERATION LOOP. `Je` is final at this
-        # point and does not change across iterations — only the row STATES
-        # do — so one partition serves the whole solve and is a superset of
-        # every iteration's coupling. Computing it per iteration would let the
-        # partition move under the factorisation.
-        _ = build_dof_segments[
-            DTYPE, J_AS=JE_AS, S_AS = AddressSpace.SHARED
-        ](
-            NV,
-            Int(rebind[Scalar[DTYPE]](mmeta[MODEL_META_IDX_NTREE])),
-            num_edges,
-            trees,
-            Je_sh,
-            seg0_sh,
-            seg1_sh,
-        )
+        # (H's diagonal blocks are built just after this block, by the
+        # whole threadgroup — see "H's diagonal blocks" below.)
 
         # Initialize qacc/qacc_smooth from workspace
         for i in range(NV):
@@ -5811,6 +5800,44 @@ def _newton_blocked_fields_kernel[
         # and the serial block resumes after it.
         for i in range(NV):
             qacc_sh[i] = qacc[i]
+    barrier()
+    # ── H's diagonal blocks, from the rows just built ────────────────────
+    #
+    # ⚠ HERE AND NOT INSIDE THE ITERATION LOOP. `Je` is final at this point
+    # and does not change across iterations — only the row STATES do — so one
+    # partition serves the whole solve and is a superset of every iteration's
+    # coupling. Computing it per iteration would let the partition move under
+    # the factorisation.
+    #
+    # ⚠ BY THE WHOLE THREADGROUP (2026-09-26). The middle phase is a
+    # `num_edges * nv` scan of `Je` (global memory once it spills); on thread
+    # 0 alone it was ~37 us of every env's setup on so101_tower at 1024 lanes.
+    # Thread 0 lays out the tree ids, every thread marks the trees its rows
+    # couple (the same value, so any split of the rows is exact), thread 0
+    # merges the runs — `newton_blocks.build_dof_segments_p`'s own three
+    # phases. `ctrl_sh[2]` carries the tree count; the factor resets it.
+    if valid_env and tid == 0:
+        ctrl_sh[2] = Scalar[DTYPE](
+            dof_segments_init_p[DTYPE, S_AS = AddressSpace.SHARED](
+                NV,
+                Int(rebind[Scalar[DTYPE]](mmeta[MODEL_META_IDX_NTREE])),
+                trees.ptr,
+                seg0_sh.ptr,
+                seg1_sh.ptr,
+            )
+        )
+    barrier()
+    var seg_nt = Int(rebind[Scalar[DTYPE]](ctrl_sh[2]))
+    if valid_env and seg_nt > 0:
+        dof_segments_mark_p[DTYPE, J_AS=JE_AS, S_AS = AddressSpace.SHARED](
+            NV, tid, THREADS, Int(rebind[Scalar[DTYPE]](ctrl_sh[0])),
+            Je_sh.ptr, seg0_sh.ptr, seg1_sh.ptr,
+        )
+    barrier()
+    if valid_env and tid == 0 and seg_nt > 0:
+        _ = dof_segments_finish_p[DTYPE, S_AS = AddressSpace.SHARED](
+            seg_nt, trees.ptr, seg0_sh.ptr, seg1_sh.ptr
+        )
     barrier()
     if valid_env:
         _block_matvec_coop[DTYPE](

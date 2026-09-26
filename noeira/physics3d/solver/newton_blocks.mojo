@@ -132,12 +132,51 @@ def build_dof_segments_p[
     already makes, for the same reason: a rule written twice drifts.
     """
 
+    # ⚠ THREE PHASES, ONE BODY EACH (2026-09-26). The blocked kernel runs the
+    # middle one on every thread — it is the `num_edges * nv` scan of `Je`,
+    # which spills to global memory, and it was ~37 us of every env's setup
+    # on so101_tower at 1024 lanes serial on thread 0 — while this driver and
+    # the CPU solver run all three in order. Each row's marks are writes of
+    # the same value, so the rows can be taken in any order and by any
+    # thread.
+    var nt = dof_segments_init_p[DTYPE, T_AS=T_AS, S_AS=S_AS](
+        nv, ntree, trees, seg_start, seg_end
+    )
+    if nt <= 0:
+        return 1
+    dof_segments_mark_p[
+        DTYPE, J_AS=J_AS, S_AS=S_AS, SPARSE=SPARSE, N_CAP=N_CAP, IX_CAP=IX_CAP
+    ](nv, 0, 1, num_edges, Je, seg_start, seg_end, je_n, je_ix)
+    return dof_segments_finish_p[DTYPE, T_AS=T_AS, S_AS=S_AS](
+        nt, trees, seg_start, seg_end
+    )
+
+
+@always_inline
+def dof_segments_init_p[
+    TO: MutOrigin,
+    SO: MutOrigin,
+    EO: MutOrigin, //,
+    DTYPE: DType,
+    T_AS: AddressSpace = AddressSpace.GENERIC,
+    S_AS: AddressSpace = AddressSpace.GENERIC,
+](
+    nv: Int,
+    ntree: Int,
+    trees: Pointer[Scalar[DTYPE], TO, address_space=T_AS],
+    seg_start: Pointer[Scalar[DTYPE], SO, address_space=S_AS],
+    seg_end: Pointer[Scalar[DTYPE], EO, address_space=S_AS],
+) -> Int:
+    """Phase 1 of `build_dof_segments_p`: tree id per dof into `seg_start`,
+    merge flags cleared in `seg_end`. Returns the tree count, or 0 after
+    writing the single-segment fallback (nothing left to do)."""
+
     @always_inline
     def one_segment() {imm} -> Int:
         for i in range(nv):
             seg_start[unsafe_offset=i] = Scalar[DTYPE](0)
             seg_end[unsafe_offset=i] = Scalar[DTYPE](nv)
-        return 1
+        return 0
 
     if ntree <= 0 or nv <= 0:
         return one_segment()
@@ -172,7 +211,35 @@ def build_dof_segments_p[
     # ── merge flags, parked in `seg_end`: does tree t join tree t+1? ──────
     for t in range(nt):
         seg_end[unsafe_offset=t] = Scalar[DTYPE](0)
-    for e in range(num_edges):
+    return nt
+
+
+@always_inline
+def dof_segments_mark_p[
+    JO: MutOrigin,
+    SO: MutOrigin,
+    EO: MutOrigin, //,
+    DTYPE: DType,
+    J_AS: AddressSpace = AddressSpace.GENERIC,
+    S_AS: AddressSpace = AddressSpace.GENERIC,
+    SPARSE: Bool = False,
+    N_CAP: Int = 1,
+    IX_CAP: Int = 1,
+](
+    nv: Int,
+    e_first: Int,
+    e_step: Int,
+    num_edges: Int,
+    Je: Pointer[Scalar[DTYPE], JO, address_space=J_AS],
+    seg_start: Pointer[Scalar[DTYPE], SO, address_space=S_AS],
+    seg_end: Pointer[Scalar[DTYPE], EO, address_space=S_AS],
+    je_n: Scratch[Int, N_CAP] = Scratch[Int, N_CAP](1, fill=0),
+    je_ix: Scratch[Int, IX_CAP] = Scratch[Int, IX_CAP](1, fill=0),
+):
+    """Phase 2: rows `e_first, e_first + e_step, ...` mark the trees they
+    couple (`seg_end[t] = 1` for t in [lo, hi)). Every write is the same
+    value, so threads may split the rows between them."""
+    for e in range(e_first, num_edges, e_step):
         var lo = -1
         var hi = -1
         comptime if SPARSE:
@@ -197,6 +264,24 @@ def build_dof_segments_p[
         for t in range(lo, hi):
             seg_end[unsafe_offset=t] = Scalar[DTYPE](1)
 
+
+
+@always_inline
+def dof_segments_finish_p[
+    TO: MutOrigin,
+    SO: MutOrigin,
+    EO: MutOrigin, //,
+    DTYPE: DType,
+    T_AS: AddressSpace = AddressSpace.GENERIC,
+    S_AS: AddressSpace = AddressSpace.GENERIC,
+](
+    nt: Int,
+    trees: Pointer[Scalar[DTYPE], TO, address_space=T_AS],
+    seg_start: Pointer[Scalar[DTYPE], SO, address_space=S_AS],
+    seg_end: Pointer[Scalar[DTYPE], EO, address_space=S_AS],
+) -> Int:
+    """Phase 3: runs of merged trees become per-dof bounds. Returns the
+    segment count."""
     # ── runs of merged trees -> per-dof bounds, WALKED BACKWARDS ─────────
     #
     # ⚠⚠ REVERSE ORDER IS A CORRECTNESS REQUIREMENT, NOT A STYLE CHOICE.
