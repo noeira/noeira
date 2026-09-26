@@ -70,7 +70,8 @@ The legacy `ws_fnet_offset` comptime was declared but never read — dropped.
 from std.math import sqrt, pow, abs
 from std.sys import simd_width_of
 from std.time import perf_counter_ns
-from max.gpu import thread_idx, block_idx, block_dim
+from max.gpu import thread_idx, block_idx, block_dim, WARP_SIZE
+from max.gpu.primitives import warp
 from max.gpu.sync import barrier
 from max.gpu.memory import AddressSpace
 from .je_budget import je_spills, je_ws_size, newton_block_threads
@@ -6451,6 +6452,15 @@ def _newton_blocked_fields_kernel[
                 Jv_e[e_idx] = rebind[Scalar[DTYPE]](Jv_e_sh[e_idx])
 
         # --- Thread 0: gauss / p0 / line search / update / cost ---
+        comptime assert THREADS >= WARP_SIZE, (
+            "the line search runs in warp 0: the block must hold one"
+        )
+        var ls_decr = Scalar[DTYPE](0)
+        var ls_gauss_a = Scalar[DTYPE](0)
+        var ls_gauss_b = Scalar[DTYPE](0)
+        var ls_snorm = Scalar[DTYPE](0)
+        var ls_gtol = Scalar[DTYPE](0)
+        var ls_budget_f = Scalar[DTYPE](0)
         if valid_env and tid == 0:
             # ⚠ 3.11 termination (AUD-39, `NEWTON_312_CRITERIA`), the block
             # kernel's copy of the per-env twin at `:2216`. The Newton
@@ -6545,12 +6555,47 @@ def _newton_blocked_fields_kernel[
             var ls_budget = LINESEARCH_ITER
             if lsiter_rt > 0 and lsiter_rt < ls_budget:
                 ls_budget = lsiter_rt
-
+            # Hand the line to warp 0: `jar` is thread 0's copy, and the
+            # pyramidal setup never publishes it (the elliptic recompute does).
+            for e_idx in range(num_edges_b):
+                jar_sh[e_idx] = jar[e_idx]
+            ls_decr = Scalar[DTYPE](1) if decr_stop else Scalar[DTYPE](0)
+            ls_gauss_a = gauss_a
+            ls_gauss_b = gauss_b
+            ls_snorm = snorm
+            ls_gtol = gtol_b
+            ls_budget_f = Scalar[DTYPE](ls_budget)
+        barrier()
+        var alpha = Scalar[DTYPE](0)
+        var lsiter_b = 0
+        if valid_env and tid < WARP_SIZE:
+            var decr_stop = warp.shuffle_idx(ls_decr, 0) != Scalar[DTYPE](0)
+            var gauss_a = warp.shuffle_idx(ls_gauss_a, 0)
+            var gauss_b = warp.shuffle_idx(ls_gauss_b, 0)
+            var snorm = warp.shuffle_idx(ls_snorm, 0)
+            var gtol_b = warp.shuffle_idx(ls_gtol, 0)
+            var ls_budget = Int(warp.shuffle_idx(ls_budget_f, 0))
             # `PrimalEval` (engine_solver.c:1511): the SHIFTED line cost
             # `cost(a) - cost(0)` and BOTH derivatives in one pass, rows
             # RE-CLASSIFIED at the trial point. Mirrors `peval` in
             # `primal.mojo` — see that docstring for why the cost has to be
             # carried at every point rather than computed in the fallback.
+            # ⚠⚠ WARP 0 EVALUATES THE LINE, NOT THREAD 0 (2026-09-26). This
+            # region runs in all 32 lanes of warp 0 with IDENTICAL control
+            # flow: every value a branch reads is either broadcast from lane 0
+            # or produced by the reduction below, which ends in a broadcast. A
+            # lane takes contacts and rows strided by WARP_SIZE; the three sums
+            # are `warp.sum`s re-broadcast from lane 0, so no two lanes can
+            # disagree by a rounding and fork the search.
+            #
+            # Measured on so101_tower at 1024 lanes (RTX 5090, NEWTON timing
+            # probe): the line search was ~54% of the slowest env's solve —
+            # 119 serial evaluations at ~14 us each on thread 0.
+            #
+            # ⚠ NOT BIT-EXACT WITH THE SERIAL ORDER. The Gauss terms are added
+            # to the reduced row sums instead of seeding a running sum, and the
+            # rows are summed as a tree. The per-env CPU leg still sums
+            # serially; the two legs now agree to rounding, not to the bit.
             @always_inline
             def _bl_peval(
                 a: Scalar[DTYPE],
@@ -6559,39 +6604,41 @@ def _newton_blocked_fields_kernel[
                 mut d1: Scalar[DTYPE],
                 mut it: Int,
             ) {imm}:
-                c = Scalar[DTYPE](0.5) * gauss_a * a * a + gauss_b * a
-                d0 = gauss_a * a + gauss_b
-                d1 = gauss_a
+                var pc = Scalar[DTYPE](0)
+                var pd0 = Scalar[DTYPE](0)
+                var pd1 = Scalar[DTYPE](0)
                 comptime if IS_ELL:
-                    # The per-env leg's `peval`: every penetrating contact
-                    # through `ell_line_eval`, BEFORE the dense rows.
-                    for cc in range(nc):
+                    for cc in range(tid, nc, WARP_SIZE):
                         if rebind[Scalar[DTYPE]](cact_sh[cc]) == Scalar[DTYPE](0):
                             continue
                         _ell_contact_line_eval[DTYPE, NT](
                             cc, a, jar_sh, Jv_e_sh, De_sh, fr_e_sh, mu_sh,
-                            ntc_sh, c, d0, d1,
+                            ntc_sh, pc, pd0, pd1,
                         )
-                for e_idx in range(dense0, num_edges_b):
+                for e_idx in range(dense0 + tid, num_edges_b, WARP_SIZE):
                     var kd = Int(rebind[Scalar[DTYPE]](kind_e_sh[e_idx]))
                     var Rd = rebind[Scalar[DTYPE]](R_e_sh[e_idx])
                     var fd = rebind[Scalar[DTYPE]](floss_e_sh[e_idx])
                     var Dd = rebind[Scalar[DTYPE]](De_sh[e_idx])
-                    var jt = jar[e_idx] + a * Jv_e[e_idx]
+                    var j0 = rebind[Scalar[DTYPE]](jar_sh[e_idx])
+                    var jv = rebind[Scalar[DTYPE]](Jv_e_sh[e_idx])
+                    var jt = j0 + a * jv
                     var st = scalar_row_state[DTYPE](kd, jt, Rd, fd)
                     # ⚠ THE alpha=0 REFERENCE IS RE-DERIVED FROM `jar`, not
-                    # read from `state_e_sh`. `PrimalEval` evaluates the line
-                    # at `Jaref + alpha*Jv` for alpha=0 like any other alpha,
-                    # and the stored state is one Newton move stale.
-                    var st0 = scalar_row_state[DTYPE](kd, jar[e_idx], Rd, fd)
-                    c += scalar_row_cost[DTYPE](
+                    # read from `state_e_sh` — see the serial form's note.
+                    var st0 = scalar_row_state[DTYPE](kd, j0, Rd, fd)
+                    pc += scalar_row_cost[DTYPE](
                         st, jt, Dd, Rd, fd
-                    ) - scalar_row_cost[DTYPE](st0, jar[e_idx], Dd, Rd, fd)
-                    d0 += (
-                        -scalar_row_force[DTYPE](st, jt, Dd, fd) * Jv_e[e_idx]
-                    )
+                    ) - scalar_row_cost[DTYPE](st0, j0, Dd, Rd, fd)
+                    pd0 += -scalar_row_force[DTYPE](st, jt, Dd, fd) * jv
                     if st == SROW_QUADRATIC:
-                        d1 += Dd * Jv_e[e_idx] * Jv_e[e_idx]
+                        pd1 += Dd * jv * jv
+                var sc = warp.shuffle_idx(warp.sum(pc), 0)
+                var sd0 = warp.shuffle_idx(warp.sum(pd0), 0)
+                var sd1 = warp.shuffle_idx(warp.sum(pd1), 0)
+                c = Scalar[DTYPE](0.5) * gauss_a * a * a + gauss_b * a + sc
+                d0 = gauss_a * a + gauss_b + sd0
+                d1 = gauss_a + sd1
                 if d1 <= Scalar[DTYPE](0):
                     d1 = Scalar[DTYPE](PRIMAL_MINVAL_GPU)
                 it += 1
@@ -6605,7 +6652,7 @@ def _newton_blocked_fields_kernel[
             # one leg start its search from a different derivative than the
             # other; blocked-GPU vs per-env-CPU `qacc` with the noslip pass OFF
             # went 1.06e-05 -> 6.26e-04 while they disagreed about it.
-            var lsiter_b = 0
+            lsiter_b = 0
             var p0_c = Scalar[DTYPE](0)
             var p0_d0 = Scalar[DTYPE](0)
             var p0_d1 = Scalar[DTYPE](0)
@@ -6630,7 +6677,7 @@ def _newton_blocked_fields_kernel[
                 _bl_peval(Scalar[DTYPE](0), p0_c, p0_d0, p0_d1, lsiter_b)
                 gtol_b = ls_gtol_dtype_floor[DTYPE](gtol_b, p0_d0)
 
-            var alpha: Scalar[DTYPE] = 0
+            alpha = Scalar[DTYPE](0)
             if not decr_stop and snorm >= Scalar[DTYPE](PRIMAL_MINVAL_GPU):
                 # Phase 1: always attempt one Newton step on the line.
                 var p1_a = -p0_d0 / p0_d1
@@ -6790,6 +6837,7 @@ def _newton_blocked_fields_kernel[
             # appears TWICE: the per-env solver carries the same guard.
             # ⚠ UNCONDITIONAL since 2026-09-14: `META_IDX_LS_EVAL` is published
             # from this count below; under the report knob only, it read 0.
+        if valid_env and tid == 0:
             ls_evals += lsiter_b
             # `mj_solPrimal` breaks on `alpha == 0` EXACTLY
             # (engine_solver.c:2432) — a tiny nonzero step is taken, not
