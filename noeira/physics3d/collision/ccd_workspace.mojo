@@ -371,6 +371,69 @@ comptime COLL_CAND_REPORT: Bool = False
 # risk — it has simply not been measured there. The arm script's `nopre` arm
 # sets it False to A/B the old production.
 comptime COLL_PREFILTER: Bool = has_nvidia_gpu_accelerator()
+
+# ── The FLAT narrow phase (`broadphase_sap.detect_contacts_sap`), 2026-09-26 ─
+#
+# ⚠ OFF UNTIL MEASURED ON THE TARGET GPU. The block kernel runs an env's
+# candidates on the 32 lanes of ONE warp, and a warp's lanes on different
+# long pairs SERIALIZE: on so101_tower (1024 lanes, RTX 5090) the narrow
+# phase of an env measured 0.55x the SUM of its candidates' single-thread
+# times (correlation 0.978 over 1024 envs), because its ~2.5 penetrating
+# box/mesh pairs (43 us each after the hill-climb seed, up to 250) diverge
+# from each other. The kernel waits for the slowest env: 540 us of narrow
+# phase where the slowest single pair is 250.
+#
+# True replaces phase 2 with four launches:
+#   1. the block kernel with `FLAT_LIST`: poses, AABBs, the sweep, then the
+#      candidate list into `Data.coll_flat` — each candidate HOT (its pair's
+#      last measured narrow phase >= `COLL_FLAT_HOT_NS`, bucketed by cost) or
+#      cold — and return;
+#   2. `_sap_flat_prefix_kernel`, one block: the envs' lists into two flat
+#      queues, the hot one in DESCENDING cost bucket;
+#   3. `_sap_narrow_flat_kernel`, one warp per env slot: warp `w` runs hot
+#      tasks `w, w + W, ...` on ONE lane each (round robin over a descending
+#      order: a longest-first schedule), then cold tasks 32 to a warp;
+#      every task's time is written back as its pair's cost;
+#   4. `_sap_flat_output_kernel`: the block kernel's phase 3 on the list.
+# Simulated on the measured per-pair times: the narrow phase 540 -> ~250 us
+# with a longest-first order (~420 in arbitrary order). Contacts are the
+# block kernel's bit for bit: same narrow phase per candidate, same staging
+# windows, same compaction. Only WHICH warp and CCD row runs a pair changes.
+#
+# ⚠ The costs are timed with `perf_counter_ns` (the global timer) on NVIDIA
+# only; elsewhere nothing is ever hot and the path degrades to cold warps.
+comptime COLL_FLAT_NARROW: Bool = False
+comptime COLL_FLAT_HOT_NS: Int = 16384
+# hot cost buckets: [1, 2), [2, 4), [4, 8), [8, inf) x COLL_FLAT_HOT_NS
+comptime COLL_FLAT_NB: Int = 4
+# `Data.coll_flat`: one row per env, then a global block.
+#   row: [0] ncand [1] overflow [2] full (a window filled) [4..8) hot count per
+#   bucket [8] cold count | a, b, t per candidate | records written per
+#   candidate | the env's task list — hot bucket 3, 2, 1, 0, then cold in kind
+#   order | the per-pair cost (ns), keyed like the hill climb's warm slots
+comptime CF_NCAND: Int = 0
+comptime CF_OVERFLOW: Int = 1
+comptime CF_FULL: Int = 2
+comptime CF_NHOT: Int = 4
+comptime CF_NCOLD: Int = 8
+comptime CF_CAND: Int = 16
+comptime CF_CNT: Int = CF_CAND + 3 * COLL_NCAND_CAP
+comptime CF_LIST: Int = CF_CNT + COLL_NCAND_CAP
+comptime CF_COST: Int = CF_LIST + COLL_NCAND_CAP
+comptime CF_ROW: Int = CF_COST + HILL_WARM_SLOTS
+#   global, at `batch * CF_ROW`: [0] hot tasks [1] cold tasks, then the hot
+#   and the cold queue, `batch * COLL_NCAND_CAP` each; a task is
+#   `env * COLL_NCAND_CAP + candidate`.
+comptime CF_G_HDR: Int = 16
+
+
+def coll_flat_words(batch: Int) -> Int:
+    """`Data.coll_flat`'s length for `batch` envs — allocated whether the
+    path is on or not (~8 KB an env), so a gate can run both paths on one
+    `Data` and compare them."""
+    return batch * CF_ROW + CF_G_HDR + 2 * batch * COLL_NCAND_CAP
+
+
 comptime COLL_REPORT_HDR: Int = 11
 comptime COLL_REPORT_WORDS: Int = COLL_REPORT_HDR + COLL_NCAND_CAP
 

@@ -25,6 +25,7 @@ differs from O(N^2), which would shift existing bit-exact gates)."""
 from std.time import perf_counter_ns
 from std.math import sqrt, abs
 from std.bit import count_trailing_zeros
+from std.sys.info import is_nvidia_gpu
 from max.gpu import thread_idx, block_idx, block_dim
 from max.gpu.host import DeviceContext
 from layout import Layout, LayoutTensor
@@ -167,6 +168,9 @@ def _hf_len(n: Int) -> Int:
 
 
 from .ccd_workspace import (
+    COLL_FLAT_NARROW, COLL_FLAT_HOT_NS, coll_flat_words,
+    CF_NCAND, CF_OVERFLOW, CF_FULL, CF_NHOT, CF_NCOLD, CF_CAND, CF_CNT,
+    CF_LIST, CF_COST, CF_ROW, CF_G_HDR,
     CCD_WS_SIZE, COLL_TPB, COLL_CCD_LANES, COLL_NCAND_CAP, COLL_STAGE_MAXC,
     HILL_WARM_ACROSS_STEPS, HILL_WARM_SLOTS, HW_WS_OFF,
     COLL_STAGE_SLOTS, COLL_BLOCK_KERNEL, COLL_NO_FALLBACK,
@@ -3282,6 +3286,234 @@ def _sap_pair_listable[
     )
 
 
+@always_inline
+def _sap_block_candidate[
+    DTYPE: DType,
+    BATCH: Int,
+    D: DimsLike,
+    EX_CAP: Int,
+    L_GEOMS: Layout,
+    L_BODIES: Layout,
+    L_MMETA: Layout,
+    L_EXCLUDES: Layout,
+    L_PAIRS: Layout,
+    L_MESH_META: Layout,
+    L_MESH_VERTS: Layout,
+    L_MESH_POLYS: Layout,
+    L_MESH_POLYVERT: Layout,
+    L_MESH_VERT_POLYMAP: Layout,
+    L_MESH_VERT_EDGEADR: Layout,
+    L_MESH_EDGES: Layout,
+    L_HF_META: Layout,
+    L_HF_DATA: Layout,
+    L_STAGE: Layout,
+    L_WS: Layout,
+](
+    env: Int,
+    wrow: Int,
+    hw_row: Int,
+    dims: D,
+    a: Int,
+    b: Int,
+    t: Int,
+    start: Int,
+    a_px: Scalar[DTYPE], a_py: Scalar[DTYPE], a_pz: Scalar[DTYPE],
+    a_qx: Scalar[DTYPE], a_qy: Scalar[DTYPE], a_qz: Scalar[DTYPE],
+    a_qw: Scalar[DTYPE],
+    b_px: Scalar[DTYPE], b_py: Scalar[DTYPE], b_pz: Scalar[DTYPE],
+    b_qx: Scalar[DTYPE], b_qy: Scalar[DTYPE], b_qz: Scalar[DTYPE],
+    b_qw: Scalar[DTYPE],
+    # geom `a`'s body / contype / conaffinity — read by a PLANE candidate only
+    a_body: Int,
+    a_contype: Int,
+    a_conaffinity: Int,
+    nbody: Int,
+    ex_sig: Scratch[Int, EX_CAP],
+    n_sig: Int,
+    mut pr: _SapProbe,
+    ccd_tol: Scalar[DTYPE],
+    ccd_iter: Int,
+    multiccd_off: Bool,
+    geoms: LayoutTensor[DTYPE, L_GEOMS, MutAnyOrigin],
+    bodies: LayoutTensor[DTYPE, L_BODIES, MutAnyOrigin],
+    mmeta: LayoutTensor[DTYPE, L_MMETA, MutAnyOrigin],
+    excludes: LayoutTensor[DTYPE, L_EXCLUDES, MutAnyOrigin],
+    pairs: LayoutTensor[DTYPE, L_PAIRS, MutAnyOrigin],
+    mesh_meta: LayoutTensor[DTYPE, L_MESH_META, MutAnyOrigin],
+    mesh_verts: LayoutTensor[DTYPE, L_MESH_VERTS, MutAnyOrigin],
+    mesh_polys: LayoutTensor[DTYPE, L_MESH_POLYS, MutAnyOrigin],
+    mesh_polyvert: LayoutTensor[DTYPE, L_MESH_POLYVERT, MutAnyOrigin],
+    mesh_polymap: LayoutTensor[DTYPE, L_MESH_POLYVERT, MutAnyOrigin],
+    mesh_vert_polymap: LayoutTensor[DTYPE, L_MESH_VERT_POLYMAP, MutAnyOrigin],
+    mesh_vert_edgeadr: LayoutTensor[DTYPE, L_MESH_VERT_EDGEADR, MutAnyOrigin],
+    mesh_edges: LayoutTensor[DTYPE, L_MESH_EDGES, MutAnyOrigin],
+    hfield_meta: LayoutTensor[DTYPE, L_HF_META, MutAnyOrigin],
+    hfield_data: LayoutTensor[DTYPE, L_HF_DATA, MutAnyOrigin],
+    stage: LayoutTensor[DTYPE, L_STAGE, MutAnyOrigin],
+    ccd_ws: LayoutTensor[DTYPE, L_WS, MutAnyOrigin],
+) -> Int:
+    """One listed candidate's narrow phase into its staging window
+    `stage[env, start ..]`; returns the records it wrote.
+
+    ⚠ ONE DISPATCH FOR BOTH GPU LAYOUTS. The block kernel's phase 2 runs a
+    candidate on the thread of its lane, the flat narrow phase
+    (`COLL_FLAT_NARROW`) on a lane of whatever warp its queue hands it to;
+    both call this, so the plane/pair split and its arguments exist once.
+    `t < 0` is a plane candidate (`a` the plane), as the listing writes it."""
+    var num_contacts = start
+    var win_end = start + COLL_STAGE_MAXC
+    if t < 0:
+        # the plane's own data, as the serial loop head computes it once per
+        # plane
+        var pn = plane_world_normal[DTYPE](a_qx, a_qy, a_qz, a_qw)
+        _sap_plane_narrow[
+            DTYPE, BATCH, D, EX_CAP, HFIELD_ENABLED=False
+        ](
+            env, env, wrow, dims, a, b, a_body, a_contype, a_conaffinity,
+            a_px, a_py, a_pz, a_qx, a_qy, a_qz, a_qw,
+            pn, nbody, win_end, ex_sig, n_sig, pr, num_contacts,
+            b_px, b_py, b_pz, b_qx, b_qy, b_qz, b_qw,
+            geoms, bodies, mmeta, excludes, pairs, mesh_meta, mesh_verts, mesh_vert_edgeadr, mesh_edges, stage, ccd_ws,
+            hw_row=hw_row,
+        )
+    else:
+        _sap_pair_narrow[
+            DTYPE, BATCH, D, EX_CAP, HFIELD_ENABLED=False
+        ](
+            env, env, wrow, dims, a, b, t, nbody, win_end,
+            ex_sig, n_sig, pr, num_contacts,
+            a_px, a_py, a_pz, a_qx, a_qy, a_qz, a_qw,
+            b_px, b_py, b_pz, b_qx, b_qy, b_qz, b_qw,
+            ccd_tol, ccd_iter, multiccd_off,
+            geoms, bodies, mmeta, excludes, pairs, mesh_meta, mesh_verts, mesh_polys, mesh_polyvert, mesh_polymap, mesh_vert_polymap, mesh_vert_edgeadr, mesh_edges, hfield_meta, hfield_data, stage, ccd_ws,
+            hw_row=hw_row,
+        )
+    return num_contacts - start
+
+
+@always_inline
+def _sap_block_output[
+    DTYPE: DType,
+    NC: Int,
+    L_STAGE: Layout,
+    L_CONTACTS: Layout,
+    L_SMETA: Layout,
+](
+    env: Int,
+    tid: Int,
+    ncand: Int,
+    max_contacts: Int,
+    nbody: Int,
+    cand_sh: LayoutTensor[
+        DTYPE, Layout.row_major(6 * NC), MutAnyOrigin,
+        address_space=AddressSpace.SHARED,
+    ],
+    sk_sh: LayoutTensor[
+        DTYPE, Layout.row_major(NC), MutAnyOrigin,
+        address_space=AddressSpace.SHARED,
+    ],
+    ctrl_sh: LayoutTensor[
+        DTYPE, Layout.row_major(8), MutAnyOrigin,
+        address_space=AddressSpace.SHARED,
+    ],
+    stage: LayoutTensor[DTYPE, L_STAGE, MutAnyOrigin],
+    contacts: LayoutTensor[DTYPE, L_CONTACTS, MutAnyOrigin],
+    smeta: LayoutTensor[DTYPE, L_SMETA, MutAnyOrigin],
+):
+    """The block kernel's phase 3 — offsets (thread 0), the MuJoCo-order sort
+    as ranks, the copy, `ncon` — on EVERY thread of the block (it barriers).
+
+    Reads, per candidate `c < ncand`: its staging start (records) at
+    `cand_sh[3*NC + c]` and its record count at `cand_sh[5*NC + c]`;
+    `ctrl_sh[1] != 0` sends the env to the serial fallback. The fused block
+    kernel calls it after its own phase 2, the flat narrow phase's compaction
+    kernel (`COLL_FLAT_NARROW`) after loading the same slots from
+    `Data.coll_flat` — one output rule for both."""
+    if tid == 0:
+        if Int(rebind[Scalar[DTYPE]](ctrl_sh[1])) != 0:
+            # ⚠ THE FALLBACK IS A SECOND LAUNCH, NOT A CALL. Calling the
+            # serial per-env function from here put a SECOND copy of the
+            # narrow phase in this kernel, and on Metal that corrupted the
+            # FIRST: the plane-mesh fixture came back with three contacts
+            # instead of one, the third one different between two runs —
+            # the per-thread miscompute `feedback_metal_wide_per_thread_
+            # inlinearray_miscompute` records, with no crash. With one copy
+            # per kernel the block path is bit-exact. So this env is MARKED
+            # (`ncon = -1`) and `detect_contacts_sap` launches the serial
+            # kernel with `ONLY_FLAGGED=True` right after, which runs it for
+            # marked envs only and overwrites the mark with the real count.
+            smeta[env, META_IDX_NUM_CONTACTS] = Scalar[DTYPE](-1)
+            ctrl_sh[3] = Scalar[DTYPE](0)
+        else:
+            # Destination offset per candidate: a prefix over the counts,
+            # capped at `max_contacts` contact by contact (the serial guard's
+            # semantics), parked in the candidate list's thread slot, which
+            # is done with.
+            var n = 0
+            for c in range(ncand):
+                var cnt = Int(rebind[Scalar[DTYPE]](cand_sh[5 * NC + c]))
+                if n + cnt > max_contacts:
+                    cnt = max_contacts - n
+                    cand_sh[5 * NC + c] = Scalar[DTYPE](cnt)
+                cand_sh[4 * NC + c] = Scalar[DTYPE](n)
+                n += cnt
+            ctrl_sh[3] = Scalar[DTYPE](n)
+    barrier()
+    # ⚠ THE MuJoCo-ORDER SORT IS A RANK, NOT AN INSERTION SORT ON THREAD 0
+    # (2026-09-26). `sort_contacts_mujoco_order` orders the compacted array
+    # STABLY by body pair; every contact of a candidate carries the same pair
+    # (one geom pair), so that order is the candidates' own, stably by pair,
+    # each keeping its records in narrow-phase order. So each candidate's
+    # destination is the count of contacts of the candidates ahead of it —
+    # smaller pair, or the same pair listed earlier — and the copy lands the
+    # records sorted. Thread 0 moved whole records in global memory, O(n^2)
+    # on a crowded env (152 us at the tower's worst). The key is read from
+    # the candidate's first staged record, the field the sort itself reads.
+    var fb = Int(rebind[Scalar[DTYPE]](ctrl_sh[1])) != 0
+    if not fb:
+        for c in range(tid, ncand, COLL_TPB):
+            var key = Scalar[DTYPE](-1)
+            if Int(rebind[Scalar[DTYPE]](cand_sh[5 * NC + c])) > 0:
+                var r0 = Int(rebind[Scalar[DTYPE]](cand_sh[3 * NC + c])) * CONTACT_SIZE
+                var ba = Int(rebind[Scalar[DTYPE]](stage[env, r0 + CONTACT_IDX_BODY_A]))
+                var bb = Int(rebind[Scalar[DTYPE]](stage[env, r0 + CONTACT_IDX_BODY_B]))
+                if ba < 0:
+                    ba = 0
+                if bb < 0:
+                    bb = 0
+                var lo = ba if ba < bb else bb
+                var hi = bb if ba < bb else ba
+                key = Scalar[DTYPE](lo * (nbody + 1) + hi)
+            sk_sh[c] = key
+    barrier()
+    if not fb:
+        for c in range(tid, ncand, COLL_TPB):
+            var k_c = rebind[Scalar[DTYPE]](sk_sh[c])
+            var dst = 0
+            for c2 in range(ncand):
+                var k2 = rebind[Scalar[DTYPE]](sk_sh[c2])
+                if k2 < k_c or (k2 == k_c and c2 < c):
+                    dst += Int(rebind[Scalar[DTYPE]](cand_sh[5 * NC + c2]))
+            cand_sh[4 * NC + c] = Scalar[DTYPE](dst)
+    barrier()
+    # Every thread copies records; the order is fixed by the offsets.
+    var n_out = Int(rebind[Scalar[DTYPE]](ctrl_sh[3]))
+    if not fb:
+        for c in range(ncand):
+            var start = Int(rebind[Scalar[DTYPE]](cand_sh[3 * NC + c]))
+            var cnt = Int(rebind[Scalar[DTYPE]](cand_sh[5 * NC + c]))
+            var dst0 = Int(rebind[Scalar[DTYPE]](cand_sh[4 * NC + c]))
+            for q in range(tid, cnt * CONTACT_SIZE, COLL_TPB):
+                var k = q // CONTACT_SIZE
+                var f = q - k * CONTACT_SIZE
+                contacts[env, (dst0 + k) * CONTACT_SIZE + f] = rebind[
+                    Scalar[DTYPE]
+                ](stage[env, (start + k) * CONTACT_SIZE + f])
+    barrier()
+    if tid == 0 and not fb:
+        smeta[env, META_IDX_NUM_CONTACTS] = Scalar[DTYPE](n_out)
+
+
 def _detect_contacts_sap_block_kernel[
     DTYPE: DType,
     NQ: Int,
@@ -3296,6 +3528,8 @@ def _detect_contacts_sap_block_kernel[
     # Appended rather than grouped with NEXCLUDE — see `fields.Model`.
     NPAIR: Int,
     NHFIELD_DATA: Int,
+    # List the candidates into `coll_flat` and return (`COLL_FLAT_NARROW`).
+    FLAT_LIST: Bool = False,
 ](
     xpos: LayoutTensor[
         DTYPE, Layout.row_major(BATCH, NBODY * 3), MutAnyOrigin
@@ -3367,6 +3601,10 @@ def _detect_contacts_sap_block_kernel[
     stage: LayoutTensor[
         DTYPE, Layout.row_major(BATCH, COLL_STAGE_SLOTS * CONTACT_SIZE),
         MutAnyOrigin,
+    ],
+    # `Data.coll_flat` — read and written only with `FLAT_LIST`
+    coll_flat: LayoutTensor[
+        DTYPE, Layout.row_major(coll_flat_words(BATCH)), MutAnyOrigin
     ],
 ):
     """ONE BLOCK PER ENV, `COLL_TPB` threads over the candidate pairs.
@@ -3867,262 +4105,720 @@ def _detect_contacts_sap_block_kernel[
             smeta[env, META_IDX_NUM_CONTACTS] = Scalar[DTYPE](0)
         return
 
-    # ── phase 2: the candidates in kind order, COLL_TPB per round ────────
-    if overflow == 0:
-        var ccd_tol = rebind[Scalar[DTYPE]](mmeta[MODEL_META_IDX_CCD_TOLERANCE])
-        if ccd_tol <= 0:
-            ccd_tol = Scalar[DTYPE](MJ_CCD_TOLERANCE)
-        var ccd_iter = Int(
-            rebind[Scalar[DTYPE]](mmeta[MODEL_META_IDX_CCD_ITERATIONS])
+    comptime if FLAT_LIST:
+        comptime assert not (
+            COLL_TIMING or COLL_CAND_REPORT or COLL_STOP_AFTER != 0
+        ), (
+            "the flat narrow phase has no timing / report / stop instrument:"
+            " time its kernels with nsys"
         )
-        if ccd_iter < 1:
-            ccd_iter = MJ_CCD_ITERATIONS
-        var multiccd_off = (
-            rebind[Scalar[DTYPE]](mmeta[MODEL_META_IDX_MULTICCD_DISABLED]) != 0
+        _sap_flat_list_env[DTYPE, NC, BATCH](
+            env, tid, ncand, overflow, cand_sh, ord_sh, coll_flat
         )
-        var pr = _SapProbe()
-        # Every thread its own CCD row; the warm slots on the env's first.
-        comptime assert COLL_CCD_LANES == COLL_TPB, (
-            "the block collision kernel gives every thread a CCD row:"
-            " COLL_CCD_LANES must equal COLL_TPB (ccd_workspace.mojo)"
-        )
-        var wrow = env * COLL_CCD_LANES + tid
-        var hw_row = env * COLL_CCD_LANES
-        var full = 0
-        var _lane_t0: Int = 0
-        var _lane_n = 0
-        var _lane_max: Int = 0
-        var _lane_max_key = -1
-        comptime if COLL_TIMING:
-            _lane_t0 = perf_counter_ns()
-        for p in range(tid, ncand, COLL_TPB):
-            var c = Int(rebind[Scalar[DTYPE]](ord_sh[p]))
-            var _c_t0: Int = 0
-            comptime if COLL_TIMING:
-                _c_t0 = perf_counter_ns()
-            var a = Int(rebind[Scalar[DTYPE]](cand_sh[0 * NC + c]))
-            var b = Int(rebind[Scalar[DTYPE]](cand_sh[1 * NC + c]))
-            var t = Int(rebind[Scalar[DTYPE]](cand_sh[2 * NC + c]))
-            var start = Int(rebind[Scalar[DTYPE]](cand_sh[3 * NC + c]))
-            var num_contacts = start
-            var win_end = start + COLL_STAGE_MAXC
-            var a_px = rebind[Scalar[DTYPE]](wp_sh[0 * NG + a])
-            var a_py = rebind[Scalar[DTYPE]](wp_sh[1 * NG + a])
-            var a_pz = rebind[Scalar[DTYPE]](wp_sh[2 * NG + a])
-            var a_qx = rebind[Scalar[DTYPE]](wp_sh[3 * NG + a])
-            var a_qy = rebind[Scalar[DTYPE]](wp_sh[4 * NG + a])
-            var a_qz = rebind[Scalar[DTYPE]](wp_sh[5 * NG + a])
-            var a_qw = rebind[Scalar[DTYPE]](wp_sh[6 * NG + a])
-            var b_px = rebind[Scalar[DTYPE]](wp_sh[0 * NG + b])
-            var b_py = rebind[Scalar[DTYPE]](wp_sh[1 * NG + b])
-            var b_pz = rebind[Scalar[DTYPE]](wp_sh[2 * NG + b])
-            var b_qx = rebind[Scalar[DTYPE]](wp_sh[3 * NG + b])
-            var b_qy = rebind[Scalar[DTYPE]](wp_sh[4 * NG + b])
-            var b_qz = rebind[Scalar[DTYPE]](wp_sh[5 * NG + b])
-            var b_qw = rebind[Scalar[DTYPE]](wp_sh[6 * NG + b])
-            if t < 0:
-                # a plane candidate: the plane's own data, as the serial loop
-                # head computes it once per plane
-                var gi_body = Int(rebind[Scalar[DTYPE]](gf_sh[1 * NG + a]))
-                var gi_contype = Int(rebind[Scalar[DTYPE]](gf_sh[2 * NG + a]))
-                var gi_conaffinity = Int(rebind[Scalar[DTYPE]](gf_sh[3 * NG + a]))
-                var pn = plane_world_normal[DTYPE](a_qx, a_qy, a_qz, a_qw)
-                _sap_plane_narrow[
-                    DTYPE, BATCH, type_of(dims), EX_CAP, HFIELD_ENABLED=False
-                ](
-                    env, env, wrow, dims, a, b, gi_body, gi_contype, gi_conaffinity,
-                    a_px, a_py, a_pz, a_qx, a_qy, a_qz, a_qw,
-                    pn, nbody, win_end, ex_sig, n_sig, pr, num_contacts,
-                    b_px, b_py, b_pz, b_qx, b_qy, b_qz, b_qw,
-                    geoms, bodies, mmeta, excludes, pairs, mesh_meta, mesh_verts, mesh_vert_edgeadr, mesh_edges, stage, ccd_ws,
-                    hw_row=hw_row,
-                )
-            else:
-                _sap_pair_narrow[
-                    DTYPE, BATCH, type_of(dims), EX_CAP, HFIELD_ENABLED=False
-                ](
-                    env, env, wrow, dims, a, b, t, nbody, win_end,
-                    ex_sig, n_sig, pr, num_contacts,
-                    a_px, a_py, a_pz, a_qx, a_qy, a_qz, a_qw,
-                    b_px, b_py, b_pz, b_qx, b_qy, b_qz, b_qw,
-                    ccd_tol, ccd_iter, multiccd_off,
-                    geoms, bodies, mmeta, excludes, pairs, mesh_meta, mesh_verts, mesh_polys, mesh_polyvert, mesh_polymap, mesh_vert_polymap, mesh_vert_edgeadr, mesh_edges, hfield_meta, hfield_data, stage, ccd_ws,
-                    hw_row=hw_row,
-                )
-            var cnt = num_contacts - start
-            if cnt >= COLL_STAGE_MAXC:
-                full = 1
-            cand_sh[5 * NC + c] = Scalar[DTYPE](cnt)
-            comptime if COLL_TIMING:
-                var _c_dt = perf_counter_ns() - _c_t0
-                _lane_n += 1
-                if _c_dt > _lane_max:
-                    _lane_max = _c_dt
-                    _lane_max_key = Int(rebind[Scalar[DTYPE]](cand_sh[4 * NC + c]))
-        comptime if COLL_TIMING:
-            stage[env, COLL_REPORT_BASE + 8 + 4 * tid + 0] = Scalar[DTYPE](Int(perf_counter_ns() - _lane_t0))
-            stage[env, COLL_REPORT_BASE + 8 + 4 * tid + 1] = Scalar[DTYPE](_lane_n)
-            stage[env, COLL_REPORT_BASE + 8 + 4 * tid + 2] = Scalar[DTYPE](Int(_lane_max))
-            stage[env, COLL_REPORT_BASE + 8 + 4 * tid + 3] = Scalar[DTYPE](_lane_max_key)
-        if full == 1:
-            ctrl_sh[1] = Scalar[DTYPE](1)
-    barrier()
-    comptime if COLL_TIMING:
-        _tt3 = perf_counter_ns()
-    comptime if COLL_STOP_AFTER == 3:
-        if tid == 0:
-            smeta[env, META_IDX_NUM_CONTACTS] = Scalar[DTYPE](0)
-        return
-
-    # ── phase 3: offsets (thread 0), the sort as ranks, the copy, ncon ────
-    if tid == 0:
-        if Int(rebind[Scalar[DTYPE]](ctrl_sh[1])) != 0:
-            # ⚠ THE FALLBACK IS A SECOND LAUNCH, NOT A CALL. Calling the
-            # serial per-env function from here put a SECOND copy of the
-            # narrow phase in this kernel, and on Metal that corrupted the
-            # FIRST: the plane-mesh fixture came back with three contacts
-            # instead of one, the third one different between two runs —
-            # the per-thread miscompute `feedback_metal_wide_per_thread_
-            # inlinearray_miscompute` records, with no crash. With one copy
-            # per kernel the block path is bit-exact. So this env is MARKED
-            # (`ncon = -1`) and `detect_contacts_sap` launches the serial
-            # kernel with `ONLY_FLAGGED=True` right after, which runs it for
-            # marked envs only and overwrites the mark with the real count.
-            smeta[env, META_IDX_NUM_CONTACTS] = Scalar[DTYPE](-1)
-            ctrl_sh[3] = Scalar[DTYPE](0)
-        else:
-            # Destination offset per candidate: a prefix over the counts,
-            # capped at `max_contacts` contact by contact (the serial guard's
-            # semantics), parked in the candidate list's thread slot, which
-            # is done with.
-            var n = 0
-            for c in range(ncand):
-                var cnt = Int(rebind[Scalar[DTYPE]](cand_sh[5 * NC + c]))
-                if n + cnt > max_contacts:
-                    cnt = max_contacts - n
-                    cand_sh[5 * NC + c] = Scalar[DTYPE](cnt)
-                cand_sh[4 * NC + c] = Scalar[DTYPE](n)
-                n += cnt
-            ctrl_sh[3] = Scalar[DTYPE](n)
-    barrier()
-    # ⚠ THE MuJoCo-ORDER SORT IS A RANK, NOT AN INSERTION SORT ON THREAD 0
-    # (2026-09-26). `sort_contacts_mujoco_order` orders the compacted array
-    # STABLY by body pair; every contact of a candidate carries the same pair
-    # (one geom pair), so that order is the candidates' own, stably by pair,
-    # each keeping its records in narrow-phase order. So each candidate's
-    # destination is the count of contacts of the candidates ahead of it —
-    # smaller pair, or the same pair listed earlier — and the copy lands the
-    # records sorted. Thread 0 moved whole records in global memory, O(n^2)
-    # on a crowded env (152 us at the tower's worst). The key is read from
-    # the candidate's first staged record, the field the sort itself reads.
-    var fb = Int(rebind[Scalar[DTYPE]](ctrl_sh[1])) != 0
-    if not fb:
-        for c in range(tid, ncand, COLL_TPB):
-            var key = Scalar[DTYPE](-1)
-            if Int(rebind[Scalar[DTYPE]](cand_sh[5 * NC + c])) > 0:
-                var r0 = Int(rebind[Scalar[DTYPE]](cand_sh[3 * NC + c])) * CONTACT_SIZE
-                var ba = Int(rebind[Scalar[DTYPE]](stage[env, r0 + CONTACT_IDX_BODY_A]))
-                var bb = Int(rebind[Scalar[DTYPE]](stage[env, r0 + CONTACT_IDX_BODY_B]))
-                if ba < 0:
-                    ba = 0
-                if bb < 0:
-                    bb = 0
-                var lo = ba if ba < bb else bb
-                var hi = bb if ba < bb else ba
-                key = Scalar[DTYPE](lo * (nbody + 1) + hi)
-            sk_sh[c] = key
-    barrier()
-    if not fb:
-        for c in range(tid, ncand, COLL_TPB):
-            var k_c = rebind[Scalar[DTYPE]](sk_sh[c])
-            var dst = 0
-            for c2 in range(ncand):
-                var k2 = rebind[Scalar[DTYPE]](sk_sh[c2])
-                if k2 < k_c or (k2 == k_c and c2 < c):
-                    dst += Int(rebind[Scalar[DTYPE]](cand_sh[5 * NC + c2]))
-            cand_sh[4 * NC + c] = Scalar[DTYPE](dst)
-    barrier()
-    # Every thread copies records; the order is fixed by the offsets.
-    var n_out = Int(rebind[Scalar[DTYPE]](ctrl_sh[3]))
-    if not fb:
-        for c in range(ncand):
-            var start = Int(rebind[Scalar[DTYPE]](cand_sh[3 * NC + c]))
-            var cnt = Int(rebind[Scalar[DTYPE]](cand_sh[5 * NC + c]))
-            var dst0 = Int(rebind[Scalar[DTYPE]](cand_sh[4 * NC + c]))
-            for q in range(tid, cnt * CONTACT_SIZE, COLL_TPB):
-                var k = q // CONTACT_SIZE
-                var f = q - k * CONTACT_SIZE
-                contacts[env, (dst0 + k) * CONTACT_SIZE + f] = rebind[
-                    Scalar[DTYPE]
-                ](stage[env, (start + k) * CONTACT_SIZE + f])
-    barrier()
-    if tid == 0 and not fb:
-        smeta[env, META_IDX_NUM_CONTACTS] = Scalar[DTYPE](n_out)
-    comptime if COLL_TIMING:
-        if tid == 0:
-            var _tt4 = perf_counter_ns()
-            stage[env, COLL_REPORT_BASE + 0] = Scalar[DTYPE](Int(_tt1 - _tt0))
-            stage[env, COLL_REPORT_BASE + 1] = Scalar[DTYPE](Int(_tt2 - _tt1))
-            stage[env, COLL_REPORT_BASE + 2] = Scalar[DTYPE](Int(_tt3 - _tt2))
-            stage[env, COLL_REPORT_BASE + 3] = Scalar[DTYPE](Int(_tt4 - _tt3))
-            stage[env, COLL_REPORT_BASE + 4] = Scalar[DTYPE](Int(_tt4 - _tt0))
-
-    # ── `COLL_CAND_REPORT`: the candidate list, into the dead staging tail ──
-    # After the compaction above nothing reads `stage` until the next
-    # launch's phase 2 writes it again, so `contacts` / `ncon` are unchanged.
-    # The kind key is RECOMPUTED from the candidate's geom types, because
-    # phase 3 reused the key slot for the destination offset; `ord_sh`
-    # (the phase-2 order) is untouched by phase 3.
-    comptime if COLL_CAND_REPORT:
-        comptime assert COLL_BLOCK_KERNEL, (
-            "COLL_CAND_REPORT reports the BLOCK kernel's candidate list"
-        )
-        if tid == 0:
-            comptime RB = COLL_REPORT_BASE
-            stage[env, RB + 0] = Scalar[DTYPE](ncand)
-            stage[env, RB + 1] = Scalar[DTYPE](overflow)
-            stage[env, RB + 2] = Scalar[DTYPE](
-                Int(rebind[Scalar[DTYPE]](ctrl_sh[1]))
-            )
-            stage[env, RB + 3] = smeta[env, META_IDX_NUM_CONTACTS]
-            stage[env, RB + 4] = Scalar[DTYPE](rep_sap_n)
-            stage[env, RB + 5] = Scalar[DTYPE](rep_tests)
-            stage[env, RB + 6] = Scalar[DTYPE](rep_shifts)
-            stage[env, RB + 7] = Scalar[DTYPE](COLL_TPB)
-            stage[env, RB + 8] = Scalar[DTYPE](rep_aabb_all)
-            stage[env, RB + 9] = Scalar[DTYPE](rep_survive)
-            stage[env, RB + 10] = Scalar[DTYPE](rep_planes)
-            for p in range(COLL_NCAND_CAP):
-                var key = -1
-                if p < ncand:
-                    var c = Int(rebind[Scalar[DTYPE]](ord_sh[p]))
-                    var a = Int(rebind[Scalar[DTYPE]](cand_sh[0 * NC + c]))
-                    var b = Int(rebind[Scalar[DTYPE]](cand_sh[1 * NC + c]))
-                    var t = Int(rebind[Scalar[DTYPE]](cand_sh[2 * NC + c]))
-                    var rb_ = mj_geom_type_rank(
-                        Int(rebind[Scalar[DTYPE]](gf_sh[0 * NG + b]))
-                    )
-                    if t < 0:
-                        key = _KIND_PLANE_BASE + rb_
-                    else:
-                        var ra = mj_geom_type_rank(
-                            Int(rebind[Scalar[DTYPE]](gf_sh[0 * NG + a]))
-                        )
-                        key = ra * 8 + rb_ if ra <= rb_ else rb_ * 8 + ra
-                stage[env, RB + COLL_REPORT_HDR + p] = Scalar[DTYPE](key)
-    else:
         _ = rep_tests
         _ = rep_shifts
         _ = rep_sap_n
         _ = rep_aabb_all
         _ = rep_survive
         _ = rep_planes
+    else:
+        # ── phase 2: the candidates in kind order, COLL_TPB per round ────────
+        if overflow == 0:
+            var ccd_tol = rebind[Scalar[DTYPE]](mmeta[MODEL_META_IDX_CCD_TOLERANCE])
+            if ccd_tol <= 0:
+                ccd_tol = Scalar[DTYPE](MJ_CCD_TOLERANCE)
+            var ccd_iter = Int(
+                rebind[Scalar[DTYPE]](mmeta[MODEL_META_IDX_CCD_ITERATIONS])
+            )
+            if ccd_iter < 1:
+                ccd_iter = MJ_CCD_ITERATIONS
+            var multiccd_off = (
+                rebind[Scalar[DTYPE]](mmeta[MODEL_META_IDX_MULTICCD_DISABLED]) != 0
+            )
+            var pr = _SapProbe()
+            # Every thread its own CCD row; the warm slots on the env's first.
+            comptime assert COLL_CCD_LANES == COLL_TPB, (
+                "the block collision kernel gives every thread a CCD row:"
+                " COLL_CCD_LANES must equal COLL_TPB (ccd_workspace.mojo)"
+            )
+            var wrow = env * COLL_CCD_LANES + tid
+            var hw_row = env * COLL_CCD_LANES
+            var full = 0
+            var _lane_t0: Int = 0
+            var _lane_n = 0
+            var _lane_max: Int = 0
+            var _lane_max_key = -1
+            comptime if COLL_TIMING:
+                _lane_t0 = perf_counter_ns()
+            for p in range(tid, ncand, COLL_TPB):
+                var c = Int(rebind[Scalar[DTYPE]](ord_sh[p]))
+                var _c_t0: Int = 0
+                comptime if COLL_TIMING:
+                    _c_t0 = perf_counter_ns()
+                var a = Int(rebind[Scalar[DTYPE]](cand_sh[0 * NC + c]))
+                var b = Int(rebind[Scalar[DTYPE]](cand_sh[1 * NC + c]))
+                var t = Int(rebind[Scalar[DTYPE]](cand_sh[2 * NC + c]))
+                var start = Int(rebind[Scalar[DTYPE]](cand_sh[3 * NC + c]))
+                var cnt = _sap_block_candidate[DTYPE, BATCH, EX_CAP=EX_CAP](
+                    env, wrow, hw_row, dims, a, b, t, start,
+                    rebind[Scalar[DTYPE]](wp_sh[0 * NG + a]),
+                    rebind[Scalar[DTYPE]](wp_sh[1 * NG + a]),
+                    rebind[Scalar[DTYPE]](wp_sh[2 * NG + a]),
+                    rebind[Scalar[DTYPE]](wp_sh[3 * NG + a]),
+                    rebind[Scalar[DTYPE]](wp_sh[4 * NG + a]),
+                    rebind[Scalar[DTYPE]](wp_sh[5 * NG + a]),
+                    rebind[Scalar[DTYPE]](wp_sh[6 * NG + a]),
+                    rebind[Scalar[DTYPE]](wp_sh[0 * NG + b]),
+                    rebind[Scalar[DTYPE]](wp_sh[1 * NG + b]),
+                    rebind[Scalar[DTYPE]](wp_sh[2 * NG + b]),
+                    rebind[Scalar[DTYPE]](wp_sh[3 * NG + b]),
+                    rebind[Scalar[DTYPE]](wp_sh[4 * NG + b]),
+                    rebind[Scalar[DTYPE]](wp_sh[5 * NG + b]),
+                    rebind[Scalar[DTYPE]](wp_sh[6 * NG + b]),
+                    Int(rebind[Scalar[DTYPE]](gf_sh[1 * NG + a])),
+                    Int(rebind[Scalar[DTYPE]](gf_sh[2 * NG + a])),
+                    Int(rebind[Scalar[DTYPE]](gf_sh[3 * NG + a])),
+                    nbody, ex_sig, n_sig, pr, ccd_tol, ccd_iter, multiccd_off,
+                    geoms, bodies, mmeta, excludes, pairs, mesh_meta, mesh_verts,
+                    mesh_polys, mesh_polyvert, mesh_polymap, mesh_vert_polymap,
+                    mesh_vert_edgeadr, mesh_edges, hfield_meta, hfield_data,
+                    stage, ccd_ws,
+                )
+                if cnt >= COLL_STAGE_MAXC:
+                    full = 1
+                cand_sh[5 * NC + c] = Scalar[DTYPE](cnt)
+                comptime if COLL_TIMING:
+                    var _c_dt = perf_counter_ns() - _c_t0
+                    _lane_n += 1
+                    if _c_dt > _lane_max:
+                        _lane_max = _c_dt
+                        _lane_max_key = Int(rebind[Scalar[DTYPE]](cand_sh[4 * NC + c]))
+            comptime if COLL_TIMING:
+                stage[env, COLL_REPORT_BASE + 8 + 4 * tid + 0] = Scalar[DTYPE](Int(perf_counter_ns() - _lane_t0))
+                stage[env, COLL_REPORT_BASE + 8 + 4 * tid + 1] = Scalar[DTYPE](_lane_n)
+                stage[env, COLL_REPORT_BASE + 8 + 4 * tid + 2] = Scalar[DTYPE](Int(_lane_max))
+                stage[env, COLL_REPORT_BASE + 8 + 4 * tid + 3] = Scalar[DTYPE](_lane_max_key)
+            if full == 1:
+                ctrl_sh[1] = Scalar[DTYPE](1)
+        barrier()
+        comptime if COLL_TIMING:
+            _tt3 = perf_counter_ns()
+        comptime if COLL_STOP_AFTER == 3:
+            if tid == 0:
+                smeta[env, META_IDX_NUM_CONTACTS] = Scalar[DTYPE](0)
+            return
+
+        # ── phase 3: offsets (thread 0), the sort as ranks, the copy, ncon ────
+        _sap_block_output[DTYPE, NC](
+            env, tid, ncand, max_contacts, nbody, cand_sh, sk_sh, ctrl_sh,
+            stage, contacts, smeta,
+        )
+        comptime if COLL_TIMING:
+            if tid == 0:
+                var _tt4 = perf_counter_ns()
+                stage[env, COLL_REPORT_BASE + 0] = Scalar[DTYPE](Int(_tt1 - _tt0))
+                stage[env, COLL_REPORT_BASE + 1] = Scalar[DTYPE](Int(_tt2 - _tt1))
+                stage[env, COLL_REPORT_BASE + 2] = Scalar[DTYPE](Int(_tt3 - _tt2))
+                stage[env, COLL_REPORT_BASE + 3] = Scalar[DTYPE](Int(_tt4 - _tt3))
+                stage[env, COLL_REPORT_BASE + 4] = Scalar[DTYPE](Int(_tt4 - _tt0))
+
+        # ── `COLL_CAND_REPORT`: the candidate list, into the dead staging tail ──
+        # After the compaction above nothing reads `stage` until the next
+        # launch's phase 2 writes it again, so `contacts` / `ncon` are unchanged.
+        # The kind key is RECOMPUTED from the candidate's geom types, because
+        # phase 3 reused the key slot for the destination offset; `ord_sh`
+        # (the phase-2 order) is untouched by phase 3.
+        comptime if COLL_CAND_REPORT:
+            comptime assert COLL_BLOCK_KERNEL, (
+                "COLL_CAND_REPORT reports the BLOCK kernel's candidate list"
+            )
+            if tid == 0:
+                comptime RB = COLL_REPORT_BASE
+                stage[env, RB + 0] = Scalar[DTYPE](ncand)
+                stage[env, RB + 1] = Scalar[DTYPE](overflow)
+                stage[env, RB + 2] = Scalar[DTYPE](
+                    Int(rebind[Scalar[DTYPE]](ctrl_sh[1]))
+                )
+                stage[env, RB + 3] = smeta[env, META_IDX_NUM_CONTACTS]
+                stage[env, RB + 4] = Scalar[DTYPE](rep_sap_n)
+                stage[env, RB + 5] = Scalar[DTYPE](rep_tests)
+                stage[env, RB + 6] = Scalar[DTYPE](rep_shifts)
+                stage[env, RB + 7] = Scalar[DTYPE](COLL_TPB)
+                stage[env, RB + 8] = Scalar[DTYPE](rep_aabb_all)
+                stage[env, RB + 9] = Scalar[DTYPE](rep_survive)
+                stage[env, RB + 10] = Scalar[DTYPE](rep_planes)
+                for p in range(COLL_NCAND_CAP):
+                    var key = -1
+                    if p < ncand:
+                        var c = Int(rebind[Scalar[DTYPE]](ord_sh[p]))
+                        var a = Int(rebind[Scalar[DTYPE]](cand_sh[0 * NC + c]))
+                        var b = Int(rebind[Scalar[DTYPE]](cand_sh[1 * NC + c]))
+                        var t = Int(rebind[Scalar[DTYPE]](cand_sh[2 * NC + c]))
+                        var rb_ = mj_geom_type_rank(
+                            Int(rebind[Scalar[DTYPE]](gf_sh[0 * NG + b]))
+                        )
+                        if t < 0:
+                            key = _KIND_PLANE_BASE + rb_
+                        else:
+                            var ra = mj_geom_type_rank(
+                                Int(rebind[Scalar[DTYPE]](gf_sh[0 * NG + a]))
+                            )
+                            key = ra * 8 + rb_ if ra <= rb_ else rb_ * 8 + ra
+                    stage[env, RB + COLL_REPORT_HDR + p] = Scalar[DTYPE](key)
+        else:
+            _ = rep_tests
+            _ = rep_shifts
+            _ = rep_sap_n
+            _ = rep_aabb_all
+            _ = rep_survive
+            _ = rep_planes
+
+
+@always_inline
+def _flat_bucket[DTYPE: DType](cost: Scalar[DTYPE]) -> Int:
+    """A candidate's hot bucket from its pair's last narrow-phase time (ns):
+    -1 = cold, else 0..3 for [1, 2), [2, 4), [4, 8), [8, inf) x
+    `COLL_FLAT_HOT_NS`. Written as comparisons: NaN or garbage is cold."""
+    comptime H = Float64(COLL_FLAT_HOT_NS)
+    if not (cost >= Scalar[DTYPE](H)):
+        return -1
+    if cost >= Scalar[DTYPE](8 * H):
+        return 3
+    if cost >= Scalar[DTYPE](4 * H):
+        return 2
+    if cost >= Scalar[DTYPE](2 * H):
+        return 1
+    return 0
+
+
+@always_inline
+def _flat_cost_slot(a: Int, b: Int) -> Int:
+    """The cost slot of a listed candidate `(a, b)` — the warm-slot hash."""
+    return (a * 131 + b) % HILL_WARM_SLOTS
+
+
+@always_inline
+def _sap_flat_list_env[
+    DTYPE: DType,
+    NC: Int,
+    BATCH: Int,
+](
+    env: Int,
+    tid: Int,
+    ncand: Int,
+    overflow: Int,
+    cand_sh: LayoutTensor[
+        DTYPE, Layout.row_major(6 * NC), MutAnyOrigin,
+        address_space=AddressSpace.SHARED,
+    ],
+    ord_sh: LayoutTensor[
+        DTYPE, Layout.row_major(NC), MutAnyOrigin,
+        address_space=AddressSpace.SHARED,
+    ],
+    coll_flat: LayoutTensor[
+        DTYPE, Layout.row_major(coll_flat_words(BATCH)), MutAnyOrigin
+    ],
+):
+    """`FLAT_LIST`'s ending (every thread): the env's listed candidates into
+    its `coll_flat` row — `a, b, t`, the counts, and the task list: HOT
+    candidates by descending cost bucket, then the cold ones, each group in
+    the phase-2 kind order (`ord_sh`). An env past the cap lists no task;
+    the output kernel sends it to the serial fallback."""
+    var base = env * CF_ROW
+    for c in range(tid, ncand, COLL_TPB):
+        coll_flat[base + CF_CAND + c] = cand_sh[0 * NC + c]
+        coll_flat[base + CF_CAND + NC + c] = cand_sh[1 * NC + c]
+        coll_flat[base + CF_CAND + 2 * NC + c] = cand_sh[2 * NC + c]
+    if tid != 0:
+        return
+    coll_flat[base + CF_NCAND] = Scalar[DTYPE](ncand)
+    coll_flat[base + CF_OVERFLOW] = Scalar[DTYPE](overflow)
+    coll_flat[base + CF_FULL] = Scalar[DTYPE](0)
+    # Scalars, not a runtime-indexed array: see
+    # `feedback_metal_wide_per_thread_inlinearray_miscompute`.
+    var n0 = 0
+    var n1 = 0
+    var n2 = 0
+    var n3 = 0
+    var nc = 0
+    if overflow == 0:
+        # pass 1: each candidate's bucket, parked in its (still unused)
+        # record-count slot
+        for p in range(ncand):
+            var c = Int(rebind[Scalar[DTYPE]](ord_sh[p]))
+            var a = Int(rebind[Scalar[DTYPE]](cand_sh[0 * NC + c]))
+            var b = Int(rebind[Scalar[DTYPE]](cand_sh[1 * NC + c]))
+            var bk = _flat_bucket[DTYPE](
+                rebind[Scalar[DTYPE]](
+                    coll_flat[base + CF_COST + _flat_cost_slot(a, b)]
+                )
+            )
+            cand_sh[5 * NC + c] = Scalar[DTYPE](bk)
+            if bk == 3:
+                n3 += 1
+            elif bk == 2:
+                n2 += 1
+            elif bk == 1:
+                n1 += 1
+            elif bk == 0:
+                n0 += 1
+            else:
+                nc += 1
+        # pass 2: the task list, bucket 3 first
+        var s3 = 0
+        var s2 = n3
+        var s1 = n3 + n2
+        var s0 = n3 + n2 + n1
+        var sc = n3 + n2 + n1 + n0
+        for p in range(ncand):
+            var c = Int(rebind[Scalar[DTYPE]](ord_sh[p]))
+            var bk = Int(rebind[Scalar[DTYPE]](cand_sh[5 * NC + c]))
+            var pos: Int
+            if bk == 3:
+                pos = s3
+                s3 += 1
+            elif bk == 2:
+                pos = s2
+                s2 += 1
+            elif bk == 1:
+                pos = s1
+                s1 += 1
+            elif bk == 0:
+                pos = s0
+                s0 += 1
+            else:
+                pos = sc
+                sc += 1
+            coll_flat[base + CF_LIST + pos] = Scalar[DTYPE](c)
+    coll_flat[base + CF_NHOT + 0] = Scalar[DTYPE](n0)
+    coll_flat[base + CF_NHOT + 1] = Scalar[DTYPE](n1)
+    coll_flat[base + CF_NHOT + 2] = Scalar[DTYPE](n2)
+    coll_flat[base + CF_NHOT + 3] = Scalar[DTYPE](n3)
+    coll_flat[base + CF_NCOLD] = Scalar[DTYPE](nc)
+
+
+comptime _FLAT_PREFIX_TPB: Int = 1024
+
+
+def _sap_flat_prefix_kernel[
+    DTYPE: DType,
+    BATCH: Int,
+](
+    coll_flat: LayoutTensor[
+        DTYPE, Layout.row_major(coll_flat_words(BATCH)), MutAnyOrigin
+    ],
+):
+    """ONE block of `_FLAT_PREFIX_TPB` threads: the envs' task lists into the
+    two global queues. The hot queue is bucket 3's tasks of every env, then
+    bucket 2's, 1's, 0's (env order within a bucket, list order within an
+    env); the cold queue is every env's cold tasks in env order. A thread
+    owns a contiguous run of envs; the five per-list offsets are a
+    Hillis-Steele scan over the threads' sums."""
+    comptime T = _FLAT_PREFIX_TPB
+    comptime NC = COLL_NCAND_CAP
+    comptime G = BATCH * CF_ROW
+    comptime QH = G + CF_G_HDR
+    comptime QC = QH + BATCH * NC
+    var tid = Int(thread_idx.x)
+    # [list * T + thread]: lists 0..3 the hot buckets, 4 the cold one
+    var sc_sh = LayoutTensor[
+        DTYPE, Layout.row_major(5 * T), MutAnyOrigin,
+        address_space=AddressSpace.SHARED,
+    ].stack_allocation()
+    comptime CH = (BATCH + T - 1) // T
+    var e0 = tid * CH
+    var e1 = e0 + CH if e0 + CH < BATCH else BATCH
+    var l0 = 0
+    var l1 = 0
+    var l2 = 0
+    var l3 = 0
+    var lc = 0
+    for e in range(e0, e1):
+        var r = e * CF_ROW
+        l0 += Int(rebind[Scalar[DTYPE]](coll_flat[r + CF_NHOT + 0]))
+        l1 += Int(rebind[Scalar[DTYPE]](coll_flat[r + CF_NHOT + 1]))
+        l2 += Int(rebind[Scalar[DTYPE]](coll_flat[r + CF_NHOT + 2]))
+        l3 += Int(rebind[Scalar[DTYPE]](coll_flat[r + CF_NHOT + 3]))
+        lc += Int(rebind[Scalar[DTYPE]](coll_flat[r + CF_NCOLD]))
+    sc_sh[0 * T + tid] = Scalar[DTYPE](l0)
+    sc_sh[1 * T + tid] = Scalar[DTYPE](l1)
+    sc_sh[2 * T + tid] = Scalar[DTYPE](l2)
+    sc_sh[3 * T + tid] = Scalar[DTYPE](l3)
+    sc_sh[4 * T + tid] = Scalar[DTYPE](lc)
+    barrier()
+    var off = 1
+    while off < T:
+        var v0 = Scalar[DTYPE](0)
+        var v1 = Scalar[DTYPE](0)
+        var v2 = Scalar[DTYPE](0)
+        var v3 = Scalar[DTYPE](0)
+        var vc = Scalar[DTYPE](0)
+        if tid >= off:
+            v0 = rebind[Scalar[DTYPE]](sc_sh[0 * T + tid - off])
+            v1 = rebind[Scalar[DTYPE]](sc_sh[1 * T + tid - off])
+            v2 = rebind[Scalar[DTYPE]](sc_sh[2 * T + tid - off])
+            v3 = rebind[Scalar[DTYPE]](sc_sh[3 * T + tid - off])
+            vc = rebind[Scalar[DTYPE]](sc_sh[4 * T + tid - off])
+        barrier()
+        sc_sh[0 * T + tid] = rebind[Scalar[DTYPE]](sc_sh[0 * T + tid]) + v0
+        sc_sh[1 * T + tid] = rebind[Scalar[DTYPE]](sc_sh[1 * T + tid]) + v1
+        sc_sh[2 * T + tid] = rebind[Scalar[DTYPE]](sc_sh[2 * T + tid]) + v2
+        sc_sh[3 * T + tid] = rebind[Scalar[DTYPE]](sc_sh[3 * T + tid]) + v3
+        sc_sh[4 * T + tid] = rebind[Scalar[DTYPE]](sc_sh[4 * T + tid]) + vc
+        barrier()
+        off *= 2
+    var t0 = Int(rebind[Scalar[DTYPE]](sc_sh[0 * T + T - 1]))
+    var t1 = Int(rebind[Scalar[DTYPE]](sc_sh[1 * T + T - 1]))
+    var t2 = Int(rebind[Scalar[DTYPE]](sc_sh[2 * T + T - 1]))
+    var t3 = Int(rebind[Scalar[DTYPE]](sc_sh[3 * T + T - 1]))
+    var tc = Int(rebind[Scalar[DTYPE]](sc_sh[4 * T + T - 1]))
+    # this thread's first slot in each list: the hot buckets in the order
+    # 3, 2, 1, 0 in one queue
+    var p3 = Int(rebind[Scalar[DTYPE]](sc_sh[3 * T + tid])) - l3
+    var p2 = t3 + Int(rebind[Scalar[DTYPE]](sc_sh[2 * T + tid])) - l2
+    var p1 = t3 + t2 + Int(rebind[Scalar[DTYPE]](sc_sh[1 * T + tid])) - l1
+    var p0 = t3 + t2 + t1 + Int(rebind[Scalar[DTYPE]](sc_sh[0 * T + tid])) - l0
+    var pc = Int(rebind[Scalar[DTYPE]](sc_sh[4 * T + tid])) - lc
+    for e in range(e0, e1):
+        var r = e * CF_ROW
+        var n0 = Int(rebind[Scalar[DTYPE]](coll_flat[r + CF_NHOT + 0]))
+        var n1 = Int(rebind[Scalar[DTYPE]](coll_flat[r + CF_NHOT + 1]))
+        var n2 = Int(rebind[Scalar[DTYPE]](coll_flat[r + CF_NHOT + 2]))
+        var n3 = Int(rebind[Scalar[DTYPE]](coll_flat[r + CF_NHOT + 3]))
+        var nc = Int(rebind[Scalar[DTYPE]](coll_flat[r + CF_NCOLD]))
+        var li = r + CF_LIST
+        for i in range(n3):
+            coll_flat[QH + p3 + i] = Scalar[DTYPE](
+                e * NC + Int(rebind[Scalar[DTYPE]](coll_flat[li + i]))
+            )
+        li += n3
+        p3 += n3
+        for i in range(n2):
+            coll_flat[QH + p2 + i] = Scalar[DTYPE](
+                e * NC + Int(rebind[Scalar[DTYPE]](coll_flat[li + i]))
+            )
+        li += n2
+        p2 += n2
+        for i in range(n1):
+            coll_flat[QH + p1 + i] = Scalar[DTYPE](
+                e * NC + Int(rebind[Scalar[DTYPE]](coll_flat[li + i]))
+            )
+        li += n1
+        p1 += n1
+        for i in range(n0):
+            coll_flat[QH + p0 + i] = Scalar[DTYPE](
+                e * NC + Int(rebind[Scalar[DTYPE]](coll_flat[li + i]))
+            )
+        li += n0
+        p0 += n0
+        for i in range(nc):
+            coll_flat[QC + pc + i] = Scalar[DTYPE](
+                e * NC + Int(rebind[Scalar[DTYPE]](coll_flat[li + i]))
+            )
+        pc += nc
+    if tid == 0:
+        coll_flat[G + 0] = Scalar[DTYPE](t0 + t1 + t2 + t3)
+        coll_flat[G + 1] = Scalar[DTYPE](tc)
+
+
+def _sap_narrow_flat_kernel[
+    DTYPE: DType,
+    NQ: Int,
+    NV: Int,
+    NBODY: Int,
+    NJOINT: Int,
+    MAX_CONTACTS: Int,
+    NGEOM: Int,
+    NEXCLUDE: Int,
+    NMESH_VERTS: Int,
+    BATCH: Int,
+    # Appended rather than grouped with NEXCLUDE — see `fields.Model`.
+    NPAIR: Int,
+    NHFIELD_DATA: Int,
+](
+    xpos: LayoutTensor[
+        DTYPE, Layout.row_major(BATCH, NBODY * 3), MutAnyOrigin
+    ],
+    xquat: LayoutTensor[
+        DTYPE, Layout.row_major(BATCH, NBODY * 4), MutAnyOrigin
+    ],
+    geoms: LayoutTensor[
+        DTYPE, Layout.row_major(NGEOM, MODEL_GEOM_SIZE), MutAnyOrigin
+    ],
+    bodies: LayoutTensor[
+        DTYPE, Layout.row_major(NBODY, MODEL_BODY_SIZE), MutAnyOrigin
+    ],
+    mmeta: LayoutTensor[
+        DTYPE, Layout.row_major(MODEL_META_SIZE), MutAnyOrigin
+    ],
+    excludes: LayoutTensor[
+        DTYPE, Layout.row_major(NEXCLUDE, 2), MutAnyOrigin
+    ],
+    pairs: LayoutTensor[
+        DTYPE, Layout.row_major(NPAIR, MODEL_PAIR_SIZE), MutAnyOrigin
+    ],
+    mesh_meta: LayoutTensor[
+        DTYPE,
+        Layout.row_major(MAX_GPU_MESHES, MODEL_MESH_META_SIZE),
+        MutAnyOrigin,
+    ],
+    mesh_verts: LayoutTensor[
+        DTYPE, Layout.row_major(NMESH_VERTS, 3), MutAnyOrigin
+    ],
+    mesh_polys: LayoutTensor[
+        DTYPE,
+        Layout.row_major(mesh_max_poly(NMESH_VERTS), MODEL_MESH_POLY_SIZE),
+        MutAnyOrigin,
+    ],
+    mesh_polyvert: LayoutTensor[
+        DTYPE, Layout.row_major(mesh_max_polyvert(NMESH_VERTS)), MutAnyOrigin
+    ],
+    mesh_polymap: LayoutTensor[
+        DTYPE, Layout.row_major(mesh_max_polyvert(NMESH_VERTS)), MutAnyOrigin
+    ],
+    mesh_vert_polymap: LayoutTensor[
+        DTYPE, Layout.row_major(NMESH_VERTS, 2), MutAnyOrigin
+    ],
+    mesh_vert_edgeadr: LayoutTensor[
+        DTYPE, Layout.row_major(NMESH_VERTS), MutAnyOrigin
+    ],
+    mesh_edges: LayoutTensor[
+        DTYPE, Layout.row_major(mesh_max_edge(NMESH_VERTS)), MutAnyOrigin
+    ],
+    hfield_meta: LayoutTensor[
+        DTYPE,
+        Layout.row_major(MAX_GPU_HFIELDS * MODEL_HFIELD_META_SIZE),
+        MutAnyOrigin,
+    ],
+    hfield_data: LayoutTensor[
+        DTYPE, Layout.row_major(BATCH * NHFIELD_DATA), MutAnyOrigin
+    ],
+    contacts: LayoutTensor[
+        DTYPE, Layout.row_major(BATCH, MAX_CONTACTS * CONTACT_SIZE),
+        MutAnyOrigin,
+    ],
+    smeta: LayoutTensor[
+        DTYPE, Layout.row_major(BATCH, METADATA_SIZE), MutAnyOrigin
+    ],
+    ccd_ws: LayoutTensor[
+        DTYPE, Layout.row_major(BATCH * COLL_CCD_LANES, CCD_WS_SIZE), MutAnyOrigin
+    ],
+    stage: LayoutTensor[
+        DTYPE, Layout.row_major(BATCH, COLL_STAGE_SLOTS * CONTACT_SIZE),
+        MutAnyOrigin,
+    ],
+    # `Data.coll_flat` — the queues, lists and costs
+    coll_flat: LayoutTensor[
+        DTYPE, Layout.row_major(coll_flat_words(BATCH)), MutAnyOrigin
+    ],
+):
+    """The flat narrow phase: one WARP (block) per env slot, over the queues
+    `_sap_flat_prefix_kernel` built. Warp `w` runs hot tasks `w, w + W, ...`
+    on its lane 0 — the queue is in descending cost bucket, so this is a
+    round robin over a longest-first order — then cold chunks of 32, one per
+    lane, from the far end of the warps. Each task is one listed candidate
+    through `_sap_block_candidate` into its staging window, exactly as the
+    block kernel's phase 2 runs it; the CCD row is the thread's own
+    (`w * COLL_TPB + lane`, the same rows the block kernel uses) and the hill
+    climb's warm slots stay on the ENV's first row. The record count goes to
+    the list, and on NVIDIA the task's time to its pair's cost slot, which
+    schedules the next step."""
+    comptime assert COLL_CCD_LANES == COLL_TPB, (
+        "the flat narrow phase gives every thread a CCD row"
+    )
+    var w = Int(block_idx.x)
+    var lane = Int(thread_idx.x)
+    comptime W = BATCH
+    comptime NC = COLL_NCAND_CAP
+    comptime G = BATCH * CF_ROW
+    comptime QH = G + CF_G_HDR
+    comptime QC = QH + BATCH * NC
+    comptime EX_CAP = cap[NEXCLUDE]() if may_exist[NEXCLUDE]() else 1
+    var dims = Dims[nq=NQ, nv=NV, nbody=NBODY, njoint=NJOINT, max_contacts=MAX_CONTACTS, ngeom=NGEOM, nexclude=NEXCLUDE, nmesh_verts=NMESH_VERTS, npair=NPAIR]()
+    var nbody = NBODY
+    var ex_sh = LayoutTensor[
+        DTYPE, Layout.row_major(EX_CAP), MutAnyOrigin,
+        address_space=AddressSpace.SHARED,
+    ].stack_allocation()
+    var nsig_sh = LayoutTensor[
+        DTYPE, Layout.row_major(1), MutAnyOrigin,
+        address_space=AddressSpace.SHARED,
+    ].stack_allocation()
+    # The model's `<exclude>` signatures, as the block kernel's phase 1a.
+    if lane == 0:
+        var ex0 = Scratch[Int, EX_CAP](
+            NEXCLUDE if NEXCLUDE > 0 else 1, fill=0
+        )
+        var n_sig0 = exclude_signatures[DTYPE, EX_CAP](
+            nbody, NEXCLUDE, mmeta, excludes, ex0
+        )
+        for k in range(EX_CAP):
+            ex_sh[k] = Scalar[DTYPE](ex0[k])
+        nsig_sh[0] = Scalar[DTYPE](n_sig0)
+    barrier()
+    var ex_sig = Scratch[Int, EX_CAP](
+        NEXCLUDE if NEXCLUDE > 0 else 1, fill=0
+    )
+    for k in range(EX_CAP):
+        ex_sig[k] = Int(rebind[Scalar[DTYPE]](ex_sh[k]))
+    var n_sig = Int(rebind[Scalar[DTYPE]](nsig_sh[0]))
+
+    var ccd_tol = rebind[Scalar[DTYPE]](mmeta[MODEL_META_IDX_CCD_TOLERANCE])
+    if ccd_tol <= 0:
+        ccd_tol = Scalar[DTYPE](MJ_CCD_TOLERANCE)
+    var ccd_iter = Int(
+        rebind[Scalar[DTYPE]](mmeta[MODEL_META_IDX_CCD_ITERATIONS])
+    )
+    if ccd_iter < 1:
+        ccd_iter = MJ_CCD_ITERATIONS
+    var multiccd_off = (
+        rebind[Scalar[DTYPE]](mmeta[MODEL_META_IDX_MULTICCD_DISABLED]) != 0
+    )
+    var pr = _SapProbe()
+    var wrow = w * COLL_TPB + lane
+
+    var nh = Int(rebind[Scalar[DTYPE]](coll_flat[G + 0]))
+    var ncold = Int(rebind[Scalar[DTYPE]](coll_flat[G + 1]))
+    # This warp's tasks, hot then cold, as ONE loop with the task body once
+    # (a capturing closure here crashed the compiler, 2026-09-27): hot tasks
+    # `w, w + W, ...` on lane 0, then cold chunks `W-1-w, 2W-1-w, ...` of
+    # `COLL_TPB`, a lane each.
+    var n_hot = (nh - w + W - 1) // W if w < nh else 0
+    var nchunk = (ncold + COLL_TPB - 1) // COLL_TPB
+    var k0 = W - 1 - w
+    var n_cold = (nchunk - k0 + W - 1) // W if k0 < nchunk else 0
+    for it in range(n_hot + n_cold):
+        var item = -1
+        if it < n_hot:
+            if lane == 0:
+                item = Int(rebind[Scalar[DTYPE]](coll_flat[QH + w + it * W]))
+        else:
+            var i = (k0 + (it - n_hot) * W) * COLL_TPB + lane
+            if i < ncold:
+                item = Int(rebind[Scalar[DTYPE]](coll_flat[QC + i]))
+        if item >= 0:
+            var env = item // NC
+            var c = item - env * NC
+            var base = env * CF_ROW
+            var a = Int(rebind[Scalar[DTYPE]](coll_flat[base + CF_CAND + c]))
+            var b = Int(rebind[Scalar[DTYPE]](coll_flat[base + CF_CAND + NC + c]))
+            var t = Int(rebind[Scalar[DTYPE]](coll_flat[base + CF_CAND + 2 * NC + c]))
+            # the block kernel's phase-0 poses, recomputed by the same function
+            var a_px: Scalar[DTYPE] = 0
+            var a_py: Scalar[DTYPE] = 0
+            var a_pz: Scalar[DTYPE] = 0
+            var a_qx: Scalar[DTYPE] = 0
+            var a_qy: Scalar[DTYPE] = 0
+            var a_qz: Scalar[DTYPE] = 0
+            var a_qw: Scalar[DTYPE] = 1
+            _geom_world_pos[DTYPE](
+                env, a, geoms, xpos, xquat, a_px, a_py, a_pz, a_qx, a_qy, a_qz, a_qw
+            )
+            var b_px: Scalar[DTYPE] = 0
+            var b_py: Scalar[DTYPE] = 0
+            var b_pz: Scalar[DTYPE] = 0
+            var b_qx: Scalar[DTYPE] = 0
+            var b_qy: Scalar[DTYPE] = 0
+            var b_qz: Scalar[DTYPE] = 0
+            var b_qw: Scalar[DTYPE] = 1
+            _geom_world_pos[DTYPE](
+                env, b, geoms, xpos, xquat, b_px, b_py, b_pz, b_qx, b_qy, b_qz, b_qw
+            )
+            var t0: Int = 0
+            comptime if is_nvidia_gpu():
+                t0 = perf_counter_ns()
+            var cnt = _sap_block_candidate[DTYPE, BATCH, EX_CAP=EX_CAP](
+                env, wrow, env * COLL_CCD_LANES, dims, a, b, t,
+                c * COLL_STAGE_MAXC,
+                a_px, a_py, a_pz, a_qx, a_qy, a_qz, a_qw,
+                b_px, b_py, b_pz, b_qx, b_qy, b_qz, b_qw,
+                Int(rebind[Scalar[DTYPE]](geoms[a, GEOM_IDX_BODY])),
+                Int(rebind[Scalar[DTYPE]](geoms[a, GEOM_IDX_CONTYPE])),
+                Int(rebind[Scalar[DTYPE]](geoms[a, GEOM_IDX_CONAFFINITY])),
+                nbody, ex_sig, n_sig, pr, ccd_tol, ccd_iter, multiccd_off,
+                geoms, bodies, mmeta, excludes, pairs, mesh_meta, mesh_verts,
+                mesh_polys, mesh_polyvert, mesh_polymap, mesh_vert_polymap,
+                mesh_vert_edgeadr, mesh_edges, hfield_meta, hfield_data,
+                stage, ccd_ws,
+            )
+            coll_flat[base + CF_CNT + c] = Scalar[DTYPE](cnt)
+            if cnt >= COLL_STAGE_MAXC:
+                coll_flat[base + CF_FULL] = Scalar[DTYPE](1)
+            comptime if is_nvidia_gpu():
+                coll_flat[base + CF_COST + _flat_cost_slot(a, b)] = Scalar[DTYPE](
+                    Int(perf_counter_ns() - t0)
+                )
+
+
+def _sap_flat_output_kernel[
+    DTYPE: DType,
+    MAX_CONTACTS: Int,
+    NBODY: Int,
+    BATCH: Int,
+](
+    contacts: LayoutTensor[
+        DTYPE, Layout.row_major(BATCH, MAX_CONTACTS * CONTACT_SIZE),
+        MutAnyOrigin,
+    ],
+    smeta: LayoutTensor[
+        DTYPE, Layout.row_major(BATCH, METADATA_SIZE), MutAnyOrigin
+    ],
+    stage: LayoutTensor[
+        DTYPE, Layout.row_major(BATCH, COLL_STAGE_SLOTS * CONTACT_SIZE),
+        MutAnyOrigin,
+    ],
+    coll_flat: LayoutTensor[
+        DTYPE, Layout.row_major(coll_flat_words(BATCH)), MutAnyOrigin
+    ],
+):
+    """One block per env: the flat narrow phase's staging windows through
+    the block kernel's phase 3 (`_sap_block_output`). A list past the cap or
+    a filled window marks the env for the serial fallback, as there."""
+    comptime NC = COLL_NCAND_CAP
+    var env = Int(block_idx.x)
+    var tid = Int(thread_idx.x)
+    if env >= BATCH:
+        return
+    var cand_sh = LayoutTensor[
+        DTYPE, Layout.row_major(6 * NC), MutAnyOrigin,
+        address_space=AddressSpace.SHARED,
+    ].stack_allocation()
+    var sk_sh = LayoutTensor[
+        DTYPE, Layout.row_major(NC), MutAnyOrigin,
+        address_space=AddressSpace.SHARED,
+    ].stack_allocation()
+    var ctrl_sh = LayoutTensor[
+        DTYPE, Layout.row_major(8), MutAnyOrigin,
+        address_space=AddressSpace.SHARED,
+    ].stack_allocation()
+    var base = env * CF_ROW
+    if tid == 0:
+        ctrl_sh[0] = coll_flat[base + CF_NCAND]
+        var fb = (
+            rebind[Scalar[DTYPE]](coll_flat[base + CF_OVERFLOW]) != 0
+            or rebind[Scalar[DTYPE]](coll_flat[base + CF_FULL]) != 0
+        )
+        ctrl_sh[1] = Scalar[DTYPE](1) if fb else Scalar[DTYPE](0)
+    barrier()
+    var ncand = Int(rebind[Scalar[DTYPE]](ctrl_sh[0]))
+    for c in range(tid, ncand, COLL_TPB):
+        cand_sh[3 * NC + c] = Scalar[DTYPE](c * COLL_STAGE_MAXC)
+        cand_sh[5 * NC + c] = coll_flat[base + CF_CNT + c]
+    barrier()
+    _sap_block_output[DTYPE, NC](
+        env, tid, ncand, MAX_CONTACTS, NBODY, cand_sh, sk_sh, ctrl_sh,
+        stage, contacts, smeta,
+    )
+
 
 def detect_contacts_sap[
     target: StaticString,
     DTYPE: DType,
     D: DimsLike,
     BATCH: Int = 1,
+    # The GPU narrow phase's layout — see `ccd_workspace.COLL_FLAT_NARROW`.
+    # A parameter so a gate can run both on one `Data`.
+    FLAT: Bool = COLL_FLAT_NARROW,
 ](
     mut d: Data[DTYPE, D, BATCH],
     mut m: Model[DTYPE, D],
@@ -4157,6 +4853,7 @@ def detect_contacts_sap[
     comptime L_SMETA = Layout.row_major(BATCH, METADATA_SIZE)
     comptime L_CCD_WS = Layout.row_major(BATCH * COLL_CCD_LANES, CCD_WS_SIZE)
     comptime L_COLL_STAGE = Layout.row_major(BATCH, COLL_STAGE_SLOTS * CONTACT_SIZE)
+    comptime L_COLL_FLAT = Layout.row_major(coll_flat_words(BATCH))
 
     comptime if target == "cpu":
         var dm = d.dims
@@ -4214,7 +4911,92 @@ def detect_contacts_sap[
         var c = ctx.value()
         comptime BLOCKS = (BATCH + SAP_TPB - 1) // SAP_TPB
         comptime USE_BLOCK = COLL_BLOCK_KERNEL and D.NHFIELD_DATA == 0
-        comptime if USE_BLOCK:
+        comptime if USE_BLOCK and FLAT:
+            # The flat narrow phase: list, queue, narrow, output — see
+            # `ccd_workspace.COLL_FLAT_NARROW`.
+            c.enqueue_function[
+                _detect_contacts_sap_block_kernel[
+                    DTYPE, D.NQ, D.NV, D.NBODY, D.NJOINT, D.MAX_CONTACTS, D.NGEOM,
+                    D.NEXCLUDE, D.NMESH_VERTS, BATCH, D.NPAIR,
+                    _hf_len(D.NHFIELD_DATA),
+                    FLAT_LIST=True,
+                ]
+            ](
+                d.xpos.lt["gpu", L_B3](),
+                d.xquat.lt["gpu", L_B4](),
+                m.geoms.lt["gpu", L_GEOM](),
+                m.bodies.lt["gpu", L_BODY](),
+                m.meta.lt["gpu", L_MMETA](),
+                m.excludes.lt["gpu", L_EXCLUDE](),
+                m.pairs.lt["gpu", L_PAIR](),
+                m.mesh_meta.lt["gpu", L_MESH_META](),
+                m.mesh_verts.lt["gpu", L_MESH_VERT](),
+                m.mesh_polys.lt["gpu", L_MESH_POLY](),
+                m.mesh_polyvert.lt["gpu", L_MESH_POLYVERT](),
+                m.mesh_polymap.lt["gpu", L_MESH_POLYVERT](),
+                m.mesh_vert_polymap.lt["gpu", L_MESH_VPMAP](),
+                m.mesh_vert_edgeadr.lt["gpu", L_MESH_VEADR](),
+                m.mesh_edges.lt["gpu", L_MESH_EDGE](),
+                m.hfield_meta.lt["gpu", L_HF_META](),
+                d.hfield_data.lt["gpu", L_HF_DATA](),
+                d.contacts.lt["gpu", L_CONTACTS](),
+                d.meta.lt["gpu", L_SMETA](),
+                d.ccd_ws.lt["gpu", L_CCD_WS](),
+                d.coll_stage.lt["gpu", L_COLL_STAGE](),
+                d.coll_flat.lt["gpu", L_COLL_FLAT](),
+                grid_dim=(BATCH,),
+                block_dim=(COLL_TPB,),
+            )
+            c.enqueue_function[_sap_flat_prefix_kernel[DTYPE, BATCH]](
+                d.coll_flat.lt["gpu", L_COLL_FLAT](),
+                grid_dim=(1,),
+                block_dim=(_FLAT_PREFIX_TPB,),
+            )
+            c.enqueue_function[
+                _sap_narrow_flat_kernel[
+                    DTYPE, D.NQ, D.NV, D.NBODY, D.NJOINT, D.MAX_CONTACTS, D.NGEOM,
+                    D.NEXCLUDE, D.NMESH_VERTS, BATCH, D.NPAIR,
+                    _hf_len(D.NHFIELD_DATA),
+                ]
+            ](
+                d.xpos.lt["gpu", L_B3](),
+                d.xquat.lt["gpu", L_B4](),
+                m.geoms.lt["gpu", L_GEOM](),
+                m.bodies.lt["gpu", L_BODY](),
+                m.meta.lt["gpu", L_MMETA](),
+                m.excludes.lt["gpu", L_EXCLUDE](),
+                m.pairs.lt["gpu", L_PAIR](),
+                m.mesh_meta.lt["gpu", L_MESH_META](),
+                m.mesh_verts.lt["gpu", L_MESH_VERT](),
+                m.mesh_polys.lt["gpu", L_MESH_POLY](),
+                m.mesh_polyvert.lt["gpu", L_MESH_POLYVERT](),
+                m.mesh_polymap.lt["gpu", L_MESH_POLYVERT](),
+                m.mesh_vert_polymap.lt["gpu", L_MESH_VPMAP](),
+                m.mesh_vert_edgeadr.lt["gpu", L_MESH_VEADR](),
+                m.mesh_edges.lt["gpu", L_MESH_EDGE](),
+                m.hfield_meta.lt["gpu", L_HF_META](),
+                d.hfield_data.lt["gpu", L_HF_DATA](),
+                d.contacts.lt["gpu", L_CONTACTS](),
+                d.meta.lt["gpu", L_SMETA](),
+                d.ccd_ws.lt["gpu", L_CCD_WS](),
+                d.coll_stage.lt["gpu", L_COLL_STAGE](),
+                d.coll_flat.lt["gpu", L_COLL_FLAT](),
+                grid_dim=(BATCH,),
+                block_dim=(COLL_TPB,),
+            )
+            c.enqueue_function[
+                _sap_flat_output_kernel[
+                    DTYPE, D.MAX_CONTACTS, D.NBODY, BATCH
+                ]
+            ](
+                d.contacts.lt["gpu", L_CONTACTS](),
+                d.meta.lt["gpu", L_SMETA](),
+                d.coll_stage.lt["gpu", L_COLL_STAGE](),
+                d.coll_flat.lt["gpu", L_COLL_FLAT](),
+                grid_dim=(BATCH,),
+                block_dim=(COLL_TPB,),
+            )
+        elif USE_BLOCK:
             c.enqueue_function[
                 _detect_contacts_sap_block_kernel[
                     DTYPE, D.NQ, D.NV, D.NBODY, D.NJOINT, D.MAX_CONTACTS, D.NGEOM,
@@ -4243,6 +5025,7 @@ def detect_contacts_sap[
                 d.meta.lt["gpu", L_SMETA](),
                 d.ccd_ws.lt["gpu", L_CCD_WS](),
                 d.coll_stage.lt["gpu", L_COLL_STAGE](),
+                d.coll_flat.lt["gpu", L_COLL_FLAT](),
                 grid_dim=(BATCH,),
                 block_dim=(COLL_TPB,),
             )
