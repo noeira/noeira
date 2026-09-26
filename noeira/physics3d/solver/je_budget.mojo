@@ -303,6 +303,7 @@ def newton_elliptic_extra_elems[MAX_CONTACTS: Int, MAX_CONDIM: Int]() -> Int:
 
         fr_e_sh                   ME            `con->friction[t]` per contact row
         mu_sh/ntc_sh/cact_sh/cs_sh 4 * MC       per-contact cone data and state
+        cmask_sh                  MC            per-contact dof mask (2026-09-26)
         hb_sh                     MC * (NT+1)^2  the cone Hessian block per contact
 
     ⚠ ZERO FOR THE PYRAMIDAL CONE — the kernel sizes these arrays at 1 there
@@ -311,7 +312,7 @@ def newton_elliptic_extra_elems[MAX_CONTACTS: Int, MAX_CONDIM: Int]() -> Int:
     """
     comptime MC = _max_one[MAX_CONTACTS]()
     comptime HN = (ell_nt[MAX_CONDIM]() + 1) * (ell_nt[MAX_CONDIM]() + 1)
-    return 4 * MC + MC * HN
+    return 5 * MC + MC * HN
 
 
 def newton_shared_elems[

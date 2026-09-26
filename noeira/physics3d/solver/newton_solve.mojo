@@ -601,6 +601,10 @@ comptime NEWTON_FORCE_BLOCKED_MAX_NV: Int = 60
 # not, because the spill decision is what a real footprint should drive, and
 # this footprint is a fake one.
 comptime NEWTON_SHARED_PAD: Int = 0
+# Dofs a contact bitmask can name in the blocked kernel's elliptic Hessian
+# build (`cmask_sh`): the mask lives in a `DTYPE` shared slot, and float32 holds
+# every integer below 2^24 exactly. Wider models skip nothing.
+comptime CMASK_BITS: Int = 24
 # ⚠ THE PAD APPLIES ONLY TO LEGS WITH `NV <= NEWTON_SHARED_PAD_MAX_NV`. The
 # park probe carries every leg in ONE binary, and ptxas refuses any kernel
 # over 0x18c00 = 101,376 B of static shared memory — k=9 (90.1 KB) plus a
@@ -5198,6 +5202,19 @@ def _newton_blocked_fields_kernel[
         DTYPE, Layout.row_major(ELL_HB), MutAnyOrigin,
         address_space=AddressSpace.SHARED,
     ].stack_allocation()
+    # ⚠ WHICH DOFS EACH CONTACT'S ROWS TOUCH, as a bitmask (bit i = some
+    # used row has a nonzero in column i). The Hessian build asks every
+    # contact about every entry (i, j) and `_ell_entry_contact_term` skips a
+    # zero `J_k[i]` only after LOADING it — and `Je` spills to global memory on
+    # any model with many contacts. On so101_tower that skip test was most of
+    # the build: 931 of the slowest env's 1027 us. Built once per solve (the
+    # rows are constant for the whole solve); skipping on it drops only
+    # contributions that are exactly zero. `CMASK_BITS` bounds it: a wider
+    # model stores -1 (every bit) and loses nothing but the skip.
+    var cmask_sh = LayoutTensor[
+        DTYPE, Layout.row_major(ELL_MC), MutAnyOrigin,
+        address_space=AddressSpace.SHARED,
+    ].stack_allocation()
     # Where the dense (non-contact) rows start: 0 on the pyramidal leg,
     # which treats every row alike, and past the contact block on the
     # elliptic one. `nc` is uniform across the threadgroup.
@@ -5290,6 +5307,17 @@ def _newton_blocked_fields_kernel[
                     else Scalar[DTYPE](0)
                 )
                 cs_sh[c] = Scalar[DTYPE](ELL_SATISFIED)
+                comptime if NV <= CMASK_BITS:
+                    var cm = 0
+                    for k in range(Int(rebind[Scalar[DTYPE]](ntc_sh[c])) + 1):
+                        for i in range(NV):
+                            if rebind[Scalar[DTYPE]](
+                                Je_sh[(row0 + k) * NV + i]
+                            ) != Scalar[DTYPE](0):
+                                cm |= 1 << i
+                    cmask_sh[c] = Scalar[DTYPE](cm)
+                else:
+                    cmask_sh[c] = Scalar[DTYPE](-1)
 
 
     barrier()
@@ -6276,6 +6304,10 @@ def _newton_blocked_fields_kernel[
                                     == ELL_SATISFIED
                                 ):
                                     continue
+                                comptime if NV <= CMASK_BITS:
+                                    var cm = Int(rebind[Scalar[DTYPE]](cmask_sh[c]))
+                                    if ((cm >> i) & 1) == 0 or ((cm >> j) & 1) == 0:
+                                        continue
                                 _ell_entry_contact_term[
                                     DTYPE, NT, HN, JE_AS=JE_AS
                                 ](c, i, j, NV, Je_sh, ntc_sh, hb_sh, h)

@@ -200,13 +200,16 @@ def main() raises:
     var pyr_libero = newton_shared_elems[
         37, 17, 0, 0, 144, 3, False, ConeType.PYRAMIDAL
     ]() * size_of[Scalar[DT]]()
-    t.truth(ell_libero == 39892 + 4,
+    # ⚠ `cmask_sh` (MC scalars, 2026-09-26) arrived after that PTX was read:
+    # it is spelled out as `+ 144 * 4` rather than folded into the recorded
+    # number, the same way arm A carries its later arrays.
+    t.truth(ell_libero == 39892 + 4 + 144 * 4,
             String("LIBERO goal, ELLIPTIC: ", ell_libero, " == 39892 (the"
                    " sm_120 PTX's 24 .shared arrays) + 4 (the elided Je"
-                   " backing scalar)"))
+                   " backing scalar) + 576 (cmask_sh)"))
     t.truth(ell_libero - pyr_libero
-            == (10 * 647 - 9 * 647 + 4 * 144 + 144 * 9) * size_of[Scalar[DT]](),
-            String("the elliptic extras are fr_e_sh (ME=647) + 4*MC +"
+            == (10 * 647 - 9 * 647 + 5 * 144 + 144 * 9) * size_of[Scalar[DT]](),
+            String("the elliptic extras are fr_e_sh (ME=647) + 5*MC +"
                    " MC*(NT+1)^2 = ", ell_libero - pyr_libero, " B"))
     t.truth(newton_shared_elems[42, 12, 0, 0, MC, CONDIM, True]()
             == newton_shared_elems[
