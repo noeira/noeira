@@ -2611,8 +2611,9 @@ def build_model_fields_from_flat[
             + String(len(edge_list)) + " edge slots (cap "
             + String(NMESH_EDGE) + ") for mf.dims.get_nmesh_verts() = "
             + String(mf.dims.get_nmesh_verts()) + ". A triangulated convex hull needs"
-            " 7V - 12, so exceeding 8V means the hull is not simplicial or"
-            " the adjacency build is wrong, not that the budget is too small."
+            " 7V - 12, so exceeding 8V (plus the hill climb's seed tables,"
+            " see `mesh_max_edge`) means the hull is not simplicial or the"
+            " adjacency build is wrong, not that the budget is too small."
         )
     for v in range(len(edge_adr)):
         if v >= mf.dims.get_nmesh_verts():

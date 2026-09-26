@@ -1942,14 +1942,34 @@ def mesh_max_polyvert(nmesh_verts: Int) -> Int:
     return 6 * nmesh_verts if nmesh_verts > 0 else 1
 
 
+# The hill climb's direction SEED TABLE (`collision/mesh_seed.mojo`): for a
+# hull of at least `MESH_SEED_MIN_VERTS` vertices, `MESH_SEED_N` local vertex
+# indices — the extreme vertex for each point of a `MESH_SEED_Q`^3 direction
+# grid — stored in `mesh_edges` directly before the mesh's first neighbour
+# list, behind one `MESH_SEED_MAGIC` slot. Reader and builder are in
+# `mesh_seed.mojo`; the layout is stated there.
+comptime MESH_SEED_Q: Int = 5
+comptime MESH_SEED_N: Int = MESH_SEED_Q * MESH_SEED_Q * MESH_SEED_Q
+comptime MESH_SEED_MIN_VERTS: Int = 64
+# Not a vertex id (>= 0) and not the -1 terminator.
+comptime MESH_SEED_MAGIC: Int = -7
+
+
 def mesh_max_edge(nmesh_verts: Int) -> Int:
     """Hull edge-graph capacity for a budget of `nmesh_verts` vertices.
 
     MuJoCo sizes the same block at `numvert + 3*numface`; a triangulated
     polytope has `F = 2V - 4`, so that is `7V - 12`. 8V leaves headroom rather
     than trusting the identity, and `fields_build` still raises on overflow.
+    On top of it, each mesh of at least `MESH_SEED_MIN_VERTS` vertices carries
+    a seed table of `MESH_SEED_N + 1` slots, so there are at most
+    `V // MESH_SEED_MIN_VERTS` of them.
     """
-    return 8 * nmesh_verts if nmesh_verts > 0 else 1
+    if nmesh_verts <= 0:
+        return 1
+    return 8 * nmesh_verts + (nmesh_verts // MESH_SEED_MIN_VERTS) * (
+        MESH_SEED_N + 1
+    )
 
 
 # =============================================================================

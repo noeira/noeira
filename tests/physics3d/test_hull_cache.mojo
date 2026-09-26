@@ -43,6 +43,9 @@ from noeira.physics3d.collision.hull_cache import (
     hull_cache_path,
 )
 from noeira.physics3d.model.mesh_inertia import MeshInertia
+from noeira.physics3d.gpu.constants import (
+    MESH_SEED_N, MESH_SEED_MIN_VERTS, MESH_SEED_MAGIC,
+)
 
 comptime CACHE_DIR = ".cache/physics3d_hulls_test"
 
@@ -302,6 +305,9 @@ def test_indices_stay_inside_their_own_mesh() raises:
         silent-wrong-geometry failure, and it lands in range for mesh 0 only.
       * `-1` terminates a vertex's neighbour run and must survive as `-1`;
         shifted, it becomes `vert_base - 1`, a plausible vertex id.
+      * a mesh of at least `MESH_SEED_MIN_VERTS` vertices has its seed table
+        (`mesh_seed.mojo`) right before its first run: `MESH_SEED_MAGIC`, then
+        `MESH_SEED_N` LOCAL vertex ids, so every seed is in `[0, nv)`.
 
     These hold whatever built the arrays, which is what makes them a real
     check rather than a mirror.
@@ -356,6 +362,24 @@ def test_indices_stay_inside_their_own_mesh() raises:
                     " polygon ids and must NOT be shifted",
                 )
             pm_run += b.polymap_num[v]
+
+        # --- the hill climb's seed table, ahead of a big mesh's lists --------
+        # (`mesh_seed.mojo`): MAGIC, then MESH_SEED_N LOCAL vertex ids.
+        if nv >= MESH_SEED_MIN_VERTS:
+            assert_true(
+                b.edge_list[el_run] == MESH_SEED_MAGIC,
+                tag + "no seed-table MAGIC at " + String(el_run)
+                + " ahead of a " + String(nv) + "-vertex mesh's lists",
+            )
+            for k in range(MESH_SEED_N):
+                var s = b.edge_list[el_run + 1 + k]
+                assert_true(
+                    s >= 0 and s < nv,
+                    tag + "seed " + String(k) + " holds " + String(s)
+                    + ", outside this mesh's [0, " + String(nv) + ") — seeds"
+                    " are LOCAL vertex ids and must NOT be shifted",
+                )
+            el_run += MESH_SEED_N + 1
 
         # --- edge graph: contiguous, GLOBAL ids, -1 preserved ----------------
         for v in range(vert_base, vert_base + nv):

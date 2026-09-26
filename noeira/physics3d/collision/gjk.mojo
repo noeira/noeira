@@ -73,10 +73,13 @@ from ..constants import (
     GEOM_MESH,
 )
 from ..kinematics.quat_math import quat_rotate, quat_rotate_inverse
+from .mesh_seed import mesh_seed_bin
 from ..gpu.constants import (
     MJ_CCD_TOLERANCE,
     MJ_CCD_ITERATIONS,
     mesh_max_edge,
+    MESH_SEED_N,
+    MESH_SEED_MAGIC,
 )
 
 # Reuse CPU GJK parameters (verbatim from gjk_gpu.mojo)
@@ -516,6 +519,10 @@ def _gjk_signed_distance[
 # vertices the linear scan beats walking the graph, and MuJoCo keeps the scan.
 comptime _HILLCLIMB_MIN: Int = 10
 
+# The hill climb's direction seed (`mesh_seed.mojo`). An A/B switch, not a
+# mode: False climbs from the warm vertex alone, as before 2026-09-26.
+comptime HILL_SEED: Bool = True
+
 
 @always_inline
 def hillclimb_support_index[
@@ -581,12 +588,33 @@ def hillclimb_support_index[
     # otherwise walk off the end of a smaller mesh into whatever vertices
     # follow it in the model-wide slab. Clamping to 0 turns that into lost
     # speed rather than a support point belonging to another geom.
-    var imax = warm if (warm >= 0 and warm < num_verts) else 0
+    var warm_ok = warm >= 0 and warm < num_verts
+    var imax = warm if warm_ok else 0
     var best_dot = (
         ld_x * rebind[Scalar[DTYPE]](mesh_verts[vert_adr + imax, 0])
         + ld_y * rebind[Scalar[DTYPE]](mesh_verts[vert_adr + imax, 1])
         + ld_z * rebind[Scalar[DTYPE]](mesh_verts[vert_adr + imax, 2])
     )
+    # The direction seed (`mesh_seed.mojo`): MuJoCo 3.12's rule on a finer
+    # grid — cold, start at the seed; warm, take the seed only if it scores
+    # STRICTLY higher. Absent (no MAGIC slot) = the warm walk as before.
+    comptime if HILL_SEED:
+        var sb = graph_head - MESH_SEED_N
+        if sb >= 1 and Int(
+            rebind[Scalar[DTYPE]](mesh_edges[sb - 1])
+        ) == MESH_SEED_MAGIC:
+            var bin = mesh_seed_bin[DTYPE](ld_x, ld_y, ld_z)
+            if bin >= 0:
+                var s = Int(rebind[Scalar[DTYPE]](mesh_edges[sb + bin]))
+                if s >= 0 and s < num_verts:
+                    var sd = (
+                        ld_x * rebind[Scalar[DTYPE]](mesh_verts[vert_adr + s, 0])
+                        + ld_y * rebind[Scalar[DTYPE]](mesh_verts[vert_adr + s, 1])
+                        + ld_z * rebind[Scalar[DTYPE]](mesh_verts[vert_adr + s, 2])
+                    )
+                    if not warm_ok or sd > best_dot:
+                        imax = s
+                        best_dot = sd
     var prev = -1
     # ⚠ THE STEP BUDGET IS A HANG GUARD, NOT AN ALGORITHMIC BOUND. The
     # walk is monotone in `best_dot` and so cannot cycle on a well-formed
