@@ -541,6 +541,17 @@ struct PPOTrainer[
             Self.train_target, Self.ROLLOUT_LEN, Self.MINIBATCH, Self.N_ENVS,
         ](self.state, self.actor, obs, action_out, self.action_scale)
 
+    def select_greedy_action_batched(
+        mut self,
+        obs_ptr: Pointer[Scalar[DT], MutAnyOrigin],
+        action_ptr: Pointer[Scalar[DT], MutAnyOrigin],
+    ) raises:
+        """N_ENVS-wide deterministic eval: the actor's mean, clamped. Leaves
+        the rollout cache alone."""
+        self.act_step.step_greedy_batched[
+            Self.train_target, Self.ROLLOUT_LEN, Self.MINIBATCH, Self.N_ENVS,
+        ](self.state, self.actor, obs_ptr, action_ptr, self.action_scale)
+
     def record_transition(
         mut self,
         ref obs: List[Scalar[DT]],

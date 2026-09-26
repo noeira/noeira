@@ -7,6 +7,7 @@
 
 Flags: --steps, --seed, --lr, --ent-coef, --ent-coef-final, --anneal-steps,
 --log-std-init, --reward potential|legacy, --success-bonus, --action absolute|delta,
+--init RUN_DIR (with --steps 0: evaluate only), --eval-rounds N (greedy, held-out),
 --checkpoint-every. The driver is `noeira/tasks/ppo_family_driver.run_ppo`;
 read its header, and `noeira-docs/SO101_PIXEL_RL_PLAN.md` for why PPO.
 """

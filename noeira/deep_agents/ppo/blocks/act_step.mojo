@@ -151,6 +151,50 @@ struct PPOActStep[
             clp[e] = lp_total
             cval[e] = v1[e]
 
+    def step_greedy_batched[
+        target: StaticString,
+        ROLLOUT_LEN: Int,
+        MINIBATCH: Int,
+        N_ENVS: Int,
+        POLICY: AMPPolicy = NoAMP,
+    ](
+        mut self,
+        mut state: OnPolicyState[
+            Self.OBS, Self.ACT, ROLLOUT_LEN, MINIBATCH, N_ENVS,
+        ],
+        mut actor: Self.ACTOR,
+        obs_ptr: Pointer[Scalar[DT], MutAnyOrigin],
+        action_ptr: Pointer[Scalar[DT], MutAnyOrigin],
+        action_scale: Scalar[DT],
+    ) raises:
+        """Deterministic N_ENVS-wide actions for eval — the actor's mean,
+        clamped like `step_greedy_n1`. Does not touch the rollout cache."""
+        for e in range(N_ENVS):
+            for d in range(Self.OBS):
+                state.ob1.data[e * Self.OBS + d] = obs_ptr[
+                    unsafe_offset = e * Self.OBS + d
+                ]
+        comptime if target == "gpu":
+            var ctx = state.ctx.value()
+            state.ob1.upload(ctx)
+            call_forward[target, N_ENVS, POLICY=POLICY](
+                actor, TensorRefs[Self.ACTOR.ARITY](state.ob1), state.ao1, state.ctx
+            )
+            state.ao1.download(ctx)
+        else:
+            call_forward[target, N_ENVS, POLICY=POLICY](
+                actor, TensorRefs[Self.ACTOR.ARITY](state.ob1), state.ao1, state.ctx
+            )
+        ref ao1 = state.ao1.data
+        for e in range(N_ENVS):
+            for j in range(Self.ACT):
+                var env_a = ao1[e * 2 * Self.ACT + j]
+                if env_a > action_scale:
+                    env_a = action_scale
+                elif env_a < -action_scale:
+                    env_a = -action_scale
+                action_ptr[unsafe_offset = e * Self.ACT + j] = env_a
+
     def step_greedy_n1[
         target: StaticString,
         ROLLOUT_LEN: Int,

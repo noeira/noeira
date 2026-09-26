@@ -205,6 +205,18 @@ struct RunningMeanStd(Movable):
                     v = -clip
                 dst[unsafe_offset = i * dim + k] = Scalar[DT](v)
 
+    def load(mut self, path: String) raises:
+        var txt = String()
+        with open(path, "r") as f:
+            txt = f.read()
+        var lines = txt.split("\n")
+        self.count = Float64(String(lines[0].split(" ")[1]))
+        var m = lines[1].split(" ")
+        var v = lines[2].split(" ")
+        for k in range(len(self.mean)):
+            self.mean[k] = Float64(String(m[k + 1]))
+            self.var_[k] = Float64(String(v[k + 1]))
+
     def save(self, path: String) raises:
         var s = String("count ") + String(self.count) + "\n"
         s += "mean"
@@ -216,6 +228,30 @@ struct RunningMeanStd(Movable):
         s += "\n"
         with open(path, "w") as f:
             f.write(s)
+
+
+def _delta_to_env(
+    ap: Pointer[Scalar[DT], MutAnyOrigin],
+    ep: Pointer[Scalar[DT], MutAnyOrigin],
+    ref arm_q: List[Float64],
+    ref a_lo: List[Float64],
+    ref a_hi: List[Float64],
+):
+    """`--action delta`: target = clamp(q + a * scale), normalised onto the
+    env's absolute action (`(target - mid) / half`)."""
+    for e in range(N_ENVS):
+        for j in range(ACT_DIM):
+            var sc = DELTA_GRIPPER if j == ACT_DIM - 1 else DELTA_ARM
+            var tgt = arm_q[e * ACT_DIM + j] + Float64(
+                ap[unsafe_offset = e * ACT_DIM + j]
+            ) * sc
+            if tgt < a_lo[j]:
+                tgt = a_lo[j]
+            elif tgt > a_hi[j]:
+                tgt = a_hi[j]
+            var mid = 0.5 * (a_lo[j] + a_hi[j])
+            var half = 0.5 * (a_hi[j] - a_lo[j])
+            ep[unsafe_offset = e * ACT_DIM + j] = Scalar[DT]((tgt - mid) / half)
 
 
 def _arg(args: List[String], key: String, default: String) raises -> String:
@@ -255,6 +291,8 @@ def run_ppo[M: ModelDefLike, C: Phyics3dEnvConfig](
     var ckpt_every = Int(_arg(args, "--checkpoint-every", "5000000"))
     var anneal_steps = Int(_arg(args, "--anneal-steps", String(total_steps)))
     var action_mode = _arg(args, "--action", "absolute")
+    var init_dir = _arg(args, "--init", "")
+    var eval_rounds = Int(_arg(args, "--eval-rounds", "4"))
     if action_mode != "absolute" and action_mode != "delta":
         raise Error("ppo task: --action absolute|delta, got " + action_mode)
     if reward != "potential" and reward != "legacy":
@@ -349,6 +387,9 @@ def run_ppo[M: ModelDefLike, C: Phyics3dEnvConfig](
         agent.trainer.actor.children[4].set_log_std_init["gpu"](
             Scalar[DT](log_std0), ctx
         )
+        if init_dir.byte_length() > 0:
+            agent.trainer.load_state(init_dir + "/checkpoints/last.ckpt")
+            print("  init: actor + critic from", init_dir)
         var env = EnvT[M, C](ctx)
         for i in range(MODEL_CURRICULUM_SIZE):
             env.mf.curriculum.data[i] = Scalar[DT](cw[i])
@@ -395,6 +436,9 @@ def run_ppo[M: ModelDefLike, C: Phyics3dEnvConfig](
         var done_dev = DeviceBuffer[DT](ctx, env.done_ptr(), N_ENVS, owning=False)
 
         var obs_rms = RunningMeanStd(OBS)
+        if init_dir.byte_length() > 0:
+            obs_rms.load(init_dir + "/obs_norm.txt")
+            print("  init: observation statistics from", init_dir)
         var ret_rms = RunningMeanStd(1)
         var ret_acc = List[Float64](length=N_ENVS, fill=0.0)
         var raw_ret = List[Float64](length=N_ENVS, fill=0.0)
@@ -444,23 +488,10 @@ def run_ppo[M: ModelDefLike, C: Phyics3dEnvConfig](
                 mptr(cur_n.unsafe_ptr()), mptr(act_h.unsafe_ptr()), step,
             )
             if action_mode == "delta":
-                var ap = mptr(act_h.unsafe_ptr())
-                var ep = mptr(env_act.unsafe_ptr())
-                for e in range(N_ENVS):
-                    for j in range(ACT_DIM):
-                        var sc = DELTA_GRIPPER if j == ACT_DIM - 1 else DELTA_ARM
-                        var tgt = arm_q[e * ACT_DIM + j] + Float64(
-                            ap[unsafe_offset = e * ACT_DIM + j]
-                        ) * sc
-                        if tgt < a_lo[j]:
-                            tgt = a_lo[j]
-                        elif tgt > a_hi[j]:
-                            tgt = a_hi[j]
-                        var mid = 0.5 * (a_lo[j] + a_hi[j])
-                        var half = 0.5 * (a_hi[j] - a_lo[j])
-                        ep[unsafe_offset = e * ACT_DIM + j] = Scalar[DT](
-                            (tgt - mid) / half
-                        )
+                _delta_to_env(
+                    mptr(act_h.unsafe_ptr()), mptr(env_act.unsafe_ptr()),
+                    arm_q, a_lo, a_hi,
+                )
                 ctx.enqueue_copy(act_dev, env_act)
             else:
                 ctx.enqueue_copy(act_dev, act_h)
@@ -598,8 +629,60 @@ def run_ppo[M: ModelDefLike, C: Phyics3dEnvConfig](
                 agent.trainer.save_state(ckpt_path)
                 obs_rms.save(run.dir + "/obs_norm.txt")
                 next_ckpt += ckpt_every
-        agent.trainer.save_state(ckpt_path)
-        obs_rms.save(run.dir + "/obs_norm.txt")
+        if total_steps > 0:
+            agent.trainer.save_state(ckpt_path)
+            obs_rms.save(run.dir + "/obs_norm.txt")
+
+        # ── the greedy evaluation: the actor's MEAN, frozen statistics,
+        # held-out placements (reset seeds the training never drew) ─────
+        var eval_ok = 0
+        var eval_n = 0
+        for rnd in range(eval_rounds):
+            env.reset_batch[N_ENVS](
+                ctx=ctx, rng_seed=UInt64(1_000_003 + seed * 101 + rnd)
+            )
+            ctx.enqueue_copy(raw_h, obs_dev)
+            ctx.synchronize()
+            var held = List[Bool](length=N_ENVS, fill=False)
+            for t in range(C.MAX_STEPS - 1):
+                var rq = mptr(raw_h.unsafe_ptr())
+                for e in range(N_ENVS):
+                    for j in range(ACT_DIM):
+                        arm_q[e * ACT_DIM + j] = Float64(
+                            rq[unsafe_offset = e * OBS + a_qa[j]]
+                        )
+                obs_rms.normalize_into(
+                    rq, mptr(cur_n.unsafe_ptr()), N_ENVS, OBS, OBS_CLIP
+                )
+                agent.trainer.select_greedy_action_batched(
+                    mptr(cur_n.unsafe_ptr()), mptr(act_h.unsafe_ptr())
+                )
+                if action_mode == "delta":
+                    _delta_to_env(
+                        mptr(act_h.unsafe_ptr()), mptr(env_act.unsafe_ptr()),
+                        arm_q, a_lo, a_hi,
+                    )
+                    ctx.enqueue_copy(act_dev, env_act)
+                else:
+                    ctx.enqueue_copy(act_dev, act_h)
+                env.step_batch[N_ENVS](ctx=ctx, rng_seed=UInt64(t + 1))
+                ctx.enqueue_copy(raw_h, obs_dev)
+                env.d.meta.download(ctx)
+                ctx.synchronize()
+                for e in range(N_ENVS):
+                    if env.d.meta.data[e * METADATA_SIZE + META_IDX_GOAL_HELD] > Scalar[DT](0.5):
+                        held[e] = True
+            var ok = 0
+            for e in range(N_ENVS):
+                if held[e]:
+                    ok += 1
+            print("  greedy eval round", rnd, ":", ok, "/", N_ENVS)
+            eval_ok += ok
+            eval_n += N_ENVS
+        var eval_rate = Float64(eval_ok) / Float64(eval_n) if eval_n > 0 else 0.0
+        if eval_n > 0:
+            print("  GREEDY SUCCESS", eval_ok, "/", eval_n, "=", eval_rate)
+            logger.log_scalar("eval_success_rate", eval_rate, step)
         var n = len(hist_succ)
         var lo = n - SUCCESS_WINDOW if n > SUCCESS_WINDOW else 0
         var ns = 0
@@ -614,5 +697,6 @@ def run_ppo[M: ModelDefLike, C: Phyics3dEnvConfig](
         print("  checkpoint", ckpt_path)
         print("=" * 70)
         finish_run(run, logger, artifacts,
-                   String("success_rate=") + String(rate))
+                   String("success_rate=") + String(rate)
+                   + " eval_success_rate=" + String(eval_rate))
         _ = logger
