@@ -88,8 +88,8 @@ from noeira.envs.robots.unitree_g1_rsi import G1RsiTable, G1_RSI_NQ, G1_RSI_NV
 # been a realloc. Aggregating by max-per-id UNDERCOUNTS by ~4.7 GiB and makes a
 # capacity wall look like a leak. It is not one.
 comptime G1_D: Int = 256          # z_dim
-comptime G1_H: Int = 1024         # hidden_dim    — §12.30: 2048/6 plateaus at the same EMD
-comptime G1_L: Int = 3            # hidden_layers — and 1024/3 is 1.75x faster to get there
+comptime G1_H: Int = 2048         # hidden_dim    — the reference's own (config.json f.hidden_dim)
+comptime G1_L: Int = 6            # hidden_layers — §12.30's null is VOID, see §12.40
 comptime G1_HB: Int = 256         # backward map hidden
 comptime G1_HD: Int = 1024        # discriminator hidden
 

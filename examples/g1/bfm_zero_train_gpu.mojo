@@ -182,26 +182,21 @@ comptime BATCH: Int = 1024
 # transition rather than 5360. At CAP 2 M that frees 3.92 GiB, which is what
 # pays for the CAP raise below.
 #
-# CAP stays 2.0 M and the tower is back to 1024/3 (docs §12.30): the
-# reference's own 2048/6 ran to 10.24 M and PLATEAUED at the same EMD as
-# 1024/3 (mean 1.342 vs 1.338 over 5.12-10.24 M), having got there faster.
-# Capacity buys early speed, not the final level.
+# ⚠ MEASURE VRAM BEFORE RAISING CAP (docs §12.41). The tower is the
+# reference's own 2048/6 and `CAP` is deliberately left at 2 M so the first
+# thing the box does is a 40-step SMOKE whose only job is to report the real
+# peak. A 40-step smoke allocates the whole ring at `make` and captures the
+# graph, so it reaches peak in ~20 s — the cheapest possible measurement.
 #
-# ⚠ CAP is held at 2.0 M ON PURPOSE. The 09-15 long run was 1024/3 at CAP
-# 2 M, so keeping it makes the ortho change (§12.28) a SINGLE-AXIS difference
-# against that run. There is headroom to raise it — at 1024/3 the budget is
-# ~12.3 GB non-ring, so CAP 4 M is ~25.3 GB and even the reference's 5.12 M
-# is ~28.9 GB of 31.8 — but spending it here would confound the one question
-# this run is launched to answer, exactly as §12.21's tower/CAP tangle did.
+# The PREDICTION, from the measured 1024/3 + 928-obs + CAP 2 M = 16.8 GB
+# (ring 6.52 -> non-ring 10.3) plus §12.21's model+Adam+activation delta of
+# +4.2 GB: non-ring ~14.5, ring 6.52, total ~21.0 GB of 31.8. CAP 3 M would be
+# ~24.3 and CAP 4 M ~27.5.
 #
-# ⚠ THAT ESTIMATE IS THE FOURTH ONE IN THIS TRACK AND THE FIRST THREE WERE
-# WRONG (18.3, 23.3, 26 GiB against a 25.9 GiB measurement). Read the
-# dashboard at step 0 before trusting the run; if it OOMs, CAP is one constant.
-#
-# The reference's own buffer is 5_120_000. That needs ~28.7 GiB here, above
-# where this card has already OOM'd once — it is reachable only paired with
-# the 1024/3 tower (§12.21 says 40 M params tracked BETTER than 111 M), which
-# is a separate experiment and is NOT bundled into this change.
+# ⚠ Four of the five VRAM predictions in this track were WRONG (18.3 / 23.3 /
+# 26 GiB against a 25.9 GiB measurement), and the one that was not was
+# PESSIMISTIC by 2.0 GB. So: read the smoke, then set CAP. Do not set CAP from
+# the numbers above.
 comptime CAP: Int = 2_000_000
 comptime SEQ: Int = 8
 comptime ZBUF: Int = 8192
