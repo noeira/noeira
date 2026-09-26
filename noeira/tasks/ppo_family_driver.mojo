@@ -79,6 +79,11 @@ from noeira.io.artifact_sink import sink_for_run
 from noeira.nn.combinators.sequential import Sequential
 from noeira.nn.constants import DT
 from noeira.nn.core.ptr import mptr
+from noeira.nn.core.tensor import Tensor
+from noeira.nn.core.tensor_refs import TensorRefs
+from noeira.nn.core.call import call_forward, call_vjp
+from noeira.deep_agents.demos.file import read_demo_file
+from std.random import random_ui64
 from noeira.nn.primitives.activations import Tanh
 from noeira.nn.primitives.linear import Linear
 from noeira.physics3d.gpu.constants import (
@@ -254,6 +259,130 @@ def _delta_to_env(
             ep[unsafe_offset = e * ACT_DIM + j] = Scalar[DT]((tgt - mid) / half)
 
 
+def _bc_pretrain[OBS: Int](
+    mut agent: AgentT[OBS],
+    ctx: DeviceContext,
+    demo_paths: String,
+    action_mode: String,
+    ref a_qa: List[Int],
+    ref a_lo: List[Float64],
+    ref a_hi: List[Float64],
+    mut obs_rms: RunningMeanStd,
+    updates: Int,
+    lr: Float64,
+) raises:
+    """Behaviour-clone the actor's MEAN on the SUCCESSFUL episodes of the
+    scripted teacher's `.demo` files — so101-nexus's fix for pick-and-place
+    (`bc_ppo_warp.py`: pure PPO never finds the place event).
+
+    The observation statistics are seeded from the demo rows first, so PPO
+    starts normalising in the demonstrated distribution. Labels in `delta`
+    mode are the teacher's TARGETS expressed as deltas from the current
+    joints, `(target - q) / scale`, clipped to [-1, 1] (the teacher's `act`
+    is the family's normalised absolute target); in `absolute` mode they are
+    `act` itself. MSE on the mean only; the log-std is the caller's to set.
+    """
+    comptime MB = MINIBATCH
+    comptime A2 = 2 * ACT_DIM
+    var X = List[Scalar[DT]]()
+    var Y = List[Scalar[DT]]()
+    var n_rows = 0
+    var n_eps = 0
+    for path in demo_paths.split(","):
+        var d = read_demo_file(String(path))
+        if d.obs_dim != OBS or d.act_dim != ACT_DIM:
+            raise Error(
+                "ppo bc: " + String(path) + " has obs " + String(d.obs_dim)
+                + " / act " + String(d.act_dim) + ", the env " + String(OBS)
+                + " / " + String(ACT_DIM)
+            )
+        for ep in range(d.n_episodes()):
+            if not d.ep_success[ep]:
+                continue
+            n_eps += 1
+            for r in range(d.ep_start[ep], d.ep_start[ep] + d.ep_len[ep]):
+                for k in range(OBS):
+                    X.append(Scalar[DT](d.obs[r * OBS + k]))
+                for j in range(ACT_DIM):
+                    var a = Float64(d.act[r * ACT_DIM + j])
+                    if action_mode == "delta":
+                        var mid = 0.5 * (a_lo[j] + a_hi[j])
+                        var half = 0.5 * (a_hi[j] - a_lo[j])
+                        var tgt = mid + a * half
+                        var q = Float64(d.obs[r * OBS + a_qa[j]])
+                        var sc = DELTA_GRIPPER if j == ACT_DIM - 1 else DELTA_ARM
+                        a = (tgt - q) / sc
+                    if a > 1.0:
+                        a = 1.0
+                    elif a < -1.0:
+                        a = -1.0
+                    Y.append(Scalar[DT](a))
+                n_rows += 1
+    if n_rows < MB:
+        raise Error("ppo bc: only " + String(n_rows) + " demo rows")
+    print("  bc: ", n_eps, "successful episodes,", n_rows, "rows from",
+          demo_paths)
+    obs_rms.update(mptr(X.unsafe_ptr()), n_rows, OBS)
+    var Xn = List[Scalar[DT]](length=n_rows * OBS, fill=Scalar[DT](0))
+    obs_rms.normalize_into(
+        mptr(X.unsafe_ptr()), mptr(Xn.unsafe_ptr()), n_rows, OBS, OBS_CLIP
+    )
+
+    # ⚠ HOST-FILLED TENSORS ARE `alloc`ed (host `.data`) and uploaded ONCE —
+    # `Tensor.make["gpu"]` allocates the device buffer only, with an empty
+    # host list; the per-update copies are then `upload_resident`.
+    var obs_t = Tensor.alloc(MB * OBS)
+    obs_t.upload(ctx)
+    var g_t = Tensor.alloc(MB * A2)
+    g_t.upload(ctx)
+    var ao_t = Tensor.make["gpu"](MB * A2, ctx)
+    var og_t = Tensor.make["gpu"](MB * OBS, ctx)
+    agent.trainer.actor_opt.set_lr(Scalar[DT](lr))
+    var loss_acc = 0.0
+    for u in range(updates):
+        var idx = List[Int](capacity=MB)
+        for _ in range(MB):
+            idx.append(Int(random_ui64(0, UInt64(n_rows - 1))))
+        for b in range(MB):
+            for k in range(OBS):
+                obs_t.data[b * OBS + k] = Xn[idx[b] * OBS + k]
+        obs_t.upload_resident(ctx)
+        agent.trainer.actor_opt.zero_grad["gpu", M=ActorNet[OBS]](
+            agent.trainer.actor, ctx
+        )
+        call_forward["gpu", MB](
+            agent.trainer.actor, TensorRefs[1](obs_t), ao_t, ctx
+        )
+        ao_t.download(ctx)
+        var loss = 0.0
+        for b in range(MB):
+            for j in range(A2):
+                g_t.data[b * A2 + j] = Scalar[DT](0)
+            for j in range(ACT_DIM):
+                var diff = Float64(ao_t.data[b * A2 + j]) - Float64(
+                    Y[idx[b] * ACT_DIM + j]
+                )
+                loss += diff * diff
+                g_t.data[b * A2 + j] = Scalar[DT](
+                    2.0 * diff / Float64(MB * ACT_DIM)
+                )
+        loss_acc += loss / Float64(MB * ACT_DIM)
+        g_t.upload_resident(ctx)
+        call_vjp["gpu", MB](
+            agent.trainer.actor, TensorRefs[1](obs_t), g_t,
+            TensorRefs[1](og_t), ctx,
+        )
+        _ = agent.trainer.actor_opt.clip_grads["gpu", M=ActorNet[OBS]](
+            agent.trainer.actor, Scalar[DT](1.0), ctx
+        )
+        agent.trainer.actor_opt.step["gpu", M=ActorNet[OBS]](
+            agent.trainer.actor, ctx
+        )
+        if (u + 1) % 250 == 0:
+            print("  bc update", u + 1, "/", updates, "| mse", loss_acc / 250.0)
+            loss_acc = 0.0
+
+
 def _arg(args: List[String], key: String, default: String) raises -> String:
     for i in range(len(args) - 1):
         if args[i] == key:
@@ -292,6 +421,10 @@ def run_ppo[M: ModelDefLike, C: Phyics3dEnvConfig](
     var anneal_steps = Int(_arg(args, "--anneal-steps", String(total_steps)))
     var action_mode = _arg(args, "--action", "absolute")
     var init_dir = _arg(args, "--init", "")
+    var bc_demos = _arg(args, "--bc-demos", "")
+    var bc_updates = Int(_arg(args, "--bc-updates", "2000"))
+    var bc_lr = Float64(_arg(args, "--bc-lr", "0.001"))
+    var bc_log_std = Float64(_arg(args, "--bc-log-std", "-1.0"))
     var eval_rounds = Int(_arg(args, "--eval-rounds", "4"))
     if action_mode != "absolute" and action_mode != "delta":
         raise Error("ppo task: --action absolute|delta, got " + action_mode)
@@ -361,6 +494,8 @@ def run_ppo[M: ModelDefLike, C: Phyics3dEnvConfig](
     logger.set_config("log_std_init", String(log_std0))
     logger.set_config("reward", reward)
     logger.set_config("action", action_mode)
+    logger.set_config("bc_demos", bc_demos)
+    logger.set_config("bc_updates", String(bc_updates))
     logger.set_config("success_bonus", String(bonus))
     logger.set_config("horizon", String(C.MAX_STEPS))
     logger.set_config("obs_norm", "running, clip 10")
@@ -439,6 +574,17 @@ def run_ppo[M: ModelDefLike, C: Phyics3dEnvConfig](
         if init_dir.byte_length() > 0:
             obs_rms.load(init_dir + "/obs_norm.txt")
             print("  init: observation statistics from", init_dir)
+        if bc_demos.byte_length() > 0:
+            _bc_pretrain[OBS](
+                agent, ctx, bc_demos, action_mode, a_qa, a_lo, a_hi, obs_rms,
+                bc_updates, bc_lr,
+            )
+            agent.trainer.actor_opt.set_lr(Scalar[DT](lr0))
+            agent.trainer.actor.children[4].set_log_std_init["gpu"](
+                Scalar[DT](bc_log_std), ctx
+            )
+            print("  bc: done; PPO starts from the cloned mean, log-std",
+                  bc_log_std)
         var ret_rms = RunningMeanStd(1)
         var ret_acc = List[Float64](length=N_ENVS, fill=0.0)
         var raw_ret = List[Float64](length=N_ENVS, fill=0.0)
