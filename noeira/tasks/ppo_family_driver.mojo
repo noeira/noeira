@@ -26,6 +26,18 @@ plus its observation and reward normalisation (CleanRL's `NormalizeObservation`
 / `NormalizeReward`: running mean/std, clip ±10), done here on the host because
 the on-policy trainer already stages obs through host memory.
 
+⚠⚠ A DIVERGED LANE IS RESET AND KEPT OUT OF THE STATISTICS. The first 5090
+run (lift, absolute actions, 2026-09-26) reached 72 % at 9.2M steps and fell
+to 1 % by 10.5M with a HEALTHY update (KL 0.009, explained variance 0.9): a
+few lanes' physics had blown up (arm qpos ~1e7, brick 1e5 m) under bang-bang
+targets, and the running variance — cumulative, never forgotten — reached
+1e14 on the joint words, so every healthy lane's normalised joints read ~0
+and the policy lost its own arm. so101-nexus guards the same failure on
+MuJoCo Warp (`_finite`). Here a lane whose raw obs has a non-finite word or
+one beyond `OBS_BOUND` (or a reward beyond `REW_BOUND`) is marked done (the
+env resets it), its reward is zeroed, its observation is left out of the
+running statistics, and the count is logged as `diverged`.
+
 THE REWARD is the family's potential-based mode by default
 (`--reward potential`, `tasks/shaping.reward_mode_words`): the change of the
 staged potential, the full budget while the goal holds, an optional one-time
@@ -99,6 +111,9 @@ comptime SUCCESS_WINDOW = 1024
 comptime OBS_CLIP = 10.0
 comptime REW_CLIP = 10.0
 comptime GAMMA = 0.99
+comptime OBS_BOUND = 1.0e3
+"""A raw observation word beyond this (or non-finite) marks the lane DIVERGED."""
+comptime REW_BOUND = 1.0e3
 comptime DELTA_ARM = 0.05
 comptime DELTA_GRIPPER = 0.2
 
@@ -136,16 +151,26 @@ struct RunningMeanStd(Movable):
         self.count = 1e-4
 
     def update(
-        mut self, x: Pointer[Scalar[DT], MutAnyOrigin], n: Int, dim: Int
+        mut self, x: Pointer[Scalar[DT], MutAnyOrigin], n_rows: Int, dim: Int,
+        skip: List[Bool] = List[Bool](),
     ):
+        """Rows with `skip[i]` set are left out (diverged lanes)."""
         var bm = List[Float64](length=dim, fill=0.0)
         var bv = List[Float64](length=dim, fill=0.0)
-        for i in range(n):
+        var n = 0
+        for i in range(n_rows):
+            if len(skip) > 0 and skip[i]:
+                continue
+            n += 1
             for k in range(dim):
                 bm[k] += Float64(x[unsafe_offset = i * dim + k])
+        if n == 0:
+            return
         for k in range(dim):
             bm[k] /= Float64(n)
-        for i in range(n):
+        for i in range(n_rows):
+            if len(skip) > 0 and skip[i]:
+                continue
             for k in range(dim):
                 var d = Float64(x[unsafe_offset = i * dim + k]) - bm[k]
                 bv[k] += d * d
@@ -377,6 +402,8 @@ def run_ppo[M: ModelDefLike, C: Phyics3dEnvConfig](
         var hist_succ = List[Bool]()
         var hist_ret = List[Float64]()
         var n_episodes = 0
+        var diverged = List[Bool](length=N_ENVS, fill=False)
+        var n_diverged = 0
 
         # the first observation
         ctx.enqueue_copy(raw_h, obs_dev)
@@ -445,10 +472,39 @@ def run_ppo[M: ModelDefLike, C: Phyics3dEnvConfig](
             env.d.meta.download(ctx)
             ctx.synchronize()
             var raw_p = mptr(raw_h.unsafe_ptr())
-            obs_rms.update(raw_p, N_ENVS, OBS)
+            var dh0 = mptr(done_h.unsafe_ptr())
+            var rh0 = mptr(rew_h.unsafe_ptr())
+            var n_bad = 0
+            for e in range(N_ENVS):
+                var bad = False
+                var rv = Float64(rh0[unsafe_offset=e])
+                if not (rv == rv) or abs(rv) > REW_BOUND:
+                    bad = True
+                for k in range(OBS):
+                    var v = Float64(raw_p[unsafe_offset = e * OBS + k])
+                    if not (v == v) or abs(v) > OBS_BOUND:
+                        bad = True
+                        break
+                diverged[e] = bad
+                if bad:
+                    n_bad += 1
+                    dh0[unsafe_offset=e] = Scalar[DT](1)
+                    rh0[unsafe_offset=e] = Scalar[DT](0)
+            n_diverged += n_bad
+            obs_rms.update(raw_p, N_ENVS, OBS, diverged)
             obs_rms.normalize_into(
                 raw_p, mptr(next_n.unsafe_ptr()), N_ENVS, OBS, OBS_CLIP,
             )
+            if n_bad > 0:
+                # the terminal obs of a diverged lane is garbage: zero it
+                var nn = mptr(next_n.unsafe_ptr())
+                for e in range(N_ENVS):
+                    if diverged[e]:
+                        for k in range(OBS):
+                            nn[unsafe_offset = e * OBS + k] = Scalar[DT](0)
+                # the env resets on its OWN done buffer: write the forced
+                # dones back before `selective_reset_batch`
+                ctx.enqueue_copy(done_dev, done_h)
             # 3. reward normalisation (CleanRL NormalizeReward) + tallies
             var rh = mptr(rew_h.unsafe_ptr())
             var dh = mptr(done_h.unsafe_ptr())
@@ -526,6 +582,7 @@ def run_ppo[M: ModelDefLike, C: Phyics3dEnvConfig](
                 logger.log_scalar("success_rate", rate, step)
                 logger.log_scalar("episode_return", mret, step)
                 logger.log_scalar("episodes", Float64(n_episodes), step)
+                logger.log_scalar("diverged", Float64(n_diverged), step)
                 logger.log_scalar("sps", Float64(step) / secs, step)
                 logger.log_scalar("lr", lr0 * frac, step)
                 logger.log_scalar("ent_coef", ent1 + (ent0 - ent1) * frac, step)
@@ -535,6 +592,7 @@ def run_ppo[M: ModelDefLike, C: Phyics3dEnvConfig](
                 if n_updates % 10 == 0:
                     print("  step", step, "| success", rate, "over", nw,
                           "ep | return", mret, "| episodes", n_episodes,
+                          "| diverged", n_diverged,
                           "|", Int(Float64(step) / secs), "steps/s")
             if step >= next_ckpt:
                 agent.trainer.save_state(ckpt_path)
