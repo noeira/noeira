@@ -36,14 +36,21 @@ the training rollout (the goal held at ANY step — `META_IDX_GOAL_HELD`), over
 a window of the last `SUCCESS_WINDOW` episodes. A greedy evaluation is a
 later addition.
 
-⚠ ACTIONS ARE THE FAMILY'S: ABSOLUTE joint targets normalised to each
-actuator's ctrlrange. so101-nexus and Squint both act in DELTAS (0.05 rad per
-joint per step); a Gaussian at std 1 over absolute targets throws every
-target across the whole range each step. Hence `--log-std-init -1.0`
-(std 0.37) by default. If exploration stalls, delta actions are the lever.
+⚠ TWO ACTION SPACES (`--action`):
+- `absolute` (default): the family's own — joint targets normalised to each
+  actuator's ctrlrange. A Gaussian at std 1 would throw every target across
+  the whole range each step, hence `--log-std-init -1.0` (std 0.37); the first
+  Metal smoke then showed a first-update KL ~1.0 with 85 % clipped, because a
+  small mean shift at a small std IS a large KL.
+- `delta`: so101-nexus's `pd_joint_delta_pos` — the target is the CURRENT
+  joint position plus `a * DELTA_SCALE` (0.05 rad per arm joint, 0.2 for the
+  gripper, per control step), clamped to the ctrlrange, then normalised into
+  the env's absolute action. Anchored on the joints (read from the raw
+  observation), so there is no hidden target state. Pair with
+  `--log-std-init 0` (nexus's std 1).
 """
 
-from std.math import sqrt
+from std.math import abs, sqrt
 from std.random import random_float64, seed as seed_rng
 from std.sys import is_defined
 from std.time import perf_counter_ns
@@ -92,6 +99,8 @@ comptime SUCCESS_WINDOW = 1024
 comptime OBS_CLIP = 10.0
 comptime REW_CLIP = 10.0
 comptime GAMMA = 0.99
+comptime DELTA_ARM = 0.05
+comptime DELTA_GRIPPER = 0.2
 
 comptime EnvT[M: ModelDefLike, C: Phyics3dEnvConfig] = Phyics3dBatchedEnv[
     M, C, N_ENVS, TERMINATE_ON_UNHEALTHY=False,
@@ -220,6 +229,9 @@ def run_ppo[M: ModelDefLike, C: Phyics3dEnvConfig](
     var bonus = Float64(_arg(args, "--success-bonus", "0"))
     var ckpt_every = Int(_arg(args, "--checkpoint-every", "5000000"))
     var anneal_steps = Int(_arg(args, "--anneal-steps", String(total_steps)))
+    var action_mode = _arg(args, "--action", "absolute")
+    if action_mode != "absolute" and action_mode != "delta":
+        raise Error("ppo task: --action absolute|delta, got " + action_mode)
     if reward != "potential" and reward != "legacy":
         raise Error("ppo task: --reward potential|legacy, got " + reward)
     var rw = reward_mode_words(reward == "potential", bonus)
@@ -234,7 +246,8 @@ def run_ppo[M: ModelDefLike, C: Phyics3dEnvConfig](
           C.MAX_STEPS)
     print("  steps", total_steps, "| lr", lr0, "| ent", ent0, "->", ent1,
           "over", anneal_steps, "steps | log_std init", log_std0)
-    print("  reward", reward, "| success bonus", bonus, "| seed", seed)
+    print("  reward", reward, "| success bonus", bonus, "| seed", seed,
+          "| action", action_mode)
     print("=" * 70)
 
     # ── the task's words (the eval's / the bench's set-up) ───────────────
@@ -250,6 +263,20 @@ def run_ppo[M: ModelDefLike, C: Phyics3dEnvConfig](
     var mw = task_meta_words(
         task, family, shape_w_goal, shape_w_reach, goal_margin, reach_margin,
     )
+    # The actuators' joints (qpos addresses) and ctrl ranges, for `--action
+    # delta`: target = clamp(q + a * scale), normalised as the env expects.
+    var jadr = List[Int]()
+    var acc = 0
+    for i in range(len(fmd.joints)):
+        jadr.append(acc)
+        acc += fmd.joints[i].nq
+    var a_qa = List[Int]()
+    var a_lo = List[Float64]()
+    var a_hi = List[Float64]()
+    for i in range(ACT_DIM):
+        a_qa.append(jadr[fmd.actuators[i].joint_id])
+        a_lo.append(fmd.actuators[i].ctrl_min)
+        a_hi.append(fmd.actuators[i].ctrl_max)
 
     var run = RunContext(
         project=project, driver=driver, slug=String("ppo-") + task,
@@ -270,6 +297,7 @@ def run_ppo[M: ModelDefLike, C: Phyics3dEnvConfig](
     logger.set_config("ent_coef_final", String(ent1))
     logger.set_config("log_std_init", String(log_std0))
     logger.set_config("reward", reward)
+    logger.set_config("action", action_mode)
     logger.set_config("success_bonus", String(bonus))
     logger.set_config("horizon", String(C.MAX_STEPS))
     logger.set_config("obs_norm", "running, clip 10")
@@ -333,6 +361,8 @@ def run_ppo[M: ModelDefLike, C: Phyics3dEnvConfig](
         var rew_n = ctx.enqueue_create_host_buffer[DT](N_ENVS)
         var done_h = ctx.enqueue_create_host_buffer[DT](N_ENVS)
         var rets = ctx.enqueue_create_host_buffer[DT](N_ENVS)
+        var env_act = ctx.enqueue_create_host_buffer[DT](N_ENVS * ACT_DIM)
+        var arm_q = List[Float64](length=N_ENVS * ACT_DIM, fill=0.0)
         ctx.synchronize()
         var obs_dev = DeviceBuffer[DT](ctx, env.obs_ptr(), N_ENVS * OBS, owning=False)
         var act_dev = DeviceBuffer[DT](ctx, env.action_ptr(), N_ENVS * ACT_DIM, owning=False)
@@ -352,6 +382,26 @@ def run_ppo[M: ModelDefLike, C: Phyics3dEnvConfig](
         ctx.enqueue_copy(raw_h, obs_dev)
         ctx.synchronize()
         var rp = mptr(raw_h.unsafe_ptr())
+        # ⚠ THE DELTA MODE READS THE JOINTS OUT OF THE RAW OBSERVATION at the
+        # actuators' qpos addresses (the family's obs starts with qpos). Proved
+        # here against the env's own qpos rather than assumed.
+        env.d.qpos.download(ctx)
+        ctx.synchronize()
+        comptime NQ_M = M.NQ
+        for e in range(N_ENVS):
+            for j in range(ACT_DIM):
+                var a = Float64(rp[unsafe_offset = e * OBS + a_qa[j]])
+                var b = Float64(env.d.qpos.data[e * NQ_M + a_qa[j]])
+                if abs(a - b) > 1e-5:
+                    raise Error(
+                        "ppo task: obs[" + String(a_qa[j]) + "] of lane "
+                        + String(e) + " is " + String(a) + ", qpos is "
+                        + String(b) + " — the observation does not start with"
+                        " qpos, and --action delta would anchor on garbage"
+                    )
+        for e in range(N_ENVS):
+            for j in range(ACT_DIM):
+                arm_q[e * ACT_DIM + j] = Float64(rp[unsafe_offset = e * OBS + a_qa[j]])
         obs_rms.update(rp, N_ENVS, OBS)
         obs_rms.normalize_into(rp, mptr(cur_n.unsafe_ptr()), N_ENVS, OBS, OBS_CLIP)
 
@@ -366,7 +416,27 @@ def run_ppo[M: ModelDefLike, C: Phyics3dEnvConfig](
             agent.trainer.select_action_batched(
                 mptr(cur_n.unsafe_ptr()), mptr(act_h.unsafe_ptr()), step,
             )
-            ctx.enqueue_copy(act_dev, act_h)
+            if action_mode == "delta":
+                var ap = mptr(act_h.unsafe_ptr())
+                var ep = mptr(env_act.unsafe_ptr())
+                for e in range(N_ENVS):
+                    for j in range(ACT_DIM):
+                        var sc = DELTA_GRIPPER if j == ACT_DIM - 1 else DELTA_ARM
+                        var tgt = arm_q[e * ACT_DIM + j] + Float64(
+                            ap[unsafe_offset = e * ACT_DIM + j]
+                        ) * sc
+                        if tgt < a_lo[j]:
+                            tgt = a_lo[j]
+                        elif tgt > a_hi[j]:
+                            tgt = a_hi[j]
+                        var mid = 0.5 * (a_lo[j] + a_hi[j])
+                        var half = 0.5 * (a_hi[j] - a_lo[j])
+                        ep[unsafe_offset = e * ACT_DIM + j] = Scalar[DT](
+                            (tgt - mid) / half
+                        )
+                ctx.enqueue_copy(act_dev, env_act)
+            else:
+                ctx.enqueue_copy(act_dev, act_h)
             # 2. step; the post-step obs, reward, done, meta (goal bit)
             env.step_batch[N_ENVS](ctx=ctx, rng_seed=UInt64(it + 1))
             ctx.enqueue_copy(raw_h, obs_dev)
@@ -418,9 +488,14 @@ def run_ppo[M: ModelDefLike, C: Phyics3dEnvConfig](
             )
             ctx.enqueue_copy(raw_h, obs_dev)
             ctx.synchronize()
+            var rp2 = mptr(raw_h.unsafe_ptr())
+            for e in range(N_ENVS):
+                for j in range(ACT_DIM):
+                    arm_q[e * ACT_DIM + j] = Float64(
+                        rp2[unsafe_offset = e * OBS + a_qa[j]]
+                    )
             obs_rms.normalize_into(
-                mptr(raw_h.unsafe_ptr()), mptr(cur_n.unsafe_ptr()), N_ENVS, OBS,
-                OBS_CLIP,
+                rp2, mptr(cur_n.unsafe_ptr()), N_ENVS, OBS, OBS_CLIP,
             )
             step += N_ENVS
             it += 1

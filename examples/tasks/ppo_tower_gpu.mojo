@@ -6,7 +6,7 @@
     # -D TASK_PPO_LANES_4096 at build for 4096 lanes, _256 for a smoke run
 
 Flags: --steps, --seed, --lr, --ent-coef, --ent-coef-final, --anneal-steps,
---log-std-init, --reward potential|legacy, --success-bonus,
+--log-std-init, --reward potential|legacy, --success-bonus, --action absolute|delta,
 --checkpoint-every. The driver is `noeira/tasks/ppo_family_driver.run_ppo`;
 read its header, and `noeira-docs/SO101_PIXEL_RL_PLAN.md` for why PPO.
 """
