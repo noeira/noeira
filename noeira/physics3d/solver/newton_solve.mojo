@@ -155,7 +155,9 @@ from .newton_ell_coop import (
 # bug fix; see `_parse_option` in `parser/full_parser.mojo` for the numbers and
 # for the confounded experiment that first, wrongly, said otherwise.
 comptime NOSLIP_TOLERANCE: Float64 = 1e-6
-from .primal import pyramidal_edge_forces, pyramidal_linesearch
+from .primal import (
+    pyramidal_edge_forces, pyramidal_linesearch, ls_gtol_dtype_floor,
+)
 from ..constraints.contact_solve import (
     _init_common_normal_ws,
     _precompute_contact_normal,
@@ -3595,6 +3597,7 @@ def _newton_solve_env[
             var p0_d0 = Scalar[DTYPE](0)
             var p0_d1 = Scalar[DTYPE](0)
             peval(p0_a, p0_c, p0_d0, p0_d1, lsiter)
+            gtol = ls_gtol_dtype_floor[DTYPE](gtol, p0_d0)
 
             comptime if _CPU_PROBE:
                 var _p_now = Int(perf_counter_ns())
@@ -6625,6 +6628,7 @@ def _newton_blocked_fields_kernel[
             # `p0_*` is read only under `if not decr_stop`.
             if not decr_stop:
                 _bl_peval(Scalar[DTYPE](0), p0_c, p0_d0, p0_d1, lsiter_b)
+                gtol_b = ls_gtol_dtype_floor[DTYPE](gtol_b, p0_d0)
 
             var alpha: Scalar[DTYPE] = 0
             if not decr_stop and snorm >= Scalar[DTYPE](PRIMAL_MINVAL_GPU):

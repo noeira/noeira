@@ -106,6 +106,44 @@ def pyramidal_edge_forces[
                 qfrc[i] += Je[e_idx * nv + i] * force[e_idx]
 
 
+# ⚠⚠ MuJoCo'S LINE-SEARCH THRESHOLD IS BELOW FLOAT32'S RESOLUTION. `gtol` is
+# `tolerance * ls_tolerance * snorm / scale`; at the float32 tolerance floor
+# (1e-6, `NEWTON_TOL_GPU`) that is ~1e-8 of the slope, while a `d0` summed in
+# float32 carries rounding near 1e-7 of its terms. So `|d0| < gtol` is often
+# unreachable and the search brackets until the interval stops moving or the
+# budget runs out.
+#
+# MEASURED 2026-09-26, so101_tower (elliptic, impratio 10), 1024 lanes, RTX
+# 5090: 31.2 evaluations per solve at 2.0 iterations (15.6 per iteration)
+# against CPU MuJoCo 3.12's 3.2 per iteration on the same protocol. With the
+# threshold floored at `LS_SLOPE_DROP_F32 * |d0(0)|`: 9.4 per solve, iterations
+# unchanged (2.01), the blocked Newton launch 3778 -> 2605 us and the control
+# step 99.2 -> 79.4 ms. 1e-4 bought 1.5% more; 1e-5 is the conservative one.
+#
+# ⚠ RELATIVE TO THE SLOPE AT alpha=0, NOT ABSOLUTE. MuJoCo Warp floors the same
+# threshold at an absolute 1e-6 (`solver.py:1023`), but it forms `snorm * scale`
+# where MuJoCo and this tree form `snorm / scale`, so the number does not
+# transplant: on the tower it cut only 8% and moved the dynamics (collision
+# +13% at the same contact count). A slope ratio has no units to get wrong.
+#
+# ⚠ FLOAT64 IS UNTOUCHED — the same scoping as `NEWTON_TOL_GPU`, so every
+# MuJoCo-parity gate (all float64) is bit-identical across this.
+comptime LS_SLOPE_DROP_F32: Float64 = 1e-5
+
+
+@always_inline
+def ls_gtol_dtype_floor[
+    DTYPE: DType
+](gtol: Scalar[DTYPE], d0_at_zero: Scalar[DTYPE]) -> Scalar[DTYPE]:
+    """The line search's derivative threshold, floored where the dtype cannot
+    resolve MuJoCo's. Call it once, after the alpha=0 `PrimalEval`, at every
+    Newton line search — they must not disagree."""
+    comptime if DTYPE == DType.float64:
+        return gtol
+    else:
+        return max(gtol, Scalar[DTYPE](LS_SLOPE_DROP_F32) * abs(d0_at_zero))
+
+
 @always_inline
 def pyramidal_linesearch[
     DTYPE: DType,
@@ -311,6 +349,7 @@ def pyramidal_linesearch[
     var p0_d0 = ZERO
     var p0_d1 = ZERO
     peval(p0_a, p0_c, p0_d0, p0_d1, lsiter)
+    gtol = ls_gtol_dtype_floor[DTYPE](gtol, p0_d0)
 
     # ⚠ `PrimalSearch` ALWAYS ATTEMPTS ONE NEWTON STEP (engine_solver.c:1733),
     # including when `d0 >= 0`. The old body returned 0 on a non-descent
