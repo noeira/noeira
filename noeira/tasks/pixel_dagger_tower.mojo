@@ -674,6 +674,11 @@ def run_pixel_dagger(args: List[String], driver: String) raises:
             var hov_s_open = 0
             var hov_both = 0
             var lab = List[Scalar[DT]](length=N_ENVS * ACT_DIM, fill=Scalar[DT](0))
+            # per joint over the hover steps: the teacher's and the student's
+            # mean action, and their mean |difference|
+            var hv_t = List[Float64](length=ACT_DIM, fill=0.0)
+            var hv_s = List[Float64](length=ACT_DIM, fill=0.0)
+            var hv_d = List[Float64](length=ACT_DIM, fill=0.0)
             for t in range(C.MAX_STEPS - 1):
                 px.observe(ctx, qpos_dev, 0)
                 var rq = mptr(raw_h.unsafe_ptr())
@@ -754,6 +759,12 @@ def run_pixel_dagger(args: List[String], driver: String) raises:
                             hov_s_open += 1
                         if t_open and s_open:
                             hov_both += 1
+                        for j in range(ACT_DIM):
+                            var tv = Float64(lab[e * ACT_DIM + j])
+                            var sv = Float64(at[unsafe_offset = e * ACT_DIM + j])
+                            hv_t[j] += tv
+                            hv_s[j] += sv
+                            hv_d[j] += abs(tv - sv)
                     if dz > 0.02 and hh < 0.045:
                         over[e] = True
                     if dz > 0.02:
@@ -809,6 +820,17 @@ def run_pixel_dagger(args: List[String], driver: String) raises:
                 print("    hover steps (up, over the bowl):", hov,
                       "| teacher says OPEN", hov_t_open, "| student opens",
                       hov_s_open, "| both", hov_both)
+                var lt = String("      teacher mean a:")
+                var ls = String("      student mean a:")
+                var ld = String("      mean |t - s|  :")
+                var nh = Float64(max(hov, 1))
+                for j in range(ACT_DIM):
+                    lt += " " + String(Int(hv_t[j] / nh * 1000.0) / 1000.0)
+                    ls += " " + String(Int(hv_s[j] / nh * 1000.0) / 1000.0)
+                    ld += " " + String(Int(hv_d[j] / nh * 1000.0) / 1000.0)
+                print(lt)
+                print(ls)
+                print(ld)
             print("    drops: over the bowl (<4.5 cm)", d_in, "| at the rim (4.5-8)",
                   d_rim, "| away (>8)", d_out,
                   "|| not held at the end: brick up", up_end,
