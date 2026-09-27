@@ -825,9 +825,9 @@ def run_pixel_dagger(args: List[String], driver: String) raises:
                 var ld = String("      mean |t - s|  :")
                 var nh = Float64(max(hov, 1))
                 for j in range(ACT_DIM):
-                    lt += " " + String(Int(hv_t[j] / nh * 1000.0) / 1000.0)
-                    ls += " " + String(Int(hv_s[j] / nh * 1000.0) / 1000.0)
-                    ld += " " + String(Int(hv_d[j] / nh * 1000.0) / 1000.0)
+                    lt += " " + String(Float64(Int(hv_t[j] / nh * 1000.0)) / 1000.0)
+                    ls += " " + String(Float64(Int(hv_s[j] / nh * 1000.0)) / 1000.0)
+                    ld += " " + String(Float64(Int(hv_d[j] / nh * 1000.0)) / 1000.0)
                 print(lt)
                 print(ls)
                 print(ld)
