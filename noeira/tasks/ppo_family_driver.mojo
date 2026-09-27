@@ -803,6 +803,9 @@ def run_ppo[M: ModelDefLike, C: Phyics3dEnvConfig](
             # the failures (carried / inside the rim / beside it / elsewhere)
             var dz_end = List[Float64](length=N_ENVS, fill=0.0)
             var h_end = List[Float64](length=N_ENVS, fill=0.0)
+            # the start state per lane (after the first step), for the
+            # per-episode CSV: brick x, y, quat (w x y z); bowl x, y
+            var start = List[Float64](length=N_ENVS * 8, fill=0.0)
             for t in range(C.MAX_STEPS - 1):
                 var rq = mptr(raw_h.unsafe_ptr())
                 for e in range(N_ENVS):
@@ -829,6 +832,8 @@ def run_ppo[M: ModelDefLike, C: Phyics3dEnvConfig](
                 env.d.meta.download(ctx)
                 ctx.synchronize()
                 env.d.xpos.download(ctx)
+                if t == 0:
+                    env.d.xquat.download(ctx)
                 ctx.synchronize()
                 for e in range(N_ENVS):
                     var hb = env.d.meta.data[e * METADATA_SIZE + META_IDX_GOAL_HELD] > Scalar[DT](0.5)
@@ -844,6 +849,13 @@ def run_ppo[M: ModelDefLike, C: Phyics3dEnvConfig](
                     var za = Float64(env.d.xpos.data[xb + ia * 3 + 2])
                     if t == 0:
                         z0[e] = za
+                        var qb = e * M.NBODY * 4 + ia * 4
+                        start[e * 8 + 0] = Float64(env.d.xpos.data[xb + ia * 3])
+                        start[e * 8 + 1] = Float64(env.d.xpos.data[xb + ia * 3 + 1])
+                        for c in range(4):
+                            start[e * 8 + 2 + c] = Float64(env.d.xquat.data[qb + c])
+                        start[e * 8 + 6] = Float64(env.d.xpos.data[xb + ib * 3])
+                        start[e * 8 + 7] = Float64(env.d.xpos.data[xb + ib * 3 + 1])
                     var dz = za - z0[e]
                     if dz > rise[e]:
                         rise[e] = dz
@@ -896,6 +908,24 @@ def run_ppo[M: ModelDefLike, C: Phyics3dEnvConfig](
                     f_beside += 1
                 else:
                     f_else += 1
+            # one row per episode: where it started, how far it got
+            var csv = String(
+                "lane,brick_x,brick_y,qw,qx,qy,qz,bowl_x,bowl_y,"
+                + "rise_max,h_min,over,success,held_end,dz_end,h_end\n"
+            )
+            for e in range(N_ENVS):
+                csv += String(e)
+                for c in range(8):
+                    csv += "," + String(start[e * 8 + c])
+                csv += "," + String(rise[e]) + "," + String(hmin[e])
+                csv += "," + ("1" if over[e] else "0")
+                csv += "," + ("1" if held[e] else "0")
+                csv += "," + ("1" if held_end[e] else "0")
+                csv += "," + String(dz_end[e]) + "," + String(h_end[e]) + "\n"
+            var csv_path = run.dir + "/eval_lanes_round" + String(rnd) + ".csv"
+            with open(csv_path, "w") as f:
+                f.write(csv)
+            print("  greedy eval round", rnd, "per-episode rows:", csv_path)
             print("  greedy eval round", rnd, "endings of the", N_ENVS - n_end,
                   "not held at the end | brick > 2 cm up (carried, hovering or on the rim)", f_up,
                   "| resting inside the rim, not Near", f_rim_in,
