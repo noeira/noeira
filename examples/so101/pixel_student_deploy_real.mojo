@@ -26,7 +26,11 @@ CSV (overhead first), --port, --fourcc, --undistort DIR (projects/so101-tower/
 cameras), --arm, --seconds (20), --no-return, --no-start-pose, --snap DIR,
 --gripper-sign 0|1 (default: the manifest's), --step-ticks (80), --force-dark,
 --record DIR (per-tick CSV of q, qd, action, target + the two frames every
-16 ticks — what a run did, to lay beside `pixel_student_probe_sim.mojo`).
+16 ticks — what a run did, to lay beside `pixel_student_probe_sim.mojo`),
+--sysid FILE (with --arm: NO policy — each joint in turn steps +A, back, -A,
+back from the sim's start pose, 0.8 s per step, A 0.1 rad / 0.3 gripper; the
+per-tick targets and joints go to FILE, the servos' delay and time constant
+are fitted from it (`delta_action.ServoLag`'s numbers)).
 
 ## What makes a SIM policy's observation on the real rig (`pixel_student.mojo`)
 
@@ -273,6 +277,7 @@ def main() raises:
     var step_ticks = Int(_arg(args, "--step-ticks", String(MAX_STEP_TICKS)))
     var force_dark = _flag(args, "--force-dark")
     var rec_dir = _arg(args, "--record", "")
+    var sysid = _arg(args, "--sysid", "")
 
     print("=" * 74)
     print("PIXEL STUDENT on the physical SO-101 — sim-to-real")
@@ -507,6 +512,57 @@ def main() raises:
             print("at the sim's start pose\n")
     else:
         print("dry run — nothing energised\n")
+
+    # ── --sysid: the servos' step response, no policy ───────────────────
+    if sysid.byte_length() > 0:
+        if not arm_it:
+            raise Error("pixel deploy: --sysid moves the arm; it needs --arm")
+        var base_q = List[Float64](length=SO101_N, fill=0.0)
+        if arm.read_positions(Span(raw)) == SO101_N:
+            for i in range(SO101_N):
+                base_q[i] = jmap.to_sim_unclamped(arm.cal, i, raw[i])
+        var csv = String("t_s,joint,tgt,q0,q1,q2,q3,q4,q5\n")
+        var sgoals = Array[Int32, SO101_N](fill=0)
+        var t0s = perf_counter_ns()
+        var hold = Int(0.8 / man.control_period_s)
+        try:
+            for jj in range(SO101_N):
+                var amp = 0.3 if jj == SO101_N - 1 else 0.1
+                var seq: List[Float64] = [0.0, amp, 0.0, -amp, 0.0]
+                print("  sysid: joint " + joint_name(jj) + " +-" + fixed(amp, 2) + " rad")
+                for k in range(len(seq)):
+                    for _h in range(hold):
+                        var tt = perf_counter_ns()
+                        var tgt_j = base_q[jj] + seq[k]
+                        if tgt_j < lo[jj]:
+                            tgt_j = lo[jj]
+                        if tgt_j > hi[jj]:
+                            tgt_j = hi[jj]
+                        for i in range(SO101_N):
+                            var ti = tgt_j if i == jj else base_q[i]
+                            sgoals[i] = jmap.from_sim(arm.cal, i, ti)
+                        arm.write_goals(Span(sgoals))
+                        if arm.read_positions(Span(raw)) == SO101_N:
+                            var row = String(Float64(perf_counter_ns() - t0s) / 1e9) + "," + String(jj) + "," + String(tgt_j)
+                            for i in range(SO101_N):
+                                row += "," + String(jmap.to_sim_unclamped(arm.cal, i, raw[i]))
+                            csv += row + "\n"
+                        _spin_until(tt + period_ns)
+        finally:
+            with open(sysid, "w") as f:
+                f.write(csv)
+            print("  wrote " + sysid)
+            var released = return_and_release(
+                arm, start_pose, arm_it, do_return, stdin, interactive
+            )
+            if not released:
+                print("⚠ the follower is STILL ENERGISED — deliberate, see above.")
+            for i in range(N_CAMS):
+                try:
+                    cams[i].stop()
+                except:
+                    pass
+        return
 
     var goals = Array[Int32, SO101_N](fill=0)
     var ticks = 0
