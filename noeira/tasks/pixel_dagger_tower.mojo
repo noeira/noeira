@@ -320,6 +320,7 @@ def run_pixel_dagger(args: List[String], driver: String) raises:
     var png_dir = _arg(args, "--png", "")
     var blank = _arg(args, "--blank-images", "0") == "1"
     var grip_sign = _arg(args, "--gripper-sign", "0") == "1"
+    var eval_teacher = _arg(args, "--eval-teacher", "0") == "1"
     seed_rng(seed)
     var family = String("so101_tower")
     var family_path = String("noeira/tasks/families/so101_tower.family")
@@ -654,6 +655,14 @@ def run_pixel_dagger(args: List[String], driver: String) raises:
             var z0 = List[Float64](length=N_ENVS, fill=0.0)
             var rise = List[Float64](length=N_ENVS, fill=0.0)
             var over = List[Bool](length=N_ENVS, fill=False)
+            # ⚠ WHERE THE BRICK COMES DOWN: the brick's horizontal gap to the
+            # bowl at the step it first falls back (rise < 1 cm after having
+            # been > 2 cm up) — "released over the bowl and bounced out" and
+            # "released beside it" are different failures with different fixes.
+            var was_up = List[Bool](length=N_ENVS, fill=False)
+            var drop_h = List[Float64](length=N_ENVS, fill=-1.0)
+            var dz_end = List[Float64](length=N_ENVS, fill=0.0)
+            var h_end = List[Float64](length=N_ENVS, fill=0.0)
             for t in range(C.MAX_STEPS - 1):
                 px.observe(ctx, qpos_dev, 0)
                 var rq = mptr(raw_h.unsafe_ptr())
@@ -663,18 +672,28 @@ def run_pixel_dagger(args: List[String], driver: String) raises:
                             rq[unsafe_offset = e * OBS + a_qa[j]]
                         )
                     g_act.data[e] = Scalar[DT](e)
-                g_act.upload_resident(ctx)
-                px.gather[N_ENVS](ctx, g_act, x_act)
-                student.forward["gpu", N_ENVS](
-                    TensorRefs[1](x_act), y_act, Optional(ctx)
-                )
-                y_act.download(ctx)
-                ctx.synchronize()
                 var at = mptr(act_t.unsafe_ptr())
-                for k in range(N_ENVS * ACT_DIM):
-                    at[unsafe_offset=k] = student_act(
-                        y_act.data[k], k % ACT_DIM, grip_sign
+                if eval_teacher:
+                    # the TEACHER through the same loop — the reference the
+                    # student's stages are read against
+                    obs_rms.normalize_into(
+                        rq, mptr(cur_n.unsafe_ptr()), N_ENVS, OBS, OBS_CLIP
                     )
+                    teacher.trainer.select_greedy_action_batched(
+                        mptr(cur_n.unsafe_ptr()), mptr(act_t.unsafe_ptr())
+                    )
+                else:
+                    g_act.upload_resident(ctx)
+                    px.gather[N_ENVS](ctx, g_act, x_act)
+                    student.forward["gpu", N_ENVS](
+                        TensorRefs[1](x_act), y_act, Optional(ctx)
+                    )
+                    y_act.download(ctx)
+                    ctx.synchronize()
+                    for k in range(N_ENVS * ACT_DIM):
+                        at[unsafe_offset=k] = student_act(
+                            y_act.data[k], k % ACT_DIM, grip_sign
+                        )
                 _delta_to_env(
                     mptr(act_t.unsafe_ptr()), mptr(env_act.unsafe_ptr()),
                     arm_q, a_lo, a_hi,
@@ -703,8 +722,16 @@ def run_pixel_dagger(args: List[String], driver: String) raises:
                     # cube in bowl; the desk's origin on lift — read loosely)
                     var ex = Float64(env.d.xpos.data[xb + ia * 3] - env.d.xpos.data[xb + ib * 3])
                     var ey = Float64(env.d.xpos.data[xb + ia * 3 + 1] - env.d.xpos.data[xb + ib * 3 + 1])
-                    if za - z0[e] > 0.02 and sqrt(ex * ex + ey * ey) < 0.045:
+                    var hh = sqrt(ex * ex + ey * ey)
+                    var dz = za - z0[e]
+                    if dz > 0.02 and hh < 0.045:
                         over[e] = True
+                    if dz > 0.02:
+                        was_up[e] = True
+                    elif was_up[e] and dz < 0.01 and drop_h[e] < 0.0:
+                        drop_h[e] = hh
+                    dz_end[e] = dz
+                    h_end[e] = hh
             var ok = 0
             var n_end = 0
             var n_lift = 0
@@ -718,9 +745,41 @@ def run_pixel_dagger(args: List[String], driver: String) raises:
                     n_end += 1
                 if rise[e] > 0.02:
                     n_lift += 1
-            print("  student greedy eval round", rnd, ":", ok, "/", N_ENVS,
+            var who = "teacher" if eval_teacher else "student"
+            print("  " + who + " greedy eval round", rnd, ":", ok, "/", N_ENVS,
                   "| held at the end", n_end, "| lifted >2cm", n_lift,
                   "| over b while lifted", n_over)
+            # the drops, by where they happened, and the endings of the rest
+            var d_in = 0
+            var d_rim = 0
+            var d_out = 0
+            var up_end = 0
+            var rim_end = 0
+            var beside_end = 0
+            var else_end = 0
+            for e in range(N_ENVS):
+                if drop_h[e] >= 0.0:
+                    if drop_h[e] < 0.045:
+                        d_in += 1
+                    elif drop_h[e] < 0.08:
+                        d_rim += 1
+                    else:
+                        d_out += 1
+                if held_end[e]:
+                    continue
+                if dz_end[e] > 0.02:
+                    up_end += 1
+                elif h_end[e] < 0.052:
+                    rim_end += 1
+                elif h_end[e] < 0.10:
+                    beside_end += 1
+                else:
+                    else_end += 1
+            print("    drops: over the bowl (<4.5 cm)", d_in, "| at the rim (4.5-8)",
+                  d_rim, "| away (>8)", d_out,
+                  "|| not held at the end: brick up", up_end,
+                  "| inside the rim, not Near", rim_end, "| beside (<10 cm)",
+                  beside_end, "| elsewhere", else_end)
             ok_all += ok
             n_all += N_ENVS
         var rate = Float64(ok_all) / Float64(max(n_all, 1))
