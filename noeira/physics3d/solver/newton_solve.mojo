@@ -163,6 +163,7 @@ from .newton_ell_coop import (
 comptime NOSLIP_TOLERANCE: Float64 = 1e-6
 from .primal import (
     pyramidal_edge_forces, pyramidal_linesearch, ls_gtol_dtype_floor,
+    newton_stall_stop,
 )
 from ..constraints.contact_solve import (
     _init_common_normal_ws,
@@ -2194,6 +2195,7 @@ def _newton_solve_env[
         # Newton iterations
         var pyr_iters = 0
         var pyr_ls_evals = 0
+        var stall_run = 0  # `primal.newton_stall_stop`
         for iter_n in range(NEWTON_ITER_GPU):
             # ⚠⚠ NO CONSTRAINT ROWS: MUJOCO RETURNS, AND WE USED TO SOLVE.
             # `mj_fwdConstraint` (engine_forward.c:884) is explicit —
@@ -2509,6 +2511,8 @@ def _newton_solve_env[
             # until the gradient or decrement criterion ends it (AUD-39).
             comptime if NEWTON_312_CRITERIA:
                 if improvement > Scalar[DTYPE](0) and improvement < tol_rt:
+                    break
+                if newton_stall_stop[DTYPE](improvement, stall_run):
                     break
             else:
                 if improvement < tol_rt and iter_n > 0:
@@ -3353,6 +3357,7 @@ def _newton_solve_env[
     # algorithms; its WORK does, and that is what AUD-40 changed.
     var ls_eval_total = 0
     var newton_iters = 0
+    var stall_run = 0  # `primal.newton_stall_stop`
     for _iter in range(NEWTON_ITER_GPU):
         # ⚠⚠ NO CONSTRAINT ROWS: MUJOCO RETURNS, AND WE USED TO SOLVE.
         # `mj_fwdConstraint` (engine_forward.c:884) is explicit —
@@ -3946,6 +3951,8 @@ def _newton_solve_env[
         comptime if NEWTON_312_CRITERIA:
             # MuJoCo's rule (see the pyramidal twin, AUD-39)
             if improvement > Scalar[DTYPE](0) and improvement < tol_rt:
+                break
+            if newton_stall_stop[DTYPE](improvement, stall_run):
                 break
         else:
             if improvement < tol_rt:
@@ -6168,6 +6175,7 @@ def _newton_blocked_fields_kernel[
     # some 200 lines further down. A thread-0 register carries it; it needs no
     # shared slot and no barrier because both readers ARE thread 0.
     var grad_below_tol = False
+    var stall_run = 0  # `primal.newton_stall_stop`
     for iter_n in range(NEWTON_ITER_GPU):
         # ⚠⚠ NO CONSTRAINT ROWS: MUJOCO RETURNS, AND WE USED TO SOLVE.
         # `mj_fwdConstraint` (engine_forward.c:884) is explicit —
@@ -7010,6 +7018,9 @@ def _newton_blocked_fields_kernel[
                         and improvement < tol_rt
                         and iter_n >= NEWTON_MIN_ITER
                     )
+                    # the float32 `alpha == 0` (`primal.newton_stall_stop`)
+                    if newton_stall_stop[DTYPE](improvement, stall_run):
+                        _stop = True
                     if _stop:
                         ctrl_sh[1] = Scalar[DTYPE](1)  # done
                 else:

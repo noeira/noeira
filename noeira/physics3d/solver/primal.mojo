@@ -144,6 +144,41 @@ def ls_gtol_dtype_floor[
         return max(gtol, Scalar[DTYPE](LS_SLOPE_DROP_F32) * abs(d0_at_zero))
 
 
+# ⚠ THE FLOAT32 STALL EXIT (2026-09-27). MuJoCo ends a Newton solve when the
+# line search returns `alpha == 0` — "no improvement: done" (`mj_solPrimal`,
+# engine_solver.c) — and otherwise keeps iterating through a zero or negative
+# improvement (AUD-39). At float32 the search can return a step too small to
+# move the cost, so the solve takes the SAME zero-improvement iteration again
+# and again: on so101_tower (1024 lanes, blocked kernel) each env's slowest
+# solve ran 4-20+ iterations and 17 envs hit the 100-iteration cap, those
+# with 85-97 iterations of improvement EXACTLY 0 while the gradient and
+# decrement sat orders above tolerance. The kernel waits for the slowest env,
+# so those repeats set its time (~60 us an iteration).
+#
+# So at float32 a run of `NEWTON_STALL_RUN_F32` consecutive zero improvements
+# is that `alpha == 0`. Not the first zero: a stalled solve on the tower did
+# make real progress again after isolated zeros. Float64 is untouched —
+# every MuJoCo-parity gate runs there.
+comptime NEWTON_STALL_RUN_F32: Int = 2
+
+
+@always_inline
+def newton_stall_stop[
+    DTYPE: DType
+](improvement: Scalar[DTYPE], mut zero_run: Int) -> Bool:
+    """True once the solve has taken `NEWTON_STALL_RUN_F32` iterations in a
+    row whose improvement was exactly zero — never at float64. `zero_run` is
+    the caller's counter, 0 at the start of the solve."""
+    comptime if DTYPE == DType.float64:
+        return False
+    else:
+        if improvement == Scalar[DTYPE](0):
+            zero_run += 1
+        else:
+            zero_run = 0
+        return zero_run >= NEWTON_STALL_RUN_F32
+
+
 @always_inline
 def pyramidal_linesearch[
     DTYPE: DType,
