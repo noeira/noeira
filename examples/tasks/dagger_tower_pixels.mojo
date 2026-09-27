@@ -7,7 +7,8 @@
 
 Flags: --teacher RUN_DIR (required), --steps, --beta-steps, --updates, --lr,
 --replay ROWS, --seed, --eval-rounds, --init-student CKPT, --png DIR,
---blank-images 1 (the joints-only control). The driver is
+--blank-images 1 (the joints-only control), --gripper-sign 1 (the student's
+gripper word snapped to +-1). The driver is
 `noeira/tasks/pixel_dagger_tower.run_pixel_dagger`; read its header.
 """
 

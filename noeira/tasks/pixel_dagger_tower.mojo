@@ -335,6 +335,7 @@ def run_pixel_dagger(args: List[String], driver: String) raises:
     var init_student = _arg(args, "--init-student", "")
     var png_dir = _arg(args, "--png", "")
     var blank = _arg(args, "--blank-images", "0") == "1"
+    var grip_sign = _arg(args, "--gripper-sign", "0") == "1"
     seed_rng(seed)
     var family = String("so101_tower")
     var family_path = String("noeira/tasks/families/so101_tower.family")
@@ -396,6 +397,7 @@ def run_pixel_dagger(args: List[String], driver: String) raises:
     logger.set_config("lr", String(lr))
     logger.set_config("replay", String(cap))
     logger.set_config("blank_images", String(blank))
+    logger.set_config("gripper_sign", String(grip_sign))
     register_run(run, logger)
     var artifacts = sink_for_run(run.id, run.dir)
 
@@ -548,12 +550,9 @@ def run_pixel_dagger(args: List[String], driver: String) raises:
                 for e in range(N_ENVS):
                     if stud_lane[e]:
                         for j in range(ACT_DIM):
-                            var v = y_act.data[e * ACT_DIM + j]
-                            if v > Scalar[DT](1):
-                                v = Scalar[DT](1)
-                            elif v < Scalar[DT](-1):
-                                v = Scalar[DT](-1)
-                            at[unsafe_offset = e * ACT_DIM + j] = v
+                            at[unsafe_offset = e * ACT_DIM + j] = _student_act(
+                                y_act.data[e * ACT_DIM + j], j, grip_sign
+                            )
             _delta_to_env(
                 mptr(act_t.unsafe_ptr()), mptr(env_act.unsafe_ptr()),
                 arm_q, a_lo, a_hi,
@@ -681,12 +680,9 @@ def run_pixel_dagger(args: List[String], driver: String) raises:
                 ctx.synchronize()
                 var at = mptr(act_t.unsafe_ptr())
                 for k in range(N_ENVS * ACT_DIM):
-                    var v = y_act.data[k]
-                    if v > Scalar[DT](1):
-                        v = Scalar[DT](1)
-                    elif v < Scalar[DT](-1):
-                        v = Scalar[DT](-1)
-                    at[unsafe_offset=k] = v
+                    at[unsafe_offset=k] = _student_act(
+                        y_act.data[k], k % ACT_DIM, grip_sign
+                    )
                 _delta_to_env(
                     mptr(act_t.unsafe_ptr()), mptr(env_act.unsafe_ptr()),
                     arm_q, a_lo, a_hi,
@@ -774,6 +770,26 @@ def _dump_obs_png(
             save_png(dir + "/lane" + String(lane) + "_cam" + String(cam) + ".png",
                      img, W, W, 3)
     print("  png: lanes 0-3 x", N_CAMS, "cameras ->", dir)
+
+
+comptime GRIPPER_ACT = 5
+"""The gripper's action index (the rig's `RIG_GRIPPER`)."""
+
+
+@always_inline
+def _student_act(v: Scalar[DT], j: Int, grip_sign: Bool) -> Scalar[DT]:
+    """The student's output as executed: clamped to [-1, 1]; with
+    `--gripper-sign 1` the GRIPPER word snapped to +-1. The release is a few
+    steps per episode, so a regression under-weights it and can leave the
+    jaws opening too slowly to drop the brick (cube in bowl, 27 Sep: over
+    the bowl 59 %, success 12.7 %)."""
+    if grip_sign and j == GRIPPER_ACT:
+        return Scalar[DT](1) if v > Scalar[DT](0) else Scalar[DT](-1)
+    if v > Scalar[DT](1):
+        return Scalar[DT](1)
+    if v < Scalar[DT](-1):
+        return Scalar[DT](-1)
+    return v
 
 
 def _rate(h: List[Bool]) -> Float64:
