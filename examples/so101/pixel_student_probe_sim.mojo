@@ -4,6 +4,7 @@
         examples/so101/pixel_student_probe_sim.mojo
     /tmp/px_probe --ckpt projects/so101-tower/policies/pixel_bowl.ckpt [--task T] [--seed S] [--episodes N]
         [--record ticks.csv]      # the deploy's --record columns, per episode
+        [--lag-tau 140,140 --lag-delay 2,2]   # the real servos' response (ServoLag)
 
 The reference a real run is read against. It starts every episode where the
 real deploy's ramp leaves the arm — the task's reset pose, props placed by
@@ -36,7 +37,7 @@ from noeira.nn.core.tensor_refs import TensorRefs
 from noeira.physics3d.fields import Data
 from noeira.physics3d.kinematics.forward_kinematics import forward_kinematics
 from noeira.physics3d.parser.runtime_load import parse_model_runtime
-from noeira.tasks.delta_action import delta_target
+from noeira.tasks.delta_action import delta_target, ServoLag
 from noeira.tasks.family import scene_path
 from noeira.tasks.family_config import So101TowerConfig
 from noeira.tasks.pixel_student import (
@@ -75,11 +76,21 @@ def main() raises:
     var seed0 = Int(_arg(args, "--seed", "1"))
     var episodes = Int(_arg(args, "--episodes", "3"))
     var rec_path = _arg(args, "--record", "")
+    # ⚠ A REAL SCENE, REPRODUCED: `--arm-pose` (a deploy snap's pose.txt,
+    # model radians) replaces the reset's arm joints, `--brick x,y` /
+    # `--bowl x,y` (world metres, e.g. from a real overhead frame through
+    # `tools/so101/sim_prop_pixels.mojo`'s homography) the props' positions
+    var arm_pose = _arg(args, "--arm-pose", "")
+    var brick_xy = _arg(args, "--brick", "")
+    var bowl_xy = _arg(args, "--bowl", "")
+
     var rec_csv = String("ep,t_s,q0,q1,q2,q3,q4,q5,qd0,qd1,qd2,qd3,qd4,qd5,a0,a1,a2,a3,a4,a5,tgt0,tgt1,tgt2,tgt3,tgt4,tgt5\n")
     var man_path = String(ckpt[byte = 0 : ckpt.byte_length() - 5]) + ".norm.json"
     if not exists(man_path):
         man_path = ckpt[byte = 0 : ckpt.rfind("/")] + "/norm.json"
     var man = check_pixel_manifest(man_path)
+    var lag_tau_s = _arg(args, "--lag-tau", "")
+    var lag_delay_s = _arg(args, "--lag-delay", "")
     print("probe:", ckpt, "|", OBS_PX, "px", "| q+qd" if JOINT_VEL else "| q",
           "| window" if WINDOWED else "| centre square", "| task", task)
 
@@ -123,6 +134,9 @@ def main() raises:
     var y = Tensor.alloc(ACT)
     var xs = List[Scalar[DT]](length=IN_DIM, fill=Scalar[DT](0))
     var env = E(ctx)
+    var lag = ServoLag.parse(1, lag_tau_s, lag_delay_s, man.control_period_s)
+    if lag.on:
+        print("probe: servo lag tau", lag_tau_s, "ms, delay", lag_delay_s, "ticks")
     var n_ok = 0
     for ep in range(episodes):
         _ = env.reset()
@@ -130,6 +144,22 @@ def main() raises:
             task, String("so101_tower"), So101TowerConfig.SLOT_RADIUS,
             seed=UInt64(seed0 + ep),
         )
+        if arm_pose.byte_length() > 0:
+            var txt = String("")
+            with open(arm_pose, "r") as fh:
+                txt = fh.read()
+            var parts = String(txt.strip()).split(" ")
+            for j in range(ACT):
+                q0[qa[j]] = Float64(String(parts[j]))
+        # free slots: 0 = bowl, 1 = brick (the family's slot order)
+        if bowl_xy.byte_length() > 0:
+            var p = bowl_xy.split(",")
+            q0[So101TowerPlacement.free_qadr(0)] = Float64(String(p[0]))
+            q0[So101TowerPlacement.free_qadr(0) + 1] = Float64(String(p[1]))
+        if brick_xy.byte_length() > 0:
+            var p = brick_xy.split(",")
+            q0[So101TowerPlacement.free_qadr(1)] = Float64(String(p[0]))
+            q0[So101TowerPlacement.free_qadr(1) + 1] = Float64(String(p[1]))
         var v0 = List[Float64](length=NV, fill=0.0)
         var obs = env.obs_at(q0, v0)
         var z0 = Float64(env.d.xpos.data[brick * 3 + 2]) if brick >= 0 else 0.0
@@ -141,6 +171,10 @@ def main() raises:
             line0 += " " + col(Float64(obs.data[qa[j]]), 7, 3)
         print(line0)
         var at_lim = 0
+        var q_start = List[Float64](length=ACT, fill=0.0)
+        for j in range(ACT):
+            q_start[j] = Float64(env.d.qpos.data[qa[j]])
+        lag.reset_lane(0, q_start, 0, 0.5, 0.5)
         for t in range(So101TowerConfig.MAX_STEPS):
             for k in range(NQ):
                 rd.qpos.data[k] = Scalar[RIG_DT](env.d.qpos.data[k])
@@ -195,6 +229,7 @@ def main() raises:
             for j in range(ACT):
                 var a = Float64(student_act(y.data[j], j, man.gripper_sign))
                 var tgt = delta_target(q[j], a, j, lo[j], hi[j])
+                tgt = lag.apply(0, j, tgt)
                 ra += "," + String(a)
                 rt += "," + String(tgt)
                 if tgt <= lo[j] or tgt >= hi[j]:
@@ -213,6 +248,7 @@ def main() raises:
             if t % 15 == 0:
                 print("  t=" + pad_left(fixed(Float64(t) * man.control_period_s, 1), 5)
                       + "s  a:" + line)
+            lag.advance()
             var res = env.step(act)
             obs = res[0].copy()
             if brick >= 0:

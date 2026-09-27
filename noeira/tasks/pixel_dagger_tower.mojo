@@ -90,8 +90,9 @@ from noeira.tasks.gpu_eval import region_table_words
 from noeira.tasks.posed_reset import task_meta_words
 from noeira.tasks.ppo_family_driver import (
     AgentT, RunningMeanStd, N_ENVS, ACT_DIM, OBS_CLIP, OBS_BOUND, GAMMA,
-    _delta_to_env, _arg,
+    _delta_to_env, _arg, _lag_reset,
 )
+from noeira.tasks.delta_action import ServoLag
 from noeira.tasks.shaping import reward_mode_words
 from noeira.tasks.so101_tower_rig import (
     RIG_DT, TOWER_MD, TowerRendererSized, make_tower_model,
@@ -531,6 +532,10 @@ def run_pixel_dagger(args: List[String], driver: String) raises:
     var dr_seed = Int(_arg(args, "--dr-seed", "11"))
     var use_aug = _arg(args, "--aug", "0") == "1"
     var eval_dr = _arg(args, "--eval-dr", "0") == "1"
+    # the real servos' response, as in the PPO driver (`--lag-tau lo,hi` ms,
+    # `--lag-delay lo,hi` ticks); the student is trained AND evaluated under it
+    var lag_tau = _arg(args, "--lag-tau", "")
+    var lag_delay = _arg(args, "--lag-delay", "")
     seed_rng(seed)
     var family = String("so101_tower")
     var family_path = String("noeira/tasks/families/so101_tower.family")
@@ -605,6 +610,8 @@ def run_pixel_dagger(args: List[String], driver: String) raises:
     logger.set_config("dr", dr_name)
     logger.set_config("dr_every", String(dr_every))
     logger.set_config("aug", String(use_aug))
+    logger.set_config("lag_tau_ms", lag_tau)
+    logger.set_config("lag_delay_ticks", lag_delay)
     logger.set_config("gripper_sign", String(grip_sign))
     logger.set_config("act_gain", String(act_gain))
     register_run(run, logger)
@@ -707,6 +714,12 @@ def run_pixel_dagger(args: List[String], driver: String) raises:
         ctx.synchronize()
 
         var stud_lane = List[Bool](length=N_ENVS, fill=False)
+        var lag = ServoLag.parse(
+            N_ENVS, lag_tau, lag_delay, Float64(C.FRAME_SKIP) * M.TIMESTEP
+        )
+        var lag_pending = List[Bool](length=N_ENVS, fill=True)
+        if lag.on:
+            print("  servo lag: tau", lag_tau, "ms, delay", lag_delay, "ticks")
         var succ = List[Bool](length=N_ENVS, fill=False)
         var hist_s = List[Bool]()  # student-executed episodes' success
         var hist_t = List[Bool]()  # teacher-executed
@@ -749,6 +762,9 @@ def run_pixel_dagger(args: List[String], driver: String) raises:
                     arm_q[e * ACT_DIM + j] = Float64(
                         rp[unsafe_offset = e * OBS + a_qa[j]]
                     )
+                if lag_pending[e]:
+                    _lag_reset(lag, arm_q, e)
+                    lag_pending[e] = False
             obs_rms.normalize_into(
                 rp, mptr(cur_n.unsafe_ptr()), N_ENVS, OBS, OBS_CLIP
             )
@@ -785,7 +801,7 @@ def run_pixel_dagger(args: List[String], driver: String) raises:
                             )
             _delta_to_env(
                 mptr(act_t.unsafe_ptr()), mptr(env_act.unsafe_ptr()),
-                arm_q, a_lo, a_hi,
+                arm_q, a_lo, a_hi, lag,
             )
             ctx.enqueue_copy(act_dev, env_act)
             # 5. step, tally, reset
@@ -813,6 +829,7 @@ def run_pixel_dagger(args: List[String], driver: String) raises:
                         hist_t.append(succ[e])
                     succ[e] = False
                     stud_lane[e] = random_float64() >= beta
+                    lag_pending[e] = True
             if forced:
                 ctx.enqueue_copy(done_dev, done_h)
             env.selective_reset_batch[N_ENVS](
@@ -963,9 +980,12 @@ def run_pixel_dagger(args: List[String], driver: String) raises:
                             y_act.data[k] * Scalar[DT](act_gain), k % ACT_DIM,
                             grip_sign,
                         )
+                if t == 0:
+                    for e in range(N_ENVS):
+                        _lag_reset(lag, arm_q, e)
                 _delta_to_env(
                     mptr(act_t.unsafe_ptr()), mptr(env_act.unsafe_ptr()),
-                    arm_q, a_lo, a_hi,
+                    arm_q, a_lo, a_hi, lag,
                 )
                 ctx.enqueue_copy(act_dev, env_act)
                 env.step_batch[N_ENVS](ctx=ctx, rng_seed=UInt64(t + 1))

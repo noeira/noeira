@@ -97,7 +97,9 @@ from noeira.tasks.family import scene_path
 from noeira.tasks.gpu_eval import region_table_words
 from noeira.tasks.posed_reset import task_meta_words
 from noeira.tasks.shaping import reward_mode_words
-from noeira.tasks.delta_action import DELTA_ACT, delta_scale, delta_target
+from noeira.tasks.delta_action import (
+    DELTA_ACT, delta_scale, delta_target, ServoLag,
+)
 from noeira.tasks.spec import load_family
 
 # ⚠ LANES AT BUILD TIME (Mojo has no integer define): 1024 by default,
@@ -240,9 +242,11 @@ def _delta_to_env(
     ref arm_q: List[Float64],
     ref a_lo: List[Float64],
     ref a_hi: List[Float64],
+    mut lag: ServoLag,
 ):
-    """`--action delta`: target = clamp(q + a * scale), normalised onto the
-    env's absolute action (`(target - mid) / half`)."""
+    """`--action delta`: target = clamp(q + a * scale), through the servo
+    model (`delta_action.ServoLag`; the identity when off), normalised onto
+    the env's absolute action (`(target - mid) / half`)."""
     for e in range(N_ENVS):
         for j in range(ACT_DIM):
             var tgt = delta_target(
@@ -250,9 +254,18 @@ def _delta_to_env(
                 Float64(ap[unsafe_offset = e * ACT_DIM + j]),
                 j, a_lo[j], a_hi[j],
             )
+            tgt = lag.apply(e, j, tgt)
             var mid = 0.5 * (a_lo[j] + a_hi[j])
             var half = 0.5 * (a_hi[j] - a_lo[j])
             ep[unsafe_offset = e * ACT_DIM + j] = Scalar[DT]((tgt - mid) / half)
+    lag.advance()
+
+
+def _lag_reset(
+    mut lag: ServoLag, ref arm_q: List[Float64], lane: Int,
+):
+    """A fresh draw of lane `lane`'s servo model, settled on its joints."""
+    lag.reset_lane(lane, arm_q, lane * ACT_DIM, random_float64(), random_float64())
 
 
 def _bc_pretrain[OBS: Int](
@@ -432,6 +445,10 @@ def run_ppo[M: ModelDefLike, C: Phyics3dEnvConfig](
     var eval_rounds = Int(_arg(args, "--eval-rounds", "4"))
     var exec_noise = Float64(_arg(args, "--exec-noise", "0"))
     var log_every = max(Int(_arg(args, "--log-every", "10")), 1)
+    # the real servos' response (`delta_action.ServoLag`): `--lag-tau lo,hi`
+    # ms and `--lag-delay lo,hi` ticks, drawn per episode; off by default
+    var lag_tau = _arg(args, "--lag-tau", "")
+    var lag_delay = _arg(args, "--lag-delay", "")
     if action_mode != "absolute" and action_mode != "delta":
         raise Error("ppo task: --action absolute|delta, got " + action_mode)
     if reward != "potential" and reward != "legacy":
@@ -507,6 +524,8 @@ def run_ppo[M: ModelDefLike, C: Phyics3dEnvConfig](
     logger.set_config("bc_updates", String(bc_updates))
     logger.set_config("success_bonus", String(bonus))
     logger.set_config("exec_noise", String(exec_noise))
+    logger.set_config("lag_tau_ms", lag_tau)
+    logger.set_config("lag_delay_ticks", lag_delay)
     logger.set_config("horizon", String(C.MAX_STEPS))
     logger.set_config("obs_norm", "running, clip 10")
     logger.set_config("reward_norm", "discounted-return std, clip 10")
@@ -574,6 +593,12 @@ def run_ppo[M: ModelDefLike, C: Phyics3dEnvConfig](
         var rets = ctx.enqueue_create_host_buffer[DT](N_ENVS)
         var env_act = ctx.enqueue_create_host_buffer[DT](N_ENVS * ACT_DIM)
         var arm_q = List[Float64](length=N_ENVS * ACT_DIM, fill=0.0)
+        var lag = ServoLag.parse(
+            N_ENVS, lag_tau, lag_delay, Float64(C.FRAME_SKIP) * M.TIMESTEP
+        )
+        if lag.on:
+            print("  servo lag: tau", lag_tau, "ms, delay", lag_delay,
+                  "ticks (per episode, per lane)")
         ctx.synchronize()
         var obs_dev = DeviceBuffer[DT](ctx, env.obs_ptr(), N_ENVS * OBS, owning=False)
         var act_dev = DeviceBuffer[DT](ctx, env.action_ptr(), N_ENVS * ACT_DIM, owning=False)
@@ -629,6 +654,7 @@ def run_ppo[M: ModelDefLike, C: Phyics3dEnvConfig](
         for e in range(N_ENVS):
             for j in range(ACT_DIM):
                 arm_q[e * ACT_DIM + j] = Float64(rp[unsafe_offset = e * OBS + a_qa[j]])
+            _lag_reset(lag, arm_q, e)
         obs_rms.update(rp, N_ENVS, OBS)
         obs_rms.normalize_into(rp, mptr(cur_n.unsafe_ptr()), N_ENVS, OBS, OBS_CLIP)
 
@@ -662,7 +688,7 @@ def run_ppo[M: ModelDefLike, C: Phyics3dEnvConfig](
             if action_mode == "delta":
                 _delta_to_env(
                     mptr(act_h.unsafe_ptr()), mptr(env_act.unsafe_ptr()),
-                    arm_q, a_lo, a_hi,
+                    arm_q, a_lo, a_hi, lag,
                 )
                 ctx.enqueue_copy(act_dev, env_act)
             else:
@@ -748,11 +774,14 @@ def run_ppo[M: ModelDefLike, C: Phyics3dEnvConfig](
             ctx.enqueue_copy(raw_h, obs_dev)
             ctx.synchronize()
             var rp2 = mptr(raw_h.unsafe_ptr())
+            var dh2 = mptr(done_h.unsafe_ptr())
             for e in range(N_ENVS):
                 for j in range(ACT_DIM):
                     arm_q[e * ACT_DIM + j] = Float64(
                         rp2[unsafe_offset = e * OBS + a_qa[j]]
                     )
+                if dh2[unsafe_offset=e] > Scalar[DT](0.5):
+                    _lag_reset(lag, arm_q, e)
             obs_rms.normalize_into(
                 rp2, mptr(cur_n.unsafe_ptr()), N_ENVS, OBS, OBS_CLIP,
             )
@@ -845,6 +874,8 @@ def run_ppo[M: ModelDefLike, C: Phyics3dEnvConfig](
                         arm_q[e * ACT_DIM + j] = Float64(
                             rq[unsafe_offset = e * OBS + a_qa[j]]
                         )
+                    if t == 0:
+                        _lag_reset(lag, arm_q, e)
                 obs_rms.normalize_into(
                     rq, mptr(cur_n.unsafe_ptr()), N_ENVS, OBS, OBS_CLIP
                 )
@@ -854,7 +885,7 @@ def run_ppo[M: ModelDefLike, C: Phyics3dEnvConfig](
                 if action_mode == "delta":
                     _delta_to_env(
                         mptr(act_h.unsafe_ptr()), mptr(env_act.unsafe_ptr()),
-                        arm_q, a_lo, a_hi,
+                        arm_q, a_lo, a_hi, lag,
                     )
                     ctx.enqueue_copy(act_dev, env_act)
                 else:
