@@ -24,7 +24,9 @@ observing the rig through its two real cameras.
 Flags: --project (so101-tower), --role (pixel_lift) or --ckpt PATH, --devices
 CSV (overhead first), --port, --fourcc, --undistort DIR (projects/so101-tower/
 cameras), --arm, --seconds (20), --no-return, --no-start-pose, --snap DIR,
---gripper-sign 0|1 (default: the manifest's), --step-ticks (80), --force-dark.
+--gripper-sign 0|1 (default: the manifest's), --step-ticks (80), --force-dark,
+--record DIR (per-tick CSV of q, qd, action, target + the two frames every
+16 ticks — what a run did, to lay beside `pixel_student_probe_sim.mojo`).
 
 ## What makes a SIM policy's observation on the real rig (`pixel_student.mojo`)
 
@@ -270,6 +272,7 @@ def main() raises:
     var grip_arg = _arg(args, "--gripper-sign", "")
     var step_ticks = Int(_arg(args, "--step-ticks", String(MAX_STEP_TICKS)))
     var force_dark = _flag(args, "--force-dark")
+    var rec_dir = _arg(args, "--record", "")
 
     print("=" * 74)
     print("PIXEL STUDENT on the physical SO-101 — sim-to-real")
@@ -512,6 +515,10 @@ def main() raises:
     var clamped = 0
     var sum_fwd = 0.0
     var worst_tick = 0.0
+    var rec_csv = String("t_s,q0,q1,q2,q3,q4,q5,qd0,qd1,qd2,qd3,qd4,qd5,a0,a1,a2,a3,a4,a5,tgt0,tgt1,tgt2,tgt3,tgt4,tgt5\n")
+    if rec_dir.byte_length() > 0:
+        makedirs(rec_dir, exist_ok=True)
+        print("  recording to " + rec_dir + " (ticks.csv, frames every 16 ticks)")
     var loop_ns = 0
     # ⚠ THE JOINT VELOCITIES ARE FINITE DIFFERENCES of the mapped angles over
     # the measured tick, not the servos' own speed register: they go through
@@ -567,6 +574,8 @@ def main() raises:
             sum_fwd += Float64(perf_counter_ns() - tf) / 1e6
             # act: the teacher's delta rule, then servo ticks
             var line2 = String("")
+            var ra = String("")
+            var rt = String("")
             for j in range(ACT):
                 var a = Float64(student_act(y.data[j], j, grip_sign))
                 var tgt = delta_target(q[j], a, j, lo[j], hi[j])
@@ -574,6 +583,17 @@ def main() raises:
                     clamped += 1
                 goals[j] = jmap.from_sim(arm.cal, j, tgt)
                 line2 += " " + col(a, 6, 2)
+                ra += "," + String(a)
+                rt += "," + String(tgt)
+            if rec_dir.byte_length() > 0:
+                var row = String(Float64(perf_counter_ns() - loop_t0) / 1e9)
+                for j in range(ACT):
+                    row += "," + String(q[j])
+                for j in range(ACT):
+                    row += "," + String(qd[j])
+                rec_csv += row + ra + rt + "\n"
+                if ticks % 16 == 0:
+                    _snap(rec_dir, frames, xs, q, String("_") + String(ticks))
             if arm_it:
                 arm.write_goals(Span(goals))
             if ticks % 15 == 0:
@@ -586,6 +606,13 @@ def main() raises:
             _spin_until(tt + period_ns)
     finally:
         loop_ns = perf_counter_ns() - loop_t0
+        if rec_dir.byte_length() > 0:
+            try:
+                with open(rec_dir + "/ticks.csv", "w") as f:
+                    f.write(rec_csv)
+                print("  wrote " + rec_dir + "/ticks.csv")
+            except:
+                print("  ⚠ could not write the tick log")
         var released = return_and_release(
             arm, start_pose, arm_it, do_return, stdin, interactive
         )

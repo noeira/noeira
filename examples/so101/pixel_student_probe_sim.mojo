@@ -3,6 +3,7 @@
     pixi run mojo build -I . -D DAGGER_PX_32 -D DAGGER_JOINT_VEL -o /tmp/px_probe \\
         examples/so101/pixel_student_probe_sim.mojo
     /tmp/px_probe --ckpt projects/so101-tower/policies/pixel_bowl.ckpt [--task T] [--seed S] [--episodes N]
+        [--record ticks.csv]      # the deploy's --record columns, per episode
 
 The reference a real run is read against. It starts every episode where the
 real deploy's ramp leaves the arm — the task's reset pose, props placed by
@@ -73,6 +74,8 @@ def main() raises:
     var task = _arg(args, "--task", "so101_tower_cube_in_bowl")
     var seed0 = Int(_arg(args, "--seed", "1"))
     var episodes = Int(_arg(args, "--episodes", "3"))
+    var rec_path = _arg(args, "--record", "")
+    var rec_csv = String("ep,t_s,q0,q1,q2,q3,q4,q5,qd0,qd1,qd2,qd3,qd4,qd5,a0,a1,a2,a3,a4,a5,tgt0,tgt1,tgt2,tgt3,tgt4,tgt5\n")
     var man_path = String(ckpt[byte = 0 : ckpt.byte_length() - 5]) + ".norm.json"
     if not exists(man_path):
         man_path = ckpt[byte = 0 : ckpt.rfind("/")] + "/norm.json"
@@ -187,15 +190,26 @@ def main() raises:
             net.forward["cpu", 1](TensorRefs[1](x), y, None)
             var act = ContAction[ACT]()
             var line = String("")
+            var ra = String("")
+            var rt = String("")
             for j in range(ACT):
                 var a = Float64(student_act(y.data[j], j, man.gripper_sign))
                 var tgt = delta_target(q[j], a, j, lo[j], hi[j])
+                ra += "," + String(a)
+                rt += "," + String(tgt)
                 if tgt <= lo[j] or tgt >= hi[j]:
                     at_lim += 1
                 var mid = 0.5 * (lo[j] + hi[j])
                 var half = 0.5 * (hi[j] - lo[j])
                 act.data[j] = (tgt - mid) / half
                 line += " " + col(a, 6, 2)
+            if rec_path.byte_length() > 0:
+                var row = String(ep) + "," + String(Float64(t) * man.control_period_s)
+                for j in range(ACT):
+                    row += "," + String(q[j])
+                for j in range(ACT):
+                    row += "," + String(qd[j])
+                rec_csv += row + ra + rt + "\n"
             if t % 15 == 0:
                 print("  t=" + pad_left(fixed(Float64(t) * man.control_period_s, 1), 5)
                       + "s  a:" + line)
@@ -216,3 +230,7 @@ def main() raises:
         print("   brick max rise", fixed(rise * 1000.0, 1), "mm | Near held:", held,
               "| targets at a joint limit", at_lim)
     print("probe:", n_ok, "/", episodes, "episodes reached the goal")
+    if rec_path.byte_length() > 0:
+        with open(rec_path, "w") as f:
+            f.write(rec_csv)
+        print("probe: wrote", rec_path)
