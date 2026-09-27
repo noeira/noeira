@@ -5,9 +5,9 @@
 
 `COLL_FLAT_NARROW` (`collision/ccd_workspace.mojo`) replaces the SAP block
 kernel's phase 2 — an env's candidates on the lanes of one warp — with four
-launches: the block kernel's listing into `Data.coll_flat`, a prefix into two
-global queues, a narrow phase over them (a HOT pair alone in a warp, cold
-pairs 32 to a warp) and the block kernel's phase 3 on the result. Only WHICH
+launches: the block kernel's listing into `Data.coll_flat` and its global
+queues, a narrow phase over them (a HOT pair alone in a warp, cold pairs 32 to
+a warp) and the block kernel's phase 3 on the result. Only WHICH
 warp and CCD row runs a pair may change; every candidate goes through the same
 `_sap_block_candidate` into the same staging window and out through the same
 `_sap_block_output`. So the gate is equality: both paths on one `Data`, the
@@ -20,7 +20,7 @@ run — so each case SEEDS the slots before the call:
 
 - all 0: every candidate cold (32 to a warp, across env boundaries);
 - all huge: every candidate hot, in bucket 3 (one warp each);
-- a spread over the four buckets and cold: the prefix's bucket ordering.
+- a spread over the four buckets and cold: the queues' bucket ordering.
 
 and asserts the queues it expects were non-empty — vacuity is the default
 failure. The CCD workspace is re-uploaded (zeroed) before every call, so the
@@ -42,8 +42,7 @@ from noeira.physics3d.fields import Data, Model
 from noeira.physics3d.kinematics.forward_kinematics import forward_kinematics
 from noeira.physics3d.collision.broadphase_sap import detect_contacts_sap
 from noeira.physics3d.collision.ccd_workspace import (
-    CF_ROW, CF_COST, CF_G_HDR, COLL_FLAT_HOT_NS, HILL_WARM_SLOTS,
-    coll_flat_words,
+    CF_ROW, CF_COST, CF_NHOT, CF_NCOLD, COLL_FLAT_HOT_NS, HILL_WARM_SLOTS,
 )
 from noeira.physics3d.model.model_dims import ModelDims
 from noeira.physics3d.gpu.constants import (
@@ -277,10 +276,14 @@ def _case(mode: Int, name: String) raises:
         for k in range(n * CONTACT_SIZE):
             got.append(Float64(d.contacts.data[e * MCON * CONTACT_SIZE + k]))
 
-    # The queues this case was meant to fill.
-    comptime G = BATCH * CF_ROW
-    var nh = Int(d.coll_flat.data[G + 0])
-    var nc = Int(d.coll_flat.data[G + 1])
+    # The queues this case was meant to fill, from the envs' own counts (the
+    # global counters are zeroed by the output kernel once consumed).
+    var nh = 0
+    var nc = 0
+    for e in range(BATCH):
+        for k in range(4):
+            nh += Int(d.coll_flat.data[e * CF_ROW + CF_NHOT + k])
+        nc += Int(d.coll_flat.data[e * CF_ROW + CF_NCOLD])
     print("  ", name, ": hot tasks", nh, " cold tasks", nc)
     if mode == 0:
         assert_true(nh == 0 and nc > 0, name + ": expected every task cold")

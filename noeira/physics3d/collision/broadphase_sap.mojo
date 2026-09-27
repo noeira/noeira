@@ -26,6 +26,7 @@ from std.time import perf_counter_ns
 from std.math import sqrt, abs
 from std.bit import count_trailing_zeros
 from std.sys.info import is_nvidia_gpu
+from std.atomic import Atomic
 from max.gpu import thread_idx, block_idx, block_dim
 from max.gpu.host import DeviceContext
 from layout import Layout, LayoutTensor
@@ -170,7 +171,7 @@ def _hf_len(n: Int) -> Int:
 from .ccd_workspace import (
     COLL_FLAT_NARROW, COLL_FLAT_HOT_NS, coll_flat_words,
     CF_NCAND, CF_OVERFLOW, CF_FULL, CF_NHOT, CF_NCOLD, CF_CAND, CF_CNT,
-    CF_LIST, CF_COST, CF_ROW, CF_G_HDR,
+    CF_COST, CF_ROW, CF_G_HDR,
     CCD_WS_SIZE, COLL_TPB, COLL_CCD_LANES, COLL_NCAND_CAP, COLL_STAGE_MAXC,
     HILL_WARM_ACROSS_STEPS, HILL_WARM_SLOTS, HW_WS_OFF,
     COLL_STAGE_SLOTS, COLL_BLOCK_KERNEL, COLL_NO_FALLBACK,
@@ -4298,6 +4299,15 @@ def _flat_cost_slot(a: Int, b: Int) -> Int:
 
 
 @always_inline
+def _flat_counter(
+    ptr: Pointer[Scalar[DType.float32], MutAnyOrigin], k: Int
+) -> Pointer[Scalar[DType.int32], MutAnyOrigin]:
+    """Queue counter `k` (0..3 hot buckets, 4 cold) of `coll_flat`, whose
+    global block starts at `ptr`, as an int32 cell for `std.atomic`."""
+    return ptr.unsafe_offset(k).unsafe_bitcast[Scalar[DType.int32]]()
+
+
+@always_inline
 def _sap_flat_list_env[
     DTYPE: DType,
     NC: Int,
@@ -4319,16 +4329,33 @@ def _sap_flat_list_env[
         DTYPE, Layout.row_major(coll_flat_words(BATCH)), MutAnyOrigin
     ],
 ):
-    """`FLAT_LIST`'s ending (every thread): the env's listed candidates into
-    its `coll_flat` row — `a, b, t`, the counts, and the task list: HOT
-    candidates by descending cost bucket, then the cold ones, each group in
-    the phase-2 kind order (`ord_sh`). An env past the cap lists no task;
-    the output kernel sends it to the serial fallback."""
+    """`FLAT_LIST`'s ending (EVERY thread — it barriers): the env's listed
+    candidates into its `coll_flat` row (`a, b, t`, the counts), each one
+    classified by its pair's cost in parallel, then thread 0 reserves a range
+    of each bucket's global queue with ONE atomic per bucket and appends the
+    env's tasks in the phase-2 kind order (`ord_sh`). An env past the cap
+    lists no task; the output kernel sends it to the serial fallback."""
+    comptime assert DTYPE == DType.float32, (
+        "the queue counters are int32 cells in a float32 `coll_flat`"
+    )
+    comptime G = BATCH * CF_ROW
+    comptime QS = BATCH * NC
     var base = env * CF_ROW
     for c in range(tid, ncand, COLL_TPB):
+        var a = Int(rebind[Scalar[DTYPE]](cand_sh[0 * NC + c]))
+        var b = Int(rebind[Scalar[DTYPE]](cand_sh[1 * NC + c]))
         coll_flat[base + CF_CAND + c] = cand_sh[0 * NC + c]
         coll_flat[base + CF_CAND + NC + c] = cand_sh[1 * NC + c]
         coll_flat[base + CF_CAND + 2 * NC + c] = cand_sh[2 * NC + c]
+        # the bucket, parked in the (still unused) record-count slot
+        cand_sh[5 * NC + c] = Scalar[DTYPE](
+            _flat_bucket[DTYPE](
+                rebind[Scalar[DTYPE]](
+                    coll_flat[base + CF_COST + _flat_cost_slot(a, b)]
+                )
+            )
+        )
+    barrier()
     if tid != 0:
         return
     coll_flat[base + CF_NCAND] = Scalar[DTYPE](ncand)
@@ -4342,18 +4369,8 @@ def _sap_flat_list_env[
     var n3 = 0
     var nc = 0
     if overflow == 0:
-        # pass 1: each candidate's bucket, parked in its (still unused)
-        # record-count slot
         for p in range(ncand):
-            var c = Int(rebind[Scalar[DTYPE]](ord_sh[p]))
-            var a = Int(rebind[Scalar[DTYPE]](cand_sh[0 * NC + c]))
-            var b = Int(rebind[Scalar[DTYPE]](cand_sh[1 * NC + c]))
-            var bk = _flat_bucket[DTYPE](
-                rebind[Scalar[DTYPE]](
-                    coll_flat[base + CF_COST + _flat_cost_slot(a, b)]
-                )
-            )
-            cand_sh[5 * NC + c] = Scalar[DTYPE](bk)
+            var bk = Int(rebind[Scalar[DTYPE]](cand_sh[5 * NC + Int(rebind[Scalar[DTYPE]](ord_sh[p]))]))
             if bk == 3:
                 n3 += 1
             elif bk == 2:
@@ -4364,161 +4381,43 @@ def _sap_flat_list_env[
                 n0 += 1
             else:
                 nc += 1
-        # pass 2: the task list, bucket 3 first
-        var s3 = 0
-        var s2 = n3
-        var s1 = n3 + n2
-        var s0 = n3 + n2 + n1
-        var sc = n3 + n2 + n1 + n0
-        for p in range(ncand):
-            var c = Int(rebind[Scalar[DTYPE]](ord_sh[p]))
-            var bk = Int(rebind[Scalar[DTYPE]](cand_sh[5 * NC + c]))
-            var pos: Int
-            if bk == 3:
-                pos = s3
-                s3 += 1
-            elif bk == 2:
-                pos = s2
-                s2 += 1
-            elif bk == 1:
-                pos = s1
-                s1 += 1
-            elif bk == 0:
-                pos = s0
-                s0 += 1
-            else:
-                pos = sc
-                sc += 1
-            coll_flat[base + CF_LIST + pos] = Scalar[DTYPE](c)
     coll_flat[base + CF_NHOT + 0] = Scalar[DTYPE](n0)
     coll_flat[base + CF_NHOT + 1] = Scalar[DTYPE](n1)
     coll_flat[base + CF_NHOT + 2] = Scalar[DTYPE](n2)
     coll_flat[base + CF_NHOT + 3] = Scalar[DTYPE](n3)
     coll_flat[base + CF_NCOLD] = Scalar[DTYPE](nc)
-
-
-comptime _FLAT_PREFIX_TPB: Int = 1024
-
-
-def _sap_flat_prefix_kernel[
-    DTYPE: DType,
-    BATCH: Int,
-](
-    coll_flat: LayoutTensor[
-        DTYPE, Layout.row_major(coll_flat_words(BATCH)), MutAnyOrigin
-    ],
-):
-    """ONE block of `_FLAT_PREFIX_TPB` threads: the envs' task lists into the
-    two global queues. The hot queue is bucket 3's tasks of every env, then
-    bucket 2's, 1's, 0's (env order within a bucket, list order within an
-    env); the cold queue is every env's cold tasks in env order. A thread
-    owns a contiguous run of envs; the five per-list offsets are a
-    Hillis-Steele scan over the threads' sums."""
-    comptime T = _FLAT_PREFIX_TPB
-    comptime NC = COLL_NCAND_CAP
-    comptime G = BATCH * CF_ROW
-    comptime QH = G + CF_G_HDR
-    comptime QC = QH + BATCH * NC
-    var tid = Int(thread_idx.x)
-    # [list * T + thread]: lists 0..3 the hot buckets, 4 the cold one
-    var sc_sh = LayoutTensor[
-        DTYPE, Layout.row_major(5 * T), MutAnyOrigin,
-        address_space=AddressSpace.SHARED,
-    ].stack_allocation()
-    comptime CH = (BATCH + T - 1) // T
-    var e0 = tid * CH
-    var e1 = e0 + CH if e0 + CH < BATCH else BATCH
-    var l0 = 0
-    var l1 = 0
-    var l2 = 0
-    var l3 = 0
-    var lc = 0
-    for e in range(e0, e1):
-        var r = e * CF_ROW
-        l0 += Int(rebind[Scalar[DTYPE]](coll_flat[r + CF_NHOT + 0]))
-        l1 += Int(rebind[Scalar[DTYPE]](coll_flat[r + CF_NHOT + 1]))
-        l2 += Int(rebind[Scalar[DTYPE]](coll_flat[r + CF_NHOT + 2]))
-        l3 += Int(rebind[Scalar[DTYPE]](coll_flat[r + CF_NHOT + 3]))
-        lc += Int(rebind[Scalar[DTYPE]](coll_flat[r + CF_NCOLD]))
-    sc_sh[0 * T + tid] = Scalar[DTYPE](l0)
-    sc_sh[1 * T + tid] = Scalar[DTYPE](l1)
-    sc_sh[2 * T + tid] = Scalar[DTYPE](l2)
-    sc_sh[3 * T + tid] = Scalar[DTYPE](l3)
-    sc_sh[4 * T + tid] = Scalar[DTYPE](lc)
-    barrier()
-    var off = 1
-    while off < T:
-        var v0 = Scalar[DTYPE](0)
-        var v1 = Scalar[DTYPE](0)
-        var v2 = Scalar[DTYPE](0)
-        var v3 = Scalar[DTYPE](0)
-        var vc = Scalar[DTYPE](0)
-        if tid >= off:
-            v0 = rebind[Scalar[DTYPE]](sc_sh[0 * T + tid - off])
-            v1 = rebind[Scalar[DTYPE]](sc_sh[1 * T + tid - off])
-            v2 = rebind[Scalar[DTYPE]](sc_sh[2 * T + tid - off])
-            v3 = rebind[Scalar[DTYPE]](sc_sh[3 * T + tid - off])
-            vc = rebind[Scalar[DTYPE]](sc_sh[4 * T + tid - off])
-        barrier()
-        sc_sh[0 * T + tid] = rebind[Scalar[DTYPE]](sc_sh[0 * T + tid]) + v0
-        sc_sh[1 * T + tid] = rebind[Scalar[DTYPE]](sc_sh[1 * T + tid]) + v1
-        sc_sh[2 * T + tid] = rebind[Scalar[DTYPE]](sc_sh[2 * T + tid]) + v2
-        sc_sh[3 * T + tid] = rebind[Scalar[DTYPE]](sc_sh[3 * T + tid]) + v3
-        sc_sh[4 * T + tid] = rebind[Scalar[DTYPE]](sc_sh[4 * T + tid]) + vc
-        barrier()
-        off *= 2
-    var t0 = Int(rebind[Scalar[DTYPE]](sc_sh[0 * T + T - 1]))
-    var t1 = Int(rebind[Scalar[DTYPE]](sc_sh[1 * T + T - 1]))
-    var t2 = Int(rebind[Scalar[DTYPE]](sc_sh[2 * T + T - 1]))
-    var t3 = Int(rebind[Scalar[DTYPE]](sc_sh[3 * T + T - 1]))
-    var tc = Int(rebind[Scalar[DTYPE]](sc_sh[4 * T + T - 1]))
-    # this thread's first slot in each list: the hot buckets in the order
-    # 3, 2, 1, 0 in one queue
-    var p3 = Int(rebind[Scalar[DTYPE]](sc_sh[3 * T + tid])) - l3
-    var p2 = t3 + Int(rebind[Scalar[DTYPE]](sc_sh[2 * T + tid])) - l2
-    var p1 = t3 + t2 + Int(rebind[Scalar[DTYPE]](sc_sh[1 * T + tid])) - l1
-    var p0 = t3 + t2 + t1 + Int(rebind[Scalar[DTYPE]](sc_sh[0 * T + tid])) - l0
-    var pc = Int(rebind[Scalar[DTYPE]](sc_sh[4 * T + tid])) - lc
-    for e in range(e0, e1):
-        var r = e * CF_ROW
-        var n0 = Int(rebind[Scalar[DTYPE]](coll_flat[r + CF_NHOT + 0]))
-        var n1 = Int(rebind[Scalar[DTYPE]](coll_flat[r + CF_NHOT + 1]))
-        var n2 = Int(rebind[Scalar[DTYPE]](coll_flat[r + CF_NHOT + 2]))
-        var n3 = Int(rebind[Scalar[DTYPE]](coll_flat[r + CF_NHOT + 3]))
-        var nc = Int(rebind[Scalar[DTYPE]](coll_flat[r + CF_NCOLD]))
-        var li = r + CF_LIST
-        for i in range(n3):
-            coll_flat[QH + p3 + i] = Scalar[DTYPE](
-                e * NC + Int(rebind[Scalar[DTYPE]](coll_flat[li + i]))
-            )
-        li += n3
-        p3 += n3
-        for i in range(n2):
-            coll_flat[QH + p2 + i] = Scalar[DTYPE](
-                e * NC + Int(rebind[Scalar[DTYPE]](coll_flat[li + i]))
-            )
-        li += n2
-        p2 += n2
-        for i in range(n1):
-            coll_flat[QH + p1 + i] = Scalar[DTYPE](
-                e * NC + Int(rebind[Scalar[DTYPE]](coll_flat[li + i]))
-            )
-        li += n1
-        p1 += n1
-        for i in range(n0):
-            coll_flat[QH + p0 + i] = Scalar[DTYPE](
-                e * NC + Int(rebind[Scalar[DTYPE]](coll_flat[li + i]))
-            )
-        li += n0
-        p0 += n0
-        for i in range(nc):
-            coll_flat[QC + pc + i] = Scalar[DTYPE](
-                e * NC + Int(rebind[Scalar[DTYPE]](coll_flat[li + i]))
-            )
-        pc += nc
-    if tid == 0:
-        coll_flat[G + 0] = Scalar[DTYPE](t0 + t1 + t2 + t3)
-        coll_flat[G + 1] = Scalar[DTYPE](tc)
+    if overflow != 0 or ncand == 0:
+        return
+    var gp = rebind[Pointer[Scalar[DType.float32], MutAnyOrigin]](
+        coll_flat.ptr.unsafe_offset(G)
+    )
+    # each list's first slot in its queue, then its queue's offset
+    var s0 = 0 * QS + Int(Atomic[Int32].fetch_add(_flat_counter(gp, 0), Int32(n0)))
+    var s1 = 1 * QS + Int(Atomic[Int32].fetch_add(_flat_counter(gp, 1), Int32(n1)))
+    var s2 = 2 * QS + Int(Atomic[Int32].fetch_add(_flat_counter(gp, 2), Int32(n2)))
+    var s3 = 3 * QS + Int(Atomic[Int32].fetch_add(_flat_counter(gp, 3), Int32(n3)))
+    var sc = 4 * QS + Int(Atomic[Int32].fetch_add(_flat_counter(gp, 4), Int32(nc)))
+    comptime Q0 = G + CF_G_HDR
+    for p in range(ncand):
+        var c = Int(rebind[Scalar[DTYPE]](ord_sh[p]))
+        var bk = Int(rebind[Scalar[DTYPE]](cand_sh[5 * NC + c]))
+        var pos: Int
+        if bk == 3:
+            pos = s3
+            s3 += 1
+        elif bk == 2:
+            pos = s2
+            s2 += 1
+        elif bk == 1:
+            pos = s1
+            s1 += 1
+        elif bk == 0:
+            pos = s0
+            s0 += 1
+        else:
+            pos = sc
+            sc += 1
+        coll_flat[Q0 + pos] = Scalar[DTYPE](env * NC + c)
 
 
 def _sap_narrow_flat_kernel[
@@ -4613,10 +4512,10 @@ def _sap_narrow_flat_kernel[
     ],
 ):
     """The flat narrow phase: one WARP (block) per env slot, over the queues
-    `_sap_flat_prefix_kernel` built. Warp `w` runs hot tasks `w, w + W, ...`
-    on its lane 0 — the queue is in descending cost bucket, so this is a
-    round robin over a longest-first order — then cold chunks of 32, one per
-    lane, from the far end of the warps. Each task is one listed candidate
+    the listing appended to. Warp `w` runs hot tasks `w, w + W, ...` on its
+    lane 0 — counted over the buckets in descending cost, so this is a round
+    robin over a longest-first order — then cold chunks of 32, one per lane,
+    from the far end of the warps. Each task is one listed candidate
     through `_sap_block_candidate` into its staging window, exactly as the
     block kernel's phase 2 runs it; the CCD row is the thread's own
     (`w * COLL_TPB + lane`, the same rows the block kernel uses) and the hill
@@ -4631,8 +4530,8 @@ def _sap_narrow_flat_kernel[
     comptime W = BATCH
     comptime NC = COLL_NCAND_CAP
     comptime G = BATCH * CF_ROW
-    comptime QH = G + CF_G_HDR
-    comptime QC = QH + BATCH * NC
+    comptime QS = BATCH * NC
+    comptime Q0 = G + CF_G_HDR
     comptime EX_CAP = cap[NEXCLUDE]() if may_exist[NEXCLUDE]() else 1
     var dims = Dims[nq=NQ, nv=NV, nbody=NBODY, njoint=NJOINT, max_contacts=MAX_CONTACTS, ngeom=NGEOM, nexclude=NEXCLUDE, nmesh_verts=NMESH_VERTS, npair=NPAIR]()
     var nbody = NBODY
@@ -4677,8 +4576,18 @@ def _sap_narrow_flat_kernel[
     var pr = _SapProbe()
     var wrow = w * COLL_TPB + lane
 
-    var nh = Int(rebind[Scalar[DTYPE]](coll_flat[G + 0]))
-    var ncold = Int(rebind[Scalar[DTYPE]](coll_flat[G + 1]))
+    comptime assert DTYPE == DType.float32, (
+        "the queue counters are int32 cells in a float32 `coll_flat`"
+    )
+    var gp = rebind[Pointer[Scalar[DType.float32], MutAnyOrigin]](
+        coll_flat.ptr.unsafe_offset(G)
+    )
+    var c0 = Int(_flat_counter(gp, 0)[])
+    var c1 = Int(_flat_counter(gp, 1)[])
+    var c2 = Int(_flat_counter(gp, 2)[])
+    var c3 = Int(_flat_counter(gp, 3)[])
+    var nh = c0 + c1 + c2 + c3
+    var ncold = Int(_flat_counter(gp, 4)[])
     # This warp's tasks, hot then cold, as ONE loop with the task body once
     # (a capturing closure here crashed the compiler, 2026-09-27): hot tasks
     # `w, w + W, ...` on lane 0, then cold chunks `W-1-w, 2W-1-w, ...` of
@@ -4691,11 +4600,22 @@ def _sap_narrow_flat_kernel[
         var item = -1
         if it < n_hot:
             if lane == 0:
-                item = Int(rebind[Scalar[DTYPE]](coll_flat[QH + w + it * W]))
+                # hot index h over buckets 3, 2, 1, 0
+                var h = w + it * W
+                var q: Int
+                if h < c3:
+                    q = 3 * QS + h
+                elif h < c3 + c2:
+                    q = 2 * QS + h - c3
+                elif h < c3 + c2 + c1:
+                    q = 1 * QS + h - c3 - c2
+                else:
+                    q = h - c3 - c2 - c1
+                item = Int(rebind[Scalar[DTYPE]](coll_flat[Q0 + q]))
         else:
             var i = (k0 + (it - n_hot) * W) * COLL_TPB + lane
             if i < ncold:
-                item = Int(rebind[Scalar[DTYPE]](coll_flat[QC + i]))
+                item = Int(rebind[Scalar[DTYPE]](coll_flat[Q0 + 4 * QS + i]))
         if item >= 0:
             var env = item // NC
             var c = item - env * NC
@@ -4744,10 +4664,27 @@ def _sap_narrow_flat_kernel[
             coll_flat[base + CF_CNT + c] = Scalar[DTYPE](cnt)
             if cnt >= COLL_STAGE_MAXC:
                 coll_flat[base + CF_FULL] = Scalar[DTYPE](1)
+            # ⚠ ONLY A HOT TASK'S CLOCK IS ITS OWN. A cold task shares its warp
+            # with 31 others, and while their branches diverge every lane's
+            # timer spans them all (the same trap as `COLL_TIMING`'s per-lane
+            # numbers): timed there, nearly every mesh pair read >= 16 us and
+            # the next step ran 21k "hot" tasks for ~2.5k slow ones. So a
+            # cold task is costed by what makes a pair slow — a MESH pair
+            # that emitted a contact penetrated, so it ran EPA — at the
+            # threshold (bucket 0), and its first hot run measures the rest.
+            # A penetrating mesh pair stays at least at the threshold, hot or
+            # cold — else one that runs under it alone would flip every step.
             comptime if is_nvidia_gpu():
-                coll_flat[base + CF_COST + _flat_cost_slot(a, b)] = Scalar[DTYPE](
-                    Int(perf_counter_ns() - t0)
-                )
+                var cost = Scalar[DTYPE](0)
+                if it < n_hot:
+                    cost = Scalar[DTYPE](Int(perf_counter_ns() - t0))
+                if cnt > 0 and t >= 0 and (
+                    t == GEOM_MESH
+                    or Int(rebind[Scalar[DTYPE]](geoms[b, GEOM_IDX_TYPE])) == GEOM_MESH
+                ):
+                    if cost < Scalar[DTYPE](COLL_FLAT_HOT_NS):
+                        cost = Scalar[DTYPE](COLL_FLAT_HOT_NS)
+                coll_flat[base + CF_COST + _flat_cost_slot(a, b)] = cost
 
 
 def _sap_flat_output_kernel[
@@ -4792,6 +4729,17 @@ def _sap_flat_output_kernel[
         address_space=AddressSpace.SHARED,
     ].stack_allocation()
     var base = env * CF_ROW
+    if env == 0 and tid == 0:
+        # The queues are consumed (the narrow kernel has run): zero their
+        # counters for the next listing.
+        comptime assert DTYPE == DType.float32, (
+            "the queue counters are int32 cells in a float32 `coll_flat`"
+        )
+        var gp = rebind[Pointer[Scalar[DType.float32], MutAnyOrigin]](
+            coll_flat.ptr.unsafe_offset(BATCH * CF_ROW)
+        )
+        for k in range(5):
+            _flat_counter(gp, k)[] = Int32(0)
     if tid == 0:
         ctrl_sh[0] = coll_flat[base + CF_NCAND]
         var fb = (
@@ -4912,7 +4860,7 @@ def detect_contacts_sap[
         comptime BLOCKS = (BATCH + SAP_TPB - 1) // SAP_TPB
         comptime USE_BLOCK = COLL_BLOCK_KERNEL and D.NHFIELD_DATA == 0
         comptime if USE_BLOCK and FLAT:
-            # The flat narrow phase: list, queue, narrow, output — see
+            # The flat narrow phase: list (and queue), narrow, output — see
             # `ccd_workspace.COLL_FLAT_NARROW`.
             c.enqueue_function[
                 _detect_contacts_sap_block_kernel[
@@ -4946,11 +4894,6 @@ def detect_contacts_sap[
                 d.coll_flat.lt["gpu", L_COLL_FLAT](),
                 grid_dim=(BATCH,),
                 block_dim=(COLL_TPB,),
-            )
-            c.enqueue_function[_sap_flat_prefix_kernel[DTYPE, BATCH]](
-                d.coll_flat.lt["gpu", L_COLL_FLAT](),
-                grid_dim=(1,),
-                block_dim=(_FLAT_PREFIX_TPB,),
             )
             c.enqueue_function[
                 _sap_narrow_flat_kernel[
