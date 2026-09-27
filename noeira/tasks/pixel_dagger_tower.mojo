@@ -321,6 +321,10 @@ def run_pixel_dagger(args: List[String], driver: String) raises:
     var blank = _arg(args, "--blank-images", "0") == "1"
     var grip_sign = _arg(args, "--gripper-sign", "0") == "1"
     var eval_teacher = _arg(args, "--eval-teacher", "0") == "1"
+    # `--act-gain k`: the student's output x k before the clamp, in the EVAL
+    # only. A regression onto sign-noise labels learns their small mean; if
+    # the student is merely too TIMID, a gain restores it without retraining.
+    var act_gain = Float64(_arg(args, "--act-gain", "1"))
     seed_rng(seed)
     var family = String("so101_tower")
     var family_path = String("noeira/tasks/families/so101_tower.family")
@@ -384,6 +388,7 @@ def run_pixel_dagger(args: List[String], driver: String) raises:
     logger.set_config("replay", String(cap))
     logger.set_config("blank_images", String(blank))
     logger.set_config("gripper_sign", String(grip_sign))
+    logger.set_config("act_gain", String(act_gain))
     register_run(run, logger)
     var artifacts = sink_for_run(run.id, run.dir)
 
@@ -715,7 +720,8 @@ def run_pixel_dagger(args: List[String], driver: String) raises:
                     ctx.synchronize()
                     for k in range(N_ENVS * ACT_DIM):
                         at[unsafe_offset=k] = student_act(
-                            y_act.data[k], k % ACT_DIM, grip_sign
+                            y_act.data[k] * Scalar[DT](act_gain), k % ACT_DIM,
+                            grip_sign,
                         )
                 _delta_to_env(
                     mptr(act_t.unsafe_ptr()), mptr(env_act.unsafe_ptr()),
