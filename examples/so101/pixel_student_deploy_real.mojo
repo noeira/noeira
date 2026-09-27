@@ -214,7 +214,10 @@ def _warm_cameras(
           + " frames drained)")
 
 
-def _snap(dir: String, ref frames: List[List[UInt8]], ref x: List[Scalar[DT]], tag: String = "") raises:
+def _snap(
+    dir: String, ref frames: List[List[UInt8]], ref x: List[Scalar[DT]],
+    ref q: List[Float64], tag: String = "",
+) raises:
     """Each camera: the undistorted frame, and the 16x16 the policy receives
     (upscaled x16), as PNGs."""
     makedirs(dir, exist_ok=True)
@@ -235,7 +238,17 @@ def _snap(dir: String, ref frames: List[List[UInt8]], ref x: List[Scalar[DT]], t
                     var b = Int(v * 255.0 + 0.5)
                     img[(yy * W + xx) * 3 + c] = UInt8(max(0, min(255, b)))
         save_png(dir + "/" + names[k] + "_policy_view" + tag + ".png", img, W, W, 3)
-    print("  snap: " + dir + "/{overhead,wrist}_{undistorted,policy_view}" + tag + ".png")
+    # ⚠ THE POSE THE FRAMES WERE TAKEN AT, in model radians through the joint
+    # map — what `tools/so101/sim_view_at_pose.mojo` renders the sim cameras
+    # at, so a real frame and a sim frame of the SAME arm pose can be laid
+    # side by side (a joint-map error shows as a different arm silhouette).
+    var ps = String("")
+    for j in range(len(q)):
+        ps += ("" if j == 0 else " ") + String(q[j])
+    with open(dir + "/pose" + tag + ".txt", "w") as f:
+        f.write(ps + "\n")
+    print("  snap: " + dir + "/{overhead,wrist}_{undistorted,policy_view}" + tag
+          + ".png + pose" + tag + ".txt (" + ps + ")")
 
 
 def main() raises:
@@ -424,7 +437,7 @@ def main() raises:
         line += " " + col(Float64(y.data[j]), 6, 2)
     print(line)
     if snap_dir.byte_length() > 0:
-        _snap(snap_dir, frames, xs)
+        _snap(snap_dir, frames, xs, q)
 
     if too_dark and arm_it and not force_dark:
         for i in range(N_CAMS):
@@ -506,6 +519,13 @@ def main() raises:
     # disagree with the positions the policy was trained beside. Tick
     # quantisation (~0.0015 rad / 32 ms ~ 0.05 rad/s) is 0.01 after the
     # plane's x0.2 — below the sim's own step noise.
+    # ⚠ RE-READ HERE, AFTER THE RAMP: `q` still holds the pre-arm pose, and
+    # the ramp to the sim's start moved the arm (0.41 rad of wrist flex on the
+    # first bring-up) — differencing against it fed the first tick a 13 rad/s
+    # "velocity".
+    if arm.read_positions(Span(raw)) == SO101_N:
+        for i in range(SO101_N):
+            q[i] = jmap.to_sim_unclamped(arm.cal, i, raw[i])
     var q_prev = List[Float64](length=SO101_N, fill=0.0)
     for i in range(SO101_N):
         q_prev[i] = q[i]
@@ -539,7 +559,7 @@ def main() raises:
             joints_to_planes(q, xs)
             joint_vels_to_planes(qd, xs)
             if snap_dir.byte_length() > 0 and ticks == 62:
-                _snap(snap_dir, frames, xs, String("_t2s"))
+                _snap(snap_dir, frames, xs, q, String("_t2s"))
             for k in range(IN_DIM):
                 x.data[k] = xs[k]
             var tf = perf_counter_ns()
