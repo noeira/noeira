@@ -135,6 +135,30 @@ def frame_to_planes(
                 )
 
 
+def render_to_planes(
+    ref rgb: List[Scalar[DT]], r: Int, cam: Int, mut x: List[Scalar[DT]]
+) raises:
+    """A SIM render (the tracer's `rgb`: `r` x `r`, HWC floats in [0, 1], top
+    row first) into camera `cam`'s planes — the host twin of the trainer's
+    `_pack_camera_kernel` (block mean over (r / OBS_PX)^2, minus 0.5), for
+    tools that drive the student one env at a time on the CPU (the viewer)."""
+    if r % OBS_PX != 0 or len(rgb) != r * r * 3:
+        raise Error("pixel student: a " + String(r) + "x" + String(r)
+                    + " render does not block-average to " + String(OBS_PX))
+    var f = r // OBS_PX
+    var inv = 1.0 / Float64(f * f)
+    for c in range(3):
+        for oy in range(OBS_PX):
+            for ox in range(OBS_PX):
+                var acc = 0.0
+                for dy in range(f):
+                    for dx in range(f):
+                        acc += Float64(rgb[((oy * f + dy) * r + ox * f + dx) * 3 + c])
+                x[(3 * cam + c) * PLANE + oy * OBS_PX + ox] = Scalar[DT](
+                    acc * inv - IMAGE_OFFSET
+                )
+
+
 def joints_to_planes(ref q: List[Float64], mut x: List[Scalar[DT]]):
     """The six joints (model radians) broadcast into their planes."""
     for j in range(ACT):
