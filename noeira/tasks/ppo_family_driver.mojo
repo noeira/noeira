@@ -62,7 +62,7 @@ later addition.
   `--log-std-init 0` (nexus's std 1).
 """
 
-from std.math import abs, sqrt
+from std.math import abs, sqrt, log, cos
 from std.random import random_float64, seed as seed_rng
 from std.sys import is_defined
 from std.time import perf_counter_ns
@@ -378,6 +378,14 @@ def _bc_pretrain[OBS: Int](
             loss_acc = 0.0
 
 
+def _gauss() -> Float64:
+    """A standard normal draw (Box-Muller on the host RNG)."""
+    var u1 = random_float64()
+    if u1 < 1e-12:
+        u1 = 1e-12
+    return sqrt(-2.0 * log(u1)) * cos(2.0 * 3.141592653589793 * random_float64())
+
+
 def _arg(args: List[String], key: String, default: String) raises -> String:
     for i in range(len(args) - 1):
         if args[i] == key:
@@ -422,6 +430,7 @@ def run_ppo[M: ModelDefLike, C: Phyics3dEnvConfig](
     var bc_lr = Float64(_arg(args, "--bc-lr", "0.001"))
     var bc_log_std = Float64(_arg(args, "--bc-log-std", "-1.0"))
     var eval_rounds = Int(_arg(args, "--eval-rounds", "4"))
+    var exec_noise = Float64(_arg(args, "--exec-noise", "0"))
     if action_mode != "absolute" and action_mode != "delta":
         raise Error("ppo task: --action absolute|delta, got " + action_mode)
     if reward != "potential" and reward != "legacy":
@@ -493,6 +502,7 @@ def run_ppo[M: ModelDefLike, C: Phyics3dEnvConfig](
     logger.set_config("bc_demos", bc_demos)
     logger.set_config("bc_updates", String(bc_updates))
     logger.set_config("success_bonus", String(bonus))
+    logger.set_config("exec_noise", String(exec_noise))
     logger.set_config("horizon", String(C.MAX_STEPS))
     logger.set_config("obs_norm", "running, clip 10")
     logger.set_config("reward_norm", "discounted-return std, clip 10")
@@ -629,6 +639,22 @@ def run_ppo[M: ModelDefLike, C: Phyics3dEnvConfig](
             agent.trainer.select_action_batched(
                 mptr(cur_n.unsafe_ptr()), mptr(act_h.unsafe_ptr()), step,
             )
+            # ⚠ `--exec-noise`: the EXECUTED action is perturbed, the RECORDED
+            # one is not (the trainer keeps its own sample) — noise of the
+            # environment, not of the policy, so the policy meets states off
+            # its own trajectories and learns to recover from them. Why: the
+            # cube-in-bowl teacher CHATTERS where its pixel student hovers
+            # (per step |teacher - student| ~0.9 on four joints, the teacher
+            # opening in 13 % of those steps) — states it never visits.
+            if exec_noise > 0.0:
+                var ah = mptr(act_h.unsafe_ptr())
+                for k in range(N_ENVS * ACT_DIM):
+                    var v = Float64(ah[unsafe_offset=k]) + exec_noise * _gauss()
+                    if v > 1.0:
+                        v = 1.0
+                    elif v < -1.0:
+                        v = -1.0
+                    ah[unsafe_offset=k] = Scalar[DT](v)
             if action_mode == "delta":
                 _delta_to_env(
                     mptr(act_h.unsafe_ptr()), mptr(env_act.unsafe_ptr()),
