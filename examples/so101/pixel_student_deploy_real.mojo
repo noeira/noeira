@@ -24,7 +24,7 @@ observing the rig through its two real cameras.
 Flags: --project (so101-tower), --role (pixel_lift) or --ckpt PATH, --devices
 CSV (overhead first), --port, --fourcc, --undistort DIR (projects/so101-tower/
 cameras), --arm, --seconds (20), --no-return, --no-start-pose, --snap DIR,
---gripper-sign 0|1 (default: the manifest's), --step-ticks (80).
+--gripper-sign 0|1 (default: the manifest's), --step-ticks (80), --force-dark.
 
 ## What makes a SIM policy's observation on the real rig (`pixel_student.mojo`)
 
@@ -111,6 +111,19 @@ comptime CAM_H = 480
 comptime MAX_STEP_TICKS = 80
 comptime TRACK_STEP_TICKS = 512
 comptime START_POSE_TIMEOUT_S = 10
+comptime CAMERA_WARMUP_S = 3
+"""⚠ THE FIRST FRAMES OF A UVC CAMERA ARE DARK AND GREEN — auto-exposure and
+white balance have not settled. The first bring-up (27 Sep) snapped the very
+first frame: mean RGB (3, 18, 4) against the sim's ~146 grey, and the policy
+answered with actions of 4 and 8 on a [-1, 1] scale. Frames are drained for
+this long before anything is observed."""
+comptime SIM_MEAN_OVERHEAD = 0.571
+comptime SIM_MEAN_WRIST = 0.600
+"""The sim's mean pixel (0..1) of each camera's policy view at the task's
+reset (`dagger_tower_pixels --png`, lift on the real layouts, 27 Sep). A real
+view darker than HALF of it refuses `--arm` (`--force-dark` overrides): a
+network fed a picture that far from its training set acts with confidence
+and without meaning."""
 
 
 def _arg(args: List[String], key: String, default: String) -> String:
@@ -179,7 +192,29 @@ def _ramp_to(mut arm: SO101Arm, ref target: List[Int32], timeout_s: Int) -> Bool
     return arrived
 
 
-def _snap(dir: String, ref frames: List[List[UInt8]], ref x: List[Scalar[DT]]) raises:
+def _view_mean(ref x: List[Scalar[DT]], cam: Int) -> Float64:
+    """Mean pixel (0..1) of camera `cam`'s planes in the policy input."""
+    var acc = 0.0
+    for k in range(3 * PLANE):
+        acc += Float64(x[3 * cam * PLANE + k]) + 0.5
+    return acc / Float64(3 * PLANE)
+
+
+def _warm_cameras(
+    mut cams: List[CameraReader], mut frames: List[List[UInt8]], seconds: Int
+) raises:
+    """Drain frames for `seconds` so exposure and white balance settle."""
+    var t_end = perf_counter_ns() + seconds * 1_000_000_000
+    var n = 0
+    while perf_counter_ns() < t_end:
+        for i in range(len(cams)):
+            if cams[i].take_blocking(frames[i], timeout_ms=1000):
+                n += 1
+    print("  cameras warmed for " + String(seconds) + " s (" + String(n)
+          + " frames drained)")
+
+
+def _snap(dir: String, ref frames: List[List[UInt8]], ref x: List[Scalar[DT]], tag: String = "") raises:
     """Each camera: the undistorted frame, and the 16x16 the policy receives
     (upscaled x16), as PNGs."""
     makedirs(dir, exist_ok=True)
@@ -189,7 +224,7 @@ def _snap(dir: String, ref frames: List[List[UInt8]], ref x: List[Scalar[DT]]) r
         for c in range(3):
             for p in range(CAM_W * CAM_H):
                 hwc[p * 3 + c] = frames[k][c * CAM_W * CAM_H + p]
-        save_png(dir + "/" + names[k] + "_undistorted.png", hwc, CAM_W, CAM_H, 3)
+        save_png(dir + "/" + names[k] + "_undistorted" + tag + ".png", hwc, CAM_W, CAM_H, 3)
         comptime S = 256 // OBS_PX
         comptime W = OBS_PX * S
         var img = List[UInt8](length=W * W * 3, fill=UInt8(0))
@@ -199,8 +234,8 @@ def _snap(dir: String, ref frames: List[List[UInt8]], ref x: List[Scalar[DT]]) r
                     var v = Float64(x[(3 * k + c) * PLANE + (yy // S) * OBS_PX + xx // S]) + 0.5
                     var b = Int(v * 255.0 + 0.5)
                     img[(yy * W + xx) * 3 + c] = UInt8(max(0, min(255, b)))
-        save_png(dir + "/" + names[k] + "_policy_view.png", img, W, W, 3)
-    print("  snap: " + dir + "/{overhead,wrist}_{undistorted,policy_view}.png")
+        save_png(dir + "/" + names[k] + "_policy_view" + tag + ".png", img, W, W, 3)
+    print("  snap: " + dir + "/{overhead,wrist}_{undistorted,policy_view}" + tag + ".png")
 
 
 def main() raises:
@@ -221,6 +256,7 @@ def main() raises:
     var snap_dir = _arg(args, "--snap", "")
     var grip_arg = _arg(args, "--gripper-sign", "")
     var step_ticks = Int(_arg(args, "--step-ticks", String(MAX_STEP_TICKS)))
+    var force_dark = _flag(args, "--force-dark")
 
     print("=" * 74)
     print("PIXEL STUDENT on the physical SO-101 — sim-to-real")
@@ -312,9 +348,29 @@ def main() raises:
         frames.append(List[UInt8](length=cams[i].frame_bytes(), fill=UInt8(0)))
         if not cams[i].take_blocking(frames[i], timeout_ms=4000):
             raise Error("pixel deploy: no first frame from " + devices[i])
+    _warm_cameras(cams, frames, CAMERA_WARMUP_S)
     var xs = List[Scalar[DT]](length=IN_DIM, fill=Scalar[DT](0))
     for i in range(N_CAMS):
         frame_to_planes(frames[i], CAM_W, CAM_H, i, xs)
+    # ⚠ THE BRIGHTNESS CHECK, against the sim's own policy view
+    var too_dark = False
+    for i in range(N_CAMS):
+        var m = _view_mean(xs, i)
+        var ref_m = SIM_MEAN_WRIST if names[i] == "wrist" else SIM_MEAN_OVERHEAD
+        var mr = 0.0
+        var mg = 0.0
+        var mb = 0.0
+        for p in range(PLANE):
+            mr += Float64(xs[(3 * i) * PLANE + p]) + 0.5
+            mg += Float64(xs[(3 * i + 1) * PLANE + p]) + 0.5
+            mb += Float64(xs[(3 * i + 2) * PLANE + p]) + 0.5
+        print("  " + pad_right(names[i], 9) + " policy view mean " + fixed(m, 3)
+              + " (R " + fixed(mr / Float64(PLANE), 3) + " G "
+              + fixed(mg / Float64(PLANE), 3) + " B " + fixed(mb / Float64(PLANE), 3)
+              + ") | sim " + fixed(ref_m, 3)
+              + ("   ⚠⚠ UNDER HALF THE SIM'S" if m < 0.5 * ref_m else ""))
+        if m < 0.5 * ref_m:
+            too_dark = True
 
     # ── the arm ───────────────────────────────────────────────────────────
     print("")
@@ -363,6 +419,18 @@ def main() raises:
     print(line)
     if snap_dir.byte_length() > 0:
         _snap(snap_dir, frames, xs)
+
+    if too_dark and arm_it and not force_dark:
+        for i in range(N_CAMS):
+            try:
+                cams[i].stop()
+            except:
+                pass
+        raise Error(
+            "pixel deploy: a camera's picture is under half the sim's"
+            " brightness — NOT arming (check the lights and the camera's"
+            " exposure; --force-dark overrides)"
+        )
 
     # ── go ────────────────────────────────────────────────────────────────
     var stdin = StdinReader()
@@ -448,6 +516,8 @@ def main() raises:
             for i in range(SO101_N):
                 q[i] = jmap.to_sim_unclamped(arm.cal, i, raw[i])
             joints_to_planes(q, xs)
+            if snap_dir.byte_length() > 0 and ticks == 62:
+                _snap(snap_dir, frames, xs, String("_t2s"))
             for k in range(IN_DIM):
                 x.data[k] = xs[k]
             var tf = perf_counter_ns()
