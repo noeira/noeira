@@ -364,7 +364,8 @@ def run_pixel_dagger(args: List[String], driver: String) raises:
 
     var run = RunContext(
         project=String("so101-tower"), driver=driver,
-        slug=String("dagger-px-") + task, env=String("family:") + family,
+        slug=String("eval-dagger-px-" if total_steps == 0 else "dagger-px-") + task,
+        env=String("family:") + family,
         task=task, seed=seed, device="gpu",
     )
     print("  run", run.dir)

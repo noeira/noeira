@@ -431,6 +431,7 @@ def run_ppo[M: ModelDefLike, C: Phyics3dEnvConfig](
     var bc_log_std = Float64(_arg(args, "--bc-log-std", "-1.0"))
     var eval_rounds = Int(_arg(args, "--eval-rounds", "4"))
     var exec_noise = Float64(_arg(args, "--exec-noise", "0"))
+    var log_every = max(Int(_arg(args, "--log-every", "10")), 1)
     if action_mode != "absolute" and action_mode != "delta":
         raise Error("ppo task: --action absolute|delta, got " + action_mode)
     if reward != "potential" and reward != "legacy":
@@ -480,7 +481,10 @@ def run_ppo[M: ModelDefLike, C: Phyics3dEnvConfig](
         a_hi.append(fmd.actuators[i].ctrl_max)
 
     var run = RunContext(
-        project=project, driver=driver, slug=String("ppo-") + task,
+        project=project, driver=driver,
+        # an evaluation of a trained policy (`--steps 0`) is a run too, but
+        # it must not read as a training run that logged one point
+        slug=String("eval-ppo-" if total_steps == 0 else "ppo-") + task,
         env=String("family:") + family, task=task, seed=seed, device="gpu",
     )
     print("  run", run.dir)
@@ -778,16 +782,22 @@ def run_ppo[M: ModelDefLike, C: Phyics3dEnvConfig](
                 var rate = Float64(ns) / Float64(nw) if nw > 0 else 0.0
                 var mret = rsum / Float64(nw) if nw > 0 else 0.0
                 var secs = Float64(perf_counter_ns() - t0) / 1e9
-                logger.log_scalar("success_rate", rate, step)
-                logger.log_scalar("episode_return", mret, step)
-                logger.log_scalar("episodes", Float64(n_episodes), step)
-                logger.log_scalar("diverged", Float64(n_diverged), step)
-                logger.log_scalar("sps", Float64(step) / secs, step)
-                logger.log_scalar("lr", lr0 * frac, step)
-                logger.log_scalar("ent_coef", ent1 + (ent0 - ent1) * frac, step)
-                agent.trainer.flush_metrics_through_logger[RunLogger](
-                    logger_ptr, step
-                )
+                # ⚠ EVERY `--log-every` UPDATES, not every update: a 60M run
+                # at 1024 lanes is 3 662 updates x 16 series, more points than
+                # a chart can show. The trainer's metrics are ACCUMULATORS
+                # drained at each flush, so a sparser flush logs the window's
+                # MEAN, not a sample of it.
+                if n_updates % log_every == 0:
+                    logger.log_scalar("success_rate", rate, step)
+                    logger.log_scalar("episode_return", mret, step)
+                    logger.log_scalar("episodes", Float64(n_episodes), step)
+                    logger.log_scalar("diverged", Float64(n_diverged), step)
+                    logger.log_scalar("sps", Float64(step) / secs, step)
+                    logger.log_scalar("lr", lr0 * frac, step)
+                    logger.log_scalar("ent_coef", ent1 + (ent0 - ent1) * frac, step)
+                    agent.trainer.flush_metrics_through_logger[RunLogger](
+                        logger_ptr, step
+                    )
                 if n_updates % 10 == 0:
                     print("  step", step, "| success", rate, "over", nw,
                           "ep | return", mret, "| episodes", n_episodes,

@@ -10,6 +10,7 @@ Flags: --steps, --seed, --lr, --ent-coef, --ent-coef-final, --anneal-steps,
 --init RUN_DIR (with --steps 0: evaluate only), --eval-rounds N (greedy, held-out),
 --bc-demos a.demo,b.demo [--bc-updates 2000 --bc-lr 1e-3 --bc-log-std -1] (clone the teacher first),
 --exec-noise SIGMA (Gaussian noise on the EXECUTED action, training only),
+--log-every N (metrics every N updates, 10),
 --checkpoint-every. The driver is `noeira/tasks/ppo_family_driver.run_ppo`;
 read its header, and `noeira-docs/SO101_PIXEL_RL_PLAN.md` for why PPO.
 """
