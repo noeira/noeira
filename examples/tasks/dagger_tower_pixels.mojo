@@ -2,7 +2,8 @@
 
     pixi run -e nvidia mojo build -I . examples/tasks/dagger_tower_pixels.mojo -o dagger_px
     ./dagger_px so101_tower_lift_real_layout --teacher runs/<ppo run> --steps 20000000
-    # -D DAGGER_WRIST_ONLY for the wrist camera alone; -D TASK_PPO_LANES_256 for a smoke run
+    # -D DAGGER_WRIST_ONLY for the wrist camera alone; -D DAGGER_PX_32 for 32x32;
+    # -D TASK_PPO_LANES_256 for a smoke run
 
 Flags: --teacher RUN_DIR (required), --steps, --beta-steps, --updates, --lr,
 --replay ROWS, --seed, --eval-rounds, --init-student CKPT, --png DIR,

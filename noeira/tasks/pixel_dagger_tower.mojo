@@ -110,7 +110,9 @@ comptime NB = M.NBODY
 comptime N_CAMS = 1 if is_defined["DAGGER_WRIST_ONLY"]() else 2
 comptime RENDER = 64
 """The traced resolution (1 sample): 144k frames/s wrist at 1024 lanes."""
-comptime OBS_PX = 16
+comptime OBS_PX = 32 if is_defined["DAGGER_PX_32"]() else 16
+"""The student's resolution: 16 (Squint's) by default, `-D DAGGER_PX_32` for
+32 — the traced 64x64 averaged over 4x4 or 2x2 blocks."""
 comptime PLANE = OBS_PX * OBS_PX
 comptime IMG = 3 * N_CAMS * PLANE
 comptime ROW = IMG + ACT_DIM
@@ -324,7 +326,10 @@ def run_pixel_dagger(args: List[String], driver: String) raises:
     var beta_steps = Int(_arg(args, "--beta-steps", "2000000"))
     var updates = Int(_arg(args, "--updates", "32"))
     var lr = Float64(_arg(args, "--lr", "0.0003"))
-    var cap = Int(_arg(args, "--replay", String(N_ENVS * 512)))
+    # the default ring: 512 steps of every lane, capped so `cap * ROW` stays
+    # under the 32-bit LayoutTensor offset (a 32x32 row is 6150 words)
+    var cap_max = ((1 << 31) - 1) // ROW // N_ENVS * N_ENVS
+    var cap = Int(_arg(args, "--replay", String(min(N_ENVS * 512, cap_max))))
     var seed = Int(_arg(args, "--seed", "1"))
     var eval_rounds = Int(_arg(args, "--eval-rounds", "2"))
     var init_student = _arg(args, "--init-student", "")
@@ -657,6 +662,7 @@ def run_pixel_dagger(args: List[String], driver: String) raises:
             var held_end = List[Bool](length=N_ENVS, fill=False)
             var z0 = List[Float64](length=N_ENVS, fill=0.0)
             var rise = List[Float64](length=N_ENVS, fill=0.0)
+            var over = List[Bool](length=N_ENVS, fill=False)
             for t in range(C.MAX_STEPS - 1):
                 px.observe(ctx, qpos_dev, 0)
                 var rq = mptr(raw_h.unsafe_ptr())
@@ -696,16 +702,28 @@ def run_pixel_dagger(args: List[String], driver: String) raises:
                     if hb:
                         held[e] = True
                     held_end[e] = hb
-                    var ia = Int(env.d.meta.data[e * METADATA_SIZE + META_IDX_TASK_PARAM_0 + 1])
-                    var za = Float64(env.d.xpos.data[e * NB * 3 + ia * 3 + 2])
+                    var mb = e * METADATA_SIZE + META_IDX_TASK_PARAM_0
+                    var ia = Int(env.d.meta.data[mb + 1])
+                    var ib = Int(env.d.meta.data[mb + 2])
+                    var xb = e * NB * 3
+                    var za = Float64(env.d.xpos.data[xb + ia * 3 + 2])
                     if t == 0:
                         z0[e] = za
                     if za - z0[e] > rise[e]:
                         rise[e] = za - z0[e]
+                    # over term 0's second body while lifted (the bowl, on
+                    # cube in bowl; the desk's origin on lift — read loosely)
+                    var ex = Float64(env.d.xpos.data[xb + ia * 3] - env.d.xpos.data[xb + ib * 3])
+                    var ey = Float64(env.d.xpos.data[xb + ia * 3 + 1] - env.d.xpos.data[xb + ib * 3 + 1])
+                    if za - z0[e] > 0.02 and sqrt(ex * ex + ey * ey) < 0.045:
+                        over[e] = True
             var ok = 0
             var n_end = 0
             var n_lift = 0
+            var n_over = 0
             for e in range(N_ENVS):
+                if over[e]:
+                    n_over += 1
                 if held[e]:
                     ok += 1
                 if held_end[e]:
@@ -713,7 +731,8 @@ def run_pixel_dagger(args: List[String], driver: String) raises:
                 if rise[e] > 0.02:
                     n_lift += 1
             print("  student greedy eval round", rnd, ":", ok, "/", N_ENVS,
-                  "| held at the end", n_end, "| lifted >2cm", n_lift)
+                  "| held at the end", n_end, "| lifted >2cm", n_lift,
+                  "| over b while lifted", n_over)
             ok_all += ok
             n_all += N_ENVS
         var rate = Float64(ok_all) / Float64(max(n_all, 1))
