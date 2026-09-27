@@ -97,6 +97,7 @@ from noeira.tasks.family import scene_path
 from noeira.tasks.gpu_eval import region_table_words
 from noeira.tasks.posed_reset import task_meta_words
 from noeira.tasks.shaping import reward_mode_words
+from noeira.tasks.delta_action import DELTA_ACT, delta_scale, delta_target
 from noeira.tasks.spec import load_family
 
 # ⚠ LANES AT BUILD TIME (Mojo has no integer define): 1024 by default,
@@ -119,8 +120,6 @@ comptime GAMMA = 0.99
 comptime OBS_BOUND = 1.0e3
 """A raw observation word beyond this (or non-finite) marks the lane DIVERGED."""
 comptime REW_BOUND = 1.0e3
-comptime DELTA_ARM = 0.05
-comptime DELTA_GRIPPER = 0.2
 
 comptime EnvT[M: ModelDefLike, C: Phyics3dEnvConfig] = Phyics3dBatchedEnv[
     M, C, N_ENVS, TERMINATE_ON_UNHEALTHY=False,
@@ -246,14 +245,11 @@ def _delta_to_env(
     env's absolute action (`(target - mid) / half`)."""
     for e in range(N_ENVS):
         for j in range(ACT_DIM):
-            var sc = DELTA_GRIPPER if j == ACT_DIM - 1 else DELTA_ARM
-            var tgt = arm_q[e * ACT_DIM + j] + Float64(
-                ap[unsafe_offset = e * ACT_DIM + j]
-            ) * sc
-            if tgt < a_lo[j]:
-                tgt = a_lo[j]
-            elif tgt > a_hi[j]:
-                tgt = a_hi[j]
+            var tgt = delta_target(
+                arm_q[e * ACT_DIM + j],
+                Float64(ap[unsafe_offset = e * ACT_DIM + j]),
+                j, a_lo[j], a_hi[j],
+            )
             var mid = 0.5 * (a_lo[j] + a_hi[j])
             var half = 0.5 * (a_hi[j] - a_lo[j])
             ep[unsafe_offset = e * ACT_DIM + j] = Scalar[DT]((tgt - mid) / half)
@@ -310,8 +306,7 @@ def _bc_pretrain[OBS: Int](
                         var half = 0.5 * (a_hi[j] - a_lo[j])
                         var tgt = mid + a * half
                         var q = Float64(d.obs[r * OBS + a_qa[j]])
-                        var sc = DELTA_GRIPPER if j == ACT_DIM - 1 else DELTA_ARM
-                        a = (tgt - q) / sc
+                        a = (tgt - q) / delta_scale(j)
                     if a > 1.0:
                         a = 1.0
                     elif a < -1.0:
@@ -404,6 +399,7 @@ def run_ppo[M: ModelDefLike, C: Phyics3dEnvConfig](
 ) raises:
     comptime OBS = OBS_DIM[M, C]
     comptime assert N_ENVS * ROLLOUT % N_MINIBATCHES == 0
+    comptime assert ACT_DIM == DELTA_ACT, "the delta action is six words"
 
     # ── flags ────────────────────────────────────────────────────────────
     var task = default_task

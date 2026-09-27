@@ -99,6 +99,10 @@ from noeira.tasks.so101_tower_rig import (
 )
 from noeira.tasks.so101_tower_xml import So101TowerModel
 from noeira.tasks.spec import load_family
+from noeira.tasks.pixel_student import (
+    StudentNet, N_CAMS, RENDER, OBS_PX, PLANE, IMG, C_IN, IN_DIM, ACT,
+    student_act, write_pixel_manifest,
+)
 
 comptime M = So101TowerModel
 comptime C = So101TowerConfig
@@ -107,31 +111,10 @@ comptime OBS = EnvT.OBS_DIM
 comptime NQ = M.NQ
 comptime NB = M.NBODY
 
-comptime N_CAMS = 1 if is_defined["DAGGER_WRIST_ONLY"]() else 2
-comptime RENDER = 64
-"""The traced resolution (1 sample): 144k frames/s wrist at 1024 lanes."""
-comptime OBS_PX = 32 if is_defined["DAGGER_PX_32"]() else 16
-"""The student's resolution: 16 (Squint's) by default, `-D DAGGER_PX_32` for
-32 — the traced 64x64 averaged over 4x4 or 2x2 blocks."""
-comptime PLANE = OBS_PX * OBS_PX
-comptime IMG = 3 * N_CAMS * PLANE
 comptime ROW = IMG + ACT_DIM
 """One replay row: the cameras' planes, then the six joints."""
-comptime C_IN = 3 * N_CAMS + ACT_DIM
-comptime IN_DIM = C_IN * PLANE
 comptime BATCH = 1024
 comptime ITER_STEPS = 32
-comptime HID = 256
-
-comptime StudentNet = Sequential[
-    Conv2D[C_IN, 32, 3, 1, 1, OBS_PX, OBS_PX], ReLU[32 * PLANE],
-    Conv2D[32, 64, 3, 2, 1, OBS_PX, OBS_PX], ReLU[64 * (PLANE // 4)],
-    Conv2D[64, 64, 3, 2, 1, OBS_PX // 2, OBS_PX // 2], ReLU[64 * (PLANE // 16)],
-    Flatten[64 * (PLANE // 16)],
-    LinearReLU[64 * (PLANE // 16), HID],
-    LinearReLU[HID, HID],
-    Linear[HID, ACT_DIM],
-]
 
 comptime RigData = Data[RIG_DT, TOWER_MD, N_ENVS]
 comptime Renderer = TowerRendererSized[N_ENVS, RENDER, RENDER, 1]
@@ -314,6 +297,7 @@ struct PixelObs(Movable):
 
 
 def run_pixel_dagger(args: List[String], driver: String) raises:
+    comptime assert ACT == ACT_DIM, "the student acts in the teacher's space"
     # ── flags ────────────────────────────────────────────────────────────
     var task = String("so101_tower_lift_real_layout")
     if len(args) > 1 and not args[1].startswith("--"):
@@ -498,7 +482,15 @@ def run_pixel_dagger(args: List[String], driver: String) raises:
         var loss_acc = 0.0
         var loss_n = 0
         var t0 = perf_counter_ns()
-        var ckpt = run.dir + "/student.ckpt"
+        # ⚠ `checkpoints/last.ckpt` + `checkpoints/norm.json` (the student's
+        # manifest): the layout `project-promote <run> last --as <role>`
+        # takes, so a student reaches the real-arm deploy as a ROLE.
+        makedirs(run.dir + "/checkpoints", exist_ok=True)
+        var ckpt = run.dir + "/checkpoints/last.ckpt"
+        write_pixel_manifest(
+            run.dir + "/checkpoints/norm.json", task, teacher_dir, grip_sign,
+            Float64(C.FRAME_SKIP) * M.TIMESTEP,
+        )
 
         ctx.enqueue_copy(raw_h, obs_dev)
         ctx.synchronize()
@@ -550,7 +542,7 @@ def run_pixel_dagger(args: List[String], driver: String) raises:
                 for e in range(N_ENVS):
                     if stud_lane[e]:
                         for j in range(ACT_DIM):
-                            at[unsafe_offset = e * ACT_DIM + j] = _student_act(
+                            at[unsafe_offset = e * ACT_DIM + j] = student_act(
                                 y_act.data[e * ACT_DIM + j], j, grip_sign
                             )
             _delta_to_env(
@@ -680,7 +672,7 @@ def run_pixel_dagger(args: List[String], driver: String) raises:
                 ctx.synchronize()
                 var at = mptr(act_t.unsafe_ptr())
                 for k in range(N_ENVS * ACT_DIM):
-                    at[unsafe_offset=k] = _student_act(
+                    at[unsafe_offset=k] = student_act(
                         y_act.data[k], k % ACT_DIM, grip_sign
                     )
                 _delta_to_env(
@@ -770,26 +762,6 @@ def _dump_obs_png(
             save_png(dir + "/lane" + String(lane) + "_cam" + String(cam) + ".png",
                      img, W, W, 3)
     print("  png: lanes 0-3 x", N_CAMS, "cameras ->", dir)
-
-
-comptime GRIPPER_ACT = 5
-"""The gripper's action index (the rig's `RIG_GRIPPER`)."""
-
-
-@always_inline
-def _student_act(v: Scalar[DT], j: Int, grip_sign: Bool) -> Scalar[DT]:
-    """The student's output as executed: clamped to [-1, 1]; with
-    `--gripper-sign 1` the GRIPPER word snapped to +-1. The release is a few
-    steps per episode, so a regression under-weights it and can leave the
-    jaws opening too slowly to drop the brick (cube in bowl, 27 Sep: over
-    the bowl 59 %, success 12.7 %)."""
-    if grip_sign and j == GRIPPER_ACT:
-        return Scalar[DT](1) if v > Scalar[DT](0) else Scalar[DT](-1)
-    if v > Scalar[DT](1):
-        return Scalar[DT](1)
-    if v < Scalar[DT](-1):
-        return Scalar[DT](-1)
-    return v
 
 
 def _rate(h: List[Bool]) -> Float64:

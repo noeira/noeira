@@ -107,6 +107,13 @@ build-jetson = { cmd = "mojo build -I . --target-accelerator sm_87", description
 act-deploy-jetson = { cmd = "mojo build -I . --target-accelerator sm_87 -DACT_GPU=1 -o /tmp/act_deploy_gpu examples/so101/act_so101_deploy_real.mojo && /tmp/act_deploy_gpu", depends-on = ["build-serial", "build-opencv"], description = "ACT on the Orin's GPU (-- --project P; --arm to move it)" }
 act-deploy-jetson-cpu = { cmd = "mojo build -I . --target-accelerator sm_87 -o /tmp/act_deploy_cpu examples/so101/act_so101_deploy_real.mojo && /tmp/act_deploy_cpu", depends-on = ["build-serial", "build-opencv"], description = "The same policy on the Orin's CPU — the other half of the A/B" }
 
+# The SIM-TRAINED pixel student (DAgger from a state PPO teacher) on the arm —
+# the sim-to-real test. CPU inference: the net is ~2 MFLOP at batch 1. Promote
+# a run first: tools/project/promote_pixel_student.sh RUN_ID pixel_lift
+#   pixi run -e jetson pixel-deploy-jetson -- --role pixel_lift --snap /tmp/px_snap
+#   pixi run -e jetson pixel-deploy-jetson -- --role pixel_lift --arm --seconds 20
+pixel-deploy-jetson = { cmd = "mojo build -I . --target-accelerator sm_87 -o /tmp/pixel_deploy examples/so101/pixel_student_deploy_real.mojo && /tmp/pixel_deploy", depends-on = ["build-serial", "build-opencv"], description = "The sim-trained pixel student on the arm (-- --role R; --arm to move it)" }
+
 # ── SmolVLA on the board ───────────────────────────────────────────────────
 # ⚠⚠ MEASURE THE QUERY FIRST. `smolvla-probe-jetson` times one `select_action`;
 # the deployment's whole loop shape rests on comparing that against the 1.667 s
