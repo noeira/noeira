@@ -799,6 +799,10 @@ def run_ppo[M: ModelDefLike, C: Phyics3dEnvConfig](
             var hmin = List[Float64](length=N_ENVS, fill=1e9)
             var over = List[Bool](length=N_ENVS, fill=False)
             var held_end = List[Bool](length=N_ENVS, fill=False)
+            # the brick's rise and horizontal gap at the LAST step, to sort
+            # the failures (carried / inside the rim / beside it / elsewhere)
+            var dz_end = List[Float64](length=N_ENVS, fill=0.0)
+            var h_end = List[Float64](length=N_ENVS, fill=0.0)
             for t in range(C.MAX_STEPS - 1):
                 var rq = mptr(raw_h.unsafe_ptr())
                 for e in range(N_ENVS):
@@ -848,6 +852,8 @@ def run_ppo[M: ModelDefLike, C: Phyics3dEnvConfig](
                         hmin[e] = h
                     if dz > 0.02 and h < 0.045:
                         over[e] = True
+                    dz_end[e] = dz
+                    h_end[e] = h
             var ok = 0
             var n_lift = 0
             var n_over = 0
@@ -870,6 +876,30 @@ def run_ppo[M: ModelDefLike, C: Phyics3dEnvConfig](
                     n_h80 += 1
                 if hmin[e] < 0.15:
                     n_h150 += 1
+            # ⚠ ENDINGS OF THE FAILED EPISODES, by the brick's final pose:
+            # still up (> 2 cm: carried, hovering, or perched on the rim), inside the
+            # bowl's 5.2 cm inner rim yet not `Near` (the 3D test wants the
+            # centre within 4.5 cm), resting beside the bowl (< 10 cm), or
+            # elsewhere. Cube-in-bowl's geometry; other tasks read it loosely.
+            var f_up = 0
+            var f_rim_in = 0
+            var f_beside = 0
+            var f_else = 0
+            for e in range(N_ENVS):
+                if held_end[e]:
+                    continue
+                if dz_end[e] > 0.02:
+                    f_up += 1
+                elif h_end[e] < 0.052:
+                    f_rim_in += 1
+                elif h_end[e] < 0.10:
+                    f_beside += 1
+                else:
+                    f_else += 1
+            print("  greedy eval round", rnd, "endings of the", N_ENVS - n_end,
+                  "not held at the end | brick > 2 cm up (carried, hovering or on the rim)", f_up,
+                  "| resting inside the rim, not Near", f_rim_in,
+                  "| beside (< 10 cm)", f_beside, "| elsewhere", f_else)
             print("  greedy eval round", rnd, ":", ok, "/", N_ENVS,
                   "| held at the end", n_end, "| lifted >2cm", n_lift,
                   "| over b while lifted", n_over,
