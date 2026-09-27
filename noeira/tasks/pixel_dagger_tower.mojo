@@ -101,7 +101,7 @@ from noeira.tasks.so101_tower_xml import So101TowerModel
 from noeira.tasks.spec import load_family
 from noeira.tasks.pixel_student import (
     StudentNet, N_CAMS, RENDER, OBS_PX, PLANE, IMG, C_IN, IN_DIM, ACT,
-    student_act, write_pixel_manifest,
+    PROPRIO, JOINT_SCALE, JOINT_VEL_SCALE, student_act, write_pixel_manifest,
 )
 
 comptime M = So101TowerModel
@@ -111,8 +111,10 @@ comptime OBS = EnvT.OBS_DIM
 comptime NQ = M.NQ
 comptime NB = M.NBODY
 
-comptime ROW = IMG + ACT_DIM
-"""One replay row: the cameras' planes, then the six joints."""
+comptime ROW = IMG + PROPRIO
+"""One replay row: the cameras' planes, then the joints (and, with
+`DAGGER_JOINT_VEL`, their velocities), RAW — scaled in the gather."""
+comptime NV = M.NV
 comptime BATCH = 1024
 comptime ITER_STEPS = 32
 
@@ -156,23 +158,31 @@ def _pack_camera_kernel[
 
 
 def _pack_proprio_kernel[
-    N: Int, NQ_: Int
+    N: Int, NQ_: Int, NV_: Int
 ](
     qpos: LayoutTensor[DT, Layout.row_major(N * NQ_), MutAnyOrigin],
+    qvel: LayoutTensor[DT, Layout.row_major(N * NV_), MutAnyOrigin],
     qa: LayoutTensor[DT, Layout.row_major(ACT_DIM), MutAnyOrigin],
+    da: LayoutTensor[DT, Layout.row_major(ACT_DIM), MutAnyOrigin],
     ring: LayoutTensor[DT, Layout.row_major(1), MutAnyOrigin],
     base_row: Int64,
 ):
-    """The actuated joints (qpos addresses `qa`) into the rows' tail."""
+    """The actuated joints (qpos addresses `qa`) — and with
+    `DAGGER_JOINT_VEL` their velocities (dof addresses `da`) — into the
+    rows' tail, raw."""
     var i = Int(global_idx.x)
-    if i >= N * ACT_DIM:
+    if i >= N * PROPRIO:
         return
-    var lane = i // ACT_DIM
-    var j = i % ACT_DIM
-    var a = Int(rebind[Scalar[DT]](qa[j]))
-    ring[(Int(base_row) + lane) * ROW + IMG + j] = rebind[Scalar[DT]](
-        qpos[lane * NQ_ + a]
-    )
+    var lane = i // PROPRIO
+    var j = i % PROPRIO
+    var v: Scalar[DT]
+    if j < ACT_DIM:
+        v = rebind[Scalar[DT]](qpos[lane * NQ_ + Int(rebind[Scalar[DT]](qa[j]))])
+    else:
+        v = rebind[Scalar[DT]](
+            qvel[lane * NV_ + Int(rebind[Scalar[DT]](da[j - ACT_DIM]))]
+        )
+    ring[(Int(base_row) + lane) * ROW + IMG + j] = v
 
 
 def _gather_kernel[
@@ -199,7 +209,8 @@ def _gather_kernel[
             x[i] = rebind[Scalar[DT]](ring[row * ROW + k])
     else:
         var j = (k - IMG) // PLANE
-        x[i] = rebind[Scalar[DT]](ring[row * ROW + IMG + j]) * Scalar[DT](0.5)
+        var sc = Scalar[DT](JOINT_SCALE) if j < ACT_DIM else Scalar[DT](JOINT_VEL_SCALE)
+        x[i] = rebind[Scalar[DT]](ring[row * ROW + IMG + j]) * sc
 
 
 struct PixelObs(Movable):
@@ -212,6 +223,7 @@ struct PixelObs(Movable):
     var r: Renderer
     var cams: List[Int]
     var qa: Tensor
+    var da: Tensor
     var ring: Tensor
     var cap: Int
     var blank: Bool
@@ -220,7 +232,7 @@ struct PixelObs(Movable):
 
     def __init__(
         out self, ctx: DeviceContext, fmd_path: String, a_qa: List[Int],
-        cap: Int,
+        a_da: List[Int], cap: Int,
     ) raises:
         var fmd = parse_model_runtime(fmd_path)
         self.rm = make_tower_model(ctx)
@@ -236,6 +248,10 @@ struct PixelObs(Movable):
         for j in range(ACT_DIM):
             self.qa.data[j] = Scalar[DT](a_qa[j])
         self.qa.upload(ctx)
+        self.da = Tensor.alloc(ACT_DIM)
+        for j in range(ACT_DIM):
+            self.da.data[j] = Scalar[DT](a_da[j])
+        self.da.upload(ctx)
         # ⚠ THE RING IS INDEXED THROUGH A 32-BIT LayoutTensor OFFSET
         # (`_a_layouttensor_index_is_int32_regardless_of_your_arithmetic`).
         if cap * ROW >= (1 << 31):
@@ -249,9 +265,11 @@ struct PixelObs(Movable):
         self.blank = False
 
     def observe(
-        mut self, ctx: DeviceContext, env_qpos: DeviceBuffer[DT], base_row: Int
+        mut self, ctx: DeviceContext, env_qpos: DeviceBuffer[DT],
+        env_qvel: DeviceBuffer[DT], base_row: Int,
     ) raises:
         ctx.enqueue_copy(self.rd.qpos.dev.value(), env_qpos)
+        ctx.enqueue_copy(self.rd.qvel.dev.value(), env_qvel)
         forward_kinematics["gpu", RIG_DT, TOWER_MD, N_ENVS](
             self.rd, self.rm, Optional(ctx)
         )
@@ -272,10 +290,12 @@ struct PixelObs(Movable):
                 grid_dim=n_img,
                 block_dim=TPB,
             )
-        comptime n_q = (N_ENVS * ACT_DIM + TPB - 1) // TPB
-        ctx.enqueue_function[_pack_proprio_kernel[N_ENVS, NQ]](
+        comptime n_q = (N_ENVS * PROPRIO + TPB - 1) // TPB
+        ctx.enqueue_function[_pack_proprio_kernel[N_ENVS, NQ, NV]](
             self.rd.qpos.lt["gpu", Layout.row_major(N_ENVS * NQ)](),
+            self.rd.qvel.lt["gpu", Layout.row_major(N_ENVS * NV)](),
             self.qa.lt["gpu", Layout.row_major(ACT_DIM)](),
+            self.da.lt["gpu", Layout.row_major(ACT_DIM)](),
             self.ring.lt["gpu", Layout.row_major(1)](),
             Int64(base_row),
             grid_dim=n_q,
@@ -358,11 +378,18 @@ def run_pixel_dagger(args: List[String], driver: String) raises:
     for i in range(len(fmd.joints)):
         jadr.append(acc)
         acc += fmd.joints[i].nq
+    var jdadr = List[Int]()
+    var dacc = 0
+    for i in range(len(fmd.joints)):
+        jdadr.append(dacc)
+        dacc += fmd.joints[i].nv
     var a_qa = List[Int]()
+    var a_da = List[Int]()
     var a_lo = List[Float64]()
     var a_hi = List[Float64]()
     for i in range(ACT_DIM):
         a_qa.append(jadr[fmd.actuators[i].joint_id])
+        a_da.append(jdadr[fmd.actuators[i].joint_id])
         a_lo.append(fmd.actuators[i].ctrl_min)
         a_hi.append(fmd.actuators[i].ctrl_max)
 
@@ -387,6 +414,7 @@ def run_pixel_dagger(args: List[String], driver: String) raises:
     logger.set_config("lr", String(lr))
     logger.set_config("replay", String(cap))
     logger.set_config("blank_images", String(blank))
+    logger.set_config("proprio", String("q+qd" if PROPRIO > ACT else "q"))
     logger.set_config("gripper_sign", String(grip_sign))
     logger.set_config("act_gain", String(act_gain))
     register_run(run, logger)
@@ -439,7 +467,7 @@ def run_pixel_dagger(args: List[String], driver: String) raises:
         env.d.meta.upload(ctx)
         ctx.synchronize()
 
-        var px = PixelObs(ctx, scene_path(f), a_qa, cap)
+        var px = PixelObs(ctx, scene_path(f), a_qa, a_da, cap)
         px.blank = blank
         if blank:
             print("  ⚠ --blank-images 1: the student sees ZERO image planes"
@@ -457,6 +485,9 @@ def run_pixel_dagger(args: List[String], driver: String) raises:
         var done_dev = DeviceBuffer[DT](ctx, env.done_ptr(), N_ENVS, owning=False)
         var qpos_dev = DeviceBuffer[DT](
             ctx, env.d.qpos.dev.value().unsafe_ptr(), N_ENVS * NQ, owning=False
+        )
+        var qvel_dev = DeviceBuffer[DT](
+            ctx, env.d.qvel.dev.value().unsafe_ptr(), N_ENVS * NV, owning=False
         )
         var labels = List[Scalar[DT]](length=cap * ACT_DIM, fill=Scalar[DT](0))
         var arm_q = List[Float64](length=N_ENVS * ACT_DIM, fill=0.0)
@@ -502,7 +533,7 @@ def run_pixel_dagger(args: List[String], driver: String) raises:
         ctx.enqueue_copy(raw_h, obs_dev)
         ctx.synchronize()
         if png_dir.byte_length() > 0:
-            _dump_obs_png(ctx, px, png_dir, qpos_dev)
+            _dump_obs_png(ctx, px, png_dir, qpos_dev, qvel_dev)
 
         while step < total_steps:
             var beta = 1.0 - Float64(step) / Float64(max(beta_steps, 1))
@@ -510,7 +541,7 @@ def run_pixel_dagger(args: List[String], driver: String) raises:
                 beta = 0.0
             var base = (it % (cap // N_ENVS)) * N_ENVS
             # 1-2. the pictures and joints of the CURRENT state
-            px.observe(ctx, qpos_dev, base)
+            px.observe(ctx, qpos_dev, qvel_dev, base)
             # 3. the teacher, on the state
             var rp = mptr(raw_h.unsafe_ptr())
             for e in range(N_ENVS):
@@ -686,7 +717,7 @@ def run_pixel_dagger(args: List[String], driver: String) raises:
             var hv_s = List[Float64](length=ACT_DIM, fill=0.0)
             var hv_d = List[Float64](length=ACT_DIM, fill=0.0)
             for t in range(C.MAX_STEPS - 1):
-                px.observe(ctx, qpos_dev, 0)
+                px.observe(ctx, qpos_dev, qvel_dev, 0)
                 var rq = mptr(raw_h.unsafe_ptr())
                 for e in range(N_ENVS):
                     for j in range(ACT_DIM):
@@ -857,12 +888,12 @@ def run_pixel_dagger(args: List[String], driver: String) raises:
 
 def _dump_obs_png(
     ctx: DeviceContext, mut px: PixelObs, dir: String,
-    qpos_dev: DeviceBuffer[DT],
+    qpos_dev: DeviceBuffer[DT], qvel_dev: DeviceBuffer[DT],
 ) raises:
     """Lanes 0..3's first observation, each camera upscaled x8, as PNGs — to
     SEE what the student sees (a transposed or blank plane trains silently)."""
     makedirs(dir, exist_ok=True)
-    px.observe(ctx, qpos_dev, 0)
+    px.observe(ctx, qpos_dev, qvel_dev, 0)
     var h = ctx.enqueue_create_host_buffer[DT](4 * ROW)
     ctx.enqueue_copy(h, px.ring.dev.value().create_sub_buffer[DT](0, 4 * ROW))
     ctx.synchronize()

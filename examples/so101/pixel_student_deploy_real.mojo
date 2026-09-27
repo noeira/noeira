@@ -94,7 +94,7 @@ from noeira.tasks.delta_action import delta_target
 from noeira.tasks.family import scene_path
 from noeira.tasks.family_config import So101TowerConfig
 from noeira.tasks.pixel_student import (
-    StudentNet, N_CAMS, OBS_PX, PLANE, IN_DIM, ACT, CAM_FOVY_DEG,
+    StudentNet, N_CAMS, OBS_PX, PLANE, IN_DIM, ACT, CAM_FOVY_DEG, JOINT_VEL,
     camera_names, check_pixel_manifest, frame_to_planes, joints_to_planes,
     student_act,
 )
@@ -261,6 +261,12 @@ def main() raises:
     print("=" * 74)
     print("PIXEL STUDENT on the physical SO-101 — sim-to-real")
     print("=" * 74)
+    # ⚠ NOT YET FOR A VELOCITY STUDENT: the servos' speed must go through the
+    # joint map's sign and units (`SimJointMap`) to model rad/s, and a wrong
+    # sign would feed the policy its motion reversed. Refused until written.
+    comptime if JOINT_VEL:
+        raise Error("pixel deploy: a -D DAGGER_JOINT_VEL student needs the"
+                    " joints' velocities from the servos — not implemented yet")
 
     # ── the policy and its manifest ───────────────────────────────────────
     if ckpt.byte_length() == 0:

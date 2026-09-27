@@ -58,10 +58,19 @@ checkpoint depends on: the manifest records it and the deploy refuses a
 mismatch."""
 comptime PLANE = OBS_PX * OBS_PX
 comptime IMG = 3 * N_CAMS * PLANE
-comptime C_IN = 3 * N_CAMS + ACT
+comptime JOINT_VEL = is_defined["DAGGER_JOINT_VEL"]()
+"""`-D DAGGER_JOINT_VEL`: the six joint VELOCITIES as six more planes. The
+cube-in-bowl teacher's quick corrections depend on velocity it reads from its
+state (its `qvel` words) and a single frame cannot show; the real servos
+report velocity (`SO101Arm.read_velocities`), so the plane is deployable."""
+comptime PROPRIO = 2 * ACT if JOINT_VEL else ACT
+"""Joint planes: the angles, then (with JOINT_VEL) the velocities."""
+comptime C_IN = 3 * N_CAMS + PROPRIO
 comptime IN_DIM = C_IN * PLANE
 comptime HID = 256
 comptime JOINT_SCALE: Float64 = 0.5
+comptime JOINT_VEL_SCALE: Float64 = 0.2
+"""rad/s -> plane value: the arm's joint speeds reach ~2-3 rad/s."""
 comptime IMAGE_OFFSET: Float64 = 0.5
 comptime GRIPPER_ACT = ACT - 1
 comptime CAM_FOVY_DEG: Float64 = 73.7398
@@ -159,6 +168,17 @@ def render_to_planes(
                 )
 
 
+def joint_vels_to_planes(ref qd: List[Float64], mut x: List[Scalar[DT]]):
+    """The six joint velocities (model rad/s) into their planes — a no-op in
+    a build without `DAGGER_JOINT_VEL`."""
+    comptime if JOINT_VEL:
+        for j in range(ACT):
+            var v = Scalar[DT](qd[j] * JOINT_VEL_SCALE)
+            var base = IMG + (ACT + j) * PLANE
+            for p in range(PLANE):
+                x[base + p] = v
+
+
 def joints_to_planes(ref q: List[Float64], mut x: List[Scalar[DT]]):
     """The six joints (model radians) broadcast into their planes."""
     for j in range(ACT):
@@ -189,6 +209,8 @@ def write_pixel_manifest(
     s += '  "fovy_deg": ' + String(CAM_FOVY_DEG) + ',\n'
     s += '  "frame": "centre square crop, block mean, /255 - 0.5",\n'
     s += '  "joint_scale": ' + String(JOINT_SCALE) + ',\n'
+    s += '  "proprio": "' + ("q+qd" if JOINT_VEL else "q") + '",\n'
+    s += '  "joint_vel_scale": ' + String(JOINT_VEL_SCALE) + ',\n'
     s += '  "joint_units": "model radians (tower_follower joint zero)",\n'
     s += '  "delta_arm": ' + String(DELTA_ARM) + ',\n'
     s += '  "delta_gripper": ' + String(DELTA_GRIPPER) + ',\n'
@@ -246,6 +268,13 @@ def check_pixel_manifest(path: String) raises -> PixelManifest:
             raise Error("pixel student: camera slot " + String(i) + " is '"
                         + doc.string(doc.at(cams, i)) + "', this build's is '"
                         + want[i] + "'")
+    var pr = doc.field(r, "proprio")
+    var proprio = doc.string(pr) if pr >= 0 else String("q")
+    if proprio != ("q+qd" if JOINT_VEL else "q"):
+        raise Error("pixel student: the policy's joint input is '" + proprio
+                    + "', this build's is '" + ("q+qd" if JOINT_VEL else "q")
+                    + "'" + (" (build with -D DAGGER_JOINT_VEL)"
+                             if proprio == "q+qd" else ""))
     if abs(_num(doc, r, "joint_scale", path) - JOINT_SCALE) > 1e-9:
         raise Error("pixel student: joint_scale differs from this build's")
     if abs(_num(doc, r, "delta_arm", path) - DELTA_ARM) > 1e-9 or abs(

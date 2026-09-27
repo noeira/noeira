@@ -68,8 +68,8 @@ from noeira.tasks.delta_action import delta_target
 from noeira.tasks.family import scene_path
 from noeira.tasks.family_config import So101TowerConfig
 from noeira.tasks.pixel_student import (
-    StudentNet, N_CAMS, OBS_PX, IN_DIM, ACT, render_to_planes,
-    joints_to_planes, student_act,
+    StudentNet, N_CAMS, OBS_PX, IN_DIM, ACT, JOINT_VEL, render_to_planes,
+    joints_to_planes, joint_vels_to_planes, student_act,
 )
 from noeira.tasks.placement.so101_tower import So101TowerPlacement
 from noeira.tasks.posed_reset import posed_qpos, task_meta_words
@@ -166,6 +166,12 @@ def find_variants(task: String) raises -> List[Variant]:
             refuse = String("a ") + String(px) + "px student: build with" + (
                 " -D DAGGER_PX_32" if px == 32 else " the default (16)"
             )
+        var pr = _cfg_value(cfg, "proprio")
+        var want = String("q+qd") if JOINT_VEL else String("q")
+        if (pr if pr.byte_length() > 0 else String("q")) != want:
+            refuse = String("joint input '") + (pr if pr else String("q")) + "': build " + (
+                "with -D DAGGER_JOINT_VEL" if pr == "q+qd" else "without -D DAGGER_JOINT_VEL"
+            )
         var name = String(d[byte = d.rfind("/") + 1 :])
         out.append(Variant(
             short + " student " + String(name[byte = name.byte_length() - 8 :]) + " ("
@@ -203,6 +209,7 @@ struct PixelViewerPolicy(ActionSource, Movable):
     var r: TowerRendererSized[1, RENDER, RENDER, 1]
     var cams: List[Int]
     var a_qa: List[Int]
+    var a_da: List[Int]
     var lo: List[Float64]
     var hi: List[Float64]
     var xs: List[Scalar[DT]]
@@ -237,11 +244,18 @@ struct PixelViewerPolicy(ActionSource, Movable):
         for i in range(len(fmd.joints)):
             jadr.append(acc)
             acc += fmd.joints[i].nq
+        var jdadr = List[Int]()
+        var dacc = 0
+        for i in range(len(fmd.joints)):
+            jdadr.append(dacc)
+            dacc += fmd.joints[i].nv
         self.a_qa = List[Int]()
+        self.a_da = List[Int]()
         self.lo = List[Float64]()
         self.hi = List[Float64]()
         for i in range(ACT):
             self.a_qa.append(jadr[fmd.actuators[i].joint_id])
+            self.a_da.append(jdadr[fmd.actuators[i].joint_id])
             self.lo.append(fmd.actuators[i].ctrl_min)
             self.hi.append(fmd.actuators[i].ctrl_max)
         self.xs = List[Scalar[DT]](length=IN_DIM, fill=Scalar[DT](0))
@@ -343,6 +357,12 @@ struct PixelViewerPolicy(ActionSource, Movable):
             for j in range(ACT):
                 q[j] = Float64(obs[self.a_qa[j]])
             joints_to_planes(q, self.xs)
+            # the observation is qpos (NQ) then qvel: the joint velocities
+            # at their dof addresses (a no-op without DAGGER_JOINT_VEL)
+            var qd = List[Float64](length=ACT, fill=0.0)
+            for j in range(ACT):
+                qd[j] = Float64(obs[NQ + self.a_da[j]])
+            joint_vels_to_planes(qd, self.xs)
             for k in range(IN_DIM):
                 self.x.data[k] = self.xs[k]
             self.student.forward["cpu", 1](TensorRefs[1](self.x), self.y, None)
