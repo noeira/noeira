@@ -196,9 +196,11 @@ def _gather_kernel[
     ring: LayoutTensor[DT, Layout.row_major(1), MutAnyOrigin],
     g: LayoutTensor[DT, Layout.row_major(B), MutAnyOrigin],
     x: LayoutTensor[DT, Layout.row_major(B * IN_DIM), MutAnyOrigin],
+    blank: Int64,
 ):
     """Rows `g` of the replay to the student's input: the image planes as
-    stored, then each joint (x 0.5) broadcast over a plane."""
+    stored (ZERO when `blank` — the control: joints alone), then each joint
+    (x 0.5) broadcast over a plane."""
     var i = Int(global_idx.x)
     if i >= B * IN_DIM:
         return
@@ -206,7 +208,10 @@ def _gather_kernel[
     var k = i % IN_DIM
     var row = Int(rebind[Scalar[DT]](g[b]))
     if k < IMG:
-        x[i] = rebind[Scalar[DT]](ring[row * ROW + k])
+        if blank != 0:
+            x[i] = Scalar[DT](0)
+        else:
+            x[i] = rebind[Scalar[DT]](ring[row * ROW + k])
     else:
         var j = (k - IMG) // PLANE
         x[i] = rebind[Scalar[DT]](ring[row * ROW + IMG + j]) * Scalar[DT](0.5)
@@ -224,6 +229,9 @@ struct PixelObs(Movable):
     var qa: Tensor
     var ring: Tensor
     var cap: Int
+    var blank: Bool
+    """`--blank-images`: the student sees zero image planes — the CONTROL
+    that says how much of its score the joints alone would get."""
 
     def __init__(
         out self, ctx: DeviceContext, fmd_path: String, a_qa: List[Int],
@@ -253,6 +261,7 @@ struct PixelObs(Movable):
                         + String(N_ENVS))
         self.cap = cap
         self.ring = Tensor.alloc_gpu(ctx, cap * ROW)
+        self.blank = False
 
     def observe(
         mut self, ctx: DeviceContext, env_qpos: DeviceBuffer[DT], base_row: Int
@@ -296,6 +305,7 @@ struct PixelObs(Movable):
             self.ring.lt["gpu", Layout.row_major(1)](),
             g.lt["gpu", Layout.row_major(B)](),
             x.lt["gpu", Layout.row_major(B * IN_DIM)](),
+            Int64(1 if self.blank else 0),
             grid_dim=n,
             block_dim=TPB,
         )
@@ -319,6 +329,7 @@ def run_pixel_dagger(args: List[String], driver: String) raises:
     var eval_rounds = Int(_arg(args, "--eval-rounds", "2"))
     var init_student = _arg(args, "--init-student", "")
     var png_dir = _arg(args, "--png", "")
+    var blank = _arg(args, "--blank-images", "0") == "1"
     seed_rng(seed)
     var family = String("so101_tower")
     var family_path = String("noeira/tasks/families/so101_tower.family")
@@ -379,6 +390,7 @@ def run_pixel_dagger(args: List[String], driver: String) raises:
     logger.set_config("batch", String(BATCH))
     logger.set_config("lr", String(lr))
     logger.set_config("replay", String(cap))
+    logger.set_config("blank_images", String(blank))
     register_run(run, logger)
     var artifacts = sink_for_run(run.id, run.dir)
 
@@ -430,6 +442,10 @@ def run_pixel_dagger(args: List[String], driver: String) raises:
         ctx.synchronize()
 
         var px = PixelObs(ctx, scene_path(f), a_qa, cap)
+        px.blank = blank
+        if blank:
+            print("  ⚠ --blank-images 1: the student sees ZERO image planes"
+                  " (the joints-only control)")
 
         # ── buffers ──────────────────────────────────────────────────────
         var raw_h = ctx.enqueue_create_host_buffer[DT](N_ENVS * OBS)

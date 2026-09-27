@@ -5,7 +5,8 @@
     # -D DAGGER_WRIST_ONLY for the wrist camera alone; -D TASK_PPO_LANES_256 for a smoke run
 
 Flags: --teacher RUN_DIR (required), --steps, --beta-steps, --updates, --lr,
---replay ROWS, --seed, --eval-rounds, --init-student CKPT. The driver is
+--replay ROWS, --seed, --eval-rounds, --init-student CKPT, --png DIR,
+--blank-images 1 (the joints-only control). The driver is
 `noeira/tasks/pixel_dagger_tower.run_pixel_dagger`; read its header.
 """
 
