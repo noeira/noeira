@@ -804,7 +804,7 @@ def run_ppo[M: ModelDefLike, C: Phyics3dEnvConfig](
             var dz_end = List[Float64](length=N_ENVS, fill=0.0)
             var h_end = List[Float64](length=N_ENVS, fill=0.0)
             # the start state per lane (after the first step), for the
-            # per-episode CSV: brick x, y, quat (w x y z); bowl x, y
+            # per-episode CSV: brick x, y, quat (x y z w — `xquat`'s order); bowl x, y
             var start = List[Float64](length=N_ENVS * 8, fill=0.0)
             for t in range(C.MAX_STEPS - 1):
                 var rq = mptr(raw_h.unsafe_ptr())
@@ -910,7 +910,7 @@ def run_ppo[M: ModelDefLike, C: Phyics3dEnvConfig](
                     f_else += 1
             # one row per episode: where it started, how far it got
             var csv = String(
-                "lane,brick_x,brick_y,qw,qx,qy,qz,bowl_x,bowl_y,"
+                "lane,brick_x,brick_y,qx,qy,qz,qw,bowl_x,bowl_y,"
                 + "rise_max,h_min,over,success,held_end,dz_end,h_end\n"
             )
             for e in range(N_ENVS):
