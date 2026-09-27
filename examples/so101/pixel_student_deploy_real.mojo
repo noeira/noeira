@@ -96,7 +96,7 @@ from noeira.tasks.family_config import So101TowerConfig
 from noeira.tasks.pixel_student import (
     StudentNet, N_CAMS, OBS_PX, PLANE, IN_DIM, ACT, CAM_FOVY_DEG, JOINT_VEL,
     camera_names, check_pixel_manifest, frame_to_planes, joints_to_planes,
-    student_act,
+    joint_vels_to_planes, student_act,
 )
 from noeira.tasks.placement.so101_tower import So101TowerPlacement
 from noeira.tasks.posed_reset import posed_qpos
@@ -261,12 +261,9 @@ def main() raises:
     print("=" * 74)
     print("PIXEL STUDENT on the physical SO-101 — sim-to-real")
     print("=" * 74)
-    # ⚠ NOT YET FOR A VELOCITY STUDENT: the servos' speed must go through the
-    # joint map's sign and units (`SimJointMap`) to model rad/s, and a wrong
-    # sign would feed the policy its motion reversed. Refused until written.
     comptime if JOINT_VEL:
-        raise Error("pixel deploy: a -D DAGGER_JOINT_VEL student needs the"
-                    " joints' velocities from the servos — not implemented yet")
+        print("  joint velocities: finite differences of the mapped joint"
+              " angles over each tick (same map, same signs as the angles)")
 
     # ── the policy and its manifest ───────────────────────────────────────
     if ckpt.byte_length() == 0:
@@ -414,8 +411,11 @@ def main() raises:
               + col(q_start[i], 16, 3)
               + ("   ⚠ far from the sim start" if d > 0.3 else ""))
 
-    # one dry forward on the real observation, printed
+    # one dry forward on the real observation, printed (the arm at rest:
+    # velocities zero)
     joints_to_planes(q, xs)
+    var qd = List[Float64](length=SO101_N, fill=0.0)
+    joint_vels_to_planes(qd, xs)
     for k in range(IN_DIM):
         x.data[k] = xs[k]
     net.forward["cpu", 1](TensorRefs[1](x), y, None)
@@ -500,6 +500,16 @@ def main() raises:
     var sum_fwd = 0.0
     var worst_tick = 0.0
     var loop_ns = 0
+    # ⚠ THE JOINT VELOCITIES ARE FINITE DIFFERENCES of the mapped angles over
+    # the measured tick, not the servos' own speed register: they go through
+    # the SAME joint map as the angles, so their signs and units cannot
+    # disagree with the positions the policy was trained beside. Tick
+    # quantisation (~0.0015 rad / 32 ms ~ 0.05 rad/s) is 0.01 after the
+    # plane's x0.2 — below the sim's own step noise.
+    var q_prev = List[Float64](length=SO101_N, fill=0.0)
+    for i in range(SO101_N):
+        q_prev[i] = q[i]
+    var t_prev = perf_counter_ns()
     var loop_t0 = perf_counter_ns()
     var deadline = loop_t0 + seconds * 1_000_000_000
     try:
@@ -519,9 +529,15 @@ def main() raises:
                 bus_skipped += 1
                 _spin_until(tt + period_ns)
                 continue
+            var t_now = perf_counter_ns()
+            var dt_s = Float64(t_now - t_prev) / 1e9
             for i in range(SO101_N):
                 q[i] = jmap.to_sim_unclamped(arm.cal, i, raw[i])
+                qd[i] = (q[i] - q_prev[i]) / dt_s if dt_s > 1e-4 else 0.0
+                q_prev[i] = q[i]
+            t_prev = t_now
             joints_to_planes(q, xs)
+            joint_vels_to_planes(qd, xs)
             if snap_dir.byte_length() > 0 and ticks == 62:
                 _snap(snap_dir, frames, xs, String("_t2s"))
             for k in range(IN_DIM):
