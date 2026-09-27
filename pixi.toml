@@ -116,6 +116,9 @@ pixel-deploy-jetson = { cmd = "mojo build -I . --target-accelerator sm_87 -o /tm
 # the same for a 32x32 student that sees its joint velocities (the build must
 # match the student: the manifest refuses a mismatch before anything moves)
 pixel-deploy-jetson-v32 = { cmd = "mojo build -I . --target-accelerator sm_87 -D DAGGER_PX_32 -D DAGGER_JOINT_VEL -o /tmp/pixel_deploy_v32 examples/so101/pixel_student_deploy_real.mojo && /tmp/pixel_deploy_v32", depends-on = ["build-serial", "build-opencv"], description = "A 32x32 joint-velocity pixel student on the arm (-- --role R; --arm to move it)" }
+# ... and a WINDOWED one (-D DAGGER_WINDOW: the overhead's workspace window,
+# the domain-randomised students)
+pixel-deploy-jetson-wv32 = { cmd = "mojo build -I . --target-accelerator sm_87 -D DAGGER_WINDOW -D DAGGER_PX_32 -D DAGGER_JOINT_VEL -o /tmp/pixel_deploy_wv32 examples/so101/pixel_student_deploy_real.mojo && /tmp/pixel_deploy_wv32", depends-on = ["build-serial", "build-opencv"], description = "A windowed 32x32 joint-velocity pixel student on the arm (-- --role R; --arm to move it)" }
 
 # ── SmolVLA on the board ───────────────────────────────────────────────────
 # ⚠⚠ MEASURE THE QUERY FIRST. `smolvla-probe-jetson` times one `select_action`;
