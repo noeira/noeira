@@ -663,6 +663,17 @@ def run_pixel_dagger(args: List[String], driver: String) raises:
             var drop_h = List[Float64](length=N_ENVS, fill=-1.0)
             var dz_end = List[Float64](length=N_ENVS, fill=0.0)
             var h_end = List[Float64](length=N_ENVS, fill=0.0)
+            # ⚠ WHAT THE TEACHER WOULD DO WHERE THE STUDENT HOVERS: in the
+            # student's run, the teacher's greedy gripper word on the same
+            # state (the DAgger label), at every step the brick is up and
+            # over the bowl. Teacher "open" + student "closed" is a learning
+            # failure; teacher "closed" too is a state the teacher would
+            # change first (lower, centre) — a perception question.
+            var hov = 0
+            var hov_t_open = 0
+            var hov_s_open = 0
+            var hov_both = 0
+            var lab = List[Scalar[DT]](length=N_ENVS * ACT_DIM, fill=Scalar[DT](0))
             for t in range(C.MAX_STEPS - 1):
                 px.observe(ctx, qpos_dev, 0)
                 var rq = mptr(raw_h.unsafe_ptr())
@@ -683,6 +694,12 @@ def run_pixel_dagger(args: List[String], driver: String) raises:
                         mptr(cur_n.unsafe_ptr()), mptr(act_t.unsafe_ptr())
                     )
                 else:
+                    obs_rms.normalize_into(
+                        rq, mptr(cur_n.unsafe_ptr()), N_ENVS, OBS, OBS_CLIP
+                    )
+                    teacher.trainer.select_greedy_action_batched(
+                        mptr(cur_n.unsafe_ptr()), mptr(lab.unsafe_ptr())
+                    )
                     g_act.upload_resident(ctx)
                     px.gather[N_ENVS](ctx, g_act, x_act)
                     student.forward["gpu", N_ENVS](
@@ -724,6 +741,19 @@ def run_pixel_dagger(args: List[String], driver: String) raises:
                     var ey = Float64(env.d.xpos.data[xb + ia * 3 + 1] - env.d.xpos.data[xb + ib * 3 + 1])
                     var hh = sqrt(ex * ex + ey * ey)
                     var dz = za - z0[e]
+                    if not eval_teacher and dz > 0.02 and hh < 0.045:
+                        # the state BEFORE this step's action: the labels and
+                        # actions above were computed on it (a one-step lag
+                        # in the hover test, harmless for a count)
+                        hov += 1
+                        var t_open = lab[e * ACT_DIM + ACT_DIM - 1] > Scalar[DT](0)
+                        var s_open = at[unsafe_offset = e * ACT_DIM + ACT_DIM - 1] > Scalar[DT](0)
+                        if t_open:
+                            hov_t_open += 1
+                        if s_open:
+                            hov_s_open += 1
+                        if t_open and s_open:
+                            hov_both += 1
                     if dz > 0.02 and hh < 0.045:
                         over[e] = True
                     if dz > 0.02:
@@ -775,6 +805,10 @@ def run_pixel_dagger(args: List[String], driver: String) raises:
                     beside_end += 1
                 else:
                     else_end += 1
+            if not eval_teacher:
+                print("    hover steps (up, over the bowl):", hov,
+                      "| teacher says OPEN", hov_t_open, "| student opens",
+                      hov_s_open, "| both", hov_both)
             print("    drops: over the bowl (<4.5 cm)", d_in, "| at the rim (4.5-8)",
                   d_rim, "| away (>8)", d_out,
                   "|| not held at the end: brick up", up_end,
