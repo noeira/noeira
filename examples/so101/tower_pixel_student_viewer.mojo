@@ -69,6 +69,7 @@ from noeira.tasks.family import scene_path
 from noeira.tasks.family_config import So101TowerConfig
 from noeira.tasks.pixel_student import (
     StudentNet, N_CAMS, OBS_PX, IN_DIM, ACT, JOINT_VEL, render_to_planes,
+    OVERHEAD_RENDER_W, OVERHEAD_RENDER_H, WINDOWED,
     joints_to_planes, joint_vels_to_planes, student_act,
 )
 from noeira.tasks.placement.so101_tower import So101TowerPlacement
@@ -166,6 +167,11 @@ def find_variants(task: String) raises -> List[Variant]:
             refuse = String("a ") + String(px) + "px student: build with" + (
                 " -D DAGGER_PX_32" if px == 32 else " the default (16)"
             )
+        var wn = _cfg_value(cfg, "window")
+        if (wn == "workspace") != WINDOWED:
+            refuse = String("camera window '") + (wn if wn else String("centre-square")) + "': build " + (
+                "with -D DAGGER_WINDOW" if wn == "workspace" else "without -D DAGGER_WINDOW"
+            )
         var pr = _cfg_value(cfg, "proprio")
         var want = String("q+qd") if JOINT_VEL else String("q")
         if (pr if pr.byte_length() > 0 else String("q")) != want:
@@ -207,6 +213,9 @@ struct PixelViewerPolicy(ActionSource, Movable):
     var rm: Model[RIG_DT, TOWER_MD]
     var rd: Data[RIG_DT, TOWER_MD, 1]
     var r: TowerRendererSized[1, RENDER, RENDER, 1]
+    """The wrist's square trace."""
+    var r_o: TowerRendererSized[1, OVERHEAD_RENDER_W, OVERHEAD_RENDER_H, 1]
+    """The overhead's: the full 4:3 frame with DAGGER_WINDOW, else square."""
     var cams: List[Int]
     var a_qa: List[Int]
     var a_da: List[Int]
@@ -234,6 +243,9 @@ struct PixelViewerPolicy(ActionSource, Movable):
         self.rm = make_tower_model(self.ctx)
         self.rd = Data[RIG_DT, TOWER_MD, 1]()
         self.r = make_tower_renderer[1, RENDER, RENDER, 1](self.ctx, fmd, self.rm)
+        self.r_o = make_tower_renderer[1, OVERHEAD_RENDER_W, OVERHEAD_RENDER_H, 1](
+            self.ctx, fmd, self.rm
+        )
         var both = tower_cameras(fmd)
         self.cams = List[Int]()
         comptime if N_CAMS == 2:
@@ -347,12 +359,18 @@ struct PixelViewerPolicy(ActionSource, Movable):
                 self.rd.qpos.data[k] = Scalar[RIG_DT](obs[k])
             forward_kinematics["cpu", RIG_DT, TOWER_MD, 1](self.rd, self.rm)
             for k in range(len(self.cams)):
-                self.r.cam = self.cams[k]
                 var rgb = List[Scalar[RIG_DT]]()
                 var dep = List[Scalar[RIG_DT]]()
                 var seg = List[Scalar[RIG_DT]]()
-                self.r.render_cpu(self.rd, self.rm, rgb, dep, seg)
-                render_to_planes(rgb, RENDER, k, self.xs)
+                if N_CAMS == 2 and k == 0:
+                    # the overhead: its own trace (4:3 when windowed)
+                    self.r_o.cam = self.cams[k]
+                    self.r_o.render_cpu(self.rd, self.rm, rgb, dep, seg)
+                    render_to_planes(rgb, OVERHEAD_RENDER_W, OVERHEAD_RENDER_H, k, self.xs)
+                else:
+                    self.r.cam = self.cams[k]
+                    self.r.render_cpu(self.rd, self.rm, rgb, dep, seg)
+                    render_to_planes(rgb, RENDER, RENDER, k, self.xs)
             var q = List[Float64](length=ACT, fill=0.0)
             for j in range(ACT):
                 q[j] = Float64(obs[self.a_qa[j]])

@@ -95,12 +95,18 @@ from noeira.tasks.ppo_family_driver import (
 from noeira.tasks.shaping import reward_mode_words
 from noeira.tasks.so101_tower_rig import (
     RIG_DT, TOWER_MD, TowerRendererSized, make_tower_model,
-    make_tower_renderer, tower_cameras,
+    make_tower_renderer, tower_cameras, scale_tower_camera_dr, RIG_DR_TARGET,
+)
+from noeira.physics3d.raytrace.randomize import (
+    DomainRandConfig, VisualRandomizer, geom_labels,
+    so101_tower_surface_groups,
 )
 from noeira.tasks.so101_tower_xml import So101TowerModel
 from noeira.tasks.spec import load_family
 from noeira.tasks.pixel_student import (
     StudentNet, N_CAMS, RENDER, OBS_PX, PLANE, IMG, C_IN, IN_DIM, ACT,
+    OVERHEAD_RENDER_W, OVERHEAD_RENDER_H, WINDOWED, camera_names,
+    window_in_render,
     PROPRIO, JOINT_SCALE, JOINT_VEL_SCALE, student_act, write_pixel_manifest,
 )
 
@@ -120,22 +126,33 @@ comptime ITER_STEPS = 32
 
 comptime RigData = Data[RIG_DT, TOWER_MD, N_ENVS]
 comptime Renderer = TowerRendererSized[N_ENVS, RENDER, RENDER, 1]
+"""The wrist's (and, without DAGGER_WINDOW, the overhead's) square trace."""
+comptime OverheadRenderer = TowerRendererSized[
+    N_ENVS, OVERHEAD_RENDER_W, OVERHEAD_RENDER_H, 1
+]
+"""The overhead's: the full 4:3 frame with DAGGER_WINDOW."""
 
 
 # ── device kernels ───────────────────────────────────────────────────────
 
 
 def _pack_camera_kernel[
-    N: Int, R: Int, P: Int
+    N: Int, RW: Int, RH: Int, P: Int
 ](
-    rgb: LayoutTensor[DT, Layout.row_major(N * R * R * 3), MutAnyOrigin],
+    rgb: LayoutTensor[DT, Layout.row_major(N * RW * RH * 3), MutAnyOrigin],
     ring: LayoutTensor[DT, Layout.row_major(1), MutAnyOrigin],
     base_row: Int64,
     ch0: Int64,
+    wx0: Scalar[DT],
+    wy0: Scalar[DT],
+    wx1: Scalar[DT],
+    wy1: Scalar[DT],
 ):
-    """One camera's `rgb` ([N, R*R*3], HWC, top row first) box-averaged to
-    P x P, minus 0.5, into channels ch0..ch0+2 of rows base_row.. (CHW)."""
-    comptime F = R // P
+    """One camera's `rgb` ([N, RW*RH*3], HWC, top row first) — its WINDOW
+    (wx0, wy0)-(wx1, wy1) in render pixels, AREA-averaged to P x P, minus
+    0.5 — into channels ch0..ch0+2 of rows base_row.. (CHW). The device twin
+    of `pixel_student.render_to_planes` (float32: Metal has no float64); a
+    window on whole pixels is the plain block mean."""
     var i = Int(global_idx.x)
     if i >= N * 3 * P * P:
         return
@@ -145,16 +162,33 @@ def _pack_camera_kernel[
     var p = r % (P * P)
     var oy = p // P
     var ox = p % P
+    var cw = (wx1 - wx0) / Scalar[DT](P)
+    var chh = (wy1 - wy0) / Scalar[DT](P)
+    var ax = wx0 + Scalar[DT](ox) * cw
+    var bx = ax + cw
+    var ay = wy0 + Scalar[DT](oy) * chh
+    var by = ay + chh
     var acc = Scalar[DT](0)
-    var base = lane * R * R * 3
-    for dy in range(F):
-        for dx in range(F):
-            var px = (oy * F + dy) * R + ox * F + dx
-            acc += rebind[Scalar[DT]](rgb[base + px * 3 + c])
+    var wsum = Scalar[DT](0)
+    var base = lane * RW * RH * 3
+    var py_end = min(Int(by) + 1, RH)
+    var px_end = min(Int(bx) + 1, RW)
+    for py in range(Int(ay), py_end):
+        var lo_y = ay if ay > Scalar[DT](py) else Scalar[DT](py)
+        var hi_y = by if by < Scalar[DT](py + 1) else Scalar[DT](py + 1)
+        var wy = hi_y - lo_y
+        if wy <= Scalar[DT](0):
+            continue
+        for px in range(Int(ax), px_end):
+            var lo_x = ax if ax > Scalar[DT](px) else Scalar[DT](px)
+            var hi_x = bx if bx < Scalar[DT](px + 1) else Scalar[DT](px + 1)
+            var wx = hi_x - lo_x
+            if wx <= Scalar[DT](0):
+                continue
+            acc += wx * wy * rebind[Scalar[DT]](rgb[base + (py * RW + px) * 3 + c])
+            wsum += wx * wy
     var row = Int(base_row) + lane
-    ring[row * ROW + (Int(ch0) + c) * P * P + p] = (
-        acc / Scalar[DT](F * F) - Scalar[DT](0.5)
-    )
+    ring[row * ROW + (Int(ch0) + c) * P * P + p] = acc / wsum - Scalar[DT](0.5)
 
 
 def _pack_proprio_kernel[
@@ -185,17 +219,26 @@ def _pack_proprio_kernel[
     ring[(Int(base_row) + lane) * ROW + IMG + j] = v
 
 
+comptime AUG_WORDS = 7
+"""Per training sample: brightness, contrast, R/G/B gains, shift x, shift y."""
+
+
 def _gather_kernel[
     B: Int
 ](
     ring: LayoutTensor[DT, Layout.row_major(1), MutAnyOrigin],
     g: LayoutTensor[DT, Layout.row_major(B), MutAnyOrigin],
     x: LayoutTensor[DT, Layout.row_major(B * IN_DIM), MutAnyOrigin],
+    aug: LayoutTensor[DT, Layout.row_major(B * AUG_WORDS), MutAnyOrigin],
     blank: Int64,
+    use_aug: Int64,
 ):
     """Rows `g` of the replay to the student's input: the image planes as
-    stored (ZERO when `blank` — the control: joints alone), then each joint
-    (x 0.5) broadcast over a plane."""
+    stored (ZERO when `blank` — the control: joints alone), then the joint
+    planes (x their scales). With `use_aug`, each sample's image planes are
+    photometrically jittered and shifted by its `aug` words (TRAINING ONLY —
+    the acting gather passes 0): v' = clamp((v x contrast x gain_c) +
+    brightness), read at (y + sy, x + sx) clamped to the plane."""
     var i = Int(global_idx.x)
     if i >= B * IN_DIM:
         return
@@ -205,6 +248,25 @@ def _gather_kernel[
     if k < IMG:
         if blank != 0:
             x[i] = Scalar[DT](0)
+        elif use_aug != 0:
+            var plane = k // PLANE
+            var p = k % PLANE
+            var oy = p // OBS_PX
+            var ox = p % OBS_PX
+            var ab = b * AUG_WORDS
+            var sx = Int(rebind[Scalar[DT]](aug[ab + 5]))
+            var sy = Int(rebind[Scalar[DT]](aug[ab + 6]))
+            var yy = min(max(oy + sy, 0), OBS_PX - 1)
+            var xx = min(max(ox + sx, 0), OBS_PX - 1)
+            var v = rebind[Scalar[DT]](ring[row * ROW + plane * PLANE + yy * OBS_PX + xx])
+            var c = plane % 3
+            v = v * rebind[Scalar[DT]](aug[ab + 1]) * rebind[Scalar[DT]](aug[ab + 2 + c])
+            v += rebind[Scalar[DT]](aug[ab])
+            if v > Scalar[DT](0.5):
+                v = Scalar[DT](0.5)
+            elif v < Scalar[DT](-0.5):
+                v = Scalar[DT](-0.5)
+            x[i] = v
         else:
             x[i] = rebind[Scalar[DT]](ring[row * ROW + k])
     else:
@@ -221,6 +283,18 @@ struct PixelObs(Movable):
     var rm: Model[RIG_DT, TOWER_MD]
     var rd: RigData
     var r: Renderer
+    var r_o: OverheadRenderer
+    var dr_w: VisualRandomizer[RIG_DT]
+    var dr_o: VisualRandomizer[RIG_DT]
+    var clean_w: VisualRandomizer[RIG_DT]
+    var clean_o: VisualRandomizer[RIG_DT]
+    """`off` randomizers: their `apply` RESTORES the base look (the rig's
+    calibrated one) — the clean evaluation."""
+    var dr_on: Bool
+    var aug_on: Bool
+    var aug: Tensor
+    var win: List[Float64]
+    """Per camera slot, its window in its render's pixels (x0 y0 x1 y1)."""
     var cams: List[Int]
     var qa: Tensor
     var da: Tensor
@@ -232,18 +306,65 @@ struct PixelObs(Movable):
 
     def __init__(
         out self, ctx: DeviceContext, fmd_path: String, a_qa: List[Int],
-        a_da: List[Int], cap: Int,
+        a_da: List[Int], cap: Int, dr_name: String, dr_seed: Int,
     ) raises:
         var fmd = parse_model_runtime(fmd_path)
         self.rm = make_tower_model(ctx)
         self.rd = RigData()
         self.rd.upload_all(ctx)
         self.r = make_tower_renderer[N_ENVS, RENDER, RENDER, 1](ctx, fmd, self.rm)
+        self.r_o = make_tower_renderer[
+            N_ENVS, OVERHEAD_RENDER_W, OVERHEAD_RENDER_H, 1
+        ](ctx, fmd, self.rm)
+        self.win = List[Float64]()
+        var names = camera_names()
+        for k in range(N_CAMS):
+            var is_o = N_CAMS == 2 and k == 0
+            var w = window_in_render(
+                names[k], OVERHEAD_RENDER_W if is_o else RENDER,
+                OVERHEAD_RENDER_H if is_o else RENDER,
+            )
+            self.win.append(w[0])
+            self.win.append(w[1])
+            self.win.append(w[2])
+            self.win.append(w[3])
         var both = tower_cameras(fmd)  # [overhead, wrist]
         self.cams = List[Int]()
         comptime if N_CAMS == 2:
             self.cams.append(both[0])
         self.cams.append(both[1])
+        # ⚠ DOMAIN RANDOMISATION: one randomizer per renderer (each holds its
+        # own visual tables), same config and seed, so a draw is ONE look
+        # across both cameras; both write the model's camera rows the same
+        # way. Built AFTER `make_tower_renderer` applied the rig's look, so the
+        # draws jitter around it (`apply_tower_look`'s rule).
+        var labels = geom_labels(fmd)
+        var dcfg = DomainRandConfig.parse(dr_name, UInt64(dr_seed))
+        self.dr_w = VisualRandomizer[RIG_DT](
+            dcfg, so101_tower_surface_groups(), self.r.vis, self.rm, labels,
+            self.cams.copy(), self.r.background, RIG_DR_TARGET,
+        )
+        scale_tower_camera_dr(self.dr_w, fmd)
+        self.dr_o = VisualRandomizer[RIG_DT](
+            dcfg, so101_tower_surface_groups(), self.r_o.vis, self.rm, labels,
+            self.cams.copy(), self.r_o.background, RIG_DR_TARGET,
+        )
+        scale_tower_camera_dr(self.dr_o, fmd)
+        var off = DomainRandConfig.off()
+        self.clean_w = VisualRandomizer[RIG_DT](
+            off, so101_tower_surface_groups(), self.r.vis, self.rm, labels,
+            self.cams.copy(), self.r.background, RIG_DR_TARGET,
+        )
+        self.clean_o = VisualRandomizer[RIG_DT](
+            off, so101_tower_surface_groups(), self.r_o.vis, self.rm, labels,
+            self.cams.copy(), self.r_o.background, RIG_DR_TARGET,
+        )
+        self.dr_on = dr_name != "off" and dr_name != ""
+        self.aug_on = False
+        # sized for the larger of the training batch and the acting batch:
+        # the acting gather passes it too (and never reads it)
+        self.aug = Tensor.alloc(max(BATCH, N_ENVS) * AUG_WORDS)
+        self.aug.upload(ctx)
         self.qa = Tensor.alloc(ACT_DIM)
         for j in range(ACT_DIM):
             self.qa.data[j] = Scalar[DT](a_qa[j])
@@ -275,21 +396,46 @@ struct PixelObs(Movable):
         )
         comptime n_img = (N_ENVS * 3 * PLANE + TPB - 1) // TPB
         for k in range(len(self.cams)):
-            self.r.render(ctx, self.rd, self.rm, self.cams[k])
-            # ⚠ ONE non-owning view per kernel (two miscompile on Metal —
-            # `Tensor.view_gpu`); the ring is an owned Tensor.
-            var rgb = Tensor.view_gpu(
-                ctx, mptr(self.r.rgb.unsafe_ptr()),
-                N_ENVS * RENDER * RENDER * 3,
-            )
-            ctx.enqueue_function[_pack_camera_kernel[N_ENVS, RENDER, OBS_PX]](
-                rgb.lt["gpu", Layout.row_major(N_ENVS * RENDER * RENDER * 3)](),
-                self.ring.lt["gpu", Layout.row_major(1)](),
-                Int64(base_row),
-                Int64(3 * k),
-                grid_dim=n_img,
-                block_dim=TPB,
-            )
+            if N_CAMS == 2 and k == 0:
+                self.r_o.render(ctx, self.rd, self.rm, self.cams[k])
+                # ⚠ ONE non-owning view per kernel (two miscompile on Metal —
+                # `Tensor.view_gpu`); the ring is an owned Tensor.
+                var rgb = Tensor.view_gpu(
+                    ctx, mptr(self.r_o.rgb.unsafe_ptr()),
+                    N_ENVS * OVERHEAD_RENDER_W * OVERHEAD_RENDER_H * 3,
+                )
+                ctx.enqueue_function[_pack_camera_kernel[
+                    N_ENVS, OVERHEAD_RENDER_W, OVERHEAD_RENDER_H, OBS_PX
+                ]](
+                    rgb.lt["gpu", Layout.row_major(
+                        N_ENVS * OVERHEAD_RENDER_W * OVERHEAD_RENDER_H * 3
+                    )](),
+                    self.ring.lt["gpu", Layout.row_major(1)](),
+                    Int64(base_row),
+                    Int64(3 * k),
+                    Scalar[DT](self.win[4 * k]), Scalar[DT](self.win[4 * k + 1]),
+                    Scalar[DT](self.win[4 * k + 2]), Scalar[DT](self.win[4 * k + 3]),
+                    grid_dim=n_img,
+                    block_dim=TPB,
+                )
+            else:
+                self.r.render(ctx, self.rd, self.rm, self.cams[k])
+                var rgb = Tensor.view_gpu(
+                    ctx, mptr(self.r.rgb.unsafe_ptr()),
+                    N_ENVS * RENDER * RENDER * 3,
+                )
+                ctx.enqueue_function[_pack_camera_kernel[
+                    N_ENVS, RENDER, RENDER, OBS_PX
+                ]](
+                    rgb.lt["gpu", Layout.row_major(N_ENVS * RENDER * RENDER * 3)](),
+                    self.ring.lt["gpu", Layout.row_major(1)](),
+                    Int64(base_row),
+                    Int64(3 * k),
+                    Scalar[DT](self.win[4 * k]), Scalar[DT](self.win[4 * k + 1]),
+                    Scalar[DT](self.win[4 * k + 2]), Scalar[DT](self.win[4 * k + 3]),
+                    grid_dim=n_img,
+                    block_dim=TPB,
+                )
         comptime n_q = (N_ENVS * PROPRIO + TPB - 1) // TPB
         ctx.enqueue_function[_pack_proprio_kernel[N_ENVS, NQ, NV]](
             self.rd.qpos.lt["gpu", Layout.row_major(N_ENVS * NQ)](),
@@ -302,15 +448,46 @@ struct PixelObs(Movable):
             block_dim=TPB,
         )
 
+    def redraw(mut self, ctx: DeviceContext, draw: Int) raises:
+        """Draw `draw` of the look, on both cameras' renderers."""
+        self.r.background = self.dr_w.apply(draw, self.r.vis, self.rm)
+        self.dr_w.upload(ctx, self.r.vis, self.rm)
+        self.r_o.background = self.dr_o.apply(draw, self.r_o.vis, self.rm)
+        self.dr_o.upload(ctx, self.r_o.vis, self.rm)
+
+    def restore(mut self, ctx: DeviceContext) raises:
+        """The base (calibrated) look back on both renderers."""
+        self.r.background = self.clean_w.apply(0, self.r.vis, self.rm)
+        self.clean_w.upload(ctx, self.r.vis, self.rm)
+        self.r_o.background = self.clean_o.apply(0, self.r_o.vis, self.rm)
+        self.clean_o.upload(ctx, self.r_o.vis, self.rm)
+
+    def draw_aug(mut self, ctx: DeviceContext) raises:
+        """Fresh per-sample photometric jitter + shift for the next TRAINING
+        batch: brightness U(+-0.1), contrast U(0.8, 1.2), per-channel gain
+        U(0.9, 1.1), shift in {-1, 0, 1} per axis."""
+        for b in range(BATCH):
+            var o = b * AUG_WORDS
+            self.aug.data[o] = Scalar[DT](random_float64(-0.1, 0.1))
+            self.aug.data[o + 1] = Scalar[DT](random_float64(0.8, 1.2))
+            for c in range(3):
+                self.aug.data[o + 2 + c] = Scalar[DT](random_float64(0.9, 1.1))
+            self.aug.data[o + 5] = Scalar[DT](Int(random_ui64(0, 2)) - 1)
+            self.aug.data[o + 6] = Scalar[DT](Int(random_ui64(0, 2)) - 1)
+        self.aug.upload_resident(ctx)
+
     def gather[B: Int](
-        mut self, ctx: DeviceContext, mut g: Tensor, mut x: Tensor
+        mut self, ctx: DeviceContext, mut g: Tensor, mut x: Tensor,
+        augment: Bool = False,
     ) raises:
         comptime n = (B * IN_DIM + TPB - 1) // TPB
         ctx.enqueue_function[_gather_kernel[B]](
             self.ring.lt["gpu", Layout.row_major(1)](),
             g.lt["gpu", Layout.row_major(B)](),
             x.lt["gpu", Layout.row_major(B * IN_DIM)](),
+            self.aug.lt["gpu", Layout.row_major(B * AUG_WORDS)](),
             Int64(1 if self.blank else 0),
+            Int64(1 if (augment and self.aug_on and B == BATCH) else 0),
             grid_dim=n,
             block_dim=TPB,
         )
@@ -345,6 +522,15 @@ def run_pixel_dagger(args: List[String], driver: String) raises:
     # only. A regression onto sign-noise labels learns their small mean; if
     # the student is merely too TIMID, a gain restores it without retraining.
     var act_gain = Float64(_arg(args, "--act-gain", "1"))
+    # domain randomisation: the rig's look redrawn every `--dr-every` control
+    # steps (`off` | `light` | `full`); `--aug 1` the per-sample photometric
+    # jitter + shift in the training batches; the eval is CLEAN (the
+    # calibrated look) unless `--eval-dr 1`
+    var dr_name = _arg(args, "--dr", "off")
+    var dr_every = max(Int(_arg(args, "--dr-every", "4")), 1)
+    var dr_seed = Int(_arg(args, "--dr-seed", "11"))
+    var use_aug = _arg(args, "--aug", "0") == "1"
+    var eval_dr = _arg(args, "--eval-dr", "0") == "1"
     seed_rng(seed)
     var family = String("so101_tower")
     var family_path = String("noeira/tasks/families/so101_tower.family")
@@ -415,6 +601,10 @@ def run_pixel_dagger(args: List[String], driver: String) raises:
     logger.set_config("replay", String(cap))
     logger.set_config("blank_images", String(blank))
     logger.set_config("proprio", String("q+qd" if PROPRIO > ACT else "q"))
+    logger.set_config("window", String("workspace" if WINDOWED else "centre-square"))
+    logger.set_config("dr", dr_name)
+    logger.set_config("dr_every", String(dr_every))
+    logger.set_config("aug", String(use_aug))
     logger.set_config("gripper_sign", String(grip_sign))
     logger.set_config("act_gain", String(act_gain))
     register_run(run, logger)
@@ -467,8 +657,14 @@ def run_pixel_dagger(args: List[String], driver: String) raises:
         env.d.meta.upload(ctx)
         ctx.synchronize()
 
-        var px = PixelObs(ctx, scene_path(f), a_qa, a_da, cap)
+        var px = PixelObs(ctx, scene_path(f), a_qa, a_da, cap, dr_name, dr_seed)
         px.blank = blank
+        px.aug_on = use_aug
+        var dr_draw = 0
+        if px.dr_on or use_aug:
+            print("  domain randomisation:", dr_name, "every", dr_every,
+                  "steps | per-sample aug:", use_aug, "| eval",
+                  "randomised" if eval_dr else "clean")
         if blank:
             print("  ⚠ --blank-images 1: the student sees ZERO image planes"
                   " (the joints-only control)")
@@ -540,7 +736,11 @@ def run_pixel_dagger(args: List[String], driver: String) raises:
             if beta < 0.0:
                 beta = 0.0
             var base = (it % (cap // N_ENVS)) * N_ENVS
-            # 1-2. the pictures and joints of the CURRENT state
+            # 1-2. the pictures and joints of the CURRENT state (under a new
+            # draw of the look every `dr_every` steps)
+            if px.dr_on and it % dr_every == 0:
+                px.redraw(ctx, dr_draw)
+                dr_draw += 1
             px.observe(ctx, qpos_dev, qvel_dev, base)
             # 3. the teacher, on the state
             var rp = mptr(raw_h.unsafe_ptr())
@@ -631,7 +831,9 @@ def run_pixel_dagger(args: List[String], driver: String) raises:
                             Int(random_ui64(0, UInt64(n_filled - 1)))
                         )
                     g_tr.upload_resident(ctx)
-                    px.gather[BATCH](ctx, g_tr, x_tr)
+                    if use_aug:
+                        px.draw_aug(ctx)
+                    px.gather[BATCH](ctx, g_tr, x_tr, augment=True)
                     student.forward["gpu", BATCH](
                         TensorRefs[1](x_tr), pred, Optional(ctx)
                     )
@@ -681,6 +883,11 @@ def run_pixel_dagger(args: List[String], driver: String) raises:
         # ── greedy evaluation of the STUDENT, held-out placements ────────
         var ok_all = 0
         var n_all = 0
+        # ⚠ THE EVAL'S LOOK: clean (the calibrated base) unless `--eval-dr 1`
+        # — a trained student is scored on the picture the training was
+        # randomised AROUND, and separately on held-out draws.
+        if px.dr_on and not eval_dr:
+            px.restore(ctx)
         for rnd in range(eval_rounds):
             env.reset_batch[N_ENVS](
                 ctx=ctx, rng_seed=UInt64(1_000_003 + seed * 101 + rnd)
@@ -717,6 +924,8 @@ def run_pixel_dagger(args: List[String], driver: String) raises:
             var hv_s = List[Float64](length=ACT_DIM, fill=0.0)
             var hv_d = List[Float64](length=ACT_DIM, fill=0.0)
             for t in range(C.MAX_STEPS - 1):
+                if px.dr_on and eval_dr and t % dr_every == 0:
+                    px.redraw(ctx, 5_000_000 + rnd * 1000 + t)  # held-out draws
                 px.observe(ctx, qpos_dev, qvel_dev, 0)
                 var rq = mptr(raw_h.unsafe_ptr())
                 for e in range(N_ENVS):
@@ -890,31 +1099,45 @@ def _dump_obs_png(
     ctx: DeviceContext, mut px: PixelObs, dir: String,
     qpos_dev: DeviceBuffer[DT], qvel_dev: DeviceBuffer[DT],
 ) raises:
-    """Lanes 0..3's first observation, each camera upscaled x8, as PNGs — to
-    SEE what the student sees (a transposed or blank plane trains silently)."""
+    """Lanes 0-1's first observation, each camera upscaled, as PNGs — to SEE
+    what the student sees (a transposed or blank plane trains silently). With
+    domain randomisation on, under the clean look and four draws
+    (`_draw<d>`), so the randomisation's range can be judged by eye."""
     makedirs(dir, exist_ok=True)
-    px.observe(ctx, qpos_dev, qvel_dev, 0)
-    var h = ctx.enqueue_create_host_buffer[DT](4 * ROW)
-    ctx.enqueue_copy(h, px.ring.dev.value().create_sub_buffer[DT](0, 4 * ROW))
-    ctx.synchronize()
-    var hp = h.unsafe_ptr()
-    comptime S = 8
-    comptime W = OBS_PX * S
-    for lane in range(4):
-        for cam in range(N_CAMS):
-            var img = List[UInt8](length=W * W * 3, fill=UInt8(0))
-            for y in range(W):
-                for x in range(W):
-                    for c in range(3):
-                        var v = Float64(hp[
-                            lane * ROW + (3 * cam + c) * PLANE
-                            + (y // S) * OBS_PX + x // S
-                        ]) + 0.5
-                        var b = Int(v * 255.0 + 0.5)
-                        img[(y * W + x) * 3 + c] = UInt8(max(0, min(255, b)))
-            save_png(dir + "/lane" + String(lane) + "_cam" + String(cam) + ".png",
-                     img, W, W, 3)
-    print("  png: lanes 0-3 x", N_CAMS, "cameras ->", dir)
+    var n_draw = 5 if px.dr_on else 1
+    for d in range(n_draw):
+        if px.dr_on:
+            if d == 0:
+                px.restore(ctx)
+            else:
+                px.redraw(ctx, 900_000 + d)
+        px.observe(ctx, qpos_dev, qvel_dev, 0)
+        var h = ctx.enqueue_create_host_buffer[DT](2 * ROW)
+        ctx.enqueue_copy(h, px.ring.dev.value().create_sub_buffer[DT](0, 2 * ROW))
+        ctx.synchronize()
+        var hp = h.unsafe_ptr()
+        comptime S = 256 // OBS_PX
+        comptime W = OBS_PX * S
+        for lane in range(2):
+            for cam in range(N_CAMS):
+                var img = List[UInt8](length=W * W * 3, fill=UInt8(0))
+                for y in range(W):
+                    for x in range(W):
+                        for c in range(3):
+                            var v = Float64(hp[
+                                lane * ROW + (3 * cam + c) * PLANE
+                                + (y // S) * OBS_PX + x // S
+                            ]) + 0.5
+                            var b = Int(v * 255.0 + 0.5)
+                            img[(y * W + x) * 3 + c] = UInt8(max(0, min(255, b)))
+                var tag = String("_clean") if (px.dr_on and d == 0) else (
+                    String("_draw") + String(d) if px.dr_on else String("")
+                )
+                save_png(dir + "/lane" + String(lane) + "_cam" + String(cam)
+                         + tag + ".png", img, W, W, 3)
+    if px.dr_on:
+        px.restore(ctx)
+    print("  png: lanes 0-1 x", N_CAMS, "cameras x", n_draw, "looks ->", dir)
 
 
 def _rate(h: List[Bool]) -> Float64:

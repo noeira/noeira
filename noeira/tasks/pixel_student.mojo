@@ -78,6 +78,72 @@ comptime CAM_FOVY_DEG: Float64 = 73.7398
 real frames are undistorted to a pinhole at this fovy."""
 comptime MANIFEST_KIND = "noeira.pixel_student.v1"
 
+# ── the camera WINDOWS (`-D DAGGER_WINDOW`) ─────────────────────────────────
+#
+# ⚠⚠ WITHOUT THE DEFINE, EVERY CAMERA IS THE CENTRED SQUARE of its 4:3 frame
+# (the first students, `pixel_lift` / `pixel_bowl`). WITH IT, each camera's
+# observation is a fixed WINDOW of its REAL 4:3 frame (undistorted to the sim
+# pinhole: fovy 73.74 deg vertically, 90 horizontally), in normalised frame
+# coordinates (u right, v down, [0, 1]), area-averaged to OBS_PX x OBS_PX —
+# the same function on the sim render and on the real frame, so the two
+# pictures are the same window of the same camera.
+#
+# The OVERHEAD window is MEASURED (`tools/tasks/tower_overhead_roi.mojo`, 300
+# cube-in-bowl placements, 27 Sep): the props' footprint spans u 0.10-0.67,
+# v 0.33-1.0 of the 4:3 frame — it reaches past the centred square's left
+# edge (u 0.125), so the square CUT some placements, and everything above
+# v 0.33 (the wall, the door, the speaker on the real rig) is never a prop.
+# The window below is that footprint with ~3 % margin. The WRIST window stays
+# the centred square: the wrist sees what the gripper approaches.
+comptime WINDOWED = is_defined["DAGGER_WINDOW"]()
+comptime OVERHEAD_RENDER_W = 128 if WINDOWED else RENDER
+comptime OVERHEAD_RENDER_H = 96 if WINDOWED else RENDER
+"""The trainer's overhead trace: the FULL 4:3 frame when windowed (it then
+covers the real frame's whole field), the centred square otherwise."""
+
+
+def camera_window(name: String) -> Tuple[Float64, Float64, Float64, Float64]:
+    """(u0, v0, u1, v1) of camera `name`'s observation in its real 4:3 frame."""
+    comptime if WINDOWED:
+        if name == "overhead":
+            return (0.0703125, 0.2916667, 0.703125, 1.0)
+    return (0.125, 0.0, 0.875, 1.0)
+
+
+def render_cover(name: String) -> Tuple[Float64, Float64, Float64, Float64]:
+    """(u0, v0, u1, v1) of the real frame the trainer's render of `name` covers:
+    the whole 4:3 frame for the windowed overhead, the centred square
+    otherwise (a square render at the camera's fovy)."""
+    comptime if WINDOWED:
+        if name == "overhead":
+            return (0.0, 0.0, 1.0, 1.0)
+    return (0.125, 0.0, 0.875, 1.0)
+
+
+def window_in_render(
+    name: String, rw: Int, rh: Int
+) -> Tuple[Float64, Float64, Float64, Float64]:
+    """Camera `name`'s window in PIXELS of a `rw` x `rh` render covering
+    `render_cover(name)` — the rectangle the trainer's kernel averages."""
+    var w = camera_window(name)
+    var c = render_cover(name)
+    var sx = Float64(rw) / (c[2] - c[0])
+    var sy = Float64(rh) / (c[3] - c[1])
+    return ((w[0] - c[0]) * sx, (w[1] - c[1]) * sy,
+            (w[2] - c[0]) * sx, (w[3] - c[1]) * sy)
+
+
+@always_inline
+def area_cell_bounds(
+    x0: Float64, y0: Float64, x1: Float64, y1: Float64, ox: Int, oy: Int,
+) -> Tuple[Float64, Float64, Float64, Float64]:
+    """Output cell (ox, oy)'s rectangle in source pixels, of the window
+    (x0, y0)-(x1, y1) split into OBS_PX x OBS_PX."""
+    var cw = (x1 - x0) / Float64(OBS_PX)
+    var ch = (y1 - y0) / Float64(OBS_PX)
+    return (x0 + Float64(ox) * cw, y0 + Float64(oy) * ch,
+            x0 + Float64(ox + 1) * cw, y0 + Float64(oy + 1) * ch)
+
 comptime StudentNet = Sequential[
     Conv2D[C_IN, 32, 3, 1, 1, OBS_PX, OBS_PX], ReLU[32 * PLANE],
     Conv2D[32, 64, 3, 2, 1, OBS_PX, OBS_PX], ReLU[64 * (PLANE // 4)],
@@ -111,60 +177,84 @@ def student_act(v: Scalar[DT], j: Int, grip_sign: Bool) -> Scalar[DT]:
     return v
 
 
+@always_inline
+def _cover(a: Float64, b: Float64, p: Int) -> Float64:
+    """Length of [a, b) inside source pixel [p, p+1)."""
+    var lo = a if a > Float64(p) else Float64(p)
+    var hi = b if b < Float64(p + 1) else Float64(p + 1)
+    return hi - lo if hi > lo else 0.0
+
+
 def frame_to_planes(
     ref frame: List[UInt8], w: Int, h: Int, cam: Int,
     mut x: List[Scalar[DT]],
 ) raises:
     """One real camera frame — CHW RGB uint8, `w` x `h`, row 0 at the top,
     undistorted to the sim pinhole — into camera `cam`'s three planes of
-    `x`: the centred `h` x `h` square, averaged over (h / OBS_PX)^2 blocks,
-    / 255 - 0.5. See the module docstring for why a CROP."""
-    if w < h:
-        raise Error("pixel student: a " + String(w) + "x" + String(h)
-                    + " frame is taller than wide")
-    if h % OBS_PX != 0:
-        raise Error("pixel student: frame height " + String(h)
-                    + " is not a multiple of " + String(OBS_PX))
+    `x`: its window (`camera_window`; the centred square by default) of the
+    4:3 frame, AREA-averaged to OBS_PX x OBS_PX, / 255 - 0.5. With the
+    centred square of a 640 x 480 frame the cells fall on whole pixels and
+    this is the plain block mean. See the module docstring for why a crop."""
     if len(frame) != 3 * w * h:
         raise Error("pixel student: frame holds " + String(len(frame))
                     + " bytes, expected 3 x " + String(w) + " x " + String(h))
-    var b = h // OBS_PX
-    var x0 = (w - h) // 2
-    var inv = 1.0 / (255.0 * Float64(b * b))
+    var win = camera_window(camera_names()[cam])
+    var x0 = win[0] * Float64(w)
+    var y0 = win[1] * Float64(h)
+    var x1 = win[2] * Float64(w)
+    var y1 = win[3] * Float64(h)
     for c in range(3):
         for oy in range(OBS_PX):
             for ox in range(OBS_PX):
-                var acc = 0
-                for dy in range(b):
-                    var row = c * w * h + (oy * b + dy) * w + x0 + ox * b
-                    for dx in range(b):
-                        acc += Int(frame[row + dx])
+                var cb = area_cell_bounds(x0, y0, x1, y1, ox, oy)
+                var acc = 0.0
+                var wsum = 0.0
+                for py in range(Int(cb[1]), min(Int(cb[3]) + 1, h)):
+                    var wy = _cover(cb[1], cb[3], py)
+                    if wy <= 0.0:
+                        continue
+                    for px in range(Int(cb[0]), min(Int(cb[2]) + 1, w)):
+                        var wx = _cover(cb[0], cb[2], px)
+                        if wx <= 0.0:
+                            continue
+                        acc += wx * wy * Float64(frame[c * w * h + py * w + px])
+                        wsum += wx * wy
                 x[(3 * cam + c) * PLANE + oy * OBS_PX + ox] = Scalar[DT](
-                    Float64(acc) * inv - IMAGE_OFFSET
+                    acc / (255.0 * wsum) - IMAGE_OFFSET
                 )
 
 
 def render_to_planes(
-    ref rgb: List[Scalar[DT]], r: Int, cam: Int, mut x: List[Scalar[DT]]
+    ref rgb: List[Scalar[DT]], rw: Int, rh: Int, cam: Int,
+    mut x: List[Scalar[DT]],
 ) raises:
-    """A SIM render (the tracer's `rgb`: `r` x `r`, HWC floats in [0, 1], top
-    row first) into camera `cam`'s planes — the host twin of the trainer's
-    `_pack_camera_kernel` (block mean over (r / OBS_PX)^2, minus 0.5), for
-    tools that drive the student one env at a time on the CPU (the viewer)."""
-    if r % OBS_PX != 0 or len(rgb) != r * r * 3:
-        raise Error("pixel student: a " + String(r) + "x" + String(r)
-                    + " render does not block-average to " + String(OBS_PX))
-    var f = r // OBS_PX
-    var inv = 1.0 / Float64(f * f)
+    """A SIM render of camera `cam` (the tracer's `rgb`: `rw` x `rh`, HWC
+    floats in [0, 1], top row first, covering `render_cover`) into its
+    planes: its window, area-averaged — the host twin of the trainer's
+    `_pack_camera_kernel`, for tools that drive the student one env at a
+    time on the CPU (the viewer) and for the gates."""
+    if len(rgb) != rw * rh * 3:
+        raise Error("pixel student: render of " + String(len(rgb))
+                    + " floats is not " + String(rw) + "x" + String(rh) + "x3")
+    var r = window_in_render(camera_names()[cam], rw, rh)
     for c in range(3):
         for oy in range(OBS_PX):
             for ox in range(OBS_PX):
+                var cb = area_cell_bounds(r[0], r[1], r[2], r[3], ox, oy)
                 var acc = 0.0
-                for dy in range(f):
-                    for dx in range(f):
-                        acc += Float64(rgb[((oy * f + dy) * r + ox * f + dx) * 3 + c])
+                var wsum = 0.0
+                for py in range(Int(cb[1]), min(Int(cb[3]) + 1, rh)):
+                    var wy = _cover(cb[1], cb[3], py)
+                    if wy <= 0.0:
+                        continue
+                    for px in range(Int(cb[0]), min(Int(cb[2]) + 1, rw)):
+                        var wx = _cover(cb[0], cb[2], px)
+                        if wx <= 0.0:
+                            continue
+                        acc += wx * wy * Float64(rgb[(py * rw + px) * 3 + c])
+                        wsum += wx * wy
                 x[(3 * cam + c) * PLANE + oy * OBS_PX + ox] = Scalar[DT](
-                    acc * inv - IMAGE_OFFSET
+                    acc / wsum - IMAGE_OFFSET
                 )
 
 
@@ -207,7 +297,8 @@ def write_pixel_manifest(
     s += '  "obs_px": ' + String(OBS_PX) + ',\n'
     s += '  "render": ' + String(RENDER) + ',\n'
     s += '  "fovy_deg": ' + String(CAM_FOVY_DEG) + ',\n'
-    s += '  "frame": "centre square crop, block mean, /255 - 0.5",\n'
+    s += '  "frame": "' + ("workspace window (camera_window), area mean, /255 - 0.5" if WINDOWED else "centre square crop, block mean, /255 - 0.5") + '",\n'
+    s += '  "window": "' + ("workspace" if WINDOWED else "centre-square") + '",\n'
     s += '  "joint_scale": ' + String(JOINT_SCALE) + ',\n'
     s += '  "proprio": "' + ("q+qd" if JOINT_VEL else "q") + '",\n'
     s += '  "joint_vel_scale": ' + String(JOINT_VEL_SCALE) + ',\n'
@@ -268,6 +359,12 @@ def check_pixel_manifest(path: String) raises -> PixelManifest:
             raise Error("pixel student: camera slot " + String(i) + " is '"
                         + doc.string(doc.at(cams, i)) + "', this build's is '"
                         + want[i] + "'")
+    var wf = doc.field(r, "window")
+    var window = doc.string(wf) if wf >= 0 else String("centre-square")
+    if window != ("workspace" if WINDOWED else "centre-square"):
+        raise Error("pixel student: the policy's camera window is '" + window
+                    + "', this build's is '" + ("workspace" if WINDOWED else "centre-square")
+                    + "'" + (" (build with -D DAGGER_WINDOW)" if window == "workspace" else ""))
     var pr = doc.field(r, "proprio")
     var proprio = doc.string(pr) if pr >= 0 else String("q")
     if proprio != ("q+qd" if JOINT_VEL else "q"):
