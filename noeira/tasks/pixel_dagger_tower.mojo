@@ -92,7 +92,7 @@ from noeira.tasks.ppo_family_driver import (
     AgentT, RunningMeanStd, N_ENVS, ACT_DIM, OBS_CLIP, OBS_BOUND, GAMMA,
     _delta_to_env, _arg, _lag_reset,
 )
-from noeira.tasks.delta_action import ServoLag
+from noeira.tasks.delta_action import ServoLag, DELTA_ARM, DELTA_GRIPPER
 from noeira.tasks.shaping import reward_mode_words
 from noeira.tasks.so101_tower_rig import (
     RIG_DT, TOWER_MD, TowerRendererSized, make_tower_model,
@@ -536,6 +536,11 @@ def run_pixel_dagger(args: List[String], driver: String) raises:
     # `--lag-delay lo,hi` ticks); the student is trained AND evaluated under it
     var lag_tau = _arg(args, "--lag-tau", "")
     var lag_delay = _arg(args, "--lag-delay", "")
+    # ⚠ THE TEACHER'S SCALES: its labels are actions in its own units, so the
+    # student must execute them with the same (checked below against the
+    # teacher's run config when it recorded them)
+    var d_arm = Float64(_arg(args, "--delta-arm", String(DELTA_ARM)))
+    var d_grip = Float64(_arg(args, "--delta-gripper", String(DELTA_GRIPPER)))
     seed_rng(seed)
     var family = String("so101_tower")
     var family_path = String("noeira/tasks/families/so101_tower.family")
@@ -612,6 +617,8 @@ def run_pixel_dagger(args: List[String], driver: String) raises:
     logger.set_config("aug", String(use_aug))
     logger.set_config("lag_tau_ms", lag_tau)
     logger.set_config("lag_delay_ticks", lag_delay)
+    logger.set_config("delta_arm", String(d_arm))
+    logger.set_config("delta_gripper", String(d_grip))
     logger.set_config("gripper_sign", String(grip_sign))
     logger.set_config("act_gain", String(act_gain))
     register_run(run, logger)
@@ -628,6 +635,20 @@ def run_pixel_dagger(args: List[String], driver: String) raises:
             max_grad_norm=Scalar[DT](0.5),
         )
         teacher.trainer.load_state(teacher_dir + "/checkpoints/last.ckpt")
+        var t_cfg = teacher_dir + "/metrics.config.kv"
+        try:
+            with open(t_cfg, "r") as fh:
+                for ln in fh.read().split("\n"):
+                    var sl = String(ln)
+                    if sl.startswith("delta_arm="):
+                        var tv = Float64(String(sl[byte = 10 :]))
+                        if abs(tv - d_arm) > 1e-9:
+                            raise Error("pixel dagger: the teacher acts with"
+                                        " --delta-arm " + String(tv)
+                                        + ", this run with " + String(d_arm))
+        except e:
+            if String(e).find("pixel dagger:") >= 0:
+                raise e^
         var obs_rms = RunningMeanStd(OBS)
         obs_rms.load(teacher_dir + "/obs_norm.txt")
 
@@ -736,7 +757,7 @@ def run_pixel_dagger(args: List[String], driver: String) raises:
         var ckpt = run.dir + "/checkpoints/last.ckpt"
         write_pixel_manifest(
             run.dir + "/checkpoints/norm.json", task, teacher_dir, grip_sign,
-            Float64(C.FRAME_SKIP) * M.TIMESTEP,
+            Float64(C.FRAME_SKIP) * M.TIMESTEP, d_arm, d_grip, lag_tau, lag_delay,
         )
 
         ctx.enqueue_copy(raw_h, obs_dev)
@@ -801,7 +822,7 @@ def run_pixel_dagger(args: List[String], driver: String) raises:
                             )
             _delta_to_env(
                 mptr(act_t.unsafe_ptr()), mptr(env_act.unsafe_ptr()),
-                arm_q, a_lo, a_hi, lag,
+                arm_q, a_lo, a_hi, lag, d_arm, d_grip,
             )
             ctx.enqueue_copy(act_dev, env_act)
             # 5. step, tally, reset
@@ -985,7 +1006,7 @@ def run_pixel_dagger(args: List[String], driver: String) raises:
                         _lag_reset(lag, arm_q, e)
                 _delta_to_env(
                     mptr(act_t.unsafe_ptr()), mptr(env_act.unsafe_ptr()),
-                    arm_q, a_lo, a_hi, lag,
+                    arm_q, a_lo, a_hi, lag, d_arm, d_grip,
                 )
                 ctx.enqueue_copy(act_dev, env_act)
                 env.step_batch[N_ENVS](ctx=ctx, rng_seed=UInt64(t + 1))

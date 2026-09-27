@@ -121,14 +121,20 @@ struct Variant(Copyable, Movable):
     """The teacher's `obs_norm.txt`; unused for a student."""
     var refuse: String
     """Why this build cannot run it ("" if it can)."""
+    var d_arm: Float64
+    var d_grip: Float64
+    """The delta scales it was trained with (its run config's)."""
 
     def __init__(out self, label: String, is_teacher: Bool, ckpt: String,
-                 norm: String, refuse: String):
+                 norm: String, refuse: String, d_arm: Float64 = 0.05,
+                 d_grip: Float64 = 0.2):
         self.label = label
         self.is_teacher = is_teacher
         self.ckpt = ckpt
         self.norm = norm
         self.refuse = refuse
+        self.d_arm = d_arm
+        self.d_grip = d_grip
 
 
 def find_variants(task: String) raises -> List[Variant]:
@@ -179,10 +185,13 @@ def find_variants(task: String) raises -> List[Variant]:
                 "with -D DAGGER_JOINT_VEL" if pr == "q+qd" else "without -D DAGGER_JOINT_VEL"
             )
         var name = String(d[byte = d.rfind("/") + 1 :])
+        var da_s = _cfg_value(cfg, "delta_arm")
+        var dg_s = _cfg_value(cfg, "delta_gripper")
         out.append(Variant(
             short + " student " + String(name[byte = name.byte_length() - 8 :]) + " ("
             + String(px) + "px)" + (" — needs another build" if refuse else ""),
             False, ck, String(""), refuse,
+            Float64(da_s) if da_s else 0.05, Float64(dg_s) if dg_s else 0.2,
         ))
         var t = _cfg_value(cfg, "teacher")
         var seen = False
@@ -195,10 +204,13 @@ def find_variants(task: String) raises -> List[Variant]:
         var ck = t + "/checkpoints/last.ckpt"
         var tn = String(t[byte = t.rfind("/") + 1 :])
         var refuse = String("") if exists(ck) else String("not on this machine: ") + t
+        var tda = _cfg_value(t + "/metrics.config.kv", "delta_arm")
+        var tdg = _cfg_value(t + "/metrics.config.kv", "delta_gripper")
         out.append(Variant(
             short + " teacher " + String(tn[byte = tn.byte_length() - 8 :])
             + ("" if not refuse else " (missing)"),
             True, ck, t + "/obs_norm.txt", refuse,
+            Float64(tda) if tda else 0.05, Float64(tdg) if tdg else 0.2,
         ))
     return out^
 
@@ -389,8 +401,9 @@ struct PixelViewerPolicy(ActionSource, Movable):
         # the delta rule, then the env's normalised absolute action
         for j in range(ACT):
             self.last_a[j] = a[j]
+            var vv = self.variants[self.current].copy()
             var tgt = delta_target(Float64(obs[self.a_qa[j]]), a[j], j,
-                                   self.lo[j], self.hi[j])
+                                   self.lo[j], self.hi[j], vv.d_arm, vv.d_grip)
             var mid = 0.5 * (self.lo[j] + self.hi[j])
             var half = 0.5 * (self.hi[j] - self.lo[j])
             action_out[j] = Scalar[DT]((tgt - mid) / half)

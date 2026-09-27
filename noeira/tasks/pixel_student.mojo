@@ -280,7 +280,9 @@ def joints_to_planes(ref q: List[Float64], mut x: List[Scalar[DT]]):
 
 def write_pixel_manifest(
     path: String, task: String, teacher: String, gripper_sign: Bool,
-    control_period_s: Float64,
+    control_period_s: Float64, delta_arm: Float64 = DELTA_ARM,
+    delta_gripper: Float64 = DELTA_GRIPPER, lag_tau: String = "",
+    lag_delay: String = "",
 ) raises:
     """The student's contract as JSON — at `checkpoints/norm.json`, the file
     `project-promote` copies beside the weights, so a promoted pixel policy
@@ -303,8 +305,9 @@ def write_pixel_manifest(
     s += '  "proprio": "' + ("q+qd" if JOINT_VEL else "q") + '",\n'
     s += '  "joint_vel_scale": ' + String(JOINT_VEL_SCALE) + ',\n'
     s += '  "joint_units": "model radians (tower_follower joint zero)",\n'
-    s += '  "delta_arm": ' + String(DELTA_ARM) + ',\n'
-    s += '  "delta_gripper": ' + String(DELTA_GRIPPER) + ',\n'
+    s += '  "delta_arm": ' + String(delta_arm) + ',\n'
+    s += '  "delta_gripper": ' + String(delta_gripper) + ',\n'
+    s += '  "servo_lag": "tau ' + lag_tau + ' ms, delay ' + lag_delay + ' ticks",\n'
     s += '  "gripper_sign": ' + ("true" if gripper_sign else "false") + ',\n'
     s += '  "control_period_s": ' + String(control_period_s) + '\n'
     s += "}\n"
@@ -317,12 +320,18 @@ struct PixelManifest(Copyable, Movable):
     var teacher: String
     var gripper_sign: Bool
     var control_period_s: Float64
+    var delta_arm: Float64
+    var delta_gripper: Float64
+    """The per-step scales the policy was TRAINED with — every executor of
+    it must use them (a student acts in its teacher's units)."""
 
     def __init__(out self):
         self.task = String("")
         self.teacher = String("")
         self.gripper_sign = False
         self.control_period_s = 0.0
+        self.delta_arm = DELTA_ARM
+        self.delta_gripper = DELTA_GRIPPER
 
 
 def _num(ref doc: JsonDoc, r: Int, k: String, path: String) raises -> Float64:
@@ -374,10 +383,11 @@ def check_pixel_manifest(path: String) raises -> PixelManifest:
                              if proprio == "q+qd" else ""))
     if abs(_num(doc, r, "joint_scale", path) - JOINT_SCALE) > 1e-9:
         raise Error("pixel student: joint_scale differs from this build's")
-    if abs(_num(doc, r, "delta_arm", path) - DELTA_ARM) > 1e-9 or abs(
-        _num(doc, r, "delta_gripper", path) - DELTA_GRIPPER
-    ) > 1e-9:
-        raise Error("pixel student: the action scale differs from this build's")
+    var da = _num(doc, r, "delta_arm", path)
+    var dg = _num(doc, r, "delta_gripper", path)
+    if not (da > 0.0 and da < 1.0 and dg > 0.0 and dg < 2.0):
+        raise Error("pixel student: implausible action scales " + String(da)
+                    + " / " + String(dg))
     if abs(_num(doc, r, "fovy_deg", path) - CAM_FOVY_DEG) > 1e-3:
         raise Error("pixel student: the camera fovy differs from this build's")
     var m = PixelManifest()
@@ -391,4 +401,6 @@ def check_pixel_manifest(path: String) raises -> PixelManifest:
     if g >= 0:
         m.gripper_sign = doc.boolean(g)
     m.control_period_s = _num(doc, r, "control_period_s", path)
+    m.delta_arm = da
+    m.delta_gripper = dg
     return m^

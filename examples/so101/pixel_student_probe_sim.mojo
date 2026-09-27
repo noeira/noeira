@@ -90,6 +90,14 @@ def main() raises:
         man_path = ckpt[byte = 0 : ckpt.rfind("/")] + "/norm.json"
     var man = check_pixel_manifest(man_path)
     var lag_tau_s = _arg(args, "--lag-tau", "")
+    # overrides of the manifest's action scales — for what-ifs only
+    var da_o = _arg(args, "--delta-arm", "")
+    var dg_o = _arg(args, "--delta-gripper", "")
+    if da_o.byte_length() > 0:
+        man.delta_arm = Float64(da_o)
+    if dg_o.byte_length() > 0:
+        man.delta_gripper = Float64(dg_o)
+    print("probe: action scale arm", man.delta_arm, "gripper", man.delta_gripper)
     var lag_delay_s = _arg(args, "--lag-delay", "")
     print("probe:", ckpt, "|", OBS_PX, "px", "| q+qd" if JOINT_VEL else "| q",
           "| window" if WINDOWED else "| centre square", "| task", task)
@@ -228,7 +236,7 @@ def main() raises:
             var rt = String("")
             for j in range(ACT):
                 var a = Float64(student_act(y.data[j], j, man.gripper_sign))
-                var tgt = delta_target(q[j], a, j, lo[j], hi[j])
+                var tgt = delta_target(q[j], a, j, lo[j], hi[j], man.delta_arm, man.delta_gripper)
                 tgt = lag.apply(0, j, tgt)
                 ra += "," + String(a)
                 rt += "," + String(tgt)

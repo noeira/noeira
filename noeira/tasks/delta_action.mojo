@@ -27,18 +27,24 @@ comptime DELTA_ACT: Int = 6
 
 
 @always_inline
-def delta_scale(j: Int) -> Float64:
+def delta_scale(
+    j: Int, arm: Float64 = DELTA_ARM, gripper: Float64 = DELTA_GRIPPER
+) -> Float64:
     """Radians per control step at a = 1 for action word `j`."""
-    return DELTA_GRIPPER if j == DELTA_ACT - 1 else DELTA_ARM
+    return gripper if j == DELTA_ACT - 1 else arm
 
 
 @always_inline
 def delta_target(
-    q: Float64, a: Float64, j: Int, lo: Float64, hi: Float64
+    q: Float64, a: Float64, j: Int, lo: Float64, hi: Float64,
+    arm: Float64 = DELTA_ARM, gripper: Float64 = DELTA_GRIPPER,
 ) -> Float64:
     """The joint target (model radians) for action word `a` at measured `q`,
-    clamped to [lo, hi]."""
-    var t = q + a * delta_scale(j)
+    clamped to [lo, hi]. `arm` / `gripper` are the per-step scales — the
+    defaults are so101-nexus's (a stiff sim at 50 Hz); a policy trained under
+    `ServoLag` needs larger ones (Squint drives the real SO-101 at 0.15), and
+    whatever it was trained with travels in its manifest."""
+    var t = q + a * delta_scale(j, arm, gripper)
     if t < lo:
         return lo
     if t > hi:

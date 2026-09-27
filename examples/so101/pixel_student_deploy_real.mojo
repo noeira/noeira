@@ -305,6 +305,8 @@ def main() raises:
     print("  " + String(N_CAMS) + " cameras at " + String(OBS_PX) + "x"
           + String(OBS_PX) + " | control period " + fixed(man.control_period_s * 1000.0, 1)
           + " ms | gripper sign " + String(grip_sign))
+    print("  action scale (rad per step at a = 1): arm " + String(man.delta_arm)
+          + ", gripper " + String(man.delta_gripper) + " — the manifest's")
     var net = StudentNet.make["cpu", Kaiming](None)
     load_params["cpu"](net, ckpt, None)
     var x = Tensor.alloc(IN_DIM)
@@ -634,7 +636,7 @@ def main() raises:
             var rt = String("")
             for j in range(ACT):
                 var a = Float64(student_act(y.data[j], j, grip_sign))
-                var tgt = delta_target(q[j], a, j, lo[j], hi[j])
+                var tgt = delta_target(q[j], a, j, lo[j], hi[j], man.delta_arm, man.delta_gripper)
                 if tgt <= lo[j] or tgt >= hi[j]:
                     clamped += 1
                 goals[j] = jmap.from_sim(arm.cal, j, tgt)

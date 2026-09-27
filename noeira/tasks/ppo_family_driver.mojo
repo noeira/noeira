@@ -98,7 +98,7 @@ from noeira.tasks.gpu_eval import region_table_words
 from noeira.tasks.posed_reset import task_meta_words
 from noeira.tasks.shaping import reward_mode_words
 from noeira.tasks.delta_action import (
-    DELTA_ACT, delta_scale, delta_target, ServoLag,
+    DELTA_ACT, DELTA_ARM, DELTA_GRIPPER, delta_scale, delta_target, ServoLag,
 )
 from noeira.tasks.spec import load_family
 
@@ -243,6 +243,8 @@ def _delta_to_env(
     ref a_lo: List[Float64],
     ref a_hi: List[Float64],
     mut lag: ServoLag,
+    d_arm: Float64 = DELTA_ARM,
+    d_grip: Float64 = DELTA_GRIPPER,
 ):
     """`--action delta`: target = clamp(q + a * scale), through the servo
     model (`delta_action.ServoLag`; the identity when off), normalised onto
@@ -252,7 +254,7 @@ def _delta_to_env(
             var tgt = delta_target(
                 arm_q[e * ACT_DIM + j],
                 Float64(ap[unsafe_offset = e * ACT_DIM + j]),
-                j, a_lo[j], a_hi[j],
+                j, a_lo[j], a_hi[j], d_arm, d_grip,
             )
             tgt = lag.apply(e, j, tgt)
             var mid = 0.5 * (a_lo[j] + a_hi[j])
@@ -449,6 +451,10 @@ def run_ppo[M: ModelDefLike, C: Phyics3dEnvConfig](
     # ms and `--lag-delay lo,hi` ticks, drawn per episode; off by default
     var lag_tau = _arg(args, "--lag-tau", "")
     var lag_delay = _arg(args, "--lag-delay", "")
+    # the delta action's per-step scales (rad at a = 1): the defaults are
+    # so101-nexus's; under `--lag-*` the real servos need larger ones
+    var d_arm = Float64(_arg(args, "--delta-arm", String(DELTA_ARM)))
+    var d_grip = Float64(_arg(args, "--delta-gripper", String(DELTA_GRIPPER)))
     if action_mode != "absolute" and action_mode != "delta":
         raise Error("ppo task: --action absolute|delta, got " + action_mode)
     if reward != "potential" and reward != "legacy":
@@ -526,6 +532,8 @@ def run_ppo[M: ModelDefLike, C: Phyics3dEnvConfig](
     logger.set_config("exec_noise", String(exec_noise))
     logger.set_config("lag_tau_ms", lag_tau)
     logger.set_config("lag_delay_ticks", lag_delay)
+    logger.set_config("delta_arm", String(d_arm))
+    logger.set_config("delta_gripper", String(d_grip))
     logger.set_config("horizon", String(C.MAX_STEPS))
     logger.set_config("obs_norm", "running, clip 10")
     logger.set_config("reward_norm", "discounted-return std, clip 10")
@@ -688,7 +696,7 @@ def run_ppo[M: ModelDefLike, C: Phyics3dEnvConfig](
             if action_mode == "delta":
                 _delta_to_env(
                     mptr(act_h.unsafe_ptr()), mptr(env_act.unsafe_ptr()),
-                    arm_q, a_lo, a_hi, lag,
+                    arm_q, a_lo, a_hi, lag, d_arm, d_grip,
                 )
                 ctx.enqueue_copy(act_dev, env_act)
             else:
@@ -885,7 +893,7 @@ def run_ppo[M: ModelDefLike, C: Phyics3dEnvConfig](
                 if action_mode == "delta":
                     _delta_to_env(
                         mptr(act_h.unsafe_ptr()), mptr(env_act.unsafe_ptr()),
-                        arm_q, a_lo, a_hi, lag,
+                        arm_q, a_lo, a_hi, lag, d_arm, d_grip,
                     )
                     ctx.enqueue_copy(act_dev, env_act)
                 else:
