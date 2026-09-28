@@ -601,6 +601,13 @@ def main() raises:
     var t_prev = perf_counter_ns()
     var loop_t0 = perf_counter_ns()
     var deadline = loop_t0 + seconds * 1_000_000_000
+    var a_ex = List[Float64](length=ACT, fill=0.0)
+    var line2 = String("")
+    var ra = String("")
+    var rt = String("")
+    if man.repeat > 1:
+        print("  the policy acts every", man.repeat, "ticks (",
+              fixed(1.0 / (man.control_period_s * Float64(man.repeat)), 1), "Hz)")
     try:
         while perf_counter_ns() < deadline:
             var tt = perf_counter_ns()
@@ -630,26 +637,30 @@ def main() raises:
             act_hist_to_planes(hist, xs)
             if snap_dir.byte_length() > 0 and ticks == 62:
                 _snap(snap_dir, frames, xs, q, String("_t2s"))
-            for k in range(IN_DIM):
-                x.data[k] = xs[k]
-            var tf = perf_counter_ns()
-            net.forward["cpu", 1](TensorRefs[1](x), y, None)
-            sum_fwd += Float64(perf_counter_ns() - tf) / 1e6
-            # act: the teacher's delta rule, then servo ticks
-            var line2 = String("")
-            var ra = String("")
-            var rt = String("")
-            var a_ex = List[Float64](length=ACT, fill=0.0)
-            for j in range(ACT):
-                var a = Float64(student_act(y.data[j], j, grip_sign))
-                a_ex[j] = a
-                var tgt = delta_target(q[j], a, j, lo[j], hi[j], man.delta_arm, man.delta_gripper)
-                if tgt <= lo[j] or tgt >= hi[j]:
-                    clamped += 1
-                goals[j] = jmap.from_sim(arm.cal, j, tgt)
-                line2 += " " + col(a, 6, 2)
-                ra += "," + String(a)
-                rt += "," + String(tgt)
+            # the policy acts every `repeat` ticks (the manifest's cadence);
+            # between, the last goals are re-sent and the joints still read
+            # every tick (the velocities are per tick, as the sim's qvel)
+            var acting = ticks % man.repeat == 0
+            if acting:
+                for k in range(IN_DIM):
+                    x.data[k] = xs[k]
+                var tf = perf_counter_ns()
+                net.forward["cpu", 1](TensorRefs[1](x), y, None)
+                sum_fwd += Float64(perf_counter_ns() - tf) / 1e6
+                # act: the teacher's delta rule, then servo ticks
+                line2 = String("")
+                ra = String("")
+                rt = String("")
+                for j in range(ACT):
+                    var a = Float64(student_act(y.data[j], j, grip_sign))
+                    a_ex[j] = a
+                    var tgt = delta_target(q[j], a, j, lo[j], hi[j], man.delta_arm, man.delta_gripper)
+                    if tgt <= lo[j] or tgt >= hi[j]:
+                        clamped += 1
+                    goals[j] = jmap.from_sim(arm.cal, j, tgt)
+                    line2 += " " + col(a, 6, 2)
+                    ra += "," + String(a)
+                    rt += "," + String(tgt)
             if rec_dir.byte_length() > 0:
                 var row = String(Float64(perf_counter_ns() - loop_t0) / 1e9)
                 for j in range(ACT):
@@ -663,7 +674,8 @@ def main() raises:
                 arm.write_goals(Span(goals))
             # ⚠ what was SENT, as the trainer records it (the dry run too: its
             # policy then sees the commands it would have made)
-            act_hist_push(hist, a_ex)
+            if acting:
+                act_hist_push(hist, a_ex)
             if ticks % 15 == 0:
                 print("  t=" + pad_left(fixed(Float64(perf_counter_ns() - loop_t0) / 1e9, 1), 5)
                       + "s  a:" + line2)

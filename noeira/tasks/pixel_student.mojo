@@ -308,7 +308,7 @@ def write_pixel_manifest(
     path: String, task: String, teacher: String, gripper_sign: Bool,
     control_period_s: Float64, delta_arm: Float64 = DELTA_ARM,
     delta_gripper: Float64 = DELTA_GRIPPER, lag_tau: String = "",
-    lag_delay: String = "",
+    lag_delay: String = "", repeat: Int = 1,
 ) raises:
     """The student's contract as JSON — at `checkpoints/norm.json`, the file
     `project-promote` copies beside the weights, so a promoted pixel policy
@@ -336,6 +336,7 @@ def write_pixel_manifest(
     s += '  "delta_gripper": ' + String(delta_gripper) + ',\n'
     s += '  "servo_lag": "tau ' + lag_tau + ' ms, delay ' + lag_delay + ' ticks",\n'
     s += '  "gripper_sign": ' + ("true" if gripper_sign else "false") + ',\n'
+    s += '  "repeat": ' + String(repeat) + ',\n'
     s += '  "control_period_s": ' + String(control_period_s) + '\n'
     s += "}\n"
     with open(path, "w") as f:
@@ -351,6 +352,9 @@ struct PixelManifest(Copyable, Movable):
     var delta_gripper: Float64
     """The per-step scales the policy was TRAINED with — every executor of
     it must use them (a student acts in its teacher's units)."""
+    var repeat: Int
+    """Ticks per policy step: the policy acts every `repeat` control
+    periods and its targets are held between (1: every tick)."""
 
     def __init__(out self):
         self.task = String("")
@@ -359,6 +363,7 @@ struct PixelManifest(Copyable, Movable):
         self.control_period_s = 0.0
         self.delta_arm = DELTA_ARM
         self.delta_gripper = DELTA_GRIPPER
+        self.repeat = 1
 
 
 def _num(ref doc: JsonDoc, r: Int, k: String, path: String) raises -> Float64:
@@ -436,4 +441,8 @@ def check_pixel_manifest(path: String) raises -> PixelManifest:
     m.control_period_s = _num(doc, r, "control_period_s", path)
     m.delta_arm = da
     m.delta_gripper = dg
+    var rp = doc.field(r, "repeat")
+    m.repeat = Int(doc.number(rp)) if rp >= 0 else 1
+    if m.repeat < 1 or m.repeat > 8:
+        raise Error("pixel student: implausible repeat " + String(m.repeat))
     return m^
