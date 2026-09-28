@@ -119,6 +119,9 @@ pixel-deploy-jetson-v32 = { cmd = "mojo build -I . --target-accelerator sm_87 -D
 # ... and a WINDOWED one (-D DAGGER_WINDOW: the overhead's workspace window,
 # the domain-randomised students)
 pixel-deploy-jetson-wv32 = { cmd = "mojo build -I . --target-accelerator sm_87 -D DAGGER_WINDOW -D DAGGER_PX_32 -D DAGGER_JOINT_VEL -o /tmp/pixel_deploy_wv32 examples/so101/pixel_student_deploy_real.mojo && /tmp/pixel_deploy_wv32", depends-on = ["build-serial", "build-opencv"], description = "A windowed 32x32 joint-velocity pixel student on the arm (-- --role R; --arm to move it)" }
+# ... and one that also sees its last 3 executed actions (-D TASK_PPO_ACT_HIST=3:
+# the students trained under the servo lag, which need to know what is in flight)
+pixel-deploy-jetson-wv32h3 = { cmd = "mojo build -I . --target-accelerator sm_87 -D DAGGER_WINDOW -D DAGGER_PX_32 -D DAGGER_JOINT_VEL -D TASK_PPO_ACT_HIST=3 -o /tmp/pixel_deploy_wv32h3 examples/so101/pixel_student_deploy_real.mojo && /tmp/pixel_deploy_wv32h3", depends-on = ["build-serial", "build-opencv"], description = "A windowed 32x32 joint-velocity pixel student with action history on the arm (-- --role R; --arm to move it)" }
 
 # ── SmolVLA on the board ───────────────────────────────────────────────────
 # ⚠⚠ MEASURE THE QUERY FIRST. `smolvla-probe-jetson` times one `select_action`;
