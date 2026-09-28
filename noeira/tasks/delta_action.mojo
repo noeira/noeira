@@ -24,6 +24,7 @@ from std.sys.defines import get_defined_int
 comptime DELTA_ARM: Float64 = 0.05
 comptime DELTA_GRIPPER: Float64 = 0.2
 comptime DELTA_ACT: Int = 6
+"""Five body joints then the gripper."""
 comptime ACT_HIST: Int = get_defined_int["TASK_PPO_ACT_HIST", 0]()
 """`-D TASK_PPO_ACT_HIST=K`: a policy also sees the last K EXECUTED actions
 (K x 6 words, the most recent first, clipped to [-1, 1], zero at an episode's
@@ -34,7 +35,6 @@ states alike in `q` / `qd` with different commands in flight need different
 actions, and the lagged teachers without it plateaued at 30-36 % greedy
 (1af8c0ed, 51a2e3bc) where the stiff sim reached 79.5 %. The real deploy
 knows what it sent. A BUILD CHOICE the checkpoints depend on."""
-"""Five body joints then the gripper."""
 
 
 @always_inline
