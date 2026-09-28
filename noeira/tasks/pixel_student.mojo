@@ -46,7 +46,7 @@ from noeira.nn.primitives.conv2d import Conv2D
 from noeira.nn.primitives.flatten import Flatten
 from noeira.nn.primitives.linear import Linear
 from noeira.nn.primitives.linear_relu import LinearReLU
-from noeira.tasks.delta_action import DELTA_ACT, DELTA_ARM, DELTA_GRIPPER
+from noeira.tasks.delta_action import DELTA_ACT, DELTA_ARM, DELTA_GRIPPER, ACT_HIST
 
 comptime ACT = DELTA_ACT
 comptime N_CAMS = 1 if is_defined["DAGGER_WRIST_ONLY"]() else 2
@@ -63,8 +63,12 @@ comptime JOINT_VEL = is_defined["DAGGER_JOINT_VEL"]()
 cube-in-bowl teacher's quick corrections depend on velocity it reads from its
 state (its `qvel` words) and a single frame cannot show; the real servos
 report velocity (`SO101Arm.read_velocities`), so the plane is deployable."""
-comptime PROPRIO = 2 * ACT if JOINT_VEL else ACT
-"""Joint planes: the angles, then (with JOINT_VEL) the velocities."""
+comptime PROPRIO_STATE = 2 * ACT if JOINT_VEL else ACT
+"""The state's joint planes: the angles, then (with JOINT_VEL) the velocities."""
+comptime HIST_WORDS = ACT_HIST * ACT
+comptime PROPRIO = PROPRIO_STATE + HIST_WORDS
+"""All the joint planes: the state's, then (`-D TASK_PPO_ACT_HIST=K`) the
+last K executed actions, most recent first, unscaled ([-1, 1])."""
 comptime C_IN = 3 * N_CAMS + PROPRIO
 comptime IN_DIM = C_IN * PLANE
 comptime HID = 256
@@ -269,6 +273,28 @@ def joint_vels_to_planes(ref qd: List[Float64], mut x: List[Scalar[DT]]):
                 x[base + p] = v
 
 
+def act_hist_to_planes(ref hist: List[Float64], mut x: List[Scalar[DT]]):
+    """The last ACT_HIST executed actions (`act_hist_push`'s layout) into
+    their planes — a no-op in a build without `TASK_PPO_ACT_HIST`."""
+    for k in range(HIST_WORDS):
+        var v = Scalar[DT](hist[k])
+        var base = IMG + (PROPRIO_STATE + k) * PLANE
+        for p in range(PLANE):
+            x[base + p] = v
+
+
+def act_hist_push(mut hist: List[Float64], ref a: List[Float64]):
+    """Shift the history by one action and put `a` (the six words AS
+    EXECUTED, clipped to [-1, 1]) in slot 0. `hist` holds HIST_WORDS words,
+    zero at an episode's start."""
+    for k in range(HIST_WORDS - 1, ACT - 1, -1):
+        hist[k] = hist[k - ACT]
+    comptime if ACT_HIST > 0:
+        for j in range(ACT):
+            var v = a[j]
+            hist[j] = 1.0 if v > 1.0 else (-1.0 if v < -1.0 else v)
+
+
 def joints_to_planes(ref q: List[Float64], mut x: List[Scalar[DT]]):
     """The six joints (model radians) broadcast into their planes."""
     for j in range(ACT):
@@ -304,6 +330,7 @@ def write_pixel_manifest(
     s += '  "joint_scale": ' + String(JOINT_SCALE) + ',\n'
     s += '  "proprio": "' + ("q+qd" if JOINT_VEL else "q") + '",\n'
     s += '  "joint_vel_scale": ' + String(JOINT_VEL_SCALE) + ',\n'
+    s += '  "act_hist": ' + String(ACT_HIST) + ',\n'
     s += '  "joint_units": "model radians (tower_follower joint zero)",\n'
     s += '  "delta_arm": ' + String(delta_arm) + ',\n'
     s += '  "delta_gripper": ' + String(delta_gripper) + ',\n'
@@ -381,6 +408,12 @@ def check_pixel_manifest(path: String) raises -> PixelManifest:
                     + "', this build's is '" + ("q+qd" if JOINT_VEL else "q")
                     + "'" + (" (build with -D DAGGER_JOINT_VEL)"
                              if proprio == "q+qd" else ""))
+    var ah = doc.field(r, "act_hist")
+    var act_hist = Int(doc.number(ah)) if ah >= 0 else 0
+    if act_hist != ACT_HIST:
+        raise Error("pixel student: the policy sees its last " + String(act_hist)
+                    + " actions, this build " + String(ACT_HIST)
+                    + " (build with -D TASK_PPO_ACT_HIST=" + String(act_hist) + ")")
     if abs(_num(doc, r, "joint_scale", path) - JOINT_SCALE) > 1e-9:
         raise Error("pixel student: joint_scale differs from this build's")
     var da = _num(doc, r, "delta_arm", path)

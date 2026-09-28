@@ -65,7 +65,6 @@ later addition.
 from std.math import abs, sqrt, log, cos
 from std.random import random_float64, seed as seed_rng
 from std.sys import is_defined
-from std.sys.defines import get_defined_int
 from std.time import perf_counter_ns
 
 from max.gpu.host import DeviceBuffer, DeviceContext
@@ -100,7 +99,12 @@ from noeira.tasks.posed_reset import task_meta_words
 from noeira.tasks.shaping import reward_mode_words
 from noeira.tasks.delta_action import (
     DELTA_ACT, DELTA_ARM, DELTA_GRIPPER, delta_scale, delta_target, ServoLag,
+    ACT_HIST,
 )
+# `ACT_HIST` (`-D TASK_PPO_ACT_HIST=K`): the last K executed actions after the
+# env's observation — see `delta_action.ACT_HIST`. A run trained without it is
+# widened for `--init` by `tools/tasks/pad_ppo_obs.py` (zero rows: the same
+# policy to start).
 from noeira.tasks.spec import load_family
 
 # ⚠ LANES AT BUILD TIME (Mojo has no integer define): 1024 by default,
@@ -117,16 +121,6 @@ comptime N_EPOCHS = 10
 comptime HIDDEN = 256
 comptime ACT_DIM = 6
 comptime SUCCESS_WINDOW = 1024
-comptime ACT_HIST: Int = get_defined_int["TASK_PPO_ACT_HIST", 0]()
-"""`-D TASK_PPO_ACT_HIST=K`: the policy also sees the last K EXECUTED actions
-(K x 6 words after the env's observation, the most recent first; zero at an
-episode's start). ⚠ WHY: under `--lag-*` the servos run 1-3 ticks behind the
-commands, so `q` and `qd` do not say what is already on its way — two lanes in
-the same state with different commands in flight need different actions, and
-a policy that cannot tell them apart plateaued at 30-36 % (1af8c0ed,
-51a2e3bc) where the stiff sim reached 79.5 %. The real deploy knows what it
-sent. A run trained without it is widened for `--init` by
-`tools/tasks/pad_ppo_obs.py` (zero rows: the same policy to start)."""
 comptime OBS_CLIP = 10.0
 comptime REW_CLIP = 10.0
 comptime GAMMA = 0.99

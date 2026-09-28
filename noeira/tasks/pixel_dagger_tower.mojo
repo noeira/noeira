@@ -90,7 +90,7 @@ from noeira.tasks.gpu_eval import region_table_words
 from noeira.tasks.posed_reset import task_meta_words
 from noeira.tasks.ppo_family_driver import (
     AgentT, RunningMeanStd, N_ENVS, ACT_DIM, OBS_CLIP, OBS_BOUND, GAMMA,
-    _delta_to_env, _arg, _lag_reset,
+    _delta_to_env, _arg, _lag_reset, _augment, _hist_push, _hist_clear,
 )
 from noeira.tasks.delta_action import ServoLag, DELTA_ARM, DELTA_GRIPPER
 from noeira.tasks.shaping import reward_mode_words
@@ -109,18 +109,24 @@ from noeira.tasks.pixel_student import (
     OVERHEAD_RENDER_W, OVERHEAD_RENDER_H, WINDOWED, camera_names,
     window_in_render,
     PROPRIO, JOINT_SCALE, JOINT_VEL_SCALE, student_act, write_pixel_manifest,
+    PROPRIO_STATE, HIST_WORDS,
 )
 
 comptime M = So101TowerModel
 comptime C = So101TowerConfig
 comptime EnvT = Phyics3dBatchedEnv[M, C, N_ENVS, TERMINATE_ON_UNHEALTHY=False]
 comptime OBS = EnvT.OBS_DIM
+comptime T_OBS = OBS + HIST_WORDS
+"""The teacher's observation: the env's, then (`-D TASK_PPO_ACT_HIST=K`) the
+last K executed actions — the same words the student sees as planes."""
+comptime HW1 = HIST_WORDS if HIST_WORDS > 0 else 1
 comptime NQ = M.NQ
 comptime NB = M.NBODY
 
 comptime ROW = IMG + PROPRIO
 """One replay row: the cameras' planes, then the joints (and, with
-`DAGGER_JOINT_VEL`, their velocities), RAW — scaled in the gather."""
+`DAGGER_JOINT_VEL`, their velocities; with `TASK_PPO_ACT_HIST`, the last
+executed actions), RAW — scaled in the gather."""
 comptime NV = M.NV
 comptime BATCH = 1024
 comptime ITER_STEPS = 32
@@ -199,12 +205,13 @@ def _pack_proprio_kernel[
     qvel: LayoutTensor[DT, Layout.row_major(N * NV_), MutAnyOrigin],
     qa: LayoutTensor[DT, Layout.row_major(ACT_DIM), MutAnyOrigin],
     da: LayoutTensor[DT, Layout.row_major(ACT_DIM), MutAnyOrigin],
+    hist: LayoutTensor[DT, Layout.row_major(N * HW1), MutAnyOrigin],
     ring: LayoutTensor[DT, Layout.row_major(1), MutAnyOrigin],
     base_row: Int64,
 ):
-    """The actuated joints (qpos addresses `qa`) — and with
-    `DAGGER_JOINT_VEL` their velocities (dof addresses `da`) — into the
-    rows' tail, raw."""
+    """The actuated joints (qpos addresses `qa`) — with `DAGGER_JOINT_VEL`
+    their velocities (dof addresses `da`), with `TASK_PPO_ACT_HIST` the lane's
+    action history (`hist`, [N, HIST_WORDS]) — into the rows' tail, raw."""
     var i = Int(global_idx.x)
     if i >= N * PROPRIO:
         return
@@ -213,10 +220,12 @@ def _pack_proprio_kernel[
     var v: Scalar[DT]
     if j < ACT_DIM:
         v = rebind[Scalar[DT]](qpos[lane * NQ_ + Int(rebind[Scalar[DT]](qa[j]))])
-    else:
+    elif j < PROPRIO_STATE:
         v = rebind[Scalar[DT]](
             qvel[lane * NV_ + Int(rebind[Scalar[DT]](da[j - ACT_DIM]))]
         )
+    else:
+        v = rebind[Scalar[DT]](hist[lane * HW1 + j - PROPRIO_STATE])
     ring[(Int(base_row) + lane) * ROW + IMG + j] = v
 
 
@@ -272,7 +281,9 @@ def _gather_kernel[
             x[i] = rebind[Scalar[DT]](ring[row * ROW + k])
     else:
         var j = (k - IMG) // PLANE
-        var sc = Scalar[DT](JOINT_SCALE) if j < ACT_DIM else Scalar[DT](JOINT_VEL_SCALE)
+        var sc = Scalar[DT](JOINT_SCALE) if j < ACT_DIM else (
+            Scalar[DT](JOINT_VEL_SCALE) if j < PROPRIO_STATE else Scalar[DT](1)
+        )
         x[i] = rebind[Scalar[DT]](ring[row * ROW + IMG + j]) * sc
 
 
@@ -299,6 +310,8 @@ struct PixelObs(Movable):
     var cams: List[Int]
     var qa: Tensor
     var da: Tensor
+    var hist_t: Tensor
+    """[N_ENVS, HW1]: the lanes' action histories, uploaded per `observe`."""
     var ring: Tensor
     var cap: Int
     var blank: Bool
@@ -374,6 +387,8 @@ struct PixelObs(Movable):
         for j in range(ACT_DIM):
             self.da.data[j] = Scalar[DT](a_da[j])
         self.da.upload(ctx)
+        self.hist_t = Tensor.alloc(N_ENVS * HW1)
+        self.hist_t.upload(ctx)
         # ⚠ THE RING IS INDEXED THROUGH A 32-BIT LayoutTensor OFFSET
         # (`_a_layouttensor_index_is_int32_regardless_of_your_arithmetic`).
         if cap * ROW >= (1 << 31):
@@ -388,8 +403,14 @@ struct PixelObs(Movable):
 
     def observe(
         mut self, ctx: DeviceContext, env_qpos: DeviceBuffer[DT],
-        env_qvel: DeviceBuffer[DT], base_row: Int,
+        env_qvel: DeviceBuffer[DT], base_row: Int, ref hist: List[Float64],
     ) raises:
+        """`hist`: the lanes' action histories ([N_ENVS, HIST_WORDS], the
+        PPO driver's `_hist_push` layout; empty without TASK_PPO_ACT_HIST)."""
+        comptime if HIST_WORDS > 0:
+            for k in range(N_ENVS * HIST_WORDS):
+                self.hist_t.data[k] = Scalar[DT](hist[k])
+            self.hist_t.upload_resident(ctx)
         ctx.enqueue_copy(self.rd.qpos.dev.value(), env_qpos)
         ctx.enqueue_copy(self.rd.qvel.dev.value(), env_qvel)
         forward_kinematics["gpu", RIG_DT, TOWER_MD, N_ENVS](
@@ -443,6 +464,7 @@ struct PixelObs(Movable):
             self.rd.qvel.lt["gpu", Layout.row_major(N_ENVS * NV)](),
             self.qa.lt["gpu", Layout.row_major(ACT_DIM)](),
             self.da.lt["gpu", Layout.row_major(ACT_DIM)](),
+            self.hist_t.lt["gpu", Layout.row_major(N_ENVS * HW1)](),
             self.ring.lt["gpu", Layout.row_major(1)](),
             Int64(base_row),
             grid_dim=n_q,
@@ -610,7 +632,8 @@ def run_pixel_dagger(args: List[String], driver: String) raises:
     logger.set_config("lr", String(lr))
     logger.set_config("replay", String(cap))
     logger.set_config("blank_images", String(blank))
-    logger.set_config("proprio", String("q+qd" if PROPRIO > ACT else "q"))
+    logger.set_config("proprio", String("q+qd" if PROPRIO_STATE > ACT else "q"))
+    logger.set_config("act_hist", String(HIST_WORDS // ACT_DIM))
     logger.set_config("window", String("workspace" if WINDOWED else "centre-square"))
     logger.set_config("dr", dr_name)
     logger.set_config("dr_every", String(dr_every))
@@ -626,7 +649,7 @@ def run_pixel_dagger(args: List[String], driver: String) raises:
 
     with DeviceContext() as ctx:
         # ── the teacher: the PPO actor, frozen, and its obs statistics ───
-        var teacher = AgentT[OBS](
+        var teacher = AgentT[T_OBS](
             ctx=ctx, actor_lr=Scalar[DT](0.0), critic_lr=Scalar[DT](0.0),
             gamma=Scalar[DT](GAMMA), gae_lambda=Scalar[DT](0.95),
             clip_eps=Scalar[DT](0.2), entropy_coef=Scalar[DT](0.0),
@@ -649,7 +672,7 @@ def run_pixel_dagger(args: List[String], driver: String) raises:
         except e:
             if String(e).find("pixel dagger:") >= 0:
                 raise e^
-        var obs_rms = RunningMeanStd(OBS)
+        var obs_rms = RunningMeanStd(T_OBS)
         obs_rms.load(teacher_dir + "/obs_norm.txt")
 
         # ── the student ──────────────────────────────────────────────────
@@ -699,7 +722,11 @@ def run_pixel_dagger(args: List[String], driver: String) raises:
 
         # ── buffers ──────────────────────────────────────────────────────
         var raw_h = ctx.enqueue_create_host_buffer[DT](N_ENVS * OBS)
-        var cur_n = ctx.enqueue_create_host_buffer[DT](N_ENVS * OBS)
+        var cur_n = ctx.enqueue_create_host_buffer[DT](N_ENVS * T_OBS)
+        var aug_o = List[Scalar[DT]](length=N_ENVS * T_OBS, fill=Scalar[DT](0))
+        # the lanes' executed actions, most recent first (zero at a reset) —
+        # the teacher's extra words and the student's extra planes
+        var hist = List[Float64](length=N_ENVS * HIST_WORDS, fill=0.0)
         var act_t = ctx.enqueue_create_host_buffer[DT](N_ENVS * ACT_DIM)
         var env_act = ctx.enqueue_create_host_buffer[DT](N_ENVS * ACT_DIM)
         var done_h = ctx.enqueue_create_host_buffer[DT](N_ENVS)
@@ -763,7 +790,7 @@ def run_pixel_dagger(args: List[String], driver: String) raises:
         ctx.enqueue_copy(raw_h, obs_dev)
         ctx.synchronize()
         if png_dir.byte_length() > 0:
-            _dump_obs_png(ctx, px, png_dir, qpos_dev, qvel_dev)
+            _dump_obs_png(ctx, px, png_dir, qpos_dev, qvel_dev, hist)
 
         while step < total_steps:
             var beta = 1.0 - Float64(step) / Float64(max(beta_steps, 1))
@@ -775,7 +802,7 @@ def run_pixel_dagger(args: List[String], driver: String) raises:
             if px.dr_on and it % dr_every == 0:
                 px.redraw(ctx, dr_draw)
                 dr_draw += 1
-            px.observe(ctx, qpos_dev, qvel_dev, base)
+            px.observe(ctx, qpos_dev, qvel_dev, base, hist)
             # 3. the teacher, on the state
             var rp = mptr(raw_h.unsafe_ptr())
             for e in range(N_ENVS):
@@ -786,8 +813,10 @@ def run_pixel_dagger(args: List[String], driver: String) raises:
                 if lag_pending[e]:
                     _lag_reset(lag, arm_q, e)
                     lag_pending[e] = False
+            _augment[OBS](rp, hist, mptr(aug_o.unsafe_ptr()))
             obs_rms.normalize_into(
-                rp, mptr(cur_n.unsafe_ptr()), N_ENVS, OBS, OBS_CLIP
+                mptr(aug_o.unsafe_ptr()), mptr(cur_n.unsafe_ptr()), N_ENVS,
+                T_OBS, OBS_CLIP,
             )
             teacher.trainer.select_greedy_action_batched(
                 mptr(cur_n.unsafe_ptr()), mptr(act_t.unsafe_ptr())
@@ -820,6 +849,7 @@ def run_pixel_dagger(args: List[String], driver: String) raises:
                             at[unsafe_offset = e * ACT_DIM + j] = student_act(
                                 y_act.data[e * ACT_DIM + j], j, grip_sign
                             )
+            _hist_push(hist, mptr(act_t.unsafe_ptr()))
             _delta_to_env(
                 mptr(act_t.unsafe_ptr()), mptr(env_act.unsafe_ptr()),
                 arm_q, a_lo, a_hi, lag, d_arm, d_grip,
@@ -851,6 +881,7 @@ def run_pixel_dagger(args: List[String], driver: String) raises:
                     succ[e] = False
                     stud_lane[e] = random_float64() >= beta
                     lag_pending[e] = True
+                    _hist_clear(hist, e)
             if forced:
                 ctx.enqueue_copy(done_dev, done_h)
             env.selective_reset_batch[N_ENVS](
@@ -961,10 +992,12 @@ def run_pixel_dagger(args: List[String], driver: String) raises:
             var hv_t = List[Float64](length=ACT_DIM, fill=0.0)
             var hv_s = List[Float64](length=ACT_DIM, fill=0.0)
             var hv_d = List[Float64](length=ACT_DIM, fill=0.0)
+            for e in range(N_ENVS):
+                _hist_clear(hist, e)
             for t in range(C.MAX_STEPS - 1):
                 if px.dr_on and eval_dr and t % dr_every == 0:
                     px.redraw(ctx, 5_000_000 + rnd * 1000 + t)  # held-out draws
-                px.observe(ctx, qpos_dev, qvel_dev, 0)
+                px.observe(ctx, qpos_dev, qvel_dev, 0, hist)
                 var rq = mptr(raw_h.unsafe_ptr())
                 for e in range(N_ENVS):
                     for j in range(ACT_DIM):
@@ -976,15 +1009,19 @@ def run_pixel_dagger(args: List[String], driver: String) raises:
                 if eval_teacher:
                     # the TEACHER through the same loop — the reference the
                     # student's stages are read against
+                    _augment[OBS](rq, hist, mptr(aug_o.unsafe_ptr()))
                     obs_rms.normalize_into(
-                        rq, mptr(cur_n.unsafe_ptr()), N_ENVS, OBS, OBS_CLIP
+                        mptr(aug_o.unsafe_ptr()), mptr(cur_n.unsafe_ptr()),
+                        N_ENVS, T_OBS, OBS_CLIP,
                     )
                     teacher.trainer.select_greedy_action_batched(
                         mptr(cur_n.unsafe_ptr()), mptr(act_t.unsafe_ptr())
                     )
                 else:
+                    _augment[OBS](rq, hist, mptr(aug_o.unsafe_ptr()))
                     obs_rms.normalize_into(
-                        rq, mptr(cur_n.unsafe_ptr()), N_ENVS, OBS, OBS_CLIP
+                        mptr(aug_o.unsafe_ptr()), mptr(cur_n.unsafe_ptr()),
+                        N_ENVS, T_OBS, OBS_CLIP,
                     )
                     teacher.trainer.select_greedy_action_batched(
                         mptr(cur_n.unsafe_ptr()), mptr(lab.unsafe_ptr())
@@ -1004,6 +1041,7 @@ def run_pixel_dagger(args: List[String], driver: String) raises:
                 if t == 0:
                     for e in range(N_ENVS):
                         _lag_reset(lag, arm_q, e)
+                _hist_push(hist, mptr(act_t.unsafe_ptr()))
                 _delta_to_env(
                     mptr(act_t.unsafe_ptr()), mptr(env_act.unsafe_ptr()),
                     arm_q, a_lo, a_hi, lag, d_arm, d_grip,
@@ -1139,6 +1177,7 @@ def run_pixel_dagger(args: List[String], driver: String) raises:
 def _dump_obs_png(
     ctx: DeviceContext, mut px: PixelObs, dir: String,
     qpos_dev: DeviceBuffer[DT], qvel_dev: DeviceBuffer[DT],
+    ref hist: List[Float64],
 ) raises:
     """Lanes 0-1's first observation, each camera upscaled, as PNGs — to SEE
     what the student sees (a transposed or blank plane trains silently). With
@@ -1152,7 +1191,7 @@ def _dump_obs_png(
                 px.restore(ctx)
             else:
                 px.redraw(ctx, 900_000 + d)
-        px.observe(ctx, qpos_dev, qvel_dev, 0)
+        px.observe(ctx, qpos_dev, qvel_dev, 0, hist)
         var h = ctx.enqueue_create_host_buffer[DT](2 * ROW)
         ctx.enqueue_copy(h, px.ring.dev.value().create_sub_buffer[DT](0, 2 * ROW))
         ctx.synchronize()

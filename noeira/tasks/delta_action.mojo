@@ -19,10 +19,21 @@ policy looking merely clumsy (`_a_rule_written_inline_twice_drifts`).
 """
 
 from std.math import exp
+from std.sys.defines import get_defined_int
 
 comptime DELTA_ARM: Float64 = 0.05
 comptime DELTA_GRIPPER: Float64 = 0.2
 comptime DELTA_ACT: Int = 6
+comptime ACT_HIST: Int = get_defined_int["TASK_PPO_ACT_HIST", 0]()
+"""`-D TASK_PPO_ACT_HIST=K`: a policy also sees the last K EXECUTED actions
+(K x 6 words, the most recent first, clipped to [-1, 1], zero at an episode's
+start) — the PPO teacher after the env's observation, the pixel student as
+K x 6 more planes. ⚠ WHY: under `ServoLag` the servos run 1-3 ticks behind
+the commands, so `q` and `qd` do not say what is already on its way — two
+states alike in `q` / `qd` with different commands in flight need different
+actions, and the lagged teachers without it plateaued at 30-36 % greedy
+(1af8c0ed, 51a2e3bc) where the stiff sim reached 79.5 %. The real deploy
+knows what it sent. A BUILD CHOICE the checkpoints depend on."""
 """Five body joints then the gripper."""
 
 

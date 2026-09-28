@@ -102,7 +102,8 @@ from noeira.tasks.family_config import So101TowerConfig
 from noeira.tasks.pixel_student import (
     StudentNet, N_CAMS, OBS_PX, PLANE, IN_DIM, ACT, CAM_FOVY_DEG, JOINT_VEL,
     camera_names, check_pixel_manifest, frame_to_planes, joints_to_planes,
-    joint_vels_to_planes, student_act,
+    joint_vels_to_planes, student_act, HIST_WORDS, act_hist_push,
+    act_hist_to_planes,
 )
 from noeira.tasks.placement.so101_tower import So101TowerPlacement
 from noeira.tasks.posed_reset import posed_qpos
@@ -439,6 +440,9 @@ def main() raises:
     joints_to_planes(q, xs)
     var qd = List[Float64](length=SO101_N, fill=0.0)
     joint_vels_to_planes(qd, xs)
+    # the last executed actions (TASK_PPO_ACT_HIST builds): none yet
+    var hist = List[Float64](length=HIST_WORDS, fill=0.0)
+    act_hist_to_planes(hist, xs)
     for k in range(IN_DIM):
         x.data[k] = xs[k]
     net.forward["cpu", 1](TensorRefs[1](x), y, None)
@@ -623,6 +627,7 @@ def main() raises:
             t_prev = t_now
             joints_to_planes(q, xs)
             joint_vels_to_planes(qd, xs)
+            act_hist_to_planes(hist, xs)
             if snap_dir.byte_length() > 0 and ticks == 62:
                 _snap(snap_dir, frames, xs, q, String("_t2s"))
             for k in range(IN_DIM):
@@ -634,8 +639,10 @@ def main() raises:
             var line2 = String("")
             var ra = String("")
             var rt = String("")
+            var a_ex = List[Float64](length=ACT, fill=0.0)
             for j in range(ACT):
                 var a = Float64(student_act(y.data[j], j, grip_sign))
+                a_ex[j] = a
                 var tgt = delta_target(q[j], a, j, lo[j], hi[j], man.delta_arm, man.delta_gripper)
                 if tgt <= lo[j] or tgt >= hi[j]:
                     clamped += 1
@@ -654,6 +661,9 @@ def main() raises:
                     _snap(rec_dir, frames, xs, q, String("_") + String(ticks))
             if arm_it:
                 arm.write_goals(Span(goals))
+            # ⚠ what was SENT, as the trainer records it (the dry run too: its
+            # policy then sees the commands it would have made)
+            act_hist_push(hist, a_ex)
             if ticks % 15 == 0:
                 print("  t=" + pad_left(fixed(Float64(perf_counter_ns() - loop_t0) / 1e9, 1), 5)
                       + "s  a:" + line2)

@@ -44,6 +44,7 @@ from noeira.tasks.pixel_student import (
     StudentNet, N_CAMS, IN_DIM, ACT, RENDER, OVERHEAD_RENDER_W,
     OVERHEAD_RENDER_H, OBS_PX, JOINT_VEL, WINDOWED, check_pixel_manifest,
     render_to_planes, joints_to_planes, joint_vels_to_planes, student_act,
+    HIST_WORDS, act_hist_push, act_hist_to_planes,
 )
 from noeira.tasks.placement.so101_tower import So101TowerPlacement
 from noeira.tasks.posed_reset import posed_qpos
@@ -183,6 +184,7 @@ def main() raises:
         for j in range(ACT):
             q_start[j] = Float64(env.d.qpos.data[qa[j]])
         lag.reset_lane(0, q_start, 0, 0.5, 0.5)
+        var hist = List[Float64](length=HIST_WORDS, fill=0.0)
         for t in range(So101TowerConfig.MAX_STEPS):
             for k in range(NQ):
                 rd.qpos.data[k] = Scalar[RIG_DT](env.d.qpos.data[k])
@@ -227,6 +229,7 @@ def main() raises:
                     print(ld_)
             joints_to_planes(q, xs)
             joint_vels_to_planes(qd, xs)
+            act_hist_to_planes(hist, xs)
             for k in range(IN_DIM):
                 x.data[k] = xs[k]
             net.forward["cpu", 1](TensorRefs[1](x), y, None)
@@ -234,8 +237,10 @@ def main() raises:
             var line = String("")
             var ra = String("")
             var rt = String("")
+            var a_ex = List[Float64](length=ACT, fill=0.0)
             for j in range(ACT):
                 var a = Float64(student_act(y.data[j], j, man.gripper_sign))
+                a_ex[j] = a
                 var tgt = delta_target(q[j], a, j, lo[j], hi[j], man.delta_arm, man.delta_gripper)
                 tgt = lag.apply(0, j, tgt)
                 ra += "," + String(a)
@@ -256,6 +261,7 @@ def main() raises:
             if t % 15 == 0:
                 print("  t=" + pad_left(fixed(Float64(t) * man.control_period_s, 1), 5)
                       + "s  a:" + line)
+            act_hist_push(hist, a_ex)
             lag.advance()
             var res = env.step(act)
             obs = res[0].copy()
