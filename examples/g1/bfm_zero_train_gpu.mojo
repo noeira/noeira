@@ -182,22 +182,28 @@ comptime BATCH: Int = 1024
 # transition rather than 5360. At CAP 2 M that frees 3.92 GiB, which is what
 # pays for the CAP raise below.
 #
-# ⚠ MEASURE VRAM BEFORE RAISING CAP (docs §12.41). The tower is the
-# reference's own 2048/6 and `CAP` is deliberately left at 2 M so the first
-# thing the box does is a 40-step SMOKE whose only job is to report the real
-# peak. A 40-step smoke allocates the whole ring at `make` and captures the
-# graph, so it reaches peak in ~20 s — the cheapest possible measurement.
+# ⚠ CAP IS 1 M BECAUSE THE CARD SAYS SO (docs §12.42, MEASURED).
 #
-# The PREDICTION, from the measured 1024/3 + 928-obs + CAP 2 M = 16.8 GB
-# (ring 6.52 -> non-ring 10.3) plus §12.21's model+Adam+activation delta of
-# +4.2 GB: non-ring ~14.5, ring 6.52, total ~21.0 GB of 31.8. CAP 3 M would be
-# ~24.3 and CAP 4 M ~27.5.
+# The 2048/6 smoke peaked at 31 436 MiB of 32 607 — 30.70 GiB of 31.84, with
+# 1.14 GiB free. Non-ring at this tower is 24.63 GiB MEASURED, against the
+# 15.3 predicted from §12.21's table plus the 1024/3 anchor: that table was
+# built at OBS 527 and does not carry the CPR critic, and the 928-wide inputs
+# widen every embedding. The prediction was wrong by 9.7 GiB — the sixth VRAM
+# estimate in this track and the fifth to miss.
 #
-# ⚠ Four of the five VRAM predictions in this track were WRONG (18.3 / 23.3 /
-# 26 GiB against a 25.9 GiB measurement), and the one that was not was
-# PESSIMISTIC by 2.0 GB. So: read the smoke, then set CAP. Do not set CAP from
-# the numbers above.
-comptime CAP: Int = 2_000_000
+#     CAP 2.00 M  ring 6.07 GiB  total 30.70  free 1.14   <- OOM band
+#     CAP 1.50 M  ring 4.55 GiB  total 29.18  free 2.66
+#     CAP 1.00 M  ring 3.04 GiB  total 27.66  free 4.18   <- here
+#
+# §12.22 OOM'd this card at ~29 GiB, so 1.5 M is not a margin. 1 M leaves
+# 4.18 GiB.
+#
+# ⚠⚠ THIS CONFOUNDS THE NEXT COMPARISON. `g3_hist` was 1024/3 at CAP 2 M; this
+# is 2048/6 at CAP 1 M — two axes. A WIN is still unambiguous (better with half
+# the buffer). A LOSS is not, and needs 1024/3 + CAP 1 M as the control before
+# anything is concluded. That control is also the CAP probe §12.23 has been
+# asking for since the ring rewrite and which has never been run.
+comptime CAP: Int = 1_000_000
 comptime SEQ: Int = 8
 comptime ZBUF: Int = 8192
 comptime T_EPISODE: Int = 500
