@@ -65,6 +65,7 @@ later addition.
 from std.math import abs, sqrt, log, cos
 from std.random import random_float64, seed as seed_rng
 from std.sys import is_defined
+from std.sys.defines import get_defined_int
 from std.time import perf_counter_ns
 
 from max.gpu.host import DeviceBuffer, DeviceContext
@@ -116,6 +117,16 @@ comptime N_EPOCHS = 10
 comptime HIDDEN = 256
 comptime ACT_DIM = 6
 comptime SUCCESS_WINDOW = 1024
+comptime ACT_HIST: Int = get_defined_int["TASK_PPO_ACT_HIST", 0]()
+"""`-D TASK_PPO_ACT_HIST=K`: the policy also sees the last K EXECUTED actions
+(K x 6 words after the env's observation, the most recent first; zero at an
+episode's start). ⚠ WHY: under `--lag-*` the servos run 1-3 ticks behind the
+commands, so `q` and `qd` do not say what is already on its way — two lanes in
+the same state with different commands in flight need different actions, and
+a policy that cannot tell them apart plateaued at 30-36 % (1af8c0ed,
+51a2e3bc) where the stiff sim reached 79.5 %. The real deploy knows what it
+sent. A run trained without it is widened for `--init` by
+`tools/tasks/pad_ppo_obs.py` (zero rows: the same policy to start)."""
 comptime OBS_CLIP = 10.0
 comptime REW_CLIP = 10.0
 comptime GAMMA = 0.99
@@ -270,6 +281,42 @@ def _lag_reset(
     lag.reset_lane(lane, arm_q, lane * ACT_DIM, random_float64(), random_float64())
 
 
+def _hist_push(
+    mut hist: List[Float64], ap: Pointer[Scalar[DT], MutAnyOrigin],
+):
+    """Shift every lane's action history by one and put the EXECUTED action
+    (clipped to [-1, 1], as `delta_target` reads it) in slot 0."""
+    comptime if ACT_HIST > 0:
+        comptime W = ACT_HIST * ACT_DIM
+        for e in range(N_ENVS):
+            for k in range(W - 1, ACT_DIM - 1, -1):
+                hist[e * W + k] = hist[e * W + k - ACT_DIM]
+            for j in range(ACT_DIM):
+                var v = Float64(ap[unsafe_offset = e * ACT_DIM + j])
+                hist[e * W + j] = 1.0 if v > 1.0 else (-1.0 if v < -1.0 else v)
+
+
+def _hist_clear(mut hist: List[Float64], lane: Int):
+    comptime W = ACT_HIST * ACT_DIM
+    for k in range(W):
+        hist[lane * W + k] = 0.0
+
+
+def _augment[E_OBS: Int](
+    raw: Pointer[Scalar[DT], MutAnyOrigin],
+    ref hist: List[Float64],
+    aug: Pointer[Scalar[DT], MutAnyOrigin],
+):
+    """The policy's observation: each lane's env row, then its history."""
+    comptime W = ACT_HIST * ACT_DIM
+    comptime A = E_OBS + W
+    for e in range(N_ENVS):
+        for k in range(E_OBS):
+            aug[unsafe_offset = e * A + k] = raw[unsafe_offset = e * E_OBS + k]
+        for k in range(W):
+            aug[unsafe_offset = e * A + E_OBS + k] = Scalar[DT](hist[e * W + k])
+
+
 def _bc_pretrain[OBS: Int](
     mut agent: AgentT[OBS],
     ctx: DeviceContext,
@@ -420,7 +467,9 @@ def run_ppo[M: ModelDefLike, C: Phyics3dEnvConfig](
     goal_margin: Float64,
     reach_margin: Float64,
 ) raises:
-    comptime OBS = OBS_DIM[M, C]
+    comptime E_OBS = OBS_DIM[M, C]
+    """The env's observation words; the policy's `OBS` adds the history."""
+    comptime OBS = E_OBS + ACT_HIST * ACT_DIM
     comptime assert N_ENVS * ROLLOUT % N_MINIBATCHES == 0
     comptime assert ACT_DIM == DELTA_ACT, "the delta action is six words"
 
@@ -457,6 +506,10 @@ def run_ppo[M: ModelDefLike, C: Phyics3dEnvConfig](
     var d_grip = Float64(_arg(args, "--delta-gripper", String(DELTA_GRIPPER)))
     if action_mode != "absolute" and action_mode != "delta":
         raise Error("ppo task: --action absolute|delta, got " + action_mode)
+    if ACT_HIST > 0 and bc_demos.byte_length() > 0:
+        raise Error("ppo task: --bc-demos has no action history; not with TASK_PPO_ACT_HIST")
+    if ACT_HIST > 0 and action_mode != "delta":
+        raise Error("ppo task: TASK_PPO_ACT_HIST is for --action delta")
     if reward != "potential" and reward != "legacy":
         raise Error("ppo task: --reward potential|legacy, got " + reward)
     var rw = reward_mode_words(reward == "potential", bonus)
@@ -467,7 +520,8 @@ def run_ppo[M: ModelDefLike, C: Phyics3dEnvConfig](
     print("PPO on", family, "—", task)
     print("  lanes", N_ENVS, "| rollout", ROLLOUT, "| batch", N_ENVS * ROLLOUT,
           "| minibatch", MINIBATCH, "x", N_MINIBATCHES, "| epochs", N_EPOCHS)
-    print("  obs", OBS, "| act", ACT_DIM, "| hidden", HIDDEN, "| horizon",
+    print("  obs", OBS, "(env", E_OBS, "+ last", ACT_HIST, "actions) | act",
+          ACT_DIM, "| hidden", HIDDEN, "| horizon",
           C.MAX_STEPS)
     print("  steps", total_steps, "| lr", lr0, "| ent", ent0, "->", ent1,
           "over", anneal_steps, "steps | log_std init", log_std0)
@@ -534,6 +588,7 @@ def run_ppo[M: ModelDefLike, C: Phyics3dEnvConfig](
     logger.set_config("lag_delay_ticks", lag_delay)
     logger.set_config("delta_arm", String(d_arm))
     logger.set_config("delta_gripper", String(d_grip))
+    logger.set_config("act_hist", String(ACT_HIST))
     logger.set_config("horizon", String(C.MAX_STEPS))
     logger.set_config("obs_norm", "running, clip 10")
     logger.set_config("reward_norm", "discounted-return std, clip 10")
@@ -591,7 +646,9 @@ def run_ppo[M: ModelDefLike, C: Phyics3dEnvConfig](
         ctx.synchronize()
 
         # ── host scratch ─────────────────────────────────────────────────
-        var raw_h = ctx.enqueue_create_host_buffer[DT](N_ENVS * OBS)
+        var raw_h = ctx.enqueue_create_host_buffer[DT](N_ENVS * E_OBS)
+        var aug = List[Scalar[DT]](length=N_ENVS * OBS, fill=Scalar[DT](0))
+        var hist = List[Float64](length=N_ENVS * ACT_HIST * ACT_DIM, fill=0.0)
         var cur_n = ctx.enqueue_create_host_buffer[DT](N_ENVS * OBS)
         var next_n = ctx.enqueue_create_host_buffer[DT](N_ENVS * OBS)
         var act_h = ctx.enqueue_create_host_buffer[DT](N_ENVS * ACT_DIM)
@@ -608,7 +665,7 @@ def run_ppo[M: ModelDefLike, C: Phyics3dEnvConfig](
             print("  servo lag: tau", lag_tau, "ms, delay", lag_delay,
                   "ticks (per episode, per lane)")
         ctx.synchronize()
-        var obs_dev = DeviceBuffer[DT](ctx, env.obs_ptr(), N_ENVS * OBS, owning=False)
+        var obs_dev = DeviceBuffer[DT](ctx, env.obs_ptr(), N_ENVS * E_OBS, owning=False)
         var act_dev = DeviceBuffer[DT](ctx, env.action_ptr(), N_ENVS * ACT_DIM, owning=False)
         var rew_dev = DeviceBuffer[DT](ctx, env.reward_ptr(), N_ENVS, owning=False)
         var done_dev = DeviceBuffer[DT](ctx, env.done_ptr(), N_ENVS, owning=False)
@@ -650,7 +707,7 @@ def run_ppo[M: ModelDefLike, C: Phyics3dEnvConfig](
         comptime NQ_M = M.NQ
         for e in range(N_ENVS):
             for j in range(ACT_DIM):
-                var a = Float64(rp[unsafe_offset = e * OBS + a_qa[j]])
+                var a = Float64(rp[unsafe_offset = e * E_OBS + a_qa[j]])
                 var b = Float64(env.d.qpos.data[e * NQ_M + a_qa[j]])
                 if abs(a - b) > 1e-5:
                     raise Error(
@@ -661,10 +718,11 @@ def run_ppo[M: ModelDefLike, C: Phyics3dEnvConfig](
                     )
         for e in range(N_ENVS):
             for j in range(ACT_DIM):
-                arm_q[e * ACT_DIM + j] = Float64(rp[unsafe_offset = e * OBS + a_qa[j]])
+                arm_q[e * ACT_DIM + j] = Float64(rp[unsafe_offset = e * E_OBS + a_qa[j]])
             _lag_reset(lag, arm_q, e)
-        obs_rms.update(rp, N_ENVS, OBS)
-        obs_rms.normalize_into(rp, mptr(cur_n.unsafe_ptr()), N_ENVS, OBS, OBS_CLIP)
+        _augment[E_OBS](rp, hist, mptr(aug.unsafe_ptr()))
+        obs_rms.update(mptr(aug.unsafe_ptr()), N_ENVS, OBS)
+        obs_rms.normalize_into(mptr(aug.unsafe_ptr()), mptr(cur_n.unsafe_ptr()), N_ENVS, OBS, OBS_CLIP)
 
         var step = 0
         var it = 0
@@ -701,6 +759,7 @@ def run_ppo[M: ModelDefLike, C: Phyics3dEnvConfig](
                 ctx.enqueue_copy(act_dev, env_act)
             else:
                 ctx.enqueue_copy(act_dev, act_h)
+            _hist_push(hist, mptr(act_h.unsafe_ptr()))
             # 2. step; the post-step obs, reward, done, meta (goal bit)
             env.step_batch[N_ENVS](ctx=ctx, rng_seed=UInt64(it + 1))
             ctx.enqueue_copy(raw_h, obs_dev)
@@ -717,8 +776,8 @@ def run_ppo[M: ModelDefLike, C: Phyics3dEnvConfig](
                 var rv = Float64(rh0[unsafe_offset=e])
                 if not (rv == rv) or abs(rv) > REW_BOUND:
                     bad = True
-                for k in range(OBS):
-                    var v = Float64(raw_p[unsafe_offset = e * OBS + k])
+                for k in range(E_OBS):
+                    var v = Float64(raw_p[unsafe_offset = e * E_OBS + k])
                     if not (v == v) or abs(v) > OBS_BOUND:
                         bad = True
                         break
@@ -728,9 +787,10 @@ def run_ppo[M: ModelDefLike, C: Phyics3dEnvConfig](
                     dh0[unsafe_offset=e] = Scalar[DT](1)
                     rh0[unsafe_offset=e] = Scalar[DT](0)
             n_diverged += n_bad
-            obs_rms.update(raw_p, N_ENVS, OBS, diverged)
+            _augment[E_OBS](raw_p, hist, mptr(aug.unsafe_ptr()))
+            obs_rms.update(mptr(aug.unsafe_ptr()), N_ENVS, OBS, diverged)
             obs_rms.normalize_into(
-                raw_p, mptr(next_n.unsafe_ptr()), N_ENVS, OBS, OBS_CLIP,
+                mptr(aug.unsafe_ptr()), mptr(next_n.unsafe_ptr()), N_ENVS, OBS, OBS_CLIP,
             )
             if n_bad > 0:
                 # the terminal obs of a diverged lane is garbage: zero it
@@ -786,12 +846,14 @@ def run_ppo[M: ModelDefLike, C: Phyics3dEnvConfig](
             for e in range(N_ENVS):
                 for j in range(ACT_DIM):
                     arm_q[e * ACT_DIM + j] = Float64(
-                        rp2[unsafe_offset = e * OBS + a_qa[j]]
+                        rp2[unsafe_offset = e * E_OBS + a_qa[j]]
                     )
                 if dh2[unsafe_offset=e] > Scalar[DT](0.5):
                     _lag_reset(lag, arm_q, e)
+                    _hist_clear(hist, e)
+            _augment[E_OBS](rp2, hist, mptr(aug.unsafe_ptr()))
             obs_rms.normalize_into(
-                rp2, mptr(cur_n.unsafe_ptr()), N_ENVS, OBS, OBS_CLIP,
+                mptr(aug.unsafe_ptr()), mptr(cur_n.unsafe_ptr()), N_ENVS, OBS, OBS_CLIP,
             )
             step += N_ENVS
             it += 1
@@ -880,12 +942,14 @@ def run_ppo[M: ModelDefLike, C: Phyics3dEnvConfig](
                 for e in range(N_ENVS):
                     for j in range(ACT_DIM):
                         arm_q[e * ACT_DIM + j] = Float64(
-                            rq[unsafe_offset = e * OBS + a_qa[j]]
+                            rq[unsafe_offset = e * E_OBS + a_qa[j]]
                         )
                     if t == 0:
                         _lag_reset(lag, arm_q, e)
+                        _hist_clear(hist, e)
+                _augment[E_OBS](rq, hist, mptr(aug.unsafe_ptr()))
                 obs_rms.normalize_into(
-                    rq, mptr(cur_n.unsafe_ptr()), N_ENVS, OBS, OBS_CLIP
+                    mptr(aug.unsafe_ptr()), mptr(cur_n.unsafe_ptr()), N_ENVS, OBS, OBS_CLIP
                 )
                 agent.trainer.select_greedy_action_batched(
                     mptr(cur_n.unsafe_ptr()), mptr(act_h.unsafe_ptr())
@@ -898,6 +962,7 @@ def run_ppo[M: ModelDefLike, C: Phyics3dEnvConfig](
                     ctx.enqueue_copy(act_dev, env_act)
                 else:
                     ctx.enqueue_copy(act_dev, act_h)
+                _hist_push(hist, mptr(act_h.unsafe_ptr()))
                 env.step_batch[N_ENVS](ctx=ctx, rng_seed=UInt64(t + 1))
                 ctx.enqueue_copy(raw_h, obs_dev)
                 env.d.meta.download(ctx)
