@@ -137,6 +137,10 @@ struct RefDump(Movable & Deinitable):
         return out^
 
 
+comptime ACT_CONTENT_QUERY_PARAM: StaticString = "tgt0.queries"
+"""The decoder's content queries: learned here, zeros in the reference."""
+
+
 struct LoadRefParams[PREFIX: StaticString](ParamVisitor, ParamVisitorRT):
     """`ParamVisitor` filling each param from `<PREFIX><dotted name>`.
 
@@ -173,6 +177,20 @@ struct LoadRefParams[PREFIX: StaticString](ParamVisitor, ParamVisitorRT):
     ) raises:
         var key = String(Self.PREFIX) + name
         if not self.dump.has(key):
+            # ⚠ THE ONE PARAM WITH NO REFERENCE COUNTERPART, FILLED WITH THE
+            # REFERENCE'S OWN VALUE. The decoder's target tokens are learned
+            # content queries here (`loss_graph.mojo`, `tgt0`, 2026-09-21: the
+            # reference's zeros made every fit predict one action for all 40
+            # chunk positions). The reference's `tgt = torch.zeros_like(
+            # query_embed)` (`transformer.py:72`) IS a content embedding of
+            # zeros, so filling this param with zeros runs the reference's
+            # decoder exactly, and every parity gate keeps its meaning. Any
+            # OTHER absent name is still reported as missing.
+            if name == ACT_CONTENT_QUERY_PARAM:
+                var zeros = List[Scalar[DT]](length=n, fill=Scalar[DT](0))
+                _fill(param, zeros, ctx)
+                self.loaded.append(key^)
+                return
             self.missing.append(key^)
             return
         var vals = self.dump.get(key)

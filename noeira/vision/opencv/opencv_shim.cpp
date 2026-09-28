@@ -35,6 +35,7 @@
 #include <opencv2/objdetect/charuco_detector.hpp>
 #include <opencv2/calib.hpp>
 #include <opencv2/geometry/3d.hpp>
+#include <opencv2/imgproc.hpp>
 
 #include <vector>
 
@@ -853,4 +854,133 @@ int nra_cv_svd_3x3(const double* A9, double* U9, double* S3, double* Vt9) {
     })
 }
 
+// ═══════════════════════════════════════════════════════════════════════════
+// G — the fisheye (Kannala-Brandt) model: calibrate, project, undistort map
+// ═══════════════════════════════════════════════════════════════════════════
+//
+// The rig's cameras are a 170-degree module (`docs/camera-rig.md` §3): the
+// radial-tangential model `calibrateCamera` fits cannot describe it.
+// `cv::fisheye` is the equidistant model with four odd-power terms,
+//     theta_d = theta (1 + k1 theta^2 + k2 theta^4 + k3 theta^6 + k4 theta^8).
+// `noeira/vision/fisheye.mojo` carries the same model in Mojo for the runtime
+// (import and deploy); these three entry points are its CALIBRATION and its
+// test ORACLES, not its implementation.
+
+// Intrinsics from several views, fisheye model.  Same concatenated layout as
+// `nra_cv_calibrate_camera`.  `D_out` gets 4 terms.  `K_out` / `D_out` are
+// IN-OUT: read as the initial guess under CALIB_USE_INTRINSIC_GUESS.  `rvecs_out` / `tvecs_out`
+// (3 per view) may be NULL.
+//
+// ⚠ `flags` IS PASSED THROUGH.  The tool uses RECOMPUTE_EXTRINSIC | FIX_SKEW;
+// CHECK_COND rejects the whole fit on one ill-conditioned view instead of
+// saying which, so it is left to the caller.
+int nra_cv_fisheye_calibrate(const double* obj_xyz, const double* img_xy,
+                             const int* counts, int n_views,
+                             int img_w, int img_h, int flags,
+                             double* K_out, double* D_out, double* rms_out,
+                             double* rvecs_out, double* tvecs_out) {
+    if (obj_xyz == nullptr || img_xy == nullptr || counts == nullptr ||
+        K_out == nullptr || D_out == nullptr || rms_out == nullptr ||
+        n_views < 1) return NRA_CV_ERR_ARG;
+    NRA_CV_TRY({
+        std::vector<std::vector<cv::Point3d> > obj;
+        std::vector<std::vector<cv::Point2d> > img;
+        int off = 0;
+        for (int v = 0; v < n_views; ++v) {
+            const int n = counts[v];
+            if (n < 4) {
+                nra_cv_set_error("fisheye_calibrate: a view has < 4 points");
+                return NRA_CV_ERR_ARG;
+            }
+            std::vector<cv::Point3d> o;
+            std::vector<cv::Point2d> p;
+            for (int i = 0; i < n; ++i) {
+                o.push_back(cv::Point3d(obj_xyz[(off + i) * 3 + 0],
+                                        obj_xyz[(off + i) * 3 + 1],
+                                        obj_xyz[(off + i) * 3 + 2]));
+                p.push_back(cv::Point2d(img_xy[(off + i) * 2 + 0],
+                                        img_xy[(off + i) * 2 + 1]));
+            }
+            obj.push_back(o);
+            img.push_back(p);
+            off += n;
+        }
+        // `K_out` / `D_out` are read first: with CALIB_USE_INTRINSIC_GUESS
+        // they are the starting point (the caller zeroes them otherwise).
+        cv::Matx33d K(K_out);
+        cv::Vec4d D(D_out[0], D_out[1], D_out[2], D_out[3]);
+        std::vector<cv::Vec3d> rvecs;
+        std::vector<cv::Vec3d> tvecs;
+        const double rms = cv::fisheye::calibrate(
+            obj, img, cv::Size(img_w, img_h), K, D, rvecs, tvecs, flags,
+            cv::TermCriteria(cv::TermCriteria::COUNT + cv::TermCriteria::EPS,
+                             200, 1e-12));
+        for (int i = 0; i < 9; ++i) K_out[i] = K(i / 3, i % 3);
+        for (int i = 0; i < 4; ++i) D_out[i] = D[i];
+        *rms_out = rms;
+        for (int v = 0; v < n_views; ++v) {
+            for (int c = 0; c < 3; ++c) {
+                if (rvecs_out != nullptr) rvecs_out[v * 3 + c] = rvecs[v][c];
+                if (tvecs_out != nullptr) tvecs_out[v * 3 + c] = tvecs[v][c];
+            }
+        }
+        return NRA_CV_OK;
+    })
+}
+
+// Project `n` object points under (rvec, tvec) through the fisheye model.
+int nra_cv_fisheye_project(const double* obj_xyz, int n, const double* rvec3,
+                           const double* tvec3, const double* K9,
+                           const double* D4, double* img_xy_out) {
+    if (obj_xyz == nullptr || rvec3 == nullptr || tvec3 == nullptr ||
+        K9 == nullptr || D4 == nullptr || img_xy_out == nullptr || n < 1)
+        return NRA_CV_ERR_ARG;
+    NRA_CV_TRY({
+        std::vector<cv::Point3d> o;
+        for (int i = 0; i < n; ++i)
+            o.push_back(cv::Point3d(obj_xyz[i * 3], obj_xyz[i * 3 + 1],
+                                    obj_xyz[i * 3 + 2]));
+        std::vector<cv::Point2d> p;
+        const cv::Vec3d r(rvec3[0], rvec3[1], rvec3[2]);
+        const cv::Vec3d t(tvec3[0], tvec3[1], tvec3[2]);
+        const cv::Matx33d K(K9);
+        const cv::Vec4d D(D4[0], D4[1], D4[2], D4[3]);
+        cv::fisheye::projectPoints(o, p, r, t, K, D);
+        for (int i = 0; i < n; ++i) {
+            img_xy_out[i * 2] = p[i].x;
+            img_xy_out[i * 2 + 1] = p[i].y;
+        }
+        return NRA_CV_OK;
+    })
+}
+
+// `cv::fisheye::initUndistortRectifyMap` with R = I and P = `Knew9`: for each
+// OUTPUT pixel of an `out_w` x `out_h` pinhole image, the SOURCE pixel in the
+// fisheye frame.  Float maps, `out_w * out_h` each.
+int nra_cv_fisheye_undistort_map(const double* K9, const double* D4,
+                                 const double* Knew9, int out_w, int out_h,
+                                 float* map_x, float* map_y) {
+    if (K9 == nullptr || D4 == nullptr || Knew9 == nullptr ||
+        map_x == nullptr || map_y == nullptr || out_w < 1 || out_h < 1)
+        return NRA_CV_ERR_ARG;
+    NRA_CV_TRY({
+        const cv::Matx33d K(K9);
+        const cv::Matx33d Kn(Knew9);
+        const cv::Vec4d D(D4[0], D4[1], D4[2], D4[3]);
+        cv::Mat mx;
+        cv::Mat my;
+        cv::fisheye::initUndistortRectifyMap(K, D, cv::Matx33d::eye(), Kn,
+                                             cv::Size(out_w, out_h), CV_32FC1,
+                                             mx, my);
+        for (int y = 0; y < out_h; ++y) {
+            for (int x = 0; x < out_w; ++x) {
+                map_x[y * out_w + x] = mx.at<float>(y, x);
+                map_y[y * out_w + x] = my.at<float>(y, x);
+            }
+        }
+        return NRA_CV_OK;
+    })
+}
+
 }  // extern "C"
+

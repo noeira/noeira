@@ -190,6 +190,7 @@ def _shoot[
         empty, empty, empty, empty, empty, 1,
         # `bodies` stands in for `qpos`: with 0 conditional sites it is never read.
         mats, texs, texels, lights, 1, bodies, 0, frame, 1, 1, 0, 0, bg,
+        empty, -1,
     )
     return Float64(h.rgb.x)
 

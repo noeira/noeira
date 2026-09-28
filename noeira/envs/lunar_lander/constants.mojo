@@ -10,8 +10,10 @@ struct LLConstants:
     comptime GRAVITY_X: Float64 = 0.0
     comptime GRAVITY_Y: Float64 = -10.0
     comptime DT: Float64 = 0.02  # 50 FPS
-    comptime VELOCITY_ITERATIONS: Int = 6
-    comptime POSITION_ITERATIONS: Int = 2
+    # Gymnasium: world.Step(1/FPS, 6 * 30, 2 * 30). Box2D stops the position
+    # iterations early once every contact and joint is within slop.
+    comptime VELOCITY_ITERATIONS: Int = 180
+    comptime POSITION_ITERATIONS: Int = 60
 
     # Lander geometry (matching Gymnasium)
     comptime SCALE: Float64 = 30.0
@@ -23,14 +25,20 @@ struct LLConstants:
     comptime LANDER_HALF_WIDTH: Float64 = 10.0 / Self.SCALE
 
     # Lander mass/inertia
-    comptime LANDER_MASS: Float64 = 5.0
-    comptime LANDER_INERTIA: Float64 = 2.0
-    comptime LEG_MASS: Float64 = 0.2
-    comptime LEG_INERTIA: Float64 = 0.02
+    # Box2D mass data of Gymnasium's fixtures (LANDER_POLY at density 5, the
+    # legs as 2x8 px boxes at density 1). Inertias are about the centre of
+    # mass. The lander's centroid sits 0.101 m above Box2D's body origin;
+    # here the body is its centre of mass (a known deviation).
+    comptime LANDER_MASS: Float64 = 4.816667
+    comptime LANDER_INERTIA: Float64 = 0.783881
+    comptime LEG_MASS: Float64 = 0.071111
+    comptime LEG_INERTIA: Float64 = 0.001791
 
     # Leg joint properties
-    comptime LEG_SPRING_STIFFNESS: Float64 = 400.0
-    comptime LEG_SPRING_DAMPING: Float64 = 40.0
+    # Leg joints (Gymnasium revoluteJointDef): motor at +-0.3 rad/s, max
+    # torque LEG_SPRING_TORQUE = 40, pushing each leg against its limit.
+    comptime LEG_MOTOR_SPEED: Float64 = 0.3
+    comptime LEG_MOTOR_TORQUE: Float64 = 40.0
 
     # Engine power
     comptime MAIN_ENGINE_POWER: Float64 = 13.0
@@ -57,7 +65,9 @@ struct LLConstants:
     comptime HELIPAD_X: Float64 = Self.W_UNITS / 2.0
 
     # Physics constants
-    comptime FRICTION: Float64 = 0.1
+    # Box2D mixes friction as sqrt(f_a * f_b): legs 0.2 (fixture default) on
+    # terrain 0.1. (A lander-body contact ends the episode as a crash.)
+    comptime FRICTION: Float64 = 0.14142136
     comptime RESTITUTION: Float64 = 0.0
     comptime BAUMGARTE: Float64 = 0.2
     comptime SLOP: Float64 = 0.005
@@ -112,6 +122,7 @@ struct LLConstants:
     comptime META_TOTAL_REWARD: Int = 1
     comptime META_PREV_SHAPING: Int = 2
     comptime META_DONE: Int = 3
+    comptime META_SLEEP_TIME: Int = 4  # Box2D island sleep clock (s)
 
     # Total state size per environment (from layout)
     comptime STATE_SIZE_VAL: Int = Self.LL.STATE_SIZE

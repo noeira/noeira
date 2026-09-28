@@ -3531,6 +3531,7 @@ def _detect_contacts_env[
                         fill=Scalar[DTYPE](0)
                     )
                     var wf_ok = 0
+                    var wfi = Array[Int, 6](fill=-1)
                     var result = gjk_epa_witness[DTYPE](
                         gi_type,
                         pi_x, pi_y, pi_z, qi_x, qi_y, qi_z, qi_w,
@@ -3540,7 +3541,7 @@ def _detect_contacts_env[
                         pj_x, pj_y, pj_z, qj_x, qj_y, qj_z, qj_w,
                         rj, hlj, hxj, hyj, hzj,
                         va2, mnv2,
-                        wf1, wf2, wxx, wf_ok,
+                        wf1, wf2, wxx, wf_ok, wfi,
                         ws, env,
                         ccd_tol, ccd_iter, contact_margin,
                         # Same opt-in as the SAP path — the two narrow phases
@@ -3607,7 +3608,7 @@ def _detect_contacts_env[
                             dims,
                             mesh_verts, mesh_polys, mesh_polyvert,
                             mesh_polymap, mesh_vert_polymap,
-                            wf1, wf2, wxx,
+                            wf1, wf2, wxx, wfi,
                             dist,
                             contact_margin,
                             contact_friction,

@@ -2,3 +2,7 @@
 # Its routes (wrangler.jsonc) cover `noeira.ai/` and `noeira.ai/robots.txt`
 # only for that reason: drop both when the marketing site takes the root.
 /  /docs/  302
+
+# Removed pages: old links land on the closest page instead of a 404.
+/docs/project/cloud-gpu  /docs/start/installation/  301
+/docs/project/cloud-gpu/  /docs/start/installation/  301

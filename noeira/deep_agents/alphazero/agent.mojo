@@ -11,7 +11,7 @@ matching driver. Packages the loose functions into a usable API:
                            time through `GenericCPUMCTS` (true-rules adapters).
   * `train_arena(...)`   — full-AlphaZero arena gating + telemetry (GPU).
   * `eval_vs_random` / `eval_vs_random_cpu` / `eval_mcts` — strength checks.
-  * `save` / `load`      — one-file `nn-ckpt v2` checkpoint of the net.
+  * `save` / `load`      — one-file v3 `storage-ckpt` checkpoint of the net.
 
 The net's params persist across `train` calls (training continues from the
 current weights); the optimizer + replay are session-local (recreated per
@@ -415,7 +415,7 @@ struct AlphaZeroAgent[
         ](self.ctx.value(), self.net, agent_player, seed, open_plies)
 
     def save(mut self, path: String) raises:
-        """Weights-only snapshot of the policy/value net (`nn-ckpt v2`
+        """Weights-only snapshot of the policy/value net (v3 `storage-ckpt`
         envelope, section `net`). Uses the `save`/`load` surface shared by
         every agent facade. NOTE: optimizers are session-local — rebuilt
         fresh inside each `train_*` call — so there is no persistent

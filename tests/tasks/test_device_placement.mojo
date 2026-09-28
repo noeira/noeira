@@ -44,17 +44,21 @@ body-chain walk.
 8. the refusals, on corpus tasks changed one way each
 """
 
+from std.math import cos, sin, sqrt
 from std.os import listdir
 
 from noeira.envs.robots.so_arm101_xml import SO_ARM101_NMESH_VERTS
 from noeira.tasks.spec import (
     FamilySpec, TaskSpec, JointInitSpec, load_family, load_task, parse_family,
-    parse_task, validate_task_against_family, SLOT_FREE, INIT_TARGET_SLOT,
+    parse_task, parse_init, validate_task_against_family, SLOT_FREE,
+    INIT_TARGET_SLOT,
 )
 from noeira.tasks.family import scene_path, task_path
 from noeira.tasks.family_config import (
     So101TabletopConfig, So101TabletopPlacement,
 )
+from noeira.tasks.placement.so101_tower import So101TowerPlacement
+from noeira.tasks.so101_tower_xml import SO101_TOWER_NMESH_VERTS
 from noeira.tasks.active import init_region_words
 from noeira.tasks.eval import region_sites
 from noeira.tasks.reset import (
@@ -62,7 +66,8 @@ from noeira.tasks.reset import (
     joint_init_dof_addresses,
 )
 from noeira.tasks.sampler import (
-    sample_placements, sample_joint_inits, RegionFrame, SampleReport,
+    sample_placements, sample_joint_inits, sample_base_qpos, RegionFrame,
+    SampleReport,
 )
 from noeira.tasks.placement.table import (
     PlacementTable, reset_task_slots,
@@ -136,6 +141,7 @@ from noeira.envs.libero.placement.libero_study_scene4 import (
 )
 from noeira.physics3d.gpu.constants import (
     META_IDX_NEWTON_ITER, META_SOLVER_WORDS,
+    META_IDX_REWARD_MODE, META_REWARD_WORDS,
     METADATA_SIZE, META_IDX_INIT_REGION_0, META_INIT_SLOTS, META_IDX_LS_EVAL,
     META_IDX_JINIT_0, META_JINIT_SLOTS, META_JINIT_WORDS,
     MODEL_JOINT_SIZE, MODEL_BODY_SIZE, MODEL_GEOM_SIZE,
@@ -204,6 +210,12 @@ struct Stats(Copyable, ImplicitlyCopyable, Movable):
     var jinit_bad: Int
     var base_words: Int
     var base_bad: Int
+    var base_jittered: Int
+    """Rest words the family jitters that came out off the rest value — the
+    vacuity guard for `base_qpos_jitter=` (0 on every family without it)."""
+    var yawed: Int
+    """Placements the host drew a nonzero `:yaw` for (the device's quaternion
+    is compared to it word for word above)."""
     # rule coverage, per placement the HOST made
     var geom: Int
     var table_off: Int
@@ -215,6 +227,11 @@ struct Stats(Copyable, ImplicitlyCopyable, Movable):
     var rejections: Int
     var clamped: Int
     var exempt: Int
+    var sep_rejected: Int
+    var sep_pairs: Int
+    var sep_margin: Float64
+    """`:sep=`: host draws only the separation refused, pairs with a
+    separation, and the smallest (distance - separation) among them (m)."""
 
     def __init__(out self):
         self.tasks = 0
@@ -233,6 +250,8 @@ struct Stats(Copyable, ImplicitlyCopyable, Movable):
         self.jinit_bad = 0
         self.base_words = 0
         self.base_bad = 0
+        self.base_jittered = 0
+        self.yawed = 0
         self.geom = 0
         self.table_off = 0
         self.on_fixture = 0
@@ -243,6 +262,9 @@ struct Stats(Copyable, ImplicitlyCopyable, Movable):
         self.rejections = 0
         self.clamped = 0
         self.exempt = 0
+        self.sep_rejected = 0
+        self.sep_pairs = 0
+        self.sep_margin = 1.0e9
 
 
 struct LaneInputs(Copyable, Movable):
@@ -395,11 +417,20 @@ def _parity[T: PlacementTable](
     for lane in range(BATCH):
         var qseen = List[Bool](length=NQ, fill=False)
         var vseen = List[Bool](length=NV, fill=False)
-        # ── the base asset's rest pose ──
+        # ── the base asset's rest pose, with the family's per-episode draw ──
+        var rest = sample_base_qpos(f, UInt64(SEED), lane)
         for i in range(T.N_BASE_QPOS):
             st.base_words += 1
-            if Float64(qs.data[lane * NQ + i]) != f.base_qpos[i]:
+            var got_q = Float64(qs.data[lane * NQ + i])
+            if abs(got_q - rest[i]) > TOL:
                 st.base_bad += 1
+                print("      ", t.name, "lane", lane, "rest", i, ": device",
+                      got_q, "host", rest[i])
+            var h = f.base_qpos_jitter[i] if len(f.base_qpos_jitter) > 0 else 0.0
+            if abs(got_q - f.base_qpos[i]) > h + TOL:
+                st.base_bad += 1
+            if h > 0.0 and got_q != f.base_qpos[i]:
+                st.base_jittered += 1
             if i < NV and Float64(vs.data[lane * NV + i]) != 0.0:
                 st.base_bad += 1
             qseen[i] = True
@@ -430,6 +461,24 @@ def _parity[T: PlacementTable](
         st.rejections += rep.attempts - rep.accepted
         st.clamped += rep.clamped
         st.exempt += rep.exempt
+        st.sep_rejected += rep.sep_rejected
+        # `:sep=`: every placed pair where either init carries one keeps it
+        for a in range(len(placed)):
+            for b in range(a + 1, len(placed)):
+                var sa = 0.0
+                var sb = 0.0
+                for q in range(len(t.inits)):
+                    var qs_ = f.slot_index(t.inits[q].slot)
+                    if qs_ == placed[a].slot:
+                        sa = t.inits[q].sep()
+                    if qs_ == placed[b].slot:
+                        sb = t.inits[q].sep()
+                var need = max(sa, sb)
+                if need > 0.0:
+                    var dxy = sqrt((placed[a].x - placed[b].x) ** 2
+                                   + (placed[a].y - placed[b].y) ** 2)
+                    st.sep_pairs += 1
+                    st.sep_margin = min(st.sep_margin, dxy - need)
         for j in range(T.N_FREE):
             var si = T.free_slot(j)
             var qa = T.free_qadr(j)
@@ -463,10 +512,12 @@ def _parity[T: PlacementTable](
             want.append(placed[k].x)
             want.append(placed[k].y)
             want.append(placed[k].z)
-            want.append(1.0)
+            want.append(cos(0.5 * placed[k].yaw))
             want.append(0.0)
             want.append(0.0)
-            want.append(0.0)
+            want.append(sin(0.5 * placed[k].yaw))
+            if placed[k].yaw != 0.0:
+                st.yawed += 1
             var this_bad = False
             for w in range(7):
                 var got = Float64(qs.data[base + w])
@@ -508,9 +559,11 @@ def _run_family[T: PlacementTable](
     mut st: Stats,
     mut refused: List[String],
     mut should: List[String],
+    yaw_all: Bool = False,
 ) raises:
     """The table against an INDEPENDENTLY derived `SceneFacts`, then every task:
-    refused, or parity on BATCH lanes with the host's per-lane FK frames."""
+    refused, or parity on BATCH lanes with the host's per-lane FK frames.
+    `yaw_all` turns `:yaw` on for every region init of every task (2c)."""
     var fmd = parse_model_runtime(scene_path(f))
     var verts = verts0
     var dims = dims_from_flat(fmd, max_contacts=64, nmesh_verts=verts)
@@ -660,6 +713,10 @@ def _run_family[T: PlacementTable](
 
     for i in range(len(tasks)):
         var t = load_task(task_path(f, tasks[i]))
+        if yaw_all:
+            for k in range(len(t.inits)):
+                if f.init_target_kind(t.inits[k].region) != INIT_TARGET_SLOT:
+                    t.inits[k].yaw = True
         validate_task_against_family(t, f)
         st.tasks += 1
         var expect_refuse = False
@@ -1088,9 +1145,10 @@ def main() raises:
         META_IDX_INIT_REGION_0 + META_INIT_SLOTS == META_IDX_JINIT_0
         and META_IDX_JINIT_0 + META_JINIT_SLOTS * META_JINIT_WORDS
         == META_IDX_NEWTON_ITER
-        and META_IDX_NEWTON_ITER + META_SOLVER_WORDS == METADATA_SIZE,
-        "the init block, the jinit block and the solver counters are"
-        " contiguous and END `meta` ("
+        and META_IDX_NEWTON_ITER + META_SOLVER_WORDS == META_IDX_REWARD_MODE
+        and META_IDX_REWARD_MODE + META_REWARD_WORDS == METADATA_SIZE,
+        "the init block, the jinit block, the solver counters and the reward"
+        " block are contiguous and END `meta` ("
         + String(META_IDX_INIT_REGION_0) + ".." + String(METADATA_SIZE - 1)
         + "), so widening moved no other word",
     )
@@ -1135,6 +1193,137 @@ def main() raises:
             ok_rad = True
     ta.check(ok_rad,
              "SLOT_RADIUS is the prop asset's own half-size (resting height)")
+
+    # ── 2b. so101_tower: the generated table, and the rest-pose DRAW ──────
+    # The one family with `base_qpos_jitter=` (the follower starts folded,
+    # pan / roll / jaw drawn per episode): the device's draw must be the
+    # host's on every lane, inside the half-width, and actually drawn.
+    print()
+    print("--- 2b. so101_tower: generated table, rest draw device vs host ---")
+    var ft = load_family(String("noeira/tasks/families/so101_tower.family"))
+    var tnames = List[String]()
+    tnames.append(String("so101_tower_cube_in_bowl"))
+    tnames.append(String("so101_tower_lift_brick"))
+    tnames.append(String("so101_tower_reach_clear"))
+    var stt = Stats()
+    var rt = List[String]()
+    var sht = List[String]()
+    _run_family[So101TowerPlacement](
+        ft, tnames, SO101_TOWER_NMESH_VERTS, 0.02,
+        String("robot_grasp_center"), ta, stt, rt, sht,
+    )
+    print("      placements", stt.placements, " rest words", stt.base_words,
+          " jittered", stt.base_jittered, " worst", stt.worst)
+    ta.check(
+        stt.bad == 0 and stt.base_bad == 0 and stt.left_alone_bad == 0
+        and stt.meta_touched == 0 and stt.other_written == 0 and len(rt) == 0,
+        "so101_tower: placements and the drawn rest agree device vs host,"
+        " nothing else is written, nothing refused",
+    )
+    # 3 of the 6 rest words are drawn; every drawn word on every lane of
+    # every task must have moved (a u of exactly 1/2 has probability 0)
+    ta.check(
+        stt.base_words == len(tnames) * BATCH * 6
+        and stt.base_jittered == len(tnames) * BATCH * 3,
+        "so101_tower: the rest is 6 words and pan / roll / jaw are drawn on"
+        " every lane (" + String(stt.base_jittered) + " of "
+        + String(len(tnames) * BATCH * 3) + ")",
+    )
+    var d0 = sample_base_qpos(ft, UInt64(SEED), 0)
+    var d1 = sample_base_qpos(ft, UInt64(SEED), 1)
+    var d0b = sample_base_qpos(ft, UInt64(SEED + 1), 0)
+    ta.check(
+        d0[0] != d1[0] and d0[0] != d0b[0] and d0[1] == d1[1]
+        and d0[1] == ft.base_qpos[1],
+        "so101_tower: the draw moves with the lane and the seed, and a"
+        " zero half-width (lift) is the rest exactly",
+    )
+
+    # ── 2c. `:yaw` on the tower: the same tasks, every region init yawed ──
+    print()
+    print("--- 2c. so101_tower with :yaw on every init: device vs host ---")
+    var sty = Stats()
+    var ry = List[String]()
+    var shy = List[String]()
+    _run_family[So101TowerPlacement](
+        ft, tnames, SO101_TOWER_NMESH_VERTS, 0.02,
+        String("robot_grasp_center"), ta, sty, ry, shy, yaw_all=True,
+    )
+    print("      placements", sty.placements, " yawed", sty.yawed,
+          " worst", sty.worst)
+    ta.check(
+        sty.bad == 0 and sty.left_alone_bad == 0 and sty.other_written == 0
+        and len(ry) == 0 and sty.placements == stt.placements
+        and sty.yawed == sty.placements,
+        "so101_tower :yaw: every placement drew a yaw, the device's quaternion"
+        " is the host's, and the placements are the no-yaw ones' count",
+    )
+    # 2b ran the tasks as written: only their own `:yaw` inits may draw a yaw
+    # (cube_in_bowl's brick since ce11b131f), one per lane each
+    var n_yaw_inits = 0
+    for k in range(len(tnames)):
+        var tk = load_task(task_path(ft, tnames[k]))
+        for q in range(len(tk.inits)):
+            if tk.inits[q].yaw:
+                n_yaw_inits += 1
+    ta.check(
+        stt.yawed == n_yaw_inits * BATCH,
+        "so101_tower as written: exactly the tasks' own :yaw inits drew a yaw ("
+        + String(stt.yawed) + " = " + String(n_yaw_inits) + " x "
+        + String(BATCH) + " lanes), every other quaternion the identity",
+    )
+    var pt = parse_task(String(
+        "schema_version=1\ntask=yaw_probe\nfamily=so101_tower\n"
+        "language=probe\ngoal=Near(brick, bowl, 0.045)\nactive=tower\n"
+        "active=desk\nactive=bowl\nactive=brick\n"
+        "init=bowl@desk_left\ninit=brick@desk_right:yaw\n"
+    ))
+    ta.check(
+        not pt.inits[0].yaw and pt.inits[1].yaw
+        and pt.inits[1].describe() == "brick@desk_right:yaw",
+        "':yaw' parses on its own init only and round-trips through describe",
+    )
+    var bad_order = False
+    try:
+        _ = parse_init(String("brick@desk_right:yaw:in"))
+    except:
+        bad_order = True
+    ta.check(bad_order, "':yaw:in' (suffixes out of order) is refused")
+
+    # ── 2d. `:sep=` — cube_in_bowl's bowl keeps 135 mm from the brick ────
+    #
+    # 2b ran cube_in_bowl AS WRITTEN (`init=bowl@desk_bowl:sep=0.135`), so its
+    # device-vs-host agreement above already covers the separation's word and
+    # the kernel's clash test; here: the rule holds on every host draw, and it
+    # is NOT VACUOUS — draws the radii alone would accept were refused.
+    print()
+    print("--- 2d. :sep= on the tower (cube_in_bowl as written) ---")
+    print("      pairs", stt.sep_pairs, " sep-only rejections", stt.sep_rejected,
+          " smallest margin", stt.sep_margin)
+    ta.check(
+        stt.sep_pairs >= BATCH and stt.sep_margin >= 0.0,
+        "so101_tower :sep=: every separated pair keeps its distance ("
+        + String(stt.sep_pairs) + " pairs, margin >= 0)",
+    )
+    ta.check(
+        stt.sep_rejected > 0,
+        "so101_tower :sep=: the separation refused draws the radii alone"
+        " accept (" + String(stt.sep_rejected) + ") — the rule is reached",
+    )
+    var ps = parse_init(String("bowl@desk_bowl:yaw:sep=0.135"))
+    ta.check(
+        ps.yaw and ps.sep_mm == 135
+        and ps.describe() == "bowl@desk_bowl:yaw:sep=0.135",
+        "':sep=' parses after ':yaw' and round-trips through describe",
+    )
+    var bad_sep = 0
+    for spec in [String("bowl@desk_bowl:sep=0.1355"), String("bowl@desk_bowl:sep=2.0"),
+                 String("bowl@desk_bowl:sep=0")]:
+        try:
+            _ = parse_init(spec)
+        except:
+            bad_sep += 1
+    ta.check(bad_sep == 3, "':sep=' refuses sub-millimetre, > 1.023 m and 0")
 
     # ── 3. an untouched meta writes nothing ───────────────────────────────
     #

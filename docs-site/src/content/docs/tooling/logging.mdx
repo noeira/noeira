@@ -52,7 +52,7 @@ log both useful and small.
 `episodes`. Every 50,000 steps is typical for a 600,000-step run.
 
 **Diagnostic cadence** (`diag_every`) — the full metric bundle for the
-algorithm: `actor_loss`, `critic_loss`, `alpha`, `mean_q`, `train_steps`. Every
+algorithm: `policy_loss`, `critic_loss`, `alpha`, `mean_q`, `train_steps`. Every
 1,000 steps.
 
 Reward alone tells you *that* something is wrong. The bundle tells you what:
@@ -60,6 +60,11 @@ a collapsing return with rising `mean_q` is value explosion; with flat `mean_q`
 it is a policy problem.
 
 ## RemoteLogger
+
+:::note[Requires noeira cloud]
+[noeira cloud](/tooling/monitor/) is not open yet. To join the private beta,
+write to [denis@noeira.ai](mailto:denis@noeira.ai).
+:::
 
 Streams to [noeira cloud](/tooling/monitor/) over HTTP as batched JSON POSTs.
 The run is announced by `register()` — call it through `register_run` with a
@@ -78,13 +83,13 @@ var logger = RemoteLogger(
 logger.set_config("algorithm", "SAC")
 logger.set_config("env", "HalfCheetah")
 logger.set_config("n_envs", String(N_ENVS))
-logger.register()   # or register_run(run, logger) — see noeira cloud
+logger.register()   # or register_run(run, logger) — see below
 ```
 
 A logger that is never registered still registers lazily on its first flush,
 so older drivers keep working — but a run that dies before that flush never
 appears on the dashboard. New drivers should use a `RunContext` and
-`register_run`; see [how a run is registered](/tooling/monitor/#how-a-run-is-registered).
+`register_run`; see [registering a run](#registering-a-run).
 
 Configuration comes from a `.env` file at the repo root, read by
 `noeira.core.dotenv`:
@@ -97,6 +102,54 @@ NOEIRA_CLOUD_API_KEY=...
 `buffer_size` controls batching (default 200). Smaller means fresher charts
 and more requests; 64–200 is the usual range. `logger.total_logged()` reports
 how many points were logged.
+
+With no `.env`, or an empty URL, the logger stays inert and training runs
+unaffected.
+
+### Registering a run
+
+A driver makes a `RunContext` — which creates the run's directory and writes
+`run.kv` before any training — then a logger, and announces the run with
+`register_run` before step 0:
+
+```mojo
+from noeira.core.dotenv import load_dotenv
+from noeira.core.logger import RemoteLogger
+from noeira.core.run import RunContext, register_run
+
+var env_vars = load_dotenv()
+var run = RunContext(
+    project="so101",
+    driver="examples/so101/act_so101_train_gpu.mojo",
+    slug="act-so101",
+)
+var logger = RemoteLogger(
+    server_url=env_vars.get("NOEIRA_CLOUD_URL", ""),
+    run_name=run.name(),
+    run_id=run.id,
+    buffer_size=64,
+    api_key=env_vars.get("NOEIRA_CLOUD_API_KEY", ""),
+)
+logger.set_config("algorithm", "ACT")
+register_run(run, logger)   # seeds run_id, project, driver, seed, host... then POSTs /runs
+
+# ... training: logger.log_scalar(...), run.checkpoint_path("best") ...
+
+run.close()                 # run.kv: status=done, finished=<now>
+logger.close()              # flushes, sends the finish, drains the queue
+```
+
+`register_run` is what makes a run that dies at step 0 visible at all. The
+task-family SAC driver (`noeira/tasks/sac_family_driver.mojo`), ACT on the
+SO-101 and on LIBERO, Forward-Backward and BFM-Zero on the G1 all do this.
+While the run is alive the logger also sends a heartbeat, which is how a run
+that was killed can be told from one that is simply quiet.
+
+:::caution[`.env` is shared by every run on the box]
+Blanking it to keep a smoke test off the dashboard also silences the next real
+run. The ACT driver has `ACT_NO_MONITOR=1` for exactly this; prefer a
+per-driver switch like it over editing `.env`.
+:::
 
 The POST never happens on the training thread. `flush` serialises the batch
 and queues it; a background thread in `noeira/io/http_sink.mojo` owns the
@@ -134,12 +187,28 @@ Each algorithm defines a metrics struct. Representative fields:
 
 | Algorithm | Metrics |
 |---|---|
-| DQN | `loss`, `mean_q`, `epsilon`, `train_steps` |
-| SAC | `actor_loss`, `critic_loss`, `alpha`, `mean_q`, `mean_next_q` |
-| PPO | `actor_loss`, `critic_loss`, `train_steps`, `n_updates` |
-| MuZero | policy / value / reward losses, search statistics |
+| DQN | `loss`, `mean_q`, `explore_rate`, `td_error_abs_mean`, `train_steps` |
+| SAC | `policy_loss`, `critic_loss`, `alpha`, `mean_q`, `mean_next_q`, `reward_mean` |
+| PPO | `policy_loss`, `critic_loss`, `approx_kl`, `clip_fraction`, `entropy` |
+| MuZero | `policy_loss`, `value_loss`, `reward_loss`, `avg_reward`, `buffer_size` |
+| FB / FB-CPR | `fb_measure_loss`, `fb_ortho_loss`, `policy_loss`, `disc_expert_loss`, `disc_policy_loss` |
+| ACT | `l1_loss`, `kl_loss`, `val_l1_loss`, `grad_norm`, `step_s` |
 
 The shared training drivers additionally emit `avg_reward` and `episodes` at the driver cadence.
+
+### Naming
+
+Metric names are flat `snake_case`, with no `/` namespaces, because the
+dashboard groups charts by exact name:
+
+- a loss ends in `_loss` (`policy_loss`, `value_loss`, `val_l1_loss`);
+- a statistic is `<quantity>_<stat>` (`reward_mean`, `action_abs_mean`);
+- an evaluation starts with `eval_` (`eval_return`, `eval_success_rate`);
+- a per-task series appends the task name (`eval_success_rate_<task>`).
+
+Settings are not metrics. A value that does not change during the run goes
+through `set_config`, which writes it to `metrics.config.kv` beside
+`metrics.csv`.
 
 ## What to watch
 

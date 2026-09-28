@@ -65,7 +65,8 @@ more than any other single change. `TiedLinear` exists for exactly this.
 | `ConvRMSNorm` | RMS normalization for conv activations |
 | `ToNCHW` · `Flatten` · `Transpose2D` | layout helpers |
 
-Conv2D fuses with an activation the same way `Linear` does.
+Unlike `Linear`, `Conv2D` has no fused-activation form: follow it with an
+activation module.
 
 :::note[Conv is bandwidth-bound, not GEMM-bound]
 Profiling the zero-series convolutional nets showed the bottleneck is memory

@@ -24,9 +24,12 @@ config (CH=64, NB=3); for an older CH=32 / 2-block checkpoint set CH=32, NB=2.
 Usage (after a training run has written the checkpoint):
     pixi run -e nvidia mojo run -I . examples/board_games/play_connect_four_muzero_gumbel.mojo
     pixi run -e apple  mojo run -I . examples/board_games/play_connect_four_muzero_gumbel.mojo
+    pixi run -e apple  mojo run -I . examples/board_games/play_connect_four_muzero_gumbel.mojo --ckpt <run_id>
 """
 
 from std.memory import alloc
+from std.sys import argv
+from noeira.core.run import resolve_checkpoint
 from max.gpu.host import DeviceContext
 from layout import Layout, LayoutTensor
 
@@ -45,6 +48,17 @@ from noeira.render import Renderer2D, SDL_Color
 from noeira.render.sdl.sdl_keyboard import get_keyboard_state
 from noeira.render.sdl.sdl_scancode import Scancode
 from noeira.render.sdl.sdl_mouse import get_mouse_state
+
+
+def _flag(name: String, dflt: String) raises -> String:
+    """Value of `--name X`, or `dflt` when the flag is absent."""
+    var av = argv()
+    for i in range(1, len(av)):
+        if String(av[i]) == name:
+            if i + 1 >= len(av):
+                raise Error("flag " + name + " needs a value")
+            return String(av[i + 1])
+    return dflt
 
 
 def main() raises:
@@ -66,7 +80,10 @@ def main() raises:
     comptime Dyn = MZDynNetC4Spatial[CH, ACT, BINS, HH, WW, NB]
     comptime Pred = MZPredNetC4Spatial[CH, ACT, BINS, HH, WW, NB]
 
-    var ckpt = String("connect_four_muzero_gumbel_spatial.ckpt")
+    var ckpt = resolve_checkpoint(
+        _flag(String("--ckpt"), String("connect_four_muzero_gumbel_spatial.ckpt")),
+        String("best"),
+    )
 
     var ctx = DeviceContext()
     var rep = Rep.make["gpu", INIT=Kaiming](ctx=ctx)

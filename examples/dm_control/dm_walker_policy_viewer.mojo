@@ -4,10 +4,12 @@
     pixi run mojo run -I . examples/dm_control/dm_walker_policy_viewer.mojo
     pixi run mojo run -I . examples/dm_control/dm_walker_policy_viewer.mojo walker_run
     pixi run mojo run -I . examples/dm_control/dm_walker_policy_viewer.mojo walker_stand policy
+    pixi run mojo run -I . examples/dm_control/dm_walker_policy_viewer.mojo --run <run_id>
 
 argv picks the task that opens first, then the drive mode (zero | random |
 sweep | policy) and an action scale; every task and mode stays selectable in the
-window. Defaults: `walker_walk`, `policy`.
+window. Defaults: `walker_walk`, `policy`. `--run` names the training run whose
+`checkpoints/` ladder is probed first.
 
 WHAT IT ADDS OVER `dm_viewer_imgui.mojo`. That viewer answers "is the MODEL
 built the way I think" and can only shake the joints. This one adds the fourth
@@ -43,6 +45,9 @@ run on the LAPTOP — it opens an SDL3 window and blocks on it.
 from std.pathlib import Path
 from std.random import seed
 from std.sys import argv
+from std.os.path import exists
+from noeira.core.project import projects_root
+from noeira.io.proc import quote_arg, run_capture
 
 from noeira.nn.constants import DT
 from noeira.deep_agents.data.any_replay import AnyReplay
@@ -78,14 +83,18 @@ comptime N_SEGMENTS = 20
 comptime CKPT_PREFIX = "sac_dm_walker_"
 
 
-def ckpt_dirs() -> List[String]:
+def ckpt_dirs(run_dir: String) -> List[String]:
     """Where a rung might live, in probe order.
 
-    The training script writes to the CWD; the ladders on this machine were
-    moved into `checkpoints/`. Probing both means neither layout has to be
-    special-cased, and `status()` reports which file actually loaded.
+    The training script now writes into its run directory
+    (`<run_dir>/checkpoints/`, probed first when `--run` is given); older
+    ladders sit in the CWD or were moved into `checkpoints/`. Probing all of
+    them means no layout has to be special-cased, and `status()` reports which
+    file actually loaded.
     """
     var d = List[String]()
+    if run_dir.byte_length() > 0:
+        d.append(run_dir + "/checkpoints/")
     d.append(String("checkpoints/"))
     d.append(String(""))
     return d^
@@ -152,7 +161,7 @@ struct WalkerLadder(ActionSource, Movable, Deinitable):
     to decide warmup vs policy, and with `learning_starts=0` any positive value
     is the policy."""
 
-    def __init__(out self) raises:
+    def __init__(out self, run_dir: String) raises:
         self.agent = SAC["cpu", OBS_DIM, ACT_DIM, BATCH, CAP, HIDDEN](
             action_scale=1.0,
             learning_starts=0,
@@ -164,7 +173,7 @@ struct WalkerLadder(ActionSource, Movable, Deinitable):
         self.step_idx = 1
 
         var tasks = ckpt_tasks()
-        var dirs = ckpt_dirs()
+        var dirs = ckpt_dirs(run_dir)
         var n_found = 0
         for t in range(len(tasks)):
             var prefix = String(CKPT_PREFIX) + tasks[t]
@@ -313,13 +322,58 @@ def dispatch(
         st.quit = True
 
 
+def _run_dir(handle: String) raises -> String:
+    """`handle` as a run directory: a path to one, or a run id under `runs/` or
+    any `projects/*/runs/`. Raises when none of them holds a `checkpoints/`."""
+    if exists(handle + "/checkpoints"):
+        return handle
+    if exists(String("runs/") + handle + "/checkpoints"):
+        return String("runs/") + handle
+    var root = projects_root()
+    var listing = run_capture(
+        String("ls -d ") + quote_arg(root) + "/*/runs/" + quote_arg(handle)
+        + " 2>/dev/null; true",
+        1 << 16,
+    )
+    for line in listing.split("\n"):
+        var d = String(String(line).strip())
+        if d.byte_length() > 0 and exists(d + "/checkpoints"):
+            return d
+    raise Error(
+        "--run '" + handle + "' is neither a run directory nor a run id under"
+        " runs/ or " + root + "/*/runs/"
+    )
+
+
+def _flag(name: String, dflt: String) raises -> String:
+    """Value of `--name X`, or `dflt` when the flag is absent."""
+    var av = argv()
+    for i in range(1, len(av)):
+        if String(av[i]) == name:
+            if i + 1 >= len(av):
+                raise Error("flag " + name + " needs a value")
+            return String(av[i + 1])
+    return dflt
+
+
 def main() raises:
     seed(SEED)
     if not imgui_shim_available():
         print("Dear ImGui shim not built.  Run:  pixi run build-imgui")
         return
 
-    var args = argv()
+    # `--run <run_id|run_dir>` is pulled out first; the rest stay positional.
+    var av = argv()
+    var run_arg = _flag(String("--run"), String(""))
+    var run_dir = _run_dir(run_arg) if run_arg.byte_length() > 0 else String("")
+    var args = List[String]()
+    var ai = 0
+    while ai < len(av):
+        if ai > 0 and String(av[ai]) == "--run":
+            ai += 2
+            continue
+        args.append(String(av[ai]))
+        ai += 1
     var start = String(args[1]) if len(args) > 1 else String("walker_walk")
     var task = task_index(start, task_names())
     if task < 0:
@@ -340,7 +394,7 @@ def main() raises:
     print("=" * 66)
     print("dm_control walker x 3 tasks + SAC ladder")
     print("=" * 66)
-    var ladder = WalkerLadder()
+    var ladder = WalkerLadder(run_dir)
 
     var st = ViewerState(
         task, drive, scale, task_names(), domain_names(), task_domain()

@@ -123,14 +123,18 @@ comptime CONTACT_IDX_SOLIMP_4: Int = 29  # mixed solimp power
 # State Buffer Layout - Metadata
 # =============================================================================
 
-comptime METADATA_SIZE: Int = 53
+comptime METADATA_SIZE: Int = 57
 """Per-env metadata words: 4 fixed slots, `META_IDX_TASK_PARAM_0..11`,
 `META_IDX_ACTDAMP_LIVE`, `META_IDX_SIM_TIME`, `META_IDX_TASK_ACTIVE`, three
 RETIRED words (19..21), `META_IDX_GOAL_HELD`, the four shaping words,
 `META_IDX_EQ_FORCE_LIVE`, `META_IDX_LS_EVAL`, the `META_INIT_SLOTS`-word
 init block `META_IDX_INIT_REGION_0..12` (29..41), the joint-init block
 `META_IDX_JINIT_0` (42..47, `META_JINIT_WORDS` per draw), and the
-`META_SOLVER_WORDS` solver counters `META_IDX_NEWTON_ITER..` (48..52).
+`META_SOLVER_WORDS` solver counters `META_IDX_NEWTON_ITER..` (48..52), and
+the `META_REWARD_WORDS` reward-mode block `META_IDX_REWARD_MODE..` (53..56).
+
+⚠ RAISED FROM 53 TO 57 FOR THE POTENTIAL-BASED REWARD (2026-09-26), by
+APPENDING, like every widening before it.
 
 ⚠ RAISED FROM 29 TO 42 FOR THE LIBERO DEVICE RESET, by APPENDING. The init
 block was three words at 19..21, one per `so101_tabletop` free slot, and
@@ -462,8 +466,43 @@ comptime META_IDX_SOLVER_ACC_NCON: Int = 51
 comptime META_IDX_SOLVER_ACC_CAPPED: Int = 52
 """Running count of solves that ran to the model's `iterations` cap."""
 comptime META_SOLVER_WORDS: Int = 5
-"""The five words above, contiguous from `META_IDX_NEWTON_ITER`; they END
-`meta` — `test_device_placement` pins the layout."""
+"""The five words above, contiguous from `META_IDX_NEWTON_ITER`, followed by
+the reward block below — `test_device_placement` pins the layout."""
+
+# ── THE REWARD'S MODE AND ITS PER-EPISODE STATE — four words ──────────────
+#
+# `tasks/family_config.So101FamilyConfig.compute_reward_and_done_gpu` pays the
+# LEGACY reward (every shaped term a raw per-step value) when
+# `META_IDX_REWARD_MODE` is 0 — what an untouched, zero-filled `meta` holds,
+# so every driver and recorder written before this block is unchanged — and
+# the POTENTIAL-BASED one when it is 1 (`tasks/shaping.reward_mode_words`,
+# `noeira-docs/SO101_PIXEL_RL_PLAN.md`).
+#
+# ⚠⚠ THE LAST TWO ARE EPISODE STATE AND THE RESET ZEROES THEM
+# (`Phyics3dBatchedEnv._reset_env_lane`, `Phyics3dEnv.reset`). A potential
+# delta needs the previous step's potential; carried across an episode
+# boundary it would pay the jump from the last episode's final state to this
+# one's first. ZERO FLAGS MEAN A FRESH EPISODE: the first step pays no shaping
+# (it only records its potential) and the bonus is unpaid.
+#
+# ⚠ `Phi` IS STORED AS ITSELF, WITH A SEPARATE "SET" BIT — not as `Phi + 1`
+# with zero meaning unset, which was the first version: `(Phi + 1) - 1` does
+# not round-trip (one ulp at Phi ~1.1 in float64), so a policy standing still
+# was paid a nonzero dwell, and `test_tower_reward_potential` caught it.
+comptime META_IDX_REWARD_MODE: Int = 53
+"""0 = legacy raw terms, 1 = potential-based deltas + success lift."""
+comptime META_IDX_SUCCESS_BONUS: Int = 54
+"""A one-time reward paid on the first step of an episode the goal holds
+(mode 1 only); 0 = none."""
+comptime META_IDX_PHI_PREV: Int = 55
+"""The previous step's potential (valid when `EPISODE_FLAG_PHI_SET` is set)."""
+comptime META_IDX_EPISODE_FLAGS: Int = 56
+"""Bit field, stored as a float: `EPISODE_FLAG_PHI_SET` | `EPISODE_FLAG_BONUS_PAID`."""
+comptime EPISODE_FLAG_PHI_SET: Int = 1
+comptime EPISODE_FLAG_BONUS_PAID: Int = 2
+comptime META_REWARD_WORDS: Int = 4
+"""The four words above, contiguous from `META_IDX_REWARD_MODE`; they END
+`meta`."""
 
 
 # =============================================================================
@@ -1903,14 +1942,34 @@ def mesh_max_polyvert(nmesh_verts: Int) -> Int:
     return 6 * nmesh_verts if nmesh_verts > 0 else 1
 
 
+# The hill climb's direction SEED TABLE (`collision/mesh_seed.mojo`): for a
+# hull of at least `MESH_SEED_MIN_VERTS` vertices, `MESH_SEED_N` local vertex
+# indices — the extreme vertex for each point of a `MESH_SEED_Q`^3 direction
+# grid — stored in `mesh_edges` directly before the mesh's first neighbour
+# list, behind one `MESH_SEED_MAGIC` slot. Reader and builder are in
+# `mesh_seed.mojo`; the layout is stated there.
+comptime MESH_SEED_Q: Int = 5
+comptime MESH_SEED_N: Int = MESH_SEED_Q * MESH_SEED_Q * MESH_SEED_Q
+comptime MESH_SEED_MIN_VERTS: Int = 64
+# Not a vertex id (>= 0) and not the -1 terminator.
+comptime MESH_SEED_MAGIC: Int = -7
+
+
 def mesh_max_edge(nmesh_verts: Int) -> Int:
     """Hull edge-graph capacity for a budget of `nmesh_verts` vertices.
 
     MuJoCo sizes the same block at `numvert + 3*numface`; a triangulated
     polytope has `F = 2V - 4`, so that is `7V - 12`. 8V leaves headroom rather
     than trusting the identity, and `fields_build` still raises on overflow.
+    On top of it, each mesh of at least `MESH_SEED_MIN_VERTS` vertices carries
+    a seed table of `MESH_SEED_N + 1` slots, so there are at most
+    `V // MESH_SEED_MIN_VERTS` of them.
     """
-    return 8 * nmesh_verts if nmesh_verts > 0 else 1
+    if nmesh_verts <= 0:
+        return 1
+    return 8 * nmesh_verts + (nmesh_verts // MESH_SEED_MIN_VERTS) * (
+        MESH_SEED_N + 1
+    )
 
 
 # =============================================================================

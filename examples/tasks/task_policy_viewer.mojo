@@ -4,6 +4,7 @@
     pixi run mojo run -I . examples/tasks/task_policy_viewer.mojo
     pixi run mojo run -I . examples/tasks/task_policy_viewer.mojo so101_lift_brick
     pixi run mojo run -I . examples/tasks/task_policy_viewer.mojo <task> --check
+    pixi run mojo run -I . examples/tasks/task_policy_viewer.mojo so101_lift_brick --ckpt <run_id>
 
 `task_viewer.mojo` with an actor in it. That file's header says outright what
 it cannot show — *"the arm does not move, and that is the point of the
@@ -15,7 +16,9 @@ trained on that `.task`.
 ⚠⚠ **THE TASK PICKER SWITCHES THE CHECKPOINT TOO.** One policy per task —
 the newest run of that task that
 `examples/tasks/sac_task_gpu.mojo` wrote (`<project runs>/<date>_sac-<task>_<hash>/
-checkpoints/last.ckpt`), or the pre-run-layout `checkpoints/sac_task_<task>.ckpt`. Selecting a task reloads the `.task`
+checkpoints/last.ckpt`), or the pre-run-layout `checkpoints/sac_task_<task>.ckpt`.
+`--ckpt <run_id|path>` pins the STARTING task's policy to that run's
+`checkpoints/last.ckpt` (or that file) instead of the newest. Selecting a task reloads the `.task`
 AND the weights trained on it, because a `gather` policy driving `lift` is a
 demo of nothing. The model is NOT rebuilt: every task in a family instantiates
 every slot, so `nq`/`nv`/`ngeom` are constant and the switch is a data reload.
@@ -81,6 +84,7 @@ from noeira.deep_agents.training.blocks import ReplaySampleStep
 
 from noeira.core.cont_action import ContAction
 from noeira.core.project import runs_root_for
+from noeira.core.run import resolve_checkpoint
 from noeira.envs.phyics3d_env import Phyics3dEnv
 from noeira.physics3d.gpu.constants import (
     METADATA_SIZE, META_IDX_TASK_PARAM_0, META_IDX_TASK_ACTIVE,
@@ -239,18 +243,25 @@ struct TaskPolicy(Movable & Deinitable):
     var agent: SacFamilyPolicy[OBS_DIM, ACT_DIM]
     var loaded_task: String
     var loaded: Bool
+    # the task `--ckpt` named a checkpoint for, and that checkpoint ("" = none)
+    var pinned_task: String
+    var pinned_path: String
 
-    def __init__(out self) raises:
+    def __init__(out self, pinned_task: String, pinned_path: String) raises:
         self.agent = SAC["cpu", OBS_DIM, ACT_DIM, BATCH, CAP, HIDDEN](
             action_scale=ACTION_SCALE, learning_starts=0
         )
         self.loaded_task = String("")
         self.loaded = False
+        self.pinned_task = pinned_task.copy()
+        self.pinned_path = pinned_path.copy()
 
     def __init__(out self, *, deinit move: Self):
         self.agent = move.agent^
         self.loaded_task = move.loaded_task^
         self.loaded = move.loaded
+        self.pinned_task = move.pinned_task^
+        self.pinned_path = move.pinned_path^
 
     def use(mut self, task: String) raises -> Bool:
         """Load `task`'s checkpoint, or report that there is none.
@@ -262,6 +273,8 @@ struct TaskPolicy(Movable & Deinitable):
         if self.loaded and self.loaded_task == task:
             return True
         var p = ckpt_path(task)
+        if self.pinned_path and task == self.pinned_task:
+            p = self.pinned_path.copy()
         if not Path(p).exists():
             print("  ⚠ no checkpoint for", task, "at", p)
             return False
@@ -420,12 +433,22 @@ def main() raises:
     var args = argv()
     var task_name = String("so101_gather_bricks")
     var check_only = False
-    for i in range(1, len(args)):
-        var a = String(args[i])
+    var ckpt_arg = String("")
+    var ai = 1
+    while ai < len(args):
+        var a = String(args[ai])
         if a == "--check":
             check_only = True
-        elif i == 1:
+        elif a == "--ckpt" and ai + 1 < len(args):
+            ckpt_arg = String(args[ai + 1])
+            ai += 1
+        elif ai == 1:
             task_name = a.copy()
+        ai += 1
+    if ckpt_arg:
+        # a RUN ID -> its `checkpoints/last.ckpt` (what the SAC task driver
+        # writes); a file is taken as is; anything else raises here.
+        ckpt_arg = resolve_checkpoint(ckpt_arg, String("last"))
     seed_rng(0)
 
     print("=" * 70)
@@ -470,7 +493,7 @@ def main() raises:
     print("  says   :", t.language)
     print("  scene  :", path, " nq", nq, " nv", nv, " obs", OBS_DIM)
 
-    var pol = TaskPolicy()
+    var pol = TaskPolicy(names[cur], ckpt_arg)
     var have_pol = pol.use(names[cur])
 
     # ── the scratch the reward's own distance function needs ──────────────

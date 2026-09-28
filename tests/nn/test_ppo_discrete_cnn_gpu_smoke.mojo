@@ -92,9 +92,9 @@ def main() raises:
 
     assert_true(n_updates > 0, "train_step never fired")
     var m = trainer.flush_metrics()
-    _finite(Float64(m.actor_loss.to_f64()), "actor_loss")
+    _finite(Float64(m.policy_loss.to_f64()), "policy_loss")
     _finite(Float64(m.critic_loss.to_f64()), "critic_loss")
     print("rollout updates fired:", n_updates)
-    print("actor_loss :", m.actor_loss.to_f64())
+    print("actor_loss :", m.policy_loss.to_f64())
     print("critic_loss:", m.critic_loss.to_f64())
     print("PASS: CNN GPU path runs finite through discrete on-policy.")

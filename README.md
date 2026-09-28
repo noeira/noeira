@@ -24,23 +24,24 @@
 noeira builds the whole robot-learning loop in one language: a MuJoCo-parity
 physics engine and the task suites that run on it, reinforcement learning,
 world models, imitation and vision-language-action policies, the camera and
-servo-bus drivers of a real arm, and the runtime that deploys a policy on a
-Jetson. The policy that trains on a GPU box is the same Mojo code that drives
-the robot.
+servo-bus drivers of real robots, and the runtime that deploys a policy on the
+robot's own computer. The policy that trains on a GPU box is the same Mojo code
+that drives the robot.
 
 > **Status:** beta, developed in the open (Modular Community Grant, 2026).
 > The physics engine, the classic and MuJoCo-style environments, DQN / PPO /
-> SAC / TD3 and `noeira.nn` are stable and tested. The task layer, LIBERO,
-> ACT, recording to LeRobot and Jetson deployment are beta. SmolVLA on the
-> arm, HIL-SERL / DAgger, the world-model agents and DeepMind Control training
-> are experimental. Each docs page carries its own maturity marker.
+> SAC / TD3 and `noeira.nn` are stable and tested. The task layer and its
+> benchmarks, imitation learning on a real robot, dataset recording and edge
+> deployment are beta. Vision-language-action models on a robot, learning from
+> interventions, the world-model agents and DeepMind Control training are
+> experimental. Each docs page carries its own maturity marker.
 
 ## What's inside
 
 **Simulation**
 - **3D physics** (`noeira/physics3d/`) — MuJoCo's generalized coordinates, MJCF loading (Menagerie, DeepMind Control, `<attach>`), PGS / Newton / CG solvers, elliptic cones, tendons, equality constraints, meshes, sensors, ray-traced cameras; checked against live MuJoCo 3.12, CPU and batched GPU
 - **2D physics** (`noeira/physics2d/`) — GPU-batched impulse engine (LunarLander, BipedalWalker, CarRacing)
-- **Environments** (`noeira/envs/`) — classic control, MuJoCo-style locomotion and manipulation, DeepMind Control, LIBERO, Menagerie robots (Panda, SO-101, Unitree G1), arcade engines, an Atari 2600 emulator, Procgen and Craftax
+- **Environments** (`noeira/envs/`) — 350+ environments and tasks: classic control, MuJoCo-style locomotion and manipulation, DeepMind Control, LIBERO, Menagerie robots (Panda, SO-101, Unitree G1), arcade engines, an Atari 2600 emulator, Procgen and Craftax
 - **Task layer** (`noeira/tasks/`) — declarative families, goals and placements; many tasks batched in one scene
 
 **Learning**
@@ -51,20 +52,20 @@ the robot.
 - **Zero-shot RL** — Forward-Backward representations (BFM-Zero on the Unitree G1)
 
 **Robots**
-- **SO-101** (`noeira/robot/`) — the Feetech servo bus, calibration, teleoperation, opt-in arming
+- **Robot drivers** (`noeira/robot/`) — servo bus, calibration, teleoperation, opt-in arming; the first supported robot is the SO-101 arm
 - **Vision** (`noeira/vision/`) — threaded camera capture, ChArUco intrinsics, camera-to-base extrinsics
-- **Datasets** — recording to LeRobot v3 (Parquet + H.264), pushing to the Hugging Face Hub, importing back — no Python in the data path
-- **Deployment** — ACT's closed loop at 30 Hz on a Jetson Orin NX
+- **Datasets** — recording in the LeRobot v3 format (Parquet + H.264), pushing to the Hugging Face Hub, importing back — a format, not a dependency, and no Python in the data path
+- **Deployment** — the training code runs the policy on the robot's own computer and GPU; ACT closes its loop at 30 Hz on a Jetson Orin NX
 
 **Infrastructure**
-- **`noeira.nn`** — Module / Param networks with autodiff, 70+ primitives, fused and flash attention, AMP, CUDA graphs
+- **`noeira.nn`** — Module / Param networks whose gradients compose at compile time (each module's VJP, no tape), 70+ primitives, fused kernels, fused and flash attention, AMP, CUDA graphs
 - **Data and I/O** — trajectory store (HDF5), replay buffers, Parquet, video, safetensors, HTTP
 - **Projects and runs** — runs recorded on disk and mirrored to [noeira cloud](https://cloud.noeira.ai)
 - **Rendering** — SDL3 renderers, ImGui viewers, a physics studio, video export
 
 ## Quick start
 
-This project uses [pixi](https://pixi.sh) (`curl -fsSL https://pixi.sh/install.sh | bash`, or `brew install pixi`). SDL3 is only needed for the viewers and video (`brew install sdl3`, `apt install libsdl3-dev`).
+This project uses [pixi](https://pixi.sh) (`curl -fsSL https://pixi.sh/install.sh | bash`, or `brew install pixi`). `pixi install` also brings SDL3, which the viewers use; there is nothing to install system-wide.
 
 ```bash
 pixi install
@@ -97,8 +98,8 @@ Full documentation lives at **[noeira.ai/docs](https://noeira.ai/docs)** — thi
 | [3D physics](https://noeira.ai/docs/physics/physics3d/) · [Validation](https://noeira.ai/docs/physics/validation/) · [Environments](https://noeira.ai/docs/environments/) | the simulator and what runs on it |
 | [The task layer](https://noeira.ai/docs/tasks/) · [LIBERO](https://noeira.ai/docs/environments/libero/) · [DeepMind Control](https://noeira.ai/docs/environments/dm-control/) | tasks and benchmarks |
 | [Algorithms](https://noeira.ai/docs/algorithms/) · [Imitation and VLAs](https://noeira.ai/docs/algorithms/imitation/) | RL, world models, ACT, SmolVLA, HIL-SERL |
-| [Robots](https://noeira.ai/docs/robots/) · [Jetson Orin](https://noeira.ai/docs/robots/jetson/) | the SO-101, cameras, recording, deployment |
-| [Neural networks](https://noeira.ai/docs/nn/) · [LeRobot datasets](https://noeira.ai/docs/data/lerobot/) · [noeira cloud](https://noeira.ai/docs/tooling/monitor/) | the infrastructure |
+| [Robots](https://noeira.ai/docs/robots/) · [Jetson Orin](https://noeira.ai/docs/robots/jetson/) | robot drivers, cameras, recording, deployment |
+| [Neural networks](https://noeira.ai/docs/nn/) · [Datasets](https://noeira.ai/docs/data/) · [noeira cloud](https://noeira.ai/docs/tooling/monitor/) | the infrastructure |
 | [Toolchain](https://noeira.ai/docs/project/toolchain/) · [Testing](https://noeira.ai/docs/project/testing/) · [Contributing](https://noeira.ai/docs/project/contributing/) | working on noeira itself |
 
 The site is built from `docs-site/`.
@@ -125,8 +126,9 @@ noeira leans on reference implementations throughout, as correctness oracles:
 [MuJoCo](https://mujoco.org/) and the [MuJoCo Menagerie](https://github.com/google-deepmind/mujoco_menagerie) for physics and robot models,
 [Gymnasium](https://github.com/Farama-Foundation/Gymnasium) and [DeepMind Control](https://github.com/google-deepmind/dm_control) for environments,
 [LIBERO](https://github.com/Lifelong-Robot-Learning/LIBERO) and [robosuite](https://github.com/ARISE-Initiative/robosuite) for the manipulation benchmark,
-[LeRobot](https://github.com/huggingface/lerobot) for datasets, ACT and SmolVLA,
+[LeRobot](https://github.com/huggingface/lerobot) for its dataset format and the ACT and SmolVLA references,
 and [HIL-SERL](https://github.com/rail-berkeley/hil-serl) for learning from interventions.
+LeRobot and [Rerun](https://rerun.io) were an early inspiration for the robot side; noeira depends on neither.
 
 ## License
 

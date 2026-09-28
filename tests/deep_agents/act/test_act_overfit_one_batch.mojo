@@ -228,6 +228,14 @@ def main() raises:
         abs(after.l1 - before.l1) < 1e-5,
         "before " + String(before.l1) + " after " + String(after.l1),
     )
+    # The moments ride the checkpoint, so Adam's step must too: restored
+    # under t = 0 they are divided by the step-1 bias corrections.
+    check(
+        fails,
+        "Adam's step state round-trips with the moments",
+        tr.opt.t > 0 and tr2.opt.t == tr.opt.t and tr2.opt.bc2 == tr.opt.bc2,
+        "saved t " + String(tr.opt.t) + " restored t " + String(tr2.opt.t),
+    )
 
     print("")
     if fails == 0:

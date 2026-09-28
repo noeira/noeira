@@ -20,6 +20,7 @@ from max.gpu.host import DeviceContext, DeviceBuffer
 from layout import LayoutTensor, Layout
 
 from noeira.nn.constants import DT
+from noeira.nn.core.checkpoint import CheckpointScalars
 
 
 # state_dev layout — single [6] device buffer.
@@ -195,3 +196,51 @@ struct ScalarAdam(Movable & Deinitable):
         ctx.enqueue_copy(h, self.state_dev.value())
         ctx.synchronize()
         return h[_SA_ALPHA]
+
+    def put_state(mut self, mut sc: CheckpointScalars, prefix: String) raises:
+        """Record the whole optimizer — the tuned value, both moments and both
+        bias-correction powers — as `<prefix>.value/.m/.v/.b1_pow/.b2_pow`.
+
+        On the GPU path the host fields are never advanced (see the module
+        header), so the live state is read back from `state_dev` first; saving
+        the host fields there would checkpoint the INITIAL α."""
+        if self.state_dev:
+            var ctx = self._ctx.value()
+            var h = ctx.enqueue_create_host_buffer[DT](_SA_STATE_N)
+            ctx.enqueue_copy(h, self.state_dev.value())
+            ctx.synchronize()
+            self.value = h[_SA_LOG_ALPHA]
+            self.m = h[_SA_M]
+            self.v = h[_SA_V]
+            self.beta1_pow_t = h[_SA_B1POW]
+            self.beta2_pow_t = h[_SA_B2POW]
+        sc.set(prefix + ".value", Float64(self.value))
+        sc.set(prefix + ".m", Float64(self.m))
+        sc.set(prefix + ".v", Float64(self.v))
+        sc.set_int(prefix + ".t", self.t)
+        sc.set(prefix + ".b1_pow", Float64(self.beta1_pow_t))
+        sc.set(prefix + ".b2_pow", Float64(self.beta2_pow_t))
+
+    def take_state(mut self, sc: CheckpointScalars, prefix: String) raises:
+        """Inverse of `put_state`, host AND device. A checkpoint without these
+        keys leaves the optimizer untouched."""
+        if not sc.has(prefix + ".value"):
+            return
+        self.value = Scalar[DT](sc.get(prefix + ".value", 0.0))
+        self.m = Scalar[DT](sc.get(prefix + ".m", 0.0))
+        self.v = Scalar[DT](sc.get(prefix + ".v", 0.0))
+        self.t = sc.get_int(prefix + ".t", 0)
+        self.beta1_pow_t = Scalar[DT](sc.get(prefix + ".b1_pow", 1.0))
+        self.beta2_pow_t = Scalar[DT](sc.get(prefix + ".b2_pow", 1.0))
+        if self.state_dev:
+            var ctx = self._ctx.value()
+            var h = ctx.enqueue_create_host_buffer[DT](_SA_STATE_N)
+            ctx.synchronize()
+            h[_SA_LOG_ALPHA] = self.value
+            h[_SA_M] = self.m
+            h[_SA_V] = self.v
+            h[_SA_B1POW] = self.beta1_pow_t
+            h[_SA_B2POW] = self.beta2_pow_t
+            h[_SA_ALPHA] = fexp(self.value)
+            ctx.enqueue_copy(self.state_dev.value(), h)
+            ctx.synchronize()

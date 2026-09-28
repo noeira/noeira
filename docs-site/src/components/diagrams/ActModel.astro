@@ -1,0 +1,141 @@
+---
+/**
+ * ActModel — one ACT query: cameras, joints and a latent in, K actions out.
+ *
+ * The dashed CVAE encoder along the bottom is the thing to notice. It exists
+ * only in training, where it reads the recorded chunk to produce z; at
+ * inference it is gone and z is the prior's mean, zero. Drawing it outside the
+ * forward path, with a dashed edge, is the difference between "a transformer
+ * that predicts a chunk" and the CVAE the paper describes.
+ *
+ * The decoder is drawn as one layer because the port has one: the reference
+ * returns index [0] of its seven-layer stack, so the other six never reach the
+ * output (see "Two quirks of the reference" on the page).
+ */
+
+/** Rows of the input column. */
+const ROWS = { cam: 70, joints: 160, z: 244 };
+
+const ENC = { x: 400, y: 40, w: 140, h: 232 };
+const DEC = { x: 590, y: 40, w: 130, h: 232 };
+const ENC_MID = ENC.x + ENC.w / 2;
+const DEC_MID = DEC.x + DEC.w / 2;
+---
+
+<figure class="diagram not-content">
+	<svg viewBox="0 0 880 400" role="img"
+		aria-label="ACT: camera images through a shared ResNet18, a joint-state token and a latent token feed a transformer encoder; a one-layer decoder turns K learned queries into a chunk of K actions; a CVAE encoder produces the latent from the recorded chunk in training only">
+		<defs>
+			<marker id="am-cyan" viewBox="0 0 10 10" refX="9" refY="5"
+				markerWidth="6" markerHeight="6" orient="auto-start-reverse">
+				<path d="M 0 0 L 10 5 L 0 10 z" class="dg-fill-cyan" />
+			</marker>
+			<marker id="am-spark" viewBox="0 0 10 10" refX="9" refY="5"
+				markerWidth="6" markerHeight="6" orient="auto-start-reverse">
+				<path d="M 0 0 L 10 5 L 0 10 z" class="dg-fill-spark" />
+			</marker>
+			<marker id="am-purple" viewBox="0 0 10 10" refX="9" refY="5"
+				markerWidth="6" markerHeight="6" orient="auto-start-reverse">
+				<path d="M 0 0 L 10 5 L 0 10 z" class="dg-fill-purple" />
+			</marker>
+			<marker id="am-muted" viewBox="0 0 10 10" refX="9" refY="5"
+				markerWidth="6" markerHeight="6" orient="auto-start-reverse">
+				<path d="M 0 0 L 10 5 L 0 10 z" class="dg-fill-muted" />
+			</marker>
+			<marker id="am-green" viewBox="0 0 10 10" refX="9" refY="5"
+				markerWidth="6" markerHeight="6" orient="auto-start-reverse">
+				<path d="M 0 0 L 10 5 L 0 10 z" class="dg-fill-green" />
+			</marker>
+		</defs>
+
+		<!-- ── inputs ──────────────────────────────────────────────────── -->
+		<g class="dg-node dg-node--cyan">
+			<rect x="20" y={ROWS.cam - 30} width="150" height="60" rx="10" />
+			<text x="95" y={ROWS.cam - 4} class="dg-title">2 cameras</text>
+			<text x="95" y={ROWS.cam + 17} class="dg-sub">240 × 320 each</text>
+		</g>
+		<g class="dg-node dg-node--purple">
+			<rect x="210" y={ROWS.cam - 30} width="150" height="60" rx="10" />
+			<text x="285" y={ROWS.cam - 4} class="dg-title">ResNet18</text>
+			<text x="285" y={ROWS.cam + 17} class="dg-sub">shared · frozen BN</text>
+		</g>
+		<path class="dg-edge dg-edge--cyan" marker-end="url(#am-cyan)"
+			d={`M 170 ${ROWS.cam} L 208 ${ROWS.cam}`} />
+		<path class="dg-edge dg-edge--cyan" marker-end="url(#am-cyan)"
+			d={`M 360 ${ROWS.cam} L ${ENC.x - 2} ${ROWS.cam}`} />
+
+		<g class="dg-node dg-node--cyan">
+			<rect x="20" y={ROWS.joints - 28} width="150" height="56" rx="10" />
+			<text x="95" y={ROWS.joints - 4} class="dg-title">joints</text>
+			<text x="95" y={ROWS.joints + 16} class="dg-sub">1 state token</text>
+		</g>
+		<path class="dg-edge dg-edge--cyan" marker-end="url(#am-cyan)"
+			d={`M 170 ${ROWS.joints} L ${ENC.x - 2} ${ROWS.joints}`} />
+
+		<g class="dg-node dg-node--spark">
+			<rect x="20" y={ROWS.z - 28} width="150" height="56" rx="10" />
+			<text x="95" y={ROWS.z - 4} class="dg-title">z</text>
+			<text x="95" y={ROWS.z + 16} class="dg-sub">= 0 at inference</text>
+		</g>
+		<path class="dg-edge dg-edge--spark" marker-end="url(#am-spark)"
+			d={`M 170 ${ROWS.z} L ${ENC.x - 2} ${ROWS.z}`} />
+
+		<!-- the CVAE encoder: training only -->
+		<g class="dg-node dg-node--muted">
+			<rect x="20" y="318" width="340" height="62" rx="10" stroke-dasharray="6 5" />
+			<text x="190" y="344" class="dg-title">CVAE encoder</text>
+			<text x="190" y="366" class="dg-sub">training only · reads the recorded chunk</text>
+		</g>
+		<path class="dg-edge dg-edge--spark dg-edge--dashed" marker-end="url(#am-spark)"
+			d={`M 95 318 L 95 ${ROWS.z + 30}`} />
+		<text x="106" y="298" class="dg-label dg-label--spark">z ~ q(z | chunk, joints)</text>
+
+		<!-- ── transformer ─────────────────────────────────────────────── -->
+		<g class="dg-node dg-node--purple">
+			<rect x={ENC.x} y={ENC.y} width={ENC.w} height={ENC.h} rx="10" />
+			<text x={ENC_MID} y={ENC.y + ENC.h / 2 - 4} class="dg-title">encoder</text>
+			<text x={ENC_MID} y={ENC.y + ENC.h / 2 + 18} class="dg-sub">4 layers</text>
+		</g>
+		<g class="dg-node dg-node--purple">
+			<rect x={DEC.x} y={DEC.y} width={DEC.w} height={DEC.h} rx="10" />
+			<text x={DEC_MID} y={DEC.y + DEC.h / 2 - 4} class="dg-title">decoder</text>
+			<text x={DEC_MID} y={DEC.y + DEC.h / 2 + 18} class="dg-sub">1 layer</text>
+		</g>
+		<path class="dg-edge dg-edge--purple" marker-end="url(#am-purple)"
+			d={`M ${ENC.x + ENC.w} 156 L ${DEC.x - 2} 156`} />
+		<text x={(ENC.x + ENC.w + DEC.x) / 2} y="146" class="dg-caption">K / V</text>
+
+		<g class="dg-node dg-node--muted">
+			<rect x={DEC.x} y="318" width={DEC.w} height="62" rx="10" />
+			<text x={DEC_MID} y="344" class="dg-title">K queries</text>
+			<text x={DEC_MID} y="366" class="dg-sub">learned</text>
+		</g>
+		<path class="dg-edge dg-edge--muted" marker-end="url(#am-muted)"
+			d={`M ${DEC_MID} 318 L ${DEC_MID} ${DEC.y + DEC.h + 2}`} />
+
+		<!-- ── the chunk ───────────────────────────────────────────────── -->
+		<path class="dg-edge dg-edge--green" marker-end="url(#am-green)"
+			d={`M ${DEC.x + DEC.w} 156 L 758 156`} />
+		{
+			Array.from({ length: 8 }, (_, i) => (
+				<rect class="dg-fill-green" x="760" y={60 + i * 24} width="100" height="18" rx="3"
+					opacity={i === 0 ? 1 : 0.55} />
+			))
+		}
+		<text x="810" y="46" class="dg-caption">a_t … a_t+K−1</text>
+		<text x="810" y="272" class="dg-caption">K = 60 · 2 s</text>
+	</svg>
+
+	<figcaption class="diagram__legend">
+		<span class="diagram__key diagram__key--cyan">observation</span>
+		<span class="diagram__key diagram__key--spark">latent</span>
+		<span class="diagram__key diagram__key--purple">networks</span>
+		<span class="diagram__key diagram__key--green">action chunk</span>
+		<span class="diagram__key diagram__key--muted">training only / learned queries</span>
+	</figcaption>
+
+	<div class="diagram__formula">
+		<span class="diagram__formula-title">training loss</span>
+		<code>L = L1(chunk, predicted chunk) + β · KL( q(z | chunk, joints) ‖ N(0, I) ),   β = 10</code>
+	</div>
+</figure>

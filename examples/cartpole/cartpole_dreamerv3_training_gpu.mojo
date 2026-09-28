@@ -23,8 +23,9 @@ from max.gpu.host import DeviceContext
 from std.random import seed
 from std.time import perf_counter_ns
 
-from noeira.core.dotenv import load_dotenv
-from noeira.core.logger import RemoteLogger
+from noeira.core.run import RunContext, register_run
+from noeira.core.run_session import RunLogger, finish_run, run_logger
+from noeira.io.artifact_sink import sink_for_run
 from noeira.nn.constants import DT
 from noeira.nn.core.initializer import Kaiming
 from noeira.deep_agents.dreamerv3.agent import DreamerV3Agent
@@ -83,7 +84,6 @@ comptime EVAL_EVERY = 2500
 comptime EVAL_EPISODES = 10
 comptime EP_LEN = 500
 comptime CHECKPOINT_EVERY = 25_000
-comptime CHECKPOINT_PATH = "dreamerv3_cartpole_gpu.ckpt"
 
 
 def main() raises:
@@ -98,20 +98,22 @@ def main() raises:
     print("=" * 70)
 
     with DeviceContext() as ctx:
-        # ─── Logger (remote) ─────────────────────────────────────────────
-        var env_vars = load_dotenv()
-        var api_key = env_vars.get("NOEIRA_CLOUD_API_KEY", "")
-        var url = env_vars.get("NOEIRA_CLOUD_URL", "")
-        var logger = RemoteLogger(
-            server_url=url,
-            run_name="DreamerV3 CartPole (GPU)",
-            buffer_size=200,
-            api_key=api_key,
+        # ─── Run + logger ────────────────────────────────────────────────
+        var run = RunContext(
+            project=String("classic-control"),
+            driver=String("examples/cartpole/cartpole_dreamerv3_training_gpu.mojo"),
+            slug=String("dreamerv3-cartpole-gpu"),
+            env=String("builtin:classic-control/cartpole"),
         )
+        var checkpoint_path = run.checkpoint_path(String("last"))
+        print("  Run:", run.dir)
+        var logger = run_logger(run, buffer_size=200)
         logger.set_config("algorithm", "DreamerV3")
         logger.set_config("env", "CartPole")
         logger.set_config("target", "gpu")
         logger.set_config("t_imag", String(T_IMAG))
+        register_run(run, logger)
+        var artifacts = sink_for_run(run.id, run.dir)
         var logger_ptr = Pointer(to=logger).as_unsafe_any_origin()
 
         # ─── Agent (GPU) + env (CPU; obs marshalled H2D in select_action) ──
@@ -133,7 +135,7 @@ def main() raises:
         # `tests/nn/test_dreamerv3_capture_parity.mojo`, ΔWM=ΔAC=0.0) so
         # convergence is unchanged; a no-op on non-NVIDIA (runs eagerly).
         var final_ret = agent.train_single[
-            EnvT, L=RemoteLogger, USE_TRAIN_CUDA_GRAPH=True
+            EnvT, L=RunLogger, USE_TRAIN_CUDA_GRAPH=True
         ](
             env,
             NUM_STEPS,
@@ -145,11 +147,17 @@ def main() raises:
             print_every=EVAL_EVERY,
             verbose=True,
             logger=logger_ptr,
-            checkpoint_path=CHECKPOINT_PATH,
+            checkpoint_path=checkpoint_path,
+            artifacts=artifacts,
+            run_dir=run.dir,
             checkpoint_every=CHECKPOINT_EVERY,
         )
         var elapsed_s = Float64(perf_counter_ns() - t_start) / 1e9
-        logger.close()
+        var sent = logger.b.total_logged()
+        finish_run(
+            run, logger, artifacts,
+            String("eval_return=") + String(final_ret),
+        )
         _ = logger  # lifetime extender for logger_ptr
 
         # ─── Summary ─────────────────────────────────────────────────────
@@ -159,7 +167,7 @@ def main() raises:
         print("  total env_steps        =", NUM_STEPS)
         print("  elapsed                =", elapsed_s, "s")
         print("  FINAL mean_ret(", EVAL_EPISODES, ")  =", final_ret)
-        print("  remote points sent     =", logger.total_logged())
+        print("  remote points sent     =", sent)
         if Float64(final_ret) >= 475.0:
             print("SOLVED — mean_ret >= 475.")
         elif Float64(final_ret) >= 200.0:

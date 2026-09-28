@@ -1,0 +1,170 @@
+---
+/**
+ * ForwardBackward — what FB trains, and what it does with a reward afterwards.
+ *
+ * Two panels because the algorithm has two moments that never overlap: a
+ * training run that sees no reward at all, and a zero-shot step that sees a
+ * reward and trains nothing. The right panel has no learning edge on purpose —
+ * `z_r` is an average, and drawing a gradient there would be the most common
+ * misreading of FB.
+ *
+ * Colours: cyan for states, purple for the two networks and the actor, spark
+ * for the task vector z, green for what comes out.
+ */
+
+/** Left edge and width of the input column in panel (a). */
+const IN_X = 20;
+const IN_W = 140;
+
+/** The two networks share one column. */
+const NET_X = 210;
+const NET_W = 150;
+
+/** The inner product, between the networks and the result. */
+const DOT = { x: 415, y: 234, r: 18 };
+
+/** Panel (b): one centred column. */
+const B_X = 645;
+const B_W = 200;
+const B_MID = B_X + B_W / 2;
+
+/** Held in bindings: a literal `{` in Astro markup opens an expression. */
+const Q_FORMULA = 'Q_r(s, a) = F(s, a, z_r)ᵀ z_r,   z_r = √d · normalise( E_ρ[ B(s) · r(s) ] )';
+---
+
+<figure class="diagram not-content">
+	<svg viewBox="0 0 880 420" role="img"
+		aria-label="Forward-Backward: F(s,a,z) and B(s′) are trained without a reward so that their inner product approximates the successor measure; afterwards a reward picks z as the reward-weighted average of B over states, and the policy for that z runs with no further training">
+		<defs>
+			<marker id="fb-cyan" viewBox="0 0 10 10" refX="9" refY="5"
+				markerWidth="6" markerHeight="6" orient="auto-start-reverse">
+				<path d="M 0 0 L 10 5 L 0 10 z" class="dg-fill-cyan" />
+			</marker>
+			<marker id="fb-spark" viewBox="0 0 10 10" refX="9" refY="5"
+				markerWidth="6" markerHeight="6" orient="auto-start-reverse">
+				<path d="M 0 0 L 10 5 L 0 10 z" class="dg-fill-spark" />
+			</marker>
+			<marker id="fb-purple" viewBox="0 0 10 10" refX="9" refY="5"
+				markerWidth="6" markerHeight="6" orient="auto-start-reverse">
+				<path d="M 0 0 L 10 5 L 0 10 z" class="dg-fill-purple" />
+			</marker>
+			<marker id="fb-green" viewBox="0 0 10 10" refX="9" refY="5"
+				markerWidth="6" markerHeight="6" orient="auto-start-reverse">
+				<path d="M 0 0 L 10 5 L 0 10 z" class="dg-fill-green" />
+			</marker>
+		</defs>
+
+		<text x="20" y="30" class="dg-title dg-title--left">(a) training</text>
+		<text x="20" y="52" class="dg-sub dg-sub--left">no reward anywhere</text>
+
+		<text x={B_X} y="30" class="dg-title dg-title--left">(b) zero-shot</text>
+		<text x={B_X} y="52" class="dg-sub dg-sub--left">a reward, given after training</text>
+
+		<line class="dg-tick" x1="615" y1="16" x2="615" y2="404" />
+
+		<!-- ── (a) inputs ─────────────────────────────────────────────── -->
+		<g class="dg-node dg-node--cyan">
+			<rect x={IN_X} y="80" width={IN_W} height="56" rx="10" />
+			<text x={IN_X + IN_W / 2} y="104" class="dg-title">(s, a)</text>
+			<text x={IN_X + IN_W / 2} y="124" class="dg-sub">from replay</text>
+		</g>
+		<g class="dg-node dg-node--spark">
+			<rect x={IN_X} y="160" width={IN_W} height="56" rx="10" />
+			<text x={IN_X + IN_W / 2} y="184" class="dg-title">z</text>
+			<text x={IN_X + IN_W / 2} y="204" class="dg-sub">‖z‖ = √d</text>
+		</g>
+		<text x={IN_X + IN_W / 2} y="238" class="dg-caption">½ uniform on the sphere</text>
+		<text x={IN_X + IN_W / 2} y="254" class="dg-caption">½ B(s) from the batch</text>
+		<g class="dg-node dg-node--cyan">
+			<rect x={IN_X} y="290" width={IN_W} height="56" rx="10" />
+			<text x={IN_X + IN_W / 2} y="314" class="dg-title">s′</text>
+			<text x={IN_X + IN_W / 2} y="334" class="dg-sub">a later state</text>
+		</g>
+
+		<!-- ── (a) the two networks ───────────────────────────────────── -->
+		<g class="dg-node dg-node--purple">
+			<rect x={NET_X} y="110" width={NET_W} height="80" rx="10" />
+			<text x={NET_X + NET_W / 2} y="144" class="dg-title">F(s, a, z)</text>
+			<text x={NET_X + NET_W / 2} y="166" class="dg-sub">forward → ℝᵈ</text>
+		</g>
+		<g class="dg-node dg-node--purple">
+			<rect x={NET_X} y="278" width={NET_W} height="80" rx="10" />
+			<text x={NET_X + NET_W / 2} y="312" class="dg-title">B(s′)</text>
+			<text x={NET_X + NET_W / 2} y="334" class="dg-sub">backward → ℝᵈ</text>
+		</g>
+
+		<path class="dg-edge dg-edge--cyan" marker-end="url(#fb-cyan)"
+			d={`M ${IN_X + IN_W} 108 L 184 108 L 184 132 L ${NET_X - 2} 132`} />
+		<path class="dg-edge dg-edge--spark" marker-end="url(#fb-spark)"
+			d={`M ${IN_X + IN_W} 188 L 184 188 L 184 168 L ${NET_X - 2} 168`} />
+		<path class="dg-edge dg-edge--cyan" marker-end="url(#fb-cyan)"
+			d={`M ${IN_X + IN_W} 318 L ${NET_X - 2} 318`} />
+
+		<!-- ── (a) inner product → successor measure ──────────────────── -->
+		<path class="dg-edge dg-edge--purple" marker-end="url(#fb-purple)"
+			d={`M ${NET_X + NET_W} 150 L ${DOT.x} 150 L ${DOT.x} ${DOT.y - DOT.r - 2}`} />
+		<path class="dg-edge dg-edge--purple" marker-end="url(#fb-purple)"
+			d={`M ${NET_X + NET_W} 318 L ${DOT.x} 318 L ${DOT.x} ${DOT.y + DOT.r + 2}`} />
+		<circle cx={DOT.x} cy={DOT.y} r={DOT.r} class="dg-tree-node" />
+		<text x={DOT.x} y={DOT.y + 5} class="dg-tree-label">·</text>
+
+		<path class="dg-edge dg-edge--green" marker-end="url(#fb-green)"
+			d={`M ${DOT.x + DOT.r} ${DOT.y} L 453 ${DOT.y}`} />
+		<g class="dg-node dg-node--green">
+			<rect x="455" y="200" width="140" height="68" rx="10" />
+			<text x="525" y="228" class="dg-title">Fᵀ B ≈ M</text>
+			<text x="525" y="250" class="dg-sub">successor measure</text>
+		</g>
+		<text x="525" y="290" class="dg-caption">time π_z spends near s′,</text>
+		<text x="525" y="306" class="dg-caption">starting from (s, a)</text>
+
+		<g class="dg-node dg-node--purple">
+			<rect x="455" y="80" width="140" height="68" rx="10" />
+			<text x="525" y="108" class="dg-title">actor π_z</text>
+			<text x="525" y="130" class="dg-sub">maximise Fᵀ z</text>
+		</g>
+
+		<!-- ── (b) zero-shot, top to bottom ───────────────────────────── -->
+		<g class="dg-node dg-node--cyan">
+			<rect x={B_X} y="80" width={B_W} height="62" rx="10" />
+			<text x={B_MID} y="106" class="dg-title">states s ~ ρ</text>
+			<text x={B_MID} y="128" class="dg-sub">each labelled with r(s)</text>
+		</g>
+		<path class="dg-edge dg-edge--cyan" marker-end="url(#fb-cyan)"
+			d={`M ${B_MID} 142 L ${B_MID} 166`} />
+
+		<g class="dg-node dg-node--purple">
+			<rect x={B_X} y="168" width={B_W} height="62" rx="10" />
+			<text x={B_MID} y="194" class="dg-title">B(s)</text>
+			<text x={B_MID} y="216" class="dg-sub">the trained net, frozen</text>
+		</g>
+		<path class="dg-edge dg-edge--purple" marker-end="url(#fb-purple)"
+			d={`M ${B_MID} 230 L ${B_MID} 254`} />
+
+		<g class="dg-node dg-node--spark">
+			<rect x={B_X} y="256" width={B_W} height="62" rx="10" />
+			<text x={B_MID} y="282" class="dg-title">z_r = E[ B(s) r(s) ]</text>
+			<text x={B_MID} y="304" class="dg-sub">rescaled to ‖z‖ = √d</text>
+		</g>
+		<path class="dg-edge dg-edge--spark" marker-end="url(#fb-spark)"
+			d={`M ${B_MID} 318 L ${B_MID} 342`} />
+
+		<g class="dg-node dg-node--green">
+			<rect x={B_X} y="344" width={B_W} height="62" rx="10" />
+			<text x={B_MID} y="370" class="dg-title">run π_z_r</text>
+			<text x={B_MID} y="392" class="dg-sub">no gradient step</text>
+		</g>
+	</svg>
+
+	<figcaption class="diagram__legend">
+		<span class="diagram__key diagram__key--cyan">states</span>
+		<span class="diagram__key diagram__key--purple">networks</span>
+		<span class="diagram__key diagram__key--spark">task vector z</span>
+		<span class="diagram__key diagram__key--green">what comes out</span>
+	</figcaption>
+
+	<div class="diagram__formula">
+		<span class="diagram__formula-title">Q-function for any reward r</span>
+		<code>{Q_FORMULA}</code>
+	</div>
+</figure>

@@ -19,8 +19,11 @@ transfers → closed-loop is worth building. If the reconstructions are garbage
 Loads `lewm_pusht_paper.ckpt` + `/tmp/lewm_pusht_decoder.txt`.
 Run (NVIDIA; 224² WM):
   pixi run -e nvidia mojo run -I . examples/lewm/lewm_pusht_simdomain_diag_gpu.mojo
+  pixi run -e nvidia mojo run -I . examples/lewm/lewm_pusht_simdomain_diag_gpu.mojo --ckpt <run_id>
 """
 
+from std.sys import argv
+from noeira.core.run import resolve_checkpoint
 from std.random import random_float64, seed as rng_seed
 from max.gpu.host import DeviceContext, DeviceBuffer
 from layout import TileTensor, row_major
@@ -97,7 +100,19 @@ def _rand_target() -> PushTAction[DT]:
     return PushTAction[DT](x, y)
 
 
+def _flag(name: String, dflt: String) raises -> String:
+    """Value of `--name X`, or `dflt` when the flag is absent."""
+    var av = argv()
+    for i in range(1, len(av)):
+        if String(av[i]) == name:
+            if i + 1 >= len(av):
+                raise Error("flag " + name + " needs a value")
+            return String(av[i + 1])
+    return dflt
+
+
 def main() raises:
+    var ckpt = resolve_checkpoint(_flag(String("--ckpt"), WM_CKPT), String("last"))
     print("=" * 70)
     print("LeWM nn — PushT sim-domain transfer diagnostic (GPU)")
     print("=" * 70)
@@ -105,8 +120,8 @@ def main() raises:
     var ctx = DeviceContext()
 
     var wm = Trainer.make(lam=Scalar[DT](0.09), lr=Scalar[DT](1e-3), ctx=ctx)
-    print("loading frozen WM", WM_CKPT, "...")
-    wm.load_params(WM_CKPT)
+    print("loading frozen WM", ckpt, "...")
+    wm.load_params(ckpt)
     var dec = Decoder.make(lr=Scalar[DT](1e-3), ctx=ctx)
     print("loading decoder", DEC_CKPT, "...")
     dec.load_params(DEC_CKPT)

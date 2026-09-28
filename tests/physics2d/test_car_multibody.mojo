@@ -22,14 +22,14 @@ from noeira.physics2d.car.constants import (
     FRICTION_LIMIT, GRASS_FRICTION, STEERING_LIMIT,
     CTRL_STEERING, CTRL_GAS, CTRL_BRAKE,
 )
-from noeira.physics2d.constants import BODY_STATE_SIZE
+from noeira.physics2d.constants import BODY_STATE_SIZE, JOINT_DATA_SIZE
 from noeira.nn.core.ptr import mptr
 
 # Compact validation layout (one car).
 comptime BOFF = 0
-comptime FOFF = BOFF + CarDynamicsMB.NUM_BODIES * 13          # bodies are 13 floats
+comptime FOFF = BOFF + CarDynamicsMB.NUM_BODIES * BODY_STATE_SIZE
 comptime JOFF = FOFF + CarDynamicsMB.NUM_BODIES * 3
-comptime ROFF = JOFF + CarDynamicsMB.NUM_JOINTS * 17          # joints are 17 floats
+comptime ROFF = JOFF + CarDynamicsMB.NUM_JOINTS * JOINT_DATA_SIZE
 comptime COFF = ROFF + CarDynamicsMB.NUM_WHEELS
 comptime SSZ = COFF + 3
 comptime DT = Scalar[dtype](0.02)
@@ -75,9 +75,9 @@ def run_scenario(
 
 
 def run_spin_check(nsteps: Int) raises -> Tuple[Float64, Float64]:
-    """Full gas + full lock: the car spins fast, so the (wrapped) hull angle
-    crosses +/-pi repeatedly. Returns (max |front-wheel steering angle|,
-    crossed-pi flag). The steering revolute joint must stay within
+    """Full gas + full lock: the car spins fast, so the hull turns past +/-pi
+    (angles are not wrapped, as in Box2D). Returns (max |front-wheel steering
+    angle|, turned-past-pi flag). The steering revolute joint must stay within
     +/-STEERING_LIMIT despite the hull crossing +/-pi — the regression guard
     for the angle-wrap-vs-joint-limit bug (a glitched relative angle let the
     motor slam the wheel a full turn past its limit)."""
@@ -100,18 +100,15 @@ def run_spin_check(nsteps: Int) raises -> Tuple[Float64, Float64]:
     var bsz = Int(BODY_STATE_SIZE)
     var max_rel = 0.0
     var crossed = False
-    var prev_hull = 0.0
     for _ in range(nsteps):
         CarDynamicsMB.step_single_env[1, SSZ, BOFF, FOFF, JOFF, ROFF, COFF](
             0, state, fric, DT
         )
         var hull = Float64(rebind[Scalar[dtype]](state[0, BOFF + IDX_ANGLE]))
-        # A >pi jump between consecutive steps == the hull wrapped past +/-pi.
-        var jump = prev_hull - hull
-        var ajump = jump if jump >= 0.0 else -jump
-        if ajump > pi_v:
+        # The unwrapped hull angle turned past +/-pi.
+        var ahull = hull if hull >= 0.0 else -hull
+        if ahull > pi_v:
             crossed = True
-        prev_hull = hull
         # Front wheels are bodies 1 and 2; steering angle = wheel - hull.
         for wb in range(1, 3):
             var wa = Float64(

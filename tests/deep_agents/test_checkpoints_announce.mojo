@@ -231,6 +231,51 @@ def main() raises:
             " agents train, save, and never upload."
         )
 
+    # ── facades with their OWN loop announce their own saves ───────
+    #
+    # TD-MPC2 and DreamerV3 do not call a shared driver: their facade runs the
+    # loop and saves itself, so there is no `artifacts=` to forward and the
+    # check above cannot see them. Each such save must be followed by the
+    # announce, exactly as in the drivers.
+    var own = run_capture(
+        String(
+            "grep -rlE 'self\\.save(_state)?\\(checkpoint_path\\)'"
+            " noeira/deep_agents/*/agent*.mojo 2>/dev/null"
+        ),
+        1 << 20,
+    )
+    var own_files = 0
+    var own_sites = 0
+    var own_bad = 0
+    for line in own.split("\n"):
+        var f = String(String(line).strip())
+        if f.byte_length() == 0:
+            continue
+        own_files += 1
+        var ls = _lines(_read(f))
+        for n in range(len(ls)):
+            var t = String(String(ls[n]).strip())
+            if t != "self.save(checkpoint_path)" and t != "self.save_state(checkpoint_path)":
+                continue
+            own_sites += 1
+            var nxt = String("")
+            for m in range(n + 1, len(ls)):
+                var u = String(String(ls[m]).strip())
+                if u.byte_length() > 0:
+                    nxt = u
+                    break
+            if nxt.find("announce_checkpoint(checkpoint_path, artifacts, run_dir)") < 0:
+                own_bad += 1
+                print("    " + f + ":" + String(n + 1) + " saves and does not announce")
+    print(
+        "  " + String(own_files) + " facades save in their own loop, "
+        + String(own_sites) + " sites, " + String(own_bad) + " unannounced"
+    )
+    if own_files == 0 or own_sites == 0:
+        raise Error("no facade saves in its own loop — the grep found nothing")
+    if own_bad != 0:
+        raise Error(String(own_bad) + " facade save(s) never reach the sink")
+
     # ── the rule the source gate CANNOT see ─────────────────────────
     #
     # ⚠⚠ A SOURCE GATE PROVES THE CALL IS THERE, NOT THAT IT DOES ANYTHING.

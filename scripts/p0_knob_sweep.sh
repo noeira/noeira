@@ -10,8 +10,10 @@
 #   KNOB=NEWTON_MIN_ITER VALUES="0 20 100 180" \
 #       pixi run -e nvidia bash scripts/p0_knob_sweep.sh
 #
-#   # F3 step 2 — OCCUPANCY. Threads per block = max(MAX_CONTACTS, FLOOR).
-#   # Bit-exact at every value; lives in je_budget.mojo:
+#   # F3 step 2 — OCCUPANCY. Threads per block = max(MAX_CONTACTS, FLOOR),
+#   # where FLOOR is this knob only for blocks over NEWTON_SMALL_BLOCK_MAX_BYTES
+#   # (smaller ones take NEWTON_THREADS_FLOOR_SMALL_BLOCK — sweep that knob for
+#   # the park k <= 6 legs). Bit-exact at every value; lives in je_budget.mojo:
 #   KNOB_SRC=noeira/physics3d/solver/je_budget.mojo \
 #   KNOB=NEWTON_THREADS_FLOOR VALUES="16 32 64 128" \
 #       pixi run -e nvidia bash scripts/p0_knob_sweep.sh

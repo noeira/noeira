@@ -28,6 +28,7 @@ from noeira.nn.constants import DT, TPB
 from ..core.tensor import Tensor
 from ..core.param import ParamVisitor, ParamVersionBump, ParamVisitorRT, ParamVisitorRef, walk_params
 from ..core.param import ParamWalkable
+from ..core.checkpoint import CheckpointScalars
 from .param_arena import ParamArena, align_param_off
 from .grad_clip import (
     clip_grad_norm, clip_arena_grads, clip_arena_grads_captured,
@@ -202,8 +203,9 @@ struct _MomentPlacer(ParamVisitor, ParamVisitorRT):
     only the handle the checkpoint walk reads was missing.
 
     The slices alias the same offsets `ParamArena` used for val/grd, so the
-    walk order is the one `adopt` just used. Placement only — no copy: the
-    moment arenas are freshly zeroed, which is exactly Adam's initial state.
+    walk order is the one `adopt` just used. A param with no moments yet gets
+    the freshly zeroed slice — Adam's initial state; one that already holds
+    moments (a checkpoint loaded before `adopt`) has them copied in.
     """
 
     var m_arena: DeviceBuffer[DT]
@@ -235,9 +237,20 @@ struct _MomentPlacer(ParamVisitor, ParamVisitorRT):
             # Same rounding as `ParamArena` — the moments alias val/grd BY
             # OFFSET, so the two walks must land on identical boundaries.
             self.off = align_param_off(self.off)
-            m.dev = Optional(self.m_arena.create_sub_buffer[DT](self.off, n))
+            var m_sub = self.m_arena.create_sub_buffer[DT](self.off, n)
+            var v_sub = self.v_arena.create_sub_buffer[DT](self.off, n)
+            # ⚠ Moments that already exist — restored from a checkpoint
+            # before `adopt`, or accumulated by per-param steps — are COPIED
+            # into the arena, not dropped. Re-pointing alone silently discarded
+            # a resume's moments whenever the load ran before the adopt, and
+            # the resumed run was worse than a cold optimizer.
+            if m.dev and v.dev and m.n >= n and v.n >= n:
+                var c = ctx.value()
+                c.enqueue_copy(m_sub, m.dev.value().create_sub_buffer[DT](0, n))
+                c.enqueue_copy(v_sub, v.dev.value().create_sub_buffer[DT](0, n))
+            m.dev = Optional(m_sub)
             m.n = n
-            v.dev = Optional(self.v_arena.create_sub_buffer[DT](self.off, n))
+            v.dev = Optional(v_sub)
             v.n = n
             self.off += n
 
@@ -334,6 +347,44 @@ struct Adam(Movable, ParamVisitor, ParamVisitorRT, Optimizer):
         self.m_arena = Tensor()
         self.v_arena = Tensor()
 
+    def put_step_state(self, mut sc: CheckpointScalars, prefix: String) raises:
+        """Record the step state a resume needs: `t` and the bias-correction
+        powers `β₁ᵗ`, `β₂ᵗ`, as `<prefix>.t` / `.b1_pow` / `.b2_pow`.
+
+        ⚠⚠ THE MOMENTS ALONE DO NOT RESUME ADAM. `m` and `v` ride the param
+        sections, but a resume that restores them with `t = 0` divides settled
+        moments by the step-1 corrections (1 − β₁ = 0.1, 1 − β₂ = 0.001), and
+        the first few hundred updates come out ~0.3× the size they should be.
+        The powers are stored rather than recomputed from `t` because the
+        running product is what `begin_step` keeps, and `pow(β, t)` differs
+        from it in the last bits."""
+        sc.set_int(prefix + ".t", self.t)
+        sc.set(prefix + ".b1_pow", Float64(self._b1_pow))
+        sc.set(prefix + ".b2_pow", Float64(self._b2_pow))
+
+    def take_step_state(mut self, sc: CheckpointScalars, prefix: String) raises:
+        """Inverse of `put_step_state`. A checkpoint written without it (every
+        file before `K` sections existed) leaves this optimizer untouched.
+        Safe before or after `adopt`: a device mirror that already exists is
+        rewritten, and one allocated later is seeded from these values."""
+        if not sc.has(prefix + ".t"):
+            return
+        self.t = sc.get_int(prefix + ".t", 0)
+        self._b1_pow = Scalar[DT](sc.get(prefix + ".b1_pow", 1.0))
+        self._b2_pow = Scalar[DT](sc.get(prefix + ".b2_pow", 1.0))
+        self.bc1 = Scalar[DT](1.0) - self._b1_pow
+        self.bc2 = Scalar[DT](1.0) - self._b2_pow
+        self._sync_step_state_dev()
+
+    def _sync_step_state_dev(mut self) raises:
+        """Host step state → the device mirrors, when they exist (GPU arena)."""
+        if self._pow_dev.dev:
+            var pd = self._pow_dev.dev.value()
+            pd.create_sub_buffer[DT](0, 1).enqueue_fill(self._b1_pow)
+            pd.create_sub_buffer[DT](1, 1).enqueue_fill(self._b2_pow)
+        if self._step_dev.dev:
+            self._step_dev.dev.value().enqueue_fill(Scalar[DT](self.t))
+
     def begin_step(mut self):
         """Bump the step counter + refresh bias corrections. Once per step."""
         self.t += 1
@@ -354,7 +405,6 @@ struct Adam(Movable, ParamVisitor, ParamVisitorRT, Optimizer):
             self.v_arena = Tensor.alloc_gpu(c, self.arena.total)
             # `[β₁ᵗ, β₂ᵗ]` seeded to β^0 = 1; advanced on-device each step.
             self._pow_dev = Tensor.alloc_gpu(c, 2)
-            self._pow_dev.dev.value().enqueue_fill(Scalar[DT](1.0))
             # Persistent grad-clip scratch (one block-partials slot per TPB chunk
             # of the arena, + scale + norm) so `clip_grads_device` never allocs.
             var nblk = (self.arena.total + TPB - 1) // TPB
@@ -366,7 +416,10 @@ struct Adam(Movable, ParamVisitor, ParamVisitorRT, Optimizer):
             self._lr_dev = Tensor.alloc_gpu(c, 1)
             self._lr_dev.dev.value().enqueue_fill(self.lr)
             self._step_dev = Tensor.alloc_gpu(c, 1)
-            self._step_dev.dev.value().enqueue_fill(Scalar[DT](0.0))
+            # `[β₁ᵗ, β₂ᵗ]` and the schedule step, seeded from the HOST step
+            # state: β^0 = 1 and step 0 on a fresh optimizer, the restored
+            # values when `take_step_state` ran before this adopt.
+            self._sync_step_state_dev()
             # Give every Param a HANDLE on its slice of the moment arenas, so
             # the checkpoint walk still finds moments to write. See
             # `_MomentPlacer` — without it, adopting silently turns
@@ -391,7 +444,6 @@ struct Adam(Movable, ParamVisitor, ParamVisitorRT, Optimizer):
             self.m_arena = Tensor.alloc_gpu(c, self.arena.total)
             self.v_arena = Tensor.alloc_gpu(c, self.arena.total)
             self._pow_dev = Tensor.alloc_gpu(c, 2)
-            self._pow_dev.dev.value().enqueue_fill(Scalar[DT](1.0))
             var nblk = (self.arena.total + TPB - 1) // TPB
             self._clip_partials = Tensor.alloc_gpu(c, nblk if nblk > 0 else 1)
             self._clip_scale = Tensor.alloc_gpu(c, 1)
@@ -399,7 +451,10 @@ struct Adam(Movable, ParamVisitor, ParamVisitorRT, Optimizer):
             self._lr_dev = Tensor.alloc_gpu(c, 1)
             self._lr_dev.dev.value().enqueue_fill(self.lr)
             self._step_dev = Tensor.alloc_gpu(c, 1)
-            self._step_dev.dev.value().enqueue_fill(Scalar[DT](0.0))
+            # `[β₁ᵗ, β₂ᵗ]` and the schedule step, seeded from the HOST step
+            # state: β^0 = 1 and step 0 on a fresh optimizer, the restored
+            # values when `take_step_state` ran before this adopt.
+            self._sync_step_state_dev()
             # ⚠ Every model, or the checkpoint silently loses the moments of
             # the ones that were skipped — `save_moments=True` becomes a
             # partial no-op and a resume comes back with a half-cold

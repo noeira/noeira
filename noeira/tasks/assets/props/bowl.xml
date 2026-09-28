@@ -10,7 +10,7 @@
   <compiler angle="radian" meshdir="so101_tower_props"/>
   <asset>
     <mesh name="bowl_octagon" file="bowl_octagon.stl" scale="0.001 0.001 0.001"/>
-    <material name="bowl_pla" rgba="0.996 0.776 0.0 1" specular="0.1" shininess="0.1"/>
+    <material name="bowl_pla" rgba="1.0 0.66 0.09 1" specular="0.1" shininess="0.1"/>
   </asset>
   <worldbody>
     <body name="bowl">

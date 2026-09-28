@@ -26,8 +26,11 @@ start/goal states come from the dataset regardless of ckpt format).
 
 Run:
   pixi run -e nvidia mojo run -I . examples/lewm/lewm_pusht_paper_protocol_tta_gpu.mojo
+  pixi run -e nvidia mojo run -I . examples/lewm/lewm_pusht_paper_protocol_tta_gpu.mojo --ckpt <run_id>
 """
 
+from std.sys import argv
+from noeira.core.run import resolve_checkpoint
 from std.memory import alloc
 from std.random import seed as rng_seed, random_float64
 from max.gpu.host import DeviceContext
@@ -111,7 +114,19 @@ comptime Source = WindowSource[
 ]
 
 
+def _flag(name: String, dflt: String) raises -> String:
+    """Value of `--name X`, or `dflt` when the flag is absent."""
+    var av = argv()
+    for i in range(1, len(av)):
+        if String(av[i]) == name:
+            if i + 1 >= len(av):
+                raise Error("flag " + name + " needs a value")
+            return String(av[i + 1])
+    return dflt
+
+
 def main() raises:
+    var ckpt = resolve_checkpoint(_flag(String("--ckpt"), CKPT_PATH), String("last"))
     print("=" * 70)
     print("LeWM PushT PAPER PROTOCOL — E1: FROZEN vs ADAPT (AdaJEPA TTA)")
     print("=" * 70)
@@ -126,8 +141,8 @@ def main() raises:
     var wm = Trainer.make(
         lam=LAM, lr=TTA_LR, max_grad_norm=Scalar[DT](1.0), ctx=ctx
     )
-    print("loading frozen recipe WM", CKPT_PATH, "...")
-    wm.load_params(CKPT_PATH)
+    print("loading frozen recipe WM", ckpt, "...")
+    wm.load_params(ckpt)
     # The recipe ckpt carries AdamW moments (exact-resume); TTA needs a
     # fresh optimizer (plan §4).
     wm.reset_opt_moments()

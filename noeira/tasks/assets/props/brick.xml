@@ -9,7 +9,7 @@
        (h_radius = the half-diagonal). The print's origin is its base. -->
   <compiler angle="radian"/>
   <asset>
-    <material name="brick_pla" rgba="0.0 0.471 0.749 1" specular="0.1" shininess="0.1"/>
+    <material name="brick_pla" rgba="0.17 0.474 0.662 1" specular="0.1" shininess="0.1"/>
   </asset>
   <worldbody>
     <body name="brick">

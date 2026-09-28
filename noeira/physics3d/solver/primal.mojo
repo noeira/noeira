@@ -106,6 +106,79 @@ def pyramidal_edge_forces[
                 qfrc[i] += Je[e_idx * nv + i] * force[e_idx]
 
 
+# ⚠⚠ MuJoCo'S LINE-SEARCH THRESHOLD IS BELOW FLOAT32'S RESOLUTION. `gtol` is
+# `tolerance * ls_tolerance * snorm / scale`; at the float32 tolerance floor
+# (1e-6, `NEWTON_TOL_GPU`) that is ~1e-8 of the slope, while a `d0` summed in
+# float32 carries rounding near 1e-7 of its terms. So `|d0| < gtol` is often
+# unreachable and the search brackets until the interval stops moving or the
+# budget runs out.
+#
+# MEASURED 2026-09-26, so101_tower (elliptic, impratio 10), 1024 lanes, RTX
+# 5090: 31.2 evaluations per solve at 2.0 iterations (15.6 per iteration)
+# against CPU MuJoCo 3.12's 3.2 per iteration on the same protocol. With the
+# threshold floored at `LS_SLOPE_DROP_F32 * |d0(0)|`: 9.4 per solve, iterations
+# unchanged (2.01), the blocked Newton launch 3778 -> 2605 us and the control
+# step 99.2 -> 79.4 ms. 1e-4 bought 1.5% more; 1e-5 is the conservative one.
+#
+# ⚠ RELATIVE TO THE SLOPE AT alpha=0, NOT ABSOLUTE. MuJoCo Warp floors the same
+# threshold at an absolute 1e-6 (`solver.py:1023`), but it forms `snorm * scale`
+# where MuJoCo and this tree form `snorm / scale`, so the number does not
+# transplant: on the tower it cut only 8% and moved the dynamics (collision
+# +13% at the same contact count). A slope ratio has no units to get wrong.
+#
+# ⚠ FLOAT64 IS UNTOUCHED — the same scoping as `NEWTON_TOL_GPU`, so every
+# MuJoCo-parity gate (all float64) is bit-identical across this.
+comptime LS_SLOPE_DROP_F32: Float64 = 1e-5
+
+
+@always_inline
+def ls_gtol_dtype_floor[
+    DTYPE: DType
+](gtol: Scalar[DTYPE], d0_at_zero: Scalar[DTYPE]) -> Scalar[DTYPE]:
+    """The line search's derivative threshold, floored where the dtype cannot
+    resolve MuJoCo's. Call it once, after the alpha=0 `PrimalEval`, at every
+    Newton line search — they must not disagree."""
+    comptime if DTYPE == DType.float64:
+        return gtol
+    else:
+        return max(gtol, Scalar[DTYPE](LS_SLOPE_DROP_F32) * abs(d0_at_zero))
+
+
+# ⚠ THE FLOAT32 STALL EXIT (2026-09-27). MuJoCo ends a Newton solve when the
+# line search returns `alpha == 0` — "no improvement: done" (`mj_solPrimal`,
+# engine_solver.c) — and otherwise keeps iterating through a zero or negative
+# improvement (AUD-39). At float32 the search can return a step too small to
+# move the cost, so the solve takes the SAME zero-improvement iteration again
+# and again: on so101_tower (1024 lanes, blocked kernel) each env's slowest
+# solve ran 4-20+ iterations and 17 envs hit the 100-iteration cap, those
+# with 85-97 iterations of improvement EXACTLY 0 while the gradient and
+# decrement sat orders above tolerance. The kernel waits for the slowest env,
+# so those repeats set its time (~60 us an iteration).
+#
+# So at float32 a run of `NEWTON_STALL_RUN_F32` consecutive zero improvements
+# is that `alpha == 0`. Not the first zero: a stalled solve on the tower did
+# make real progress again after isolated zeros. Float64 is untouched —
+# every MuJoCo-parity gate runs there.
+comptime NEWTON_STALL_RUN_F32: Int = 2
+
+
+@always_inline
+def newton_stall_stop[
+    DTYPE: DType
+](improvement: Scalar[DTYPE], mut zero_run: Int) -> Bool:
+    """True once the solve has taken `NEWTON_STALL_RUN_F32` iterations in a
+    row whose improvement was exactly zero — never at float64. `zero_run` is
+    the caller's counter, 0 at the start of the solve."""
+    comptime if DTYPE == DType.float64:
+        return False
+    else:
+        if improvement == Scalar[DTYPE](0):
+            zero_run += 1
+        else:
+            zero_run = 0
+        return zero_run >= NEWTON_STALL_RUN_F32
+
+
 @always_inline
 def pyramidal_linesearch[
     DTYPE: DType,
@@ -311,6 +384,7 @@ def pyramidal_linesearch[
     var p0_d0 = ZERO
     var p0_d1 = ZERO
     peval(p0_a, p0_c, p0_d0, p0_d1, lsiter)
+    gtol = ls_gtol_dtype_floor[DTYPE](gtol, p0_d0)
 
     # ⚠ `PrimalSearch` ALWAYS ATTEMPTS ONE NEWTON STEP (engine_solver.c:1733),
     # including when `d0 >= 0`. The old body returned 0 on a non-descent

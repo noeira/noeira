@@ -1,6 +1,6 @@
 """ACT ON LIBERO — WHAT ONE CHECKPOINT PREDICTS FOR A STORE ROW, POSITION BY POSITION.
 
-    pixi run -e apple  mojo run -I . examples/libero/libero_act_inspect.mojo --act runs/<id>/checkpoints --store build/demos/<store>.h5
+    pixi run -e apple  mojo run -I . examples/libero/libero_act_inspect.mojo --act <run_id> --store build/demos/<store>.h5
     pixi run -e nvidia mojo run -I . examples/libero/libero_act_inspect.mojo --act runs/<id>/checkpoints --store build/demos/libero_goal.rendered.h5 --ckpt last
 
 Every ACT evaluation on the 5090 (2026-09-19/20) executed chunks whose 40
@@ -36,16 +36,18 @@ not, wherever it is read).
 of the zero the eval uses (`ACTTrainer.predict_with_posterior`): a chunk that
 varies here and not under `predict` puts the whole shape in the latent.
 
-Flags: `--act DIR` (best.ckpt + norm.json), `--store PATH`, `--ckpt best|last`,
+Flags: `--act RUN_ID|DIR` (a run id, found under `runs/` or
+`projects/*/runs/`, or a directory holding best.ckpt + norm.json), `--store PATH`, `--ckpt best|last`,
 `--ep E` (episode, default 0), `--stride S` (rows at steps 0, S, 2S, ...;
 default 10), `--rows N` (≤ 20, default 12). Normalised units throughout.
 """
 
-from std.os.path import exists
+from std.os.path import exists, isdir
 from std.sys import argv
 from std.math import sqrt
 from max.gpu.host import DeviceContext
 
+from noeira.core.run import resolve_checkpoint
 from noeira.nn.constants import DT
 from noeira.envs.libero.act import (
     LiberoActTrainer, LiberoActDataset, LIBERO_ACT_QPOS, LIBERO_ACT_ADIM,
@@ -173,6 +175,9 @@ def main() raises:
     if act_dir == "" or store == "":
         raise Error("libero act inspect: --act DIR and --store PATH are required")
     var path = act_dir + "/" + ckpt + ".ckpt"
+    if not isdir(act_dir) and not no_load:
+        # a RUN ID: its `checkpoints/<best|last>.ckpt` (or a .ckpt file as is)
+        path = resolve_checkpoint(act_dir, ckpt)
     if not exists(path) and not no_load:
         raise Error("libero act inspect: no " + path)
     if rows < 1 or rows > B:

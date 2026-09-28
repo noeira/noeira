@@ -419,6 +419,7 @@ def trace_visual[
     L_HF_META: Layout,
     L_HF: Layout,
     L_QPOS: Layout,
+    L_CULL: Layout,
 ](
     geoms: LayoutTensor[DTYPE, L_GEOMS, MutAnyOrigin],
     ngeom: Int,
@@ -436,10 +437,23 @@ def trace_visual[
     hf_stride: Int,
     pnt: Vec3Generic[DTYPE],
     vec: Vec3Generic[DTYPE],
+    cull: LayoutTensor[DTYPE, L_CULL, MutAnyOrigin],
+    cull_base: Int,
+    px: Int,
+    py: Int,
 ) -> RayHit[DTYPE] where DTYPE.is_floating_point():
     """`ray_model` over the ordinary geoms, then each CONDITIONAL SITE row
     whose lane-local condition holds (`APP_IDX_COND_QADR`). The nearest wins,
-    and a site's hit reports its row index, `>= ngeom`, as the geom."""
+    and a site's hit reports its row index, `>= ngeom`, as the geom.
+
+    ⚠ `cull_base >= 0` SKIPS GEOMS BY SCREEN RECTANGLE: `cull[cull_base +
+    4 g ..]` is geom `g`'s `(x0, x1, y0, y1)` for this lane and camera
+    (`cull.geom_screen_rect`), and a ray through pixel `(px, py)` — any of its
+    samples, all inside the unit square `[px, px+1) x [py, py+1)` — cannot
+    reach a geom whose rectangle misses that square. ONLY a camera's primary
+    rays may pass it: a reflected or continued ray does not start at the
+    camera, and passes `-1` (with any 1-D tensor, never read). The geoms are
+    still visited in index order, so a tie is won by the same geom."""
     # ⚠ ONE `ray_model` CALL SITE, IN A LOOP: pass 0 is the ordinary geoms
     # `[0, ngeom)`, pass `k` the one conditional row `ngeom + k - 1`. Mojo
     # inlines every call site of a generic kernel function, and two sites of
@@ -449,12 +463,26 @@ def trace_visual[
         Scalar[DTYPE](-1), -1, Vec3Generic[DTYPE](0, 0, 0), -1,
         Scalar[DTYPE](0), Scalar[DTYPE](0),
     )
-    for k in range(1 + ncond):
-        var g0 = 0
-        var g1 = ngeom
-        if k > 0:
-            g0 = ngeom + k - 1
-            g1 = g0 + 1
+    # ⚠ ONE ROW PER CALL NOW (it was one call over `[0, ngeom)`), so a culled
+    # geom can be skipped; the running best goes in as `tcut`, which makes
+    # the sequence of calls answer exactly what the single call did.
+    var fx = Scalar[DTYPE](px)
+    var fy = Scalar[DTYPE](py)
+    var one = Scalar[DTYPE](1)
+    for k in range(ngeom + ncond):
+        var g0 = k
+        var g1 = k + 1
+        if k < ngeom:
+            if cull_base >= 0:
+                var o = cull_base + k * 4
+                if (
+                    fx + one < rebind[Scalar[DTYPE]](cull[o + 0])
+                    or fx > rebind[Scalar[DTYPE]](cull[o + 1])
+                    or fy + one < rebind[Scalar[DTYPE]](cull[o + 2])
+                    or fy > rebind[Scalar[DTYPE]](cull[o + 3])
+                ):
+                    continue
+        else:
             var ab = g0 * VIS_GEOM_APPEARANCE
             var qadr = Int(rebind[Scalar[DTYPE]](appearance[ab + APP_IDX_COND_QADR]))
             if qadr >= 0:
@@ -464,7 +492,7 @@ def trace_visual[
         var h = ray_model[DTYPE](
             geoms, g1, bodies, xpos, xquat, env,
             mesh_meta, mesh_tris, hfield_meta, hfield_data, hf_stride,
-            pnt, vec, -1, True, False, 0x3F, g0,
+            pnt, vec, -1, True, False, 0x3F, g0, hit.t,
         )
         if h.geom >= 0 and (hit.geom < 0 or h.t < hit.t):
             hit = h
@@ -490,6 +518,7 @@ def render_pixel[
     L_TEXELS: Layout,
     L_LIGHTS: Layout,
     L_QPOS: Layout,
+    L_CULL: Layout,
     SAMPLES: Int = 1,
 ](
     geoms: LayoutTensor[DTYPE, L_GEOMS, MutAnyOrigin],
@@ -518,8 +547,13 @@ def render_pixel[
     px: Int,
     py: Int,
     background: Vec3Generic[DTYPE],
+    cull: LayoutTensor[DTYPE, L_CULL, MutAnyOrigin],
+    cull_base: Int,
 ) -> PixelHit[DTYPE] where DTYPE.is_floating_point():
     """One pixel: the centre ray, and with `SAMPLES = 4` OpenGL's 4x MSAA.
+
+    `cull` / `cull_base`: this lane's screen rectangles for this camera, or
+    `-1` (any 1-D tensor, never read) — see `trace_visual`.
 
     ⚠⚠ LIBERO'S PICTURES ARE MULTISAMPLED, AND THAT IS MOST OF THE GAP A
     SINGLE RAY LEAVES. `mjr_makeContext` allocates the offscreen buffer with
@@ -579,7 +613,7 @@ def render_pixel[
         var sh = trace_visual[DTYPE](
             geoms, ngeom, ncond, appearance, qpos, bodies, xpos, xquat, env,
             mesh_meta, mesh_tris, hfield_meta, hfield_data, hf_stride,
-            frame.pos, sdir,
+            frame.pos, sdir, cull, cull_base, px, py,
         )
         if k > 0 and sh.geom == centre_geom:
             acc = acc + centre_rgb
@@ -756,6 +790,7 @@ def _shade_surface[
                     xquat, env, mesh_meta, mesh_tris, hfield_meta,
                     hfield_data, hf_stride,
                     org + n * Scalar[DTYPE](1.0e-6), rdir,
+                    mesh_meta, -1, 0, 0,
                 )
                 # `i != j` in the reference's loop: the mirror does not
                 # reflect itself.
@@ -920,6 +955,7 @@ def _shade_ray[
                 geoms, ngeom, ncond, appearance, qpos, bodies, xpos, xquat,
                 env, mesh_meta, mesh_tris, hfield_meta, hfield_data,
                 hf_stride, frame.pos + dir * tpos, dir,
+                mesh_meta, -1, 0, 0,
             )
             if nxt.geom < 0:
                 break

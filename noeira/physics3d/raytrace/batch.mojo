@@ -69,6 +69,7 @@ from .camera import (
     RT_CAM_MODE_TRACKCOM,
 )
 from .render import render_pixel
+from .cull import CULL_WORDS, geom_screen_rect
 from ..fields.rt_layout import DYN1, DYN2, rl1, rl2
 from .visual import VisualModel, visual_model_from_model
 from .visual_records import (
@@ -241,6 +242,15 @@ struct BatchedCameraRenderer[
     """
 
     var cam: Int
+    var cull: DeviceBuffer[Self.DTYPE]
+    """`[BATCH, ngeom, CULL_WORDS]` — each visual geom's screen rectangle for
+    the camera of the current launch (`cull.geom_screen_rect`), written by a
+    pre-pass in `render` and read by the primary rays."""
+    var cull_cap: Int
+    var cull_enabled: Bool
+    """True by default. False renders every pixel against every geom — the
+    same pictures (the cull only skips geoms a pixel cannot reach), slower;
+    kept so a gate and a benchmark can compare the two in one binary."""
     var light_dir: Vec3Generic[Self.DTYPE]
     """The direction the light TRAVELS, as `mjModel.light_dir` is. The default
     points down and slightly forward, matching the key light `Renderer3D`
@@ -269,6 +279,9 @@ struct BatchedCameraRenderer[
         check_camera(m, cam)
 
         self.cam = cam
+        self.cull = ctx.enqueue_create_buffer[Self.DTYPE](CULL_WORDS)
+        self.cull_cap = CULL_WORDS
+        self.cull_enabled = True
         self.rgb = ctx.enqueue_create_buffer[Self.DTYPE](
             Self.BATCH * Self.NPIX * RGB_CHANNELS
         )
@@ -336,11 +349,13 @@ struct BatchedCameraRenderer[
         camera OBSERVATION is an off-by-one in the MDP and not a visual
         artefact anyone would notice.
 
-        ⚠⚠ TWENTY BUFFERS AND SIX SCALARS — 26 OPERANDS. Metal's argument
+        ⚠⚠ TWENTY-ONE BUFFERS AND SIX SCALARS — 27 OPERANDS. Metal's argument
         table fails SILENTLY at 29 and ships at 27
-        (`_metals_limit_is_the_argument_table_not_the_stack`), so the headroom
-        here is ONE operand and it is why the headlight is a row of the light
-        table rather than six scalars. `qpos` was the twentieth buffer (the
+        (`_metals_limit_is_the_argument_table_not_the_stack`), so there is NO
+        headroom left: the cull table (2026-09-26) took the last slot, and its
+        on/off flag rides in `nl`'s bit 20 rather than taking a scalar. It is
+        also why the headlight is a row of the light table rather than six
+        scalars. `qpos` was the twentieth buffer (the
         conditional sites read it per lane), and the conditional-site COUNT
         rides in `ng`'s high bits rather than taking a scalar of its own.
         Adding an operand to this kernel is a decision, not a detail.
@@ -351,6 +366,11 @@ struct BatchedCameraRenderer[
         var nvg = self.vis.ngeom
         var nlight = self.vis.nlight
         var ncond = self.vis.ncond
+        if nlight >= (1 << 20):
+            raise Error(
+                "BatchedCameraRenderer: " + String(nlight) + " lights do not"
+                " fit `nl`'s 20 bits (bit 20 is the cull flag)"
+            )
         if nvg >= 65536 or ncond >= 32768:
             raise Error(
                 "BatchedCameraRenderer: " + String(nvg) + " geoms and "
@@ -379,6 +399,7 @@ struct BatchedCameraRenderer[
             texels: LayoutTensor[DType.uint8, DYN1, MutAnyOrigin],
             lights: LayoutTensor[Self.DTYPE, DYN1, MutAnyOrigin],
             qpos: LayoutTensor[Self.DTYPE, Self.L_QPOS, MutAnyOrigin],
+            cull_t: LayoutTensor[Self.DTYPE, DYN1, MutAnyOrigin],
             rgb_out: LayoutTensor[Self.DTYPE, Self.L_RGB, MutAnyOrigin],
             depth_out: LayoutTensor[
                 Self.DTYPE, Self.L_SCALARPIX, MutAnyOrigin
@@ -446,7 +467,7 @@ struct BatchedCameraRenderer[
                     textures,
                     texels,
                     lights,
-                    Int(nl),
+                    Int(nl) & 0xFFFFF,
                     qpos,
                     n_cond,
                     frame,
@@ -455,12 +476,72 @@ struct BatchedCameraRenderer[
                     pxx,
                     py,
                     Vec3Generic[Self.DTYPE](br, bg, bb),
+                    cull_t,
+                    # `nl` bit 20 = the cull table is valid for this launch.
+                    env * n_geom * CULL_WORDS if ((Int(nl) >> 20) & 1) != 0 else -1,
                 )
                 rgb_out[env, pix * RGB_CHANNELS + 0] = hit.rgb.x
                 rgb_out[env, pix * RGB_CHANNELS + 1] = hit.rgb.y
                 rgb_out[env, pix * RGB_CHANNELS + 2] = hit.rgb.z
                 depth_out[env, pix] = hit.depth
                 seg_out[env, pix] = Scalar[Self.DTYPE](hit.geom)
+
+        # ── the cull pre-pass: one thread per (lane, visual geom) ─────────
+        var cull_on = self.cull_enabled and nvg > 0
+        if cull_on:
+            var need = Self.BATCH * nvg * CULL_WORDS
+            if need > self.cull_cap:
+                self.cull = ctx.enqueue_create_buffer[Self.DTYPE](need)
+                self.cull_cap = need
+
+            @always_inline
+            def cull_kernel(
+                geoms: LayoutTensor[Self.DTYPE, DYN2, MutAnyOrigin],
+                xpos: LayoutTensor[Self.DTYPE, Self.L_B3, MutAnyOrigin],
+                xquat: LayoutTensor[Self.DTYPE, Self.L_B4, MutAnyOrigin],
+                subtree_com: LayoutTensor[Self.DTYPE, Self.L_B3, MutAnyOrigin],
+                cameras: LayoutTensor[Self.DTYPE, Self.L_CAM, MutAnyOrigin],
+                cull_out: LayoutTensor[Self.DTYPE, DYN1, MutAnyOrigin],
+                cam: Int32,
+                ng: Int32,
+            ):
+                var i = Int(block_dim.x * block_idx.x + thread_idx.x)
+                var ngv = Int(ng)
+                if i >= Self.BATCH * ngv:
+                    return
+                comptime if Self.DTYPE.is_floating_point():
+                    var env = i // ngv
+                    var g = i - env * ngv
+                    var frame = camera_world_frame[Self.DTYPE](
+                        cameras, xpos, xquat, subtree_com, env, Int(cam)
+                    )
+                    var r = geom_screen_rect[Self.DTYPE](
+                        geoms, xpos, xquat, env, g, frame,
+                        Self.WIDTH, Self.HEIGHT,
+                    )
+                    var o = i * CULL_WORDS
+                    cull_out[o + 0] = r[0]
+                    cull_out[o + 1] = r[1]
+                    cull_out[o + 2] = r[2]
+                    cull_out[o + 3] = r[3]
+
+            var ncull = Self.BATCH * nvg
+            ctx.enqueue_function[cull_kernel](
+                self.vis.geoms.lt_dyn["gpu", DYN2](
+                    rl2(nvg + ncond, MODEL_GEOM_SIZE)
+                ),
+                d.xpos.lt["gpu", Self.L_B3](),
+                d.xquat.lt["gpu", Self.L_B4](),
+                d.subtree_com.lt["gpu", Self.L_B3](),
+                m.cameras.lt["gpu", Self.L_CAM](),
+                LayoutTensor[Self.DTYPE, DYN1, MutAnyOrigin](
+                    self.cull, rl1(self.cull_cap)
+                ),
+                Int32(cam_used),
+                Int32(nvg),
+                grid_dim=(ceildiv(ncull, TPB),),
+                block_dim=(TPB,),
+            )
 
         var total = Self.BATCH * Self.NPIX
         ctx.enqueue_function[cam_kernel](
@@ -485,12 +566,15 @@ struct BatchedCameraRenderer[
             self.vis.texels.lt_dyn["gpu", DYN1](rl1(self.vis.texels.n)),
             self.vis.lights.lt_dyn["gpu", DYN1](rl1(self.vis.lights.n)),
             d.qpos.lt["gpu", Self.L_QPOS](),
+            LayoutTensor[Self.DTYPE, DYN1, MutAnyOrigin](
+                self.cull, rl1(self.cull_cap)
+            ),
             LayoutTensor[Self.DTYPE, Self.L_RGB](self.rgb),
             LayoutTensor[Self.DTYPE, Self.L_SCALARPIX](self.depth),
             LayoutTensor[Self.DTYPE, Self.L_SCALARPIX](self.seg),
             Int32(cam_used),
             Int32(nvg + (ncond << 16)),
-            Int32(nlight),
+            Int32(nlight + ((1 if cull_on else 0) << 20)),
             self.background.x,
             self.background.y,
             self.background.z,
@@ -686,6 +770,10 @@ struct BatchedCameraRenderer[
                             pxx,
                             py,
                             self.background,
+                            # The host leg is UNCULLED: the gate compares the
+                            # culled device render against it.
+                            mm_c,
+                            -1,
                         )
                         var b = env * Self.NPIX + pix
                         rgb[b * RGB_CHANNELS + 0] = hit.rgb.x

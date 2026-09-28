@@ -80,8 +80,8 @@ def test_c51_metrics_populated() raises:
     var m = trainer.flush_metrics()
     var q = m.mean_q.to_f64()
     var tgt = m.mean_target.to_f64()
-    var ent = m.dist_entropy.to_f64()
-    var rew = m.mean_reward.to_f64()
+    var ent = m.dist_entropy_mean.to_f64()
+    var rew = m.reward_mean.to_f64()
     var dn = m.mean_done.to_f64()
     var nup = m.n_updates.to_f64()
     print("  mean_q       =", q)
@@ -93,8 +93,8 @@ def test_c51_metrics_populated() raises:
 
     _finite(Scalar[DT](q), "mean_q")
     _finite(Scalar[DT](tgt), "mean_target")
-    _finite(Scalar[DT](ent), "dist_entropy")
-    _finite(Scalar[DT](rew), "mean_reward")
+    _finite(Scalar[DT](ent), "dist_entropy_mean")
+    _finite(Scalar[DT](rew), "reward_mean")
     _finite(Scalar[DT](dn), "mean_done")
 
     assert_true(nup > 0.0, "no training updates ran")

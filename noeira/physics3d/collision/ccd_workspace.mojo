@@ -144,8 +144,13 @@ comptime CCD_WS_HSTK: Int = CCD_WS_HOR + EPA_F_CAP * 2
 # face's projection away from it.
 comptime CCD_WS_CTR: Int = CCD_WS_HSTK + EPA_F_CAP * 3
 
-# `spx` — GJK'S OWN SIMPLEX, four vertices of nine floats: the Minkowski point
-# (0..2) and the two witness points (3..5, 6..8).
+# `spx` — GJK'S OWN SIMPLEX, four vertices of eleven floats: the Minkowski
+# point (0..2), the two witness points (3..5, 6..8) and the two SUPPORT INDICES
+# (9, 10) — the SAME layout as an EPA vertex (`ev`), so seeding the polytope
+# from the simplex is a straight copy and a seed keeps its hull vertex. It was
+# nine floats (no indices) until 2026-09-26; multicontact then had to recover
+# every seed's vertex by scanning the whole hull, ~0.75 ms of a 1.5 ms
+# collision launch on so101_tower at 1024 lanes.
 #
 # ⚠⚠ IT IS HERE FOR A DIFFERENT REASON THAN THE POLYTOPE ABOVE, AND THE REASON
 # IS A METAL MISCOMPILE, NOT SIZE. Thirty-six floats is nothing; what matters
@@ -164,7 +169,7 @@ comptime CCD_WS_CTR: Int = CCD_WS_HSTK + EPA_F_CAP * 3
 # contacts, while the box and the capsule, which make GJK iterate, diverged
 # from the first vertex count onwards. That split is what named this array.
 comptime CCD_WS_SPX: Int = CCD_WS_CTR + 3
-comptime SPX_STRIDE: Int = 9
+comptime SPX_STRIDE: Int = 11
 # `spx2` — `gjkIntersect`'s scratch copy. The reference builds the permuted
 # tetrahedron in a local `Vertex simplex[4]` and copies it back over the
 # caller's; ours cannot alias the same region while it does that.
@@ -366,6 +371,80 @@ comptime COLL_CAND_REPORT: Bool = False
 # risk — it has simply not been measured there. The arm script's `nopre` arm
 # sets it False to A/B the old production.
 comptime COLL_PREFILTER: Bool = has_nvidia_gpu_accelerator()
+
+# ── The FLAT narrow phase (`broadphase_sap.detect_contacts_sap`), 2026-09-26 ─
+#
+# ⚠ ON FOR NVIDIA, OFF FOR METAL — the costs that schedule it are timed only
+# on NVIDIA (below), so on Metal every pair would run cold, unmeasured there.
+# The block kernel runs an env's
+# candidates on the 32 lanes of ONE warp, and a warp's lanes on different
+# long pairs SERIALIZE: on so101_tower (1024 lanes, RTX 5090) the narrow
+# phase of an env measured 0.55x the SUM of its candidates' single-thread
+# times (correlation 0.978 over 1024 envs), because its ~2.5 penetrating
+# box/mesh pairs (43 us each after the hill-climb seed, up to 250) diverge
+# from each other. The kernel waits for the slowest env: 540 us of narrow
+# phase where the slowest single pair is 250.
+#
+# True replaces phase 2 with three launches:
+#   1. the block kernel with `FLAT_LIST`: poses, AABBs, the sweep, then the
+#      candidate list into `Data.coll_flat` — each candidate HOT (its pair's
+#      cost >= `COLL_FLAT_HOT_NS`, in four cost buckets) or cold — each
+#      appended to its bucket's global queue at a range reserved with an
+#      atomic, and return;
+#   2. `_sap_narrow_flat_kernel`, one warp per env slot: warp `w` runs hot
+#      tasks `w, w + W, ...` over the buckets in DESCENDING cost, on ONE lane
+#      each (a round robin over a longest-first order), then cold tasks 32 to
+#      a warp;
+#   3. `_sap_flat_output_kernel`: the block kernel's phase 3 on the list; it
+#      also zeroes the queue counters for the next call.
+# Contacts are the block kernel's bit for bit: same narrow phase per
+# candidate, same staging windows, same compaction. Only WHICH warp and CCD
+# row runs a pair changes.
+#
+# A pair's cost is measured only when it runs ALONE (hot): a cold task's
+# timer spans its diverged warp. A cold MESH pair that emits a contact
+# penetrated, so it ran EPA — the slow kind — and is costed at the threshold,
+# which puts it hot on the next call.
+#
+# MEASURED (so101_tower, 1024 lanes, RTX 5090, interleaved, 2026-09-27):
+# collision 574 -> 436 us per physics step (list 123, narrow 290, output
+# 23), control step 31.56 -> 29.03 ms; contacts, iterations and line-search
+# evaluations identical. The first version timed cold tasks too and ran 21k
+# "hot" tasks (601 us); a separate prefix kernel for the queues cost 36 us.
+#
+# ⚠ The costs are timed with `perf_counter_ns` (the global timer) on NVIDIA
+# only; elsewhere nothing is ever hot and the path degrades to cold warps.
+comptime COLL_FLAT_NARROW: Bool = has_nvidia_gpu_accelerator()
+comptime COLL_FLAT_HOT_NS: Int = 16384
+# hot cost buckets: [1, 2), [2, 4), [4, 8), [8, inf) x COLL_FLAT_HOT_NS
+comptime COLL_FLAT_NB: Int = 4
+# `Data.coll_flat`: one row per env, then a global block.
+#   row: [0] ncand [1] overflow [2] full (a window filled) [4..8) hot count per
+#   bucket [8] cold count | a, b, t per candidate | records written per
+#   candidate | the per-pair cost (ns), keyed like the hill climb's warm slots
+comptime CF_NCAND: Int = 0
+comptime CF_OVERFLOW: Int = 1
+comptime CF_FULL: Int = 2
+comptime CF_NHOT: Int = 4
+comptime CF_NCOLD: Int = 8
+comptime CF_CAND: Int = 16
+comptime CF_CNT: Int = CF_CAND + 3 * COLL_NCAND_CAP
+comptime CF_COST: Int = CF_CNT + COLL_NCAND_CAP
+comptime CF_ROW: Int = CF_COST + HILL_WARM_SLOTS
+#   global, at `batch * CF_ROW`: `CF_G_HDR` words whose first five are INT32
+#   task counters (read and written only through an int32 view) — hot
+#   buckets 0..3, then cold — then five queues of `batch * COLL_NCAND_CAP`
+#   tasks in the same order; a task is `env * COLL_NCAND_CAP + candidate`.
+comptime CF_G_HDR: Int = 16
+
+
+def coll_flat_words(batch: Int) -> Int:
+    """`Data.coll_flat`'s length for `batch` envs — allocated whether the
+    path is on or not (~8 KB an env), so a gate can run both paths on one
+    `Data` and compare them."""
+    return batch * CF_ROW + CF_G_HDR + 5 * batch * COLL_NCAND_CAP
+
+
 comptime COLL_REPORT_HDR: Int = 11
 comptime COLL_REPORT_WORDS: Int = COLL_REPORT_HDR + COLL_NCAND_CAP
 

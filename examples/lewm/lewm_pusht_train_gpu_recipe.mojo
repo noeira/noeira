@@ -25,6 +25,9 @@ Plus audit item 5 (architecture parity):
 
 Writes a NEW checkpoint (z-action semantics — incompatible with the raw
 CLS/mean-pool checkpoints). Saves periodically so partial runs are usable.
+The run (project `lewm`) writes its checkpoint to
+`runs/<id>/checkpoints/last.ckpt`, beside `metrics.csv` (loss, var_min,
+gram_off) and `run.kv`.
 Eval after: lewm_pusht_paper_protocol_gpu_recipe.mojo.
 
 Run (NVIDIA; long):
@@ -36,6 +39,10 @@ from max.gpu.host import DeviceContext
 from layout import TileTensor, row_major
 
 from noeira.nn.constants import DT
+from noeira.core.run import RunContext, register_run
+from noeira.core.run_session import finish_run, run_logger
+from noeira.io.artifact_sink import sink_for_run
+from noeira.deep_agents.training.checkpoint import announce_checkpoint
 from noeira.experimental.lewm.trainer import LeWMTrainer
 from noeira.experimental.lewm.encoder import LeWMEncoderCLS
 from noeira.experimental.lewm.pong_data import WindowSource
@@ -82,7 +89,6 @@ comptime MAX_GRAD_NORM: Scalar[DT] = 1.0
 comptime LAM: Scalar[DT] = 0.09
 comptime LOG_EVERY: Int = 500
 comptime CKPT_EVERY: Int = 10000    # periodic saves → partial runs usable
-comptime CKPT_PATH: String = "lewm_pusht_recipe.ckpt"
 
 comptime EncCLS = LeWMEncoderCLS[
     IN_CH, IMG, PATCH, N_PATCHES, HIDDEN, ENC_HEADS, ENC_LAYERS, EMB,
@@ -117,6 +123,22 @@ def main() raises:
     print()
 
     var ctx = DeviceContext()
+    var run = RunContext(
+        project=String("lewm"),
+        driver=String("examples/lewm/lewm_pusht_train_gpu_recipe.mojo"),
+        slug=String("lewm-pusht-recipe"),
+        env=String("builtin:pusht"),
+        dataset=String("lewm_pusht"),
+        device=String(ctx.name()),
+    )
+    print("run:", run.dir)
+    var ckpt_path = run.checkpoint_path(String("last"))
+    var logger = run_logger(run)
+    logger.set_config("algorithm", "LeWM")
+    logger.set_config("env", "PushT")
+    logger.set_config("steps", String(STEPS))
+    register_run(run, logger)
+    var artifacts = sink_for_run(run.id, run.dir)
     print("opening PushT expert dataset (z-scored actions) ...")
     var sampler = PushTOfflineSampler(
         frameskip=FRAMESKIP, num_steps=T, normalize_actions=True
@@ -129,6 +151,7 @@ def main() raises:
     )
 
     print("training", STEPS, "steps ...")
+    var last_loss = Float64(0.0)
     tr.reset_loss_accum()
     for s in range(STEPS):
         tr.opt.lr = Scalar[DT](_lr_at(s))
@@ -140,17 +163,33 @@ def main() raises:
             var wl = tr.read_loss_accum()
             tr.reset_loss_accum()
             var probes = tr.collapse_probes()
+            last_loss = Float64(wl)
+            var ln = List[String]()
+            var lv = List[Float64]()
+            ln.append(String("loss"))
+            lv.append(Float64(wl))
+            ln.append(String("var_min"))
+            lv.append(Float64(probes[0]))
+            ln.append(String("gram_off"))
+            lv.append(Float64(probes[1]))
+            logger.log_scalars(ln, lv, s + 1)
             print("   step", s + 1, "/", STEPS,
                   " lr=", _lr_at(s),
                   " loss=", wl, " var_min=", probes[0],
                   " gram_off=", probes[1])
         if (s + 1) % CKPT_EVERY == 0:
-            tr.save_params(CKPT_PATH)
-            print("   checkpoint saved →", CKPT_PATH, "(step", s + 1, ")")
+            tr.save_params(ckpt_path)
+            announce_checkpoint(ckpt_path, artifacts, run.dir)
+            print("   checkpoint saved →", ckpt_path, "(step", s + 1, ")")
 
     print()
-    print("saving →", CKPT_PATH)
-    tr.save_params(CKPT_PATH)
+    print("saving →", ckpt_path)
+    tr.save_params(ckpt_path)
+    announce_checkpoint(ckpt_path, artifacts, run.dir)
+    finish_run(
+        run, logger, artifacts,
+        String("final_loss=") + String(last_loss),
+    )
     _ = src^
     _ = tr^
     print("=" * 70)

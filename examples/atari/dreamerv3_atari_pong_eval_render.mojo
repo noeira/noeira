@@ -24,11 +24,14 @@ Window controls: P pauses, ESC/Q or window-close quits.
 Run:
     pixi run -e apple  mojo run -I . examples/atari/dreamerv3_atari_pong_eval_render.mojo
     pixi run -e nvidia mojo run -I . examples/atari/dreamerv3_atari_pong_eval_render.mojo
+    pixi run -e apple  mojo run -I . examples/atari/dreamerv3_atari_pong_eval_render.mojo --ckpt <run_id>
 
-Reads dreamerv3_atari_pong_gpu.ckpt.
+Reads dreamerv3_atari_pong_gpu.ckpt, or the run/file given by `--ckpt`.
 """
 
 from std.memory import alloc, memcpy
+from std.sys import argv
+from noeira.core.run import resolve_checkpoint
 from max.gpu.host import DeviceContext
 
 from noeira.nn.constants import DT
@@ -96,17 +99,29 @@ def _argmax(p: Pointer[Scalar[DT], MutAnyOrigin], n: Int) -> Int:
     return best
 
 
+def _flag(name: String, dflt: String) raises -> String:
+    """Value of `--name X`, or `dflt` when the flag is absent."""
+    var av = argv()
+    for i in range(1, len(av)):
+        if String(av[i]) == name:
+            if i + 1 >= len(av):
+                raise Error("flag " + name + " needs a value")
+            return String(av[i + 1])
+    return dflt
+
+
 def main() raises:
+    var ckpt = resolve_checkpoint(_flag(String("--ckpt"), String(CHECKPOINT_PATH)), String("last"))
     print("=" * 70)
     print("DreamerV3 Atari Pong — checkpoint eval (live SDL, CPU emulator)")
     print("=" * 70)
-    print("  Checkpoint:", CHECKPOINT_PATH, "  Episodes:", EVAL_EPISODES)
+    print("  Checkpoint:", ckpt, "  Episodes:", EVAL_EPISODES)
     print("  TIER:", TIER, " DETER:", DETER, " TOKEN:", TOKEN)
     print()
 
     with DeviceContext() as ctx:
         var agent = Ag.make(ctx=ctx)
-        agent.load(CHECKPOINT_PATH)
+        agent.load(ckpt)
         print("Checkpoint loaded. Starting live play...")
 
         # Pixel env (auto-loads roms/pong.bin) + SDL renderer. Cap 15 decisions/s

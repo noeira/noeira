@@ -73,17 +73,29 @@ fi
 # SDL3 comes from the pixi env — headers AND the dylib. No system SDL is
 # involved, and the rpath below is what lets the shim find libSDL3 at load
 # time without the caller exporting DYLD_LIBRARY_PATH.
-SDL_PREFIX="$ROOT/.pixi/envs/default"
-if [ ! -f "$SDL_PREFIX/include/SDL3/SDL.h" ]; then
-    echo "[imgui] ERROR: SDL3 headers not found under $SDL_PREFIX." >&2
-    echo "[imgui] Run 'pixi install' first." >&2
+#
+# ⚠ THE ACTIVE ENV FIRST, NOT `default`. `pixi run` sets $CONDA_PREFIX to the
+# env it activated — `jetson` on the Orin, where `default` may not even be
+# installed — and the viewer loads libSDL3 from that same env at run time
+# (`noeira/render/sdl`). `default` stays as the fallback for a bare shell.
+SDL_PREFIX=""
+for c in "${CONDA_PREFIX:-}" "$ROOT/.pixi/envs/default"; do
+    [ -n "$c" ] && [ -f "$c/include/SDL3/SDL.h" ] && { SDL_PREFIX="$c"; break; }
+done
+if [ -z "$SDL_PREFIX" ]; then
+    echo "[imgui] ERROR: SDL3 headers not found in \$CONDA_PREFIX or .pixi/envs/default." >&2
+    echo "[imgui] Run 'pixi install' (or 'pixi install -e jetson') first." >&2
     exit 1
 fi
+
+# ⚠ `c++`, NOT `clang++`: the other shims use the platform's default compiler,
+# and a stock Jetson has g++ only. Override with CXX=... .
+CXX="${CXX:-c++}"
 
 echo "[imgui] building $LIB ..."
 # imgui_demo.cpp is deliberately NOT compiled: it is ~500 KB of artifact for a
 # gallery nothing here calls. Add it back if you want ShowDemoWindow().
-clang++ -O2 -std=c++17 -fPIC -shared \
+"$CXX" -O2 -std=c++17 -fPIC -shared \
     -I "$IMGUI_DIR" -I "$IMGUI_DIR/backends" \
     -I "$GZ_DIR/src" \
     -I "$SDL_PREFIX/include" \

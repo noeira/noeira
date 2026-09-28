@@ -30,7 +30,7 @@ physics.
 
 Generic traits let the compiler specialize the whole pipeline for the target
 device, which is why the same source produces a CPU loop, a fused GPU one, and
-a Jetson binary.
+a binary for the robot's embedded board.
 
 ## Package layout
 
@@ -46,14 +46,14 @@ noeira/
 │   ├── training/   CPU/GPU drivers, BatchedEnv wrappers
 │   └── core/ primitives/ loss/ data/ zero/
 ├── nn/             Deep-learning framework (Module + Param)
-├── data/           Trajectory store, replay buffers, LeRobot v3 import/export
+├── data/           Trajectory store, replay buffers, LeRobot v3-format datasets
 ├── io/             Native HDF5, Parquet, video, JSON, HTTP, safetensors, serial
 ├── physics3d/      MuJoCo-inspired generalized-coordinates engine
 ├── physics2d/      GPU-batched 2D impulse engine
 ├── envs/           Environments: classic, MuJoCo-style, DM Control, LIBERO, robots
 ├── tasks/          The task layer: families, goals, placement, evaluation
 ├── planners/       Trajectory optimizers (MPPI, CEM, iLQR) + GPU tree search
-├── robot/          The SO-101 over its Feetech servo bus
+├── robot/          Robot drivers — today the SO-101 over its Feetech servo bus
 ├── vision/         Cameras, calibration, the OpenCV shim
 ├── render/         SDL3 renderers, ImGui viewers, video recording
 ├── math3d/         Vec3, Quat, Mat3, Mat4 (+ GPU variants)
@@ -87,12 +87,13 @@ lane.
 
 ## The real world
 
-**`robot`** drives the SO-101 arm over its Feetech servo bus — calibration,
-torque, synchronized reads and writes — with a safety rule throughout: nothing
-moves unless a command was explicitly armed. **`vision`** covers camera
+**`robot`** drives real robots — calibration, torque, synchronized reads and
+writes over the servo bus — with a safety rule throughout: nothing moves
+unless a command was explicitly armed. The first robot it supports is the
+SO-101 arm on its Feetech bus. **`vision`** covers camera
 capture on its own thread, intrinsic and extrinsic calibration, and the image
-preprocessing a policy expects. Teleoperation records both into LeRobot v3
-datasets through **`data`** and **`io`**.
+preprocessing a policy expects. Teleoperation records both into datasets
+through **`data`** and **`io`**.
 
 ## Deep learning and data
 
@@ -104,11 +105,12 @@ datasets through **`data`** and **`io`**.
 - **Combinators**: Sequential, Residual, Parallel, Repeat
 - **Pre-built models**: ResNet, GPT, ViT, LSTM
 - **Optimizers**: SGD, Adam, AdamW, with grouped multi-tensor apply
-- **Automatic fusion**: MatMul+Bias+Activation and Conv2D+Activation collapse into single GPU kernels
+- **Fused primitives**: `LinearAct` runs matmul, bias and activation as one GPU kernel — fusion is a module you choose, not a compiler pass
 - **Training**: supervised `Trainer` with AMP and CUDA-graph capture
 
 **`data`** is the trajectory store (HDF5), the replay buffers the off-policy
-agents sample from, and LeRobot v3 datasets in both directions. **`io`** is the
+agents sample from, and datasets in the LeRobot v3 format, read and written
+natively. **`io`** is the
 native I/O underneath — Parquet, H.264 video through ffmpeg, safetensors, HTTP
 — with no Python in the data path.
 
@@ -154,8 +156,8 @@ under a project and mirrored to [noeira cloud](/tooling/monitor/).
 
 The other loops follow the same shape: a recorder drives the robot or the
 simulator and writes demonstrations; a deployment loop loads a checkpoint and
-its normalisation, reads the cameras and the joints, and commands the arm —
-on a workstation or a Jetson Orin.
+its normalisation, reads the cameras and the joints, and commands the robot —
+on a workstation or on an embedded board such as a Jetson Orin.
 
 ## The through-line: every layer runs on the GPU
 
@@ -169,7 +171,7 @@ No host round-trips; the data never leaves the device. That is only possible
 because the physics engine, the networks and the driver are all Mojo, compiled
 together. On NVIDIA the loop can additionally be captured as a CUDA graph and
 replayed, worth roughly **1.4×** on SAC. On the robot, the same modules run
-the policy on the Jetson's GPU.
+the policy on its onboard GPU.
 
 ## Next
 

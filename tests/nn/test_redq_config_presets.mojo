@@ -81,11 +81,11 @@ def test_small_redq_preset() raises:
     assert_true(ga >= -1.0 and ga <= 1.0, "greedy action in [-1, 1]")
 
     var m = agent.flush_metrics()
-    print("  metrics.actor_loss   =", m.actor_loss.to_f64())
+    print("  metrics.actor_loss   =", m.policy_loss.to_f64())
     print("  metrics.critic_loss  =", m.critic_loss.to_f64())
     print("  metrics.alpha        =", m.alpha.to_f64())
     assert_true(
-        m.actor_loss.to_f64() == m.actor_loss.to_f64(),
+        m.policy_loss.to_f64() == m.policy_loss.to_f64(),
         "actor_loss finite",
     )
     assert_true(

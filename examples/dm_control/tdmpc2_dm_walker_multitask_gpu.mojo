@@ -96,8 +96,10 @@ from std.time import perf_counter_ns
 from max.gpu.host import DeviceContext
 
 from noeira.nn.constants import DT
-from noeira.core.dotenv import load_dotenv
-from noeira.core.logger import RemoteLogger
+from noeira.core.run import RunContext, register_run
+from noeira.core.run_session import RunLogger, finish_run, run_logger
+from noeira.deep_agents.training.checkpoint import announce_checkpoint
+from noeira.io.artifact_sink import sink_for_run
 from noeira.deep_agents.tdmpc2.config_mt import TDMPC2MultiTask
 from noeira.envs.phyics3d_batched_env import Phyics3dBatchedEnv
 from noeira.envs.dm_control.walker.walker_xml import DMWalkerModel
@@ -180,12 +182,11 @@ comptime N_ROUNDS = 13
 comptime EVAL_EVERY = SEGMENT_STEPS  # once per segment, on that task
 comptime DIAG_EVERY = 1_000
 comptime PRINT_EVERY = 4_000
-# ⚠ Built at RUNTIME (`var ckpt` in main), not as a comptime String — comptime
-# String stores do not survive here. Tagged with the acting mode and UTD:
-# `tdmpc2_dm_walker_multitask.ckpt` is the 130k MPC-off / UTD=0.125 run
-# analysed on 2026-08-12, the control for every comparison here, and an
-# untagged name overwrites it.
-comptime CKPT_STEM = "tdmpc2_dm_walker_multitask"
+# The checkpoint lives in the run's own directory (`RunContext` in main), so no
+# run overwrites another. The slug is still tagged with the acting mode and
+# UTD: `tdmpc2_dm_walker_multitask.ckpt` was the 130k MPC-off / UTD=0.125 run
+# analysed on 2026-08-12, the control for every comparison here, and the name
+# is what tells the runs apart on the dashboard.
 
 comptime MAX_RETURN = 1000.0
 
@@ -244,20 +245,26 @@ def main() raises:
     seed(0)
     var ctx = DeviceContext()
 
-    var CKPT = (
-        String(CKPT_STEM)
-        + ("_mpc" if USE_MPC else "_mpcoff")
-        + "_utd"
-        + String(UPDATES_PER_STEP)
-        # ⚠ The deviation is in the filename. A per-task-scale run and a
-        # reference run must never land on the same checkpoint — the whole
-        # experiment is the comparison between them.
-        + ("_ptscale" if PER_TASK_PI_SCALE else "")
-        # ⚠ TASK_EMB changes every net's first-layer shape, so a checkpoint
-        # from another value cannot load. Keep it in the name.
-        + "_emb" + String(TASK_EMB)
-        + ".ckpt"
+    var run = RunContext(
+        project=String("dm-control"),
+        driver=String("examples/dm_control/tdmpc2_dm_walker_multitask_gpu.mojo"),
+        slug=(
+            String("tdmpc2-mt-dm-walker")
+            + ("-mpc" if USE_MPC else "-mpcoff")
+            + "-utd"
+            + String(UPDATES_PER_STEP)
+            # ⚠ The deviation is in the name. A per-task-scale run and a
+            # reference run must never be confused — the whole experiment is
+            # the comparison between them.
+            + ("-ptscale" if PER_TASK_PI_SCALE else "")
+            # ⚠ TASK_EMB changes every net's first-layer shape, so a
+            # checkpoint from another value cannot load. Keep it in the name.
+            + "-emb" + String(TASK_EMB)
+        ),
+        env=String("builtin:dm_control/walker-stand+walk+run"),
     )
+    var CKPT = run.checkpoint_path(String("last"))
+    print("  Run:", run.dir)
 
     var stand = StandEnv(ctx)
     var walk = WalkEnv(ctx)
@@ -306,13 +313,7 @@ def main() raises:
         PER_TASK_PI_SCALE, Scalar[DT](PI_SCALE_MAX_REWEIGHT)
     )
 
-    var env_vars = load_dotenv()
-    var logger = RemoteLogger(
-        server_url=env_vars.get("NOEIRA_CLOUD_URL", ""),
-        run_name="TD-MPC2 dm_control walker MULTI-TASK",
-        buffer_size=64,
-        api_key=env_vars.get("NOEIRA_CLOUD_API_KEY", ""),
-    )
+    var logger = run_logger(run, buffer_size=64)
     logger.set_config("algorithm", "TD-MPC2-MT")
     logger.set_config("env", "dm_control/walker-stand+walk+run")
     logger.set_config("target", TARGET)
@@ -323,11 +324,9 @@ def main() raises:
     logger.set_config(
         "per_task_pi_scale", String("1") if PER_TASK_PI_SCALE else String("0")
     )
+    register_run(run, logger)
+    var artifacts = sink_for_run(run.id, run.dir)
     var lg = Pointer(to=logger).as_unsafe_any_origin()
-    if env_vars.get("NOEIRA_CLOUD_URL", "").byte_length() > 0:
-        print("  logger: ENABLED → eval/<task> + avg_reward/<task>")
-    else:
-        print("  logger: DISABLED — NOEIRA_CLOUD_URL not in .env")
 
     print("Starting multi-task training ...")
     print("-" * 70)
@@ -343,7 +342,7 @@ def main() raises:
         # dashboard shows N_ROUNDS x 3 overlapping runs. The warmup gate reads
         # the replay count, not this, so it is a logging axis only.
         var b0 = ag.train_batched_mt[
-            StandEnv, N_ENVS, RemoteLogger, USE_MPC, StandEval, EVAL_ENVS
+            StandEnv, N_ENVS, RunLogger, USE_MPC, StandEval, EVAL_ENVS
         ](
             stand,
             T_STAND,
@@ -357,6 +356,8 @@ def main() raises:
             base_step=at,
             checkpoint_path=CKPT,
             checkpoint_every=0,
+            artifacts=artifacts,
+            run_dir=run.dir,
             eval_env=stand_ev_p,
             eval_every=EVAL_EVERY,
             eval_max_steps=EPISODE_LEN,
@@ -367,7 +368,7 @@ def main() raises:
             best_stand = b0
 
         var b1 = ag.train_batched_mt[
-            WalkEnv, N_ENVS, RemoteLogger, USE_MPC, WalkEval, EVAL_ENVS
+            WalkEnv, N_ENVS, RunLogger, USE_MPC, WalkEval, EVAL_ENVS
         ](
             walk,
             T_WALK,
@@ -381,6 +382,8 @@ def main() raises:
             base_step=at,
             checkpoint_path=CKPT,
             checkpoint_every=0,
+            artifacts=artifacts,
+            run_dir=run.dir,
             eval_env=walk_ev_p,
             eval_every=EVAL_EVERY,
             eval_max_steps=EPISODE_LEN,
@@ -391,7 +394,7 @@ def main() raises:
             best_walk = b1
 
         var b2 = ag.train_batched_mt[
-            RunEnv, N_ENVS, RemoteLogger, USE_MPC, RunEval, EVAL_ENVS
+            RunEnv, N_ENVS, RunLogger, USE_MPC, RunEval, EVAL_ENVS
         ](
             run_e,
             T_RUN,
@@ -405,6 +408,8 @@ def main() raises:
             base_step=at,
             checkpoint_path=CKPT,
             checkpoint_every=0,
+            artifacts=artifacts,
+            run_dir=run.dir,
             eval_env=run_ev_p,
             eval_every=EVAL_EVERY,
             eval_max_steps=EPISODE_LEN,
@@ -417,19 +422,20 @@ def main() raises:
         # One checkpoint per ROUND — after all three tasks have collected, so
         # the file is never a mid-round snapshot biased to the last task.
         ag.save_state(CKPT)
+        announce_checkpoint(CKPT, artifacts, run.dir)
         # ⚠ Log the per-task scales, not just the shared one: whether the three
         # spreads actually SEPARATE is what makes this experiment readable. If
         # they stay near-equal, the reweight is ~1 and a null result says
         # nothing about the hypothesis — only that the mechanism never engaged.
         comptime if PER_TASK_PI_SCALE:
             logger.log_scalar(
-                "pi_scale/stand", Float64(ag.task_pi_scale(T_STAND)), at
+                "pi_scale_stand", Float64(ag.task_pi_scale(T_STAND)), at
             )
             logger.log_scalar(
-                "pi_scale/walk", Float64(ag.task_pi_scale(T_WALK)), at
+                "pi_scale_walk", Float64(ag.task_pi_scale(T_WALK)), at
             )
             logger.log_scalar(
-                "pi_scale/run", Float64(ag.task_pi_scale(T_RUN)), at
+                "pi_scale_run", Float64(ag.task_pi_scale(T_RUN)), at
             )
             print(
                 "     pi_scale — shared",
@@ -461,7 +467,12 @@ def main() raises:
     _ = walk_ev
     _ = run_ev
     var elapsed = Float64(perf_counter_ns() - t_start) / 1e9
-    logger.close()
+    finish_run(
+        run, logger, artifacts,
+        String("best_eval_stand=") + String(best_stand)
+        + " best_eval_walk=" + String(best_walk)
+        + " best_eval_run=" + String(best_run),
+    )
     _ = logger
 
     print("-" * 70)
@@ -477,7 +488,7 @@ def main() raises:
         " run:",
         best_run,
     )
-    print("  checkpoint      =", CKPT)
+    print("  run             =", run.dir)
     print("=" * 70)
     print("Read it against the SINGLE-TASK, MPC-OFF baseline per task —")
     print(

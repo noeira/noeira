@@ -214,6 +214,9 @@ struct CarDynamicsMB:
             state[env, jo + JOINT_FLAGS] = Scalar[dtype](
                 JOINT_FLAG_LIMIT_ENABLED | JOINT_FLAG_MOTOR_ENABLED
             )
+            RevoluteJointSolver.clear_warm_start[BATCH, STATE_SIZE](
+                state, env, jo
+            )
 
             # Rolling wheel speed (tire-model DOF, not a Box2D body DOF)
             state[env, ROLLING_OFFSET + w] = Scalar[dtype](0.0)
@@ -454,6 +457,14 @@ struct CarDynamicsMB:
                 BATCH, Self.NUM_BODIES, STATE_SIZE, BODIES_OFFSET, FORCES_OFFSET
             ](env, state, Scalar[dtype](0.0), Scalar[dtype](0.0), sub_dt)
 
+            RevoluteJointSolver.init_velocity_single_env[
+                BATCH,
+                Self.NUM_BODIES,
+                Self.NUM_JOINTS,
+                STATE_SIZE,
+                BODIES_OFFSET,
+                JOINTS_OFFSET,
+            ](env, state, Self.NUM_JOINTS)
             for _ in range(VEL_ITERS):
                 RevoluteJointSolver.solve_velocity_single_env[
                     BATCH,
@@ -469,14 +480,15 @@ struct CarDynamicsMB:
             ](env, state, sub_dt)
 
             for _ in range(POS_ITERS):
-                RevoluteJointSolver.solve_position_single_env[
+                if RevoluteJointSolver.solve_position_single_env[
                     BATCH,
                     Self.NUM_BODIES,
                     Self.NUM_JOINTS,
                     STATE_SIZE,
                     BODIES_OFFSET,
                     JOINTS_OFFSET,
-                ](env, state, Self.NUM_JOINTS, Scalar[dtype](0.2), Scalar[dtype](0.005))
+                ](env, state, Self.NUM_JOINTS):
+                    break
 
     @always_inline
     @staticmethod

@@ -23,8 +23,11 @@ Controls (renderer window):
 
 Run:
     pixi run mojo run -I . examples/humanoid/sac_humanoid_nn_eval_cpu.mojo
+    pixi run mojo run -I . examples/humanoid/sac_humanoid_nn_eval_cpu.mojo --ckpt <run_id>
 """
 
+from std.sys import argv
+from noeira.core.run import resolve_checkpoint
 from std.random import seed
 
 from max.gpu.host import DeviceContext
@@ -62,7 +65,19 @@ comptime MAX_STEPS = 1000
 comptime FRAME_DELAY_MS = 16  # ~60 FPS playback
 
 
+def _flag(name: String, dflt: String) raises -> String:
+    """Value of `--name X`, or `dflt` when the flag is absent."""
+    var av = argv()
+    for i in range(1, len(av)):
+        if String(av[i]) == name:
+            if i + 1 >= len(av):
+                raise Error("flag " + name + " needs a value")
+            return String(av[i + 1])
+    return dflt
+
+
 def main() raises:
+    var ckpt = resolve_checkpoint(_flag(String("--ckpt"), String(CHECKPOINT_PATH)), String("last"))
     seed(42)
     print("=" * 70)
     print("SAC (deep_agents) — Humanoid CPU eval + 3D rendering")
@@ -71,7 +86,7 @@ def main() raises:
     print("  ACT_DIM         =", ACT_DIM)
     print("  HIDDEN          =", HIDDEN)
     print("  action_scale    =", ACTION_SCALE)
-    print("  Checkpoint      =", CHECKPOINT_PATH)
+    print("  Checkpoint      =", ckpt)
     print("  Episodes        =", NUM_EPISODES)
     print("  Max steps/ep    =", MAX_STEPS)
     print("=" * 70)
@@ -87,7 +102,7 @@ def main() raises:
     # ─── Load checkpoint ─────────────────────────────────────────────────
     print("Loading checkpoint...")
     try:
-        agent.load(CHECKPOINT_PATH)
+        agent.load(ckpt)
         print("Checkpoint loaded.")
     except e:
         print("ERROR loading checkpoint:", e)

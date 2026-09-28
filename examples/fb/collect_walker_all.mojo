@@ -67,6 +67,7 @@ since after `reward_at` any of the three can.
 
 Run:
     pixi run mojo run -I . examples/fb/collect_walker_all.mojo
+    pixi run mojo run -I . examples/fb/collect_walker_all.mojo --run-stand <id> --run-walk <id> --run-run <id>
 """
 
 from std.random import random_float64, seed
@@ -80,6 +81,10 @@ from noeira.envs.phyics3d_env_config import Phyics3dEnvConfig
 from noeira.envs.dm_control.walker import DMWalkerModel, DMWalkerConfig
 
 from max.gpu.host import DeviceContext
+from std.sys import argv
+from std.os.path import exists
+from noeira.core.project import projects_root
+from noeira.io.proc import quote_arg, run_capture
 
 
 # ══ LADDER GEOMETRY — MUST MATCH `sac_dm_walker_training_gpu.mojo` ═══════
@@ -159,11 +164,17 @@ def collect_task[
     ctx: DeviceContext,
     task_name: String,
     task_id: Int,
+    run_dir: String,
 ) raises -> TaskStats:
-    """Roll out one task's whole ladder, rung 0 (random) through N_SEGMENTS."""
+    """Roll out one task's whole ladder, rung 0 (random) through N_SEGMENTS.
+
+    `run_dir` is the training run holding that ladder (its `checkpoints/`), or
+    "" for the old layout — rungs in the CWD."""
     comptime EnvT = Phyics3dEnv[DMWalkerModel, CONFIG, DType.float64, False]
 
     var prefix = String(CKPT_PREFIX) + task_name
+    if run_dir.byte_length() > 0:
+        prefix = run_dir + "/checkpoints/" + prefix
     var env = EnvT(ctx)
 
     # Flushed once per episode so `ep_return` — known only at the end — can be
@@ -285,6 +296,45 @@ def collect_task[
     return TaskStats(rows, eps, missing)
 
 
+def _run_dir(handle: String) raises -> String:
+    """`handle` as a run directory: a path to one, or a run id under `runs/` or
+    any `projects/*/runs/`. Raises when none of them holds a `checkpoints/`."""
+    if exists(handle + "/checkpoints"):
+        return handle
+    if exists(String("runs/") + handle + "/checkpoints"):
+        return String("runs/") + handle
+    var root = projects_root()
+    var listing = run_capture(
+        String("ls -d ") + quote_arg(root) + "/*/runs/" + quote_arg(handle)
+        + " 2>/dev/null; true",
+        1 << 16,
+    )
+    for line in listing.split("\n"):
+        var d = String(String(line).strip())
+        if d.byte_length() > 0 and exists(d + "/checkpoints"):
+            return d
+    raise Error(
+        "--run '" + handle + "' is neither a run directory nor a run id under"
+        " runs/ or " + root + "/*/runs/"
+    )
+
+
+def _flag(name: String, dflt: String) raises -> String:
+    """Value of `--name X`, or `dflt` when the flag is absent."""
+    var av = argv()
+    for i in range(1, len(av)):
+        if String(av[i]) == name:
+            if i + 1 >= len(av):
+                raise Error("flag " + name + " needs a value")
+            return String(av[i + 1])
+    return dflt
+
+
+def _task_run_dir(flag: String) raises -> String:
+    var h = _flag(flag, String(""))
+    return _run_dir(h) if h.byte_length() > 0 else String("")
+
+
 def main() raises:
     seed(SEED)
     var per_task = (
@@ -304,6 +354,12 @@ def main() raises:
     print("  NQ / NV / NACT     =", NQ, "/", NV, "/", NACT)
     print("  out                =", OUT_PATH)
     print("=" * 70)
+
+    # One training run per task (`--run-stand/--run-walk/--run-run`); a task
+    # without one reads its rungs from the CWD, the old layout.
+    var dir_stand = _task_run_dir(String("--run-stand"))
+    var dir_walk = _task_run_dir(String("--run-walk"))
+    var dir_run = _task_run_dir(String("--run-run"))
 
     var cols = List[ColumnSpec]()
     cols.append(ColumnSpec(String("qpos"), DType.float32, NQ))
@@ -326,12 +382,12 @@ def main() raises:
 
     print("[stand] ------------------------------------------------------")
     var s_stand = collect_task[DMWalkerConfig[0.0]](
-        w, ctx, String("stand"), 0
+        w, ctx, String("stand"), 0, dir_stand
     )
     print("[walk]  ------------------------------------------------------")
-    var s_walk = collect_task[DMWalkerConfig[1.0]](w, ctx, String("walk"), 1)
+    var s_walk = collect_task[DMWalkerConfig[1.0]](w, ctx, String("walk"), 1, dir_walk)
     print("[run]   ------------------------------------------------------")
-    var s_run = collect_task[DMWalkerConfig[8.0]](w, ctx, String("run"), 2)
+    var s_run = collect_task[DMWalkerConfig[8.0]](w, ctx, String("run"), 2, dir_run)
 
     w.close()
 

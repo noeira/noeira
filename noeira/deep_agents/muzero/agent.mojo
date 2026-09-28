@@ -20,7 +20,7 @@ driver. `save` / `load` are device-aware.
   * `eval_greedy(env, episodes)` — the deployed-agent metric: noise-off,
     argmax-visit rollout. ALWAYS judge the policy by this, not the exploratory
     training return (∝-visit sampling + root Dirichlet noise badly understates it).
-  * `save` / `load` — one-file `nn-ckpt v2` envelope packing all three nets
+  * `save` / `load` — one-file v3 `storage-ckpt` file packing all three nets
     (sections `rep` / `dyn` / `pred`).
 
 The three nets share `LATENT` + `BINS`; reward (`dyn`) and value (`pred`) heads
@@ -319,7 +319,7 @@ struct MuZeroAgent[
 
     def save(mut self, path: String) raises:
         """Weights-only snapshot of the three learned-model nets (rep / dyn
-        / pred) in the `nn-ckpt v2` envelope. Uses the `save`/`load`
+        / pred) in the v3 `storage-ckpt` file. Uses the `save`/`load`
         surface shared by every agent facade. NOTE: optimizers are
         session-local — rebuilt per `train_*` call — so only weights
         persist; this is the inference / self-play artifact, not a

@@ -49,6 +49,7 @@ with no local structure for `B` to embed.
 
 Run (after training the ladder for the same TASK):
     pixi run mojo run -I . examples/fb/collect_walker_sac.mojo
+    pixi run mojo run -I . examples/fb/collect_walker_sac.mojo --run <run_id>
 """
 
 from std.random import seed
@@ -61,6 +62,10 @@ from noeira.envs.phyics3d_env import Phyics3dEnv
 from noeira.envs.dm_control.walker import DMWalkerModel, DMWalkerConfig
 
 from max.gpu.host import DeviceContext
+from std.sys import argv
+from std.os.path import exists
+from noeira.core.project import projects_root
+from noeira.io.proc import quote_arg, run_capture
 
 
 # ── must match the training script for this TASK ─────────────────────────
@@ -111,6 +116,40 @@ def _stamped(prefix: String, step: Int) raises -> String:
     return prefix + ".ckpt." + pad + s
 
 
+def _run_dir(handle: String) raises -> String:
+    """`handle` as a run directory: a path to one, or a run id under `runs/` or
+    any `projects/*/runs/`. Raises when none of them holds a `checkpoints/`."""
+    if exists(handle + "/checkpoints"):
+        return handle
+    if exists(String("runs/") + handle + "/checkpoints"):
+        return String("runs/") + handle
+    var root = projects_root()
+    var listing = run_capture(
+        String("ls -d ") + quote_arg(root) + "/*/runs/" + quote_arg(handle)
+        + " 2>/dev/null; true",
+        1 << 16,
+    )
+    for line in listing.split("\n"):
+        var d = String(String(line).strip())
+        if d.byte_length() > 0 and exists(d + "/checkpoints"):
+            return d
+    raise Error(
+        "--run '" + handle + "' is neither a run directory nor a run id under"
+        " runs/ or " + root + "/*/runs/"
+    )
+
+
+def _flag(name: String, dflt: String) raises -> String:
+    """Value of `--name X`, or `dflt` when the flag is absent."""
+    var av = argv()
+    for i in range(1, len(av)):
+        if String(av[i]) == name:
+            if i + 1 >= len(av):
+                raise Error("flag " + name + " needs a value")
+            return String(av[i + 1])
+    return dflt
+
+
 def main() raises:
     # ⚠ In a function body — a top-level `comptime assert` does not parse.
     # Without it a typo'd TASK falls through the ternary above to 8.0 (run)
@@ -131,7 +170,13 @@ def main() raises:
     print("  out                =", OUT_PATH)
     print("=" * 70)
 
+    # Rungs live in the CWD (old layout) or, with `--run`, in that training
+    # run's `checkpoints/` (`runs/<id>/checkpoints/sac_dm_walker_<task>.ckpt.*`).
+    var run_arg = _flag(String("--run"), String(""))
     var prefix = String(CKPT_PREFIX) + String(TASK)
+    if run_arg.byte_length() > 0:
+        prefix = _run_dir(run_arg) + "/checkpoints/" + prefix
+    print("  ladder prefix      =", prefix)
 
     var cols = List[ColumnSpec]()
     cols.append(ColumnSpec(String("qpos"), DType.float32, NQ))

@@ -13,10 +13,11 @@ deep_agents counterpart of the legacy `redq_half_cheetah_training_gpu.mojo`
     setup (one parallel env; each transition triggers UTD inner gradient
     updates). The HalfCheetah physics env steps on CPU; every REDQ gradient
     update runs on the GPU.
-  * `RemoteLogger` — streams `avg_reward` + `episodes` at the driver's
-    `print_every` cadence and (via `diag_every`) the full REDQ metric bundle
-    (critic_loss, actor_loss, alpha, mean_q, ...). Config (server URL + API
-    key) read from a `.env` via `noeira.core.dotenv`.
+  * A `RunContext` (project `mujoco`): the checkpoint, `metrics.csv` and
+    `run.kv` all live in `runs/<id>/`, and the monitor row carries the same id.
+  * `run_logger(run)` — `metrics.csv` + the monitor: `avg_reward` +
+    `episodes` at the driver's `print_every` cadence and (via `diag_every`)
+    the full REDQ metric bundle (critic_loss, actor_loss, alpha, mean_q, ...).
 
 deep_agents REDQ ships single-env training only (R.5); the batched multi-env
 `train()` entry point that SAC has is a follow-up. REDQ's paper uses a single
@@ -37,8 +38,9 @@ from max.gpu.host import DeviceContext
 from std.random import seed
 from std.time import perf_counter_ns
 
-from noeira.core.dotenv import load_dotenv
-from noeira.core.logger import RemoteLogger
+from noeira.core.run import RunContext, register_run
+from noeira.core.run_session import RunLogger, finish_run, run_logger
+from noeira.io.artifact_sink import sink_for_run
 from noeira.nn.constants import DT
 from noeira.deep_agents.redq import REDQ
 from noeira.envs.half_cheetah import HalfCheetah, HalfCheetahConfig
@@ -70,7 +72,6 @@ comptime WARMUP_STEPS = 5_000
 comptime PRINT_EVERY = 10_000  # driver-cadence verbose + env/mean_ret emit
 comptime DIAG_EVERY = 1_000  # full metric-bundle flush cadence (mean_q, ...)
 
-comptime CHECKPOINT_PATH = "redq_half_cheetah_nn.ckpt"
 comptime CHECKPOINT_EVERY = 50_000
 
 comptime EnvT = HalfCheetah[DT, TERMINATE_ON_UNHEALTHY=False]
@@ -96,17 +97,16 @@ def main() raises:
     print("=" * 70)
 
     with DeviceContext() as ctx:
-        # ─── Logger (remote) ─────────────────────────────────────────────
-        var env_vars = load_dotenv()
-        var api_key = env_vars.get("NOEIRA_CLOUD_API_KEY", "")
-        var url = env_vars.get("NOEIRA_CLOUD_URL", "")
-
-        var logger = RemoteLogger(
-            server_url=url,
-            run_name="REDQ HalfCheetah NN (GPU)",
-            buffer_size=64,
-            api_key=api_key,
+        # ─── Run + logger ───────────────────────────────────────────────────
+        var run = RunContext(
+            project=String("mujoco"),
+            driver=String("examples/half_cheetah/redq_half_cheetah_training_gpu.mojo"),
+            slug=String("redq-half-cheetah-gpu"),
+            env=String("builtin:mujoco/half_cheetah"),
         )
+        var checkpoint_path = run.checkpoint_path(String("last"))
+        print("  Run                =", run.dir)
+        var logger = run_logger(run, buffer_size=64)
         logger.set_config("algorithm", "REDQ")
         logger.set_config("env", "HalfCheetah")
         logger.set_config("target", "gpu")
@@ -117,6 +117,8 @@ def main() raises:
         logger.set_config("num_min", "2")
         logger.set_config("utd_ratio", "20")
         logger.set_config("policy_delay", "20")
+        register_run(run, logger)
+        var artifacts = sink_for_run(run.id, run.dir)
 
         var logger_ptr = Pointer(to=logger).as_unsafe_any_origin()
 
@@ -146,7 +148,7 @@ def main() raises:
         var env = EnvT()
 
         # To resume from a previous run, uncomment:
-        # agent.load(CHECKPOINT_PATH)
+        # agent.load(checkpoint_path)
 
         # ─── Single train_single() call — off-policy GPU driver ──────────
         # Each env transition triggers UTD=20 gradient updates on-device.
@@ -155,7 +157,7 @@ def main() raises:
         var t_start = perf_counter_ns()
         _ = agent.train_single[
             EnvT,
-            L=RemoteLogger,
+            L=RunLogger,
         ](
             env,
             NUM_STEPS,
@@ -163,11 +165,17 @@ def main() raises:
             verbose=True,
             logger=logger_ptr,
             diag_every=DIAG_EVERY,
-            checkpoint_path=CHECKPOINT_PATH,
+            checkpoint_path=checkpoint_path,
             checkpoint_every=CHECKPOINT_EVERY,
+            artifacts=artifacts,
+            run_dir=run.dir,
         )
         var elapsed_s = Float64(perf_counter_ns() - t_start) / 1e9
-        logger.close()
+        var sent = logger.b.total_logged()
+        finish_run(
+            run, logger, artifacts,
+            String("mean_return_100=") + String(agent.mean_return()),
+        )
         _ = logger  # lifetime extender for logger_ptr
 
         # ─── Summary ─────────────────────────────────────────────────────
@@ -178,7 +186,8 @@ def main() raises:
         print("  elapsed                   =", elapsed_s, "s")
         print("  mean ep return (last 100) =", agent.mean_return())
         print("  episodes completed        =", agent.ep_count())
-        print("  remote points sent        =", logger.total_logged())
+        print("  remote points sent        =", sent)
+        print("  run record                =", run.kv_path())
         print("=" * 70)
 
         var final_avg = Float64(agent.mean_return())

@@ -7,10 +7,13 @@
     pixi run project-prune so101 --older-than 30 [--apply]
     pixi run project-promote <run_id> best --as reach --note "8/10 on the arm"
         (add --no-push to keep it local; the box is the record either way)
-    pixi run project-push so101 [<run_id>] [--kind checkpoint] [--force]
+    pixi run project-push so101 [<run_id>] [--kind checkpoint|eval|log] [--force]
     pixi run project-pull so101 [<run_id>] [--kind checkpoint] [--force]
     pixi run project-pull so101 --weights   # definition + promoted policies' weights
     pixi run project-list --remote
+    pixi run project-show so101 --remote    # the project's runs on the monitor
+    pixi run project-rerun <run_id> [--exec]    # how to run it again, exactly
+    pixi run project-resume <run_id> [--from last] [--dry-run]
 
 ⚠⚠ PROJECTS ARE PRIVATE AND NOT IN GIT. `projects/` is ignored, so a project's
 DEFINITION (`project.kv`, calibration, task files, policy records) reaches a
@@ -52,14 +55,23 @@ from noeira.core.policy import (
     policy_kv_path,
     write_policy,
 )
-from noeira.core.run import RunRecord, epoch_seconds, iso8601_utc, load_run
+from noeira.core.run import (
+    RunRecord,
+    epoch_seconds,
+    git_commit,
+    git_dirty,
+    iso8601_utc,
+    load_run,
+    resume_args_for,
+    run_command,
+)
 from noeira.data.policy_weights import pull_policy_weights
 from noeira.data.project_sync import pull_definition, push_definition
 from noeira.data.remote import RemoteCatalog
 from noeira.io.fetch import fetch_to_cache
 from noeira.io.fileio import file_size
 from noeira.io.json import JsonDoc
-from noeira.io.proc import quote_arg, run_capture
+from noeira.io.proc import quote_arg, run_capture, run_system
 from noeira.io.sha256 import sha256_file
 
 
@@ -189,10 +201,63 @@ def cmd_list() raises:
         print(" ", shown, "project(s) under", root + "/")
 
 
+def _field_or(ref doc: JsonDoc, row: Int, name: String) -> String:
+    try:
+        var f = doc.field(row, name)
+        if f < 0:
+            return String("")
+        return doc.string(f)
+    except:
+        return String("")
+
+
+def cmd_show_remote(name: String) raises:
+    """`project-show <name> --remote`: the project's runs as the MONITOR has
+    them — including runs trained on boxes this one has never seen, which is
+    the list to pick a run from before `project-pull <name> <run_id>`."""
+    var cat = RemoteCatalog.from_env()
+    var doc = cat.runs_of(name)
+    var root = doc.root()
+    var n = doc.size(root)
+    print("project", name, "on the platform:", n, "run(s)")
+    for i in range(n):
+        var row = doc.at(root, i)
+        var rid = _field_or(doc, row, String("runId"))
+        var st = _field_or(doc, row, String("status"))
+        var oc = _field_or(doc, row, String("outcome"))
+        var tg = _field_or(doc, row, String("tag"))
+        var here = len(_run_dirs(name, rid)) > 0
+        print(
+            "   ", st, rid,
+            ("  " + oc) if oc else "",
+            ("  #" + tg) if tg else "",
+            "" if here else "   (not on this box)",
+        )
+
+
 def cmd_show() raises:
     var name = _positional(1)
     if name.byte_length() == 0:
-        raise Error("usage: project-show <name>")
+        raise Error("usage: project-show <name> [--remote]")
+    if _has("--remote"):
+        cmd_show_remote(name)
+        return
+    if not project_exists(name, projects_root()):
+        # ⚠ NO DEFINITION IS NOT NO RUNS. `runs_root_for` files a run in the
+        # flat `runs/` root until someone runs `project-init`, so a project
+        # can have dozens of runs and no `project.kv` — refusing to show them
+        # hid exactly the runs nobody had organised yet.
+        print("project", name, "— not project-init'ed on this box (no refs, no policies)")
+        var dirs = _run_dirs(name, String(""))
+        print("  runs:", len(dirs), "(in the flat runs/ root)")
+        for d in dirs:
+            var rec = load_run(String(d) + "/run.kv")
+            print(
+                "   ", rec.status, rec.run_id,
+                ("  " + rec.outcome) if rec.outcome else "",
+                ("  #" + rec.tag) if rec.tag else "",
+            )
+        return
     var p = load_project(name, projects_root())
     print("project", p.name, "  created", p.created)
     if p.description:
@@ -595,6 +660,14 @@ def _artifact_rel(line: String) -> String:
 
 
 def _run_dirs(project: String, only: String) raises -> List[String]:
+    """Every run of `project` on this box: under `projects/<p>/runs/`, AND in
+    the flat `runs/` root when its `run.kv` says `project=<p>`.
+
+    ⚠ THE FLAT ROOT IS WHERE MOST RUNS ARE. `runs_root_for` falls back to it
+    whenever the named project has not been `project-init`ed, which on
+    2026-09-22 was 47 runs of so101, libero and g1 — none of which a
+    project-scoped listing could see, and so none of which could be pushed.
+    """
     var out = List[String]()
     var base = projects_root() + "/" + project + "/runs"
     for n in _ls(base):
@@ -602,7 +675,101 @@ def _run_dirs(project: String, only: String) raises -> List[String]:
             continue
         if exists(base + "/" + n + "/run.kv"):
             out.append(base + "/" + n)
+    for n in _ls(String("runs")):
+        if only.byte_length() > 0 and n != only:
+            continue
+        var kv = String("runs/") + n + "/run.kv"
+        if not exists(kv):
+            continue
+        try:
+            if load_run(kv).project == project:
+                out.append(String("runs/") + n)
+        except:
+            pass  # a record this build cannot read is reported by project-show
     return out^
+
+
+def _kind_of(rel: String) -> String:
+    if rel.startswith("checkpoints/"):
+        return String("checkpoint")
+    if rel.startswith("eval/"):
+        return String("eval")
+    return String("log")
+
+
+def _run_files(dir: String, rec: RunRecord) raises -> List[String]:
+    """What a push sends for one run, as paths relative to the run directory.
+
+    The `artifact=` lines of `run.kv`; when there are none — a run that died
+    before `close()`, or one closed by a build older than
+    `RunContext.record_artifacts` — the same directories `close()` would have
+    read. Then the run's own record: `run.kv`, `metrics.csv` and
+    `metrics.config.kv`, so a run pulled onto another box is a run there
+    (`project-show` lists what has a `run.kv`) and its curves come with it.
+    """
+    var out = List[String]()
+    for line in rec.artifacts:
+        out.append(_artifact_rel(String(line)))
+    if len(out) == 0:
+        var listing = run_capture(
+            String("cd ") + quote_arg(dir)
+            + " && find checkpoints eval -type f ! -name '*.tmp' 2>/dev/null"
+            + " | sort; true",
+            1 << 20,
+        )
+        for l in listing.split("\n"):
+            var rel = String(String(l).strip())
+            if rel.byte_length() > 0:
+                out.append(rel)
+    for f in [String("run.kv"), String("metrics.csv"), String("metrics.config.kv")]:
+        var seen = False
+        for r in out:
+            if r == f:
+                seen = True
+        if not seen and exists(dir + "/" + f):
+            out.append(f)
+    return out^
+
+
+def _run_config(dir: String, rec: RunRecord) raises -> Tuple[List[String], List[String]]:
+    """The config a live run registers with (`core/run.register_run` + the
+    logger's `set_config` calls), rebuilt from the run's files so the upsert
+    does not replace it with less."""
+    var k = List[String]()
+    var v = List[String]()
+
+    def put(key: String, val: String) {mut k, mut v}:
+        if val.byte_length() == 0:
+            return
+        for i in range(len(k)):
+            if k[i] == key:
+                v[i] = val
+                return
+        k.append(key)
+        v.append(val)
+
+    var cfg = dir + "/metrics.config.kv"
+    if exists(cfg):
+        with open(cfg, "r") as fh:
+            for line in fh.read().split("\n"):
+                var l = String(line)
+                var cut = l.find("=")
+                if cut > 0:
+                    put(String(l[byte=0:cut]), String(l[byte = cut + 1 :]))
+    for c in rec.config:
+        var cs = String(c)
+        var cut = cs.find(":")
+        if cut > 0:
+            put(String(cs[byte=0:cut]), String(cs[byte = cut + 1 :]))
+    put(String("run_id"), rec.run_id)
+    put(String("project"), rec.project)
+    put(String("driver"), rec.driver)
+    put(String("env"), rec.env)
+    put(String("task"), rec.task)
+    put(String("source_commit"), rec.source_commit)
+    put(String("seed"), String(rec.seed))
+    put(String("host"), rec.host)
+    return (k^, v^)
 
 
 def _ready_digests(mut cat: RemoteCatalog, run_id: String) -> List[String]:
@@ -637,22 +804,59 @@ def _ready_digests(mut cat: RemoteCatalog, run_id: String) -> List[String]:
     return out^
 
 
+def _push_dry_run(project: String, only: String, kind: String) raises:
+    """`project-push --dry-run`: every run, its status, its config size and
+    the files a push would consider — with no network and no credentials."""
+    var dirs = _run_dirs(project, only)
+    var n_files = 0
+    for d in dirs:
+        var dir = String(d)
+        var rec = load_run(dir + "/run.kv")
+        var cfg = _run_config(dir, rec)
+        print(
+            "  run " + rec.run_id + "  [" + rec.status + "]  "
+            + String(len(cfg[0])) + " config keys  (" + dir + ")"
+        )
+        for rel in _run_files(dir, rec):
+            var k = _kind_of(rel)
+            if kind.byte_length() > 0 and k != kind:
+                continue
+            n_files += 1
+            var here = exists(dir + "/" + rel)
+            print(
+                "      " + k + "  " + rel
+                + ("" if here else "   (MISSING locally)")
+            )
+    print(String(len(dirs)) + " runs, " + String(n_files) + " files — dry run, nothing sent")
+
+
 def cmd_push() raises:
-    """Send this box's artifacts for a project's runs to the monitor.
+    """Send this box's runs of a project to the monitor: the run itself, its
+    checkpoints and eval files, and its record (`run.kv`, `metrics.csv`,
+    `metrics.config.kv`).
 
     ⚠ IT IS A RESUME, NOT A RE-SEND. Anything the monitor already holds with a
     matching sha256 is skipped, so running it twice costs two catalog reads and
     no bytes — the same "cache, not toll booth" rule `RemoteCatalog.pull` uses
     for datasets.
+
+    ⚠ THE RUN IS REGISTERED FIRST. `/artifacts` refuses a run the monitor has
+    never seen, so without this a run trained offline could never be pushed.
+    `--kind checkpoint|eval|log` limits what is sent.
     """
     var project = _positional(1)
     if project.byte_length() == 0:
         raise Error(
             "usage: project-push <project> [<run_id>] [--kind K] [--force]"
-            " [--definition-only]"
+            " [--definition-only] [--dry-run]"
         )
     var only = _positional(2)
-    var kind = _flag(String("--kind"), String("checkpoint"))
+    var kind = _flag(String("--kind"), String(""))
+    # `--dry-run`: what would be registered and sent, with no request made.
+    var dry = _has("--dry-run")
+    if dry:
+        _push_dry_run(project, only, kind)
+        return
     var cat = RemoteCatalog.from_env()
 
     # ⚠ THE DEFINITION FIRST, and only when no single run was named. A box
@@ -661,12 +865,17 @@ def cmd_push() raises:
     # calibration to run them with.
     if only.byte_length() == 0:
         var root = projects_root()
-        var spec = load_project(project, root)
-        print("definition  " + root + "/" + project + "/")
-        var rep = push_definition(
-            cat, project, root, spec.description, _has("--force")
-        )
-        rep.print_all(String("pushed"))
+        if project_exists(project, root):
+            var spec = load_project(project, root)
+            print("definition  " + root + "/" + project + "/")
+            var rep = push_definition(
+                cat, project, root, spec.description, _has("--force")
+            )
+            rep.print_all(String("pushed"))
+        else:
+            # Runs can exist without a definition (the flat `runs/` root);
+            # the platform creates the project from the run's config.
+            print("definition  none — " + project + " was never project-init'ed here")
         if _has("--definition-only"):
             return
         print()
@@ -674,22 +883,35 @@ def cmd_push() raises:
     var dirs = _run_dirs(project, only)
     if len(dirs) == 0:
         if only.byte_length() > 0:
-            raise Error("no run " + only + " with a run.kv under " + project)
-        print("runs        none with a run.kv under " + project + " yet")
+            raise Error("no run " + only + " with a run.kv for " + project)
+        print("runs        none with a run.kv for " + project + " yet")
         return
     print("runs")
     var sent = 0
     var skipped = 0
     var missing = 0
     var considered = 0
+    var registered = 0
 
     for d in dirs:
-        var rec = load_run(String(d) + "/run.kv")
+        var dir = String(d)
+        var rec = load_run(dir + "/run.kv")
+        var cfg = _run_config(dir, rec)
+        try:
+            cat.upsert_run(rec.run_id, rec.run_id, cfg[0], cfg[1])
+            registered += 1
+            if rec.status == "done" or rec.status == "killed" or rec.status == "crashed":
+                cat.finish_run(rec.run_id, rec.status, rec.outcome)
+        except e:
+            print("  skip     " + rec.run_id + "  (could not register: " + String(e) + ")")
+            continue
         var have = _ready_digests(cat, rec.run_id)
-        for line in rec.artifacts:
+        for rel in _run_files(dir, rec):
+            var k = _kind_of(rel)
+            if kind.byte_length() > 0 and k != kind:
+                continue
             considered += 1
-            var rel = _artifact_rel(String(line))
-            var local = String(d) + "/" + rel
+            var local = dir + "/" + rel
             if not exists(local):
                 missing += 1
                 print("  missing  " + rec.run_id + "  " + rel)
@@ -704,30 +926,19 @@ def cmd_push() raises:
                 skipped += 1
                 continue
             print(
-                "  push     "
-                + rec.run_id
-                + "  "
-                + rel
-                + "  ("
-                + String(file_size(local) // 1_000_000)
-                + " MB)"
+                "  push     " + rec.run_id + "  " + rel + "  ("
+                + String(file_size(local) // 1_000_000) + " MB)"
             )
-            _ = cat.push_artifact(rec.run_id, rel, local, kind)
+            _ = cat.push_artifact(rec.run_id, rel, local, k)
             sent += 1
 
     # ⚠ PRINT WHAT WAS CONSIDERED BESIDE WHAT WAS SENT. "0 pushed" is also what
-    # a run with no `artifact=` lines prints, and those are different facts.
+    # a run with nothing to send prints, and those are different facts.
     print(
-        String(considered)
-        + " artifacts considered across "
-        + String(len(dirs))
-        + " runs: "
-        + String(sent)
-        + " pushed, "
-        + String(skipped)
-        + " already there, "
-        + String(missing)
-        + " missing locally"
+        String(len(dirs)) + " runs (" + String(registered) + " registered), "
+        + String(considered) + " files considered: " + String(sent)
+        + " pushed, " + String(skipped) + " already there, "
+        + String(missing) + " missing locally"
     )
 
 
@@ -806,6 +1017,134 @@ def cmd_pull() raises:
     )
 
 
+# =============================================================================
+# rerun / resume — a run is a recipe, not only a record
+# =============================================================================
+
+
+def _load_found(rid: String) raises -> Tuple[String, RunRecord]:
+    var found = _find_run(rid)
+    var dir = found[0]
+    return (dir, load_run(dir + "/run.kv"))
+
+
+def _require_recipe(rid: String, rec: RunRecord) raises:
+    """⚠ A record from before schema 2 has no `arg=` lines — its arguments
+    were never written, and "no arguments" would be a guess presented as a
+    fact. Refuse rather than rerun it with its defaults."""
+    if rec.schema_version < 2:
+        raise Error(
+            "run " + rid + " was recorded before 2026-09-23 (run.kv schema "
+            + String(rec.schema_version) + "): its command-line arguments"
+            " were not saved, so it cannot be rerun as it ran. Its driver"
+            " was " + rec.driver + "."
+        )
+
+
+def _source_verdict(rec: RunRecord) -> String:
+    """Whether THIS checkout is the code the run ran — the one question a
+    rerun has to answer before its curve is compared with the original."""
+    var head = git_commit()
+    if head != rec.source_commit:
+        return (
+            String("NOT exact here: HEAD is ") + head + ", the run was at "
+            + rec.source_commit
+        )
+    if rec.dirty or git_dirty():
+        if rec.source_patch == "source.patch" and not git_dirty():
+            return String("NOT exact here: the run had uncommitted changes"
+                          " (apply its source.patch)")
+        return String("NOT exact here: the run or this tree has uncommitted"
+                      " changes")
+    return String("exact: same commit, both trees clean")
+
+
+def cmd_rerun() raises:
+    """Print how to run a run again, exactly; `--exec` runs it HERE."""
+    var rid = _positional(1)
+    if rid.byte_length() == 0:
+        raise Error("usage: project-rerun <run_id> [--exec]")
+    var lr = _load_found(rid)
+    var dir = lr[0]
+    ref rec = lr[1]
+    _require_recipe(rid, rec)
+    var cmd = run_command(rec.driver, rec.pixi_env, rec.args)
+    print("run", rid, "—", rec.driver)
+    var src = rec.source_commit
+    if rec.source_patch == "source.patch":
+        src += " + source.patch (uncommitted changes, saved with the run)"
+    elif rec.source_patch.startswith("too_large:"):
+        src += " + uncommitted changes NOT saved (" + rec.source_patch
+        src += " bytes): this run cannot be reproduced exactly"
+    elif rec.dirty:
+        src += " + uncommitted changes NOT saved"
+    print("  source :", src)
+    print("  here   :", _source_verdict(rec))
+    print()
+    print("  In a separate worktree (leaves this checkout alone):")
+    var wt = String("../noeira-rerun-") + rid
+    print("    git worktree add", wt, rec.source_commit)
+    if rec.source_patch == "source.patch":
+        var abs_patch = String(run_capture(
+            String("cd ") + quote_arg(dir) + " && pwd", 4096
+        ).strip()) + "/source.patch"
+        print("    git -C", wt, "apply", quote_arg(abs_patch))
+    print("    cd", wt, "&&", cmd)
+    print()
+    print("  Or on this checkout:")
+    print("    " + cmd)
+    if _has(String("--exec")):
+        print()
+        print("  running it here (" + _source_verdict(rec) + ")")
+        var code = run_system(cmd)
+        if code != 0:
+            raise Error("the rerun exited with status " + String(code))
+
+
+def cmd_resume() raises:
+    """Continue a run from one of its checkpoints, with its own arguments.
+
+    ⚠ ONLY FOR A DRIVER THAT DECLARED `resume_args` (`RunContext.
+    set_resume_args`). Inventing a flag for one that did not would start a
+    FRESH run and call it a continuation — the failure this refuses.
+    """
+    var rid = _positional(1)
+    if rid.byte_length() == 0:
+        raise Error(
+            "usage: project-resume <run_id> [--from last] [--dry-run]"
+        )
+    var name = _flag(String("--from"), String("last"))
+    var lr = _load_found(rid)
+    var dir = lr[0]
+    ref rec = lr[1]
+    _require_recipe(rid, rec)
+    if rec.resume_args.byte_length() == 0:
+        raise Error(
+            rec.driver + " declares no way to continue from a checkpoint"
+            " (no resume_args in its run.kv). `pixi run project-rerun "
+            + rid + "` starts it again from scratch."
+        )
+    var ckpt = dir + "/checkpoints/" + name + ".ckpt"
+    if not exists(ckpt):
+        var proj = rec.project if rec.project.byte_length() > 0 else String(
+            "<project>"
+        )
+        raise Error(
+            "no " + ckpt + " on this box. If the run trained elsewhere:"
+            " pixi run project-pull " + proj + " " + rid + " --kind checkpoint"
+        )
+    var args = resume_args_for(rec.args, rec.resume_args, ckpt)
+    var cmd = run_command(rec.driver, rec.pixi_env, args)
+    print("resume", rid, "from", ckpt)
+    print("  source :", _source_verdict(rec))
+    print("  " + cmd)
+    if _has(String("--dry-run")):
+        return
+    var code = run_system(cmd)
+    if code != 0:
+        raise Error("the resumed run exited with status " + String(code))
+
+
 def main() raises:
     var cmd = _positional(0)
     if cmd == "init":
@@ -824,9 +1163,13 @@ def main() raises:
         cmd_push()
     elif cmd == "pull":
         cmd_pull()
+    elif cmd == "rerun":
+        cmd_rerun()
+    elif cmd == "resume":
+        cmd_resume()
     else:
         print(
             "usage: project_cli"
-            " <init|list|show|tag|prune|promote|push|pull> ..."
+            " <init|list|show|tag|prune|promote|push|pull|rerun|resume> ..."
         )
         print("  see the module docstring, or docs/PROJECT_LAYER_PLAN.md §10")

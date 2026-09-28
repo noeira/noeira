@@ -9,9 +9,12 @@ GPU successor of `sac_walker2d_training.mojo` and counterpart of the legacy
     train-step pipeline run on-device.
   * `Phyics3dBatchedEnv[Walker2dModel, Walker2dConfig, N_ENVS]` — the env
     (`GPUContinuousEnv`) into a `BatchedEnv`.
-  * `RemoteLogger` — streams `avg_reward` + `episodes` at `print_every`, AND
-    (via `diag_every`) the full SAC metric bundle (`actor_loss`,
-    `critic_loss`, `alpha`, `mean_q`, `mean_reward`, `train_steps`, …).
+  * A `RunContext` (project `mujoco`): the checkpoint, `metrics.csv` and
+    `run.kv` all live in `runs/<id>/`, and the monitor row carries the same id.
+  * `run_logger(run)` — `metrics.csv` + the monitor: `avg_reward` + `episodes`
+    at `print_every`, AND (via `diag_every`) the full SAC metric bundle
+    (`actor_loss`, `critic_loss`, `alpha`, `mean_q`, `mean_reward`,
+    `train_steps`, …).
 
 `updates_per_step=N_ENVS` keeps the effective UTD = 1 per collected transition.
 
@@ -22,7 +25,8 @@ alpha optimizer) every `CHECKPOINT_EVERY` env-steps and one final time at the
 end. The save runs between iterations (a D2H of the live GPU params) so it is
 safe to combine with the CUDA-graph capture below. The replay buffer / episode
 tracker are NOT persisted, so a resumed run starts with a fresh replay. Load a
-saved checkpoint back into a fresh agent with `agent.load(CHECKPOINT_PATH)`.
+saved checkpoint back into a fresh agent with `agent.load(path)`; the path
+is `run.checkpoint_path("last")`, in the run directory.
 
 Walker2d (Phyics3dEnv, MuJoCo-style):
   * 17D observation (qpos[1:9] + qvel[0:9])
@@ -40,8 +44,9 @@ from max.gpu.host import DeviceContext
 from std.random import seed
 from std.time import perf_counter_ns
 
-from noeira.core.dotenv import load_dotenv
-from noeira.core.logger import RemoteLogger
+from noeira.core.run import RunContext, register_run
+from noeira.core.run_session import RunLogger, finish_run, run_logger
+from noeira.io.artifact_sink import sink_for_run
 from noeira.nn.constants import DT
 from noeira.deep_agents.sac import SAC
 from noeira.envs.phyics3d_batched_env import Phyics3dBatchedEnv
@@ -71,7 +76,6 @@ comptime WARMUP_STEPS = 10_000
 comptime PRINT_EVERY = 50_000
 comptime DIAG_EVERY = 1_000  # full metric-bundle flush cadence (mean_q, …)
 comptime CHECKPOINT_EVERY = 50_000  # auto-save cadence (env steps)
-comptime CHECKPOINT_PATH = "sac_walker2d_nn.ckpt"
 
 
 comptime BatchedEnvT = Phyics3dBatchedEnv[
@@ -99,21 +103,19 @@ def main() raises:
     print("  WARMUP_STEPS       =", WARMUP_STEPS)
     print("  PRINT_EVERY        =", PRINT_EVERY)
     print("  CHECKPOINT_EVERY   =", CHECKPOINT_EVERY)
-    print("  CHECKPOINT_PATH    =", CHECKPOINT_PATH)
-    print("=" * 70)
 
     with DeviceContext() as ctx:
-        # ─── Logger (remote) ─────────────────────────────────────────────
-        var env_vars = load_dotenv()
-        var api_key = env_vars.get("NOEIRA_CLOUD_API_KEY", "")
-        var url = env_vars.get("NOEIRA_CLOUD_URL", "")
-
-        var logger = RemoteLogger(
-            server_url=url,
-            run_name="SAC Walker2d NN (GPU)",
-            buffer_size=64,
-            api_key=api_key,
+        # ─── Run + logger ───────────────────────────────────────────────────
+        var run = RunContext(
+            project=String("mujoco"),
+            driver=String("examples/walker2d/sac_walker2d_training_gpu.mojo"),
+            slug=String("sac-walker2d-gpu"),
+            env=String("builtin:mujoco/walker2d"),
         )
+        var checkpoint_path = run.checkpoint_path(String("last"))
+        print("  Run                =", run.dir)
+        print("=" * 70)
+        var logger = run_logger(run, buffer_size=64)
         logger.set_config("algorithm", "SAC")
         logger.set_config("env", "Walker2d")
         logger.set_config("target", "gpu")
@@ -121,6 +123,8 @@ def main() raises:
         logger.set_config("batch", String(BATCH))
         logger.set_config("n_envs", String(N_ENVS))
         logger.set_config("buffer_capacity", String(REPLAY_CAPACITY))
+        register_run(run, logger)
+        var artifacts = sink_for_run(run.id, run.dir)
 
         var logger_ptr = Pointer(to=logger).as_unsafe_any_origin()
 
@@ -147,7 +151,7 @@ def main() raises:
         _ = agent.train[
             BatchedEnvT,
             N_ENVS=N_ENVS,
-            L=RemoteLogger,
+            L=RunLogger,
             # CUDA-graph capture of the train step. The earlier capture
             # divergence was a replay-buffer bug — the uniform sample kernel
             # took the buffer fill count as a HOST scalar, which capture baked
@@ -181,12 +185,18 @@ def main() raises:
             # Auto-save the SAC weights (no optimizer state) every CHECKPOINT_EVERY
             # env-steps (and once more at the end). Safe alongside the
             # CUDA-graph capture above — the save is host-side D2H between
-            # iterations. Resume/eval later via `agent.load(CHECKPOINT_PATH)`.
+            # iterations. Resume/eval later via `agent.load(checkpoint_path)`.
             checkpoint_every=CHECKPOINT_EVERY,
-            checkpoint_path=CHECKPOINT_PATH,
+            checkpoint_path=checkpoint_path,
+            artifacts=artifacts,
+            run_dir=run.dir,
         )
         var elapsed_s = Float64(perf_counter_ns() - t_start) / 1e9
-        logger.close()
+        var sent = logger.b.total_logged()
+        finish_run(
+            run, logger, artifacts,
+            String("mean_return_100=") + String(agent.mean_return()),
+        )
         _ = logger  # lifetime extender for logger_ptr
 
         # ─── Summary ─────────────────────────────────────────────────────
@@ -197,8 +207,9 @@ def main() raises:
         print("  elapsed                   =", elapsed_s, "s")
         print("  mean ep return (last 100) =", agent.mean_return())
         print("  episodes completed        =", agent.ep_count())
-        print("  remote points sent        =", logger.total_logged())
-        print("  checkpoint saved to       =", CHECKPOINT_PATH)
+        print("  remote points sent        =", sent)
+        print("  run record                =", run.kv_path())
+        print("  checkpoint saved to       =", checkpoint_path)
         print("=" * 70)
 
         var final_avg = Float64(agent.mean_return())

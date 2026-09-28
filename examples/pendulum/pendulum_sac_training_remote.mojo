@@ -1,13 +1,14 @@
-"""SAC training on Pendulum V1 via the storage `SAC[...]` facade + RemoteLogger.
+"""SAC training on Pendulum V1 via the storage `SAC[...]` facade + a run logger.
 
 Demonstrates the Track-1 monitoring path: pass a `logger=` kwarg to
 `agent.train_single()` and the off-policy driver emits `avg_reward` +
 `episodes` at the `print_every` cadence automatically. After training, the
 agent is round-tripped through `save()` / `load()`.
 
-The dashboard endpoint defaults to `http://localhost:3000/api`. `RemoteLogger`
-silently swallows HTTP errors, so this example runs end-to-end even without a
-server listening.
+The run lives in a `RunContext` (project `classic-control`): the checkpoint,
+`metrics.csv` and `run.kv` all land in `runs/<id>/`. `run_logger(run)` writes
+the CSV and streams to the monitor named in `.env` (no URL there => the remote
+half is inert, so this example runs end-to-end without a server).
 
 Run:
     pixi run mojo run -I . examples/pendulum/pendulum_sac_training_remote.mojo
@@ -15,7 +16,10 @@ Run:
 
 from std.random import seed
 
-from noeira.core.logger import RemoteLogger
+from noeira.core.run import RunContext, register_run
+from noeira.core.run_session import RunLogger, finish_run, run_logger
+from noeira.deep_agents.training.checkpoint import announce_checkpoint
+from noeira.io.artifact_sink import sink_for_run
 from noeira.nn.constants import DT
 from noeira.deep_agents.sac import SAC, SACAgent, SACActorNet, SACCriticNet
 from noeira.deep_agents.training.blocks import ReplaySampleStep
@@ -32,7 +36,6 @@ comptime BATCH = 256
 comptime REPLAY_CAPACITY = 50_000
 comptime NUM_STEPS = 3_000
 comptime PRINT_EVERY = 500
-comptime CHECKPOINT_PATH = "/tmp/sac_pendulum_remote.ckpt"
 
 
 comptime SAC_T = SACAgent[
@@ -57,20 +60,26 @@ def _make_agent() raises -> SAC_T:
 def main() raises:
     seed(42)
     print("=" * 70)
-    print("SAC + RemoteLogger demo — Pendulum V1 (CPU)")
+    print("SAC + run logger demo — Pendulum V1 (CPU)")
     print("=" * 70)
 
-    # 1. Build a RemoteLogger. If the dashboard server isn't running, all
-    # flush() / log_scalar() calls silently no-op (errors swallowed by the
-    # helper in noeira/core/logger.mojo).
-    var logger = RemoteLogger(
-        server_url="http://localhost:3000/api",
-        run_name="sac_pendulum_remote_demo",
-        buffer_size=50,
+    # 1. Open the run and its logger (metrics.csv + the monitor from `.env`).
+    # If the dashboard server isn't running, the remote half silently no-ops.
+    var run = RunContext(
+        project=String("classic-control"),
+        driver=String("examples/pendulum/pendulum_sac_training_remote.mojo"),
+        slug=String("sac-pendulum"),
+        env=String("builtin:classic-control/pendulum"),
+        seed=42,
     )
+    var checkpoint_path = run.checkpoint_path(String("last"))
+    print("Run:", run.dir)
+    var logger = run_logger(run, buffer_size=50)
     logger.set_config("algorithm", "SAC")
     logger.set_config("env", "Pendulum-v1")
     logger.set_config("seed", "42")
+    register_run(run, logger)
+    var artifacts = sink_for_run(run.id, run.dir)
 
     var logger_ptr = Pointer(to=logger).as_unsafe_any_origin()
 
@@ -82,7 +91,7 @@ def main() raises:
     # through the logger at `print_every` cadence automatically.
     _ = agent.train_single[
         EnvT,
-        L=RemoteLogger,
+        L=RunLogger,
     ](
         env,
         NUM_STEPS,
@@ -90,16 +99,22 @@ def main() raises:
         verbose=True,
         logger=logger_ptr,
     )
-    logger.close()
+
+    # 4. Save the agent (single-file `.ckpt`) and hand it to the artifact
+    # sink BEFORE the run is finished (finish_run closes the sink).
+    agent.save(checkpoint_path)
+    announce_checkpoint(checkpoint_path, artifacts, run.dir)
+    var sent = logger.b.total_logged()
+    finish_run(
+        run, logger, artifacts,
+        String("mean_return_10=") + String(agent.mean_return()),
+    )
     _ = logger  # lifetime extender for logger_ptr
 
     print("=" * 70)
     print("Final mean ep return (last 10): ", agent.mean_return())
-    print("Total logged points:            ", logger.total_logged())
-
-    # 4. Save the agent (single-file `.ckpt`).
-    agent.save(CHECKPOINT_PATH)
-    print("Saved agent state to:           ", CHECKPOINT_PATH)
+    print("Total logged points:            ", sent)
+    print("Saved agent state to:           ", checkpoint_path)
 
     # 5. Probe greedy action, reload into a fresh agent, confirm it matches.
     var probe_obs = List[Scalar[DT]](length=OBS_DIM, fill=Scalar[DT](0.0))
@@ -110,7 +125,7 @@ def main() raises:
     agent.select_greedy_action(probe_obs, act_before)
 
     var fresh = _make_agent()
-    fresh.load(CHECKPOINT_PATH)
+    fresh.load(checkpoint_path)
     var act_after = List[Scalar[DT]](length=ACT_DIM, fill=Scalar[DT](0.0))
     fresh.select_greedy_action(probe_obs, act_after)
 

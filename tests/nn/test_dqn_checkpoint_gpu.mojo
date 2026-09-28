@@ -28,6 +28,7 @@ Run: pixi run -e apple mojo run -I . tests/nn/test_dqn_checkpoint_gpu.mojo
 
 from std.random import seed
 from max.gpu.host import DeviceContext
+from noeira.io.sha256 import sha256_file
 from std.testing import assert_true, assert_equal
 
 from noeira.nn.constants import DT
@@ -66,8 +67,9 @@ comptime CKPT_B = String("/tmp/dqn_gpu_ckpt_b.ckpt")
 
 
 def _read_file(path: String) raises -> String:
-    with open(path, "r") as f:
-        return String(f.read())
+    """The file's SHA-256. A v3 checkpoint is binary, so its bytes cannot be
+    read into a `String` and compared as text."""
+    return sha256_file(path)
 
 
 def _obs(f: Scalar[DT]) -> List[Scalar[DT]]:
@@ -157,7 +159,7 @@ def test_dqn_gpu_checkpoint_roundtrip() raises:
         "GPU checkpoint not byte-identical after save→load→save "
         "(param/state/ε round-trip lossy)",
     )
-    print("  re-save byte-identity OK (", a.byte_length(), "bytes )")
+    print("  re-save byte-identity OK (sha256", a, ")")
 
     # Invariant 2: greedy-action agreement on a battery of observations.
     var n_match = 0

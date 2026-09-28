@@ -233,11 +233,14 @@ def main() raises:
     var max_demos = 0
     var only_tasks = List[String]()
     var compare = True
+    var no_dq = False  # --no-dq: the ablation store, difference words ZERO
     var i = 1
     while i < len(args):
         var a = String(args[i])
         var has_val = i + 1 < len(args)
-        if a == "--no-compare":
+        if a == "--no-dq":
+            no_dq = True
+        elif a == "--no-compare":
             compare = False
         elif a.startswith("--"):
             if not has_val:
@@ -502,7 +505,9 @@ def main() raises:
                         if t > 0 else cur
                     )
                     qb[unsafe_offset = l * QPOS_DIM + k] = cur
-                    qb[unsafe_offset = l * QPOS_DIM + QPOS_PROPRIO + k] = cur - prev
+                    qb[unsafe_offset = l * QPOS_DIM + QPOS_PROPRIO + k] = (
+                        Scalar[DType.float32](0) if no_dq else cur - prev
+                    )
                 for k in range(len(stems)):
                     qb[unsafe_offset = l * QPOS_DIM + QPOS_WORDS + k] = Scalar[
                         DType.float32

@@ -69,6 +69,96 @@ def gather_rows_kernel[ROW_DIM: Int, BATCH: Int](
     dst[unsafe_offset=t] = src[unsafe_offset=Int(idx[unsafe_offset=i]) * ROW_DIM + d]
 
 
+def gather_rows_into_kernel[SRC_DIM: Int, DST_STRIDE: Int, BATCH: Int](
+    src: Pointer[Scalar[DT], MutAnyOrigin],
+    idx: Pointer[Scalar[IDX_DT], MutAnyOrigin],
+    dst: Pointer[Scalar[DT], MutAnyOrigin],
+):
+    """`dst[i, 0:SRC_DIM] = src[idx[i], :]` into rows of width `DST_STRIDE`.
+
+    `gather_rows_kernel` assumes the destination row is exactly as wide as the
+    source. That stops being true once part of a batch row is DERIVED rather
+    than stored (§12.36): the ring holds `STORE_OBS` columns and the batch row
+    is `OBS` wide, with `derive_tail_kernel` filling the rest.
+
+    At `DST_STRIDE == SRC_DIM` this is `gather_rows_kernel` exactly, which is
+    the case every caller that does not derive a tail still takes.
+    """
+    var t = Int(global_idx.x)
+    if t >= BATCH * SRC_DIM:
+        return
+    var i = t // SRC_DIM
+    var d = t % SRC_DIM
+    dst[unsafe_offset=i * DST_STRIDE + d] = src[
+        unsafe_offset=Int(idx[unsafe_offset=i]) * SRC_DIM + d
+    ]
+
+
+def derive_tail_kernel[
+    ROWS: Int, CAP: Int, LANES: Int, STORE_OBS: Int, ACT: Int, TAIL: Int,
+    OBS: Int,
+](
+    r_obs: Pointer[Scalar[DT], MutAnyOrigin],    # CAP x STORE_OBS
+    r_act: Pointer[Scalar[DT], MutAnyOrigin],    # CAP x ACT
+    r_age: Pointer[Scalar[DT], MutAnyOrigin],    # CAP, steps since this lane's reset
+    idx: Pointer[Scalar[IDX_DT], MutAnyOrigin],  # ROWS, the drawn rows
+    spec: Pointer[Scalar[DType.int32], MutAnyOrigin],   # TAIL x 4
+    act_scale: Scalar[DT],
+    act_clip: Scalar[DT],
+    dst: Pointer[Scalar[DT], MutAnyOrigin],      # the batch, OBS-wide rows
+    row0: Int32,
+):
+    """Fill the DERIVED TAIL of a gathered batch row from the ring itself.
+
+    A replay row's `[STORE_OBS, OBS)` columns are not stored — they are a
+    function of the SAME lane's earlier rows, so storing them is the
+    redundancy §12.23 removed for `next_obs`, one layer up (docs §12.36). For
+    the G1 that tail is `last_action 29 | history 372`: 401 floats per row
+    against the ONE `r_age` float this needs, 4860 B/row against 3260.
+
+    ⚠ Generic ON PURPOSE. The agent must not know what the tail MEANS — the
+    layout is one env's business. `spec` carries it, four int32 per output
+    element:
+
+        [0] kind      0 = read `r_obs`, 1 = read `r_act` (scaled and clipped)
+        [1] steps     lane-aligned back-steps: row - steps * LANES
+        [2] src_off   column within that source row
+        [3] min_age   written as 0 when `r_age[row] < min_age`
+
+    The env builds it once on the host (`g1_build_tail_spec`) and hands it
+    over. Zero cost when `TAIL == 0`: the caller does not launch this.
+
+    ⚠ Looking BACKWARD needs no sampling-bound change — a predecessor row is
+    always already written, unlike the successor `next_obs` needed.
+    """
+    var t = Int(global_idx.x)
+    if t >= ROWS * TAIL:
+        return
+    var i = t // TAIL
+    var k = t % TAIL
+    var row = Int(idx[unsafe_offset=i])
+    var age = Int(r_age[unsafe_offset=row])
+
+    var o = (Int(row0) + i) * OBS + STORE_OBS + k
+    if age < Int(spec[unsafe_offset=k * 4 + 3]):
+        dst[unsafe_offset=o] = Scalar[DT](0.0)
+        return
+
+    var r = row - Int(spec[unsafe_offset=k * 4 + 1]) * LANES
+    while r < 0:
+        r += CAP
+    var src_off = Int(spec[unsafe_offset=k * 4 + 2])
+    if Int(spec[unsafe_offset=k * 4]) == 0:
+        dst[unsafe_offset=o] = r_obs[unsafe_offset=r * STORE_OBS + src_off]
+    else:
+        var a = r_act[unsafe_offset=r * ACT + src_off] * act_scale
+        if a > act_clip:
+            a = act_clip
+        if a < -act_clip:
+            a = -act_clip
+        dst[unsafe_offset=o] = a
+
+
 def gather_idx_kernel[BATCH: Int](
     table: Pointer[Scalar[IDX_DT], MutAnyOrigin],
     idx: Pointer[Scalar[IDX_DT], MutAnyOrigin],
@@ -316,6 +406,30 @@ def fb_diag_override_kernel[BATCH: Int](
     var i = Int(global_idx.x)
     if i < BATCH:
         go[unsafe_offset=i * BATCH + i] = diag_scale
+
+
+def diag_sumsq_kernel[BATCH: Int](
+    m: Pointer[Scalar[DT], MutAnyOrigin],
+    acc: Pointer[Scalar[DT], MutAnyOrigin],
+):
+    """`acc[0] = sum_i m[i,i]^2` on a `[BATCH, BATCH]` matrix.
+
+    `L_ortho`'s quadratic runs over the OFF-DIAGONAL only (`agent.py:249`
+    masks `Cov` with `off_diag`), and the cheap way to that sum is the full
+    sum of squares minus the diagonal's own. Unlike `fb_diag_stats_kernel`
+    there is no target to subtract here: the ortho target IS zero, so the
+    residual is `O` itself.
+    """
+    var t = Int(thread_idx.x)
+    var s2: Scalar[DT] = 0.0
+    var k = t
+    while k < BATCH:
+        var v = m[unsafe_offset=k * BATCH + k]
+        s2 += v * v
+        k += TPB_REDUCE
+    var t2 = block.sum[block_size=TPB_REDUCE, broadcast=False](val=s2)
+    if t == 0:
+        acc[unsafe_offset=0] = t2[0]
 
 
 def fb_diag_stats_kernel[BATCH: Int](

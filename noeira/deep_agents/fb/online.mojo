@@ -104,6 +104,8 @@ from .obs_ema import ObsEma
 from .loss import fb_measure_loss_into, fb_ortho_loss_into
 from .kernels import (
     gather_rows_kernel,
+    gather_rows_into_kernel,
+    derive_tail_kernel,
     gather_idx_kernel,
     pack2_kernel,
     project_sphere_kernel,
@@ -133,9 +135,11 @@ def ring_store_kernel[
     r_act: Pointer[Scalar[DT], MutAnyOrigin],
     r_term: Pointer[Scalar[DT], MutAnyOrigin],
     r_bnd: Pointer[Scalar[DT], MutAnyOrigin],
+    r_age: Pointer[Scalar[DT], MutAnyOrigin],
     r_z: Pointer[Scalar[DT], MutAnyOrigin],
     pos: Int32,
     bnd: Int32,
+    age: Int32,
 ):
     """Append `LANES` transitions at rows `(pos + lane) % CAP`, one launch.
 
@@ -159,7 +163,7 @@ def ring_store_kernel[
     not serialise inside a per-lane thread. `pos` is a host scalar because
     `record_batch_gpu` is eager — the driver never captures it.
     """
-    comptime W = OBS + ACT + D + 2
+    comptime W = OBS + ACT + D + 3
     var t = Int(global_idx.x)
     if t >= LANES * W:
         return
@@ -176,6 +180,10 @@ def ring_store_kernel[
         r_z[unsafe_offset=row * D + j] = z_src[unsafe_offset=lane * D + j]
     elif k == OBS + ACT + D:
         r_term[unsafe_offset=row] = term_src[unsafe_offset=lane]
+    elif k == OBS + ACT + D + 1:
+        # steps since this lane's reset, capped by the caller. What the
+        # DERIVED tail needs to know how far back it may look (§12.36).
+        r_age[unsafe_offset=row] = age.cast[DT]()
     else:
         var terminated = term_src[unsafe_offset=lane] != Scalar[DT](0.0)
         var b = (Int(bnd) != 0) or terminated
@@ -451,6 +459,7 @@ struct FBOnlineAgent[
     LANES: Int,
     ZBUF: Int = 10_000,
     EXPERT_ROWS: Int = 0,
+    DERIVED_TAIL: Int = 0,
 ](OffPolicyAgentGpu):
     """`OffPolicyAgentGpu` conformer around `FBTrainer[..., "gpu"]`.
 
@@ -475,6 +484,12 @@ struct FBOnlineAgent[
     ]
     comptime A_IN: Int = Self.OBS + Self.D
     comptime RING_ROWS: Int = Self.BATCH - Self.EXPERT_ROWS
+    # ⚠ The ring stores `STORE_OBS` columns; the batch row is `OBS` wide and
+    # the last `DERIVED_TAIL` of it is DERIVED from the same lane's earlier
+    # rows (docs §12.36), the way `next_obs` is derived from the next one
+    # (§12.23). At `DERIVED_TAIL == 0` — every caller but the G1 — the two are
+    # equal and every path below is what it was.
+    comptime STORE_OBS: Int = Self.OBS - Self.DERIVED_TAIL
 
     var t: Self.TrainerT
     var ctx: Optional[DeviceContext]
@@ -486,6 +501,11 @@ struct FBOnlineAgent[
     var r_z: Tensor
     var r_term: Tensor
     var r_bnd: Tensor          # CAP, 1 = this row's successor is post-reset
+    var r_age: Tensor          # CAP, steps since this lane's reset (capped)
+    var tail_spec: Optional[DeviceBuffer[DType.int32]]
+    var age_next: Int          # set by `set_age`, consumed by the next record
+    var act_norm: Scalar[DT]   # the derived tail's action scaling ...
+    var act_clip: Scalar[DT]   # ... and its clip, both env-specific
     var size: Int
     var pos: Int
     var bnd_next: Bool         # set by `set_boundary`, consumed by the next record
@@ -572,6 +592,11 @@ struct FBOnlineAgent[
         self.r_z = Tensor()
         self.r_term = Tensor()
         self.r_bnd = Tensor()
+        self.r_age = Tensor()
+        self.tail_spec = None
+        self.age_next = 0
+        self.act_norm = Scalar[DT](1.0)
+        self.act_clip = Scalar[DT](1e30)
         self.size = 0
         self.pos = 0
         self.bnd_next = False
@@ -717,7 +742,7 @@ struct FBOnlineAgent[
         # Ring: device only. A host mirror of CAP x (OBS + ACT + D + 2)
         # floats at CAP = 1 M would be ~350 MB of host RAM nothing reads.
         # `next_obs` is derived, not stored — see `ring_store_kernel`.
-        a.r_obs.ensure_gpu(ctx, Self.CAP * Self.OBS)
+        a.r_obs.ensure_gpu(ctx, Self.CAP * Self.STORE_OBS)
         a.r_act.ensure_gpu(ctx, Self.CAP * Self.ACT)
         a.r_z.ensure_gpu(ctx, Self.CAP * Self.D)
         a.r_term.ensure_gpu(ctx, Self.CAP)
@@ -727,6 +752,8 @@ struct FBOnlineAgent[
         # ring inspected before it has been written reads as "no valid
         # successor" rather than as a transition into uninitialised memory.
         a.r_bnd.dev.value().enqueue_fill(Scalar[DT](1.0))
+        a.r_age.ensure_gpu(ctx, Self.CAP)
+        a.r_age.dev.value().enqueue_fill(Scalar[DT](0.0))
         var sz = ctx.enqueue_create_buffer[DType.int32](1)
         sz.enqueue_fill(Int32(0))
         a.size_dev = sz^
@@ -860,35 +887,91 @@ struct FBOnlineAgent[
         c.enqueue_function[ring_next_idx_kernel[ROWS, Self.CAP, Self.LANES]](
             ip_s, ip_sn, grid_dim=nb, block_dim=TPB,
         )
-        c.enqueue_function[gather_rows_kernel[Self.OBS, ROWS]](
+        # the STORED head; the derived tail follows below
+        c.enqueue_function[
+            gather_rows_into_kernel[Self.STORE_OBS, Self.OBS, ROWS]
+        ](
             mptr(self.r_obs.dev.value().unsafe_ptr()), ip_s,
             mptr(self.t.bs.dev.value().unsafe_ptr()).unsafe_offset(row0 * Self.OBS),
-            grid_dim=_blocks(ROWS * Self.OBS), block_dim=TPB,
+            grid_dim=_blocks(ROWS * Self.STORE_OBS), block_dim=TPB,
         )
         c.enqueue_function[gather_rows_kernel[Self.ACT, ROWS]](
             mptr(self.r_act.dev.value().unsafe_ptr()), ip_s,
             mptr(self.t.ba.dev.value().unsafe_ptr()).unsafe_offset(row0 * Self.ACT),
             grid_dim=_blocks(ROWS * Self.ACT), block_dim=TPB,
         )
-        c.enqueue_function[gather_rows_kernel[Self.OBS, ROWS]](
+        c.enqueue_function[
+            gather_rows_into_kernel[Self.STORE_OBS, Self.OBS, ROWS]
+        ](
             mptr(self.r_obs.dev.value().unsafe_ptr()), ip_sn,
             mptr(self.t.bsn.dev.value().unsafe_ptr()).unsafe_offset(row0 * Self.OBS),
-            grid_dim=_blocks(ROWS * Self.OBS), block_dim=TPB,
+            grid_dim=_blocks(ROWS * Self.STORE_OBS), block_dim=TPB,
         )
         c.enqueue_function[gather_rows_kernel[Self.D, ROWS]](
             mptr(self.r_z.dev.value().unsafe_ptr()), ip_s,
             mptr(self.t.bz.dev.value().unsafe_ptr()).unsafe_offset(row0 * Self.D),
             grid_dim=_blocks(ROWS * Self.D), block_dim=TPB,
         )
-        c.enqueue_function[gather_rows_kernel[Self.OBS, ROWS]](
+        c.enqueue_function[
+            gather_rows_into_kernel[Self.STORE_OBS, Self.OBS, ROWS]
+        ](
             mptr(self.r_obs.dev.value().unsafe_ptr()), ip_sp,
             mptr(self.t.bsp.dev.value().unsafe_ptr()).unsafe_offset(row0 * Self.OBS),
-            grid_dim=_blocks(ROWS * Self.OBS), block_dim=TPB,
+            grid_dim=_blocks(ROWS * Self.STORE_OBS), block_dim=TPB,
         )
+
+        # ── the DERIVED tail (§12.36) ────────────────────────────────
+        # `bs` and `bsn` feed `f` / `critic`, which take the whole row.
+        # `bsp` feeds `b` ONLY, whose filter is the stored head — but its tail
+        # is filled anyway: leaving a slice of a live tensor holding whatever
+        # the last step left there is the kind of thing that is correct until
+        # someone widens a filter.
+        comptime if Self.DERIVED_TAIL > 0:
+            var sp = self.tail_spec.value().unsafe_ptr()
+            var ro = mptr(self.r_obs.dev.value().unsafe_ptr())
+            var ra = mptr(self.r_act.dev.value().unsafe_ptr())
+            var rg = mptr(self.r_age.dev.value().unsafe_ptr())
+            comptime TK = derive_tail_kernel[
+                ROWS, Self.CAP, Self.LANES, Self.STORE_OBS, Self.ACT,
+                Self.DERIVED_TAIL, Self.OBS,
+            ]
+            comptime nbt = _blocks(ROWS * Self.DERIVED_TAIL)
+            c.enqueue_function[TK](
+                ro, ra, rg, ip_s, sp, self.act_norm, self.act_clip,
+                mptr(self.t.bs.dev.value().unsafe_ptr()), Int32(row0),
+                grid_dim=nbt, block_dim=TPB,
+            )
+            c.enqueue_function[TK](
+                ro, ra, rg, ip_sn, sp, self.act_norm, self.act_clip,
+                mptr(self.t.bsn.dev.value().unsafe_ptr()), Int32(row0),
+                grid_dim=nbt, block_dim=TPB,
+            )
+            c.enqueue_function[TK](
+                ro, ra, rg, ip_sp, sp, self.act_norm, self.act_clip,
+                mptr(self.t.bsp.dev.value().unsafe_ptr()), Int32(row0),
+                grid_dim=nbt, block_dim=TPB,
+            )
 
     def _gather_expert(mut self) raises:
         """Batch rows `[0, EXPERT_ROWS)` of `s`, `a`, `s'`, `s+` from the
-        expert store. `z` is left for the relabel to draw."""
+        expert store. `z` is left for the relabel to draw.
+
+        ⚠ NOT COMPATIBLE WITH `DERIVED_TAIL > 0`, and this refuses rather than
+        producing something plausible. The derived tail is lane-strided — row
+        `r - k * LANES` is the same lane `k` steps earlier — and an expert
+        store is CONTIGUOUS, so the same arithmetic reads unrelated rows. A
+        store also has no actions, so `last_action` and the history's
+        `actions` key have no source at all. The G1 run uses
+        `EXPERT_ROWS = 0` (its expert data reaches the losses through the
+        window encoding and the discriminator, both of which filter to the
+        stored head), so this combination has never been needed.
+        """
+        comptime assert Self.DERIVED_TAIL == 0, (
+            "FBOnlineAgent: EXPERT_ROWS > 0 with DERIVED_TAIL > 0 is not"
+            " supported — the tail's back-steps are lane-strided and an"
+            " expert store is contiguous, and a store carries no actions."
+            " See `_gather_expert`."
+        )
         comptime E = Self.EXPERT_ROWS
         var c = self.ctx.value()
         var size_lt = LayoutTensor[DType.int32, Layout.row_major(1)](
@@ -1186,9 +1269,11 @@ struct FBOnlineAgent[
         )
         _ = reward_dev
         _ = obs_dev
-        comptime W = Self.OBS + Self.ACT + Self.D + 2
+        comptime W = Self.STORE_OBS + Self.ACT + Self.D + 3
         ctx.enqueue_function[
-            ring_store_kernel[Self.OBS, Self.ACT, Self.D, Self.CAP, Self.LANES]
+            ring_store_kernel[
+                Self.STORE_OBS, Self.ACT, Self.D, Self.CAP, Self.LANES
+            ]
         ](
             mptr(prev_obs_dev.unsafe_ptr()),
             mptr(action_dev.unsafe_ptr()),
@@ -1198,9 +1283,11 @@ struct FBOnlineAgent[
             mptr(self.r_act.dev.value().unsafe_ptr()),
             mptr(self.r_term.dev.value().unsafe_ptr()),
             mptr(self.r_bnd.dev.value().unsafe_ptr()),
+            mptr(self.r_age.dev.value().unsafe_ptr()),
             mptr(self.r_z.dev.value().unsafe_ptr()),
             Int32(self.pos),
             Int32(1) if self.bnd_next else Int32(0),
+            Int32(self.age_next),
             grid_dim=_blocks(Self.LANES * W), block_dim=TPB,
         )
         self.bnd_next = False
@@ -1241,6 +1328,45 @@ struct FBOnlineAgent[
         schedule. Both G1 drivers call it.
         """
         self.bnd_next = b
+
+    def set_age(mut self, a: Int):
+        """Steps since this lane's reset, for the NEXT `record_batch_gpu`.
+
+        Only read when `DERIVED_TAIL > 0`: it is what lets the gather know how
+        far back the derived tail may look before a reset truncates it
+        (docs §12.36). Every lane resets together under the G1 driver's
+        scheduled `_rsi_reset`, so one scalar covers the batch — as `bnd` does.
+
+        Cap it at whatever the tail's deepest back-step needs; larger values
+        are equivalent and only waste range.
+        """
+        self.age_next = a
+
+    def attach_tail_spec(mut self, ref spec: List[Int32]) raises:
+        """The `DERIVED_TAIL x 4` table `derive_tail_kernel` reads.
+
+        The agent never interprets it — the env builds it (§12.36). Uploaded
+        once, resident for the run, so the captured training step never sees a
+        moving pointer (`_tensor_upload_reallocates_every_call`).
+        """
+        comptime if Self.DERIVED_TAIL == 0:
+            raise Error(
+                "attach_tail_spec: this agent derives no tail"
+                " (DERIVED_TAIL == 0)"
+            )
+        if len(spec) != Self.DERIVED_TAIL * 4:
+            raise Error(
+                "attach_tail_spec: expected " + String(Self.DERIVED_TAIL * 4)
+                + " int32 (4 per derived column), got " + String(len(spec))
+            )
+        var c = self.ctx.value()
+        var d = c.enqueue_create_buffer[DType.int32](Self.DERIVED_TAIL * 4)
+        var h = c.enqueue_create_host_buffer[DType.int32](Self.DERIVED_TAIL * 4)
+        for i in range(Self.DERIVED_TAIL * 4):
+            h[i] = spec[i]
+        c.enqueue_copy(d, h)
+        c.synchronize()
+        self.tail_spec = d^
 
     def record_batch_gpu_nstep[
         N_ENVS: Int, NS: Int
@@ -1432,11 +1558,18 @@ struct FBOnlineAgent[
             self.t.g_f2, self.t.g_bsn2, q2, a2, True, self.ctx,
         )
         measure = 0.5 * (l1 + l2)
-        # HALVED into the reference's scale, so these read directly against
-        # `references/BFM-Zero-main/released/new_model/train_log.txt`'s
-        # `fb_offdiag` / `fb_diag` at the same timestep. See `loss.mojo`.
-        fb_quad = 0.5 * 0.5 * (q1 + q2)
-        fb_anchor = 0.5 * 0.5 * (a1 + a2)
+        # The MEAN over the two F heads, and nothing else — these read directly
+        # against `train_log.txt`'s `fb_offdiag` / `fb_diag` at the same
+        # timestep. ⚠ There used to be a SECOND 0.5 here, "halving into the
+        # reference's scale", and it was wrong: `agent.py:243` reduces
+        # `diff` over BOTH heads (`Ms` is `num_parallel x B x B`) while
+        # dividing by `off_diag_sum = B*(B-1)`, a SINGLE matrix's count — so
+        # their leading 0.5 already IS the per-head mean at num_parallel 2.
+        # Likewise `agent.py:244`'s `* Ms.shape[0]` is `num_parallel` = 2, not
+        # BATCH. Both of our metrics were logged at exactly HALF scale, which
+        # is what §12.21 read as "the magnitudes do not match" (docs §12.27).
+        fb_quad = 0.5 * (q1 + q2)
+        fb_anchor = 0.5 * (a1 + a2)
         # `M1` in the reference's log: the mean ENTRY of `M = F·B(s+)^T`. It
         # sits at ~49 and flat there from 2.3 M steps to 200 M, which makes it
         # the cheapest check that our M is not drifting in scale.
@@ -1495,31 +1628,31 @@ struct FBOnlineAgent[
         if Bool(logger):
             var names = List[String]()
             var vals = List[Float64]()
-            names.append(String("fb/measure")); vals.append(measure)
-            names.append(String("fb/ortho")); vals.append(ortho)
-            names.append(String("fb/actor")); vals.append(actor)
-            names.append(String("fb/fb_offdiag")); vals.append(fbq)
-            names.append(String("fb/fb_diag")); vals.append(fba)
-            names.append(String("fb/M1")); vals.append(mmean)
-            names.append(String("fb/q_fb_abs")); vals.append(qabs)
-            names.append(String("fb/f_norm")); vals.append(fnorm)
-            names.append(String("fb/b_norm")); vals.append(bnorm)
-            names.append(String("fb/b_norm_deficit"))
+            names.append(String("fb_measure_loss")); vals.append(measure)
+            names.append(String("fb_ortho_loss")); vals.append(ortho)
+            names.append(String("policy_loss")); vals.append(actor)
+            names.append(String("fb_offdiag")); vals.append(fbq)
+            names.append(String("fb_diag")); vals.append(fba)
+            names.append(String("fb_m1")); vals.append(mmean)
+            names.append(String("fb_q_abs_mean")); vals.append(qabs)
+            names.append(String("f_norm")); vals.append(fnorm)
+            names.append(String("b_norm")); vals.append(bnorm)
+            names.append(String("b_norm_deficit"))
             vals.append(sqrt(Float64(Self.D)) - bnorm)
-            names.append(String("fb/ortho_Q"))
-            vals.append(ortho + 2.0 * bnorm * bnorm)
-            names.append(String("fb/grad_norm_f1")); vals.append(gf1)
-            names.append(String("fb/grad_norm_f2")); vals.append(gf2)
-            names.append(String("fb/grad_norm_b")); vals.append(gb)
-            names.append(String("fb/mean_abs_action")); vals.append(maa)
-            names.append(String("fb/actor_grad_value")); vals.append(gv)
-            names.append(String("fb/actor_grad_total")); vals.append(gt)
-            names.append(String("fb/replay_size")); vals.append(Float64(self.size))
-            names.append(String("fb/expert_rows"))
+            names.append(String("fb_ortho_q"))
+            vals.append(ortho + bnorm * bnorm)
+            names.append(String("f1_grad_norm")); vals.append(gf1)
+            names.append(String("f2_grad_norm")); vals.append(gf2)
+            names.append(String("b_grad_norm")); vals.append(gb)
+            names.append(String("action_abs_mean")); vals.append(maa)
+            names.append(String("actor_grad_value")); vals.append(gv)
+            names.append(String("actor_grad_total")); vals.append(gt)
+            names.append(String("buffer_size")); vals.append(Float64(self.size))
+            names.append(String("expert_rows"))
             vals.append(Float64(Self.EXPERT_ROWS if self._expert_n > 0 else 0))
-            names.append(String("fb/train_steps"))
+            names.append(String("train_steps"))
             vals.append(Float64(self._total_train_steps))
-            names.append(String("fb/updates_since_flush"))
+            names.append(String("n_updates"))
             vals.append(Float64(n_upd))
             logger.value()[].log_scalars(names, vals, step)
         print(

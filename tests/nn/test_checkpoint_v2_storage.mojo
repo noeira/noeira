@@ -21,7 +21,7 @@ from noeira.nn.core.tensor_refs import TensorRefs
 from noeira.nn.core.param import ParamVisitor
 from noeira.nn.core.initializer import Deterministic
 from noeira.nn.core.checkpoint import (
-    save_params, load_params, CheckpointWriter,
+    save_params, load_params, LegacyV2CheckpointWriter,
 )
 from noeira.nn.primitives.linear import Linear
 from noeira.nn.combinators.sequential import Sequential
@@ -127,7 +127,7 @@ def main() raises:
     # dispatching load_params, values must match.
     var a2 = NET.make["cpu", Deterministic](None)
     _train3["cpu"](a2, None)
-    var w = CheckpointWriter(save_moments=True)
+    var w = LegacyV2CheckpointWriter(save_moments=True)
     w.mode = 0
     a2.for_each_param["cpu"](w, None)
     w.mode = 1

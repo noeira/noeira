@@ -42,6 +42,7 @@ from noeira.physics3d.dynamics.pose_transmission import (
 )
 from noeira.physics3d.model.model_def import ModelDefLike
 from noeira.physics3d.model.model_renderer import ModelRenderer
+from noeira.math3d import Vec3 as Vec3Generic
 from noeira.render.ui import UIRect, UIText
 from noeira.render.renderer3d import RendererHandoff
 from noeira.physics3d.kinematics.forward_kinematics import (
@@ -63,6 +64,8 @@ from noeira.physics3d.gpu.constants import (
     JOINT_IDX_QPOS_ADR,
     META_IDX_NUM_CONTACTS,
     META_IDX_SIM_TIME,
+    META_IDX_PHI_PREV,
+    META_IDX_EPISODE_FLAGS,
     META_IDX_TASK_PARAM_0,
     META_IDX_TASK_PARAM_6,
 )
@@ -332,6 +335,9 @@ struct Phyics3dEnv[
         # first step of every episode after the first would be clamped to
         # `slewmax*dt` around a stale command.
         self.d.meta.data[META_IDX_SIM_TIME] = Scalar[Self.DTYPE](0)
+        # The reward's per-episode state, as `Phyics3dBatchedEnv._reset_env_lane`.
+        self.d.meta.data[META_IDX_PHI_PREV] = Scalar[Self.DTYPE](0)
+        self.d.meta.data[META_IDX_EPISODE_FLAGS] = Scalar[Self.DTYPE](0)
         Self.MODEL_DEF.reset_data(self.sf, self.d)
         var noise_scale = Self.CONFIG.get_reset_noise()
         if noise_scale > 0.0:
@@ -978,6 +984,15 @@ struct Phyics3dEnv[
         if not self._renderer_initialized:
             return
         self._renderer.value()[].request_free_camera()
+
+    def renderer_set_free_camera(
+        mut self, eye: Vec3Generic[DType.float64], target: Vec3Generic[DType.float64]
+    ) -> None:
+        """The free camera at an exact pose (no 3/4-view reframe) — a framed
+        shot for a recorded clip; the mouse still orbits it afterwards."""
+        if not self._renderer_initialized:
+            return
+        self._renderer.value()[].set_free_camera(eye, target)
 
     def renderer_set_pip_cameras(mut self, var cams: List[Int]) -> None:
         """Draw these model cameras as insets beside the main view — the

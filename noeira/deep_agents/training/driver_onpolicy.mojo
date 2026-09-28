@@ -73,7 +73,14 @@ trait OnPolicyCheckpointable(Deinitable, Movable):
         pass
 
     def save_state(mut self, path: String) raises:
-        pass
+        """⚠ RAISES BY DEFAULT, on purpose. Drivers call this only when a
+        `checkpoint_path` was given; a `pass` default meant a trainer that did
+        not override it produced no file and no error, and the run looked
+        checkpointed until someone tried to resume it."""
+        raise Error(
+            "save_state: this trainer does not implement checkpointing, and a"
+            " checkpoint was requested at " + path
+        )
 
     def total_train_steps(self) -> Int:
         """Cumulative gradient-update count for the inter-log progress bar's
@@ -299,7 +306,7 @@ def run_onpolicy_train[
                 trainer.flush_metrics_through_logger[L](logger, abs_step)
 
         # `checkpoint_every` — overwrite `checkpoint_path` with the
-        # trainer's one-file v2 envelope. Default trait impl is no-op.
+        # trainer's one-file v3 checkpoint. The trait default raises.
         if (
             checkpoint_every > 0
             and abs_step % checkpoint_every == 0
@@ -509,6 +516,8 @@ def _run_onpolicy_batched_body[
     run_dir: String,
     base_step: Int,
     progress_label: String,
+    stop_at_mean_return: Optional[Scalar[DT]] = None,
+    stop_min_episodes: Int = 0,
 ) raises -> List[Scalar[DT]]:
     """ONE loop body behind BOTH batched on-policy drivers (continuous
     `run_onpolicy_train_batched` and discrete
@@ -516,7 +525,14 @@ def _run_onpolicy_batched_body[
     line-identical — the only genuine axis is the action-slot width
     `ACT` (AGENT_ACT_DIM floats vs ONE index-as-float), so it is a
     comptime param supplied by the public wrappers, which also carry
-    the per-driver comptime asserts + ctx checks."""
+    the per-driver comptime asserts + ctx checks.
+
+    `stop_at_mean_return` ends training early the first time the
+    trainer's windowed `mean_return()` reaches it with at least
+    `stop_min_episodes` episodes completed (pass the tracker's window
+    size so the window holds real returns, not its initial fill) — the
+    "solved" exit of a time-to-solve benchmark. The final checkpoint is
+    still written."""
     comptime env_target: StaticString = E.ENV_TARGET
     comptime OBS = A.AGENT_OBS_DIM
     comptime N_ENVS = A.AGENT_N_ENVS
@@ -694,11 +710,30 @@ def _run_onpolicy_batched_body[
 
         # Snapshot mean_return whenever an episode completes.
         var new_ep_count = trainer.ep_count()
+        var reached_target = False
         if new_ep_count > last_ep_count:
             ep_returns.append(trainer.mean_return())
             last_ep_count = new_ep_count
+            if stop_at_mean_return and new_ep_count >= stop_min_episodes:
+                reached_target = (
+                    trainer.mean_return() >= stop_at_mean_return.value()
+                )
 
         var abs_step = base_step + step_idx
+
+        if reached_target:
+            if verbose:
+                print(
+                    "[" + progress_label + "] target mean return reached:",
+                    trainer.mean_return(),
+                    ">=",
+                    stop_at_mean_return.value(),
+                    "| step",
+                    abs_step,
+                    "| episodes",
+                    new_ep_count,
+                )
+            break
 
         cad.tick(step_idx, trainer.total_train_steps())
 
@@ -727,7 +762,7 @@ def _run_onpolicy_batched_body[
                 trainer.flush_metrics_through_logger[L](logger, abs_step)
 
         # `checkpoint_every` — overwrite `checkpoint_path` with the
-        # trainer's one-file v2 envelope. Default trait impl is no-op.
+        # trainer's one-file v3 checkpoint. The trait default raises.
         if cad.ckpt_due(step_idx):
             trainer.save_state(checkpoint_path)
             announce_checkpoint(checkpoint_path, artifacts, run_dir)

@@ -409,6 +409,13 @@ def generate(family_path: String) raises -> String:
     for i in range(len(f.base_qpos)):
         bq.append(_f(f.base_qpos[i]))
     o += _method("base_qpos", "i", "Float64", bq)
+    # only a family that declares it: every other table stays byte-identical
+    # and takes the trait's default of 0
+    if len(f.base_qpos_jitter) > 0:
+        var bj = List[String]()
+        for i in range(len(f.base_qpos_jitter)):
+            bj.append(_f(f.base_qpos_jitter[i]))
+        o += _method("base_qpos_jitter", "i", "Float64", bj)
     o += _method("free_slot", "j", "Int", fslot)
     o += _method("free_qadr", "j", "Int", fqadr)
     o += _method("free_dadr", "j", "Int", fdadr)

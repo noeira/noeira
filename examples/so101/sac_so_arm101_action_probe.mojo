@@ -1,6 +1,6 @@
 """Is the actor SATURATED? Run this after any training run.
 
-    pixi run mojo run -I . examples/so101/sac_so_arm101_action_probe.mojo
+    pixi run mojo run -I . examples/so101/sac_so_arm101_action_probe.mojo --ckpt <run_id>
 
 A greedy action is `tanh(mu) * action_scale`, and where it sits in that range
 is the difference between "a smooth policy that happens to oscillate" and "an
@@ -27,6 +27,7 @@ joint limits — a reach that genuinely wants a joint at its stop will sit
 there. Read it together with `outside range`, which should be 0.
 """
 from std.random import seed
+from std.sys import argv
 from std.math import abs
 from max.gpu.host import DeviceContext
 from noeira.nn.constants import DT
@@ -40,6 +41,7 @@ from noeira.physics3d.fields import actuator_column
 from noeira.physics3d.gpu.constants import ACT_IDX_CTRL_MAX, ACT_IDX_CTRL_MIN
 from noeira.robot.so101 import joint_name
 from noeira.utils.fmt import col, fixed, pad_right
+from noeira.core.run import resolve_checkpoint
 
 comptime EnvT = Phyics3dEnv[
     SoArm101Model, SoArm101ReachConfig, DT, TERMINATE_ON_UNHEALTHY=False
@@ -56,11 +58,25 @@ comptime AgentT = SACAgent[
 comptime N_EP = 8
 comptime STEPS = 500
 comptime SETTLE = 200
+comptime DEFAULT_CKPT = "sac_so_arm101_reach.ckpt"
+
+
+def ckpt_from_argv(default: String) raises -> String:
+    """`--ckpt <run_id|path>`, else `default`. A RUN ID resolves to its
+    `checkpoints/last.ckpt` — what `sac_so_arm101_reach_training_gpu.mojo`
+    writes into its run directory."""
+    var args = argv()
+    for i in range(1, len(args) - 1):
+        if String(args[i]) == "--ckpt":
+            return resolve_checkpoint(String(args[i + 1]), String("last"))
+    return default
 
 
 def main() raises:
     var agent = AgentT(action_scale=SCALE)
-    agent.load(String("sac_so_arm101_reach.ckpt"))
+    var ckpt = ckpt_from_argv(String(DEFAULT_CKPT))
+    print("  checkpoint:", ckpt)
+    agent.load(ckpt)
     var ctx = DeviceContext()
     var env = EnvT(ctx)
     var sf = SoArm101Model.make_spec_fields[DType.float64]()

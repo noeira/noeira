@@ -40,7 +40,9 @@ name front
 device 0
 size 640 480
 intrinsics <fx> <fy> <cx> <cy>
-dist <k1> <k2> [p1 p2 k3 ...]
+model pinhole | fisheye
+dist <k1> <k2> [p1 p2 k3 ...]     (pinhole: OpenCV's radial-tangential vector)
+dist <k1> <k2> <k3> <k4>          (fisheye: Kannala-Brandt, `vision/fisheye.mojo`)
 rms_px <the intrinsics fit residual>
 extrinsics_rot <r00..r22, row-major, camera -> base>
 extrinsics_trans <tx ty tz, metres>
@@ -50,6 +52,12 @@ poses <how many correspondences the extrinsics used>
 
 ⚠ **`extrinsics_*` IS OPTIONAL AND ITS ABSENCE IS NOT AN ERROR** — intrinsics
 are measured first and are useful alone (they are what `solve_pnp` needs).
+
+⚠ **`model` IS ABSENT FROM EVERY FILE WRITTEN BEFORE THE FISHEYE MODEL** and
+reads as `pinhole`, which is what those files are. A fisheye file's four
+`dist` terms are NOT the first four radial-tangential terms: `FisheyeLens`
+refuses a `pinhole` file, and a pinhole consumer (`solve_pnp`) must check
+`model` before passing `dist`.
 `has_extrinsics` says which kind of file you have; a consumer that needs a
 robot-frame answer must check it rather than reading zeros as a pose at the
 base origin.
@@ -83,6 +91,10 @@ struct CameraCalib(Copyable, Movable, Writable):
     var fy: Float64
     var cx: Float64
     var cy: Float64
+
+    var model: String
+    """`pinhole` (OpenCV's radial-tangential `dist`) or `fisheye`
+    (Kannala-Brandt, 4 terms — `vision/fisheye.mojo`)."""
 
     var dist: List[Float64]
     """OpenCV's distortion vector, however many terms were fitted. Pass it
@@ -123,6 +135,7 @@ struct CameraCalib(Copyable, Movable, Writable):
         self.fy = fy
         self.cx = cx
         self.cy = cy
+        self.model = String("pinhole")
         self.dist = List[Float64]()
         self.rms_px = 0.0
         self.has_extrinsics = False
@@ -189,6 +202,7 @@ struct CameraCalib(Copyable, Movable, Writable):
             "intrinsics ", self.fx, " ", self.fy, " ", self.cx, " ",
             self.cy, "\n",
         )
+        writer.write("model ", self.model, "\n")
         if len(self.dist) > 0:
             writer.write("dist")
             for i in range(len(self.dist)):
@@ -239,6 +253,7 @@ def read_calib(path: String) raises -> CameraCalib:
     var cx = 0.0
     var cy = 0.0
     var dist = List[Float64]()
+    var model = String("pinhole")
     var rms_px = 0.0
     var rot = Mat3d.identity()
     var trans = Vec3d.zero()
@@ -281,6 +296,10 @@ def read_calib(path: String) raises -> CameraCalib:
             cx = Float64(String(parts[3]))
             cy = Float64(String(parts[4]))
             seen_intr = True
+        elif key == "model" and len(parts) >= 2:
+            model = String(parts[1])
+            if model != "pinhole" and model != "fisheye":
+                raise String(path) + ": unknown camera model '" + model + "'"
         elif key == "dist":
             for i in range(1, len(parts)):
                 dist.append(Float64(String(parts[i])))
@@ -325,6 +344,7 @@ def read_calib(path: String) raises -> CameraCalib:
 
     var out = CameraCalib(name^, device, w, h, fx, fy, cx, cy)
     out.dist = dist^
+    out.model = model^
     out.rms_px = rms_px
     # ⚠ BOTH HALVES OR NEITHER. A rotation without a translation is not a
     # partial pose, it is a pose with the origin silently at the base — which

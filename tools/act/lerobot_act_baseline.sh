@@ -36,7 +36,7 @@
 # ─────────────────────────────────────────────────────────────────────────────
 # WHAT TO COMPARE, AND THE THREE CAVEATS
 #
-# Ours (`val/l1` in the dashboard):   best 0.3941 @ epoch 7.7, pretrained
+# Ours (`val_l1_loss` in the dashboard):   best 0.3941 @ epoch 7.7, pretrained
 #                                     best 0.4076 @ epoch 15.5, random backbone
 # LeRobot logs `eval_loss` every `--eval_steps`.
 #

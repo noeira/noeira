@@ -209,6 +209,22 @@ def run_capture(var command: String, max_bytes: Int = 1 << 16) raises -> String:
 # ══════════════════════════════════════════════════════════════════════════
 
 
+def run_system(command: String) raises -> Int:
+    """Run `command` through `/bin/sh` in the FOREGROUND, stdin/stdout/stderr
+    inherited, and return its exit status (the `wait` status's high byte).
+
+    For launching something a person watches — a training run started by
+    `project-rerun --exec` — where `run_capture` would swallow the output
+    until it ended.
+    """
+    var c = command.copy()
+    var st = external_call["system", Int32](c.as_c_string_span().ptr())
+    _ = c^
+    if st == -1:
+        raise Error("proc: system() could not start /bin/sh")
+    return Int((st >> 8) & 0xFF)
+
+
 def _ignore_sigpipe():
     """Make a write to a dead pipe return an error instead of killing us.
 

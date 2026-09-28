@@ -52,7 +52,7 @@ cube 10 g (PLA matte, #0078BF). The sim carries each as a `density` on its
 COLLISION boxes — MuJoCo sums geom masses, and the eight wall boxes overlap
 at the corners — so the density is `mass / (sum of the box volumes)`, computed
 below from the same numbers that size the boxes, and the total body mass
-comes out at the scale's reading. The colours are the filaments' as sRGB.
+comes out at the scale's reading. The colours are the CAMERAS' view of the filaments (`BOWL_RGBA`).
 
 ## THE MATERIAL IS MATTE, AND THAT IS A RENDERING FIX
 
@@ -86,11 +86,23 @@ BOWL_WALL_MM = 6.0
 BOWL_HEIGHT_MM = 45.0
 BOWL_FLOOR_MM = 4.0
 BOWL_MASS_G = 88.0          # weighed, PLA basic 20 % infill
-BOWL_RGBA = "0.996 0.776 0.0 1"        # #FEC600
+BOWL_FILAMENT_RGBA = "0.996 0.776 0.0 1"   # #FEC600, the filament's sRGB
+BOWL_RGBA = "1.0 0.66 0.09 1"
+"""The bowl's RENDER albedo: what the rig's cameras record it as under the
+family's calibrated lights (2026-09-24, cube-in-bowl-printed: real median RGB
+208,140,21 overhead — boxed at the bowl's estimated pose, a whole-frame mask
+reads the wooden floor — and 176,114,13 wrist, both hue ~36; albedo = real /
+the sim's light level on the bowl, 0.76 overhead / 0.61 wrist). Red wants
+more than 1, so green is set for the hue: renders hue 36 on both cameras. The
+filament's own colour rendered clipped yellow (hue 60)."""
 
 BRICK_MM = 25.0
 BRICK_MASS_G = 10.0         # weighed, PLA matte
-BRICK_RGBA = "0.0 0.471 0.749 1"       # #0078BF
+BRICK_FILAMENT_RGBA = "0.0 0.471 0.749 1"  # #0078BF, the filament's sRGB
+BRICK_RGBA = "0.17 0.474 0.662 1"
+"""The brick's RENDER albedo (as `BOWL_RGBA`): real 46,100,135 overhead /
+20,72,104 wrist (hue 204 / 203), the two cameras' geometric mean — darker and
+less saturated than the filament, which rendered clipped cyan on the wrist."""
 
 CONTACT = 'solref="0.01 1" solimp="0.998 0.998 0.001"'
 """The contact softness on every prop geom and the desk — robosuite's and

@@ -103,7 +103,9 @@ def main() raises:
         for i in range(len(lines)):
             if lines[i].find("RunContext(") >= 0:
                 has_ctor = True
-            if lines[i].find("run.close()") >= 0:
+            # `finish_run` (core/run_session) closes the run too, after the
+            # logger has the outcome — the order the inline form got wrong.
+            if lines[i].find("run.close()") >= 0 or lines[i].find("finish_run(") >= 0:
                 has_close = True
         if not has_ctor or not has_close:
             missing_run += 1

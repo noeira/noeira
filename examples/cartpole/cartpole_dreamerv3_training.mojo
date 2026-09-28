@@ -4,13 +4,16 @@ CartPole counterpart of `examples/humanoid/sac_humanoid_training.mojo`. Uses
 the facade surface — the example writes NO training loop of its own:
 
   * `DreamerV3Agent[..., DISCRETE=True]` — world-model + actor-critic agent.
-  * `agent.train_single[EnvT, L=RemoteLogger](env, NUM_STEPS, ...)` — owns the
+  * `agent.train_single[EnvT, L=RunLogger](env, NUM_STEPS, ...)` — owns the
     whole loop (warmup → on-policy collect → record (+terminal obs) → WM-BPTT +
     imagination AC every `train_every`), with periodic greedy eval, metric
     streaming, and one-file checkpointing.
-  * `RemoteLogger` — streams `eval/mean_return` + WM/AC/con diagnostics.
-  * Single-file checkpoint — `agent.save(path)` / `agent.load(path)` write/read
-    ONE `nn-ckpt v2` envelope (the full world model + actor-critic).
+  * A `RunContext` (project `classic-control`): checkpoint, `metrics.csv` and
+    `run.kv` live in `runs/<id>/`; `run_logger(run)` writes the CSV and
+    streams `eval/mean_return` + WM/AC/con diagnostics to the monitor.
+  * Single-file checkpoint — `run.checkpoint_path("last")`, one `nn-ckpt`
+    envelope (the full world model + actor-critic), uploaded through the
+    run's artifact sink.
 
 After training, the final checkpoint is reloaded and a greedy probe confirms the
 action reproduces to `|diff| < 1e-5`.
@@ -26,8 +29,9 @@ Run:
 from std.random import seed
 from std.time import perf_counter_ns
 
-from noeira.core.dotenv import load_dotenv
-from noeira.core.logger import RemoteLogger
+from noeira.core.run import RunContext, register_run
+from noeira.core.run_session import RunLogger, finish_run, run_logger
+from noeira.io.artifact_sink import sink_for_run
 from noeira.nn.constants import DT
 from noeira.nn.core.initializer import Kaiming
 from noeira.deep_agents.dreamerv3.agent import DreamerV3Agent
@@ -69,7 +73,6 @@ comptime EVAL_EVERY = 2500
 comptime EVAL_EPISODES = 10
 comptime EP_LEN = 500
 comptime CHECKPOINT_EVERY = 25_000
-comptime CHECKPOINT_PATH = "dreamerv3_cartpole.ckpt"
 
 
 def main() raises:
@@ -82,22 +85,23 @@ def main() raises:
     print("  T / T_IMAG         =", T, "/", T_IMAG)
     print("  NUM_STEPS          =", NUM_STEPS)
     print("  CHECKPOINT_EVERY   =", CHECKPOINT_EVERY)
-    print("  Checkpoint path    =", CHECKPOINT_PATH)
-    print("=" * 70)
 
-    # ─── Logger (remote) ─────────────────────────────────────────────────
-    var env_vars = load_dotenv()
-    var api_key = env_vars.get("NOEIRA_CLOUD_API_KEY", "")
-    var url = env_vars.get("NOEIRA_CLOUD_URL", "")
-    var logger = RemoteLogger(
-        server_url=url,
-        run_name="DreamerV3 CartPole (CPU)",
-        buffer_size=200,
-        api_key=api_key,
+    # ─── Run + logger ────────────────────────────────────────────────────
+    var run = RunContext(
+        project=String("classic-control"),
+        driver=String("examples/cartpole/cartpole_dreamerv3_training.mojo"),
+        slug=String("dreamerv3-cartpole"),
+        env=String("builtin:classic-control/cartpole"),
     )
+    var checkpoint_path = run.checkpoint_path(String("last"))
+    print("  Run                =", run.dir)
+    print("=" * 70)
+    var logger = run_logger(run, buffer_size=200)
     logger.set_config("algorithm", "DreamerV3")
     logger.set_config("env", "CartPole")
     logger.set_config("t_imag", String(T_IMAG))
+    register_run(run, logger)
+    var artifacts = sink_for_run(run.id, run.dir)
     var logger_ptr = Pointer(to=logger).as_unsafe_any_origin()
 
     # ─── Agent + env ─────────────────────────────────────────────────────
@@ -108,7 +112,7 @@ def main() raises:
 
     # ─── Single train() call — auto-eval + auto-log + auto-checkpoint ────
     var t_start = perf_counter_ns()
-    var final_ret = agent.train_single[EnvT, L=RemoteLogger](
+    var final_ret = agent.train_single[EnvT, L=RunLogger](
         env,
         NUM_STEPS,
         learn_start=LEARN_START,
@@ -119,11 +123,17 @@ def main() raises:
         print_every=EVAL_EVERY,
         verbose=True,
         logger=logger_ptr,
-        checkpoint_path=CHECKPOINT_PATH,
+        checkpoint_path=checkpoint_path,
+        artifacts=artifacts,
+        run_dir=run.dir,
         checkpoint_every=CHECKPOINT_EVERY,
     )
     var elapsed_s = Float64(perf_counter_ns() - t_start) / 1e9
-    logger.close()
+    var sent = logger.b.total_logged()
+    finish_run(
+        run, logger, artifacts,
+        String("eval_return=") + String(final_ret),
+    )
     _ = logger  # lifetime extender for logger_ptr
 
     # ─── Summary ─────────────────────────────────────────────────────────
@@ -132,7 +142,7 @@ def main() raises:
     print("  total env_steps        =", NUM_STEPS)
     print("  elapsed                =", elapsed_s, "s")
     print("  FINAL mean_ret(", EVAL_EPISODES, ")  =", final_ret)
-    print("  remote points sent     =", logger.total_logged())
+    print("  remote points sent     =", sent)
     if Float64(final_ret) >= 475.0:
         print("SOLVED — mean_ret >= 475.")
     elif Float64(final_ret) >= 200.0:
@@ -153,7 +163,7 @@ def main() raises:
     agent.reset_belief()
     agent.select_greedy_action(probe_ptr, before_ptr)
 
-    agent.load(CHECKPOINT_PATH)
+    agent.load(checkpoint_path)
     var act_after = List[Scalar[DT]](length=ACT, fill=Scalar[DT](0.0))
     var after_ptr = act_after.unsafe_ptr().as_unsafe_any_origin()
     agent.reset_belief()

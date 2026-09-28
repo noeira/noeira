@@ -37,3 +37,9 @@ tests/robots/test_lafan_import_vs_oracle.mojo
 # only when instantiated. Also gates that the driver's host-side lie-down
 # diagnostic counts the same lanes the kernel actually transformed.
 tests/robots/test_g1_rsi_inject_kernel_gpu.mojo
+
+# `last_action` + `history_actor` — the 401 dims our actor never had (§12.34).
+# Gated against `bfm_zero_tracking_oracle.py`, which G2 validated by running
+# the RELEASED ONNX actor through its 721-vector to three decimals. The layout
+# is KEY-MAJOR, newest-first; a step-major transcription has the right SIZE.
+tests/robots/test_g1_history.mojo

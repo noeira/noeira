@@ -12,11 +12,14 @@ deliberately tiny (eval never samples it).
 Run with (GPU env — the trainer is a GPU trainer):
     pixi run -e apple  mojo run -I . examples/arcade_games/rainbow_pong_eval_render.mojo
     pixi run -e nvidia mojo run -I . examples/arcade_games/rainbow_pong_eval_render.mojo
+    pixi run -e apple  mojo run -I . examples/arcade_games/rainbow_pong_eval_render.mojo --ckpt <run_id>
 
 Pass nothing — it reads checkpoints/rainbow_pong.ckpt. The window closes on
 quit (ESC / window close) or after EVAL_EPISODES games.
 """
 
+from std.sys import argv
+from noeira.core.run import resolve_checkpoint
 from max.gpu.host import DeviceContext
 
 from noeira.nn.constants import DT
@@ -62,11 +65,23 @@ comptime RainbowTrainer = C51Trainer[
 ]
 
 
+def _flag(name: String, dflt: String) raises -> String:
+    """Value of `--name X`, or `dflt` when the flag is absent."""
+    var av = argv()
+    for i in range(1, len(av)):
+        if String(av[i]) == name:
+            if i + 1 >= len(av):
+                raise Error("flag " + name + " needs a value")
+            return String(av[i + 1])
+    return dflt
+
+
 def main() raises:
+    var ckpt = resolve_checkpoint(_flag(String("--ckpt"), String(CKPT_PATH)), String("last"))
     print("=" * 70)
     print("Rainbow Pong — Live Render Eval (clean obs)")
     print("=" * 70)
-    print("  Checkpoint:", CKPT_PATH)
+    print("  Checkpoint:", ckpt)
     print("  Episodes:", EVAL_EPISODES)
     print()
 
@@ -88,7 +103,7 @@ def main() raises:
             v_max=V_MAX,
         )
 
-        trainer.load_state(String(CKPT_PATH))
+        trainer.load_state(ckpt)
         print("Checkpoint loaded. Starting live play...")
 
         # Deterministic greedy: zero out NoisyLinear exploration noise.

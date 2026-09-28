@@ -334,6 +334,8 @@ def run_onpolicy_discrete_train_batched[
     run_dir: String = "",
     base_step: Int = 0,
     progress_label: String = "on-policy-disc",
+    stop_at_mean_return: Optional[Scalar[DT]] = None,
+    stop_min_episodes: Int = 0,
 ) raises -> List[Scalar[DT]]:
     """Discrete-action sibling of `run_onpolicy_train_batched`.
 
@@ -392,4 +394,6 @@ def run_onpolicy_discrete_train_batched[
         run_dir=run_dir,
         base_step=base_step,
         progress_label=progress_label,
+        stop_at_mean_return=stop_at_mean_return,
+        stop_min_episodes=stop_min_episodes,
     )

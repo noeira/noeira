@@ -25,11 +25,13 @@ GIF encoding is pure Mojo (`save_frame_sequence_gif`) — no Python, no SDL.
 
 Run (NVIDIA, after the training run has written a checkpoint):
     pixi run -e nvidia mojo run -I . \\
-        examples/car_racing/dreamerv3_car_racing_imagination_gif.mojo
+        examples/car_racing/dreamerv3_car_racing_imagination_gif.mojo [--ckpt <run_id>]
 """
 
 from std.memory import alloc
 from std.random import seed
+from std.sys import argv
+from noeira.core.run import resolve_checkpoint
 from max.gpu.host import DeviceContext
 
 from noeira.nn.constants import DT
@@ -107,7 +109,19 @@ comptime WC = 3 * IMG + 2 * SEP
 comptime HC = IMG
 
 
+def _flag(name: String, dflt: String) raises -> String:
+    """Value of `--name X`, or `dflt` when the flag is absent."""
+    var av = argv()
+    for i in range(1, len(av)):
+        if String(av[i]) == name:
+            if i + 1 >= len(av):
+                raise Error("flag " + name + " needs a value")
+            return String(av[i + 1])
+    return dflt
+
+
 def main() raises:
+    var ckpt = resolve_checkpoint(_flag(String("--ckpt"), String(CHECKPOINT_PATH)), String("last"))
     print("=" * 70)
     print("DreamerV3 pixel-CarRacing — imagination GIF (GPU decode)")
     print(
@@ -118,8 +132,8 @@ def main() raises:
 
     with DeviceContext() as ctx:
         var agent = Ag.make(ctx=ctx, action_scale=Scalar[DT](1.0))
-        print("loading checkpoint", CHECKPOINT_PATH, "...")
-        agent.load(CHECKPOINT_PATH)
+        print("loading checkpoint", ckpt, "...")
+        agent.load(ckpt)
 
         # ── collect one greedy episode (closed-loop) ──
         var env = Env()

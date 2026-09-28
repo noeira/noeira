@@ -1,0 +1,117 @@
+---
+/**
+ * TemporalEnsemble — how ACT turns overlapping chunks into one command.
+ *
+ * Four queries, one per control step, each writing a chunk forward in time.
+ * The highlighted column is step t: every chunk that covers it contributes,
+ * and the command is their weighted mean.
+ *
+ * The weights are the trap. `w_i = exp(-m·i)` counts i from the OLDEST chunk
+ * covering t, so the oldest prediction weighs most — the paper says so, and
+ * `noeira/deep_agents/act/inference.mojo` spells out why reading it the
+ * intuitive way silently inverts the smoothing. The row labels carry the
+ * weights so the figure cannot be read the wrong way round.
+ *
+ * Chunks are drawn 6 steps long for legibility; the real K is 60.
+ */
+
+const STEP = 66;
+const X0 = 200;
+const CELL = 58;
+const CHUNK = 6;
+
+/** Grid steps drawn on the axis: t−3 … t+6. */
+const AXIS = Array.from({ length: 10 }, (_, j) => j);
+/** The column being commanded. */
+const NOW = 3;
+
+const ROW_Y = (i: number) => 44 + i * 44;
+const ROW_H = 28;
+
+const QUERIES = [
+	{ at: 0, label: 't−3', w: 'exp(0)' },
+	{ at: 1, label: 't−2', w: 'exp(−m)' },
+	{ at: 2, label: 't−1', w: 'exp(−2m)' },
+	{ at: 3, label: 't', w: 'exp(−3m)' },
+];
+
+const tick = (j: number) => {
+	const d = j - NOW;
+	return d === 0 ? 't' : d < 0 ? `t−${-d}` : `t+${d}`;
+};
+
+const colX = (j: number) => X0 + j * STEP;
+const NOW_MID = colX(NOW) + CELL / 2;
+const AXIS_Y = ROW_Y(QUERIES.length) + 4;
+
+/** Held in a binding: a literal `{` in Astro markup opens an expression. */
+const FORMULA = 'a_t = Σᵢ wᵢ Aᵢ[t] / Σᵢ wᵢ,   wᵢ = exp(−m · i),   i = 0 for the oldest chunk covering t,   m = 0.01';
+---
+
+<figure class="diagram not-content">
+	<svg viewBox="0 0 880 380" role="img"
+		aria-label="ACT temporal ensemble: a new chunk is predicted at every step; the command at step t is the weighted mean of every chunk covering t, with the oldest chunk weighted most">
+		<defs>
+			<marker id="te-green" viewBox="0 0 10 10" refX="9" refY="5"
+				markerWidth="6" markerHeight="6" orient="auto-start-reverse">
+				<path d="M 0 0 L 10 5 L 0 10 z" class="dg-fill-green" />
+			</marker>
+		</defs>
+
+		<!-- the column being commanded -->
+		<rect class="dg-group" x={colX(NOW) - 5} y={ROW_Y(0) - 10}
+			width={CELL + 10} height={ROW_Y(QUERIES.length) - ROW_Y(0) + 4} rx="8" />
+
+		<text x="188" y={ROW_Y(0) - 16} class="dg-caption" style="text-anchor:end">weight</text>
+		{
+			QUERIES.map((q, i) => (
+				<g>
+					<text x="20" y={ROW_Y(i) + 19} class="dg-label dg-label--muted">{`query ${q.label}`}</text>
+					<text x="188" y={ROW_Y(i) + 19} class="dg-label dg-label--spark"
+						style="text-anchor:end">{q.w}</text>
+					{Array.from({ length: CHUNK }, (_, k) => {
+						const j = q.at + k;
+						if (j >= AXIS.length) return null;
+						return (
+							<rect x={colX(j)} y={ROW_Y(i)} width={CELL} height={ROW_H} rx="4"
+								class={j === NOW ? 'dg-fill-spark' : 'dg-fill-muted'}
+								opacity={j === NOW ? 0.9 : 0.3} />
+						);
+					})}
+				</g>
+			))
+		}
+
+		<!-- time axis -->
+		<line class="dg-axis" x1={X0 - 10} y1={AXIS_Y} x2={colX(AXIS.length - 1) + CELL + 10} y2={AXIS_Y} />
+		{
+			AXIS.map((j) => (
+				<text x={colX(j) + CELL / 2} y={AXIS_Y + 20} class="dg-caption">{tick(j)}</text>
+			))
+		}
+
+		<!-- the command -->
+		<path class="dg-edge dg-edge--green" marker-end="url(#te-green)"
+			d={`M ${NOW_MID} ${AXIS_Y + 30} L ${NOW_MID} ${AXIS_Y + 58}`} />
+		<g class="dg-node dg-node--green">
+			<rect x={NOW_MID - 110} y={AXIS_Y + 60} width="220" height="62" rx="10" />
+			<text x={NOW_MID} y={AXIS_Y + 86} class="dg-title">command at t</text>
+			<text x={NOW_MID} y={AXIS_Y + 108} class="dg-sub">weighted mean of 4 chunks</text>
+		</g>
+
+		<text x="572" y={AXIS_Y + 80} class="dg-sub dg-sub--left">The oldest chunk weighs most.</text>
+		<text x="572" y={AXIS_Y + 102} class="dg-sub dg-sub--left">With m = 0.01 the spread is gentle:</text>
+		<text x="572" y={AXIS_Y + 124} class="dg-sub dg-sub--left">1.0 down to 0.55 across K = 60.</text>
+	</svg>
+
+	<figcaption class="diagram__legend">
+		<span class="diagram__key diagram__key--spark">predictions for step t</span>
+		<span class="diagram__key diagram__key--muted">the rest of each chunk</span>
+		<span class="diagram__key diagram__key--green">executed command</span>
+	</figcaption>
+
+	<div class="diagram__formula">
+		<span class="diagram__formula-title">temporal ensemble</span>
+		<code>{FORMULA}</code>
+	</div>
+</figure>

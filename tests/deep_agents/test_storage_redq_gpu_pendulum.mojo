@@ -127,15 +127,15 @@ def main() raises:
 
         var m = agent.flush_metrics()
         print("-" * 64)
-        print("  DIAG actor_loss =", m.actor_loss.v)
+        print("  DIAG actor_loss =", m.policy_loss.v)
         print("  DIAG critic_loss=", m.critic_loss.v)
         print("  DIAG alpha      =", m.alpha.v)
         print("  DIAG mean_q     =", m.mean_q.v)
         print("  DIAG mean_target=", m.mean_target.v)
-        print("  DIAG mean_reward=", m.mean_reward.v)
+        print("  DIAG mean_reward=", m.reward_mean.v)
         print("  DIAG mean_next_q=", m.mean_next_q.v)
         print("  DIAG mean_done  =", m.mean_done.v)
-        print("  DIAG mean_abs_a =", m.mean_abs_action.v)
+        print("  DIAG mean_abs_a =", m.action_abs_mean.v)
         print("  DIAG train_steps=", m.train_steps.v)
         print("  DIAG n_updates  =", m.n_updates.v)
         print("-" * 64)
@@ -154,7 +154,7 @@ def main() raises:
             "GPU critic_loss populated (not 0.0)",
         )
         assert_true(
-            m.mean_reward.v != Scalar[DT](0.0),
+            m.reward_mean.v != Scalar[DT](0.0),
             "GPU mean_reward populated (not 0.0)",
         )
         assert_true(

@@ -20,6 +20,9 @@ Watch `value_mse`: if it drops below the flat run's ~0.38 floor, the spatial
 dynamics broke the ceiling; if it stays pinned, the value target itself is the
 limit (not the model).
 
+The best net goes to `runs/<id>/checkpoints/best.ckpt` (project `board-games`),
+beside the run's `metrics.csv` and `run.kv`.
+
 Usage:
     pixi run -e nvidia mojo run -I . examples/board_games/connect_four_muzero_gumbel_spatial.mojo
 """
@@ -29,8 +32,10 @@ from max.gpu.host import DeviceContext
 
 from noeira.nn.constants import DT
 from noeira.nn.core.initializer import Kaiming
-from noeira.core.dotenv import load_dotenv
-from noeira.core.logger import RemoteLogger
+from noeira.core.run import RunContext, register_run
+from noeira.core.run_session import RunLogger, finish_run, run_logger
+from noeira.io.artifact_sink import sink_for_run
+from noeira.deep_agents.training.checkpoint import announce_checkpoint
 from noeira.deep_agents.muzero.nets_spatial import (
     MZRepNetC4Spatial,
     MZDynNetC4Spatial,
@@ -55,20 +60,20 @@ def main() raises:
     )
     print()
 
-    var env_vars = load_dotenv()
-    var api_key = env_vars.get("NOEIRA_CLOUD_API_KEY", "")
-    var url = env_vars.get("NOEIRA_CLOUD_URL", "")
-
-    var logger = RemoteLogger(
-        server_url=url,
-        run_name="Gumbel MuZero Connect Four spatial (nn)",
-        buffer_size=22,
-        api_key=api_key,
+    var run = RunContext(
+        project=String("board-games"),
+        driver=String("examples/board_games/connect_four_muzero_gumbel_spatial.mojo"),
+        slug=String("muzero-gumbel-spatial-connect-four"),
+        env=String("builtin:connect_four"),
     )
+    print("run:", run.dir)
+    var logger = run_logger(run, buffer_size=22)
     logger.set_config("agent", "GumbelMuZero")
     logger.set_config("env", "ConnectFour")
     logger.set_config("network", "MZ spatial conv h/g/f [C=64, 3 blocks, 6x7]")
     logger.set_config("framework", "deep_agents/nn")
+    register_run(run, logger)
+    var artifacts = sink_for_run(run.id, run.dir)
 
     comptime OBS = 126
     comptime ACT = 7
@@ -138,7 +143,7 @@ def main() raises:
         MAX_PLIES=MAX_PLIES,
         OPP1=GPUMinimaxConnectFour[5],
         OPP2=RandomOpponent,
-        L=RemoteLogger,
+        L=RunLogger,
         ARENA_GAMES=64,
         EVAL_GAMES=64,
         TEMP_MOVES=20,
@@ -200,7 +205,7 @@ def main() raises:
         # Rolling checkpoint of the best net every 2k moves → playable /
         # recoverable mid-run (play it with play_connect_four_muzero_gumbel).
         checkpoint_every=2_000,
-        checkpoint_path=String("connect_four_muzero_gumbel_spatial.ckpt"),
+        checkpoint_path=run.checkpoint_path(String("best")),
         # Prioritized Experience Replay (device sum-tree). OFF for board games:
         # the MuZero paper uses PER only for Atari and samples BOARD-GAME states
         # UNIFORMLY ("For board games, states are sampled uniformly"). Empirically
@@ -213,18 +218,21 @@ def main() raises:
         per_beta=Scalar[DT](1.0),
     )
 
-    logger.close()
-
     # Storage checkpoint: the rep/dyn/pred trio goes into ONE file via
     # `save_params_multi` — the same single-file layout the driver's rolling
     # `checkpoint_every` save uses, so `play_connect_four_muzero_gumbel` loads
     # from it too.
-    var ckpt = String("connect_four_muzero_gumbel_spatial.ckpt")
+    var ckpt = run.checkpoint_path(String("best"))
     save_params_multi["gpu", Rep, Dyn, Pred](
         ckpt, Optional(ctx), False, rep, dyn, pred
+    )
+    announce_checkpoint(ckpt, artifacts, run.dir)
+    finish_run(
+        run, logger, artifacts,
+        String("last_loss=") + String(res.last_loss) + String(" promotions=") + String(res.promotions),
     )
 
     print()
     print("last_loss:", res.last_loss, "| promotions:", res.promotions)
-    print("saved best net → connect_four_muzero_gumbel_spatial.ckpt")
+    print("saved best net →", ckpt)
     print("=== Done ===")

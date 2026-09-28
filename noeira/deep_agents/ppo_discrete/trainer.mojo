@@ -25,8 +25,8 @@ D2Hs logits/value); rollout buffers live host-only; the K-epoch
 minibatch is H2D-uploaded before each train step.
 
 STORAGE migration: nets are storage `Module`s, optimizers are storage `Adam`
-(arena-adopted on GPU), every block passes storage `Tensor`s. Checkpoint uses
-the storage `CheckpointWriter`/`CheckpointReader` + an appended counter line.
+(arena-adopted on GPU), every block passes storage `Tensor`s. Checkpoint is v3,
+the train-step counter a `K` scalar (legacy v2 files still load).
 The GPU diag forward writes into an owned device `Tensor` scratch (`_diag_logits`);
 the per-sample / EV kernels read/write owned `Tensor`s via `.lt["gpu", layout]()`
 views (no raw pointers). The EV kernel is reused from `ppo.trainer`.
@@ -49,11 +49,9 @@ from noeira.nn.core.call import call_forward, call_vjp
 from noeira.nn.core.initializer import Xavier
 from noeira.nn.optimizer.adam import Adam
 from noeira.nn.core.checkpoint import (
-    CheckpointWriter,
-    CheckpointReader,
-    _bytes_append_str,
-    _split_lines,
-    _write_file_bytes,
+    BinaryCheckpointWriter, BinaryCheckpointReader, CheckpointReader,
+    CheckpointScalars, write_model, read_model, _split_lines, _is_v3_header,
+    _read_file_bytes, _write_file_bytes,
 )
 
 from noeira.nn.core.log_bundle import log_bundle
@@ -735,7 +733,7 @@ struct PPODiscreteTrainer[
             clip_mean = self._clip_accum * inv
             ev_mean = self._ev_accum * inv
         var bundle = PPOMetrics(
-            actor_loss=LogScalar[DT](self._actor_L_accum * inv),
+            policy_loss=LogScalar[DT](self._actor_L_accum * inv),
             critic_loss=LogScalar[DT](self._critic_L_accum * inv),
             train_steps=LogScalar[DT](Scalar[DT](self._total_train_steps)),
             n_updates=LogScalar[DT](Scalar[DT](self._update_count)),
@@ -767,60 +765,59 @@ struct PPODiscreteTrainer[
     ) raises:
         _ = self.flush_metrics[L](logger, step)
 
+    # ─── Checkpoint (ONE v3 file: actor + critic + train-step counter) ───
     def save_state(mut self, path: String) raises:
-        """One-file storage checkpoint of the actor + critic params + state,
-        plus the cumulative train-step counter (appended as a `key=value`
-        line). Sections name-prefixed `actor.` / `critic.`. On GPU device
-        params download to host first; the on-disk format is target-agnostic.
-        Optimizer moments are NOT persisted (on-policy resume re-rolls)."""
-        var w = CheckpointWriter(save_moments=False)
-        w.mode = 0
-        walk_params[Self.train_target](self.actor, w, self.ctx, "actor")
-        walk_params[Self.train_target](self.critic, w, self.ctx, "critic")
-        w.mode = 1
-        var _sref1 = ParamVisitorRef.of[type_of(w), Self.train_target](w)
-        self.actor.for_each_state[Self.train_target](_sref1, self.ctx, "actor")
-        var _sref2 = ParamVisitorRef.of[type_of(w), Self.train_target](w)
-        self.critic.for_each_state[Self.train_target](_sref2, self.ctx, "critic")
-        w.content += (
-            "_total_train_steps=" + String(self._total_train_steps) + "\n"
-        )
-        # Chunked + atomic (tmp-rename) write — a bare `f.write(w.content)`
-        # is non-atomic and a single write(2) silently truncates at ~2 GiB
-        # (the v2 corruption source). Format unchanged (v2 text + the
-        # `_total_train_steps` metadata line, which v3 has no slot for).
-        var bytes = List[UInt8]()
-        _bytes_append_str(bytes, w.content)
-        _write_file_bytes(path, bytes)
+        """ONE v3 `storage-ckpt` file: actor + critic params + state,
+        name-prefixed `actor.` / `critic.`; the train-step counter as a `K`
+        section. Atomic and chunked; target-agnostic (GPU params download
+        first). Optimizer moments NOT persisted (on-policy resume re-rolls)."""
+        var w = BinaryCheckpointWriter(save_moments=False)
+        write_model[Self.train_target](w, self.actor, self.ctx, "actor")
+        write_model[Self.train_target](w, self.critic, self.ctx, "critic")
+        var sc = CheckpointScalars()
+        sc.set_int("total_train_steps", self._total_train_steps)
+        w.write_scalars(sc)
+        _write_file_bytes(path, w.content)
 
     def load_state(mut self, path: String) raises:
-        """Inverse of `save_state`. PPO has no target nets, so no
-        hard-copy step is needed. On GPU the device params are restored via
-        host staging (byte-identical on-disk format)."""
-        var content: String
-        with open(path, "r") as f:
-            content = String(f.read())
-        var lines = _split_lines(content)
-        var body = List[String]()
-        for li in range(len(lines)):
-            if lines[li].startswith("storage-ckpt"):
-                continue
-            body.append(lines[li])
-        var r = CheckpointReader(body^)
-        r.mode = 0
-        walk_params[Self.train_target](self.actor, r, self.ctx, "actor")
-        walk_params[Self.train_target](self.critic, r, self.ctx, "critic")
-        r.mode = 1
-        var _sref3 = ParamVisitorRef.of[type_of(r), Self.train_target](r)
-        self.actor.for_each_state[Self.train_target](_sref3, self.ctx, "actor")
-        var _sref4 = ParamVisitorRef.of[type_of(r), Self.train_target](r)
-        self.critic.for_each_state[Self.train_target](_sref4, self.ctx, "critic")
-        self._total_train_steps = Int(
-            self._scan_scalar(
-                content, "_total_train_steps=",
-                Scalar[DT](self._total_train_steps),
+        """Restore actor + critic (v3, or the legacy v2 text this trainer
+        wrote before) and the train-step counter. PPO has no target nets, so
+        there is no hard copy."""
+        var bytes = _read_file_bytes(path)
+        if _is_v3_header(bytes):
+            var rb = BinaryCheckpointReader(bytes^)
+            read_model[Self.train_target](rb, self.actor, self.ctx, "actor")
+            read_model[Self.train_target](rb, self.critic, self.ctx, "critic")
+            var sc = rb.read_scalars()
+            rb.finish()
+            self._total_train_steps = sc.get_int(
+                "total_train_steps", self._total_train_steps
             )
-        )
+        else:
+            var content: String
+            with open(path, "r") as f:
+                content = String(f.read())
+            var lines = _split_lines(content)
+            var body = List[String]()
+            for li in range(len(lines)):
+                if lines[li].startswith("storage-ckpt"):
+                    continue
+                body.append(lines[li])
+            var r = CheckpointReader(body^)
+            r.mode = 0
+            walk_params[Self.train_target](self.actor, r, self.ctx, "actor")
+            walk_params[Self.train_target](self.critic, r, self.ctx, "critic")
+            r.mode = 1
+            var _sref3 = ParamVisitorRef.of[type_of(r), Self.train_target](r)
+            self.actor.for_each_state[Self.train_target](_sref3, self.ctx, "actor")
+            var _sref4 = ParamVisitorRef.of[type_of(r), Self.train_target](r)
+            self.critic.for_each_state[Self.train_target](_sref4, self.ctx, "critic")
+            self._total_train_steps = Int(
+                self._scan_scalar(
+                    content, "_total_train_steps=",
+                    Scalar[DT](self._total_train_steps),
+                )
+            )
 
     @staticmethod
     def _scan_scalar(

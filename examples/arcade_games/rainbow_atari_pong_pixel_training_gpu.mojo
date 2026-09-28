@@ -45,8 +45,9 @@ from std.memory import Pointer
 
 from max.gpu.host import DeviceContext
 
-from noeira.core.dotenv import load_dotenv
-from noeira.core.logger import RemoteLogger
+from noeira.core.run import RunContext, register_run
+from noeira.core.run_session import RunLogger, finish_run, run_logger
+from noeira.io.artifact_sink import sink_for_run
 from noeira.nn.constants import DT
 
 from noeira.deep_agents.c51.config import RainbowCNN
@@ -102,11 +103,10 @@ comptime WARMUP = 20_000
 comptime NUM_STEPS = 2_000_000
 comptime LR = Scalar[DT](6.25e-5)
 
-# Checkpointing. The CNN q-net + optimizer + epsilon are written to
-# CKPT_PATH every CKPT_EVERY env-steps (and once at the end); the replay
-# buffer is NOT saved.
+# Checkpointing. The CNN q-net + optimizer + epsilon are written to the run's
+# `checkpoints/last.ckpt` every CKPT_EVERY env-steps (and once at the end);
+# the replay buffer is NOT saved.
 comptime CKPT_EVERY = 250_000
-comptime CKPT_PATH = "checkpoints/rainbow_atari_pong_pixel.ckpt"
 
 comptime ROM_PATH = "roms/pong.bin"
 
@@ -214,23 +214,21 @@ def main() raises:
         print("  Learning rate:", LR)
         print("  Warmup:", WARMUP)
         print("  Total transitions:", NUM_STEPS)
-        print("  Checkpoint:", CKPT_PATH, "(every", CKPT_EVERY, "steps)")
         print()
 
         # =====================================================================
         # Logger
         # =====================================================================
 
-        var env_vars = load_dotenv()
-        var api_key = env_vars.get("NOEIRA_CLOUD_API_KEY", "")
-        var url = env_vars.get("NOEIRA_CLOUD_URL", "")
-
-        var logger = RemoteLogger(
-            server_url=url,
-            run_name="Rainbow Atari Pong Pixel GPU (deep_agents)",
-            buffer_size=64,
-            api_key=api_key,
+        var run = RunContext(
+            project=String("atari"),
+            driver=String("examples/arcade_games/rainbow_atari_pong_pixel_training_gpu.mojo"),
+            slug=String("rainbow-atari-pong-pixel"),
+            env=String("builtin:atari/pong"),
         )
+        var checkpoint_path = run.checkpoint_path(String("last"))
+        print("  Run:", run.dir)
+        var logger = run_logger(run, buffer_size=64)
         logger.set_config("agent", "Rainbow DQN CNN (deep_agents)")
         logger.set_config("env", "Atari Pong (Pixel)")
         logger.set_config("obs", "4x84x84")
@@ -248,6 +246,9 @@ def main() raises:
         logger.set_config("updates_per_step", String(UPDATES_PER_STEP))
         logger.set_config("noop_max", String(NOOP_MAX))
 
+        register_run(run, logger)
+        var artifacts = sink_for_run(run.id, run.dir)
+
         # =====================================================================
         # Train
         # =====================================================================
@@ -259,7 +260,7 @@ def main() raises:
 
         try:
             var _ep_returns = agent.train_cpu_batched[
-                BatchedAtariPong, N_ENVS, N_STEP, RemoteLogger
+                BatchedAtariPong, N_ENVS, N_STEP, RunLogger
             ](
                 env,
                 NUM_STEPS,
@@ -271,14 +272,19 @@ def main() raises:
                 logger=Pointer(to=logger).as_unsafe_any_origin(),
                 diag_every=5_000,
                 checkpoint_every=CKPT_EVERY,
-                checkpoint_path=String(CKPT_PATH),
+                checkpoint_path=checkpoint_path,
+                artifacts=artifacts,
+                run_dir=run.dir,
                 eval_env=Pointer(to=eval_env).as_unsafe_any_origin(),
                 eval_every=100_000,
                 eval_episodes=N_ENVS,  # one parallel wave of full episodes
             )
 
             var elapsed_s = Float64(perf_counter_ns() - start_time) / 1e9
-            logger.close()
+            finish_run(
+                run, logger, artifacts,
+                String("mean_return_10=") + String(agent.mean_return()),
+            )
 
             print("-" * 70)
             print()

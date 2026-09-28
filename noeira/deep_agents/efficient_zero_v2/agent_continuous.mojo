@@ -20,7 +20,7 @@ policy NLL).
   * `eval_greedy(env, episodes)` — the deployed-agent metric: deterministic
     (argmax-visit) sampled-Gumbel rollout. The projector/predictor are
     consistency-only, unused here.
-  * `save` / `load` — one-file `nn-ckpt v2` envelope packing all five nets
+  * `save` / `load` — one-file v3 `storage-ckpt` file packing all five nets
     (sections `rep` / `dyn` / `pred` / `proj` / `predh`), GPU body visitors.
 """
 

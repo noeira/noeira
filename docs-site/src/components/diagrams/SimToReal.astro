@@ -3,8 +3,10 @@
  * SimToReal — the loop the project is built around.
  *
  * Four stages left to right: SIMULATE (the physics and the task suites),
- * LEARN (RL, world models, imitation and VLAs), ACT (the policy on a real arm,
- * on a Jetson), RECORD (teleoperation and cameras into LeRobot datasets). The
+ * LEARN (RL, world models, imitation and VLAs), ACT (a policy on a real robot,
+ * on edge hardware), RECORD (teleoperation and interventions into datasets).
+ * Kept at the level of concepts on purpose: the robots, boards and benchmarks
+ * supported today are examples on their own pages, not the loop itself. The
  * return edge is the point of drawing it: what the robot records flows back
  * into learning, so the loop is closed in both directions — dream in
  * simulation, act in the world, learn from both. The bar underneath is the one
@@ -15,10 +17,10 @@
  */
 
 const STAGES = [
-	{ x: 0, tone: 'cyan', title: 'SIMULATE', l1: 'MuJoCo-parity physics,', l2: 'DM Control, LIBERO, tasks' },
+	{ x: 0, tone: 'cyan', title: 'SIMULATE', l1: 'physics checked against', l2: 'MuJoCo · task suites' },
 	{ x: 230, tone: 'spark', title: 'LEARN', l1: 'RL · world models ·', l2: 'imitation · VLAs' },
-	{ x: 460, tone: 'green', title: 'ACT', l1: 'SO-101 arm, cameras,', l2: 'Jetson Orin at 30 Hz' },
-	{ x: 690, tone: 'purple', title: 'RECORD', l1: 'teleop, interventions,', l2: 'LeRobot datasets' },
+	{ x: 460, tone: 'green', title: 'ACT', l1: 'real robots, cameras,', l2: 'edge GPUs, real time' },
+	{ x: 690, tone: 'purple', title: 'RECORD', l1: 'teleoperation,', l2: 'interventions, datasets' },
 ];
 const W = 190;
 const Y = 70;
@@ -61,10 +63,13 @@ const H = 120;
 			))
 		}
 
-		{/* the return edge: recordings back into learning */}
+		{/* the return edge: recordings back into learning. Routed square — down,
+		    across, up — so it ENTERS LEARN vertically: a single Bézier from
+		    RECORD's bottom arrived at an angle and tilted the arrowhead. */}
 		<path class="dg-edge dg-edge--purple" marker-end="url(#s2r-purple)"
-			d={`M 785 ${Y + H} C 785 ${Y + H + 48}, 325 ${Y + H + 48}, 325 ${Y + H + 8}`} />
-		<text x="555" y={Y + H + 56} class="dg-label dg-label--purple dg-label--center">
+			d={`M 785 ${Y + H} L 785 ${Y + H + 24} Q 785 ${Y + H + 36} 773 ${Y + H + 36}
+				L 337 ${Y + H + 36} Q 325 ${Y + H + 36} 325 ${Y + H + 24} L 325 ${Y + H + 4}`} />
+		<text x="555" y={Y + H + 60} class="dg-label dg-label--purple dg-label--center">
 			demonstrations · interventions · datasets
 		</text>
 

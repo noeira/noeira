@@ -19,5 +19,17 @@ reference generator; a new recording regenerates the table and changes BOTH
 constants here, together.
 """
 
-comptime SO101_TASKS = "tools/vla/smolvla_tasks_so101-tower_cube-in-bowl.tsv"
-comptime SO101_N_LANG: Int = 11
+from std.sys.defines import get_defined_int, get_defined_string
+
+comptime SO101_TASKS = get_defined_string[
+    "SMOLVLA_TASKS_TSV", "tools/vla/smolvla_tasks_so101-tower_cube-in-bowl.tsv"
+]()
+comptime SO101_N_LANG: Int = get_defined_int["SMOLVLA_N_LANG", 11]()
+"""⚠ Another recording is a BUILD of both ends with the same two defines, e.g.
+the printed-props one (15 tokens):
+
+    -D SMOLVLA_N_LANG=15 \\
+    -D SMOLVLA_TASKS_TSV=tools/vla/smolvla_tasks_so101-tower_cube-in-bowl-printed.tsv
+
+on the fine-tune AND the deployment; the fine-tune refuses a table whose length
+is not `SO101_N_LANG` at its first step, the deployment at its start."""

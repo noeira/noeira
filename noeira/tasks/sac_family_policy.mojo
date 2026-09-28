@@ -2,7 +2,7 @@
 
 `sac_family_driver` trains with these widths, and every tool that loads its
 checkpoints on the CPU (viewers, recorders, probes, the DAgger handover)
-builds the same nets: `nn-ckpt v2` loads by parameter name AND size, so a
+builds the same nets: a checkpoint loads by parameter name AND size, so a
 width copied by hand into five files was five chances to load nothing.
 
     from noeira.tasks.sac_family_policy import (

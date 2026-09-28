@@ -113,7 +113,7 @@ def test_td3_gpu_smoke() raises:
         _ = trainer.train_step(step)
 
     var m = trainer.flush_metrics()
-    var al = m.actor_loss.to_f64()
+    var al = m.policy_loss.to_f64()
     var cl = m.critic_loss.to_f64()
     var nact = m.n_actor_updates.to_f64()
     var ncrit = m.n_critic_updates.to_f64()
@@ -124,7 +124,7 @@ def test_td3_gpu_smoke() raises:
     print("  n_critic_updates=", ncrit)
     print("  mean_ret(10)    =", mret)
 
-    _finite(al, "actor_loss")
+    _finite(al, "policy_loss")
     _finite(cl, "critic_loss")
     _finite(mret, "mean_return")
     assert_true(ncrit > 0.0, "no critic updates ran")

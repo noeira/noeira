@@ -236,6 +236,10 @@ def placement_table_drift[T: PlacementTable](
         for i in range(T.N_BASE_QPOS):
             if T.base_qpos[D64](i) != f.base_qpos[i]:
                 out.append("base_qpos[" + String(i) + "]")
+            # a table that forgot the jitter falls back to the trait's 0
+            var h = f.base_qpos_jitter[i] if len(f.base_qpos_jitter) > 0 else 0.0
+            if T.base_qpos_jitter[D64](i) != h:
+                out.append("base_qpos_jitter[" + String(i) + "]")
     if T.GRIPPER_SITE != facts.gripper_site:
         out.append(
             "GRIPPER_SITE " + String(T.GRIPPER_SITE) + " vs scene "

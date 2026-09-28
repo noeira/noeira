@@ -25,10 +25,11 @@ target is a mocap body, so it is visible in the render as the thing the jaw
 should be touching.
 
 Run:
-    pixi run mojo run -I . examples/so101/sac_so_arm101_reach_eval_cpu.mojo
+    pixi run mojo run -I . examples/so101/sac_so_arm101_reach_eval_cpu.mojo --ckpt <run_id>
 """
 
 from std.random import seed
+from std.sys import argv
 
 from max.gpu.host import DeviceContext
 
@@ -37,6 +38,7 @@ from noeira.deep_agents.sac import SAC
 from noeira.envs.phyics3d_env import Phyics3dEnv
 from noeira.envs.robots.so_arm101_xml import SoArm101Model
 from noeira.envs.robots.so_arm101 import SoArm101ReachConfig
+from noeira.core.run import resolve_checkpoint
 
 
 comptime EnvT = Phyics3dEnv[
@@ -58,15 +60,27 @@ comptime MAX_STEPS = 500  # SoArmReachConfig.MAX_STEPS
 comptime FRAME_DELAY_MS = 16  # ~60 FPS playback
 
 
+def ckpt_from_argv(default: String) raises -> String:
+    """`--ckpt <run_id|path>`, else `default`. A RUN ID resolves to its
+    `checkpoints/last.ckpt` — what `sac_so_arm101_reach_training_gpu.mojo`
+    writes into its run directory."""
+    var args = argv()
+    for i in range(1, len(args) - 1):
+        if String(args[i]) == "--ckpt":
+            return resolve_checkpoint(String(args[i + 1]), String("last"))
+    return default
+
+
 def main() raises:
     seed(42)
+    var ckpt = ckpt_from_argv(String(CHECKPOINT_PATH))
     print("=" * 70)
     print("SAC — SO-ARM101 reach, CPU eval + 3D rendering")
     print("=" * 70)
     print("  OBS_DIM         =", OBS_DIM)
     print("  ACT_DIM         =", ACT_DIM, "(joint angles in RADIANS)")
     print("  action_scale    =", ACTION_SCALE)
-    print("  Checkpoint      =", CHECKPOINT_PATH)
+    print("  Checkpoint      =", ckpt)
     print("  Episodes        =", NUM_EPISODES)
     print("=" * 70)
 
@@ -76,7 +90,7 @@ def main() raises:
 
     print("Loading checkpoint...")
     try:
-        agent.load(CHECKPOINT_PATH)
+        agent.load(ckpt)
         print("Checkpoint loaded.")
     except e:
         print("ERROR loading checkpoint:", e)

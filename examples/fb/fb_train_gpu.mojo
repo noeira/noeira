@@ -66,6 +66,9 @@ from noeira.data.sampler import UniformDeviceSampler
 from noeira.core.dotenv import load_dotenv
 from noeira.core.logger import CsvLogger, RemoteLogger, CompositeLogger
 from noeira.core.run import RunContext, register_run
+from noeira.core.run_session import finish_run
+from noeira.io.artifact_sink import sink_for_run
+from noeira.deep_agents.training.checkpoint import announce_checkpoint
 from noeira.cuda import CUDAGraph, maybe_capture_replay
 from noeira.deep_agents.fb.trainer import FBTrainer, FBLosses
 from noeira.envs.phyics3d_env import Phyics3dEnv
@@ -529,6 +532,9 @@ def main() raises:
     # `/runs` payload carries the config, and a run that dies before its first
     # metric batch would otherwise never appear on the dashboard at all.
     register_run(run, logger)
+    # The uplink: `final` is uploaded (step_* only on request); None without
+    # a monitor in .env, and every call below is then a no-op.
+    var artifacts = sink_for_run(run.id, run.dir)
 
     # Lazily captured on the first non-logging step; replayed thereafter.
     var train_graph = Optional[CUDAGraph](None)
@@ -657,25 +663,25 @@ def main() raises:
 
             var names = List[String]()
             var vals = List[Float64]()
-            names.append(String("fb/measure")); vals.append(l.measure)
-            names.append(String("fb/ortho")); vals.append(l.ortho)
-            names.append(String("fb/actor")); vals.append(l.actor)
-            names.append(String("fb/f_norm")); vals.append(l.f_norm)
-            names.append(String("fb/b_norm")); vals.append(l.b_norm)
+            names.append(String("fb_measure_loss")); vals.append(l.measure)
+            names.append(String("fb_ortho_loss")); vals.append(l.ortho)
+            names.append(String("policy_loss")); vals.append(l.actor)
+            names.append(String("f_norm")); vals.append(l.f_norm)
+            names.append(String("b_norm")); vals.append(l.b_norm)
             # Derived, because reading the raw numbers needed hand arithmetic
             # three separate times during the last run:
             #   b_norm_deficit — the sqrt(d) pin is exact, so ANY deficit is the
             #     eps floor being approached. Alarm at > 0.11 (|B| < 11.2).
             #   ortho_Q — L_ortho = Q - 2*||B||^2. With |B| pinned the anchor is
             #     a constant, so Q is the part that carries information.
-            names.append(String("fb/b_norm_deficit"))
+            names.append(String("b_norm_deficit"))
             vals.append(SQRT_D - l.b_norm)
-            names.append(String("fb/ortho_Q"))
+            names.append(String("fb_ortho_q"))
             vals.append(l.ortho + 2.0 * l.b_norm * l.b_norm)
-            names.append(String("fb/grad_norm_f1")); vals.append(gn_f1)
-            names.append(String("fb/grad_norm_f2")); vals.append(gn_f2)
-            names.append(String("fb/grad_norm_b")); vals.append(gn_b)
-            names.append(String("perf/steps_per_s")); vals.append(sps)
+            names.append(String("f1_grad_norm")); vals.append(gn_f1)
+            names.append(String("f2_grad_norm")); vals.append(gn_f2)
+            names.append(String("b_grad_norm")); vals.append(gn_b)
+            names.append(String("steps_per_s")); vals.append(sps)
             logger.log_scalars(names, vals, step)
 
             print(
@@ -734,13 +740,13 @@ def main() raises:
             print("      checkpoint ->", p)
     var pf = run.checkpoint_path(String("final"))
     t.save_state(pf)
+    announce_checkpoint(pf, artifacts, run.dir)
     if obs_norm_on:
         onorm.save(pf + ".norm")
     # ⚠ Without this the tail of the buffer is lost — CsvLogger flushes at
     # `buffer_size`, so up to 63 entries (the most recent ones) would never
     # reach disk on a clean exit.
-    logger.close()
-    run.close()
+    finish_run(run, logger, artifacts)
     print("[3] done. final checkpoint ->", pf)
     print("      metrics CSV ->", run.metrics_path())
     print("      run record   ->", run.kv_path())

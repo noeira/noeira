@@ -231,6 +231,11 @@ bytes).
 
 ## Moving a project between machines
 
+:::note[Requires noeira cloud]
+[noeira cloud](/tooling/monitor/) is not open yet. To join the private beta,
+write to [denis@noeira.ai](mailto:denis@noeira.ai).
+:::
+
 `project-push` and `project-pull` move a project through
 [noeira cloud](/tooling/monitor/). They need `NOEIRA_CLOUD_URL` and
 `NOEIRA_CLOUD_API_KEY` (in the environment or `.env`) and the HTTP shim
@@ -275,10 +280,14 @@ it. Transfers are resumable — a file already present with the right digest is
 skipped.
 
 The usual flow on a rented GPU box is: `project-pull <name>`, train, then
-`project-push <name> <run_id>` to send the run's checkpoints home. See
-[Cloud GPU boxes](/project/cloud-gpu/).
+`project-push <name> <run_id>` to send the run's checkpoints home.
 
 ## Datasets
+
+:::note[Requires noeira cloud]
+[noeira cloud](/tooling/monitor/) is not open yet. To join the private beta,
+write to [denis@noeira.ai](mailto:denis@noeira.ai).
+:::
 
 Recordings live at `<projects root>/<project>/datasets/<dataset>/`. The
 recorders and the dataset tools resolve that path through

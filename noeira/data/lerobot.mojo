@@ -65,6 +65,8 @@ from noeira.io.hf import (
     repo_slug,
 )
 from noeira.io.image import resize_bilinear_pil
+from noeira.vision.calib_file import read_calib
+from noeira.vision.fisheye import FisheyeLens, Pinhole, UndistortMap
 from noeira.io.json import J_ARRAY, JsonDoc, load_json, parse_json
 from noeira.io.parquet import ParquetFile
 from noeira.io.video import VideoDecoder
@@ -772,8 +774,19 @@ def import_lerobot_v3(
     var env_id: String = String(""),
     var source_commit: String = String(""),
     verbose: Bool = True,
+    undistort_dir: String = String(""),
+    undistort_fovy: Float64 = 73.7398,
 ) raises:
     """Convert a downloaded LeRobot v3.0 dataset at `root` into `out_path`.
+
+    `undistort_dir` (optional): each camera's native frame is first brought
+    to the SIM's pinhole — `vision/fisheye.mojo`, fovy `undistort_fovy`
+    (the rig's `overhead_cam` / `wrist_cam`) at the native size — from
+    `<undistort_dir>/camera_<name>.txt`, `<name>` being the camera key's
+    last dotted part (`observation.images.overhead` -> `overhead`), THEN
+    resized as always. A calibration that is missing, not `fisheye`, of
+    another size, or whose map leaves the lens, is REFUSED: a store half in
+    one camera model and half in another is not a store.
 
     Writes to `<out_path>.tmp` and renames on success, so an interrupted run
     never leaves a half-built store where the next one would find it.
@@ -853,6 +866,40 @@ def import_lerobot_v3(
             + " rejected episode(s): " + names
         )
 
+    # ── the fisheye -> sim-pinhole maps, one per camera — checked BEFORE the
+    # store exists, so a missing calibration leaves no partial file ──────
+    var undistort = undistort_dir.byte_length() > 0
+    var maps = List[UndistortMap]()
+    var und = List[UInt8]()
+    var calib_paths = List[String]()
+    if undistort:
+        for c in range(len(info.cameras)):
+            var key = String(info.cameras[c])
+            var parts = key.split(".")
+            var short = String(parts[len(parts) - 1])
+            var cp = undistort_dir + "/camera_" + short + ".txt"
+            if not exists(cp):
+                raise Error(
+                    "lerobot: --undistort needs " + cp + " for camera '" + key
+                    + "' (examples/vision/calibrate_fisheye.mojo --name " + short
+                    + ")"
+                )
+            var cal = read_calib(cp)
+            var lens = FisheyeLens.from_calib(cal)
+            var um = UndistortMap(
+                lens, Pinhole.sim(undistort_fovy, cal.width, cal.height)
+            )
+            if um.n_outside > 0:
+                raise Error(
+                    "lerobot: " + cp + ": " + String(um.n_outside) + " pixels of"
+                    " the " + String(undistort_fovy) + "-degree pinhole fall"
+                    " outside the lens — they would be black in every frame"
+                )
+            if verbose:
+                print("      undistort " + key + ": " + String(lens))
+            maps.append(um^)
+            calib_paths.append(cp)
+
     # ── store ─────────────────────────────────────────────────────────
     var n_cam = len(info.cameras)
     var cam_elems = 3 * height * width
@@ -907,6 +954,15 @@ def import_lerobot_v3(
             + (String(free // 1_000_000_000) + " GB free" if free >= 0 else "free space unknown")
         )
 
+    if undistort_dir.byte_length() > 0:
+        # ⚠ IN THE MANIFEST, so a store says which camera model its pixels
+        # are in — a raw-fisheye store and an undistorted one have the same
+        # columns and shapes and nothing else would tell them apart.
+        source_commit += (
+            " | images undistorted fisheye -> sim pinhole fovy "
+            + String(undistort_fovy) + " (vision/fisheye.mojo) from "
+            + undistort_dir + "/camera_<name>.txt"
+        )
     var w = TrajectoryStoreWriter(
         String(tmp), columns^, env_id^, 0, source_commit^
     )
@@ -947,8 +1003,25 @@ def import_lerobot_v3(
             var g = index.from_index[e] + t
             for c in range(n_cam):
                 streams[c].next_native()
+                var src_ptr = _uptr(streams[c].raw)
+                if undistort:
+                    if (
+                        streams[c].width != maps[c].src_w
+                        or streams[c].height != maps[c].src_h
+                    ):
+                        raise Error(
+                            "lerobot: camera '" + String(info.cameras[c])
+                            + "' decodes at " + String(streams[c].width) + "x"
+                            + String(streams[c].height) + ", " + calib_paths[c]
+                            + " was measured at " + String(maps[c].src_w) + "x"
+                            + String(maps[c].src_h)
+                        )
+                    if len(und) != len(streams[c].raw):
+                        und = List[UInt8](length=len(streams[c].raw), fill=0)
+                    maps[c].apply_hwc(streams[c].raw, 0, 3, und, 0)
+                    src_ptr = _uptr(und)
                 resize_bilinear_pil(
-                    _uptr(streams[c].raw),
+                    src_ptr,
                     streams[c].height,
                     streams[c].width,
                     _uptr(hwc),

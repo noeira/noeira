@@ -8,7 +8,8 @@ model + agent training and periodically reports a GREEDY-EVAL return.
 Tokenizer recon uses MSE + 0.2·perceptual (paper eq. 5), the perceptual term
 against the frozen CIFAR ResNet-20 backbone trained by
 `examples/dreamer4/train_perceptual_backbone_cifar_gpu.mojo` — this file loads
-`dreamer4_perceptual_backbone.ckpt` from the working directory.
+`dreamer4_perceptual_backbone.ckpt` from the working directory, or the
+backbone run's `checkpoints/backbone.ckpt` with `--ckpt <run_id>`.
 
 DYN_TARGET="gpu": the dynamics transformer AND the tokenizer run on device (the
 heavy compute); the heads, task embedder, perceptual backbone, and the env stay on
@@ -17,10 +18,13 @@ a bigger box.
 
 Run (NVIDIA): pixi run -e nvidia mojo run -I . examples/car_racing/dreamer4_car_racing_online.mojo
 Run (Apple):  pixi run -e apple  mojo run -I . examples/car_racing/dreamer4_car_racing_online.mojo
+Backbone from a run: ... dreamer4_car_racing_online.mojo --ckpt <run_id>
 """
 
 from std.random import seed
 
+from std.sys import argv
+from noeira.core.run import resolve_checkpoint
 from max.gpu.host import DeviceContext
 
 from noeira.nn.constants import DT
@@ -33,6 +37,17 @@ from noeira.deep_agents.dreamer4.agent import Dreamer4Agent
 from noeira.deep_agents.dreamer4.tokenizer import Dreamer4Tokenizer
 from noeira.deep_agents.dreamer4.online import run_online_dreamer4
 from noeira.envs.car_racing.car_racing_mb import CarRacingMB
+
+
+def _flag(name: String, dflt: String) raises -> String:
+    """Value of `--name X`, or `dflt` when the flag is absent."""
+    var av = argv()
+    for i in range(1, len(av)):
+        if String(av[i]) == name:
+            if i + 1 >= len(av):
+                raise Error("flag " + name + " needs a value")
+            return String(av[i + 1])
+    return dflt
 
 
 def main() raises:
@@ -113,11 +128,13 @@ def main() raises:
     ].make["gpu", Xavier](Optional(ctx))       # tokenizer runs on device too
 
     # Frozen perceptual backbone (CIFAR ResNet-20). Trained separately; loaded
-    # here from the working directory.
+    # from the working directory, or from the run/file given by `--ckpt`.
     var backbone = CifarBackbone[TGT, TGT].make["gpu", Xavier](Optional(ctx))
-    load_params["gpu"](
-        backbone, String("dreamer4_perceptual_backbone.ckpt"), Optional(ctx)
+    var backbone_ckpt = resolve_checkpoint(
+        _flag(String("--ckpt"), String("dreamer4_perceptual_backbone.ckpt")),
+        String("backbone"),
     )
+    load_params["gpu"](backbone, backbone_ckpt, Optional(ctx))
     print("loaded perceptual backbone (GPU)")
 
     # Remote logger config from a .env (NOEIRA_CLOUD_URL / NOEIRA_CLOUD_API_KEY), the

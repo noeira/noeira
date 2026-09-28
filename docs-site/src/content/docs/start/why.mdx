@@ -1,6 +1,6 @@
 ---
 title: Why noeira
-description: Why build the whole Physical AI loop — physics, learning, perception and deployment — in one language instead of stitching MuJoCo, PyTorch, LeRobot and a robot SDK together.
+description: Why build the whole Physical AI loop — physics, learning, perception and deployment — in one language instead of stitching a simulator, a deep-learning framework, a robot-learning library and a robot SDK together.
 ---
 
 import { Card, CardGrid } from '@astrojs/starlight/components';
@@ -46,13 +46,13 @@ libraries, but as one codebase the compiler sees whole:
 
 - a **physics engine** in MuJoCo's generalized coordinates, loading MJCF and
   checked against live MuJoCo;
-- **task suites** — DeepMind Control, LIBERO, the SO-101 families — on a
-  declarative task layer that batches many tasks in one scene;
+- **task suites and benchmarks** on a declarative task layer that batches
+  many tasks in one scene;
 - **learning** — reinforcement learning, world models, imitation and
   vision-language-action policies — on a deep-learning framework written in
   the same language;
-- the **real-world side** — the servo bus, cameras, calibration, recording
-  to LeRobot datasets — and the **deployment** runtime on a Jetson.
+- the **real-world side** — servo buses, cameras, calibration, recording
+  datasets — and the **deployment** runtime on the robot's own computer.
 
 In simulation, the whole training loop can live on the GPU — environment step,
 observation, network forward and backward, replay sample, target update — with
@@ -70,7 +70,7 @@ trained: the same modules, the same normalisation file, the same preprocessing.
 	</Card>
 	<Card title="Native GPU" icon="setting">
 		Custom kernels target CUDA and Metal from the same source, from a
-		workstation GPU to a Jetson Orin.
+		workstation GPU to an embedded board on the robot.
 	</Card>
 	<Card title="Compile-time specialization" icon="puzzle">
 		Dimensions, network architectures and environments are type parameters, so
@@ -85,12 +85,13 @@ trained: the same modules, the same normalisation file, the same preprocessing.
   from a replay buffer that was never copied to the host. On NVIDIA the loop
   can also be captured as a CUDA graph and replayed — worth roughly **1.4×** on
   SAC.
-- **One policy, two computers.** ACT trains on a GPU box and runs its closed
-  loop on a Jetson Orin NX at **30 Hz**, through the same modules and the same
-  normalisation file.
+- **One policy, two computers.** A policy trains on a GPU box and runs on the
+  robot's computer through the same modules and the same normalisation file —
+  ACT, for example, closes its loop at **30 Hz** on a Jetson Orin NX.
 - **Datasets without a Python dependency.** Teleoperated episodes are written
-  as LeRobot v3 datasets (Parquet, H.264 video) and pushed to the Hugging Face
-  Hub natively, and read back into training the same way.
+  in the LeRobot v3 format (Parquet, H.264 video) — a format, not a
+  dependency: noeira reads, writes and pushes it to the Hugging Face Hub
+  natively, and reads it back into training the same way.
 
 ## What this is not
 
@@ -112,6 +113,6 @@ landing next.
 
 ## Next
 
-- [Installation](/start/installation/) — pixi, the GPU targets and the Jetson
+- [Installation](/start/installation/) — pixi, the GPU targets and embedded boards
 - [The stack](/concepts/architecture/) — how the pieces fit together
 - [RL in five minutes](/start/rl-in-five-minutes/) — if the vocabulary above was new

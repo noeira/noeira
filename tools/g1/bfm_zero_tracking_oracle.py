@@ -197,8 +197,29 @@ class Protocol:
             )
             inp = self.sess.get_inputs()[0]
             assert list(inp.shape) == [1, ACTOR_OBS_DIM], inp.shape
-        if self.released is not None and (self.released / "humanoidverse_tracking_eval.csv").exists():
-            self.csv = self._read_csv(self.released / "humanoidverse_tracking_eval.csv")
+        csv_path = (
+            self.released / "humanoidverse_tracking_eval.csv"
+            if self.released is not None
+            else None
+        )
+        if csv_path is not None and csv_path.exists():
+            self.csv = self._read_csv(csv_path)
+        else:
+            # ⚠ SAY SO. Without this the comparison columns print `nan / nan
+            # (0)` for every clip, which reads like a join failure against the
+            # released CSV rather than the file being absent — and that is
+            # exactly how it was misread once (docs §12.32). `references/` is
+            # a SYMLINK excluded from git (`.git/info/exclude`), so a fresh
+            # checkout on a rented box has no reference data at all.
+            print(
+                "  ⚠ released tracking CSV NOT FOUND at "
+                + str(csv_path)
+                + "\n    the MuJoCo / Isaac comparison columns will be EMPTY"
+                " (`nan / nan (0)`) — this is a MISSING FILE, not a"
+                " disagreement.\n    `references/` is a symlink excluded from"
+                " git; copy it to the box, or score with `--out <file>` and"
+                " join against the CSV where it lives."
+            )
 
     @staticmethod
     def _read_csv(path):
@@ -414,6 +435,20 @@ class Tally:
             s += f"  | Isaac (released) {float(ref['distance']):.3f} / {float(ref['emd']):.3f}"
         return s
 
+    def _col(self, c, column):
+        """One comparison column, or `absent` when no row was found.
+
+        `nan / nan (0)` is indistinguishable from a broken join; say which it
+        is, at the only place a reader looks.
+        """
+        n = self.count(c, column)
+        if n == 0:
+            return "absent"
+        return (
+            f"{self.mean(c, column=column):.3f} /"
+            f" {self.mean(c, 'emd', column):.3f} ({n})"
+        )
+
     def mean(self, clip, key="distance", column="ours"):
         vals = []
         for c, s, m, ref, mj in self.rows:
@@ -451,8 +486,8 @@ class Tally:
         return (
             f"  MEAN clip {c} {self.proto.keys[c]} over {self.count(c)} segments:"
             f"  ours distance {self.mean(c):.3f} emd {self.mean(c, 'emd'):.3f}"
-            f"  | MuJoCo {self.mean(c, column='mujoco'):.3f} / {self.mean(c, 'emd', 'mujoco'):.3f} ({self.count(c, 'mujoco')})"
-            f"  | Isaac (released) {self.mean(c, column='isaac'):.3f} / {self.mean(c, 'emd', 'isaac'):.3f} ({self.count(c, 'isaac')})"
+            f"  | MuJoCo {self._col(c, 'mujoco')}"
+            f"  | Isaac (released) {self._col(c, 'isaac')}"
         )
 
 

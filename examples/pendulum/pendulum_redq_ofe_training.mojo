@@ -32,6 +32,10 @@ HIDDEN=64, PER_UNIT=8):
 from std.random import seed
 
 from noeira.nn.constants import DT
+from noeira.core.run import RunContext, register_run
+from noeira.core.run_session import RunLogger, finish_run, run_logger
+from noeira.io.artifact_sink import sink_for_run
+from noeira.deep_agents.training.checkpoint import announce_checkpoint
 from noeira.deep_agents.redq_ofe import REDQOFE6
 from noeira.envs.pendulum import PendulumEnv
 
@@ -70,11 +74,29 @@ def main() raises:
     )
     var env = PendulumEnv[DT]()
 
-    var ep_returns = agent.train_single(
+    # ─── Run: one directory per run, and the monitor row shares its id ────
+    var run = RunContext(
+        project=String("classic-control"),
+        driver=String("examples/pendulum/pendulum_redq_ofe_training.mojo"),
+        slug=String("redq-ofe-pendulum"),
+        env=String("builtin:classic-control/pendulum"),
+    )
+    var logger = run_logger(run)
+    logger.set_config("algorithm", "REDQ-OFE")
+    logger.set_config("per_unit", String(PER_UNIT))
+    logger.set_config("hidden", String(HIDDEN))
+    logger.set_config("batch", String(BATCH))
+    register_run(run, logger)
+    var artifacts = sink_for_run(run.id, run.dir)
+    var logger_ptr = Pointer(to=logger).as_unsafe_any_origin()
+    print("Run:", run.dir)
+
+    var ep_returns = agent.train_single[L=RunLogger](
         env,
         total_timesteps=TOTAL_TIMESTEPS,
         print_every=1_000,
         verbose=True,
+        logger=logger_ptr,
     )
 
     print("=" * 70)
@@ -93,10 +115,18 @@ def main() raises:
         print("EARLY — still exploring (<-1000).")
     print("=" * 70)
 
-    # Optional follow-up: save the agent + eval greedy.
-    var ckpt = String("/tmp/pendulum_redqofe6.bin")
+    # The checkpoint lands in the run, and is uploaded if a monitor is set.
+    var ckpt = run.checkpoint_path(String("last"))
     agent.save(ckpt)
+    announce_checkpoint(ckpt, artifacts, run.dir)
     print("Saved checkpoint to:", ckpt)
 
     var eval_mean = agent.eval(env, num_episodes=5)
     print("Greedy eval mean return (5 eps):", eval_mean)
+    finish_run(
+        run, logger, artifacts,
+        String("eval_return=") + String(eval_mean)
+        + " mean_return_10=" + String(final_mean),
+    )
+    _ = logger  # lifetime extender for logger_ptr
+    print("Run record:", run.kv_path())

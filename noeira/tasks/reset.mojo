@@ -34,6 +34,7 @@ lives (`spec.SlotSpec`) and cannot be moved at reset. Asking for its address
 raises rather than returning something that looks like an address.
 """
 
+from std.math import cos, sin
 from .spec import FamilySpec, TaskSpec, SLOT_FREE, SLOT_STATIC
 from .sampler import Placement
 from .family import park_pos
@@ -106,9 +107,11 @@ def free_slot_addresses(
 @always_inline
 def write_free_pose(
     mut qpos: List[Float64], qadr: Int,
-    x: Float64, y: Float64, z: Float64,
+    x: Float64, y: Float64, z: Float64, yaw: Float64 = 0.0,
 ):
-    """A free joint's seven `qpos`: position, then an IDENTITY quaternion.
+    """A free joint's seven `qpos`: position, then a quaternion — the IDENTITY
+    unless `yaw` (about +z, an init's `:yaw` draw) says otherwise; yaw 0
+    writes exactly (1, 0, 0, 0).
 
     ⚠ SPELLED OUT, NOT A LOOP, because the seven words are not
     interchangeable — three are a position and four are a quaternion whose
@@ -124,10 +127,10 @@ def write_free_pose(
     qpos[qadr + 0] = x
     qpos[qadr + 1] = y
     qpos[qadr + 2] = z
-    qpos[qadr + 3] = 1.0
+    qpos[qadr + 3] = cos(0.5 * yaw)
     qpos[qadr + 4] = 0.0
     qpos[qadr + 5] = 0.0
-    qpos[qadr + 6] = 0.0
+    qpos[qadr + 6] = sin(0.5 * yaw)
 
 
 @always_inline
@@ -276,7 +279,8 @@ def reset_slots(
             if placed[p].slot == si:
                 active = True
                 write_free_pose(
-                    qpos, a.qadr, placed[p].x, placed[p].y, placed[p].z
+                    qpos, a.qadr, placed[p].x, placed[p].y, placed[p].z,
+                    placed[p].yaw,
                 )
                 break
         if not active:

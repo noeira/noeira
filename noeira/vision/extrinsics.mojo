@@ -327,3 +327,151 @@ def fit_rigid(
     var rms_mm = sqrt(sq_sum / Float64(n)) * 1000.0
 
     return RigidFit(rot, trans, rms_mm, max_mm, worst, n, spread^)
+
+
+# ── the marker's offset, solved WITH the camera ─────────────────────────────
+
+
+comptime MIN_ROT_SPREAD_DEG = 10.0
+"""Below this rotational spread of the gripper over the captured poses the
+marker offset is not determined — see `fit_rigid_with_offset`."""
+
+
+@fieldwise_init
+struct OffsetFit(Copyable, Movable, Writable):
+    """`fit_rigid` with the marker offset estimated rather than measured."""
+
+    var fit: RigidFit
+    """The camera -> base fit at the solved offset."""
+    var offset: Vec3d
+    """The marker centre in the GRIPPER body's frame, metres."""
+    var rot_spread_deg: Float64
+    """How much the gripper's orientation varied over the poses: the RMS
+    angle about its LEAST-varied axis, degrees (see the function)."""
+    var iterations: Int
+
+    def write_to(self, mut writer: Some[Writer]):
+        writer.write(
+            self.fit, "  offset  ", self.offset.x, " ", self.offset.y, " ",
+            self.offset.z, " m (solved, gripper frame)\n  wrist   ",
+            self.rot_spread_deg, " deg rotational spread (least-varied axis), ",
+            self.iterations, " iterations\n",
+        )
+
+
+def fit_rigid_with_offset(
+    cam_xyz: List[Float64],
+    grip_pos: List[Float64],
+    grip_rot: List[Float64],
+    max_iter: Int = 500,
+    tol_m: Float64 = 1e-9,
+) raises -> OffsetFit:
+    """Solve the camera -> base transform AND the marker's offset on the
+    gripper, from `n` poses: `cam_xyz` the marker in the camera (flat, 3 per
+    pose), `grip_pos` / `grip_rot` the gripper body's FK position (flat, 3)
+    and rotation (flat, 9, row-major) in the base frame.
+
+    ⚠⚠ WHY: `--offset` is a hand measurement of the marker centre in the
+    gripper body's frame — a frame with no visible origin — and a 10 mm error
+    there is ~10 mm of error in the result that no number of poses averages
+    away (the tool's header). But the offset is DETERMINED by the data once
+    the wrist turns: the marker sits at `t_i + R_i * off` in the base frame,
+    and a different `off` moves that point differently for each `R_i`.
+
+    Block coordinate descent on the one least-squares objective
+    `sum |R c_i + T - t_i - R_i off|^2`, each block exact:
+      * `off` fixed: Kabsch (`fit_rigid`) gives R, T;
+      * R, T fixed: `R_i` is orthogonal, so `off = mean(R_i^T (R c_i + T - t_i))`.
+    Monotone, from `off = 0`.
+
+    ⚠ REFUSED WITHOUT ROTATION. If every `R_i` is the same, `R_i off` is a
+    constant that `T` absorbs and `off` is anything. The spread is the
+    smallest eigenvalue of `sum (R_i - Rbar)^T (R_i - Rbar)`, per pose, as an
+    angle; below `MIN_ROT_SPREAD_DEG` the call raises — turn the wrist
+    (roll AND pitch) between captures. Three more unknowns also mean the
+    residual reads LOWER than with a measured offset; it needs more poses to
+    mean the same thing (the tool asks for 10)."""
+    var n = len(cam_xyz) // 3
+    if len(grip_pos) != n * 3 or len(grip_rot) != n * 9:
+        raise String("fit_rigid_with_offset: pose lists do not match")
+    if n < MIN_POINTS + 2:
+        raise String("fit_rigid_with_offset: need at least ") + String(MIN_POINTS + 2) + " poses"
+
+    # ── is the offset determined at all? ────────────────────────────────
+    var rbar = List[Float64](length=9, fill=0.0)
+    for k in range(n):
+        for e in range(9):
+            rbar[e] += grip_rot[k * 9 + e] / Float64(n)
+    var dmat = List[Float64](length=9, fill=0.0)
+    for k in range(n):
+        for i in range(3):
+            for j in range(3):
+                var acc = 0.0
+                for r in range(3):
+                    acc += (grip_rot[k * 9 + r * 3 + i] - rbar[r * 3 + i]) * (
+                        grip_rot[k * 9 + r * 3 + j] - rbar[r * 3 + j]
+                    )
+                dmat[i * 3 + j] += acc
+    var u9 = List[Float64]()
+    var s3 = List[Float64]()
+    var vt9 = List[Float64]()
+    svd_3x3(dmat, u9, s3, vt9)
+    var lmin = min(s3[0], min(s3[1], s3[2]))
+    # for small rotations |R_i - Rbar|^2 about an axis ~ 2 theta^2 per
+    # off-axis direction; sqrt(lmin / n) is that theta in radians
+    var spread_deg = sqrt(max(lmin, 0.0) / Float64(n)) * 180.0 / 3.141592653589793
+    if spread_deg < MIN_ROT_SPREAD_DEG:
+        raise (
+            String("fit_rigid_with_offset: the gripper barely rotated (")
+            + String(spread_deg) + " deg about its least-varied axis, need "
+            + String(MIN_ROT_SPREAD_DEG)
+            + ") — the marker offset is undetermined. Turn the wrist (roll AND"
+            " pitch) between captures, or pass a measured --offset."
+        )
+
+    # ── alternate ───────────────────────────────────────────────────────
+    var off = Vec3d.zero()
+    var base = List[Float64](length=n * 3, fill=0.0)
+    var it = 0
+    while it < max_iter:
+        it += 1
+        for k in range(n):
+            var rk = Mat3d(
+                grip_rot[k * 9], grip_rot[k * 9 + 1], grip_rot[k * 9 + 2],
+                grip_rot[k * 9 + 3], grip_rot[k * 9 + 4], grip_rot[k * 9 + 5],
+                grip_rot[k * 9 + 6], grip_rot[k * 9 + 7], grip_rot[k * 9 + 8],
+            )
+            var b = Vec3d(grip_pos[k * 3], grip_pos[k * 3 + 1], grip_pos[k * 3 + 2]) + rk * off
+            base[k * 3] = b.x
+            base[k * 3 + 1] = b.y
+            base[k * 3 + 2] = b.z
+        var fit_i = fit_rigid(cam_xyz, base)
+        var acc = Vec3d.zero()
+        for k in range(n):
+            var rk = Mat3d(
+                grip_rot[k * 9], grip_rot[k * 9 + 1], grip_rot[k * 9 + 2],
+                grip_rot[k * 9 + 3], grip_rot[k * 9 + 4], grip_rot[k * 9 + 5],
+                grip_rot[k * 9 + 6], grip_rot[k * 9 + 7], grip_rot[k * 9 + 8],
+            )
+            var y = fit_i.apply(Vec3d(cam_xyz[k * 3], cam_xyz[k * 3 + 1], cam_xyz[k * 3 + 2])) - Vec3d(
+                grip_pos[k * 3], grip_pos[k * 3 + 1], grip_pos[k * 3 + 2]
+            )
+            acc = acc + rk.transpose() * y
+        var new_off = acc / Float64(n)
+        var step = Float64((new_off - off).length())
+        off = new_off
+        if step < tol_m:
+            break
+    # the final fit AT the converged offset
+    for k in range(n):
+        var rk = Mat3d(
+            grip_rot[k * 9], grip_rot[k * 9 + 1], grip_rot[k * 9 + 2],
+            grip_rot[k * 9 + 3], grip_rot[k * 9 + 4], grip_rot[k * 9 + 5],
+            grip_rot[k * 9 + 6], grip_rot[k * 9 + 7], grip_rot[k * 9 + 8],
+        )
+        var b = Vec3d(grip_pos[k * 3], grip_pos[k * 3 + 1], grip_pos[k * 3 + 2]) + rk * off
+        base[k * 3] = b.x
+        base[k * 3 + 1] = b.y
+        base[k * 3 + 2] = b.z
+    var fit = fit_rigid(cam_xyz, base)
+    return OffsetFit(fit^, off, spread_deg, it)

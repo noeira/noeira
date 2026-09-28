@@ -1,0 +1,163 @@
+---
+/**
+ * HilSerlReplay — one replay, a pinned prefix, and where the prefix's rows
+ * come from.
+ *
+ * The left half is RLPD's sampling as `pin_demo_prefix` implements it: the
+ * demo rows sit at the front of SAC's own replay and the ring wraps past them,
+ * so every minibatch is half demonstration for the whole run. The right half is
+ * a DAgger round, which happens between runs: a checkpoint drives, the expert
+ * takes over near the brick, and the takeover rows go into the next run's
+ * `--demos`. The return edge is dashed because it crosses a run boundary — no
+ * human or expert is ever inside the training loop.
+ */
+
+const CELL = 22;
+const GAP = 2;
+const STRIP_Y = 70;
+const STRIP_H = 40;
+
+const PREFIX_X = 40;
+const PREFIX_N = 8;
+const RING_X = PREFIX_X + PREFIX_N * (CELL + GAP) + 8;
+const RING_N = 13;
+const RING_END = RING_X + RING_N * (CELL + GAP) - GAP;
+const PREFIX_END = PREFIX_X + PREFIX_N * (CELL + GAP) - GAP;
+
+/** The minibatch, two halves. */
+const MB = { x: 220, y: 176, w: 280, h: 44 };
+const MB_MID = MB.x + MB.w / 2;
+
+/** DAgger column. */
+const DG_X = 620;
+const DG_W = 240;
+const DG_MID = DG_X + DG_W / 2;
+
+const STRIP_MID = STRIP_Y + STRIP_H / 2;
+---
+
+<figure class="diagram not-content">
+	<svg viewBox="0 0 880 430" role="img"
+		aria-label="HIL-SERL: demonstration rows are pinned at the front of SAC's replay while online rows wrap in a ring behind them; every minibatch is half demonstration and half online; the SAC update adds a behaviour-cloning term on the demo half; between runs, a DAgger round lets a checkpoint drive until the expert takes over, and the flagged rows feed the next run">
+		<defs>
+			<marker id="hs-cyan" viewBox="0 0 10 10" refX="9" refY="5"
+				markerWidth="6" markerHeight="6" orient="auto-start-reverse">
+				<path d="M 0 0 L 10 5 L 0 10 z" class="dg-fill-cyan" />
+			</marker>
+			<marker id="hs-spark" viewBox="0 0 10 10" refX="9" refY="5"
+				markerWidth="6" markerHeight="6" orient="auto-start-reverse">
+				<path d="M 0 0 L 10 5 L 0 10 z" class="dg-fill-spark" />
+			</marker>
+			<marker id="hs-green" viewBox="0 0 10 10" refX="9" refY="5"
+				markerWidth="6" markerHeight="6" orient="auto-start-reverse">
+				<path d="M 0 0 L 10 5 L 0 10 z" class="dg-fill-green" />
+			</marker>
+			<marker id="hs-purple" viewBox="0 0 10 10" refX="9" refY="5"
+				markerWidth="6" markerHeight="6" orient="auto-start-reverse">
+				<path d="M 0 0 L 10 5 L 0 10 z" class="dg-fill-purple" />
+			</marker>
+		</defs>
+
+		<!-- ── the replay: pinned prefix + online ring ────────────────── -->
+		<text x={PREFIX_X} y={STRIP_Y - 14} class="dg-label dg-label--green">pinned demos [0, n)</text>
+		<text x={RING_X} y={STRIP_Y - 14} class="dg-label dg-label--cyan">online ring — wraps past the prefix</text>
+		{
+			Array.from({ length: PREFIX_N }, (_, k) => (
+				<rect class="dg-fill-green" x={PREFIX_X + k * (CELL + GAP)} y={STRIP_Y}
+					width={CELL} height={STRIP_H} rx="3" opacity="0.75" />
+			))
+		}
+		{
+			Array.from({ length: RING_N }, (_, k) => (
+				<rect class="dg-fill-cyan" x={RING_X + k * (CELL + GAP)} y={STRIP_Y}
+					width={CELL} height={STRIP_H} rx="3" opacity="0.45" />
+			))
+		}
+		<!-- the ring's wrap: from its end back to its start, never into the prefix -->
+		<path class="dg-edge dg-edge--cyan dg-edge--dashed" marker-end="url(#hs-cyan)"
+			d={`M ${RING_END - 8} ${STRIP_Y + STRIP_H + 4} L ${RING_END - 8} ${STRIP_Y + STRIP_H + 18}
+				L ${RING_X + 10} ${STRIP_Y + STRIP_H + 18} L ${RING_X + 10} ${STRIP_Y + STRIP_H + 6}`} />
+
+		<!-- online rows arrive from the batched env -->
+		<g class="dg-node dg-node--cyan">
+			<rect x={DG_X} y={STRIP_Y - 10} width={DG_W} height="60" rx="10" />
+			<text x={DG_MID} y={STRIP_Y + 14} class="dg-title">batched GPU lanes</text>
+			<text x={DG_MID} y={STRIP_Y + 35} class="dg-sub">SAC acting, online</text>
+		</g>
+		<path class="dg-edge dg-edge--cyan" marker-end="url(#hs-cyan)"
+			d={`M ${DG_X} ${STRIP_MID} L ${RING_END + 4} ${STRIP_MID}`} />
+
+		<!-- the demo files, loaded before the first step -->
+		<g class="dg-node dg-node--green">
+			<rect x="20" y="196" width="170" height="68" rx="10" />
+			<text x="105" y="224" class="dg-title">.demo files</text>
+			<text x="105" y="246" class="dg-sub">expert · teleop · DAgger</text>
+		</g>
+		<path class="dg-edge dg-edge--green" marker-end="url(#hs-green)"
+			d={`M 60 196 L 60 ${STRIP_Y + STRIP_H + 4}`} />
+		<text x="70" y="170" class="dg-caption" style="text-anchor:start">before step 1</text>
+
+		<!-- ── the minibatch: half and half ───────────────────────────── -->
+		<path class="dg-edge dg-edge--green" marker-end="url(#hs-green)"
+			d={`M ${PREFIX_END - 30} ${STRIP_Y + STRIP_H + 4} L ${PREFIX_END - 30} 150
+				L ${MB.x + MB.w / 4} 150 L ${MB.x + MB.w / 4} ${MB.y - 2}`} />
+		<path class="dg-edge dg-edge--cyan" marker-end="url(#hs-cyan)"
+			d={`M ${MB.x + (3 * MB.w) / 4} ${STRIP_Y + STRIP_H + 4} L ${MB.x + (3 * MB.w) / 4} ${MB.y - 2}`} />
+
+		<g class="dg-node dg-node--green">
+			<rect x={MB.x} y={MB.y} width={MB.w / 2} height={MB.h} rx="8" />
+			<text x={MB.x + MB.w / 4} y={MB.y + 28} class="dg-sub">BATCH / 2 demo</text>
+		</g>
+		<g class="dg-node dg-node--cyan">
+			<rect x={MB_MID} y={MB.y} width={MB.w / 2} height={MB.h} rx="8" />
+			<text x={MB.x + (3 * MB.w) / 4} y={MB.y + 28} class="dg-sub">BATCH / 2 online</text>
+		</g>
+
+		<path class="dg-edge dg-edge--spark" marker-end="url(#hs-spark)"
+			d={`M ${MB_MID} ${MB.y + MB.h} L ${MB_MID} 268`} />
+		<g class="dg-node dg-node--spark">
+			<rect x="210" y="270" width="300" height="84" rx="10" />
+			<text x={MB_MID} y="298" class="dg-title">SAC update</text>
+			<text x={MB_MID} y="320" class="dg-sub">critics and actor on every row</text>
+			<text x={MB_MID} y="340" class="dg-sub">+ λ · BC on the demo half</text>
+		</g>
+
+		<!-- ── a DAgger round, between runs ───────────────────────────── -->
+		<text x={DG_MID} y="160" class="dg-caption">DAgger round, between runs</text>
+		<g class="dg-node dg-node--purple">
+			<rect x={DG_X} y="172" width={DG_W} height="58" rx="10" />
+			<text x={DG_MID} y="196" class="dg-title">checkpoint drives</text>
+			<text x={DG_MID} y="217" class="dg-sub">greedy, fresh placements</text>
+		</g>
+		<path class="dg-edge dg-edge--purple" marker-end="url(#hs-purple)"
+			d={`M ${DG_MID} 230 L ${DG_MID} 248`} />
+		<g class="dg-node dg-node--spark">
+			<rect x={DG_X} y="250" width={DG_W} height="58" rx="10" />
+			<text x={DG_MID} y="274" class="dg-title">handover</text>
+			<text x={DG_MID} y="295" class="dg-sub">jaw within 36 mm, arm settled</text>
+		</g>
+		<path class="dg-edge dg-edge--spark" marker-end="url(#hs-spark)"
+			d={`M ${DG_MID} 308 L ${DG_MID} 326`} />
+		<g class="dg-node dg-node--green">
+			<rect x={DG_X} y="328" width={DG_W} height="58" rx="10" />
+			<text x={DG_MID} y="352" class="dg-title">expert closes, lifts</text>
+			<text x={DG_MID} y="373" class="dg-sub">rows flagged INTERVENED</text>
+		</g>
+
+		<path class="dg-edge dg-edge--green dg-edge--dashed" marker-end="url(#hs-green)"
+			d={`M ${DG_MID} 386 L ${DG_MID} 406 L 105 406 L 105 266`} />
+		<text x="360" y="398" class="dg-label dg-label--green">the next run's --demos</text>
+	</svg>
+
+	<figcaption class="diagram__legend">
+		<span class="diagram__key diagram__key--green">demonstration rows</span>
+		<span class="diagram__key diagram__key--cyan">online rows</span>
+		<span class="diagram__key diagram__key--spark">learning update / takeover</span>
+		<span class="diagram__key diagram__key--purple">trained checkpoint</span>
+	</figcaption>
+
+	<div class="diagram__formula">
+		<span class="diagram__formula-title">actor loss, with the BC term</span>
+		<code>L_π = E[ α log π(a|s) − Q(s, a) ]  +  λ · E_demo[ | tanh μ(s) − a_demo | ]</code>
+	</div>
+</figure>

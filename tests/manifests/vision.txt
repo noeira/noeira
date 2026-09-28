@@ -53,3 +53,35 @@ tests/vision/test_extrinsics_kabsch.mojo
 # looks entirely reasonable, and was undetectable in the six-float file this
 # replaces. Needs no shim, no camera, no fixture.
 tests/vision/test_calib_file.mojo
+# The fisheye -> sim-pinhole path (`vision/fisheye.mojo`, `fisheye_calib.mojo`):
+# the Mojo lens model and undistortion map against cv::fisheye, the target
+# pinhole against the TRACER's own camera ray, a synthetic 170-degree
+# calibration recovered (with a control that the lens terms matter and a check
+# that the bootstrap spread tracks the true error), the remap. ⚠ NOT bit
+# equality like the entries above: the model is a PORT (float tolerances, each
+# stated in the file), and the calibration is a fit.
+tests/vision/test_fisheye.mojo
+# The extrinsics path for the rig's fisheye cameras: marker corners
+# undistorted through the lens then a K=I solve_pnp (vs raw pixels as a
+# pinhole, the control), and the measured-vs-sim comparison — the tower's own
+# `overhead_cam` must come back as the asset's `<camera pos xyaxes>` at 0 mm
+# / 0 deg, and a known perturbation as itself.
+tests/vision/test_extrinsics_fisheye.mojo
+# The marker offset solved with the camera (`fit_rigid_with_offset`): exact
+# noise-free, within 3 mm / 0.5 deg at 1 mm of marker noise, a zero-offset fit
+# on the same data > 20 mm off (the control), and a wrist turned about ONE
+# axis refused rather than answered.
+tests/vision/test_extrinsics_offset.mojo
+# The tabletop pose estimator (`vision/tabletop_pose.mojo`: colour mask ->
+# component -> fit of the known prism), on frames drawn by an EXACT ray caster
+# that shares only the lens with it, through the sim pinhole AND the rig's
+# measured fisheye: brick <= 1.5 mm / 2 deg, bowl <= 2 mm; a control that the
+# lens matters (the bowl read as a pinhole is > 10 mm off); occlusion lowers
+# `coverage`; a brick-coloured box outside the ROI is not taken. Needs no shim.
+tests/vision/test_tabletop_pose.mojo
+# The so101-tower overhead reader's camera pose sources
+# (`tasks/so101_tower_overhead.mojo`): no --extrinsics = the asset pose; an
+# arm calibration written as calibration extrinsics moves every desk-plane
+# point by exactly R p + d (with a flipped-rotation control that fails by
+# ~38 mm); a non-`*_armcal` file (the lens file's stale extrinsics) refused.
+tests/tasks/test_so101_tower_overhead.mojo

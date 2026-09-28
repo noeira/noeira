@@ -3,7 +3,7 @@
 
 Same arena harness as the AlphaZero Gumbel example (best/learner gating,
 horizontal-flip augmentation, periodic full-strength MCTS eval vs 5-ply minimax +
-random, RemoteLogger), but the agent plans over a **learned model** instead of
+random, run logger), but the agent plans over a **learned model** instead of
 the true game rules: three MLP nets h/g/f (representation / dynamics / prediction)
 trained by a K-step BPTT unroll, with the self-play search swapped to two-player
 Gumbel MuZero (`run_muzero_selfplay_arena_gumbel_2p`).
@@ -24,8 +24,9 @@ pass advances all N_ENVS games by one move).
 Usage:
     pixi run -e nvidia mojo run -I . examples/board_games/connect_four_muzero_gumbel.mojo
 
-With no `NOEIRA_CLOUD_URL` in the environment the RemoteLogger is a silent no-op;
-the per-report lines still print to stdout.
+The run (project `board-games`) keeps its checkpoint, `metrics.csv` and
+`run.kv` in `runs/<id>/`; with no `NOEIRA_CLOUD_URL` in `.env` the monitor half
+is inert and the per-report lines still print to stdout.
 """
 
 from std.memory import Pointer
@@ -33,8 +34,10 @@ from max.gpu.host import DeviceContext
 
 from noeira.nn.constants import DT
 from noeira.nn.core.initializer import Kaiming
-from noeira.core.dotenv import load_dotenv
-from noeira.core.logger import RemoteLogger
+from noeira.core.run import RunContext, register_run
+from noeira.core.run_session import RunLogger, finish_run, run_logger
+from noeira.io.artifact_sink import sink_for_run
+from noeira.deep_agents.training.checkpoint import announce_checkpoint
 from noeira.deep_agents.muzero.nets import (
     MZRepNet, MZRepNetC4Conv, MZDynNet, MZPredNet
 )
@@ -55,20 +58,20 @@ def main() raises:
     print()
 
     # ── Logger setup ────────────────────────────────────────────
-    var env_vars = load_dotenv()
-    var api_key = env_vars.get("NOEIRA_CLOUD_API_KEY", "")
-    var url = env_vars.get("NOEIRA_CLOUD_URL", "")
-
-    var logger = RemoteLogger(
-        server_url=url,
-        run_name="Gumbel MuZero Connect Four (nn)",
-        buffer_size=22,
-        api_key=api_key,
+    var run = RunContext(
+        project=String("board-games"),
+        driver=String("examples/board_games/connect_four_muzero_gumbel.mojo"),
+        slug=String("muzero-gumbel-connect-four"),
+        env=String("builtin:connect_four"),
     )
+    print("run:", run.dir)
+    var logger = run_logger(run, buffer_size=22)
     logger.set_config("agent", "GumbelMuZero")
     logger.set_config("env", "ConnectFour")
     logger.set_config("network", "MZ MLP[LATENT=128,H=128,BINS=51]")
     logger.set_config("framework", "deep_agents/nn")
+    register_run(run, logger)
+    var artifacts = sink_for_run(run.id, run.dir)
 
     comptime OBS = 126
     comptime ACT = 7
@@ -122,7 +125,7 @@ def main() raises:
         CAP=CAP, B=B, K=K, N=N, MAX_PLIES=MAX_PLIES,
         OPP1=GPUMinimaxConnectFour[5],
         OPP2=RandomOpponent,
-        L=RemoteLogger,
+        L=RunLogger,
         ARENA_GAMES=64,
         EVAL_GAMES=64,
         TEMP_MOVES=20,
@@ -166,19 +169,24 @@ def main() raises:
         target_sync_interval=200,
     )
 
-    logger.close()
-
     # Persist the BEST net trio (rep/dyn/pred hold the final promoted weights —
     # the deployable artifact, distinct from the drifting learner). The storage
     # checkpoint is whole-file-per-model, so this writes three per-net files
     # (`.rep` / `.dyn` / `.pred`), the same layout the driver's rolling
     # checkpoint + `MuZeroAgent.save` use.
-    var ckpt = String("connect_four_muzero_gumbel.ckpt")
+    var ckpt = run.checkpoint_path(String("best"))
     save_params["gpu", Rep](rep, ckpt + String(".rep"), Optional(ctx), False)
     save_params["gpu", Dyn](dyn, ckpt + String(".dyn"), Optional(ctx), False)
     save_params["gpu", Pred](pred, ckpt + String(".pred"), Optional(ctx), False)
+    announce_checkpoint(ckpt + String(".rep"), artifacts, run.dir)
+    announce_checkpoint(ckpt + String(".dyn"), artifacts, run.dir)
+    announce_checkpoint(ckpt + String(".pred"), artifacts, run.dir)
+    finish_run(
+        run, logger, artifacts,
+        String("last_loss=") + String(res.last_loss) + String(" promotions=") + String(res.promotions),
+    )
 
     print()
     print("last_loss:", res.last_loss, "| promotions:", res.promotions)
-    print("saved best net → connect_four_muzero_gumbel.ckpt")
+    print("saved best net →", ckpt + String(".{rep,dyn,pred}"))
     print("=== Done ===")

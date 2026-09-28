@@ -34,6 +34,7 @@ where any of dones[start : start + T - 1] is set (episode boundary mid-window).
 The final frame may be done (a valid prediction / termination target).
 """
 
+from noeira.io.fileio import write_file_atomic
 from noeira.envs.arcade_games.pong.offline_buffer import (
     PONG_OBS_C,
     PONG_OBS_H,
@@ -280,8 +281,7 @@ struct Dreamer4PongRewardBuffer(Movable):
         for i in range(4 * self.n_frames):
             data.append(rb[unsafe_offset=i])
 
-        with open(path, "w") as f:
-            f.write_bytes(data)
+        write_file_atomic(path, data)
 
     @staticmethod
     def load(path: String) raises -> Dreamer4PongRewardBuffer:

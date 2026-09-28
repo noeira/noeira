@@ -12,8 +12,11 @@ quantitative read on the collapse the training probes flagged.
 
 Run (after training):
   pixi run -e nvidia mojo run -I . examples/lewm/lewm_pong_eval_gpu.mojo
+  pixi run -e nvidia mojo run -I . examples/lewm/lewm_pong_eval_gpu.mojo --ckpt <run_id>
 """
 
+from std.sys import argv
+from noeira.core.run import resolve_checkpoint
 from std.memory import alloc
 from max.gpu.host import DeviceContext
 
@@ -70,7 +73,19 @@ def _a(n: Int) -> Pointer[Scalar[DT], MutAnyOrigin]:
     return alloc[Scalar[DT]](n)
 
 
+def _flag(name: String, dflt: String) raises -> String:
+    """Value of `--name X`, or `dflt` when the flag is absent."""
+    var av = argv()
+    for i in range(1, len(av)):
+        if String(av[i]) == name:
+            if i + 1 >= len(av):
+                raise Error("flag " + name + " needs a value")
+            return String(av[i + 1])
+    return dflt
+
+
 def main() raises:
+    var ckpt = resolve_checkpoint(_flag(String("--ckpt"), CKPT_PATH), String("last"))
     print("=" * 70)
     print("LeWM nn — Pong world-model eval (GPU, §10.9 action-awareness)")
     print("=" * 70)
@@ -80,8 +95,8 @@ def main() raises:
     print("buffer n_frames =", buf.n_frames)
 
     var tr = Trainer.make(lam=Scalar[DT](0.09), lr=Scalar[DT](1e-3), ctx=ctx)
-    print("loading checkpoint", CKPT_PATH, "...")
-    tr.load_params(CKPT_PATH)
+    print("loading checkpoint", ckpt, "...")
+    tr.load_params(ckpt)
 
     # Sample one context window → host fp32 pixels + host one-hot actions.
     var pix_u8: Pointer[Scalar[DType.uint8], MutAnyOrigin] = alloc[

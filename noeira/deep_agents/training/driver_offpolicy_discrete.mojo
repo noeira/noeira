@@ -158,9 +158,9 @@ trait OffPolicyDiscreteAgent(Deinitable, Movable):
     #
     # Mirror the continuous `OffPolicyAgent` surface so the discrete
     # driver can call into the trainer at `diag_every` / `checkpoint_every`
-    # cadences. Each has a `pass` default; DQNTrainer overrides both with
-    # real bodies that drain its `DQNMetrics` bundle and write a one-file
-    # v2 checkpoint envelope.
+    # cadences. `flush_metrics_through_logger` has a `pass` default and
+    # `save_state` a raising one; DQNTrainer overrides both with real bodies
+    # that drain its `DQNMetrics` bundle and write a one-file v3 checkpoint.
 
     def flush_metrics_through_logger[
         L: Logger
@@ -172,7 +172,14 @@ trait OffPolicyDiscreteAgent(Deinitable, Movable):
         pass
 
     def save_state(mut self, path: String) raises:
-        pass
+        """⚠ RAISES BY DEFAULT, on purpose. Drivers call this only when a
+        `checkpoint_path` was given; a `pass` default meant a trainer that did
+        not override it produced no file and no error, and the run looked
+        checkpointed until someone tried to resume it."""
+        raise Error(
+            "save_state: this trainer does not implement checkpointing, and a"
+            " checkpoint was requested at " + path
+        )
 
     def set_noise_scale(mut self, scale: Scalar[DT]) raises:
         """Toggle Noisy-net exploration magnitude on the acting net:
@@ -513,7 +520,7 @@ def run_offpolicy_discrete_train[
                 trainer.flush_metrics_through_logger[L](logger, abs_step)
 
         # `checkpoint_every` — overwrite `checkpoint_path` with the
-        # trainer's one-file v2 envelope. Default trait impl is no-op.
+        # trainer's one-file v3 checkpoint. The trait default raises.
         if (
             checkpoint_every > 0
             and abs_step % checkpoint_every == 0
@@ -547,7 +554,7 @@ def run_offpolicy_discrete_train[
             comptime if L.ENABLED:
                 if Bool(logger):
                     logger.value()[].log_scalar(
-                        "eval/mean_return", Float64(eval_ret), abs_step
+                        "eval_return", Float64(eval_ret), abs_step
                     )
                     logger.value()[].flush()
 
@@ -949,7 +956,7 @@ def run_offpolicy_discrete_train_gpu_batched[
             comptime if L.ENABLED:
                 if Bool(logger):
                     logger.value()[].log_scalar(
-                        "eval/mean_return", Float64(eval_ret), abs_step
+                        "eval_return", Float64(eval_ret), abs_step
                     )
                     logger.value()[].flush()
             if verbose:
@@ -1226,7 +1233,7 @@ def run_offpolicy_discrete_train_cpu_env_gpu_agent[
             comptime if L.ENABLED:
                 if Bool(logger):
                     logger.value()[].log_scalar(
-                        "eval/mean_return", Float64(eval_ret), abs_step
+                        "eval_return", Float64(eval_ret), abs_step
                     )
                     logger.value()[].flush()
             if verbose:

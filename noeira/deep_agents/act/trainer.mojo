@@ -105,6 +105,7 @@ from noeira.nn.models.resnet18 import (
 from noeira.nn.core.checkpoint import (
     BinaryCheckpointReader,
     BinaryCheckpointWriter,
+    CheckpointScalars,
     _is_v3_header,
     _read_file_bytes,
     _write_file_bytes,
@@ -1299,6 +1300,11 @@ struct ACTTrainer[
         reloaded model runs BatchNorm on whatever its init held (mean 0,
         var 1), and every prediction is wrong in a way that looks like a
         training failure rather than a load failure.
+
+        ⚠ With the moments goes Adam's step state (`opt.t`, `β₁ᵗ`, `β₂ᵗ`, as
+        `K` scalars): moments restored under `t = 0` are divided by the
+        step-1 bias corrections, and a resumed run's first few hundred
+        updates come out ~0.3× the size they should.
         """
         var w = BinaryCheckpointWriter(save_moments)
         w.mode = 0
@@ -1306,6 +1312,10 @@ struct ACTTrainer[
         w.mode = 1
         var _sref1 = ParamVisitorRef.of[type_of(w), Self.target](w)
         self.graph.for_each_state[Self.target](_sref1, self.ctx)
+        if save_moments:
+            var sc = CheckpointScalars()
+            self.opt.put_step_state(sc, "opt")
+            w.write_scalars(sc)
         _write_file_bytes(path, w.content)
 
     def load_backbone(
@@ -1488,4 +1498,8 @@ struct ACTTrainer[
         # ⚠ NOT REDUNDANT: the call above hands the state pass a POINTER to
         # `r`, so without a later mention Mojo destroys `r` at that line and
         # the pass reads freed memory. See `BinaryCheckpointReader.finish`.
+        var sc = r.read_scalars()
         r.finish()
+        # A checkpoint written with moments carries the step state too; one
+        # from before `K` sections existed leaves the optimizer at t = 0.
+        self.opt.take_step_state(sc, "opt")

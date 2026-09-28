@@ -35,6 +35,7 @@ from noeira.envs.phyics3d_env import Phyics3dEnv, Phyics3dEnvConfig
 from noeira.physics3d.fields import Data, Model, DimsLike
 from noeira.physics3d.model import ModelDefLike
 from noeira.render.renderer3d import Renderer3D, RendererHandoff
+from noeira.math3d import Vec3 as Vec3Generic
 from noeira.render.imgui import (
     imgui_shim_available,
     ig_begin_panel, ig_end, ig_begin_child, ig_end_child,
@@ -438,6 +439,19 @@ struct ViewerState(Copyable, Movable):
     the host reads it from `mf`, so a front end that records must fill it.
     Its length must be `MODEL_CURRICULUM_SIZE` or it is ignored with a printed
     line."""
+    var record_path: String
+    """Record the 3D view (insets included, sidebar excluded) to this file
+    from the first step, then close the viewer after `record_episodes`
+    episodes — an unattended clip. Empty (the default) = the record button
+    only, so every existing front end is unchanged. The frame rate is the
+    loop's own, `1000 / frame_ms`, so a front end pacing to the control period
+    records in real time; `ffmpeg` picks the codec from the extension."""
+    var record_episodes: Int
+    var free_camera_eye: List[Float64]
+    var free_camera_target: List[Float64]
+    """With `free_camera`, an exact free-camera pose (x, y, z each) instead of
+    the automatic 3/4-view reframe — a framed shot for a recorded clip. Empty
+    (the default) = the reframe, as before."""
 
     def __init__(
         out self,
@@ -468,6 +482,10 @@ struct ViewerState(Copyable, Movable):
         self.frame_ms = FRAME_TARGET_MS
         self.pip_cameras = List[Int]()
         self.reset_curriculum = List[Float64]()
+        self.record_path = String("")
+        self.record_episodes = 1
+        self.free_camera_eye = List[Float64]()
+        self.free_camera_target = List[Float64]()
 
 
 @fieldwise_init
@@ -935,7 +953,19 @@ def run_view[
     # first `render`, which is where the camera's current distance — the only
     # model-scale information available — is still on hand.
     if st.free_camera:
-        env.renderer_request_free_camera()
+        if len(st.free_camera_eye) == 3 and len(st.free_camera_target) == 3:
+            env.renderer_set_free_camera(
+                Vec3Generic[DType.float64](
+                    st.free_camera_eye[0], st.free_camera_eye[1],
+                    st.free_camera_eye[2],
+                ),
+                Vec3Generic[DType.float64](
+                    st.free_camera_target[0], st.free_camera_target[1],
+                    st.free_camera_target[2],
+                ),
+            )
+        else:
+            env.renderer_request_free_camera()
     if len(st.pip_cameras) > 0:
         env.renderer_set_pip_cameras(st.pip_cameras.copy())
 
@@ -979,6 +1009,14 @@ def run_view[
     var cursor = 0
 
     var frame_t0 = perf_counter_ns()
+
+    # `ViewerState.record_path`: an unattended clip. Started after the camera
+    # and inset requests so the first frame is already the requested view.
+    var auto_record = st.record_path.byte_length() > 0
+    var record_done = False
+    if auto_record:
+        var fps = max(1, (1000 + st.frame_ms // 2) // max(1, st.frame_ms))
+        env.start_recording(st.record_path, fps, 1)
 
     while env.is_renderer_open():
         # Pump events FIRST: ImGui drains the queue in its NewFrame, so events
@@ -1148,6 +1186,12 @@ def run_view[
                       "(manual)" if manual_reset else "")
                 if have_obs:
                     observer.value()[].on_episode_end(step_i, manual_reset)
+                if auto_record and episode >= st.record_episodes:
+                    # Stopped BEFORE this frame renders the reset pose, so the
+                    # clip ends on the episode's last state; the loop leaves
+                    # after `render_frame`, which closes the open ImGui frame.
+                    env.stop_recording()
+                    record_done = True
                 var sr = env.reset()
                 for i in range(E.OBS_DIM):
                     obs_l[i] = Scalar[DT](sr.data[i])
@@ -1167,7 +1211,7 @@ def run_view[
                 ep_return = 0.0
 
         env.render_frame()
-        if switching:
+        if switching or record_done:
             break
 
         # Sleep only what is LEFT of the target period. `frame_t0` is taken

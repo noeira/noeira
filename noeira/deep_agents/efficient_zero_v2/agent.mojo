@@ -14,7 +14,7 @@ MCTS). The GPU Gumbel path is a separate build.
   * `eval_greedy(env, episodes)` — the deployed-agent metric: noise-off,
     argmax-visit rollout (judge the policy by this, not the exploratory training
     return). The projector/predictor are consistency-only, unused here.
-  * `save` / `load` — one-file `nn-ckpt v2` envelope packing all five nets
+  * `save` / `load` — one-file v3 `storage-ckpt` file packing all five nets
     (sections `rep` / `dyn` / `pred` / `proj` / `predh`).
 """
 
@@ -197,7 +197,7 @@ struct EZv2DiscreteAgent[
 
     def save(mut self, path: String) raises:
         """Weights-only snapshot of the five EZv2 nets (rep / dyn / pred /
-        proj / predh) in the `nn-ckpt v2` envelope. Uses the `save`/`load`
+        proj / predh) in the v3 `storage-ckpt` file. Uses the `save`/`load`
         surface shared by every agent facade. NOTE: optimizers are
         session-local — rebuilt per `train_*` call — so only weights
         persist; this is the inference / self-play artifact, not a

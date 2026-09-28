@@ -2,6 +2,7 @@
 
     pixi run build-imgui                                              # ONCE
     pixi run mojo run -I . examples/so101/sac_so_arm101_reach_policy_viewer.mojo
+    pixi run mojo run -I . examples/so101/sac_so_arm101_reach_policy_viewer.mojo --ckpt <run_id>
     pixi run mojo run -I . examples/so101/sac_so_arm101_reach_policy_viewer.mojo my.ckpt
 
 The interactive counterpart of `sac_so_arm101_reach_eval_cpu.mojo`. That
@@ -77,6 +78,7 @@ from noeira.envs.robots.so_arm101_xml import SoArm101Model
 from noeira.render.imgui import imgui_shim_available
 from noeira.render.renderer3d import Renderer3D
 from noeira.utils.fmt import fixed
+from noeira.core.run import resolve_checkpoint
 
 comptime SEED: Int = 0
 
@@ -343,7 +345,15 @@ def main() raises:
         return
 
     var args = argv()
-    var explicit = String(args[1]) if len(args) > 1 else String("")
+    var explicit = String("")
+    if len(args) > 2 and String(args[1]) == "--ckpt":
+        explicit = String(args[2])
+    elif len(args) > 1:
+        explicit = String(args[1])
+    if explicit:
+        # a RUN ID -> its `checkpoints/last.ckpt` (what the reach trainer
+        # writes); a file is taken as is; anything else raises here.
+        explicit = resolve_checkpoint(explicit, String("last"))
 
     print("=" * 66)
     print("SO-ARM101 reach — trained policy, ImGui viewer")

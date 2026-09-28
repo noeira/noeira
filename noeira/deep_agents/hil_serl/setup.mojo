@@ -38,17 +38,23 @@ def apply_hil_serl[
         print("  demos    :", rep.n_rows, "rows pinned as the replay"
               " prefix (of", rep.n_file_rows, "in the files); mean reward",
               rep.mean_reward)
-        logger.log_scalar(String("cfg/demo_rows"), Float64(rep.n_rows), 0)
-        logger.log_scalar(String("cfg/demo_mean_reward"), rep.mean_reward, 0)
+        # ⚠ CONFIG, NOT METRICS: facts about the run, not curves. They are
+        # known only now, after `register`, so they reach `metrics.config.kv`
+        # (rewritten at `close`) but not the dashboard's `/runs` config.
+        logger.set_config("demo_rows", String(rep.n_rows))
+        logger.set_config("demo_mean_reward", String(rep.mean_reward))
         if cfg.bc_weight > Scalar[DT](0):
             var half = SACTrainer[t, S, A, C].BATCH // 2
             trainer.set_bc(cfg.bc_weight, half)
             print("  bc       : weight", cfg.bc_weight, "on the demo half of"
                   " every batch (", half, "rows )")
-            logger.log_scalar(String("cfg/bc_weight"), Float64(cfg.bc_weight), 0)
+            if cfg.bc_q_ratio > Scalar[DT](0):
+                trainer.set_bc_q_ratio(cfg.bc_q_ratio)
+                print("  bc-q     : the weight tracks max(", cfg.bc_weight,
+                      ",", cfg.bc_q_ratio, "* mean|Q| ) at every diagnostics"
+                      " flush (logged as `bc_weight`)")
     if cfg.bc_only:
         trainer.set_q_weight(Scalar[DT](0))
         print("  bc-only  : the SAC half of the actor loss is OFF —"
               " the actor fits the demo half of every batch, the critics"
               " train on its rollouts")
-        logger.log_scalar(String("cfg/bc_only"), 1.0, 0)

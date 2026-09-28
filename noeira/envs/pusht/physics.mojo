@@ -423,11 +423,15 @@ def pusht_substep_single_env[
     )
     state[env, CONTACT_COUNT_OFFSET] = Scalar[dtype](c)
 
-    # 3. Velocity constraints
+    # 3. Velocity constraints (Box2D-style: init + warm start once, then
+    # friction-then-normal every iteration)
+    ImpulseSolver.init_velocity_single_env[
+        BATCH, NUM_BODIES, MAX_CONTACTS, STATE_SIZE, BODIES_OFFSET
+    ](env, state, contacts, c, restitution)
     for _ in range(VEL_ITERATIONS):
         ImpulseSolver.solve_velocity_single_env[
             BATCH, NUM_BODIES, MAX_CONTACTS, STATE_SIZE, BODIES_OFFSET
-        ](env, state, contacts, c, friction, restitution)
+        ](env, state, contacts, c, friction)
 
     # 4. Position integration (advance agent manually since it's kinematic;
     # then run the standard integrator for the T-block).
@@ -444,7 +448,18 @@ def pusht_substep_single_env[
     ](env, state, dt)
 
     # 5. Baumgarte position correction
+    # PushT is in pixels: its own slop / baumgarte, and no per-iteration
+    # correction cap (Box2D's 0.2 is in meters).
     for _ in range(POS_ITERATIONS):
-        ImpulseSolver.solve_position_single_env[
+        if ImpulseSolver.solve_position_single_env[
             BATCH, NUM_BODIES, MAX_CONTACTS, STATE_SIZE, BODIES_OFFSET
-        ](env, state, contacts, c, baumgarte, slop)
+        ](
+            env,
+            state,
+            contacts,
+            c,
+            linear_slop=slop,
+            baumgarte=baumgarte,
+            max_linear_correction=Scalar[dtype](1e30),
+        ):
+            break

@@ -307,8 +307,27 @@ def _init_common_normal_ws[
 ):
     """Zero-initialize common normal workspace fields for one contact slot
     (verbatim from init_common_normal_workspace_gpu; the `solver_idx` base
-    is gone — offsets are row-relative)."""
-    var nv = dims.get_nv()
+    is gone — offsets are row-relative): its scalar fields, then its two
+    `nv`-wide rows."""
+    _init_common_normal_scalars[DTYPE](env, contact_tid, dims, solver)
+    _init_common_normal_rows[DTYPE](env, contact_tid, dims, solver)
+
+
+@always_inline
+def _init_common_normal_scalars[
+    DTYPE: DType,
+    D: DimsLike,
+    L_SOLVER: Layout,
+](
+    env: Int,
+    contact_tid: Int,
+    dims: D,
+    solver: LayoutTensor[
+        DTYPE, L_SOLVER, MutAnyOrigin
+    ],
+):
+    """The 15 scalar fields of one contact slot (`k*mc + slot`), the first
+    half of `_init_common_normal_ws`."""
     var max_contacts = dims.get_max_contacts()
 
     solver[env, 0 * max_contacts + contact_tid] = 0  # lambda_n
@@ -326,7 +345,28 @@ def _init_common_normal_ws[
     solver[env, 12 * max_contacts + contact_tid] = 0  # inv_K_imp
     solver[env, 13 * max_contacts + contact_tid] = 0  # imp_n
     solver[env, 14 * max_contacts + contact_tid] = 0  # diag_n
-    # Zero J_n and MinvJn for this slot
+
+
+@always_inline
+def _init_common_normal_rows[
+    DTYPE: DType,
+    D: DimsLike,
+    L_SOLVER: Layout,
+](
+    env: Int,
+    contact_tid: Int,
+    dims: D,
+    solver: LayoutTensor[
+        DTYPE, L_SOLVER, MutAnyOrigin
+    ],
+):
+    """Zero J_n and MinvJn for one contact slot — the second half of
+    `_init_common_normal_ws`. Across all `max_contacts` slots these rows tile
+    `[15*mc, 15*mc + 2*mc*nv)` exactly, which is what lets the blocked Newton
+    kernel zero that range with the whole threadgroup, coalesced, instead
+    (`newton_solve`, stage 1)."""
+    var nv = dims.get_nv()
+    var max_contacts = dims.get_max_contacts()
     for i in range(nv):
         solver[env, 15 * max_contacts + contact_tid * nv + i] = 0
         solver[env, 15 * max_contacts + max_contacts * nv + contact_tid * nv + i] = 0

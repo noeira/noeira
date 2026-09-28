@@ -21,10 +21,12 @@ dashboard gets the same points when `.env` names one (`RemoteLogger`, inert
 without a URL), `run.kv` records `status`/`outcome` WRITTEN and never inferred,
 and each checkpoint is offered to the artifact sink so a box that dies at hour
 40 does not take the weights with it. A 30-minute check-up is therefore
-`tail -3 runs/<id>/metrics.csv` plus `run.kv`, from anywhere — read `eval/emd`
-and `norm/B_rank_eff` first. `eval/*` is the TRACKING EVAL, run in the loop over
-the checkpoint just written (`--eval-segments`, default 1 = one segment per
-clip, ~35 s); run 1 had to be scored by hand hours after it ended, which is how
+`tail -3 runs/<id>/metrics.csv` plus `run.kv`, from anywhere — read `eval_emd`
+and `b_rank_eff` first. `eval_*` is the TRACKING EVAL, run in the loop over
+the checkpoint just written (`--eval-segments`, default 5 = five segments per
+clip STRATIFIED across it, ~200 of the store's ~862 windows, ~3 min; the old
+default of 1 scored the opening ten seconds of each clip and read ~0.19 low
+against the reference, §12.29); run 1 had to be scored by hand hours after it ended, which is how
 a divergence at 4 M steps went unnoticed until 8 M (§12.14). `norm/B` is sqrt(d) = 16 BY CONSTRUCTION and cannot
 move, so it can never warn you about anything; `norm/B_rank_eff` is the
 effective rank of `E[B B^T]` and must sit at d = 256. Run 1 died with it at
@@ -106,18 +108,28 @@ from noeira.nn.core.tensor import Tensor
 from noeira.nn.core.tensor_refs import TensorRefs
 from noeira.nn.core.call import call_forward
 from noeira.nn.core.ptr import mptr
-from noeira.core.run import RunContext, register_run
+from noeira.core.run import RunContext, register_run, run_id_of_checkpoint
 from noeira.core.dotenv import load_dotenv
 from noeira.core.logger import CsvLogger, RemoteLogger, CompositeLogger
-from noeira.io.artifact_sink import close_sink, sink_for_run
+from noeira.io.artifact_sink import sink_for_run
+from noeira.core.run_session import finish_run
 from noeira.deep_agents.training.checkpoint import announce_checkpoint
 from noeira.data.store import TrajectoryStore
 from noeira.data.resident import IDX_DT
 from noeira.deep_agents.fb import FBCPROnlineAgent
+from noeira.deep_agents.fb.loss import fb_rank_eff_from_ortho
+from noeira.envs.robots.unitree_g1_history import (
+    UNITREE_G1_FULL_OBS_DIM, G1_ACTOR_EXTRA, G1_HIST_DIM, G1_N_ACT,
+    G1_HIST_STEP, G1_HIST_MAX_AGE,
+    g1_pack_full_obs_kernel, g1_hist_push_kernel, g1_hist_reset_kernel,
+    g1_build_tail_spec, g1_scale_clip_kernel,
+)
+from noeira.envs.robots.unitree_g1_pd import G1_NORMALIZE_TO, G1_ACTION_CLIP
 from noeira.deep_agents.fb.bfm_towers import (
-    BFMFTower, BFMActorTower, BFMBNet, BFMDNet,
+    BFMFTower, BFMBNetFiltered, BFMActorTowerFiltered, BFMDNetFiltered,
 )
 from noeira.deep_agents.fb.kernels import (
+    gather_rows_into_kernel,
     gather_rows_kernel, project_sphere_kernel, ensure_t, _blocks,
 )
 from noeira.deep_agents.fb.kernels import uniform01_kernel
@@ -134,7 +146,8 @@ from noeira.envs.robots.g1_motion_priority import (
 )
 from noeira.envs.robots.g1_tracking_eval import (
     G1_D, G1_H, G1_L, G1_HB, G1_HD,
-    G1_SEG_ROWS, G1TrackScore, g1_n_segments, g1_segment_row, g1_score_segment,
+    G1_SEG_ROWS, G1TrackScore, g1_n_segments, g1_segment_row, g1_segment_pick,
+    g1_score_segment,
 )
 from noeira.envs.robots.unitree_g1_rsi import (
     G1RsiTable, rsi_inject_kernel, G1_RSI_NQ, G1_RSI_NV, G1_LIE_DOWN_PROB,
@@ -144,7 +157,13 @@ from noeira.envs.robots.unitree_g1_rsi import (
 
 # ── the recipe ────────────────────────────────────────────────────────────
 comptime N_ENVS: Int = 1024
-comptime OBS: Int = UNITREE_G1_OBS_DIM        # 527
+# ⚠ TWO widths (docs §12.34-12.36). `SP` is what the ENV produces and what
+# `b` / `discriminator` consume — `state 64 | privileged 463`. `OBS` is the
+# packed row `f`, `critic` and (filtered) the actor see; its last 401 are
+# `last_action 29 | history 372`, maintained per lane during the rollout and
+# DERIVED from the ring during training, never stored.
+comptime SP: Int = UNITREE_G1_OBS_DIM         # 527
+comptime OBS: Int = UNITREE_G1_FULL_OBS_DIM   # 928
 comptime ACT: Int = UnitreeG1Model.ACTION_DIM  # 29
 comptime D: Int = G1_D
 comptime H: Int = G1_H
@@ -163,20 +182,28 @@ comptime BATCH: Int = 1024
 # transition rather than 5360. At CAP 2 M that frees 3.92 GiB, which is what
 # pays for the CAP raise below.
 #
-# CAP went 2.0 -> 1.5 M to make room for a 2048/6 tower, back to 2.0 M when
-# that tower turned out not to fit at ANY CAP, and is now 4.0 M on the freed
-# space. Budget at 1536/4: ring 12.15 GiB + the rest ~13.2 GiB = 25.3 GiB,
-# ~27 GB as the vast dashboard reports it, against 31.8 GB.
+# ⚠ CAP IS 1 M BECAUSE THE CARD SAYS SO (docs §12.42, MEASURED).
 #
-# ⚠ THAT ESTIMATE IS THE FOURTH ONE IN THIS TRACK AND THE FIRST THREE WERE
-# WRONG (18.3, 23.3, 26 GiB against a 25.9 GiB measurement). Read the
-# dashboard at step 0 before trusting the run; if it OOMs, CAP is one constant.
+# The 2048/6 smoke peaked at 31 436 MiB of 32 607 — 30.70 GiB of 31.84, with
+# 1.14 GiB free. Non-ring at this tower is 24.63 GiB MEASURED, against the
+# 15.3 predicted from §12.21's table plus the 1024/3 anchor: that table was
+# built at OBS 527 and does not carry the CPR critic, and the 928-wide inputs
+# widen every embedding. The prediction was wrong by 9.7 GiB — the sixth VRAM
+# estimate in this track and the fifth to miss.
 #
-# The reference's own buffer is 5_120_000. That needs ~28.7 GiB here, above
-# where this card has already OOM'd once — it is reachable only paired with
-# the 1024/3 tower (§12.21 says 40 M params tracked BETTER than 111 M), which
-# is a separate experiment and is NOT bundled into this change.
-comptime CAP: Int = 4_000_000
+#     CAP 2.00 M  ring 6.07 GiB  total 30.70  free 1.14   <- OOM band
+#     CAP 1.50 M  ring 4.55 GiB  total 29.18  free 2.66
+#     CAP 1.00 M  ring 3.04 GiB  total 27.66  free 4.18   <- here
+#
+# §12.22 OOM'd this card at ~29 GiB, so 1.5 M is not a margin. 1 M leaves
+# 4.18 GiB.
+#
+# ⚠⚠ THIS CONFOUNDS THE NEXT COMPARISON. `g3_hist` was 1024/3 at CAP 2 M; this
+# is 2048/6 at CAP 1 M — two axes. A WIN is still unambiguous (better with half
+# the buffer). A LOSS is not, and needs 1024/3 + CAP 1 M as the control before
+# anything is concluded. That control is also the CAP probe §12.23 has been
+# asking for since the ring rewrite and which has never been run.
+comptime CAP: Int = 1_000_000
 comptime SEQ: Int = 8
 comptime ZBUF: Int = 8192
 comptime T_EPISODE: Int = 500
@@ -190,12 +217,15 @@ comptime B_CHUNK: Int = 4096                  # rows per B forward while encodin
 
 comptime EnvT = UnitreeG1Batched[N_ENVS]
 comptime FNet = BFMFTower[OBS, ACT, D, H, L, D]
-comptime BNet = BFMBNet[OBS, D, HB]
-comptime ANet = BFMActorTower[OBS, D, H, L, ACT]
-comptime DNet = BFMDNet[OBS, D, HD]
+comptime BNet = BFMBNetFiltered[OBS, SP, D, HB]
+comptime ANet = BFMActorTowerFiltered[
+    OBS, UNITREE_G1_STATE_DIM, G1_ACTOR_EXTRA, D, H, L, ACT
+]
+comptime DNet = BFMDNetFiltered[OBS, SP, D, HD]
 comptime QNet = BFMFTower[OBS, ACT, D, H, L, 1]
 comptime Agent = FBCPROnlineAgent[
-    FNet, BNet, ANet, DNet, QNet, OBS, ACT, D, BATCH, CAP, N_ENVS, SEQ, ZBUF
+    FNet, BNet, ANet, DNet, QNet, OBS, ACT, D, BATCH, CAP, N_ENVS, SEQ, ZBUF,
+    G1_ACTOR_EXTRA,   # DERIVED_TAIL — the 401 the ring does NOT store (§12.36)
 ]
 comptime NQ = UnitreeG1Model.NQ
 comptime NV = UnitreeG1Model.NV
@@ -428,10 +458,14 @@ def _score_tracking(
     for clip in range(rsi.n_ep):
         var clip_e = 0.0
         var clip_n = 0
-        var n_seg = g1_n_segments(Int(rsi.ep_len.data[clip]))
+        var n_avail = g1_n_segments(Int(rsi.ep_len.data[clip]))
+        var n_seg = n_avail
         if n_seg > max_segments:
             n_seg = max_segments
-        for seg in range(n_seg):
+        for k in range(n_seg):
+            # spread across the clip, not the first `n_seg` — see
+            # `g1_segment_pick`; taking the opening windows reads ~0.19 low
+            var seg = g1_segment_pick(n_avail, n_seg, k)
             var r0 = g1_segment_row(Int(rsi.ep_offset.data[clip]), seg)
             var sc = g1_score_segment[FNet, BNet, ANet, OBS, ACT, D, 64](
                 t, env, rsi, st, pv, qpos_col, norm, r0,
@@ -493,7 +527,12 @@ def main() raises:
     # 0 turns the in-loop tracking eval off. 1 is one segment per clip (40
     # segments, ~35 s) — ~3 % of a 20-minute checkpoint interval, and the only
     # number in the file that measures the thing the run is FOR.
-    var eval_segments = atol(_flag(String("--eval-segments"), String(1)))
+    # 5 per clip = ~200 of the store's ~862 windows, STRATIFIED across each
+    # clip (`g1_segment_pick`). The old default of 1 scored 40 — the opening
+    # ten seconds of every motion, which reads ~0.19 low against the
+    # reference's all-862 number (docs §12.29). 5 is the coverage the mid and
+    # ring runs already paid for, so the cost is known.
+    var eval_segments = atol(_flag(String("--eval-segments"), String(5)))
     # The eval used to run ONLY at checkpoints, so the curve was three points
     # and "the peak is at 4000" partly meant "4000 was the best of the three
     # we sampled". `--eval-every` (batched steps) decouples the two; it
@@ -525,8 +564,12 @@ def main() raises:
         env=String("builtin:unitree_g1"),
         dataset=store_path,
         seed=seed_v,
+        resumed_from=run_id_of_checkpoint(resume_path),
     )
     run.set_tag(tag)
+    # `project-resume <run_id>` continues this run from its last checkpoint,
+    # at the env step it saved (the replay re-warms from the store).
+    run.set_resume_args(String("--resume {ckpt}"))
     print("run:", run.dir)
 
     # ── the run's own record: a CSV that outlives the ssh session ─────────
@@ -546,21 +589,27 @@ def main() raises:
         buffer_size=64,
         api_key=env_vars.get("NOEIRA_CLOUD_API_KEY", ""),
     )
-    remote.set_config("algorithm", "BFM-Zero FB-CPR")
-    remote.set_config("env", "unitree_g1")
-    remote.set_config("target", "gpu")
-    remote.set_config("lanes", String(N_ENVS))
-    remote.set_config("obs", String(OBS))
-    remote.set_config("act", String(ACT))
-    remote.set_config("d", String(D))
-    remote.set_config("h", String(H))
-    remote.set_config("layers", String(L))
-    remote.set_config("updates_per_step", String(ups))
-    remote.set_config("seed_steps", String(SEED_STEPS))
-    remote.set_config("store", store_path)
-    remote.set_config("resume_from", resume_path)
-    remote.set_config("start_at", String(start_at))
-    var logger = CompositeLogger(CsvLogger(run.metrics_path()), remote)
+    # ⚠ THE CONFIG GOES TO BOTH HALVES: `/runs` for the dashboard and
+    # `metrics.config.kv` beside the CSV, so a CSV read a week later still says
+    # what produced it. Hence the composite is built BEFORE `set_config`.
+    var logger = CompositeLogger(CsvLogger(run.metrics_path()), remote^)
+    logger.set_config("algorithm", "BFM-Zero FB-CPR")
+    logger.set_config("env", "unitree_g1")
+    logger.set_config("target", "gpu")
+    logger.set_config("lanes", String(N_ENVS))
+    logger.set_config("obs", String(OBS))
+    logger.set_config("act", String(ACT))
+    logger.set_config("d", String(D))
+    logger.set_config("h", String(H))
+    logger.set_config("layers", String(L))
+    logger.set_config("updates_per_step", String(ups))
+    logger.set_config("seed_steps", String(SEED_STEPS))
+    logger.set_config("store", store_path)
+    logger.set_config("resume_from", resume_path)
+    logger.set_config("start_at", String(start_at))
+    logger.set_config("t_episode", String(T_EPISODE))
+    logger.set_config("track_len", String(TRACK_LEN))
+    logger.set_config("lie_prob", String(lie_prob))
     # ⚠ AFTER the config and before step 0 — `register_run` seeds the
     # dashboard from the run (id, project, commit, seed, host) and POSTs
     # `/runs`. A run that dies before step 0 otherwise never appears at all.
@@ -572,27 +621,6 @@ def main() raises:
     # monitor — a box with no credentials must still train — and every
     # `announce_checkpoint` below is a no-op on a None, so there is no branch.
     var artifacts = sink_for_run(run.id, run.dir)
-
-    # ⚠ THE SETTINGS GO OUT AS SCALARS TOO, SO THE CSV IS SELF-DESCRIBING.
-    # `set_config` reaches the dashboard and NOT the CSV — `CsvLogger` has
-    # nowhere to put a config field — so a CSV read a week later would carry
-    # the curves and none of the settings that produced them. As `cfg/*` so
-    # they sort together and cannot collide with a metric name.
-    logger.log_scalar(String("cfg/lanes"), Float64(N_ENVS), 0)
-    logger.log_scalar(String("cfg/obs"), Float64(OBS), 0)
-    logger.log_scalar(String("cfg/act"), Float64(ACT), 0)
-    logger.log_scalar(String("cfg/d"), Float64(D), 0)
-    logger.log_scalar(String("cfg/h"), Float64(H), 0)
-    logger.log_scalar(String("cfg/layers"), Float64(L), 0)
-    logger.log_scalar(String("cfg/updates_per_step"), Float64(ups), 0)
-    logger.log_scalar(String("cfg/seed_steps"), Float64(SEED_STEPS), 0)
-    logger.log_scalar(String("cfg/t_episode"), Float64(T_EPISODE), 0)
-    logger.log_scalar(String("cfg/track_len"), Float64(TRACK_LEN), 0)
-    logger.log_scalar(String("cfg/lie_prob"), lie_prob, 0)
-    logger.log_scalar(String("cfg/seed"), Float64(seed_v), 0)
-    logger.log_scalar(String("cfg/start_at"), Float64(start_at), 0)
-    logger.log_scalar(String("cfg/resumed"),
-                      1.0 if resume_path.byte_length() > 0 else 0.0, 0)
 
     var ctx = DeviceContext()
     print("BFM-Zero G1 privileged arm: lanes", N_ENVS, " obs", OBS, " act", ACT, " d", D, " h", H, " L", L)
@@ -611,12 +639,17 @@ def main() raises:
     # prioritization refresh — where `upload` would ALSO hand the RSI kernel a
     # new pointer every 9.6 M steps.
     var eobs = Tensor()
-    ensure_t["gpu"](eobs, n_rows * OBS, Optional(ctx))
+    # ⚠ SP-wide, not OBS-wide. The expert rows are only ever read by `b` (the
+    # window encoding) and the discriminator, whose reference filters are both
+    # `state + privileged_state` — so the derived tail would be 0.7 GB of
+    # columns nothing reads. The B forward takes an OBS-wide row, so the
+    # CHUNK is widened and its tail zeroed once, not the table.
+    ensure_t["gpu"](eobs, n_rows * SP, Optional(ctx))
     for r in range(n_rows):
         for i in range(UNITREE_G1_STATE_DIM):
-            eobs.data[r * OBS + i] = Scalar[DT](st[r * UNITREE_G1_STATE_DIM + i])
+            eobs.data[r * SP + i] = Scalar[DT](st[r * UNITREE_G1_STATE_DIM + i])
         for i in range(UNITREE_G1_PRIV_DIM):
-            eobs.data[r * OBS + UNITREE_G1_STATE_DIM + i] = Scalar[DT](pv[r * UNITREE_G1_PRIV_DIM + i])
+            eobs.data[r * SP + UNITREE_G1_STATE_DIM + i] = Scalar[DT](pv[r * UNITREE_G1_PRIV_DIM + i])
     eobs.upload_resident(ctx)
     var starts8 = _valid_starts(store, SEQ)
     var starts250 = _valid_starts(store, TRACK_LEN + 1)
@@ -701,6 +734,12 @@ def main() raises:
         z_hold=Z_HOLD, zbuf_frac=1.0, keep_frac=0.2, p_goal=0.2, p_expert=0.6,
         seed=UInt64(seed_v), normalize_obs=True,
     )
+    # ⚠ The agent derives a tail it cannot interpret (§12.36): the env hands
+    # it the layout, and the scaling its PD chain applies to a stored action.
+    var tail_spec = List[Int32]()
+    g1_build_tail_spec(tail_spec)
+    agent.attach_tail_spec(tail_spec)
+    agent.set_action_norm(G1_NORMALIZE_TO, G1_ACTION_CLIP)
     agent.attach_expert_windows(eobs^, starts8_dev^, len(starts8))
     if track_on:
         agent.base.enable_z_pin()
@@ -727,7 +766,56 @@ def main() raises:
             return
 
     # ── rollout buffers ───────────────────────────────────────────────
+    # `prev_obs` is the PACKED row the action was chosen from — that is what
+    # the ring must store the stored head of, and what the eval reproduces.
     var prev_obs = ctx.enqueue_create_buffer[DT](N_ENVS * OBS)
+    var prev_env_obs = ctx.enqueue_create_buffer[DT](N_ENVS * SP)
+    # ── the actor's other 401, per lane (docs §12.34-12.36) ──────────
+    var full_obs = ctx.enqueue_create_buffer[DT](N_ENVS * OBS)
+    var h_last = ctx.enqueue_create_buffer[DT](N_ENVS * G1_N_ACT)
+    var h_hist = ctx.enqueue_create_buffer[DT](N_ENVS * G1_HIST_DIM)
+    var h_live = ctx.enqueue_create_buffer[DT](N_ENVS)
+    var h_all = ctx.enqueue_create_buffer[DT](N_ENVS)
+    h_last.enqueue_fill(Scalar[DT](0.0))
+    h_hist.enqueue_fill(Scalar[DT](0.0))
+    h_live.enqueue_fill(Scalar[DT](0.0))   # the reset row is never pushed
+    h_all.enqueue_fill(Scalar[DT](1.0))    # a mask selecting every lane
+
+    def _hist_reset() capturing raises:
+        """Zero `last_action` and the history, and skip the next push.
+
+        Every lane resets together under `_rsi_reset`, so the mask is all
+        ones. Clearing `live` is what implements "the reset observation is
+        never pushed"."""
+        ctx.enqueue_function[g1_hist_reset_kernel[N_ENVS]](
+            mptr(h_last.unsafe_ptr()), mptr(h_hist.unsafe_ptr()),
+            mptr(h_live.unsafe_ptr()), mptr(h_all.unsafe_ptr()),
+            grid_dim=_blocks(N_ENVS * (G1_N_ACT + G1_HIST_DIM)), block_dim=TPB,
+        )
+
+    def _pack_obs() capturing raises:
+        """`full_obs = [env._obs 527 | last_action 29 | history 372]`."""
+        ctx.enqueue_function[g1_pack_full_obs_kernel[N_ENVS]](
+            mptr(env._obs.unsafe_ptr()), mptr(h_last.unsafe_ptr()),
+            mptr(h_hist.unsafe_ptr()), mptr(full_obs.unsafe_ptr()),
+            grid_dim=_blocks(N_ENVS * OBS), block_dim=TPB,
+        )
+
+    def _hist_advance() capturing raises:
+        """Push this step's state with the PREVIOUS action, then take the new
+        one — the reference's order (`_push` then `last_action =`), which the
+        history gate caught an off-by-one in once."""
+        ctx.enqueue_function[g1_hist_push_kernel[N_ENVS]](
+            mptr(env._obs.unsafe_ptr()), mptr(h_last.unsafe_ptr()),
+            mptr(h_hist.unsafe_ptr()), mptr(h_live.unsafe_ptr()),
+            grid_dim=_blocks(N_ENVS * G1_HIST_STEP), block_dim=TPB,
+        )
+        h_live.enqueue_fill(Scalar[DT](1.0))
+        ctx.enqueue_function[g1_scale_clip_kernel[N_ENVS * G1_N_ACT]](
+            mptr(h_last.unsafe_ptr()), mptr(env._action.unsafe_ptr()),
+            Scalar[DT](G1_NORMALIZE_TO), Scalar[DT](G1_ACTION_CLIP),
+            grid_dim=_blocks(N_ENVS * G1_N_ACT), block_dim=TPB,
+        )
     var reward0 = ctx.enqueue_create_buffer[DT](N_ENVS)
     var done0 = ctx.enqueue_create_buffer[DT](N_ENVS)
     var ao = ctx.enqueue_create_buffer[DT](N_ENVS * 2 * ACT)
@@ -763,6 +851,9 @@ def main() raises:
     var chunk_in = Tensor()
     var chunk_out = Tensor()
     ensure_t["gpu"](chunk_in, B_CHUNK * OBS, Optional(ctx))
+    # the derived tail of these rows is never gathered into; zero it ONCE so
+    # `b` is not fed whatever the allocator left behind
+    chunk_in.dev.value().enqueue_fill(Scalar[DT](0.0))
     ensure_t["gpu"](chunk_out, B_CHUNK * D, Optional(ctx))
     var track_b = ctx.enqueue_create_buffer[DT](N_PAD * D)
     var track_z = ctx.enqueue_create_buffer[DT](N_TRACK * TRACK_LEN * D)
@@ -823,10 +914,12 @@ def main() raises:
                 mptr(track_idx.unsafe_ptr()), Int32(c * B_CHUNK), mptr(chunk_idx.unsafe_ptr()),
                 grid_dim=_blocks(B_CHUNK), block_dim=TPB,
             )
-            ctx.enqueue_function[gather_rows_kernel[OBS, B_CHUNK]](
+            # SP-wide source into OBS-wide rows; the tail was zeroed once at
+            # allocation and `b` filters it out anyway (§12.34)
+            ctx.enqueue_function[gather_rows_into_kernel[SP, OBS, B_CHUNK]](
                 mptr(agent.exp_obs.dev.value().unsafe_ptr()), mptr(chunk_idx.unsafe_ptr()),
                 mptr(chunk_in.dev.value().unsafe_ptr()),
-                grid_dim=_blocks(B_CHUNK * OBS), block_dim=TPB,
+                grid_dim=_blocks(B_CHUNK * SP), block_dim=TPB,
             )
             agent.base.obs_ema.apply[B_CHUNK](chunk_in)
             call_forward["gpu", B_CHUNK](
@@ -866,10 +959,7 @@ def main() raises:
     var n_batched = (total_env_steps - start_at) // N_ENVS
     if n_batched <= 0:
         print("nothing to do: --start-at", start_at, ">= --steps", total_env_steps)
-        run.set_outcome(String("noop_start_at_ge_steps"))
-        logger.close()
-        close_sink(artifacts)
-        run.close()
+        finish_run(run, logger, artifacts, String("noop_start_at_ge_steps"))
         return
     var last_measure = 0.0
     var last_rate = 0.0
@@ -883,6 +973,7 @@ def main() raises:
         if s % T_EPISODE == 0:
             var sign = 1.0 if random_float64() < 0.5 else -1.0
             _rsi_reset(sign)
+            _hist_reset()
             if smoke or s % (T_EPISODE * 20) == 0:
                 # diagnostics: which rows the lanes got, and how many lie down
                 ctx.enqueue_copy(h_row_got, row_got)
@@ -913,20 +1004,33 @@ def main() raises:
         if track_on:
             _pin_step(s % TRACK_LEN)
 
-        ctx.enqueue_copy(prev_obs, env._obs)
+        # read: pack the actor's view BEFORE acting
+        ctx.enqueue_copy(prev_env_obs, env._obs)   # the STORED head, pre-step
+        _pack_obs()
+        ctx.enqueue_copy(prev_obs, full_obs)
         agent.select_action_batched[N_ENVS](
-            LayoutTensor[DT, Layout.row_major(N_ENVS, OBS), MutAnyOrigin](env._obs),
+            LayoutTensor[DT, Layout.row_major(N_ENVS, OBS), MutAnyOrigin](full_obs),
             LayoutTensor[DT, Layout.row_major(N_ENVS, ACT), MutAnyOrigin](env._action),
             LayoutTensor[DT, Layout.row_major(N_ENVS, 2 * ACT), MutAnyOrigin](ao),
             LayoutTensor[DT, Layout.row_major(N_ENVS, ACT + 1), MutAnyOrigin](alp),
             env_steps,
         )
+        # push(state_t, a_{t-1}) then last_action = a_t, before the env moves
+        _hist_advance()
         env.step_batch[N_ENVS](Optional(ctx), UInt64(seed_v) + UInt64(s))
+        # steps since the reset, for the DERIVED tail's back-step bound
+        var age = s % T_EPISODE
+        agent.set_age(age if age < G1_HIST_MAX_AGE else G1_HIST_MAX_AGE)
         # The reset runs at the START of a step, so it is THIS transition
         # whose successor row will hold a post-reset observation — the ring
         # derives `s'` from the next row and must be told to skip this one.
         agent.set_boundary((s + 1) % T_EPISODE == 0)
-        agent.record_batch_gpu[N_ENVS](ctx, prev_obs, env._action, reward0, env._obs, done0)
+        # ⚠ `prev_obs` is the PACKED 928 row; `record_batch_gpu` stores
+        # `STORE_OBS` = 527 columns per row and would MIS-STRIDE a packed one.
+        # `prev_env_obs` is the same row's stored head, captured before the
+        # step — identical to `prev_obs[0:527]` by construction, and correctly
+        # strided.
+        agent.record_batch_gpu[N_ENVS](ctx, prev_env_obs, env._action, reward0, env._obs, done0)
 
         if env_steps >= SEED_STEPS:
             if no_graph:
@@ -978,13 +1082,13 @@ def main() raises:
             # stand makes the run go FASTER.
             var mn = List[String]()
             var mv = List[Float64]()
-            mn.append(String("loss/measure")); mv.append(measure)
-            mn.append(String("loss/ortho")); mv.append(ortho)
-            mn.append(String("loss/actor")); mv.append(actor)
-            mn.append(String("loss/fb_offdiag")); mv.append(fb_quad)
-            mn.append(String("loss/fb_diag")); mv.append(fb_anchor)
-            mn.append(String("loss/M1")); mv.append(m_mean)
-            mn.append(String("loss/q_fb_abs")); mv.append(q_fb_abs)
+            mn.append(String("fb_measure_loss")); mv.append(measure)
+            mn.append(String("fb_ortho_loss")); mv.append(ortho)
+            mn.append(String("policy_loss")); mv.append(actor)
+            mn.append(String("fb_offdiag")); mv.append(fb_quad)
+            mn.append(String("fb_diag")); mv.append(fb_anchor)
+            mn.append(String("fb_m1")); mv.append(m_mean)
+            mn.append(String("fb_q_abs_mean")); mv.append(q_fb_abs)
             # ── the CPR half ──────────────────────────────────────────
             # Runs 1-3 turned at the same step under three materially
             # different FB losses, and NOTHING logged inflected at the turn.
@@ -1007,43 +1111,33 @@ def main() raises:
             var q_loss = 0.0
             var q_pi = 0.0
             agent.head.read_diag(d_pos, d_neg, r_d, q_d, q_loss, q_pi)
-            mn.append(String("cpr/bce_expert")); mv.append(d_pos)
-            mn.append(String("cpr/bce_policy")); mv.append(d_neg)
-            mn.append(String("cpr/r_d")); mv.append(r_d)
-            mn.append(String("cpr/q_d")); mv.append(q_d)
-            mn.append(String("cpr/q_loss")); mv.append(q_loss)
-            mn.append(String("cpr/q_pi")); mv.append(q_pi)
-            mn.append(String("norm/F")); mv.append(f_norm)
-            mn.append(String("norm/B")); mv.append(b_norm)
+            mn.append(String("disc_expert_loss")); mv.append(d_pos)
+            mn.append(String("disc_policy_loss")); mv.append(d_neg)
+            mn.append(String("disc_reward_mean")); mv.append(r_d)
+            mn.append(String("mean_q")); mv.append(q_d)
+            mn.append(String("critic_loss")); mv.append(q_loss)
+            mn.append(String("policy_q_mean")); mv.append(q_pi)
+            mn.append(String("f_norm")); mv.append(f_norm)
+            mn.append(String("b_norm")); mv.append(b_norm)
             # `|B|` is pinned to sqrt(d) by the net's sphere projection, so it
             # is structurally incapable of showing a DIRECTIONAL collapse —
             # which is what killed run 1 (§12.12). `ortho` can, once unpacked.
             #
-            # `tr(C) = d` always, so `Q := ortho + 2d` is the whole pairwise
-            # sum `mean_ij (B_i·B_j)^2`. That sum INCLUDES i=j, and each of
-            # those is `||B_i||^4 = d^2`, contributing a constant `d^2/BATCH`
-            # that has nothing to do with isotropy — subtract it before
-            # reading anything, or a perfectly isotropic B reports rank 205
-            # instead of 256:
+            # The participation-ratio effective rank of `E[B B^T]`, derived
+            # from `L_ortho`. d = 256 means isotropic; the reference holds
+            # ~255.7 (§12.13). THIS is the number to watch, not `b_norm`.
             #
-            #     tr(C^2)  = (Q - d^2/BATCH) · BATCH/(BATCH-1)
-            #     rank_eff = tr(C)^2 / tr(C^2) = d^2 / tr(C^2)
-            #
-            # the participation-ratio effective rank of `E[B B^T]`. d = 256
-            # means isotropic; the reference holds it there for 200 M steps
-            # (§12.13). THIS is the number to watch, not `norm/B`.
-            var q = ortho + 2.0 * Float64(D)
-            var nb = Float64(BATCH)
-            var tr_c2 = (q - Float64(D) * Float64(D) / nb) * nb / (nb - 1.0)
-            mn.append(String("norm/B_rank_eff"))
-            mv.append(
-                Float64(D) * Float64(D) / tr_c2 if tr_c2 > 1e-9 else 0.0
-            )
-            mn.append(String("env/st_s")); mv.append(rate)
-            mn.append(String("env/ring")); mv.append(Float64(agent.base.size))
-            mn.append(String("train/updates")); mv.append(Float64(agent.total_train_steps()))
-            mn.append(String("env/lie_down")); mv.append(lie_frac)
-            mn.append(String("env/elapsed_s")); mv.append(el)
+            # ⚠ The conversion lives in `loss.mojo` BESIDE the loss it depends
+            # on. It used to be inline here and was missed when `L_ortho`
+            # moved to the reference's scale (§12.28), logging 200.8 where the
+            # truth was 244.3 — the shape of a B collapse, from a metric bug.
+            mn.append(String("b_rank_eff"))
+            mv.append(fb_rank_eff_from_ortho[D, BATCH](ortho))
+            mn.append(String("steps_per_s")); mv.append(rate)
+            mn.append(String("buffer_size")); mv.append(Float64(agent.base.size))
+            mn.append(String("train_steps")); mv.append(Float64(agent.total_train_steps()))
+            mn.append(String("lie_down_frac")); mv.append(lie_frac)
+            mn.append(String("wall_s")); mv.append(el)
             logger.log_scalars(mn, mv, env_steps + start_at)
         var ee = eval_every if eval_every > 0 else ckpt_every
         var do_ckpt = ckpt_every > 0 and s > 0 and s % ckpt_every == 0
@@ -1073,10 +1167,10 @@ def main() raises:
                 )
                 var en = List[String]()
                 var ev = List[Float64]()
-                en.append(String("eval/emd")); ev.append(sc.emd)
-                en.append(String("eval/distance")); ev.append(sc.distance)
-                en.append(String("eval/proximity")); ev.append(sc.proximity)
-                en.append(String("eval/segments")); ev.append(Float64(sc.n))
+                en.append(String("eval_emd")); ev.append(sc.emd)
+                en.append(String("eval_distance")); ev.append(sc.distance)
+                en.append(String("eval_proximity")); ev.append(sc.proximity)
+                en.append(String("eval_segments")); ev.append(Float64(sc.n))
 
                 # ── motion prioritization refresh ─────────────────────
                 if prio_on and env_steps + start_at >= next_prio:
@@ -1124,9 +1218,9 @@ def main() raises:
                         " weight spread",
                         g1_motion_priority(hi) / g1_motion_priority(lo),
                     )
-                    en.append(String("prio/emd_min")); ev.append(lo)
-                    en.append(String("prio/emd_max")); ev.append(hi)
-                    en.append(String("prio/spread"))
+                    en.append(String("prio_emd_min")); ev.append(lo)
+                    en.append(String("prio_emd_max")); ev.append(hi)
+                    en.append(String("prio_spread"))
                     ev.append(
                         g1_motion_priority(hi) / g1_motion_priority(lo)
                     )
@@ -1149,12 +1243,10 @@ def main() raises:
     # `run.kv` still saying `running` with an hour-old `started` IS a crashed
     # run — which is exactly what a 55-hour run needs a reader to be able to
     # tell without the terminal it was launched from.
-    run.set_outcome(
+    finish_run(
+        run, logger, artifacts,
         String("env_steps=") + String(start_at + n_batched * N_ENVS)
         + " updates=" + String(agent.total_train_steps())
         + " measure=" + String(last_measure)
-        + " env_st_s=" + String(last_rate)
+        + " env_st_s=" + String(last_rate),
     )
-    logger.close()
-    close_sink(artifacts)
-    run.close()

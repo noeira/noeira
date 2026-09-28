@@ -14,7 +14,7 @@ from std.math import abs, sqrt
 from std.testing import assert_true
 
 from noeira.envs.robots.g1_tracking_eval import (
-    G1_SEG_ROWS, G1_SEG_STRIDE, g1_n_segments, g1_segment_row,
+    G1_SEG_ROWS, G1_SEG_STRIDE, g1_n_segments, g1_segment_row, g1_segment_pick,
     g1_track_metrics,
 )
 
@@ -133,10 +133,60 @@ def test_segment_table() raises:
     assert_true(g1_segment_row(1234, 3) == 1234 + 3 * G1_SEG_STRIDE, "offset")
 
 
+def test_segment_pick() raises:
+    """`g1_segment_pick` decides WHICH windows the eval ever sees.
+
+    Taking the first `n_take` of every clip reads ~0.19 low against the
+    reference's all-862 number (docs §12.29), so the picks are stratified.
+    Four properties, each of which a plausible wrong formula breaks:
+      * FULL COVERAGE IS THE IDENTITY — `n_take == n_avail` must score every
+        segment, or raising `--eval-segments` would start SKIPPING windows;
+      * in range, so no pick runs past the clip;
+      * strictly increasing, so no window is scored twice while another is
+        never scored (a `k * n_avail // n_take` rule with rounding can tie);
+      * at `n_take == 1` it is NOT segment 0 — that is the whole bias being
+        removed, and a formula without the midpoint offset returns 0 here.
+    """
+    print("[5] the stratified segment picker ...")
+    for n_avail in range(1, 40):
+        # identity at full coverage
+        for k in range(n_avail):
+            assert_true(
+                g1_segment_pick(n_avail, n_avail, k) == k,
+                "full coverage must be the identity: n_avail "
+                + String(n_avail) + " k " + String(k) + " -> "
+                + String(g1_segment_pick(n_avail, n_avail, k)),
+            )
+        for n_take in range(1, n_avail + 1):
+            var prev = -1
+            for k in range(n_take):
+                var got = g1_segment_pick(n_avail, n_take, k)
+                assert_true(
+                    got >= 0 and got < n_avail,
+                    "pick out of range: " + String(got) + " of "
+                    + String(n_avail),
+                )
+                assert_true(
+                    got > prev,
+                    "picks not strictly increasing at n_avail "
+                    + String(n_avail) + " n_take " + String(n_take),
+                )
+                prev = got
+    # one pick lands mid-clip, not at its opening ten seconds
+    assert_true(
+        g1_segment_pick(22, 1, 0) == 11,
+        "a single pick must be the MIDDLE of the clip, got "
+        + String(g1_segment_pick(22, 1, 0)),
+    )
+    print("      identity at full coverage, in range, strictly increasing,"
+          " 1-of-22 -> segment", g1_segment_pick(22, 1, 0))
+
+
 def main() raises:
     print("=== G1 tracking protocol ===")
     test_identity()
     test_proximity_ramp()
     test_emd_is_a_set_metric_and_distance_is_not()
     test_segment_table()
+    test_segment_pick()
     print("=== all passed ===")

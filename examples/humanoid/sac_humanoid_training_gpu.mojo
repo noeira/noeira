@@ -9,7 +9,10 @@ GPU successor of `sac_humanoid_training.mojo` and counterpart of the legacy
     train-step pipeline run on-device.
   * `Phyics3dBatchedEnv[HumanoidModel, HumanoidConfig, N_ENVS]` — the physics3d env
     (`GPUContinuousEnv`) into a `BatchedEnv`.
-  * `RemoteLogger` — streams `env/mean_ret` and `env/ep_count`.
+  * A `RunContext` (project `mujoco`): the checkpoint, `metrics.csv` and
+    `run.kv` all live in `runs/<id>/`, and the monitor row carries the same id.
+  * `run_logger(run)` — `metrics.csv` + the monitor: `env/mean_ret` and
+    `env/ep_count`.
 
 `updates_per_step=N_ENVS` keeps the effective UTD = 1 per collected transition.
 
@@ -28,8 +31,9 @@ NOTE on checkpointing: the batched `train` entry point auto-saves the SAC
 weights (one-file v3 checkpoint: actor + online critics, no optimizer state) every `CHECKPOINT_EVERY` env-steps
 and once at the end (a host-side D2H between iterations, safe with the CUDA-
 graph capture). The LayerNorm critic changes `PARAM_SIZE`, so this checkpoint
-(`sac_humanoid_nn_ln.ckpt`) is NOT loadable by the preset-based eval script —
-render it with `sac_humanoid_nn_ln_eval_cpu.mojo` (same LayerNorm critic).
+(`run.checkpoint_path("last")`) is NOT loadable by the preset-based eval
+script — render it with `sac_humanoid_nn_ln_eval_cpu.mojo` (same LayerNorm
+critic).
 
 Humanoid (Phyics3dEnv, MuJoCo-style):
   * 45D observation (qpos[2:24] + qvel[0:23])
@@ -48,8 +52,9 @@ from max.gpu.host import DeviceContext
 from std.random import seed
 from std.time import perf_counter_ns
 
-from noeira.core.dotenv import load_dotenv
-from noeira.core.logger import RemoteLogger
+from noeira.core.run import RunContext, register_run
+from noeira.core.run_session import RunLogger, finish_run, run_logger
+from noeira.io.artifact_sink import sink_for_run
 from noeira.nn.constants import DT
 from noeira.deep_agents.sac import SAC
 from noeira.envs.phyics3d_batched_env import Phyics3dBatchedEnv
@@ -84,7 +89,6 @@ comptime PRINT_EVERY = 50_000
 comptime DIAG_EVERY = 1_000  # full metric-bundle flush cadence (mean_q, …)
 comptime CHECKPOINT_EVERY = 50_000  # auto-save cadence (env steps)
 # render with `sac_humanoid_nn_eval_cpu.mojo` (HIDDEN=256).
-comptime CHECKPOINT_PATH = "sac_humanoid_nn.ckpt"
 
 # Periodic DETERMINISTIC eval (greedy, no exploration noise) on an isolated set
 # of `EVAL_ENVS` parallel envs — the deployable-policy signal. The always-on
@@ -130,17 +134,16 @@ def main() raises:
     print("=" * 70)
 
     with DeviceContext() as ctx:
-        # ─── Logger (remote) ─────────────────────────────────────────────
-        var env_vars = load_dotenv()
-        var api_key = env_vars.get("NOEIRA_CLOUD_API_KEY", "")
-        var url = env_vars.get("NOEIRA_CLOUD_URL", "")
-
-        var logger = RemoteLogger(
-            server_url=url,
-            run_name="SAC Humanoid NN (GPU, H256, 3M)",
-            buffer_size=64,
-            api_key=api_key,
+        # ─── Run + logger ───────────────────────────────────────────────────
+        var run = RunContext(
+            project=String("mujoco"),
+            driver=String("examples/humanoid/sac_humanoid_training_gpu.mojo"),
+            slug=String("sac-humanoid-gpu"),
+            env=String("builtin:mujoco/humanoid"),
         )
+        var checkpoint_path = run.checkpoint_path(String("last"))
+        print("  Run                =", run.dir)
+        var logger = run_logger(run, buffer_size=64)
         logger.set_config("algorithm", "SAC")
         logger.set_config("env", "Humanoid")
         logger.set_config("target", "gpu")
@@ -148,6 +151,8 @@ def main() raises:
         logger.set_config("batch", String(BATCH))
         logger.set_config("n_envs", String(N_ENVS))
         logger.set_config("buffer_capacity", String(REPLAY_CAPACITY))
+        register_run(run, logger)
+        var artifacts = sink_for_run(run.id, run.dir)
 
         var logger_ptr = Pointer(to=logger).as_unsafe_any_origin()
 
@@ -183,7 +188,7 @@ def main() raises:
         _ = agent.train[
             BatchedEnvT,
             N_ENVS=N_ENVS,
-            L=RemoteLogger,
+            L=RunLogger,
             USE_TRAIN_CUDA_GRAPH=True,
             USE_ENV_CUDA_GRAPH=False,
             EE=EvalEnvT,
@@ -199,7 +204,9 @@ def main() raises:
             diag_every=DIAG_EVERY,
             episode_sync_every=32,
             checkpoint_every=CHECKPOINT_EVERY,
-            checkpoint_path=CHECKPOINT_PATH,
+            checkpoint_path=checkpoint_path,
+            artifacts=artifacts,
+            run_dir=run.dir,
             eval_env=eval_env_ptr,
             eval_every=EVAL_EVERY,
             eval_episodes=EVAL_EPISODES,
@@ -207,7 +214,11 @@ def main() raises:
         )
         _ = eval_env  # lifetime extender for eval_env_ptr
         var elapsed_s = Float64(perf_counter_ns() - t_start) / 1e9
-        logger.close()
+        var sent = logger.b.total_logged()
+        finish_run(
+            run, logger, artifacts,
+            String("mean_return_100=") + String(agent.mean_return()),
+        )
         _ = logger  # lifetime extender for logger_ptr
 
         # ─── Summary ─────────────────────────────────────────────────────
@@ -218,7 +229,8 @@ def main() raises:
         print("  elapsed                   =", elapsed_s, "s")
         print("  mean ep return (last 100) =", agent.mean_return())
         print("  episodes completed        =", agent.ep_count())
-        print("  remote points sent        =", logger.total_logged())
+        print("  remote points sent        =", sent)
+        print("  run record                =", run.kv_path())
         print("=" * 70)
 
         var final_avg = Float64(agent.mean_return())

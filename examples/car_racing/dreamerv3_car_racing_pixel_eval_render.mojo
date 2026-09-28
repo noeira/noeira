@@ -20,11 +20,14 @@ imagination), so the checkpoint loads regardless of which recon it trained with.
 Run with:
     pixi run -e apple  mojo run -I . examples/car_racing/dreamerv3_car_racing_pixel_eval_render.mojo
     pixi run -e nvidia mojo run -I . examples/car_racing/dreamerv3_car_racing_pixel_eval_render.mojo
+    pixi run -e apple  mojo run -I . examples/car_racing/dreamerv3_car_racing_pixel_eval_render.mojo --ckpt <run_id>
 
-Reads dreamerv3_carracing_pixel_gpu.ckpt.
+Reads dreamerv3_carracing_pixel_gpu.ckpt, or the run/file given by `--ckpt`.
 """
 
 from std.memory import alloc
+from std.sys import argv
+from noeira.core.run import resolve_checkpoint
 from max.gpu.host import DeviceContext
 
 from noeira.nn.constants import DT
@@ -78,16 +81,28 @@ comptime MAX_STEPS = 1_000  # Gymnasium CarRacing-v3 max_episode_steps (env fram
 comptime ACTION_REPEAT = 4
 
 
+def _flag(name: String, dflt: String) raises -> String:
+    """Value of `--name X`, or `dflt` when the flag is absent."""
+    var av = argv()
+    for i in range(1, len(av)):
+        if String(av[i]) == name:
+            if i + 1 >= len(av):
+                raise Error("flag " + name + " needs a value")
+            return String(av[i + 1])
+    return dflt
+
+
 def main() raises:
+    var ckpt = resolve_checkpoint(_flag(String("--ckpt"), String(CHECKPOINT_PATH)), String("last"))
     print("=" * 70)
     print("DreamerV3 CarRacing — checkpoint eval (color scene, CPU env)")
     print("=" * 70)
-    print("  Checkpoint:", CHECKPOINT_PATH, "  Episodes:", EVAL_EPISODES)
+    print("  Checkpoint:", ckpt, "  Episodes:", EVAL_EPISODES)
     print()
 
     with DeviceContext() as ctx:
         var agent = Ag.make(ctx=ctx, action_scale=Scalar[DT](1.0))
-        agent.load(CHECKPOINT_PATH)
+        agent.load(ckpt)
         print("Checkpoint loaded. Starting live play...")
 
         var env = Env(max_steps=MAX_STEPS)

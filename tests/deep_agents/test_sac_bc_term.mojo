@@ -94,6 +94,15 @@ def main() raises:
     print("  loss with q weight 0:", out_only.loss, " expected", Float64(LAMBDA) * l1_only)
     assert_almost_equal(Float64(out_only.loss), Float64(LAMBDA) * l1_only, atol=1e-4,
                         msg="q weight 0 => loss = λ·mean(mask·L1) alone")
+    # ── 5. set_bc_weight changes λ alone: the mask stays, the loss scales ─
+    blk.set_bc_weight(LAMBDA * Scalar[DT](2.0), None)
+    var l1_twice = _mean_l1(actor, mb_s, mb_a)
+    var out_twice = blk.forward_backward["cpu"](actor, opt, c1, c2, mb_s, mb_a, Scalar[DT](0.0), None)
+    print("  loss with λ doubled by set_bc_weight:", out_twice.loss, " expected", 2.0 * Float64(LAMBDA) * l1_twice)
+    assert_almost_equal(Float64(out_twice.loss), 2.0 * Float64(LAMBDA) * l1_twice, atol=1e-4,
+                        msg="set_bc_weight(2λ) => loss = 2λ·mean(mask·L1)")
+    assert_true(Float64(blk.bc_weight) == 2.0 * Float64(LAMBDA), "bc_weight field follows")
+    blk.set_bc_weight(LAMBDA, None)
     blk.set_q_weight(Scalar[DT](1.0))
-    print("SAC BC TERM OK (q weight leg too)")
+    print("SAC BC TERM OK (q weight + set_bc_weight legs too)")
     print("SAC BC TERM OK")

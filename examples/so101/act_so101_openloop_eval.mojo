@@ -7,6 +7,7 @@ action stream against what was actually recorded.
 
     pixi run mojo build -I . -Xlinker -ld_classic -o /tmp/act_eval \\
         examples/so101/act_so101_openloop_eval.mojo && /tmp/act_eval
+    ACT_CKPT=<run_id> /tmp/act_eval    # a training run's best.ckpt (or a .ckpt path)
 
 This is the whole inference path — chunked query, ring buffer, exponential
 weighting, denormalization back to lerobot units — exercised exactly as a
@@ -28,6 +29,18 @@ An error number on its own says nothing. Two references are reported beside it:
 * **hold** — predict the CURRENT joint positions for every future step. This is
   the trivial policy, and on a slow demonstration it is a strong one; a model
   that cannot beat it has learned nothing useful.
+
+  ⚠⚠ IT IS REPORTED TWICE, AND ONLY ONE OF THE TWO IS ACT'S BASELINE.
+  `hold 1-step` compares each step's action with the position measured AT
+  that step: a horizon of zero. ACT's action for step `t` is the temporal
+  ensemble of every chunk queried in the last K steps, weighted toward the
+  OLDEST (`m = 0.01`), so what it scores was on average predicted ~K/2 steps
+  earlier. `hold ens.` is hold run through the SAME ensemble — query `i`
+  predicts `q_i` for every future step, and step `t` averages those with
+  ACT's own weights — and it is the column ACT is judged against. Before
+  2026-09-22 only the 1-step column existed, and the first checkpoint with a
+  working decoder read as "does NOT beat hold" (9.94 vs 2.00) while it beat
+  the horizon-matched hold (14.4 by the weighted per-horizon error) by ~30%.
 * **mean** — predict the dataset's mean action. Beating only this is not
   evidence of anything.
 
@@ -37,6 +50,7 @@ ignoring the gripper — the one dimension that decides whether a grasp happens.
 
 from std.python import Python, PythonObject
 
+from std.math import exp
 from noeira.nn.constants import DT
 from noeira.deep_agents.act.config import (
     ACT_TEMPORAL_ENSEMBLE_M,
@@ -56,6 +70,7 @@ from noeira.deep_agents.act.config import (
 from noeira.deep_agents.act.data import ACTDataset
 from noeira.deep_agents.act.inference import TemporalEnsemble, denormalize
 from noeira.deep_agents.act.trainer import ACTTrainer
+from noeira.core.run import resolve_checkpoint
 
 
 comptime QPOS = SO101_QPOS
@@ -93,9 +108,9 @@ comptime T = ACTTrainer[
 ]
 comptime IMG_ELEMS = N_CAM * 3 * IMG_H * IMG_W
 comptime DEFAULT_CKPT = "act_so101_best_gpu.ckpt"
-"""The GPU run's best checkpoint. `ACT_CKPT` overrides — point it at
-`/tmp/act_so101_best.ckpt` for a CPU run, or at a `_last_` checkpoint to
-evaluate a run that was killed."""
+"""The GPU run's best checkpoint. `ACT_CKPT` overrides — a RUN ID (its
+`runs/<id>/checkpoints/best.ckpt`, what the trainers now write) or a checkpoint
+FILE, e.g. a run's `last.ckpt` to evaluate a run that was killed."""
 
 
 # Joint names, in the dataset's own order (meta/info.json `action.names`).
@@ -147,6 +162,9 @@ def main() raises:
     )
     if ckpt.byte_length() == 0:
         ckpt = String(DEFAULT_CKPT)
+    else:
+        # a RUN ID resolves to its checkpoints/best.ckpt; a file is used as is
+        ckpt = resolve_checkpoint(ckpt, String("best"))
     if not Bool(os.path.exists(PythonObject(ckpt))):
         print("MISSING CHECKPOINT: " + ckpt)
         print(
@@ -191,6 +209,7 @@ def main() raises:
 
     var sum_abs = List[Float64](length=ADIM, fill=0.0)
     var sum_hold = List[Float64](length=ADIM, fill=0.0)
+    var sum_hold_ens = List[Float64](length=ADIM, fill=0.0)
     var sum_mean = List[Float64](length=ADIM, fill=0.0)
     var n = 0
     var g0 = ds.store.episodes.start_of(ep)
@@ -205,10 +224,22 @@ def main() raises:
         for j in range(ADIM):
             var truth = Float64(ds.action_raw[(g0 + t) * ADIM + j])
             sum_abs[j] += abs(Float64(pred[j]) - truth)
-            # `hold`: keep the current measured joint position.
+            # `hold 1-step`: keep the current measured joint position.
             sum_hold[j] += abs(
                 Float64(ds.qpos_raw[(g0 + t) * QPOS + j]) - truth
             )
+            # `hold ens.`: hold through ACT's ensemble — the queries that
+            # contribute to step t (the window [t-K+1, t]) each predict the
+            # position they measured, weighted exp(-m * (i - i_min)) exactly
+            # as `TemporalEnsemble.action_at` weights ACT's chunks.
+            var i_min = t - K + 1 if t - K + 1 > 0 else 0
+            var wsum = 0.0
+            var acc = 0.0
+            for i in range(i_min, t + 1):
+                var w = exp(-ACT_TEMPORAL_ENSEMBLE_M * Float64(i - i_min))
+                wsum += w
+                acc += w * Float64(ds.qpos_raw[(g0 + i) * QPOS + j])
+            sum_hold_ens[j] += abs(acc / wsum - truth)
             # `mean`: the dataset's average action.
             sum_mean[j] += abs(Float64(ds.action_mean[j]) - truth)
         n += 1
@@ -223,17 +254,20 @@ def main() raises:
 
     print("")
     print("  mean |error| in lerobot units (degrees; gripper 0-100)")
-    print("    joint            ACT      hold      mean")
+    print("    joint            ACT      hold ens.   hold 1-step   mean")
     var names = joint_names()
     var tot_act = Float64(0.0)
     var tot_hold = Float64(0.0)
+    var tot_hold_ens = Float64(0.0)
     var tot_mean = Float64(0.0)
     for j in range(ADIM):
         var a = sum_abs[j] / Float64(n)
         var h = sum_hold[j] / Float64(n)
+        var he = sum_hold_ens[j] / Float64(n)
         var m = sum_mean[j] / Float64(n)
         tot_act += a
         tot_hold += h
+        tot_hold_ens += he
         tot_mean += m
         var nm = names[j]
         while nm.byte_length() < 14:
@@ -244,6 +278,8 @@ def main() raises:
             + "  "
             + String(a)
             + "   "
+            + String(he)
+            + "   "
             + String(h)
             + "   "
             + String(m)
@@ -253,17 +289,22 @@ def main() raises:
         "    ALL             "
         + String(tot_act / Float64(ADIM))
         + "   "
+        + String(tot_hold_ens / Float64(ADIM))
+        + "   "
         + String(tot_hold / Float64(ADIM))
         + "   "
         + String(tot_mean / Float64(ADIM))
     )
     print("")
-    if tot_act < tot_hold:
-        print("  ACT beats `hold` — the policy is using the observation.")
+    if tot_act < tot_hold_ens:
+        print("  ACT beats `hold ens.` (hold at ACT's own horizons) — the policy is"
+              " using the observation. `hold 1-step` is a zero-horizon"
+              " reference, not ACT's baseline.")
     else:
         print(
-            "  ⚠ ACT does NOT beat `hold`. At 4 training episodes that is a"
-            " likely outcome and it means the vision tower has not learned"
-            " anything usable — not that the port is wrong (the M0-M7 gates"
-            " cover that). More demonstrations is the lever."
+            "  ⚠ ACT does NOT beat `hold ens.` — holding the arm still, run through"
+            " the same ensemble, predicts the demonstration as well. The policy"
+            " has not learned anything the closed loop could use; check its"
+            " chunks with `pixi run act-so101-inspect` (a flat chunk is the"
+            " pre-2026-09-21 decoder) before blaming the data."
         )

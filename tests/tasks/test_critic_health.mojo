@@ -29,7 +29,8 @@ from noeira.tasks.critic_health import critic_health
 
 
 def write_csv(path: String, peak_q: Float64, peak_loss: Float64,
-              final_r: Float64) raises:
+              final_r: Float64,
+              reward_name: String = String("reward_mean")) raises:
     """A CSV with the four-field shape `CsvLogger` writes.
 
     ⚠ THE PEAK IS BURIED IN THE MIDDLE and the LAST rows are healthy — which
@@ -46,7 +47,10 @@ def write_csv(path: String, peak_q: Float64, peak_loss: Float64,
             l = peak_loss
         s += String(i * 32) + ",0.1,mean_q," + String(q) + "\n"
         s += String(i * 32) + ",0.1,critic_loss," + String(l) + "\n"
-        s += String(i * 32) + ",0.1,mean_reward," + String(final_r) + "\n"
+        s += (
+            String(i * 32) + ",0.1," + reward_name + "," + String(final_r)
+            + "\n"
+        )
     with open(path, "w") as f:
         f.write(s)
 
@@ -125,6 +129,18 @@ def main() raises:
         print("  FAIL: the converged run trips the overshoot band")
         fails += 1
     remove(mid_path)
+
+    # A run logged before 2026-09-22 names the batch reward `mean_reward`.
+    # Those are the runs this is read against, so the old name must give the
+    # SAME fixed point — not a silent 0 that makes every peak look diverged.
+    var legacy = String("/tmp/_ch_legacy.csv")
+    write_csv(legacy, 48.9, 1.0, 0.488, String("mean_reward"))
+    var h_l = critic_health(legacy, 0.99)
+    print("  legacy `mean_reward` CSV: fixed point", h_l[2], "(expected 48.8)")
+    if h_l[2] < 48.7 or h_l[2] > 48.9:
+        print("  FAIL: a pre-rename CSV lost its reward")
+        fails += 1
+    remove(legacy)
 
     remove(ok_path)
     remove(bad_path)

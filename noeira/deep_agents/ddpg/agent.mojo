@@ -289,7 +289,7 @@ struct DDPGAgent[
 
     def save(mut self, path: String) raises:
         """Thin passthrough to `trainer.save_state(path)`. Writes ONE
-        file (`nn-ckpt v2` envelope) with prefixed sections for actor,
+        file (v3 `storage-ckpt` file) with prefixed sections for actor,
         critic, actor_opt, critic_opt. Replay buffer + episode tracker
         NOT included."""
         self.trainer.save_state(path)

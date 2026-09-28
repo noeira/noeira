@@ -1,140 +1,38 @@
 ---
 title: noeira cloud
-description: The hosted side of noeira — runs, live metrics, run artifacts, promoted policies, project definitions and datasets, at cloud.noeira.ai.
+description: The hosted companion to noeira — runs, live metrics, policies and datasets shared across the machines a project lives on. In private use today; a private beta is planned.
 ---
 
-import Maturity from '~/components/Maturity.astro';
-
-<Maturity level="beta" note="A separate repository, github.com/noeira/noeira-cloud. Nothing in noeira requires it." />
-
-noeira cloud is the dashboard and storage behind a noeira project that lives
-on more than one machine. Training usually happens on a rented GPU, recording
-on the laptop beside the arm, deployment on a Jetson; the cloud is where the
-three meet. It is served at **https://cloud.noeira.ai** (the older host
-`rl-monitor.denislabs.com` still answers during the transition).
-
-Everything it holds is also on disk locally. A run's directory, its
-checkpoints and its `run.kv` record are written on the box that ran it; the
-cloud is their index and a second copy, not the source of truth.
-
-## What it holds
-
-| Object | How it gets there | On the dashboard |
-|---|---|---|
-| **Runs** | `register_run` at start, metric batches while training, a finish at `close()` | the run list, per-run charts streamed live, run comparison |
-| **Run artifacts** | uploaded during the run by the driver's `ArtifactSink`, or later with `pixi run project-push` | a project's artifacts, downloadable with `pixi run project-pull` |
-| **Policies** | recorded by `pixi run project-promote` | a project's promoted policies: which run fills each role, and why |
-| **Project definitions** | `pixi run project-push` (`project.kv`, calibration, task files, policy records) | a project's definition files |
-| **Datasets** | `pixi run dataset-push` | a project's datasets, pulled back with `pixi run dataset-pull` |
-
-Projects are private and are not part of the git repository — `projects/` is
-ignored — so the cloud is also how a project's definition reaches a second
-machine. See [Projects and runs](/concepts/projects/) and
-[remote datasets](/data/remote/).
-
-## Connecting a machine
-
-Create an API key in the dashboard, then put the URL and the key in a `.env`
-at the repository root:
-
-```
-NOEIRA_CLOUD_URL=https://cloud.noeira.ai
-NOEIRA_CLOUD_API_KEY=...
-```
-
-Every client in the tree reads these two names through
-`noeira.core.dotenv`, and the key is sent as a bearer token. With no `.env`,
-or an empty URL, the loggers stay inert and training runs unaffected; the
-`project-push` / `project-pull` / `dataset-*` tasks refuse with the missing
-key named, rather than failing later as a 401.
-
-:::caution[`.env` is shared by every run on the box]
-Blanking it to keep a smoke test off the dashboard also silences the next real
-run. The ACT driver has `ACT_NO_MONITOR=1` for exactly this; prefer a
-per-driver switch like it over editing `.env`.
+:::note[Not open yet]
+noeira cloud is in private use by the project today, and a private beta is
+planned: to join it, write to [denis@noeira.ai](mailto:denis@noeira.ai).
+Nothing in noeira requires it.
 :::
 
-## How a run is registered
+A robot-learning project rarely lives on one machine. Training happens on a
+GPU box, recording on the computer beside the robot, deployment on the robot's
+own board. noeira cloud is where those machines meet: a hosted dashboard and
+storage that every noeira program can report to.
 
-A driver makes a `RunContext` — which creates the run's directory and writes
-`run.kv` before any training — then a logger, and announces the run with
-`register_run` before step 0:
+## What it is for
 
-```mojo
-from noeira.core.dotenv import load_dotenv
-from noeira.core.logger import RemoteLogger
-from noeira.core.run import RunContext, register_run
+- **Runs, live.** Every scalar a training driver logs — returns, losses,
+  success rates, validation curves — streamed as it happens, with the run's
+  configuration beside it, and runs compared side by side.
+- **Policies.** Which checkpoint fills which role in a project, and why it was
+  promoted.
+- **Datasets and artifacts.** Recordings and checkpoints pushed from one
+  machine and pulled onto another, so a project follows its data.
 
-var env_vars = load_dotenv()
-var run = RunContext(
-    project="so101",
-    driver="examples/so101/act_so101_train_gpu.mojo",
-    slug="act-so101",
-)
-var logger = RemoteLogger(
-    server_url=env_vars.get("NOEIRA_CLOUD_URL", ""),
-    run_name=run.name(),
-    run_id=run.id,
-    buffer_size=64,
-    api_key=env_vars.get("NOEIRA_CLOUD_API_KEY", ""),
-)
-logger.set_config("algorithm", "ACT")
-register_run(run, logger)   # seeds run_id, project, driver, seed, host... then POSTs /runs
+## Without it
 
-# ... training: logger.log_scalar(...), run.checkpoint_path("best") ...
-
-run.close()                 # run.kv: status=done, finished=<now>
-logger.close()              # flushes, sends the finish, drains the queue
-```
-
-`register_run` is what makes a run that dies at step 0 visible at all. The
-drivers that already do this: the task-family SAC driver
-(`noeira/tasks/sac_family_driver.mojo`), ACT on the SO-101 and on LIBERO,
-Forward-Backward, and BFM-Zero on the G1 — for example
-`examples/so101/act_so101_train_gpu.mojo`.
-
-The run's life on the dashboard is three calls — `register`, the metrics, and
-the finish that `close()` sends. While the run is alive the logger also sends
-a heartbeat to `/runs/<id>/ping`, which is how the dashboard can tell a run
-that was killed (out of memory, a released instance) from one that is simply
-quiet.
-
-## What it shows
-
-Per run, over steps or wall time: every scalar the driver logs — episode
-return, losses, `mean_q`, success rates, validation losses — plus the
-configuration recorded with `set_config` and the run's tag and outcome. Runs
-can be compared side by side.
-
-Failures show up in these metrics before they show up in reward: value
-explosion, target-network staleness and misaligned world-model targets each
-first appeared as a metric behaving oddly. See
-[what to watch](/tooling/logging/#what-to-watch).
-
-## What it is built on
-
-A Cloudflare Worker running a Hono API and serving the React dashboard; run
-and project records in a D1 SQL database; datasets and artifacts in R2 object
-storage; and a Durable Object that streams a run's metrics to open dashboards
-over a WebSocket.
-
-The dashboard is also where the **noeira** design system originated. This
-documentation site mirrors its brand tokens: they live in the noeira-cloud
-repository's `client/src/index.css` and are hand-mirrored into
-`docs-site/src/styles/noeira.css` — change both together.
-
-## Offline alternatives
-
-```mojo
-var logger = CsvLogger("/tmp/run_metrics.csv", buffer_size=64)
-```
-
-CSV works everywhere and is the right choice for CI and headless boxes. A
-`RunContext` already gives every run its own `metrics_path()`, and
-`CompositeLogger` writes to a CSV and the cloud at once.
+Nothing changes. Every run writes its directory, checkpoints and metrics on
+the machine that ran it, and the loggers stay silent when no server is
+configured. `CsvLogger` records the same metrics to a file, and
+`CompositeLogger` writes to both. See [logging](/tooling/logging/) and
+[projects and runs](/concepts/projects/).
 
 ## Next
 
-- [Logging and metrics](/tooling/logging/) — the logger API and what to watch
-- [Projects and runs](/concepts/projects/) — the on-disk side of all of this
-- [Checkpoints](/concepts/checkpoints/) — persisting the run
+- [Logging and metrics](/tooling/logging/) — the logger API, local or remote
+- [Projects and runs](/concepts/projects/) — the on-disk side of a run

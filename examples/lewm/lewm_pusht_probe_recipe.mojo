@@ -27,8 +27,11 @@ and the output kept out of the OS page cache).
 
 Run (Apple):
   pixi run -e apple mojo run -I . examples/lewm/lewm_pusht_probe_recipe_apple.mojo
+  pixi run -e apple mojo run -I . examples/lewm/lewm_pusht_probe_recipe.mojo --ckpt <run_id>
 """
 
+from std.sys import argv
+from noeira.core.run import resolve_checkpoint
 from max.gpu.host import DeviceContext, DeviceBuffer
 from layout import TileTensor, row_major
 
@@ -143,7 +146,19 @@ def _p(b: DeviceBuffer[DT]) -> Pointer[Scalar[DT], MutAnyOrigin]:
     return rebind[Pointer[Scalar[DT], MutAnyOrigin]](b.unsafe_ptr())
 
 
+def _flag(name: String, dflt: String) raises -> String:
+    """Value of `--name X`, or `dflt` when the flag is absent."""
+    var av = argv()
+    for i in range(1, len(av)):
+        if String(av[i]) == name:
+            if i + 1 >= len(av):
+                raise Error("flag " + name + " needs a value")
+            return String(av[i + 1])
+    return dflt
+
+
 def main() raises:
+    var ckpt = resolve_checkpoint(_flag(String("--ckpt"), CKPT_PATH), String("last"))
     print("=" * 70)
     print("LeWM recipe-WM light probes (Apple): shuffled eval + recon grids")
     print("=" * 70)
@@ -155,8 +170,8 @@ def main() raises:
     )
     var src = Source.make(sampler^, ctx=ctx)
     var wm = Trainer.make(lam=Scalar[DT](0.09), lr=Scalar[DT](5e-5), ctx=ctx)
-    print("loading recipe WM", CKPT_PATH, "...")
-    wm.load_params(CKPT_PATH)
+    print("loading recipe WM", ckpt, "...")
+    wm.load_params(ckpt)
     if wm.last_load_had_state:
         print("v3 checkpoint carried BN running stats — no warmup needed")
     else:

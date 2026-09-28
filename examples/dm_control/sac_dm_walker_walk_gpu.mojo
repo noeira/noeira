@@ -40,8 +40,9 @@ from max.gpu.host import DeviceContext
 from std.random import seed
 from std.time import perf_counter_ns
 
-from noeira.core.dotenv import load_dotenv
-from noeira.core.logger import RemoteLogger
+from noeira.core.run import RunContext, register_run
+from noeira.core.run_session import RunLogger, finish_run, run_logger
+from noeira.io.artifact_sink import sink_for_run
 from noeira.deep_agents.sac import SAC
 from noeira.envs.dm_control.walker import (
     DMWalkerWalkBatched,
@@ -69,7 +70,6 @@ comptime WARMUP_STEPS = 10_000
 comptime PRINT_EVERY = 50_000
 comptime DIAG_EVERY = 1_000
 comptime CHECKPOINT_EVERY = 50_000
-comptime CHECKPOINT_PATH = "sac_dm_walker_walk.ckpt"
 
 comptime BatchedEnvT = DMWalkerWalkBatched[N_ENVS]
 
@@ -90,16 +90,16 @@ def main() raises:
     print("=" * 70)
 
     with DeviceContext() as ctx:
-        var env_vars = load_dotenv()
-        var api_key = env_vars.get("NOEIRA_CLOUD_API_KEY", "")
-        var url = env_vars.get("NOEIRA_CLOUD_URL", "")
-
-        var logger = RemoteLogger(
-            server_url=url,
-            run_name="SAC dm_control walker-walk (GPU)",
-            buffer_size=64,
-            api_key=api_key,
+        # ─── Run + logger ───────────────────────────────────────────────────
+        var run = RunContext(
+            project=String("dm-control"),
+            driver=String("examples/dm_control/sac_dm_walker_walk_gpu.mojo"),
+            slug=String("sac-dm-walker-walk"),
+            env=String("builtin:dm_control/walker-walk"),
         )
+        var checkpoint_path = run.checkpoint_path(String("last"))
+        print("  Run                =", run.dir)
+        var logger = run_logger(run, buffer_size=64)
         logger.set_config("algorithm", "SAC")
         logger.set_config("env", "dm_control/walker-walk")
         logger.set_config("target", "gpu")
@@ -107,6 +107,8 @@ def main() raises:
         logger.set_config("batch", String(BATCH))
         logger.set_config("n_envs", String(N_ENVS))
         logger.set_config("buffer_capacity", String(REPLAY_CAPACITY))
+        register_run(run, logger)
+        var artifacts = sink_for_run(run.id, run.dir)
 
         var logger_ptr = Pointer(to=logger).as_unsafe_any_origin()
 
@@ -126,7 +128,7 @@ def main() raises:
         _ = agent.train[
             BatchedEnvT,
             N_ENVS=N_ENVS,
-            L=RemoteLogger,
+            L=RunLogger,
             USE_TRAIN_CUDA_GRAPH=True,
             # ⚠ Capturing the env step is safe here for the same reason as in
             # the Gym scripts — physics3d's GPU step is RNG-free (RNG lives in
@@ -145,10 +147,16 @@ def main() raises:
             diag_every=DIAG_EVERY,
             episode_sync_every=32,
             checkpoint_every=CHECKPOINT_EVERY,
-            checkpoint_path=CHECKPOINT_PATH,
+            checkpoint_path=checkpoint_path,
+            artifacts=artifacts,
+            run_dir=run.dir,
         )
         var elapsed_s = Float64(perf_counter_ns() - t_start) / 1e9
-        logger.close()
+        var sent = logger.b.total_logged()
+        finish_run(
+            run, logger, artifacts,
+            String("mean_return_100=") + String(agent.mean_return()),
+        )
         _ = logger  # lifetime extender for logger_ptr
 
         print("-" * 70)
@@ -158,7 +166,7 @@ def main() raises:
         print("  elapsed                   =", elapsed_s, "s")
         print("  mean ep return (last 100) =", agent.mean_return())
         print("  episodes completed        =", agent.ep_count())
-        print("  checkpoint saved to       =", CHECKPOINT_PATH)
+        print("  checkpoint saved to       =", checkpoint_path)
         print("=" * 70)
 
         # dm_control thresholds, NOT the Gym script's. Every episode is exactly

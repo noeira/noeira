@@ -63,6 +63,9 @@ from noeira.data.sampler import UniformDeviceSampler
 from noeira.core.dotenv import load_dotenv
 from noeira.core.logger import CsvLogger, RemoteLogger, CompositeLogger
 from noeira.core.run import RunContext, register_run
+from noeira.core.run_session import finish_run
+from noeira.io.artifact_sink import sink_for_run
+from noeira.deep_agents.training.checkpoint import announce_checkpoint
 from noeira.cuda import CUDAGraph, maybe_capture_replay
 from noeira.deep_agents.fb.cpr import FBCPRTrainer, FBCPRLosses
 from noeira.deep_agents.fb.trainer import FBLosses
@@ -411,6 +414,9 @@ def main() raises:
     comptime SQRT_D = sqrt(Float64(D))
     # ⚠ AFTER the config, before step 0 — see `core/run.register_run`.
     register_run(run, logger)
+    # The uplink: `final` is uploaded (step_* only on request); None without
+    # a monitor in .env, and every call below is then a no-op.
+    var artifacts = sink_for_run(run.id, run.dir)
 
     var t_log = perf_counter_ns()
     var last_log_step = 0
@@ -527,26 +533,26 @@ def main() raises:
 
             var names = List[String]()
             var vals = List[Float64]()
-            names.append(String("fb/measure")); vals.append(l.fb.measure)
-            names.append(String("fb/ortho")); vals.append(l.fb.ortho)
-            names.append(String("fb/actor")); vals.append(l.fb.actor)
-            names.append(String("fb/f_norm")); vals.append(l.fb.f_norm)
-            names.append(String("fb/b_norm")); vals.append(l.fb.b_norm)
-            names.append(String("fb/b_norm_deficit")); vals.append(SQRT_D - l.fb.b_norm)
-            names.append(String("fb/ortho_Q")); vals.append(l.fb.ortho + 2.0 * l.fb.b_norm * l.fb.b_norm)
-            names.append(String("fb/grad_norm_f1")); vals.append(gn_f1)
-            names.append(String("fb/grad_norm_f2")); vals.append(gn_f2)
-            names.append(String("fb/grad_norm_b")); vals.append(gn_b)
-            names.append(String("fb/actor_grad_value")); vals.append(g_value)
-            names.append(String("fb/actor_grad_total")); vals.append(g_total)
-            names.append(String("cpr/d_pos")); vals.append(l.d_pos)
-            names.append(String("cpr/d_neg")); vals.append(l.d_neg)
-            names.append(String("cpr/d_gp")); vals.append(l.d_gp)
-            names.append(String("cpr/r_mean")); vals.append(l.r_mean)
-            names.append(String("cpr/q_mean")); vals.append(l.q_mean)
-            names.append(String("cpr/q_loss")); vals.append(l.q_loss)
-            names.append(String("cpr/q_pi")); vals.append(l.q_pi)
-            names.append(String("perf/steps_per_s")); vals.append(sps)
+            names.append(String("fb_measure_loss")); vals.append(l.fb.measure)
+            names.append(String("fb_ortho_loss")); vals.append(l.fb.ortho)
+            names.append(String("policy_loss")); vals.append(l.fb.actor)
+            names.append(String("f_norm")); vals.append(l.fb.f_norm)
+            names.append(String("b_norm")); vals.append(l.fb.b_norm)
+            names.append(String("b_norm_deficit")); vals.append(SQRT_D - l.fb.b_norm)
+            names.append(String("fb_ortho_q")); vals.append(l.fb.ortho + 2.0 * l.fb.b_norm * l.fb.b_norm)
+            names.append(String("f1_grad_norm")); vals.append(gn_f1)
+            names.append(String("f2_grad_norm")); vals.append(gn_f2)
+            names.append(String("b_grad_norm")); vals.append(gn_b)
+            names.append(String("actor_grad_value")); vals.append(g_value)
+            names.append(String("actor_grad_total")); vals.append(g_total)
+            names.append(String("disc_expert_loss")); vals.append(l.d_pos)
+            names.append(String("disc_policy_loss")); vals.append(l.d_neg)
+            names.append(String("disc_gp_loss")); vals.append(l.d_gp)
+            names.append(String("disc_reward_mean")); vals.append(l.r_mean)
+            names.append(String("mean_q")); vals.append(l.q_mean)
+            names.append(String("critic_loss")); vals.append(l.q_loss)
+            names.append(String("policy_q_mean")); vals.append(l.q_pi)
+            names.append(String("steps_per_s")); vals.append(sps)
             logger.log_scalars(names, vals, step)
             print(
                 "   step", step,
@@ -567,9 +573,9 @@ def main() raises:
             print("      checkpoint ->", p, "(+ .cpr)")
     var pf = run.checkpoint_path(String("final"))
     t.save_state(pf)
-    logger.close()
+    announce_checkpoint(pf, artifacts, run.dir)
+    finish_run(run, logger, artifacts)
     print("[3] done. final checkpoint ->", pf, "(+ .cpr)")
-    run.close()
     print("      metrics CSV ->", csv_path)
     print("      run record  ->", run.kv_path())
 

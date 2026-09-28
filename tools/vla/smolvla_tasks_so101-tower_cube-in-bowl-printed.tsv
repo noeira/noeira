@@ -1,0 +1,4 @@
+# task_index	n_tokens	ids	task
+# tokenizer: HuggingFaceTB/SmolVLM2-500M-Video-Instruct
+# a trailing newline is appended to every task before tokenising
+0	15	55,4183,260,4461,20636,284,1830,357,281,260,5724,14530,35994,12505,198	Grab the blue cube and put it in the yellow octogonal bowl

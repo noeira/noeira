@@ -12,7 +12,8 @@ SDL3 GPU SPIR-V binding convention:
 
 def _load_spv(path: String) raises -> List[UInt8]:
     """Load a SPIR-V binary file into a byte list."""
-    with open(path, "rb") as f:
+    # Mojo's open() has no "b" modes; "r" + read_bytes() is already binary.
+    with open(path, "r") as f:
         return f.read_bytes()
 
 

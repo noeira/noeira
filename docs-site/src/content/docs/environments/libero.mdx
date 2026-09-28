@@ -6,6 +6,8 @@ description: LIBERO's 130 manipulation tasks as 23 task families on noeira's eng
 import Maturity from '~/components/Maturity.astro';
 import Paper from '~/components/Paper.astro';
 import Papers from '~/components/Papers.astro';
+import Demo from '~/components/Demo.astro';
+import DemoGrid from '~/components/DemoGrid.astro';
 
 <Maturity level="beta" note="The batched OSC path runs on NVIDIA. Frozen inits exist for libero_goal only. Policy results are early." />
 
@@ -30,6 +32,18 @@ examples in `examples/libero/`, tests in `tests/libero/` and generators in
 		note="The task suites, demonstrations and eval protocol ported here."
 	/>
 </Papers>
+
+<DemoGrid min="14rem">
+	<Demo name="libero_bowl_on_plate" caption="put the bowl on the plate" meta="libero_goal · agentview" />
+	<Demo name="libero_drawer_bowl" caption="open the top drawer and put the bowl inside" meta="libero_goal · agentview" />
+	<Demo name="libero_stove" caption="turn on the stove" meta="libero_goal · agentview" />
+	<Demo name="libero_wine_rack" caption="put the wine bottle on the rack" meta="libero_goal · agentview · 1.5× speed" />
+</DemoGrid>
+
+LIBERO's own human demonstrations, each recorded state re-rendered by noeira's
+camera tracer at 256×256 (`pixi run libero-camera-video -- <task> --no-compare
+--size 256`). These are state replays, not simulations: nothing is stepped,
+so they show the scenes and the renderer rather than a policy.
 
 ## Suites and families
 
@@ -221,15 +235,18 @@ you can walk the gripper to an object and watch the goal readout change.
 | Families on the batch | all 23 pass: device reset == host, success word exact, no contact saturation, finite state | five miss a 1e-3 batch-vs-CPU window over five null steps. On NVIDIA most of that gap is attributed to the blocked elliptic Newton kernel; the rest is read as float32-vs-float64 divergence at knife-edge contacts, not confirmed |
 | Batched throughput, `libero_goal` | 494 lane control steps/s at 1024 lanes | RTX 5090, demonstration replay with timing only, first measurement (14 Sep). Engine work since reached 1,130 lane control steps/s at 256 lanes on the same GPU — see `noeira/physics3d/PERFORMANCE.md` §13.53–13.54 |
 | Demo re-render | 879 frames/s; PSNR 28.16 / 26.79 dB | RTX 5090; agentview / eye-in-hand |
-| [ACT](/algorithms/imitation/act/) on `libero_goal` | 31/200 = 0.155 | temporal ensemble, frozen inits, 600 steps |
-| Vision-free control: kNN, k=5, on joints and their one-step difference | 144/200 = 0.72 | same protocol; no network, no camera |
+| [ACT](/algorithms/imitation/act/) on `libero_goal` | 0.75 ± 0.05 over 3 seeds (0.81, 0.705, 0.735) | temporal ensemble, frozen inits, 600 steps |
+| Vision-free control: nearest demonstration (k=1) on joints and their one-step difference | 159/200 = 0.795 | same protocol; no network, no camera |
+| Vision-free control: median of the 5 nearest demonstrations | 144/200 = 0.72 | same protocol; no network, no camera |
 | [BC](/algorithms/imitation/bc/) MLP, low-dim observation | 13/200 = 0.065 | same protocol |
 
-The kNN control is there to be read beside ACT: a nearest-neighbour lookup on
-the robot's own joints, with no camera, solves 72% of episodes. So the physics,
-the controller and the goal language are solvable by matching demonstrations
-on LIBERO's own start states, and the ACT policy's gap is a policy problem, not
-a simulator one.
+The nearest-neighbour controls are there to be read beside ACT: a lookup on
+the robot's own joints, with no camera, solves 72 to 80% of episodes. So the
+physics, the controller and the goal language are solvable by matching
+demonstrations on LIBERO's own start states. ACT with two cameras sits between
+the two controls: in `libero_goal` every task shares one scene and the objects
+move about a centimetre, so the images add little the joints do not already
+carry. The weakest tasks for every policy are the two drawer tasks.
 
 :::caution[Not comparable to LIBERO's published tables]
 These rates come from a different simulator (noeira's engine, not MuJoCo under

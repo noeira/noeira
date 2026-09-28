@@ -21,7 +21,7 @@ separately.
 | Toolchain | Mojo **1.1.0** and MAX **26.6.0**, pinned exactly in `pixi.toml` |
 | Python | 3.13 (the environments pin it; see below) |
 | GPU (optional) | NVIDIA via CUDA, Apple Silicon via Metal, Jetson Orin via JetPack's CUDA |
-| Rendering (optional) | SDL3 — not needed for training |
+| Rendering (optional) | SDL3 — installed by pixi, not needed for training |
 
 ## 1. Install pixi
 
@@ -155,17 +155,23 @@ your dashboard stays empty, check for that message first.
 
 ### SDL3 — for on-screen rendering
 
-Required to open a window: environment renderers, the 3D viewer. **Not**
-required for training. Video encoding goes through `ffmpeg`, which pixi
-installs.
+Required to open a window: environment renderers, the 3D viewer, the ImGui
+tools. **Not** required for training. Video encoding goes through `ffmpeg`.
+
+**Nothing to install.** `pixi install` brings SDL3 — the library and its
+headers — into the environment on macOS and Linux alike, and noeira loads it
+from there. A system SDL3 is neither needed nor used. That matters on Ubuntu
+24.04 LTS, which ships no SDL3 package: `libsdl3-dev` only exists from Ubuntu
+25.04 and Debian 13.
+
+On a headless machine SDL3 is installed but has no display to open a window
+on: training runs, the viewers need a desktop session or X forwarding.
+
+To use a different build of SDL3, point `SDL3_LIB` at it:
 
 ```bash
-brew install sdl3            # macOS
-sudo apt install libsdl3-dev # Ubuntu / Debian
-sudo dnf install SDL3-devel  # Fedora
+SDL3_LIB=/path/to/libSDL3.so pixi run mojo run -I . examples/cartpole/cartpole_demo.mojo
 ```
-
-Source releases: [libsdl-org/SDL](https://github.com/libsdl-org/SDL/releases).
 
 ### Atari ROMs — for the 2600 emulator
 

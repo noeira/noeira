@@ -36,7 +36,7 @@ test. Run it before a large merge; CI runs it weekly.
 
 **`test-gpu`** discovers the GPU tests — files ending in `_gpu.mojo`,
 `_gpu_vs_cpu.mojo` or `_gpu_parity.mojo`. It never runs in CI (there are no
-free GPU runners), so it is a local or [rented-box](/project/cloud-gpu/) task.
+free GPU runners), so it is a task for a local or rented GPU box.
 
 All of them go through `scripts/run_tests.sh`, which prints the last 40 lines
 of each failing test, a summary table, and exits with the number of failures.

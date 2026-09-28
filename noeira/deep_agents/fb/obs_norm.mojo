@@ -35,6 +35,7 @@ from std.math import sqrt
 from noeira.nn.constants import DT
 from noeira.nn.core.tensor import Tensor
 from noeira.nn.core.checkpoint import _split_lines
+from noeira.io.fileio import write_text_atomic
 
 
 struct ObsNorm[N: Int](Copyable & Deinitable):
@@ -100,8 +101,10 @@ struct ObsNorm[N: Int](Copyable & Deinitable):
         var s = String(Self.N) + "\n"
         for k in range(Self.N):
             s += String(self.mu[k]) + " " + String(self.sd[k]) + "\n"
-        with open(path, "w") as f:
-            f.write(s)
+        # Atomic: a crash mid-save must not leave the checkpoint beside it
+        # with a truncated sidecar, which `try_load` would reject — or, cut on
+        # a line boundary, accept with the wrong width's rows missing.
+        write_text_atomic(path, s)
 
     @staticmethod
     def try_load(path: String) raises -> Optional[Self]:

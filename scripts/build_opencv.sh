@@ -48,7 +48,7 @@ fi
 # ⚠ solvePnP lives in libopencv_GEOMETRY in OpenCV 5, not libopencv_calib --
 # the header moved to geometry/3d.hpp and the symbol moved with it.
 
-LIBS="-lopencv_core -lopencv_videoio -lopencv_imgcodecs -lopencv_objdetect -lopencv_geometry -lopencv_calib"
+LIBS="-lopencv_core -lopencv_videoio -lopencv_imgcodecs -lopencv_objdetect -lopencv_geometry -lopencv_calib -lopencv_imgproc"
 
 CXX="${CXX:-c++}"
 echo "building opencv shim from $SRC"

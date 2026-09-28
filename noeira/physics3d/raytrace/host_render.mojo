@@ -136,6 +136,8 @@ def render_lane_cpu[
                     px,
                     py,
                     background,
+                    mm_c,
+                    -1,
                 )
                 var b = py * width + px
                 rgb[b * RGB_CHANNELS_HOST + 0] = hit.rgb.x

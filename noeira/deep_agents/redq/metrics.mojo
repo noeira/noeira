@@ -5,7 +5,7 @@ tools work unchanged (REDQ is a generalization of SAC; the metric
 semantics are identical, just averaged over N instead of 2 critics).
 
 Field semantics:
-  actor_loss      — mean of `α·logp − combined_Q` across the chunk
+  policy_loss      — mean of `α·logp − combined_Q` across the chunk
                     (computed every POLICY_DELAY inner critic steps)
   critic_loss     — mean of Σᵢ MSE(Qᵢ(s,a), y) across all inner steps
                     (one outer chunk = UTD × outer-train-steps inner
@@ -16,11 +16,11 @@ Field semantics:
                     inner steps (representative sample; matches the
                     legacy REDQ convention)
   mean_target     — mean of the REDQ TD target `y` across inner steps
-  mean_reward     — mean of batch reward across inner steps
+  reward_mean     — mean of batch reward across inner steps
   mean_next_q     — mean of the combined_Q used to build y (after
                     MIN/AVE/REM reduction) across inner steps
   mean_done       — mean batch done across inner steps
-  mean_abs_action — mean |action| in the actor batch (per-policy step)
+  action_abs_mean — mean |action| in the actor batch (per-policy step)
   train_steps     — cumulative INNER train steps so far (NOT reset on
                     flush). One env step contributes UTD inner steps.
   n_updates       — INNER train steps THIS chunk (reset on flush)
@@ -36,14 +36,14 @@ from noeira.nn.core.metric import LogScalar
 
 @fieldwise_init
 struct REDQMetrics(Copyable, Movable, Deinitable):
-    var actor_loss:      LogScalar[DT]
+    var policy_loss:     LogScalar[DT]
     var critic_loss:     LogScalar[DT]
     var alpha:           LogScalar[DT]
     var mean_q:          LogScalar[DT]
     var mean_target:     LogScalar[DT]
-    var mean_reward:     LogScalar[DT]
+    var reward_mean:     LogScalar[DT]
     var mean_next_q:     LogScalar[DT]
     var mean_done:       LogScalar[DT]
-    var mean_abs_action: LogScalar[DT]
+    var action_abs_mean: LogScalar[DT]
     var train_steps:     LogScalar[DT]
     var n_updates:       LogScalar[DT]

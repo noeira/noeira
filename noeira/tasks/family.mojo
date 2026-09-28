@@ -194,6 +194,20 @@ def compose_family(f: FamilySpec, scene_dir: String) raises -> String:
     # Calling it with "" rather than writing the floor by hand is what keeps
     # this file free of MJCF text (§7).
     var d = scene_from_base(String(""), floor=f.floor)
+    if f.sunlight >= 0.0:
+        # `sunlight=` (see `FamilySpec.sunlight`): the floor light's diffuse
+        var sun_old = String('<light pos="0 0 3" dir="0 0 -1" directional="true"/>')
+        if d.base_world.find(sun_old) < 0:
+            raise Error(
+                "tasks: family '" + f.name + "' sets sunlight= but the composed"
+                " floor has no default light to set (floor=0?)"
+            )
+        var g = String(f.sunlight)
+        d.base_world = d.base_world.replace(
+            sun_old,
+            String('<light pos="0 0 3" dir="0 0 -1" directional="true" diffuse="')
+            + g + " " + g + " " + g + '"/>',
+        )
 
     # ⚠⚠ THE HOST MUST RESTATE THE BASE'S ANGLE UNIT, AND OMITTING IT FROZE
     # THE ARM. MuJoCo's default for `<compiler angle>` is **degree**, so a
@@ -260,6 +274,19 @@ def compose_family(f: FamilySpec, scene_dir: String) raises -> String:
         if header.byte_length() > 0:
             header += "\n"
         header += "  " + opt
+    if len(f.headlight) == 3:
+        # `headlight=` (see `FamilySpec.headlight`): the fill light a white
+        # part seen edge-on needs. Grey levels, written as MuJoCo's rgb.
+        var a = String(f.headlight[0])
+        var dd = String(f.headlight[1])
+        var sp = String(f.headlight[2])
+        if header.byte_length() > 0:
+            header += "\n"
+        header += (
+            '  <visual><headlight ambient="' + a + " " + a + " " + a
+            + '" diffuse="' + dd + " " + dd + " " + dd + '" specular="' + sp
+            + " " + sp + " " + sp + '"/></visual>'
+        )
     d.base_xml = header
 
     var base_key = _asset_key(f.base)

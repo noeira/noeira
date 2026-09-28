@@ -24,11 +24,13 @@ Obs is a 4×96×96 grayscale stack (C=4); the panels show the NEWEST frame
 
 Run (NVIDIA, after training has written a checkpoint; needs roms/pong.bin):
     pixi run -e nvidia mojo run -I . \\
-        examples/atari/dreamerv3_atari_pong_imagination_gif.mojo
+        examples/atari/dreamerv3_atari_pong_imagination_gif.mojo [--ckpt <run_id>]
 """
 
 from std.memory import alloc
 from std.random import seed
+from std.sys import argv
+from noeira.core.run import resolve_checkpoint
 from max.gpu.host import DeviceContext
 
 from noeira.nn.constants import DT
@@ -126,7 +128,19 @@ def _argmax(p: Pointer[Scalar[DT], MutAnyOrigin], n: Int) -> Int:
     return best
 
 
+def _flag(name: String, dflt: String) raises -> String:
+    """Value of `--name X`, or `dflt` when the flag is absent."""
+    var av = argv()
+    for i in range(1, len(av)):
+        if String(av[i]) == name:
+            if i + 1 >= len(av):
+                raise Error("flag " + name + " needs a value")
+            return String(av[i + 1])
+    return dflt
+
+
 def main() raises:
+    var ckpt = resolve_checkpoint(_flag(String("--ckpt"), String(CHECKPOINT_PATH)), String("last"))
     print("=" * 70)
     print("DreamerV3 Atari Pong — imagination GIF (GPU decode)")
     print("  CTX", CTX, " HOR", HOR, " OBS", OBS, "(", C, "x", IMG, "x", IMG, ")")
@@ -135,8 +149,8 @@ def main() raises:
 
     with DeviceContext() as ctx:
         var agent = Ag.make(ctx=ctx)
-        print("loading checkpoint", CHECKPOINT_PATH, "...")
-        agent.load(CHECKPOINT_PATH)
+        print("loading checkpoint", ckpt, "...")
+        agent.load(ckpt)
 
         # ── collect one episode (closed-loop, sampling the actor) ──
         var env = Env(AtariGame.PONG)

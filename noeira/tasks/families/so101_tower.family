@@ -28,10 +28,60 @@ control_freq=30
 # sim grasp creeps out of the jaw under the defaults (see the bake).
 inherit_option=1
 
+# ⚠ A FILL LIGHT, SO THE WHITE PARTS STAY WHITE SEEN EDGE-ON. Under MuJoCo's
+# default headlight (.1 ambient) the jaws render nearly black from the wrist
+# camera: both lights graze them. The real room lights them from everywhere
+# and the recorded wrist frames show them light grey-white. Chosen against
+# the rig's undistorted real frames (2026-09-22): ambient .45 brings the jaws
+# to a light grey without washing out the overhead view's shading (.6 did);
+# the headlight's diffuse drops .4 -> .3 to keep the lit faces from clipping
+# harder than they already do. Randomized around by `randomize.mojo`.
+#
+# ⚠⚠ SUPERSEDED 2026-09-24 BY AN APPEARANCE CALIBRATION against the printed
+# recording (cube-in-bowl-printed, both cameras, surfaces labelled by MuJoCo
+# segmentation at the recorded arm states). With the .7 sun and the headlight
+# above, the desk rendered CLIPPED WHITE (255) on both cameras against the
+# real 183 overhead / 155 wrist, the white arm parts 255 against 143, and
+# `--dr full`'s darkest wrist frames never reached the real brightness (for
+# series-2 H s1, blanking the real wrist image improved its roll 52.8 -> 39.5
+# deg; a later student recovered the roll without this, so it is a fidelity
+# fix, not THE roll fix). Fitted in MuJoCo, whose light model the tracer
+# matches: ambient .6 from everywhere, NO headlight diffuse, a .2 sun — the
+# room is lit diffusely — with the desk / arm / prop albedos lowered to the
+# real grey levels (`desk_mat.xml`, bake step 6, `gen_tower_props.py`).
+# Measured on the TRACER's frames after (real in brackets): frame mean
+# overhead 130 (127), wrist 164 (146); desk 170 (183 / 155); arm 147 (143);
+# bowl hue 38 (35); brick hue 217 / 203 (204 / 203). `--look legacy`
+# (`so101_tower_rig.apply_tower_look`) renders the pre-calibration look,
+# byte for byte, for an A/B.
+headlight=0.6,0.0,0.5
+sunlight=0.2
+
 # ⚠⚠ THE ROBOT SITS ON THE STAND'S BASE PLATE, 5 mm ABOVE THE DESK. The desk
 # is the floor plane; the tower's foot and plate rest on it. See
 # `props/so101_tower_stand.xml` for where the plate's hole pattern is.
 base_pos=0.0,0.0,0.005
+
+# ⚠⚠ EVERY EPISODE STARTS WHERE THE REAL ARM RESTS, NOT AT qpos0. MuJoCo's
+# qpos0 is the arm straight up — a pose the real follower never starts from.
+# Measured on the kept episodes of BOTH rig recordings (frame 0:
+# cube-in-bowl, 50, 2026-09-15; cube-in-bowl-printed, 70, 2026-09-24), in
+# model radians through the measured joint zero
+# (`robot/so101/sim_map.tower_follower_zero_deg`; the roll centre moved +5 deg
+# with that zero's roll on 2026-09-25, and the jaw's centre and half-span with
+# the gripper's measured line the same day — the same real 0.5..41% span):
+# lift, elbow and wrist_flex
+# sit on their FOLDED hard stops (sd < 0.5 deg: the median, no jitter); pan,
+# wrist roll and the jaw are wherever the operator left them, so each episode
+# draws them uniformly over the observed span (real-arm degrees: pan
+# -3.3..70.0, roll 49.8..84.5; jaw 0..41% open). The second recording started
+# at pan 28..70, past the first's -3..46, which is why the span is the union.
+# Lift -109.4 deg is past the stock -100 limit: the rig's model widens the
+# JOINT (not the actuator) to -110
+# (`bake_so_arm101_tower.py` step 7). The draw is `sampler.sample_base_qpos`
+# on the host and `placement/table.reset_task_slots` on the device.
+base_qpos=0.394770,-1.908661,1.544271,1.342561,1.258746,0.310346
+base_qpos_jitter=0.639826,0.0,0.0,0.0,0.303035,0.459539
 
 # ⚠ THE FIXTURE CARRIES ITS POSE (see the tabletop family). The stand is
 # placed at the NEGATION of the arm's position on its plate — body (+0.019,
@@ -78,3 +128,17 @@ region=desk_top:site:desk_surface:-0.14,-0.16,0.06,0.16:0.03
 # so `Near(brick, bowl, 0.045)` is FALSE at reset for every draw.
 region=desk_left:site:desk_surface:-0.14,0.06,0.06,0.16
 region=desk_right:site:desk_surface:-0.14,-0.16,0.06,-0.06
+
+# THE REAL LAYOUTS (24 Sep): the printed-props recording's start poses, from the
+# overhead pose estimator over all 70 episodes (`tower_pose_real_check`,
+# projects/so101-tower/poses/cube-in-bowl-printed_start_poses.csv), world mm:
+# brick x 104..370, y -239..+207; bowl x 134..456, y -228..+189, on EITHER side
+# of the brick. The strips above hold 20/70 bricks and 17/68 bowls. These two
+# cover them; APPENDED so desk_top stays region 0. Two different unanchored
+# regions are clash-tested (h_radius sum 0.079 > Near's 0.045: the goal is false
+# at reset). |y| <= 0.24: the bowl's rim stays inside the real desk (+y 0.29).
+# The bowl stops at x 0.38 (95% of the real ones): beyond ~0.40 m from the base
+# the expert's place IK misses by 7-23 mm (measured on 150 draws to x 0.46,
+# where only 2/68 real bowls are).
+region=desk_brick:site:desk_surface:-0.22,-0.24,0.05,0.21
+region=desk_bowl:site:desk_surface:-0.19,-0.23,0.06,0.19

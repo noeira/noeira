@@ -8,10 +8,12 @@ Gaussian-policy PPO flavour. Uses the new `deep_agents/` surface:
     `SAMPLE` block, no `learning_starts`. Every `ROLLOUT_LEN` env
     steps the driver computes GAE and runs `N_EPOCHS` passes of
     minibatch SGD (`MINIBATCH` rows each).
-  * `RemoteLogger` — driver `print_every` cadence (`avg_reward` /
-    `episodes`) + chunk cadence (`PPOMetrics`).
-  * One-file `.ckpt` envelope holding actor (incl. Gaussian
-    log-std parameter) + critic + Adam states.
+  * A `RunContext` (project `mujoco`): the checkpoint, `metrics.csv` and
+    `run.kv` all live in `runs/<id>/`, and the monitor row carries the same id.
+  * `run_logger(run)` — `metrics.csv` + the monitor, driver `print_every`
+    cadence (`avg_reward` / `episodes`) + chunk cadence (`PPOMetrics`).
+  * One-file `.ckpt` envelope (`run.checkpoint_path("last")`) holding actor
+    (incl. Gaussian log-std parameter) + critic + Adam states.
 
 Metric names (driver cadence): `avg_reward`, `episodes`.
 Chunk cadence (`PPOMetrics` fields): `actor_loss`, `critic_loss`,
@@ -30,8 +32,9 @@ Run:
 from std.random import seed
 from std.time import perf_counter_ns
 
-from noeira.core.dotenv import load_dotenv
-from noeira.core.logger import RemoteLogger
+from noeira.core.run import RunContext, register_run
+from noeira.core.run_session import RunLogger, finish_run, run_logger
+from noeira.io.artifact_sink import sink_for_run
 from noeira.nn.constants import DT
 from noeira.nn.combinators.sequential import Sequential
 from noeira.nn.primitives.linear import Linear
@@ -59,8 +62,6 @@ comptime NUM_STEPS = 1_000_000
 comptime PRINT_EVERY = 50_000
 comptime DIAG_EVERY = 50_000
 comptime CHECKPOINT_EVERY = 50_000
-
-comptime CHECKPOINT_PATH = "ppo_half_cheetah_nn.ckpt"
 
 comptime LOG_STD_INIT: Scalar[DT] = -0.5
 comptime MAX_TORQUE: Scalar[DT] = 1.0  # HalfCheetah torque range
@@ -96,27 +97,26 @@ def main() raises:
     print("  PRINT_EVERY        =", PRINT_EVERY)
     print("  DIAG_EVERY         =", DIAG_EVERY)
     print("  CHECKPOINT_EVERY   =", CHECKPOINT_EVERY)
-    print("  Checkpoint path    =", CHECKPOINT_PATH)
-    print("=" * 70)
 
-    # ─── Logger (remote) ───────────────────────────────────
-
-    var env_vars = load_dotenv()
-    var api_key = env_vars.get("NOEIRA_CLOUD_API_KEY", "")
-    var url = env_vars.get("NOEIRA_CLOUD_URL", "")
-
-    var logger = RemoteLogger(
-        server_url=url,
-        run_name="PPO HalfCheetah NN (CPU)",
-        buffer_size=200,
-        api_key=api_key,
+    # ─── Run + logger ───────────────────────────────────────────────────────
+    var run = RunContext(
+        project=String("mujoco"),
+        driver=String("examples/half_cheetah/ppo_half_cheetah_training.mojo"),
+        slug=String("ppo-half-cheetah"),
+        env=String("builtin:mujoco/half_cheetah"),
     )
+    var checkpoint_path = run.checkpoint_path(String("last"))
+    print("  Run                =", run.dir)
+    print("=" * 70)
+    var logger = run_logger(run, buffer_size=200)
     logger.set_config("algorithm", "PPO")
     logger.set_config("env", "HalfCheetah")
     logger.set_config("hidden", String(HIDDEN))
     logger.set_config("rollout_len", String(ROLLOUT_LEN))
     logger.set_config("minibatch", String(MINIBATCH))
     logger.set_config("n_epochs", String(N_EPOCHS))
+    register_run(run, logger)
+    var artifacts = sink_for_run(run.id, run.dir)
 
     var logger_ptr = Pointer(to=logger).as_unsafe_any_origin()
 
@@ -156,7 +156,7 @@ def main() raises:
     var t_start = perf_counter_ns()
     _ = agent.train_single[
         HalfCheetah[DT, TERMINATE_ON_UNHEALTHY=False],
-        L=RemoteLogger,
+        L=RunLogger,
     ](
         env,
         NUM_STEPS,
@@ -164,12 +164,18 @@ def main() raises:
         verbose=True,
         logger=logger_ptr,
         diag_every=DIAG_EVERY,
-        checkpoint_path=CHECKPOINT_PATH,
+        checkpoint_path=checkpoint_path,
         checkpoint_every=CHECKPOINT_EVERY,
+        artifacts=artifacts,
+        run_dir=run.dir,
     )
     var elapsed_s = Float64(perf_counter_ns() - t_start) / 1e9
     var total = NUM_STEPS
-    logger.close()
+    var sent = logger.b.total_logged()
+    finish_run(
+        run, logger, artifacts,
+        String("mean_return_100=") + String(agent.mean_return()),
+    )
     _ = logger  # lifetime extender for logger_ptr
 
     # ─── Summary ─────────────────────────────────────────────────────────
@@ -179,7 +185,8 @@ def main() raises:
     print("  elapsed                =", elapsed_s, "s")
     print("  mean ep return (last 100) =", agent.mean_return())
     print("  episodes completed     =", agent.ep_count())
-    print("  remote points sent     =", logger.total_logged())
+    print("  remote points sent     =", sent)
+    print("  run record             =", run.kv_path())
     print("=" * 70)
 
     var final_avg = Float64(agent.mean_return())
@@ -202,7 +209,7 @@ def main() raises:
     var act_before = List[Scalar[DT]](length=ACT_DIM, fill=Scalar[DT](0.0))
     agent.select_greedy_action(probe_obs, act_before)
 
-    agent.load(CHECKPOINT_PATH)
+    agent.load(checkpoint_path)
     var act_after = List[Scalar[DT]](length=ACT_DIM, fill=Scalar[DT](0.0))
     agent.select_greedy_action(probe_obs, act_after)
 

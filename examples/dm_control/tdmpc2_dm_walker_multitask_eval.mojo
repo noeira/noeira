@@ -39,11 +39,13 @@ shrunk here. Everything else is copied verbatim.
 
 Run:
     pixi run -e nvidia mojo run -I . \\
-        examples/dm_control/tdmpc2_dm_walker_multitask_eval.mojo
+        examples/dm_control/tdmpc2_dm_walker_multitask_eval.mojo [--ckpt <run_id>]
 """
 
 from std.random import seed
 from std.time import perf_counter_ns
+from std.sys import argv
+from noeira.core.run import resolve_checkpoint
 from max.gpu.host import DeviceContext
 
 from noeira.nn.constants import DT
@@ -106,11 +108,23 @@ comptime T_WALK = 1
 comptime T_RUN = 2
 
 
+def _flag(name: String, dflt: String) raises -> String:
+    """Value of `--name X`, or `dflt` when the flag is absent."""
+    var av = argv()
+    for i in range(1, len(av)):
+        if String(av[i]) == name:
+            if i + 1 >= len(av):
+                raise Error("flag " + name + " needs a value")
+            return String(av[i + 1])
+    return dflt
+
+
 def main() raises:
+    var ckpt = resolve_checkpoint(_flag(String("--ckpt"), String(CKPT)), String("last"))
     print("=" * 70)
     print("TD-MPC2 MULTI-TASK checkpoint eval — MPC ON vs OFF")
     print("=" * 70)
-    print("  checkpoint =", CKPT)
+    print("  checkpoint =", ckpt)
     print("  eval_envs  =", EVAL_ENVS, " seeds =", N_SEEDS,
           " episode_len =", EPISODE_LEN)
     print("  MPPI       =", MPC_SAMPLES, "+", MPC_PI_TRAJS, "trajs x",
@@ -135,8 +149,8 @@ def main() raises:
         ctx=ctx, action_scale=Scalar[DT](ACTION_SCALE), learning_starts=0,
     )
 
-    print("Loading", CKPT, "...")
-    ag.load_state(CKPT)
+    print("Loading", ckpt, "...")
+    ag.load_state(ckpt)
     print("  loaded.")
     print("-" * 70)
 

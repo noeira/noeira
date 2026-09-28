@@ -49,7 +49,9 @@ from noeira.nn.core.call import call_forward
 from noeira.nn.core.initializer import Xavier
 from noeira.nn.optimizer.adam import Adam
 from noeira.nn.core.checkpoint import (
-    CheckpointWriter, CheckpointReader, _split_lines,
+    BinaryCheckpointWriter, BinaryCheckpointReader, CheckpointReader,
+    CheckpointScalars, write_model, read_model, _split_lines, _is_v3_header,
+    _read_file_bytes, _write_file_bytes,
 )
 from noeira.nn.random.box_muller import box_muller_normal, box_muller_normal_gpu
 
@@ -664,11 +666,11 @@ struct TD3Trainer[
             reward_mean = self._reward_accum * inv_c
             done_mean = self._done_accum * inv_c
         var bundle = TD3Metrics(
-            actor_loss=LogScalar[DT](actor_mean),
+            policy_loss=LogScalar[DT](actor_mean),
             critic_loss=LogScalar[DT](critic_mean),
             mean_q=LogScalar[DT](q_mean),
             mean_target=LogScalar[DT](target_mean),
-            mean_reward=LogScalar[DT](reward_mean),
+            reward_mean=LogScalar[DT](reward_mean),
             mean_done=LogScalar[DT](done_mean),
             train_steps=LogScalar[DT](Scalar[DT](self._total_train_steps)),
             n_actor_updates=LogScalar[DT](Scalar[DT](self._actor_updates)),
@@ -728,62 +730,63 @@ struct TD3Trainer[
         self._done_accum = Scalar[DT](0.0)
         return out
 
-    # ─── Checkpoint (ONE file: actor + critic1 + critic2 v2 envelope) ───
+    # ─── Checkpoint (ONE v3 file: actor + twin critics + train-step counter) ───
     def save_state(mut self, path: String) raises:
-        """Write the ONLINE actor + both critics into a SINGLE `storage-ckpt`
-        file, sections name-prefixed `actor.` / `critic1.` / `critic2.`.
-        Optimizer moments NOT persisted (resume re-warms)."""
-        var w = CheckpointWriter(save_moments=False)
-        w.mode = 0
-        walk_params[Self.train_target](self.actor_pair.online, w, self.ctx, "actor"
-        )
-        walk_params[Self.train_target](self.pair1.online, w, self.ctx, "critic1"
-        )
-        walk_params[Self.train_target](self.pair2.online, w, self.ctx, "critic2"
-        )
-        w.mode = 1
-        self.actor_pair.online.for_each_state[Self.train_target](
-            w, self.ctx, "actor"
-        )
-        self.pair1.online.for_each_state[Self.train_target](
-            w, self.ctx, "critic1"
-        )
-        self.pair2.online.for_each_state[Self.train_target](
-            w, self.ctx, "critic2"
-        )
-        with open(path, "w") as f:
-            f.write(w.content)
+        """ONE v3 `storage-ckpt` file: the ONLINE nets, name-prefixed
+        `actor.` / `critic1.` / `critic2.`; training scalars as `K` sections.
+        Atomic and chunked. Optimizer moments NOT persisted (resume re-warms)."""
+        var w = BinaryCheckpointWriter(save_moments=False)
+        write_model[Self.train_target](w, self.actor_pair.online, self.ctx, "actor")
+        write_model[Self.train_target](w, self.pair1.online, self.ctx, "critic1")
+        write_model[Self.train_target](w, self.pair2.online, self.ctx, "critic2")
+        var sc = CheckpointScalars()
+        sc.set_int("total_train_steps", self._total_train_steps)
+        w.write_scalars(sc)
+        _write_file_bytes(path, w.content)
 
     def load_state(mut self, path: String) raises:
-        """Restore the online actor + both critics from the single envelope,
-        then hard-copy online → target for all three pairs."""
-        var content: String
-        with open(path, "r") as f:
-            content = String(f.read())
-        var lines = _split_lines(content)
-        var body = List[String]()
-        for li in range(len(lines)):
-            if lines[li].startswith("storage-ckpt"):
-                continue
-            body.append(lines[li])
-        var r = CheckpointReader(body^)
-        r.mode = 0
-        walk_params[Self.train_target](self.actor_pair.online, r, self.ctx, "actor"
-        )
-        walk_params[Self.train_target](self.pair1.online, r, self.ctx, "critic1"
-        )
-        walk_params[Self.train_target](self.pair2.online, r, self.ctx, "critic2"
-        )
-        r.mode = 1
-        self.actor_pair.online.for_each_state[Self.train_target](
-            r, self.ctx, "actor"
-        )
-        self.pair1.online.for_each_state[Self.train_target](
-            r, self.ctx, "critic1"
-        )
-        self.pair2.online.for_each_state[Self.train_target](
-            r, self.ctx, "critic2"
-        )
+        """Restore the online nets (v3, or the legacy v2 text this trainer
+        wrote before) and the training scalars, then hard-copy online →
+        target."""
+        var bytes = _read_file_bytes(path)
+        if _is_v3_header(bytes):
+            var rb = BinaryCheckpointReader(bytes^)
+            read_model[Self.train_target](rb, self.actor_pair.online, self.ctx, "actor")
+            read_model[Self.train_target](rb, self.pair1.online, self.ctx, "critic1")
+            read_model[Self.train_target](rb, self.pair2.online, self.ctx, "critic2")
+            var sc = rb.read_scalars()
+            rb.finish()
+            self._total_train_steps = sc.get_int(
+                "total_train_steps", self._total_train_steps
+            )
+        else:
+            var content: String
+            with open(path, "r") as f:
+                content = String(f.read())
+            var lines = _split_lines(content)
+            var body = List[String]()
+            for li in range(len(lines)):
+                if lines[li].startswith("storage-ckpt"):
+                    continue
+                body.append(lines[li])
+            var r = CheckpointReader(body^)
+            r.mode = 0
+            walk_params[Self.train_target](self.actor_pair.online, r, self.ctx, "actor"
+            )
+            walk_params[Self.train_target](self.pair1.online, r, self.ctx, "critic1"
+            )
+            walk_params[Self.train_target](self.pair2.online, r, self.ctx, "critic2"
+            )
+            r.mode = 1
+            self.actor_pair.online.for_each_state[Self.train_target](
+                r, self.ctx, "actor"
+            )
+            self.pair1.online.for_each_state[Self.train_target](
+                r, self.ctx, "critic1"
+            )
+            self.pair2.online.for_each_state[Self.train_target](
+                r, self.ctx, "critic2"
+            )
         self.actor_pair.target_net.polyak_from[Self.train_target](
             self.actor_pair.online, Scalar[DT](1.0), self.ctx
         )

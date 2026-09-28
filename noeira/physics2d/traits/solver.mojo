@@ -34,8 +34,33 @@ trait ConstraintSolver(ImplicitlyCopyable):
     comptime POSITION_ITERATIONS: Int
 
     # =========================================================================
-    # CPU Methods
+    # CPU Methods (Box2D order per step: init_velocity once, solve_velocity
+    # per velocity iteration, solve_position per position iteration)
     # =========================================================================
+
+    def init_velocity[
+        BATCH: Int,
+        NUM_BODIES: Int,
+        MAX_CONTACTS: Int,
+    ](
+        self,
+        mut bodies: LayoutTensor[
+            dtype,
+            Layout.row_major(BATCH, NUM_BODIES, BODY_STATE_SIZE),
+            MutAnyOrigin,
+        ],
+        mut contacts: LayoutTensor[
+            dtype,
+            Layout.row_major(BATCH, MAX_CONTACTS, CONTACT_DATA_SIZE),
+            MutAnyOrigin,
+        ],
+        contact_counts: LayoutTensor[
+            dtype, Layout.row_major(BATCH), MutAnyOrigin
+        ],
+    ):
+        """Prepare this step's contacts (anchors, restitution bias) and warm
+        start. Call once per step, before the velocity iterations."""
+        ...
 
     def solve_velocity[
         BATCH: Int,
@@ -88,11 +113,11 @@ trait ConstraintSolver(ImplicitlyCopyable):
         contact_counts: LayoutTensor[
             dtype, Layout.row_major(BATCH), MutAnyOrigin
         ],
-    ):
+    ) -> Bool:
         """Solve position constraints for one iteration.
 
         Pushes bodies apart to resolve interpenetration.
-        Should be called POSITION_ITERATIONS times per physics step.
+        Returns True when every contact is within tolerance (stop iterating).
 
         Args:
             bodies: Body state tensor [BATCH, NUM_BODIES, BODY_STATE_SIZE].

@@ -1,6 +1,6 @@
 ---
 title: Neural networks
-description: noeira.nn — Module/Param networks with autodiff, 70+ primitives, automatic fusion, and dual CPU/GPU paths.
+description: noeira.nn — Module/Param networks whose gradients compose at compile time, 70+ primitives, fused kernels, and dual CPU/GPU paths.
 ---
 
 import Maturity from '~/components/Maturity.astro';
@@ -84,8 +84,9 @@ Linear[D, H], ReLU[H]   # two modules, two kernels
 LinearReLU[D, H]        # one module, one fused kernel
 ```
 
-`MatMul+Bias+Activation` and `Conv2D+Activation` collapse into single GPU
-kernels this way.
+`MatMul+Bias+Activation` collapses into a single GPU kernel this way
+(`LinearAct` and its aliases). Nothing fuses automatically, and convolutions
+have no fused-activation form.
 
 ## A complete example
 
@@ -159,7 +160,8 @@ noeira/nn/
 :::note[Initializers live in `core`, not their own package]
 `from noeira.nn.core.initializer import Kaiming` — not
 `noeira.nn.initializer`. Likewise `ComputeGraph` is in `combinators/`, not an
-`autodiff/` package. Older documentation says otherwise.
+`autodiff/` package: the legacy framework's `AutoDiffChain` and `AutoFused`
+went with it in the storage sunset. Older documentation says otherwise.
 :::
 
 ## Next

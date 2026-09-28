@@ -70,7 +70,8 @@ The legacy `ws_fnet_offset` comptime was declared but never read — dropped.
 from std.math import sqrt, pow, abs
 from std.sys import simd_width_of
 from std.time import perf_counter_ns
-from max.gpu import thread_idx, block_idx, block_dim
+from max.gpu import thread_idx, block_idx, block_dim, WARP_SIZE
+from max.gpu.primitives import warp
 from max.gpu.sync import barrier
 from max.gpu.memory import AddressSpace
 from .je_budget import je_spills, je_ws_size, newton_block_threads
@@ -86,7 +87,12 @@ from .cholesky import (
     chol_factor_inline, chol_solve_inline, chol_factor_seg, chol_solve_seg,
     chol_solve_seg_p, _dot_seg, chol_update_seg,
 )
-from .newton_blocks import build_dof_segments, build_dof_segments_p
+from .newton_blocks import (
+    build_dof_segments_p,
+    dof_segments_init_p,
+    dof_segments_mark_p,
+    dof_segments_finish_p,
+)
 
 # MuJoCo's `mjMINVAL`; see `cholesky.mojo` on why `1e-10` was not the
 # reference's number for this guard.
@@ -155,9 +161,13 @@ from .newton_ell_coop import (
 # bug fix; see `_parse_option` in `parser/full_parser.mojo` for the numbers and
 # for the confounded experiment that first, wrongly, said otherwise.
 comptime NOSLIP_TOLERANCE: Float64 = 1e-6
-from .primal import pyramidal_edge_forces, pyramidal_linesearch
+from .primal import (
+    pyramidal_edge_forces, pyramidal_linesearch, ls_gtol_dtype_floor,
+    newton_stall_stop,
+)
 from ..constraints.contact_solve import (
     _init_common_normal_ws,
+    _init_common_normal_scalars,
     _precompute_contact_normal,
     _precompute_contact_friction,
 )
@@ -598,6 +608,10 @@ comptime NEWTON_FORCE_BLOCKED_MAX_NV: Int = 60
 # not, because the spill decision is what a real footprint should drive, and
 # this footprint is a fake one.
 comptime NEWTON_SHARED_PAD: Int = 0
+# Dofs a contact bitmask can name in the blocked kernel's elliptic Hessian
+# build (`cmask_sh`): the mask lives in a `DTYPE` shared slot, and float32 holds
+# every integer below 2^24 exactly. Wider models skip nothing.
+comptime CMASK_BITS: Int = 24
 # ⚠ THE PAD APPLIES ONLY TO LEGS WITH `NV <= NEWTON_SHARED_PAD_MAX_NV`. The
 # park probe carries every leg in ONE binary, and ptxas refuses any kernel
 # over 0x18c00 = 101,376 B of static shared memory — k=9 (90.1 KB) plus a
@@ -2181,6 +2195,7 @@ def _newton_solve_env[
         # Newton iterations
         var pyr_iters = 0
         var pyr_ls_evals = 0
+        var stall_run = 0  # `primal.newton_stall_stop`
         for iter_n in range(NEWTON_ITER_GPU):
             # ⚠⚠ NO CONSTRAINT ROWS: MUJOCO RETURNS, AND WE USED TO SOLVE.
             # `mj_fwdConstraint` (engine_forward.c:884) is explicit —
@@ -2496,6 +2511,8 @@ def _newton_solve_env[
             # until the gradient or decrement criterion ends it (AUD-39).
             comptime if NEWTON_312_CRITERIA:
                 if improvement > Scalar[DTYPE](0) and improvement < tol_rt:
+                    break
+                if newton_stall_stop[DTYPE](improvement, stall_run):
                     break
             else:
                 if improvement < tol_rt and iter_n > 0:
@@ -3340,6 +3357,7 @@ def _newton_solve_env[
     # algorithms; its WORK does, and that is what AUD-40 changed.
     var ls_eval_total = 0
     var newton_iters = 0
+    var stall_run = 0  # `primal.newton_stall_stop`
     for _iter in range(NEWTON_ITER_GPU):
         # ⚠⚠ NO CONSTRAINT ROWS: MUJOCO RETURNS, AND WE USED TO SOLVE.
         # `mj_fwdConstraint` (engine_forward.c:884) is explicit —
@@ -3595,6 +3613,7 @@ def _newton_solve_env[
             var p0_d0 = Scalar[DTYPE](0)
             var p0_d1 = Scalar[DTYPE](0)
             peval(p0_a, p0_c, p0_d0, p0_d1, lsiter)
+            gtol = ls_gtol_dtype_floor[DTYPE](gtol, p0_d0)
 
             comptime if _CPU_PROBE:
                 var _p_now = Int(perf_counter_ns())
@@ -3932,6 +3951,8 @@ def _newton_solve_env[
         comptime if NEWTON_312_CRITERIA:
             # MuJoCo's rule (see the pyramidal twin, AUD-39)
             if improvement > Scalar[DTYPE](0) and improvement < tol_rt:
+                break
+            if newton_stall_stop[DTYPE](improvement, stall_run):
                 break
         else:
             if improvement < tol_rt:
@@ -4646,7 +4667,10 @@ def _newton_blocked_fields_kernel[
     comptime M_SIZE = _max_one[NV * NV]()
     # ⚠ FROM `je_budget.newton_block_threads`, which the LAUNCH also reads —
     # the stride and `block_dim` must not drift apart.
-    comptime THREADS = newton_block_threads[MAX_CONTACTS]()
+    comptime THREADS = newton_block_threads[
+        DTYPE, NV, NJOINT, NTENDON, NEQUALITY, MAX_CONTACTS, MAX_CONDIM,
+        CONE_TYPE,
+    ]()
     # The cooperative STRIDE. Equals `THREADS` in production; see
     # `NEWTON_COOP_DIV`. `block_dim` is `THREADS` either way, so every
     # thread still reaches every `barrier()`.
@@ -4730,16 +4754,8 @@ def _newton_blocked_fields_kernel[
         # bit-identical at 1x, 2x, 4x and 8x `MAX_CONTACTS` threads WITH the
         # guards in place, which is the property F3 step 2 depends on.
         if contact_tid < MC:
-            _init_common_normal_ws[
+            _init_common_normal_scalars[
                 DTYPE](env, contact_tid, Dims[nq=NQ, nv=NV, nbody=NBODY, njoint=NJOINT, max_contacts=MAX_CONTACTS, ngeom=NGEOM, nequality=NEQUALITY, ntendon=NTENDON, nsite=NSITE](), solver)
-            # ⚠ ALL `2*(dim-1)` EDGE BLOCKS, not the four this used to zero.
-            # The producer re-zeros every edge of a non-penetrating contact
-            # itself, which is the only reason the short version was survivable.
-            for e in range(NE_ZERO):
-                for d in range(NV):
-                    solver[
-                        env, ws_Jt_idx + e * MC * NV + contact_tid * NV + d
-                    ] = 0
             comptime if CONE_TYPE == ConeType.ELLIPTIC:
                 for t in range(NT):
                     solver[env, ws_ell_dt + t * MC + contact_tid] = 0
@@ -4748,7 +4764,27 @@ def _newton_blocked_fields_kernel[
                 solver[env, ws_ell_mu + contact_tid] = 0
                 solver[env, ws_ell_dn + contact_tid] = 0
                 solver[env, ws_ell_ntc + contact_tid] = 0
-
+        # ⚠⚠ THE SLOTS' ROWS, ZEROED BY THE WHOLE THREADGROUP, COALESCED
+        # (2026-09-26). Each slot's thread used to zero its own `nv`-wide runs
+        # — J_n / MinvJn (`_init_common_normal_rows`) and its `NE_ZERO`
+        # tangential blocks — so a warp's store landed on 32 runs `nv` floats
+        # apart, ~96 scattered stores per thread. Timed in the kernel on
+        # so101_tower at 1024 lanes (RTX 5090) this stage was ~35 us of every
+        # env's setup. The slots' runs tile two contiguous ranges exactly, so
+        # a stride over them writes the same zeros with adjacent lanes on
+        # adjacent floats. The per-slot scalar fields stay per slot (already
+        # `k*MC + slot`, contiguous across lanes).
+        # ⚠ ALL `2*(dim-1)` EDGE BLOCKS (pyramidal; `NT` elliptic), not the four
+        # this used to zero — the producer re-zeros every edge of a
+        # non-penetrating contact itself, which is the only reason the short
+        # version was survivable.
+        for q in range(tid, 2 * MC * NV, THREADS):
+            solver[env, 15 * MC + q] = 0
+        for q in range(tid, NE_ZERO * MC * NV, THREADS):
+            solver[env, ws_Jt_idx + q] = 0
+    # Every slot's stage-2 producer writes into ranges another thread just
+    # zeroed.
+    barrier()
     comptime if NEWTON_STOP_AFTER == 1:
         return
 
@@ -5191,6 +5227,19 @@ def _newton_blocked_fields_kernel[
         DTYPE, Layout.row_major(ELL_HB), MutAnyOrigin,
         address_space=AddressSpace.SHARED,
     ].stack_allocation()
+    # ⚠ WHICH DOFS EACH CONTACT'S ROWS TOUCH, as a bitmask (bit i = some
+    # used row has a nonzero in column i). The Hessian build asks every
+    # contact about every entry (i, j) and `_ell_entry_contact_term` skips a
+    # zero `J_k[i]` only after LOADING it — and `Je` spills to global memory on
+    # any model with many contacts. On so101_tower that skip test was most of
+    # the build: 931 of the slowest env's 1027 us. Built once per solve (the
+    # rows are constant for the whole solve); skipping on it drops only
+    # contributions that are exactly zero. `CMASK_BITS` bounds it: a wider
+    # model stores -1 (every bit) and loses nothing but the skip.
+    var cmask_sh = LayoutTensor[
+        DTYPE, Layout.row_major(ELL_MC), MutAnyOrigin,
+        address_space=AddressSpace.SHARED,
+    ].stack_allocation()
     # Where the dense (non-contact) rows start: 0 on the pyramidal leg,
     # which treats every row alike, and past the contact block on the
     # elliptic one. `nc` is uniform across the threadgroup.
@@ -5283,6 +5332,17 @@ def _newton_blocked_fields_kernel[
                     else Scalar[DTYPE](0)
                 )
                 cs_sh[c] = Scalar[DTYPE](ELL_SATISFIED)
+                comptime if NV <= CMASK_BITS:
+                    var cm = 0
+                    for k in range(Int(rebind[Scalar[DTYPE]](ntc_sh[c])) + 1):
+                        for i in range(NV):
+                            if rebind[Scalar[DTYPE]](
+                                Je_sh[(row0 + k) * NV + i]
+                            ) != Scalar[DTYPE](0):
+                                cm |= 1 << i
+                    cmask_sh[c] = Scalar[DTYPE](cm)
+                else:
+                    cmask_sh[c] = Scalar[DTYPE](-1)
 
 
     barrier()
@@ -5746,24 +5806,8 @@ def _newton_blocked_fields_kernel[
         # Publish num_edges to shared for all threads.
         ctrl_sh[0] = Scalar[DTYPE](num_edges)
 
-        # ── H's diagonal blocks, from the rows just built ────────────────
-        #
-        # ⚠ HERE AND NOT INSIDE THE ITERATION LOOP. `Je` is final at this
-        # point and does not change across iterations — only the row STATES
-        # do — so one partition serves the whole solve and is a superset of
-        # every iteration's coupling. Computing it per iteration would let the
-        # partition move under the factorisation.
-        _ = build_dof_segments[
-            DTYPE, J_AS=JE_AS, S_AS = AddressSpace.SHARED
-        ](
-            NV,
-            Int(rebind[Scalar[DTYPE]](mmeta[MODEL_META_IDX_NTREE])),
-            num_edges,
-            trees,
-            Je_sh,
-            seg0_sh,
-            seg1_sh,
-        )
+        # (H's diagonal blocks are built just after this block, by the
+        # whole threadgroup — see "H's diagonal blocks" below.)
 
         # Initialize qacc/qacc_smooth from workspace
         for i in range(NV):
@@ -5777,11 +5821,132 @@ def _newton_blocked_fields_kernel[
         for i in range(NV):
             qacc_sh[i] = qacc[i]
     barrier()
+    # ── H's diagonal blocks, from the rows just built ────────────────────
+    #
+    # ⚠ HERE AND NOT INSIDE THE ITERATION LOOP. `Je` is final at this point
+    # and does not change across iterations — only the row STATES do — so one
+    # partition serves the whole solve and is a superset of every iteration's
+    # coupling. Computing it per iteration would let the partition move under
+    # the factorisation.
+    #
+    # ⚠ BY THE WHOLE THREADGROUP (2026-09-26). The middle phase is a
+    # `num_edges * nv` scan of `Je` (global memory once it spills); on thread
+    # 0 alone it was ~37 us of every env's setup on so101_tower at 1024 lanes.
+    # Thread 0 lays out the tree ids, every thread marks the trees its rows
+    # couple (the same value, so any split of the rows is exact), thread 0
+    # merges the runs — `newton_blocks.build_dof_segments_p`'s own three
+    # phases. `ctrl_sh[2]` carries the tree count; the factor resets it.
+    if valid_env and tid == 0:
+        ctrl_sh[2] = Scalar[DTYPE](
+            dof_segments_init_p[DTYPE, S_AS = AddressSpace.SHARED](
+                NV,
+                Int(rebind[Scalar[DTYPE]](mmeta[MODEL_META_IDX_NTREE])),
+                trees.ptr,
+                seg0_sh.ptr,
+                seg1_sh.ptr,
+            )
+        )
+    barrier()
+    var seg_nt = Int(rebind[Scalar[DTYPE]](ctrl_sh[2]))
+    if valid_env and seg_nt > 0:
+        dof_segments_mark_p[DTYPE, J_AS=JE_AS, S_AS = AddressSpace.SHARED](
+            NV, tid, THREADS, Int(rebind[Scalar[DTYPE]](ctrl_sh[0])),
+            Je_sh.ptr, seg0_sh.ptr, seg1_sh.ptr,
+        )
+    barrier()
+    if valid_env and tid == 0 and seg_nt > 0:
+        _ = dof_segments_finish_p[DTYPE, S_AS = AddressSpace.SHARED](
+            seg_nt, trees.ptr, seg0_sh.ptr, seg1_sh.ptr
+        )
+    barrier()
     if valid_env:
         _block_matvec_coop[DTYPE](
             tid, COOP, env, NV, M, qacc_sh, Mv_sh, seg0_sh, seg1_sh
         )
     barrier()
+    # ⚠⚠ THE WARM-START TRIAL COSTS RUN IN WARP 0 (2026-09-26), BOTH CONES.
+    # Each is a full cost: on the elliptic cone every penetrating contact's
+    # rows dotted with the trial acceleration (`Je` spills to global memory on
+    # a many-contact model), and on both cones every dense row — which on the
+    # pyramidal cone is every row (`dense0 == 0`). Serial on thread 0 the
+    # elliptic pair was ~56 us of every env's setup on so101_tower at 1024
+    # lanes (RTX 5090). Contacts and rows are strided over the warp's lanes and
+    # `warp.sum`med, re-broadcast from lane 0; thread 0 — lane 0 — takes the
+    # two values into its warm-start choice below. The inputs are complete
+    # here: `qacc_sh` (= `qacc_smooth`) and the rows were published before the
+    # barrier above, `ctrl_sh[0]` holds `num_edges`, and the warm start is read
+    # straight from `qacc_warmstart`.
+    #
+    # ⚠ THE PYRAMIDAL SMOOTH COST USED THREAD 0's STORED `jar` AND STATES,
+    # built later in this setup from the same `bias + sum_i Je[e,i]*qacc[i]`
+    # in the same order — so each row's term here is the same number; only
+    # the sum across rows is reordered.
+    # ⚠ NOT BIT-EXACT with the serial sum, like the line search; a near-tie
+    # between the two candidates can resolve the other way.
+    var trial_cost_s = Scalar[DTYPE](0)
+    var trial_cost_w = Scalar[DTYPE](0)
+    @always_inline
+    def _trial_cost_warp(warm: Bool, ne: Int) {imm} -> Scalar[DTYPE]:
+        var acc = Scalar[DTYPE](0)
+        comptime if IS_ELL:
+            var jar_t = Scratch[Scalar[DTYPE], NT](NT, fill=Scalar[DTYPE](0))
+            var D_t = Scratch[Scalar[DTYPE], NT](NT, fill=Scalar[DTYPE](0))
+            var fr = Scratch[Scalar[DTYPE], NT](NT, fill=Scalar[DTYPE](0))
+            for c in range(tid, nc, WARP_SIZE):
+                if rebind[Scalar[DTYPE]](cact_sh[c]) == Scalar[DTYPE](0):
+                    continue
+                var row0 = c * RPC
+                var nt_c = Int(rebind[Scalar[DTYPE]](ntc_sh[c]))
+                var jn = rebind[Scalar[DTYPE]](bias_e_sh[row0])
+                for t in range(nt_c):
+                    jar_t[t] = rebind[Scalar[DTYPE]](bias_e_sh[row0 + 1 + t])
+                for i in range(NV):
+                    var qa_i = (
+                        rebind[Scalar[DTYPE]](qacc_warmstart[env, i]) if warm
+                        else rebind[Scalar[DTYPE]](qacc_sh[i])
+                    )
+                    jn += rebind[Scalar[DTYPE]](Je_sh[row0 * NV + i]) * qa_i
+                    for t in range(nt_c):
+                        jar_t[t] += rebind[Scalar[DTYPE]](
+                            Je_sh[(row0 + 1 + t) * NV + i]
+                        ) * qa_i
+                _ell_tangent_locals[DTYPE, NT](nt_c, row0, De_sh, D_t)
+                _ell_tangent_locals[DTYPE, NT](nt_c, row0, fr_e_sh, fr)
+                acc += _ell_cost_at_jar[DTYPE, NT](
+                    nt_c, jn, jar_t, rebind[Scalar[DTYPE]](mu_sh[c]),
+                    rebind[Scalar[DTYPE]](De_sh[row0]), D_t, fr,
+                )
+        for e_idx in range(dense0 + tid, ne, WARP_SIZE):
+            var jar_w = rebind[Scalar[DTYPE]](bias_e_sh[e_idx])
+            for i in range(NV):
+                var qa_i = (
+                    rebind[Scalar[DTYPE]](qacc_warmstart[env, i]) if warm
+                    else rebind[Scalar[DTYPE]](qacc_sh[i])
+                )
+                jar_w += rebind[Scalar[DTYPE]](Je_sh[e_idx * NV + i]) * qa_i
+            var st_w = scalar_row_state[DTYPE](
+                Int(rebind[Scalar[DTYPE]](kind_e_sh[e_idx])),
+                jar_w,
+                rebind[Scalar[DTYPE]](R_e_sh[e_idx]),
+                rebind[Scalar[DTYPE]](floss_e_sh[e_idx]),
+            )
+            acc += scalar_row_cost[DTYPE](
+                st_w,
+                jar_w,
+                rebind[Scalar[DTYPE]](De_sh[e_idx]),
+                rebind[Scalar[DTYPE]](R_e_sh[e_idx]),
+                rebind[Scalar[DTYPE]](floss_e_sh[e_idx]),
+            )
+        return warp.shuffle_idx(warp.sum(acc), 0)
+    var ne_w = Int(rebind[Scalar[DTYPE]](ctrl_sh[0]))
+    if (
+        valid_env
+        and tid < WARP_SIZE
+        and mmeta[MODEL_META_IDX_WARMSTART_DISABLED] == Scalar[DTYPE](0)
+        and ne_w > 0
+    ):
+        trial_cost_s = _trial_cost_warp(False, ne_w)
+        trial_cost_w = _trial_cost_warp(True, ne_w)
     if valid_env and tid == 0:
         for i in range(NV):
             Ma[i] = rebind[Scalar[DTYPE]](Mv_sh[i])
@@ -5841,66 +6006,6 @@ def _newton_blocked_fields_kernel[
                 for i in range(NV):
                     qfrc[i] += rebind[Scalar[DTYPE]](Je_sh[e_idx * NV + i]) * f_e
 
-        # ── the ELLIPTIC warm-start candidate cost, from scratch ──────────
-        # The per-env leg's `acc_cost` loop: every penetrating contact's
-        # `jar` at the trial acceleration, its zone and cost
-        # (`_ell_cost_at_jar`), then the dense rows re-classified — no
-        # stored state is read. `warm` picks `search_sh` (the warm start,
-        # published below) or `qacc` (= `qacc_smooth` here).
-        @always_inline
-        def _ell_trial_cost(warm: Bool) {imm} -> Scalar[DTYPE]:
-            var acc = Scalar[DTYPE](0)
-            comptime if IS_ELL:
-                var jar_t = Scratch[Scalar[DTYPE], NT](NT, fill=Scalar[DTYPE](0))
-                var D_t = Scratch[Scalar[DTYPE], NT](NT, fill=Scalar[DTYPE](0))
-                var fr = Scratch[Scalar[DTYPE], NT](NT, fill=Scalar[DTYPE](0))
-                for c in range(nc):
-                    if rebind[Scalar[DTYPE]](cact_sh[c]) == Scalar[DTYPE](0):
-                        continue
-                    var row0 = c * RPC
-                    var nt_c = Int(rebind[Scalar[DTYPE]](ntc_sh[c]))
-                    var jn = rebind[Scalar[DTYPE]](bias_e_sh[row0])
-                    for t in range(nt_c):
-                        jar_t[t] = rebind[Scalar[DTYPE]](bias_e_sh[row0 + 1 + t])
-                    for i in range(NV):
-                        var qa_i = (
-                            rebind[Scalar[DTYPE]](search_sh[i]) if warm
-                            else qacc[i]
-                        )
-                        jn += rebind[Scalar[DTYPE]](Je_sh[row0 * NV + i]) * qa_i
-                        for t in range(nt_c):
-                            jar_t[t] += rebind[Scalar[DTYPE]](
-                                Je_sh[(row0 + 1 + t) * NV + i]
-                            ) * qa_i
-                    _ell_tangent_locals[DTYPE, NT](nt_c, row0, De_sh, D_t)
-                    _ell_tangent_locals[DTYPE, NT](nt_c, row0, fr_e_sh, fr)
-                    acc += _ell_cost_at_jar[DTYPE, NT](
-                        nt_c, jn, jar_t, rebind[Scalar[DTYPE]](mu_sh[c]),
-                        rebind[Scalar[DTYPE]](De_sh[row0]), D_t, fr,
-                    )
-                for e_idx in range(dense0, num_edges):
-                    var jar_w = rebind[Scalar[DTYPE]](bias_e_sh[e_idx])
-                    for i in range(NV):
-                        var qa_i = (
-                            rebind[Scalar[DTYPE]](search_sh[i]) if warm
-                            else qacc[i]
-                        )
-                        jar_w += rebind[Scalar[DTYPE]](Je_sh[e_idx * NV + i]) * qa_i
-                    var st_w = scalar_row_state[DTYPE](
-                        Int(rebind[Scalar[DTYPE]](kind_e_sh[e_idx])),
-                        jar_w,
-                        rebind[Scalar[DTYPE]](R_e_sh[e_idx]),
-                        rebind[Scalar[DTYPE]](floss_e_sh[e_idx]),
-                    )
-                    acc += scalar_row_cost[DTYPE](
-                        st_w,
-                        jar_w,
-                        rebind[Scalar[DTYPE]](De_sh[e_idx]),
-                        rebind[Scalar[DTYPE]](R_e_sh[e_idx]),
-                        rebind[Scalar[DTYPE]](floss_e_sh[e_idx]),
-                    )
-            return acc
-
         # ── warmstart() — the per-env path's twin, see the comment there.
         # Serial on thread 0 like the rest of this init, and re-running the
         # init loop above rather than keeping a trial state is what keeps the
@@ -5909,18 +6014,7 @@ def _newton_blocked_fields_kernel[
             mmeta[MODEL_META_IDX_WARMSTART_DISABLED] == Scalar[DTYPE](0)
             and num_edges > 0
         ):
-            ws_cost_s = 0
-            comptime if CONE_TYPE == ConeType.PYRAMIDAL:
-                for e_idx in range(num_edges):
-                    ws_cost_s += scalar_row_cost[DTYPE](
-                        Int(rebind[Scalar[DTYPE]](state_e_sh[e_idx])),
-                        jar[e_idx],
-                        rebind[Scalar[DTYPE]](De_sh[e_idx]),
-                        rebind[Scalar[DTYPE]](R_e_sh[e_idx]),
-                        rebind[Scalar[DTYPE]](floss_e_sh[e_idx]),
-                    )
-            else:
-                ws_cost_s = _ell_trial_cost(False)
+            ws_cost_s = trial_cost_s
             # The trial acceleration goes to threadgroup memory for the
             # cooperative matvec after the cut (`search_sh` is free until the
             # loop).
@@ -5933,30 +6027,7 @@ def _newton_blocked_fields_kernel[
                         ctrl_sh[2] = Scalar[DTYPE](0)
             for i in range(NV):
                 search_sh[i] = rebind[Scalar[DTYPE]](qacc_warmstart[env, i])
-            ws_cost_w = 0
-            comptime if CONE_TYPE == ConeType.PYRAMIDAL:
-                for e_idx in range(num_edges):
-                    var jar_w = rebind[Scalar[DTYPE]](bias_e_sh[e_idx])
-                    for i in range(NV):
-                        jar_w += (
-                            rebind[Scalar[DTYPE]](Je_sh[e_idx * NV + i])
-                            * rebind[Scalar[DTYPE]](search_sh[i])
-                        )
-                    var st_w = scalar_row_state[DTYPE](
-                        Int(rebind[Scalar[DTYPE]](kind_e_sh[e_idx])),
-                        jar_w,
-                        rebind[Scalar[DTYPE]](R_e_sh[e_idx]),
-                        rebind[Scalar[DTYPE]](floss_e_sh[e_idx]),
-                    )
-                    ws_cost_w += scalar_row_cost[DTYPE](
-                        st_w,
-                        jar_w,
-                        rebind[Scalar[DTYPE]](De_sh[e_idx]),
-                        rebind[Scalar[DTYPE]](R_e_sh[e_idx]),
-                        rebind[Scalar[DTYPE]](floss_e_sh[e_idx]),
-                    )
-            else:
-                ws_cost_w = _ell_trial_cost(True)
+            ws_cost_w = trial_cost_w
             # The warmstart trial's `Ma = M*qacc_w` — the second NV^2 serial
             # matvec in this setup block, same block restriction and the same
             # exact-zero argument as the one above.
@@ -6104,6 +6175,7 @@ def _newton_blocked_fields_kernel[
     # some 200 lines further down. A thread-0 register carries it; it needs no
     # shared slot and no barrier because both readers ARE thread 0.
     var grad_below_tol = False
+    var stall_run = 0  # `primal.newton_stall_stop`
     for iter_n in range(NEWTON_ITER_GPU):
         # ⚠⚠ NO CONSTRAINT ROWS: MUJOCO RETURNS, AND WE USED TO SOLVE.
         # `mj_fwdConstraint` (engine_forward.c:884) is explicit —
@@ -6211,6 +6283,7 @@ def _newton_blocked_fields_kernel[
                 # is safe only because nothing reads them; it is NOT the same
                 # property as `L_sh` below, where zero is load-bearing.
                 var bp = 0
+                var base = 0
                 while bp < NV:
                     var be = Int(rebind[Scalar[DTYPE]](seg1_sh[bp]))
                     # A malformed partition would hang the walk; a runaway is worse
@@ -6236,9 +6309,27 @@ def _newton_blocked_fields_kernel[
                                             * rebind[Scalar[DTYPE]](Je_sh[e * NV + pj])
                                         )
                                 L_sh[pidx] = ph
-                    for q in range(tid, bn * bn, COOP):
-                        var i = bp + q // bn
-                        var j = bp + q % bn
+                    # ⚠⚠ THE LOWER TRIANGLE ONLY, AND EVERY BLOCK IN ONE STRIDE
+                    # (2026-09-26). The factor reads `[j*nv+j]` and `[i*nv+j]`
+                    # with i > j (audited above), and the triangular solve only
+                    # the lower triangle, so the upper entries were dead writes
+                    # — half the build. And a thread used to take block `bp`'s
+                    # `bn*bn` entries on a stride of COOP and then WAIT for the
+                    # next block: on so101_tower (three 6-dof trees) that was
+                    # 36 entries on 64 threads, three times over. Numbering
+                    # the lower triangles of all blocks as ONE list (`base`
+                    # counts entries before this block) puts 63 entries on 64
+                    # threads in a single pass. Each entry's arithmetic is
+                    # unchanged, so the factor sees the same bits.
+                    var cnt = bn * (bn + 1) // 2
+                    var first = base + (((tid - base) % COOP) + COOP) % COOP
+                    for q in range(first, base + cnt, COOP):
+                        var r = q - base
+                        var ra = 0
+                        while (ra + 1) * (ra + 2) // 2 <= r:
+                            ra += 1
+                        var i = bp + ra
+                        var j = bp + (r - ra * (ra + 1) // 2)
                         var idx = i * NV + j
                         var h = rebind[Scalar[DTYPE]](M[env, idx])
                         # The rank-deficient retry: what `_chol_factor_coop`
@@ -6269,12 +6360,17 @@ def _newton_blocked_fields_kernel[
                                     == ELL_SATISFIED
                                 ):
                                     continue
+                                comptime if NV <= CMASK_BITS:
+                                    var cm = Int(rebind[Scalar[DTYPE]](cmask_sh[c]))
+                                    if ((cm >> i) & 1) == 0 or ((cm >> j) & 1) == 0:
+                                        continue
                                 _ell_entry_contact_term[
                                     DTYPE, NT, HN, JE_AS=JE_AS
                                 ](c, i, j, NV, Je_sh, ntc_sh, hb_sh, h)
                             if chol_attempt == 1 and i == j:
                                 h += Scalar[DTYPE](1e-6)
                         L_sh[idx] = h
+                    base += cnt
                     bp = be
             barrier()
 
@@ -6445,6 +6541,15 @@ def _newton_blocked_fields_kernel[
                 Jv_e[e_idx] = rebind[Scalar[DTYPE]](Jv_e_sh[e_idx])
 
         # --- Thread 0: gauss / p0 / line search / update / cost ---
+        comptime assert THREADS >= WARP_SIZE, (
+            "the line search runs in warp 0: the block must hold one"
+        )
+        var ls_decr = Scalar[DTYPE](0)
+        var ls_gauss_a = Scalar[DTYPE](0)
+        var ls_gauss_b = Scalar[DTYPE](0)
+        var ls_snorm = Scalar[DTYPE](0)
+        var ls_gtol = Scalar[DTYPE](0)
+        var ls_budget_f = Scalar[DTYPE](0)
         if valid_env and tid == 0:
             # ⚠ 3.11 termination (AUD-39, `NEWTON_312_CRITERIA`), the block
             # kernel's copy of the per-env twin at `:2216`. The Newton
@@ -6539,12 +6644,47 @@ def _newton_blocked_fields_kernel[
             var ls_budget = LINESEARCH_ITER
             if lsiter_rt > 0 and lsiter_rt < ls_budget:
                 ls_budget = lsiter_rt
-
+            # Hand the line to warp 0: `jar` is thread 0's copy, and the
+            # pyramidal setup never publishes it (the elliptic recompute does).
+            for e_idx in range(num_edges_b):
+                jar_sh[e_idx] = jar[e_idx]
+            ls_decr = Scalar[DTYPE](1) if decr_stop else Scalar[DTYPE](0)
+            ls_gauss_a = gauss_a
+            ls_gauss_b = gauss_b
+            ls_snorm = snorm
+            ls_gtol = gtol_b
+            ls_budget_f = Scalar[DTYPE](ls_budget)
+        barrier()
+        var alpha = Scalar[DTYPE](0)
+        var lsiter_b = 0
+        if valid_env and tid < WARP_SIZE:
+            var decr_stop = warp.shuffle_idx(ls_decr, 0) != Scalar[DTYPE](0)
+            var gauss_a = warp.shuffle_idx(ls_gauss_a, 0)
+            var gauss_b = warp.shuffle_idx(ls_gauss_b, 0)
+            var snorm = warp.shuffle_idx(ls_snorm, 0)
+            var gtol_b = warp.shuffle_idx(ls_gtol, 0)
+            var ls_budget = Int(warp.shuffle_idx(ls_budget_f, 0))
             # `PrimalEval` (engine_solver.c:1511): the SHIFTED line cost
             # `cost(a) - cost(0)` and BOTH derivatives in one pass, rows
             # RE-CLASSIFIED at the trial point. Mirrors `peval` in
             # `primal.mojo` — see that docstring for why the cost has to be
             # carried at every point rather than computed in the fallback.
+            # ⚠⚠ WARP 0 EVALUATES THE LINE, NOT THREAD 0 (2026-09-26). This
+            # region runs in all 32 lanes of warp 0 with IDENTICAL control
+            # flow: every value a branch reads is either broadcast from lane 0
+            # or produced by the reduction below, which ends in a broadcast. A
+            # lane takes contacts and rows strided by WARP_SIZE; the three sums
+            # are `warp.sum`s re-broadcast from lane 0, so no two lanes can
+            # disagree by a rounding and fork the search.
+            #
+            # Measured on so101_tower at 1024 lanes (RTX 5090, NEWTON timing
+            # probe): the line search was ~54% of the slowest env's solve —
+            # 119 serial evaluations at ~14 us each on thread 0.
+            #
+            # ⚠ NOT BIT-EXACT WITH THE SERIAL ORDER. The Gauss terms are added
+            # to the reduced row sums instead of seeding a running sum, and the
+            # rows are summed as a tree. The per-env CPU leg still sums
+            # serially; the two legs now agree to rounding, not to the bit.
             @always_inline
             def _bl_peval(
                 a: Scalar[DTYPE],
@@ -6553,39 +6693,41 @@ def _newton_blocked_fields_kernel[
                 mut d1: Scalar[DTYPE],
                 mut it: Int,
             ) {imm}:
-                c = Scalar[DTYPE](0.5) * gauss_a * a * a + gauss_b * a
-                d0 = gauss_a * a + gauss_b
-                d1 = gauss_a
+                var pc = Scalar[DTYPE](0)
+                var pd0 = Scalar[DTYPE](0)
+                var pd1 = Scalar[DTYPE](0)
                 comptime if IS_ELL:
-                    # The per-env leg's `peval`: every penetrating contact
-                    # through `ell_line_eval`, BEFORE the dense rows.
-                    for cc in range(nc):
+                    for cc in range(tid, nc, WARP_SIZE):
                         if rebind[Scalar[DTYPE]](cact_sh[cc]) == Scalar[DTYPE](0):
                             continue
                         _ell_contact_line_eval[DTYPE, NT](
                             cc, a, jar_sh, Jv_e_sh, De_sh, fr_e_sh, mu_sh,
-                            ntc_sh, c, d0, d1,
+                            ntc_sh, pc, pd0, pd1,
                         )
-                for e_idx in range(dense0, num_edges_b):
+                for e_idx in range(dense0 + tid, num_edges_b, WARP_SIZE):
                     var kd = Int(rebind[Scalar[DTYPE]](kind_e_sh[e_idx]))
                     var Rd = rebind[Scalar[DTYPE]](R_e_sh[e_idx])
                     var fd = rebind[Scalar[DTYPE]](floss_e_sh[e_idx])
                     var Dd = rebind[Scalar[DTYPE]](De_sh[e_idx])
-                    var jt = jar[e_idx] + a * Jv_e[e_idx]
+                    var j0 = rebind[Scalar[DTYPE]](jar_sh[e_idx])
+                    var jv = rebind[Scalar[DTYPE]](Jv_e_sh[e_idx])
+                    var jt = j0 + a * jv
                     var st = scalar_row_state[DTYPE](kd, jt, Rd, fd)
                     # ⚠ THE alpha=0 REFERENCE IS RE-DERIVED FROM `jar`, not
-                    # read from `state_e_sh`. `PrimalEval` evaluates the line
-                    # at `Jaref + alpha*Jv` for alpha=0 like any other alpha,
-                    # and the stored state is one Newton move stale.
-                    var st0 = scalar_row_state[DTYPE](kd, jar[e_idx], Rd, fd)
-                    c += scalar_row_cost[DTYPE](
+                    # read from `state_e_sh` — see the serial form's note.
+                    var st0 = scalar_row_state[DTYPE](kd, j0, Rd, fd)
+                    pc += scalar_row_cost[DTYPE](
                         st, jt, Dd, Rd, fd
-                    ) - scalar_row_cost[DTYPE](st0, jar[e_idx], Dd, Rd, fd)
-                    d0 += (
-                        -scalar_row_force[DTYPE](st, jt, Dd, fd) * Jv_e[e_idx]
-                    )
+                    ) - scalar_row_cost[DTYPE](st0, j0, Dd, Rd, fd)
+                    pd0 += -scalar_row_force[DTYPE](st, jt, Dd, fd) * jv
                     if st == SROW_QUADRATIC:
-                        d1 += Dd * Jv_e[e_idx] * Jv_e[e_idx]
+                        pd1 += Dd * jv * jv
+                var sc = warp.shuffle_idx(warp.sum(pc), 0)
+                var sd0 = warp.shuffle_idx(warp.sum(pd0), 0)
+                var sd1 = warp.shuffle_idx(warp.sum(pd1), 0)
+                c = Scalar[DTYPE](0.5) * gauss_a * a * a + gauss_b * a + sc
+                d0 = gauss_a * a + gauss_b + sd0
+                d1 = gauss_a + sd1
                 if d1 <= Scalar[DTYPE](0):
                     d1 = Scalar[DTYPE](PRIMAL_MINVAL_GPU)
                 it += 1
@@ -6599,7 +6741,7 @@ def _newton_blocked_fields_kernel[
             # one leg start its search from a different derivative than the
             # other; blocked-GPU vs per-env-CPU `qacc` with the noslip pass OFF
             # went 1.06e-05 -> 6.26e-04 while they disagreed about it.
-            var lsiter_b = 0
+            lsiter_b = 0
             var p0_c = Scalar[DTYPE](0)
             var p0_d0 = Scalar[DTYPE](0)
             var p0_d1 = Scalar[DTYPE](0)
@@ -6622,8 +6764,9 @@ def _newton_blocked_fields_kernel[
             # `p0_*` is read only under `if not decr_stop`.
             if not decr_stop:
                 _bl_peval(Scalar[DTYPE](0), p0_c, p0_d0, p0_d1, lsiter_b)
+                gtol_b = ls_gtol_dtype_floor[DTYPE](gtol_b, p0_d0)
 
-            var alpha: Scalar[DTYPE] = 0
+            alpha = Scalar[DTYPE](0)
             if not decr_stop and snorm >= Scalar[DTYPE](PRIMAL_MINVAL_GPU):
                 # Phase 1: always attempt one Newton step on the line.
                 var p1_a = -p0_d0 / p0_d1
@@ -6783,6 +6926,7 @@ def _newton_blocked_fields_kernel[
             # appears TWICE: the per-env solver carries the same guard.
             # ⚠ UNCONDITIONAL since 2026-09-14: `META_IDX_LS_EVAL` is published
             # from this count below; under the report knob only, it read 0.
+        if valid_env and tid == 0:
             ls_evals += lsiter_b
             # `mj_solPrimal` breaks on `alpha == 0` EXACTLY
             # (engine_solver.c:2432) — a tiny nonzero step is taken, not
@@ -6874,6 +7018,9 @@ def _newton_blocked_fields_kernel[
                         and improvement < tol_rt
                         and iter_n >= NEWTON_MIN_ITER
                     )
+                    # the float32 `alpha == 0` (`primal.newton_stall_stop`)
+                    if newton_stall_stop[DTYPE](improvement, stall_run):
+                        _stop = True
                     if _stop:
                         ctrl_sh[1] = Scalar[DTYPE](1)  # done
                 else:
@@ -7287,5 +7434,10 @@ def solve_newton_blocked[
             grid_dim=(BATCH,),
             # ⚠ SAME SOURCE AS THE KERNEL'S `THREADS`, not `MC`. They were
             # equal by coincidence of both spelling `_max_one[MAX_CONTACTS]`.
-            block_dim=(newton_block_threads[D.MAX_CONTACTS](),),
+            block_dim=(
+                newton_block_threads[
+                    DTYPE, D.NV, D.NJOINT, D.NTENDON, D.NEQUALITY,
+                    D.MAX_CONTACTS, MAX_CONDIM, CONE_TYPE,
+                ](),
+            ),
         )

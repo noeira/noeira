@@ -127,7 +127,7 @@ no room above it and no saturation below.
 around them is: -31.5 (32 envs) and -19.98 (64 envs) were the linear form at
 weights 0.50/0.25, and -3.996 was 0.10/0.05. A return is comparable only
 within one reward SHAPE, one weight pair and one lane count. All three now
-travel with the run as `cfg/*` fields.
+travel with the run in its config (`metrics.config.kv`).
 
 ⚠ THE SUCCESS-RATE baselines are lane-count independent — a rate is per
 episode either way — so only the RETURN figures moved.
@@ -156,7 +156,7 @@ turned out to be worth: 0.56 success, not 0.64.
 
 ⚠⚠ THE LAST CHANGE WAS `TERMINATE_ON_UNHEALTHY: True -> False`, ALONE. Run 13
 had every other setting identical — same weights, same tau, same entropy, same
-tolerance margins, confirmed by its own `cfg/*` — and its `mean_q` sat 12x
+tolerance margins, confirmed by its own logged config — and its `mean_q` sat 12x
 above its fixed point with the eval swinging 25..69 around a baseline of 48.
 
 Why it matters is a value CLIFF. A lane that succeeds gets `done = 1`, so the
@@ -201,6 +201,7 @@ learning.
 """
 
 from std.pathlib import Path
+from std.sys import is_defined
 from std.random import seed as seed_rng
 from std.time import perf_counter_ns
 
@@ -261,7 +262,18 @@ from noeira.tasks.critic_health import critic_health
 # parameters and the greedy eval's lane count. `--updates-per-step` is the
 # flag, and it is what varies the tracking rate WITHOUT changing how much
 # data an iteration collects.
-comptime N_ENVS = 32
+#
+# ⚠ `-D TASK_SAC_LANES_256` / `-D TASK_SAC_LANES_1024` select a wider batch
+# at BUILD time (Mojo has no integer define here), for the Squint-scale runs
+# of `noeira-docs/SO101_PIXEL_RL_PLAN.md` step 0. The default stays 32. A
+# wide run MUST pass `--updates-per-step` and `--tau` explicitly: the default
+# `updates_per_step = N_ENVS` would be 1024 updates per iteration, and the
+# target's tracking rate is `1 - (1 - tau)^updates_per_step` (below) — at 256
+# updates, `--tau 0.0003` is the ~7.4 % the 32-lane history found stable.
+comptime N_ENVS = (
+    1024 if is_defined["TASK_SAC_LANES_1024"]()
+    else (256 if is_defined["TASK_SAC_LANES_256"]() else 32)
+)
 # ⚠⚠ `lift`, NOT `reach`. `reach` and `reach_clear` are both
 # `AtRegion(robot_gripperframe, table_top)` and
 # `examples/tasks/task_null_action.mojo` measured what that is worth: a
@@ -455,7 +467,7 @@ def baselines_for(task: String) -> Tuple[Float64, Float64, Float64, Bool]:
         # The two seeds are one population (Fisher p = 0.09) and the pooled
         # rate against a baseline of 0 in 256 is not close — 43 successes
         # against an expectation of 3. A run far below 0.13 at this config is
-        # configured differently or has a sick critic; check `cfg/*` and the
+        # configured differently or has a sick critic; check `metrics.config.kv` and the
         # peak ratio before tuning anything.
         #
         # ⚠⚠ AND THE MULTI-TASK BATCH BEATS IT. One policy on
@@ -723,7 +735,8 @@ def run_sac[M: ModelDefLike, C: Phyics3dEnvConfig](
     # NO CHECKPOINT to diagnose (50k default, first eval 25k): `--checkpoint-
     # every` sets the cadence so a stopped run still has a policy to load.
     var checkpoint_every = CHECKPOINT_EVERY
-    # ⚠ `--demos` / `--demo-filter` / `--bc-weight` / `--bc-only` are
+    # ⚠ `--demos` / `--demo-filter` / `--bc-weight` / `--bc-q-ratio` /
+    # `--bc-only` are
     # HIL-SERL's (`deep_agents/hil_serl`, which documents each); `--init CKPT`
     # loads a `--bc-only` checkpoint (actor + twin critics; targets
     # hard-copied) into a normal run — the second half of a warm start.
@@ -933,7 +946,7 @@ def run_sac[M: ModelDefLike, C: Phyics3dEnvConfig](
     # so there was no single knob to turn and every run was the same draw.
     #
     # ⚠ A RUN OF THIS CONFIGURATION IS ONE SAMPLE. Two `gather` runs at an
-    # identical `cfg/*` block reached 0.5625 and 0.0, the second by a critic
+    # identical logged config reached 0.5625 and 0.0, the second by a critic
     # that peaked 273x its fixed point and decayed back. Read `critic_health`
     # at the end of BOTH before comparing their rates.
     seed_rng(seed)
@@ -1111,36 +1124,65 @@ def run_sac[M: ModelDefLike, C: Phyics3dEnvConfig](
             run_id=run.id,
             buffer_size=64,
             api_key=env_vars.get("NOEIRA_CLOUD_API_KEY", ""),
+            spool_path=run.dir + "/remote.spool",
         )
-        remote.set_config("algorithm", "SAC")
-        remote.set_config("family", f.name)
-        remote.set_config("task", task_name)
-        remote.set_config("goal", t.goal)
-        remote.set_config("language", t.language)
-        remote.set_config("target", "gpu")
-        remote.set_config("n_envs", String(N_ENVS))
-        remote.set_config("hidden", String(HIDDEN))
-        remote.set_config("batch", String(BATCH))
-        remote.set_config("warmup", String(warmup))
-        remote.set_config("horizon", String(C.MAX_STEPS))
-        remote.set_config("action_scale", String(ACTION_SCALE))
-        remote.set_config("target_entropy", String(target_entropy))
-        remote.set_config("init_alpha", String(init_alpha))
-        remote.set_config("shape_w_goal", String(shape_goal))
-        remote.set_config("shape_w_reach", String(shape_reach))
-        remote.set_config("updates_per_step", String(updates_per_step))
-        remote.set_config("tau", String(tau))
-        hil.log_config(remote)
-        remote.set_config("target_track_per_iter", String(track))
+        # ⚠ THE CONFIG GOES TO BOTH HALVES: `/runs` for the dashboard and
+        # `metrics.config.kv` beside the CSV, so a CSV read later still says
+        # what produced it. Hence the composite is built BEFORE `set_config`.
+        var logger = CompositeLogger(CsvLogger(csv_path), remote^)
+        logger.set_config("algorithm", "SAC")
+        logger.set_config("family", f.name)
+        logger.set_config("task", task_name)
+        logger.set_config("goal", t.goal)
+        logger.set_config("language", t.language)
+        logger.set_config("target", "gpu")
+        logger.set_config("n_envs", String(N_ENVS))
+        logger.set_config("hidden", String(HIDDEN))
+        logger.set_config("batch", String(BATCH))
+        logger.set_config("warmup", String(warmup))
+        logger.set_config("horizon", String(C.MAX_STEPS))
+        logger.set_config("action_scale", String(ACTION_SCALE))
+        logger.set_config("target_entropy", String(target_entropy))
+        logger.set_config("init_alpha", String(init_alpha))
+        logger.set_config("shape_w_goal", String(shape_goal))
+        logger.set_config("shape_w_reach", String(shape_reach))
+        logger.set_config("updates_per_step", String(updates_per_step))
+        logger.set_config("tau", String(tau))
+        hil.log_config(logger)
+        logger.set_config("target_track_per_iter", String(track))
         # ⚠ THE MEASURED FLOOR TRAVELS WITH THE RUN. A rate on a dashboard is
         # unreadable without it — 0.05 is nothing on `reach` and would be real
         # on `lift` — and a config field is the only part of a run that is
         # still there when somebody opens the chart a week later.
         var bl0 = baselines_for(task_name)
-        remote.set_config("baseline_random", String(bl0[0]))
-        remote.set_config("baseline_untrained_greedy", String(bl0[1]))
-        remote.set_config("baseline_measured", String(bl0[2]))
-        var logger = CompositeLogger(CsvLogger(csv_path), remote)
+        logger.set_config("baseline_random", String(bl0[0]))
+        logger.set_config("baseline_untrained_greedy", String(bl0[1]))
+        logger.set_config("baseline_measured", String(bl0[2]))
+        # ⚠⚠ PER TASK, KEYED BY TASK NAME. The weights and margins were one
+        # value each, which is right for one task and a lie for two — a batch
+        # whose tasks carry different margins would have recorded one of
+        # them. It cost a real conclusion once: two runs' shaped costs were
+        # decomposed under ASSUMED weights, the decompositions disagreed (a
+        # goal distance of -0.030 m), and nothing in the files could say
+        # which weight had actually run.
+        logger.set_config("n_tasks", String(n_tasks))
+        for i in range(n_tasks):
+            var k = task_names[i] + String(".")
+            logger.set_config(k + String("shape_w_goal"), String(wg[i]))
+            logger.set_config(k + String("shape_w_reach"), String(wr[i]))
+            logger.set_config(k + String("goal_margin"), String(mg[i]))
+            logger.set_config(k + String("reach_margin"), String(mr[i]))
+            logger.set_config(
+                k + String("lanes"), String(lanes_for_task(i, N_ENVS, n_tasks))
+            )
+        logger.set_config("obs_dim", String(OBS))
+        # ⚠⚠ THE ONE SETTING THAT WAS NOT RECORDED WAS THE DECISIVE ONE.
+        # `TERMINATE_ON_UNHEALTHY` is a comptime env parameter, not a flag, so
+        # it was in no config — and it is what separated fourteen runs of a
+        # diverging critic from the first one that trained.
+        logger.set_config(
+            "terminate_on_unhealthy", String(EnvL.TERMINATE_ON_UNHEALTHY)
+        )
         # ⚠ AFTER the config and before step 0 — `register_run` seeds the
         # dashboard's config from the run (id, project, task, commit, seed,
         # host) and then POSTs `/runs`. Registering any earlier would ship an
@@ -1156,60 +1198,6 @@ def run_sac[M: ModelDefLike, C: Phyics3dEnvConfig](
         # is a no-op on a None, so there is no branch to write here.
         var artifacts = sink_for_run(run.id, run.dir)
 
-        # ⚠⚠ THE CONFIG ALSO GOES OUT AS SCALARS AT STEP 0, SO THE CSV IS
-        # SELF-DESCRIBING. `set_config` reaches the dashboard and NOT the CSV
-        # — `CsvLogger` writes `step,wall_time_ms,name,value` and has nowhere
-        # to put a config field — so a CSV read later carries the curves and
-        # none of the settings that produced them.
-        #
-        # That cost a real conclusion. Two runs' shaped costs were decomposed
-        # into a goal distance and a reach distance under ASSUMED weights, and
-        # the two decompositions were mutually inconsistent: solving the pair
-        # gives a goal distance of -0.030 m, which is impossible. The
-        # arithmetic was fine; one of the weights I assumed was not what ran,
-        # and nothing in the file could say so.
-        #
-        # ⚠ AS `cfg/*` SO THEY SORT TOGETHER and cannot collide with a metric
-        # name. Emitted once, at step 0, before anything else is logged.
-        # ⚠⚠ PER TASK, KEYED BY TASK NAME. These were four scalars, which is
-        # right for one task and a lie for two — a batch whose tasks carry
-        # different margins would have recorded one of them, and the reason
-        # this block exists at all is that an assumed weight turned out not
-        # to be what ran.
-        logger.log_scalar(String("cfg/n_tasks"), Float64(n_tasks), 0)
-        for i in range(n_tasks):
-            var k = String("cfg/") + task_names[i] + String("/")
-            logger.log_scalar(k + String("shape_w_goal"), wg[i], 0)
-            logger.log_scalar(k + String("shape_w_reach"), wr[i], 0)
-            logger.log_scalar(k + String("goal_margin"), mg[i], 0)
-            logger.log_scalar(k + String("reach_margin"), mr[i], 0)
-            logger.log_scalar(
-                k + String("lanes"),
-                Float64(lanes_for_task(i, N_ENVS, n_tasks)), 0,
-            )
-        logger.log_scalar(
-            String("cfg/target_entropy"), Float64(target_entropy), 0
-        )
-        logger.log_scalar(String("cfg/init_alpha"), Float64(init_alpha), 0)
-        logger.log_scalar(String("cfg/tau"), Float64(tau), 0)
-        logger.log_scalar(
-            String("cfg/updates_per_step"), Float64(updates_per_step), 0
-        )
-        logger.log_scalar(String("cfg/n_envs"), Float64(N_ENVS), 0)
-        logger.log_scalar(String("cfg/warmup"), Float64(warmup), 0)
-        logger.log_scalar(String("cfg/seed"), Float64(seed), 0)
-        logger.log_scalar(String("cfg/obs_dim"), Float64(OBS), 0)
-        # ⚠⚠ THE ONE SETTING THAT WAS NOT RECORDED WAS THE DECISIVE ONE.
-        # `TERMINATE_ON_UNHEALTHY` is a comptime env parameter, not a flag, so
-        # it never went into `cfg/*` — and it is what separated fourteen runs
-        # of a diverging critic from the first one that trained.
-        logger.log_scalar(
-            String("cfg/terminate_on_unhealthy"),
-            1.0 if EnvL.TERMINATE_ON_UNHEALTHY else 0.0, 0,
-        )
-        logger.log_scalar(String("cfg/max_steps"),
-                          Float64(C.MAX_STEPS), 0)
-        logger.log_scalar(String("cfg/target_track_per_iter"), track, 0)
 
         var logger_ptr = Pointer(to=logger).as_unsafe_any_origin()
 
@@ -1422,29 +1410,44 @@ def run_sac[M: ModelDefLike, C: Phyics3dEnvConfig](
         # for a single-task run, because every chart and every comparison
         # made so far reads them.
         for i in range(n_tasks):
-            var k = String("eval/") + task_names[i] + String("/")
-            logger.log_scalar(k + String("success_rate"),
-                              any_rates[i], num_steps)
-            logger.log_scalar(k + String("success_rate_final"),
-                              fin_rates[i], num_steps)
-        if n_tasks == 1:
-            logger.log_scalar(String("eval/success_rate"), rate, num_steps)
             logger.log_scalar(
-                String("eval/success_rate_final"), rate_final, num_steps
+                String("eval_success_rate_") + task_names[i],
+                any_rates[i], num_steps,
             )
-        logger.log_scalar(String("eval/shaped_return"), shaped, num_steps)
+            logger.log_scalar(
+                String("eval_success_rate_final_") + task_names[i],
+                fin_rates[i], num_steps,
+            )
+        if n_tasks == 1:
+            logger.log_scalar(String("eval_success_rate"), rate, num_steps)
+            logger.log_scalar(
+                String("eval_success_rate_final"), rate_final, num_steps
+            )
+        logger.log_scalar(String("eval_shaped_return"), shaped, num_steps)
 
         # ⚠⚠ `close()` GOES **AFTER** THE LAST `log_scalar`, AND IT DID NOT.
         # It sat above the greedy eval, so the two metrics this run exists to
         # produce were logged to a CLOSED logger and dropped — `close()`
         # drains the queue and joins the POST thread, and anything queued
         # afterwards has nothing to carry it. The 990k-step run's
-        # `eval/success_rate` is missing from its CSV for exactly this reason
+        # `eval/success_rate` (now `eval_success_rate`) is missing from its CSV for exactly this reason
         # and NOT because the export was early, which is what I assumed.
         #
         # ⚠ IT IS SILENT. `log_scalar` after `close` neither raises nor warns;
         # the metric simply never appears, and a missing key reads as "the run
         # did not get that far".
+        #
+        # ⚠⚠ AND THE VERDICT GOES TO THE MONITOR BEFORE `close()`. `close()`
+        # sends `/finish` with `done` and an EMPTY outcome for any run that did
+        # not `finish` first, and the first finish wins — so setting the
+        # outcome on `run` below, after this, reached run.kv and never the
+        # dashboard. Every SAC-family run on the monitor had a blank outcome.
+        var outcome = (
+            String("success_rate=") + String(rate)
+            + " success_rate_final=" + String(rate_final)
+            + " shaped_return=" + String(shaped)
+        )
+        logger.finish(String("done"), outcome)
         logger.close()
         _ = logger        # keeps `logger_ptr` alive to here
 
@@ -1459,11 +1462,7 @@ def run_sac[M: ModelDefLike, C: Phyics3dEnvConfig](
         # successful" is pain 1, and no naming convention fixes it — a written
         # `outcome=` does. ⚠ `success_rate` is NOT the return: this family's
         # `RETURN != SUCCESS`, and it is the rate the whole family is judged by.
-        run.set_outcome(
-            String("success_rate=") + String(rate)
-            + " success_rate_final=" + String(rate_final)
-            + " shaped_return=" + String(shaped)
-        )
+        run.set_outcome(outcome)
 
         print("  csv                :", csv_path)
         print("  checkpoint         :", ckpt_path)

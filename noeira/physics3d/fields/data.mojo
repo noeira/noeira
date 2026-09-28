@@ -34,7 +34,7 @@ from .dims import DimsLike
 
 from ..gpu.constants import CONTACT_SIZE, METADATA_SIZE
 from ..collision.ccd_workspace import (
-    CCD_WS_SIZE, COLL_CCD_LANES, COLL_STAGE_SLOTS,
+    CCD_WS_SIZE, COLL_CCD_LANES, COLL_STAGE_SLOTS, coll_flat_words,
 )
 
 
@@ -128,6 +128,7 @@ struct Data[
     # across calls — it is pure scratch, never uploaded or downloaded.
     var ccd_ws: TensorImpl[Self.DTYPE]  # [BATCH * COLL_CCD_LANES, CCD_WS_SIZE]
     var coll_stage: TensorImpl[Self.DTYPE]  # [BATCH, COLL_STAGE_SLOTS * CONTACT_SIZE]
+    var coll_flat: TensorImpl[Self.DTYPE]  # `ccd_workspace.coll_flat_words(BATCH)`
     # Derived / auxiliary
     var hfield_data: TensorImpl[Self.DTYPE]  # [BATCH, NHFIELD_DATA]
     """The heightfield elevation grids, PER ENVIRONMENT.
@@ -340,6 +341,11 @@ struct Data[
         self.coll_stage = TensorImpl[Self.DTYPE].alloc(
             B * COLL_STAGE_SLOTS * CONTACT_SIZE
         )
+        # The flat narrow phase's lists and queues (`COLL_FLAT_NARROW`). Its
+        # per-pair COST slots persist across steps — the only part read
+        # before it is written — and start at 0, which schedules every pair
+        # cold on the first step.
+        self.coll_flat = TensorImpl[Self.DTYPE].alloc(coll_flat_words(B))
         # ⚠ `_at_least_one`: a model with no heightfield must still allocate,
         # because `alloc(0)` is not a valid buffer and every kernel binds this
         # tensor whether the model uses it or not.
@@ -431,6 +437,7 @@ struct Data[
         # hence no matching `download`.
         self.ccd_ws.upload(ctx)
         self.coll_stage.upload(ctx)
+        self.coll_flat.upload(ctx)
         if Self.NSITE > 0:
             self.site_xpos.upload(ctx)
         self.cfrc_ext.upload(ctx)

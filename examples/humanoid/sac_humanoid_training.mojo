@@ -6,11 +6,12 @@ Humanoid counterpart of
 
   * `SACAgent[...]` — facade over `SACTrainer` + the single-env off-policy
     driver.
-  * `RemoteLogger` — streams metrics at every chunk boundary AND at the
-    driver's `print_every` cadence.
-  * Single-file checkpointing — `agent.save(CHECKPOINT_PATH)` writes ONE
-    `.ckpt` file (overwritten each chunk) under a single `nn-ckpt v2`
-    envelope.
+  * A `RunContext` (project `mujoco`): the checkpoint, `metrics.csv` and
+    `run.kv` all live in `runs/<id>/`, and the monitor row carries the same id.
+  * `run_logger(run)` — `metrics.csv` + the monitor, at every chunk boundary
+    AND at the driver's `print_every` cadence.
+  * Single-file checkpointing — `run.checkpoint_path("last")`, overwritten
+    each chunk and uploaded through the run's artifact sink.
 
 After training, the final checkpoint is reloaded into the same agent and a
 greedy probe confirms the action reproduces to `|diff| < 1e-5`.
@@ -30,8 +31,9 @@ Run:
 from std.random import seed
 from std.time import perf_counter_ns
 
-from noeira.core.dotenv import load_dotenv
-from noeira.core.logger import RemoteLogger
+from noeira.core.run import RunContext, register_run
+from noeira.core.run_session import RunLogger, finish_run, run_logger
+from noeira.io.artifact_sink import sink_for_run
 from noeira.nn.constants import DT
 from max.gpu.host import DeviceContext
 
@@ -62,8 +64,6 @@ comptime PRINT_EVERY = 5_000
 comptime DIAG_EVERY = 5_000
 comptime CHECKPOINT_EVERY = 50_000
 
-comptime CHECKPOINT_PATH = "sac_humanoid_nn.ckpt"
-
 # Actor + twin critics come from the `SAC[...]` preset (deep_agents.sac):
 # the canonical fused-`LinearReLU` `SACActorNet` / `SACCriticNet`. Using the
 # preset here keeps the CPU checkpoint layout identical to the GPU trainer's,
@@ -85,24 +85,24 @@ def main() raises:
     print("  PRINT_EVERY        =", PRINT_EVERY)
     print("  DIAG_EVERY         =", DIAG_EVERY)
     print("  CHECKPOINT_EVERY   =", CHECKPOINT_EVERY)
-    print("  Checkpoint path    =", CHECKPOINT_PATH)
-    print("=" * 70)
 
-    # ─── Logger (remote) ───────────────────────────────────
-    var env_vars = load_dotenv()
-    var api_key = env_vars.get("NOEIRA_CLOUD_API_KEY", "")
-    var url = env_vars.get("NOEIRA_CLOUD_URL", "")
-
-    var logger = RemoteLogger(
-        server_url=url,
-        run_name="SAC Humanoid NN (CPU)",
-        buffer_size=200,
-        api_key=api_key,
+    # ─── Run + logger ───────────────────────────────────────────────────────
+    var run = RunContext(
+        project=String("mujoco"),
+        driver=String("examples/humanoid/sac_humanoid_training.mojo"),
+        slug=String("sac-humanoid"),
+        env=String("builtin:mujoco/humanoid"),
     )
+    var checkpoint_path = run.checkpoint_path(String("last"))
+    print("  Run                =", run.dir)
+    print("=" * 70)
+    var logger = run_logger(run, buffer_size=200)
     logger.set_config("algorithm", "SAC")
     logger.set_config("env", "Humanoid")
     logger.set_config("hidden", String(HIDDEN))
     logger.set_config("batch", String(BATCH))
+    register_run(run, logger)
+    var artifacts = sink_for_run(run.id, run.dir)
 
     var logger_ptr = Pointer(to=logger).as_unsafe_any_origin()
 
@@ -125,7 +125,7 @@ def main() raises:
     var t_start = perf_counter_ns()
     _ = agent.train_single[
         EnvT,
-        L=RemoteLogger,
+        L=RunLogger,
     ](
         env,
         NUM_STEPS,
@@ -133,12 +133,18 @@ def main() raises:
         verbose=True,
         logger=logger_ptr,
         diag_every=DIAG_EVERY,
-        checkpoint_path=CHECKPOINT_PATH,
+        checkpoint_path=checkpoint_path,
         checkpoint_every=CHECKPOINT_EVERY,
+        artifacts=artifacts,
+        run_dir=run.dir,
     )
     var elapsed_s = Float64(perf_counter_ns() - t_start) / 1e9
     var total = NUM_STEPS
-    logger.close()
+    var sent = logger.b.total_logged()
+    finish_run(
+        run, logger, artifacts,
+        String("mean_return_100=") + String(agent.mean_return()),
+    )
     _ = logger  # lifetime extender for logger_ptr
 
     # ─── Summary ─────────────────────────────────────────────────────────
@@ -148,7 +154,8 @@ def main() raises:
     print("  elapsed                =", elapsed_s, "s")
     print("  mean ep return (last 100) =", agent.mean_return())
     print("  episodes completed     =", agent.ep_count())
-    print("  remote points sent     =", logger.total_logged())
+    print("  remote points sent     =", sent)
+    print("  run record             =", run.kv_path())
     print("=" * 70)
 
     var final_avg = Float64(agent.mean_return())
@@ -171,7 +178,7 @@ def main() raises:
     var act_before = List[Scalar[DT]](length=ACT_DIM, fill=Scalar[DT](0.0))
     agent.select_greedy_action(probe_obs, act_before)
 
-    agent.load(CHECKPOINT_PATH)
+    agent.load(checkpoint_path)
     var act_after = List[Scalar[DT]](length=ACT_DIM, fill=Scalar[DT](0.0))
     agent.select_greedy_action(probe_obs, act_after)
 

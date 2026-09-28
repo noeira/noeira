@@ -12,8 +12,8 @@ STORAGE migration (Stage 5): own scratch as `nn.storage.Tensor` (was legacy
 `Scratch`/`TargetStorage`); storage `Adam` (decoupled `wd`); the actor update
 reuses `SACActorLoss.forward_backward` DIRECTLY (the `SACActorStep` wrapper is
 incompatible — it imports a legacy Adam) plus a separately-owned `RSample` for
-select_action (mirrors the storage SAC trainer's `self.sel`). Storage
-CheckpointWriter/Reader one-file envelope. CUDA-graph capture DEFERRED via the
+select_action (mirrors the storage SAC trainer's `self.sel`). One-file v3
+checkpoint (α, elites and the counter as `K` scalars). CUDA-graph capture DEFERRED via the
 OffPolicyAgentGpu trait-default no-ops.
 
 CPU is behaviorally equivalent to the prior CPU MBPOTrainer. Conforms to
@@ -41,7 +41,9 @@ from noeira.nn.optimizer.adam import Adam
 from noeira.nn.optimizer.scalar_adam import ScalarAdam
 from noeira.nn.primitives.rsample import RSample
 from noeira.nn.core.checkpoint import (
-    CheckpointWriter, CheckpointReader, _split_lines,
+    BinaryCheckpointWriter, BinaryCheckpointReader, CheckpointReader,
+    CheckpointScalars, write_model, read_model, _split_lines, _is_v3_header,
+    _read_file_bytes, _write_file_bytes,
 )
 
 from noeira.nn.core.log_bundle import log_bundle
@@ -1207,19 +1209,19 @@ struct MBPOTrainer[
             done_mean = self._done_accum * inv
             act_abs_mean = self._action_abs_accum * inv
         var bundle = MBPOMetrics(
-            actor_loss=LogScalar[DT](actor_mean),
+            policy_loss=LogScalar[DT](actor_mean),
             critic_loss=LogScalar[DT](critic_mean),
             alpha=LogScalar[DT](alpha_val),
             mean_q=LogScalar[DT](q_mean),
-            mean_reward=LogScalar[DT](reward_mean),
-            td_target=LogScalar[DT](td_mean),
-            done_ratio=LogScalar[DT](done_mean),
-            mean_abs_action=LogScalar[DT](act_abs_mean),
+            reward_mean=LogScalar[DT](reward_mean),
+            mean_target=LogScalar[DT](td_mean),
+            mean_done=LogScalar[DT](done_mean),
+            action_abs_mean=LogScalar[DT](act_abs_mean),
             dyn_loss=LogScalar[DT](self._dyn_loss_last),
-            dyn_holdout_loss=LogScalar[DT](self._dyn_holdout_loss),
-            dyn_holdout_min=LogScalar[DT](self._dyn_holdout_min),
-            dyn_holdout_max=LogScalar[DT](self._dyn_holdout_max),
-            dyn_holdout_spread=LogScalar[DT](
+            dyn_holdout_mse_mean=LogScalar[DT](self._dyn_holdout_loss),
+            dyn_holdout_mse_min=LogScalar[DT](self._dyn_holdout_min),
+            dyn_holdout_mse_max=LogScalar[DT](self._dyn_holdout_max),
+            dyn_holdout_mse_spread=LogScalar[DT](
                 self._dyn_holdout_max - self._dyn_holdout_min
             ),
             dyn_input_std_mean=LogScalar[DT](self._dyn_input_std_mean),
@@ -1260,68 +1262,89 @@ struct MBPOTrainer[
         _ = self.flush_metrics[L](logger, self._total_train_steps)
 
     def save_state(mut self, path: String) raises:
-        """One-file v2 checkpoint: SAC modules (actor + 2 online critics) +
-        every dynamics member, in a single storage envelope. Optimizer moments
-        + elite indices NOT persisted (resume re-warms the dynamics)."""
-        var w = CheckpointWriter(save_moments=False)
-        w.mode = 0
-        walk_params[Self.train_target](self.actor, w, self.ctx, "actor")
-        walk_params[Self.train_target](self.pair1.online, w, self.ctx, "critic1"
-        )
-        walk_params[Self.train_target](self.pair2.online, w, self.ctx, "critic2"
-        )
+        """ONE v3 `storage-ckpt` file: the SAC nets (actor + 2 online critics)
+        and every dynamics member, then as `K` sections α's whole optimizer
+        (`alpha.*`), the elite indices (`elites.n`, `elites.<i>`) and the
+        train-step counter. Atomic and chunked. Optimizer moments and the
+        dynamics input scaler are NOT persisted: the scaler is refit from the
+        replay buffer on every dynamics fit, and the buffer is not saved."""
+        var w = BinaryCheckpointWriter(save_moments=False)
+        write_model[Self.train_target](w, self.actor, self.ctx, "actor")
+        write_model[Self.train_target](w, self.pair1.online, self.ctx, "critic1")
+        write_model[Self.train_target](w, self.pair2.online, self.ctx, "critic2")
         for i in range(Self.N_ENSEMBLE):
-            walk_params[Self.train_target](self.ensemble.members[i], w, self.ctx, "dyn_member" + String(i)
+            write_model[Self.train_target](
+                w, self.ensemble.members[i], self.ctx, "dyn_member" + String(i)
             )
-        w.mode = 1
-        var _sref1 = ParamVisitorRef.of[type_of(w), Self.train_target](w)
-        self.actor.for_each_state[Self.train_target](_sref1, self.ctx, "actor")
-        self.pair1.online.for_each_state[Self.train_target](
-            w, self.ctx, "critic1"
-        )
-        self.pair2.online.for_each_state[Self.train_target](
-            w, self.ctx, "critic2"
-        )
-        for i in range(Self.N_ENSEMBLE):
-            self.ensemble.members[i].for_each_state[Self.train_target](
-                w, self.ctx, "dyn_member" + String(i)
-            )
-        with open(path, "w") as f:
-            f.write(w.content)
+        var sc = CheckpointScalars()
+        self.alpha_opt.put_state(sc, "alpha")
+        sc.set_int("elites.n", len(self.ensemble.elite_indices))
+        for e in range(len(self.ensemble.elite_indices)):
+            sc.set_int("elites." + String(e), self.ensemble.elite_indices[e])
+        sc.set_int("total_train_steps", self._total_train_steps)
+        w.write_scalars(sc)
+        _write_file_bytes(path, w.content)
 
     def load_state(mut self, path: String) raises:
-        var content: String
-        with open(path, "r") as f:
-            content = String(f.read())
-        var lines = _split_lines(content)
-        var body = List[String]()
-        for li in range(len(lines)):
-            if lines[li].startswith("storage-ckpt"):
-                continue
-            body.append(lines[li])
-        var r = CheckpointReader(body^)
-        r.mode = 0
-        walk_params[Self.train_target](self.actor, r, self.ctx, "actor")
-        walk_params[Self.train_target](self.pair1.online, r, self.ctx, "critic1"
-        )
-        walk_params[Self.train_target](self.pair2.online, r, self.ctx, "critic2"
-        )
-        for i in range(Self.N_ENSEMBLE):
-            walk_params[Self.train_target](self.ensemble.members[i], r, self.ctx, "dyn_member" + String(i)
+        """Restore every net, α, the elites and the counter (v3, or the legacy
+        v2 text this trainer wrote before, which carries only the nets), then
+        hard-copy online → target."""
+        var bytes = _read_file_bytes(path)
+        if _is_v3_header(bytes):
+            var rb = BinaryCheckpointReader(bytes^)
+            read_model[Self.train_target](rb, self.actor, self.ctx, "actor")
+            read_model[Self.train_target](rb, self.pair1.online, self.ctx, "critic1")
+            read_model[Self.train_target](rb, self.pair2.online, self.ctx, "critic2")
+            for i in range(Self.N_ENSEMBLE):
+                read_model[Self.train_target](
+                    rb, self.ensemble.members[i], self.ctx,
+                    "dyn_member" + String(i),
+                )
+            var sc = rb.read_scalars()
+            rb.finish()
+            self.alpha_opt.take_state(sc, "alpha")
+            if sc.has("elites.n"):
+                self.ensemble.elite_indices.clear()
+                for e in range(sc.get_int("elites.n", 0)):
+                    self.ensemble.elite_indices.append(
+                        sc.get_int("elites." + String(e), e)
+                    )
+            self._total_train_steps = sc.get_int(
+                "total_train_steps", self._total_train_steps
             )
-        r.mode = 1
-        var _sref2 = ParamVisitorRef.of[type_of(r), Self.train_target](r)
-        self.actor.for_each_state[Self.train_target](_sref2, self.ctx, "actor")
-        self.pair1.online.for_each_state[Self.train_target](
-            r, self.ctx, "critic1"
-        )
-        self.pair2.online.for_each_state[Self.train_target](
-            r, self.ctx, "critic2"
-        )
-        for i in range(Self.N_ENSEMBLE):
-            self.ensemble.members[i].for_each_state[Self.train_target](
-                r, self.ctx, "dyn_member" + String(i)
+        else:
+            var content: String
+            with open(path, "r") as f:
+                content = String(f.read())
+            var lines = _split_lines(content)
+            var body = List[String]()
+            for li in range(len(lines)):
+                if lines[li].startswith("storage-ckpt"):
+                    continue
+                body.append(lines[li])
+            var r = CheckpointReader(body^)
+            r.mode = 0
+            walk_params[Self.train_target](self.actor, r, self.ctx, "actor")
+            walk_params[Self.train_target](self.pair1.online, r, self.ctx, "critic1"
             )
+            walk_params[Self.train_target](self.pair2.online, r, self.ctx, "critic2"
+            )
+            for i in range(Self.N_ENSEMBLE):
+                walk_params[Self.train_target](self.ensemble.members[i], r, self.ctx, "dyn_member" + String(i)
+                )
+            r.mode = 1
+            var _sref2 = ParamVisitorRef.of[type_of(r), Self.train_target](r)
+            self.actor.for_each_state[Self.train_target](_sref2, self.ctx, "actor")
+            self.pair1.online.for_each_state[Self.train_target](
+                r, self.ctx, "critic1"
+            )
+            self.pair2.online.for_each_state[Self.train_target](
+                r, self.ctx, "critic2"
+            )
+            for i in range(Self.N_ENSEMBLE):
+                self.ensemble.members[i].for_each_state[Self.train_target](
+                    r, self.ctx, "dyn_member" + String(i)
+                )
         self.pair1.target_net.polyak_from[Self.train_target](
             self.pair1.online, Scalar[DT](1.0), self.ctx
         )

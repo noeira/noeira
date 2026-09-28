@@ -11,6 +11,7 @@
 
 # ── nn core: checkpoint format + optimizer state ──────────────────────
 tests/nn/test_checkpoint_v2_storage.mojo
+tests/nn/test_checkpoint_scalars.mojo
 tests/nn/test_adam_visitor_ref.mojo
 tests/nn/test_checkpoint_adam_storage.mojo
 
@@ -65,6 +66,8 @@ tests/tasks/test_spec_roundtrip.mojo
 # composition cannot pass vacuously.
 tests/tasks/test_so101_tower_config.mojo
 tests/tasks/test_so101_tower_cameras.mojo
+tests/tasks/test_so101_tower_units.mojo
+tests/tasks/test_so101_tower_look.mojo
 
 # ── noeira/tasks: LIBERO's registry as data + the resolved import (L1) ──
 # The category table (38 corpus categories, 5 problem classes, the four
@@ -408,6 +411,12 @@ tests/io/test_http_sink.mojo
 # passes just as happily for a worker that pings every millisecond, so the
 # interval has an upper bound too. Needs `pixi run build-http`.
 tests/io/test_http_sink_heartbeat.mojo
+# An outage costs the dashboard time, never metrics. The decisive leg: a
+# monitor DOWN when the run starts receives everything, in order, once it is
+# back — the first failed POST used to latch the transport dead and drop the
+# rest of the run. Also 503 retry-in-place, poison payloads, spool + replay.
+# Needs `pixi run build-http`.
+tests/io/test_http_sink_outage.mojo
 # §7's ArtifactSink, against a fixture playing BOTH the monitor and R2. The
 # decisive legs need the fixture's SLOW-PUT mode: over loopback a transfer
 # finishes before the next offer is made, so a sink with no dedup at all — and
@@ -420,6 +429,18 @@ tests/io/test_artifact_sink.mojo
 # trains, the file is on disk, and only the box dying reveals the loss. Prints
 # sites-scanned beside violations, and pins the count at 18.
 tests/deep_agents/test_checkpoints_announce.mojo
+
+# A SOURCE gate: nothing in `noeira/` writes a v2 checkpoint, and nothing under
+# `deep_agents/` writes a file in place (non-atomic, cut at 2 GiB). Globbed on
+# purpose — it checks an ABSENCE, so a new file must be scanned unasked.
+tests/deep_agents/test_no_v2_checkpoint_writes.mojo
+
+# A SOURCE gate: a run's settings go through `set_config` (metrics.config.kv +
+# /runs), never as `cfg/*` scalars that the dashboard draws as one-point charts.
+tests/core/test_no_config_as_metrics.mojo
+# A SOURCE gate: metric names are flat snake_case, never `fb/measure`-style
+# namespaces — the dashboard groups charts by exact name.
+tests/core/test_metric_names_are_flat.mojo
 # A run's END is a signal it sends, and its START is not its first metric.
 # Offline like test_http_sink beside it: routes and payloads by value, plus the
 # idempotence latches and the inertness that a `close()` which now POSTs could

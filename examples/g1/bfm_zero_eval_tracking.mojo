@@ -52,7 +52,8 @@ from noeira.core.assignment import emd_uniform
 from noeira.envs.robots.unitree_g1_rsi import G1RsiTable
 from noeira.envs.robots.g1_tracking_eval import (
     G1_D, G1_H, G1_L, G1_HB, G1_HD,
-    G1_SEG_ROWS, g1_n_segments, g1_segment_row, g1_score_segment,
+    G1_SEG_ROWS, g1_n_segments, g1_segment_row, g1_segment_pick,
+    g1_score_segment,
 )
 from noeira.data.store import TrajectoryStore
 from noeira.deep_agents.fb.trainer import FBTrainer
@@ -220,10 +221,15 @@ def main() raises:
                 "clip " + String(clip) + ": native n_segments " + String(n_seg)
                 + " != oracle " + String(n_oracle)
             )
+        var n_avail = n_seg
         if n_seg > max_segments:
             n_seg = max_segments
         print("clip", clip, String(proto.keys[clip]), ":", n_seg, "segments")
-        for seg in range(n_seg):
+        for k in range(n_seg):
+            # `--segments` truncates; spread the picks over the clip rather
+            # than taking its opening windows (`g1_segment_pick`). The default
+            # is full coverage, where this is the identity.
+            var seg = g1_segment_pick(n_avail, n_seg, k)
             var r0 = g1_segment_row(ep_off, seg)
             var r0_oracle = Int(Float64(py=proto.episode(clip, seg).first_row()))
             if r0 != r0_oracle:

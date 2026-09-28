@@ -113,6 +113,7 @@ binary aborts with `symbol not found: H5PLprepend` anywhere else. It also reads
 | `ACT_STORE` | the `.h5` to train on; default is the 5-episode recording |
 | `ACT_PRETRAINED` | **defaults to `hub`** — the ImageNet backbone, fetched with no PyTorch and cached. A `dump_resnet18_imagenet.py` directory uses the torchvision dump; `random` trains a from-scratch backbone |
 | `ACT_STEPS` | step count, **without a rebuild** — the graph takes ~6 min to compile, so "run it longer" must not mean "build it again" |
+| `ACT_SEED` | the run's seed (default 7): the weight init, the episode split and the batch draws. ⚠ One run per recipe cannot rank recipes: the so101_tower vision student scored 32 / 56% on the SAME recipe (a data subset), so compare >= 3 seeds per arm |
 | `ACT_NO_MONITOR` | force the logger inert with the keys present; what a smoke run should use so it does not land in the dashboard beside a real one |
 | `ACT_CKPT` | read by `act_so101_openloop_eval.mojo`, not by this file |
 
@@ -231,6 +232,10 @@ never applies it.
 ## What to expect
 
 40 training episodes / 10 held out, ~12,400 training frames, no augmentation.
+`ACT_AUGMENT=light|default` turns on image augmentation
+(`deep_agents/act/augment.mojo`, DR plan Phase 1) for TRAINING batches, on
+either data path (device gather kernels, or the host sampler under
+`-D ACT_HOST_DATA`); validation is never augmented.
 
 The FIRST 50-episode run, with a random backbone, is the baseline to beat:
 best val L1 **0.4076 at epoch 15.5**, then 26 consecutive validations all worse
@@ -253,6 +258,8 @@ at; it reports a `hold` baseline so "it produces plausible actions" cannot be
 mistaken for "it learned something".
 """
 from std.os import getenv
+from std.random import seed as seed_rng
+from std.sys import is_defined
 from std.os.path import exists
 from std.time import perf_counter_ns
 
@@ -275,8 +282,9 @@ from noeira.deep_agents.act.config import (
     SO101_N_CAM,
     SO101_QPOS,
 )
-from noeira.deep_agents.act.data import ACTDataset
+from noeira.deep_agents.act.data import ACTDataset, IMAGES_RESIDENT_MAX_BYTES
 from noeira.deep_agents.act.data_gpu import ACTDeviceDataset
+from noeira.deep_agents.act.augment import ImageAugConfig
 from noeira.deep_agents.act.trainer import (
     ACTTrainer,
     ACTWindowMetrics,
@@ -329,9 +337,16 @@ require rebuilding it."""
 # statistically the same; individual steps will not match.
 #
 # ⚠ Startup uploads the whole store as uint8 (7.1 GB for 50 episodes, ~13 s).
-# Set False on a machine where that does not fit; see
-# `docs/ACT_GPU_DATA_PATH.md` for the windowed design that would.
-comptime GPU_DATA = True
+# A store that does not fit the device is trained on the host path instead:
+# build with `-D ACT_HOST_DATA` (the images then STREAM from the store a row
+# at a time, `ACTDataset`'s own residency rule). Measured need: the so101_tower
+# vision student's DAgger store — 200 expert episodes + one round of expert
+# relabels, ~61k rows = 28 GB of uint8 — does not fit a 32 GB 5090 beside the
+# model, and capping the expert half to make room REPLACED data instead of
+# aggregating it (round 1 fell from 32% to 16% cube-in-bowl). See
+# `docs/ACT_GPU_DATA_PATH.md` for the windowed design that would keep the
+# device path.
+comptime GPU_DATA = not is_defined["ACT_HOST_DATA"]()
 
 
 # USE_CUDA_GRAPH — capture the per-step device kernel sequence into a CUDA
@@ -507,7 +522,27 @@ def main() raises:
         + String(IMG_W) + ", batch " + String(BATCH)
     )
 
-    var ds = ACTDataset[QPOS, ADIM, N_CAM, IMG_H, IMG_W](String(path), seed=7)
+    # `ACT_RESIDENT_GB`: how large an image column the HOST keeps in RAM
+    # (default `IMAGES_RESIDENT_MAX_BYTES`, 2 GiB); above it the images stream
+    # from the store a row at a time. ⚠ ON THE HOST PATH (`-D ACT_HOST_DATA`)
+    # THIS DECIDES THE SPEED: streaming a deflated 61k-row store measured
+    # ~0.6 s/step on the 5090 box (one core decompressing 460 KB rows), where
+    # a resident column pays only the host normalisation. Unused by the device
+    # path, which uploads the column whole either way.
+    var resident_gb = getenv("ACT_RESIDENT_GB")
+    var max_img = IMAGES_RESIDENT_MAX_BYTES
+    if resident_gb.byte_length() > 0:
+        max_img = Int(Float64(resident_gb) * Float64(1 << 30))
+    var run_seed = 7
+    var env_seed = getenv("ACT_SEED")
+    if env_seed.byte_length() > 0:
+        run_seed = Int(env_seed)
+    seed_rng(run_seed)
+    print("  seed    " + String(run_seed)
+          + ("" if env_seed.byte_length() == 0 else " (ACT_SEED)"))
+    var ds = ACTDataset[QPOS, ADIM, N_CAM, IMG_H, IMG_W](
+        String(path), seed=UInt64(run_seed), max_image_bytes=max_img
+    )
     print(
         "  split   " + String(len(ds.train_eps)) + " train / "
         + String(len(ds.val_eps)) + " val episodes of "
@@ -540,6 +575,7 @@ def main() raises:
         env=String("builtin:so_arm101"),
         dataset=path,
         device=String(ctx.name()),
+        seed=run_seed,
     )
     print("  run     " + run.dir)
     var logger = RemoteLogger(
@@ -569,6 +605,16 @@ def main() raises:
     logger.set_config("steps", String(steps))
     logger.set_config("train_episodes", String(len(ds.train_eps)))
     logger.set_config("val_episodes", String(len(ds.val_eps)))
+    # `ACT_AUGMENT=off|light|default` — an unknown value raises rather than
+    # running an un-augmented experiment under an augmented name.
+    var aug = ImageAugConfig.parse(getenv("ACT_AUGMENT"))
+    # Both samplers augment: the device one in its gather kernels, the host
+    # one (`-D ACT_HOST_DATA`) through the same draw and per-pixel rules
+    # (`act/augment.mojo`). Validation is never augmented on either.
+    comptime if not GPU_DATA:
+        ds.set_augment(aug)
+    logger.set_config("augment", String(aug))
+    print("  augment " + String(aug))
     print(
         "  metrics " + (
             "streaming to " + monitor_url if logger.is_active()
@@ -592,7 +638,8 @@ def main() raises:
     var dev_ds = DDS()
     comptime if GPU_DATA:
         var u0 = perf_counter_ns()
-        dev_ds = DDS.upload_from[BATCH](ds, ctx, seed=7)
+        dev_ds = DDS.upload_from[BATCH](ds, ctx, seed=UInt64(run_seed))
+        dev_ds.set_augment(aug)
         var u1 = perf_counter_ns()
         print(
             "  device dataset    " + String(Float64(u1 - u0) / 1e9) + " s to"
@@ -742,19 +789,19 @@ def main() raises:
     takes both from the peeked window."""
 
     var names = List[String]()
-    names.append(String("train/l1"))
-    names.append(String("train/kl"))
-    names.append(String("train/loss"))
-    names.append(String("train/grad_norm"))
-    names.append(String("train/epoch"))
+    names.append(String("l1_loss"))
+    names.append(String("kl_loss"))
+    names.append(String("loss"))
+    names.append(String("grad_norm"))
+    names.append(String("epoch"))
 
     var val_names = List[String]()
-    val_names.append(String("val/l1"))
-    val_names.append(String("val/kl"))
-    val_names.append(String("perf/s_per_step"))
-    val_names.append(String("perf/s_data"))
-    val_names.append(String("perf/s_gpu"))
-    val_names.append(String("best/val_l1"))
+    val_names.append(String("val_l1_loss"))
+    val_names.append(String("val_kl_loss"))
+    val_names.append(String("step_s"))
+    val_names.append(String("data_s"))
+    val_names.append(String("gpu_s"))
+    val_names.append(String("val_l1_loss_best"))
 
     # Capture prerequisites: adopt the arena eagerly and force the padded /
     # bf16 weight caches to refresh every forward. WITHOUT the second, a replay

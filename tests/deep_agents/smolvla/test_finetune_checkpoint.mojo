@@ -33,7 +33,9 @@ loader ignored. So:
 exact rather than a restart with a cold optimizer, and a cold optimizer is
 precisely what damages a pretrained model on its first step — the runner's
 whole warmup story. A checkpoint that silently dropped them would resume into
-that.
+that. Leg [5] checks Adam's step count and bias-correction powers, which the
+moments are meaningless without: restored under `t = 0`, settled moments are
+divided by the step-1 corrections.
 """
 
 from std.math import abs
@@ -45,6 +47,7 @@ from noeira.nn.constants import DT
 from noeira.nn.core.tensor import Tensor
 from noeira.nn.core.initializer import Deterministic
 from noeira.nn.optimizer.adam import Adam
+from noeira.nn.core.checkpoint import CheckpointScalars
 from noeira.nn.primitives.linear import Linear
 from noeira.deep_agents.smolvla.text import SMOLLM_THETA
 from noeira.deep_agents.smolvla.expert import SmolVLAExpert
@@ -200,8 +203,10 @@ def main() raises:
 
     if Path(CKPT).exists():
         remove(CKPT)
+    var opt_sc = CheckpointScalars()
+    opt.put_step_state(opt_sc, "opt")
     save_trainables["cpu", L, EW, EFF, W, KVW, ADIM](
-        CKPT, e, ai, ti, to, ao, sp, True, None
+        CKPT, e, ai, ti, to, ao, sp, True, None, scalars=opt_sc
     )
     assert_true(Path(CKPT).exists(), "no checkpoint file was written")
 
@@ -241,7 +246,7 @@ def main() raises:
         " NOTHING would pass legs [1] and [2]",
     )
 
-    load_trainables["cpu", L, EW, EFF, W, KVW, ADIM](
+    var back_sc = load_trainables["cpu", L, EW, EFF, W, KVW, ADIM](
         CKPT, e2, ai2, ti2, to2, ao2, sp2, None
     )
 
@@ -307,6 +312,17 @@ def main() raises:
         " model",
     )
 
+    # ── [5] and so did the step count the moments were accumulated under ──
+    var opt2 = Adam(lr=LR)
+    opt2.take_step_state(back_sc, "opt")
+    print("  [5] Adam step: saved", opt.t, " restored", opt2.t)
+    assert_true(opt.t > 0, "the source optimizer never stepped")
+    assert_true(
+        opt2.t == opt.t and opt2.bc1 == opt.bc1 and opt2.bc2 == opt.bc2,
+        "Adam's step state did not survive — the restored moments would be"
+        " divided by the step-1 bias corrections",
+    )
+
     remove(CKPT)
     print()
-    print("PASSED — weights, loss and moments all survive the round trip")
+    print("PASSED — weights, loss, moments and Adam's step all survive")

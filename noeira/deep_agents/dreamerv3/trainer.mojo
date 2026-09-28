@@ -31,7 +31,7 @@ from noeira.nn.core.initializer import Initializer, Kaiming, Zero
 from noeira.nn.core.tensor import Tensor, TensorImpl
 from noeira.nn.core.tensor_refs import TensorRefs, child_refs
 from noeira.nn.core.checkpoint import (
-    CheckpointWriter, CheckpointReader, _split_lines,
+    CheckpointReader, _split_lines,
     BinaryCheckpointWriter, BinaryCheckpointReader,
     _write_file_bytes, _read_file_bytes, _is_v3_header,
 )

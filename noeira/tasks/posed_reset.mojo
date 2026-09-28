@@ -30,7 +30,7 @@ from noeira.physics3d.gpu.constants import (
 from noeira.physics3d.parser.runtime_load import parse_model_runtime
 from .spec import load_family, load_task, validate_task_against_family, SLOT_FREE
 from .family import scene_path, task_path
-from .sampler import sample_placements, RegionFrame, SampleReport
+from .sampler import sample_placements, sample_base_qpos, RegionFrame, SampleReport
 from .reset import reset_slots, SlotAddress
 from .placement.table import PlacementTable
 from .predicates import parse_goal, bind_goal
@@ -56,6 +56,11 @@ def posed_qpos[P: PlacementTable](
     var t = load_task(task_path(f, task))
     validate_task_against_family(t, f)
     var q0 = List[Float64](length=P.NQ, fill=0.0)
+    # the base asset's rest (and its per-episode draw) — the device reset's
+    # first write, `placement/table.reset_task_slots`
+    var rest = sample_base_qpos(f, seed, 0)
+    for i in range(len(rest)):
+        q0[i] = rest[i]
     for j in range(P.N_FREE):
         var adr = P.free_qadr(j)
         q0[adr] = Float64(P.free_park_x[DT](j))

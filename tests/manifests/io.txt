@@ -87,6 +87,12 @@ tests/io/test_http_sink.mojo
 # passes just as happily for a worker that pings every millisecond, so the
 # interval has an upper bound too. Needs `pixi run build-http`.
 tests/io/test_http_sink_heartbeat.mojo
+# An outage costs the dashboard time, never metrics. The decisive leg: a
+# monitor DOWN when the run starts receives everything, in order, once it is
+# back — the first failed POST used to latch the transport dead and drop the
+# rest of the run. Also 503 retry-in-place, poison payloads, spool + replay.
+# Needs `pixi run build-http`.
+tests/io/test_http_sink_outage.mojo
 # §7's ArtifactSink, against a fixture playing BOTH the monitor and R2. The
 # decisive legs need the fixture's SLOW-PUT mode: over loopback a transfer
 # finishes before the next offer is made, so a sink with no dedup at all — and

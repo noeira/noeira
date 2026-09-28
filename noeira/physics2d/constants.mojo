@@ -90,28 +90,39 @@ comptime MAX_COMPOUND_SUBSHAPES: Int = 8
 # =============================================================================
 # Contacts store collision information for constraint solving
 
-comptime CONTACT_DATA_SIZE: Int = 9
+comptime CONTACT_DATA_SIZE: Int = 14
 
+# Written by collision detection. The normal points from B toward A.
 comptime CONTACT_BODY_A: Int = 0
 comptime CONTACT_BODY_B: Int = 1  # -1 for static/ground
 comptime CONTACT_POINT_X: Int = 2
 comptime CONTACT_POINT_Y: Int = 3
 comptime CONTACT_NORMAL_X: Int = 4
 comptime CONTACT_NORMAL_Y: Int = 5
-comptime CONTACT_DEPTH: Int = 6
-comptime CONTACT_NORMAL_IMPULSE: Int = 7  # For warm starting
+comptime CONTACT_DEPTH: Int = 6  # penetration at detection (> 0)
+# Accumulated impulses of the current step (detection zeroes them).
+comptime CONTACT_NORMAL_IMPULSE: Int = 7
 comptime CONTACT_TANGENT_IMPULSE: Int = 8
+# Written by `ImpulseSolver.init_velocity_single_env` (Box2D's
+# InitializeVelocityConstraints): the contact point in each body's frame, so
+# the position solve can recompute the separation from the current poses
+# (a static B stores the world point), and the restitution velocity bias.
+comptime CONTACT_LOCAL_AX: Int = 9
+comptime CONTACT_LOCAL_AY: Int = 10
+comptime CONTACT_LOCAL_BX: Int = 11
+comptime CONTACT_LOCAL_BY: Int = 12
+comptime CONTACT_VELOCITY_BIAS: Int = 13
 
 # =============================================================================
 # Joint Layout
 # =============================================================================
 # Joints connect two bodies and constrain their relative motion
-# Revolute joint layout:
+# Revolute joint layout (Box2D 2.3 b2RevoluteJoint: motor + limit, no spring):
 # [type, body_a, body_b, anchor_ax, anchor_ay, anchor_bx, anchor_by,
 #  ref_angle, lower_limit, upper_limit, max_motor_torque, motor_speed,
-#  stiffness, damping, flags, impulse, motor_impulse]
+#  impulse_y, impulse_z, flags, impulse_x, motor_impulse, limit_state]
 
-comptime JOINT_DATA_SIZE: Int = 17
+comptime JOINT_DATA_SIZE: Int = 18
 
 # Joint types
 comptime JOINT_REVOLUTE: Int = 0
@@ -131,16 +142,25 @@ comptime JOINT_LOWER_LIMIT: Int = 8  # Lower angle limit
 comptime JOINT_UPPER_LIMIT: Int = 9  # Upper angle limit
 comptime JOINT_MAX_MOTOR_TORQUE: Int = 10
 comptime JOINT_MOTOR_SPEED: Int = 11  # Target motor speed
-comptime JOINT_STIFFNESS: Int = 12  # Spring stiffness (for soft joints)
-comptime JOINT_DAMPING: Int = 13  # Spring damping
-comptime JOINT_FLAGS: Int = 14  # Bit flags: 1=limit_enabled, 2=motor_enabled, 4=spring_enabled
-comptime JOINT_IMPULSE: Int = 15  # Accumulated constraint impulse (for warm starting)
-comptime JOINT_MOTOR_IMPULSE: Int = 16  # Accumulated motor impulse
+comptime JOINT_FLAGS: Int = 14  # Bit flags: 1=limit_enabled, 2=motor_enabled
+# Accumulated impulses, carried across steps for warm starting (Box2D's
+# m_impulse (x, y = point, z = limit) and m_motorImpulse); zero them when the
+# joint is (re)created.
+comptime JOINT_IMPULSE_X: Int = 15
+comptime JOINT_IMPULSE_Y: Int = 12
+comptime JOINT_IMPULSE_Z: Int = 13
+comptime JOINT_MOTOR_IMPULSE: Int = 16
+comptime JOINT_LIMIT_STATE: Int = 17  # one of the JOINT_LIMIT_* states below
 
 # Joint flags
 comptime JOINT_FLAG_LIMIT_ENABLED: Int = 1
 comptime JOINT_FLAG_MOTOR_ENABLED: Int = 2
-comptime JOINT_FLAG_SPRING_ENABLED: Int = 4
+
+# Limit states (Box2D b2LimitState)
+comptime JOINT_LIMIT_INACTIVE: Int = 0
+comptime JOINT_LIMIT_AT_LOWER: Int = 1
+comptime JOINT_LIMIT_AT_UPPER: Int = 2
+comptime JOINT_LIMIT_EQUAL: Int = 3
 
 # Maximum joints per environment
 comptime MAX_JOINTS_PER_ENV: Int = 8
@@ -170,4 +190,19 @@ comptime DEFAULT_SLOP: Float64 = 0.005  # Penetration allowance
 from std.math import pi
 
 comptime PI: Float64 = pi
+
+# =============================================================================
+# Box2D 2.3 solver settings (b2Settings.h, pybox2d 2.3.10 = Gymnasium's Box2D)
+# =============================================================================
+comptime B2_LINEAR_SLOP: Float64 = 0.005
+comptime B2_ANGULAR_SLOP: Float64 = 2.0 / 180.0 * pi
+comptime B2_BAUMGARTE: Float64 = 0.2
+comptime B2_MAX_LINEAR_CORRECTION: Float64 = 0.2
+comptime B2_MAX_ANGULAR_CORRECTION: Float64 = 8.0 / 180.0 * pi
+comptime B2_VELOCITY_THRESHOLD: Float64 = 1.0  # restitution applies above it
+comptime B2_MAX_TRANSLATION: Float64 = 2.0  # per step
+comptime B2_MAX_ROTATION: Float64 = 0.5 * pi  # per step
+comptime B2_TIME_TO_SLEEP: Float64 = 0.5
+comptime B2_LINEAR_SLEEP_TOLERANCE: Float64 = 0.01
+comptime B2_ANGULAR_SLEEP_TOLERANCE: Float64 = 2.0 / 180.0 * pi
 comptime TWO_PI: Float64 = 2.0 * pi

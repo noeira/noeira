@@ -204,6 +204,7 @@ def ray_mesh_bvh[
     bvhnum: Int,
     pnt: Vec3Generic[DTYPE],
     vec: Vec3Generic[DTYPE],
+    tcut: Scalar[DTYPE] = Scalar[DTYPE](RAY_NO_HIT),
 ) -> MeshHit[DTYPE] where DTYPE.is_floating_point():
     """`mju_rayTree` — the same answer as `ray_mesh`, over a BVH.
 
@@ -226,6 +227,25 @@ def ray_mesh_bvh[
     index per node instead (`MESH_BVH_IDX_ESCAPE`): the left child is always
     the next record, and a miss jumps to the end of the subtree. Traversal is
     then two integers in registers and holds for any depth.
+
+    ⚠⚠ `tcut` IS THE CALLER'S BEST HIT SO FAR (`ray_model` passes the nearest
+    distance among the geoms it has already tested; negative = none). A
+    triangle at `t >= tcut` cannot win there — `ray_model` keeps the FIRST
+    geom on a tie, strictly — so this walk drops it, and a node whose box
+    starts at or beyond `tcut` is not entered. MuJoCo Warp does the same
+    (`mesh_query_ray(..., max_t)`); the reference walks every mesh to its own
+    nearest hit. A pruned call returns NO HIT where the uncut one would have
+    returned a farther hit, and `ray_model` would have discarded that hit:
+    the model's answer is unchanged, which is what the gate checks.
+
+    ⚠⚠ TIES INSIDE THE MESH GO TO THE LOWER TRIANGLE INDEX, as in the linear
+    sweep (which scans in index order and keeps the first strictly nearer).
+    Without the rule the winner of an exact tie — a ray through a shared edge
+    — depends on the TREE's visiting order, so a different build (SAH vs the
+    reference's median split) could return the other face, with its own
+    normal and shading. With it, any valid tree returns the sweep's triangle,
+    and the node test must admit `tmin == x` (a tied, lower-index triangle can
+    sit in a box that starts exactly at `x`).
 
     `bvhadr`/`bvhnum` are the mesh's node window in the same arena as `tri`,
     in RECORDS. `bvhnum <= 0` means no tree was built — the caller is expected
@@ -266,6 +286,7 @@ def ray_mesh_bvh[
     var best_bv = Scalar[DTYPE](0)
 
     comptime FAR = Scalar[DTYPE](1e30)
+    var cut = tcut if tcut >= Scalar[DTYPE](0) else FAR
     var node = bvhadr
     var stop = bvhadr + bvhnum
 
@@ -312,15 +333,18 @@ def ray_mesh_bvh[
         if tmax > FAR:
             tmax = FAR
 
-        # ⚠ `tmin < x` IS AN EARLY-OUT THE REFERENCE DOES NOT HAVE, and it is
-        # safe for a reason worth stating: every point of every triangle under
-        # this node lies inside the node's box, so nothing under it can be
-        # nearer than the box's own entry distance. If we already hold a hit
-        # at `x <= tmin`, the whole subtree is provably not the winner. It
-        # changes the ORDER of nothing and the RESULT of nothing; it only
-        # skips work. (The boxes are also PADDED outwards by the builder,
-        # which makes `tmin` an under-estimate — the conservative direction.)
-        var visit = tmin < tmax and (x < 0 or tmin < x)
+        # ⚠ `tmin <= x` IS AN EARLY-OUT THE REFERENCE DOES NOT HAVE, and it
+        # is safe for a reason worth stating: every point of every triangle
+        # under this node lies inside the node's box, so nothing under it can
+        # be nearer than the box's own entry distance. If we already hold a
+        # hit at `x < tmin`, the whole subtree is provably not the winner.
+        # `<=`, not `<`: a triangle at exactly `x` with a LOWER index still
+        # wins the tie (see the docstring), and it can lie in a box entered at
+        # `x`. `tmin < cut` is the caller's best hit, strict for the same
+        # reason `ray_model`'s comparison is. (The boxes are also PADDED
+        # outwards by the builder, which makes `tmin` an under-estimate — the
+        # conservative direction.)
+        var visit = tmin < tmax and tmin < cut and (x < 0 or tmin <= x)
 
         if visit:
             var tid = Int(rebind[Scalar[DTYPE]](tri[o + MESH_BVH_IDX_TRI]))
@@ -332,8 +356,13 @@ def ray_mesh_bvh[
                     _v3[DTYPE, L_TRI](tri, to + 6),
                     lpnt, lvec, b0, b1,
                 )
-                # The same two tests, in the same order, as the linear sweep.
-                if r.t >= 0 and (x < 0 or r.t < x):
+                # The linear sweep's two tests, then the index tie-break the
+                # sweep gets from its scan order, then the caller's cut.
+                if (
+                    r.t >= 0
+                    and r.t < cut
+                    and (x < 0 or r.t < x or (r.t == x and tid < best_tri))
+                ):
                     x = r.t
                     normal_local = r.normal
                     best_tri = tid

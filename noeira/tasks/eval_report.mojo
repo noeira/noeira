@@ -221,14 +221,14 @@ struct SuccessReport(Movable & Deinitable):
             var c = self.counts(t)
             if c[1] == 0:
                 continue
-            var k = String("eval/success/task_") + String(t)
+            var k = String("eval_success_rate_task_") + String(t)
             logger.log_scalar(k, Float64(c[0]) / Float64(c[1]), step)
             logger.log_scalar(
-                String("eval/episodes/task_") + String(t), Float64(c[1]), step
+                String("eval_episodes_task_") + String(t), Float64(c[1]), step
             )
         logger.log_scalar(
-            String("eval/success/overall"), self.overall(), step
+            String("eval_success_rate"), self.overall(), step
         )
         logger.log_scalar(
-            String("eval/episodes/overall"), Float64(self.n_lanes()), step
+            String("eval_episodes"), Float64(self.n_lanes()), step
         )

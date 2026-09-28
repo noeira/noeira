@@ -27,26 +27,25 @@ import { Card, CardGrid } from '@astrojs/starlight/components';
 import SimToReal from '~/components/diagrams/SimToReal.astro';
 
 <ul class="stat-grid not-content">
-	<li class="stat"><span class="stat__value">83</span><span class="stat__label">MuJoCo Menagerie models load</span></li>
-	<li class="stat"><span class="stat__value">18</span><span class="stat__label">DeepMind Control domains</span></li>
-	<li class="stat"><span class="stat__value">129</span><span class="stat__label">LIBERO tasks</span></li>
-	<li class="stat"><span class="stat__value">30 Hz</span><span class="stat__label">ACT on a Jetson Orin</span></li>
+	<li class="stat"><span class="stat__value">350+</span><span class="stat__label">environments and tasks</span></li>
+	<li class="stat"><span class="stat__value">35+</span><span class="stat__label">learning algorithms and planners</span></li>
+	<li class="stat"><span class="stat__value">0</span><span class="stat__label">Python between training and the motors</span></li>
 	<li class="stat"><span class="stat__value">1,100+</span><span class="stat__label">test files</span></li>
 </ul>
 
 ## From the simulator to the robot, in one language
 
 A robot-learning project today is assembled from pieces that were never meant
-to meet: MuJoCo for physics, PyTorch for networks, LeRobot for datasets and
-policies, a vendor SDK for the motors, and whatever runtime fits on the robot's
-computer. Every seam costs something — copies across language boundaries,
+to meet: a simulator for physics, a deep-learning framework for networks, a
+robot-learning library for datasets and policies, a vendor SDK for the motors,
+and whatever runtime fits on the robot's computer. Every seam costs something — copies across language boundaries,
 versions that drift, a policy that behaves differently on the robot than it
 did in training because the code that ran it was not the code that trained it.
 
 noeira builds the whole loop in Mojo instead: the physics engine, the task
 suites, the neural networks, the learning algorithms, the camera pipeline, the
 servo bus and the deployment runtime. The policy that trains on a GPU in the
-cloud is the same code that drives the arm from a Jetson.
+cloud is the same code that drives the robot from its onboard computer.
 
 <SimToReal />
 
@@ -54,15 +53,15 @@ cloud is the same code that drives the arm from a Jetson.
 
 <CardGrid>
 	<Card title="Simulation" icon="setting">
-		A MuJoCo-inspired 3D engine validated against live MuJoCo — Menagerie
-		robots, DeepMind Control, meshes, tendons, elliptic contacts — with
-		batched GPU stepping and ray-traced cameras. See
+		A MuJoCo-inspired 3D engine checked against MuJoCo itself — meshes,
+		tendons, contacts, sensors — with batched GPU stepping, ray-traced
+		cameras and a library of environments and robot models. See
 		[3D physics](/physics/physics3d/) and [environments](/environments/).
 	</Card>
 	<Card title="Tasks and benchmarks" icon="list-format">
-		A declarative task layer — families, goals, placements — that runs many
-		tasks in one batched scene. [LIBERO](/environments/libero/)'s suites are
-		ported onto it; the SO-101 has its own tabletop and tower families. See
+		A declarative task layer — families, goals, placements — that describes a
+		task once and runs many of them in one batched GPU scene. Benchmarks such
+		as [LIBERO](/environments/libero/) are ported onto it. See
 		[the task layer](/tasks/).
 	</Card>
 	<Card title="Learning" icon="star">
@@ -71,20 +70,22 @@ cloud is the same code that drives the arm from a Jetson.
 		Forward-Backward. See [algorithms](/algorithms/).
 	</Card>
 	<Card title="Imitation and VLAs" icon="random">
-		ACT and SmolVLA trained and run in Mojo, behaviour cloning, and
-		HIL-SERL with DAgger-style interventions — learning from demonstrations
-		recorded in simulation or on the real arm. See
-		[imitation and VLAs](/algorithms/imitation/).
+		Learning from demonstrations: behaviour cloning, action-chunking
+		transformers, vision-language-action models, and reinforcement learning
+		with human interventions — from data recorded in simulation or on a real
+		robot. See [imitation and VLAs](/algorithms/imitation/).
 	</Card>
 	<Card title="Robots" icon="rocket">
-		The SO-101 arm over its servo bus: calibration, teleoperation, recording
-		to LeRobot v3 datasets with cameras, and policies deployed on a Jetson
-		Orin. See [robots](/robots/).
+		Hardware in the loop: servo buses, calibration, teleoperation, cameras,
+		recording, and policies deployed on edge GPUs with the safety rules built
+		in. The first supported robot is the SO-101 arm on a Jetson Orin. See
+		[robots](/robots/).
 	</Card>
 	<Card title="Infrastructure" icon="puzzle">
-		[`noeira.nn`](/nn/) — autodiff, 70+ primitives, fused and flash
+		[`noeira.nn`](/nn/) — gradients composed at compile time, 70+ primitives, fused and flash
 		attention, AMP and CUDA graphs — plus native HDF5, Parquet and video I/O,
-		and [noeira cloud](/tooling/monitor/) for runs and datasets.
+		datasets in the LeRobot v3 format with no dependency on LeRobot, and
+		[noeira cloud](/tooling/monitor/) for runs and datasets.
 	</Card>
 </CardGrid>
 
@@ -100,8 +101,9 @@ cloud is the same code that drives the arm from a Jetson.
 		smaller with [Q-Learning on GridWorld](/start/quickstart-tabular/).
 	</Card>
 	<Card title="Bring up a robot" icon="rocket">
-		[Set up the SO-101](/robots/so101-setup/), record demonstrations, and
-		[deploy a policy](/robots/deployment/) — safety rules first.
+		[Set up a robot](/robots/so101-setup/) — the SO-101 is the first
+		supported — record demonstrations, and
+		[deploy a policy](/robots/deployment/), safety rules first.
 	</Card>
 	<Card title="New to the field?" icon="open-book">
 		[RL in five minutes](/start/rl-in-five-minutes/) — the agent and
@@ -121,9 +123,9 @@ carries its own marker:
 
 - **Stable:** the 3D physics engine and its MuJoCo validation, the classic
   and MuJoCo-style environments, DQN / PPO / SAC / TD3, `noeira.nn`.
-- **Beta:** the task layer and LIBERO, ACT (trained and deployed on the real
-  arm), recording to LeRobot, Jetson deployment.
-- **Experimental:** SmolVLA on the arm, HIL-SERL and DAgger, the world-model
-  agents, DeepMind Control training. Results are reported with their caveats
+- **Beta:** the task layer and its benchmarks, imitation learning on a real
+  robot, dataset recording, deployment on edge hardware.
+- **Experimental:** vision-language-action models on a robot, learning from
+  interventions, the world-model agents, DeepMind Control training. Results are reported with their caveats
   on each page.
 :::

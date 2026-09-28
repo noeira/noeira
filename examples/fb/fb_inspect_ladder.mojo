@@ -40,10 +40,15 @@ parameter set; loading them here would fail or, worse, partially match.
 
 Run:
     pixi run mojo run -I . examples/fb/fb_inspect_ladder.mojo
+    pixi run mojo run -I . examples/fb/fb_inspect_ladder.mojo --run <run_id>
 """
 
 from std.math import sqrt
 from std.random import random_float64, seed
+from std.sys import argv
+from std.os.path import exists
+from noeira.core.project import projects_root
+from noeira.io.proc import quote_arg, run_capture
 
 from noeira.nn.constants import DT
 from noeira.nn.core.tensor import Tensor
@@ -85,8 +90,8 @@ comptime CKPT_DIR: StaticString = "checkpoints/"
 # WRITE. Since 2026-09-09 (`docs/PROJECT_LAYER_PLAN.md` P0d) the FB trainers write
 # `runs/<id>/checkpoints/step_<n>.ckpt` instead — a unique directory per run, so
 # two arms at the same `--tag` cannot overwrite each other. The files this points
-# at still exist and still load; a ladder from a NEW run has to be named
-# explicitly.
+# at still exist and still load; a ladder from a NEW run is read with
+# `--run <run_id>`.
 comptime CKPT_STEM: StaticString = "fb_walker_all_d128.ckpt."
 comptime N_CKPT: Int = 10
 comptime FIRST_STEP: Int = 50_000
@@ -141,11 +146,52 @@ def _rms(ref t: Tensor, n: Int, rows: Int) -> Float64:
     return sqrt(s / Float64(rows))
 
 
+def _run_dir(handle: String) raises -> String:
+    """`handle` as a run directory: a path to one, or a run id under `runs/` or
+    any `projects/*/runs/`. Raises when none of them holds a `checkpoints/`."""
+    if exists(handle + "/checkpoints"):
+        return handle
+    if exists(String("runs/") + handle + "/checkpoints"):
+        return String("runs/") + handle
+    var root = projects_root()
+    var listing = run_capture(
+        String("ls -d ") + quote_arg(root) + "/*/runs/" + quote_arg(handle)
+        + " 2>/dev/null; true",
+        1 << 16,
+    )
+    for line in listing.split("\n"):
+        var d = String(String(line).strip())
+        if d.byte_length() > 0 and exists(d + "/checkpoints"):
+            return d
+    raise Error(
+        "--run '" + handle + "' is neither a run directory nor a run id under"
+        " runs/ or " + root + "/*/runs/"
+    )
+
+
+def _flag(name: String, dflt: String) raises -> String:
+    """Value of `--name X`, or `dflt` when the flag is absent."""
+    var av = argv()
+    for i in range(1, len(av)):
+        if String(av[i]) == name:
+            if i + 1 >= len(av):
+                raise Error("flag " + name + " needs a value")
+            return String(av[i + 1])
+    return dflt
+
+
 def main() raises:
     seed(SEED)
     print("=" * 78)
     print("FB checkpoint ladder — is F running away?")
     print("=" * 78)
+
+    # `--run <run_id|run_dir>` reads a NEW run's `checkpoints/step_<n>.ckpt`
+    # ladder; without it, the historical `CKPT_DIR + CKPT_STEM + <n>` one.
+    var run_arg = _flag(String("--run"), String(""))
+    var run_dir = _run_dir(run_arg) if run_arg.byte_length() > 0 else String("")
+    if run_dir.byte_length() > 0:
+        print("  run:", run_dir)
 
     # One FIXED probe batch, drawn before any load, reused for every rung.
     var ps = Tensor.alloc(BATCH * OBS)
@@ -183,6 +229,8 @@ def main() raises:
     for k in range(N_CKPT):
         var at = FIRST_STEP + k * STEP_STRIDE
         var path = String(CKPT_DIR) + String(CKPT_STEM) + String(at)
+        if run_dir.byte_length() > 0:
+            path = run_dir + "/checkpoints/step_" + String(at) + ".ckpt"
 
         var t = Trainer.make[Xavier](lr=1e-4, max_grad_norm=1.0, bc_weight=1.0)
         try:

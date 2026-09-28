@@ -29,8 +29,11 @@ Requires (NVIDIA box):
 
 Run:
   pixi run -e nvidia mojo run -I . examples/lewm/lewm_pusht_closedloop_tta_gpu.mojo
+  pixi run -e nvidia mojo run -I . examples/lewm/lewm_pusht_closedloop_tta_gpu.mojo --ckpt <run_id>
 """
 
+from std.sys import argv
+from noeira.core.run import resolve_checkpoint
 from max.gpu.host import DeviceContext
 from layout import TileTensor, row_major
 
@@ -103,13 +106,13 @@ comptime Source = WindowSource[
 comptime MPC_HORIZON = 4           # NEEDED = H+horizon-1 = 6 = T
 
 
-def _make_warmed_wm(ctx: DeviceContext) raises -> Trainer:
+def _make_warmed_wm(ctx: DeviceContext, ckpt: String) raises -> Trainer:
     """Fresh trainer (fresh Adam — TTA precondition) + ckpt (+ BN warmup
     only for legacy flat checkpoints — v3 carries the BN running stats)."""
     # wd=0, no grad clip: the adapt step matches training exactly.
     var wm = Trainer.make(lam=LAM, lr=TTA_LR, ctx=ctx)
-    print("   loading frozen WM", CKPT_PATH, "...")
-    wm.load_params(CKPT_PATH)
+    print("   loading frozen WM", ckpt, "...")
+    wm.load_params(ckpt)
     # A v3 ckpt may carry the training run's Adam moments; the TTA mask
     # invariant needs zero moments (plan §4).
     wm.reset_opt_moments()
@@ -129,7 +132,19 @@ def _make_warmed_wm(ctx: DeviceContext) raises -> Trainer:
     return wm^
 
 
+def _flag(name: String, dflt: String) raises -> String:
+    """Value of `--name X`, or `dflt` when the flag is absent."""
+    var av = argv()
+    for i in range(1, len(av)):
+        if String(av[i]) == name:
+            if i + 1 >= len(av):
+                raise Error("flag " + name + " needs a value")
+            return String(av[i + 1])
+    return dflt
+
+
 def main() raises:
+    var ckpt = resolve_checkpoint(_flag(String("--ckpt"), CKPT_PATH), String("last"))
     print("=" * 70)
     print("LeWM PushT closed-loop — E1: FROZEN vs ADAPT (AdaJEPA TTA)")
     print("=" * 70)
@@ -149,7 +164,7 @@ def main() raises:
         print("── seed set", s, "(seed0 =", seed0, ") ──")
         # One warmed wm per set serves both arms: the frozen run never
         # steps the optimizer, so the adapt run still sees a fresh Adam.
-        var wm = _make_warmed_wm(ctx)
+        var wm = _make_warmed_wm(ctx, ckpt)
 
         print("   [frozen] ...")
         var rf = run_lewm_closedloop[

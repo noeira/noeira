@@ -66,6 +66,8 @@ from ..core.concurrent.worker import (
 )
 from .opencv import VideoCapture, opencv_shim_available
 from .preprocess import camera_frame_to_chw_rgb
+from .calib_file import read_calib
+from .fisheye import FisheyeLens, Pinhole, UndistortMap
 from .resize_pad import camera_frame_to_siglip
 
 
@@ -321,6 +323,10 @@ struct _CamWorker(BackgroundWorker):
     var f32: List[Float32]
     var opened: Bool
     var rgb: Bool
+    var und_map: List[UndistortMap]
+    """Empty, or the ONE fisheye -> sim-pinhole map applied to each native
+    frame before the ACT resize (`CameraReader.set_undistort`)."""
+    var und: List[UInt8]
 
     def __init__(
         out self,
@@ -336,6 +342,7 @@ struct _CamWorker(BackgroundWorker):
         out_w: Int,
         out_h: Int,
         siglip: Int,
+        var und_map: List[UndistortMap],
     ) raises:
         self.ring = ring^
         self.block = block^
@@ -357,6 +364,8 @@ struct _CamWorker(BackgroundWorker):
         self.f32 = List[Float32]()
         self.opened = False
         self.rgb = rgb
+        self.und_map = und_map^
+        self.und = List[UInt8]()
 
     def __init__(out self, *, deinit move: Self):
         self.ring = move.ring^
@@ -376,6 +385,8 @@ struct _CamWorker(BackgroundWorker):
         self.f32 = move.f32^
         self.opened = move.opened
         self.rgb = move.rgb
+        self.und_map = move.und_map^
+        self.und = move.und^
 
     def on_start(mut self, ctl: WorkerCtl):
         # ⚠ THE DEVICE IS OPENED HERE, ON THE THREAD THAT WILL READ IT — the
@@ -469,10 +480,26 @@ struct _CamWorker(BackgroundWorker):
         # covers it wherever it runs.
         if self.out_w > 0:
             try:
-                camera_frame_to_chw_rgb(
-                    self.buf, self.width, self.height,
-                    self.out, self.out_w, self.out_h,
-                )
+                if len(self.und_map) > 0:
+                    # ⚠ THE SAME `UndistortMap` THE IMPORTER'S `--undistort`
+                    # APPLIED, before the same resize — so the deployed frame
+                    # and the stored one are in one camera model. Channel
+                    # order is irrelevant to it (per channel, like the resize).
+                    ref um = self.und_map[0]
+                    if um.src_w != self.width or um.src_h != self.height:
+                        raise Error("undistort: calibration size != frame size")
+                    if len(self.und) != len(self.buf):
+                        self.und = List[UInt8](length=len(self.buf), fill=0)
+                    um.apply_hwc(self.buf, 0, 3, self.und, 0)
+                    camera_frame_to_chw_rgb(
+                        self.und, self.width, self.height,
+                        self.out, self.out_w, self.out_h,
+                    )
+                else:
+                    camera_frame_to_chw_rgb(
+                        self.buf, self.width, self.height,
+                        self.out, self.out_w, self.out_h,
+                    )
             except:
                 _ = self.block.fetch_add(CELL_READ_FAIL, Int64(1))
                 return POLL_IDLE
@@ -557,6 +584,10 @@ struct CameraReader(Movable):
     var running: Bool
     var rgb: Bool
     """True when frames are delivered RGB24 instead of OpenCV's BGR."""
+    var undistort_calib: String
+    """A fisheye calibration applied before the ACT resize, or "" — see
+    `set_undistort`."""
+    var undistort_fovy: Float64
 
     def __init__(
         out self,
@@ -693,6 +724,8 @@ struct CameraReader(Movable):
         self._starved = 0
         self.running = False
         self.rgb = rgb
+        self.undistort_calib = String("")
+        self.undistort_fovy = 0.0
 
     def __init__(out self, *, deinit move: Self):
         self.ring = move.ring^
@@ -710,6 +743,8 @@ struct CameraReader(Movable):
         self._starved = move._starved
         self.running = move.running
         self.rgb = move.rgb
+        self.undistort_calib = move.undistort_calib^
+        self.undistort_fovy = move.undistort_fovy
 
     def label(self) -> String:
         """How this camera is named in a message: the path, or `device N`."""
@@ -744,6 +779,24 @@ struct CameraReader(Movable):
         """
         return _unpack_fourcc(self.block.acquire_load(CELL_FOURCC))
 
+    def set_undistort(mut self, calib_path: String, fovy: Float64) raises:
+        """Bring each native frame to the SIM's pinhole (`vision/fisheye.mojo`,
+        `fovy` degrees at the native size) before the ACT resize — what a
+        store imported with `--undistort` holds. Call before `start`.
+
+        ⚠ ACT DELIVERY ONLY (`out_w > 0`). A recorder's raw frames must stay
+        raw: they are the dataset, and the dataset is undistorted at IMPORT,
+        where the calibration can be redone without re-recording."""
+        if self.running:
+            raise Error("camera_thread: set_undistort after start")
+        if self.out_w <= 0:
+            raise Error(
+                "camera_thread: undistortion applies to the ACT delivery"
+                " (out_w > 0); a raw recorder frame is undistorted at import"
+            )
+        self.undistort_calib = calib_path
+        self.undistort_fovy = fovy
+
     def frame_bytes(self) -> Int:
         """Bytes one frame occupies AS DELIVERED — resized when the worker
         resizes, native otherwise. Every `take` sizes its buffer from this."""
@@ -752,6 +805,24 @@ struct CameraReader(Movable):
         if self.out_w > 0:
             return self.out_w * self.out_h * 3
         return self.width * self.height * 3
+
+    def _undistort_map(self) raises -> List[UndistortMap]:
+        var out = List[UndistortMap]()
+        if self.undistort_calib.byte_length() == 0:
+            return out^
+        var cal = read_calib(self.undistort_calib)
+        cal.require_size(self.width, self.height)
+        var um = UndistortMap(
+            FisheyeLens.from_calib(cal),
+            Pinhole.sim(self.undistort_fovy, self.width, self.height),
+        )
+        if um.n_outside > 0:
+            raise Error(
+                "camera_thread: " + self.undistort_calib + " leaves "
+                + String(um.n_outside) + " pixels of the pinhole outside the lens"
+            )
+        out.append(um^)
+        return out^
 
     def start(mut self, wait_ms: Int = 4000) raises:
         """Spawn the thread and WAIT for the device to actually open.
@@ -768,7 +839,7 @@ struct CameraReader(Movable):
             _CamWorker(
                 self.ring, self.block, self.device, self.path, self.fourcc,
                 self.width, self.height, self.fps, self.rgb,
-                self.out_w, self.out_h, self.siglip,
+                self.out_w, self.out_h, self.siglip, self._undistort_map(),
             )
         )
         self.running = True

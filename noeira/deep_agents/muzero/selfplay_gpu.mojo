@@ -5,8 +5,8 @@ on the **device** (`mz_unroll_train_step_gpu`) while the MCTS search still runs 
 the CPU (`GenericCPUMCTS` over the learned model — the search is host control-flow
 heavy and not worth porting). The two halves are bridged by a **CPU mirror** of
 the three nets: after every GPU train step the freshly-updated device params are
-downloaded into the mirror (one `nn-ckpt v2` string round-trip per net via
-`save_state_v2_body_gpu` → `load_state_v2_body`), so the next search plans with
+downloaded into the mirror (`mz_sync_gpu_to_cpu`: collect/inject visitors,
+exact, no checkpoint round-trip), so the next search plans with
 up-to-date weights. The replay buffer is host-side (`MCTSSequenceReplay`) and the
 training batch is a host slab H2D-copied inside the unroll step — the same data
 path as the CPU driver; only the gradient math moves to the GPU.
@@ -389,9 +389,9 @@ def run_muzero_selfplay_gpu[
                 ravg /= Float64(rcnt)
             var rn = List[String]()
             var rv = List[Float64]()
-            rn.append(String("avg_return")); rv.append(ravg)
+            rn.append(String("avg_reward")); rv.append(ravg)
             rn.append(String("episodes")); rv.append(Float64(rb.num_episodes()))
-            rn.append(String("replay_size")); rv.append(Float64(rb.num_steps()))
+            rn.append(String("buffer_size")); rv.append(Float64(rb.num_steps()))
             logger.value()[].log_scalars(rn, rv, it + 1)
 
     l_parts.unsafe_free(); h_diag_pred.unsafe_free()

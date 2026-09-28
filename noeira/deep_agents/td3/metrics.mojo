@@ -11,7 +11,7 @@ on the critic cadence → averaged by `n_critic_updates`):
   * `mean_q`      — mean Q1(s, a) over the minibatch (twin critic
                     forward, reads `twin_critic_blk.inner.c1._mb_q`)
   * `mean_target` — mean TD target y over the minibatch (`state.mb_y`)
-  * `mean_reward` — mean reward of the minibatch (`state.mb_r`)
+  * `reward_mean` — mean reward of the minibatch (`state.mb_r`)
   * `mean_done`   — mean done flag of the minibatch (`state.mb_d`)
 On the storage GPU train path these diagnostics are populated from
 device-resident accumulators (read once at flush), same as SAC — not 0.0."""
@@ -22,12 +22,12 @@ from noeira.nn.core.metric import LogScalar
 
 @fieldwise_init
 struct TD3Metrics(Copyable, Movable, Deinitable):
-    var actor_loss:  LogScalar[DT]
-    var critic_loss: LogScalar[DT]
-    var mean_q:      LogScalar[DT]
-    var mean_target: LogScalar[DT]
-    var mean_reward: LogScalar[DT]
-    var mean_done:   LogScalar[DT]
+    var policy_loss:      LogScalar[DT]
+    var critic_loss:      LogScalar[DT]
+    var mean_q:           LogScalar[DT]
+    var mean_target:      LogScalar[DT]
+    var reward_mean:      LogScalar[DT]
+    var mean_done:        LogScalar[DT]
     var train_steps:      LogScalar[DT]
     var n_actor_updates:  LogScalar[DT]
     var n_critic_updates: LogScalar[DT]

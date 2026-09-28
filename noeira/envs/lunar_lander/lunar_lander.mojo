@@ -39,6 +39,10 @@ from noeira.physics2d.integrators.euler import SemiImplicitEuler
 from noeira.physics2d.collision.edge_terrain import EdgeTerrainCollision
 from noeira.physics2d.solvers.impulse import ImpulseSolver
 from noeira.physics2d.joints.revolute import RevoluteJointSolver
+from noeira.physics2d.island import (
+    island_sleep_time_single_env,
+    island_is_asleep,
+)
 
 from noeira.physics2d import (
     dtype,
@@ -68,11 +72,8 @@ from noeira.physics2d import (
     JOINT_REF_ANGLE,
     JOINT_LOWER_LIMIT,
     JOINT_UPPER_LIMIT,
-    JOINT_STIFFNESS,
-    JOINT_DAMPING,
     JOINT_FLAGS,
     JOINT_FLAG_LIMIT_ENABLED,
-    JOINT_FLAG_SPRING_ENABLED,
     PhysicsState,
     PhysicsStateOwned,
     # Contact data indices for collision-based crash detection
@@ -517,9 +518,8 @@ struct LunarLander[
             / Float64(LLConstants.TERRAIN_CHUNKS - 1),
         )
 
-        # Initial position and velocity
-        var init_x = LLConstants.HELIPAD_X
-        var init_y = LLConstants.H_UNITS
+        # Initial velocity (Gymnasium's ApplyForceToCenter integrated over
+        # its in-reset step: v = F dt / m)
         var rand1 = Float64(rand_vals[0])
         var rand2 = Float64(rand_vals[1])
         var init_fx = (rand1 * 2.0 - 1.0) * 1000.0  # INITIAL_RANDOM
@@ -527,94 +527,12 @@ struct LunarLander[
         var init_vx = init_fx * LLConstants.DT / LLConstants.LANDER_MASS
         var init_vy = init_fy * LLConstants.DT / LLConstants.LANDER_MASS
 
-        # Clear existing joints
-        self.physics.clear_joints(0)
-
-        # Set main lander body state (body 0)
-        self.physics.set_body_position(0, Self.BODY_LANDER, init_x, init_y)
-        self.physics.set_body_velocity(
-            0, Self.BODY_LANDER, init_vx, init_vy, 0.0
-        )
-        self.physics.set_body_angle(0, Self.BODY_LANDER, 0.0)
-        self.physics.set_body_mass(
+        # Lander, legs and leg joints: the SAME initializer as the GPU reset.
+        Self._init_bodies_single_env[1, LLConstants.STATE_SIZE_VAL](
+            self.physics.get_state_tensor(),
             0,
-            Self.BODY_LANDER,
-            LLConstants.LANDER_MASS,
-            LLConstants.LANDER_INERTIA,
-        )
-        self.physics.set_body_shape(0, Self.BODY_LANDER, 0)
-
-        # Compute initial leg positions
-        var left_leg_x = init_x - LLConstants.LEG_AWAY
-        var left_leg_y = (
-            init_y - (10.0 / LLConstants.SCALE) - LLConstants.LEG_DOWN
-        )
-        var right_leg_x = init_x + LLConstants.LEG_AWAY
-        var right_leg_y = (
-            init_y - (10.0 / LLConstants.SCALE) - LLConstants.LEG_DOWN
-        )
-
-        # Set left leg body state (body 1)
-        self.physics.set_body_position(
-            0, Self.BODY_LEFT_LEG, left_leg_x, left_leg_y
-        )
-        self.physics.set_body_velocity(
-            0, Self.BODY_LEFT_LEG, init_vx, init_vy, 0.0
-        )
-        self.physics.set_body_angle(0, Self.BODY_LEFT_LEG, 0.0)
-        self.physics.set_body_mass(
-            0,
-            Self.BODY_LEFT_LEG,
-            LLConstants.LEG_MASS,
-            LLConstants.LEG_INERTIA,
-        )
-        self.physics.set_body_shape(0, Self.BODY_LEFT_LEG, 1)
-
-        # Set right leg body state (body 2)
-        self.physics.set_body_position(
-            0, Self.BODY_RIGHT_LEG, right_leg_x, right_leg_y
-        )
-        self.physics.set_body_velocity(
-            0, Self.BODY_RIGHT_LEG, init_vx, init_vy, 0.0
-        )
-        self.physics.set_body_angle(0, Self.BODY_RIGHT_LEG, 0.0)
-        self.physics.set_body_mass(
-            0,
-            Self.BODY_RIGHT_LEG,
-            LLConstants.LEG_MASS,
-            LLConstants.LEG_INERTIA,
-        )
-        self.physics.set_body_shape(0, Self.BODY_RIGHT_LEG, 2)
-
-        # Add revolute joints connecting legs to main lander
-        _ = self.physics.add_revolute_joint(
-            env=0,
-            body_a=Self.BODY_LANDER,
-            body_b=Self.BODY_LEFT_LEG,
-            anchor_ax=-LLConstants.LEG_AWAY,
-            anchor_ay=-10.0 / LLConstants.SCALE,
-            anchor_bx=0.0,
-            anchor_by=LLConstants.LEG_H,
-            stiffness=LLConstants.LEG_SPRING_STIFFNESS,
-            damping=LLConstants.LEG_SPRING_DAMPING,
-            lower_limit=0.4,
-            upper_limit=0.9,
-            enable_limit=True,
-        )
-
-        _ = self.physics.add_revolute_joint(
-            env=0,
-            body_a=Self.BODY_LANDER,
-            body_b=Self.BODY_RIGHT_LEG,
-            anchor_ax=LLConstants.LEG_AWAY,
-            anchor_ay=-10.0 / LLConstants.SCALE,
-            anchor_bx=0.0,
-            anchor_by=LLConstants.LEG_H,
-            stiffness=LLConstants.LEG_SPRING_STIFFNESS,
-            damping=LLConstants.LEG_SPRING_DAMPING,
-            lower_limit=-0.9,
-            upper_limit=-0.4,
-            enable_limit=True,
+            Scalar[dtype](init_vx),
+            Scalar[dtype](init_vy),
         )
 
         # Reset tracking
@@ -1108,37 +1026,14 @@ struct LunarLander[
         )
 
     def _step_physics_cpu(mut self):
-        """Execute physics step."""
+        """Execute physics step: detection, then the SAME Box2D island solve
+        the GPU kernels run (`_solve_step_single_env`)."""
         var bodies = self.physics.get_bodies_tensor()
         var shapes = self.physics.get_shapes_tensor()
-        var forces = self.physics.get_forces_tensor()
         var contacts = self.physics.get_contacts_tensor()
         var contact_counts = self.physics.get_contact_counts_tensor()
-        var joints = self.physics.get_joints_tensor()
-        var joint_counts = self.physics.get_joint_counts_tensor()
+        var states = self.physics.get_state_tensor()
 
-        var integrator = SemiImplicitEuler()
-        var solver = ImpulseSolver(
-            LLConstants.FRICTION, LLConstants.RESTITUTION
-        )
-
-        # Cast config values to Float32 for physics functions
-        var gravity_x = Scalar[dtype](self.config.gravity_x)
-        var gravity_y = Scalar[dtype](self.config.gravity_y)
-        var dt = Scalar[dtype](self.config.dt)
-        var baumgarte = Scalar[dtype](self.config.baumgarte)
-        var slop = Scalar[dtype](self.config.slop)
-
-        # Integrate velocities
-        integrator.integrate_velocities[1, LLConstants.NUM_BODIES](
-            bodies,
-            forces,
-            gravity_x,
-            gravity_y,
-            dt,
-        )
-
-        # Detect collisions
         self.edge_collision.detect[
             1,
             LLConstants.NUM_BODIES,
@@ -1146,35 +1041,19 @@ struct LunarLander[
             LLConstants.MAX_CONTACTS,
         ](bodies, shapes, contacts, contact_counts)
 
-        # Solve velocity constraints (contacts + joints INTERLEAVED to match GPU)
-        # GPU uses UnifiedConstraintSolver which interleaves: contact iter, joint iter, repeat
-        for _ in range(self.config.velocity_iterations):
-            solver.solve_velocity[
-                1, LLConstants.NUM_BODIES, LLConstants.MAX_CONTACTS
-            ](bodies, contacts, contact_counts)
-            RevoluteJointSolver.solve_velocity[
-                1, LLConstants.NUM_BODIES, LLConstants.MAX_JOINTS
-            ](bodies, joints, joint_counts, dt)
-
-        # Integrate positions
-        integrator.integrate_positions[1, LLConstants.NUM_BODIES](bodies, dt)
-
-        # Solve position constraints (contacts + joints INTERLEAVED to match GPU)
-        for _ in range(self.config.position_iterations):
-            solver.solve_position[
-                1, LLConstants.NUM_BODIES, LLConstants.MAX_CONTACTS
-            ](bodies, contacts, contact_counts)
-            RevoluteJointSolver.solve_position[
-                1, LLConstants.NUM_BODIES, LLConstants.MAX_JOINTS
-            ](
-                bodies,
-                joints,
-                joint_counts,
-                baumgarte,
-                slop,
-            )
+        Self._solve_step_single_env[1, LLConstants.STATE_SIZE_VAL](
+            0,
+            states,
+            contacts,
+            Int(contact_counts[0]),
+            Int(states[0, LLConstants.JOINT_COUNT_OFFSET]),
+            Scalar[dtype](self.config.gravity_x),
+            Scalar[dtype](self.config.gravity_y),
+            Scalar[dtype](self.config.dt),
+        )
 
         # Clear forces
+        var forces = self.physics.get_forces_tensor()
         for body in range(LLConstants.NUM_BODIES):
             forces[0, body, 0] = Scalar[dtype](0)
             forces[0, body, 1] = Scalar[dtype](0)
@@ -1210,12 +1089,6 @@ struct LunarLander[
 
         var obs = self.get_observation(0)
         var x_norm = obs[0]
-        var left_contact = obs[6]
-        var right_contact = obs[7]
-
-        var vx = Float64(self.physics.get_body_vx(0, Self.BODY_LANDER))
-        var vy = Float64(self.physics.get_body_vy(0, Self.BODY_LANDER))
-        var omega = Float64(self.physics.get_body_omega(0, Self.BODY_LANDER))
 
         var new_shaping = self._compute_shaping()
         var reward = new_shaping - self.prev_shaping
@@ -1228,10 +1101,6 @@ struct LunarLander[
             s_power * LLConstants.SIDE_ENGINE_FUEL_COST
         )
 
-        var both_legs = left_contact > Scalar[Self.dtype](
-            0.5
-        ) and right_contact > Scalar[Self.dtype](0.5)
-        var speed = sqrt(vx * vx + vy * vy)
         # Crash: lander body touches ground (physics-based crash detection).
         var lander_contact = self._has_lander_body_contact()
         if lander_contact:
@@ -1239,13 +1108,15 @@ struct LunarLander[
 
         # Single-source terminal predicate + terminal reward overrides
         # (shared with BOTH GPU step kernels — see helpers.mojo).
+        var asleep = island_is_asleep(
+            rebind[Scalar[dtype]](
+                self.physics.get_state_tensor()[
+                    0, LLConstants.METADATA_OFFSET + LLConstants.META_SLEEP_TIME
+                ]
+            )
+        )
         var tr = lunar_terminal_and_reward[Self.dtype](
-            Scalar[Self.dtype](x_norm),
-            lander_contact,
-            both_legs,
-            Scalar[Self.dtype](speed),
-            Scalar[Self.dtype](abs(omega)),
-            reward,
+            Scalar[Self.dtype](x_norm), lander_contact, asleep, reward
         )
         reward = tr[0]
         var terminated = tr[1]
@@ -1614,10 +1485,6 @@ struct LunarLander[
             Scalar[dtype](LLConstants.GRAVITY_X),
             Scalar[dtype](LLConstants.GRAVITY_Y),
             Scalar[dtype](LLConstants.DT),
-            Scalar[dtype](LLConstants.FRICTION),
-            Scalar[dtype](LLConstants.RESTITUTION),
-            Scalar[dtype](LLConstants.BAUMGARTE),
-            Scalar[dtype](LLConstants.SLOP),
         )
 
     @staticmethod
@@ -1705,10 +1572,6 @@ struct LunarLander[
             Scalar[dtype](LLConstants.GRAVITY_X),
             Scalar[dtype](LLConstants.GRAVITY_Y),
             Scalar[dtype](LLConstants.DT),
-            Scalar[dtype](LLConstants.FRICTION),
-            Scalar[dtype](LLConstants.RESTITUTION),
-            Scalar[dtype](LLConstants.BAUMGARTE),
-            Scalar[dtype](LLConstants.SLOP),
         )
 
     @staticmethod
@@ -1946,6 +1809,174 @@ struct LunarLander[
     # =========================================================================
 
     @always_inline
+    # =========================================================================
+    # Shared physics (CPU step, both GPU kernels, both resets): ONE copy
+    # =========================================================================
+
+    @always_inline
+    @staticmethod
+    def _init_bodies_single_env[
+        BATCH: Int,
+        STATE_SIZE: Int,
+    ](
+        states: LayoutTensor[
+            dtype, Layout.row_major(BATCH, STATE_SIZE), MutAnyOrigin
+        ],
+        env: Int,
+        init_vx: Scalar[dtype],
+        init_vy: Scalar[dtype],
+    ):
+        """Lander + legs + leg joints as Gymnasium builds them (lunar_lander.py
+        reset): the leg i (i = -1 for body 1 = `legs[0]`, +1 for body 2) is
+        pinned by a revolute joint from the lander's origin to the point
+        (i * LEG_AWAY, LEG_DOWN) of the leg, reference angle 0, limits
+        [0.4, 0.9] (i = -1) / [-0.9, -0.4] (i = +1), motor 0.3 * i rad/s at
+        most LEG_MOTOR_TORQUE. The legs start pinned at the limit their motor
+        pushes against (joint angle -0.4 * i); Gymnasium creates them at
+        angle 0.05 * i and lets its first step (inside reset) snap them, to
+        ~+-0.49. Velocities: the lander's initial random push as v = F dt / m,
+        carried by the legs too. Also clears forces and the sleep clock."""
+        var lx = Scalar[dtype](LLConstants.HELIPAD_X)
+        var ly = Scalar[dtype](LLConstants.H_UNITS)
+        var lander_off = LLConstants.BODIES_OFFSET
+        states[env, lander_off + IDX_X] = lx
+        states[env, lander_off + IDX_Y] = ly
+        states[env, lander_off + IDX_ANGLE] = Scalar[dtype](0)
+        states[env, lander_off + IDX_VX] = init_vx
+        states[env, lander_off + IDX_VY] = init_vy
+        states[env, lander_off + IDX_OMEGA] = Scalar[dtype](0)
+        states[env, lander_off + IDX_INV_MASS] = Scalar[dtype](
+            1.0 / LLConstants.LANDER_MASS
+        )
+        states[env, lander_off + IDX_INV_INERTIA] = Scalar[dtype](
+            1.0 / LLConstants.LANDER_INERTIA
+        )
+        states[env, lander_off + IDX_SHAPE] = Scalar[dtype](0)
+
+        states[env, LLConstants.JOINT_COUNT_OFFSET] = Scalar[dtype](2)
+        for k in range(2):
+            var i = Scalar[dtype](-1.0) if k == 0 else Scalar[dtype](1.0)
+            var theta = Scalar[dtype](-0.4) * i
+            var bx = i * Scalar[dtype](LLConstants.LEG_AWAY)
+            var by = Scalar[dtype](LLConstants.LEG_DOWN)
+            var c = cos(theta)
+            var sn = sin(theta)
+            var leg_off = LLConstants.BODIES_OFFSET + (k + 1) * BODY_STATE_SIZE
+            # Leg centre such that R(theta) * (bx, by) lands on the pivot.
+            states[env, leg_off + IDX_X] = lx - (c * bx - sn * by)
+            states[env, leg_off + IDX_Y] = ly - (sn * bx + c * by)
+            states[env, leg_off + IDX_ANGLE] = theta
+            states[env, leg_off + IDX_VX] = init_vx
+            states[env, leg_off + IDX_VY] = init_vy
+            states[env, leg_off + IDX_OMEGA] = Scalar[dtype](0)
+            states[env, leg_off + IDX_INV_MASS] = Scalar[dtype](
+                1.0 / LLConstants.LEG_MASS
+            )
+            states[env, leg_off + IDX_INV_INERTIA] = Scalar[dtype](
+                1.0 / LLConstants.LEG_INERTIA
+            )
+            states[env, leg_off + IDX_SHAPE] = Scalar[dtype](k + 1)
+
+            RevoluteJointSolver.write_joint[BATCH, STATE_SIZE](
+                states,
+                env,
+                LLConstants.JOINTS_OFFSET + k * JOINT_DATA_SIZE,
+                body_a=LLConstants.BODY_LANDER,
+                body_b=k + 1,
+                anchor_ax=Scalar[dtype](0),
+                anchor_ay=Scalar[dtype](0),
+                anchor_bx=bx,
+                anchor_by=by,
+                reference_angle=Scalar[dtype](0),
+                lower_limit=Scalar[dtype](0.4) if k == 0 else Scalar[dtype](
+                    -0.9
+                ),
+                upper_limit=Scalar[dtype](0.9) if k == 0 else Scalar[dtype](
+                    -0.4
+                ),
+                enable_limit=True,
+                enable_motor=True,
+                motor_speed=Scalar[dtype](LLConstants.LEG_MOTOR_SPEED) * i,
+                max_motor_torque=Scalar[dtype](LLConstants.LEG_MOTOR_TORQUE),
+            )
+
+        for body in range(LLConstants.NUM_BODIES):
+            var force_off = LLConstants.FORCES_OFFSET + body * 3
+            states[env, force_off + 0] = Scalar[dtype](0)
+            states[env, force_off + 1] = Scalar[dtype](0)
+            states[env, force_off + 2] = Scalar[dtype](0)
+        states[
+            env, LLConstants.METADATA_OFFSET + LLConstants.META_SLEEP_TIME
+        ] = Scalar[dtype](0)
+
+    @always_inline
+    @staticmethod
+    def _solve_step_single_env[
+        BATCH: Int,
+        STATE_SIZE: Int,
+    ](
+        env: Int,
+        states: LayoutTensor[
+            dtype, Layout.row_major(BATCH, STATE_SIZE), MutAnyOrigin
+        ],
+        contacts: LayoutTensor[
+            dtype,
+            Layout.row_major(BATCH, LLConstants.MAX_CONTACTS, CONTACT_DATA_SIZE),
+            MutAnyOrigin,
+        ],
+        n_contacts: Int,
+        n_joints: Int,
+        gravity_x: Scalar[dtype],
+        gravity_y: Scalar[dtype],
+        dt: Scalar[dtype],
+    ):
+        """b2Island::Solve for this env, after collision detection: integrate
+        velocities, init + warm start contacts and joints, velocity
+        iterations (joints, then contacts), integrate positions, position
+        iterations (contacts, then joints; stop once both are within slop),
+        then advance the island's sleep clock."""
+        comptime NB = LLConstants.NUM_BODIES
+        comptime MC = LLConstants.MAX_CONTACTS
+        comptime MJ = LLConstants.MAX_JOINTS
+        comptime BO = LLConstants.BODIES_OFFSET
+        comptime JO = LLConstants.JOINTS_OFFSET
+        SemiImplicitEuler.integrate_velocities_single_env[
+            BATCH, NB, STATE_SIZE, BO, LLConstants.FORCES_OFFSET
+        ](env, states, gravity_x, gravity_y, dt)
+        ImpulseSolver.init_velocity_single_env[BATCH, NB, MC, STATE_SIZE, BO](
+            env,
+            states,
+            contacts,
+            n_contacts,
+            Scalar[dtype](LLConstants.RESTITUTION),
+        )
+        RevoluteJointSolver.init_velocity_single_env[
+            BATCH, NB, MJ, STATE_SIZE, BO, JO
+        ](env, states, n_joints)
+        for _ in range(LLConstants.VELOCITY_ITERATIONS):
+            RevoluteJointSolver.solve_velocity_single_env[
+                BATCH, NB, MJ, STATE_SIZE, BO, JO
+            ](env, states, n_joints, dt)
+            ImpulseSolver.solve_velocity_single_env[
+                BATCH, NB, MC, STATE_SIZE, BO
+            ](env, states, contacts, n_contacts, Scalar[dtype](LLConstants.FRICTION))
+        SemiImplicitEuler.integrate_positions_single_env[
+            BATCH, NB, STATE_SIZE, BO
+        ](env, states, dt)
+        for _ in range(LLConstants.POSITION_ITERATIONS):
+            var contacts_ok = ImpulseSolver.solve_position_single_env[
+                BATCH, NB, MC, STATE_SIZE, BO
+            ](env, states, contacts, n_contacts)
+            var joints_ok = RevoluteJointSolver.solve_position_single_env[
+                BATCH, NB, MJ, STATE_SIZE, BO, JO
+            ](env, states, n_joints)
+            if contacts_ok and joints_ok:
+                break
+        comptime SLEEP = LLConstants.METADATA_OFFSET + LLConstants.META_SLEEP_TIME
+        states[env, SLEEP] = island_sleep_time_single_env[
+            BATCH, NB, STATE_SIZE, BO
+        ](env, states, rebind[Scalar[dtype]](states[env, SLEEP]), dt)
+
     @staticmethod
     def _reset_env_gpu[
         BATCH_SIZE: Int,
@@ -2045,12 +2076,11 @@ struct LunarLander[
 
         # Initialize lander
         # Initial velocity matching CPU: (rand * 2 - 1) * INITIAL_RANDOM * DT / LANDER_MASS
-        # INITIAL_RANDOM = 1000.0, DT = 0.02, LANDER_MASS = 5.0
-        # = (rand * 2 - 1) * 1000 * 0.02 / 5 = (rand * 2 - 1) * 4.0
+        # = (rand * 2 - 1) * INITIAL_RANDOM (1000) * DT / LANDER_MASS
         # Use velocity_rand[0] and [1] to match CPU exactly
         var init_random_scale = Scalar[dtype](
             1000.0 * LLConstants.DT / LLConstants.LANDER_MASS
-        )  # = 4.0
+        )
         var init_vx: states.element_type = (
             velocity_rand[0] * Scalar[dtype](2.0) - Scalar[dtype](1.0)
         ) * init_random_scale
@@ -2058,91 +2088,9 @@ struct LunarLander[
             velocity_rand[1] * Scalar[dtype](2.0) - Scalar[dtype](1.0)
         ) * init_random_scale
 
-        var lander_off = LLConstants.BODIES_OFFSET
-        states[env, lander_off + IDX_X] = Scalar[dtype](LLConstants.HELIPAD_X)
-        states[env, lander_off + IDX_Y] = Scalar[dtype](LLConstants.H_UNITS)
-        states[env, lander_off + IDX_ANGLE] = Scalar[dtype](0)
-        states[env, lander_off + IDX_VX] = init_vx
-        states[env, lander_off + IDX_VY] = init_vy
-        states[env, lander_off + IDX_OMEGA] = Scalar[dtype](0)
-        states[env, lander_off + IDX_INV_MASS] = Scalar[dtype](
-            1.0 / LLConstants.LANDER_MASS
+        Self._init_bodies_single_env[BATCH_SIZE, STATE_SIZE](
+            states, env, rebind[Scalar[dtype]](init_vx), rebind[Scalar[dtype]](init_vy)
         )
-        states[env, lander_off + IDX_INV_INERTIA] = Scalar[dtype](
-            1.0 / LLConstants.LANDER_INERTIA
-        )
-        states[env, lander_off + IDX_SHAPE] = Scalar[dtype](0)
-
-        # Initialize legs
-        for leg in range(2):
-            var leg_off = (
-                LLConstants.BODIES_OFFSET + (leg + 1) * BODY_STATE_SIZE
-            )
-            var leg_offset_x = Scalar[dtype](
-                LLConstants.LEG_AWAY
-            ) if leg == 1 else Scalar[dtype](-LLConstants.LEG_AWAY)
-            states[env, leg_off + IDX_X] = (
-                Scalar[dtype](LLConstants.HELIPAD_X) + leg_offset_x
-            )
-
-            states[env, leg_off + IDX_Y] = Scalar[dtype](
-                LLConstants.H_UNITS
-                - 10.0 / LLConstants.SCALE
-                - LLConstants.LEG_DOWN
-            )
-            states[env, leg_off + IDX_ANGLE] = Scalar[dtype](0)
-            states[env, leg_off + IDX_VX] = init_vx
-            states[env, leg_off + IDX_VY] = init_vy
-            states[env, leg_off + IDX_OMEGA] = Scalar[dtype](0)
-            states[env, leg_off + IDX_INV_MASS] = Scalar[dtype](
-                1.0 / LLConstants.LEG_MASS
-            )
-            states[env, leg_off + IDX_INV_INERTIA] = Scalar[dtype](
-                1.0 / LLConstants.LEG_INERTIA
-            )
-            states[env, leg_off + IDX_SHAPE] = Scalar[dtype](leg + 1)
-
-        # Initialize joints
-        states[env, LLConstants.JOINT_COUNT_OFFSET] = Scalar[dtype](2)
-        for j in range(2):
-            var joint_off = LLConstants.JOINTS_OFFSET + j * JOINT_DATA_SIZE
-            var leg_offset_x: states.element_type = Scalar[dtype](
-                LLConstants.LEG_AWAY
-            ) if j == 1 else Scalar[dtype](-LLConstants.LEG_AWAY)
-            states[env, joint_off + JOINT_TYPE] = Scalar[dtype](JOINT_REVOLUTE)
-            states[env, joint_off + JOINT_BODY_A] = Scalar[dtype](0)
-            states[env, joint_off + JOINT_BODY_B] = Scalar[dtype](j + 1)
-            states[env, joint_off + JOINT_ANCHOR_AX] = leg_offset_x
-            states[env, joint_off + JOINT_ANCHOR_AY] = Scalar[dtype](
-                -10.0 / LLConstants.SCALE
-            )
-            states[env, joint_off + JOINT_ANCHOR_BX] = Scalar[dtype](0)
-            states[env, joint_off + JOINT_ANCHOR_BY] = Scalar[dtype](
-                LLConstants.LEG_H
-            )
-            states[env, joint_off + JOINT_REF_ANGLE] = Scalar[dtype](0)
-            states[env, joint_off + JOINT_LOWER_LIMIT] = Scalar[dtype](
-                -0.9
-            ) if j == 1 else Scalar[dtype](0.4)
-            states[env, joint_off + JOINT_UPPER_LIMIT] = Scalar[dtype](
-                -0.4
-            ) if j == 1 else Scalar[dtype](0.9)
-            states[env, joint_off + JOINT_STIFFNESS] = Scalar[dtype](
-                LLConstants.LEG_SPRING_STIFFNESS
-            )
-            states[env, joint_off + JOINT_DAMPING] = Scalar[dtype](
-                LLConstants.LEG_SPRING_DAMPING
-            )
-            states[env, joint_off + JOINT_FLAGS] = Scalar[dtype](
-                JOINT_FLAG_LIMIT_ENABLED | JOINT_FLAG_SPRING_ENABLED
-            )
-
-        # Clear forces
-        for body in range(LLConstants.NUM_BODIES):
-            var force_off = LLConstants.FORCES_OFFSET + body * 3
-            states[env, force_off + 0] = Scalar[dtype](0)
-            states[env, force_off + 1] = Scalar[dtype](0)
-            states[env, force_off + 2] = Scalar[dtype](0)
 
         # Initialize observation - use Scalar[dtype] to avoid Float64 issues
         var y_norm: states.element_type = Scalar[dtype](
@@ -2685,18 +2633,20 @@ struct LunarLander[
                 lander_contact = True
                 break
 
-        var both_legs = left_contact > Scalar[dtype](
-            0.5
-        ) and right_contact > Scalar[dtype](0.5)
-        var speed_val = sqrt(vx * vx + vy * vy)
-        var abs_omega = omega
-        if omega < Scalar[dtype](0.0):
-            abs_omega = -omega
+        # Landed = the Box2D island fell asleep (clock advanced by the solve).
+        var asleep = island_is_asleep(
+            rebind[Scalar[dtype]](
+                states[
+                    env,
+                    LLConstants.METADATA_OFFSET + LLConstants.META_SLEEP_TIME,
+                ]
+            )
+        )
 
         # Single-source terminal predicate + terminal reward overrides
         # (shared with the CPU _compute_step_result — see helpers.mojo).
         var tr = lunar_terminal_and_reward[dtype](
-            x_norm, lander_contact, both_legs, speed_val, abs_omega, reward
+            x_norm, lander_contact, asleep, reward
         )
         reward = tr[0]
         if tr[1]:
@@ -2812,10 +2762,6 @@ struct LunarLander[
         gravity_x: Scalar[dtype],
         gravity_y: Scalar[dtype],
         dt: Scalar[dtype],
-        friction: Scalar[dtype],
-        restitution: Scalar[dtype],
-        baumgarte: Scalar[dtype],
-        slop: Scalar[dtype],
     ) raises:
         """Fused physics + finalize + extract_obs kernel.
 
@@ -2909,10 +2855,6 @@ struct LunarLander[
             gravity_x: Scalar[dtype],
             gravity_y: Scalar[dtype],
             dt: Scalar[dtype],
-            friction: Scalar[dtype],
-            restitution: Scalar[dtype],
-            baumgarte: Scalar[dtype],
-            slop: Scalar[dtype],
         ):
             var env = Int(block_dim.x * block_idx.x + thread_idx.x)
             if env >= BATCH_SIZE:
@@ -2921,15 +2863,8 @@ struct LunarLander[
             var n_edges = Int(edge_counts[env])
             var n_joints = Int(joint_counts[env])
 
-            # Physics Step
-            SemiImplicitEuler.integrate_velocities_single_env[
-                BATCH_SIZE,
-                LLConstants.NUM_BODIES,
-                LLConstants.STATE_SIZE_VAL,
-                LLConstants.BODIES_OFFSET,
-                LLConstants.FORCES_OFFSET,
-            ](env, states, gravity_x, gravity_y, dt)
-
+            # Physics step: detection, then the shared Box2D island solve
+            # (the SAME `_solve_step_single_env` the CPU step runs).
             EdgeTerrainCollision.detect_single_env[
                 BATCH_SIZE,
                 LLConstants.NUM_BODIES,
@@ -2942,49 +2877,18 @@ struct LunarLander[
             ](env, states, shapes, n_edges, contacts, contact_counts)
 
             var n_contacts = Int(contact_counts[env])
-
-            for _ in range(LLConstants.VELOCITY_ITERATIONS):
-                ImpulseSolver.solve_velocity_single_env[
-                    BATCH_SIZE,
-                    LLConstants.NUM_BODIES,
-                    LLConstants.MAX_CONTACTS,
-                    LLConstants.STATE_SIZE_VAL,
-                    LLConstants.BODIES_OFFSET,
-                ](env, states, contacts, n_contacts, friction, restitution)
-
-                RevoluteJointSolver.solve_velocity_single_env[
-                    BATCH_SIZE,
-                    LLConstants.NUM_BODIES,
-                    LLConstants.MAX_JOINTS,
-                    LLConstants.STATE_SIZE_VAL,
-                    LLConstants.BODIES_OFFSET,
-                    LLConstants.JOINTS_OFFSET,
-                ](env, states, n_joints, dt)
-
-            SemiImplicitEuler.integrate_positions_single_env[
-                BATCH_SIZE,
-                LLConstants.NUM_BODIES,
-                LLConstants.STATE_SIZE_VAL,
-                LLConstants.BODIES_OFFSET,
-            ](env, states, dt)
-
-            for _ in range(LLConstants.POSITION_ITERATIONS):
-                ImpulseSolver.solve_position_single_env[
-                    BATCH_SIZE,
-                    LLConstants.NUM_BODIES,
-                    LLConstants.MAX_CONTACTS,
-                    LLConstants.STATE_SIZE_VAL,
-                    LLConstants.BODIES_OFFSET,
-                ](env, states, contacts, n_contacts, baumgarte, slop)
-
-                RevoluteJointSolver.solve_position_single_env[
-                    BATCH_SIZE,
-                    LLConstants.NUM_BODIES,
-                    LLConstants.MAX_JOINTS,
-                    LLConstants.STATE_SIZE_VAL,
-                    LLConstants.BODIES_OFFSET,
-                    LLConstants.JOINTS_OFFSET,
-                ](env, states, n_joints, baumgarte, slop)
+            Self.SelfType._solve_step_single_env[
+                BATCH_SIZE, LLConstants.STATE_SIZE_VAL
+            ](
+                env,
+                states,
+                contacts,
+                n_contacts,
+                n_joints,
+                gravity_x,
+                gravity_y,
+                dt,
+            )
 
             # Finalize (writes obs to states at OBS_OFFSET)
             Self.SelfType._finalize_single_env[BATCH_SIZE](
@@ -3017,10 +2921,6 @@ struct LunarLander[
             gravity_x,
             gravity_y,
             dt,
-            friction,
-            restitution,
-            baumgarte,
-            slop,
             grid_dim=(BLOCKS,),
             block_dim=(TPB,),
         )
@@ -3293,10 +3193,6 @@ struct LunarLander[
         gravity_x: Scalar[dtype],
         gravity_y: Scalar[dtype],
         dt: Scalar[dtype],
-        friction: Scalar[dtype],
-        restitution: Scalar[dtype],
-        baumgarte: Scalar[dtype],
-        slop: Scalar[dtype],
     ) raises:
         """Fused physics + finalize + extract_obs for continuous actions."""
         var states = LayoutTensor[
@@ -3386,10 +3282,6 @@ struct LunarLander[
             gravity_x: Scalar[dtype],
             gravity_y: Scalar[dtype],
             dt: Scalar[dtype],
-            friction: Scalar[dtype],
-            restitution: Scalar[dtype],
-            baumgarte: Scalar[dtype],
-            slop: Scalar[dtype],
         ):
             var env = Int(block_dim.x * block_idx.x + thread_idx.x)
             if env >= BATCH_SIZE:
@@ -3398,15 +3290,8 @@ struct LunarLander[
             var n_edges = Int(edge_counts[env])
             var n_joints = Int(joint_counts[env])
 
-            # Physics Step (same as discrete version)
-            SemiImplicitEuler.integrate_velocities_single_env[
-                BATCH_SIZE,
-                LLConstants.NUM_BODIES,
-                LLConstants.STATE_SIZE_VAL,
-                LLConstants.BODIES_OFFSET,
-                LLConstants.FORCES_OFFSET,
-            ](env, states, gravity_x, gravity_y, dt)
-
+            # Physics step (same as the discrete kernel): detection, then the
+            # shared Box2D island solve.
             EdgeTerrainCollision.detect_single_env[
                 BATCH_SIZE,
                 LLConstants.NUM_BODIES,
@@ -3419,49 +3304,18 @@ struct LunarLander[
             ](env, states, shapes, n_edges, contacts, contact_counts)
 
             var n_contacts = Int(contact_counts[env])
-
-            for _ in range(LLConstants.VELOCITY_ITERATIONS):
-                ImpulseSolver.solve_velocity_single_env[
-                    BATCH_SIZE,
-                    LLConstants.NUM_BODIES,
-                    LLConstants.MAX_CONTACTS,
-                    LLConstants.STATE_SIZE_VAL,
-                    LLConstants.BODIES_OFFSET,
-                ](env, states, contacts, n_contacts, friction, restitution)
-
-                RevoluteJointSolver.solve_velocity_single_env[
-                    BATCH_SIZE,
-                    LLConstants.NUM_BODIES,
-                    LLConstants.MAX_JOINTS,
-                    LLConstants.STATE_SIZE_VAL,
-                    LLConstants.BODIES_OFFSET,
-                    LLConstants.JOINTS_OFFSET,
-                ](env, states, n_joints, dt)
-
-            SemiImplicitEuler.integrate_positions_single_env[
-                BATCH_SIZE,
-                LLConstants.NUM_BODIES,
-                LLConstants.STATE_SIZE_VAL,
-                LLConstants.BODIES_OFFSET,
-            ](env, states, dt)
-
-            for _ in range(LLConstants.POSITION_ITERATIONS):
-                ImpulseSolver.solve_position_single_env[
-                    BATCH_SIZE,
-                    LLConstants.NUM_BODIES,
-                    LLConstants.MAX_CONTACTS,
-                    LLConstants.STATE_SIZE_VAL,
-                    LLConstants.BODIES_OFFSET,
-                ](env, states, contacts, n_contacts, baumgarte, slop)
-
-                RevoluteJointSolver.solve_position_single_env[
-                    BATCH_SIZE,
-                    LLConstants.NUM_BODIES,
-                    LLConstants.MAX_JOINTS,
-                    LLConstants.STATE_SIZE_VAL,
-                    LLConstants.BODIES_OFFSET,
-                    LLConstants.JOINTS_OFFSET,
-                ](env, states, n_joints, baumgarte, slop)
+            Self.SelfType._solve_step_single_env[
+                BATCH_SIZE, LLConstants.STATE_SIZE_VAL
+            ](
+                env,
+                states,
+                contacts,
+                n_contacts,
+                n_joints,
+                gravity_x,
+                gravity_y,
+                dt,
+            )
 
             # Finalize with continuous action fuel costs
             Self.SelfType._finalize_single_env_continuous[
@@ -3496,10 +3350,6 @@ struct LunarLander[
             gravity_x,
             gravity_y,
             dt,
-            friction,
-            restitution,
-            baumgarte,
-            slop,
             grid_dim=(BLOCKS,),
             block_dim=(TPB,),
         )
@@ -3717,18 +3567,20 @@ struct LunarLander[
                 lander_contact = True
                 break
 
-        var both_legs = left_contact > Scalar[dtype](
-            0.5
-        ) and right_contact > Scalar[dtype](0.5)
-        var speed_val = sqrt(vx * vx + vy * vy)
-        var abs_omega = omega
-        if omega < Scalar[dtype](0.0):
-            abs_omega = -omega
+        # Landed = the Box2D island fell asleep (clock advanced by the solve).
+        var asleep = island_is_asleep(
+            rebind[Scalar[dtype]](
+                states[
+                    env,
+                    LLConstants.METADATA_OFFSET + LLConstants.META_SLEEP_TIME,
+                ]
+            )
+        )
 
         # Single-source terminal predicate + terminal reward overrides
         # (shared with the CPU _compute_step_result — see helpers.mojo).
         var tr = lunar_terminal_and_reward[dtype](
-            x_norm, lander_contact, both_legs, speed_val, abs_omega, reward
+            x_norm, lander_contact, asleep, reward
         )
         reward = tr[0]
         if tr[1]:

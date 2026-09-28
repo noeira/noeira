@@ -92,8 +92,8 @@ def test_c51_gpu() raises:
         # is > 0; mean_q over CartPole returns is non-zero.
         var dm = trainer.flush_metrics()
         var dq = dm.mean_q.to_f64()
-        var dent = dm.dist_entropy.to_f64()
-        var drew = dm.mean_reward.to_f64()
+        var dent = dm.dist_entropy_mean.to_f64()
+        var drew = dm.reward_mean.to_f64()
         print("  mean_q=", dq, " dist_entropy=", dent, " mean_reward=", drew)
         assert_true(not isnan(dq) and not isinf(dq), "C51 GPU mean_q non-finite")
         assert_true(

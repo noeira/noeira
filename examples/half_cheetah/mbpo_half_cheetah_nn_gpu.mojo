@@ -44,8 +44,9 @@ from std.random import seed
 from std.time import perf_counter_ns
 from max.gpu.host import DeviceContext
 
-from noeira.core.dotenv import load_dotenv
-from noeira.core.logger import RemoteLogger
+from noeira.core.run import RunContext, register_run
+from noeira.core.run_session import RunLogger, finish_run, run_logger
+from noeira.io.artifact_sink import sink_for_run
 from noeira.nn.constants import DT
 from noeira.nn.combinators.sequential import Sequential
 from noeira.nn.primitives.linear import Linear
@@ -103,8 +104,6 @@ comptime NUM_STEPS = 300_000  # MBPO needs ~10× fewer real steps than SAC
 comptime PRINT_EVERY = 10_000
 comptime DIAG_EVERY = 5_000
 comptime CHECKPOINT_EVERY = 50_000
-
-comptime CHECKPOINT_PATH = "mbpo_half_cheetah_nn_gpu.ckpt"
 
 # ─── A/B: entropy-temperature (alpha) ablation ───────────────────────────────
 # The nn-MBPO vs legacy overlay showed nn's auto-tuned alpha equilibrates
@@ -178,17 +177,16 @@ def main() raises:
     print("=" * 70)
 
     with DeviceContext() as ctx:
-        # ─── Logger (remote) ─────────────────────────────────────────────
-        var env_vars = load_dotenv()
-        var api_key = env_vars.get("NOEIRA_CLOUD_API_KEY", "")
-        var url = env_vars.get("NOEIRA_CLOUD_URL", "")
-
-        var logger = RemoteLogger(
-            server_url=url,
-            run_name=RUN_NAME,
-            buffer_size=64,
-            api_key=api_key,
+        # ─── Run + logger ───────────────────────────────────────────────────
+        var run = RunContext(
+            project=String("mujoco"),
+            driver=String("examples/half_cheetah/mbpo_half_cheetah_nn_gpu.mojo"),
+            slug=String("mbpo-half-cheetah-gpu"),
+            env=String("builtin:mujoco/half_cheetah"),
         )
+        var checkpoint_path = run.checkpoint_path(String("last"))
+        print("  Run                =", run.dir)
+        var logger = run_logger(run, buffer_size=64)
         logger.set_config("algorithm", "MBPO")
         logger.set_config("env", "HalfCheetah")
         logger.set_config("target", "gpu")
@@ -199,6 +197,8 @@ def main() raises:
         logger.set_config("batch", String(BATCH))
         logger.set_config("ensemble", String(N_ENSEMBLE))
         logger.set_config("real_ratio_pct", String(REAL_RATIO_PCT))
+        register_run(run, logger)
+        var artifacts = sink_for_run(run.id, run.dir)
 
         var logger_ptr = Pointer(to=logger).as_unsafe_any_origin()
 
@@ -263,7 +263,7 @@ def main() raises:
         var t_start = perf_counter_ns()
         _ = agent.train_single[
             HalfCheetah[DT, TERMINATE_ON_UNHEALTHY=False],
-            L=RemoteLogger,
+            L=RunLogger,
         ](
             env,
             NUM_STEPS,
@@ -271,11 +271,17 @@ def main() raises:
             verbose=True,
             logger=logger_ptr,
             diag_every=DIAG_EVERY,
-            checkpoint_path=CHECKPOINT_PATH,
+            checkpoint_path=checkpoint_path,
             checkpoint_every=CHECKPOINT_EVERY,
+            artifacts=artifacts,
+            run_dir=run.dir,
         )
         var elapsed_s = Float64(perf_counter_ns() - t_start) / 1e9
-        logger.close()
+        var sent = logger.b.total_logged()
+        finish_run(
+            run, logger, artifacts,
+            String("mean_return_100=") + String(agent.mean_return()),
+        )
         _ = logger  # lifetime extender for logger_ptr
 
         # ─── Summary ─────────────────────────────────────────────────────
@@ -285,7 +291,8 @@ def main() raises:
         print("  elapsed                =", elapsed_s, "s")
         print("  mean ep return (last 100) =", agent.mean_return())
         print("  episodes completed     =", agent.ep_count())
-        print("  remote points sent     =", logger.total_logged())
+        print("  remote points sent     =", sent)
+        print("  run record             =", run.kv_path())
         print("=" * 70)
 
         var final_avg = Float64(agent.mean_return())

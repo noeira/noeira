@@ -53,7 +53,9 @@ from noeira.nn.core.call import call_forward
 from noeira.nn.core.initializer import Xavier
 from noeira.nn.optimizer.adam import Adam
 from noeira.nn.core.checkpoint import (
-    CheckpointWriter, CheckpointReader, _split_lines,
+    BinaryCheckpointWriter, BinaryCheckpointReader, CheckpointReader,
+    CheckpointScalars, write_model, read_model, _split_lines, _is_v3_header,
+    _read_file_bytes, _write_file_bytes,
 )
 from noeira.nn.random.box_muller import box_muller_normal, box_muller_normal_gpu
 
@@ -631,11 +633,11 @@ struct DDPGTrainer[
             mtgt = self._mean_target_accum * inv
             mr = self._mean_reward_accum * inv
         var bundle = DDPGMetrics(
-            actor_loss=LogScalar[DT](actor_val),
+            policy_loss=LogScalar[DT](actor_val),
             critic_loss=LogScalar[DT](critic_val),
             mean_q=LogScalar[DT](mq),
             mean_target=LogScalar[DT](mtgt),
-            mean_reward=LogScalar[DT](mr),
+            reward_mean=LogScalar[DT](mr),
             train_steps=LogScalar[DT](Scalar[DT](self._total_train_steps)),
             n_updates=LogScalar[DT](Scalar[DT](self._update_count)),
         )
@@ -684,52 +686,56 @@ struct DDPGTrainer[
         self._update_count = 0
         return out
 
-    # ─── Checkpoint (ONE file: actor + critic in a v2 envelope) ─────────
+    # ─── Checkpoint (ONE v3 file: actor + critic + train-step counter) ──
     def save_state(mut self, path: String) raises:
-        """Write the ONLINE actor + critic into a SINGLE `storage-ckpt`
-        file, sections name-prefixed `actor.` / `critic.`. Optimizer moments
-        NOT persisted (resume re-warms)."""
-        var w = CheckpointWriter(save_moments=False)
-        w.mode = 0
-        walk_params[Self.train_target](self.actor_pair.online, w, self.ctx, "actor"
-        )
-        walk_params[Self.train_target](self.critic_pair.online, w, self.ctx, "critic"
-        )
-        w.mode = 1
-        self.actor_pair.online.for_each_state[Self.train_target](
-            w, self.ctx, "actor"
-        )
-        self.critic_pair.online.for_each_state[Self.train_target](
-            w, self.ctx, "critic"
-        )
-        with open(path, "w") as f:
-            f.write(w.content)
+        """Write the ONLINE actor + critic into a SINGLE v3 `storage-ckpt`
+        file, sections name-prefixed `actor.` / `critic.`, the train-step
+        counter as a `K` scalar. Atomic and chunked. Optimizer moments NOT
+        persisted (resume re-warms)."""
+        var w = BinaryCheckpointWriter(save_moments=False)
+        write_model[Self.train_target](w, self.actor_pair.online, self.ctx, "actor")
+        write_model[Self.train_target](w, self.critic_pair.online, self.ctx, "critic")
+        var sc = CheckpointScalars()
+        sc.set_int("total_train_steps", self._total_train_steps)
+        w.write_scalars(sc)
+        _write_file_bytes(path, w.content)
 
     def load_state(mut self, path: String) raises:
-        """Restore the online actor + critic from the single envelope (same
-        walk order as `save_state`), then hard-copy online → target."""
-        var content: String
-        with open(path, "r") as f:
-            content = String(f.read())
-        var lines = _split_lines(content)
-        var body = List[String]()
-        for li in range(len(lines)):
-            if lines[li].startswith("storage-ckpt"):
-                continue
-            body.append(lines[li])
-        var r = CheckpointReader(body^)
-        r.mode = 0
-        walk_params[Self.train_target](self.actor_pair.online, r, self.ctx, "actor"
-        )
-        walk_params[Self.train_target](self.critic_pair.online, r, self.ctx, "critic"
-        )
-        r.mode = 1
-        self.actor_pair.online.for_each_state[Self.train_target](
-            r, self.ctx, "actor"
-        )
-        self.critic_pair.online.for_each_state[Self.train_target](
-            r, self.ctx, "critic"
-        )
+        """Restore the online actor + critic (v3, or the legacy v2 text this
+        trainer wrote before), then hard-copy online → target."""
+        var bytes = _read_file_bytes(path)
+        if _is_v3_header(bytes):
+            var rb = BinaryCheckpointReader(bytes^)
+            read_model[Self.train_target](rb, self.actor_pair.online, self.ctx, "actor")
+            read_model[Self.train_target](rb, self.critic_pair.online, self.ctx, "critic")
+            var sc = rb.read_scalars()
+            rb.finish()
+            self._total_train_steps = sc.get_int(
+                "total_train_steps", self._total_train_steps
+            )
+        else:
+            var content: String
+            with open(path, "r") as f:
+                content = String(f.read())
+            var lines = _split_lines(content)
+            var body = List[String]()
+            for li in range(len(lines)):
+                if lines[li].startswith("storage-ckpt"):
+                    continue
+                body.append(lines[li])
+            var r = CheckpointReader(body^)
+            r.mode = 0
+            walk_params[Self.train_target](self.actor_pair.online, r, self.ctx, "actor"
+            )
+            walk_params[Self.train_target](self.critic_pair.online, r, self.ctx, "critic"
+            )
+            r.mode = 1
+            self.actor_pair.online.for_each_state[Self.train_target](
+                r, self.ctx, "actor"
+            )
+            self.critic_pair.online.for_each_state[Self.train_target](
+                r, self.ctx, "critic"
+            )
         self.actor_pair.target_net.polyak_from[Self.train_target](
             self.actor_pair.online, Scalar[DT](1.0), self.ctx
         )

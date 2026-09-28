@@ -37,6 +37,8 @@ from std.memory import alloc, dealloc
 from std.random import random_float64
 from max.gpu.host import DeviceContext
 
+from noeira.io.artifact_sink import ArtifactSink
+from noeira.deep_agents.training.checkpoint import announce_checkpoint
 from noeira.core.env_traits import BoxDiscreteActionEnv, BoxContinuousActionEnv
 from noeira.core.logger import Logger, NoOpLogger
 from noeira.nn.constants import DT
@@ -181,7 +183,7 @@ struct DreamerV3Agent[
         self.trainer.record_terminal(obs)
 
     def save(mut self, path: String) raises:
-        """Write the full world model + actor-critic to one `nn-ckpt v2` file."""
+        """Write the full world model + actor-critic to one v3 `storage-ckpt` file."""
         self.trainer.save_state(path)
 
     def load(mut self, path: String) raises:
@@ -244,6 +246,8 @@ struct DreamerV3Agent[
         verbose: Bool = True,
         logger: Optional[Pointer[L, MutAnyOrigin]] = None,
         checkpoint_path: String = String(""),
+        artifacts: Optional[ArtifactSink] = None,
+        run_dir: String = String(""),
         checkpoint_every: Int = 0,
     ) raises -> Scalar[DT]:
         """Own the whole DreamerV3 single-env training loop for a DISCRETE env
@@ -403,16 +407,16 @@ struct DreamerV3Agent[
                         # imagination-health scalars (already computed, now
                         # surfaced): value spread + return spread + con floor.
                         lg[].log_scalar(
-                            "imag_val_mean", Float64(self.trainer.dbg_val_mean()), step
+                            "imagined_value_mean", Float64(self.trainer.dbg_val_mean()), step
                         )
                         lg[].log_scalar(
-                            "imag_val_std", Float64(self.trainer.dbg_val_std()), step
+                            "imagined_value_std", Float64(self.trainer.dbg_val_std()), step
                         )
                         lg[].log_scalar(
-                            "imag_ret_std", Float64(self.trainer.dbg_ret_std()), step
+                            "imagined_return_std", Float64(self.trainer.dbg_ret_std()), step
                         )
                         lg[].log_scalar(
-                            "imag_con_min", Float64(self.trainer.dbg_con_min()), step
+                            "imagined_continue_min", Float64(self.trainer.dbg_con_min()), step
                         )
                         lg[].log_scalar(
                             "train_steps", Float64(self.train_steps_done()), step
@@ -443,7 +447,7 @@ struct DreamerV3Agent[
                         lg[].log_scalar("avg_reward", Float64(avg_ret), step)
                         lg[].log_scalar("episode_reward", Float64(last_ep), step)
                         lg[].log_scalar("best_reward", Float64(best_ret), step)
-                        lg[].log_scalar("eval/mean_return", Float64(ev), step)
+                        lg[].log_scalar("eval_return", Float64(ev), step)
                         lg[].flush()
                 ep_acc = Scalar[DT](0.0)
                 ep_n = 0
@@ -451,11 +455,13 @@ struct DreamerV3Agent[
                     step % checkpoint_every == 0
                 ):
                     self.save(checkpoint_path)
+                    announce_checkpoint(checkpoint_path, artifacts, run_dir)
                 obs = env.reset_obs_list()
                 self.reset_belief()
 
         if checkpoint_path.byte_length() > 0:
             self.save(checkpoint_path)
+            announce_checkpoint(checkpoint_path, artifacts, run_dir)
         var final_ev = self._greedy_eval[E](
             env, eval_episodes, ep_len, obsbuf, actbuf
         )
@@ -539,6 +545,8 @@ struct DreamerV3Agent[
         verbose: Bool = True,
         logger: Optional[Pointer[L, MutAnyOrigin]] = None,
         checkpoint_path: String = String(""),
+        artifacts: Optional[ArtifactSink] = None,
+        run_dir: String = String(""),
         checkpoint_every: Int = 0,
         frame_repeat: Int = 1,
     ) raises -> Scalar[DT]:
@@ -690,7 +698,7 @@ struct DreamerV3Agent[
                         lg[].log_scalar("avg_reward", Float64(avg_ret), step)
                         lg[].log_scalar("episode_reward", Float64(last_ep), step)
                         lg[].log_scalar("best_reward", Float64(best_ret), step)
-                        lg[].log_scalar("eval/mean_return", Float64(ev), step)
+                        lg[].log_scalar("eval_return", Float64(ev), step)
                         lg[].flush()
                 ep_acc = Scalar[DT](0.0)
                 ep_n = 0
@@ -698,11 +706,13 @@ struct DreamerV3Agent[
                     step % checkpoint_every == 0
                 ):
                     self.save(checkpoint_path)
+                    announce_checkpoint(checkpoint_path, artifacts, run_dir)
                 obs = self._reset_obs_dt[E](env)
                 self.reset_belief()
 
         if checkpoint_path.byte_length() > 0:
             self.save(checkpoint_path)
+            announce_checkpoint(checkpoint_path, artifacts, run_dir)
         var final_ev = self._greedy_eval_cont[E](
             env, eval_episodes, ep_len, obsbuf, actbuf, frame_repeat
         )
@@ -874,11 +884,11 @@ struct DreamerV3Agent[
                             lg[].log_scalar("avg_reward", Float64(avg), step)
                             lg[].log_scalar("episode_reward", Float64(last_ep), step)
                             lg[].log_scalar(
-                                "loss/world_model",
+                                "wm_loss",
                                 Float64(self.last_wm_loss()), step,
                             )
                             lg[].log_scalar(
-                                "loss/actor_critic",
+                                "ac_loss",
                                 Float64(self.last_ac_loss()), step,
                             )
 

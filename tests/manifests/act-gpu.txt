@@ -33,6 +33,10 @@ tests/nn/test_batch_norm_2d_frozen_gpu.mojo
 # The device sampler: same rows in, same tensors out as the host path. Needs a
 # store; skip it (or set ACT_STORE) if you have not converted one.
 tests/deep_agents/act/test_act_dataset_gpu.mojo
+# Image augmentation (DR plan Phase 1): off == the original gather bit-exact,
+# the augmented kernel == the host twin to one byte, validation never
+# augmented. Needs a store, like the entry above.
+tests/deep_agents/act/test_act_augment_gpu.mojo
 # Device-resident logging: the window `train_metrics`/`val_metrics` drain must
 # equal what `_read_terms`/`read_clip_norm` download off the same forward.
 # Self-contained (stub backbone, synthetic batch) — no store, no fixture.

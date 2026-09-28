@@ -7,7 +7,7 @@ This integrator follows Box2D's integration order:
 This order is crucial for energy conservation in constrained systems.
 """
 
-from std.math import cos, sin, pi
+from std.math import cos, sin, pi, sqrt
 from layout import LayoutTensor, Layout
 from max.gpu import thread_idx, block_idx, block_dim
 from max.gpu.host import DeviceContext, DeviceBuffer
@@ -27,37 +27,10 @@ from ..constants import (
     IDX_TAU,
     IDX_INV_MASS,
     IDX_INV_INERTIA,
-    PI,
-    TWO_PI,
+    B2_MAX_TRANSLATION,
+    B2_MAX_ROTATION,
 )
 from ..traits.integrator import Integrator
-
-
-@always_inline
-def normalize_angle_inplace(
-    mut angle: Scalar[dtype],
-    pi_val: Scalar[dtype],
-    two_pi_val: Scalar[dtype],
-    zero: Scalar[dtype],
-    extreme: Scalar[dtype],
-):
-    """Normalize angle to [-pi, pi] range in place."""
-    # Handle extreme values
-    var neg_extreme = Scalar[dtype](0) - extreme
-    if angle > extreme or angle < neg_extreme:
-        angle = zero
-        return
-
-    var neg_pi_val = Scalar[dtype](0) - pi_val
-    # Normalize (bounded iterations for GPU safety)
-    if angle > pi_val:
-        angle = angle - two_pi_val
-    if angle > pi_val:
-        angle = angle - two_pi_val
-    if angle < neg_pi_val:
-        angle = angle + two_pi_val
-    if angle < neg_pi_val:
-        angle = angle + two_pi_val
 
 
 struct SemiImplicitEuler(Integrator):
@@ -139,48 +112,18 @@ struct SemiImplicitEuler(Integrator):
         ],
         dt: Scalar[dtype],
     ):
-        """Integrate positions: x' = x + v' * dt (using NEW velocity)."""
+        """Integrate positions: x' = x + v' * dt (using NEW velocity). The
+        bodies layout is the flat state layout with BODIES_OFFSET = 0, so
+        this routes to `integrate_positions_single_env` (ONE rule)."""
+        var state = LayoutTensor[
+            dtype,
+            Layout.row_major(BATCH, NUM_BODIES * BODY_STATE_SIZE),
+            MutAnyOrigin,
+        ](bodies.ptr)
         for env in range(BATCH):
-            for body in range(NUM_BODIES):
-                var inv_mass = bodies[env, body, IDX_INV_MASS]
-
-                # Skip static bodies
-                if inv_mass == Scalar[dtype](0):
-                    continue
-
-                # Read positions and NEW velocities (after integrate_velocities)
-                var x = bodies[env, body, IDX_X]
-                var y = bodies[env, body, IDX_Y]
-                var angle = bodies[env, body, IDX_ANGLE]
-                var vx = bodies[env, body, IDX_VX]
-                var vy = bodies[env, body, IDX_VY]
-                var omega = bodies[env, body, IDX_OMEGA]
-
-                # Integrate positions
-                x = x + vx * dt
-                y = y + vy * dt
-                angle = angle + omega * dt
-
-                # Normalize angle to [-pi, pi]
-                var pi_val = Scalar[dtype](PI)
-                var two_pi_val = Scalar[dtype](TWO_PI)
-                var zero = Scalar[dtype](0.0)
-                var extreme = Scalar[dtype](100.0)
-                if angle > extreme or angle < -extreme:
-                    angle = zero
-                elif angle > pi_val:
-                    angle = angle - two_pi_val
-                    if angle > pi_val:
-                        angle = angle - two_pi_val
-                elif angle < -pi_val:
-                    angle = angle + two_pi_val
-                    if angle < -pi_val:
-                        angle = angle + two_pi_val
-
-                # Write back
-                bodies[env, body, IDX_X] = x
-                bodies[env, body, IDX_Y] = y
-                bodies[env, body, IDX_ANGLE] = angle
+            Self.integrate_positions_single_env[
+                BATCH, NUM_BODIES, NUM_BODIES * BODY_STATE_SIZE, 0
+            ](env, state, dt)
 
     # =========================================================================
     # Strided GPU Kernels for 2D State Layout
@@ -286,27 +229,28 @@ struct SemiImplicitEuler(Integrator):
             var vy = state[env, body_off + IDX_VY]
             var omega = state[env, body_off + IDX_OMEGA]
 
-            x = x + vx * dt
-            y = y + vy * dt
-            angle = angle + omega * dt
+            # b2Island::Solve: cap the per-step translation / rotation by
+            # scaling the velocity itself. Angles are NOT wrapped (Box2D
+            # never does; a wrapped angle breaks joint angles aB - aA).
+            var tx = vx * dt
+            var ty = vy * dt
+            var t2 = tx * tx + ty * ty
+            var max_t = Scalar[dtype](B2_MAX_TRANSLATION)
+            if t2 > max_t * max_t:
+                var ratio = max_t / sqrt(t2)
+                vx = vx * ratio
+                vy = vy * ratio
+            var rot = omega * dt
+            var max_r = Scalar[dtype](B2_MAX_ROTATION)
+            if rot * rot > max_r * max_r:
+                omega = omega * (max_r / abs(rot))
+            state[env, body_off + IDX_VX] = vx
+            state[env, body_off + IDX_VY] = vy
+            state[env, body_off + IDX_OMEGA] = omega
 
-            # Normalize angle
-            var pi_val = Scalar[dtype](PI)
-            var two_pi_val = Scalar[dtype](TWO_PI)
-            if angle > Scalar[dtype](100.0) or angle < Scalar[dtype](-100.0):
-                angle = Scalar[dtype](0.0)
-            if angle > pi_val:
-                angle = angle - two_pi_val
-            if angle > pi_val:
-                angle = angle - two_pi_val
-            if angle < -pi_val:
-                angle = angle + two_pi_val
-            if angle < -pi_val:
-                angle = angle + two_pi_val
-
-            state[env, body_off + IDX_X] = x
-            state[env, body_off + IDX_Y] = y
-            state[env, body_off + IDX_ANGLE] = angle
+            state[env, body_off + IDX_X] = x + vx * dt
+            state[env, body_off + IDX_Y] = y + vy * dt
+            state[env, body_off + IDX_ANGLE] = angle + omega * dt
 
     @always_inline
     @staticmethod

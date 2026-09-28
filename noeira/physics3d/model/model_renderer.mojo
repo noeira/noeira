@@ -162,6 +162,15 @@ struct ModelRenderer[MODEL_DEF: ModelDefLike](EnvRenderer3D, Movable):
 
     var show_sites: Bool
 
+    var track_prev: Vec3
+    """Torso position the trackcom camera was last moved to, or unset.
+
+    A trackcom camera follows the body by translating eye AND target by the
+    torso's displacement since the previous frame — see the trackcom branch of
+    `render` for why re-anchoring the target on the torso was wrong."""
+
+    var track_prev_set: Bool
+
     var free_cam_reframe: Bool
     """One-shot: reposition the free camera to a 3/4 view on the next frame.
 
@@ -342,6 +351,8 @@ struct ModelRenderer[MODEL_DEF: ModelDefLike](EnvRenderer3D, Movable):
         self.show_sites = show_sites
         self.show_hud = True
         self.free_cam_reframe = False
+        self.track_prev = Vec3(0.0, 0.0, 0.0)
+        self.track_prev_set = False
         self.pip_cameras = List[Int]()
         self.hud_extra = List[String]()
         self.ui_rects = List[UIRect]()
@@ -434,6 +445,8 @@ struct ModelRenderer[MODEL_DEF: ModelDefLike](EnvRenderer3D, Movable):
         self.show_sites = move.show_sites
         self.show_hud = move.show_hud
         self.free_cam_reframe = move.free_cam_reframe
+        self.track_prev = move.track_prev
+        self.track_prev_set = move.track_prev_set
         self.pip_cameras = move.pip_cameras^
         self.hud_extra = move.hud_extra^
         self.ui_rects = move.ui_rects^
@@ -585,6 +598,7 @@ struct ModelRenderer[MODEL_DEF: ModelDefLike](EnvRenderer3D, Movable):
             self.renderer.camera.fov = new_cam.fov
             self.renderer.camera.near = new_cam.near
             self.renderer.camera.far = new_cam.far
+            self.track_prev_set = False
 
         var torso_pos = positions[1]  # Body 1 = torso (body 0 = worldbody)
 
@@ -685,11 +699,51 @@ struct ModelRenderer[MODEL_DEF: ModelDefLike](EnvRenderer3D, Movable):
             # does: the targetbody case overwrites the orientation and leaves
             # `cam_xpos` from the local2Global default standing.
         if self.follow and cam_mode == 0:  # CAM_TRACKCOM
-            # Preserve the current eye-to-target offset so mouse orbit is respected.
-            # Each frame we only translate both eye and target to follow the torso.
-            var offset = self.renderer.camera.eye - self.renderer.camera.target
-            self.renderer.camera.target = Vec3(torso_pos.x, 0.0, torso_pos.z)
-            self.renderer.camera.eye = self.renderer.camera.target + offset
+            # MuJoCo's trackcom keeps the camera's declared offset from the
+            # body and its declared orientation: the camera TRANSLATES with the
+            # body. So both eye and target move by the torso's displacement
+            # since the last frame, which also leaves a mouse orbit standing.
+            #
+            # ⚠ THIS USED TO RE-ANCHOR THE TARGET ON THE TORSO and keep the
+            # eye-to-target offset. `setup_cameras` puts a model camera's target
+            # ONE UNIT in front of its eye (only the direction is known), so
+            # every trackcom camera ended up 1 m from the torso whatever its
+            # declared distance: humanoid's 3 m `side` and quadruped's 4 m `y`
+            # became close-ups, fish's 0.3 m `tracking_y` a distant speck.
+            #
+            # On the first frame after a switch the camera is PLACED: a camera
+            # declared inside a body (walker, cheetah, humanoid, dog all put
+            # theirs in the torso) has a body-local pose, and MuJoCo's
+            # `cam_pos0` is that pose taken into the world. `setup_cameras`
+            # read it as a world pose, which put cheetah's `side` camera at
+            # floor height.
+            #
+            # ⚠ ONLY THE BODY'S POSITION IS APPLIED, NOT ITS ORIENTATION.
+            # `cam_pos0` / `cam_mat0` are taken at qpos0, and dm_control's
+            # resets randomise the torso's orientation (walker, humanoid,
+            # quadruped, dog): composing with this frame's body quaternion
+            # rolled the whole view. At qpos0 these torsos are unrotated, so
+            # the declared local pose read as an offset from the body's current
+            # position is MuJoCo's placement. A torso declared rotated would
+            # need its qpos0 quaternion here, which the renderer does not have.
+            var ac = self.active_camera
+            if self.track_prev_set:
+                var delta = torso_pos - self.track_prev
+                self.renderer.camera.target = self.renderer.camera.target + delta
+                self.renderer.camera.eye = self.renderer.camera.eye + delta
+            elif (
+                ac < len(self.camera_bodies)
+                and self.camera_bodies[ac] > 0
+                and self.camera_bodies[ac] < len(positions)
+            ):
+                var cb = self.camera_bodies[ac]
+                var eye = positions[cb] + self.camera_local_pos[ac]
+                var q = self.camera_local_quat[ac]
+                self.renderer.camera.eye = eye
+                self.renderer.camera.target = eye + camera_look_dir(q)
+                self.renderer.camera.up = camera_up_dir(q)
+            self.track_prev = torso_pos
+            self.track_prev_set = True
         elif cam_mode == 2:  # CAM_TARGETBODY
             # MuJoCo `mj_camlight`, mjCAMLIGHT_TARGETBODY: the camera does NOT
             # move — it TURNS to face the body every frame. That is the whole

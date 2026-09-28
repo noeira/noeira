@@ -146,11 +146,17 @@ struct PPODiscreteAgent[
         run_dir: String = "",
         checkpoint_every: Int = 0,
         base_step: Int = 0,
+        stop_at_mean_return: Optional[Scalar[DT]] = None,
+        stop_min_episodes: Int = 0,
     ) raises -> List[Scalar[DT]]:
         """N_ENVS-wide discrete on-policy training via
         `run_onpolicy_discrete_train_batched`. Covers same-target
         `(env=cpu, train=cpu)` and `(env=gpu, train=gpu)` at the
-        compile-time `N_ENVS`. For single-env / cross-target use `train`."""
+        compile-time `N_ENVS`. For single-env / cross-target use `train`.
+
+        `stop_at_mean_return` stops early once the windowed mean return
+        reaches it with >= `stop_min_episodes` episodes done (see
+        `_run_onpolicy_batched_body`)."""
         return run_onpolicy_discrete_train_batched[Self.TrainerT, E, L](
             ctx,
             self.trainer,
@@ -166,6 +172,8 @@ struct PPODiscreteAgent[
             artifacts=artifacts,
             run_dir=run_dir,
             base_step=base_step,
+            stop_at_mean_return=stop_at_mean_return,
+            stop_min_episodes=stop_min_episodes,
         )
 
     # ─── Evaluation ─────────────────────────────────────────────────────

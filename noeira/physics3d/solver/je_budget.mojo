@@ -105,9 +105,62 @@ from ..constraints.elliptic_layout import ell_nt
 # it is not known to be optimal for another shape.
 comptime NEWTON_THREADS_FLOOR: Int = 64
 
+# ⚠⚠ AND 64 IS WRONG FOR A SMALL BLOCK — ONE WARP WINS WHEN SHARED MEMORY IS
+# NOT WHAT BINDS. The sweep above ran at 1 block per SM, where the SM was
+# SHARED-bound and extra threads were free warps. A small block is the other
+# regime: at 130-170 registers a 64-thread block is REGISTER-bound at 6 blocks
+# per SM on the RTX 5090 (`cuOccupancyMaxActiveBlocksPerMultiprocessor`), and
+# since the block IS one env, every thread it does not need is an env that
+# cannot be resident. Halving it to one warp buys residency exactly when shared
+# memory admits a 7th block, and nothing otherwise.
+#
+# MEASURED 2026-09-25, RTX 5090, Newton launch at 32 threads / 64 threads.
+# `bytes` is `newton_shared_elems` (the compiled block carries ~1 KB more):
+#
+#     model            NV  MC   bytes   blocks/SM 32 : 64   newton 32/64
+#     park k=0          6  16    5244        12 : 6            0.617
+#     half_cheetah      9  20    8292        10 : 6            0.77  (4096 lanes)
+#     park k=3         24  16    6808        12 : 6            0.758
+#     park k=6         42  16   12928         7 : 6            0.759
+#     park k=9         60  16   21640         4 : 4            1.020
+#     park k=13        84  16   37288         2 : 2            1.119
+#
+#     (park at 1024 lanes, `examples/so101/so101_park_attrib_probe.mojo`)
+#
+# The win at k=6 is ONE block per SM: 7 x 170 = 1190 envs per wave against
+# 6 x 170 = 1020, so 1024 lanes run in one wave instead of two. Where both
+# sizes hold the same blocks (k=9, k=13) the half block only loses cooperative
+# workers. HalfCheetah's obs checksums are BIT-IDENTICAL at 32 and 64 at every
+# batch from 1 to 4096; the cooperative phases partition work, they do not
+# reorder sums.
+#
+# ⚠ THE BOUNDARY IS THE 5090'S, AND IT IS CONSERVATIVE ELSEWHERE. 13 KB is
+# where a 7th block stops fitting in 100 KB of shared memory per SM. An SM
+# with more (A100/Orin 164 KB, H100 228 KB) would admit the extra block at
+# larger footprints, so this under-uses one warp there, never over-uses it.
+# ⚠ At a batch that fits in one wave either way, one warp is ~2% slower
+# (HalfCheetah N=1: 52.8 vs 51.9 µs) — the rule does not see the batch.
+comptime NEWTON_THREADS_FLOOR_SMALL_BLOCK: Int = 32
+comptime NEWTON_SMALL_BLOCK_MAX_BYTES: Int = 13 * 1024
 
-def newton_block_threads[MAX_CONTACTS: Int]() -> Int:
+
+def newton_block_threads[
+    DTYPE: DType,
+    NV: Int,
+    NJOINT: Int,
+    NTENDON: Int,
+    NEQUALITY: Int,
+    MAX_CONTACTS: Int,
+    MAX_CONDIM: Int,
+    CONE_TYPE: Int,
+]() -> Int:
     """Threads per block for `_newton_blocked_fields_kernel`.
+
+    One warp when the block's threadgroup footprint is small enough that an
+    SM can hold more one-warp blocks than register-bound 64-thread ones
+    (`NEWTON_SMALL_BLOCK_MAX_BYTES`), else `NEWTON_THREADS_FLOOR`; never below
+    `MAX_CONTACTS`. The footprint is `newton_shared_elems` with the kernel's
+    own spill decision, so the rule sees the same block the kernel allocates.
 
     ⚠⚠ ONE SOURCE FOR TWO PLACES THAT MUST NOT DISAGREE — the kernel's
     cooperative stride (`comptime THREADS`) and the launch's `block_dim`. They
@@ -121,15 +174,23 @@ def newton_block_threads[MAX_CONTACTS: Int]() -> Int:
     workspace keeps the previous step's values. More is safe (every such phase
     is now guarded `< MC` or `< nc`); fewer is a wrong answer.
 
-    Today it returns exactly `MAX_CONTACTS`, so the launch is unchanged. It
-    exists so that changing the shape is a one-line edit HERE rather than two
-    edits 2,000 lines apart.
-
     ⚠ NEVER LESS THAN `MAX_CONTACTS` — see the note on the contact phases above
     — so the floor only ever raises the count, never lowers it.
     """
     comptime MC = _max_one[MAX_CONTACTS]()
-    return MC if MC > NEWTON_THREADS_FLOOR else NEWTON_THREADS_FLOOR
+    comptime JE_IN_SHARED = not je_spills[
+        DTYPE, NV, NJOINT, NTENDON, NEQUALITY, MAX_CONTACTS, MAX_CONDIM,
+        CONE_TYPE,
+    ]()
+    comptime BYTES = newton_shared_elems[
+        NV, NJOINT, NTENDON, NEQUALITY, MAX_CONTACTS, MAX_CONDIM,
+        JE_IN_SHARED, CONE_TYPE,
+    ]() * size_of[Scalar[DTYPE]]()
+    comptime FLOOR = (
+        NEWTON_THREADS_FLOOR_SMALL_BLOCK if BYTES
+        <= NEWTON_SMALL_BLOCK_MAX_BYTES else NEWTON_THREADS_FLOOR
+    )
+    return MC if MC > FLOOR else FLOOR
 
 
 # ⚠⚠ TWO NUMBERS, AND THEY WERE ONE UNTIL 2026-09-07. The LIMIT is what
@@ -242,6 +303,7 @@ def newton_elliptic_extra_elems[MAX_CONTACTS: Int, MAX_CONDIM: Int]() -> Int:
 
         fr_e_sh                   ME            `con->friction[t]` per contact row
         mu_sh/ntc_sh/cact_sh/cs_sh 4 * MC       per-contact cone data and state
+        cmask_sh                  MC            per-contact dof mask (2026-09-26)
         hb_sh                     MC * (NT+1)^2  the cone Hessian block per contact
 
     ⚠ ZERO FOR THE PYRAMIDAL CONE — the kernel sizes these arrays at 1 there
@@ -250,7 +312,7 @@ def newton_elliptic_extra_elems[MAX_CONTACTS: Int, MAX_CONDIM: Int]() -> Int:
     """
     comptime MC = _max_one[MAX_CONTACTS]()
     comptime HN = (ell_nt[MAX_CONDIM]() + 1) * (ell_nt[MAX_CONDIM]() + 1)
-    return 4 * MC + MC * HN
+    return 5 * MC + MC * HN
 
 
 def newton_shared_elems[

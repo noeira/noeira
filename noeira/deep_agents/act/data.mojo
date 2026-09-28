@@ -68,6 +68,9 @@ from noeira.io.hdf5 import H5Dataset
 
 from .config import NORM_STD_FLOOR, TRAIN_SPLIT_RATIO
 from .inference import normalize_camera_chw
+from .augment import (
+    AUG_UNIFORMS, AUG_WORDS, ImageAugConfig, aug_param, augment_camera_u8,
+)
 
 
 # ── residency budget ─────────────────────────────────────────────────────
@@ -141,6 +144,19 @@ struct ACTDataset[
     var train_eps: List[Int]
     var val_eps: List[Int]
     var rng: UInt64
+
+    var aug: ImageAugConfig
+    """Training-batch augmentation (`set_augment`); `off` by default.
+    Validation batches and `fill_at` are never augmented."""
+    var aug_rng: UInt64
+    """The augmentation's OWN stream, separate from `rng`, so turning
+    augmentation on does not move which rows `sample_batch` draws."""
+    var last_rows: List[Int]
+    """The flat rows the last `sample_batch` drew, slot order — what a gate
+    re-derives the batch from."""
+    var aug_last: List[SIMD[DType.float32, AUG_WORDS]]
+    """`[BATCH * N_CAM]` records of the last augmented batch — what a gate
+    compares the images against."""
 
     # ── where does `sample_batch` actually spend its time? ───────────────
     # It is 16.1 ms of a 144.8 ms ACT iteration with the GPU idle throughout,
@@ -224,6 +240,10 @@ struct ACTDataset[
         self.train_eps = List[Int]()
         self.val_eps = List[Int]()
         self.rng = seed if seed != 0 else UInt64(0x2545F4914F6CDD1D)
+        self.aug = ImageAugConfig.off()
+        self.aug_rng = self.rng ^ UInt64(0xA06D1A7E5EED0001)
+        self.aug_last = List[SIMD[DType.float32, AUG_WORDS]]()
+        self.last_rows = List[Int]()
 
         var n = self.store.n_rows()
         _moments(self.qpos_raw, n, Self.QPOS, self.qpos_mean, self.qpos_std)
@@ -249,6 +269,10 @@ struct ACTDataset[
         self.train_eps = move.train_eps^
         self.val_eps = move.val_eps^
         self.rng = move.rng
+        self.aug = move.aug
+        self.aug_rng = move.aug_rng
+        self.aug_last = move.aug_last^
+        self.last_rows = move.last_rows^
 
     def _split_episodes(mut self) raises:
         """`utils.py:112` — shuffle episode ids, first 80% train.
@@ -283,6 +307,15 @@ struct ACTDataset[
     def n_rows(self) -> Int:
         return self.store.n_rows()
 
+    def set_augment(mut self, cfg: ImageAugConfig):
+        """Augment TRAINING batches from `sample_batch` — the host twin of
+        `ACTDeviceDataset.set_augment`: the same `aug_param` draw rule and
+        the same `augment_camera_u8` per-pixel rule (gated device == host to
+        one byte in `test_act_augment_gpu.mojo`), then the unchanged
+        `normalize_camera_chw`. The uniforms come from `aug_rng`, not
+        Philox, so a host batch and a device batch are not the same draws —
+        only the same distribution."""
+        self.aug = cfg
     def n_episodes(self) -> Int:
         return self.store.n_episodes()
 
@@ -314,13 +347,33 @@ struct ACTDataset[
         if len(eps) == 0:
             raise Error("ACTDataset.sample_batch: the split is empty")
 
+        # ⚠ AUGMENTATION DRAWS FROM ITS OWN STREAM (`aug_rng`), after the
+        # row draws are untouched: the same seed samples the same rows with
+        # augmentation on or off, and validation (never augmented) is pinned
+        # through `rng` alone.
+        var augment = self.aug.enabled and not val
+        if augment:
+            self.aug_last = List[SIMD[DType.float32, AUG_WORDS]]()
+            for _ in range(BATCH * Self.N_CAM):
+                var u = SIMD[DType.float32, AUG_UNIFORMS](0.0)
+                for j in range(AUG_UNIFORMS):
+                    u[j] = Float32(
+                        Float64(Int(_splitmix64(self.aug_rng) >> 11))
+                        * (1.0 / 9007199254740992.0)
+                    )
+                self.aug_last.append(
+                    aug_param(self.aug, u, Self.IMG_H, Self.IMG_W)
+                )
+        self.last_rows = List[Int]()
         for b in range(BATCH):
             var ep = eps[_rand_below(self.rng, len(eps))]
             var ep_start = self.store.episodes.start_of(ep)
             var ep_len = self.store.episodes.length_of(ep)
             var start_ts = _rand_below(self.rng, ep_len)
+            self.last_rows.append(ep_start + start_ts)
             self._fill_one[K](b, ep_start + start_ts, ep_len - start_ts,
-                              out_qpos, out_images, out_actions, out_valid)
+                              out_qpos, out_images, out_actions, out_valid,
+                              augment)
 
     def fill_at[
         K: Int
@@ -389,9 +442,11 @@ struct ACTDataset[
         mut out_images: List[Scalar[DT]],
         mut out_actions: List[Scalar[DT]],
         mut out_valid: List[Scalar[DT]],
+        augment: Bool = False,
     ) raises:
         """`g` = flat row of the observation; `remaining` = steps left in its
-        episode (so `min(K, remaining)` actions are real)."""
+        episode (so `min(K, remaining)` actions are real). `augment` applies
+        `aug_last[slot * N_CAM + cam]` to each camera before the normalise."""
 
         # qpos at g.
         var qo = slot * Self.QPOS
@@ -445,11 +500,24 @@ struct ACTDataset[
         # copies of "/255 then ImageNet" is the defect shape this repo hits
         # most often, and its failure here is invisible: a policy that behaves
         # on the dataset and worse on the robot, with nothing raising.
+        var cam_u8 = List[Scalar[DType.uint8]]()
+        if augment:
+            cam_u8 = List[Scalar[DType.uint8]](length=Self.CAM_ELEMS, fill=0)
         for c in range(Self.N_CAM):
             var cbase = c * Self.CAM_ELEMS
-            normalize_camera_chw[Self.IMG_H, Self.IMG_W](
-                img, src + cbase, out_images, io + cbase
-            )
+            if augment:
+                # the augmented uint8 frame, THEN the one shared normalise
+                augment_camera_u8[Self.IMG_H, Self.IMG_W](
+                    img, src + cbase, self.aug_last[slot * Self.N_CAM + c],
+                    cam_u8, 0,
+                )
+                normalize_camera_chw[Self.IMG_H, Self.IMG_W](
+                    cam_u8, 0, out_images, io + cbase
+                )
+            else:
+                normalize_camera_chw[Self.IMG_H, Self.IMG_W](
+                    img, src + cbase, out_images, io + cbase
+                )
         self.ns_img_norm += perf_counter_ns() - t_nm0
 
 

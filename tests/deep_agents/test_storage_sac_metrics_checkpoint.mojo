@@ -56,17 +56,17 @@ def main() raises:
     print("  mean_q         =", m.mean_q.to_f64())
     print("  mean_target    =", m.mean_target.to_f64())
     print("  mean_next_q    =", m.mean_next_q.to_f64())
-    print("  mean_reward    =", m.mean_reward.to_f64())
+    print("  mean_reward    =", m.reward_mean.to_f64())
     print("  mean_done      =", m.mean_done.to_f64())
-    print("  mean_abs_action=", m.mean_abs_action.to_f64())
+    print("  mean_abs_action=", m.action_abs_mean.to_f64())
 
     assert_true(m.train_steps.to_f64() > 0.0, "training actually ran")
     assert_true(_finite(m.mean_q.to_f64()) and m.mean_q.to_f64() != 0.0, "mean_q populated")
     assert_true(_finite(m.mean_target.to_f64()) and m.mean_target.to_f64() != 0.0, "mean_target populated")
     assert_true(_finite(m.mean_next_q.to_f64()) and m.mean_next_q.to_f64() != 0.0, "mean_next_q populated")
-    assert_true(_finite(m.mean_reward.to_f64()) and m.mean_reward.to_f64() != 0.0, "mean_reward populated")
+    assert_true(_finite(m.reward_mean.to_f64()) and m.reward_mean.to_f64() != 0.0, "mean_reward populated")
     assert_true(_finite(m.mean_done.to_f64()), "mean_done finite")  # may legitimately be 0
-    assert_true(m.mean_abs_action.to_f64() > 0.0, "mean_abs_action populated")
+    assert_true(m.action_abs_mean.to_f64() > 0.0, "mean_abs_action populated")
     print("  diagnostics OK (real per-batch means)")
 
     # ── (2) single-file checkpoint + round-trip ──────────────────────────

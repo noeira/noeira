@@ -436,7 +436,7 @@ def run_online_dreamer4[
         else:
             for i in range(IMG_DIM):
                 cur[i] = nxt[i]
-    logger.log_scalar(String("online/warmup_frames"), Float64(buf.count()), 0)
+    logger.log_scalar(String("warmup_frames"), Float64(buf.count()), 0)
 
     # ── Stage 1: tokenizer pretrain → freeze (OR reuse a checkpoint) ─────
     # If `save_ckpt`.ckpt already exists, LOAD it (tok + agent) and SKIP the
@@ -534,7 +534,7 @@ def run_online_dreamer4[
     if not reused:
         tok.set_mae_p(0.0, 0.0)  # FREEZE
         print("  tokenizer frozen (recon=", last_tok_loss, ")")
-        logger.log_scalar(String("online/tok_recon_loss"), last_tok_loss, 0)
+        logger.log_scalar(String("tokenizer_loss"), last_tok_loss, 0)
         # Checkpoint right after tokenizer pretrain so the imagination-GIF example
         # can eyeball RECON quality (the tokenizer autoencode) WITHOUT running any
         # RL — the tokenizer is the gate: if RECON is noise, nothing downstream
@@ -600,15 +600,15 @@ def run_online_dreamer4[
             # metric logging at the SAME cadence (not per train/imag step — that
             # floods the remote logger with thousands of points).
             if logger.is_active():
-                logger.log_scalar(String("online/wm_video"), last_video, step)
-                logger.log_scalar(String("online/wm_bc"), last_bc, step)
-                logger.log_scalar(String("online/imag_value_loss"), last_v, step)
-                logger.log_scalar(String("online/imag_policy_loss"), last_p, step)
+                logger.log_scalar(String("wm_video_loss"), last_video, step)
+                logger.log_scalar(String("wm_bc_loss"), last_bc, step)
+                logger.log_scalar(String("value_loss"), last_v, step)
+                logger.log_scalar(String("policy_loss"), last_p, step)
                 # NEW — reward/value calibration (the decisive columns):
-                logger.log_scalar(String("online/real_rew_mean"), rr[0], step)
-                logger.log_scalar(String("online/imag_rew_mean"), ir[0], step)
-                logger.log_scalar(String("online/imag_val_mean"), iv[0], step)
-                logger.log_scalar(String("online/lambda_ret_mean"), lr[0], step)
+                logger.log_scalar(String("reward_mean"), rr[0], step)
+                logger.log_scalar(String("imagined_reward_mean"), ir[0], step)
+                logger.log_scalar(String("imagined_value_mean"), iv[0], step)
+                logger.log_scalar(String("lambda_return_mean"), lr[0], step)
             if diag:
                 print("  [diag] real_rew(mean/min/max)=", rr[0], rr[1], rr[2],
                       " imag_rew=", ir[0], ir[1], ir[2],
@@ -649,7 +649,7 @@ def run_online_dreamer4[
         ep_ret += Float64(rd[0])
         if d:
             if logger.is_active():
-                logger.log_scalar(String("online/train_return"), ep_ret, step)
+                logger.log_scalar(String("episode_reward"), ep_ret, step)
             ep_ret = 0.0
             var no = env.reset_obs_list()
             for i in range(IMG_DIM):
@@ -860,7 +860,7 @@ def run_online_dreamer4[
             else:
                 print("  [eval] step", step, " greedy return =", last_eval_return)
             if logger.is_active():
-                logger.log_scalar(String("online/eval_return"),
+                logger.log_scalar(String("eval_return"),
                                   last_eval_return, step)
             if save_ckpt != String(""):
                 agent.save(tok, save_ckpt, dctx)

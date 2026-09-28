@@ -28,8 +28,9 @@ keep moving. Same operation on the two devices, one launch each:
 
 Both are RNG-free and allocation-free, so they sit inside a captured train
 step. The host mirror (`sync_host`) serves the single-row greedy path and
-the `.norm` sidecar (`ObsNorm`'s format: `N` then `mu sd` per line, `sd =
-sqrt(var + eps)`), which the evals load with `ObsNorm.try_load` unchanged.
+the `.norm` sidecar (`ObsNorm`'s format: `N` then `mu sd var` per line, `sd =
+sqrt(var + eps)`, then `n_updates <k>`), which the evals load with
+`ObsNorm.try_load` unchanged — it reads the first two columns.
 """
 
 from max.gpu import global_idx
@@ -40,6 +41,7 @@ from max.gpu.host import DeviceContext
 from noeira.nn.constants import DT, TPB
 from noeira.nn.core.tensor import Tensor
 from noeira.nn.core.ptr import mptr
+from noeira.io.fileio import write_text_atomic
 
 from .kernels import ensure_t, _blocks
 
@@ -213,16 +215,28 @@ struct ObsEma[OBS: Int](Movable, Deinitable):
             )
 
     def save(mut self, path: String) raises:
-        """`ObsNorm`'s sidecar format: `N`, then `mu sd` per dimension with
-        `sd = sqrt(var + eps)` — what the evals apply through
-        `ObsNorm.try_load` / `apply_row`."""
+        """`ObsNorm`'s sidecar format: `N`, then `mu sd var` per dimension
+        with `sd = sqrt(var + eps)` — the evals apply the first two through
+        `ObsNorm.try_load` / `apply_row`, which reads two columns and ignores
+        the rest — then a trailing `n_updates <k>` line.
+
+        ⚠ THE THIRD COLUMN IS WHAT MAKES A RESUME EXACT. Rebuilding the
+        variance as `sd² − eps` cancels catastrophically for a dimension whose
+        variance is near or below eps (1e-5): a near-constant input came back
+        with a variance off by orders of magnitude, or negative. Written
+        atomically: a crash mid-save must not leave the checkpoint beside it
+        with a truncated normaliser."""
         self.sync_host()
         var s = String(Self.OBS) + "\n"
         for d in range(Self.OBS):
-            var sd = sqrt(Float64(self.var_.data[d]) + OBS_EMA_EPS)
-            s += String(Float64(self.mean.data[d])) + " " + String(sd) + "\n"
-        with open(path, "w") as f:
-            f.write(s)
+            var v = Float64(self.var_.data[d])
+            var sd = sqrt(v + OBS_EMA_EPS)
+            s += (
+                String(Float64(self.mean.data[d])) + " " + String(sd) + " "
+                + String(v) + "\n"
+            )
+        s += "n_updates " + String(self.n_updates) + "\n"
+        write_text_atomic(path, s)
 
     def load(mut self, path: String) raises:
         """Restore from the sidecar (`var = sd² − eps`), upload."""
@@ -241,9 +255,17 @@ struct ObsEma[OBS: Int](Movable, Deinitable):
         for d in range(Self.OBS):
             var parts = String(lines[1 + d]).split(" ")
             var mu = atof(String(parts[0]).strip())
-            var sd = atof(String(parts[1]).strip())
             self.mean.data[d] = Scalar[DT](mu)
-            self.var_.data[d] = Scalar[DT](sd * sd - OBS_EMA_EPS)
+            if len(parts) >= 3:
+                self.var_.data[d] = Scalar[DT](atof(String(parts[2]).strip()))
+            else:
+                # A sidecar from before the `var` column: lossy near eps.
+                var sd = atof(String(parts[1]).strip())
+                self.var_.data[d] = Scalar[DT](sd * sd - OBS_EMA_EPS)
+        for i in range(Self.OBS + 1, len(lines)):
+            var kv = String(lines[i]).strip().split(" ")
+            if len(kv) == 2 and String(kv[0]) == "n_updates":
+                self.n_updates = atol(String(kv[1]))
         var c = self.ctx.value()
         self.mean.upload(c)
         self.var_.upload(c)

@@ -17,8 +17,8 @@ inner critic loop per `train_step`:
                 alpha    (AlphaUpdateStep — host ScalarAdam)
 
 STORAGE migration (Stage 5): own scratch as `nn.storage.Tensor`s (not `Scratch`);
-`Adam.adopt` on GPU; storage `CheckpointWriter`/`CheckpointReader` one-file
-envelope; device-resident `DeviceMeanAccum` diagnostics on GPU / host
+`Adam.adopt` on GPU; a one-file v3 checkpoint (α's optimizer and the counter
+as `K` scalars); device-resident `DeviceMeanAccum` diagnostics on GPU / host
 accumulators on CPU. α is a HOST scalar on both targets (the actor-loss block
 D2Hs `log_prob_mean` already; REDQ doesn't capture under CUDA graphs because of
 the subset-sampling + policy-delay host control flow — capture DEFERRED via the
@@ -47,7 +47,9 @@ from noeira.nn.primitives.rsample import RSample
 from noeira.nn.optimizer.adam import Adam
 from noeira.nn.optimizer.scalar_adam import ScalarAdam
 from noeira.nn.core.checkpoint import (
-    CheckpointWriter, CheckpointReader, _split_lines,
+    BinaryCheckpointWriter, BinaryCheckpointReader, CheckpointReader,
+    CheckpointScalars, write_model, read_model, _split_lines, _is_v3_header,
+    _read_file_bytes, _write_file_bytes,
 )
 
 from noeira.nn.core.log_bundle import log_bundle
@@ -812,15 +814,15 @@ struct REDQTrainer[
             alpha_v = self._alpha_accum * inv_a
 
         var bundle = REDQMetrics(
-            actor_loss=LogScalar[DT](actor_loss_v),
+            policy_loss=LogScalar[DT](actor_loss_v),
             critic_loss=LogScalar[DT](critic_loss_v),
             alpha=LogScalar[DT](alpha_v),
             mean_q=LogScalar[DT](q_mean),
             mean_target=LogScalar[DT](target_mean),
-            mean_reward=LogScalar[DT](reward_mean),
+            reward_mean=LogScalar[DT](reward_mean),
             mean_next_q=LogScalar[DT](Scalar[DT](0.0)),
             mean_done=LogScalar[DT](done_mean),
-            mean_abs_action=LogScalar[DT](abs_action_mean),
+            action_abs_mean=LogScalar[DT](abs_action_mean),
             train_steps=LogScalar[DT](Scalar[DT](self._total_train_steps)),
             n_updates=LogScalar[DT](Scalar[DT](self._update_count)),
         )
@@ -874,47 +876,68 @@ struct REDQTrainer[
     def flush_timer_log(mut self) -> String:
         return String("")
 
-    # ─── Checkpoint (ONE file: actor + N online critics in a v2 envelope) ──
+    # ─── Checkpoint (ONE v3 file: actor + N online critics + α + counter) ─
     def save_state(mut self, path: String) raises:
-        var w = CheckpointWriter(save_moments=False)
-        w.mode = 0
-        walk_params[Self.train_target](self.actor, w, self.ctx, "actor")
+        """ONE v3 `storage-ckpt` file: the actor and the N ONLINE critics,
+        name-prefixed `actor.` / `critic<i>.`, then as `K` sections the
+        entropy temperature's whole optimizer (`alpha.*`) and the train-step
+        counter. Atomic and chunked. Network optimizer moments NOT persisted
+        (resume re-warms); α IS, because a resume that restarts it at the
+        initial 0.2 undoes the part of the run that tuned it."""
+        var w = BinaryCheckpointWriter(save_moments=False)
+        write_model[Self.train_target](w, self.actor, self.ctx, "actor")
         for i in range(Self.N):
-            walk_params[Self.train_target](self.ensemble.pairs[i].online, w, self.ctx, "critic" + String(i)
+            write_model[Self.train_target](
+                w, self.ensemble.pairs[i].online, self.ctx, "critic" + String(i)
             )
-        w.mode = 1
-        var _sref1 = ParamVisitorRef.of[type_of(w), Self.train_target](w)
-        self.actor.for_each_state[Self.train_target](_sref1, self.ctx, "actor")
-        for i in range(Self.N):
-            self.ensemble.pairs[i].online.for_each_state[Self.train_target](
-                w, self.ctx, "critic" + String(i)
-            )
-        with open(path, "w") as f:
-            f.write(w.content)
+        var sc = CheckpointScalars()
+        self.alpha_opt.put_state(sc, "alpha")
+        sc.set_int("total_train_steps", self._total_train_steps)
+        w.write_scalars(sc)
+        _write_file_bytes(path, w.content)
 
     def load_state(mut self, path: String) raises:
-        var content: String
-        with open(path, "r") as f:
-            content = String(f.read())
-        var lines = _split_lines(content)
-        var body = List[String]()
-        for li in range(len(lines)):
-            if lines[li].startswith("storage-ckpt"):
-                continue
-            body.append(lines[li])
-        var r = CheckpointReader(body^)
-        r.mode = 0
-        walk_params[Self.train_target](self.actor, r, self.ctx, "actor")
-        for i in range(Self.N):
-            walk_params[Self.train_target](self.ensemble.pairs[i].online, r, self.ctx, "critic" + String(i)
+        """Restore the actor, the N online critics, α and the counter (v3, or
+        the legacy v2 text this trainer wrote before, which carries neither
+        α nor the counter), then hard-copy online → target."""
+        var bytes = _read_file_bytes(path)
+        if _is_v3_header(bytes):
+            var rb = BinaryCheckpointReader(bytes^)
+            read_model[Self.train_target](rb, self.actor, self.ctx, "actor")
+            for i in range(Self.N):
+                read_model[Self.train_target](
+                    rb, self.ensemble.pairs[i].online, self.ctx,
+                    "critic" + String(i),
+                )
+            var sc = rb.read_scalars()
+            rb.finish()
+            self.alpha_opt.take_state(sc, "alpha")
+            self._total_train_steps = sc.get_int(
+                "total_train_steps", self._total_train_steps
             )
-        r.mode = 1
-        var _sref2 = ParamVisitorRef.of[type_of(r), Self.train_target](r)
-        self.actor.for_each_state[Self.train_target](_sref2, self.ctx, "actor")
-        for i in range(Self.N):
-            self.ensemble.pairs[i].online.for_each_state[Self.train_target](
-                r, self.ctx, "critic" + String(i)
-            )
+        else:
+            var content: String
+            with open(path, "r") as f:
+                content = String(f.read())
+            var lines = _split_lines(content)
+            var body = List[String]()
+            for li in range(len(lines)):
+                if lines[li].startswith("storage-ckpt"):
+                    continue
+                body.append(lines[li])
+            var r = CheckpointReader(body^)
+            r.mode = 0
+            walk_params[Self.train_target](self.actor, r, self.ctx, "actor")
+            for i in range(Self.N):
+                walk_params[Self.train_target](self.ensemble.pairs[i].online, r, self.ctx, "critic" + String(i)
+                )
+            r.mode = 1
+            var _sref2 = ParamVisitorRef.of[type_of(r), Self.train_target](r)
+            self.actor.for_each_state[Self.train_target](_sref2, self.ctx, "actor")
+            for i in range(Self.N):
+                self.ensemble.pairs[i].online.for_each_state[Self.train_target](
+                    r, self.ctx, "critic" + String(i)
+                )
         for i in range(Self.N):
             self.ensemble.pairs[i].target_net.polyak_from[Self.train_target](
                 self.ensemble.pairs[i].online, Scalar[DT](1.0), self.ctx

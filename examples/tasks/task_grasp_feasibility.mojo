@@ -49,7 +49,7 @@ from noeira.physics3d.gpu.constants import (
     META_IDX_TASK_PARAM_0, META_IDX_TASK_ACTIVE, META_IDX_NUM_CONTACTS,
     CONTACT_IDX_BODY_A, CONTACT_IDX_BODY_B, CONTACT_IDX_DIST, CONTACT_SIZE,
     CONTACT_IDX_CONDIM, CONTACT_IDX_FRICTION,
-    MODEL_GEOM_SIZE, GEOM_IDX_BODY, GEOM_IDX_HALF_X,
+    MODEL_GEOM_SIZE, GEOM_IDX_BODY, GEOM_IDX_HALF_X, MODEL_META_IDX_TIMESTEP,
     GEOM_IDX_HALF_Y, GEOM_IDX_HALF_Z, GEOM_IDX_RBOUND,
 )
 from noeira.physics3d.parser.runtime_load import parse_model_runtime
@@ -199,7 +199,7 @@ def step_hold[M: ModelDefLike, C: Phyics3dEnvConfig](mut e: EnvT[M, C], h: List[
 
 def run[M: ModelDefLike, C: Phyics3dEnvConfig](
     task_name: String, family_path: String, slot_radius: Float64,
-    gripper_site: Int,
+    gripper_site: Int, timestep: Float64 = 0.0,
 ) raises:
     """`slot_radius` and `gripper_site` are the concrete config's
     `SLOT_RADIUS` / `GRIPPER_SITE` — SO-101-family members the env-config
@@ -242,6 +242,17 @@ def run[M: ModelDefLike, C: Phyics3dEnvConfig](
 
     var env = EnvL()
     _ = env.reset()
+    # ⚠ `--timestep`: the integrator reads the RUNTIME model word
+    # (`MODEL_META_IDX_TIMESTEP`), so a coarser physics step is a probe of the
+    # same compiled scene. so101-nexus runs the SO-101 at 5 ms x 4 substeps;
+    # this family at 2 ms x 16 — 2.5x more physics per simulated second
+    # (`noeira-docs/SO101_PIXEL_RL_PLAN.md`). The durations below stay in
+    # SECONDS, so the hold is the same 6 s whatever the step.
+    var ts = C.get_timestep()
+    if timestep > 0.0:
+        ts = timestep
+        env.mf.meta.data[MODEL_META_IDX_TIMESTEP] = Scalar[DT](ts)
+    print("  physics timestep", ts, "s, frame skip", C.FRAME_SKIP)
     for w in range(TAPE_WORDS):
         env.d.meta.data[META_IDX_TASK_PARAM_0 + w] = Scalar[DT](tape[w])
     env.d.meta.data[META_IDX_TASK_ACTIVE] = Scalar[DT](mask)
@@ -361,7 +372,7 @@ def run[M: ModelDefLike, C: Phyics3dEnvConfig](
     # The hold action per joint is the one that maps back to the pose the arm
     # is already in: `a = (q - mid) / halfrange`.
     print("LEG 3 — the gripper closed on the brick, against gravity")
-    var dt_step = Float64(C.FRAME_SKIP) * C.get_timestep()
+    var dt_step = Float64(C.FRAME_SKIP) * ts
     var n_open = Int(OPEN_S / dt_step + 0.999)
     var n_close = Int(CLOSE_S / dt_step + 0.999)
     var n_hold = Int(HOLD_S / dt_step + 0.999)
@@ -688,6 +699,10 @@ def main() raises:
     var task_name = String("so101_lift_brick")
     if len(args) > 1:
         task_name = String(args[1])
+    var timestep = 0.0
+    for i in range(len(args) - 1):
+        if String(args[i]) == "--timestep":
+            timestep = Float64(String(args[i + 1]))
     # ⚠ THE FAMILY COMES FROM THE TASK FILE, not from a flag: a task names its
     # family, and a probe run on the wrong scene would measure the wrong jaw.
     var t = load_task("noeira/tasks/tasks/" + task_name + ".task")
@@ -695,12 +710,12 @@ def main() raises:
     if t.family == "so101_tabletop":
         run[So101TabletopModel, So101TabletopConfig](
             task_name, fam, So101TabletopConfig.SLOT_RADIUS,
-            So101TabletopConfig.GRIPPER_SITE,
+            So101TabletopConfig.GRIPPER_SITE, timestep,
         )
     elif t.family == "so101_tower":
         run[So101TowerModel, So101TowerConfig](
             task_name, fam, So101TowerConfig.SLOT_RADIUS,
-            So101TowerConfig.GRIPPER_SITE,
+            So101TowerConfig.GRIPPER_SITE, timestep,
         )
     else:
         raise Error(

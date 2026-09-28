@@ -49,6 +49,7 @@ row bootstraps exactly as its online twin would. The episode boundary lives
 in the episodes table, where the success flag is.
 """
 
+from noeira.io.fileio import write_file_atomic
 from std.memory import bitcast
 from std.os.path import exists
 
@@ -301,8 +302,9 @@ def write_demo_file(path: String, ref d: DemoSet) raises:
         start += d.ep_len[e]
     if written != n:
         raise Error("write_demo_file: wrote " + String(written) + " rows of " + String(n))
-    with open(path, "w") as f:
-        f.write_bytes(b)
+    # Atomic and chunked: a crash mid-write must not leave a truncated
+    # `.demo` where the previous good one was.
+    write_file_atomic(path, b)
 
 
 def read_demo_file(path: String) raises -> DemoSet:

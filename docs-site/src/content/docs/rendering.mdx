@@ -26,13 +26,12 @@ the same split.
 	<Demo name="pong_playable" caption="Playable" meta="interactive, keyboard input" />
 </DemoGrid>
 
-## Installing SDL3
+## SDL3
 
-```bash
-brew install sdl3             # macOS
-sudo apt install libsdl3-dev  # Ubuntu / Debian
-sudo dnf install SDL3-devel   # Fedora
-```
+`pixi install` provides SDL3 on every platform; there is no system package to
+install, and a system SDL3 is not used. `SDL3_LIB=/path/to/libSDL3.so`
+overrides the library that is loaded. See
+[Installation](/start/installation/#sdl3--for-on-screen-rendering).
 
 The bindings are complete FFI — 35 files under `render/sdl/` — not a wrapper
 around a C shim.

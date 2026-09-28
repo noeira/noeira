@@ -1,5 +1,5 @@
 """HIL-SERL's knobs on an off-policy run: `--demos`, `--demo-filter`,
-`--bc-weight`, `--bc-only`.
+`--bc-weight`, `--bc-q-ratio`, `--bc-only`.
 
 A driver keeps one `HilSerlConfig`, offers every flag to `try_parse` in its
 own argument loop, calls `validate` after the loop, `print_banner` with its
@@ -8,7 +8,7 @@ other settings, `log_config` on its remote logger, and `apply_hil_serl`
 """
 
 from noeira.nn.constants import DT
-from noeira.core.logger import RemoteLogger
+from noeira.core.logger import Logger
 from noeira.deep_agents.demos.filter import DemoFilter
 
 
@@ -28,6 +28,14 @@ struct HilSerlConfig(Copyable, Movable):
     lift policy parked (eval 356/355 at 25k/50k with 7677 expert rows
     pinned); TD3+BC's normalisation puts λ near mean|Q| / 2.5 ≈ 40 there.
     Needs `--demos`; 0 (the default) is plain RLPD."""
+    var bc_q_ratio: Scalar[DT]
+    """`--bc-q-ratio r` — the BC weight tracks the critic: after every
+    diagnostics flush it becomes max(`--bc-weight`, r · mean|Q|)
+    (`SACTrainer.set_bc_q_ratio`). With λ fixed the BC term's share of the
+    actor gradient shrinks as Q grows: the tower lift policy peaked at 25k
+    (eval 414, mean_q 58) and had lost its grasp by 50k (400, mean_q 87).
+    0.7 reproduces that run's 25k balance (40 / 58) and holds it. Needs
+    `--bc-weight > 0`, which is the floor; 0 (the default) is a fixed λ."""
     var bc_only: Bool
     """`--bc-only` — zero the SAC half of the actor loss
     (`SACActorLoss.set_q_weight(0)`): the actor fits the demo half of every
@@ -39,6 +47,7 @@ struct HilSerlConfig(Copyable, Movable):
         self.demos = String("")
         self.filter = DemoFilter()
         self.bc_weight = Scalar[DT](0.0)
+        self.bc_q_ratio = Scalar[DT](0.0)
         self.bc_only = False
 
     def active(self) -> Bool:
@@ -62,6 +71,9 @@ struct HilSerlConfig(Copyable, Movable):
         if flag == "--bc-weight":
             self.bc_weight = Scalar[DT](Float64(value))
             return True
+        if flag == "--bc-q-ratio":
+            self.bc_q_ratio = Scalar[DT](Float64(value))
+            return True
         if flag == "--demo-filter":
             self.filter = DemoFilter.parse(value, who)
             return True
@@ -72,6 +84,10 @@ struct HilSerlConfig(Copyable, Movable):
             raise Error(who + ": --bc-weight needs --demos")
         if self.bc_only and self.bc_weight <= Scalar[DT](0):
             raise Error(who + ": --bc-only needs --bc-weight > 0")
+        if self.bc_q_ratio < Scalar[DT](0):
+            raise Error(who + ": --bc-q-ratio must be >= 0")
+        if self.bc_q_ratio > Scalar[DT](0) and self.bc_weight <= Scalar[DT](0):
+            raise Error(who + ": --bc-q-ratio needs --bc-weight > 0 (the floor)")
 
     def paths(self, who: String = "hil-serl") raises -> List[String]:
         """`--demos` split on commas. ⚠ An empty piece is refused: `a.demo,`
@@ -101,7 +117,9 @@ struct HilSerlConfig(Copyable, Movable):
             print("  ⚠ --warmup is", warmup, "with demos loaded; HIL-SERL"
                   " starts learning after ~100 steps. Consider --warmup 1000.")
 
-    def log_config(self, mut remote: RemoteLogger):
-        remote.set_config("demos", self.demos)
-        remote.set_config("demo_filter", self.filter.name())
-        remote.set_config("bc_weight", String(self.bc_weight))
+    def log_config[L: Logger](self, mut logger: L):
+        logger.set_config("demos", self.demos)
+        logger.set_config("demo_filter", self.filter.name())
+        logger.set_config("bc_weight", String(self.bc_weight))
+        logger.set_config("bc_q_ratio", String(self.bc_q_ratio))
+        logger.set_config("bc_only", String(self.bc_only))

@@ -1,0 +1,28 @@
+# LIFT ON CUBE-IN-BOWL'S LAYOUTS — the grasp half of `so101_tower_cube_in_bowl`
+# on that task's own start distribution, as the first stage of a curriculum.
+#
+# ⚠⚠ WHY NOT `so101_tower_lift_brick`. That task draws the brick in
+# `desk_right` at a FIXED yaw and the bowl in `desk_left`; cube-in-bowl draws
+# them over the recorded layouts (`desk_brick` with a random yaw, the bowl on
+# either side 135 mm away). The lift policy (97.7 % greedy on its own task,
+# run ac2b3010) lifted the brick in 197 / 1024 of cube-in-bowl's resets, and
+# a PPO fine-tune from it on cube-in-bowl sat at ~45 % lifted from 15M to 30M
+# (26 Sep, `noeira-docs/SO101_PIXEL_RL_PLAN.md`). Train the lift HERE, then
+# `--init` cube-in-bowl from it: the two share every placement word.
+schema_version=1
+task=so101_tower_lift_real_layout
+family=so101_tower
+language=Pick up the cube
+
+# as `so101_tower_lift_brick`: ~4 cm of lift above the mat
+goal=Above(brick, desk, 0.05)
+
+active=tower
+active=desk
+active=bowl
+active=brick
+
+# ⚠ COPIED FROM `so101_tower_cube_in_bowl.task` — keep the two identical.
+# Slot order bowl before brick, as the family's slot table requires.
+init=bowl@desk_bowl:sep=0.135
+init=brick@desk_brick:yaw

@@ -1,0 +1,153 @@
+---
+/**
+ * BcPipeline — what `fit_bc` does between a recording and a policy it trusts.
+ *
+ * The regression itself is one box; the diagram is about the parts around it
+ * that make its number readable. The split is drawn by episode, as strips,
+ * because a row-wise split is the failure it exists to prevent: neighbouring
+ * frames of one demonstration on both sides of the line. And the checkpoint is
+ * re-scored after a reload, on the path a driver uses, before anything is
+ * accepted — the refusal branch is drawn as a peer of the success branch
+ * because `fit_bc` raises rather than warns.
+ */
+
+/** Episode strips: frames per strip and their geometry. */
+const FRAMES = 8;
+const F_W = 18;
+const F_GAP = 3;
+const STRIP_X = 20;
+const STRIP_H = 16;
+
+/** Four training episodes above the line, two held out below it. */
+const TRAIN_Y = [48, 72, 96, 120];
+const VAL_Y = [236, 260];
+
+const STRIP_END = STRIP_X + FRAMES * (F_W + F_GAP) - F_GAP;
+
+/** Row centres the edges run along. */
+const ROW_A = 84;
+const ROW_B = 262;
+
+const strip = (y: number, cls: string, opacity: number) =>
+	Array.from({ length: FRAMES }, (_, k) => ({
+		x: STRIP_X + k * (F_W + F_GAP),
+		y,
+		cls,
+		opacity,
+	}));
+---
+
+<figure class="diagram not-content">
+	<svg viewBox="0 0 880 410" role="img"
+		aria-label="Behaviour cloning in noeira: demonstrations are split by episode; the input normalisation is computed from training rows; an MLP is fitted with Adam on MSE; the saved checkpoint is reloaded and re-scored on the held-out episodes against zero and mean baselines, and the fit is accepted or refused">
+		<defs>
+			<marker id="bc-cyan" viewBox="0 0 10 10" refX="9" refY="5"
+				markerWidth="6" markerHeight="6" orient="auto-start-reverse">
+				<path d="M 0 0 L 10 5 L 0 10 z" class="dg-fill-cyan" />
+			</marker>
+			<marker id="bc-spark" viewBox="0 0 10 10" refX="9" refY="5"
+				markerWidth="6" markerHeight="6" orient="auto-start-reverse">
+				<path d="M 0 0 L 10 5 L 0 10 z" class="dg-fill-spark" />
+			</marker>
+			<marker id="bc-purple" viewBox="0 0 10 10" refX="9" refY="5"
+				markerWidth="6" markerHeight="6" orient="auto-start-reverse">
+				<path d="M 0 0 L 10 5 L 0 10 z" class="dg-fill-purple" />
+			</marker>
+			<marker id="bc-green" viewBox="0 0 10 10" refX="9" refY="5"
+				markerWidth="6" markerHeight="6" orient="auto-start-reverse">
+				<path d="M 0 0 L 10 5 L 0 10 z" class="dg-fill-green" />
+			</marker>
+			<marker id="bc-muted" viewBox="0 0 10 10" refX="9" refY="5"
+				markerWidth="6" markerHeight="6" orient="auto-start-reverse">
+				<path d="M 0 0 L 10 5 L 0 10 z" class="dg-fill-muted" />
+			</marker>
+		</defs>
+
+		<!-- ── the demonstrations, split by episode ───────────────────── -->
+		<text x={(STRIP_X + STRIP_END) / 2} y="32" class="dg-caption">training episodes</text>
+		{TRAIN_Y.flatMap((y) => strip(y, 'dg-fill-cyan', 0.7)).map((c) => (
+			<rect class={c.cls} x={c.x} y={c.y} width={F_W} height={STRIP_H} rx="2" opacity={c.opacity} />
+		))}
+
+		<line class="dg-tick" x1={STRIP_X} y1="180" x2={STRIP_END} y2="180" stroke-dasharray="4 4" />
+		<text x={STRIP_X} y="172" class="dg-label dg-label--muted">split by episode,</text>
+		<text x={STRIP_X} y="200" class="dg-label dg-label--muted">never by row</text>
+
+		{VAL_Y.flatMap((y) => strip(y, 'dg-fill-purple', 0.7)).map((c) => (
+			<rect class={c.cls} x={c.x} y={c.y} width={F_W} height={STRIP_H} rx="2" opacity={c.opacity} />
+		))}
+		<text x={(STRIP_X + STRIP_END) / 2} y="296" class="dg-caption">held-out episodes</text>
+
+		<!-- ── row A: normalise → fit → save ─────────────────────────── -->
+		<path class="dg-edge dg-edge--cyan" marker-end="url(#bc-cyan)"
+			d={`M ${STRIP_END + 6} ${ROW_A} L 238 ${ROW_A}`} />
+		<g class="dg-node dg-node--cyan">
+			<rect x="240" y={ROW_A - 34} width="170" height="68" rx="10" />
+			<text x="325" y={ROW_A - 6} class="dg-title">BcNorm</text>
+			<text x="325" y={ROW_A + 16} class="dg-sub">mu, sd of training rows</text>
+		</g>
+
+		<path class="dg-edge dg-edge--cyan" marker-end="url(#bc-cyan)"
+			d={`M 410 ${ROW_A} L 448 ${ROW_A}`} />
+		<g class="dg-node dg-node--spark">
+			<rect x="450" y={ROW_A - 34} width="180" height="68" rx="10" />
+			<text x="540" y={ROW_A - 6} class="dg-title">fit BcNet</text>
+			<text x="540" y={ROW_A + 16} class="dg-sub">Adam on MSE</text>
+		</g>
+
+		<path class="dg-edge dg-edge--spark" marker-end="url(#bc-spark)"
+			d={`M 630 ${ROW_A} L 668 ${ROW_A}`} />
+		<g class="dg-node dg-node--purple">
+			<rect x="670" y={ROW_A - 34} width="190" height="68" rx="10" />
+			<text x="765" y={ROW_A - 6} class="dg-title">save</text>
+			<text x="765" y={ROW_A + 16} class="dg-sub">.ckpt + .norm sidecar</text>
+		</g>
+		<text x="540" y="144" class="dg-caption">OBS → 256 → 256 → ACT, ReLU, no squash</text>
+
+		<!-- ── row B: reload and re-score on held-out episodes ────────── -->
+		<path class="dg-edge dg-edge--purple" marker-end="url(#bc-purple)"
+			d={`M 765 ${ROW_A + 34} L 765 ${ROW_B} L 642 ${ROW_B}`} />
+		<text x="777" y="190" class="dg-label dg-label--purple">reload,</text>
+		<text x="777" y="208" class="dg-label dg-label--purple">driver path</text>
+
+		<path class="dg-edge dg-edge--purple" marker-end="url(#bc-purple)"
+			d={`M ${STRIP_END + 6} ${ROW_B} L 438 ${ROW_B}`} />
+
+		<g class="dg-node dg-node--purple">
+			<rect x="440" y={ROW_B - 42} width="200" height="84" rx="10" />
+			<text x="540" y={ROW_B - 14} class="dg-title">re-score on CPU</text>
+			<text x="540" y={ROW_B + 8} class="dg-sub">val MSE of the reload</text>
+			<text x="540" y={ROW_B + 28} class="dg-sub">vs zero · vs train mean</text>
+		</g>
+
+		<!-- ── the verdict ─────────────────────────────────────────────── -->
+		<path class="dg-edge dg-edge--green" marker-end="url(#bc-green)"
+			d={`M 500 ${ROW_B + 42} L 500 322 L 370 322 L 370 338`} />
+		<path class="dg-edge dg-edge--muted" marker-end="url(#bc-muted)"
+			d={`M 580 ${ROW_B + 42} L 580 322 L 715 322 L 715 338`} />
+
+		<g class="dg-node dg-node--green">
+			<rect x="240" y="340" width="260" height="62" rx="10" />
+			<text x="370" y="366" class="dg-title">policy</text>
+			<text x="370" y="388" class="dg-sub">beats the mean · reload ≤ 1.5× fit</text>
+		</g>
+		<g class="dg-node dg-node--muted">
+			<rect x="570" y="340" width="290" height="62" rx="10" />
+			<text x="715" y="366" class="dg-title">raise</text>
+			<text x="715" y="388" class="dg-sub">no gain · bad reload · widths · empty split</text>
+		</g>
+	</svg>
+
+	<figcaption class="diagram__legend">
+		<span class="diagram__key diagram__key--cyan">training data</span>
+		<span class="diagram__key diagram__key--spark">the fit</span>
+		<span class="diagram__key diagram__key--purple">held-out check, on the saved file</span>
+		<span class="diagram__key diagram__key--green">accepted</span>
+		<span class="diagram__key diagram__key--muted">refused</span>
+	</figcaption>
+
+	<div class="diagram__formula">
+		<span class="diagram__formula-title">loss</span>
+		<code>L = ‖ BcNet( (o − mu) / sd ) − a ‖²,   mu and sd from the training rows only</code>
+	</div>
+</figure>

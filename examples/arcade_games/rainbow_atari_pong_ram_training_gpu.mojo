@@ -27,8 +27,9 @@ from std.memory import Pointer
 
 from max.gpu.host import DeviceContext
 
-from noeira.core.dotenv import load_dotenv
-from noeira.core.logger import RemoteLogger
+from noeira.core.run import RunContext, register_run
+from noeira.core.run_session import RunLogger, finish_run, run_logger
+from noeira.io.artifact_sink import sink_for_run
 from noeira.nn.constants import DT
 
 from noeira.deep_agents.c51.config import Rainbow
@@ -68,7 +69,6 @@ comptime NOOP_MAX = 30
 comptime MAX_FRAMES = 108_000
 
 comptime CKPT_EVERY = 500_000
-comptime CKPT_PATH = "checkpoints/rainbow_atari_pong_ram.ckpt"
 
 comptime AtariBatched = AtariGpuBatchedEnv[
     PongDef, N_ENVS, FRAME_SKIP, NOOP_MAX, MAX_FRAMES
@@ -110,13 +110,15 @@ def main() raises:
         print("Expected: random ~-21 → good policy > 0 (beating CPU)")
         print("-" * 70)
 
-        var env_vars = load_dotenv()
-        var logger = RemoteLogger(
-            server_url=env_vars.get("NOEIRA_CLOUD_URL", ""),
-            run_name="Rainbow Atari Pong RAM (GPU)",
-            buffer_size=64,
-            api_key=env_vars.get("NOEIRA_CLOUD_API_KEY", ""),
+        var run = RunContext(
+            project=String("atari"),
+            driver=String("examples/arcade_games/rainbow_atari_pong_ram_training_gpu.mojo"),
+            slug=String("rainbow-atari-pong-ram"),
+            env=String("builtin:atari/pong"),
         )
+        var checkpoint_path = run.checkpoint_path(String("last"))
+        print("  Run:", run.dir)
+        var logger = run_logger(run, buffer_size=64)
         logger.set_config("agent", "Rainbow DQN (deep_agents)")
         logger.set_config("env", "Atari Pong RAM (GPU emulator)")
         logger.set_config("obs_dim", String(OBS_DIM))
@@ -126,10 +128,13 @@ def main() raises:
         logger.set_config("n_envs", String(N_ENVS))
         logger.set_config("n_step", String(N_STEP))
 
+        register_run(run, logger)
+        var artifacts = sink_for_run(run.id, run.dir)
+
         var start_time = perf_counter_ns()
         try:
             var _ep_returns = agent.train_gpu_batched[
-                AtariBatched, N_ENVS, N_STEP, RemoteLogger
+                AtariBatched, N_ENVS, N_STEP, RunLogger
             ](
                 env,
                 NUM_STEPS,
@@ -141,13 +146,18 @@ def main() raises:
                 logger=Pointer(to=logger).as_unsafe_any_origin(),
                 diag_every=5_000,
                 checkpoint_every=CKPT_EVERY,
-                checkpoint_path=String(CKPT_PATH),
+                checkpoint_path=checkpoint_path,
+                artifacts=artifacts,
+                run_dir=run.dir,
                 eval_env=Pointer(to=eval_env).as_unsafe_any_origin(),
                 eval_every=100_000,
                 eval_episodes=20,
             )
             var elapsed_s = Float64(perf_counter_ns() - start_time) / 1e9
-            logger.close()
+            finish_run(
+                run, logger, artifacts,
+                String("mean_return_10=") + String(agent.mean_return()),
+            )
             print("-" * 70)
             print("Training complete in", fit(String(elapsed_s), 8), "s")
             print("Final mean return (last 10):", agent.mean_return())

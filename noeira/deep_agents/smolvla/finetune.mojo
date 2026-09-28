@@ -65,7 +65,7 @@ from noeira.nn.core.param import ParamVersionBump, walk_params
 from noeira.nn.core.tensor import Tensor
 from noeira.nn.core.tensor_refs import TensorRefs
 from noeira.nn.core.checkpoint import (
-    save_params_multi, load_params_multi,
+    CheckpointScalars, save_params_multi, load_params_multi,
 )
 from noeira.nn.optimizer.adam import Adam
 from noeira.nn.primitives.linear import Linear
@@ -270,8 +270,11 @@ def save_trainables[
     mut state_proj: Linear[SDIM, VW],
     save_moments: Bool = True,
     ctx: Optional[DeviceContext] = None,
+    scalars: CheckpointScalars = CheckpointScalars(),
 ) raises:
-    """Write the trainable set to one v3 checkpoint.
+    """Write the trainable set to one v3 checkpoint, `scalars` as its `K`
+    sections — the caller's `opt.put_step_state(sc, "opt")`, without which
+    the moments below resume under `t = 0` (see `Adam.put_step_state`).
 
     ⚠ **ONLY the trainable set** — the SigLIP tower, the sixteen VLM layers,
     the connector and the token embedding are frozen and are already on disk
@@ -295,12 +298,12 @@ def save_trainables[
     comptime if TRAIN_STATE_PROJ:
         save_params_multi[target](
             path, ctx, save_moments, expert, action_in, time_mlp_in,
-            time_mlp_out, action_out, state_proj,
+            time_mlp_out, action_out, state_proj, scalars=scalars,
         )
     else:
         save_params_multi[target](
             path, ctx, save_moments, expert, action_in, time_mlp_in,
-            time_mlp_out, action_out,
+            time_mlp_out, action_out, scalars=scalars,
         )
 
 
@@ -317,8 +320,10 @@ def load_trainables[
     mut action_out: Linear[EW, ADIM],
     mut state_proj: Linear[SDIM, VW],
     ctx: Optional[DeviceContext] = None,
-) raises:
+) raises -> CheckpointScalars:
     """Read back what `save_trainables` wrote, over an already-loaded base.
+    Returns the file's `K` scalars — hand them to `opt.take_step_state` on a
+    resume; a deployment can ignore them.
 
     ⚠ Load the BASE checkpoint first. This file holds only the trainable set;
     applying it to a freshly initialised policy leaves the vision tower and
@@ -326,12 +331,12 @@ def load_trainables[
     prefix and no error anywhere.
     """
     comptime if TRAIN_STATE_PROJ:
-        load_params_multi[target](
+        return load_params_multi[target](
             path, ctx, expert, action_in, time_mlp_in, time_mlp_out,
             action_out, state_proj,
         )
     else:
-        load_params_multi[target](
+        return load_params_multi[target](
             path, ctx, expert, action_in, time_mlp_in, time_mlp_out,
             action_out,
         )

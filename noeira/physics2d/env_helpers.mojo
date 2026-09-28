@@ -30,6 +30,7 @@ Example:
 from std.math import sqrt
 from layout import LayoutTensor, Layout
 
+from .joints.revolute import RevoluteJointSolver
 from .constants import (
     dtype,
     BODY_STATE_SIZE,
@@ -57,12 +58,9 @@ from .constants import (
     JOINT_REF_ANGLE,
     JOINT_LOWER_LIMIT,
     JOINT_UPPER_LIMIT,
-    JOINT_STIFFNESS,
-    JOINT_DAMPING,
     JOINT_FLAGS,
     JOINT_REVOLUTE,
     JOINT_FLAG_LIMIT_ENABLED,
-    JOINT_FLAG_SPRING_ENABLED,
 )
 
 
@@ -483,11 +481,13 @@ struct PhysicsEnvHelpers:
         anchor_ay: Float64,
         anchor_bx: Float64,
         anchor_by: Float64,
-        stiffness: Float64 = 0.0,
-        damping: Float64 = 0.0,
         lower_limit: Float64 = 0.0,
         upper_limit: Float64 = 0.0,
         enable_limit: Bool = False,
+        enable_motor: Bool = False,
+        motor_speed: Float64 = 0.0,
+        max_motor_torque: Float64 = 0.0,
+        reference_angle: Optional[Float64] = None,
     ) -> Int:
         """Add a revolute joint between two bodies.
 
@@ -500,45 +500,33 @@ struct PhysicsEnvHelpers:
         if joint_idx >= MAX_JOINTS:
             return -1
 
-        var off = JOINTS_OFFSET + joint_idx * JOINT_DATA_SIZE
-
-        # Joint type
-        states[env, off + JOINT_TYPE] = Scalar[dtype](JOINT_REVOLUTE)
-
-        # Body indices
-        states[env, off + JOINT_BODY_A] = Scalar[dtype](body_a)
-        states[env, off + JOINT_BODY_B] = Scalar[dtype](body_b)
-
-        # Local anchors
-        states[env, off + JOINT_ANCHOR_AX] = Scalar[dtype](anchor_ax)
-        states[env, off + JOINT_ANCHOR_AY] = Scalar[dtype](anchor_ay)
-        states[env, off + JOINT_ANCHOR_BX] = Scalar[dtype](anchor_bx)
-        states[env, off + JOINT_ANCHOR_BY] = Scalar[dtype](anchor_by)
-
-        # Reference angle (angle_b - angle_a at creation)
-        var angle_a = Self.get_body_angle[BATCH, STATE_SIZE, BODIES_OFFSET](
-            states, env, body_a
+        var ref = Scalar[dtype](0)
+        if reference_angle:
+            ref = Scalar[dtype](reference_angle.value())
+        else:
+            ref = Self.get_body_angle[BATCH, STATE_SIZE, BODIES_OFFSET](
+                states, env, body_b
+            ) - Self.get_body_angle[BATCH, STATE_SIZE, BODIES_OFFSET](
+                states, env, body_a
+            )
+        RevoluteJointSolver.write_joint[BATCH, STATE_SIZE](
+            states,
+            env,
+            JOINTS_OFFSET + joint_idx * JOINT_DATA_SIZE,
+            body_a=body_a,
+            body_b=body_b,
+            anchor_ax=Scalar[dtype](anchor_ax),
+            anchor_ay=Scalar[dtype](anchor_ay),
+            anchor_bx=Scalar[dtype](anchor_bx),
+            anchor_by=Scalar[dtype](anchor_by),
+            reference_angle=ref,
+            lower_limit=Scalar[dtype](lower_limit),
+            upper_limit=Scalar[dtype](upper_limit),
+            enable_limit=enable_limit,
+            enable_motor=enable_motor,
+            motor_speed=Scalar[dtype](motor_speed),
+            max_motor_torque=Scalar[dtype](max_motor_torque),
         )
-        var angle_b = Self.get_body_angle[BATCH, STATE_SIZE, BODIES_OFFSET](
-            states, env, body_b
-        )
-        states[env, off + JOINT_REF_ANGLE] = angle_b - angle_a
-
-        # Angle limits
-        states[env, off + JOINT_LOWER_LIMIT] = Scalar[dtype](lower_limit)
-        states[env, off + JOINT_UPPER_LIMIT] = Scalar[dtype](upper_limit)
-
-        # Spring properties
-        states[env, off + JOINT_STIFFNESS] = Scalar[dtype](stiffness)
-        states[env, off + JOINT_DAMPING] = Scalar[dtype](damping)
-
-        # Flags
-        var flags = 0
-        if stiffness > 0.0 or damping > 0.0:
-            flags = flags | JOINT_FLAG_SPRING_ENABLED
-        if enable_limit:
-            flags = flags | JOINT_FLAG_LIMIT_ENABLED
-        states[env, off + JOINT_FLAGS] = Scalar[dtype](flags)
 
         # Increment count
         Self.set_joint_count[BATCH, STATE_SIZE, JOINT_COUNT_OFFSET](

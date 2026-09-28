@@ -46,8 +46,16 @@ comptime _pm = UNITREE_G1_DIMS
 # (`humanoidverse_isaac.py:404-450`; the ONNX exporter pins `state_end = 64`),
 # followed since G3.0 by the 463-D privileged `max_local_self`
 # (`unitree_g1_priv_obs.mojo`): `[state 64 | privileged 463]` = 527, the
-# observation every net of the paper's "priv" arm consumes. Consumers of
-# the proprio part alone read the first `UNITREE_G1_STATE_DIM` entries.
+# observation `b` and `discriminator` consume — their reference key lists are
+# exactly `state + privileged_state` (§12.34). Consumers of the proprio part
+# alone read the first `UNITREE_G1_STATE_DIM` entries.
+#
+# ⚠ `UNITREE_G1_OBS_DIM` is NOT what `f`, `critic` or the actor see any more.
+# The packed row carries `last_action 29 | history 372` after this prefix —
+# `UNITREE_G1_FULL_OBS_DIM` in `unitree_g1_history.mojo`. This constant is now
+# specifically "the b/discriminator prefix", and the ENV still produces exactly
+# this much: the 401 is assembled by the driver (rollout) or derived from the
+# ring (training), never by the physics hook.
 comptime UNITREE_G1_STATE_DIM: Int = 64
 comptime UNITREE_G1_PRIV_DIM: Int = 463
 comptime UNITREE_G1_OBS_DIM: Int = UNITREE_G1_STATE_DIM + UNITREE_G1_PRIV_DIM

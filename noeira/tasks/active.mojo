@@ -51,7 +51,9 @@ word of `METADATA_SIZE` and no signature anywhere.
 """
 
 from .spec import FamilySpec, TaskSpec, SLOT_FREE, INIT_TARGET_SLOT
-from .placement.table import INIT_WORD_IN_BIAS
+from .placement.table import (
+    INIT_WORD_IN_BIAS, INIT_WORD_SEP_UNIT, INIT_WORD_YAW_BIAS,
+)
 from noeira.physics3d.gpu.constants import META_INIT_SLOTS
 from .obs import slot_active, write_free_slot_obs, FREE_JOINT_NQ, FREE_JOINT_NV
 
@@ -118,8 +120,9 @@ def init_region_words(t: TaskSpec, f: FamilySpec) raises -> List[Float64]:
     """One word per FREE slot: where its `init=` starts it, or 0.
 
     ⚠ THE ENCODING IS `placement/table.mojo`'s — a region `r + 1`, the same
-    plus `INIT_WORD_IN_BIAS` for an `In`, `-(s + 1)` for a STACK on family slot
-    `s` — and this is its one writer. The paragraphs below predate stacks and
+    plus `INIT_WORD_IN_BIAS` for an `In` and `INIT_WORD_YAW_BIAS` for `:yaw`,
+    plus `sep_mm * INIT_WORD_SEP_UNIT` for `:sep=`, `-(s + 1)` for a STACK on
+    family slot `s` — and this is its one writer. The paragraphs below predate stacks and
     `In`, and still hold for the region case.
 
     ⚠⚠ INDEXED BY FREE-SLOT ORDINAL, NOT BY FAMILY SLOT INDEX. The `meta`
@@ -157,6 +160,11 @@ def init_region_words(t: TaskSpec, f: FamilySpec) raises -> List[Float64]:
                 # fall through `region_index` to -1 and write 0 — so a stacked
                 # prop was silently PARKED on the device, which is why
                 # `require_gpu_placement` had to refuse every task with one.
+                if it.yaw or it.sep_mm > 0:
+                    raise Error(
+                        "task '" + t.name + "': init '" + it.describe()
+                        + "' stacks, and ':yaw' / ':sep=' apply to a region draw"
+                    )
                 w = -(f.slot_index(it.region) + 1)
             else:
                 var ri = f.region_index(it.region)
@@ -170,6 +178,11 @@ def init_region_words(t: TaskSpec, f: FamilySpec) raises -> List[Float64]:
                 w = ri + 1
                 if it.inside:
                     w += INIT_WORD_IN_BIAS
+                if it.yaw:
+                    w += INIT_WORD_YAW_BIAS
+                # `:sep=` in whole mm, above both biases (`InitSpec.sep_mm`
+                # refuses anything outside 1..1023)
+                w += it.sep_mm * INIT_WORD_SEP_UNIT
         out.append(Float64(w))
     if len(out) > META_INIT_SLOTS:
         raise Error(

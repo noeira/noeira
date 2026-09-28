@@ -6,6 +6,7 @@ description: The simplest imitation learner — an MLP regressed onto demonstrat
 import Maturity from '~/components/Maturity.astro';
 import Paper from '~/components/Paper.astro';
 import Papers from '~/components/Papers.astro';
+import BcPipeline from '~/components/diagrams/BcPipeline.astro';
 
 <Maturity level="beta" note="The fit, the checkpoint and its reload are gated. As a policy it is a baseline: 13/200 on LIBERO libero_goal." />
 
@@ -34,6 +35,8 @@ observation carries enough information to imitate at all.
 
 Everything lives in `noeira/deep_agents/bc/`, generic over where the
 demonstrations come from.
+
+<BcPipeline />
 
 **`BcNet[OBS, ACT]`** (`noeira/deep_agents/bc/policy.mojo`) — an MLP,
 `OBS → 256 → 256 → ACT` with ReLU and no output squash. Recorded actions are
@@ -142,11 +145,13 @@ trains the SAC actor as a pure imitator while its critics learn.
 |---|---|---|
 | LIBERO `libero_goal`, 10 tasks × 20 frozen inits, 600 steps | **13/200** | low-dimensional observation with goal words |
 
-For comparison on the same protocol: a vision-free kNN matcher over joints and
-their one-step difference scores 144/200, and [ACT](/algorithms/imitation/act/)
-with cameras 31/200. The kNN result shows the task is solvable from
+For comparison on the same protocol: a vision-free nearest-demonstration
+matcher over joints and their one-step difference scores 0.72 (median of 5)
+and 0.795 (nearest one), and [ACT](/algorithms/imitation/act/) with cameras
+0.75 ± 0.05 over three seeds. The matcher shows the task is solvable from
 proprioception by committing to the nearest demonstrated phase; a regression
-onto the conditional mean blurs exactly where demonstrations disagree.
+onto the conditional mean blurs exactly where demonstrations disagree, which
+is what this MLP does and what ACT did until its decoder was fixed.
 
 ## Next
 

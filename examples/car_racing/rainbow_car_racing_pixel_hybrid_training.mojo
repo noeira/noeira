@@ -23,8 +23,9 @@ from std.memory import Pointer
 
 from max.gpu.host import DeviceContext
 
-from noeira.core.dotenv import load_dotenv
-from noeira.core.logger import RemoteLogger
+from noeira.core.run import RunContext, register_run
+from noeira.core.run_session import RunLogger, finish_run, run_logger
+from noeira.io.artifact_sink import sink_for_run
 from noeira.nn.constants import DT
 
 from noeira.deep_agents.c51.config import RainbowCNN
@@ -71,7 +72,6 @@ comptime NUM_STEPS = 10_000_000
 comptime LR = Scalar[DT](6.25e-5)
 
 comptime CKPT_EVERY = 250_000
-comptime CKPT_PATH = "checkpoints/rainbow_car_racing_pixel_hybrid.ckpt"
 
 comptime BatchedCarRacing = BatchedCpuDiscreteEnv[CarRacingPx, N_ENVS, OBS_DIM]
 
@@ -111,20 +111,24 @@ def main() raises:
         print("  Hidden:", HIDDEN, " Atoms:", NUM_ATOMS, " support [", V_MIN, ",", V_MAX, "]")
         print("  N-step:", N_STEP, " Buffer:", BUFFER_CAPACITY, "(uint8)")
         print("  Updates/step:", UPDATES_PER_STEP, " LR:", LR, " Warmup:", WARMUP)
-        print("  Checkpoint:", CKPT_PATH)
         print()
 
-        var env_vars = load_dotenv()
-        var logger = RemoteLogger(
-            server_url=env_vars.get("NOEIRA_CLOUD_URL", ""),
-            run_name="Rainbow CarRacing Pixel HYBRID (cpu env + gpu train)",
-            buffer_size=64,
-            api_key=env_vars.get("NOEIRA_CLOUD_API_KEY", ""),
+        var run = RunContext(
+            project=String("box2d"),
+            driver=String("examples/car_racing/rainbow_car_racing_pixel_hybrid_training.mojo"),
+            slug=String("rainbow-car-racing-pixel"),
+            env=String("builtin:box2d/car_racing"),
         )
+        var checkpoint_path = run.checkpoint_path(String("last"))
+        print("  Run:", run.dir)
+        var logger = run_logger(run, buffer_size=64)
         logger.set_config("agent", "Rainbow DQN CNN (hybrid)")
         logger.set_config("env", "CarRacingMB pixel (CPU)")
         logger.set_config("n_envs", String(N_ENVS))
         logger.set_config("n_step", String(N_STEP))
+
+        register_run(run, logger)
+        var artifacts = sink_for_run(run.id, run.dir)
 
         print("Starting hybrid training...")
         print("-" * 70)
@@ -132,7 +136,7 @@ def main() raises:
 
         try:
             var _ep_returns = agent.train_cpu_batched[
-                BatchedCarRacing, N_ENVS, N_STEP, RemoteLogger
+                BatchedCarRacing, N_ENVS, N_STEP, RunLogger
             ](
                 env,
                 NUM_STEPS,
@@ -144,7 +148,9 @@ def main() raises:
                 logger=Pointer(to=logger).as_unsafe_any_origin(),
                 diag_every=5_000,
                 checkpoint_every=CKPT_EVERY,
-                checkpoint_path=String(CKPT_PATH),
+                checkpoint_path=checkpoint_path,
+                artifacts=artifacts,
+                run_dir=run.dir,
                 eval_env=Pointer(to=eval_env).as_unsafe_any_origin(),
                 eval_every=100_000,
                 # 8 episodes is too few — a couple of -100 run-offs drag the
@@ -155,7 +161,10 @@ def main() raises:
             )
 
             var elapsed_s = Float64(perf_counter_ns() - start_time) / 1e9
-            logger.close()
+            finish_run(
+                run, logger, artifacts,
+                String("mean_return_10=") + String(agent.mean_return()),
+            )
             print("-" * 70)
             print("Hybrid Training Complete")
             print("Training time:", fit(String(elapsed_s), 6), "seconds")

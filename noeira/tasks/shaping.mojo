@@ -31,6 +31,8 @@ the SPARSE reward — the goal bit and nothing else — instead of a shaped one
 with meaningless parameters. Same bias-toward-safe as the init-region words.
 """
 
+from std.math import sqrt
+
 from noeira.physics3d.gpu.constants import (
     META_IDX_SHAPE_W_GOAL, META_IDX_SHAPE_W_REACH,
     META_IDX_GOAL_MARGIN, META_IDX_REACH_MARGIN,
@@ -90,6 +92,72 @@ def shaping_words(
     out.append(goal_margin)
     out.append(reach_margin)
     return out^
+
+
+comptime REWARD_MODE_WORDS: Int = 2
+"""How many `meta` words `reward_mode_words` returns, starting at
+`META_IDX_REWARD_MODE`: the mode and the success bonus. (The block's other
+two words, `META_IDX_PHI_PREV` / `META_IDX_EPISODE_FLAGS`, are episode state the
+hook and the reset own — a driver never writes them.)"""
+
+
+def reward_mode_words(
+    potential: Bool, success_bonus: Float64 = 0.0
+) raises -> List[Float64]:
+    """`[mode, success_bonus]` for `meta[META_IDX_REWARD_MODE ..]`.
+
+    `potential=False` is the LEGACY reward (every shaped term a raw per-step
+    value) — also what an untouched `meta` gives. `potential=True` pays the
+    change of the staged potential and the full budget while the goal holds
+    (`family_config.compute_reward_and_done_gpu`, the potential-based mode).
+
+    ⚠ A SUCCESS BONUS WITHOUT THE POTENTIAL MODE IS REFUSED: the legacy hook
+    never reads the word, so the bonus would be silently absent from a run
+    that asked for it.
+    """
+    if success_bonus < 0.0:
+        raise Error("tasks: negative success bonus " + String(success_bonus))
+    if success_bonus > 0.0 and not potential:
+        raise Error(
+            "tasks: a success bonus (" + String(success_bonus) + ") needs the"
+            " potential-based reward mode; the legacy hook never reads it."
+        )
+    var out = List[Float64]()
+    out.append(1.0 if potential else 0.0)
+    out.append(success_bonus)
+    return out^
+
+
+@always_inline
+def near_transport_shortfall[
+    DTYPE: DType
+](
+    ex: Scalar[DTYPE], ey: Scalar[DTYPE], ez: Scalar[DTYPE],
+    radius: Scalar[DTYPE],
+) -> Scalar[DTYPE]:
+    """The `Near(a, b, radius)` shortfall the POTENTIAL-BASED reward measures:
+    `max(|horizontal|, |vertical|) - radius`, floored at 0.
+
+    ⚠⚠ NOT THE 3D DISTANCE, BECAUSE THE 3D DISTANCE PAYS NEGATIVE FOR THE LIFT
+    THE TASK NEEDS. `so101_tower_cube_in_bowl` is `Near(brick, bowl, 0.045)`:
+    with the 3D shortfall, raising the brick off the desk moves it AWAY from
+    the bowl's origin, so the goal potential DROPS on the one move that can
+    get the brick over the rim, and the cheap optimum is to push it along the
+    desk against the bowl (0.078 away at the rim). PPO sat at ~2 % success for
+    20M steps (26 Sep). so101-nexus's reward notes name this trap ("an undo
+    factor pays negative on the lift the task requires") and fix it with a
+    Chebyshev transport distance.
+
+    Along the ideal trajectory it never increases: lifting is FREE while the
+    horizontal gap exceeds the height gap, carrying reduces it, and lowering
+    into the bowl reduces it. It is <= the 3D shortfall, so it reaches 0 no
+    later than the predicate. The SUCCESS test is still the 3D `Near`.
+    """
+    var h = sqrt(ex * ex + ey * ey)
+    var v = ez if ez > Scalar[DTYPE](0) else -ez
+    var m = h if h > v else v
+    var d = m - radius
+    return d if d > Scalar[DTYPE](0) else Scalar[DTYPE](0)
 
 
 comptime OPTIMAL_MARGIN_PER_METRE: Float64 = 1.5174271293851465

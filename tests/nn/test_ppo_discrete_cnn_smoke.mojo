@@ -101,11 +101,11 @@ def main() raises:
     assert_true(n_updates > 0, "train_step never fired over 160 steps")
 
     var m = trainer.flush_metrics()
-    _finite(Float64(m.actor_loss.to_f64()), "actor_loss")
+    _finite(Float64(m.policy_loss.to_f64()), "policy_loss")
     _finite(Float64(m.critic_loss.to_f64()), "critic_loss")
     _finite(Float64(m.entropy.to_f64()), "entropy")
     print("rollout updates fired:", n_updates)
-    print("actor_loss :", m.actor_loss.to_f64())
+    print("actor_loss :", m.policy_loss.to_f64())
     print("critic_loss:", m.critic_loss.to_f64())
     print("entropy    :", m.entropy.to_f64())
     print("train_steps:", trainer.total_train_steps())

@@ -24,7 +24,8 @@ Run:
     pixi run -e nvidia mojo run -I . examples/procgen/leaper_rainbow_training_gpu.mojo   # training
 
 Heavy training should run on NVIDIA (Apple Metal is flaky under sustained load);
-the CNN q-net + optimizer are checkpointed to CKPT_PATH.
+the CNN q-net + optimizer are checkpointed to the run's `checkpoints/last.ckpt`
+(a `RunContext`, project `procgen`; `run_logger` writes `metrics.csv` + the monitor).
 """
 
 from std.random import seed
@@ -32,8 +33,9 @@ from std.time import perf_counter_ns
 from std.memory import Pointer, ArcPointer
 from max.gpu.host import DeviceContext
 
-from noeira.core.dotenv import load_dotenv
-from noeira.core.logger import RemoteLogger
+from noeira.core.run import RunContext, register_run
+from noeira.core.run_session import RunLogger, finish_run, run_logger
+from noeira.io.artifact_sink import sink_for_run
 from noeira.nn.constants import DT
 
 from noeira.deep_agents.c51.config import RainbowCNN
@@ -78,7 +80,6 @@ comptime NUM_STEPS = 1_000_000  # single level converges well inside this
 comptime LR = Scalar[DT](6.25e-5)
 
 comptime CKPT_EVERY = 250_000
-comptime CKPT_PATH = "checkpoints/rainbow_procgen_leaper_pixel.ckpt"
 
 comptime BatchedLeaper = BatchedCpuDiscreteEnv[LeaperCNNEnv, N_ENVS, OBS_DIM]
 
@@ -154,18 +155,17 @@ def main() raises:
         print("  Buffer:", BUFFER_CAPACITY, "(GPU-resident, uint8 obs ring)")
         print("  Batch:", BATCH_SIZE, " N-step:", N_STEP, " lr:", LR)
         print("  Warmup:", WARMUP, " Total steps:", NUM_STEPS)
-        print("  Checkpoint:", CKPT_PATH, "(every", CKPT_EVERY, "steps)")
+        var run = RunContext(
+            project=String("procgen"),
+            driver=String("examples/procgen/leaper_rainbow_training_gpu.mojo"),
+            slug=String("rainbow-leaper"),
+            env=String("builtin:procgen/leaper"),
+        )
+        var checkpoint_path = run.checkpoint_path(String("last"))
+        print("  Run:", run.dir, "(checkpoint every", CKPT_EVERY, "steps)")
         print()
 
-        var env_vars = load_dotenv()
-        var api_key = env_vars.get("NOEIRA_CLOUD_API_KEY", "")
-        var url = env_vars.get("NOEIRA_CLOUD_URL", "")
-        var logger = RemoteLogger(
-            server_url=url,
-            run_name="Rainbow Procgen Leaper Pixel GPU",
-            buffer_size=64,
-            api_key=api_key,
-        )
+        var logger = run_logger(run, buffer_size=64)
         logger.set_config("agent", "Rainbow DQN CNN (deep_agents, GPU)")
         logger.set_config("env", "procgen-leaper-easy")
         logger.set_config("obs", "3x84x84")
@@ -174,12 +174,15 @@ def main() raises:
         logger.set_config("lr", String(LR))
         logger.set_config("n_step", String(N_STEP))
 
+        register_run(run, logger)
+        var artifacts = sink_for_run(run.id, run.dir)
+
         print("Starting GPU training...")
         print("-" * 70)
         var start = perf_counter_ns()
         try:
             var _ret = agent.train_cpu_batched[
-                BatchedLeaper, N_ENVS, N_STEP, RemoteLogger
+                BatchedLeaper, N_ENVS, N_STEP, RunLogger
             ](
                 env,
                 NUM_STEPS,
@@ -191,13 +194,18 @@ def main() raises:
                 logger=Pointer(to=logger).as_unsafe_any_origin(),
                 diag_every=5_000,
                 checkpoint_every=CKPT_EVERY,
-                checkpoint_path=String(CKPT_PATH),
+                checkpoint_path=checkpoint_path,
+                artifacts=artifacts,
+                run_dir=run.dir,
                 eval_env=Pointer(to=eval_env).as_unsafe_any_origin(),
                 eval_every=100_000,
                 eval_episodes=N_ENVS,
             )
             var elapsed = Float64(perf_counter_ns() - start) / 1e9
-            logger.close()
+            finish_run(
+                run, logger, artifacts,
+                String("mean_return_10=") + String(agent.mean_return()),
+            )
             print("-" * 70)
             print("Done in", fit(String(elapsed), 8), "s")
             print("Final mean return (last 10):", agent.mean_return())

@@ -85,7 +85,7 @@ from noeira.nn.core.call import call_forward, call_vjp
 from noeira.nn.core.initializer import Initializer, Xavier
 from noeira.nn.optimizer.adam import Adam
 from noeira.nn.core.checkpoint import (
-    CheckpointWriter, CheckpointReader, _split_lines,
+    CheckpointReader, _split_lines,
     BinaryCheckpointWriter, BinaryCheckpointReader,
     _read_file_bytes, _write_file_bytes, _is_v3_header,
 )

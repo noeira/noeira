@@ -3,6 +3,7 @@
     pixi run -e nvidia mojo run -I . examples/libero/libero_eval_batched.mojo
     pixi run -e nvidia mojo run -I . examples/libero/libero_eval_batched.mojo --inits 20 --steps 600
     pixi run -e apple  mojo run -I . examples/libero/libero_eval_batched.mojo --steps 40   # a small family
+    pixi run -e nvidia mojo run -I . examples/libero/libero_eval_batched.mojo --policy <run_id>   # a libero-bc-train run
 
 `examples/libero/libero_eval.mojo` runs `lifelong/metric.py`'s loop one env at a
 time on the CPU. This is the same loop on the batched GPU env, lane per
@@ -186,6 +187,7 @@ from noeira.nn.constants import DT
 from noeira.nn.core.tensor import Tensor
 from noeira.nn.core.tensor_refs import TensorRefs
 from noeira.nn.core.checkpoint import load_params
+from noeira.core.run import resolve_checkpoint
 from noeira.nn.core.initializer import Kaiming
 from noeira.physics3d.fields import Data, Model, DynDims
 from noeira.physics3d.model.model_def import ModelDefLike
@@ -600,6 +602,7 @@ def run[T: PlacementTable, M: ModelDefLike](
     video_path: String, video_lane: Int, trace_lane: Int,
     knn_store: String, knn_k: Int, knn_vel: Bool, demo_init: String,
     only_task: Int, act_ckpt: String, act_m: Float64, act_latent: String,
+    act_no_dq: Bool,
 ) raises:
     comptime E = Phyics3dBatchedEnv[
         M, LiberoOscConfig[T], LANES, CRBA_TREEWALK=True
@@ -779,6 +782,9 @@ def run[T: PlacementTable, M: ModelDefLike](
               ", temporal ensemble m =", act_m,
               "(paper's 0.01; NEGATIVE favours the newest query)" if act_m != Float64(ACT_TEMPORAL_ENSEMBLE_M) else "")
         print("          fitted on", act_norm.store)
+        if act_no_dq:
+            print("          proprio: the nine DIFFERENCE words fed as ZERO (--act-no-dq; the"
+                  " ablation, for a checkpoint fitted on a --no-dq store)")
         print("          latent :", "z ~ N(0, I), a prior DRAW per query (--act-latent sample)"
               if act_latent == "sample" else "z = 0, the prior mean (the paper's)")
         if act_exec == 0:
@@ -1301,7 +1307,8 @@ def run[T: PlacementTable, M: ModelDefLike](
                         elif k < 2 * AQP:
                             var cur = Float64(env.d.qpos.data[e * NQ + qadr9[k - AQP]])
                             raw = Scalar[DT](
-                                cur - act_prev[e * AQP + k - AQP] if t_pol > 0 else 0.0
+                                cur - act_prev[e * AQP + k - AQP]
+                                if (t_pol > 0 and not act_no_dq) else 0.0
                             )
                         else:
                             raw = Scalar[DT](1.0 if k - 2 * AQP == r_task else 0.0)
@@ -1614,6 +1621,7 @@ def main() raises:
     var act_ckpt = String("best")
     var act_m = Float64(ACT_TEMPORAL_ENSEMBLE_M)
     var act_latent = String("zero")
+    var act_no_dq = False
     var i = 1
     while i < len(args):
         var s = String(args[i])
@@ -1651,6 +1659,8 @@ def main() raises:
                 i += 1
         elif s == "--knn-vel":
             knn_vel = True
+        elif s == "--act-no-dq":
+            act_no_dq = True
         elif s == "--act-latent" and i + 1 < len(args):
             act_latent = String(args[i + 1])
             if act_latent != "zero" and act_latent != "sample":
@@ -1683,14 +1693,18 @@ def main() raises:
         else:
             raise Error(
                 "libero eval batched: unknown argument '" + s + "' (--inits N,"
-                " --steps N, --check-lanes K, --sampled, --policy PATH,"
+                " --steps N, --check-lanes K, --sampled, --policy RUN_ID|PATH,"
                 " --act DIR, --act-exec N, --check-obs [STORE], --video F.mp4,"
                 " --video-lane L, --trace-lane L, --knn [STORE], --knn-k N, --knn-vel,"
                 " --demo-init [STORE], --task T, --act-ckpt best|last, --act-m M,"
-                " --act-latent zero|sample)"
+                " --act-latent zero|sample, --act-no-dq)"
             )
         i += 1
 
+    if policy_path != "":
+        # a RUN ID -> its `checkpoints/last.ckpt` (what libero_bc_train
+        # writes, `.norm` sidecar beside it); a file is used as is.
+        policy_path = resolve_checkpoint(policy_path, String("last"))
     if knn_k < 1 or knn_k > 64:
         raise Error("--knn-k must be in [1, 64]")
     if act_exec < 0 or act_exec > LIBERO_ACT_K:
@@ -1701,30 +1715,35 @@ def main() raises:
             n_inits, max_steps, check_lanes, sampled, policy_path, act_dir, act_exec,
             obs_store, video_path, video_lane, trace_lane, knn_store, knn_k,
             knn_vel, demo_init, only_task, act_ckpt, act_m, act_latent,
+            act_no_dq,
         )
     elif FAMILY == "libero_object":
         run[LiberoObjectPlacement, LiberoObjectModel](
             n_inits, max_steps, check_lanes, sampled, policy_path, act_dir, act_exec,
             obs_store, video_path, video_lane, trace_lane, knn_store, knn_k,
             knn_vel, demo_init, only_task, act_ckpt, act_m, act_latent,
+            act_no_dq,
         )
     elif FAMILY == "libero_spatial":
         run[LiberoSpatialPlacement, LiberoSpatialModel](
             n_inits, max_steps, check_lanes, sampled, policy_path, act_dir, act_exec,
             obs_store, video_path, video_lane, trace_lane, knn_store, knn_k,
             knn_vel, demo_init, only_task, act_ckpt, act_m, act_latent,
+            act_no_dq,
         )
     elif FAMILY == "libero_kitchen_scene3":
         run[LiberoKitchenScene3Placement, LiberoKitchenScene3Model](
             n_inits, max_steps, check_lanes, sampled, policy_path, act_dir, act_exec,
             obs_store, video_path, video_lane, trace_lane, knn_store, knn_k,
             knn_vel, demo_init, only_task, act_ckpt, act_m, act_latent,
+            act_no_dq,
         )
     elif FAMILY == "libero_kitchen_scene5":
         run[LiberoKitchenScene5Placement, LiberoKitchenScene5Model](
             n_inits, max_steps, check_lanes, sampled, policy_path, act_dir, act_exec,
             obs_store, video_path, video_lane, trace_lane, knn_store, knn_k,
             knn_vel, demo_init, only_task, act_ckpt, act_m, act_latent,
+            act_no_dq,
         )
     else:
         comptime assert False, (

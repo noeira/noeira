@@ -6,6 +6,8 @@ description: The dm_control suite and its manipulation tasks, ported to physics3
 import Maturity from '~/components/Maturity.astro';
 import Paper from '~/components/Paper.astro';
 import Papers from '~/components/Papers.astro';
+import Demo from '~/components/Demo.astro';
+import DemoGrid from '~/components/DemoGrid.astro';
 
 <Maturity level="experimental" note="Every task is parity-gated against MuJoCo and the reference task. None has a documented training result yet." />
 
@@ -33,6 +35,21 @@ tree — and a benchmark whose returns compare across tasks.
 		note="The manipulation tasks and the dog."
 	/>
 </Papers>
+
+<DemoGrid min="12rem">
+	<Demo name="dm_walker" caption="walker" meta="walk · side camera" />
+	<Demo name="dm_cheetah" caption="cheetah" meta="run · side camera" />
+	<Demo name="dm_humanoid" caption="humanoid" meta="walk · side camera" />
+	<Demo name="dm_quadruped" caption="quadruped" meta="walk · y camera" />
+	<Demo name="dm_dog" caption="dog" meta="walk · side camera" />
+	<Demo name="dm_finger" caption="finger" meta="spin" />
+	<Demo name="dm_fish" caption="fish" meta="swim · tracking camera" />
+	<Demo name="dm_manipulator" caption="manipulator" meta="bring_ball · fixed camera" />
+</DemoGrid>
+
+Uniform random actions through the model's own cameras
+(`examples/dm_control/export_dm_gifs.mojo`): the clips show the models and
+their contacts, not a trained policy.
 
 ## The suite's rules
 

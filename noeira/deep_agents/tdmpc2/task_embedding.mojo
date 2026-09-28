@@ -30,6 +30,9 @@ from layout import Layout, LayoutTensor
 
 from noeira.nn.constants import DT, TPB
 from noeira.nn.core.tensor import Tensor
+from noeira.nn.core.checkpoint import (
+    BinaryCheckpointReader, BinaryCheckpointWriter, CheckpointScalars,
+)
 
 
 # ── GPU kernels (operate over storage Tensor `.lt` views) ────────────────
@@ -373,6 +376,43 @@ struct TaskEmbedding[NUM_TASKS: Int, TASK_EMB: Int](
         self.param.upload(c)
         self.m.upload(c)
         self.v.upload(c)
+
+    def write_v3(
+        mut self, mut w: BinaryCheckpointWriter, mut sc: CheckpointScalars,
+        name: String,
+    ) raises:
+        """One `P` section (param + m + v, moments ALWAYS written — the table
+        is tiny and trained by its own Adam) and the bias-correction powers
+        as `K` scalars `<name>.b1_pow` / `.b2_pow`. The table's Adam is part
+        of the checkpoint even when the networks' is not: it has no `t` to
+        re-derive the powers from."""
+        self.sync_to_host()
+        var mode = w.mode
+        var save_moments = w.save_moments
+        w.mode = 0
+        w.save_moments = True
+        w.visit_rt["cpu"](
+            name, self.param, self.grad, self.m, self.v, Self.N, False, None
+        )
+        w.mode = mode
+        w.save_moments = save_moments
+        sc.set(name + ".b1_pow", Float64(self.b1pow))
+        sc.set(name + ".b2_pow", Float64(self.b2pow))
+
+    def read_v3(mut self, mut r: BinaryCheckpointReader, name: String) raises:
+        """The tensor half of `write_v3`. Call `take_scalars` once the reader
+        has reached the `K` sections — that is also what uploads."""
+        var mode = r.mode
+        r.mode = 0
+        r.visit_rt["cpu"](
+            name, self.param, self.grad, self.m, self.v, Self.N, False, None
+        )
+        r.mode = mode
+
+    def take_scalars(mut self, sc: CheckpointScalars, name: String) raises:
+        self.b1pow = Scalar[DT](sc.get(name + ".b1_pow", Float64(self.b1pow)))
+        self.b2pow = Scalar[DT](sc.get(name + ".b2_pow", Float64(self.b2pow)))
+        self.upload_from_host()
 
     def save_body(mut self, mut out: String, name: String) raises:
         """Append param + m + v + Adam scalars as a small text body. On GPU,

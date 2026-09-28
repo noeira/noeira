@@ -381,6 +381,9 @@ def main() raises:
     if have_file:
         try:
             var prev = read_calib(calib_path)
+            if prev.model != "pinhole":
+                # the studio's pose readout is OpenCV's pinhole solve_pnp
+                raise Error("a " + prev.model + " calibration, not loaded")
             cal_k = prev.k_matrix()
             cal_dist = prev.dist.copy()
             fx = Float32(prev.fx)

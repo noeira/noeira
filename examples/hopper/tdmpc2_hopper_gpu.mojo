@@ -26,8 +26,10 @@ from std.time import perf_counter_ns
 from max.gpu.host import DeviceContext
 
 from noeira.nn.constants import DT
-from noeira.core.dotenv import load_dotenv
-from noeira.core.logger import RemoteLogger
+from noeira.core.run import RunContext, register_run
+from noeira.core.run_session import RunLogger, finish_run, run_logger
+from noeira.deep_agents.training.checkpoint import announce_checkpoint
+from noeira.io.artifact_sink import sink_for_run
 from noeira.deep_agents.tdmpc2.agent import TDMPC2Agent
 from noeira.deep_agents.tdmpc2.config import TDMPC2
 from noeira.envs.hopper import Hopper, HopperConfig
@@ -55,7 +57,6 @@ comptime TOTAL = 1_000_000
 comptime EVAL_EVERY = 20_000
 comptime DIAG_EVERY = 1_000
 comptime CHECKPOINT_EVERY = 50_000
-comptime CHECKPOINT_PATH = "tdmpc2_hopper.ckpt"
 comptime EVAL_EPS = 5
 comptime EP_LEN = 1_000
 
@@ -104,20 +105,21 @@ def main() raises:
         learning_starts=LEARN_START, bce_coef=Scalar[DT](BCE_COEF),
     )
 
-    var env_vars = load_dotenv()
-    var logger = RemoteLogger(
-        server_url=env_vars.get("NOEIRA_CLOUD_URL", ""),
-        run_name="TD-MPC2 Hopper",
-        buffer_size=64,
-        api_key=env_vars.get("NOEIRA_CLOUD_API_KEY", ""),
+    # ─── Run + logger ───────────────────────────────────────────────────────
+    var run = RunContext(
+        project=String("mujoco"),
+        driver=String("examples/hopper/tdmpc2_hopper_gpu.mojo"),
+        slug=String("tdmpc2-hopper"),
+        env=String("builtin:mujoco/hopper"),
     )
+    var checkpoint_path = run.checkpoint_path(String("last"))
+    print("  Run:", run.dir)
+    var logger = run_logger(run, buffer_size=64)
     logger.set_config("algorithm", "TD-MPC2")
     logger.set_config("env", "Hopper")
+    register_run(run, logger)
+    var artifacts = sink_for_run(run.id, run.dir)
     var logger_ptr = Pointer(to=logger).as_unsafe_any_origin()
-    if env_vars.get("NOEIRA_CLOUD_URL", "").byte_length() > 0:
-        print("  logger: ENABLED → streaming each", DIAG_EVERY, "steps")
-    else:
-        print("  logger: DISABLED — NOEIRA_CLOUD_URL not in .env")
 
     var obs = env.reset_obs_list()
     var obsbuf = alloc[Scalar[DT]](OBS)
@@ -147,10 +149,11 @@ def main() raises:
         if step >= LEARN_START and step % TRAIN_EVERY == 0:
             _ = ag.train_step()
         if step > 0 and step % DIAG_EVERY == 0:
-            ag.flush_metrics_through_logger[RemoteLogger](logger_ptr, step)
+            ag.flush_metrics_through_logger[RunLogger](logger_ptr, step)
             logger.flush()
         if step > 0 and step % CHECKPOINT_EVERY == 0:
-            ag.save_state(CHECKPOINT_PATH)
+            ag.save_state(checkpoint_path)
+            announce_checkpoint(checkpoint_path, artifacts, run.dir)
         if step > 0 and step % EVAL_EVERY == 0:
             var ret = _greedy_eval(ag, env)
             if ret > best:
@@ -164,12 +167,15 @@ def main() raises:
                 " (", elapsed, "s )",
             )
 
-    ag.save_state(CHECKPOINT_PATH)
-    logger.close()
+    ag.save_state(checkpoint_path)
+    announce_checkpoint(checkpoint_path, artifacts, run.dir)
+    finish_run(
+        run, logger, artifacts, String("best_eval_return=") + String(best)
+    )
     _ = logger
     print("=" * 70)
     print("  FINAL best eval return =", best)
     print("  ( Hopper: >1500 strong, >3000 excellent )")
-    print("  checkpoint:", CHECKPOINT_PATH)
+    print("  run:", run.dir)
     print("=" * 70)
     obsbuf.free(); actbuf.free()

@@ -56,3 +56,9 @@ tests/dm_control/test_reward_relabel.mojo
 # a 192 M-step run — and a format change that could not read the old files
 # would break the resume of a run already in flight.
 tests/deep_agents/test_fb_checkpoint_formats.mojo
+
+# The actor's observation filter (§12.34-12.35): the reference's actor keys are
+# `state, last_action, history_actor` and EXCLUDE `privileged_state`, which f /
+# critic get. Values checked, not widths — a Parallel of the wrong two Slices
+# has the right width.
+tests/fb/test_bfm_actor_view.mojo

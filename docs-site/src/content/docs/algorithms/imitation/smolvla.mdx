@@ -7,6 +7,7 @@ import Maturity from '~/components/Maturity.astro';
 import Paper from '~/components/Paper.astro';
 import Papers from '~/components/Papers.astro';
 import Demo from '~/components/Demo.astro';
+import SmolvlaQuery from '~/components/diagrams/SmolvlaQuery.astro';
 
 <Maturity level="experimental" note="Inference and fine-tuning work and are gated. First grasp-and-place on the real arm on 20 Sep 2026; no success rate has been measured." />
 
@@ -63,6 +64,8 @@ tokenised instruction and one state token — and caches its keys and values
 **suffix**, the action chunk: starting from Gaussian noise at `t = 1`, each of
 the 10 Euler steps predicts a velocity field and moves toward `t = 0`. The
 prefix is computed once per query, the expert ten times.
+
+<SmolvlaQuery />
 
 The prefix and suffix are joined by a block attention mask: the prefix cannot
 see the actions, so training's single joint pass and inference's prefill +

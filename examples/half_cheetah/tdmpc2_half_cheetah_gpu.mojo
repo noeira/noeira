@@ -41,8 +41,9 @@ from std.time import perf_counter_ns
 from max.gpu.host import DeviceContext
 
 from noeira.nn.constants import DT
-from noeira.core.dotenv import load_dotenv
-from noeira.core.logger import RemoteLogger
+from noeira.core.run import RunContext, register_run
+from noeira.core.run_session import RunLogger, finish_run, run_logger
+from noeira.io.artifact_sink import sink_for_run
 from noeira.deep_agents.tdmpc2.config import TDMPC2
 from noeira.envs.half_cheetah import HalfCheetah, HalfCheetahConfig
 
@@ -80,8 +81,6 @@ comptime EP_LEN = 1_000
 comptime DIAG_EVERY = 1_000   # metric-bundle flush → logger cadence
 comptime PRINT_EVERY = 20_000
 comptime CHECKPOINT_EVERY = 50_000
-# Mode-specific path so an MPC run never overwrites an MPC-off checkpoint.
-comptime CHECKPOINT_PATH = "tdmpc2_half_cheetah_mpc.ckpt" if USE_MPC else "tdmpc2_half_cheetah_mpcoff.ckpt"
 
 comptime Env = HalfCheetah[DT, TERMINATE_ON_UNHEALTHY=False]
 
@@ -116,28 +115,32 @@ def main() raises:
         action_scale=Scalar[DT](ACTION_SCALE), learning_starts=LEARN_START,
     )
 
-    # RemoteLogger (dashboard) — URL/key from .env; no-ops if unset.
-    var env_vars = load_dotenv()
-    var logger = RemoteLogger(
-        server_url=env_vars.get("NOEIRA_CLOUD_URL", ""),
-        run_name="TD-MPC2 HalfCheetah",
-        buffer_size=64,
-        api_key=env_vars.get("NOEIRA_CLOUD_API_KEY", ""),
+    # ─── Run + logger ───────────────────────────────────────────────────────
+    # The run directory replaces the old mode-specific checkpoint name: an MPC
+    # run and an MPC-off run never share a directory (the mode is in the slug).
+    var run = RunContext(
+        project=String("mujoco"),
+        driver=String("examples/half_cheetah/tdmpc2_half_cheetah_gpu.mojo"),
+        slug=String("tdmpc2-half-cheetah-mpc") if USE_MPC else String(
+            "tdmpc2-half-cheetah-mpcoff"
+        ),
+        env=String("builtin:mujoco/half_cheetah"),
     )
+    var checkpoint_path = run.checkpoint_path(String("last"))
+    print("  Run:", run.dir)
+    var logger = run_logger(run, buffer_size=64)
     logger.set_config("algorithm", "TD-MPC2")
     logger.set_config("env", "HalfCheetah")
     logger.set_config("mpc", String("1") if USE_MPC else String("0"))
+    register_run(run, logger)
+    var artifacts = sink_for_run(run.id, run.dir)
     var logger_ptr = Pointer(to=logger).as_unsafe_any_origin()
-    if env_vars.get("NOEIRA_CLOUD_URL", "").byte_length() > 0:
-        print("  logger: ENABLED → streaming to dashboard each", DIAG_EVERY, "steps")
-    else:
-        print("  logger: DISABLED — NOEIRA_CLOUD_URL not found in .env (no metrics sent)")
 
     # ─── Single train() call — single-env TD-MPC2 driver ─────────────────
     print("Starting training...")
     print("-" * 70)
     var t_start = perf_counter_ns()
-    var best = ag.train[Env, RemoteLogger, Env, USE_MPC](
+    var best = ag.train[Env, RunLogger, Env, USE_MPC](
         env,
         TOTAL,
         train_every=TRAIN_EVERY,
@@ -145,8 +148,10 @@ def main() raises:
         verbose=True,
         logger=logger_ptr,
         diag_every=DIAG_EVERY,
-        checkpoint_path=CHECKPOINT_PATH,
+        checkpoint_path=checkpoint_path,
         checkpoint_every=CHECKPOINT_EVERY,
+        artifacts=artifacts,
+        run_dir=run.dir,
         eval_env=eval_env_ptr,
         eval_every=EVAL_EVERY,
         eval_episodes=EVAL_EPS,
@@ -155,10 +160,12 @@ def main() raises:
     _ = eval_env  # lifetime extender for eval_env_ptr
     var elapsed = Float64(perf_counter_ns() - t_start) / 1e9
 
-    logger.close()
+    finish_run(
+        run, logger, artifacts, String("best_eval_return=") + String(best)
+    )
     _ = logger  # lifetime extender for logger_ptr
     print("=" * 70)
     print("  FINAL best eval return =", best, " (", elapsed, "s )")
     print("  ( HalfCheetah: >3000 good, >8000 strong )")
-    print("  checkpoint:", CHECKPOINT_PATH)
+    print("  run:", run.dir)
     print("=" * 70)

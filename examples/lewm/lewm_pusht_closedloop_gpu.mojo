@@ -13,8 +13,11 @@ Loads `lewm_pusht_paper.ckpt`. Heavy one-shot (per cycle:
 2 encode forwards + CEM_ITERS·CEM_SAMPLES latent rollouts).
 Run (NVIDIA):
   pixi run -e nvidia mojo run -I . examples/lewm/lewm_pusht_closedloop_gpu.mojo
+  pixi run -e nvidia mojo run -I . examples/lewm/lewm_pusht_closedloop_gpu.mojo --ckpt <run_id>
 """
 
+from std.sys import argv
+from noeira.core.run import resolve_checkpoint
 from max.gpu.host import DeviceContext
 from layout import TileTensor, row_major
 
@@ -78,15 +81,27 @@ comptime Source = WindowSource[
 ]
 
 
+def _flag(name: String, dflt: String) raises -> String:
+    """Value of `--name X`, or `dflt` when the flag is absent."""
+    var av = argv()
+    for i in range(1, len(av)):
+        if String(av[i]) == name:
+            if i + 1 >= len(av):
+                raise Error("flag " + name + " needs a value")
+            return String(av[i + 1])
+    return dflt
+
+
 def main() raises:
+    var ckpt = resolve_checkpoint(_flag(String("--ckpt"), CKPT_PATH), String("last"))
     print("=" * 70)
     print("LeWM nn — PushT CLOSED-LOOP MPC (mean-pool WM, GPU) — retry")
     print("=" * 70)
     var ctx = DeviceContext()
 
     var wm = Trainer.make(lam=Scalar[DT](0.09), lr=Scalar[DT](1e-3), ctx=ctx)
-    print("loading frozen WM", CKPT_PATH, "...")
-    wm.load_params(CKPT_PATH)
+    print("loading frozen WM", ckpt, "...")
+    wm.load_params(ckpt)
 
     print("warming BatchNorm running stats (", BN_WARMUP_STEPS,
           "training-mode forwards over dataset windows) ...")

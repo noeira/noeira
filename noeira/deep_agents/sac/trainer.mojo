@@ -45,6 +45,7 @@ from noeira.nn.optimizer.adam import Adam
 from noeira.nn.optimizer.scalar_adam import ScalarAdam
 from noeira.nn.core.checkpoint import (
     CheckpointReader,
+    CheckpointScalars,
     _is_v3_header,
     _read_file_bytes,
     _split_lines,
@@ -145,6 +146,11 @@ struct SACTrainer[
     var _alpha_accum: Scalar[DT]
     # Diagnostic accumulators (CPU path): batch means drained at flush_metrics.
     var _mean_q_accum: Scalar[DT]            # online Q1(s, a) over the batch
+    # `set_bc_q_ratio`: after every `flush_metrics` the BC weight becomes
+    # max(bc_weight_floor, bc_q_ratio · mean|Q|) — TD3+BC's normalisation,
+    # applied to λ instead of to Q. 0 = fixed λ.
+    var bc_q_ratio: Scalar[DT]
+    var bc_weight_floor: Scalar[DT]
     var _mean_target_accum: Scalar[DT]       # Bellman target y
     var _mean_reward_accum: Scalar[DT]       # batch reward
     var _mean_next_q_accum: Scalar[DT]       # min(Q1_t,Q2_t)(s',a') bootstrap
@@ -207,6 +213,8 @@ struct SACTrainer[
         self._critic_L_accum = Scalar[DT](0.0)
         self._alpha_accum = Scalar[DT](0.0)
         self._mean_q_accum = Scalar[DT](0.0)
+        self.bc_q_ratio = Scalar[DT](0.0)
+        self.bc_weight_floor = Scalar[DT](0.0)
         self._mean_target_accum = Scalar[DT](0.0)
         self._mean_reward_accum = Scalar[DT](0.0)
         self._mean_next_q_accum = Scalar[DT](0.0)
@@ -269,6 +277,8 @@ struct SACTrainer[
         self._critic_L_accum = Scalar[DT](0.0)
         self._alpha_accum = Scalar[DT](0.0)
         self._mean_q_accum = Scalar[DT](0.0)
+        self.bc_q_ratio = Scalar[DT](0.0)
+        self.bc_weight_floor = Scalar[DT](0.0)
         self._mean_target_accum = Scalar[DT](0.0)
         self._mean_reward_accum = Scalar[DT](0.0)
         self._mean_next_q_accum = Scalar[DT](0.0)
@@ -432,6 +442,21 @@ struct SACTrainer[
         """Behaviour-cloning penalty on the batch's first `n_demo_rows` rows —
         `SACActorLoss.set_bc`. Call after the demos are pinned."""
         self.actor_loss_blk.set_bc(weight, n_demo_rows, self.ctx)
+
+    def set_bc_q_ratio(mut self, ratio: Scalar[DT]) raises:
+        """Track the critic: after every `flush_metrics` the BC weight is set
+        to max(λ0, ratio · mean|Q|), λ0 being the weight `set_bc` gave. A
+        fixed λ against a growing Q shrinks the BC term's share of the actor
+        gradient — the tower lift policy peaked at 25k (Q 58) and lost its
+        grasp by 50k (Q 87) that way. 0 turns the tracking off."""
+        if ratio < Scalar[DT](0):
+            raise Error("set_bc_q_ratio: ratio must be >= 0")
+        self.bc_q_ratio = ratio
+        self.bc_weight_floor = self.actor_loss_blk.bc_weight
+
+    def bc_weight(self) -> Scalar[DT]:
+        """The BC weight in force (`SACActorLoss.bc_weight`)."""
+        return self.actor_loss_blk.bc_weight
 
     def set_q_weight(mut self, weight: Scalar[DT]) raises:
         """Multiplier on the SAC half of the actor loss — 0 = BC only.
@@ -974,15 +999,15 @@ struct SACTrainer[
             alpha_val = self._alpha_accum * inv
             critic_val = self._critic_L_accum * inv
         var bundle = SACMetrics(
-            actor_loss=LogScalar[DT](actor_val),
+            policy_loss=LogScalar[DT](actor_val),
             critic_loss=LogScalar[DT](critic_val),
             alpha=LogScalar[DT](alpha_val),
             mean_q=LogScalar[DT](mq),
             mean_target=LogScalar[DT](mtgt),
-            mean_reward=LogScalar[DT](mr),
+            reward_mean=LogScalar[DT](mr),
             mean_next_q=LogScalar[DT](mnq),
             mean_done=LogScalar[DT](md),
-            mean_abs_action=LogScalar[DT](maa),
+            action_abs_mean=LogScalar[DT](maa),
             train_steps=LogScalar[DT](Scalar[DT](self._total_train_steps)),
             n_updates=LogScalar[DT](Scalar[DT](self._update_count)),
         )
@@ -1006,6 +1031,12 @@ struct SACTrainer[
             self.twin_critic_blk.inner.c1.mse_loss.reset_accum["gpu"]()
             self.twin_critic_blk.inner.c2.mse_loss.reset_accum["gpu"]()
         self._update_count = 0
+        if self.bc_q_ratio > Scalar[DT](0) and n > 0:
+            var scaled = self.bc_q_ratio * (mq if mq >= Scalar[DT](0) else -mq)
+            var w = scaled if scaled > self.bc_weight_floor else self.bc_weight_floor
+            self.actor_loss_blk.set_bc_weight(w, self.ctx)
+            if Bool(logger):
+                logger.value()[].log_scalar(String("bc_weight"), Float64(w), step)
         if Bool(logger):
             log_bundle(logger.value()[], bundle, step)
         return bundle^
@@ -1061,8 +1092,14 @@ struct SACTrainer[
         """Write actor + the two ONLINE critics into a SINGLE v3 binary
         checkpoint (chunked + atomic tmp-rename I/O — the old v2 text path
         wrote the final file in one `f.write`, non-atomic and silently
-        truncated at the ~2 GiB write(2) cap). Optimizer moments + α are NOT
-        persisted (resume re-warms)."""
+        truncated at the ~2 GiB write(2) cap). α's whole optimizer
+        (`alpha.*`) and the train-step counter ride as `K` scalars; network
+        optimizer moments are NOT persisted (resume re-warms). α is, because
+        a resume that restarts it at its initial value undoes the part of the
+        run that tuned it."""
+        var sc = CheckpointScalars()
+        self.alpha_opt.put_state(sc, "alpha")
+        sc.set_int("total_train_steps", self._total_train_steps)
         save_params_multi[Self.train_target](
             path,
             self.ctx,
@@ -1070,6 +1107,7 @@ struct SACTrainer[
             self.actor,
             self.pair1.online,
             self.pair2.online,
+            scalars=sc,
         )
 
     def load_state(mut self, path: String) raises:
@@ -1077,12 +1115,16 @@ struct SACTrainer[
         `actor.`/`critic1.`/`critic2.`-prefixed v2 text envelope this trainer
         used to write), then hard-copy online → target."""
         if _is_v3_header(_read_file_bytes(path)):
-            load_params_multi[Self.train_target](
+            var sc = load_params_multi[Self.train_target](
                 path,
                 self.ctx,
                 self.actor,
                 self.pair1.online,
                 self.pair2.online,
+            )
+            self.alpha_opt.take_state(sc, "alpha")
+            self._total_train_steps = sc.get_int(
+                "total_train_steps", self._total_train_steps
             )
         else:
             var content: String

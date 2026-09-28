@@ -423,7 +423,7 @@ struct C51Agent[
 
     def save(mut self, path: String) raises:
         """Thin passthrough to `trainer.save_state(path)`. Writes ONE
-        file (`nn-ckpt v2` envelope) with prefixed sections for q_net
+        file (v3 `storage-ckpt` file) with prefixed sections for q_net
         and q_opt. Replay buffer + episode tracker NOT included.
         CPU-only — GPU trainer raises with a helpful message."""
         self.trainer.save_state(path)

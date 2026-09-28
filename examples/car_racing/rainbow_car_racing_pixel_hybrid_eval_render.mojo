@@ -16,10 +16,13 @@ The CNN q-net identity below MUST match the hybrid training script.
 Run with:
     pixi run -e apple  mojo run -I . examples/car_racing/rainbow_car_racing_pixel_hybrid_eval_render.mojo
     pixi run -e nvidia mojo run -I . examples/car_racing/rainbow_car_racing_pixel_hybrid_eval_render.mojo
+    pixi run -e apple  mojo run -I . examples/car_racing/rainbow_car_racing_pixel_hybrid_eval_render.mojo --ckpt <run_id>
 
-Reads checkpoints/rainbow_car_racing_pixel_hybrid.ckpt.
+Reads checkpoints/rainbow_car_racing_pixel_hybrid.ckpt, or the run/file given by `--ckpt`.
 """
 
+from std.sys import argv
+from noeira.core.run import resolve_checkpoint
 from max.gpu.host import DeviceContext
 
 from noeira.nn.constants import DT
@@ -77,11 +80,23 @@ comptime RainbowTrainer = C51Trainer[
 ]
 
 
+def _flag(name: String, dflt: String) raises -> String:
+    """Value of `--name X`, or `dflt` when the flag is absent."""
+    var av = argv()
+    for i in range(1, len(av)):
+        if String(av[i]) == name:
+            if i + 1 >= len(av):
+                raise Error("flag " + name + " needs a value")
+            return String(av[i + 1])
+    return dflt
+
+
 def main() raises:
+    var ckpt = resolve_checkpoint(_flag(String("--ckpt"), String(CKPT_PATH)), String("last"))
     print("=" * 70)
     print("Rainbow CarRacing — HYBRID checkpoint eval (color scene, CPU env)")
     print("=" * 70)
-    print("  Checkpoint:", CKPT_PATH, "  Episodes:", EVAL_EPISODES)
+    print("  Checkpoint:", ckpt, "  Episodes:", EVAL_EPISODES)
     print()
 
     with DeviceContext() as ctx:
@@ -92,7 +107,7 @@ def main() raises:
             per_alpha=Scalar[DT](0.5), per_beta=Scalar[DT](0.4),
             per_epsilon=Scalar[DT](1e-6), nstep=N_STEP, v_min=V_MIN, v_max=V_MAX,
         )
-        trainer.load_state(String(CKPT_PATH))
+        trainer.load_state(ckpt)
         print("Checkpoint loaded. Starting live play...")
         trainer.set_noise_scale(Scalar[DT](0.0))  # deterministic greedy
 

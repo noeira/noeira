@@ -1,6 +1,6 @@
 """FB checkpoints are binary, and the text ones already on disk still load.
 
-`FBTrainer.save_state` used to write `CheckpointWriter`'s v2 text format — one
+`FBTrainer.save_state` used to write `LegacyV2CheckpointWriter`'s v2 text format — one
 DECIMAL FLOAT PER LINE, 23 bytes for a 4-byte number. On the G1 run that is a
 500 MB `.ckpt` plus a 421 MB `.cpr` sidecar every checkpoint, ~86 GB over a
 192 M-step run, and ~16.5 s of the step it lands on. It now writes v3 binary
@@ -36,7 +36,7 @@ from noeira.nn.primitives.linear import Linear
 from noeira.nn.primitives.activations import ReLU, Tanh
 from noeira.nn.primitives.layer_norm import LayerNorm
 from noeira.nn.core.param import walk_params, ParamVisitorRef
-from noeira.nn.core.checkpoint import CheckpointWriter
+from noeira.nn.core.checkpoint import LegacyV2CheckpointWriter
 from noeira.io.fileio import file_size
 from noeira.deep_agents.fb.trainer import FBTrainer
 from noeira.deep_agents.fb import sample_z_uniform
@@ -84,7 +84,7 @@ def _save_v2(mut t: Trainer, path: String) raises:
     """`FBTrainer.save_state` EXACTLY as it was before v3 — the same writer,
     the same four prefixes, the same order. This is what makes [2] a real
     legacy-file test rather than a v3 file under another name."""
-    var w = CheckpointWriter(save_moments=False)
+    var w = LegacyV2CheckpointWriter(save_moments=False)
     w.mode = 0
     walk_params["cpu"](t.bnet.online, w, t.ctx, "b")
     walk_params["cpu"](t.f1.online, w, t.ctx, "f1")

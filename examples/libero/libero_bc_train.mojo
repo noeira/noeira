@@ -8,7 +8,15 @@ Reads `build/demos/<family>.lowdim.h5` (`data/libero_demos.mojo`'s store: one
 episode per demonstration, `state` in OUR joint order, `action` the recorded
 seven OSC_POSE words), rebuilds each frame's OBSERVATION exactly as the batched
 env writes it, fits an MLP, and writes a checkpoint
-`examples/libero/libero_eval_batched.mojo` can load into `_policy_action`.
+`examples/libero/libero_eval_batched.mojo` can load into `_policy_action`:
+
+    pixi run mojo run -I . examples/libero/libero_eval_batched.mojo --policy <run_id>
+
+The checkpoint lives in the run's own directory (`RunContext`, project
+`libero`): `runs/<id>/checkpoints/last.ckpt` with its `.norm` sidecar beside it
+(`last.ckpt.norm`) — the network at the END of the fit, the only one
+`fit_bc` writes. `--out PATH` still overrides the location. The run's
+`run.kv`, `metrics.csv` and monitor row carry the same id.
 
 ## ⚠⚠ THE OBSERVATION IS REBUILT, NOT STORED — AND THAT IS THE POINT
 
@@ -53,6 +61,10 @@ from std.sys import argv
 from std.time import perf_counter_ns
 
 
+from noeira.core.run import RunContext, register_run
+from noeira.core.run_session import finish_run, run_logger
+from noeira.deep_agents.training.checkpoint import announce_checkpoint
+from noeira.io.artifact_sink import sink_for_run
 from noeira.data.store import TrajectoryStore
 from noeira.physics3d.fields import Data, Model, DynDims
 from noeira.physics3d.parser.runtime_load import (
@@ -86,7 +98,6 @@ comptime FAMILY = "libero_goal"
 comptime FAMILY_DIR = "noeira/envs/libero/families/"
 comptime TASK_DIR = "noeira/envs/libero/tasks/"
 comptime STORE = "build/demos/libero_goal.lowdim.h5"
-comptime OUT_DIR = "build/policies"
 comptime OBS = LIBERO_GOAL_OBS_DIM
 comptime ACT = 7
 comptime HID = BC_HID
@@ -120,7 +131,7 @@ def main() raises:
     var lr = 1.0e-3
     var val_demos = 5
     var max_demos = 0
-    var out_path = String(OUT_DIR) + "/libero_goal_bc.ckpt"
+    var out_path = String("")
     var i = 1
     while i < len(args):
         var s = String(args[i])
@@ -303,9 +314,44 @@ def main() raises:
             "libero bc train: the rebuilt observation is constant or has an"
             " empty goal block — the frames were not written"
         )
+    # ── the run: checkpoint, metrics and record under runs/<id>/ ──────────
+    var run = RunContext(
+        project=String("libero"),
+        driver=String("examples/libero/libero_bc_train.mojo"),
+        slug=String("bc-libero-goal"),
+        env=String("builtin:libero_goal"),
+        dataset=String(STORE),
+    )
+    if out_path.byte_length() == 0:
+        out_path = run.checkpoint_path(String("last"))
+    print("  run   :", run.dir)
+    print("  ckpt  :", out_path)
+    var logger = run_logger(run)
+    logger.set_config("algorithm", "BC")
+    logger.set_config("suite", "libero_goal")
+    logger.set_config("store", String(STORE))
+    logger.set_config("epochs", String(epochs))
+    logger.set_config("lr", String(lr))
+    logger.set_config("batch", String(BATCH))
+    logger.set_config("val_demos", String(val_demos))
+    logger.set_config("train_rows", String(n_tr))
+    logger.set_config("val_rows", String(data.n_va))
+    register_run(run, logger)
+    var artifacts = sink_for_run(run.id, run.dir)
+
     # ── normalise, baseline, fit, save, re-score (`deep_agents/bc/fit.mojo`) ─
     var rep = fit_bc[OBS, ACT, BATCH](
         data, epochs, lr, out_path, String("libero bc train")
     )
+    announce_checkpoint(out_path, artifacts, run.dir)
+    announce_checkpoint(out_path + ".norm", artifacts, run.dir)
     print("=== best val MSE", rep.best_val, "against zero", rep.mse_zero,
           "and mean", rep.mse_mean, "===")
+    finish_run(
+        run, logger, artifacts,
+        String("best_val_mse=") + String(rep.best_val)
+        + " reloaded_val_mse=" + String(rep.reloaded_val)
+        + " mse_zero=" + String(rep.mse_zero)
+        + " mse_mean=" + String(rep.mse_mean),
+    )
+    print("  run record:", run.kv_path())

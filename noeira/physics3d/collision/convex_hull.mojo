@@ -54,6 +54,7 @@ from .hull_cache import (
     hull_cache_store,
 )
 from .mesh_polygons import build_mesh_polygons, polygon_normal
+from .mesh_seed import append_mesh_seed_table
 from .robust_predicates import orient3d_dd
 from ..model.mesh_inertia import (
     MeshInertia,
@@ -1699,6 +1700,11 @@ def load_mesh_hull[
     # Vertex adjacency for the plane-mesh path. Built from the SAME triangles
     # the polygons were merged from, and indexed by global vertex id, so it
     # stays parallel to the vertex block written above.
+    # The hill climb's seed table goes FIRST, so it ends where this mesh's
+    # neighbour lists begin — see `mesh_seed.mojo` for the layout.
+    append_mesh_seed_table[DTYPE](
+        mesh_vert, vert_float_offset, num_hull, edge_list
+    )
     var edge_list_base = len(edge_list)
     for i in range(num_hull):
         edge_adr.append(p.edge_adr[i] + edge_list_base)

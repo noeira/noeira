@@ -216,12 +216,12 @@ def main() raises:
             n_rows += 1
     print("    ", n_rows - 1, "metric rows written")
 
-    var r0 = _csv_value(text, String("eval/success/task_0"))
-    var r1 = _csv_value(text, String("eval/success/task_1"))
-    var e0 = _csv_value(text, String("eval/episodes/task_0"))
-    var e1 = _csv_value(text, String("eval/episodes/task_1"))
-    var ov = _csv_value(text, String("eval/success/overall"))
-    var oe = _csv_value(text, String("eval/episodes/overall"))
+    var r0 = _csv_value(text, String("eval_success_rate_task_0"))
+    var r1 = _csv_value(text, String("eval_success_rate_task_1"))
+    var e0 = _csv_value(text, String("eval_episodes_task_0"))
+    var e1 = _csv_value(text, String("eval_episodes_task_1"))
+    var ov = _csv_value(text, String("eval_success_rate"))
+    var oe = _csv_value(text, String("eval_episodes"))
     print("     task_0:", r0, "over", e0, " task_1:", r1, "over", e1,
           " overall:", ov, "over", oe)
     ta.check(r0 == 0.5 and r1 == 0.25,
@@ -238,7 +238,7 @@ def main() raises:
 
     var missing = 0
     try:
-        var _v = _csv_value(text, String("eval/success/task_2"))
+        var _v = _csv_value(text, String("eval_success_rate_task_2"))
         print("    NOT RAISED: a task the table never had")
     except e:
         missing += 1

@@ -16,8 +16,11 @@ checked at runtime against the proprio column (proprio = agent position).
 
 Run (NVIDIA, after lewm_pusht_train_gpu_paper_cls.mojo):
   pixi run -e nvidia mojo run -I . examples/lewm/lewm_pusht_paper_protocol_gpu_cls.mojo
+  pixi run -e nvidia mojo run -I . examples/lewm/lewm_pusht_paper_protocol_gpu_cls.mojo --ckpt <run_id>
 """
 
+from std.sys import argv
+from noeira.core.run import resolve_checkpoint
 from std.memory import alloc
 from std.random import seed as rng_seed, random_float64
 from max.gpu.host import DeviceContext
@@ -92,15 +95,27 @@ comptime Source = WindowSource[
 ]
 
 
+def _flag(name: String, dflt: String) raises -> String:
+    """Value of `--name X`, or `dflt` when the flag is absent."""
+    var av = argv()
+    for i in range(1, len(av)):
+        if String(av[i]) == name:
+            if i + 1 >= len(av):
+                raise Error("flag " + name + " needs a value")
+            return String(av[i + 1])
+    return dflt
+
+
 def main() raises:
+    var ckpt = resolve_checkpoint(_flag(String("--ckpt"), CKPT_PATH), String("last"))
     print("=" * 70)
     print("LeWM nn — PushT PAPER-PROTOCOL planning eval, CLS WM (GPU)")
     print("=" * 70)
     var ctx = DeviceContext()
 
     var wm = Trainer.make(lam=Scalar[DT](0.09), lr=Scalar[DT](1e-3), ctx=ctx)
-    print("loading frozen CLS WM", CKPT_PATH, "...")
-    wm.load_params(CKPT_PATH)
+    print("loading frozen CLS WM", ckpt, "...")
+    wm.load_params(ckpt)
 
     # BN running-stats warm-up (checkpoints don't persist them).
     print("warming BatchNorm running stats (", BN_WARMUP_STEPS,

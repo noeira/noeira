@@ -151,6 +151,7 @@ struct SACActorLoss[
     var _lp_mean: Tensor
     var _loss_acc: Tensor
     var _bc_mask: Tensor    # [B] 1.0 on the demo rows, 0 elsewhere — `set_bc`
+    var _bc_w_dev: Tensor   # [1] the BC weight the `bc_w` Scale reads ON-DEVICE
     var bc_weight: Scalar[DT]
 
     def __init__(out self):
@@ -160,6 +161,7 @@ struct SACActorLoss[
         self._lp_mean = Tensor()
         self._loss_acc = Tensor()
         self._bc_mask = Tensor()
+        self._bc_w_dev = Tensor()
         self.bc_weight = Scalar[DT](0.0)
 
     @staticmethod
@@ -207,6 +209,16 @@ struct SACActorLoss[
             blk._lp_mean.dev.value().enqueue_fill(Scalar[DT](0))
             blk._loss_acc = Tensor.alloc_gpu(c, 2)
             blk._loss_acc.dev.value().enqueue_fill(Scalar[DT](0))
+            # The BC weight lives in a device word the `bc_w` Scale reads at
+            # every launch, like α: a host multiplier is BAKED into a captured
+            # CUDA graph, so `set_bc_weight` after the first train step (the
+            # mean-|Q| tracking of `set_bc_q_ratio`) would be a silent no-op
+            # there. One H2D of one word per flush instead.
+            blk._bc_w_dev = Tensor.alloc_gpu(c, 1)   # device word, zeroed
+            blk._bc_w_dev.ensure(1)                  # + its host copy for `upload`
+            blk.graph.set_node_attr_buf["bc_w", "multiplier"](
+                blk._bc_w_dev.dev.value()
+            )
         return blk^
 
     def set_bc(
@@ -223,7 +235,23 @@ struct SACActorLoss[
             self._bc_mask.data[b] = Scalar[DT](1.0) if b < n_demo_rows else Scalar[DT](0.0)
         if self._bc_mask.dev:
             self._bc_mask.upload(ctx.value())
+        self.set_bc_weight(weight, ctx)
+
+    def set_bc_weight(
+        mut self, weight: Scalar[DT], ctx: Optional[DeviceContext] = None
+    ) raises:
+        """Change λ alone; the mask stays. Safe after the first train step on
+        every target (the GPU weight is a device word, see `make`) — this is
+        what `SACTrainer.flush_metrics` calls to track mean|Q|."""
+        self.bc_weight = weight
         self.graph.set_node_attr["bc_w", "multiplier"](weight)
+        if self._bc_w_dev.dev:
+            self._bc_w_dev.data[0] = weight
+            # ⚠ IN PLACE. `upload` REALLOCATES the device buffer, and the
+            # `bc_w` Scale node holds the handle wired in `make` — an upload
+            # would leave it reading the original zeroed word for the whole
+            # run (it did: the first --bc-q-ratio run trained with λ = 0).
+            self._bc_w_dev.upload_resident(ctx.value())
 
     def set_q_weight(mut self, weight: Scalar[DT]) raises:
         """The multiplier on the SAC half of the loss, `α·logp − min_q`: 1 by

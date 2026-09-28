@@ -1,6 +1,6 @@
 """Did it REACH, does it HOLD, and how hard is it shaking? (CPU, no window)
 
-    pixi run mojo run -I . examples/so101/sac_so_arm101_reach_diag.mojo
+    pixi run mojo run -I . examples/so101/sac_so_arm101_reach_diag.mojo --ckpt <run_id>
 
 ⚠⚠ **THE RETURN DOES NOT ANSWER "DID IT REACH."** The reward is dm_control's
 `tolerance` with `TARGET_RADIUS = 0.02 m` and `REWARD_MARGIN = 0.25 m`, and
@@ -37,6 +37,7 @@ checkpoint does; do not read one table's rate as more precise than the other.
 """
 
 from std.random import seed
+from std.sys import argv
 from std.math import sqrt, asin, abs
 from max.gpu.host import DeviceContext
 
@@ -48,6 +49,7 @@ from noeira.envs.phyics3d_env import Phyics3dEnv
 from noeira.envs.robots.so_arm101_xml import SoArm101Model
 from noeira.envs.robots.so_arm101 import SoArm101ReachConfig
 from noeira.utils.fmt import col, fixed, pad_left
+from noeira.core.run import resolve_checkpoint
 
 comptime EnvT = Phyics3dEnv[
     SoArm101Model, SoArm101ReachConfig, DT, TERMINATE_ON_UNHEALTHY=False
@@ -88,6 +90,17 @@ comptime AgentT = SACAgent[
     SACActorNet[OBS_DIM, ACT_DIM, HIDDEN],
     SACCriticNet[OBS_DIM, ACT_DIM, HIDDEN],
 ]
+
+
+def ckpt_from_argv(default: String) raises -> String:
+    """`--ckpt <run_id|path>`, else `default`. A RUN ID resolves to its
+    `checkpoints/last.ckpt` — what `sac_so_arm101_reach_training_gpu.mojo`
+    writes into its run directory."""
+    var args = argv()
+    for i in range(1, len(args) - 1):
+        if String(args[i]) == "--ckpt":
+            return resolve_checkpoint(String(args[i + 1]), String("last"))
+    return default
 
 
 def episodes(
@@ -187,12 +200,13 @@ def main() raises:
     print("SO-ARM101 reach — reached / held / chatter")
     print("=" * 72)
     var agent = AgentT(action_scale=ACTION_SCALE)
+    var ckpt = ckpt_from_argv(String(CKPT))
     try:
-        agent.load(String(CKPT))
+        agent.load(ckpt)
     except e:
-        print("ERROR loading", CKPT, "-", e)
+        print("ERROR loading", ckpt, "-", e)
         return
-    print("  checkpoint:", CKPT, " episodes:", N_EP, "x", STEPS, "steps")
+    print("  checkpoint:", ckpt, " episodes:", N_EP, "x", STEPS, "steps")
     var ctx = DeviceContext()
     var env = EnvT(ctx)
 

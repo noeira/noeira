@@ -1365,7 +1365,7 @@ def run_muzero_selfplay_arena_gumbel_2p[
             var values = List[Float64]()
             names.append(String("loss")); values.append(last_loss)
             names.append(String("games")); values.append(Float64(total_games))
-            names.append(String("replay_size"))
+            names.append(String("buffer_size"))
             values.append(Float64(rb.num_steps()))
             names.append(String("promotions"))
             values.append(Float64(promotions))

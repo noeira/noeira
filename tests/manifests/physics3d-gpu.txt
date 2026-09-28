@@ -36,3 +36,10 @@ tests/physics3d/test_cfrc_ext_batched_vs_cpu.mojo
 # The Euler finalize's four launches (rhs kernel, the step's LDL factor and
 # solve, integrate) against the CPU step, bit-exact, on a damped model.
 tests/physics3d/test_euler_finalize_gpu_parity.mojo
+
+# Render-time domain randomization (DR plan Phase 2) on the so101_tower rig:
+# `off` restores the build's tables and frame bit for bit, a draw is a
+# function of (seed, index), lights/colours never move `seg` and the camera
+# knob does. Self-contained: the tower scene from the tree, no dumps.
+tests/physics3d/test_domain_randomization_gpu.mojo
+tests/tasks/test_device_placement_gpu.mojo

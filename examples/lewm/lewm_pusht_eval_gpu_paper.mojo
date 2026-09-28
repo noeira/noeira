@@ -7,8 +7,11 @@ attention-expansion fidelity note.
 
 Run (after the paper-width train run):
   pixi run -e nvidia mojo run -I . examples/lewm/lewm_pusht_eval_gpu_paper.mojo
+  pixi run -e nvidia mojo run -I . examples/lewm/lewm_pusht_eval_gpu_paper.mojo --ckpt <run_id>
 """
 
+from std.sys import argv
+from noeira.core.run import resolve_checkpoint
 from max.gpu.host import DeviceContext, DeviceBuffer
 from layout import TileTensor, row_major
 
@@ -60,7 +63,19 @@ comptime Source = WindowSource[
 ]
 
 
+def _flag(name: String, dflt: String) raises -> String:
+    """Value of `--name X`, or `dflt` when the flag is absent."""
+    var av = argv()
+    for i in range(1, len(av)):
+        if String(av[i]) == name:
+            if i + 1 >= len(av):
+                raise Error("flag " + name + " needs a value")
+            return String(av[i + 1])
+    return dflt
+
+
 def main() raises:
+    var ckpt = resolve_checkpoint(_flag(String("--ckpt"), CKPT_PATH), String("last"))
     print("=" * 70)
     print("LeWM nn — PushT PAPER-WIDTH eval (GPU, H6 action-awareness)")
     print("=" * 70)
@@ -69,8 +84,8 @@ def main() raises:
     var sampler = PushTOfflineSampler(frameskip=FRAMESKIP, num_steps=T)
     var src = Source.make(sampler^, ctx=ctx)
     var tr = Trainer.make(lam=Scalar[DT](0.09), lr=Scalar[DT](1e-3), ctx=ctx)
-    print("loading checkpoint", CKPT_PATH, "...")
-    tr.load_params(CKPT_PATH)
+    print("loading checkpoint", ckpt, "...")
+    tr.load_params(ckpt)
 
     src.next_batch()
     var pix_t = TileTensor(src.pix_ptr(), row_major[B, PIX]())

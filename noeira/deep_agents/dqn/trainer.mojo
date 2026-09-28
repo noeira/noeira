@@ -20,8 +20,8 @@ STORAGE migration (Stage 5): `Scratch`/`TargetStorage`/`init_scratch_auto`/
 `mptr`/TileTensor/legacy-checkpoint gone. The Q nets are storage `Module`s; the
 blocks pass storage `Tensor`s; action selection bridges the driver's raw obs/
 action pointers into owned `Tensor` scratch around the storage `Module.forward`
-(the same bridge the storage SAC trainer uses). Checkpoint via storage
-`CheckpointWriter`/`CheckpointReader` (+ appended ε / counter scalar lines).
+(the same bridge the storage SAC trainer uses). Checkpoint: v3, with ε and the
+train-step counter as `K` scalars (legacy v2 files still load).
 CPU + GPU bodies share one `_train_step_impl[POLICY]`. No D2H/H2D in the GPU
 train step (all gather/scatter on-device).
 """
@@ -41,7 +41,9 @@ from noeira.nn.core.call import call_forward
 from noeira.nn.core.initializer import Xavier
 from noeira.nn.optimizer.adam import Adam
 from noeira.nn.core.checkpoint import (
-    CheckpointWriter, CheckpointReader, _split_lines,
+    BinaryCheckpointWriter, BinaryCheckpointReader, CheckpointReader,
+    CheckpointScalars, write_model, read_model, _split_lines, _is_v3_header,
+    _read_file_bytes, _write_file_bytes,
 )
 
 from noeira.nn.core.log_bundle import log_bundle
@@ -804,11 +806,11 @@ struct DQNTrainer[
             done_mean = self._done_accum * inv
         var bundle = DQNMetrics(
             loss=LogScalar[DT](loss_mean),
-            epsilon=LogScalar[DT](self.epsilon),
+            explore_rate=LogScalar[DT](self.epsilon),
             mean_q=LogScalar[DT](q_mean),
             mean_target=LogScalar[DT](target_mean),
-            mean_td_error=LogScalar[DT](td_error_mean),
-            mean_reward=LogScalar[DT](reward_mean),
+            td_error_abs_mean=LogScalar[DT](td_error_mean),
+            reward_mean=LogScalar[DT](reward_mean),
             mean_done=LogScalar[DT](done_mean),
             train_steps=LogScalar[DT](Scalar[DT](self._total_train_steps)),
             n_updates=LogScalar[DT](Scalar[DT](self._update_count)),
@@ -843,32 +845,45 @@ struct DQNTrainer[
         _ = self.flush_metrics[L](logger, step)
 
     def save_state(mut self, path: String) raises:
-        """One-file storage checkpoint of the ONLINE Q-net params + state, plus
+        """One-file v3 checkpoint of the ONLINE Q-net params + state, plus
         the ε-greedy exploration scalars + the cumulative train-step counter
-        (appended as `key=value` lines). On GPU device params download to host
-        first; the on-disk format is target-agnostic (train-on-GPU → eval-on-CPU
-        loads). The target net is hard-copied from online on load."""
-        var w = CheckpointWriter(save_moments=False)
-        w.mode = 0
-        walk_params[Self.train_target](self.pair.online, w, self.ctx, "q_net"
-        )
-        w.mode = 1
-        self.pair.online.for_each_state[Self.train_target](
-            w, self.ctx, "q_net"
-        )
-        # Exploration + counter scalars (order-independent `key=value` lines).
-        w.content += "eps.epsilon=" + String(self.epsilon) + "\n"
-        w.content += "eps.epsilon_decay=" + String(self.epsilon_decay) + "\n"
-        w.content += "eps.epsilon_min=" + String(self.epsilon_min) + "\n"
-        w.content += (
-            "_total_train_steps=" + String(self._total_train_steps) + "\n"
-        )
-        with open(path, "w") as f:
-            f.write(w.content)
+        as `K` sections. Atomic and chunked. On GPU device params download to
+        host first; the on-disk format is target-agnostic (train-on-GPU →
+        eval-on-CPU loads). The target net is hard-copied from online on load."""
+        var w = BinaryCheckpointWriter(save_moments=False)
+        write_model[Self.train_target](w, self.pair.online, self.ctx, "q_net")
+        var sc = CheckpointScalars()
+        sc.set("eps.epsilon", Float64(self.epsilon))
+        sc.set("eps.epsilon_decay", Float64(self.epsilon_decay))
+        sc.set("eps.epsilon_min", Float64(self.epsilon_min))
+        sc.set_int("total_train_steps", self._total_train_steps)
+        w.write_scalars(sc)
+        _write_file_bytes(path, w.content)
 
     def load_state(mut self, path: String) raises:
         """Inverse of `save_state`: restore online params + state, ε scalars +
-        counter, then hard-copy online → target."""
+        counter, then hard-copy online → target. Legacy v2 text files (the
+        format this trainer wrote before) still load."""
+        var bytes = _read_file_bytes(path)
+        if _is_v3_header(bytes):
+            var rb = BinaryCheckpointReader(bytes^)
+            read_model[Self.train_target](rb, self.pair.online, self.ctx, "q_net")
+            var sc = rb.read_scalars()
+            rb.finish()
+            self.epsilon = Scalar[DT](sc.get("eps.epsilon", Float64(self.epsilon)))
+            self.epsilon_decay = Scalar[DT](
+                sc.get("eps.epsilon_decay", Float64(self.epsilon_decay))
+            )
+            self.epsilon_min = Scalar[DT](
+                sc.get("eps.epsilon_min", Float64(self.epsilon_min))
+            )
+            self._total_train_steps = sc.get_int(
+                "total_train_steps", self._total_train_steps
+            )
+            self.pair.target_net.polyak_from[Self.train_target](
+                self.pair.online, Scalar[DT](1.0), self.ctx
+            )
+            return
         var content: String
         with open(path, "r") as f:
             content = String(f.read())

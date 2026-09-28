@@ -612,6 +612,59 @@ struct RemoteCatalog(Movable & Deinitable):
             )
         return m^
 
+    def upsert_run(
+        mut self,
+        run_id: String,
+        run_name: String,
+        keys: List[String],
+        vals: List[String],
+    ) raises:
+        """`POST /runs` — the registration a live `RemoteLogger` sends, from a
+        run's files instead of its process.
+
+        ⚠⚠ WHY `project-push` NEEDS IT. `POST /artifacts` answers 404 "unknown
+        run" for a run the monitor never saw, so a run trained offline — no
+        `.env`, `ACT_NO_MONITOR`, a box with no network — could never be
+        pushed at all. The server's `/runs` is an UPSERT, so re-registering a
+        run it already has is harmless AS LONG AS the config sent is the one
+        it registered with; the caller sends `run.kv` + `metrics.config.kv`,
+        which is exactly that.
+        """
+        var w = JsonWriter()
+        w.begin_object()
+        w.member(String("run_id"), run_id)
+        w.member(String("run_name"), run_name)
+        w.key(String("config"))
+        w.begin_object()
+        for i in range(min(len(keys), len(vals))):
+            w.member(keys[i], vals[i])
+        w.end_object()
+        w.end_object()
+        _ = self._request(String("POST"), String("/runs"), w.done(), 201)
+
+    def finish_run(
+        mut self, run_id: String, status: String, outcome: String
+    ) raises:
+        """`POST /runs/<id>/finish`. Only for a terminal status the RUN wrote
+        (`done|killed|crashed`); a `running` record is the server's to call
+        stale, never the client's."""
+        var w = JsonWriter()
+        w.begin_object()
+        w.member(String("status"), status)
+        w.member(String("outcome"), outcome)
+        w.end_object()
+        _ = self._request(
+            String("POST"), String("/runs/") + run_id + "/finish", w.done(), 200
+        )
+
+    def runs_of(mut self, project: String) raises -> JsonDoc:
+        """This account's runs of `project` on the monitor, newest first —
+        `GET /runs?project=`. Rows carry `runId`, `status`, `outcome`, `tag`,
+        `task`. An unknown project is an empty list, not an error."""
+        return self._request(
+            String("GET"), String("/runs?project=") + project, String(""), 200
+        )
+
     def artifacts_of(mut self, run_id: String) raises -> JsonDoc:
         """Every artifact row for a run, pending ones included.
 

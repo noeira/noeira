@@ -25,6 +25,10 @@ Options
                    `~/.cache/noeira/act_so101/P__D_<H>x<W>.h5`
 --out PATH         output .h5 (default: the cache path above)
 --height / --width resize target (default 240x320; the recording is 480x640)
+--undistort DIR    bring each camera's fisheye frame to the SIM's pinhole
+                   first (`vision/fisheye.mojo`), from DIR/camera_<name>.txt —
+                   `examples/vision/calibrate_fisheye.mojo`; e.g.
+                   projects/so101-tower/cameras. The output name gains `_undist`.
 --revision REV     branch or commit (default `main`)
 --force            rebuild even if the output already exists
 --no-download      fail rather than fetch anything over the network
@@ -85,6 +89,7 @@ def main() raises:
     var height = atol(_opt(args, String("--height"), String("240")))
     var width = atol(_opt(args, String("--width"), String("320")))
     var force = _flag(args, String("--force"))
+    var undistort = _opt(args, String("--undistort"), String(""))
     var download = not _flag(args, String("--no-download"))
 
     if repo == "" and root == "":
@@ -101,7 +106,10 @@ def main() raises:
             slug = repo_slug(repo)
         var dir = noeira_cache() + "/act_so101"
         makedirs(dir, exist_ok=True)
-        out = dir + "/" + slug + "_" + String(height) + "x" + String(width) + ".h5"
+        out = (
+            dir + "/" + slug + "_" + String(height) + "x" + String(width)
+            + ("_undist" if undistort != "" else "") + ".h5"
+        )
 
     print("LeRobot v3 -> TrajectoryStore")
     print("  out: " + out)
@@ -122,6 +130,7 @@ def main() raises:
         String("lerobot/") + repo if repo != "" else String(""),
         pinned,
         True,
+        undistort,
     )
 
     # ⚠ THE SIDE FILE `<out>.json`: which camera fills which slot. The store

@@ -445,7 +445,7 @@ struct SACAgent[
 
     def save(mut self, path: String) raises:
         """Thin passthrough to `trainer.save_state(path)`. Writes ONE
-        file (`nn-ckpt v2` envelope) with prefixed sections for
+        file (v3 `storage-ckpt` file) with prefixed sections for
         actor, critic1, critic2 (the online nets). Optimizer moments, α,
         replay buffer and episode tracker are NOT included — resume
         re-warms. CPU-only."""

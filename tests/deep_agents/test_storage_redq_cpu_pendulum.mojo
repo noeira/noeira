@@ -61,12 +61,12 @@ def main() raises:
 
     var metrics = agent.flush_metrics()
     print("-" * 60)
-    print("DIAG  actor_loss :", metrics.actor_loss.v)
+    print("DIAG  actor_loss :", metrics.policy_loss.v)
     print("DIAG  critic_loss:", metrics.critic_loss.v)
     print("DIAG  alpha      :", metrics.alpha.v)
     print("DIAG  mean_q     :", metrics.mean_q.v)
     print("DIAG  mean_target:", metrics.mean_target.v)
-    print("DIAG  mean_reward:", metrics.mean_reward.v)
+    print("DIAG  mean_reward:", metrics.reward_mean.v)
     print("DIAG  mean_done  :", metrics.mean_done.v)
     print("DIAG  train_steps:", metrics.train_steps.v)
     print("-" * 60)
@@ -89,7 +89,7 @@ def main() raises:
         "critic_loss diagnostic populated (> 0)",
     )
     assert_true(
-        metrics.mean_reward.v < Scalar[DT](0.0),
+        metrics.reward_mean.v < Scalar[DT](0.0),
         "mean_reward diagnostic populated (Pendulum reward < 0)",
     )
     assert_true(

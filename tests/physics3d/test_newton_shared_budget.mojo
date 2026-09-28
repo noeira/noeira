@@ -35,7 +35,7 @@ Run: pixi run mojo run -I . tests/physics3d/test_newton_shared_budget.mojo
 from std.sys.info import size_of
 from noeira.physics3d.solver.je_budget import (
     newton_shared_elems, je_spills, je_elems, SOLVER_SHARED_BUDGET,
-    SOLVER_SHARED_LIMIT,
+    SOLVER_SHARED_LIMIT, newton_block_threads,
 )
 from noeira.physics3d.types import ConeType
 
@@ -200,13 +200,16 @@ def main() raises:
     var pyr_libero = newton_shared_elems[
         37, 17, 0, 0, 144, 3, False, ConeType.PYRAMIDAL
     ]() * size_of[Scalar[DT]]()
-    t.truth(ell_libero == 39892 + 4,
+    # ⚠ `cmask_sh` (MC scalars, 2026-09-26) arrived after that PTX was read:
+    # it is spelled out as `+ 144 * 4` rather than folded into the recorded
+    # number, the same way arm A carries its later arrays.
+    t.truth(ell_libero == 39892 + 4 + 144 * 4,
             String("LIBERO goal, ELLIPTIC: ", ell_libero, " == 39892 (the"
                    " sm_120 PTX's 24 .shared arrays) + 4 (the elided Je"
-                   " backing scalar)"))
+                   " backing scalar) + 576 (cmask_sh)"))
     t.truth(ell_libero - pyr_libero
-            == (10 * 647 - 9 * 647 + 4 * 144 + 144 * 9) * size_of[Scalar[DT]](),
-            String("the elliptic extras are fr_e_sh (ME=647) + 4*MC +"
+            == (10 * 647 - 9 * 647 + 5 * 144 + 144 * 9) * size_of[Scalar[DT]](),
+            String("the elliptic extras are fr_e_sh (ME=647) + 5*MC +"
                    " MC*(NT+1)^2 = ", ell_libero - pyr_libero, " B"))
     t.truth(newton_shared_elems[42, 12, 0, 0, MC, CONDIM, True]()
             == newton_shared_elems[
@@ -214,6 +217,39 @@ def main() raises:
             ](),
             "the CONE_TYPE default is PYRAMIDAL, so every pin above reads"
             " the same formula it always did")
+
+    # ── G: threads per block, per shape (2026-09-25) ────────────────────
+    # One warp where the block is small enough that an SM holds more of them
+    # than register-bound 64-thread blocks; 64 where shared memory binds both
+    # the same. Every row is a shape measured on the RTX 5090 (the table in
+    # `je_budget.NEWTON_SMALL_BLOCK_MAX_BYTES`): 32 won at the first four,
+    # tied or lost at the last two. A rule that moves the boundary across a
+    # measured row fails here and names it.
+    print("--- G: newton_block_threads, the measured shapes ---")
+    comptime PYR = ConeType.PYRAMIDAL
+    var hc_bytes = newton_shared_elems[9, 9, 0, 0, 20, 3, True]() * size_of[
+        Scalar[DT]
+    ]()
+    t.truth(hc_bytes == 8292,
+            String("half_cheetah footprint ", hc_bytes, " == 8292 (the"
+                   " compiled kernel's 9316 minus the uncounted 1 KB)"))
+    t.truth(newton_block_threads[DT, 9, 9, 0, 0, 20, 3, PYR]() == 32,
+            "half_cheetah (nv 9, MC 20, 8292 B) -> 32")
+    t.truth(newton_block_threads[DT, 6, 6, 0, 0, MC, CONDIM, PYR]() == 32,
+            "park k=0 (nv 6) -> 32")
+    t.truth(newton_block_threads[DT, 24, 9, 0, 0, MC, CONDIM, PYR]() == 32,
+            "park k=3 (nv 24, Je spilled) -> 32")
+    t.truth(newton_block_threads[DT, 42, 12, 0, 0, MC, CONDIM, PYR]() == 32,
+            "park k=6 (nv 42, 12928 B) -> 32")
+    t.truth(newton_block_threads[DT, 60, 15, 0, 0, MC, CONDIM, PYR]() == 64,
+            "park k=9 (nv 60, 21640 B) -> 64")
+    t.truth(newton_block_threads[DT, 84, 19, 0, 0, MC, CONDIM, PYR]() == 64,
+            "park k=13 (nv 84) -> 64")
+    # Never below MAX_CONTACTS: LIBERO goal's 144 contacts set the block.
+    t.truth(newton_block_threads[
+                DT, 37, 17, 0, 0, 144, 3, ConeType.ELLIPTIC
+            ]() == 144,
+            "LIBERO goal (MC 144, elliptic) -> 144, MAX_CONTACTS wins")
 
     print("===", t.checks - t.fails, "/", t.checks, "passed ===")
     if t.fails != 0:

@@ -58,8 +58,10 @@ from std.time import perf_counter_ns
 from max.gpu.host import DeviceContext
 
 from noeira.nn.constants import DT
-from noeira.core.dotenv import load_dotenv
-from noeira.core.logger import RemoteLogger
+from noeira.core.run import RunContext, register_run
+from noeira.core.run_session import RunLogger, finish_run, run_logger
+from noeira.deep_agents.training.checkpoint import announce_checkpoint
+from noeira.io.artifact_sink import sink_for_run
 from noeira.deep_agents.tdmpc2.config_mt import TDMPC2MultiTask
 from noeira.envs.phyics3d_batched_env import Phyics3dBatchedEnv
 from noeira.envs.dm_control.walker.walker_xml import DMWalkerModel
@@ -155,29 +157,29 @@ def main() raises:
         action_scale=Scalar[DT](ACTION_SCALE), learning_starts=LEARN_START,
     )
 
-    var ckpt = (
-        String("tdmpc2_dm_walker_mt_degenerate")
-        + ("_rotate" if ROTATE_IDS else "_single")
-        + ("_mpc" if USE_MPC else "_mpcoff") + ".ckpt"
+    var run = RunContext(
+        project=String("dm-control"),
+        driver=String(
+            "examples/dm_control/tdmpc2_dm_walker_mt_degenerate_gpu.mojo"
+        ),
+        slug=(
+            String("tdmpc2-mt-degenerate-dm-walker")
+            + ("-rotate" if ROTATE_IDS else "-single")
+            + ("-mpc" if USE_MPC else "-mpcoff")
+        ),
+        env=String("builtin:dm_control/walker-walk"),
     )
+    var checkpoint_path = run.checkpoint_path(String("last"))
+    print("  Run:", run.dir)
 
-    var env_vars = load_dotenv()
-    var logger = RemoteLogger(
-        server_url=env_vars.get("NOEIRA_CLOUD_URL", ""),
-        run_name=String("TD-MPC2 walker MT-DEGENERATE ")
-        + ("rotate" if ROTATE_IDS else "single"),
-        buffer_size=64,
-        api_key=env_vars.get("NOEIRA_CLOUD_API_KEY", ""),
-    )
+    var logger = run_logger(run, buffer_size=64)
     logger.set_config("algorithm", "TD-MPC2-MT-degenerate")
     logger.set_config("env", "dm_control/walker-walk")
     logger.set_config("rotate_ids", String("1") if ROTATE_IDS else String("0"))
     logger.set_config("updates_per_step", String(UPDATES_PER_STEP))
+    register_run(run, logger)
+    var artifacts = sink_for_run(run.id, run.dir)
     var lg = Pointer(to=logger).as_unsafe_any_origin()
-    if env_vars.get("NOEIRA_CLOUD_URL", "").byte_length() > 0:
-        print("  logger: ENABLED")
-    else:
-        print("  logger: DISABLED — NOEIRA_CLOUD_URL not in .env")
 
     print("Starting ...")
     print("-" * 74)
@@ -193,43 +195,48 @@ def main() raises:
             var tid = s % NUM_TASKS
             var lab = String("id") + String(tid)
             var r = ag.train_batched_mt[
-                WalkEnv, N_ENVS, RemoteLogger, USE_MPC, WalkEval, EVAL_ENVS
+                WalkEnv, N_ENVS, RunLogger, USE_MPC, WalkEval, EVAL_ENVS
             ](
                 env, tid, SEG_STEPS,
                 rng_seed=UInt64(100 + s), updates_per_step=UPDATES_PER_STEP,
                 print_every=PRINT_EVERY, verbose=True, logger=lg,
                 diag_every=DIAG_EVERY, base_step=at,
-                checkpoint_path=ckpt, checkpoint_every=0,
+                checkpoint_path=checkpoint_path, checkpoint_every=0,
+                artifacts=artifacts, run_dir=run.dir,
                 eval_env=ev_p, eval_every=EVAL_EVERY,
                 eval_max_steps=EPISODE_LEN, task_label=lab,
             )
             at += SEG_STEPS
             if r > best:
                 best = r
-            ag.save_state(ckpt)
+            ag.save_state(checkpoint_path)
+            announce_checkpoint(checkpoint_path, artifacts, run.dir)
     else:
         best = ag.train_batched_mt[
-            WalkEnv, N_ENVS, RemoteLogger, USE_MPC, WalkEval, EVAL_ENVS
+            WalkEnv, N_ENVS, RunLogger, USE_MPC, WalkEval, EVAL_ENVS
         ](
             env, T_WALK, TOTAL,
             rng_seed=UInt64(42), updates_per_step=UPDATES_PER_STEP,
             print_every=PRINT_EVERY, verbose=True, logger=lg,
             diag_every=DIAG_EVERY, base_step=0,
-            checkpoint_path=ckpt, checkpoint_every=25_000,
+            checkpoint_path=checkpoint_path, checkpoint_every=25_000,
+            artifacts=artifacts, run_dir=run.dir,
             eval_env=ev_p, eval_every=EVAL_EVERY,
             eval_max_steps=EPISODE_LEN, task_label=String("walk"),
         )
 
     _ = ev
     var elapsed = Float64(perf_counter_ns() - t0) / 1e9
-    logger.close()
+    finish_run(
+        run, logger, artifacts, String("best_eval_return=") + String(best)
+    )
     _ = logger
 
     print("-" * 74)
     print("=" * 74)
     print("  best eval  =", best)
     print("  elapsed    =", elapsed, "s")
-    print("  checkpoint =", ckpt)
+    print("  run        =", run.dir)
     print("=" * 74)
     print("Read consistency_loss FIRST, not the return:")
     print("  ~0.01 and falling → the MT path is sound on one task. The defect")

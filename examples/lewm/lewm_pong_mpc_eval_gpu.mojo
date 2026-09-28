@@ -10,8 +10,11 @@ expert < random_min. A collapsed model scores them all alike.
 
 Run (after training a non-collapsed model — see the λ sweep):
   pixi run -e nvidia mojo run -I . examples/lewm/lewm_pong_mpc_eval_gpu.mojo
+  pixi run -e nvidia mojo run -I . examples/lewm/lewm_pong_mpc_eval_gpu.mojo --ckpt <run_id>
 """
 
+from std.sys import argv
+from noeira.core.run import resolve_checkpoint
 from std.memory import alloc
 from max.gpu.host import DeviceContext, DeviceBuffer
 from layout import TileTensor, row_major
@@ -74,7 +77,19 @@ def _p(b: DeviceBuffer[DT]) -> Pointer[Scalar[DT], MutAnyOrigin]:
     return rebind[Pointer[Scalar[DT], MutAnyOrigin]](b.unsafe_ptr())
 
 
+def _flag(name: String, dflt: String) raises -> String:
+    """Value of `--name X`, or `dflt` when the flag is absent."""
+    var av = argv()
+    for i in range(1, len(av)):
+        if String(av[i]) == name:
+            if i + 1 >= len(av):
+                raise Error("flag " + name + " needs a value")
+            return String(av[i + 1])
+    return dflt
+
+
 def main() raises:
+    var ckpt = resolve_checkpoint(_flag(String("--ckpt"), CKPT_PATH), String("last"))
     print("=" * 70)
     print("LeWM nn — Pong MPC eval (GPU, §10.9, horizon=", MPC_HORIZON, ")")
     print("=" * 70)
@@ -83,8 +98,8 @@ def main() raises:
     var buf = PongOfflineBuffer.load(BUFFER_PATH)
     print("buffer n_frames =", buf.n_frames)
     var tr = Trainer.make(lam=Scalar[DT](0.09), lr=Scalar[DT](1e-3), ctx=ctx)
-    print("loading checkpoint", CKPT_PATH, "...")
-    tr.load_params(CKPT_PATH)
+    print("loading checkpoint", ckpt, "...")
+    tr.load_params(ckpt)
 
     # sample one window → device fp32 pixels + device/host actions
     var pix_u8: Pointer[Scalar[DType.uint8], MutAnyOrigin] = alloc[

@@ -143,76 +143,42 @@ rest is the RL and infrastructure history it was built on.
 
 ### Deep Learning Framework (`nn/`)
 
-- [x] **Model Trait** - Stateless layers with compile-time dimensions
-  - Linear, LinearReLU, LinearTanh, LinearSigmoid, LinearMish, ReLU, Tanh, Sigmoid, Softmax, Mish
-  - LayerNorm, SimNorm, Dropout, NormedLinear (Linear->LayerNorm->Mish)
-  - NoisyLinear, NoisyLinearReLU, NoisyLinearTanh (factorized Gaussian noise for exploration)
-  - Conv2D, Conv2DReLU, Conv2DTanh, Conv2DSigmoid, Conv2DMish, MaxPool, AvgPool, Flatten
-  - StochasticActor (Gaussian policy with reparameterization trick)
-  - Sequential[*LAYERS] - Variadic N-layer composition
-- [x] **Optimizer Trait** - SGD, Adam, AdamW, RMSprop, Muon
-- [x] **Loss Function Trait** - MSELoss, HuberLoss, CrossEntropyLoss, SoftCrossEntropyLoss, TwoHot (C51 distributional)
-- [x] **Initializer Trait** - Xavier, Kaiming, LeCun, Zeros, Ones, Constant, Uniform, Normal
-- [x] **Training Infrastructure**
-  - Trainer[MODEL, OPT, LOSS] with CPU and GPU training loops
-  - NetworkState (CPU) and GPUNetworkState (device memory)
-  - NetworkPair / GPUNetworkPair (online + target networks with soft updates)
-- [x] **Checkpointing** - Text-based and binary checkpoint formats
-  - Save/load for agents, networks, trainers
-- [x] **GPU Kernels** - Tiled matmul (shared memory + MMA tensor cores), elementwise ops, Apple Silicon optimizations
-  - Fused matmul+bias+activation kernels for inference and training
-  - Matmul backward kernels (dx, dW)
+The storage framework that replaced the legacy `nn` in the sunset: modules own
+their weights, and gradients come from each module's own VJP.
 
-### Automatic Differentiation (`nn/autodiff/`)
-
-- [x] **DiffOp Trait** - Fine-grained differentiable operations
-  - Arithmetic: MatMul, BiasAdd, Scale, ElemMul, NegateOp
-  - Activations: ReLUOp, TanhOp, SigmoidOp, MishOp, SoftmaxOp, SymlogOp
-  - Normalization: LayerNormOp, RMSNormOp
-  - Reduction: ReduceSum, ReduceMean
-  - Spatial: Conv2D, MaxPool2D, AvgPool2D, Flatten
-  - Attention: ScaledDotProductAttention
-  - Embedding: Embedding, GatherOp
-  - RL-specific: RSampleOp (reparameterized tanh sampling), MinOp (twin critic), SliceOp, GaussianLogProbOp
-  - PPO-specific: CategoricalLogProbOp, RatioOp, ClipSurrogateOp
-  - Loss ops: MSEOp, HuberOp
-- [x] **AutoDiffChain[*OPS]** - Variadic composition of N DiffOps into a Model
-- [x] **Fused Operations** - FusedMatMulBias, FusedMatMulBiasActivation, FusedConv2DActivation
-- [x] **AutoFused[*OPS]** - Automatic compile-time greedy fusion (MatMul+Bias+Act -> fused kernel, Conv2D+Act -> fused)
-- [x] **Combinators** - Residual[Inner], Parallel[*BRANCHES], Repeat[n, Inner], SkipConcat[Inner], DualPath[A, B], SplitApply[Left, Right, split], FanOut[Inner, N]
-- [x] **ComputeGraph[*NODES]** - Named-node DAG builder for complex loss graphs (SAC actor loss, etc.)
-- [x] **CompositeParams[*MODELS]** - Multi-model parameter alignment with auto-padding for GPU safety
-- [x] **Composites** - Pre-built architectures: ResBlock, ResNet, LeNet, NatureDQN (Atari CNN), FFN
-- [x] **Convenience Aliases** - Dense, DenseReLU, DenseTanh, DenseSigmoid, DenseMish (AutoFused shortcuts)
+- [x] **Module trait** — `forward` and `vjp` over tensor packs, compile-time dimensions, CPU and GPU from one source
+- [x] **Param** — each weight owns its value and gradient tensors; parameters are discovered by reflection (`for_each_param`), so the optimizer and checkpoints need no registration
+- [x] **Gradients by composition** — every primitive writes its VJP; combinators chain them at compile time. Reverse mode with no tape and no runtime graph
+- [x] **Primitives (70+)** — Linear, Conv2D / Conv2DTranspose, pooling, LayerNorm / RMSNorm / BatchNorm / SimNorm, attention (self, cross, masked; fused, and MAX's flash attention on NVIDIA), RoPE, SwiGLU, embeddings, LSTM / GRU cells, NoisyLinear, BlockLinear (ensembles in one kernel), RL ops (rsample, symlog, dueling heads)
+- [x] **Fused primitives** — `LinearAct` and its `LinearReLU` / `LinearTanh` / … aliases (matmul + bias + activation in one epilogue kernel), `LayerNormAct`. Fusion is chosen by the primitive you use, not by a compiler pass; convolutions have no fused-activation form
+- [x] **Combinators** — Sequential, Residual, ProjectedResidual, Parallel, Repeat, SkipConcat, Tokenwise, StopGrad, and `ComputeGraph`, a named-node DAG for loss graphs that are not a chain
+- [x] **Models** — ResNet, ResNet-18 (torchvision-compatible weights), GPT, ViT, transformers
+- [x] **Optimizers** — SGD, Adam / AdamW with a parameter arena and grouped multi-tensor apply, gradient clipping, LR schedules
+- [x] **Losses** — MSE, cross-entropy, soft cross-entropy, sequence cross-entropy, two-hot, BCE with logits, Gaussian NLL, gradient penalty
+- [x] **Training** — supervised and autoregressive `Trainer`s, AMP (bf16 activations, fp32 master weights), CUDA-graph capture
+- [x] **Checkpoints v2** — every `Param` is `Saveable`; safetensors import for published weights
+- [x] **Datasets** — MNIST, CIFAR-10, TinyShakespeare, LeWM Push-T
 
 ### Deep RL Agents (`deep_agents/`)
 
-**Refactored to config-driven generic architecture** — old per-agent directories replaced by composable strategies.
+One package per algorithm, each an `XxxAgent` facade over a trainer and a shared
+training driver (the legacy config-driven `GenericXxxAgent` design was removed).
 
-- [x] **DQN / Double DQN** - Deep Q-Network with target network, epsilon-greedy, GPU training
-- [x] **DQN + PER** - Prioritized replay with sum-tree, importance sampling, beta annealing, GPU
-- [x] **Dueling DQN** - V(s) + A(s,a) architecture with shared backbone
-- [x] **Noisy DQN** - NoisyLinear layers (factorized Gaussian noise), no epsilon-greedy needed
-- [x] **DQN CNN** - NatureDQN CNN architecture for pixel observations (84x84)
-- [x] **C51 (Categorical DQN)** - Distributional RL with 51 atoms, cross-entropy loss, Bellman projection
-- [x] **Rainbow** - C51 + Double DQN + PER + Dueling + Noisy Networks + N-step returns
-- [x] **DDPG** - Deterministic actor, Gaussian noise, target networks, GPU training
-- [x] **TD3** - Twin critics, delayed policy updates, target smoothing, GPU training
-- [x] **SAC** - Stochastic Gaussian policy, max entropy, auto alpha tuning, GPU training
-- [x] **A2C** - Advantage Actor-Critic with GAE
-- [x] **PPO (Discrete)** - Clipped surrogate, multi-epoch, entropy bonus, CNN variant
-- [x] **PPO (Continuous)** - Unbounded Gaussian policy (CleanRL-style), GPU training, LR annealing, KL early stopping, gradient clipping
-- [x] **TD-MPC2** - Model-based RL with world model ensemble, MPPI planning, distributional RL (two-hot), sequence replay buffer [experimental]
-- [x] **DreamerV3** - World model (RSSM), actor-critic in imagination, categorical latent states [experimental]
-- [x] **MuZero** - Learned representation/dynamics/prediction networks, MCTS planning with PUCT, K-step unrolled training, n-step bootstrapped targets, distributional value/reward [experimental]
+- [x] **Value-based** — DQN (Double, Dueling, Noisy, PER variants), C51, Rainbow
+- [x] **Off-policy actor-critic** — DDPG, TD3, SAC, REDQ, REDQ-OFE
+- [x] **On-policy** — PPO (continuous and discrete, GPU-batched), A2C
+- [x] **Model-based** — MBPO, TD-MPC2, DreamerV3, Dreamer 4
+- [x] **Search** — AlphaZero, MuZero, EfficientZero V2 (shared `zero/` package, GPU MCTS)
+- [x] **Imitation and VLAs** — behaviour cloning, ACT, SmolVLA
+- [x] **From demonstrations** — HIL-SERL (RLPD pinned demo prefix + BC term), DAgger recorders, the `.demo` format
+- [x] **Zero-shot** — Forward-Backward and FB-CPR (BFM-Zero on the Unitree G1)
 
-### Deep RL Shared Infrastructure (`deep_agents/core/`)
+### Deep RL Shared Infrastructure (`deep_agents/training/`, `data/`)
 
-- [x] **Trait-based agent design** - OffPolicyContinuousAgent, OffPolicyDiscreteAgent, OnPolicyContinuousAgent, OnPolicyDiscreteAgent, GPUOffPolicyAgent, GPUOnPolicyContinuousAgent, Checkpointable
-- [x] **Composable strategies** - Exploration (GaussianNoise, StochasticSample), target value (Single/Twin/Entropic), target action (Deterministic/Smoothed/Reparam), actor loss (DPG/MaxEnt/Autodiff), policy gradient (Vanilla/Clipped/Autodiff), Q-output (Direct/Dueling), Q-gradient (Manual/Autodiff)
-- [x] **Unified training loops** - CPU and GPU variants for off-policy and on-policy agents
-- [x] **Shared GPU kernels** - 80+ reusable kernels (soft update, episode tracking, replay, TD targets, distributional RL, etc.)
-- [x] **Replay buffer variants** - HeapReplayBuffer, PrioritizedReplayBuffer, GPUReplayBuffer, GPUPrioritizedReplayBuffer, NStepBuffer, SequenceReplayBuffer, GPUSequenceReplayBuffer
+- [x] **Training drivers** — off-policy and on-policy, continuous and discrete, CPU and GPU (`run_offpolicy_*` / `run_onpolicy_*`), over a `BatchedEnv` trait
+- [x] **Trainer blocks** — sampling, acting and update blocks the drivers compose; CUDA-graph-capturable steps
+- [x] **Replay** — `StoreReplay` / `StoreReplayGpu` on the trajectory store: uniform and prioritized, ERE, uint8 observations, device-side sampling, a pinned demonstration prefix
+- [x] **Runs** — `RunContext` records each run's checkpoints and metrics under a project, mirrored to noeira cloud
 
 ### 3D Physics Engine (`physics3d/`)
 

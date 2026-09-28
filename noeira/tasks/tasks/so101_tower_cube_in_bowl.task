@@ -29,7 +29,13 @@ active=desk
 active=bowl
 active=brick
 
-# The recorded layout: bowl on the arm's left, brick on its right — see the
-# family for the strips and the guaranteed separation.
-init=bowl@desk_left
-init=brick@desk_right
+# THE REAL LAYOUTS: brick and bowl drawn over the printed-props recording's
+# start poses, the bowl on EITHER side of the brick — the family's desk_brick /
+# desk_bowl (24 Sep; before, desk_left / desk_right held 20/70 of the real
+# bricks and 17/68 of the bowls). Sim rates before and after are not comparable.
+#
+# `:sep=0.135`: the bowl's centre stays 135 mm from the brick's — the recorded
+# layouts' minimum (70 episodes); the radii alone allow 79 mm, and the expert
+# grasped 1 of 14 draws under 100 mm (the bowl in the jaw's way).
+init=bowl@desk_bowl:sep=0.135
+init=brick@desk_brick:yaw

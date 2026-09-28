@@ -6,6 +6,7 @@ description: Zero-shot RL with Forward-Backward representations — train once w
 import Maturity from '~/components/Maturity.astro';
 import Paper from '~/components/Paper.astro';
 import Papers from '~/components/Papers.astro';
+import ForwardBackward from '~/components/diagrams/ForwardBackward.astro';
 
 <Maturity level="experimental" note="The losses, sampler and device path are gated, and the released BFM-Zero actor reproduces the paper's MuJoCo numbers in our G1. Our own G1 training still trails the reference's curve." />
 
@@ -61,6 +62,8 @@ a batch of states with the new reward, average `B(s) · r(s)`, project onto the
 sphere, and run `π_z`. In code that is `z_from_reward`
 (`noeira/deep_agents/fb/z_sampler.mojo`).
 
+<ForwardBackward />
+
 ### Sampling `z`
 
 During training each `z` comes from a mixture: half uniform on the sphere, half
@@ -83,12 +86,15 @@ at `d`. The norm of `B` is `√d` by construction and can never warn of anything
 
 ## Variants
 
-| Package piece | What it is | Driver |
+The pieces live in `noeira/deep_agents/fb/` and their drivers in
+`examples/fb/`.
+
+| Piece | What it is | Driver |
 |---|---|---|
-| `FBTrainer` (`noeira/deep_agents/fb/trainer.mojo`) | offline FB from a collected dataset | `examples/fb/fb_train_gpu.mojo` |
-| `FBOnlineAgent` (`noeira/deep_agents/fb/online.mojo`) | online, off-policy FB on a batched GPU env, no dataset | `examples/fb/fb_online_walker_gpu.mojo` |
-| `FBCPRTrainer` (`noeira/deep_agents/fb/cpr.mojo`) | FB-CPR offline: a z-conditioned discriminator `D(s, z)` and style critic around an unchanged `FBTrainer` | `examples/fb/fb_train_cpr_gpu.mojo` |
-| `FBCPROnlineAgent` (`noeira/deep_agents/fb/online_cpr.mojo`) | FB-CPR online — the reference's own setting | `examples/fb/fb_online_cpr_walker_gpu.mojo` |
+| `FBTrainer`<br />`trainer.mojo` | offline FB from a collected dataset | `fb_train_gpu` |
+| `FBOnlineAgent`<br />`online.mojo` | online, off-policy FB on a batched GPU env, no dataset | `fb_online_walker_gpu` |
+| `FBCPRTrainer`<br />`cpr.mojo` | FB-CPR offline: a z-conditioned discriminator `D(s, z)` and style critic around an unchanged `FBTrainer` | `fb_train_cpr_gpu` |
+| `FBCPROnlineAgent`<br />`online_cpr.mojo` | FB-CPR online — the reference's own setting | `fb_online_cpr_walker_gpu` |
 
 The CPR head is composed around the plain trainer: with the regularisation
 weight at 0 its FB half is bit-identical to `FBTrainer`, which a gate checks.

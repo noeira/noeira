@@ -14,6 +14,12 @@ resolves a dataset name to bytes at a local path, fetching only if the local
 copy is missing or stale. The catalog it talks to is
 [noeira cloud](/tooling/monitor/), the same service that records runs.
 
+:::note[Requires noeira cloud]
+[noeira cloud](/tooling/monitor/) is not open yet. The dataset and asset-pack
+syncing on this page needs it; the Hugging Face downloader does not. To join
+the private beta, write to [denis@noeira.ai](mailto:denis@noeira.ai).
+:::
+
 Three kinds of thing move through it:
 
 | What | Where it lives locally | Commands |

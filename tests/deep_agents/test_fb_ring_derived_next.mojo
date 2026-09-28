@@ -102,6 +102,10 @@ def _case[
     var r_z = c.enqueue_create_buffer[DT](CAP * D)
     var r_term = c.enqueue_create_buffer[DT](CAP)
     var r_bnd = c.enqueue_create_buffer[DT](CAP)
+    # `r_age` (steps since the lane's reset) is what the DERIVED observation
+    # tail reads, not this gate — but `ring_store_kernel` writes it, so it has
+    # to exist. §12.36 added the column; this file's job is still `s'`.
+    var r_age = c.enqueue_create_buffer[DT](CAP)
     r_obs.enqueue_fill(Scalar[DT](-1.0))
     r_bnd.enqueue_fill(Scalar[DT](1.0))
 
@@ -114,7 +118,7 @@ def _case[
     z_src.enqueue_fill(Scalar[DT](0.0))
     term_src.enqueue_fill(Scalar[DT](0.0))
 
-    comptime W = OBS + ACT + D + 2
+    comptime W = OBS + ACT + D + 3
     var pos = 0
     var size = 0
     for s in range(NSTEPS):
@@ -130,8 +134,8 @@ def _case[
             mptr(term_src.unsafe_ptr()), mptr(z_src.unsafe_ptr()),
             mptr(r_obs.unsafe_ptr()), mptr(r_act.unsafe_ptr()),
             mptr(r_term.unsafe_ptr()), mptr(r_bnd.unsafe_ptr()),
-            mptr(r_z.unsafe_ptr()),
-            Int32(pos), Int32(bnd),
+            mptr(r_age.unsafe_ptr()), mptr(r_z.unsafe_ptr()),
+            Int32(pos), Int32(bnd), Int32(s if s < 5 else 5),
             grid_dim=_blk(LANES * W), block_dim=TPB,
         )
         # ⚠ the H2D copy above is ENQUEUED: without this the next iteration
@@ -321,8 +325,9 @@ def _case[
             mptr(term_src.unsafe_ptr()), mptr(z_src.unsafe_ptr()),
             mptr(p2_obs.unsafe_ptr()), mptr(r_act.unsafe_ptr()),
             mptr(r_term.unsafe_ptr()), mptr(p2_bnd.unsafe_ptr()),
-            mptr(r_z.unsafe_ptr()),
+            mptr(r_age.unsafe_ptr()), mptr(r_z.unsafe_ptr()),
             Int32(pos2), Int32(1 if (s + 1) % T_EP == 0 else 0),
+            Int32(s if s < 5 else 5),
             grid_dim=_blk(LANES * W), block_dim=TPB,
         )
         c.synchronize()

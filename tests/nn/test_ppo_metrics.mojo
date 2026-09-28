@@ -92,7 +92,7 @@ def test_ppo_metrics_populated() raises:
         _ = t.train_step(step_idx)
 
     var m = t.flush_metrics()
-    var aL = m.actor_loss.to_f64()
+    var aL = m.policy_loss.to_f64()
     var cL = m.critic_loss.to_f64()
     var ent = m.entropy.to_f64()
     var kl = m.approx_kl.to_f64()
@@ -107,7 +107,7 @@ def test_ppo_metrics_populated() raises:
     print("  explained_variance =", ev)
     print("  n_updates          =", nup)
 
-    _finite(Scalar[DT](aL), "actor_loss")
+    _finite(Scalar[DT](aL), "policy_loss")
     _finite(Scalar[DT](cL), "critic_loss")
     _finite(Scalar[DT](ent), "entropy")
     _finite(Scalar[DT](kl), "approx_kl")

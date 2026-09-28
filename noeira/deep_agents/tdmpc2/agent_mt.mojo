@@ -12,8 +12,8 @@ Storage threads externals into ONE forward/vjp call (two `mut` List subscripts
 can't alias). The WM step threads all 5 online Q as distinct args; the random
 PAIR steps (policy: online (pa,pb); td: target (ta,tb)) use a comptime-unrolled
 guarded dispatch so two DISTINCT fields are threaded. Adam via ctor+adopt+step;
-polyak via `Module.polyak_from`; storage CheckpointWriter/Reader (task_emb body
-appended last); action/record entry points take `List[Scalar[DT]]`.
+polyak via `Module.polyak_from`; a one-file v3 checkpoint (task table last,
+its Adam powers + pi_scale + step count as `K` scalars); action/record entry points take `List[Scalar[DT]]`.
 
 Acting: MPC-off (`a = π(encode([obs|task_emb]))`) by default, or MPPI planning
 via `select_action_mpc` on the GPU target — the planner is task-conditioned
@@ -26,6 +26,8 @@ grad sites 1+2) → policy update on encoded latents (site 3) → ONE embedding 
 step → Polyak. The embedding table's `zero_grad`/`step` bracket the whole step.
 """
 
+from noeira.io.artifact_sink import ArtifactSink
+from noeira.deep_agents.training.checkpoint import announce_checkpoint
 from noeira.nn.core.param import walk_params, ParamVisitorRef
 from std.math import tanh
 from std.random import random_float64
@@ -40,7 +42,9 @@ from noeira.nn.core.initializer import Kaiming, Zero
 from noeira.nn.optimizer.adam import Adam
 from noeira.nn.primitives.rsample import RSample
 from noeira.nn.core.checkpoint import (
-    CheckpointWriter, CheckpointReader, _split_lines,
+    BinaryCheckpointWriter, BinaryCheckpointReader, CheckpointReader,
+    CheckpointScalars, write_model, read_model, _split_lines, _is_v3_header,
+    _read_file_bytes, _write_file_bytes,
 )
 
 from noeira.deep_agents.data.sequence_replay import SequenceReplay
@@ -725,64 +729,68 @@ struct TDMPC2MultiTaskAgent[
     ) raises:
         _ = self.flush_metrics[L](logger, step)
 
-    # ── Checkpointing (storage v2 envelope; table appended LAST) ────────
+    # ── Checkpointing (one v3 file; task table LAST among the tensors) ─
     def save_state(mut self, path: String) raises:
+        """Every world-model module, the Q ensemble (online + target), policy
+        and termination into ONE v3 storage-ckpt file, then the task table
+        (param + its own Adam moments), then as `K` sections the table's
+        bias-correction powers, the running Q scale (`pi_scale`) and the step
+        counter. Atomic and chunked. Network optimizer moments NOT persisted."""
         comptime tg = Self.target
-        var w = CheckpointWriter(save_moments=False)
-        w.mode = 0
-        walk_params[tg](self.encoder, w, self.ctx, "encoder")
-        walk_params[tg](self.dynamics, w, self.ctx, "dynamics")
-        walk_params[tg](self.reward, w, self.ctx, "reward")
-        walk_params[tg](self.policy, w, self.ctx, "policy")
-        walk_params[tg](self.q0, w, self.ctx, "q0")
-        walk_params[tg](self.q1, w, self.ctx, "q1")
-        walk_params[tg](self.q2, w, self.ctx, "q2")
-        walk_params[tg](self.q3, w, self.ctx, "q3")
-        walk_params[tg](self.q4, w, self.ctx, "q4")
-        walk_params[tg](self.qt0, w, self.ctx, "qt0")
-        walk_params[tg](self.qt1, w, self.ctx, "qt1")
-        walk_params[tg](self.qt2, w, self.ctx, "qt2")
-        walk_params[tg](self.qt3, w, self.ctx, "qt3")
-        walk_params[tg](self.qt4, w, self.ctx, "qt4")
-        walk_params[tg](self.termination, w, self.ctx, "termination")
-        w.mode = 1
-        var _sref1 = ParamVisitorRef.of[type_of(w), tg](w)
-        self.encoder.for_each_state[tg](_sref1, self.ctx, "encoder")
-        var _sref2 = ParamVisitorRef.of[type_of(w), tg](w)
-        self.dynamics.for_each_state[tg](_sref2, self.ctx, "dynamics")
-        var _sref3 = ParamVisitorRef.of[type_of(w), tg](w)
-        self.reward.for_each_state[tg](_sref3, self.ctx, "reward")
-        var _sref4 = ParamVisitorRef.of[type_of(w), tg](w)
-        self.policy.for_each_state[tg](_sref4, self.ctx, "policy")
-        var _sref5 = ParamVisitorRef.of[type_of(w), tg](w)
-        self.q0.for_each_state[tg](_sref5, self.ctx, "q0")
-        var _sref6 = ParamVisitorRef.of[type_of(w), tg](w)
-        self.q1.for_each_state[tg](_sref6, self.ctx, "q1")
-        var _sref7 = ParamVisitorRef.of[type_of(w), tg](w)
-        self.q2.for_each_state[tg](_sref7, self.ctx, "q2")
-        var _sref8 = ParamVisitorRef.of[type_of(w), tg](w)
-        self.q3.for_each_state[tg](_sref8, self.ctx, "q3")
-        var _sref9 = ParamVisitorRef.of[type_of(w), tg](w)
-        self.q4.for_each_state[tg](_sref9, self.ctx, "q4")
-        var _sref10 = ParamVisitorRef.of[type_of(w), tg](w)
-        self.qt0.for_each_state[tg](_sref10, self.ctx, "qt0")
-        var _sref11 = ParamVisitorRef.of[type_of(w), tg](w)
-        self.qt1.for_each_state[tg](_sref11, self.ctx, "qt1")
-        var _sref12 = ParamVisitorRef.of[type_of(w), tg](w)
-        self.qt2.for_each_state[tg](_sref12, self.ctx, "qt2")
-        var _sref13 = ParamVisitorRef.of[type_of(w), tg](w)
-        self.qt3.for_each_state[tg](_sref13, self.ctx, "qt3")
-        var _sref14 = ParamVisitorRef.of[type_of(w), tg](w)
-        self.qt4.for_each_state[tg](_sref14, self.ctx, "qt4")
-        var _sref15 = ParamVisitorRef.of[type_of(w), tg](w)
-        self.termination.for_each_state[tg](_sref15, self.ctx, "termination")
-        # Task embedding table appended last (param + Adam moments).
-        self.task_emb.save_body(w.content, "task_emb")
-        with open(path, "w") as f:
-            f.write(w.content)
+        var w = BinaryCheckpointWriter(save_moments=False)
+        write_model[tg](w, self.encoder, self.ctx, "encoder")
+        write_model[tg](w, self.dynamics, self.ctx, "dynamics")
+        write_model[tg](w, self.reward, self.ctx, "reward")
+        write_model[tg](w, self.policy, self.ctx, "policy")
+        write_model[tg](w, self.q0, self.ctx, "q0")
+        write_model[tg](w, self.q1, self.ctx, "q1")
+        write_model[tg](w, self.q2, self.ctx, "q2")
+        write_model[tg](w, self.q3, self.ctx, "q3")
+        write_model[tg](w, self.q4, self.ctx, "q4")
+        write_model[tg](w, self.qt0, self.ctx, "qt0")
+        write_model[tg](w, self.qt1, self.ctx, "qt1")
+        write_model[tg](w, self.qt2, self.ctx, "qt2")
+        write_model[tg](w, self.qt3, self.ctx, "qt3")
+        write_model[tg](w, self.qt4, self.ctx, "qt4")
+        write_model[tg](w, self.termination, self.ctx, "termination")
+        var sc = CheckpointScalars()
+        self.task_emb.write_v3(w, sc, "task_emb")
+        sc.set("pi_scale", Float64(self.pol_step.scale.value))
+        sc.set_int("step_count", self.step_count)
+        w.write_scalars(sc)
+        _write_file_bytes(path, w.content)
 
     def load_state(mut self, path: String) raises:
+        """Inverse of `save_state`. Legacy v2 text files (the task table as a
+        positional text body, no scalars) still load."""
         comptime tg = Self.target
+        var bytes = _read_file_bytes(path)
+        if _is_v3_header(bytes):
+            var rb = BinaryCheckpointReader(bytes^)
+            read_model[tg](rb, self.encoder, self.ctx, "encoder")
+            read_model[tg](rb, self.dynamics, self.ctx, "dynamics")
+            read_model[tg](rb, self.reward, self.ctx, "reward")
+            read_model[tg](rb, self.policy, self.ctx, "policy")
+            read_model[tg](rb, self.q0, self.ctx, "q0")
+            read_model[tg](rb, self.q1, self.ctx, "q1")
+            read_model[tg](rb, self.q2, self.ctx, "q2")
+            read_model[tg](rb, self.q3, self.ctx, "q3")
+            read_model[tg](rb, self.q4, self.ctx, "q4")
+            read_model[tg](rb, self.qt0, self.ctx, "qt0")
+            read_model[tg](rb, self.qt1, self.ctx, "qt1")
+            read_model[tg](rb, self.qt2, self.ctx, "qt2")
+            read_model[tg](rb, self.qt3, self.ctx, "qt3")
+            read_model[tg](rb, self.qt4, self.ctx, "qt4")
+            read_model[tg](rb, self.termination, self.ctx, "termination")
+            self.task_emb.read_v3(rb, "task_emb")
+            var sc = rb.read_scalars()
+            rb.finish()
+            self.task_emb.take_scalars(sc, "task_emb")
+            self.pol_step.scale.value = Scalar[DT](
+                sc.get("pi_scale", Float64(self.pol_step.scale.value))
+            )
+            self.step_count = sc.get_int("step_count", self.step_count)
+            return
         var content: String
         with open(path, "r") as f:
             content = String(f.read())
@@ -1299,6 +1307,8 @@ struct TDMPC2MultiTaskAgent[
         logger: Optional[Pointer[L, MutAnyOrigin]] = None,
         diag_every: Int = 0,
         checkpoint_path: String = "",
+        artifacts: Optional[ArtifactSink] = None,
+        run_dir: String = String(""),
         checkpoint_every: Int = 0,
         base_step: Int = 0,
         eval_env: Optional[Pointer[EE, MutAnyOrigin]] = None,
@@ -1559,7 +1569,7 @@ struct TDMPC2MultiTaskAgent[
                         for k in range(w_cnt):
                             acc += window[k]
                         lg[].log_scalar(
-                            String("avg_reward/") + tag,
+                            String("avg_reward_") + tag,
                             Float64(acc / Scalar[DT](w_cnt)),
                             gstep,
                         )
@@ -1571,6 +1581,7 @@ struct TDMPC2MultiTaskAgent[
                 and _crossed(prev, now, checkpoint_every)
             ):
                 self.save_state(checkpoint_path)
+                announce_checkpoint(checkpoint_path, artifacts, run_dir)
 
             var do_eval = (
                 eval_every > 0
@@ -1589,7 +1600,7 @@ struct TDMPC2MultiTaskAgent[
                 if Bool(logger):
                     var lg = logger.value()
                     lg[].log_scalar(
-                        String("eval/") + tag, Float64(ret), gstep
+                        String("eval_return_") + tag, Float64(ret), gstep
                     )
                 if verbose:
                     var el = Float64(perf_counter_ns() - t_start) / 1e9
@@ -1615,6 +1626,7 @@ struct TDMPC2MultiTaskAgent[
 
         if checkpoint_every > 0 and checkpoint_path.byte_length() > 0:
             self.save_state(checkpoint_path)
+            announce_checkpoint(checkpoint_path, artifacts, run_dir)
         return best
 
     def _mt_stage_obs[

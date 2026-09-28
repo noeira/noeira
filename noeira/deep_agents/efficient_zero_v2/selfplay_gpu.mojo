@@ -309,10 +309,10 @@ def run_ezv2_gumbel_selfplay_gpu[
             var dn = List[String]()
             var dv = List[Float64]()
             dn.append(String("loss")); dv.append(last_loss)
-            dn.append(String("loss_policy")); dv.append(Float64(l_parts[unsafe_offset=0]))
-            dn.append(String("loss_value")); dv.append(Float64(l_parts[unsafe_offset=1]))
-            dn.append(String("loss_reward")); dv.append(Float64(l_parts[unsafe_offset=2]))
-            dn.append(String("loss_consistency"))
+            dn.append(String("policy_loss")); dv.append(Float64(l_parts[unsafe_offset=0]))
+            dn.append(String("value_loss")); dv.append(Float64(l_parts[unsafe_offset=1]))
+            dn.append(String("reward_loss")); dv.append(Float64(l_parts[unsafe_offset=2]))
+            dn.append(String("consistency_loss"))
             dv.append(Float64(l_parts[unsafe_offset=3]))
             append_mz_train_diagnostics[ACT, BINS, B](
                 h_diag_pred, t_pol, t_val, v_min, v_max, dn, dv
@@ -438,9 +438,9 @@ def run_ezv2_gumbel_selfplay_gpu[
                 ravg /= Float64(rcnt)
             var rn = List[String]()
             var rv = List[Float64]()
-            rn.append(String("avg_return")); rv.append(ravg)
+            rn.append(String("avg_reward")); rv.append(ravg)
             rn.append(String("episodes")); rv.append(Float64(rb.num_episodes()))
-            rn.append(String("replay_size")); rv.append(Float64(rb.num_steps()))
+            rn.append(String("buffer_size")); rv.append(Float64(rb.num_steps()))
             logger.value()[].log_scalars(rn, rv, it + 1)
 
     t_cmask.unsafe_free()

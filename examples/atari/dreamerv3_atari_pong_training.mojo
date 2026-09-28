@@ -57,8 +57,9 @@ from max.gpu.host import DeviceContext
 from std.random import seed
 from std.time import perf_counter_ns
 
-from noeira.core.dotenv import load_dotenv
-from noeira.core.logger import RemoteLogger
+from noeira.core.run import RunContext, register_run
+from noeira.core.run_session import RunLogger, finish_run, run_logger
+from noeira.io.artifact_sink import sink_for_run
 from noeira.nn.constants import DT
 from noeira.nn.primitives.ops.swish_op import SwishOp
 from noeira.nn.core.initializer import Zero, TruncNormalIn
@@ -171,7 +172,6 @@ comptime EVAL_EVERY = 10_000  # greedy eval + episode returns (expensive, ~3 min
 comptime EVAL_EPISODES = 5
 comptime EP_LEN = 2000  # eval-episode cap (agent decisions)
 comptime CHECKPOINT_EVERY = 10_000  # frequent WM assets for WM_CKPT/reset_ac reuse
-comptime CHECKPOINT_PATH = "dreamerv3_atari_pong_gpu.ckpt"
 
 
 def main() raises:
@@ -186,18 +186,22 @@ def main() raises:
     print("=" * 70)
 
     with DeviceContext() as ctx:
-        # ─── Logger (remote; same KNOWN_GROUPS metrics as the other envs) ──
-        var env_vars = load_dotenv()
-        var logger = RemoteLogger(
-            server_url=env_vars.get("NOEIRA_CLOUD_URL", ""),
-            run_name="DreamerV3 Atari Pong PIXEL (GPU, discrete)",
-            buffer_size=200,
-            api_key=env_vars.get("NOEIRA_CLOUD_API_KEY", ""),
+        # ─── Run + logger (same KNOWN_GROUPS metrics as the other envs) ────
+        var run = RunContext(
+            project=String("atari"),
+            driver=String("examples/atari/dreamerv3_atari_pong_training.mojo"),
+            slug=String("dreamerv3-atari-pong"),
+            env=String("builtin:atari/pong"),
         )
+        var checkpoint_path = run.checkpoint_path(String("last"))
+        print("  Run:", run.dir)
+        var logger = run_logger(run, buffer_size=200)
         logger.set_config("algorithm", "DreamerV3")
         logger.set_config("env", "AtariPong")
         logger.set_config("target", "gpu")
         logger.set_config("t_imag", String(T_IMAG))
+        register_run(run, logger)
+        var artifacts = sink_for_run(run.id, run.dir)
         var logger_ptr = Pointer(to=logger).as_unsafe_any_origin()
 
         # ─── Agent (GPU) + env (CPU 6502; obs marshalled H2D in select_action) ──
@@ -231,7 +235,7 @@ def main() raises:
         print("-" * 70)
         var t_start = perf_counter_ns()
         var final_ret = agent.train_single[
-            Env, L=RemoteLogger, USE_TRAIN_CUDA_GRAPH=True
+            Env, L=RunLogger, USE_TRAIN_CUDA_GRAPH=True
         ](
             env,
             NUM_STEPS,
@@ -244,11 +248,17 @@ def main() raises:
             log_every=LOG_EVERY,
             verbose=True,
             logger=logger_ptr,
-            checkpoint_path=CHECKPOINT_PATH,
+            checkpoint_path=checkpoint_path,
+            artifacts=artifacts,
+            run_dir=run.dir,
             checkpoint_every=CHECKPOINT_EVERY,
         )
         var elapsed_s = Float64(perf_counter_ns() - t_start) / 1e9
-        logger.close()
+        var sent = logger.b.total_logged()
+        finish_run(
+            run, logger, artifacts,
+            String("eval_return=") + String(final_ret),
+        )
         _ = logger  # lifetime extender for logger_ptr
 
         # ─── Summary ─────────────────────────────────────────────────────
@@ -258,6 +268,6 @@ def main() raises:
         print("  total env_steps   =", NUM_STEPS)
         print("  elapsed           =", elapsed_s, "s")
         print("  FINAL mean_ret(", EVAL_EPISODES, ")  =", final_ret)
-        print("  remote points sent=", logger.total_logged())
+        print("  remote points sent=", sent)
         print("  (Pong: -21 = shutout loss, +21 = shutout win)")
         print("=" * 70)

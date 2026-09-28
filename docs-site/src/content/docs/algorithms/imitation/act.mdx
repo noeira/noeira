@@ -6,6 +6,8 @@ description: Action Chunking with Transformers — a CVAE transformer that predi
 import Maturity from '~/components/Maturity.astro';
 import Paper from '~/components/Paper.astro';
 import Papers from '~/components/Papers.astro';
+import ActModel from '~/components/diagrams/ActModel.astro';
+import TemporalEnsemble from '~/components/diagrams/TemporalEnsemble.astro';
 
 <Maturity level="beta" note="Gated against the reference implementation and against LeRobot's training. Runs closed loop on the arm at 30 Hz; no real-arm success rate has been measured." />
 
@@ -41,7 +43,9 @@ matters for human-collected data.
 
 **A DETR-style transformer.** The decoder is an encoder–decoder transformer:
 the encoder attends over image feature tokens, the joint-state token and the
-latent token; the decoder turns `K` learned queries into `K` actions. The
+latent token; the decoder turns `K` learned queries into `K` actions (see
+[the departure from the reference](#one-departure-from-the-reference) for what
+those queries are made of). The
 attention is `noeira/nn/primitives/cross_attention.mojo`, which carries what
 DETR needs and plain self-attention cannot express: query and key lengths that
 differ, and positional embeddings added to queries and keys but not values.
@@ -52,11 +56,16 @@ starts from ImageNet weights, fetched from the Hub with no PyTorch, and its
 BatchNorm statistics are frozen — both references do this, and trainable
 BatchNorm replaces the ImageNet statistics within a few hundred steps.
 
+<ActModel />
+
 **Chunking and the temporal ensemble.** The policy is queried every control
 step. Each query returns `K` future actions; the command for step `t` is a
-weighted average of every chunk that covers `t`, with weight
-`exp(-m · age)` and `m = ACT_TEMPORAL_ENSEMBLE_M = 0.01`
+weighted average of every chunk that covers `t`, with weight `exp(-m · i)`,
+where `i` counts from the **oldest** chunk covering `t` — the oldest
+prediction weighs most — and `m = ACT_TEMPORAL_ENSEMBLE_M = 0.01`
 (`noeira/deep_agents/act/inference.mojo`).
+
+<TemporalEnsemble />
 
 ### Two quirks of the reference, reproduced
 
@@ -67,7 +76,38 @@ weighted average of every chunk that covers `t`, with weight
 - **The CVAE latent collapses.** At the paper's KL weight of 10 the KL term
   falls to ~0 within a few epochs and `z` carries no information. LeRobot's
   ACT shows the same collapse on the same data, so it is faithful — but it
-  means the model runs as a plain chunk predictor.
+  means the model runs as a plain chunk predictor. Lowering the weight does
+  not help: on LIBERO the KL trajectories at weights 0.1 and 10 agree to three
+  digits. The decoder ignores `z` from the start, so the KL term is the
+  encoder head's only gradient, and Adam's per-parameter step normalisation
+  cancels its weight.
+
+### One departure from the reference
+
+The reference feeds the decoder **zeros** as its target tokens and adds the
+learned queries only as positional embeddings to the attention's queries and
+keys. With zero targets, the only route from "which chunk position" to the
+output is the cross-attention weights. On LIBERO every fit built that way —
+per task, multi-task, 150k steps, other KL weights, an extra loss on the
+chunk's shape — converged to **one action for all `K` positions**: the policy
+drove with the chunk's average, and scored at most 0.155. The per-position
+part of the output is a small residual, and the L1 fit removes it while it
+fits the per-state mean.
+
+The port's decoder targets are a second learned embedding per position
+(content queries, as in conditional-DETR-style decoders), so the position
+rides the residual stream and a different action per position is easy to
+express. On the same data this took LIBERO from 0.155 to 0.75, and the
+predicted chunks vary across positions as much as the recorded ones.
+`examples/libero/libero_act_inspect.mojo` reads any checkpoint's chunk
+position by position; a spread near zero is the flat failure.
+
+The reference gates still hold: loading a reference dump fills the content
+queries with zeros, which is the reference's decoder exactly. Checkpoints
+saved before this change (21 Sep 2026) do not load — they lack the extra
+parameter — and need a refit. The query embeddings are also drawn from
+N(0, 1), as `nn.Embedding` draws them; an earlier Kaiming draw at std 0.09 was
+a porting bug.
 
 ## Configuration on the SO-101
 
@@ -213,8 +253,8 @@ Its default ACT inference is the temporal ensemble; `--act-exec N` executes
 |---|---|
 | LeRobot parity: stock LeRobot ACT on the same 50 episodes, same 40/10 split | ours: val L1 **0.3941** at epoch 7.7 (≈0.414 in LeRobot's units, which divide by valid slots only); LeRobot: best **0.3726**, plateau 0.3791 |
 | Closed loop on a Jetson Orin NX (CUDA) | **30.0 Hz** — cameras 2.2 + preprocess 3.4 + forward 27.6 = 33.2 ms per query |
-| LIBERO `libero_goal`, 200 episodes, temporal ensemble | **31/200** |
-| LIBERO control: kNN over the same proprio words, no camera | 144/200 |
+| LIBERO `libero_goal`, 200 episodes, temporal ensemble, 3 seeds | **0.75 ± 0.05** (0.81, 0.705, 0.735) |
+| LIBERO controls: nearest demonstration over the same joint words, no camera | 0.795 (k=1), 0.72 (k=5) |
 
 How to read them:
 
@@ -226,9 +266,13 @@ How to read them:
 - **The Orin number is latency, not success.** It means the policy is queried
   at the rate it was trained at. No success rate on the real arm has been
   measured yet.
-- **LIBERO.** 31/200 is below the vision-free control, so the image policy is
-  not yet using what the proprioception alone can solve. These rates come
-  from noeira's LIBERO port and are not comparable to LIBERO's published
+- **LIBERO.** The policy sits between the two vision-free controls, which
+  match each state against the demonstrations using joints alone. In
+  `libero_goal` every task shares one scene and objects move about a
+  centimetre, so the cameras add little the joints do not already carry. The
+  seed spread (sd 0.054) is larger than the error of one 200-episode eval
+  (0.031), so a single seed is not a rate: `ACT_SEED` sets it. These rates
+  come from noeira's LIBERO port and are not comparable to LIBERO's published
   tables.
 
 ## Gates

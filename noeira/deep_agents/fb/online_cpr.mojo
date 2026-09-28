@@ -69,6 +69,7 @@ from ..training.driver_offpolicy import OffPolicyAgentGpu
 from .online import FBOnlineAgent
 from .cpr import FBCPRHead
 from .kernels import (
+    gather_rows_into_kernel,
     gather_rows_kernel,
     gather_idx_kernel,
     expand_windows_kernel,
@@ -96,13 +97,17 @@ struct FBCPROnlineAgent[
     LANES: Int,
     SEQ: Int,
     ZBUF: Int = 10_000,
+    DERIVED_TAIL: Int = 0,
 ](OffPolicyAgentGpu):
     comptime AGENT_TRAIN_TARGET: StaticString = "gpu"
     comptime AGENT_OBS_DIM: Int = Self.OBS
+    # what the expert table and the ring actually store; `OBS - DERIVED_TAIL`
+    comptime STORE_OBS: Int = Self.OBS - Self.DERIVED_TAIL
     comptime AGENT_ACT_DIM: Int = Self.ACT
     comptime Base = FBOnlineAgent[
         Self.FNET, Self.BNET, Self.ANET, Self.OBS, Self.ACT, Self.D,
         Self.BATCH, Self.CAP, Self.LANES, Self.ZBUF, 0,
+        Self.DERIVED_TAIL,
     ]
     comptime Head = FBCPRHead[
         Self.FNET, Self.BNET, Self.ANET, Self.DNET, Self.QNET,
@@ -258,6 +263,13 @@ struct FBCPROnlineAgent[
             raise Error("attach_expert_windows: obs must be uploaded to device")
         var c = self.ctx.value()
         self.exp_obs = obs^
+        # the gathers above write only the stored head of `es` / `esn`; zero
+        # their derived tails ONCE so `b` and D are never handed whatever the
+        # allocator left there (both filter it out, which is exactly the kind
+        # of "harmless" that stops being harmless when a filter widens)
+        comptime if Self.DERIVED_TAIL > 0:
+            self.head.es.dev.value().enqueue_fill(Scalar[DT](0.0))
+            self.head.esn.dev.value().enqueue_fill(Scalar[DT](0.0))
         self.starts_dev = starts^
         var nb = c.enqueue_create_buffer[DType.int32](1)
         nb.enqueue_fill(Int32(n_starts))
@@ -298,17 +310,30 @@ struct FBCPROnlineAgent[
             mptr(self.idx_en.value().unsafe_ptr()),
             grid_dim=_blocks(Self.BATCH), block_dim=TPB,
         )
-        c.enqueue_function[gather_rows_kernel[Self.OBS, Self.BATCH]](
+        # ⚠ THE EXPERT TABLE IS `STORE_OBS` WIDE, NOT `OBS`. Its only readers
+        # are `b` (the window encoding) and the discriminator, whose reference
+        # filters are both `state + privileged_state` — so it carries no
+        # derived tail (§12.37). Gathering it at `OBS` stride misaligns every
+        # row after the first and reads PAST THE BUFFER on the last ones: on
+        # the box that produced garbage -> NaN in `es` / `esn` -> NaN through
+        # D and B and, one optimizer step later, NaN weights everywhere
+        # (§12.38). The destination rows stay `OBS` wide; their tails were
+        # zeroed once at attach.
+        c.enqueue_function[
+            gather_rows_into_kernel[Self.STORE_OBS, Self.OBS, Self.BATCH]
+        ](
             mptr(self.exp_obs.dev.value().unsafe_ptr()),
             mptr(self.idx_e.value().unsafe_ptr()),
             mptr(self.head.es.dev.value().unsafe_ptr()),
-            grid_dim=_blocks(Self.BATCH * Self.OBS), block_dim=TPB,
+            grid_dim=_blocks(Self.BATCH * Self.STORE_OBS), block_dim=TPB,
         )
-        c.enqueue_function[gather_rows_kernel[Self.OBS, Self.BATCH]](
+        c.enqueue_function[
+            gather_rows_into_kernel[Self.STORE_OBS, Self.OBS, Self.BATCH]
+        ](
             mptr(self.exp_obs.dev.value().unsafe_ptr()),
             mptr(self.idx_en.value().unsafe_ptr()),
             mptr(self.head.esn.dev.value().unsafe_ptr()),
-            grid_dim=_blocks(Self.BATCH * Self.OBS), block_dim=TPB,
+            grid_dim=_blocks(Self.BATCH * Self.STORE_OBS), block_dim=TPB,
         )
 
     def _relabel_z3(mut self) raises:
@@ -462,6 +487,23 @@ struct FBCPROnlineAgent[
         driver calls this on the agent it holds, which is this one."""
         self.base.set_boundary(b)
 
+    def set_age(mut self, a: Int):
+        """Forwarded — see `FBOnlineAgent.set_age` (docs §12.36)."""
+        self.base.set_age(a)
+
+    def attach_tail_spec(mut self, ref spec: List[Int32]) raises:
+        """Forwarded — see `FBOnlineAgent.attach_tail_spec`."""
+        self.base.attach_tail_spec(spec)
+
+    def set_action_norm(mut self, scale: Float64, clip: Float64):
+        """The scaling the DERIVED tail applies to stored actions.
+
+        The G1 stores the actor's RAW output and its PD chain consumes
+        `clip(a * 5, +-5)`; the tail must reproduce what the policy actually
+        saw, not what the net emitted (docs §12.36)."""
+        self.base.act_norm = Scalar[DT](scale)
+        self.base.act_clip = Scalar[DT](clip)
+
     def record_batch_gpu_nstep[
         N_ENVS: Int, NS: Int
     ](
@@ -524,12 +566,12 @@ struct FBCPROnlineAgent[
         if Bool(logger):
             var names = List[String]()
             var vals = List[Float64]()
-            names.append(String("cpr/d_pos")); vals.append(d_pos)
-            names.append(String("cpr/d_neg")); vals.append(d_neg)
-            names.append(String("cpr/r_mean")); vals.append(r_mean)
-            names.append(String("cpr/q_mean")); vals.append(q_mean)
-            names.append(String("cpr/q_loss")); vals.append(q_loss)
-            names.append(String("cpr/q_pi")); vals.append(q_pi)
+            names.append(String("disc_expert_loss")); vals.append(d_pos)
+            names.append(String("disc_policy_loss")); vals.append(d_neg)
+            names.append(String("disc_reward_mean")); vals.append(r_mean)
+            names.append(String("mean_q")); vals.append(q_mean)
+            names.append(String("critic_loss")); vals.append(q_loss)
+            names.append(String("policy_q_mean")); vals.append(q_pi)
             logger.value()[].log_scalars(names, vals, step)
         print(
             "   [cpr] step", step, " D+", d_pos, " D-", d_neg, " r", r_mean,

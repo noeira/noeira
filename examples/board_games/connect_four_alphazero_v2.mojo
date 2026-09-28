@@ -5,7 +5,7 @@ nn net torsos (`AZConnectFourResNet` — conv stem → 5 identity-skip ResBlocks
 FC policy/value heads, 128 filters, the closest match to the original AlphaZero
 backbone) + the `AlphaZeroAgent` facade, and exercises the production telemetry:
 two pluggable `GPUEvaluator` opponents (5-ply minimax + random), a per-report
-progress print, and a `RemoteLogger` metrics sink. The periodic eval plays the
+progress print, and a `run_logger` metrics sink. The periodic eval plays the
 agent at full **MCTS** strength (temp=0), so the numbers reflect the deployed
 agent, not the bare policy head.
 
@@ -26,15 +26,18 @@ advances all N_ENVS games by one move), not legacy-style collect+train rounds.
 Usage:
     pixi run -e nvidia mojo run -I . examples/board_games/connect_four_alphazero_v2.mojo
 
-With no `NOEIRA_CLOUD_URL` in the environment the RemoteLogger is a silent no-op;
-the per-report lines still print to stdout.
+The run (project `board-games`) keeps its checkpoint, `metrics.csv` and
+`run.kv` in `runs/<id>/`; with no `NOEIRA_CLOUD_URL` in `.env` the monitor half
+is inert and the per-report lines still print to stdout.
 """
 
 from std.memory import Pointer
 from max.gpu.host import DeviceContext
 
-from noeira.core.dotenv import load_dotenv
-from noeira.core.logger import RemoteLogger
+from noeira.core.run import RunContext, register_run
+from noeira.core.run_session import RunLogger, finish_run, run_logger
+from noeira.io.artifact_sink import sink_for_run
+from noeira.deep_agents.training.checkpoint import announce_checkpoint
 from noeira.deep_agents.alphazero.nets import AZConnectFourResNet
 from noeira.deep_agents.alphazero.agent import AlphaZeroAgent
 from noeira.deep_agents.zero.symmetries import HFlipColumnAugmenter
@@ -50,20 +53,20 @@ def main() raises:
     print()
 
     # ── Logger setup ────────────────────────────────────────────
-    var env_vars = load_dotenv()
-    var api_key = env_vars.get("NOEIRA_CLOUD_API_KEY", "")
-    var url = env_vars.get("NOEIRA_CLOUD_URL", "")
-
-    var logger = RemoteLogger(
-        server_url=url,
-        run_name="AlphaZero Connect Four (nn)",
-        buffer_size=22,
-        api_key=api_key,
+    var run = RunContext(
+        project=String("board-games"),
+        driver=String("examples/board_games/connect_four_alphazero_v2.mojo"),
+        slug=String("alphazero-connect-four"),
+        env=String("builtin:connect_four"),
     )
+    print("run:", run.dir)
+    var logger = run_logger(run, buffer_size=22)
     logger.set_config("agent", "AlphaZero")
     logger.set_config("env", "ConnectFour")
     logger.set_config("network", "AZConnectFourResNet[F=128,NB=5,FC=128]")
     logger.set_config("framework", "deep_agents/nn")
+    register_run(run, logger)
+    var artifacts = sink_for_run(run.id, run.dir)
     # logger.set_config("charts", json.dumps([
     #     {
     #         "title": "Eval vs MinMax",
@@ -131,7 +134,7 @@ def main() raises:
         AUG=Aug,
         OPP1=GPUMinimaxConnectFour[5],
         OPP2=RandomOpponent,
-        L=RemoteLogger,
+        L=RunLogger,
         ARENA_GAMES=128,
         RESULT_IDX=43,
         MAX_PLIES=42,
@@ -166,10 +169,15 @@ def main() raises:
         weight_decay=1e-4,
     )
 
-    logger.close()
-    agent.save("connect_four_alphazero_v2.ckpt")
+    var ckpt = run.checkpoint_path(String("last"))
+    agent.save(ckpt)
+    announce_checkpoint(ckpt, artifacts, run.dir)
+    finish_run(
+        run, logger, artifacts,
+        String("last_loss=") + String(res.last_loss) + String(" promotions=") + String(res.promotions),
+    )
 
     print()
     print("last_loss:", res.last_loss, "| promotions:", res.promotions)
-    print("saved → connect_four_alphazero_v2.ckpt")
+    print("saved →", ckpt)
     print("=== Done ===")

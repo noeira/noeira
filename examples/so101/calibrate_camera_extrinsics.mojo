@@ -66,6 +66,55 @@ admits the far easier 3D-3D problem.
    picked 15 cm above that plane is then localised by a direction nobody
    measured.
 
+## Every capture is written to `<calib>.poses.txt`
+
+One line per pose, rewritten at each capture/drop/clear: the marker in the
+camera frame, the gripper's FK position and rotation, the six joint values
+(model radians) and raw servo ticks, and the marker's four corner pixels.
+So a residual that will not come down can be diagnosed OFFLINE — a scale
+(marker size, focal length), a joint zero offset, distance-dependent depth
+noise, the lens edge — instead of by recapturing. The panel's `scale` line
+is the first of those: the least-squares scale between the camera-side and
+arm-side point sets at the fitted rotation. It should read 1.000; a
+systematic scale error grows the residual with the spread.
+
+## Without `--offset`, the offset is SOLVED (`fit_rigid_with_offset`)
+
+Leave `--offset` out and the marker's position on the gripper is estimated
+together with the camera, from the captured poses themselves — the marker can
+then go anywhere rigid on the gripper body (the rig's wrist-camera mount is
+a good flat spot) without measuring anything but its printed size. It needs
+the WRIST TURNED between captures, roll AND pitch: with one orientation the
+offset is undetermined, and the fit says so instead of guessing (`wrist`
+spread below 10 deg is refused). 10+ poses.
+
+## The arm's joint zero (`--joint-zero follower|none`)
+
+The fit trusts the arm's FK, so it trusts the servo -> model joint map. The
+so101-tower follower's calibrated zero is NOT the model's (pan -10.7 deg,
+`robot/so101/sim_map.mojo`), and with the reference map (`none`) the fit
+absorbs that into a camera 12 deg off and a 12 mm residual — measured, on
+this rig, 2026-09-22. `follower` (the default) applies the measured zero and
+REFUSES an arm whose calibration is not the one it was measured against.
+
+## Fisheye cameras (the so101-tower rig)
+
+A `model fisheye` calibration (`examples/vision/calibrate_fisheye.mojo`) is
+handled by UNDISTORTING the four marker corners through the lens
+(`FisheyeLens.unproject`) and solving the pinhole problem on the normalised
+coordinates (`K = I`, no distortion). Detection runs on a 2x upscale by
+default for a fisheye (`--detect-scale`), for the reason that tool gives:
+at 640x480 the lens makes a marker a few pixels wide.
+
+`--sim-camera NAME` (default `<camera>_cam`, e.g. `overhead_cam`) compares
+the fitted pose with the SIMULATOR's camera of that name in the
+`so101_tower` scene. The robot base sits at the family's `base_pos` in that
+scene, so the fit is moved there first. The tool prints the position and
+orientation error and the corrected `<camera pos=... xyaxes=...>`, in the
+camera's PARENT BODY frame, ready to paste into the asset. The pose is
+printed, not written: the scene is shared, and changing it changes every
+render.
+
 ## What it needs first
 
 An INTRINSICS calibration for this camera, as a
@@ -75,6 +124,7 @@ with a guessed focal length returns a pose with an unknown scale factor on it,
 and a scale error in the correspondences becomes a rotation error in the fit.
 """
 
+from std.math import acos
 from std.sys import argv
 from std.time import perf_counter_ns
 
@@ -110,8 +160,13 @@ from noeira.robot.so101.ports import follower_port
 from noeira.robot.so101.sim_map import SimJointMap
 from noeira.utils.fmt import fixed
 from noeira.vision.calib_file import CameraCalib, read_calib, write_calib
-from noeira.vision.extrinsics import RigidFit, fit_rigid
+from noeira.vision.extrinsics import RigidFit, fit_rigid, fit_rigid_with_offset
 from noeira.vision.camera_thread import open_camera_spec
+from noeira.vision.fisheye import FisheyeLens
+from noeira.vision.preprocess import pil_bilinear_u8
+from noeira.tasks.so101_tower_camera_pose import (
+    SimCamera, tower_sim_camera, camera_pose_vs_sim, fit_to_mujoco_rot,
+)
 from noeira.vision.opencv import (
     ArucoDetector,
     DICT_4X4_50,
@@ -149,6 +204,114 @@ comptime MIN_POSES = 6
 """⚠ THE SOLVER ACCEPTS 3 AND THREE PROVES NOTHING — it fits exactly, so the
 residual is 0 whatever the data says. This is the number at which `rms_mm`
 starts being a measurement rather than an identity."""
+comptime MIN_POSES_AUTO = 10
+"""With the offset SOLVED (no `--offset`): three more unknowns, so more poses
+before the residual means as much."""
+
+
+def _refit(
+    auto_off: Bool, ref cam_pts: List[Float64], ref grip_pos: List[Float64],
+    ref grip_rot: List[Float64], off: Vec3d, mut solved_off: Vec3d,
+    mut wrist_spread: Float64,
+) raises -> RigidFit:
+    """The fit over the captured poses: the offset SOLVED (`auto_off`) or
+    the given one applied."""
+    var n = len(cam_pts) // 3
+    if auto_off:
+        if n < 5:
+            raise String("offset solve: capture 5+ poses (turn the wrist between them)")
+        var of = fit_rigid_with_offset(cam_pts, grip_pos, grip_rot)
+        solved_off = of.offset
+        wrist_spread = of.rot_spread_deg
+        return of.fit.copy()
+    var base = List[Float64]()
+    for k in range(n):
+        var rk = Mat3d(
+            grip_rot[k * 9], grip_rot[k * 9 + 1], grip_rot[k * 9 + 2],
+            grip_rot[k * 9 + 3], grip_rot[k * 9 + 4], grip_rot[k * 9 + 5],
+            grip_rot[k * 9 + 6], grip_rot[k * 9 + 7], grip_rot[k * 9 + 8],
+        )
+        var b = Vec3d(grip_pos[k * 3], grip_pos[k * 3 + 1], grip_pos[k * 3 + 2]) + rk * off
+        base.append(b.x)
+        base.append(b.y)
+        base.append(b.z)
+    solved_off = off
+    return fit_rigid(cam_pts, base)
+
+
+def _dump_poses(
+    path: String, ref cam: List[Float64], ref gp: List[Float64],
+    ref gr: List[Float64], ref q: List[Float64], ref raw: List[Int],
+    ref px: List[Float64],
+):
+    """`<calib>.poses.txt` — every capture, rewritten whole (see the header).
+    A failure to write is printed, never raised: the capture itself stands."""
+    var s = String(
+        "# extrinsics captures: cam_x cam_y cam_z (m, camera frame) | grip_x"
+        " grip_y grip_z (m, base) | grip_rot r00..r22 (row-major) | q0..q5"
+        " (model rad) | raw0..raw5 (ticks) | u0 v0 .. u3 v3 (marker corners, px)\n"
+    )
+    var n = len(cam) // 3
+    for k in range(n):
+        for c in range(3):
+            s += String(cam[k * 3 + c]) + " "
+        s += "| "
+        for c in range(3):
+            s += String(gp[k * 3 + c]) + " "
+        s += "| "
+        for c in range(9):
+            s += String(gr[k * 9 + c]) + " "
+        s += "| "
+        for c in range(SO101_N):
+            s += String(q[k * SO101_N + c]) + " "
+        s += "| "
+        for c in range(SO101_N):
+            s += String(raw[k * SO101_N + c]) + " "
+        s += "| "
+        for c in range(8):
+            s += String(px[k * 8 + c]) + " "
+        s += "\n"
+    try:
+        with open(path, "w") as f:
+            f.write(s)
+    except e:
+        print("could not write", path, "-", e)
+
+
+def _fit_scale(
+    fit: RigidFit, ref cam: List[Float64], ref gp: List[Float64],
+    ref gr: List[Float64], off: Vec3d,
+) -> Float64:
+    """Least-squares scale between the camera-side points (rotated by the
+    fit) and the arm-side points, both centred: 1.0 when the marker size and
+    the focal length are right."""
+    var n = len(cam) // 3
+    if n < 2:
+        return 1.0
+    var cc = Vec3d.zero()
+    var cb = Vec3d.zero()
+    var pc = List[Vec3d]()
+    var pb = List[Vec3d]()
+    for k in range(n):
+        var rk = Mat3d(
+            gr[k * 9], gr[k * 9 + 1], gr[k * 9 + 2], gr[k * 9 + 3], gr[k * 9 + 4],
+            gr[k * 9 + 5], gr[k * 9 + 6], gr[k * 9 + 7], gr[k * 9 + 8],
+        )
+        var c = fit.rot * Vec3d(cam[k * 3], cam[k * 3 + 1], cam[k * 3 + 2])
+        var b = Vec3d(gp[k * 3], gp[k * 3 + 1], gp[k * 3 + 2]) + rk * off
+        pc.append(c)
+        pb.append(b)
+        cc = cc + c
+        cb = cb + b
+    cc = cc / Float64(n)
+    cb = cb / Float64(n)
+    var num = 0.0
+    var den = 0.0
+    for k in range(n):
+        var dc = pc[k] - cc
+        num += Float64(dc.dot(pb[k] - cb))
+        den += Float64(dc.dot(dc))
+    return num / den if den > 0.0 else 1.0
 
 
 def _fmt3(v: Vec3d, scale: Float64, digits: Int) -> String:
@@ -171,6 +334,9 @@ def main() raises:
     var body = GRIPPER_BODY_IDX
     var off = Vec3d.zero()
     var port = follower_port()
+    var detect_scale = -1
+    var sim_cam_name = String("")
+    var joint_zero = String("follower")
     var args = argv()
     for i in range(1, len(args)):
         var a = String(args[i])
@@ -188,6 +354,12 @@ def main() raises:
             body = Int(String(args[i + 1]))
         elif a == "--port" and i + 1 < len(args):
             port = String(args[i + 1])
+        elif a == "--detect-scale" and i + 1 < len(args):
+            detect_scale = Int(String(args[i + 1]))
+        elif a == "--sim-camera" and i + 1 < len(args):
+            sim_cam_name = String(args[i + 1])
+        elif a == "--joint-zero" and i + 1 < len(args):
+            joint_zero = String(args[i + 1])
         elif a == "--offset" and i + 3 < len(args):
             off = Vec3d(
                 Float64(String(args[i + 1])),
@@ -227,14 +399,14 @@ def main() raises:
             "poses) — saving will REPLACE them",
         )
 
-    if off.x == 0.0 and off.y == 0.0 and off.z == 0.0:
+    var auto_off = off.x == 0.0 and off.y == 0.0 and off.z == 0.0
+    if auto_off:
         print("")
-        print("⚠⚠ --offset IS ZERO, which asserts that the marker's centre is")
-        print("   at the gripper body's origin — inside the plastic. Measure")
-        print("   it and pass it, or every correspondence carries the error")
-        print("   and it ROTATES with the wrist, so no number of poses")
-        print("   averages it away.")
+        print("no --offset: the marker's position on the gripper is SOLVED with")
+        print("the camera. Turn the wrist (roll AND pitch) between captures;")
+        print(String(MIN_POSES_AUTO) + "+ poses. The solved offset is printed.")
         print("")
+    var min_poses = MIN_POSES_AUTO if auto_off else MIN_POSES
 
     # ── the camera ─────────────────────────────────────────────────────────
     var bgr = List[UInt8]()
@@ -279,7 +451,14 @@ def main() raises:
     for i in range(SO101_N):
         lo[i] = Float64(lo_col[i])
         hi[i] = Float64(hi_col[i])
-    var jmap = SimJointMap.identity(lo^, hi^)
+    var jmap: SimJointMap
+    if joint_zero == "follower":
+        jmap = SimJointMap.tower_follower(arm.cal, lo^, hi^)
+    elif joint_zero == "none":
+        jmap = SimJointMap.identity(lo^, hi^)
+    else:
+        raise Error("--joint-zero none|follower, not '" + joint_zero + "'")
+    print("  " + jmap.describe())
 
     # ── the window ─────────────────────────────────────────────────────────
     var r = Renderer3D(WIN_W, WIN_H)
@@ -303,7 +482,20 @@ def main() raises:
     var still = 0
 
     var cam_pts = List[Float64]()
-    var base_pts = List[Float64]()
+    # per pose: the gripper body's FK position (3) and rotation (9, row-major)
+    # — the marker is at `grip_pos + grip_rot * offset`
+    var grip_pos = List[Float64]()
+    var grip_rot = List[Float64]()
+    var solved_off = off
+    # per pose, for `<calib>.poses.txt` (see the header)
+    var pose_q = List[Float64]()
+    var pose_raw = List[Int]()
+    var pose_px = List[Float64]()
+    var marker_px = List[Float64](length=8, fill=0.0)
+    var poses_path = calib_path + ".poses.txt"
+    var wrist_spread = 0.0
+    var g_pos = Vec3d.zero()
+    var g_rot = Mat3d.identity()
     var fit = RigidFit(
         Mat3d.identity(), Vec3d.zero(), 0.0, 0.0, 0, 0,
         Array[Float64, 3](fill=0.0),
@@ -312,8 +504,31 @@ def main() raises:
     var fit_msg = String("")
     var status = String("release the arm and show the marker")
 
+    # ⚠ `solve_pnp` takes OpenCV's radial-tangential vector; a fisheye file's
+    # four Kannala-Brandt terms passed there would be a different lens that
+    # still returns a pose. So a fisheye calibration undistorts the CORNERS
+    # (`FisheyeLens.unproject`) and solves on normalised coordinates, K = I.
+    var fisheye = calib.model == "fisheye"
+    var lens = FisheyeLens(1.0, 1.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, fw, fh)
     var k = calib.k_matrix()
     var dist = calib.dist.copy()
+    if fisheye:
+        lens = FisheyeLens.from_calib(calib)
+        k = [1.0, 0.0, 0.0, 0.0, 1.0, 0.0, 0.0, 0.0, 1.0]
+        dist = List[Float64]()
+    elif calib.model != "pinhole":
+        raise Error("calibrate_camera_extrinsics: unknown model " + calib.model)
+    if detect_scale < 1:
+        detect_scale = 2 if fisheye else 1
+    var up = List[UInt8]()
+    if sim_cam_name == "":
+        sim_cam_name = cam_name + "_cam"
+    var sim = tower_sim_camera(sim_cam_name)
+    if sim.found:
+        print("sim camera:", sim.name, "at", _fmt3(sim.pos, 1000.0, 1), "mm (world)")
+    else:
+        print("sim camera: none named *" + sim_cam_name + " in the tower scene — no comparison")
+    print("lens:", calib.model, "| detection at", detect_scale, "x")
     var obj = List[Float64]()
     var half = marker_mm / 2000.0
     obj.append(-half); obj.append(half); obj.append(0.0)
@@ -339,7 +554,15 @@ def main() raises:
                 rgba[i * 4 + 2] = bgr[i * 3 + 0]
                 rgba[i * 4 + 3] = 255
             _ = tex.upload(rgba)
-            var n_markers = det.detect(bgr, fw, fh, 3, ids, corners)
+            var n_markers: Int
+            if detect_scale > 1:
+                pil_bilinear_u8(bgr, fw, fh, 3, up, fw * detect_scale, fh * detect_scale)
+                n_markers = det.detect(up, fw * detect_scale, fh * detect_scale, 3, ids, corners)
+                var sc = Float32(detect_scale)
+                for q in range(n_markers * 8):
+                    corners[q] = (corners[q] + 0.5) / sc - 0.5
+            else:
+                n_markers = det.detect(bgr, fw, fh, 3, ids, corners)
 
             # ── which marker is on the gripper ─────────────────────────────
             #
@@ -364,13 +587,23 @@ def main() raises:
             var p_cam = Vec3d.zero()
             if pick >= 0:
                 var img_xy = List[Float64]()
-                for i in range(8):
-                    img_xy.append(Float64(corners[pick * 8 + i]))
                 try:
+                    for i in range(4):
+                        var u = Float64(corners[pick * 8 + i * 2])
+                        var v = Float64(corners[pick * 8 + i * 2 + 1])
+                        if fisheye:
+                            var ab = lens.unproject(u, v)
+                            img_xy.append(ab[0])
+                            img_xy.append(ab[1])
+                        else:
+                            img_xy.append(u)
+                            img_xy.append(v)
                     solve_pnp(
                         obj, img_xy, k, dist, rvec, tvec, SOLVEPNP_IPPE_SQUARE
                     )
                     p_cam = Vec3d(tvec[0], tvec[1], tvec[2])
+                    for q in range(8):
+                        marker_px[q] = Float64(corners[pick * 8 + q])
                     have_marker = True
                 except:
                     have_marker = False
@@ -419,7 +652,9 @@ def main() raises:
                     Float64(env.d.xpos.data[body * 3 + 1]),
                     Float64(env.d.xpos.data[body * 3 + 2]),
                 )
-                p_base = bp + Mat3d.from_quat(bq) * off
+                g_pos = bp
+                g_rot = Mat3d.from_quat(bq)
+                p_base = bp + g_rot * solved_off
             else:
                 still = 0
 
@@ -483,11 +718,22 @@ def main() raises:
                 cam_pts.append(p_cam.x)
                 cam_pts.append(p_cam.y)
                 cam_pts.append(p_cam.z)
-                base_pts.append(p_base.x)
-                base_pts.append(p_base.y)
-                base_pts.append(p_base.z)
+                grip_pos.append(g_pos.x)
+                grip_pos.append(g_pos.y)
+                grip_pos.append(g_pos.z)
+                for rr in range(3):
+                    var row = g_rot.row(rr)
+                    grip_rot.append(row.x)
+                    grip_rot.append(row.y)
+                    grip_rot.append(row.z)
+                for jq in range(SO101_N):
+                    pose_q.append(qp[jq])
+                    pose_raw.append(Int(raw[jq]))
+                for q in range(8):
+                    pose_px.append(marker_px[q])
+                _dump_poses(poses_path, cam_pts, grip_pos, grip_rot, pose_q, pose_raw, pose_px)
                 try:
-                    fit = fit_rigid(cam_pts, base_pts)
+                    fit = _refit(auto_off, cam_pts, grip_pos, grip_rot, off, solved_off, wrist_spread)
                     have_fit = True
                     fit_msg = String("")
                 except e:
@@ -504,18 +750,34 @@ def main() raises:
                 # looks nice is fitting the report.
                 var w = fit.worst
                 var keep_cam = List[Float64]()
-                var keep_base = List[Float64]()
+                var keep_gp = List[Float64]()
+                var keep_gr = List[Float64]()
+                var keep_q = List[Float64]()
+                var keep_raw = List[Int]()
+                var keep_px = List[Float64]()
                 for j in range(len(cam_pts) // 3):
                     if j == w:
                         continue
                     for c in range(3):
                         keep_cam.append(cam_pts[j * 3 + c])
-                        keep_base.append(base_pts[j * 3 + c])
+                        keep_gp.append(grip_pos[j * 3 + c])
+                    for c in range(9):
+                        keep_gr.append(grip_rot[j * 9 + c])
+                    for c in range(SO101_N):
+                        keep_q.append(pose_q[j * SO101_N + c])
+                        keep_raw.append(pose_raw[j * SO101_N + c])
+                    for c in range(8):
+                        keep_px.append(pose_px[j * 8 + c])
                 cam_pts = keep_cam^
-                base_pts = keep_base^
+                grip_pos = keep_gp^
+                grip_rot = keep_gr^
+                pose_q = keep_q^
+                pose_raw = keep_raw^
+                pose_px = keep_px^
+                _dump_poses(poses_path, cam_pts, grip_pos, grip_rot, pose_q, pose_raw, pose_px)
                 have_fit = False
                 try:
-                    fit = fit_rigid(cam_pts, base_pts)
+                    fit = _refit(auto_off, cam_pts, grip_pos, grip_rot, off, solved_off, wrist_spread)
                     have_fit = True
                     fit_msg = String("")
                 except e:
@@ -523,7 +785,12 @@ def main() raises:
                 status = String("dropped pose ") + String(w)
             if ig_button(String("clear")):
                 cam_pts = List[Float64]()
-                base_pts = List[Float64]()
+                grip_pos = List[Float64]()
+                grip_rot = List[Float64]()
+                pose_q = List[Float64]()
+                pose_raw = List[Int]()
+                pose_px = List[Float64]()
+                solved_off = off
                 have_fit = False
                 fit_msg = String("")
                 status = String("cleared")
@@ -563,6 +830,19 @@ def main() raises:
                     ig_text(String("spread ") + sp + " mm")
                     ig_text_disabled(String("(mm, three principal axes)"))
                 ig_text(String("origin ") + _fmt3(fit.trans, 1.0, 3) + " m")
+                ig_text(String("scale  ") + fixed(_fit_scale(fit, cam_pts, grip_pos, grip_rot, solved_off), 4)
+                        + "  (1.000 = no scale error)")
+                if auto_off:
+                    ig_text(String("offset ") + _fmt3(solved_off, 1000.0, 1) + " mm (solved)")
+                    ig_text(String("wrist  ") + fixed(wrist_spread, 0) + " deg spread")
+                if sim.found:
+                    var r_mj = fit_to_mujoco_rot(fit.rot)
+                    var dpos = (fit.trans + sim.base_off - sim.pos) * 1000.0
+                    var rel = sim.rot.transpose() @ r_mj
+                    var cc = (Float64(rel.trace()) - 1.0) / 2.0
+                    cc = 1.0 if cc > 1.0 else (-1.0 if cc < -1.0 else cc)
+                    ig_text(String("vs sim ") + fixed(Float64(dpos.length()), 1) + " mm, "
+                            + fixed(acos(cc) * 180.0 / 3.141592653589793, 2) + " deg")
             else:
                 ig_text_disabled(String("rms    -"))
                 ig_text_disabled(String("worst  -"))
@@ -571,7 +851,7 @@ def main() raises:
             if fit_msg != "":
                 ig_text_colored(fit_msg, 1.0, 0.5, 0.3, 1.0)
 
-            var enough = have_fit and len(cam_pts) // 3 >= MIN_POSES
+            var enough = have_fit and len(cam_pts) // 3 >= min_poses
             if ig_button(String("save calibration"), 200.0, 30.0) and enough:
                 calib.has_extrinsics = True
                 calib.rot = fit.rot
@@ -583,11 +863,15 @@ def main() raises:
                     status = String("saved to ") + calib_path
                     print("saved", calib_path)
                     print(String(fit))
+                    print("marker offset", _fmt3(solved_off, 1000.0, 2), "mm (gripper frame)",
+                          "SOLVED, wrist spread " + fixed(wrist_spread, 1) + " deg" if auto_off else "given")
+                    if sim.found:
+                        print(camera_pose_vs_sim(sim, fit.rot, fit.trans))
                 except e:
                     status = String("COULD NOT SAVE: ") + String(e)
             if not enough:
                 ig_text_disabled(
-                    String("save needs ") + String(MIN_POSES) + "+ poses"
+                    String("save needs ") + String(min_poses) + "+ poses"
                 )
             ig_separator()
             ig_text(status)
@@ -631,4 +915,6 @@ def main() raises:
     if have_fit:
         print("")
         print(String(fit))
+        if sim.found:
+            print(camera_pose_vs_sim(sim, fit.rot, fit.trans))
         print("saved to", calib_path, "if you pressed save")

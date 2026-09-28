@@ -64,6 +64,9 @@ from noeira.deep_agents.act.data import ACTDataset
 from noeira.deep_agents.act.trainer import ACTTrainer
 from noeira.core.dotenv import load_dotenv
 from noeira.core.logger import RemoteLogger
+from noeira.core.run import RunContext, register_run
+from noeira.deep_agents.training.checkpoint import announce_checkpoint
+from noeira.io.artifact_sink import ArtifactSink, close_sink, sink_for_run
 
 from std.python import Python, PythonObject
 
@@ -189,9 +192,19 @@ def main() raises:
         String("") if no_monitor.byte_length() > 0
         else env_vars.get("NOEIRA_CLOUD_URL", "")
     )
+    var run = RunContext(
+        project=String("so101"),
+        driver=String("examples/so101/act_so101_train_cpu.mojo"),
+        slug=String("act-so101-cpu"),
+        env=String("builtin:so_arm101"),
+        dataset=String(path),
+        device=String("cpu"),
+    )
+    print("  run     " + run.dir)
     var logger = RemoteLogger(
         server_url=monitor_url,
-        run_name="ACT SO-ARM101 (CPU)",
+        run_name=run.name(),
+        run_id=run.id,
         buffer_size=64,
         api_key=env_vars.get("NOEIRA_CLOUD_API_KEY", ""),
     )
@@ -265,6 +278,15 @@ def main() raises:
         logger.set_config("backbone_init", "random")
         logger.set_config("backbone_norm", "trainable")
 
+    # Registered after the last `set_config`: the registration carries the
+    # config and `project=` to the dashboard.
+    register_run(run, logger)
+    # `best` and `last` are uploaded as they are written. None without a
+    # monitor, and `ACT_NO_MONITOR` must silence the uploads too.
+    var artifacts: Optional[ArtifactSink] = None
+    if monitor_url.byte_length() > 0:
+        artifacts = sink_for_run(run.id, run.dir)
+
     var qpos = List[Scalar[DT]](unsafe_uninit_length=BATCH * QPOS)
     var images = List[Scalar[DT]](unsafe_uninit_length=BATCH * IMG_ELEMS)
     var actions = List[Scalar[DT]](unsafe_uninit_length=BATCH * K * ADIM)
@@ -274,8 +296,8 @@ def main() raises:
     var best_step = -1
     var stale = 0
     """Validations since the best. See PATIENCE."""
-    var best_ckpt = String("/tmp/act_so101_best.ckpt")
-    var last_ckpt = String("/tmp/act_so101_last.ckpt")
+    var best_ckpt = run.checkpoint_path(String("best"))
+    var last_ckpt = run.checkpoint_path(String("last"))
 
     var train_frames = 0
     for i in range(len(ds.train_eps)):
@@ -300,15 +322,15 @@ def main() raises:
     var acc_n = 0
 
     var names = List[String]()
-    names.append(String("train/l1"))
-    names.append(String("train/kl"))
-    names.append(String("train/epoch"))
+    names.append(String("l1_loss"))
+    names.append(String("kl_loss"))
+    names.append(String("epoch"))
 
     var val_names = List[String]()
-    val_names.append(String("val/l1"))
-    val_names.append(String("val/kl"))
-    val_names.append(String("perf/s_per_step"))
-    val_names.append(String("best/val_l1"))
+    val_names.append(String("val_l1_loss"))
+    val_names.append(String("val_kl_loss"))
+    val_names.append(String("step_s"))
+    val_names.append(String("val_l1_loss_best"))
 
     for s in range(steps):
         # Split, because "0.176 s/step" does not say WHICH half. `sample_batch`
@@ -382,11 +404,13 @@ def main() raises:
                 + "% data), ~" + String(Int(eta)) + " min left"
             )
             tr.save(last_ckpt)
+            announce_checkpoint(last_ckpt, artifacts, run.dir)
             if vl1 < best_val:
                 best_val = vl1
                 best_step = s
                 stale = 0
                 tr.save(best_ckpt)
+                announce_checkpoint(best_ckpt, artifacts, run.dir)
             else:
                 stale += 1
 
@@ -410,7 +434,17 @@ def main() raises:
                 )
                 break
 
+    # The verdict goes to `run.kv` AND the dashboard: `finish` before `close`,
+    # and the sink drained after the loop so the last `best` is uploaded.
+    var outcome = (
+        String("best_val_l1=") + String(best_val)
+        + " best_step=" + String(best_step)
+    )
+    run.set_outcome(outcome)
+    logger.finish(String("done"), outcome)
     logger.close()
+    close_sink(artifacts)
+    run.close()
 
     print("")
     print(
@@ -420,6 +454,7 @@ def main() raises:
     )
     print("  best -> " + best_ckpt)
     print("  last -> " + last_ckpt)
+    print("  run  -> " + run.kv_path())
     print("")
     print(
         "  ⚠ validation L1 rising while training L1 falls is what a"

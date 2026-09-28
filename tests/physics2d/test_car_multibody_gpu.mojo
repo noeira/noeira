@@ -13,6 +13,7 @@ from layout import Layout, LayoutTensor
 from max.gpu.host import DeviceContext
 from noeira.physics2d import dtype
 from noeira.physics2d.constants import IDX_X, IDX_Y, IDX_ANGLE, IDX_VX, IDX_VY, IDX_OMEGA
+from noeira.physics2d.constants import BODY_STATE_SIZE, JOINT_DATA_SIZE
 from noeira.physics2d.car import CarDynamicsMB, CarMBPhysicsKernel
 from noeira.physics2d.car.constants import (
     FRICTION_LIMIT, GRASS_FRICTION, ROAD_FRICTION,
@@ -22,9 +23,9 @@ from noeira.nn.core.ptr import mptr
 
 comptime BATCH = 8
 comptime BOFF = 0
-comptime FOFF = BOFF + CarDynamicsMB.NUM_BODIES * 13
+comptime FOFF = BOFF + CarDynamicsMB.NUM_BODIES * BODY_STATE_SIZE
 comptime JOFF = FOFF + CarDynamicsMB.NUM_BODIES * 3
-comptime ROFF = JOFF + CarDynamicsMB.NUM_JOINTS * 17
+comptime ROFF = JOFF + CarDynamicsMB.NUM_JOINTS * JOINT_DATA_SIZE
 comptime COFF = ROFF + CarDynamicsMB.NUM_WHEELS
 comptime SSZ = COFF + 3
 comptime K = 40

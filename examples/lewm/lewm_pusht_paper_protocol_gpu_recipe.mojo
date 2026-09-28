@@ -13,8 +13,11 @@ comparable to the paper's ~90%) but for the recipe-retrained WM
 
 Run (NVIDIA, after lewm_pusht_train_gpu_recipe.mojo):
   pixi run -e nvidia mojo run -I . examples/lewm/lewm_pusht_paper_protocol_gpu_recipe.mojo
+  pixi run -e nvidia mojo run -I . examples/lewm/lewm_pusht_paper_protocol_gpu_recipe.mojo --ckpt <run_id>
 """
 
+from std.sys import argv
+from noeira.core.run import resolve_checkpoint
 from std.memory import alloc
 from std.random import seed as rng_seed, random_float64
 from max.gpu.host import DeviceContext
@@ -89,15 +92,27 @@ comptime Source = WindowSource[
 ]
 
 
+def _flag(name: String, dflt: String) raises -> String:
+    """Value of `--name X`, or `dflt` when the flag is absent."""
+    var av = argv()
+    for i in range(1, len(av)):
+        if String(av[i]) == name:
+            if i + 1 >= len(av):
+                raise Error("flag " + name + " needs a value")
+            return String(av[i + 1])
+    return dflt
+
+
 def main() raises:
+    var ckpt = resolve_checkpoint(_flag(String("--ckpt"), CKPT_PATH), String("last"))
     print("=" * 70)
     print("LeWM nn — PushT PAPER-PROTOCOL eval, RECIPE WM (GPU)")
     print("=" * 70)
     var ctx = DeviceContext()
 
     var wm = Trainer.make(lam=Scalar[DT](0.09), lr=Scalar[DT](5e-5), ctx=ctx)
-    print("loading frozen recipe WM", CKPT_PATH, "...")
-    wm.load_params(CKPT_PATH)
+    print("loading frozen recipe WM", ckpt, "...")
+    wm.load_params(ckpt)
 
     # BN running-stats warm-up with the WM's z-scored action convention.
     # Read the de-normalization stats BEFORE the sampler moves into Source.

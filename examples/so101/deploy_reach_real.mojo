@@ -6,6 +6,8 @@ policy binary -> the arm moves."* Same checkpoint as
 
     pixi run build-serial      # ONCE
     pixi run mojo run -I . examples/so101/deploy_reach_real.mojo
+    # a training run's own weights instead of the promoted `reach` role:
+    pixi run mojo run -I . examples/so101/deploy_reach_real.mojo --ckpt <run_id>
 
 ## ⚠⚠ THIS MOVES A REAL ARM. Read the safety notes before the first run.
 
@@ -83,6 +85,7 @@ from noeira.robot.so101.deploy_shutdown import return_and_release
 from noeira.io.fileio import StdinReader, stdin_is_tty
 from noeira.utils.fmt import col, fixed, pad_left, pad_right
 from noeira.core.policy import describe_policy, resolve_policy
+from noeira.core.run import resolve_checkpoint
 
 comptime POLICY_PROJECT = "so101"
 comptime POLICY_ROLE = "reach"
@@ -231,6 +234,7 @@ def main() raises:
     var seconds = SECONDS
     var step_ticks = MAX_STEP_TICKS
     var smooth = SMOOTH
+    var ckpt_arg = String("")
     var args = argv()
     for i in range(1, len(args)):
         var a = String(args[i])
@@ -242,6 +246,13 @@ def main() raises:
             step_ticks = Int(String(args[i + 1]))
         elif a == "--smooth" and i + 1 < len(args):
             smooth = Float64(String(args[i + 1]))
+        elif a == "--ckpt" and i + 1 < len(args):
+            ckpt_arg = String(args[i + 1])
+    if ckpt_arg.byte_length() > 0:
+        # ⚠ RESOLVED BEFORE ANYTHING IS OPENED. A RUN ID becomes its
+        # `checkpoints/last.ckpt` (what the reach trainer writes); a file is
+        # used as is; anything else raises here, not after the arm is up.
+        ckpt_arg = resolve_checkpoint(ckpt_arg, String("last"))
     print("=" * 70)
     if live:
         print("SO-ARM101 reach — SIM-TRAINED POLICY ON THE REAL ARM  [LIVE]")
@@ -254,9 +265,11 @@ def main() raises:
     var agent = SAC["cpu", OBS_DIM, ACT_DIM, BATCH, REPLAY_CAPACITY, HIDDEN](
         action_scale=ACTION_SCALE,
     )
-    var ckpt_path = resolve_policy(
-        String(POLICY_PROJECT), String(POLICY_ROLE), String(CHECKPOINT_FALLBACK)
-    )
+    var ckpt_path = ckpt_arg
+    if ckpt_path.byte_length() == 0:
+        ckpt_path = resolve_policy(
+            String(POLICY_PROJECT), String(POLICY_ROLE), String(CHECKPOINT_FALLBACK)
+        )
     try:
         agent.load(ckpt_path)
     except e:
@@ -267,7 +280,9 @@ def main() raises:
     print("  policy          =", ckpt_path)
     # ⚠ WHICH RUN, AND WHAT THE HUMAN SAID ABOUT IT — before the arm moves.
     var provenance = describe_policy(String(POLICY_PROJECT), String(POLICY_ROLE))
-    if provenance:
+    if ckpt_arg.byte_length() > 0:
+        print("  promoted from   = (none — named by --ckpt, not the promoted role)")
+    elif provenance:
         print("  promoted from   =", provenance)
     else:
         print(

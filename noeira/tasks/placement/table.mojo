@@ -55,6 +55,7 @@ drawer region stands in the drawer the draw just opened.
 """
 
 from layout import Layout, LayoutTensor
+from std.math import cos, sin, pi
 from std.random.philox import Random as PhiloxRandom
 
 from noeira.physics3d.gpu.constants import (
@@ -74,6 +75,12 @@ comptime PLACEMENT_SALT: UInt64 = 0x9E3779B97F4A7C15
 """Keeps placement draws off the env's reset-noise stream. See `sampler.mojo`'s
 header; any value that is not the env's own works."""
 
+
+comptime BASE_JITTER_AXIS_BASE: Int = 0xC000
+"""Where the rest-pose jitter's Philox axes start: word `i` of `base_qpos`
+draws on axis `BASE_JITTER_AXIS_BASE + i`, attempt 0 — clear of the
+placement axes and of `JOINT_AXIS_BASE`'s `jinit=` block, and below the
+16-bit axis field (`_uniform01`)."""
 
 comptime JOINT_AXIS_BASE: Int = 0x8000
 """Where a `jinit=` draw's Philox axis starts, clear of every placement axis.
@@ -109,6 +116,32 @@ reason `_uniform01` uses the counter axes at all."""
 comptime INIT_WORD_IN_BIAS: Int = 4096
 """Added to `r + 1` for an `In`. Regions per family stay far below it, and
 `active.init_region_words` refuses one that does not. Exact in float32 (2^24)."""
+
+comptime INIT_WORD_YAW_BIAS: Int = 8192
+"""Added on top of a REGION word (`r + 1`, with or without the `In` bias) for
+an init with `:yaw` — the slot's yaw is drawn on axis `YAW_AXIS_BASE + si`.
+Above every region word, exact in float32; a stack never carries it."""
+
+comptime INIT_WORD_SEP_UNIT: Int = 16384
+"""`:sep=` — the separation in WHOLE MILLIMETRES times this unit, added on top
+of a region word (with or without the `In` and `:yaw` biases, both below it).
+1..1023 mm keeps the word under 2^24, exact in float32. Decode: `sep_mm = w //
+INIT_WORD_SEP_UNIT` first, then the yaw and `In` biases from the remainder
+(`_init_word_split`)."""
+
+
+@always_inline
+def _init_word_split(w: Int) -> Tuple[Int, Int]:
+    """A REGION init word (w > 0) -> (the word without its separation, the
+    separation in mm)."""
+    var sep_mm = w // INIT_WORD_SEP_UNIT
+    return (w - sep_mm * INIT_WORD_SEP_UNIT, sep_mm)
+
+
+comptime YAW_AXIS_BASE: Int = 0xA000
+"""Where a `:yaw` draw's Philox axis starts: family slot `si` draws on
+`YAW_AXIS_BASE + si`, attempt 0 — clear of the placement axes (`si * 2`,
+`si * 2 + 1`), of `JOINT_AXIS_BASE` and of `BASE_JITTER_AXIS_BASE`."""
 
 
 trait PlacementTable:
@@ -153,6 +186,17 @@ trait PlacementTable:
         """The `.family`'s `base_qpos=` — the base asset's joint positions at
         REST, which the reset writes into `qpos[0 .. N_BASE_QPOS)`."""
         ...
+
+    @staticmethod
+    def base_qpos_jitter[DTYPE: DType](i: Int) -> Scalar[DTYPE]:
+        """The `.family`'s `base_qpos_jitter=` half-width for word `i`; the
+        reset draws `base_qpos(i) + h * (2u - 1)`. 0 = no draw.
+
+        ⚠ A DEFAULT OF 0, so the families without the key (every LIBERO one,
+        the tabletop) need not restate it — and so a table that FORGETS it is
+        silent here. `placement/check.check_table` compares it word for word
+        with the family's, which is where a missing override fails."""
+        return Scalar[DTYPE](0)
 
     # ── per free slot ──
     @staticmethod
@@ -332,6 +376,9 @@ def place_free_slots[
     """Place lane `env`'s free slots from its init words. Writes `qpos`/`qvel`
     of the slots it places and nothing else — never `meta`, whose tape must
     survive the reset."""
+    # the evidence `sin`/`cos` of a generic `Scalar[DTYPE]` need (`:yaw`),
+    # given in the body so the reset hook's trait signature stays unconstrained
+    comptime assert DTYPE.is_floating_point(), "DTYPE must be floating point"
     comptime NF = T.N_FREE
     var kind = Array[Int, META_INIT_SLOTS](fill=_KIND_NONE)
     var target = Array[Int, META_INIT_SLOTS](fill=-1)
@@ -343,6 +390,14 @@ def place_free_slots[
         var w = Int(rebind[Scalar[DTYPE]](meta[env, META_IDX_INIT_REGION_0 + j]))
         if w > 0:
             kind[j] = _KIND_REGION
+            # `:sep=` first (the highest field); it is re-read from the word
+            # in the clash test, like `:yaw` where the pose is written — a
+            # per-thread array here is the Metal miscompute shape
+            w = _init_word_split(w)[0]
+            # `:yaw` is re-read from the word where the pose is written — a
+            # per-thread flag array here is the Metal miscompute shape
+            if w > INIT_WORD_YAW_BIAS:
+                w -= INIT_WORD_YAW_BIAS
             if w > INIT_WORD_IN_BIAS:
                 inside[j] = True
                 w -= INIT_WORD_IN_BIAS
@@ -483,10 +538,27 @@ def place_free_slots[
                 y = fy + y0 + v * (y1 - y0)
 
             var clash = False
+            var sep_i = _init_word_split(Int(
+                rebind[Scalar[DTYPE]](meta[env, META_IDX_INIT_REGION_0 + j])
+            ))[1]
             for k in range(n_placed):
                 var dx = px[k] - x
                 var dy = py[k] - y
                 var rr = rad_i + T.free_radius[DTYPE](pord[k])
+                # `:sep=` — `sampler.sample_placements`' rule: the larger of
+                # the radii's sum and either slot's separation. A stack's
+                # word is negative and carries none.
+                var wk = Int(
+                    rebind[Scalar[DTYPE]](meta[env, META_IDX_INIT_REGION_0 + pord[k]])
+                )
+                var sep_mm = sep_i
+                if wk > 0:
+                    sep_mm = max(sep_mm, _init_word_split(wk)[1])
+                # ⚠ IN DTYPE, NOT Float64: Metal has no double. A division
+                # rounds once, so this is the host's metres rounded to DTYPE.
+                var sep = Scalar[DTYPE](sep_mm) / Scalar[DTYPE](1000)
+                if sep > rr:
+                    rr = sep
                 if dx * dx + dy * dy < rr * rr:
                     var rk = preg[k]
                     if rk < 0:
@@ -495,8 +567,26 @@ def place_free_slots[
                         continue
                     clash = True
             if not clash:
+                # `:yaw` — `sampler.sample_placements`' draw, its own axis
+                var cz = Scalar[DTYPE](1)
+                var sz_ = Scalar[DTYPE](0)
+                var wj = _init_word_split(Int(
+                    rebind[Scalar[DTYPE]](meta[env, META_IDX_INIT_REGION_0 + j])
+                ))[0]
+                if wj > INIT_WORD_YAW_BIAS:
+                    var ry = PhiloxRandom(
+                        seed=UInt64(seed) ^ PLACEMENT_SALT,
+                        subsequence=(UInt64(env) << 16) | UInt64(YAW_AXIS_BASE + si),
+                        offset=UInt64(0),
+                    )
+                    var uy = Scalar[DTYPE](Float64(ry.step_uniform()[0]))
+                    var half = (Scalar[DTYPE](2) * uy - Scalar[DTYPE](1)) * Scalar[
+                        DTYPE
+                    ](pi) * Scalar[DTYPE](0.5)
+                    cz = cos(half)
+                    sz_ = sin(half)
                 _write_pose[DTYPE, BATCH_SIZE, NQ_F, NV_F](
-                    qpos, qvel, env, qa, da, x, y, z
+                    qpos, qvel, env, qa, da, x, y, z, cz, sz_
                 )
                 px[n_placed] = x
                 py[n_placed] = y
@@ -563,8 +653,8 @@ def reset_task_slots[
     env: Int,
     seed: Int,
 ):
-    """The task layer's whole reset for one lane: the base asset's rest pose,
-    the joint draws, THEN the placements.
+    """The task layer's whole reset for one lane: the base asset's rest pose
+    (with its `base_qpos_jitter=` draw), the joint draws, THEN the placements.
 
     ⚠⚠ THE REST POSE, BECAUSE `qpos0` IS NOT IT. `_reset_env_lane` restores
     the composed scene's `qpos0`, which for the Panda is every joint at ZERO —
@@ -580,7 +670,18 @@ def reset_task_slots[
     drawer's drawn `qpos`, so the draw must be written first — the host's order
     too (draw, FK, frames, sample)."""
     for i in range(T.N_BASE_QPOS):
-        qpos[env, i] = T.base_qpos[DTYPE](i)
+        var q = T.base_qpos[DTYPE](i)
+        var h = T.base_qpos_jitter[DTYPE](i)
+        if h != Scalar[DTYPE](0):
+            # `sampler.sample_base_qpos`'s draw: axis BASE_JITTER_AXIS_BASE + i
+            var ru = PhiloxRandom(
+                seed=UInt64(seed) ^ PLACEMENT_SALT,
+                subsequence=(UInt64(env) << 16) | UInt64(BASE_JITTER_AXIS_BASE + i),
+                offset=UInt64(0),
+            )
+            var u = Scalar[DTYPE](Float64(ru.step_uniform()[0]))
+            q = q + h * (Scalar[DTYPE](2) * u - Scalar[DTYPE](1))
+        qpos[env, i] = q
         if i < NV_F:
             qvel[env, i] = Scalar[DTYPE](0)
     draw_joint_inits[T, DTYPE, BATCH_SIZE, NQ_F, NV_F](
@@ -601,17 +702,20 @@ def _write_pose[DTYPE: DType, BATCH_SIZE: Int, NQ_F: Int, NV_F: Int](
     x: Scalar[DTYPE],
     y: Scalar[DTYPE],
     z: Scalar[DTYPE],
+    qw: Scalar[DTYPE] = Scalar[DTYPE](1),
+    qz: Scalar[DTYPE] = Scalar[DTYPE](0),
 ):
-    """`reset.write_free_pose` + `write_free_vel_zero` on one lane.
+    """`reset.write_free_pose` + `write_free_vel_zero` on one lane; `(qw, qz)`
+    is a yaw about +z, the identity by default.
 
     ⚠ W-FIRST IN `qpos`: a free joint's seven words are (x, y, z, w, x, y, z),
     and the identity is (1, 0, 0, 0) — zeros are a degenerate rotation."""
     qpos[env, qa + 0] = x
     qpos[env, qa + 1] = y
     qpos[env, qa + 2] = z
-    qpos[env, qa + 3] = Scalar[DTYPE](1)
+    qpos[env, qa + 3] = qw
     qpos[env, qa + 4] = Scalar[DTYPE](0)
     qpos[env, qa + 5] = Scalar[DTYPE](0)
-    qpos[env, qa + 6] = Scalar[DTYPE](0)
+    qpos[env, qa + 6] = qz
     for k in range(FREE_JOINT_NV):
         qvel[env, da + k] = Scalar[DTYPE](0)

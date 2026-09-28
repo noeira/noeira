@@ -1,22 +1,32 @@
-"""Revolute Joint constraint solver.
+"""Revolute joint — a port of Box2D 2.3's b2RevoluteJoint.
 
-A revolute joint constrains two bodies to rotate around a common anchor point.
-It can optionally have:
-- Angle limits (lower/upper bounds on relative rotation)
-- Motor (applies torque to reach target angular velocity)
-- Spring (soft constraint with stiffness and damping)
+Reference: `references/pybox2d-2.3.10/Box2D/Dynamics/Joints/b2RevoluteJoint.cpp`
+(the Box2D that Gymnasium's LunarLander / BipedalWalker / CarRacing run).
 
-The constraint ensures the anchor points on both bodies remain coincident.
+A revolute joint pins an anchor on body A to an anchor on body B. Optionally:
+- an angle limit on `angle_b - angle_a - reference_angle`,
+- a motor driving the relative angular velocity toward `motor_speed` with
+  at most `max_motor_torque`.
+
+Per world step (see the env steps), for every joint:
+  1. `init_velocity_single_env`  — InitVelocityConstraints: limit state, then
+     warm start from the impulses accumulated last step.
+  2. `solve_velocity_single_env` — SolveVelocityConstraints, once per velocity
+     iteration: motor, then limit + point as one 3x3 block (or point alone).
+  3. `solve_position_single_env` — SolvePositionConstraints, once per position
+     iteration: angular limit, then the point (non-linear Gauss-Seidel).
+     Returns whether the joint is within slop, for Box2D's early exit.
+
+Bodies are stored at their centre of mass, so Box2D's `localAnchor -
+localCenter` is the stored local anchor. Box2D 2.3 has no joint spring, and
+neither does this port.
 """
 
 from std.math import cos, sin, sqrt
 from layout import LayoutTensor, Layout
-from max.gpu import thread_idx, block_idx, block_dim
-from max.gpu.host import DeviceContext, DeviceBuffer
 
 from ..constants import (
     dtype,
-    TPB,
     BODY_STATE_SIZE,
     JOINT_DATA_SIZE,
     IDX_X,
@@ -39,486 +49,254 @@ from ..constants import (
     JOINT_UPPER_LIMIT,
     JOINT_MAX_MOTOR_TORQUE,
     JOINT_MOTOR_SPEED,
-    JOINT_STIFFNESS,
-    JOINT_DAMPING,
     JOINT_FLAGS,
-    JOINT_IMPULSE,
+    JOINT_IMPULSE_X,
+    JOINT_IMPULSE_Y,
+    JOINT_IMPULSE_Z,
     JOINT_MOTOR_IMPULSE,
+    JOINT_LIMIT_STATE,
     JOINT_REVOLUTE,
     JOINT_FLAG_LIMIT_ENABLED,
     JOINT_FLAG_MOTOR_ENABLED,
-    JOINT_FLAG_SPRING_ENABLED,
-    PI,
-    TWO_PI,
+    JOINT_LIMIT_INACTIVE,
+    JOINT_LIMIT_AT_LOWER,
+    JOINT_LIMIT_AT_UPPER,
+    JOINT_LIMIT_EQUAL,
+    B2_LINEAR_SLOP,
+    B2_ANGULAR_SLOP,
+    B2_MAX_ANGULAR_CORRECTION,
 )
 
 
+@always_inline
+def _ld[
+    BATCH: Int, STATE_SIZE: Int
+](
+    state: LayoutTensor[dtype, Layout.row_major(BATCH, STATE_SIZE), MutAnyOrigin],
+    env: Int,
+    i: Int,
+) -> Scalar[dtype]:
+    return rebind[Scalar[dtype]](state[env, i])
+
+
+@always_inline
+def _clamp(x: Scalar[dtype], lo: Scalar[dtype], hi: Scalar[dtype]) -> Scalar[dtype]:
+    return lo if x < lo else (hi if x > hi else x)
+
+
+@fieldwise_init
+struct _JointFrame(Copyable, Movable):
+    """One joint's per-solve quantities (Box2D recomputes them per call too)."""
+
+    var off_a: Int
+    var off_b: Int
+    var ma: Scalar[dtype]
+    var mb: Scalar[dtype]
+    var ia: Scalar[dtype]
+    var ib: Scalar[dtype]
+    var rax: Scalar[dtype]
+    var ray: Scalar[dtype]
+    var rbx: Scalar[dtype]
+    var rby: Scalar[dtype]
+
+
+@always_inline
+def _joint_frame[
+    BATCH: Int, STATE_SIZE: Int, BODIES_OFFSET: Int
+](
+    state: LayoutTensor[dtype, Layout.row_major(BATCH, STATE_SIZE), MutAnyOrigin],
+    env: Int,
+    joint_off: Int,
+) -> _JointFrame:
+    """Body offsets, inverse masses and world-frame anchor arms r_a, r_b."""
+    var body_a = Int(_ld(state, env, joint_off + JOINT_BODY_A))
+    var body_b = Int(_ld(state, env, joint_off + JOINT_BODY_B))
+    var off_a = BODIES_OFFSET + body_a * BODY_STATE_SIZE
+    var off_b = BODIES_OFFSET + body_b * BODY_STATE_SIZE
+    var aa = _ld(state, env, off_a + IDX_ANGLE)
+    var ab = _ld(state, env, off_b + IDX_ANGLE)
+    var lax = _ld(state, env, joint_off + JOINT_ANCHOR_AX)
+    var lay = _ld(state, env, joint_off + JOINT_ANCHOR_AY)
+    var lbx = _ld(state, env, joint_off + JOINT_ANCHOR_BX)
+    var lby = _ld(state, env, joint_off + JOINT_ANCHOR_BY)
+    var ca = cos(aa)
+    var sa = sin(aa)
+    var cb = cos(ab)
+    var sb = sin(ab)
+    return _JointFrame(
+        off_a=off_a,
+        off_b=off_b,
+        ma=_ld(state, env, off_a + IDX_INV_MASS),
+        mb=_ld(state, env, off_b + IDX_INV_MASS),
+        ia=_ld(state, env, off_a + IDX_INV_INERTIA),
+        ib=_ld(state, env, off_b + IDX_INV_INERTIA),
+        rax=ca * lax - sa * lay,
+        ray=sa * lax + ca * lay,
+        rbx=cb * lbx - sb * lby,
+        rby=sb * lbx + cb * lby,
+    )
+
+
 struct RevoluteJointSolver:
-    """Solver for revolute joint constraints.
-
-    Implements sequential impulse solving for:
-    1. Point-to-point constraint (anchor coincidence)
-    2. Angle limit constraint (optional)
-    3. Motor constraint (optional)
-    4. Spring force (optional)
-    """
+    """Box2D 2.3 revolute joint: warm-started sequential impulses."""
 
     # =========================================================================
-    # CPU Implementation
+    # Joint creation / reset
     # =========================================================================
 
+    @always_inline
     @staticmethod
-    def solve_velocity[
+    def write_joint[
+        BATCH: Int, STATE_SIZE: Int
+    ](
+        states: LayoutTensor[
+            dtype, Layout.row_major(BATCH, STATE_SIZE), MutAnyOrigin
+        ],
+        env: Int,
+        joint_off: Int,
+        body_a: Int,
+        body_b: Int,
+        anchor_ax: Scalar[dtype],
+        anchor_ay: Scalar[dtype],
+        anchor_bx: Scalar[dtype],
+        anchor_by: Scalar[dtype],
+        reference_angle: Scalar[dtype],
+        lower_limit: Scalar[dtype],
+        upper_limit: Scalar[dtype],
+        enable_limit: Bool,
+        enable_motor: Bool,
+        motor_speed: Scalar[dtype],
+        max_motor_torque: Scalar[dtype],
+    ):
+        """Write a revolute joint record at `joint_off` (b2RevoluteJointDef
+        fields) with zeroed warm-start state. The ONE writer every env uses."""
+        states[env, joint_off + JOINT_TYPE] = Scalar[dtype](JOINT_REVOLUTE)
+        states[env, joint_off + JOINT_BODY_A] = Scalar[dtype](body_a)
+        states[env, joint_off + JOINT_BODY_B] = Scalar[dtype](body_b)
+        states[env, joint_off + JOINT_ANCHOR_AX] = anchor_ax
+        states[env, joint_off + JOINT_ANCHOR_AY] = anchor_ay
+        states[env, joint_off + JOINT_ANCHOR_BX] = anchor_bx
+        states[env, joint_off + JOINT_ANCHOR_BY] = anchor_by
+        states[env, joint_off + JOINT_REF_ANGLE] = reference_angle
+        states[env, joint_off + JOINT_LOWER_LIMIT] = lower_limit
+        states[env, joint_off + JOINT_UPPER_LIMIT] = upper_limit
+        states[env, joint_off + JOINT_MOTOR_SPEED] = motor_speed
+        states[env, joint_off + JOINT_MAX_MOTOR_TORQUE] = max_motor_torque
+        var flags = 0
+        if enable_limit:
+            flags = flags | JOINT_FLAG_LIMIT_ENABLED
+        if enable_motor:
+            flags = flags | JOINT_FLAG_MOTOR_ENABLED
+        states[env, joint_off + JOINT_FLAGS] = Scalar[dtype](flags)
+        RevoluteJointSolver.clear_warm_start[BATCH, STATE_SIZE](
+            states, env, joint_off
+        )
+
+    @always_inline
+    @staticmethod
+    def clear_warm_start[
+        BATCH: Int, STATE_SIZE: Int
+    ](
+        states: LayoutTensor[
+            dtype, Layout.row_major(BATCH, STATE_SIZE), MutAnyOrigin
+        ],
+        env: Int,
+        joint_off: Int,
+    ):
+        """Zero one joint's accumulated impulses and limit state — what a
+        freshly created b2Joint starts with. Call on every env reset for
+        joints whose fields are rewritten in place."""
+        states[env, joint_off + JOINT_IMPULSE_X] = Scalar[dtype](0)
+        states[env, joint_off + JOINT_IMPULSE_Y] = Scalar[dtype](0)
+        states[env, joint_off + JOINT_IMPULSE_Z] = Scalar[dtype](0)
+        states[env, joint_off + JOINT_MOTOR_IMPULSE] = Scalar[dtype](0)
+        states[env, joint_off + JOINT_LIMIT_STATE] = Scalar[dtype](
+            JOINT_LIMIT_INACTIVE
+        )
+
+    # =========================================================================
+    # InitVelocityConstraints
+    # =========================================================================
+
+    @always_inline
+    @staticmethod
+    def init_velocity_single_env[
         BATCH: Int,
         NUM_BODIES: Int,
         MAX_JOINTS: Int,
+        STATE_SIZE: Int,
+        BODIES_OFFSET: Int,
+        JOINTS_OFFSET: Int,
     ](
-        mut bodies: LayoutTensor[
-            dtype,
-            Layout.row_major(BATCH, NUM_BODIES, BODY_STATE_SIZE),
-            MutAnyOrigin,
+        env: Int,
+        state: LayoutTensor[
+            dtype, Layout.row_major(BATCH, STATE_SIZE), MutAnyOrigin
         ],
-        mut joints: LayoutTensor[
-            dtype,
-            Layout.row_major(BATCH, MAX_JOINTS, JOINT_DATA_SIZE),
-            MutAnyOrigin,
-        ],
-        joint_counts: LayoutTensor[
-            dtype, Layout.row_major(BATCH), MutAnyOrigin
-        ],
-        dt: Scalar[dtype],
+        joint_count: Int,
     ):
-        """Solve velocity constraints for all joints."""
-        for env in range(BATCH):
-            var n_joints = Int(joint_counts[env])
+        """Update each joint's limit state and apply the warm-start impulses
+        (b2RevoluteJoint::InitVelocityConstraints, dtRatio = 1)."""
+        for j in range(MAX_JOINTS):
+            if j >= joint_count:
+                break
+            var joff = JOINTS_OFFSET + j * JOINT_DATA_SIZE
+            if Int(_ld(state, env, joff + JOINT_TYPE)) != JOINT_REVOLUTE:
+                continue
+            var f = _joint_frame[BATCH, STATE_SIZE, BODIES_OFFSET](
+                state, env, joff
+            )
+            var flags = Int(_ld(state, env, joff + JOINT_FLAGS))
+            var fixed_rotation = (f.ia + f.ib) == Scalar[dtype](0)
 
-            for j in range(n_joints):
-                if j >= MAX_JOINTS:
-                    break
+            if (flags & JOINT_FLAG_MOTOR_ENABLED) == 0 or fixed_rotation:
+                state[env, joff + JOINT_MOTOR_IMPULSE] = Scalar[dtype](0)
 
-                var joint_type = Int(joints[env, j, JOINT_TYPE])
-                if joint_type != JOINT_REVOLUTE:
-                    continue
-
-                # Get body indices
-                var body_a = Int(joints[env, j, JOINT_BODY_A])
-                var body_b = Int(joints[env, j, JOINT_BODY_B])
-
-                # Get body states
-                var xa = bodies[env, body_a, IDX_X]
-                var ya = bodies[env, body_a, IDX_Y]
-                var angle_a = bodies[env, body_a, IDX_ANGLE]
-                var vxa = bodies[env, body_a, IDX_VX]
-                var vya = bodies[env, body_a, IDX_VY]
-                var wa = bodies[env, body_a, IDX_OMEGA]
-                var inv_ma = bodies[env, body_a, IDX_INV_MASS]
-                var inv_ia = bodies[env, body_a, IDX_INV_INERTIA]
-
-                var xb = bodies[env, body_b, IDX_X]
-                var yb = bodies[env, body_b, IDX_Y]
-                var angle_b = bodies[env, body_b, IDX_ANGLE]
-                var vxb = bodies[env, body_b, IDX_VX]
-                var vyb = bodies[env, body_b, IDX_VY]
-                var wb = bodies[env, body_b, IDX_OMEGA]
-                var inv_mb = bodies[env, body_b, IDX_INV_MASS]
-                var inv_ib = bodies[env, body_b, IDX_INV_INERTIA]
-
-                # Local anchors
-                var local_ax = joints[env, j, JOINT_ANCHOR_AX]
-                var local_ay = joints[env, j, JOINT_ANCHOR_AY]
-                var local_bx = joints[env, j, JOINT_ANCHOR_BX]
-                var local_by = joints[env, j, JOINT_ANCHOR_BY]
-
-                # Transform anchors to world space
-                var cos_a = cos(angle_a)
-                var sin_a = sin(angle_a)
-                var cos_b = cos(angle_b)
-                var sin_b = sin(angle_b)
-
-                # r_a = anchor in world relative to body A center
-                var rax = local_ax * cos_a - local_ay * sin_a
-                var ray = local_ax * sin_a + local_ay * cos_a
-                # r_b = anchor in world relative to body B center
-                var rbx = local_bx * cos_b - local_by * sin_b
-                var rby = local_bx * sin_b + local_by * cos_b
-
-                # Relative velocity at anchor point
-                # v_a_anchor = v_a + w_a × r_a
-                # v_b_anchor = v_b + w_b × r_b
-                var va_anchor_x = vxa - wa * ray
-                var va_anchor_y = vya + wa * rax
-                var vb_anchor_x = vxb - wb * rby
-                var vb_anchor_y = vyb + wb * rbx
-
-                # Constraint velocity (should be zero for rigid joint)
-                var cdot_x = vb_anchor_x - va_anchor_x
-                var cdot_y = vb_anchor_y - va_anchor_y
-
-                # Compute effective mass for point-to-point constraint
-                # K = [inv_ma + inv_mb + inv_ia*ray^2 + inv_ib*rby^2, -inv_ia*rax*ray - inv_ib*rbx*rby]
-                #     [-inv_ia*rax*ray - inv_ib*rbx*rby, inv_ma + inv_mb + inv_ia*rax^2 + inv_ib*rbx^2]
-                var k11 = (
-                    inv_ma + inv_mb + inv_ia * ray * ray + inv_ib * rby * rby
+            var limit_state = Int(_ld(state, env, joff + JOINT_LIMIT_STATE))
+            if (flags & JOINT_FLAG_LIMIT_ENABLED) != 0 and not fixed_rotation:
+                var angle = (
+                    _ld(state, env, f.off_b + IDX_ANGLE)
+                    - _ld(state, env, f.off_a + IDX_ANGLE)
+                    - _ld(state, env, joff + JOINT_REF_ANGLE)
                 )
-                var k12 = -inv_ia * rax * ray - inv_ib * rbx * rby
-                var k22 = (
-                    inv_ma + inv_mb + inv_ia * rax * rax + inv_ib * rbx * rbx
-                )
+                var lower = _ld(state, env, joff + JOINT_LOWER_LIMIT)
+                var upper = _ld(state, env, joff + JOINT_UPPER_LIMIT)
+                if abs(upper - lower) < Scalar[dtype](2.0 * B2_ANGULAR_SLOP):
+                    limit_state = JOINT_LIMIT_EQUAL
+                elif angle <= lower:
+                    if limit_state != JOINT_LIMIT_AT_LOWER:
+                        state[env, joff + JOINT_IMPULSE_Z] = Scalar[dtype](0)
+                    limit_state = JOINT_LIMIT_AT_LOWER
+                elif angle >= upper:
+                    if limit_state != JOINT_LIMIT_AT_UPPER:
+                        state[env, joff + JOINT_IMPULSE_Z] = Scalar[dtype](0)
+                    limit_state = JOINT_LIMIT_AT_UPPER
+                else:
+                    limit_state = JOINT_LIMIT_INACTIVE
+                    state[env, joff + JOINT_IMPULSE_Z] = Scalar[dtype](0)
+            else:
+                limit_state = JOINT_LIMIT_INACTIVE
+            state[env, joff + JOINT_LIMIT_STATE] = Scalar[dtype](limit_state)
 
-                # Invert 2x2 matrix
-                var det = k11 * k22 - k12 * k12
-                if det < Scalar[dtype](1e-10):
-                    det = Scalar[dtype](1e-10)
-
-                var inv_det = Scalar[dtype](1.0) / det
-                var inv_k11 = k22 * inv_det
-                var inv_k12 = -k12 * inv_det
-                var inv_k22 = k11 * inv_det
-
-                # Compute impulse: lambda = -K^-1 * Cdot
-                var impulse_x = -(inv_k11 * cdot_x + inv_k12 * cdot_y)
-                var impulse_y = -(inv_k12 * cdot_x + inv_k22 * cdot_y)
-
-                # Apply impulse
-                bodies[env, body_a, IDX_VX] = vxa - inv_ma * impulse_x
-                bodies[env, body_a, IDX_VY] = vya - inv_ma * impulse_y
-                bodies[env, body_a, IDX_OMEGA] = wa - inv_ia * (
-                    rax * impulse_y - ray * impulse_x
-                )
-
-                bodies[env, body_b, IDX_VX] = vxb + inv_mb * impulse_x
-                bodies[env, body_b, IDX_VY] = vyb + inv_mb * impulse_y
-                bodies[env, body_b, IDX_OMEGA] = wb + inv_ib * (
-                    rbx * impulse_y - rby * impulse_x
-                )
-
-                # Handle spring (soft constraint)
-                var flags = Int(joints[env, j, JOINT_FLAGS])
-                if flags & JOINT_FLAG_SPRING_ENABLED:
-                    var stiffness = joints[env, j, JOINT_STIFFNESS]
-                    var damping = joints[env, j, JOINT_DAMPING]
-                    var ref_angle = joints[env, j, JOINT_REF_ANGLE]
-
-                    # Current angle difference
-                    var current_angle = angle_b - angle_a
-                    var angle_error = current_angle - ref_angle
-
-                    # Relative angular velocity
-                    var rel_omega = wb - wa
-
-                    # Spring torque: tau = -k * angle_error - c * rel_omega
-                    var spring_torque = (
-                        -stiffness * angle_error - damping * rel_omega
-                    )
-
-                    # Apply as impulse: impulse = torque * dt
-                    var angular_impulse = spring_torque * dt
-
-                    # Effective inertia
-                    var eff_inertia = inv_ia + inv_ib
-                    if eff_inertia > Scalar[dtype](1e-10):
-                        var omega_change = angular_impulse * eff_inertia
-                        bodies[env, body_a, IDX_OMEGA] = (
-                            bodies[env, body_a, IDX_OMEGA]
-                            - inv_ia * angular_impulse / eff_inertia
-                        )
-                        bodies[env, body_b, IDX_OMEGA] = (
-                            bodies[env, body_b, IDX_OMEGA]
-                            + inv_ib * angular_impulse / eff_inertia
-                        )
-
-                # Handle angle limits
-                if flags & JOINT_FLAG_LIMIT_ENABLED:
-                    var lower_limit = rebind[Scalar[dtype]](
-                        joints[env, j, JOINT_LOWER_LIMIT]
-                    )
-                    var upper_limit = rebind[Scalar[dtype]](
-                        joints[env, j, JOINT_UPPER_LIMIT]
-                    )
-                    var lim_ref_angle = rebind[Scalar[dtype]](
-                        joints[env, j, JOINT_REF_ANGLE]
-                    )
-
-                    # Current relative angle
-                    var current_wa = rebind[Scalar[dtype]](
-                        bodies[env, body_a, IDX_OMEGA]
-                    )
-                    var current_wb = rebind[Scalar[dtype]](
-                        bodies[env, body_b, IDX_OMEGA]
-                    )
-                    var current_angle_a = rebind[Scalar[dtype]](
-                        bodies[env, body_a, IDX_ANGLE]
-                    )
-                    var current_angle_b = rebind[Scalar[dtype]](
-                        bodies[env, body_b, IDX_ANGLE]
-                    )
-                    var relative_angle = (
-                        current_angle_b - current_angle_a - lim_ref_angle
-                    )
-                    # Body angles are wrapped to [-pi, pi], so this difference
-                    # jumps by 2*pi when a body crosses +/-pi. Wrap it back so
-                    # the limit sees the true relative angle (always small here).
-                    if relative_angle > Scalar[dtype](PI):
-                        relative_angle -= Scalar[dtype](TWO_PI)
-                    elif relative_angle < -Scalar[dtype](PI):
-                        relative_angle += Scalar[dtype](TWO_PI)
-
-                    # Relative angular velocity
-                    var rel_omega = current_wb - current_wa
-
-                    # Effective inertia for angular constraint
-                    var lim_eff_inertia = rebind[Scalar[dtype]](
-                        inv_ia
-                    ) + rebind[Scalar[dtype]](inv_ib)
-                    if lim_eff_inertia > Scalar[dtype](1e-10):
-                        var limit_impulse = Scalar[dtype](0.0)
-
-                        # Check lower limit
-                        if relative_angle <= lower_limit:
-                            # At lower limit, prevent further clockwise rotation (negative rel_omega)
-                            if rel_omega < Scalar[dtype](0.0):
-                                limit_impulse = -rel_omega / lim_eff_inertia
-
-                        # Check upper limit
-                        elif relative_angle >= upper_limit:
-                            # At upper limit, prevent further counter-clockwise rotation (positive rel_omega)
-                            if rel_omega > Scalar[dtype](0.0):
-                                limit_impulse = -rel_omega / lim_eff_inertia
-
-                        # Apply limit impulse
-                        if limit_impulse != Scalar[dtype](0.0):
-                            bodies[env, body_a, IDX_OMEGA] = (
-                                current_wa
-                                - rebind[Scalar[dtype]](inv_ia) * limit_impulse
-                            )
-                            bodies[env, body_b, IDX_OMEGA] = (
-                                current_wb
-                                + rebind[Scalar[dtype]](inv_ib) * limit_impulse
-                            )
-
-                # Handle motor
-                if flags & JOINT_FLAG_MOTOR_ENABLED:
-                    var motor_speed = joints[env, j, JOINT_MOTOR_SPEED]
-                    var max_torque = joints[env, j, JOINT_MAX_MOTOR_TORQUE]
-
-                    # Current relative angular velocity
-                    var current_wa = bodies[env, body_a, IDX_OMEGA]
-                    var current_wb = bodies[env, body_b, IDX_OMEGA]
-                    var rel_omega = current_wb - current_wa
-
-                    # Motor wants to achieve target speed
-                    var speed_error = motor_speed - rel_omega
-
-                    # Effective inertia for motor
-                    var eff_inertia = inv_ia + inv_ib
-                    if eff_inertia > Scalar[dtype](1e-10):
-                        var motor_impulse = speed_error / eff_inertia
-
-                        # Clamp to max torque
-                        var max_impulse = max_torque * dt
-                        if motor_impulse > max_impulse:
-                            motor_impulse = max_impulse
-                        if motor_impulse < -max_impulse:
-                            motor_impulse = -max_impulse
-
-                        bodies[env, body_a, IDX_OMEGA] = (
-                            current_wa - inv_ia * motor_impulse
-                        )
-                        bodies[env, body_b, IDX_OMEGA] = (
-                            current_wb + inv_ib * motor_impulse
-                        )
-
-    @staticmethod
-    def solve_position[
-        BATCH: Int,
-        NUM_BODIES: Int,
-        MAX_JOINTS: Int,
-    ](
-        mut bodies: LayoutTensor[
-            dtype,
-            Layout.row_major(BATCH, NUM_BODIES, BODY_STATE_SIZE),
-            MutAnyOrigin,
-        ],
-        joints: LayoutTensor[
-            dtype,
-            Layout.row_major(BATCH, MAX_JOINTS, JOINT_DATA_SIZE),
-            MutAnyOrigin,
-        ],
-        joint_counts: LayoutTensor[
-            dtype, Layout.row_major(BATCH), MutAnyOrigin
-        ],
-        baumgarte: Scalar[dtype],
-        slop: Scalar[dtype],
-    ):
-        """Solve position constraints for all joints (position correction)."""
-        for env in range(BATCH):
-            var n_joints = Int(joint_counts[env])
-
-            for j in range(n_joints):
-                if j >= MAX_JOINTS:
-                    break
-
-                var joint_type = Int(joints[env, j, JOINT_TYPE])
-                if joint_type != JOINT_REVOLUTE:
-                    continue
-
-                # Get body indices
-                var body_a = Int(joints[env, j, JOINT_BODY_A])
-                var body_b = Int(joints[env, j, JOINT_BODY_B])
-
-                # Get body positions
-                var xa = bodies[env, body_a, IDX_X]
-                var ya = bodies[env, body_a, IDX_Y]
-                var angle_a = bodies[env, body_a, IDX_ANGLE]
-                var inv_ma = bodies[env, body_a, IDX_INV_MASS]
-                var inv_ia = bodies[env, body_a, IDX_INV_INERTIA]
-
-                var xb = bodies[env, body_b, IDX_X]
-                var yb = bodies[env, body_b, IDX_Y]
-                var angle_b = bodies[env, body_b, IDX_ANGLE]
-                var inv_mb = bodies[env, body_b, IDX_INV_MASS]
-                var inv_ib = bodies[env, body_b, IDX_INV_INERTIA]
-
-                # Local anchors
-                var local_ax = joints[env, j, JOINT_ANCHOR_AX]
-                var local_ay = joints[env, j, JOINT_ANCHOR_AY]
-                var local_bx = joints[env, j, JOINT_ANCHOR_BX]
-                var local_by = joints[env, j, JOINT_ANCHOR_BY]
-
-                # Transform anchors to world space
-                var cos_a = cos(angle_a)
-                var sin_a = sin(angle_a)
-                var cos_b = cos(angle_b)
-                var sin_b = sin(angle_b)
-
-                var rax = local_ax * cos_a - local_ay * sin_a
-                var ray = local_ax * sin_a + local_ay * cos_a
-                var rbx = local_bx * cos_b - local_by * sin_b
-                var rby = local_bx * sin_b + local_by * cos_b
-
-                # World anchor positions
-                var anchor_ax = xa + rax
-                var anchor_ay = ya + ray
-                var anchor_bx = xb + rbx
-                var anchor_by = yb + rby
-
-                # Position error (separation)
-                var cx = anchor_bx - anchor_ax
-                var cy = anchor_by - anchor_ay
-
-                var error = sqrt(cx * cx + cy * cy)
-                if error < slop:
-                    continue
-
-                # Compute effective mass (same as velocity solve)
-                var k11 = (
-                    inv_ma + inv_mb + inv_ia * ray * ray + inv_ib * rby * rby
-                )
-                var k12 = -inv_ia * rax * ray - inv_ib * rbx * rby
-                var k22 = (
-                    inv_ma + inv_mb + inv_ia * rax * rax + inv_ib * rbx * rbx
-                )
-
-                var det = k11 * k22 - k12 * k12
-                if det < Scalar[dtype](1e-10):
-                    det = Scalar[dtype](1e-10)
-
-                var inv_det = Scalar[dtype](1.0) / det
-                var inv_k11 = k22 * inv_det
-                var inv_k12 = -k12 * inv_det
-                var inv_k22 = k11 * inv_det
-
-                # Position correction impulse with Baumgarte stabilization
-                var correction_x = -baumgarte * (inv_k11 * cx + inv_k12 * cy)
-                var correction_y = -baumgarte * (inv_k12 * cx + inv_k22 * cy)
-
-                # Apply position correction
-                bodies[env, body_a, IDX_X] = xa - inv_ma * correction_x
-                bodies[env, body_a, IDX_Y] = ya - inv_ma * correction_y
-                bodies[env, body_a, IDX_ANGLE] = angle_a - inv_ia * (
-                    rax * correction_y - ray * correction_x
-                )
-
-                bodies[env, body_b, IDX_X] = xb + inv_mb * correction_x
-                bodies[env, body_b, IDX_Y] = yb + inv_mb * correction_y
-                bodies[env, body_b, IDX_ANGLE] = angle_b + inv_ib * (
-                    rbx * correction_y - rby * correction_x
-                )
-
-                # Handle angle limit position correction
-                var flags = Int(joints[env, j, JOINT_FLAGS])
-                if flags & JOINT_FLAG_LIMIT_ENABLED:
-                    var lower_limit = rebind[Scalar[dtype]](
-                        joints[env, j, JOINT_LOWER_LIMIT]
-                    )
-                    var upper_limit = rebind[Scalar[dtype]](
-                        joints[env, j, JOINT_UPPER_LIMIT]
-                    )
-                    var pos_ref_angle = rebind[Scalar[dtype]](
-                        joints[env, j, JOINT_REF_ANGLE]
-                    )
-
-                    # Current relative angle (after point constraint correction)
-                    var cur_angle_a = rebind[Scalar[dtype]](
-                        bodies[env, body_a, IDX_ANGLE]
-                    )
-                    var cur_angle_b = rebind[Scalar[dtype]](
-                        bodies[env, body_b, IDX_ANGLE]
-                    )
-                    var relative_angle = (
-                        cur_angle_b - cur_angle_a - pos_ref_angle
-                    )
-                    # Wrap the wrapped-body-angle difference back to [-pi, pi].
-                    if relative_angle > Scalar[dtype](PI):
-                        relative_angle -= Scalar[dtype](TWO_PI)
-                    elif relative_angle < -Scalar[dtype](PI):
-                        relative_angle += Scalar[dtype](TWO_PI)
-
-                    # Effective inertia
-                    var pos_eff_inertia = rebind[Scalar[dtype]](
-                        inv_ia
-                    ) + rebind[Scalar[dtype]](inv_ib)
-                    if pos_eff_inertia > Scalar[dtype](1e-10):
-                        var angle_correction = Scalar[dtype](0.0)
-
-                        # Check lower limit
-                        if relative_angle < lower_limit:
-                            angle_correction = baumgarte * (
-                                lower_limit - relative_angle
-                            )
-
-                        # Check upper limit
-                        elif relative_angle > upper_limit:
-                            angle_correction = baumgarte * (
-                                upper_limit - relative_angle
-                            )
-
-                        # Apply angle correction
-                        if angle_correction != Scalar[dtype](0.0):
-                            bodies[env, body_a, IDX_ANGLE] = (
-                                cur_angle_a
-                                - rebind[Scalar[dtype]](inv_ia)
-                                * angle_correction
-                                / pos_eff_inertia
-                            )
-                            bodies[env, body_b, IDX_ANGLE] = (
-                                cur_angle_b
-                                + rebind[Scalar[dtype]](inv_ib)
-                                * angle_correction
-                                / pos_eff_inertia
-                            )
+            # Warm start.
+            var px = _ld(state, env, joff + JOINT_IMPULSE_X)
+            var py = _ld(state, env, joff + JOINT_IMPULSE_Y)
+            var pz = _ld(state, env, joff + JOINT_IMPULSE_Z)
+            var pm = _ld(state, env, joff + JOINT_MOTOR_IMPULSE)
+            var cross_a = f.rax * py - f.ray * px
+            var cross_b = f.rbx * py - f.rby * px
+            state[env, f.off_a + IDX_VX] = _ld(state, env, f.off_a + IDX_VX) - f.ma * px
+            state[env, f.off_a + IDX_VY] = _ld(state, env, f.off_a + IDX_VY) - f.ma * py
+            state[env, f.off_a + IDX_OMEGA] = _ld(
+                state, env, f.off_a + IDX_OMEGA
+            ) - f.ia * (cross_a + pm + pz)
+            state[env, f.off_b + IDX_VX] = _ld(state, env, f.off_b + IDX_VX) + f.mb * px
+            state[env, f.off_b + IDX_VY] = _ld(state, env, f.off_b + IDX_VY) + f.mb * py
+            state[env, f.off_b + IDX_OMEGA] = _ld(
+                state, env, f.off_b + IDX_OMEGA
+            ) + f.ib * (cross_b + pm + pz)
 
     # =========================================================================
-    # Strided GPU Kernels for 2D State Layout
-    # =========================================================================
-    #
-    # These methods work with 2D [BATCH, STATE_SIZE] layout for bodies.
-    # Joints are stored at JOINTS_OFFSET within each environment's state.
-    # Memory layout: state[env, OFFSET + ...]
-    # =========================================================================
-
-    # =========================================================================
-    # Single-Environment Methods (can be called from fused kernels)
+    # SolveVelocityConstraints
     # =========================================================================
 
     @always_inline
@@ -533,255 +311,153 @@ struct RevoluteJointSolver:
     ](
         env: Int,
         state: LayoutTensor[
-            dtype,
-            Layout.row_major(BATCH, STATE_SIZE),
-            MutAnyOrigin,
+            dtype, Layout.row_major(BATCH, STATE_SIZE), MutAnyOrigin
         ],
         joint_count: Int,
         dt: Scalar[dtype],
     ):
-        """Solve velocity constraints for a single environment.
-
-        This is the core solving logic, extracted to be callable from:
-        - _solve_velocity_kernel (standalone kernel)
-        - FusedConstraintSolver (fused kernel)
-        """
+        """One velocity iteration over all joints
+        (b2RevoluteJoint::SolveVelocityConstraints)."""
         for j in range(MAX_JOINTS):
             if j >= joint_count:
                 break
-
-            var joint_off = JOINTS_OFFSET + j * JOINT_DATA_SIZE
-            var joint_type = Int(state[env, joint_off + JOINT_TYPE])
-            if joint_type != JOINT_REVOLUTE:
+            var joff = JOINTS_OFFSET + j * JOINT_DATA_SIZE
+            if Int(_ld(state, env, joff + JOINT_TYPE)) != JOINT_REVOLUTE:
                 continue
-
-            var body_a = Int(state[env, joint_off + JOINT_BODY_A])
-            var body_b = Int(state[env, joint_off + JOINT_BODY_B])
-
-            var body_a_off = BODIES_OFFSET + body_a * BODY_STATE_SIZE
-            var body_b_off = BODIES_OFFSET + body_b * BODY_STATE_SIZE
-
-            var xa = state[env, body_a_off + IDX_X]
-            var ya = state[env, body_a_off + IDX_Y]
-            var angle_a = state[env, body_a_off + IDX_ANGLE]
-            var vxa = state[env, body_a_off + IDX_VX]
-            var vya = state[env, body_a_off + IDX_VY]
-            var wa = state[env, body_a_off + IDX_OMEGA]
-            var inv_ma = state[env, body_a_off + IDX_INV_MASS]
-            var inv_ia = state[env, body_a_off + IDX_INV_INERTIA]
-
-            var xb = state[env, body_b_off + IDX_X]
-            var yb = state[env, body_b_off + IDX_Y]
-            var angle_b = state[env, body_b_off + IDX_ANGLE]
-            var vxb = state[env, body_b_off + IDX_VX]
-            var vyb = state[env, body_b_off + IDX_VY]
-            var wb = state[env, body_b_off + IDX_OMEGA]
-            var inv_mb = state[env, body_b_off + IDX_INV_MASS]
-            var inv_ib = state[env, body_b_off + IDX_INV_INERTIA]
-
-            var local_ax = state[env, joint_off + JOINT_ANCHOR_AX]
-            var local_ay = state[env, joint_off + JOINT_ANCHOR_AY]
-            var local_bx = state[env, joint_off + JOINT_ANCHOR_BX]
-            var local_by = state[env, joint_off + JOINT_ANCHOR_BY]
-
-            var cos_a = cos(angle_a)
-            var sin_a = sin(angle_a)
-            var cos_b = cos(angle_b)
-            var sin_b = sin(angle_b)
-
-            var rax = local_ax * cos_a - local_ay * sin_a
-            var ray = local_ax * sin_a + local_ay * cos_a
-            var rbx = local_bx * cos_b - local_by * sin_b
-            var rby = local_bx * sin_b + local_by * cos_b
-
-            var va_anchor_x = vxa - wa * ray
-            var va_anchor_y = vya + wa * rax
-            var vb_anchor_x = vxb - wb * rby
-            var vb_anchor_y = vyb + wb * rbx
-
-            var cdot_x = vb_anchor_x - va_anchor_x
-            var cdot_y = vb_anchor_y - va_anchor_y
-
-            var k11 = inv_ma + inv_mb + inv_ia * ray * ray + inv_ib * rby * rby
-            var k12 = -inv_ia * rax * ray - inv_ib * rbx * rby
-            var k22 = inv_ma + inv_mb + inv_ia * rax * rax + inv_ib * rbx * rbx
-
-            var det = k11 * k22 - k12 * k12
-            if det < Scalar[dtype](1e-10):
-                det = Scalar[dtype](1e-10)
-
-            var inv_det = Scalar[dtype](1.0) / det
-            var inv_k11 = k22 * inv_det
-            var inv_k12 = -k12 * inv_det
-            var inv_k22 = k11 * inv_det
-
-            var impulse_x = -(inv_k11 * cdot_x + inv_k12 * cdot_y)
-            var impulse_y = -(inv_k12 * cdot_x + inv_k22 * cdot_y)
-
-            state[env, body_a_off + IDX_VX] = vxa - inv_ma * impulse_x
-            state[env, body_a_off + IDX_VY] = vya - inv_ma * impulse_y
-            state[env, body_a_off + IDX_OMEGA] = wa - inv_ia * (
-                rax * impulse_y - ray * impulse_x
+            var f = _joint_frame[BATCH, STATE_SIZE, BODIES_OFFSET](
+                state, env, joff
             )
+            var ma = f.ma
+            var mb = f.mb
+            var ia = f.ia
+            var ib = f.ib
+            var rax = f.rax
+            var ray = f.ray
+            var rbx = f.rbx
+            var rby = f.rby
 
-            state[env, body_b_off + IDX_VX] = vxb + inv_mb * impulse_x
-            state[env, body_b_off + IDX_VY] = vyb + inv_mb * impulse_y
-            state[env, body_b_off + IDX_OMEGA] = wb + inv_ib * (
-                rbx * impulse_y - rby * impulse_x
-            )
+            var vax = _ld(state, env, f.off_a + IDX_VX)
+            var vay = _ld(state, env, f.off_a + IDX_VY)
+            var wa = _ld(state, env, f.off_a + IDX_OMEGA)
+            var vbx = _ld(state, env, f.off_b + IDX_VX)
+            var vby = _ld(state, env, f.off_b + IDX_VY)
+            var wb = _ld(state, env, f.off_b + IDX_OMEGA)
 
-            # Spring handling
-            var flags = Int(state[env, joint_off + JOINT_FLAGS])
-            if flags & JOINT_FLAG_SPRING_ENABLED:
-                var stiffness = state[env, joint_off + JOINT_STIFFNESS]
-                var damping = state[env, joint_off + JOINT_DAMPING]
-                var ref_angle = state[env, joint_off + JOINT_REF_ANGLE]
+            var flags = Int(_ld(state, env, joff + JOINT_FLAGS))
+            var limit_state = Int(_ld(state, env, joff + JOINT_LIMIT_STATE))
+            var fixed_rotation = (ia + ib) == Scalar[dtype](0)
 
-                var current_angle = angle_b - angle_a
-                var angle_error = current_angle - ref_angle
-                # Use pre-impulse omega values (wa, wb) to match CPU behavior
-                var rel_omega = wb - wa
-
-                var spring_torque = (
-                    -stiffness * angle_error - damping * rel_omega
+            # Motor.
+            if (
+                (flags & JOINT_FLAG_MOTOR_ENABLED) != 0
+                and limit_state != JOINT_LIMIT_EQUAL
+                and not fixed_rotation
+            ):
+                var motor_mass = Scalar[dtype](1) / (ia + ib)
+                var cdot = wb - wa - _ld(state, env, joff + JOINT_MOTOR_SPEED)
+                var impulse = -motor_mass * cdot
+                var old_impulse = _ld(state, env, joff + JOINT_MOTOR_IMPULSE)
+                var max_impulse = dt * _ld(
+                    state, env, joff + JOINT_MAX_MOTOR_TORQUE
                 )
-                var angular_impulse = spring_torque * dt
-
-                var eff_inertia = inv_ia + inv_ib
-                if eff_inertia > Scalar[dtype](1e-10):
-                    state[env, body_a_off + IDX_OMEGA] = (
-                        state[env, body_a_off + IDX_OMEGA]
-                        - inv_ia * angular_impulse / eff_inertia
-                    )
-                    state[env, body_b_off + IDX_OMEGA] = (
-                        state[env, body_b_off + IDX_OMEGA]
-                        + inv_ib * angular_impulse / eff_inertia
-                    )
-
-            # Handle angle limits
-            if flags & JOINT_FLAG_LIMIT_ENABLED:
-                var lower_limit = rebind[Scalar[dtype]](
-                    state[env, joint_off + JOINT_LOWER_LIMIT]
+                var new_impulse = _clamp(
+                    old_impulse + impulse, -max_impulse, max_impulse
                 )
-                var upper_limit = rebind[Scalar[dtype]](
-                    state[env, joint_off + JOINT_UPPER_LIMIT]
+                state[env, joff + JOINT_MOTOR_IMPULSE] = new_impulse
+                impulse = new_impulse - old_impulse
+                wa = wa - ia * impulse
+                wb = wb + ib * impulse
+
+            # Effective mass K (Box2D's m_mass, symmetric 3x3).
+            var k11 = ma + mb + ray * ray * ia + rby * rby * ib
+            var k12 = -ray * rax * ia - rby * rbx * ib
+            var k13 = -ray * ia - rby * ib
+            var k22 = ma + mb + rax * rax * ia + rbx * rbx * ib
+            var k23 = rax * ia + rbx * ib
+            var k33 = ia + ib
+
+            var cdot1x = vbx - wb * rby - vax + wa * ray
+            var cdot1y = vby + wb * rbx - vay - wa * rax
+
+            if (
+                (flags & JOINT_FLAG_LIMIT_ENABLED) != 0
+                and limit_state != JOINT_LIMIT_INACTIVE
+                and not fixed_rotation
+            ):
+                var cdot2 = wb - wa
+                # impulse = -K^-1 * Cdot  (b2Mat33::Solve33)
+                var s3 = _solve33(
+                    k11, k12, k13, k22, k23, k33, -cdot1x, -cdot1y, -cdot2
                 )
-                var lim_ref_angle = rebind[Scalar[dtype]](
-                    state[env, joint_off + JOINT_REF_ANGLE]
+                var ix = s3[0]
+                var iy = s3[1]
+                var iz = s3[2]
+                var acc_x = _ld(state, env, joff + JOINT_IMPULSE_X)
+                var acc_y = _ld(state, env, joff + JOINT_IMPULSE_Y)
+                var acc_z = _ld(state, env, joff + JOINT_IMPULSE_Z)
+                if limit_state == JOINT_LIMIT_EQUAL:
+                    acc_x += ix
+                    acc_y += iy
+                    acc_z += iz
+                elif (
+                    limit_state == JOINT_LIMIT_AT_LOWER
+                    and acc_z + iz < Scalar[dtype](0)
+                ) or (
+                    limit_state == JOINT_LIMIT_AT_UPPER
+                    and acc_z + iz > Scalar[dtype](0)
+                ):
+                    # The limit would pull: drop it, solve the point alone
+                    # with the limit impulse removed (Box2D's reduced 2x2).
+                    var rhs_x = -cdot1x + acc_z * k13
+                    var rhs_y = -cdot1y + acc_z * k23
+                    var s2 = _solve22(k11, k12, k22, rhs_x, rhs_y)
+                    ix = s2[0]
+                    iy = s2[1]
+                    iz = -acc_z
+                    acc_x += ix
+                    acc_y += iy
+                    acc_z = Scalar[dtype](0)
+                else:
+                    acc_x += ix
+                    acc_y += iy
+                    acc_z += iz
+                state[env, joff + JOINT_IMPULSE_X] = acc_x
+                state[env, joff + JOINT_IMPULSE_Y] = acc_y
+                state[env, joff + JOINT_IMPULSE_Z] = acc_z
+                vax -= ma * ix
+                vay -= ma * iy
+                wa -= ia * (rax * iy - ray * ix + iz)
+                vbx += mb * ix
+                vby += mb * iy
+                wb += ib * (rbx * iy - rby * ix + iz)
+            else:
+                # Point-to-point only (b2Mat33::Solve22 on the 2x2 block).
+                var s2 = _solve22(k11, k12, k22, -cdot1x, -cdot1y)
+                var ix = s2[0]
+                var iy = s2[1]
+                state[env, joff + JOINT_IMPULSE_X] = (
+                    _ld(state, env, joff + JOINT_IMPULSE_X) + ix
                 )
-
-                var current_wa = rebind[Scalar[dtype]](
-                    state[env, body_a_off + IDX_OMEGA]
+                state[env, joff + JOINT_IMPULSE_Y] = (
+                    _ld(state, env, joff + JOINT_IMPULSE_Y) + iy
                 )
-                var current_wb = rebind[Scalar[dtype]](
-                    state[env, body_b_off + IDX_OMEGA]
-                )
-                var current_angle_a = rebind[Scalar[dtype]](
-                    state[env, body_a_off + IDX_ANGLE]
-                )
-                var current_angle_b = rebind[Scalar[dtype]](
-                    state[env, body_b_off + IDX_ANGLE]
-                )
-                var relative_angle = (
-                    current_angle_b - current_angle_a - lim_ref_angle
-                )
-                # Wrap the wrapped-body-angle difference back to [-pi, pi].
-                if relative_angle > Scalar[dtype](PI):
-                    relative_angle -= Scalar[dtype](TWO_PI)
-                elif relative_angle < -Scalar[dtype](PI):
-                    relative_angle += Scalar[dtype](TWO_PI)
+                vax -= ma * ix
+                vay -= ma * iy
+                wa -= ia * (rax * iy - ray * ix)
+                vbx += mb * ix
+                vby += mb * iy
+                wb += ib * (rbx * iy - rby * ix)
 
-                var rel_omega = current_wb - current_wa
-                var lim_eff_inertia = rebind[Scalar[dtype]](inv_ia) + rebind[
-                    Scalar[dtype]
-                ](inv_ib)
+            state[env, f.off_a + IDX_VX] = vax
+            state[env, f.off_a + IDX_VY] = vay
+            state[env, f.off_a + IDX_OMEGA] = wa
+            state[env, f.off_b + IDX_VX] = vbx
+            state[env, f.off_b + IDX_VY] = vby
+            state[env, f.off_b + IDX_OMEGA] = wb
 
-                if lim_eff_inertia > Scalar[dtype](1e-10):
-                    var limit_impulse = Scalar[dtype](0.0)
-
-                    if relative_angle <= lower_limit:
-                        if rel_omega < Scalar[dtype](0.0):
-                            limit_impulse = -rel_omega / lim_eff_inertia
-                    elif relative_angle >= upper_limit:
-                        if rel_omega > Scalar[dtype](0.0):
-                            limit_impulse = -rel_omega / lim_eff_inertia
-
-                    if limit_impulse != Scalar[dtype](0.0):
-                        state[env, body_a_off + IDX_OMEGA] = (
-                            current_wa
-                            - rebind[Scalar[dtype]](inv_ia) * limit_impulse
-                        )
-                        state[env, body_b_off + IDX_OMEGA] = (
-                            current_wb
-                            + rebind[Scalar[dtype]](inv_ib) * limit_impulse
-                        )
-
-            # Handle motor (after spring and limit handling)
-            if flags & JOINT_FLAG_MOTOR_ENABLED:
-                var motor_speed = state[env, joint_off + JOINT_MOTOR_SPEED]
-                var max_torque = state[env, joint_off + JOINT_MAX_MOTOR_TORQUE]
-
-                # Current relative angular velocity (read updated values)
-                var current_wa = state[env, body_a_off + IDX_OMEGA]
-                var current_wb = state[env, body_b_off + IDX_OMEGA]
-                var rel_omega = current_wb - current_wa
-
-                # Motor wants to achieve target speed
-                var speed_error = motor_speed - rel_omega
-
-                # Effective inertia for motor
-                var eff_inertia = inv_ia + inv_ib
-                if eff_inertia > Scalar[dtype](1e-10):
-                    var motor_impulse = speed_error / eff_inertia
-
-                    # Clamp to max torque
-                    var max_impulse = max_torque * dt
-                    if motor_impulse > max_impulse:
-                        motor_impulse = max_impulse
-                    if motor_impulse < -max_impulse:
-                        motor_impulse = -max_impulse
-
-                    state[env, body_a_off + IDX_OMEGA] = (
-                        current_wa - inv_ia * motor_impulse
-                    )
-                    state[env, body_b_off + IDX_OMEGA] = (
-                        current_wb + inv_ib * motor_impulse
-                    )
-
-    @always_inline
-    @staticmethod
-    def _solve_velocity_kernel[
-        BATCH: Int,
-        NUM_BODIES: Int,
-        MAX_JOINTS: Int,
-        STATE_SIZE: Int,
-        BODIES_OFFSET: Int,
-        JOINTS_OFFSET: Int,
-    ](
-        state: LayoutTensor[
-            dtype,
-            Layout.row_major(BATCH, STATE_SIZE),
-            MutAnyOrigin,
-        ],
-        joint_counts: LayoutTensor[
-            dtype, Layout.row_major(BATCH), ImmutAnyOrigin
-        ],
-        dt: Scalar[dtype],
-    ):
-        """GPU kernel for velocity constraint solving with 2D strided layout."""
-        var env = Int(block_dim.x * block_idx.x + thread_idx.x)
-        if env >= BATCH:
-            return
-
-        var n_joints = Int(joint_counts[env])
-        RevoluteJointSolver.solve_velocity_single_env[
-            BATCH,
-            NUM_BODIES,
-            MAX_JOINTS,
-            STATE_SIZE,
-            BODIES_OFFSET,
-            JOINTS_OFFSET,
-        ](env, state, n_joints, dt)
+    # =========================================================================
+    # SolvePositionConstraints
+    # =========================================================================
 
     @always_inline
     @staticmethod
@@ -795,294 +471,166 @@ struct RevoluteJointSolver:
     ](
         env: Int,
         state: LayoutTensor[
-            dtype,
-            Layout.row_major(BATCH, STATE_SIZE),
-            MutAnyOrigin,
+            dtype, Layout.row_major(BATCH, STATE_SIZE), MutAnyOrigin
         ],
         joint_count: Int,
-        baumgarte: Scalar[dtype],
-        slop: Scalar[dtype],
-    ):
-        """Solve position constraints for a single environment.
-
-        This is the core solving logic, extracted to be callable from:
-        - _solve_position_kernel (standalone kernel)
-        - FusedConstraintSolver (fused kernel)
-        """
+    ) -> Bool:
+        """One position iteration over all joints
+        (b2RevoluteJoint::SolvePositionConstraints). Returns True when every
+        joint is within `B2_LINEAR_SLOP` / `B2_ANGULAR_SLOP`."""
+        var all_ok = True
         for j in range(MAX_JOINTS):
             if j >= joint_count:
                 break
-
-            var joint_off = JOINTS_OFFSET + j * JOINT_DATA_SIZE
-            var joint_type = Int(state[env, joint_off + JOINT_TYPE])
-            if joint_type != JOINT_REVOLUTE:
+            var joff = JOINTS_OFFSET + j * JOINT_DATA_SIZE
+            if Int(_ld(state, env, joff + JOINT_TYPE)) != JOINT_REVOLUTE:
                 continue
+            var body_a = Int(_ld(state, env, joff + JOINT_BODY_A))
+            var body_b = Int(_ld(state, env, joff + JOINT_BODY_B))
+            var off_a = BODIES_OFFSET + body_a * BODY_STATE_SIZE
+            var off_b = BODIES_OFFSET + body_b * BODY_STATE_SIZE
+            var ma = _ld(state, env, off_a + IDX_INV_MASS)
+            var mb = _ld(state, env, off_b + IDX_INV_MASS)
+            var ia = _ld(state, env, off_a + IDX_INV_INERTIA)
+            var ib = _ld(state, env, off_b + IDX_INV_INERTIA)
+            var cax = _ld(state, env, off_a + IDX_X)
+            var cay = _ld(state, env, off_a + IDX_Y)
+            var aa = _ld(state, env, off_a + IDX_ANGLE)
+            var cbx = _ld(state, env, off_b + IDX_X)
+            var cby = _ld(state, env, off_b + IDX_Y)
+            var ab = _ld(state, env, off_b + IDX_ANGLE)
 
-            var body_a = Int(state[env, joint_off + JOINT_BODY_A])
-            var body_b = Int(state[env, joint_off + JOINT_BODY_B])
+            var flags = Int(_ld(state, env, joff + JOINT_FLAGS))
+            var limit_state = Int(_ld(state, env, joff + JOINT_LIMIT_STATE))
+            var fixed_rotation = (ia + ib) == Scalar[dtype](0)
+            var angular_error = Scalar[dtype](0)
 
-            var body_a_off = BODIES_OFFSET + body_a * BODY_STATE_SIZE
-            var body_b_off = BODIES_OFFSET + body_b * BODY_STATE_SIZE
+            # Angular limit.
+            if (
+                (flags & JOINT_FLAG_LIMIT_ENABLED) != 0
+                and limit_state != JOINT_LIMIT_INACTIVE
+                and not fixed_rotation
+            ):
+                var motor_mass = Scalar[dtype](1) / (ia + ib)
+                var angle = ab - aa - _ld(state, env, joff + JOINT_REF_ANGLE)
+                var max_corr = Scalar[dtype](B2_MAX_ANGULAR_CORRECTION)
+                var slop = Scalar[dtype](B2_ANGULAR_SLOP)
+                var limit_impulse = Scalar[dtype](0)
+                if limit_state == JOINT_LIMIT_EQUAL:
+                    var c = _clamp(
+                        angle - _ld(state, env, joff + JOINT_LOWER_LIMIT),
+                        -max_corr,
+                        max_corr,
+                    )
+                    limit_impulse = -motor_mass * c
+                    angular_error = abs(c)
+                elif limit_state == JOINT_LIMIT_AT_LOWER:
+                    var c = angle - _ld(state, env, joff + JOINT_LOWER_LIMIT)
+                    angular_error = -c
+                    c = _clamp(c + slop, -max_corr, Scalar[dtype](0))
+                    limit_impulse = -motor_mass * c
+                elif limit_state == JOINT_LIMIT_AT_UPPER:
+                    var c = angle - _ld(state, env, joff + JOINT_UPPER_LIMIT)
+                    angular_error = c
+                    c = _clamp(c - slop, Scalar[dtype](0), max_corr)
+                    limit_impulse = -motor_mass * c
+                aa -= ia * limit_impulse
+                ab += ib * limit_impulse
 
-            var xa = state[env, body_a_off + IDX_X]
-            var ya = state[env, body_a_off + IDX_Y]
-            var angle_a = state[env, body_a_off + IDX_ANGLE]
-            var inv_ma = state[env, body_a_off + IDX_INV_MASS]
-            var inv_ia = state[env, body_a_off + IDX_INV_INERTIA]
+            # Point-to-point.
+            var lax = _ld(state, env, joff + JOINT_ANCHOR_AX)
+            var lay = _ld(state, env, joff + JOINT_ANCHOR_AY)
+            var lbx = _ld(state, env, joff + JOINT_ANCHOR_BX)
+            var lby = _ld(state, env, joff + JOINT_ANCHOR_BY)
+            var ca = cos(aa)
+            var sa = sin(aa)
+            var cb = cos(ab)
+            var sb = sin(ab)
+            var rax = ca * lax - sa * lay
+            var ray = sa * lax + ca * lay
+            var rbx = cb * lbx - sb * lby
+            var rby = sb * lbx + cb * lby
+            var cx = cbx + rbx - cax - rax
+            var cy = cby + rby - cay - ray
+            var position_error = sqrt(cx * cx + cy * cy)
+            var k11 = ma + mb + ia * ray * ray + ib * rby * rby
+            var k12 = -ia * rax * ray - ib * rbx * rby
+            var k22 = ma + mb + ia * rax * rax + ib * rbx * rbx
+            var s2 = _solve22(k11, k12, k22, cx, cy)  # b2Mat22::Solve(C)
+            var ix = -s2[0]
+            var iy = -s2[1]
+            cax -= ma * ix
+            cay -= ma * iy
+            aa -= ia * (rax * iy - ray * ix)
+            cbx += mb * ix
+            cby += mb * iy
+            ab += ib * (rbx * iy - rby * ix)
 
-            var xb = state[env, body_b_off + IDX_X]
-            var yb = state[env, body_b_off + IDX_Y]
-            var angle_b = state[env, body_b_off + IDX_ANGLE]
-            var inv_mb = state[env, body_b_off + IDX_INV_MASS]
-            var inv_ib = state[env, body_b_off + IDX_INV_INERTIA]
+            state[env, off_a + IDX_X] = cax
+            state[env, off_a + IDX_Y] = cay
+            state[env, off_a + IDX_ANGLE] = aa
+            state[env, off_b + IDX_X] = cbx
+            state[env, off_b + IDX_Y] = cby
+            state[env, off_b + IDX_ANGLE] = ab
 
-            var local_ax = state[env, joint_off + JOINT_ANCHOR_AX]
-            var local_ay = state[env, joint_off + JOINT_ANCHOR_AY]
-            var local_bx = state[env, joint_off + JOINT_ANCHOR_BX]
-            var local_by = state[env, joint_off + JOINT_ANCHOR_BY]
+            if not (
+                position_error <= Scalar[dtype](B2_LINEAR_SLOP)
+                and angular_error <= Scalar[dtype](B2_ANGULAR_SLOP)
+            ):
+                all_ok = False
+        return all_ok
 
-            var cos_a = cos(angle_a)
-            var sin_a = sin(angle_a)
-            var cos_b = cos(angle_b)
-            var sin_b = sin(angle_b)
 
-            var rax = local_ax * cos_a - local_ay * sin_a
-            var ray = local_ax * sin_a + local_ay * cos_a
-            var rbx = local_bx * cos_b - local_by * sin_b
-            var rby = local_bx * sin_b + local_by * cos_b
+# =============================================================================
+# Small dense solves (b2Mat33::Solve33 / Solve22, b2Mat22::Solve)
+# =============================================================================
 
-            var anchor_ax = xa + rax
-            var anchor_ay = ya + ray
-            var anchor_bx = xb + rbx
-            var anchor_by = yb + rby
 
-            var cx = anchor_bx - anchor_ax
-            var cy = anchor_by - anchor_ay
+@always_inline
+def _solve22(
+    k11: Scalar[dtype],
+    k12: Scalar[dtype],
+    k22: Scalar[dtype],
+    bx: Scalar[dtype],
+    by: Scalar[dtype],
+) -> Tuple[Scalar[dtype], Scalar[dtype]]:
+    """Solve [[k11, k12], [k12, k22]] x = b (0 when singular, as Box2D)."""
+    var det = k11 * k22 - k12 * k12
+    if det != Scalar[dtype](0):
+        det = Scalar[dtype](1) / det
+    return (det * (k22 * bx - k12 * by), det * (k11 * by - k12 * bx))
 
-            var error = sqrt(cx * cx + cy * cy)
-            if error < slop:
-                continue
 
-            var k11 = inv_ma + inv_mb + inv_ia * ray * ray + inv_ib * rby * rby
-            var k12 = -inv_ia * rax * ray - inv_ib * rbx * rby
-            var k22 = inv_ma + inv_mb + inv_ia * rax * rax + inv_ib * rbx * rbx
-
-            var det = k11 * k22 - k12 * k12
-            if det < Scalar[dtype](1e-10):
-                det = Scalar[dtype](1e-10)
-
-            var inv_det = Scalar[dtype](1.0) / det
-            var inv_k11 = k22 * inv_det
-            var inv_k12 = -k12 * inv_det
-            var inv_k22 = k11 * inv_det
-
-            var correction_x = -baumgarte * (inv_k11 * cx + inv_k12 * cy)
-            var correction_y = -baumgarte * (inv_k12 * cx + inv_k22 * cy)
-
-            state[env, body_a_off + IDX_X] = xa - inv_ma * correction_x
-            state[env, body_a_off + IDX_Y] = ya - inv_ma * correction_y
-            state[env, body_a_off + IDX_ANGLE] = angle_a - inv_ia * (
-                rax * correction_y - ray * correction_x
-            )
-
-            state[env, body_b_off + IDX_X] = xb + inv_mb * correction_x
-            state[env, body_b_off + IDX_Y] = yb + inv_mb * correction_y
-            state[env, body_b_off + IDX_ANGLE] = angle_b + inv_ib * (
-                rbx * correction_y - rby * correction_x
-            )
-
-            # Handle angle limit position correction
-            var flags = Int(state[env, joint_off + JOINT_FLAGS])
-            if flags & JOINT_FLAG_LIMIT_ENABLED:
-                var lower_limit = rebind[Scalar[dtype]](
-                    state[env, joint_off + JOINT_LOWER_LIMIT]
-                )
-                var upper_limit = rebind[Scalar[dtype]](
-                    state[env, joint_off + JOINT_UPPER_LIMIT]
-                )
-                var pos_ref_angle = rebind[Scalar[dtype]](
-                    state[env, joint_off + JOINT_REF_ANGLE]
-                )
-
-                var cur_angle_a = rebind[Scalar[dtype]](
-                    state[env, body_a_off + IDX_ANGLE]
-                )
-                var cur_angle_b = rebind[Scalar[dtype]](
-                    state[env, body_b_off + IDX_ANGLE]
-                )
-                var relative_angle = cur_angle_b - cur_angle_a - pos_ref_angle
-                # Wrap the wrapped-body-angle difference back to [-pi, pi].
-                if relative_angle > Scalar[dtype](PI):
-                    relative_angle -= Scalar[dtype](TWO_PI)
-                elif relative_angle < -Scalar[dtype](PI):
-                    relative_angle += Scalar[dtype](TWO_PI)
-
-                var pos_eff_inertia = rebind[Scalar[dtype]](inv_ia) + rebind[
-                    Scalar[dtype]
-                ](inv_ib)
-                if pos_eff_inertia > Scalar[dtype](1e-10):
-                    var angle_correction = Scalar[dtype](0.0)
-
-                    if relative_angle < lower_limit:
-                        angle_correction = baumgarte * (
-                            lower_limit - relative_angle
-                        )
-                    elif relative_angle > upper_limit:
-                        angle_correction = baumgarte * (
-                            upper_limit - relative_angle
-                        )
-
-                    if angle_correction != Scalar[dtype](0.0):
-                        state[env, body_a_off + IDX_ANGLE] = (
-                            cur_angle_a
-                            - rebind[Scalar[dtype]](inv_ia)
-                            * angle_correction
-                            / pos_eff_inertia
-                        )
-                        state[env, body_b_off + IDX_ANGLE] = (
-                            cur_angle_b
-                            + rebind[Scalar[dtype]](inv_ib)
-                            * angle_correction
-                            / pos_eff_inertia
-                        )
-
-    @always_inline
-    @staticmethod
-    def _solve_position_kernel[
-        BATCH: Int,
-        NUM_BODIES: Int,
-        MAX_JOINTS: Int,
-        STATE_SIZE: Int,
-        BODIES_OFFSET: Int,
-        JOINTS_OFFSET: Int,
-    ](
-        state: LayoutTensor[
-            dtype,
-            Layout.row_major(BATCH, STATE_SIZE),
-            MutAnyOrigin,
-        ],
-        joint_counts: LayoutTensor[
-            dtype, Layout.row_major(BATCH), ImmutAnyOrigin
-        ],
-        baumgarte: Scalar[dtype],
-        slop: Scalar[dtype],
-    ):
-        """GPU kernel for position constraint solving with 2D strided layout."""
-        var env = Int(block_dim.x * block_idx.x + thread_idx.x)
-        if env >= BATCH:
-            return
-
-        var n_joints = Int(joint_counts[env])
-        RevoluteJointSolver.solve_position_single_env[
-            BATCH,
-            NUM_BODIES,
-            MAX_JOINTS,
-            STATE_SIZE,
-            BODIES_OFFSET,
-            JOINTS_OFFSET,
-        ](env, state, n_joints, baumgarte, slop)
-
-    @staticmethod
-    def solve_velocity_gpu[
-        BATCH: Int,
-        NUM_BODIES: Int,
-        MAX_JOINTS: Int,
-        STATE_SIZE: Int,
-        BODIES_OFFSET: Int,
-        JOINTS_OFFSET: Int,
-    ](
-        ctx: DeviceContext,
-        mut state_buf: DeviceBuffer[dtype],
-        joint_counts_buf: DeviceBuffer[dtype],
-        dt: Scalar[dtype],
-    ) raises:
-        """Solve velocity constraints on GPU with 2D strided layout."""
-        var state = LayoutTensor[
-            dtype, Layout.row_major(BATCH, STATE_SIZE)
-        ](state_buf)  # mut=True (written)
-        var joint_counts = LayoutTensor[
-            dtype, Layout.row_major(BATCH)
-        ](joint_counts_buf)  # mut=False (read-only) -> ImmutAnyOrigin kernel param
-
-        comptime BLOCKS = (BATCH + TPB - 1) // TPB
-
-        @always_inline
-        def kernel_wrapper(
-            state: LayoutTensor[
-                dtype, Layout.row_major(BATCH, STATE_SIZE), MutAnyOrigin
-            ],
-            joint_counts: LayoutTensor[
-                dtype, Layout.row_major(BATCH), ImmutAnyOrigin
-            ],
-            dt: Scalar[dtype],
-        ):
-            RevoluteJointSolver._solve_velocity_kernel[
-                BATCH,
-                NUM_BODIES,
-                MAX_JOINTS,
-                STATE_SIZE,
-                BODIES_OFFSET,
-                JOINTS_OFFSET,
-            ](state, joint_counts, dt)
-
-        ctx.enqueue_function[kernel_wrapper](
-            state,
-            joint_counts,
-            dt,
-            grid_dim=(BLOCKS,),
-            block_dim=(TPB,),
-        )
-
-    @staticmethod
-    def solve_position_gpu[
-        BATCH: Int,
-        NUM_BODIES: Int,
-        MAX_JOINTS: Int,
-        STATE_SIZE: Int,
-        BODIES_OFFSET: Int,
-        JOINTS_OFFSET: Int,
-    ](
-        ctx: DeviceContext,
-        mut state_buf: DeviceBuffer[dtype],
-        joint_counts_buf: DeviceBuffer[dtype],
-        baumgarte: Scalar[dtype],
-        slop: Scalar[dtype],
-    ) raises:
-        """Solve position constraints on GPU with 2D strided layout."""
-        var state = LayoutTensor[
-            dtype, Layout.row_major(BATCH, STATE_SIZE)
-        ](state_buf)  # mut=True (written)
-        var joint_counts = LayoutTensor[
-            dtype, Layout.row_major(BATCH)
-        ](joint_counts_buf)  # mut=False (read-only) -> ImmutAnyOrigin kernel param
-
-        comptime BLOCKS = (BATCH + TPB - 1) // TPB
-
-        @always_inline
-        def kernel_wrapper(
-            state: LayoutTensor[
-                dtype, Layout.row_major(BATCH, STATE_SIZE), MutAnyOrigin
-            ],
-            joint_counts: LayoutTensor[
-                dtype, Layout.row_major(BATCH), ImmutAnyOrigin
-            ],
-            baumgarte: Scalar[dtype],
-            slop: Scalar[dtype],
-        ):
-            RevoluteJointSolver._solve_position_kernel[
-                BATCH,
-                NUM_BODIES,
-                MAX_JOINTS,
-                STATE_SIZE,
-                BODIES_OFFSET,
-                JOINTS_OFFSET,
-            ](state, joint_counts, baumgarte, slop)
-
-        ctx.enqueue_function[kernel_wrapper](
-            state,
-            joint_counts,
-            baumgarte,
-            slop,
-            grid_dim=(BLOCKS,),
-            block_dim=(TPB,),
-        )
+@always_inline
+def _solve33(
+    k11: Scalar[dtype],
+    k12: Scalar[dtype],
+    k13: Scalar[dtype],
+    k22: Scalar[dtype],
+    k23: Scalar[dtype],
+    k33: Scalar[dtype],
+    bx: Scalar[dtype],
+    by: Scalar[dtype],
+    bz: Scalar[dtype],
+) -> Tuple[Scalar[dtype], Scalar[dtype], Scalar[dtype]]:
+    """Solve the symmetric 3x3 K x = b by Cramer's rule, as b2Mat33::Solve33
+    (columns ex = (k11, k12, k13), ey = (k12, k22, k23), ez = (k13, k23, k33))."""
+    # cross(ey, ez)
+    var eyez_x = k22 * k33 - k23 * k23
+    var eyez_y = k23 * k13 - k12 * k33
+    var eyez_z = k12 * k23 - k22 * k13
+    var det = k11 * eyez_x + k12 * eyez_y + k13 * eyez_z
+    if det != Scalar[dtype](0):
+        det = Scalar[dtype](1) / det
+    var x = det * (bx * eyez_x + by * eyez_y + bz * eyez_z)
+    # dot(ex, cross(b, ez))
+    var bez_x = by * k33 - bz * k23
+    var bez_y = bz * k13 - bx * k33
+    var bez_z = bx * k23 - by * k13
+    var y = det * (k11 * bez_x + k12 * bez_y + k13 * bez_z)
+    # dot(ex, cross(ey, b))
+    var eyb_x = k22 * bz - k23 * by
+    var eyb_y = k23 * bx - k12 * bz
+    var eyb_z = k12 * by - k22 * bx
+    var z = det * (k11 * eyb_x + k12 * eyb_y + k13 * eyb_z)
+    return (x, y, z)

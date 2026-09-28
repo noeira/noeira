@@ -30,9 +30,9 @@ original TD-MPC2 loop one env-step at a time — and is the right thing to
 compare a suspicious batched curve against.
 
 Consequence for checkpoints: the driver OVERWRITES `checkpoint_path` on every
-save, so this run leaves ONE file (the latest), not a ladder. That is fine
-here — the FB ladder comes from the SAC script; this run only needs a
-resumable final policy.
+save, so this run leaves ONE file (`runs/<id>/checkpoints/last.ckpt`), not a
+ladder. That is fine here — the FB ladder comes from the SAC script; this run
+only needs a resumable final policy.
 
 ## Acting mode (`USE_MPC`)
 
@@ -98,8 +98,9 @@ from std.time import perf_counter_ns
 from max.gpu.host import DeviceContext
 
 from noeira.nn.constants import DT
-from noeira.core.dotenv import load_dotenv
-from noeira.core.logger import RemoteLogger
+from noeira.core.run import RunContext, register_run
+from noeira.core.run_session import RunLogger, finish_run, run_logger
+from noeira.io.artifact_sink import sink_for_run
 from noeira.deep_agents.tdmpc2.config import TDMPC2
 from noeira.envs.phyics3d_env import Phyics3dEnv
 from noeira.envs.dm_control.walker.walker_xml import DMWalkerModel
@@ -197,13 +198,19 @@ def main() raises:
     # convert (same idiom as logger_ptr below).
     var eval_env_ptr = Pointer(to=eval_env).as_unsafe_any_origin()
 
-    # Mode- and task-specific path so an MPC run never overwrites an MPC-off
-    # one, and `walk` never overwrites `run`. Built at RUNTIME: a comptime
-    # String store of a concatenation does not compile.
-    var ckpt = (
-        String("tdmpc2_dm_walker_") + String(TASK)
-        + ("_mpc" if USE_MPC else "_mpcoff") + ".ckpt"
+    # One directory per run; the mode and task are in the slug so an MPC run
+    # and an MPC-off one, or `walk` and `run`, are told apart by name.
+    var run = RunContext(
+        project=String("dm-control"),
+        driver=String("examples/dm_control/tdmpc2_dm_walker_gpu.mojo"),
+        slug=(
+            String("tdmpc2-dm-walker-") + String(TASK)
+            + ("-mpc" if USE_MPC else "-mpcoff")
+        ),
+        env=String("builtin:dm_control/walker-") + String(TASK),
     )
+    var checkpoint_path = run.checkpoint_path(String("last"))
+    print("  Run:", run.dir)
 
     # Build through the Design-F preset (config.mojo): reads like a
     # constructor, applies the reference-tuned defaults (gamma 0.99 / tau 0.01
@@ -216,14 +223,8 @@ def main() raises:
         action_scale=Scalar[DT](ACTION_SCALE), learning_starts=LEARN_START,
     )
 
-    # RemoteLogger (dashboard) — URL/key from .env; no-ops if unset.
-    var env_vars = load_dotenv()
-    var logger = RemoteLogger(
-        server_url=env_vars.get("NOEIRA_CLOUD_URL", ""),
-        run_name=String("TD-MPC2 dm_control walker ") + String(TASK),
-        buffer_size=64,
-        api_key=env_vars.get("NOEIRA_CLOUD_API_KEY", ""),
-    )
+    # metrics.csv + the monitor from .env (the remote half no-ops if unset).
+    var logger = run_logger(run, buffer_size=64)
     logger.set_config("algorithm", "TD-MPC2")
     logger.set_config("env", String("dm_control/walker-") + String(TASK))
     logger.set_config("target", TARGET)
@@ -231,17 +232,15 @@ def main() raises:
     logger.set_config("latent", String(LATENT))
     logger.set_config("batch", String(B))
     logger.set_config("horizon", String(H))
+    register_run(run, logger)
+    var artifacts = sink_for_run(run.id, run.dir)
     var logger_ptr = Pointer(to=logger).as_unsafe_any_origin()
-    if env_vars.get("NOEIRA_CLOUD_URL", "").byte_length() > 0:
-        print("  logger: ENABLED → streaming every", DIAG_EVERY, "steps")
-    else:
-        print("  logger: DISABLED — NOEIRA_CLOUD_URL not in .env")
 
     # ─── Single train() call — single-env TD-MPC2 driver ─────────────────
     print("Starting training...")
     print("-" * 70)
     var t_start = perf_counter_ns()
-    var best = ag.train[Env, RemoteLogger, Env, USE_MPC](
+    var best = ag.train[Env, RunLogger, Env, USE_MPC](
         env,
         TOTAL,
         train_every=TRAIN_EVERY,
@@ -249,8 +248,10 @@ def main() raises:
         verbose=True,
         logger=logger_ptr,
         diag_every=DIAG_EVERY,
-        checkpoint_path=ckpt,
+        checkpoint_path=checkpoint_path,
         checkpoint_every=CHECKPOINT_EVERY,
+        artifacts=artifacts,
+        run_dir=run.dir,
         eval_env=eval_env_ptr,
         eval_every=EVAL_EVERY,
         eval_episodes=EVAL_EPS,
@@ -259,7 +260,9 @@ def main() raises:
     _ = eval_env  # lifetime extender for eval_env_ptr
     var elapsed = Float64(perf_counter_ns() - t_start) / 1e9
 
-    logger.close()
+    finish_run(
+        run, logger, artifacts, String("best_eval_return=") + String(best)
+    )
     _ = logger  # lifetime extender for logger_ptr
 
     print("-" * 70)
@@ -268,7 +271,7 @@ def main() raises:
     print("  total env_steps        =", TOTAL)
     print("  elapsed                =", elapsed, "s")
     print("  best eval return       =", best)
-    print("  checkpoint             =", ckpt)
+    print("  run                    =", run.dir)
     print("=" * 70)
 
     var frac = Float64(best) / MAX_RETURN

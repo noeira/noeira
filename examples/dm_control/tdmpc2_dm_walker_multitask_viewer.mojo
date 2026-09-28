@@ -3,6 +3,7 @@
     pixi run build-imgui                                        # ONCE
     pixi run -e apple mojo run -I . examples/dm_control/tdmpc2_dm_walker_multitask_viewer.mojo
     pixi run -e apple mojo run -I . examples/dm_control/tdmpc2_dm_walker_multitask_viewer.mojo walker_run
+    pixi run -e apple mojo run -I . examples/dm_control/tdmpc2_dm_walker_multitask_viewer.mojo --ckpt <run_id>
 
 The multi-task counterpart of `tdmpc2_dm_walker_policy_viewer.mojo`. One
 checkpoint holds ONE task-conditioned world model for stand + walk + run, so
@@ -61,7 +62,8 @@ ring, neither of which a viewer touches, and neither is in the checkpoint.
 
 ## ⚠ CHECKPOINTS ARE NOT IN THE REPO
 
-Probes `checkpoints/` then the project root. ⚠ Checkpoints written before
+Probes `checkpoints/` then the project root; `--ckpt <run_id|path>` adds a
+run's `checkpoints/last.ckpt` (or a file) as the first checkpoint. ⚠ Checkpoints written before
 `8d7f07d8` are INCOMPATIBLE — the MT dynamics' final layer changed shape when
 its output width was fixed from LATENT+TASK_EMB back to LATENT — and will fail
 to load rather than load wrong. That is the intended behaviour; those runs
@@ -79,6 +81,7 @@ after either as policy behaviour.
 from std.pathlib import Path
 from std.random import seed
 from std.sys import argv
+from noeira.core.run import resolve_checkpoint, run_id_of_checkpoint
 from max.gpu.host import DeviceContext
 
 from noeira.nn.constants import DT
@@ -195,7 +198,7 @@ struct TDMPC2WalkerMT(ActionSource, Movable, Deinitable):
     """Which file is currently in the nets — lets a task-id switch skip the
     re-read, which is the common case when stepping +/-."""
 
-    def __init__(out self) raises:
+    def __init__(out self, ckpt: String) raises:
         var ctx = DeviceContext()
         self.agent = TDMPC2MultiTask[
             "gpu", MAX_OBS, MAX_ACT, NUM_TASKS, TASK_EMB, B, CAP,
@@ -217,19 +220,28 @@ struct TDMPC2WalkerMT(ActionSource, Movable, Deinitable):
         var tl = task_labels()
         var ladder = mpc_iter_ladder()
         var n_found = 0
+        # `--ckpt` (already resolved to a file) goes first, then the probed names.
+        var founds = List[String]()
+        var shorts = List[String]()
+        if ckpt.byte_length() > 0:
+            var rid = run_id_of_checkpoint(ckpt)
+            founds.append(ckpt)
+            shorts.append(rid if rid.byte_length() > 0 else ckpt)
         for i in range(len(names)):
-            var found = String("")
             for d in range(len(dirs)):
                 var cand = dirs[d] + names[i]
                 if Path(cand).exists():
-                    found = cand
+                    founds.append(cand)
+                    shorts.append(
+                        names[i].replace("tdmpc2_dm_walker_", "").replace(
+                            ".ckpt", ""
+                        )
+                    )
                     break
-            if not found:
-                continue
+        for i in range(len(founds)):
+            var found = founds[i]
             n_found += 1
-            var short = names[i].replace("tdmpc2_dm_walker_", "").replace(
-                ".ckpt", ""
-            )
+            var short = shorts[i]
             for t in range(NUM_TASKS):
                 for k in range(len(ladder)):
                     self.paths.append(found)
@@ -367,13 +379,37 @@ def dispatch(
         st.quit = True
 
 
+def _flag(name: String, dflt: String) raises -> String:
+    """Value of `--name X`, or `dflt` when the flag is absent."""
+    var av = argv()
+    for i in range(1, len(av)):
+        if String(av[i]) == name:
+            if i + 1 >= len(av):
+                raise Error("flag " + name + " needs a value")
+            return String(av[i + 1])
+    return dflt
+
+
 def main() raises:
     seed(SEED)
     if not imgui_shim_available():
         print("Dear ImGui shim not built.  Run:  pixi run build-imgui")
         return
 
-    var args = argv()
+    # `--ckpt <run_id|path>` is pulled out first; the rest stay positional.
+    var av = argv()
+    var ckpt_arg = _flag(String("--ckpt"), String(""))
+    var ckpt = String("")
+    if ckpt_arg.byte_length() > 0:
+        ckpt = resolve_checkpoint(ckpt_arg, String("last"))
+    var args = List[String]()
+    var ai = 0
+    while ai < len(av):
+        if ai > 0 and String(av[ai]) == "--ckpt":
+            ai += 2
+            continue
+        args.append(String(av[ai]))
+        ai += 1
     var start = String(args[1]) if len(args) > 1 else String("walker_walk")
     var task = task_index(start, task_names())
     if task < 0:
@@ -400,7 +436,7 @@ def main() raises:
     print("  ⚠ the variant picks the agent's TASK ID; the sidebar's task combo")
     print("    picks the ENV. Crossing them is the point — the reward")
     print("    sparkline always reads the ENV's reward.")
-    var walker = TDMPC2WalkerMT()
+    var walker = TDMPC2WalkerMT(ckpt)
 
     var st = ViewerState(
         task, drive, scale, task_names(), domain_names(), task_domain()

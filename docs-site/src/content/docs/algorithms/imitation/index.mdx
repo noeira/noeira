@@ -29,8 +29,9 @@ Every imitation pipeline here has the same five stages. The pages for each
 learner fill in the commands.
 
 **1. Record.** Demonstrations are captured as observation–action pairs at the
-control rate. On the real SO-101 the leader arm drives the follower and
-`examples/so101/record.mojo` writes a LeRobot v3 dataset; in simulation the
+control rate. On a real robot — the SO-101 today — the leader arm drives the
+follower and `examples/so101/record.mojo` writes a dataset in the LeRobot v3
+format; in simulation the
 recorders write the `.demo` format. See [Teleoperation and recording](/robots/teleop-recording/).
 
 **2. Import.** Training reads a [TrajectoryStore](/data/trajectory-store/), not
@@ -101,7 +102,7 @@ observed episode.
 |---|---|---|
 | ACT vs LeRobot's ACT, same 50 SO-101 episodes, same 40/10 split | val L1 0.3941 (≈0.414 in LeRobot's units) vs LeRobot's best 0.3726 | both plateau near the data's ceiling (≈0.38); LeRobot used 52M parameters at 480×640 |
 | ACT deployed on a Jetson Orin NX | closed loop at 30.0 Hz — 27.6 ms forward, 33.2 ms per query | a latency result; no success rate measured |
-| ACT on LIBERO `libero_goal`, 10 tasks × 20 frozen inits | 31/200 | a vision-free kNN over the same proprio words scores 144/200; not comparable to LIBERO's published tables |
+| ACT on LIBERO `libero_goal`, 10 tasks × 20 frozen inits | 0.75 ± 0.05 over 3 seeds | vision-free nearest-demonstration controls score 0.72 and 0.795; not comparable to LIBERO's published tables |
 | BC MLP on LIBERO `libero_goal` | 13/200 | a low-dimensional baseline |
 | SmolVLA fine-tune | held-out flow loss 0.5509 → 0.2170 (RTX 5090, 2000 steps) | a loss, not a success rate |
 | SmolVLA on the real arm | first grasp-and-place on 20 Sep 2026: cube picked up and dropped into the bowl | roughly 20% of attempts by informal count — not a measured rate; more and better data needed |

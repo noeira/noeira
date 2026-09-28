@@ -341,7 +341,14 @@ trait OffPolicyAgent(Deinitable, Movable):
         pass
 
     def save_state(mut self, path: String) raises:
-        pass
+        """⚠ RAISES BY DEFAULT, on purpose. Drivers call this only when a
+        `checkpoint_path` was given; a `pass` default meant a trainer that did
+        not override it produced no file and no error, and the run looked
+        checkpointed until someone tried to resume it."""
+        raise Error(
+            "save_state: this trainer does not implement checkpointing, and a"
+            " checkpoint was requested at " + path
+        )
 
 
 # ──────────────────────────────────────────────────────────────────────
@@ -702,7 +709,7 @@ def run_offpolicy_train[
                 logger.value()[].flush()
 
         # `checkpoint_every` — overwrite `checkpoint_path` with the
-        # trainer's one-file v2 envelope. Default trait impl is no-op.
+        # trainer's one-file v3 checkpoint. The trait default raises.
         if (
             checkpoint_every > 0
             and abs_step % checkpoint_every == 0
@@ -882,13 +889,13 @@ def run_offpolicy_train_batched[
     when both set, the driver calls `trainer.save_state(checkpoint_path)`
     inline every `checkpoint_every` env-steps and one final time at the
     end of the loop — overwriting `checkpoint_path` with the one-file
-    `nn-ckpt v2` envelope (actor + twin critics + their optimizers +
-    alpha optimizer; the replay buffer and episode tracker are NOT
-    persisted). On the GPU train target the save does a D2H of the live
+    v3 `storage-ckpt` file (for SAC: actor + twin critics, with α's
+    optimizer and the step counter as `K` scalars; the network optimizers,
+    replay buffer and episode tracker are NOT persisted). On the GPU train target the save does a D2H of the live
     params; it runs in host code between iterations, so it is safe to
     combine with `USE_TRAIN_CUDA_GRAPH` / `USE_ENV_CUDA_GRAPH` (the
     captured graphs are per-step, not the whole loop). Default trait
-    `save_state` impl is a no-op, so non-SAC trainers ignore it.
+    `save_state` raises, so a trainer without checkpointing fails loudly.
 
     `episode_sync_every` (GPU-env path only): batch the per-iteration
     reward/done D2H readback used for episode-return bookkeeping over this many
@@ -1483,9 +1490,9 @@ def run_offpolicy_train_batched[
                 )
 
         # ── Checkpoint cadence — overwrite `checkpoint_path` with the
-        # trainer's one-file v2 envelope. Runs in host code between
+        # trainer's one-file v3 checkpoint. Runs in host code between
         # iterations (D2H of live params on the GPU target), so it is
-        # CUDA-graph-capture safe. Default `save_state` impl is a no-op.
+        # CUDA-graph-capture safe. The default `save_state` raises.
         if cad.ckpt_due(step_idx):
             trainer.save_state(checkpoint_path)
             announce_checkpoint(checkpoint_path, artifacts, run_dir)
@@ -1517,7 +1524,7 @@ def run_offpolicy_train_batched[
             comptime if L.ENABLED:
                 if Bool(logger):
                     logger.value()[].log_scalar(
-                        "eval/mean_return",
+                        "eval_return",
                         Float64(eval_ret),
                         base_step + step_idx,
                     )
@@ -1790,7 +1797,7 @@ def run_offpolicy_train_cpu_env_gpu_agent[
                 )
 
         # `checkpoint_every` — overwrite `checkpoint_path` with the
-        # trainer's one-file v2 envelope. Default trait impl is a no-op.
+        # trainer's one-file v3 checkpoint. The trait default raises.
         if cad.ckpt_due(step_idx):
             trainer.save_state(checkpoint_path)
             announce_checkpoint(checkpoint_path, artifacts, run_dir)

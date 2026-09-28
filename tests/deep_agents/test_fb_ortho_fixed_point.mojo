@@ -33,7 +33,7 @@ from std.testing import assert_true
 
 from noeira.nn.constants import DT
 from noeira.nn.core.tensor import Tensor
-from noeira.deep_agents.fb.loss import fb_ortho_loss
+from noeira.deep_agents.fb.loss import fb_ortho_loss, fb_rank_eff_from_ortho
 
 
 comptime D: Int = 32
@@ -84,6 +84,71 @@ def _rank_eff(ref b: Tensor) -> Float64:
             var v = Float64(c.data[a * D + bb])
             tr2 += v * v
     return tr * tr / tr2
+
+
+def test_rank_from_ortho_matches_direct() raises:
+    """`fb_rank_eff_from_ortho` must agree with rank computed FROM B.
+
+    The training loop never sees B — it logs `b_rank_eff` from the ortho loss
+    alone, because `|B|` is pinned and cannot show a directional collapse
+    (§12.12). That conversion depends on `L_ortho`'s exact definition, and
+    when the loss moved to the reference's scale (§12.28) the inline copy in
+    the driver was missed: it logged 200.8 where the truth was 244.3 — which
+    reads exactly like B collapsing. Nothing caught it because nothing
+    compared the derived number against one computed independently.
+
+    This does. Two routes to the same quantity, on three B's spanning the
+    range: a random spread one, a renormalised rank-1 collapse, and the
+    descended near-isotropic one.
+    """
+    print("[0] rank from L_ortho == rank computed from B ...")
+    var g = Tensor.alloc(BATCH * D)
+    for ci in range(3):
+        var name = String("random")
+        if ci == 1:
+            name = String("rank-1")
+        elif ci == 2:
+            name = String("descended")
+        var b = Tensor.alloc(BATCH * D)
+        if ci == 1:
+            # rank-1: every row the same direction, plus a whisper of noise so
+            # the Gram is not exactly singular (mirrors [2]'s start)
+            var st = UInt64(4242)
+            for k in range(D):
+                st = st * 6364136223846793005 + 1442695040888963407
+                var v = Float64((st >> 33) % 2000) / 1000.0 - 1.0
+                for i in range(BATCH):
+                    b.data[i * D + k] = Scalar[DT](v)
+            for i in range(BATCH * D):
+                st = st * 6364136223846793005 + 1442695040888963407
+                b.data[i] = Scalar[DT](
+                    Float64(b.data[i])
+                    + 1e-3 * (Float64((st >> 33) % 2000) / 1000.0 - 1.0)
+                )
+        else:
+            _rand_fill(b, UInt64(777 + ci))
+        _renorm(b)
+        if ci == 2:
+            for _ in range(STEPS):
+                _ = fb_ortho_loss[D, BATCH](b, g)
+                for i in range(BATCH * D):
+                    b.data[i] = Scalar[DT](
+                        Float64(b.data[i]) - LR * Float64(g.data[i])
+                    )
+                _renorm(b)
+        var direct = _rank_eff(b)
+        var ortho = fb_ortho_loss[D, BATCH](b, g)
+        var derived = fb_rank_eff_from_ortho[D, BATCH](ortho)
+        var rel = abs(derived - direct) / direct
+        print("      ", name, ": direct", direct, " from ortho", derived,
+              " rel", rel)
+        assert_true(
+            rel < 1e-6,
+            "rank from L_ortho (" + String(derived) + ") disagrees with rank"
+            " computed from B (" + String(direct) + ") on the " + name
+            + " case — the conversion has drifted from the loss",
+        )
+    print("      OK")
 
 
 def test_ortho_descends_to_full_rank() raises:
@@ -170,6 +235,7 @@ def test_a_collapsed_start_is_recovered() raises:
 
 def main() raises:
     print("=== FB ortho fixed point ===")
+    test_rank_from_ortho_matches_direct()
     test_ortho_descends_to_full_rank()
     test_a_collapsed_start_is_recovered()
     print("=== all passed ===")

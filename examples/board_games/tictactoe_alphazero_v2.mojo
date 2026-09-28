@@ -3,7 +3,7 @@
 Second-generation port of `tictactoe_alphazero.mojo`. Uses the config-free
 nn net torsos + the `AlphaZeroAgent` facade, and exercises the production
 telemetry: two pluggable `GPUEvaluator` opponents (minimax + random), a
-per-report progress print, and a `RemoteLogger` metrics sink. The periodic eval
+per-report progress print, and a `run_logger` metrics sink. The periodic eval
 plays the agent at full **MCTS** strength (temp=0), so the numbers reflect the
 deployed agent; over the run it learns strong play (drawing minimax, beating
 random) — the textbook "optimal never loses" result.
@@ -15,15 +15,18 @@ Usage:
     pixi run -e nvidia mojo run -I . examples/board_games/tictactoe_alphazero_v2.mojo
     pixi run -e apple  mojo run -I . examples/board_games/tictactoe_alphazero_v2.mojo
 
-With no `NOEIRA_CLOUD_URL` in the environment the RemoteLogger is a silent no-op,
-so this runs anywhere; the per-report lines still print to stdout.
+The run (project `board-games`) keeps its checkpoint, `metrics.csv` and
+`run.kv` in `runs/<id>/`; with no `NOEIRA_CLOUD_URL` in `.env` the monitor half
+is inert and the per-report lines still print to stdout.
 """
 
 from std.memory import Pointer
 from max.gpu.host import DeviceContext
 
-from noeira.core.dotenv import load_dotenv
-from noeira.core.logger import RemoteLogger
+from noeira.core.run import RunContext, register_run
+from noeira.core.run_session import RunLogger, finish_run, run_logger
+from noeira.io.artifact_sink import sink_for_run
+from noeira.deep_agents.training.checkpoint import announce_checkpoint
 from noeira.deep_agents.alphazero.nets import AZMLPNet
 from noeira.deep_agents.alphazero.agent import AlphaZeroAgent
 from noeira.deep_agents.zero.symmetries import D4SquareAugmenter
@@ -38,20 +41,20 @@ def main() raises:
     print()
 
     # ── Logger setup ────────────────────────────────────────────
-    var env_vars = load_dotenv()
-    var api_key = env_vars.get("NOEIRA_CLOUD_API_KEY", "")
-    var url = env_vars.get("NOEIRA_CLOUD_URL", "")
-
-    var logger = RemoteLogger(
-        server_url=url,
-        run_name="AlphaZero TicTacToe (nn)",
-        buffer_size=22,
-        api_key=api_key,
+    var run = RunContext(
+        project=String("board-games"),
+        driver=String("examples/board_games/tictactoe_alphazero_v2.mojo"),
+        slug=String("alphazero-tictactoe"),
+        env=String("builtin:tictactoe"),
     )
+    print("run:", run.dir)
+    var logger = run_logger(run, buffer_size=22)
     logger.set_config("agent", "AlphaZero")
     logger.set_config("env", "TicTacToe")
     logger.set_config("network", "AZMLPNet[27,9,128]")
     logger.set_config("framework", "deep_agents/nn")
+    register_run(run, logger)
+    var artifacts = sink_for_run(run.id, run.dir)
 
     comptime OBS = 27
     comptime ACT = 9
@@ -73,7 +76,7 @@ def main() raises:
         AUG=Aug,
         OPP1=GPUMinimaxTicTacToe,
         OPP2=RandomOpponent,
-        L=RemoteLogger,
+        L=RunLogger,
         ARENA_GAMES=40,
         RESULT_IDX=10,
         MAX_PLIES=9,
@@ -94,10 +97,15 @@ def main() raises:
         logger=Pointer(to=logger).as_unsafe_any_origin(),
     )
 
-    logger.close()
-    agent.save("tictactoe_alphazero_v2.ckpt")
+    var ckpt = run.checkpoint_path(String("last"))
+    agent.save(ckpt)
+    announce_checkpoint(ckpt, artifacts, run.dir)
+    finish_run(
+        run, logger, artifacts,
+        String("last_loss=") + String(res.last_loss) + String(" promotions=") + String(res.promotions),
+    )
 
     print()
     print("last_loss:", res.last_loss, "| promotions:", res.promotions)
-    print("saved → tictactoe_alphazero_v2.ckpt")
+    print("saved →", ckpt)
     print("=== Done ===")

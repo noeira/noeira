@@ -342,7 +342,7 @@ def run_alphazero_selfplay_arena_cpu[
             values.append(last_loss)
             names.append(String("games"))
             values.append(Float64(total_games))
-            names.append(String("replay_size"))
+            names.append(String("buffer_size"))
             values.append(Float64(len(replay)))
             names.append(String("promotions"))
             values.append(Float64(promotions))

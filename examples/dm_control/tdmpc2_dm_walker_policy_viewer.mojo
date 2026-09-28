@@ -3,6 +3,7 @@
     pixi run build-imgui                                        # ONCE
     pixi run -e apple mojo run -I . examples/dm_control/tdmpc2_dm_walker_policy_viewer.mojo
     pixi run -e apple mojo run -I . examples/dm_control/tdmpc2_dm_walker_policy_viewer.mojo walker_run
+    pixi run -e apple mojo run -I . examples/dm_control/tdmpc2_dm_walker_policy_viewer.mojo --ckpt <run_id>
 
 argv picks the task that opens first, then the drive mode (zero | random |
 sweep | policy) and an action scale; every task and mode stays selectable in
@@ -65,9 +66,10 @@ of host memory to open a window with.
 ## ⚠ THE CHECKPOINT IS NOT IN THE REPO
 
 `CKPT_DIRS` probes `checkpoints/` then the project root, for both the batched
-and single-env filenames of all three tasks. A variant whose file is absent is
-labelled `(missing)` in the combo and left un-driven rather than silently
-driving an uninitialised net.
+and single-env filenames of all three tasks; `--ckpt <run_id|path>` adds a
+run's `checkpoints/last.ckpt` (or a file) as the first checkpoint. A variant
+whose file is absent is labelled `(missing)` in the combo and left un-driven
+rather than silently driving an uninitialised net.
 
 ⚠ CPU PHYSICS + GPU AGENT. The viewer's env is the CPU float32 path while the
 checkpoint trained on the GPU batched path, so treat small differences as path
@@ -84,6 +86,7 @@ episode as policy behaviour.
 from std.pathlib import Path
 from std.random import seed
 from std.sys import argv
+from noeira.core.run import resolve_checkpoint, run_id_of_checkpoint
 from max.gpu.host import DeviceContext
 
 from noeira.nn.constants import DT
@@ -215,7 +218,7 @@ struct TDMPC2Walker(ActionSource, Movable, Deinitable):
     var current: Int
     var loaded: Bool
 
-    def __init__(out self) raises:
+    def __init__(out self, ckpt: String) raises:
         # The agent owns its own context — `run_view` builds a separate one for
         # the renderer. Safe because the two never share a buffer: this trait
         # speaks host Lists.
@@ -234,22 +237,31 @@ struct TDMPC2Walker(ActionSource, Movable, Deinitable):
         var names = ckpt_names()
         var dirs = ckpt_dirs()
         var n_found = 0
+        # `--ckpt` (already resolved to a file) goes first, then the probed names.
+        var founds = List[String]()
+        var shorts = List[String]()
+        if ckpt.byte_length() > 0:
+            var rid = run_id_of_checkpoint(ckpt)
+            founds.append(ckpt)
+            shorts.append(rid if rid.byte_length() > 0 else ckpt)
         for i in range(len(names)):
-            var found = String("")
             for d in range(len(dirs)):
                 var cand = dirs[d] + names[i]
                 if Path(cand).exists():
-                    found = cand
+                    founds.append(cand)
+                    shorts.append(
+                        names[i].replace("tdmpc2_dm_walker_", "").replace(
+                            ".ckpt", ""
+                        )
+                    )
                     break
-            # A missing checkpoint contributes NO variants at all — with 12
-            # candidate filenames x 2 modes, listing the absent ones would bury
-            # the one that exists in 22 lines of "(missing)".
-            if not found:
-                continue
+        # A missing checkpoint contributes NO variants at all — with 12
+        # candidate filenames x 2 modes, listing the absent ones would bury
+        # the one that exists in 22 lines of "(missing)".
+        for i in range(len(founds)):
+            var found = founds[i]
             n_found += 1
-            var short = names[i].replace("tdmpc2_dm_walker_", "").replace(
-                ".ckpt", ""
-            )
+            var short = shorts[i]
             # One MPC row per iteration budget, cheapest first, then the
             # non-planning prior. +/- therefore steps the frame-rate knob.
             var ladder = mpc_iter_ladder()
@@ -393,13 +405,37 @@ def dispatch(
         st.quit = True
 
 
+def _flag(name: String, dflt: String) raises -> String:
+    """Value of `--name X`, or `dflt` when the flag is absent."""
+    var av = argv()
+    for i in range(1, len(av)):
+        if String(av[i]) == name:
+            if i + 1 >= len(av):
+                raise Error("flag " + name + " needs a value")
+            return String(av[i + 1])
+    return dflt
+
+
 def main() raises:
     seed(SEED)
     if not imgui_shim_available():
         print("Dear ImGui shim not built.  Run:  pixi run build-imgui")
         return
 
-    var args = argv()
+    # `--ckpt <run_id|path>` is pulled out first; the rest stay positional.
+    var av = argv()
+    var ckpt_arg = _flag(String("--ckpt"), String(""))
+    var ckpt = String("")
+    if ckpt_arg.byte_length() > 0:
+        ckpt = resolve_checkpoint(ckpt_arg, String("last"))
+    var args = List[String]()
+    var ai = 0
+    while ai < len(av):
+        if ai > 0 and String(av[ai]) == "--ckpt":
+            ai += 2
+            continue
+        args.append(String(av[ai]))
+        ai += 1
     var start = String(args[1]) if len(args) > 1 else String("walker_walk")
     var task = task_index(start, task_names())
     if task < 0:
@@ -423,7 +459,7 @@ def main() raises:
     print("  MPPI budget:", MPC_SAMPLES, "+", MPC_PI_TRAJS, "trajs,",
           MPC_ITERS, "iters, horizon", H)
     print("  ⚠ the MPC variant plans EVERY frame — expect a few Hz, not 60")
-    var walker = TDMPC2Walker()
+    var walker = TDMPC2Walker(ckpt)
 
     var st = ViewerState(
         task, drive, scale, task_names(), domain_names(), task_domain()

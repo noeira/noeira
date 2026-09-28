@@ -20,14 +20,17 @@ pass), not legacy-style collect+train rounds.
 Usage:
     pixi run mojo run -I . examples/board_games/tictactoe_alphazero_v2_cpu.mojo
 
-With no `NOEIRA_CLOUD_URL` in the environment the RemoteLogger is a silent no-op,
-so this runs anywhere; the per-report lines still print to stdout.
+The run (project `board-games`) keeps its checkpoint, `metrics.csv` and
+`run.kv` in `runs/<id>/`; with no `NOEIRA_CLOUD_URL` in `.env` the monitor half
+is inert and the per-report lines still print to stdout.
 """
 
 from std.memory import Pointer
 
-from noeira.core.dotenv import load_dotenv
-from noeira.core.logger import RemoteLogger
+from noeira.core.run import RunContext, register_run
+from noeira.core.run_session import RunLogger, finish_run, run_logger
+from noeira.io.artifact_sink import sink_for_run
+from noeira.deep_agents.training.checkpoint import announce_checkpoint
 from noeira.deep_agents.alphazero.nets import AZMLPNet
 from noeira.deep_agents.alphazero.agent import AlphaZeroAgent
 from noeira.deep_agents.zero.symmetries import D4SquareAugmenter
@@ -43,21 +46,21 @@ def main() raises:
     print()
 
     # ── Logger setup ────────────────────────────────────────────
-    var env_vars = load_dotenv()
-    var api_key = env_vars.get("NOEIRA_CLOUD_API_KEY", "")
-    var url = env_vars.get("NOEIRA_CLOUD_URL", "")
-
-    var logger = RemoteLogger(
-        server_url=url,
-        run_name="AlphaZero TicTacToe (nn, CPU)",
-        buffer_size=22,
-        api_key=api_key,
+    var run = RunContext(
+        project=String("board-games"),
+        driver=String("examples/board_games/tictactoe_alphazero_v2_cpu.mojo"),
+        slug=String("alphazero-cpu-tictactoe"),
+        env=String("builtin:tictactoe"),
     )
+    print("run:", run.dir)
+    var logger = run_logger(run, buffer_size=22)
     logger.set_config("agent", "AlphaZero")
     logger.set_config("env", "TicTacToe")
     logger.set_config("network", "AZMLPNet[27,9,128]")
     logger.set_config("framework", "deep_agents/nn")
     logger.set_config("target", "cpu")
+    register_run(run, logger)
+    var artifacts = sink_for_run(run.id, run.dir)
 
     comptime OBS = 27
     comptime ACT = 9
@@ -110,7 +113,7 @@ def main() raises:
         AUG=Aug,
         OPP1=GPUMinimaxTicTacToe,
         OPP2=RandomOpponent,
-        L=RemoteLogger,
+        L=RunLogger,
         ARENA_GAMES=20,
         RESULT_IDX=10,
         MAX_PLIES=9,
@@ -131,14 +134,20 @@ def main() raises:
         logger=Pointer(to=logger).as_unsafe_any_origin(),
     )
 
-    logger.close()
-
     # Endline: greedy net-policy vs random after training (should clearly beat
     # the baseline). `agent.save` checkpoints the net through the storage
     # facade — it threads `self.ctx` (None on this CPU path), so the
     # host-resident net is written via the weights-only `save_params` surface.
     var after = agent.eval_vs_random_cpu[200, 9](agent_player=0, seed=12345)
-    agent.save("tictactoe_alphazero_v2_cpu.ckpt")
+    var ckpt = run.checkpoint_path(String("last"))
+    agent.save(ckpt)
+    announce_checkpoint(ckpt, artifacts, run.dir)
+    finish_run(
+        run, logger, artifacts,
+        String("win_vs_random=") + String(after.wins) + String("/200")
+        + String(" draw=") + String(after.draws)
+        + String(" loss=") + String(after.losses),
+    )
 
     print()
     print(
@@ -150,5 +159,5 @@ def main() raises:
         after.losses,
     )
     print("last_loss:", res.last_loss, "| promotions:", res.promotions)
-    print("saved → tictactoe_alphazero_v2_cpu.ckpt")
+    print("saved →", ckpt)
     print("=== Done ===")

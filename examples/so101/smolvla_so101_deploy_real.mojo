@@ -11,6 +11,10 @@
     pixi run -e jetson smolvla-deploy-jetson -- --project so101-tower \\
         --devices /dev/soarm_cam_overhead,/dev/soarm_cam_wrist
 
+    # a fine-tune run's own weights: a RUN ID (its checkpoints/last.ckpt) or a
+    # .ckpt path; absent it, $SMOLVLA_CKPT, then the promoted policies/smolvla.ckpt
+    ... --ckpt <run_id> --stats <meta/stats.json>
+
     # --arm is what actually moves the robot. Be at the desk, hand on the power.
     ... --arm --seconds 30
 
@@ -114,6 +118,7 @@ from noeira.deep_agents.smolvla.query_worker import (
 from noeira.core.concurrent.block import SharedBlock
 from noeira.core.concurrent.ring import SharedRing
 from noeira.core.concurrent.worker import BackgroundThread
+from noeira.core.run import resolve_checkpoint
 from noeira.deep_agents.smolvla.recording import SO101_N_LANG, SO101_TASKS
 from noeira.deep_agents.smolvla.tasks import TaskTokens
 from noeira.io.fileio import StdinReader, stdin_is_tty
@@ -390,13 +395,17 @@ def main() raises:
         ensemble = False
     if ckpt == "":
         ckpt = getenv("SMOLVLA_CKPT", String(""))
+    if ckpt != "":
+        # A RUN ID -> its `checkpoints/last.ckpt` (the fine-tune's deploy
+        # checkpoint, see its header); a file is used as is.
+        ckpt = resolve_checkpoint(ckpt, String("last"))
     if ckpt == "":
         var promoted = "projects/" + project + "/policies/smolvla.ckpt"
         if exists(promoted):
             ckpt = promoted
     if ckpt == "":
         raise Error(
-            "smolvla deploy: no fine-tuned weights. Pass --ckpt <file>, set"
+            "smolvla deploy: no fine-tuned weights. Pass --ckpt <run_id|file>, set"
             " $SMOLVLA_CKPT, or promote one into projects/" + project
             + "/policies/smolvla.ckpt.\n  ⚠ The BASE checkpoint alone has never"
             " seen this robot; running it would not be a test of anything."

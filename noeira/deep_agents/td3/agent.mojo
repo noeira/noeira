@@ -294,7 +294,7 @@ struct TD3Agent[
 
     def save(mut self, path: String) raises:
         """Thin passthrough to `trainer.save_state(path)`. Writes ONE
-        file (`nn-ckpt v2` envelope) with prefixed sections for
+        file (v3 `storage-ckpt` file) with prefixed sections for
         actor, critic1, critic2, actor_opt, critic1_opt, critic2_opt.
         Replay buffer + episode tracker NOT included."""
         self.trainer.save_state(path)

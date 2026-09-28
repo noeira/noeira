@@ -22,10 +22,13 @@ Also writes a 6-panel GIF (one panel per held action) for visual confirmation.
 Run (checkpoint from the training run; C below MUST match it):
     pixi run -e apple  mojo run -I . examples/atari/dreamerv3_atari_pong_dream_action_response.mojo
     pixi run -e nvidia mojo run -I . examples/atari/dreamerv3_atari_pong_dream_action_response.mojo
+    pixi run -e apple  mojo run -I . examples/atari/dreamerv3_atari_pong_dream_action_response.mojo --ckpt <run_id>
 """
 
 from std.memory import alloc
 from std.random import seed
+from std.sys import argv
+from noeira.core.run import resolve_checkpoint
 from max.gpu.host import DeviceContext
 
 from noeira.nn.constants import DT
@@ -151,7 +154,19 @@ def _argmax(p: Pointer[Scalar[DT], MutAnyOrigin], n: Int) -> Int:
     return best
 
 
+def _flag(name: String, dflt: String) raises -> String:
+    """Value of `--name X`, or `dflt` when the flag is absent."""
+    var av = argv()
+    for i in range(1, len(av)):
+        if String(av[i]) == name:
+            if i + 1 >= len(av):
+                raise Error("flag " + name + " needs a value")
+            return String(av[i + 1])
+    return dflt
+
+
 def main() raises:
+    var ckpt = resolve_checkpoint(_flag(String("--ckpt"), String(CHECKPOINT_PATH)), String("last"))
     print("=" * 70)
     print("DreamerV3 Pong — DREAM action response (counterfactual imagination)")
     print("  CTX", CTX, " HOR", HOR, " per-branch; OBS", OBS)
@@ -160,8 +175,8 @@ def main() raises:
 
     with DeviceContext() as ctx:
         var agent = Ag.make(ctx=ctx)
-        print("loading checkpoint", CHECKPOINT_PATH, "...")
-        agent.load(CHECKPOINT_PATH)
+        print("loading checkpoint", ckpt, "...")
+        agent.load(ckpt)
 
         # ── collect CTX real steps for the belief context (sampled actor) ──
         var env = Env(AtariGame.PONG)

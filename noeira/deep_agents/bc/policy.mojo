@@ -17,6 +17,8 @@ match the checkpoint's width.
 
 from std.os.path import exists
 
+from noeira.io.fileio import write_text_atomic
+
 from noeira.nn.constants import DT
 from noeira.nn.combinators.sequential import Sequential
 from noeira.nn.primitives.activations import ReLU
@@ -81,8 +83,10 @@ def write_bc_norm(
         text += "mu=" + String(mu[j]) + "\n"
     for j in range(len(sd)):
         text += "sd=" + String(sd[j]) + "\n"
-    with open(path, "w") as fh:
-        fh.write(text)
+    # Atomic: the checkpoint beside it is, and a policy whose sidecar was cut
+    # short by a crash is refused on load — or worse, loaded with the wrong
+    # width if the cut fell on a line boundary.
+    write_text_atomic(path, text)
 
 
 def load_bc_norm(

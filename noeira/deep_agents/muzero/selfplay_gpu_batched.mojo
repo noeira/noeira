@@ -126,9 +126,9 @@ def _mz_emit_batch_diag[
     var dn = List[String]()
     var dv = List[Float64]()
     dn.append(String("loss")); dv.append(last_loss)
-    dn.append(String("loss_policy")); dv.append(Float64(l_parts[unsafe_offset=0]))
-    dn.append(String("loss_value")); dv.append(Float64(l_parts[unsafe_offset=1]))
-    dn.append(String("loss_reward")); dv.append(Float64(l_parts[unsafe_offset=2]))
+    dn.append(String("policy_loss")); dv.append(Float64(l_parts[unsafe_offset=0]))
+    dn.append(String("value_loss")); dv.append(Float64(l_parts[unsafe_offset=1]))
+    dn.append(String("reward_loss")); dv.append(Float64(l_parts[unsafe_offset=2]))
     append_mz_train_diagnostics[ACT, BINS, B](
         h_pred, t_pol, t_val, v_min, v_max, dn, dv
     )
@@ -462,9 +462,9 @@ def run_muzero_gumbel_selfplay_gpu_batched[
             var dn = List[String]()
             var dv = List[Float64]()
             dn.append(String("loss")); dv.append(last_loss)
-            dn.append(String("loss_policy")); dv.append(Float64(l_parts[unsafe_offset=0]))
-            dn.append(String("loss_value")); dv.append(Float64(l_parts[unsafe_offset=1]))
-            dn.append(String("loss_reward")); dv.append(Float64(l_parts[unsafe_offset=2]))
+            dn.append(String("policy_loss")); dv.append(Float64(l_parts[unsafe_offset=0]))
+            dn.append(String("value_loss")); dv.append(Float64(l_parts[unsafe_offset=1]))
+            dn.append(String("reward_loss")); dv.append(Float64(l_parts[unsafe_offset=2]))
             logger.value()[].log_scalars(dn, dv, it + 1)
 
         # ── high-coverage batched reanalyze: re-target `reanalyze_batch` stored
@@ -582,10 +582,10 @@ def run_muzero_gumbel_selfplay_gpu_batched[
                 ravg /= Float64(rcnt)
             var rn = List[String]()
             var rv = List[Float64]()
-            rn.append(String("avg_return")); rv.append(ravg)
+            rn.append(String("avg_reward")); rv.append(ravg)
             rn.append(String("episodes"))
             rv.append(Float64(rb.num_episodes()))
-            rn.append(String("replay_size"))
+            rn.append(String("buffer_size"))
             rv.append(Float64(rb.num_steps()))
             logger.value()[].log_scalars(rn, rv, it + 1)
 
@@ -1009,10 +1009,10 @@ def run_muzero_gumbel_selfplay_gpu_batched_devreplay[
         ):
             var rn = List[String]()
             var rv = List[Float64]()
-            rn.append(String("avg_return"))
+            rn.append(String("avg_reward"))
             rv.append(_avg_last_n(ep_returns, 10))
             rn.append(String("episodes")); rv.append(Float64(rb.num_episodes()))
-            rn.append(String("replay_size")); rv.append(Float64(rb.num_steps()))
+            rn.append(String("buffer_size")); rv.append(Float64(rb.num_steps()))
             logger.value()[].log_scalars(rn, rv, it + 1)
 
     # t_*/h_* metadata + PER scratch are owned Lists (RAII) — only the raw

@@ -49,12 +49,12 @@ def critic_health(csv_path: String, gamma: Float64) raises -> Tuple[
     empty decade" — 1.00x on the converged run, 89x on the destroyed one,
     nothing between. A later `lift` run at `updates_per_step 16` peaked at
     **4.19x** with `critic_loss` 33.9: it did not diverge, it overshot and
-    decayed, and it learned nothing (`mean_reward` 0.3931 -> 0.3949 over 1M
+    decayed, and it learned nothing (`reward_mean` 0.3931 -> 0.3949 over 1M
     steps). So the decade is populated, the claim was an artefact of two data
     points, and a run between 2x and 10x is worth SAYING rather than passing
     silently — it is not a diverged run and it is not a healthy one.
 
-    ⚠ THE FIXED POINT IS THE RUN'S OWN. `mean_reward / (1 - gamma)` from the
+    ⚠ THE FIXED POINT IS THE RUN'S OWN. `reward_mean / (1 - gamma)` from the
     last row that carries one, so the check needs no per-task calibration —
     the same reason the baseline comes from the run's own warmup.
     """
@@ -75,7 +75,11 @@ def critic_health(csv_path: String, gamma: Float64) raises -> Tuple[
         if len(c) != 4:
             continue
         var name = String(c[2])
-        if name != "mean_q" and name != "critic_loss" and name != "mean_reward":
+        # ⚠ `mean_reward` is the pre-2026-09-22 name of `reward_mean`; the
+        # runs this is read against were mostly logged under it.
+        if name == "mean_reward":
+            name = String("reward_mean")
+        if name != "mean_q" and name != "critic_loss" and name != "reward_mean":
             continue
         var v: Float64
         try:

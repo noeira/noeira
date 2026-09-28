@@ -4,7 +4,7 @@
     pixi run mojo run -I . examples/so101/tower_policy_viewer.mojo
     pixi run mojo run -I . examples/so101/tower_policy_viewer.mojo so101_tower_lift_brick
     pixi run mojo run -I . examples/so101/tower_policy_viewer.mojo so101_tower_lift_brick \\
-        projects/so101-tower/runs/2026-09-19_sac-so101_tower_lift_brick_e20c4728/checkpoints/last.ckpt
+        --ckpt <run_id>
 
 The interactive counterpart of `examples/tasks/sac_tower_gpu.mojo`'s final
 eval: the same checkpoint, the same family env on the CPU, the same greedy
@@ -16,7 +16,8 @@ distances the reward is built from, in millimetres, every step.
 ## WHAT IT SHOWS
 
 The first argument is the TASK (default `so101_tower_lift_brick`), the second
-an explicit checkpoint. With no checkpoint named, every
+(or `--ckpt`) an explicit checkpoint: a RUN ID (its `checkpoints/last.ckpt`) or
+a .ckpt path. With no checkpoint named, every
 `projects/so101-tower/runs/*<task>*/checkpoints/last.ckpt` is listed, newest
 first, in the sidebar's variant combo — so runs can be compared live.
 
@@ -77,6 +78,7 @@ from noeira.tasks.posed_reset import posed_qpos, task_meta_words
 from noeira.tasks.placement.so101_tower import So101TowerPlacement
 from noeira.tasks.family_config import So101TowerConfig
 from noeira.tasks.so101_tower_xml import So101TowerModel
+from noeira.core.run import resolve_checkpoint
 
 comptime SEED: Int = 0
 comptime FAMILY = "so101_tower"
@@ -251,8 +253,24 @@ def main() raises:
         print("Dear ImGui shim not built.  Run:  pixi run build-imgui")
         return
     var args = argv()
-    var task = String(args[1]) if len(args) > 1 else String(DEFAULT_TASK)
-    var explicit = String(args[2]) if len(args) > 2 else String("")
+    var positional = List[String]()
+    var explicit = String("")
+    var ai = 1
+    while ai < len(args):
+        var a = String(args[ai])
+        if a == "--ckpt" and ai + 1 < len(args):
+            explicit = String(args[ai + 1])
+            ai += 2
+            continue
+        positional.append(a)
+        ai += 1
+    var task = positional[0].copy() if len(positional) > 0 else String(DEFAULT_TASK)
+    if not explicit and len(positional) > 1:
+        explicit = positional[1].copy()
+    if explicit:
+        # a RUN ID -> its `checkpoints/last.ckpt` (what the task layer's SAC
+        # driver writes); a file is taken as is; anything else raises here.
+        explicit = resolve_checkpoint(explicit, String("last"))
     var ti = task_index(task, task_names())
     if ti < 0:
         print("unknown task:", task, "— this viewer registers:")

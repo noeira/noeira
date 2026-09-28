@@ -155,6 +155,7 @@ def ray_model[
     # with this, through the SAME dispatch — a second copy of the per-type
     # size spelling below is how two ray paths drift apart.
     g_start: Int = 0,
+    tcut: Scalar[DTYPE] = Scalar[DTYPE](RAY_NO_HIT),
 ) -> RayHit[DTYPE] where DTYPE.is_floating_point():
     """Nearest intersection of `pnt + x*vec` with the model.
 
@@ -166,6 +167,12 @@ def ray_model[
     contract every routine underneath keeps. The reference RAISES on a
     zero-length `vec`; here that case simply hits nothing, because a ray query
     inside a sensor loop is not a place to abort a simulation from.
+
+    `tcut` (negative = none) is a hit the CALLER already holds: only a hit
+    strictly nearer is returned, and a mesh walk is cut there. The renderer
+    calls this one geom at a time (`render.trace_visual`, so it can skip
+    culled geoms) and passes its running best, which keeps the answer the one
+    a single call over the same geoms would give.
     """
     var best = Scalar[DTYPE](RAY_NO_HIT)
     var best_geom = -1
@@ -284,6 +291,11 @@ def ray_model[
                         bvhnum,
                         pnt,
                         vec,
+                        # The best hit so far (or the caller's): a mesh
+                        # BEHIND it is not walked (a tie keeps the earlier
+                        # geom, as the comparison below does, so the answer
+                        # cannot move).
+                        best if best >= 0 else tcut,
                     )
                     t = rb.t
                     n = rb.normal
@@ -375,7 +387,7 @@ def ray_model[
             t = r[0]
             n = r[1]
 
-        if t >= 0 and (best < 0 or t < best):
+        if t >= 0 and (best < 0 or t < best) and (tcut < 0 or t < tcut):
             best = t
             best_geom = g
             best_normal = n

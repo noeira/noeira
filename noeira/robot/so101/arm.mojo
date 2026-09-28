@@ -49,6 +49,7 @@ from noeira.robot.feetech.control_table import (
     STS_MIN_POSITION_LIMIT,
     STS_ACCELERATION,
     STS_OPERATING_MODE,
+    STS_PRESENT_LOAD,
     STS_PRESENT_POSITION,
     STS_PRESENT_VELOCITY,
     STS_RESOLUTION,
@@ -346,6 +347,18 @@ struct SO101Arm(Movable):
         """
         return self.bus.sync_read(
             STS_PRESENT_VELOCITY, SIZE_2, Span(self.ids), out_raw
+        )
+
+    def read_loads[
+        o: MutOrigin
+    ](mut self, out_raw: Span[Int32, o]) raises -> Int:
+        """All six present loads in one round trip: signed, in 0.1 % of the
+        servo's maximum torque (1000 = full), sign-magnitude at bit 10,
+        decoded by `sync_read` like the velocities. The sign is the direction
+        the servo pushes.
+        """
+        return self.bus.sync_read(
+            STS_PRESENT_LOAD, SIZE_2, Span(self.ids), out_raw
         )
 
     # ── writing ────────────────────────────────────────────────────────────

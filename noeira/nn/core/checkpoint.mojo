@@ -11,6 +11,17 @@ v3 (CURRENT — what every save now writes):
     S <dotted-name> <size>\n
     <size raw Scalar[DT] payload bytes>
     ...
+    K <name>\n                      (zero or more, AFTER every P/S section)
+    <8 raw Float64 bytes>
+
+`K` sections carry the training state that is not a tensor: ε, α, step
+counters, Adam's `t` and bias-correction powers (`CheckpointScalars`). Before
+they existed, v3 had nowhere to put a number, so four trainers stayed on v2 to
+append `key=value` lines and every v3 trainer lost that state on resume. The
+value is raw Float64 bytes, not text: `Float64(String)` reads one ULP low, and
+a step counter stored through `Scalar[DT]` (float32) stops counting at 2^24.
+A file with no `K` section is still a valid v3 file — its scalars are empty
+and every `get` returns the caller's default.
 
 v2 (LEGACY — still readable; loaders dispatch on the header line): identical
 section headers but one ASCII float per line. v2 hit its ceiling at DreamerV3
@@ -34,7 +45,7 @@ download on save / upload on load.
 from noeira.core.bytes import string_from_bytes
 
 from max.gpu.host import DeviceContext
-from std.memory import unsafe_memcpy
+from std.memory import bitcast, unsafe_memcpy
 from std.sys.info import size_of
 
 from noeira.io.fileio import read_file_bytes, write_file_atomic
@@ -78,6 +89,66 @@ def _bytes_append_vals(mut buf: List[UInt8], t: Tensor, n: Int):
     )
 
 
+def _bytes_append_f64(mut buf: List[UInt8], x: Float64):
+    var old = len(buf)
+    buf.resize(old + 8, 0)
+    var bits = bitcast[DType.uint64](x)
+    for i in range(8):
+        buf[old + i] = UInt8((bits >> UInt64(8 * i)) & 0xFF)
+
+
+struct CheckpointScalars(Copyable, Defaultable, Movable, Sized):
+    """The named non-tensor state of a checkpoint — one `K` section each.
+
+    Order is kept (sections are written in insertion order); `set` on an
+    existing name overwrites it rather than writing the name twice.
+    """
+    var names: List[String]
+    var values: List[Float64]
+
+    def __init__(out self):
+        self.names = List[String]()
+        self.values = List[Float64]()
+
+    def __len__(self) -> Int:
+        return len(self.names)
+
+    def _find(self, name: String) -> Int:
+        for i in range(len(self.names)):
+            if self.names[i] == name:
+                return i
+        return -1
+
+    def set(mut self, name: String, value: Float64) raises:
+        # A space or newline would split the `K <name>` header on load.
+        if name.byte_length() == 0 or " " in name or "\n" in name:
+            raise Error(
+                "checkpoint scalar: invalid name `" + name
+                + "` (empty, or holds a space / newline)"
+            )
+        var i = self._find(name)
+        if i >= 0:
+            self.values[i] = value
+            return
+        self.names.append(name)
+        self.values.append(value)
+
+    def set_int(mut self, name: String, value: Int) raises:
+        """Exact for |value| < 2^53 — every counter this tree keeps."""
+        self.set(name, Float64(value))
+
+    def has(self, name: String) -> Bool:
+        return self._find(name) >= 0
+
+    def get(self, name: String, default: Float64) -> Float64:
+        var i = self._find(name)
+        return self.values[i] if i >= 0 else default
+
+    def get_int(self, name: String, default: Int) -> Int:
+        var i = self._find(name)
+        return Int(self.values[i]) if i >= 0 else default
+
+
 def _is_v3_header(bytes: List[UInt8]) -> Bool:
     var tag = String("storage-ckpt v3")
     var tb = tag.as_bytes()
@@ -106,8 +177,18 @@ def _split_lines(content: String) -> List[String]:
     return lines^
 
 
-struct CheckpointWriter(ParamVisitor, ParamVisitorRT):
-    """Appends a named section per visited Param/State. `mode`: 0 = Param (P,
+struct LegacyV2CheckpointWriter(ParamVisitor, ParamVisitorRT):
+    """The v2 TEXT writer — kept ONLY to make v2 fixtures for the tests that
+    prove old files still load. Nothing in the library writes v2 any more:
+    use `BinaryCheckpointWriter` (+ `write_model`, `write_scalars`) or
+    `save_params` / `save_params_multi`.
+
+    ⚠ The name is the guard. Twelve trainers kept writing v2 after v3 landed
+    because this struct was still called `CheckpointWriter`, the obvious
+    name, and v3 had no place for their `key=value` scalars; the files were
+    3× larger, non-atomic, and truncated at 2 GiB.
+
+    Appends a named section per visited Param/State. `mode`: 0 = Param (P,
     with optional moments), 1 = State (S). `save_moments` gates m/v output."""
     var content: String
     var mode: Int
@@ -254,7 +335,7 @@ struct CheckpointReader(ParamVisitor, ParamVisitorRT):
     ) raises:
         self.visit_rt[target](name, param, grad, m, v, N, apply_decay, ctx)
 struct BinaryCheckpointWriter(ParamVisitor, ParamVisitorRT):
-    """V3 twin of `CheckpointWriter`: text section headers, raw-byte payloads.
+    """V3 twin of `LegacyV2CheckpointWriter`: text section headers, raw-byte payloads.
     `mode`: 0 = Param (P, with optional moments), 1 = State (S)."""
     var content: List[UInt8]
     var mode: Int
@@ -265,6 +346,13 @@ struct BinaryCheckpointWriter(ParamVisitor, ParamVisitorRT):
         _bytes_append_str(self.content, String("storage-ckpt v3\n"))
         self.mode = 0
         self.save_moments = save_moments
+
+    def write_scalars(mut self, scalars: CheckpointScalars):
+        """Append one `K` section per scalar. Call AFTER the last P/S section:
+        the reader walks the tensors first and only then reads the scalars."""
+        for i in range(len(scalars.names)):
+            _bytes_append_str(self.content, "K " + scalars.names[i] + "\n")
+            _bytes_append_f64(self.content, scalars.values[i])
 
     def visit_rt[target: StaticString](
         mut self, name: String, mut param: Tensor, mut grad: Tensor,
@@ -366,6 +454,32 @@ struct BinaryCheckpointReader(ParamVisitor, ParamVisitorRT):
         )
         self.cur += n * SB
 
+    def read_scalars(mut self) raises -> CheckpointScalars:
+        """Consume the trailing `K` sections. Call after the last tensor walk
+        and before `finish`. A file written before `K` existed has none, and
+        returns an empty set."""
+        var out = CheckpointScalars()
+        while self.cur < len(self.bytes):
+            var hdr = self._next_line()
+            var toks = hdr.split(" ")
+            if len(toks) != 2 or String(toks[0]) != "K":
+                raise Error(
+                    "checkpoint: section `" + hdr + "` left unread after "
+                    + String(self.seen) + " section(s) — only `K` scalar"
+                    " sections may follow the last tensor, so the file holds"
+                    " tensors this build does not walk (topology drift)"
+                )
+            if self.cur + 8 > len(self.bytes):
+                raise Error(
+                    "checkpoint: truncated scalar `" + String(toks[1]) + "`"
+                )
+            var bits = UInt64(0)
+            for i in range(8):
+                bits |= UInt64(self.bytes[self.cur + i]) << UInt64(8 * i)
+            self.cur += 8
+            out.set(String(toks[1]), bitcast[DType.float64](bits))
+        return out^
+
     def finish(self) raises:
         """Every byte accounted for — and the reason this is called at all.
 
@@ -450,28 +564,70 @@ struct BinaryCheckpointReader(ParamVisitor, ParamVisitorRT):
         ctx: Optional[DeviceContext],
     ) raises:
         self.visit_rt[target](name, param, grad, m, v, N, apply_decay, ctx)
+def write_model[
+    target: StaticString, M: ParamWalkable
+](
+    mut w: BinaryCheckpointWriter,
+    mut model: M,
+    ctx: Optional[DeviceContext],
+    prefix: String = String(""),
+) raises:
+    """One model's Param then State sections, names under `prefix`. A trainer
+    with several nets calls this once per net, then `write_scalars`, then
+    `_write_file_bytes` — and loads with `read_model` in the SAME order."""
+    w.mode = 0
+    walk_params[target](model, w, ctx, prefix)
+    w.mode = 1
+    var sref = ParamVisitorRef.of[type_of(w), target](w)
+    model.for_each_state[target](sref, ctx, prefix)
+
+
+def read_model[
+    target: StaticString, M: ParamWalkable
+](
+    mut r: BinaryCheckpointReader,
+    mut model: M,
+    ctx: Optional[DeviceContext],
+    prefix: String = String(""),
+) raises:
+    """Inverse of `write_model`. ⚠ The caller must still mention `r` after its
+    last `read_model` — `read_scalars` + `finish` do — or the reader can be
+    destroyed under the state pass (see `BinaryCheckpointReader.finish`)."""
+    r.mode = 0
+    walk_params[target](model, r, ctx, prefix)
+    r.mode = 1
+    var sref = ParamVisitorRef.of[type_of(r), target](r)
+    model.for_each_state[target](sref, ctx, prefix)
+
+
 def save_params[
     target: StaticString, M: ParamWalkable
 ](
     mut model: M, path: String,
     ctx: Optional[DeviceContext] = None,
     save_moments: Bool = True,
+    scalars: CheckpointScalars = CheckpointScalars(),
 ) raises:
-    """Write a v3 named checkpoint: Params (+ moments if populated) then States."""
+    """Write a v3 named checkpoint: Params (+ moments if populated), then
+    States, then one `K` section per entry of `scalars`."""
     var w = BinaryCheckpointWriter(save_moments)
     w.mode = 0
     walk_params[target](model, w, ctx)
     w.mode = 1
     var _sref1 = ParamVisitorRef.of[type_of(w), target](w)
     model.for_each_state[target](_sref1, ctx)
+    w.write_scalars(scalars)
     _write_file_bytes(path, w.content)
 
 
 def load_params[
     target: StaticString, M: ParamWalkable
-](mut model: M, path: String, ctx: Optional[DeviceContext] = None) raises:
+](
+    mut model: M, path: String, ctx: Optional[DeviceContext] = None
+) raises -> CheckpointScalars:
     """Load a named checkpoint (v3 binary, or legacy v2 text — dispatched on
-    the header line), validating names/sizes against `model`."""
+    the header line), validating names/sizes against `model`. Returns the
+    file's `K` scalars (empty for v2, and for a v3 file written without any)."""
     var bytes = _read_file_bytes(path)
     if _is_v3_header(bytes):
         var r = BinaryCheckpointReader(bytes^)
@@ -480,8 +636,9 @@ def load_params[
         r.mode = 1
         var _sref2 = ParamVisitorRef.of[type_of(r), target](r)
         model.for_each_state[target](_sref2, ctx)
+        var sc = r.read_scalars()
         r.finish()
-        return
+        return sc^
     # Legacy v2 text checkpoint.
     var content: String
     with open(path, "r") as f:
@@ -500,6 +657,7 @@ def load_params[
     var _sref3 = ParamVisitorRef.of[type_of(r), target](r)
     model.for_each_state[target](_sref3, ctx)
     r.finish()
+    return CheckpointScalars()
 
 
 def save_params_multi[
@@ -509,6 +667,7 @@ def save_params_multi[
     ctx: Optional[DeviceContext],
     save_moments: Bool,
     mut *models: *Ms,
+    scalars: CheckpointScalars = CheckpointScalars(),
 ) raises:
     """Write N models into ONE v3 checkpoint file: a single header, then each
     model's Param + State sections, in pack order. `load_params_multi` walks the
@@ -523,6 +682,7 @@ def save_params_multi[
         w.mode = 1
         var _sref4 = ParamVisitorRef.of[type_of(w), target](w)
         models[i].for_each_state[target](_sref4, ctx)
+    w.write_scalars(scalars)
     _write_file_bytes(path, w.content)
 
 
@@ -532,10 +692,11 @@ def load_params_multi[
     path: String,
     ctx: Optional[DeviceContext],
     mut *models: *Ms,
-) raises:
+) raises -> CheckpointScalars:
     """Load a single-file multi-model checkpoint written by `save_params_multi`
     (v3 binary, or legacy v2 text), walking the models in the same pack order
-    and validating each one's names/sizes against the file's sections."""
+    and validating each one's names/sizes against the file's sections. Returns
+    the file's `K` scalars (empty for v2)."""
     var bytes = _read_file_bytes(path)
     if _is_v3_header(bytes):
         var rb = BinaryCheckpointReader(bytes^)
@@ -545,7 +706,13 @@ def load_params_multi[
             rb.mode = 1
             var _sref5 = ParamVisitorRef.of[type_of(rb), target](rb)
             models[i].for_each_state[target](_sref5, ctx)
-        return
+        # ⚠ `finish` is also the mention that keeps `rb` alive through the last
+        # state pass — see `BinaryCheckpointReader.finish`. This path had no
+        # mention after the loop, so the last model's state pass walked a
+        # reader that was already destroyed.
+        var sc = rb.read_scalars()
+        rb.finish()
+        return sc^
     var content: String
     with open(path, "r") as f:
         content = String(f.read())
@@ -564,3 +731,4 @@ def load_params_multi[
         var _sref6 = ParamVisitorRef.of[type_of(r), target](r)
         models[i].for_each_state[target](_sref6, ctx)
         _ = r.cur  # keep `r` alive past the pointer hand-off; see finish()
+    return CheckpointScalars()

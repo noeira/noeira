@@ -57,12 +57,25 @@
 
        THE OVERHEAD CAMERA: plate face centre (28.94, 361.98, 0) in the top's
        frame, outward normal (0.4243, -0.9055, 0); entrance pupil 15.6 mm
-       along it (adapter 3 + standoffs 5 + PCB 1.6 + ~6 to the pupil, §4);
+       along it (adapter 3 + standoffs 5 + PCB 1.6 + ~6 to the pupil, §4;
+       19.0 measured since — the bake's `PUPIL_ALONG_NORMAL_MM` — and the
+       calibrated pose below supersedes the whole derivation);
        plus the (18.7, 188, 36.5) frame offset; y-up -> z-up. Image-up is
        FORWARD (the far edge of the desk at the top of the recorded frames),
        image-right is the robot's right (-y). `fovy` is the virtual pinhole
        the fisheye frames are undistorted to — 90° horizontal at 4:3, see
        `tools/soarm/bake_so_arm101_tower.py`.
+
+       ⚠⚠ THE CAMERA POSE IS NOW THE CALIBRATED ONE (2026-09-25), not the
+       STL derivation above, which put it at pos (0.05426, -0.0365, 0.53585),
+       xyaxes (0 -1 0  0.9055 0 0.4243). Fitted from 62 marker captures of
+       `calibrate_camera_extrinsics.mojo` (projects/so101-tower/cameras/
+       camera_overhead*.poses.txt, 2026-09-22 + 2026-09-25, nothing moved
+       between them): gripper FK from the raw ticks through the measured
+       zero (roll +5.0 included), the marker fixed at its photographed place
+       on the camera plate, the camera free. The derivation was off by
+       (+6.4, -3.5, +0.8) mm and 0.55 deg (leave-one-out sd 2-3 mm); the
+       ~9 mm camera-vs-arm offset the pose estimator saw was this.
 
        COLLISION is four boxes: the foot, the post, the head and the base
        plate. ⚠ THE POST IS INSIDE THE ARM'S SWING — it stands 10..13 cm to
@@ -99,9 +112,9 @@
             rgba="0.20 0.45 0.85 0.3" group="3"/>
       <geom name="plate" type="box" pos="0.045 0.0795 0.0025" size="0.045 0.0795 0.0025"
             rgba="0.20 0.45 0.85 0.3" group="3"/>
-      <!-- the overhead IMX335, see the header -->
-      <camera name="overhead_cam" pos="0.05426 -0.0365 0.53585"
-              xyaxes="0 -1 0  0.9055 0 0.4243" fovy="73.7398"/>
+      <!-- the overhead IMX335, CALIBRATED — see the header -->
+      <camera name="overhead_cam" pos="0.06067 -0.03998 0.53666"
+              xyaxes="0.0059 -1.0000 0.0069  0.9042 0.0083 0.4270" fovy="73.7398"/>
     </body>
   </worldbody>
 </mujoco>

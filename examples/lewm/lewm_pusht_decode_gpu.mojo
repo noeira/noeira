@@ -18,8 +18,14 @@ Loads the paper-width checkpoint `lewm_pusht_paper.ckpt`.
 
 Run (after the paper-width train run, NVIDIA — 224² is too heavy for Apple):
   pixi run -e nvidia mojo run -I . examples/lewm/lewm_pusht_decode_gpu.mojo
+  pixi run -e nvidia mojo run -I . examples/lewm/lewm_pusht_decode_gpu.mojo --ckpt <run_id>
 """
 
+from std.sys import argv
+from noeira.core.run import RunContext, register_run, resolve_checkpoint
+from noeira.core.run_session import finish_run, run_logger
+from noeira.io.artifact_sink import sink_for_run
+from noeira.deep_agents.training.checkpoint import announce_checkpoint
 from max.gpu.host import DeviceContext, DeviceBuffer
 from layout import TileTensor, row_major
 
@@ -76,7 +82,6 @@ comptime STEPS = 20_000
 comptime PRINT_EVERY = 500
 comptime VIZ_EVERY = 4_000
 comptime N_VIZ = 8                          # frames per reconstruction grid
-comptime DEC_CKPT: String = "/tmp/lewm_pusht_decoder.txt"
 
 comptime Trainer = LeWMTrainer[
     IN_CH, IMG, PATCH, HIDDEN, ENC_HEADS, ENC_LAYERS, EMB, ENC_PROJ_H,
@@ -95,7 +100,36 @@ def _p(b: DeviceBuffer[DT]) -> Pointer[Scalar[DT], MutAnyOrigin]:
     return rebind[Pointer[Scalar[DT], MutAnyOrigin]](b.unsafe_ptr())
 
 
+def _flag(name: String, dflt: String) raises -> String:
+    """Value of `--name X`, or `dflt` when the flag is absent."""
+    var av = argv()
+    for i in range(1, len(av)):
+        if String(av[i]) == name:
+            if i + 1 >= len(av):
+                raise Error("flag " + name + " needs a value")
+            return String(av[i + 1])
+    return dflt
+
+
 def main() raises:
+    var ckpt = resolve_checkpoint(_flag(String("--ckpt"), WM_CKPT), String("last"))
+    # ⚠ THE DECODER PROBE IS ITSELF A TRAINING RUN — it fits weights and keeps
+    # them — so it opens a run like any other: the decoder lands in
+    # `runs/<id>/checkpoints/`, beside its own metrics.csv and run.kv.
+    var run = RunContext(
+        project=String("lewm"),
+        driver=String("examples/lewm/lewm_pusht_decode_gpu.mojo"),
+        slug=String("lewm-pusht-decoder"),
+        env=String("builtin:pusht"),
+        dataset=ckpt,
+    )
+    var logger = run_logger(run)
+    logger.set_config("algorithm", "LeWM decoder probe")
+    logger.set_config("wm_checkpoint", ckpt)
+    register_run(run, logger)
+    var artifacts = sink_for_run(run.id, run.dir)
+    var dec_ckpt = run.checkpoint_path(String("decoder"))
+    print("run:", run.dir)
     print("=" * 70)
     print("LeWM nn — PushT reconstruction DECODER probe (frozen WM, GPU)")
     print("=" * 70)
@@ -104,8 +138,8 @@ def main() raises:
     var sampler = PushTOfflineSampler(frameskip=FRAMESKIP, num_steps=T)
     var src = Source.make(sampler^, ctx=ctx)
     var wm = Trainer.make(lam=Scalar[DT](0.09), lr=Scalar[DT](1e-3), ctx=ctx)
-    print("loading frozen WM checkpoint", WM_CKPT, "...")
-    wm.load_params(WM_CKPT)
+    print("loading frozen WM checkpoint", ckpt, "...")
+    wm.load_params(ckpt)
 
     var dec = Decoder.make(lr=Scalar[DT](1e-3), ctx=ctx)
     print("  decoder:", DEC_LAYERS, "layers, hid", DEC_HID, ", queries", N_Q,
@@ -188,8 +222,10 @@ def main() raises:
                 vmin=0.0, vmax=1.0,
             )
 
-    dec.save_params(DEC_CKPT)
-    print("decoder weights →", DEC_CKPT)
+    dec.save_params(dec_ckpt)
+    announce_checkpoint(dec_ckpt, artifacts, run.dir)
+    print("decoder weights →", dec_ckpt)
+    finish_run(run, logger, artifacts)
     _ = src^; _ = wm^; _ = dec^
     print("=" * 70)
     print("DONE — reconstruction grids in /tmp/lewm_pusht_recon_*.ppm")

@@ -87,6 +87,12 @@ from noeira.physics3d.gpu.constants import (
     META_IDX_PREV_X,
     META_IDX_TASK_ACTIVE,
     META_IDX_GOAL_HELD,
+    META_IDX_REWARD_MODE,
+    META_IDX_SUCCESS_BONUS,
+    META_IDX_PHI_PREV,
+    META_IDX_EPISODE_FLAGS,
+    EPISODE_FLAG_PHI_SET,
+    EPISODE_FLAG_BONUS_PAID,
     META_IDX_NUM_CONTACTS,
     CONTACT_IDX_BODY_A,
     CONTACT_IDX_BODY_B,
@@ -105,6 +111,8 @@ from .task_hooks import (
     repark_inactive_slots, write_task_obs, write_task_obs_host,
 )
 from .predicates import OP_NEAR, OP_ABOVE, OP_ON, OP_IN
+from .tape import TERM_WORDS
+from .shaping import near_transport_shortfall
 from noeira.envs.dm_control.rewards import (
     tolerance, SIGMOID_GAUSSIAN, DEFAULT_VALUE_AT_MARGIN,
 )
@@ -1158,7 +1166,7 @@ struct So101FamilyConfig[
         # predicate holds — so the band is [0, GOAL_RADIUS] and the margin
         # does the shaping. `SIGMOID_GAUSSIAN` and the default
         # `value_at_margin` match `SoArm101ReachConfig`.
-        var r = w_goal * tolerance[
+        var goal_t = tolerance[
             SIGMOID_GAUSSIAN, DEFAULT_VALUE_AT_MARGIN, DTYPE
         ](
             dist,
@@ -1166,6 +1174,13 @@ struct So101FamilyConfig[
             Scalar[DTYPE](Self.GOAL_RADIUS),
             m_goal,
         )
+        var r = w_goal * goal_t
+        # Each term's own value, for the potential-based mode below (the
+        # legacy sum `r` is accumulated exactly as it always was).
+        var reach_t = Scalar[DTYPE](0)
+        var grasp_b = Scalar[DTYPE](0)
+        var close_v = Scalar[DTYPE](0)
+        var has_hand = False
 
         # ⚠ THE REACH TERM READS THE FIRST TERM'S SUBJECT OUT OF THE TAPE.
         # `meta[TASK_PARAM_1]` is term 0's `a`, which for `Near`, `Above`,
@@ -1188,7 +1203,8 @@ struct So101FamilyConfig[
                 site_xpos[env, GS * 3 + 2]
             ) - rebind[Scalar[DTYPE]](xpos[env, sb * 3 + 2])
             var reach = sqrt(ex * ex + ey * ey + ez * ez)
-            r = r + w_reach * tolerance[
+            has_hand = True
+            reach_t = tolerance[
                 SIGMOID_GAUSSIAN, DEFAULT_VALUE_AT_MARGIN, DTYPE
             ](
                 reach,
@@ -1196,6 +1212,7 @@ struct So101FamilyConfig[
                 Scalar[DTYPE](Self.REACH_RADIUS),
                 m_reach,
             )
+            r = r + w_reach * reach_t
             # ── the grasp rung — see `SHAPE_W_GRASP` ─────────────────────
             comptime if Self.GRASP_W > 0.0:
                 var ncon = Int(
@@ -1218,6 +1235,7 @@ struct So101FamilyConfig[
                         if other == Self.JAW_BODY:
                             on_jaw = True
                 if on_grip and on_jaw:
+                    grasp_b = Scalar[DTYPE](1)
                     r = r + Scalar[DTYPE](Self.GRASP_W)
             # ── the closing bonus — see `SHAPE_W_CLOSE` ──────────────────
             comptime if Self.CLOSE_W > 0.0:
@@ -1230,7 +1248,110 @@ struct So101FamilyConfig[
                         closed = Scalar[DTYPE](0)
                     if closed > Scalar[DTYPE](1):
                         closed = Scalar[DTYPE](1)
+                    close_v = closed
                     r = r + Scalar[DTYPE](Self.CLOSE_W) * closed
+
+        # ── the POTENTIAL-BASED mode (`META_IDX_REWARD_MODE == 1`) ─────────
+        #
+        # ⚠⚠ WHY. Every term above is a RAW PER-STEP value, so a state that
+        # saturates some of them before the goal holds pays their sum every
+        # step for the rest of the episode — the grasped brick held OVER the
+        # bowl collects reach + grasp + close + most of the goal term, forever,
+        # which can beat finishing. so101-nexus hit exactly this on its
+        # pick-and-place ("hover a grasped object above the goal") and fixed it
+        # with potential-based shaping (Ng, Harada & Russell, ICML 1999):
+        # pay the CHANGE of a potential Phi, which telescopes over an episode
+        # to Phi(end) - Phi(start), so dwelling anywhere short of the goal pays
+        # ~0 per step. `noeira-docs/SO101_PIXEL_RL_PLAN.md`.
+        #
+        #   Phi   = w_goal goal + w_reach max(reach, H) + GRASP_W max(grasp, H)
+        #           + CLOSE_W max(close, H)                 H = the goal holds
+        #   r     = Phi - Phi_prev            (0 on an episode's first step)
+        #   r     = W = the weights' sum       while the goal holds
+        #         + SUCCESS_BONUS              once, on the first such step
+        #
+        # ⚠ THE HAND TERMS ARE HELD UP BY H, so releasing the brick in the bowl
+        # and backing off — mandatory forward progress — pays no negative
+        # delta (nexus's `place_grasp_potential` / `place_reach_potential`).
+        # Leaving the goal pays `Phi - W`, negative, as a real regression must.
+        # ⚠ WHILE IT HOLDS THE STEP PAYS THE FULL BUDGET, the global maximum of
+        # a step (ManiSkill's `reward[success] = max`, nexus's
+        # `RewardConfig.compute`), so staying solved beats every other state —
+        # which is what a fixed-horizon episode needs to learn to HOLD.
+        # ⚠ THE LEGACY MODE IS THE ZERO WORD: nothing below runs and `meta` is
+        # not written, so every run and recorder before this block is
+        # bit-identical.
+        var mode = Int(rebind[Scalar[DTYPE]](meta[env, META_IDX_REWARD_MODE]))
+        if mode == 1:
+            var hh = Scalar[DTYPE](1) if holds else Scalar[DTYPE](0)
+            # ⚠ A SINGLE `Near` GOAL IS MEASURED AS A TRANSPORT DISTANCE here
+            # (`shaping.near_transport_shortfall`): the 3D shortfall the
+            # legacy term uses pays negative for lifting the brick off the
+            # desk, which `cube_in_bowl` needs to clear the bowl's rim.
+            var goal_pot = goal_t
+            var op_near = Int(
+                rebind[Scalar[DTYPE]](meta[env, META_IDX_TASK_PARAM_0])
+            )
+            var op_next = Int(
+                rebind[Scalar[DTYPE]](meta[env, META_IDX_TASK_PARAM_0 + TERM_WORDS])
+            )
+            if op_near == OP_NEAR and op_next < 0:
+                var na = Int(rebind[Scalar[DTYPE]](meta[env, META_IDX_TASK_PARAM_0 + 1]))
+                var nb = Int(rebind[Scalar[DTYPE]](meta[env, META_IDX_TASK_PARAM_0 + 2]))
+                var nr = rebind[Scalar[DTYPE]](meta[env, META_IDX_TASK_PARAM_0 + 3])
+                var tsf = near_transport_shortfall[DTYPE](
+                    rebind[Scalar[DTYPE]](xpos[env, na * 3]) - rebind[Scalar[DTYPE]](xpos[env, nb * 3]),
+                    rebind[Scalar[DTYPE]](xpos[env, na * 3 + 1]) - rebind[Scalar[DTYPE]](xpos[env, nb * 3 + 1]),
+                    rebind[Scalar[DTYPE]](xpos[env, na * 3 + 2]) - rebind[Scalar[DTYPE]](xpos[env, nb * 3 + 2]),
+                    nr,
+                )
+                goal_pot = tolerance[
+                    SIGMOID_GAUSSIAN, DEFAULT_VALUE_AT_MARGIN, DTYPE
+                ](
+                    tsf,
+                    Scalar[DTYPE](0),
+                    Scalar[DTYPE](Self.GOAL_RADIUS),
+                    m_goal,
+                )
+                # ⚠⚠ AND IT COUNTS ONLY WHILE THE BRICK IS GRASPED (or the
+                # goal holds) — ManiSkill's `place x grasped`. Ungated, a
+                # PUSH moves the brick toward the bowl as well as a carry
+                # does and is far easier: both PPO arms (26 Sep, 5M) lifted
+                # the brick in 9 and 7 of 1024 greedy episodes and reached
+                # over the bowl in NONE, their ~2 % "success" being pushes
+                # that grazed the radius (3 and 6 still held at the end).
+                comptime if Self.GRASP_W > 0.0:
+                    if has_hand:
+                        var gate = grasp_b if grasp_b > hh else hh
+                        goal_pot = goal_pot * gate
+            var phi = w_goal * goal_pot
+            var wsum = w_goal
+            if has_hand:
+                var rt = reach_t if reach_t > hh else hh
+                var gb = grasp_b if grasp_b > hh else hh
+                var cv = close_v if close_v > hh else hh
+                phi = phi + w_reach * rt + Scalar[DTYPE](Self.GRASP_W) * gb
+                phi = phi + Scalar[DTYPE](Self.CLOSE_W) * cv
+                wsum = wsum + w_reach + Scalar[DTYPE](Self.GRASP_W)
+                wsum = wsum + Scalar[DTYPE](Self.CLOSE_W)
+            var flags = Int(
+                rebind[Scalar[DTYPE]](meta[env, META_IDX_EPISODE_FLAGS])
+            )
+            var rp = Scalar[DTYPE](0)
+            if (flags & EPISODE_FLAG_PHI_SET) != 0:
+                rp = phi - rebind[Scalar[DTYPE]](meta[env, META_IDX_PHI_PREV])
+            if holds:
+                rp = wsum
+                if (flags & EPISODE_FLAG_BONUS_PAID) == 0:
+                    rp = rp + rebind[Scalar[DTYPE]](
+                        meta[env, META_IDX_SUCCESS_BONUS]
+                    )
+                    flags = flags | EPISODE_FLAG_BONUS_PAID
+            meta[env, META_IDX_PHI_PREV] = phi
+            meta[env, META_IDX_EPISODE_FLAGS] = Scalar[DTYPE](
+                flags | EPISODE_FLAG_PHI_SET
+            )
+            r = rp
         _ = qpos
         _ = qvel
         _ = xipos

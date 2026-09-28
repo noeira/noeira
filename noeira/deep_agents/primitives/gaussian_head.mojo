@@ -178,11 +178,20 @@ struct GaussianHead[IN: Int, ACT: Int](Module):
         mut self, value: Scalar[DT], ctx: Optional[DeviceContext] = None
     ) raises:
         """Override the log_std initialization. Call after `make`. Fills the
-        host `.data` and (on GPU) re-uploads to the device buffer."""
+        host `.data` and (on GPU) writes it into the EXISTING device buffer.
+
+        ⚠⚠ `upload_resident`, NOT `upload`. `Tensor.upload` REALLOCATES the
+        device buffer on every call, and by the time a caller can reach this
+        (after `make`) the trainer's Adam has already ADOPTED the old buffer
+        into its arena. With `upload` the forward read the new buffer — frozen
+        at `value` — while Adam updated the old one, so the log-std never
+        learned: the first GPU PPO run on the tower (2026-09-26) logged its
+        entropy at exactly the init value, 2.5136 for 6 joints at -1, after 640
+        updates. No GPU caller existed before that run."""
         for k in range(Self.LS_SIZE):
             self.log_std.val.data[k] = value
         comptime if target == "gpu":
-            self.log_std.val.upload(ctx.value())
+            self.log_std.val.upload_resident(ctx.value())
 
     # ----- Forward ---------------------------------------------------------
 

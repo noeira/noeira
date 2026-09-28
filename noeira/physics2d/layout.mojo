@@ -250,7 +250,7 @@ comptime LunarLanderLayout = PhysicsLayout[
     MAX_JOINTS=2,
     MAX_TERRAIN_EDGES=16,
     OBS_DIM=8,
-    METADATA_SIZE=4,
+    METADATA_SIZE=5,  # step_count, total_reward, prev_shaping, done, sleep_time
     NUM_SHAPES=3,
 ]
 

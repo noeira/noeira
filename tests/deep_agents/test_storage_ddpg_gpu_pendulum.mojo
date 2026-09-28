@@ -84,11 +84,11 @@ def main() raises:
         )
 
         var m = agent.flush_metrics()
-        print("  DIAG actor_loss =", m.actor_loss.to_f64())
+        print("  DIAG actor_loss =", m.policy_loss.to_f64())
         print("  DIAG critic_loss=", m.critic_loss.to_f64())
         print("  DIAG mean_q     =", m.mean_q.to_f64())
         print("  DIAG mean_target=", m.mean_target.to_f64())
-        print("  DIAG mean_reward=", m.mean_reward.to_f64())
+        print("  DIAG mean_reward=", m.reward_mean.to_f64())
         print("  DIAG train_steps=", m.train_steps.to_f64())
         print("  DIAG n_updates  =", m.n_updates.to_f64())
 
@@ -104,7 +104,7 @@ def main() raises:
             m.mean_target.to_f64() != 0.0, "GPU mean_target populated (not 0.0)"
         )
         assert_true(
-            m.mean_reward.to_f64() != 0.0, "GPU mean_reward populated (not 0.0)"
+            m.reward_mean.to_f64() != 0.0, "GPU mean_reward populated (not 0.0)"
         )
 
         # Greedy eval is informational only (known Apple B=1 issue).

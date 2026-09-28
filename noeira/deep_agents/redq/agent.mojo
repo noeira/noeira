@@ -264,9 +264,10 @@ struct REDQAgent[
     # ─── Checkpointing (delegates to trainer.save_state / load_state) ─
 
     def save(mut self, path: String) raises:
-        """One-file `nn-ckpt v2` envelope: actor + N onlines + actor_opt
-        + N critic Adams + alpha_opt. Targets reconstructed via
-        hard-copy on load. Replay buffer + episode tracker not saved."""
+        """One v3 `storage-ckpt` file: actor + N online critics, with α's
+        optimizer and the step counter as `K` scalars. Targets reconstructed
+        via hard-copy on load. Network optimizers, replay buffer and episode
+        tracker not saved."""
         self.trainer.save_state(path)
 
     def load(mut self, path: String) raises:

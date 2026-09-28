@@ -107,6 +107,22 @@ build-jetson = { cmd = "mojo build -I . --target-accelerator sm_87", description
 act-deploy-jetson = { cmd = "mojo build -I . --target-accelerator sm_87 -DACT_GPU=1 -o /tmp/act_deploy_gpu examples/so101/act_so101_deploy_real.mojo && /tmp/act_deploy_gpu", depends-on = ["build-serial", "build-opencv"], description = "ACT on the Orin's GPU (-- --project P; --arm to move it)" }
 act-deploy-jetson-cpu = { cmd = "mojo build -I . --target-accelerator sm_87 -o /tmp/act_deploy_cpu examples/so101/act_so101_deploy_real.mojo && /tmp/act_deploy_cpu", depends-on = ["build-serial", "build-opencv"], description = "The same policy on the Orin's CPU — the other half of the A/B" }
 
+# The SIM-TRAINED pixel student (DAgger from a state PPO teacher) on the arm —
+# the sim-to-real test. CPU inference: the net is ~2 MFLOP at batch 1. Promote
+# a run first: tools/project/promote_pixel_student.sh RUN_ID pixel_lift
+#   pixi run -e jetson pixel-deploy-jetson -- --role pixel_lift --snap /tmp/px_snap
+#   pixi run -e jetson pixel-deploy-jetson -- --role pixel_lift --arm --seconds 20
+pixel-deploy-jetson = { cmd = "mojo build -I . --target-accelerator sm_87 -o /tmp/pixel_deploy examples/so101/pixel_student_deploy_real.mojo && /tmp/pixel_deploy", depends-on = ["build-serial", "build-opencv"], description = "The sim-trained pixel student on the arm (-- --role R; --arm to move it)" }
+# the same for a 32x32 student that sees its joint velocities (the build must
+# match the student: the manifest refuses a mismatch before anything moves)
+pixel-deploy-jetson-v32 = { cmd = "mojo build -I . --target-accelerator sm_87 -D DAGGER_PX_32 -D DAGGER_JOINT_VEL -o /tmp/pixel_deploy_v32 examples/so101/pixel_student_deploy_real.mojo && /tmp/pixel_deploy_v32", depends-on = ["build-serial", "build-opencv"], description = "A 32x32 joint-velocity pixel student on the arm (-- --role R; --arm to move it)" }
+# ... and a WINDOWED one (-D DAGGER_WINDOW: the overhead's workspace window,
+# the domain-randomised students)
+pixel-deploy-jetson-wv32 = { cmd = "mojo build -I . --target-accelerator sm_87 -D DAGGER_WINDOW -D DAGGER_PX_32 -D DAGGER_JOINT_VEL -o /tmp/pixel_deploy_wv32 examples/so101/pixel_student_deploy_real.mojo && /tmp/pixel_deploy_wv32", depends-on = ["build-serial", "build-opencv"], description = "A windowed 32x32 joint-velocity pixel student on the arm (-- --role R; --arm to move it)" }
+# ... and one that also sees its last 3 executed actions (-D TASK_PPO_ACT_HIST=3:
+# the students trained under the servo lag, which need to know what is in flight)
+pixel-deploy-jetson-wv32h3 = { cmd = "mojo build -I . --target-accelerator sm_87 -D DAGGER_WINDOW -D DAGGER_PX_32 -D DAGGER_JOINT_VEL -D TASK_PPO_ACT_HIST=3 -o /tmp/pixel_deploy_wv32h3 examples/so101/pixel_student_deploy_real.mojo && /tmp/pixel_deploy_wv32h3", depends-on = ["build-serial", "build-opencv"], description = "A windowed 32x32 joint-velocity pixel student with action history on the arm (-- --role R; --arm to move it)" }
+
 # ── SmolVLA on the board ───────────────────────────────────────────────────
 # ⚠⚠ MEASURE THE QUERY FIRST. `smolvla-probe-jetson` times one `select_action`;
 # the deployment's whole loop shape rests on comparing that against the 1.667 s
@@ -198,6 +214,13 @@ imageio-ffmpeg = ">=0.6.0,<0.7"
 # natural cleanup now that neither imports it — would take `ffmpeg` with it and
 # break both, at runtime, on a machine where it used to work.
 ffmpeg = ">=7,<9"
+# ⚠ DECLARED, NOT TRANSITIVE — the same rule again. libSDL3 (and its headers,
+# which `scripts/build_imgui.sh` compiles against) reached this environment
+# only because conda-forge's `sdl2` is now sdl2-compat, built on SDL3, pulled
+# in by pygame and ffmpeg. `noeira/render/sdl` dlopens it from $CONDA_PREFIX,
+# so the docs can say "pixi installs it" — which stops being true the day
+# either of those drops sdl2. Ubuntu 24.04 has no SDL3 package to fall back on.
+sdl3 = ">=3.2.22,<4"
 # Used by `noeira/data/lerobot.mojo` to fetch a dataset from the HuggingFace
 # Hub. Present as /usr/bin/curl on macOS and most Linux images, absent from
 # slim containers; declared so the import path does not depend on the base
@@ -365,6 +388,11 @@ build-serial = { cmd = "bash scripts/build_serial.sh", description = "Build the 
 # catalog, the HF downloader and the MNIST / TinyShakespeare loaders — i.e.
 # of every remaining network call in the tree, none of which touch Python.
 build-http = { cmd = "bash scripts/build_http.sh", description = "Build the HTTP shim (noeira/io/http.mojo)" }
+# What a run's RemoteLogger could not deliver live (an outage still going at
+# close, one past its memory cap, a payload the server rejected) is spooled to
+# `<run dir>/remote.spool` or `logs/remote_spool/<run_id>.spool`. This sends
+# it; no argument means every spool under logs/ and projects/.
+logger-replay = { cmd = "mojo run -I . tools/logger/replay_spool.mojo", description = "Replay RemoteLogger spool files into the monitor: logger-replay [spool...]" }
 # qhull shim for `noeira/physics3d/collision/`. MuJoCo does not implement a
 # convex hull — `MakeGraph` CALLS qhull and walks `FORALLfacets`, and that
 # order decides every polygon normal. Prerequisite of any MESH model.
@@ -378,6 +406,7 @@ build-http = { cmd = "bash scripts/build_http.sh", description = "Build the HTTP
 # than `mojo run` -- it links ResNet-free but still takes ~40 s to compile.
 camera-studio = { cmd = "mojo run -I . examples/vision/camera_studio.mojo", depends-on = ["build-imgui", "build-opencv"], description = "Live camera + ArUco playground (examples/vision/camera_studio.mojo)" }
 build-opencv = { cmd = "bash scripts/build_opencv.sh", description = "Build the OpenCV shim (noeira/vision/opencv/)" }
+calibrate-fisheye = { cmd = "mojo run -I . examples/vision/calibrate_fisheye.mojo", depends-on = ["build-opencv"], description = "Headless fisheye intrinsics for a rig camera (-- --camera /dev/soarm_cam_overhead --name overhead --preview); runs over SSH"}
 build-qhull = { cmd = "bash scripts/build_qhull.sh", description = "Build the qhull shim (noeira/physics3d/collision/)" }
 # The SO-101 hardware gate: dump both arms from Mojo, diff against
 # `tools/soarm/so101_diag.py` (Python + lerobot). Read-only — writes no
@@ -423,6 +452,7 @@ libero-demo-import = { cmd = "mojo run -I . examples/libero/libero_demo_import.m
 libero-demo-rerender = { cmd = "mojo run -I . examples/libero/libero_demo_rerender.mojo", description = "L7a: every demo state re-rendered through OUR two cameras on the device (128x128, 4x MSAA, the demo's fixtures) into build/demos/<suite>.rendered.h5 with a qpos column, frame r = state r; PSNR vs the recording and the frame alignment are asserted; args: [--demos N] [--tasks a,b] [--out F] [--no-compare]" }
 libero-act-train = { cmd = "mojo run -I . examples/libero/libero_act_train.mojo", description = "L7b: ACT on LIBERO's demonstrations (2 cameras, ImageNet ResNet18, K = 2 s) from the rendered store; writes runs/<id>/checkpoints/{best,last}.ckpt + norm.json; env: ACT_STORE, ACT_STEPS, ACT_PRETRAINED, ACT_NO_MONITOR" }
 libero-act-inspect = { cmd = "mojo run -I . examples/libero/libero_act_inspect.mojo", description = "What an ACT checkpoint predicts for one store episode, position by position: the chunk's spread across its 40 positions beside the recorded chunk's, and the query / decoder / action-head nodes' spread — flat means the policy drives with the chunk mean; args: --act DIR --store PATH [--ckpt best|last] [--ep E] [--stride S] [--rows N] [--no-load]" }
+act-so101-inspect = { cmd = "mojo run -I . examples/so101/act_so101_inspect.mojo", description = "What an SO-101 ACT checkpoint predicts for one store episode, position by position: flat chunks (the pre-21-Sep decoder) mean do not arm the robot; args: --act DIR --store PATH [--ckpt best|last] [--ep E] [--stride S] [--rows N]" }
 osc-control-batched = { cmd = "mojo run -I . tests/libero/test_osc_control_batched.mojo", description = "L6 gate: the OSC control STAGE over 8 lanes and 3 control steps against OscPose — the sequence (refresh, set_goal on substep 0 only, run, gripper), not the torque law" }
 libero-osc-env = { cmd = "mojo run -I . tests/libero/test_libero_osc_env.mojo", description = "L6: the batched libero_goal env with OSC_POSE — config arithmetic + the model record; the stepping leg needs NVIDIA" }
 libero-osc-batched = { cmd = "mojo run -I . examples/libero/libero_osc_batched.mojo", description = "L6 driver (NVIDIA ONLY — Metal cannot compile the metallib at nv=37): step the batched libero_goal env under OSC_POSE; args: [n_control_steps]" }
@@ -446,6 +476,8 @@ project-prune = { cmd = "mojo run -I . tools/project/project_cli.mojo prune", de
 project-promote = { cmd = "mojo run -I . tools/project/project_cli.mojo promote", description = 'Promote a run checkpoint to a named role: project-promote <run_id> best --as reach --note "..."' }
 project-push = { cmd = "mojo run -I . tools/project/project_cli.mojo push", description = "Send a project's run artifacts to the monitor (needs NOEIRA_CLOUD_*)" }
 project-pull = { cmd = "mojo run -I . tools/project/project_cli.mojo pull", description = "Bring a run's artifacts back onto this box (needs NOEIRA_CLOUD_*)" }
+project-rerun = { cmd = "mojo run -I . tools/project/project_cli.mojo rerun", description = "How to run a run again exactly (commit, patch, command): project-rerun <run_id> [--exec]" }
+project-resume = { cmd = "mojo run -I . tools/project/project_cli.mojo resume", description = "Continue a run from its last checkpoint with its own arguments: project-resume <run_id> [--from last] [--dry-run]" }
 run-tag = { cmd = "mojo run -I . tools/project/project_cli.mojo tag", description = 'Tag a run: run-tag <run_id> "free text"' }
 
 # Record teleoperation into a LeRobot v3 dataset. ⚠ SAFE BY DEFAULT: without
@@ -480,6 +512,7 @@ soarm-tower-record = { cmd = "mojo run -I . examples/so101/tower_teleop_record.m
 soarm-tower-expert = { cmd = "mojo run -I . examples/so101/tower_expert_record.mojo", description = "Generate so101_tower demonstrations with a scripted IK expert (-- [task] --episodes N --noise SIGMA --seed S)" }
 soarm-tower-replay = { cmd = "mojo run -I . examples/so101/tower_demo_viewer.mojo", depends-on = ["build-imgui"], description = "Replay a so101_tower .demo file in the 3D viewer, posed from the recorded states (-- FILE.demo [--episode K] [--speed X] [--loop])" }
 soarm-tower-probe = { cmd = "mojo run -I . examples/so101/tower_policy_probe.mojo", description = "Probe a so101_tower SAC checkpoint: teacher-forced L1 on a .demo file, closed-loop episodes from fresh placements, step-by-step replay of one demo (-- --ckpt F --demos F [--replay-episode K [--open-loop]])" }
+soarm-tower-rerender = { cmd = "mojo run -I . examples/so101/tower_demo_rerender.mojo", description = "Render so101_tower .demo files through the rig's two cameras into an ACT store in the real dataset's layout (LeRobot units, overhead + wrist 240x320) (-- --demos a.demo[,b.demo] [--out F] [--episodes N])" }
 soarm-tower-preview = { cmd = "mojo run -I . examples/so101/tower_camera_preview.mojo", description = "Render the so101_tower family's wrist and overhead cameras at a recorded state (-- --state deg,.. --out-dir DIR)" }
 soarm-calibrate-extrinsics = { cmd = "mojo run -I . examples/so101/calibrate_camera_extrinsics.mojo", depends-on = ["build-serial", "build-opencv", "build-imgui"], description = "Fit the camera -> robot-base transform (never energises the arm)" }
 # Run a trained ACT policy on the follower, from the two live cameras.

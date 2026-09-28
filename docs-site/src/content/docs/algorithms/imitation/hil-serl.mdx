@@ -6,6 +6,7 @@ description: SAC that learns from demonstrations and corrections — a pinned de
 import Maturity from '~/components/Maturity.astro';
 import Paper from '~/components/Paper.astro';
 import Papers from '~/components/Papers.astro';
+import HilSerlReplay from '~/components/diagrams/HilSerlReplay.astro';
 
 <Maturity level="beta" note="Runs in simulation on the SO-101 tower family and produced the first learned lift there. Not yet run on the real arm." />
 
@@ -59,6 +60,8 @@ overwrites them. The sampler then draws `BATCH/2` rows from the prefix and
 The mixed-index kernel (`noeira/data/replay_gpu.mojo`) keeps the demo count on
 the device, so the step stays CUDA-graph capturable.
 
+<HilSerlReplay />
+
 **An optional BC term.** `--bc-weight λ` adds an L1 penalty
 `λ · |tanh(mu(s)) − a|` on the demo half of every batch to the SAC actor loss
 (`SACActorLoss.set_bc`, `noeira/deep_agents/sac/actor_loss.mojo`). HIL-SERL
@@ -97,8 +100,9 @@ pixi run -e apple mojo run -I . examples/tasks/sac_tower_gpu.mojo so101_tower_li
 | `--init CKPT` | load actor and critics from a checkpoint (the second half of a warm start) |
 | `--warmup N` | random-action steps before learning. HIL-SERL starts learning after ~100 steps because the demos already cover the space; the driver warns if it is left at the default |
 
-The run logs `cfg/demo_rows` and `cfg/demo_mean_reward`. Early on, the demos'
-mean reward should sit above the online `mean_reward`; if it does not, the
+The run records `demo_rows` and `demo_mean_reward` in its config
+(`metrics.config.kv`, beside `metrics.csv`). Early on, the demos'
+mean reward should sit above the online `reward_mean`; if it does not, the
 demos are not showing the policy anything better than what it already does.
 A `.demo` file recorded on another family is refused by its widths.
 

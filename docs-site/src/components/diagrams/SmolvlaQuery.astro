@@ -1,0 +1,174 @@
+---
+/**
+ * SmolvlaQuery — one SmolVLA query: a prefix computed once, a suffix denoised
+ * ten times.
+ *
+ * The two dashed groups are the whole cost model. Everything in the top group
+ * — SigLIP, the connector, sixteen SmolLM2 layers — runs once and leaves its
+ * keys and values in a cache; the bottom group is the expert, which runs once
+ * per Euler step against that cache. That split is why the prefix is where a
+ * fine-tune's vision cache pays, and why the expert's attention kernels were
+ * the ones worth speeding up.
+ *
+ * The Euler step subtracts: t runs from 1 (noise) to 0 (actions), so dt is
+ * negative. `noeira/deep_agents/smolvla/flow.mojo` explains why the sign is a
+ * silent failure if flipped.
+ */
+
+const IN_X = 30;
+const IN_W = 150;
+
+/** Rows of the prefix inputs. */
+const ROWS = { cam: 78, text: 156, state: 226 };
+
+const LM = { x: 560, y: 48, w: 150, h: 208 };
+const CACHE = { x: 740, y: 118, w: 120, h: 68 };
+const CACHE_MID = CACHE.x + CACHE.w / 2;
+
+/** The suffix row. */
+const SUF_Y = 362;
+const EXPERT = { x: 250, y: SUF_Y - 42, w: 230, h: 84 };
+const EXPERT_MID = EXPERT.x + EXPERT.w / 2;
+const EULER = { x: 540, y: SUF_Y - 32, w: 160, h: 64 };
+const EULER_MID = EULER.x + EULER.w / 2;
+
+/** Where the cached K/V crosses from the prefix group to the suffix group. */
+const KV_Y = 294;
+---
+
+<figure class="diagram not-content">
+	<svg viewBox="0 0 880 460" role="img"
+		aria-label="SmolVLA query: two camera images through SigLIP and a pixel-shuffle connector, the tokenised instruction and a state token pass once through SmolLM2, whose keys and values are cached; the action expert then denoises a 50-step chunk from Gaussian noise in 10 Euler steps, cross-attending to the cache">
+		<defs>
+			<marker id="sv-cyan" viewBox="0 0 10 10" refX="9" refY="5"
+				markerWidth="6" markerHeight="6" orient="auto-start-reverse">
+				<path d="M 0 0 L 10 5 L 0 10 z" class="dg-fill-cyan" />
+			</marker>
+			<marker id="sv-spark" viewBox="0 0 10 10" refX="9" refY="5"
+				markerWidth="6" markerHeight="6" orient="auto-start-reverse">
+				<path d="M 0 0 L 10 5 L 0 10 z" class="dg-fill-spark" />
+			</marker>
+			<marker id="sv-purple" viewBox="0 0 10 10" refX="9" refY="5"
+				markerWidth="6" markerHeight="6" orient="auto-start-reverse">
+				<path d="M 0 0 L 10 5 L 0 10 z" class="dg-fill-purple" />
+			</marker>
+			<marker id="sv-green" viewBox="0 0 10 10" refX="9" refY="5"
+				markerWidth="6" markerHeight="6" orient="auto-start-reverse">
+				<path d="M 0 0 L 10 5 L 0 10 z" class="dg-fill-green" />
+			</marker>
+		</defs>
+
+		<!-- ── the prefix: once per query ─────────────────────────────── -->
+		<rect class="dg-group" x="12" y="30" width="856" height="244" rx="12" />
+		<text x="24" y="20" class="dg-label dg-label--muted">prefix — once per query, frozen in the fine-tune</text>
+
+		<g class="dg-node dg-node--cyan">
+			<rect x={IN_X} y={ROWS.cam - 28} width={IN_W} height="56" rx="10" />
+			<text x={IN_X + IN_W / 2} y={ROWS.cam - 4} class="dg-title">2 cameras</text>
+			<text x={IN_X + IN_W / 2} y={ROWS.cam + 16} class="dg-sub">512 × 512</text>
+		</g>
+		<path class="dg-edge dg-edge--cyan" marker-end="url(#sv-cyan)"
+			d={`M ${IN_X + IN_W} ${ROWS.cam} L 208 ${ROWS.cam}`} />
+		<g class="dg-node dg-node--purple">
+			<rect x="210" y={ROWS.cam - 28} width="150" height="56" rx="10" />
+			<text x="285" y={ROWS.cam - 4} class="dg-title">SigLIP</text>
+			<text x="285" y={ROWS.cam + 16} class="dg-sub">12 layers</text>
+		</g>
+		<path class="dg-edge dg-edge--purple" marker-end="url(#sv-purple)"
+			d={`M 360 ${ROWS.cam} L 388 ${ROWS.cam}`} />
+		<g class="dg-node dg-node--muted">
+			<rect x="390" y={ROWS.cam - 28} width="140" height="56" rx="10" />
+			<text x="460" y={ROWS.cam - 4} class="dg-title">shuffle ×4</text>
+			<text x="460" y={ROWS.cam + 16} class="dg-sub">64 tokens / image</text>
+		</g>
+		<path class="dg-edge dg-edge--cyan" marker-end="url(#sv-cyan)"
+			d={`M 530 ${ROWS.cam} L ${LM.x - 2} ${ROWS.cam}`} />
+
+		<g class="dg-node dg-node--cyan">
+			<rect x={IN_X} y={ROWS.text - 28} width={IN_W} height="56" rx="10" />
+			<text x={IN_X + IN_W / 2} y={ROWS.text - 4} class="dg-title">instruction</text>
+			<text x={IN_X + IN_W / 2} y={ROWS.text + 16} class="dg-sub">tokenised text</text>
+		</g>
+		<path class="dg-edge dg-edge--cyan" marker-end="url(#sv-cyan)"
+			d={`M ${IN_X + IN_W} ${ROWS.text} L ${LM.x - 2} ${ROWS.text}`} />
+
+		<g class="dg-node dg-node--cyan">
+			<rect x={IN_X} y={ROWS.state - 28} width={IN_W} height="56" rx="10" />
+			<text x={IN_X + IN_W / 2} y={ROWS.state - 4} class="dg-title">joint state</text>
+			<text x={IN_X + IN_W / 2} y={ROWS.state + 16} class="dg-sub">1 token</text>
+		</g>
+		<path class="dg-edge dg-edge--cyan" marker-end="url(#sv-cyan)"
+			d={`M ${IN_X + IN_W} ${ROWS.state} L ${LM.x - 2} ${ROWS.state}`} />
+
+		<g class="dg-node dg-node--purple">
+			<rect x={LM.x} y={LM.y} width={LM.w} height={LM.h} rx="10" />
+			<text x={LM.x + LM.w / 2} y={LM.y + LM.h / 2 - 4} class="dg-title">SmolLM2</text>
+			<text x={LM.x + LM.w / 2} y={LM.y + LM.h / 2 + 18} class="dg-sub">16 layers</text>
+		</g>
+		<path class="dg-edge dg-edge--green" marker-end="url(#sv-green)"
+			d={`M ${LM.x + LM.w} ${CACHE.y + CACHE.h / 2} L ${CACHE.x - 2} ${CACHE.y + CACHE.h / 2}`} />
+		<g class="dg-node dg-node--green">
+			<rect x={CACHE.x} y={CACHE.y} width={CACHE.w} height={CACHE.h} rx="10" />
+			<text x={CACHE_MID} y={CACHE.y + 30} class="dg-title">K/V cache</text>
+			<text x={CACHE_MID} y={CACHE.y + 51} class="dg-sub">every layer</text>
+		</g>
+
+		<!-- the cache crosses into the suffix -->
+		<path class="dg-edge dg-edge--green" marker-end="url(#sv-green)"
+			d={`M ${CACHE_MID} ${CACHE.y + CACHE.h} L ${CACHE_MID} ${KV_Y} L 440 ${KV_Y} L 440 ${EXPERT.y - 2}`} />
+		<text x={CACHE_MID + 10} y="240" class="dg-label dg-label--green">K/V</text>
+
+		<!-- ── the suffix: once per Euler step ────────────────────────── -->
+		<rect class="dg-group" x="12" y="304" width="856" height="140" rx="12" />
+		<text x="24" y="322" class="dg-label dg-label--muted">suffix — 10 Euler steps</text>
+
+		<g class="dg-node dg-node--spark">
+			<rect x={IN_X} y={SUF_Y - 32} width={IN_W + 20} height="64" rx="10" />
+			<text x={IN_X + (IN_W + 20) / 2} y={SUF_Y - 6} class="dg-title">x ~ N(0, I)</text>
+			<text x={IN_X + (IN_W + 20) / 2} y={SUF_Y + 16} class="dg-sub">t = 1 · 50 × 32</text>
+		</g>
+		<path class="dg-edge dg-edge--spark" marker-end="url(#sv-spark)"
+			d={`M ${IN_X + IN_W + 20} ${SUF_Y} L ${EXPERT.x - 2} ${SUF_Y}`} />
+
+		<g class="dg-node dg-node--purple">
+			<rect x={EXPERT.x} y={EXPERT.y} width={EXPERT.w} height={EXPERT.h} rx="10" />
+			<text x={EXPERT_MID} y={EXPERT.y + 28} class="dg-title">action expert</text>
+			<text x={EXPERT_MID} y={EXPERT.y + 50} class="dg-sub">16 layers · width 720</text>
+			<text x={EXPERT_MID} y={EXPERT.y + 70} class="dg-sub">odd layers read the cache</text>
+		</g>
+		<path class="dg-edge dg-edge--spark" marker-end="url(#sv-spark)"
+			d={`M ${EXPERT.x + EXPERT.w} ${SUF_Y} L ${EULER.x - 2} ${SUF_Y}`} />
+		<text x={(EXPERT.x + EXPERT.w + EULER.x) / 2} y={SUF_Y - 10} class="dg-caption">v(x, t)</text>
+
+		<g class="dg-node dg-node--spark">
+			<rect x={EULER.x} y={EULER.y} width={EULER.w} height={EULER.h} rx="10" />
+			<text x={EULER_MID} y={EULER.y + 28} class="dg-title">x ← x − 0.1 v</text>
+			<text x={EULER_MID} y={EULER.y + 50} class="dg-sub">t ← t − 0.1</text>
+		</g>
+
+		<!-- the loop back to the expert -->
+		<path class="dg-edge dg-edge--spark dg-edge--dashed" marker-end="url(#sv-spark)"
+			d={`M ${EULER_MID} ${EULER.y + EULER.h} L ${EULER_MID} 428 L ${EXPERT_MID} 428 L ${EXPERT_MID} ${EXPERT.y + EXPERT.h + 2}`} />
+		<text x={(EULER_MID + EXPERT_MID) / 2} y="422" class="dg-caption">× 10</text>
+
+		<path class="dg-edge dg-edge--green" marker-end="url(#sv-green)"
+			d={`M ${EULER.x + EULER.w} ${SUF_Y} L 738 ${SUF_Y}`} />
+		<g class="dg-node dg-node--green">
+			<rect x="740" y={SUF_Y - 32} width="120" height="64" rx="10" />
+			<text x="800" y={SUF_Y - 6} class="dg-title">chunk</text>
+			<text x="800" y={SUF_Y + 16} class="dg-sub">50 actions</text>
+		</g>
+	</svg>
+
+	<figcaption class="diagram__legend">
+		<span class="diagram__key diagram__key--cyan">observation and instruction</span>
+		<span class="diagram__key diagram__key--purple">networks</span>
+		<span class="diagram__key diagram__key--spark">denoising</span>
+		<span class="diagram__key diagram__key--green">cache and output</span>
+	</figcaption>
+
+	<div class="diagram__formula">
+		<span class="diagram__formula-title">flow-matching objective (fine-tune)</span>
+		<code>x_t = t · ε + (1 − t) · a,   L = ‖ v_θ(x_t, t | prefix) − (ε − a) ‖²</code>
+	</div>
+</figure>

@@ -376,8 +376,9 @@ struct REDQOFEAgent[
         return self.trainer.flush_metrics()
 
     def save(mut self, path: String) raises:
-        """One-file `nn-ckpt v2` envelope over actor + N critics +
-        SB + AB + PRED + their Adams + alpha_opt."""
+        """One v3 `storage-ckpt` file over actor + N critics + SB + AB +
+        PRED, with α's optimizer and the step counter as `K` scalars. The
+        network optimizers are not saved."""
         self.trainer.save_state(path)
 
     def load(mut self, path: String) raises:

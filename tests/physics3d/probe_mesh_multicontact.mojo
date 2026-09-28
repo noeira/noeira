@@ -221,6 +221,7 @@ def main() raises:
     var wf2 = Array[Scalar[DTYPE], 9](fill=Scalar[DTYPE](0))
     var wxx = Array[Scalar[DTYPE], 6](fill=Scalar[DTYPE](0))
     var wf_ok = 0
+    var wfi = Array[Int, 6](fill=-1)
     var ws = ccd_ws_alloc[DTYPE]()
     var z = Scalar[DTYPE](0)
     var one = Scalar[DTYPE](1)
@@ -235,7 +236,7 @@ def main() raises:
         z, z, z, one,
         z, z, z, z, z,
         va2, mnv2,
-        wf1, wf2, wxx, wf_ok,
+        wf1, wf2, wxx, wf_ok, wfi,
         ws.lt["cpu", L_CCD_WS1](), 0,
     )
     print("  EPA: dist", r[0], " n(gi->gj)", r[4], r[5], r[6], " ok", wf_ok)
@@ -256,7 +257,7 @@ def main() raises:
         z, z, z, one, z, z, z, rb_j, va2, mnv2, pa2, pn2,
         AsStatic[MD](),
         mesh_verts_v, mesh_polys_v, mesh_pv_v, mesh_pm_v, mesh_vpm_v,
-        wf1, wf2, wxx,
+        wf1, wf2, wxx, wfi,
         r[0],
         Scalar[DTYPE](0), Scalar[DTYPE](1), Scalar[DTYPE](0.005),
         Scalar[DTYPE](0.0001), 3,

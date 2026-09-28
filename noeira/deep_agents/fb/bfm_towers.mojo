@@ -104,6 +104,74 @@ comptime BFMActorTower[OBS: Int, D: Int, H: Int, L: Int, ACT: Int] = Sequential[
     Tanh[ACT],
 ]
 
+# ── the per-net observation FILTERS (docs §12.34-12.35) ───────────────
+#
+# `released/new_model/config.json` gives each net its own key list. With the
+# packed row laid out
+#
+#     [ state 64 | privileged 463 | last_action 29 | history 372 | z 256 ]
+#       \________ SD + PRIV = 527 ________/ \_____ EX = 401 _____/
+#
+# the four filters are:
+#
+#     f, critic     everything            -> the row as it is
+#     b             [0, 527)              -> BFMBNetFiltered
+#     discriminator [0, 527) ++ z         -> BFMDNetFiltered
+#     actor         [0, 64) ++ [527, +z)  -> BFMActorTowerFiltered
+#
+# `b` and `discriminator` take the 527 PREFIX, which is why the privileged
+# block sits in the middle rather than at the end: their filters are exactly
+# our pre-existing observation, so their weights and their inputs are
+# unchanged by the extension.
+#
+# ⚠ `discriminator` needs `z` too, and `z` is at the END of the packed row, so
+# its filter is a two-slice concat like the actor's — NOT a prefix.
+
+# `BackwardMap` on `state + privileged_state` only.
+comptime BFMBNetFiltered[OBSF: Int, SP: Int, D: Int, HB: Int] = Sequential[
+    Slice[OBSF, 0, SP], BFMBNet[SP, D, HB]
+]
+
+# `Discriminator` on `[state + privileged_state | z]`.
+comptime BFMDNetFiltered[OBSF: Int, SP: Int, D: Int, HD: Int] = Sequential[
+    Parallel[Slice[OBSF + D, 0, SP], Slice[OBSF + D, OBSF, OBSF + D]],
+    BFMDNet[SP, D, HD],
+]
+
+# ── the actor's VIEW of the packed row (docs §12.34) ──────────────────
+#
+# `released/new_model/config.json` filters the observation dict per net, and
+# the ACTOR's keys are `state, last_action, history_actor` — it does NOT see
+# `privileged_state`, which `f`, `critic` and `aux_critic` do. Our packed row
+# is
+#
+#     [ state 64 | privileged 463 | last_action 29 | history 372 | z 256 ]
+#          SD          OBSF-SD-EX         EX = 401                   D
+#
+# so the actor's 721 is the row MINUS the privileged block — two slices
+# concatenated, `[0, SD)` and `[OBSF - EX, OBSF + D)`. The privileged block
+# stays in the MIDDLE so `b` and `discriminator` keep reading `[0, 527)`
+# contiguously, which is exactly `state + privileged_state`, their own keys.
+#
+# ⚠ Feeding the actor the privileged block is not a free extra: §12.34
+# measured our privileged-actor policy at 1.32-1.83x the RELEASED actor on the
+# same clips in an environment G2 proved identical. Matching the reference
+# means giving those 463 dims UP.
+comptime BFMActorView[OBSF: Int, SD: Int, EX: Int, D: Int] = Parallel[
+    Slice[OBSF + D, 0, SD],
+    Slice[OBSF + D, OBSF - EX, OBSF + D],
+]
+
+# `ResidualActor` on the reference's OWN actor keys: `state | last_action |
+# history | z`, with `embedding_layers 2` embeddings (`BFMEmbed2`) and an
+# `hidden_layers`-deep residual trunk — `nn_models.py:523-527`.
+comptime BFMActorTowerFiltered[
+    OBSF: Int, SD: Int, EX: Int, D: Int, H: Int, L: Int, ACT: Int
+] = Sequential[
+    BFMActorView[OBSF, SD, EX, D],
+    BFMActorTower[SD + EX, D, H, L, ACT],
+]
+
 # `BackwardMap` with `hidden_layers 1`, `norm True`
 comptime BFMBNet[OBS: Int, D: Int, HB: Int] = Sequential[
     Linear[OBS, HB], LayerNorm[HB], Tanh[HB], Linear[HB, D],

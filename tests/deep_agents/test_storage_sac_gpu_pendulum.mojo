@@ -95,7 +95,7 @@ def main() raises:
         )
 
         var m = agent.flush_metrics()
-        print("  DIAG actor_loss =", m.actor_loss.to_f64())
+        print("  DIAG actor_loss =", m.policy_loss.to_f64())
         print("  DIAG critic_loss=", m.critic_loss.to_f64())
         print("  DIAG alpha      =", m.alpha.to_f64())
         print("  DIAG train_steps=", m.train_steps.to_f64())
@@ -105,9 +105,9 @@ def main() raises:
         print("  DIAG mean_q         =", m.mean_q.to_f64())
         print("  DIAG mean_target    =", m.mean_target.to_f64())
         print("  DIAG mean_next_q    =", m.mean_next_q.to_f64())
-        print("  DIAG mean_reward    =", m.mean_reward.to_f64())
+        print("  DIAG mean_reward    =", m.reward_mean.to_f64())
         print("  DIAG mean_done      =", m.mean_done.to_f64())
-        print("  DIAG mean_abs_action=", m.mean_abs_action.to_f64())
+        print("  DIAG mean_abs_action=", m.action_abs_mean.to_f64())
         assert_true(m.mean_q.to_f64() != 0.0, "GPU mean_q populated (not 0.0)")
         assert_true(
             m.mean_target.to_f64() != 0.0, "GPU mean_target populated (not 0.0)"
@@ -116,10 +116,10 @@ def main() raises:
             m.mean_next_q.to_f64() != 0.0, "GPU mean_next_q populated (not 0.0)"
         )
         assert_true(
-            m.mean_reward.to_f64() != 0.0, "GPU mean_reward populated (not 0.0)"
+            m.reward_mean.to_f64() != 0.0, "GPU mean_reward populated (not 0.0)"
         )
         assert_true(
-            m.mean_abs_action.to_f64() > 0.0, "GPU mean_abs_action populated"
+            m.action_abs_mean.to_f64() > 0.0, "GPU mean_abs_action populated"
         )
 
         var final_eval = agent.eval(

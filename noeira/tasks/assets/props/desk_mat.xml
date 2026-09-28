@@ -25,6 +25,10 @@
        recordings have — a 2 cm platform would move every grasp height;
        (2) the tracer draws it, and the recorded frames show a white desk,
        not a brown slab. `rgba` is the desk's colour for that reason.
+       ⚠ 0.81, NOT 0.93: the grey the rig's CAMERAS record the desk at under
+       the family's calibrated lights (so101_tower.family, 2026-09-24:
+       real median 183 overhead / 155 wrist; albedo = real / light level,
+       the two cameras' geometric mean). A whiter desk rendered clipped.
 
        ⚠⚠ 2 cm THICK, EXTENDING BELOW THE FLOOR PLANE, WITH ITS TOP STILL AT
        z = 0.002. It was a 2 mm slab, and the printed bowl FELL THROUGH IT
@@ -42,12 +46,62 @@
 
        ⚠ `solref`/`solimp` AS ON THE PROPS (`gen_tower_props.CONTACT`): a
        pair's softness is the AVERAGE of its two geoms', so a stiff brick on
-       a default desk is only half stiff. -->
+       a default desk is only half stiff.
+
+       ⚠ `priority="1"` + friction 0.5 (2026-09-25): MuJoCo takes the MAX of a
+       pair's frictions, so the brick's 1.5 (`gen_tower_props.BRICK_FRICTION`,
+       the jaw-brick value) was the brick-DESK friction too; printed PLA on the
+       mat slides far easier, and the sticky desk jammed the jaw's sweep under
+       the brick (noeira-54). A higher-priority geom dictates the whole
+       contact — its friction, solref, solimp and condim — so brick-desk,
+       bowl-desk and arm-desk take 0.5 while brick-jaw keeps 1.5; the
+       stiffness is unchanged (the desk's solref/solimp are the props').
+       NOT measured on the desk itself (it cannot be tilted): the printed
+       cube on a similar material slides at ~30 deg (mu 0.58), a typical PLA-
+       on-mat value is ~0.4; 0.5 splits them. The expert does not care in
+       that range: 209/300 at 0.4 AND at 0.5, not one episode flipping (seeds
+       61000 + 62000, --posture human --return-rest --clear-plan), against
+       179/300 at the brick's 1.5 — the jaw had swept past a brick stuck to
+       the desk. `<pair>` would be the other route, and the parser refuses
+       it. -->
   <compiler angle="radian"/>
+  <asset>
+    <material name="backdrop_desk" rgba="0.81 0.81 0.79 1" specular="0" shininess="0"/>
+    <material name="backdrop_clutter" rgba="0.583 0.593 0.627 1" specular="0" shininess="0"/>
+    <material name="backdrop_floor" rgba="0.319 0.279 0.431 1" specular="0" shininess="0"/>
+    <material name="backdrop_wall" rgba="1.0 1.0 0.98 1" specular="0" shininess="0"/>
+  </asset>
   <worldbody>
     <body name="mat">
       <geom name="geom" type="box" pos="-0.055 0 -0.009" size="0.325 0.325 0.010" density="800"
-            rgba="0.93 0.93 0.91 1" solref="0.01 1" solimp="0.998 0.998 0.001"/>
+            rgba="0.81 0.81 0.79 1" solref="0.01 1" solimp="0.998 0.998 0.001"
+            friction="0.5 0.01 0.0001" priority="1"/>
+      <!-- ⚠ THE BACKDROP — group 4, VISUAL ONLY (contype/conaffinity 0, no
+           mass): what the rig's cameras see around the desk, measured on
+           cube-in-bowl-printed (2026-09-24) through the asset overhead camera.
+           The real desk ENDS at world y +0.29 (the slab above reaches .325:
+           its collision is left alone) and CONTINUES on -y under the leader
+           arm to about -0.60; past +0.29 is a blue mat / wooden floor (median
+           65,57,88); past the far edge a white wall (155,158,150). Albedo =
+           real / the calibrated light (.8 on a horizontal face, .6 on the
+           wall). MATTE (specular 0): with MuJoCo's default .5 the headlight
+           put a hot spot on the desk around the arm's base and on the wall,
+           which the real frames do not have — so the desk's top is a matte
+           SKIN over the slab, and the slab (collision) is left alone. The
+           -y extension carries the leader arm, cables and a speaker on the
+           rig (median 119,121,128), so it is that average, not the desk. The CALIBRATED look renders group 4 and `--look legacy`
+           does not (`so101_tower_rig.rig_visual_group_mask`), so the legacy
+           look stays byte-identical to the stores rendered before it. -->
+      <geom name="floor_cover" type="box" group="4" contype="0" conaffinity="0" density="0"
+            pos="0.18 0 -0.0014" size="2.5 3.0 0.0005" material="backdrop_floor"/>
+      <geom name="desk_skin" type="box" group="4" contype="0" conaffinity="0" density="0"
+            pos="-0.055 -0.0175 0.0011" size="0.325 0.3075 0.0001" material="backdrop_desk"/>
+      <geom name="floor_strip" type="box" group="4" contype="0" conaffinity="0" density="0"
+            pos="-0.055 0.3075 0.0011" size="0.325 0.0175 0.0001" material="backdrop_floor"/>
+      <geom name="desk_ext" type="box" group="4" contype="0" conaffinity="0" density="0"
+            pos="-0.055 -0.6625 0.00005" size="0.325 0.3375 0.00095" material="backdrop_clutter"/>
+      <geom name="wall" type="box" group="4" contype="0" conaffinity="0" density="0"
+            pos="0.28 -0.25 0.399" size="0.01 0.85 0.4" material="backdrop_wall"/>
       <!-- THE SITE THE REGIONS ATTACH TO, on the top face — see
            `fixture.xml` for why it is site-relative and `group="3"`. -->
       <site name="surface" pos="0 0 0.001" size="0.005" group="3"/>

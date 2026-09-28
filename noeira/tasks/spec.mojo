@@ -450,19 +450,57 @@ struct InitSpec(Copyable, ImplicitlyCopyable, Movable):
 
     ⚠ FALSE IS THE DEFAULT AND WRITES NOTHING, so every `.task` that predates
     this round-trips byte for byte."""
+    var yaw: Bool
+    """`:yaw` — the slot's yaw about +z is drawn uniformly on (-pi, pi] each
+    episode (`sampler.sample_placements`, `placement/table.YAW_AXIS_BASE`),
+    instead of the identity every other placement starts at.
+
+    ⚠ OPT-IN, PER INIT, BECAUSE IT CHANGES WHAT A POLICY SEES AT RESET. The
+    real rig's Duplo lies at any yaw and the operator closes the jaw on its
+    faces; an axis-aligned sim cube teaches a grasp the real cube does not
+    allow. A region draw only: the clash test compares circles, so the yaw
+    never changes WHERE a slot lands, and a STACK (no draw at all) refuses it.
+    False writes nothing, so every older `.task` round-trips byte for byte."""
+    var sep_mm: Int
+    """`:sep=<metres>` — this slot's centre keeps at least this far from
+    every other placed slot's centre: the clash test's distance becomes
+    `max(h_radius_i + h_radius_j, sep_i, sep_j)` (the exemptions — another
+    fixture's region, a stack — still apply). Whole MILLIMETRES, 1..1023: it
+    travels to the device in the init word (`placement/table`,
+    `INIT_WORD_SEP_UNIT`), and host and device must compare the same number.
+
+    ⚠ OPT-IN, PER INIT: `cube_in_bowl`'s bowl, because the recorded layouts
+    never have the brick closer than 135 mm while the radii alone allow 79 —
+    and the expert grasps 1/14 of the draws under 100 mm. 0 writes nothing, so
+    every older `.task` round-trips byte for byte."""
 
     def __init__(out self, slot: String, region: String):
         self.slot = slot
         self.region = region
         self.inside = False
+        self.yaw = False
+        self.sep_mm = 0
 
-    def __init__(out self, slot: String, region: String, inside: Bool):
+    def __init__(
+        out self, slot: String, region: String, inside: Bool, yaw: Bool = False,
+        sep_mm: Int = 0,
+    ):
         self.slot = slot
         self.region = region
         self.inside = inside
+        self.yaw = yaw
+        self.sep_mm = sep_mm
+
+    def sep(self) -> Float64:
+        """The separation in metres (0: none)."""
+        return Float64(self.sep_mm) / 1000.0
 
     def describe(self) -> String:
-        return self.slot + "@" + self.region + (":in" if self.inside else "")
+        return (
+            self.slot + "@" + self.region + (":in" if self.inside else "")
+            + (":yaw" if self.yaw else "")
+            + ((":sep=" + _sep_text(self.sep_mm)) if self.sep_mm > 0 else "")
+        )
 
 
 struct JointInitSpec(Copyable, ImplicitlyCopyable, Movable):
@@ -533,6 +571,14 @@ struct FamilySpec(Movable & Deinitable):
     A Panda at all-zeros folds link 5 onto link 7 and reports 18 self
     contacts "at rest" — LIBERO never runs it there, and neither must a
     gate."""
+    var base_qpos_jitter: List[Float64]
+    """`base_qpos_jitter=h1,h2,...` — a per-episode draw around the rest:
+    joint i starts at `base_qpos[i] + h_i * (2u - 1)`, `u` uniform on its own
+    Philox axis (`placement/table.BASE_JITTER_AXIS_BASE + i`). Optional; the
+    same length as `base_qpos` when given; a half-width of 0 draws nothing.
+    The so101-tower follower's rest is folded on three hard stops with pan,
+    wrist roll and the jaw left wherever the last episode put them — one
+    fixed pose would show the student a single start it never meets."""
     var inherit_option: Bool
     """`inherit_option=0|1` — copy the base asset's `<option>` tag, and its
     `inertiagrouprange` / `autolimits` compiler attributes, into the
@@ -541,6 +587,27 @@ struct FamilySpec(Movable & Deinitable):
     density=1.2 viscosity=2e-5 timestep=0.002`, authored once in the vendored
     Panda; MuJoCo's `<attach>` ignores a child's `<option>`, so without this
     the composed scene would run robosuite's robot under our defaults."""
+    var headlight: List[Float64]
+    """`headlight=ambient,diffuse,specular` — the composed scene's
+    `<visual><headlight>` as three GREY levels. Empty (the default) leaves
+    MuJoCo's .1/.4/.5 and every existing family byte-identical.
+
+    ⚠ WHY A FAMILY SETS IT: the headlight's AMBIENT is the only light that
+    reaches a surface regardless of its angle. Under MuJoCo's defaults (one
+    light straight down + a .1-ambient headlight) the tower's WHITE jaws
+    render nearly black from the wrist camera — they are seen edge-on to both
+    lights — where the real room, lit from everywhere, shows them white
+    (MuJoCo's own renderer agrees with the tracer; checked 2026-09-22)."""
+    var sunlight: Float64
+    """`sunlight=g` — the composed floor light's (the directional light
+    straight down) diffuse GREY level. Negative (the default) leaves MuJoCo's
+    .7 and every existing family byte-identical.
+
+    ⚠ AN APPEARANCE CALIBRATION, NOT A LOOK: with the .7 sun plus a lit
+    headlight the tower desk rendered CLIPPED WHITE on both cameras (255
+    against the real 183 overhead / 155 wrist, 2026-09-24), so no randomized
+    look around it could reach the real exposure. The so101_tower values are
+    fitted against the rig's recorded frames, see its `.family`."""
     var root: String
     """The TASK ROOT this family was loaded from: the directory holding its
     `families/`, `tasks/` and `scenes/`. `load_family(path)` sets it to the
@@ -580,7 +647,10 @@ struct FamilySpec(Movable & Deinitable):
         self.base_z = 0.0
         self.floor = True
         self.base_qpos = List[Float64]()
+        self.base_qpos_jitter = List[Float64]()
         self.inherit_option = False
+        self.headlight = List[Float64]()
+        self.sunlight = -1.0
         self.root = String(DEFAULT_TASK_ROOT)
 
     def __init__(out self, *, deinit move: Self):
@@ -599,7 +669,10 @@ struct FamilySpec(Movable & Deinitable):
         self.base_z = move.base_z
         self.floor = move.floor
         self.base_qpos = move.base_qpos^
+        self.base_qpos_jitter = move.base_qpos_jitter^
         self.inherit_option = move.inherit_option
+        self.headlight = move.headlight^
+        self.sunlight = move.sunlight
         self.root = move.root^
 
     def init_target_kind(self, name: String) raises -> Int:
@@ -682,8 +755,23 @@ struct FamilySpec(Movable & Deinitable):
                     s += ","
                 s += String(self.base_qpos[i])
             s += "\n"
+        if len(self.base_qpos_jitter) > 0:
+            s += "base_qpos_jitter="
+            for i in range(len(self.base_qpos_jitter)):
+                if i > 0:
+                    s += ","
+                s += String(self.base_qpos_jitter[i])
+            s += "\n"
         if self.inherit_option:
             s += "inherit_option=1\n"
+        if len(self.headlight) == 3:
+            s += (
+                "headlight=" + String(self.headlight[0]) + ","
+                + String(self.headlight[1]) + "," + String(self.headlight[2])
+                + "\n"
+            )
+        if self.sunlight >= 0.0:
+            s += "sunlight=" + String(self.sunlight) + "\n"
         for i in range(len(self.slots)):
             s += "slot=" + self.slots[i].describe() + "\n"
         # ⚠ A SEPARATE LINE, NOT A FIFTH FIELD ON `slot=`. The pose field is
@@ -952,8 +1040,17 @@ def parse_region(spec: String) raises -> RegionSpec:
     return out^
 
 
+def _sep_text(mm: Int) -> String:
+    """`135` -> `0.135`: the metres a `.task` writes, exactly what it read."""
+    var frac = String(mm % 1000)
+    while frac.byte_length() < 3:
+        frac = "0" + frac
+    return String(mm // 1000) + "." + frac
+
+
 def parse_init(spec: String) raises -> InitSpec:
-    """`<slot>@<region>[:in]` — see `InitSpec.inside` for the suffix."""
+    """`<slot>@<region>[:in|:on][:yaw][:sep=<metres>]` — see `InitSpec.inside`,
+    `InitSpec.yaw` and `InitSpec.sep_mm` for the suffixes."""
     var parts = split_once(spec, String("@"))
     if len(parts) != 2:
         raise Error(
@@ -963,6 +1060,25 @@ def parse_init(spec: String) raises -> InitSpec:
     var slot = String(String(parts[0]).strip())
     var rest = String(String(parts[1]).strip())
     var inside = False
+    var yaw = False
+    var sep_mm = 0
+    var sc = rest.rfind(":sep=")
+    if sc >= 0:
+        var txt = String(rest[byte = sc + 5 : rest.byte_length()])
+        var metres = Float64(txt)
+        var mm = Int(metres * 1000.0 + 0.5)
+        if mm < 1 or mm > 1023 or abs(metres * 1000.0 - Float64(mm)) > 1e-6:
+            raise Error(
+                "tasks: init '" + spec + "' — ':sep=' takes metres in whole"
+                " millimetres, 0.001..1.023 (it travels to the device as mm)"
+            )
+        sep_mm = mm
+        var head_s = String(rest[byte=0:sc])
+        rest = head_s^
+    if rest.endswith(":yaw"):
+        yaw = True
+        var head0 = String(rest[byte=0 : rest.byte_length() - 4])
+        rest = head0^
     var colon = rest.rfind(":")
     if colon >= 0:
         var tail = String(rest[byte = colon + 1 : rest.byte_length()])
@@ -979,11 +1095,17 @@ def parse_init(spec: String) raises -> InitSpec:
         else:
             raise Error(
                 "tasks: init '" + spec + "' ends in ':" + tail + "'; the only"
-                " suffixes are ':in' and ':on' (see InitSpec.inside)"
+                " suffixes are ':in' / ':on', then ':yaw', then ':sep=M'"
+                " (see InitSpec)"
             )
     if slot.byte_length() == 0 or rest.byte_length() == 0:
         raise Error("tasks: init has an empty slot or region: '" + spec + "'")
-    return InitSpec(slot^, rest^, inside)
+    if rest.find(":") >= 0:
+        raise Error(
+            "tasks: init '" + spec + "' — the suffixes go ':in' / ':on'"
+            " first, then ':yaw'; a region name has no colon"
+        )
+    return InitSpec(slot^, rest^, inside, yaw, sep_mm)
 
 
 def parse_joint_init(spec: String) raises -> JointInitSpec:
@@ -1071,8 +1193,37 @@ def parse_family(text: String) raises -> FamilySpec:
                 f.base_qpos.append(Float64(String(String(q[k]).strip())))
             if len(f.base_qpos) == 0:
                 raise Error("family spec: base_qpos is empty")
+        elif key == "base_qpos_jitter":
+            var q = split_on(val, String(","))
+            f.base_qpos_jitter = List[Float64]()
+            for k in range(len(q)):
+                var h = Float64(String(String(q[k]).strip()))
+                if not (h >= 0.0):
+                    raise Error(
+                        "family spec: base_qpos_jitter is a half-width, >= 0;"
+                        " got " + String(h)
+                    )
+                f.base_qpos_jitter.append(h)
         elif key == "inherit_option":
             f.inherit_option = _parse_flag(val, String("inherit_option"))
+        elif key == "headlight":
+            var h = split_on(val, String(","))
+            if len(h) != 3:
+                raise Error(
+                    "family spec: headlight needs three grey levels"
+                    " 'ambient,diffuse,specular', got '" + val + "'"
+                )
+            f.headlight = List[Float64]()
+            for k in range(3):
+                var v = Float64(String(String(h[k]).strip()))
+                if v < 0.0 or v > 1.0:
+                    raise Error("family spec: headlight level outside [0, 1]: " + val)
+                f.headlight.append(v)
+        elif key == "sunlight":
+            var g = Float64(String(val.strip()))
+            if g < 0.0 or g > 1.0:
+                raise Error("family spec: sunlight grey level outside [0, 1]: " + val)
+            f.sunlight = g
         elif key == "slot":
             f.slots.append(parse_slot(val))
         elif key == "slot_geom":
@@ -1113,7 +1264,8 @@ def parse_family(text: String) raises -> FamilySpec:
             _unknown_key(
                 key, lines[i].lineno, String("family spec"),
                 String("schema_version, family, base, horizon, control_freq,"
-                       " park, base_pos, floor, base_qpos, inherit_option, slot,"
+                       " park, base_pos, floor, base_qpos, base_qpos_jitter, sunlight,"
+                       " inherit_option, slot,"
                        " slot_geom, region"),
             )
 
@@ -1125,6 +1277,11 @@ def parse_family(text: String) raises -> FamilySpec:
         raise Error("family spec: no base= scene")
     if f.horizon <= 0:
         raise Error("family spec: horizon must be > 0, got " + String(f.horizon))
+    if len(f.base_qpos_jitter) > 0 and len(f.base_qpos_jitter) != len(f.base_qpos):
+        raise Error(
+            "family spec: base_qpos_jitter has " + String(len(f.base_qpos_jitter))
+            + " words but base_qpos has " + String(len(f.base_qpos))
+        )
 
     # ⚠ DUPLICATE NAMES ARE REFUSED. Slot ORDER is the observation layout and
     # the instance prefix is the identity, so two slots sharing a name is two

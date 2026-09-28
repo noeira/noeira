@@ -48,6 +48,7 @@ LIBERO's frozen inits, which are not demonstrations at all.
 | `ACT_STEPS` | optimizer steps without a rebuild (default 50 000) |
 | `ACT_LR` | the learning rate (default `LIBERO_ACT_LR` = 1e-5, the paper's). An overfit at 1e-3 on a few episodes is the test of whether the graph can REPRESENT a per-position chunk at all (2026-09-20: the box fits' chunks were flat across the 40 positions after training even with unit-scale queries) |
 | `ACT_SHAPE` | weight of the chunk-shape term (L1 on first differences along the chunk; default `ACT_SHAPE_WEIGHT` = 0, the paper's loss). See `deep_agents/act/config.mojo` |
+| `ACT_SEED` | the run's seed (default 7): the episode split, the batch order and the weight init all follow it. Two fits at different seeds bound the run-to-run spread of the closed-loop rate; the default reproduces every fit before 2026-09-22 |
 | `ACT_PATIENCE` | validations without improvement before the early stop (default 10); `0` disables it. ⚠ On LIBERO the validation L1 bottoms at the DEMONSTRATOR NOISE FLOOR (task+phase oracle 0.386, the fits 0.41-0.42) 17-28k steps in, and its minimum there is noise: the fit's training L1 is still falling (0.25) and its closed-loop rate still moving. ACT's recipe trains thousands of epochs and the per-task drawer fit at the val minimum scored 1/20 against the multi-task 6/20; `ACT_PATIENCE=0 ACT_STEPS=300000` with `--act-ckpt last` at eval is the recipe's schedule |
 | `ACT_KL` | the KL weight (default `LIBERO_ACT_KL` = 10, the paper's). ⚠ Both 5090 fits collapsed the CVAE at 10 — `train/kl` 59 -> 0.05 — so the latent carried nothing and every chunk was the conditional median: half the demonstrations' action scale, 5/200. The paper's ablation says the CVAE is what absorbs demonstrator variability; a lower weight is the lever, and it is here so a sweep needs no rebuild |
 | `ACT_PRETRAINED` | defaults to `hub` (ImageNet ResNet18, no PyTorch); `random` opts out |
@@ -60,6 +61,7 @@ On Apple, `mojo build` needs `-Xlinker -ld_classic`; `mojo run` does not.
 """
 
 from std.os import getenv, makedirs
+from std.random import seed as seed_rng
 from std.os.path import exists
 from std.time import perf_counter_ns
 from max.gpu.host import DeviceContext
@@ -209,7 +211,13 @@ def main() raises:
           + ", qpos " + String(QPOS) + ", action " + String(ADIM)
           + ", batch " + String(BATCH))
 
-    var ds = LiberoActDataset(String(path), seed=7)
+    var run_seed = 7
+    var env_seed = getenv("ACT_SEED")
+    if env_seed.byte_length() > 0:
+        run_seed = Int(env_seed)
+    seed_rng(run_seed)
+    print("  seed    " + String(run_seed) + ("" if env_seed.byte_length() == 0 else " (ACT_SEED)"))
+    var ds = LiberoActDataset(String(path), seed=UInt64(run_seed))
     print("  split   " + String(len(ds.train_eps)) + " train / "
           + String(len(ds.val_eps)) + " val episodes of "
           + String(ds.n_episodes()) + " (" + String(ds.n_rows()) + " rows)")
@@ -273,7 +281,7 @@ def main() raises:
     var dev_ds = DDS()
     comptime if GPU_DATA:
         var u0 = perf_counter_ns()
-        dev_ds = DDS.upload_from[BATCH](ds, ctx, seed=7)
+        dev_ds = DDS.upload_from[BATCH](ds, ctx, seed=UInt64(run_seed))
         print("  device dataset  " + String(Float64(perf_counter_ns() - u0) / 1e9)
               + " s to upload " + String(Float64(dev_ds.n_rows)
                                          * Float64(IMG_ELEMS) / 1e9)
@@ -327,16 +335,16 @@ def main() raises:
     var valid = List[Scalar[DT]](unsafe_uninit_length=BATCH * K)
 
     var names = List[String]()
-    names.append(String("train/l1"))
-    names.append(String("train/kl"))
-    names.append(String("train/loss"))
-    names.append(String("train/grad_norm"))
-    names.append(String("train/epoch"))
+    names.append(String("l1_loss"))
+    names.append(String("kl_loss"))
+    names.append(String("loss"))
+    names.append(String("grad_norm"))
+    names.append(String("epoch"))
     var val_names = List[String]()
-    val_names.append(String("val/l1"))
-    val_names.append(String("val/kl"))
-    val_names.append(String("perf/s_per_step"))
-    val_names.append(String("best/val_l1"))
+    val_names.append(String("val_l1_loss"))
+    val_names.append(String("val_kl_loss"))
+    val_names.append(String("step_s"))
+    val_names.append(String("val_l1_loss_best"))
 
     var best_val = Float64(1e30)
     var best_step = -1

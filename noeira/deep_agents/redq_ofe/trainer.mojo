@@ -27,7 +27,8 @@ The three OFE nets (state_branch / action_branch / predictor) are owned by the
 trainer and threaded into all OFE blocks; they train ONLY via the aux step.
 
 STORAGE migration (Stage 5): own scratch as `nn.storage.Tensor`s; `Adam.adopt`
-on GPU; storage `CheckpointWriter`/`CheckpointReader`; α is a HOST scalar on
+on GPU; a one-file v3 checkpoint (α's optimizer and the counter as `K`
+scalars); α is a HOST scalar on
 both targets; CUDA-graph capture DEFERRED (host control flow). Dimensions
 (OBS / ACT / BATCH) derive from `SAMPLE`; PHI_S_DIM from SB; PHI_SA_DIM from AB.
 """
@@ -52,7 +53,9 @@ from noeira.nn.primitives.rsample import RSample
 from noeira.nn.optimizer.adam import Adam
 from noeira.nn.optimizer.scalar_adam import ScalarAdam
 from noeira.nn.core.checkpoint import (
-    CheckpointWriter, CheckpointReader, _split_lines,
+    BinaryCheckpointWriter, BinaryCheckpointReader, CheckpointReader,
+    CheckpointScalars, write_model, read_model, _split_lines, _is_v3_header,
+    _read_file_bytes, _write_file_bytes,
 )
 
 from noeira.nn.core.log_bundle import log_bundle
@@ -765,7 +768,7 @@ struct REDQOFETrainer[
         if Bool(logger):
             var lg = logger.value()
             lg[].log_scalar("critic_loss", Float64(m.critic_loss), step)
-            lg[].log_scalar("actor_loss", Float64(m.actor_loss), step)
+            lg[].log_scalar("policy_loss", Float64(m.actor_loss), step)
             lg[].log_scalar("alpha", Float64(m.alpha), step)
             lg[].log_scalar("log_prob_mean", Float64(m.log_prob_mean), step)
             lg[].log_scalar("aux_loss", Float64(m.aux_loss), step)
@@ -775,77 +778,87 @@ struct REDQOFETrainer[
     def flush_timer_log(mut self) -> String:
         return String("")
 
-    # ─── Checkpoint (ONE file: actor + N critics + SB + AB + PRED) ─────────
+    # ─── Checkpoint (ONE v3 file: actor + N critics + SB + AB + PRED + α) ──
     def save_state(mut self, path: String) raises:
-        var w = CheckpointWriter(save_moments=False)
-        w.mode = 0
-        walk_params[Self.train_target](self.actor, w, self.ctx, "actor")
+        """ONE v3 `storage-ckpt` file: the actor, the N ONLINE critics and the
+        three OFE nets, then as `K` sections α's whole optimizer (`alpha.*`)
+        and the train-step counter. Atomic and chunked. Network optimizer
+        moments NOT persisted (resume re-warms)."""
+        var w = BinaryCheckpointWriter(save_moments=False)
+        write_model[Self.train_target](w, self.actor, self.ctx, "actor")
         for i in range(Self.N):
-            walk_params[Self.train_target](self.ensemble.pairs[i].online, w, self.ctx, "critic" + String(i)
+            write_model[Self.train_target](
+                w, self.ensemble.pairs[i].online, self.ctx, "critic" + String(i)
             )
-        walk_params[Self.train_target](self.state_branch, w, self.ctx, "state_branch"
-        )
-        walk_params[Self.train_target](self.action_branch, w, self.ctx, "action_branch"
-        )
-        walk_params[Self.train_target](self.predictor, w, self.ctx, "predictor"
-        )
-        w.mode = 1
-        var _sref1 = ParamVisitorRef.of[type_of(w), Self.train_target](w)
-        self.actor.for_each_state[Self.train_target](_sref1, self.ctx, "actor")
-        for i in range(Self.N):
-            self.ensemble.pairs[i].online.for_each_state[Self.train_target](
-                w, self.ctx, "critic" + String(i)
-            )
-        self.state_branch.for_each_state[Self.train_target](
-            w, self.ctx, "state_branch"
-        )
-        self.action_branch.for_each_state[Self.train_target](
-            w, self.ctx, "action_branch"
-        )
-        self.predictor.for_each_state[Self.train_target](
-            w, self.ctx, "predictor"
-        )
-        with open(path, "w") as f:
-            f.write(w.content)
+        write_model[Self.train_target](w, self.state_branch, self.ctx, "state_branch")
+        write_model[Self.train_target](w, self.action_branch, self.ctx, "action_branch")
+        write_model[Self.train_target](w, self.predictor, self.ctx, "predictor")
+        var sc = CheckpointScalars()
+        self.alpha_opt.put_state(sc, "alpha")
+        sc.set_int("total_train_steps", self._total_train_steps)
+        w.write_scalars(sc)
+        _write_file_bytes(path, w.content)
 
     def load_state(mut self, path: String) raises:
-        var content: String
-        with open(path, "r") as f:
-            content = String(f.read())
-        var lines = _split_lines(content)
-        var body = List[String]()
-        for li in range(len(lines)):
-            if lines[li].startswith("storage-ckpt"):
-                continue
-            body.append(lines[li])
-        var r = CheckpointReader(body^)
-        r.mode = 0
-        walk_params[Self.train_target](self.actor, r, self.ctx, "actor")
-        for i in range(Self.N):
-            walk_params[Self.train_target](self.ensemble.pairs[i].online, r, self.ctx, "critic" + String(i)
+        """Restore every net, α and the counter (v3, or the legacy v2 text
+        this trainer wrote before, which carries neither α nor the counter),
+        then hard-copy online → target."""
+        var bytes = _read_file_bytes(path)
+        if _is_v3_header(bytes):
+            var rb = BinaryCheckpointReader(bytes^)
+            read_model[Self.train_target](rb, self.actor, self.ctx, "actor")
+            for i in range(Self.N):
+                read_model[Self.train_target](
+                    rb, self.ensemble.pairs[i].online, self.ctx,
+                    "critic" + String(i),
+                )
+            read_model[Self.train_target](rb, self.state_branch, self.ctx, "state_branch")
+            read_model[Self.train_target](rb, self.action_branch, self.ctx, "action_branch")
+            read_model[Self.train_target](rb, self.predictor, self.ctx, "predictor")
+            var sc = rb.read_scalars()
+            rb.finish()
+            self.alpha_opt.take_state(sc, "alpha")
+            self._total_train_steps = sc.get_int(
+                "total_train_steps", self._total_train_steps
             )
-        walk_params[Self.train_target](self.state_branch, r, self.ctx, "state_branch"
-        )
-        walk_params[Self.train_target](self.action_branch, r, self.ctx, "action_branch"
-        )
-        walk_params[Self.train_target](self.predictor, r, self.ctx, "predictor"
-        )
-        r.mode = 1
-        var _sref2 = ParamVisitorRef.of[type_of(r), Self.train_target](r)
-        self.actor.for_each_state[Self.train_target](_sref2, self.ctx, "actor")
-        for i in range(Self.N):
-            self.ensemble.pairs[i].online.for_each_state[Self.train_target](
-                r, self.ctx, "critic" + String(i)
+        else:
+            var content: String
+            with open(path, "r") as f:
+                content = String(f.read())
+            var lines = _split_lines(content)
+            var body = List[String]()
+            for li in range(len(lines)):
+                if lines[li].startswith("storage-ckpt"):
+                    continue
+                body.append(lines[li])
+            var r = CheckpointReader(body^)
+            r.mode = 0
+            walk_params[Self.train_target](self.actor, r, self.ctx, "actor")
+            for i in range(Self.N):
+                walk_params[Self.train_target](self.ensemble.pairs[i].online, r, self.ctx, "critic" + String(i)
+                )
+            walk_params[Self.train_target](self.state_branch, r, self.ctx, "state_branch"
             )
-        self.state_branch.for_each_state[Self.train_target](
-            r, self.ctx, "state_branch"
-        )
-        self.action_branch.for_each_state[Self.train_target](
-            r, self.ctx, "action_branch"
-        )
-        self.predictor.for_each_state[Self.train_target](
-            r, self.ctx, "predictor"
-        )
+            walk_params[Self.train_target](self.action_branch, r, self.ctx, "action_branch"
+            )
+            walk_params[Self.train_target](self.predictor, r, self.ctx, "predictor"
+            )
+            r.mode = 1
+            var _sref2 = ParamVisitorRef.of[type_of(r), Self.train_target](r)
+            self.actor.for_each_state[Self.train_target](_sref2, self.ctx, "actor")
+            for i in range(Self.N):
+                self.ensemble.pairs[i].online.for_each_state[Self.train_target](
+                    r, self.ctx, "critic" + String(i)
+                )
+            self.state_branch.for_each_state[Self.train_target](
+                r, self.ctx, "state_branch"
+            )
+            self.action_branch.for_each_state[Self.train_target](
+                r, self.ctx, "action_branch"
+            )
+            self.predictor.for_each_state[Self.train_target](
+                r, self.ctx, "predictor"
+            )
         for i in range(Self.N):
             self.ensemble.pairs[i].target_net.polyak_from[Self.train_target](
                 self.ensemble.pairs[i].online, Scalar[DT](1.0), self.ctx

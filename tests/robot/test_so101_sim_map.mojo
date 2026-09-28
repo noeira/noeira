@@ -22,14 +22,17 @@ disagreement is REPORTED rather than silently clamped away.
 Run: pixi run mojo run -I . tests/robot/test_so101_sim_map.mojo
 """
 
-from std.math import abs
+from std.math import abs, pi
 from std.testing import assert_almost_equal, assert_equal, assert_true, assert_false, TestSuite
 
 from noeira.envs.robots.so_arm101_xml import SoArm101Model
 from noeira.physics3d.fields import actuator_column
 from noeira.physics3d.gpu.constants import ACT_IDX_CTRL_MAX, ACT_IDX_CTRL_MIN
 from noeira.robot.so101.arm import GRIPPER, SO101Calibration, SO101_N
-from noeira.robot.so101.sim_map import SimJointMap
+from noeira.robot.so101.sim_map import (
+    SimJointMap, tower_follower_zero_deg, tower_follower_zero_matches,
+    TOWER_FOLLOWER_GRIPPER_ZERO_RAD, tower_follower_gripper_span_rad,
+)
 
 # Measured on the follower, 2026-08-25. `ofs` is sign-magnitude-decoded, which
 # is why four of the six are negative.
@@ -392,6 +395,122 @@ def test_our_gripper_limits_are_the_references() raises:
     # visible change rather than a silent one.
     assert_almost_equal(m.sim_lo[GRIPPER], -0.17453, atol=1e-15)
     assert_almost_equal(m.sim_hi[GRIPPER], 1.74533, atol=1e-15)
+
+
+# The follower's calibration of 2026-09-14 (`projects/so101-tower/calibration/
+# follower.json`) — the one `tower_follower_zero_deg` was measured against.
+def TOWER_OFS(i: Int) -> Int:
+    var v: List[Int] = [-634, 510, 506, -81, -1216, -506]
+    return v[i]
+
+
+def TOWER_LO(i: Int) -> Int:
+    var v: List[Int] = [882, 856, 791, 911, 585, 2031]
+    return v[i]
+
+
+def TOWER_HI(i: Int) -> Int:
+    var v: List[Int] = [3092, 3272, 3002, 3247, 3509, 3515]
+    return v[i]
+
+
+def _tower_cal() raises -> SO101Calibration:
+    var ofs = Array[Int32, SO101_N](fill=0)
+    var lo = Array[Int32, SO101_N](fill=0)
+    var hi = Array[Int32, SO101_N](fill=0)
+    for i in range(SO101_N):
+        ofs[i] = Int32(TOWER_OFS(i))
+        lo[i] = Int32(TOWER_LO(i))
+        hi[i] = Int32(TOWER_HI(i))
+    return SO101Calibration(ofs^, lo^, hi^)
+
+
+def test_tower_follower_applies_the_measured_zero() raises:
+    """At a body joint's calibrated mid the tower follower's map gives the
+    measured zero, the gripper is untouched, and the map announces that it
+    departs from the reference. The pan and roll zeros are pinned by value:
+    -10.7 and +5.0 deg are the MEASUREMENTS (two fits, `sim_map` module docstring), and a change to
+    it must be a visible edit here, not a drift."""
+    var cal = _tower_cal()
+    var ref_map = _map()
+    var m = SimJointMap.tower_follower(
+        cal, ref_map.sim_lo.copy(), ref_map.sim_hi.copy()
+    )
+    assert_true(m.differs_from_lerobot(), "a measured zero is a departure")
+    assert_almost_equal(tower_follower_zero_deg(0), -10.7, atol=1e-12)
+    assert_almost_equal(tower_follower_zero_deg(4), 5.0, atol=1e-12)
+    for i in range(SO101_N):
+        var raw = Int32(Int(cal.mid(i)))
+        var frac = cal.mid(i) - Float64(Int(cal.mid(i)))
+        if i == GRIPPER:
+            # the measured LINE, not the fraction of the model's range: the
+            # mid is half of 130.46 deg past -9.25 deg (the two differ by
+            # ~10 deg here — the reference would be 45 deg)
+            var want_g = TOWER_FOLLOWER_GRIPPER_ZERO_RAD + (
+                (Float64(raw) - Float64(TOWER_LO(i))) / Float64(TOWER_HI(i) - TOWER_LO(i))
+            ) * tower_follower_gripper_span_rad()
+            assert_almost_equal(m.to_sim_unclamped(cal, i, raw), want_g, atol=1e-12)
+            assert_true(
+                abs(m.to_sim_unclamped(cal, i, raw) - ref_map.to_sim_unclamped(cal, i, raw)) > 0.1,
+                "the tower gripper is the fraction map",
+            )
+            continue
+        # a half-tick mid is read at the tick below it
+        var want = (tower_follower_zero_deg(i) - frac * 360.0 / 4095.0) * pi / 180.0
+        assert_almost_equal(
+            m.to_sim_unclamped(cal, i, raw), want, atol=1e-12,
+            msg="joint " + String(i) + " at its mid is not the measured zero",
+        )
+
+
+def test_tower_follower_round_trips() raises:
+    """`from_sim(to_sim(t)) == t` with the zero applied — a policy's target
+    must reach the servo the joint came from."""
+    var cal = _tower_cal()
+    var ref_map = _map()
+    var m = SimJointMap.tower_follower(
+        cal, ref_map.sim_lo.copy(), ref_map.sim_hi.copy()
+    )
+    for i in range(SO101_N):
+        for k in range(1, 10):
+            var t = Int32(TOWER_LO(i) + (TOWER_HI(i) - TOWER_LO(i)) * k // 10)
+            var back = m.from_sim(cal, i, m.to_sim_unclamped(cal, i, t))
+            assert_true(
+                abs(Int(back) - Int(t)) <= 1,
+                "joint " + String(i) + ": " + String(t) + " -> " + String(back),
+            )
+
+
+def test_tower_follower_gripper_line_is_the_measured_one() raises:
+    """The gripper map is pinned by value: 130.46 deg over the 1484-tick
+    span (the arm's 360/4095 per tick), and the printed 25 mm cube's real
+    grasp reading 13.1 lands at 0.1368 rad — the angle where the model's tip
+    boxes are 25.0 mm apart (`sim_map` docstring, measured 2026-09-25)."""
+    assert_almost_equal(tower_follower_gripper_span_rad() * 180.0 / pi, 130.46, atol=0.01)
+    var cal = _tower_cal()
+    var ref_map = _map()
+    var m = SimJointMap.tower_follower(
+        cal, ref_map.sim_lo.copy(), ref_map.sim_hi.copy()
+    )
+    var raw = Int32(Int(Float64(TOWER_LO(GRIPPER)) + 0.131 * Float64(TOWER_HI(GRIPPER) - TOWER_LO(GRIPPER)) + 0.5))
+    assert_almost_equal(m.to_sim_unclamped(cal, GRIPPER, raw), 0.1368, atol=0.002)
+
+
+def test_tower_follower_refuses_another_calibration() raises:
+    """The zero belongs to ONE calibration. The 2026-08-25 one (this file's
+    `_cal`) has other mids, so the map must refuse it rather than apply a
+    zero measured on a different sweep."""
+    assert_true(tower_follower_zero_matches(_tower_cal()))
+    assert_false(tower_follower_zero_matches(_cal()))
+    var ref_map = _map()
+    var refused = False
+    try:
+        _ = SimJointMap.tower_follower(
+            _cal(), ref_map.sim_lo.copy(), ref_map.sim_hi.copy()
+        )
+    except e:
+        refused = String(e).find("recalibrated") >= 0
+    assert_true(refused, "a foreign calibration was accepted")
 
 
 def main() raises:

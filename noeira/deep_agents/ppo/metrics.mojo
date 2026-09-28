@@ -6,7 +6,7 @@ emits one `log_scalar` call per field.
 
 Fields correspond to what `PPOTrainer` accumulates over the K-epoch
 minibatch SGD inside one `train_step`:
-  * `actor_loss`  — mean of PPO clipped-surrogate loss across all minibatches
+  * `policy_loss`  — mean of PPO clipped-surrogate loss across all minibatches
   * `critic_loss` — mean of value MSE across all minibatches
   * `train_steps` — cumulative minibatch updates since trainer was made
                     (NOT reset on flush)
@@ -25,10 +25,10 @@ from noeira.nn.core.metric import LogScalar
 
 @fieldwise_init
 struct PPOMetrics(Copyable, Movable, Deinitable):
-    var actor_loss:  LogScalar[DT]
-    var critic_loss: LogScalar[DT]
-    var train_steps: LogScalar[DT]
-    var n_updates:   LogScalar[DT]
+    var policy_loss:        LogScalar[DT]
+    var critic_loss:        LogScalar[DT]
+    var train_steps:        LogScalar[DT]
+    var n_updates:          LogScalar[DT]
     # Per-minibatch policy/critic diagnostics (CPU diag walk; 0.0 on GPU
     # where the diag pass is skipped). Mirrors the DQN/C51 metrics pattern.
     var entropy:            LogScalar[DT]  # mean Gaussian entropy

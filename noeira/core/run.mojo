@@ -36,19 +36,29 @@ Usage:
 """
 
 from std.ffi import external_call
+from std.os import getenv
+from std.sys import argv
 from std.time import perf_counter_ns
 
 from noeira.core.concurrent.thread import OpaquePtr, null_opaque
 
 from noeira.core.kv import KvWriter, kv_lines
 from noeira.core.logger import Logger
-from noeira.core.project import runs_root_for
+from noeira.core.project import projects_root, runs_root_for
+from std.os.path import exists
 from noeira.io.fileio import file_size, write_text_atomic
 from noeira.io.proc import quote_arg, run_capture
 from noeira.io.sha256 import sha256_file, sha256_string
 
 
-comptime SCHEMA_VERSION = 1
+comptime SCHEMA_VERSION = 2
+"""2 (2026-09-23) added `pixi_env`, `arg`, `resume_args` and `source_patch` —
+what a run needs to be RE-RUN, not just identified. 1 is still read."""
+
+comptime SOURCE_PATCH_MAX_BYTES = 8 << 20
+"""A dirty tree's `git diff HEAD` goes into the run as `source.patch` up to
+this size. Past it the diff is not recording one experiment's change — it is
+a shared tree with other work in flight — and the run says so instead."""
 comptime DEFAULT_ROOT = "runs"
 """The flat root, used when the named project does not exist yet.
 
@@ -226,6 +236,126 @@ def git_dirty() -> Bool:
         return False
 
 
+def shell_word(a: String) -> String:
+    """`a` as one `/bin/sh` word: bare when it is only `[A-Za-z0-9_./:=,+@%-]`,
+    else single-quoted with `'` written `'\\''`. NEVER RAISES (unlike
+    `io/proc.quote_arg`, which refuses a quote): it runs on a training
+    driver's argv, and an odd argument must not stop a run.
+
+    ⚠ A NEWLINE BECOMES A SPACE — the one lossy case. A record line cannot
+    hold one (`core/kv.mojo`), and an argument with a newline in it is not
+    something a driver here has ever taken.
+    """
+    var bare = a.byte_length() > 0
+    var bytes = a.as_bytes()
+    for i in range(len(bytes)):
+        var c = Int(bytes[i])
+        var ok = (
+            (c >= ord("a") and c <= ord("z"))
+            or (c >= ord("A") and c <= ord("Z"))
+            or (c >= ord("0") and c <= ord("9"))
+            or c == ord("_") or c == ord(".") or c == ord("/")
+            or c == ord(":") or c == ord("=") or c == ord(",")
+            or c == ord("+") or c == ord("@") or c == ord("%")
+            or c == ord("-")
+        )
+        if not ok:
+            bare = False
+            break
+    if bare:
+        return a
+    var body = a.replace("\n", " ").replace("\r", " ").replace("'", "'\\''")
+    return "'" + body + "'"
+
+
+def run_command(driver: String, pixi_env: String, args: List[String]) -> String:
+    """`pixi run [-e <env>] mojo run -I . <driver> <args…>`, `args` already
+    shell words. ONE builder for `RunContext.reproduce_command`, the
+    dashboard's config and `project-rerun`, so the three cannot disagree."""
+    var cmd = String("pixi run ")
+    if pixi_env.byte_length() > 0 and pixi_env != "default":
+        cmd += "-e " + pixi_env + " "
+    cmd += "mojo run -I . " + driver
+    for a in args:
+        cmd += " " + a
+    return cmd^
+
+
+def resume_args_for(
+    args: List[String], template: String, ckpt: String
+) -> List[String]:
+    """A run's arguments (shell words) turned into a continuation from `ckpt`:
+    the flags `template` uses are removed with their values — so a run that
+    was itself a resume does not carry two `--resume`s — and the template is
+    appended with `{ckpt}` filled in.
+
+    A template flag takes a value when the next template token is not a flag
+    (`--resume {ckpt}`); a bare one (`--resume --ckpt {ckpt}`) does not.
+    """
+    var toks = List[String]()
+    for t in template.split(" "):
+        var x = String(t)
+        if x.byte_length() > 0:
+            toks.append(x)
+    var flags = List[String]()
+    var takes = List[Bool]()
+    for i in range(len(toks)):
+        if toks[i].startswith("--"):
+            flags.append(toks[i])
+            takes.append(i + 1 < len(toks) and not toks[i + 1].startswith("--"))
+    var out = List[String]()
+    var i = 0
+    while i < len(args):
+        var hit = -1
+        for f in range(len(flags)):
+            if args[i] == flags[f]:
+                hit = f
+        if hit < 0:
+            out.append(args[i])
+            i += 1
+        else:
+            i += 2 if takes[hit] else 1
+    for t in toks:
+        out.append(shell_word(t.replace("{ckpt}", ckpt)))
+    return out^
+
+
+def pixi_environment() -> String:
+    """The pixi environment this process runs in (`default`, `apple`,
+    `nvidia`), from `PIXI_ENVIRONMENT_NAME`; empty outside `pixi run`."""
+    return getenv("PIXI_ENVIRONMENT_NAME")
+
+
+def _write_source_patch(dir: String) -> String:
+    """Write `git diff HEAD --binary` into `<dir>/source.patch` and return
+    `source.patch`; or `too_large:<bytes>` / `` (no diff, not a work tree).
+
+    ⚠⚠ `dirty=1` ALONE MAKES A RUN IRREPRODUCIBLE, and in this tree most runs
+    are dirty: `source_commit` names code that did not run. The diff against
+    HEAD is the missing half. Untracked files are NOT in it — a new file the
+    run imported must be committed (or `git add -N`) to be captured.
+    """
+    try:
+        var size_s = String(
+            run_capture(
+                String("git diff HEAD --binary 2>/dev/null | wc -c"), 64
+            ).strip()
+        )
+        var size = atol(size_s) if size_s.byte_length() > 0 else 0
+        if size == 0:
+            return String("")
+        if size > SOURCE_PATCH_MAX_BYTES:
+            return String("too_large:") + String(size)
+        _ = run_capture(
+            String("git diff HEAD --binary > ")
+            + quote_arg(dir + "/source.patch") + " 2>/dev/null; true",
+            4096,
+        )
+        return String("source.patch")
+    except:
+        return String("")
+
+
 def _mkdir_p(path: String) raises:
     _ = run_capture(String("mkdir -p ") + quote_arg(path) + " 2>&1", 4096)
 
@@ -242,6 +372,61 @@ def _basename_noext(path: String) -> String:
     var start = cut + 1
     var end = dot if dot > start else path.byte_length()
     return String(path[byte=start:end])
+
+
+def resolve_checkpoint(handle: String, name: String = String("last")) raises -> String:
+    """The checkpoint a reader should load, from what a person typed.
+
+    `handle` is either a checkpoint FILE (used as is) or a RUN ID, found in the
+    flat `runs/` root or any `projects/*/runs/`, whose
+    `checkpoints/<name>.ckpt` is returned. Raises naming both roots when
+    neither matches — a viewer that silently fell back to a default path would
+    show the wrong policy.
+
+    ⚠⚠ WHY READERS NEED THIS. Training drivers write into their run directory
+    (`runs/<id>/checkpoints/last.ckpt`), so the fixed paths the eval, viewer
+    and deploy scripts used to hard-code stopped being written. A run id is
+    what `project-show` prints and what the dashboard shows; it is the handle
+    a person actually has.
+    """
+    if handle.byte_length() == 0:
+        raise Error(
+            "resolve_checkpoint: no checkpoint given — pass a run id (see"
+            " `pixi run project-show <project>`) or a .ckpt path"
+        )
+    if exists(handle):
+        return handle
+    var file = String("/checkpoints/") + name + ".ckpt"
+    if exists(String("runs/") + handle + file):
+        return String("runs/") + handle + file
+    var root = projects_root()
+    var listing = run_capture(
+        String("ls -d ") + quote_arg(root) + "/*/runs/" + quote_arg(handle)
+        + " 2>/dev/null; true",
+        1 << 16,
+    )
+    for line in listing.split("\n"):
+        var d = String(String(line).strip())
+        if d.byte_length() > 0 and exists(d + file):
+            return d + file
+    raise Error(
+        "resolve_checkpoint: '" + handle + "' is neither a file nor a run with "
+        + String(file[byte=1:]) + " under runs/ or " + root + "/*/runs/"
+    )
+
+
+def run_id_of_checkpoint(path: String) -> String:
+    """The run a checkpoint belongs to: `<id>` out of
+    `.../<id>/checkpoints/step_50000.ckpt`, or "" for a path that is not
+    inside a run directory. What a resuming driver passes as `resumed_from`,
+    so the new run's record names the run it continues rather than a file
+    path that stops meaning anything once the box is gone."""
+    var cut = path.find("/checkpoints/")
+    if cut <= 0:
+        return String("")
+    var head = String(path[byte=0:cut])
+    var slash = head.rfind("/")
+    return String(head[byte = slash + 1 :]) if slash >= 0 else head
 
 
 # =============================================================================
@@ -273,6 +458,13 @@ struct RunContext(Movable):
     var dirty: Bool
     var started: Int
     var resumed_from: String
+    var pixi_env: String
+    var args: List[String]
+    """The driver's arguments, `argv[1:]`, each as a `shell_word` — argv[0]
+    is the source file under `mojo run` and a build path for a binary, so
+    the DRIVER field, not it, names what to run again."""
+    var resume_args: String
+    var source_patch: String
     var _status: String
     var _outcome: String
     var _tag: String
@@ -316,6 +508,13 @@ struct RunContext(Movable):
         self.host = hostname()
         self.source_commit = git_commit()
         self.dirty = git_dirty()
+        self.pixi_env = pixi_environment()
+        self.args = List[String]()
+        var av = argv()
+        for i in range(1, len(av)):
+            self.args.append(shell_word(String(av[i])))
+        self.resume_args = String("")
+        self.source_patch = String("")
         self.id = derive_run_id(
             date_utc(self.started),
             self.slug,
@@ -335,6 +534,8 @@ struct RunContext(Movable):
         self._closed = False
         _mkdir_p(self.dir + "/checkpoints")
         _mkdir_p(self.dir + "/eval")
+        if self.dirty:
+            self.source_patch = _write_source_patch(self.dir)
         self._flush()
 
     def __init__(out self, *, deinit move: Self):
@@ -353,6 +554,10 @@ struct RunContext(Movable):
         self.dirty = move.dirty
         self.started = move.started
         self.resumed_from = move.resumed_from^
+        self.pixi_env = move.pixi_env^
+        self.args = move.args^
+        self.resume_args = move.resume_args^
+        self.source_patch = move.source_patch^
         self._status = move._status^
         self._outcome = move._outcome^
         self._tag = move._tag^
@@ -423,6 +628,36 @@ struct RunContext(Movable):
         self._status = status
         self._flush()
 
+    def set_resume_args(mut self, template: String) raises:
+        """Declare how THIS driver continues from a checkpoint: the arguments
+        that load one, with `{ckpt}` where its path goes — `--resume {ckpt}`,
+        `--resume --ckpt {ckpt}`. `project-resume` reads it.
+
+        ⚠⚠ NO DRIVER HERE RESUMES BIT-EXACTLY: no checkpoint carries the
+        replay buffer, so every continuation re-warms it. What a declaration
+        promises is only that the flag loads the checkpoint into a run that
+        carries on (weights, optimizer state, the `K` scalars the trainer
+        saves). A driver whose flag is a WARM START ONLY — weights loaded, the
+        step counter and schedules reset, like the SAC family's `--init` —
+        does not declare one: overlaying that curve on its parent's is
+        comparing two different runs.
+        """
+        if template.find("{ckpt}") < 0:
+            raise Error(
+                "set_resume_args: the template must contain {ckpt}: " + template
+            )
+        self.resume_args = template
+        self._flush()
+
+    def reproduce_command(self) -> String:
+        """The command that runs this driver again with the same arguments.
+
+        It does not check out `source_commit` or apply `source.patch`: that is
+        the caller's (`project-rerun`, the dashboard) — this is the one line
+        that is true on any checkout.
+        """
+        return run_command(self.driver, self.pixi_env, self.args)
+
     def add_artifact(mut self, rel_path: String) raises:
         """Record a file this run produced, content-addressed.
 
@@ -431,13 +666,53 @@ struct RunContext(Movable):
         loop that writes `best` every N steps. P3b's `ArtifactSink` is what
         moves the hashing off the training thread.
         """
-        var full = self.dir + "/" + rel_path
-        var digest = sha256_file(full)
-        self._artifacts.append(
-            rel_path + ":sha256:" + digest + ":" + String(file_size(full))
-            + ":local"
-        )
+        self._record(rel_path)
         self._flush()
+
+    def _record(mut self, rel_path: String) raises:
+        """One `artifact=` entry, REPLACING any earlier one for the same path:
+        `checkpoints/best.ckpt` is rewritten on every improvement, and the
+        record must describe the bytes on disk, not the first ones."""
+        var full = self.dir + "/" + rel_path
+        var entry = (
+            rel_path + ":sha256:" + sha256_file(full) + ":"
+            + String(file_size(full)) + ":local"
+        )
+        var prefix = rel_path + ":"
+        for i in range(len(self._artifacts)):
+            if self._artifacts[i].startswith(prefix):
+                self._artifacts[i] = entry
+                return
+        self._artifacts.append(entry)
+
+    def record_artifacts(mut self) raises:
+        """Record every file the run left in its directory: `checkpoints/`,
+        `eval/`, `metrics.csv` and its `metrics.config.kv`. `close()` calls
+        this.
+
+        ⚠⚠ THIS IS WHY `run.kv` HAS `artifact=` LINES AT ALL. `add_artifact`
+        existed from P0c and had ZERO callers: all 74 run records on disk
+        carried none, and `project-push` — which pushes exactly what `run.kv`
+        lists — pushed nothing for every one of them. Asking each driver to
+        remember a call per checkpoint is the rule-at-every-site shape that
+        failed; the run directory already IS the list, so it is read once, at
+        the end, in one place.
+
+        ⚠ IT HASHES EVERY FILE, once, at close — seconds for an ACT run's two
+        215 MB checkpoints. A run that dies before `close()` records nothing;
+        `project-push` scans the same directories for exactly that case.
+        """
+        var listing = run_capture(
+            String("cd ") + quote_arg(self.dir)
+            + " && { find checkpoints eval -type f ! -name '*.tmp' 2>/dev/null;"
+            + " for f in metrics.csv metrics.config.kv source.patch; do"
+            + " [ -f $f ] && echo $f; done; } | sort; true",
+            1 << 20,
+        )
+        for line in listing.split("\n"):
+            var rel = String(String(line).strip())
+            if rel.byte_length() > 0:
+                self._record(rel)
 
     def close(mut self, status: String = String("")) raises:
         """Write `finished` and the terminal status. Idempotent.
@@ -450,6 +725,12 @@ struct RunContext(Movable):
         if self._closed:
             return
         self._closed = True
+        # ⚠ Never fatal: a run that trained must still close with its status
+        # even if a file could not be hashed.
+        try:
+            self.record_artifacts()
+        except e:
+            print("  [run] could not record artifacts:", e)
         if status.byte_length() > 0:
             self._status = status
         elif self._status == String("running"):
@@ -498,6 +779,11 @@ struct RunContext(Movable):
             w.add(String("artifact"), self._artifacts[i])
         w.add(String("tag"), self._tag)
         w.add(String("resumed_from"), self.resumed_from)
+        w.add(String("pixi_env"), self.pixi_env)
+        for a in self.args:
+            w.add(String("arg"), a)
+        w.add(String("resume_args"), self.resume_args)
+        w.add(String("source_patch"), self.source_patch)
         return w^.done()
 
     def _flush(mut self) raises:
@@ -529,6 +815,14 @@ def register_run[L: Logger](ref run: RunContext, mut logger: L) raises:
         logger.set_config(String("source_commit"), run.source_commit)
     logger.set_config(String("seed"), String(run.seed))
     logger.set_config(String("host"), run.host)
+    # What the dashboard needs to show "run this again" — the command, and
+    # whether the commit alone reproduces it.
+    logger.set_config(String("command"), run.reproduce_command())
+    logger.set_config(String("dirty"), String(1) if run.dirty else String(0))
+    if run.source_patch.byte_length() > 0:
+        logger.set_config(String("source_patch"), run.source_patch)
+    if run.resume_args.byte_length() > 0:
+        logger.set_config(String("resume_args"), run.resume_args)
     logger.register()
 
 
@@ -540,13 +834,14 @@ def register_run[L: Logger](ref run: RunContext, mut logger: L) raises:
 comptime _KNOWN_KEYS = (
     "schema_version run_id project driver env task dataset source_commit"
     " dirty seed host device started finished status outcome config artifact"
-    " tag resumed_from"
+    " tag resumed_from pixi_env arg resume_args source_patch"
 )
 
 
 struct RunRecord(Movable):
     """A `run.kv` as read back. The retrieval half of `RunContext`."""
 
+    var schema_version: Int
     var run_id: String
     var project: String
     var driver: String
@@ -564,10 +859,15 @@ struct RunRecord(Movable):
     var outcome: String
     var tag: String
     var resumed_from: String
+    var pixi_env: String
+    var args: List[String]
+    var resume_args: String
+    var source_patch: String
     var config: List[String]
     var artifacts: List[String]
 
     def __init__(out self):
+        self.schema_version = 0
         self.run_id = String("")
         self.project = String("")
         self.driver = String("")
@@ -585,6 +885,10 @@ struct RunRecord(Movable):
         self.outcome = String("")
         self.tag = String("")
         self.resumed_from = String("")
+        self.pixi_env = String("")
+        self.args = List[String]()
+        self.resume_args = String("")
+        self.source_patch = String("")
         self.config = List[String]()
         self.artifacts = List[String]()
 
@@ -647,12 +951,21 @@ def parse_run(text: String, what: String) raises -> RunRecord:
             r.tag = v
         elif k == "resumed_from":
             r.resumed_from = v
+        elif k == "pixi_env":
+            r.pixi_env = v
+        elif k == "arg":
+            r.args.append(v)
+        elif k == "resume_args":
+            r.resume_args = v
+        elif k == "source_patch":
+            r.source_patch = v
         elif k == "config":
             r.config.append(v)
         elif k == "artifact":
             r.artifacts.append(v)
         elif k == "schema_version":
-            if v != String(SCHEMA_VERSION):
+            r.schema_version = atol(v) if v.byte_length() > 0 else 0
+            if v != String(SCHEMA_VERSION) and v != String("1"):
                 raise Error(
                     what + ": schema_version " + v + ", this build writes "
                     + String(SCHEMA_VERSION)

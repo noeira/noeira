@@ -87,6 +87,15 @@ MODEL and returns a plausible calibration — fx 602.311 against cv2's 602.379,
 a disagreement in the fourth digit that no sanity check on "is fx near 600"
 would ever catch. The bit-equality gate caught it on the first run. PRINT EVERY
 CONSTANT FROM THE INSTALLED cv2."""
+comptime FISHEYE_CALIB_USE_INTRINSIC_GUESS: Int = 1
+comptime FISHEYE_CALIB_FIX_K2: Int = 0x40
+comptime FISHEYE_CALIB_FIX_K3: Int = 0x80
+comptime FISHEYE_CALIB_FIX_K4: Int = 0x800
+comptime FISHEYE_CALIB_RECOMPUTE_EXTRINSIC: Int = 1 << 23
+comptime FISHEYE_CALIB_CHECK_COND: Int = 1 << 24
+comptime FISHEYE_CALIB_FIX_SKEW: Int = 1 << 25
+"""`cv::CALIB_*` for `cv::fisheye::calibrate`, read off OpenCV 5.0's
+`calib.hpp` (they are shared enum values there, "for fisheye model only")."""
 
 
 # ═══════════════════════════════════════════════════════════════════════════
@@ -1010,6 +1019,147 @@ def calibrate_camera(
         "calibrate_camera",
     )
     return (Int(n_dist), rms)
+
+
+def fisheye_calibrate(
+    obj_xyz: List[Float64],
+    img_xy: List[Float64],
+    counts: List[Int32],
+    img_w: Int,
+    img_h: Int,
+    mut k: List[Float64],
+    mut d: List[Float64],
+    mut rvecs: List[Float64],
+    mut tvecs: List[Float64],
+    flags: Int = FISHEYE_CALIB_RECOMPUTE_EXTRINSIC | FISHEYE_CALIB_FIX_SKEW,
+) raises -> Float64:
+    """`cv::fisheye::calibrate` — the Kannala-Brandt model, 4 terms. Returns
+    the rms reprojection error in pixels; `k` gets 9 (row-major), `d` 4,
+    `rvecs` / `tvecs` 3 per view. Same concatenated layout as
+    `calibrate_camera`.
+
+    ⚠ THE RUNTIME MODEL IS `vision/fisheye.mojo`, NOT THIS. This is the fit;
+    what the importer and the deploy path evaluate is the Mojo port, gated
+    against `fisheye_project` / `fisheye_undistort_map` below."""
+    var nv = len(counts)
+    # ⚠ `k` / `d` are IN-OUT: under `FISHEYE_CALIB_USE_INTRINSIC_GUESS` their
+    # contents are the starting point, so they are resized, never cleared.
+    k.resize(9, 0.0)
+    d.resize(4, 0.0)
+    rvecs.resize(nv * 3, 0.0)
+    tvecs.resize(nv * 3, 0.0)
+    var rms = Float64(0.0)
+    _check(
+        _get_dylib_function[
+            lib,
+            "nra_cv_fisheye_calibrate",
+            def(
+                Ptr[Float64, MutUntrackedOrigin],
+                Ptr[Float64, MutUntrackedOrigin],
+                Ptr[Int32, MutUntrackedOrigin],
+                Int32,
+                Int32,
+                Int32,
+                Int32,
+                Ptr[Float64, MutUntrackedOrigin],
+                Ptr[Float64, MutUntrackedOrigin],
+                Ptr[Float64, MutUntrackedOrigin],
+                Ptr[Float64, MutUntrackedOrigin],
+                Ptr[Float64, MutUntrackedOrigin],
+            ) thin -> Int32,
+        ]()(
+            untracked(Ptr(to=obj_xyz[0])),
+            untracked(Ptr(to=img_xy[0])),
+            untracked(Ptr(to=counts[0])),
+            Int32(nv),
+            Int32(img_w),
+            Int32(img_h),
+            Int32(flags),
+            untracked(Ptr(to=k[0])),
+            untracked(Ptr(to=d[0])),
+            untracked(Ptr(to=rms)),
+            untracked(Ptr(to=rvecs[0])),
+            untracked(Ptr(to=tvecs[0])),
+        ),
+        "fisheye_calibrate",
+    )
+    return rms
+
+
+def fisheye_project(
+    obj_xyz: List[Float64],
+    rvec: List[Float64],
+    tvec: List[Float64],
+    k: List[Float64],
+    d: List[Float64],
+    mut img_xy: List[Float64],
+) raises:
+    """`cv::fisheye::projectPoints` — the ORACLE the Mojo model is gated on."""
+    var n = len(obj_xyz) // 3
+    img_xy.resize(n * 2, 0.0)
+    _check(
+        _get_dylib_function[
+            lib,
+            "nra_cv_fisheye_project",
+            def(
+                Ptr[Float64, MutUntrackedOrigin],
+                Int32,
+                Ptr[Float64, MutUntrackedOrigin],
+                Ptr[Float64, MutUntrackedOrigin],
+                Ptr[Float64, MutUntrackedOrigin],
+                Ptr[Float64, MutUntrackedOrigin],
+                Ptr[Float64, MutUntrackedOrigin],
+            ) thin -> Int32,
+        ]()(
+            untracked(Ptr(to=obj_xyz[0])),
+            Int32(n),
+            untracked(Ptr(to=rvec[0])),
+            untracked(Ptr(to=tvec[0])),
+            untracked(Ptr(to=k[0])),
+            untracked(Ptr(to=d[0])),
+            untracked(Ptr(to=img_xy[0])),
+        ),
+        "fisheye_project",
+    )
+
+
+def fisheye_undistort_map(
+    k: List[Float64],
+    d: List[Float64],
+    k_new: List[Float64],
+    out_w: Int,
+    out_h: Int,
+    mut map_x: List[Float32],
+    mut map_y: List[Float32],
+) raises:
+    """`cv::fisheye::initUndistortRectifyMap` (R = I, P = `k_new`), float
+    maps `[out_h * out_w]` — the ORACLE for `fisheye.UndistortMap`."""
+    map_x.resize(out_w * out_h, 0.0)
+    map_y.resize(out_w * out_h, 0.0)
+    _check(
+        _get_dylib_function[
+            lib,
+            "nra_cv_fisheye_undistort_map",
+            def(
+                Ptr[Float64, MutUntrackedOrigin],
+                Ptr[Float64, MutUntrackedOrigin],
+                Ptr[Float64, MutUntrackedOrigin],
+                Int32,
+                Int32,
+                Ptr[Float32, MutUntrackedOrigin],
+                Ptr[Float32, MutUntrackedOrigin],
+            ) thin -> Int32,
+        ]()(
+            untracked(Ptr(to=k[0])),
+            untracked(Ptr(to=d[0])),
+            untracked(Ptr(to=k_new[0])),
+            Int32(out_w),
+            Int32(out_h),
+            untracked(Ptr(to=map_x[0])),
+            untracked(Ptr(to=map_y[0])),
+        ),
+        "fisheye_undistort_map",
+    )
 
 
 # ═══════════════════════════════════════════════════════════════════════════

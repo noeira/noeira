@@ -1,6 +1,6 @@
 ---
 title: Robots
-description: The real-world half of noeira — an SO-101 arm over its Feetech bus, UVC cameras, and a Jetson Orin — and the safety rules every program that touches it follows.
+description: The real-world half of noeira — robot drivers, cameras, recording and on-robot deployment, with the SO-101 arm on a Jetson Orin as the first supported rig — and the safety rules every program that touches hardware follows.
 ---
 
 import Maturity from '~/components/Maturity.astro';
@@ -10,7 +10,10 @@ import Maturity from '~/components/Maturity.astro';
 noeira drives a real robot arm with the same code that trains in simulation.
 The servo bus, the camera pipeline, the dataset writer and the policy runtime
 are all Mojo, so nothing sits between a trained checkpoint and the arm except
-the program that loads it.
+the program that loads it. The first supported rig is the SO-101 arm with two
+cameras and a Jetson Orin; the pages below are written for it, and the
+layering underneath — servo bus, camera pipeline, dataset writer, policy
+runtime — is what another robot would plug into.
 
 ## The loop
 
@@ -19,7 +22,7 @@ the program that loads it.
 | 1. Sim twin | The rig as a task family, with the same two cameras and the same 30 Hz cadence | [Sim twin](/robots/sim-twin/) |
 | 2. Set up | Build the serial shim, check the bus, calibrate each arm | [SO-101 setup](/robots/so101-setup/) |
 | 3. Cameras | Intrinsics with a ChArUco board, then the camera-to-base transform | [Cameras](/robots/cameras/) |
-| 4. Record | The leader drives the follower; every tick goes into a LeRobot v3 dataset | [Teleop and recording](/robots/teleop-recording/) |
+| 4. Record | The leader drives the follower; every tick goes into a dataset in the LeRobot v3 format | [Teleop and recording](/robots/teleop-recording/) |
 | 5. Train | Import the dataset and train ACT or fine-tune SmolVLA | [Imitation learning](/algorithms/imitation/) |
 | 6. Deploy | The policy drives the follower from the live cameras | [Deployment](/robots/deployment/) |
 | 7. On the robot | The same programs on a Jetson Orin NX, policy on its GPU | [Jetson Orin](/robots/jetson/) |

@@ -85,6 +85,8 @@ from noeira.physics3d.gpu.constants import (
     JOINT_IDX_QPOS_ADR,
     METADATA_SIZE,
     META_IDX_STEP_COUNT,
+    META_IDX_PHI_PREV,
+    META_IDX_EPISODE_FLAGS,
     META_IDX_TASK_PARAM_0,
     META_IDX_TASK_PARAM_6,
     META_IDX_NUM_CONTACTS,
@@ -2127,6 +2129,10 @@ struct Phyics3dBatchedEnv[
         Self.CONFIG.init_act_gpu[DT, Self.N_ENVS, Self.NA_F](act, env, seed)
 
         meta[env, META_IDX_STEP_COUNT] = Scalar[DT](0.0)
+        # The reward's per-episode state (`constants.META_IDX_PHI_PREV`): a
+        # potential delta must not span the episode boundary.
+        meta[env, META_IDX_PHI_PREV] = Scalar[DT](0.0)
+        meta[env, META_IDX_EPISODE_FLAGS] = Scalar[DT](0.0)
         Self.CONFIG.pre_step_full_gpu[DT, Self.N_ENVS, Self.NQ, Self.NV](
             qpos, qvel, meta, env
         )

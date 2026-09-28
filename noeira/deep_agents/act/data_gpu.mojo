@@ -55,6 +55,15 @@ from noeira.nn.core.tensor import Tensor, TensorImpl
 from noeira.io.hdf5 import H5Dataset
 
 from .data import ACTDataset
+from .augment import (
+    AUG_SALT,
+    AUG_UNIFORMS,
+    AUG_WORDS,
+    ImageAugConfig,
+    aug_param,
+    aug_src_index,
+    aug_value_u8,
+)
 from .config import (
     IMAGENET_MEAN_R,
     IMAGENET_MEAN_G,
@@ -192,6 +201,106 @@ def _act_gather_images_kernel[
     out_img[i] = (v - mean) * (Scalar[DT](1.0) / std)
 
 
+# ── augmentation (docs/DOMAIN_RANDOMIZATION_PLAN.md, Phase 1) ─────────────
+
+
+def _act_aug_draw_kernel[
+    B: Int, N_CAM: Int, IMG_H: Int, IMG_W: Int
+](
+    params: LayoutTensor[DT, Layout.row_major(B * N_CAM * AUG_WORDS), MutAnyOrigin],
+    seed: UInt64,
+    offset_buf: LayoutTensor[U64, Layout.row_major(1), MutAnyOrigin],
+    brightness: Float32,
+    contrast: Float32,
+    gamma: Float32,
+    gain: Float32,
+    noise_sigma: Float32,
+    max_shift: Int32,
+    cutout_prob: Float32,
+    cutout_max_frac: Float32,
+):
+    """Thread `(b, cam)` draws its record — `augment.aug_param` from 16
+    Philox uniforms.
+
+    ⚠ Reads the SAME device offset as `_act_draw_kernel`, and runs BEFORE the
+    advance kernel, so pinning the offset (`set_offset`, validation) pins the
+    augmentation too and `offset_host` keeps its `+= 2*B` rule. The streams
+    are separated by the SEED (`seed ^ AUG_SALT`), not by the offset."""
+    var t = Int(global_idx.x)
+    if t >= B * N_CAM:
+        return
+    var philox = PhiloxRandom(
+        seed=(seed ^ AUG_SALT) + UInt64(t),
+        offset=rebind[UInt64](offset_buf[0]),
+    )
+    var u = SIMD[DType.float32, AUG_UNIFORMS](0.0)
+    comptime for k in range(AUG_UNIFORMS // 4):
+        var r = philox.step_uniform()
+        comptime for j in range(4):
+            u[4 * k + j] = Float32(r[j])
+    var cfg = ImageAugConfig(
+        True, brightness, contrast, gamma, gain, noise_sigma, Int(max_shift),
+        cutout_prob, cutout_max_frac,
+    )
+    var p = aug_param(cfg, u, IMG_H, IMG_W)
+    comptime for w in range(AUG_WORDS):
+        params[t * AUG_WORDS + w] = Scalar[DT](p[w])
+
+
+def _act_gather_images_aug_kernel[
+    B: Int, N_CAM: Int, IMG_H: Int, IMG_W: Int
+](
+    src: Pointer[Scalar[U8], MutAnyOrigin],
+    g: LayoutTensor[I32, Layout.row_major(B), MutAnyOrigin],
+    params: LayoutTensor[DT, Layout.row_major(B * N_CAM * AUG_WORDS), MutAnyOrigin],
+    out_img: LayoutTensor[
+        DT, Layout.row_major(B * N_CAM * 3 * IMG_H * IMG_W), MutAnyOrigin
+    ],
+    n_rows: Int64,
+):
+    """`_act_gather_images_kernel` with the augmented byte in place of the
+    stored one. Everything after the byte — `/255`, ImageNet, `* (1/std)` —
+    is the SAME arithmetic, which is what keeps the normalisation the one
+    rule the deploy path shares.
+
+    ⚠ `src` stays a raw pointer for the int32-wrap reason documented on the
+    un-augmented kernel."""
+    comptime HW = IMG_H * IMG_W
+    comptime CAM_ELEMS = 3 * HW
+    comptime IMG_ELEMS = N_CAM * CAM_ELEMS
+    var i = Int(global_idx.x)
+    if i >= B * IMG_ELEMS:
+        return
+    var b = i // IMG_ELEMS
+    var e = i % IMG_ELEMS
+    var cam = e // CAM_ELEMS
+    var within = e % CAM_ELEMS
+    var ch = within // HW
+    var pl = within % HW
+    var y = pl // IMG_W
+    var x = pl % IMG_W
+
+    var p = SIMD[DType.float32, AUG_WORDS](0.0)
+    var pbase = (b * N_CAM + cam) * AUG_WORDS
+    comptime for w in range(AUG_WORDS):
+        p[w] = Float32(rebind[Scalar[DT]](params[pbase + w]))
+
+    var row = Int(g[b])
+    var flat = row * IMG_ELEMS + cam * CAM_ELEMS + ch * HW + aug_src_index(
+        p, y, x, IMG_H, IMG_W
+    )
+    var byte = aug_value_u8(p, src[unsafe_offset=flat], ch, y, x, within)
+
+    var mean = Scalar[DT](IMAGENET_MEAN_R) if ch == 0 else (
+        Scalar[DT](IMAGENET_MEAN_G) if ch == 1 else Scalar[DT](IMAGENET_MEAN_B)
+    )
+    var std = Scalar[DT](IMAGENET_STD_R) if ch == 0 else (
+        Scalar[DT](IMAGENET_STD_G) if ch == 1 else Scalar[DT](IMAGENET_STD_B)
+    )
+    var v = Scalar[DT](Int(byte)) / Scalar[DT](255.0)
+    out_img[i] = (v - mean) * (Scalar[DT](1.0) / std)
+
+
 def _act_gather_qpos_kernel[
     B: Int, QPOS: Int
 ](
@@ -291,6 +400,12 @@ struct ACTDeviceDataset[
     the best model."""
     var seed: UInt64
 
+    var aug: ImageAugConfig
+    """Training-batch augmentation. `off` (the default) runs the original
+    gather kernel; validation batches are NEVER augmented."""
+    var aug_params: Tensor
+    """[B, N_CAM, AUG_WORDS] — the records the last augmented gather used."""
+
     def __init__(out self):
         self.images_u8 = TensorImpl[U8]()
         self.qpos_raw = Tensor()
@@ -311,6 +426,8 @@ struct ACTDeviceDataset[
         self.rng_offset = TensorImpl[U64]()
         self.offset_host = 0
         self.seed = 0
+        self.aug = ImageAugConfig.off()
+        self.aug_params = Tensor()
 
     def __init__(out self, *, deinit move: Self):
         self.images_u8 = move.images_u8^
@@ -332,6 +449,8 @@ struct ACTDeviceDataset[
         self.rng_offset = move.rng_offset^
         self.offset_host = move.offset_host
         self.seed = move.seed
+        self.aug = move.aug
+        self.aug_params = move.aug_params^
 
     @staticmethod
     def upload_from[
@@ -414,8 +533,17 @@ struct ACTDeviceDataset[
         d.g = TensorImpl[I32].alloc_gpu(ctx, B)
         d.n_real = TensorImpl[I32].alloc_gpu(ctx, B)
         d.rng_offset = TensorImpl[U64].alloc_gpu(ctx, 1)
+        # Allocated even while augmentation is off, so turning it on later
+        # allocates nothing (a capture region cannot).
+        d.aug_params = Tensor.alloc_gpu(ctx, B * Self.N_CAM * AUG_WORDS)
         ctx.synchronize()
         return d^
+
+    def set_augment(mut self, cfg: ImageAugConfig):
+        """Augment TRAINING batches from now on (`off` restores the original
+        gather). Validation batches are never augmented: `best_val` must rank
+        models, not draws."""
+        self.aug = cfg
 
     def sample[
         B: Int, K: Int
@@ -444,13 +572,37 @@ struct ACTDeviceDataset[
             grid_dim=nb,
             block_dim=TPB,
         )
+        var augment = self.aug.enabled and not val
+        if augment:
+            comptime na = (B * Self.N_CAM + TPB - 1) // TPB
+            ctx.enqueue_function[
+                _act_aug_draw_kernel[B, Self.N_CAM, Self.IMG_H, Self.IMG_W]
+            ](
+                self.aug_params.lt[
+                    "gpu", Layout.row_major(B * Self.N_CAM * AUG_WORDS)
+                ](),
+                self.seed,
+                self.rng_offset.lt["gpu", Layout.row_major(1)](),
+                self.aug.brightness,
+                self.aug.contrast,
+                self.aug.gamma,
+                self.aug.gain,
+                self.aug.noise_sigma,
+                Int32(self.aug.max_shift),
+                self.aug.cutout_prob,
+                self.aug.cutout_max_frac,
+                grid_dim=na,
+                block_dim=TPB,
+            )
         ctx.enqueue_function[_act_advance_offset_kernel[B]](
             self.rng_offset.lt["gpu", Layout.row_major(1)](),
             grid_dim=1,
             block_dim=1,
         )
         self.offset_host += UInt64(B * 2)
-        self._gather[B, K](out_qpos, out_images, out_actions, out_valid, ctx)
+        self._gather[B, K](
+            out_qpos, out_images, out_actions, out_valid, ctx, augment
+        )
 
     def note_replayed_sample[B: Int](mut self):
         """Advance the HOST mirror for a `sample` that ran as a graph REPLAY.
@@ -500,6 +652,39 @@ struct ACTDeviceDataset[
         self.n_real.upload_resident(ctx)
         self._gather[B, K](out_qpos, out_images, out_actions, out_valid, ctx)
 
+    def gather_at_augmented[
+        B: Int, K: Int
+    ](
+        mut self,
+        rows: List[Int],
+        n_reals: List[Int],
+        params: List[Scalar[DT]],
+        mut out_qpos: Tensor,
+        mut out_images: Tensor,
+        mut out_actions: Tensor,
+        mut out_valid: Tensor,
+        ctx: DeviceContext,
+    ) raises:
+        """`gather_at` with EXPLICIT augmentation records
+        (`[B, N_CAM, AUG_WORDS]`) — the parity entry point for the augmented
+        kernel against `augment_camera_u8` + `normalize_camera_chw`."""
+        if len(params) != B * Self.N_CAM * AUG_WORDS:
+            raise Error("gather_at_augmented: params must be B*N_CAM*AUG_WORDS")
+        self.g.ensure(B)
+        self.n_real.ensure(B)
+        for b in range(B):
+            self.g.data[b] = Int32(rows[b])
+            self.n_real.data[b] = Int32(n_reals[b])
+        self.aug_params.ensure(B * Self.N_CAM * AUG_WORDS)
+        for i in range(len(params)):
+            self.aug_params.data[i] = params[i]
+        self.g.upload_resident(ctx)
+        self.n_real.upload_resident(ctx)
+        self.aug_params.upload_resident(ctx)
+        self._gather[B, K](
+            out_qpos, out_images, out_actions, out_valid, ctx, True
+        )
+
     def _gather[
         B: Int, K: Int
     ](
@@ -509,6 +694,7 @@ struct ACTDeviceDataset[
         mut out_actions: Tensor,
         mut out_valid: Tensor,
         ctx: DeviceContext,
+        augment: Bool = False,
     ) raises:
         out_qpos.ensure_gpu(ctx, B * Self.QPOS)
         out_images.ensure_gpu(ctx, B * Self.IMG_ELEMS)
@@ -516,18 +702,35 @@ struct ACTDeviceDataset[
         out_valid.ensure_gpu(ctx, B * K)
 
         comptime nimg = (B * Self.IMG_ELEMS + TPB - 1) // TPB
-        ctx.enqueue_function[
-            _act_gather_images_kernel[
-                B, Self.IMG_ELEMS, Self.CAM_ELEMS, Self.HW
-            ]
-        ](
-            self.images_u8.dev.value(),
-            self.g.lt["gpu", Layout.row_major(B)](),
-            out_images.lt["gpu", Layout.row_major(B * Self.IMG_ELEMS)](),
-            Int64(self.n_rows),
-            grid_dim=nimg,
-            block_dim=TPB,
-        )
+        if augment:
+            ctx.enqueue_function[
+                _act_gather_images_aug_kernel[
+                    B, Self.N_CAM, Self.IMG_H, Self.IMG_W
+                ]
+            ](
+                self.images_u8.dev.value(),
+                self.g.lt["gpu", Layout.row_major(B)](),
+                self.aug_params.lt[
+                    "gpu", Layout.row_major(B * Self.N_CAM * AUG_WORDS)
+                ](),
+                out_images.lt["gpu", Layout.row_major(B * Self.IMG_ELEMS)](),
+                Int64(self.n_rows),
+                grid_dim=nimg,
+                block_dim=TPB,
+            )
+        else:
+            ctx.enqueue_function[
+                _act_gather_images_kernel[
+                    B, Self.IMG_ELEMS, Self.CAM_ELEMS, Self.HW
+                ]
+            ](
+                self.images_u8.dev.value(),
+                self.g.lt["gpu", Layout.row_major(B)](),
+                out_images.lt["gpu", Layout.row_major(B * Self.IMG_ELEMS)](),
+                Int64(self.n_rows),
+                grid_dim=nimg,
+                block_dim=TPB,
+            )
         comptime nq = (B * Self.QPOS + TPB - 1) // TPB
         ctx.enqueue_function[_act_gather_qpos_kernel[B, Self.QPOS]](
             self.qpos_raw.lt["gpu", Layout.row_major(1)](),

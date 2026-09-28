@@ -8,7 +8,7 @@
    Dark mode is the faithful brand theme; light mode is a
    cool blue-cast derivation (the source system is dark-only).
 
-   Mirrors noeira-cloud/client/src/index.css. Keep in sync.
+   Mirrors noeira cloud's design tokens. Keep in sync.
    ============================================================ */
 
 @import '@fontsource-variable/manrope/index.css';

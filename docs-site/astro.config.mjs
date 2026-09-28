@@ -296,7 +296,6 @@ export default defineConfig({
 					label: 'Project',
 					items: [
 						{ label: 'Toolchain', slug: 'project/toolchain' },
-						{ label: 'Cloud GPU boxes', slug: 'project/cloud-gpu' },
 						{ label: 'Testing', slug: 'project/testing' },
 						{ label: 'Contributing', slug: 'project/contributing' },
 					],

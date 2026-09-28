@@ -404,10 +404,20 @@ def test_act_l2_margin_leaves_the_band_alone() raises:
         before — the adaptive scale had been switched on by the penalty and
         held mean|a| at 0.27 against 0.73, with the hinge itself doing
         nothing (§18.7.1).
-      * the 0.8 hinge must not raise mean|a| and must leave fewer actions
-        above 0.9 than no penalty.
+      * the CROSSED hinge must not raise mean|a| and must leave fewer actions
+        above the margin than no penalty.
+
+    ⚠ The crossed arm used margin 0.8 and counted actions above 0.9. The
+    actor's outputs sit at mean|a| ~= 0.54, so exactly ONE element of
+    `BATCH * ACT` was ever above 0.9 — the leg passed or failed on a single
+    element flipping, and it flipped the moment `L_ortho` moved to the
+    reference's scale (docs §12.28) and shifted the trajectory. The hinge code
+    was not involved. The margin is now 0.3, BELOW where the actions sit, so
+    the penalty demonstrably engages, and `above[0]` is asserted non-trivial
+    so the leg can still fail.
     """
-    print("[6b] act_l2_margin: an uncrossed margin is invisible; 0.8 caps ...")
+    comptime HINGE_M = 0.3
+    print("[6b] act_l2_margin: an uncrossed margin is invisible; a crossed one caps ...")
     var probe = Tensor.alloc(BATCH * OBS)
     for i in range(BATCH * OBS):
         probe.data[i] = Scalar[DT](0.17 * Float64(i % 11) - 0.8)
@@ -416,7 +426,7 @@ def test_act_l2_margin_leaves_the_band_alone() raises:
     var above = List[Int]()
     for variant in range(3):
         var w = 0.0 if variant == 0 else 2.0
-        var m = 0.999 if variant == 1 else 0.8
+        var m = 0.999 if variant == 1 else HINGE_M
         seed(SEED)
         var t = Trainer.make(lr=3e-3, act_l2_weight=w, act_l2_margin=m)
         seed(SEED + 9)
@@ -435,22 +445,32 @@ def test_act_l2_margin_leaves_the_band_alone() raises:
         for i in range(BATCH * ACT):
             var v = abs(Float64(out.data[i]))
             acc += v
-            if v > 0.9:
+            if v > HINGE_M:
                 n_above += 1
         means.append(acc / Float64(BATCH * ACT))
         above.append(n_above)
     print("      mean|a|:  none ->", means[0], "  hinge@0.999 ->", means[1],
-          "  hinge@0.8 ->", means[2])
-    print("      |a|>0.9:  none ->", above[0], "  hinge@0.999 ->", above[1],
-          "  hinge@0.8 ->", above[2])
+          "  hinge@", HINGE_M, "->", means[2])
+    print("      |a|>", HINGE_M, ":  none ->", above[0], "  hinge@0.999 ->",
+          above[1], "  hinge@", HINGE_M, "->", above[2])
+    assert_true(
+        above[0] >= (BATCH * ACT) // 10,
+        "vacuous: only " + String(above[0]) + " of " + String(BATCH * ACT)
+        + " actions clear the margin without a penalty, so 'the hinge caps'"
+        " is decided by a handful of elements and flips on any trajectory"
+        " change",
+    )
     assert_true(
         abs(means[1] - means[0]) < 1e-6,
         "a margin no action crosses CHANGED the actor (" + String(means[0])
         + " vs " + String(means[1]) + ") — something other than the hinge is"
         " reacting to act_l2_weight > 0",
     )
-    assert_true(means[2] <= means[0] + 1e-6, "the 0.8 hinge raised mean|a|")
-    assert_true(above[2] <= above[0], "the 0.8 hinge left more actions above 0.9")
+    assert_true(means[2] <= means[0] + 1e-6, "the crossed hinge raised mean|a|")
+    assert_true(
+        above[2] <= above[0],
+        "the crossed hinge left more actions above the margin",
+    )
 
 
 def main() raises:

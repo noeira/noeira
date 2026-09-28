@@ -145,8 +145,9 @@ from std.time import perf_counter_ns
 from max.gpu.host import DeviceContext
 
 from noeira.nn.constants import DT
-from noeira.core.dotenv import load_dotenv
-from noeira.core.logger import RemoteLogger
+from noeira.core.run import RunContext, register_run
+from noeira.core.run_session import RunLogger, finish_run, run_logger
+from noeira.io.artifact_sink import sink_for_run
 from noeira.deep_agents.tdmpc2.config import TDMPC2
 from noeira.envs.phyics3d_batched_env import Phyics3dBatchedEnv
 from noeira.envs.dm_control.walker.walker_xml import DMWalkerModel
@@ -155,8 +156,8 @@ from noeira.envs.dm_control.walker.walker_config import DMWalkerConfig
 
 # ── pick ONE ─────────────────────────────────────────────────────────────
 # ⚠ "run" — this is the RUN BASELINE (see "The run baseline" in the docstring).
-# The checkpoint name carries TASK, so flipping this back to "walk" recovers
-# the earlier baseline without clobbering anything.
+# Every run gets its own directory (the slug carries TASK), so flipping this
+# back to "walk" recovers the earlier baseline without clobbering anything.
 comptime TASK: StaticString = "run"  # "stand" | "walk" | "run"
 
 comptime MOVE_SPEED: Float64 = 0.0 if TASK == "stand" else (
@@ -259,14 +260,21 @@ def main() raises:
     var eval_env = EvalEnv(ctx)
     var eval_env_ptr = Pointer(to=eval_env).as_unsafe_any_origin()
 
-    # ⚠ The UTD tag is part of the name on purpose: without it this run
-    # overwrites the UPDATES_PER_STEP=1 checkpoint, which is the CONTROL for
-    # the comparison it exists to make.
-    var ckpt = (
-        String("tdmpc2_dm_walker_batched_") + String(TASK)
-        + ("_mpc" if USE_MPC else "_mpcoff")
-        + "_utd" + String(UPDATES_PER_STEP) + ".ckpt"
+    # ⚠ The UTD tag is part of the slug on purpose: the UPDATES_PER_STEP=1
+    # run is the CONTROL for the comparison this one exists to make, and the
+    # two must be told apart by name as well as by directory.
+    var run = RunContext(
+        project=String("dm-control"),
+        driver=String("examples/dm_control/tdmpc2_dm_walker_batched_gpu.mojo"),
+        slug=(
+            String("tdmpc2-dm-walker-batched-") + String(TASK)
+            + ("-mpc" if USE_MPC else "-mpcoff")
+            + "-utd" + String(UPDATES_PER_STEP)
+        ),
+        env=String("builtin:dm_control/walker-") + String(TASK),
     )
+    var checkpoint_path = run.checkpoint_path(String("last"))
+    print("  Run:", run.dir)
 
     var ag = TDMPC2[
         TARGET, OBS, ACT, B, CAP, ENC, LATENT, MLP, BINS, SN, VMIN, VMAX, H,
@@ -276,16 +284,7 @@ def main() raises:
         action_scale=Scalar[DT](ACTION_SCALE), learning_starts=LEARN_START,
     )
 
-    var env_vars = load_dotenv()
-    var logger = RemoteLogger(
-        server_url=env_vars.get("NOEIRA_CLOUD_URL", ""),
-        run_name=(
-            String("TD-MPC2 dm_control walker ") + String(TASK) + " x"
-            + String(N_ENVS)
-        ),
-        buffer_size=64,
-        api_key=env_vars.get("NOEIRA_CLOUD_API_KEY", ""),
-    )
+    var logger = run_logger(run, buffer_size=64)
     logger.set_config("algorithm", "TD-MPC2")
     logger.set_config("env", String("dm_control/walker-") + String(TASK))
     logger.set_config("target", TARGET)
@@ -293,17 +292,15 @@ def main() raises:
     logger.set_config("n_envs", String(N_ENVS))
     logger.set_config("latent", String(LATENT))
     logger.set_config("batch", String(B))
+    register_run(run, logger)
+    var artifacts = sink_for_run(run.id, run.dir)
     var logger_ptr = Pointer(to=logger).as_unsafe_any_origin()
-    if env_vars.get("NOEIRA_CLOUD_URL", "").byte_length() > 0:
-        print("  logger: ENABLED → streaming every", DIAG_EVERY, "steps")
-    else:
-        print("  logger: DISABLED — NOEIRA_CLOUD_URL not in .env")
 
     print("Starting training...")
     print("-" * 70)
     var t_start = perf_counter_ns()
     var best = ag.train_batched[
-        Env, N_ENVS, RemoteLogger, USE_MPC, EvalEnv, EVAL_ENVS
+        Env, N_ENVS, RunLogger, USE_MPC, EvalEnv, EVAL_ENVS
     ](
         env,
         TOTAL,
@@ -313,8 +310,10 @@ def main() raises:
         verbose=True,
         logger=logger_ptr,
         diag_every=DIAG_EVERY,
-        checkpoint_path=ckpt,
+        checkpoint_path=checkpoint_path,
         checkpoint_every=CHECKPOINT_EVERY,
+        artifacts=artifacts,
+        run_dir=run.dir,
         eval_env=eval_env_ptr,
         eval_every=EVAL_EVERY,
         eval_max_steps=EP_LEN,
@@ -322,7 +321,9 @@ def main() raises:
     _ = eval_env  # lifetime extender for eval_env_ptr
     var elapsed = Float64(perf_counter_ns() - t_start) / 1e9
 
-    logger.close()
+    finish_run(
+        run, logger, artifacts, String("best_eval_return=") + String(best)
+    )
     _ = logger  # lifetime extender for logger_ptr
 
     print("-" * 70)
@@ -332,7 +333,7 @@ def main() raises:
     print("  elapsed          =", elapsed, "s")
     print("  env-steps/s      =", Float64(TOTAL) / elapsed)
     print("  best eval return =", best)
-    print("  checkpoint       =", ckpt)
+    print("  run              =", run.dir)
     print("=" * 70)
 
     var frac = Float64(best) / MAX_RETURN

@@ -77,6 +77,9 @@ from std.time import perf_counter_ns
 from noeira.core.dotenv import load_dotenv
 from noeira.core.logger import CsvLogger, RemoteLogger, CompositeLogger
 from noeira.core.run import RunContext, register_run
+from noeira.core.run_session import finish_run
+from noeira.io.artifact_sink import sink_for_run
+from noeira.deep_agents.training.checkpoint import announce_checkpoint
 from noeira.nn.constants import DT
 from noeira.nn.combinators.sequential import Sequential
 from noeira.nn.primitives.linear import Linear
@@ -367,6 +370,9 @@ def main() raises:
         # the first metric batch (which `flush` still does for drivers that never
         # call this) means a run that dies before step 0 never appears at all.
         register_run(run, logger)
+        # The uplink: `final` is uploaded (step_* only on request); None without
+        # a monitor in .env, and every call below is then a no-op.
+        var artifacts = sink_for_run(run.id, run.dir)
 
         var t_start = perf_counter_ns()
         for s in range(n_segments):
@@ -402,8 +408,8 @@ def main() raises:
             )
         var pf = run.checkpoint_path(String("final"))
         agent.save_state(pf)
-        logger.close()
-        run.close()
+        announce_checkpoint(pf, artifacts, run.dir)
+        finish_run(run, logger, artifacts)
         _ = logger
         print("=" * 70)
         print("done. final checkpoint ->", pf, "   metrics ->", csv_path)

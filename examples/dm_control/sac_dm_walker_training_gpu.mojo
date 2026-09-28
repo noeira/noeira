@@ -16,14 +16,17 @@ produces both.
 
 So this script does not save one checkpoint. It trains in `N_SEGMENTS`
 segments on ONE agent (nets + replay + optimizers persist across `train`
-calls) and writes a STEP-STAMPED checkpoint after each:
+calls) and writes a STEP-STAMPED checkpoint after each, into the run's own
+directory (`RunContext`, project `dm-control`; `metrics.csv` and `run.kv` sit
+beside it, and each rung is uploaded through the run's artifact sink):
 
-    sac_dm_walker_stand.ckpt.00025000
-    sac_dm_walker_stand.ckpt.00050000
+    runs/<id>/checkpoints/sac_dm_walker_stand.ckpt.00025000
+    runs/<id>/checkpoints/sac_dm_walker_stand.ckpt.00050000
     ...
 
-`examples/fb/collect_walker_sac.mojo` then rolls out every rung and writes one
-dataset spanning random → expert, tagging each row with the rung it came from.
+`examples/fb/collect_walker_sac.mojo` then rolls out every rung (point its
+prefix at that run's `checkpoints/`) and writes one dataset spanning random →
+expert, tagging each row with the rung it came from.
 
 ⚠ The ladder exists because the driver OVERWRITES `checkpoint_path` on every
 save (`run_offpolicy_train_batched`, and `train`'s docstring now says so). A
@@ -60,8 +63,10 @@ from max.gpu.host import DeviceContext
 from std.random import seed
 from std.time import perf_counter_ns
 
-from noeira.core.dotenv import load_dotenv
-from noeira.core.logger import RemoteLogger
+from noeira.core.run import RunContext, register_run
+from noeira.core.run_session import RunLogger, finish_run, run_logger
+from noeira.deep_agents.training.checkpoint import announce_checkpoint
+from noeira.io.artifact_sink import sink_for_run
 from noeira.nn.constants import DT
 from noeira.nn.combinators.sequential import Sequential
 from noeira.nn.primitives.linear import Linear
@@ -110,8 +115,6 @@ comptime NUM_STEPS = SEGMENT_STEPS * N_SEGMENTS
 comptime WARMUP_STEPS = 10_000
 comptime PRINT_EVERY = SEGMENT_STEPS
 comptime DIAG_EVERY = 1000
-
-comptime CKPT_PREFIX = "sac_dm_walker_"
 
 # dm_control rewards are in [0, 1] per step over 1000 steps, so an episode
 # return is bounded by 1000 regardless of task — unlike HalfCheetah's unbounded
@@ -172,20 +175,20 @@ def main() raises:
     print("  WARMUP_STEPS       =", WARMUP_STEPS)
     print("=" * 70)
 
-    var prefix = String(CKPT_PREFIX) + String(TASK)
+    var run = RunContext(
+        project=String("dm-control"),
+        driver=String("examples/dm_control/sac_dm_walker_training_gpu.mojo"),
+        slug=String("sac-dm-walker-") + String(TASK),
+        env=String("builtin:dm_control/walker-") + String(TASK),
+        seed=42,
+    )
+    # The ladder keeps its step-stamped names, now inside the run directory.
+    var prefix = run.dir + "/checkpoints/sac_dm_walker_" + String(TASK)
+    print("  Run                =", run.dir)
 
     with DeviceContext() as ctx:
         # ─── Logger ──────────────────────────────────────────────────────
-        var env_vars = load_dotenv()
-        var api_key = env_vars.get("NOEIRA_CLOUD_API_KEY", "")
-        var url = env_vars.get("NOEIRA_CLOUD_URL", "")
-
-        var logger = RemoteLogger(
-            server_url=url,
-            run_name=String("SAC dm_control walker ") + String(TASK) + " (GPU)",
-            buffer_size=64,
-            api_key=api_key,
-        )
+        var logger = run_logger(run, buffer_size=64)
         logger.set_config("algorithm", "SAC")
         logger.set_config("env", String("dm_control/walker-") + String(TASK))
         logger.set_config("target", "gpu")
@@ -195,6 +198,8 @@ def main() raises:
         logger.set_config("buffer_capacity", String(REPLAY_CAPACITY))
         logger.set_config("ladder_rungs", String(N_SEGMENTS))
         logger.set_config("segment_steps", String(SEGMENT_STEPS))
+        register_run(run, logger)
+        var artifacts = sink_for_run(run.id, run.dir)
 
         var logger_ptr = Pointer(to=logger).as_unsafe_any_origin()
 
@@ -240,7 +245,7 @@ def main() raises:
                 N_ENVS=N_ENVS,
                 USE_TRAIN_CUDA_GRAPH=True,
                 USE_ENV_CUDA_GRAPH=False,
-                L=RemoteLogger,
+                L=RunLogger,
             ](
                 env,
                 SEGMENT_STEPS,
@@ -256,13 +261,17 @@ def main() raises:
             var at = done_steps + SEGMENT_STEPS
             var path = _stamped(prefix, at)
             agent.save(path)
+            announce_checkpoint(path, artifacts, run.dir)
             print(
                 "  [rung", seg + 1, "/", N_SEGMENTS, "]  step", at,
                 "  mean_ret", agent.mean_return(), " ->", path,
             )
 
         var elapsed_s = Float64(perf_counter_ns() - t_start) / 1e9
-        logger.close()
+        finish_run(
+            run, logger, artifacts,
+            String("mean_return_100=") + String(agent.mean_return()),
+        )
         _ = logger  # lifetime extender for logger_ptr
 
         # ─── Summary ─────────────────────────────────────────────────────
@@ -275,6 +284,7 @@ def main() raises:
         print("  episodes completed        =", agent.ep_count())
         print("  ladder rungs written      =", N_SEGMENTS)
         print("  ladder prefix             =", prefix + ".ckpt.*")
+        print("  run record                =", run.kv_path())
         print("=" * 70)
 
         var final_avg = Float64(agent.mean_return())

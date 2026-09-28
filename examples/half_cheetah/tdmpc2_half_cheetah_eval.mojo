@@ -16,8 +16,11 @@ Point CKPT at a GOOD checkpoint — e.g. tdmpc2_half_cheetah_mpcoff.ckpt from a
 strong MPC-off run. Bump MPC_* toward the 512/24/64/6 reference to test budget.
 
 Run: `pixi run -e nvidia mojo run -I . examples/half_cheetah/tdmpc2_half_cheetah_eval.mojo`
+     (`... --ckpt <run_id>` reads a training run's `checkpoints/last.ckpt`)
 """
 
+from std.sys import argv
+from noeira.core.run import resolve_checkpoint
 from max.gpu.host import DeviceContext
 
 from noeira.nn.constants import DT
@@ -51,9 +54,21 @@ comptime N_EPS = 5
 comptime Env = HalfCheetah[DT, TERMINATE_ON_UNHEALTHY=False]
 
 
+def _flag(name: String, dflt: String) raises -> String:
+    """Value of `--name X`, or `dflt` when the flag is absent."""
+    var av = argv()
+    for i in range(1, len(av)):
+        if String(av[i]) == name:
+            if i + 1 >= len(av):
+                raise Error("flag " + name + " needs a value")
+            return String(av[i + 1])
+    return dflt
+
+
 def main() raises:
+    var ckpt = resolve_checkpoint(_flag(String("--ckpt"), String(CKPT)), String("last"))
     print("=" * 70)
-    print("TD-MPC2 HalfCheetah — policy vs MPC eval @", CKPT)
+    print("TD-MPC2 HalfCheetah — policy vs MPC eval @", ckpt)
     print("  MPC budget:", MPC_SAMPLES, "/", MPC_PI_TRAJS, "/", MPC_ELITES,
           "/", MPC_ITERS, " (samples/pi/elites/iters)")
     print("=" * 70)
@@ -64,7 +79,7 @@ def main() raises:
         "gpu", OBS, ACT, B, CAP, ENC, LATENT, MLP, BINS, SN, VMIN, VMAX, H,
         MPC_SAMPLES, MPC_PI_TRAJS, MPC_ELITES, MPC_ITERS,
     ](ctx=ctx, action_scale=Scalar[DT](1.0), learning_starts=0)
-    ag.load_state(CKPT)
+    ag.load_state(ckpt)
 
     var pol = ag.evaluate[Env, USE_MPC=False](
         env, episodes=N_EPS, max_steps=EP_LEN

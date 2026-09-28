@@ -611,6 +611,9 @@ struct BipedalWalker[
             state[0, hip_off + JOINT_FLAGS] = Scalar[dtype](
                 JOINT_FLAG_LIMIT_ENABLED | JOINT_FLAG_MOTOR_ENABLED
             )
+            RevoluteJointSolver.clear_warm_start[1, BWConstants.STATE_SIZE_VAL](
+                state, 0, hip_off
+            )
 
             # Knee joint (upper leg to lower leg)
             var knee_off = (
@@ -644,6 +647,9 @@ struct BipedalWalker[
             state[0, knee_off + JOINT_MOTOR_SPEED] = Scalar[dtype](0)
             state[0, knee_off + JOINT_FLAGS] = Scalar[dtype](
                 JOINT_FLAG_LIMIT_ENABLED | JOINT_FLAG_MOTOR_ENABLED
+            )
+            RevoluteJointSolver.clear_warm_start[1, BWConstants.STATE_SIZE_VAL](
+                state, 0, knee_off
             )
 
         # Clear forces
@@ -874,36 +880,15 @@ struct BipedalWalker[
                 return
 
     def _step_physics_cpu(mut self):
-        """Execute physics step."""
+        """Execute physics step: detection, then the SAME Box2D island solve
+        the GPU kernel runs (`_solve_step_single_env`)."""
         var bodies = self.physics.get_bodies_tensor()
         var shapes = self.physics.get_shapes_tensor()
         var forces = self.physics.get_forces_tensor()
         var contacts = self.physics.get_contacts_tensor()
         var contact_counts = self.physics.get_contact_counts_tensor()
-        var joints = self.physics.get_joints_tensor()
-        var joint_counts = self.physics.get_joint_counts_tensor()
+        var states = self.physics.get_state_tensor()
 
-        var integrator = SemiImplicitEuler()
-        var solver = ImpulseSolver(
-            BWConstants.FRICTION, BWConstants.RESTITUTION
-        )
-
-        var gravity_x = Scalar[dtype](self.config.gravity_x)
-        var gravity_y = Scalar[dtype](self.config.gravity_y)
-        var dt = Scalar[dtype](self.config.dt)
-        var baumgarte = Scalar[dtype](self.config.baumgarte)
-        var slop = Scalar[dtype](self.config.slop)
-
-        # Integrate velocities
-        integrator.integrate_velocities[1, BWConstants.NUM_BODIES](
-            bodies,
-            forces,
-            gravity_x,
-            gravity_y,
-            dt,
-        )
-
-        # Detect collisions
         self.edge_collision.detect[
             1,
             BWConstants.NUM_BODIES,
@@ -911,32 +896,16 @@ struct BipedalWalker[
             BWConstants.MAX_CONTACTS,
         ](bodies, shapes, contacts, contact_counts)
 
-        # Solve velocity constraints
-        for _ in range(self.config.velocity_iterations):
-            solver.solve_velocity[
-                1, BWConstants.NUM_BODIES, BWConstants.MAX_CONTACTS
-            ](bodies, contacts, contact_counts)
-            RevoluteJointSolver.solve_velocity[
-                1, BWConstants.NUM_BODIES, BWConstants.MAX_JOINTS
-            ](bodies, joints, joint_counts, dt)
-
-        # Integrate positions
-        integrator.integrate_positions[1, BWConstants.NUM_BODIES](bodies, dt)
-
-        # Solve position constraints
-        for _ in range(self.config.position_iterations):
-            solver.solve_position[
-                1, BWConstants.NUM_BODIES, BWConstants.MAX_CONTACTS
-            ](bodies, contacts, contact_counts)
-            RevoluteJointSolver.solve_position[
-                1, BWConstants.NUM_BODIES, BWConstants.MAX_JOINTS
-            ](
-                bodies,
-                joints,
-                joint_counts,
-                baumgarte,
-                slop,
-            )
+        Self._solve_step_single_env[1, BWConstants.STATE_SIZE_VAL](
+            0,
+            states,
+            contacts,
+            Int(contact_counts[0]),
+            Int(states[0, BWConstants.JOINT_COUNT_OFFSET]),
+            Scalar[dtype](self.config.gravity_x),
+            Scalar[dtype](self.config.gravity_y),
+            Scalar[dtype](self.config.dt),
+        )
 
         # Clear forces
         for body in range(BWConstants.NUM_BODIES):
@@ -1804,6 +1773,72 @@ struct BipedalWalker[
 
     @always_inline
     @staticmethod
+    def _solve_step_single_env[
+        BATCH: Int,
+        STATE_SIZE: Int,
+    ](
+        env: Int,
+        states: LayoutTensor[
+            dtype, Layout.row_major(BATCH, STATE_SIZE), MutAnyOrigin
+        ],
+        contacts: LayoutTensor[
+            dtype,
+            Layout.row_major(BATCH, BWConstants.MAX_CONTACTS, CONTACT_DATA_SIZE),
+            MutAnyOrigin,
+        ],
+        n_contacts: Int,
+        n_joints: Int,
+        gravity_x: Scalar[dtype],
+        gravity_y: Scalar[dtype],
+        dt: Scalar[dtype],
+    ):
+        """Box2D island solve after collision detection — the ONE copy the
+        CPU step and the GPU kernel run (see LunarLander's twin): integrate
+        velocities, init + warm start contacts and joints, velocity
+        iterations (joints, then contacts), integrate positions, position
+        iterations (contacts, then joints; stop once both are within slop).
+        Gymnasium steps BipedalWalker with 180 / 60 iterations; this env
+        keeps its own VELOCITY_ITERATIONS / POSITION_ITERATIONS."""
+        comptime NB = BWConstants.NUM_BODIES
+        comptime MC = BWConstants.MAX_CONTACTS
+        comptime MJ = BWConstants.MAX_JOINTS
+        comptime BO = BWConstants.BODIES_OFFSET
+        comptime JO = BWConstants.JOINTS_OFFSET
+        SemiImplicitEuler.integrate_velocities_single_env[
+            BATCH, NB, STATE_SIZE, BO, BWConstants.FORCES_OFFSET
+        ](env, states, gravity_x, gravity_y, dt)
+        ImpulseSolver.init_velocity_single_env[BATCH, NB, MC, STATE_SIZE, BO](
+            env,
+            states,
+            contacts,
+            n_contacts,
+            Scalar[dtype](BWConstants.RESTITUTION),
+        )
+        RevoluteJointSolver.init_velocity_single_env[
+            BATCH, NB, MJ, STATE_SIZE, BO, JO
+        ](env, states, n_joints)
+        for _ in range(BWConstants.VELOCITY_ITERATIONS):
+            RevoluteJointSolver.solve_velocity_single_env[
+                BATCH, NB, MJ, STATE_SIZE, BO, JO
+            ](env, states, n_joints, dt)
+            ImpulseSolver.solve_velocity_single_env[
+                BATCH, NB, MC, STATE_SIZE, BO
+            ](env, states, contacts, n_contacts, Scalar[dtype](BWConstants.FRICTION))
+        SemiImplicitEuler.integrate_positions_single_env[
+            BATCH, NB, STATE_SIZE, BO
+        ](env, states, dt)
+        for _ in range(BWConstants.POSITION_ITERATIONS):
+            var contacts_ok = ImpulseSolver.solve_position_single_env[
+                BATCH, NB, MC, STATE_SIZE, BO
+            ](env, states, contacts, n_contacts)
+            var joints_ok = RevoluteJointSolver.solve_position_single_env[
+                BATCH, NB, MJ, STATE_SIZE, BO, JO
+            ](env, states, n_joints)
+            if contacts_ok and joints_ok:
+                break
+
+    @always_inline
+    @staticmethod
     def _reset_env_gpu[
         BATCH_SIZE: Int,
         STATE_SIZE: Int,
@@ -1975,6 +2010,9 @@ struct BipedalWalker[
             states[env, hip_off + JOINT_FLAGS] = Scalar[dtype](
                 JOINT_FLAG_LIMIT_ENABLED | JOINT_FLAG_MOTOR_ENABLED
             )
+            RevoluteJointSolver.clear_warm_start[BATCH_SIZE, STATE_SIZE](
+                states, env, hip_off
+            )
 
             var knee_off = (
                 BWConstants.JOINTS_OFFSET + (leg * 2 + 1) * JOINT_DATA_SIZE
@@ -2003,6 +2041,9 @@ struct BipedalWalker[
             states[env, knee_off + JOINT_MOTOR_SPEED] = Scalar[dtype](0)
             states[env, knee_off + JOINT_FLAGS] = Scalar[dtype](
                 JOINT_FLAG_LIMIT_ENABLED | JOINT_FLAG_MOTOR_ENABLED
+            )
+            RevoluteJointSolver.clear_warm_start[BATCH_SIZE, STATE_SIZE](
+                states, env, knee_off
             )
 
         # Clear forces
@@ -2396,23 +2437,10 @@ struct BipedalWalker[
             var dt = Scalar[dtype](BWConstants.DT)
             var gravity_x = Scalar[dtype](BWConstants.GRAVITY_X)
             var gravity_y = Scalar[dtype](BWConstants.GRAVITY_Y)
-            var friction = Scalar[dtype](BWConstants.FRICTION)
-            var restitution = Scalar[dtype](BWConstants.RESTITUTION)
-            var baumgarte = Scalar[dtype](BWConstants.BAUMGARTE)
-            var slop = Scalar[dtype](BWConstants.SLOP)
 
             # Get joint count
             var joint_count = Int(states[env, BWConstants.JOINT_COUNT_OFFSET])
             var n_edges = Int(states[env, BWConstants.EDGE_COUNT_OFFSET])
-
-            # Step 1: Integrate velocities (apply gravity + external forces)
-            SemiImplicitEuler.integrate_velocities_single_env[
-                BATCH_SIZE,
-                BWConstants.NUM_BODIES,
-                STATE_SIZE,
-                BWConstants.BODIES_OFFSET,
-                BWConstants.FORCES_OFFSET,
-            ](env, states, gravity_x, gravity_y, dt)
 
             # Step 2: Collision detection against terrain edges
             EdgeTerrainCollision.detect_single_env[
@@ -2428,55 +2456,19 @@ struct BipedalWalker[
 
             var contact_count = Int(contact_counts[env])
 
-            # Step 3: Velocity constraint solving (multiple iterations)
-            for _ in range(BWConstants.VELOCITY_ITERATIONS):
-                # Solve contact constraints
-                ImpulseSolver.solve_velocity_single_env[
-                    BATCH_SIZE,
-                    BWConstants.NUM_BODIES,
-                    BWConstants.MAX_CONTACTS,
-                    STATE_SIZE,
-                    BWConstants.BODIES_OFFSET,
-                ](env, states, contacts, contact_count, friction, restitution)
-
-                # Solve joint constraints
-                RevoluteJointSolver.solve_velocity_single_env[
-                    BATCH_SIZE,
-                    BWConstants.NUM_BODIES,
-                    BWConstants.MAX_JOINTS,
-                    STATE_SIZE,
-                    BWConstants.BODIES_OFFSET,
-                    BWConstants.JOINTS_OFFSET,
-                ](env, states, joint_count, dt)
-
-            # Step 4: Integrate positions
-            SemiImplicitEuler.integrate_positions_single_env[
-                BATCH_SIZE,
-                BWConstants.NUM_BODIES,
-                STATE_SIZE,
-                BWConstants.BODIES_OFFSET,
-            ](env, states, dt)
-
-            # Step 5: Position constraint solving (multiple iterations)
-            for _ in range(BWConstants.POSITION_ITERATIONS):
-                # Solve contact position constraints
-                ImpulseSolver.solve_position_single_env[
-                    BATCH_SIZE,
-                    BWConstants.NUM_BODIES,
-                    BWConstants.MAX_CONTACTS,
-                    STATE_SIZE,
-                    BWConstants.BODIES_OFFSET,
-                ](env, states, contacts, contact_count, baumgarte, slop)
-
-                # Solve joint position constraints
-                RevoluteJointSolver.solve_position_single_env[
-                    BATCH_SIZE,
-                    BWConstants.NUM_BODIES,
-                    BWConstants.MAX_JOINTS,
-                    STATE_SIZE,
-                    BWConstants.BODIES_OFFSET,
-                    BWConstants.JOINTS_OFFSET,
-                ](env, states, joint_count, baumgarte, slop)
+            # Steps 3-5: the shared Box2D island solve.
+            BipedalWalker[Self.dtype]._solve_step_single_env[
+                BATCH_SIZE, STATE_SIZE
+            ](
+                env,
+                states,
+                contacts,
+                contact_count,
+                joint_count,
+                gravity_x,
+                gravity_y,
+                dt,
+            )
 
             # Step 6: Clear forces
             for body in range(BWConstants.NUM_BODIES):
