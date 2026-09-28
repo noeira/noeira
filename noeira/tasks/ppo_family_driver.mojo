@@ -852,7 +852,16 @@ def run_ppo[M: ModelDefLike, C: Phyics3dEnvConfig](
                             succ[e] = True
                         if dh_t[unsafe_offset=e] > Scalar[DT](0.5):
                             dmac[e] = True
-                    if dmac[e] and tick < repeat - 1:
+                    # ⚠ AT WHATEVER TICK it ends — the last one included. A
+                    # copy only for ticks before the last left a lane that
+                    # ended on the last tick (the usual case) reading the row
+                    # from its PREVIOUS early end: after one physics blow-up,
+                    # that lane's diverged row re-entered the observation
+                    # statistics, UNFLAGGED, at each of its later episode
+                    # ends — the joint means went to +-593, the variances to
+                    # 1e11, and the 10 Hz lift_real stages collapsed from ~60 %
+                    # to 0 at their first diverged lane (18ea9d25, b5ccffa3).
+                    if dmac[e]:
                         for k in range(E_OBS):
                             term[e * E_OBS + k] = rp_t[unsafe_offset = e * E_OBS + k]
             n_diverged += n_bad
