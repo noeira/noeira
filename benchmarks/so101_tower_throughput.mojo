@@ -107,6 +107,18 @@ steps/s at 1024 / 4096).
 4096 lanes: the Newton solver kernels ~58 % of GPU time, the collision
 kernels ~38 %, the rest ~3 %.
 
+**After the 26-27 Sep Newton + collision commits (a684443d2, 5090, 2026-09-28,
+same box for all three rows; the old row is abf28444a rebuilt there):**
+
+    physics steps/s     32      256     1024    4096
+    noeira abf28444a   8.9k    50.7k   154k    354k
+    noeira a684443d2  39.0k    211k    618k    1.32M    (3.7-4.4x)
+    MuJoCo Warp       27.3k    136k    431k    1.21M
+    ratio              1.42    1.55    1.43    1.09     (was 0.29-0.37)
+
+Same load: 9.2-9.3 contacts and 1.9 Newton iterations per solve (MuJoCo Warp
+9.8-10.8 and 1.7). Cameras unchanged (no renderer commit): 0.47-0.62x.
+
 ⚠ THE POSE IS HOST FK OF THE ENV'S `qpos`, AS IN THE EVAL
 (`so101_tower_rig.mojo`'s header): the env leaves `SYNC_FK_AFTER_STEP` off, so
 its device `xpos` is one substep stale. A pixel-RL loop would need a device FK
