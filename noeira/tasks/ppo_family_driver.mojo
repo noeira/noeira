@@ -254,15 +254,45 @@ def _delta_to_env(
 ):
     """`--action delta`: target = clamp(q + a * scale), through the servo
     model (`delta_action.ServoLag`; the identity when off), normalised onto
-    the env's absolute action (`(target - mid) / half`)."""
+    the env's absolute action (`(target - mid) / half`). One tick: the
+    targets of `_delta_targets`, then `_targets_to_env`."""
+    var tg = List[Float64](length=N_ENVS * ACT_DIM, fill=0.0)
+    _delta_targets(ap, tg, arm_q, a_lo, a_hi, d_arm, d_grip)
+    _targets_to_env(tg, ep, a_lo, a_hi, lag)
+
+
+def _delta_targets(
+    ap: Pointer[Scalar[DT], MutAnyOrigin],
+    mut tg: List[Float64],
+    ref arm_q: List[Float64],
+    ref a_lo: List[Float64],
+    ref a_hi: List[Float64],
+    d_arm: Float64 = DELTA_ARM,
+    d_grip: Float64 = DELTA_GRIPPER,
+):
+    """The policy step's joint targets, clamp(q + a * scale), per lane —
+    held for the `--repeat` ticks the action lasts."""
     for e in range(N_ENVS):
         for j in range(ACT_DIM):
-            var tgt = delta_target(
+            tg[e * ACT_DIM + j] = delta_target(
                 arm_q[e * ACT_DIM + j],
                 Float64(ap[unsafe_offset = e * ACT_DIM + j]),
                 j, a_lo[j], a_hi[j], d_arm, d_grip,
             )
-            tgt = lag.apply(e, j, tgt)
+
+
+def _targets_to_env(
+    ref tg: List[Float64],
+    ep: Pointer[Scalar[DT], MutAnyOrigin],
+    ref a_lo: List[Float64],
+    ref a_hi: List[Float64],
+    mut lag: ServoLag,
+):
+    """One TICK: the held targets through the servo model (it advances per
+    tick, not per policy step), normalised onto the env's absolute action."""
+    for e in range(N_ENVS):
+        for j in range(ACT_DIM):
+            var tgt = lag.apply(e, j, tg[e * ACT_DIM + j])
             var mid = 0.5 * (a_lo[j] + a_hi[j])
             var half = 0.5 * (a_hi[j] - a_lo[j])
             ep[unsafe_offset = e * ACT_DIM + j] = Scalar[DT]((tgt - mid) / half)
@@ -499,10 +529,25 @@ def run_ppo[M: ModelDefLike, C: Phyics3dEnvConfig](
     # so101-nexus's; under `--lag-*` the real servos need larger ones
     var d_arm = Float64(_arg(args, "--delta-arm", String(DELTA_ARM)))
     var d_grip = Float64(_arg(args, "--delta-gripper", String(DELTA_GRIPPER)))
+    # ⚠ `--repeat K`: the policy acts every K ticks (31.25 / K Hz) and its
+    # delta targets are HELD for the K ticks, the servo model running per
+    # tick underneath. Why: at 31 Hz under the real servos' 1-2 tick delay
+    # and ~50 ms response, every action lands while the last two or three are
+    # still in flight, and the lagged cube-in-bowl teachers plateaued at
+    # 30-37 % (the stiff sim: 79.5 %); at 10 Hz (K = 3) most of an action is
+    # done within its own step — the regime the real expert (it waits for the
+    # arm to settle) and Squint (10 Hz) work in. Rewards are summed over the
+    # K ticks; the steps counted are TICKS.
+    var repeat = max(Int(_arg(args, "--repeat", "1")), 1)
     if action_mode != "absolute" and action_mode != "delta":
         raise Error("ppo task: --action absolute|delta, got " + action_mode)
     if ACT_HIST > 0 and bc_demos.byte_length() > 0:
         raise Error("ppo task: --bc-demos has no action history; not with TASK_PPO_ACT_HIST")
+    if C.MAX_STEPS % repeat != 0:
+        raise Error("ppo task: --repeat " + String(repeat) + " must divide the horizon "
+                    + String(C.MAX_STEPS) + " (episodes end on a policy step)")
+    if repeat > 1 and action_mode != "delta":
+        raise Error("ppo task: --repeat is for --action delta")
     if ACT_HIST > 0 and action_mode != "delta":
         raise Error("ppo task: TASK_PPO_ACT_HIST is for --action delta")
     if reward != "potential" and reward != "legacy":
@@ -510,7 +555,7 @@ def run_ppo[M: ModelDefLike, C: Phyics3dEnvConfig](
     var rw = reward_mode_words(reward == "potential", bonus)
     seed_rng(seed)
 
-    var n_updates_total = anneal_steps // (N_ENVS * ROLLOUT)
+    var n_updates_total = anneal_steps // (N_ENVS * ROLLOUT * repeat)
     print("=" * 70)
     print("PPO on", family, "—", task)
     print("  lanes", N_ENVS, "| rollout", ROLLOUT, "| batch", N_ENVS * ROLLOUT,
@@ -521,7 +566,7 @@ def run_ppo[M: ModelDefLike, C: Phyics3dEnvConfig](
     print("  steps", total_steps, "| lr", lr0, "| ent", ent0, "->", ent1,
           "over", anneal_steps, "steps | log_std init", log_std0)
     print("  reward", reward, "| success bonus", bonus, "| seed", seed,
-          "| action", action_mode)
+          "| action", action_mode, "| repeat", repeat, "ticks per policy step")
     print("=" * 70)
 
     # ── the task's words (the eval's / the bench's set-up) ───────────────
@@ -584,6 +629,7 @@ def run_ppo[M: ModelDefLike, C: Phyics3dEnvConfig](
     logger.set_config("delta_arm", String(d_arm))
     logger.set_config("delta_gripper", String(d_grip))
     logger.set_config("act_hist", String(ACT_HIST))
+    logger.set_config("repeat", String(repeat))
     logger.set_config("horizon", String(C.MAX_STEPS))
     logger.set_config("obs_norm", "running, clip 10")
     logger.set_config("reward_norm", "discounted-return std, clip 10")
@@ -634,8 +680,9 @@ def run_ppo[M: ModelDefLike, C: Phyics3dEnvConfig](
         env.d.meta.download(ctx)
         ctx.synchronize()
         for e in range(N_ENVS):
+            # a multiple of --repeat: every episode ends on a policy step
             env.d.meta.data[e * METADATA_SIZE + META_IDX_STEP_COUNT] = Scalar[DT](
-                Int(random_float64() * Float64(C.MAX_STEPS))
+                Int(random_float64() * Float64(C.MAX_STEPS // repeat)) * repeat
             )
         env.d.meta.upload(ctx)
         ctx.synchronize()
@@ -653,6 +700,12 @@ def run_ppo[M: ModelDefLike, C: Phyics3dEnvConfig](
         var rets = ctx.enqueue_create_host_buffer[DT](N_ENVS)
         var env_act = ctx.enqueue_create_host_buffer[DT](N_ENVS * ACT_DIM)
         var arm_q = List[Float64](length=N_ENVS * ACT_DIM, fill=0.0)
+        # the policy step's held targets, and per lane over its ticks: the
+        # summed reward, whether it ended, its terminal observation
+        var tg = List[Float64](length=N_ENVS * ACT_DIM, fill=0.0)
+        var rsum = List[Float64](length=N_ENVS, fill=0.0)
+        var dmac = List[Bool](length=N_ENVS, fill=False)
+        var term = List[Scalar[DT]](length=N_ENVS * E_OBS, fill=Scalar[DT](0))
         var lag = ServoLag.parse(
             N_ENVS, lag_tau, lag_delay, Float64(C.FRAME_SKIP) * M.TIMESTEP
         )
@@ -747,41 +800,75 @@ def run_ppo[M: ModelDefLike, C: Phyics3dEnvConfig](
                         v = -1.0
                     ah[unsafe_offset=k] = Scalar[DT](v)
             if action_mode == "delta":
-                _delta_to_env(
-                    mptr(act_h.unsafe_ptr()), mptr(env_act.unsafe_ptr()),
-                    arm_q, a_lo, a_hi, lag, d_arm, d_grip,
+                _delta_targets(
+                    mptr(act_h.unsafe_ptr()), tg, arm_q, a_lo, a_hi, d_arm, d_grip,
                 )
-                ctx.enqueue_copy(act_dev, env_act)
-            else:
-                ctx.enqueue_copy(act_dev, act_h)
             _hist_push(hist, mptr(act_h.unsafe_ptr()))
-            # 2. step; the post-step obs, reward, done, meta (goal bit)
-            env.step_batch[N_ENVS](ctx=ctx, rng_seed=UInt64(it + 1))
-            ctx.enqueue_copy(raw_h, obs_dev)
-            ctx.enqueue_copy(rew_h, rew_dev)
-            ctx.enqueue_copy(done_h, done_dev)
-            env.d.meta.download(ctx)
-            ctx.synchronize()
+            # 2. `repeat` ticks under the held targets: per lane the summed
+            # reward, the goal bit, and — for a lane that ends (or diverges)
+            # before the last tick — its TERMINAL row, kept (its later ticks
+            # are stepped and discarded; it resets with the others below)
+            for e in range(N_ENVS):
+                rsum[e] = 0.0
+                dmac[e] = False
+                diverged[e] = False
+            var n_bad = 0
+            for tick in range(repeat):
+                if action_mode == "delta":
+                    _targets_to_env(tg, mptr(env_act.unsafe_ptr()), a_lo, a_hi, lag)
+                    ctx.enqueue_copy(act_dev, env_act)
+                else:
+                    ctx.enqueue_copy(act_dev, act_h)
+                env.step_batch[N_ENVS](
+                    ctx=ctx, rng_seed=UInt64(it * repeat + tick + 1)
+                )
+                ctx.enqueue_copy(raw_h, obs_dev)
+                ctx.enqueue_copy(rew_h, rew_dev)
+                ctx.enqueue_copy(done_h, done_dev)
+                env.d.meta.download(ctx)
+                ctx.synchronize()
+                var rp_t = mptr(raw_h.unsafe_ptr())
+                var dh_t = mptr(done_h.unsafe_ptr())
+                var rh_t = mptr(rew_h.unsafe_ptr())
+                for e in range(N_ENVS):
+                    if dmac[e]:
+                        continue
+                    var bad = False
+                    var rv = Float64(rh_t[unsafe_offset=e])
+                    if not (rv == rv) or abs(rv) > REW_BOUND:
+                        bad = True
+                    for k in range(E_OBS):
+                        var v = Float64(rp_t[unsafe_offset = e * E_OBS + k])
+                        if not (v == v) or abs(v) > OBS_BOUND:
+                            bad = True
+                            break
+                    if bad:
+                        diverged[e] = True
+                        n_bad += 1
+                        dmac[e] = True
+                    else:
+                        rsum[e] += rv
+                        if env.d.meta.data[e * METADATA_SIZE + META_IDX_GOAL_HELD] > Scalar[DT](0.5):
+                            succ[e] = True
+                        if dh_t[unsafe_offset=e] > Scalar[DT](0.5):
+                            dmac[e] = True
+                    if dmac[e] and tick < repeat - 1:
+                        for k in range(E_OBS):
+                            term[e * E_OBS + k] = rp_t[unsafe_offset = e * E_OBS + k]
+            n_diverged += n_bad
+            # the policy step's transition: the last tick's rows, a lane that
+            # ended early its terminal row; the summed reward; done if it ended
             var raw_p = mptr(raw_h.unsafe_ptr())
             var dh0 = mptr(done_h.unsafe_ptr())
             var rh0 = mptr(rew_h.unsafe_ptr())
-            var n_bad = 0
             for e in range(N_ENVS):
-                var bad = False
-                var rv = Float64(rh0[unsafe_offset=e])
-                if not (rv == rv) or abs(rv) > REW_BOUND:
-                    bad = True
-                for k in range(E_OBS):
-                    var v = Float64(raw_p[unsafe_offset = e * E_OBS + k])
-                    if not (v == v) or abs(v) > OBS_BOUND:
-                        bad = True
-                        break
-                diverged[e] = bad
-                if bad:
-                    n_bad += 1
-                    dh0[unsafe_offset=e] = Scalar[DT](1)
-                    rh0[unsafe_offset=e] = Scalar[DT](0)
-            n_diverged += n_bad
+                rh0[unsafe_offset=e] = Scalar[DT](rsum[e])
+                dh0[unsafe_offset=e] = Scalar[DT](1) if dmac[e] else Scalar[DT](0)
+            if repeat > 1:
+                for e in range(N_ENVS):
+                    if dmac[e]:
+                        for k in range(E_OBS):
+                            raw_p[unsafe_offset = e * E_OBS + k] = term[e * E_OBS + k]
             _augment[E_OBS](raw_p, hist, mptr(aug.unsafe_ptr()))
             obs_rms.update(mptr(aug.unsafe_ptr()), N_ENVS, OBS, diverged)
             obs_rms.normalize_into(
@@ -794,8 +881,10 @@ def run_ppo[M: ModelDefLike, C: Phyics3dEnvConfig](
                     if diverged[e]:
                         for k in range(OBS):
                             nn[unsafe_offset = e * OBS + k] = Scalar[DT](0)
-                # the env resets on its OWN done buffer: write the forced
-                # dones back before `selective_reset_batch`
+            if n_bad > 0 or repeat > 1:
+                # the env resets on its OWN done buffer: write the policy
+                # step's dones (forced, or from an earlier tick) back before
+                # `selective_reset_batch`
                 ctx.enqueue_copy(done_dev, done_h)
             # 3. reward normalisation (CleanRL NormalizeReward) + tallies
             var rh = mptr(rew_h.unsafe_ptr())
@@ -806,8 +895,6 @@ def run_ppo[M: ModelDefLike, C: Phyics3dEnvConfig](
                 ret_acc[e] = ret_acc[e] * GAMMA + r
                 rt[unsafe_offset=e] = Scalar[DT](ret_acc[e])
                 raw_ret[e] += r
-                if env.d.meta.data[e * METADATA_SIZE + META_IDX_GOAL_HELD] > Scalar[DT](0.5):
-                    succ[e] = True
             ret_rms.update(rt, N_ENVS, 1)
             var rscale = 1.0 / sqrt(ret_rms.var_[0] + 1e-8)
             var rn = mptr(rew_n.unsafe_ptr())
@@ -850,7 +937,7 @@ def run_ppo[M: ModelDefLike, C: Phyics3dEnvConfig](
             obs_rms.normalize_into(
                 mptr(aug.unsafe_ptr()), mptr(cur_n.unsafe_ptr()), N_ENVS, OBS, OBS_CLIP,
             )
-            step += N_ENVS
+            step += N_ENVS * repeat
             it += 1
             # 6. the update at the rollout boundary, then the schedules
             if agent.trainer.train_step(step):
@@ -938,30 +1025,35 @@ def run_ppo[M: ModelDefLike, C: Phyics3dEnvConfig](
             var start = List[Float64](length=N_ENVS * 8, fill=0.0)
             for t in range(C.MAX_STEPS - 1):
                 var rq = mptr(raw_h.unsafe_ptr())
-                for e in range(N_ENVS):
-                    for j in range(ACT_DIM):
-                        arm_q[e * ACT_DIM + j] = Float64(
-                            rq[unsafe_offset = e * E_OBS + a_qa[j]]
-                        )
-                    if t == 0:
-                        _lag_reset(lag, arm_q, e)
-                        _hist_clear(hist, e)
-                _augment[E_OBS](rq, hist, mptr(aug.unsafe_ptr()))
-                obs_rms.normalize_into(
-                    mptr(aug.unsafe_ptr()), mptr(cur_n.unsafe_ptr()), N_ENVS, OBS, OBS_CLIP
-                )
-                agent.trainer.select_greedy_action_batched(
-                    mptr(cur_n.unsafe_ptr()), mptr(act_h.unsafe_ptr())
-                )
-                if action_mode == "delta":
-                    _delta_to_env(
-                        mptr(act_h.unsafe_ptr()), mptr(env_act.unsafe_ptr()),
-                        arm_q, a_lo, a_hi, lag, d_arm, d_grip,
+                # the policy acts every `repeat` ticks; its targets are held
+                # between, the servo model advancing per tick
+                if t % repeat == 0:
+                    for e in range(N_ENVS):
+                        for j in range(ACT_DIM):
+                            arm_q[e * ACT_DIM + j] = Float64(
+                                rq[unsafe_offset = e * E_OBS + a_qa[j]]
+                            )
+                        if t == 0:
+                            _lag_reset(lag, arm_q, e)
+                            _hist_clear(hist, e)
+                    _augment[E_OBS](rq, hist, mptr(aug.unsafe_ptr()))
+                    obs_rms.normalize_into(
+                        mptr(aug.unsafe_ptr()), mptr(cur_n.unsafe_ptr()), N_ENVS, OBS, OBS_CLIP
                     )
+                    agent.trainer.select_greedy_action_batched(
+                        mptr(cur_n.unsafe_ptr()), mptr(act_h.unsafe_ptr())
+                    )
+                    if action_mode == "delta":
+                        _delta_targets(
+                            mptr(act_h.unsafe_ptr()), tg, arm_q, a_lo, a_hi,
+                            d_arm, d_grip,
+                        )
+                    _hist_push(hist, mptr(act_h.unsafe_ptr()))
+                if action_mode == "delta":
+                    _targets_to_env(tg, mptr(env_act.unsafe_ptr()), a_lo, a_hi, lag)
                     ctx.enqueue_copy(act_dev, env_act)
                 else:
                     ctx.enqueue_copy(act_dev, act_h)
-                _hist_push(hist, mptr(act_h.unsafe_ptr()))
                 env.step_batch[N_ENVS](ctx=ctx, rng_seed=UInt64(t + 1))
                 ctx.enqueue_copy(raw_h, obs_dev)
                 env.d.meta.download(ctx)
