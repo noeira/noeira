@@ -1124,6 +1124,7 @@ def run_sac[M: ModelDefLike, C: Phyics3dEnvConfig](
             run_id=run.id,
             buffer_size=64,
             api_key=env_vars.get("NOEIRA_CLOUD_API_KEY", ""),
+            spool_path=run.dir + "/remote.spool",
         )
         # ⚠ THE CONFIG GOES TO BOTH HALVES: `/runs` for the dashboard and
         # `metrics.config.kv` beside the CSV, so a CSV read later still says

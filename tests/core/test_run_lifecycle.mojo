@@ -29,14 +29,26 @@ from noeira.core.logger import (
     NoOpLogger,
     RemoteLogger,
 )
+from noeira.io.fileio import remove_file
 
 
 comptime DEAD = "http://127.0.0.1:9"
 
 
 def _logger(run_id: String) raises -> RemoteLogger:
+    # ⚠ THE SPOOL GOES TO /tmp: against the discard port every payload ends
+    # there, and the default (`logs/remote_spool/`) is inside the tree. It is
+    # appended to, so a stale one from the last run is removed first.
+    var spool = "/tmp/noeira_lifecycle_gate_" + run_id + ".spool"
+    try:
+        remove_file(spool)
+    except:
+        pass
     return RemoteLogger(
-        server_url=String(DEAD), run_name=String("gate"), run_id=run_id
+        server_url=String(DEAD),
+        run_name=String("gate"),
+        run_id=run_id,
+        spool_path=spool,
     )
 
 

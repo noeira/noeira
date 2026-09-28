@@ -296,35 +296,39 @@ def main() raises:
     print("  first beat: 0 in 400 ms at a 5 s interval, not one at t=0")
     checks += 1
 
-    # ── 7. a dead transport stops the heartbeat ─────────────────────
+    # ── 7. a down transport is probed on the backoff, not the interval ──
     #
-    # ⚠ ONE FAILURE IS THE WHOLE BUDGET. `127.0.0.1:9` is the discard port, so
-    # every attempt costs a full client timeout. A heartbeat that ignores the
-    # dead latch pays that once per interval for the rest of the run — the
-    # exact cost the latch exists to bound, reintroduced by the one code path
-    # that generates its own traffic.
+    # ⚠ THE BACKOFF, NOT THE PING INTERVAL, SETS THE PACE WHILE DOWN.
+    # `127.0.0.1:9` is the discard port. This used to be the dead latch —
+    # one failure, then silence for the rest of the run, which is also what
+    # threw away every later metric. Now the transport is retried, but at
+    # `retry_min` (100 ms here) doubling (200, 400, 800 …): about four probes
+    # in 1.5 s, where a heartbeat that ignored the outage would make ~14.
     var f = HttpPostSink(
         timeout_ms=300,
         ping_url=String("http://127.0.0.1:9/runs/x/ping"),
         ping_interval_ms=100,
+        retry_min_ms=100,
+        retry_max_ms=5000,
     )
     sleep(1.5)
     f.close(drain_ms=200)
-    if not f.dead():
+    if not f.down() or f.outages() != 1:
         raise Error(
-            "the discard port did not latch the transport dead — the gate"
-            " below would be vacuous"
+            "the discard port did not register as an outage (down="
+            + String(f.down()) + " outages=" + String(f.outages())
+            + ") — the gate below would be vacuous"
         )
-    if f.failed() != 1:
+    if f.failed() < 2 or f.failed() > 6:
         raise Error(
-            "a dead transport was pinged "
+            "a down transport was probed "
             + String(f.failed())
-            + " times in 1.5 s at a 100 ms interval; the dead latch must stop"
-            " it after the first"
+            + " times in 1.5 s; a 100 ms backoff doubling gives ~4, a"
+            " heartbeat on its 100 ms interval ~14, a dead latch 1"
         )
     print(
-        "  dead transport: 1 attempt, then silent (a 100 ms interval over"
-        " 1.5 s would have cost ~14 timeouts)"
+        "  down transport: " + String(f.failed()) + " probes in 1.5 s on a"
+        " doubling backoff (a 100 ms interval would have cost ~14)"
     )
     checks += 2
 
@@ -340,7 +344,7 @@ def main() raises:
 #   N3  the empty-ping_url guard is removed      -> check 3 (dead/failed != 0)
 #   N4  on_start leaves the stamp at 0           -> check 6
 #   N5  the interval is in ms, not ns            -> check 2
-#   N6  the ping ignores the dead latch          -> check 7
+#   N6  the ping ignores the outage backoff       -> check 7 (upper bound)
 #
 # ⚠ N4 AND N6 SURVIVED THE FIRST SWEEP and checks 6 and 7 exist because of it.
 # Check 4 appeared to cover N4 and did not: there the payload is already queued

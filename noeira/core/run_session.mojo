@@ -50,6 +50,9 @@ def run_logger(
     ⚠ THE REMOTE RUN ID IS THE RUN'S ID, never one the logger minted. That is
     what makes a dashboard row, a `run.kv` and a checkpoint directory the same
     object (`core/run.mojo`, pain 2).
+
+    What the monitor never took is spooled to `<run dir>/remote.spool`, beside
+    the `metrics.csv` it duplicates — `pixi run logger-replay` sends it.
     """
     var url = String("")
     var key = String("")
@@ -67,6 +70,7 @@ def run_logger(
             run_id=run.id,
             buffer_size=buffer_size,
             api_key=key,
+            spool_path=run.dir + "/remote.spool",
         ),
     )
 

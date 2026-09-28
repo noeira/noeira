@@ -23,13 +23,19 @@ why it names `RemoteLogger.flush` when it explains the pin. Nothing in the
 training path imports Python now.
 
 ⚠ REQUIRES THE HTTP SHIM: `pixi run build-http`. A missing one is reported
-once and metrics are dropped from there on — a dashboard that cannot be
-reached must never take the training run with it.
+once and every payload goes to the spool file instead — a dashboard that
+cannot be reached must never take the training run with it.
 
-⚠ METRICS ARE DROPPABLE, AND DROPS ARE COUNTED. The queue is bounded; if the
-dashboard falls behind the run, batches are refused rather than stalling
-training. `close()` prints the tally (`sink_report()`), and a caller that
-suppresses that output is running a silently lossy logger.
+⚠⚠ METRICS ARE HELD, RETRIED AND SPOOLED — NOT DROPPED. This used to drop:
+the first failed POST latched the transport dead and "metrics will be dropped
+for the rest of this run" followed, so a blip at minute one of a twelve-hour
+run cost eleven hours and fifty-nine minutes of dashboard. Now an outage holds
+the batches in memory and retries on a backoff capped at a minute; what cannot
+be delivered live (a server rejection, an outage past `hold_bytes`, an outage
+still going at `close()`) lands in the spool file, replayable with
+`pixi run logger-replay <spool>`. `close()` prints the tally (`sink_report()`)
+and the only loss it can show is `lost` — a spool that could not be written.
+See `noeira/io/http_sink.mojo` for the policy.
 
 Usage:
     # CSV only
@@ -64,7 +70,7 @@ from std.time import perf_counter_ns
 from std.math import isnan, isinf
 
 
-from noeira.io.http_sink import HttpPostSink
+from noeira.io.http_sink import HttpPostSink, append_spool, spool_record
 from noeira.io.json import JsonWriter
 from noeira.io.fileio import write_text_atomic
 
@@ -406,8 +412,9 @@ struct RemoteLogger(Logger):
     and one worker means the registration queued by the first `flush` is sent
     before the `/ingest` batch behind it.
 
-    ⚠ `close()` IS NOT OPTIONAL. It drains the queue and joins the worker;
-    without it, whatever is still queued at process exit is lost.
+    ⚠ `close()` IS NOT OPTIONAL. It drains the queue, spools what did not
+    drain, and joins the worker; without it, whatever is still held at process
+    exit is lost — the spool is written by `close()`, not by the kernel.
     """
 
     var run_id: String
@@ -430,9 +437,17 @@ struct RemoteLogger(Logger):
     That is the right meaning (two copies of a logger are one run) and it is
     also forced: `Logger` is `Copyable`, `CompositeLogger` copies its halves,
     and a libcurl easy handle may not be shared across threads."""
+    var spool_path: String
+    """Where payloads the dashboard never took are written, for
+    `pixi run logger-replay`. Defaults to `logs/remote_spool/<run_id>.spool`;
+    `run_logger` puts it in the run directory."""
     var _reported: Bool
-    """Whether a transport problem has been printed. Once per run, not once
-    per flush."""
+    """Whether a PERMANENT problem (no shim, no sink) has been printed. Once
+    per run, not once per flush."""
+    var _was_down: Bool
+    """The outage state last printed, so each transition prints once — down,
+    then back — rather than once per flush for the whole outage."""
+    var _reported_spool: Bool
     var _finished: Bool
     """Whether the terminal state has been sent.
 
@@ -448,6 +463,7 @@ struct RemoteLogger(Logger):
         run_id: String = "",
         buffer_size: Int = 200,
         api_key: String = "",
+        spool_path: String = "",
     ):
         self._start_ns = perf_counter_ns()
         if run_id.byte_length() > 0:
@@ -464,7 +480,13 @@ struct RemoteLogger(Logger):
         self._run_registered = False
         self._total_logged = 0
         self._sink = None
+        if spool_path.byte_length() > 0:
+            self.spool_path = spool_path
+        else:
+            self.spool_path = "logs/remote_spool/" + self.run_id + ".spool"
         self._reported = False
+        self._was_down = False
+        self._reported_spool = False
         self._finished = False
 
     def __init__(out self, *, deinit move: Self):
@@ -480,7 +502,10 @@ struct RemoteLogger(Logger):
         self._run_registered = move._run_registered
         self._total_logged = move._total_logged
         self._sink = move._sink^
+        self.spool_path = move.spool_path^
         self._reported = move._reported
+        self._was_down = move._was_down
+        self._reported_spool = move._reported_spool
         self._finished = move._finished
 
     def log_scalar(mut self, name: String, value: Float64, step: Int) raises:
@@ -514,7 +539,13 @@ struct RemoteLogger(Logger):
             self.flush()
 
     def flush(mut self) raises:
-        if self.server_url.byte_length() == 0 or len(self.entries) == 0:
+        if self.server_url.byte_length() == 0:
+            return
+        if len(self.entries) == 0:
+            # Nothing new, but a batch parked while the ring was full still
+            # needs the owner thread to move it — the worker cannot.
+            if self._sink:
+                self._sink.value().pump()
             return
 
         if not self._run_registered:
@@ -582,8 +613,9 @@ struct RemoteLogger(Logger):
         """Flush, then drain the sink and join its thread.
 
         ⚠ THE DRAIN IS BOUNDED. `drain_ms` is a budget, not a promise — see
-        `HttpPostSink`. A hung dashboard is bounded by the worker's `dead`
-        latch instead, at one client timeout rather than one per payload.
+        `HttpPostSink`. A hung dashboard is bounded by the worker's close-time
+        `dead` latch instead, at one client timeout rather than one per
+        payload, and what did not drain is SPOOLED, not discarded.
 
         ⚠⚠ REACHING HERE IS ITSELF THE END SIGNAL. A run that arrives at
         `close()` finished cleanly, so it reports `done` unless the driver
@@ -599,14 +631,16 @@ struct RemoteLogger(Logger):
         self.flush()
         self.finish(String("done"), String(""))
         if self._sink:
-            self._report_transport_once()
-            var line = self.sink_report()
+            self._report_transport()
             self._sink.value().close(drain_ms=3000)
             var final = self.sink_report()
             if final.byte_length() > 0:
                 print(final)
-            elif line.byte_length() > 0:
-                print(line)
+            if self._sink.value().spooled() > 0:
+                print(
+                    "  [logger] replay what the dashboard missed with:"
+                    " pixi run logger-replay " + self.spool_path
+                )
 
     def set_config(mut self, key: String, value: String):
         for i in range(len(self._config_keys)):
@@ -711,69 +745,107 @@ struct RemoteLogger(Logger):
                         timeout_ms=5000,
                         ping_url=self._ping_url(),
                         ping_body=self._ping_payload(),
+                        spool_path=self.spool_path,
                     )
                 )
-            _ = self._sink.value().post(url, payload)
+            if not self._sink.value().post(url, payload):
+                if not self._reported:
+                    self._reported = True
+                    print(
+                        "  [logger] a payload was LOST (oversize, or the spool "
+                        + self.spool_path + " is not writable)"
+                    )
         except e:
+            # ⚠ NO SINK MEANS NO WORKER TO SPOOL FOR US, so this path spools
+            # itself. Rare (a thread that would not start), but it is the one
+            # place a payload could otherwise vanish without a count.
+            if not append_spool(self.spool_path, spool_record(url, payload)):
+                print("  [logger] a payload was LOST: " + String(e))
             if not self._reported:
                 self._reported = True
-                print("  [logger] could not start the POST sink: " + String(e))
-        self._report_transport_once()
+                print(
+                    "  [logger] could not start the POST sink: " + String(e)
+                    + " — payloads go to " + self.spool_path
+                )
+        self._report_transport()
 
-    def _report_transport_once(mut self):
-        """Print the first transport problem the worker recorded, once.
+    def _report_transport(mut self):
+        """Print each change in the transport's state, once.
 
         The worker never prints: it runs on another thread and would interleave
         with training output. It records into atomic cells and the owning
-        thread reports here.
+        thread reports here — on a flush, so a run that logs nothing for an
+        hour reports its outage when it next does.
         """
-        if self._reported or not self._sink:
+        if not self._sink:
             return
         var s = self._sink.value()
         if s.shim_missing():
-            self._reported = True
+            if not self._reported:
+                self._reported = True
+                print(
+                    "  [logger] the HTTP shim is missing — build it with"
+                    " `pixi run build-http`. Metrics go to the spool "
+                    + self.spool_path
+                )
+            return
+        var down = s.down()
+        if down and not self._was_down:
+            self._was_down = True
             print(
-                "  [logger] the HTTP shim is missing — build it with"
-                " `pixi run build-http`. Metrics will be dropped."
-            )
-        elif s.dead():
-            self._reported = True
-            print(
-                "  [logger] the dashboard transport failed (last status "
+                "  [logger] the dashboard is unreachable (last status "
                 + String(s.last_status())
-                + "); metrics will be dropped for the rest of this run."
+                + "); holding metrics and retrying with backoff — nothing is"
+                " dropped."
+            )
+        elif not down and self._was_down:
+            self._was_down = False
+            print(
+                "  [logger] the dashboard is back; "
+                + String(s.held())
+                + " held batches are being delivered."
+            )
+        if s.spooled() > 0 and not self._reported_spool:
+            self._reported_spool = True
+            print(
+                "  [logger] some payloads could not go live and were written to "
+                + self.spool_path
+                + " — `pixi run logger-replay` sends them once the dashboard"
+                " takes them."
             )
 
     def sink_report(self) -> String:
         """One line of delivery accounting, or empty if nothing was sent.
 
-        ⚠ THE DROP COUNT IS THE COST OF THE DROP POLICY AND MUST BE VISIBLE. A
-        Sink that never reports it is silently lossy; `close()` prints this.
+        ⚠ `lost` IS THE NUMBER THAT MUST BE ZERO, AND MUST BE VISIBLE. Every
+        other outcome — delivered, spooled — still has the payload somewhere.
+        `close()` prints this.
         """
         if not self._sink:
             return String("")
         var s = self._sink.value()
-        var total = (
-            s.sent() + s.failed() + s.dropped() + s.abandoned() + s.pings()
-        )
+        var lost = s.dropped() + s.abandoned()
+        var total = s.sent() + s.failed() + s.spooled() + lost + s.pings()
         if total == 0:
             return String("")
-        return (
-            "  [logger] "
-            + String(s.sent())
-            + " batches delivered, "
-            + String(s.failed())
-            + " failed, "
-            + String(s.dropped())
-            + " dropped (queue full), "
-            + String(s.abandoned())
-            + " abandoned at close"
-            + (
-                ", " + String(s.pings()) + " heartbeats"
-                if s.pings() > 0
-                else String("")
+        var line = "  [logger] " + String(s.sent()) + " batches delivered"
+        if s.held() > 0:
+            line += ", " + String(s.held()) + " still held"
+        if s.spooled() > 0:
+            line += (
+                ", " + String(s.spooled()) + " spooled to " + self.spool_path
             )
-        )
+            if s.rejected() > 0:
+                line += " (" + String(s.rejected()) + " rejected by the server)"
+        line += ", " + String(lost) + " lost"
+        if s.outages() > 0:
+            line += (
+                "; " + String(s.outages()) + " outage(s), "
+                + String(s.failed()) + " failed attempts"
+            )
+        if s.pings() > 0:
+            line += ", " + String(s.pings()) + " heartbeats"
+        return line
 
     def total_logged(self) -> Int:
         return self._total_logged
@@ -782,15 +854,15 @@ struct RemoteLogger(Logger):
         return len(self.entries)
 
     def posts_attempted(self) -> Int:
-        """Payloads the worker has accounted for — delivered, failed, dropped
-        or abandoned. The four terms `sink_report` prints, as one number.
+        """Payloads accounted for — delivered, spooled, or lost. Each payload
+        once, however many attempts it took (`failed()` counts attempts).
 
         ⚠ IT IS ONLY FINAL AFTER `close()`. Before the drain it is a snapshot of
         a live counter and says nothing about what is still in flight."""
         if not self._sink:
             return 0
         var s = self._sink.value()
-        return s.sent() + s.failed() + s.dropped() + s.abandoned()
+        return s.sent() + s.spooled() + s.dropped() + s.abandoned()
 
     def registered(self) -> Bool:
         """Whether `/runs` has been queued. Diagnostics and gates."""

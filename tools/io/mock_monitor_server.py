@@ -1,9 +1,9 @@
 """A recording stand-in for the noeira-cloud Worker, for the sink gates.
 
-    python3 tools/io/mock_monitor_server.py <port-file> <log-file> [<seconds>]
+    python3 tools/io/mock_monitor_server.py <port-file> <log-file> [<seconds>] [<port>]
 
-Binds port 0, writes the chosen port to `<port-file>` atomically, and appends
-one line per request to `<log-file>`:
+Binds `<port>` (default 0, i.e. any), writes the bound port to `<port-file>`
+atomically, and appends one line per request to `<log-file>`:
 
     <monotonic_ms> <METHOD> <path> <body-or-"<N bytes>">
 
@@ -71,6 +71,9 @@ ARTIFACTS = {}
 ARTIFACT_ROWS = {}  # id -> row, for GET /artifacts?run_id= and /artifacts/<id>
 SLOW_PUT_MS = 150
 LOCK = threading.Lock()
+# `POST /__fail_next` with a count in the body: that many following POSTs to
+# /runs or /ingest answer 503 — an overloaded monitor, for the retry gate.
+FAIL_NEXT = 0
 
 # slug -> {"description": str, "files": {path: sha256}}
 PROJECTS = {}
@@ -258,6 +261,23 @@ class Handler(BaseHTTPRequestHandler):
         if u.path == "/__shutdown":
             os._exit(0)
 
+        global FAIL_NEXT
+        if u.path == "/__fail_next":
+            with LOCK:
+                FAIL_NEXT = int(text or "0")
+            return self._json(200, {"ok": True})
+        if u.path in ("/runs", "/ingest"):
+            with LOCK:
+                busy = FAIL_NEXT > 0
+                if busy:
+                    FAIL_NEXT -= 1
+            if busy:
+                return self._json(503, {"error": "asked to be busy"})
+
+        # A payload the server refuses for good: never worth retrying.
+        if "/reject" in u.path:
+            return self._json(400, {"error": "asked to reject"})
+
         # A registration the gate has asked to fail, so the retry path and the
         # "abandoned" accounting can be exercised without unplugging anything.
         if "/fail" in u.path:
@@ -379,8 +399,9 @@ def main():
     global LOG, PORT
     port_file, LOG = sys.argv[1], sys.argv[2]
     seconds = float(sys.argv[3]) if len(sys.argv) > 3 else 60.0
+    port = int(sys.argv[4]) if len(sys.argv) > 4 else 0
     open(LOG, "w").close()
-    srv = ThreadingHTTPServer(("127.0.0.1", 0), Handler)
+    srv = ThreadingHTTPServer(("127.0.0.1", port), Handler)
     PORT = srv.server_address[1]
     tmp = port_file + ".tmp"
     with open(tmp, "w") as f:

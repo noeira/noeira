@@ -388,6 +388,11 @@ build-serial = { cmd = "bash scripts/build_serial.sh", description = "Build the 
 # catalog, the HF downloader and the MNIST / TinyShakespeare loaders — i.e.
 # of every remaining network call in the tree, none of which touch Python.
 build-http = { cmd = "bash scripts/build_http.sh", description = "Build the HTTP shim (noeira/io/http.mojo)" }
+# What a run's RemoteLogger could not deliver live (an outage still going at
+# close, one past its memory cap, a payload the server rejected) is spooled to
+# `<run dir>/remote.spool` or `logs/remote_spool/<run_id>.spool`. This sends
+# it; no argument means every spool under logs/ and projects/.
+logger-replay = { cmd = "mojo run -I . tools/logger/replay_spool.mojo", description = "Replay RemoteLogger spool files into the monitor: logger-replay [spool...]" }
 # qhull shim for `noeira/physics3d/collision/`. MuJoCo does not implement a
 # convex hull — `MakeGraph` CALLS qhull and walks `FORALLfacets`, and that
 # order decides every polygon normal. Prerequisite of any MESH model.

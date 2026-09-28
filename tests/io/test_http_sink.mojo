@@ -1,4 +1,4 @@
-"""HttpPostSink — framing, drop accounting, and non-blocking under failure.
+"""HttpPostSink — framing, accounting, and non-blocking under failure.
 
 Run: pixi run mojo run -I . tests/io/test_http_sink.mojo
 
@@ -23,11 +23,13 @@ from std.time import perf_counter_ns
 
 from noeira.core.concurrent.ring import SharedRing
 from noeira.core.logger import RemoteLogger
+from noeira.io.fileio import remove_file
 from noeira.io.http_sink import (
     DEFAULT_SLOT_BYTES,
     HttpPostSink,
-    unframe,
     frame_into,
+    read_spool,
+    unframe,
 )
 
 
@@ -118,15 +120,34 @@ def test_full_queue_drops_and_counts() raises:
     )
 
 
+def _spool_count(path: String) raises -> Int:
+    var u = List[String]()
+    var b = List[String]()
+    read_spool(path, u, b)
+    return len(u)
+
+
+def _rm(path: String):
+    try:
+        remove_file(path)
+    except:
+        pass
+
+
 def test_dead_dashboard_costs_the_caller_nothing() raises:
     """The operational property. Nothing is listening on the discard port.
 
-    Asserts three things a synchronous POST could not give: the caller is not
-    blocked, the worker latches dead rather than retrying every payload, and
-    `close()` returns promptly instead of paying a timeout per queued item.
+    Asserts what a synchronous POST could not give: the caller is not blocked,
+    `close()` returns promptly instead of paying a timeout per queued item —
+    the close-time `dead` latch — and every payload that did not go out is in
+    the spool rather than on the floor.
     """
     comptime N = 64
-    var sink = HttpPostSink(timeout_ms=2000, capacity=N, slot_bytes=4096)
+    var spool = String("/tmp/noeira_http_sink_gate_dead.spool")
+    _rm(spool)
+    var sink = HttpPostSink(
+        timeout_ms=2000, capacity=N, slot_bytes=4096, spool_path=spool
+    )
     var t0 = perf_counter_ns()
     var queued = 0
     for i in range(N):
@@ -138,7 +159,7 @@ def test_dead_dashboard_costs_the_caller_nothing() raises:
     sink.close(drain_ms=3000)
     var close_ms = Float64(perf_counter_ns() - t1) / 1e6
 
-    var handled = sink.sent() + sink.failed() + sink.abandoned()
+    var handled = sink.sent() + sink.spooled() + sink.abandoned()
     if queued != N:
         raise Error(
             "queued " + String(queued) + " of " + String(N)
@@ -156,29 +177,74 @@ def test_dead_dashboard_costs_the_caller_nothing() raises:
         )
     if not sink.dead():
         raise Error(
-            "the worker did not latch dead after a refused connection; a drain"
-            " will pay one client timeout PER queued payload"
+            "the worker did not latch dead at close after a refused"
+            " connection; a drain will pay one client timeout PER payload"
         )
-    if sink.failed() != 1:
+    # ⚠ ONE OR TWO, NOT ONE: the worker may try the head once while the run
+    # is live (and back off), then once more when `close()` asks it to stop.
+    # What the latch forbids is one attempt PER payload — 64 here.
+    if sink.failed() < 1 or sink.failed() > 2:
         raise Error(
             "the worker tried " + String(sink.failed()) + " POSTs; the latch"
-            " should stop it after the first failure"
+            " should stop it after the first failure at close"
         )
-    if handled != N:
+    if handled != N or sink.abandoned() != 0:
         raise Error(
             "accounting: " + String(sink.sent()) + " sent + "
-            + String(sink.failed()) + " failed + " + String(sink.abandoned())
-            + " abandoned = " + String(handled) + ", expected " + String(N)
+            + String(sink.spooled()) + " spooled + " + String(sink.abandoned())
+            + " lost = " + String(handled) + ", expected " + String(N)
+            + " with 0 lost"
+        )
+    if _spool_count(spool) != N:
+        raise Error(
+            "the spool holds " + String(_spool_count(spool)) + " of "
+            + String(N) + " payloads"
         )
     if close_ms > 2500.0:
         raise Error(
             "close() took " + String(close_ms) + " ms against a dead port"
         )
+    _rm(spool)
     print(
         "  dead dashboard:", queued, "queued in", post_ms, "ms; close() in",
-        close_ms, "ms;", sink.failed(), "tried +", sink.abandoned(),
-        "abandoned =", handled, "of", N, "( dead latched )",
+        close_ms, "ms;", sink.failed(), "tried,", sink.spooled(),
+        "spooled, 0 lost ( dead latched at close )",
     )
+
+
+def test_full_ring_parks_rather_than_drops() raises:
+    """⚠⚠ A FULL RING USED TO BE A DROP. Two slots, 50 posts faster than any
+    worker drains them: every one must be accepted, none counted dropped, and
+    all 50 must come out the other end — here, in order, in the spool."""
+    comptime N = 50
+    var spool = String("/tmp/noeira_http_sink_gate_full.spool")
+    _rm(spool)
+    var sink = HttpPostSink(
+        timeout_ms=500, capacity=2, slot_bytes=1024, spool_path=spool
+    )
+    var accepted = 0
+    for i in range(N):
+        if sink.post(String(DEAD_URL), String('{"i":') + String(i) + "}"):
+            accepted += 1
+    sink.close(drain_ms=1000)
+    if accepted != N or sink.dropped() != 0:
+        raise Error(
+            "full ring: " + String(accepted) + " accepted, "
+            + String(sink.dropped()) + " dropped; want " + String(N) + ", 0"
+        )
+    var u = List[String]()
+    var b = List[String]()
+    read_spool(spool, u, b)
+    if len(u) != N or sink.spooled() != N or sink.abandoned() != 0:
+        raise Error(
+            "full ring: spool holds " + String(len(u)) + ", spooled="
+            + String(sink.spooled()) + " lost=" + String(sink.abandoned())
+        )
+    for i in range(N):
+        if b[i] != String('{"i":') + String(i) + "}":
+            raise Error("full ring: spool record " + String(i) + " is " + b[i])
+    _rm(spool)
+    print("  full ring: 50 posts through 2 slots, 0 dropped, 50 spooled in order")
 
 
 def test_close_is_idempotent() raises:
@@ -216,10 +282,13 @@ def test_logger_does_not_block_on_a_dead_dashboard() raises:
     must pay effectively nothing and must still close."""
     comptime STEPS = 2000
     comptime BUFFER = 100
+    var spool = String("/tmp/noeira_http_sink_gate_logger.spool")
+    _rm(spool)
     var lg = RemoteLogger(
         server_url=String("http://127.0.0.1:9"),
         run_name=String("offline-gate"),
         buffer_size=BUFFER,
+        spool_path=spool,
     )
     var t0 = perf_counter_ns()
     for step in range(STEPS):
@@ -248,6 +317,14 @@ def test_logger_does_not_block_on_a_dead_dashboard() raises:
             "no delivery accounting was recorded — the sink was never used,"
             " so this gate is VACUOUS"
         )
+    # /runs + one /ingest per flush + /finish, every one of them in the spool.
+    if lg.posts_attempted() != flushes + 2 or _spool_count(spool) != flushes + 2:
+        raise Error(
+            "offline run: " + String(lg.posts_attempted()) + " accounted, "
+            + String(_spool_count(spool)) + " spooled; want "
+            + String(flushes + 2) + " of each"
+        )
+    _rm(spool)
     print(
         "  offline run:", STEPS, "log_scalar calls /", flushes,
         "flushes in", log_ms, "ms; close() in", close_ms, "ms",
@@ -263,6 +340,7 @@ def main() raises:
     test_oversize_is_refused_not_truncated()
     test_full_queue_drops_and_counts()
     test_dead_dashboard_costs_the_caller_nothing()
+    test_full_ring_parks_rather_than_drops()
     test_close_is_idempotent()
     test_inert_logger_starts_no_sink()
     test_logger_does_not_block_on_a_dead_dashboard()
