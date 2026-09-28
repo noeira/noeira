@@ -62,6 +62,7 @@ later addition.
   `--log-std-init 0` (nexus's std 1).
 """
 
+from std.builtin.sort import sort
 from std.math import abs, sqrt, log, cos
 from std.random import random_float64, seed as seed_rng
 from std.sys import is_defined
@@ -915,6 +916,10 @@ def run_ppo[M: ModelDefLike, C: Phyics3dEnvConfig](
             ctx.enqueue_copy(raw_h, obs_dev)
             ctx.synchronize()
             var held = List[Bool](length=N_ENVS, fill=False)
+            # ⚠ WHEN it first succeeds (step index, -1 never): is the horizon
+            # the limit? A lagged arm is slower; successes bunched at the end
+            # of the episode say the clock, not the skill, caps the score.
+            var t_held = List[Int](length=N_ENVS, fill=-1)
             # ⚠ WHERE EPISODES STOP, not only whether they succeed: the brick
             # (term 0's `a`) rising, reaching over `b`, and the closest
             # horizontal gap. A success rate cannot tell "never grasps" from
@@ -969,6 +974,8 @@ def run_ppo[M: ModelDefLike, C: Phyics3dEnvConfig](
                     var hb = env.d.meta.data[e * METADATA_SIZE + META_IDX_GOAL_HELD] > Scalar[DT](0.5)
                     if hb:
                         held[e] = True
+                        if t_held[e] < 0:
+                            t_held[e] = t
                     held_end[e] = hb
                     var mb = e * METADATA_SIZE + META_IDX_TASK_PARAM_0
                     var ia = Int(env.d.meta.data[mb + 1])
@@ -1041,7 +1048,7 @@ def run_ppo[M: ModelDefLike, C: Phyics3dEnvConfig](
             # one row per episode: where it started, how far it got
             var csv = String(
                 "lane,brick_x,brick_y,qx,qy,qz,qw,bowl_x,bowl_y,"
-                + "rise_max,h_min,over,success,held_end,dz_end,h_end\n"
+                + "rise_max,h_min,over,success,held_end,dz_end,h_end,t_held\n"
             )
             for e in range(N_ENVS):
                 csv += String(e)
@@ -1051,11 +1058,30 @@ def run_ppo[M: ModelDefLike, C: Phyics3dEnvConfig](
                 csv += "," + ("1" if over[e] else "0")
                 csv += "," + ("1" if held[e] else "0")
                 csv += "," + ("1" if held_end[e] else "0")
-                csv += "," + String(dz_end[e]) + "," + String(h_end[e]) + "\n"
+                csv += "," + String(dz_end[e]) + "," + String(h_end[e])
+                csv += "," + String(t_held[e]) + "\n"
             var csv_path = run.dir + "/eval_lanes_round" + String(rnd) + ".csv"
             with open(csv_path, "w") as f:
                 f.write(csv)
             print("  greedy eval round", rnd, "per-episode rows:", csv_path)
+            # the successes' first-success step: quartiles, and the share in
+            # the horizon's last quarter
+            var ts = List[Int]()
+            for e in range(N_ENVS):
+                if t_held[e] >= 0:
+                    ts.append(t_held[e])
+            if len(ts) > 0:
+                sort(ts)
+                var late = 0
+                for k in range(len(ts)):
+                    if ts[k] >= (3 * C.MAX_STEPS) // 4:
+                        late += 1
+                var dt_s = Float64(C.FRAME_SKIP) * M.TIMESTEP
+                print("  greedy eval round", rnd, "first success at step (of",
+                      C.MAX_STEPS, ") p25", ts[len(ts) // 4], "p50",
+                      ts[len(ts) // 2], "p90", ts[(9 * len(ts)) // 10],
+                      "| p50", Float64(ts[len(ts) // 2]) * dt_s, "s | in the last quarter",
+                      late, "of", len(ts))
             print("  greedy eval round", rnd, "endings of the", N_ENVS - n_end,
                   "not held at the end | brick > 2 cm up (carried, hovering or on the rim)", f_up,
                   "| resting inside the rim, not Near", f_rim_in,
