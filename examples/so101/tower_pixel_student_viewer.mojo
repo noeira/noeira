@@ -7,6 +7,9 @@ so101_tower — ImGui sidebar, the overhead and wrist cameras as insets.
     pixi run mojo run -I . -D DAGGER_PX_32 examples/so101/tower_pixel_student_viewer.mojo \\
         so101_tower_cube_in_bowl                  # a 32x32 student needs a 32x32 build
     ... --seed 3                                  # another placement of the props
+    ... --policy 82139be3                         # a policy by (part of) its run id
+    ... --record gifs/so101_bowl.mp4 --episodes 2 # an unattended clip, then close
+    ... --eye 0.75,-0.6,0.5 --target 0.2,0,0.05  # a fixed free-camera shot
 
 The interactive counterpart of the DAgger driver's greedy eval
 (`noeira/tasks/pixel_dagger_tower.mojo`). Two tasks — lift on the real
@@ -416,11 +419,41 @@ def main() raises:
     var args = argv()
     var positional = List[String]()
     var place_seed = 0
+    var want_policy = String("")
+    var record_path = String("")
+    var record_episodes = 1
+    var eye = List[Float64]()
+    var target = List[Float64]()
     var ai = 1
     while ai < len(args):
         var a = String(args[ai])
         if a == "--seed" and ai + 1 < len(args):
             place_seed = Int(String(args[ai + 1]))
+            ai += 2
+            continue
+        if a == "--policy" and ai + 1 < len(args):
+            want_policy = String(args[ai + 1])
+            ai += 2
+            continue
+        if a == "--record" and ai + 1 < len(args):
+            record_path = String(args[ai + 1])
+            ai += 2
+            continue
+        if (a == "--eye" or a == "--target") and ai + 1 < len(args):
+            var v = List[Float64]()
+            for part in String(args[ai + 1]).split(","):
+                v.append(Float64(String(part)))
+            if len(v) != 3:
+                print("  " + a + " takes x,y,z")
+                return
+            if a == "--eye":
+                eye = v^
+            else:
+                target = v^
+            ai += 2
+            continue
+        if a == "--episodes" and ai + 1 < len(args):
+            record_episodes = Int(String(args[ai + 1]))
             ai += 2
             continue
         positional.append(a)
@@ -447,10 +480,28 @@ def main() raises:
     st.policy_variant = 0
     var want = String("lift") if task.find("lift") >= 0 else String("bowl")
     var labels = src.variant_labels()
+    var picked = False
     for i in range(len(labels)):
-        if labels[i].startswith(want) and src.variants[i].refuse.byte_length() == 0:
+        if want_policy.byte_length() > 0:
+            if (labels[i].find(want_policy) >= 0
+                    or src.variants[i].ckpt.find(want_policy) >= 0):
+                if src.variants[i].refuse.byte_length() > 0:
+                    print("  --policy", want_policy, ":", src.variants[i].refuse)
+                    return
+                st.policy_variant = Int32(i)
+                picked = True
+                break
+        elif labels[i].startswith(want) and src.variants[i].refuse.byte_length() == 0:
             st.policy_variant = Int32(i)
+            picked = True
             break
+    if want_policy.byte_length() > 0 and not picked:
+        print("  --policy", want_policy, ": no such variant (see the list above)")
+        return
+    st.record_path = record_path
+    st.record_episodes = record_episodes
+    st.free_camera_eye = eye^
+    st.free_camera_target = target^
     st.free_camera = True
     st.episode_steps = So101TowerConfig.MAX_STEPS
     st.frame_ms = Int(Float64(So101TowerConfig.FRAME_SKIP) * So101TowerModel.TIMESTEP * 1000.0)

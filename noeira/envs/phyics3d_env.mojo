@@ -42,6 +42,7 @@ from noeira.physics3d.dynamics.pose_transmission import (
 )
 from noeira.physics3d.model.model_def import ModelDefLike
 from noeira.physics3d.model.model_renderer import ModelRenderer
+from noeira.math3d import Vec3 as Vec3Generic
 from noeira.render.ui import UIRect, UIText
 from noeira.render.renderer3d import RendererHandoff
 from noeira.physics3d.kinematics.forward_kinematics import (
@@ -983,6 +984,15 @@ struct Phyics3dEnv[
         if not self._renderer_initialized:
             return
         self._renderer.value()[].request_free_camera()
+
+    def renderer_set_free_camera(
+        mut self, eye: Vec3Generic[DType.float64], target: Vec3Generic[DType.float64]
+    ) -> None:
+        """The free camera at an exact pose (no 3/4-view reframe) — a framed
+        shot for a recorded clip; the mouse still orbits it afterwards."""
+        if not self._renderer_initialized:
+            return
+        self._renderer.value()[].set_free_camera(eye, target)
 
     def renderer_set_pip_cameras(mut self, var cams: List[Int]) -> None:
         """Draw these model cameras as insets beside the main view — the
