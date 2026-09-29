@@ -206,8 +206,18 @@ def g1_score_segment[
     mut obs_t: Tensor,
     mut z1: Tensor,
     mut act_out: Tensor,
+    render: Bool = False,
+    frame_delay_ms: Int = 16,
 ) raises -> G1TrackScore:
     """`tracking_inference` for ONE segment starting at store row `r0`.
+
+    `render=True` draws each step through the env's own renderer. That flag
+    exists so the VIEWER IS THIS FUNCTION — `bfm_zero_policy_viewer.mojo` opens
+    a window and calls exactly the loop the EMD came out of. A viewer with its
+    own copy of the rollout would be a second place for the z schedule, the
+    history rules and the action chain to drift, and it would then be showing
+    something the number never measured (`_a_rule_written_inline_twice_drifts`).
+    The caller owns `init_renderer` / `close`; this only draws.
 
     `z_t = project(B(row t+1))` — a SINGLE row, not the mean of eight the
     training rollouts use — then reset to row 0 and `T-1` mean-action steps.
@@ -320,6 +330,9 @@ def g1_score_segment[
                     v = -G1_ACTION_CLIP
                 last_a[k] = v
         _ = env.step(a)
+        if render:
+            env.render_frame()
+            env.renderer_delay(frame_delay_ms)
         for i in range(NQ):
             qp[i] = Float64(env.d.qpos.data[i])
         for k in range(ACT):
