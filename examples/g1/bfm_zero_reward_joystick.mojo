@@ -103,8 +103,15 @@ comptime OFF_WZ: Int = UNITREE_G1_STATE_DIM + G1_PRIV_OFF_ANGVEL + 2
 comptime SIGMA_V: Float64 = 0.5
 comptime SIGMA_W: Float64 = 0.5
 
-comptime SIDEBAR_W: Int = 224
-comptime PAD_W: Float32 = 186.0
+comptime SIDEBAR_W: Int = 240
+# ⚠ THE TEXT BUDGET, IN CHARACTERS. `draw_text` advances 8*scale pixels per
+# character, so at scale 1 a label starting at x=12 has (SIDEBAR_W-24)/8 = 27
+# characters before it runs off the panel and into the 3D viewport. Nothing
+# clips it for you — the text pass sets a FULL-WINDOW viewport on purpose so
+# the HUD is not cut by the scene inset — so every string below is either
+# short by construction or passed through `_fit`.
+comptime SIDE_CHARS: Int = (SIDEBAR_W - 24) // 8
+comptime PAD_W: Float32 = Float32(SIDEBAR_W - 24)
 comptime PAD_H: Float32 = 150.0
 comptime LOG_ROWS: Int = 6
 
@@ -131,6 +138,14 @@ comptime UI_LOG = Color(150, 200, 170, 255)
 comptime UI_CAP = Color(44, 50, 66, 240)
 comptime UI_CAP_ON = Color(210, 90, 70, 255)
 comptime UI_RING = Color(60, 68, 88, 210)
+
+
+def _fit(text: String, n: Int) -> String:
+    """Truncate to `n` characters. See `SIDE_CHARS`: the alternative is a
+    label bleeding over the robot, which is what shipped first."""
+    if text.byte_length() <= n:
+        return text
+    return String(text[byte = 0 : n])
 
 
 def _clamp(v: Float64, lo: Float64, hi: Float64) -> Float64:
@@ -230,7 +245,7 @@ def _drive_pad(
     if _cap(ui, x + PAD_W - 34, y + 4, 28, String("D"), sr):
         d[1] -= CLICK_V
     ui.label(x + 6, y + PAD_H - 14,
-             String("^v drive  <> turn  ·  A/D strafe"), UI_DIM, 1)
+             String("^v drive  <> turn"), UI_DIM, 1)
     return d^
 
 
@@ -519,10 +534,13 @@ def main() raises:
                 abs(cx - zx) > 0.08 or abs(cy - zy) > 0.08
                 or abs(cw - zw) > 0.12
             ):
+                # ⚠ 22 characters, not 43. The long form
+                # ("set_velocity  vx .. · vy .. · vyaw ..") is wider than
+                # the sidebar and every row of it ran over the scene.
                 log.append(
-                    String("set_velocity  vx ") + _f2(cx)
-                    + String(" · vy ") + _f2(cy)
-                    + String(" · vyaw ") + _f2(cw)
+                    String("vx ") + _f2(cx)
+                    + String(" vy ") + _f2(cy)
+                    + String(" w ") + _f2(cw)
                 )
                 if len(log) > LOG_ROWS:
                     var trimmed = List[String]()
@@ -560,18 +578,19 @@ def main() raises:
 
         # left sidebar — the menu
         ui.panel(0, 0, Float32(SIDEBAR_W), Float32(win_h))
-        ui.label(12, 10, String("BFM-ZERO  ·  REWARD JOYSTICK"), UI_HEAD, 1)
-        ui.label(12, 26, String("z = E[B(s)·r(s)]  — no training"), UI_DIM, 1)
-        ui.label(12, 52, String("COMMAND"), UI_DIM, 1)
-        ui.label(12, 68, String("vx    ") + _f2(cx) + String(" m/s"), UI_TXT, 1)
-        ui.label(12, 82, String("vy    ") + _f2(cy) + String(" m/s"), UI_TXT, 1)
-        ui.label(12, 96, String("vyaw  ") + _f2(cw) + String(" rad/s"), UI_TXT, 1)
-        ui.label(12, 120, String("MEASURED"), UI_DIM, 1)
-        ui.label(12, 136, String("vx    ") + _f2(mvx), UI_TXT, 1)
-        ui.label(12, 150, String("vy    ") + _f2(mvy), UI_TXT, 1)
-        ui.label(12, 164, String("vyaw  ") + _f2(mwz), UI_TXT, 1)
+        ui.label(12, 10, String("BFM-ZERO JOYSTICK"), UI_HEAD, 1)
+        ui.label(12, 26, String("z = E[B(s) r(s)]"), UI_DIM, 1)
+        ui.label(12, 38, String("no training, no gradient"), UI_DIM, 1)
+        ui.label(12, 58, String("COMMAND"), UI_DIM, 1)
+        ui.label(12, 74, String("vx    ") + _f2(cx) + String(" m/s"), UI_TXT, 1)
+        ui.label(12, 88, String("vy    ") + _f2(cy) + String(" m/s"), UI_TXT, 1)
+        ui.label(12, 102, String("vyaw  ") + _f2(cw) + String(" rad/s"), UI_TXT, 1)
+        ui.label(12, 126, String("MEASURED"), UI_DIM, 1)
+        ui.label(12, 142, String("vx    ") + _f2(mvx), UI_TXT, 1)
+        ui.label(12, 156, String("vy    ") + _f2(mvy), UI_TXT, 1)
+        ui.label(12, 170, String("vyaw  ") + _f2(mwz), UI_TXT, 1)
 
-        var by = Float32(194)
+        var by = Float32(200)
         if ui.button(12, by, 96, 22, String("stand"), abs(cx) + abs(cy) + abs(cw) < 1e-3, 1):
             cx = 0.0
             cy = 0.0
@@ -593,16 +612,22 @@ def main() raises:
 
         ui.label(12, by + 92, String("COMMAND LOG"), UI_DIM, 1)
         for i in range(len(log)):
-            ui.label(12, by + 108 + Float32(i) * 12, log[i], UI_LOG, 1)
+            ui.label(12, by + 108 + Float32(i) * 12,
+                     _fit(log[i], SIDE_CHARS), UI_LOG, 1)
 
-        ui.label(12, Float32(win_h) - 34, String("steps ") + String(steps), UI_DIM, 1)
+        ui.label(12, Float32(win_h) - 32, String("steps ") + String(steps), UI_DIM, 1)
         ui.label(12, Float32(win_h) - 20, String("pool ") + String(POOL)
-                 + String("  ·  d ") + String(D), UI_DIM, 1)
+                 + String("  d ") + String(D), UI_DIM, 1)
 
-        # bottom-left drive pad
+        # ⚠ THE PAD LIVES IN THE SIDEBAR, not over the scene. Menlo's floats
+        # on the render because that render is a video feed it cannot write
+        # into; ours has a reserved column, and putting the pad there means
+        # nothing the UI draws can ever sit on top of the robot. It also gives
+        # the pad a hard width to fit — PAD_W is sized off SIDEBAR_W rather
+        # than chosen, so the two cannot drift apart.
+        var pad_y = Float32(win_h) - PAD_H - 64
         var pad = _drive_pad(
-            ui, Float32(SIDEBAR_W) + 18, Float32(win_h) - PAD_H - 18,
-            cx, cy, cw, up, dn, lf, rt, sl, sr,
+            ui, 12, pad_y, cx, cy, cw, up, dn, lf, rt, sl, sr,
         )
         cx += pad[0]
         cy += pad[1]
@@ -611,8 +636,8 @@ def main() raises:
         # only one that writes back, and it does it through this flag because a
         # widget cannot reach `cx` from in there.
         if ui.button(
-            Float32(SIDEBAR_W) + 18, Float32(win_h) - 34, 118, 24,
-            String("■ STOP  (X)"), halt, 1,
+            12, pad_y + PAD_H + 6, PAD_W, 22,
+            String("STOP  (X)"), halt, 1,
         ):
             cx = 0.0
             cy = 0.0

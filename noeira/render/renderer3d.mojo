@@ -2940,6 +2940,20 @@ struct Renderer3D(Movable):
             if not self._text_budget_ok():
                 break
             var c = text.as_bytes()[i]
+            # ⚠ THE ATLAS IS ASCII AND THIS LOOP WALKS BYTES. A non-ASCII
+            # character is several UTF-8 bytes, and drawing each of them as a
+            # glyph produced a run of garbage — "·" (0xC2 0xB7) came out as
+            # "B7" on screen, and it also made every string WIDER than its
+            # character count, which is how a sidebar label that should have
+            # fitted overflowed into the 3D viewport.
+            #
+            # One '?' per character is the honest degradation: skip the
+            # continuation bytes, substitute the lead byte. Decoding properly
+            # would not help — the atlas has no glyph to show.
+            if c >= 0x80:
+                if c < 0xC0:
+                    continue          # continuation byte of the char before
+                c = 0x3F              # lead byte -> a single '?'
             var uv = glyph_uv(c)
             var u0 = uv[0]
             var v0 = uv[1]
