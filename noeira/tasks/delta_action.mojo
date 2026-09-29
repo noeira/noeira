@@ -91,6 +91,16 @@ struct ServoLag(Movable):
     configured ranges (randomised dynamics: the policy must not depend on the
     exact numbers). Off (`tau_hi_ms <= 0`) it is the identity — every run
     before it is unchanged.
+
+    ⚠ `set_limits`: a SPEED CAP on the arm joints (the gripper's is left
+    alone) drawn per episode in `vmax` "lo,hi" rad/s, and the elbow's REAL
+    upper stop. The real follower tops out at ~1.0-1.25 rad/s per arm joint
+    under the pixel students (p95 0.8-1.1; the sim arm 2-3 rad/s), so the
+    policy's 0.1 rad/tick asks ~3 rad/s and the real arm falls behind — 0.4
+    rad of shoulder_lift after 1.5 s on 29 Sep, where the sim policy was
+    already turning to the cube. The 0.1 rad sysid steps never reached the
+    cap. The real elbow folds no further than ~1.56 rad (sysid and the runs;
+    the model's range reaches 1.69).
     """
 
     var n: Int
@@ -107,6 +117,12 @@ struct ServoLag(Movable):
     var hist: List[Float64]
     """[n * LAG_MAX_DELAY * DELTA_ACT]: the last commands, a ring by tick."""
     var tick: Int
+    var vmax_lo: Float64
+    var vmax_hi: Float64
+    var vmax: List[Float64]
+    """[n]: this episode's arm speed cap, rad/s (0: none)."""
+    var elbow_max: Float64
+    """The elbow's upper stop, rad (0: none)."""
 
     def __init__(
         out self, n: Int, tau_lo_ms: Float64, tau_hi_ms: Float64, d_lo: Int,
@@ -124,6 +140,22 @@ struct ServoLag(Movable):
         self.y = List[Float64](length=n * DELTA_ACT, fill=0.0)
         self.hist = List[Float64](length=n * LAG_MAX_DELAY * DELTA_ACT, fill=0.0)
         self.tick = 0
+        self.vmax_lo = 0.0
+        self.vmax_hi = 0.0
+        self.vmax = List[Float64](length=n, fill=0.0)
+        self.elbow_max = 0.0
+
+    def set_limits(mut self, vmax: String, elbow_max: Float64) raises:
+        """`vmax` "lo,hi" rad/s (or "" for none), `elbow_max` rad (0: none).
+        Either turns the model on (the lag itself stays the identity if its
+        ranges are empty)."""
+        if vmax.byte_length() > 0:
+            var p = vmax.split(",")
+            self.vmax_lo = Float64(String(p[0]))
+            self.vmax_hi = Float64(String(p[len(p) - 1]))
+        self.elbow_max = elbow_max
+        if self.vmax_hi > 0.0 or self.elbow_max > 0.0:
+            self.on = True
 
     @staticmethod
     def parse(n: Int, tau: String, delay: String, dt: Float64) raises -> Self:
@@ -142,7 +174,10 @@ struct ServoLag(Movable):
             dhi = Int(String(p[len(p) - 1]))
         return Self(n, tlo, thi, dlo, dhi, dt)
 
-    def reset_lane(mut self, e: Int, q: List[Float64], q_off: Int, u01: Float64, u02: Float64):
+    def reset_lane(
+        mut self, e: Int, q: List[Float64], q_off: Int, u01: Float64,
+        u02: Float64, u03: Float64 = 0.5,
+    ):
         """A new episode on lane `e`: draw its tau and delay (from the two
         uniforms), and settle the lag on the lane's joints `q[q_off..+6]` — no
         stale target from the last episode survives into this one."""
@@ -153,6 +188,7 @@ struct ServoLag(Movable):
         self.delay[e] = self.d_lo + Int(u02 * Float64(self.d_hi - self.d_lo + 1))
         if self.delay[e] > self.d_hi:
             self.delay[e] = self.d_hi
+        self.vmax[e] = self.vmax_lo + (self.vmax_hi - self.vmax_lo) * u03
         for j in range(DELTA_ACT):
             self.y[e * DELTA_ACT + j] = q[q_off + j]
             for k in range(LAG_MAX_DELAY):
@@ -169,7 +205,13 @@ struct ServoLag(Movable):
         var r = (self.tick - self.delay[e] + LAG_MAX_DELAY * 8) % LAG_MAX_DELAY
         var ud = self.hist[(e * LAG_MAX_DELAY + r) * DELTA_ACT + j]
         var i = e * DELTA_ACT + j
-        self.y[i] = self.y[i] + self.alpha[e] * (ud - self.y[i])
+        var dy = self.alpha[e] * (ud - self.y[i])
+        if self.vmax[e] > 0.0 and j < DELTA_ACT - 1:
+            var cap = self.vmax[e] * self.dt
+            dy = cap if dy > cap else (-cap if dy < -cap else dy)
+        self.y[i] = self.y[i] + dy
+        if self.elbow_max > 0.0 and j == 2 and self.y[i] > self.elbow_max:
+            self.y[i] = self.elbow_max
         return self.y[i]
 
     def advance(mut self):

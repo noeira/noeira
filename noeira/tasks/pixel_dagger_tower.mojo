@@ -559,6 +559,9 @@ def run_pixel_dagger(args: List[String], driver: String) raises:
     # `--lag-delay lo,hi` ticks); the student is trained AND evaluated under it
     var lag_tau = _arg(args, "--lag-tau", "")
     var lag_delay = _arg(args, "--lag-delay", "")
+    # the real arm's speed cap and elbow stop (`ServoLag.set_limits`)
+    var lag_vmax = _arg(args, "--lag-vmax", "")
+    var elbow_max = Float64(_arg(args, "--elbow-max", "0"))
     # ⚠ THE TEACHER'S SCALES: its labels are actions in its own units, so the
     # student must execute them with the same (checked below against the
     # teacher's run config when it recorded them)
@@ -776,9 +779,11 @@ def run_pixel_dagger(args: List[String], driver: String) raises:
         var lag = ServoLag.parse(
             N_ENVS, lag_tau, lag_delay, Float64(C.FRAME_SKIP) * M.TIMESTEP
         )
+        lag.set_limits(lag_vmax, elbow_max)
         var lag_pending = List[Bool](length=N_ENVS, fill=True)
         if lag.on:
-            print("  servo lag: tau", lag_tau, "ms, delay", lag_delay, "ticks")
+            print("  servo lag: tau", lag_tau, "ms, delay", lag_delay,
+                  "ticks | arm speed cap", lag_vmax, "rad/s | elbow max", elbow_max)
         var succ = List[Bool](length=N_ENVS, fill=False)
         var hist_s = List[Bool]()  # student-executed episodes' success
         var hist_t = List[Bool]()  # teacher-executed

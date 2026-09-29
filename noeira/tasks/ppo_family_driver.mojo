@@ -303,7 +303,10 @@ def _lag_reset(
     mut lag: ServoLag, ref arm_q: List[Float64], lane: Int,
 ):
     """A fresh draw of lane `lane`'s servo model, settled on its joints."""
-    lag.reset_lane(lane, arm_q, lane * ACT_DIM, random_float64(), random_float64())
+    lag.reset_lane(
+        lane, arm_q, lane * ACT_DIM, random_float64(), random_float64(),
+        random_float64(),
+    )
 
 
 def _hist_push(
@@ -550,6 +553,9 @@ def run_ppo[M: ModelDefLike, C: Phyics3dEnvConfig](
     # ms and `--lag-delay lo,hi` ticks, drawn per episode; off by default
     var lag_tau = _arg(args, "--lag-tau", "")
     var lag_delay = _arg(args, "--lag-delay", "")
+    # the real arm's speed cap and elbow stop (`ServoLag.set_limits`)
+    var lag_vmax = _arg(args, "--lag-vmax", "")
+    var elbow_max = Float64(_arg(args, "--elbow-max", "0"))
     # the delta action's per-step scales (rad at a = 1): the defaults are
     # so101-nexus's; under `--lag-*` the real servos need larger ones
     var d_arm = Float64(_arg(args, "--delta-arm", String(DELTA_ARM)))
@@ -664,6 +670,8 @@ def run_ppo[M: ModelDefLike, C: Phyics3dEnvConfig](
     logger.set_config("exec_noise", String(exec_noise))
     logger.set_config("lag_tau_ms", lag_tau)
     logger.set_config("lag_delay_ticks", lag_delay)
+    logger.set_config("lag_vmax", lag_vmax)
+    logger.set_config("elbow_max", String(elbow_max))
     logger.set_config("delta_arm", String(d_arm))
     logger.set_config("delta_gripper", String(d_grip))
     logger.set_config("act_hist", String(ACT_HIST))
@@ -758,9 +766,11 @@ def run_ppo[M: ModelDefLike, C: Phyics3dEnvConfig](
         var lag = ServoLag.parse(
             N_ENVS, lag_tau, lag_delay, Float64(C.FRAME_SKIP) * M.TIMESTEP
         )
+        lag.set_limits(lag_vmax, elbow_max)
         if lag.on:
             print("  servo lag: tau", lag_tau, "ms, delay", lag_delay,
-                  "ticks (per episode, per lane)")
+                  "ticks (per episode, per lane) | arm speed cap", lag_vmax,
+                  "rad/s | elbow max", elbow_max)
         ctx.synchronize()
         var obs_dev = DeviceBuffer[DT](ctx, env.obs_ptr(), N_ENVS * E_OBS, owning=False)
         var act_dev = DeviceBuffer[DT](ctx, env.action_ptr(), N_ENVS * ACT_DIM, owning=False)

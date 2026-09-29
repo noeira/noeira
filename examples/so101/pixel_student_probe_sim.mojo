@@ -149,8 +149,13 @@ def main() raises:
     var xs = List[Scalar[DT]](length=IN_DIM, fill=Scalar[DT](0))
     var env = E(ctx)
     var lag = ServoLag.parse(1, lag_tau_s, lag_delay_s, man.control_period_s)
+    # the real arm's speed cap (rad/s, "v" or "lo,hi": the probe takes the
+    # middle) and elbow stop — `ServoLag.set_limits`
+    lag.set_limits(_arg(args, "--lag-vmax", ""), Float64(_arg(args, "--elbow-max", "0")))
     if lag.on:
-        print("probe: servo lag tau", lag_tau_s, "ms, delay", lag_delay_s, "ticks")
+        print("probe: servo lag tau", lag_tau_s, "ms, delay", lag_delay_s,
+              "ticks | arm speed cap", lag.vmax_lo, "-", lag.vmax_hi,
+              "rad/s | elbow max", lag.elbow_max)
     var n_ok = 0
     for ep in range(episodes):
         _ = env.reset()
