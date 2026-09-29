@@ -737,6 +737,22 @@ def main() raises:
                 print("  wrote " + rec_dir + "/ticks.csv")
             except:
                 print("  ⚠ could not write the tick log")
+        # after a DIVE stop, lift clear of the desk first: shoulder_lift alone
+        # back to 0.3 rad (the arm rises away from the desk), the other joints
+        # held — the straight return from the dive pose did not arrive twice
+        # (1460-1476 ticks off) and left the arm energised on the desk
+        if arm_it and dive_ticks >= 3:
+            try:
+                if arm.read_positions(Span(raw)) == SO101_N:
+                    var lift = List[Int32]()
+                    for i in range(SO101_N):
+                        lift.append(raw[i])
+                    lift[1] = jmap.from_sim(arm.cal, 1, 0.3)
+                    print("  lifting clear of the desk (shoulder_lift -> 0.3 rad) ...")
+                    if not _ramp_to(arm, lift, 6):
+                        print("  ⚠ the lift did not arrive; returning anyway")
+            except:
+                print("  ⚠ the lift clear of the desk failed; returning anyway")
         var released = return_and_release(
             arm, start_pose, arm_it, do_return, stdin, interactive
         )
