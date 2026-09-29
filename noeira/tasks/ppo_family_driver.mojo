@@ -564,6 +564,14 @@ def run_ppo[M: ModelDefLike, C: Phyics3dEnvConfig](
     # arm to settle) and Squint (10 Hz) work in. Rewards are summed over the
     # K ticks; the steps counted are TICKS.
     var repeat = max(Int(_arg(args, "--repeat", "1")), 1)
+    # ⚠ `--smooth-penalty W`: each policy step pays W x the mean squared
+    # change of the five ARM action words (as executed) from the lane's last
+    # step (not on an episode's first). Why: the 31 Hz lag students flip the
+    # sign of their arm actions on ~25-30 % of ticks, in sim as on the real
+    # arm, where it shook the clamped tower and blurred the wrist camera; a
+    # deploy-side EMA of 0.5 halved the flips and RAISED the probe's success
+    # (7/16 -> 11/16) — smoothness is not bought with skill here.
+    var smooth_w = Float64(_arg(args, "--smooth-penalty", "0"))
     if action_mode != "absolute" and action_mode != "delta":
         raise Error("ppo task: --action absolute|delta, got " + action_mode)
     if C.MAX_STEPS % repeat != 0:
@@ -653,6 +661,7 @@ def run_ppo[M: ModelDefLike, C: Phyics3dEnvConfig](
     logger.set_config("delta_gripper", String(d_grip))
     logger.set_config("act_hist", String(ACT_HIST))
     logger.set_config("repeat", String(repeat))
+    logger.set_config("smooth_penalty", String(smooth_w))
     logger.set_config("horizon", String(C.MAX_STEPS))
     logger.set_config("obs_norm", "running, clip 10")
     logger.set_config("reward_norm", "discounted-return std, clip 10")
@@ -729,6 +738,13 @@ def run_ppo[M: ModelDefLike, C: Phyics3dEnvConfig](
         var rsum = List[Float64](length=N_ENVS, fill=0.0)
         var dmac = List[Bool](length=N_ENVS, fill=False)
         var term = List[Scalar[DT]](length=N_ENVS * E_OBS, fill=Scalar[DT](0))
+        # `--smooth-penalty`: each lane's last executed action, and whether
+        # its episode has one yet
+        var a_prev = List[Float64](length=N_ENVS * ACT_DIM, fill=0.0)
+        var has_prev = List[Bool](length=N_ENVS, fill=False)
+        var spen = List[Float64](length=N_ENVS, fill=0.0)
+        var spen_acc = 0.0
+        var spen_n = 0
         var lag = ServoLag.parse(
             N_ENVS, lag_tau, lag_delay, Float64(C.FRAME_SKIP) * M.TIMESTEP
         )
@@ -822,6 +838,21 @@ def run_ppo[M: ModelDefLike, C: Phyics3dEnvConfig](
                     elif v < -1.0:
                         v = -1.0
                     ah[unsafe_offset=k] = Scalar[DT](v)
+            if smooth_w > 0.0:
+                var ap = mptr(act_h.unsafe_ptr())
+                for e in range(N_ENVS):
+                    var d2 = 0.0
+                    for j in range(ACT_DIM - 1):
+                        var v = Float64(ap[unsafe_offset = e * ACT_DIM + j])
+                        v = 1.0 if v > 1.0 else (-1.0 if v < -1.0 else v)
+                        if has_prev[e]:
+                            var dd = v - a_prev[e * ACT_DIM + j]
+                            d2 += dd * dd
+                        a_prev[e * ACT_DIM + j] = v
+                    spen[e] = smooth_w * d2 / Float64(ACT_DIM - 1)
+                    has_prev[e] = True
+                    spen_acc += spen[e]
+                    spen_n += 1
             if action_mode == "delta":
                 _delta_targets(
                     mptr(act_h.unsafe_ptr()), tg, arm_q, a_lo, a_hi, d_arm, d_grip,
@@ -894,6 +925,8 @@ def run_ppo[M: ModelDefLike, C: Phyics3dEnvConfig](
             var dh0 = mptr(done_h.unsafe_ptr())
             var rh0 = mptr(rew_h.unsafe_ptr())
             for e in range(N_ENVS):
+                if smooth_w > 0.0:
+                    rsum[e] -= spen[e]
                 rh0[unsafe_offset=e] = Scalar[DT](rsum[e])
                 dh0[unsafe_offset=e] = Scalar[DT](1) if dmac[e] else Scalar[DT](0)
             if repeat > 1:
@@ -965,6 +998,7 @@ def run_ppo[M: ModelDefLike, C: Phyics3dEnvConfig](
                 if dh2[unsafe_offset=e] > Scalar[DT](0.5):
                     _lag_reset(lag, arm_q, e)
                     _hist_clear(hist, e)
+                    has_prev[e] = False
             _augment[E_OBS](rp2, hist, mptr(aug.unsafe_ptr()))
             obs_rms.normalize_into(
                 mptr(aug.unsafe_ptr()), mptr(cur_n.unsafe_ptr()), N_ENVS, OBS, OBS_CLIP,
@@ -1006,12 +1040,18 @@ def run_ppo[M: ModelDefLike, C: Phyics3dEnvConfig](
                     logger.log_scalar("episodes", Float64(n_episodes), step)
                     logger.log_scalar("diverged", Float64(n_diverged), step)
                     logger.log_scalar("sps", Float64(step) / secs, step)
+                    if spen_n > 0:
+                        logger.log_scalar("smooth_penalty_mean", spen_acc / Float64(spen_n), step)
                     logger.log_scalar("lr", lr0 * frac, step)
                     logger.log_scalar("ent_coef", ent1 + (ent0 - ent1) * frac, step)
                     agent.trainer.flush_metrics_through_logger[RunLogger](
                         logger_ptr, step
                     )
                 if n_updates % 10 == 0:
+                    if spen_n > 0:
+                        print("  smooth penalty per step", spen_acc / Float64(spen_n))
+                        spen_acc = 0.0
+                        spen_n = 0
                     print("  step", step, "| success", rate, "over", nw,
                           "ep | return", mret, "| episodes", n_episodes,
                           "| diverged", n_diverged,
