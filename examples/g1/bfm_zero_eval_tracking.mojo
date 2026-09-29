@@ -156,6 +156,9 @@ def main() raises:
     var max_segments = atol(_flag(String("--segments"), String(1 << 30)))
     var out_csv = _flag(String("--out"), String(""))
     var clips = _flag_ints(String("--clips"))
+    # 12.45: the tracking PROMPT, not the policy. 1 is what every recorded
+    # number used; the reference sums B over a look-ahead horizon.
+    var z_horizon = atol(_flag(String("--z-horizon"), String(1)))
     if ckpt == "" and not random_init:
         raise Error("pass --ckpt <path> or --random")
 
@@ -174,6 +177,8 @@ def main() raises:
     # ── the networks ──────────────────────────────────────────────────
     var t = Trainer.make(lr=3e-4, gamma=0.98, tau=0.01, ortho_weight=100.0, ctx=None, seed=UInt64(7))
     var norm: Optional[ObsNorm[OBS]] = None
+    print("  z_horizon", z_horizon,
+          "(tracking prompt: B summed over that many look-ahead rows)")
     if random_init:
         print("random-init networks (the null baseline)")
     else:
@@ -255,6 +260,7 @@ def main() raises:
             var sc = g1_score_segment[FNet, BNet, ANet, OBS, ACT, D, BATCH](
                 t, env, rsi, st, pv, qpos_col, norm, r0,
                 ach, tgt, b_in, b_out, z_seg, obs_t, z1, act_out,
+                z_horizon=z_horizon,
             )
 
             # ── the gate: replay OUR rollout into the oracle and compare ──

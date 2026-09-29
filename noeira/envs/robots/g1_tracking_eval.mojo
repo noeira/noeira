@@ -43,6 +43,7 @@ from noeira.envs.robots import UnitreeG1
 from noeira.envs.robots.unitree_g1_history import (
     G1_HIST_DIM, G1_HIST_LEN, G1_N_ACT, G1_LAST_ACTION_DIM,
     g1_hist_key_offset, g1_hist_key_dim, g1_hist_key_state_offset,
+    G1ActorObs,
 )
 from noeira.envs.robots.unitree_g1_pd import G1_NORMALIZE_TO, G1_ACTION_CLIP
 from noeira.envs.robots.unitree_g1_xml import (
@@ -208,6 +209,7 @@ def g1_score_segment[
     mut act_out: Tensor,
     render: Bool = False,
     frame_delay_ms: Int = 16,
+    z_horizon: Int = 1,
 ) raises -> G1TrackScore:
     """`tracking_inference` for ONE segment starting at store row `r0`.
 
@@ -224,8 +226,10 @@ def g1_score_segment[
     at a time. Events cannot reach the physics — they move the camera —
     so the score is identical with `render` on or off.
 
-    `z_t = project(B(row t+1))` — a SINGLE row, not the mean of eight the
-    training rollouts use — then reset to row 0 and `T-1` mean-action steps.
+    `z_t = project(sum_{h=1}^{z_horizon} B(row t+h))` — at the default
+    `z_horizon=1` a SINGLE row, which is neither the reference's look-ahead sum
+    nor the mean of eight our training rollouts use (12.45). Then reset to row 0
+    and `T-1` mean-action steps.
     """
     comptime T = G1_SEG_ROWS
     comptime NQ = UnitreeG1Model.NQ
@@ -252,9 +256,30 @@ def g1_score_segment[
     if norm:
         norm.value().apply_rows(b_in, T)
     t.backward_embed[T](b_in, b_out)
+    # The tracking prompt. `z_horizon=1` is a SINGLE look-ahead row and is the
+    # default because every number recorded before 12.45 was measured with it;
+    # changing the default would silently reprice the whole history.
+    #
+    # BFM-Zero's own prompt is a look-ahead SUM, `z_t = sum_{t'=t}^{t+H} B(s_t')`
+    # (arXiv 2511.04131), and our TRAINING rollouts use the mean of eight — so
+    # H=1 agrees with neither. The sum runs to `T-1` and stops there rather than
+    # wrapping or clamping to a repeated final row: a segment's last steps
+    # genuinely have less future to aim at, and inventing rows for them would
+    # make the tail of every segment score against a motion the clip does not
+    # contain. The projection is what makes the SUM and the MEAN the same
+    # prompt, so this does not need a 1/H.
+    var zh = z_horizon if z_horizon > 0 else 1
     for j in range(T - 1):
         for k in range(D):
             z_seg.data[j * D + k] = b_out.data[(j + 1) * D + k]
+        for h in range(1, zh):
+            var r = j + 1 + h
+            if r > T - 1:
+                break
+            for k in range(D):
+                z_seg.data[j * D + k] = (
+                    z_seg.data[j * D + k] + b_out.data[r * D + k]
+                )
         g1_project_z[D](z_seg, j)
 
     # reset: the RSI row IS `init_state()` (qvel already body-frame)
@@ -285,19 +310,10 @@ def g1_score_segment[
     # happens AFTER the step's history is read and BEFORE `last_action` is
     # updated — so the newest `actions` entry is the action applied one step
     # earlier, not the one about to be applied.
-    var last_a = List[Float64](length=G1_N_ACT, fill=0.0)
-    var hist = List[Float64](length=G1_HIST_DIM, fill=0.0)
+    var aobs = G1ActorObs()
     for step in range(T - 1):
         var o = env.get_obs_list()
-        for k in range(UNITREE_G1_OBS_DIM):
-            obs_t.data[k] = Scalar[DT](Float64(o[k]))
-        comptime if OBS > UNITREE_G1_OBS_DIM:
-            for k in range(G1_N_ACT):
-                obs_t.data[UNITREE_G1_OBS_DIM + k] = Scalar[DT](last_a[k])
-            for k in range(G1_HIST_DIM):
-                obs_t.data[
-                    UNITREE_G1_OBS_DIM + G1_LAST_ACTION_DIM + k
-                ] = Scalar[DT](hist[k])
+        aobs.fill[OBS=OBS](o, obs_t)
         if norm:
             norm.value().apply_row(obs_t)
         for k in range(D):
@@ -316,28 +332,7 @@ def g1_score_segment[
         # push BEFORE `last_a` is updated: the newest `actions` entry is the
         # PREVIOUS step's action (the oracle's `_push` then `last_action =`)
         comptime if OBS > UNITREE_G1_OBS_DIM:
-            if step >= 1:                      # the reset row is never pushed
-                for key in range(5):
-                    var kb = g1_hist_key_offset(key)
-                    var kd = g1_hist_key_dim(key)
-                    var so = g1_hist_key_state_offset(key)
-                    var jj = G1_HIST_LEN - 1
-                    while jj > 0:
-                        for e in range(kd):
-                            hist[kb + jj * kd + e] = hist[kb + (jj - 1) * kd + e]
-                        jj -= 1
-                    for e in range(kd):
-                        if so < 0:
-                            hist[kb + e] = last_a[e]
-                        else:
-                            hist[kb + e] = Float64(o[so + e])
-            for k in range(G1_N_ACT):
-                var v = Float64(act_out.data[k]) * G1_NORMALIZE_TO
-                if v > G1_ACTION_CLIP:
-                    v = G1_ACTION_CLIP
-                elif v < -G1_ACTION_CLIP:
-                    v = -G1_ACTION_CLIP
-                last_a[k] = v
+            aobs.push(o, act_out)
         _ = env.step(a)
         if render and not quit_seen:
             # ⚠ THE PUMP IS HERE, NOT ONCE PER SEGMENT. `check_renderer_quit`
