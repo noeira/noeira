@@ -217,7 +217,12 @@ def g1_score_segment[
     own copy of the rollout would be a second place for the z schedule, the
     history rules and the action chain to drift, and it would then be showing
     something the number never measured (`_a_rule_written_inline_twice_drifts`).
-    The caller owns `init_renderer` / `close`; this only draws.
+    The caller owns `init_renderer` / `close`; this draws AND pumps. The
+    pump matters: `check_renderer_quit` is the renderer's only
+    `poll_event` site, and a segment is 499 frames, so a caller that
+    polled between segments left the window unserviced for ten seconds
+    at a time. Events cannot reach the physics — they move the camera —
+    so the score is identical with `render` on or off.
 
     `z_t = project(B(row t+1))` — a SINGLE row, not the mean of eight the
     training rollouts use — then reset to row 0 and `T-1` mean-action steps.
@@ -265,6 +270,10 @@ def g1_score_segment[
     for i in range(NQ):
         qp[i] = Float64(env.d.qpos.data[i])
     var nrec = 0
+    # latched: once Escape / the close box has fired, stop PACING and
+    # drawing so the caller gets control back in well under a second,
+    # while the rollout still runs to T and returns a complete score
+    var quit_seen = False
     # ⚠ TWO RECORD SITES, AND THEY MUST STAY IN STEP — the `nrec != T` raise
     # below is the guard that caught exactly that bug once already.
     for k in range(ACT):
@@ -330,9 +339,33 @@ def g1_score_segment[
                     v = -G1_ACTION_CLIP
                 last_a[k] = v
         _ = env.step(a)
-        if render:
+        if render and not quit_seen:
+            # ⚠ THE PUMP IS HERE, NOT ONCE PER SEGMENT. `check_renderer_quit`
+            # is the renderer's ONLY `poll_event` site — `render_frame` draws but
+            # never services the queue. A segment is 499 frames (≈10 s at 50 Hz),
+            # so pumping only between segments left the window unserviced for ten
+            # seconds at a time: macOS stops presenting a window whose events go
+            # unread, `SDL_WaitAndAcquireGPUSwapchainTexture` then hands back NULL
+            # and `end_frame` submits an EMPTY command buffer — the compositor
+            # keeps showing whatever was in the surface. That is the colour
+            # flashing, and it is also why Escape did nothing mid-segment.
+            # Pumping cannot touch the rollout: it moves the CAMERA, never `d`.
+            quit_seen = env.check_renderer_quit()
             env.render_frame()
             env.renderer_delay(frame_delay_ms)
+            # SPACE holds the picture. The renderer's own pause flag is
+            # DISPLAY-ONLY — it draws a badge and freezes a frame counter, it
+            # does not gate the caller — so without this loop Space drew
+            # "PAUSED" over a robot that kept walking. Holding here cannot
+            # change the score: the rollout is a fixed sequence of T steps and
+            # this only delays the next one.
+            while (
+                env.renderer_paused() and not quit_seen
+                and env.is_renderer_open()
+            ):
+                quit_seen = env.check_renderer_quit()
+                env.render_frame()
+                env.renderer_delay(frame_delay_ms)
         for i in range(NQ):
             qp[i] = Float64(env.d.qpos.data[i])
         for k in range(ACT):
