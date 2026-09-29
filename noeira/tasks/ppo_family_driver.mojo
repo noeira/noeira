@@ -572,6 +572,13 @@ def run_ppo[M: ModelDefLike, C: Phyics3dEnvConfig](
     # deploy-side EMA of 0.5 halved the flips and RAISED the probe's success
     # (7/16 -> 11/16) — smoothness is not bought with skill here.
     var smooth_w = Float64(_arg(args, "--smooth-penalty", "0"))
+    # ⚠ `--dive-penalty W`: each tick with the arm reaching down past the desk
+    # (shoulder_lift > 1.35 AND elbow_flex < -1.35 rad) costs W. No sim grasp
+    # is made there (they close at shoulder_lift -0.1..0.5, elbow 0.35..1.4),
+    # yet the smooth student spent 12.6 % of its probe ticks there: the sim's
+    # rigid desk absorbs the push; on the real arm it drove into the desk and
+    # rocked the clamped tower.
+    var dive_w = Float64(_arg(args, "--dive-penalty", "0"))
     if action_mode != "absolute" and action_mode != "delta":
         raise Error("ppo task: --action absolute|delta, got " + action_mode)
     if C.MAX_STEPS % repeat != 0:
@@ -662,6 +669,7 @@ def run_ppo[M: ModelDefLike, C: Phyics3dEnvConfig](
     logger.set_config("act_hist", String(ACT_HIST))
     logger.set_config("repeat", String(repeat))
     logger.set_config("smooth_penalty", String(smooth_w))
+    logger.set_config("dive_penalty", String(dive_w))
     logger.set_config("horizon", String(C.MAX_STEPS))
     logger.set_config("obs_norm", "running, clip 10")
     logger.set_config("reward_norm", "discounted-return std, clip 10")
@@ -745,6 +753,8 @@ def run_ppo[M: ModelDefLike, C: Phyics3dEnvConfig](
         var spen = List[Float64](length=N_ENVS, fill=0.0)
         var spen_acc = 0.0
         var spen_n = 0
+        var dive_ticks = 0
+        var all_ticks = 0
         var lag = ServoLag.parse(
             N_ENVS, lag_tau, lag_delay, Float64(C.FRAME_SKIP) * M.TIMESTEP
         )
@@ -902,6 +912,13 @@ def run_ppo[M: ModelDefLike, C: Phyics3dEnvConfig](
                         dmac[e] = True
                     else:
                         rsum[e] += rv
+                        if dive_w > 0.0:
+                            all_ticks += 1
+                            var q1 = Float64(rp_t[unsafe_offset = e * E_OBS + a_qa[1]])
+                            var q2 = Float64(rp_t[unsafe_offset = e * E_OBS + a_qa[2]])
+                            if q1 > 1.35 and q2 < -1.35:
+                                rsum[e] -= dive_w
+                                dive_ticks += 1
                         if env.d.meta.data[e * METADATA_SIZE + META_IDX_GOAL_HELD] > Scalar[DT](0.5):
                             succ[e] = True
                         if dh_t[unsafe_offset=e] > Scalar[DT](0.5):
@@ -1052,6 +1069,10 @@ def run_ppo[M: ModelDefLike, C: Phyics3dEnvConfig](
                         print("  smooth penalty per step", spen_acc / Float64(spen_n))
                         spen_acc = 0.0
                         spen_n = 0
+                    if all_ticks > 0:
+                        print("  dive fraction", Float64(dive_ticks) / Float64(all_ticks))
+                        dive_ticks = 0
+                        all_ticks = 0
                     print("  step", step, "| success", rate, "over", nw,
                           "ep | return", mret, "| episodes", n_episodes,
                           "| diverged", n_diverged,
