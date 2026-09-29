@@ -28,6 +28,10 @@ Run: pixi run mojo run -I . tests/render/test_mesh_index_width.mojo
 
 from noeira.render.stl_loader import load_stl
 from noeira.render.gpu_mesh import generate_sphere
+from noeira.render.renderer3d import (
+    MAX_TEXT_CHARS, TEXT_INDEX_BYTES, TEXT_INDEX_ELEMENT_SIZE,
+)
+from noeira.render.sdl.sdl_gpu import GPUIndexElementSize
 
 comptime BIG = String(
     "references/mujoco_menagerie-main/toddlerbot_2xc/assets/head_visual.stl"
@@ -104,6 +108,37 @@ def main() raises:
     t.truth(len(s.indices) > 0 and s_max < len(s.vertices),
             String("a generated sphere still indexes in range (max ", s_max,
                    " < ", len(s.vertices), ")"))
+
+    # ------------------------------------------------------------------
+    # ⚠ THE TEXT ATLAS, WHICH THIS GATE'S OWN COMMIT BROKE.
+    #
+    # `b147dcde8` widened the MESH indices to 32-bit and swept all three
+    # `bind_gpu_index_buffer` sites — including the HUD's, whose buffer is
+    # still allocated and written as UInt16. The mesh legs above all passed
+    # while the HUD spent every frame decoding PAIRS of its indices as single
+    # UInt32s: [0,1,2,2,3,0] reads back as 65536, 131074, 3, so the vertex
+    # fetch ran far past an 8192-vertex buffer and drew quads from whatever
+    # was next in memory — coloured flashes over the scene.
+    #
+    # The mesh legs could not see it: they test `MeshData`, and the HUD does
+    # not go through `MeshData`. This leg ties the ALLOCATION to the BIND so
+    # the next blanket edit fails here instead of on screen.
+    # ------------------------------------------------------------------
+    var text_bind_is_16 = (
+        TEXT_INDEX_ELEMENT_SIZE
+        == GPUIndexElementSize.GPU_INDEXELEMENTSIZE_16BIT
+    )
+    t.truth(
+        (TEXT_INDEX_BYTES == 2) == text_bind_is_16,
+        String("the HUD's index STRIDE and BIND agree (", TEXT_INDEX_BYTES,
+               " bytes, 16-bit bind ", text_bind_is_16, ")"),
+    )
+    var text_max_idx = MAX_TEXT_CHARS * 4 - 1
+    t.truth(
+        (not text_bind_is_16) or text_max_idx <= U16_MAX,
+        String("the HUD's largest index fits its element size (", text_max_idx,
+               " <= ", U16_MAX, ")"),
+    )
 
     print("===", t.checks - t.fails, "/", t.checks, "passed ===")
     if t.fails != 0:

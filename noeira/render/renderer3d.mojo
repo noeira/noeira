@@ -245,6 +245,25 @@ comptime MAX_LINE_VERTICES = 512
 # allocated once at init.
 comptime MAX_TEXT_CHARS = 2048
 
+# ⚠ THE TEXT ATLAS INDEXES 16-BIT, AND THE BIND MUST SAY SO. These two are
+# one decision and they live together because they have already drifted apart
+# once: `b147dcde8` widened the MESH index buffers to 32-bit ("a mesh over
+# 65,535 vertices WRAPPED its indices") and changed all three
+# `bind_gpu_index_buffer` sites in one sweep — but this buffer was never
+# widened, so the HUD spent every frame since decoding PAIRS of its UInt16
+# indices as single UInt32s. [0,1,2,...] reads back as 65536, 131074, ... and
+# the vertex fetch runs far past a 8192-vertex buffer, which draws quads at
+# whatever the neighbouring memory happens to say — the coloured full- and
+# half-screen flashes.
+#
+# 16-bit is correct and not a limitation: the largest index this buffer can
+# hold is MAX_TEXT_CHARS*4 - 1 = 8191, well inside UInt16. If MAX_TEXT_CHARS
+# ever passes 16384, BOTH of these have to move together.
+comptime TEXT_INDEX_BYTES = 2
+comptime TEXT_INDEX_ELEMENT_SIZE = (
+    GPUIndexElementSize.GPU_INDEXELEMENTSIZE_16BIT
+)
+
 
 # --- Line color entry for list storage ---
 
@@ -2601,7 +2620,7 @@ struct Renderer3D(Movable):
         ))
 
         # --- 5. Allocate and upload static index buffer (MAX_TEXT_CHARS quads × 6 indices × 2 bytes) ---
-        var tib_size = UInt32(MAX_TEXT_CHARS * 6 * 2)
+        var tib_size = UInt32(MAX_TEXT_CHARS * 6 * TEXT_INDEX_BYTES)
         var tib_info = GPUBufferCreateInfo(
             usage=GPUBufferUsageFlags.GPU_BUFFERUSAGE_INDEX,
             size=tib_size,
@@ -5203,7 +5222,7 @@ struct Renderer3D(Movable):
             bind_gpu_index_buffer(
                 render_pass,
                 Ptr(to=text_ib_binding),
-                GPUIndexElementSize.GPU_INDEXELEMENTSIZE_32BIT,
+                TEXT_INDEX_ELEMENT_SIZE,
             )
             draw_gpu_indexed_primitives(
                 render_pass, UInt32(num_text_chars * 6), 1, 0, 0, 0
