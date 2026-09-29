@@ -31,6 +31,14 @@ cameras), --arm, --seconds (20), --no-return, --no-start-pose, --snap DIR,
 not to the one the commands use — the real jaws read ~0.05 rad more closed
 on the 25 mm cube than the sim's, 0.063 vs 0.10-0.14, and a student never
 trained on that reading hovered over the bowl without releasing),
+--start-grip RAD (the gripper's angle in the start pose the arm ramps to,
+default the task reset's; the sim resets it anywhere in -0.13..0.68 and the
+students closed at once, and never recovered, in 3 / 16 probe episodes and on
+the arm from -0.02), --no-dive-guard (by default a run ENDS when the arm has
+been reaching down past the desk — shoulder_lift > 1.35 AND elbow_flex <
+-1.35 rad — for 3 ticks: no sim grasp is made there (they close at
+shoulder_lift -0.1..0.5, elbow 0.35..1.4), the sim's rigid desk absorbs it
+and the real tower does not),
 --sysid FILE (with --arm: NO policy — each joint in turn steps +A, back, -A,
 back from the sim's start pose, 0.8 s per step, A 0.1 rad / 0.3 gripper; the
 per-tick targets and joints go to FILE, the servos' delay and time constant
@@ -289,6 +297,8 @@ def main() raises:
     # their arm actions on ~30 % of ticks, in sim as on the arm, and the
     # real run shook the clamped tower
     var act_ema = Float64(_arg(args, "--act-ema", "0"))
+    var start_grip = _arg(args, "--start-grip", "")
+    var dive_guard = not _flag(args, "--no-dive-guard")
 
     print("=" * 74)
     print("PIXEL STUDENT on the physical SO-101 — sim-to-real")
@@ -353,6 +363,9 @@ def main() raises:
     var q_start = List[Float64]()
     for i in range(ACT):
         q_start.append(q0[qa[i]])
+    if start_grip.byte_length() > 0:
+        q_start[ACT - 1] = Float64(start_grip)
+        print("  --start-grip: the gripper starts at", q_start[ACT - 1], "rad")
 
     # ── the cameras ───────────────────────────────────────────────────────
     var devices = parse_camera_specs(devices_csv)
@@ -616,6 +629,7 @@ def main() raises:
     var loop_t0 = perf_counter_ns()
     var deadline = loop_t0 + seconds * 1_000_000_000
     var a_ex = List[Float64](length=ACT, fill=0.0)
+    var dive_ticks = 0
     if act_ema > 0.0:
         print("  --act-ema", act_ema, "on the arm's action words")
     var line2 = String("")
@@ -648,6 +662,15 @@ def main() raises:
                 qd[i] = (q[i] - q_prev[i]) / dt_s if dt_s > 1e-4 else 0.0
                 q_prev[i] = q[i]
             t_prev = t_now
+            # the DIVE GUARD: reaching down past the desk, no grasp is made there
+            if dive_guard and q[1] > 1.35 and q[2] < -1.35:
+                dive_ticks += 1
+                if dive_ticks >= 3:
+                    print("  ⚠ dive guard: shoulder_lift", fixed(q[1], 2), "elbow",
+                          fixed(q[2], 2), "— reaching down past the desk; the run ends")
+                    break
+            else:
+                dive_ticks = 0
             for i in range(SO101_N):
                 q_pol[i] = q[i]
             q_pol[SO101_N - 1] += grip_off
