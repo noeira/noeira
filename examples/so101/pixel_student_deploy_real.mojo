@@ -284,6 +284,11 @@ def main() raises:
     var rec_dir = _arg(args, "--record", "")
     var sysid = _arg(args, "--sysid", "")
     var grip_off = Float64(_arg(args, "--grip-offset", "0"))
+    # --act-ema A: each ARM action word executed as (1 - A) new + A previous
+    # (the gripper's is not smoothed) — the 31 Hz students flip the sign of
+    # their arm actions on ~30 % of ticks, in sim as on the arm, and the
+    # real run shook the clamped tower
+    var act_ema = Float64(_arg(args, "--act-ema", "0"))
 
     print("=" * 74)
     print("PIXEL STUDENT on the physical SO-101 — sim-to-real")
@@ -611,6 +616,8 @@ def main() raises:
     var loop_t0 = perf_counter_ns()
     var deadline = loop_t0 + seconds * 1_000_000_000
     var a_ex = List[Float64](length=ACT, fill=0.0)
+    if act_ema > 0.0:
+        print("  --act-ema", act_ema, "on the arm's action words")
     var line2 = String("")
     var ra = String("")
     var rt = String("")
@@ -665,6 +672,8 @@ def main() raises:
                 rt = String("")
                 for j in range(ACT):
                     var a = Float64(student_act(y.data[j], j, grip_sign))
+                    if act_ema > 0.0 and j < ACT - 1:
+                        a = (1.0 - act_ema) * a + act_ema * a_ex[j]
                     a_ex[j] = a
                     var tgt = delta_target(q[j], a, j, lo[j], hi[j], man.delta_arm, man.delta_gripper)
                     if tgt <= lo[j] or tgt >= hi[j]:

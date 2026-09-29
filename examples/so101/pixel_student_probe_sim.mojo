@@ -94,6 +94,8 @@ def main() raises:
     # added to the GRIPPER angle the student sees (the deploy's --grip-offset):
     # -0.05 plays the real jaws, which read ~0.05 rad more closed on the cube
     var grip_off = Float64(_arg(args, "--grip-offset", "0"))
+    # the deploy's --act-ema: arm action words executed as (1 - A) new + A previous
+    var act_ema = Float64(_arg(args, "--act-ema", "0"))
     # overrides of the manifest's action scales — for what-ifs only
     var da_o = _arg(args, "--delta-arm", "")
     var dg_o = _arg(args, "--delta-gripper", "")
@@ -250,6 +252,8 @@ def main() raises:
                 ra = String("")
                 for j in range(ACT):
                     var a = Float64(student_act(y.data[j], j, man.gripper_sign))
+                    if act_ema > 0.0 and j < ACT - 1:
+                        a = (1.0 - act_ema) * a + act_ema * a_ex[j]
                     a_ex[j] = a
                     tgt_hold[j] = delta_target(q[j], a, j, lo[j], hi[j], man.delta_arm, man.delta_gripper)
                     ra += "," + String(a)
