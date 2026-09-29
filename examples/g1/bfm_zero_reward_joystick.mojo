@@ -83,6 +83,8 @@ from noeira.render.sdl.sdl_scancode import Scancode
 from noeira.render.sdl.sdl_keyboard import get_keyboard_state
 from noeira.render.sdl import c_int, Ptr
 from noeira.render.ui import UI
+from noeira.nn.core.checkpoint import _split_lines
+from noeira.core.bytes import string_from_bytes
 from noeira.render.types import Color
 
 comptime SP: Int = UNITREE_G1_OBS_DIM
@@ -280,6 +282,7 @@ def main() raises:
     var store_path = _flag(String("--store"), String("lafan_g1_50hz.h5"))
     var fps = atol(_flag(String("--fps"), String("50")))
     var start_clip = atol(_flag(String("--clip"), String("13")))
+    var presets_path = _flag(String("--presets"), String(""))
     if ckpt == "":
         raise Error("pass --ckpt <path/to/step_NNNN.ckpt>")
     var delay_ms = 1000 // fps if fps > 0 else 0
@@ -406,6 +409,46 @@ def main() raises:
     else:
         print("  prompts are distinct (worst separation", worst_deg, "deg)")
 
+    # ── optimised presets, if a probe emitted any ─────────────────────
+    # `bfm_zero_cmd_probe.mojo --emit` writes 256 floats per command: the same
+    # `z` this demo derives, then refined by 128 rollouts of CEM with the
+    # NETWORK FROZEN. Measured 49.3 % less velocity error over four commands.
+    # Loading it is the point of latent search being a search over the PROMPT:
+    # the cost is paid once, offline, and what ships is a vector.
+    var preset_n = 0
+    var preset_cmd = List[Float64]()
+    var preset_z = List[Scalar[DT]]()
+    var preset_name = List[String]()
+    if presets_path != "":
+        var raw: String
+        with open(presets_path, "r") as f:
+            raw = string_from_bytes(f.read_bytes())
+        var lines = _split_lines(raw)
+        if len(lines) < 1:
+            raise Error("presets file is empty: " + presets_path)
+        var hdr = lines[0].split(" ")
+        preset_n = atol(hdr[0])
+        # ⚠ WIDTH CHECKED, NOT ASSUMED. A presets file from a different `d`
+        # would otherwise be read as garbage `z` and drive the robot with a
+        # prompt off the sphere — silent, and it looks like a bad policy.
+        if atol(hdr[1]) != D:
+            raise Error(
+                "presets file has d=" + String(hdr[1]) + ", this build is d="
+                + String(D)
+            )
+        for i in range(preset_n):
+            var head = lines[1 + i * 2].split(" ")
+            preset_name.append(String(head[0]))
+            preset_cmd.append(Float64(String(head[1])))
+            preset_cmd.append(Float64(String(head[2])))
+            preset_cmd.append(Float64(String(head[3])))
+            var row = lines[2 + i * 2].split(" ")
+            for k in range(D):
+                preset_z.append(Scalar[DT](Float64(String(row[k]))))
+        print("  loaded", preset_n, "CEM-optimised presets from", presets_path)
+    else:
+        print("  no --presets: the buttons use the derived prompt")
+
     # ── the env + the window ──────────────────────────────────────────
     var env = UnitreeG1[DType.float64]()
     _ = env.reset()
@@ -430,6 +473,11 @@ def main() raises:
     var cx = 0.0
     var cy = 0.0
     var cw = 0.0
+    # ⚠ WHILE LOCKED, THE DERIVED PROMPT IS NOT REBUILT. A preset installs a
+    # `z` that CEM found; recomputing `E[B r]` on the next frame would throw
+    # it away instantly and the button would appear to do nothing. Any
+    # steering input releases the lock and the demo is live again.
+    var z_lock = False
     var zx = 1e9
     var zy = 1e9
     var zw = 1e9
@@ -500,6 +548,8 @@ def main() raises:
             cx = 0.0
             cy = 0.0
             cw = 0.0
+        if up or dn or lf or rt or sl or sr or halt:
+            z_lock = False
 
         var key = env.renderer_take_key()
         if key == Int(Keycode.SDLK_G):
@@ -513,7 +563,7 @@ def main() raises:
         # Rebuild only on a MATERIAL change. The matvec is cheap enough to run
         # every frame, but rebuilding on float noise would make the printed
         # command log unreadable.
-        if (
+        if not z_lock and (
             abs(cx - zx) > 1e-3 or abs(cy - zy) > 1e-3 or abs(cw - zw) > 1e-3
         ):
             for i in range(POOL):
@@ -595,24 +645,54 @@ def main() raises:
             cx = 0.0
             cy = 0.0
             cw = 0.0
-        if ui.button(114, by, 96, 22, String("walk"), False, 1):
-            cx = 0.8
-            cy = 0.0
-            cw = 0.0
-        if ui.button(12, by + 26, 96, 22, String("back"), False, 1):
-            cx = -0.5
-            cy = 0.0
-            cw = 0.0
-        if ui.button(114, by + 26, 96, 22, String("spin"), False, 1):
-            cx = 0.0
-            cy = 0.0
-            cw = 1.2
+        # A preset button carries its CEM prompt when one was loaded, and
+        # falls back to the derived command when it was not — so the same
+        # binary demos both, and the label says which you are driving.
+        var opt = String(" *") if preset_n > 0 else String("")
+        for pi in range(4):
+            var bx = Float32(12) if pi % 2 == 0 else Float32(114)
+            var byy = by if pi < 2 else by + 26
+            if pi == 0:
+                continue                      # slot 0 is `stand`, above
+            var nm = String("walk") if pi == 1 else (
+                String("back") if pi == 2 else String("spin")
+            )
+            var dx = 0.8 if pi == 1 else (-0.5 if pi == 2 else 0.0)
+            var dw = 1.2 if pi == 3 else 0.0
+            if ui.button(bx, byy, 96, 22, nm + opt, False, 1):
+                cx = dx
+                cy = 0.0
+                cw = dw
+                z_lock = False
+                # find the emitted prompt for this command, if there is one
+                for q in range(preset_n):
+                    if preset_name[q] == nm:
+                        for k in range(D):
+                            z1.data[k] = preset_z[q * D + k]
+                        g1_project_z[D](z1, 0)
+                        cx = preset_cmd[q * 3 + 0]
+                        cy = preset_cmd[q * 3 + 1]
+                        cw = preset_cmd[q * 3 + 2]
+                        zx = cx
+                        zy = cy
+                        zw = cw
+                        z_lock = True
+                        log.append(String("CEM prompt: ") + nm)
+                        if len(log) > LOG_ROWS:
+                            var tr = List[String]()
+                            for w in range(len(log) - LOG_ROWS, len(log)):
+                                tr.append(log[w])
+                            log = tr^
         if ui.button(12, by + 56, 198, 22, String("respawn  (G)"), False, 1):
             want_respawn = True
 
-        ui.label(12, by + 92, String("COMMAND LOG"), UI_DIM, 1)
+        ui.label(12, by + 88,
+                 String("prompt: CEM *") if z_lock else
+                 String("prompt: derived"),
+                 UI_LOG if z_lock else UI_DIM, 1)
+        ui.label(12, by + 102, String("COMMAND LOG"), UI_DIM, 1)
         for i in range(len(log)):
-            ui.label(12, by + 108 + Float32(i) * 12,
+            ui.label(12, by + 118 + Float32(i) * 12,
                      _fit(log[i], SIDE_CHARS), UI_LOG, 1)
 
         ui.label(12, Float32(win_h) - 32, String("steps ") + String(steps), UI_DIM, 1)

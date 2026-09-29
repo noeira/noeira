@@ -42,6 +42,7 @@ from noeira.core.cont_action import ContAction
 from noeira.data.store import TrajectoryStore
 from noeira.deep_agents.fb.trainer import FBTrainer
 from noeira.deep_agents.fb.obs_norm import ObsNorm
+from noeira.io.fileio import write_text_atomic
 from noeira.deep_agents.fb.z_sampler import z_from_reward
 from noeira.deep_agents.fb.bfm_towers import (
     BFMFTower, BFMActorTowerFiltered, BFMBNetFiltered,
@@ -186,6 +187,11 @@ def main() raises:
     var pop = atol(_flag(String("--cem-pop"), String(16)))
     var elites = atol(_flag(String("--cem-elites"), String(4)))
     var sigma0 = Float64(String(_flag(String("--cem-sigma"), String("0.30"))))
+    # `--emit` writes the optimised prompts so the joystick can SHIP them.
+    # The search costs 128 rollouts per command and the result is 256 floats
+    # — paying that once offline and loading the vector is the whole point of
+    # latent search being a search over the PROMPT and not the weights.
+    var emit = _flag(String("--emit"), String(""))
     if ckpt == "":
         raise Error("pass --ckpt <path/to/step_NNNN.ckpt>")
 
@@ -263,6 +269,7 @@ def main() raises:
     var sum_r = 0.0
     var n_better = 0
     var t0 = perf_counter_ns()
+    var out = String(len(cxs)) + " " + String(D) + "\n"
     print("-" * 76)
     print("  command    random   zero-shot(shipped)     CEM     gain")
     for g in range(len(cxs)):
@@ -301,6 +308,9 @@ def main() raises:
             mean[k] = z0[k]
         var sigma = sigma0
         var best = e_zs
+        var best_z = List[Scalar[DT]](length=D, fill=Scalar[DT](0))
+        for k in range(D):
+            best_z[k] = z0[k]
         var cand = List[Scalar[DT]](length=pop * D, fill=Scalar[DT](0))
         var score = List[Float64](length=pop, fill=0.0)
         var order = List[Int](length=pop, fill=0)
@@ -321,6 +331,8 @@ def main() raises:
                 )
                 if score[c] < best:
                     best = score[c]
+                    for k in range(D):
+                        best_z[k] = cand[c * D + k]
             for c in range(pop):
                 order[c] = c
             for i in range(elites):
@@ -346,6 +358,16 @@ def main() raises:
         sum_r += e_rnd
         if best < e_zs - 1e-9:
             n_better += 1
+        # ⚠ `mean` after the last refit is NOT the best sample. CEM returns a
+        # distribution; `best` is the score of a specific draw, and emitting
+        # the mean would ship a prompt nobody ever scored. So the best draw is
+        # tracked explicitly and that is what gets written.
+        if emit != "":
+            out += names[g].strip() + " " + String(cx) + " " + String(cy) \
+                   + " " + String(cw) + "\n"
+            for k in range(D):
+                out += String(Float64(best_z[k]))
+                out += " " if k + 1 < D else "\n"
         print("  ", names[g], " ", _f3(e_rnd), "     ", _f3(e_zs),
               "        ", _f3(best), "  ",
               _f3(100.0 * (e_zs - best) / e_zs) + String("%"))
@@ -366,3 +388,6 @@ def main() raises:
     else:
         print("  control OK: a random z is", _f3(mr / mz) + String("x"),
               "the prompt's error")
+    if emit != "":
+        write_text_atomic(emit, out)
+        print("  wrote", len(cxs), "optimised prompts ->", emit)
