@@ -113,7 +113,11 @@ from noeira.core.dotenv import load_dotenv
 from noeira.core.logger import CsvLogger, RemoteLogger, CompositeLogger
 from noeira.io.artifact_sink import sink_for_run
 from noeira.core.run_session import finish_run
-from noeira.deep_agents.training.checkpoint import announce_checkpoint
+from noeira.deep_agents.training.checkpoint import (
+    announce_checkpoint, checkpoint_retain,
+)
+from noeira.io.fileio import remove_file, file_size
+from noeira.io.proc import run_capture
 from noeira.data.store import TrajectoryStore
 from noeira.data.resident import IDX_DT
 from noeira.deep_agents.fb import FBCPROnlineAgent
@@ -483,6 +487,44 @@ def _score_tracking(
     return G1TrackScore(sum_d / f, sum_e / f, sum_p / f, n)
 
 
+
+def _free_gb(path: String) raises -> Float64:
+    """Free space on `path`'s filesystem, GB. -1 when it cannot be read.
+
+    ⚠ VIA `df`, not `statvfs`. The struct `statvfs` fills differs between
+    macOS and Linux and would have to be declared per platform; `df -k` prints
+    the same column on both and this runs once per checkpoint, not per step.
+    """
+    try:
+        var out = run_capture(String("df -k ") + path + String(" 2>/dev/null"))
+        var lines = out.split("\n")
+        if len(lines) < 2:
+            return -1.0
+        var f = lines[1].split()
+        if len(f) < 4:
+            return -1.0
+        return Float64(String(f[3])) * 1024.0 / 1073741824.0
+    except:
+        return -1.0
+
+
+def _drop_checkpoint(path: String):
+    """Remove a checkpoint's THREE files. A checkpoint is not one file:
+    `<p>` (the FB nets), `<p>.cpr` (the CPR critic) and `<p>.norm` (the
+    normaliser sidecar) — 1.17 GB together at 2048/6. Deleting only `<p>`
+    would leave the two largest behind and the retention policy would appear
+    to do nothing."""
+    var sfx = List[String]()
+    sfx.append(String(""))
+    sfx.append(String(".cpr"))
+    sfx.append(String(".norm"))
+    for i in range(len(sfx)):
+        try:
+            remove_file(path + sfx[i])
+        except:
+            pass
+
+
 def main() raises:
     var smoke = _has("--smoke")
     var no_graph = _has("--no-graph")
@@ -496,7 +538,29 @@ def main() raises:
     var ups = atol(_flag(String("--ups"), String(UPDATES_PER_STEP)))
     var tag = _flag(String("--tag"), String("g3_priv"))
     var store_path = _flag(String("--store"), String("lafan_g1_50hz.h5"))
-    var ckpt_every = atol(_flag(String("--ckpt-every"), String(2000)))   # batched steps
+    var ckpt_every = atol(_flag(String("--ckpt-every"), String(2000)))
+    # ⚠ RETENTION, because the 2048/6 run DIED OF A FULL DISK at 38 k steps.
+    # A checkpoint here is 1.17 GB across three files and the cadence was
+    # every 2000 batched steps, so 19 of them filled a 60 GB box and
+    # `step_38000.ckpt.cpr` was cut off mid-write. The run did not fail on the
+    # GPU, on the maths or on the data — it ran out of somewhere to put the
+    # next file, 20 h and $16 in.
+    #
+    # Keep the last `--ckpt-keep`, the BEST-scoring one, and a sparse
+    # milestone ladder. At the defaults a 64 h / 120 M-frame run holds
+    # 3 + 1 + ~5 = 9 checkpoints ~ 10.5 GB, against 192 ~ 225 GB unpruned.
+    var ckpt_keep = atol(_flag(String("--ckpt-keep"), String(3)))
+    var ckpt_milestone = atol(_flag(String("--ckpt-milestone"), String(25000)))
+    # Below this, SKIP the write rather than start one that cannot finish. A
+    # skipped checkpoint costs one interval; a truncated one is what ended the
+    # last run, and it is indistinguishable from a good file until it is read.
+    var ckpt_min_free = Float64(
+        String(_flag(String("--ckpt-min-free-gb"), String("4.0")))
+    )
+    var ckpt_written = List[Int]()
+    var ckpt_best_step = -1
+    var ckpt_best_emd = 1e18
+    var ckpt_skipped = 0   # batched steps
     var print_every = atol(_flag(String("--print-every"), String(100)))
     # ── resume ───────────────────────────────────────────────────────────
     # `--resume PATH` restores the online nets + the `.norm` sidecar from a
@@ -1151,11 +1215,27 @@ def main() raises:
                 String("step_") + String(s + s_off) if do_ckpt
                 else String("_eval_scratch")
             )
-            agent.save_state(p)
-            if do_ckpt:
+            # ⚠ THE GUARD IS BEFORE THE WRITE, not after. A checkpoint is
+            # 1.17 GB across three files and `save_state` has no way to
+            # un-write a partial one; the last run's `step_38000.ckpt.cpr`
+            # stopped mid-stream and the process died on it. Refusing the
+            # write costs one interval and leaves a resumable run behind.
+            var free_gb = _free_gb(run.dir)
+            var room = free_gb < 0.0 or free_gb >= ckpt_min_free
+            if not room:
+                ckpt_skipped += 1
+                print(
+                    "  ⚠ SKIPPING checkpoint —", free_gb, "GB free on",
+                    run.dir, "is under --ckpt-min-free-gb", ckpt_min_free,
+                    " (skipped", ckpt_skipped, "so far; the run continues)",
+                )
+            if room:
+                agent.save_state(p)
+            if room and do_ckpt:
                 announce_checkpoint(p, artifacts, run.dir)
                 print("  checkpoint", p)
-            if do_eval:
+                ckpt_written.append(s + s_off)
+            if do_eval and room:
                 var sc = _score_tracking(
                     eval_t, eval_env, rsi, st, pv, eval_qpos, p, eval_segments,
                     eval_ach, eval_tgt, eval_b_in, eval_b_out, eval_z_seg,
@@ -1225,6 +1305,47 @@ def main() raises:
                         g1_motion_priority(hi) / g1_motion_priority(lo)
                     )
                 logger.log_scalars(en, ev, env_steps + start_at)
+
+                # best-so-far, and ONLY when a real checkpoint backs it. The
+                # finer eval cadence scores `_eval_scratch`, which is
+                # overwritten every time — recording it as "best" would
+                # protect a path whose bytes are already gone. §12.44 hit
+                # exactly that: the run's best number, 1.1899 at step 33000,
+                # has no checkpoint because that step was eval-only.
+                if do_ckpt and sc.emd < ckpt_best_emd:
+                    ckpt_best_emd = sc.emd
+                    ckpt_best_step = s + s_off
+
+            # ── retention, AFTER the eval so `best` is current ─────────
+            if do_ckpt and room and ckpt_keep > 0:
+                var dropped = 0
+                for i in range(len(ckpt_written)):
+                    var st_i = ckpt_written[i]
+                    if not checkpoint_retain(
+                        st_i, ckpt_written, ckpt_keep, ckpt_milestone,
+                        ckpt_best_step,
+                    ):
+                        _drop_checkpoint(
+                            run.checkpoint_path(String("step_") + String(st_i))
+                        )
+                        dropped += 1
+                if dropped > 0:
+                    var alive = List[Int]()
+                    for i in range(len(ckpt_written)):
+                        var st_i = ckpt_written[i]
+                        if checkpoint_retain(
+                            st_i, ckpt_written, ckpt_keep, ckpt_milestone,
+                            ckpt_best_step,
+                        ):
+                            alive.append(st_i)
+                    ckpt_written = alive^
+                    print(
+                        "  retention: dropped", dropped, "· keeping",
+                        len(ckpt_written), "(last", ckpt_keep,
+                        "+ best step", ckpt_best_step,
+                        "+ every", ckpt_milestone, ") ·",
+                        _free_gb(run.dir), "GB free",
+                    )
             logger.flush()  # the CSV is the record; do not lose it to a crash
     ctx.synchronize()
     # ⚠ STOP THE CLOCK BEFORE THE CHECKPOINT. `el` used to be taken AFTER
