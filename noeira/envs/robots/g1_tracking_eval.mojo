@@ -30,7 +30,7 @@ reader to keep `H`/`L`/`HB`/`D` in sync by hand, and a mismatch only showed up
 as a checkpoint that would not load.
 """
 
-from std.math import sqrt, abs
+from std.math import sqrt, abs, acos, sin
 
 from noeira.nn.constants import DT
 from noeira.nn.core.module import Module
@@ -187,54 +187,83 @@ def g1_project_z[Dz: Int](mut z: Tensor, row: Int):
         )
 
 
-def g1_score_segment[
-    FNET: Module, BNET: Module, ANET: Module,
+def g1_slerp_z[Dz: Int](
+    ref src: Tensor, ai: Int, bi: Int,
+    u: Float64, mut dst: Tensor, di: Int,
+):
+    """Geodesic interpolation between two `z` on the radius-sqrt(d) sphere.
+
+    The latent is a SPHERE, so the straight line between two prompts
+    leaves it and a renormalised lerp is not the shortest path. 12.45:
+    the reference shows interpolation along geodesics produces
+    "semantically meaningful intermediate skills"; a lerp bunches the
+    intermediate points toward the endpoints and would make a coarse
+    knot sequence move in jerks between them.
+
+    Lives here, beside `g1_project_z`, because both own the radius and
+    it must not be computed in two places.
+
+    ⚠ ONE source tensor and two ROW INDICES, not two tensors: the
+    callers interpolate between adjacent rows of the same knot table,
+    and Mojo rejects passing one tensor as two `ref` arguments.
+    """
+    var dot = 0.0
+    var na = 0.0
+    var nb = 0.0
+    for k in range(Dz):
+        var x = Float64(src.data[ai * Dz + k])
+        var y = Float64(src.data[bi * Dz + k])
+        dot += x * y
+        na += x * x
+        nb += y * y
+    var den = sqrt(na * nb) + 1e-12
+    var c = dot / den
+    if c > 1.0:
+        c = 1.0
+    if c < -1.0:
+        c = -1.0
+    var th = acos(c)
+    var s_th = sin(th)
+    # ⚠ NEAR-PARALLEL FALLS BACK TO A LERP, and must: sin(theta) in the
+    # denominator is a 0/0 as the two prompts coincide, which is the
+    # COMMON case here — adjacent knots on a smooth motion are nearly
+    # the same vector (12.45 measured exactly that on the horizon
+    # sweep). The projection at the end makes the lerp exact there.
+    var wa = 1.0 - u
+    var wb = u
+    if s_th > 1e-6:
+        wa = sin((1.0 - u) * th) / s_th
+        wb = sin(u * th) / s_th
+    for k in range(Dz):
+        dst.data[di * Dz + k] = Scalar[DT](
+            wa * Float64(src.data[ai * Dz + k])
+            + wb * Float64(src.data[bi * Dz + k])
+        )
+    g1_project_z[Dz](dst, di)
+
+
+def g1_build_prompt[
+    BNET: Module, FNET: Module, ANET: Module,
     OBS: Int, ACT: Int, D: Int, BATCH: Int,
 ](
     mut t: FBTrainer[FNET, BNET, ANET, OBS, ACT, D, BATCH, "cpu"],
-    mut env: UnitreeG1[DType.float64],
-    ref rsi: G1RsiTable,
     ref st: List[Scalar[DType.float32]],
     ref pv: List[Scalar[DType.float32]],
-    ref qpos_col: List[Scalar[DType.float32]],
     ref norm: Optional[ObsNorm[OBS]],
     r0: Int,
-    mut ach: List[Float64],
-    mut tgt: List[Float64],
     mut b_in: Tensor,
     mut b_out: Tensor,
     mut z_seg: Tensor,
-    mut obs_t: Tensor,
-    mut z1: Tensor,
-    mut act_out: Tensor,
-    render: Bool = False,
-    frame_delay_ms: Int = 16,
-    z_horizon: Int = 1,
-) raises -> G1TrackScore:
-    """`tracking_inference` for ONE segment starting at store row `r0`.
+    z_horizon: Int,
+) raises:
+    """The TRACKING prompt for one segment: `B` over the reference rows.
 
-    `render=True` draws each step through the env's own renderer. That flag
-    exists so the VIEWER IS THIS FUNCTION — `bfm_zero_policy_viewer.mojo` opens
-    a window and calls exactly the loop the EMD came out of. A viewer with its
-    own copy of the rollout would be a second place for the z schedule, the
-    history rules and the action chain to drift, and it would then be showing
-    something the number never measured (`_a_rule_written_inline_twice_drifts`).
-    The caller owns `init_renderer` / `close`; this draws AND pumps. The
-    pump matters: `check_renderer_quit` is the renderer's only
-    `poll_event` site, and a segment is 499 frames, so a caller that
-    polled between segments left the window unserviced for ten seconds
-    at a time. Events cannot reach the physics — they move the camera —
-    so the score is identical with `render` on or off.
-
-    `z_t = project(sum_{h=1}^{z_horizon} B(row t+h))` — at the default
-    `z_horizon=1` a SINGLE row, which is neither the reference's look-ahead sum
-    nor the mean of eight our training rollouts use (12.45). Then reset to row 0
-    and `T-1` mean-action steps.
+    Split out of `g1_score_segment` so a search can replace it (12.47)
+    while the rollout, the action chain, the history rules and the
+    scoring stay on ONE code path. `g1_score_segment(z_given=True)` skips
+    this and uses whatever the caller left in `z_seg`.
     """
     comptime T = G1_SEG_ROWS
-    comptime NQ = UnitreeG1Model.NQ
-    comptime NV = UnitreeG1Model.NV
-
     for j in range(T):
         for k in range(UNITREE_G1_STATE_DIM):
             b_in.data[j * OBS + k] = Scalar[DT](
@@ -281,6 +310,65 @@ def g1_score_segment[
                     z_seg.data[j * D + k] + b_out.data[r * D + k]
                 )
         g1_project_z[D](z_seg, j)
+
+
+def g1_score_segment[
+    FNET: Module, BNET: Module, ANET: Module,
+    OBS: Int, ACT: Int, D: Int, BATCH: Int,
+](
+    mut t: FBTrainer[FNET, BNET, ANET, OBS, ACT, D, BATCH, "cpu"],
+    mut env: UnitreeG1[DType.float64],
+    ref rsi: G1RsiTable,
+    ref st: List[Scalar[DType.float32]],
+    ref pv: List[Scalar[DType.float32]],
+    ref qpos_col: List[Scalar[DType.float32]],
+    ref norm: Optional[ObsNorm[OBS]],
+    r0: Int,
+    mut ach: List[Float64],
+    mut tgt: List[Float64],
+    mut b_in: Tensor,
+    mut b_out: Tensor,
+    mut z_seg: Tensor,
+    mut obs_t: Tensor,
+    mut z1: Tensor,
+    mut act_out: Tensor,
+    render: Bool = False,
+    frame_delay_ms: Int = 16,
+    z_horizon: Int = 1,
+    z_given: Bool = False,
+) raises -> G1TrackScore:
+    """`tracking_inference` for ONE segment starting at store row `r0`.
+
+    `render=True` draws each step through the env's own renderer. That flag
+    exists so the VIEWER IS THIS FUNCTION — `bfm_zero_policy_viewer.mojo` opens
+    a window and calls exactly the loop the EMD came out of. A viewer with its
+    own copy of the rollout would be a second place for the z schedule, the
+    history rules and the action chain to drift, and it would then be showing
+    something the number never measured (`_a_rule_written_inline_twice_drifts`).
+    The caller owns `init_renderer` / `close`; this draws AND pumps. The
+    pump matters: `check_renderer_quit` is the renderer's only
+    `poll_event` site, and a segment is 499 frames, so a caller that
+    polled between segments left the window unserviced for ten seconds
+    at a time. Events cannot reach the physics — they move the camera —
+    so the score is identical with `render` on or off.
+
+    `z_t = project(sum_{h=1}^{z_horizon} B(row t+h))` — at the default
+    `z_horizon=1` a SINGLE row, which is neither the reference's look-ahead sum
+    nor the mean of eight our training rollouts use (12.45). Then reset to row 0
+    and `T-1` mean-action steps.
+    """
+    comptime T = G1_SEG_ROWS
+    comptime NQ = UnitreeG1Model.NQ
+    comptime NV = UnitreeG1Model.NV
+
+    # `z_given` hands the PROMPT SEQUENCE in rather than deriving it, which
+    # is what lets a search optimise `z_t` against this exact rollout and
+    # this exact metric (12.47). Everything after the prompt stays on one
+    # code path, which is why this is a flag and not a second function.
+    if not z_given:
+        g1_build_prompt[BNET, FNET, ANET, OBS, ACT, D, BATCH](
+            t, st, pv, norm, r0, b_in, b_out, z_seg, z_horizon
+        )
 
     # reset: the RSI row IS `init_state()` (qvel already body-frame)
     var qp = List[Float64](length=NQ, fill=0.0)
