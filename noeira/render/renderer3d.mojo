@@ -4835,7 +4835,17 @@ struct Renderer3D(Movable):
                 offset=0,
                 size=UInt32(len(self.line_vertex_data) * 4),
             )
-            upload_to_gpu_buffer(copy_pass, Ptr(to=src), Ptr(to=dst), False)
+            # `cycle=True`. SDL_gpu.h: "You must also take care not to
+            # overwrite a section of data that has been referenced in a command
+            # without cycling first ... overwriting a section of data that has
+            # already been referenced will produce unexpected results." This is
+            # a WHOLE-BUFFER overwrite, every frame, of a buffer last frame's
+            # draw call referenced and the GPU may still be reading. The mesh
+            # path at `_upload_deformed_mesh` already learned this; these two
+            # per-frame buffers were left behind. Torn vertex data puts a quad
+            # at garbage coordinates with a garbage colour — which is what a
+            # full- or half-screen colour flash IS.
+            upload_to_gpu_buffer(copy_pass, Ptr(to=src), Ptr(to=dst), True)
             end_gpu_copy_pass(copy_pass)
 
         # Upload text vertex data if any (must be before render pass)
@@ -4868,8 +4878,12 @@ struct Renderer3D(Movable):
                 offset=0,
                 size=UInt32(n_text_floats * 4),
             )
+            # `cycle=True` — same hazard as the line buffer above, and worse:
+            # the HUD's text CHANGES LENGTH between frames, so a short frame
+            # overwrites only part of what a long frame referenced, which is
+            # the exact case SDL names as producing unexpected results.
             upload_to_gpu_buffer(
-                text_copy_pass, Ptr(to=text_src), Ptr(to=text_dst), False
+                text_copy_pass, Ptr(to=text_src), Ptr(to=text_dst), True
             )
             end_gpu_copy_pass(text_copy_pass)
 

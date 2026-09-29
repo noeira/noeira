@@ -113,12 +113,26 @@ def _flag_ints(name: String) raises -> List[Int]:
     return out^
 
 
+def _has(name: String) raises -> Bool:
+    var av = argv()
+    for i in range(1, len(av)):
+        if String(av[i]) == name:
+            return True
+    return False
+
+
 def main() raises:
     var ckpt = _flag(String("--ckpt"), String(""))
     var store_path = _flag(String("--store"), String("lafan_g1_50hz.h5"))
     var max_segments = atol(_flag(String("--segments"), String(2)))
     var fps = atol(_flag(String("--fps"), String("50")))
     var clips = _flag_ints(String("--clips"))
+    # Bisect switches for the renderer, not the policy. The two buffers the
+    # main pass overwrites every frame are the TEXT (HUD) and the LINE
+    # (velocity arrow) vertex buffers; each flag removes one of them from the
+    # frame entirely. If a colour flash survives both, it is neither.
+    var no_hud = _has(String("--no-hud"))
+    var no_lines = _has(String("--no-lines"))
     if ckpt == "":
         raise Error("pass --ckpt <path/to/step_NNNN.ckpt>")
     var delay_ms = 1000 // fps if fps > 0 else 0
@@ -157,8 +171,13 @@ def main() raises:
 
     var env = UnitreeG1[DType.float64]()
     _ = env.reset()
-    if not env.init_renderer():
+    if not env.init_renderer(show_velocity=not no_lines):
         print("  ⚠ no renderer available — scoring headless instead.")
+    if no_hud:
+        env.renderer_set_show_hud(False)
+    if no_hud or no_lines:
+        print("  renderer bisect: hud", "OFF" if no_hud else "on",
+              " velocity lines", "OFF" if no_lines else "on")
     var obs_t = Tensor.alloc(OBS)
     var z1 = Tensor.alloc(D)
     var act_out = Tensor.alloc(ACT)
