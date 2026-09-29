@@ -888,6 +888,23 @@ struct Phyics3dEnv[
             return False
         return self._renderer.value()[].take_click()
 
+    def renderer_width(self) -> Int:
+        """Window width in pixels, 0 with no renderer.
+
+        Screen-space UI (`noeira/render/ui.mojo`) is laid out in these
+        coordinates, so anything anchored to the right or bottom edge must
+        read them every frame rather than assume the 1280x720 default —
+        the window is resizable and the swapchain follows it.
+        """
+        if not self._renderer_initialized:
+            return 0
+        return self._renderer.value()[].win_width()
+
+    def renderer_height(self) -> Int:
+        if not self._renderer_initialized:
+            return 0
+        return self._renderer.value()[].win_height()
+
     def renderer_mouse_x(self) -> Float32:
         if not self._renderer_initialized:
             return 0

@@ -49,7 +49,8 @@ velocity, and `E_rho[B.r]` only means what it says if `r` does.
 float64 single-env. The GPU draws and nothing else.
 """
 
-from std.math import exp, sqrt, acos
+from std.math import exp, sqrt, acos, abs
+from std.math import cos as _cos64, sin as _sin64
 from std.sys import argv
 
 from noeira.nn.constants import DT
@@ -78,6 +79,11 @@ from noeira.envs.robots.g1_tracking_eval import (
     G1_D, G1_H, G1_L, G1_HB, g1_project_z,
 )
 from noeira.render.sdl.sdl_keycode import Keycode
+from noeira.render.sdl.sdl_scancode import Scancode
+from noeira.render.sdl.sdl_keyboard import get_keyboard_state
+from noeira.render.sdl import c_int, Ptr
+from noeira.render.ui import UI
+from noeira.render.types import Color
 
 comptime SP: Int = UNITREE_G1_OBS_DIM
 comptime OBS: Int = UNITREE_G1_FULL_OBS_DIM
@@ -96,6 +102,145 @@ comptime OFF_WZ: Int = UNITREE_G1_STATE_DIM + G1_PRIV_OFF_ANGVEL + 2
 
 comptime SIGMA_V: Float64 = 0.5
 comptime SIGMA_W: Float64 = 0.5
+
+comptime SIDEBAR_W: Int = 224
+comptime PAD_W: Float32 = 186.0
+comptime PAD_H: Float32 = 150.0
+comptime LOG_ROWS: Int = 6
+
+# A stick, in units per 50 Hz control step. `RAMP` is how fast leaning on a key
+# moves the command; `DECAY` is how fast letting go centres it. Decay is the
+# faster of the two on purpose: "stop" should feel immediate, "go" should not.
+comptime RAMP_V: Float64 = 0.030
+comptime DECAY_V: Float64 = 0.060
+comptime RAMP_W: Float64 = 0.050
+comptime DECAY_W: Float64 = 0.100
+comptime MAX_FWD: Float64 = 1.40
+comptime MAX_BACK: Float64 = 0.80
+comptime MAX_LAT: Float64 = 0.60
+comptime MAX_YAW: Float64 = 1.60
+# One click is worth a quarter second of holding the key: enough to feel like
+# a control, small enough that the pad is still a fine adjustment.
+comptime CLICK_V: Float64 = 0.25
+comptime CLICK_W: Float64 = 0.40
+
+comptime UI_HEAD = Color(235, 240, 250, 255)
+comptime UI_TXT = Color(205, 215, 232, 255)
+comptime UI_DIM = Color(120, 132, 155, 255)
+comptime UI_LOG = Color(150, 200, 170, 255)
+comptime UI_CAP = Color(44, 50, 66, 240)
+comptime UI_CAP_ON = Color(210, 90, 70, 255)
+comptime UI_RING = Color(60, 68, 88, 210)
+
+
+def _clamp(v: Float64, lo: Float64, hi: Float64) -> Float64:
+    if v < lo:
+        return lo
+    if v > hi:
+        return hi
+    return v
+
+
+def _decay(v: Float64, rate: Float64) -> Float64:
+    """Toward zero by `rate`, without crossing it."""
+    if v > rate:
+        return v - rate
+    if v < -rate:
+        return v + rate
+    return 0.0
+
+
+def _f2(v: Float64) -> String:
+    """Two decimals, without pulling in a formatter."""
+    var neg = v < 0.0
+    var a = -v if neg else v
+    var h = Int(a * 100.0 + 0.5)
+    var ip = h // 100
+    var fp = h % 100
+    var frac = String(fp) if fp >= 10 else (String("0") + String(fp))
+    var body = String(ip) + String(".") + frac
+    return (String("-") + body) if neg else body
+
+
+def _cap(
+    mut ui: UI, x: Float32, y: Float32, w: Float32, label: String, on: Bool
+) -> Bool:
+    """One key cap: lit while the key is HELD, and clickable in its own right.
+
+    ⚠ Returns the CLICK, not the held state — the caller already knows the
+    latter. Menlo's pad works the same way: the caps are both a legend and a
+    control, which is what makes the demo usable without a keyboard at all.
+    """
+    return ui.button(x, y, w, 20, label, on, 1)
+
+
+def _drive_pad(
+    mut ui: UI,
+    x: Float32,
+    y: Float32,
+    cx: Float64,
+    cy: Float64,
+    cw: Float64,
+    up: Bool, dn: Bool, lf: Bool, rt: Bool, sl: Bool, sr: Bool,
+) -> List[Float64]:
+    """The bottom-left stick: caps, a ring, and the command as a dot.
+
+    The dot is the COMMAND, drawn at its fraction of the per-axis maximum, so
+    the ring reads as a stick deflection rather than as a number. It is the
+    only part of this window that shows `z` changing without reading a float.
+    """
+    ui.panel(x, y, PAD_W, PAD_H, Color(14, 16, 24, 205))
+    var cxp = x + PAD_W * 0.5
+    var cyp = y + 66.0
+
+    # the ring, as 12 dots on a circle — `ui` has rects, not circles, and a
+    # dotted ring reads better at this size than a square outline would
+    var r = Float32(42.0)
+    for i in range(12):
+        var ang = Float32(i) * 0.5235988
+        var dx = r * _cosf(ang)
+        var dy = r * _sinf(ang)
+        ui.panel(cxp + dx - 1.5, cyp + dy - 1.5, 3, 3, UI_RING)
+
+    # the command dot
+    var fx = Float32(cx / (MAX_FWD if cx >= 0.0 else MAX_BACK))
+    var fy = Float32(cy / MAX_LAT)
+    var px = cxp - fy * r
+    var py = cyp - fx * r
+    ui.panel(cxp - 4, cyp - 4, 8, 8, UI_RING)
+    ui.panel(px - 5, py - 5, 10, 10, Color(235, 240, 250, 255))
+
+    # the caps, laid out where the keys are
+    # ⚠ THE PAD RETURNS DELTAS RATHER THAN WRITING THE COMMAND. A widget runs
+    # inside this call and cannot reach the caller's `cx`; Mojo closures across
+    # that boundary are painful enough that `ui.mojo` itself deferred drawing
+    # for the same reason. So a click becomes a number the caller adds — which
+    # also means a click and a held key go through exactly one code path.
+    var d = List[Float64](length=3, fill=0.0)
+    if _cap(ui, cxp - 14, y + 4, 28, String("^"), up):
+        d[0] += CLICK_V
+    if _cap(ui, cxp - 14, y + 112, 28, String("v"), dn):
+        d[0] -= CLICK_V
+    if _cap(ui, x + 6, cyp - 10, 28, String("<"), lf):
+        d[2] += CLICK_W
+    if _cap(ui, x + PAD_W - 34, cyp - 10, 28, String(">"), rt):
+        d[2] -= CLICK_W
+    if _cap(ui, x + 6, y + 4, 28, String("A"), sl):
+        d[1] += CLICK_V
+    if _cap(ui, x + PAD_W - 34, y + 4, 28, String("D"), sr):
+        d[1] -= CLICK_V
+    ui.label(x + 6, y + PAD_H - 14,
+             String("^v drive  <> turn  ·  A/D strafe"), UI_DIM, 1)
+    return d^
+
+
+def _cosf(a: Float32) -> Float32:
+    return Float32(_cos64(Float64(a)))
+
+
+def _sinf(a: Float32) -> Float32:
+    return Float32(_sin64(Float64(a)))
+
 
 comptime FNet = BFMFTower[OBS, ACT, D, G1_H, G1_L, D]
 comptime BNet = BFMBNetFiltered[OBS, SP, D, G1_HB]
@@ -127,12 +272,14 @@ def main() raises:
     print("=" * 70)
     print("BFM-Zero G1 — the REWARD JOYSTICK (docs §12.45)")
     print("=" * 70)
-    print("  W / X   forward velocity  -+ 0.25 m/s")
-    print("  Q / E   strafe            -+ 0.25 m/s")
-    print("  A / D   turn              -+ 0.40 rad/s")
-    print("  Z       halt (zero command — the STAND objective)")
-    print("  G       put the robot back on its feet")
-    print("  Esc     quit.  1-9 cameras, Space pause, mouse orbits.")
+    print("  up / down     drive forward / back   (also W / S)")
+    print("  left / right  turn                  (also Q / E)")
+    print("  A / D         strafe")
+    print("  X             stop (the STAND objective)")
+    print("  G             put the robot back on its feet")
+    print("  Esc quit · 1-9 cameras · mouse orbits · the pad is CLICKABLE")
+    print("  keys are read as SCANCODES, so the letters above are PHYSICAL")
+    print("  positions — on AZERTY they fall on Z/S, A/E and Q/D.")
     print("-" * 70)
 
     var t = Trainer.make(
@@ -244,12 +391,14 @@ def main() raises:
     else:
         print("  prompts are distinct (worst separation", worst_deg, "deg)")
 
-    # ── the env ────────────────────────────────────────────────────────
+    # ── the env + the window ──────────────────────────────────────────
     var env = UnitreeG1[DType.float64]()
     _ = env.reset()
     if not env.init_renderer():
         print("  ⚠ no renderer — nothing to drive. Exiting.")
         return
+    env.renderer_set_show_hud(False)      # the sidebar says all of it, beside
+    env.set_ui_sidebar_width(SIDEBAR_W)
 
     var qp = List[Float64](length=NQ, fill=0.0)
     var qv = List[Float64](length=NV, fill=0.0)
@@ -260,17 +409,29 @@ def main() raises:
     var rewards = List[Scalar[DT]](length=POOL, fill=Scalar[DT](0))
 
     var reset_row = Int(rsi.ep_offset.data[start_clip])
-
-    # ⚠ NOT a nested `def`. A closure over `env`/`qp`/`aobs` needs an explicit
-    # capture convention in Mojo 1.1, and the respawn has to run once before the
-    # first action anyway — so it is a flag consumed at the top of the loop.
     var want_respawn = True
 
+    # the command, and the command the prompt was last built for
     var cx = 0.0
     var cy = 0.0
     var cw = 0.0
-    var dirty = True
+    var zx = 1e9
+    var zy = 1e9
+    var zw = 1e9
     var steps = 0
+    var log = List[String]()
+
+    # ⚠ SCANCODES, NOT KEYCODES, and the reason is not only AZERTY. A scancode
+    # is a PHYSICAL key position, so the same code is the same key under every
+    # layout — the block below is WASD on QWERTY and ZQSD on AZERTY without
+    # branching on anything. It also sidesteps the event pump: `check_quit`
+    # CLAIMS the right arrow for its pause-step binding and never forwards it,
+    # so an arrow-driven joystick reading `take_key` would silently lose one of
+    # its four directions. `get_keyboard_state` reads SDL's own array instead,
+    # which is a snapshot of what is HELD rather than a queue of transitions —
+    # exactly the right shape for a stick that ramps while you lean on it.
+    var nkeys = c_int(0)
+    var kb = get_keyboard_state(Ptr(to=nkeys).as_unsafe_any_origin())
 
     while env.is_renderer_open():
         if env.check_renderer_quit():
@@ -286,70 +447,93 @@ def main() raises:
             # feed the policy a history from before the teleport.
             aobs.reset()
             want_respawn = False
-        var key = env.renderer_take_key()
-        if key == Int(Keycode.SDLK_W):
-            cx += 0.25
-            dirty = True
-        elif key == Int(Keycode.SDLK_X):
-            cx -= 0.25
-            dirty = True
-        elif key == Int(Keycode.SDLK_Q):
-            cy += 0.25
-            dirty = True
-        elif key == Int(Keycode.SDLK_E):
-            cy -= 0.25
-            dirty = True
-        elif key == Int(Keycode.SDLK_A):
-            cw += 0.40
-            dirty = True
-        elif key == Int(Keycode.SDLK_D):
-            cw -= 0.40
-            dirty = True
-        elif key == Int(Keycode.SDLK_Z):
+
+        # ── held keys -> a ramped command ─────────────────────────────
+        var up = kb[Int(Scancode.SCANCODE_UP)] or kb[Int(Scancode.SCANCODE_W)]
+        var dn = kb[Int(Scancode.SCANCODE_DOWN)] or kb[Int(Scancode.SCANCODE_S)]
+        var lf = kb[Int(Scancode.SCANCODE_LEFT)] or kb[Int(Scancode.SCANCODE_Q)]
+        var rt = kb[Int(Scancode.SCANCODE_RIGHT)] or kb[Int(Scancode.SCANCODE_E)]
+        var sl = kb[Int(Scancode.SCANCODE_A)]
+        var sr = kb[Int(Scancode.SCANCODE_D)]
+        # ⚠ NOT space. `check_quit` claims space for its pause toggle, and
+        # although scancode polling still SEES it, the renderer would pause
+        # on the same press — one key doing two things, one of them
+        # invisible. X is unclaimed.
+        var halt = kb[Int(Scancode.SCANCODE_X)]
+
+        # A stick, not a stepper: hold to lean, release and it centres. The
+        # decay is what makes "let go" mean "stop" without a keypress.
+        if up:
+            cx += RAMP_V
+        elif dn:
+            cx -= RAMP_V
+        else:
+            cx = _decay(cx, DECAY_V)
+        if sl:
+            cy += RAMP_V
+        elif sr:
+            cy -= RAMP_V
+        else:
+            cy = _decay(cy, DECAY_V)
+        if lf:
+            cw += RAMP_W
+        elif rt:
+            cw -= RAMP_W
+        else:
+            cw = _decay(cw, DECAY_W)
+        if halt:
             cx = 0.0
             cy = 0.0
             cw = 0.0
-            dirty = True
-        elif key == Int(Keycode.SDLK_G):
+
+        var key = env.renderer_take_key()
+        if key == Int(Keycode.SDLK_G):
             want_respawn = True
-        if cx > 1.5:
-            cx = 1.5
-        if cx < -1.0:
-            cx = -1.0
-        if cy > 1.0:
-            cy = 1.0
-        if cy < -1.0:
-            cy = -1.0
-        if cw > 1.6:
-            cw = 1.6
-        if cw < -1.6:
-            cw = -1.6
+
+        cx = _clamp(cx, -MAX_BACK, MAX_FWD)
+        cy = _clamp(cy, -MAX_LAT, MAX_LAT)
+        cw = _clamp(cw, -MAX_YAW, MAX_YAW)
 
         # ── the whole point: a new objective, and its policy ───────────
-        if dirty:
+        # Rebuild only on a MATERIAL change. The matvec is cheap enough to run
+        # every frame, but rebuilding on float noise would make the printed
+        # command log unreadable.
+        if (
+            abs(cx - zx) > 1e-3 or abs(cy - zy) > 1e-3 or abs(cw - zw) > 1e-3
+        ):
             for i in range(POOL):
                 var dx = pvx[i] - cx
                 var dy = pvy[i] - cy
                 var dw = pwz[i] - cw
-                var rv = exp(-(dx * dx + dy * dy) / (SIGMA_V * SIGMA_V))
-                var rw = exp(-(dw * dw) / (SIGMA_W * SIGMA_W))
-                rewards[i] = Scalar[DT](rv * rw)
+                rewards[i] = Scalar[DT](
+                    exp(-(dx * dx + dy * dy) / (SIGMA_V * SIGMA_V))
+                    * exp(-(dw * dw) / (SIGMA_W * SIGMA_W))
+                )
             var zl = z_from_reward[D](b_list, rewards, POOL)
             for k in range(D):
                 z1.data[k] = zl[k]
-            # `z_from_reward` already projects; this is belt-and-braces for the
-            # ONE invariant §11 ranks first among the silent failures.
+            # `z_from_reward` already projects; belt-and-braces on the ONE
+            # invariant §11 ranks first among the silent failures.
             g1_project_z[D](z1, 0)
-            print("  cmd  vx", cx, " vy", cy, " wz", cw)
-            var hud = List[String]()
-            hud.append(
-                String("cmd vx ") + String(cx) + String("  vy ") + String(cy)
-                + String("  wz ") + String(cw)
-            )
-            hud.append(String("W/X fwd  Q/E strafe  A/D turn  Z halt  G reset"))
-            env.set_hud_extra(hud)
-            dirty = False
+            if (
+                abs(cx - zx) > 0.08 or abs(cy - zy) > 0.08
+                or abs(cw - zw) > 0.12
+            ):
+                log.append(
+                    String("set_velocity  vx ") + _f2(cx)
+                    + String(" · vy ") + _f2(cy)
+                    + String(" · vyaw ") + _f2(cw)
+                )
+                if len(log) > LOG_ROWS:
+                    var trimmed = List[String]()
+                    for i in range(len(log) - LOG_ROWS, len(log)):
+                        trimmed.append(log[i])
+                    log = trimmed^
+            zx = cx
+            zy = cy
+            zw = cw
 
+        # ── act ───────────────────────────────────────────────────────
         var o = env.get_obs_list()
         aobs.fill[OBS=OBS](o, obs_t)
         if norm:
@@ -357,18 +541,88 @@ def main() raises:
         t.act[1](obs_t, z1, act_out)
         var a = ContAction[ACT]()
         for k in range(ACT):
-            var v = Float64(act_out.data[k])
-            if v > 1.0:
-                v = 1.0
-            elif v < -1.0:
-                v = -1.0
-            a.data[k] = v
+            a.data[k] = _clamp(Float64(act_out.data[k]), -1.0, 1.0)
         aobs.push(o, act_out)
         _ = env.step(a)
+
+        # what the robot is ACTUALLY doing, in the same heading frame the
+        # command is written in — so the pad's two dots can be compared
+        var mvx = Float64(o[OFF_VX + 0])
+        var mvy = Float64(o[OFF_VX + 1])
+        var mwz = Float64(o[OFF_WZ])
+
+        # ── the UI ────────────────────────────────────────────────────
+        var win_h = env.renderer_height()
+        var ui = UI(
+            env.renderer_mouse_x(), env.renderer_mouse_y(),
+            env.renderer_take_click(),
+        )
+
+        # left sidebar — the menu
+        ui.panel(0, 0, Float32(SIDEBAR_W), Float32(win_h))
+        ui.label(12, 10, String("BFM-ZERO  ·  REWARD JOYSTICK"), UI_HEAD, 1)
+        ui.label(12, 26, String("z = E[B(s)·r(s)]  — no training"), UI_DIM, 1)
+        ui.label(12, 52, String("COMMAND"), UI_DIM, 1)
+        ui.label(12, 68, String("vx    ") + _f2(cx) + String(" m/s"), UI_TXT, 1)
+        ui.label(12, 82, String("vy    ") + _f2(cy) + String(" m/s"), UI_TXT, 1)
+        ui.label(12, 96, String("vyaw  ") + _f2(cw) + String(" rad/s"), UI_TXT, 1)
+        ui.label(12, 120, String("MEASURED"), UI_DIM, 1)
+        ui.label(12, 136, String("vx    ") + _f2(mvx), UI_TXT, 1)
+        ui.label(12, 150, String("vy    ") + _f2(mvy), UI_TXT, 1)
+        ui.label(12, 164, String("vyaw  ") + _f2(mwz), UI_TXT, 1)
+
+        var by = Float32(194)
+        if ui.button(12, by, 96, 22, String("stand"), abs(cx) + abs(cy) + abs(cw) < 1e-3, 1):
+            cx = 0.0
+            cy = 0.0
+            cw = 0.0
+        if ui.button(114, by, 96, 22, String("walk"), False, 1):
+            cx = 0.8
+            cy = 0.0
+            cw = 0.0
+        if ui.button(12, by + 26, 96, 22, String("back"), False, 1):
+            cx = -0.5
+            cy = 0.0
+            cw = 0.0
+        if ui.button(114, by + 26, 96, 22, String("spin"), False, 1):
+            cx = 0.0
+            cy = 0.0
+            cw = 1.2
+        if ui.button(12, by + 56, 198, 22, String("respawn  (G)"), False, 1):
+            want_respawn = True
+
+        ui.label(12, by + 92, String("COMMAND LOG"), UI_DIM, 1)
+        for i in range(len(log)):
+            ui.label(12, by + 108 + Float32(i) * 12, log[i], UI_LOG, 1)
+
+        ui.label(12, Float32(win_h) - 34, String("steps ") + String(steps), UI_DIM, 1)
+        ui.label(12, Float32(win_h) - 20, String("pool ") + String(POOL)
+                 + String("  ·  d ") + String(D), UI_DIM, 1)
+
+        # bottom-left drive pad
+        var pad = _drive_pad(
+            ui, Float32(SIDEBAR_W) + 18, Float32(win_h) - PAD_H - 18,
+            cx, cy, cw, up, dn, lf, rt, sl, sr,
+        )
+        cx += pad[0]
+        cy += pad[1]
+        cw += pad[2]
+        # the pad's buttons are hit-tested inside `_drive_pad`; its Stop is the
+        # only one that writes back, and it does it through this flag because a
+        # widget cannot reach `cx` from in there.
+        if ui.button(
+            Float32(SIDEBAR_W) + 18, Float32(win_h) - 34, 118, 24,
+            String("■ STOP  (X)"), halt, 1,
+        ):
+            cx = 0.0
+            cy = 0.0
+            cw = 0.0
+
+        env.set_ui(ui.rects, ui.texts)
         env.render_frame()
         env.renderer_delay(delay_ms)
         steps += 1
 
     env.close()
     print("-" * 70)
-    print("  ", steps, "control steps driven by", steps, "rewards you wrote")
+    print("  ", steps, "control steps, each one driven by a reward you wrote")

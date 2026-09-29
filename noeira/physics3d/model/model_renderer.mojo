@@ -1099,6 +1099,13 @@ struct ModelRenderer[MODEL_DEF: ModelDefLike](EnvRenderer3D, Movable):
     def paused(self) -> Bool:
         return self.renderer.paused()
 
+    def win_width(self) -> Int:
+        """The swapchain width in pixels; a window resize updates it."""
+        return self.renderer.width
+
+    def win_height(self) -> Int:
+        return self.renderer.height
+
     def toggle_pause(mut self):
         self.renderer.toggle_pause()
 
