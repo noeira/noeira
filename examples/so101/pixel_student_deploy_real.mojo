@@ -27,6 +27,10 @@ cameras), --arm, --seconds (20), --no-return, --no-start-pose, --snap DIR,
 --gripper-sign 0|1 (default: the manifest's), --step-ticks (80), --force-dark,
 --record DIR (per-tick CSV of q, qd, action, target + the two frames every
 16 ticks — what a run did, to lay beside `pixel_student_probe_sim.mojo`),
+--grip-offset X (rad, default 0: added to the GRIPPER angle the policy SEES,
+not to the one the commands use — the real jaws read ~0.05 rad more closed
+on the 25 mm cube than the sim's, 0.063 vs 0.10-0.14, and a student never
+trained on that reading hovered over the bowl without releasing),
 --sysid FILE (with --arm: NO policy — each joint in turn steps +A, back, -A,
 back from the sim's start pose, 0.8 s per step, A 0.1 rad / 0.3 gripper; the
 per-tick targets and joints go to FILE, the servos' delay and time constant
@@ -279,6 +283,7 @@ def main() raises:
     var force_dark = _flag(args, "--force-dark")
     var rec_dir = _arg(args, "--record", "")
     var sysid = _arg(args, "--sysid", "")
+    var grip_off = Float64(_arg(args, "--grip-offset", "0"))
 
     print("=" * 74)
     print("PIXEL STUDENT on the physical SO-101 — sim-to-real")
@@ -437,7 +442,11 @@ def main() raises:
 
     # one dry forward on the real observation, printed (the arm at rest:
     # velocities zero)
-    joints_to_planes(q, xs)
+    if grip_off != 0.0:
+        print("  --grip-offset", grip_off, "rad on the gripper angle the policy sees")
+    var q_pol = q.copy()
+    q_pol[SO101_N - 1] += grip_off
+    joints_to_planes(q_pol, xs)
     var qd = List[Float64](length=SO101_N, fill=0.0)
     joint_vels_to_planes(qd, xs)
     # the last executed actions (TASK_PPO_ACT_HIST builds): none yet
@@ -632,7 +641,10 @@ def main() raises:
                 qd[i] = (q[i] - q_prev[i]) / dt_s if dt_s > 1e-4 else 0.0
                 q_prev[i] = q[i]
             t_prev = t_now
-            joints_to_planes(q, xs)
+            for i in range(SO101_N):
+                q_pol[i] = q[i]
+            q_pol[SO101_N - 1] += grip_off
+            joints_to_planes(q_pol, xs)
             joint_vels_to_planes(qd, xs)
             act_hist_to_planes(hist, xs)
             if snap_dir.byte_length() > 0 and ticks == 62:

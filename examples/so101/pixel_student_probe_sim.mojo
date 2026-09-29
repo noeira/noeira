@@ -91,6 +91,9 @@ def main() raises:
         man_path = ckpt[byte = 0 : ckpt.rfind("/")] + "/norm.json"
     var man = check_pixel_manifest(man_path)
     var lag_tau_s = _arg(args, "--lag-tau", "")
+    # added to the GRIPPER angle the student sees (the deploy's --grip-offset):
+    # -0.05 plays the real jaws, which read ~0.05 rad more closed on the cube
+    var grip_off = Float64(_arg(args, "--grip-offset", "0"))
     # overrides of the manifest's action scales — for what-ifs only
     var da_o = _arg(args, "--delta-arm", "")
     var dg_o = _arg(args, "--delta-gripper", "")
@@ -235,7 +238,9 @@ def main() raises:
                             ld_ += " " + fixed(Float64(env.d.qpos.data[k]), 3)
                         print(lo_)
                         print(ld_)
-                joints_to_planes(q, xs)
+                var q_pol = q.copy()
+                q_pol[ACT - 1] += grip_off
+                joints_to_planes(q_pol, xs)
                 joint_vels_to_planes(qd, xs)
                 act_hist_to_planes(hist, xs)
                 for k in range(IN_DIM):
