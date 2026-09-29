@@ -353,6 +353,9 @@ def _bc_pretrain[OBS: Int](
     mut obs_rms: RunningMeanStd,
     updates: Int,
     lr: Float64,
+    d_arm: Float64 = DELTA_ARM,
+    d_grip: Float64 = DELTA_GRIPPER,
+    repeat: Int = 1,
 ) raises:
     """Behaviour-clone the actor's MEAN on the SUCCESSFUL episodes of the
     scripted teacher's `.demo` files — so101-nexus's fix for pick-and-place
@@ -364,42 +367,64 @@ def _bc_pretrain[OBS: Int](
     joints, `(target - q) / scale`, clipped to [-1, 1] (the teacher's `act`
     is the family's normalised absolute target); in `absolute` mode they are
     `act` itself. MSE on the mean only; the log-std is the caller's to set.
+
+    On the run's cadence and inputs: every `repeat`-th demo row (the demos
+    are recorded per tick), labels at the run's scales (`d_arm` / `d_grip`),
+    and with `TASK_PPO_ACT_HIST` the history words rebuilt from the episode's
+    own earlier labels (zero at its start) — the demos hold the env's
+    observation only.
     """
     comptime MB = MINIBATCH
     comptime A2 = 2 * ACT_DIM
+    comptime W = ACT_HIST * ACT_DIM
+    comptime E = OBS - W
     var X = List[Scalar[DT]]()
     var Y = List[Scalar[DT]]()
     var n_rows = 0
     var n_eps = 0
     for path in demo_paths.split(","):
         var d = read_demo_file(String(path))
-        if d.obs_dim != OBS or d.act_dim != ACT_DIM:
+        if d.obs_dim != E or d.act_dim != ACT_DIM:
             raise Error(
                 "ppo bc: " + String(path) + " has obs " + String(d.obs_dim)
-                + " / act " + String(d.act_dim) + ", the env " + String(OBS)
+                + " / act " + String(d.act_dim) + ", the env " + String(E)
                 + " / " + String(ACT_DIM)
             )
         for ep in range(d.n_episodes()):
             if not d.ep_success[ep]:
                 continue
             n_eps += 1
-            for r in range(d.ep_start[ep], d.ep_start[ep] + d.ep_len[ep]):
-                for k in range(OBS):
-                    X.append(Scalar[DT](d.obs[r * OBS + k]))
+            var hist = List[Float64](length=W, fill=0.0)
+            var r = d.ep_start[ep]
+            while r < d.ep_start[ep] + d.ep_len[ep]:
+                for k in range(E):
+                    X.append(Scalar[DT](d.obs[r * E + k]))
+                for k in range(W):
+                    X.append(Scalar[DT](hist[k]))
+                var lab = List[Float64](length=ACT_DIM, fill=0.0)
                 for j in range(ACT_DIM):
                     var a = Float64(d.act[r * ACT_DIM + j])
                     if action_mode == "delta":
                         var mid = 0.5 * (a_lo[j] + a_hi[j])
                         var half = 0.5 * (a_hi[j] - a_lo[j])
                         var tgt = mid + a * half
-                        var q = Float64(d.obs[r * OBS + a_qa[j]])
-                        a = (tgt - q) / delta_scale(j)
+                        var q = Float64(d.obs[r * E + a_qa[j]])
+                        a = (tgt - q) / delta_scale(j, d_arm, d_grip)
                     if a > 1.0:
                         a = 1.0
                     elif a < -1.0:
                         a = -1.0
+                    lab[j] = a
                     Y.append(Scalar[DT](a))
+                # the history the policy would have: this label, then the
+                # earlier ones
+                for k in range(W - 1, ACT_DIM - 1, -1):
+                    hist[k] = hist[k - ACT_DIM]
+                comptime if W > 0:
+                    for j in range(ACT_DIM):
+                        hist[j] = lab[j]
                 n_rows += 1
+                r += repeat
     if n_rows < MB:
         raise Error("ppo bc: only " + String(n_rows) + " demo rows")
     print("  bc: ", n_eps, "successful episodes,", n_rows, "rows from",
@@ -541,8 +566,6 @@ def run_ppo[M: ModelDefLike, C: Phyics3dEnvConfig](
     var repeat = max(Int(_arg(args, "--repeat", "1")), 1)
     if action_mode != "absolute" and action_mode != "delta":
         raise Error("ppo task: --action absolute|delta, got " + action_mode)
-    if ACT_HIST > 0 and bc_demos.byte_length() > 0:
-        raise Error("ppo task: --bc-demos has no action history; not with TASK_PPO_ACT_HIST")
     if C.MAX_STEPS % repeat != 0:
         raise Error("ppo task: --repeat " + String(repeat) + " must divide the horizon "
                     + String(C.MAX_STEPS) + " (episodes end on a policy step)")
@@ -725,7 +748,7 @@ def run_ppo[M: ModelDefLike, C: Phyics3dEnvConfig](
         if bc_demos.byte_length() > 0:
             _bc_pretrain[OBS](
                 agent, ctx, bc_demos, action_mode, a_qa, a_lo, a_hi, obs_rms,
-                bc_updates, bc_lr,
+                bc_updates, bc_lr, d_arm, d_grip, repeat,
             )
             agent.trainer.actor_opt.set_lr(Scalar[DT](lr0))
             agent.trainer.actor.children[4].set_log_std_init["gpu"](
