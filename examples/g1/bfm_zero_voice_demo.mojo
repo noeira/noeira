@@ -140,8 +140,13 @@ comptime DRAIN_S: Float64 = 0.35
 # crosses it a dozen times a second between syllables and each crossing would
 # open or close a segment. Opening is harder than staying open, and a segment
 # ends only after HANG_S of quiet.
-comptime VAD_OPEN_MULT: Float64 = 8.0
-comptime VAD_CLOSE_MULT: Float64 = 3.5
+# ⚠ MEASURED AGAINST A REAL ROOM, NOT A QUIET ONE. A silent room gave a floor
+# of 0.0004 against speech peaks of 0.024-0.037 — 60-90x, which made almost
+# any multiplier look right. A working session gave ambient peaks of 0.0070
+# against the same speech: a ratio of 4-8. These numbers fit the second case,
+# because that is the one a demo happens in.
+comptime VAD_OPEN_MULT: Float64 = 5.0
+comptime VAD_CLOSE_MULT: Float64 = 2.5
 comptime VAD_OPEN_MIN: Float64 = 0.0020
 comptime VAD_FLOOR_MIN: Float64 = 0.00005
 
@@ -176,6 +181,21 @@ def _f4(v: Float64) -> String:
         f = String("0") + f
     var b = String(h // 10000) + String(".") + f
     return (String("-") + b) if neg else b
+
+
+def _speak_seconds(text: String) -> Float64:
+    """How long `say` will be talking, roughly.
+
+    ⚠ THIS EXISTS BECAUSE THE ROBOT HEARS ITSELF. With an open mic, a spoken
+    confirmation is picked up, transcribed and decided on: a real log came
+    back with "Note adressée to the robot", "No such command", "Left hand
+    up" and "Boost and Zub" — the demo talking to itself, and about half the
+    utterances in the session were its own voice. `say` gives no completion
+    handle, so the gate is an estimate: macOS's default rate is about 175
+    words a minute, near 14 characters a second, plus a margin for the
+    start-up delay and the tail of the last word.
+    """
+    return Float64(text.byte_length()) / 14.0 + 0.6
 
 
 def _say_async(text: String) raises:
@@ -341,6 +361,8 @@ def main() raises:
     var quiet_since = perf_counter_ns()
     var prev_m = False
     var forced = False
+    # ⚠ while this is in the future, the microphone is the robot's own voice
+    var mute_until = perf_counter_ns()
 
     var state = ST_IDLE
     var heard = String("")
@@ -390,10 +412,16 @@ def main() raises:
         # has exited, carrying ffmpeg's own reason — which is the difference
         # between "grant Terminal microphone access" and "the device went
         # away", and it is why this no longer guesses.
+        # ⚠ still READ while the robot speaks — the pipe is 64 KiB, about 2 s,
+        # and past that ffmpeg blocks and the device drops audio. The samples
+        # are read and DISCARDED, never ringed, never levelled.
+        var echoing = perf_counter_ns() < mute_until
         if mic_on and mic_dead == "":
             try:
                 var pcm = mic.read()
-                if len(pcm) > 0:
+                if echoing:
+                    level = 0.0
+                elif len(pcm) > 0:
                     level = rms(pcm)
                     if level > peak:
                         peak = level
@@ -408,15 +436,20 @@ def main() raises:
                             for i in range(len(ring) - ring_max, len(ring)):
                                 keep.append(ring[i])
                             ring = keep^
-                        # ⚠ TRACK THE FLOOR ONLY WHILE NOT IN A SEGMENT, or
-                        # speech raises the floor it is measured against and
-                        # the detector deafens itself mid-sentence. Fast
-                        # down, slow up: a quieter room is believed at once,
-                        # a louder one only gradually.
-                        if level < floor:
-                            floor = level
-                        else:
-                            floor = floor * 1.0005
+                        # ⚠ THE FLOOR IS TYPICAL QUIET, NOT THE QUIETEST
+                        # INSTANT. Tracking the minimum put `close_at` BELOW
+                        # ordinary room noise, so a segment that opened never
+                        # closed: a real session recorded 5.99 s for "you"
+                        # and 7.06 s for "Cool. Run.", ending on the
+                        # max-segment guard rather than on silence. An
+                        # average over quiet frames sits where the room
+                        # actually is.
+                        #
+                        # Only frames BELOW the open threshold count, or
+                        # speech would raise the floor it is measured against
+                        # and the detector would deafen itself mid-sentence.
+                        if level < floor * VAD_OPEN_MULT:
+                            floor = floor * 0.98 + level * 0.02
                         if floor < VAD_FLOOR_MIN:
                             floor = VAD_FLOOR_MIN
                 if not checked_silence and mic.seconds_read() > 1.0:
@@ -426,8 +459,11 @@ def main() raises:
                                           "disabled, or permission refused")
                         print("  [mic]", mic_dead)
                     else:
+                        # ⚠ this used to say "noise floor" and print the
+                        # PEAK — two different numbers, and the one it
+                        # printed was the loudest thing in the first second.
                         print("  [mic] input live —", _f2(mic.seconds_read()),
-                              "s read, noise floor", _f4(peak))
+                              "s read, floor", _f4(floor), "peak", _f4(peak))
             except e:
                 mic_dead = String(e)
                 print("  [mic]", mic_dead)
@@ -443,7 +479,8 @@ def main() raises:
         # one. The 1.2 s guard keeps the floor estimate from opening a
         # segment on its own first samples.
         if (mic_on and mic_dead == "" and state == ST_IDLE and vad
-            and level > open_at and mic.seconds_read() > 1.2):
+            and not echoing and level > open_at
+            and mic.seconds_read() > 1.2):
             heard = String("")
             pick = G1LangPick()
             seg = ring.copy()
@@ -513,17 +550,22 @@ def main() raises:
                             # ⚠ SAY THE PART IT CANNOT DO. A robot that
                             # silently performs 30 % of an instruction is
                             # worse than one that performs 30 % and says so.
+                            var utter = pick.name
                             if pick.needs_world > 0.5:
-                                _say_async(pick.name
-                                    + String(", but I have no object or destination"))
-                            else:
-                                _say_async(pick.name)
+                                utter = pick.name + String(
+                                    ", but I have no object or destination")
+                            _say_async(utter)
+                            mute_until = perf_counter_ns() + Int(
+                                _speak_seconds(utter) * 1e9)
                 else:
                     last_event = String("refused: ") + pick.reason
                     print("  [refused]", pick.reason, " P(none)",
                           _f2(pick.p_none), " addressed", _f2(pick.addressed))
-                    if not mute:
-                        _say_async(pick.reason)
+                    # ⚠ A SPOKEN REFUSAL IS THE WORST THING TO SAY ALOUD.
+                    # "no such command" is heard, transcribed, and refused
+                    # again — the loop that filled a whole session's log. The
+                    # HUD already says it; saying it too buys nothing and
+                    # costs a Whisper call every time.
                 state = ST_IDLE
 
         # ── keys ──────────────────────────────────────────────────────
