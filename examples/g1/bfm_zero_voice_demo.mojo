@@ -265,6 +265,16 @@ def _say_async(text: String):
     would be a window between the spawn and the flag appearing in which the
     gate is open and the microphone is already live.
     """
+    # ⚠ NEVER START A SECOND UTTERANCE WHILE ONE IS RUNNING. The flag is a
+    # single shared file: two overlapping `say` shells both remove it, and
+    # the FIRST to finish opens the gate while the SECOND is still speaking.
+    # That is how "je tourne à gauche" — the robot's own phrase for
+    # `spin_left` — came back through Whisper and picked `spin_left` again,
+    # after a chained step spoke while the previous confirmation was still
+    # going. The confirmation is cosmetic and the HUD already shows it, so
+    # the later one is simply dropped.
+    if _speaking():
+        return
     try:
         write_text_atomic(String(SPEAK_TEXT), text)
         _ = run_system("touch " + quote_arg(String(SPEAK_FLAG)))
@@ -428,6 +438,19 @@ def main() raises:
     if lang != "":
         stt.language = lang
         print("  whisper language pinned to", lang)
+    # ⚠ BIAS THE DECODER TOWARD THE WORDS THIS ROBOT ANSWERS TO. "cours" came
+    # back as "cool" twice in a row — a homophone Whisper has no reason to
+    # resolve one way without context. The prompt is a hint, not a grammar,
+    # so anything may still come back; it only tilts the odds among
+    # candidates that sound alike.
+    var vocab = _flag(String("--vocab"), String(
+        "marche, cours, recule, tourne à gauche, tourne à droite,"
+        " accroupis-toi, lève le bras droit, lève le bras gauche,"
+        " lève les deux bras, écarte les bras, regarde à gauche,"
+        " regarde à droite, arrête-toi, baisse les bras"
+    ))
+    if vocab != "":
+        stt.prompt = vocab
     jev.warm_up()
     stt.warm_up()
     # ⚠ `talk` needs a client warmed BEFORE the loop like the others, or its
@@ -612,7 +635,15 @@ def main() raises:
         var open_at = floor * VAD_OPEN_MULT
         if open_at < VAD_OPEN_MIN:
             open_at = VAD_OPEN_MIN
+        # ⚠ AND THE CLOSE THRESHOLD NEEDS A FLOOR OF ITS OWN. It was
+        # `floor * 2.5`, and the floor is an average over QUIET frames, so in
+        # a room whose between-word noise sits above that a segment opens and
+        # never closes: one ran the full 10 s max-segment guard for a 3 s
+        # question. Tying it to the opening threshold keeps the two in
+        # proportion whatever the room is doing.
         var close_at = floor * VAD_CLOSE_MULT
+        if close_at < VAD_OPEN_MIN * 0.5:
+            close_at = VAD_OPEN_MIN * 0.5
 
         # ⚠ VAD OPENS ONLY FROM IDLE. While a transcription or a decision is
         # in flight, speech is still ringed but starts nothing — one call per

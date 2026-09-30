@@ -54,6 +54,13 @@ struct SpeechToText(Movable):
     var language: String
     """ISO-639-1 hint ("en", "fr"); "" lets the model detect it. A hint
     avoids a wrong-language transcript of a two-word command."""
+    var prompt: String
+    """Text that biases the decoder's vocabulary — Whisper's own
+    `prompt` field. Give it the words you expect and it will prefer them
+    among homophones: a French speaker saying "cours" was transcribed
+    "cool" twice in a row, and listing the command vocabulary is what
+    separates them. It is a hint, not a grammar: anything may still come
+    back."""
     var retries: Int
     var _http: HttpClient
     var _call: ApiCall
@@ -65,6 +72,7 @@ struct SpeechToText(Movable):
         self.url = url^
         self.model = model^
         self.language = String("")
+        self.prompt = String("")
         self.retries = 2
         self._http = HttpClient(120000, 10000)
         self._call = ApiCall()
@@ -76,6 +84,7 @@ struct SpeechToText(Movable):
         self.url = move.url^
         self.model = move.model^
         self.language = move.language^
+        self.prompt = move.prompt^
         self.retries = move.retries
         self._http = move._http^
         self._call = move._call^
@@ -130,6 +139,8 @@ struct SpeechToText(Movable):
         form.field("response_format", "json")
         if self.language.byte_length() > 0:
             form.field("language", self.language)
+        if self.prompt.byte_length() > 0:
+            form.field("prompt", self.prompt)
         form.file("file", "audio.wav", "audio/wav", wav)
         var body = form.finish()
         self._call.begin(
