@@ -6,6 +6,7 @@
     pixi run mojo run -I . examples/ai/tool_agent.mojo                # Claude
     pixi run mojo run -I . examples/ai/tool_agent.mojo hf             # Qwen3.5 on HF
     pixi run mojo run -I . examples/ai/tool_agent.mojo ollama:qwen3:8b
+    pixi run mojo run -I . examples/ai/tool_agent.mojo hf --stream  # text live, tools reassembled
 
 The "robot" is a dictionary of object positions. Replace the three skill
 functions with the real ones (an ACT policy rollout, an IK move, the SO-101
@@ -20,7 +21,7 @@ supports.
 
 from std.sys import argv
 
-from noeira.ai.chat import ChatClient, Conversation, ToolCall
+from noeira.ai.chat import ChatClient, ChatResponse, Conversation, ToolCall
 
 
 struct Table(Movable):
@@ -85,6 +86,7 @@ struct Table(Movable):
 def main() raises:
     var args = argv()
     var spec = String(args[1]) if len(args) > 1 else String("anthropic")
+    var stream = len(args) > 2 and String(args[2]) == "--stream"
     var llm = ChatClient.from_spec(spec)
     if spec.startswith("hf"):
         llm.extra("chat_template_kwargs", '{"enable_thinking": false}')
@@ -107,9 +109,26 @@ def main() raises:
 
     var table = Table()
     for step in range(12):
-        var r = conv.send(llm)
-        if r.text.byte_length() > 0:
-            print("[model]", r.text)
+        var r: ChatResponse
+        if stream:
+            # Text prints as it arrives; tool calls stream as JSON fragments
+            # and come out of `finish` whole, exactly as `send` returns them.
+            conv.start(llm)
+            var said = False
+            while not llm.done():
+                var d = llm.poll(50)
+                if d.byte_length() > 0:
+                    if not said:
+                        print("[model] ", end="")
+                        said = True
+                    print(d, end="", flush=True)
+            if said:
+                print()
+            r = conv.finish(llm)
+        else:
+            r = conv.send(llm)
+            if r.text.byte_length() > 0:
+                print("[model]", r.text)
         if not r.wants_tools():
             print("-- finished after", step + 1, "turns (", r.stop_reason, ")")
             break
