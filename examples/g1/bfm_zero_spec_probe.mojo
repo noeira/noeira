@@ -209,6 +209,9 @@ def main() raises:
     # numbers — see the note at the resolver.
     var low_p = Float64(String(_flag(String("--low-pct"), String("0.10"))))
     var sup_p = Float64(String(_flag(String("--sup-pct"), String("0.50"))))
+    # what "a moderate amount" and "as far as it can" resolve to
+    var mag_base = Float64(String(_flag(String("--mag-base"), String("0.88"))))
+    var mag_ext = Float64(String(_flag(String("--mag-ext"), String("0.95"))))
     var mid_lo = Float64(String(_flag(String("--mid-lo"), String("0.40"))))
     var mid_hi = Float64(String(_flag(String("--mid-hi"), String("0.60"))))
     if ckpt == "":
@@ -489,6 +492,14 @@ def main() raises:
         _ask_leg(
             ask_path, bank, qv, b_list, n_pool, cols, z_ref, high_p, low_p,
             mid_lo, mid_hi, sup_p, _has(String("--warn")),
+            # ⚠ OPT-IN, BECAUSE IT WAS MEASURED AND IT DOES NOT PAY (§12.59).
+            # The `score` magnitude neither separated `walk` from `run` — the
+            # model returns 1.0 for BOTH "marche" and "cours" — nor improved
+            # retrieval (13-14 of 16 either way, inside run-to-run noise),
+            # and it costs +345 input tokens per instruction. With a loose
+            # base it actively hurts, 11 of 16, by overriding thresholds the
+            # two-level ladder had right.
+            _has(String("--magnitude")), mag_base, mag_ext, high_p,
         )
 
     print()
@@ -703,6 +714,23 @@ def _truth_dir(op: Int, lo: Float64, hi: Float64, med: Float64) -> Int:
     return LVL_NONE
 
 
+def _pct_for(m: Float64, hi: Bool, base: Float64, ext: Float64) -> Float64:
+    """A magnitude score (0..3, fractional) -> the percentile to threshold at.
+
+    `base` is what a "moderate" instruction means and `ext` what an emphatic
+    one does; the score interpolates between them, which is why a `score`
+    rather than a `choice` is what breaks the magnitude ceiling.
+    """
+    var t = m / 3.0
+    if t < 0.0:
+        t = 0.0
+    if t > 1.0:
+        t = 1.0
+    if hi:
+        return base + (ext - base) * t
+    return (1.0 - base) + ((1.0 - ext) - (1.0 - base)) * t
+
+
 def _snap(
     ref cols: List[Float64], q: Int, n_pool: Int, x: Float64, step: Float64
 ) raises -> Float64:
@@ -745,6 +773,10 @@ def _ask_leg(
     mid_hi: Float64,
     sup_p: Float64,
     warn: Bool,
+    mag: Bool,
+    mag_base: Float64,
+    mag_ext: Float64,
+    qh_p: Float64,
 ) raises:
     """Ask a model for the reward, score it two ways.
 
@@ -795,6 +827,11 @@ def _ask_leg(
           + " | suppression low p" + _f2(sup_p))
     print("  arm:", String("B — told that an unconstrained DoF returns the"
           " dataset average") if warn else String("A — no hint"))
+    if mag:
+        print("  magnitude: `score` over 4 rungs, moderate -> p"
+              + _f2(mag_base) + ", extreme -> p" + _f2(mag_ext))
+    else:
+        print("  magnitude: OFF — the two-level ladder of §12.58")
 
     # ── the questions: one category + one level per quantity ──────────
     var cats = List[String]()
@@ -839,6 +876,16 @@ def _ask_leg(
         qdescs.append(_dir_desc(v, False))
     qnames.append(String("none"))
     qdescs.append(String("no further quantity is constrained"))
+
+    # ⚠ FOUR RUNGS, WORDED AS DEGREES AND NOT AS NUMBERS. Jev's own docs
+    # list numeric comparison as a failure mode, so the rungs are words and
+    # the percentile they resolve to is ours — the same rule that made
+    # `doing_since` a word in §12.56.
+    var mlvls = List[String]()
+    mlvls.append(String("only slightly — barely more than the robot's usual"))
+    mlvls.append(String("a moderate amount — a normal, unremarkable version"))
+    mlvls.append(String("a lot — clearly more than usual"))
+    mlvls.append(String("as far as the robot physically can"))
 
     var jev = JevClient.from_env()
     var rew = List[Scalar[DT]](length=n_pool, fill=Scalar[DT](0))
@@ -908,6 +955,31 @@ def _ask_leg(
                 ),
                 qnames, qdescs,
             )
+            # ⚠ A `score`, NOT A `choice`, AND THAT IS THE WHOLE POINT.
+            # §12.58's ceiling was 18/20 because a two-level ladder cannot
+            # separate commands differing only in MAGNITUDE on one quantity:
+            # `walk` [0.5, 1.4] and `run` [1.5, 3.0] are both "forward speed
+            # high", `squat` [0.40, 0.62] and `crouch` [0.62, 0.72] both
+            # "body height low". `score` takes ORDERED levels and returns the
+            # EXPECTED level as a float, so "quite fast" lands between two
+            # rungs instead of being forced onto one. The `extent` question
+            # already uses it for exactly this reason.
+            #
+            # ⚠ It re-derives which quantity it is talking about from the
+            # instruction, the same way `command2` re-derives the second
+            # step (§12.55). It cannot see its own answer to `q<s>`.
+            if mag:
+                q.score(
+                    String("m") + String(s),
+                    String(
+                        "Think about the " + ordinals[s] + " thing this"
+                        " instruction asks the robot for. HOW FAR in that"
+                        " direction should the robot go? Judge it from the"
+                        " words: a plain instruction is a moderate amount,"
+                        " and only an emphatic one is extreme."
+                    ),
+                    mlvls,
+                )
         var a = jev.decide_text(String("instruction: ") + insts[r], q)
         toks += a.input_tokens
 
@@ -929,6 +1001,7 @@ def _ask_leg(
 
         var m_q = List[Int]()
         var m_d = List[Int]()
+        var m_m = List[Float64]()
         for s in range(3):
             var pick = a.choice(String("q") + String(s))
             var vi = -1
@@ -952,6 +1025,7 @@ def _ask_leg(
                 continue
             m_q.append(vi)
             m_d.append(li)
+            m_m.append(a.score(String("m") + String(s)) if mag else -1.0)
             # ⚠ THE LADDER IS SLOT-DEPENDENT, AND THIS IS MEASURED, NOT
             # CHOSEN. `low` means two different things. As the FIRST thing
             # asked for it is a GOAL — "move backwards", "look right" — and
@@ -966,11 +1040,24 @@ def _ask_leg(
             # The bank had this right all along and it is visible in its own
             # terms: `right_hand_up` is `RHAND_H > p90` AND `LHAND_H < p50`.
             # A goal threshold and a suppression threshold, in one compound.
+            # the column, for a percentile the ladder chose at run time
+            for i2 in range(n_pool):
+                col[i2] = cols[vi * n_pool + i2]
             if li == LVL_HIGH:
-                ts.append(G1Term(vi, OP_GT, qh[vi], 0.0, False))
+                var p = qh_p if not mag else _pct_for(
+                    a.score(String("m") + String(s)), True, mag_base, mag_ext
+                )
+                ts.append(G1Term(vi, OP_GT, g1_quantile(col, p), 0.0, False))
             elif s == 0:
-                ts.append(G1Term(vi, OP_LT, 0.0, ql[vi], False))
+                var p = low_p if not mag else _pct_for(
+                    a.score(String("m") + String(s)), False, mag_base, mag_ext
+                )
+                ts.append(G1Term(vi, OP_LT, 0.0, g1_quantile(col, p), False))
             else:
+                # ⚠ SUPPRESSION IGNORES THE MAGNITUDE, and that is §12.58's
+                # measurement rather than a simplification: a later slot is
+                # almost always "the other hand stays down", and honouring
+                # an emphatic "as low as it can" there took ESS 233 -> 0.
                 ts.append(G1Term(vi, OP_LT, 0.0, qs[vi], False))
 
         var ess = _z_of(ts, qv, b_list, n_pool, rew, z_ask, 0)
@@ -1014,6 +1101,13 @@ def _ask_leg(
             if ts_m != "":
                 ts_m += String(",")
             ts_m += g1_vocab_name(m_q[j]) + String(":") + _lvl_name(m_d[j])
+            # ⚠ SHOW THE MAGNITUDE. A wrong retrieval with the right
+            # quantity is a LADDER failure and one with the wrong quantity
+            # is a SEMANTIC failure; without the score printed the two are
+            # indistinguishable, which is the defect shape this whole
+            # section keeps paying for.
+            if mag and m_m[j] >= 0.0:
+                ts_m += String("@") + _f1(m_m[j])
         if ts_m == "":
             ts_m = String("(nothing)")
         var mk = String("  ") if b1i == c else String(" X")
