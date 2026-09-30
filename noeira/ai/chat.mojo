@@ -52,8 +52,23 @@ string (`call.arguments_json`); `call.args()` parses it.
   model inside the same call. `stop_reason == "refusal"` means the whole
   chain declined. Set `client.fallbacks = False` to turn it off.
 
-Not here yet: streaming (SSE). Every call blocks until the answer is
-complete — see the package docstring.
+## Streaming and background calls
+
+`chat()` blocks. For a demo that must keep drawing, start the call and poll
+it once per frame — `poll` never blocks, and with `stream=True` it returns
+the text that arrived since the previous poll:
+
+    conv.start(llm)                        # returns at once
+    while not llm.done():
+        caption += llm.poll()              # "" when nothing new
+        draw_frame(caption)
+    var r = conv.finish(llm)               # same ChatResponse as send()
+
+⚠ A STREAMED CLAUDE TURN IS REASSEMBLED, NOT JUST CONCATENATED. The stream
+sends each content block as a start event plus deltas (text, thinking,
+signature, tool-input JSON fragments); `StreamState` rebuilds the exact
+blocks the non-streamed API returns, so the replay rule above holds for a
+streamed turn too.
 """
 
 from noeira.io.base64 import b64_encode
@@ -61,7 +76,10 @@ from noeira.io.http import HttpClient
 from noeira.io.json import J_STRING, JsonDoc, JsonWriter, dump_json, parse_json
 
 from noeira.ai.keys import api_key, find_api_key
-from noeira.ai.transport import post_json_api
+from noeira.ai.sse import SseEvent, SseParser
+from noeira.ai.transport import (
+    warm_up, ApiCall, CALL_DONE, CALL_FAILED, CALL_IDLE, post_json_api,
+)
 
 
 comptime PROVIDER_ANTHROPIC = 0
@@ -167,6 +185,9 @@ struct ChatResponse(Movable):
     var input_tokens: Int
     var output_tokens: Int
     var latency_ms: Float64
+    var first_token_ms: Float64
+    """Streamed calls: time to the first text delta — what a user perceives
+    as the response time. 0 when not streamed."""
     var message: ChatMessage
     """This turn as a message, ready to append to the history."""
 
@@ -178,6 +199,7 @@ struct ChatResponse(Movable):
         self.input_tokens = 0
         self.output_tokens = 0
         self.latency_ms = 0.0
+        self.first_token_ms = 0.0
         self.message = ChatMessage.assistant(String(""))
 
     def __init__(out self, *, deinit move: Self):
@@ -188,6 +210,7 @@ struct ChatResponse(Movable):
         self.input_tokens = move.input_tokens
         self.output_tokens = move.output_tokens
         self.latency_ms = move.latency_ms
+        self.first_token_ms = move.first_token_ms
         self.message = move.message^
 
     def wants_tools(self) -> Bool:
@@ -343,6 +366,11 @@ struct ChatClient(Movable):
     var _extra_keys: List[String]
     var _extra_values: List[String]
     var _http: HttpClient
+    var _call: ApiCall
+    var _streaming: Bool
+    var _sse: SseParser
+    var _acc: StreamState
+    var _flushed: Bool
 
     def __init__(
         out self,
@@ -363,6 +391,11 @@ struct ChatClient(Movable):
         self._extra_keys = List[String]()
         self._extra_values = List[String]()
         self._http = HttpClient(timeout_ms, 10000)
+        self._call = ApiCall()
+        self._streaming = False
+        self._sse = SseParser()
+        self._acc = StreamState(provider)
+        self._flushed = False
         if provider == PROVIDER_ANTHROPIC:
             self._http.header(String("x-api-key"), key)
             self._http.header(String("anthropic-version"), String("2023-06-01"))
@@ -381,6 +414,11 @@ struct ChatClient(Movable):
         self._extra_keys = move._extra_keys^
         self._extra_values = move._extra_values^
         self._http = move._http^
+        self._call = move._call^
+        self._streaming = move._streaming
+        self._sse = move._sse^
+        self._acc = move._acc^
+        self._flushed = move._flushed
 
     def extra(mut self, var key: String, var json_value: String) raises:
         """Add a top-level request field this client does not model — the
@@ -392,7 +430,7 @@ struct ChatClient(Movable):
 
         Setting a key again replaces it. ⚠ A key the client also writes
         (`model`, `messages`, …) would be sent TWICE; that is refused."""
-        for name in ["model", "max_tokens", "messages", "system", "tools", "temperature"]:
+        for name in ["model", "max_tokens", "messages", "system", "tools", "temperature", "stream", "stream_options"]:
             if key == name:
                 raise Error("chat: '" + key + "' is set by the client, not extra()")
         for i in range(len(self._extra_keys)):
@@ -511,12 +549,20 @@ struct ChatClient(Movable):
         ref messages: List[ChatMessage],
         system: String = String(""),
         tools: List[ToolSpec] = List[ToolSpec](),
+        stream: Bool = False,
     ) raises -> String:
         """The JSON this client would POST. Public so a test can pin it."""
         var w = JsonWriter()
         w.begin_object()
         w.member("model", self.model)
         w.member("max_tokens", self.max_tokens)
+        if stream:
+            w.key("stream")
+            w.boolean(True)
+            if self.provider == PROVIDER_OPENAI:
+                # Without it the OpenAI stream carries no token counts.
+                w.key("stream_options")
+                w.raw(String('{"include_usage":true}'))
         if self.temperature >= 0.0:
             w.member("temperature", self.temperature)
         if self.provider == PROVIDER_ANTHROPIC:
@@ -585,6 +631,102 @@ struct ChatClient(Movable):
         var r = parse_openai_response(reply.json())
         r.latency_ms = reply.latency_ms
         return r^
+
+    # ── background / streaming ────────────────────────────────────────
+
+    def _endpoint(self) -> String:
+        if self.provider == PROVIDER_ANTHROPIC:
+            return self.base_url + "/messages"
+        return self.base_url + "/chat/completions"
+
+    def start(
+        mut self,
+        ref messages: List[ChatMessage],
+        system: String = String(""),
+        tools: List[ToolSpec] = List[ToolSpec](),
+        stream: Bool = True,
+    ) raises:
+        """Launch the request and return at once; drive it with `poll`.
+        `stream=False` is a plain background call (no text until `result`)."""
+        var body = self.request_body(messages, system, tools, stream)
+        if self.provider == PROVIDER_ANTHROPIC and self.fallbacks:
+            self._http.header(
+                String("anthropic-beta"), String("server-side-fallback-2026-07-01")
+            )
+        var b = List[UInt8](capacity=body.byte_length())
+        var src = body.as_bytes()
+        for i in range(body.byte_length()):
+            b.append(src[i])
+        self._streaming = stream
+        self._sse = SseParser()
+        self._acc = StreamState(self.provider)
+        self._flushed = False
+        self._call.begin(
+            self._http, self._endpoint(), b^, String("application/json"),
+            String("chat (") + self.model + ")", self.retries,
+        )
+
+    def poll(mut self, timeout_ms: Int = 0) raises -> String:
+        """Advance the call; return the text that arrived since the last poll
+        ("" when none, or when not streaming). Waits up to `timeout_ms` for
+        the network (0 = never). Raises when the call has failed."""
+        if self._call.state == CALL_IDLE:
+            raise Error("chat: poll() with nothing started")
+        var fin = self._call.poll(self._http, timeout_ms)
+        var delta = String("")
+        if self._streaming:
+            var bytes = self._call.read_stream(self._http)
+            if len(bytes) > 0:
+                var events = self._sse.feed(bytes)
+                for i in range(len(events)):
+                    delta += self._acc.on_event(events[i])
+            if fin and self._call.state == CALL_DONE and not self._flushed:
+                self._flushed = True
+                var tail = self._sse.finish()
+                for i in range(len(tail)):
+                    delta += self._acc.on_event(tail[i])
+            if delta.byte_length() > 0 and self._acc.first_token_ms == 0.0:
+                self._acc.first_token_ms = self._call.elapsed_ms()
+        if self._call.state == CALL_FAILED:
+            raise Error(self._call.error)
+        if self._acc.error.byte_length() > 0:
+            raise Error("chat stream: " + self._acc.error)
+        return delta^
+
+    def done(self) -> Bool:
+        """True once the call has finished (either way) — or none is running."""
+        return self._call.finished() or self._call.state == CALL_IDLE
+
+    def result(mut self) raises -> ChatResponse:
+        """The finished call, as `chat()` returns it. Polls to the end first
+        if needed (blocking), so `start(...); result()` is a synchronous call."""
+        while not self._call.finished():
+            _ = self.poll(100)
+        if self._call.state == CALL_FAILED:
+            raise Error(self._call.error)
+        var r: ChatResponse
+        if self._streaming:
+            _ = self.poll(0)  # flush the SSE tail if the loop never saw it
+            r = self._acc.response()
+        else:
+            var reply = self._call.reply()
+            if self.provider == PROVIDER_ANTHROPIC:
+                r = parse_anthropic_response(reply.json())
+            else:
+                r = parse_openai_response(reply.json())
+        r.latency_ms = self._call.latency_ms
+        self._call.state = CALL_IDLE
+        return r^
+
+    def warm_up(mut self):
+        """Open the TLS connection now, before a real-time loop — see
+        `noeira.ai.transport.warm_up`."""
+        warm_up(self._http, self._endpoint())
+
+    def cancel(mut self) raises:
+        """Abandon the call in flight (no-op when none)."""
+        self._call.cancel(self._http)
+        self._call.state = CALL_IDLE
 
     def ask(mut self, var prompt: String, system: String = String("")) raises -> String:
         """One question, one answer, no history."""
@@ -675,6 +817,268 @@ def parse_openai_response(doc: JsonDoc) raises -> ChatResponse:
 
 
 # ═══════════════════════════════════════════════════════════════════════════
+# Streaming — SSE events back into a ChatResponse
+# ═══════════════════════════════════════════════════════════════════════════
+
+
+def _bytes(s: String) -> List[UInt8]:
+    var b = List[UInt8](capacity=s.byte_length())
+    var src = s.as_bytes()
+    for i in range(s.byte_length()):
+        b.append(src[i])
+    return b^
+
+
+@fieldwise_init
+struct _Block(Copyable, Movable):
+    """One Anthropic content block as it streams in."""
+
+    var start_json: String
+    """The `content_block` of `content_block_start`, re-serialised."""
+    var kind: String
+    var text: String
+    var thinking: String
+    var signature: String
+    var partial_json: String
+
+
+def _tool_input(partial: String) raises -> String:
+    """The concatenated `input_json_delta` fragments, normalised. Empty means
+    a tool with no arguments; a truncated fragment (the turn hit max_tokens
+    mid-call) becomes `{}` so the turn can still be replayed."""
+    if partial.byte_length() == 0:
+        return String("{}")
+    try:
+        var d = parse_json(_bytes(partial))
+        return dump_json(d, d.root())
+    except:
+        return String("{}")
+
+
+struct StreamState(Movable):
+    """Accumulates one streamed response, for either wire format."""
+
+    var provider: Int
+    var text: String
+    var model: String
+    var stop_reason: String
+    var input_tokens: Int
+    var output_tokens: Int
+    var error: String
+    """An `error` event inside a 200 stream (e.g. overloaded mid-answer)."""
+    var first_token_ms: Float64
+    var blocks: List[_Block]
+    """Anthropic: content blocks by index."""
+    var oa_ids: List[String]
+    var oa_names: List[String]
+    var oa_args: List[String]
+    """OpenAI: tool calls by index, arguments concatenated."""
+
+    def __init__(out self, provider: Int):
+        self.provider = provider
+        self.text = String("")
+        self.model = String("")
+        self.stop_reason = String("")
+        self.input_tokens = 0
+        self.output_tokens = 0
+        self.error = String("")
+        self.first_token_ms = 0.0
+        self.blocks = List[_Block]()
+        self.oa_ids = List[String]()
+        self.oa_names = List[String]()
+        self.oa_args = List[String]()
+
+    def __init__(out self, *, deinit move: Self):
+        self.provider = move.provider
+        self.text = move.text^
+        self.model = move.model^
+        self.stop_reason = move.stop_reason^
+        self.input_tokens = move.input_tokens
+        self.output_tokens = move.output_tokens
+        self.error = move.error^
+        self.first_token_ms = move.first_token_ms
+        self.blocks = move.blocks^
+        self.oa_ids = move.oa_ids^
+        self.oa_names = move.oa_names^
+        self.oa_args = move.oa_args^
+
+    def on_event(mut self, ref ev: SseEvent) raises -> String:
+        """Fold one event in; return the visible text it added."""
+        if ev.data == "[DONE]" or ev.data.byte_length() == 0:
+            return String("")
+        var doc = parse_json(_bytes(ev.data))
+        if self.provider == PROVIDER_ANTHROPIC:
+            return self._anthropic(doc)
+        return self._openai(doc)
+
+    def _anthropic(mut self, ref doc: JsonDoc) raises -> String:
+        var root = doc.root()
+        var kind = _str_or_empty(doc, doc.field(root, "type"))
+        if kind == "content_block_delta":
+            var i = doc.integer(doc.field(root, "index"))
+            var d = doc.field(root, "delta")
+            var dk = _str_or_empty(doc, doc.field(d, "type"))
+            if i < 0 or i >= len(self.blocks):
+                raise Error("anthropic stream: delta for unknown block " + String(i))
+            if dk == "text_delta":
+                var t = doc.string(doc.field(d, "text"))
+                self.blocks[i].text += t
+                self.text += t
+                return t^
+            if dk == "thinking_delta":
+                self.blocks[i].thinking += doc.string(doc.field(d, "thinking"))
+            elif dk == "signature_delta":
+                self.blocks[i].signature += doc.string(doc.field(d, "signature"))
+            elif dk == "input_json_delta":
+                self.blocks[i].partial_json += doc.string(doc.field(d, "partial_json"))
+            return String("")
+        if kind == "content_block_start":
+            var i = doc.integer(doc.field(root, "index"))
+            var cb = doc.field(root, "content_block")
+            while len(self.blocks) <= i:
+                self.blocks.append(
+                    _Block(String(""), String(""), String(""), String(""), String(""), String(""))
+                )
+            self.blocks[i] = _Block(
+                dump_json(doc, cb), _str_or_empty(doc, doc.field(cb, "type")),
+                _str_or_empty(doc, doc.field(cb, "text")), String(""),
+                String(""), String(""),
+            )
+            var t = self.blocks[i].text.copy()
+            self.text += t
+            return t^
+        if kind == "message_start":
+            var m = doc.field(root, "message")
+            self.model = _str_or_empty(doc, doc.field(m, "model"))
+            var u = doc.field(m, "usage")
+            self.input_tokens = _int_or_zero(doc, doc.field(u, "input_tokens"))
+        elif kind == "message_delta":
+            var sr = _str_or_empty(doc, doc.field(doc.field(root, "delta"), "stop_reason"))
+            if sr.byte_length() > 0:
+                self.stop_reason = sr^
+            var out_t = _int_or_zero(doc, doc.field(doc.field(root, "usage"), "output_tokens"))
+            if out_t > 0:
+                self.output_tokens = out_t
+        elif kind == "error":
+            self.error = _str_or_empty(doc, doc.field(doc.field(root, "error"), "message"))
+            if self.error.byte_length() == 0:
+                self.error = String("error event with no message")
+        return String("")
+
+    def _openai(mut self, ref doc: JsonDoc) raises -> String:
+        var root = doc.root()
+        var err = doc.field(root, "error")
+        if err >= 0:
+            var m = _str_or_empty(doc, doc.field(err, "message"))
+            self.error = m if m.byte_length() > 0 else dump_json(doc, err)
+            return String("")
+        var model = _str_or_empty(doc, doc.field(root, "model"))
+        if model.byte_length() > 0:
+            self.model = model^
+        var usage = doc.field(root, "usage")
+        if doc.kind_of(usage) == 5:  # J_OBJECT; null on all but the last chunk
+            self.input_tokens = _int_or_zero(doc, doc.field(usage, "prompt_tokens"))
+            self.output_tokens = _int_or_zero(doc, doc.field(usage, "completion_tokens"))
+        var choice = doc.at(doc.field(root, "choices"), 0)
+        if choice < 0:
+            return String("")
+        var fr = _str_or_empty(doc, doc.field(choice, "finish_reason"))
+        if fr.byte_length() > 0:
+            self.stop_reason = fr^
+        var delta = doc.field(choice, "delta")
+        var calls = doc.field(delta, "tool_calls")
+        for k in range(doc.size(calls)):
+            var c = doc.at(calls, k)
+            var idx_node = doc.field(c, "index")
+            var idx = doc.integer(idx_node) if idx_node >= 0 else k
+            while len(self.oa_ids) <= idx:
+                self.oa_ids.append(String(""))
+                self.oa_names.append(String(""))
+                self.oa_args.append(String(""))
+            var id = _str_or_empty(doc, doc.field(c, "id"))
+            if id.byte_length() > 0:
+                self.oa_ids[idx] = id^
+            var func = doc.field(c, "function")
+            var name = _str_or_empty(doc, doc.field(func, "name"))
+            if name.byte_length() > 0:
+                self.oa_names[idx] = name^
+            var a = doc.field(func, "arguments")
+            if doc.kind_of(a) == J_STRING:
+                self.oa_args[idx] += doc.string(a)
+            elif a >= 0:
+                self.oa_args[idx] += dump_json(doc, a)
+        var t = _str_or_empty(doc, doc.field(delta, "content"))
+        self.text += t
+        return t^
+
+    def _block_json(self, ref b: _Block) raises -> String:
+        """The block as the non-streamed API would have returned it."""
+        var d = parse_json(_bytes(b.start_json))
+        var root = d.root()
+        var w = JsonWriter()
+        w.begin_object()
+        var saw_sig = False
+        for i in range(d.size(root)):
+            var key = d.key_at(root, i)
+            w.key(key)
+            if key == "text" and b.kind == "text":
+                w.string(b.text)
+            elif key == "thinking" and b.kind == "thinking":
+                w.string(b.thinking)
+            elif key == "signature":
+                saw_sig = True
+                if b.signature.byte_length() > 0:
+                    w.string(b.signature)
+                else:
+                    w.raw(dump_json(d, d.at(root, i)))
+            elif key == "input" and (b.kind == "tool_use" or b.partial_json.byte_length() > 0):
+                w.raw(_tool_input(b.partial_json))
+            else:
+                w.raw(dump_json(d, d.at(root, i)))
+        if not saw_sig and b.signature.byte_length() > 0:
+            w.member("signature", b.signature)
+        w.end_object()
+        return w.done()
+
+    def response(self) raises -> ChatResponse:
+        var r = ChatResponse()
+        r.text = self.text.copy()
+        r.model = self.model.copy()
+        r.stop_reason = self.stop_reason.copy()
+        r.input_tokens = self.input_tokens
+        r.output_tokens = self.output_tokens
+        r.first_token_ms = self.first_token_ms
+        if self.provider == PROVIDER_ANTHROPIC:
+            var w = JsonWriter()
+            w.begin_array()
+            for i in range(len(self.blocks)):
+                w.raw(self._block_json(self.blocks[i]))
+                if self.blocks[i].kind == "tool_use":
+                    var bd = parse_json(_bytes(self.blocks[i].start_json))
+                    r.tool_calls.append(
+                        ToolCall(
+                            bd.string(bd.field(bd.root(), "id")),
+                            bd.string(bd.field(bd.root(), "name")),
+                            _tool_input(self.blocks[i].partial_json),
+                        )
+                    )
+            w.end_array()
+            r.message = ChatMessage.assistant(r.text.copy())
+            r.message.tool_calls = r.tool_calls.copy()
+            r.message.raw = w.done()
+            r.message.raw_provider = PROVIDER_ANTHROPIC
+        else:
+            for i in range(len(self.oa_ids)):
+                var args = self.oa_args[i].copy()
+                if args.byte_length() == 0:
+                    args = String("{}")
+                r.tool_calls.append(ToolCall(self.oa_ids[i], self.oa_names[i], args^))
+            r.message = ChatMessage.assistant(r.text.copy())
+            r.message.tool_calls = r.tool_calls.copy()
+        return r^
+
+
+# ═══════════════════════════════════════════════════════════════════════════
 # Conversation — history + tools, append-only
 # ═══════════════════════════════════════════════════════════════════════════
 
@@ -719,5 +1123,15 @@ struct Conversation(Movable):
     def send(mut self, mut client: ChatClient) raises -> ChatResponse:
         """Send the history; append the answer to it; return the answer."""
         var r = client.chat(self.messages, self.system, self.tools)
+        self.messages.append(r.message.copy())
+        return r^
+
+    def start(mut self, mut client: ChatClient, stream: Bool = True) raises:
+        """`send` without blocking: poll `client`, then call `finish`."""
+        client.start(self.messages, self.system, self.tools, stream)
+
+    def finish(mut self, mut client: ChatClient) raises -> ChatResponse:
+        """Collect the call `start` launched and append it to the history."""
+        var r = client.result()
         self.messages.append(r.message.copy())
         return r^

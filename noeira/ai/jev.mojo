@@ -38,7 +38,7 @@ from noeira.io.http import HttpClient
 from noeira.io.json import J_NUMBER, J_OBJECT, J_STRING, JsonDoc, JsonWriter, parse_json
 
 from noeira.ai.keys import api_key
-from noeira.ai.transport import post_json_api
+from noeira.ai.transport import warm_up, ApiCall, CALL_IDLE
 
 
 struct JevQuestions(Copyable, Movable):
@@ -199,6 +199,7 @@ struct JevClient(Movable):
     var model: String
     var retries: Int
     var _http: HttpClient
+    var _call: ApiCall
 
     def __init__(
         out self,
@@ -211,12 +212,14 @@ struct JevClient(Movable):
         self.retries = 2
         self._http = HttpClient(30000, 10000)
         self._http.bearer(key)
+        self._call = ApiCall()
 
     def __init__(out self, *, deinit move: Self):
         self.url = move.url^
         self.model = move.model^
         self.retries = move.retries
         self._http = move._http^
+        self._call = move._call^
 
     @staticmethod
     def from_env(var model: String = String("jev-latest")) raises -> JevClient:
@@ -242,12 +245,50 @@ struct JevClient(Movable):
     def decide(mut self, state_json: String, ref questions: JevQuestions) raises -> JevAnswers:
         """`state_json` is a JSON value (normally an object) describing the
         situation; questions refer to its fields by name."""
-        var body = self.request_body(state_json, True, questions)
-        var reply = post_json_api(self._http, self.url, body^, String("jev decide"), self.retries)
-        return JevAnswers(reply.json(), reply.latency_ms)
+        self.start(state_json, questions)
+        return self.result()
 
     def decide_text(mut self, state_text: String, ref questions: JevQuestions) raises -> JevAnswers:
         """Same, with free text as the state (a transcript, a message)."""
-        var body = self.request_body(state_text, False, questions)
-        var reply = post_json_api(self._http, self.url, body^, String("jev decide"), self.retries)
+        self.start_text(state_text, questions)
+        return self.result()
+
+    # ── background: decide while the loop keeps running ───────────────
+    #
+    #     jev.start(state, q)
+    #     while not jev.poll():       # never blocks
+    #         step_sim(); draw()
+    #     var a = jev.result()
+
+    def start(mut self, state_json: String, ref questions: JevQuestions) raises:
+        self._begin(self.request_body(state_json, True, questions))
+
+    def start_text(mut self, state_text: String, ref questions: JevQuestions) raises:
+        self._begin(self.request_body(state_text, False, questions))
+
+    def _begin(mut self, body: String) raises:
+        var b = List[UInt8](capacity=body.byte_length())
+        for i in range(body.byte_length()):
+            b.append(body.as_bytes()[i])
+        self._call.begin(
+            self._http, self.url, b^, String("application/json"),
+            String("jev decide"), self.retries,
+        )
+
+    def poll(mut self, timeout_ms: Int = 0) raises -> Bool:
+        """True once the answer is in (or the call failed — `result` says)."""
+        return self._call.poll(self._http, timeout_ms)
+
+    def result(mut self) raises -> JevAnswers:
+        var reply = self._call.wait(self._http)
+        self._call.state = CALL_IDLE
         return JevAnswers(reply.json(), reply.latency_ms)
+
+    def warm_up(mut self):
+        """Open the TLS connection now, before a real-time loop — see
+        `noeira.ai.transport.warm_up`."""
+        warm_up(self._http, self.url)
+
+    def cancel(mut self) raises:
+        self._call.cancel(self._http)
+        self._call.state = CALL_IDLE

@@ -15,7 +15,8 @@
  * response buffer, and the progress line.
  *
  * Scope: HTTP/1.1+ CLIENT only — GET / POST / PUT / DELETE / HEAD, TLS,
- * redirects, `Range` resume, file upload. No server, no async. That is the
+ * redirects, `Range` resume, file upload, and an async mode (`nra_http_start`
+ * + `poll`) for streaming and background calls. No server. That is the
  * whole of what `noeira` asks the network for.
  *
  * Built by scripts/build_http.sh into libnra_http.dylib / .so, which
@@ -114,6 +115,12 @@ struct nra_http {
     int follow;
     long max_redirs;
 
+    /* async (curl_multi) — see nra_http_start */
+    CURLM *multi;
+    int running;
+    int async_rc;
+    size_t buf_read;   /* bytes of `buf` already handed out by read_new */
+
     char err[CURL_ERROR_SIZE];
 };
 
@@ -182,6 +189,10 @@ nra_http *nra_http_new(void) {
 
 void nra_http_free(nra_http *h) {
     if (!h) return;
+    if (h->multi) {
+        if (h->running) curl_multi_remove_handle(h->multi, h->curl);
+        curl_multi_cleanup(h->multi);
+    }
     drop_files(h);
     if (h->zds) ZSTD_freeDStream((ZSTD_DStream *)h->zds);
     free(h->z_out);
@@ -209,6 +220,7 @@ void nra_http_reset(nra_http *h) {
     h->req_body = NULL;
     h->req_body_len = 0;
     h->buf_len = 0;
+    h->buf_read = 0;
     h->since_sync = 0;
     h->resume_from = 0;
     h->up_size = 0;
@@ -402,7 +414,10 @@ static size_t hdr_cb(char *b, size_t sz, size_t n, void *ud) {
         h->progress_done = 0;
         h->last_decile = -1;
         h->t_last = 0.0;
-        if (!h->fp) h->buf_len = 0;
+        if (!h->fp) {
+            h->buf_len = 0;
+            h->buf_read = 0;
+        }
         char *sp = (char *)memchr(b, ' ', len);
         if (sp) h->status = strtol(sp + 1, NULL, 10);
     }
@@ -592,14 +607,15 @@ static int xfer_cb(void *ud, curl_off_t dltotal, curl_off_t dlnow,
 
 /* ── perform ────────────────────────────────────────────────────────────── */
 
-int nra_http_perform(nra_http *h, const char *method, const char *url) {
-    if (!h || !method || !url) return -1;
-
+/* Everything a transfer needs set before it runs — shared by the blocking
+ * `perform` and the async `start`, so the two cannot drift apart. */
+static void prepare(nra_http *h, const char *method, const char *url) {
     CURL *c = h->curl;
     curl_easy_reset(c); /* options only — keeps connections, TLS + DNS caches */
 
     h->err[0] = 0;
     h->buf_len = 0;
+    h->buf_read = 0;
     h->since_sync = 0;
     h->status = 0;
     h->first_write_done = 0;
@@ -664,8 +680,12 @@ int nra_http_perform(nra_http *h, const char *method, const char *url) {
     } else if (strcmp(method, "GET") != 0) {
         curl_easy_setopt(c, CURLOPT_CUSTOMREQUEST, method);
     }
+}
 
-    CURLcode rc = curl_easy_perform(c);
+/* Everything after a transfer ends, blocking or async: close files, settle
+ * the status, and name a cause libcurl reports only as a code. */
+static int conclude(nra_http *h, CURLcode rc) {
+    CURL *c = h->curl;
 
     if (h->fp) {
         fflush(h->fp);
@@ -714,6 +734,99 @@ int nra_http_perform(nra_http *h, const char *method, const char *url) {
         }
     }
     return (int)rc;
+}
+
+int nra_http_perform(nra_http *h, const char *method, const char *url) {
+    if (!h || !method || !url) return -1;
+    if (h->running) return -2; /* an async transfer owns the handle */
+    prepare(h, method, url);
+    return conclude(h, curl_easy_perform(h->curl));
+}
+
+/* ── async: the same transfer, driven by the caller's loop ──────────────── */
+/*
+ * `start` launches the prepared transfer on a private curl_multi and returns
+ * at once; `poll` advances it (waiting up to `timeout_ms` for socket
+ * activity, 0 = never wait) and returns 1 once it has finished. Nothing runs
+ * between polls — there is no thread — so a render loop that polls once per
+ * frame IS the network loop. That is deliberate: a libcurl easy handle must
+ * not be touched from two threads, and this way it never is.
+ *
+ * `read_new` hands out body bytes as they arrive (the streaming half): each
+ * call returns what came in since the previous one. The full body is still
+ * accumulated, so `body_copy` after the end returns all of it.
+ *
+ * ⚠ THE REQUEST MUST NOT BE RESET WHILE IT RUNS: `reset` frees the header
+ * list libcurl is reading. `nra_http_running` is the guard the Mojo side
+ * checks; `cancel` is the only way to stop early.
+ */
+int nra_http_start(nra_http *h, const char *method, const char *url) {
+    if (!h || !method || !url) return -1;
+    if (h->running) return -2;
+    if (!h->multi) {
+        h->multi = curl_multi_init();
+        if (!h->multi) return -3;
+    }
+    prepare(h, method, url);
+    h->async_rc = -1;
+    if (curl_multi_add_handle(h->multi, h->curl) != CURLM_OK) return -3;
+    h->running = 1;
+    return 0;
+}
+
+int nra_http_poll(nra_http *h, int timeout_ms) {
+    if (!h) return -1;
+    if (!h->running) return 1;
+    int still = 0;
+    CURLMcode m = curl_multi_perform(h->multi, &still);
+    if (m == CURLM_OK && still && timeout_ms > 0) {
+        m = curl_multi_poll(h->multi, NULL, 0, timeout_ms, NULL);
+        if (m == CURLM_OK) m = curl_multi_perform(h->multi, &still);
+    }
+    CURLcode rc = CURLE_OK;
+    if (m != CURLM_OK) {
+        rc = CURLE_FAILED_INIT;
+        strncpy(h->err, curl_multi_strerror(m), sizeof(h->err) - 1);
+        h->err[sizeof(h->err) - 1] = 0;
+    } else if (still) {
+        return 0;
+    } else {
+        int left = 0;
+        CURLMsg *msg;
+        while ((msg = curl_multi_info_read(h->multi, &left)) != NULL)
+            if (msg->msg == CURLMSG_DONE) rc = msg->data.result;
+    }
+    curl_multi_remove_handle(h->multi, h->curl);
+    h->running = 0;
+    h->async_rc = conclude(h, rc);
+    return 1;
+}
+
+int nra_http_running(nra_http *h) { return h ? h->running : 0; }
+
+/* The CURLcode of the finished async transfer: 0 = completed (any status). */
+int nra_http_async_result(nra_http *h) { return h ? h->async_rc : -1; }
+
+void nra_http_cancel(nra_http *h) {
+    if (!h || !h->running) return;
+    curl_multi_remove_handle(h->multi, h->curl);
+    h->running = 0;
+    drop_files(h);
+    h->async_rc = (int)CURLE_ABORTED_BY_CALLBACK;
+    strncpy(h->err, "cancelled", sizeof(h->err) - 1);
+}
+
+long nra_http_read_new(nra_http *h, unsigned char *dst, long cap) {
+    if (!h || !dst || cap <= 0 || h->buf_read >= h->buf_len) return 0;
+    long avail = (long)(h->buf_len - h->buf_read);
+    long n = avail < cap ? avail : cap;
+    memcpy(dst, h->buf + h->buf_read, (size_t)n);
+    h->buf_read += (size_t)n;
+    return n;
+}
+
+long nra_http_unread_len(nra_http *h) {
+    return (h && h->buf_len > h->buf_read) ? (long)(h->buf_len - h->buf_read) : 0;
 }
 
 /* ── results ────────────────────────────────────────────────────────────── */

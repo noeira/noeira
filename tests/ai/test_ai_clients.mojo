@@ -24,13 +24,22 @@ as what it parses.
 * **A 529 is retried; a 422 is not**, and the 422's body reaches the caller.
 * **WAV survives encode → multipart → the server's own parser**, resampled
   and down-mixed to 16 kHz mono on the way.
+* **A streamed turn equals a blocking one.** The fixture cuts every SSE event
+  at an arbitrary byte (mid-line, mid-"—"); the deltas must concatenate to
+  the final text, and a reassembled Claude turn — thinking signature arriving
+  as a DELTA, tool input as JSON FRAGMENTS — must pass the same verbatim
+  replay check on the next turn.
+* **`poll` never blocks**: many polls happen while a 0.4 s call is in flight,
+  and while a 529 backoff is being waited out.
+* **An `error` event inside a 200 stream raises**; `cancel` frees the client
+  for the next request.
 """
 
 from std.os.path import exists
-from std.time import sleep
+from std.time import perf_counter_ns, sleep
 
 from noeira.ai.chat import (
-    ChatClient, Conversation, PROVIDER_ANTHROPIC, PROVIDER_OPENAI,
+    ChatClient, ChatMessage, Conversation, PROVIDER_ANTHROPIC, PROVIDER_OPENAI,
 )
 from noeira.ai.jev import JevClient, JevQuestions
 from noeira.ai.speech import STT_MULTIPART, STT_RAW, SpeechToText, TextToSpeech
@@ -98,12 +107,62 @@ def _agent_round_trip(mut client: ChatClient, label: String) raises -> Int:
     var r2 = conv.send(client)
     _check(not r2.wants_tools(), label + ": second turn still wants tools")
     _check(
-        r2.text == "done: get_pose=0 | get_pose=1",
+        r2.text == "done — get_pose=0 | get_pose=1",
         label + ": tool results mis-grouped: " + r2.text,
     )
     _check(len(conv.messages) == 5, label + ": history length")
     print("  " + label + ": 2-turn tool agent, image, parallel calls   ok")
     return 9
+
+
+def _drain(mut client: ChatClient, mut deltas: Int, mut polls: Int) raises -> String:
+    """A render loop: poll without waiting, 'draw', repeat."""
+    var seen = String("")
+    while not client.done():
+        var d = client.poll(0)
+        polls += 1
+        if d.byte_length() > 0:
+            deltas += 1
+            seen += d
+        sleep(0.002)
+    return seen^
+
+
+def _stream_round_trip(mut client: ChatClient, label: String) raises -> Int:
+    var conv = Conversation("You are a robot planner.")
+    conv.tool("get_pose", "Pose of a named object", String(POSE_SCHEMA))
+    var png: List[UInt8] = [0x89, 0x50, 0x4E, 0x47]
+    conv.user_image("Where are the objects?", png)
+    conv.start(client)
+    var deltas = 0
+    var polls = 0
+    var seen = _drain(client, deltas, polls)
+    var r1 = conv.finish(client)
+    _check(seen == r1.text, label + ": deltas != final text: '" + seen + "'")
+    _check(r1.text == "I see 1 image(s).", label + ": streamed text: " + r1.text)
+    _check(deltas >= 2, label + ": text arrived in " + String(deltas) + " delta(s), not streamed")
+    _check(polls > deltas, label + ": every poll returned text — was it blocking?")
+    _check(r1.first_token_ms > 0.0 and r1.first_token_ms < r1.latency_ms, label + ": first_token_ms")
+    _check(len(r1.tool_calls) == 2, label + ": streamed tool calls")
+    _check(
+        r1.tool_calls[0].arguments_json == '{"name":"cube","k":2}',
+        label + ": streamed arguments: " + r1.tool_calls[0].arguments_json,
+    )
+    _check(r1.input_tokens == 40 and r1.output_tokens == 30, label + ": streamed usage")
+    for i in range(len(r1.tool_calls)):
+        var call = r1.tool_calls[i].copy()
+        conv.tool_result(call.id, call.name + "=" + String(i))
+    conv.start(client)
+    var d2 = 0
+    var p2 = 0
+    var seen2 = _drain(client, d2, p2)
+    var r2 = conv.finish(client)
+    _check(r2.text == "done — get_pose=0 | get_pose=1", label + ": turn 2: " + r2.text)
+    _check(seen2 == r2.text, label + ": turn-2 deltas (split UTF-8) != text")
+    print("  " + label + ": streamed 2-turn agent, " + String(deltas) + " deltas over "
+          + String(polls) + " polls, first token " + String(Int(r1.first_token_ms))
+          + " ms of " + String(Int(r1.latency_ms)) + "   ok")
+    return 11
 
 
 def main() raises:
@@ -202,6 +261,80 @@ def main() raises:
     _check(spoken.sample_rate == 16000 and spoken.frames() == 4000, "TTS WAV decode")
     checks += 6
     print("  speech: wav codec, multipart + raw STT, TTS            ok")
+
+    # ── 6. streaming: both wire formats, reassembly, replay ──────────────
+    checks += _stream_round_trip(claude, String("anthropic stream"))
+    checks += _stream_round_trip(oai, String("openai stream"))
+
+    # ── 7. an error event inside a 200 stream raises, after partial text ──
+    var broken = ChatClient(
+        PROVIDER_ANTHROPIC, base + "/err/v1", String("claude-opus-5-5"), String("test-key")
+    )
+    var one = List[ChatMessage]()
+    one.append(ChatMessage.user(String("hi")))
+    broken.start(one)
+    var partial = String("")
+    var err = String("")
+    try:
+        while not broken.done():
+            partial += broken.poll(0)
+            sleep(0.002)
+        _ = broken.result()
+    except e:
+        err = String(e)
+    _check("Overloaded" in err, "stream error event not raised: '" + err + "'")
+    _check(partial == "Partial é", "partial text before the error: '" + partial + "'")
+    checks += 2
+    print("  stream error event: raised after partial text           ok")
+
+    # ── 8. cancel mid-stream, then the same client works again ───────────
+    var conv_c = Conversation()
+    conv_c.tool("get_pose", "Pose", String(POSE_SCHEMA))
+    conv_c.user("go")
+    conv_c.start(claude)
+    while claude.poll(5).byte_length() == 0 and not claude.done():
+        pass
+    claude.cancel()
+    _check(claude.done(), "cancel left the call running")
+    conv_c.start(claude)
+    var rc = conv_c.finish(claude)
+    _check(len(rc.tool_calls) == 2, "client unusable after cancel")
+    checks += 2
+    print("  cancel mid-stream, then reuse the client                ok")
+
+    # ── 9. background calls do not block ─────────────────────────────────
+    var slow = JevClient(String("test-key"), url=base + "/slow/v1/systemone")
+    slow.start('{"cube_in_jaws": true}', q)
+    var bg_polls = 0
+    var t0 = perf_counter_ns()
+    while not slow.poll():
+        bg_polls += 1
+        sleep(0.005)
+    var sa = slow.result()
+    _check(sa.choice("next") == "lift", "background jev answer")
+    _check(bg_polls >= 20, "only " + String(bg_polls) + " polls during a 0.4 s call")
+    # Two 529s: the 0.5 s + 1.0 s backoff must be waited out WITHOUT blocking.
+    var flaky_bg = JevClient(String("test-key"), url=base + "/flaky-bg/v1/systemone")
+    flaky_bg.start("{}", q)
+    var fb_polls = 0
+    var tb = perf_counter_ns()
+    while not flaky_bg.poll():
+        fb_polls += 1
+        sleep(0.005)
+    var fb_ms = Float64(perf_counter_ns() - tb) / 1e6
+    _check(flaky_bg.result().choice("next") == "lift", "background jev through 2 retries")
+    _check(fb_ms > 1400.0, "the backoff was not waited out (" + String(fb_ms) + " ms)")
+    _check(fb_polls >= 100, "backoff blocked: only " + String(fb_polls) + " polls in " + String(fb_ms) + " ms")
+    var stt_bg = SpeechToText(
+        STT_MULTIPART, base + "/v1/audio/transcriptions", String("whisper-1"), String("k")
+    )
+    stt_bg.start(stereo48)
+    while not stt_bg.poll():
+        sleep(0.002)
+    _check(stt_bg.result().text == "8000@16000", "background STT")
+    checks += 6
+    print("  background: " + String(bg_polls) + " polls during a 0.4 s call, "
+          + String(fb_polls) + " during a " + String(Int(fb_ms)) + " ms retry backoff   ok")
 
     _ = probe.get(base + "/__shutdown")
     print("=== ai clients: " + String(checks) + " checks passed ===")

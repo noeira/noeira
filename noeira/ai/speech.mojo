@@ -33,7 +33,7 @@ from noeira.io.json import J_STRING, JsonWriter
 from noeira.io.wav import WavAudio, decode_wav, encode_wav
 
 from noeira.ai.keys import api_key
-from noeira.ai.transport import MultipartForm, post_api, post_json_api
+from noeira.ai.transport import warm_up, ApiCall, CALL_IDLE, MultipartForm
 
 
 comptime STT_MULTIPART = 0
@@ -56,6 +56,7 @@ struct SpeechToText(Movable):
     avoids a wrong-language transcript of a two-word command."""
     var retries: Int
     var _http: HttpClient
+    var _call: ApiCall
 
     def __init__(
         out self, kind: Int, var url: String, var model: String, var key: String
@@ -66,6 +67,7 @@ struct SpeechToText(Movable):
         self.language = String("")
         self.retries = 2
         self._http = HttpClient(120000, 10000)
+        self._call = ApiCall()
         if key.byte_length() > 0:
             self._http.bearer(key)
 
@@ -76,6 +78,7 @@ struct SpeechToText(Movable):
         self.language = move.language^
         self.retries = move.retries
         self._http = move._http^
+        self._call = move._call^
 
     @staticmethod
     def openai(var model: String = String("whisper-1")) raises -> SpeechToText:
@@ -114,17 +117,14 @@ struct SpeechToText(Movable):
             model.copy(), key^,
         )
 
-    def transcribe_wav_bytes(mut self, ref wav: List[UInt8]) raises -> Transcript:
+    def start_wav_bytes(mut self, ref wav: List[UInt8]) raises:
+        """Upload in the background; `poll` it, then `result`."""
         var what = String("speech-to-text (") + self.model + ")"
         if self.kind == STT_RAW:
-            var reply = post_api(
-                self._http, self.url, wav, String("audio/wav"), what^, self.retries
+            self._call.begin(
+                self._http, self.url, wav.copy(), String("audio/wav"), what^, self.retries
             )
-            var doc = reply.json()
-            var t = doc.field(doc.root(), "text")
-            if doc.kind_of(t) != J_STRING:
-                raise Error("speech-to-text: no 'text' in the reply")
-            return Transcript(doc.string(t), reply.latency_ms)
+            return
         var form = MultipartForm()
         form.field("model", self.model)
         form.field("response_format", "json")
@@ -132,18 +132,46 @@ struct SpeechToText(Movable):
             form.field("language", self.language)
         form.file("file", "audio.wav", "audio/wav", wav)
         var body = form.finish()
-        var reply = post_api(
-            self._http, self.url, body, form.content_type(), what^, self.retries
+        self._call.begin(
+            self._http, self.url, body^, form.content_type(), what^, self.retries
         )
-        var doc = reply.json()
-        return Transcript(doc.string(doc.field(doc.root(), "text")), reply.latency_ms)
 
-    def transcribe(mut self, ref audio: WavAudio) raises -> Transcript:
-        """Down-mix and resample to 16 kHz mono, then transcribe."""
+    def start(mut self, ref audio: WavAudio) raises:
+        """Down-mix and resample to 16 kHz mono, then `start_wav_bytes`."""
         var mono = audio.to_mono()
         var a16 = mono.resample(16000) if mono.sample_rate != 16000 else mono^
         var wav = encode_wav(a16)
-        return self.transcribe_wav_bytes(wav)
+        self.start_wav_bytes(wav)
+
+    def poll(mut self, timeout_ms: Int = 0) raises -> Bool:
+        return self._call.poll(self._http, timeout_ms)
+
+    def result(mut self) raises -> Transcript:
+        var reply = self._call.wait(self._http)
+        self._call.state = CALL_IDLE
+        var doc = reply.json()
+        var t = doc.field(doc.root(), "text")
+        if doc.kind_of(t) != J_STRING:
+            raise Error("speech-to-text: no 'text' in the reply")
+        return Transcript(doc.string(t), reply.latency_ms)
+
+    def warm_up(mut self):
+        """Open the TLS connection now, before a real-time loop — see
+        `noeira.ai.transport.warm_up`."""
+        warm_up(self._http, self.url)
+
+    def cancel(mut self) raises:
+        self._call.cancel(self._http)
+        self._call.state = CALL_IDLE
+
+    def transcribe_wav_bytes(mut self, ref wav: List[UInt8]) raises -> Transcript:
+        self.start_wav_bytes(wav)
+        return self.result()
+
+    def transcribe(mut self, ref audio: WavAudio) raises -> Transcript:
+        """Down-mix and resample to 16 kHz mono, then transcribe."""
+        self.start(audio)
+        return self.result()
 
     def transcribe_file(mut self, path: String) raises -> Transcript:
         var b = read_file_bytes(path)
@@ -160,6 +188,7 @@ struct TextToSpeech(Movable):
     "" sends none."""
     var retries: Int
     var _http: HttpClient
+    var _call: ApiCall
 
     def __init__(
         out self, var url: String, var model: String, var voice: String, var key: String
@@ -170,6 +199,7 @@ struct TextToSpeech(Movable):
         self.instructions = String("")
         self.retries = 2
         self._http = HttpClient(120000, 10000)
+        self._call = ApiCall()
         if key.byte_length() > 0:
             self._http.bearer(key)
 
@@ -180,6 +210,7 @@ struct TextToSpeech(Movable):
         self.instructions = move.instructions^
         self.retries = move.retries
         self._http = move._http^
+        self._call = move._call^
 
     @staticmethod
     def openai(
@@ -201,7 +232,8 @@ struct TextToSpeech(Movable):
         """Kokoro-FastAPI: `("http://localhost:8880/v1", "kokoro", "af_heart")`."""
         return TextToSpeech(base_url + "/audio/speech", model^, voice^, key^)
 
-    def speak_wav_bytes(mut self, text: String) raises -> List[UInt8]:
+    def start(mut self, text: String) raises:
+        """Synthesise in the background; `poll` it, then `result`."""
         var w = JsonWriter()
         w.begin_object()
         w.member("model", self.model)
@@ -211,12 +243,40 @@ struct TextToSpeech(Movable):
         if self.instructions.byte_length() > 0:
             w.member("instructions", self.instructions)
         w.end_object()
-        var reply = post_json_api(
-            self._http, self.url, w.done(), String("text-to-speech (") + self.model + ")",
-            self.retries,
+        var body = w.done()
+        var b = List[UInt8](capacity=body.byte_length())
+        for i in range(body.byte_length()):
+            b.append(body.as_bytes()[i])
+        self._call.begin(
+            self._http, self.url, b^, String("application/json"),
+            String("text-to-speech (") + self.model + ")", self.retries,
         )
+
+    def poll(mut self, timeout_ms: Int = 0) raises -> Bool:
+        return self._call.poll(self._http, timeout_ms)
+
+    def result_wav_bytes(mut self) raises -> List[UInt8]:
+        var reply = self._call.wait(self._http)
+        self._call.state = CALL_IDLE
         return reply^.take_body()
 
-    def speak(mut self, text: String) raises -> WavAudio:
-        var b = self.speak_wav_bytes(text)
+    def result(mut self) raises -> WavAudio:
+        var b = self.result_wav_bytes()
         return decode_wav(b)
+
+    def warm_up(mut self):
+        """Open the TLS connection now, before a real-time loop — see
+        `noeira.ai.transport.warm_up`."""
+        warm_up(self._http, self.url)
+
+    def cancel(mut self) raises:
+        self._call.cancel(self._http)
+        self._call.state = CALL_IDLE
+
+    def speak_wav_bytes(mut self, text: String) raises -> List[UInt8]:
+        self.start(text)
+        return self.result_wav_bytes()
+
+    def speak(mut self, text: String) raises -> WavAudio:
+        self.start(text)
+        return self.result()

@@ -19,7 +19,16 @@ Routes
   POST /v1/audio/transcriptions   multipart WAV -> {"text": "<frames>@<rate>"}
   POST /hf/whisper                raw WAV body -> same
   POST /v1/audio/speech           -> a 0.25 s 16 kHz mono WAV
+  POST /slow/v1/systemone         as /v1/systemone, after 0.4 s
+  POST /err/v1/messages           a stream that dies with an `error` event
   POST /flaky/v1/systemone        529 twice, then as /v1/systemone
+  POST /flaky-bg/v1/systemone     the same, own counter (the background gate)
+
+Streaming: a chat request with `"stream": true` is answered as SSE in that
+provider's event grammar, built from the same canned message. ⚠ EACH EVENT
+IS WRITTEN IN TWO PIECES split at an arbitrary byte, with a pause between —
+so the client sees a line, a JSON document and a UTF-8 character cut in
+half, and a parser that assumes whole lines per chunk fails here.
   POST /bad/v1/systemone          422 {"error":"questions: field required"}
   GET  /__last, /__shutdown
 """
@@ -29,10 +38,11 @@ import os
 import struct
 import sys
 import threading
+import time
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 
 LAST = {}
-FLAKY = {"n": 0}
+FLAKY = {"/flaky/v1/systemone": 0, "/flaky-bg/v1/systemone": 0}
 
 
 def wav_info(b):
@@ -99,7 +109,7 @@ def anthropic(req, headers):
         need(prev[0] == {"type": "thinking", "thinking": "", "signature": "sig-1"},
              "thinking block not replayed verbatim")
         need(len(results) == 2, "both tool results must share ONE user message")
-        text = "done: " + " | ".join(r["content"] for r in results)
+        text = "done — " + " | ".join(r["content"] for r in results)
         return {"id": "msg_2", "type": "message", "role": "assistant",
                 "model": req["model"], "stop_reason": "end_turn",
                 "content": [{"type": "text", "text": text}],
@@ -129,7 +139,7 @@ def openai(req, headers):
         need(len(asst["tool_calls"]) == 2, "assistant tool_calls not replayed")
         need(isinstance(asst["tool_calls"][0]["function"]["arguments"], str),
              "arguments must be a JSON string")
-        text = "done: " + " | ".join(m["content"] for m in tool_msgs)
+        text = "done — " + " | ".join(m["content"] for m in tool_msgs)
         return {"id": "c2", "model": req["model"], "choices": [{
             "index": 0, "finish_reason": "stop",
             "message": {"role": "assistant", "content": text}}],
@@ -183,6 +193,71 @@ def systemone(req, headers):
             "usage": {"input_tokens": 210, "output_tokens": 31}}
 
 
+def anthropic_events(msg):
+    yield "message_start", {"type": "message_start", "message": {
+        "id": msg["id"], "type": "message", "role": "assistant",
+        "model": msg["model"], "content": [], "stop_reason": None,
+        "usage": {"input_tokens": msg["usage"]["input_tokens"], "output_tokens": 1}}}
+    yield "ping", {"type": "ping"}
+    for i, b in enumerate(msg["content"]):
+        t = b["type"]
+        if t == "text":
+            yield "content_block_start", {"type": "content_block_start", "index": i,
+                                          "content_block": {"type": "text", "text": ""}}
+            h = len(b["text"]) // 2
+            for part in (b["text"][:h], b["text"][h:]):
+                yield "content_block_delta", {"type": "content_block_delta", "index": i,
+                                              "delta": {"type": "text_delta", "text": part}}
+        elif t == "thinking":
+            # The real API sends no `signature` key at start: it arrives as a delta.
+            yield "content_block_start", {"type": "content_block_start", "index": i,
+                                          "content_block": {"type": "thinking", "thinking": ""}}
+            yield "content_block_delta", {"type": "content_block_delta", "index": i,
+                                          "delta": {"type": "signature_delta",
+                                                    "signature": b["signature"]}}
+        elif t == "tool_use":
+            yield "content_block_start", {"type": "content_block_start", "index": i,
+                                          "content_block": {"type": "tool_use", "id": b["id"],
+                                                            "name": b["name"], "input": {}}}
+            js = json.dumps(b["input"])
+            h = len(js) // 2
+            for part in (js[:h], js[h:]):
+                yield "content_block_delta", {"type": "content_block_delta", "index": i,
+                                              "delta": {"type": "input_json_delta",
+                                                        "partial_json": part}}
+        yield "content_block_stop", {"type": "content_block_stop", "index": i}
+    yield "message_delta", {"type": "message_delta",
+                            "delta": {"stop_reason": msg["stop_reason"]},
+                            "usage": {"output_tokens": msg["usage"]["output_tokens"]}}
+    yield "message_stop", {"type": "message_stop"}
+
+
+def openai_events(resp, include_usage):
+    m = resp["choices"][0]["message"]
+    base = {"id": resp["id"], "object": "chat.completion.chunk", "model": resp["model"]}
+
+    def chunk(delta, finish=None):
+        return dict(base, choices=[{"index": 0, "delta": delta, "finish_reason": finish}])
+
+    yield None, chunk({"role": "assistant", "content": ""})
+    text = m.get("content") or ""
+    h = len(text) // 2
+    for part in (text[:h], text[h:]):
+        yield None, chunk({"content": part})
+    for k, tc in enumerate(m.get("tool_calls", [])):
+        yield None, chunk({"tool_calls": [{"index": k, "id": tc["id"], "type": "function",
+                                           "function": {"name": tc["function"]["name"],
+                                                        "arguments": ""}}]})
+        a = tc["function"]["arguments"]
+        h = len(a) // 2
+        for part in (a[:h], a[h:]):
+            yield None, chunk({"tool_calls": [{"index": k, "function": {"arguments": part}}]})
+    yield None, chunk({}, resp["choices"][0]["finish_reason"])
+    if include_usage:
+        yield None, dict(base, choices=[], usage=resp["usage"])
+    yield None, "[DONE]"
+
+
 class Handler(BaseHTTPRequestHandler):
     def log_message(self, *a):
         pass
@@ -195,6 +270,21 @@ class Handler(BaseHTTPRequestHandler):
         self.send_header("Content-Length", str(len(body)))
         self.end_headers()
         self.wfile.write(body)
+
+    def stream(self, events, pause=0.02):
+        self.send_response(200)
+        self.send_header("Content-Type", "text/event-stream")
+        self.end_headers()
+        self.wfile.write(b": keep-alive\r\n\r\n")
+        for name, data in events:
+            payload = data if isinstance(data, str) else json.dumps(data, ensure_ascii=False)
+            ev = ("event: %s\n" % name if name else "") + "data: " + payload + "\n\n"
+            b = ev.encode("utf-8")
+            cut = max(1, (len(b) * 5) // 11)  # arbitrary: lands mid-line / mid-char
+            for piece in (b[:cut], b[cut:]):
+                self.wfile.write(piece)
+                self.wfile.flush()
+                time.sleep(pause)
 
     def do_GET(self):
         if self.path == "/__last":
@@ -215,14 +305,38 @@ class Handler(BaseHTTPRequestHandler):
                      "body": raw.decode("utf-8", "replace")})
         try:
             if self.path == "/v1/messages":
-                return self.reply(200, anthropic(json.loads(raw), headers))
+                req = json.loads(raw)
+                msg = anthropic(req, headers)
+                if req.get("stream"):
+                    return self.stream(anthropic_events(msg))
+                return self.reply(200, msg)
             if self.path == "/v1/chat/completions":
-                return self.reply(200, openai(json.loads(raw), headers))
+                req = json.loads(raw)
+                resp = openai(req, headers)
+                if req.get("stream"):
+                    inc = (req.get("stream_options") or {}).get("include_usage", False)
+                    return self.stream(openai_events(resp, inc))
+                return self.reply(200, resp)
+            if self.path == "/err/v1/messages":
+                req = json.loads(raw)
+                need(req.get("stream"), "stream expected")
+                return self.stream([
+                    ("message_start", {"type": "message_start", "message": {
+                        "model": req["model"], "usage": {"input_tokens": 3}}}),
+                    ("content_block_start", {"type": "content_block_start", "index": 0,
+                                             "content_block": {"type": "text", "text": ""}}),
+                    ("content_block_delta", {"type": "content_block_delta", "index": 0,
+                                             "delta": {"type": "text_delta", "text": "Partial é"}}),
+                    ("error", {"type": "error", "error": {"type": "overloaded_error",
+                                                          "message": "Overloaded"}})])
             if self.path == "/v1/systemone":
                 return self.reply(200, systemone(json.loads(raw), headers))
-            if self.path == "/flaky/v1/systemone":
-                FLAKY["n"] += 1
-                if FLAKY["n"] <= 2:
+            if self.path == "/slow/v1/systemone":
+                time.sleep(0.4)
+                return self.reply(200, systemone(json.loads(raw), headers))
+            if self.path in FLAKY:
+                FLAKY[self.path] += 1
+                if FLAKY[self.path] <= 2:
                     return self.reply(529, {"error": "overloaded"})
                 return self.reply(200, systemone(json.loads(raw), headers))
             if self.path == "/bad/v1/systemone":
