@@ -53,6 +53,16 @@ from noeira.ai.jev import JevQuestions, JevAnswers
 from noeira.envs.robots.g1_command_bank import G1CommandBank
 
 comptime G1_Q_COMMAND: String = "command"
+# ⚠ THREE COMMANDS IN ONE CALL. Jev answers every question against the same
+# state, so asking for a second and third step costs almost nothing beyond
+# repeating the option list — that is the shape of its cost model, and it is
+# what makes decomposition cheap here. "Marche un mètre et tourne sur
+# toi-même" is two steps, and a single-choice reading of it has to throw one
+# of them away.
+comptime G1_Q_CMD2: String = "command2"
+comptime G1_Q_CMD3: String = "command3"
+comptime G1_Q_EXTENT: String = "extent"
+comptime G1_MAX_STEPS: Int = 3
 comptime G1_Q_NEEDS_WORLD: String = "needs_world"
 comptime G1_Q_ADDRESSED: String = "addressed"
 comptime G1_OPT_NONE: String = "none"
@@ -121,13 +131,20 @@ def g1_command_instruction() -> String:
     0.90 with `P(none)` 0.04. That single edit is larger than any threshold
     in this file.
     """
+    # ⚠ "THE FIRST THING" IS LOAD-BEARING. Without it, a two-part
+    # instruction returns whichever part the model finds most salient:
+    # "marche un mètre puis tourne sur toi-même" came back `turn_around`,
+    # and "accroupis-toi puis lève les deux bras et marche" came back
+    # `walk_both_hands_up` — steps two and three merged into one. The
+    # chain questions only work if this one is anchored.
     return String(
         "A humanoid robot can perform exactly the commands listed, and"
-        " nothing else. Pick the command that best matches what the"
-        " instruction asks the robot to do with its body — it does not"
-        " have to match exactly, only be the closest thing the robot can"
-        " do. Pick `none` ONLY when no command on the list is even"
-        " approximately what was asked."
+        " nothing else. Which command is the FIRST thing the instruction"
+        " asks the robot to do? If the instruction asks for several things"
+        " in sequence, answer with the first one only. It does not have to"
+        " match exactly, only be the closest thing the robot can do. Pick"
+        " `none` ONLY when no command on the list is even approximately"
+        " what was asked."
     )
 
 
@@ -163,6 +180,45 @@ def g1_command_questions(
 
     var q = JevQuestions()
     q.choice(String(G1_Q_COMMAND), g1_command_instruction(), options, descs)
+    # ⚠ THE SAME OPTION LIST, so a second step is chosen from exactly what
+    # the robot can do. `none` on step 2 means the instruction was one
+    # command, which is the common case and must stay cheap.
+    q.choice(
+        String(G1_Q_CMD2),
+        String(
+            "If the instruction asks the robot to do a SECOND thing after the"
+            " first, which command is it? Pick `none` when the instruction"
+            " asks for only one thing."
+        ),
+        options, descs,
+    )
+    q.choice(
+        String(G1_Q_CMD3),
+        String(
+            "If the instruction asks for a THIRD thing after the second,"
+            " which command is it? Pick `none` otherwise."
+        ),
+        options, descs,
+    )
+    # ⚠ THE EXTENT IS ORDERED, WHICH IS WHY IT IS A `score`. "a metre" and
+    # "ten metres" are not unrelated labels, and the answer is the EXPECTED
+    # level — a float between them — so "a couple of metres" lands between
+    # the two rather than being forced onto one.
+    var levels = List[String]()
+    levels.append(String("barely at all — about half a metre, or one second"))
+    levels.append(String("a little — about one metre, or two seconds"))
+    levels.append(String("a moderate amount — about two metres, or three seconds"))
+    levels.append(String("a long way — about five metres, or six seconds"))
+    levels.append(String("a very long way — about ten metres, or twelve seconds"))
+    q.score(
+        String(G1_Q_EXTENT),
+        String(
+            "How far, or for how long, should the robot carry out the FIRST"
+            " action? Judge from the instruction; when it says nothing about"
+            " distance or duration, answer `a moderate amount`."
+        ),
+        levels,
+    )
     q.noul(
         String(G1_Q_NEEDS_WORLD),
         String(
@@ -264,6 +320,92 @@ def g1_command_phrase(name: String) -> String:
     return name
 
 
+struct G1ChainStep(Copyable, Movable):
+    var name: String
+    var conf: Float64
+
+    def __init__(out self, name: String, conf: Float64):
+        self.name = name
+        self.conf = conf
+
+
+def g1_extent_metres(level: Float64) -> Float64:
+    """The `extent` score as a distance, interpolated between the levels it
+    was described with. ⚠ Approximate by construction: the robot's distance
+    is integrated from its own commanded velocity with no odometry, so "a
+    metre" means about a metre."""
+    var t = level
+    if t < 0.0:
+        t = 0.0
+    if t > 4.0:
+        t = 4.0
+    var a = List[Float64]()
+    a.append(0.5)
+    a.append(1.0)
+    a.append(2.0)
+    a.append(5.0)
+    a.append(10.0)
+    var i = Int(t)
+    if i >= 4:
+        return a[4]
+    return a[i] + (a[i + 1] - a[i]) * (t - Float64(i))
+
+
+def g1_extent_seconds(level: Float64) -> Float64:
+    var t = level
+    if t < 0.0:
+        t = 0.0
+    if t > 4.0:
+        t = 4.0
+    var a = List[Float64]()
+    a.append(1.0)
+    a.append(2.0)
+    a.append(3.0)
+    a.append(6.0)
+    a.append(12.0)
+    var i = Int(t)
+    if i >= 4:
+        return a[4]
+    return a[i] + (a[i + 1] - a[i]) * (t - Float64(i))
+
+
+def g1_decide_chain(
+    ref ans: JevAnswers,
+    ref bank: G1CommandBank,
+    min_step: Float64 = 0.35,
+) raises -> List[G1ChainStep]:
+    """Steps 2 and 3, in order. Step 1 comes from `g1_decide`.
+
+    ⚠ A LATER STEP NEEDS A CLEARER ANSWER THAN THE FIRST, not a looser one.
+    Errors compound down a chain and nothing checks them: a wrong second step
+    runs after a correct first one and looks like the robot misunderstanding
+    the whole sentence. When in doubt, do less.
+    """
+    var out = List[G1ChainStep]()
+    var ids = List[String]()
+    ids.append(String(G1_Q_CMD2))
+    ids.append(String(G1_Q_CMD3))
+    for k in range(len(ids)):
+        var best = String("")
+        var bconf = 0.0
+        for i in range(bank.count() + G1_N_ALIAS):
+            var nm = bank.name_at(i) if i < bank.count() else g1_alias_name(
+                i - bank.count()
+            )
+            var p = ans.probability(ids[k], nm)
+            if p > bconf:
+                bconf = p
+                best = g1_resolve(nm)
+        var p_none = ans.probability(ids[k], String(G1_OPT_NONE))
+        # ⚠ STOP AT THE FIRST GAP. A third step without a second is not a
+        # chain, it is a misread — and running it would reorder the
+        # instruction.
+        if best == "" or bconf < min_step or p_none > bconf:
+            break
+        out.append(G1ChainStep(best, bconf))
+    return out^
+
+
 def g1_decide(
     ref ans: JevAnswers,
     ref bank: G1CommandBank,
@@ -302,7 +444,11 @@ def g1_decide(
     # greeting that the model half-reads as a command should move the robot,
     # not start a conversation — the movement is the demo, and a wrong answer
     # in words is more confusing than a wrong gesture.
-    if p_talk > r.conf and p_talk > max_none:
+    # ⚠ `talk` NEEDS A REAL BAR, not merely to beat `none`. A garbled
+    # fragment — "Fera un." — won at 0.30 and started a conversation about
+    # nothing. Beating the best movement is necessary; being confident is
+    # also necessary.
+    if p_talk > r.conf and p_talk > 0.50:
         r.talk = True
         r.name = String("")
         r.conf = p_talk

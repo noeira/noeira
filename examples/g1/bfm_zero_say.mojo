@@ -45,7 +45,8 @@ from std.time import perf_counter_ns
 
 from noeira.ai.jev import JevClient, JevQuestions
 from noeira.envs.robots.g1_command_language import (
-    g1_command_questions, g1_command_instruction, g1_decide,
+    g1_command_questions, g1_command_instruction, g1_decide, g1_decide_chain,
+    g1_extent_metres, g1_extent_seconds, G1_Q_EXTENT,
     g1_alias_name, g1_alias_target, g1_alias_desc, G1_N_ALIAS,
     G1_Q_COMMAND, G1_OPT_NONE,
 )
@@ -228,6 +229,17 @@ def main() raises:
             best2 = nm
     if best2 != "":
         print("runner-up:", best2, _f2(p2))
+    # the decomposition, so a two-part instruction can be read at a glance
+    var chain = g1_decide_chain(ans, bank)
+    if len(chain) > 0:
+        var cs = String("")
+        for i in range(len(chain)):
+            cs += String(" -> ") + chain[i].name + String(" ") \
+                  + _f2(chain[i].conf)
+        print("chain:" + cs)
+    var ext = ans.score(String(G1_Q_EXTENT))
+    print("extent:", _f2(ext), "->", _f2(g1_extent_metres(ext)), "m /",
+          _f2(g1_extent_seconds(ext)), "s")
 
     # ── abstain, or send ──────────────────────────────────────────────
     # ⚠ ONE RULE, in `g1_decide`. This used to hold its own copy of the
@@ -235,6 +247,13 @@ def main() raises:
     # copy; §12.54 measured the QUESTION's wording moving P(none) by half, so
     # two copies of the rule around it would be two different systems.
     var needs_world = d.needs_world
+    # ⚠ `talk` is a SUCCESS with an empty `name`, not a refusal. The viewer
+    # answers it; this tool only decides, so it says so and stops.
+    if d.talk:
+        print("TALK:", _f2(d.conf),
+              "— the speaker wanted an answer, not a movement.",
+              "`build/g1voice` replies; this does not.")
+        return
     if d.name == "":
         print("REFUSED:", d.reason, " P(none)", _f2(d.p_none),
               " (leaning", d.best, _f2(d.conf), ") — nothing sent.")

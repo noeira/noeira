@@ -76,7 +76,7 @@ from noeira.envs.robots.g1_tracking_eval import (
 from noeira.envs.robots.g1_command_bank import G1CommandBank
 from noeira.envs.robots.g1_command_channel import G1CommandChannel
 from noeira.envs.robots.g1_reward_vocab import (
-    G1_NVOC, g1_quantities, QV_BODY_H, QV_SPEED, QV_UPRIGHT,
+    G1_NVOC, g1_quantities, QV_BODY_H, QV_SPEED, QV_UPRIGHT, QV_SPEED_FWD,
     QV_LHAND_H, QV_RHAND_H, QV_YAW_RATE,
 )
 from noeira.render.sdl import Ptr
@@ -95,6 +95,7 @@ from noeira.ai.jev import JevClient
 from noeira.ai.speech import SpeechToText
 from noeira.envs.robots.g1_command_language import (
     g1_command_questions, g1_decide, G1LangPick, g1_command_phrase,
+    g1_decide_chain, g1_extent_metres, g1_extent_seconds, G1_Q_EXTENT,
 )
 from noeira.ai.chat import ChatClient, ChatMessage, ToolSpec
 
@@ -232,6 +233,16 @@ def _speaking() -> Bool:
 
 
 comptime SPEAK_TEXT: String = "/tmp/noeira_g1_say.txt"
+
+
+def _ns(seconds: Float64) -> Int:
+    """Seconds to nanoseconds, via milliseconds.
+
+    ⚠ `Int(x * 1e9)` does not compile here — the literal drags the product
+    into a SIMD type that `Int` will not take. Going through an integer
+    millisecond keeps it in Int arithmetic, and a millisecond is finer than
+    anything this schedules."""
+    return Int(seconds * 1000.0) * 1_000_000
 
 
 def _say_async(text: String):
@@ -474,6 +485,16 @@ def main() raises:
     var prev_m = False
     var forced = False
     var above = 0
+    # ── the queue ─────────────────────────────────────────────────────
+    # ⚠ ONE STEP IS ACTIVE AT A TIME and the rest wait. A chain is not
+    # played by scheduling three commands at fixed offsets: a locomotion
+    # step ends on DISTANCE, which is not known in advance.
+    var q_name = List[String]()
+    var q_conf = List[Float64]()
+    var step_end_dist = 0.0     # metres, 0 = not distance-terminated
+    var step_end_at = perf_counter_ns()
+    var step_dist = 0.0
+    var extent = 2.0
     # ⚠ while this is in the future, the microphone is the robot's own voice
     var mute_until = perf_counter_ns()
 
@@ -529,7 +550,7 @@ def main() raises:
         # and past that ffmpeg blocks and the device drops audio. The samples
         # are read and DISCARDED, never ringed, never levelled.
         if _speaking():
-            mute_until = perf_counter_ns() + Int(ECHO_TAIL_S * 1e9)
+            mute_until = perf_counter_ns() + _ns(ECHO_TAIL_S)
         var echoing = perf_counter_ns() < mute_until
         if mic_on and mic_dead == "":
             try:
@@ -681,6 +702,30 @@ def main() raises:
                         pending_blend = 25
                         last_event = String("voice: ") + pick.name
                         t_cmd = perf_counter_ns()
+                        # the first step's extent comes from the utterance
+                        extent = ans.score(String(G1_Q_EXTENT))
+                        step_dist = 0.0
+                        if bank.group_at(idx2) == "locomotion":
+                            step_end_dist = g1_extent_metres(extent)
+                            # ⚠ AND A CLOCK AS WELL. A robot that is blocked,
+                            # or walking on the spot, would never reach its
+                            # distance and the chain would hang for ever.
+                            step_end_at = perf_counter_ns() + _ns(g1_extent_seconds(extent) * 3.0 + 4.0)
+                        else:
+                            step_end_dist = 0.0
+                            step_end_at = perf_counter_ns() + _ns(g1_extent_seconds(extent))
+                        var rest = g1_decide_chain(ans, bank)
+                        q_name = List[String]()
+                        q_conf = List[Float64]()
+                        for si in range(len(rest)):
+                            q_name.append(rest[si].name)
+                            q_conf.append(rest[si].conf)
+                        if len(q_name) > 0:
+                            var qs = String("")
+                            for si in range(len(q_name)):
+                                qs += String(" -> ") + q_name[si]
+                            print("  [chain]", len(q_name), "more:", qs,
+                                  " extent", _f2(extent))
                         print("  [pick]", pick.name, _f2(pick.conf),
                               " P(none)", _f2(pick.p_none),
                               " world", _f2(pick.needs_world))
@@ -696,8 +741,7 @@ def main() raises:
                                 utter = utter + String(
                                     ", but I have no object or destination")
                             _say_async(utter)
-                            mute_until = perf_counter_ns() + Int(
-                                ECHO_TAIL_S * 1e9)
+                            mute_until = perf_counter_ns() + _ns(ECHO_TAIL_S)
                 elif pick.talk:
                     # ⚠ NOT a bank command: the speaker wanted an answer.
                     # Nothing about the robot's motion changes — it goes on
@@ -734,7 +778,7 @@ def main() raises:
                 heard = rep.text
                 if not mute:
                     _say_async(rep.text)
-                    mute_until = perf_counter_ns() + Int(ECHO_TAIL_S * 1e9)
+                    mute_until = perf_counter_ns() + _ns(ECHO_TAIL_S)
                 last_event = String("replied")
                 state = ST_IDLE
 
@@ -808,10 +852,48 @@ def main() raises:
                 forced = True
         prev_key = rec_key
 
+        # ── the queue advances when the current step is done ──────────
+        var step_done = (step_dist >= step_end_dist) if step_end_dist > 0.0 \
+                        else (perf_counter_ns() >= step_end_at)
+        if step_done and len(q_name) > 0 and state == ST_IDLE:
+            var nxt = q_name[0]
+            var ncf = q_conf[0]
+            var rest_n = List[String]()
+            var rest_c = List[Float64]()
+            for i in range(1, len(q_name)):
+                rest_n.append(q_name[i])
+                rest_c.append(q_conf[i])
+            q_name = rest_n^
+            q_conf = rest_c^
+            var ni = bank.find(nxt)
+            if ni >= 0:
+                pending = ni
+                pending_blend = 25
+                last_event = String("then: ") + nxt
+                print("  [chain] ->", nxt, _f2(ncf))
+                step_dist = 0.0
+                # ⚠ a queued step gets the DEFAULT extent, not the first
+                # step's. "Walk a metre and turn round" does not ask the
+                # robot to turn round for a metre.
+                if bank.group_at(ni) == "locomotion":
+                    step_end_dist = 2.0
+                    step_end_at = perf_counter_ns() + _ns(8.0)
+                else:
+                    step_end_dist = 0.0
+                    step_end_at = perf_counter_ns() + _ns(3.0)
+                if not mute:
+                    var u2 = g1_command_phrase(nxt)
+                    for pi in range(len(ph_name)):
+                        if ph_name[pi] == nxt:
+                            u2 = ph_text[pi]
+                    _say_async(u2)
+                    mute_until = perf_counter_ns() + _ns(ECHO_TAIL_S)
+
         # ⚠ LOCOMOTION HAS NO NATURAL END. A posture holds itself because `z`
         # persists; `walk` walks for ever. The bank's `group` is what decides.
         if (bank.group_at(cur) == "locomotion"
             and Float64(perf_counter_ns() - t_cmd) / 1e9 > walk_s
+            and len(q_name) == 0 and step_done
             and state == ST_IDLE):
             var si2 = bank.find(String("stand"))
             if si2 >= 0 and cur != si2:
@@ -866,6 +948,14 @@ def main() raises:
         aobs.push(o, act_out)
         _ = env.step(a)
         g1_quantities(o, 0, quant, 0)
+        # ⚠ DISTANCE IS INTEGRATED FROM THE POLICY'S OWN VELOCITY. There is
+        # no odometry and nothing corrects it, so "one metre" means about one
+        # metre — good enough for an instruction, not for anything that has
+        # to be right. dt is the env's control step, not the frame time.
+        var sp = quant[QV_SPEED_FWD]
+        if sp < 0.0:
+            sp = -sp
+        step_dist += sp * 0.02
 
         # ── the UI ────────────────────────────────────────────────────
         var win_h = env.renderer_height()
