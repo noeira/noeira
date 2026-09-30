@@ -98,6 +98,14 @@ from noeira.envs.robots.unitree_g1_xml import (
 from noeira.envs.robots.g1_tracking_eval import (
     G1_D, G1_H, G1_L, G1_HB, g1_project_z,
 )
+from noeira.envs.robots.g1_reward_vocab import (
+    G1_NVOC, G1Term, g1_quantities, g1_vocab_name, g1_term_value,
+    g1_term_str, g1_ess_rows, g1_quantile,
+    OP_GT, OP_LT, OP_BAND, OP_SOFT,
+    QV_BODY_H, QV_HEAD_H, QV_LHAND_H, QV_RHAND_H, QV_LHAND_LAT,
+    QV_RHAND_LAT, QV_LFOOT_H, QV_RFOOT_H, QV_UPRIGHT, QV_SPEED_FWD,
+    QV_SPEED_LAT, QV_SPEED, QV_YAW_RATE, QV_TORSO_YAW,
+)
 
 comptime SP: Int = UNITREE_G1_OBS_DIM
 comptime OBS: Int = UNITREE_G1_FULL_OBS_DIM
@@ -112,45 +120,12 @@ comptime HOLD: Int = 40
 # size itself be a runtime flag — which is the whole point of this probe.
 comptime CHUNK: Int = 4096
 
-# ── the named vocabulary ──────────────────────────────────────────────────
-# `g1_skeleton_body` order: 0 pelvis, 1-6 left leg, 7-12 right leg,
-# 13-15 waist/torso, 16-22 left arm, 23-29 right arm, 30 the virtual head.
-# ⚠ THE POS BLOCK DROPS THE ROOT: body s is at `1 + (s-1)*3` there, and at
-# `s*6` / `s*3` in ROT / VEL / ANGVEL. Reading a neighbouring body returns a
-# perfectly plausible wrong `z`, so each index is derived from the skeleton
-# constant rather than written out.
-comptime SK_ANKLE_L: Int = 6        # left_ankle_roll_link   (model body 7)
-comptime SK_ANKLE_R: Int = 12       # right_ankle_roll_link  (model body 17)
-comptime SK_TORSO: Int = 15         # torso_link             (model body 24)
-comptime SK_WRIST_L: Int = 22       # left_wrist_yaw_link    (model body 31)
-comptime SK_WRIST_R: Int = 29       # right_wrist_yaw_link   (model body 39)
-comptime SK_HEAD: Int = 30          # the virtual head       (torso + 0.35 z)
-
-comptime P_L: Int = G1_PRIV_OFF_POS   # POS base, body s at P_L + (s-1)*3
-comptime R_L: Int = G1_PRIV_OFF_ROT   # ROT base, body s at R_L + s*6
-comptime V_L: Int = G1_PRIV_OFF_VEL
-comptime W_L: Int = G1_PRIV_OFF_ANGVEL
-
-comptime NVOC: Int = 13
-comptime Q_BODY_H: Int = 0
-comptime Q_HEAD_H: Int = 1
-comptime Q_LHAND_H: Int = 2
-comptime Q_RHAND_H: Int = 3
-comptime Q_LHAND_LAT: Int = 4
-comptime Q_RHAND_LAT: Int = 5
-comptime Q_LFOOT_H: Int = 6
-comptime Q_RFOOT_H: Int = 7
-comptime Q_UPRIGHT: Int = 8
-comptime Q_SPEED_FWD: Int = 9
-comptime Q_SPEED: Int = 10
-comptime Q_YAW_RATE: Int = 11
-comptime Q_TORSO_YAW: Int = 12
-
-# term ops
-comptime OP_GT: Int = 0        # I[x > lo]
-comptime OP_LT: Int = 1        # I[x < hi]
-comptime OP_BAND: Int = 2      # I[lo < x < hi]
-comptime OP_SOFT: Int = 3      # exp(-lo * |x|)   — Motivo's stillness term
+# ⚠ THE VOCABULARY LIVES IN `noeira/envs/robots/g1_reward_vocab.mojo`.
+# It was defined inline here first, and then `bfm_zero_bank_build.mojo`
+# needed the identical definition of "right hand height" — one to score the
+# POOL, one to score the ROLLOUT. Two copies of those index rules would let
+# every command appear to work while measuring something else, which is the
+# single most recurring defect shape in this tree. One definition, imported.
 
 comptime FNet = BFMFTower[OBS, ACT, D, G1_H, G1_L, D]
 comptime BNet = BFMBNetFiltered[OBS, SP, D, G1_HB]
@@ -158,97 +133,6 @@ comptime ANet = BFMActorTowerFiltered[
     OBS, UNITREE_G1_STATE_DIM, G1_ACTOR_EXTRA, D, G1_H, G1_L, ACT
 ]
 comptime Trainer = FBTrainer[FNet, BNet, ANet, OBS, ACT, D, BATCH, "cpu"]
-
-
-def _vocab_name(q: Int) -> String:
-    if q == Q_BODY_H:
-        return String("body_height")
-    if q == Q_HEAD_H:
-        return String("head_height")
-    if q == Q_LHAND_H:
-        return String("left_hand_height")
-    if q == Q_RHAND_H:
-        return String("right_hand_height")
-    if q == Q_LHAND_LAT:
-        return String("left_hand_lateral")
-    if q == Q_RHAND_LAT:
-        return String("right_hand_lateral")
-    if q == Q_LFOOT_H:
-        return String("left_foot_height")
-    if q == Q_RFOOT_H:
-        return String("right_foot_height")
-    if q == Q_UPRIGHT:
-        return String("upright")
-    if q == Q_SPEED_FWD:
-        return String("body_speed_forward")
-    if q == Q_SPEED:
-        return String("body_speed")
-    if q == Q_YAW_RATE:
-        return String("body_angular_velocity_yaw")
-    return String("torso_yaw")
-
-
-@always_inline
-def _quantities(ref o: List[Float64], base: Int, mut out: List[Float64], off: Int):
-    """The 13 named quantities from one [state 64 | privileged 463] row.
-
-    ⚠ THE ONE DEFINITION. The pool scorer and the rollout metric both call
-    this. Heights are ABSOLUTE: the privileged POS block is root-relative in
-    the heading frame, and the heading frame is a yaw-only rotation, so z adds
-    straight onto the root height. Lateral distances stay in the heading
-    frame, which is what makes them mean "out to the side of the robot"
-    rather than "along the world y axis".
-    """
-    var p = base + UNITREE_G1_STATE_DIM
-    var root_z = o[p + G1_PRIV_OFF_HEIGHT]
-    out[off + Q_BODY_H] = root_z
-    out[off + Q_HEAD_H] = root_z + o[p + P_L + (SK_HEAD - 1) * 3 + 2]
-    out[off + Q_LHAND_H] = root_z + o[p + P_L + (SK_WRIST_L - 1) * 3 + 2]
-    out[off + Q_RHAND_H] = root_z + o[p + P_L + (SK_WRIST_R - 1) * 3 + 2]
-    var ly = o[p + P_L + (SK_WRIST_L - 1) * 3 + 1]
-    var ry = o[p + P_L + (SK_WRIST_R - 1) * 3 + 1]
-    out[off + Q_LHAND_LAT] = ly if ly > 0.0 else -ly
-    out[off + Q_RHAND_LAT] = ry if ry > 0.0 else -ry
-    out[off + Q_LFOOT_H] = root_z + o[p + P_L + (SK_ANKLE_L - 1) * 3 + 2]
-    out[off + Q_RFOOT_H] = root_z + o[p + P_L + (SK_ANKLE_R - 1) * 3 + 2]
-    out[off + Q_UPRIGHT] = o[p + R_L + SK_TORSO * 6 + 5]      # torso normal z
-    var vx = o[p + V_L + 0]
-    var vy = o[p + V_L + 1]
-    out[off + Q_SPEED_FWD] = vx
-    out[off + Q_SPEED] = sqrt(vx * vx + vy * vy)
-    out[off + Q_YAW_RATE] = o[p + W_L + 2]
-    out[off + Q_TORSO_YAW] = o[p + R_L + SK_TORSO * 6 + 1]    # torso tangent y
-
-
-struct Term(Copyable, Movable):
-    """One predicate. `as_pct` resolves `lo`/`hi` against the POOL's own
-    quantile of that quantity — a literal threshold nobody in the dataset
-    satisfies gives a reward of 0 everywhere, and `z_from_reward` still
-    returns a unit-norm vector. That failure is silent, so thresholds that
-    should follow the data say so."""
-    var q: Int
-    var op: Int
-    var lo: Float64
-    var hi: Float64
-    var as_pct: Bool
-
-    def __init__(out self, q: Int, op: Int, lo: Float64, hi: Float64, as_pct: Bool):
-        self.q = q
-        self.op = op
-        self.lo = lo
-        self.hi = hi
-        self.as_pct = as_pct
-
-
-def _term_str(ref t: Term, lo: Float64, hi: Float64) -> String:
-    var n = _vocab_name(t.q)
-    if t.op == OP_GT:
-        return n + String(" > ") + _f3(lo)
-    if t.op == OP_LT:
-        return n + String(" < ") + _f3(hi)
-    if t.op == OP_BAND:
-        return _f3(lo) + String(" < ") + n + String(" < ") + _f3(hi)
-    return String("exp(-") + _f3(t.lo) + String(" * |") + n + String("|)")
 
 
 def _f3(v: Float64) -> String:
@@ -294,43 +178,6 @@ def _has(name: String) raises -> Bool:
     return False
 
 
-def _term_value(ref t: Term, lo: Float64, hi: Float64, x: Float64) -> Float64:
-    if t.op == OP_GT:
-        return 1.0 if x > lo else 0.0
-    if t.op == OP_LT:
-        return 1.0 if x < hi else 0.0
-    if t.op == OP_BAND:
-        return 1.0 if (x > lo and x < hi) else 0.0
-    var a = x if x > 0.0 else -x
-    return exp(-t.lo * a)
-
-
-def _ess_pct(ref w: List[Float64], n: Int) -> Float64:
-    """(sum w)^2 / sum w^2, as a percentage of `n`. The number of pool rows
-    actually standing behind the prompt."""
-    var s1 = 0.0
-    var s2 = 0.0
-    for i in range(n):
-        s1 += w[i]
-        s2 += w[i] * w[i]
-    if s2 <= 0.0:
-        return 0.0
-    return 100.0 * (s1 * s1 / s2) / Float64(n)
-
-
-def _pct_of(ref col: List[Float64], q: Float64) -> Float64:
-    var v = List[Float64](length=len(col), fill=0.0)
-    for i in range(len(col)):
-        v[i] = col[i]
-    sort(v)
-    var idx = Int(q * Float64(len(v) - 1) + 0.5)
-    if idx < 0:
-        idx = 0
-    if idx >= len(v):
-        idx = len(v) - 1
-    return v[idx]
-
-
 struct Roll(Copyable, Movable):
     var q: List[Float64]
 
@@ -373,8 +220,8 @@ def _roll[
     for k in range(D):
         z1.data[k] = z[z_off + k]
 
-    var acc = List[Float64](length=NVOC, fill=0.0)
-    var one = List[Float64](length=NVOC, fill=0.0)
+    var acc = List[Float64](length=G1_NVOC, fill=0.0)
+    var one = List[Float64](length=G1_NVOC, fill=0.0)
     var n = 0
     for step in range(horizon):
         var o = env.get_obs_list()
@@ -398,11 +245,11 @@ def _roll[
                 env.renderer_delay(frame_delay_ms)
         if step >= horizon - HOLD:
             var o2 = env.get_obs_list()
-            _quantities(o2, 0, one, 0)
-            for c in range(NVOC):
+            g1_quantities(o2, 0, one, 0)
+            for c in range(G1_NVOC):
                 acc[c] += one[c]
             n += 1
-    for c in range(NVOC):
+    for c in range(G1_NVOC):
         acc[c] = acc[c] / Float64(n)
     return Roll(acc)
 
@@ -449,33 +296,33 @@ def main() raises:
     var names = List[String]()
     var says = List[String]()
     var prim = List[Int]()
-    var terms = List[List[Term]]()
+    var terms = List[List[G1Term]]()
 
-    var c0 = List[Term]()
-    c0.append(Term(Q_UPRIGHT, OP_GT, 0.90, 0.0, False))
-    c0.append(Term(Q_HEAD_H, OP_GT, 0.50, 0.0, True))
-    c0.append(Term(Q_SPEED, OP_SOFT, 3.0, 0.0, False))
-    c0.append(Term(Q_RHAND_H, OP_GT, 0.90, 0.0, True))
-    c0.append(Term(Q_LHAND_H, OP_LT, 0.0, 0.50, True))
+    var c0 = List[G1Term]()
+    c0.append(G1Term(QV_UPRIGHT, OP_GT, 0.90, 0.0, False))
+    c0.append(G1Term(QV_HEAD_H, OP_GT, 0.50, 0.0, True))
+    c0.append(G1Term(QV_SPEED, OP_SOFT, 3.0, 0.0, False))
+    c0.append(G1Term(QV_RHAND_H, OP_GT, 0.90, 0.0, True))
+    c0.append(G1Term(QV_LHAND_H, OP_LT, 0.0, 0.50, True))
     names.append(String("raise_right_hand"))
     says.append(String("Motivo raisearms-l-h + standing"))
     prim.append(3)                      # the right-hand term is the goal
     terms.append(c0^)
 
-    var c1 = List[Term]()
-    c1.append(Term(Q_UPRIGHT, OP_GT, 0.90, 0.0, False))
-    c1.append(Term(Q_BODY_H, OP_BAND, 0.40, 0.62, False))
-    c1.append(Term(Q_SPEED, OP_SOFT, 3.0, 0.0, False))
+    var c1 = List[G1Term]()
+    c1.append(G1Term(QV_UPRIGHT, OP_GT, 0.90, 0.0, False))
+    c1.append(G1Term(QV_BODY_H, OP_BAND, 0.40, 0.62, False))
+    c1.append(G1Term(QV_SPEED, OP_SOFT, 3.0, 0.0, False))
     names.append(String("squat"))
     says.append(String("Motivo crouch: low root, still UPRIGHT"))
     prim.append(1)
     terms.append(c1^)
 
-    var c2 = List[Term]()
-    c2.append(Term(Q_UPRIGHT, OP_GT, 0.90, 0.0, False))
-    c2.append(Term(Q_BODY_H, OP_GT, 0.50, 0.0, True))
-    c2.append(Term(Q_SPEED, OP_SOFT, 3.0, 0.0, False))
-    c2.append(Term(Q_TORSO_YAW, OP_GT, 0.90, 0.0, True))
+    var c2 = List[G1Term]()
+    c2.append(G1Term(QV_UPRIGHT, OP_GT, 0.90, 0.0, False))
+    c2.append(G1Term(QV_BODY_H, OP_GT, 0.50, 0.0, True))
+    c2.append(G1Term(QV_SPEED, OP_SOFT, 3.0, 0.0, False))
+    c2.append(G1Term(QV_TORSO_YAW, OP_GT, 0.90, 0.0, True))
     names.append(String("look_left"))
     says.append(String("Motivo rotate + its alignment term"))
     prim.append(3)
@@ -485,10 +332,10 @@ def main() raises:
     # objectives (one wants motion, the other stillness). Motivo reports
     # FB-CPR at 74 % of single-task TD3 on exactly this pairing, so a partial
     # result here is the expected shape, not a failure.
-    var c3 = List[Term]()
-    c3.append(Term(Q_UPRIGHT, OP_GT, 0.90, 0.0, False))
-    c3.append(Term(Q_SPEED_FWD, OP_BAND, 0.60, 0.90, True))
-    c3.append(Term(Q_LHAND_H, OP_GT, 0.90, 0.0, True))
+    var c3 = List[G1Term]()
+    c3.append(G1Term(QV_UPRIGHT, OP_GT, 0.90, 0.0, False))
+    c3.append(G1Term(QV_SPEED_FWD, OP_BAND, 0.60, 0.90, True))
+    c3.append(G1Term(QV_LHAND_H, OP_GT, 0.90, 0.0, True))
     names.append(String("walk_left_hand_up"))
     says.append(String("Motivo WALK-LAM: band on speed x hand high"))
     prim.append(2)
@@ -500,12 +347,12 @@ def main() raises:
     # TARGET set to 0 — a band, not a decay. This arm swaps one for the other
     # and is otherwise identical to `raise_right_hand`, so the difference is
     # attributable to that single term.
-    var c4 = List[Term]()
-    c4.append(Term(Q_UPRIGHT, OP_GT, 0.90, 0.0, False))
-    c4.append(Term(Q_HEAD_H, OP_GT, 0.50, 0.0, True))
-    c4.append(Term(Q_SPEED, OP_LT, 0.0, 0.30, False))
-    c4.append(Term(Q_RHAND_H, OP_GT, 0.90, 0.0, True))
-    c4.append(Term(Q_LHAND_H, OP_LT, 0.0, 0.50, True))
+    var c4 = List[G1Term]()
+    c4.append(G1Term(QV_UPRIGHT, OP_GT, 0.90, 0.0, False))
+    c4.append(G1Term(QV_HEAD_H, OP_GT, 0.50, 0.0, True))
+    c4.append(G1Term(QV_SPEED, OP_LT, 0.0, 0.30, False))
+    c4.append(G1Term(QV_RHAND_H, OP_GT, 0.90, 0.0, True))
+    c4.append(G1Term(QV_LHAND_H, OP_LT, 0.0, 0.50, True))
     names.append(String("raise_right_hand_hard"))
     says.append(String("same, with I[speed < 0.3] instead of exp(-3|v|)"))
     prim.append(3)
@@ -549,7 +396,7 @@ def main() raises:
 
         # ── chunked encode: B over the pool, CHUNK rows at a time ──────
         var b_list = List[Scalar[DT]](length=n_pool * D, fill=Scalar[DT](0))
-        var qv = List[Float64](length=n_pool * NVOC, fill=0.0)
+        var qv = List[Float64](length=n_pool * G1_NVOC, fill=0.0)
         var row = List[Float64](length=SP, fill=0.0)
         var chunk_t = Tensor.alloc(CHUNK * OBS)
         var b_chunk = Tensor()
@@ -569,7 +416,7 @@ def main() raises:
                 # ⚠ RAW, before the normaliser: the reward is about physical
                 # quantities, and `_quantities` is the same call the rollout
                 # metric makes.
-                _quantities(row, 0, qv, (done + j) * NVOC)
+                g1_quantities(row, 0, qv, (done + j) * G1_NVOC)
                 for k in range(SP):
                     chunk_t.data[j * OBS + k] = Scalar[DT](row[k])
             if norm:
@@ -596,15 +443,15 @@ def main() raises:
                   + _lpad(String("p02"), 9) + _lpad(String("p10"), 9)
                   + _lpad(String("p50"), 9) + _lpad(String("p90"), 9)
                   + _lpad(String("p98"), 9))
-            for q in range(NVOC):
+            for q in range(G1_NVOC):
                 for i in range(n_pool):
-                    col[i] = qv[i * NVOC + q]
-                print("    " + _pad(_vocab_name(q), 28)
-                      + _lpad(_f3(_pct_of(col, 0.02)), 9)
-                      + _lpad(_f3(_pct_of(col, 0.10)), 9)
-                      + _lpad(_f3(_pct_of(col, 0.50)), 9)
-                      + _lpad(_f3(_pct_of(col, 0.90)), 9)
-                      + _lpad(_f3(_pct_of(col, 0.98)), 9))
+                    col[i] = qv[i * G1_NVOC + q]
+                print("    " + _pad(g1_vocab_name(q), 28)
+                      + _lpad(_f3(g1_quantile(col, 0.02)), 9)
+                      + _lpad(_f3(g1_quantile(col, 0.10)), 9)
+                      + _lpad(_f3(g1_quantile(col, 0.50)), 9)
+                      + _lpad(_f3(g1_quantile(col, 0.90)), 9)
+                      + _lpad(_f3(g1_quantile(col, 0.98)), 9))
 
         for c in range(ncmd):
             print("  " + _pad(names[c], 26) + says[c])
@@ -617,16 +464,16 @@ def main() raises:
             for ti in range(nt):
                 var tm = terms[c][ti].copy()
                 for i in range(n_pool):
-                    col[i] = qv[i * NVOC + tm.q]
-                var lo = _pct_of(col, tm.lo) if tm.as_pct else tm.lo
-                var hi = _pct_of(col, tm.hi) if tm.as_pct else tm.hi
+                    col[i] = qv[i * G1_NVOC + tm.q]
+                var lo = g1_quantile(col, tm.lo) if tm.as_pct else tm.lo
+                var hi = g1_quantile(col, tm.hi) if tm.as_pct else tm.hi
                 for i in range(n_pool):
-                    w[i] = _term_value(tm, lo, hi, col[i])
+                    w[i] = g1_term_value(tm, lo, hi, col[i])
                     prod[i] *= w[i]
                     if ti != prim[c]:
                         scaf[i] *= w[i]
-                var e = _ess_pct(w, n_pool)
-                print("    " + _pad(_term_str(tm, lo, hi), 46) + _lpad(_f3(e), 9)
+                var e = (100.0 * g1_ess_rows(w, n_pool) / Float64(n_pool))
+                print("    " + _pad(g1_term_str(tm, lo, hi), 46) + _lpad(_f3(e), 9)
                       + _lpad(String(Int(e * Float64(n_pool) / 100.0)), 9))
                 # the SINGLE-term arm is the primary term on its own
                 if ti == prim[c]:
@@ -635,7 +482,7 @@ def main() raises:
                     var zsg = z_from_reward[D](b_list, rew, n_pool)
                     for k in range(D):
                         zs_all[(pi * ncmd + c) * D + k] = zsg[k]
-            var ep = _ess_pct(prod, n_pool)
+            var ep = (100.0 * g1_ess_rows(prod, n_pool) / Float64(n_pool))
             var nrows = Int(ep * Float64(n_pool) / 100.0)
             print("    " + _pad(String("PRODUCT"), 46) + _lpad(_f3(ep), 9)
                   + _lpad(String(nrows), 9)
@@ -647,7 +494,7 @@ def main() raises:
                 var zcp = z_from_reward[D](b_list, rew, n_pool)
                 for k in range(D):
                     zc_all[(pi * ncmd + c) * D + k] = zcp[k]
-            var ek = _ess_pct(scaf, n_pool)
+            var ek = (100.0 * g1_ess_rows(scaf, n_pool) / Float64(n_pool))
             print("    " + _pad(String("scaffold (goal term removed)"), 46)
                   + _lpad(_f3(ek), 9)
                   + _lpad(String(Int(ek * Float64(n_pool) / 100.0)), 9))
@@ -663,14 +510,14 @@ def main() raises:
     print("BEHAVIOUR at pool", pools[1], "— single term vs compound")
     var hdr = String("  ") + _pad(String("command / arm"), 26)
     var show = List[Int]()
-    show.append(Q_RHAND_H)
-    show.append(Q_LHAND_H)
-    show.append(Q_BODY_H)
-    show.append(Q_SPEED)
-    show.append(Q_UPRIGHT)
-    show.append(Q_TORSO_YAW)
+    show.append(QV_RHAND_H)
+    show.append(QV_LHAND_H)
+    show.append(QV_BODY_H)
+    show.append(QV_SPEED)
+    show.append(QV_UPRIGHT)
+    show.append(QV_TORSO_YAW)
     for i in range(len(show)):
-        hdr += _lpad(_vocab_name(show[i]), 13)
+        hdr += _lpad(g1_vocab_name(show[i]), 13)
     print(hdr)
     for c in range(ncmd):
         var rs = _roll[FNet, BNet, ANet](
