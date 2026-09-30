@@ -44,6 +44,10 @@ from std.sys import argv
 from std.time import perf_counter_ns
 
 from noeira.ai.jev import JevClient, JevQuestions
+from noeira.envs.robots.g1_command_language import (
+    g1_command_questions, g1_command_instruction, g1_decide,
+    G1_Q_COMMAND, G1_OPT_NONE,
+)
 # ⚠ module scope — Mojo rejects an import inside a branch. Importing costs
 # nothing; only `SpeechToText.huggingface()` needs HF_TOKEN, so `--text`
 # still runs without one.
@@ -88,20 +92,6 @@ def _spin(ms: Int):
     var want = ms * 1_000_000
     while Int(perf_counter_ns() - t0) < want:
         pass
-
-
-def _INSTR() -> String:
-    """⚠ ONE copy of the wording. §12.54 measured it moving `P(none)` by half,
-    so a second transcription in the order sweep would be measuring a
-    different question than the one that ships."""
-    return String(
-        "A humanoid robot can perform exactly the commands listed, and"
-        " nothing else. Pick the command that best matches what the"
-        " instruction asks the robot to do with its body — it does not"
-        " have to match exactly, only be the closest thing the robot can"
-        " do. Pick `none` ONLY when no command on the list is even"
-        " approximately what was asked."
-    )
 
 
 def main() raises:
@@ -168,35 +158,7 @@ def main() raises:
     options.append(String("none"))
     descs.append(String("not one of these, or not a command for this robot"))
 
-    var q = JevQuestions()
-    q.choice(
-        String("command"),
-        # ⚠ `none` IS THE EXCEPTION, and the wording has to say so. The
-        # first version ended "Choose `none` if the instruction asks for
-        # something not on the list", which reads as an invitation: "show me
-        # your left hand" came back `none` 0.52 against `left_hand_up` 0.48.
-        _INSTR(),
-        options, descs,
-    )
-    # ⚠ ONE MORE QUESTION, AND IT IS NEARLY FREE. Jev answers every question
-    # against the same state, so a second costs almost nothing — that is the
-    # whole shape of its cost model.
-    #
-    # It exists because rewording the choice to stop it over-picking `none`
-    # created the opposite error: "walk to the fridge and open it" went from
-    # a refusal to `walk` at 0.92. That is not wrong — walking IS the closest
-    # thing this robot can do — but it silently drops "to the fridge and open
-    # it". This robot has no object interaction and no navigation to a
-    # landmark, so asking about THAT directly is answerable from the
-    # instruction alone, and it does not need to know which command was
-    # picked.
-    q.noul(
-        String("needs_world"),
-        String(
-            "Does the instruction ask the robot to interact with an object,"
-            " or to go to a particular place or thing?"
-        ),
-    )
+    var q = g1_command_questions(bank)
 
     var jev = JevClient.from_env()
 
@@ -217,11 +179,11 @@ def main() raises:
                     o2.append(bank.name_at(k))
                     d2.append(bank.describe(k))
             var q2 = JevQuestions()
-            q2.choice(String("command"), _INSTR(), o2, d2)
+            q2.choice(String(G1_Q_COMMAND), g1_command_instruction(), o2, d2)
             var a2 = jev.decide_text(String("instruction: ") + text, q2)
-            var pk = a2.choice(String("command"))
-            var pn = a2.probability(String("command"), String("none"))
-            var cf = a2.confidence(String("command"))
+            var pk = a2.choice(String(G1_Q_COMMAND))
+            var pn = a2.probability(String(G1_Q_COMMAND), String(G1_OPT_NONE))
+            var cf = a2.confidence(String(G1_Q_COMMAND))
             print("  rot", rot, "->", pk, " top1", _f2(cf), " P(none)", _f2(pn))
             if r == 0:
                 first = pk
@@ -233,58 +195,39 @@ def main() raises:
     var t0 = perf_counter_ns()
     var ans = jev.decide_text(String("instruction: ") + text, q)
     var ms = Float64(perf_counter_ns() - t0) / 1e6
-    var argmax = ans.choice(String("command"))
-    var p_none = ans.probability(String("command"), String("none"))
-    # ⚠ THE BEST REAL COMMAND, NOT THE ARGMAX. "spin around fast" split
-    # 0.42 `spin_left` / 0.14 `spin_right`, so `none` at 0.44 won the argmax
-    # while 0.56 of the mass sat on commands the robot HAS. Near-duplicate
-    # options divide their own vote; `none` does not have to beat the field,
-    # only the sum of it.
-    var pick = String("")
-    var conf = 0.0
-    for i in range(len(options)):
-        if options[i] == "none":
-            continue
-        var pi = ans.probability(String("command"), options[i])
-        if pi > conf:
-            conf = pi
-            pick = options[i]
-    print("argmax:", argmax, " best-real:", pick, _f2(conf),
+    var argmax = ans.choice(String(G1_Q_COMMAND))
+    var d = g1_decide(ans, bank, max_none, min_top)
+    var p_none = d.p_none
+    var pick = d.name if d.name != "" else String("")
+    var conf = d.conf
+    print("argmax:", argmax, " best-real:", d.best, _f2(conf),
           " P(none)", _f2(p_none), " (", Int(ms), "ms )")
 
     # the runners-up say whether the decision was close
     var best2 = String("")
     var p2 = 0.0
-    for i in range(len(options)):
-        if options[i] == pick:
+    for i in range(bank.count() + 1):
+        var nm = bank.name_at(i) if i < bank.count() else String(G1_OPT_NONE)
+        if nm == pick:
             continue
-        var pi = ans.probability(String("command"), options[i])
+        var pi = ans.probability(String(G1_Q_COMMAND), nm)
         if pi > p2:
             p2 = pi
-            best2 = options[i]
+            best2 = nm
     if best2 != "":
         print("runner-up:", best2, _f2(p2))
 
-    var needs_world = ans.noul(String("needs_world"))
-
     # ── abstain, or send ──────────────────────────────────────────────
-    if p_none > max_none or pick == "":
-        print("REFUSED: P(none)", _f2(p_none), "— the robot has no such",
-              "command. Nothing sent.")
+    # ⚠ ONE RULE, in `g1_decide`. This used to hold its own copy of the
+    # thresholds and the best-real-option logic, and the voice demo a second
+    # copy; §12.54 measured the QUESTION's wording moving P(none) by half, so
+    # two copies of the rule around it would be two different systems.
+    var needs_world = d.needs_world
+    if d.name == "":
+        print("REFUSED:", d.reason, " P(none)", _f2(d.p_none),
+              " (leaning", d.best, _f2(d.conf), ") — nothing sent.")
         return
-    # the second guard still earns its place: `P(none)` can be low while the
-    # mass is spread flat over many real commands, which means "it is a robot
-    # command but I cannot tell which" — also not something to act on.
-    if conf < min_top:
-        print("REFUSED: best real option only", _f2(conf),
-              "— no clear pick. Nothing sent.")
-        return
-    var idx = bank.find(pick)
-    if idx < 0:
-        # ⚠ belt and braces: a model that returned something off its own
-        # option list would otherwise reach the channel and be dropped there.
-        print("REFUSED: '", pick, "' is not in the bank. Nothing sent.")
-        return
+
     # ⚠ PARTIAL EXECUTION, SAID OUT LOUD. The default is to do the part it
     # can and name the part it cannot, because a robot that silently performs
     # 30 % of an instruction is worse than one that performs 30 % and says
