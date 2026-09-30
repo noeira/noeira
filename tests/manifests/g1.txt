@@ -47,3 +47,7 @@ tests/robots/test_g1_history.mojo
 # the command bank reader: a short `z` row would slide every later command's
 # vector and each would silently drive a different behaviour than its name
 tests/robots/test_g1_command_bank.mojo
+
+# the command channel: an absent or half-written file is NORMAL, and the seq
+# gate is what stops a blend restarting on every frame
+tests/robots/test_g1_command_channel.mojo

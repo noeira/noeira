@@ -728,5 +728,17 @@ def main() raises:
     head += String("# gates ess>=") + String(Int(min_ess)) \
             + String(" scaffold>=15% hard>=") + String(min_hard) + String("\n")
     head += String("count ") + String(n_ok) + String(" ") + String(D) + String("\n")
+    # ⚠ THE START POSE TRAVELS WITH THE BANK. Without it a consumer has to
+    # open the 1.69 GB LAFAN store for ONE row, which cost the viewer ~14 s
+    # of startup — long enough that commands sent in the meantime were
+    # dropped before the loop began polling.
+    head += String("start_clip ") + String(start_clip) + String("\n")
+    head += String("qpos")
+    for i in range(NQ):
+        head += String(" ") + String(Float64(rsi.rows.data[start_row * (G1_RSI_NQ + G1_RSI_NV) + i]))
+    head += String("\nqvel")
+    for i in range(NV):
+        head += String(" ") + String(Float64(rsi.rows.data[start_row * (G1_RSI_NQ + G1_RSI_NV) + G1_RSI_NQ + i]))
+    head += String("\n")
     write_text_atomic(out_path, head + entries)
     print("  wrote", out_path)
