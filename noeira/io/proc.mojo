@@ -61,6 +61,8 @@ from std.ffi import external_call
 comptime SIGPIPE = 13
 comptime EPIPE_EXIT = 224
 """`AVERROR(EPIPE)` (-32) returned from `main` and truncated by `exit`."""
+comptime POLLIN = 1
+"""`poll` event bit, the same value on macOS and Linux."""
 
 
 def quote_arg(s: String) raises -> String:
@@ -132,6 +134,51 @@ struct Pipe(Movable):
         if count <= 0:
             return 0
         return external_call["fread", Int](dst, Int(1), count, self._fp)
+
+    def fileno(self) raises -> Int:
+        """The pipe's file descriptor (for `poll`, or a raw `read`)."""
+        if self.closed:
+            raise Error("proc: fileno of a closed pipe")
+        return Int(external_call["fileno", Int32](self._fp))
+
+    def read_available(
+        mut self, dst: Pointer[Scalar[DType.uint8], MutAnyOrigin], count: Int
+    ) raises -> Int:
+        """Read what is ALREADY in the pipe, up to `count` bytes, WITHOUT
+        blocking. Returns the count read, 0 when nothing is waiting, -1 at EOF
+        (the child closed its stdout — exited, or crashed).
+
+        For a child that produces data forever (a microphone capture) read by
+        a loop that must not stall (a render loop). `poll` with a zero
+        timeout says whether a `read` would block; a pipe `read` then returns
+        what is there rather than waiting for `count`.
+
+        ⚠ NOT `fcntl(O_NONBLOCK)`: `fcntl` is C-VARIADIC, and Mojo's fixed
+        `external_call` prototype passes its third argument where Apple arm64
+        does not look — the `ioctl` trap `io/serial/native.mojo` records.
+        `poll` and `read` have fixed arities.
+
+        ⚠ DO NOT MIX WITH `read_into` on the same pipe: that goes through
+        stdio's `FILE*` buffer, which can hold bytes `poll` cannot see.
+        """
+        if self.closed:
+            raise Error("proc: read from a closed pipe")
+        if count <= 0:
+            return 0
+        # struct pollfd { int fd; short events; short revents; } — 8 bytes,
+        # little-endian: lane 0 = fd, lane 1 = events | (revents << 16).
+        var pfd = SIMD[DType.int32, 2](Int32(self.fileno()), Int32(POLLIN))
+        var ready = external_call["poll", Int32](Pointer(to=pfd), Int(1), Int32(0))
+        if ready < 0:
+            raise Error("proc: poll failed on: " + self.command)
+        if ready == 0:
+            return 0
+        var n = external_call["read", Int](Int32(self.fileno()), dst, count)
+        if n < 0:
+            raise Error("proc: read failed on: " + self.command)
+        if n == 0:
+            return -1  # readable with nothing to read: EOF
+        return n
 
     def close(mut self, allow_broken_pipe: Bool = False) raises -> Int:
         """Wait for the child and return its exit code. Raises if it failed.

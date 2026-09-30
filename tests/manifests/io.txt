@@ -39,6 +39,11 @@ tests/io/test_http.mojo
 # and REFUSES a wrongly shaped request. No key, no network. Same prerequisites
 # as test_http.
 tests/ai/test_ai_clients.mojo
+# `MicCapture` (continuous capture for a VAD-gated voice loop) with ffmpeg's
+# own generators standing in for the microphone: read() never blocks, the
+# stream keeps real time with no lost sample, levels are exact, stop() and a
+# dropped capture leave no ffmpeg behind, a dead ffmpeg raises. Needs ffmpeg.
+tests/ai/test_mic_capture.mojo
 # The PNG decoder vs Pillow, on fixtures written HERE rather than found:
 # CIFAR-10's 60,000 images never use the `Average` filter, so real data leaves
 # that branch uncovered. Auto-generates its fixtures on first run.
