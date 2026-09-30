@@ -84,7 +84,9 @@ from noeira.render.types import Color
 from noeira.render.ui import UI
 from noeira.render.sdl.sdl_scancode import Scancode
 from noeira.render.sdl.sdl_keyboard import get_keyboard_state
-from noeira.io.fileio import remove_file, file_size, read_file_bytes
+from noeira.io.fileio import (
+    remove_file, file_size, read_file_bytes, write_text_atomic,
+)
 from noeira.core.bytes import string_from_bytes
 from noeira.io.proc import run_system, quote_arg
 from noeira.ai.audio_io import MicCapture, rms
@@ -229,18 +231,43 @@ def _speaking() -> Bool:
         return False
 
 
-def _say_async(text: String) raises:
+comptime SPEAK_TEXT: String = "/tmp/noeira_g1_say.txt"
+
+
+def _say_async(text: String):
     """Speak in the background, and leave a flag behind that says so.
+
+    ⚠ THE TEXT GOES THROUGH A FILE, NEVER THE COMMAND LINE. `quote_arg`
+    REFUSES a string containing a single quote — a sound rule for a path and
+    a fatal one for speech, because French is full of apostrophes. The first
+    French phrase the robot tried to say was "je m'accroupis", and it took
+    the whole demo down with it. `say -f` reads the text from a file, so
+    nothing in it is ever interpreted by a shell: apostrophes, quotes,
+    accents, newlines.
+
+    ⚠ AND IT CANNOT RAISE. A confirmation is cosmetic; the robot, the
+    physics and the microphone are not. Anything that goes wrong here is
+    swallowed, because the alternative is what happened above.
 
     `say` blocks for as long as it speaks, so it cannot run in the loop. The
     flag is written HERE rather than inside the backgrounded shell, or there
     would be a window between the spawn and the flag appearing in which the
-    gate is open and the microphone is already live."""
-    _ = run_system("touch " + quote_arg(String(SPEAK_FLAG)))
-    _ = run_system(
-        "( say " + quote_arg(text) + " ; rm -f "
-        + quote_arg(String(SPEAK_FLAG)) + " ) >/dev/null 2>&1 &"
-    )
+    gate is open and the microphone is already live.
+    """
+    try:
+        write_text_atomic(String(SPEAK_TEXT), text)
+        _ = run_system("touch " + quote_arg(String(SPEAK_FLAG)))
+        _ = run_system(
+            "( say -f " + quote_arg(String(SPEAK_TEXT)) + " ; rm -f "
+            + quote_arg(String(SPEAK_FLAG)) + " ) >/dev/null 2>&1 &"
+        )
+    except:
+        # ⚠ and clear the flag, or the gate stays shut for ever and the
+        # microphone never reopens.
+        try:
+            remove_file(String(SPEAK_FLAG))
+        except:
+            pass
 
 comptime FNet = BFMFTower[OBS, ACT, D, G1_H, G1_L, D]
 comptime BNet = BFMBNetFiltered[OBS, SP, D, G1_HB]
