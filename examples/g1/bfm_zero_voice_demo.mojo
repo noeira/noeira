@@ -147,7 +147,19 @@ comptime DRAIN_S: Float64 = 0.35
 # because that is the one a demo happens in.
 comptime VAD_OPEN_MULT: Float64 = 5.0
 comptime VAD_CLOSE_MULT: Float64 = 2.5
-comptime VAD_OPEN_MIN: Float64 = 0.0020
+# ⚠ RAISED FROM 0.0020 ON EVIDENCE. The floor is an average over quiet
+# frames and keeps falling in a silent room, so this constant — not the
+# multiplier — is what actually opens a segment when nothing is happening. At
+# 0.0020 a faint sound of 0.0028 opened one and cost a Whisper call to be
+# told it was "you". Speech in the same session peaked at 0.021-0.043.
+comptime VAD_OPEN_MIN: Float64 = 0.0060
+# ⚠ AND ONE FRAME IS NOT SPEECH. A single read above the threshold is a
+# click, a chair, a keystroke. Requiring consecutive frames costs nothing,
+# because the pre-roll ring already holds the onset that the wait discards.
+comptime VAD_OPEN_FRAMES: Int = 3
+# a segment whose loudest moment never rises meaningfully above the opening
+# threshold was not speech either — dropped before it costs a call
+comptime VAD_MIN_PEAK_MULT: Float64 = 1.6
 comptime VAD_FLOOR_MIN: Float64 = 0.00005
 
 
@@ -276,6 +288,14 @@ def main() raises:
     var min_top = Float64(String(_flag(String("--min-top"), String("0.35"))))
     var mute = _has(String("--mute"))
     var mic_dev = _flag(String("--mic"), String(""))
+    # ⚠ `--lang fr` PINS WHISPER'S LANGUAGE. Auto-detection on a short, quiet
+    # clip is unreliable in a way that is invisible until it is absurd: a real
+    # session's first utterance came back as "래위에 봐" — Korean — from a
+    # French speaker. `SpeechToText.language`'s own docstring says it "avoids
+    # a wrong-language transcript of a two-word command", which is exactly
+    # the case here: robot commands are two words, and they are the hardest
+    # thing to auto-detect from.
+    var lang = _flag(String("--lang"), String(""))
     var vad = not _has(String("--push-to-talk"))
     var hang_s = Float64(String(_flag(String("--hang"), String("0.7"))))
     var max_seg = Float64(String(_flag(String("--max-seg"), String("10"))))
@@ -362,6 +382,9 @@ def main() raises:
     # connection costs 19.5 ms — a dropped frame — against 0.16 ms warmed.
     var jev = JevClient.from_env()
     var stt = SpeechToText.huggingface()
+    if lang != "":
+        stt.language = lang
+        print("  whisper language pinned to", lang)
     jev.warm_up()
     stt.warm_up()
     var quest = g1_command_questions(bank, True)
@@ -384,6 +407,7 @@ def main() raises:
     var quiet_since = perf_counter_ns()
     var prev_m = False
     var forced = False
+    var above = 0
     # ⚠ while this is in the future, the microphone is the robot's own voice
     var mute_until = perf_counter_ns()
 
@@ -508,8 +532,12 @@ def main() raises:
         # client, and a queue of half-heard commands is worse than a missed
         # one. The 1.2 s guard keeps the floor estimate from opening a
         # segment on its own first samples.
+        if level > open_at and not echoing:
+            above += 1
+        else:
+            above = 0
         if (mic_on and mic_dead == "" and state == ST_IDLE and vad
-            and not echoing and level > open_at
+            and not echoing and above >= VAD_OPEN_FRAMES
             and mic.seconds_read() > 1.2):
             heard = String("")
             pick = G1LangPick()
@@ -543,6 +571,12 @@ def main() raises:
                     print("  [vad] dropped", _f2(seg_s), "s — under",
                           _f2(min_seg))
                     state = ST_IDLE
+                elif peak < open_at * VAD_MIN_PEAK_MULT:
+                    # never got meaningfully louder than the threshold that
+                    # opened it
+                    print("  [vad] dropped — peak", _f4(peak), "under",
+                          _f4(open_at * VAD_MIN_PEAK_MULT))
+                    state = ST_IDLE
                 else:
                     var audio = WavAudio(16000, 1, seg.copy())
                     stt.start(audio)
@@ -556,7 +590,15 @@ def main() raises:
                 var tr = stt.result()
                 heard = tr.text
                 print("  [heard]", heard, "(", tr.latency_ms, "ms )")
-                if heard.byte_length() == 0:
+                # ⚠ Whisper returns "." or " " for a cough. Asking a model
+                # which of 18 commands a full stop means costs a call to be
+                # told none of them.
+                var letters = 0
+                for ch in heard.codepoints():
+                    if ch.to_u32() > 64:
+                        letters += 1
+                if letters < 3:
+                    print("  [stt] nothing said — skipped")
                     state = ST_IDLE
                 else:
                     jev.start_text(String("instruction: ") + heard, quest)
