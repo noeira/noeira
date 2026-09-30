@@ -134,6 +134,52 @@ struct G1CommandChannel(Movable):
             pass
 
 
+def g1_channel_seq(path: String) -> Int:
+    """The seq currently in the channel, or -1.
+
+    ⚠ A WRITER MUST ADVANCE PAST THIS, not start from 1. Two writers (a voice
+    process and a shell script, say) sharing a channel would otherwise fight:
+    the second one's `seq 1` is below the first's `seq 7` and the reader
+    ignores it, so the command is silently dropped.
+    """
+    try:
+        var txt = string_from_bytes(read_file_bytes(path))
+        var lines = txt.split("\n")
+        for i in range(len(lines)):
+            var l = String(lines[i])
+            if l.startswith("seq "):
+                var p = l.split(" ")
+                if len(p) >= 2:
+                    return atol(String(p[1]))
+    except:
+        pass
+    return -1
+
+
+def g1_channel_read_ack(path: String) -> G1ChannelMsg:
+    """The reader's last acknowledgement. `cmd` is the command it saw and
+    `fresh` is True when the status was `ok` — so a writer can tell an
+    accepted command from a rejected one without guessing."""
+    var m = G1ChannelMsg()
+    try:
+        var txt = string_from_bytes(read_file_bytes(path + String(".ack")))
+        var lines = txt.split("\n")
+        for i in range(len(lines)):
+            var l = String(lines[i])
+            var p = l.split(" ")
+            if len(p) < 2:
+                continue
+            if l.startswith("seq "):
+                m.seq = atol(String(p[1]))
+            elif l.startswith("cmd "):
+                m.cmd = String(p[1])
+            elif l.startswith("status "):
+                m.fresh = String(p[1]) == "ok"
+    except:
+        pass
+    return m^
+
+
 def g1_channel_write(path: String, seq: Int, cmd: String, blend: Int = 25) raises:
     """Send one command. Atomic, so a reader polling at 50 Hz cannot see a
     partial line."""
