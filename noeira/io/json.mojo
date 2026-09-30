@@ -221,25 +221,53 @@ def _hex4(mut s: _Scanner) raises -> Int:
     return v
 
 
+def _put_utf8(mut out: List[UInt8], cp: Int):
+    if cp < 0x80:
+        out.append(UInt8(cp))
+    elif cp < 0x800:
+        out.append(UInt8(0xC0 | (cp >> 6)))
+        out.append(UInt8(0x80 | (cp & 0x3F)))
+    elif cp < 0x10000:
+        out.append(UInt8(0xE0 | (cp >> 12)))
+        out.append(UInt8(0x80 | ((cp >> 6) & 0x3F)))
+        out.append(UInt8(0x80 | (cp & 0x3F)))
+    else:
+        out.append(UInt8(0xF0 | (cp >> 18)))
+        out.append(UInt8(0x80 | ((cp >> 12) & 0x3F)))
+        out.append(UInt8(0x80 | ((cp >> 6) & 0x3F)))
+        out.append(UInt8(0x80 | (cp & 0x3F)))
+
+
 def _parse_string(mut s: _Scanner) raises -> String:
+    """⚠ BYTES IN, BYTES OUT — never `chr(byte)`. A raw UTF-8 byte above 0x7F
+    passed through `chr` becomes the CODEPOINT of that value and is re-encoded
+    as two bytes, so "à" (C3 A0) read back as "Ã " — the defect
+    `core/bytes.mojo` documents, and it lived here until a French transcript
+    came back from Whisper through `noeira/ai/speech.mojo`. Raw bytes are
+    copied verbatim; only a `\\u` escape is decoded, to UTF-8.
+
+    ⚠ `\\u0000` TRUNCATES the value: the result is built through a
+    NUL-terminated constructor. No payload this tree reads carries one.
+    """
     s.expect(0x22)  # "
-    var out = String("")
+    var out = List[UInt8]()
     while True:
         var c = s.next()
         if c == 0x22:
-            return out^
+            out.append(0)
+            return String(unsafe_from_utf8_ptr=out.unsafe_ptr())
         if c != 0x5C:  # backslash
-            out += chr(c)
+            out.append(UInt8(c))
             continue
         var e = s.next()
-        if e == 0x22: out += chr(0x22)
-        elif e == 0x5C: out += chr(0x5C)
-        elif e == 0x2F: out += chr(0x2F)
-        elif e == 0x62: out += chr(0x08)
-        elif e == 0x66: out += chr(0x0C)
-        elif e == 0x6E: out += chr(0x0A)
-        elif e == 0x72: out += chr(0x0D)
-        elif e == 0x74: out += chr(0x09)
+        if e == 0x22: out.append(0x22)
+        elif e == 0x5C: out.append(0x5C)
+        elif e == 0x2F: out.append(0x2F)
+        elif e == 0x62: out.append(0x08)
+        elif e == 0x66: out.append(0x0C)
+        elif e == 0x6E: out.append(0x0A)
+        elif e == 0x72: out.append(0x0D)
+        elif e == 0x74: out.append(0x09)
         elif e == 0x75:
             var cp = _hex4(s)
             # Surrogate pair: a high surrogate must be followed by \uDC00-\uDFFF.
@@ -254,7 +282,7 @@ def _parse_string(mut s: _Scanner) raises -> String:
                         raise Error("json: unpaired surrogate escape")
                 else:
                     raise Error("json: unpaired surrogate escape")
-            out += chr(cp)
+            _put_utf8(out, cp)
         else:
             raise Error("json: unknown escape '\\" + chr(e) + "'")
 
@@ -511,6 +539,20 @@ struct JsonWriter(Movable):
         self._sep()
         self._out += "null"
 
+    def raw(mut self, json_text: String) raises:
+        """Splice an already-serialised JSON value in as the next item.
+
+        For values the caller holds as text: a tool's JSON Schema, a model's
+        tool-call arguments, an assistant turn replayed verbatim
+        (`noeira/ai/`). ⚠ NOT VALIDATED beyond being non-empty — an invalid
+        fragment makes the whole payload invalid. Parse it first
+        (`parse_json`) when it came from a person rather than a server.
+        """
+        if json_text.byte_length() == 0:
+            raise Error("json: raw() of an empty fragment")
+        self._sep()
+        self._out += json_text
+
     def member(mut self, name: String, v: String) raises:
         """`"name": "value"` — the shape most call sites actually write."""
         self.key(name)
@@ -590,3 +632,49 @@ def json_quote(s: String) raises -> String:
     out.append(UInt8(0x22))  # closing quote
     out.append(UInt8(0))
     return String(unsafe_from_utf8_ptr=out.unsafe_ptr())
+
+
+def _dump_node(ref doc: JsonDoc, node: Int, mut w: JsonWriter) raises:
+    var k = doc.kind_of(node)
+    if k == J_OBJECT:
+        w.begin_object()
+        for i in range(doc.size(node)):
+            w.key(doc.key_at(node, i))
+            _dump_node(doc, doc.at(node, i), w)
+        w.end_object()
+    elif k == J_ARRAY:
+        w.begin_array()
+        for i in range(doc.size(node)):
+            _dump_node(doc, doc.at(node, i), w)
+        w.end_array()
+    elif k == J_STRING:
+        w.string(doc.string(node))
+    elif k == J_NUMBER:
+        # An integral value goes back out as an integer: `{"n": 3}` must not
+        # come back as `{"n": 3.0}`, which a strict schema (`"type":
+        # "integer"`) rejects.
+        var v = doc.number(node)
+        var i = Int(v)
+        if Float64(i) == v and v < 9007199254740992.0 and v > -9007199254740992.0:
+            w.integer(i)
+        else:
+            w.number(v)
+    elif k == J_BOOL:
+        w.boolean(doc.boolean(node))
+    elif k == J_NULL:
+        w.null()
+    else:
+        raise Error("json: dump_json of an absent node")
+
+
+def dump_json(ref doc: JsonDoc, node: Int) raises -> String:
+    """The sub-tree at `node`, serialised back to compact JSON text.
+
+    The reader keeps decoded values, not source spans, so this re-writes
+    rather than slices: key ORDER is preserved, whitespace is not, and a
+    number that was integral comes back without a fraction. Used to hand a
+    model's tool-call arguments to the caller as one JSON string.
+    """
+    var w = JsonWriter()
+    _dump_node(doc, node, w)
+    return w.done()

@@ -24,11 +24,21 @@ tests/io/test_base64.mojo
 # The JSON writer's exact output (validated by `json.loads` before pinning),
 # its escaping, and its refusal of NaN / Infinity.
 tests/io/test_json_write.mojo
+# The JSON reader keeps non-ASCII strings byte-exact (raw UTF-8, \u escapes,
+# surrogate pairs), checked against BYTE LITERALS — it used to double-encode
+# every byte above 0x7F ("à" -> "Ã ").
+tests/io/test_json_read_utf8.mojo
 # The HTTP client against `tools/io/mock_http_server.py` on a loopback port:
 # needs `pixi run build-http` and `python3`, nothing else. Covers the paths a
 # live server will not produce on demand — a 404 that must not touch the
 # output file, and a server that IGNORES `Range` and answers 200.
 tests/io/test_http.mojo
+# `noeira/ai/` (Claude + OpenAI-compatible chat with images and tool calls,
+# Jev, speech-to-text, TTS) and the WAV codec against
+# `tools/ai/mock_ai_server.py`: each route speaks one provider's wire format
+# and REFUSES a wrongly shaped request. No key, no network. Same prerequisites
+# as test_http.
+tests/ai/test_ai_clients.mojo
 # The PNG decoder vs Pillow, on fixtures written HERE rather than found:
 # CIFAR-10's 60,000 images never use the `Average` filter, so real data leaves
 # that branch uncovered. Auto-generates its fixtures on first run.
