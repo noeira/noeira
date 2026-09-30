@@ -24,13 +24,18 @@ already runs an SDL event loop; a demo that must keep drawing while it
 listens belongs there. This module is for the first version of a demo.
 
 ⚠ macOS ASKS FOR MICROPHONE PERMISSION the first time, on behalf of the
-TERMINAL app, not of this binary. A denied prompt produces a silent clip,
-not an error — check `wav.to_float32()` has energy before blaming the STT.
+TERMINAL app, not of this binary. What a DENIAL looks like is not verified
+here (no one denied it on this machine): expect either an ffmpeg error or a
+clip of exact zeros — `MicCapture.digital_silence()` tells the second case
+apart from a quiet room.
 """
 
 from std.ffi import external_call
 from std.sys import CompilationTarget
+from std.time import perf_counter_ns
 
+from noeira.core.bytes import string_from_byte_span
+from noeira.io.fileio import read_file_bytes, remove_file
 from noeira.io.proc import Pipe, quote_arg, run_system
 
 
@@ -171,9 +176,21 @@ struct MicCapture(Movable):
     fixed-length `record_wav` cannot do that — ffmpeg's ~100 ms startup
     clips the start of every take, which is where a wake word is.
 
-    ⚠ KEEP A PRE-ROLL. A VAD fires a few chunks AFTER speech starts, so a
-    segment cut from the onset loses the first syllable. Keep the last
-    ~300 ms of samples in a ring and prepend them to the segment.
+    ⚠ KEEP A PRE-ROLL OF ~500 ms. A level-threshold VAD fires 100-300 ms
+    AFTER speech starts — the onset of a word is quieter than its vowel — so
+    a segment cut at the trigger loses the first word. With a wake word that
+    first word IS the wake word, and the symptom is "the robot ignores me
+    when I start with 'Robot'", which sends people debugging the STT or the
+    matcher. Keep the last ~500 ms of samples in a ring and prepend them to
+    every segment.
+
+    ⚠ WHY IT STOPPED IS IN THE ERROR. ffmpeg's stderr goes to a per-capture
+    log, and when the stream ends `read` raises with its last lines — a
+    missing device, a bad input, a refused permission each say so there.
+    `digital_silence()` covers the case that raises nothing: a stream of
+    EXACT zeros, which a live microphone never produces (its noise floor
+    alone moves the low bits) — a muted or disabled input, or plausibly a
+    denied permission. A quiet room is NOT digital silence.
 
     ⚠ READ EVERY FRAME, OR AT LEAST OFTEN. ffmpeg blocks once the pipe is full
     (64 KiB on macOS = 2 s at 16 kHz); after that, the capture device drops
@@ -200,9 +217,17 @@ struct MicCapture(Movable):
     var _pipe: Pipe
     var _buf: List[UInt8]
     var _pcm: Pcm16Decoder
+    var _any_nonzero: Bool
+    var log_path: String
+    """ffmpeg's stderr for this capture; its tail goes into `read`'s error."""
 
     def __init__(
-        out self, sample_rate: Int, var command: String, var pipe: Pipe, pid: Int
+        out self,
+        sample_rate: Int,
+        var command: String,
+        var pipe: Pipe,
+        pid: Int,
+        var log_path: String,
     ):
         self.sample_rate = sample_rate
         self.pid = pid
@@ -213,6 +238,8 @@ struct MicCapture(Movable):
         self._buf = List[UInt8]()
         self._buf.resize(1 << 16, 0)
         self._pcm = Pcm16Decoder()
+        self._any_nonzero = False
+        self.log_path = log_path^
 
     def __init__(out self, *, deinit move: Self):
         self.sample_rate = move.sample_rate
@@ -223,6 +250,8 @@ struct MicCapture(Movable):
         self._pipe = move._pipe^
         self._buf = move._buf^
         self._pcm = move._pcm^
+        self._any_nonzero = move._any_nonzero
+        self.log_path = move.log_path^
 
     def __deinit__(deinit self):
         # Kill BEFORE the pipe's own destructor runs its `pclose`, which would
@@ -261,14 +290,15 @@ struct MicCapture(Movable):
             + input + " -ac 1 -ar " + String(sample_rate)
             + " -f s16le -flush_packets 1 pipe:1"
         )
-        var pipe = Pipe("echo $$; exec " + ff)
+        var log_path = "/tmp/noeira_mic_" + String(perf_counter_ns()) + ".log"
+        var pipe = Pipe("echo $$; exec " + ff + " 2> " + quote_arg(log_path))
         # The pid line, read RAW, byte by byte: a stdio read would pull PCM
         # into the FILE* buffer, where `poll` cannot see it.
         var fd = pipe.fileno()
         var pid = 0
         var one = SIMD[DType.uint8, 1](0)
         for _ in range(24):
-            var n = external_call["read", Int](Int32(fd), Pointer(to=one), Int(1))
+            var n = external_call["read", Int](fd, Pointer(to=one), Int(1))  # Int fd: see Pipe.read_available
             if n != 1:
                 raise Error("mic: the capture shell died before starting ffmpeg")
             var c = Int(one[0])
@@ -279,7 +309,7 @@ struct MicCapture(Movable):
             pid = pid * 10 + (c - 0x30)
         if pid <= 0:
             raise Error("mic: could not read ffmpeg's pid")
-        return MicCapture(sample_rate, ff^, pipe^, pid)
+        return MicCapture(sample_rate, ff^, pipe^, pid, log_path^)
 
     def read(mut self) raises -> List[Int16]:
         """Every sample captured since the last call — possibly none. Never
@@ -297,15 +327,37 @@ struct MicCapture(Movable):
                 self.ended = True
                 self.pid = 0
                 raise Error(
-                    "mic: ffmpeg stopped producing audio (see its message above;"
-                    " on macOS check the terminal's microphone permission): "
-                    + self.command
+                    "mic: ffmpeg stopped producing audio: " + self.ffmpeg_log()
+                    + "\n  (on macOS, also check the terminal's microphone"
+                    " permission)\n  command: " + self.command
                 )
             if n == 0:
                 break
             self._pcm.feed(self._buf, n, out)
+        if not self._any_nonzero:
+            for i in range(len(out)):
+                if out[i] != 0:
+                    self._any_nonzero = True
+                    break
         self.samples_read += len(out)
         return out^
+
+    def digital_silence(self, min_seconds: Float64 = 0.5) -> Bool:
+        """True when at least `min_seconds` have been read and EVERY sample
+        was exactly zero — no live microphone does that. Check it once,
+        early, and tell the user to look at the input device and the mic
+        permission instead of waiting for speech that cannot arrive."""
+        return self.seconds_read() >= min_seconds and not self._any_nonzero
+
+    def ffmpeg_log(self) -> String:
+        """The last lines ffmpeg wrote to stderr ("" when none)."""
+        try:
+            var b = read_file_bytes(self.log_path)
+            var start = len(b) - 600 if len(b) > 600 else 0
+            var t = string_from_byte_span(b, start, len(b))
+            return String(t.strip())
+        except:
+            return String("")
 
     def seconds_read(self) -> Float64:
         return Float64(self.samples_read) / Float64(self.sample_rate)
@@ -321,4 +373,8 @@ struct MicCapture(Movable):
                 _ = self._pipe.close(allow_broken_pipe=True)
             except:
                 pass  # killed on purpose: its exit status says so, not a failure
+        try:
+            remove_file(self.log_path)
+        except:
+            pass
 

@@ -20,7 +20,9 @@ the same pipe, pid and non-blocking read path runs as with a mic.
   `anullsrc` is silence: the numbers a threshold is set against.
 * **`stop` is fast and leaves no process**, and so does dropping a capture
   without calling it — the destructor must not hang in `pclose`.
-* **A dead ffmpeg raises** instead of reading as silence forever.
+* **A dead ffmpeg raises** instead of reading as silence forever, and the
+  error carries ffmpeg's own reason (its stderr goes to a per-capture log).
+* **Exact zeros are flagged** (`digital_silence`), a live signal is not.
 """
 
 from std.ffi import external_call
@@ -121,6 +123,7 @@ def main() raises:
         if d > 800 or d < -800:
             jumps += 1
     _check(jumps == 0, String(jumps) + " discontinuities: samples lost or misaligned")
+    _check(not mic.digital_silence(), "a live signal reported as digital silence")
     var ts = perf_counter_ns()
     mic.stop()
     var stop_ms = _ms(ts)
@@ -144,7 +147,8 @@ def main() raises:
         sleep(0.01)
     quiet.stop()
     _check(len(qs) > 4000 and rms(qs) < 1e-4, "silence: " + String(len(qs)) + " samples, rms " + String(rms(qs)))
-    print("  silence: " + String(len(qs)) + " samples, rms " + String(rms(qs)) + "   ok")
+    _check(quiet.digital_silence(), "exact zeros not reported as digital silence")
+    print("  silence: " + String(len(qs)) + " samples, rms " + String(rms(qs)) + ", digital_silence() = True   ok")
 
     # ── 3. dropped without stop(): the destructor must not hang ─────────
     var dropped_pid = 0
@@ -171,5 +175,7 @@ def main() raises:
             raised = String(e)
         sleep(0.01)
     _check("stopped producing audio" in raised, "a dead ffmpeg did not raise: '" + raised + "'")
-    print("  dead ffmpeg: raised after " + String(Int(_ms(tb))) + " ms   ok")
-    print("=== mic capture: 14 checks passed ===")
+    # The CAUSE must be in the error, not only on a terminal nobody watches.
+    _check("No such filter" in raised, "ffmpeg's reason missing from the error: '" + raised + "'")
+    print("  dead ffmpeg: raised after " + String(Int(_ms(tb))) + " ms, with ffmpeg's reason   ok")
+    print("=== mic capture: 17 checks passed ===")

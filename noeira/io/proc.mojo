@@ -173,7 +173,10 @@ struct Pipe(Movable):
             raise Error("proc: poll failed on: " + self.command)
         if ready == 0:
             return 0
-        var n = external_call["read", Int](Int32(self.fileno()), dst, count)
+        # ⚠ `Int` fd, not `Int32`: the stdlib declares `read` with an index fd
+        # (`serial/port.mojo` records the collision), and a second declaration
+        # with `si32` fails at LLVM lowering in any binary that links both.
+        var n = external_call["read", Int](self.fileno(), dst, count)
         if n < 0:
             raise Error("proc: read failed on: " + self.command)
         if n == 0:
