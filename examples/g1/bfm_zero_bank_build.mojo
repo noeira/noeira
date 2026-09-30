@@ -152,11 +152,20 @@ struct Roll(Copyable, Movable):
     var soft: Float64
     var hard: Float64
     var q: List[Float64]
+    # ⚠ THE PER-STEP RANGE, not just the mean. `run` reported a mean of
+    # 1.798 m/s inside its own [1.50, 3.00] band and a hold of 0.000 — the
+    # mean sits in the band while the stride carries the instantaneous speed
+    # out of it twice a cycle. A mean cannot show that; a range can.
+    var qmin: List[Float64]
+    var qmax: List[Float64]
 
-    def __init__(out self, soft: Float64, hard: Float64, q: List[Float64]):
+    def __init__(out self, soft: Float64, hard: Float64, q: List[Float64],
+                 qmin: List[Float64], qmax: List[Float64]):
         self.soft = soft
         self.hard = hard
         self.q = q.copy()
+        self.qmin = qmin.copy()
+        self.qmax = qmax.copy()
 
 
 def _roll[
@@ -204,6 +213,8 @@ def _roll[
         z1.data[k] = z[z_off + k]
 
     var acc = List[Float64](length=G1_NVOC, fill=0.0)
+    var qmin = List[Float64](length=G1_NVOC, fill=1e30)
+    var qmax = List[Float64](length=G1_NVOC, fill=-1e30)
     var one = List[Float64](length=G1_NVOC, fill=0.0)
     var s_soft = 0.0
     var s_hard = 0.0
@@ -233,6 +244,10 @@ def _roll[
             g1_quantities(o2, 0, one, 0)
             for c in range(G1_NVOC):
                 acc[c] += one[c]
+                if one[c] < qmin[c]:
+                    qmin[c] = one[c]
+                if one[c] > qmax[c]:
+                    qmax[c] = one[c]
             var ps = 1.0
             var ph = 1.0
             for ti in range(len(terms)):
@@ -247,7 +262,7 @@ def _roll[
             n += 1
     for c in range(G1_NVOC):
         acc[c] = acc[c] / Float64(n)
-    return Roll(s_soft / Float64(n), s_hard / Float64(n), acc)
+    return Roll(s_soft / Float64(n), s_hard / Float64(n), acc, qmin, qmax)
 
 
 def _add(
@@ -326,6 +341,10 @@ def main() raises:
     var sigma0 = Float64(String(_flag(String("--cem-sigma"), String("0.30"))))
     var min_ess = Float64(String(_flag(String("--min-ess"), String("100"))))
     var min_hard = Float64(String(_flag(String("--min-hard"), String("0.25"))))
+    # ⚠ `--only NAME` builds ONE command. Iterating on a single rejected
+    # entry cost 25 minutes a try without it, which is how a threshold ends
+    # up tuned by patience rather than by evidence.
+    var only = _flag(String("--only"), String(""))
     if ckpt == "":
         raise Error("pass --ckpt <path/to/step_NNNN.ckpt>")
 
@@ -526,6 +545,8 @@ def main() raises:
           + _lpad(String("soft gain"), 11) + _lpad(String("shipped"), 9) + "  verdict")
 
     for c in range(ncmd):
+        if only != "" and names[c] != only:
+            continue
         var nt = len(terms[c])
         var los = List[Float64](length=nt, fill=0.0)
         var his = List[Float64](length=nt, fill=0.0)
@@ -539,8 +560,21 @@ def main() raises:
                 col[i] = qv[i * G1_NVOC + tm.q]
             los[ti] = g1_quantile(col, tm.lo) if tm.as_pct else tm.lo
             his[ti] = g1_quantile(col, tm.hi) if tm.as_pct else tm.hi
+            # ⚠ THE WIDTH MUST MATCH THE EXCURSION, NOT THE DISTRIBUTION.
+            # At 0.15 of the pool spread this was 0.225 for a forward speed,
+            # and `run`'s policy came out 2 m/s outside its band — where
+            # exp(-2.1/0.225) is 1e-4 for every candidate alike. Monotone is
+            # not enough; the objective has to still VARY where the search
+            # actually is. A band's own width is the right scale for a band,
+            # and half the pool spread for a one-sided threshold.
             var sp = qhi[tm.q] - qlo[tm.q]
-            wid[ti] = 0.15 * (sp if sp > 0.0 else -sp)
+            if sp < 0.0:
+                sp = -sp
+            if tm.op == OP_BAND:
+                var bw = his[ti] - los[ti]
+                wid[ti] = bw if bw > 0.0 else -bw
+            else:
+                wid[ti] = 0.5 * sp
             if wid[ti] < 1e-6:
                 wid[ti] = 1e-6
             for i in range(n_pool):
@@ -663,6 +697,12 @@ def main() raises:
         # ── G3: it must actually hold ─────────────────────────────────
         if hard_ship < min_hard:
             print(line + "  REJECT: holds " + _f3(hard_ship) + " < " + _f3(min_hard))
+            if only != "":
+                for ti in range(nt):
+                    var td = terms[c][ti].copy()
+                    print("      " + g1_vocab_name(td.q) + " ranged "
+                          + _f3(r_b.qmin[td.q]) + " .. " + _f3(r_b.qmax[td.q])
+                          + "  (want " + g1_term_str(td, los[ti], his[ti]) + ")")
             continue
         # ⚠ G4: `hard` is the fraction of STEPS that satisfy the compound, and
         # a command can clear a fractional bar while its MEAN behaviour breaks
@@ -691,6 +731,9 @@ def main() raises:
             print(line + "  REJECT: the shipped MEAN breaks its own compound (" + why + ")")
             continue
         print(line + _lpad(_f3(ship.q[gq]), 9) + "  ok (" + kept + ")")
+        if only != "":
+            print("      per-step range of " + g1_vocab_name(gq) + ": "
+                  + _f3(ship.qmin[gq]) + " .. " + _f3(ship.qmax[gq]))
         n_ok += 1
 
         entries += String("name ") + names[c] + String("\n")

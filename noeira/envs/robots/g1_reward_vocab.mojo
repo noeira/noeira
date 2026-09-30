@@ -216,20 +216,48 @@ def g1_term_soft(ref t: G1Term, lo: Float64, hi: Float64, w: Float64, x: Float64
     ⚠ CEM CANNOT CLIMB A HARD INDICATOR. A product of indicators is zero
     almost everywhere near a bad prompt, so every candidate scores 0, every
     elite set is arbitrary, and the search returns its own starting point
-    while looking like it ran. `w` is a width taken from the quantity's own
-    pool spread, so one constant works across metres, m/s and rad/s.
+    while looking like it ran.
+
+    ⚠ NOR CAN IT CLIMB A SATURATED ONE, which is the subtler version and cost
+    a rejected command. `run` was scored with a product of sigmoids of width
+    0.15 of the pool spread; the policy came out at **4.0-5.1 m/s** against a
+    band of [1.5, 3.0], where that sigmoid is flat to six decimals. Every
+    candidate scored the same, CEM reported a 4152 % gain on a base of
+    ~0.001, and the hard rate never left 0.000. A search objective must have
+    a gradient AT THE DISTANCE THE POLICY ACTUALLY STRAYS, not merely near
+    the target.
+
+    So the score is `exp(-outside / w)`, where `outside` is the distance
+    beyond the predicate: monotone at every distance, never flat, and 1.0
+    once satisfied. The band is shrunk by `MARGIN` first so that "satisfied"
+    means comfortably inside rather than balanced on an edge the next step
+    falls off.
 
     The hard form stays the published number; this one only steers.
     """
+    comptime MARGIN: Float64 = 0.15
     if t.op == OP_SOFT:
         var a = x if x > 0.0 else -x
         return exp(-t.lo * a)
     var ww = w if w > 1e-9 else 1e-9
+    var outside = 0.0
     if t.op == OP_GT:
-        return 1.0 / (1.0 + exp(-(x - lo) / ww))
-    if t.op == OP_LT:
-        return 1.0 / (1.0 + exp(-(hi - x) / ww))
-    return (1.0 / (1.0 + exp(-(x - lo) / ww))) * (1.0 / (1.0 + exp(-(hi - x) / ww)))
+        var lo_in = lo + MARGIN * ww
+        if x < lo_in:
+            outside = lo_in - x
+    elif t.op == OP_LT:
+        var hi_in = hi - MARGIN * ww
+        if x > hi_in:
+            outside = x - hi_in
+    else:
+        var span = hi - lo
+        var lo_b = lo + MARGIN * span
+        var hi_b = hi - MARGIN * span
+        if x < lo_b:
+            outside = lo_b - x
+        elif x > hi_b:
+            outside = x - hi_b
+    return exp(-outside / ww)
 
 
 def g1_term_str(ref t: G1Term, lo: Float64, hi: Float64) -> String:

@@ -57,6 +57,52 @@ comptime G1_Q_NEEDS_WORLD: String = "needs_world"
 comptime G1_Q_ADDRESSED: String = "addressed"
 comptime G1_OPT_NONE: String = "none"
 
+# ── aliases: more WORDS than there are behaviours ─────────────────────────
+# ⚠ AN ALIAS IS NOT A BANK ENTRY, and the distinction is the point. A bank
+# entry is a distinct behaviour that passed four gates; an alias is a word
+# people use for one that already exists. "Baisse les bras" came back refused
+# at P(none) 0.47 in a real session — not because the robot cannot lower its
+# arms, but because `stand` ships with them at 0.78/0.78 and nobody calls
+# that "arms down".
+#
+# Adding `arms_down` to the BANK would have been dishonest: it would fail the
+# scaffold gate, which exists precisely to reject a command that does nothing
+# its scaffold does not already do. Adding it here is honest — the word maps
+# to a behaviour that genuinely has that property.
+comptime G1_N_ALIAS: Int = 3
+
+
+def g1_alias_name(i: Int) -> String:
+    if i == 0:
+        return String("arms_down")
+    if i == 1:
+        return String("stop")
+    return String("turn_around")
+
+
+def g1_alias_target(i: Int) -> String:
+    if i == 0:
+        return String("stand")
+    if i == 1:
+        return String("stand")
+    return String("spin_left")
+
+
+def g1_alias_desc(i: Int) -> String:
+    if i == 0:
+        return String("stand still with both arms hanging down at the sides")
+    if i == 1:
+        return String("stop moving and stand still")
+    return String("turn on the spot to face the other way")
+
+
+def g1_resolve(name: String) -> String:
+    """An alias to the bank command it means, or the name unchanged."""
+    for i in range(G1_N_ALIAS):
+        if g1_alias_name(i) == name:
+            return g1_alias_target(i)
+    return name
+
 
 def g1_command_instruction() -> String:
     """⚠ THE ONE COPY OF THE WORDING.
@@ -93,6 +139,10 @@ def g1_command_questions(
     for i in range(bank.count()):
         options.append(bank.name_at(i))
         descs.append(bank.describe(i))
+    # the aliases are offered as ordinary options; `g1_decide` resolves them
+    for i in range(G1_N_ALIAS):
+        options.append(g1_alias_name(i))
+        descs.append(g1_alias_desc(i))
     # `none` last and ALWAYS present: without it the model must pick
     # something, and "something" for an impossible request is a real command
     # the robot will actually run.
@@ -160,13 +210,17 @@ def g1_decide(
     if with_addressed:
         r.addressed = ans.noul(String(G1_Q_ADDRESSED))
 
-    # the best REAL option — never the argmax, see the header
-    for i in range(bank.count()):
-        var p = ans.probability(String(G1_Q_COMMAND), bank.name_at(i))
+    # the best REAL option — never the argmax, see the header. Aliases
+    # compete on equal terms and are resolved to their target afterwards.
+    for i in range(bank.count() + G1_N_ALIAS):
+        var nm = bank.name_at(i) if i < bank.count() else g1_alias_name(
+            i - bank.count()
+        )
+        var p = ans.probability(String(G1_Q_COMMAND), nm)
         if p > r.conf:
             r.conf = p
-            r.name = bank.name_at(i)
-            r.best = bank.name_at(i)
+            r.name = g1_resolve(nm)
+            r.best = nm
 
     if with_addressed and r.addressed < min_addressed:
         r.reason = String("not addressed to the robot")

@@ -46,6 +46,7 @@ from std.time import perf_counter_ns
 from noeira.ai.jev import JevClient, JevQuestions
 from noeira.envs.robots.g1_command_language import (
     g1_command_questions, g1_command_instruction, g1_decide,
+    g1_alias_name, g1_alias_target, g1_alias_desc, G1_N_ALIAS,
     G1_Q_COMMAND, G1_OPT_NONE,
 )
 # ⚠ module scope — Mojo rejects an import inside a branch. Importing costs
@@ -129,6 +130,13 @@ def main() raises:
         for i in range(bank.count()):
             print("  " + bank.name_at(i))
             print("      " + bank.describe(i))
+        # ⚠ listed from the SAME source the question is built from. A
+        # hand-kept listing drifts, and a listing that omits the aliases
+        # makes them look absent when they are being offered.
+        for i in range(G1_N_ALIAS):
+            print("  " + g1_alias_name(i) + "   (alias -> "
+                  + g1_alias_target(i) + ")")
+            print("      " + g1_alias_desc(i))
         print("  none")
         print("      not one of these, or not a command for this robot")
         return
@@ -206,9 +214,13 @@ def main() raises:
     # the runners-up say whether the decision was close
     var best2 = String("")
     var p2 = 0.0
-    for i in range(bank.count() + 1):
-        var nm = bank.name_at(i) if i < bank.count() else String(G1_OPT_NONE)
-        if nm == pick:
+    for i in range(bank.count() + G1_N_ALIAS + 1):
+        var nm = String(G1_OPT_NONE)
+        if i < bank.count():
+            nm = bank.name_at(i)
+        elif i < bank.count() + G1_N_ALIAS:
+            nm = g1_alias_name(i - bank.count())
+        if nm == d.best:
             continue
         var pi = ans.probability(String(G1_Q_COMMAND), nm)
         if pi > p2:
