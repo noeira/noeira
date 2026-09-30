@@ -56,6 +56,13 @@ comptime G1_Q_COMMAND: String = "command"
 comptime G1_Q_NEEDS_WORLD: String = "needs_world"
 comptime G1_Q_ADDRESSED: String = "addressed"
 comptime G1_OPT_NONE: String = "none"
+# ⚠ `talk` IS AN OPTION, NOT A REFUSAL. "Bonjour, comment vas-tu ?" used to
+# come back "not addressed to the robot" — technically true and completely
+# wrong in effect: a robot that cannot say hello reads as one that is not
+# listening. Offering it as a choice lets the same call that picks a movement
+# decide that no movement was wanted, which is cheaper and more accurate than
+# a second classifier.
+comptime G1_OPT_TALK: String = "talk"
 
 # ── aliases: more WORDS than there are behaviours ─────────────────────────
 # ⚠ AN ALIAS IS NOT A BANK ENTRY, and the distinction is the point. A bank
@@ -146,6 +153,11 @@ def g1_command_questions(
     # `none` last and ALWAYS present: without it the model must pick
     # something, and "something" for an impossible request is a real command
     # the robot will actually run.
+    options.append(String(G1_OPT_TALK))
+    descs.append(String(
+        "the speaker is talking TO the robot but not asking it to move —"
+        " a greeting, a question, a remark. Answer in words, not motion."
+    ))
     options.append(String(G1_OPT_NONE))
     descs.append(String("not one of these, or not a command for this robot"))
 
@@ -183,6 +195,9 @@ struct G1LangPick(Copyable, Movable):
     var addressed: Float64
     var reason: String
     """Empty when accepted; otherwise why not, in words for a HUD."""
+    var talk: Bool
+    """The speaker wanted an answer, not a movement. `name` is empty and
+    `reason` is not set — this is a success with a different handler."""
 
     def __init__(out self):
         self.name = String("")
@@ -192,6 +207,61 @@ struct G1LangPick(Copyable, Movable):
         self.needs_world = 0.0
         self.addressed = 1.0
         self.reason = String("")
+        self.talk = False
+
+
+def g1_command_phrase(name: String) -> String:
+    """What the robot says when it starts a command.
+
+    ⚠ IT USED TO SAY THE COMMAND'S NAME. `say "spin_left"` pronounces the
+    underscore, takes 2.79 s for two syllables of content, and sounds like a
+    machine reading a variable back. These are one line each and cost
+    nothing — no second round trip before the robot acknowledges, and no
+    tokens per command, which an LLM-written confirmation would spend on
+    every single movement.
+
+    English here because the tree is English; `--phrases FILE` overrides the
+    table with `name=phrase` lines, and that file is data rather than source.
+    """
+    if name == "walk":
+        return String("walking")
+    if name == "run":
+        return String("running")
+    if name == "spin_left":
+        return String("turning left")
+    if name == "spin_right":
+        return String("turning right")
+    if name == "strafe_left":
+        return String("stepping to my left")
+    if name == "strafe_right":
+        return String("stepping to my right")
+    if name == "diagonal":
+        return String("walking diagonally")
+    if name == "stand":
+        return String("standing still")
+    if name == "squat":
+        return String("squatting")
+    if name == "crouch":
+        return String("crouching")
+    if name == "right_hand_up":
+        return String("raising my right arm")
+    if name == "left_hand_up":
+        return String("raising my left arm")
+    if name == "both_hands_up":
+        return String("raising both arms")
+    if name == "arms_wide":
+        return String("arms out wide")
+    if name == "look_left":
+        return String("looking left")
+    if name == "look_right":
+        return String("looking right")
+    if name == "walk_right_hand_up":
+        return String("walking with my right arm up")
+    if name == "walk_both_hands_up":
+        return String("walking with both arms up")
+    if name == "spin_arms_in":
+        return String("spinning with my arms in")
+    return name
 
 
 def g1_decide(
@@ -210,6 +280,8 @@ def g1_decide(
     if with_addressed:
         r.addressed = ans.noul(String(G1_Q_ADDRESSED))
 
+    var p_talk = ans.probability(String(G1_Q_COMMAND), String(G1_OPT_TALK))
+
     # the best REAL option — never the argmax, see the header. Aliases
     # compete on equal terms and are resolved to their target afterwards.
     for i in range(bank.count() + G1_N_ALIAS):
@@ -225,6 +297,15 @@ def g1_decide(
     if with_addressed and r.addressed < min_addressed:
         r.reason = String("not addressed to the robot")
         r.name = String("")
+        return r^
+    # ⚠ `talk` COMPETES WITH THE MOVEMENTS, and only wins outright. A
+    # greeting that the model half-reads as a command should move the robot,
+    # not start a conversation — the movement is the demo, and a wrong answer
+    # in words is more confusing than a wrong gesture.
+    if p_talk > r.conf and p_talk > max_none:
+        r.talk = True
+        r.name = String("")
+        r.conf = p_talk
         return r^
     if r.p_none > max_none or r.name == "":
         r.reason = String("no such command")

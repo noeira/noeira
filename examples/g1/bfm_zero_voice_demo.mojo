@@ -84,15 +84,17 @@ from noeira.render.types import Color
 from noeira.render.ui import UI
 from noeira.render.sdl.sdl_scancode import Scancode
 from noeira.render.sdl.sdl_keyboard import get_keyboard_state
-from noeira.io.fileio import remove_file, file_size
+from noeira.io.fileio import remove_file, file_size, read_file_bytes
+from noeira.core.bytes import string_from_bytes
 from noeira.io.proc import run_system, quote_arg
 from noeira.ai.audio_io import MicCapture, rms
 from noeira.io.wav import WavAudio
 from noeira.ai.jev import JevClient
 from noeira.ai.speech import SpeechToText
 from noeira.envs.robots.g1_command_language import (
-    g1_command_questions, g1_decide, G1LangPick,
+    g1_command_questions, g1_decide, G1LangPick, g1_command_phrase,
 )
+from noeira.ai.chat import ChatClient, ChatMessage, ToolSpec
 
 comptime SP: Int = UNITREE_G1_OBS_DIM
 comptime OBS: Int = UNITREE_G1_FULL_OBS_DIM
@@ -112,6 +114,7 @@ comptime ST_IDLE: Int = 0
 comptime ST_REC: Int = 1
 comptime ST_STT: Int = 2
 comptime ST_JEV: Int = 3
+comptime ST_CHAT: Int = 4
 
 # ⚠ A 4 s WINDOW DOES NOT CAPTURE 4 s. Measured: a 4.0 s recording arrived as
 # 56 832 samples — 3.55 s — and Whisper returned "Lève les brl'air" for
@@ -296,6 +299,8 @@ def main() raises:
     # the case here: robot commands are two words, and they are the hardest
     # thing to auto-detect from.
     var lang = _flag(String("--lang"), String(""))
+    var llm_spec = _flag(String("--llm"), String("hf"))
+    var phrase_file = _flag(String("--phrases"), String(""))
     var vad = not _has(String("--push-to-talk"))
     var hang_s = Float64(String(_flag(String("--hang"), String("0.7"))))
     var max_seg = Float64(String(_flag(String("--max-seg"), String("10"))))
@@ -387,6 +392,21 @@ def main() raises:
         print("  whisper language pinned to", lang)
     jev.warm_up()
     stt.warm_up()
+    # ⚠ `talk` needs a client warmed BEFORE the loop like the others, or its
+    # first reply pays 19.5 ms inside one frame.
+    var llm = ChatClient.from_spec(llm_spec)
+    llm.max_tokens = 120
+    # ⚠ Qwen thinks before answering unless told not to, which took a reply
+    # from 10.8 s to 1.4 s in the AI package's own tests. A robot that pauses
+    # eleven seconds before saying hello is not having a conversation.
+    llm.extra(String("chat_template_kwargs"), String('{"enable_thinking": false}'))
+    llm.warm_up()
+    var chat_sys = String(
+        "You are a small humanoid robot in a simulator. Reply in ONE short"
+        " sentence, in the language you were addressed in. You can walk,"
+        " turn, squat and raise your arms, but you cannot pick things up or"
+        " go anywhere in particular. Be warm and brief."
+    )
     var quest = g1_command_questions(bank, True)
     print("  jev + whisper warmed")
 
@@ -400,6 +420,25 @@ def main() raises:
     var seg = List[Int16]()
     var ring = List[Int16]()
     var ring_max = Int(PREROLL_S * 16000.0)
+    # ⚠ `--phrases FILE` overrides the spoken phrases with `name=phrase`
+    # lines. The built-in table is English because the tree is English; a
+    # French session wants a French file, and that is data, not source.
+    var ph_name = List[String]()
+    var ph_text = List[String]()
+    if phrase_file != "":
+        var praw = string_from_bytes(read_file_bytes(phrase_file))
+        var plines = praw.split("\n")
+        for i in range(len(plines)):
+            var pl = String(plines[i])
+            if pl.byte_length() == 0 or pl.startswith("#"):
+                continue
+            var eq = pl.find("=")
+            if eq <= 0:
+                continue
+            ph_name.append(String(pl[byte=0:eq]))
+            ph_text.append(String(pl[byte=eq + 1:pl.byte_length()]))
+        print("  phrases:", len(ph_name), "from", phrase_file)
+
     var mic_dead = String("")
     var checked_silence = False
     var mic_on = True
@@ -622,13 +661,26 @@ def main() raises:
                             # ⚠ SAY THE PART IT CANNOT DO. A robot that
                             # silently performs 30 % of an instruction is
                             # worse than one that performs 30 % and says so.
-                            var utter = pick.name
+                            var utter = g1_command_phrase(pick.name)
+                            for pi in range(len(ph_name)):
+                                if ph_name[pi] == pick.name:
+                                    utter = ph_text[pi]
                             if pick.needs_world > 0.5:
-                                utter = pick.name + String(
+                                utter = utter + String(
                                     ", but I have no object or destination")
                             _say_async(utter)
                             mute_until = perf_counter_ns() + Int(
                                 ECHO_TAIL_S * 1e9)
+                elif pick.talk:
+                    # ⚠ NOT a bank command: the speaker wanted an answer.
+                    # Nothing about the robot's motion changes — it goes on
+                    # doing whatever it was doing while it replies.
+                    var msgs = List[ChatMessage]()
+                    msgs.append(ChatMessage.user(heard))
+                    llm.start(msgs, chat_sys, List[ToolSpec](), False)
+                    last_event = String("talking...")
+                    print("  [talk]", _f2(pick.conf))
+                    state = ST_CHAT
                 else:
                     last_event = String("refused: ") + pick.reason
                     print("  [refused]", pick.reason, " P(none)",
@@ -638,6 +690,25 @@ def main() raises:
                     # again — the loop that filled a whole session's log. The
                     # HUD already says it; saying it too buys nothing and
                     # costs a Whisper call every time.
+                # ⚠ ONLY when the decision did not hand off. The talk branch
+                # sets ST_CHAT, and an unconditional reset here would drop
+                # the reply on the floor — the request would run to
+                # completion and nothing would ever read it.
+                if state == ST_JEV:
+                    state = ST_IDLE
+
+        elif state == ST_CHAT:
+            # non-streaming, so `poll` returns "" throughout and `done`
+            # is the signal. The robot keeps moving while it thinks.
+            _ = llm.poll()
+            if llm.done():
+                var rep = llm.result()
+                print("  [said]", rep.text)
+                heard = rep.text
+                if not mute:
+                    _say_async(rep.text)
+                    mute_until = perf_counter_ns() + Int(ECHO_TAIL_S * 1e9)
+                last_event = String("replied")
                 state = ST_IDLE
 
         # ── keys ──────────────────────────────────────────────────────
