@@ -43,3 +43,7 @@ tests/robots/test_g1_rsi_inject_kernel_gpu.mojo
 # the RELEASED ONNX actor through its 721-vector to three decimals. The layout
 # is KEY-MAJOR, newest-first; a step-major transcription has the right SIZE.
 tests/robots/test_g1_history.mojo
+
+# the command bank reader: a short `z` row would slide every later command's
+# vector and each would silently drive a different behaviour than its name
+tests/robots/test_g1_command_bank.mojo
