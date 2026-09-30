@@ -118,7 +118,7 @@ comptime ST_JEV: Int = 3
 # "lève les bras en l'air". The loss is at both ends and neither is the
 # microphone's fault:
 #
-#   TAIL: the loop stops reading the instant `rec_s` elapses, while ffmpeg's
+#   TAIL: the loop stops reading the instant a segment ends, while ffmpeg's
 #   last packets are still in the pipe. DRAIN_S keeps reading past the end.
 #
 #   HEAD: a speaker starts on the keypress, not after it. PREROLL_S keeps a
@@ -128,6 +128,22 @@ comptime ST_JEV: Int = 3
 #   lives.
 comptime PREROLL_S: Float64 = 0.35
 comptime DRAIN_S: Float64 = 0.35
+
+# ── voice activity detection ──────────────────────────────────────────────
+# ⚠ AN ABSOLUTE RMS THRESHOLD DOES NOT SURVIVE A ROOM CHANGE. This machine's
+# noise floor measured 0.0004 against speech peaks of 0.024-0.037 — a factor
+# of 60-90 — but a fan, a laptop under load or a different room moves the
+# floor by more than the margin a fixed number would leave. So the floor is
+# TRACKED while nobody is speaking, and the thresholds are multiples of it.
+#
+# ⚠ AND THEY ARE TWO DIFFERENT NUMBERS. One threshold chatters: a talker
+# crosses it a dozen times a second between syllables and each crossing would
+# open or close a segment. Opening is harder than staying open, and a segment
+# ends only after HANG_S of quiet.
+comptime VAD_OPEN_MULT: Float64 = 8.0
+comptime VAD_CLOSE_MULT: Float64 = 3.5
+comptime VAD_OPEN_MIN: Float64 = 0.0020
+comptime VAD_FLOOR_MIN: Float64 = 0.00005
 
 
 # ⚠ THERE IS NO `_rec_start` ANY MORE, AND THE BUG IT DIED OF IS WORTH
@@ -212,12 +228,15 @@ def main() raises:
     var chan_path = _flag(String("--channel"), String("/tmp/g1_cmd"))
     var start_clip = atol(_flag(String("--start-clip"), String(13)))
     var fps = atol(_flag(String("--fps"), String(50)))
-    var rec_s = Float64(String(_flag(String("--record"), String("4"))))
     var walk_s = Float64(String(_flag(String("--walk-seconds"), String("5"))))
     var max_none = Float64(String(_flag(String("--max-none"), String("0.25"))))
     var min_top = Float64(String(_flag(String("--min-top"), String("0.35"))))
     var mute = _has(String("--mute"))
     var mic_dev = _flag(String("--mic"), String(""))
+    var vad = not _has(String("--push-to-talk"))
+    var hang_s = Float64(String(_flag(String("--hang"), String("0.7"))))
+    var max_seg = Float64(String(_flag(String("--max-seg"), String("10"))))
+    var min_seg = Float64(String(_flag(String("--min-seg"), String("0.45"))))
     if ckpt == "":
         raise Error("pass --ckpt <path/to/step_NNNN.ckpt>")
 
@@ -317,6 +336,11 @@ def main() raises:
     var ring_max = Int(PREROLL_S * 16000.0)
     var mic_dead = String("")
     var checked_silence = False
+    var mic_on = True
+    var floor = 0.0010
+    var quiet_since = perf_counter_ns()
+    var prev_m = False
+    var forced = False
 
     var state = ST_IDLE
     var heard = String("")
@@ -330,7 +354,11 @@ def main() raises:
     var pending = -1
     var pending_blend = 25
 
-    print("  TAB = speak (", rec_s, "s), keys 1-9 / a-i pick, SPACE = stand, ESC quits")
+    if vad:
+        print("  HANDS-FREE: just speak. M mutes the mic, TAB forces a segment.")
+    else:
+        print("  push-to-talk: TAB to speak. M mutes the mic.")
+    print("  keys 1-9 / a-i pick a command, SPACE = stand, ESC quits")
     print("-" * 72)
 
     var step = 0
@@ -362,7 +390,7 @@ def main() raises:
         # has exited, carrying ffmpeg's own reason — which is the difference
         # between "grant Terminal microphone access" and "the device went
         # away", and it is why this no longer guesses.
-        if mic_dead == "":
+        if mic_on and mic_dead == "":
             try:
                 var pcm = mic.read()
                 if len(pcm) > 0:
@@ -373,7 +401,6 @@ def main() raises:
                         for i in range(len(pcm)):
                             seg.append(pcm[i])
                     else:
-                        # the pre-roll ring, kept only while NOT recording
                         for i in range(len(pcm)):
                             ring.append(pcm[i])
                         if len(ring) > ring_max:
@@ -381,11 +408,17 @@ def main() raises:
                             for i in range(len(ring) - ring_max, len(ring)):
                                 keep.append(ring[i])
                             ring = keep^
-                # ⚠ EXACT ZEROS ARE NOT A QUIET ROOM. A live microphone's
-                # noise floor always moves the low bits; all-zero samples mean
-                # a muted or disabled input, or a refused permission. Checked
-                # once, early, so the demo says so instead of waiting for
-                # speech that cannot arrive.
+                        # ⚠ TRACK THE FLOOR ONLY WHILE NOT IN A SEGMENT, or
+                        # speech raises the floor it is measured against and
+                        # the detector deafens itself mid-sentence. Fast
+                        # down, slow up: a quieter room is believed at once,
+                        # a louder one only gradually.
+                        if level < floor:
+                            floor = level
+                        else:
+                            floor = floor * 1.0005
+                        if floor < VAD_FLOOR_MIN:
+                            floor = VAD_FLOOR_MIN
                 if not checked_silence and mic.seconds_read() > 1.0:
                     checked_silence = True
                     if mic.digital_silence(0.5):
@@ -399,18 +432,56 @@ def main() raises:
                 mic_dead = String(e)
                 print("  [mic]", mic_dead)
 
+        var open_at = floor * VAD_OPEN_MULT
+        if open_at < VAD_OPEN_MIN:
+            open_at = VAD_OPEN_MIN
+        var close_at = floor * VAD_CLOSE_MULT
+
+        # ⚠ VAD OPENS ONLY FROM IDLE. While a transcription or a decision is
+        # in flight, speech is still ringed but starts nothing — one call per
+        # client, and a queue of half-heard commands is worse than a missed
+        # one. The 1.2 s guard keeps the floor estimate from opening a
+        # segment on its own first samples.
+        if (mic_on and mic_dead == "" and state == ST_IDLE and vad
+            and level > open_at and mic.seconds_read() > 1.2):
+            heard = String("")
+            pick = G1LangPick()
+            seg = ring.copy()
+            ring = List[Int16]()
+            peak = level
+            t_rec = perf_counter_ns()
+            quiet_since = perf_counter_ns()
+            forced = False
+            state = ST_REC
+            last_event = String("listening...")
+
         if state == ST_REC:
-            if Float64(perf_counter_ns() - t_rec) / 1e9 >= rec_s + DRAIN_S:
-                if len(seg) < 1600:             # under 0.1 s of audio
-                    heard = String("(no audio captured)")
-                    print("  [rec] captured", len(seg), "samples — mic?")
+            if level > close_at:
+                quiet_since = perf_counter_ns()
+            var quiet_s = Float64(perf_counter_ns() - quiet_since) / 1e9
+            var seg_s = Float64(len(seg)) / 16000.0
+            # ⚠ THREE WAYS TO END, and the last two are not optional. Silence
+            # is the normal one — HANG_S bridges the gap between words without
+            # feeling like a wait. A segment that never falls quiet (a fan, a
+            # conversation across the room) would otherwise record for ever
+            # and post a minute of audio to Whisper. A forced end is what TAB
+            # is for when a room is too loud for the detector to close.
+            var over = seg_s > max_seg
+            var done = forced or over or (quiet_s > hang_s)
+            if done and seg_s > DRAIN_S:
+                forced = False
+                # ⚠ a cough, a chair, a door. Below `min_seg` it is not
+                # speech, and sending it costs a Whisper call to be told so.
+                if seg_s < min_seg:
+                    print("  [vad] dropped", _f2(seg_s), "s — under",
+                          _f2(min_seg))
                     state = ST_IDLE
                 else:
                     var audio = WavAudio(16000, 1, seg.copy())
                     stt.start(audio)
-                    print("  [stt]", len(seg), "samples (",
-                          _f2(Float64(len(seg)) / 16000.0), "s ), peak",
-                          _f4(peak))
+                    print("  [stt]", len(seg), "samples (", _f2(seg_s),
+                          "s ), peak", _f4(peak),
+                          "— max-seg" if over else "")
                     state = ST_STT
 
         elif state == ST_STT:
@@ -473,17 +544,56 @@ def main() raises:
         # ⚠ EDGE-TRIGGERED. `get_keyboard_state` reports the key as HELD, so
         # a level test would start a new recording every frame it is down.
         var rec_key = kb[Int(Scancode.SCANCODE_TAB)]
-        if rec_key and not prev_key and state == ST_IDLE and mic_dead == "":
-            heard = String("")
-            pick = G1LangPick()
-            # ⚠ START FROM THE RING, not from empty — the first syllable is
-            # already in it.
-            seg = ring.copy()
-            ring = List[Int16]()
-            peak = 0.0
-            t_rec = perf_counter_ns()
-            state = ST_REC
-            last_event = String("listening...")
+        # ⚠ M CLOSES THE MICROPHONE, and it is not a convenience. An
+        # always-open mic in a room of people is a privacy problem before it
+        # is a false-trigger problem: everything said near this laptop would
+        # otherwise be posted to a transcription service. `stop()` kills
+        # ffmpeg, so the OS recording indicator goes out and nothing is
+        # captured at all — not captured-and-ignored.
+        var m_key = kb[Int(Scancode.SCANCODE_M)]
+        if m_key and not prev_m:
+            if mic_on:
+                try:
+                    mic.stop()
+                except:
+                    pass
+                mic_on = False
+                ring = List[Int16]()
+                level = 0.0
+                state = ST_IDLE
+                last_event = String("mic CLOSED")
+                print("  [mic] closed")
+            else:
+                try:
+                    mic = MicCapture.start(16000, mic_dev)
+                    mic_on = True
+                    mic_dead = String("")
+                    checked_silence = False
+                    peak = 0.0
+                    floor = 0.0010
+                    last_event = String("mic open")
+                    print("  [mic] reopened")
+                except e:
+                    mic_dead = String(e)
+                    print("  [mic]", mic_dead)
+        prev_m = m_key
+
+        # TAB forces a segment to start, or ends the one in progress — the
+        # manual override for a room too loud for the detector to close.
+        if rec_key and not prev_key and mic_on and mic_dead == "":
+            if state == ST_IDLE:
+                heard = String("")
+                pick = G1LangPick()
+                seg = ring.copy()
+                ring = List[Int16]()
+                peak = 0.0
+                t_rec = perf_counter_ns()
+                quiet_since = perf_counter_ns()
+                forced = False
+                state = ST_REC
+                last_event = String("listening...")
+            elif state == ST_REC:
+                forced = True
         prev_key = rec_key
 
         # ⚠ LOCOMOTION HAS NO NATURAL END. A posture holds itself because `z`
@@ -553,15 +663,17 @@ def main() raises:
         )
         ui.panel(0, 0, Float32(SIDEBAR_W), Float32(win_h))
         ui.label(12, 10, String("BFM-ZERO — TALK TO IT"), UI_HEAD, 1)
-        ui.label(12, 26, String("TAB to speak, 18 commands"), UI_DIM, 1)
+        ui.label(12, 26, String("just speak · M mute · TAB force"), UI_DIM, 1)
         # ⚠ THE STATE READOUT IS NOT DECORATION. Speech plus decision is
         # 1.5 s; without a visible state an audience sees a robot that moves
         # two seconds after you speak for no reason anyone can follow.
         var st_s = String("idle — press TAB")
         var st_c = UI_DIM
         if state == ST_REC:
-            var el = Float64(perf_counter_ns() - t_rec) / 1e9
-            st_s = String("LISTENING...") if el < rec_s else String("...")
+            # the bar of the HUD is the segment so far, not a countdown —
+            # there is no window to count down any more.
+            var el = Float64(len(seg)) / 16000.0
+            st_s = String("LISTENING ") + _f2(el) + String("s")
             st_c = UI_WARN
         elif state == ST_STT:
             st_s = String("transcribing...")
@@ -628,8 +740,17 @@ def main() raises:
         if pk > 0.02:
             ui.panel(12 + mw * Float32(pk) - 2, by + 16, 2, 12)
         ui.label(12, by + 32, String("rms ") + _f4(level)
-                 + String(" pk ") + _f4(peak), UI_DIM, 1)
-        if mic_dead != "":
+                 + String(" open>") + _f4(open_at), UI_DIM, 1)
+        # the open threshold on the bar's own scale, so you can see how far a
+        # voice is from starting a segment
+        var thr = open_at * 6.0
+        if thr > 1.0:
+            thr = 1.0
+        if mic_on and thr > 0.01:
+            ui.panel(12 + mw * Float32(thr), by + 14, 1, 16)
+        if not mic_on:
+            ui.label(12, by + 48, String("MIC CLOSED — M opens"), UI_WARN, 1)
+        elif mic_dead != "":
             var md = mic_dead
             if md.byte_length() > 26:
                 var mcut = String(mic_dead[codepoint=0:26])
@@ -638,7 +759,8 @@ def main() raises:
         elif not checked_silence:
             ui.label(12, by + 48, String("checking input..."), UI_DIM, 1)
         else:
-            ui.label(12, by + 48, String("input live"), UI_OK, 1)
+            ui.label(12, by + 48, String("live · floor ") + _f4(floor),
+                     UI_OK, 1)
 
         ui.label(12, by + 68, last_event, UI_DIM, 1)
         env.set_ui(ui.rects, ui.texts)
