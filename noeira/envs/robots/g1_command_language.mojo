@@ -229,10 +229,19 @@ def g1_command_questions(
     if with_addressed:
         q.noul(
             String(G1_Q_ADDRESSED),
+            # ⚠ "AIMED AT", NOT "AN INSTRUCTION". The first wording asked
+            # whether this was "an instruction addressed to the robot, asking
+            # it to do something now" — and a greeting is NOT an instruction,
+            # so "Bonjour, comment vas-tu ?" came back 0.06 and was refused
+            # before `talk` could ever be reached. The question this gate
+            # needs to ask is whether the speaker is addressing the ROBOT at
+            # all; what they want from it is what every other question is
+            # for.
             String(
-                "Is this an instruction addressed to the robot, asking it to"
-                " do something now? Answer no for background conversation,"
-                " silence, or speech not aimed at the robot."
+                "Is this speech aimed at the robot — an instruction, a"
+                " question, or a greeting directed at it? Answer no for"
+                " background conversation, for someone talking to another"
+                " person, and for speech not aimed at the robot."
             ),
         )
     return q^

@@ -115,6 +115,12 @@ def main() raises:
     var min_top = Float64(String(_flag(String("--min-top"), String("0.35"))))
     var dry = _has(String("--dry-run"))
     var strict = _has(String("--strict"))
+    # ⚠ `--addressed` MAKES THIS TOOL ASK WHAT THE VIEWER ASKS. Without it
+    # the CLI omits the `addressed` gate, so a phrase can pass here and be
+    # refused there — which is exactly what happened to "Bonjour, comment
+    # vas-tu ?": it read `talk` 1.00 in this tool and was killed by a gate
+    # this tool never ran.
+    var addressed = _has(String("--addressed"))
     # ⚠ `--shuffle N` asks the SAME question N times with the option list
     # rotated. The readout in this family is not permutation-invariant —
     # `imajev` pays 4x compute averaging over four orderings for exactly this
@@ -167,7 +173,7 @@ def main() raises:
     options.append(String("none"))
     descs.append(String("not one of these, or not a command for this robot"))
 
-    var q = g1_command_questions(bank)
+    var q = g1_command_questions(bank, addressed)
 
     var jev = JevClient.from_env()
 
@@ -205,7 +211,7 @@ def main() raises:
     var ans = jev.decide_text(String("instruction: ") + text, q)
     var ms = Float64(perf_counter_ns() - t0) / 1e6
     var argmax = ans.choice(String(G1_Q_COMMAND))
-    var d = g1_decide(ans, bank, max_none, min_top)
+    var d = g1_decide(ans, bank, max_none, min_top, 0.5, addressed)
     var p_none = d.p_none
     var pick = d.name if d.name != "" else String("")
     var conf = d.conf
@@ -256,6 +262,7 @@ def main() raises:
         return
     if d.name == "":
         print("REFUSED:", d.reason, " P(none)", _f2(d.p_none),
+              " addressed", _f2(d.addressed),
               " (leaning", d.best, _f2(d.conf), ") — nothing sent.")
         return
 
