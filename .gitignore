@@ -134,8 +134,11 @@ celerybeat.pid
 # SageMath parsed files
 *.sage.py
 
-# Environments
+# Environments — API keys live in .env (noeira/ai/keys.mojo); never commit
+# one. Variants (.env.local, .env.prod, …) too; an example file may be.
 .env
+.env.*
+!.env.example
 .envrc
 .venv
 env/
