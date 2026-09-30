@@ -84,7 +84,7 @@ from noeira.render.types import Color
 from noeira.render.ui import UI
 from noeira.render.sdl.sdl_scancode import Scancode
 from noeira.render.sdl.sdl_keyboard import get_keyboard_state
-from noeira.io.fileio import remove_file
+from noeira.io.fileio import remove_file, file_size
 from noeira.io.proc import run_system, quote_arg
 from noeira.ai.audio_io import MicCapture, rms
 from noeira.io.wav import WavAudio
@@ -183,26 +183,49 @@ def _f4(v: Float64) -> String:
     return (String("-") + b) if neg else b
 
 
-def _speak_seconds(text: String) -> Float64:
-    """How long `say` will be talking, roughly.
+comptime SPEAK_FLAG: String = "/tmp/noeira_g1_speaking"
+# ⚠ how long the room keeps ringing after `say` exits, plus whatever is still
+# in ffmpeg's pipe. Small, but not zero.
+comptime ECHO_TAIL_S: Float64 = 0.45
 
-    ⚠ THIS EXISTS BECAUSE THE ROBOT HEARS ITSELF. With an open mic, a spoken
-    confirmation is picked up, transcribed and decided on: a real log came
-    back with "Note adressée to the robot", "No such command", "Left hand
-    up" and "Boost and Zub" — the demo talking to itself, and about half the
-    utterances in the session were its own voice. `say` gives no completion
-    handle, so the gate is an estimate: macOS's default rate is about 175
-    words a minute, near 14 characters a second, plus a margin for the
-    start-up delay and the tail of the last word.
+
+def _speaking() -> Bool:
+    """True while `say` is still talking.
+
+    ⚠ THIS WAS AN ESTIMATE AND THE ESTIMATE WAS NOT CLOSE. The first version
+    predicted the duration from the text at ~14 characters a second: it gave
+    1.24 s for "spin_left", which actually takes **2.79 s** — and
+    "both_hands_up", half again as long in characters, takes **2.20 s**, so
+    the estimate does not even order them correctly. `say` has a start-up
+    cost that dominates a short word, and it pronounces an underscore.
+
+    The robot went on hearing itself, transcribing "SpinLeft" and
+    "SpinLift" back into its own decider, because the gate expired while the
+    speaker was still going.
+
+    `say` has no completion handle, so it gets one: the flag is created
+    before the process and REMOVED BY THE SHELL when it exits. Exact, and the
+    same trick as renaming a finished recording into place.
     """
-    return Float64(text.byte_length()) / 14.0 + 0.6
+    try:
+        _ = file_size(String(SPEAK_FLAG))
+        return True
+    except:
+        return False
 
 
 def _say_async(text: String) raises:
-    """`say` blocks for as long as it speaks, so it goes to the background
-    too. Fire and forget: a missed confirmation is not worth a dropped
-    frame."""
-    _ = run_system("say " + quote_arg(text) + " >/dev/null 2>&1 &")
+    """Speak in the background, and leave a flag behind that says so.
+
+    `say` blocks for as long as it speaks, so it cannot run in the loop. The
+    flag is written HERE rather than inside the backgrounded shell, or there
+    would be a window between the spawn and the flag appearing in which the
+    gate is open and the microphone is already live."""
+    _ = run_system("touch " + quote_arg(String(SPEAK_FLAG)))
+    _ = run_system(
+        "( say " + quote_arg(text) + " ; rm -f "
+        + quote_arg(String(SPEAK_FLAG)) + " ) >/dev/null 2>&1 &"
+    )
 
 comptime FNet = BFMFTower[OBS, ACT, D, G1_H, G1_L, D]
 comptime BNet = BFMBNetFiltered[OBS, SP, D, G1_HB]
@@ -415,12 +438,19 @@ def main() raises:
         # ⚠ still READ while the robot speaks — the pipe is 64 KiB, about 2 s,
         # and past that ffmpeg blocks and the device drops audio. The samples
         # are read and DISCARDED, never ringed, never levelled.
+        if _speaking():
+            mute_until = perf_counter_ns() + Int(ECHO_TAIL_S * 1e9)
         var echoing = perf_counter_ns() < mute_until
         if mic_on and mic_dead == "":
             try:
                 var pcm = mic.read()
                 if echoing:
                     level = 0.0
+                    # ⚠ AND DROP THE RING. It holds the last 0.35 s of audio
+                    # and is prepended to the next segment — which would
+                    # hand Whisper the tail of the robot's own sentence as
+                    # the first syllable of yours.
+                    ring = List[Int16]()
                 elif len(pcm) > 0:
                     level = rms(pcm)
                     if level > peak:
@@ -556,7 +586,7 @@ def main() raises:
                                     ", but I have no object or destination")
                             _say_async(utter)
                             mute_until = perf_counter_ns() + Int(
-                                _speak_seconds(utter) * 1e9)
+                                ECHO_TAIL_S * 1e9)
                 else:
                     last_event = String("refused: ") + pick.reason
                     print("  [refused]", pick.reason, " P(none)",
