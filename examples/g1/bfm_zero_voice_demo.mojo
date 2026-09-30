@@ -113,6 +113,22 @@ comptime ST_REC: Int = 1
 comptime ST_STT: Int = 2
 comptime ST_JEV: Int = 3
 
+# ⚠ A 4 s WINDOW DOES NOT CAPTURE 4 s. Measured: a 4.0 s recording arrived as
+# 56 832 samples — 3.55 s — and Whisper returned "Lève les brl'air" for
+# "lève les bras en l'air". The loss is at both ends and neither is the
+# microphone's fault:
+#
+#   TAIL: the loop stops reading the instant `rec_s` elapses, while ffmpeg's
+#   last packets are still in the pipe. DRAIN_S keeps reading past the end.
+#
+#   HEAD: a speaker starts on the keypress, not after it. PREROLL_S keeps a
+#   ring of audio from BEFORE the key so the first syllable survives. This is
+#   the same ring VAD will need, and for a sharper reason — a level detector
+#   trips 100-300 ms after the onset, which is exactly where a wake word
+#   lives.
+comptime PREROLL_S: Float64 = 0.35
+comptime DRAIN_S: Float64 = 0.35
+
 
 # ⚠ THERE IS NO `_rec_start` ANY MORE, AND THE BUG IT DIED OF IS WORTH
 # KEEPING. It spawned ffmpeg to write `<path>.part` and renamed on success —
@@ -297,6 +313,8 @@ def main() raises:
     var level = 0.0
     var peak = 0.0
     var seg = List[Int16]()
+    var ring = List[Int16]()
+    var ring_max = Int(PREROLL_S * 16000.0)
     var mic_dead = String("")
     var checked_silence = False
 
@@ -354,6 +372,15 @@ def main() raises:
                     if state == ST_REC:
                         for i in range(len(pcm)):
                             seg.append(pcm[i])
+                    else:
+                        # the pre-roll ring, kept only while NOT recording
+                        for i in range(len(pcm)):
+                            ring.append(pcm[i])
+                        if len(ring) > ring_max:
+                            var keep = List[Int16]()
+                            for i in range(len(ring) - ring_max, len(ring)):
+                                keep.append(ring[i])
+                            ring = keep^
                 # ⚠ EXACT ZEROS ARE NOT A QUIET ROOM. A live microphone's
                 # noise floor always moves the low bits; all-zero samples mean
                 # a muted or disabled input, or a refused permission. Checked
@@ -373,7 +400,7 @@ def main() raises:
                 print("  [mic]", mic_dead)
 
         if state == ST_REC:
-            if Float64(perf_counter_ns() - t_rec) / 1e9 >= rec_s:
+            if Float64(perf_counter_ns() - t_rec) / 1e9 >= rec_s + DRAIN_S:
                 if len(seg) < 1600:             # under 0.1 s of audio
                     heard = String("(no audio captured)")
                     print("  [rec] captured", len(seg), "samples — mic?")
@@ -381,7 +408,9 @@ def main() raises:
                 else:
                     var audio = WavAudio(16000, 1, seg.copy())
                     stt.start(audio)
-                    print("  [stt]", len(seg), "samples, peak", _f4(peak))
+                    print("  [stt]", len(seg), "samples (",
+                          _f2(Float64(len(seg)) / 16000.0), "s ), peak",
+                          _f4(peak))
                     state = ST_STT
 
         elif state == ST_STT:
@@ -447,7 +476,10 @@ def main() raises:
         if rec_key and not prev_key and state == ST_IDLE and mic_dead == "":
             heard = String("")
             pick = G1LangPick()
-            seg = List[Int16]()
+            # ⚠ START FROM THE RING, not from empty — the first syllable is
+            # already in it.
+            seg = ring.copy()
+            ring = List[Int16]()
             peak = 0.0
             t_rec = perf_counter_ns()
             state = ST_REC
@@ -528,7 +560,8 @@ def main() raises:
         var st_s = String("idle — press TAB")
         var st_c = UI_DIM
         if state == ST_REC:
-            st_s = String("LISTENING...")
+            var el = Float64(perf_counter_ns() - t_rec) / 1e9
+            st_s = String("LISTENING...") if el < rec_s else String("...")
             st_c = UI_WARN
         elif state == ST_STT:
             st_s = String("transcribing...")
