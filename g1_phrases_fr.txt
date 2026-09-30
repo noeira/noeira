@@ -22,3 +22,4 @@ look_right=je regarde à droite
 walk_right_hand_up=je marche le bras droit levé
 walk_both_hands_up=je marche les deux bras levés
 spin_arms_in=je tourne les bras serrés
+back=je recule
