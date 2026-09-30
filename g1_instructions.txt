@@ -1,0 +1,28 @@
+# Instructions for the semantic probe (§12.58) — `--ask g1_instructions.txt`
+#
+# ⚠ THESE ARE REAL PHRASINGS, NOT CONSTRUCTED FOR THE TEST. Writing them
+# while looking at the term list would bias the experiment towards the
+# answer. Every line below is a phrase that has actually been said to this
+# robot in a session, or is in the demo's own `--vocab` list (which was
+# written for Whisper, before any of this existed):
+#   French: the 14 of `bfm_zero_voice_demo.mojo --vocab`
+#   English: the phrasings recorded in §12.54
+#
+# `command=instruction`. The command name is the GROUND TRUTH label; the
+# instruction is all the model is shown.
+walk=marche
+run=cours
+back=recule
+spin_left=tourne à gauche
+spin_right=tourne à droite
+squat=accroupis-toi
+right_hand_up=lève le bras droit
+left_hand_up=lève le bras gauche
+both_hands_up=lève les deux bras
+arms_wide=écarte les bras
+look_left=regarde à gauche
+look_right=regarde à droite
+stand=arrête-toi
+crouch=crouch down low
+strafe_left=step to your left
+strafe_right=step to your right

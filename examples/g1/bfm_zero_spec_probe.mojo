@@ -66,11 +66,16 @@ from noeira.envs.robots.unitree_g1_xml import (
     UNITREE_G1_PRIV_DIM,
 )
 from noeira.envs.robots.g1_tracking_eval import G1_D, G1_H, G1_L, G1_HB
+from noeira.ai.jev import JevClient, JevQuestions
+from noeira.core.bytes import string_from_bytes
+from noeira.io.fileio import read_file_bytes
 from noeira.envs.robots.g1_command_bank import G1CommandBank
 from noeira.envs.robots.g1_reward_vocab import (
     G1_NVOC, G1Term, g1_quantities, g1_vocab_name, g1_term_value,
     g1_ess_rows, g1_quantile, OP_GT, OP_LT, OP_BAND, OP_SOFT,
     QV_SPEED_FWD, QV_SPEED_LAT, QV_SPEED, QV_YAW_RATE, QV_UPRIGHT,
+    QV_BODY_H, QV_HEAD_H, QV_LHAND_H, QV_RHAND_H, QV_LHAND_LAT,
+    QV_RHAND_LAT, QV_LFOOT_H, QV_RFOOT_H, QV_TORSO_YAW,
 )
 
 comptime SP: Int = UNITREE_G1_OBS_DIM
@@ -86,6 +91,14 @@ comptime ANet = BFMActorTowerFiltered[
     OBS, UNITREE_G1_STATE_DIM, G1_ACTOR_EXTRA, D, G1_H, G1_L, ACT
 ]
 comptime Trainer = FBTrainer[FNet, BNet, ANet, OBS, ACT, D, BATCH, "cpu"]
+
+
+def _has(name: String) -> Bool:
+    var av = argv()
+    for i in range(len(av)):
+        if String(av[i]) == name:
+            return True
+    return False
 
 
 def _flag(name: String, dflt: String) -> String:
@@ -186,6 +199,18 @@ def main() raises:
     # with 5 levels plus a direction can address; finer than the model can
     # plausibly emit, so it is a GENEROUS test of the coarse-level design.
     var step = Float64(String(_flag(String("--quantise"), String("0.10"))))
+    # ⚠ THE LADDER IS A FLAG, NOT A CONSTANT. §12.57 priced hand height as
+    # the precision-critical quantity (3-4 cm = up to 20 deg), so the level
+    # a word resolves to is exactly the kind of number that must be
+    # measured rather than chosen. The bank itself uses p90 for a raised
+    # hand and p50 for the other one.
+    var high_p = Float64(String(_flag(String("--high-pct"), String("0.90"))))
+    # goal `low` (slot 1) and suppression `low` (later slots) are separate
+    # numbers — see the note at the resolver.
+    var low_p = Float64(String(_flag(String("--low-pct"), String("0.10"))))
+    var sup_p = Float64(String(_flag(String("--sup-pct"), String("0.50"))))
+    var mid_lo = Float64(String(_flag(String("--mid-lo"), String("0.40"))))
+    var mid_hi = Float64(String(_flag(String("--mid-hi"), String("0.60"))))
     if ckpt == "":
         raise Error("pass --ckpt <path/to/step_NNNN.ckpt>")
 
@@ -453,6 +478,19 @@ def main() raises:
               + _lpad(bank.name_at(s1i) + ms, 21)
               + _lpad(_f1(_angle(z_b2, c * D, z_ref, c * D)), 8))
 
+    # ── the SEMANTIC leg: does a model name the right quantities? ─────
+    var ask_path = _flag(String("--ask"), String(""))
+    if ask_path != "":
+        # ⚠ TWO ARMS, because "the model cannot" and "the model was not
+        # told" are different findings. Arm B states how `z = E_rho[r B]`
+        # behaves — that an unconstrained DoF returns the dataset average —
+        # which is a fact about the SYSTEM, not the answer to any particular
+        # instruction. §12.51 is the section that fact came from.
+        _ask_leg(
+            ask_path, bank, qv, b_list, n_pool, cols, z_ref, high_p, low_p,
+            mid_lo, mid_hi, sup_p, _has(String("--warn")),
+        )
+
     print()
     print("-" * 96)
     print("  B, vs BASELINE :", hitB, "/", n,
@@ -472,6 +510,197 @@ def main() raises:
         print("    ⚠ ESS collapsed under quantisation:", ess_dead,
               "— refused online, not silently wrong")
     print("-" * 96)
+
+
+# ⚠ THREE OFFERED, FOUR NAMED. `middle` stays in the enum because
+# `_truth_dir` needs a value for a term that is neither, but it is NOT
+# offered to the model — see the note beside the option list.
+comptime N_LVL: Int = 4
+comptime LVL_HIGH: Int = 0
+comptime LVL_LOW: Int = 1
+comptime LVL_MID: Int = 2
+comptime LVL_NONE: Int = 3
+
+
+def _vocab_desc(q: Int) -> String:
+    """What each quantity MEANS, including its sign.
+
+    ⚠ THE SIGN CONVENTION WAS MISSING AND THAT ALONE MADE TWO COMMANDS
+    UNANSWERABLE. `step to your left` and `step to your right` came back as
+    BYTE-IDENTICAL specs, because nothing told the model that a positive
+    lateral speed means left. That is not a model failure and no amount of
+    prompt tuning fixes it: the information was not in the question. Every
+    signed quantity now states its direction, which is a fact about the
+    state representation in the same way the option list is.
+    """
+    if q == QV_BODY_H:
+        return String("height of the pelvis above the ground, in metres")
+    if q == QV_HEAD_H:
+        return String("height of the head above the ground, in metres")
+    if q == QV_LHAND_H:
+        return String("height of the LEFT hand above the ground, in metres")
+    if q == QV_RHAND_H:
+        return String("height of the RIGHT hand above the ground, in metres")
+    if q == QV_LHAND_LAT:
+        return String(
+            "how far the LEFT hand is out to the side, away from the body"
+        )
+    if q == QV_RHAND_LAT:
+        return String(
+            "how far the RIGHT hand is out to the side, away from the body"
+        )
+    if q == QV_LFOOT_H:
+        return String("height of the LEFT foot above the ground")
+    if q == QV_RFOOT_H:
+        return String("height of the RIGHT foot above the ground")
+    if q == QV_UPRIGHT:
+        return String(
+            "how upright the torso is: 1 = straight up, 0 = horizontal"
+        )
+    if q == QV_SPEED_FWD:
+        return String(
+            "speed along the direction the robot faces, in m/s."
+            " POSITIVE = FORWARDS, NEGATIVE = BACKWARDS"
+        )
+    if q == QV_SPEED_LAT:
+        return String(
+            "sideways speed, in m/s. POSITIVE = TO THE ROBOT'S LEFT,"
+            " NEGATIVE = TO ITS RIGHT"
+        )
+    if q == QV_SPEED:
+        return String(
+            "overall speed over the ground, in m/s, never negative"
+        )
+    if q == QV_YAW_RATE:
+        return String(
+            "how fast the whole body turns about the vertical axis, in rad/s."
+            " POSITIVE = TURNING LEFT, NEGATIVE = TURNING RIGHT"
+        )
+    return String(
+        "how far the torso is twisted about the vertical axis relative to the"
+        " direction of travel. POSITIVE = TWISTED LEFT, NEGATIVE = RIGHT"
+    )
+
+
+def _dir_option(q: Int, hi: Bool) -> String:
+    """The option NAME for one (quantity, direction) pair."""
+    return g1_vocab_name(q) + (String("_high") if hi else String("_low"))
+
+
+def _dir_desc(q: Int, hi: Bool) -> String:
+    """What that pair MEANS, in the robot's own terms.
+
+    ⚠ THE DIRECTION AND ITS MEANING MUST BE IN THE SAME OPTION. The previous
+    form asked "which quantity?" with the sign convention on those options,
+    then a SEPARATE "high or low?" whose options were bare. Jev answers every
+    question independently against one state, so the convention never reached
+    the question that needed it — and `step to your left` came back
+    `lateral:low` while `step to your right` came back `lateral:high`. LEFT
+    AND RIGHT INVERTED, on a question that could not have been answered from
+    what it was given.
+    """
+    if q == QV_SPEED_LAT:
+        return String("stepping to the robot's LEFT") if hi else String(
+            "stepping to the robot's RIGHT")
+    if q == QV_YAW_RATE:
+        return String("turning on the spot to the LEFT") if hi else String(
+            "turning on the spot to the RIGHT")
+    if q == QV_TORSO_YAW:
+        return String(
+            "torso twisted to the LEFT, as when looking left without turning"
+        ) if hi else String(
+            "torso twisted to the RIGHT, as when looking right without turning"
+        )
+    if q == QV_SPEED_FWD:
+        return String("moving FORWARDS over the ground") if hi else String(
+            "moving BACKWARDS over the ground")
+    if q == QV_SPEED:
+        return String("moving fast, in any direction") if hi else String(
+            "barely moving at all — standing still")
+    if q == QV_BODY_H:
+        return String("pelvis high — standing at full height") if hi else \
+            String("pelvis LOW — crouched, squatting, close to the ground")
+    if q == QV_HEAD_H:
+        return String("head high — upright at full height") if hi else \
+            String("head LOW — bent or crouched down")
+    if q == QV_UPRIGHT:
+        return String("torso vertical") if hi else String(
+            "torso far from vertical — leaning, pitched or fallen")
+    if q == QV_LHAND_H:
+        return String("LEFT hand raised high") if hi else String(
+            "LEFT hand down, low by the side")
+    if q == QV_RHAND_H:
+        return String("RIGHT hand raised high") if hi else String(
+            "RIGHT hand down, low by the side")
+    if q == QV_LHAND_LAT:
+        return String("LEFT hand held out wide, away from the body") if hi \
+            else String("LEFT hand held in, close to the body")
+    if q == QV_RHAND_LAT:
+        return String("RIGHT hand held out wide, away from the body") if hi \
+            else String("RIGHT hand held in, close to the body")
+    if q == QV_LFOOT_H:
+        return String("LEFT foot lifted off the ground") if hi else String(
+            "LEFT foot flat on the ground")
+    return String("RIGHT foot lifted off the ground") if hi else String(
+        "RIGHT foot flat on the ground")
+
+
+def _lvl_name(i: Int) -> String:
+    if i == LVL_HIGH:
+        return String("high")
+    if i == LVL_LOW:
+        return String("low")
+    if i == LVL_MID:
+        return String("middle")     # retained for the ground-truth mapping
+    return String("unconstrained")
+
+
+def _cat_name(i: Int) -> String:
+    """The four scaffold categories, after Motivo's own task taxonomy."""
+    if i == 0:
+        return String("standing")
+    if i == 1:
+        return String("low")
+    if i == 2:
+        return String("moving")
+    return String("turning")
+
+
+def _cat_donor(i: Int) -> String:
+    """⚠ THE SCAFFOLD COMES FROM THE BANK, NOT FROM A COPY OF IT. Each
+    category names an entry whose NON-goal terms are that scaffold, so this
+    file never transcribes `_scaffold_stand` and friends out of
+    `bfm_zero_bank_build.mojo`. A second copy of the scaffold rules is
+    exactly the defect shape §12.51 was created by."""
+    if i == 0:
+        return String("right_hand_up")     # _scaffold_stand
+    if i == 1:
+        return String("squat")             # _scaffold_low
+    if i == 2:
+        return String("walk")              # _scaffold_move
+    return String("spin_left")             # _scaffold_rotate
+
+
+def _truth_dir(op: Int, lo: Float64, hi: Float64, med: Float64) -> Int:
+    """The ground-truth LEVEL of a bank goal term.
+
+    ⚠ A BAND'S DIRECTION IS NOT IN ITS OPERATOR. `squat` is
+    `body_height BAND [0.40, 0.62]`, which means LOW; `run` is
+    `speed_forward BAND [1.50, 3.00]`, which means HIGH. Both are OP_BAND.
+    The only thing that separates them is where the band sits in the
+    quantity's own distribution, so the pool's median decides — which is
+    why this probe needs the pool even for the semantic leg.
+    """
+    if op == OP_GT:
+        return LVL_HIGH
+    if op == OP_LT:
+        return LVL_LOW
+    if op == OP_BAND:
+        var c = (lo + hi) * 0.5
+        if c > med:
+            return LVL_HIGH
+        return LVL_LOW
+    return LVL_NONE
 
 
 def _snap(
@@ -500,3 +729,305 @@ def _snap(
     for i in range(n_pool):
         col[i] = cols[q * n_pool + i]
     return g1_quantile(col, lvl)
+
+
+def _ask_leg(
+    path: String,
+    ref bank: G1CommandBank,
+    ref qv: List[Float64],
+    ref b_list: List[Scalar[DT]],
+    n_pool: Int,
+    ref cols: List[Float64],
+    ref z_ref: List[Float64],
+    high_p: Float64,
+    low_p: Float64,
+    mid_lo: Float64,
+    mid_hi: Float64,
+    sup_p: Float64,
+    warn: Bool,
+) raises:
+    """Ask a model for the reward, score it two ways.
+
+    The numeric half is settled (§12.57): coarse, quantile-resolved levels
+    carry a command. This is the other half — given an instruction and
+    nothing else, does the model name the right QUANTITIES with the right
+    DIRECTIONS? Scored against each bank entry's own goal terms, and then
+    end to end by building its answer into a `z` and retrieving.
+    """
+    print()
+    print("=" * 96)
+    print("SEMANTIC LEG — a model writes the reward (§10.2's other half)")
+    print("=" * 96)
+
+    # per-quantity medians, for the band-direction rule and the resolver
+    var med = List[Float64](length=G1_NVOC, fill=0.0)
+    var qh = List[Float64](length=G1_NVOC, fill=0.0)
+    var ql = List[Float64](length=G1_NVOC, fill=0.0)
+    var qs = List[Float64](length=G1_NVOC, fill=0.0)
+    var qml = List[Float64](length=G1_NVOC, fill=0.0)
+    var qmh = List[Float64](length=G1_NVOC, fill=0.0)
+    var col = List[Float64](length=n_pool, fill=0.0)
+    for q in range(G1_NVOC):
+        for i in range(n_pool):
+            col[i] = cols[q * n_pool + i]
+        med[q] = g1_quantile(col, 0.50)
+        qh[q] = g1_quantile(col, high_p)
+        ql[q] = g1_quantile(col, low_p)
+        qs[q] = g1_quantile(col, sup_p)
+        qml[q] = g1_quantile(col, mid_lo)
+        qmh[q] = g1_quantile(col, mid_hi)
+
+    var raw = string_from_bytes(read_file_bytes(path))
+    var lines = raw.split("\n")
+    var cmds = List[String]()
+    var insts = List[String]()
+    for i in range(len(lines)):
+        var l = String(lines[i])
+        if l.byte_length() == 0 or l.startswith("#"):
+            continue
+        var eq = l.find("=")
+        if eq <= 0:
+            continue
+        cmds.append(String(l[byte=0:eq]))
+        insts.append(String(l[byte=eq + 1:l.byte_length()]))
+    print("  instructions:", len(cmds), "from", path)
+    print("  ladder: high p" + _f2(high_p) + " | goal low p" + _f2(low_p)
+          + " | suppression low p" + _f2(sup_p))
+    print("  arm:", String("B — told that an unconstrained DoF returns the"
+          " dataset average") if warn else String("A — no hint"))
+
+    # ── the questions: one category + one level per quantity ──────────
+    var cats = List[String]()
+    var cdesc = List[String]()
+    cats.append(String("standing"))
+    cdesc.append(String("upright and still, at full height"))
+    cats.append(String("low"))
+    cdesc.append(String("upright and still, but crouched or close to the ground"))
+    cats.append(String("moving"))
+    cdesc.append(String("travelling across the ground"))
+    cats.append(String("turning"))
+    cdesc.append(String("rotating on the spot"))
+
+    var lvls = List[String]()
+    var ldesc = List[String]()
+    lvls.append(String("high"))
+    ldesc.append(String(
+        "as large as it gets — for a signed quantity, strongly POSITIVE"
+    ))
+    lvls.append(String("low"))
+    ldesc.append(String(
+        "small — for a signed quantity, strongly NEGATIVE"
+    ))
+
+    # ⚠ BUDGETED SLOTS, NOT ONE QUESTION PER QUANTITY. Asking about all 14
+    # independently was the third self-inflicted failure: each question is
+    # answered in isolation, so the model has no way to say "only this one
+    # matters" and it constrained 8-14 of them per instruction. Precision
+    # 0.13. And the direction errors followed from the same thing — asked
+    # about `torso_yaw` for "marche", the model has to answer something.
+    #
+    # A slot list forces the budget, and it is the CHAIN PATTERN that
+    # §12.55 already measured working for command/command2/command3. The
+    # bank's own entries carry 1-3 goal terms, so three slots is the right
+    # size and `none` on slot 2 must stay cheap.
+    var qnames = List[String]()
+    var qdescs = List[String]()
+    for v in range(G1_NVOC):
+        qnames.append(_dir_option(v, True))
+        qdescs.append(_dir_desc(v, True))
+        qnames.append(_dir_option(v, False))
+        qdescs.append(_dir_desc(v, False))
+    qnames.append(String("none"))
+    qdescs.append(String("no further quantity is constrained"))
+
+    var jev = JevClient.from_env()
+    var rew = List[Scalar[DT]](length=n_pool, fill=Scalar[DT](0))
+    var z_ask = List[Float64](length=D, fill=0.0)
+
+    var tp = 0
+    var fp = 0
+    var fneg = 0
+    var hit = 0
+    var toks = 0
+    print()
+    print(_rpad(String("instruction"), 22) + _rpad(String("truth"), 34)
+          + _rpad(String("model"), 34) + _lpad(String("ESS"), 7)
+          + _lpad(String("retrieves"), 21))
+
+    for r in range(len(cmds)):
+        var c = bank.find(cmds[r])
+        if c < 0:
+            print("  ⚠ not in the bank, skipped:", cmds[r])
+            continue
+        # ground truth: the entry's own GOAL terms
+        var t_q = List[Int]()
+        var t_d = List[Int]()
+        var s0 = bank.t_start[c]
+        for j in range(bank.t_count[c]):
+            var k = s0 + j
+            if not bank.t_goal[k] or bank.t_op[k] == OP_SOFT:
+                continue
+            t_q.append(bank.t_q[k])
+            t_d.append(_truth_dir(bank.t_op[k], bank.t_lo[k], bank.t_hi[k],
+                                  med[bank.t_q[k]]))
+
+        var q = JevQuestions()
+        q.choice(
+            String("category"),
+            String(
+                "A humanoid robot is given this instruction. Which of these"
+                " best describes the POSTURE the robot should be in while"
+                " carrying it out?"
+            ),
+            cats, cdesc,
+        )
+        var ordinals = List[String]()
+        ordinals.append(String("FIRST and most important"))
+        ordinals.append(String("SECOND"))
+        ordinals.append(String("THIRD"))
+        for s in range(3):
+            q.choice(
+                String("q") + String(s),
+                String(
+                    "A humanoid robot is carrying out this instruction. The"
+                    " robot's body is measured by the quantities listed."
+                    " Which of these is the " + ordinals[s] + " thing the"
+                    " instruction asks for?"
+                    + (
+                        String(
+                            " ⚠ Any quantity you do NOT name comes back as the"
+                            " robot's average behaviour, so name the ones that"
+                            " must NOT change as well: if one hand goes up,"
+                            " the other must be named as staying low."
+                        ) if warn else String("")
+                    )
+                    + (
+                        String(" Pick `none` when the instruction constrains"
+                               " nothing further.") if s > 0 else String("")
+                    )
+                ),
+                qnames, qdescs,
+            )
+        var a = jev.decide_text(String("instruction: ") + insts[r], q)
+        toks += a.input_tokens
+
+        # ── the model's spec: the donor scaffold + its named goals ────
+        var cat_pick = a.choice(String("category"))
+        var ci = 0
+        for j in range(4):
+            if _cat_name(j) == cat_pick:
+                ci = j
+        var donor = bank.find(_cat_donor(ci))
+        var ts = List[G1Term]()
+        var d0 = bank.t_start[donor]
+        for j in range(bank.t_count[donor]):
+            var k = d0 + j
+            if bank.t_goal[k]:
+                continue
+            ts.append(G1Term(bank.t_q[k], bank.t_op[k], bank.t_lo[k],
+                             bank.t_hi[k], False))
+
+        var m_q = List[Int]()
+        var m_d = List[Int]()
+        for s in range(3):
+            var pick = a.choice(String("q") + String(s))
+            var vi = -1
+            var li = LVL_HIGH
+            for v in range(G1_NVOC):
+                if _dir_option(v, True) == pick:
+                    vi = v
+                    li = LVL_HIGH
+                elif _dir_option(v, False) == pick:
+                    vi = v
+                    li = LVL_LOW
+            # ⚠ STOP AT THE FIRST `none`, exactly as `g1_decide_chain` does:
+            # a third slot without a second is a misread, not a spec.
+            if vi < 0:
+                break
+            var already = False
+            for j in range(len(m_q)):
+                if m_q[j] == vi:
+                    already = True
+            if already:
+                continue
+            m_q.append(vi)
+            m_d.append(li)
+            # ⚠ THE LADDER IS SLOT-DEPENDENT, AND THIS IS MEASURED, NOT
+            # CHOSEN. `low` means two different things. As the FIRST thing
+            # asked for it is a GOAL — "move backwards", "look right" — and
+            # must be firmly negative: at p50 `recule` scored ESS 27407 and
+            # retrieved `stand`, at p10 it scored 6072 and retrieved `back`.
+            # In a LATER slot it is almost always SUPPRESSION — "the other
+            # hand stays down" — and p10 empties the product outright:
+            # `lève le bras droit` went from ESS 233 to ESS **0**, because
+            # the pool has essentially no frames with one hand above p90
+            # while the other is below p10.
+            #
+            # The bank had this right all along and it is visible in its own
+            # terms: `right_hand_up` is `RHAND_H > p90` AND `LHAND_H < p50`.
+            # A goal threshold and a suppression threshold, in one compound.
+            if li == LVL_HIGH:
+                ts.append(G1Term(vi, OP_GT, qh[vi], 0.0, False))
+            elif s == 0:
+                ts.append(G1Term(vi, OP_LT, 0.0, ql[vi], False))
+            else:
+                ts.append(G1Term(vi, OP_LT, 0.0, qs[vi], False))
+
+        var ess = _z_of(ts, qv, b_list, n_pool, rew, z_ask, 0)
+
+        # set scores on (quantity, direction)
+        for j in range(len(t_q)):
+            var found = False
+            for i2 in range(len(m_q)):
+                if m_q[i2] == t_q[j] and m_d[i2] == t_d[j]:
+                    found = True
+            if found:
+                tp += 1
+            else:
+                fneg += 1
+        for i2 in range(len(m_q)):
+            var found = False
+            for j in range(len(t_q)):
+                if m_q[i2] == t_q[j] and m_d[i2] == t_d[j]:
+                    found = True
+            if not found:
+                fp += 1
+
+        # retrieval against the BASELINE rows (§12.57's conclusion 2)
+        var b1 = 1e9
+        var b1i = -1
+        for o in range(bank.count()):
+            var ang = _angle(z_ask, 0, z_ref, o * D)
+            if ang < b1:
+                b1 = ang
+                b1i = o
+        if b1i == c:
+            hit += 1
+
+        var ts_t = String("")
+        for j in range(len(t_q)):
+            if ts_t != "":
+                ts_t += String(",")
+            ts_t += g1_vocab_name(t_q[j]) + String(":") + _lvl_name(t_d[j])
+        var ts_m = String("")
+        for j in range(len(m_q)):
+            if ts_m != "":
+                ts_m += String(",")
+            ts_m += g1_vocab_name(m_q[j]) + String(":") + _lvl_name(m_d[j])
+        if ts_m == "":
+            ts_m = String("(nothing)")
+        var mk = String("  ") if b1i == c else String(" X")
+        print(_rpad(insts[r], 22) + _rpad(ts_t, 34) + _rpad(ts_m, 34)
+              + _lpad(String(Int(ess)), 7)
+              + _lpad(bank.name_at(b1i) + mk, 21))
+
+    print()
+    print("-" * 96)
+    var prec = Float64(tp) / Float64(tp + fp) if tp + fp > 0 else 0.0
+    var rec = Float64(tp) / Float64(tp + fneg) if tp + fneg > 0 else 0.0
+    print("  (quantity, direction) precision", _f2(prec), " recall", _f2(rec),
+          " [tp", tp, "fp", fp, "fn", fneg, "]")
+    print("  END TO END retrieval:", hit, "/", len(cmds),
+          "— the model's own spec names its own command")
+    print("  input tokens:", toks, "total,", toks // len(cmds), "per instruction")
+    print("-" * 96)
