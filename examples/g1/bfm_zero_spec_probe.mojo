@@ -70,6 +70,7 @@ from noeira.ai.jev import JevClient, JevQuestions
 from noeira.core.bytes import string_from_bytes
 from noeira.io.fileio import read_file_bytes
 from noeira.envs.robots.g1_command_bank import G1CommandBank
+from noeira.envs.robots.g1_spec import g1_pool_save
 from noeira.envs.robots.g1_reward_vocab import (
     G1_NVOC, G1Term, g1_quantities, g1_vocab_name, g1_term_value,
     g1_ess_rows, g1_quantile, OP_GT, OP_LT, OP_BAND, OP_SOFT,
@@ -273,6 +274,20 @@ def main() raises:
         done += m
     print("  pool", n_pool, "rows (stride", stride, "of", n_rows,
           ") — B encoded in", Int(Float64(perf_counter_ns() - t0) / 1e9), "s")
+
+    # ── the sidecar: this pool, for consumers with no checkpoint ───────
+    # ⚠ THIS IS WHAT MAKES THE CACHE-MISS PATH DEPLOYABLE. `z = E_rho[r B]`
+    # needs `B` over the pool and nothing else — no actor, no critic, no
+    # simulator — so the encoded rows go to a 67 MB file and `g1say` can
+    # compute a novel `z` without the 640 MB checkpoint or the 1.7 GB store.
+    var emit = _flag(String("--emit-pool"), String(""))
+    if emit != "":
+        var bf = List[Float64](length=n_pool * D, fill=0.0)
+        for i in range(n_pool * D):
+            bf[i] = Float64(b_list[i])
+        g1_pool_save(emit, n_pool, bf, qv)
+        print("  wrote", emit, "—", n_pool, "rows x", D, "+", G1_NVOC,
+              "quantities")
 
     # ── each quantity's sorted column, for the percentile round trip ──
     var cols = List[Float64](length=G1_NVOC * n_pool, fill=0.0)

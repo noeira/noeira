@@ -322,3 +322,8 @@ scratch/
 # LIBERO asset pack, materialised by `pixi run assets-pull libero` (assets.kv)
 noeira/envs/libero/assets/
 build/packs/
+
+# the BFM-Zero pool sidecar: 70 MB of encoded B rows, rebuilt in seconds by
+# `examples/g1/bfm_zero_spec_probe.mojo --emit-pool` from the checkpoint and
+# the store. Derived, and larger than anything that belongs in git.
+g1_pool.bin

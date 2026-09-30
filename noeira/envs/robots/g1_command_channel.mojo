@@ -30,6 +30,16 @@ Whole file, rewritten each time, three lines at most:
     seq 7
     cmd squat
     blend 25          # optional: frames to slerp over, 0 snaps
+    z -0.28 0.02 ...  # optional: 256 floats, a command with NO bank entry
+
+⚠ `z` IS FOR A COMMAND THE BANK DOES NOT HAVE. The cache-miss path
+(`noeira/envs/robots/g1_spec.mojo`, §12.57-12.59) turns an instruction into a
+reward spec and that into a latent, so there is no name to send. `cmd` is
+still required and becomes a LABEL for the ack and the HUD — the reader
+prefers `z` when both are present, and falls back to looking `cmd` up in the
+bank when it is absent. A named command must never travel as a `z`: the
+bank's row went through four gates and a CEM refinement worth 37-49 %, and
+the spec path's baseline has had neither.
 
 ⚠ WRITERS MUST WRITE ATOMICALLY (`write_text_atomic`, which writes a
 temporary and renames). A plain rewrite lets the reader catch the file
@@ -57,6 +67,8 @@ struct G1ChannelMsg(Copyable, Movable):
     var seq: Int
     var cmd: String
     var blend: Int
+    var z: List[Float64]
+    """256 floats when the writer sent a latent directly, else empty."""
     var fresh: Bool
     """False when there was nothing new, the file was absent, or it did not
     parse. A caller keeps doing whatever it was doing."""
@@ -65,6 +77,7 @@ struct G1ChannelMsg(Copyable, Movable):
         self.seq = -1
         self.cmd = String("")
         self.blend = 0
+        self.z = List[Float64]()
         self.fresh = False
 
 
@@ -97,6 +110,7 @@ struct G1CommandChannel(Movable):
             var seq = -1
             var cmd = String("")
             var blend = 0
+            var zs = List[Float64]()
             for i in range(len(lines)):
                 var l = String(lines[i])
                 if l.byte_length() == 0 or l.startswith("#"):
@@ -110,12 +124,23 @@ struct G1CommandChannel(Movable):
                     cmd = String(p[1])
                 elif l.startswith("blend "):
                     blend = atol(String(p[1]))
+                elif l.startswith("z "):
+                    # ⚠ A SHORT `z` IS A HALF-WRITTEN FILE, NOT A SHORT
+                    # COMMAND. Any 256 floats project onto the sphere and
+                    # drive a plausible robot, so a truncated row would be
+                    # silently obeyed. Length is checked by the caller
+                    # against its own D; here a wrong count is dropped.
+                    for j in range(1, len(p)):
+                        var tok = String(p[j])
+                        if tok.byte_length() > 0:
+                            zs.append(Float64(tok))
             if seq <= self.last_seq or cmd == "":
                 return m^
             self.last_seq = seq
             m.seq = seq
             m.cmd = cmd
             m.blend = blend
+            m.z = zs^
             m.fresh = True
         except:
             # absent, unreadable, or caught mid-write — all the same answer
@@ -186,4 +211,34 @@ def g1_channel_write(path: String, seq: Int, cmd: String, blend: Int = 25) raise
     var s = String("seq ") + String(seq) + String("\n")
     s += String("cmd ") + cmd + String("\n")
     s += String("blend ") + String(blend) + String("\n")
+    write_text_atomic(path, s)
+
+
+def g1_channel_write_z(
+    path: String, seq: Int, label: String, ref z: List[Float64],
+    blend: Int = 25,
+) raises:
+    """Send a latent the bank has no name for — the cache-miss path.
+
+    `label` is what the ack and the HUD show; it is NOT looked up in the
+    bank, so it can be a description of the spec.
+
+    ⚠ THE LABEL MUST BE ONE TOKEN, and this RAISES rather than truncating.
+    `cmd` is read as `line.split(" ")[1]`, so a label with a space silently
+    loses everything after it — `spec:right_foot_height high` arrived as
+    `spec:right_foot_height`, which reads as a different command than the one
+    that was sent. A caller joins its words with `_`.
+    """
+    if label.find(" ") >= 0:
+        raise Error(
+            "g1 channel: the label '" + label + "' contains a space, and"
+            " `cmd` is a single token — join the words with `_`"
+        )
+    var s = String("seq ") + String(seq) + String("\n")
+    s += String("cmd ") + label + String("\n")
+    s += String("blend ") + String(blend) + String("\n")
+    s += String("z")
+    for k in range(len(z)):
+        s += String(" ") + String(z[k])
+    s += String("\n")
     write_text_atomic(path, s)

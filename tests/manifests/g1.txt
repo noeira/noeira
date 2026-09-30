@@ -57,3 +57,9 @@ tests/robots/test_g1_command_channel.mojo
 # than a smaller one. Pins the history's order, the repeat case, and the
 # duration bucketing that keeps a float off the wire.
 tests/robots/test_g1_command_state.mojo
+
+# the cache-miss path's pure parts: the pool sidecar's own round trip (the
+# first loader refused its own space-padded header), the goal key that is the
+# duplicate test after two angle criteria were measured failing at it, and
+# the channel's refusal of a label it would truncate.
+tests/robots/test_g1_spec.mojo

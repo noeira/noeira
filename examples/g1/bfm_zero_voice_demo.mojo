@@ -571,16 +571,44 @@ def main() raises:
         # speech, a model call — happened in another process.
         var msg = chan.poll()
         if msg.fresh:
-            var idx = bank.find(msg.cmd)
-            if idx >= 0:
-                pending = idx
-                pending_blend = msg.blend
-                last_event = String("chan: ") + msg.cmd
+            # ⚠ A `z` ON THE CHANNEL IS A COMMAND WITH NO BANK ENTRY — the
+            # cache-miss path (`g1_spec.mojo`, §12.60). It arrives already
+            # gated by the writer on ESS and the goal-term key, so the loop's
+            # only job is to check the WIDTH: any 256 floats project onto the
+            # sphere and drive a plausible robot, so a truncated row would be
+            # obeyed rather than noticed.
+            if len(msg.z) == D:
+                for k in range(D):
+                    zpair.data[k] = zcur.data[k]
+                    zpair.data[D + k] = Scalar[DT](msg.z[k])
+                blend_len = msg.blend if msg.blend > 0 else 1
+                blend_left = blend_len
+                # ⚠ `cur` STAYS PUT and `pending` is NOT set. A novel `z` has
+                # no bank index, and `cur` is what the HUD, the keys and the
+                # context all read as "the command running now". Pointing it
+                # at a stale entry would make the next relative instruction
+                # ("plus vite") resolve against a command the robot is not
+                # doing (§12.56).
+                ctx.began(String("spec"))
+                t_cmd = perf_counter_ns()
+                last_event = String("chan: z ") + msg.cmd
                 chan.ack(msg.seq, msg.cmd, True)
-            else:
-                # ⚠ unknown: keep doing what we were doing, and SAY SO.
-                last_event = String("chan: ?") + msg.cmd
+            elif len(msg.z) > 0:
+                # a short row is a half-written file, not a short command
+                last_event = String("chan: BAD z (") + String(len(msg.z)) \
+                             + String(" of ") + String(D) + String(")")
                 chan.ack(msg.seq, msg.cmd, False)
+            else:
+                var idx = bank.find(msg.cmd)
+                if idx >= 0:
+                    pending = idx
+                    pending_blend = msg.blend
+                    last_event = String("chan: ") + msg.cmd
+                    chan.ack(msg.seq, msg.cmd, True)
+                else:
+                    # ⚠ unknown: keep doing what we were doing, and SAY SO.
+                    last_event = String("chan: ?") + msg.cmd
+                    chan.ack(msg.seq, msg.cmd, False)
 
         # ── the voice state machine ───────────────────────────────────
         # Every branch is non-blocking. The policy above has already stepped,

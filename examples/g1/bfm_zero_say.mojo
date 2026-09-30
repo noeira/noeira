@@ -63,10 +63,14 @@ from std.time import perf_counter_ns
 from noeira.ai.jev import JevClient, JevQuestions
 from noeira.envs.robots.g1_command_language import (
     g1_command_questions, g1_command_instruction, g1_decide, g1_decide_chain,
-G1Context, g1_command_state,
     g1_extent_metres, g1_extent_seconds, G1_Q_EXTENT,
     g1_alias_name, g1_alias_target, g1_alias_desc, G1_N_ALIAS,
     G1_Q_COMMAND, G1_OPT_NONE,
+    G1Context, g1_command_state,
+)
+from noeira.envs.robots.g1_spec import (
+    G1Pool, g1_spec_questions, g1_spec_from_answers, g1_spec_admit,
+    g1_spec_bank_baseline, g1_spec_describe, G1_SPEC_D,
 )
 # ⚠ module scope — Mojo rejects an import inside a branch. Importing costs
 # nothing; only `SpeechToText.huggingface()` needs HF_TOKEN, so `--text`
@@ -74,8 +78,9 @@ G1Context, g1_command_state,
 from noeira.ai.audio_io import record_wav
 from noeira.ai.speech import SpeechToText
 from noeira.envs.robots.g1_command_bank import G1CommandBank
+from noeira.envs.robots.g1_reward_vocab import G1Term
 from noeira.envs.robots.g1_command_channel import (
-    g1_channel_write, g1_channel_seq, g1_channel_read_ack,
+    g1_channel_write, g1_channel_write_z, g1_channel_seq, g1_channel_read_ack,
 )
 
 
@@ -130,6 +135,13 @@ def main() raises:
     # 3 s = "a_moment": a command that has only just started is the odd case,
     # not the default one.
     var since = Float64(String(_flag(String("--since"), String("3"))))
+    # ⚠ THE CACHE-MISS PATH IS OPT-IN AND LAZY. `P(none)` over the bank is a
+    # CALIBRATED cache miss (§10.2), so nothing here changes the hit path —
+    # which is the path §12.54 measured and the one the demo depends on. The
+    # 70 MB sidecar is read only after a miss, and the second Jev call costs
+    # ~350 ms, which is imperceptible after someone has stopped speaking.
+    var pool_path = _flag(String("--pool"), String(""))
+    var no_warn = _has(String("--spec-no-warn"))
     # ⚠ THE BAR IS P(none), NOT THE TOP-1 CONFIDENCE, and that is a measured
     # correction. "crouch down low" returned `crouch` at 0.56 with `squat` at
     # 0.38 — the mass was split between TWO CORRECT ANSWERS, because their
@@ -315,9 +327,74 @@ def main() raises:
               "`build/g1voice` replies; this does not.")
         return
     if d.name == "":
+        # ── the cache miss: ask for a REWARD instead of a name ────────
+        if pool_path != "" and d.reason == "no such command":
+            print("MISS: P(none)", _f2(d.p_none),
+                  "— the bank has no name for this. Asking for a reward spec.")
+            var pool = G1Pool.load(pool_path)
+            print("  pool:", pool.n, "rows from", pool_path)
+            var sq = g1_spec_questions(not no_warn)
+            var t1 = perf_counter_ns()
+            var sa = jev.decide(state, sq)
+            print("  sketch:", Int(Float64(perf_counter_ns() - t1) / 1e6),
+                  "ms,", sa.input_tokens, "input tokens")
+            var terms = List[G1Term]()
+            # the return value IS the scaffold count — the goals start there
+            var n_scaf = g1_spec_from_answers(sa, pool, bank, terms)
+            if n_scaf < 0:
+                print("REFUSED: the model named no quantity — nothing sent.")
+                return
+            var zb = List[Float64](length=bank.count() * G1_SPEC_D, fill=0.0)
+            g1_spec_bank_baseline(pool, bank, zb)
+            var z = List[Float64](length=G1_SPEC_D, fill=0.0)
+            var v = g1_spec_admit(pool, bank, zb, terms, z, n_scaf)
+            print("  spec:", g1_spec_describe(terms, n_scaf),
+                  " (+", n_scaf, "scaffold terms )")
+            print("  ESS", Int(v.ess), " nearest", (
+                bank.name_at(v.nearest) if v.nearest >= 0 else String("-")),
+                "at", _f2(v.angle), "deg, runner-up", (
+                bank.name_at(v.second) if v.second >= 0 else String("-")),
+                "margin", _f2(v.margin), "deg")
+            if not v.ok:
+                # ⚠ A DUPLICATE IS A SUCCESS WITH A DIFFERENT HANDLER. The
+                # instruction named something the bank already holds, and the
+                # bank's row went through four gates and a CEM refinement
+                # worth 37-49 % that this baseline has not. Run THAT.
+                if v.nearest >= 0:
+                    print("  ", v.reason, "— sending the bank's row instead.")
+                    if dry:
+                        print("dry run — would send", bank.name_at(v.nearest))
+                        return
+                    var sq2 = g1_channel_seq(chan_path) + 1
+                    if sq2 < 1:
+                        sq2 = 1
+                    g1_channel_write(chan_path, sq2,
+                                     bank.name_at(v.nearest), blend)
+                    print("sent seq", sq2, "->", bank.name_at(v.nearest))
+                    return
+                print("REFUSED:", v.reason, "— nothing sent.")
+                return
+            # ⚠ ONE TOKEN — `g1_channel_write_z` raises otherwise, because
+            # `cmd` is read as one whitespace-delimited field.
+            var label = String("spec:") + g1_spec_describe(terms, n_scaf)
+            var lab = String("")
+            for ch in label.codepoints():
+                lab += String("_") if ch.to_u32() == 32 else String(ch)
+            label = lab^
+            if dry:
+                print("dry run — would send a NOVEL z (", label, ")")
+                return
+            var sq3 = g1_channel_seq(chan_path) + 1
+            if sq3 < 1:
+                sq3 = 1
+            g1_channel_write_z(chan_path, sq3, label, z, blend)
+            print("sent seq", sq3, "-> NOVEL z:", label)
+            return
         print("REFUSED:", d.reason, " P(none)", _f2(d.p_none),
               " addressed", _f2(d.addressed),
-              " (leaning", d.best, _f2(d.conf), ") — nothing sent.")
+              " (leaning", d.best, _f2(d.conf), ") — nothing sent.",
+              String("Pass --pool g1_pool.bin to try a reward spec.")
+              if pool_path == "" else String(""))
         return
 
     # ⚠ PARTIAL EXECUTION, SAID OUT LOUD. The default is to do the part it
