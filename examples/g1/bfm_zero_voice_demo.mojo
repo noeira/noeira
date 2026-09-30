@@ -84,8 +84,10 @@ from noeira.render.types import Color
 from noeira.render.ui import UI
 from noeira.render.sdl.sdl_scancode import Scancode
 from noeira.render.sdl.sdl_keyboard import get_keyboard_state
-from noeira.io.fileio import read_file_bytes, remove_file
+from noeira.io.fileio import remove_file
 from noeira.io.proc import run_system, quote_arg
+from noeira.ai.audio_io import MicCapture, rms
+from noeira.io.wav import WavAudio
 from noeira.ai.jev import JevClient
 from noeira.ai.speech import SpeechToText
 from noeira.envs.robots.g1_command_language import (
@@ -112,27 +114,36 @@ comptime ST_STT: Int = 2
 comptime ST_JEV: Int = 3
 
 
-def _rec_start(path: String, seconds: Float64) raises:
-    """Spawn ffmpeg DETACHED and have the shell rename on success.
+# ⚠ THERE IS NO `_rec_start` ANY MORE, AND THE BUG IT DIED OF IS WORTH
+# KEEPING. It spawned ffmpeg to write `<path>.part` and renamed on success —
+# the atomic-write discipline the command channel uses. But **ffmpeg picks
+# its output format from the file EXTENSION**, and `.part` is not a format:
+#
+#     Unable to choose an output format for '/tmp/....wav.part';
+#     use a standard extension for the filename or specify the format
+#
+# It failed instantly, every time, and the demo reported "no wav — mic
+# permission?" because that was the only explanation I had built. The mic was
+# never involved. ⚠ AND I HAD SENT ITS STDERR TO /dev/null, so the one line
+# that said exactly what was wrong was discarded on purpose. `-f wav` fixes
+# it; MicCapture removes the spawn instead, and gives a live level meter for
+# free — which is what tells you the microphone is alive BEFORE you speak.
 
-    ⚠ `audio_io.record_wav` blocks for the whole duration, and four seconds of
-    frozen renderer is four seconds of frozen physics. ⚠ The rename is what
-    makes the poll safe: without it the loop can read a WAV ffmpeg is still
-    writing. Same discipline as the command channel's atomic writes.
-    """
-    try:
-        remove_file(path)
-    except:
-        pass
-    var part = path + String(".part")
-    var cmd = (
-        "( ffmpeg -hide_banner -loglevel error -y -f avfoundation"
-        " -i " + quote_arg(String(":default"))
-        + " -t " + String(seconds) + " -ac 1 -ar 16000 -sample_fmt s16 "
-        + quote_arg(part) + " && mv " + quote_arg(part) + " "
-        + quote_arg(path) + " ) >/dev/null 2>&1 &"
-    )
-    _ = run_system(cmd)
+
+def _f4(v: Float64) -> String:
+    """⚠ FOUR DECIMALS FOR THE MIC, and it is not fussiness. A quiet room's
+    noise floor is around 0.001 RMS, which at two decimals prints `0.00` —
+    indistinguishable from a dead input, which is the one thing the meter
+    exists to rule out. `digital_silence()` gives the verdict; this lets the
+    number agree with it."""
+    var neg = v < 0.0
+    var a = -v if neg else v
+    var h = Int(a * 10000.0 + 0.5)
+    var f = String(h % 10000)
+    while f.byte_length() < 4:
+        f = String("0") + f
+    var b = String(h // 10000) + String(".") + f
+    return (String("-") + b) if neg else b
 
 
 def _say_async(text: String) raises:
@@ -190,7 +201,7 @@ def main() raises:
     var max_none = Float64(String(_flag(String("--max-none"), String("0.25"))))
     var min_top = Float64(String(_flag(String("--min-top"), String("0.35"))))
     var mute = _has(String("--mute"))
-    var wav = String("/tmp/noeira_g1_voice.wav")
+    var mic_dev = _flag(String("--mic"), String(""))
     if ckpt == "":
         raise Error("pass --ckpt <path/to/step_NNNN.ckpt>")
 
@@ -239,6 +250,11 @@ def main() raises:
     if not env.init_renderer(show_velocity=False):
         raise Error("no renderer available")
     env.set_ui_sidebar_width(SIDEBAR_W)
+    # ⚠ the renderer's built-in HUD draws over the ENV viewport, not the
+    # sidebar, so it sits on top of the robot. Safe to turn off: `render()`
+    # draws the application widget list on both branches (the split that made
+    # `set_show_hud(False)` stop killing `set_ui`), so the sidebar stays.
+    env.renderer_set_show_hud(False)
     var delay_ms = 1000 // fps if fps > 0 else 0
 
     var obs_t = Tensor.alloc(OBS)
@@ -272,6 +288,17 @@ def main() raises:
     stt.warm_up()
     var quest = g1_command_questions(bank, True)
     print("  jev + whisper warmed")
+
+    # ⚠ ONE capture for the whole session, not one per utterance. It is what
+    # makes a live level meter possible, it is the foundation VAD needs, and
+    # it removes a process spawn from the moment you press a key.
+    var mic = MicCapture.start(16000, mic_dev)
+    print("  mic open:", "default" if mic_dev == "" else mic_dev)
+    var level = 0.0
+    var peak = 0.0
+    var seg = List[Int16]()
+    var mic_dead = String("")
+    var checked_silence = False
 
     var state = ST_IDLE
     var heard = String("")
@@ -312,27 +339,50 @@ def main() raises:
         # ── the voice state machine ───────────────────────────────────
         # Every branch is non-blocking. The policy above has already stepped,
         # so the robot goes on doing its last command throughout.
-        if state == ST_REC:
-            # ffmpeg renames the file into place when it finishes, so its
-            # mere existence means a COMPLETE wav.
-            var ok_wav = False
-            var bytes = List[UInt8]()
+        # ── the microphone, every frame ───────────────────────────────
+        # `read` never blocks: 0.08 ms steady state. It RAISES once ffmpeg
+        # has exited, carrying ffmpeg's own reason — which is the difference
+        # between "grant Terminal microphone access" and "the device went
+        # away", and it is why this no longer guesses.
+        if mic_dead == "":
             try:
-                bytes = read_file_bytes(wav)
-                ok_wav = len(bytes) > 44        # past the WAV header
-            except:
-                pass
-            if ok_wav:
-                stt.start_wav_bytes(bytes)
-                state = ST_STT
-                print("  [stt] ", len(bytes), "bytes")
-            elif Float64(perf_counter_ns() - t_rec) / 1e9 > rec_s + 6.0:
-                # ⚠ ffmpeg can fail silently (no mic permission is the usual
-                # one) and would otherwise leave the demo stuck in RECORDING
-                # with no way back.
-                heard = String("(no audio — mic permission?)")
-                state = ST_IDLE
-                print("  [rec] timed out — no wav. mic permission?")
+                var pcm = mic.read()
+                if len(pcm) > 0:
+                    level = rms(pcm)
+                    if level > peak:
+                        peak = level
+                    if state == ST_REC:
+                        for i in range(len(pcm)):
+                            seg.append(pcm[i])
+                # ⚠ EXACT ZEROS ARE NOT A QUIET ROOM. A live microphone's
+                # noise floor always moves the low bits; all-zero samples mean
+                # a muted or disabled input, or a refused permission. Checked
+                # once, early, so the demo says so instead of waiting for
+                # speech that cannot arrive.
+                if not checked_silence and mic.seconds_read() > 1.0:
+                    checked_silence = True
+                    if mic.digital_silence(0.5):
+                        mic_dead = String("mic is digital silence — muted, "
+                                          "disabled, or permission refused")
+                        print("  [mic]", mic_dead)
+                    else:
+                        print("  [mic] input live —", _f2(mic.seconds_read()),
+                              "s read, noise floor", _f4(peak))
+            except e:
+                mic_dead = String(e)
+                print("  [mic]", mic_dead)
+
+        if state == ST_REC:
+            if Float64(perf_counter_ns() - t_rec) / 1e9 >= rec_s:
+                if len(seg) < 1600:             # under 0.1 s of audio
+                    heard = String("(no audio captured)")
+                    print("  [rec] captured", len(seg), "samples — mic?")
+                    state = ST_IDLE
+                else:
+                    var audio = WavAudio(16000, 1, seg.copy())
+                    stt.start(audio)
+                    print("  [stt]", len(seg), "samples, peak", _f4(peak))
+                    state = ST_STT
 
         elif state == ST_STT:
             if stt.poll():
@@ -394,10 +444,11 @@ def main() raises:
         # ⚠ EDGE-TRIGGERED. `get_keyboard_state` reports the key as HELD, so
         # a level test would start a new recording every frame it is down.
         var rec_key = kb[Int(Scancode.SCANCODE_TAB)]
-        if rec_key and not prev_key and state == ST_IDLE:
+        if rec_key and not prev_key and state == ST_IDLE and mic_dead == "":
             heard = String("")
             pick = G1LangPick()
-            _rec_start(wav, rec_s)
+            seg = List[Int16]()
+            peak = 0.0
             t_rec = perf_counter_ns()
             state = ST_REC
             last_event = String("listening...")
@@ -518,16 +569,45 @@ def main() raises:
         ui.label(12, 254, String("hand L") + _f2(quant[QV_LHAND_H])
                  + String(" R") + _f2(quant[QV_RHAND_H]), UI_TXT, 1)
 
+        # ⚠ NO COMMAND GRID. Eighteen buttons were how you drove this before
+        # there was a microphone; they crowd the panel and invite clicking
+        # rather than speaking. The keys still work for a rehearsed demo —
+        # they are just not advertised here.
         var by = Float32(278)
-        for i in range(bank.count()):
-            var bx = Float32(12) if i % 2 == 0 else Float32(126)
-            var byy = by + Float32((i // 2) * 24)
-            if ui.button(bx, byy, 102, 20, bank.name_at(i), i == cur, 1):
-                pending = i
-                pending_blend = 25
-                last_event = String("click: ") + bank.name_at(i)
-        var ey = by + Float32(((bank.count() + 1) // 2) * 24) + 10
-        ui.label(12, ey, last_event, UI_DIM, 1)
+        # ── the level meter ───────────────────────────────────────────
+        # ⚠ THIS IS THE ANSWER TO "is the microphone working?", and it is
+        # available BEFORE you speak. A bar that never moves is a dead input;
+        # one that moves when you talk means everything upstream of Whisper
+        # is fine. It cost a day to not have it.
+        ui.label(12, by, String("MIC"), UI_DIM, 1)
+        var mw = Float32(SIDEBAR_W - 24)
+        ui.panel(12, by + 16, mw, 12)
+        var lvl = level * 6.0              # speech sits low in a 0-1 RMS
+        if lvl > 1.0:
+            lvl = 1.0
+        if lvl > 0.01:
+            ui.panel(12, by + 16, mw * Float32(lvl), 12)
+        # a thin peak marker — the loudest moment, so a spike that came and
+        # went is still visible a frame later
+        var pk = peak * 6.0
+        if pk > 1.0:
+            pk = 1.0
+        if pk > 0.02:
+            ui.panel(12 + mw * Float32(pk) - 2, by + 16, 2, 12)
+        ui.label(12, by + 32, String("rms ") + _f4(level)
+                 + String(" pk ") + _f4(peak), UI_DIM, 1)
+        if mic_dead != "":
+            var md = mic_dead
+            if md.byte_length() > 26:
+                var mcut = String(mic_dead[codepoint=0:26])
+                md = mcut
+            ui.label(12, by + 48, String("MIC: ") + md, UI_WARN, 1)
+        elif not checked_silence:
+            ui.label(12, by + 48, String("checking input..."), UI_DIM, 1)
+        else:
+            ui.label(12, by + 48, String("input live"), UI_OK, 1)
+
+        ui.label(12, by + 68, last_event, UI_DIM, 1)
         env.set_ui(ui.rects, ui.texts)
 
         env.render_frame()
