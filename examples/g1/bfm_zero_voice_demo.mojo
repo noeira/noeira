@@ -92,7 +92,7 @@ from noeira.io.proc import run_system, quote_arg
 from noeira.ai.audio_io import MicCapture, rms
 from noeira.io.wav import WavAudio
 from noeira.ai.jev import JevClient
-from noeira.ai.speech import SpeechToText
+from noeira.ai.speech import SpeechToText, STT_RAW
 from noeira.envs.robots.g1_command_language import (
     g1_command_questions, g1_decide, G1LangPick, g1_command_phrase,
     g1_decide_chain, g1_extent_metres, g1_extent_seconds, G1_Q_EXTENT,
@@ -434,15 +434,25 @@ def main() raises:
     # ⚠ WARM BOTH CONNECTIONS BEFORE THE LOOP. The first poll on a cold TLS
     # connection costs 19.5 ms — a dropped frame — against 0.16 ms warmed.
     var jev = JevClient.from_env()
-    var stt = SpeechToText.huggingface()
+    # `--stt groq` is the escape hatch: Groq's Whisper takes a TEXT prompt,
+    # which the HF endpoint cannot (see `--vocab` below).
+    var stt_spec = _flag(String("--stt"), String("hf"))
+    var stt = SpeechToText.groq() if stt_spec == "groq" else SpeechToText.huggingface()
     if lang != "":
         stt.language = lang
-        print("  whisper language pinned to", lang)
+        print("  whisper language pinned to", lang, "(" + stt_spec + ")")
     # ⚠ BIAS THE DECODER TOWARD THE WORDS THIS ROBOT ANSWERS TO. "cours" came
-    # back as "cool" twice in a row — a homophone Whisper has no reason to
-    # resolve one way without context. The prompt is a hint, not a grammar,
-    # so anything may still come back; it only tilts the odds among
-    # candidates that sound alike.
+    # back as "cool" twice in a row. The first suspect was the homophone; the
+    # real one was that `language` was NEVER REACHING WHISPER on this backend
+    # — the HF path posted the raw WAV and dropped both hints — so it was
+    # auto-detecting from a one-word French utterance. That is fixed in the
+    # client; pinning the language may be the whole fix, and the vocabulary
+    # below only matters if it is not.
+    #
+    # ⚠ HF CANNOT TAKE A TEXT PROMPT — its Whisper pipeline accepts one only
+    # as token ids, and the client RAISES rather than dropping it silently.
+    # So the vocabulary is sent only on a backend that takes it, and the HUD
+    # says which, instead of a hint that quietly does nothing.
     var vocab = _flag(String("--vocab"), String(
         "marche, cours, recule, tourne à gauche, tourne à droite,"
         " accroupis-toi, lève le bras droit, lève le bras gauche,"
@@ -450,7 +460,12 @@ def main() raises:
         " regarde à droite, arrête-toi, baisse les bras"
     ))
     if vocab != "":
-        stt.prompt = vocab
+        if stt.kind == STT_RAW:
+            print("  vocabulary hint NOT sent —", stt_spec,
+                  "takes no text prompt; pass --stt groq to use it")
+        else:
+            stt.prompt = vocab
+            print("  vocabulary hint sent to the decoder")
     jev.warm_up()
     stt.warm_up()
     # ⚠ `talk` needs a client warmed BEFORE the loop like the others, or its

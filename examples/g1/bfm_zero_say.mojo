@@ -5,7 +5,7 @@
 
     # with `build/g1play` already running:
     ./build/g1say --text "raise your right hand"
-    ./build/g1say --record 4                    # speak it instead
+    ./build/g1say --record 4 --lang fr          # speak it instead
     ./build/g1say --list                        # what Jev will be offered
 
 Needs `JEV_API_KEY` (or `TYPESAFE_API_KEY`); `--record` also needs `HF_TOKEN`
@@ -101,6 +101,7 @@ def main() raises:
     var chan_path = _flag(String("--channel"), String("/tmp/g1_cmd"))
     var text = _flag(String("--text"), String(""))
     var record_s = _flag(String("--record"), String(""))
+    var lang = _flag(String("--lang"), String(""))
     var blend = atol(_flag(String("--blend"), String("25")))
     # ⚠ THE BAR IS P(none), NOT THE TOP-1 CONFIDENCE, and that is a measured
     # correction. "crouch down low" returned `crouch` at 0.56 with `squat` at
@@ -155,6 +156,11 @@ def main() raises:
         print("listening", seconds, "s ...")
         record_wav(wav, seconds)
         var stt = SpeechToText.huggingface()
+        # ⚠ PIN THE LANGUAGE HERE TOO. The viewer pins it; a CLI that lets
+        # Whisper auto-detect is asking a different question than the demo
+        # it stands in for, and its answer cannot be carried back.
+        if lang != "":
+            stt.language = lang
         var heard = stt.transcribe_file(wav)
         text = heard.text
         print("heard:", text, "(", heard.latency_ms, "ms )")
