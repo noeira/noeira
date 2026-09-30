@@ -90,6 +90,20 @@ def _spin(ms: Int):
         pass
 
 
+def _INSTR() -> String:
+    """⚠ ONE copy of the wording. §12.54 measured it moving `P(none)` by half,
+    so a second transcription in the order sweep would be measuring a
+    different question than the one that ships."""
+    return String(
+        "A humanoid robot can perform exactly the commands listed, and"
+        " nothing else. Pick the command that best matches what the"
+        " instruction asks the robot to do with its body — it does not"
+        " have to match exactly, only be the closest thing the robot can"
+        " do. Pick `none` ONLY when no command on the list is even"
+        " approximately what was asked."
+    )
+
+
 def main() raises:
     var bank_path = _flag(String("--bank"), String("g1_command_bank.txt"))
     var chan_path = _flag(String("--channel"), String("/tmp/g1_cmd"))
@@ -109,6 +123,13 @@ def main() raises:
     var min_top = Float64(String(_flag(String("--min-top"), String("0.35"))))
     var dry = _has(String("--dry-run"))
     var strict = _has(String("--strict"))
+    # ⚠ `--shuffle N` asks the SAME question N times with the option list
+    # rotated. The readout in this family is not permutation-invariant —
+    # `imajev` pays 4x compute averaging over four orderings for exactly this
+    # (`docs/SYSTEM_ONE_ASSESSMENT.md` §3.2) — and with 18 options a pick that
+    # moves with the order is a pick nobody should act on. Nothing is sent in
+    # this mode; it is a measurement.
+    var shuffle = atol(_flag(String("--shuffle"), String("0")))
 
     var bank = G1CommandBank.load(bank_path)
 
@@ -154,14 +175,7 @@ def main() raises:
         # first version ended "Choose `none` if the instruction asks for
         # something not on the list", which reads as an invitation: "show me
         # your left hand" came back `none` 0.52 against `left_hand_up` 0.48.
-        String(
-            "A humanoid robot can perform exactly the commands listed, and"
-            " nothing else. Pick the command that best matches what the"
-            " instruction asks the robot to do with its body — it does not"
-            " have to match exactly, only be the closest thing the robot can"
-            " do. Pick `none` ONLY when no command on the list is even"
-            " approximately what was asked."
-        ),
+        _INSTR(),
         options, descs,
     )
     # ⚠ ONE MORE QUESTION, AND IT IS NEARLY FREE. Jev answers every question
@@ -185,6 +199,37 @@ def main() raises:
     )
 
     var jev = JevClient.from_env()
+
+    if shuffle > 0:
+        print("option-order sweep:", shuffle, "rotations of the same question")
+        var first = String("")
+        var agree = 0
+        for r in range(shuffle):
+            var rot = (r * 7) % (bank.count() + 1)
+            var o2 = List[String]()
+            var d2 = List[String]()
+            for j in range(bank.count() + 1):
+                var k = (j + rot) % (bank.count() + 1)
+                if k == bank.count():
+                    o2.append(String("none"))
+                    d2.append(String("not one of these, or not a command for this robot"))
+                else:
+                    o2.append(bank.name_at(k))
+                    d2.append(bank.describe(k))
+            var q2 = JevQuestions()
+            q2.choice(String("command"), _INSTR(), o2, d2)
+            var a2 = jev.decide_text(String("instruction: ") + text, q2)
+            var pk = a2.choice(String("command"))
+            var pn = a2.probability(String("command"), String("none"))
+            var cf = a2.confidence(String("command"))
+            print("  rot", rot, "->", pk, " top1", _f2(cf), " P(none)", _f2(pn))
+            if r == 0:
+                first = pk
+            elif pk == first:
+                agree += 1
+        print("  ", agree + 1, "of", shuffle, "orderings agree on", first)
+        return
+
     var t0 = perf_counter_ns()
     var ans = jev.decide_text(String("instruction: ") + text, q)
     var ms = Float64(perf_counter_ns() - t0) / 1e6
