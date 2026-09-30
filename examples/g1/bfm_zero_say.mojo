@@ -7,6 +7,7 @@
     ./build/g1say --text "raise your right hand"
     ./build/g1say --record 4 --lang fr          # speak it instead
     ./build/g1say --list                        # what Jev will be offered
+    ./build/g1say --doing walk --text "plus vite"    # a RELATIVE instruction
 
 Needs `JEV_API_KEY` (or `TYPESAFE_API_KEY`); `--record` also needs `HF_TOKEN`
 for Whisper. Nothing here touches the renderer: this is a WRITER on the
@@ -29,6 +30,22 @@ hand-written blurb would drift from the terms the command was gated on, and
 the drift would be invisible — the robot doing one thing while the model was
 told another.
 
+## ⚠ `--doing` is how a relative instruction is tested without a microphone
+
+"plus vite" is not a command, it is an edit to one. The viewer knows what the
+robot is doing and says so in the state it sends
+(`g1_command_state`); this CLI has no robot, so `--doing NAME` supplies the
+same field, `--did A,B` the history and `--since SECONDS` the clock.
+
+    ./build/g1say --doing walk --text "plus vite" --dry-run      # -> run
+    ./build/g1say --doing right_hand_up --text "l'autre bras"    # -> left_hand_up
+
+⚠ AND IT IS HOW THE WORDING STAYS HONEST. The relative clause was appended to
+`g1_command_instruction` — the one wording §12.54 measured moving `P(none)`
+by half — so every absolute phrasing has to be re-measured against it with
+`--doing` UNSET. A regression there is a regression in the whole demo, and
+this is the only path that can see it.
+
 ## ⚠ Abstention is a first-class answer
 
 `none` is always on the list and the confidence is thresholded. Below the
@@ -46,6 +63,7 @@ from std.time import perf_counter_ns
 from noeira.ai.jev import JevClient, JevQuestions
 from noeira.envs.robots.g1_command_language import (
     g1_command_questions, g1_command_instruction, g1_decide, g1_decide_chain,
+G1Context, g1_command_state,
     g1_extent_metres, g1_extent_seconds, G1_Q_EXTENT,
     g1_alias_name, g1_alias_target, g1_alias_desc, G1_N_ALIAS,
     G1_Q_COMMAND, G1_OPT_NONE,
@@ -103,6 +121,15 @@ def main() raises:
     var record_s = _flag(String("--record"), String(""))
     var lang = _flag(String("--lang"), String(""))
     var blend = atol(_flag(String("--blend"), String("25")))
+    # ⚠ THE ROBOT'S SIDE OF THE CONVERSATION, supplied by hand because this
+    # program has no robot. Unset means `doing: nothing`, which is what a
+    # cold start looks like and therefore what the absolute phrasings must
+    # still be measured under.
+    var doing = _flag(String("--doing"), String(""))
+    var did = _flag(String("--did"), String(""))
+    # 3 s = "a_moment": a command that has only just started is the odd case,
+    # not the default one.
+    var since = Float64(String(_flag(String("--since"), String("3"))))
     # ⚠ THE BAR IS P(none), NOT THE TOP-1 CONFIDENCE, and that is a measured
     # correction. "crouch down low" returned `crouch` at 0.56 with `squat` at
     # 0.38 — the mass was split between TWO CORRECT ANSWERS, because their
@@ -201,7 +228,13 @@ def main() raises:
                     d2.append(bank.describe(k))
             var q2 = JevQuestions()
             q2.choice(String(G1_Q_COMMAND), g1_command_instruction(), o2, d2)
-            var a2 = jev.decide_text(String("instruction: ") + text, q2)
+            # ⚠ THE SAME STATE as the main leg, or the ordering probe is
+            # measuring the state change as well as the ordering.
+            var ctx2 = G1Context()
+            if doing != "":
+                ctx2.doing = doing.copy()
+                ctx2.since_s = since
+            var a2 = jev.decide(g1_command_state(text, ctx2), q2)
             var pk = a2.choice(String(G1_Q_COMMAND))
             var pn = a2.probability(String(G1_Q_COMMAND), String(G1_OPT_NONE))
             var cf = a2.confidence(String(G1_Q_COMMAND))
@@ -213,8 +246,23 @@ def main() raises:
         print("  ", agree + 1, "of", shuffle, "orderings agree on", first)
         return
 
+    var ctx = G1Context()
+    if doing != "":
+        ctx.doing = doing.copy()
+        ctx.since_s = since
+    if did != "":
+        var parts = did.split(",")
+        for i in range(len(parts)):
+            var pnm = String(String(parts[i]).strip())
+            if pnm.byte_length() > 0:
+                ctx.recent.append(pnm)
+    var state = g1_command_state(text, ctx)
+    # ⚠ PRINT IT. The state is now half the question, and a CLI that shows
+    # only the answer cannot be used to debug a wrong one.
+    print("state:", state)
+
     var t0 = perf_counter_ns()
-    var ans = jev.decide_text(String("instruction: ") + text, q)
+    var ans = jev.decide(state, q)
     var ms = Float64(perf_counter_ns() - t0) / 1e6
     var argmax = ans.choice(String(G1_Q_COMMAND))
     var d = g1_decide(ans, bank, max_none, min_top, 0.5, addressed)

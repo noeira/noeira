@@ -31,6 +31,15 @@ THE DECISION RULE, AND WHY IT IS NOT THE ARGMAX
   spread flat across many commands — "it is a robot command but I cannot tell
   which", also not something to act on.
 
+THE STATE IS HALF THE QUESTION
+==============================
+`g1_command_state` builds the JSON the questions are answered against:
+`instruction`, `doing`, `doing_since`, `did_before`, `last_arm_raised`. Before
+it, the demo sent the transcript as free text and "plus vite" after a walk was
+refused — correctly, because the request did not say what was to be done
+faster. A relative instruction is an edit to a command, and an edit needs
+something to edit. §10.1 of `docs/BFM_ZERO_NEXT_LEVEL.md`.
+
 TWO EXTRA QUESTIONS, BOTH NEARLY FREE
 =====================================
 Jev answers every question against the same state, so more questions cost
@@ -51,6 +60,7 @@ almost nothing — that is the shape of its cost model.
 
 from noeira.ai.jev import JevQuestions, JevAnswers
 from noeira.envs.robots.g1_command_bank import G1CommandBank
+from noeira.io.json import JsonWriter
 
 comptime G1_Q_COMMAND: String = "command"
 # ⚠ THREE COMMANDS IN ONE CALL. Jev answers every question against the same
@@ -121,6 +131,128 @@ def g1_resolve(name: String) -> String:
     return name
 
 
+# ── the conversational state ──────────────────────────────────────────────
+# ⚠ THE STATE IS WHY A RELATIVE INSTRUCTION CAN WORK AT ALL. The demo used
+# to send `"instruction: " + heard` as free text, and §10.1 of
+# `docs/BFM_ZERO_NEXT_LEVEL.md` is what that cost: the user said "plus vite"
+# after a walk and got a refusal. Jev was not failing to remember — THERE WAS
+# NOTHING TO REMEMBER WITH. "plus vite" has no referent unless the state says
+# what is being done faster, and no wording fixes a state that omits the
+# subject of the sentence.
+#
+# So the state carries what the robot is doing, how long it has been doing it,
+# what it did before that, and which arm was last raised. Nothing else: this
+# is a classifier over a closed option set, and every field is one the model
+# has to use to resolve a word like "encore" or "l'autre".
+comptime G1_N_RECENT: Int = 3
+
+
+def g1_arm_of(name: String) -> String:
+    """Which arm a bank command raises: "left", "right", "both" or "".
+
+    This is what makes "l'autre bras" answerable. It is derived from the
+    bank's own names rather than stored, so a new arm command needs one line
+    here and nothing else.
+    """
+    if name == "right_hand_up" or name == "walk_right_hand_up":
+        return String("right")
+    if name == "left_hand_up":
+        return String("left")
+    if (
+        name == "both_hands_up"
+        or name == "walk_both_hands_up"
+        or name == "arms_wide"
+    ):
+        return String("both")
+    return String("")
+
+
+def g1_since_word(seconds: Float64) -> String:
+    """How long the current command has been running, AS A WORD.
+
+    ⚠ NOT A NUMBER, AND THIS IS NOT STYLE. Jev's own docs list arithmetic,
+    counting and numeric comparison as failure modes, so a threshold belongs
+    on our side of the wire (`docs/SYSTEM_ONE_ASSESSMENT.md`, and the same
+    rule the `extent` question already follows). Sending `4.2` would ask the
+    model to compare it against a bound it was never told.
+    """
+    if seconds < 1.5:
+        return String("just_started")
+    if seconds < 6.0:
+        return String("a_moment")
+    return String("a_while")
+
+
+struct G1Context(Copyable, Movable):
+    """What the robot is doing, for the next instruction to be relative to."""
+
+    var doing: String
+    """The command running now; "" before anything has been asked."""
+    var since_s: Float64
+    """Seconds since `doing` started. Bucketed by `g1_since_word` on the way
+    out — the caller keeps the clock, this keeps the word."""
+    var recent: List[String]
+    """MOST RECENT FIRST, `doing` excluded, at most `G1_N_RECENT`."""
+
+    def __init__(out self):
+        self.doing = String("")
+        self.since_s = 0.0
+        self.recent = List[String]()
+
+    def began(mut self, name: String):
+        """Record that `name` has just started.
+
+        ⚠ A REPEAT IS NOT A HISTORY ENTRY. Holding `walk` for thirty seconds
+        while the user says "plus vite" twice must not push `walk` into
+        `recent` three times and evict everything that came before it.
+        """
+        if self.doing != "" and self.doing != name:
+            self.recent.insert(0, self.doing.copy())
+            while len(self.recent) > G1_N_RECENT:
+                _ = self.recent.pop()
+        self.doing = name.copy()
+        self.since_s = 0.0
+
+    def last_arm(self) -> String:
+        """The arm most recently raised, current command first."""
+        var a = g1_arm_of(self.doing)
+        if a != "":
+            return a
+        for i in range(len(self.recent)):
+            a = g1_arm_of(self.recent[i])
+            if a != "":
+                return a
+        return String("")
+
+
+def g1_command_state(instruction: String, ref ctx: G1Context) raises -> String:
+    """The JSON state for `JevClient.decide` / `.start`.
+
+    ⚠ ONE COPY, for the same reason `g1_command_instruction` is one copy. The
+    viewer and `bfm_zero_say.mojo` must send the same SHAPE as well as the
+    same questions — a CLI that omits `doing` is asking a different question
+    than the demo it stands in for, and its answer cannot be carried back.
+    That has now cost this project three separate sessions.
+    """
+    var w = JsonWriter()
+    w.begin_object()
+    w.member("instruction", instruction)
+    # ⚠ "nothing" RATHER THAN AN ABSENT FIELD. An option list that is always
+    # the same length and a state whose keys are always present are what make
+    # the answers comparable across calls; a missing key reads as a different
+    # question.
+    w.member("doing", ctx.doing if ctx.doing != "" else String("nothing"))
+    w.member("doing_since", g1_since_word(ctx.since_s))
+    w.key("did_before")
+    w.begin_array()
+    for i in range(len(ctx.recent)):
+        w.string(ctx.recent[i])
+    w.end_array()
+    w.member("last_arm_raised", ctx.last_arm() if ctx.last_arm() != "" else String("none"))
+    w.end_object()
+    return w.done()
+
+
 def g1_command_instruction() -> String:
     """⚠ THE ONE COPY OF THE WORDING.
 
@@ -145,6 +277,17 @@ def g1_command_instruction() -> String:
         " match exactly, only be the closest thing the robot can do. Pick"
         " `none` ONLY when no command on the list is even approximately"
         " what was asked."
+        # ⚠ ADDITIVE, AND DELIBERATELY SO. §12.54 measured this wording
+        # moving `P(none)` by half on a correct instruction, so the relative
+        # clause is appended rather than woven in, and `--doing` on
+        # `bfm_zero_say.mojo` exists to re-measure the absolute phrasings
+        # against it.
+        " The state also says what the robot is doing NOW, what it did"
+        " before, and which arm it last raised. An instruction may be"
+        " relative to that rather than self-contained — \"faster\","
+        " \"again\", \"the other arm\", \"stop\" — and then the answer is"
+        " the command that RESULTS from applying it to what the robot is"
+        " already doing, not the command that describes the words."
     )
 
 

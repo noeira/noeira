@@ -51,3 +51,9 @@ tests/robots/test_g1_command_bank.mojo
 # the command channel: an absent or half-written file is NORMAL, and the seq
 # gate is what stops a blend restarting on every frame
 tests/robots/test_g1_command_channel.mojo
+
+# the conversational state: "plus vite" has no referent unless the state says
+# what is being done faster, and a missing key is a DIFFERENT question rather
+# than a smaller one. Pins the history's order, the repeat case, and the
+# duration bucketing that keeps a float off the wire.
+tests/robots/test_g1_command_state.mojo

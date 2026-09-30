@@ -96,6 +96,7 @@ from noeira.ai.speech import SpeechToText, STT_RAW
 from noeira.envs.robots.g1_command_language import (
     g1_command_questions, g1_decide, G1LangPick, g1_command_phrase,
     g1_decide_chain, g1_extent_metres, g1_extent_seconds, G1_Q_EXTENT,
+    G1Context, g1_command_state, g1_since_word,
 )
 from noeira.ai.chat import ChatClient, ChatMessage, ToolSpec
 
@@ -544,6 +545,11 @@ def main() raises:
     var prev_key = False
 
     var chan = G1CommandChannel(chan_path)
+    # ⚠ WHAT THE ROBOT IS DOING, SO THE NEXT SENTENCE CAN BE RELATIVE TO IT.
+    # Without this the demo sent Jev the transcript alone, and "plus vite"
+    # after a walk was refused — correctly, because nothing in the request
+    # said what was to be done faster (§10.1 of BFM_ZERO_NEXT_LEVEL.md).
+    var ctx = G1Context()
     var last_event = String("(waiting)")
     var pending = -1
     var pending_blend = 25
@@ -734,7 +740,22 @@ def main() raises:
                     print("  [stt] nothing said — skipped")
                     state = ST_IDLE
                 else:
-                    jev.start_text(String("instruction: ") + heard, quest)
+                    # ⚠ `start`, NOT `start_text` — a JSON state, so the
+                    # questions can refer to `doing` / `did_before` /
+                    # `last_arm_raised` by name.
+                    ctx.since_s = Float64(perf_counter_ns() - t_cmd) * 1e-9
+                    # ⚠ SHOW THE STATE. It is half the question now, and a
+                    # wrong answer to a relative instruction cannot be read
+                    # without it — "why did it walk?" is answerable only if
+                    # the log says what it thought it was doing. The CLI
+                    # prints the same thing; two views of one question is how
+                    # the last three divergences happened.
+                    print("  [ctx] doing", ctx.doing if ctx.doing != "" else
+                          String("nothing"), "for",
+                          g1_since_word(ctx.since_s), " arm",
+                          ctx.last_arm() if ctx.last_arm() != "" else
+                          String("none"))
+                    jev.start(g1_command_state(heard, ctx), quest)
                     state = ST_JEV
 
         elif state == ST_JEV:
@@ -966,6 +987,13 @@ def main() raises:
             blend_left = blend_len
             cur = pending
             t_cmd = perf_counter_ns()
+            # ⚠ HERE, AND NOWHERE ELSE. This is the one site where the active
+            # command changes — keys, channel, voice and chain steps all funnel
+            # through it — so it is the only place the context can be kept
+            # honest. Recording it at the decision instead would tell Jev the
+            # robot is doing something it has not started, and a chain step
+            # that never runs would enter the history.
+            ctx.began(bank.name_at(cur))
             pending = -1
         elif pending == cur:
             pending = -1
