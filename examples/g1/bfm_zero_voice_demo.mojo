@@ -118,6 +118,7 @@ comptime UI_TXT = Color(205, 215, 232, 255)
 comptime UI_DIM = Color(120, 132, 155, 255)
 comptime UI_WARN = Color(232, 168, 96, 255)
 comptime UI_OK = Color(120, 210, 150, 255)
+comptime UI_BAD = Color(232, 108, 104, 255)
 
 comptime ST_IDLE: Int = 0
 comptime ST_REC: Int = 1
@@ -129,6 +130,31 @@ comptime ST_CHAT: Int = 4
 # the bank is a calibrated miss (§10.2); this is where the instruction gets a
 # reward spec instead of a name.
 comptime ST_SPEC: Int = 5
+
+# ⚠ EVERY WAIT NEEDS A DEADLINE AND A VISIBLE CLOCK, and this had neither. A
+# session hung on `transcribing...` and the honest answer to "is it slow or is
+# it dead?" was that THE DEMO COULD NOT SAY — the HUD printed a STATE, not a
+# FACT. That is the same defect as a "noise floor" that printed the peak and a
+# language hint the HUD announced but the client dropped: an instrument that
+# reports an intention instead of a measurement.
+#
+# It was most likely slow rather than dead. `HttpClient(120000, 10000)` gives
+# a 120 s read timeout and `retries = 2`, so ONE hanging request can sit for
+# about six minutes. From outside, six minutes is indistinguishable from
+# forever.
+#
+# The bounds come from this project's own measured latencies, not from taste.
+# Whisper on the HF endpoint across §12.55-12.60: 0.71, 0.79, 1.97, 4.99,
+# 5.30, 5.41 s. Jev: 0.25-0.61 s. So 20 s is ~4x the slowest transcription
+# ever seen here and 12 s is ~20x the slowest decision.
+comptime STT_DEADLINE_S: Float64 = 20.0
+comptime JEV_DEADLINE_S: Float64 = 12.0
+# ⚠ THE CHAT REPLY GETS ITS OWN, AND A LONGER ONE. It is a generative call,
+# not a constrained readout — tokens come out one at a time and a sentence is
+# genuinely slower than a decision. But it is the same failure: `llm.done()`
+# that never turns true leaves the demo waiting for ever, with the HUD saying
+# nothing about it.
+comptime CHAT_DEADLINE_S: Float64 = 30.0
 
 # ⚠ A 4 s WINDOW DOES NOT CAPTURE 4 s. Measured: a 4.0 s recording arrived as
 # 56 832 samples — 3.55 s — and Whisper returned "Lève les brl'air" for
@@ -551,6 +577,9 @@ def main() raises:
     var heard = String("")
     var pick = G1LangPick()
     var t_rec = perf_counter_ns()
+    # ⚠ when the CURRENT wait began. Reset on every transition into a waiting
+    # state; read by both the HUD and the deadline, so they cannot disagree.
+    var t_wait = perf_counter_ns()
     var t_cmd = perf_counter_ns()
     var prev_key = False
 
@@ -565,6 +594,22 @@ def main() raises:
     # recomputing all 20 per miss would cost 20 passes over the pool — about
     # a second. Precomputed, a miss costs ONE pass (~30 ms, one dropped
     # frame) plus 20 dot products.
+    # ⚠ THE DEADLINES ARE FLAGS SO THE GIVE-UP PATH CAN BE EXERCISED. It
+    # fires only when a call hangs, which is exactly the condition that
+    # cannot be summoned on demand — so set a tiny one and any NORMAL call
+    # blows it, which tests the recovery rather than the hang:
+    #
+    #     --stt-deadline 0.5     # speak; it must give up and keep running
+    #
+    # A recovery path that has never run is a guess, and this file has paid
+    # for guesses four times over (§12.55's echo estimate, §12.56's dropped
+    # language hint, §12.60's two duplicate criteria).
+    var stt_dl = Float64(String(_flag(String("--stt-deadline"),
+                                      String(STT_DEADLINE_S))))
+    var jev_dl = Float64(String(_flag(String("--jev-deadline"),
+                                      String(JEV_DEADLINE_S))))
+    var chat_dl = Float64(String(_flag(String("--chat-deadline"),
+                                       String(CHAT_DEADLINE_S))))
     var spec_pool_path = _flag(String("--pool"), String(""))
     var has_pool = spec_pool_path != ""
     var pool = G1Pool(1, List[Float64](length=D, fill=0.0),
@@ -791,16 +836,47 @@ def main() raises:
                 else:
                     var audio = WavAudio(16000, 1, seg.copy())
                     stt.start(audio)
+                    t_wait = perf_counter_ns()
                     print("  [stt]", len(seg), "samples (", _f2(seg_s),
                           "s ), peak", _f4(peak),
                           "— max-seg" if over else "")
                     state = ST_STT
 
         elif state == ST_STT:
-            if stt.poll():
-                var tr = stt.result()
-                heard = tr.text
-                print("  [heard]", heard, "(", tr.latency_ms, "ms )")
+            # ⚠ CHECKED BEFORE THE POLL, so a call that has already blown its
+            # budget is cancelled rather than waited on one more frame.
+            var stt_el = Float64(perf_counter_ns() - t_wait) / 1e9
+            if stt_el > stt_dl:
+                print("  [stt] GAVE UP after", _f2(stt_el),
+                      "s — the endpoint never answered. Say it again.")
+                try:
+                    stt.cancel()
+                except:
+                    # a cancel that fails must not take the renderer with it
+                    pass
+                last_event = String("stt timed out")
+                state = ST_IDLE
+            elif stt.poll():
+                # ⚠ `poll` RETURNS TRUE ON FAILURE TOO — it means "the call
+                # has finished", not "it worked" — and `result` is what
+                # raises. Unwrapped, a 503 from the endpoint took the whole
+                # renderer down, and with it the physics step.
+                #
+                # On failure `heard` stays empty, and the `letters < 3` guard
+                # below already routes an empty transcript back to IDLE. So
+                # this needs no second exit path.
+                var txt = String("")
+                var lat = 0.0
+                try:
+                    var tr = stt.result()
+                    txt = tr.text
+                    lat = tr.latency_ms
+                except e:
+                    print("  [stt] FAILED:", String(e))
+                    last_event = String("stt failed")
+                heard = txt
+                if lat > 0.0:
+                    print("  [heard]", heard, "(", lat, "ms )")
                 # ⚠ Whisper returns "." or " " for a cough. Asking a model
                 # which of 18 commands a full stop means costs a call to be
                 # told none of them.
@@ -828,10 +904,21 @@ def main() raises:
                           ctx.last_arm() if ctx.last_arm() != "" else
                           String("none"))
                     jev.start(g1_command_state(heard, ctx), quest)
+                    t_wait = perf_counter_ns()
                     state = ST_JEV
 
         elif state == ST_JEV:
-            if jev.poll():
+            var jev_el = Float64(perf_counter_ns() - t_wait) / 1e9
+            if jev_el > jev_dl:
+                print("  [jev] GAVE UP after", _f2(jev_el),
+                      "s — no decision came back.")
+                try:
+                    jev.cancel()
+                except:
+                    pass
+                last_event = String("jev timed out")
+                state = ST_IDLE
+            elif jev.poll():
                 var ans = jev.result()
                 pick = g1_decide(ans, bank, max_none, min_top, 0.5, True)
                 if pick.name != "":
@@ -888,6 +975,7 @@ def main() raises:
                     var msgs = List[ChatMessage]()
                     msgs.append(ChatMessage.user(heard))
                     llm.start(msgs, chat_sys, List[ToolSpec](), False)
+                    t_wait = perf_counter_ns()
                     last_event = String("talking...")
                     print("  [talk]", _f2(pick.conf))
                     state = ST_CHAT
@@ -907,6 +995,7 @@ def main() raises:
                         # in the state made the same instruction produce
                         # ESS 5089 while walking and 301 while standing.
                         jev.start_text(g1_spec_prompt(heard), spec_q)
+                        t_wait = perf_counter_ns()
                         state = ST_SPEC
                     else:
                         print("  [refused]", pick.reason, " P(none)",
@@ -925,7 +1014,16 @@ def main() raises:
                     state = ST_IDLE
 
         elif state == ST_SPEC:
-            if jev.poll():
+            var sp_el = Float64(perf_counter_ns() - t_wait) / 1e9
+            if sp_el > jev_dl:
+                print("  [spec] GAVE UP after", _f2(sp_el), "s")
+                try:
+                    jev.cancel()
+                except:
+                    pass
+                last_event = String("spec timed out")
+                state = ST_IDLE
+            elif jev.poll():
                 var sa = jev.result()
                 var sterms = List[G1Term]()
                 var n_scaf = g1_spec_from_answers(sa, pool, bank, sterms)
@@ -1002,15 +1100,34 @@ def main() raises:
         elif state == ST_CHAT:
             # non-streaming, so `poll` returns "" throughout and `done`
             # is the signal. The robot keeps moving while it thinks.
-            _ = llm.poll()
-            if llm.done():
-                var rep = llm.result()
-                print("  [said]", rep.text)
-                heard = rep.text
-                if not mute:
-                    _say_async(rep.text)
+            var ch_el = Float64(perf_counter_ns() - t_wait) / 1e9
+            if ch_el > chat_dl:
+                print("  [talk] GAVE UP after", _f2(ch_el),
+                      "s — no reply came back.")
+                try:
+                    llm.cancel()
+                except:
+                    pass
+                last_event = String("talk timed out")
+                state = ST_IDLE
+            else:
+                _ = llm.poll()
+            if state == ST_CHAT and llm.done():
+                # ⚠ `result` RAISES on a failed call, and an unanswered
+                # greeting must not take the renderer down.
+                var rtxt = String("")
+                try:
+                    var rep = llm.result()
+                    rtxt = rep.text
+                except e:
+                    print("  [talk] FAILED:", String(e))
+                    last_event = String("talk failed")
+                print("  [said]", rtxt)
+                heard = rtxt
+                if not mute and rtxt != "":
+                    _say_async(rtxt)
                     mute_until = perf_counter_ns() + _ns(ECHO_TAIL_S)
-                last_event = String("replied")
+                    last_event = String("replied")
                 state = ST_IDLE
 
         # ── keys ──────────────────────────────────────────────────────
@@ -1218,11 +1335,24 @@ def main() raises:
             st_s = String("LISTENING ") + _f2(el) + String("s")
             st_c = UI_WARN
         elif state == ST_STT:
-            st_s = String("transcribing...")
-            st_c = UI_WARN
-        elif state == ST_JEV:
-            st_s = String("deciding...")
-            st_c = UI_WARN
+            # ⚠ WITH THE ELAPSED TIME AND THE BUDGET. "transcribing..." alone
+            # cannot distinguish a 5 s call from a dead one, and a session was
+            # lost to exactly that question.
+            var e1 = Float64(perf_counter_ns() - t_wait) / 1e9
+            st_s = String("transcribing ") + _f2(e1) + String("s / ") \
+                   + _f2(stt_dl) + String("s")
+            st_c = UI_WARN if e1 < stt_dl * 0.5 else UI_BAD
+        elif state == ST_CHAT:
+            var e3 = Float64(perf_counter_ns() - t_wait) / 1e9
+            st_s = String("replying ") + _f2(e3) + String("s / ") \
+                   + _f2(chat_dl) + String("s")
+            st_c = UI_WARN if e3 < chat_dl * 0.5 else UI_BAD
+        elif state == ST_JEV or state == ST_SPEC:
+            var e2 = Float64(perf_counter_ns() - t_wait) / 1e9
+            st_s = (String("deciding ") if state == ST_JEV
+                    else String("writing a reward ")) + _f2(e2) \
+                   + String("s / ") + _f2(jev_dl) + String("s")
+            st_c = UI_WARN if e2 < jev_dl * 0.5 else UI_BAD
         ui.label(12, 40, st_s, st_c, 1)
 
         var hs = heard
