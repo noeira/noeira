@@ -651,6 +651,36 @@ def _slot_descs(base: List[String], s: Int) -> List[String]:
     return out^
 
 
+def g1_spec_prompt(instruction: String) -> String:
+    """The state the spec questions are asked against — THE INSTRUCTION ALONE.
+
+    ⚠ NOT `g1_command_state`, AND THIS IS MEASURED. The demo first asked the
+    sketch against the full conversational state, which carries `doing` — and
+    the posture CATEGORY is answered from that state, so the scaffold came
+    out of what the robot happened to be doing rather than what was asked.
+    "Lève ton pied droit" twice in one session:
+
+        doing: walk   -> category `moving`   -> ESS 5089
+        doing: stand  -> category `standing` -> ESS  301
+
+    Same instruction, same goal terms, same `describe` output, same duplicate
+    key — 17x the support and a different behaviour. The looser one is
+    §12.51's trap exactly: `_scaffold_move` constrains only head height, so
+    the product retains walking frames and the conditional mean comes back as
+    walking. **An implicit scaffold change is invisible**, which is the defect
+    class this whole track keeps paying for.
+
+    A reward spec describes a TARGET BEHAVIOUR, not a transition into one, so
+    it must be a function of the instruction and nothing else. `doing` belongs
+    to the bank lookup, where it resolves "plus vite" (§12.56); it has no
+    business choosing a scaffold.
+
+    ⚠ It is also what the §12.58 measurement used — `decide_text("instruction:
+    " + ...)`. The demo had diverged from the number it was built on.
+    """
+    return String("instruction: ") + instruction
+
+
 def g1_spec_questions(warn: Bool = True) raises -> JevQuestions:
     """The reward sketch: a posture category plus three budgeted slots.
 

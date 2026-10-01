@@ -95,7 +95,7 @@ from noeira.ai.jev import JevClient
 from noeira.ai.speech import SpeechToText, STT_RAW
 from noeira.envs.robots.g1_spec import (
     G1Pool, g1_spec_questions, g1_spec_from_answers, g1_spec_admit,
-    g1_spec_bank_baseline, g1_spec_describe,
+    g1_spec_bank_baseline, g1_spec_describe, g1_spec_prompt,
 )
 from noeira.envs.robots.g1_reward_vocab import G1Term
 from noeira.envs.robots.g1_command_language import (
@@ -587,6 +587,9 @@ def main() raises:
     # after a walk was refused — correctly, because nothing in the request
     # said what was to be done faster (§10.1 of BFM_ZERO_NEXT_LEVEL.md).
     var ctx = G1Context()
+    # ⚠ True while a novel `z` is driving and `cur` therefore does NOT
+    # describe what the robot is doing — see the note at `spec_active = True`.
+    var spec_active = False
     var last_event = String("(waiting)")
     var pending = -1
     var pending_blend = 25
@@ -620,6 +623,10 @@ def main() raises:
                     zpair.data[D + k] = Scalar[DT](msg.z[k])
                 blend_len = msg.blend if msg.blend > 0 else 1
                 blend_left = blend_len
+                # same cancellation as the voice path
+                spec_active = True
+                q_name = List[String]()
+                q_conf = List[Float64]()
                 # ⚠ `cur` STAYS PUT and `pending` is NOT set. A novel `z` has
                 # no bank index, and `cur` is what the HUD, the keys and the
                 # context all read as "the command running now". Pointing it
@@ -895,7 +902,11 @@ def main() raises:
                     if has_pool and pick.reason == "no such command":
                         print("  [miss] P(none)", _f2(pick.p_none),
                               "— no name for this; asking for a reward spec")
-                        jev.start(g1_command_state(heard, ctx), spec_q)
+                        # ⚠ THE INSTRUCTION ALONE, not the conversational
+                        # state — see `g1_spec_prompt`. Asking with `doing`
+                        # in the state made the same instruction produce
+                        # ESS 5089 while walking and 301 while standing.
+                        jev.start_text(g1_spec_prompt(heard), spec_q)
                         state = ST_SPEC
                     else:
                         print("  [refused]", pick.reason, " P(none)",
@@ -940,6 +951,24 @@ def main() raises:
                         blend_left = blend_len
                         ctx.began(String("spec"))
                         t_cmd = perf_counter_ns()
+                        # ⚠ A NOVEL `z` MUST CANCEL THE PREVIOUS COMMAND'S
+                        # TERMINATION, and leaving `cur` alone is exactly why
+                        # it does not happen by itself. The locomotion
+                        # timeout reads `bank.group_at(cur)`, so a foot-lift
+                        # asked for while walking was overridden by the
+                        # WALK's 5 s timeout a moment later — visible in the
+                        # session log as `[spec] ... ESS 5089` followed
+                        # immediately by `[timeout] locomotion -> stand`.
+                        # ⚠ THE GUARD IS THE FLAG, NOT A FAR-FUTURE
+                        # DEADLINE. Pushing `step_end_at` out would make
+                        # `step_done` false for ever, and the timeout
+                        # condition also reads it — so the NEXT `walk` would
+                        # never end either. One flag, one meaning.
+                        spec_active = True
+                        # a chain queued by an earlier utterance is not what
+                        # the robot was just asked for
+                        q_name = List[String]()
+                        q_conf = List[Float64]()
                         last_event = String("spec: ") + what
                         # ⚠ a novel command has no phrase in the table, so
                         # the robot says the QUANTITY it is about to move.
@@ -1093,7 +1122,7 @@ def main() raises:
 
         # ⚠ LOCOMOTION HAS NO NATURAL END. A posture holds itself because `z`
         # persists; `walk` walks for ever. The bank's `group` is what decides.
-        if (bank.group_at(cur) == "locomotion"
+        if (not spec_active and bank.group_at(cur) == "locomotion"
             and Float64(perf_counter_ns() - t_cmd) / 1e9 > walk_s
             and len(q_name) == 0 and step_done
             and state == ST_IDLE):
@@ -1122,6 +1151,8 @@ def main() raises:
             blend_left = blend_len
             cur = pending
             t_cmd = perf_counter_ns()
+            # a bank command is running again, so `cur` is meaningful
+            spec_active = False
             # ⚠ HERE, AND NOWHERE ELSE. This is the one site where the active
             # command changes — keys, channel, voice and chain steps all funnel
             # through it — so it is the only place the context can be kept

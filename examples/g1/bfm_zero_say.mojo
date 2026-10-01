@@ -70,7 +70,7 @@ from noeira.envs.robots.g1_command_language import (
 )
 from noeira.envs.robots.g1_spec import (
     G1Pool, g1_spec_questions, g1_spec_from_answers, g1_spec_admit,
-    g1_spec_bank_baseline, g1_spec_describe, G1_SPEC_D,
+    g1_spec_bank_baseline, g1_spec_describe, g1_spec_prompt, G1_SPEC_D,
 )
 # ⚠ module scope — Mojo rejects an import inside a branch. Importing costs
 # nothing; only `SpeechToText.huggingface()` needs HF_TOKEN, so `--text`
@@ -335,7 +335,11 @@ def main() raises:
             print("  pool:", pool.n, "rows from", pool_path)
             var sq = g1_spec_questions(not no_warn)
             var t1 = perf_counter_ns()
-            var sa = jev.decide(state, sq)
+            # ⚠ THE INSTRUCTION ALONE — see `g1_spec_prompt`. The full
+            # state carries `doing`, and the posture category is answered
+            # from it, so the scaffold would come out of what the robot
+            # happened to be doing.
+            var sa = jev.decide_text(g1_spec_prompt(text), sq)
             print("  sketch:", Int(Float64(perf_counter_ns() - t1) / 1e6),
                   "ms,", sa.input_tokens, "input tokens")
             var terms = List[G1Term]()
