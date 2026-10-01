@@ -181,6 +181,10 @@ safetensors = ">=0.4,<1"
 # reading of the architecture and could not see a misreading; HuggingFace's own
 # SmolVLM can.
 transformers = ">=4.50"
+# The LeWorldModel reference (`references/le-wm-main/{jepa,module}.py`, run
+# as-is by `tools/lewm/`) reshapes with einops. Its encoder is HF's ViTModel,
+# which is why `transformers` above serves LeWM too.
+einops = ">=0.7"
 
 [feature.cpu.dependencies]
 # CPU-only environment for CI and headless test runs: base deps WITHOUT the
