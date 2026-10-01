@@ -347,8 +347,19 @@ def main() raises:
     var horizon = atol(_flag(String("--horizon"), String(150)))
     var start_clip = atol(_flag(String("--start-clip"), String(13)))
     var n_pool = atol(_flag(String("--pool"), String(65536)))
-    var iters = atol(_flag(String("--cem-iters"), String(8)))
-    var pop = atol(_flag(String("--cem-pop"), String(16)))
+    # ⚠⚠ 20 x 24, NOT 8 x 16, BECAUSE THAT IS WHAT BUILT THE SHIPPED BANK —
+    # its own header records `cem 20x24`. A re-run at the smaller default
+    # REJECTED `run` and `back` at hold 0.000, and §12.52's title is "`run`
+    # and `back` recovered": they are the two entries that NEED the larger
+    # search. `run`'s row shows the shape of it — soft gain **806 %** with
+    # hardCEM still 0.000, so CEM was climbing hard and simply ran out of
+    # iterations before the indicator held.
+    #
+    # A default that does not reproduce the artefact in the tree is a trap:
+    # the rebuild looks like it worked, the count comes out the same, and two
+    # commands are quietly different.
+    var iters = atol(_flag(String("--cem-iters"), String(20)))
+    var pop = atol(_flag(String("--cem-pop"), String(24)))
     var elites = atol(_flag(String("--cem-elites"), String(4)))
     var sigma0 = Float64(String(_flag(String("--cem-sigma"), String("0.30"))))
     var min_ess = Float64(String(_flag(String("--min-ess"), String("100"))))
@@ -584,6 +595,11 @@ def main() raises:
 
     var entries = String("")
     var n_ok = 0
+    # ⚠ WHICH commands were accepted, not just HOW MANY. The write guard
+    # compares the SET against what the bank already holds, because a COUNT
+    # guard watched 20 -> 20 while `run` and `back` were being replaced by
+    # two new entries. A count is not coverage.
+    var ok_flag = List[Bool](length=len(names), fill=False)
     var t0 = perf_counter_ns()
     print("-" * 104)
     print("  " + _pad(String("command"), 21) + _pad(String("group"), 12)
@@ -594,6 +610,25 @@ def main() raises:
     for c in range(ncmd):
         if only != "" and names[c] != only:
             continue
+        # ⚠⚠ RESEED PER COMMAND, OR `--only` MEASURES A DIFFERENT THING THAN
+        # THE RUN IT IS MEANT TO STAND IN FOR. CEM draws from one seeded
+        # stream, so with a single `seed(31)` at the top a command's random
+        # sequence depends on HOW MANY COMMANDS CONSUMED DRAWS BEFORE IT.
+        # Measured on `right_foot_height_hi` at the same 8x16 budget:
+        #
+        #     --only      hold 0.500  ->  REJECT
+        #     full run    hold 0.600  ->  ok (cem)
+        #
+        # Two full runs agreed exactly, so the stream is deterministic; it is
+        # the POSITION in it that moved. Every per-command measurement taken
+        # with `--only` was therefore measuring a path the real run never
+        # takes — which is the whole reason `--only` exists (iterating one
+        # rejected entry cost 25 minutes a try without it).
+        #
+        # Seeding from the command INDEX makes a command's result independent
+        # of what ran before it, so `--only NAME` and a full rebuild agree,
+        # and a full rebuild stays reproducible.
+        seed(31 + c)
         var nt = len(terms[c])
         var los = List[Float64](length=nt, fill=0.0)
         var his = List[Float64](length=nt, fill=0.0)
@@ -782,6 +817,7 @@ def main() raises:
             print("      per-step range of " + g1_vocab_name(gq) + ": "
                   + _f3(ship.qmin[gq]) + " .. " + _f3(ship.qmax[gq]))
         n_ok += 1
+        ok_flag[c] = True
 
         entries += String("name ") + names[c] + String("\n")
         entries += String("group ") + groups[c] + String("\n")
@@ -850,20 +886,44 @@ def main() raises:
         # the cost of being wrong is asymmetric: a refused write loses a
         # 25-minute run, an accepted one loses commands that took four gates
         # each to earn.
-        var had = 0
+        # ⚠⚠ THE SET, NOT THE COUNT — and the count version was MEASURED
+        # FAILING. A promote run rejected `run` and `back` while accepting
+        # two new foot commands, so 20 went to 20, the count guard saw
+        # nothing, and the bank silently LOST the command that §12.56's
+        # "plus vite" resolves to. A count is not coverage.
+        var prior = List[String]()
         try:
             var prev = string_from_bytes(read_file_bytes(out_path))
             var pls = prev.split("\n")
             for i in range(len(pls)):
-                if String(pls[i]).startswith("name "):
-                    had += 1
+                var pl = String(pls[i])
+                if pl.startswith("name "):
+                    var pp = pl.split(" ")
+                    if len(pp) >= 2:
+                        prior.append(String(pp[1]))
         except:
-            had = 0
-        if n_ok < had and not force_shrink:
-            print("  NOT written — this run accepted", n_ok,
-                  "commands and", out_path, "already holds", had,
-                  ". Refusing to shrink the bank; pass --force-shrink if that"
-                  " is really what you want.")
+            prior = List[String]()
+        var lost = String("")
+        for i in range(len(prior)):
+            var still = False
+            for c in range(ncmd):
+                if names[c] == prior[i] and ok_flag[c]:
+                    still = True
+            if not still:
+                if lost != "":
+                    lost += String(" ")
+                lost += prior[i]
+        var had = len(prior)
+        if lost != "" and not force_shrink:
+            print("  NOT written —", out_path, "holds", had,
+                  "commands and this run would DROP:", lost)
+            print("    A command already in the bank passed four gates to get"
+                  " there, so losing one is far more likely to be a smaller"
+                  " CEM budget or a missing artefact than an intention.")
+            print("    This run used CEM", iters, "x", pop,
+                  "; the shipped bank's own header records what built it.")
+            print("    Pass --force-shrink if dropping them is really what"
+                  " you want.")
         else:
             write_text_atomic(out_path, head + entries)
             print("  wrote", out_path, "—", n_ok, "commands (was", had, ")")
