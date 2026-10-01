@@ -376,6 +376,14 @@ def main() raises:
     var promote = _flag(String("--promote"), String(""))
     # see the guards at the write site — this is the only way past them
     var force_shrink = _has(String("--force-shrink"))
+    # ⚠ `--append` (with `--promote`): evaluate ONLY the candidates and ADD the
+    # accepted rows to the existing `--out` file, whose rows are left byte for
+    # byte. Without it a promotion rebuilds every hand-written command too —
+    # hours of CEM to add one row — and a bank that is not this file's own
+    # (a project's copy) could not grow at all without being regenerated.
+    var append_mode = _has(String("--append"))
+    if append_mode and promote == "":
+        raise Error("--append adds PROMOTED rows; pass --promote <candidates>")
     if ckpt == "":
         raise Error("pass --ckpt <path/to/step_NNNN.ckpt>")
 
@@ -554,6 +562,21 @@ def main() raises:
     # terms came from — which is the point: a promoted row has to earn its
     # place, because `g1_decide` offers every bank entry to the model as
     # though they were equivalent.
+    var existing = List[String]()
+    # ⚠ THE HAND-WRITTEN ENTRIES STAY IN THE LIST under `--append` and are
+    # SKIPPED in the loop, not removed: CEM is seeded `31 + c` per command, so
+    # a list holding only the candidates would shift every index and give each
+    # candidate a different seed — results that match neither a full run nor
+    # another `--append` run, and nothing would say so.
+    var n_hand = len(names)
+    if append_mode:
+        var prev_txt = string_from_bytes(read_file_bytes(out_path))
+        var prev_ls = prev_txt.split("\n")
+        for i in range(len(prev_ls)):
+            var pl = String(prev_ls[i])
+            if pl.startswith("name "):
+                existing.append(String(pl.split(" ")[1]))
+        print("  --append: only the candidates; ", len(existing), "rows already in", out_path)
     if promote != "":
         var cands = g1_spec_load_candidates(promote)
         print("  promoting", len(cands), "candidates from", promote)
@@ -564,6 +587,9 @@ def main() raises:
             var clash = False
             for j in range(len(names)):
                 if names[j] == cands[i].name:
+                    clash = True
+            for j in range(len(existing)):
+                if existing[j] == cands[i].name:
                     clash = True
             if clash:
                 print("    skipped `" + cands[i].name
@@ -609,6 +635,8 @@ def main() raises:
 
     for c in range(ncmd):
         if only != "" and names[c] != only:
+            continue
+        if append_mode and c < n_hand:
             continue
         # ⚠⚠ RESEED PER COMMAND, OR `--only` MEASURES A DIFFERENT THING THAN
         # THE RUN IT IS MEANT TO STAND IN FOR. CEM draws from one seeded
@@ -879,6 +907,31 @@ def main() raises:
         print("  NOT written —", out_path, "is unchanged. `--only` evaluates"
               " ONE command, so writing would delete every other entry."
               " Re-run without `--only` to rebuild the bank.")
+    elif append_mode:
+        # the existing rows stay byte for byte; only `count` changes
+        if n_ok == 0:
+            print("  NOT written — no candidate was accepted;", out_path, "is unchanged")
+        else:
+            var prev_txt2 = string_from_bytes(read_file_bytes(out_path))
+            var prev_ls2 = prev_txt2.split("\n")
+            var out_txt = String("")
+            var n_prev = 0
+            for i in range(len(prev_ls2)):
+                var pl = String(prev_ls2[i])
+                if pl.startswith("count "):
+                    var pp = pl.split(" ")
+                    n_prev = atol(String(pp[1]))
+                    if len(pp) < 3 or atol(String(pp[2])) != D:
+                        raise Error("--append: " + out_path + " is not a "
+                                    + String(D) + "-wide bank")
+                    pl = String("count ") + String(n_prev + n_ok) + String(" ") + String(D)
+                if i + 1 < len(prev_ls2) or pl.byte_length() > 0:
+                    out_txt += pl + String("\n")
+            out_txt += String("# appended by --append from ") + promote + String(": cem ") \
+                       + String(iters) + String("x") + String(pop) + String(" elites ") \
+                       + String(elites) + String(", same gates\n")
+            write_text_atomic(out_path, out_txt + entries)
+            print("  appended", n_ok, "rows to", out_path, "— now", n_prev + n_ok)
     else:
         # ⚠ NEVER SHRINK SILENTLY. A rebuild that accepts fewer commands than
         # the file already holds is far more likely to be a mistake (a bad
