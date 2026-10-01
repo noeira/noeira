@@ -37,14 +37,14 @@ from noeira.nn.core.tensor_refs import TensorRefs
 from noeira.physics3d.fields import Data
 from noeira.physics3d.kinematics.forward_kinematics import forward_kinematics
 from noeira.physics3d.parser.runtime_load import parse_model_runtime
-from noeira.tasks.delta_action import delta_target, ServoLag
+from noeira.tasks.delta_action import delta_target, target_step, ServoLag, TARGET_OBS
 from noeira.tasks.family import scene_path
 from noeira.tasks.family_config import So101TowerConfig
 from noeira.tasks.pixel_student import (
     StudentNet, N_CAMS, IN_DIM, ACT, RENDER, OVERHEAD_RENDER_W,
     OVERHEAD_RENDER_H, OBS_PX, JOINT_VEL, WINDOWED, check_pixel_manifest,
     render_to_planes, joints_to_planes, joint_vels_to_planes, student_act,
-    HIST_WORDS, act_hist_push, act_hist_to_planes,
+    HIST_WORDS, act_hist_push, act_hist_to_planes, target_lead_to_planes,
 )
 from noeira.tasks.placement.so101_tower import So101TowerPlacement
 from noeira.tasks.posed_reset import posed_qpos
@@ -199,6 +199,10 @@ def main() raises:
         var qd = List[Float64](length=ACT, fill=0.0)
         var a_ex = List[Float64](length=ACT, fill=0.0)
         var tgt_hold = List[Float64](length=ACT, fill=0.0)
+        # target mode (`man.action == "target"`): the last commanded target,
+        # starting on the joints; its lead over them is the student's input
+        var tprev = q_start.copy()
+        var lead = List[Float64](length=TARGET_OBS, fill=0.0)
         var line = String("")
         var ra = String("")
         for t in range(So101TowerConfig.MAX_STEPS):
@@ -250,6 +254,9 @@ def main() raises:
                 joints_to_planes(q_pol, xs)
                 joint_vels_to_planes(qd, xs)
                 act_hist_to_planes(hist, xs)
+                for j in range(TARGET_OBS):
+                    lead[j] = tprev[j] - q[j]
+                target_lead_to_planes(lead, xs)
                 for k in range(IN_DIM):
                     x.data[k] = xs[k]
                 net.forward["cpu", 1](TensorRefs[1](x), y, None)
@@ -260,7 +267,14 @@ def main() raises:
                     if act_ema > 0.0 and j < ACT - 1:
                         a = (1.0 - act_ema) * a + act_ema * a_ex[j]
                     a_ex[j] = a
-                    tgt_hold[j] = delta_target(q[j], a, j, lo[j], hi[j], man.delta_arm, man.delta_gripper)
+                    if man.action == "target":
+                        tgt_hold[j] = target_step(
+                            tprev[j], q[j], a, j, lo[j], hi[j], man.delta_arm,
+                            man.delta_gripper, man.target_lead,
+                        )
+                        tprev[j] = tgt_hold[j]
+                    else:
+                        tgt_hold[j] = delta_target(q[j], a, j, lo[j], hi[j], man.delta_arm, man.delta_gripper)
                     ra += "," + String(a)
                     line += " " + col(a, 6, 2)
                 act_hist_push(hist, a_ex)

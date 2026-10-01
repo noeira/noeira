@@ -108,14 +108,14 @@ from noeira.robot.so101.deploy_shutdown import (
 )
 from noeira.robot.so101.ports import follower_port, port_refusal
 from noeira.robot.so101.sim_map import SimJointMap
-from noeira.tasks.delta_action import delta_target
+from noeira.tasks.delta_action import delta_target, target_step, TARGET_OBS
 from noeira.tasks.family import scene_path
 from noeira.tasks.family_config import So101TowerConfig
 from noeira.tasks.pixel_student import (
     StudentNet, N_CAMS, OBS_PX, PLANE, IN_DIM, ACT, CAM_FOVY_DEG, JOINT_VEL,
     camera_names, check_pixel_manifest, frame_to_planes, joints_to_planes,
     joint_vels_to_planes, student_act, HIST_WORDS, act_hist_push,
-    act_hist_to_planes,
+    act_hist_to_planes, target_lead_to_planes,
 )
 from noeira.tasks.placement.so101_tower import So101TowerPlacement
 from noeira.tasks.posed_reset import posed_qpos
@@ -625,6 +625,14 @@ def main() raises:
     var q_prev = List[Float64](length=SO101_N, fill=0.0)
     for i in range(SO101_N):
         q_prev[i] = q[i]
+    # target mode (`man.action == "target"`): the last commanded target,
+    # seeded on the joints the ramp left the arm at — the policy steps from
+    # it (`delta_action.target_step`), and sees its lead over the joints
+    var tprev = q.copy()
+    var lead = List[Float64](length=TARGET_OBS, fill=0.0)
+    if man.action == "target":
+        print("  target mode: steps from the previous target, lead bound",
+              man.target_lead, "rad")
     var t_prev = perf_counter_ns()
     var loop_t0 = perf_counter_ns()
     var deadline = loop_t0 + seconds * 1_000_000_000
@@ -677,6 +685,9 @@ def main() raises:
             joints_to_planes(q_pol, xs)
             joint_vels_to_planes(qd, xs)
             act_hist_to_planes(hist, xs)
+            for j in range(TARGET_OBS):
+                lead[j] = tprev[j] - q[j]
+            target_lead_to_planes(lead, xs)
             if snap_dir.byte_length() > 0 and ticks == 62:
                 _snap(snap_dir, frames, xs, q, String("_t2s"))
             # the policy acts every `repeat` ticks (the manifest's cadence);
@@ -698,7 +709,15 @@ def main() raises:
                     if act_ema > 0.0 and j < ACT - 1:
                         a = (1.0 - act_ema) * a + act_ema * a_ex[j]
                     a_ex[j] = a
-                    var tgt = delta_target(q[j], a, j, lo[j], hi[j], man.delta_arm, man.delta_gripper)
+                    var tgt: Float64
+                    if man.action == "target":
+                        tgt = target_step(
+                            tprev[j], q[j], a, j, lo[j], hi[j], man.delta_arm,
+                            man.delta_gripper, man.target_lead,
+                        )
+                        tprev[j] = tgt
+                    else:
+                        tgt = delta_target(q[j], a, j, lo[j], hi[j], man.delta_arm, man.delta_gripper)
                     if tgt <= lo[j] or tgt >= hi[j]:
                         clamped += 1
                     goals[j] = jmap.from_sim(arm.cal, j, tgt)

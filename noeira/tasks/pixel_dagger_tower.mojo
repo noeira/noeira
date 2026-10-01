@@ -91,7 +91,7 @@ from noeira.tasks.posed_reset import task_meta_words
 from noeira.tasks.ppo_family_driver import (
     AgentT, RunningMeanStd, N_ENVS, ACT_DIM, OBS_CLIP, OBS_BOUND, GAMMA,
     _delta_to_env, _arg, _lag_reset, _augment, _hist_push, _hist_clear,
-    _delta_targets, _targets_to_env,
+    _delta_targets, _targets_to_env, _target_targets, _target_reset,
 )
 from noeira.tasks.delta_action import ServoLag, DELTA_ARM, DELTA_GRIPPER, TARGET_OBS
 from noeira.tasks.shaping import reward_mode_words
@@ -110,17 +110,20 @@ from noeira.tasks.pixel_student import (
     OVERHEAD_RENDER_W, OVERHEAD_RENDER_H, WINDOWED, camera_names,
     window_in_render,
     PROPRIO, JOINT_SCALE, JOINT_VEL_SCALE, student_act, write_pixel_manifest,
-    PROPRIO_STATE, HIST_WORDS,
+    PROPRIO_STATE, HIST_WORDS, TARGET_LEAD_SCALE,
 )
 
 comptime M = So101TowerModel
 comptime C = So101TowerConfig
 comptime EnvT = Phyics3dBatchedEnv[M, C, N_ENVS, TERMINATE_ON_UNHEALTHY=False]
 comptime OBS = EnvT.OBS_DIM
-comptime T_OBS = OBS + HIST_WORDS
+comptime T_OBS = OBS + HIST_WORDS + TARGET_OBS
 """The teacher's observation: the env's, then (`-D TASK_PPO_ACT_HIST=K`) the
 last K executed actions — the same words the student sees as planes."""
-comptime HW1 = HIST_WORDS if HIST_WORDS > 0 else 1
+comptime EXW = HIST_WORDS + TARGET_OBS
+"""The host-made joint words per lane: the action history, then (target
+mode) the target's lead over the joints."""
+comptime HW1 = EXW if EXW > 0 else 1
 comptime NQ = M.NQ
 comptime NB = M.NBODY
 
@@ -283,7 +286,10 @@ def _gather_kernel[
     else:
         var j = (k - IMG) // PLANE
         var sc = Scalar[DT](JOINT_SCALE) if j < ACT_DIM else (
-            Scalar[DT](JOINT_VEL_SCALE) if j < PROPRIO_STATE else Scalar[DT](1)
+            Scalar[DT](JOINT_VEL_SCALE) if j < PROPRIO_STATE else (
+                Scalar[DT](1) if j < PROPRIO_STATE + HIST_WORDS
+                else Scalar[DT](TARGET_LEAD_SCALE)
+            )
         )
         x[i] = rebind[Scalar[DT]](ring[row * ROW + IMG + j]) * sc
 
@@ -405,12 +411,20 @@ struct PixelObs(Movable):
     def observe(
         mut self, ctx: DeviceContext, env_qpos: DeviceBuffer[DT],
         env_qvel: DeviceBuffer[DT], base_row: Int, ref hist: List[Float64],
+        ref lead: List[Float64],
     ) raises:
         """`hist`: the lanes' action histories ([N_ENVS, HIST_WORDS], the
         PPO driver's `_hist_push` layout; empty without TASK_PPO_ACT_HIST)."""
-        comptime if HIST_WORDS > 0:
-            for k in range(N_ENVS * HIST_WORDS):
-                self.hist_t.data[k] = Scalar[DT](hist[k])
+        comptime if EXW > 0:
+            # per lane: its HIST_WORDS history words, then its TARGET_OBS
+            # target leads (`lead`: [N_ENVS, TARGET_OBS], target - q)
+            for e in range(N_ENVS):
+                for k in range(HIST_WORDS):
+                    self.hist_t.data[e * HW1 + k] = Scalar[DT](hist[e * HIST_WORDS + k])
+                for k in range(TARGET_OBS):
+                    self.hist_t.data[e * HW1 + HIST_WORDS + k] = Scalar[DT](
+                        lead[e * TARGET_OBS + k]
+                    )
             self.hist_t.upload_resident(ctx)
         ctx.enqueue_copy(self.rd.qpos.dev.value(), env_qpos)
         ctx.enqueue_copy(self.rd.qvel.dev.value(), env_qvel)
@@ -518,10 +532,6 @@ struct PixelObs(Movable):
 
 
 def run_pixel_dagger(args: List[String], driver: String) raises:
-    # the teacher's observation is built with no target-lead words (the
-    # trainer refuses a target-mode teacher): a TARGET_OBS build would widen
-    # the teacher's input with words this trainer never fills
-    comptime assert TARGET_OBS == 0, "pixel dagger: build without -D TASK_PPO_TARGET_OBS"
     comptime assert ACT == ACT_DIM, "the student acts in the teacher's space"
     # ── flags ────────────────────────────────────────────────────────────
     var task = String("so101_tower_lift_real_layout")
@@ -674,18 +684,20 @@ def run_pixel_dagger(args: List[String], driver: String) raises:
         )
         teacher.trainer.load_state(teacher_dir + "/checkpoints/last.ckpt")
         var t_cfg = teacher_dir + "/metrics.config.kv"
+        var t_action = String("delta")
+        var target_lead = 0.0
         try:
             with open(t_cfg, "r") as fh:
                 for ln in fh.read().split("\n"):
                     var sl = String(ln)
                     # ⚠ a `--action target` teacher's actions are steps
-                    # from its PREVIOUS target (`delta_action.target_step`);
-                    # labelled here as steps from `q` they would be wrong
-                    # silently
-                    if sl == "action=target":
-                        raise Error("pixel dagger: the teacher was trained"
-                                    " with --action target, which this"
-                                    " student does not speak yet")
+                    # from its PREVIOUS target (`delta_action.target_step`):
+                    # executed here the same way, with the same lead bound,
+                    # and only by a TARGET_OBS build (its input has the leads)
+                    if sl.startswith("action="):
+                        t_action = String(sl[byte = 7 :])
+                    if sl.startswith("target_lead="):
+                        target_lead = Float64(String(sl[byte = 12 :]))
                     if sl.startswith("delta_arm="):
                         var tv = Float64(String(sl[byte = 10 :]))
                         if abs(tv - d_arm) > 1e-9:
@@ -695,6 +707,11 @@ def run_pixel_dagger(args: List[String], driver: String) raises:
         except e:
             if String(e).find("pixel dagger:") >= 0:
                 raise e^
+        if (t_action == "target") != (TARGET_OBS > 0):
+            raise Error("pixel dagger: the teacher acts with --action "
+                        + t_action + "; a target teacher needs (and only it"
+                        + " may use) a -D TASK_PPO_TARGET_OBS build")
+        print("  teacher action", t_action, "| target lead", target_lead)
         var obs_rms = RunningMeanStd(T_OBS)
         obs_rms.load(teacher_dir + "/obs_norm.txt")
 
@@ -750,9 +767,10 @@ def run_pixel_dagger(args: List[String], driver: String) raises:
         # the lanes' executed actions, most recent first (zero at a reset) —
         # the teacher's extra words and the student's extra planes
         var hist = List[Float64](length=N_ENVS * HIST_WORDS, fill=0.0)
-        # `_augment`'s target-lead words: none here — the trainer refuses a
-        # target-mode teacher (its config says action=target)
-        var no_tprev = List[Float64]()
+        # target mode: each lane's last commanded target, and its lead over
+        # the joints at the observation (the student's lead planes)
+        var tprev = List[Float64](length=N_ENVS * ACT_DIM, fill=0.0)
+        var lead = List[Float64](length=N_ENVS * TARGET_OBS, fill=0.0)
         var act_t = ctx.enqueue_create_host_buffer[DT](N_ENVS * ACT_DIM)
         var env_act = ctx.enqueue_create_host_buffer[DT](N_ENVS * ACT_DIM)
         var done_h = ctx.enqueue_create_host_buffer[DT](N_ENVS)
@@ -816,6 +834,7 @@ def run_pixel_dagger(args: List[String], driver: String) raises:
         write_pixel_manifest(
             run.dir + "/checkpoints/norm.json", task, teacher_dir, grip_sign,
             Float64(C.FRAME_SKIP) * M.TIMESTEP, d_arm, d_grip, lag_tau, lag_delay, repeat,
+            t_action, target_lead,
         )
 
         ctx.enqueue_copy(raw_h, obs_dev)
@@ -833,8 +852,7 @@ def run_pixel_dagger(args: List[String], driver: String) raises:
             if px.dr_on and it % dr_every == 0:
                 px.redraw(ctx, dr_draw)
                 dr_draw += 1
-            px.observe(ctx, qpos_dev, qvel_dev, base, hist)
-            # 3. the teacher, on the state
+            # the joints, and a new episode's servo model and target
             var rp = mptr(raw_h.unsafe_ptr())
             for e in range(N_ENVS):
                 for j in range(ACT_DIM):
@@ -843,8 +861,15 @@ def run_pixel_dagger(args: List[String], driver: String) raises:
                     )
                 if lag_pending[e]:
                     _lag_reset(lag, arm_q, e)
+                    _target_reset(tprev, arm_q, e)
                     lag_pending[e] = False
-            _augment[OBS](rp, hist, no_tprev, a_qa, mptr(aug_o.unsafe_ptr()))
+                for j in range(TARGET_OBS):
+                    lead[e * TARGET_OBS + j] = (
+                        tprev[e * ACT_DIM + j] - arm_q[e * ACT_DIM + j]
+                    )
+            px.observe(ctx, qpos_dev, qvel_dev, base, hist, lead)
+            # 3. the teacher, on the state
+            _augment[OBS](rp, hist, tprev, a_qa, mptr(aug_o.unsafe_ptr()))
             obs_rms.normalize_into(
                 mptr(aug_o.unsafe_ptr()), mptr(cur_n.unsafe_ptr()), N_ENVS,
                 T_OBS, OBS_CLIP,
@@ -881,9 +906,15 @@ def run_pixel_dagger(args: List[String], driver: String) raises:
                                 y_act.data[e * ACT_DIM + j], j, grip_sign
                             )
             _hist_push(hist, mptr(act_t.unsafe_ptr()))
-            _delta_targets(
-                mptr(act_t.unsafe_ptr()), tg, arm_q, a_lo, a_hi, d_arm, d_grip,
-            )
+            if t_action == "target":
+                _target_targets(
+                    mptr(act_t.unsafe_ptr()), tg, tprev, arm_q, a_lo, a_hi,
+                    d_arm, d_grip, target_lead,
+                )
+            else:
+                _delta_targets(
+                    mptr(act_t.unsafe_ptr()), tg, arm_q, a_lo, a_hi, d_arm, d_grip,
+                )
             # 5. `repeat` ticks under the held targets, tally, reset
             for e in range(N_ENVS):
                 dmac[e] = False
@@ -1046,7 +1077,6 @@ def run_pixel_dagger(args: List[String], driver: String) raises:
                 if t % repeat == 0:
                     if px.dr_on and eval_dr and t % dr_every == 0:
                         px.redraw(ctx, 5_000_000 + rnd * 1000 + t)  # held-out draws
-                    px.observe(ctx, qpos_dev, qvel_dev, 0, hist)
                     var rq = mptr(raw_h.unsafe_ptr())
                     for e in range(N_ENVS):
                         for j in range(ACT_DIM):
@@ -1054,10 +1084,17 @@ def run_pixel_dagger(args: List[String], driver: String) raises:
                                 rq[unsafe_offset = e * OBS + a_qa[j]]
                             )
                         g_act.data[e] = Scalar[DT](e)
+                        if t == 0:
+                            _target_reset(tprev, arm_q, e)
+                        for j in range(TARGET_OBS):
+                            lead[e * TARGET_OBS + j] = (
+                                tprev[e * ACT_DIM + j] - arm_q[e * ACT_DIM + j]
+                            )
+                    px.observe(ctx, qpos_dev, qvel_dev, 0, hist, lead)
                     if eval_teacher:
                         # the TEACHER through the same loop — the reference the
                         # student's stages are read against
-                        _augment[OBS](rq, hist, no_tprev, a_qa, mptr(aug_o.unsafe_ptr()))
+                        _augment[OBS](rq, hist, tprev, a_qa, mptr(aug_o.unsafe_ptr()))
                         obs_rms.normalize_into(
                             mptr(aug_o.unsafe_ptr()), mptr(cur_n.unsafe_ptr()),
                             N_ENVS, T_OBS, OBS_CLIP,
@@ -1066,7 +1103,7 @@ def run_pixel_dagger(args: List[String], driver: String) raises:
                             mptr(cur_n.unsafe_ptr()), mptr(act_t.unsafe_ptr())
                         )
                     else:
-                        _augment[OBS](rq, hist, no_tprev, a_qa, mptr(aug_o.unsafe_ptr()))
+                        _augment[OBS](rq, hist, tprev, a_qa, mptr(aug_o.unsafe_ptr()))
                         obs_rms.normalize_into(
                             mptr(aug_o.unsafe_ptr()), mptr(cur_n.unsafe_ptr()),
                             N_ENVS, T_OBS, OBS_CLIP,
@@ -1090,10 +1127,16 @@ def run_pixel_dagger(args: List[String], driver: String) raises:
                         for e in range(N_ENVS):
                             _lag_reset(lag, arm_q, e)
                     _hist_push(hist, mptr(act_t.unsafe_ptr()))
-                    _delta_targets(
-                        mptr(act_t.unsafe_ptr()), tg, arm_q, a_lo, a_hi,
-                        d_arm, d_grip,
-                    )
+                    if t_action == "target":
+                        _target_targets(
+                            mptr(act_t.unsafe_ptr()), tg, tprev, arm_q, a_lo,
+                            a_hi, d_arm, d_grip, target_lead,
+                        )
+                    else:
+                        _delta_targets(
+                            mptr(act_t.unsafe_ptr()), tg, arm_q, a_lo, a_hi,
+                            d_arm, d_grip,
+                        )
                 _targets_to_env(tg, mptr(env_act.unsafe_ptr()), a_lo, a_hi, lag)
                 ctx.enqueue_copy(act_dev, env_act)
                 env.step_batch[N_ENVS](ctx=ctx, rng_seed=UInt64(t + 1))
@@ -1240,7 +1283,8 @@ def _dump_obs_png(
                 px.restore(ctx)
             else:
                 px.redraw(ctx, 900_000 + d)
-        px.observe(ctx, qpos_dev, qvel_dev, 0, hist)
+        var lead0 = List[Float64](length=N_ENVS * TARGET_OBS, fill=0.0)
+        px.observe(ctx, qpos_dev, qvel_dev, 0, hist, lead0)
         var h = ctx.enqueue_create_host_buffer[DT](2 * ROW)
         ctx.enqueue_copy(h, px.ring.dev.value().create_sub_buffer[DT](0, 2 * ROW))
         ctx.synchronize()
