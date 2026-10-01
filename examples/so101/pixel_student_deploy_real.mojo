@@ -711,6 +711,11 @@ def main() raises:
     var bus_skipped = 0
     var clamped = 0
     var sum_fwd = 0.0
+    # where a tick's time goes (ms, summed): the cameras (take + planes), the
+    # bus read, the bus write -- the loop ran ~27.5 Hz against the sim's 31.25
+    var sum_cam = 0.0
+    var sum_read = 0.0
+    var sum_write = 0.0
     var worst_tick = 0.0
     var rec_csv = String("t_s,q0,q1,q2,q3,q4,q5,qd0,qd1,qd2,qd3,qd4,qd5,a0,a1,a2,a3,a4,a5,tgt0,tgt1,tgt2,tgt3,tgt4,tgt5\n")
     if rec_dir.byte_length() > 0:
@@ -763,11 +768,16 @@ def main() raises:
                 break
             # observe: the latest frame of each camera (the previous one if
             # none arrived this period — counted)
+            var tc0 = perf_counter_ns()
             for i in range(N_CAMS):
                 if cams[i].take_latest(frames[i]) == 0:
                     stale += 1
                 frame_to_planes(frames[i], CAM_W, CAM_H, i, xs)
-            if arm.read_positions(Span(raw)) != SO101_N:
+            var tc1 = perf_counter_ns()
+            sum_cam += Float64(tc1 - tc0) / 1e6
+            var rd_ok = arm.read_positions(Span(raw)) == SO101_N
+            sum_read += Float64(perf_counter_ns() - tc1) / 1e6
+            if not rd_ok:
                 bus_skipped += 1
                 _spin_until(tt + period_ns)
                 continue
@@ -842,7 +852,9 @@ def main() raises:
                 if ticks % 16 == 0:
                     _snap(rec_dir, frames, xs, q, String("_") + String(ticks))
             if arm_it:
+                var tw0 = perf_counter_ns()
                 arm.write_goals(Span(goals))
+                sum_write += Float64(perf_counter_ns() - tw0) / 1e6
             # ⚠ what was SENT, as the trainer records it (the dry run too: its
             # policy then sees the commands it would have made)
             if acting:
@@ -899,6 +911,11 @@ def main() raises:
     print("  ticks           = " + String(ticks) + " in " + fixed(el, 1) + " s = "
           + fixed(Float64(ticks) / max(el, 1e-9), 1) + " Hz (sim: "
           + fixed(1.0 / man.control_period_s, 2) + ")")
+    var nt = Float64(max(ticks, 1))
+    print("  tick time (mean ms): cameras + planes " + fixed(sum_cam / nt, 2)
+          + " | bus read " + fixed(sum_read / nt, 2) + " | bus write "
+          + fixed(sum_write / nt, 2) + " | forward " + fixed(sum_fwd / nt, 2)
+          + " | budget " + fixed(Float64(period_ns) / 1e6, 1))
     print("  worst tick      = " + fixed(worst_tick, 1) + " ms | forward mean "
           + fixed(sum_fwd / Float64(max(ticks, 1)), 2) + " ms")
     print("  stale frames    = " + String(stale) + " | bus reads skipped "
