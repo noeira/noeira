@@ -746,6 +746,9 @@ def run_pixel_dagger(args: List[String], driver: String) raises:
         # the lanes' executed actions, most recent first (zero at a reset) —
         # the teacher's extra words and the student's extra planes
         var hist = List[Float64](length=N_ENVS * HIST_WORDS, fill=0.0)
+        # `_augment`'s target-lead words: none here — the trainer refuses a
+        # target-mode teacher (its config says action=target)
+        var no_tprev = List[Float64]()
         var act_t = ctx.enqueue_create_host_buffer[DT](N_ENVS * ACT_DIM)
         var env_act = ctx.enqueue_create_host_buffer[DT](N_ENVS * ACT_DIM)
         var done_h = ctx.enqueue_create_host_buffer[DT](N_ENVS)
@@ -837,7 +840,7 @@ def run_pixel_dagger(args: List[String], driver: String) raises:
                 if lag_pending[e]:
                     _lag_reset(lag, arm_q, e)
                     lag_pending[e] = False
-            _augment[OBS](rp, hist, mptr(aug_o.unsafe_ptr()))
+            _augment[OBS](rp, hist, no_tprev, a_qa, mptr(aug_o.unsafe_ptr()))
             obs_rms.normalize_into(
                 mptr(aug_o.unsafe_ptr()), mptr(cur_n.unsafe_ptr()), N_ENVS,
                 T_OBS, OBS_CLIP,
@@ -1050,7 +1053,7 @@ def run_pixel_dagger(args: List[String], driver: String) raises:
                     if eval_teacher:
                         # the TEACHER through the same loop — the reference the
                         # student's stages are read against
-                        _augment[OBS](rq, hist, mptr(aug_o.unsafe_ptr()))
+                        _augment[OBS](rq, hist, no_tprev, a_qa, mptr(aug_o.unsafe_ptr()))
                         obs_rms.normalize_into(
                             mptr(aug_o.unsafe_ptr()), mptr(cur_n.unsafe_ptr()),
                             N_ENVS, T_OBS, OBS_CLIP,
@@ -1059,7 +1062,7 @@ def run_pixel_dagger(args: List[String], driver: String) raises:
                             mptr(cur_n.unsafe_ptr()), mptr(act_t.unsafe_ptr())
                         )
                     else:
-                        _augment[OBS](rq, hist, mptr(aug_o.unsafe_ptr()))
+                        _augment[OBS](rq, hist, no_tprev, a_qa, mptr(aug_o.unsafe_ptr()))
                         obs_rms.normalize_into(
                             mptr(aug_o.unsafe_ptr()), mptr(cur_n.unsafe_ptr()),
                             N_ENVS, T_OBS, OBS_CLIP,
