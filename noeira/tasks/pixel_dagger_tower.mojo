@@ -674,6 +674,14 @@ def run_pixel_dagger(args: List[String], driver: String) raises:
             with open(t_cfg, "r") as fh:
                 for ln in fh.read().split("\n"):
                     var sl = String(ln)
+                    # ⚠ a `--action target` teacher's actions are steps
+                    # from its PREVIOUS target (`delta_action.target_step`);
+                    # labelled here as steps from `q` they would be wrong
+                    # silently
+                    if sl == "action=target":
+                        raise Error("pixel dagger: the teacher was trained"
+                                    " with --action target, which this"
+                                    " student does not speak yet")
                     if sl.startswith("delta_arm="):
                         var tv = Float64(String(sl[byte = 10 :]))
                         if abs(tv - d_arm) > 1e-9:

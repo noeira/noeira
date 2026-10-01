@@ -60,6 +60,11 @@ later addition.
   the env's absolute action. Anchored on the joints (read from the raw
   observation), so there is no hidden target state. Pair with
   `--log-std-init 0` (nexus's std 1).
+- `target`: SimToolReal's arm rule — the same step added to the lane's
+  PREVIOUS TARGET, not to the measured joint (`delta_action.target_step`,
+  why in its module header). The target is hidden state the policy
+  integrates, so the build needs `-D TASK_PPO_TARGET_OBS` (the policy sees
+  `target - q`). `--target-lead L` bounds the target to L rad from `q`.
 """
 
 from std.builtin.sort import sort
@@ -100,7 +105,7 @@ from noeira.tasks.posed_reset import task_meta_words
 from noeira.tasks.shaping import reward_mode_words
 from noeira.tasks.delta_action import (
     DELTA_ACT, DELTA_ARM, DELTA_GRIPPER, delta_scale, delta_target, ServoLag,
-    ACT_HIST,
+    ACT_HIST, TARGET_OBS, target_step,
 )
 # `ACT_HIST` (`-D TASK_PPO_ACT_HIST=K`): the last K executed actions after the
 # env's observation — see `delta_action.ACT_HIST`. A run trained without it is
@@ -281,6 +286,37 @@ def _delta_targets(
             )
 
 
+def _target_targets(
+    ap: Pointer[Scalar[DT], MutAnyOrigin],
+    mut tg: List[Float64],
+    mut tprev: List[Float64],
+    ref arm_q: List[Float64],
+    ref a_lo: List[Float64],
+    ref a_hi: List[Float64],
+    d_arm: Float64,
+    d_grip: Float64,
+    lead: Float64,
+):
+    """`--action target`: the policy step's joint targets from each lane's
+    PREVIOUS target (`delta_action.target_step`), which they then become."""
+    for e in range(N_ENVS):
+        for j in range(ACT_DIM):
+            var k = e * ACT_DIM + j
+            tg[k] = target_step(
+                tprev[k], arm_q[k], Float64(ap[unsafe_offset=k]), j,
+                a_lo[j], a_hi[j], d_arm, d_grip, lead,
+            )
+            tprev[k] = tg[k]
+
+
+def _target_reset(
+    mut tprev: List[Float64], ref arm_q: List[Float64], lane: Int,
+):
+    """A new episode: lane `lane`'s target starts on its joints."""
+    for j in range(ACT_DIM):
+        tprev[lane * ACT_DIM + j] = arm_q[lane * ACT_DIM + j]
+
+
 def _targets_to_env(
     ref tg: List[Float64],
     ep: Pointer[Scalar[DT], MutAnyOrigin],
@@ -333,16 +369,25 @@ def _hist_clear(mut hist: List[Float64], lane: Int):
 def _augment[E_OBS: Int](
     raw: Pointer[Scalar[DT], MutAnyOrigin],
     ref hist: List[Float64],
+    ref tprev: List[Float64],
+    ref a_qa: List[Int],
     aug: Pointer[Scalar[DT], MutAnyOrigin],
 ):
-    """The policy's observation: each lane's env row, then its history."""
+    """The policy's observation: each lane's env row, then its history,
+    then (`TARGET_OBS`) its target's lead over the joints, `target - q`."""
     comptime W = ACT_HIST * ACT_DIM
-    comptime A = E_OBS + W
+    comptime A = E_OBS + W + TARGET_OBS
     for e in range(N_ENVS):
         for k in range(E_OBS):
             aug[unsafe_offset = e * A + k] = raw[unsafe_offset = e * E_OBS + k]
         for k in range(W):
             aug[unsafe_offset = e * A + E_OBS + k] = Scalar[DT](hist[e * W + k])
+        comptime if TARGET_OBS > 0:
+            for j in range(ACT_DIM):
+                var q = Float64(raw[unsafe_offset = e * E_OBS + a_qa[j]])
+                aug[unsafe_offset = e * A + E_OBS + W + j] = Scalar[DT](
+                    tprev[e * ACT_DIM + j] - q
+                )
 
 
 def _bc_pretrain[OBS: Int](
@@ -380,7 +425,7 @@ def _bc_pretrain[OBS: Int](
     comptime MB = MINIBATCH
     comptime A2 = 2 * ACT_DIM
     comptime W = ACT_HIST * ACT_DIM
-    comptime E = OBS - W
+    comptime E = OBS - W - TARGET_OBS
     var X = List[Scalar[DT]]()
     var Y = List[Scalar[DT]]()
     var n_rows = 0
@@ -404,6 +449,8 @@ def _bc_pretrain[OBS: Int](
                     X.append(Scalar[DT](d.obs[r * E + k]))
                 for k in range(W):
                     X.append(Scalar[DT](hist[k]))
+                for _ in range(TARGET_OBS):
+                    X.append(Scalar[DT](0))
                 var lab = List[Float64](length=ACT_DIM, fill=0.0)
                 for j in range(ACT_DIM):
                     var a = Float64(d.act[r * ACT_DIM + j])
@@ -522,7 +569,7 @@ def run_ppo[M: ModelDefLike, C: Phyics3dEnvConfig](
 ) raises:
     comptime E_OBS = OBS_DIM[M, C]
     """The env's observation words; the policy's `OBS` adds the history."""
-    comptime OBS = E_OBS + ACT_HIST * ACT_DIM
+    comptime OBS = E_OBS + ACT_HIST * ACT_DIM + TARGET_OBS
     comptime assert N_ENVS * ROLLOUT % N_MINIBATCHES == 0
     comptime assert ACT_DIM == DELTA_ACT, "the delta action is six words"
 
@@ -585,15 +632,28 @@ def run_ppo[M: ModelDefLike, C: Phyics3dEnvConfig](
     # rigid desk absorbs the push; on the real arm it drove into the desk and
     # rocked the clamped tower.
     var dive_w = Float64(_arg(args, "--dive-penalty", "0"))
-    if action_mode != "absolute" and action_mode != "delta":
-        raise Error("ppo task: --action absolute|delta, got " + action_mode)
+    # `--target-lead L` (`--action target`): the target stays within L rad of
+    # the measured joint (`delta_action.target_step`); 0 = unbounded
+    var target_lead = Float64(_arg(args, "--target-lead", "0"))
+    if action_mode != "absolute" and action_mode != "delta" and action_mode != "target":
+        raise Error("ppo task: --action absolute|delta|target, got " + action_mode)
+    # a per-step action (`delta` or `target`): through `ServoLag`, held over
+    # `--repeat`, with the action history
+    var stepped = action_mode != "absolute"
+    if (action_mode == "target") != (TARGET_OBS > 0):
+        raise Error("ppo task: --action target needs -D TASK_PPO_TARGET_OBS"
+                    " and the define needs --action target (the target is"
+                    " hidden state the policy must see)")
+    if action_mode == "target" and bc_demos.byte_length() > 0:
+        raise Error("ppo task: --bc-demos labels absolute or delta actions,"
+                    " not --action target")
     if C.MAX_STEPS % repeat != 0:
         raise Error("ppo task: --repeat " + String(repeat) + " must divide the horizon "
                     + String(C.MAX_STEPS) + " (episodes end on a policy step)")
-    if repeat > 1 and action_mode != "delta":
-        raise Error("ppo task: --repeat is for --action delta")
-    if ACT_HIST > 0 and action_mode != "delta":
-        raise Error("ppo task: TASK_PPO_ACT_HIST is for --action delta")
+    if repeat > 1 and not stepped:
+        raise Error("ppo task: --repeat is for --action delta|target")
+    if ACT_HIST > 0 and not stepped:
+        raise Error("ppo task: TASK_PPO_ACT_HIST is for --action delta|target")
     if reward != "potential" and reward != "legacy":
         raise Error("ppo task: --reward potential|legacy, got " + reward)
     var rw = reward_mode_words(reward == "potential", bonus)
@@ -604,13 +664,15 @@ def run_ppo[M: ModelDefLike, C: Phyics3dEnvConfig](
     print("PPO on", family, "—", task)
     print("  lanes", N_ENVS, "| rollout", ROLLOUT, "| batch", N_ENVS * ROLLOUT,
           "| minibatch", MINIBATCH, "x", N_MINIBATCHES, "| epochs", N_EPOCHS)
-    print("  obs", OBS, "(env", E_OBS, "+ last", ACT_HIST, "actions) | act",
+    print("  obs", OBS, "(env", E_OBS, "+ last", ACT_HIST, "actions +",
+          TARGET_OBS, "target lead) | act",
           ACT_DIM, "| hidden", HIDDEN, "| horizon",
           C.MAX_STEPS)
     print("  steps", total_steps, "| lr", lr0, "| ent", ent0, "->", ent1,
           "over", anneal_steps, "steps | log_std init", log_std0)
     print("  reward", reward, "| success bonus", bonus, "| seed", seed,
-          "| action", action_mode, "| repeat", repeat, "ticks per policy step")
+          "| action", action_mode, "| repeat", repeat, "ticks per policy step",
+          "| target lead", target_lead)
     print("=" * 70)
 
     # ── the task's words (the eval's / the bench's set-up) ───────────────
@@ -675,6 +737,8 @@ def run_ppo[M: ModelDefLike, C: Phyics3dEnvConfig](
     logger.set_config("delta_arm", String(d_arm))
     logger.set_config("delta_gripper", String(d_grip))
     logger.set_config("act_hist", String(ACT_HIST))
+    logger.set_config("target_obs", String(TARGET_OBS))
+    logger.set_config("target_lead", String(target_lead))
     logger.set_config("repeat", String(repeat))
     logger.set_config("smooth_penalty", String(smooth_w))
     logger.set_config("dive_penalty", String(dive_w))
@@ -748,6 +812,8 @@ def run_ppo[M: ModelDefLike, C: Phyics3dEnvConfig](
         var rets = ctx.enqueue_create_host_buffer[DT](N_ENVS)
         var env_act = ctx.enqueue_create_host_buffer[DT](N_ENVS * ACT_DIM)
         var arm_q = List[Float64](length=N_ENVS * ACT_DIM, fill=0.0)
+        # `--action target`: each lane's last commanded target
+        var tprev = List[Float64](length=N_ENVS * ACT_DIM, fill=0.0)
         # the policy step's held targets, and per lane over its ticks: the
         # summed reward, whether it ended, its terminal observation
         var tg = List[Float64](length=N_ENVS * ACT_DIM, fill=0.0)
@@ -827,7 +893,8 @@ def run_ppo[M: ModelDefLike, C: Phyics3dEnvConfig](
             for j in range(ACT_DIM):
                 arm_q[e * ACT_DIM + j] = Float64(rp[unsafe_offset = e * E_OBS + a_qa[j]])
             _lag_reset(lag, arm_q, e)
-        _augment[E_OBS](rp, hist, mptr(aug.unsafe_ptr()))
+            _target_reset(tprev, arm_q, e)
+        _augment[E_OBS](rp, hist, tprev, a_qa, mptr(aug.unsafe_ptr()))
         obs_rms.update(mptr(aug.unsafe_ptr()), N_ENVS, OBS)
         obs_rms.normalize_into(mptr(aug.unsafe_ptr()), mptr(cur_n.unsafe_ptr()), N_ENVS, OBS, OBS_CLIP)
 
@@ -877,6 +944,11 @@ def run_ppo[M: ModelDefLike, C: Phyics3dEnvConfig](
                 _delta_targets(
                     mptr(act_h.unsafe_ptr()), tg, arm_q, a_lo, a_hi, d_arm, d_grip,
                 )
+            elif action_mode == "target":
+                _target_targets(
+                    mptr(act_h.unsafe_ptr()), tg, tprev, arm_q, a_lo, a_hi,
+                    d_arm, d_grip, target_lead,
+                )
             _hist_push(hist, mptr(act_h.unsafe_ptr()))
             # 2. `repeat` ticks under the held targets: per lane the summed
             # reward, the goal bit, and — for a lane that ends (or diverges)
@@ -888,7 +960,7 @@ def run_ppo[M: ModelDefLike, C: Phyics3dEnvConfig](
                 diverged[e] = False
             var n_bad = 0
             for tick in range(repeat):
-                if action_mode == "delta":
+                if stepped:
                     _targets_to_env(tg, mptr(env_act.unsafe_ptr()), a_lo, a_hi, lag)
                     ctx.enqueue_copy(act_dev, env_act)
                 else:
@@ -961,7 +1033,7 @@ def run_ppo[M: ModelDefLike, C: Phyics3dEnvConfig](
                     if dmac[e]:
                         for k in range(E_OBS):
                             raw_p[unsafe_offset = e * E_OBS + k] = term[e * E_OBS + k]
-            _augment[E_OBS](raw_p, hist, mptr(aug.unsafe_ptr()))
+            _augment[E_OBS](raw_p, hist, tprev, a_qa, mptr(aug.unsafe_ptr()))
             obs_rms.update(mptr(aug.unsafe_ptr()), N_ENVS, OBS, diverged)
             obs_rms.normalize_into(
                 mptr(aug.unsafe_ptr()), mptr(next_n.unsafe_ptr()), N_ENVS, OBS, OBS_CLIP,
@@ -1024,9 +1096,10 @@ def run_ppo[M: ModelDefLike, C: Phyics3dEnvConfig](
                     )
                 if dh2[unsafe_offset=e] > Scalar[DT](0.5):
                     _lag_reset(lag, arm_q, e)
+                    _target_reset(tprev, arm_q, e)
                     _hist_clear(hist, e)
                     has_prev[e] = False
-            _augment[E_OBS](rp2, hist, mptr(aug.unsafe_ptr()))
+            _augment[E_OBS](rp2, hist, tprev, a_qa, mptr(aug.unsafe_ptr()))
             obs_rms.normalize_into(
                 mptr(aug.unsafe_ptr()), mptr(cur_n.unsafe_ptr()), N_ENVS, OBS, OBS_CLIP,
             )
@@ -1138,8 +1211,9 @@ def run_ppo[M: ModelDefLike, C: Phyics3dEnvConfig](
                             )
                         if t == 0:
                             _lag_reset(lag, arm_q, e)
+                            _target_reset(tprev, arm_q, e)
                             _hist_clear(hist, e)
-                    _augment[E_OBS](rq, hist, mptr(aug.unsafe_ptr()))
+                    _augment[E_OBS](rq, hist, tprev, a_qa, mptr(aug.unsafe_ptr()))
                     obs_rms.normalize_into(
                         mptr(aug.unsafe_ptr()), mptr(cur_n.unsafe_ptr()), N_ENVS, OBS, OBS_CLIP
                     )
@@ -1151,8 +1225,13 @@ def run_ppo[M: ModelDefLike, C: Phyics3dEnvConfig](
                             mptr(act_h.unsafe_ptr()), tg, arm_q, a_lo, a_hi,
                             d_arm, d_grip,
                         )
+                    elif action_mode == "target":
+                        _target_targets(
+                            mptr(act_h.unsafe_ptr()), tg, tprev, arm_q, a_lo,
+                            a_hi, d_arm, d_grip, target_lead,
+                        )
                     _hist_push(hist, mptr(act_h.unsafe_ptr()))
-                if action_mode == "delta":
+                if stepped:
                     _targets_to_env(tg, mptr(env_act.unsafe_ptr()), a_lo, a_hi, lag)
                     ctx.enqueue_copy(act_dev, env_act)
                 else:

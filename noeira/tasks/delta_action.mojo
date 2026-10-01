@@ -16,9 +16,30 @@ and evaluated with it, and the REAL-ARM deploy
 it. A scale changed in one of them and not the others would send a policy's
 learned step size to a real arm at the wrong magnitude — silently, with the
 policy looking merely clumsy (`_a_rule_written_inline_twice_drifts`).
+
+THE TARGET ANCHOR (`--action target`, `target_step`) is SimToolReal's arm
+rule (`env.py` pre_physics_step, `useRelativeControl: False`): the same step,
+added to the PREVIOUS TARGET instead of the measured joint —
+
+    target_j = clamp(prev_j + a_j * scale_j, lo_j, hi_j)
+
+⚠ WHY. Anchored on `q`, a command reaches only one step past wherever the
+lagging servo happens to be, so the servo's delay and lag sit INSIDE the
+policy's loop: the lagged teachers plateaued at 30-44 % and one became
+lag-dependent (29 % with the lag, 1.4 % without). Anchored on the previous
+target, the target is a path the policy integrates itself, independent of the
+plant; a slow servo follows it behind. A sign flip undoes the last step
+instead of jumping the target 2 x scale around `q`. The target is then hidden
+state, so the policy must see it: `TARGET_OBS`.
+(SimToolReal's arm EMA of 0.1 on a previous-target anchor is algebraically a
+step gain of 0.1 — `prev + 0.1 (prev + d - prev)` — so it is not taken; the
+step scale is the knob. Their arm: 1.5 rad/s x dt x 0.1 = 0.15 rad/s max.)
+Only the PPO driver speaks it so far; the DAgger student and the deploys
+refuse a target-mode teacher until they do.
 """
 
 from std.math import exp
+from std.sys import is_defined
 from std.sys.defines import get_defined_int
 
 comptime DELTA_ARM: Float64 = 0.05
@@ -35,6 +56,15 @@ states alike in `q` / `qd` with different commands in flight need different
 actions, and the lagged teachers without it plateaued at 30-36 % greedy
 (1af8c0ed, 51a2e3bc) where the stiff sim reached 79.5 %. The real deploy
 knows what it sent. A BUILD CHOICE the checkpoints depend on."""
+comptime TARGET_OBS: Int = DELTA_ACT if is_defined["TASK_PPO_TARGET_OBS"]() else 0
+"""`-D TASK_PPO_TARGET_OBS`: a policy also sees its target's LEAD over the
+measured joints, `target_j - q_j` (6 words, model rad, after the action
+history; 0 at an episode's start). Required by `--action target`, whose
+target is state the policy integrates (SimToolReal's actor reads its
+`prev_action_targets`); the lead rather than the raw target because it is
+what the servo still has to travel — the commands in flight — and it
+normalises on its own scale instead of riding on `q`'s. A BUILD CHOICE the
+checkpoints depend on."""
 
 
 @always_inline
@@ -60,6 +90,35 @@ def delta_target(
         return lo
     if t > hi:
         return hi
+    return t
+
+
+@always_inline
+def target_step(
+    prev: Float64, q: Float64, a: Float64, j: Int, lo: Float64, hi: Float64,
+    arm: Float64 = DELTA_ARM, gripper: Float64 = DELTA_GRIPPER,
+    lead: Float64 = 0.0,
+) -> Float64:
+    """`--action target`: the joint target for action word `a` from the
+    PREVIOUS target `prev` (see the module header), clamped to [lo, hi].
+
+    `lead` > 0 also keeps the target within `lead` rad of the measured `q`.
+    ⚠ WHY it exists: an integrated target is not tied to the arm, so an arm
+    held by the desk or the brick lets it run on, and a position servo then
+    pushes at full torque towards a target far past the obstacle — absorbed
+    by the sim's rigid desk, an overload on the real STS3215. 0 (the default,
+    SimToolReal's rule) leaves it unbounded; with it, `q` re-enters the rule
+    only at that bound."""
+    var t = delta_target(prev, a, j, lo, hi, arm, gripper)
+    if lead > 0.0:
+        if t > q + lead:
+            t = q + lead
+        elif t < q - lead:
+            t = q - lead
+        if t < lo:
+            t = lo
+        elif t > hi:
+            t = hi
     return t
 
 
