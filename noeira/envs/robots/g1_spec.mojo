@@ -58,7 +58,7 @@ from std.math import acos, sqrt
 from std.builtin.sort import sort
 
 from noeira.core.bytes import string_from_bytes
-from noeira.io.fileio import read_file_bytes, write_file_atomic
+from noeira.io.fileio import read_file_bytes, write_file_atomic, write_text_atomic
 from noeira.ai.jev import JevQuestions, JevAnswers
 from noeira.envs.robots.g1_command_bank import G1CommandBank
 from noeira.envs.robots.g1_reward_vocab import (
@@ -889,3 +889,161 @@ def g1_spec_describe(ref terms: List[G1Term], n_scaffold: Int) -> String:
         if terms[t].op == OP_BAND:
             out += String(" (band)")
     return out
+
+
+# ── promotion: a spec that got used becomes a candidate bank entry ────────
+#
+# ⚠ WHY THIS EXISTS, AND WHAT IT IS NOT. A novel `z` is a BASELINE: the two
+# online gates say the reward has support in the data and is not a restatement
+# of a bank entry, and that is all they say. Each of the bank's 20 commands
+# additionally got **128 CEM rollouts**, worth 37-49 % on a single command
+# (§12.46, §12.49), and the builder's own note is that CEM "is what removes
+# the residual motion a prompt alone leaves" — §12.51's gated arm poses still
+# held at 0.38 m/s before it. The first live session saw exactly that: "it was
+# not completely stable, but still it's a right foot in the air."
+#
+# So the wobble is the CEM gap, and CEM is 128 rollouts of 150 steps — minutes,
+# not milliseconds. It cannot run in a conversation. Promotion is therefore
+# **a batch job over a text file**: the demo records what it ran, and
+# `bfm_zero_bank_build.mojo --promote` puts those specs through the SAME four
+# gates as every hand-written entry and appends the survivors to the bank.
+#
+# ⚠ THE SAME FOUR GATES, NOT A RELAXED SET. A promoted entry that skipped the
+# scaffold-control arm or the hold would be a bank row with none of the
+# properties a bank row is relied on for, and `g1_decide` offers every entry
+# to the model as though they were equivalent.
+
+
+def g1_spec_group(ref terms: List[G1Term], n_scaffold: Int) -> String:
+    """The bank `group` a spec belongs in, from its goal quantities.
+
+    ⚠ IT IS NOT COSMETIC. The viewer's locomotion timeout reads
+    `bank.group_at(cur)`, because locomotion has no natural end while a
+    posture holds itself — `walk` walks for ever. A spec whose goal is a
+    speed or a yaw rate must be marked `locomotion` or a promoted "walk
+    faster" would never stop.
+    """
+    for t in range(n_scaffold, len(terms)):
+        var q = terms[t].q
+        if (q == QV_SPEED_FWD or q == QV_SPEED_LAT or q == QV_YAW_RATE):
+            return String("locomotion")
+    for t in range(n_scaffold, len(terms)):
+        var q = terms[t].q
+        if (q == QV_LHAND_H or q == QV_RHAND_H or q == QV_LHAND_LAT
+            or q == QV_RHAND_LAT):
+            return String("arms")
+    for t in range(n_scaffold, len(terms)):
+        if terms[t].q == QV_TORSO_YAW:
+            return String("torso")
+    return String("posture")
+
+
+def g1_spec_suggest_name(ref terms: List[G1Term], n_scaffold: Int) -> String:
+    """A bank name derived from the goal terms.
+
+    ⚠ MECHANICAL AND UGLY ON PURPOSE. `right_foot_height_high` is not what a
+    person would call it, and that is the point: the candidate file is TEXT,
+    the operator renames it before promoting, and a name invented by this
+    function cannot quietly disagree with the terms it was derived from. The
+    bank's `describe` is generated from the compound for the same reason.
+    """
+    var out = String("")
+    for t in range(n_scaffold, len(terms)):
+        if out.byte_length() > 0:
+            out += String("_")
+        out += g1_vocab_name(terms[t].q)
+        out += String("_hi") if terms[t].op == OP_GT else String("_lo")
+    return out if out.byte_length() > 0 else String("unnamed")
+
+
+def g1_spec_record(
+    path: String,
+    ref pool: G1Pool,
+    ref terms: List[G1Term],
+    n_scaffold: Int,
+) raises -> Bool:
+    """Append this spec to the candidate file. False if it was already there.
+
+    ⚠ DEDUPLICATED BY THE GOAL KEY, not by the name or the thresholds. The
+    same instruction said three times in a session is one candidate; and two
+    phrasings that resolve to the same goal terms are the same candidate,
+    which is the same key the duplicate test uses against the bank.
+
+    ⚠ IT RECORDS WHAT WAS RUN, not what was asked. The instruction is a
+    comment; the terms are the record. A spec is reproducible from its terms
+    and not from the sentence that produced it — the sentence went through a
+    model whose answer can move between runs (§12.59 measured `regarde à
+    gauche` returning a different quantity on two consecutive calls).
+    """
+    var key = g1_spec_goal_key(pool, terms, n_scaffold)
+    var prev = String("")
+    try:
+        prev = string_from_bytes(read_file_bytes(path))
+    except:
+        prev = String(
+            "# g1 reward-spec candidates — written by the demo, read by\n"
+            "# `bfm_zero_bank_build.mojo --promote`. Rename a `cand` line\n"
+            "# before promoting; `group` drives the locomotion timeout.\n"
+        )
+    if prev.find(String("# key ") + key + String("\n")) >= 0:
+        return False
+    var blk = String("\ncand ") + g1_spec_suggest_name(terms, n_scaffold) + "\n"
+    blk += String("# key ") + key + String("\n")
+    blk += String("group ") + g1_spec_group(terms, n_scaffold) + "\n"
+    blk += String("terms ") + String(len(terms)) + String("\n")
+    blk += String("goals ") + String(len(terms) - n_scaffold) + String("\n")
+    for t in range(len(terms)):
+        blk += String("term ") + String(terms[t].q) + String(" ") \
+               + String(terms[t].op) + String(" ") + String(terms[t].lo) \
+               + String(" ") + String(terms[t].hi) + String("\n")
+    write_text_atomic(path, prev + blk)
+    return True
+
+
+@fieldwise_init
+struct G1Candidate(Copyable, Movable):
+    var name: String
+    var group: String
+    var n_goal: Int
+    var terms: List[G1Term]
+
+
+def g1_spec_load_candidates(path: String) raises -> List[G1Candidate]:
+    """The candidate file, for the promoter."""
+    var out = List[G1Candidate]()
+    var txt = string_from_bytes(read_file_bytes(path))
+    var lines = txt.split("\n")
+    var name = String("")
+    var group = String("posture")
+    var n_goal = 0
+    var ts = List[G1Term]()
+    for i in range(len(lines)):
+        var l = String(lines[i])
+        if l.byte_length() == 0 or l.startswith("#"):
+            continue
+        var p = l.split(" ")
+        if l.startswith("cand "):
+            if name != "" and len(ts) > 0:
+                out.append(G1Candidate(name.copy(), group.copy(), n_goal,
+                                       ts.copy()))
+            name = String(p[1])
+            group = String("posture")
+            n_goal = 0
+            ts = List[G1Term]()
+        elif l.startswith("group ") and len(p) >= 2:
+            group = String(p[1])
+        elif l.startswith("goals ") and len(p) >= 2:
+            n_goal = atol(String(p[1]))
+        elif l.startswith("term ") and len(p) >= 5:
+            ts.append(G1Term(atol(String(p[1])), atol(String(p[2])),
+                             Float64(String(p[3])), Float64(String(p[4])),
+                             False))
+    if name != "" and len(ts) > 0:
+        out.append(G1Candidate(name^, group^, n_goal, ts^))
+    # ⚠ a candidate with no goal terms would be gated against its own
+    # scaffold and pass vacuously — §12.51's control arm, as a refusal.
+    var kept = List[G1Candidate]()
+    for i in range(len(out)):
+        if out[i].n_goal > 0:
+            kept.append(out[i].copy())
+    return kept^

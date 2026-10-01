@@ -70,7 +70,8 @@ from noeira.envs.robots.g1_command_language import (
 )
 from noeira.envs.robots.g1_spec import (
     G1Pool, g1_spec_questions, g1_spec_from_answers, g1_spec_admit,
-    g1_spec_bank_baseline, g1_spec_describe, g1_spec_prompt, G1_SPEC_D,
+    g1_spec_bank_baseline, g1_spec_describe, g1_spec_prompt, g1_spec_record,
+    G1_SPEC_D,
 )
 # ⚠ module scope — Mojo rejects an import inside a branch. Importing costs
 # nothing; only `SpeechToText.huggingface()` needs HF_TOKEN, so `--text`
@@ -141,6 +142,7 @@ def main() raises:
     # 70 MB sidecar is read only after a miss, and the second Jev call costs
     # ~350 ms, which is imperceptible after someone has stopped speaking.
     var pool_path = _flag(String("--pool"), String(""))
+    var cand_path = _flag(String("--candidates"), String("g1_spec_candidates.txt"))
     var no_warn = _has(String("--spec-no-warn"))
     # ⚠ THE BAR IS P(none), NOT THE TOP-1 CONFIDENCE, and that is a measured
     # correction. "crouch down low" returned `crouch` at 0.56 with `squat` at
@@ -388,6 +390,12 @@ def main() raises:
             if dry:
                 print("dry run — would send a NOVEL z (", label, ")")
                 return
+            # ⚠ RECORD WHAT WAS RUN, so it can be CEM'd offline and
+            # promoted. A novel latent is a baseline; the bank's rows each had
+            # 128 rollouts of search, which is why this one wobbles.
+            if cand_path != "":
+                if g1_spec_record(cand_path, pool, terms, n_scaf):
+                    print("  recorded a candidate in", cand_path)
             var sq3 = g1_channel_seq(chan_path) + 1
             if sq3 < 1:
                 sq3 = 1

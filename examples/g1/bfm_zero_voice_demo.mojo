@@ -95,7 +95,7 @@ from noeira.ai.jev import JevClient
 from noeira.ai.speech import SpeechToText, STT_RAW
 from noeira.envs.robots.g1_spec import (
     G1Pool, g1_spec_questions, g1_spec_from_answers, g1_spec_admit,
-    g1_spec_bank_baseline, g1_spec_describe, g1_spec_prompt,
+    g1_spec_bank_baseline, g1_spec_describe, g1_spec_prompt, g1_spec_record,
 )
 from noeira.envs.robots.g1_reward_vocab import G1Term
 from noeira.envs.robots.g1_command_language import (
@@ -611,6 +611,8 @@ def main() raises:
     var chat_dl = Float64(String(_flag(String("--chat-deadline"),
                                        String(CHAT_DEADLINE_S))))
     var spec_pool_path = _flag(String("--pool"), String(""))
+    var cand_path = _flag(String("--candidates"),
+                          String("g1_spec_candidates.txt"))
     var has_pool = spec_pool_path != ""
     var pool = G1Pool(1, List[Float64](length=D, fill=0.0),
                       List[Float64](length=G1_NVOC, fill=0.0))
@@ -1062,6 +1064,19 @@ def main() raises:
                         # `step_done` false for ever, and the timeout
                         # condition also reads it — so the NEXT `walk` would
                         # never end either. One flag, one meaning.
+                        # ⚠ RECORD IT FOR OFFLINE PROMOTION. This is the
+                        # only place a novel spec is known to have actually
+                        # RUN, which is the signal worth recording — a spec
+                        # that was refused is not a candidate.
+                        if cand_path != "":
+                            try:
+                                if g1_spec_record(cand_path, pool, sterms,
+                                                  n_scaf):
+                                    print("  [spec] recorded a candidate")
+                            except:
+                                # a demo does not stop because a text file
+                                # could not be written
+                                pass
                         spec_active = True
                         # a chain queued by an earlier utterance is not what
                         # the robot was just asked for

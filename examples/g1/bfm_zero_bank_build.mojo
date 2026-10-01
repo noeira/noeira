@@ -62,7 +62,8 @@ from noeira.core.cont_action import ContAction
 from noeira.data.store import TrajectoryStore
 from noeira.deep_agents.fb.trainer import FBTrainer
 from noeira.deep_agents.fb.obs_norm import ObsNorm
-from noeira.io.fileio import write_text_atomic
+from noeira.io.fileio import write_text_atomic, read_file_bytes
+from noeira.core.bytes import string_from_bytes
 from noeira.deep_agents.fb.z_sampler import z_from_reward
 from noeira.deep_agents.fb.bfm_towers import (
     BFMFTower, BFMActorTowerFiltered, BFMBNetFiltered,
@@ -78,6 +79,9 @@ from noeira.envs.robots.unitree_g1_xml import (
 )
 from noeira.envs.robots.g1_tracking_eval import (
     G1_D, G1_H, G1_L, G1_HB, g1_project_z,
+)
+from noeira.envs.robots.g1_spec import (
+    G1Pool, g1_spec_load_candidates,
 )
 from noeira.envs.robots.g1_reward_vocab import (
     G1_NVOC, G1Term, g1_quantities, g1_vocab_name, g1_term_value,
@@ -104,6 +108,14 @@ comptime ANet = BFMActorTowerFiltered[
     OBS, UNITREE_G1_STATE_DIM, G1_ACTOR_EXTRA, D, G1_H, G1_L, ACT
 ]
 comptime Trainer = FBTrainer[FNet, BNet, ANet, OBS, ACT, D, BATCH, "cpu"]
+
+
+def _has(name: String) -> Bool:
+    var av = argv()
+    for i in range(len(av)):
+        if String(av[i]) == name:
+            return True
+    return False
 
 
 def _flag(name: String, dflt: String) raises -> String:
@@ -345,6 +357,14 @@ def main() raises:
     # entry cost 25 minutes a try without it, which is how a threshold ends
     # up tuned by patience rather than by evidence.
     var only = _flag(String("--only"), String(""))
+    # ⚠ PROMOTION RUNS THE SAME FOUR GATES AS EVERY HAND-WRITTEN ENTRY. A
+    # promoted row that skipped the scaffold-control arm or the hold would be
+    # a bank entry with none of the properties a bank entry is relied on for,
+    # and `g1_decide` offers them all to the model as equivalent. The only
+    # difference is where the terms came from.
+    var promote = _flag(String("--promote"), String(""))
+    # see the guards at the write site — this is the only way past them
+    var force_shrink = _has(String("--force-shrink"))
     if ckpt == "":
         raise Error("pass --ckpt <path/to/step_NNNN.ckpt>")
 
@@ -515,6 +535,33 @@ def main() raises:
     v.append(G1Term(QV_LHAND_LAT, OP_LT, 0.0, 0.25, True))
     v.append(G1Term(QV_RHAND_LAT, OP_LT, 0.0, 0.25, True))
     _add(names, groups, ngoal, terms, String("spin_arms_in"), String("combo"), 3, v)
+
+    # ── promoted candidates: the demo's own specs, same gates ─────────
+    # ⚠ APPENDED TO THE SAME LIST, so they go through G1 (pool support), G2
+    # (the scaffold-control arm), the CEM and G3 (the rollout hold) exactly
+    # as the hand-written entries above do. The ONLY difference is where the
+    # terms came from — which is the point: a promoted row has to earn its
+    # place, because `g1_decide` offers every bank entry to the model as
+    # though they were equivalent.
+    if promote != "":
+        var cands = g1_spec_load_candidates(promote)
+        print("  promoting", len(cands), "candidates from", promote)
+        for i in range(len(cands)):
+            # ⚠ a name that already exists would be a SECOND row with the
+            # same name, and `bank.find` returns the FIRST — so the robot
+            # would run whichever happened to be written first, silently.
+            var clash = False
+            for j in range(len(names)):
+                if names[j] == cands[i].name:
+                    clash = True
+            if clash:
+                print("    skipped `" + cands[i].name
+                      + "` — that name is already in the bank")
+                continue
+            print("    +", cands[i].name, "(", cands[i].group, ",",
+                  cands[i].n_goal, "goal terms )")
+            _add(names, groups, ngoal, terms, cands[i].name.copy(),
+                 cands[i].group.copy(), cands[i].n_goal, cands[i].terms)
 
     var ncmd = len(names)
     print("  ", ncmd, "candidate commands")
@@ -783,5 +830,40 @@ def main() raises:
     for i in range(NV):
         head += String(" ") + String(Float64(rsi.rows.data[start_row * (G1_RSI_NQ + G1_RSI_NV) + G1_RSI_NQ + i]))
     head += String("\n")
-    write_text_atomic(out_path, head + entries)
-    print("  wrote", out_path)
+    # ⚠⚠ THIS WRITE DESTROYED THE BANK ONCE AND MUST NOT BE ABLE TO AGAIN.
+    # `--only right_foot_height_hi --promote ...` evaluated ONE command, the
+    # other 23 were skipped, and the writer emitted only the accepted ones —
+    # so a 20-command bank gated at hold 1.000 was replaced by a 9-line file
+    # with NO entries. It was recoverable from git; the viewer, `g1say` and
+    # the probe all read this file, and `G1CommandBank.load` raises on no
+    # `count` header, so every one of them would have failed to start.
+    #
+    # Two guards, and the second is the one that generalises:
+    if only != "":
+        print("  NOT written —", out_path, "is unchanged. `--only` evaluates"
+              " ONE command, so writing would delete every other entry."
+              " Re-run without `--only` to rebuild the bank.")
+    else:
+        # ⚠ NEVER SHRINK SILENTLY. A rebuild that accepts fewer commands than
+        # the file already holds is far more likely to be a mistake (a bad
+        # flag, a missing artefact, a threshold typo) than an intention, and
+        # the cost of being wrong is asymmetric: a refused write loses a
+        # 25-minute run, an accepted one loses commands that took four gates
+        # each to earn.
+        var had = 0
+        try:
+            var prev = string_from_bytes(read_file_bytes(out_path))
+            var pls = prev.split("\n")
+            for i in range(len(pls)):
+                if String(pls[i]).startswith("name "):
+                    had += 1
+        except:
+            had = 0
+        if n_ok < had and not force_shrink:
+            print("  NOT written — this run accepted", n_ok,
+                  "commands and", out_path, "already holds", had,
+                  ". Refusing to shrink the bank; pass --force-shrink if that"
+                  " is really what you want.")
+        else:
+            write_text_atomic(out_path, head + entries)
+            print("  wrote", out_path, "—", n_ok, "commands (was", had, ")")
