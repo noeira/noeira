@@ -44,8 +44,9 @@ from noeira.tasks.pixel_student import (
     StudentNet, N_CAMS, IN_DIM, ACT, RENDER, OVERHEAD_RENDER_W,
     OVERHEAD_RENDER_H, OBS_PX, PLANE, check_pixel_manifest, render_to_planes,
     joints_to_planes, joint_vels_to_planes, HIST_WORDS, act_hist_to_planes,
-    camera_names,
+    camera_names, target_lead_to_planes,
 )
+from noeira.tasks.delta_action import TARGET_OBS
 from noeira.tasks.placement.so101_tower import So101TowerPlacement
 from noeira.tasks.posed_reset import posed_qpos
 from noeira.tasks.so101_tower_rig import (
@@ -165,6 +166,12 @@ def main() raises:
             q[j] = r[1 + j]
             qd[j] = r[7 + j]
             logged[j] = r[13 + j]
+        # target-mode builds: the commanded target's lead over the joints,
+        # from the logged target (a delta run's target is its step from q —
+        # the same value for the real and the sim inputs, which is the point)
+        var lead = List[Float64](length=TARGET_OBS, fill=0.0)
+        for j in range(TARGET_OBS):
+            lead[j] = r[19 + j] - q[j]
         var hist = List[Float64](length=HIST_WORDS, fill=0.0)
         for k in range(HIST_WORDS // ACT):
             var tt = t - 1 - k
@@ -249,24 +256,31 @@ def main() raises:
         joints_to_planes(q, xr)
         joint_vels_to_planes(qd, xr)
         act_hist_to_planes(hist, xr)
+        target_lead_to_planes(lead, xr)
         joints_to_planes(q, xsim)
         joint_vels_to_planes(qd, xsim)
         act_hist_to_planes(hist, xsim)
+        target_lead_to_planes(lead, xsim)
         joints_to_planes(q, xmo)
         joint_vels_to_planes(qd, xmo)
         act_hist_to_planes(hist, xmo)
+        target_lead_to_planes(lead, xmo)
         joints_to_planes(q, xmw)
         joint_vels_to_planes(qd, xmw)
         act_hist_to_planes(hist, xmw)
+        target_lead_to_planes(lead, xmw)
         joints_to_planes(q, xbg)
         joint_vels_to_planes(qd, xbg)
         act_hist_to_planes(hist, xbg)
+        target_lead_to_planes(lead, xbg)
         joints_to_planes(q, xwbg)
         joint_vels_to_planes(qd, xwbg)
         act_hist_to_planes(hist, xwbg)
+        target_lead_to_planes(lead, xwbg)
         joints_to_planes(q, xabg)
         joint_vels_to_planes(qd, xabg)
         act_hist_to_planes(hist, xabg)
+        target_lead_to_planes(lead, xabg)
         var ar = _forward(net, xr, x, y)
         var asim = _forward(net, xsim, x, y)
         var amo = _forward(net, xmo, x, y)
