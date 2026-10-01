@@ -29,7 +29,7 @@ from std.sys import argv
 
 from max.gpu.host import DeviceContext
 
-from noeira.io.png import load_png_file
+from noeira.io.png import load_png_file, save_png
 from noeira.nn.constants import DT
 from noeira.nn.core.checkpoint import load_params
 from noeira.nn.core.initializer import Kaiming
@@ -92,6 +92,9 @@ def main() raises:
     var rec = _arg(args, "--rec", "")
     var brick_xy = _arg(args, "--brick", "")
     var bowl_xy = _arg(args, "--bowl", "")
+    # --png DIR: the SIM policy views too (sim_<cam>_policy_view_<tick>.png,
+    # the deploy's x8 layout) — to lay beside the real ones
+    var png_dir = _arg(args, "--png", "")
     if rec.byte_length() == 0 or brick_xy.byte_length() == 0 or bowl_xy.byte_length() == 0:
         raise Error("usage: --ckpt C --rec DIR --brick x,y --bowl x,y")
     var man_path = String(ckpt[byte = 0 : ckpt.byte_length() - 5]) + ".norm.json"
@@ -197,7 +200,31 @@ def main() raises:
                 r_w.cam = cams[k]
                 r_w.render_cpu(rd, rm, rgb, dd, ss)
                 render_to_planes(rgb, RENDER, RENDER, k, xsim)
+        if png_dir.byte_length() > 0:
+            for k in range(N_CAMS):
+                comptime W = OBS_PX * S
+                var img = List[UInt8](length=W * W * 3, fill=UInt8(0))
+                for yy in range(W):
+                    for xx in range(W):
+                        for c in range(3):
+                            var v = Float64(xsim[(3 * k + c) * PLANE + (yy // S) * OBS_PX + xx // S]) + 0.5
+                            var b = Int(v * 255.0 + 0.5)
+                            img[(yy * W + xx) * 3 + c] = UInt8(max(0, min(255, b)))
+                save_png(png_dir + "/sim_" + names[k] + "_policy_view_" + String(t) + ".png", img, W, W, 3)
         # the mixes: one camera real, the other sim
+        # real-bg: the real overhead with the pixels the SIM renders as its
+        # backdrop (dark, blue over red: the purple off the desk) taken from
+        # the sim — the real floor and room around the desk swapped out
+        var xbg = xr.copy()
+        var n_bg = 0
+        for p in range(PLANE):
+            var sr = Float64(xsim[0 * PLANE + p])
+            var sg = Float64(xsim[1 * PLANE + p])
+            var sb = Float64(xsim[2 * PLANE + p])
+            if sb > sr + 0.05 and sr < -0.05 and sg < 0.0:
+                n_bg += 1
+                for c in range(3):
+                    xbg[c * PLANE + p] = xsim[c * PLANE + p]
         var xmo = xsim.copy()
         var xmw = xsim.copy()
         for i in range(3 * PLANE):
@@ -215,10 +242,14 @@ def main() raises:
         joints_to_planes(q, xmw)
         joint_vels_to_planes(qd, xmw)
         act_hist_to_planes(hist, xmw)
+        joints_to_planes(q, xbg)
+        joint_vels_to_planes(qd, xbg)
+        act_hist_to_planes(hist, xbg)
         var ar = _forward(net, xr, x, y)
         var asim = _forward(net, xsim, x, y)
         var amo = _forward(net, xmo, x, y)
         var amw = _forward(net, xmw, x, y)
+        var abg = _forward(net, xbg, x, y)
         var d = 0.0
         for j in range(ACT):
             d += abs(ar[j] - asim[j])
@@ -232,6 +263,7 @@ def main() raises:
         print(_line("sim    ", asim))
         print(_line("real-o ", amo))
         print(_line("real-w ", amw))
+        print(_line("real-bg", abg) + "   (" + String(n_bg) + " backdrop px swapped)")
         t += 16
     if n_cmp > 0:
         print("replay: mean |real - sim| over", n_cmp, "ticks:", sum_rs / Float64(n_cmp))
