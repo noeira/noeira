@@ -100,8 +100,11 @@ struct _NamedImportVisitor(ParamVisitor):
         for i in range(N):
             param.data[i] = vals[i]
         param.n = N
+        # Advance `version` so `Linear`'s version-gated `w_pad` / `w_bf` pick
+        # up the new weight (see `_LoadVisitor` in trainer.mojo).
+        param.version += 1
         comptime if target == "gpu":
-            param.upload(ctx.value())
+            param.upload_resident(ctx.value())
 
 
 struct LeWMPredictor[

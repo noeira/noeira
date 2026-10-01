@@ -331,6 +331,8 @@ test-io = { cmd = "bash scripts/run_tests.sh tests/manifests/io.txt", descriptio
 test-vision = { cmd = "bash scripts/run_tests.sh tests/manifests/vision.txt", depends-on = ["build-opencv"], description = "The vision gates (OpenCV shim, calibration, capture) — needs the OpenCV shim, so not in test-smoke" }
 test-swm = { cmd = "bash scripts/run_tests.sh tests/manifests/swm.txt", description = "SWM-H sheaf world model gates (experimental, CPU)" }
 test-fb = { cmd = "bash scripts/run_tests.sh tests/manifests/fb.txt", description = "Forward-Backward zero-shot RL gates (CPU; docs/BFM_ZERO_SHOT_RL.md)" }
+test-lewm = { cmd = "bash scripts/run_tests.sh tests/manifests/lewm.txt", description = "LeWorldModel port self-consistency (experimental, CPU, toy dims)" }
+test-lewm-gpu = { cmd = "bash scripts/run_tests.sh tests/manifests/lewm-gpu.txt", description = "LeWorldModel port GPU paths, toy dims (needs -e apple or -e nvidia)" }
 test-concurrent = { cmd = "bash scripts/run_tests.sh tests/manifests/concurrent.txt", description = "Concurrency backbone (noeira/core/concurrent): pthread, SPSC ring, atomic cells" }
 # Format interop: our safetensors reader/writer against the REFERENCE library,
 # and the Hub's ImageNet ResNet18 against torchvision's. Needs `-e act-ref`

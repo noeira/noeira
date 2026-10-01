@@ -325,8 +325,13 @@ struct _LoadVisitor(ParamVisitor):
             param.data[i] = self.vals[self.idx]
             self.idx += 1
         param.n = N
+        # A restored weight must advance `version`, or `Linear`'s version-gated
+        # `w_pad` / `w_bf` keep serving the pre-restore weight (same rule as
+        # `BinaryCheckpointReader`). `upload_resident`, not `upload`: `upload`
+        # recreates the buffer and would detach a param from an adopted arena.
+        param.version += 1
         comptime if target == "gpu":
-            param.upload(ctx.value())
+            param.upload_resident(ctx.value())
 
 
 struct _NamedExportVisitor(ParamVisitor):

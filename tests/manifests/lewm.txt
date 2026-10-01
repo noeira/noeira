@@ -1,0 +1,24 @@
+# LeWM manifest — `pixi run test-lewm`
+#
+# LeWorldModel port (noeira/experimental/lewm/, docs/LEWM_REOPEN_PLAN.md).
+# CPU, toy dims, no dataset and no checkpoint on disk. These are the
+# port's own consistency checks (plumbing, checkpoints, masks, protocol
+# wiring) — NOT reference parity. The torch-parity gates of P2 go in
+# lewm-ref.txt. GPU tests live in lewm-gpu.txt.
+tests/experimental/lewm/lewm/test_loss_graph_smoke.mojo
+tests/experimental/lewm/lewm/test_nets_smoke.mojo
+tests/experimental/lewm/lewm/test_trainer.mojo
+tests/experimental/lewm/lewm/test_trainer_cls.mojo
+tests/experimental/lewm/lewm/test_overfit.mojo
+tests/experimental/lewm/lewm/test_ckpt_v3.mojo
+tests/experimental/lewm/lewm/test_tta_mask.mojo
+tests/experimental/lewm/lewm/test_tta_buffer.mojo
+tests/experimental/lewm/lewm/test_predict_consistency.mojo
+tests/experimental/lewm/lewm/test_eval.mojo
+tests/experimental/lewm/lewm/test_shuffled_eval.mojo
+tests/experimental/lewm/lewm/test_mpc.mojo
+tests/experimental/lewm/lewm/test_mpc_continuous.mojo
+tests/experimental/lewm/lewm/test_online_sampler.mojo
+tests/experimental/lewm/lewm/test_pusht_sim_bridge.mojo
+tests/experimental/lewm/lewm/test_pong_data.mojo
+tests/experimental/lewm/test_pong_buffer.mojo

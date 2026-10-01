@@ -139,6 +139,7 @@ def main() raises:
     tr.graph.set_node_attr["sig", "resample"](Scalar[DT](0.0))
     print("checkpoint round-trip ...")
     var lA = tr.eval_loss(pix_t, act_t)
+    var snap = tr.snapshot_all()
     tr.save_params(String("/tmp/lewm_ckpt_gpu.txt"))
     for _ in range(10):
         _ = tr.train_step(pix_t, act_t)
@@ -150,6 +151,22 @@ def main() raises:
                 "training should perturb the eval loss (sanity)")
     assert_true((lA3 - lA).__abs__() < Scalar[DT](1e-4),
                 "load_params must restore the saved model exactly")
+
+    # `restore_all` (the AdaJEPA per-episode reset) after more training. A
+    # restored weight that does not advance `param.version` leaves `Linear`'s
+    # GPU padded-weight cache on the PERTURBED weight: the device values match
+    # the snapshot bit for bit and the forward still differs. The forward
+    # BEFORE the restore matters: it re-pads at the current version, so a
+    # restore that does not bump is never re-padded. Without it the Adam step's
+    # own bump hides the bug (plan -> reset is the AdaJEPA episode shape).
+    for _ in range(10):
+        _ = tr.train_step(pix_t, act_t)
+    _ = tr.eval_loss(pix_t, act_t)
+    tr.restore_all(snap)
+    var lA4 = tr.eval_loss(pix_t, act_t)
+    print("   restore_all after training=", lA4)
+    assert_true((lA4 - lA).__abs__() < Scalar[DT](1e-4),
+                "restore_all must restore the snapshot exactly")
 
     _ = tr^
     print("=" * 70)
