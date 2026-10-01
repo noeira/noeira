@@ -93,7 +93,7 @@ from noeira.tasks.ppo_family_driver import (
     _delta_to_env, _arg, _lag_reset, _augment, _hist_push, _hist_clear,
     _delta_targets, _targets_to_env,
 )
-from noeira.tasks.delta_action import ServoLag, DELTA_ARM, DELTA_GRIPPER
+from noeira.tasks.delta_action import ServoLag, DELTA_ARM, DELTA_GRIPPER, TARGET_OBS
 from noeira.tasks.shaping import reward_mode_words
 from noeira.tasks.so101_tower_rig import (
     RIG_DT, TOWER_MD, TowerRendererSized, make_tower_model,
@@ -518,6 +518,10 @@ struct PixelObs(Movable):
 
 
 def run_pixel_dagger(args: List[String], driver: String) raises:
+    # the teacher's observation is built with no target-lead words (the
+    # trainer refuses a target-mode teacher): a TARGET_OBS build would widen
+    # the teacher's input with words this trainer never fills
+    comptime assert TARGET_OBS == 0, "pixel dagger: build without -D TASK_PPO_TARGET_OBS"
     comptime assert ACT == ACT_DIM, "the student acts in the teacher's space"
     # ── flags ────────────────────────────────────────────────────────────
     var task = String("so101_tower_lift_real_layout")
