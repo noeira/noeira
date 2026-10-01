@@ -93,6 +93,11 @@ from noeira.ai.audio_io import MicCapture, rms
 from noeira.io.wav import WavAudio
 from noeira.ai.jev import JevClient
 from noeira.ai.speech import SpeechToText, STT_RAW
+from noeira.envs.robots.g1_spec import (
+    G1Pool, g1_spec_questions, g1_spec_from_answers, g1_spec_admit,
+    g1_spec_bank_baseline, g1_spec_describe,
+)
+from noeira.envs.robots.g1_reward_vocab import G1Term
 from noeira.envs.robots.g1_command_language import (
     g1_command_questions, g1_decide, G1LangPick, g1_command_phrase,
     g1_decide_chain, g1_extent_metres, g1_extent_seconds, G1_Q_EXTENT,
@@ -119,6 +124,11 @@ comptime ST_REC: Int = 1
 comptime ST_STT: Int = 2
 comptime ST_JEV: Int = 3
 comptime ST_CHAT: Int = 4
+# ⚠ THE CACHE MISS GETS ITS OWN STATE, because it is a SECOND round trip and
+# the loop cannot block for it any more than for the first. `P(none)` over
+# the bank is a calibrated miss (§10.2); this is where the instruction gets a
+# reward spec instead of a name.
+comptime ST_SPEC: Int = 5
 
 # ⚠ A 4 s WINDOW DOES NOT CAPTURE 4 s. Measured: a 4.0 s recording arrived as
 # 56 832 samples — 3.55 s — and Whisper returned "Lève les brl'air" for
@@ -544,6 +554,33 @@ def main() raises:
     var t_cmd = perf_counter_ns()
     var prev_key = False
 
+    # ── the cache-miss path, loaded up front ──────────────────────────
+    # ⚠ AT STARTUP, NOT LAZILY. The sidecar is 70 MB and `G1Pool.__init__`
+    # sorts 14 columns of 65 536; doing that on the first miss would freeze
+    # the render loop — and with it the physics step — for about a second,
+    # mid-demo. The demo already opens a 640 MB checkpoint, so one more read
+    # here is invisible where a hitch would not be.
+    #
+    # ⚠ AND THE BANK BASELINES ARE PRECOMPUTED. They never change, and
+    # recomputing all 20 per miss would cost 20 passes over the pool — about
+    # a second. Precomputed, a miss costs ONE pass (~30 ms, one dropped
+    # frame) plus 20 dot products.
+    var spec_pool_path = _flag(String("--pool"), String(""))
+    var has_pool = spec_pool_path != ""
+    var pool = G1Pool(1, List[Float64](length=D, fill=0.0),
+                      List[Float64](length=G1_NVOC, fill=0.0))
+    var zbase = List[Float64]()
+    if has_pool:
+        pool = G1Pool.load(spec_pool_path)
+        zbase = List[Float64](length=bank.count() * D, fill=0.0)
+        g1_spec_bank_baseline(pool, bank, zbase)
+        print("  spec path: ON —", pool.n, "pool rows from", spec_pool_path)
+    else:
+        print("  spec path: off (pass --pool g1_pool.bin to answer commands",
+              "the bank has no name for)")
+    var spec_q = g1_spec_questions(True)
+    var znew = List[Float64](length=D, fill=0.0)
+
     var chan = G1CommandChannel(chan_path)
     # ⚠ WHAT THE ROBOT IS DOING, SO THE NEXT SENTENCE CAN BE RELATIVE TO IT.
     # Without this the demo sent Jev the transcript alone, and "plus vite"
@@ -849,8 +886,21 @@ def main() raises:
                     state = ST_CHAT
                 else:
                     last_event = String("refused: ") + pick.reason
-                    print("  [refused]", pick.reason, " P(none)",
-                          _f2(pick.p_none), " addressed", _f2(pick.addressed))
+                    # ⚠ A REFUSAL FOR `no such command` IS A CACHE MISS.
+                    # The bank has no NAME for this; the reward vocabulary may
+                    # still be able to say it (§12.60). Any other reason —
+                    # not addressed, no clear pick — is a real refusal and
+                    # must not be routed here, or background speech would
+                    # start generating latents.
+                    if has_pool and pick.reason == "no such command":
+                        print("  [miss] P(none)", _f2(pick.p_none),
+                              "— no name for this; asking for a reward spec")
+                        jev.start(g1_command_state(heard, ctx), spec_q)
+                        state = ST_SPEC
+                    else:
+                        print("  [refused]", pick.reason, " P(none)",
+                              _f2(pick.p_none), " addressed",
+                              _f2(pick.addressed))
                     # ⚠ A SPOKEN REFUSAL IS THE WORST THING TO SAY ALOUD.
                     # "no such command" is heard, transcribed, and refused
                     # again — the loop that filled a whole session's log. The
@@ -861,6 +911,63 @@ def main() raises:
                 # the reply on the floor — the request would run to
                 # completion and nothing would ever read it.
                 if state == ST_JEV:
+                    state = ST_IDLE
+
+        elif state == ST_SPEC:
+            if jev.poll():
+                var sa = jev.result()
+                var sterms = List[G1Term]()
+                var n_scaf = g1_spec_from_answers(sa, pool, bank, sterms)
+                if n_scaf < 0:
+                    print("  [spec] the model named no quantity — nothing done")
+                    state = ST_IDLE
+                else:
+                    var v = g1_spec_admit(pool, bank, zbase, sterms, znew,
+                                          n_scaf)
+                    var what = g1_spec_describe(sterms, n_scaf)
+                    print("  [spec]", what, " ESS", Int(v.ess))
+                    if v.ok:
+                        # ⚠ BLEND FROM WHERE WE ARE, like every other path:
+                        # a novel `z` has no bank index, so `cur` stays put
+                        # and `pending` is NOT set. `cur` is what the HUD,
+                        # the keys and the context read as "running now", and
+                        # pointing it at a stale entry would make the next
+                        # "plus vite" resolve against the wrong command.
+                        for k in range(D):
+                            zpair.data[k] = zcur.data[k]
+                            zpair.data[D + k] = Scalar[DT](znew[k])
+                        blend_len = 25
+                        blend_left = blend_len
+                        ctx.began(String("spec"))
+                        t_cmd = perf_counter_ns()
+                        last_event = String("spec: ") + what
+                        # ⚠ a novel command has no phrase in the table, so
+                        # the robot says the QUANTITY it is about to move.
+                        # Silence here reads as "it did not understand".
+                        if not mute:
+                            # ⚠ a novel command has no phrase in the table,
+                            # so the robot says the QUANTITY it is about to
+                            # move. Silence here reads as "it did not
+                            # understand", which is the opposite of true.
+                            _say_async(String("ok, ") + what)
+                            mute_until = perf_counter_ns() + _ns(ECHO_TAIL_S)
+                    elif v.nearest >= 0:
+                        # the spec IS a bank entry: run the GATED row, which
+                        # went through four gates and a CEM refinement this
+                        # baseline has not.
+                        print("   ", v.reason)
+                        pending = v.nearest
+                        pending_blend = 25
+                        last_event = String("spec->") + bank.name_at(v.nearest)
+                        if not mute:
+                            var u3 = g1_command_phrase(bank.name_at(v.nearest))
+                            for pi in range(len(ph_name)):
+                                if ph_name[pi] == bank.name_at(v.nearest):
+                                    u3 = ph_text[pi]
+                            _say_async(u3)
+                            mute_until = perf_counter_ns() + _ns(ECHO_TAIL_S)
+                    else:
+                        print("  [spec] REFUSED:", v.reason)
                     state = ST_IDLE
 
         elif state == ST_CHAT:
