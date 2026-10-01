@@ -282,7 +282,9 @@ def main() raises:
             var rt = String("")
             for j in range(ACT):
                 var tgt = lag.apply(0, j, tgt_hold[j])
-                rt += "," + String(tgt)
+                # the COMMANDED target, as the deploy's --record logs it (the
+                # lagged one is what the actuator gets)
+                rt += "," + String(tgt_hold[j])
                 if tgt <= lo[j] or tgt >= hi[j]:
                     at_lim += 1
                 var mid = 0.5 * (lo[j] + hi[j])

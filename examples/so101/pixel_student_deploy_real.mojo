@@ -45,6 +45,11 @@ found so, a UVC camera may drop to ~10 fps to lengthen its exposure as the
 room dims — runs then saw 2 / 3 of their frames STALE and the student, acting
 on an image ~100 ms behind the arm, overshot the pan and closed beside the
 cube, 1 Oct; the run with 8 % stale frames grasped),
+--play-targets SIM_CSV OUT_CSV (with --arm: NO policy, NO cameras used —
+the commanded targets of a sim probe rollout, `pixel_student_probe_sim.mojo
+--record` episode 0's tgt0..5, played tick by tick from the start pose; OUT
+gets the real joints beside the sim's: does the real arm follow the path the
+sim arm took under the SAME commands? The dive guard stays on),
 --sysid FILE (with --arm: NO policy — each joint in turn steps +A, back, -A,
 back from the sim's start pose, 0.8 s per step, A 0.1 rad / 0.3 gripper; the
 per-tick targets and joints go to FILE, the servos' delay and time constant
@@ -298,6 +303,12 @@ def main() raises:
     var force_dark = _flag(args, "--force-dark")
     var rec_dir = _arg(args, "--record", "")
     var sysid = _arg(args, "--sysid", "")
+    var play_in = String("")
+    var play_out = String("")
+    for i in range(len(args) - 2):
+        if args[i] == "--play-targets":
+            play_in = args[i + 1]
+            play_out = args[i + 2]
     var grip_off = Float64(_arg(args, "--grip-offset", "0"))
     var keep_dyn_fps = _flag(args, "--keep-dynamic-fps")
     # --act-ema A: each ARM action word executed as (1 - A) new + A previous
@@ -567,6 +578,82 @@ def main() raises:
     else:
         print("dry run — nothing energised\n")
 
+    var dive_ticks = 0
+    # ── --play-targets: a sim rollout's commands on the real arm ─────────
+    if play_in.byte_length() > 0:
+        if not arm_it:
+            raise Error("pixel deploy: --play-targets moves the arm; it needs --arm")
+        var sim_q = List[List[Float64]]()
+        var sim_t = List[List[Float64]]()
+        with open(play_in, "r") as fh:
+            var lines = fh.read().split("\n")
+            for li in range(1, len(lines)):
+                var l = String(lines[li].strip())
+                if l.byte_length() == 0:
+                    continue
+                var w = l.split(",")
+                if Int(String(w[0])) != 0:
+                    break
+                var qq = List[Float64]()
+                var tt = List[Float64]()
+                for j in range(SO101_N):
+                    qq.append(Float64(String(w[2 + j])))
+                    tt.append(Float64(String(w[20 + j])))
+                sim_q.append(qq^)
+                sim_t.append(tt^)
+        print("  play-targets:", len(sim_t), "ticks from", play_in)
+        var pcsv = String("tick,t_s,q0,q1,q2,q3,q4,q5,sq0,sq1,sq2,sq3,sq4,sq5,tgt0,tgt1,tgt2,tgt3,tgt4,tgt5\n")
+        var pgoals = Array[Int32, SO101_N](fill=0)
+        var t0p = perf_counter_ns()
+        var pdive = 0
+        try:
+            for k in range(len(sim_t)):
+                var tt0 = perf_counter_ns()
+                for i in range(SO101_N):
+                    var g = sim_t[k][i]
+                    if g < lo[i]:
+                        g = lo[i]
+                    if g > hi[i]:
+                        g = hi[i]
+                    pgoals[i] = jmap.from_sim(arm.cal, i, g)
+                arm.write_goals(Span(pgoals))
+                if arm.read_positions(Span(raw)) == SO101_N:
+                    var row = String(k) + "," + String(Float64(perf_counter_ns() - t0p) / 1e9)
+                    var rq = List[Float64](length=SO101_N, fill=0.0)
+                    for i in range(SO101_N):
+                        rq[i] = jmap.to_sim_unclamped(arm.cal, i, raw[i])
+                        row += "," + String(rq[i])
+                    for i in range(SO101_N):
+                        row += "," + String(sim_q[k][i])
+                    for i in range(SO101_N):
+                        row += "," + String(sim_t[k][i])
+                    pcsv += row + "\n"
+                    if rq[1] > 1.35 and rq[2] < -1.35:
+                        pdive += 1
+                        if pdive >= 3:
+                            print("  ⚠ dive guard during play-targets; stopping")
+                            dive_ticks = 3
+                            break
+                    else:
+                        pdive = 0
+                _spin_until(tt0 + period_ns)
+        finally:
+            with open(play_out, "w") as f:
+                f.write(pcsv)
+            print("  wrote " + play_out)
+            var released = return_and_release(
+                arm, start_pose, arm_it, do_return, stdin, interactive,
+                20 if dive_ticks >= 3 else 8,
+            )
+            if not released:
+                print("⚠ the follower is STILL ENERGISED — deliberate, see above.")
+            for i in range(N_CAMS):
+                try:
+                    cams[i].stop()
+                except:
+                    pass
+        return
+
     # ── --sysid: the servos' step response, no policy ───────────────────
     if sysid.byte_length() > 0:
         if not arm_it:
@@ -658,7 +745,7 @@ def main() raises:
     var loop_t0 = perf_counter_ns()
     var deadline = loop_t0 + seconds * 1_000_000_000
     var a_ex = List[Float64](length=ACT, fill=0.0)
-    var dive_ticks = 0
+    dive_ticks = 0
     if act_ema > 0.0:
         print("  --act-ema", act_ema, "on the arm's action words")
     var line2 = String("")
