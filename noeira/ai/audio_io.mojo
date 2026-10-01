@@ -5,7 +5,8 @@
 
     record_wav("/tmp/cmd.wav", seconds=4.0)     # blocks while recording
     play_wav("/tmp/reply.wav")                  # blocks while playing
-    speak_local("Cube placed.")                 # OS voice, no API
+    speak_local("J'ai posé le cube.")           # OS voice, no API, waits
+    var voice = LocalVoice(); voice.say("...")  # same, returns at once; .speaking()
 
     var mic = MicCapture.start()                # continuous, 16 kHz mono
     while running:
@@ -32,7 +33,7 @@ apart from a quiet room.
 
 from std.ffi import external_call
 from std.sys import CompilationTarget
-from std.time import perf_counter_ns
+from std.time import perf_counter_ns, sleep
 
 from noeira.core.bytes import string_from_byte_span
 from noeira.io.fileio import read_file_bytes, remove_file
@@ -80,27 +81,173 @@ def play_wav(path: String) raises:
         raise Error("play_wav: exited " + String(rc) + ": " + cmd)
 
 
-def speak_local(text: String, var voice: String = String("")) raises:
-    """Say `text` through the OS voice: `say` (macOS) / `espeak` (Linux).
-
-    No key, no network, ~instant — the placeholder TTS for a demo until a
-    `TextToSpeech` service is wired. ⚠ `say` picks the SYSTEM LANGUAGE's
-    voice by default, so English text on a French Mac comes out with a French
-    accent; pass `voice` ("Daniel", "Samantha" — `say -v '?'` lists them).
-    """
+def _speech_command(
+    text_path: String, voice: String, out_path: String
+) raises -> String:
+    """The OS voice reading `text_path`. The TEXT NEVER TOUCHES THE SHELL:
+    `quote_arg` refuses a single quote (correctly — it cannot be escaped
+    inside POSIX single quotes), and French is full of them, so "j'ai fini"
+    passed as an argument took a demo down. `say -f` / `espeak -f` read the
+    file instead."""
     var cmd: String
     comptime if CompilationTarget.is_macos():
         cmd = String("say ")
         if voice.byte_length() > 0:
             cmd += "-v " + quote_arg(voice) + " "
+        if out_path.byte_length() > 0:
+            cmd += "-o " + quote_arg(out_path) + " "
     else:
         cmd = String("espeak ")
         if voice.byte_length() > 0:
             cmd += "-v " + quote_arg(voice) + " "
-    cmd += quote_arg(text)
-    var rc = run_system(cmd)
+        if out_path.byte_length() > 0:
+            cmd += "-w " + quote_arg(out_path) + " "
+    return cmd + "-f " + quote_arg(text_path)
+
+
+def _write_text(path: String, text: String) raises:
+    var f = open(path, "w")
+    f.write(text)
+    f.close()
+
+
+def speak_local(text: String, var voice: String = String("")) raises:
+    """Say `text` through the OS voice and WAIT until it is done: `say`
+    (macOS) / `espeak` (Linux). Any text — apostrophes, accents, quotes.
+
+    No key, no network — the placeholder TTS for a demo until a
+    `TextToSpeech` service is wired. For a loop that must keep running while
+    the robot talks, use `LocalVoice`. ⚠ `say` picks the SYSTEM LANGUAGE's
+    voice by default (French on this project's Mac — right for its user);
+    pass `voice` ("Daniel", "Samantha" — `say -v '?'` lists them) for another.
+    """
+    var path = "/tmp/noeira_say_" + String(perf_counter_ns()) + ".txt"
+    _write_text(path, text)
+    var rc = run_system(_speech_command(path, voice, String("")))
+    try:
+        remove_file(path)
+    except:
+        pass
     if rc != 0:
         raise Error("speak_local: exited " + String(rc))
+
+
+def _read_pid(mut pipe: Pipe) raises -> Int:
+    """The first stdout line of `echo $$; exec <cmd>`: the child's pid
+    (`exec` keeps the shell's). Read RAW, byte by byte — a stdio read would
+    pull what follows into the `FILE*` buffer, where `poll` cannot see it."""
+    var fd = pipe.fileno()
+    var pid = 0
+    var one = SIMD[DType.uint8, 1](0)
+    for _ in range(24):
+        var n = external_call["read", Int](fd, Pointer(to=one), Int(1))  # Int fd: see Pipe.read_available
+        if n != 1:
+            raise Error("proc: the shell died before starting its command")
+        var c = Int(one[0])
+        if c == 0x0A:
+            break
+        if c < 0x30 or c > 0x39:
+            raise Error("proc: unexpected output before the pid")
+        pid = pid * 10 + (c - 0x30)
+    if pid <= 0:
+        raise Error("proc: could not read the child's pid")
+    return pid
+
+
+struct LocalVoice(Movable):
+    """The OS voice, without blocking — and with an exact "still talking".
+
+        var voice = LocalVoice()
+        voice.say("J'ai fini.")          # returns at once
+        while running:
+            if not voice.speaking():     # true until the audio has finished
+                mic_gate_open = True     # don't listen to yourself
+            step_and_draw()
+
+    ⚠ `speaking()` IS THE ONLY RELIABLE END SIGNAL. `say`'s duration cannot
+    be estimated from the text: measured, "spin_left" 2.79 s but the LONGER
+    "both_hands_up" 2.20 s — start-up dominates a short utterance and it
+    pronounces the underscore — so a character-rate estimate is wrong in
+    order, not just magnitude. Here the child's exit closes its stdout, which
+    `poll` sees: exact, no timer, no flag file.
+
+    ⚠ ONE UTTERANCE AT A TIME. `say` while speaking CUTS OFF the previous one
+    first. Two overlapping voices sharing one "done" signal is how a demo
+    opened its microphone while still audibly talking and heard itself (an
+    echo loop, measured by the G1 session).
+    """
+
+    var voice: String
+    var _pipe: Optional[Pipe]
+    var _pid: Int
+    var _text_path: String
+
+    def __init__(out self, var voice: String = String("")):
+        self.voice = voice^
+        self._pipe = None
+        self._pid = 0
+        self._text_path = String("")
+
+    def __init__(out self, *, deinit move: Self):
+        self.voice = move.voice^
+        self._pipe = move._pipe^
+        self._pid = move._pid
+        self._text_path = move._text_path^
+
+    def __deinit__(deinit self):
+        if self._pid > 0:
+            _ = external_call["kill", Int32](Int32(self._pid), Int32(9))
+
+    def say(mut self, text: String, var out_path: String = String("")) raises:
+        """Start speaking `text` (any characters). `out_path` renders to a
+        file instead of the speakers — `say -o x.aiff`, `espeak -w x.wav`."""
+        self.stop()
+        self._text_path = "/tmp/noeira_voice_" + String(perf_counter_ns()) + ".txt"
+        _write_text(self._text_path, text)
+        var pipe = Pipe(
+            "echo $$; exec " + _speech_command(self._text_path, self.voice, out_path)
+        )
+        self._pid = _read_pid(pipe)
+        self._pipe = pipe^
+
+    def speaking(mut self) raises -> Bool:
+        """True while the utterance is still playing. Never blocks."""
+        if not self._pipe:
+            return False
+        var one = SIMD[DType.uint8, 8](0)
+        var n = self._pipe.value().read_available(
+            rebind[Pointer[Scalar[DType.uint8], MutAnyOrigin]](Pointer(to=one)), 8
+        )
+        if n >= 0:
+            return True  # nothing (or stray output): still running
+        self._finish()  # EOF: the child has exited
+        return False
+
+    def wait(mut self) raises:
+        """Block until the current utterance ends."""
+        while self.speaking():
+            sleep(0.01)
+
+    def stop(mut self) raises:
+        """Cut the current utterance off (no-op when silent)."""
+        if self._pid > 0:
+            _ = external_call["kill", Int32](Int32(self._pid), Int32(9))
+        self._finish()
+
+    def _finish(mut self):
+        self._pid = 0
+        if self._pipe:
+            try:
+                _ = self._pipe.value().close(allow_broken_pipe=True)
+            except:
+                pass  # killed on purpose, or a non-zero `say`: nothing to act on
+            self._pipe = None
+        if self._text_path.byte_length() > 0:
+            try:
+                remove_file(self._text_path)
+            except:
+                pass
+            self._text_path = String("")
 
 
 # ═══════════════════════════════════════════════════════════════════════════
@@ -292,23 +439,7 @@ struct MicCapture(Movable):
         )
         var log_path = "/tmp/noeira_mic_" + String(perf_counter_ns()) + ".log"
         var pipe = Pipe("echo $$; exec " + ff + " 2> " + quote_arg(log_path))
-        # The pid line, read RAW, byte by byte: a stdio read would pull PCM
-        # into the FILE* buffer, where `poll` cannot see it.
-        var fd = pipe.fileno()
-        var pid = 0
-        var one = SIMD[DType.uint8, 1](0)
-        for _ in range(24):
-            var n = external_call["read", Int](fd, Pointer(to=one), Int(1))  # Int fd: see Pipe.read_available
-            if n != 1:
-                raise Error("mic: the capture shell died before starting ffmpeg")
-            var c = Int(one[0])
-            if c == 0x0A:
-                break
-            if c < 0x30 or c > 0x39:
-                raise Error("mic: unexpected output before the pid: " + ff)
-            pid = pid * 10 + (c - 0x30)
-        if pid <= 0:
-            raise Error("mic: could not read ffmpeg's pid")
+        var pid = _read_pid(pipe)
         return MicCapture(sample_rate, ff^, pipe^, pid, log_path^)
 
     def read(mut self) raises -> List[Int16]:

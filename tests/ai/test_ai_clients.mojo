@@ -24,6 +24,9 @@ as what it parses.
 * **A 529 is retried; a 422 is not**, and the 422's body reaches the caller.
 * **WAV survives encode → multipart → the server's own parser**, resampled
   and down-mixed to 16 kHz mono on the way.
+* **`language` reaches the server on EVERY speech backend** — the HF one
+  used to drop it (raw-bytes body, nowhere to put it) — and a `prompt` the
+  HF backend cannot carry RAISES instead of vanishing.
 * **A streamed turn equals a blocking one.** The fixture cuts every SSE event
   at an arbitrary byte (mid-line, mid-"—"); the deltas must concatenate to
   the final text, and a reassembled Claude turn — thinking signature arriving
@@ -256,10 +259,30 @@ def main() raises:
     var hf = SpeechToText(STT_RAW, base + "/hf/whisper", String("w"), String("k"))
     var tr2 = hf.transcribe(stereo48)
     _check(tr2.text == "8000@16000", "raw-body STT: " + tr2.text)
+    # language + prompt reach the server — on EVERY backend, or raise.
+    stt.language = String("fr")
+    stt.prompt = String("cours, marche, stop")
+    var trp = stt.transcribe(stereo48)
+    _check(
+        trp.text == "8000@16000 language=fr prompt=cours, marche, stop",
+        "multipart language/prompt not sent: " + trp.text,
+    )
+    hf.language = String("fr")
+    var trl = hf.transcribe(stereo48)
+    _check(trl.text == "8000@16000 language=fr", "HF language not sent: " + trl.text)
+    hf.prompt = String("cours")
+    var refused = String("")
+    try:
+        _ = hf.transcribe(stereo48)
+    except e:
+        refused = String(e)
+    _check("not supported by the Hugging Face" in refused, "HF prompt silently dropped: '" + refused + "'")
+    hf.prompt = String("")
+    hf.language = String("")
     var tts = TextToSpeech(base + "/v1/audio/speech", String("m"), String("v"), String("k"))
     var spoken = tts.speak("Cube placed.")
     _check(spoken.sample_rate == 16000 and spoken.frames() == 4000, "TTS WAV decode")
-    checks += 6
+    checks += 9
     print("  speech: wav codec, multipart + raw STT, TTS            ok")
 
     # ── 6. streaming: both wire formats, reassembly, replay ──────────────

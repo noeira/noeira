@@ -110,7 +110,10 @@ def main() raises:
     # The cost of a read is converting what is waiting, so the startup burst
     # (10k samples) is the worst call; at 100 Hz a steady read holds ~160.
     _check(worst < 5.0, "read() blocked: worst call " + String(worst) + " ms")
-    _check(worst_steady < 0.5, "steady-state read took " + String(worst_steady) + " ms")
+    # A read that WAITED for data would take a chunk period (~64 ms of audio
+    # per ffmpeg packet); scheduler noise on a busy machine reaches ~20 ms.
+    # Measured unloaded: 0.06-0.09 ms.
+    _check(worst_steady < 30.0, "steady-state read took " + String(worst_steady) + " ms")
     _check(rate > 13000.0 and rate < 19000.0, "not real time: " + String(rate) + " samples/s")
     var level = rms(all)
     _check(level > 0.080 and level < 0.097, "sine RMS " + String(level) + " (expect 0.0884)")

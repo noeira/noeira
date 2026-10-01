@@ -27,6 +27,7 @@ speaches also serve locally, so the same migration path holds.
 is most of the latency on a slow link. `transcribe(audio)` converts first.
 """
 
+from noeira.io.base64 import b64_encode
 from noeira.io.fileio import read_file_bytes
 from noeira.io.http import HttpClient
 from noeira.io.json import J_STRING, JsonWriter
@@ -53,14 +54,18 @@ struct SpeechToText(Movable):
     var model: String
     var language: String
     """ISO-639-1 hint ("en", "fr"); "" lets the model detect it. A hint
-    avoids a wrong-language transcript of a two-word command."""
+    avoids a wrong-language transcript of a two-word command. Sent on every
+    backend (HF: as `generate_kwargs.language` — see `start_wav_bytes`)."""
     var prompt: String
     """Text that biases the decoder's vocabulary — Whisper's own
     `prompt` field. Give it the words you expect and it will prefer them
     among homophones: a French speaker saying "cours" was transcribed
     "cool" twice in a row, and listing the command vocabulary is what
     separates them. It is a hint, not a grammar: anything may still come
-    back."""
+    back.
+
+    ⚠ NOT ON THE HUGGING FACE BACKEND, which takes Whisper's prompt only as
+    token ids: `start` RAISES there rather than dropping it silently."""
     var retries: Int
     var _http: HttpClient
     var _call: ApiCall
@@ -130,8 +135,47 @@ struct SpeechToText(Movable):
         """Upload in the background; `poll` it, then `result`."""
         var what = String("speech-to-text (") + self.model + ")"
         if self.kind == STT_RAW:
+            if self.prompt.byte_length() > 0:
+                # Refuse rather than drop: a silently ignored hint looks
+                # exactly like a hint that did not help.
+                raise Error(
+                    "speech-to-text: `prompt` is not supported by the Hugging Face"
+                    " endpoint — its Whisper pipeline takes a prompt only as token"
+                    " ids. Use SpeechToText.groq() / .openai() / a local"
+                    " openai_compatible server (they take a text prompt), or leave"
+                    " `prompt` empty here."
+                )
+            if self.language.byte_length() == 0:
+                self._call.begin(
+                    self._http, self.url, wav.copy(), String("audio/wav"), what^,
+                    self.retries,
+                )
+                return
+            # A language needs the JSON form: base64 audio + generate_kwargs.
+            # Measured on whisper-large-v3-turbo: a bare `language` is a 400;
+            # nested under `generate_kwargs` (or `generation_parameters`) it is
+            # HONOURED — the French clip with `language: "en"` came back in
+            # English. ⚠ Forcing a language onto speech that is already in
+            # another one proves nothing: English audio forced to "fr" still
+            # comes back English, which first read as "ignored".
+            var w = JsonWriter()
+            w.begin_object()
+            w.member("inputs", b64_encode(wav))
+            w.key("parameters")
+            w.begin_object()
+            w.key("generate_kwargs")
+            w.begin_object()
+            w.member("language", self.language)
+            w.member("task", String("transcribe"))
+            w.end_object()
+            w.end_object()
+            w.end_object()
+            var body = w.done()
+            var b = List[UInt8](capacity=body.byte_length())
+            for i in range(body.byte_length()):
+                b.append(body.as_bytes()[i])
             self._call.begin(
-                self._http, self.url, wav.copy(), String("audio/wav"), what^, self.retries
+                self._http, self.url, b^, String("application/json"), what^, self.retries
             )
             return
         var form = MultipartForm()

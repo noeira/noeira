@@ -17,7 +17,8 @@ Routes
   POST /v1/chat/completions       OpenAI Chat Completions, same script
   POST /v1/systemone              TypeSafe System One: one answer per question
   POST /v1/audio/transcriptions   multipart WAV -> {"text": "<frames>@<rate>"}
-  POST /hf/whisper                raw WAV body -> same
+  POST /hf/whisper                raw WAV body -> same; or the JSON form (base64 +
+                                  parameters.generate_kwargs.language), echoed
   POST /v1/audio/speech           -> a 0.25 s 16 kHz mono WAV
   POST /slow/v1/systemone         as /v1/systemone, after 0.4 s
   POST /err/v1/messages           a stream that dies with an `error` event
@@ -33,6 +34,7 @@ half, and a parser that assumes whole lines per chunk fails here.
   GET  /__last, /__shutdown
 """
 
+import base64
 import json
 import os
 import struct
@@ -347,8 +349,21 @@ class Handler(BaseHTTPRequestHandler):
                 need(parts.get("model") == b"whisper-1", "model part")
                 frames, rate, ch = wav_info(parts["file"])
                 need(ch == 1, "mono expected")
-                return self.reply(200, {"text": "%d@%d" % (frames, rate)})
+                text = "%d@%d" % (frames, rate)
+                for k in ("language", "prompt"):
+                    if k in parts:
+                        text += " %s=%s" % (k, parts[k].decode())
+                return self.reply(200, {"text": text})
             if self.path == "/hf/whisper":
+                if ctype == "application/json":
+                    # The HF JSON form: base64 audio + generate_kwargs. A bare
+                    # `language` is refused, as the real endpoint does.
+                    req = json.loads(raw)
+                    need("language" not in req.get("parameters", {}),
+                         "unexpected keyword argument 'language'")
+                    gk = req["parameters"]["generate_kwargs"]
+                    frames, rate, ch = wav_info(base64.b64decode(req["inputs"]))
+                    return self.reply(200, {"text": "%d@%d language=%s" % (frames, rate, gk["language"])})
                 need(ctype == "audio/wav", "audio/wav body expected")
                 frames, rate, ch = wav_info(raw)
                 return self.reply(200, {"text": "%d@%d" % (frames, rate)})
