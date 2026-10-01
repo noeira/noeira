@@ -39,6 +39,12 @@ been reaching down past the desk — shoulder_lift > 1.35 AND elbow_flex <
 -1.35 rad — for 3 ticks: no sim grasp is made there (they close at
 shoulder_lift -0.1..0.5, elbow 0.35..1.4), the sim's rigid desk absorbs it
 and the real tower does not),
+--keep-dynamic-fps (by default each /dev camera gets `v4l2-ctl -c
+exposure_dynamic_framerate=0` at open: with it ON, both rig cameras were
+found so, a UVC camera may drop to ~10 fps to lengthen its exposure as the
+room dims — runs then saw 2 / 3 of their frames STALE and the student, acting
+on an image ~100 ms behind the arm, overshot the pan and closed beside the
+cube, 1 Oct; the run with 8 % stale frames grasped),
 --sysid FILE (with --arm: NO policy — each joint in turn steps +A, back, -A,
 back from the sim's start pose, 0.8 s per step, A 0.1 rad / 0.3 gripper; the
 per-tick targets and joints go to FILE, the servos' delay and time constant
@@ -108,6 +114,7 @@ from noeira.robot.so101.deploy_shutdown import (
 )
 from noeira.robot.so101.ports import follower_port, port_refusal
 from noeira.robot.so101.sim_map import SimJointMap
+from noeira.io.proc import run_capture
 from noeira.tasks.delta_action import delta_target, target_step, TARGET_OBS
 from noeira.tasks.family import scene_path
 from noeira.tasks.family_config import So101TowerConfig
@@ -292,6 +299,7 @@ def main() raises:
     var rec_dir = _arg(args, "--record", "")
     var sysid = _arg(args, "--sysid", "")
     var grip_off = Float64(_arg(args, "--grip-offset", "0"))
+    var keep_dyn_fps = _flag(args, "--keep-dynamic-fps")
     # --act-ema A: each ARM action word executed as (1 - A) new + A previous
     # (the gripper's is not smoothed) — the 31 Hz students flip the sign of
     # their arm actions on ~30 % of ticks, in sim as on the arm, and the
@@ -378,6 +386,19 @@ def main() raises:
     for i in range(N_CAMS):
         print("camera slot " + String(i) + " = " + pad_right(names[i], 10)
               + " <- " + devices[i])
+        if not keep_dyn_fps and devices[i].startswith("/dev/"):
+            # a constant 30 fps: no exposure-driven frame-rate drop
+            try:
+                var out = run_capture(
+                    "v4l2-ctl -d " + devices[i]
+                    + " -c exposure_dynamic_framerate=0 2>&1"
+                )
+                if out.byte_length() > 0:
+                    print("            v4l2-ctl: " + String(out.strip()))
+                else:
+                    print("            exposure_dynamic_framerate=0 (constant frame rate)")
+            except:
+                print("            ⚠ could not run v4l2-ctl: the frame rate may drop in dim light")
         var c = CameraReader.from_spec(
             devices[i], CAM_W, CAM_H, 30.0, rgb=False, fourcc=fourcc,
             out_w=CAM_W, out_h=CAM_H,
@@ -793,4 +814,10 @@ def main() raises:
           + fixed(sum_fwd / Float64(max(ticks, 1)), 2) + " ms")
     print("  stale frames    = " + String(stale) + " | bus reads skipped "
           + String(bus_skipped) + " | targets at a joint limit " + String(clamped))
+    if ticks > 0 and Float64(stale) > 0.2 * Float64(ticks * N_CAMS):
+        print("  ⚠⚠ " + fixed(100.0 * Float64(stale) / Float64(ticks * N_CAMS), 0)
+              + " % of the camera reads were STALE: the policy acted on images"
+              + " behind the arm (a camera below 30 fps — dim light with"
+              + " exposure_dynamic_framerate on, or USB bandwidth). Do not"
+              + " judge the policy on this run.")
     print("=" * 74)
