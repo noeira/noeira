@@ -361,7 +361,26 @@ def main() raises:
     var iters = atol(_flag(String("--cem-iters"), String(20)))
     var pop = atol(_flag(String("--cem-pop"), String(24)))
     var elites = atol(_flag(String("--cem-elites"), String(4)))
-    var sigma0 = Float64(String(_flag(String("--cem-sigma"), String("0.30"))))
+    # ⚠⚠ 0.60, NOT 0.30, AND THIS IS THE FIX FOR `run` (§12.63). At 0.30 the
+    # search NEVER VISITS the region where `run`'s compound holds: `hard` was
+    # 0.000 for all 480 candidates, which is why adding it to the objective
+    # changed nothing. Measured on `--only run`, everything else equal:
+    #
+    #     sigma 0.15   hold 0.000   soft gain  334 %
+    #     sigma 0.30   hold 0.000   soft gain 1111 %   <- the old default
+    #     sigma 0.60   hold 1.000   soft gain 1712 %   shipped 2.494
+    #     sigma 1.00   hold 1.000   soft gain 1712 %   shipped 1.968
+    #
+    # `z` is on the radius-sqrt(D) sphere and sigma is per-component, so the
+    # step norm is about sigma * sqrt(256) = 16 * sigma — 0.60 is 60 % of the
+    # radius. 1.00 is a full-radius step, essentially a random direction, and
+    # it lands nearer the band edge (1.968 against 0.60's 2.494), so 0.60 is
+    # the choice rather than "as large as possible".
+    #
+    # A 24-command regression at 20x24 confirmed no cost: ACCEPTED 23 of 24
+    # with every accepted row holding at 1.000, `back` 0.850 -> 1.000 and
+    # `right_foot_height_hi` 0.675 -> 1.000, and nothing regressed.
+    var sigma0 = Float64(String(_flag(String("--cem-sigma"), String("0.60"))))
     var min_ess = Float64(String(_flag(String("--min-ess"), String("100"))))
     var min_hard = Float64(String(_flag(String("--min-hard"), String("0.25"))))
     # ⚠ `--only NAME` builds ONE command. Iterating on a single rejected
@@ -877,6 +896,12 @@ def main() raises:
     var head = String("# g1 command bank v1\n")
     head += String("# ckpt ") + ckpt + String("\n")
     head += String("# pool ") + String(n_pool) + String(" stride ") + String(stride) + String("\n")
+    # ⚠ THE HEADER MUST RECORD SIGMA. It recorded iters, pop and elites but
+    # not sigma, and sigma is the one that decides whether `run` is in the
+    # bank at all. §12.62's lesson was that a default which cannot rebuild
+    # the artefact beside it is a trap; an artefact that does not record what
+    # built it is the same trap from the other side.
+    head += String("# sigma ") + String(sigma0) + String("\n")
     head += String("# cem ") + String(iters) + String("x") + String(pop) \
             + String(" elites ") + String(elites) + String("\n")
     head += String("# gates ess>=") + String(Int(min_ess)) \
