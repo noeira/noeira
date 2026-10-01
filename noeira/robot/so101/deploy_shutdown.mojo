@@ -60,8 +60,14 @@ def return_and_release(
     do_return: Bool,
     mut stdin: StdinReader,
     interactive: Bool,
+    timeout_s: Int = RETURN_TIMEOUT_S,
 ) -> Bool:
     """Bring the follower home, hold, and only then release. True if released.
+
+    `timeout_s`: how long the way home may take (RETURN_TIMEOUT_S by
+    default). A caller whose arm may end with a jaw dragging on the desk —
+    the pixel deploy after a dive stop — gives it longer: the friction slows
+    the slew-bounded return past 8 s without blocking it.
 
     ⚠⚠ **THIS EXISTS BECAUSE THE ARM FELL.** The first armed run ended by
     cutting torque wherever the policy happened to leave the arm — extended,
@@ -91,7 +97,7 @@ def return_and_release(
         print("")
         print(
             "returning to the pose the run started from (<= "
-            + String(RETURN_TIMEOUT_S) + " s) ..."
+            + String(timeout_s) + " s) ..."
         )
         var hold = arm.max_step_ticks
         arm.max_step_ticks = RETURN_STEP_TICKS
@@ -104,7 +110,7 @@ def return_and_release(
             goals[i] = start[i]
         var present = Array[Int32, SO101_N](fill=0)
         var period = 1_000_000_000 // 30
-        var t_end = perf_counter_ns() + RETURN_TIMEOUT_S * 1_000_000_000
+        var t_end = perf_counter_ns() + timeout_s * 1_000_000_000
         var arrived = False
         var worst = 1 << 30
         while perf_counter_ns() < t_end:

@@ -788,13 +788,15 @@ def main() raises:
                     for i in range(SO101_N):
                         lift.append(raw[i])
                     lift[1] = jmap.from_sim(arm.cal, 1, 0.3)
-                    print("  lifting clear of the desk (shoulder_lift -> 0.3 rad) ...")
-                    if not _ramp_to(arm, lift, 6):
+                    print("  lifting clear of the desk (shoulder_lift -> 0.3 rad, <= 15 s) ...")
+                    # ⚠ slow, not blocked: the jaw drags on the desk at first
+                    if not _ramp_to(arm, lift, 15):
                         print("  ⚠ the lift did not arrive; returning anyway")
             except:
                 print("  ⚠ the lift clear of the desk failed; returning anyway")
         var released = return_and_release(
-            arm, start_pose, arm_it, do_return, stdin, interactive
+            arm, start_pose, arm_it, do_return, stdin, interactive,
+            20 if dive_ticks >= 3 else 8,
         )
         if not released:
             print("⚠ the follower is STILL ENERGISED — deliberate, see above.")
