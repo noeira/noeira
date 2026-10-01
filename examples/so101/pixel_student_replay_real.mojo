@@ -225,6 +225,22 @@ def main() raises:
                 n_bg += 1
                 for c in range(3):
                     xbg[c * PLANE + p] = xsim[c * PLANE + p]
+        # real-wbg: both cameras real, the WRIST's backdrop pixels from the sim
+        # (a wrist tilted up sees the room — wall, door — where the sim has
+        # its backdrop); real-abg: both cameras' backdrops swapped
+        var xwbg = xr.copy()
+        var n_wbg = 0
+        for p in range(PLANE):
+            var sr = Float64(xsim[3 * PLANE + p])
+            var sg = Float64(xsim[4 * PLANE + p])
+            var sb = Float64(xsim[5 * PLANE + p])
+            if sb > sr + 0.05 and sr < -0.05 and sg < 0.0:
+                n_wbg += 1
+                for c in range(3):
+                    xwbg[(3 + c) * PLANE + p] = xsim[(3 + c) * PLANE + p]
+        var xabg = xwbg.copy()
+        for i in range(3 * PLANE):
+            xabg[i] = xbg[i]
         var xmo = xsim.copy()
         var xmw = xsim.copy()
         for i in range(3 * PLANE):
@@ -245,11 +261,19 @@ def main() raises:
         joints_to_planes(q, xbg)
         joint_vels_to_planes(qd, xbg)
         act_hist_to_planes(hist, xbg)
+        joints_to_planes(q, xwbg)
+        joint_vels_to_planes(qd, xwbg)
+        act_hist_to_planes(hist, xwbg)
+        joints_to_planes(q, xabg)
+        joint_vels_to_planes(qd, xabg)
+        act_hist_to_planes(hist, xabg)
         var ar = _forward(net, xr, x, y)
         var asim = _forward(net, xsim, x, y)
         var amo = _forward(net, xmo, x, y)
         var amw = _forward(net, xmw, x, y)
         var abg = _forward(net, xbg, x, y)
+        var awbg = _forward(net, xwbg, x, y)
+        var aabg = _forward(net, xabg, x, y)
         var d = 0.0
         for j in range(ACT):
             d += abs(ar[j] - asim[j])
@@ -264,6 +288,8 @@ def main() raises:
         print(_line("real-o ", amo))
         print(_line("real-w ", amw))
         print(_line("real-bg", abg) + "   (" + String(n_bg) + " backdrop px swapped)")
+        print(_line("rl-wbg ", awbg) + "   (" + String(n_wbg) + " wrist backdrop px swapped)")
+        print(_line("rl-abg ", aabg))
         t += 16
     if n_cmp > 0:
         print("replay: mean |real - sim| over", n_cmp, "ticks:", sum_rs / Float64(n_cmp))

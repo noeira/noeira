@@ -190,10 +190,31 @@ struct DomainRandConfig(Copyable, ImplicitlyCopyable, Movable, Writable):
             return Self.light(seed)
         if name == "full":
             return Self.full(seed)
+        if name == "room":
+            return Self.room(seed)
         raise Error(
             "DomainRandConfig: unknown preset '" + name
-            + "' (expected off | light | full)"
+            + "' (expected off | light | full | room)"
         )
+
+    @staticmethod
+    def room(seed: UInt64) -> Self:
+        """`full`, with the backdrop drawn `U(-0.4, 0.4)` per channel around
+        the base instead of ±0.10 — and the tower's surface groups widened on
+        the room (`so101_tower_surface_groups(wide_room=True)`: the floor any
+        hue and a wide brightness, the desk brighter or darker).
+
+        ⚠ WHY (1 Oct): replaying the real pixel_bowl_h3 runs through the
+        student (`examples/so101/pixel_student_replay_real.mojo`), its actions
+        on the real and the sim overhead agree over the reach and split by
+        0.4-0.5 from the approach. The real overhead sees a WOODEN floor
+        around the desk where the sim renders a dark purple backdrop; swapping
+        only those pixels for the sim's halves the split, and a cloth over the
+        real floor gave the first clean grasp and carry. A tilted-up wrist sees
+        the room (wall, door) the sim has no model of either."""
+        var c = Self.full(seed)
+        c.background = 0.4
+        return c
 
     def write_to(self, mut writer: Some[Writer]):
         if not self.enabled:
@@ -707,16 +728,38 @@ def geom_labels(fmd: FlatModelDef) -> List[String]:
     return out^
 
 
-def so101_tower_surface_groups() -> List[SurfaceGroup]:
+def so101_tower_surface_groups(wide_room: Bool = False) -> List[SurfaceGroup]:
     """The tower rig's surfaces, at `strength = 1` (plan §2.2).
+
+    `wide_room` (the `room` preset): the BACKDROP FLOOR (and the world floor)
+    takes any hue, saturation x U(0.1, 1.9) and value x U(0, 2) — the real
+    room shows a wooden floor, a white sheet or a rug where the calibrated
+    backdrop is dark purple — the backdrop wall a moderate cast, and the
+    desk's value range doubles (the real desk is whiter than the sim's:
+    overhead frame means 0.61-0.63 against the sim's 0.57).
 
     Task objects (bowl, brick): hue ±15°, value ±20% — enough to survive a
     lighting temperature, not so much the student cannot find them. White
     surfaces (desk, floor, stand): a colour cast by tint. The arm: small, and
     ONE draw for all 17 of its materials, so it stays one arm."""
     var g = List[SurfaceGroup]()
-    g.append(SurfaceGroup("desk", ["desk_"], ColourJitter(0.0, 0.3, 0.15, 0.10, 0.5)))
-    g.append(SurfaceGroup("floor", ["world/floor"], ColourJitter(0.0, 0.5, 0.30, 0.15, 0.5)))
+    if wide_room:
+        # ⚠ BEFORE "desk": the first matching group wins, and the calibrated
+        # look's BACKDROP geoms (`desk_mat.xml`, visual group 4) are desk_mat
+        # children — the floor past the desk (`backdrop_floor`, the purple
+        # (.32, .28, .43) the real overhead sees as wood) and the wall
+        g.append(SurfaceGroup(
+            "backdrop_floor", ["desk_mat/desk_floor_cover", "desk_mat/desk_floor_strip"],
+            ColourJitter(180.0, 0.9, 1.0, 0.30, 0.5),
+        ))
+        g.append(SurfaceGroup(
+            "backdrop_wall", ["desk_mat/desk_wall"], ColourJitter(30.0, 0.5, 0.35, 0.15, 0.5)
+        ))
+        g.append(SurfaceGroup("desk", ["desk_"], ColourJitter(0.0, 0.3, 0.30, 0.10, 0.5)))
+        g.append(SurfaceGroup("floor", ["world/floor"], ColourJitter(180.0, 0.8, 0.80, 0.30, 0.5)))
+    else:
+        g.append(SurfaceGroup("desk", ["desk_"], ColourJitter(0.0, 0.3, 0.15, 0.10, 0.5)))
+        g.append(SurfaceGroup("floor", ["world/floor"], ColourJitter(0.0, 0.5, 0.30, 0.15, 0.5)))
     g.append(SurfaceGroup("stand", ["tower_"], ColourJitter(10.0, 0.2, 0.15, 0.08, 0.5)))
     g.append(SurfaceGroup("arm", ["robot_"], ColourJitter(0.0, 0.1, 0.10, 0.05, 0.5)))
     g.append(SurfaceGroup("bowl", ["bowl_"], ColourJitter(15.0, 0.2, 0.20, 0.05, 0.5)))

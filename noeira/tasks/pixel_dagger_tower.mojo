@@ -356,12 +356,12 @@ struct PixelObs(Movable):
         var labels = geom_labels(fmd)
         var dcfg = DomainRandConfig.parse(dr_name, UInt64(dr_seed))
         self.dr_w = VisualRandomizer[RIG_DT](
-            dcfg, so101_tower_surface_groups(), self.r.vis, self.rm, labels,
+            dcfg, so101_tower_surface_groups(dr_name == "room"), self.r.vis, self.rm, labels,
             self.cams.copy(), self.r.background, RIG_DR_TARGET,
         )
         scale_tower_camera_dr(self.dr_w, fmd)
         self.dr_o = VisualRandomizer[RIG_DT](
-            dcfg, so101_tower_surface_groups(), self.r_o.vis, self.rm, labels,
+            dcfg, so101_tower_surface_groups(dr_name == "room"), self.r_o.vis, self.rm, labels,
             self.cams.copy(), self.r_o.background, RIG_DR_TARGET,
         )
         scale_tower_camera_dr(self.dr_o, fmd)
