@@ -576,6 +576,14 @@ def run_pixel_dagger(args: List[String], driver: String) raises:
     # the real arm's speed cap and elbow stop (`ServoLag.set_limits`)
     var lag_vmax = _arg(args, "--lag-vmax", "")
     var elbow_max = Float64(_arg(args, "--elbow-max", "0"))
+    # per-joint servo dynamics, offsets, control-period jitter, as in the PPO
+    # driver (`ServoLag.set_per_joint` / `set_offset` / `set_period`):
+    # "lo,hi;..." x 6 joints (offsets in rad), "lo,hi" ms
+    var lag_tau_j = _arg(args, "--lag-tau-j", "")
+    var lag_delay_j = _arg(args, "--lag-delay-j", "")
+    var lag_vmax_j = _arg(args, "--lag-vmax-j", "")
+    var lag_off_j = _arg(args, "--lag-offset-j", "")
+    var lag_period = _arg(args, "--lag-period", "")
     # ⚠ THE TEACHER'S SCALES: its labels are actions in its own units, so the
     # student must execute them with the same (checked below against the
     # teacher's run config when it recorded them)
@@ -664,6 +672,11 @@ def run_pixel_dagger(args: List[String], driver: String) raises:
     logger.set_config("aug", String(use_aug))
     logger.set_config("lag_tau_ms", lag_tau)
     logger.set_config("lag_delay_ticks", lag_delay)
+    logger.set_config("lag_tau_j", lag_tau_j)
+    logger.set_config("lag_delay_j", lag_delay_j)
+    logger.set_config("lag_vmax_j", lag_vmax_j)
+    logger.set_config("lag_offset_j", lag_off_j)
+    logger.set_config("lag_period_ms", lag_period)
     logger.set_config("delta_arm", String(d_arm))
     logger.set_config("delta_gripper", String(d_grip))
     logger.set_config("gripper_sign", String(grip_sign))
@@ -813,10 +826,17 @@ def run_pixel_dagger(args: List[String], driver: String) raises:
             N_ENVS, lag_tau, lag_delay, Float64(C.FRAME_SKIP) * M.TIMESTEP
         )
         lag.set_limits(lag_vmax, elbow_max)
+        lag.set_per_joint(lag_tau_j, lag_delay_j, lag_vmax_j)
+        lag.set_offset(lag_off_j)
+        lag.set_period(lag_period)
         var lag_pending = List[Bool](length=N_ENVS, fill=True)
         if lag.on:
             print("  servo lag: tau", lag_tau, "ms, delay", lag_delay,
                   "ticks | arm speed cap", lag_vmax, "rad/s | elbow max", elbow_max)
+        if lag.per_joint or lag.has_off or lag.dt_hi > 0.0:
+            print("  servo per joint: tau", lag_tau_j, "ms | delay", lag_delay_j,
+                  "| cap", lag_vmax_j, "rad/s | offset", lag_off_j,
+                  "rad | period", lag_period, "ms")
         var succ = List[Bool](length=N_ENVS, fill=False)
         var hist_s = List[Bool]()  # student-executed episodes' success
         var hist_t = List[Bool]()  # teacher-executed

@@ -5,6 +5,7 @@
     /tmp/px_probe --ckpt projects/so101-tower/policies/pixel_bowl.ckpt [--task T] [--seed S] [--episodes N]
         [--record ticks.csv]      # the deploy's --record columns, per episode
         [--lag-tau 140,140 --lag-delay 2,2]   # the real servos' response (ServoLag)
+        [--lag-vmax-j "...;0.8,1.2" --lag-offset-j ... --lag-period 32,38]   # per joint
 
 The reference a real run is read against. It starts every episode where the
 real deploy's ramp leaves the arm — the task's reset pose, props placed by
@@ -152,6 +153,15 @@ def main() raises:
     # the real arm's speed cap (rad/s, "v" or "lo,hi": the probe takes the
     # middle) and elbow stop — `ServoLag.set_limits`
     lag.set_limits(_arg(args, "--lag-vmax", ""), Float64(_arg(args, "--elbow-max", "0")))
+    # per-joint ranges ("lo,hi;..." x6, the gripper last), signed offsets and
+    # the control period's range — `ServoLag.set_per_joint` / `set_offset` /
+    # `set_period`, as in the state probe
+    lag.set_per_joint(
+        _arg(args, "--lag-tau-j", ""), _arg(args, "--lag-delay-j", ""),
+        _arg(args, "--lag-vmax-j", ""),
+    )
+    lag.set_offset(_arg(args, "--lag-offset-j", ""))
+    lag.set_period(_arg(args, "--lag-period", ""))
     if lag.on:
         print("probe: servo lag tau", lag_tau_s, "ms, delay", lag_delay_s,
               "ticks | arm speed cap", lag.vmax_lo, "-", lag.vmax_hi,
