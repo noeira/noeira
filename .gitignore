@@ -327,3 +327,8 @@ build/packs/
 # `examples/g1/bfm_zero_spec_probe.mojo --emit-pool` from the checkpoint and
 # the store. Derived, and larger than anything that belongs in git.
 g1_pool.bin
+
+# reward-spec candidates the voice demo appends to when it runs a novel latent
+# (`g1_spec_record`). An operational log, not a source: the bank records each
+# promoted row's own terms, so nothing is lost by regenerating it.
+g1_spec_candidates.txt

@@ -84,12 +84,14 @@ from noeira.render.types import Color
 from noeira.render.ui import UI
 from noeira.render.sdl.sdl_scancode import Scancode
 from noeira.render.sdl.sdl_keyboard import get_keyboard_state
-from noeira.io.fileio import (
-    remove_file, file_size, read_file_bytes, write_text_atomic,
-)
+# ⚠ `remove_file`, `file_size`, `write_text_atomic` and the whole of
+# `noeira.io.proc` went with the flag-file echo gate — see the note above
+# `_say`. Four imports fewer is the shape of the simplification: the gate used
+# to be a /tmp file, a touch, a backgrounded shell and a `say -f` dance, and
+# it is now one method call on `LocalVoice`.
+from noeira.io.fileio import read_file_bytes
 from noeira.core.bytes import string_from_bytes
-from noeira.io.proc import run_system, quote_arg
-from noeira.ai.audio_io import MicCapture, rms
+from noeira.ai.audio_io import MicCapture, rms, LocalVoice
 from noeira.io.wav import WavAudio
 from noeira.ai.jev import JevClient
 from noeira.ai.speech import SpeechToText, STT_RAW
@@ -238,38 +240,10 @@ def _f4(v: Float64) -> String:
     return (String("-") + b) if neg else b
 
 
-comptime SPEAK_FLAG: String = "/tmp/noeira_g1_speaking"
-# ⚠ how long the room keeps ringing after `say` exits, plus whatever is still
-# in ffmpeg's pipe. Small, but not zero.
+# ⚠ THE TAIL SURVIVES THE REWRITE, but for a different reason than it was
+# first written — see the note at the gate. It is a CAPTURE-BUFFER DRAIN, not
+# an estimate of how long an utterance takes.
 comptime ECHO_TAIL_S: Float64 = 0.45
-
-
-def _speaking() -> Bool:
-    """True while `say` is still talking.
-
-    ⚠ THIS WAS AN ESTIMATE AND THE ESTIMATE WAS NOT CLOSE. The first version
-    predicted the duration from the text at ~14 characters a second: it gave
-    1.24 s for "spin_left", which actually takes **2.79 s** — and
-    "both_hands_up", half again as long in characters, takes **2.20 s**, so
-    the estimate does not even order them correctly. `say` has a start-up
-    cost that dominates a short word, and it pronounces an underscore.
-
-    The robot went on hearing itself, transcribing "SpinLeft" and
-    "SpinLift" back into its own decider, because the gate expired while the
-    speaker was still going.
-
-    `say` has no completion handle, so it gets one: the flag is created
-    before the process and REMOVED BY THE SHELL when it exits. Exact, and the
-    same trick as renaming a finished recording into place.
-    """
-    try:
-        _ = file_size(String(SPEAK_FLAG))
-        return True
-    except:
-        return False
-
-
-comptime SPEAK_TEXT: String = "/tmp/noeira_g1_say.txt"
 
 
 def _ns(seconds: Float64) -> Int:
@@ -282,51 +256,55 @@ def _ns(seconds: Float64) -> Int:
     return Int(seconds * 1000.0) * 1_000_000
 
 
-def _say_async(text: String):
-    """Speak in the background, and leave a flag behind that says so.
+# ⚠ THE ECHO GATE IS NOW `LocalVoice.speaking()` — AN EXACT SIGNAL, AND BOTH
+# THINGS IT REPLACES WERE WRONG IN DIFFERENT WAYS (§12.55, §12.56).
+#
+# First it was an ESTIMATE of `say`'s duration from the text at ~14 characters
+# a second. That gave 1.24 s for "spin_left", which takes **2.79 s**, while
+# "both_hands_up" — half again as long in characters — takes **2.20 s**. The
+# estimate does not even ORDER them correctly, because `say` has a start-up
+# cost that dominates a short word and it pronounces the underscore.
+#
+# Then it was a FLAG FILE, which was exact per utterance and raced across
+# them: two overlapping `say` shells share one file, both remove it, and the
+# FIRST to finish opens the microphone while the SECOND is still audibly
+# talking. That is how "je tourne à gauche" came back through Whisper and
+# re-picked `spin_left`. The workaround was to DROP a second utterance while
+# one was running — a cosmetic loss, accepted only because the race was worse.
+#
+# `LocalVoice` (noeira/ai/audio_io.mojo, commit ecc8f2657 from the
+# `noeira/ai/` session) ends both: `speaking()` reads the child's stdout
+# closing, so it is exact with no timer and no shared state, and `say()` cuts
+# off the previous utterance itself — so the drop-the-second workaround goes
+# too, and a chained step can speak over its predecessor as it should.
+#
+# It also takes ANY TEXT. `quote_arg` refuses a single quote, which is sound
+# for a path and fatal for French — "je m'accroupis" took the whole demo down
+# — so this file used to write the text to a file and call `say -f`. That is
+# now inside `LocalVoice`, and the two /tmp paths it needed are gone.
 
-    ⚠ THE TEXT GOES THROUGH A FILE, NEVER THE COMMAND LINE. `quote_arg`
-    REFUSES a string containing a single quote — a sound rule for a path and
-    a fatal one for speech, because French is full of apostrophes. The first
-    French phrase the robot tried to say was "je m'accroupis", and it took
-    the whole demo down with it. `say -f` reads the text from a file, so
-    nothing in it is ever interpreted by a shell: apostrophes, quotes,
-    accents, newlines.
 
-    ⚠ AND IT CANNOT RAISE. A confirmation is cosmetic; the robot, the
-    physics and the microphone are not. Anything that goes wrong here is
-    swallowed, because the alternative is what happened above.
+def _say(mut v: LocalVoice, text: String):
+    """Speak, and never raise.
 
-    `say` blocks for as long as it speaks, so it cannot run in the loop. The
-    flag is written HERE rather than inside the backgrounded shell, or there
-    would be a window between the spawn and the flag appearing in which the
-    gate is open and the microphone is already live.
+    ⚠ A CONFIRMATION IS COSMETIC; THE ROBOT, THE PHYSICS AND THE MICROPHONE
+    ARE NOT. Anything that goes wrong in here is swallowed, because the
+    alternative is a render loop that stops because the OS voice was busy.
     """
-    # ⚠ NEVER START A SECOND UTTERANCE WHILE ONE IS RUNNING. The flag is a
-    # single shared file: two overlapping `say` shells both remove it, and
-    # the FIRST to finish opens the gate while the SECOND is still speaking.
-    # That is how "je tourne à gauche" — the robot's own phrase for
-    # `spin_left` — came back through Whisper and picked `spin_left` again,
-    # after a chained step spoke while the previous confirmation was still
-    # going. The confirmation is cosmetic and the HUD already shows it, so
-    # the later one is simply dropped.
-    if _speaking():
-        return
     try:
-        write_text_atomic(String(SPEAK_TEXT), text)
-        _ = run_system("touch " + quote_arg(String(SPEAK_FLAG)))
-        _ = run_system(
-            "( say -f " + quote_arg(String(SPEAK_TEXT)) + " ; rm -f "
-            + quote_arg(String(SPEAK_FLAG)) + " ) >/dev/null 2>&1 &"
-        )
+        v.say(text)
     except:
-        # ⚠ and clear the flag, or the gate stays shut for ever and the
-        # microphone never reopens.
-        try:
-            remove_file(String(SPEAK_FLAG))
-        except:
-            pass
+        pass
 
+
+def _is_speaking(mut v: LocalVoice) -> Bool:
+    """`speaking()` raises; a gate that raises would take the loop down, and
+    the safe default is to assume we ARE talking rather than open the
+    microphone onto our own voice."""
+    try:
+        return v.speaking()
+    except:
+        return True
 comptime FNet = BFMFTower[OBS, ACT, D, G1_H, G1_L, D]
 comptime BNet = BFMBNetFiltered[OBS, SP, D, G1_HB]
 comptime ANet = BFMActorTowerFiltered[
@@ -552,6 +530,10 @@ def main() raises:
             ph_text.append(String(pl[byte=eq + 1:pl.byte_length()]))
         print("  phrases:", len(ph_name), "from", phrase_file)
 
+    # one voice for the whole session: `say` cuts off its own predecessor,
+    # so there is no second instance to race with.
+    var voice = LocalVoice()
+
     var mic_dead = String("")
     var checked_silence = False
     var mic_on = True
@@ -712,7 +694,14 @@ def main() raises:
         # ⚠ still READ while the robot speaks — the pipe is 64 KiB, about 2 s,
         # and past that ffmpeg blocks and the device drops audio. The samples
         # are read and DISCARDED, never ringed, never levelled.
-        if _speaking():
+        # ⚠ THE TAIL IS NOW A CAPTURE-BUFFER DRAIN, NOT A DURATION GUESS, and
+        # the distinction is why it survives. `speaking()` goes false the
+        # instant playback ends, but ffmpeg's pipe is 64 KiB — about 2 s — so
+        # samples recorded WHILE the robot was talking are still queued behind
+        # it. They are read and discarded for one more tail's worth, which is
+        # a fixed window for a known buffer rather than a guess at how long a
+        # sentence takes.
+        if _is_speaking(voice):
             mute_until = perf_counter_ns() + _ns(ECHO_TAIL_S)
         var echoing = perf_counter_ns() < mute_until
         if mic_on and mic_dead == "":
@@ -968,7 +957,7 @@ def main() raises:
                             if pick.needs_world > 0.5:
                                 utter = utter + String(
                                     ", but I have no object or destination")
-                            _say_async(utter)
+                            _say(voice, utter)
                             mute_until = perf_counter_ns() + _ns(ECHO_TAIL_S)
                 elif pick.talk:
                     # ⚠ NOT a bank command: the speaker wanted an answer.
@@ -1091,7 +1080,7 @@ def main() raises:
                             # so the robot says the QUANTITY it is about to
                             # move. Silence here reads as "it did not
                             # understand", which is the opposite of true.
-                            _say_async(String("ok, ") + what)
+                            _say(voice, String("ok, ") + what)
                             mute_until = perf_counter_ns() + _ns(ECHO_TAIL_S)
                     elif v.nearest >= 0:
                         # the spec IS a bank entry: run the GATED row, which
@@ -1106,7 +1095,7 @@ def main() raises:
                             for pi in range(len(ph_name)):
                                 if ph_name[pi] == bank.name_at(v.nearest):
                                     u3 = ph_text[pi]
-                            _say_async(u3)
+                            _say(voice, u3)
                             mute_until = perf_counter_ns() + _ns(ECHO_TAIL_S)
                     else:
                         print("  [spec] REFUSED:", v.reason)
@@ -1140,7 +1129,7 @@ def main() raises:
                 print("  [said]", rtxt)
                 heard = rtxt
                 if not mute and rtxt != "":
-                    _say_async(rtxt)
+                    _say(voice, rtxt)
                     mute_until = perf_counter_ns() + _ns(ECHO_TAIL_S)
                     last_event = String("replied")
                 state = ST_IDLE
@@ -1249,7 +1238,7 @@ def main() raises:
                     for pi in range(len(ph_name)):
                         if ph_name[pi] == nxt:
                             u2 = ph_text[pi]
-                    _say_async(u2)
+                    _say(voice, u2)
                     mute_until = perf_counter_ns() + _ns(ECHO_TAIL_S)
 
         # ⚠ LOCOMOTION HAS NO NATURAL END. A posture holds itself because `z`
