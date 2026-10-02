@@ -7,3 +7,5 @@
 # ~/.cache/noeira/lewm_pusht/hf/ (docs/LEWM_REOPEN_PLAN.md P1/P2).
 tests/experimental/lewm/ref/test_ref_forward.mojo
 tests/experimental/lewm/ref/test_ref_train.mojo
+tests/experimental/lewm/ref/test_ref_rollout.mojo
+tests/experimental/lewm/ref/test_ref_cem.mojo

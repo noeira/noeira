@@ -584,6 +584,51 @@ def section_rollout(dump: Dump, model, dtype, rng, s: int = 8, horizon: int = 5)
           f"cost {cost.flatten()[:4].tolist()} ...")
 
 
+def section_cem(dump: Dump, model, dtype, rng, num_samples: int = 64,
+                n_steps: int = 4, topk: int = 8, horizon: int = 5, seed: int = 1234):
+    """`stable_worldmodel` 0.1.1 `CEMSolver.solve` for ONE env, replicated
+    line for line (solver/cem.py imports gymnasium/loguru) around the model's
+    own `get_cost`. Per iteration k the dump holds what the gate needs to
+    re-run that iteration from torch's state: the raw noise, the incoming
+    mean / std, the costs, the elite indices, the updated mean / std.
+    Smaller than the eval budget (300 x 30, top 30) — the semantics are the
+    same; only a float64 run's cost differs."""
+    model.eval()
+    u8 = frames_sequence(rng, 2, 1)[:, 0]
+    pix = preprocess(u8, dtype)
+    info = {
+        "pixels": pix[0].expand(1, num_samples, 1, *pix.shape[1:]),
+        "goal": pix[1].expand(1, num_samples, 1, *pix.shape[1:]),
+        "action": torch.zeros(1, num_samples, 1, ACT_DIM, dtype=dtype),
+    }
+    dump.add("cem.start_pixels", pix[0])
+    dump.add("cem.goal_pixels", pix[1])
+    gen = torch.Generator().manual_seed(seed)
+    # init_action_distrib: var = var_scale * ones, mean = zeros (no warm start)
+    mean = torch.zeros(1, horizon, ACT_DIM, dtype=dtype)
+    var = 1.0 * torch.ones(1, horizon, ACT_DIM, dtype=dtype)
+    with torch.no_grad():
+        for k in range(n_steps):
+            noise = torch.randn(1, num_samples, horizon, ACT_DIM, generator=gen, dtype=dtype)
+            candidates = noise * var.unsqueeze(1) + mean.unsqueeze(1)
+            candidates[:, 0] = mean
+            costs = model.get_cost(info, candidates)
+            topk_vals, topk_inds = torch.topk(costs, k=topk, dim=1, largest=False)
+            topk_candidates = candidates[torch.zeros(1, topk, dtype=torch.long), topk_inds]
+            dump.add(f"cem.{k}.noise", noise)
+            dump.add(f"cem.{k}.mean_in", mean)
+            dump.add(f"cem.{k}.var_in", var)
+            dump.add(f"cem.{k}.costs", costs)
+            dump.add(f"cem.{k}.topk_inds", topk_inds.double())
+            mean = topk_candidates.mean(dim=1)
+            var = topk_candidates.std(dim=1)
+            dump.add(f"cem.{k}.mean_out", mean)
+            dump.add(f"cem.{k}.var_out", var)
+    dump.add("cem.actions", mean)
+    print(f"  cem: {n_steps} iterations x {num_samples} samples, top {topk}; "
+          f"final elite cost {topk_vals.mean().item():.4g}")
+
+
 def _noise(dump: Dump, name: str, ref64, got32):
     """max |f32 - f64| / std(f64): torch's own float32 error at this stage."""
     r = ref64.double()
@@ -597,7 +642,7 @@ def _noise(dump: Dump, name: str, ref64, got32):
 # --------------------------------------------------------------------------- #
 
 
-SECTIONS = ("params", "encoder", "action", "predictor", "train", "rollout")
+SECTIONS = ("params", "encoder", "action", "predictor", "train", "rollout", "cem")
 
 
 def main():
@@ -635,6 +680,8 @@ def main():
         section_predictor(dump, model, dtype, sub(3), b=4, f32_model=f32)
     if run("rollout"):  # before `train`: the optimizer step mutates the model
         section_rollout(dump, model, dtype, sub(5))
+    if run("cem"):
+        section_cem(dump, model, dtype, sub(6))
     if run("train"):
         section_train(dump, model, dtype, sub(4), f32_model=f32)
     dump.close()

@@ -1,0 +1,276 @@
+"""LeWM planning rollout, reference-exact: `stable_worldmodel` 0.1.1
+`LeWM.rollout` + `criterion` (`references/stable-worldmodel-0.1.1/.../lewm.py`).
+
+docs/LEWM_REOPEN_PLAN.md P3. With the eval config's `history_size: 1` the
+context starts at ONE encoded frame and grows to the predictor's 3:
+
+    emb[0] = encode(start);  act_emb[k] = ActionEmbedder(candidate block k)
+    for t in 0 ..< HORIZON:
+        lo = max(0, t + 1 - 3);  L = t + 1 - lo           # 1, 2, 3, 3, 3
+        emb[t+1] = Predictor(emb[lo..t] + pos[0..L-1],  act_emb[lo..t])[L-1]
+    cost = Σ_d (emb[HORIZON] - goal)²                       # last step only
+
+Variable L on a fixed 3-token predictor: the real L tokens sit at positions
+0..L-1 and the tail is zero padding. Attention is CAUSAL and every other op
+(AdaLN modulation, the LayerNorms, the FFN, pred_proj with BN in EVAL mode) is
+per token, so output L-1 never sees the padding and equals the reference's
+L-token result — and the position embedding is the reference's `pos[:, :L]`.
+(The old port replicated the current latent into all 3 slots: audit A.5.)
+
+⚠ Activations round-trip the host between module calls (`_up` / `_down`).
+Fine for the gates and the semantics; the first thing to move on device when
+the full CEM budget (300 x 30 per replan) runs in P5.
+"""
+
+from std.math import sqrt
+from max.gpu.host import DeviceContext
+
+from noeira.nn.constants import DT
+from noeira.nn.core.tensor import Tensor
+from noeira.nn.core.tensor_pack import TensorPack
+from noeira.nn.core.tensor_refs import TensorRefs
+from noeira.nn.core.initializer import Kaiming
+from noeira.nn import BiasAdd, RepeatConditional, Tokenwise, LayerNorm
+from .ref_model import (
+    ActionEmbedderRef,
+    ConditionalTransformerBlockRef,
+    ProjectorRef,
+    LeWMEncoderRef,
+    TORCH_LN_EPS,
+)
+from .ref_load import load_ref
+
+
+# the published model (config.json of quentinll/lewm-pusht)
+comptime REF_EMB = 192
+comptime REF_ACT = 10       # frameskip 5 x 2
+comptime REF_CTX = 3        # predictor num_frames
+comptime REF_DEPTH = 6
+comptime REF_PROJ_H = 2048
+
+comptime RefEncoder = LeWMEncoderRef[3, 224, 14, 192, 3, 12, REF_EMB, REF_PROJ_H]
+
+
+def _up[target: StaticString](
+    vals: List[Scalar[DT]], ctx: Optional[DeviceContext]
+) raises -> Tensor:
+    var t = Tensor.alloc(len(vals))
+    for i in range(len(vals)):
+        t.data[i] = vals[i]
+    comptime if target == "gpu":
+        t.upload(ctx.value())
+    return t^
+
+
+def _down[target: StaticString](
+    mut t: Tensor, n: Int, ctx: Optional[DeviceContext]
+) raises -> List[Scalar[DT]]:
+    comptime if target == "gpu":
+        ctx.value().synchronize()
+        t.download(ctx.value())
+    var out = List[Scalar[DT]](capacity=n)
+    for i in range(n):
+        out.append(t.data[i])
+    return out^
+
+
+def encode_ref[target: StaticString, N: Int](
+    mut enc: RefEncoder, pixels: List[Scalar[DT]], ctx: Optional[DeviceContext]
+) raises -> List[Scalar[DT]]:
+    """N ImageNet-normalised CHW frames -> N x EMB (BN in eval mode)."""
+    enc.set_attr["training"](Scalar[DT](0.0))
+    var x = _up[target](pixels, ctx)
+    var out = Tensor.alloc(N * REF_EMB)
+    enc.forward[target, N](TensorRefs[1](x), out, ctx)
+    return _down[target](out, N * REF_EMB, ctx)
+
+
+struct LeWMRefRollout[target: StaticString, S: Int, HORIZON: Int]:
+    """S candidate action sequences of HORIZON blocks, rolled out from one
+    start embedding. The predictor and action embedder of the published
+    model, loaded by the loss graph's walk names (`ref_load`)."""
+
+    comptime D = REF_EMB
+    comptime H = REF_CTX
+
+    var ae: ActionEmbedderRef[Self.HORIZON, REF_ACT, REF_EMB]
+    var pe: BiasAdd[REF_CTX * REF_EMB]
+    var pred: RepeatConditional[
+        REF_DEPTH,
+        ConditionalTransformerBlockRef[REF_EMB, 16, REF_CTX, 2048, 64],
+    ]
+    var ln: Tokenwise[REF_CTX, LayerNorm[REF_EMB, DT, TORCH_LN_EPS]]
+    var pp: Tokenwise[REF_CTX, ProjectorRef[REF_EMB, REF_PROJ_H, REF_EMB]]
+    var ctx: Optional[DeviceContext]
+
+    def __init__(out self, dump_dir: String, ctx: Optional[DeviceContext]) raises:
+        self.ctx = ctx
+        self.ae = ActionEmbedderRef[Self.HORIZON, REF_ACT, REF_EMB].make[
+            Self.target, Kaiming
+        ](ctx)
+        self.pe = BiasAdd[REF_CTX * REF_EMB].make[Self.target, Kaiming](ctx)
+        self.pred = RepeatConditional[
+            REF_DEPTH,
+            ConditionalTransformerBlockRef[REF_EMB, 16, REF_CTX, 2048, 64],
+        ].make[Self.target, Kaiming](ctx)
+        self.ln = Tokenwise[REF_CTX, LayerNorm[REF_EMB, DT, TORCH_LN_EPS]].make[
+            Self.target, Kaiming
+        ](ctx)
+        self.pp = Tokenwise[REF_CTX, ProjectorRef[REF_EMB, REF_PROJ_H, REF_EMB]].make[
+            Self.target, Kaiming
+        ](ctx)
+        _ = load_ref[Self.target](self.ae, dump_dir, String("act_emb."), ctx)
+        _ = load_ref[Self.target](self.pe, dump_dir, String("x_pe."), ctx)
+        _ = load_ref[Self.target](self.pred, dump_dir, String("pred_raw."), ctx)
+        _ = load_ref[Self.target](self.ln, dump_dir, String("pred_ln."), ctx)
+        _ = load_ref[Self.target](self.pp, dump_dir, String("pred."), ctx)
+        self.pp.set_attr["training"](Scalar[DT](0.0))
+
+    def _predict_last(
+        mut self,
+        x_ctx: List[Scalar[DT]],
+        c_ctx: List[Scalar[DT]],
+        L: Int,
+    ) raises -> List[Scalar[DT]]:
+        """One predictor pass over (S, 3, D) left-aligned contexts; returns
+        the output token L-1 of every row, (S, D)."""
+        comptime HD = REF_CTX * REF_EMB
+        var x = _up[Self.target](x_ctx, self.ctx)
+        var xp = Tensor.alloc(Self.S * HD)
+        self.pe.forward[Self.target, Self.S](TensorRefs[1](x), xp, self.ctx)
+        var ins = TensorPack[2]()
+        var xh = _down[Self.target](xp, Self.S * HD, self.ctx)
+        ins[0].ensure(Self.S * HD)
+        ins[1].ensure(Self.S * HD)
+        for q in range(Self.S * HD):
+            ins[0].data[q] = xh[q]
+            ins[1].data[q] = c_ctx[q]
+        comptime if Self.target == "gpu":
+            ins[0].upload(self.ctx.value())
+            ins[1].upload(self.ctx.value())
+        var y = Tensor.alloc(Self.S * HD)
+        self.pred.forward[Self.target, Self.S](TensorRefs[2](ins[0], ins[1]), y, self.ctx)
+        var z = Tensor.alloc(Self.S * HD)
+        self.ln.forward[Self.target, Self.S](TensorRefs[1](y), z, self.ctx)
+        var p = Tensor.alloc(Self.S * HD)
+        self.pp.forward[Self.target, Self.S](TensorRefs[1](z), p, self.ctx)
+        var ph = _down[Self.target](p, Self.S * HD, self.ctx)
+        var out = List[Scalar[DT]](capacity=Self.S * Self.D)
+        for s in range(Self.S):
+            for d in range(Self.D):
+                out.append(ph[s * HD + (L - 1) * Self.D + d])
+        return out^
+
+    def rollout(
+        mut self, start_emb: List[Scalar[DT]], actions: List[Scalar[DT]]
+    ) raises -> List[Scalar[DT]]:
+        """start_emb (D), actions (S, HORIZON, ACT) z-scored ->
+        predicted embeddings (S, HORIZON + 1, D); entry 0 is the start."""
+        comptime D = Self.D
+        comptime T1 = Self.HORIZON + 1
+        var a = _up[Self.target](actions, self.ctx)
+        var ae_t = Tensor.alloc(Self.S * Self.HORIZON * D)
+        self.ae.forward[Self.target, Self.S](TensorRefs[1](a), ae_t, self.ctx)
+        var act_emb = _down[Self.target](ae_t, Self.S * Self.HORIZON * D, self.ctx)
+
+        var embs = List[Scalar[DT]](length=Self.S * T1 * D, fill=Scalar[DT](0))
+        for s in range(Self.S):
+            for d in range(D):
+                embs[(s * T1) * D + d] = start_emb[d]
+        for t in range(Self.HORIZON):
+            var lo = max(0, t + 1 - Self.H)
+            var L = t + 1 - lo
+            var x = List[Scalar[DT]](length=Self.S * Self.H * D, fill=Scalar[DT](0))
+            var c = List[Scalar[DT]](length=Self.S * Self.H * D, fill=Scalar[DT](0))
+            for s in range(Self.S):
+                for j in range(L):
+                    for d in range(D):
+                        x[(s * Self.H + j) * D + d] = embs[(s * T1 + lo + j) * D + d]
+                        c[(s * Self.H + j) * D + d] = act_emb[
+                            (s * Self.HORIZON + lo + j) * D + d
+                        ]
+            var nxt = self._predict_last(x, c, L)
+            for s in range(Self.S):
+                for d in range(D):
+                    embs[(s * T1 + t + 1) * D + d] = nxt[s * D + d]
+        return embs^
+
+    def cost(
+        self, embs: List[Scalar[DT]], goal_emb: List[Scalar[DT]]
+    ) -> List[Scalar[DT]]:
+        """`criterion`: Σ_d (emb[HORIZON] - goal)² per row."""
+        comptime D = Self.D
+        comptime T1 = Self.HORIZON + 1
+        var out = List[Scalar[DT]](capacity=Self.S)
+        for s in range(Self.S):
+            var acc = Float64(0)
+            for d in range(D):
+                var diff = Float64(embs[(s * T1 + Self.HORIZON) * D + d]) - Float64(goal_emb[d])
+                acc += diff * diff
+            out.append(Scalar[DT](acc))
+        return out^
+
+
+@fieldwise_init
+struct CEMStep(Movable):
+    """One CEM iteration's result (`cem_step`)."""
+
+    var candidates: List[Scalar[DT]]  # (S, HORIZON, ACT)
+    var costs: List[Scalar[DT]]       # (S)
+    var elite: List[Int]              # K indices, ascending cost
+    var mean: List[Scalar[DT]]        # (HORIZON, ACT)
+    var std: List[Scalar[DT]]         # (HORIZON, ACT), unbiased
+
+
+def cem_step[
+    target: StaticString, S: Int, HORIZON: Int, K: Int
+](
+    mut roll: LeWMRefRollout[target, S, HORIZON],
+    start_emb: List[Scalar[DT]],
+    goal_emb: List[Scalar[DT]],
+    mean: List[Scalar[DT]],
+    std: List[Scalar[DT]],
+    noise: List[Scalar[DT]],
+) raises -> CEMStep:
+    """`CEMSolver.solve`'s loop body (stable_worldmodel 0.1.1 solver/cem.py),
+    one env:
+
+        candidates = noise * var + mean;  candidates[0] = mean
+        costs = get_cost(candidates)
+        elite = topk(costs, K, largest=False)          (ascending)
+        mean, var = elite.mean(0), elite.std(0)        (torch std: unbiased)
+
+    `var` in the reference IS a standard deviation (it multiplies the noise).
+    `noise` is the caller's (S, HORIZON, ACT) draw, so a gate can replay
+    torch's generator exactly."""
+    comptime A = HORIZON * REF_ACT
+    var cand = List[Scalar[DT]](length=S * A, fill=Scalar[DT](0))
+    for s in range(S):
+        for i in range(A):
+            cand[s * A + i] = mean[i] if s == 0 else noise[s * A + i] * std[i] + mean[i]
+    var embs = roll.rollout(start_emb, cand)
+    var costs = roll.cost(embs, goal_emb)
+    # top-K smallest, ascending (partial selection; K << S)
+    var taken = List[Bool](length=S, fill=False)
+    var elite = List[Int](capacity=K)
+    for _ in range(K):
+        var best = -1
+        for s in range(S):
+            if not taken[s] and (best < 0 or costs[s] < costs[best]):
+                best = s
+        taken[best] = True
+        elite.append(best)
+    var m = List[Scalar[DT]](length=A, fill=Scalar[DT](0))
+    var v = List[Scalar[DT]](length=A, fill=Scalar[DT](0))
+    for i in range(A):
+        var acc = Float64(0)
+        for k in range(K):
+            acc += Float64(cand[elite[k] * A + i])
+        var mu = acc / Float64(K)
+        var ss = Float64(0)
+        for k in range(K):
+            var d = Float64(cand[elite[k] * A + i]) - mu
+            ss += d * d
+        m[i] = Scalar[DT](mu)
+        v[i] = Scalar[DT](sqrt(ss / Float64(K - 1)))
+    return CEMStep(cand^, costs^, elite^, m^, v^)
