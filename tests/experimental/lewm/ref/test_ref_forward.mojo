@@ -39,10 +39,12 @@ from noeira.experimental.lewm.ref_model import (
     HF_VIT_LN_EPS,
     TORCH_LN_EPS,
 )
-from noeira.experimental.lewm.ref_load import load_ref, ref_input, std_err
+from noeira.experimental.lewm.ref_load import load_ref, ref_input, std_err, tf32_gemm
 
 
 comptime TOL = 1e-4
+comptime TOL_TF32 = 3e-2
+"""CUDA's GPU leg (`tf32_gemm`): measured worst 1.1e-2 on a 5090."""
 
 # published config (config.json): ViT-tiny/14 at 224, EMB 192, predictor 6 x 16 x 64
 comptime IMG = 224
@@ -61,16 +63,18 @@ comptime H = 3
 struct Gate(Movable):
     var worst: Float64
     var failed: List[String]
+    var tol: Float64
 
     def __init__(out self):
         self.worst = 0.0
         self.failed = List[String]()
+        self.tol = TOL
 
     def check(mut self, label: String, err: Float64):
-        var flag = String("  ") if err <= TOL else String("✗ ")
+        var flag = String("  ") if err <= self.tol else String("✗ ")
         print("   ", flag, label, " ", err, sep="")
         self.worst = max(self.worst, err)
-        if err > TOL:
+        if err > self.tol:
             self.failed.append(label)
 
 
@@ -185,11 +189,16 @@ def main() raises:
     print("G2a  LeWM reference forward, stage by stage (max |ours-torch| / std(torch); TOL", TOL, ")")
     var g = Gate()
     print("  -- cpu")
+    g.tol = TOL
     _encoder["cpu"](dump, None, g)
     _action["cpu"](dump, None, g)
     _predictor["cpu"](dump, None, g)
     var c = DeviceContext()
-    print("  -- gpu")
+    g.tol = TOL_TF32 if tf32_gemm["gpu"]() else TOL
+    if tf32_gemm["gpu"]():
+        print("  -- gpu (TF32 GEMMs: band", g.tol, ")")
+    else:
+        print("  -- gpu")
     _encoder["gpu"](dump, Optional(c), g)
     _action["gpu"](dump, Optional(c), g)
     _predictor["gpu"](dump, Optional(c), g)

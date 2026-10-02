@@ -17,6 +17,7 @@ the format.
 """
 
 from std.math import abs, sqrt
+from std.sys import has_nvidia_gpu_accelerator
 from max.gpu.host import DeviceContext
 
 from noeira.nn.constants import DT
@@ -83,6 +84,19 @@ def load_ref[
     module.for_each_state[target](v, ctx)
     v.check()
     return v.loaded
+
+
+def tf32_gemm[target: StaticString]() -> Bool:
+    """True when this target's float32 GEMMs run TF32: on NVIDIA, MAX's
+    multistage matmul cannot disable TF32 for float32 outside SM100 (a 5090
+    is SM120). Metal has no TF32; the CPU none either. A reference gate then
+    holds the GPU leg to a TF32 band (10-bit mantissa) — and checks gradients
+    by DIRECTION, since TF32 rounding inside cancelling sums puts single
+    gradients ~0.3 std off while a wrong VJP flips or rotates them. The CPU
+    leg on the same machine keeps the exact float32 check."""
+    comptime if target == "gpu":
+        return has_nvidia_gpu_accelerator()
+    return False
 
 
 def ref_input[target: StaticString](

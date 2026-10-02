@@ -41,10 +41,19 @@ from noeira.nn.core.param import ParamVisitor
 from noeira.nn.core.initializer import Kaiming
 from noeira.deep_agents.act.refload import RefDump
 from noeira.experimental.lewm.ref_model import LeWMLossGraphRef
-from noeira.experimental.lewm.ref_load import LoadRef, ref_input, std_err
+from noeira.experimental.lewm.ref_load import LoadRef, ref_input, std_err, tf32_gemm
 
 
 comptime TOL = 1e-4
+comptime TOL_TF32 = 3e-2
+"""CUDA's GPU leg (`tf32_gemm`), activations and BN stats (5090: 7e-3 / 1e-2)."""
+comptime REL_TF32 = 1e-2
+"""CUDA: loss and gradient norm, relative (5090: 1.7e-3 / 3.0e-3)."""
+comptime COS_TF32 = 0.999
+"""CUDA: per-tensor cosine with torch's gradient. TF32 rounding inside
+cancelling sums leaves single entries up to ~0.3 std off (an AdaLN gate on a
+5090) but keeps the DIRECTION; a wrong VJP — a sign, a transpose, a missing
+term — does not."""
 comptime B = 4
 comptime T = 4
 comptime H = 3
@@ -71,10 +80,14 @@ struct _GradCheck(ParamVisitor):
     var sumsq: Float64
     var rms: Float64
     var worst_ratio: Float64
+    var tf32: Bool
+    var worst_cos: Float64
 
-    def __init__(out self, var dump: RefDump) raises:
+    def __init__(out self, var dump: RefDump, tf32: Bool) raises:
         self.rms = Float64(dump.get(String("train.grad_rms"))[0])
         self.worst_ratio = 0.0
+        self.tf32 = tf32
+        self.worst_cos = 1.0
         self.dump = dump^
         self.worst = 0.0
         self.worst_name = String("")
@@ -101,11 +114,19 @@ struct _GradCheck(ParamVisitor):
         mean /= Float64(N)
         var var_ = 0.0
         var worst = 0.0
+        var dot = 0.0
+        var nw = 0.0
+        var ng = 0.0
         for i in range(N):
             var d = Float64(want[i]) - mean
             var_ += d * d
-            worst = max(worst, abs(Float64(grad.data[i]) - Float64(want[i])))
-            self.sumsq += Float64(grad.data[i]) * Float64(grad.data[i])
+            var gi = Float64(grad.data[i])
+            var wi = Float64(want[i])
+            worst = max(worst, abs(gi - wi))
+            self.sumsq += gi * gi
+            dot += gi * wi
+            nw += wi * wi
+            ng += gi * gi
         # floor at the global gradient RMS: several tensors have an EXACT zero
         # gradient (a bias / LN beta feeding a train-mode BatchNorm, attention
         # key biases), where std(torch) is roundoff (see the dumper)
@@ -118,13 +139,25 @@ struct _GradCheck(ParamVisitor):
         if err > self.worst:
             self.worst = err
             self.worst_name = name
+        if self.tf32:
+            # an exact-zero gradient has no direction: hold it to the band
+            if sqrt(var_ / Float64(N)) < 1e-6 * self.rms:
+                if err > TOL_TF32:
+                    self.failed.append(name + " (zero grad) " + String(err))
+                return
+            var cos = dot / max(sqrt(nw) * sqrt(ng), 1e-300)
+            self.worst_cos = min(self.worst_cos, cos)
+            if cos < COS_TF32:
+                self.failed.append(name + " cos " + String(cos))
+            return
         self.worst_ratio = max(self.worst_ratio, err / tol)
         if err > tol:
             self.failed.append(name + " " + String(err) + " (tol " + String(tol) + ")")
 
 
 def _node_err[NODE: StaticString, target: StaticString](
-    mut g: Graph, dump: String, ref_name: String, ctx: Optional[DeviceContext]
+    mut g: Graph, dump: String, ref_name: String, ctx: Optional[DeviceContext],
+    tol: Float64,
 ) raises -> Float64:
     ref out = g.node_output[NODE]()
     comptime if target == "gpu":
@@ -134,7 +167,7 @@ def _node_err[NODE: StaticString, target: StaticString](
     for i in range(out.n):
         t.data[i] = out.data[i]
     var e = std_err["cpu"](dump, ref_name, t, ctx)
-    var flag = String("  ") if e <= TOL else String("✗ ")
+    var flag = String("  ") if e <= tol else String("✗ ")
     print("     ", flag, NODE, " ", e, sep="")
     return e
 
@@ -177,7 +210,13 @@ struct _BNCheck(ParamVisitor):
 
 
 def _run[target: StaticString](dump: String, ctx: Optional[DeviceContext]) raises -> Int:
-    print("  --", target)
+    var tf32 = tf32_gemm[target]()
+    var tol = TOL_TF32 if tf32 else TOL
+    var rel_tol = REL_TF32 if tf32 else 1e-5
+    if tf32:
+        print("  --", target, "(TF32 GEMMs: bands", tol, rel_tol, ", gradients by cosine >=", COS_TF32, ")")
+    else:
+        print("  --", target)
     var g = Graph.make[target, Kaiming](ctx)
     var lv = LoadRef(RefDump(dump), String(""))
     g.for_each_param[target](lv, ctx)
@@ -220,35 +259,36 @@ def _run[target: StaticString](dump: String, ctx: Optional[DeviceContext]) raise
     var want_loss = Float64(RefDump(dump).get(String("train.loss"))[0])
     var rel = abs(lm - want_loss) / abs(want_loss)
     print("     loss  ours", lm, " torch", want_loss, " rel", rel)
-    if rel > 1e-5:
+    if rel > rel_tol:
         fails += 1
         print("     ✗ loss")
 
-    var e_emb = _node_err["emb", target](g, dump, String("train.emb"), ctx)
-    var e_pred = _node_err["pred", target](g, dump, String("train.pred_emb"), ctx)
+    var e_emb = _node_err["emb", target](g, dump, String("train.emb"), ctx, tol)
+    var e_pred = _node_err["pred", target](g, dump, String("train.pred_emb"), ctx, tol)
     for e in [e_emb, e_pred]:
-        if e > TOL:
+        if e > tol:
             fails += 1
 
     var bc = _BNCheck(RefDump(dump))
     g.for_each_state[target](bc, ctx)
     print("     BN running stats after the step:", bc.n_checked, "checked; worst", bc.worst)
-    if bc.n_checked != 4 or bc.worst > TOL:
+    if bc.n_checked != 4 or bc.worst > tol:
         fails += 1
         print("     ✗ BN running stats")
 
-    var gc = _GradCheck(RefDump(dump))
+    var gc = _GradCheck(RefDump(dump), tf32)
     g.for_each_param[target](gc, ctx)
     var want_norm = Float64(RefDump(dump).get(String("adamw.grad_norm"))[0])
     var norm = sqrt(gc.sumsq)
     var nrel = abs(norm - want_norm) / want_norm
     print("     grads:", gc.n_checked, "checked,", gc.n_skipped, "skipped (qkv bias); worst",
-          gc.worst, "at", gc.worst_name, "; worst err/tol", gc.worst_ratio)
+          gc.worst, "at", gc.worst_name, "; worst err/tol", gc.worst_ratio,
+          "; worst cosine", gc.worst_cos)
     print("     grad norm ours", norm, " torch", want_norm, " rel", nrel)
     for f in gc.failed:
         print("     ✗ grad", f)
     fails += len(gc.failed)
-    if nrel > 1e-5:
+    if nrel > rel_tol:
         fails += 1
         print("     ✗ grad norm")
     if gc.n_checked != 309:
