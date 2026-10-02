@@ -41,7 +41,7 @@ from noeira.nn.core.tensor import Tensor
 from noeira.nn.core.param import ParamVisitor
 from noeira.nn.core.initializer import Kaiming
 from noeira.nn.optimizer.adam import Adam
-from noeira.deep_agents.act.refload import RefDump
+from noeira.deep_agents.act.refload import RefDump, _fill
 from .ref_model import LeWMLossGraphRef
 from .ref_load import LoadRef
 from noeira.nn.optimizer.grad_clip import _sum_sq_kernel_rt, GC_TPB
@@ -272,6 +272,60 @@ struct _AdamWAll(ParamVisitor):
         )
 
 
+def _write_f32(path: String, t: Tensor, n: Int) raises:
+    var bytes = List[UInt8](capacity=n * 4)
+    var p = t.data.unsafe_ptr().bitcast[UInt8]()
+    for i in range(n * 4):
+        bytes.append(p[i])
+    write_file_atomic(path, bytes)
+
+
+struct _MomentIO(ParamVisitor):
+    """Adam's first / second moments as `adam_m.<name>` / `adam_v.<name>`:
+    written (SAVE) or read back (LOAD) — the optimizer half of a resume."""
+
+    var dir: String
+    var save: Bool
+    var manifest: String
+    var dump: Optional[RefDump]
+    var n: Int
+
+    def __init__(out self, dir: String, save: Bool) raises:
+        self.dir = dir
+        self.save = save
+        self.manifest = String("")
+        self.dump = None if save else Optional(RefDump(dir))
+        self.n = 0
+
+    def visit[target: StaticString, N: Int](
+        mut self, name: String, mut param: Tensor, mut grad: Tensor,
+        mut m: Tensor, mut v: Tensor, apply_decay: Bool,
+        ctx: Optional[DeviceContext],
+    ) raises:
+        if self.save:
+            comptime if target == "gpu":
+                if not m.dev:
+                    return  # never stepped (the masked qkv bias stays at 0)
+                ctx.value().synchronize()
+                m.download(ctx.value())
+                v.download(ctx.value())
+            else:
+                if m.n < N:
+                    return
+            _write_f32(self.dir + "/adam_m." + name + ".bin", m, N)
+            _write_f32(self.dir + "/adam_v." + name + ".bin", v, N)
+            self.manifest += "adam_m." + name + "\t" + String(N) + "\n"
+            self.manifest += "adam_v." + name + "\t" + String(N) + "\n"
+            self.n += 1
+            return
+        ref d = self.dump.value()
+        if not d.has(String("adam_m.") + name):
+            return
+        _fill(m, d.get(String("adam_m.") + name), ctx)
+        _fill(v, d.get(String("adam_v.") + name), ctx)
+        self.n += 1
+
+
 struct _DumpWriter(ParamVisitor):
     """Every Param / State as `ours.<name>.bin` (float32 LE) + a manifest line —
     the format `RefDump` / `load_ref` read, so a checkpoint loads where the
@@ -489,6 +543,41 @@ struct LeWMRefTrainer[target: StaticString, B: Int](Movable):
             if b == UInt8(ord("\n")):
                 n += 1
         return n
+
+    def save_resume(mut self, dir: String) raises -> Int:
+        """Everything a resume needs into `dir`: params + BN state (as
+        `save_dump`), Adam's moments, and its step state (`adam.txt`: t,
+        β₁ᵗ, β₂ᵗ — the moments alone do not resume Adam, see
+        `Adam.put_step_state`). Returns the tensors with moments."""
+        makedirs(dir, exist_ok=True)
+        var w = _DumpWriter(dir)
+        self.graph.for_each_param[Self.target](w, self.ctx)
+        self.graph.for_each_state[Self.target](w, self.ctx)
+        var mw = _MomentIO(dir, True)
+        self.graph.for_each_param[Self.target](mw, self.ctx)
+        with open(dir + "/manifest.txt", "w") as f:
+            f.write(w.manifest + mw.manifest)
+        ref a = self.opt.adam
+        with open(dir + "/adam.txt", "w") as f:
+            f.write(String(a.t) + "\n" + String(Float64(a._b1_pow)) + "\n" + String(Float64(a._b2_pow)) + "\n")
+        return mw.n
+
+    def load_resume(mut self, dir: String) raises -> Int:
+        """Inverse of `save_resume`."""
+        _ = self.load(dir)
+        var mr = _MomentIO(dir, False)
+        self.graph.for_each_param[Self.target](mr, self.ctx)
+        var lines = List[String]()
+        with open(dir + "/adam.txt", "r") as f:
+            for l in f.read().split("\n"):
+                if l.byte_length() > 0:
+                    lines.append(String(l))
+        self.opt.adam.t = Int(lines[0])
+        self.opt.adam._b1_pow = Scalar[DT](Float64(lines[1]))
+        self.opt.adam._b2_pow = Scalar[DT](Float64(lines[2]))
+        self.opt.adam.bc1 = Scalar[DT](1.0) - self.opt.adam._b1_pow
+        self.opt.adam.bc2 = Scalar[DT](1.0) - self.opt.adam._b2_pow
+        return mr.n
 
     def _stage_in(mut self, act: List[Scalar[DT]], slot: Int) raises:
         """Staging slot -> device uint8 -> normalised `pix`; actions up."""
