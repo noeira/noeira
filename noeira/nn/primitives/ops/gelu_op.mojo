@@ -1,35 +1,30 @@
-"""GELUOp — `ElementOp` for the GELU activation (tanh approximation).
+"""GELUOp — `ElementOp` for the EXACT (erf) GELU.
 
-Matches `jax.nn.gelu(x, approximate=True)`, which is what the DreamerV3
-reference `embodied/jax/nets.py:act('gelu')` resolves to:
+    y      = 0.5 · x · (1 + erf(x / √2))          = x · Φ(x)
+    dy/dx  = Φ(x) + x · φ(x),   φ(x) = exp(-x²/2) / √(2π)
 
-    c   = sqrt(2/π)
-    u   = c · (x + 0.044715 · x³)
-    y   = 0.5 · x · (1 + tanh(u))
+This is `torch.nn.GELU()` (approximate='none') and HuggingFace's `"gelu"`:
+the activation of the LeWorldModel ViT encoder, its projectors and its
+predictor FFNs. `GELUTanhOp` (gelu_tanh_op.mojo) is the TANH approximation — jax's
+default, what DreamerV3 uses — and differs from this by up to ~5e-4 at
+|x| ~ 2: far outside a float32 parity gate. Pick by the reference, never by
+habit.
 
-Backward (input-cache, `owns_cache=False` — needs original x):
-
-    t      = tanh(u)
-    dy/dx  = 0.5·(1 + t) + 0.5·x·(1 - t²)·c·(1 + 3·0.044715·x²)
-           = 0.5·(1 + t) + 0.5·x·(1 - t²)·c·(1 + 0.134145·x²)
-
-Used by the RSSM / Encoder / Decoder trunks (`Linear → Norm → GELU`).
+Backward reads the cached INPUT (`owns_cache=False`).
 """
 
-from std.math import tanh
+from std.math import erf, exp
 
 from ...constants import DT
 from ...core.element_op import ElementOp
 
 
-# sqrt(2/π) and 3·0.044715 as DT-precision constants.
-comptime _GELU_C: Scalar[DT] = 0.7978845608028654
-comptime _GELU_A: Scalar[DT] = 0.044715
-comptime _GELU_3A: Scalar[DT] = 0.134145
+comptime _INV_SQRT2: Scalar[DT] = 0.7071067811865476
+comptime _INV_SQRT_2PI: Scalar[DT] = 0.3989422804014327
 
 
 struct GELUOp(ElementOp):
-    """GELU (tanh approximation) with input-cache backward."""
+    """GELU (erf) with input-cache backward."""
 
     comptime owns_cache = False
 
@@ -39,45 +34,29 @@ struct GELUOp(ElementOp):
 
     @staticmethod
     def forward_scalar(x: Scalar[DT]) -> Scalar[DT]:
-        var u = _GELU_C * (x + _GELU_A * x * x * x)
-        return Scalar[DT](0.5) * x * (Scalar[DT](1.0) + tanh(u))
+        return Scalar[DT](0.5) * x * (Scalar[DT](1.0) + erf(x * _INV_SQRT2))
 
     @staticmethod
     def forward_simd[W: Int](x: SIMD[DT, W]) -> SIMD[DT, W]:
-        var half = SIMD[DT, W](0.5)
-        var one = SIMD[DT, W](1.0)
-        var c = SIMD[DT, W](_GELU_C)
-        var a = SIMD[DT, W](_GELU_A)
-        var u = c * (x + a * x * x * x)
-        return half * x * (one + tanh(u))
+        return (
+            SIMD[DT, W](0.5) * x
+            * (SIMD[DT, W](1.0) + erf(x * SIMD[DT, W](_INV_SQRT2)))
+        )
 
     @staticmethod
     def backward_scalar(c: Scalar[DT], go: Scalar[DT]) -> Scalar[DT]:
-        # c is the cached INPUT (x).
         var x = c
-        var u = _GELU_C * (x + _GELU_A * x * x * x)
-        var t = tanh(u)
-        var half = Scalar[DT](0.5)
-        var one = Scalar[DT](1.0)
-        var sech2 = one - t * t
-        var dgelu = (
-            half * (one + t)
-            + half * x * sech2 * _GELU_C * (one + _GELU_3A * x * x)
-        )
-        return go * dgelu
+        var cdf = Scalar[DT](0.5) * (Scalar[DT](1.0) + erf(x * _INV_SQRT2))
+        var pdf = _INV_SQRT_2PI * exp(Scalar[DT](-0.5) * x * x)
+        return go * (cdf + x * pdf)
 
     @staticmethod
     def backward_simd[W: Int](
         c: SIMD[DT, W], go: SIMD[DT, W]
     ) -> SIMD[DT, W]:
         var x = c
-        var half = SIMD[DT, W](0.5)
-        var one = SIMD[DT, W](1.0)
-        var cc = SIMD[DT, W](_GELU_C)
-        var a = SIMD[DT, W](_GELU_A)
-        var a3 = SIMD[DT, W](_GELU_3A)
-        var u = cc * (x + a * x * x * x)
-        var t = tanh(u)
-        var sech2 = one - t * t
-        var dgelu = half * (one + t) + half * x * sech2 * cc * (one + a3 * x * x)
-        return go * dgelu
+        var cdf = SIMD[DT, W](0.5) * (
+            SIMD[DT, W](1.0) + erf(x * SIMD[DT, W](_INV_SQRT2))
+        )
+        var pdf = SIMD[DT, W](_INV_SQRT_2PI) * exp(SIMD[DT, W](-0.5) * x * x)
+        return go * (cdf + x * pdf)

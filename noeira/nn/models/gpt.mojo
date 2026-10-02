@@ -52,7 +52,7 @@ from ..core.tensor import Tensor
 from ..primitives.linear import Linear
 from ..primitives.tied_linear import TiedLinear
 from ..primitives.layer_norm import LayerNorm
-from ..primitives.activations import GELU
+from ..primitives.activations import GELUTanh
 from ..primitives.embedding import Embedding
 from ..primitives.bias_add import BiasAdd
 from ..primitives.attention import ScaledDotProductAttention
@@ -126,7 +126,7 @@ comptime TransformerFFNDrop[
     ADT: DType = DT,
 ] = Sequential[
     Tokenwise[seq_len, Linear[dim, ff_dim, ADT]],
-    GELU[seq_len * ff_dim, ADT],
+    GELUTanh[seq_len * ff_dim, ADT],
     Tokenwise[seq_len, Linear[ff_dim, dim, ADT]],
     Dropout[seq_len * dim, dropout_p, seed, ADT],
 ]

@@ -34,8 +34,8 @@ this is a NAMED struct rather than a `Sequential` of anonymous children: the
 walked names are `attn.q.…`/`attn.k.…`, not `0.1.…`/`0.2.…`.
 
 ⚠ **GELU here is the tanh approximation, and that is correct.** SigLIP is
-`hidden_act = "gelu_pytorch_tanh"`. `nn.primitives.activations.GELU` is
-`GELUOp`, which is the tanh form — so this matches by construction. Do not
+`hidden_act = "gelu_pytorch_tanh"`, i.e. `nn.primitives.activations.GELUTanh`
+(`GELUTanhOp`) — so this matches by construction. Do not
 "fix" it to the erf form.
 """
 
@@ -58,7 +58,7 @@ from noeira.nn.primitives.layer_norm import LayerNorm
 from noeira.nn.primitives.conv2d import Conv2D
 from noeira.nn.primitives.bias_add import BiasAdd
 from noeira.nn.primitives.transpose_2d import Transpose2D
-from noeira.nn.primitives.activations import GELU
+from noeira.nn.primitives.activations import GELUTanh
 from noeira.nn.combinators.sequential import Sequential
 from noeira.nn.combinators.residual import Residual
 from noeira.nn.combinators.repeat import Repeat
@@ -208,7 +208,7 @@ struct SigLIPAttention[SEQ: Int, DIM: Int, HEADS: Int](Module):
 # (Linear -> GELU -> Linear, per-token), so it is reused rather than restated.
 comptime SigLIPFFN[SEQ: Int, DIM: Int, FF: Int] = Sequential[
     Tokenwise[SEQ, Linear[DIM, FF]],
-    GELU[SEQ * FF],
+    GELUTanh[SEQ * FF],
     Tokenwise[SEQ, Linear[FF, DIM]],
 ]
 

@@ -216,8 +216,9 @@ struct BatchNorm1D[
     """`UNBIASED_RUNNING`: torch's `BatchNorm1d` normalises with the BIASED
     batch variance but feeds the UNBIASED one (x B/(B-1)) to `running_var`.
     False (the default, unchanged) keeps the biased update; LeWM sets True to
-    match its torch reference. EfficientZero v2 and REDQ-OFE port torch
-    references too and still run the biased update."""
+    match its torch reference. ⚠ EfficientZero v2 ports torch too and still
+    runs the biased update — invisible today only because its drivers never
+    put BN in eval mode (the reference does, for MCTS / reanalyze)."""
     comptime ARITY = 1
     comptime IN_DIMS = Array[Int, 1](fill=Self.DIM_)
     comptime OUT_DIM = Self.DIM_

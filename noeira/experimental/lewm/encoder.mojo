@@ -24,7 +24,7 @@ from noeira.nn import (
     Linear,
     LinearSwish,
     BatchNorm1D,
-    GELU,
+    GELUTanh,
     LayerNorm,
     TokenMean,
     BiasAdd,
@@ -41,7 +41,7 @@ from noeira.nn.models.transformer import TransformerBlock
 comptime LeWMProjector[HIDDEN: Int, PROJ_H: Int, EMB: Int] = Sequential[
     Linear[HIDDEN, PROJ_H],
     BatchNorm1D[PROJ_H],
-    GELU[PROJ_H],
+    GELUTanh[PROJ_H],
     Linear[PROJ_H, EMB],
 ]
 
@@ -139,7 +139,7 @@ comptime PredProj[H: Int, EMB: Int, PROJ_H: Int] = Tokenwise[
     Sequential[
         Linear[EMB, PROJ_H],
         BatchNorm1D[PROJ_H],
-        GELU[PROJ_H],
+        GELUTanh[PROJ_H],
         Linear[PROJ_H, EMB],
     ],
 ]

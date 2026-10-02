@@ -35,7 +35,7 @@ from noeira.nn.primitives.linear import Linear
 from noeira.nn.primitives.block_linear import BlockLinear
 from noeira.nn.primitives.rms_norm import RMSNorm
 from noeira.nn.primitives.elementwise import Elementwise
-from noeira.nn.primitives.ops.gelu_op import GELUOp
+from noeira.nn.primitives.ops.gelu_tanh_op import GELUTanhOp
 from noeira.nn.primitives.concat import Concat
 from noeira.nn.core.element_op import ElementOp
 from noeira.nn.core.module import Module
@@ -61,7 +61,7 @@ from .nets import DreamerDecoder, DreamerRewardMLP, DreamerContMLP
 # path passes `DreamerDecoderCNN[SC+DETER, C, H, W, BASE, A]` (same IN=SC+DETER,
 # OUT=OBS=C*H*W) — a deconv reconstruction instead of an MLP, no other change.
 comptime DecLossGraph[
-    SC: Int, DETER: Int, OBS: Int, DEC_U: Int, A: ElementOp = GELUOp,
+    SC: Int, DETER: Int, OBS: Int, DEC_U: Int, A: ElementOp = GELUTanhOp,
     DEC: Module = DreamerDecoder[SC + DETER, OBS, DEC_U, A],
     SIGMOID: Bool = False,  # True → sigmoid+MSE recon (bounded [0,1] pixels)
 ] = ComputeGraph[
@@ -75,7 +75,7 @@ comptime DecLossGraph[
 
 
 comptime RewLossGraph[
-    DETER: Int, SC: Int, HU: Int, BINS: Int, A: ElementOp = GELUOp,
+    DETER: Int, SC: Int, HU: Int, BINS: Int, A: ElementOp = GELUTanhOp,
     OUT_INIT: Initializer = Zero,  # reward-head output-layer init (nets.mojo)
 ] = ComputeGraph[
     InputSlot["nd", DETER],
@@ -87,7 +87,7 @@ comptime RewLossGraph[
 ]
 
 
-comptime ConLossGraph[DETER: Int, SC: Int, HU: Int, A: ElementOp = GELUOp] = ComputeGraph[
+comptime ConLossGraph[DETER: Int, SC: Int, HU: Int, A: ElementOp = GELUTanhOp] = ComputeGraph[
     InputSlot["nd", DETER],
     InputSlot["stoch_new", SC],
     InputSlot["ctgt", 1],
@@ -107,7 +107,7 @@ comptime ConLossGraph[DETER: Int, SC: Int, HU: Int, A: ElementOp = GELUOp] = Com
 
 comptime WMImagineGraph[
     DETER: Int, H: Int, STOCH: Int, CLASSES: Int, BLOCKS: Int, ACT: Int,
-    A: ElementOp = GELUOp,
+    A: ElementOp = GELUTanhOp,
 ] = ComputeGraph[
     InputSlot["deter", DETER],
     InputSlot["stoch", STOCH * CLASSES],
@@ -135,7 +135,7 @@ comptime WMImagineGraph[
 
 comptime WMObserveGraph[
     DETER: Int, H: Int, STOCH: Int, CLASSES: Int, BLOCKS: Int,
-    ACT: Int, TOKEN: Int, A: ElementOp = GELUOp,
+    ACT: Int, TOKEN: Int, A: ElementOp = GELUTanhOp,
 ] = ComputeGraph[
     InputSlot["deter", DETER],
     InputSlot["stoch", STOCH * CLASSES],
@@ -171,7 +171,7 @@ comptime WMObserveGraph[
 
 comptime WMCoreGraph[
     DETER: Int, H: Int, STOCH: Int, CLASSES: Int, BLOCKS: Int,
-    ACT: Int, TOKEN: Int, A: ElementOp = GELUOp,
+    ACT: Int, TOKEN: Int, A: ElementOp = GELUTanhOp,
 ] = ComputeGraph[
     InputSlot["deter", DETER],
     InputSlot["stoch", STOCH * CLASSES],
@@ -206,7 +206,7 @@ comptime WMCoreGraph[
 comptime WMLossGraph[
     DETER: Int, H: Int, STOCH: Int, CLASSES: Int, BLOCKS: Int,
     ACT: Int, TOKEN: Int, OBS: Int, DEC_U: Int, HU: Int, BINS: Int,
-    A: ElementOp = GELUOp,
+    A: ElementOp = GELUTanhOp,
 ] = ComputeGraph[
     InputSlot["deter", DETER],
     InputSlot["stoch", STOCH * CLASSES],

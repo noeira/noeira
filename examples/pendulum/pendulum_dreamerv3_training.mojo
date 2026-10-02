@@ -11,7 +11,7 @@ periodic greedy eval.
 
 act = SiLU (SwishOp), as in the size1m/dmc config: the trainer/blocks/agent
 thread `SwishOp` through every WM + AC net (`blocks.mojo` / `trainer.mojo`).
-The `GELUOp` default on the `nets.mojo` / `wm.mojo` aliases is ONLY for the
+The `GELUTanhOp` default on the `nets.mojo` / `wm.mojo` aliases is ONLY for the
 JAX-fixture validation spikes — it is overridden here. (Same for the GPU
 driver `pendulum_dreamerv3_nn_gpu.mojo`.)
 

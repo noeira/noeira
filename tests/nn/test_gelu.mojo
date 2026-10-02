@@ -1,13 +1,13 @@
-"""`GELUExact` = `torch.nn.GELU()` (erf), forward and backward, CPU and GPU.
+"""`GELU` = `torch.nn.GELU()` (erf), forward and backward, CPU and GPU.
 
 The reference values are torch's own (float64, `F.gelu` + autograd, printed
 once and pasted below) — not this file's `erf`, which would make the check
-circular. The tanh `GELU` is run on the same points and MUST fail the same
+circular. `GELUTanh` is run on the same points and MUST fail the same
 tolerance: torch's exact and tanh forms differ by up to 4.4e-4 here, so a
 gate that cannot tell them apart is not checking which one we have.
 
 Run:
-    pixi run -e apple mojo run -I . tests/nn/test_gelu_exact.mojo
+    pixi run -e apple mojo run -I . tests/nn/test_gelu.mojo
 """
 
 from std.math import abs
@@ -17,7 +17,7 @@ from noeira.nn.constants import DT
 from noeira.nn.core.tensor import Tensor
 from noeira.nn.core.tensor_refs import TensorRefs
 from noeira.nn.core.initializer import Deterministic
-from noeira.nn.primitives.activations import GELU, GELUExact
+from noeira.nn.primitives.activations import GELU, GELUTanh
 
 
 comptime N = 11
@@ -74,7 +74,7 @@ def _err(mut y: Tensor, mut gi: Tensor, c: Optional[DeviceContext]) raises -> Tu
 
 
 def _run_exact[target: StaticString](c: Optional[DeviceContext]) raises -> Tuple[Float64, Float64]:
-    var m = GELUExact[N].make[target, Deterministic](c)
+    var m = GELU[N].make[target, Deterministic](c)
     var x = Tensor.alloc(N)
     var go = Tensor.alloc(N)
     _fill(x, go, c)
@@ -86,7 +86,7 @@ def _run_exact[target: StaticString](c: Optional[DeviceContext]) raises -> Tuple
 
 
 def _run_tanh(c: Optional[DeviceContext]) raises -> Tuple[Float64, Float64]:
-    var m = GELU[N].make["cpu", Deterministic](c)
+    var m = GELUTanh[N].make["cpu", Deterministic](c)
     var x = Tensor.alloc(N)
     var go = Tensor.alloc(N)
     _fill(x, go, c)
@@ -98,18 +98,18 @@ def _run_tanh(c: Optional[DeviceContext]) raises -> Tuple[Float64, Float64]:
 
 
 def main() raises:
-    print("GELUExact vs torch F.gelu (exact)")
+    print("GELU vs torch F.gelu (exact)")
     var c = DeviceContext()
     var cpu = _run_exact["cpu"](None)
     var gpu = _run_exact["gpu"](Optional(c))
     var tanh_cpu = _run_tanh(None)
-    print("  GELUExact cpu: fwd", cpu[0], " bwd", cpu[1])
-    print("  GELUExact gpu: fwd", gpu[0], " bwd", gpu[1])
-    print("  GELU(tanh) cpu: fwd", tanh_cpu[0], " bwd", tanh_cpu[1], " (must FAIL)")
+    print("  GELU cpu: fwd", cpu[0], " bwd", cpu[1])
+    print("  GELU gpu: fwd", gpu[0], " bwd", gpu[1])
+    print("  GELUTanh cpu: fwd", tanh_cpu[0], " bwd", tanh_cpu[1], " (must FAIL)")
     if cpu[0] > TOL or cpu[1] > TOL:
-        raise Error("FAIL: GELUExact on CPU is not torch's exact GELU")
+        raise Error("FAIL: GELU on CPU is not torch's exact GELU")
     if gpu[0] > TOL or gpu[1] > TOL:
-        raise Error("FAIL: GELUExact on GPU is not torch's exact GELU")
+        raise Error("FAIL: GELU on GPU is not torch's exact GELU")
     if tanh_cpu[0] <= TOL:
-        raise Error("FAIL: the tanh GELU passes too — the gate cannot tell them apart")
+        raise Error("FAIL: GELUTanh passes too — the gate cannot tell them apart")
     print("PASS")

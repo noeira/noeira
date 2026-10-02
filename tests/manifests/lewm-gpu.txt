@@ -19,6 +19,6 @@ tests/experimental/lewm/lewm/test_paper_protocol_tta.mojo
 
 # --- framework gates LeWM depends on (P2) ---
 tests/nn/test_layer_norm_eps_gpu.mojo
-tests/nn/test_gelu_exact.mojo
+tests/nn/test_gelu.mojo
 tests/nn/test_batch_norm_1d_unbiased_running.mojo
 tests/nn/test_sigreg_attrs.mojo

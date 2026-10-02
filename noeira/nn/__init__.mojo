@@ -73,7 +73,7 @@ from .primitives.activations import (
     Tanh,
     Sigmoid,
     GELU,
-    GELUExact,
+    GELUTanh,
     Mish,
     Swish,
     Symlog,

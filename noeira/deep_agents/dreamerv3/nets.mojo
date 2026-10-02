@@ -20,34 +20,34 @@ from noeira.nn.combinators.init_with import InitWith
 from noeira.nn.primitives.linear import Linear
 from noeira.nn.primitives.rms_norm import RMSNorm
 from noeira.nn.primitives.elementwise import Elementwise
-from noeira.nn.primitives.ops.gelu_op import GELUOp
+from noeira.nn.primitives.ops.gelu_tanh_op import GELUTanhOp
 from noeira.nn.primitives.symlog import Symlog
 from noeira.nn.core.element_op import ElementOp
 from noeira.nn.core.initializer import Initializer, Zero, ScaledKaiming
 
 
-# Inter-layer activation is a comptime op `A` (default `GELUOp`, matching the
+# Inter-layer activation is a comptime op `A` (default `GELUTanhOp`, matching the
 # PR4/5b JAX fixtures so the validation spikes stay green). The production
 # trainer/agent pass `SwishOp` (size1m/dmc config `act: silu`). `Elementwise
-# [DIM, A]` == `GELU[DIM]` when A=GELUOp, `SiLU[DIM]` when A=SwishOp.
+# [DIM, A]` == `GELUTanh[DIM]` when A=GELUTanhOp, `SiLU[DIM]` when A=SwishOp.
 
 
 # Encoder: symlog(obs) → [Linear, RMSNorm, act] × 2 → tokens[U]
-comptime DreamerEncoder[OBS: Int, U: Int, A: ElementOp = GELUOp] = Sequential[
+comptime DreamerEncoder[OBS: Int, U: Int, A: ElementOp = GELUTanhOp] = Sequential[
     Symlog[OBS],
     Linear[OBS, U], RMSNorm[U], Elementwise[U, A],
     Linear[U, U], RMSNorm[U], Elementwise[U, A],
 ]
 
 # Decoder: concat([stoch,deter])[FEATIN] → [Linear,RMSNorm,act]×2 → pred[OBS]
-comptime DreamerDecoder[FEATIN: Int, OBS: Int, U: Int, A: ElementOp = GELUOp] = Sequential[
+comptime DreamerDecoder[FEATIN: Int, OBS: Int, U: Int, A: ElementOp = GELUTanhOp] = Sequential[
     Linear[FEATIN, U], RMSNorm[U], Elementwise[U, A],
     Linear[U, U], RMSNorm[U], Elementwise[U, A],
     Linear[U, OBS],
 ]
 
 # RSSM prior: deter[DETER] → [Linear,RMSNorm,act]×2 → logit[SC]
-comptime DreamerPrior[DETER: Int, H: Int, SC: Int, A: ElementOp = GELUOp] = Sequential[
+comptime DreamerPrior[DETER: Int, H: Int, SC: Int, A: ElementOp = GELUTanhOp] = Sequential[
     Linear[DETER, H], RMSNorm[H], Elementwise[H, A],
     Linear[H, H], RMSNorm[H], Elementwise[H, A],
     Linear[H, SC],
@@ -60,7 +60,7 @@ comptime DreamerPrior[DETER: Int, H: Int, SC: Int, A: ElementOp = GELUOp] = Sequ
 # tasks like CartPole). Replaces the post-hoc `scale_output_graph("rew.3.…")`
 # name-path surgery, which failed SILENTLY on refactor.
 comptime DreamerRewardMLP[
-    FEAT: Int, U: Int, BINS: Int, A: ElementOp = GELUOp,
+    FEAT: Int, U: Int, BINS: Int, A: ElementOp = GELUTanhOp,
     OUT_INIT: Initializer = Zero,
 ] = Sequential[
     Linear[FEAT, U], RMSNorm[U], Elementwise[U, A],
@@ -68,7 +68,7 @@ comptime DreamerRewardMLP[
 ]
 
 # Cont head MLP (1 hidden): feat[FEAT] → [Linear,RMSNorm,act] → logit[1]
-comptime DreamerContMLP[FEAT: Int, U: Int, A: ElementOp = GELUOp] = Sequential[
+comptime DreamerContMLP[FEAT: Int, U: Int, A: ElementOp = GELUTanhOp] = Sequential[
     Linear[FEAT, U], RMSNorm[U], Elementwise[U, A],
     Linear[U, 1],
 ]
@@ -77,7 +77,7 @@ comptime DreamerContMLP[FEAT: Int, U: Int, A: ElementOp = GELUOp] = Sequential[
 # Same shape as the reward MLP (symexp_twohot output); same structural
 # OUT_INIT (paper zero-inits the critic output; reference `value.outscale: 0.0`).
 comptime DreamerValue[
-    FEAT: Int, U: Int, BINS: Int, A: ElementOp = GELUOp,
+    FEAT: Int, U: Int, BINS: Int, A: ElementOp = GELUTanhOp,
     OUT_INIT: Initializer = Zero,
 ] = Sequential[
     Linear[FEAT, U], RMSNorm[U], Elementwise[U, A],
@@ -86,7 +86,7 @@ comptime DreamerValue[
 
 # Policy head (1 hidden): feat[FEAT] → [mean_raw[ACT], std_raw[ACT]] = 2·ACT.
 # `bounded_normal` (dists.mojo) maps mean_raw→tanh, std_raw→sigmoid-scaled.
-comptime DreamerPolicy[FEAT: Int, U: Int, ACT: Int, A: ElementOp = GELUOp] = Sequential[
+comptime DreamerPolicy[FEAT: Int, U: Int, ACT: Int, A: ElementOp = GELUTanhOp] = Sequential[
     Linear[FEAT, U], RMSNorm[U], Elementwise[U, A],
     Linear[U, 2 * ACT],
 ]
@@ -95,7 +95,7 @@ comptime DreamerPolicy[FEAT: Int, U: Int, ACT: Int, A: ElementOp = GELUOp] = Seq
 # `dists_discrete.mojo`'s unimix categorical (`OneHotDist`) maps logits→probs.
 # Same MLP shape as the continuous head but a single ACT-wide logit output
 # (vs 2·ACT mean/std). Used when the agent's `DISCRETE` flag is set.
-comptime DreamerPolicyDiscrete[FEAT: Int, U: Int, ACT: Int, A: ElementOp = GELUOp] = Sequential[
+comptime DreamerPolicyDiscrete[FEAT: Int, U: Int, ACT: Int, A: ElementOp = GELUTanhOp] = Sequential[
     Linear[FEAT, U], RMSNorm[U], Elementwise[U, A],
     Linear[U, ACT],
 ]
@@ -106,7 +106,7 @@ comptime DreamerPolicyDiscrete[FEAT: Int, U: Int, ACT: Int, A: ElementOp = GELUO
 # ternary, which Mojo joins (breaking Movable). Use this when threading a
 # compile-time `DISCRETE` flag through the trainer / AC block / agent.
 comptime DreamerPolicyHead[
-    FEAT: Int, U: Int, ACT: Int, DISCRETE: Bool, A: ElementOp = GELUOp
+    FEAT: Int, U: Int, ACT: Int, DISCRETE: Bool, A: ElementOp = GELUTanhOp
 ] = Sequential[
     Linear[FEAT, U], RMSNorm[U], Elementwise[U, A],
     # Reference `policy.outscale = 0.01` declared STRUCTURALLY: near-zero

@@ -7,9 +7,9 @@ assert a SANE round-trip: bf16-flow output vs the fp32 reference within bf16
 precision (~1-2%), not just "no crash".
 
 Two checks per leaf:
- 1. NoAMP guard: the fp32 `LayerNorm[D]` / `GELU[D]` GPU forward is the reference.
- 2. bf16-flow: `LayerNorm[D, bfloat16]` / `GELU[D, bfloat16]` (= `Elementwise[D,
-    GELUOp, bfloat16]`) fwd+vjp on GPU compiles + runs, and forward matches the
+ 1. NoAMP guard: the fp32 `LayerNorm[D]` / `GELUTanh[D]` GPU forward is the reference.
+ 2. bf16-flow: `LayerNorm[D, bfloat16]` / `GELUTanh[D, bfloat16]` (= `Elementwise[D,
+    GELUTanhOp, bfloat16]`) fwd+vjp on GPU compiles + runs, and forward matches the
     fp32 reference to bf16 tolerance (a bf16-vs-fp32 round-trip rel err).
 
 Run: pixi run -e apple mojo run -I . tests/nn/test_layer_norm_gelu_bf16_flow.mojo
@@ -25,7 +25,7 @@ from noeira.nn.core.tensor import Tensor, TensorImpl
 from noeira.nn.core.tensor_refs import TensorRefs
 from noeira.nn.core.initializer import Deterministic
 from noeira.nn.primitives.layer_norm import LayerNorm
-from noeira.nn.primitives.activations import GELU
+from noeira.nn.primitives.activations import GELUTanh
 
 comptime DIM = 16
 comptime B = 8
@@ -90,7 +90,7 @@ def test_gelu_bf16_flow() raises:
     var c = DeviceContext()
 
     # ── fp32 reference ──
-    var refm = GELU[DIM].make["gpu", Deterministic](Optional(c))
+    var refm = GELUTanh[DIM].make["gpu", Deterministic](Optional(c))
     var xr = Tensor.alloc(B * DIM)
     for i in range(B * DIM):
         xr.data[i] = Scalar[DT]((i % 11) - 5) * 0.25
@@ -100,7 +100,7 @@ def test_gelu_bf16_flow() raises:
     outr.download(c)
 
     # ── bf16-flow (stage the same input at bf16 via CPU alloc + upload) ──
-    var m = GELU[DIM, BF].make["gpu", Deterministic](Optional(c))
+    var m = GELUTanh[DIM, BF].make["gpu", Deterministic](Optional(c))
     var x = TensorImpl[BF].alloc(B * DIM)
     for i in range(B * DIM):
         x.data[i] = xr.data[i].cast[BF]()

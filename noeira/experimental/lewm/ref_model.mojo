@@ -46,7 +46,7 @@ from noeira.nn import (
     Linear,
     LinearSwish,
     BatchNorm1D,
-    GELUExact,
+    GELU,
     LayerNorm,
     LayerNormNoAffine,
     BiasAdd,
@@ -81,7 +81,7 @@ comptime TORCH_LN_EPS: Scalar[DT] = 1e-5
 
 comptime FFNExact[SEQ: Int, DIM: Int, FF: Int] = Sequential[
     Tokenwise[SEQ, Linear[DIM, FF]],
-    GELUExact[SEQ * FF],
+    GELU[SEQ * FF],
     Tokenwise[SEQ, Linear[FF, DIM]],
 ]
 """Linear -> exact GELU -> Linear, per token (HF `ViTMLP`; the predictor's
@@ -107,7 +107,7 @@ separate biased Linears in HF, fused here as [q|k|v] (the loader concatenates)."
 comptime ProjectorRef[IN: Int, HID: Int, OUT: Int] = Sequential[
     Linear[IN, HID],
     BatchNorm1D[HID, BN_DEFAULT_MOM, BN_DEFAULT_EPS, DT, True],
-    GELUExact[HID],
+    GELU[HID],
     Linear[HID, OUT],
 ]
 """`module.MLP(norm_fn=BatchNorm1d)`: the encoder `projector` and `pred_proj`."""

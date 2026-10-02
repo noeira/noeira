@@ -27,7 +27,7 @@ from noeira.nn.core.initializer import Deterministic, Kaiming
 from noeira.nn.primitives.linear import Linear
 from noeira.nn.primitives.rms_norm import RMSNorm
 from noeira.nn.primitives.elementwise import Elementwise
-from noeira.nn.primitives.ops.gelu_op import GELUOp
+from noeira.nn.primitives.ops.gelu_tanh_op import GELUTanhOp
 from noeira.nn.combinators.sequential import Sequential
 from noeira.nn.combinators.compute_graph import ComputeGraph
 from noeira.nn.combinators.graph_decl import InputSlot, Node
@@ -50,7 +50,7 @@ comptime B = 5
 comptime VAL = Sequential[Linear[D, H], Linear[H, O]]
 # Reward-head shape: out Linear is child index 3 → "3.weight" / "3.bias".
 comptime HEAD = Sequential[
-    Linear[D, H], RMSNorm[H], Elementwise[H, GELUOp], Linear[H, O]
+    Linear[D, H], RMSNorm[H], Elementwise[H, GELUTanhOp], Linear[H, O]
 ]
 comptime PG = ComputeGraph[InputSlot["x", D], Node["lin", Linear[D, O], "x"]]
 

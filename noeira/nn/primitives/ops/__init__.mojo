@@ -13,8 +13,8 @@ from .symlog_op import SymlogOp
 from .swish_op import SwishOp
 from .mish_op import MishOp
 from .sigmoid_op import SigmoidOp
+from .gelu_tanh_op import GELUTanhOp
 from .gelu_op import GELUOp
-from .gelu_exact_op import GELUExactOp
 from .stop_grad_op import StopGradOp
 from .sum_op import SumOp
 from .mean_op import MeanOp

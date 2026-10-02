@@ -30,7 +30,7 @@ for NCHW maps; γ size = channels) in every _ConvDown/_ConvUp and the decoder's
 initial projection. The encoder's final Linear (→tokens) and the decoder's
 output deconv stay raw, mirroring the reference's unnormalized output layers.
 
-Activation `A` defaults to `GELUOp` (matching `nets.mojo`); the training config
+Activation `A` defaults to `GELUTanhOp` (matching `nets.mojo`); the training config
 passes `SwishOp` (SiLU). The final encoder Linear and final decoder deconv are
 LINEAR (no activation) — raw tokens / raw pixel logits.
 """
@@ -49,7 +49,7 @@ from noeira.nn.primitives.conv_rms_norm import ConvRMSNorm
 from noeira.nn.primitives.max_pool_2d import MaxPool2D
 from noeira.nn.primitives.upsample2x import Upsample2x
 from noeira.nn.primitives.elementwise import Elementwise
-from noeira.nn.primitives.ops.gelu_op import GELUOp
+from noeira.nn.primitives.ops.gelu_tanh_op import GELUTanhOp
 from noeira.nn.primitives.ops.center_half_op import CenterHalfOp
 from noeira.nn.core.element_op import ElementOp
 from noeira.nn.core.tensor import Tensor
@@ -93,7 +93,7 @@ comptime _ConvUp[
 # stays in [0,1] (the reference centers only the encoder input).
 comptime DreamerEncoderCNN[
     C: Int, H: Int, W: Int, BASE: Int, TOKEN: Int,
-    A: ElementOp = GELUOp, LAYOUT: Int = LAYOUT_NCHW,
+    A: ElementOp = GELUTanhOp, LAYOUT: Int = LAYOUT_NCHW,
 ] = Sequential[
     Elementwise[C * H * W, CenterHalfOp],                      # [0,1] → [-0.5,0.5]
     _ConvDown[C, BASE, H, W, A, LAYOUT],                       # H   → H/2
@@ -113,7 +113,7 @@ comptime DreamerEncoderCNN[
 # budget). Pass TOKEN = 8·BASE·(H/16)·(W/16) wherever the arch needs it.
 comptime DreamerEncoderCNNRaw[
     C: Int, H: Int, W: Int, BASE: Int,
-    A: ElementOp = GELUOp, LAYOUT: Int = LAYOUT_NCHW,
+    A: ElementOp = GELUTanhOp, LAYOUT: Int = LAYOUT_NCHW,
 ] = Sequential[
     Elementwise[C * H * W, CenterHalfOp],                      # [0,1] → [-0.5,0.5]
     _ConvDown[C, BASE, H, W, A, LAYOUT],                       # H   → H/2
@@ -126,7 +126,7 @@ comptime DreamerEncoderCNNRaw[
 # ── Decoder: feature[FEATIN] → Linear → 4× transposed-conv → image[C·H·W] ─────
 comptime DreamerDecoderCNN[
     FEATIN: Int, C: Int, H: Int, W: Int, BASE: Int,
-    A: ElementOp = GELUOp, LAYOUT: Int = LAYOUT_NCHW,
+    A: ElementOp = GELUTanhOp, LAYOUT: Int = LAYOUT_NCHW,
 ] = Sequential[
     Linear[FEATIN, 8 * BASE * (H // 16) * (W // 16)],
     ConvRMSNorm[8 * BASE, (H // 16) * (W // 16)],
@@ -174,7 +174,7 @@ comptime _UpConv[
 # IMG 96 that is 256·36 = 9216, the reference's exact token width. ──
 comptime DreamerEncoderCNNPool[
     C: Int, H: Int, W: Int, BASE: Int,
-    A: ElementOp = GELUOp, LAYOUT: Int = LAYOUT_NCHW,
+    A: ElementOp = GELUTanhOp, LAYOUT: Int = LAYOUT_NCHW,
 ] = Sequential[
     Elementwise[C * H * W, CenterHalfOp],                          # [0,1] → [-0.5,0.5]
     _ConvPoolDown[C, 2 * BASE, H, W, A, LAYOUT],                   # H   → H/2
@@ -235,7 +235,7 @@ def _stem_add_k[
 
 struct DreamerDecoderStem[
     DETER: Int, SC: Int, UNITS: Int, U: Int,
-    A: ElementOp = GELUOp, BSPACE: Int = 8,
+    A: ElementOp = GELUTanhOp, BSPACE: Int = 8,
 ](Module):
     """The reference decoder's `bspace` input stem.
 
@@ -492,7 +492,7 @@ struct DreamerDecoderStem[
 # (raw pixel logits; the trainer's RECON_SIGMOID applies the sigmoid). ──
 comptime DreamerDecoderCNNPool[
     FEATIN: Int, DETER: Int, C: Int, H: Int, W: Int, BASE: Int, UNITS: Int,
-    A: ElementOp = GELUOp, LAYOUT: Int = LAYOUT_NCHW,
+    A: ElementOp = GELUTanhOp, LAYOUT: Int = LAYOUT_NCHW,
 ] = Sequential[
     DreamerDecoderStem[
         DETER, FEATIN - DETER, UNITS, 4 * BASE * (H // 16) * (W // 16), A

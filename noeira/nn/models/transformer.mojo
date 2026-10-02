@@ -3,7 +3,7 @@
 Storage-surface port of `nn/models/transformer.mojo`. Pure `comptime`
 composition over storage leaves + combinators — no structs, no kernels — so it
 inherits correct forward / vjp / walkers from its parts. The ONLY change vs the
-legacy file is the import path for `ReLU`/`GELU` (storage keeps the activation
+legacy file is the import path for `ReLU`/`GELUTanh` (storage keeps the activation
 aliases in `primitives/activations.mojo`, not standalone `relu.mojo`/`gelu.mojo`).
 
 All per-token sublayers (QKV/out projection, FFN, LayerNorm) are wrapped in
@@ -19,7 +19,7 @@ itself spans the full sequence. `causal=False` → bidirectional (ViT);
 from noeira.nn.constants import DT
 from ..primitives.linear import Linear
 from ..primitives.layer_norm import LayerNorm
-from ..primitives.activations import GELU
+from ..primitives.activations import GELUTanh
 from ..primitives.attention import ScaledDotProductAttention
 from ..primitives.qkv_to_major import QKVToMajor
 from ..combinators.sequential import Sequential
@@ -60,7 +60,7 @@ comptime TransformerFFN[
     seq_len: Int, dim: Int, ff_dim: Int, ADT: DType = DT,
 ] = Sequential[
     Tokenwise[seq_len, Linear[dim, ff_dim, ADT]],
-    GELU[seq_len * ff_dim, ADT],
+    GELUTanh[seq_len * ff_dim, ADT],
     Tokenwise[seq_len, Linear[ff_dim, dim, ADT]],
 ]
 
