@@ -59,6 +59,10 @@ def _layer_norm_forward_kernel[
     BATCH: Int,
     DIM: Int,
     ADT: DType = DT,
+    EPS: Scalar[DT] = LN_EPS,
+    # ⚠ The kernel used to read the module constant `LN_EPS` instead of the
+    # struct's `EPS`, so `LayerNorm[DIM, EPS=1e-12]` was 1e-12 on CPU and 1e-5
+    # on GPU. Gate: tests/nn/test_layer_norm_eps_gpu.mojo.
 ](
     input: LayoutTensor[ADT, Layout.row_major(BATCH, DIM), MutAnyOrigin],
     output: LayoutTensor[ADT, Layout.row_major(BATCH, DIM), MutAnyOrigin],
@@ -99,7 +103,7 @@ def _layer_norm_forward_kernel[
         var var_val = ex2 - mean_val * mean_val
         if var_val < Scalar[LN_ACC](0):
             var_val = Scalar[LN_ACC](0)
-        var inv_std = Scalar[LN_ACC](1.0) / sqrt(var_val + LN_EPS.cast[LN_ACC]())
+        var inv_std = Scalar[LN_ACC](1.0) / sqrt(var_val + EPS.cast[LN_ACC]())
         if t == 0:
             cache_inv_std[b] = inv_std.cast[DT]()
 
@@ -128,7 +132,7 @@ def _layer_norm_forward_kernel[
         var var_val = ex2 - mean_val * mean_val
         if var_val < Scalar[LN_ACC](0):
             var_val = Scalar[LN_ACC](0)
-        var inv_std = Scalar[LN_ACC](1.0) / sqrt(var_val + LN_EPS.cast[LN_ACC]())
+        var inv_std = Scalar[LN_ACC](1.0) / sqrt(var_val + EPS.cast[LN_ACC]())
         if t == 0:
             cache_inv_std[b] = inv_std.cast[DT]()
         idx = t
@@ -373,7 +377,7 @@ struct LayerNorm[DIM_: Int, ADT: DType = DT, EPS: Scalar[DT] = LN_EPS](Module):
                 comptime lb = Layout.row_major(B)
                 comptime ld = Layout.row_major(Self.DIM_)
                 c.enqueue_function[
-                    _layer_norm_forward_kernel[B, Self.DIM_, Self.ADT]
+                    _layer_norm_forward_kernel[B, Self.DIM_, Self.ADT, Self.EPS]
                 ](
                     in0d.lt["gpu", l2d](),
                     outd.lt["gpu", l2d](),
@@ -398,7 +402,7 @@ struct LayerNorm[DIM_: Int, ADT: DType = DT, EPS: Scalar[DT] = LN_EPS](Module):
             comptime lb = Layout.row_major(B)
             comptime ld = Layout.row_major(Self.DIM_)
             c.enqueue_function[
-                _layer_norm_forward_kernel[B, Self.DIM_, Self.ADT]
+                _layer_norm_forward_kernel[B, Self.DIM_, Self.ADT, Self.EPS]
             ](
                 in0.lt["gpu", l2d](),
                 out.lt["gpu", l2d](),

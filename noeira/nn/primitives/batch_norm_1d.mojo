@@ -98,6 +98,7 @@ def _bn1d_forward_train_kernel[
 def _bn1d_update_running_kernel[
     DIM: Int,
     MOMENTUM: Float64,
+    VAR_CORR: Float64 = 1.0,
 ](
     cache_mean: LayoutTensor[DT, Layout.row_major(DIM), MutAnyOrigin],
     cache_var: LayoutTensor[DT, Layout.row_major(DIM), MutAnyOrigin],
@@ -114,7 +115,9 @@ def _bn1d_update_running_kernel[
     var mom = Scalar[DT](MOMENTUM)
     var one_m = Scalar[DT](1.0) - mom
     running_mean[f] = one_m * running_mean[f] + mom * cache_mean[f]
-    running_var[f] = one_m * running_var[f] + mom * cache_var[f]
+    running_var[f] = one_m * running_var[f] + mom * (
+        Scalar[DT](VAR_CORR) * cache_var[f]
+    )
 
 
 def _bn1d_forward_eval_kernel[
@@ -208,7 +211,13 @@ struct BatchNorm1D[
     MOMENTUM: Float64 = BN_DEFAULT_MOM,
     EPSILON: Float64 = BN_DEFAULT_EPS,
     ADT: DType = DT,
+    UNBIASED_RUNNING: Bool = False,
 ](Module):
+    """`UNBIASED_RUNNING`: torch's `BatchNorm1d` normalises with the BIASED
+    batch variance but feeds the UNBIASED one (x B/(B-1)) to `running_var`.
+    False (the default, unchanged) keeps the biased update; LeWM sets True to
+    match its torch reference. EfficientZero v2 and REDQ-OFE port torch
+    references too and still run the biased update."""
     comptime ARITY = 1
     comptime IN_DIMS = Array[Int, 1](fill=Self.DIM_)
     comptime OUT_DIM = Self.DIM_
@@ -229,6 +238,13 @@ struct BatchNorm1D[
     var cache_var: Tensor  # [DIM] (GPU: batch var, fed to the running-stat EMA)
     var cache_is_training: Bool
     var training: Bool
+
+    @staticmethod
+    def _var_corr[B: Int]() -> Float64:
+        """Factor applied to the batch variance in the running update."""
+        comptime if Self.UNBIASED_RUNNING:
+            return Float64(B) / Float64(B - 1)
+        return 1.0
 
     def __init__(out self):
         self.gamma = Param["gamma", False, Self.DIM_]()
@@ -371,7 +387,9 @@ struct BatchNorm1D[
                         xhat_v[b, f] = xh
                         output_v[b, f] = g * xh + bt
                     rm_v[f] = one_m * rm_v[f] + mom * mean
-                    rv_v[f] = one_m * rv_v[f] + mom * var_
+                    rv_v[f] = one_m * rv_v[f] + mom * (
+                        Scalar[DT](Self._var_corr[B]()) * var_
+                    )
                 self.cache_is_training = True
             else:
                 for f in range(Self.DIM_):
@@ -411,7 +429,9 @@ struct BatchNorm1D[
                 )
                 # Running-stat EMA in a dedicated kernel (see kernel docstring).
                 c.enqueue_function[
-                    _bn1d_update_running_kernel[Self.DIM_, Self.MOMENTUM]
+                    _bn1d_update_running_kernel[
+                        Self.DIM_, Self.MOMENTUM, Self._var_corr[B]()
+                    ]
                 ](
                     self.cache_mean.lt["gpu", ld](),
                     self.cache_var.lt["gpu", ld](),

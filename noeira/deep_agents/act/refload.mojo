@@ -310,6 +310,9 @@ def _fill(
     param.ensure(len(vals))
     for i in range(len(vals)):
         param.data[i] = vals[i]
+    # A written weight must advance `version`, or `Linear`'s version-gated
+    # padded / bf16 copies keep serving the weight from before the load.
+    param.version += 1
     if ctx:
         param.upload_resident(ctx.value())
 

@@ -39,7 +39,7 @@ never passes raw device pointers to kernels). The kernel BODY math is identical.
 
 from max.gpu import thread_idx, block_idx, block_dim, global_idx
 from max.gpu.primitives import block
-from max.gpu.host import DeviceContext
+from max.gpu.host import DeviceContext, DeviceBuffer
 from std.math import sin, cos, sqrt, log, exp, pi
 from std.random.philox import Random as PhiloxRandom
 from layout import Layout, LayoutTensor, TileTensor, row_major
@@ -73,6 +73,11 @@ struct SIGReg[DIM: Int, SEQ_LEN: Int, NUM_PROJ: Int, KNOTS: Int](Module):
     # fd-gradcheck needs a deterministic f across forward calls, and every
     # existing run stays bit-identical.
     var resample: Bool
+    # An INJECTED projection matrix [DIM, NUM_PROJ] (row-major, columns already
+    # unit-norm) used instead of the PRNG draw, in forward AND vjp. Gating only:
+    # it is how the LeWM reference gate replays torch's exact `A`
+    # (`set_node_attr_buf["sig", "fixed_a"]`). None = the PRNG (every run).
+    var fixed_a: Optional[DeviceBuffer[DT]]
     var _step_ctr: UInt64
     var _cur_seed: UInt64
     var _seed_valid: Bool
@@ -86,6 +91,7 @@ struct SIGReg[DIM: Int, SEQ_LEN: Int, NUM_PROJ: Int, KNOTS: Int](Module):
         self.ws_scalar = Tensor()
         self.ws_dLdz = Tensor()
         self.resample = False
+        self.fixed_a = None
         self._step_ctr = 0
         self._cur_seed = 0
         self._seed_valid = False
@@ -102,6 +108,54 @@ struct SIGReg[DIM: Int, SEQ_LEN: Int, NUM_PROJ: Int, KNOTS: Int](Module):
             self._cur_seed = base
         self._seed_valid = True
         return self._cur_seed
+
+    def set_attr[ATTR: StaticString](mut self, value: Scalar[DT]):
+        """`resample` (0/1). ⚠ This override was LOST when the storage port
+        replaced the legacy SIGReg (2026-06-23): `set_node_attr["sig",
+        "resample"]` fell through to the trait's no-op, so every run since,
+        the LeWM recipe included, kept ONE projection matrix for its whole
+        life. Gate: tests/nn/test_sigreg_attrs.mojo."""
+        comptime if ATTR == "resample":
+            self.resample = value != Scalar[DT](0)
+
+    def set_attr_buf[ATTR: StaticString](mut self, buf: DeviceBuffer[DT]):
+        """`fixed_a`: inject the projection matrix (see the field)."""
+        comptime if ATTR == "fixed_a":
+            self.fixed_a = buf
+
+    def _fill_a_cpu(
+        self, seed: UInt64, a_ptr: Pointer[Scalar[DT], MutAnyOrigin]
+    ) raises:
+        """A for the CPU path: the injected matrix, else the PRNG draw."""
+        if self.fixed_a:
+            with self.fixed_a.value().map_to_host() as h:
+                for i in range(Self.DIM * Self.NUM_PROJ):
+                    a_ptr[unsafe_offset=i] = h[i]
+        else:
+            Self._generate_a_cpu(seed, a_ptr)
+
+    def _fill_a_gpu(mut self, c: DeviceContext, seed: UInt64) raises:
+        """A for the GPU path, into `ws_a`: the injected matrix, else the PRNG."""
+        comptime D = Self.DIM
+        comptime P = Self.NUM_PROJ
+        comptime lay_a = Layout.row_major(D, P)
+        if self.fixed_a:
+            c.enqueue_copy(
+                self.ws_a.dev.value().create_sub_buffer[DT](0, D * P),
+                self.fixed_a.value().create_sub_buffer[DT](0, D * P),
+            )
+            return
+        c.enqueue_function[_sr_gen_a_unnorm[D, P]](
+            self.ws_a.lt["gpu", lay_a](),
+            seed,
+            grid_dim=((D * P + TPB - 1) // TPB,),
+            block_dim=(TPB,),
+        )
+        c.enqueue_function[_sr_norm_a[D, P]](
+            self.ws_a.lt["gpu", lay_a](),
+            grid_dim=((P + TPB - 1) // TPB,),
+            block_dim=(TPB,),
+        )
 
     def _backward_seed(self, base: UInt64) -> UInt64:
         return self._cur_seed if self._seed_valid else base
@@ -214,7 +268,7 @@ struct SIGReg[DIM: Int, SEQ_LEN: Int, NUM_PROJ: Int, KNOTS: Int](Module):
                 UInt64(Int(self.cache_z.data.unsafe_ptr()))
             )
             var a = Array[Scalar[DT], D * P](uninitialized=True)
-            Self._generate_a_cpu(
+            self._fill_a_cpu(
                 seed,
                 rebind[Pointer[Scalar[DT], MutAnyOrigin]](
                     a.unsafe_ptr()
@@ -276,17 +330,7 @@ struct SIGReg[DIM: Int, SEQ_LEN: Int, NUM_PROJ: Int, KNOTS: Int](Module):
                 UInt64(Int(self.cache_z.dev.value().unsafe_ptr()))
             )
 
-            c.enqueue_function[_sr_gen_a_unnorm[D, P]](
-                self.ws_a.lt["gpu", lay_a](),
-                seed,
-                grid_dim=((D * P + TPB - 1) // TPB,),
-                block_dim=(TPB,),
-            )
-            c.enqueue_function[_sr_norm_a[D, P]](
-                self.ws_a.lt["gpu", lay_a](),
-                grid_dim=((P + TPB - 1) // TPB,),
-                block_dim=(TPB,),
-            )
+            self._fill_a_gpu(c, seed)
             # cache_z[B*T, P] = X @ A — kept hand-rolled (faster at M=B·T=96, the
             # real LeWM regime; see _sr_project note + bench). max_matmul only
             # wins forward at M≥~1.5k, which no LeWM config hits.
@@ -347,7 +391,7 @@ struct SIGReg[DIM: Int, SEQ_LEN: Int, NUM_PROJ: Int, KNOTS: Int](Module):
                 UInt64(Int(self.cache_z.data.unsafe_ptr()))
             )
             var a = Array[Scalar[DT], D * P](uninitialized=True)
-            Self._generate_a_cpu(
+            self._fill_a_cpu(
                 seed,
                 rebind[Pointer[Scalar[DT], MutAnyOrigin]](
                     a.unsafe_ptr()
@@ -414,17 +458,7 @@ struct SIGReg[DIM: Int, SEQ_LEN: Int, NUM_PROJ: Int, KNOTS: Int](Module):
                 UInt64(Int(self.cache_z.dev.value().unsafe_ptr()))
             )
 
-            c.enqueue_function[_sr_gen_a_unnorm[D, P]](
-                self.ws_a.lt["gpu", lay_a](),
-                seed,
-                grid_dim=((D * P + TPB - 1) // TPB,),
-                block_dim=(TPB,),
-            )
-            c.enqueue_function[_sr_norm_a[D, P]](
-                self.ws_a.lt["gpu", lay_a](),
-                grid_dim=((P + TPB - 1) // TPB,),
-                block_dim=(TPB,),
-            )
+            self._fill_a_gpu(c, seed)
             c.enqueue_function[_sr_cm_sm[B, T, P, K, N_PARTIALS, False]](
                 self.cache_z.lt["gpu", lay_cache](),
                 self.ws_cm.lt["gpu", lay_cmsm](),

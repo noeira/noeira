@@ -12,6 +12,7 @@ from noeira.nn.primitives.ops.relu_op import ReLUOp
 from noeira.nn.primitives.ops.tanh_op import TanhOp
 from noeira.nn.primitives.ops.sigmoid_op import SigmoidOp
 from noeira.nn.primitives.ops.gelu_op import GELUOp
+from noeira.nn.primitives.ops.gelu_exact_op import GELUExactOp
 from noeira.nn.primitives.ops.mish_op import MishOp
 from noeira.nn.primitives.ops.swish_op import SwishOp
 from noeira.nn.primitives.ops.symlog_op import SymlogOp
@@ -24,6 +25,10 @@ comptime ReLU[DIM: Int, ADT: DType = DT] = Elementwise[DIM, ReLUOp, ADT]
 comptime Tanh[DIM: Int, ADT: DType = DT] = Elementwise[DIM, TanhOp, ADT]
 comptime Sigmoid[DIM: Int, ADT: DType = DT] = Elementwise[DIM, SigmoidOp, ADT]
 comptime GELU[DIM: Int, ADT: DType = DT] = Elementwise[DIM, GELUOp, ADT]
+"""⚠ The TANH approximation (jax's default). torch's `nn.GELU()` and HF's
+`"gelu"` are `GELUExact`."""
+comptime GELUExact[DIM: Int, ADT: DType = DT] = Elementwise[DIM, GELUExactOp, ADT]
+"""Exact (erf) GELU = `torch.nn.GELU()`."""
 comptime Mish[DIM: Int, ADT: DType = DT] = Elementwise[DIM, MishOp, ADT]
 comptime Swish[DIM: Int, ADT: DType = DT] = Elementwise[DIM, SwishOp, ADT]
 comptime Symlog[DIM: Int, ADT: DType = DT] = Elementwise[DIM, SymlogOp, ADT]
