@@ -75,6 +75,16 @@ comptime G1_Q_EXTENT: String = "extent"
 comptime G1_MAX_STEPS: Int = 3
 comptime G1_Q_NEEDS_WORLD: String = "needs_world"
 comptime G1_Q_ADDRESSED: String = "addressed"
+# ⚠ A DESTINATION IS NOT A COMMAND, AND IT MUST NOT REACH THE SPEC PATH.
+# `z = E_rho[r(s) B(s)]` is an expectation over the state pool, and of the 463
+# privileged numbers exactly ONE is a world quantity (`root_height`); the other
+# 462 are in the heading frame. So `r(s) = -||root_xy - fridge_xy||` is not a
+# hard reward, it is a MEANINGLESS one — it returns a unit-norm `z` and a robot
+# that does something confident and wrong (§3.2 of BFM_ZERO_NEXT_LEVEL.md,
+# §12.60). A destination therefore has to be routed to a NAVIGATOR before the
+# cache-miss path can claim it, which is why this question is answered in the
+# same call and checked before `P(none)`.
+comptime G1_Q_DESTINATION: String = "destination"
 comptime G1_OPT_NONE: String = "none"
 # ⚠ `talk` IS AN OPTION, NOT A REFUSAL. "Bonjour, comment vas-tu ?" used to
 # come back "not addressed to the robot" — technically true and completely
@@ -292,7 +302,10 @@ def g1_command_instruction() -> String:
 
 
 def g1_command_questions(
-    ref bank: G1CommandBank, with_addressed: Bool = False
+    ref bank: G1CommandBank,
+    with_addressed: Bool = False,
+    destinations: List[String] = List[String](),
+    dest_descs: List[String] = List[String](),
 ) raises -> JevQuestions:
     """The choice over the bank, plus the two cheap guards.
 
@@ -369,6 +382,46 @@ def g1_command_questions(
             " or to go to a particular place or thing?"
         ),
     )
+    # ⚠ THE DESTINATION QUESTION IS ADDITIVE AND ABSENT BY DEFAULT, and that
+    # is a safety property rather than tidiness. §12.54 measured the `command`
+    # WORDING moving `P(none)` by half, and every question in the request is
+    # part of the context the others are answered against — so a caller with
+    # no destinations (the bare viewer, `g1say`) sends exactly the request it
+    # sent before and its measured numbers still hold. Only a caller that HAS
+    # a world to navigate pays for the extra option list.
+    #
+    # The options come from the caller because they are ITS scene: the room
+    # session reads them from its `.task` `language=` lines, which keeps the
+    # names it offers the model identical to the names its planner resolves —
+    # the same rule that makes `bank.describe` generated rather than written.
+    if len(destinations) > 0:
+        if len(dest_descs) != 0 and len(dest_descs) != len(destinations):
+            raise Error(
+                "g1 destination: one description per destination, or none"
+            )
+        var dops = List[String]()
+        var ddesc = List[String]()
+        for i in range(len(destinations)):
+            dops.append(destinations[i])
+            ddesc.append(
+                dest_descs[i] if len(dest_descs) > 0 else destinations[i]
+            )
+        # ⚠ `none` LAST AND ALWAYS, for the same reason the command question
+        # has one: without it the model must name a place, and "lève le bras
+        # droit" would acquire a destination.
+        dops.append(String(G1_OPT_NONE))
+        ddesc.append(String(
+            "the instruction names no place or thing to go to"
+        ))
+        q.choice(
+            String(G1_Q_DESTINATION),
+            String(
+                "Does the instruction tell the robot to GO somewhere, or to a"
+                " particular object? If so, which one? Pick `none` when it"
+                " asks for a movement or a posture rather than a destination."
+            ),
+            dops, ddesc,
+        )
     if with_addressed:
         q.noul(
             String(G1_Q_ADDRESSED),
@@ -406,6 +459,11 @@ struct G1LangPick(Copyable, Movable):
     var talk: Bool
     """The speaker wanted an answer, not a movement. `name` is empty and
     `reason` is not set — this is a success with a different handler."""
+    var destination: String
+    """A place the instruction named, or "". Like `talk`, this is a SUCCESS
+    WITH A DIFFERENT HANDLER: `name` is empty and a navigator takes over.
+    Empty unless the caller offered destinations."""
+    var dest_conf: Float64
 
     def __init__(out self):
         self.name = String("")
@@ -416,6 +474,8 @@ struct G1LangPick(Copyable, Movable):
         self.addressed = 1.0
         self.reason = String("")
         self.talk = False
+        self.destination = String("")
+        self.dest_conf = 0.0
 
 
 def g1_command_phrase(name: String) -> String:
@@ -565,6 +625,9 @@ def g1_decide(
     min_top: Float64 = 0.35,
     min_addressed: Float64 = 0.5,
     with_addressed: Bool = False,
+    with_destination: Bool = False,
+    min_world: Float64 = 0.5,
+    min_dest: Float64 = 0.5,
 ) raises -> G1LangPick:
     """Apply the rule above. Returns an empty `name` with a `reason` set when
     the honest answer is to do nothing."""
@@ -605,6 +668,40 @@ def g1_decide(
         r.name = String("")
         r.conf = p_talk
         return r^
+    # ⚠⚠ THE DESTINATION IS CHECKED BEFORE `P(none)`, AND THE ORDER IS THE
+    # WHOLE POINT. A refusal for `no such command` is what routes an
+    # instruction to the cache-miss path (§12.60), and a destination must
+    # NEVER get there: world position is not in the state pool, so a reward
+    # over it returns a unit-norm `z` and a confidently wrong robot (§3.2).
+    # "Walk to the fridge" has to reach a navigator, and if `P(none)` were
+    # tested first it would instead reach a reward spec.
+    #
+    # It is also checked AFTER `talk`, because a greeting that happens to
+    # mention a place is still a greeting, and after `addressed`, because
+    # background conversation about the kitchen is not an instruction.
+    #
+    # ⚠ BOTH SIGNALS ARE REQUIRED. `needs_world` alone over-fires — §12.54
+    # measured "walk to the fridge and open it" coming back `walk` at 0.92
+    # with `needs_world` high, so the noul is sensitive but says nothing about
+    # WHICH place. A named destination alone is not enough either: the
+    # destination question has to pick something from a closed list, and
+    # `none` is the only escape. Requiring both means a route happens when the
+    # instruction is about going somewhere AND the somewhere is one this scene
+    # has.
+    if with_destination:
+        var dpick = ans.choice(String(G1_Q_DESTINATION))
+        var dconf = ans.probability(String(G1_Q_DESTINATION), dpick)
+        if (dpick != G1_OPT_NONE and dconf >= min_dest
+            and r.needs_world >= min_world):
+            r.destination = dpick
+            r.dest_conf = dconf
+            # ⚠ `name` IS CLEARED. The caller must not run a bank command AND
+            # hand a destination to a planner — the planner's first act is to
+            # choose a command, and a stale one racing it is how the robot
+            # walks off while being told where to walk.
+            r.name = String("")
+            return r^
+
     if r.p_none > max_none or r.name == "":
         r.reason = String("no such command")
         r.name = String("")

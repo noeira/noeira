@@ -143,6 +143,12 @@ def main() raises:
     # ~350 ms, which is imperceptible after someone has stopped speaking.
     var pool_path = _flag(String("--pool"), String(""))
     var cand_path = _flag(String("--candidates"), String("g1_spec_candidates.txt"))
+    # ⚠ DESTINATIONS MAKE THE WORLD ROUTE TESTABLE WITHOUT A ROOM. The viewer
+    # that owns a scene reads these from its `.task` `language=` lines; this
+    # program has no scene, so a comma list stands in — the same reason
+    # `--doing` exists (§12.56). A CLI that cannot ask the question the demo
+    # asks cannot debug the demo's answer.
+    var dest_arg = _flag(String("--destinations"), String(""))
     var no_warn = _has(String("--spec-no-warn"))
     # ⚠ THE BAR IS P(none), NOT THE TOP-1 CONFIDENCE, and that is a measured
     # correction. "crouch down low" returned `crouch` at 0.56 with `squat` at
@@ -220,7 +226,14 @@ def main() raises:
     options.append(String("none"))
     descs.append(String("not one of these, or not a command for this robot"))
 
-    var q = g1_command_questions(bank, addressed)
+    var dests = List[String]()
+    if dest_arg != "":
+        var dp = dest_arg.split(",")
+        for i in range(len(dp)):
+            var d = String(String(dp[i]).strip())
+            if d.byte_length() > 0:
+                dests.append(d)
+    var q = g1_command_questions(bank, addressed, dests, List[String]())
 
     var jev = JevClient.from_env()
 
@@ -279,7 +292,8 @@ def main() raises:
     var ans = jev.decide(state, q)
     var ms = Float64(perf_counter_ns() - t0) / 1e6
     var argmax = ans.choice(String(G1_Q_COMMAND))
-    var d = g1_decide(ans, bank, max_none, min_top, 0.5, addressed)
+    var d = g1_decide(ans, bank, max_none, min_top, 0.5, addressed,
+                      len(dests) > 0)
     var p_none = d.p_none
     var pick = d.name if d.name != "" else String("")
     var conf = d.conf
@@ -323,6 +337,16 @@ def main() raises:
     var needs_world = d.needs_world
     # ⚠ `talk` is a SUCCESS with an empty `name`, not a refusal. The viewer
     # answers it; this tool only decides, so it says so and stops.
+    # ⚠ THE WORLD ROUTE IS A SUCCESS WITH A DIFFERENT HANDLER, like `talk`.
+    # This program has no navigator, so it reports and stops — but it reports
+    # the DESTINATION, which is what a room binary would hand to its planner.
+    if d.destination != "":
+        print("WORLD:", d.destination, _f2(d.dest_conf),
+              " needs_world", _f2(d.needs_world),
+              "— a navigator takes this; nothing sent to the channel.")
+        print("   (the bank was leaning", d.best, _f2(d.conf),
+              "— deliberately NOT run, see `g1_decide`)")
+        return
     if d.talk:
         print("TALK:", _f2(d.conf),
               "— the speaker wanted an answer, not a movement.",
@@ -402,8 +426,17 @@ def main() raises:
             g1_channel_write_z(chan_path, sq3, label, z, blend)
             print("sent seq", sq3, "-> NOVEL z:", label)
             return
+        # ⚠ `needs_world` BELONGS IN THE REFUSAL. With destinations offered, a
+        # refusal has two possible causes — the bank has no command, or the
+        # world route declined — and without this number they are
+        # indistinguishable. "assieds-toi sur la chaise" refuses with
+        # `needs_world` HIGH and no destination, because sitting names an
+        # object without being a request to GO anywhere; that is §6.4's
+        # verdict (sitting is a posture in contact, not navigation) arriving
+        # as a number instead of a guess.
         print("REFUSED:", d.reason, " P(none)", _f2(d.p_none),
               " addressed", _f2(d.addressed),
+              " needs_world", _f2(d.needs_world),
               " (leaning", d.best, _f2(d.conf), ") — nothing sent.",
               String("Pass --pool g1_pool.bin to try a reward spec.")
               if pool_path == "" else String(""))
