@@ -9,3 +9,9 @@ tests/experimental/lewm/ref/test_ref_forward.mojo
 tests/experimental/lewm/ref/test_ref_train.mojo
 tests/experimental/lewm/ref/test_ref_rollout.mojo
 tests/experimental/lewm/ref/test_ref_cem.mojo
+
+# P4 — PushT against the dataset (docs/LEWM_REOPEN_PLAN.md). Need box session
+# A's fixture + pymunk oracle in ~/.cache/noeira/lewm_pusht/session_a/ and,
+# for the renderer, `tools/lewm/sample_fixture_frames.py` -> /tmp/lewm_frames.
+tests/experimental/lewm/ref/test_pusht_replay.mojo
+tests/experimental/lewm/ref/test_pusht_render.mojo

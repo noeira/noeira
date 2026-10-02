@@ -1,6 +1,7 @@
 """Bridge: render a PushTEnv state into a LeWM-encoder input frame.
 
-The mojo PushT sim renders 96²-native (`render.mojo`, gym-pusht palette);
+The frame is drawn the way stable-worldmodel 0.0.6 draws it
+(`envs/pusht/render_swm.mojo`), the renderer of the LeWM dataset;
 the LeWM world model encodes 224² CHW [0,1] frames (the offline HF dataset
 layout). `sim_frame_chw_norm` renders one env state at the WM's resolution
 and converts HWC [0,255] → CHW [0,1] in one host call, so a sim observation
@@ -16,7 +17,7 @@ from std.memory import alloc, dealloc
 from layout import Layout, LayoutTensor
 
 from ...nn.constants import DT
-from noeira.envs.pusht.render import render_pusht_rgb_at
+from noeira.envs.pusht.render_swm import render_pusht_swm_at
 
 
 def sim_frame_chw_norm[
@@ -38,7 +39,12 @@ def sim_frame_chw_norm[
     var pix = LayoutTensor[DT, Layout.row_major(OUT, OUT, 3), MutAnyOrigin](
         tmp.as_unsafe_any_origin()
     )
-    render_pusht_rgb_at[OUT](
+    # stable-worldmodel 0.0.6's drawing (render_swm.mojo): the frames the
+    # LeWM dataset — and so every LeWM encoder — was trained on. The env's
+    # own `render_pusht_rgb_at` (flat fills, no outline, no resize) put the
+    # published encoder ~1.5 env steps of motion away from the real frame
+    # (G4b, docs/LEWM_REOPEN_PLAN.md P4).
+    render_pusht_swm_at[OUT](
         block_cx, block_cy, block_angle, agent_cx, agent_cy, pix
     )
     # HWC [0,255] → CHW [0,1]

@@ -13,7 +13,7 @@ from std.testing import assert_true
 from layout import Layout, LayoutTensor
 
 from noeira.nn.constants import DT
-from noeira.envs.pusht.render import render_pusht_rgb_at
+from noeira.envs.pusht.render_swm import render_pusht_swm_at  # what the bridge draws with
 from noeira.experimental.lewm.pusht_sim_bridge import sim_frame_chw_norm
 
 
@@ -35,7 +35,7 @@ def main() raises:
     # reference HWC [0,255]
     var hwc = alloc[Scalar[DT]](HW * 3).as_unsafe_any_origin()
     var hwc_t = LayoutTensor[DT, Layout.row_major(OUT, OUT, 3), MutAnyOrigin](hwc)
-    render_pusht_rgb_at[OUT](bcx, bcy, bang, acx, acy, hwc_t)
+    render_pusht_swm_at[OUT](bcx, bcy, bang, acx, acy, hwc_t)
 
     # bridge CHW [0,1]
     var chw = alloc[Scalar[DT]](3 * HW).as_unsafe_any_origin()
