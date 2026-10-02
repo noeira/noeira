@@ -337,6 +337,8 @@ test-swm = { cmd = "bash scripts/run_tests.sh tests/manifests/swm.txt", descript
 test-fb = { cmd = "bash scripts/run_tests.sh tests/manifests/fb.txt", description = "Forward-Backward zero-shot RL gates (CPU; docs/BFM_ZERO_SHOT_RL.md)" }
 test-lewm = { cmd = "bash scripts/run_tests.sh tests/manifests/lewm.txt", description = "LeWorldModel port self-consistency (experimental, CPU, toy dims)" }
 test-lewm-gpu = { cmd = "bash scripts/run_tests.sh tests/manifests/lewm-gpu.txt", description = "LeWorldModel port GPU paths, toy dims (needs -e apple or -e nvidia)" }
+dump-lewm-ref = { cmd = "pixi run -e act-ref python tools/lewm/dump_lewm_reference.py --out /tmp/lewm_ref --noise && pixi run mojo run -I . tools/lewm/list_ref_params.mojo > /tmp/lewm_ref/ours_names.tsv && pixi run -e act-ref python tools/lewm/convert_ref_to_ours.py --dump /tmp/lewm_ref", description = "LeWM reference dump: the published checkpoint under torch, re-expressed in our names (needs weights in ~/.cache/noeira/lewm_pusht/hf)" }
+test-lewm-ref = { cmd = "bash scripts/run_tests.sh tests/manifests/lewm-ref.txt", description = "LeWM reference-exact model vs torch: forward stages + training-step gradients (needs dump-lewm-ref; -e apple or -e nvidia)" }
 test-concurrent = { cmd = "bash scripts/run_tests.sh tests/manifests/concurrent.txt", description = "Concurrency backbone (noeira/core/concurrent): pthread, SPSC ring, atomic cells" }
 # Format interop: our safetensors reader/writer against the REFERENCE library,
 # and the Hub's ImageNet ResNet18 against torchvision's. Needs `-e act-ref`

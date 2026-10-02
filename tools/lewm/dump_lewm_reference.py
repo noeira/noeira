@@ -480,7 +480,7 @@ class _FixedRandn:
 
 
 def section_train(dump: Dump, model, dtype, rng, b: int = 4, t: int = 4,
-                  do_adamw: bool = True):
+                  do_adamw: bool = True, f32_model=None):
     model.train()
     dropout_off(model)
     sigreg = swm_loss.SIGReg(knots=17, num_proj=1024).to(dtype)
@@ -512,6 +512,42 @@ def section_train(dump: Dump, model, dtype, rng, b: int = 4, t: int = 4,
     for k, v in model.state_dict().items():
         if "running_" in k:
             dump.add(f"bn_after.{ckpt_name(k)}", v)
+
+    if f32_model is not None:
+        # torch's OWN float32 error on this step, per gradient tensor:
+        # max |g32 - g64| / std(g64). The scale a float32 port's gradient
+        # gate has to be held to (it is not the forward's).
+        f32_model.train()
+        dropout_off(f32_model)
+        sig32 = swm_loss.SIGReg(knots=17, num_proj=1024)
+        f32_model.zero_grad(set_to_none=True)
+        with _FixedRandn(a_raw.float()):
+            o32 = lejepa_forward(f32_model, sig32, {"pixels": pix.float(), "action": act.float()})
+        o32["loss"].backward()
+        g64 = dict(model.named_parameters())
+        # floor: the global gradient RMS. Several tensors have an EXACT zero
+        # gradient (a bias or LN beta feeding a train-mode BatchNorm — BN
+        # removes the batch mean; attention key biases — softmax ignores a
+        # per-query constant), so std(g64) is roundoff and max|d|/std is
+        # meaningless; against the RMS they are judged in absolute terms.
+        allg = torch.cat([p.grad.double().reshape(-1) for p in model.parameters()
+                          if p.grad is not None])
+        rms = allg.square().mean().sqrt().item()
+        dump.add("train.grad_rms", np.array([rms]))
+        worst = []
+        for k, p32 in f32_model.named_parameters():
+            r = g64[k].grad.double()
+            if p32.grad is None:
+                continue
+            den = max(r.std().item(), rms)
+            v = (p32.grad.double() - r).abs().max().item() / den
+            dump.add(f"noise_grad.{ckpt_name(k)}", np.array([v]))
+            worst.append((v, ckpt_name(k)))
+        worst.sort(reverse=True)
+        print(f"  noise grads (max|g32-g64| / max(std, rms={rms:.3g})): max {worst[0][0]:.3g} ({worst[0][1]}); "
+              f"median {worst[len(worst) // 2][0]:.3g}")
+        for v, k in worst[:6]:
+            print(f"     {v:.3g}  {k}")
 
     if not do_adamw:
         return
@@ -600,7 +636,7 @@ def main():
     if run("rollout"):  # before `train`: the optimizer step mutates the model
         section_rollout(dump, model, dtype, sub(5))
     if run("train"):
-        section_train(dump, model, dtype, sub(4))
+        section_train(dump, model, dtype, sub(4), f32_model=f32)
     dump.close()
 
 

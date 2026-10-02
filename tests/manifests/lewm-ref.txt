@@ -1,0 +1,9 @@
+# LeWM reference gates — `pixi run dump-lewm-ref` once, then `pixi run -e apple test-lewm-ref`
+#
+# The published LeWM PushT checkpoint (quentinll/lewm-pusht, MIT) through the
+# reference-exact model (noeira/experimental/lewm/ref_model.mojo) against its
+# torch run (tools/lewm/dump_lewm_reference.py, float64). CPU + GPU in each.
+# Needs the dump in /tmp/lewm_ref and the weights in
+# ~/.cache/noeira/lewm_pusht/hf/ (docs/LEWM_REOPEN_PLAN.md P1/P2).
+tests/experimental/lewm/ref/test_ref_forward.mojo
+tests/experimental/lewm/ref/test_ref_train.mojo
