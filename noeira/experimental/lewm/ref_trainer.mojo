@@ -29,7 +29,8 @@ none. The parity gates run torch with dropout off (`dropout_off`).
 
 from std.math import sqrt
 from std.time import perf_counter_ns
-from max.gpu.host import DeviceContext, DeviceBuffer
+from max.gpu import global_idx
+from max.gpu.host import DeviceContext, DeviceBuffer, HostBuffer
 from layout import Layout
 
 from noeira.nn.constants import DT, TPB
@@ -40,6 +41,7 @@ from noeira.nn.optimizer.adam import Adam
 from noeira.deep_agents.act.refload import RefDump
 from .ref_model import LeWMLossGraphRef
 from .ref_load import LoadRef
+from noeira.nn.optimizer.grad_clip import _sum_sq_kernel_rt, GC_TPB
 from .trainer import _clip_scale_kernel
 
 
@@ -57,6 +59,71 @@ comptime LeWMRefGraph = LeWMLossGraphRef[
 ]
 """The published model's training graph: ViT-tiny/14 at 224, projector 2048,
 predictor 6 x (16 heads x 64), FF 2048, SIGReg 1024 projections x 17 knots."""
+
+
+comptime _HW = REF_IMG * REF_IMG
+
+
+def _lewm_pixels_kernel(
+    src: Pointer[Scalar[DType.uint8], MutAnyOrigin],
+    dst: Pointer[Scalar[DT], MutAnyOrigin],
+    n_frames: Int64,
+):
+    """`dst[f, c, p] = (src[f, p, c] / 255 - mean[c]) / std[c]`: the dataset's
+    uint8 HWC frames to the encoder's ImageNet-normalised CHW, in torch's
+    float32 order (`ToImage`: divide, then normalise). One thread per OUTPUT
+    element, so the writes coalesce."""
+    var idx = Int(global_idx.x)
+    if idx >= Int(n_frames) * 3 * _HW:
+        return
+    var f = idx // (3 * _HW)
+    var rem = idx % (3 * _HW)
+    var c = rem // _HW
+    var p = rem % _HW
+    var x = Scalar[DT](src[unsafe_offset=(f * _HW + p) * 3 + c]) / Scalar[DT](255.0)
+    var m = Scalar[DT](0.485)
+    var sd = Scalar[DT](0.229)
+    if c == 1:
+        m = Scalar[DT](0.456)
+        sd = Scalar[DT](0.224)
+    elif c == 2:
+        m = Scalar[DT](0.406)
+        sd = Scalar[DT](0.225)
+    dst[unsafe_offset=idx] = (x - m) / sd
+
+
+def _clip_coef_kernel(
+    parts: Pointer[Scalar[DT], MutAnyOrigin],
+    k: Int64,
+    max_norm: Scalar[DT],
+    res: Pointer[Scalar[DT], MutAnyOrigin],
+):
+    """One thread: norm = sqrt(Σ parts[0..k)) in order, then torch's
+    `clip_grad_norm_` coefficient min(1, max_norm / (norm + 1e-6)) —
+    res = [norm, coef]. On the device, so the step never waits on the host."""
+    if Int(global_idx.x) != 0:
+        return
+    var s = Scalar[DT](0)
+    for i in range(Int(k)):
+        s += parts[unsafe_offset=i]
+    var norm = sqrt(s)
+    var coef = max_norm / (norm + Scalar[DT](1e-6))
+    if coef > Scalar[DT](1):
+        coef = Scalar[DT](1)
+    res[unsafe_offset=0] = norm
+    res[unsafe_offset=1] = coef
+
+
+def _scale_by_dev_kernel(
+    grad: Pointer[Scalar[DT], MutAnyOrigin],
+    n: Int64,
+    coef: Pointer[Scalar[DT], MutAnyOrigin],
+):
+    """grad *= coef[1] (torch multiplies by the clamped coefficient always;
+    × 1.0 is exact)."""
+    var i = Int(global_idx.x)
+    if i < Int(n):
+        grad[unsafe_offset=i] = grad[unsafe_offset=i] * coef[unsafe_offset=1]
 
 
 def _is_pred_qkv_bias(name: String) -> Bool:
@@ -86,12 +153,19 @@ struct _MaskPredQKVBias(ParamVisitor):
 
 
 struct _GradSumSq(ParamVisitor):
-    """Σ g² over every gradient, accumulated in Float64 on the host."""
+    """Σ g² over every gradient. CPU: Float64 on the host. GPU: one
+    single-block reduction per parameter into `parts[k]` on the device (the
+    caller downloads the few hundred partials once and adds them in Float64)
+    — downloading every gradient (72 MB) cost 0.05 s a step."""
 
     var sumsq: Float64
+    var k: Int
+    var parts: Optional[DeviceBuffer[DT]]
 
-    def __init__(out self):
+    def __init__(out self, parts: Optional[DeviceBuffer[DT]] = None):
         self.sumsq = 0.0
+        self.k = 0
+        self.parts = parts
 
     def visit[target: StaticString, N: Int](
         mut self, name: String, mut param: Tensor, mut grad: Tensor,
@@ -99,7 +173,15 @@ struct _GradSumSq(ParamVisitor):
         ctx: Optional[DeviceContext],
     ) raises:
         comptime if target == "gpu":
-            grad.download(ctx.value())
+            ctx.value().enqueue_function[_sum_sq_kernel_rt](
+                grad.dev.value(),
+                Int64(N),
+                self.parts.value().create_sub_buffer[DT](self.k, 1),
+                grid_dim=1,
+                block_dim=GC_TPB,
+            )
+            self.k += 1
+            return
         var s = 0.0
         for i in range(N):
             var g = Float64(grad.data[i])
@@ -128,6 +210,23 @@ struct _GradScale(ParamVisitor):
                 grid_dim=(N + TPB - 1) // TPB,
                 block_dim=TPB,
             )
+
+
+struct _GradScaleDev(ParamVisitor):
+    var coef: DeviceBuffer[DT]
+
+    def __init__(out self, coef: DeviceBuffer[DT]):
+        self.coef = coef
+
+    def visit[target: StaticString, N: Int](
+        mut self, name: String, mut param: Tensor, mut grad: Tensor,
+        mut m: Tensor, mut v: Tensor, apply_decay: Bool,
+        ctx: Optional[DeviceContext],
+    ) raises:
+        ctx.value().enqueue_function[_scale_by_dev_kernel](
+            grad.dev.value(), Int64(N), self.coef,
+            grid_dim=(N + TPB - 1) // TPB, block_dim=TPB,
+        )
 
 
 struct _AdamWAll(ParamVisitor):
@@ -174,6 +273,15 @@ struct LeWMRefTrainer[target: StaticString, B: Int](Movable):
     var pix: Tensor
     var act: Tensor
     var a_buf: Optional[DeviceBuffer[DT]]
+    var pix_host: List[HostBuffer[DType.uint8]]
+    """Two pinned uint8 staging slots, (B, T, 224, 224, 3) each: the host
+    fills one while the GPU trains on the other (`submit_staged`)."""
+    var pix_u8: Optional[DeviceBuffer[DType.uint8]]
+    var norm_parts: Tensor
+    """Per-parameter Σ g² partials (GPU clip)."""
+    var norm_dev: Tensor
+    """[norm, coef] of the last step's clip, on the device."""
+    var norm_host: Float64
     var profile: Bool
     """Synchronise between the stages of `train_step` and accumulate their
     wall time in `t_stage` (seconds): copy-in, forward, vjp, clip, AdamW."""
@@ -205,6 +313,11 @@ struct LeWMRefTrainer[target: StaticString, B: Int](Movable):
         self.pix = Tensor.alloc(Self.B * Self.PIX)
         self.act = Tensor.alloc(Self.B * Self.ACT)
         self.a_buf = None
+        self.pix_host = List[HostBuffer[DType.uint8]]()
+        self.pix_u8 = None
+        self.norm_parts = Tensor()
+        self.norm_dev = Tensor()
+        self.norm_host = 0.0
         self.profile = False
         self.t_stage = List[Float64](length=5, fill=0.0)
         comptime if Self.target == "gpu":
@@ -249,12 +362,68 @@ struct LeWMRefTrainer[target: StaticString, B: Int](Movable):
         var t = Int(perf_counter_ns())
         for i in range(Self.B * Self.PIX):
             self.pix.data[i] = pix[i]
+        comptime if Self.target == "gpu":
+            self.pix.upload(self.ctx.value())
+        self._set_actions(act)
+        self._lap(0, t)
+        self._submit(t)
+        return self.finish()
+
+    def staging(mut self, slot: Int = 0) raises -> Pointer[Scalar[DType.uint8], MutAnyOrigin]:
+        """Pinned uint8 staging slot 0 or 1: (B, T, 224, 224, 3), the dataset's
+        own layout — a loader writes each window straight into it
+        (`LewmPushTExpert.sample_clip_pixels_uint8`). GPU.
+
+        ⚠ Slot s is read by an ASYNC copy once submitted: refill it only
+        after the `finish()` of the step that read it."""
+        comptime assert Self.target == "gpu", "staging: GPU only"
+        if len(self.pix_host) == 0:
+            var c = self.ctx.value()
+            for _ in range(2):
+                self.pix_host.append(c.enqueue_create_host_buffer[DType.uint8](Self.B * Self.PIX))
+            self.pix_u8 = c.enqueue_create_buffer[DType.uint8](Self.B * Self.PIX)
+            c.synchronize()
+        return rebind[Pointer[Scalar[DType.uint8], MutAnyOrigin]](
+            self.pix_host[slot].unsafe_ptr()
+        )
+
+    def train_step_staged(mut self, act: List[Scalar[DT]], slot: Int = 0) raises -> RefStepStats:
+        """`submit_staged` then `finish`."""
+        self.submit_staged(act, slot)
+        return self.finish()
+
+    def submit_staged(mut self, act: List[Scalar[DT]], slot: Int = 0) raises:
+        """Enqueue a whole training step on the frames in `staging(slot)` and
+        return WITHOUT waiting: 77 MB of uint8 go up (not 308 MB of float32),
+        normalised on the device by `_lewm_pixels_kernel` (bit-equal to
+        torch's float32 `ToImage`); the clip runs on the device. The host is
+        free to fill the other slot; `finish()` waits and reads the step.
+        (With `profile` on, every stage synchronises.)"""
+        comptime assert Self.target == "gpu", "submit_staged: GPU only"
+        var t = Int(perf_counter_ns())
+        var c = self.ctx.value()
+        if len(self.pix_host) == 0:
+            raise Error("submit_staged: call staging() and fill it first")
+        c.enqueue_copy(self.pix_u8.value(), self.pix_host[slot])
+        self.pix.ensure_gpu(c, Self.B * Self.PIX)
+        c.enqueue_function[_lewm_pixels_kernel](
+            self.pix_u8.value(),
+            self.pix.dev.value(),
+            Int64(Self.B * REF_T),
+            grid_dim=(Self.B * Self.PIX + TPB - 1) // TPB,
+            block_dim=TPB,
+        )
+        self._set_actions(act)
+        self._lap(0, t)
+        self._submit(t)
+
+    def _set_actions(mut self, act: List[Scalar[DT]]) raises:
         for i in range(Self.B * Self.ACT):
             self.act.data[i] = act[i]
         comptime if Self.target == "gpu":
-            self.pix.upload(self.ctx.value())
             self.act.upload(self.ctx.value())
-        self._lap(0, t)
+
+    def _submit(mut self, mut t: Int) raises:
         self.graph.zero_grad[Self.target](self.ctx)
         self.graph.set_input["pixels", Self.B](self.pix, self.ctx)
         self.graph.set_input["actions", Self.B](self.act, self.ctx)
@@ -267,27 +436,47 @@ struct LeWMRefTrainer[target: StaticString, B: Int](Movable):
         self.graph.for_each_param[Self.target](mask, self.ctx)
         if mask.n_masked != 6:
             raise Error("LeWMRefTrainer: masked " + String(mask.n_masked) + " predictor qkv biases, expected 6")
-        var ss = _GradSumSq()
-        self.graph.for_each_param[Self.target](ss, self.ctx)
-        var norm = sqrt(ss.sumsq)
         # torch.nn.utils.clip_grad_norm_: clip_coef = max_norm / (norm + 1e-6),
-        # clamped to 1 (a no-op multiply when not clipping)
-        var coef = self.max_norm / (norm + 1e-6)
-        if coef < 1.0:
-            var sc = _GradScale(Scalar[DT](coef))
+        # clamped to 1
+        comptime if Self.target == "gpu":
+            var c = self.ctx.value()
+            self.norm_parts.ensure_gpu(c, 512)
+            self.norm_dev.ensure_gpu(c, 2)
+            var ss = _GradSumSq(self.norm_parts.dev.value())
+            self.graph.for_each_param[Self.target](ss, self.ctx)
+            if ss.k > 512:
+                raise Error("LeWMRefTrainer: more than 512 parameter tensors")
+            c.enqueue_function[_clip_coef_kernel](
+                self.norm_parts.dev.value(), Int64(ss.k), Scalar[DT](self.max_norm),
+                self.norm_dev.dev.value(), grid_dim=1, block_dim=1,
+            )
+            var sc = _GradScaleDev(self.norm_dev.dev.value())
             self.graph.for_each_param[Self.target](sc, self.ctx)
+        else:
+            var ss = _GradSumSq()
+            self.graph.for_each_param[Self.target](ss, self.ctx)
+            self.norm_host = sqrt(ss.sumsq)
+            var coef = self.max_norm / (self.norm_host + 1e-6)
+            if coef < 1.0:
+                var sc = _GradScale(Scalar[DT](coef))
+                self.graph.for_each_param[Self.target](sc, self.ctx)
         self._lap(3, t)
         self.opt.adam.begin_step()
         self.graph.for_each_param[Self.target](self.opt, self.ctx)
         self._lap(4, t)
 
-        var stats = RefStepStats(0.0, 0.0, 0.0, norm)
+    def finish(mut self) raises -> RefStepStats:
+        """Wait for the submitted step; its loss, the two terms and the
+        pre-clip gradient norm."""
+        var stats = RefStepStats(0.0, 0.0, 0.0, self.norm_host)
         comptime if Self.target == "gpu":
             var c = self.ctx.value()
             c.synchronize()
             self.loss.download(c)
             self.graph.node_output["pl"]().download(c)
             self.graph.node_output["sig"]().download(c)
+            self.norm_dev.download(c)
+            stats.grad_norm = Float64(self.norm_dev.data[0])
         for b in range(Self.B):
             stats.loss += Float64(self.loss.data[b])
             stats.pred_loss += Float64(self.graph.node_output["pl"]().data[b])

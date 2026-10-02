@@ -19,7 +19,7 @@ within 3 %. Measured: 0.09 % and 1.7 % (mean window 0.59 %, torch-TF32's
 0.69 %).
 
     pixi run -e nvidia mojo run -I . examples/lewm/lewm_pusht_train_parity.mojo \\
-        --run /workspace/lewm_parity32 --h5 /workspace/.../pusht_expert_train.h5 [--steps N]
+        --run /workspace/lewm_parity128 --h5 /workspace/.../pusht_expert_train.h5 [--steps N]
 """
 
 from std.sys import argv
@@ -28,17 +28,15 @@ from std.time import perf_counter_ns
 from max.gpu.host import DeviceContext
 
 from noeira.nn.constants import DT
-from noeira.nn.datasets.lewm_pusht import LewmPushTExpert
 from noeira.deep_agents.act.refload import RefDump
 from noeira.experimental.lewm.ref_trainer import LeWMRefTrainer, REF_T, REF_IMG, REF_ACT_IN
+from noeira.experimental.lewm.batch_loader import LewmBatchLoaderThread
 
 
-comptime B = 32
-"""The torch run's batch (`--batch 32`). Not the recipe's 128: one step of
-this graph allocates 31.5 GB at batch 64 (`NOEIRA_ALLOC_TRACE=1`: a persistent
-gradient buffer beside every activation, attention scores and FFN hiddens
-4.6 GB each, K-padded Linear inputs 3.9 GB) and the 5090 has 32; torch fits
-128. The memory is P6.2's question; parity does not depend on the batch."""
+comptime B = 128
+"""The recipe's batch, and the torch run's (`--batch 128`). Until
+`49a56a667` this graph could not take one step at 64 on a 32 GB 5090; with
+the ViT blocks checkpointed it peaks at 17.2 GB."""
 comptime HW = REF_IMG * REF_IMG
 comptime PIX = REF_T * 3 * HW
 comptime ACT = REF_T * REF_ACT_IN
@@ -55,7 +53,7 @@ def _mean(v: List[Float64], a: Int, b: Int) -> Float64:
 
 
 def main() raises:
-    var run = String("/workspace/lewm_parity32")
+    var run = String("/workspace/lewm_parity128")
     var h5 = String("/workspace/lewm_session_a/stablewm/pusht_expert_train.h5")
     var n_steps = -1
     var args = argv()
@@ -88,57 +86,64 @@ def main() raises:
     )
     var n = tr.load(run)
     print("P6.1 parity replay:", n_steps, "steps x batch", B, "; loaded", n, "tensors (torch's init)")
-    var ds = LewmPushTExpert(frameskip=5, num_steps=REF_T, path=h5)
-    print("  dataset:", len(ds), "clips")
 
-    var u8 = List[UInt8](length=REF_T * HW * 3, fill=0)
-    var dense = List[UInt8](length=REF_T * 5 * HW * 3, fill=0)
-    var araw = List[Float32](length=ACT, fill=0)
-    var pix = List[Scalar[DT]](length=B * PIX, fill=0)
-    var act = List[Scalar[DT]](length=B * ACT, fill=0)
-    var im_mean: List[Float32] = [0.485, 0.456, 0.406]
-    var im_std: List[Float32] = [0.229, 0.224, 0.225]
+    var stages: List[Pointer[Scalar[DType.uint8], MutAnyOrigin]] = [tr.staging(0), tr.staging(1)]
+    var idx = List[Int](capacity=n_steps * B)
+    for k in range(n_steps * B):
+        idx.append(Int(clip_idx[k]))
+    var am: List[Float32] = [Float32(a_mean[0]), Float32(a_mean[1])]
+    var asd: List[Float32] = [Float32(a_std[0]), Float32(a_std[1])]
+    # the reads run on their own thread (batch_loader.mojo): a step's ~4,000
+    # kernel launches hold this one
+    var loader = LewmBatchLoaderThread[B](h5, idx, am, asd, stages)
 
     var ours = List[Float64]()
     var theirs = List[Float64]()
     var t_all = perf_counter_ns()
+    loader.request(0)
     for s in range(n_steps):
         var t0 = perf_counter_ns()
-        for b in range(B):
-            ds.sample_clip_pixels_uint8(
-                Int(clip_idx[s * B + b]),
-                rebind[Pointer[Scalar[DType.uint8], MutAnyOrigin]](u8.unsafe_ptr()),
-                rebind[Pointer[Scalar[DType.float32], MutAnyOrigin]](araw.unsafe_ptr()),
-                rebind[Pointer[Scalar[DType.uint8], MutAnyOrigin]](dense.unsafe_ptr()),
-            )
-            # torch: u8.float() / 255, permute to CHW, (x - mean) / std — float32
-            for t in range(REF_T):
+        var t_next = loader.wait(s)
+        var t_wait = Float64(perf_counter_ns() - t0) / 1e9
+        # slot (s+1) % 2 was last read by step s-1, finished: the loader can
+        # fill it while this thread is held by step s's kernel launches
+        if s + 1 < n_steps:
+            loader.request(s + 1)
+        tr.set_sigreg_a(rd.get(String("run.A.") + String(s)))
+        tr.submit_staged(loader.actions(s), s % 2)
+        var st = tr.finish()
+        if s == 0:
+            # the device normalisation against torch's float32 order on the
+            # host (u8 / 255, then (x - mean) / std): must be bit-equal
+            var im_mean: List[Float32] = [0.485, 0.456, 0.406]
+            var im_std: List[Float32] = [0.229, 0.224, 0.225]
+            var stage = stages[0]
+            tr.pix.download(c)
+            var diff = 0
+            for f in range(B * REF_T):
                 for p in range(HW):
                     for ch in range(3):
-                        var x = Float32(u8[(t * HW + p) * 3 + ch]) / Float32(255.0)
-                        pix[b * PIX + (t * 3 + ch) * HW + p] = rebind[Scalar[DT]](
-                            (x - im_mean[ch]) / im_std[ch]
-                        )
-            # (20, 2) dense = (4, 10) row-major; z-score per raw dim, NaN -> 0
-            for k in range(ACT):
-                var z = (araw[k] - Float32(a_mean[k % 2])) / Float32(a_std[k % 2])
-                act[b * ACT + k] = Scalar[DT](0.0) if isnan(z) else rebind[Scalar[DT]](z)
-        var t_data = perf_counter_ns()
-        tr.set_sigreg_a(rd.get(String("run.A.") + String(s)))
-        var st = tr.train_step(pix, act)
+                        var x = Float32(stage[(f * HW + p) * 3 + ch]) / Float32(255.0)
+                        var want = (x - im_mean[ch]) / im_std[ch]
+                        if rebind[Float32](tr.pix.data[(f * 3 + ch) * HW + p]) != want:
+                            diff += 1
+            print("  step 0: device pixel normalisation vs host float32:", diff, "of", B * PIX, "differ")
+            if diff > 0:
+                raise Error("the device pixel normalisation is not torch's")
         ours.append(st.loss)
         theirs.append(Float64(want[s * 5]))
-        if s % 25 == 0 or s == n_steps - 1:
+        if s % 25 == 0 or s == n_steps - 1 or s < 5:
             print(
                 "  step", s, " loss ours", Float32(st.loss), "torch", Float32(want[s * 5]),
                 "  pred", Float32(st.pred_loss), Float32(want[s * 5 + 1]),
                 "  sigreg", Float32(st.sigreg_loss), Float32(want[s * 5 + 2]),
                 "  norm", Float32(st.grad_norm), Float32(want[s * 5 + 3]),
-                "  (data", Float32(Float64(t_data - t0) / 1e9), "s, step",
-                Float32(Float64(perf_counter_ns() - t_data) / 1e9), "s)",
+                "  (wall", Float32(Float64(perf_counter_ns() - t0) / 1e9), "s: waited",
+                Float32(t_wait), "s for a batch the loader read in", Float32(t_next), "s)",
             )
 
     print("  total", Float64(perf_counter_ns() - t_all) / 1e9, "s")
+    loader.stop()
     var early = 0.0
     for s in range(min(10, n_steps)):
         early = max(early, abs(ours[s] - theirs[s]) / theirs[s])

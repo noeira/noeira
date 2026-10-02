@@ -7,7 +7,7 @@ PushT dataset, and record everything a Mojo replay needs to take the SAME
 steps (docs/LEWM_REOPEN_PLAN.md P6):
 
     python tools/lewm/train_parity_ref.py --h5 .../pusht_expert_train.h5 \\
-        --out /workspace/lewm_parity32 --steps 1000 --batch 32
+        --out /workspace/lewm_parity128 --steps 1000 --batch 128
 
 then `convert_ref_to_ours.py --dump <out>` (the init in our names) and
 `examples/lewm/lewm_pusht_train_parity.mojo --run <out>`.

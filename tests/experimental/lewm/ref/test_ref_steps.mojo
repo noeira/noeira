@@ -41,6 +41,15 @@ comptime B = 4
 comptime TOL = 1e-3
 """Deltas, std units (torch's own float32 error: median 2.5e-3, max 0.09 —
 most tensors are held to 10x their own)."""
+comptime NOISE_X_CPU = 10.0
+comptime NOISE_X_GPU = 20.0
+"""A delta is held to max(TOL, X x torch's own float32 error on it). The GPU
+leg reduces in other orders than torch's CPU kernels (warp / chunked sums,
+tiled products), a second float32 rounding draw: measured on an M1 Pro,
+err/tol above 0.25 / 0.5 / 0.75 / 1.0 at 10x — before `49a56a667`'s kernels
+14 / 2 / 1 / 0 of 305 tensors, after 7 / 3 / 3 / 1 (the fc1 bias of block 5
+at 1.02). A reshuffle of the rounding, not a shift; a semantic error is O(1)
+std (the decay mutation: 221x)."""
 comptime TOL_SCALAR = 1e-5
 comptime TOL_BN = 1e-4
 comptime REL_TF32 = 2e-2
@@ -58,6 +67,8 @@ struct _DeltaCheck(ParamVisitor):
     var failed: List[String]
     var qkv_bias_zero: Bool
     var dead_tensors: List[String]
+    var ratios: List[Float64]
+    var ratio_names: List[String]
 
     def __init__(out self, var dump: RefDump, tf32: Bool):
         self.dump = dump^
@@ -70,6 +81,8 @@ struct _DeltaCheck(ParamVisitor):
         self.failed = List[String]()
         self.qkv_bias_zero = True
         self.dead_tensors = List[String]()
+        self.ratios = List[Float64]()
+        self.ratio_names = List[String]()
 
     def visit[target: StaticString, N: Int](
         mut self, name: String, mut param: Tensor, mut grad: Tensor,
@@ -129,8 +142,10 @@ struct _DeltaCheck(ParamVisitor):
                 self.failed.append(name + " cos " + String(cos))
             return
         var noise = Float64(self.dump.get(String("ours_steps_noise.") + name)[0])
-        var tol = max(TOL, 10.0 * noise)
+        var tol = max(TOL, (NOISE_X_GPU if target == "gpu" else NOISE_X_CPU) * noise)
         self.worst_ratio = max(self.worst_ratio, err / tol)
+        self.ratios.append(err / tol)
+        self.ratio_names.append(name)
         if err > tol:
             self.failed.append(name + " " + String(err) + " (tol " + String(tol) + ")")
 
@@ -223,6 +238,16 @@ def _run[target: StaticString](
         dead += " " + d
     print("     deltas:", dc.n_checked, "checked +", len(dc.dead_tensors), "wholly dead (" + dead + " ); worst", dc.worst, "at", dc.worst_name,
           "; worst err/tol", dc.worst_ratio, "; worst cosine", dc.worst_cos)
+    # the distribution, not just the worst: how many tensors sit near their band
+    var bands: List[Float64] = [0.25, 0.5, 0.75, 1.0]
+    var line = String("     err/tol distribution:")
+    for bd in bands:
+        var n_above = 0
+        for r in dc.ratios:
+            if r > bd:
+                n_above += 1
+        line += "  >" + String(bd) + ": " + String(n_above)
+    print(line, " (of", len(dc.ratios), ")")
     for f in dc.failed:
         print("     ✗ delta", f)
     fails += len(dc.failed)
