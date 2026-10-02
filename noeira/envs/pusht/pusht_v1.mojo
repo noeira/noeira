@@ -68,6 +68,8 @@ from .geometry import (
     get_t_keypoints_world,
     compute_coverage,
     t_rect_long_vertex,
+    t_body_from_origin,
+    t_origin_from_body,
     t_rect_stem_vertex,
 )
 from .physics import (
@@ -280,8 +282,9 @@ struct PushTEnv[DTYPE: DType](
 
         # T-block (body 1)
         var to_ = PushTLayout.BODY_T_OFFSET
-        state[0, to_ + IDX_X] = block_x
-        state[0, to_ + IDX_Y] = block_y
+        var bxy = t_body_from_origin(block_x, block_y, block_angle)
+        state[0, to_ + IDX_X] = bxy[0]
+        state[0, to_ + IDX_Y] = bxy[1]
         state[0, to_ + IDX_ANGLE] = block_angle
         var m = Scalar[dtype](PConstants.T_MASS)
         var I = _compute_t_inertia()
@@ -337,6 +340,10 @@ struct PushTEnv[DTYPE: DType](
         var bx = rebind[Scalar[dtype]](s[0, to_ + IDX_X])
         var by = rebind[Scalar[dtype]](s[0, to_ + IDX_Y])
         var ba = rebind[Scalar[dtype]](s[0, to_ + IDX_ANGLE])
+        # the physics integrates the T about its cog: back to the origin pose
+        var _org = t_origin_from_body(bx, by, ba)
+        bx = _org[0]
+        by = _org[1]
         var kp = Array[Scalar[dtype], PConstants.KEYPOINTS_DIM](
             fill=Scalar[dtype](0.0)
         )
@@ -409,14 +416,34 @@ struct PushTEnv[DTYPE: DType](
         block_x: Scalar[dtype],
         block_y: Scalar[dtype],
         block_angle: Scalar[dtype],
+        *,
+        agent_vx: Scalar[dtype] = 0.0,
+        agent_vy: Scalar[dtype] = 0.0,
+        settle: Bool = False,
     ) -> PushTState[Self.dtype]:
-        """Teleport to an exact (agent, block) configuration with zero
-        velocities — the LeWM paper-protocol eval starts episodes from
-        DATASET states (swm `_set_state` callable). Same body as
-        `_reset_internal` minus the RNG draw: seed bodies, clear contact
-        count / step / done / reward / coverage metadata, refresh obs."""
+        """Teleport to an exact (agent, block) configuration — the LeWM
+        paper-protocol eval starts episodes from DATASET states (swm
+        `_set_state` callable). Same body as `_reset_internal` minus the RNG
+        draw: seed bodies, clear contact count / step / done / reward /
+        coverage metadata, refresh obs.
+
+        Defaults keep the old behaviour (zero velocities, no physics step).
+        swm's `PushT._set_state` (stable-worldmodel 0.0.6) differs on two
+        points, opt-in here: it keeps the AGENT velocity from the 7-d state
+        (`agent_vx/vy`; the block's velocity is not in the state and stays
+        at rest), and it advances the physics ONE free substep (`settle`):
+        `space.step(dt)` with no PD force. The free substep is our PD substep
+        aimed at `pos + (k_v / k_p) * vel`, where the PD acceleration
+        `k_p (target - pos) - k_v vel` is exactly zero."""
         self._seed_bodies(agent_x, agent_y, block_x, block_y, block_angle)
         var s = self._state_view()
+        var ao = PushTLayout.BODY_AGENT_OFFSET
+        s[0, ao + IDX_VX] = agent_vx
+        s[0, ao + IDX_VY] = agent_vy
+        if settle:
+            var r = Scalar[dtype](PConstants.K_V / PConstants.K_P)
+            self._substep(agent_x + r * agent_vx, agent_y + r * agent_vy)
+            s = self._state_view()
         s[0, PushTLayout.CONTACT_COUNT_OFFSET] = Scalar[dtype](0.0)
         s[0, PushTLayout.METADATA_OFFSET + PushTLayout.META_STEP] = Scalar[
             dtype
@@ -453,6 +480,10 @@ struct PushTEnv[DTYPE: DType](
         var bx = rebind[Scalar[dtype]](s[0, to_ + IDX_X])
         var by = rebind[Scalar[dtype]](s[0, to_ + IDX_Y])
         var ba = rebind[Scalar[dtype]](s[0, to_ + IDX_ANGLE])
+        # the physics integrates the T about its cog: back to the origin pose
+        var _org = t_origin_from_body(bx, by, ba)
+        bx = _org[0]
+        by = _org[1]
         var cov = compute_coverage(
             bx,
             by,
@@ -605,12 +636,20 @@ struct PushTEnv[DTYPE: DType](
     def block_pose(mut self) -> Tuple[
         Scalar[Self.dtype], Scalar[Self.dtype], Scalar[Self.dtype]
     ]:
+        """The block's ORIGIN pose (x, y, angle) — the dataset's convention
+        (the physics integrates its cog; see PConstants.T_COG_Y)."""
         var s = self._state_view()
         var to_ = PushTLayout.BODY_T_OFFSET
+        var ba = rebind[Scalar[dtype]](s[0, to_ + IDX_ANGLE])
+        var o = t_origin_from_body(
+            rebind[Scalar[dtype]](s[0, to_ + IDX_X]),
+            rebind[Scalar[dtype]](s[0, to_ + IDX_Y]),
+            ba,
+        )
         return (
-            rebind[Scalar[Self.dtype]](s[0, to_ + IDX_X]),
-            rebind[Scalar[Self.dtype]](s[0, to_ + IDX_Y]),
-            rebind[Scalar[Self.dtype]](s[0, to_ + IDX_ANGLE]),
+            rebind[Scalar[Self.dtype]](o[0]),
+            rebind[Scalar[Self.dtype]](o[1]),
+            rebind[Scalar[Self.dtype]](ba),
         )
 
     def agent_pos(mut self) -> Tuple[Scalar[Self.dtype], Scalar[Self.dtype]]:

@@ -22,7 +22,11 @@ from max.gpu.host import DeviceContext, DeviceBuffer
 from noeira.physics2d import dtype, TPB
 from noeira.physics2d.constants import IDX_X, IDX_Y, IDX_ANGLE
 from .constants import PConstants, PushTLayout
-from .geometry import t_rect_long_vertex, t_rect_stem_vertex
+from .geometry import (
+    t_rect_long_vertex,
+    t_rect_stem_vertex,
+    t_origin_from_body,
+)
 
 
 comptime IMG_H: Int = 96
@@ -315,6 +319,10 @@ def render_pixel_obs_kernel_gpu[
         var bx = rebind[Scalar[dtype]](st[env, to_ + IDX_X])
         var by = rebind[Scalar[dtype]](st[env, to_ + IDX_Y])
         var ba = rebind[Scalar[dtype]](st[env, to_ + IDX_ANGLE])
+        # the physics integrates the T about its cog: back to the origin pose
+        var _org = t_origin_from_body(bx, by, ba)
+        bx = _org[0]
+        by = _org[1]
         var scale = Scalar[dtype](PIXEL_SCALE)
         var pyw = (Scalar[dtype](r) + Scalar[dtype](0.5)) * scale
         var pxw = (Scalar[dtype](c) + Scalar[dtype](0.5)) * scale

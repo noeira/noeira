@@ -116,8 +116,12 @@ def init_pusht_shape_buffer[
     shapes[PushTShapeBuf.SHAPE_T_RECT_LONG][1] = Scalar[dtype](4)
     for v in range(4):
         var p = t_rect_long_vertex(v)
+        # collision shapes are relative to the body's integration point, the
+        # cog (0, T_COG_Y) — see PConstants.T_COG_Y
         shapes[PushTShapeBuf.SHAPE_T_RECT_LONG][2 + v * 2] = p[0]
-        shapes[PushTShapeBuf.SHAPE_T_RECT_LONG][3 + v * 2] = p[1]
+        shapes[PushTShapeBuf.SHAPE_T_RECT_LONG][3 + v * 2] = p[1] - Scalar[dtype](
+            PConstants.T_COG_Y
+        )
 
     # Slot 2: T stem polygon
     for j in range(SHAPE_MAX_SIZE):
@@ -126,8 +130,12 @@ def init_pusht_shape_buffer[
     shapes[PushTShapeBuf.SHAPE_T_RECT_STEM][1] = Scalar[dtype](4)
     for v in range(4):
         var p = t_rect_stem_vertex(v)
+        # collision shapes are relative to the body's integration point, the
+        # cog (0, T_COG_Y) — see PConstants.T_COG_Y
         shapes[PushTShapeBuf.SHAPE_T_RECT_STEM][2 + v * 2] = p[0]
-        shapes[PushTShapeBuf.SHAPE_T_RECT_STEM][3 + v * 2] = p[1]
+        shapes[PushTShapeBuf.SHAPE_T_RECT_STEM][3 + v * 2] = p[1] - Scalar[dtype](
+            PConstants.T_COG_Y
+        )
 
     # Slot 3: T compound — references slots 1 and 2
     for j in range(SHAPE_MAX_SIZE):
@@ -177,6 +185,27 @@ def transform_point(
 # `get_keypoints` which iterates the two shapes and emits each vertex
 # transformed by body angle + position.
 # =============================================================================
+
+
+@always_inline
+def t_body_from_origin(
+    ox: Scalar[dtype], oy: Scalar[dtype], angle: Scalar[dtype]
+) -> Tuple[Scalar[dtype], Scalar[dtype]]:
+    """The T's physics position (its cog) from its ORIGIN pose:
+    origin + R(angle) (0, T_COG_Y). See PConstants.T_COG_Y."""
+    var cg = Scalar[dtype](PConstants.T_COG_Y)
+    return (ox - cg * sin(angle), oy + cg * cos(angle))
+
+
+@always_inline
+def t_origin_from_body(
+    bx: Scalar[dtype], by: Scalar[dtype], angle: Scalar[dtype]
+) -> Tuple[Scalar[dtype], Scalar[dtype]]:
+    """Inverse of `t_body_from_origin`: the ORIGIN pose every geometry
+    consumer (keypoints, coverage, rendering, the dataset's block x, y)
+    uses."""
+    var cg = Scalar[dtype](PConstants.T_COG_Y)
+    return (bx + cg * sin(angle), by - cg * cos(angle))
 
 
 @always_inline
