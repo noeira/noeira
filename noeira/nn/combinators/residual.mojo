@@ -195,5 +195,11 @@ struct Residual[Inner: Module](Module):
     ) raises:
         self.inner.polyak_from[target](src.inner, tau, ctx)
 
+    def release_buffers(mut self):
+        """`mid` (the inner output / inner grad-input, both transient), then
+        the inner module."""
+        self.mid.release()
+        self.inner.release_buffers()
+
     def set_attr[ATTR: StaticString](mut self, value: Scalar[DT]):
         self.inner.set_attr[ATTR](value)

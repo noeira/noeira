@@ -164,6 +164,7 @@ from .combinators.sequential import Sequential
 from .combinators.residual import Residual
 from .combinators.parallel import Parallel
 from .combinators.repeat import Repeat
+from .combinators.checkpointed import Checkpointed
 from .combinators.repeat_conditional import RepeatConditional
 from .combinators.projected_residual import ProjectedResidual
 from .combinators.tokenwise import Tokenwise

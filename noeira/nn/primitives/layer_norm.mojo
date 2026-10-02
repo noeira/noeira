@@ -297,6 +297,11 @@ struct LayerNorm[DIM_: Int, ADT: DType = DT, EPS: Scalar[DT] = LN_EPS](Module):
             ln.beta.val.upload(dctx)
         return ln^
 
+    def release_buffers(mut self):
+        """`cache_xhat` / `cache_inv_std`: rebuilt by every forward."""
+        self.cache_xhat.release()
+        self.cache_inv_std.release()
+
     def forward[
         target: StaticString, B: Int, o: MutOrigin, POLICY: AMPPolicy = NoAMP
     ](

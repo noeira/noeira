@@ -172,6 +172,13 @@ struct Repeat[N: Int, Inner: Module, shared: Bool = False](Module):
         for i in range(Self.N):
             self.children[i].polyak_from[target](src.children[i], tau, ctx)
 
+    def release_buffers(mut self):
+        """The inter-stage slabs, then every copy (`Module.release_buffers`)."""
+        self.act.release()
+        self.grd.release()
+        for i in range(Self.N):
+            self.children[i].release_buffers()
+
     def set_attr[ATTR: StaticString](mut self, value: Scalar[DT]):
         for i in range(Self.N):
             self.children[i].set_attr[ATTR](value)

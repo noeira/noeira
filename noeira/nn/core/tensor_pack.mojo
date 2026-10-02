@@ -23,6 +23,11 @@ struct TensorPack[N: Int, ADT: DType = DT](
         comptime for i in range(Self.N):
             self.tensors.append(TensorImpl[Self.ADT]())
 
+    def release(mut self):
+        """`TensorImpl.release` on every slot (see it)."""
+        for i in range(len(self.tensors)):
+            self.tensors[i].release()
+
     def __getitem__(
         mut self, index: Int
     ) raises -> ref [MutAnyOrigin] TensorImpl[Self.ADT]:

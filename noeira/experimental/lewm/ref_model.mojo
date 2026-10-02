@@ -41,6 +41,7 @@ from noeira.nn.core.module import Module
 from noeira.nn import (
     Sequential,
     Repeat,
+    Checkpointed,
     RepeatConditional,
     Residual,
     Linear,
@@ -129,8 +130,10 @@ comptime LeWMEncoderRef[
     BiasAdd[((IMG // PATCH) * (IMG // PATCH) + 1) * HIDDEN],
     Repeat[
         LAYERS,
-        ViTBlockHF[
-            HIDDEN, HEADS, (IMG // PATCH) * (IMG // PATCH) + 1, 4 * HIDDEN
+        Checkpointed[
+            ViTBlockHF[
+                HIDDEN, HEADS, (IMG // PATCH) * (IMG // PATCH) + 1, 4 * HIDDEN
+            ]
         ],
     ],
     Tokenwise[
@@ -141,7 +144,12 @@ comptime LeWMEncoderRef[
 ]
 """Image (CHW, ImageNet-normalised) -> (B, EMB): patch Conv2D -> prepend CLS ->
 + position embedding (no interpolation at the trained size) -> LAYERS x ViT
-block -> final LN -> CLS token -> projector."""
+block -> final LN -> CLS token -> projector.
+
+Each ViT block is `Checkpointed` (names unchanged), OFF unless a trainer sets
+`checkpoint`: on, the encoder keeps the 12 block inputs and one block's
+internals at a time, and recomputes each block's forward in the vjp. The
+blocks are deterministic (no BN, no dropout), so the gradients are the same."""
 
 
 # ── action embedder ───────────────────────────────────────────────────────

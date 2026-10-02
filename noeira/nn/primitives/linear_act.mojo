@@ -62,7 +62,7 @@ from ..core.initializer import Initializer
 from ..core.amp import AMPPolicy, NoAMP
 from ..core.polyak import polyak_tensor
 from .linear import (
-    _lin_gb_kernel,
+    enqueue_bias_grad,
     _transpose_tiled_kernel,
     _accum_kernel,
     _accum_2d_kernel,
@@ -280,6 +280,8 @@ struct LinearAct[IN_: Int, OUT_: Int, OP: ElementOp, ADT: DType = DT](Module):
     STRIDED add (`_accum_2d_kernel`) because its row stride is N_PAD."""
     var gi_pad: Tensor
     """[B, K_PAD] padded grad_input, sliced back to [B, IN_]."""
+    var gb_part: Tensor
+    """Bias-gradient chunk partials (`linear.enqueue_bias_grad`)."""
     var _w_pad_version: Int
     # Split-K reduction workspace for the dW GEMM, `[P, IN_, OUT_]`, and the
     # cached partition count (-1 = not yet decided, 1 = do not split).
@@ -322,6 +324,7 @@ struct LinearAct[IN_: Int, OUT_: Int, OP: ElementOp, ADT: DType = DT](Module):
         self.cT_pad = Tensor()
         self.dW_pad = Tensor()
         self.gi_pad = Tensor()
+        self.gb_part = Tensor()
         self._w_pad_version = -1  # < any real version → first forward pads
         self.sk_ws = Tensor()
         self._sk_p = -1
@@ -664,13 +667,8 @@ struct LinearAct[IN_: Int, OUT_: Int, OP: ElementOp, ADT: DType = DT](Module):
                     grid_dim=(M + TPB - 1) // TPB,
                     block_dim=TPB,
                 )
-                c.enqueue_function[_lin_gb_kernel[DT]](
-                    god.dev.value(),
-                    self.bias.grd.dev.value(),
-                    Int64(B),
-                    Int64(Self.OUT_),
-                    grid_dim=(Self.OUT_ + TPB - 1) // TPB,
-                    block_dim=TPB,
+                enqueue_bias_grad[DT](
+                    c, god.dev.value(), self.bias.grd.dev.value(), B, Self.OUT_, self.gb_part
                 )
                 c.enqueue_function[_transpose_tiled_kernel[DT]](
                     find.dev.value(),
@@ -862,13 +860,8 @@ struct LinearAct[IN_: Int, OUT_: Int, OP: ElementOp, ADT: DType = DT](Module):
                 block_dim=TPB,
             )
             # grad_b += colsum(go): bf16 go → fp32 master grad (fp32 accumulator).
-            c.enqueue_function[_lin_gb_kernel[Self.ADT]](
-                grad_output.dev.value(),
-                self.bias.grd.dev.value(),
-                Int64(B),
-                Int64(Self.OUT_),
-                grid_dim=(Self.OUT_ + TPB - 1) // TPB,
-                block_dim=TPB,
+            enqueue_bias_grad[Self.ADT](
+                c, grad_output.dev.value(), self.bias.grd.dev.value(), B, Self.OUT_, self.gb_part
             )
             # grad_w += cacheᵀ @ go: transpose the bf16 fwd-input → bf16 cacheT_bf
             # (B1' tiled), then a bf16-in → FP32-out GEMM into fp32 dW_tmp, then

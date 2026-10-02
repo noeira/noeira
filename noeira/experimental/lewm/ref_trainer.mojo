@@ -17,6 +17,8 @@ paper's dimensions:
     `exclude_bias_norm` defaults to False, so biases, LN / BN affines, the CLS
     token and the position embeddings decay too. `nn.Adam` skips params built
     with `apply_decay=False`; `_AdamWAll` forwards every one with decay on;
+  * activation checkpointing of the 12 ViT blocks (`checkpoint`, on by
+    default): the encoder's memory is its block inputs plus one block;
   * SIGReg: a fresh projection matrix per step (`resample`, the default, like
     the reference's per-forward `torch.randn`) or an injected one
     (`set_sigreg_a`, for the torch gates).
@@ -26,6 +28,7 @@ none. The parity gates run torch with dropout off (`dropout_off`).
 """
 
 from std.math import sqrt
+from std.time import perf_counter_ns
 from max.gpu.host import DeviceContext, DeviceBuffer
 from layout import Layout
 
@@ -171,6 +174,10 @@ struct LeWMRefTrainer[target: StaticString, B: Int](Movable):
     var pix: Tensor
     var act: Tensor
     var a_buf: Optional[DeviceBuffer[DT]]
+    var profile: Bool
+    """Synchronise between the stages of `train_step` and accumulate their
+    wall time in `t_stage` (seconds): copy-in, forward, vjp, clip, AdamW."""
+    var t_stage: List[Float64]
 
     def __init__(
         out self,
@@ -180,9 +187,12 @@ struct LeWMRefTrainer[target: StaticString, B: Int](Movable):
         max_norm: Float64 = 1.0,
         sigreg_lambda: Float64 = 0.09,
         decay_all: Bool = True,
+        checkpoint: Bool = True,
     ) raises:
         comptime assert Self.target == "cpu" or Self.target == "gpu"
         self.graph = LeWMRefGraph.make[Self.target, Kaiming](ctx)
+        # the 12 ViT blocks recompute their forward in the vjp (ref_model)
+        self.graph.set_node_attr["emb", "checkpoint"](Scalar[DT](1 if checkpoint else 0))
         self.graph.set_node_attr["sig_s", "multiplier"](Scalar[DT](sigreg_lambda))
         self.graph.set_node_attr["sig", "resample"](Scalar[DT](1))
         self.opt = _AdamWAll(Scalar[DT](lr), Scalar[DT](wd), decay_all)
@@ -195,8 +205,19 @@ struct LeWMRefTrainer[target: StaticString, B: Int](Movable):
         self.pix = Tensor.alloc(Self.B * Self.PIX)
         self.act = Tensor.alloc(Self.B * Self.ACT)
         self.a_buf = None
+        self.profile = False
+        self.t_stage = List[Float64](length=5, fill=0.0)
         comptime if Self.target == "gpu":
             self.seed.upload(ctx.value())
+
+    def _lap(mut self, stage: Int, mut t: Int) raises:
+        if not self.profile:
+            return
+        comptime if Self.target == "gpu":
+            self.ctx.value().synchronize()
+        var now = Int(perf_counter_ns())
+        self.t_stage[stage] += Float64(now - t) / 1e9
+        t = now
 
     def load(mut self, dump_dir: String) raises -> Int:
         """Every Param and BN State from a converted dump (`ours.<name>`)."""
@@ -225,6 +246,7 @@ struct LeWMRefTrainer[target: StaticString, B: Int](Movable):
     ) raises -> RefStepStats:
         """pix: (B, T, 3, 224, 224) ImageNet-normalised; act: (B, T, 10)
         z-scored, NaN already zeroed (train.py's `nan_to_num`)."""
+        var t = Int(perf_counter_ns())
         for i in range(Self.B * Self.PIX):
             self.pix.data[i] = pix[i]
         for i in range(Self.B * Self.ACT):
@@ -232,11 +254,14 @@ struct LeWMRefTrainer[target: StaticString, B: Int](Movable):
         comptime if Self.target == "gpu":
             self.pix.upload(self.ctx.value())
             self.act.upload(self.ctx.value())
+        self._lap(0, t)
         self.graph.zero_grad[Self.target](self.ctx)
         self.graph.set_input["pixels", Self.B](self.pix, self.ctx)
         self.graph.set_input["actions", Self.B](self.act, self.ctx)
         self.graph.forward[Self.B, Self.target](self.loss, self.ctx)
+        self._lap(1, t)
         self.graph.vjp[Self.B, Self.target](self.seed, self.ctx)
+        self._lap(2, t)
 
         var mask = _MaskPredQKVBias()
         self.graph.for_each_param[Self.target](mask, self.ctx)
@@ -251,8 +276,10 @@ struct LeWMRefTrainer[target: StaticString, B: Int](Movable):
         if coef < 1.0:
             var sc = _GradScale(Scalar[DT](coef))
             self.graph.for_each_param[Self.target](sc, self.ctx)
+        self._lap(3, t)
         self.opt.adam.begin_step()
         self.graph.for_each_param[Self.target](self.opt, self.ctx)
+        self._lap(4, t)
 
         var stats = RefStepStats(0.0, 0.0, 0.0, norm)
         comptime if Self.target == "gpu":

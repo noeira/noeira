@@ -214,6 +214,13 @@ struct Sequential[*MODULES: Module](Module):
         comptime for i in range(Self.N):
             self.children[i].polyak_from[target](src.children[i], tau, ctx)
 
+    def release_buffers(mut self):
+        """The inter-child slabs, then every child (`Module.release_buffers`)."""
+        self.act.release()
+        self.grd.release()
+        comptime for i in range(Self.N):
+            self.children[i].release_buffers()
+
     def set_attr[ATTR: StaticString](mut self, value: Scalar[DT]):
         """Recurse a named runtime attribute (e.g. BatchNorm's "training") into
         every child — the plain-Sequential analog of ComputeGraph's

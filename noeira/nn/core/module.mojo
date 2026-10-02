@@ -119,6 +119,19 @@ trait Module(ParamWalkable & Defaultable):
         override on their `Param`s, combinators recurse into children."""
         pass
 
+    def release_buffers(mut self):
+        """Drop every buffer this module REBUILDS on its next forward / vjp —
+        cached activations, padded copies, scratch, inter-child slabs — and
+        keep what must persist: params, state (BN running stats), caches
+        gated on a param version (`Linear.w_pad`), workspaces sized once
+        (`Linear.sk_ws`). Combinators release theirs and recurse.
+
+        For activation checkpointing (`Checkpointed`): a block's whole
+        forward state is freed between its forward and its recomputed
+        forward in the vjp. Default no-op: a module without an override keeps
+        its buffers, which costs memory, never correctness."""
+        pass
+
     def set_attr_buf[
         ATTR: StaticString
     ](mut self, buf: DeviceBuffer[DT]):

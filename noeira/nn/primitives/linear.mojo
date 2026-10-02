@@ -143,25 +143,103 @@ def _accum_kernel(
         dst[unsafe_offset=i] += src[unsafe_offset=i]
 
 
-# grad_b += colsum(go). Dtype-parametric on the grad_output activation (`ADT`):
-# the bf16 path reads a bf16 `go` and accumulates into the FP32 `gb` (each
-# element cast to DT before summing — the accumulator stays fp32).
-def _lin_gb_kernel[
+# grad_b += colsum(go): `enqueue_bias_grad`. Dtype-parametric on the
+# grad_output activation (`ADT`): the bf16 path reads a bf16 `go` and
+# accumulates into the FP32 `gb` (each element cast to DT before summing).
+comptime _GB_COLS = 32
+comptime _GB_ROWS = 8
+comptime _GB_CHUNK = 1024
+"""Rows per partial sum of the bias gradient."""
+
+
+def _lin_gb_partial_kernel[
     ADT: DType = DT
 ](
     go: Pointer[Scalar[ADT], MutAnyOrigin],
-    gb: Pointer[Scalar[DT], MutAnyOrigin],
+    part: Pointer[Scalar[DT], MutAnyOrigin],
     b_arg: Int64,
     out_arg: Int64,
 ):
-    """`gb[j] += sum_b go[b, j]`, one thread per column."""
+    """`part[c, j] = sum of go[b, j] over the rows of chunk c` (`_GB_CHUNK`
+    rows). Block (`_GB_COLS`, `_GB_ROWS`): lanes along j (coalesced), the
+    `_GB_ROWS` row-strided sums reduced in a fixed order in shared memory."""
+    var n_out = Int(out_arg)
+    var n_b = Int(b_arg)
+    var tx = Int(thread_idx.x)
+    var ty = Int(thread_idx.y)
+    var j = Int(block_idx.x) * _GB_COLS + tx
+    var r0 = Int(block_idx.y) * _GB_CHUNK
+    var r1 = min(r0 + _GB_CHUNK, n_b)
+    var acc = LayoutTensor[
+        DT, Layout.row_major(_GB_ROWS, _GB_COLS), MutAnyOrigin,
+        address_space=AddressSpace.SHARED,
+    ].stack_allocation()
+    var s: Scalar[DT] = 0
+    if j < n_out:
+        var r = r0 + ty
+        while r < r1:
+            s += go[unsafe_offset=r * n_out + j].cast[DT]()
+            r += _GB_ROWS
+    acc[ty, tx] = s
+    barrier()
+    if ty == 0 and j < n_out:
+        var t: Scalar[DT] = 0
+        comptime for k in range(_GB_ROWS):
+            t += rebind[Scalar[DT]](acc[k, tx])
+        part[unsafe_offset=Int(block_idx.y) * n_out + j] = t
+
+
+def _lin_gb_final_kernel(
+    part: Pointer[Scalar[DT], MutAnyOrigin],
+    gb: Pointer[Scalar[DT], MutAnyOrigin],
+    chunks_arg: Int64,
+    out_arg: Int64,
+):
+    """`gb[j] += sum_c part[c, j]`, chunks in order."""
     var n_out = Int(out_arg)
     var j = Int(global_idx.x)
     if j < n_out:
         var s: Scalar[DT] = 0
-        for b in range(Int(b_arg)):
-            s += go[unsafe_offset=b * n_out + j].cast[DT]()
+        for c in range(Int(chunks_arg)):
+            s += part[unsafe_offset=c * n_out + j]
         gb[unsafe_offset=j] += s
+
+
+def enqueue_bias_grad[ADT: DType](
+    c: DeviceContext,
+    go: DeviceBuffer[ADT],
+    gb: DeviceBuffer[DT],
+    B: Int,
+    OUT: Int,
+    mut part: Tensor,
+) raises:
+    """`gb += colsum(go)` for a [B, OUT] grad_output, deterministic.
+
+    Replaces `_lin_gb_kernel`'s one thread per column, which gave the whole
+    reduction OUT threads (a few blocks) each walking all B rows: on the
+    LeWM encoder (B = 131,584 token rows) it was 39 % of a training step's
+    GPU time on a 5090, 0.58 s of 1.47. Two passes now: chunk partials over
+    a (OUT / 32, B / 1024) grid, then one thread per column adds the chunks
+    in order. `part` is the caller's scratch, sized lazily (stable after the
+    first step, so capture-safe)."""
+    var chunks = (B + _GB_CHUNK - 1) // _GB_CHUNK
+    part.ensure_gpu(c, chunks * OUT)
+    c.enqueue_function[_lin_gb_partial_kernel[ADT]](
+        go,
+        part.dev.value(),
+        Int64(B),
+        Int64(OUT),
+        grid_dim=((OUT + _GB_COLS - 1) // _GB_COLS, chunks),
+        block_dim=(_GB_COLS, _GB_ROWS),
+    )
+    c.enqueue_function[_lin_gb_final_kernel](
+        part.dev.value(),
+        gb,
+        Int64(chunks),
+        Int64(OUT),
+        grid_dim=(OUT + 255) // 256,
+        block_dim=256,
+    )
 
 
 comptime BF16 = DType.bfloat16
@@ -534,6 +612,8 @@ struct Linear[IN_: Int, OUT_: Int, ADT: DType = DT](Module):
     STRIDED add (`_accum_2d_kernel`) because its row stride is N_PAD."""
     var gi_pad: Tensor
     """[B, K_PAD] padded grad_input, sliced back to [B, IN_]."""
+    var gb_part: Tensor
+    """Bias-gradient chunk partials (`enqueue_bias_grad`), [B / 1024, OUT_]."""
     var sk_ws: Tensor
     """Split-K reduction workspace for the dW GEMM, `[P, K_PAD, N_PAD]`.
 
@@ -578,6 +658,7 @@ struct Linear[IN_: Int, OUT_: Int, ADT: DType = DT](Module):
         self.sk_ws = Tensor()
         self._sk_p = -1
         self.gi_pad = Tensor()
+        self.gb_part = Tensor()
         self._w_pad_version = -1  # < any real version → first forward pads
 
     def set_attr[ATTR: StaticString](mut self, value: Scalar[DT]):
@@ -670,6 +751,21 @@ struct Linear[IN_: Int, OUT_: Int, ADT: DType = DT](Module):
         )
         INIT.init_bias[target](l.bias.val, Self.B_SIZE, ctx)
         return l^
+
+    def release_buffers(mut self):
+        """The forward / vjp activations and scratch: `cacheT` (the input,
+        transposed, for grad_w), its bf16 twin, and the padded copies
+        `x_pad` / `y_pad` / `go_pad` / `cT_pad` / `gi_pad`. Kept: the params,
+        the version-gated weight caches (`w_pad`, `w_bf`, `b_a`), the
+        weight-sized `dW_pad` / `dW_tmp`, and `sk_ws`, sized ONCE with the
+        split-K decision."""
+        self.cacheT.release()
+        self.cacheT_bf.release()
+        self.x_pad.release()
+        self.y_pad.release()
+        self.go_pad.release()
+        self.cT_pad.release()
+        self.gi_pad.release()
 
     def forward[
         target: StaticString, B: Int, o: MutOrigin, POLICY: AMPPolicy = NoAMP
@@ -954,14 +1050,7 @@ struct Linear[IN_: Int, OUT_: Int, ADT: DType = DT](Module):
                 # grad_b += colsum(go)
                 var gol = god.dev.value()
                 var gbl = self.bias.grd.dev.value()
-                c.enqueue_function[_lin_gb_kernel[DT]](
-                    gol,
-                    gbl,
-                    Int64(B),
-                    Int64(Self.OUT_),
-                    grid_dim=(Self.OUT_ + 255) // 256,
-                    block_dim=256,
-                )
+                enqueue_bias_grad[DT](c, gol, gbl, B, Self.OUT_, self.gb_part)
                 # grad_w += cacheᵀ @ go: transpose x → cacheT (B1' tiled, fp32),
                 # then the two GEMMs (grad_w + grad_x), then the grad_w accumulate.
                 var xl = find.dev.value()
@@ -1160,14 +1249,7 @@ struct Linear[IN_: Int, OUT_: Int, ADT: DType = DT](Module):
             # grad_b += colsum(go): bf16 go → fp32 master grad (fp32 accumulator).
             var gol = grad_output.dev.value()
             var gbl = self.bias.grd.dev.value()
-            c.enqueue_function[_lin_gb_kernel[Self.ADT]](
-                gol,
-                gbl,
-                Int64(B),
-                Int64(Self.OUT_),
-                grid_dim=(Self.OUT_ + 255) // 256,
-                block_dim=256,
-            )
+            enqueue_bias_grad[Self.ADT](c, gol, gbl, B, Self.OUT_, self.gb_part)
             # grad_w += cacheᵀ @ go. `fin`/`go` are ALREADY bf16 (no cast).
             # Transpose the bf16 fwd-input directly → bf16 cacheT_bf, then a
             # bf16-in → FP32-out GEMM into the fp32 dW_tmp, then accumulate into

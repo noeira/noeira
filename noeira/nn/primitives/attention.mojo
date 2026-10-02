@@ -27,8 +27,10 @@ buffer per slab) instead of a single pointer-sliced scratch — no `mptr`.
 """
 
 from noeira.nn.core.mm import mm, bmm
+from noeira.nn.core.mm_tiled import bmm_tiled
 from std.math import exp, sqrt
-from max.gpu import thread_idx, block_idx, block_dim, global_idx
+from max.gpu import thread_idx, block_idx, block_dim, global_idx, WARP_SIZE
+from max.gpu.primitives import warp
 from max.gpu.host import DeviceContext
 from layout import Layout, LayoutTensor, TileTensor, row_major
 from linalg.bmm import batched_matmul
@@ -354,56 +356,122 @@ def _attn_pack_qkv_fwd_kernel[
     packed_v.ptr[unsafe_offset=pidx] = vv
 
 
-def _attn_softmax_kernel[
+def attn_warp_rows_grid(rows: Int) -> Int:
+    """Blocks of `TPB` for a one-warp-per-row kernel over `rows` rows. A whole
+    number of warps per block keeps the early return warp-uniform (a warp
+    reduction with a lane missing is undefined)."""
+    comptime assert TPB % WARP_SIZE == 0, "attention: TPB must be whole warps"
+    return (rows * WARP_SIZE + TPB - 1) // TPB
+
+
+def _attn_softmax_warp_kernel[
     BATCH: Int, N_HEADS: Int, SEQ: Int, HEAD_DIM: Int, CAUSAL: Bool,
     CACHE_SIZE: Int, SCORES: Int, BH: Int,
 ](
     scores: LayoutTensor[DT, Layout.row_major(SCORES), MutAnyOrigin],
     cache: LayoutTensor[DT, Layout.row_major(BATCH, CACHE_SIZE), MutAnyOrigin],
 ):
-    # 1 block per (b,h); threads stride over rows i. scale + stable softmax
-    # in-place on `scores`; mirror weights into cache.attn (per-sample strided).
-    var blk = Int(block_idx.x)
-    if blk >= BH:
+    """The stable softmax of the per-(b,h)-block kernel it replaced (scale, max, causal zeros,
+    weights mirrored into cache.attn) with one WARP per (b, h, i) row, lanes
+    striding the row: coalesced, and BH x SEQ warps instead of BH blocks with
+    a thread walking each row three times. The old kernel was the attention's
+    largest non-GEMM cost in LeWM training (0.15 s of a 0.91 s step, batch
+    128 on a 5090; `docs/CROSS_ATTENTION_OPTIMIZATION.md` §2.2, §4.7).
+    Launch `attn_warp_rows_grid(BH * SEQ)` blocks of `TPB`."""
+    var idx = Int(global_idx.x)
+    var row = idx // WARP_SIZE
+    var lane = idx % WARP_SIZE
+    if row >= BH * SEQ:
         return
-    var b = blk // N_HEADS
-    var h = blk % N_HEADS
-    var tid = Int(thread_idx.x)
-    var bs = Int(block_dim.x)
+    var bh = row // SEQ
+    var i = row % SEQ
+    var b = bh // N_HEADS
+    var h = bh % N_HEADS
     comptime ATTN_OFF = 3 * SEQ * (N_HEADS * HEAD_DIM)
     var scale = Scalar[DT](Float32(1.0) / sqrt(Float32(HEAD_DIM)))
-    var bh_off = blk * SEQ * SEQ
-    var cache_attn_base = b * CACHE_SIZE + ATTN_OFF + h * SEQ * SEQ
-    var i = tid
-    while i < SEQ:
-        var j_end = SEQ
-        comptime if CAUSAL:
-            j_end = i + 1
-        var row_off = bh_off + i * SEQ
-        var cache_row = cache_attn_base + i * SEQ
-        var mx = Scalar[DT](-1e30)
-        for j in range(j_end):
-            var s = rebind[Scalar[DT]](scores.ptr[unsafe_offset=row_off + j]) * scale
-            scores.ptr[unsafe_offset=row_off + j] = s
-            if s > mx:
-                mx = s
-        var se = Scalar[DT](0)
-        for j in range(j_end):
-            var e = exp(rebind[Scalar[DT]](scores.ptr[unsafe_offset=row_off + j]) - mx)
-            scores.ptr[unsafe_offset=row_off + j] = e
-            se += e
-        comptime if CAUSAL:
-            for j in range(i + 1, SEQ):
-                scores.ptr[unsafe_offset=row_off + j] = Scalar[DT](0)
-        var inv = Scalar[DT](1) / se
-        for j in range(j_end):
-            var w = rebind[Scalar[DT]](scores.ptr[unsafe_offset=row_off + j]) * inv
-            scores.ptr[unsafe_offset=row_off + j] = w
-            cache.ptr[unsafe_offset=cache_row + j] = w
-        comptime if CAUSAL:
-            for j in range(i + 1, SEQ):
-                cache.ptr[unsafe_offset=cache_row + j] = Scalar[DT](0)
-        i += bs
+    var row_off = bh * SEQ * SEQ + i * SEQ
+    var cache_row = b * CACHE_SIZE + ATTN_OFF + h * SEQ * SEQ + i * SEQ
+    var j_end = SEQ
+    comptime if CAUSAL:
+        j_end = i + 1
+    var mx = Scalar[DT](-1e30)
+    var j = lane
+    while j < j_end:
+        mx = max(mx, rebind[Scalar[DT]](scores.ptr[unsafe_offset=row_off + j]) * scale)
+        j += WARP_SIZE
+    mx = warp.max(mx)
+    var part = Scalar[DT](0)
+    j = lane
+    while j < j_end:
+        part += exp(rebind[Scalar[DT]](scores.ptr[unsafe_offset=row_off + j]) * scale - mx)
+        j += WARP_SIZE
+    var inv = Scalar[DT](1) / warp.sum(part)
+    j = lane
+    while j < SEQ:
+        var w = Scalar[DT](0)
+        if j < j_end:
+            w = exp(rebind[Scalar[DT]](scores.ptr[unsafe_offset=row_off + j]) * scale - mx) * inv
+        scores.ptr[unsafe_offset=row_off + j] = w
+        cache.ptr[unsafe_offset=cache_row + j] = w
+        j += WARP_SIZE
+
+
+def _attn_softmax_jvp_warp_kernel[
+    BATCH: Int, N_HEADS: Int, SEQ: Int, HEAD_DIM: Int,
+    CACHE_SIZE: Int, SCORES: Int, BH: Int,
+](
+    dscore: LayoutTensor[DT, Layout.row_major(SCORES), MutAnyOrigin],
+    dattn: LayoutTensor[DT, Layout.row_major(SCORES), MutAnyOrigin],
+    cache: LayoutTensor[DT, Layout.row_major(BATCH, CACHE_SIZE), MutAnyOrigin],
+):
+    """`_attn_softmax_jvp_kernel` (dscore = scale·a·(dattn − Σ a·dattn)), one
+    WARP per row; the dot is a warp reduction. Same launch as the softmax."""
+    var idx = Int(global_idx.x)
+    var row = idx // WARP_SIZE
+    var lane = idx % WARP_SIZE
+    if row >= BH * SEQ:
+        return
+    var bh = row // SEQ
+    var i = row % SEQ
+    var b = bh // N_HEADS
+    var h = bh % N_HEADS
+    comptime ATTN_OFF = 3 * SEQ * (N_HEADS * HEAD_DIM)
+    var scale = Scalar[DT](Float32(1.0) / sqrt(Float32(HEAD_DIM)))
+    var row_off = bh * SEQ * SEQ + i * SEQ
+    var cache_row = b * CACHE_SIZE + ATTN_OFF + h * SEQ * SEQ + i * SEQ
+    var part = Scalar[DT](0)
+    var j = lane
+    while j < SEQ:
+        part += rebind[Scalar[DT]](cache.ptr[unsafe_offset=cache_row + j]) * rebind[
+            Scalar[DT]
+        ](dattn.ptr[unsafe_offset=row_off + j])
+        j += WARP_SIZE
+    var s = warp.sum(part)
+    j = lane
+    while j < SEQ:
+        var a = rebind[Scalar[DT]](cache.ptr[unsafe_offset=cache_row + j])
+        var da = rebind[Scalar[DT]](dattn.ptr[unsafe_offset=row_off + j])
+        dscore.ptr[unsafe_offset=row_off + j] = scale * a * (da - s)
+        j += WARP_SIZE
+
+
+def _attn_packed_t_kernel[BH: Int, SEQ: Int, HEAD_DIM: Int, PACKED: Int](
+    dst: LayoutTensor[DT, Layout.row_major(PACKED), MutAnyOrigin],
+    src: LayoutTensor[DT, Layout.row_major(PACKED), MutAnyOrigin],
+):
+    """`dst[bh, d, t] = src[bh, t, d]`: a packed head (BH, SEQ, HEAD_DIM) to
+    the (BH, HEAD_DIM, SEQ) operand `bmm_tiled` takes for a ·ᵀ product. One
+    thread per SOURCE element: the reads coalesce, the writes stride."""
+    var idx = Int(global_idx.x)
+    if idx >= BH * SEQ * HEAD_DIM:
+        return
+    var d = idx % HEAD_DIM
+    var rem = idx // HEAD_DIM
+    var t = rem % SEQ
+    var bh = rem // SEQ
+    dst.ptr[unsafe_offset=bh * HEAD_DIM * SEQ + d * SEQ + t] = rebind[Scalar[DT]](
+        src.ptr[unsafe_offset=idx]
+    )
 
 
 def _attn_unpack_out_kernel[
@@ -626,6 +694,7 @@ struct ScaledDotProductAttention[
     var sp3: Tensor  # packed slot 3
     var ss0: Tensor  # scores slot 0
     var ss1: Tensor  # scores slot 1
+    var sp4: Tensor  # packed slot 4: Vᵀ for the backward's dout·Vᵀ
 
     def __init__(out self):
         comptime assert (
@@ -638,6 +707,7 @@ struct ScaledDotProductAttention[
         self.sp3 = Tensor()
         self.ss0 = Tensor()
         self.ss1 = Tensor()
+        self.sp4 = Tensor()
 
     @staticmethod
     def make[
@@ -664,8 +734,21 @@ struct ScaledDotProductAttention[
         self.sp3.ensure_gpu(c, PACKED)
         self.ss0.ensure_gpu(c, SCORES)
         self.ss1.ensure_gpu(c, SCORES)
+        self.sp4.ensure_gpu(c, PACKED)
 
     # ----- Forward ---------------------------------------------------------
+
+    def release_buffers(mut self):
+        """The forward cache (scores + q/k/v) and the packed-head / scores
+        scratch slots — all `ensure`d by every forward and vjp."""
+        self.cache.release()
+        self.sp0.release()
+        self.sp1.release()
+        self.sp2.release()
+        self.sp3.release()
+        self.ss0.release()
+        self.ss1.release()
+        self.sp4.release()
 
     def forward[
         target: StaticString, B: Int, o: MutOrigin, POLICY: AMPPolicy = NoAMP
@@ -767,24 +850,31 @@ struct ScaledDotProductAttention[
             grid_dim=pblocks, block_dim=TPB,
         )
 
-        # 2. scores = Q @ Kᵀ  (BH, SEQ, SEQ).
-        bmm[transpose_b=True, A0=BH, A1=Self.SEQ_LEN, A2=Self.HEAD_DIM, B0=BH, B1=Self.SEQ_LEN, B2=Self.HEAD_DIM, O0=BH, O1=Self.SEQ_LEN, O2=Self.SEQ_LEN](
-            self.ss0.dev.value(), self.sp0.dev.value(), self.sp1.dev.value(), c
+        # 2. scores = Q @ Kᵀ  (BH, SEQ, SEQ): Kᵀ materialised in sp3 (free
+        # until step 4), then the tiled product — MAX's `bmm` takes its naive
+        # kernel at HEAD_DIM 64 (no multistage GEMM below k = 128).
+        comptime pt_k = _attn_packed_t_kernel[BH, Self.SEQ_LEN, Self.HEAD_DIM, PACKED]
+        c.enqueue_function[pt_k](
+            self.sp3.lt["gpu", lay_p](), self.sp1.lt["gpu", lay_p](),
+            grid_dim=pblocks, block_dim=TPB,
+        )
+        bmm_tiled[BH=BH, M=Self.SEQ_LEN, N=Self.SEQ_LEN, K=Self.HEAD_DIM](
+            self.ss0.dev.value(), self.sp0.dev.value(), self.sp3.dev.value(), c
         )
 
         # 3. scale + stable softmax in-place; mirror into cache.attn.
-        comptime sm_k = _attn_softmax_kernel[
+        comptime sm_k = _attn_softmax_warp_kernel[
             B, Self.N_HEADS, Self.SEQ_LEN, Self.HEAD_DIM, Self.CAUSAL,
             Self.CACHE_SIZE, SCORES, BH,
         ]
         c.enqueue_function[sm_k](
             self.ss0.lt["gpu", lay_s](),
             self.cache.lt["gpu", lay_c](),
-            grid_dim=BH, block_dim=TPB,
+            grid_dim=attn_warp_rows_grid(BH * Self.SEQ_LEN), block_dim=TPB,
         )
 
         # 4. packed_out = attn @ V.
-        bmm[A0=BH, A1=Self.SEQ_LEN, A2=Self.SEQ_LEN, B0=BH, B1=Self.SEQ_LEN, B2=Self.HEAD_DIM, O0=BH, O1=Self.SEQ_LEN, O2=Self.HEAD_DIM](
+        bmm_tiled[BH=BH, M=Self.SEQ_LEN, N=Self.HEAD_DIM, K=Self.SEQ_LEN](
             self.sp3.dev.value(), self.ss0.dev.value(), self.sp2.dev.value(), c
         )
 
@@ -1055,20 +1145,25 @@ struct ScaledDotProductAttention[
             grid_dim=pblocks, block_dim=TPB,
         )
 
-        # 2. dattn(ss0) = dout @ Vᵀ.
-        bmm[transpose_b=True, A0=BH, A1=SL, A2=HD, B0=BH, B1=SL, B2=HD, O0=BH, O1=SL, O2=SL](
-            self.ss0.dev.value(), self.sp0.dev.value(), self.sp3.dev.value(), c
+        # 2. dattn(ss0) = dout @ Vᵀ: Vᵀ(sp4), then the tiled product.
+        comptime pt_k = _attn_packed_t_kernel[BH, SL, HD, PACKED]
+        c.enqueue_function[pt_k](
+            self.sp4.lt["gpu", lay_p](), self.sp3.lt["gpu", lay_p](),
+            grid_dim=pblocks, block_dim=TPB,
+        )
+        bmm_tiled[BH=BH, M=SL, N=SL, K=HD](
+            self.ss0.dev.value(), self.sp0.dev.value(), self.sp4.dev.value(), c
         )
 
         # 3. softmax jvp → dscore(ss1)  (reads dattn(ss0)).
-        comptime jvp_k = _attn_softmax_jvp_kernel[
+        comptime jvp_k = _attn_softmax_jvp_warp_kernel[
             B, Self.N_HEADS, SL, HD, Self.CACHE_SIZE, SCORES, BH,
         ]
         c.enqueue_function[jvp_k](
             self.ss1.lt["gpu", lay_s](),
             self.ss0.lt["gpu", lay_s](),
             self.cache.lt["gpu", lay_c](),
-            grid_dim=BH, block_dim=TPB,
+            grid_dim=attn_warp_rows_grid(BH * SL), block_dim=TPB,
         )
 
         # 4. attn_T(ss0) = transpose(cache.attn)  (ss0 free — dattn consumed).
@@ -1082,7 +1177,7 @@ struct ScaledDotProductAttention[
         )
 
         # 5. dV(sp3) = attn_T(ss0) @ dout(sp0)  (sp3 free — pv last read step 2).
-        bmm[A0=BH, A1=SL, A2=SL, B0=BH, B1=SL, B2=HD, O0=BH, O1=SL, O2=HD](
+        bmm_tiled[BH=BH, M=SL, N=HD, K=SL](
             self.sp3.dev.value(), self.ss0.dev.value(), self.sp0.dev.value(), c
         )
 
@@ -1095,12 +1190,12 @@ struct ScaledDotProductAttention[
         )
 
         # 7. dK(sp0) = dscore_T(ss0) @ Q(sp1)  (sp0 free — pdout last read s5).
-        bmm[A0=BH, A1=SL, A2=SL, B0=BH, B1=SL, B2=HD, O0=BH, O1=SL, O2=HD](
+        bmm_tiled[BH=BH, M=SL, N=HD, K=SL](
             self.sp0.dev.value(), self.ss0.dev.value(), self.sp1.dev.value(), c
         )
 
         # 8. dQ(sp1) = dscore(ss1) @ K(sp2)  (sp1 free — pq last read step 7).
-        bmm[A0=BH, A1=SL, A2=SL, B0=BH, B1=SL, B2=HD, O0=BH, O1=SL, O2=HD](
+        bmm_tiled[BH=BH, M=SL, N=HD, K=SL](
             self.sp1.dev.value(), self.ss1.dev.value(), self.sp2.dev.value(), c
         )
 
