@@ -68,6 +68,11 @@ tests/io/test_parquet.mojo
 tests/io/test_parquet_write.mojo
 # The bilinear resize vs Pillow, byte for byte.
 tests/io/test_image_resize.mojo
+# The NumPy `.npy` reader (the AMASS dump's only format) and step 1 of the
+# AMASS import, against fixtures written here. The refusals are the point:
+# `fortran_order: True` and a big-endian `descr` are both READABLE as C-order
+# little-endian, and both read as garbage of the right shape.
+tests/data/test_amass.mojo
 # The LeRobot v3 import vs tools/act/lerobot_v3_to_store.py, on a synthetic
 # dataset built to break the bookkeeping the unit gates cannot see.
 tests/data/test_lerobot_import.mojo

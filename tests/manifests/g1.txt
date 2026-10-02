@@ -70,3 +70,22 @@ tests/robots/test_g1_spec.mojo
 # close and both look like a broken microphone. Plus the deadlines, pinned to
 # the measured latencies they were derived from.
 tests/robots/test_g1_voice_loop.mojo
+
+# AMASS step 1 — the `[N, 36]` layout of the retargeted dump. Steps 2-5 are
+# `convert_frames`, held by the oracle gate above; step 1 is new and every
+# way it can be wrong is SILENT (XYZW read as WXYZ is a valid rotation, a
+# dropped `+0.793` is a plausible crouch, a shifted DoF slice is a pose).
+# Self-contained: writes its own .npy fixtures, no network.
+tests/data/test_amass.mojo
+# The same convention through MuJoCo on real clips, with the three plausible
+# misreadings as the CONTROL (they land 0.79 / 0.56 / 0.25 m away, against a
+# 5e-5 m band). Needs two artefacts built first:
+#   pixi run python tools/g1/amass_reference_frames.py --out /tmp/amass_ref \
+#     --clips "$C/A1 - Stand_poses_120_jpos.npy" \
+#             "$C/A10 - lie to crouch_poses_120_jpos.npy" \
+#             "$C/A11 - crawl forward_poses_120_jpos.npy" \
+#             "$C/A12 - crawl backwards_poses_120_jpos.npy"
+#   pixi run mojo run -I . examples/g1/amass_import.mojo --subset ACCAD \
+#     --max-clips 4 --full --keep-source --out /tmp/amass_gate.h5
+# with $C the Hub cache dir of g1/ACCAD/Female1General_c3d.
+tests/data/test_amass_vs_mujoco.mojo /tmp/amass_gate.h5 /tmp/amass_ref

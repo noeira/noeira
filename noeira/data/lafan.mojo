@@ -11,7 +11,9 @@ path is kept as the ORACLE, the way `tools/act/lerobot_v3_to_store.py` is
 for the LeRobot importer.
 
 THE PIPELINE, per clip (float32 throughout, as the reference; the ops are
-written in the reference's order so float32 rounding lands the same way):
+written in the reference's order so float32 rounding lands the same way).
+Step 1 is LAFAN-specific and lives in `convert_clip`; steps 2–5 are
+`convert_frames`, which `data/amass.mojo` calls with its own step 1:
 
   1. frames at the clip's own fps (30): root quaternion from the root
      axis-angle by `axis_angle_to_quaternion` (pytorch3d's, wxyz; the small-
@@ -468,26 +470,72 @@ def _q4(xs: List[Float32], base: Int) -> Array[Float32, 4]:
 
 
 def convert_clip(clip: LafanClip, mut env: UnitreeG1[DType.float64], motion_id: Int) raises -> LafanRows:
-    """Steps 1–5 of the module docstring for one clip."""
-    var n = clip.n
-    var fps = clip.fps
-    var dt32 = Float32(1.0 / Float64(fps))
-    comptime NB = LAFAN_N_BODIES
+    """Steps 1–5 of the module docstring for one clip.
 
-    # ── 1 + 2: frames -> world poses of the 31 bodies (xyzw, re-signed) ──
-    var fpos = List[Float32](length=n * NB * 3, fill=Float32(0))
-    var frot = List[Float32](length=n * NB * 4, fill=Float32(0))
+    Step 1 — the pickle's `(root_trans_offset, pose_aa)` to a root pose and
+    29 joint angles — is the ONLY part of the pipeline that knows LAFAN's
+    format; it is done here and steps 2–5 are `convert_frames`, which
+    `data/amass.mojo` reuses. The arithmetic is unchanged and in the same
+    order, so `tests/robots/test_lafan_import_vs_oracle.mojo` still holds
+    the whole path against the reference dump.
+    """
+    var n = clip.n
+    var root_pos = List[Float32](length=n * 3, fill=Float32(0))
+    var root_quat = List[Float32](length=n * 4, fill=Float32(0))
     var fdof = List[Float32](length=n * G1_N_DOF, fill=Float32(0))
-    var qp = List[Float64](length=LAFAN_NQ, fill=0.0)
-    var qv = List[Float64](length=LAFAN_NV, fill=0.0)
     for f in range(n):
         var rq = aa_to_quat_wxyz(clip.pose_aa[f * 90 + 0], clip.pose_aa[f * 90 + 1], clip.pose_aa[f * 90 + 2])
+        for k in range(4):
+            root_quat[f * 4 + k] = rq[k]
         for j in range(G1_N_DOF):
             var b = f * 90 + (1 + j) * 3
             fdof[f * G1_N_DOF + j] = clip.pose_aa[b] + clip.pose_aa[b + 1] + clip.pose_aa[b + 2]
-        qp[0] = Float64(clip.root_trans[f * 3 + 0])
-        qp[1] = Float64(clip.root_trans[f * 3 + 1])
-        qp[2] = Float64(clip.root_trans[f * 3 + 2])
+        for c in range(3):
+            root_pos[f * 3 + c] = clip.root_trans[f * 3 + c]
+    _ = motion_id
+    return convert_frames(clip.fps, n, root_pos, root_quat, fdof, env)
+
+
+def convert_frames(
+    fps: Int,
+    n: Int,
+    root_pos: List[Float32],
+    root_quat: List[Float32],
+    fdof: List[Float32],
+    mut env: UnitreeG1[DType.float64],
+) raises -> LafanRows:
+    """Steps 2–5 for `n` frames at `fps`, whatever produced them.
+
+    `root_pos` is `n × 3`, `root_quat` is `n × 4` WXYZ and `fdof` is
+    `n × 29`, all float32 — the form both LAFAN (from `pose_aa`) and the
+    retargeted AMASS dump (stored that way) reduce to.
+
+    ⚠ `root_quat` IS THE QUATERNION THE ROOT'S ROTATION MATRIX IS BUILT
+    FROM, unnormalised. The engine renormalises a free joint's quaternion in
+    float64; the reference does not, and the one ulp between them moves the
+    slerp's midpoint branch on 18 rows of LAFAN clip 0 (measured). So the
+    root body takes this quaternion and every other body takes the engine's.
+    """
+    var dt32 = Float32(1.0 / Float64(fps))
+    comptime NB = LAFAN_N_BODIES
+    if n < 3:
+        raise Error(
+            "lafan: a clip of " + String(n) + " frames cannot be converted —"
+            " the reference's joint-velocity tail reads index n − 3"
+        )
+
+    # ── 2: frames -> world poses of the 31 bodies (xyzw, re-signed) ──────
+    var fpos = List[Float32](length=n * NB * 3, fill=Float32(0))
+    var frot = List[Float32](length=n * NB * 4, fill=Float32(0))
+    var qp = List[Float64](length=LAFAN_NQ, fill=0.0)
+    var qv = List[Float64](length=LAFAN_NV, fill=0.0)
+    for f in range(n):
+        var rq = Array[Float32, 4](fill=Float32(0))
+        for k in range(4):
+            rq[k] = root_quat[f * 4 + k]
+        qp[0] = Float64(root_pos[f * 3 + 0])
+        qp[1] = Float64(root_pos[f * 3 + 1])
+        qp[2] = Float64(root_pos[f * 3 + 2])
         qp[3] = Float64(rq[0])
         qp[4] = Float64(rq[1])
         qp[5] = Float64(rq[2])
@@ -500,11 +548,9 @@ def convert_clip(clip: LafanClip, mut env: UnitreeG1[DType.float64], motion_id: 
             for c in range(3):
                 fpos[(f * NB + s) * 3 + c] = Float32(env.d.xpos.data[b * 3 + c])
             # our xquat is (x, y, z, w); re-sign through the reference's matrix rule.
-            # ⚠ THE ROOT TAKES THE AXIS-ANGLE QUATERNION ITSELF, not the engine's:
-            # the reference's root matrix is `quaternion_to_matrix` of that float32
-            # quaternion unnormalised, and the engine normalises the free joint's
-            # quaternion in float64 — one ulp apart, which is enough to move the
-            # slerp's branch on 18 rows of clip 0 (measured). Bit-exact with it.
+            # ⚠ THE ROOT TAKES THE CALLER'S QUATERNION, not the engine's — see
+            # this function's docstring: one ulp of renormalisation moves the
+            # slerp's branch on 18 rows of LAFAN clip 0 (measured).
             var m: Array[Float32, 9]
             if s == 0:
                 m = quat_to_matrix_wxyz(rq[0], rq[1], rq[2], rq[3])
@@ -670,7 +716,6 @@ def convert_clip(clip: LafanClip, mut env: UnitreeG1[DType.float64], motion_id: 
             for c in range(3):
                 rows.privileged[pb + 277 + b * 3 + c] = lv[c]
                 rows.privileged[pb + 370 + b * 3 + c] = lw[c]
-    _ = motion_id
     return rows^
 
 

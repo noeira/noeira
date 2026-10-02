@@ -387,3 +387,39 @@ struct WritePipe(Movable):
                 "proc: child exited " + String(code) + ": " + self.command
             )
         return code
+
+
+def disk_free_bytes(path: String) raises -> Int:
+    """Bytes available to this user on the filesystem holding `path`, or −1.
+
+    `df -P -k` — POSIX output, 512-byte-block-free `df` variants excluded by
+    `-k`, one header line then one row whose fourth field is "Available".
+    ⚠ A DEVICE NAME WITH A SPACE WRAPS THE ROW, which is why the fields are
+    counted from the END of the last line rather than from its start: the
+    last three are available / capacity / mount on every `df -P` we have.
+    Returns −1 rather than raising — a planner that cannot read the disk
+    should say so, not refuse to run.
+    """
+    try:
+        var out = run_capture("df -P -k " + quote_arg(path) + " 2>/dev/null")
+        var lines = out.split("\n")
+        for li in range(len(lines) - 1, -1, -1):
+            var line = String(lines[li]).strip()
+            if line == "" or line.startswith("Filesystem"):
+                continue
+            var f = List[String]()
+            for t in line.split(" "):
+                if String(t) != "":
+                    f.append(String(t))
+            # Filesystem 1024-blocks Used Available Capacity Mounted-on
+            if len(f) < 5:
+                return -1
+            var avail = f[len(f) - 3]
+            for i in range(avail.byte_length()):
+                var c = avail.as_bytes()[i]
+                if c < 48 or c > 57:
+                    return -1
+            return Int(avail) * 1024
+        return -1
+    except:
+        return -1
