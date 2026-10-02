@@ -3,8 +3,11 @@
 #
 #   bash tools/lewm/box_session_a.sh            # from the noeira repo root
 #
-# 1. a throwaway Python 3.10 venv with stable-worldmodel 0.1.1 (PINNED: its
-#    `rollout` is le-wm-main's; GitHub main has since changed it);
+# 1. a throwaway Python 3.10 venv with stable-worldmodel 0.0.6 (PINNED: the
+#    release contemporary with the paper, 2026-03-16. le-wm-main's eval.py
+#    passes `history_size` / `frame_skip` to `swm.World`, which 0.1.x no longer
+#    takes — it forwards them to the env and PushT rejects them. CEM and the
+#    policy's receding horizon are identical in 0.0.6 and 0.1.1);
 # 2. the HF weights converted to the `_object.ckpt` eval.py loads (README),
 #    and an `import eval` smoke — a version mismatch fails BEFORE step 3;
 # 3. the dataset, streamed through zstd (~13 GB in, 47 GB on disk);
@@ -24,12 +27,24 @@ mkdir -p "$WORK" "$STABLEWM_HOME" "$OUT"
 log() { echo "[session-a $(date +%H:%M:%S)] $*" | tee -a "$OUT/session.log"; }
 
 # ---- 1. the reference environment ----------------------------------------
-if [[ ! -x "$WORK/venv/bin/python" ]]; then
-    log "venv: python 3.10 + stable-worldmodel[train,env]==0.1.1"
+# Installed = it IMPORTS, not "the venv directory exists": a failed install
+# leaves a venv behind, and the old check then skipped the install for good.
+SWM_VERSION=0.0.6
+if ! "$WORK/venv/bin/python" -c "import importlib.metadata as m, stable_pretraining, transformers; assert m.version('stable-worldmodel') == '$SWM_VERSION' and transformers.__version__ < '5'" 2>/dev/null; then
+    log "venv: python 3.10 + stable-worldmodel[train,env]==$SWM_VERSION"
     command -v uv >/dev/null || curl -LsSf https://astral.sh/uv/install.sh | sh
     export PATH="$HOME/.local/bin:$PATH"
-    uv venv --python=3.10 "$WORK/venv"
-    VIRTUAL_ENV="$WORK/venv" uv pip install "stable-worldmodel[train,env]==0.1.1" h5py
+    # [env] -> gymnasium[all] -> box2d-py, which builds from source with swig
+    command -v swig >/dev/null || { apt-get update -qq && apt-get install -y -qq swig; } \
+        || { uv pip install --system swig || pip install swig; }
+    [[ -x "$WORK/venv/bin/python" ]] || uv venv --python=3.10 "$WORK/venv"
+    # datasets>=3: left alone, uv resolves datasets 1.1.1 (2020), which
+    # subclasses pyarrow.PyExtensionType — gone from the pyarrow it pairs it with.
+    # transformers<5: the checkpoint was saved with 4.x ViT parameter names;
+    # 5.x renamed them (encoder.layers.N.attention.q_proj ...), so the README's
+    # strict load_state_dict fails. Column R runs THEIR stack: keep 4.x.
+    VIRTUAL_ENV="$WORK/venv" uv pip install "stable-worldmodel[train,env]==$SWM_VERSION" \
+        "datasets>=3" "transformers<5" h5py
 fi
 PY="$WORK/venv/bin/python"
 "$PY" - <<'PY' | tee -a "$OUT/session.log"
@@ -83,8 +98,8 @@ PY
     ) | tee -a "$OUT/session.log"
 fi
 
-# fail BEFORE the 13 GB download if eval.py does not import against 0.1.1
-log "smoke: import le-wm-main eval.py under stable-worldmodel 0.1.1"
+# fail BEFORE the 13 GB download if eval.py does not import against $SWM_VERSION
+log "smoke: import le-wm-main eval.py under stable-worldmodel $SWM_VERSION"
 (cd "$LEWM_REF" && "$PY" -c "import eval; import stable_worldmodel as swm; print('  eval.py imports; swm', swm.__file__)") \
     2>&1 | tee -a "$OUT/session.log"
 

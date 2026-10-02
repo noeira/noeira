@@ -42,6 +42,15 @@ from pathlib import Path
 import h5py
 import numpy as np
 
+try:
+    # The real dataset's `pixels` are Blosc-compressed (HDF5 filter 32001):
+    # h5py reads them only once hdf5plugin has registered the filter (swm's
+    # own dataset module imports it too). The fixture this writes is
+    # uncompressed, so the laptop needs no plugin.
+    import hdf5plugin  # noqa: F401
+except ImportError:
+    pass
+
 REPO = Path(__file__).resolve().parents[2]
 sys.path.insert(0, str(REPO))
 from tools.act.dump_act_reference import Dump  # noqa: E402
