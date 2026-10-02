@@ -313,6 +313,18 @@ struct G1VoiceLoop(Movable):
         if self.cfg.vocab != "" and self.stt.kind != STT_RAW:
             self.stt.prompt = self.cfg.vocab
         self.llm = ChatClient.from_spec(self.cfg.llm_spec)
+        # ⚠ BOTH OF THESE ARE MEASURED AND BELONG WITH THE CLIENT. A reply is
+        # one short sentence, so 120 tokens is generous — and Qwen THINKS
+        # before answering unless told not to, which took a reply from
+        # **10.8 s to 1.4 s** in the AI package's own tests. A robot that
+        # pauses eleven seconds before saying hello is not having a
+        # conversation, and a caller that had to remember these would
+        # eventually not.
+        self.llm.max_tokens = 120
+        self.llm.extra(
+            String("chat_template_kwargs"),
+            String('{"enable_thinking": false}'),
+        )
         self.voice = LocalVoice()
         # ⚠ `MicCapture.start` IS THE CONSTRUCTOR — it opens the device, so
         # there is no separate `start()` for it and the field cannot be a
@@ -399,6 +411,9 @@ struct G1VoiceLoop(Movable):
         in the middle of an utterance."""
         self.jev.warm_up()
         self.stt.warm_up()
+        # ⚠ `talk` needs its client warmed BEFORE the loop like the others, or
+        # its first reply pays 19.5 ms inside one frame.
+        self.llm.warm_up()
 
     def stop(mut self):
         try:
@@ -434,8 +449,42 @@ struct G1VoiceLoop(Movable):
         elif self.state == VL_ST_REC:
             self.forced = True
 
-    def toggle_mic(mut self):
-        self.mic_on = not self.mic_on
+    def toggle_mic(mut self) -> String:
+        """Close or reopen the microphone. Returns a line for the log.
+
+        ⚠ IT ACTUALLY KILLS THE CAPTURE, and that is a privacy property rather
+        than a convenience. An always-open mic in a room of people is a privacy
+        problem before it is a false-trigger problem: everything said near the
+        machine would otherwise be posted to a transcription service. `stop()`
+        kills ffmpeg, so the OS recording indicator GOES OUT and nothing is
+        captured at all — not captured-and-ignored. A version of this that
+        only flipped a flag would look identical from the code and be a
+        different promise to the room.
+        """
+        if self.mic_on:
+            try:
+                self.mic.stop()
+            except:
+                pass
+            self.mic_on = False
+            self.ring = List[Int16]()
+            self.level = 0.0
+            self.state = VL_ST_IDLE
+            return String("[mic] closed")
+        try:
+            self.mic = MicCapture.start(16000, self.cfg.mic_dev)
+            self.mic_on = True
+            self.mic_dead = String("")
+            # ⚠ and the detector starts over: a floor learned before the gap
+            # describes a room that may have changed, and `checked_silence`
+            # must re-run or a newly-muted device would never be reported.
+            self.checked_silence = False
+            self.peak = 0.0
+            self.floor = 0.0010
+            return String("[mic] reopened")
+        except e:
+            self.mic_dead = String(e)
+            return String("[mic] ") + self.mic_dead
 
     def take_note(mut self) -> String:
         """The last log line, consumed. Empty when there is nothing new."""
@@ -932,6 +981,36 @@ struct G1VoiceLoop(Movable):
 
     def meter(self) -> Float64:
         return self.level
+
+    def mic_checked(self) -> Bool:
+        """True once the first second of audio has been inspected for digital
+        silence. ⚠ Until then "live" is not yet a claim this object can make,
+        and a HUD that said so anyway would be asserting something it has not
+        measured."""
+        return self.checked_silence
+
+    def mic_open(self) -> Bool:
+        """False when M has CLOSED the device — not muted-in-software. The
+        OS recording indicator is out and nothing is captured."""
+        return self.mic_on
+
+    def mic_error(self) -> String:
+        """Why the microphone is unusable, in ffmpeg's own words, or "".
+        ⚠ Carrying the REASON is the point: "grant Terminal microphone
+        access" and "the device went away" are different problems, and a demo
+        that printed neither cost a day (§12.55)."""
+        return self.mic_dead
+
+    def peak_level(self) -> Float64:
+        """The loudest moment of the current segment, so a spike that came and
+        went is still visible a frame later."""
+        return self.peak
+
+    def open_threshold(self) -> Float64:
+        """What the level must exceed to start a segment. ⚠ A HUD that shows
+        the level without this cannot answer "how far is my voice from
+        starting a recording", which is the question a silent demo raises."""
+        return g1_vad_open_at(self.floor)
 
     def noise_floor(self) -> Float64:
         """⚠ THE FLOOR, NOT THE PEAK. The first version of this printed the

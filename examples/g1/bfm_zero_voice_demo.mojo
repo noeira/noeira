@@ -91,7 +91,11 @@ from noeira.render.sdl.sdl_keyboard import get_keyboard_state
 # it is now one method call on `LocalVoice`.
 from noeira.io.fileio import read_file_bytes
 from noeira.core.bytes import string_from_bytes
-from noeira.ai.audio_io import MicCapture, rms, LocalVoice
+from noeira.envs.robots.g1_voice_loop import (
+    G1VoiceLoop, G1VoiceConfig, G1VoiceEvent,
+    VL_COMMAND, VL_SPEC, VL_WORLD, VL_TALK, VL_REFUSED,
+    VL_STT_DEADLINE_S, VL_JEV_DEADLINE_S, VL_CHAT_DEADLINE_S,
+)
 from noeira.io.wav import WavAudio
 from noeira.ai.jev import JevClient
 from noeira.ai.speech import SpeechToText, STT_RAW
@@ -284,27 +288,6 @@ def _ns(seconds: Float64) -> Int:
 # now inside `LocalVoice`, and the two /tmp paths it needed are gone.
 
 
-def _say(mut v: LocalVoice, text: String):
-    """Speak, and never raise.
-
-    ⚠ A CONFIRMATION IS COSMETIC; THE ROBOT, THE PHYSICS AND THE MICROPHONE
-    ARE NOT. Anything that goes wrong in here is swallowed, because the
-    alternative is a render loop that stops because the OS voice was busy.
-    """
-    try:
-        v.say(text)
-    except:
-        pass
-
-
-def _is_speaking(mut v: LocalVoice) -> Bool:
-    """`speaking()` raises; a gate that raises would take the loop down, and
-    the safe default is to assume we ARE talking rather than open the
-    microphone onto our own voice."""
-    try:
-        return v.speaking()
-    except:
-        return True
 comptime FNet = BFMFTower[OBS, ACT, D, G1_H, G1_L, D]
 comptime BNet = BFMBNetFiltered[OBS, SP, D, G1_HB]
 comptime ANet = BFMActorTowerFiltered[
@@ -447,70 +430,82 @@ def main() raises:
     var blend_len = 0
 
     # ⚠ WARM BOTH CONNECTIONS BEFORE THE LOOP. The first poll on a cold TLS
-    # connection costs 19.5 ms — a dropped frame — against 0.16 ms warmed.
-    var jev = JevClient.from_env()
-    # `--stt groq` is the escape hatch: Groq's Whisper takes a TEXT prompt,
-    # which the HF endpoint cannot (see `--vocab` below).
-    var stt_spec = _flag(String("--stt"), String("hf"))
-    var stt = SpeechToText.groq() if stt_spec == "groq" else SpeechToText.huggingface()
-    if lang != "":
-        stt.language = lang
-        print("  whisper language pinned to", lang, "(" + stt_spec + ")")
-    # ⚠ BIAS THE DECODER TOWARD THE WORDS THIS ROBOT ANSWERS TO. "cours" came
-    # back as "cool" twice in a row. The first suspect was the homophone; the
-    # real one was that `language` was NEVER REACHING WHISPER on this backend
-    # — the HF path posted the raw WAV and dropped both hints — so it was
-    # auto-detecting from a one-word French utterance. That is fixed in the
-    # client; pinning the language may be the whole fix, and the vocabulary
-    # below only matters if it is not.
+    # ⚠ THE DEADLINES ARE FLAGS SO THE GIVE-UP PATH CAN BE EXERCISED. It
+    # fires only when a call hangs, which is exactly the condition that cannot
+    # be summoned on demand — so set a tiny one and any NORMAL call blows it,
+    # which tests the RECOVERY rather than the hang:
     #
-    # ⚠ HF CANNOT TAKE A TEXT PROMPT — its Whisper pipeline accepts one only
-    # as token ids, and the client RAISES rather than dropping it silently.
-    # So the vocabulary is sent only on a backend that takes it, and the HUD
-    # says which, instead of a hint that quietly does nothing.
-    var vocab = _flag(String("--vocab"), String(
+    #     --stt-deadline 0.5     # speak; it must give up and keep running
+    #
+    # The user ran exactly that: 0.5 was too harsh, every call gave up, the
+    # demo kept running, and the path is therefore verified. ⚠ 2 s is below
+    # the observed 5.4 s Whisper tail, so it clips slow calls; the default is
+    # for use rather than for testing.
+    var stt_dl = Float64(String(_flag(String("--stt-deadline"),
+                                      String(VL_STT_DEADLINE_S))))
+    var jev_dl = Float64(String(_flag(String("--jev-deadline"),
+                                      String(VL_JEV_DEADLINE_S))))
+    var chat_dl = Float64(String(_flag(String("--chat-deadline"),
+                                       String(VL_CHAT_DEADLINE_S))))
+    # ⚠ THE POOL IS OPT-IN AND LOADED BY THE LOOP, at construction rather than
+    # on the first miss: the sidecar is 70 MB and `G1Pool.__init__` sorts 14
+    # columns of 65 536, which mid-frame would freeze the render loop — and
+    # with it the physics step — for about a second (§12.60).
+    # ⚠ `--stt groq` IS THE ESCAPE HATCH for the vocabulary hint: only a
+    # multipart backend takes a TEXT prompt, and the HF endpoint RAISES on one
+    # (§12.56). The loop decides which to send it to.
+    var stt_spec = _flag(String("--stt"), String("hf"))
+    var spec_pool_path = _flag(String("--pool"), String(""))
+    var cand_path = _flag(String("--candidates"),
+                          String("g1_spec_candidates.txt"))
+
+    # ⚠ THE WHOLE VOICE PATH IS ONE OBJECT NOW — `G1VoiceLoop`. It owns the
+    # microphone, the detector, the recogniser, the decision, the reward-spec
+    # route and the text-to-speech, because that set is where every bug of
+    # §12.55 to §12.63 lived and a second copy of it would diverge. The room
+    # session's binary owns one of these too, so the next detector fix is made
+    # once (§12.64).
+    #
+    # This file keeps what only it knows: the latent, the blend, the bank
+    # index, the chain's distance and clock, the locomotion timeout and the
+    # HUD. `poll` returns a decision; scheduling it is the robot's business.
+    var vcfg = G1VoiceConfig()
+    vcfg.lang = lang
+    vcfg.stt_spec = stt_spec
+    vcfg.vad = vad
+    vcfg.mute = mute
+    vcfg.hang_s = hang_s
+    vcfg.min_seg = min_seg
+    vcfg.max_seg = max_seg
+    vcfg.max_none = max_none
+    vcfg.min_top = min_top
+    vcfg.stt_dl = stt_dl
+    vcfg.jev_dl = jev_dl
+    vcfg.chat_dl = chat_dl
+    vcfg.pool_path = spec_pool_path
+    vcfg.cand_path = cand_path
+    vcfg.mic_dev = mic_dev
+    vcfg.llm_spec = llm_spec
+    # ⚠ THE VOCABULARY IS SENT ONLY TO A BACKEND THAT TAKES ONE, and the loop
+    # decides — HF's Whisper accepts a prompt as token ids, never text, and
+    # the client RAISES on one. Passing it unconditionally is what made this
+    # demo armed to crash at the first transcription (§12.56).
+    vcfg.vocab = _flag(String("--vocab"), String(
         "marche, cours, recule, tourne à gauche, tourne à droite,"
         " accroupis-toi, lève le bras droit, lève le bras gauche,"
         " lève les deux bras, écarte les bras, regarde à gauche,"
         " regarde à droite, arrête-toi, baisse les bras"
     ))
-    if vocab != "":
-        if stt.kind == STT_RAW:
-            print("  vocabulary hint NOT sent —", stt_spec,
-                  "takes no text prompt; pass --stt groq to use it")
-        else:
-            stt.prompt = vocab
-            print("  vocabulary hint sent to the decoder")
-    jev.warm_up()
-    stt.warm_up()
-    # ⚠ `talk` needs a client warmed BEFORE the loop like the others, or its
-    # first reply pays 19.5 ms inside one frame.
-    var llm = ChatClient.from_spec(llm_spec)
-    llm.max_tokens = 120
-    # ⚠ Qwen thinks before answering unless told not to, which took a reply
-    # from 10.8 s to 1.4 s in the AI package's own tests. A robot that pauses
-    # eleven seconds before saying hello is not having a conversation.
-    llm.extra(String("chat_template_kwargs"), String('{"enable_thinking": false}'))
-    llm.warm_up()
-    var chat_sys = String(
+    vcfg.chat_sys = String(
         "You are a small humanoid robot in a simulator. Reply in ONE short"
         " sentence, in the language you were addressed in. You can walk,"
         " turn, squat and raise your arms, but you cannot pick things up or"
         " go anywhere in particular. Be warm and brief."
     )
-    var quest = g1_command_questions(bank, True)
-    print("  jev + whisper warmed")
-
-    # ⚠ ONE capture for the whole session, not one per utterance. It is what
-    # makes a live level meter possible, it is the foundation VAD needs, and
-    # it removes a process spawn from the moment you press a key.
-    var mic = MicCapture.start(16000, mic_dev)
-    print("  mic open:", "default" if mic_dev == "" else mic_dev)
-    var level = 0.0
-    var peak = 0.0
-    var seg = List[Int16]()
-    var ring = List[Int16]()
-    var ring_max = Int(PREROLL_S * 16000.0)
+    var vl = G1VoiceLoop(vcfg^, bank)
+    vl.start()
+    print("  voice loop ready — mic", "default" if mic_dev == "" else mic_dev,
+          "| spec path", "ON" if spec_pool_path != "" else "off")
     # ⚠ `--phrases FILE` overrides the spoken phrases with `name=phrase`
     # lines. The built-in table is English because the tree is English; a
     # French session wants a French file, and that is data, not source.
@@ -530,18 +525,10 @@ def main() raises:
             ph_text.append(String(pl[byte=eq + 1:pl.byte_length()]))
         print("  phrases:", len(ph_name), "from", phrase_file)
 
-    # one voice for the whole session: `say` cuts off its own predecessor,
-    # so there is no second instance to race with.
-    var voice = LocalVoice()
-
-    var mic_dead = String("")
-    var checked_silence = False
-    var mic_on = True
-    var floor = 0.0010
-    var quiet_since = perf_counter_ns()
+    # ⚠ the microphone, the voice, the detector's state and the floor are all
+    # inside `vl` now. What is left here is the KEY EDGE state, because the
+    # keyboard belongs to the renderer and not to the voice path.
     var prev_m = False
-    var forced = False
-    var above = 0
     # ── the queue ─────────────────────────────────────────────────────
     # ⚠ ONE STEP IS ACTIVE AT A TIME and the rest wait. A chain is not
     # played by scheduling three commands at fixed offsets: a locomotion
@@ -564,51 +551,6 @@ def main() raises:
     var t_wait = perf_counter_ns()
     var t_cmd = perf_counter_ns()
     var prev_key = False
-
-    # ── the cache-miss path, loaded up front ──────────────────────────
-    # ⚠ AT STARTUP, NOT LAZILY. The sidecar is 70 MB and `G1Pool.__init__`
-    # sorts 14 columns of 65 536; doing that on the first miss would freeze
-    # the render loop — and with it the physics step — for about a second,
-    # mid-demo. The demo already opens a 640 MB checkpoint, so one more read
-    # here is invisible where a hitch would not be.
-    #
-    # ⚠ AND THE BANK BASELINES ARE PRECOMPUTED. They never change, and
-    # recomputing all 20 per miss would cost 20 passes over the pool — about
-    # a second. Precomputed, a miss costs ONE pass (~30 ms, one dropped
-    # frame) plus 20 dot products.
-    # ⚠ THE DEADLINES ARE FLAGS SO THE GIVE-UP PATH CAN BE EXERCISED. It
-    # fires only when a call hangs, which is exactly the condition that
-    # cannot be summoned on demand — so set a tiny one and any NORMAL call
-    # blows it, which tests the recovery rather than the hang:
-    #
-    #     --stt-deadline 0.5     # speak; it must give up and keep running
-    #
-    # A recovery path that has never run is a guess, and this file has paid
-    # for guesses four times over (§12.55's echo estimate, §12.56's dropped
-    # language hint, §12.60's two duplicate criteria).
-    var stt_dl = Float64(String(_flag(String("--stt-deadline"),
-                                      String(STT_DEADLINE_S))))
-    var jev_dl = Float64(String(_flag(String("--jev-deadline"),
-                                      String(JEV_DEADLINE_S))))
-    var chat_dl = Float64(String(_flag(String("--chat-deadline"),
-                                       String(CHAT_DEADLINE_S))))
-    var spec_pool_path = _flag(String("--pool"), String(""))
-    var cand_path = _flag(String("--candidates"),
-                          String("g1_spec_candidates.txt"))
-    var has_pool = spec_pool_path != ""
-    var pool = G1Pool(1, List[Float64](length=D, fill=0.0),
-                      List[Float64](length=G1_NVOC, fill=0.0))
-    var zbase = List[Float64]()
-    if has_pool:
-        pool = G1Pool.load(spec_pool_path)
-        zbase = List[Float64](length=bank.count() * D, fill=0.0)
-        g1_spec_bank_baseline(pool, bank, zbase)
-        print("  spec path: ON —", pool.n, "pool rows from", spec_pool_path)
-    else:
-        print("  spec path: off (pass --pool g1_pool.bin to answer commands",
-              "the bank has no name for)")
-    var spec_q = g1_spec_questions(True)
-    var znew = List[Float64](length=D, fill=0.0)
 
     var chan = G1CommandChannel(chan_path)
     # ⚠ WHAT THE ROBOT IS DOING, SO THE NEXT SENTENCE CAN BE RELATIVE TO IT.
@@ -683,456 +625,114 @@ def main() raises:
                     last_event = String("chan: ?") + msg.cmd
                     chan.ack(msg.seq, msg.cmd, False)
 
-        # ── the voice state machine ───────────────────────────────────
-        # Every branch is non-blocking. The policy above has already stepped,
-        # so the robot goes on doing its last command throughout.
-        # ── the microphone, every frame ───────────────────────────────
-        # `read` never blocks: 0.08 ms steady state. It RAISES once ffmpeg
-        # has exited, carrying ffmpeg's own reason — which is the difference
-        # between "grant Terminal microphone access" and "the device went
-        # away", and it is why this no longer guesses.
-        # ⚠ still READ while the robot speaks — the pipe is 64 KiB, about 2 s,
-        # and past that ffmpeg blocks and the device drops audio. The samples
-        # are read and DISCARDED, never ringed, never levelled.
-        # ⚠ THE TAIL IS NOW A CAPTURE-BUFFER DRAIN, NOT A DURATION GUESS, and
-        # the distinction is why it survives. `speaking()` goes false the
-        # instant playback ends, but ffmpeg's pipe is 64 KiB — about 2 s — so
-        # samples recorded WHILE the robot was talking are still queued behind
-        # it. They are read and discarded for one more tail's worth, which is
-        # a fixed window for a known buffer rather than a guess at how long a
-        # sentence takes.
-        if _is_speaking(voice):
-            mute_until = perf_counter_ns() + _ns(ECHO_TAIL_S)
-        var echoing = perf_counter_ns() < mute_until
-        if mic_on and mic_dead == "":
-            try:
-                var pcm = mic.read()
-                if echoing:
-                    level = 0.0
-                    # ⚠ AND DROP THE RING. It holds the last 0.35 s of audio
-                    # and is prepended to the next segment — which would
-                    # hand Whisper the tail of the robot's own sentence as
-                    # the first syllable of yours.
-                    ring = List[Int16]()
-                elif len(pcm) > 0:
-                    level = rms(pcm)
-                    if level > peak:
-                        peak = level
-                    if state == ST_REC:
-                        for i in range(len(pcm)):
-                            seg.append(pcm[i])
-                    else:
-                        for i in range(len(pcm)):
-                            ring.append(pcm[i])
-                        if len(ring) > ring_max:
-                            var keep = List[Int16]()
-                            for i in range(len(ring) - ring_max, len(ring)):
-                                keep.append(ring[i])
-                            ring = keep^
-                        # ⚠ THE FLOOR IS TYPICAL QUIET, NOT THE QUIETEST
-                        # INSTANT. Tracking the minimum put `close_at` BELOW
-                        # ordinary room noise, so a segment that opened never
-                        # closed: a real session recorded 5.99 s for "you"
-                        # and 7.06 s for "Cool. Run.", ending on the
-                        # max-segment guard rather than on silence. An
-                        # average over quiet frames sits where the room
-                        # actually is.
-                        #
-                        # Only frames BELOW the open threshold count, or
-                        # speech would raise the floor it is measured against
-                        # and the detector would deafen itself mid-sentence.
-                        if level < floor * VAD_OPEN_MULT:
-                            floor = floor * 0.98 + level * 0.02
-                        if floor < VAD_FLOOR_MIN:
-                            floor = VAD_FLOOR_MIN
-                if not checked_silence and mic.seconds_read() > 1.0:
-                    checked_silence = True
-                    if mic.digital_silence(0.5):
-                        mic_dead = String("mic is digital silence — muted, "
-                                          "disabled, or permission refused")
-                        print("  [mic]", mic_dead)
-                    else:
-                        # ⚠ this used to say "noise floor" and print the
-                        # PEAK — two different numbers, and the one it
-                        # printed was the loudest thing in the first second.
-                        print("  [mic] input live —", _f2(mic.seconds_read()),
-                              "s read, floor", _f4(floor), "peak", _f4(peak))
-            except e:
-                mic_dead = String(e)
-                print("  [mic]", mic_dead)
+        # ── the voice loop: one poll, five outcomes ───────────────────
+        # ⚠ EVERYTHING BETWEEN THE MICROPHONE AND A DECISION IS IN
+        # `G1VoiceLoop` NOW. What stays here is what only this file knows: the
+        # latent, the blend, the bank index, the chain's distance and clock,
+        # and the locomotion timeout. See §12.64 — the split is that the loop
+        # owns the AUDIO and this owns the ROBOT.
+        #
+        # ⚠ `ctx.since_s` IS SET HERE, not in the loop, because it is measured
+        # from the robot's own command clock which the loop does not have.
+        ctx.since_s = Float64(perf_counter_ns() - t_cmd) * 1e-9
+        var ev = vl.poll(ctx, bank)
+        var vnote = vl.take_note()
+        if vnote != "":
+            print("  " + vnote)
 
-        var open_at = floor * VAD_OPEN_MULT
-        if open_at < VAD_OPEN_MIN:
-            open_at = VAD_OPEN_MIN
-        # ⚠ AND THE CLOSE THRESHOLD NEEDS A FLOOR OF ITS OWN. It was
-        # `floor * 2.5`, and the floor is an average over QUIET frames, so in
-        # a room whose between-word noise sits above that a segment opens and
-        # never closes: one ran the full 10 s max-segment guard for a 3 s
-        # question. Tying it to the opening threshold keeps the two in
-        # proportion whatever the room is doing.
-        var close_at = floor * VAD_CLOSE_MULT
-        if close_at < VAD_OPEN_MIN * 0.5:
-            close_at = VAD_OPEN_MIN * 0.5
-
-        # ⚠ VAD OPENS ONLY FROM IDLE. While a transcription or a decision is
-        # in flight, speech is still ringed but starts nothing — one call per
-        # client, and a queue of half-heard commands is worse than a missed
-        # one. The 1.2 s guard keeps the floor estimate from opening a
-        # segment on its own first samples.
-        if level > open_at and not echoing:
-            above += 1
-        else:
-            above = 0
-        if (mic_on and mic_dead == "" and state == ST_IDLE and vad
-            and not echoing and above >= VAD_OPEN_FRAMES
-            and mic.seconds_read() > 1.2):
-            heard = String("")
-            pick = G1LangPick()
-            seg = ring.copy()
-            ring = List[Int16]()
-            peak = level
-            t_rec = perf_counter_ns()
-            quiet_since = perf_counter_ns()
-            forced = False
-            state = ST_REC
-            last_event = String("listening...")
-
-        if state == ST_REC:
-            if level > close_at:
-                quiet_since = perf_counter_ns()
-            var quiet_s = Float64(perf_counter_ns() - quiet_since) / 1e9
-            var seg_s = Float64(len(seg)) / 16000.0
-            # ⚠ THREE WAYS TO END, and the last two are not optional. Silence
-            # is the normal one — HANG_S bridges the gap between words without
-            # feeling like a wait. A segment that never falls quiet (a fan, a
-            # conversation across the room) would otherwise record for ever
-            # and post a minute of audio to Whisper. A forced end is what TAB
-            # is for when a room is too loud for the detector to close.
-            var over = seg_s > max_seg
-            var done = forced or over or (quiet_s > hang_s)
-            if done and seg_s > DRAIN_S:
-                forced = False
-                # ⚠ a cough, a chair, a door. Below `min_seg` it is not
-                # speech, and sending it costs a Whisper call to be told so.
-                if seg_s < min_seg:
-                    print("  [vad] dropped", _f2(seg_s), "s — under",
-                          _f2(min_seg))
-                    state = ST_IDLE
-                elif peak < open_at * VAD_MIN_PEAK_MULT:
-                    # never got meaningfully louder than the threshold that
-                    # opened it
-                    print("  [vad] dropped — peak", _f4(peak), "under",
-                          _f4(open_at * VAD_MIN_PEAK_MULT))
-                    state = ST_IDLE
+        if ev.kind == VL_COMMAND:
+            var idx2 = bank.find(ev.name)
+            if idx2 >= 0:
+                pending = idx2
+                pending_blend = 25
+                last_event = String("voice: ") + ev.name
+                t_cmd = perf_counter_ns()
+                # the first step's extent comes from the utterance
+                extent = ev.extent
+                step_dist = 0.0
+                if bank.group_at(idx2) == "locomotion":
+                    step_end_dist = g1_extent_metres(extent)
+                    # ⚠ AND A CLOCK AS WELL. A robot that is blocked, or
+                    # walking on the spot, would never reach its distance and
+                    # the chain would hang for ever.
+                    step_end_at = perf_counter_ns() + _ns(g1_extent_seconds(extent) * 3.0 + 4.0)
                 else:
-                    var audio = WavAudio(16000, 1, seg.copy())
-                    stt.start(audio)
-                    t_wait = perf_counter_ns()
-                    print("  [stt]", len(seg), "samples (", _f2(seg_s),
-                          "s ), peak", _f4(peak),
-                          "— max-seg" if over else "")
-                    state = ST_STT
+                    step_end_dist = 0.0
+                    step_end_at = perf_counter_ns() + _ns(g1_extent_seconds(extent))
+                q_name = List[String]()
+                q_conf = List[Float64]()
+                for si in range(len(ev.chain)):
+                    q_name.append(ev.chain[si])
+                    q_conf.append(ev.chain_conf[si])
+                if len(q_name) > 0:
+                    var qs = String("")
+                    for si in range(len(q_name)):
+                        qs += String(" -> ") + q_name[si]
+                    print("  [chain]", len(q_name), "more:", qs,
+                          " extent", _f2(extent))
+                if not mute:
+                    # ⚠ SAY THE PART IT CANNOT DO. A robot that silently
+                    # performs 30 % of an instruction is worse than one that
+                    # performs 30 % and says so.
+                    var utter = g1_command_phrase(ev.name)
+                    for pi in range(len(ph_name)):
+                        if ph_name[pi] == ev.name:
+                            utter = ph_text[pi]
+                    if ev.needs_world > 0.5:
+                        utter = utter + String(
+                            ", but I have no object or destination")
+                    vl.say(utter)
 
-        elif state == ST_STT:
-            # ⚠ CHECKED BEFORE THE POLL, so a call that has already blown its
-            # budget is cancelled rather than waited on one more frame.
-            var stt_el = Float64(perf_counter_ns() - t_wait) / 1e9
-            if stt_el > stt_dl:
-                print("  [stt] GAVE UP after", _f2(stt_el),
-                      "s — the endpoint never answered. Say it again.")
-                try:
-                    stt.cancel()
-                except:
-                    # a cancel that fails must not take the renderer with it
-                    pass
-                last_event = String("stt timed out")
-                state = ST_IDLE
-            elif stt.poll():
-                # ⚠ `poll` RETURNS TRUE ON FAILURE TOO — it means "the call
-                # has finished", not "it worked" — and `result` is what
-                # raises. Unwrapped, a 503 from the endpoint took the whole
-                # renderer down, and with it the physics step.
-                #
-                # On failure `heard` stays empty, and the `letters < 3` guard
-                # below already routes an empty transcript back to IDLE. So
-                # this needs no second exit path.
-                var txt = String("")
-                var lat = 0.0
-                try:
-                    var tr = stt.result()
-                    txt = tr.text
-                    lat = tr.latency_ms
-                except e:
-                    print("  [stt] FAILED:", String(e))
-                    last_event = String("stt failed")
-                heard = txt
-                if lat > 0.0:
-                    print("  [heard]", heard, "(", lat, "ms )")
-                # ⚠ Whisper returns "." or " " for a cough. Asking a model
-                # which of 18 commands a full stop means costs a call to be
-                # told none of them.
-                var letters = 0
-                for ch in heard.codepoints():
-                    if ch.to_u32() > 64:
-                        letters += 1
-                if letters < 3:
-                    print("  [stt] nothing said — skipped")
-                    state = ST_IDLE
-                else:
-                    # ⚠ `start`, NOT `start_text` — a JSON state, so the
-                    # questions can refer to `doing` / `did_before` /
-                    # `last_arm_raised` by name.
-                    ctx.since_s = Float64(perf_counter_ns() - t_cmd) * 1e-9
-                    # ⚠ SHOW THE STATE. It is half the question now, and a
-                    # wrong answer to a relative instruction cannot be read
-                    # without it — "why did it walk?" is answerable only if
-                    # the log says what it thought it was doing. The CLI
-                    # prints the same thing; two views of one question is how
-                    # the last three divergences happened.
-                    print("  [ctx] doing", ctx.doing if ctx.doing != "" else
-                          String("nothing"), "for",
-                          g1_since_word(ctx.since_s), " arm",
-                          ctx.last_arm() if ctx.last_arm() != "" else
-                          String("none"))
-                    jev.start(g1_command_state(heard, ctx), quest)
-                    t_wait = perf_counter_ns()
-                    state = ST_JEV
+        elif ev.kind == VL_SPEC:
+            # ⚠ BLEND FROM WHERE WE ARE, and leave `cur` ALONE: a novel `z`
+            # has no bank index, and `cur` is what the HUD, the keys and the
+            # context read as "running now". Pointing it at a stale entry
+            # would make the next "plus vite" resolve against a command the
+            # robot is not doing (§12.56).
+            if len(ev.z) == D:
+                for k in range(D):
+                    zpair.data[k] = zcur.data[k]
+                    zpair.data[D + k] = Scalar[DT](ev.z[k])
+                blend_len = 25
+                blend_left = blend_len
+                ctx.began(String("spec"))
+                t_cmd = perf_counter_ns()
+                # ⚠ A NOVEL `z` MUST CANCEL THE PREVIOUS COMMAND'S
+                # TERMINATION, and leaving `cur` alone is exactly why it does
+                # not happen by itself: the locomotion timeout reads
+                # `bank.group_at(cur)`, so a foot-lift asked for while walking
+                # was overridden by the WALK's 5 s timeout a moment later. The
+                # guard is the FLAG, not a far-future deadline — the timeout
+                # also reads `step_done`, so pushing that out would stop the
+                # NEXT walk from ever ending (§12.62).
+                spec_active = True
+                q_name = List[String]()
+                q_conf = List[Float64]()
+                last_event = String("spec: ") + ev.name
 
-        elif state == ST_JEV:
-            var jev_el = Float64(perf_counter_ns() - t_wait) / 1e9
-            if jev_el > jev_dl:
-                print("  [jev] GAVE UP after", _f2(jev_el),
-                      "s — no decision came back.")
-                try:
-                    jev.cancel()
-                except:
-                    pass
-                last_event = String("jev timed out")
-                state = ST_IDLE
-            elif jev.poll():
-                var ans = jev.result()
-                pick = g1_decide(ans, bank, max_none, min_top, 0.5, True)
-                if pick.name != "":
-                    var idx2 = bank.find(pick.name)
-                    if idx2 >= 0:
-                        pending = idx2
-                        pending_blend = 25
-                        last_event = String("voice: ") + pick.name
-                        t_cmd = perf_counter_ns()
-                        # the first step's extent comes from the utterance
-                        extent = ans.score(String(G1_Q_EXTENT))
-                        step_dist = 0.0
-                        if bank.group_at(idx2) == "locomotion":
-                            step_end_dist = g1_extent_metres(extent)
-                            # ⚠ AND A CLOCK AS WELL. A robot that is blocked,
-                            # or walking on the spot, would never reach its
-                            # distance and the chain would hang for ever.
-                            step_end_at = perf_counter_ns() + _ns(g1_extent_seconds(extent) * 3.0 + 4.0)
-                        else:
-                            step_end_dist = 0.0
-                            step_end_at = perf_counter_ns() + _ns(g1_extent_seconds(extent))
-                        var rest = g1_decide_chain(ans, bank)
-                        q_name = List[String]()
-                        q_conf = List[Float64]()
-                        for si in range(len(rest)):
-                            q_name.append(rest[si].name)
-                            q_conf.append(rest[si].conf)
-                        if len(q_name) > 0:
-                            var qs = String("")
-                            for si in range(len(q_name)):
-                                qs += String(" -> ") + q_name[si]
-                            print("  [chain]", len(q_name), "more:", qs,
-                                  " extent", _f2(extent))
-                        print("  [pick]", pick.name, _f2(pick.conf),
-                              " P(none)", _f2(pick.p_none),
-                              " world", _f2(pick.needs_world))
-                        if not mute:
-                            # ⚠ SAY THE PART IT CANNOT DO. A robot that
-                            # silently performs 30 % of an instruction is
-                            # worse than one that performs 30 % and says so.
-                            var utter = g1_command_phrase(pick.name)
-                            for pi in range(len(ph_name)):
-                                if ph_name[pi] == pick.name:
-                                    utter = ph_text[pi]
-                            if pick.needs_world > 0.5:
-                                utter = utter + String(
-                                    ", but I have no object or destination")
-                            _say(voice, utter)
-                            mute_until = perf_counter_ns() + _ns(ECHO_TAIL_S)
-                elif pick.talk:
-                    # ⚠ NOT a bank command: the speaker wanted an answer.
-                    # Nothing about the robot's motion changes — it goes on
-                    # doing whatever it was doing while it replies.
-                    var msgs = List[ChatMessage]()
-                    msgs.append(ChatMessage.user(heard))
-                    llm.start(msgs, chat_sys, List[ToolSpec](), False)
-                    t_wait = perf_counter_ns()
-                    last_event = String("talking...")
-                    print("  [talk]", _f2(pick.conf))
-                    state = ST_CHAT
-                else:
-                    last_event = String("refused: ") + pick.reason
-                    # ⚠ A REFUSAL FOR `no such command` IS A CACHE MISS.
-                    # The bank has no NAME for this; the reward vocabulary may
-                    # still be able to say it (§12.60). Any other reason —
-                    # not addressed, no clear pick — is a real refusal and
-                    # must not be routed here, or background speech would
-                    # start generating latents.
-                    if has_pool and pick.reason == "no such command":
-                        print("  [miss] P(none)", _f2(pick.p_none),
-                              "— no name for this; asking for a reward spec")
-                        # ⚠ THE INSTRUCTION ALONE, not the conversational
-                        # state — see `g1_spec_prompt`. Asking with `doing`
-                        # in the state made the same instruction produce
-                        # ESS 5089 while walking and 301 while standing.
-                        jev.start_text(g1_spec_prompt(heard), spec_q)
-                        t_wait = perf_counter_ns()
-                        state = ST_SPEC
-                    else:
-                        print("  [refused]", pick.reason, " P(none)",
-                              _f2(pick.p_none), " addressed",
-                              _f2(pick.addressed))
-                    # ⚠ A SPOKEN REFUSAL IS THE WORST THING TO SAY ALOUD.
-                    # "no such command" is heard, transcribed, and refused
-                    # again — the loop that filled a whole session's log. The
-                    # HUD already says it; saying it too buys nothing and
-                    # costs a Whisper call every time.
-                # ⚠ ONLY when the decision did not hand off. The talk branch
-                # sets ST_CHAT, and an unconditional reset here would drop
-                # the reply on the floor — the request would run to
-                # completion and nothing would ever read it.
-                if state == ST_JEV:
-                    state = ST_IDLE
+        elif ev.kind == VL_WORLD:
+            # ⚠ A DESTINATION HAS NO HANDLER IN THIS BINARY, and saying so is
+            # the point rather than a gap. `g1_decide` routes it here instead
+            # of to the reward-spec path because world position is NOT in the
+            # state pool — a reward over it returns a unit-norm `z` and a
+            # confidently wrong robot (§3.2). The room session's binary owns a
+            # planner and takes this event; this one has no scene, so it
+            # reports and keeps doing what it was doing.
+            last_event = String("world: ") + ev.destination
+            print("  [world]", ev.destination,
+                  "— no navigator in this binary; the room demo takes this.")
+            if not mute:
+                vl.say(String("I cannot go to the ") + ev.destination
+                       + String(" from here"))
 
-        elif state == ST_SPEC:
-            var sp_el = Float64(perf_counter_ns() - t_wait) / 1e9
-            if sp_el > jev_dl:
-                print("  [spec] GAVE UP after", _f2(sp_el), "s")
-                try:
-                    jev.cancel()
-                except:
-                    pass
-                last_event = String("spec timed out")
-                state = ST_IDLE
-            elif jev.poll():
-                var sa = jev.result()
-                var sterms = List[G1Term]()
-                var n_scaf = g1_spec_from_answers(sa, pool, bank, sterms)
-                if n_scaf < 0:
-                    print("  [spec] the model named no quantity — nothing done")
-                    state = ST_IDLE
-                else:
-                    var v = g1_spec_admit(pool, bank, zbase, sterms, znew,
-                                          n_scaf)
-                    var what = g1_spec_describe(sterms, n_scaf)
-                    print("  [spec]", what, " ESS", Int(v.ess))
-                    if v.ok:
-                        # ⚠ BLEND FROM WHERE WE ARE, like every other path:
-                        # a novel `z` has no bank index, so `cur` stays put
-                        # and `pending` is NOT set. `cur` is what the HUD,
-                        # the keys and the context read as "running now", and
-                        # pointing it at a stale entry would make the next
-                        # "plus vite" resolve against the wrong command.
-                        for k in range(D):
-                            zpair.data[k] = zcur.data[k]
-                            zpair.data[D + k] = Scalar[DT](znew[k])
-                        blend_len = 25
-                        blend_left = blend_len
-                        ctx.began(String("spec"))
-                        t_cmd = perf_counter_ns()
-                        # ⚠ A NOVEL `z` MUST CANCEL THE PREVIOUS COMMAND'S
-                        # TERMINATION, and leaving `cur` alone is exactly why
-                        # it does not happen by itself. The locomotion
-                        # timeout reads `bank.group_at(cur)`, so a foot-lift
-                        # asked for while walking was overridden by the
-                        # WALK's 5 s timeout a moment later — visible in the
-                        # session log as `[spec] ... ESS 5089` followed
-                        # immediately by `[timeout] locomotion -> stand`.
-                        # ⚠ THE GUARD IS THE FLAG, NOT A FAR-FUTURE
-                        # DEADLINE. Pushing `step_end_at` out would make
-                        # `step_done` false for ever, and the timeout
-                        # condition also reads it — so the NEXT `walk` would
-                        # never end either. One flag, one meaning.
-                        # ⚠ RECORD IT FOR OFFLINE PROMOTION. This is the
-                        # only place a novel spec is known to have actually
-                        # RUN, which is the signal worth recording — a spec
-                        # that was refused is not a candidate.
-                        if cand_path != "":
-                            try:
-                                if g1_spec_record(cand_path, pool, sterms,
-                                                  n_scaf):
-                                    print("  [spec] recorded a candidate")
-                            except:
-                                # a demo does not stop because a text file
-                                # could not be written
-                                pass
-                        spec_active = True
-                        # a chain queued by an earlier utterance is not what
-                        # the robot was just asked for
-                        q_name = List[String]()
-                        q_conf = List[Float64]()
-                        last_event = String("spec: ") + what
-                        # ⚠ a novel command has no phrase in the table, so
-                        # the robot says the QUANTITY it is about to move.
-                        # Silence here reads as "it did not understand".
-                        if not mute:
-                            # ⚠ a novel command has no phrase in the table,
-                            # so the robot says the QUANTITY it is about to
-                            # move. Silence here reads as "it did not
-                            # understand", which is the opposite of true.
-                            _say(voice, String("ok, ") + what)
-                            mute_until = perf_counter_ns() + _ns(ECHO_TAIL_S)
-                    elif v.nearest >= 0:
-                        # the spec IS a bank entry: run the GATED row, which
-                        # went through four gates and a CEM refinement this
-                        # baseline has not.
-                        print("   ", v.reason)
-                        pending = v.nearest
-                        pending_blend = 25
-                        last_event = String("spec->") + bank.name_at(v.nearest)
-                        if not mute:
-                            var u3 = g1_command_phrase(bank.name_at(v.nearest))
-                            for pi in range(len(ph_name)):
-                                if ph_name[pi] == bank.name_at(v.nearest):
-                                    u3 = ph_text[pi]
-                            _say(voice, u3)
-                            mute_until = perf_counter_ns() + _ns(ECHO_TAIL_S)
-                    else:
-                        print("  [spec] REFUSED:", v.reason)
-                    state = ST_IDLE
+        elif ev.kind == VL_TALK:
+            # already spoken by the loop, which owns the voice
+            last_event = String("replied")
 
-        elif state == ST_CHAT:
-            # non-streaming, so `poll` returns "" throughout and `done`
-            # is the signal. The robot keeps moving while it thinks.
-            var ch_el = Float64(perf_counter_ns() - t_wait) / 1e9
-            if ch_el > chat_dl:
-                print("  [talk] GAVE UP after", _f2(ch_el),
-                      "s — no reply came back.")
-                try:
-                    llm.cancel()
-                except:
-                    pass
-                last_event = String("talk timed out")
-                state = ST_IDLE
-            else:
-                _ = llm.poll()
-            if state == ST_CHAT and llm.done():
-                # ⚠ `result` RAISES on a failed call, and an unanswered
-                # greeting must not take the renderer down.
-                var rtxt = String("")
-                try:
-                    var rep = llm.result()
-                    rtxt = rep.text
-                except e:
-                    print("  [talk] FAILED:", String(e))
-                    last_event = String("talk failed")
-                print("  [said]", rtxt)
-                heard = rtxt
-                if not mute and rtxt != "":
-                    _say(voice, rtxt)
-                    mute_until = perf_counter_ns() + _ns(ECHO_TAIL_S)
-                    last_event = String("replied")
-                state = ST_IDLE
+        elif ev.kind == VL_REFUSED:
+            # ⚠ NEVER SPOKEN ALOUD: "no such command" is heard, transcribed
+            # and refused again — the loop that filled a whole session's log.
+            last_event = String("refused: ") + ev.text
 
         # ── keys ──────────────────────────────────────────────────────
         # ⚠ SCANCODES, NOT KEYCODES — physical key POSITIONS, so this works
@@ -1150,58 +750,22 @@ def main() raises:
                 pending = i
                 pending_blend = 25
         # ⚠ EDGE-TRIGGERED. `get_keyboard_state` reports the key as HELD, so
-        # a level test would start a new recording every frame it is down.
+        # a level test would fire every frame it is down.
         var rec_key = kb[Int(Scancode.SCANCODE_TAB)]
-        # ⚠ M CLOSES THE MICROPHONE, and it is not a convenience. An
-        # always-open mic in a room of people is a privacy problem before it
-        # is a false-trigger problem: everything said near this laptop would
-        # otherwise be posted to a transcription service. `stop()` kills
-        # ffmpeg, so the OS recording indicator goes out and nothing is
-        # captured at all — not captured-and-ignored.
         var m_key = kb[Int(Scancode.SCANCODE_M)]
         if m_key and not prev_m:
-            if mic_on:
-                try:
-                    mic.stop()
-                except:
-                    pass
-                mic_on = False
-                ring = List[Int16]()
-                level = 0.0
-                state = ST_IDLE
-                last_event = String("mic CLOSED")
-                print("  [mic] closed")
-            else:
-                try:
-                    mic = MicCapture.start(16000, mic_dev)
-                    mic_on = True
-                    mic_dead = String("")
-                    checked_silence = False
-                    peak = 0.0
-                    floor = 0.0010
-                    last_event = String("mic open")
-                    print("  [mic] reopened")
-                except e:
-                    mic_dead = String(e)
-                    print("  [mic]", mic_dead)
+            # ⚠ M really CLOSES the device — `vl.toggle_mic` kills ffmpeg, so
+            # the OS recording indicator goes out and nothing is captured at
+            # all, not captured-and-ignored. That is a privacy property.
+            var mn = vl.toggle_mic()
+            print("  " + mn)
+            last_event = mn
         prev_m = m_key
 
         # TAB forces a segment to start, or ends the one in progress — the
         # manual override for a room too loud for the detector to close.
-        if rec_key and not prev_key and mic_on and mic_dead == "":
-            if state == ST_IDLE:
-                heard = String("")
-                pick = G1LangPick()
-                seg = ring.copy()
-                ring = List[Int16]()
-                peak = 0.0
-                t_rec = perf_counter_ns()
-                quiet_since = perf_counter_ns()
-                forced = False
-                state = ST_REC
-                last_event = String("listening...")
-            elif state == ST_REC:
-                forced = True
+        if rec_key and not prev_key:
+            vl.force()
         prev_key = rec_key
 
         # ── the queue advances when the current step is done ──────────
@@ -1238,8 +802,10 @@ def main() raises:
                     for pi in range(len(ph_name)):
                         if ph_name[pi] == nxt:
                             u2 = ph_text[pi]
-                    _say(voice, u2)
-                    mute_until = perf_counter_ns() + _ns(ECHO_TAIL_S)
+                    # ⚠ THROUGH THE LOOP, which owns the echo gate — `say`
+                    # sets the drain itself, so there is no second place that
+                    # has to remember to.
+                    vl.say(u2)
 
         # ⚠ LOCOMOTION HAS NO NATURAL END. A posture holds itself because `z`
         # persists; `walk` walks for ever. The bank's `group` is what decides.
@@ -1330,33 +896,20 @@ def main() raises:
         # ⚠ THE STATE READOUT IS NOT DECORATION. Speech plus decision is
         # 1.5 s; without a visible state an audience sees a robot that moves
         # two seconds after you speak for no reason anyone can follow.
-        var st_s = String("idle — press TAB")
+        # ⚠ THE LOOP OWNS THE WORDS, THIS FILE OWNS THE COLOURS. The status
+        # text carries the ELAPSED TIME AND THE BUDGET — "transcribing 4.21s /
+        # 20.00s" — because "transcribing..." alone cannot distinguish a 5 s
+        # call from a dead one, and a session was lost to exactly that
+        # question (§12.60).
+        var st_s = vl.status_line()
+        # ⚠ `slvl`, not `lvl` — the level METER below uses that name, and two
+        # different levels under one name is how a HUD lies.
+        var slvl = vl.status_level()
         var st_c = UI_DIM
-        if state == ST_REC:
-            # the bar of the HUD is the segment so far, not a countdown —
-            # there is no window to count down any more.
-            var el = Float64(len(seg)) / 16000.0
-            st_s = String("LISTENING ") + _f2(el) + String("s")
+        if slvl == 1:
             st_c = UI_WARN
-        elif state == ST_STT:
-            # ⚠ WITH THE ELAPSED TIME AND THE BUDGET. "transcribing..." alone
-            # cannot distinguish a 5 s call from a dead one, and a session was
-            # lost to exactly that question.
-            var e1 = Float64(perf_counter_ns() - t_wait) / 1e9
-            st_s = String("transcribing ") + _f2(e1) + String("s / ") \
-                   + _f2(stt_dl) + String("s")
-            st_c = UI_WARN if e1 < stt_dl * 0.5 else UI_BAD
-        elif state == ST_CHAT:
-            var e3 = Float64(perf_counter_ns() - t_wait) / 1e9
-            st_s = String("replying ") + _f2(e3) + String("s / ") \
-                   + _f2(chat_dl) + String("s")
-            st_c = UI_WARN if e3 < chat_dl * 0.5 else UI_BAD
-        elif state == ST_JEV or state == ST_SPEC:
-            var e2 = Float64(perf_counter_ns() - t_wait) / 1e9
-            st_s = (String("deciding ") if state == ST_JEV
-                    else String("writing a reward ")) + _f2(e2) \
-                   + String("s / ") + _f2(jev_dl) + String("s")
-            st_c = UI_WARN if e2 < jev_dl * 0.5 else UI_BAD
+        elif slvl == 2:
+            st_c = UI_BAD
         ui.label(12, 40, st_s, st_c, 1)
 
         var hs = heard
@@ -1403,6 +956,13 @@ def main() raises:
         ui.label(12, by, String("MIC"), UI_DIM, 1)
         var mw = Float32(SIDEBAR_W - 24)
         ui.panel(12, by + 16, mw, 12)
+        var level = vl.meter()
+        var peak = vl.peak_level()
+        var open_at = vl.open_threshold()
+        var mic_on = vl.mic_open()
+        var mic_dead = vl.mic_error()
+        var checked_silence = vl.mic_checked()
+        var floor = vl.noise_floor()
         var lvl = level * 6.0              # speech sits low in a 0-1 RMS
         if lvl > 1.0:
             lvl = 1.0
