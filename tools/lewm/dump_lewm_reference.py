@@ -68,6 +68,9 @@ owns every transpose, in ONE place (the ACT lesson: a transposed square
               gradient of every parameter; BN running stats after the step.
 * `adamw`     one AdamW step on those gradients: the clip's total norm and
               each parameter's delta (`adam_delta.<name>` = new - old).
+* `steps`     P6: five AdamW steps (lr 5e-5, gate wd 1.0) on fresh windows
+              and SIGReg matrices: per-step loss and pre-clip norm, every
+              parameter's total delta, BN stats after (`section_steps`).
 * `rollout`   `get_cost` for S candidate action sequences (horizon 5,
               history 1 growing to 3): `predicted_emb`, `goal_emb`, `cost`.
 """
@@ -561,6 +564,125 @@ def section_train(dump: Dump, model, dtype, rng, b: int = 4, t: int = 4,
     print(f"  adamw: pre-clip grad norm {total.item():.6g}")
 
 
+def _adamw_run(model, batches, a_raws, lr, wd, clip):
+    """K training steps of `train.py` on the given batches: BN train mode,
+    dropout off, SIGReg on the injected matrices, torch AdamW (decay on every
+    parameter) after `clip_grad_norm_`. Returns the per-step scalars and,
+    per parameter, the max |grad| seen over the K steps."""
+    model.train()
+    dropout_off(model)
+    dtype = next(model.parameters()).dtype
+    sigreg = swm_loss.SIGReg(knots=17, num_proj=1024).to(dtype)
+    opt = torch.optim.AdamW(model.parameters(), lr=lr, weight_decay=wd)
+    rows = []
+    gmax = {k: torch.zeros_like(p, dtype=torch.float64) for k, p in model.named_parameters()}
+    for (pix, act), a_raw in zip(batches, a_raws):
+        opt.zero_grad(set_to_none=True)
+        with _FixedRandn(a_raw.to(dtype)):
+            out = lejepa_forward(model, sigreg, {"pixels": pix.to(dtype), "action": act.to(dtype)})
+        out["loss"].backward()
+        for k, p in model.named_parameters():
+            if p.grad is not None:
+                gmax[k] = torch.maximum(gmax[k], p.grad.detach().double().abs())
+        total = torch.nn.utils.clip_grad_norm_(model.parameters(), clip)
+        opt.step()
+        rows.append([out["loss"].item(), out["pred_loss"].item(),
+                     out["sigreg_loss"].item(), total.item()])
+    return np.array(rows), gmax
+
+
+def section_steps(dump: Dump, weights: Path, rng, k: int = 5, b: int = 4, t: int = 4,
+                  lr: float = 5e-5, wd: float = 1.0, clip: float = 1.0, noise: bool = True):
+    """P6 G6a: K AdamW steps from the published weights, each on its own
+    (B, T) window and its own SIGReg matrix. lr is the recipe's (5e-5); wd is
+    the GATE's (1.0, not 1e-3): at the recipe's, decoupled decay moves a
+    weight by 5e-8 of itself per step, below float32, and would go unchecked;
+    at 1.0 it is lr x p, the size of Adam's own step. (lr 1e-3 knocks the
+    published model off its minimum — loss 0.18 -> 0.82 in 2 steps — and
+    torch float32 then drifts 2.4 % from float64: a chaotic run gates nothing.)
+
+    Dumps the inputs (`steps.<k>.pixels|action|sigreg_A`), the per-step
+    scalars (`steps.scalars`: loss, pred_loss, sigreg_loss, pre-clip norm),
+    each parameter's total delta (`steps_delta.<name>`) and BN running stats
+    after (`steps_bn.<name>`).
+
+    `steps_dead.<name>` marks the elements whose gradient was ZERO at every
+    step (|g| < 1e-8 x the gradient RMS: biases / LN betas feeding a
+    train-mode BN, the ViT key biases). Adam turns their roundoff gradient
+    into a full ±lr step of random sign — in torch float32 as in ours — and
+    they cannot move the training loss, so the delta gate skips them; the
+    BN running stats downstream DO see them, which `--noise` measures.
+    `steps_noise.<name>` = max |d32 - d64| / std(d64) over the live elements:
+    torch's own float32 error on the K-step delta, the scale ours is held to.
+    """
+    model = load_model(weights, torch.float64)
+    before = {kk: p.detach().clone() for kk, p in model.named_parameters()}
+    batches, a_raws = [], []
+    for s in range(k):
+        u8 = frames_sequence(rng, b, t)
+        pix = preprocess(u8, torch.float64)
+        act = torch.from_numpy(rng.normal(size=(b, t, ACT_DIM)))
+        a_raw = torch.from_numpy(rng.normal(size=(192, 1024)))
+        dump.add(f"steps.{s}.pixels", pix)
+        dump.add(f"steps.{s}.action", act)
+        dump.add(f"steps.{s}.sigreg_A", a_raw / a_raw.norm(p=2, dim=0))
+        batches.append((pix, act))
+        a_raws.append(a_raw)
+    rows, gmax = _adamw_run(model, batches, a_raws, lr, wd, clip)
+    dump.add("steps.scalars", rows)
+    dump.add("steps.hparams", np.array([lr, wd, clip, float(k)]))
+    rms = math.sqrt(sum(float(g.square().sum()) for g in gmax.values())
+                    / sum(g.numel() for g in gmax.values()))
+    delta = {}
+    n_dead = 0
+    for kk, p in model.named_parameters():
+        delta[kk] = (p.detach() - before[kk]).double()
+        dead = (gmax[kk] < 1e-6 * rms).double()
+        n_dead += int(dead.sum())
+        dump.add(f"steps_delta.{ckpt_name(kk)}", delta[kk])
+        dump.add(f"steps_dead.{ckpt_name(kk)}", dead)
+    for kk, v in model.state_dict().items():
+        if "running_" in kk:
+            dump.add(f"steps_bn.{ckpt_name(kk)}", v)
+    for s, r in enumerate(rows):
+        print(f"  steps {s}: loss {r[0]:.6g}  pred {r[1]:.6g}  sigreg {r[2]:.6g}  "
+              f"pre-clip norm {r[3]:.4g}{'  (clipped)' if r[3] > clip else ''}")
+    print(f"  steps: {n_dead} dead gradient elements (skipped by the delta gate)")
+
+    if not noise:
+        return
+    m32 = load_model(weights, torch.float32)
+    rows32, _ = _adamw_run(m32, [(p.float(), a.float()) for p, a in batches],
+                           [a.float() for a in a_raws], lr, wd, clip)
+    dump.add("steps.noise_scalars", np.abs(rows32 - rows) / np.abs(rows))
+    p64 = dict(model.named_parameters())
+    worst = []
+    for kk, p in m32.named_parameters():
+        d32 = p.detach().double() - before[kk].double()
+        live = ~(gmax[kk] < 1e-6 * rms)
+        d64 = delta[kk]
+        if live.sum() < 2:
+            v = 0.0
+        else:
+            sd = d64[live].std().item() or 1.0
+            v = (d32 - d64)[live].abs().max().item() / sd
+        dump.add(f"steps_noise.{ckpt_name(kk)}", np.array([v]))
+        worst.append((v, ckpt_name(kk)))
+    sd64 = model.state_dict()
+    for kk, v32 in m32.state_dict().items():
+        if "running_" in kk:
+            r = sd64[kk].double()
+            v = (v32.double() - r).abs().max().item() / (r.std().item() or 1.0)
+            dump.add(f"steps_noise_bn.{ckpt_name(kk)}", np.array([v]))
+            worst.append((v, "bn " + ckpt_name(kk)))
+    worst.sort(reverse=True)
+    print(f"  steps noise (max|d32-d64|/std(d64), live elements): max {worst[0][0]:.3g} "
+          f"({worst[0][1]}); median {worst[len(worst) // 2][0]:.3g}; "
+          f"scalars {np.abs(rows32 - rows).max() / np.abs(rows).min():.3g} rel")
+    for v, kk in worst[:6]:
+        print(f"     {v:.3g}  {kk}")
+
+
 def section_rollout(dump: Dump, model, dtype, rng, s: int = 8, horizon: int = 5):
     """`LeWM.get_cost` as the CEM solver calls it: one env (B=1), S candidate
     sequences of `horizon` z-scored action blocks, ONE history frame (eval
@@ -642,7 +764,7 @@ def _noise(dump: Dump, name: str, ref64, got32):
 # --------------------------------------------------------------------------- #
 
 
-SECTIONS = ("params", "encoder", "action", "predictor", "train", "rollout", "cem")
+SECTIONS = ("params", "encoder", "action", "predictor", "train", "rollout", "cem", "steps")
 
 
 def main():
@@ -684,6 +806,8 @@ def main():
         section_cem(dump, model, dtype, sub(6))
     if run("train"):
         section_train(dump, model, dtype, sub(4), f32_model=f32)
+    if run("steps"):  # its own float64 model from the weights: `train` stepped this one
+        section_steps(dump, weights, sub(7), noise=args.noise)
     dump.close()
 
 

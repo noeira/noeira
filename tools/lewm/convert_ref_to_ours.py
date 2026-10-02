@@ -15,6 +15,8 @@ Writes, into the same dump directory, for every Param / State name of
     ours_grad.<name>     d loss / d param of `train`     (P)
     ours_adam.<name>     the AdamW step's delta          (P)
     ours_bn_after.<name> running stats after `train`     (S)
+    ours_steps_delta|dead|noise.<name>, ours_steps_bn|noise_bn.<name>
+                         the `steps` section (P6 G6a)       (P / S)
 
 ## The ONE place layouts are decided
 
@@ -153,7 +155,7 @@ def main():
 
     out = Dump(root)
     used: dict[str, int] = {}
-    n_grad = n_adam = n_bn = 0
+    n_grad = n_adam = n_bn = n_steps = 0
     for kind, name, size in ours:
         hit = [(m, f) for rx, f in rules if (m := rx.match(name))]
         if len(hit) != 1:
@@ -184,8 +186,20 @@ def main():
                         np.array([max(float(ref[f"noise_grad.{k}"][0]) for k in keys)]))
             if all(f"adam_delta.{k}" in ref for k in keys):
                 out.add(f"ours_adam.{name}", conv("adam_delta")); n_adam += 1
-        elif all(f"bn_after.{k}" in ref for k in keys):
-            out.add(f"ours_bn_after.{name}", conv("bn_after")); n_bn += 1
+            if all(f"steps_delta.{k}" in ref for k in keys):
+                out.add(f"ours_steps_delta.{name}", conv("steps_delta"))
+                out.add(f"ours_steps_dead.{name}", conv("steps_dead")); n_steps += 1
+            if all(f"steps_noise.{k}" in ref for k in keys):
+                out.add(f"ours_steps_noise.{name}",
+                        np.array([max(float(ref[f"steps_noise.{k}"][0]) for k in keys)]))
+        else:
+            if all(f"bn_after.{k}" in ref for k in keys):
+                out.add(f"ours_bn_after.{name}", conv("bn_after")); n_bn += 1
+            if all(f"steps_bn.{k}" in ref for k in keys):
+                out.add(f"ours_steps_bn.{name}", conv("steps_bn"))
+            if all(f"steps_noise_bn.{k}" in ref for k in keys):
+                out.add(f"ours_steps_noise_bn.{name}",
+                        np.array([max(float(ref[f"steps_noise_bn.{k}"][0]) for k in keys)]))
 
     ref_params = {k[len("param."):] for k in ref if k.startswith("param.")}
     unused = sorted(ref_params - set(used))
@@ -196,7 +210,8 @@ def main():
         sys.exit(f"reference tensors unused: {unused[:8]}  used the wrong number of times: {twice[:8]}")
     out.close()
     print(f"  {len(ours)} of our tensors mapped from {len(ref_params)} reference "
-          f"tensors (each used once; AdaLN six ways); grads {n_grad}, adam deltas {n_adam}, bn_after {n_bn}")
+          f"tensors (each used once; AdaLN six ways); grads {n_grad}, adam deltas {n_adam}, bn_after {n_bn}, "
+          f"steps deltas {n_steps}")
 
 
 if __name__ == "__main__":

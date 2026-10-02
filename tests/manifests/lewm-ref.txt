@@ -9,6 +9,8 @@ tests/experimental/lewm/ref/test_ref_forward.mojo
 tests/experimental/lewm/ref/test_ref_train.mojo
 tests/experimental/lewm/ref/test_ref_rollout.mojo
 tests/experimental/lewm/ref/test_ref_cem.mojo
+# P6 — five chained training steps (AdamW, clip, decay on every parameter)
+tests/experimental/lewm/ref/test_ref_steps.mojo
 
 # P4 — PushT against the dataset (docs/LEWM_REOPEN_PLAN.md). Need box session
 # A's fixture + pymunk oracle in ~/.cache/noeira/lewm_pusht/session_a/ and,
