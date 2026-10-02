@@ -226,6 +226,15 @@ struct G1VoiceConfig(Copyable, Movable):
     var destinations: List[String]
     var dest_descs: List[String]
     var mic_dev: String
+    var refuse_placeless: Bool
+    """Refuse "go to the kitchen" when the scene has no kitchen, instead of
+    walking in an arbitrary direction and saying so.
+
+    ⚠ OFF BY DEFAULT, because whether a partial action is safe is a property
+    of the SCENE. §12.54's rule is to do the part it can and name the part it
+    cannot — harmless in an empty void, and walking into the fridge in a
+    furnished room. A caller with obstacles sets this; a bare viewer does not.
+    """
     var llm_spec: String
     """Passed to `ChatClient.from_spec` — `hf`, `openai`, `anthropic`, or a
     local openai-compatible base URL."""
@@ -252,6 +261,7 @@ struct G1VoiceConfig(Copyable, Movable):
         self.destinations = List[String]()
         self.dest_descs = List[String]()
         self.mic_dev = String("")
+        self.refuse_placeless = False
         self.llm_spec = String("hf")
 
 
@@ -804,7 +814,8 @@ struct G1VoiceLoop(Movable):
             var ans = self.jev.result()
             self.pick = g1_decide(
                 ans, bank, self.cfg.max_none, self.cfg.min_top, 0.5, True,
-                len(self.cfg.destinations) > 0,
+                len(self.cfg.destinations) > 0, 0.5, 0.5,
+                self.cfg.refuse_placeless,
             )
             ev.conf = self.pick.conf
             ev.p_none = self.pick.p_none

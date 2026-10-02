@@ -149,6 +149,8 @@ def main() raises:
     # `--doing` exists (§12.56). A CLI that cannot ask the question the demo
     # asks cannot debug the demo's answer.
     var dest_arg = _flag(String("--destinations"), String(""))
+    # ⚠ makes the room session's choice testable here too — see `g1_decide`.
+    var refuse_placeless = _has(String("--refuse-placeless"))
     var no_warn = _has(String("--spec-no-warn"))
     # ⚠ THE BAR IS P(none), NOT THE TOP-1 CONFIDENCE, and that is a measured
     # correction. "crouch down low" returned `crouch` at 0.56 with `squat` at
@@ -293,7 +295,7 @@ def main() raises:
     var ms = Float64(perf_counter_ns() - t0) / 1e6
     var argmax = ans.choice(String(G1_Q_COMMAND))
     var d = g1_decide(ans, bank, max_none, min_top, 0.5, addressed,
-                      len(dests) > 0)
+                      len(dests) > 0, 0.5, 0.5, refuse_placeless)
     var p_none = d.p_none
     var pick = d.name if d.name != "" else String("")
     var conf = d.conf
@@ -438,8 +440,16 @@ def main() raises:
               " addressed", _f2(d.addressed),
               " needs_world", _f2(d.needs_world),
               " (leaning", d.best, _f2(d.conf), ") — nothing sent.",
+              # ⚠ THE HINT MUST MATCH THE REASON. The cache-miss path takes
+              # ONLY `no such command`; a placeless "go somewhere" is refused
+              # precisely so it cannot reach a reward spec (world position is
+              # not in the state pool), so offering `--pool` there would send
+              # the operator after a route that will not take it. An
+              # instrument that suggests the wrong fix is the same defect as
+              # one that reports the wrong number.
               String("Pass --pool g1_pool.bin to try a reward spec.")
-              if pool_path == "" else String(""))
+              if pool_path == "" and d.reason == "no such command"
+              else String(""))
         return
 
     # ⚠ PARTIAL EXECUTION, SAID OUT LOUD. The default is to do the part it

@@ -628,6 +628,7 @@ def g1_decide(
     with_destination: Bool = False,
     min_world: Float64 = 0.5,
     min_dest: Float64 = 0.5,
+    refuse_placeless: Bool = False,
 ) raises -> G1LangPick:
     """Apply the rule above. Returns an empty `name` with a `reason` set when
     the honest answer is to do nothing."""
@@ -701,6 +702,37 @@ def g1_decide(
             # walks off while being told where to walk.
             r.name = String("")
             return r^
+
+    # ⚠ "GO TO THE KITCHEN" WHEN THE SCENE HAS NO KITCHEN. `needs_world` is
+    # high and no destination matched, so without this the decision falls
+    # through to the nearest MOVEMENT — `walk` at 0.97 in the room session's
+    # measurement — and the robot sets off in an arbitrary direction.
+    #
+    # ⚠ WHETHER THAT IS RIGHT IS A PROPERTY OF THE SCENE, NOT OF THE
+    # LANGUAGE, which is why this is opt-in rather than the default. §12.54's
+    # rule is to do the part it can and NAME the part it cannot, and walking
+    # while saying "but I have no destination" is exactly that — harmless in
+    # an empty void, and walking into the fridge in a furnished room. The
+    # caller knows which it has; this file cannot.
+    #
+    # ⚠⚠ AND THE REASON MUST NOT BE `no such command`, because that exact
+    # string is what routes an instruction to the cache-miss path (§12.60). A
+    # placeless "go somewhere" handed to a reward spec is §3.2's trap with an
+    # extra step: world position is not in the state pool, so it would come
+    # back a unit-norm `z` and a confidently wrong robot. Different cause,
+    # different word, different route.
+    if (with_destination and refuse_placeless and r.destination == ""
+        and r.needs_world >= min_world):
+        # ⚠ THE REASON STATES THE OBSERVATION, NOT AN INFERENCE. It first read
+        # "names a place this scene does not have", which is true for "go to
+        # the kitchen" and FALSE for "assieds-toi sur la chaise" — the chair IS
+        # listed, and the destination question returned `none` because sitting
+        # is not GOING (§6.4). Both arrive here identically and nothing in the
+        # answer separates them, so the wording may not claim to know which.
+        # Refusing is right in both cases; asserting an absent chair is not.
+        r.reason = String("needs a destination, and none of this scene's matched")
+        r.name = String("")
+        return r^
 
     if r.p_none > max_none or r.name == "":
         r.reason = String("no such command")
