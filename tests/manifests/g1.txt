@@ -63,3 +63,10 @@ tests/robots/test_g1_command_state.mojo
 # duplicate test after two angle criteria were measured failing at it, and
 # the channel's refusal of a label it would truncate.
 tests/robots/test_g1_spec.mojo
+
+# the voice loop's pure parts — chiefly the detector invariant that cost a
+# session: `close_at < open_at` at every floor, asserted over six orders of
+# magnitude, because when they cross a segment either cannot open or cannot
+# close and both look like a broken microphone. Plus the deadlines, pinned to
+# the measured latencies they were derived from.
+tests/robots/test_g1_voice_loop.mojo
