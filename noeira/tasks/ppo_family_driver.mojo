@@ -603,6 +603,14 @@ def run_ppo[M: ModelDefLike, C: Phyics3dEnvConfig](
     # the real arm's speed cap and elbow stop (`ServoLag.set_limits`)
     var lag_vmax = _arg(args, "--lag-vmax", "")
     var elbow_max = Float64(_arg(args, "--elbow-max", "0"))
+    # per-joint servo dynamics, offsets, control-period jitter
+    # (`ServoLag.set_per_joint` / `set_offset` / `set_period`; why in its
+    # header): "lo,hi;..." x 6 joints (offsets in rad), "lo,hi" ms
+    var lag_tau_j = _arg(args, "--lag-tau-j", "")
+    var lag_delay_j = _arg(args, "--lag-delay-j", "")
+    var lag_vmax_j = _arg(args, "--lag-vmax-j", "")
+    var lag_off_j = _arg(args, "--lag-offset-j", "")
+    var lag_period = _arg(args, "--lag-period", "")
     # the delta action's per-step scales (rad at a = 1): the defaults are
     # so101-nexus's; under `--lag-*` the real servos need larger ones
     var d_arm = Float64(_arg(args, "--delta-arm", String(DELTA_ARM)))
@@ -734,6 +742,11 @@ def run_ppo[M: ModelDefLike, C: Phyics3dEnvConfig](
     logger.set_config("lag_delay_ticks", lag_delay)
     logger.set_config("lag_vmax", lag_vmax)
     logger.set_config("elbow_max", String(elbow_max))
+    logger.set_config("lag_tau_j", lag_tau_j)
+    logger.set_config("lag_delay_j", lag_delay_j)
+    logger.set_config("lag_vmax_j", lag_vmax_j)
+    logger.set_config("lag_offset_j", lag_off_j)
+    logger.set_config("lag_period_ms", lag_period)
     logger.set_config("delta_arm", String(d_arm))
     logger.set_config("delta_gripper", String(d_grip))
     logger.set_config("act_hist", String(ACT_HIST))
@@ -833,10 +846,17 @@ def run_ppo[M: ModelDefLike, C: Phyics3dEnvConfig](
             N_ENVS, lag_tau, lag_delay, Float64(C.FRAME_SKIP) * M.TIMESTEP
         )
         lag.set_limits(lag_vmax, elbow_max)
+        lag.set_per_joint(lag_tau_j, lag_delay_j, lag_vmax_j)
+        lag.set_offset(lag_off_j)
+        lag.set_period(lag_period)
         if lag.on:
             print("  servo lag: tau", lag_tau, "ms, delay", lag_delay,
                   "ticks (per episode, per lane) | arm speed cap", lag_vmax,
                   "rad/s | elbow max", elbow_max)
+        if lag.per_joint or lag.has_off or lag.dt_hi > 0.0:
+            print("  servo per joint: tau", lag_tau_j, "ms | delay", lag_delay_j,
+                  "| cap", lag_vmax_j, "rad/s | offset", lag_off_j,
+                  "rad | period", lag_period, "ms")
         ctx.synchronize()
         var obs_dev = DeviceBuffer[DT](ctx, env.obs_ptr(), N_ENVS * E_OBS, owning=False)
         var act_dev = DeviceBuffer[DT](ctx, env.action_ptr(), N_ENVS * ACT_DIM, owning=False)

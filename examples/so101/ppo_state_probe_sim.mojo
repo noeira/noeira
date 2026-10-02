@@ -5,6 +5,7 @@
     build/ppo_state_probe --run runs/<ppo run dir> [--task T] [--seed S] [--episodes N]
         [--arm-pose "q0 q1 q2 q3 q4 q5" | FILE]  [--brick x,y] [--bowl x,y]
         [--lag-tau 50,50 --lag-delay 2,2] [--lag-vmax 1.1,1.1] [--elbow-max 1.56]
+        [--lag-tau-j "lo,hi;..." --lag-delay-j ... --lag-vmax-j ...] [--lag-offset-j "lo,hi;..."] [--lag-period lo,hi]
 
 The state teacher's counterpart of `pixel_student_probe_sim.mojo`, for the
 same gate: the real scene rebuilt (`--arm-pose` from the run's pose_0,
@@ -180,6 +181,12 @@ def main() raises:
         env.mf.curriculum.data[i] = Scalar[DT](cw[i])
     var lag = ServoLag.parse(1, _arg(args, "--lag-tau", ""), _arg(args, "--lag-delay", ""), period)
     lag.set_limits(_arg(args, "--lag-vmax", ""), Float64(_arg(args, "--elbow-max", "0")))
+    lag.set_per_joint(
+        _arg(args, "--lag-tau-j", ""), _arg(args, "--lag-delay-j", ""),
+        _arg(args, "--lag-vmax-j", ""),
+    )
+    lag.set_offset(_arg(args, "--lag-offset-j", ""))
+    lag.set_period(_arg(args, "--lag-period", ""))
     if lag.on:
         print("probe: servo lag tau", _arg(args, "--lag-tau", ""), "ms, delay",
               _arg(args, "--lag-delay", ""), "ticks | arm speed cap",
