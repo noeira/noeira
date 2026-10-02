@@ -479,6 +479,34 @@ def fetch_licenses(
             " whose terms did not travel with it"
         )
     print("  licences: " + String(len(want)) + " files -> " + out_dir)
+
+    # ⚠ WHICH SUB-DATASETS HAVE NO LICENCE TEXT OF THEIR OWN. Measured on
+    # the dump: it holds 49 licence files in all, and three sub-datasets are
+    # missing half their pair — `MOYO_smplh_gendered` has only a
+    # `citation.bib`, `SSM_synced` and `Transitions_mocap` only a
+    # `license.txt`. A missing `citation.bib` costs an attribution; a missing
+    # `license.txt` means that sub-dataset's TERMS are not in this store at
+    # all, and the two must not report the same way. Named, not counted: a
+    # tally of 49 looks complete.
+    var no_text = List[String]()
+    for j in range(len(subs)):
+        var found = False
+        for i in range(len(want)):
+            if (amass_subset_of(want[i]) == subs[j]
+                    and want[i].endswith("license.txt")):
+                found = True
+                break
+        if not found:
+            no_text.append(subs[j].copy())
+    if len(no_text) > 0:
+        var names = String("")
+        for j in range(len(no_text)):
+            names += (String(", ") if j > 0 else String("")) + no_text[j]
+        print(
+            "  ⚠ no `license.txt` in the dump for: " + names
+            + " — their terms are NOT in this store; check the AMASS source"
+            " before redistributing it"
+        )
     for i in range(len(want)):
         var dest = out_dir + "/" + String(want[i].replace("/", "__"))
         _ = hf_download_sized(
