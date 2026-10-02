@@ -71,6 +71,10 @@ struct _ScaleOutVisitor(ParamVisitor, ParamVisitorRT):
         ctx: Optional[DeviceContext],
     ) raises:
         if name == self.wname or name == self.bname:
+            # A written weight must advance `version`: `Linear`'s GPU forward
+            # reads a version-gated padded copy (`w_pad`) and would keep the
+            # old weight.
+            param.version += 1
             comptime if target == "cpu":
                 for k in range(n):
                     param.data[k] = self.scale * param.data[k]
