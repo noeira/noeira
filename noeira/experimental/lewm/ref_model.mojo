@@ -68,6 +68,9 @@ from noeira.nn import (
 )
 from noeira.nn.models.vit import PatchEmbed
 from noeira.nn.models.transformer import MultiHeadAttention, MultiHeadAttentionXL
+from noeira.nn.primitives.attention import ScaledDotProductAttention
+from noeira.nn.primitives.qkv_to_major import QKVToMajor
+from noeira.nn.primitives.hash_dropout import HashDropout
 from noeira.nn.primitives.batch_norm_1d import BN_DEFAULT_MOM, BN_DEFAULT_EPS
 
 
@@ -167,6 +170,32 @@ a per-token Linear, then Linear -> SiLU -> Linear. ONE SiLU."""
 
 # ── predictor block ───────────────────────────────────────────────────────
 
+comptime PRED_DROPOUT = 0.1
+"""`config/train/lewm.yaml` `predictor.dropout`: every dropout site of the
+predictor's blocks (`emb_dropout` is 0). Off unless the trainer switches
+`dropout` on: the torch gates, validation and planning run without it."""
+
+comptime AttnDropRef[EMB: Int, HEADS: Int, HEAD_DIM: Int, H: Int, P: Float64] = Sequential[
+    Tokenwise[H, Linear[EMB, 3 * HEADS * HEAD_DIM]],
+    QKVToMajor[H, HEADS * HEAD_DIM],
+    ScaledDotProductAttention[HEADS * HEAD_DIM, HEADS, H, True, True, DT, P],
+    Tokenwise[H, Linear[HEADS * HEAD_DIM, EMB]],
+    HashDropout[H * EMB, P],
+]
+"""`module.Attention`: causal SDPA with `dropout_p` on the weights, then
+`to_out` = Linear + Dropout. Same parameter paths as `MultiHeadAttentionXL`
+(`.0.0` qkv, `.3.0` out)."""
+
+comptime FFNDropRef[SEQ: Int, DIM: Int, FF: Int, P: Float64] = Sequential[
+    Tokenwise[SEQ, Linear[DIM, FF]],
+    GELU[SEQ * FF],
+    HashDropout[SEQ * FF, P],
+    Tokenwise[SEQ, Linear[FF, DIM]],
+    HashDropout[SEQ * DIM, P],
+]
+"""`module.FeedForward` minus its LayerNorm: Linear -> GELU -> Dropout ->
+Linear -> Dropout (the second Linear is `.3.0`)."""
+
 
 struct ConditionalTransformerBlockRef[
     EMB: Int, HEADS: Int, H: Int, FF: Int, HEAD_DIM: Int
@@ -179,7 +208,9 @@ struct ConditionalTransformerBlockRef[
         x = x + g2 * FFN ( LN_f( LN2(x)*(1+sc2)+sh2 ) )      LN_a/LN_f: affine, 1e-5
 
     Attention: causal, HEADS x HEAD_DIM inner (16 x 64 = 1024 for the paper).
-    FFN: Linear -> exact GELU -> Linear. Same wrapper as
+    FFN: Linear -> exact GELU -> Linear. Dropout (`PRED_DROPOUT`) on the
+    attention weights, after `to_out`, after the GELU and after the FFN —
+    off unless `set_attr["dropout"](1)`. Same wrapper as
     `nn.primitives.ConditionalTransformerBlock` (a Module around an internal
     ComputeGraph); only the graph differs — Mojo has no conditional type alias,
     so the variant is a sibling struct, not a flag."""
@@ -208,16 +239,14 @@ struct ConditionalTransformerBlockRef[
         Node["ln_a", Self.LNA, "mod1"],
         Node[
             "attn",
-            MultiHeadAttentionXL[
-                Self.EMB, Self.HEADS, Self.HEAD_DIM, Self.H, True
-            ],
+            AttnDropRef[Self.EMB, Self.HEADS, Self.HEAD_DIM, Self.H, PRED_DROPOUT],
             "ln_a",
         ],
         Node["x1", Gate[Self.SEQ_DIM], "x", "g1", "attn"],
         Node["ln2", Self.LN, "x1"],
         Node["mod2", Modulate[Self.SEQ_DIM], "ln2", "sc2", "sh2"],
         Node["ln_f", Self.LNA, "mod2"],
-        Node["mlp", FFNExact[Self.H, Self.EMB, Self.FF], "ln_f"],
+        Node["mlp", FFNDropRef[Self.H, Self.EMB, Self.FF, PRED_DROPOUT], "ln_f"],
         Node["x2", Gate[Self.SEQ_DIM], "x1", "g2", "mlp"],
     ]
 
@@ -235,7 +264,12 @@ struct ConditionalTransformerBlockRef[
         )
         var b = Self()
         b.graph = Self.Graph.make[target=target, INIT=INIT](ctx)
+        b.graph.set_attr["dropout"](Scalar[DT](0))  # see PRED_DROPOUT
         return b^
+
+    def set_attr[ATTR: StaticString](mut self, value: Scalar[DT]):
+        """Into the block's graph (`dropout`; nothing else listens here)."""
+        self.graph.set_attr[ATTR](value)
 
     def forward[
         target: StaticString, B: Int, o: MutOrigin, POLICY: AMPPolicy = NoAMP

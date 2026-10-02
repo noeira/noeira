@@ -121,7 +121,7 @@ def _rules():
             [f"predictor.transformer.layers.{m[1]}.mlp.net.0.{'weight' if m[2] == 'gamma' else 'bias'}"], same)),
         (r"pred_raw\.(\d+)\.mlp\.0\.0\.(weight|bias)", lambda m: (
             [f"predictor.transformer.layers.{m[1]}.mlp.net.1.{m[2]}"], T if m[2] == "weight" else same)),
-        (r"pred_raw\.(\d+)\.mlp\.2\.0\.(weight|bias)", lambda m: (
+        (r"pred_raw\.(\d+)\.mlp\.3\.0\.(weight|bias)", lambda m: (
             [f"predictor.transformer.layers.{m[1]}.mlp.net.4.{m[2]}"], T if m[2] == "weight" else same)),
         (r"pred_ln\.0\.(gamma|beta)", lambda m: (
             [f"predictor.transformer.norm.{'weight' if m[1] == 'gamma' else 'bias'}"], same)),

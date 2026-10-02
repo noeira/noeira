@@ -17,6 +17,8 @@ paper's dimensions:
     `exclude_bias_norm` defaults to False, so biases, LN / BN affines, the CLS
     token and the position embeddings decay too. `nn.Adam` skips params built
     with `apply_decay=False`; `_AdamWAll` forwards every one with decay on;
+  * the predictor's dropout 0.1 (`dropout`, off by default — the parity
+    gates run torch without it; `set_eval` / `set_train` switch it with BN);
   * activation checkpointing of the 12 ViT blocks (`checkpoint`, on by
     default): the encoder's memory is its block inputs plus one block;
   * SIGReg: a fresh projection matrix per step (`resample`, the default, like
@@ -27,7 +29,8 @@ Dropout: the reference trains the predictor with dropout 0.1; this graph has
 none. The parity gates run torch with dropout off (`dropout_off`).
 """
 
-from std.math import sqrt
+from std.math import sqrt, cos, pi
+from std.os import makedirs
 from std.time import perf_counter_ns
 from max.gpu import global_idx
 from max.gpu.host import DeviceContext, DeviceBuffer, HostBuffer
@@ -43,6 +46,7 @@ from .ref_model import LeWMLossGraphRef
 from .ref_load import LoadRef
 from noeira.nn.optimizer.grad_clip import _sum_sq_kernel_rt, GC_TPB
 from .trainer import _clip_scale_kernel
+from noeira.io.fileio import write_file_atomic
 
 
 comptime REF_T = 4
@@ -62,6 +66,23 @@ predictor 6 x (16 heads x 64), FF 2048, SIGReg 1024 projections x 17 knots."""
 
 
 comptime _HW = REF_IMG * REF_IMG
+
+
+def recipe_lr(step: Int, total_steps: Int, base_lr: Float64 = 5e-5) -> Float64:
+    """The learning rate `train.py` trains with at optimizer step `step` of
+    `total_steps` (= epochs x batches per epoch).
+
+    `scheduler: LinearWarmupCosineAnnealingLR` with stable-pretraining
+    0.1.7's defaults — warmup_steps = max(1, int(0.01 * total)), warmup from
+    0, cosine to eta_min 0 — stepped EVERY optimizer step: measured on the box
+    with spt + Lightning themselves (`train.py`'s `"interval": "epoch"` does
+    not make it per-epoch; the LR moved within the first epoch and matched
+    this formula at every logged step). Step 0 trains at LR 0."""
+    var w = max(1, Int(0.01 * Float64(total_steps)))
+    if step < w:
+        return base_lr * Float64(step) / Float64(w)
+    var t = Float64(step - w) / Float64(max(1, total_steps - w))
+    return base_lr * (1.0 + cos(pi * t)) / 2.0
 
 
 def _lewm_pixels_kernel(
@@ -251,6 +272,34 @@ struct _AdamWAll(ParamVisitor):
         )
 
 
+struct _DumpWriter(ParamVisitor):
+    """Every Param / State as `ours.<name>.bin` (float32 LE) + a manifest line —
+    the format `RefDump` / `load_ref` read, so a checkpoint loads where the
+    published weights do (`LeWMRefRollout`, the column-M runner's --dump)."""
+
+    var dir: String
+    var manifest: String
+
+    def __init__(out self, dir: String):
+        self.dir = dir
+        self.manifest = String("")
+
+    def visit[target: StaticString, N: Int](
+        mut self, name: String, mut param: Tensor, mut grad: Tensor,
+        mut m: Tensor, mut v: Tensor, apply_decay: Bool,
+        ctx: Optional[DeviceContext],
+    ) raises:
+        comptime if target == "gpu":
+            ctx.value().synchronize()
+            param.download(ctx.value())
+        var bytes = List[UInt8](capacity=N * 4)
+        var p = param.data.unsafe_ptr().bitcast[UInt8]()
+        for i in range(N * 4):
+            bytes.append(p[i])
+        write_file_atomic(self.dir + "/ours." + name + ".bin", bytes)
+        self.manifest += "ours." + name + "\t" + String(N) + "\n"
+
+
 @fieldwise_init
 struct RefStepStats(Copyable, Movable, Writable):
     var loss: Float64
@@ -282,6 +331,7 @@ struct LeWMRefTrainer[target: StaticString, B: Int](Movable):
     var norm_dev: Tensor
     """[norm, coef] of the last step's clip, on the device."""
     var norm_host: Float64
+    var dropout_on: Bool
     var profile: Bool
     """Synchronise between the stages of `train_step` and accumulate their
     wall time in `t_stage` (seconds): copy-in, forward, vjp, clip, AdamW."""
@@ -296,11 +346,16 @@ struct LeWMRefTrainer[target: StaticString, B: Int](Movable):
         sigreg_lambda: Float64 = 0.09,
         decay_all: Bool = True,
         checkpoint: Bool = True,
+        dropout: Bool = False,
     ) raises:
         comptime assert Self.target == "cpu" or Self.target == "gpu"
         self.graph = LeWMRefGraph.make[Self.target, Kaiming](ctx)
         # the 12 ViT blocks recompute their forward in the vjp (ref_model)
         self.graph.set_node_attr["emb", "checkpoint"](Scalar[DT](1 if checkpoint else 0))
+        # the predictor's dropout (ref_model.PRED_DROPOUT): the recipe trains
+        # with it; the torch parity gates run without
+        self.dropout_on = dropout
+        self.graph.set_node_attr["pred_raw", "dropout"](Scalar[DT](1 if dropout else 0))
         self.graph.set_node_attr["sig_s", "multiplier"](Scalar[DT](sigreg_lambda))
         self.graph.set_node_attr["sig", "resample"](Scalar[DT](1))
         self.opt = _AdamWAll(Scalar[DT](lr), Scalar[DT](wd), decay_all)
@@ -387,6 +442,70 @@ struct LeWMRefTrainer[target: StaticString, B: Int](Movable):
             self.pix_host[slot].unsafe_ptr()
         )
 
+    def set_eval(mut self):
+        """Lightning's `model.eval()`: BatchNorm on its running statistics,
+        no dropout."""
+        self.graph.set_attr["training"](Scalar[DT](0))
+        self.graph.set_node_attr["pred_raw", "dropout"](Scalar[DT](0))
+
+    def set_train(mut self):
+        self.graph.set_attr["training"](Scalar[DT](1))
+        self.graph.set_node_attr["pred_raw", "dropout"](Scalar[DT](1 if self.dropout_on else 0))
+
+    def eval_staged(mut self, act: List[Scalar[DT]], slot: Int = 0) raises -> RefStepStats:
+        """The validation loss on the frames in `staging(slot)`: forward only,
+        in eval mode (call `set_eval` first). grad_norm is 0."""
+        comptime assert Self.target == "gpu", "eval_staged: GPU only"
+        self._stage_in(act, slot)
+        self.graph.set_input["pixels", Self.B](self.pix, self.ctx)
+        self.graph.set_input["actions", Self.B](self.act, self.ctx)
+        self.graph.forward[Self.B, Self.target](self.loss, self.ctx)
+        var stats = RefStepStats(0.0, 0.0, 0.0, 0.0)
+        var c = self.ctx.value()
+        c.synchronize()
+        self.loss.download(c)
+        self.graph.node_output["pl"]().download(c)
+        self.graph.node_output["sig"]().download(c)
+        for b in range(Self.B):
+            stats.loss += Float64(self.loss.data[b])
+            stats.pred_loss += Float64(self.graph.node_output["pl"]().data[b])
+            stats.sigreg_loss += Float64(self.graph.node_output["sig"]().data[b])
+        stats.loss /= Float64(Self.B)
+        stats.pred_loss /= Float64(Self.B)
+        stats.sigreg_loss /= Float64(Self.B)
+        return stats^
+
+    def save_dump(mut self, dir: String) raises -> Int:
+        """Write every Param and BN State to `dir` (see `_DumpWriter`);
+        returns how many tensors."""
+        makedirs(dir, exist_ok=True)
+        var w = _DumpWriter(dir)
+        self.graph.for_each_param[Self.target](w, self.ctx)
+        self.graph.for_each_state[Self.target](w, self.ctx)
+        with open(dir + "/manifest.txt", "w") as f:
+            f.write(w.manifest)
+        var n = 0
+        for b in w.manifest.as_bytes():
+            if b == UInt8(ord("\n")):
+                n += 1
+        return n
+
+    def _stage_in(mut self, act: List[Scalar[DT]], slot: Int) raises:
+        """Staging slot -> device uint8 -> normalised `pix`; actions up."""
+        var c = self.ctx.value()
+        if len(self.pix_host) == 0:
+            raise Error("LeWMRefTrainer: call staging() and fill it first")
+        c.enqueue_copy(self.pix_u8.value(), self.pix_host[slot])
+        self.pix.ensure_gpu(c, Self.B * Self.PIX)
+        c.enqueue_function[_lewm_pixels_kernel](
+            self.pix_u8.value(),
+            self.pix.dev.value(),
+            Int64(Self.B * REF_T),
+            grid_dim=(Self.B * Self.PIX + TPB - 1) // TPB,
+            block_dim=TPB,
+        )
+        self._set_actions(act)
+
     def train_step_staged(mut self, act: List[Scalar[DT]], slot: Int = 0) raises -> RefStepStats:
         """`submit_staged` then `finish`."""
         self.submit_staged(act, slot)
@@ -401,19 +520,7 @@ struct LeWMRefTrainer[target: StaticString, B: Int](Movable):
         (With `profile` on, every stage synchronises.)"""
         comptime assert Self.target == "gpu", "submit_staged: GPU only"
         var t = Int(perf_counter_ns())
-        var c = self.ctx.value()
-        if len(self.pix_host) == 0:
-            raise Error("submit_staged: call staging() and fill it first")
-        c.enqueue_copy(self.pix_u8.value(), self.pix_host[slot])
-        self.pix.ensure_gpu(c, Self.B * Self.PIX)
-        c.enqueue_function[_lewm_pixels_kernel](
-            self.pix_u8.value(),
-            self.pix.dev.value(),
-            Int64(Self.B * REF_T),
-            grid_dim=(Self.B * Self.PIX + TPB - 1) // TPB,
-            block_dim=TPB,
-        )
-        self._set_actions(act)
+        self._stage_in(act, slot)
         self._lap(0, t)
         self._submit(t)
 

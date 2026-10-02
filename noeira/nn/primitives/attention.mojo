@@ -36,6 +36,7 @@ from layout import Layout, LayoutTensor, TileTensor, row_major
 from linalg.bmm import batched_matmul
 
 from noeira.nn.constants import DT, TPB
+from noeira.nn.random.hash_mask import hash_keep, new_dropout_seed
 from ..core.tensor import Tensor, TensorImpl
 from ..core.tensor_refs import TensorRefs
 from ..core.module import Module
@@ -455,6 +456,32 @@ def _attn_softmax_jvp_warp_kernel[
         j += WARP_SIZE
 
 
+def _attn_drop_kernel[SEQ: Int, SCORES: Int, TRANSPOSED: Bool](
+    buf: LayoutTensor[DT, Layout.row_major(SCORES), MutAnyOrigin],
+    seed: UInt64,
+    ctr: UInt64,
+    p: Float32,
+    scale: Scalar[DT],
+):
+    """Attention dropout on a (BH, SEQ, SEQ) slab: × 1/(1-p) where
+    `hash_keep(seed, ctr, bh·S² + i·S + j)`, else 0. TRANSPOSED: the slab is
+    laid out (bh, j, i) — the index is mapped back so the mask is the
+    forward's (`nn/random/hash_mask.mojo`)."""
+    var idx = Int(global_idx.x)
+    if idx >= SCORES:
+        return
+    var orig = idx
+    comptime if TRANSPOSED:
+        var i = idx % SEQ
+        var j = (idx // SEQ) % SEQ
+        var bh = idx // (SEQ * SEQ)
+        orig = bh * SEQ * SEQ + i * SEQ + j
+    var v = rebind[Scalar[DT]](buf.ptr[unsafe_offset=idx]) * scale
+    if not hash_keep(seed, ctr, UInt64(orig), p):
+        v = Scalar[DT](0)
+    buf.ptr[unsafe_offset=idx] = v
+
+
 def _attn_packed_t_kernel[BH: Int, SEQ: Int, HEAD_DIM: Int, PACKED: Int](
     dst: LayoutTensor[DT, Layout.row_major(PACKED), MutAnyOrigin],
     src: LayoutTensor[DT, Layout.row_major(PACKED), MutAnyOrigin],
@@ -658,7 +685,13 @@ struct ScaledDotProductAttention[
     CAUSAL: Bool = False,
     USE_MAX_KERNELS: Bool = True,
     ADT: DType = DT,
+    P_DROP: Float64 = 0.0,
 ](Module):
+    """`P_DROP` > 0: dropout on the attention WEIGHTS while training (torch's
+    `scaled_dot_product_attention(dropout_p=…)`): A·V uses a·m/(1-p) while the
+    cache keeps a for the softmax JVP; the mask is a counter hash
+    (`hash_mask.mojo`), redrawn in the vjp. Switched by `set_attr["dropout"]`
+    (ON by default); fp32 + the bmm path only. 0 compiles it out."""
     comptime ARITY: Int = 1
     # Activation-flow dtype (satisfies the Module trait). `ScaledDotProduct
     # Attention[D, H, S]` = fp32 (ACT_DT == DT, the legacy path, byte-identical);
@@ -695,6 +728,12 @@ struct ScaledDotProductAttention[
     var ss0: Tensor  # scores slot 0
     var ss1: Tensor  # scores slot 1
     var sp4: Tensor  # packed slot 4: Vᵀ for the backward's dout·Vᵀ
+    # attention dropout (P_DROP > 0): see the struct docstring
+    var drop_on: Bool
+    var drop_seed: UInt64
+    var drop_ctr: UInt64
+    var drop_ctr_fwd: UInt64
+    var drop_drew: Bool
 
     def __init__(out self):
         comptime assert (
@@ -708,6 +747,42 @@ struct ScaledDotProductAttention[
         self.ss0 = Tensor()
         self.ss1 = Tensor()
         self.sp4 = Tensor()
+        self.drop_on = True
+        self.drop_seed = new_dropout_seed()
+        self.drop_ctr = 0
+        self.drop_ctr_fwd = 0
+        self.drop_drew = False
+
+    def set_attr[ATTR: StaticString](mut self, value: Scalar[DT]):
+        """`dropout` (0/1): the attention dropout (P_DROP > 0 only)."""
+        comptime if ATTR == "dropout":
+            self.drop_on = value != Scalar[DT](0)
+
+    def _drop_begin(mut self):
+        """At each forward: draw a mask iff P_DROP > 0 and switched on."""
+        self.drop_drew = Self.P_DROP > 0.0 and self.drop_on
+        if self.drop_drew:
+            self.drop_ctr_fwd = self.drop_ctr
+            self.drop_ctr += 1
+
+    @staticmethod
+    def _drop_gpu[TRANSPOSED: Bool, BATCH: Int](
+        mut buf: Tensor, seed: UInt64, ctr: UInt64, c: DeviceContext
+    ) raises:
+        comptime SCORES = BATCH * Self.N_HEADS * Self.SEQ_LEN * Self.SEQ_LEN
+        c.enqueue_function[_attn_drop_kernel[Self.SEQ_LEN, SCORES, TRANSPOSED]](
+            buf.lt["gpu", Layout.row_major(SCORES)](),
+            seed, ctr, Float32(Self.P_DROP),
+            Scalar[DT](1.0 / (1.0 - Self.P_DROP)),
+            grid_dim=(SCORES + TPB - 1) // TPB, block_dim=TPB,
+        )
+
+    @always_inline
+    def _drop_scale(self, idx: Int) -> Scalar[DT]:
+        """CPU: the mask value (0 or 1/(1-p)) of score element `idx`."""
+        if hash_keep(self.drop_seed, self.drop_ctr_fwd, UInt64(idx), Float32(Self.P_DROP)):
+            return Scalar[DT](1.0 / (1.0 - Self.P_DROP))
+        return Scalar[DT](0)
 
     @staticmethod
     def make[
@@ -759,6 +834,11 @@ struct ScaledDotProductAttention[
         ctx: Optional[DeviceContext] = None,
     ) raises:
         ref in0 = inputs[0]
+        comptime if Self.P_DROP > 0.0:
+            comptime assert Self.ACT_DT == DT and Self.USE_MAX_KERNELS, (
+                "attention dropout: fp32 bmm path only"
+            )
+        self._drop_begin()
         comptime if Self.ACT_DT == DT:
             # ── fp32 path (legacy NoAMP, byte-identical) ──
             # The CPU helpers are fp32-only (`Tensor`) → rebind the activation
@@ -873,6 +953,11 @@ struct ScaledDotProductAttention[
             grid_dim=attn_warp_rows_grid(BH * Self.SEQ_LEN), block_dim=TPB,
         )
 
+        # 3b. attention dropout on the A·V operand (cache.attn keeps a).
+        comptime if Self.P_DROP > 0.0:
+            if self.drop_drew:
+                Self._drop_gpu[False, B](self.ss0, self.drop_seed, self.drop_ctr_fwd, c)
+
         # 4. packed_out = attn @ V.
         bmm_tiled[BH=BH, M=Self.SEQ_LEN, N=Self.HEAD_DIM, K=Self.SEQ_LEN](
             self.sp3.dev.value(), self.ss0.dev.value(), self.sp2.dev.value(), c
@@ -979,6 +1064,12 @@ struct ScaledDotProductAttention[
                         for j in range(i + 1, Self.SEQ_LEN):
                             sc[row + j] = Scalar[DT](0)
                             cp[crow + j] = Scalar[DT](0)
+
+        # 3b. attention dropout on the A·V operand (cache.attn keeps a).
+        comptime if Self.P_DROP > 0.0:
+            if self.drop_drew:
+                for k in range(SCORES):
+                    sc[k] = sc[k] * self._drop_scale(k)
 
         # 4. packed_out = attn @ V  (BH, SEQ, HEAD_DIM).
         var pout_tt = TileTensor(
@@ -1155,6 +1246,11 @@ struct ScaledDotProductAttention[
             self.ss0.dev.value(), self.sp0.dev.value(), self.sp4.dev.value(), c
         )
 
+        # 2b. dropout: d(a) = d(a·m/(1-p)) · m/(1-p).
+        comptime if Self.P_DROP > 0.0:
+            if self.drop_drew:
+                Self._drop_gpu[False, B](self.ss0, self.drop_seed, self.drop_ctr_fwd, c)
+
         # 3. softmax jvp → dscore(ss1)  (reads dattn(ss0)).
         comptime jvp_k = _attn_softmax_jvp_warp_kernel[
             B, Self.N_HEADS, SL, HD, Self.CACHE_SIZE, SCORES, BH,
@@ -1175,6 +1271,11 @@ struct ScaledDotProductAttention[
             self.cache.lt["gpu", lay_c](),
             grid_dim=sblocks, block_dim=TPB,
         )
+
+        # 4b. dropout: dV takes the DROPPED weights (a·m/(1-p))ᵀ.
+        comptime if Self.P_DROP > 0.0:
+            if self.drop_drew:
+                Self._drop_gpu[True, B](self.ss0, self.drop_seed, self.drop_ctr_fwd, c)
 
         # 5. dV(sp3) = attn_T(ss0) @ dout(sp0)  (sp3 free — pv last read step 2).
         bmm_tiled[BH=BH, M=SL, N=HD, K=SL](
@@ -1266,6 +1367,12 @@ struct ScaledDotProductAttention[
             dattn_tt, pdout_tt, pv_tt
         )
 
+        # 2b. dropout: d(a) = d(a·m/(1-p)) · m/(1-p).
+        comptime if Self.P_DROP > 0.0:
+            if self.drop_drew:
+                for k in range(SCORES):
+                    dattn[k] = dattn[k] * self._drop_scale(k)
+
         # 3. softmax jvp (scalar): dscore = scale*a*(dattn - Σ_k a_k*dattn_k).
         #    a is cache.attn (causal upper-triangle already zeroed) → dscore is
         #    automatically zero where masked. Also build attn_T / dscore_T.
@@ -1283,7 +1390,11 @@ struct ScaledDotProductAttention[
                     for j in range(SL):
                         var a = cp[crow + j]
                         dscore[row + j] = scale * a * (dattn[row + j] - s)
-                        attn_T[sc_base + j * SL + i] = a
+                        var a_used = a
+                        comptime if Self.P_DROP > 0.0:
+                            if self.drop_drew:
+                                a_used = a * self._drop_scale(row + j)
+                        attn_T[sc_base + j * SL + i] = a_used
                         dscore_T[sc_base + j * SL + i] = dscore[row + j]
 
         # 4. dV = attn_T @ dout.
