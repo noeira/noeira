@@ -277,6 +277,136 @@ def _roll[
     return Roll(s_soft / Float64(n), s_hard / Float64(n), acc, qmin, qmax)
 
 
+comptime TRANS_FROM: Int = 100
+"""Steps of `walk` before the switch — 2 s at 50 Hz, enough for the gait to
+establish so the transition measured is from MOVING and not from a start-up."""
+comptime TRANS_AFTER: Int = 100
+"""Steps scored after the switch — 2 s, which is how long the room session
+measured the post-stop shuffle lasting."""
+comptime TRANS_TAIL: Int = 50
+"""The last 1 s, for the residual speed."""
+
+
+@fieldwise_init
+struct Trans(Copyable, Movable):
+    var drift: Float64
+    """Metres the root travelled from the switch point in `TRANS_AFTER` steps."""
+    var end_v: Float64
+    """Mean speed over the last `TRANS_TAIL` steps — what is left moving."""
+
+
+def _roll_transition[
+    FNET: Module, BNET: Module, ANET: Module
+](
+    mut t: FBTrainer[FNET, BNET, ANET, OBS, ACT, D, BATCH, "cpu"],
+    mut env: UnitreeG1[DType.float64],
+    ref rsi: G1RsiTable,
+    ref norm: Optional[ObsNorm[OBS]],
+    start_row: Int,
+    # ⚠ ONE LIST, TWO OFFSETS — Mojo rejects two aliasing `ref` arguments, and
+    # both latents live in the same `zship` array. Same shape as `g1_slerp_z`,
+    # and for the same reason (§12.49).
+    ref zs: List[Scalar[DT]],
+    from_off: Int,
+    to_off: Int,
+    mut obs_t: Tensor,
+    mut z1: Tensor,
+    mut act_out: Tensor,
+    mut qp: List[Float64],
+    mut qv: List[Float64],
+) raises -> Trans:
+    """Roll `z_from` until the gait is established, SWITCH to `z_to`, and
+    measure what the robot does on the way into it.
+
+    ⚠ WHY THIS EXISTS: THE FOUR GATES CANNOT SEE A TRANSITION. `_roll` scores
+    `step >= horizon - HOLD`, i.e. the last 40 of 150 steps, so the first 2.2 s
+    are an unscored settle window — by construction. Every `achieved` and every
+    `hold` in the bank is therefore a STEADY-STATE number measured after the
+    robot has already converged.
+
+    The room session measured what that hides, on rows this bank calls good:
+    `stand` ships at `body_speed 0.0009` while the room sees **0.2-0.3 m/s for
+    about 2 s** after `stand` is commanded; `walk_straight` runs out 0.82 m
+    against `walk`'s 0.40; `turn_left_still` slides 0.60 m entering from stand
+    against a steady-state speed of 0.075. All true, all invisible here.
+
+    ⚠ AND IT DOES NOT GATE ANYTHING. It is a COLUMN, reported beside the
+    others and written into the bank file, because the useful thing is not
+    rejecting rows — it is letting a planner brake early by a row's OWN
+    measured run-out. The room sized its goal regions to +-0.65 m precisely
+    because stopping is imprecise; a per-row number is what replaces that
+    guess. Inventing a threshold here instead would be a constant tuned by
+    patience rather than by evidence.
+    """
+    var base = start_row * (G1_RSI_NQ + G1_RSI_NV)
+    for i in range(NQ):
+        qp[i] = Float64(rsi.rows.data[base + i])
+    for i in range(NV):
+        qv[i] = Float64(rsi.rows.data[base + G1_RSI_NQ + i])
+    env.set_state(qp, qv)
+    var aobs = G1ActorObs()
+    # ⚠ IDENTICAL RESET TO `_roll`, including the actor's 401-dim history, or
+    # this measures a start state rather than a transition (§12.49-12.51).
+    for k in range(D):
+        z1.data[k] = zs[from_off + k]
+    for _ in range(TRANS_FROM):
+        var o = env.get_obs_list()
+        aobs.fill[OBS=OBS](o, obs_t)
+        if norm:
+            norm.value().apply_rows(obs_t, 1)
+        t.act[1](obs_t, z1, act_out)
+        # ⚠ CLAMPED, EXACTLY AS `_roll` DOES. An unclamped action is a
+        # different actuation, so a transition measured without the clamp
+        # would describe a robot the four gates never scored.
+        var a = ContAction[ACT]()
+        for k in range(ACT):
+            var v = Float64(act_out.data[k])
+            if v > 1.0:
+                v = 1.0
+            elif v < -1.0:
+                v = -1.0
+            a.data[k] = v
+        aobs.push(o, act_out)
+        _ = env.step(a)
+    # the switch point, in WORLD coordinates — the one quantity the privileged
+    # vector does not carry (§3.2), read straight off the simulator
+    var x0 = Float64(env.d.qpos.data[0])
+    var y0 = Float64(env.d.qpos.data[1])
+    for k in range(D):
+        z1.data[k] = zs[to_off + k]
+    var vsum = 0.0
+    var vn = 0
+    for step in range(TRANS_AFTER):
+        var o = env.get_obs_list()
+        aobs.fill[OBS=OBS](o, obs_t)
+        if norm:
+            norm.value().apply_rows(obs_t, 1)
+        t.act[1](obs_t, z1, act_out)
+        # ⚠ CLAMPED, EXACTLY AS `_roll` DOES. An unclamped action is a
+        # different actuation, so a transition measured without the clamp
+        # would describe a robot the four gates never scored.
+        var a = ContAction[ACT]()
+        for k in range(ACT):
+            var v = Float64(act_out.data[k])
+            if v > 1.0:
+                v = 1.0
+            elif v < -1.0:
+                v = -1.0
+            a.data[k] = v
+        aobs.push(o, act_out)
+        _ = env.step(a)
+        if step >= TRANS_AFTER - TRANS_TAIL:
+            var vx = Float64(env.d.qvel.data[0])
+            var vy = Float64(env.d.qvel.data[1])
+            vsum += sqrt(vx * vx + vy * vy)
+            vn += 1
+    var dx = Float64(env.d.qpos.data[0]) - x0
+    var dy = Float64(env.d.qpos.data[1]) - y0
+    return Trans(
+        sqrt(dx * dx + dy * dy), vsum / Float64(vn) if vn > 0 else 0.0
+    )
+
+
 def _add(
     mut names: List[String], mut groups: List[String], mut ngoal: List[Int],
     mut terms: List[List[G1Term]],
@@ -645,12 +775,17 @@ def main() raises:
     # guard watched 20 -> 20 while `run` and `back` were being replaced by
     # two new entries. A count is not coverage.
     var ok_flag = List[Bool](length=len(names), fill=False)
+    # ⚠ THE SHIPPED LATENTS, RETAINED. They were written straight to text as
+    # each row was accepted, so nothing held them — and the transition column
+    # needs `walk`'s in order to roll INTO a row from a moving start.
+    var zship = List[Scalar[DT]](length=len(names) * D, fill=Scalar[DT](0))
     var t0 = perf_counter_ns()
     print("-" * 104)
     print("  " + _pad(String("command"), 21) + _pad(String("group"), 12)
           + _lpad(String("ESS"), 7) + _lpad(String("scaf->cmd"), 20)
           + _lpad(String("hard0"), 8) + _lpad(String("hardCEM"), 9)
-          + _lpad(String("soft gain"), 11) + _lpad(String("shipped"), 9) + "  verdict")
+          + _lpad(String("soft gain"), 11) + _lpad(String("shipped"), 9)
+          + _lpad(String("drift"), 8) + _lpad(String("endv"), 7) + "  verdict")
 
     for c in range(ncmd):
         if only != "" and names[c] != only:
@@ -859,12 +994,38 @@ def main() raises:
         if not mean_ok:
             print(line + "  REJECT: the shipped MEAN breaks its own compound (" + why + ")")
             continue
-        print(line + _lpad(_f3(ship.q[gq]), 9) + "  ok (" + kept + ")")
+        # ⚠ the accept line is printed BELOW, after the transition column has
+        # been measured — appending to `line` after printing it is how the two
+        # new numbers went missing on the first run.
         if only != "":
             print("      per-step range of " + g1_vocab_name(gq) + ": "
                   + _f3(ship.qmin[gq]) + " .. " + _f3(ship.qmax[gq]))
         n_ok += 1
         ok_flag[c] = True
+        for k in range(D):
+            zship[c * D + k] = zb[k]
+
+        # ⚠ THE TRANSITION COLUMN — MEASURED, NOT GATED. See
+        # `_roll_transition`: the four gates score only the last 40 of 150
+        # steps, so every number above is steady-state and the approach to a
+        # command is invisible. This rolls `walk` for 2 s, switches to the row
+        # being shipped, and reports how far the robot travels and what is
+        # still moving. It cannot change any verdict — it runs AFTER the
+        # accept — and it is written into the bank so a planner can brake by a
+        # row's own run-out instead of by a global guess.
+        var tr = Trans(0.0, 0.0)
+        var widx = -1
+        for wi in range(ncmd):
+            if names[wi] == "walk":
+                widx = wi
+        if widx >= 0 and ok_flag[widx]:
+            try:
+                tr = _roll_transition[FNet, BNet, ANet](
+                    t, env, rsi, norm, start_row, zship, widx * D, c * D,
+                    obs_t, z1, act_out, qp, qvel,
+                )
+            except e:
+                print("    transition not measured:", String(e))
 
         entries += String("name ") + names[c] + String("\n")
         entries += String("group ") + groups[c] + String("\n")
@@ -885,6 +1046,14 @@ def main() raises:
         for q in range(G1_NVOC):
             entries += String(" ") + String(r_b.q[q])
         entries += String("\n")
+        print(line + _lpad(_f3(ship.q[gq]), 9) + _lpad(_f3(tr.drift), 8)
+              + _lpad(_f3(tr.end_v), 7) + "  ok (" + kept + ")")
+        # ⚠ WRITTEN INTO THE BANK, because the useful thing is not a verdict
+        # but a number a planner can brake by: the room sized its goal regions
+        # to +-0.65 m because stopping is imprecise, and a per-row run-out is
+        # what replaces that guess.
+        entries += String("transition ") + String(tr.drift) + String(" ") \
+                   + String(tr.end_v) + String("\n")
         entries += String("z")
         for k in range(D):
             entries += String(" ") + String(Float64(zb[k]))

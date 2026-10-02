@@ -66,6 +66,23 @@ struct G1CommandBank(Movable):
     var t_goal: List[Bool]
     var t_start: List[Int]
     var t_count: List[Int]
+    var drift: List[Float64]
+    """Metres the root travels in the 2 s AFTER this row is commanded from a
+    MOVING start, or -1 for a bank built before the column existed.
+
+    ⚠ THIS IS THE ONE NUMBER THE FOUR GATES CANNOT SEE. They score the last 40
+    of 150 steps, so every `achieved` and `hold` is steady-state, measured once
+    the robot has converged — `stand` ships at `body_speed 0.0009` while the
+    room session measured **0.2-0.3 m/s for about 2 s** after `stand` is
+    commanded. Both are true; only this one predicts where the robot stops.
+
+    ⚠ IT GATES NOTHING, deliberately. The useful thing is not rejecting a row
+    but letting a planner command `stand` EARLY by the row's own run-out: the
+    room sized its goal regions to +-0.65 m because stopping is imprecise, and
+    a per-row number is what replaces that guess. A threshold invented here
+    instead would be a constant tuned by patience rather than by evidence."""
+    var end_v: List[Float64]
+    """Mean speed over the last 1 s of that window — what is still moving."""
 
     def __init__(out self):
         self.names = List[String]()
@@ -82,6 +99,8 @@ struct G1CommandBank(Movable):
         self.t_goal = List[Bool]()
         self.t_start = List[Int]()
         self.t_count = List[Int]()
+        self.drift = List[Float64]()
+        self.end_v = List[Float64]()
 
     def __init__(out self, *, deinit move: Self):
         self.names = move.names^
@@ -98,6 +117,8 @@ struct G1CommandBank(Movable):
         self.t_goal = move.t_goal^
         self.t_start = move.t_start^
         self.t_count = move.t_count^
+        self.drift = move.drift^
+        self.end_v = move.end_v^
 
     @staticmethod
     def load(path: String) raises -> G1CommandBank:
@@ -107,6 +128,10 @@ struct G1CommandBank(Movable):
         var pending_name = String("")
         var pending_group = String("")
         var pending_hard = 0.0
+        # -1 marks a bank built before the transition column existed, so a
+        # consumer can tell 'not measured' from 'measured as zero'.
+        var pending_drift = -1.0
+        var pending_endv = -1.0
         var pending_start = 0
         var lines = txt.split("\n")
         for li in range(len(lines)):
@@ -145,6 +170,11 @@ struct G1CommandBank(Movable):
                 if len(p) >= 3:
                     pending_hard = Float64(String(p[2]))
                 continue
+            if l.startswith("transition "):
+                if len(p) >= 3:
+                    pending_drift = Float64(String(p[1]))
+                    pending_endv = Float64(String(p[2]))
+                continue
             if l.startswith("z "):
                 # ⚠ the row must be exactly `dim` wide. A short row would
                 # otherwise slide every later command's `z` by its shortfall
@@ -162,6 +192,10 @@ struct G1CommandBank(Movable):
                 self.names.append(pending_name)
                 self.groups.append(pending_group)
                 self.hard.append(pending_hard)
+                self.drift.append(pending_drift)
+                self.end_v.append(pending_endv)
+                pending_drift = -1.0
+                pending_endv = -1.0
                 self.t_start.append(pending_start)
                 self.t_count.append(len(self.t_q) - pending_start)
                 continue
@@ -195,6 +229,18 @@ struct G1CommandBank(Movable):
 
     def group_at(self, i: Int) -> String:
         return self.groups[i]
+
+    def drift_at(self, i: Int) -> Float64:
+        """Metres this row travels in the 2 s after it is commanded from a
+        moving start, or **-1 when it was never measured** — a bank built
+        before the column existed. ⚠ A caller must branch on -1 rather than
+        treat it as zero: "stops instantly" and "nobody measured it" are
+        different claims, and only one of them is safe to brake on."""
+        return self.drift[i]
+
+    def end_v_at(self, i: Int) -> Float64:
+        """Mean speed over the last 1 s of that window, or -1."""
+        return self.end_v[i]
 
     def hold_at(self, i: Int) -> Float64:
         """The fraction of the scored window this command held its compound
