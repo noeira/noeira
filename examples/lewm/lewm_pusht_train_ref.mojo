@@ -113,6 +113,35 @@ def _save_resume[BB: Int](
     print("  resume state ->", slot, "(step", step, ", epoch", ep, ", next batch", s_next, ";", n, "moment tensors )")
 
 
+def _validate[BB: Int](
+    mut tr: LeWMRefTrainer["gpu", BB], h5: String, val_idx: List[Scalar[DT]], n_val: Int,
+    am: List[Float32], asd: List[Float32],
+    stages: List[Pointer[Scalar[DType.uint8], MutAnyOrigin]],
+) raises -> List[Float64]:
+    """Mean loss / pred / SIGReg over the first `n_val` batches of the
+    validation split, in eval mode (BN running stats, no dropout)."""
+    var vuse = List[Int](capacity=n_val * BB)
+    for k in range(n_val * BB):
+        vuse.append(Int(val_idx[k]))
+    var vloader = LewmBatchLoaderThread[BB](h5, vuse, am, asd, stages)
+    tr.set_eval()
+    vloader.request(0)
+    var v = List[Float64](length=3, fill=0.0)
+    for s in range(n_val):
+        _ = vloader.wait(s)
+        if s + 1 < n_val:
+            vloader.request(s + 1)
+        var r = tr.eval_staged(vloader.actions(s), s % 2)
+        v[0] += r.loss
+        v[1] += r.pred_loss
+        v[2] += r.sigreg_loss
+    vloader.stop()
+    tr.set_train()
+    for k in range(3):
+        v[k] /= Float64(max(1, n_val))
+    return v^
+
+
 def main() raises:
     var h5 = String("/workspace/lewm_session_a/stablewm/pusht_expert_train.h5")
     var split = String("/workspace/lewm_split")
@@ -129,6 +158,7 @@ def main() raises:
     var min_gb = 3.0
     var abort_at = -1        # test: raise at this global step (a "crash")
     var verify_resume = False  # test: re-save right after a resume
+    var eval_only = False    # validate `--init` and exit (e.g. the published weights)
     var args = argv()
     var i = 1
     while i < len(args):
@@ -159,6 +189,8 @@ def main() raises:
             save_every = Int(String(args[i + 1])); i += 1
         elif a == "--abort-at":
             abort_at = Int(String(args[i + 1])); i += 1
+        elif a == "--eval-only":
+            eval_only = True
         elif a == "--verify-resume":
             verify_resume = True
         elif a == "--min-free-gb":
@@ -228,6 +260,10 @@ def main() raises:
           "=", total, "steps; train", len(train_idx), "clips, val", n_val, "batches")
     print("  init", init, "(", n, "tensors );  action stats", am[0], am[1], asd[0], asd[1])
 
+    if eval_only:
+        var v = _validate(tr, h5, val_idx, n_val, am, asd, stages)
+        print("  eval-only", init, ": val loss", v[0], " pred", v[1], " sigreg", v[2], "over", n_val, "batches")
+        return
     var t_all = perf_counter_ns()
     var step_start = step
     for ep in range(ep0, epochs):
@@ -283,26 +319,7 @@ def main() raises:
                 _save_resume(tr, out, step, ep, s + 1, min_gb)
         loader.stop()
 
-        # validation: eval mode, the reference's held-out clips
-        var vuse = List[Int](capacity=n_val * B)
-        for k in range(n_val * B):
-            vuse.append(Int(val_idx[k]))
-        var vloader = LewmBatchLoaderThread[B](h5, vuse, am, asd, stages)
-        tr.set_eval()
-        vloader.request(0)
-        var v = List[Float64](length=3, fill=0.0)
-        for s in range(n_val):
-            _ = vloader.wait(s)
-            if s + 1 < n_val:
-                vloader.request(s + 1)
-            var r = tr.eval_staged(vloader.actions(s), s % 2)
-            v[0] += r.loss
-            v[1] += r.pred_loss
-            v[2] += r.sigreg_loss
-        vloader.stop()
-        tr.set_train()
-        for k in range(3):
-            v[k] /= Float64(max(1, n_val))
+        var v = _validate(tr, h5, val_idx, n_val, am, asd, stages)
         vlog += String(ep) + "," + String(v[0]) + "," + String(v[1]) + "," + String(v[2]) + "\n"
         with open(out + "/val_log.csv", "w") as f:
             f.write(vlog)
