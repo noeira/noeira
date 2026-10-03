@@ -158,11 +158,29 @@ def render_pusht_swm_canvas(
     agent_x: Float64, agent_y: Float64,
 ) -> List[UInt8]:
     """The 512 x 512 x 3 uint8 canvas, before the resize."""
+    return render_pusht_swm_canvas_goal(
+        block_x, block_y, block_angle, agent_x, agent_y,
+        PConstants.GOAL_X, PConstants.GOAL_Y, PConstants.GOAL_ANGLE,
+    )
+
+
+def render_pusht_swm_canvas_goal(
+    block_x: Float64, block_y: Float64, block_angle: Float64,
+    agent_x: Float64, agent_y: Float64,
+    goal_x: Float64, goal_y: Float64, goal_angle: Float64,
+    goal_agent_x: Float64 = -1.0, goal_agent_y: Float64 = -1.0,
+) -> List[UInt8]:
+    """The canvas with the green goal T at an arbitrary ORIGIN pose — for
+    displays of the LeWM protocol, whose goal is a dataset state, not the
+    env's fixed goal (the model is fed the dataset's goal FRAME; this is for
+    people). A goal agent position >= 0 adds a faint disc there."""
     var canvas = List[UInt8](length=CANVAS * CANVAS * 3, fill=UInt8(255))
     # goal (filled, no outline)
-    var goal = _t_polys_world(PConstants.GOAL_X, PConstants.GOAL_Y, PConstants.GOAL_ANGLE)
+    var goal = _t_polys_world(goal_x, goal_y, goal_angle)
     for k in range(2):
         _fill_polygon(canvas, goal[2 * k], goal[2 * k + 1], 144, 238, 144)
+    if goal_agent_x >= 0.0:
+        _fill_disc(canvas, Int(round(goal_agent_x)), Int(round(goal_agent_y)), 15, 200, 214, 250)
     # walls: the static segments, radius 2, LightGray
     _fat_segment(canvas, 5, 506, 5, 5, 2.0, 211, 211, 211)
     _fat_segment(canvas, 5, 5, 506, 5, 2.0, 211, 211, 211)

@@ -24,7 +24,12 @@ nothing of theirs but the weights:
 
     pixi run -e nvidia mojo run -I . examples/lewm/lewm_pusht_column_m.mojo \\
         [--dump /tmp/lewm_ref] [--fixture ~/.cache/noeira/lewm_pusht/session_a/out/fixture] \\
-        [--episodes 50] [--seed 0]
+        [--episodes 50] [--seed 0] [--video DIR]
+
+`--video DIR`: one mp4 per pair, `pair_<e>_success.mp4` / `_fail.mp4`, every
+env step (10 fps) drawn on swm's 512 canvas with the PAIR's goal — the dataset
+state the success test compares against: the T in green, the agent's goal
+position as a faint disc.
 """
 
 from std.sys import argv
@@ -39,7 +44,10 @@ from noeira.nn.constants import DT
 from noeira.nn.core.initializer import Kaiming
 from noeira.deep_agents.act.refload import RefDump
 from noeira.envs.pusht import PushTEnv, PushTAction
-from noeira.envs.pusht.render_swm import render_pusht_swm_at
+from noeira.envs.pusht.render_swm import render_pusht_swm_at, render_pusht_swm_canvas_goal
+from noeira.io.video.encoder import VideoEncoder
+from noeira.io.fileio import rename_over
+from std.os import makedirs
 from noeira.experimental.lewm.ref_load import load_ref
 from noeira.experimental.lewm.ref_rollout import (
     LeWMRefRollout, RefEncoder, encode_ref, cem_step, REF_EMB, REF_ACT,
@@ -123,11 +131,22 @@ def _success(mut env: PushTEnv[F], goal: List[Scalar[DT]], g: Int) -> Bool:
     return sqrt(d) < 20.0 and a < pi / 9.0
 
 
+def _video_frame(mut env: PushTEnv[F], goal: List[Scalar[DT]], e: Int) -> List[UInt8]:
+    var ag = env.agent_pos()
+    var bp = env.block_pose()
+    return render_pusht_swm_canvas_goal(
+        Float64(bp[0]), Float64(bp[1]), Float64(bp[2]), Float64(ag[0]), Float64(ag[1]),
+        Float64(goal[e * 7 + 2]), Float64(goal[e * 7 + 3]), Float64(goal[e * 7 + 4]),
+        Float64(goal[e * 7 + 0]), Float64(goal[e * 7 + 1]),
+    )
+
+
 def main() raises:
     var dump = String("/tmp/lewm_ref")
     var fixture = getenv("HOME") + "/.cache/noeira/lewm_pusht/session_a/out/fixture"
     var n_eps = 50
     var seed: UInt64 = 0
+    var video = String("")
     var args = argv()
     var i = 1
     while i < len(args):
@@ -138,6 +157,8 @@ def main() raises:
             fixture = String(args[i + 1]); i += 1
         elif a == "--episodes":
             n_eps = Int(String(args[i + 1])); i += 1
+        elif a == "--video":
+            video = String(args[i + 1]); i += 1
         elif a == "--seed":
             seed = UInt64(Int(String(args[i + 1]))); i += 1
         i += 1
@@ -174,6 +195,9 @@ def main() raises:
             agent_vy=Scalar[F](start_state[e * 7 + 6]),
             settle=True,
         )
+        var clip = List[List[UInt8]]()  # --video: the episode's frames
+        if video.byte_length() > 0:
+            clip.append(_video_frame(env, goal_state, e))
         var goal_emb = encode_ref[TARGET, 1](
             enc, _imagenet_from_hwc255(goal_pix, e * HW * 3), ctx
         )
@@ -206,11 +230,21 @@ def main() raises:
                         Scalar[F](Float64(ag[1]) + 100.0 * ay),
                     ))
                     step += 1
+                    if video.byte_length() > 0:
+                        clip.append(_video_frame(env, goal_state, e))
                     if _success(env, goal_state, e):
                         ok = True
         if ok:
             n_success += 1
         successes.append(ok)
+        if video.byte_length() > 0:
+            makedirs(video, exist_ok=True)
+            var tmp = video + "/pair_" + String(e) + "_tmp.mp4"
+            var venc = VideoEncoder(tmp, 512, 512, fps=10)
+            for ref fr in clip:
+                venc.add_frame_list(fr)
+            _ = venc.close()
+            rename_over(tmp, video + "/pair_" + String(e) + ("_success" if ok else "_fail") + ".mp4")
         print("  pair", e, "success" if ok else "FAIL", " (", replan, "replans,",
               Float64(perf_counter_ns() - t0) / 1e9, "s )  running", n_success, "/", e + 1)
     print("Column M:", n_success, "/", n_eps, "=", 100.0 * Float64(n_success) / Float64(n_eps), "%",
