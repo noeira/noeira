@@ -27,7 +27,7 @@ against the same agent config, so the buffer layout is fixed by
 construction.
 
 Concrete implementations live next to the agent that owns the world
-model — e.g. ``noeira/experimental/lewm/lewm_rollout_callback.mojo``
+model — e.g. a LeWM rollout (``noeira/experimental/lewm/ref_rollout.mojo``)
 wraps LeWM's autoregressive MPC shot. New planners (MPPI, iLQR) can
 reuse the same traits when they need host-side scoring; planners that
 keep the rollout fully on-device (the planned ``GPUMCTS``) don't use

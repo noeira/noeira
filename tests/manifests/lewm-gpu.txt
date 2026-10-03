@@ -1,21 +1,11 @@
 # LeWM GPU manifest — `pixi run -e apple test-lewm-gpu` (or -e nvidia)
 #
-# Toy-dim GPU paths of the LeWM port: trainer, encoder, MPC, closed loop,
-# paper protocol and AdaJEPA TTA wiring. Each runs on Apple Metal.
-tests/experimental/lewm/lewm/test_encoder_cls.mojo
-tests/experimental/lewm/lewm/test_trainer_gpu.mojo
-tests/experimental/lewm/lewm/test_trainer_gpu_scale.mojo
-tests/experimental/lewm/lewm/test_eval_gpu.mojo
-tests/experimental/lewm/lewm/test_mpc_gpu.mojo
+# GPU paths of the LeWM port that need no torch dump: frames, windows and
+# the reconstruction probe; then the framework gates the port depends on.
 tests/experimental/lewm/lewm/test_pixel_convert_gpu.mojo
 tests/experimental/lewm/lewm/test_window_source_hwc.mojo
 tests/experimental/lewm/lewm/test_decoder.mojo
-tests/experimental/lewm/lewm/test_decode_integration.mojo
 tests/experimental/lewm/lewm/test_pong_data_gpu.mojo
-tests/experimental/lewm/lewm/test_closedloop.mojo
-tests/experimental/lewm/lewm/test_closedloop_tta.mojo
-tests/experimental/lewm/lewm/test_paper_protocol.mojo
-tests/experimental/lewm/lewm/test_paper_protocol_tta.mojo
 
 # --- framework gates LeWM depends on (P2) ---
 tests/nn/test_layer_norm_eps_gpu.mojo

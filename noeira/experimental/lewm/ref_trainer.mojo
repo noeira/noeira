@@ -34,7 +34,7 @@ from std.os import makedirs
 from std.time import perf_counter_ns
 from max.gpu import global_idx
 from max.gpu.host import DeviceContext, DeviceBuffer, HostBuffer
-from layout import Layout
+from layout import Layout, LayoutTensor
 
 from noeira.nn.constants import DT, TPB
 from noeira.nn.core.tensor import Tensor
@@ -45,7 +45,6 @@ from noeira.deep_agents.act.refload import RefDump, _fill
 from .ref_model import LeWMLossGraphRef
 from .ref_load import LoadRef
 from noeira.nn.optimizer.grad_clip import _sum_sq_kernel_rt, GC_TPB
-from .trainer import _clip_scale_kernel
 from noeira.io.fileio import write_file_atomic
 
 
@@ -111,6 +110,20 @@ def _lewm_pixels_kernel(
         m = Scalar[DT](0.406)
         sd = Scalar[DT](0.225)
     dst[unsafe_offset=idx] = (x - m) / sd
+
+
+def _clip_scale_kernel[
+    N: Int
+](
+    grad: LayoutTensor[DT, Layout.row_major(N), MutAnyOrigin],
+    scale: Scalar[DT],
+):
+    """grad *= scale; a scale of 0 writes exact zeros (the NaN guard)."""
+    var i = Int(global_idx.x)
+    if i < N:
+        grad[i] = rebind[Scalar[DT]](grad[i]) * scale if scale != Scalar[DT](
+            0.0
+        ) else Scalar[DT](0.0)
 
 
 def _clip_coef_kernel(

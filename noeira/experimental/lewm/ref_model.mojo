@@ -7,11 +7,11 @@ HuggingFace `ViTModel` encoder, and the published checkpoint
 (`ref_load.mojo`). Every module here is gated against torch on that
 checkpoint (`tests/experimental/lewm/ref/`).
 
-The older aliases in `encoder.mojo` (`LeWMEncoder`, `LeWMEncoderCLS`,
-`ActionEmbedder`, `ARPredictor`, `PredProj`) are the port's own reading of the
-paper and differ from the reference in ways that change every number:
+The first port (`encoder.mojo` & co., removed 2026-10-03 once the
+reference model had replaced it — P5 / P6) was its own reading of the paper
+and differed from the reference in ways that changed every number:
 
-| piece | reference (here) | encoder.mojo |
+| piece | reference (here) | the first port |
 |---|---|---|
 | ViT LayerNorm eps | 1e-12 (HF) | 1e-5 |
 | GELU (ViT FFN, projectors, predictor FFN) | exact (erf) | tanh |
@@ -20,13 +20,10 @@ paper and differ from the reference in ways that change every number:
 | predictor tail | final affine LN | none |
 | BN running var | unbiased update (torch) | biased |
 
-They stay for the old checkpoints until the reference model replaces them.
-
 ⚠ ONE DEVIATION LEFT: the reference's attention `to_qkv` has NO bias; ours is
-a biased `Linear` (`MultiHeadAttentionXL`). Loaded from the checkpoint the
-bias is zero, so forward and every reference gradient are exact. In TRAINING
-it would get a gradient and move — mask `pred_raw.*.attn.0.bias` (or add a
-bias-free Linear) before P6 trains this model.
+a biased `Linear`. Loaded from the checkpoint the bias is zero, so forward and
+every reference gradient are exact; in training `ref_trainer` zeroes its
+gradient, so it stays 0.
 """
 
 from max.gpu.host import DeviceContext

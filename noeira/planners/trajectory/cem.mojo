@@ -6,7 +6,7 @@ per action probability mass), samples candidate plans, scores each via
 a ``ScorePlanCallback``, then refits the distribution to the top-K
 plans using add-K (Laplace) smoothing.
 
-Promoted from ``noeira/experimental/lewm/kernels._run_cem_eval_iter``.
+Promoted from the first LeWM port's ``kernels._run_cem_eval_iter`` (removed).
 The original was specialized to LeWM's autoregressive MPC rollout; this
 version is agent-agnostic — the scoring step delegates to a callback,
 so LeWM, future MBPO-CEM, or any other discrete-action world-model
