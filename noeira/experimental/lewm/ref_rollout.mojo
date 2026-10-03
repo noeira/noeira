@@ -26,6 +26,7 @@ from std.math import sqrt
 from max.gpu.host import DeviceContext
 
 from noeira.nn.constants import DT
+from noeira.nn.core.param import ParamVisitor
 from noeira.nn.core.tensor import Tensor
 from noeira.nn.core.tensor_pack import TensorPack
 from noeira.nn.core.tensor_refs import TensorRefs
@@ -124,6 +125,19 @@ struct LeWMRefRollout[target: StaticString, S: Int, HORIZON: Int]:
         _ = load_ref[Self.target](self.pred, dump_dir, String("pred_raw."), ctx)
         _ = load_ref[Self.target](self.ln, dump_dir, String("pred_ln."), ctx)
         _ = load_ref[Self.target](self.pp, dump_dir, String("pred."), ctx)
+        self.pp.set_attr["training"](Scalar[DT](0.0))
+
+    def sync_from[V: ParamVisitor](mut self, mut fill_pred: V, mut fill_ae: V, mut fill_pe: V,
+                                   mut fill_ln: V, mut fill_pp: V) raises:
+        """Re-load the planner's predictor side after a test-time update (one
+        visitor per module, each carrying that module's name prefix). Without
+        this the CEM keeps planning on the weights it was built with."""
+        self.pred.for_each_param[Self.target](fill_pred, self.ctx)
+        self.ae.for_each_param[Self.target](fill_ae, self.ctx)
+        self.pe.for_each_param[Self.target](fill_pe, self.ctx)
+        self.ln.for_each_param[Self.target](fill_ln, self.ctx)
+        self.pp.for_each_param[Self.target](fill_pp, self.ctx)
+        self.pp.for_each_state[Self.target](fill_pp, self.ctx)
         self.pp.set_attr["training"](Scalar[DT](0.0))
 
     def _predict_last(

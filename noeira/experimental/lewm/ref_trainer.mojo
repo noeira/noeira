@@ -152,6 +152,130 @@ def _is_pred_qkv_bias(name: String) -> Bool:
     return name.startswith("pred_raw.") and name.endswith(".attn.0.0.bias")
 
 
+def _kept(name: String, keep: List[String]) -> Bool:
+    if len(keep) == 0:
+        return True
+    for k in keep:
+        if name.startswith(k):
+            return True
+    return False
+
+
+struct _MaskKeep(ParamVisitor):
+    """Zero the gradient of every parameter NOT under one of `keep`'s
+    prefixes (an empty list keeps everything) — test-time adaptation of a
+    subset. Runs before the clip, so the norm covers only what moves."""
+
+    var keep: List[String]
+
+    def __init__(out self, keep: List[String]):
+        self.keep = keep.copy()
+
+    def visit[target: StaticString, N: Int](
+        mut self, name: String, mut param: Tensor, mut grad: Tensor,
+        mut m: Tensor, mut v: Tensor, apply_decay: Bool,
+        ctx: Optional[DeviceContext],
+    ) raises:
+        if _kept(name, self.keep):
+            return
+        comptime if target == "cpu":
+            for i in range(N):
+                grad.data[i] = Scalar[DT](0.0)
+        else:
+            grad.dev.value().enqueue_fill(Scalar[DT](0.0))
+
+
+struct _ZeroMoments(ParamVisitor):
+    def __init__(out self):
+        pass
+
+    def visit[target: StaticString, N: Int](
+        mut self, name: String, mut param: Tensor, mut grad: Tensor,
+        mut m: Tensor, mut v: Tensor, apply_decay: Bool,
+        ctx: Optional[DeviceContext],
+    ) raises:
+        comptime if target == "cpu":
+            for i in range(min(N, m.n)):
+                m.data[i] = Scalar[DT](0)
+                v.data[i] = Scalar[DT](0)
+        else:
+            if m.dev:
+                m.dev.value().enqueue_fill(Scalar[DT](0))
+                v.dev.value().enqueue_fill(Scalar[DT](0))
+
+
+struct TrainerSnapshot(Copyable, Movable):
+    """Host copies of a trainer's params and state, by walk name."""
+
+    var names: List[String]
+    var values: List[List[Scalar[DT]]]
+
+    def __init__(out self):
+        self.names = List[String]()
+        self.values = List[List[Scalar[DT]]]()
+
+    def find(self, name: String) -> Int:
+        for i in range(len(self.names)):
+            if self.names[i] == name:
+                return i
+        return -1
+
+
+struct _Collect(ParamVisitor):
+    """Copy (to the host) every tensor under `keep` (empty = all)."""
+
+    var snap: TrainerSnapshot
+    var keep: List[String]
+
+    def __init__(out self, keep: List[String]):
+        self.snap = TrainerSnapshot()
+        self.keep = keep.copy()
+
+    def visit[target: StaticString, N: Int](
+        mut self, name: String, mut param: Tensor, mut grad: Tensor,
+        mut m: Tensor, mut v: Tensor, apply_decay: Bool,
+        ctx: Optional[DeviceContext],
+    ) raises:
+        if not _kept(name, self.keep):
+            return
+        comptime if target == "gpu":
+            ctx.value().synchronize()
+            param.download(ctx.value())
+        var vals = List[Scalar[DT]](capacity=N)
+        for i in range(N):
+            vals.append(param.data[i])
+        self.snap.names.append(name)
+        self.snap.values.append(vals^)
+
+
+struct FillFromSnapshot(ParamVisitor):
+    """Write a snapshot's tensors into a module whose walk names are the
+    snapshot's minus `prefix` (e.g. the rollout's predictor: `pred_raw.`).
+    Names the snapshot lacks are left alone; `n` counts the writes."""
+
+    var snap: TrainerSnapshot
+    var prefix: String
+    var n: Int
+
+    def __init__(out self, snap: TrainerSnapshot, prefix: String):
+        self.snap = snap.copy()
+        self.prefix = prefix
+        self.n = 0
+
+    def visit[target: StaticString, N: Int](
+        mut self, name: String, mut param: Tensor, mut grad: Tensor,
+        mut m: Tensor, mut v: Tensor, apply_decay: Bool,
+        ctx: Optional[DeviceContext],
+    ) raises:
+        var k = self.snap.find(self.prefix + name)
+        if k < 0:
+            return
+        if len(self.snap.values[k]) != N:
+            raise Error("FillFromSnapshot: size mismatch at " + self.prefix + name)
+        _fill(param, self.snap.values[k], ctx)
+        self.n += 1
+
+
 struct _MaskPredQKVBias(ParamVisitor):
     var n_masked: Int
 
@@ -386,6 +510,9 @@ struct LeWMRefTrainer[target: StaticString, B: Int](Movable):
     """[norm, coef] of the last step's clip, on the device."""
     var norm_host: Float64
     var dropout_on: Bool
+    var keep: List[String]
+    """Test-time adaptation: only params under these prefixes move (empty =
+    all). See `set_keep`."""
     var profile: Bool
     """Synchronise between the stages of `train_step` and accumulate their
     wall time in `t_stage` (seconds): copy-in, forward, vjp, clip, AdamW."""
@@ -409,6 +536,7 @@ struct LeWMRefTrainer[target: StaticString, B: Int](Movable):
         # the predictor's dropout (ref_model.PRED_DROPOUT): the recipe trains
         # with it; the torch parity gates run without
         self.dropout_on = dropout
+        self.keep = List[String]()
         self.graph.set_node_attr["pred_raw", "dropout"](Scalar[DT](1 if dropout else 0))
         self.graph.set_node_attr["sig_s", "multiplier"](Scalar[DT](sigreg_lambda))
         self.graph.set_node_attr["sig", "resample"](Scalar[DT](1))
@@ -495,6 +623,79 @@ struct LeWMRefTrainer[target: StaticString, B: Int](Movable):
         return rebind[Pointer[Scalar[DType.uint8], MutAnyOrigin]](
             self.pix_host[slot].unsafe_ptr()
         )
+
+    # ── test-time adaptation (AdaJEPA, docs/LEWM_REOPEN_PLAN.md P7) ────────
+
+    def set_keep(mut self, keep: List[String]):
+        """Adapt only the params under these prefixes (empty = all).
+
+        ⚠ With Adam a masked param stays put only if its moments are zero
+        and the decay is 0: construct the TTA trainer with `wd=0` and call
+        `reset_optimizer` at each episode's start, with ONE mask per
+        episode (a param that moved once keeps moving on its momentum)."""
+        self.keep = keep.copy()
+
+    def reset_optimizer(mut self) raises:
+        """Fresh Adam: zero moments, t = 0 (each episode adapts from scratch)."""
+        var z = _ZeroMoments()
+        self.graph.for_each_param[Self.target](z, self.ctx)
+        self.opt.adam.t = 0
+        self.opt.adam._b1_pow = Scalar[DT](1.0)
+        self.opt.adam._b2_pow = Scalar[DT](1.0)
+        self.opt.adam.bc1 = Scalar[DT](1.0)
+        self.opt.adam.bc2 = Scalar[DT](1.0)
+
+    def set_bn_training(mut self, on: Bool):
+        """BatchNorm on batch statistics (and updating its running stats), or
+        frozen on its running stats — the latter backpropagates through the
+        affine eval map (`BatchNorm1D._vjp_eval`)."""
+        self.graph.set_attr["training"](Scalar[DT](1 if on else 0))
+
+    def export_params(mut self, keep: List[String], with_state: Bool) raises -> TrainerSnapshot:
+        """Host copies of the params under `keep` (empty = all), plus every BN
+        running statistic when `with_state`."""
+        var col = _Collect(keep)
+        self.graph.for_each_param[Self.target](col, self.ctx)
+        if with_state:
+            var cs = _Collect(List[String]())
+            self.graph.for_each_state[Self.target](cs, self.ctx)
+            for i in range(len(cs.snap.names)):
+                col.snap.names.append(cs.snap.names[i])
+                col.snap.values.append(cs.snap.values[i].copy())
+        return col.snap.copy()
+
+    def restore(mut self, snap: TrainerSnapshot) raises -> Int:
+        """Write a snapshot (from `export_params`) back; returns the count."""
+        var f = FillFromSnapshot(snap, String(""))
+        self.graph.for_each_param[Self.target](f, self.ctx)
+        self.graph.for_each_state[Self.target](f, self.ctx)
+        return f.n
+
+    def loss_of(mut self, pix: List[Scalar[DT]], act: List[Scalar[DT]]) raises -> RefStepStats:
+        """Forward only, in the current mode (no update): the loss on a batch."""
+        for i in range(Self.B * Self.PIX):
+            self.pix.data[i] = pix[i]
+        comptime if Self.target == "gpu":
+            self.pix.upload(self.ctx.value())
+        self._set_actions(act)
+        self.graph.set_input["pixels", Self.B](self.pix, self.ctx)
+        self.graph.set_input["actions", Self.B](self.act, self.ctx)
+        self.graph.forward[Self.B, Self.target](self.loss, self.ctx)
+        var stats = RefStepStats(0.0, 0.0, 0.0, 0.0)
+        comptime if Self.target == "gpu":
+            var c = self.ctx.value()
+            c.synchronize()
+            self.loss.download(c)
+            self.graph.node_output["pl"]().download(c)
+            self.graph.node_output["sig"]().download(c)
+        for b in range(Self.B):
+            stats.loss += Float64(self.loss.data[b])
+            stats.pred_loss += Float64(self.graph.node_output["pl"]().data[b])
+            stats.sigreg_loss += Float64(self.graph.node_output["sig"]().data[b])
+        stats.loss /= Float64(Self.B)
+        stats.pred_loss /= Float64(Self.B)
+        stats.sigreg_loss /= Float64(Self.B)
+        return stats^
 
     def set_eval(mut self):
         """Lightning's `model.eval()`: BatchNorm on its running statistics,
@@ -632,6 +833,9 @@ struct LeWMRefTrainer[target: StaticString, B: Int](Movable):
         self.graph.for_each_param[Self.target](mask, self.ctx)
         if mask.n_masked != 6:
             raise Error("LeWMRefTrainer: masked " + String(mask.n_masked) + " predictor qkv biases, expected 6")
+        if len(self.keep) > 0:
+            var mk = _MaskKeep(self.keep)
+            self.graph.for_each_param[Self.target](mk, self.ctx)
         # torch.nn.utils.clip_grad_norm_: clip_coef = max_norm / (norm + 1e-6),
         # clamped to 1
         comptime if Self.target == "gpu":

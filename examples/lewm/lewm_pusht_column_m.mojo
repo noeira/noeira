@@ -52,6 +52,9 @@ from noeira.experimental.lewm.ref_load import load_ref
 from noeira.experimental.lewm.ref_rollout import (
     LeWMRefRollout, RefEncoder, encode_ref, cem_step, REF_EMB, REF_ACT,
 )
+from noeira.experimental.lewm.paper_pairs import (
+    imagenet_from_hwc255, render_frame, gauss, pair_success, video_frame,
+)
 
 
 comptime TARGET = "gpu"
@@ -65,80 +68,6 @@ comptime IMG = 224
 comptime HW = IMG * IMG
 comptime A = HORIZON * REF_ACT
 comptime F = DType.float32
-
-
-def _imagenet_from_hwc255(hwc: List[Scalar[DT]], off: Int) -> List[Scalar[DT]]:
-    """(224, 224, 3) 0..255 -> CHW ImageNet-normalised (swm ToImage + Normalize)."""
-    var mean: List[Float64] = [0.485, 0.456, 0.406]
-    var std: List[Float64] = [0.229, 0.224, 0.225]
-    var out = List[Scalar[DT]](length=3 * HW, fill=Scalar[DT](0))
-    for i in range(HW):
-        for c in range(3):
-            out[c * HW + i] = Scalar[DT](
-                (Float64(hwc[off + i * 3 + c]) / 255.0 - mean[c]) / std[c]
-            )
-    return out^
-
-
-def _render_frame(mut env: PushTEnv[F]) raises -> List[Scalar[DT]]:
-    """Our env's current state, drawn like swm 0.0.6, as (224, 224, 3) 0..255."""
-    var ag = env.agent_pos()
-    var bp = env.block_pose()
-    var buf = List[Scalar[DT]](length=HW * 3, fill=Scalar[DT](0))
-    var pix = LayoutTensor[DT, Layout.row_major(IMG, IMG, 3), MutAnyOrigin](
-        rebind[Pointer[Scalar[DT], MutAnyOrigin]](buf.unsafe_ptr())
-    )
-    render_pusht_swm_at[IMG](
-        rebind[Scalar[DT]](bp[0]), rebind[Scalar[DT]](bp[1]), rebind[Scalar[DT]](bp[2]),
-        rebind[Scalar[DT]](ag[0]), rebind[Scalar[DT]](ag[1]), pix,
-    )
-    return buf^
-
-
-def _gauss(seed: UInt64, n: Int, offset: UInt64) -> List[Scalar[DT]]:
-    """n standard normals (Box-Muller over Philox)."""
-    var out = List[Scalar[DT]](capacity=n)
-    var i = 0
-    var ctr = offset
-    while i < n:
-        var rng = PhiloxRandom(seed=seed, offset=ctr)
-        var u = rng.step_uniform()
-        ctr += 1
-        var u1 = max(Float64(u[0]), 1e-12)
-        var u2 = Float64(u[1])
-        var r = sqrt(-2.0 * log(u1))
-        out.append(Scalar[DT](r * cos(2.0 * pi * u2)))
-        if i + 1 < n:
-            out.append(Scalar[DT](r * sin(2.0 * pi * u2)))
-        i += 2
-    return out^
-
-
-def _success(mut env: PushTEnv[F], goal: List[Scalar[DT]], g: Int) -> Bool:
-    """swm `eval_state`: ‖goal[:4] - cur[:4]‖ < 20 and wrapped |Δ angle| < π/9."""
-    var ag = env.agent_pos()
-    var bp = env.block_pose()
-    var cur: List[Float64] = [
-        Float64(ag[0]), Float64(ag[1]), Float64(bp[0]), Float64(bp[1]), Float64(bp[2])
-    ]
-    var d = 0.0
-    for j in range(4):
-        d += (cur[j] - Float64(goal[g * 7 + j])) ** 2
-    var a = abs(Float64(goal[g * 7 + 4]) - cur[4])
-    while a > 2.0 * pi:
-        a -= 2.0 * pi
-    a = min(a, 2.0 * pi - a)
-    return sqrt(d) < 20.0 and a < pi / 9.0
-
-
-def _video_frame(mut env: PushTEnv[F], goal: List[Scalar[DT]], e: Int) -> List[UInt8]:
-    var ag = env.agent_pos()
-    var bp = env.block_pose()
-    return render_pusht_swm_canvas_goal(
-        Float64(bp[0]), Float64(bp[1]), Float64(bp[2]), Float64(ag[0]), Float64(ag[1]),
-        Float64(goal[e * 7 + 2]), Float64(goal[e * 7 + 3]), Float64(goal[e * 7 + 4]),
-        Float64(goal[e * 7 + 0]), Float64(goal[e * 7 + 1]),
-    )
 
 
 def main() raises:
@@ -197,9 +126,9 @@ def main() raises:
         )
         var clip = List[List[UInt8]]()  # --video: the episode's frames
         if video.byte_length() > 0:
-            clip.append(_video_frame(env, goal_state, e))
+            clip.append(video_frame(env, goal_state, e))
         var goal_emb = encode_ref[TARGET, 1](
-            enc, _imagenet_from_hwc255(goal_pix, e * HW * 3), ctx
+            enc, imagenet_from_hwc255(goal_pix, e * HW * 3), ctx
         )
         var ok = False
         var step = 0
@@ -207,12 +136,12 @@ def main() raises:
         while step < BUDGET:
             # observation: the dataset's start frame first (swm overwrites
             # the first info with it), our render of the env afterwards
-            var frame = _imagenet_from_hwc255(start_pix, e * HW * 3) if step == 0 else _imagenet_from_hwc255(_render_frame(env), 0)
+            var frame = imagenet_from_hwc255(start_pix, e * HW * 3) if step == 0 else imagenet_from_hwc255(render_frame(env), 0)
             var start_emb = encode_ref[TARGET, 1](enc, frame, ctx)
             var mean = List[Scalar[DT]](length=A, fill=Scalar[DT](0))
             var std = List[Scalar[DT]](length=A, fill=Scalar[DT](1))
             for it in range(ITERS):
-                var noise = _gauss(seed * 1000003 + UInt64(e), S * A, UInt64((replan * ITERS + it) * S * A))
+                var noise = gauss(seed * 1000003 + UInt64(e), S * A, UInt64((replan * ITERS + it) * S * A))
                 var st = cem_step[TARGET, S, HORIZON, K](roll, start_emb, goal_emb, mean, std, noise)
                 mean = st.mean.copy()
                 std = st.std.copy()
@@ -231,8 +160,8 @@ def main() raises:
                     ))
                     step += 1
                     if video.byte_length() > 0:
-                        clip.append(_video_frame(env, goal_state, e))
-                    if _success(env, goal_state, e):
+                        clip.append(video_frame(env, goal_state, e))
+                    if pair_success(env, goal_state, e):
                         ok = True
         if ok:
             n_success += 1
