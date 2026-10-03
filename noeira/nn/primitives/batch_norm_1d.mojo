@@ -149,6 +149,46 @@ def _bn1d_forward_eval_kernel[
         b += BN_TPB
 
 
+def _bn1d_backward_eval_kernel[
+    BATCH: Int,
+    DIM: Int,
+    EPSILON: Float64,
+](
+    grad_output: LayoutTensor[DT, Layout.row_major(BATCH, DIM), MutAnyOrigin],
+    input: LayoutTensor[DT, Layout.row_major(BATCH, DIM), MutAnyOrigin],
+    gamma: LayoutTensor[DT, Layout.row_major(DIM), MutAnyOrigin],
+    running_mean: LayoutTensor[DT, Layout.row_major(DIM), MutAnyOrigin],
+    running_var: LayoutTensor[DT, Layout.row_major(DIM), MutAnyOrigin],
+    grad_input: LayoutTensor[DT, Layout.row_major(BATCH, DIM), MutAnyOrigin],
+    grad_gamma: LayoutTensor[DT, Layout.row_major(DIM), MutAnyOrigin],
+    grad_beta: LayoutTensor[DT, Layout.row_major(DIM), MutAnyOrigin],
+):
+    """Eval mode: y = γ·(x − μ_run)·inv + β is affine in x, so
+    dx = dy·γ·inv, dγ += Σ dy·x̂, dβ += Σ dy (x̂ from the running stats)."""
+    var f = Int(block_idx.x)
+    var t = Int(thread_idx.x)
+    if f >= DIM:
+        return
+    var inv_std = rebind[Scalar[DT]](1.0 / sqrt(running_var[f] + Scalar[DT](EPSILON)))
+    var g = rebind[Scalar[DT]](gamma[f])
+    var rm = rebind[Scalar[DT]](running_mean[f])
+    var my_dgamma: Scalar[DT] = 0.0
+    var my_dbeta: Scalar[DT] = 0.0
+    var b = t
+    while b < BATCH:
+        var dy = rebind[Scalar[DT]](grad_output[b, f])
+        var xh = (rebind[Scalar[DT]](input[b, f]) - rm) * inv_std
+        my_dgamma += dy * xh
+        my_dbeta += dy
+        grad_input[b, f] = dy * g * inv_std
+        b += BN_TPB
+    var d_gamma_tot = block.sum[block_size=BN_TPB, broadcast=False](val=my_dgamma)
+    var d_beta_tot = block.sum[block_size=BN_TPB, broadcast=False](val=my_dbeta)
+    if t == 0:
+        grad_gamma[f] = grad_gamma[f] + d_gamma_tot[0]
+        grad_beta[f] = grad_beta[f] + d_beta_tot[0]
+
+
 def _bn1d_backward_kernel[
     BATCH: Int,
     DIM: Int,
@@ -400,6 +440,7 @@ struct BatchNorm1D[
                     var rm = rm_v[f]
                     for b in range(B):
                         output_v[b, f] = g * (input[b, f] - rm) * inv_std + bt
+                self.cache_is_training = False
         else:
             var c = ctx.value()
             out.ensure_gpu(c, B * Self.DIM_)
@@ -459,6 +500,7 @@ struct BatchNorm1D[
                     grid_dim=Self.DIM_,
                     block_dim=BN_TPB,
                 )
+                self.cache_is_training = False
 
     def vjp[
         target: StaticString,
@@ -473,11 +515,23 @@ struct BatchNorm1D[
         grad_inputs: TensorRefs[1, ogi, Self.ACT_DT],
         ctx: Optional[DeviceContext] = None,
     ) raises:
+        # The vjp follows the LAST forward's mode. ⚠ The flag used to be set
+        # by a training forward and never cleared, so an eval forward + vjp
+        # silently reused that training forward's caches; an eval forward now
+        # clears it and the eval vjp below runs instead (it used to raise
+        # only before ANY training forward).
         if not self.cache_is_training:
-            raise Error(
-                "BatchNorm1D.vjp: training-mode cache not populated. Call"
-                " forward with training=True before vjp."
-            )
+            comptime if Self.ACT_DT == DT:
+                ref xin = rebind[Tensor](forward_input[0])
+                ref god = rebind[Tensor](grad_output)
+                ref gind = rebind[Tensor](grad_inputs[0])
+                self._vjp_eval[target, B](xin, god, gind, ctx)
+                return
+            else:
+                raise Error(
+                    "BatchNorm1D.vjp: eval-mode backward is fp32-only (the"
+                    " last forward ran in eval mode)"
+                )
         # AMP §3 fp32-internal (forward_input unused, as in the fp32 body).
         comptime if Self.ACT_DT == DT:
             ref god = rebind[Tensor](grad_output)
@@ -576,6 +630,50 @@ struct BatchNorm1D[
                 self.gamma.val.lt["gpu", ld](),
                 self.cache_xhat.lt["gpu", l2d](),
                 self.cache_inv_std.lt["gpu", ld](),
+                gin.lt["gpu", l2d](),
+                self.gamma.grd.lt["gpu", ld](),
+                self.beta.grd.lt["gpu", ld](),
+                grid_dim=Self.DIM_,
+                block_dim=BN_TPB,
+            )
+
+    def _vjp_eval[target: StaticString, B: Int](
+        mut self,
+        mut x: Tensor,
+        mut grad_output: Tensor,
+        mut gin: Tensor,
+        ctx: Optional[DeviceContext] = None,
+    ) raises:
+        """Eval-mode backward (the forward was the affine map with the
+        running statistics): dx = dy·γ·inv, dγ += Σ dy·x̂, dβ += Σ dy. Used to
+        adapt a model at test time with its BatchNorms frozen in eval mode."""
+        var eps = Scalar[DT](Self.EPSILON)
+        comptime if target == "cpu":
+            gin.ensure(B * Self.DIM_)
+            for f in range(Self.DIM_):
+                var inv_std = Scalar[DT](1.0) / sqrt(self.running_var.t.data[f] + eps)
+                var g = self.gamma.val.data[f]
+                var rm = self.running_mean.t.data[f]
+                var dg: Scalar[DT] = 0.0
+                var db: Scalar[DT] = 0.0
+                for b in range(B):
+                    var dy = grad_output.data[b * Self.DIM_ + f]
+                    dg += dy * (x.data[b * Self.DIM_ + f] - rm) * inv_std
+                    db += dy
+                    gin.data[b * Self.DIM_ + f] = dy * g * inv_std
+                self.gamma.grd.data[f] += dg
+                self.beta.grd.data[f] += db
+        else:
+            var c = ctx.value()
+            gin.ensure_gpu(c, B * Self.DIM_)
+            comptime l2d = Layout.row_major(B, Self.DIM_)
+            comptime ld = Layout.row_major(Self.DIM_)
+            c.enqueue_function[_bn1d_backward_eval_kernel[B, Self.DIM_, Self.EPSILON]](
+                grad_output.lt["gpu", l2d](),
+                x.lt["gpu", l2d](),
+                self.gamma.val.lt["gpu", ld](),
+                self.running_mean.t.lt["gpu", ld](),
+                self.running_var.t.lt["gpu", ld](),
                 gin.lt["gpu", l2d](),
                 self.gamma.grd.lt["gpu", ld](),
                 self.beta.grd.lt["gpu", ld](),

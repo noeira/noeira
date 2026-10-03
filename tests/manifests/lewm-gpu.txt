@@ -21,6 +21,7 @@ tests/experimental/lewm/lewm/test_paper_protocol_tta.mojo
 tests/nn/test_layer_norm_eps_gpu.mojo
 tests/nn/test_gelu.mojo
 tests/nn/test_batch_norm_1d_unbiased_running.mojo
+tests/nn/test_batch_norm_1d_eval_vjp.mojo
 tests/nn/test_sigreg_attrs.mojo
 tests/nn/test_checkpointed.mojo
 tests/nn/test_attention_gpu_shapes.mojo
