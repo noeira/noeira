@@ -13,7 +13,8 @@
 #       setsid nohup bash tools/lewm/box_session_p7.sh > /dev/null 2>&1 < /dev/null &
 #
 # Then read $OUT/summary.txt. ~4 h on an RTX 5090 (a 50-pair board ~100 s;
-# an AdaJEPA config at --receding 1 ~20 min for both arms).
+# an AdaJEPA config at --receding 1 ~20 min for both arms). SKIP_BOARDS=1
+# runs the AdaJEPA part only (the boards do not depend on it).
 set -u
 RUN=${RUN:-/workspace/lewm_train}
 FIX=${FIX:-/workspace/fixture}
@@ -27,7 +28,7 @@ pixi run -e nvidia mojo build -I . examples/lewm/lewm_pusht_column_m.mojo -o "$O
 pixi run -e nvidia mojo build -I . examples/lewm/lewm_pusht_adajepa.mojo -o "$OUT/adajepa_bin" 2>&1 | grep error
 
 # ── 1. multi-seed boards (seed 0 is in the P6.2 table) ─────────────────────
-for E in 4 7; do
+for E in $([ -n "${SKIP_BOARDS:-}" ] || echo 4 7); do
   for SEED in 1 2 3 4; do
     pixi run -e nvidia "$OUT/colm_bin" --dump "$RUN/epoch_$E" --fixture "$FIX" \
       --episodes 50 --seed $SEED > "$OUT/board_e${E}_s${SEED}.log" 2>&1

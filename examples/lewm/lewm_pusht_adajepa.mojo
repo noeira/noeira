@@ -19,7 +19,12 @@ Two arms per pair, on identical pairs and identical CEM noise:
 
 Knobs (defaults = AdaJEPA's): `--receding R` blocks executed per replan (1 =
 AdaJEPA's one chunk per replan; 5 = the paper protocol of column R / M, which
-leaves 2 replans in a budget of 50 — too few to adapt); `--budget` env steps;
+leaves 2 replans in a budget of 50 — too few to adapt); `--cold` restarts every
+replan's CEM at mean 0 instead of swm's default warm start (`warm_start=True`:
+the previous plan's unexecuted blocks, zero-padded — moot at R = 5, where
+nothing is left; cold at R = 1 executes the first block of an unrelated plan
+each time: epoch_0 frozen 34/50 at R 5 fell to 11/50 cold, 16/50 warm — R 1 at
+budget 50 stays the weaker planner either way); `--budget` env steps;
 `--subset pred | predlast_enclast | all`; `--tta-lr` (5e-5, the training LR);
 `--tta-bn eval | train`; `--lambda` SIGReg weight in the adaptation loss;
 `--shift none | noise:σ | dark:gain | swap` (E2: applied to EVERY observed
@@ -70,6 +75,7 @@ comptime FRAME = PAIR_HW * 3
 @fieldwise_init
 struct Cfg(Copyable, Movable):
     var receding: Int
+    var warm_start: Bool
     var budget: Int
     var tta_steps: Int
     var tta_bn_train: Bool
@@ -146,9 +152,10 @@ def _episode(
     var acts = List[List[Scalar[DT]]]()
     var out = Outcome(False, 0, 0, 0.0)
     var step = 0
+    var init = List[Scalar[DT]](length=A, fill=Scalar[DT](0))
     while step < cfg.budget:
         var start_emb = encode_ref[TARGET, 1](enc, imagenet_from_hwc255(frames[len(frames) - 1], 0), ctx)
-        var mean = List[Scalar[DT]](length=A, fill=Scalar[DT](0))
+        var mean = init.copy()
         var std = List[Scalar[DT]](length=A, fill=Scalar[DT](1))
         for it in range(ITERS):
             var noise = gauss(cfg.seed * 1000003 + UInt64(e), S * A, UInt64((out.replans * ITERS + it) * S * A))
@@ -156,6 +163,10 @@ def _episode(
             mean = st.mean.copy()
             std = st.std.copy()
         out.replans += 1
+        # swm warm start: the next replan's mean = this plan's unexecuted blocks, zero-padded
+        var kept = A - cfg.receding * REF_ACT
+        for j in range(A):
+            init[j] = mean[cfg.receding * REF_ACT + j] if cfg.warm_start and j < kept else Scalar[DT](0)
         for blk in range(cfg.receding):
             var block = List[Scalar[DT]](capacity=REF_ACT)
             for k in range(FRAMESKIP):
@@ -205,6 +216,7 @@ def main() raises:
     var first_pair = 0
     var seed: UInt64 = 0
     var receding = 1
+    var warm_start = True
     var budget = 50
     var arms = String("both")
     var subset = String("pred")
@@ -229,6 +241,8 @@ def main() raises:
             seed = UInt64(Int(String(args[i + 1]))); i += 1
         elif a == "--receding":
             receding = Int(String(args[i + 1])); i += 1
+        elif a == "--cold":
+            warm_start = False
         elif a == "--budget":
             budget = Int(String(args[i + 1])); i += 1
         elif a == "--arms":
@@ -257,7 +271,7 @@ def main() raises:
     for k in keep:
         if k.startswith("emb."):
             touches_enc = True
-    var cfg = Cfg(receding, budget, tta_steps, tta_bn == "train", keep^, touches_enc,
+    var cfg = Cfg(receding, warm_start, budget, tta_steps, tta_bn == "train", keep^, touches_enc,
                   VisualShift.parse(shift_spec), seed)
     var run_frozen = arms == "both" or arms == "frozen"
     var run_adapt = arms == "both" or arms == "adapt"
@@ -282,7 +296,7 @@ def main() raises:
     _ = tr.load(dump)
     tr.set_keep(cfg.keep)
     var base = tr.export_params(List[String](), True)
-    print("AdaJEPA on", dump, ":", n_eps, "pairs from", first_pair, "; receding", receding,
+    print("AdaJEPA on", dump, ":", n_eps, "pairs from", first_pair, "; receding", receding, "warm" if warm_start else "cold",
           "budget", budget, "; subset", subset, "(", len(cfg.keep), "prefixes ) lr", tta_lr,
           "steps", tta_steps, "BN", tta_bn, "lambda", lam, "; shift", shift_spec,
           "; base snapshot", len(base.names), "tensors")
