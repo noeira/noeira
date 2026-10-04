@@ -814,6 +814,12 @@ struct Adam(Movable, ParamVisitor, ParamVisitorRT, Optimizer):
                 grid_dim=nblk,
                 block_dim=TPB,
             )
+        # ⚠ The bump belongs HERE, at the write, not only in `step`. Graph
+        # trainers drive `model.for_each_param(opt)` directly and never call
+        # `step`; without it `Linear`'s version-gated `w_pad` / `w_bf` keep the
+        # pre-update weight and the GPU forward trains against its init with
+        # no error. `step`'s own bump walk is then a harmless second increment.
+        param.version += 1
 
     def visit[
         target: StaticString, N: Int

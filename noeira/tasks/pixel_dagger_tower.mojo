@@ -91,8 +91,9 @@ from noeira.tasks.posed_reset import task_meta_words
 from noeira.tasks.ppo_family_driver import (
     AgentT, RunningMeanStd, N_ENVS, ACT_DIM, OBS_CLIP, OBS_BOUND, GAMMA,
     _delta_to_env, _arg, _lag_reset, _augment, _hist_push, _hist_clear,
+    _delta_targets, _targets_to_env, _target_targets, _target_reset,
 )
-from noeira.tasks.delta_action import ServoLag, DELTA_ARM, DELTA_GRIPPER
+from noeira.tasks.delta_action import ServoLag, DELTA_ARM, DELTA_GRIPPER, TARGET_OBS
 from noeira.tasks.shaping import reward_mode_words
 from noeira.tasks.so101_tower_rig import (
     RIG_DT, TOWER_MD, TowerRendererSized, make_tower_model,
@@ -109,17 +110,20 @@ from noeira.tasks.pixel_student import (
     OVERHEAD_RENDER_W, OVERHEAD_RENDER_H, WINDOWED, camera_names,
     window_in_render,
     PROPRIO, JOINT_SCALE, JOINT_VEL_SCALE, student_act, write_pixel_manifest,
-    PROPRIO_STATE, HIST_WORDS,
+    PROPRIO_STATE, HIST_WORDS, TARGET_LEAD_SCALE,
 )
 
 comptime M = So101TowerModel
 comptime C = So101TowerConfig
 comptime EnvT = Phyics3dBatchedEnv[M, C, N_ENVS, TERMINATE_ON_UNHEALTHY=False]
 comptime OBS = EnvT.OBS_DIM
-comptime T_OBS = OBS + HIST_WORDS
+comptime T_OBS = OBS + HIST_WORDS + TARGET_OBS
 """The teacher's observation: the env's, then (`-D TASK_PPO_ACT_HIST=K`) the
 last K executed actions — the same words the student sees as planes."""
-comptime HW1 = HIST_WORDS if HIST_WORDS > 0 else 1
+comptime EXW = HIST_WORDS + TARGET_OBS
+"""The host-made joint words per lane: the action history, then (target
+mode) the target's lead over the joints."""
+comptime HW1 = EXW if EXW > 0 else 1
 comptime NQ = M.NQ
 comptime NB = M.NBODY
 
@@ -282,7 +286,10 @@ def _gather_kernel[
     else:
         var j = (k - IMG) // PLANE
         var sc = Scalar[DT](JOINT_SCALE) if j < ACT_DIM else (
-            Scalar[DT](JOINT_VEL_SCALE) if j < PROPRIO_STATE else Scalar[DT](1)
+            Scalar[DT](JOINT_VEL_SCALE) if j < PROPRIO_STATE else (
+                Scalar[DT](1) if j < PROPRIO_STATE + HIST_WORDS
+                else Scalar[DT](TARGET_LEAD_SCALE)
+            )
         )
         x[i] = rebind[Scalar[DT]](ring[row * ROW + IMG + j]) * sc
 
@@ -355,12 +362,12 @@ struct PixelObs(Movable):
         var labels = geom_labels(fmd)
         var dcfg = DomainRandConfig.parse(dr_name, UInt64(dr_seed))
         self.dr_w = VisualRandomizer[RIG_DT](
-            dcfg, so101_tower_surface_groups(), self.r.vis, self.rm, labels,
+            dcfg, so101_tower_surface_groups(dr_name == "room"), self.r.vis, self.rm, labels,
             self.cams.copy(), self.r.background, RIG_DR_TARGET,
         )
         scale_tower_camera_dr(self.dr_w, fmd)
         self.dr_o = VisualRandomizer[RIG_DT](
-            dcfg, so101_tower_surface_groups(), self.r_o.vis, self.rm, labels,
+            dcfg, so101_tower_surface_groups(dr_name == "room"), self.r_o.vis, self.rm, labels,
             self.cams.copy(), self.r_o.background, RIG_DR_TARGET,
         )
         scale_tower_camera_dr(self.dr_o, fmd)
@@ -404,12 +411,20 @@ struct PixelObs(Movable):
     def observe(
         mut self, ctx: DeviceContext, env_qpos: DeviceBuffer[DT],
         env_qvel: DeviceBuffer[DT], base_row: Int, ref hist: List[Float64],
+        ref lead: List[Float64],
     ) raises:
         """`hist`: the lanes' action histories ([N_ENVS, HIST_WORDS], the
         PPO driver's `_hist_push` layout; empty without TASK_PPO_ACT_HIST)."""
-        comptime if HIST_WORDS > 0:
-            for k in range(N_ENVS * HIST_WORDS):
-                self.hist_t.data[k] = Scalar[DT](hist[k])
+        comptime if EXW > 0:
+            # per lane: its HIST_WORDS history words, then its TARGET_OBS
+            # target leads (`lead`: [N_ENVS, TARGET_OBS], target - q)
+            for e in range(N_ENVS):
+                for k in range(HIST_WORDS):
+                    self.hist_t.data[e * HW1 + k] = Scalar[DT](hist[e * HIST_WORDS + k])
+                for k in range(TARGET_OBS):
+                    self.hist_t.data[e * HW1 + HIST_WORDS + k] = Scalar[DT](
+                        lead[e * TARGET_OBS + k]
+                    )
             self.hist_t.upload_resident(ctx)
         ctx.enqueue_copy(self.rd.qpos.dev.value(), env_qpos)
         ctx.enqueue_copy(self.rd.qvel.dev.value(), env_qvel)
@@ -558,11 +573,28 @@ def run_pixel_dagger(args: List[String], driver: String) raises:
     # `--lag-delay lo,hi` ticks); the student is trained AND evaluated under it
     var lag_tau = _arg(args, "--lag-tau", "")
     var lag_delay = _arg(args, "--lag-delay", "")
+    # the real arm's speed cap and elbow stop (`ServoLag.set_limits`)
+    var lag_vmax = _arg(args, "--lag-vmax", "")
+    var elbow_max = Float64(_arg(args, "--elbow-max", "0"))
+    # per-joint servo dynamics, offsets, control-period jitter, as in the PPO
+    # driver (`ServoLag.set_per_joint` / `set_offset` / `set_period`):
+    # "lo,hi;..." x 6 joints (offsets in rad), "lo,hi" ms
+    var lag_tau_j = _arg(args, "--lag-tau-j", "")
+    var lag_delay_j = _arg(args, "--lag-delay-j", "")
+    var lag_vmax_j = _arg(args, "--lag-vmax-j", "")
+    var lag_off_j = _arg(args, "--lag-offset-j", "")
+    var lag_period = _arg(args, "--lag-period", "")
     # ⚠ THE TEACHER'S SCALES: its labels are actions in its own units, so the
     # student must execute them with the same (checked below against the
     # teacher's run config when it recorded them)
     var d_arm = Float64(_arg(args, "--delta-arm", String(DELTA_ARM)))
     var d_grip = Float64(_arg(args, "--delta-gripper", String(DELTA_GRIPPER)))
+    # the teacher's cadence (`ppo_family_driver --repeat`): it acts every
+    # `repeat` ticks, targets held between — the student, its labels and its
+    # replay rows are on the same cadence
+    var repeat = max(Int(_arg(args, "--repeat", "1")), 1)
+    if C.MAX_STEPS % repeat != 0:
+        raise Error("pixel dagger: --repeat must divide the horizon")
     seed_rng(seed)
     var family = String("so101_tower")
     var family_path = String("noeira/tasks/families/so101_tower.family")
@@ -640,10 +672,16 @@ def run_pixel_dagger(args: List[String], driver: String) raises:
     logger.set_config("aug", String(use_aug))
     logger.set_config("lag_tau_ms", lag_tau)
     logger.set_config("lag_delay_ticks", lag_delay)
+    logger.set_config("lag_tau_j", lag_tau_j)
+    logger.set_config("lag_delay_j", lag_delay_j)
+    logger.set_config("lag_vmax_j", lag_vmax_j)
+    logger.set_config("lag_offset_j", lag_off_j)
+    logger.set_config("lag_period_ms", lag_period)
     logger.set_config("delta_arm", String(d_arm))
     logger.set_config("delta_gripper", String(d_grip))
     logger.set_config("gripper_sign", String(grip_sign))
     logger.set_config("act_gain", String(act_gain))
+    logger.set_config("repeat", String(repeat))
     register_run(run, logger)
     var artifacts = sink_for_run(run.id, run.dir)
 
@@ -659,10 +697,20 @@ def run_pixel_dagger(args: List[String], driver: String) raises:
         )
         teacher.trainer.load_state(teacher_dir + "/checkpoints/last.ckpt")
         var t_cfg = teacher_dir + "/metrics.config.kv"
+        var t_action = String("delta")
+        var target_lead = 0.0
         try:
             with open(t_cfg, "r") as fh:
                 for ln in fh.read().split("\n"):
                     var sl = String(ln)
+                    # ⚠ a `--action target` teacher's actions are steps
+                    # from its PREVIOUS target (`delta_action.target_step`):
+                    # executed here the same way, with the same lead bound,
+                    # and only by a TARGET_OBS build (its input has the leads)
+                    if sl.startswith("action="):
+                        t_action = String(sl[byte = 7 :])
+                    if sl.startswith("target_lead="):
+                        target_lead = Float64(String(sl[byte = 12 :]))
                     if sl.startswith("delta_arm="):
                         var tv = Float64(String(sl[byte = 10 :]))
                         if abs(tv - d_arm) > 1e-9:
@@ -672,6 +720,11 @@ def run_pixel_dagger(args: List[String], driver: String) raises:
         except e:
             if String(e).find("pixel dagger:") >= 0:
                 raise e^
+        if (t_action == "target") != (TARGET_OBS > 0):
+            raise Error("pixel dagger: the teacher acts with --action "
+                        + t_action + "; a target teacher needs (and only it"
+                        + " may use) a -D TASK_PPO_TARGET_OBS build")
+        print("  teacher action", t_action, "| target lead", target_lead)
         var obs_rms = RunningMeanStd(T_OBS)
         obs_rms.load(teacher_dir + "/obs_norm.txt")
 
@@ -703,7 +756,7 @@ def run_pixel_dagger(args: List[String], driver: String) raises:
         ctx.synchronize()
         for e in range(N_ENVS):
             env.d.meta.data[e * METADATA_SIZE + META_IDX_STEP_COUNT] = Scalar[DT](
-                Int(random_float64() * Float64(C.MAX_STEPS))
+                Int(random_float64() * Float64(C.MAX_STEPS // repeat)) * repeat
             )
         env.d.meta.upload(ctx)
         ctx.synchronize()
@@ -727,6 +780,10 @@ def run_pixel_dagger(args: List[String], driver: String) raises:
         # the lanes' executed actions, most recent first (zero at a reset) —
         # the teacher's extra words and the student's extra planes
         var hist = List[Float64](length=N_ENVS * HIST_WORDS, fill=0.0)
+        # target mode: each lane's last commanded target, and its lead over
+        # the joints at the observation (the student's lead planes)
+        var tprev = List[Float64](length=N_ENVS * ACT_DIM, fill=0.0)
+        var lead = List[Float64](length=N_ENVS * TARGET_OBS, fill=0.0)
         var act_t = ctx.enqueue_create_host_buffer[DT](N_ENVS * ACT_DIM)
         var env_act = ctx.enqueue_create_host_buffer[DT](N_ENVS * ACT_DIM)
         var done_h = ctx.enqueue_create_host_buffer[DT](N_ENVS)
@@ -762,12 +819,24 @@ def run_pixel_dagger(args: List[String], driver: String) raises:
         ctx.synchronize()
 
         var stud_lane = List[Bool](length=N_ENVS, fill=False)
+        # the policy step's held targets; per lane, whether it ended in them
+        var tg = List[Float64](length=N_ENVS * ACT_DIM, fill=0.0)
+        var dmac = List[Bool](length=N_ENVS, fill=False)
         var lag = ServoLag.parse(
             N_ENVS, lag_tau, lag_delay, Float64(C.FRAME_SKIP) * M.TIMESTEP
         )
+        lag.set_limits(lag_vmax, elbow_max)
+        lag.set_per_joint(lag_tau_j, lag_delay_j, lag_vmax_j)
+        lag.set_offset(lag_off_j)
+        lag.set_period(lag_period)
         var lag_pending = List[Bool](length=N_ENVS, fill=True)
         if lag.on:
-            print("  servo lag: tau", lag_tau, "ms, delay", lag_delay, "ticks")
+            print("  servo lag: tau", lag_tau, "ms, delay", lag_delay,
+                  "ticks | arm speed cap", lag_vmax, "rad/s | elbow max", elbow_max)
+        if lag.per_joint or lag.has_off or lag.dt_hi > 0.0:
+            print("  servo per joint: tau", lag_tau_j, "ms | delay", lag_delay_j,
+                  "| cap", lag_vmax_j, "rad/s | offset", lag_off_j,
+                  "rad | period", lag_period, "ms")
         var succ = List[Bool](length=N_ENVS, fill=False)
         var hist_s = List[Bool]()  # student-executed episodes' success
         var hist_t = List[Bool]()  # teacher-executed
@@ -784,7 +853,8 @@ def run_pixel_dagger(args: List[String], driver: String) raises:
         var ckpt = run.dir + "/checkpoints/last.ckpt"
         write_pixel_manifest(
             run.dir + "/checkpoints/norm.json", task, teacher_dir, grip_sign,
-            Float64(C.FRAME_SKIP) * M.TIMESTEP, d_arm, d_grip, lag_tau, lag_delay,
+            Float64(C.FRAME_SKIP) * M.TIMESTEP, d_arm, d_grip, lag_tau, lag_delay, repeat,
+            t_action, target_lead,
         )
 
         ctx.enqueue_copy(raw_h, obs_dev)
@@ -802,8 +872,7 @@ def run_pixel_dagger(args: List[String], driver: String) raises:
             if px.dr_on and it % dr_every == 0:
                 px.redraw(ctx, dr_draw)
                 dr_draw += 1
-            px.observe(ctx, qpos_dev, qvel_dev, base, hist)
-            # 3. the teacher, on the state
+            # the joints, and a new episode's servo model and target
             var rp = mptr(raw_h.unsafe_ptr())
             for e in range(N_ENVS):
                 for j in range(ACT_DIM):
@@ -812,8 +881,15 @@ def run_pixel_dagger(args: List[String], driver: String) raises:
                     )
                 if lag_pending[e]:
                     _lag_reset(lag, arm_q, e)
+                    _target_reset(tprev, arm_q, e)
                     lag_pending[e] = False
-            _augment[OBS](rp, hist, mptr(aug_o.unsafe_ptr()))
+                for j in range(TARGET_OBS):
+                    lead[e * TARGET_OBS + j] = (
+                        tprev[e * ACT_DIM + j] - arm_q[e * ACT_DIM + j]
+                    )
+            px.observe(ctx, qpos_dev, qvel_dev, base, hist, lead)
+            # 3. the teacher, on the state
+            _augment[OBS](rp, hist, tprev, a_qa, mptr(aug_o.unsafe_ptr()))
             obs_rms.normalize_into(
                 mptr(aug_o.unsafe_ptr()), mptr(cur_n.unsafe_ptr()), N_ENVS,
                 T_OBS, OBS_CLIP,
@@ -850,29 +926,49 @@ def run_pixel_dagger(args: List[String], driver: String) raises:
                                 y_act.data[e * ACT_DIM + j], j, grip_sign
                             )
             _hist_push(hist, mptr(act_t.unsafe_ptr()))
-            _delta_to_env(
-                mptr(act_t.unsafe_ptr()), mptr(env_act.unsafe_ptr()),
-                arm_q, a_lo, a_hi, lag, d_arm, d_grip,
-            )
-            ctx.enqueue_copy(act_dev, env_act)
-            # 5. step, tally, reset
-            env.step_batch[N_ENVS](ctx=ctx, rng_seed=UInt64(it + 1))
-            ctx.enqueue_copy(raw_h, obs_dev)
-            ctx.enqueue_copy(done_h, done_dev)
-            env.d.meta.download(ctx)
-            ctx.synchronize()
-            var rq = mptr(raw_h.unsafe_ptr())
+            if t_action == "target":
+                _target_targets(
+                    mptr(act_t.unsafe_ptr()), tg, tprev, arm_q, a_lo, a_hi,
+                    d_arm, d_grip, target_lead,
+                )
+            else:
+                _delta_targets(
+                    mptr(act_t.unsafe_ptr()), tg, arm_q, a_lo, a_hi, d_arm, d_grip,
+                )
+            # 5. `repeat` ticks under the held targets, tally, reset
+            for e in range(N_ENVS):
+                dmac[e] = False
+            for tick in range(repeat):
+                _targets_to_env(tg, mptr(env_act.unsafe_ptr()), a_lo, a_hi, lag)
+                ctx.enqueue_copy(act_dev, env_act)
+                env.step_batch[N_ENVS](
+                    ctx=ctx, rng_seed=UInt64(it * repeat + tick + 1)
+                )
+                ctx.enqueue_copy(raw_h, obs_dev)
+                ctx.enqueue_copy(done_h, done_dev)
+                env.d.meta.download(ctx)
+                ctx.synchronize()
+                var rq_t = mptr(raw_h.unsafe_ptr())
+                var dh_t = mptr(done_h.unsafe_ptr())
+                for e in range(N_ENVS):
+                    if dmac[e]:
+                        continue
+                    for k in range(OBS):
+                        var v = Float64(rq_t[unsafe_offset = e * OBS + k])
+                        if not (v == v) or abs(v) > OBS_BOUND:
+                            dmac[e] = True
+                            break
+                    if env.d.meta.data[e * METADATA_SIZE + META_IDX_GOAL_HELD] > Scalar[DT](0.5):
+                        succ[e] = True
+                    if dh_t[unsafe_offset=e] > Scalar[DT](0.5):
+                        dmac[e] = True
             var dh = mptr(done_h.unsafe_ptr())
             var forced = False
             for e in range(N_ENVS):
-                for k in range(OBS):
-                    var v = Float64(rq[unsafe_offset = e * OBS + k])
-                    if not (v == v) or abs(v) > OBS_BOUND:
-                        dh[unsafe_offset=e] = Scalar[DT](1)
-                        forced = True
-                        break
-                if env.d.meta.data[e * METADATA_SIZE + META_IDX_GOAL_HELD] > Scalar[DT](0.5):
-                    succ[e] = True
+                var was = dh[unsafe_offset=e] > Scalar[DT](0.5)
+                if dmac[e] != was:
+                    forced = True
+                dh[unsafe_offset=e] = Scalar[DT](1) if dmac[e] else Scalar[DT](0)
                 if dh[unsafe_offset=e] > Scalar[DT](0.5):
                     if stud_lane[e]:
                         hist_s.append(succ[e])
@@ -889,7 +985,7 @@ def run_pixel_dagger(args: List[String], driver: String) raises:
             )
             ctx.enqueue_copy(raw_h, obs_dev)
             ctx.synchronize()
-            step += N_ENVS
+            step += N_ENVS * repeat
             it += 1
 
             # ── the regression, on the aggregate dataset ─────────────────
@@ -995,57 +1091,73 @@ def run_pixel_dagger(args: List[String], driver: String) raises:
             for e in range(N_ENVS):
                 _hist_clear(hist, e)
             for t in range(C.MAX_STEPS - 1):
-                if px.dr_on and eval_dr and t % dr_every == 0:
-                    px.redraw(ctx, 5_000_000 + rnd * 1000 + t)  # held-out draws
-                px.observe(ctx, qpos_dev, qvel_dev, 0, hist)
-                var rq = mptr(raw_h.unsafe_ptr())
-                for e in range(N_ENVS):
-                    for j in range(ACT_DIM):
-                        arm_q[e * ACT_DIM + j] = Float64(
-                            rq[unsafe_offset = e * OBS + a_qa[j]]
-                        )
-                    g_act.data[e] = Scalar[DT](e)
+                # the policy acts every `repeat` ticks (observe, label, act);
+                # its targets are held between, the servo model per tick
                 var at = mptr(act_t.unsafe_ptr())
-                if eval_teacher:
-                    # the TEACHER through the same loop — the reference the
-                    # student's stages are read against
-                    _augment[OBS](rq, hist, mptr(aug_o.unsafe_ptr()))
-                    obs_rms.normalize_into(
-                        mptr(aug_o.unsafe_ptr()), mptr(cur_n.unsafe_ptr()),
-                        N_ENVS, T_OBS, OBS_CLIP,
-                    )
-                    teacher.trainer.select_greedy_action_batched(
-                        mptr(cur_n.unsafe_ptr()), mptr(act_t.unsafe_ptr())
-                    )
-                else:
-                    _augment[OBS](rq, hist, mptr(aug_o.unsafe_ptr()))
-                    obs_rms.normalize_into(
-                        mptr(aug_o.unsafe_ptr()), mptr(cur_n.unsafe_ptr()),
-                        N_ENVS, T_OBS, OBS_CLIP,
-                    )
-                    teacher.trainer.select_greedy_action_batched(
-                        mptr(cur_n.unsafe_ptr()), mptr(lab.unsafe_ptr())
-                    )
-                    g_act.upload_resident(ctx)
-                    px.gather[N_ENVS](ctx, g_act, x_act)
-                    student.forward["gpu", N_ENVS](
-                        TensorRefs[1](x_act), y_act, Optional(ctx)
-                    )
-                    y_act.download(ctx)
-                    ctx.synchronize()
-                    for k in range(N_ENVS * ACT_DIM):
-                        at[unsafe_offset=k] = student_act(
-                            y_act.data[k] * Scalar[DT](act_gain), k % ACT_DIM,
-                            grip_sign,
-                        )
-                if t == 0:
+                if t % repeat == 0:
+                    if px.dr_on and eval_dr and t % dr_every == 0:
+                        px.redraw(ctx, 5_000_000 + rnd * 1000 + t)  # held-out draws
+                    var rq = mptr(raw_h.unsafe_ptr())
                     for e in range(N_ENVS):
-                        _lag_reset(lag, arm_q, e)
-                _hist_push(hist, mptr(act_t.unsafe_ptr()))
-                _delta_to_env(
-                    mptr(act_t.unsafe_ptr()), mptr(env_act.unsafe_ptr()),
-                    arm_q, a_lo, a_hi, lag, d_arm, d_grip,
-                )
+                        for j in range(ACT_DIM):
+                            arm_q[e * ACT_DIM + j] = Float64(
+                                rq[unsafe_offset = e * OBS + a_qa[j]]
+                            )
+                        g_act.data[e] = Scalar[DT](e)
+                        if t == 0:
+                            _target_reset(tprev, arm_q, e)
+                        for j in range(TARGET_OBS):
+                            lead[e * TARGET_OBS + j] = (
+                                tprev[e * ACT_DIM + j] - arm_q[e * ACT_DIM + j]
+                            )
+                    px.observe(ctx, qpos_dev, qvel_dev, 0, hist, lead)
+                    if eval_teacher:
+                        # the TEACHER through the same loop — the reference the
+                        # student's stages are read against
+                        _augment[OBS](rq, hist, tprev, a_qa, mptr(aug_o.unsafe_ptr()))
+                        obs_rms.normalize_into(
+                            mptr(aug_o.unsafe_ptr()), mptr(cur_n.unsafe_ptr()),
+                            N_ENVS, T_OBS, OBS_CLIP,
+                        )
+                        teacher.trainer.select_greedy_action_batched(
+                            mptr(cur_n.unsafe_ptr()), mptr(act_t.unsafe_ptr())
+                        )
+                    else:
+                        _augment[OBS](rq, hist, tprev, a_qa, mptr(aug_o.unsafe_ptr()))
+                        obs_rms.normalize_into(
+                            mptr(aug_o.unsafe_ptr()), mptr(cur_n.unsafe_ptr()),
+                            N_ENVS, T_OBS, OBS_CLIP,
+                        )
+                        teacher.trainer.select_greedy_action_batched(
+                            mptr(cur_n.unsafe_ptr()), mptr(lab.unsafe_ptr())
+                        )
+                        g_act.upload_resident(ctx)
+                        px.gather[N_ENVS](ctx, g_act, x_act)
+                        student.forward["gpu", N_ENVS](
+                            TensorRefs[1](x_act), y_act, Optional(ctx)
+                        )
+                        y_act.download(ctx)
+                        ctx.synchronize()
+                        for k in range(N_ENVS * ACT_DIM):
+                            at[unsafe_offset=k] = student_act(
+                                y_act.data[k] * Scalar[DT](act_gain), k % ACT_DIM,
+                                grip_sign,
+                            )
+                    if t == 0:
+                        for e in range(N_ENVS):
+                            _lag_reset(lag, arm_q, e)
+                    _hist_push(hist, mptr(act_t.unsafe_ptr()))
+                    if t_action == "target":
+                        _target_targets(
+                            mptr(act_t.unsafe_ptr()), tg, tprev, arm_q, a_lo,
+                            a_hi, d_arm, d_grip, target_lead,
+                        )
+                    else:
+                        _delta_targets(
+                            mptr(act_t.unsafe_ptr()), tg, arm_q, a_lo, a_hi,
+                            d_arm, d_grip,
+                        )
+                _targets_to_env(tg, mptr(env_act.unsafe_ptr()), a_lo, a_hi, lag)
                 ctx.enqueue_copy(act_dev, env_act)
                 env.step_batch[N_ENVS](ctx=ctx, rng_seed=UInt64(t + 1))
                 ctx.enqueue_copy(raw_h, obs_dev)
@@ -1191,7 +1303,8 @@ def _dump_obs_png(
                 px.restore(ctx)
             else:
                 px.redraw(ctx, 900_000 + d)
-        px.observe(ctx, qpos_dev, qvel_dev, 0, hist)
+        var lead0 = List[Float64](length=N_ENVS * TARGET_OBS, fill=0.0)
+        px.observe(ctx, qpos_dev, qvel_dev, 0, hist, lead0)
         var h = ctx.enqueue_create_host_buffer[DT](2 * ROW)
         ctx.enqueue_copy(h, px.ring.dev.value().create_sub_buffer[DT](0, 2 * ROW))
         ctx.synchronize()

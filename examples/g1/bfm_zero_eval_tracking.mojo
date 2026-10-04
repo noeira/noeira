@@ -50,6 +50,9 @@ from noeira.nn.core.tensor import Tensor
 from noeira.core.cont_action import ContAction
 from noeira.core.assignment import emd_uniform
 from noeira.envs.robots.unitree_g1_rsi import G1RsiTable
+from noeira.envs.robots.unitree_g1_history import (
+    UNITREE_G1_FULL_OBS_DIM, G1_ACTOR_EXTRA,
+)
 from noeira.envs.robots.g1_tracking_eval import (
     G1_D, G1_H, G1_L, G1_HB, G1_HD,
     G1_SEG_ROWS, g1_n_segments, g1_segment_row, g1_segment_pick,
@@ -58,14 +61,23 @@ from noeira.envs.robots.g1_tracking_eval import (
 from noeira.data.store import TrajectoryStore
 from noeira.deep_agents.fb.trainer import FBTrainer
 from noeira.deep_agents.fb.obs_norm import ObsNorm
-from noeira.deep_agents.fb.bfm_towers import BFMFTower, BFMActorTower, BFMBNet
+from noeira.deep_agents.fb.bfm_towers import (
+    BFMFTower, BFMActorTowerFiltered, BFMBNetFiltered,
+)
 from noeira.envs.robots import UnitreeG1
 from noeira.envs.robots.unitree_g1_xml import (
     UnitreeG1Model, UNITREE_G1_OBS_DIM, UNITREE_G1_STATE_DIM, UNITREE_G1_PRIV_DIM,
 )
 
 
-comptime OBS: Int = UNITREE_G1_OBS_DIM
+# ⚠ TWO widths, as in the trainer (docs §12.34-12.37). `SP` is what the env
+# produces and what `b` filters to; `OBS` is the packed row, whose last 401 are
+# `last_action | history` — maintained by `g1_score_segment` itself. Declaring
+# `OBS = SP` here would compile the history OUT of that function's
+# `comptime if` and then fail to load any post-§12.37 checkpoint on a shape
+# mismatch, which is exactly what it did until this line changed.
+comptime SP: Int = UNITREE_G1_OBS_DIM
+comptime OBS: Int = UNITREE_G1_FULL_OBS_DIM
 comptime ACT: Int = UnitreeG1Model.ACTION_DIM
 comptime D: Int = G1_D
 comptime H: Int = G1_H
@@ -77,8 +89,10 @@ comptime NV = UnitreeG1Model.NV
 comptime SEG_ROWS: Int = G1_SEG_ROWS
 
 comptime FNet = BFMFTower[OBS, ACT, D, H, L, D]
-comptime BNet = BFMBNet[OBS, D, HB]
-comptime ANet = BFMActorTower[OBS, D, H, L, ACT]
+comptime BNet = BFMBNetFiltered[OBS, SP, D, HB]
+comptime ANet = BFMActorTowerFiltered[
+    OBS, UNITREE_G1_STATE_DIM, G1_ACTOR_EXTRA, D, H, L, ACT
+]
 comptime Trainer = FBTrainer[FNet, BNet, ANet, OBS, ACT, D, BATCH, "cpu"]
 
 
@@ -142,6 +156,9 @@ def main() raises:
     var max_segments = atol(_flag(String("--segments"), String(1 << 30)))
     var out_csv = _flag(String("--out"), String(""))
     var clips = _flag_ints(String("--clips"))
+    # 12.45: the tracking PROMPT, not the policy. 1 is what every recorded
+    # number used; the reference sums B over a look-ahead horizon.
+    var z_horizon = atol(_flag(String("--z-horizon"), String(1)))
     if ckpt == "" and not random_init:
         raise Error("pass --ckpt <path> or --random")
 
@@ -160,6 +177,8 @@ def main() raises:
     # ── the networks ──────────────────────────────────────────────────
     var t = Trainer.make(lr=3e-4, gamma=0.98, tau=0.01, ortho_weight=100.0, ctx=None, seed=UInt64(7))
     var norm: Optional[ObsNorm[OBS]] = None
+    print("  z_horizon", z_horizon,
+          "(tracking prompt: B summed over that many look-ahead rows)")
     if random_init:
         print("random-init networks (the null baseline)")
     else:
@@ -241,6 +260,7 @@ def main() raises:
             var sc = g1_score_segment[FNet, BNet, ANet, OBS, ACT, D, BATCH](
                 t, env, rsi, st, pv, qpos_col, norm, r0,
                 ach, tgt, b_in, b_out, z_seg, obs_t, z1, act_out,
+                z_horizon=z_horizon,
             )
 
             # ── the gate: replay OUR rollout into the oracle and compare ──

@@ -3,7 +3,7 @@
 # +--------------------------------------------------------------------------+ #
 """`DETRVAE.forward` + `ACTPolicy.__call__`'s loss, as one graph.
 
-Mirrors `experimental/lewm/loss_graph.mojo`: every component is an owned node,
+Mirrored the first LeWM port's loss graph (removed 2026-10-03): every component is an owned node,
 so a single Adam iterating `graph.for_each_param` trains the whole model.
 
 ## Inputs

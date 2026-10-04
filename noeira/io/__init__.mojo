@@ -14,6 +14,7 @@
 - ``base64``  — RFC 4648 §4; the Hub's `preupload` and `commit` bodies.
 - ``hf``      — HuggingFace Hub cache paths + file download, over ``http``.
 - ``image``   — Pillow-compatible bilinear and NEAREST resize.
+- ``wav``     — 16-bit PCM WAV read/write, mono/resample (`noeira/ai/speech`).
 - ``png``     — a PNG decoder AND encoder (8-bit, non-interlaced),
                 Pillow-exact both ways.
 - ``tar``     — a ustar / pax / GNU reader, for dataset archives.

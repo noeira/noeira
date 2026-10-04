@@ -27,6 +27,29 @@ cameras), --arm, --seconds (20), --no-return, --no-start-pose, --snap DIR,
 --gripper-sign 0|1 (default: the manifest's), --step-ticks (80), --force-dark,
 --record DIR (per-tick CSV of q, qd, action, target + the two frames every
 16 ticks — what a run did, to lay beside `pixel_student_probe_sim.mojo`),
+--grip-offset X (rad, default 0: added to the GRIPPER angle the policy SEES,
+not to the one the commands use — the real jaws read ~0.05 rad more closed
+on the 25 mm cube than the sim's, 0.063 vs 0.10-0.14, and a student never
+trained on that reading hovered over the bowl without releasing),
+--start-grip RAD (the gripper's angle in the start pose the arm ramps to,
+default the task reset's; the sim resets it anywhere in -0.13..0.68 and the
+students closed at once, and never recovered, in 3 / 16 probe episodes and on
+the arm from -0.02), --no-dive-guard (by default a run ENDS when the arm has
+been reaching down past the desk — shoulder_lift > 1.35 AND elbow_flex <
+-1.35 rad — for 3 ticks: no sim grasp is made there (they close at
+shoulder_lift -0.1..0.5, elbow 0.35..1.4), the sim's rigid desk absorbs it
+and the real tower does not),
+--keep-dynamic-fps (by default each /dev camera gets `v4l2-ctl -c
+exposure_dynamic_framerate=0` at open: with it ON, both rig cameras were
+found so, a UVC camera may drop to ~10 fps to lengthen its exposure as the
+room dims — runs then saw 2 / 3 of their frames STALE and the student, acting
+on an image ~100 ms behind the arm, overshot the pan and closed beside the
+cube, 1 Oct; the run with 8 % stale frames grasped),
+--play-targets SIM_CSV OUT_CSV (with --arm: NO policy, NO cameras used —
+the commanded targets of a sim probe rollout, `pixel_student_probe_sim.mojo
+--record` episode 0's tgt0..5, played tick by tick from the start pose; OUT
+gets the real joints beside the sim's: does the real arm follow the path the
+sim arm took under the SAME commands? The dive guard stays on),
 --sysid FILE (with --arm: NO policy — each joint in turn steps +A, back, -A,
 back from the sim's start pose, 0.8 s per step, A 0.1 rad / 0.3 gripper; the
 per-tick targets and joints go to FILE, the servos' delay and time constant
@@ -96,14 +119,15 @@ from noeira.robot.so101.deploy_shutdown import (
 )
 from noeira.robot.so101.ports import follower_port, port_refusal
 from noeira.robot.so101.sim_map import SimJointMap
-from noeira.tasks.delta_action import delta_target
+from noeira.io.proc import run_capture
+from noeira.tasks.delta_action import delta_target, target_step, TARGET_OBS
 from noeira.tasks.family import scene_path
 from noeira.tasks.family_config import So101TowerConfig
 from noeira.tasks.pixel_student import (
     StudentNet, N_CAMS, OBS_PX, PLANE, IN_DIM, ACT, CAM_FOVY_DEG, JOINT_VEL,
     camera_names, check_pixel_manifest, frame_to_planes, joints_to_planes,
     joint_vels_to_planes, student_act, HIST_WORDS, act_hist_push,
-    act_hist_to_planes,
+    act_hist_to_planes, target_lead_to_planes,
 )
 from noeira.tasks.placement.so101_tower import So101TowerPlacement
 from noeira.tasks.posed_reset import posed_qpos
@@ -279,6 +303,21 @@ def main() raises:
     var force_dark = _flag(args, "--force-dark")
     var rec_dir = _arg(args, "--record", "")
     var sysid = _arg(args, "--sysid", "")
+    var play_in = String("")
+    var play_out = String("")
+    for i in range(len(args) - 2):
+        if args[i] == "--play-targets":
+            play_in = args[i + 1]
+            play_out = args[i + 2]
+    var grip_off = Float64(_arg(args, "--grip-offset", "0"))
+    var keep_dyn_fps = _flag(args, "--keep-dynamic-fps")
+    # --act-ema A: each ARM action word executed as (1 - A) new + A previous
+    # (the gripper's is not smoothed) — the 31 Hz students flip the sign of
+    # their arm actions on ~30 % of ticks, in sim as on the arm, and the
+    # real run shook the clamped tower
+    var act_ema = Float64(_arg(args, "--act-ema", "0"))
+    var start_grip = _arg(args, "--start-grip", "")
+    var dive_guard = not _flag(args, "--no-dive-guard")
 
     print("=" * 74)
     print("PIXEL STUDENT on the physical SO-101 — sim-to-real")
@@ -343,6 +382,9 @@ def main() raises:
     var q_start = List[Float64]()
     for i in range(ACT):
         q_start.append(q0[qa[i]])
+    if start_grip.byte_length() > 0:
+        q_start[ACT - 1] = Float64(start_grip)
+        print("  --start-grip: the gripper starts at", q_start[ACT - 1], "rad")
 
     # ── the cameras ───────────────────────────────────────────────────────
     var devices = parse_camera_specs(devices_csv)
@@ -355,6 +397,19 @@ def main() raises:
     for i in range(N_CAMS):
         print("camera slot " + String(i) + " = " + pad_right(names[i], 10)
               + " <- " + devices[i])
+        if not keep_dyn_fps and devices[i].startswith("/dev/"):
+            # a constant 30 fps: no exposure-driven frame-rate drop
+            try:
+                var out = run_capture(
+                    "v4l2-ctl -d " + devices[i]
+                    + " -c exposure_dynamic_framerate=0 2>&1"
+                )
+                if out.byte_length() > 0:
+                    print("            v4l2-ctl: " + String(out.strip()))
+                else:
+                    print("            exposure_dynamic_framerate=0 (constant frame rate)")
+            except:
+                print("            ⚠ could not run v4l2-ctl: the frame rate may drop in dim light")
         var c = CameraReader.from_spec(
             devices[i], CAM_W, CAM_H, 30.0, rgb=False, fourcc=fourcc,
             out_w=CAM_W, out_h=CAM_H,
@@ -437,7 +492,11 @@ def main() raises:
 
     # one dry forward on the real observation, printed (the arm at rest:
     # velocities zero)
-    joints_to_planes(q, xs)
+    if grip_off != 0.0:
+        print("  --grip-offset", grip_off, "rad on the gripper angle the policy sees")
+    var q_pol = q.copy()
+    q_pol[SO101_N - 1] += grip_off
+    joints_to_planes(q_pol, xs)
     var qd = List[Float64](length=SO101_N, fill=0.0)
     joint_vels_to_planes(qd, xs)
     # the last executed actions (TASK_PPO_ACT_HIST builds): none yet
@@ -519,6 +578,82 @@ def main() raises:
     else:
         print("dry run — nothing energised\n")
 
+    var dive_ticks = 0
+    # ── --play-targets: a sim rollout's commands on the real arm ─────────
+    if play_in.byte_length() > 0:
+        if not arm_it:
+            raise Error("pixel deploy: --play-targets moves the arm; it needs --arm")
+        var sim_q = List[List[Float64]]()
+        var sim_t = List[List[Float64]]()
+        with open(play_in, "r") as fh:
+            var lines = fh.read().split("\n")
+            for li in range(1, len(lines)):
+                var l = String(lines[li].strip())
+                if l.byte_length() == 0:
+                    continue
+                var w = l.split(",")
+                if Int(String(w[0])) != 0:
+                    break
+                var qq = List[Float64]()
+                var tt = List[Float64]()
+                for j in range(SO101_N):
+                    qq.append(Float64(String(w[2 + j])))
+                    tt.append(Float64(String(w[20 + j])))
+                sim_q.append(qq^)
+                sim_t.append(tt^)
+        print("  play-targets:", len(sim_t), "ticks from", play_in)
+        var pcsv = String("tick,t_s,q0,q1,q2,q3,q4,q5,sq0,sq1,sq2,sq3,sq4,sq5,tgt0,tgt1,tgt2,tgt3,tgt4,tgt5\n")
+        var pgoals = Array[Int32, SO101_N](fill=0)
+        var t0p = perf_counter_ns()
+        var pdive = 0
+        try:
+            for k in range(len(sim_t)):
+                var tt0 = perf_counter_ns()
+                for i in range(SO101_N):
+                    var g = sim_t[k][i]
+                    if g < lo[i]:
+                        g = lo[i]
+                    if g > hi[i]:
+                        g = hi[i]
+                    pgoals[i] = jmap.from_sim(arm.cal, i, g)
+                arm.write_goals(Span(pgoals))
+                if arm.read_positions(Span(raw)) == SO101_N:
+                    var row = String(k) + "," + String(Float64(perf_counter_ns() - t0p) / 1e9)
+                    var rq = List[Float64](length=SO101_N, fill=0.0)
+                    for i in range(SO101_N):
+                        rq[i] = jmap.to_sim_unclamped(arm.cal, i, raw[i])
+                        row += "," + String(rq[i])
+                    for i in range(SO101_N):
+                        row += "," + String(sim_q[k][i])
+                    for i in range(SO101_N):
+                        row += "," + String(sim_t[k][i])
+                    pcsv += row + "\n"
+                    if rq[1] > 1.35 and rq[2] < -1.35:
+                        pdive += 1
+                        if pdive >= 3:
+                            print("  ⚠ dive guard during play-targets; stopping")
+                            dive_ticks = 3
+                            break
+                    else:
+                        pdive = 0
+                _spin_until(tt0 + period_ns)
+        finally:
+            with open(play_out, "w") as f:
+                f.write(pcsv)
+            print("  wrote " + play_out)
+            var released = return_and_release(
+                arm, start_pose, arm_it, do_return, stdin, interactive,
+                20 if dive_ticks >= 3 else 8,
+            )
+            if not released:
+                print("⚠ the follower is STILL ENERGISED — deliberate, see above.")
+            for i in range(N_CAMS):
+                try:
+                    cams[i].stop()
+                except:
+                    pass
+        return
+
     # ── --sysid: the servos' step response, no policy ───────────────────
     if sysid.byte_length() > 0:
         if not arm_it:
@@ -576,6 +711,11 @@ def main() raises:
     var bus_skipped = 0
     var clamped = 0
     var sum_fwd = 0.0
+    # where a tick's time goes (ms, summed): the cameras (take + planes), the
+    # bus read, the bus write -- the loop ran ~27.5 Hz against the sim's 31.25
+    var sum_cam = 0.0
+    var sum_read = 0.0
+    var sum_write = 0.0
     var worst_tick = 0.0
     var rec_csv = String("t_s,q0,q1,q2,q3,q4,q5,qd0,qd1,qd2,qd3,qd4,qd5,a0,a1,a2,a3,a4,a5,tgt0,tgt1,tgt2,tgt3,tgt4,tgt5\n")
     if rec_dir.byte_length() > 0:
@@ -598,9 +738,27 @@ def main() raises:
     var q_prev = List[Float64](length=SO101_N, fill=0.0)
     for i in range(SO101_N):
         q_prev[i] = q[i]
+    # target mode (`man.action == "target"`): the last commanded target,
+    # seeded on the joints the ramp left the arm at — the policy steps from
+    # it (`delta_action.target_step`), and sees its lead over the joints
+    var tprev = q.copy()
+    var lead = List[Float64](length=TARGET_OBS, fill=0.0)
+    if man.action == "target":
+        print("  target mode: steps from the previous target, lead bound",
+              man.target_lead, "rad")
     var t_prev = perf_counter_ns()
     var loop_t0 = perf_counter_ns()
     var deadline = loop_t0 + seconds * 1_000_000_000
+    var a_ex = List[Float64](length=ACT, fill=0.0)
+    dive_ticks = 0
+    if act_ema > 0.0:
+        print("  --act-ema", act_ema, "on the arm's action words")
+    var line2 = String("")
+    var ra = String("")
+    var rt = String("")
+    if man.repeat > 1:
+        print("  the policy acts every", man.repeat, "ticks (",
+              fixed(1.0 / (man.control_period_s * Float64(man.repeat)), 1), "Hz)")
     try:
         while perf_counter_ns() < deadline:
             var tt = perf_counter_ns()
@@ -610,11 +768,16 @@ def main() raises:
                 break
             # observe: the latest frame of each camera (the previous one if
             # none arrived this period — counted)
+            var tc0 = perf_counter_ns()
             for i in range(N_CAMS):
                 if cams[i].take_latest(frames[i]) == 0:
                     stale += 1
                 frame_to_planes(frames[i], CAM_W, CAM_H, i, xs)
-            if arm.read_positions(Span(raw)) != SO101_N:
+            var tc1 = perf_counter_ns()
+            sum_cam += Float64(tc1 - tc0) / 1e6
+            var rd_ok = arm.read_positions(Span(raw)) == SO101_N
+            sum_read += Float64(perf_counter_ns() - tc1) / 1e6
+            if not rd_ok:
                 bus_skipped += 1
                 _spin_until(tt + period_ns)
                 continue
@@ -625,31 +788,60 @@ def main() raises:
                 qd[i] = (q[i] - q_prev[i]) / dt_s if dt_s > 1e-4 else 0.0
                 q_prev[i] = q[i]
             t_prev = t_now
-            joints_to_planes(q, xs)
+            # the DIVE GUARD: reaching down past the desk, no grasp is made there
+            if dive_guard and q[1] > 1.35 and q[2] < -1.35:
+                dive_ticks += 1
+                if dive_ticks >= 3:
+                    print("  ⚠ dive guard: shoulder_lift", fixed(q[1], 2), "elbow",
+                          fixed(q[2], 2), "— reaching down past the desk; the run ends")
+                    break
+            else:
+                dive_ticks = 0
+            for i in range(SO101_N):
+                q_pol[i] = q[i]
+            q_pol[SO101_N - 1] += grip_off
+            joints_to_planes(q_pol, xs)
             joint_vels_to_planes(qd, xs)
             act_hist_to_planes(hist, xs)
+            for j in range(TARGET_OBS):
+                lead[j] = tprev[j] - q[j]
+            target_lead_to_planes(lead, xs)
             if snap_dir.byte_length() > 0 and ticks == 62:
                 _snap(snap_dir, frames, xs, q, String("_t2s"))
-            for k in range(IN_DIM):
-                x.data[k] = xs[k]
-            var tf = perf_counter_ns()
-            net.forward["cpu", 1](TensorRefs[1](x), y, None)
-            sum_fwd += Float64(perf_counter_ns() - tf) / 1e6
-            # act: the teacher's delta rule, then servo ticks
-            var line2 = String("")
-            var ra = String("")
-            var rt = String("")
-            var a_ex = List[Float64](length=ACT, fill=0.0)
-            for j in range(ACT):
-                var a = Float64(student_act(y.data[j], j, grip_sign))
-                a_ex[j] = a
-                var tgt = delta_target(q[j], a, j, lo[j], hi[j], man.delta_arm, man.delta_gripper)
-                if tgt <= lo[j] or tgt >= hi[j]:
-                    clamped += 1
-                goals[j] = jmap.from_sim(arm.cal, j, tgt)
-                line2 += " " + col(a, 6, 2)
-                ra += "," + String(a)
-                rt += "," + String(tgt)
+            # the policy acts every `repeat` ticks (the manifest's cadence);
+            # between, the last goals are re-sent and the joints still read
+            # every tick (the velocities are per tick, as the sim's qvel)
+            var acting = ticks % man.repeat == 0
+            if acting:
+                for k in range(IN_DIM):
+                    x.data[k] = xs[k]
+                var tf = perf_counter_ns()
+                net.forward["cpu", 1](TensorRefs[1](x), y, None)
+                sum_fwd += Float64(perf_counter_ns() - tf) / 1e6
+                # act: the teacher's delta rule, then servo ticks
+                line2 = String("")
+                ra = String("")
+                rt = String("")
+                for j in range(ACT):
+                    var a = Float64(student_act(y.data[j], j, grip_sign))
+                    if act_ema > 0.0 and j < ACT - 1:
+                        a = (1.0 - act_ema) * a + act_ema * a_ex[j]
+                    a_ex[j] = a
+                    var tgt: Float64
+                    if man.action == "target":
+                        tgt = target_step(
+                            tprev[j], q[j], a, j, lo[j], hi[j], man.delta_arm,
+                            man.delta_gripper, man.target_lead,
+                        )
+                        tprev[j] = tgt
+                    else:
+                        tgt = delta_target(q[j], a, j, lo[j], hi[j], man.delta_arm, man.delta_gripper)
+                    if tgt <= lo[j] or tgt >= hi[j]:
+                        clamped += 1
+                    goals[j] = jmap.from_sim(arm.cal, j, tgt)
+                    line2 += " " + col(a, 6, 2)
+                    ra += "," + String(a)
+                    rt += "," + String(tgt)
             if rec_dir.byte_length() > 0:
                 var row = String(Float64(perf_counter_ns() - loop_t0) / 1e9)
                 for j in range(ACT):
@@ -660,10 +852,13 @@ def main() raises:
                 if ticks % 16 == 0:
                     _snap(rec_dir, frames, xs, q, String("_") + String(ticks))
             if arm_it:
+                var tw0 = perf_counter_ns()
                 arm.write_goals(Span(goals))
+                sum_write += Float64(perf_counter_ns() - tw0) / 1e6
             # ⚠ what was SENT, as the trainer records it (the dry run too: its
             # policy then sees the commands it would have made)
-            act_hist_push(hist, a_ex)
+            if acting:
+                act_hist_push(hist, a_ex)
             if ticks % 15 == 0:
                 print("  t=" + pad_left(fixed(Float64(perf_counter_ns() - loop_t0) / 1e9, 1), 5)
                       + "s  a:" + line2)
@@ -681,8 +876,26 @@ def main() raises:
                 print("  wrote " + rec_dir + "/ticks.csv")
             except:
                 print("  ⚠ could not write the tick log")
+        # after a DIVE stop, lift clear of the desk first: shoulder_lift alone
+        # back to 0.3 rad (the arm rises away from the desk), the other joints
+        # held — the straight return from the dive pose did not arrive twice
+        # (1460-1476 ticks off) and left the arm energised on the desk
+        if arm_it and dive_ticks >= 3:
+            try:
+                if arm.read_positions(Span(raw)) == SO101_N:
+                    var lift = List[Int32]()
+                    for i in range(SO101_N):
+                        lift.append(raw[i])
+                    lift[1] = jmap.from_sim(arm.cal, 1, 0.3)
+                    print("  lifting clear of the desk (shoulder_lift -> 0.3 rad, <= 15 s) ...")
+                    # ⚠ slow, not blocked: the jaw drags on the desk at first
+                    if not _ramp_to(arm, lift, 15):
+                        print("  ⚠ the lift did not arrive; returning anyway")
+            except:
+                print("  ⚠ the lift clear of the desk failed; returning anyway")
         var released = return_and_release(
-            arm, start_pose, arm_it, do_return, stdin, interactive
+            arm, start_pose, arm_it, do_return, stdin, interactive,
+            20 if dive_ticks >= 3 else 8,
         )
         if not released:
             print("⚠ the follower is STILL ENERGISED — deliberate, see above.")
@@ -698,8 +911,19 @@ def main() raises:
     print("  ticks           = " + String(ticks) + " in " + fixed(el, 1) + " s = "
           + fixed(Float64(ticks) / max(el, 1e-9), 1) + " Hz (sim: "
           + fixed(1.0 / man.control_period_s, 2) + ")")
+    var nt = Float64(max(ticks, 1))
+    print("  tick time (mean ms): cameras + planes " + fixed(sum_cam / nt, 2)
+          + " | bus read " + fixed(sum_read / nt, 2) + " | bus write "
+          + fixed(sum_write / nt, 2) + " | forward " + fixed(sum_fwd / nt, 2)
+          + " | budget " + fixed(Float64(period_ns) / 1e6, 1))
     print("  worst tick      = " + fixed(worst_tick, 1) + " ms | forward mean "
           + fixed(sum_fwd / Float64(max(ticks, 1)), 2) + " ms")
     print("  stale frames    = " + String(stale) + " | bus reads skipped "
           + String(bus_skipped) + " | targets at a joint limit " + String(clamped))
+    if ticks > 0 and Float64(stale) > 0.2 * Float64(ticks * N_CAMS):
+        print("  ⚠⚠ " + fixed(100.0 * Float64(stale) / Float64(ticks * N_CAMS), 0)
+              + " % of the camera reads were STALE: the policy acted on images"
+              + " behind the arm (a camera below 30 fps — dim light with"
+              + " exposure_dynamic_framerate on, or USB bandwidth). Do not"
+              + " judge the policy on this run.")
     print("=" * 74)

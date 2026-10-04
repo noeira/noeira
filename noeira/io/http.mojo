@@ -13,6 +13,11 @@
 
     _ = http_download(url, "cache/x.h5", expect_size=n, label="dataset")
 
+    c.start("POST", url, body, "application/json")   # async: returns at once
+    while not c.poll(0):                              # advance; never blocks
+        consume(c.read_new())                         # bytes as they arrive
+    var r = c.finish()
+
 Every net call in `noeira` used to go through Python `urllib` or a `curl`
 subprocess. `urllib` is the more expensive of the two, and not because of
 throughput: `RemoteLogger.flush` was the reason a *training binary* had to
@@ -314,6 +319,11 @@ struct HttpClient(Movable & Deinitable):
     # ── the one call everything else goes through ─────────────────────
 
     def _reset(mut self) raises:
+        if self.running():
+            raise Error(
+                "http: a request is already in flight on this client — poll it"
+                " to the end or cancel() it first"
+            )
         _get_dylib_function[lib, "nra_http_reset", def (Int) thin -> None]()(
             self._h
         )
@@ -430,6 +440,117 @@ struct HttpClient(Movable & Deinitable):
                 + String(expect) + "): " + resp.text()
             )
         return resp^
+
+    # ── async: streaming and background requests ──────────────────────
+    #
+    #     c.start("POST", url, body, "application/json")
+    #     while not c.poll(0):          # never blocks; call once per frame
+    #         var chunk = c.read_new()  # body bytes that arrived since last call
+    #         draw()
+    #     var r = c.finish()            # the whole response, as request() gives
+    #
+    # ⚠ NOTHING HAPPENS BETWEEN POLLS. There is no thread: the transfer only
+    # advances inside `poll`, so a loop that stops polling stalls the request
+    # (and, past the server's patience, times it out). `poll(timeout_ms)` with
+    # a positive timeout waits for socket activity, which is how a blocking
+    # caller spins without burning a core.
+
+    def start(
+        mut self,
+        var method: String,
+        var url: String,
+        body: List[UInt8] = List[UInt8](),
+        var content_type: String = String(""),
+    ) raises:
+        """Launch a request and return at once. Same arguments as `request`."""
+        self._reset()
+        if content_type.byte_length() > 0:
+            _ = self._add_header("Content-Type: " + content_type)
+        if len(body) > 0:
+            var st = _get_dylib_function[
+                lib,
+                "nra_http_set_body",
+                def (Int, Ptr[UInt8, MutUntrackedOrigin], Int) thin -> Int32,
+            ]()(self._h, untracked(Ptr(to=body[0])), len(body))
+            if st != 0:
+                raise Error("http: cannot buffer a " + String(len(body)) + " byte body")
+        var rc = _get_dylib_function[
+            lib,
+            "nra_http_start",
+            def (
+                Int,
+                Ptr[c_char, MutUntrackedOrigin],
+                Ptr[c_char, MutUntrackedOrigin],
+            ) thin -> Int32,
+        ]()(
+            self._h,
+            untracked(method.as_c_string_span().ptr()),
+            untracked(url.as_c_string_span().ptr()),
+        )
+        if rc != 0:
+            raise Error("http: cannot start " + method + " " + url + " (" + String(rc) + ")")
+
+    def poll(mut self, timeout_ms: Int = 0) raises -> Bool:
+        """Advance the in-flight request. True once it has finished (or when
+        nothing is in flight); then call `finish`."""
+        var r = _get_dylib_function[lib, "nra_http_poll", def (Int, Int32) thin -> Int32]()(
+            self._h, Int32(timeout_ms)
+        )
+        if r < 0:
+            raise Error("http: poll failed")
+        return r == 1
+
+    def running(self) -> Bool:
+        try:
+            return (
+                _get_dylib_function[lib, "nra_http_running", def (Int) thin -> Int32]()(
+                    self._h
+                )
+                != 0
+            )
+        except:
+            return False
+
+    def status(self) raises -> Int:
+        """The response status so far — 0 until the headers arrive."""
+        return _get_dylib_function[lib, "nra_http_status", def (Int) thin -> Int]()(
+            self._h
+        )
+
+    def read_new(mut self) raises -> List[UInt8]:
+        """Body bytes that arrived since the previous call (possibly none).
+        Works during the transfer and after it, until the next request."""
+        var n = _get_dylib_function[lib, "nra_http_unread_len", def (Int) thin -> Int]()(
+            self._h
+        )
+        var out = List[UInt8]()
+        if n <= 0:
+            return out^
+        out.resize(n, 0)
+        var got = _get_dylib_function[
+            lib,
+            "nra_http_read_new",
+            def (Int, Ptr[UInt8, MutUntrackedOrigin], Int) thin -> Int,
+        ]()(self._h, untracked(Ptr(to=out[0])), n)
+        out.resize(got, 0)
+        return out^
+
+    def finish(mut self) raises -> HttpResponse:
+        """The finished response. Raises on a TRANSPORT failure (like
+        `request`), or when the request has not finished yet."""
+        if self.running():
+            raise Error("http: finish() while the request is still running")
+        var rc = _get_dylib_function[
+            lib, "nra_http_async_result", def (Int) thin -> Int32
+        ]()(self._h)
+        if rc != 0:
+            raise Error("http: async request failed: " + self._error() + " (curl " + String(rc) + ")")
+        return HttpResponse(self.status(), self._take_body())
+
+    def cancel(mut self) raises:
+        """Abandon the in-flight request (no-op when none). The connection is
+        dropped; the next request opens a new one."""
+        _get_dylib_function[lib, "nra_http_cancel", def (Int) thin -> None]()(self._h)
 
     def get(mut self, var url: String, expect: Int = -1) raises -> HttpResponse:
         return self.request(String("GET"), url, expect=expect)

@@ -56,6 +56,8 @@ from max.gpu import global_idx
 from noeira.nn.constants import DT
 from noeira.data.resident import IDX_DT
 from .unitree_g1_xml import UNITREE_G1_OBS_DIM, UNITREE_G1_STATE_DIM
+from .unitree_g1_pd import G1_NORMALIZE_TO, G1_ACTION_CLIP
+from noeira.nn.core.tensor import Tensor
 
 
 comptime G1_HIST_LEN: Int = 4
@@ -425,3 +427,103 @@ def g1_scale_clip_kernel[N: Int](
     if v < -clip:
         v = -clip
     dst[unsafe_offset=i] = v
+
+
+# =====================================================================
+# The actor's 401, host-side and single-lane
+# =====================================================================
+
+
+struct G1ActorObs(Copyable, Movable):
+    """`last_action` + `history_actor` for a ONE-LANE host rollout.
+
+    ⚠ THIS IS THE ONLY HOST-SIDE COPY OF THESE RULES. `g1_score_segment` (the
+    tracking eval, and therefore the viewer) and the reward joystick both drive
+    it. They used to be one inline block inside the eval, and a second caller
+    would have had to restate four things that are each a silent-wrong-answer
+    if got wrong (`_a_rule_written_inline_twice_drifts`):
+
+      1. zero at reset;
+      2. the RESET observation is never pushed — `push` is a no-op on its own
+         first call, which is what makes `history[j]` valid only from age j+2;
+      3. the push happens AFTER the step's history has been read and BEFORE
+         `last_action` is updated, so the newest `actions` entry is the action
+         applied one step EARLIER, not the one about to be applied;
+      4. the stored action is what the PD chain saw — `a * G1_NORMALIZE_TO`
+         clipped to +-G1_ACTION_CLIP — not the raw net output.
+
+    The GPU rollout keeps its own copy of the same rules in the ring's derived
+    tail (`derive_tail_kernel`); `tests/robots/test_g1_history.mojo` gates the
+    two against each other, which is what stops THAT pair drifting.
+    """
+
+    var last_a: List[Float64]
+    var hist: List[Float64]
+    var pushes: Int
+
+    def __init__(out self):
+        self.last_a = List[Float64](length=G1_N_ACT, fill=0.0)
+        self.hist = List[Float64](length=G1_HIST_DIM, fill=0.0)
+        self.pushes = 0
+
+    def reset(mut self):
+        """Zero both blocks. Call on every `set_state`, not just the first."""
+        for i in range(G1_N_ACT):
+            self.last_a[i] = 0.0
+        for i in range(G1_HIST_DIM):
+            self.hist[i] = 0.0
+        self.pushes = 0
+
+    def fill[
+        DTYPE: DType, OBS: Int
+    ](self, ref o: List[Scalar[DTYPE]], mut obs_t: Tensor) raises:
+        """Write the packed `[state+priv | last_action | history]` row.
+
+        `OBS` decides how much: at `UNITREE_G1_OBS_DIM` this is the 527-wide
+        pre-12.34 row and the tail is not written at all, which is what lets a
+        caller compile against either width.
+        """
+        for k in range(UNITREE_G1_OBS_DIM):
+            obs_t.data[k] = Scalar[DT](Float64(o[k]))
+        comptime if OBS > UNITREE_G1_OBS_DIM:
+            for k in range(G1_N_ACT):
+                obs_t.data[UNITREE_G1_OBS_DIM + k] = Scalar[DT](self.last_a[k])
+            for k in range(G1_HIST_DIM):
+                obs_t.data[
+                    UNITREE_G1_OBS_DIM + G1_LAST_ACTION_DIM + k
+                ] = Scalar[DT](self.hist[k])
+
+    def push[
+        DTYPE: DType
+    ](mut self, ref o: List[Scalar[DTYPE]], ref act_out: Tensor) raises:
+        """Advance one control step: history first, then `last_action`.
+
+        `act_out` is the RAW net output; the scaling to what the PD chain saw
+        is applied here so no caller has to remember it. The first call after
+        a `reset` only records `last_action` — see rule 2 above.
+        """
+        if self.pushes >= 1:
+            for key in range(5):
+                var kb = g1_hist_key_offset(key)
+                var kd = g1_hist_key_dim(key)
+                var so = g1_hist_key_state_offset(key)
+                var jj = G1_HIST_LEN - 1
+                while jj > 0:
+                    for e in range(kd):
+                        self.hist[kb + jj * kd + e] = self.hist[
+                            kb + (jj - 1) * kd + e
+                        ]
+                    jj -= 1
+                for e in range(kd):
+                    if so < 0:
+                        self.hist[kb + e] = self.last_a[e]
+                    else:
+                        self.hist[kb + e] = Float64(o[so + e])
+        for k in range(G1_N_ACT):
+            var v = Float64(act_out.data[k]) * G1_NORMALIZE_TO
+            if v > G1_ACTION_CLIP:
+                v = G1_ACTION_CLIP
+            elif v < -G1_ACTION_CLIP:
+                v = -G1_ACTION_CLIP
+            self.last_a[k] = v
+        self.pushes += 1

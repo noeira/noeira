@@ -30,7 +30,7 @@ reader to keep `H`/`L`/`HB`/`D` in sync by hand, and a mismatch only showed up
 as a checkpoint that would not load.
 """
 
-from std.math import sqrt, abs
+from std.math import sqrt, abs, acos, sin
 
 from noeira.nn.constants import DT
 from noeira.nn.core.module import Module
@@ -43,6 +43,7 @@ from noeira.envs.robots import UnitreeG1
 from noeira.envs.robots.unitree_g1_history import (
     G1_HIST_DIM, G1_HIST_LEN, G1_N_ACT, G1_LAST_ACTION_DIM,
     g1_hist_key_offset, g1_hist_key_dim, g1_hist_key_state_offset,
+    G1ActorObs,
 )
 from noeira.envs.robots.unitree_g1_pd import G1_NORMALIZE_TO, G1_ACTION_CLIP
 from noeira.envs.robots.unitree_g1_xml import (
@@ -186,36 +187,83 @@ def g1_project_z[Dz: Int](mut z: Tensor, row: Int):
         )
 
 
-def g1_score_segment[
-    FNET: Module, BNET: Module, ANET: Module,
+def g1_slerp_z[Dz: Int](
+    ref src: Tensor, ai: Int, bi: Int,
+    u: Float64, mut dst: Tensor, di: Int,
+):
+    """Geodesic interpolation between two `z` on the radius-sqrt(d) sphere.
+
+    The latent is a SPHERE, so the straight line between two prompts
+    leaves it and a renormalised lerp is not the shortest path. 12.45:
+    the reference shows interpolation along geodesics produces
+    "semantically meaningful intermediate skills"; a lerp bunches the
+    intermediate points toward the endpoints and would make a coarse
+    knot sequence move in jerks between them.
+
+    Lives here, beside `g1_project_z`, because both own the radius and
+    it must not be computed in two places.
+
+    ⚠ ONE source tensor and two ROW INDICES, not two tensors: the
+    callers interpolate between adjacent rows of the same knot table,
+    and Mojo rejects passing one tensor as two `ref` arguments.
+    """
+    var dot = 0.0
+    var na = 0.0
+    var nb = 0.0
+    for k in range(Dz):
+        var x = Float64(src.data[ai * Dz + k])
+        var y = Float64(src.data[bi * Dz + k])
+        dot += x * y
+        na += x * x
+        nb += y * y
+    var den = sqrt(na * nb) + 1e-12
+    var c = dot / den
+    if c > 1.0:
+        c = 1.0
+    if c < -1.0:
+        c = -1.0
+    var th = acos(c)
+    var s_th = sin(th)
+    # ⚠ NEAR-PARALLEL FALLS BACK TO A LERP, and must: sin(theta) in the
+    # denominator is a 0/0 as the two prompts coincide, which is the
+    # COMMON case here — adjacent knots on a smooth motion are nearly
+    # the same vector (12.45 measured exactly that on the horizon
+    # sweep). The projection at the end makes the lerp exact there.
+    var wa = 1.0 - u
+    var wb = u
+    if s_th > 1e-6:
+        wa = sin((1.0 - u) * th) / s_th
+        wb = sin(u * th) / s_th
+    for k in range(Dz):
+        dst.data[di * Dz + k] = Scalar[DT](
+            wa * Float64(src.data[ai * Dz + k])
+            + wb * Float64(src.data[bi * Dz + k])
+        )
+    g1_project_z[Dz](dst, di)
+
+
+def g1_build_prompt[
+    BNET: Module, FNET: Module, ANET: Module,
     OBS: Int, ACT: Int, D: Int, BATCH: Int,
 ](
     mut t: FBTrainer[FNET, BNET, ANET, OBS, ACT, D, BATCH, "cpu"],
-    mut env: UnitreeG1[DType.float64],
-    ref rsi: G1RsiTable,
     ref st: List[Scalar[DType.float32]],
     ref pv: List[Scalar[DType.float32]],
-    ref qpos_col: List[Scalar[DType.float32]],
     ref norm: Optional[ObsNorm[OBS]],
     r0: Int,
-    mut ach: List[Float64],
-    mut tgt: List[Float64],
     mut b_in: Tensor,
     mut b_out: Tensor,
     mut z_seg: Tensor,
-    mut obs_t: Tensor,
-    mut z1: Tensor,
-    mut act_out: Tensor,
-) raises -> G1TrackScore:
-    """`tracking_inference` for ONE segment starting at store row `r0`.
+    z_horizon: Int,
+) raises:
+    """The TRACKING prompt for one segment: `B` over the reference rows.
 
-    `z_t = project(B(row t+1))` — a SINGLE row, not the mean of eight the
-    training rollouts use — then reset to row 0 and `T-1` mean-action steps.
+    Split out of `g1_score_segment` so a search can replace it (12.47)
+    while the rollout, the action chain, the history rules and the
+    scoring stay on ONE code path. `g1_score_segment(z_given=True)` skips
+    this and uses whatever the caller left in `z_seg`.
     """
     comptime T = G1_SEG_ROWS
-    comptime NQ = UnitreeG1Model.NQ
-    comptime NV = UnitreeG1Model.NV
-
     for j in range(T):
         for k in range(UNITREE_G1_STATE_DIM):
             b_in.data[j * OBS + k] = Scalar[DT](
@@ -237,10 +285,90 @@ def g1_score_segment[
     if norm:
         norm.value().apply_rows(b_in, T)
     t.backward_embed[T](b_in, b_out)
+    # The tracking prompt. `z_horizon=1` is a SINGLE look-ahead row and is the
+    # default because every number recorded before 12.45 was measured with it;
+    # changing the default would silently reprice the whole history.
+    #
+    # BFM-Zero's own prompt is a look-ahead SUM, `z_t = sum_{t'=t}^{t+H} B(s_t')`
+    # (arXiv 2511.04131), and our TRAINING rollouts use the mean of eight — so
+    # H=1 agrees with neither. The sum runs to `T-1` and stops there rather than
+    # wrapping or clamping to a repeated final row: a segment's last steps
+    # genuinely have less future to aim at, and inventing rows for them would
+    # make the tail of every segment score against a motion the clip does not
+    # contain. The projection is what makes the SUM and the MEAN the same
+    # prompt, so this does not need a 1/H.
+    var zh = z_horizon if z_horizon > 0 else 1
     for j in range(T - 1):
         for k in range(D):
             z_seg.data[j * D + k] = b_out.data[(j + 1) * D + k]
+        for h in range(1, zh):
+            var r = j + 1 + h
+            if r > T - 1:
+                break
+            for k in range(D):
+                z_seg.data[j * D + k] = (
+                    z_seg.data[j * D + k] + b_out.data[r * D + k]
+                )
         g1_project_z[D](z_seg, j)
+
+
+def g1_score_segment[
+    FNET: Module, BNET: Module, ANET: Module,
+    OBS: Int, ACT: Int, D: Int, BATCH: Int,
+](
+    mut t: FBTrainer[FNET, BNET, ANET, OBS, ACT, D, BATCH, "cpu"],
+    mut env: UnitreeG1[DType.float64],
+    ref rsi: G1RsiTable,
+    ref st: List[Scalar[DType.float32]],
+    ref pv: List[Scalar[DType.float32]],
+    ref qpos_col: List[Scalar[DType.float32]],
+    ref norm: Optional[ObsNorm[OBS]],
+    r0: Int,
+    mut ach: List[Float64],
+    mut tgt: List[Float64],
+    mut b_in: Tensor,
+    mut b_out: Tensor,
+    mut z_seg: Tensor,
+    mut obs_t: Tensor,
+    mut z1: Tensor,
+    mut act_out: Tensor,
+    render: Bool = False,
+    frame_delay_ms: Int = 16,
+    z_horizon: Int = 1,
+    z_given: Bool = False,
+) raises -> G1TrackScore:
+    """`tracking_inference` for ONE segment starting at store row `r0`.
+
+    `render=True` draws each step through the env's own renderer. That flag
+    exists so the VIEWER IS THIS FUNCTION — `bfm_zero_policy_viewer.mojo` opens
+    a window and calls exactly the loop the EMD came out of. A viewer with its
+    own copy of the rollout would be a second place for the z schedule, the
+    history rules and the action chain to drift, and it would then be showing
+    something the number never measured (`_a_rule_written_inline_twice_drifts`).
+    The caller owns `init_renderer` / `close`; this draws AND pumps. The
+    pump matters: `check_renderer_quit` is the renderer's only
+    `poll_event` site, and a segment is 499 frames, so a caller that
+    polled between segments left the window unserviced for ten seconds
+    at a time. Events cannot reach the physics — they move the camera —
+    so the score is identical with `render` on or off.
+
+    `z_t = project(sum_{h=1}^{z_horizon} B(row t+h))` — at the default
+    `z_horizon=1` a SINGLE row, which is neither the reference's look-ahead sum
+    nor the mean of eight our training rollouts use (12.45). Then reset to row 0
+    and `T-1` mean-action steps.
+    """
+    comptime T = G1_SEG_ROWS
+    comptime NQ = UnitreeG1Model.NQ
+    comptime NV = UnitreeG1Model.NV
+
+    # `z_given` hands the PROMPT SEQUENCE in rather than deriving it, which
+    # is what lets a search optimise `z_t` against this exact rollout and
+    # this exact metric (12.47). Everything after the prompt stays on one
+    # code path, which is why this is a flag and not a second function.
+    if not z_given:
+        g1_build_prompt[BNET, FNET, ANET, OBS, ACT, D, BATCH](
+            t, st, pv, norm, r0, b_in, b_out, z_seg, z_horizon
+        )
 
     # reset: the RSI row IS `init_state()` (qvel already body-frame)
     var qp = List[Float64](length=NQ, fill=0.0)
@@ -255,6 +383,10 @@ def g1_score_segment[
     for i in range(NQ):
         qp[i] = Float64(env.d.qpos.data[i])
     var nrec = 0
+    # latched: once Escape / the close box has fired, stop PACING and
+    # drawing so the caller gets control back in well under a second,
+    # while the rollout still runs to T and returns a complete score
+    var quit_seen = False
     # ⚠ TWO RECORD SITES, AND THEY MUST STAY IN STEP — the `nrec != T` raise
     # below is the guard that caught exactly that bug once already.
     for k in range(ACT):
@@ -266,19 +398,10 @@ def g1_score_segment[
     # happens AFTER the step's history is read and BEFORE `last_action` is
     # updated — so the newest `actions` entry is the action applied one step
     # earlier, not the one about to be applied.
-    var last_a = List[Float64](length=G1_N_ACT, fill=0.0)
-    var hist = List[Float64](length=G1_HIST_DIM, fill=0.0)
+    var aobs = G1ActorObs()
     for step in range(T - 1):
         var o = env.get_obs_list()
-        for k in range(UNITREE_G1_OBS_DIM):
-            obs_t.data[k] = Scalar[DT](Float64(o[k]))
-        comptime if OBS > UNITREE_G1_OBS_DIM:
-            for k in range(G1_N_ACT):
-                obs_t.data[UNITREE_G1_OBS_DIM + k] = Scalar[DT](last_a[k])
-            for k in range(G1_HIST_DIM):
-                obs_t.data[
-                    UNITREE_G1_OBS_DIM + G1_LAST_ACTION_DIM + k
-                ] = Scalar[DT](hist[k])
+        aobs.fill[OBS=OBS](o, obs_t)
         if norm:
             norm.value().apply_row(obs_t)
         for k in range(D):
@@ -297,29 +420,35 @@ def g1_score_segment[
         # push BEFORE `last_a` is updated: the newest `actions` entry is the
         # PREVIOUS step's action (the oracle's `_push` then `last_action =`)
         comptime if OBS > UNITREE_G1_OBS_DIM:
-            if step >= 1:                      # the reset row is never pushed
-                for key in range(5):
-                    var kb = g1_hist_key_offset(key)
-                    var kd = g1_hist_key_dim(key)
-                    var so = g1_hist_key_state_offset(key)
-                    var jj = G1_HIST_LEN - 1
-                    while jj > 0:
-                        for e in range(kd):
-                            hist[kb + jj * kd + e] = hist[kb + (jj - 1) * kd + e]
-                        jj -= 1
-                    for e in range(kd):
-                        if so < 0:
-                            hist[kb + e] = last_a[e]
-                        else:
-                            hist[kb + e] = Float64(o[so + e])
-            for k in range(G1_N_ACT):
-                var v = Float64(act_out.data[k]) * G1_NORMALIZE_TO
-                if v > G1_ACTION_CLIP:
-                    v = G1_ACTION_CLIP
-                elif v < -G1_ACTION_CLIP:
-                    v = -G1_ACTION_CLIP
-                last_a[k] = v
+            aobs.push(o, act_out)
         _ = env.step(a)
+        if render and not quit_seen:
+            # ⚠ THE PUMP IS HERE, NOT ONCE PER SEGMENT. `check_renderer_quit`
+            # is the renderer's ONLY `poll_event` site — `render_frame` draws but
+            # never services the queue. A segment is 499 frames (≈10 s at 50 Hz),
+            # so pumping only between segments left the window unserviced for ten
+            # seconds at a time: macOS stops presenting a window whose events go
+            # unread, `SDL_WaitAndAcquireGPUSwapchainTexture` then hands back NULL
+            # and `end_frame` submits an EMPTY command buffer — the compositor
+            # keeps showing whatever was in the surface. That is the colour
+            # flashing, and it is also why Escape did nothing mid-segment.
+            # Pumping cannot touch the rollout: it moves the CAMERA, never `d`.
+            quit_seen = env.check_renderer_quit()
+            env.render_frame()
+            env.renderer_delay(frame_delay_ms)
+            # SPACE holds the picture. The renderer's own pause flag is
+            # DISPLAY-ONLY — it draws a badge and freezes a frame counter, it
+            # does not gate the caller — so without this loop Space drew
+            # "PAUSED" over a robot that kept walking. Holding here cannot
+            # change the score: the rollout is a fixed sequence of T steps and
+            # this only delays the next one.
+            while (
+                env.renderer_paused() and not quit_seen
+                and env.is_renderer_open()
+            ):
+                quit_seen = env.check_renderer_quit()
+                env.render_frame()
+                env.renderer_delay(frame_delay_ms)
         for i in range(NQ):
             qp[i] = Float64(env.d.qpos.data[i])
         for k in range(ACT):

@@ -35,6 +35,17 @@ struct PConstants:
     # T-block geometry (pymunk reference: scale=30, length=4)
     comptime T_SCALE: Float64 = 30.0
     comptime T_LENGTH: Float64 = 4.0  # ratio so rect1 width = length*scale=120
+    comptime T_COG_Y: Float64 = 45.0
+    """The T's centre of gravity in its body frame: (0, T_COG_Y). The
+    reference sets `body.center_of_gravity` to the mean of the two shapes'
+    centroids, (0, 15) and (0, 75). Chipmunk integrates a body ABOUT its cog
+    while `body.position` (= the dataset's block x, y) stays the ORIGIN. Our
+    physics therefore integrates the T's cog (`t_body_from_origin`) with
+    cog-relative collision shapes, and every pose leaving the physics is
+    converted back (`t_origin_from_body`); geometry, keypoints, coverage, the
+    goal and rendering stay in the origin frame. Rotating about the origin
+    instead put the block a median 13 px off pymunk after 25 steps (G4a,
+    docs/LEWM_REOPEN_PLAN.md P4)."""
     # rect1 (long horizontal bar): local [-60,0] to [60,30]
     # rect2 (vertical stem):       local [-15,30] to [15,120]
     # In *body local frame*. The body's CoM (set in setup) aligns roughly with
@@ -75,7 +86,12 @@ struct PConstants:
     # Solver
     comptime VEL_ITERATIONS: Int = 6
     comptime POS_ITERATIONS: Int = 2
-    comptime FRICTION: Float64 = 1.0  # pymunk default for our bodies
+    comptime FRICTION: Float64 = 0.0
+    """The reference PushT is FRICTIONLESS. It writes `body.friction = 1`, but
+    friction is a pymunk SHAPE property (default 0) and `Body` has none, so
+    the assignment is a silent no-op: every shape — agent, both T polygons,
+    walls — has friction 0.0 (checked on pymunk 7.3 / stable-worldmodel
+    0.0.6). This was 1.0, read as "pymunk's default"."""
     comptime RESTITUTION: Float64 = 0.0
     # Per-second velocity retention factor applied to the dynamic T-block
     # before contact resolution. Matches pymunk's `space.damping` semantics

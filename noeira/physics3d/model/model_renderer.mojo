@@ -881,9 +881,11 @@ struct ModelRenderer[MODEL_DEF: ModelDefLike](EnvRenderer3D, Movable):
         if self.show_velocity:
             self._draw_velocity_indicator(torso_pos, vel_x)
 
-        # HUD overlay
+        # HUD overlay. The widgets paint either way — see `_draw_ui_list`.
         if self.show_hud:
             self._draw_hud()
+        else:
+            self._draw_ui_list()
 
         # Increment step counter AFTER drawing (so first frame shows 0)
         # Only increment when not paused (paused display should freeze the count)
@@ -1099,6 +1101,13 @@ struct ModelRenderer[MODEL_DEF: ModelDefLike](EnvRenderer3D, Movable):
     def paused(self) -> Bool:
         return self.renderer.paused()
 
+    def win_width(self) -> Int:
+        """The swapchain width in pixels; a window resize updates it."""
+        return self.renderer.width
+
+    def win_height(self) -> Int:
+        return self.renderer.height
+
     def toggle_pause(mut self):
         self.renderer.toggle_pause()
 
@@ -1184,6 +1193,23 @@ struct ModelRenderer[MODEL_DEF: ModelDefLike](EnvRenderer3D, Movable):
         """Consume a keycode the renderer's own bindings did not claim."""
         return self.renderer.take_key()
 
+    def _draw_ui_list(mut self):
+        """Paint the application's deferred widgets.
+
+        ⚠ SEPARATE FROM `_draw_hud`, and it has to be. These are the
+        APPLICATION's widgets; `show_hud` is about the ENGINE's text
+        overlay. They were one block, so `set_show_hud(False)` — the
+        obvious thing to call when your own sidebar replaces the engine
+        readout — silently took every panel, button and label with it.
+        The window then shows a correctly INSET viewport beside an empty
+        strip, which reads as "set_ui is broken" rather than as a flag
+        doing two jobs.
+        """
+        for rc in self.ui_rects:
+            self.renderer.draw_rect(rc.x, rc.y, rc.w, rc.h, rc.color)
+        for tx in self.ui_texts:
+            self.renderer.draw_text(tx.x, tx.y, tx.text, tx.color, tx.scale)
+
     def _draw_hud(mut self):
         """Draw MuJoCo-style HUD: controls help, camera name, step counter, pause indicator.
         """
@@ -1266,10 +1292,7 @@ struct ModelRenderer[MODEL_DEF: ModelDefLike](EnvRenderer3D, Movable):
             self.renderer.draw_text(x0, y, rec_str, Color(220, 40, 40, 255), s)
 
         # Widget command list first, so HUD text stays legible over panels.
-        for rc in self.ui_rects:
-            self.renderer.draw_rect(rc.x, rc.y, rc.w, rc.h, rc.color)
-        for tx in self.ui_texts:
-            self.renderer.draw_text(tx.x, tx.y, tx.text, tx.color, tx.scale)
+        self._draw_ui_list()
 
         # Application-owned lines last, in cyan so they read as "not engine".
         for line in self.hud_extra:

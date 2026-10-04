@@ -245,6 +245,25 @@ comptime MAX_LINE_VERTICES = 512
 # allocated once at init.
 comptime MAX_TEXT_CHARS = 2048
 
+# ⚠ THE TEXT ATLAS INDEXES 16-BIT, AND THE BIND MUST SAY SO. These two are
+# one decision and they live together because they have already drifted apart
+# once: `b147dcde8` widened the MESH index buffers to 32-bit ("a mesh over
+# 65,535 vertices WRAPPED its indices") and changed all three
+# `bind_gpu_index_buffer` sites in one sweep — but this buffer was never
+# widened, so the HUD spent every frame since decoding PAIRS of its UInt16
+# indices as single UInt32s. [0,1,2,...] reads back as 65536, 131074, ... and
+# the vertex fetch runs far past a 8192-vertex buffer, which draws quads at
+# whatever the neighbouring memory happens to say — the coloured full- and
+# half-screen flashes.
+#
+# 16-bit is correct and not a limitation: the largest index this buffer can
+# hold is MAX_TEXT_CHARS*4 - 1 = 8191, well inside UInt16. If MAX_TEXT_CHARS
+# ever passes 16384, BOTH of these have to move together.
+comptime TEXT_INDEX_BYTES = 2
+comptime TEXT_INDEX_ELEMENT_SIZE = (
+    GPUIndexElementSize.GPU_INDEXELEMENTSIZE_16BIT
+)
+
 
 # --- Line color entry for list storage ---
 
@@ -2601,7 +2620,7 @@ struct Renderer3D(Movable):
         ))
 
         # --- 5. Allocate and upload static index buffer (MAX_TEXT_CHARS quads × 6 indices × 2 bytes) ---
-        var tib_size = UInt32(MAX_TEXT_CHARS * 6 * 2)
+        var tib_size = UInt32(MAX_TEXT_CHARS * 6 * TEXT_INDEX_BYTES)
         var tib_info = GPUBufferCreateInfo(
             usage=GPUBufferUsageFlags.GPU_BUFFERUSAGE_INDEX,
             size=tib_size,
@@ -2921,6 +2940,20 @@ struct Renderer3D(Movable):
             if not self._text_budget_ok():
                 break
             var c = text.as_bytes()[i]
+            # ⚠ THE ATLAS IS ASCII AND THIS LOOP WALKS BYTES. A non-ASCII
+            # character is several UTF-8 bytes, and drawing each of them as a
+            # glyph produced a run of garbage — "·" (0xC2 0xB7) came out as
+            # "B7" on screen, and it also made every string WIDER than its
+            # character count, which is how a sidebar label that should have
+            # fitted overflowed into the 3D viewport.
+            #
+            # One '?' per character is the honest degradation: skip the
+            # continuation bytes, substitute the lead byte. Decoding properly
+            # would not help — the atlas has no glyph to show.
+            if c >= 0x80:
+                if c < 0xC0:
+                    continue          # continuation byte of the char before
+                c = 0x3F              # lead byte -> a single '?'
             var uv = glyph_uv(c)
             var u0 = uv[0]
             var v0 = uv[1]
@@ -4835,7 +4868,17 @@ struct Renderer3D(Movable):
                 offset=0,
                 size=UInt32(len(self.line_vertex_data) * 4),
             )
-            upload_to_gpu_buffer(copy_pass, Ptr(to=src), Ptr(to=dst), False)
+            # `cycle=True`. SDL_gpu.h: "You must also take care not to
+            # overwrite a section of data that has been referenced in a command
+            # without cycling first ... overwriting a section of data that has
+            # already been referenced will produce unexpected results." This is
+            # a WHOLE-BUFFER overwrite, every frame, of a buffer last frame's
+            # draw call referenced and the GPU may still be reading. The mesh
+            # path at `_upload_deformed_mesh` already learned this; these two
+            # per-frame buffers were left behind. Torn vertex data puts a quad
+            # at garbage coordinates with a garbage colour — which is what a
+            # full- or half-screen colour flash IS.
+            upload_to_gpu_buffer(copy_pass, Ptr(to=src), Ptr(to=dst), True)
             end_gpu_copy_pass(copy_pass)
 
         # Upload text vertex data if any (must be before render pass)
@@ -4868,8 +4911,12 @@ struct Renderer3D(Movable):
                 offset=0,
                 size=UInt32(n_text_floats * 4),
             )
+            # `cycle=True` — same hazard as the line buffer above, and worse:
+            # the HUD's text CHANGES LENGTH between frames, so a short frame
+            # overwrites only part of what a long frame referenced, which is
+            # the exact case SDL names as producing unexpected results.
             upload_to_gpu_buffer(
-                text_copy_pass, Ptr(to=text_src), Ptr(to=text_dst), False
+                text_copy_pass, Ptr(to=text_src), Ptr(to=text_dst), True
             )
             end_gpu_copy_pass(text_copy_pass)
 
@@ -5189,7 +5236,7 @@ struct Renderer3D(Movable):
             bind_gpu_index_buffer(
                 render_pass,
                 Ptr(to=text_ib_binding),
-                GPUIndexElementSize.GPU_INDEXELEMENTSIZE_32BIT,
+                TEXT_INDEX_ELEMENT_SIZE,
             )
             draw_gpu_indexed_primitives(
                 render_pass, UInt32(num_text_chars * 6), 1, 0, 0, 0

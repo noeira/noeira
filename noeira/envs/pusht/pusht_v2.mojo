@@ -55,6 +55,8 @@ from .geometry import (
     get_t_keypoints_world,
     compute_coverage,
     t_rect_long_vertex,
+    t_body_from_origin,
+    t_origin_from_body,
 )
 from .physics import pusht_substep_single_env
 
@@ -117,8 +119,9 @@ def _seed_env_state_gpu[
 
     # T-block (body 1)
     var to_ = PushTLayout.BODY_T_OFFSET
-    state[env, to_ + IDX_X] = block_x
-    state[env, to_ + IDX_Y] = block_y
+    var bxy = t_body_from_origin(block_x, block_y, block_angle)
+    state[env, to_ + IDX_X] = bxy[0]
+    state[env, to_ + IDX_Y] = bxy[1]
     state[env, to_ + IDX_ANGLE] = block_angle
     var m = Scalar[dtype](PConstants.T_MASS)
     var I = _compute_t_inertia_g()
@@ -146,6 +149,10 @@ def _write_obs_to_state_only[
     var bx = rebind[Scalar[dtype]](state[env, to_ + IDX_X])
     var by = rebind[Scalar[dtype]](state[env, to_ + IDX_Y])
     var ba = rebind[Scalar[dtype]](state[env, to_ + IDX_ANGLE])
+    # the physics integrates the T about its cog: back to the origin pose
+    var _org = t_origin_from_body(bx, by, ba)
+    bx = _org[0]
+    by = _org[1]
     var ax = rebind[Scalar[dtype]](state[env, ao + IDX_X])
     var ay = rebind[Scalar[dtype]](state[env, ao + IDX_Y])
     var kp = Array[Scalar[dtype], PConstants.KEYPOINTS_DIM](
@@ -178,6 +185,10 @@ def _write_obs_single_env[
     var bx = rebind[Scalar[dtype]](state[env, to_ + IDX_X])
     var by = rebind[Scalar[dtype]](state[env, to_ + IDX_Y])
     var ba = rebind[Scalar[dtype]](state[env, to_ + IDX_ANGLE])
+    # the physics integrates the T about its cog: back to the origin pose
+    var _org = t_origin_from_body(bx, by, ba)
+    bx = _org[0]
+    by = _org[1]
     var ax = rebind[Scalar[dtype]](state[env, ao + IDX_X])
     var ay = rebind[Scalar[dtype]](state[env, ao + IDX_Y])
     var kp = Array[Scalar[dtype], PConstants.KEYPOINTS_DIM](
@@ -408,6 +419,10 @@ struct PushTV2[DTYPE: DType](
         var bx = rebind[Scalar[dtype]](s[0, to_ + IDX_X])
         var by = rebind[Scalar[dtype]](s[0, to_ + IDX_Y])
         var ba = rebind[Scalar[dtype]](s[0, to_ + IDX_ANGLE])
+        # the physics integrates the T about its cog: back to the origin pose
+        var _org = t_origin_from_body(bx, by, ba)
+        bx = _org[0]
+        by = _org[1]
         var cov = compute_coverage(
             bx,
             by,
@@ -961,6 +976,10 @@ struct PushTV2[DTYPE: DType](
         var bx = rebind[Scalar[dtype]](state[env, to_ + IDX_X])
         var by = rebind[Scalar[dtype]](state[env, to_ + IDX_Y])
         var ba = rebind[Scalar[dtype]](state[env, to_ + IDX_ANGLE])
+        # the physics integrates the T about its cog: back to the origin pose
+        var _org = t_origin_from_body(bx, by, ba)
+        bx = _org[0]
+        by = _org[1]
         var cov = compute_coverage(
             bx,
             by,

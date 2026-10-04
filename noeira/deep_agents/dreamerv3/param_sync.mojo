@@ -101,8 +101,11 @@ struct _NamedImportVisitor(ParamVisitor, ParamVisitorRT):
         for i in range(nn):
             param.data[i] = vals[i]
         param.n = n
+        # A written weight must advance `version`: `Linear`'s GPU forward reads a
+        # version-gated padded copy (`w_pad`) and would keep the old weight.
+        param.version += 1
         comptime if target == "gpu":
-            param.upload(ctx.value())
+            param.upload_resident(ctx.value())
 
     def visit[target: StaticString, N: Int](
         mut self,
@@ -220,6 +223,7 @@ struct _DevImportVisitor(ParamVisitor, ParamVisitorRT):
             if name not in self.d:
                 return
             param.copy_from_device(self.ctx, self.d[name].as_unsafe_any_origin(), n)
+            param.version += 1  # see the host-dict apply above
 
     def visit[target: StaticString, N: Int](
         mut self,

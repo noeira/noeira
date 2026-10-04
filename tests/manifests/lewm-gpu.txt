@@ -1,0 +1,18 @@
+# LeWM GPU manifest — `pixi run -e apple test-lewm-gpu` (or -e nvidia)
+#
+# GPU paths of the LeWM port that need no torch dump: frames, windows and
+# the reconstruction probe; then the framework gates the port depends on.
+tests/experimental/lewm/lewm/test_pixel_convert_gpu.mojo
+tests/experimental/lewm/lewm/test_window_source_hwc.mojo
+tests/experimental/lewm/lewm/test_decoder.mojo
+tests/experimental/lewm/lewm/test_pong_data_gpu.mojo
+
+# --- framework gates LeWM depends on (P2) ---
+tests/nn/test_layer_norm_eps_gpu.mojo
+tests/nn/test_gelu.mojo
+tests/nn/test_batch_norm_1d_unbiased_running.mojo
+tests/nn/test_batch_norm_1d_eval_vjp.mojo
+tests/nn/test_sigreg_attrs.mojo
+tests/nn/test_checkpointed.mojo
+tests/nn/test_attention_gpu_shapes.mojo
+tests/nn/test_hash_dropout.mojo

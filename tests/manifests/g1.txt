@@ -43,3 +43,49 @@ tests/robots/test_g1_rsi_inject_kernel_gpu.mojo
 # the RELEASED ONNX actor through its 721-vector to three decimals. The layout
 # is KEY-MAJOR, newest-first; a step-major transcription has the right SIZE.
 tests/robots/test_g1_history.mojo
+
+# the command bank reader: a short `z` row would slide every later command's
+# vector and each would silently drive a different behaviour than its name
+tests/robots/test_g1_command_bank.mojo
+
+# the command channel: an absent or half-written file is NORMAL, and the seq
+# gate is what stops a blend restarting on every frame
+tests/robots/test_g1_command_channel.mojo
+
+# the conversational state: "plus vite" has no referent unless the state says
+# what is being done faster, and a missing key is a DIFFERENT question rather
+# than a smaller one. Pins the history's order, the repeat case, and the
+# duration bucketing that keeps a float off the wire.
+tests/robots/test_g1_command_state.mojo
+
+# the cache-miss path's pure parts: the pool sidecar's own round trip (the
+# first loader refused its own space-padded header), the goal key that is the
+# duplicate test after two angle criteria were measured failing at it, and
+# the channel's refusal of a label it would truncate.
+tests/robots/test_g1_spec.mojo
+
+# the voice loop's pure parts — chiefly the detector invariant that cost a
+# session: `close_at < open_at` at every floor, asserted over six orders of
+# magnitude, because when they cross a segment either cannot open or cannot
+# close and both look like a broken microphone. Plus the deadlines, pinned to
+# the measured latencies they were derived from.
+tests/robots/test_g1_voice_loop.mojo
+
+# AMASS step 1 — the `[N, 36]` layout of the retargeted dump. Steps 2-5 are
+# `convert_frames`, held by the oracle gate above; step 1 is new and every
+# way it can be wrong is SILENT (XYZW read as WXYZ is a valid rotation, a
+# dropped `+0.793` is a plausible crouch, a shifted DoF slice is a pose).
+# Self-contained: writes its own .npy fixtures, no network.
+tests/data/test_amass.mojo
+# The same convention through MuJoCo on real clips, with the three plausible
+# misreadings as the CONTROL (they land 0.79 / 0.56 / 0.25 m away, against a
+# 5e-5 m band). Needs two artefacts built first:
+#   pixi run python tools/g1/amass_reference_frames.py --out /tmp/amass_ref \
+#     --clips "$C/A1 - Stand_poses_120_jpos.npy" \
+#             "$C/A10 - lie to crouch_poses_120_jpos.npy" \
+#             "$C/A11 - crawl forward_poses_120_jpos.npy" \
+#             "$C/A12 - crawl backwards_poses_120_jpos.npy"
+#   pixi run mojo run -I . examples/g1/amass_import.mojo --subset ACCAD \
+#     --max-clips 4 --full --keep-source --out /tmp/amass_gate.h5
+# with $C the Hub cache dir of g1/ACCAD/Female1General_c3d.
+tests/data/test_amass_vs_mujoco.mojo /tmp/amass_gate.h5 /tmp/amass_ref

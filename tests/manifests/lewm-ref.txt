@@ -1,0 +1,21 @@
+# LeWM reference gates — `pixi run dump-lewm-ref` once, then `pixi run -e apple test-lewm-ref`
+#
+# The published LeWM PushT checkpoint (quentinll/lewm-pusht, MIT) through the
+# reference-exact model (noeira/experimental/lewm/ref_model.mojo) against its
+# torch run (tools/lewm/dump_lewm_reference.py, float64). CPU + GPU in each.
+# Needs the dump in /tmp/lewm_ref and the weights in
+# ~/.cache/noeira/lewm_pusht/hf/ (docs/LEWM_REOPEN_PLAN.md P1/P2).
+tests/experimental/lewm/ref/test_ref_forward.mojo
+tests/experimental/lewm/ref/test_ref_train.mojo
+tests/experimental/lewm/ref/test_ref_rollout.mojo
+tests/experimental/lewm/ref/test_ref_cem.mojo
+# P6 — five chained training steps (AdamW, clip, decay on every parameter)
+tests/experimental/lewm/ref/test_ref_steps.mojo
+# P7 — the test-time-adaptation machinery (mask, BN, restore, planner sync, windows)
+tests/experimental/lewm/ref/test_ref_tta.mojo
+
+# P4 — PushT against the dataset (docs/LEWM_REOPEN_PLAN.md). Need box session
+# A's fixture + pymunk oracle in ~/.cache/noeira/lewm_pusht/session_a/ and,
+# for the renderer, `tools/lewm/sample_fixture_frames.py` -> /tmp/lewm_frames.
+tests/experimental/lewm/ref/test_pusht_replay.mojo
+tests/experimental/lewm/ref/test_pusht_render.mojo

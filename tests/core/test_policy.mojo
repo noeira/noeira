@@ -336,6 +336,30 @@ def main() raises:
     print("  norm.json is carried to policies/<role>.norm.json, and removed when the new holder has none")
     checks += 2
 
+    # ── 14. ⚠ an FB checkpoint's OWN sidecar travels too ────────────
+    #
+    # FB/BFM runs write no norm.json: `ObsNorm` lives beside each checkpoint
+    # as `<ckpt>.norm`, and the G1 viewers read `ckpt + ".norm"`. A role
+    # without it runs on RAW inputs after one warning line.
+    var rid_s = String("2026-09-28_bfm-zero-g3_s1dec4r0")
+    var ds = _make_run(rid_s, 77)
+    _blob(ds + "/checkpoints/best.ckpt.norm", 9, 500)
+    _ = _promote(rid_s, String("best"), String("bfm"), String(""))
+    var pol_side = String(TMP) + "/projects/so101/policies/bfm.ckpt.norm"
+    if not exists(pol_side) or sha256_file(pol_side) != sha256_file(ds + "/checkpoints/best.ckpt.norm"):
+        raise Error("promote did not carry the checkpoint's .norm sidecar to " + pol_side)
+    # ⚠ the SIDECAR OF THE CHECKPOINT PROMOTED, not any sidecar in the run
+    _blob(ds + "/checkpoints/last.ckpt.norm", 13, 500)
+    _ = _promote(rid_s, String("last"), String("bfm"), String(""))
+    if sha256_file(pol_side) != sha256_file(ds + "/checkpoints/last.ckpt.norm"):
+        raise Error("re-promoting `last` kept `best`'s sidecar at " + pol_side)
+    # ...and a holder without one must not inherit the previous statistics
+    _ = _promote(rid_a, String("best"), String("bfm"), String(""))
+    if exists(pol_side):
+        raise Error("promoting a checkpoint with no .norm left the previous holder's beside new weights")
+    print("  <ckpt>.norm is carried to policies/<role>.ckpt.norm, per checkpoint, and removed when absent")
+    checks += 3
+
     _ = run_capture("rm -rf " + quote_arg(String(TMP)))
     print("[PASS] policy (" + String(checks) + " checks)")
 
@@ -354,3 +378,6 @@ def main() raises:
 #   E11 --no-push is ignored                    -> check 12
 #   E12 promote does not copy norm.json        -> check 13
 #   E13 promote leaves a stale norm.json        -> check 13
+#   E14 promote does not copy <ckpt>.norm       -> check 14
+#   E15 promote copies best's sidecar for `last` -> check 14
+#   E16 promote leaves a stale <ckpt>.norm      -> check 14

@@ -60,8 +60,14 @@ later addition.
   the env's absolute action. Anchored on the joints (read from the raw
   observation), so there is no hidden target state. Pair with
   `--log-std-init 0` (nexus's std 1).
+- `target`: SimToolReal's arm rule — the same step added to the lane's
+  PREVIOUS TARGET, not to the measured joint (`delta_action.target_step`,
+  why in its module header). The target is hidden state the policy
+  integrates, so the build needs `-D TASK_PPO_TARGET_OBS` (the policy sees
+  `target - q`). `--target-lead L` bounds the target to L rad from `q`.
 """
 
+from std.builtin.sort import sort
 from std.math import abs, sqrt, log, cos
 from std.random import random_float64, seed as seed_rng
 from std.sys import is_defined
@@ -99,7 +105,7 @@ from noeira.tasks.posed_reset import task_meta_words
 from noeira.tasks.shaping import reward_mode_words
 from noeira.tasks.delta_action import (
     DELTA_ACT, DELTA_ARM, DELTA_GRIPPER, delta_scale, delta_target, ServoLag,
-    ACT_HIST,
+    ACT_HIST, TARGET_OBS, target_step,
 )
 # `ACT_HIST` (`-D TASK_PPO_ACT_HIST=K`): the last K executed actions after the
 # env's observation — see `delta_action.ACT_HIST`. A run trained without it is
@@ -253,15 +259,76 @@ def _delta_to_env(
 ):
     """`--action delta`: target = clamp(q + a * scale), through the servo
     model (`delta_action.ServoLag`; the identity when off), normalised onto
-    the env's absolute action (`(target - mid) / half`)."""
+    the env's absolute action (`(target - mid) / half`). One tick: the
+    targets of `_delta_targets`, then `_targets_to_env`."""
+    var tg = List[Float64](length=N_ENVS * ACT_DIM, fill=0.0)
+    _delta_targets(ap, tg, arm_q, a_lo, a_hi, d_arm, d_grip)
+    _targets_to_env(tg, ep, a_lo, a_hi, lag)
+
+
+def _delta_targets(
+    ap: Pointer[Scalar[DT], MutAnyOrigin],
+    mut tg: List[Float64],
+    ref arm_q: List[Float64],
+    ref a_lo: List[Float64],
+    ref a_hi: List[Float64],
+    d_arm: Float64 = DELTA_ARM,
+    d_grip: Float64 = DELTA_GRIPPER,
+):
+    """The policy step's joint targets, clamp(q + a * scale), per lane —
+    held for the `--repeat` ticks the action lasts."""
     for e in range(N_ENVS):
         for j in range(ACT_DIM):
-            var tgt = delta_target(
+            tg[e * ACT_DIM + j] = delta_target(
                 arm_q[e * ACT_DIM + j],
                 Float64(ap[unsafe_offset = e * ACT_DIM + j]),
                 j, a_lo[j], a_hi[j], d_arm, d_grip,
             )
-            tgt = lag.apply(e, j, tgt)
+
+
+def _target_targets(
+    ap: Pointer[Scalar[DT], MutAnyOrigin],
+    mut tg: List[Float64],
+    mut tprev: List[Float64],
+    ref arm_q: List[Float64],
+    ref a_lo: List[Float64],
+    ref a_hi: List[Float64],
+    d_arm: Float64,
+    d_grip: Float64,
+    lead: Float64,
+):
+    """`--action target`: the policy step's joint targets from each lane's
+    PREVIOUS target (`delta_action.target_step`), which they then become."""
+    for e in range(N_ENVS):
+        for j in range(ACT_DIM):
+            var k = e * ACT_DIM + j
+            tg[k] = target_step(
+                tprev[k], arm_q[k], Float64(ap[unsafe_offset=k]), j,
+                a_lo[j], a_hi[j], d_arm, d_grip, lead,
+            )
+            tprev[k] = tg[k]
+
+
+def _target_reset(
+    mut tprev: List[Float64], ref arm_q: List[Float64], lane: Int,
+):
+    """A new episode: lane `lane`'s target starts on its joints."""
+    for j in range(ACT_DIM):
+        tprev[lane * ACT_DIM + j] = arm_q[lane * ACT_DIM + j]
+
+
+def _targets_to_env(
+    ref tg: List[Float64],
+    ep: Pointer[Scalar[DT], MutAnyOrigin],
+    ref a_lo: List[Float64],
+    ref a_hi: List[Float64],
+    mut lag: ServoLag,
+):
+    """One TICK: the held targets through the servo model (it advances per
+    tick, not per policy step), normalised onto the env's absolute action."""
+    for e in range(N_ENVS):
+        for j in range(ACT_DIM):
+            var tgt = lag.apply(e, j, tg[e * ACT_DIM + j])
             var mid = 0.5 * (a_lo[j] + a_hi[j])
             var half = 0.5 * (a_hi[j] - a_lo[j])
             ep[unsafe_offset = e * ACT_DIM + j] = Scalar[DT]((tgt - mid) / half)
@@ -272,7 +339,10 @@ def _lag_reset(
     mut lag: ServoLag, ref arm_q: List[Float64], lane: Int,
 ):
     """A fresh draw of lane `lane`'s servo model, settled on its joints."""
-    lag.reset_lane(lane, arm_q, lane * ACT_DIM, random_float64(), random_float64())
+    lag.reset_lane(
+        lane, arm_q, lane * ACT_DIM, random_float64(), random_float64(),
+        random_float64(),
+    )
 
 
 def _hist_push(
@@ -299,16 +369,25 @@ def _hist_clear(mut hist: List[Float64], lane: Int):
 def _augment[E_OBS: Int](
     raw: Pointer[Scalar[DT], MutAnyOrigin],
     ref hist: List[Float64],
+    ref tprev: List[Float64],
+    ref a_qa: List[Int],
     aug: Pointer[Scalar[DT], MutAnyOrigin],
 ):
-    """The policy's observation: each lane's env row, then its history."""
+    """The policy's observation: each lane's env row, then its history,
+    then (`TARGET_OBS`) its target's lead over the joints, `target - q`."""
     comptime W = ACT_HIST * ACT_DIM
-    comptime A = E_OBS + W
+    comptime A = E_OBS + W + TARGET_OBS
     for e in range(N_ENVS):
         for k in range(E_OBS):
             aug[unsafe_offset = e * A + k] = raw[unsafe_offset = e * E_OBS + k]
         for k in range(W):
             aug[unsafe_offset = e * A + E_OBS + k] = Scalar[DT](hist[e * W + k])
+        comptime if TARGET_OBS > 0:
+            for j in range(ACT_DIM):
+                var q = Float64(raw[unsafe_offset = e * E_OBS + a_qa[j]])
+                aug[unsafe_offset = e * A + E_OBS + W + j] = Scalar[DT](
+                    tprev[e * ACT_DIM + j] - q
+                )
 
 
 def _bc_pretrain[OBS: Int](
@@ -322,6 +401,9 @@ def _bc_pretrain[OBS: Int](
     mut obs_rms: RunningMeanStd,
     updates: Int,
     lr: Float64,
+    d_arm: Float64 = DELTA_ARM,
+    d_grip: Float64 = DELTA_GRIPPER,
+    repeat: Int = 1,
 ) raises:
     """Behaviour-clone the actor's MEAN on the SUCCESSFUL episodes of the
     scripted teacher's `.demo` files — so101-nexus's fix for pick-and-place
@@ -333,42 +415,66 @@ def _bc_pretrain[OBS: Int](
     joints, `(target - q) / scale`, clipped to [-1, 1] (the teacher's `act`
     is the family's normalised absolute target); in `absolute` mode they are
     `act` itself. MSE on the mean only; the log-std is the caller's to set.
+
+    On the run's cadence and inputs: every `repeat`-th demo row (the demos
+    are recorded per tick), labels at the run's scales (`d_arm` / `d_grip`),
+    and with `TASK_PPO_ACT_HIST` the history words rebuilt from the episode's
+    own earlier labels (zero at its start) — the demos hold the env's
+    observation only.
     """
     comptime MB = MINIBATCH
     comptime A2 = 2 * ACT_DIM
+    comptime W = ACT_HIST * ACT_DIM
+    comptime E = OBS - W - TARGET_OBS
     var X = List[Scalar[DT]]()
     var Y = List[Scalar[DT]]()
     var n_rows = 0
     var n_eps = 0
     for path in demo_paths.split(","):
         var d = read_demo_file(String(path))
-        if d.obs_dim != OBS or d.act_dim != ACT_DIM:
+        if d.obs_dim != E or d.act_dim != ACT_DIM:
             raise Error(
                 "ppo bc: " + String(path) + " has obs " + String(d.obs_dim)
-                + " / act " + String(d.act_dim) + ", the env " + String(OBS)
+                + " / act " + String(d.act_dim) + ", the env " + String(E)
                 + " / " + String(ACT_DIM)
             )
         for ep in range(d.n_episodes()):
             if not d.ep_success[ep]:
                 continue
             n_eps += 1
-            for r in range(d.ep_start[ep], d.ep_start[ep] + d.ep_len[ep]):
-                for k in range(OBS):
-                    X.append(Scalar[DT](d.obs[r * OBS + k]))
+            var hist = List[Float64](length=W, fill=0.0)
+            var r = d.ep_start[ep]
+            while r < d.ep_start[ep] + d.ep_len[ep]:
+                for k in range(E):
+                    X.append(Scalar[DT](d.obs[r * E + k]))
+                for k in range(W):
+                    X.append(Scalar[DT](hist[k]))
+                for _ in range(TARGET_OBS):
+                    X.append(Scalar[DT](0))
+                var lab = List[Float64](length=ACT_DIM, fill=0.0)
                 for j in range(ACT_DIM):
                     var a = Float64(d.act[r * ACT_DIM + j])
                     if action_mode == "delta":
                         var mid = 0.5 * (a_lo[j] + a_hi[j])
                         var half = 0.5 * (a_hi[j] - a_lo[j])
                         var tgt = mid + a * half
-                        var q = Float64(d.obs[r * OBS + a_qa[j]])
-                        a = (tgt - q) / delta_scale(j)
+                        var q = Float64(d.obs[r * E + a_qa[j]])
+                        a = (tgt - q) / delta_scale(j, d_arm, d_grip)
                     if a > 1.0:
                         a = 1.0
                     elif a < -1.0:
                         a = -1.0
+                    lab[j] = a
                     Y.append(Scalar[DT](a))
+                # the history the policy would have: this label, then the
+                # earlier ones
+                for k in range(W - 1, ACT_DIM - 1, -1):
+                    hist[k] = hist[k - ACT_DIM]
+                comptime if W > 0:
+                    for j in range(ACT_DIM):
+                        hist[j] = lab[j]
                 n_rows += 1
+                r += repeat
     if n_rows < MB:
         raise Error("ppo bc: only " + String(n_rows) + " demo rows")
     print("  bc: ", n_eps, "successful episodes,", n_rows, "rows from",
@@ -463,7 +569,7 @@ def run_ppo[M: ModelDefLike, C: Phyics3dEnvConfig](
 ) raises:
     comptime E_OBS = OBS_DIM[M, C]
     """The env's observation words; the policy's `OBS` adds the history."""
-    comptime OBS = E_OBS + ACT_HIST * ACT_DIM
+    comptime OBS = E_OBS + ACT_HIST * ACT_DIM + TARGET_OBS
     comptime assert N_ENVS * ROLLOUT % N_MINIBATCHES == 0
     comptime assert ACT_DIM == DELTA_ACT, "the delta action is six words"
 
@@ -494,33 +600,87 @@ def run_ppo[M: ModelDefLike, C: Phyics3dEnvConfig](
     # ms and `--lag-delay lo,hi` ticks, drawn per episode; off by default
     var lag_tau = _arg(args, "--lag-tau", "")
     var lag_delay = _arg(args, "--lag-delay", "")
+    # the real arm's speed cap and elbow stop (`ServoLag.set_limits`)
+    var lag_vmax = _arg(args, "--lag-vmax", "")
+    var elbow_max = Float64(_arg(args, "--elbow-max", "0"))
+    # per-joint servo dynamics, offsets, control-period jitter
+    # (`ServoLag.set_per_joint` / `set_offset` / `set_period`; why in its
+    # header): "lo,hi;..." x 6 joints (offsets in rad), "lo,hi" ms
+    var lag_tau_j = _arg(args, "--lag-tau-j", "")
+    var lag_delay_j = _arg(args, "--lag-delay-j", "")
+    var lag_vmax_j = _arg(args, "--lag-vmax-j", "")
+    var lag_off_j = _arg(args, "--lag-offset-j", "")
+    var lag_period = _arg(args, "--lag-period", "")
     # the delta action's per-step scales (rad at a = 1): the defaults are
     # so101-nexus's; under `--lag-*` the real servos need larger ones
     var d_arm = Float64(_arg(args, "--delta-arm", String(DELTA_ARM)))
     var d_grip = Float64(_arg(args, "--delta-gripper", String(DELTA_GRIPPER)))
-    if action_mode != "absolute" and action_mode != "delta":
-        raise Error("ppo task: --action absolute|delta, got " + action_mode)
-    if ACT_HIST > 0 and bc_demos.byte_length() > 0:
-        raise Error("ppo task: --bc-demos has no action history; not with TASK_PPO_ACT_HIST")
-    if ACT_HIST > 0 and action_mode != "delta":
-        raise Error("ppo task: TASK_PPO_ACT_HIST is for --action delta")
+    # ⚠ `--repeat K`: the policy acts every K ticks (31.25 / K Hz) and its
+    # delta targets are HELD for the K ticks, the servo model running per
+    # tick underneath. Why: at 31 Hz under the real servos' 1-2 tick delay
+    # and ~50 ms response, every action lands while the last two or three are
+    # still in flight, and the lagged cube-in-bowl teachers plateaued at
+    # 30-37 % (the stiff sim: 79.5 %); at 10 Hz (K = 3) most of an action is
+    # done within its own step — the regime the real expert (it waits for the
+    # arm to settle) and Squint (10 Hz) work in. Rewards are summed over the
+    # K ticks; the steps counted are TICKS.
+    var repeat = max(Int(_arg(args, "--repeat", "1")), 1)
+    # ⚠ `--smooth-penalty W`: each policy step pays W x the mean squared
+    # change of the five ARM action words (as executed) from the lane's last
+    # step (not on an episode's first). Why: the 31 Hz lag students flip the
+    # sign of their arm actions on ~25-30 % of ticks, in sim as on the real
+    # arm, where it shook the clamped tower and blurred the wrist camera; a
+    # deploy-side EMA of 0.5 halved the flips and RAISED the probe's success
+    # (7/16 -> 11/16) — smoothness is not bought with skill here.
+    var smooth_w = Float64(_arg(args, "--smooth-penalty", "0"))
+    # ⚠ `--dive-penalty W`: each tick with the arm reaching down past the desk
+    # (shoulder_lift > 1.35 AND elbow_flex < -1.35 rad) costs W. No sim grasp
+    # is made there (they close at shoulder_lift -0.1..0.5, elbow 0.35..1.4),
+    # yet the smooth student spent 12.6 % of its probe ticks there: the sim's
+    # rigid desk absorbs the push; on the real arm it drove into the desk and
+    # rocked the clamped tower.
+    var dive_w = Float64(_arg(args, "--dive-penalty", "0"))
+    # `--target-lead L` (`--action target`): the target stays within L rad of
+    # the measured joint (`delta_action.target_step`); 0 = unbounded
+    var target_lead = Float64(_arg(args, "--target-lead", "0"))
+    if action_mode != "absolute" and action_mode != "delta" and action_mode != "target":
+        raise Error("ppo task: --action absolute|delta|target, got " + action_mode)
+    # a per-step action (`delta` or `target`): through `ServoLag`, held over
+    # `--repeat`, with the action history
+    var stepped = action_mode != "absolute"
+    if (action_mode == "target") != (TARGET_OBS > 0):
+        raise Error("ppo task: --action target needs -D TASK_PPO_TARGET_OBS"
+                    " and the define needs --action target (the target is"
+                    " hidden state the policy must see)")
+    if action_mode == "target" and bc_demos.byte_length() > 0:
+        raise Error("ppo task: --bc-demos labels absolute or delta actions,"
+                    " not --action target")
+    if C.MAX_STEPS % repeat != 0:
+        raise Error("ppo task: --repeat " + String(repeat) + " must divide the horizon "
+                    + String(C.MAX_STEPS) + " (episodes end on a policy step)")
+    if repeat > 1 and not stepped:
+        raise Error("ppo task: --repeat is for --action delta|target")
+    if ACT_HIST > 0 and not stepped:
+        raise Error("ppo task: TASK_PPO_ACT_HIST is for --action delta|target")
     if reward != "potential" and reward != "legacy":
         raise Error("ppo task: --reward potential|legacy, got " + reward)
     var rw = reward_mode_words(reward == "potential", bonus)
     seed_rng(seed)
 
-    var n_updates_total = anneal_steps // (N_ENVS * ROLLOUT)
+    var n_updates_total = anneal_steps // (N_ENVS * ROLLOUT * repeat)
     print("=" * 70)
     print("PPO on", family, "—", task)
     print("  lanes", N_ENVS, "| rollout", ROLLOUT, "| batch", N_ENVS * ROLLOUT,
           "| minibatch", MINIBATCH, "x", N_MINIBATCHES, "| epochs", N_EPOCHS)
-    print("  obs", OBS, "(env", E_OBS, "+ last", ACT_HIST, "actions) | act",
+    print("  obs", OBS, "(env", E_OBS, "+ last", ACT_HIST, "actions +",
+          TARGET_OBS, "target lead) | act",
           ACT_DIM, "| hidden", HIDDEN, "| horizon",
           C.MAX_STEPS)
     print("  steps", total_steps, "| lr", lr0, "| ent", ent0, "->", ent1,
           "over", anneal_steps, "steps | log_std init", log_std0)
     print("  reward", reward, "| success bonus", bonus, "| seed", seed,
-          "| action", action_mode)
+          "| action", action_mode, "| repeat", repeat, "ticks per policy step",
+          "| target lead", target_lead)
     print("=" * 70)
 
     # ── the task's words (the eval's / the bench's set-up) ───────────────
@@ -580,9 +740,21 @@ def run_ppo[M: ModelDefLike, C: Phyics3dEnvConfig](
     logger.set_config("exec_noise", String(exec_noise))
     logger.set_config("lag_tau_ms", lag_tau)
     logger.set_config("lag_delay_ticks", lag_delay)
+    logger.set_config("lag_vmax", lag_vmax)
+    logger.set_config("elbow_max", String(elbow_max))
+    logger.set_config("lag_tau_j", lag_tau_j)
+    logger.set_config("lag_delay_j", lag_delay_j)
+    logger.set_config("lag_vmax_j", lag_vmax_j)
+    logger.set_config("lag_offset_j", lag_off_j)
+    logger.set_config("lag_period_ms", lag_period)
     logger.set_config("delta_arm", String(d_arm))
     logger.set_config("delta_gripper", String(d_grip))
     logger.set_config("act_hist", String(ACT_HIST))
+    logger.set_config("target_obs", String(TARGET_OBS))
+    logger.set_config("target_lead", String(target_lead))
+    logger.set_config("repeat", String(repeat))
+    logger.set_config("smooth_penalty", String(smooth_w))
+    logger.set_config("dive_penalty", String(dive_w))
     logger.set_config("horizon", String(C.MAX_STEPS))
     logger.set_config("obs_norm", "running, clip 10")
     logger.set_config("reward_norm", "discounted-return std, clip 10")
@@ -633,8 +805,9 @@ def run_ppo[M: ModelDefLike, C: Phyics3dEnvConfig](
         env.d.meta.download(ctx)
         ctx.synchronize()
         for e in range(N_ENVS):
+            # a multiple of --repeat: every episode ends on a policy step
             env.d.meta.data[e * METADATA_SIZE + META_IDX_STEP_COUNT] = Scalar[DT](
-                Int(random_float64() * Float64(C.MAX_STEPS))
+                Int(random_float64() * Float64(C.MAX_STEPS // repeat)) * repeat
             )
         env.d.meta.upload(ctx)
         ctx.synchronize()
@@ -652,12 +825,38 @@ def run_ppo[M: ModelDefLike, C: Phyics3dEnvConfig](
         var rets = ctx.enqueue_create_host_buffer[DT](N_ENVS)
         var env_act = ctx.enqueue_create_host_buffer[DT](N_ENVS * ACT_DIM)
         var arm_q = List[Float64](length=N_ENVS * ACT_DIM, fill=0.0)
+        # `--action target`: each lane's last commanded target
+        var tprev = List[Float64](length=N_ENVS * ACT_DIM, fill=0.0)
+        # the policy step's held targets, and per lane over its ticks: the
+        # summed reward, whether it ended, its terminal observation
+        var tg = List[Float64](length=N_ENVS * ACT_DIM, fill=0.0)
+        var rsum = List[Float64](length=N_ENVS, fill=0.0)
+        var dmac = List[Bool](length=N_ENVS, fill=False)
+        var term = List[Scalar[DT]](length=N_ENVS * E_OBS, fill=Scalar[DT](0))
+        # `--smooth-penalty`: each lane's last executed action, and whether
+        # its episode has one yet
+        var a_prev = List[Float64](length=N_ENVS * ACT_DIM, fill=0.0)
+        var has_prev = List[Bool](length=N_ENVS, fill=False)
+        var spen = List[Float64](length=N_ENVS, fill=0.0)
+        var spen_acc = 0.0
+        var spen_n = 0
+        var dive_ticks = 0
+        var all_ticks = 0
         var lag = ServoLag.parse(
             N_ENVS, lag_tau, lag_delay, Float64(C.FRAME_SKIP) * M.TIMESTEP
         )
+        lag.set_limits(lag_vmax, elbow_max)
+        lag.set_per_joint(lag_tau_j, lag_delay_j, lag_vmax_j)
+        lag.set_offset(lag_off_j)
+        lag.set_period(lag_period)
         if lag.on:
             print("  servo lag: tau", lag_tau, "ms, delay", lag_delay,
-                  "ticks (per episode, per lane)")
+                  "ticks (per episode, per lane) | arm speed cap", lag_vmax,
+                  "rad/s | elbow max", elbow_max)
+        if lag.per_joint or lag.has_off or lag.dt_hi > 0.0:
+            print("  servo per joint: tau", lag_tau_j, "ms | delay", lag_delay_j,
+                  "| cap", lag_vmax_j, "rad/s | offset", lag_off_j,
+                  "rad | period", lag_period, "ms")
         ctx.synchronize()
         var obs_dev = DeviceBuffer[DT](ctx, env.obs_ptr(), N_ENVS * E_OBS, owning=False)
         var act_dev = DeviceBuffer[DT](ctx, env.action_ptr(), N_ENVS * ACT_DIM, owning=False)
@@ -671,7 +870,7 @@ def run_ppo[M: ModelDefLike, C: Phyics3dEnvConfig](
         if bc_demos.byte_length() > 0:
             _bc_pretrain[OBS](
                 agent, ctx, bc_demos, action_mode, a_qa, a_lo, a_hi, obs_rms,
-                bc_updates, bc_lr,
+                bc_updates, bc_lr, d_arm, d_grip, repeat,
             )
             agent.trainer.actor_opt.set_lr(Scalar[DT](lr0))
             agent.trainer.actor.children[4].set_log_std_init["gpu"](
@@ -714,7 +913,8 @@ def run_ppo[M: ModelDefLike, C: Phyics3dEnvConfig](
             for j in range(ACT_DIM):
                 arm_q[e * ACT_DIM + j] = Float64(rp[unsafe_offset = e * E_OBS + a_qa[j]])
             _lag_reset(lag, arm_q, e)
-        _augment[E_OBS](rp, hist, mptr(aug.unsafe_ptr()))
+            _target_reset(tprev, arm_q, e)
+        _augment[E_OBS](rp, hist, tprev, a_qa, mptr(aug.unsafe_ptr()))
         obs_rms.update(mptr(aug.unsafe_ptr()), N_ENVS, OBS)
         obs_rms.normalize_into(mptr(aug.unsafe_ptr()), mptr(cur_n.unsafe_ptr()), N_ENVS, OBS, OBS_CLIP)
 
@@ -745,43 +945,115 @@ def run_ppo[M: ModelDefLike, C: Phyics3dEnvConfig](
                     elif v < -1.0:
                         v = -1.0
                     ah[unsafe_offset=k] = Scalar[DT](v)
+            if smooth_w > 0.0:
+                var ap = mptr(act_h.unsafe_ptr())
+                for e in range(N_ENVS):
+                    var d2 = 0.0
+                    for j in range(ACT_DIM - 1):
+                        var v = Float64(ap[unsafe_offset = e * ACT_DIM + j])
+                        v = 1.0 if v > 1.0 else (-1.0 if v < -1.0 else v)
+                        if has_prev[e]:
+                            var dd = v - a_prev[e * ACT_DIM + j]
+                            d2 += dd * dd
+                        a_prev[e * ACT_DIM + j] = v
+                    spen[e] = smooth_w * d2 / Float64(ACT_DIM - 1)
+                    has_prev[e] = True
+                    spen_acc += spen[e]
+                    spen_n += 1
             if action_mode == "delta":
-                _delta_to_env(
-                    mptr(act_h.unsafe_ptr()), mptr(env_act.unsafe_ptr()),
-                    arm_q, a_lo, a_hi, lag, d_arm, d_grip,
+                _delta_targets(
+                    mptr(act_h.unsafe_ptr()), tg, arm_q, a_lo, a_hi, d_arm, d_grip,
                 )
-                ctx.enqueue_copy(act_dev, env_act)
-            else:
-                ctx.enqueue_copy(act_dev, act_h)
+            elif action_mode == "target":
+                _target_targets(
+                    mptr(act_h.unsafe_ptr()), tg, tprev, arm_q, a_lo, a_hi,
+                    d_arm, d_grip, target_lead,
+                )
             _hist_push(hist, mptr(act_h.unsafe_ptr()))
-            # 2. step; the post-step obs, reward, done, meta (goal bit)
-            env.step_batch[N_ENVS](ctx=ctx, rng_seed=UInt64(it + 1))
-            ctx.enqueue_copy(raw_h, obs_dev)
-            ctx.enqueue_copy(rew_h, rew_dev)
-            ctx.enqueue_copy(done_h, done_dev)
-            env.d.meta.download(ctx)
-            ctx.synchronize()
+            # 2. `repeat` ticks under the held targets: per lane the summed
+            # reward, the goal bit, and — for a lane that ends (or diverges)
+            # before the last tick — its TERMINAL row, kept (its later ticks
+            # are stepped and discarded; it resets with the others below)
+            for e in range(N_ENVS):
+                rsum[e] = 0.0
+                dmac[e] = False
+                diverged[e] = False
+            var n_bad = 0
+            for tick in range(repeat):
+                if stepped:
+                    _targets_to_env(tg, mptr(env_act.unsafe_ptr()), a_lo, a_hi, lag)
+                    ctx.enqueue_copy(act_dev, env_act)
+                else:
+                    ctx.enqueue_copy(act_dev, act_h)
+                env.step_batch[N_ENVS](
+                    ctx=ctx, rng_seed=UInt64(it * repeat + tick + 1)
+                )
+                ctx.enqueue_copy(raw_h, obs_dev)
+                ctx.enqueue_copy(rew_h, rew_dev)
+                ctx.enqueue_copy(done_h, done_dev)
+                env.d.meta.download(ctx)
+                ctx.synchronize()
+                var rp_t = mptr(raw_h.unsafe_ptr())
+                var dh_t = mptr(done_h.unsafe_ptr())
+                var rh_t = mptr(rew_h.unsafe_ptr())
+                for e in range(N_ENVS):
+                    if dmac[e]:
+                        continue
+                    var bad = False
+                    var rv = Float64(rh_t[unsafe_offset=e])
+                    if not (rv == rv) or abs(rv) > REW_BOUND:
+                        bad = True
+                    for k in range(E_OBS):
+                        var v = Float64(rp_t[unsafe_offset = e * E_OBS + k])
+                        if not (v == v) or abs(v) > OBS_BOUND:
+                            bad = True
+                            break
+                    if bad:
+                        diverged[e] = True
+                        n_bad += 1
+                        dmac[e] = True
+                    else:
+                        rsum[e] += rv
+                        if dive_w > 0.0:
+                            all_ticks += 1
+                            var q1 = Float64(rp_t[unsafe_offset = e * E_OBS + a_qa[1]])
+                            var q2 = Float64(rp_t[unsafe_offset = e * E_OBS + a_qa[2]])
+                            if q1 > 1.35 and q2 < -1.35:
+                                rsum[e] -= dive_w
+                                dive_ticks += 1
+                        if env.d.meta.data[e * METADATA_SIZE + META_IDX_GOAL_HELD] > Scalar[DT](0.5):
+                            succ[e] = True
+                        if dh_t[unsafe_offset=e] > Scalar[DT](0.5):
+                            dmac[e] = True
+                    # ⚠ AT WHATEVER TICK it ends — the last one included. A
+                    # copy only for ticks before the last left a lane that
+                    # ended on the last tick (the usual case) reading the row
+                    # from its PREVIOUS early end: after one physics blow-up,
+                    # that lane's diverged row re-entered the observation
+                    # statistics, UNFLAGGED, at each of its later episode
+                    # ends — the joint means went to +-593, the variances to
+                    # 1e11, and the 10 Hz lift_real stages collapsed from ~60 %
+                    # to 0 at their first diverged lane (18ea9d25, b5ccffa3).
+                    if dmac[e]:
+                        for k in range(E_OBS):
+                            term[e * E_OBS + k] = rp_t[unsafe_offset = e * E_OBS + k]
+            n_diverged += n_bad
+            # the policy step's transition: the last tick's rows, a lane that
+            # ended early its terminal row; the summed reward; done if it ended
             var raw_p = mptr(raw_h.unsafe_ptr())
             var dh0 = mptr(done_h.unsafe_ptr())
             var rh0 = mptr(rew_h.unsafe_ptr())
-            var n_bad = 0
             for e in range(N_ENVS):
-                var bad = False
-                var rv = Float64(rh0[unsafe_offset=e])
-                if not (rv == rv) or abs(rv) > REW_BOUND:
-                    bad = True
-                for k in range(E_OBS):
-                    var v = Float64(raw_p[unsafe_offset = e * E_OBS + k])
-                    if not (v == v) or abs(v) > OBS_BOUND:
-                        bad = True
-                        break
-                diverged[e] = bad
-                if bad:
-                    n_bad += 1
-                    dh0[unsafe_offset=e] = Scalar[DT](1)
-                    rh0[unsafe_offset=e] = Scalar[DT](0)
-            n_diverged += n_bad
-            _augment[E_OBS](raw_p, hist, mptr(aug.unsafe_ptr()))
+                if smooth_w > 0.0:
+                    rsum[e] -= spen[e]
+                rh0[unsafe_offset=e] = Scalar[DT](rsum[e])
+                dh0[unsafe_offset=e] = Scalar[DT](1) if dmac[e] else Scalar[DT](0)
+            if repeat > 1:
+                for e in range(N_ENVS):
+                    if dmac[e]:
+                        for k in range(E_OBS):
+                            raw_p[unsafe_offset = e * E_OBS + k] = term[e * E_OBS + k]
+            _augment[E_OBS](raw_p, hist, tprev, a_qa, mptr(aug.unsafe_ptr()))
             obs_rms.update(mptr(aug.unsafe_ptr()), N_ENVS, OBS, diverged)
             obs_rms.normalize_into(
                 mptr(aug.unsafe_ptr()), mptr(next_n.unsafe_ptr()), N_ENVS, OBS, OBS_CLIP,
@@ -793,8 +1065,10 @@ def run_ppo[M: ModelDefLike, C: Phyics3dEnvConfig](
                     if diverged[e]:
                         for k in range(OBS):
                             nn[unsafe_offset = e * OBS + k] = Scalar[DT](0)
-                # the env resets on its OWN done buffer: write the forced
-                # dones back before `selective_reset_batch`
+            if n_bad > 0 or repeat > 1:
+                # the env resets on its OWN done buffer: write the policy
+                # step's dones (forced, or from an earlier tick) back before
+                # `selective_reset_batch`
                 ctx.enqueue_copy(done_dev, done_h)
             # 3. reward normalisation (CleanRL NormalizeReward) + tallies
             var rh = mptr(rew_h.unsafe_ptr())
@@ -805,8 +1079,6 @@ def run_ppo[M: ModelDefLike, C: Phyics3dEnvConfig](
                 ret_acc[e] = ret_acc[e] * GAMMA + r
                 rt[unsafe_offset=e] = Scalar[DT](ret_acc[e])
                 raw_ret[e] += r
-                if env.d.meta.data[e * METADATA_SIZE + META_IDX_GOAL_HELD] > Scalar[DT](0.5):
-                    succ[e] = True
             ret_rms.update(rt, N_ENVS, 1)
             var rscale = 1.0 / sqrt(ret_rms.var_[0] + 1e-8)
             var rn = mptr(rew_n.unsafe_ptr())
@@ -844,12 +1116,14 @@ def run_ppo[M: ModelDefLike, C: Phyics3dEnvConfig](
                     )
                 if dh2[unsafe_offset=e] > Scalar[DT](0.5):
                     _lag_reset(lag, arm_q, e)
+                    _target_reset(tprev, arm_q, e)
                     _hist_clear(hist, e)
-            _augment[E_OBS](rp2, hist, mptr(aug.unsafe_ptr()))
+                    has_prev[e] = False
+            _augment[E_OBS](rp2, hist, tprev, a_qa, mptr(aug.unsafe_ptr()))
             obs_rms.normalize_into(
                 mptr(aug.unsafe_ptr()), mptr(cur_n.unsafe_ptr()), N_ENVS, OBS, OBS_CLIP,
             )
-            step += N_ENVS
+            step += N_ENVS * repeat
             it += 1
             # 6. the update at the rollout boundary, then the schedules
             if agent.trainer.train_step(step):
@@ -886,12 +1160,22 @@ def run_ppo[M: ModelDefLike, C: Phyics3dEnvConfig](
                     logger.log_scalar("episodes", Float64(n_episodes), step)
                     logger.log_scalar("diverged", Float64(n_diverged), step)
                     logger.log_scalar("sps", Float64(step) / secs, step)
+                    if spen_n > 0:
+                        logger.log_scalar("smooth_penalty_mean", spen_acc / Float64(spen_n), step)
                     logger.log_scalar("lr", lr0 * frac, step)
                     logger.log_scalar("ent_coef", ent1 + (ent0 - ent1) * frac, step)
                     agent.trainer.flush_metrics_through_logger[RunLogger](
                         logger_ptr, step
                     )
                 if n_updates % 10 == 0:
+                    if spen_n > 0:
+                        print("  smooth penalty per step", spen_acc / Float64(spen_n))
+                        spen_acc = 0.0
+                        spen_n = 0
+                    if all_ticks > 0:
+                        print("  dive fraction", Float64(dive_ticks) / Float64(all_ticks))
+                        dive_ticks = 0
+                        all_ticks = 0
                     print("  step", step, "| success", rate, "over", nw,
                           "ep | return", mret, "| episodes", n_episodes,
                           "| diverged", n_diverged,
@@ -915,6 +1199,10 @@ def run_ppo[M: ModelDefLike, C: Phyics3dEnvConfig](
             ctx.enqueue_copy(raw_h, obs_dev)
             ctx.synchronize()
             var held = List[Bool](length=N_ENVS, fill=False)
+            # ⚠ WHEN it first succeeds (step index, -1 never): is the horizon
+            # the limit? A lagged arm is slower; successes bunched at the end
+            # of the episode say the clock, not the skill, caps the score.
+            var t_held = List[Int](length=N_ENVS, fill=-1)
             # ⚠ WHERE EPISODES STOP, not only whether they succeed: the brick
             # (term 0's `a`) rising, reaching over `b`, and the closest
             # horizontal gap. A success rate cannot tell "never grasps" from
@@ -933,30 +1221,41 @@ def run_ppo[M: ModelDefLike, C: Phyics3dEnvConfig](
             var start = List[Float64](length=N_ENVS * 8, fill=0.0)
             for t in range(C.MAX_STEPS - 1):
                 var rq = mptr(raw_h.unsafe_ptr())
-                for e in range(N_ENVS):
-                    for j in range(ACT_DIM):
-                        arm_q[e * ACT_DIM + j] = Float64(
-                            rq[unsafe_offset = e * E_OBS + a_qa[j]]
-                        )
-                    if t == 0:
-                        _lag_reset(lag, arm_q, e)
-                        _hist_clear(hist, e)
-                _augment[E_OBS](rq, hist, mptr(aug.unsafe_ptr()))
-                obs_rms.normalize_into(
-                    mptr(aug.unsafe_ptr()), mptr(cur_n.unsafe_ptr()), N_ENVS, OBS, OBS_CLIP
-                )
-                agent.trainer.select_greedy_action_batched(
-                    mptr(cur_n.unsafe_ptr()), mptr(act_h.unsafe_ptr())
-                )
-                if action_mode == "delta":
-                    _delta_to_env(
-                        mptr(act_h.unsafe_ptr()), mptr(env_act.unsafe_ptr()),
-                        arm_q, a_lo, a_hi, lag, d_arm, d_grip,
+                # the policy acts every `repeat` ticks; its targets are held
+                # between, the servo model advancing per tick
+                if t % repeat == 0:
+                    for e in range(N_ENVS):
+                        for j in range(ACT_DIM):
+                            arm_q[e * ACT_DIM + j] = Float64(
+                                rq[unsafe_offset = e * E_OBS + a_qa[j]]
+                            )
+                        if t == 0:
+                            _lag_reset(lag, arm_q, e)
+                            _target_reset(tprev, arm_q, e)
+                            _hist_clear(hist, e)
+                    _augment[E_OBS](rq, hist, tprev, a_qa, mptr(aug.unsafe_ptr()))
+                    obs_rms.normalize_into(
+                        mptr(aug.unsafe_ptr()), mptr(cur_n.unsafe_ptr()), N_ENVS, OBS, OBS_CLIP
                     )
+                    agent.trainer.select_greedy_action_batched(
+                        mptr(cur_n.unsafe_ptr()), mptr(act_h.unsafe_ptr())
+                    )
+                    if action_mode == "delta":
+                        _delta_targets(
+                            mptr(act_h.unsafe_ptr()), tg, arm_q, a_lo, a_hi,
+                            d_arm, d_grip,
+                        )
+                    elif action_mode == "target":
+                        _target_targets(
+                            mptr(act_h.unsafe_ptr()), tg, tprev, arm_q, a_lo,
+                            a_hi, d_arm, d_grip, target_lead,
+                        )
+                    _hist_push(hist, mptr(act_h.unsafe_ptr()))
+                if stepped:
+                    _targets_to_env(tg, mptr(env_act.unsafe_ptr()), a_lo, a_hi, lag)
                     ctx.enqueue_copy(act_dev, env_act)
                 else:
                     ctx.enqueue_copy(act_dev, act_h)
-                _hist_push(hist, mptr(act_h.unsafe_ptr()))
                 env.step_batch[N_ENVS](ctx=ctx, rng_seed=UInt64(t + 1))
                 ctx.enqueue_copy(raw_h, obs_dev)
                 env.d.meta.download(ctx)
@@ -969,6 +1268,8 @@ def run_ppo[M: ModelDefLike, C: Phyics3dEnvConfig](
                     var hb = env.d.meta.data[e * METADATA_SIZE + META_IDX_GOAL_HELD] > Scalar[DT](0.5)
                     if hb:
                         held[e] = True
+                        if t_held[e] < 0:
+                            t_held[e] = t
                     held_end[e] = hb
                     var mb = e * METADATA_SIZE + META_IDX_TASK_PARAM_0
                     var ia = Int(env.d.meta.data[mb + 1])
@@ -1041,7 +1342,7 @@ def run_ppo[M: ModelDefLike, C: Phyics3dEnvConfig](
             # one row per episode: where it started, how far it got
             var csv = String(
                 "lane,brick_x,brick_y,qx,qy,qz,qw,bowl_x,bowl_y,"
-                + "rise_max,h_min,over,success,held_end,dz_end,h_end\n"
+                + "rise_max,h_min,over,success,held_end,dz_end,h_end,t_held\n"
             )
             for e in range(N_ENVS):
                 csv += String(e)
@@ -1051,11 +1352,30 @@ def run_ppo[M: ModelDefLike, C: Phyics3dEnvConfig](
                 csv += "," + ("1" if over[e] else "0")
                 csv += "," + ("1" if held[e] else "0")
                 csv += "," + ("1" if held_end[e] else "0")
-                csv += "," + String(dz_end[e]) + "," + String(h_end[e]) + "\n"
+                csv += "," + String(dz_end[e]) + "," + String(h_end[e])
+                csv += "," + String(t_held[e]) + "\n"
             var csv_path = run.dir + "/eval_lanes_round" + String(rnd) + ".csv"
             with open(csv_path, "w") as f:
                 f.write(csv)
             print("  greedy eval round", rnd, "per-episode rows:", csv_path)
+            # the successes' first-success step: quartiles, and the share in
+            # the horizon's last quarter
+            var ts = List[Int]()
+            for e in range(N_ENVS):
+                if t_held[e] >= 0:
+                    ts.append(t_held[e])
+            if len(ts) > 0:
+                sort(ts)
+                var late = 0
+                for k in range(len(ts)):
+                    if ts[k] >= (3 * C.MAX_STEPS) // 4:
+                        late += 1
+                var dt_s = Float64(C.FRAME_SKIP) * M.TIMESTEP
+                print("  greedy eval round", rnd, "first success at step (of",
+                      C.MAX_STEPS, ") p25", ts[len(ts) // 4], "p50",
+                      ts[len(ts) // 2], "p90", ts[(9 * len(ts)) // 10],
+                      "| p50", Float64(ts[len(ts) // 2]) * dt_s, "s | in the last quarter",
+                      late, "of", len(ts))
             print("  greedy eval round", rnd, "endings of the", N_ENVS - n_end,
                   "not held at the end | brick > 2 cm up (carried, hovering or on the rim)", f_up,
                   "| resting inside the rim, not Near", f_rim_in,

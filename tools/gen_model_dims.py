@@ -272,12 +272,12 @@ def fmt_float(x: float) -> str:
     return s if ("." in s or "e" in s or "E" in s) else s + ".0"
 
 
-def render(module: str, syms: list) -> str:
-    out = [
+def _header(regen: str, check: str) -> list:
+    return [
         '"""Model dimensions — GENERATED, DO NOT EDIT.\n',
         "\n",
-        "Regenerate with:  pixi run python tools/gen_model_dims.py\n",
-        "CI checks it with: pixi run python tools/gen_model_dims.py --check\n",
+        "Regenerate with:  %s\n" % regen,
+        "CI checks it with: %s\n" % check,
         "\n",
         "Source of truth is the `.xml` asset, read through `mujoco.MjModel`.\n",
         "Editing a VALUE in the asset (a mass, a size, a colour) needs no\n",
@@ -287,20 +287,46 @@ def render(module: str, syms: list) -> str:
         "\n",
         "from noeira.physics3d.parser.xml_parser import ParsedModel\n",
     ]
+
+
+def _dims_block(xml_path: str, const: str) -> list:
+    """One `comptime <const> = ParsedModel(...)` — the ONE spelling of it,
+    shared by the `MODELS` table and `--xml`."""
+    d = dims_from_mujoco(xml_path)
+    out = ["\n\n# %s\n" % xml_path, "comptime %s = ParsedModel(\n" % const]
+    for k in ("nbody", "njoint", "nq", "nv", "ngeom", "nact", "ntex",
+              "nmat", "nlight", "ncam", "nsite", "neq", "nexclude",
+              "npair", "ntendon", "nsensor", "nsensordata"):
+        out.append("    %s=%d,\n" % (k, int(d[k])))
+    out.append("    timestep=%s,\n" % fmt_float(d["timestep"]))
+    out.append("    max_condim=%d,\n" % int(d["max_condim"]))
+    out.append("    noslip_iter=%d,\n" % int(d["noslip_iter"]))
+    out.append("    ccd_tol=%s,\n" % fmt_float(d["ccd_tol"]))
+    out.append("    ccd_iter=%d,\n" % int(d["ccd_iter"]))
+    out.append(")\n")
+    return out
+
+
+def render(module: str, syms: list) -> str:
+    out = _header("pixi run python tools/gen_model_dims.py",
+                  "pixi run python tools/gen_model_dims.py --check")
     for sym in syms:
-        d = dims_from_mujoco(asset_path(module, sym))
-        out.append("\n\n# %s\n" % asset_path(module, sym))
-        out.append("comptime %s = ParsedModel(\n" % const_name(sym))
-        for k in ("nbody", "njoint", "nq", "nv", "ngeom", "nact", "ntex",
-                  "nmat", "nlight", "ncam", "nsite", "neq", "nexclude",
-                  "npair", "ntendon", "nsensor", "nsensordata"):
-            out.append("    %s=%d,\n" % (k, int(d[k])))
-        out.append("    timestep=%s,\n" % fmt_float(d["timestep"]))
-        out.append("    max_condim=%d,\n" % int(d["max_condim"]))
-        out.append("    noslip_iter=%d,\n" % int(d["noslip_iter"]))
-        out.append("    ccd_tol=%s,\n" % fmt_float(d["ccd_tol"]))
-        out.append("    ccd_iter=%d,\n" % int(d["ccd_iter"]))
-        out.append(")\n")
+        out += _dims_block(asset_path(module, sym), const_name(sym))
+    return "".join(out)
+
+
+def render_xml(xml_path: str, emit: str, name: str) -> str:
+    """`--xml`: the dims of ANY scene, for a model that is not the library's.
+
+    ⚠ A PROJECT's scene (`projects/<p>/...`) is not in `MODELS` and must not
+    be: the library does not list what a private project builds. The file is
+    written where the caller says, and its header records the exact command,
+    so the project regenerates and checks it the same way CI checks ours.
+    """
+    args = "--xml %s --emit %s --name %s" % (xml_path, emit, name)
+    out = _header("pixi run python tools/gen_model_dims.py " + args,
+                  "pixi run python tools/gen_model_dims.py " + args + " --check")
+    out += _dims_block(xml_path, name.upper() + "_DIMS")
     return "".join(out)
 
 
@@ -308,11 +334,35 @@ def main() -> int:
     ap = argparse.ArgumentParser()
     ap.add_argument("--check", action="store_true",
                     help="do not write; exit 1 if any file would change")
+    ap.add_argument("--xml", help="one scene NOT in MODELS (e.g. a project's);"
+                    " needs --emit and --name")
+    ap.add_argument("--emit", help="with --xml: the dims module to write")
+    ap.add_argument("--name", help="with --xml: the constant is <NAME>_DIMS")
     args = ap.parse_args()
 
     if not os.path.isdir("noeira/envs"):
         print("run me from the project root", file=sys.stderr)
         return 2
+
+    if args.xml or args.emit or args.name:
+        if not (args.xml and args.emit and args.name):
+            print("--xml needs --emit and --name", file=sys.stderr)
+            return 2
+        text = render_xml(args.xml, args.emit, args.name)
+        old = None
+        if os.path.exists(args.emit):
+            with open(args.emit, "r") as f:
+                old = f.read()
+        if old == text:
+            print("up to date —", args.emit)
+            return 0
+        if args.check:
+            print("STALE —", args.emit, "differs from", args.xml)
+            return 1
+        with open(args.emit, "w") as f:
+            f.write(text)
+        print("wrote", args.emit)
+        return 0
 
     stale, written = [], 0
     for module, syms in MODELS:

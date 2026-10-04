@@ -122,6 +122,9 @@ pixel-deploy-jetson-wv32 = { cmd = "mojo build -I . --target-accelerator sm_87 -
 # ... and one that also sees its last 3 executed actions (-D TASK_PPO_ACT_HIST=3:
 # the students trained under the servo lag, which need to know what is in flight)
 pixel-deploy-jetson-wv32h3 = { cmd = "mojo build -I . --target-accelerator sm_87 -D DAGGER_WINDOW -D DAGGER_PX_32 -D DAGGER_JOINT_VEL -D TASK_PPO_ACT_HIST=3 -o /tmp/pixel_deploy_wv32h3 examples/so101/pixel_student_deploy_real.mojo && /tmp/pixel_deploy_wv32h3", depends-on = ["build-serial", "build-opencv"], description = "A windowed 32x32 joint-velocity pixel student with action history on the arm (-- --role R; --arm to move it)" }
+# ... and a TARGET-MODE one (-D TASK_PPO_TARGET_OBS: steps from the previous
+# target, delta_action.target_step; a student of an --action target teacher)
+pixel-deploy-jetson-wv32h3t = { cmd = "mojo build -I . --target-accelerator sm_87 -D DAGGER_WINDOW -D DAGGER_PX_32 -D DAGGER_JOINT_VEL -D TASK_PPO_ACT_HIST=3 -D TASK_PPO_TARGET_OBS -o /tmp/pixel_deploy_wv32h3t examples/so101/pixel_student_deploy_real.mojo && /tmp/pixel_deploy_wv32h3t", depends-on = ["build-serial", "build-opencv"], description = "A windowed 32x32 joint-velocity pixel student with action history, TARGET mode, on the arm (-- --role R; --arm to move it)" }
 
 # ── SmolVLA on the board ───────────────────────────────────────────────────
 # ⚠⚠ MEASURE THE QUERY FIRST. `smolvla-probe-jetson` times one `select_action`;
@@ -178,6 +181,10 @@ safetensors = ">=0.4,<1"
 # reading of the architecture and could not see a misreading; HuggingFace's own
 # SmolVLM can.
 transformers = ">=4.50"
+# The LeWorldModel reference (`references/le-wm-main/{jepa,module}.py`, run
+# as-is by `tools/lewm/`) reshapes with einops. Its encoder is HF's ViTModel,
+# which is why `transformers` above serves LeWM too.
+einops = ">=0.7"
 
 [feature.cpu.dependencies]
 # CPU-only environment for CI and headless test runs: base deps WITHOUT the
@@ -328,6 +335,14 @@ test-io = { cmd = "bash scripts/run_tests.sh tests/manifests/io.txt", descriptio
 test-vision = { cmd = "bash scripts/run_tests.sh tests/manifests/vision.txt", depends-on = ["build-opencv"], description = "The vision gates (OpenCV shim, calibration, capture) — needs the OpenCV shim, so not in test-smoke" }
 test-swm = { cmd = "bash scripts/run_tests.sh tests/manifests/swm.txt", description = "SWM-H sheaf world model gates (experimental, CPU)" }
 test-fb = { cmd = "bash scripts/run_tests.sh tests/manifests/fb.txt", description = "Forward-Backward zero-shot RL gates (CPU; docs/BFM_ZERO_SHOT_RL.md)" }
+test-lewm = { cmd = "bash scripts/run_tests.sh tests/manifests/lewm.txt", description = "LeWorldModel port self-consistency (experimental, CPU, toy dims)" }
+test-lewm-gpu = { cmd = "bash scripts/run_tests.sh tests/manifests/lewm-gpu.txt", description = "LeWorldModel port GPU paths, toy dims (needs -e apple or -e nvidia)" }
+# ⚠ The torch steps run WITHOUT the task's LD_PRELOAD: on Linux this project's
+# activation preloads `noeira/cuda/libcuda_intercept.so` (a dlsym hook), every
+# process of the task inherits it, and the CUDA build of torch in act-ref then
+# sat at 100 % of one core without starting (RTX 5090 box, 2026-10-02).
+dump-lewm-ref = { cmd = "pixi install -e act-ref && env -u LD_PRELOAD .pixi/envs/act-ref/bin/python tools/lewm/dump_lewm_reference.py --out /tmp/lewm_ref --noise && mojo run -I . tools/lewm/list_ref_params.mojo > /tmp/lewm_ref/ours_names.tsv && env -u LD_PRELOAD .pixi/envs/act-ref/bin/python tools/lewm/convert_ref_to_ours.py --dump /tmp/lewm_ref", description = "LeWM reference dump: the published checkpoint under torch, re-expressed in our names (needs weights in ~/.cache/noeira/lewm_pusht/hf)" }
+test-lewm-ref = { cmd = "bash scripts/run_tests.sh tests/manifests/lewm-ref.txt", description = "LeWM reference-exact model vs torch: forward stages + training-step gradients (needs dump-lewm-ref; -e apple or -e nvidia)" }
 test-concurrent = { cmd = "bash scripts/run_tests.sh tests/manifests/concurrent.txt", description = "Concurrency backbone (noeira/core/concurrent): pthread, SPSC ring, atomic cells" }
 # Format interop: our safetensors reader/writer against the REFERENCE library,
 # and the Hub's ImageNet ResNet18 against torchvision's. Needs `-e act-ref`

@@ -41,7 +41,7 @@ def _is_pointwise(label: String) -> Bool:
     scalar op per element, derivative known per-op)."""
     var pw = [
         String("ReLU"), String("Tanh"), String("Sigmoid"), String("Mish"),
-        String("GELU"), String("SiLU"), String("Symlog"), String("StopGrad"),
+        String("GELU"), String("GELUTanh"), String("SiLU"), String("Symlog"), String("StopGrad"),
         String("Scale"), String("Min"), String("Sub"), String("Add"),
         String("Binary"),
     ]

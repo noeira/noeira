@@ -26,16 +26,25 @@ from noeira.nn.primitives.linear import Linear
 
 
 def _cmp(
-    name: String, cpu: Tensor, gpu: Tensor, n: Int, tol: Float64
+    name: String, cpu: Tensor, gpu: Tensor, n: Int, tol: Float64,
+    floor_frac: Float64 = 0.0,
 ) raises -> Float64:
+    """Per-element relative error; the denominator is floored at 1e-6, or at
+    `floor_frac` x the tensor's largest |element| when that is larger.
+
+    grad_bias uses floor_frac 0.1: it is a column SUM over the batch, and the
+    upstream pattern here makes some columns cancel to exactly 0 — the CPU
+    returns -4.5e-8 there and the GPU's chunked reduction (a different order)
+    -1.5e-7, both roundoff of zero, which a 1e-6 floor reads as a 10 % error.
+    A wrong reduction (a lost chunk, a wrong column) is off by O(the value)."""
     var max_rel = Float64(0)
     var mag = Float64(0)
     for i in range(n):
+        mag = max(mag, abs(Float64(cpu.data[i])))
+    for i in range(n):
         var a = Float64(cpu.data[i])
         var b = Float64(gpu.data[i])
-        if abs(a) > mag:
-            mag = abs(a)
-        var denom = abs(a) if abs(a) > 1e-6 else 1e-6
+        var denom = max(abs(a), max(1e-6, floor_frac * mag))
         var r = abs(a - b) / denom
         if r > max_rel:
             max_rel = r
@@ -101,7 +110,7 @@ def check[IN: Int, OUT: Int, B: Int](ctx: DeviceContext) raises:
 
     var r_gi = _cmp("grad_input", gic, gig, B * IN, 1e-4)
     var r_gw = _cmp("grad_w", lc.weight.grd, lg.weight.grd, L.W_SIZE, 1e-4)
-    var r_gb = _cmp("grad_bias", lc.bias.grd, lg.bias.grd, L.B_SIZE, 1e-4)
+    var r_gb = _cmp("grad_bias", lc.bias.grd, lg.bias.grd, L.B_SIZE, 1e-4, 0.1)
     print(
         "     grad_input ", r_gi, "   grad_w ", r_gw, "   grad_bias ", r_gb,
         sep="",

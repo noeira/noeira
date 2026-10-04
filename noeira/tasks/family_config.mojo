@@ -76,6 +76,7 @@ from layout import Layout, LayoutTensor
 
 from noeira.physics3d.fields import Data, Dims, DimsLike
 from std.math import sqrt
+from std.sys.defines import get_defined_int
 
 from noeira.physics3d.gpu.constants import (
     MODEL_GEOM_SIZE,
@@ -1462,8 +1463,16 @@ timestep — what every run on this family has used), the bare arm's hull
 budget (the props are boxes), and `cube.xml`'s half-size as the sampler's
 radius — see `So101TabletopPlacement.SLOT_RADIUS`; NO grasp term (0.0)."""
 
+comptime SO101_TOWER_HORIZON: Int = get_defined_int["TASK_TOWER_HORIZON", 300]()
+"""The tower's episode length in policy steps: the family's `horizon=300`
+(9.6 s at 31.25 Hz) unless `-D TASK_TOWER_HORIZON=N`. ⚠ For the servo-lag
+runs: a lagged arm is slower, and a horizon that ends its episodes before it
+can finish caps the score at the clock, not the skill (the eval prints when
+the successes happen)."""
+
 comptime So101TowerConfig = So101FamilyConfig[
-    So101TowerPlacement, 300, 16, SO101_TOWER_NMESH_VERTS, 0.0226, 0.5, 0.25
+    So101TowerPlacement, SO101_TOWER_HORIZON, 16, SO101_TOWER_NMESH_VERTS,
+    0.0226, 0.5, 0.25,
 ]
 """`so101_tower`: horizon 300, frame skip 16 — `control_freq=30` in the
 family, 1/30 s / 2 ms = 16.7 substeps, rounded to the integer below (31.25

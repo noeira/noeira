@@ -46,7 +46,9 @@ from noeira.nn.primitives.conv2d import Conv2D
 from noeira.nn.primitives.flatten import Flatten
 from noeira.nn.primitives.linear import Linear
 from noeira.nn.primitives.linear_relu import LinearReLU
-from noeira.tasks.delta_action import DELTA_ACT, DELTA_ARM, DELTA_GRIPPER, ACT_HIST
+from noeira.tasks.delta_action import (
+    DELTA_ACT, DELTA_ARM, DELTA_GRIPPER, ACT_HIST, TARGET_OBS,
+)
 
 comptime ACT = DELTA_ACT
 comptime N_CAMS = 1 if is_defined["DAGGER_WRIST_ONLY"]() else 2
@@ -66,9 +68,15 @@ report velocity (`SO101Arm.read_velocities`), so the plane is deployable."""
 comptime PROPRIO_STATE = 2 * ACT if JOINT_VEL else ACT
 """The state's joint planes: the angles, then (with JOINT_VEL) the velocities."""
 comptime HIST_WORDS = ACT_HIST * ACT
-comptime PROPRIO = PROPRIO_STATE + HIST_WORDS
+comptime PROPRIO = PROPRIO_STATE + HIST_WORDS + TARGET_OBS
 """All the joint planes: the state's, then (`-D TASK_PPO_ACT_HIST=K`) the
-last K executed actions, most recent first, unscaled ([-1, 1])."""
+last K executed actions, most recent first, unscaled ([-1, 1]), then
+(`-D TASK_PPO_TARGET_OBS`, `--action target`) the commanded target's LEAD
+over the measured joints, `target - q`, x TARGET_LEAD_SCALE — the commands
+still in flight, the hidden state a target-mode policy integrates."""
+comptime TARGET_LEAD_SCALE: Float64 = 3.0
+"""The lead is bounded by `--target-lead` (~0.3 rad): x3 brings it to the
+other planes' range."""
 comptime C_IN = 3 * N_CAMS + PROPRIO
 comptime IN_DIM = C_IN * PLANE
 comptime HID = 256
@@ -273,6 +281,16 @@ def joint_vels_to_planes(ref qd: List[Float64], mut x: List[Scalar[DT]]):
                 x[base + p] = v
 
 
+def target_lead_to_planes(ref lead: List[Float64], mut x: List[Scalar[DT]]):
+    """The six target leads `target - q` (model rad) into their planes, x
+    TARGET_LEAD_SCALE — a no-op in a build without `TASK_PPO_TARGET_OBS`."""
+    for k in range(TARGET_OBS):
+        var v = Scalar[DT](lead[k] * TARGET_LEAD_SCALE)
+        var base = IMG + (PROPRIO_STATE + HIST_WORDS + k) * PLANE
+        for p in range(PLANE):
+            x[base + p] = v
+
+
 def act_hist_to_planes(ref hist: List[Float64], mut x: List[Scalar[DT]]):
     """The last ACT_HIST executed actions (`act_hist_push`'s layout) into
     their planes — a no-op in a build without `TASK_PPO_ACT_HIST`."""
@@ -308,7 +326,8 @@ def write_pixel_manifest(
     path: String, task: String, teacher: String, gripper_sign: Bool,
     control_period_s: Float64, delta_arm: Float64 = DELTA_ARM,
     delta_gripper: Float64 = DELTA_GRIPPER, lag_tau: String = "",
-    lag_delay: String = "",
+    lag_delay: String = "", repeat: Int = 1, action: String = "delta",
+    target_lead: Float64 = 0.0,
 ) raises:
     """The student's contract as JSON — at `checkpoints/norm.json`, the file
     `project-promote` copies beside the weights, so a promoted pixel policy
@@ -336,6 +355,10 @@ def write_pixel_manifest(
     s += '  "delta_gripper": ' + String(delta_gripper) + ',\n'
     s += '  "servo_lag": "tau ' + lag_tau + ' ms, delay ' + lag_delay + ' ticks",\n'
     s += '  "gripper_sign": ' + ("true" if gripper_sign else "false") + ',\n'
+    s += '  "repeat": ' + String(repeat) + ',\n'
+    s += '  "action": "' + action + '",\n'
+    s += '  "target_lead": ' + String(target_lead) + ',\n'
+    s += '  "target_obs": ' + String(TARGET_OBS) + ',\n'
     s += '  "control_period_s": ' + String(control_period_s) + '\n'
     s += "}\n"
     with open(path, "w") as f:
@@ -351,6 +374,14 @@ struct PixelManifest(Copyable, Movable):
     var delta_gripper: Float64
     """The per-step scales the policy was TRAINED with — every executor of
     it must use them (a student acts in its teacher's units)."""
+    var repeat: Int
+    """Ticks per policy step: the policy acts every `repeat` control
+    periods and its targets are held between (1: every tick)."""
+    var action: String
+    """`delta` (the step from the measured joints) or `target` (the step
+    from the previous target, `delta_action.target_step`)."""
+    var target_lead: Float64
+    """`target` mode's bound on target - q (rad, 0 = none)."""
 
     def __init__(out self):
         self.task = String("")
@@ -359,6 +390,9 @@ struct PixelManifest(Copyable, Movable):
         self.control_period_s = 0.0
         self.delta_arm = DELTA_ARM
         self.delta_gripper = DELTA_GRIPPER
+        self.repeat = 1
+        self.action = String("delta")
+        self.target_lead = 0.0
 
 
 def _num(ref doc: JsonDoc, r: Int, k: String, path: String) raises -> Float64:
@@ -436,4 +470,22 @@ def check_pixel_manifest(path: String) raises -> PixelManifest:
     m.control_period_s = _num(doc, r, "control_period_s", path)
     m.delta_arm = da
     m.delta_gripper = dg
+    var rp = doc.field(r, "repeat")
+    m.repeat = Int(doc.number(rp)) if rp >= 0 else 1
+    var ac = doc.field(r, "action")
+    m.action = doc.string(ac) if ac >= 0 else String("delta")
+    if m.action != "delta" and m.action != "target":
+        raise Error("pixel student: unknown action '" + m.action + "'")
+    var tl = doc.field(r, "target_lead")
+    m.target_lead = doc.number(tl) if tl >= 0 else 0.0
+    var to = doc.field(r, "target_obs")
+    var target_obs = Int(doc.number(to)) if to >= 0 else 0
+    if target_obs != TARGET_OBS or (m.action == "target") != (TARGET_OBS > 0):
+        raise Error("pixel student: the policy is action '" + m.action
+                    + "' with " + String(target_obs) + " target-lead planes,"
+                    + " this build has " + String(TARGET_OBS)
+                    + " (a target policy needs -D TASK_PPO_TARGET_OBS, and"
+                    + " only it does)")
+    if m.repeat < 1 or m.repeat > 8:
+        raise Error("pixel student: implausible repeat " + String(m.repeat))
     return m^

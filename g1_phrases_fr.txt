@@ -1,0 +1,25 @@
+# Spoken confirmations, French. Load with --phrases g1_phrases_fr.txt
+# Format: <bank command>=<what the robot says>
+# The built-in table is English because the tree is English; this file is
+# runtime data, and it exists because a French speaker gets a French reply
+# from the `talk` path and should get one from a movement too.
+walk=je marche
+run=je cours
+spin_left=je tourne à gauche
+spin_right=je tourne à droite
+strafe_left=je me déplace vers la gauche
+strafe_right=je me déplace vers la droite
+diagonal=je marche en diagonale
+stand=je reste immobile
+squat=je m'accroupis
+crouch=je fléchis les jambes
+right_hand_up=je lève le bras droit
+left_hand_up=je lève le bras gauche
+both_hands_up=je lève les deux bras
+arms_wide=j'écarte les bras
+look_left=je regarde à gauche
+look_right=je regarde à droite
+walk_right_hand_up=je marche le bras droit levé
+walk_both_hands_up=je marche les deux bras levés
+spin_arms_in=je tourne les bras serrés
+back=je recule

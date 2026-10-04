@@ -82,3 +82,48 @@ def announce_checkpoint(
         return
     var sink = artifacts.value()
     _ = sink.offer(rel, String(KIND_CHECKPOINT))
+
+
+def checkpoint_retain(
+    step: Int,
+    ref written: List[Int],
+    keep: Int,
+    milestone: Int,
+    best: Int,
+) -> Bool:
+    """Should the checkpoint at `step` survive a prune?
+
+    ⚠ THIS EXISTS BECAUSE A RUN DIED OF A FULL DISK, not because a directory
+    was untidy. The 2048/6 G1 run wrote 1.17 GB every 2000 batched steps and
+    at 38 000 the 19th one cut off mid-write on a 60 GB box — 20 h of
+    training lost with nothing wrong upstream of the filesystem
+    (`docs/BFM_ZERO_G1_REPRODUCTION.md` §12.44 era).
+
+    Three reasons to keep one, in priority order:
+
+      * it is the BEST-scoring checkpoint (`best`, -1 for none);
+      * it is on the milestone ladder (`step % milestone == 0`), which is what
+        makes a long run auditable after the fact rather than only resumable;
+      * it is among the last `keep` written, which is what makes it resumable.
+
+    `written` is the ordered list of steps still on disk, oldest first, so
+    "last `keep`" is positional rather than arithmetic — a run that skipped a
+    checkpoint for want of space must still keep its most recent ones, and a
+    rule like `step > last - keep * every` would quietly drop all of them.
+
+    ⚠ ONE FUNCTION FOR BOTH THE PRUNE AND THE REPORT. The caller deletes with
+    this predicate and then recounts with it; two copies of the rule would let
+    the log claim a file that had just been removed.
+    """
+    if best >= 0 and step == best:
+        return True
+    if milestone > 0 and step % milestone == 0:
+        return True
+    if keep <= 0:
+        return False
+    var n = len(written)
+    var first = n - keep if n > keep else 0
+    for i in range(first, n):
+        if written[i] == step:
+            return True
+    return False

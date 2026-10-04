@@ -139,6 +139,21 @@ struct TensorImpl[dt: DType = DT](Defaultable & Movable & Deinitable):
         t.n = n
         return t^
 
+    def release(mut self):
+        """Drop the storage (device buffer, host list, pinned staging); the
+        next `ensure` / `ensure_gpu` allocates afresh. For buffers a module
+        REBUILDS on its next forward / vjp (`Module.release_buffers`).
+
+        ⚠ The new allocation is NOT zero-filled on the device (`ensure_gpu`):
+        only release a buffer whose every element is written before it is
+        read. A device buffer goes back to MAX's caching pool, so the next
+        allocation reuses it without a driver call."""
+        self.dev = None
+        self.data = List[Scalar[Self.dt]]()
+        self.n = 0
+        self.hbuf = None
+        self.hcap = 0
+
     def ensure(mut self, n: Int):
         """Lazy-grow the CPU list to >= n, zero-filled."""
         if len(self.data) < n:

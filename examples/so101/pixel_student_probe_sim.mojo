@@ -5,6 +5,7 @@
     /tmp/px_probe --ckpt projects/so101-tower/policies/pixel_bowl.ckpt [--task T] [--seed S] [--episodes N]
         [--record ticks.csv]      # the deploy's --record columns, per episode
         [--lag-tau 140,140 --lag-delay 2,2]   # the real servos' response (ServoLag)
+        [--lag-vmax-j "...;0.8,1.2" --lag-offset-j ... --lag-period 32,38]   # per joint
 
 The reference a real run is read against. It starts every episode where the
 real deploy's ramp leaves the arm — the task's reset pose, props placed by
@@ -37,14 +38,14 @@ from noeira.nn.core.tensor_refs import TensorRefs
 from noeira.physics3d.fields import Data
 from noeira.physics3d.kinematics.forward_kinematics import forward_kinematics
 from noeira.physics3d.parser.runtime_load import parse_model_runtime
-from noeira.tasks.delta_action import delta_target, ServoLag
+from noeira.tasks.delta_action import delta_target, target_step, ServoLag, TARGET_OBS
 from noeira.tasks.family import scene_path
 from noeira.tasks.family_config import So101TowerConfig
 from noeira.tasks.pixel_student import (
     StudentNet, N_CAMS, IN_DIM, ACT, RENDER, OVERHEAD_RENDER_W,
     OVERHEAD_RENDER_H, OBS_PX, JOINT_VEL, WINDOWED, check_pixel_manifest,
     render_to_planes, joints_to_planes, joint_vels_to_planes, student_act,
-    HIST_WORDS, act_hist_push, act_hist_to_planes,
+    HIST_WORDS, act_hist_push, act_hist_to_planes, target_lead_to_planes,
 )
 from noeira.tasks.placement.so101_tower import So101TowerPlacement
 from noeira.tasks.posed_reset import posed_qpos
@@ -91,6 +92,11 @@ def main() raises:
         man_path = ckpt[byte = 0 : ckpt.rfind("/")] + "/norm.json"
     var man = check_pixel_manifest(man_path)
     var lag_tau_s = _arg(args, "--lag-tau", "")
+    # added to the GRIPPER angle the student sees (the deploy's --grip-offset):
+    # -0.05 plays the real jaws, which read ~0.05 rad more closed on the cube
+    var grip_off = Float64(_arg(args, "--grip-offset", "0"))
+    # the deploy's --act-ema: arm action words executed as (1 - A) new + A previous
+    var act_ema = Float64(_arg(args, "--act-ema", "0"))
     # overrides of the manifest's action scales — for what-ifs only
     var da_o = _arg(args, "--delta-arm", "")
     var dg_o = _arg(args, "--delta-gripper", "")
@@ -144,8 +150,22 @@ def main() raises:
     var xs = List[Scalar[DT]](length=IN_DIM, fill=Scalar[DT](0))
     var env = E(ctx)
     var lag = ServoLag.parse(1, lag_tau_s, lag_delay_s, man.control_period_s)
+    # the real arm's speed cap (rad/s, "v" or "lo,hi": the probe takes the
+    # middle) and elbow stop — `ServoLag.set_limits`
+    lag.set_limits(_arg(args, "--lag-vmax", ""), Float64(_arg(args, "--elbow-max", "0")))
+    # per-joint ranges ("lo,hi;..." x6, the gripper last), signed offsets and
+    # the control period's range — `ServoLag.set_per_joint` / `set_offset` /
+    # `set_period`, as in the state probe
+    lag.set_per_joint(
+        _arg(args, "--lag-tau-j", ""), _arg(args, "--lag-delay-j", ""),
+        _arg(args, "--lag-vmax-j", ""),
+    )
+    lag.set_offset(_arg(args, "--lag-offset-j", ""))
+    lag.set_period(_arg(args, "--lag-period", ""))
     if lag.on:
-        print("probe: servo lag tau", lag_tau_s, "ms, delay", lag_delay_s, "ticks")
+        print("probe: servo lag tau", lag_tau_s, "ms, delay", lag_delay_s,
+              "ticks | arm speed cap", lag.vmax_lo, "-", lag.vmax_hi,
+              "rad/s | elbow max", lag.elbow_max)
     var n_ok = 0
     for ep in range(episodes):
         _ = env.reset()
@@ -185,83 +205,111 @@ def main() raises:
             q_start[j] = Float64(env.d.qpos.data[qa[j]])
         lag.reset_lane(0, q_start, 0, 0.5, 0.5)
         var hist = List[Float64](length=HIST_WORDS, fill=0.0)
+        var q = List[Float64](length=ACT, fill=0.0)
+        var qd = List[Float64](length=ACT, fill=0.0)
+        var a_ex = List[Float64](length=ACT, fill=0.0)
+        var tgt_hold = List[Float64](length=ACT, fill=0.0)
+        # target mode (`man.action == "target"`): the last commanded target,
+        # starting on the joints; its lead over them is the student's input
+        var tprev = q_start.copy()
+        var lead = List[Float64](length=TARGET_OBS, fill=0.0)
+        var line = String("")
+        var ra = String("")
         for t in range(So101TowerConfig.MAX_STEPS):
-            for k in range(NQ):
-                rd.qpos.data[k] = Scalar[RIG_DT](env.d.qpos.data[k])
-            forward_kinematics["cpu", RIG_DT, TOWER_MD, 1](rd, rm)
-            for k in range(N_CAMS):
-                var rgb = List[Scalar[RIG_DT]]()
-                var dd = List[Scalar[RIG_DT]]()
-                var ss = List[Scalar[RIG_DT]]()
-                if N_CAMS == 2 and k == 0:
-                    r_o.cam = cams[k]
-                    r_o.render_cpu(rd, rm, rgb, dd, ss)
-                    render_to_planes(rgb, OVERHEAD_RENDER_W, OVERHEAD_RENDER_H, k, xs)
-                else:
-                    r_w.cam = cams[k]
-                    r_w.render_cpu(rd, rm, rgb, dd, ss)
-                    render_to_planes(rgb, RENDER, RENDER, k, xs)
-            var q = List[Float64](length=ACT, fill=0.0)
-            var qd = List[Float64](length=ACT, fill=0.0)
-            for j in range(ACT):
-                # ⚠ FROM THE ENV'S Data, as the trainer packs them (the
-                # observation's words are what the STATE policy reads)
-                q[j] = Float64(env.d.qpos.data[qa[j]])
-                qd[j] = Float64(env.d.qvel.data[da[j]])
-            if t < 2:
-                var dq = 0.0
-                var dv = 0.0
+            # the policy acts every `repeat` ticks (the manifest's): render,
+            # forward, new targets; between, the targets are HELD and the
+            # servo model runs per tick
+            if t % man.repeat == 0:
                 for k in range(NQ):
-                    dq = max(dq, abs(Float64(obs.data[k]) - Float64(env.d.qpos.data[k])))
-                for k in range(NV):
-                    dv = max(dv, abs(Float64(obs.data[NQ + k]) - Float64(env.d.qvel.data[k])))
-                var lv = String("   t=") + String(t) + " max|obs-qpos| " + fixed(dq, 5) + " max|obs-qvel| " + fixed(dv, 5) + "  qd:"
+                    rd.qpos.data[k] = Scalar[RIG_DT](env.d.qpos.data[k])
+                forward_kinematics["cpu", RIG_DT, TOWER_MD, 1](rd, rm)
+                for k in range(N_CAMS):
+                    var rgb = List[Scalar[RIG_DT]]()
+                    var dd = List[Scalar[RIG_DT]]()
+                    var ss = List[Scalar[RIG_DT]]()
+                    if N_CAMS == 2 and k == 0:
+                        r_o.cam = cams[k]
+                        r_o.render_cpu(rd, rm, rgb, dd, ss)
+                        render_to_planes(rgb, OVERHEAD_RENDER_W, OVERHEAD_RENDER_H, k, xs)
+                    else:
+                        r_w.cam = cams[k]
+                        r_w.render_cpu(rd, rm, rgb, dd, ss)
+                        render_to_planes(rgb, RENDER, RENDER, k, xs)
                 for j in range(ACT):
-                    lv += " " + col(qd[j], 6, 2)
-                print(lv)
-                if t == 0:
-                    var lo_ = String("   obs  [0:NQ]:")
-                    var ld_ = String("   qpos [0:NQ]:")
+                    # ⚠ FROM THE ENV'S Data, as the trainer packs them (the
+                    # observation's words are what the STATE policy reads)
+                    q[j] = Float64(env.d.qpos.data[qa[j]])
+                    qd[j] = Float64(env.d.qvel.data[da[j]])
+                if t < 2:
+                    var dq = 0.0
+                    var dv = 0.0
                     for k in range(NQ):
-                        lo_ += " " + fixed(Float64(obs.data[k]), 3)
-                        ld_ += " " + fixed(Float64(env.d.qpos.data[k]), 3)
-                    print(lo_)
-                    print(ld_)
-            joints_to_planes(q, xs)
-            joint_vels_to_planes(qd, xs)
-            act_hist_to_planes(hist, xs)
-            for k in range(IN_DIM):
-                x.data[k] = xs[k]
-            net.forward["cpu", 1](TensorRefs[1](x), y, None)
+                        dq = max(dq, abs(Float64(obs.data[k]) - Float64(env.d.qpos.data[k])))
+                    for k in range(NV):
+                        dv = max(dv, abs(Float64(obs.data[NQ + k]) - Float64(env.d.qvel.data[k])))
+                    var lv = String("   t=") + String(t) + " max|obs-qpos| " + fixed(dq, 5) + " max|obs-qvel| " + fixed(dv, 5) + "  qd:"
+                    for j in range(ACT):
+                        lv += " " + col(qd[j], 6, 2)
+                    print(lv)
+                    if t == 0:
+                        var lo_ = String("   obs  [0:NQ]:")
+                        var ld_ = String("   qpos [0:NQ]:")
+                        for k in range(NQ):
+                            lo_ += " " + fixed(Float64(obs.data[k]), 3)
+                            ld_ += " " + fixed(Float64(env.d.qpos.data[k]), 3)
+                        print(lo_)
+                        print(ld_)
+                var q_pol = q.copy()
+                q_pol[ACT - 1] += grip_off
+                joints_to_planes(q_pol, xs)
+                joint_vels_to_planes(qd, xs)
+                act_hist_to_planes(hist, xs)
+                for j in range(TARGET_OBS):
+                    lead[j] = tprev[j] - q[j]
+                target_lead_to_planes(lead, xs)
+                for k in range(IN_DIM):
+                    x.data[k] = xs[k]
+                net.forward["cpu", 1](TensorRefs[1](x), y, None)
+                line = String("")
+                ra = String("")
+                for j in range(ACT):
+                    var a = Float64(student_act(y.data[j], j, man.gripper_sign))
+                    if act_ema > 0.0 and j < ACT - 1:
+                        a = (1.0 - act_ema) * a + act_ema * a_ex[j]
+                    a_ex[j] = a
+                    if man.action == "target":
+                        tgt_hold[j] = target_step(
+                            tprev[j], q[j], a, j, lo[j], hi[j], man.delta_arm,
+                            man.delta_gripper, man.target_lead,
+                        )
+                        tprev[j] = tgt_hold[j]
+                    else:
+                        tgt_hold[j] = delta_target(q[j], a, j, lo[j], hi[j], man.delta_arm, man.delta_gripper)
+                    ra += "," + String(a)
+                    line += " " + col(a, 6, 2)
+                act_hist_push(hist, a_ex)
             var act = ContAction[ACT]()
-            var line = String("")
-            var ra = String("")
             var rt = String("")
-            var a_ex = List[Float64](length=ACT, fill=0.0)
             for j in range(ACT):
-                var a = Float64(student_act(y.data[j], j, man.gripper_sign))
-                a_ex[j] = a
-                var tgt = delta_target(q[j], a, j, lo[j], hi[j], man.delta_arm, man.delta_gripper)
-                tgt = lag.apply(0, j, tgt)
-                ra += "," + String(a)
-                rt += "," + String(tgt)
+                var tgt = lag.apply(0, j, tgt_hold[j])
+                # the COMMANDED target, as the deploy's --record logs it (the
+                # lagged one is what the actuator gets)
+                rt += "," + String(tgt_hold[j])
                 if tgt <= lo[j] or tgt >= hi[j]:
                     at_lim += 1
                 var mid = 0.5 * (lo[j] + hi[j])
                 var half = 0.5 * (hi[j] - lo[j])
                 act.data[j] = (tgt - mid) / half
-                line += " " + col(a, 6, 2)
             if rec_path.byte_length() > 0:
                 var row = String(ep) + "," + String(Float64(t) * man.control_period_s)
                 for j in range(ACT):
-                    row += "," + String(q[j])
+                    row += "," + String(Float64(env.d.qpos.data[qa[j]]))
                 for j in range(ACT):
-                    row += "," + String(qd[j])
+                    row += "," + String(Float64(env.d.qvel.data[da[j]]))
                 rec_csv += row + ra + rt + "\n"
             if t % 15 == 0:
                 print("  t=" + pad_left(fixed(Float64(t) * man.control_period_s, 1), 5)
                       + "s  a:" + line)
-            act_hist_push(hist, a_ex)
             lag.advance()
             var res = env.step(act)
             obs = res[0].copy()

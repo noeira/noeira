@@ -69,6 +69,13 @@ tests/tasks/test_so101_tower_cameras.mojo
 tests/tasks/test_so101_tower_units.mojo
 tests/tasks/test_so101_tower_look.mojo
 
+# ── noeira/tasks: `--action target`'s rule (the PPO driver) ─────────────
+# Pure arithmetic. The property it exists for — under ServoLag a constant
+# action still drives the target one step per tick — with the q-anchored
+# delta under the same lag as the CONTROL (one step past the joint).
+tests/tasks/test_target_step.mojo
+tests/tasks/test_servo_lag.mojo
+
 # ── noeira/tasks: LIBERO's registry as data + the resolved import (L1) ──
 # The category table (38 corpus categories, 5 problem classes, the four
 # articulation directions QUOTED from LIBERO's Python), the `slot=` yaw

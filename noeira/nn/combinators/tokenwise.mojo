@@ -59,6 +59,9 @@ struct Tokenwise[SEQ_LEN: Int, Inner: Module](Module):
     ](ctx: Optional[DeviceContext] = None) raises -> Self:
         return Self.__init__[target, INIT](ctx=ctx)
 
+    def release_buffers(mut self):
+        self.inner.release_buffers()
+
     def set_attr[ATTR: StaticString](mut self, value: Scalar[DT]):
         """Forward runtime attrs into the wrapped module. Without this the
         `Module` trait's no-op default swallowed them here — BatchNorm

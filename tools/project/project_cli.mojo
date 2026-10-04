@@ -560,6 +560,31 @@ def cmd_promote() raises:
     # `checkpoints/norm.json` is copied to `policies/<name>.norm.json` — a
     # small .json, so `project-push` syncs it as definition, and a deployment
     # on another machine finds it beside the weights.
+    #
+    # ⚠ AN FB/BFM CHECKPOINT CARRIES ITS OWN, PER CHECKPOINT: `<ckpt>.norm`
+    # (`deep_agents/fb/obs_norm.ObsNorm`), which every G1 viewer reads as
+    # `ckpt + ".norm"` — and one that finds none runs on RAW inputs after a
+    # single warning line. So it lands beside the ROLE's weights as
+    # `policies/<name>.ckpt.norm`, digest-checked like them. A previous
+    # holder's sidecar is REMOVED when the new one has none: the new weights
+    # must never load the old statistics.
+    var side_src = src + ".norm"
+    var side_dst = dst + ".norm"
+    var has_side = exists(side_src)
+    if has_side:
+        _ = run_capture(
+            "cp " + quote_arg(side_src) + " " + quote_arg(side_dst) + ".tmp && mv "
+            + quote_arg(side_dst) + ".tmp " + quote_arg(side_dst)
+        )
+        if sha256_file(side_dst) != sha256_file(side_src):
+            raise Error(
+                "the materialised normalization does not match its source: "
+                + side_src + " -> " + side_dst
+            )
+        print("normalization  " + side_dst)
+    else:
+        _ = run_capture("rm -f " + quote_arg(side_dst))
+
     var norm_src = run_dir + "/checkpoints/norm.json"
     var norm_dst = pdir + "/policies/" + name + ".norm.json"
     if exists(norm_src):
@@ -568,6 +593,8 @@ def cmd_promote() raises:
             + quote_arg(norm_dst) + ".tmp " + quote_arg(norm_dst)
         )
         print("normalization  " + norm_dst)
+    elif has_side:
+        _ = run_capture("rm -f " + quote_arg(norm_dst))
     else:
         _ = run_capture("rm -f " + quote_arg(norm_dst))
         print(

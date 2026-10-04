@@ -1,7 +1,10 @@
 """Adam through `ParamVisitorRef` (the type-erased walk, runtime size, SIMD
 update) against an INDEPENDENT scalar Adam written here — not against the
 optimizer's own generic path, which now forwards to the same code and would
-make the check blind. CPU. Also asserts the walk visits every param once."""
+make the check blind. CPU. Also asserts the walk visits every param once,
+and that a BARE walk (`model.for_each_param(opt)`, what graph trainers do
+instead of `opt.step`) advances every weight's `version` — the gate on the
+derived caches (`Linear`'s padded `w_pad`, the bf16 `w_bf`)."""
 from std.math import abs, sqrt
 from max.gpu.host import DeviceContext
 from noeira.nn.constants import DT
@@ -31,6 +34,17 @@ struct _SetGrad(ParamVisitor):
         for k in range(N):
             grad.data[k] = Scalar[DT](0.01) * Scalar[DT]((k + self.seed) % 17 - 8)
         self.seed += 3
+
+
+struct _Versions(ParamVisitor):
+    var v: List[Int]
+    def __init__(out self):
+        self.v = List[Int]()
+    def visit[target: StaticString, N: Int](
+        mut self, name: String, mut param: Tensor, mut grad: Tensor,
+        mut m: Tensor, mut v: Tensor, apply_decay: Bool, ctx: Optional[DeviceContext],
+    ) raises:
+        self.v.append(param.version)
 
 
 struct _Snapshot(ParamVisitor):
@@ -98,3 +112,24 @@ def main() raises:
     if worst > Scalar[DT](2e-6):
         raise Error("FAIL: Adam through ParamVisitorRef disagrees with the scalar reference")
     print("PASS: Adam via ParamVisitorRef matches the independent reference")
+
+    # A BARE walk must bump `version` too. `Linear` re-pads its K-aligned
+    # weight copy only when the version moves, so a walk that updates the
+    # weight without bumping leaves the GPU forward on the pre-update weight
+    # forever, with no error. Shipped twice: fixed at this leaf in c5a527c7e,
+    # lost again when e09997780 moved the bump into `step` only — and found
+    # by the LeWM GPU checkpoint round-trip, not by any optimizer gate.
+    var before = _Versions()
+    net.for_each_param["cpu"](before, None)
+    opt.begin_step()
+    net.for_each_param["cpu"](opt, None)
+    var after = _Versions()
+    net.for_each_param["cpu"](after, None)
+    for k in range(len(before.v)):
+        if after.v[k] <= before.v[k]:
+            raise Error(
+                "FAIL: a bare Adam walk left param " + String(k)
+                + "'s version at " + String(after.v[k])
+                + " — version-gated weight caches would serve stale weights"
+            )
+    print("PASS: a bare Adam walk advances every param's version")

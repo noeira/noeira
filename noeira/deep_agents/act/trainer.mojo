@@ -3,7 +3,7 @@
 # +--------------------------------------------------------------------------+ #
 """Owns the loss graph + one AdamW + the scratch a step needs.
 
-Transposed from `experimental/lewm/trainer.mojo`, which is the established
+Transposed from the first LeWM port's trainer (removed 2026-10-03), which was the established
 shape for "one ComputeGraph, one optimizer": a step is
 
     zero_grad -> set_input x4 -> forward -> seed grad 1/B -> vjp -> clip -> step
