@@ -13,19 +13,36 @@ Two arms per pair, on identical pairs and identical CEM noise:
           3 + 1, frameskip 5) with the executed actions (z-scored with the
           TRAINING normaliser — the model's space, not the planner's
           population-std one), `--tta-steps` steps of `LeWMRefTrainer`
-          (`set_keep` subset, wd 0, a fresh Adam per episode, dropout off,
-          BN per `--tta-bn`), then the planner's predictor side (and encoder,
-          when adapted) re-synced, and the goal re-encoded.
+          (`set_keep` subset, wd 0, Adam per `--adam`, dropout off, BN per
+          `--tta-bn`), then the planner's predictor side (and encoder, when
+          adapted) re-synced, and the goal re-encoded.
 
-Knobs (defaults = AdaJEPA's): `--receding R` blocks executed per replan (1 =
+Both arms log the PREDICTION loss on those windows at every replan (the
+frozen arm measures without updating): the direct test of whether adapting
+makes the model better on the episode's new data. The SIGReg term dominates
+the total loss (~0.33 vs a prediction loss ~0.004), so the total hides it.
+
+The official implementation (references/adajepa-main, DINO-WM based) sets the
+defaults: one block per replan, warm start, budget 100 (`max_iter: 20`), the
+predictor's last block + its final norm and the encoder's last submodule
+(`predlast_enclast`), a fresh Adam at EVERY adaptation (`_make_optimizer`
+per `finetune` call). It also adapts with the predictor in train mode
+(dropout 0.1), and its loss is the 1-step latent MSE alone. Here dropout stays
+off and the loss is LeWM's own (prediction + λ·SIGReg, `--lambda 0` = MSE).
+
+Knobs (defaults = the official AdaJEPA's): `--receding R` blocks executed per replan (1 =
 AdaJEPA's one chunk per replan; 5 = the paper protocol of column R / M, which
 leaves 2 replans in a budget of 50 — too few to adapt); `--cold` restarts every
 replan's CEM at mean 0 instead of swm's default warm start (`warm_start=True`:
 the previous plan's unexecuted blocks, zero-padded — moot at R = 5, where
 nothing is left; cold at R = 1 executes the first block of an unrelated plan
 each time: epoch_0 frozen 34/50 at R 5 fell to 11/50 cold, 16/50 warm — R 1 at
-budget 50 stays the weaker planner either way); `--budget` env steps;
-`--subset pred | predlast_enclast | all`; `--tta-lr` (5e-5, the training LR);
+budget 50 stays the weaker planner either way); `--cost staged[:b] | all[:b] |
+last` the planning cost (`PlanCost`; default AdaJEPA's `staged` — LeWM's own
+last-step cost PROCRASTINATES at R 1: epoch_7 frozen, 9 pairs, budget 50,
+last 3/9, all:2 8/9, staged 9/9, R 5 9/9); `--budget` env steps;
+`--subset predlast_enclast | pred | all`; `--adam per-adapt | per-episode`;
+`--tta-lr` (5e-5, LeWM's training LR — AdaJEPA's rule);
 `--tta-bn eval | train`; `--lambda` SIGReg weight in the adaptation loss;
 `--shift none | noise:σ | dark:gain | swap` (E2: applied to EVERY observed
 frame, the dataset start and goal frames included); `--arms both | frozen |
@@ -48,14 +65,14 @@ from noeira.deep_agents.act.refload import RefDump
 from noeira.envs.pusht import PushTAction
 from noeira.experimental.lewm.ref_load import load_ref
 from noeira.experimental.lewm.ref_rollout import (
-    LeWMRefRollout, RefEncoder, encode_ref, cem_step, REF_EMB, REF_ACT,
+    LeWMRefRollout, RefEncoder, encode_ref, cem_step, PlanCost, REF_EMB, REF_ACT,
 )
 from noeira.experimental.lewm.ref_trainer import (
     LeWMRefTrainer, TrainerSnapshot, FillFromSnapshot, REF_T,
 )
 from noeira.experimental.lewm.paper_pairs import (
-    PairEnv, PAIR_HW, imagenet_from_hwc255, render_frame, gauss, pair_success,
-    VisualShift, shift_frame, tta_windows,
+    PairEnv, PAIR_HW, imagenet_from_hwc255, render_frame, gauss,
+    VisualShift, shift_frame, tta_windows, pair_margin,
 )
 
 
@@ -76,8 +93,10 @@ comptime FRAME = PAIR_HW * 3
 struct Cfg(Copyable, Movable):
     var receding: Int
     var warm_start: Bool
+    var cost: PlanCost
     var budget: Int
     var tta_steps: Int
+    var adam_per_adapt: Bool
     var tta_bn_train: Bool
     var keep: List[String]
     var touches_encoder: Bool
@@ -91,15 +110,21 @@ struct Outcome(Copyable, Movable):
     var replans: Int
     var adapts: Int
     var pre_loss: Float64
-    """Mean loss on the newest windows just BEFORE each adaptation step (the
-    adapt arm's health signal; 0 when nothing was adapted)."""
+    """Mean total loss on the newest windows just BEFORE each adaptation
+    step (0 when nothing was adapted)."""
+    var pred_loss: Float64
+    """Mean PREDICTION loss on the newest windows at each replan, before
+    any update — measured in both arms."""
+    var measured: Int
+    var margin: Float64
+    """min over the episode of `pair_margin` (< 1 = success)."""
 
 
 def _keep_for(subset: String) raises -> List[String]:
     if subset == "pred":
         return ["pred_raw.", "pred_ln.", "pred.", "x_pe.", "act_emb."]
     if subset == "predlast_enclast":
-        return ["pred_raw.5.", "pred.", "emb.0.6."]
+        return ["pred_raw.5.", "pred_ln.", "pred.", "emb.0.6."]
     if subset == "all":
         return List[String]()
     raise Error("unknown --subset " + subset + " (pred | predlast_enclast | all)")
@@ -150,16 +175,17 @@ def _episode(
     var frames = List[List[Scalar[DT]]]()
     frames.append(first^)
     var acts = List[List[Scalar[DT]]]()
-    var out = Outcome(False, 0, 0, 0.0)
+    var out = Outcome(False, 0, 0, 0.0, 0.0, 0, 1e9)
     var step = 0
     var init = List[Scalar[DT]](length=A, fill=Scalar[DT](0))
     while step < cfg.budget:
         var start_emb = encode_ref[TARGET, 1](enc, imagenet_from_hwc255(frames[len(frames) - 1], 0), ctx)
         var mean = init.copy()
         var std = List[Scalar[DT]](length=A, fill=Scalar[DT](1))
+        var step_w = cfg.cost.weights(HORIZON, out.replans)
         for it in range(ITERS):
             var noise = gauss(cfg.seed * 1000003 + UInt64(e), S * A, UInt64((out.replans * ITERS + it) * S * A))
-            var st = cem_step[TARGET, S, HORIZON, K](roll, start_emb, goal_emb, mean, std, noise)
+            var st = cem_step[TARGET, S, HORIZON, K](roll, start_emb, goal_emb, mean, std, noise, step_w)
             mean = st.mean.copy()
             std = st.std.copy()
         out.replans += 1
@@ -183,7 +209,9 @@ def _episode(
                     Scalar[DType.float32](Float64(ag[1]) + 100.0 * ay),
                 ))
                 step += 1
-                if pair_success(env, goal_state, e):
+                var mg = pair_margin(env, goal_state, e)
+                out.margin = min(out.margin, mg)
+                if mg < 1.0:
                     out.ok = True
             if len(block) < REF_ACT:
                 break  # a block cut by the budget is not a model step
@@ -191,12 +219,18 @@ def _episode(
             var fr = render_frame(env)
             shift_frame(fr, 0, cfg.shift, UInt64(e) * 7919 + UInt64(len(frames)) * 13 + 3)
             frames.append(fr^)
-        # adapt on the episode so far, then plan with the updated model
-        if adapt and len(frames) >= REF_T and step < cfg.budget:
+        # measure (both arms), adapt (adapt arm), then plan with the updated model
+        if len(frames) >= REF_T and step < cfg.budget:
             var bt = tta_windows[TB, REF_T](frames, acts)
-            tr.set_bn_training(cfg.tta_bn_train)
             var pre = tr.loss_of(bt[0], bt[1])
+            out.pred_loss += pre.pred_loss
+            out.measured += 1
+            if not adapt:
+                continue
             out.pre_loss += pre.loss
+            if cfg.adam_per_adapt:
+                tr.reset_optimizer()
+            tr.set_bn_training(cfg.tta_bn_train)
             for _ in range(cfg.tta_steps):
                 _ = tr.train_step(bt[0], bt[1])
             tr.set_bn_training(False)
@@ -206,6 +240,8 @@ def _episode(
             out.adapts += 1
     if out.adapts > 0:
         out.pre_loss /= Float64(out.adapts)
+    if out.measured > 0:
+        out.pred_loss /= Float64(out.measured)
     return out^
 
 
@@ -217,11 +253,13 @@ def main() raises:
     var seed: UInt64 = 0
     var receding = 1
     var warm_start = True
-    var budget = 50
+    var cost_spec = String("staged")
+    var budget = 100
     var arms = String("both")
-    var subset = String("pred")
+    var subset = String("predlast_enclast")
     var tta_lr = 5e-5
     var tta_steps = 1
+    var adam = String("per-adapt")
     var tta_bn = String("eval")
     var lam = 0.09
     var shift_spec = String("none")
@@ -243,6 +281,8 @@ def main() raises:
             receding = Int(String(args[i + 1])); i += 1
         elif a == "--cold":
             warm_start = False
+        elif a == "--cost":
+            cost_spec = String(args[i + 1]); i += 1
         elif a == "--budget":
             budget = Int(String(args[i + 1])); i += 1
         elif a == "--arms":
@@ -251,6 +291,8 @@ def main() raises:
             subset = String(args[i + 1]); i += 1
         elif a == "--tta-lr":
             tta_lr = Float64(String(args[i + 1])); i += 1
+        elif a == "--adam":
+            adam = String(args[i + 1]); i += 1
         elif a == "--tta-steps":
             tta_steps = Int(String(args[i + 1])); i += 1
         elif a == "--tta-bn":
@@ -266,12 +308,14 @@ def main() raises:
         raise Error("--receding must be 1.." + String(HORIZON))
     if tta_bn != "eval" and tta_bn != "train":
         raise Error("--tta-bn eval | train")
+    if adam != "per-adapt" and adam != "per-episode":
+        raise Error("--adam per-adapt | per-episode")
     var keep = _keep_for(subset)
     var touches_enc = len(keep) == 0
     for k in keep:
         if k.startswith("emb."):
             touches_enc = True
-    var cfg = Cfg(receding, warm_start, budget, tta_steps, tta_bn == "train", keep^, touches_enc,
+    var cfg = Cfg(receding, warm_start, PlanCost.parse(cost_spec), budget, tta_steps, adam == "per-adapt", tta_bn == "train", keep^, touches_enc,
                   VisualShift.parse(shift_spec), seed)
     var run_frozen = arms == "both" or arms == "frozen"
     var run_adapt = arms == "both" or arms == "adapt"
@@ -295,13 +339,16 @@ def main() raises:
                                        sigreg_lambda=lam, dropout=False)
     _ = tr.load(dump)
     tr.set_keep(cfg.keep)
+    tr.set_bn_training(False)  # measuring (both arms) must not move BN's running stats
     var base = tr.export_params(List[String](), True)
-    print("AdaJEPA on", dump, ":", n_eps, "pairs from", first_pair, "; receding", receding, "warm" if warm_start else "cold",
+    print("AdaJEPA on", dump, ":", n_eps, "pairs from", first_pair, "; receding", receding, "warm" if warm_start else "cold", "cost", cost_spec,
           "budget", budget, "; subset", subset, "(", len(cfg.keep), "prefixes ) lr", tta_lr,
-          "steps", tta_steps, "BN", tta_bn, "lambda", lam, "; shift", shift_spec,
+          "steps", tta_steps, "Adam", adam, "BN", tta_bn, "lambda", lam, "; shift", shift_spec,
           "; base snapshot", len(base.names), "tensors")
 
     var n_ok = List[Int](length=2, fill=0)
+    var pred_sum = List[Float64](length=2, fill=0.0)
+    var margin_sum = List[Float64](length=2, fill=0.0)
     var t_all = perf_counter_ns()
     for ei in range(n_eps):
         var e = first_pair + ei
@@ -325,8 +372,10 @@ def main() raises:
                              goal_state, a_mean, a_scale, a_std_train)
             if o.ok:
                 n_ok[arm] += 1
+            pred_sum[arm] += o.pred_loss
+            margin_sum[arm] += o.margin
             line += "  " + (String("frozen ") if arm == 0 else String("adapt ")) + ("ok  " if o.ok else "FAIL")
-            line += " (" + String(o.replans) + " replans"
+            line += " (margin " + String(Float32(o.margin)) + ", " + String(o.replans) + " replans, pred loss " + String(Float32(o.pred_loss))
             if arm == 1:
                 line += ", " + String(o.adapts) + " adapts, pre-adapt loss " + String(Float32(o.pre_loss))
             line += ", " + String(Float32(Float64(perf_counter_ns() - t0) / 1e9)) + " s)"
@@ -337,3 +386,7 @@ def main() raises:
         print(line)
     print("frozen:", n_ok[0], "/", n_eps, "   adapt:", n_ok[1], "/", n_eps,
           "   total", Float32(Float64(perf_counter_ns() - t_all) / 1e9), "s")
+    print("mean best margin (< 1 = success) — frozen:", Float32(margin_sum[0] / Float64(n_eps)),
+          "  adapt:", Float32(margin_sum[1] / Float64(n_eps)))
+    print("mean pred loss on the episode's windows — frozen:", Float32(pred_sum[0] / Float64(n_eps)),
+          "  adapt (before each update):", Float32(pred_sum[1] / Float64(n_eps)))

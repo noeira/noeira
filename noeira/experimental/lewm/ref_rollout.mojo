@@ -9,6 +9,7 @@ context starts at ONE encoded frame and grows to the predictor's 3:
         lo = max(0, t + 1 - 3);  L = t + 1 - lo           # 1, 2, 3, 3, 3
         emb[t+1] = Predictor(emb[lo..t] + pos[0..L-1],  act_emb[lo..t])[L-1]
     cost = Σ_d (emb[HORIZON] - goal)²                       # last step only
+                                                    # (`PlanCost` for others)
 
 Variable L on a fixed 3-token predictor: the real L tokens sit at positions
 0..L-1 and the tail is zero padding. Attention is CAUSAL and every other op
@@ -210,19 +211,82 @@ struct LeWMRefRollout[target: StaticString, S: Int, HORIZON: Int]:
         return embs^
 
     def cost(
-        self, embs: List[Scalar[DT]], goal_emb: List[Scalar[DT]]
+        self, embs: List[Scalar[DT]], goal_emb: List[Scalar[DT]],
+        step_w: List[Float64] = List[Float64](),
     ) -> List[Scalar[DT]]:
-        """`criterion`: Σ_d (emb[HORIZON] - goal)² per row."""
+        """`criterion`: Σ_d (emb[HORIZON] - goal)² per row. With `step_w`
+        (HORIZON weights, `PlanCost.weights`): Σ_t w[t] Σ_d (emb[t+1] - goal)²."""
         comptime D = Self.D
         comptime T1 = Self.HORIZON + 1
         var out = List[Scalar[DT]](capacity=Self.S)
         for s in range(Self.S):
             var acc = Float64(0)
-            for d in range(D):
-                var diff = Float64(embs[(s * T1 + Self.HORIZON) * D + d]) - Float64(goal_emb[d])
-                acc += diff * diff
+            if len(step_w) == 0:
+                for d in range(D):
+                    var diff = Float64(embs[(s * T1 + Self.HORIZON) * D + d]) - Float64(goal_emb[d])
+                    acc += diff * diff
+            else:
+                for t in range(Self.HORIZON):
+                    if step_w[t] == 0.0:
+                        continue
+                    var st = Float64(0)
+                    for d in range(D):
+                        var diff = Float64(embs[(s * T1 + t + 1) * D + d]) - Float64(goal_emb[d])
+                        st += diff * diff
+                    acc += step_w[t] * st
             out.append(Scalar[DT](acc))
         return out^
+
+
+comptime COST_LAST = 0
+comptime COST_ALL = 1
+comptime COST_STAGED = 2
+
+
+@fieldwise_init
+struct PlanCost(Copyable, Movable, Writable):
+    """The planning cost over the predicted steps.
+
+      last       LeWM's `criterion`: the final step only (the default);
+      all:b      Σ_t b^t·‖emb[t+1] − goal‖² over every predicted step, the
+                 weights normalised (AdaJEPA's `objective_fn_all`, base 2) —
+                 rewards plans that get close EARLY, so a planner that executes
+                 one block per replan is not paid to procrastinate;
+      staged:b   AdaJEPA's default `mode: staged`: `last` while the replan
+                 index is < HORIZON, `all:b` from then on
+                 (references/adajepa-main/planning/objectives.py — its `step`
+                 is the MPC iteration).
+
+    The start embedding's term is constant across candidates and dropped."""
+
+    var kind: Int
+    var base: Float64
+
+    @staticmethod
+    def parse(spec: String) raises -> Self:
+        var parts = spec.split(":")
+        var base = Float64(String(parts[1])) if len(parts) == 2 else 2.0
+        if parts[0] == "last" and len(parts) == 1:
+            return Self(COST_LAST, base)
+        if parts[0] == "all":
+            return Self(COST_ALL, base)
+        if parts[0] == "staged":
+            return Self(COST_STAGED, base)
+        raise Error("unknown --cost " + spec + " (last | all[:base] | staged[:base])")
+
+    def weights(self, horizon: Int, replan: Int) -> List[Float64]:
+        """Per-step weights for replan `replan`; empty = `last` (the exact
+        reference criterion)."""
+        if self.kind == COST_LAST or (self.kind == COST_STAGED and replan < horizon):
+            return List[Float64]()
+        var w = List[Float64](capacity=horizon)
+        var tot = 0.0
+        for t in range(horizon):
+            w.append(self.base ** Float64(t + 1))
+            tot += w[t]
+        for t in range(horizon):
+            w[t] /= tot
+        return w^
 
 
 @fieldwise_init
@@ -245,6 +309,7 @@ def cem_step[
     mean: List[Scalar[DT]],
     std: List[Scalar[DT]],
     noise: List[Scalar[DT]],
+    step_w: List[Float64] = List[Float64](),
 ) raises -> CEMStep:
     """`CEMSolver.solve`'s loop body (stable_worldmodel 0.1.1 solver/cem.py),
     one env:
@@ -256,14 +321,14 @@ def cem_step[
 
     `var` in the reference IS a standard deviation (it multiplies the noise).
     `noise` is the caller's (S, HORIZON, ACT) draw, so a gate can replay
-    torch's generator exactly."""
+    torch's generator exactly. `step_w`: `LeWMRefRollout.cost`."""
     comptime A = HORIZON * REF_ACT
     var cand = List[Scalar[DT]](length=S * A, fill=Scalar[DT](0))
     for s in range(S):
         for i in range(A):
             cand[s * A + i] = mean[i] if s == 0 else noise[s * A + i] * std[i] + mean[i]
     var embs = roll.rollout(start_emb, cand)
-    var costs = roll.cost(embs, goal_emb)
+    var costs = roll.cost(embs, goal_emb, step_w)
     # top-K smallest, ascending (partial selection; K << S)
     var taken = List[Bool](length=S, fill=False)
     var elite = List[Int](capacity=K)

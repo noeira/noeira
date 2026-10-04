@@ -10,7 +10,10 @@ causal context on the fixed 3-token predictor) must give:
   * every predicted embedding, steps 1..5 (context lengths 1, 2, 3, 3, 3 —
     steps 1 and 2 are exactly the variable-length cases the old port faked by
     replicating the latent);
-  * the cost of every candidate.
+  * the cost of every candidate;
+  * `PlanCost`: one-hot weights on the last step reproduce `cost` exactly,
+    `staged` is `last` before replan HORIZON, and `all:2` weights sum to 1
+    and rise 2x per step.
 
 Unit: max |ours - torch| / std(torch) for embeddings; relative for costs.
 
@@ -27,7 +30,7 @@ from noeira.nn.core.initializer import Kaiming
 from noeira.deep_agents.act.refload import RefDump
 from noeira.experimental.lewm.ref_load import load_ref, tf32_gemm
 from noeira.experimental.lewm.ref_rollout import (
-    LeWMRefRollout, RefEncoder, encode_ref, REF_EMB,
+    LeWMRefRollout, RefEncoder, encode_ref, PlanCost, REF_EMB,
 )
 
 
@@ -105,6 +108,27 @@ def _run[target: StaticString](dump: String, ctx: Optional[DeviceContext]) raise
         crel = max(crel, abs(Float64(cost[s]) - Float64(want_cost[s])) / abs(Float64(want_cost[s])))
     print("     cost (8 candidates) max rel", crel, "  e.g. ours", cost[0], "torch", want_cost[0])
     if crel > cost_tol:
+        fails += 1
+
+    var onehot = List[Float64](length=HORIZON, fill=0.0)
+    onehot[HORIZON - 1] = 1.0
+    var c1 = roll.cost(embs, goal, onehot)
+    var same = True
+    for s in range(S):
+        if c1[s] != cost[s]:
+            same = False
+    var staged = PlanCost.parse(String("staged"))
+    var w_all = PlanCost.parse(String("all:2")).weights(HORIZON, 0)
+    var tot = 0.0
+    var rising = True
+    for t in range(HORIZON):
+        tot += w_all[t]
+        if t > 0 and abs(w_all[t] / w_all[t - 1] - 2.0) > 1e-12:
+            rising = False
+    var ok_pc = same and len(staged.weights(HORIZON, HORIZON - 1)) == 0 \
+        and len(staged.weights(HORIZON, HORIZON)) == HORIZON and abs(tot - 1.0) < 1e-12 and rising
+    print("     PlanCost: one-hot last == cost", same, "| staged / all:2 weights ok", ok_pc)
+    if not ok_pc:
         fails += 1
     return fails
 

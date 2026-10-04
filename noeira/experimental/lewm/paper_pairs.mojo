@@ -11,7 +11,8 @@ same way — kept here once, not twice:
   * `render_frame`: our env's state drawn like swm 0.0.6 (`render_swm`);
   * `gauss`: the CEM's standard normals (Box-Muller over Philox);
   * `pair_success`: swm `eval_state` — ‖Δ(agent, block)‖ < 20 px and
-    wrapped |Δ angle| < π/9 against the pair's goal state;
+    wrapped |Δ angle| < π/9 against the pair's goal state; `pair_margin` the
+    same test as one number (< 1 = success);
   * `video_frame`: the 512 canvas with the pair's own goal (for people);
   * `shift_frame`: AdaJEPA's E2 visual shifts — test-time perturbations of
     every observed frame, goal included;
@@ -81,6 +82,13 @@ def gauss(seed: UInt64, n: Int, offset: UInt64) -> List[Scalar[DT]]:
 
 def pair_success(mut env: PairEnv, goal: List[Scalar[DT]], g: Int) -> Bool:
     """swm `eval_state`: ‖goal[:4] - cur[:4]‖ < 20 and wrapped |Δ angle| < π/9."""
+    return pair_margin(env, goal, g) < 1.0
+
+
+def pair_margin(mut env: PairEnv, goal: List[Scalar[DT]], g: Int) -> Float64:
+    """max(‖goal[:4] - cur[:4]‖ / 20, wrapped |Δ angle| / (π/9)): how far
+    from `pair_success` (< 1 = success) — a continuous outcome, far less
+    noisy per pair than the success bit."""
     var ag = env.agent_pos()
     var bp = env.block_pose()
     var cur: List[Float64] = [
@@ -93,7 +101,7 @@ def pair_success(mut env: PairEnv, goal: List[Scalar[DT]], g: Int) -> Bool:
     while a > 2.0 * pi:
         a -= 2.0 * pi
     a = min(a, 2.0 * pi - a)
-    return sqrt(d) < 20.0 and a < pi / 9.0
+    return max(sqrt(d) / 20.0, a / (pi / 9.0))
 
 
 def video_frame(mut env: PairEnv, goal: List[Scalar[DT]], e: Int) -> List[UInt8]:
