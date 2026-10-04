@@ -14,7 +14,11 @@ GPU:
   4. PLANNER SYNC: a planner re-synced from the adapted trainer rolls out
      bit-identically to one loaded independently from a dump of that
      trainer, and differently from the unadapted planner;
-  5. WINDOWS: `tta_windows` aligns frames and the actions taken FROM them.
+  5. WINDOWS: `tta_windows` aligns frames and the actions taken FROM them;
+  6. STOP-GRAD TARGET (`set_stop_grad_target`): adapting `pred_raw.5.` +
+     `emb.0.6.` with clipping off, detaching the target leaves the predictor's
+     update bit-identical (its gradient never flows through the target) and
+     changes the encoder projector's (it loses the target-side gradient).
 
     pixi run -e apple mojo run -I . tests/experimental/lewm/ref/test_ref_tta.mojo
 """
@@ -156,6 +160,46 @@ def main() raises:
                     break
     print("  2. BN train mode: running-stat tensors moved", bn_moved, "of 4")
     if bn_moved != 4:
+        fails += 1
+
+    # 6. stop-grad target: predictor update unchanged, encoder projector's not
+    var keep6: List[String] = ["pred_raw.5.", "emb.0.6."]
+    tr.set_keep(keep6)
+    tr.max_norm = 1e9  # clipping couples every tensor through the global norm
+    var upd = List[TrainerSnapshot]()
+    for sg in range(2):
+        _ = tr.restore(base)
+        tr.reset_optimizer()
+        tr.set_stop_grad_target(sg == 1)
+        _ = tr.train_step(pix, act)
+        upd.append(tr.export_params(keep6, False))
+    tr.set_stop_grad_target(False)
+    var pred_same = True
+    var enc_moved = 0
+    var pred_moved = 0
+    for i in range(len(upd[0].names)):
+        var k = upd[1].find(upd[0].names[i])
+        var same = True
+        for j in range(len(upd[0].values[i])):
+            if upd[0].values[i][j] != upd[1].values[k][j]:
+                same = False
+                break
+        var b = base.find(upd[0].names[i])
+        var moved = False
+        for j in range(len(upd[0].values[i])):
+            if upd[0].values[i][j] != base.values[b][j]:
+                moved = True
+                break
+        if upd[0].names[i].startswith("pred_raw."):
+            if not same:
+                pred_same = False
+            if moved:
+                pred_moved += 1
+        elif not same:
+            enc_moved += 1
+    print("  6. stop-grad target: predictor update identical", pred_same, "(", pred_moved,
+          "tensors moved ) | encoder-projector tensors that differ", enc_moved)
+    if not pred_same or pred_moved == 0 or enc_moved == 0:
         fails += 1
 
     # 5. windows: frame j is all j, action block j is j*100 + i

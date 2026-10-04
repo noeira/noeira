@@ -658,6 +658,11 @@ struct LeWMRefTrainer[target: StaticString, B: Int](Movable):
         self.opt.adam.bc1 = Scalar[DT](1.0)
         self.opt.adam.bc2 = Scalar[DT](1.0)
 
+    def set_stop_grad_target(mut self, on: Bool):
+        """Detach the target embeddings in the prediction loss (AdaJEPA's
+        `detach_tgt`); off = LeWM's loss, gradient through both sides."""
+        self.graph.set_node_attr["tgt_sg", "stop_grad"](Scalar[DT](1 if on else 0))
+
     def set_bn_training(mut self, on: Bool):
         """BatchNorm on batch statistics (and updating its running stats), or
         frozen on its running stats — the latter backpropagates through the

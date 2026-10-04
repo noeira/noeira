@@ -26,7 +26,10 @@
 # On an RTX 5090: a 50-pair board ~2 min; an AdaJEPA config ~45 min for both
 # arms at budget 100 — E1 ~2.3 h, E2 ~2.3 h, E3 ~4 h, ordered so the session
 # can be stopped after any block. SKIP_BOARDS=1 skips the boards (done
-# 2026-10-03: epoch_4 95.6 %, epoch_7 97.2 % over 5 seeds).
+# 2026-10-03: epoch_4 95.6 %, epoch_7 97.2 % over 5 seeds). BLOCKS picks the
+# AdaJEPA blocks (default "e1 e2 e3"; E1/E2 done 2026-10-04: no success gain,
+# yet the prediction loss drops 27 % on epoch_0 and 71 % under dark). E4
+# probes those two cases: stop-gradient target, 10x LR, λ = 0, the whole model.
 set -u
 RUN=${RUN:-/workspace/lewm_train}
 FIX=${FIX:-/workspace/fixture}
@@ -60,21 +63,41 @@ ada() {  # name, then driver flags
 }
 
 # ── 2. E1: in distribution, the data-limited checkpoints and the best ─────
-ada e1_epoch0 --dump "$RUN/epoch_0"
-ada e1_epoch1 --dump "$RUN/epoch_1"
-ada e1_epoch7 --dump "$RUN/epoch_7"
+e1() {
+  ada e1_epoch0 --dump "$RUN/epoch_0"
+  ada e1_epoch1 --dump "$RUN/epoch_1"
+  ada e1_epoch7 --dump "$RUN/epoch_7"
+}
 
 # ── 3. E2: visual shift (every observed frame, start and goal included;
 #       the default subset adapts the encoder's projector) ─────────────────
-ada e2_dark   --dump "$RUN/epoch_7" --shift dark:0.5
-ada e2_noise  --dump "$RUN/epoch_7" --shift noise:0.1
-ada e2_swap   --dump "$RUN/epoch_7" --shift swap
+e2() {
+  ada e2_dark   --dump "$RUN/epoch_7" --shift dark:0.5
+  ada e2_noise  --dump "$RUN/epoch_7" --shift noise:0.1
+  ada e2_swap   --dump "$RUN/epoch_7" --shift swap
+}
 
 # ── 4. E3: ablations on the data-limited epoch_1 ──────────────────────────
-ada e3_pred      --dump "$RUN/epoch_1" --subset pred
-ada e3_adam_ep   --dump "$RUN/epoch_1" --adam per-episode
-ada e3_lambda0   --dump "$RUN/epoch_1" --lambda 0
-ada e3_steps2    --dump "$RUN/epoch_1" --tta-steps 2
-ada e3_lr10x     --dump "$RUN/epoch_1" --tta-lr 5e-4
+e3() {
+  ada e3_pred      --dump "$RUN/epoch_1" --subset pred
+  ada e3_adam_ep   --dump "$RUN/epoch_1" --adam per-episode
+  ada e3_lambda0   --dump "$RUN/epoch_1" --lambda 0
+  ada e3_steps2    --dump "$RUN/epoch_1" --tta-steps 2
+  ada e3_lr10x     --dump "$RUN/epoch_1" --tta-lr 5e-4
+}
+
+# ── 5. E4: where adapting moves the prediction loss — dark (epoch_7) and the
+#       data-limited epoch_0 — does a detached target, a bigger step, no
+#       SIGReg or the whole model turn it into planning? ──────────────────
+e4() {
+  ada e4_dark_sg      --dump "$RUN/epoch_7" --shift dark:0.5 --stop-grad-target
+  ada e4_dark_lr10x   --dump "$RUN/epoch_7" --shift dark:0.5 --tta-lr 5e-4
+  ada e4_dark_all_sg  --dump "$RUN/epoch_7" --shift dark:0.5 --subset all --stop-grad-target
+  ada e4_e0_sg        --dump "$RUN/epoch_0" --stop-grad-target
+  ada e4_e0_lr10x     --dump "$RUN/epoch_0" --tta-lr 5e-4
+  ada e4_e0_lambda0   --dump "$RUN/epoch_0" --lambda 0
+}
+
+for B in ${BLOCKS:-e1 e2 e3}; do $B; done
 
 log "P7-SESSION-DONE"

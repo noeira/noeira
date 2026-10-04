@@ -44,6 +44,9 @@ last 3/9, all:2 8/9, staged 9/9, R 5 9/9); `--budget` env steps;
 `--subset predlast_enclast | pred | all`; `--adam per-adapt | per-episode`;
 `--tta-lr` (5e-5, LeWM's training LR — AdaJEPA's rule);
 `--tta-bn eval | train`; `--lambda` SIGReg weight in the adaptation loss;
+`--stop-grad-target` detaches the target embeddings in the prediction loss
+(AdaJEPA's `detach_tgt`; LeWM itself trains without — only matters when the
+encoder adapts);
 `--shift none | noise:σ | dark:gain | swap` (E2: applied to EVERY observed
 frame, the dataset start and goal frames included); `--arms both | frozen |
 adapt`.
@@ -98,6 +101,7 @@ struct Cfg(Copyable, Movable):
     var tta_steps: Int
     var adam_per_adapt: Bool
     var tta_bn_train: Bool
+    var stop_grad_target: Bool
     var keep: List[String]
     var touches_encoder: Bool
     var shift: VisualShift
@@ -261,6 +265,7 @@ def main() raises:
     var tta_steps = 1
     var adam = String("per-adapt")
     var tta_bn = String("eval")
+    var stop_grad_target = False
     var lam = 0.09
     var shift_spec = String("none")
     var args = argv()
@@ -295,6 +300,8 @@ def main() raises:
             adam = String(args[i + 1]); i += 1
         elif a == "--tta-steps":
             tta_steps = Int(String(args[i + 1])); i += 1
+        elif a == "--stop-grad-target":
+            stop_grad_target = True
         elif a == "--tta-bn":
             tta_bn = String(args[i + 1]); i += 1
         elif a == "--lambda":
@@ -315,7 +322,7 @@ def main() raises:
     for k in keep:
         if k.startswith("emb."):
             touches_enc = True
-    var cfg = Cfg(receding, warm_start, PlanCost.parse(cost_spec), budget, tta_steps, adam == "per-adapt", tta_bn == "train", keep^, touches_enc,
+    var cfg = Cfg(receding, warm_start, PlanCost.parse(cost_spec), budget, tta_steps, adam == "per-adapt", tta_bn == "train", stop_grad_target, keep^, touches_enc,
                   VisualShift.parse(shift_spec), seed)
     var run_frozen = arms == "both" or arms == "frozen"
     var run_adapt = arms == "both" or arms == "adapt"
@@ -340,10 +347,11 @@ def main() raises:
     _ = tr.load(dump)
     tr.set_keep(cfg.keep)
     tr.set_bn_training(False)  # measuring (both arms) must not move BN's running stats
+    tr.set_stop_grad_target(cfg.stop_grad_target)
     var base = tr.export_params(List[String](), True)
     print("AdaJEPA on", dump, ":", n_eps, "pairs from", first_pair, "; receding", receding, "warm" if warm_start else "cold", "cost", cost_spec,
           "budget", budget, "; subset", subset, "(", len(cfg.keep), "prefixes ) lr", tta_lr,
-          "steps", tta_steps, "Adam", adam, "BN", tta_bn, "lambda", lam, "; shift", shift_spec,
+          "steps", tta_steps, "Adam", adam, "BN", tta_bn, "stop-grad target" if stop_grad_target else "", "lambda", lam, "; shift", shift_spec,
           "; base snapshot", len(base.names), "tensors")
 
     var n_ok = List[Int](length=2, fill=0)

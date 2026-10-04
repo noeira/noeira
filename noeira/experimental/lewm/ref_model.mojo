@@ -68,6 +68,7 @@ from noeira.nn.models.transformer import MultiHeadAttention, MultiHeadAttentionX
 from noeira.nn.primitives.attention import ScaledDotProductAttention
 from noeira.nn.primitives.qkv_to_major import QKVToMajor
 from noeira.nn.primitives.hash_dropout import HashDropout
+from noeira.nn.primitives.grad_gate import GradGate
 from noeira.nn.primitives.batch_norm_1d import BN_DEFAULT_MOM, BN_DEFAULT_EPS
 
 
@@ -379,6 +380,7 @@ comptime LeWMLossGraphRef[
     Node["ctx_x", Slice[T * EMB, 0, H * EMB], "emb"],
     Node["ctx_a", Slice[T * EMB, 0, H * EMB], "act_emb"],
     Node["tgt", Slice[T * EMB, N_PREDS * EMB, (N_PREDS + H) * EMB], "emb"],
+    Node["tgt_sg", GradGate[H * EMB], "tgt"],
     Node["x_pe", BiasAdd[H * EMB], "ctx_x"],
     Node[
         "pred_raw",
@@ -393,7 +395,7 @@ comptime LeWMLossGraphRef[
     ],
     Node["pred_ln", Tokenwise[H, LayerNorm[EMB, DT, TORCH_LN_EPS]], "pred_raw"],
     Node["pred", Tokenwise[H, ProjectorRef[EMB, PROJ_H, EMB]], "pred_ln"],
-    Node["pl", MSEPerSample[H * EMB], "pred", "tgt"],
+    Node["pl", MSEPerSample[H * EMB], "pred", "tgt_sg"],
     Node["sig", SIGReg[EMB, T, SIG_PROJ, SIG_KNOTS], "emb"],
     Node["sig_s", Scale[1], "sig"],
     Node["loss", Add[1], "pl", "sig_s"],
@@ -401,7 +403,9 @@ comptime LeWMLossGraphRef[
 """`train.py:lejepa_forward`: loss = mean((pred - emb[:, n_preds:])²) +
 λ·SIGReg(emb), per sample (B, 1); λ = `sig_s.multiplier`. Predictor context =
 the first H frames (+ the learned position embedding `x_pe`), conditioned on
-the first H action embeddings; NO stop-gradient on the target.
+the first H action embeddings; NO stop-gradient on the target — `tgt_sg` is a
+`GradGate`, pass-through unless `set_node_attr["tgt_sg", "stop_grad"](1)`
+(AdaJEPA's detached target, a test-time-adaptation ablation).
 
 ⚠ `MSEPerSample` is per-sample mean; the trainer's 1/B seed makes the batch
 mean = torch's `.mean()` over (B, H, EMB). `PROJ_H` serves both projectors
