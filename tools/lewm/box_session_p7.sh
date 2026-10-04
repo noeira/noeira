@@ -93,6 +93,9 @@ e4() {
   ada e4_dark_sg      --dump "$RUN/epoch_7" --shift dark:0.5 --stop-grad-target
   ada e4_dark_lr10x   --dump "$RUN/epoch_7" --shift dark:0.5 --tta-lr 5e-4
   ada e4_dark_all_sg  --dump "$RUN/epoch_7" --shift dark:0.5 --subset all --stop-grad-target
+  # noise: the encoder's cost landscape survives it (lewm_pusht_cost_landscape:
+  # Spearman 0.76 vs 0.78 clean), the predictor does not (pred loss 13x)
+  ada e4_noise_lr10x  --dump "$RUN/epoch_7" --shift noise:0.1 --tta-lr 5e-4
   ada e4_e0_sg        --dump "$RUN/epoch_0" --stop-grad-target
   ada e4_e0_lr10x     --dump "$RUN/epoch_0" --tta-lr 5e-4
   ada e4_e0_lambda0   --dump "$RUN/epoch_0" --lambda 0
