@@ -52,8 +52,13 @@ struct OnPolicyState[
     var adv_buf: Tensor
     var ret_buf: Tensor
 
-    # Bootstrap obs per env (obs after the last rollout step → V(s_T)).
-    var bootstrap_obs: Tensor
+    # Each row's NEXT observation — the PRE-RESET obs after its step, so an
+    # episode that ends on that row (terminated or truncated) still has its
+    # own final state — and V of it, computed once at the update. GAE
+    # bootstraps a truncated row from it, a terminated row from 0, and the
+    # last row of the rollout from it (`PPOGAEStep`).
+    var next_obs_buf: Tensor
+    var next_val_buf: Tensor
 
     # ── Per-step caches per env (filled by act, drained by record) ──
     var cached_action: Tensor
@@ -95,7 +100,8 @@ struct OnPolicyState[
         self.term_buf = Tensor()
         self.adv_buf = Tensor()
         self.ret_buf = Tensor()
-        self.bootstrap_obs = Tensor()
+        self.next_obs_buf = Tensor()
+        self.next_val_buf = Tensor()
         self.cached_action = Tensor()
         self.cached_log_prob = Tensor()
         self.cached_value = Tensor()
@@ -149,7 +155,8 @@ struct OnPolicyState[
         s.term_buf = Self._mk[target](RN, ctx)
         s.adv_buf = Self._mk[target](RN, ctx)
         s.ret_buf = Self._mk[target](RN, ctx)
-        s.bootstrap_obs = Self._mk[target](Self.N_ENVS * Self.OBS, ctx)
+        s.next_obs_buf = Self._mk[target](RN * Self.OBS, ctx)
+        s.next_val_buf = Self._mk[target](RN, ctx)
         s.cached_action = Self._mk[target](Self.N_ENVS * Self.ACT, ctx)
         s.cached_log_prob = Self._mk[target](Self.N_ENVS, ctx)
         s.cached_value = Self._mk[target](Self.N_ENVS, ctx)

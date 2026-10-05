@@ -15,7 +15,9 @@ SAC way (`training/blocks/action_select.mojo`, `nn/random/box_muller.mojo`):
                       done / terminated / next-obs buffers (`PPORecordStep`'s
                       loop, `mark_terminal` folded in: term = terminated);
   - `gae`             the per-env backward GAE pass (`PPOGAEStep`), one thread
-                      per env, after the trainer's bootstrap critic forward.
+                      per env, after the trainer's critic forward over every
+                      row's next obs (truncations bootstrap from their own
+                      final state).
 
 The randomness is Philox with the offset in a DEVICE buffer advanced by a
 kernel (`box_muller_normal_gpu_dev` + `advance_rng_offset_kernel`), so the act
@@ -152,7 +154,7 @@ def _record_kernel[N_ENVS: Int, OBS: Int, ACT: Int, RN: Int](
     rew_buf: LayoutTensor[DT, Layout.row_major(RN), MutAnyOrigin],
     done_buf: LayoutTensor[DT, Layout.row_major(RN), MutAnyOrigin],
     term_buf: LayoutTensor[DT, Layout.row_major(RN), MutAnyOrigin],
-    boot: LayoutTensor[DT, Layout.row_major(N_ENVS * OBS), MutAnyOrigin],
+    next_buf: LayoutTensor[DT, Layout.row_major(RN * OBS), MutAnyOrigin],
 ):
     """`PPORecordStep.step` for env `e` at row `t` (one thread), with the
     driver's `mark_terminal_env` folded in: term = (terminated > 0.5)."""
@@ -162,7 +164,7 @@ def _record_kernel[N_ENVS: Int, OBS: Int, ACT: Int, RN: Int](
     var row = Int(t) * N_ENVS + e
     for d in range(OBS):
         obs_buf[row * OBS + d] = ob1[e * OBS + d]
-        boot[e * OBS + d] = next_obs[e * OBS + d]
+        next_buf[row * OBS + d] = next_obs[e * OBS + d]
     for j in range(ACT):
         act_buf[row * ACT + j] = ca[e * ACT + j]
     olp_buf[row] = clp[e]
@@ -177,32 +179,37 @@ def _record_kernel[N_ENVS: Int, OBS: Int, ACT: Int, RN: Int](
 
 
 def _gae_kernel[N_ENVS: Int, T: Int](
-    v1: LayoutTensor[DT, Layout.row_major(N_ENVS), MutAnyOrigin],
+    nval: LayoutTensor[DT, Layout.row_major(T * N_ENVS), MutAnyOrigin],
     rew: LayoutTensor[DT, Layout.row_major(T * N_ENVS), MutAnyOrigin],
     val: LayoutTensor[DT, Layout.row_major(T * N_ENVS), MutAnyOrigin],
+    done: LayoutTensor[DT, Layout.row_major(T * N_ENVS), MutAnyOrigin],
     term: LayoutTensor[DT, Layout.row_major(T * N_ENVS), MutAnyOrigin],
     adv: LayoutTensor[DT, Layout.row_major(T * N_ENVS), MutAnyOrigin],
     ret: LayoutTensor[DT, Layout.row_major(T * N_ENVS), MutAnyOrigin],
     gamma: Scalar[DT],
     gae_lambda: Scalar[DT],
 ):
-    """`PPOGAEStep`'s per-env backward pass for env `e` (one thread)."""
+    """`PPOGAEStep`'s per-env backward pass for env `e` (one thread): a row
+    that ended (or the rollout's last) bootstraps from V(its own next obs),
+    times (1 - term); the recursion stops at every episode end."""
     var e = Int(global_idx.x)
     if e >= N_ENVS:
         return
     var last_gae: Scalar[DT] = 0.0
-    var next_value_e = rebind[Scalar[DT]](v1[e])
     for t in range(T - 1, -1, -1):
         var idx = t * N_ENVS + e
-        var nonterm = Scalar[DT](1.0) - rebind[Scalar[DT]](term[idx])
+        var ended = rebind[Scalar[DT]](done[idx]) > Scalar[DT](0.5)
         var nv: Scalar[DT]
-        if t == T - 1:
-            nv = next_value_e
+        if ended or t == T - 1:
+            nv = (Scalar[DT](1.0) - rebind[Scalar[DT]](term[idx])) * rebind[
+                Scalar[DT]
+            ](nval[idx])
         else:
             nv = rebind[Scalar[DT]](val[(t + 1) * N_ENVS + e])
+        var cont = Scalar[DT](0.0) if ended else Scalar[DT](1.0)
         var vi = rebind[Scalar[DT]](val[idx])
-        var delta = rebind[Scalar[DT]](rew[idx]) + gamma * nv * nonterm - vi
-        last_gae = delta + gamma * gae_lambda * nonterm * last_gae
+        var delta = rebind[Scalar[DT]](rew[idx]) + gamma * nv - vi
+        last_gae = delta + gamma * gae_lambda * cont * last_gae
         adv[idx] = last_gae
         ret[idx] = last_gae + vi
 
@@ -350,7 +357,7 @@ struct PPODeviceRollout(Defaultable & Movable & Deinitable):
             state.rew_buf.lt["gpu", Layout.row_major(RN)](),
             state.done_buf.lt["gpu", Layout.row_major(RN)](),
             state.term_buf.lt["gpu", Layout.row_major(RN)](),
-            state.bootstrap_obs.lt["gpu", Layout.row_major(N_ENVS * OBS)](),
+            state.next_obs_buf.lt["gpu", Layout.row_major(RN * OBS)](),
             grid_dim=(N_ENVS + TPB - 1) // TPB,
             block_dim=TPB,
         )
@@ -364,14 +371,15 @@ struct PPODeviceRollout(Defaultable & Movable & Deinitable):
         gamma: Scalar[DT],
         gae_lambda: Scalar[DT],
     ) raises:
-        """After the bootstrap critic forward into `state.v1`: GAE into the
-        device `adv_buf` / `ret_buf`."""
+        """After the critic forward over `state.next_obs_buf` into
+        `state.next_val_buf`: GAE into the device `adv_buf` / `ret_buf`."""
         comptime RN = RL * N_ENVS
         var c = state.ctx.value()
         c.enqueue_function[_gae_kernel[N_ENVS, RL]](
-            state.v1.lt["gpu", Layout.row_major(N_ENVS)](),
+            state.next_val_buf.lt["gpu", Layout.row_major(RN)](),
             state.rew_buf.lt["gpu", Layout.row_major(RN)](),
             state.val_buf.lt["gpu", Layout.row_major(RN)](),
+            state.done_buf.lt["gpu", Layout.row_major(RN)](),
             state.term_buf.lt["gpu", Layout.row_major(RN)](),
             state.adv_buf.lt["gpu", Layout.row_major(RN)](),
             state.ret_buf.lt["gpu", Layout.row_major(RN)](),

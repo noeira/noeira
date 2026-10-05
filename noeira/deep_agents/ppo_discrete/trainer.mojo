@@ -730,12 +730,13 @@ struct PPODiscreteTrainer[
 
         var t_gae = perf_counter_ns()
         if self._device_rollout:
-            # The pool is on the device: bootstrap V(s_T), GAE there, and the
-            # advantages down once for the host shuffle's normalisation.
-            call_forward["gpu", Self.N_ENVS](
+            # The pool is on the device: V of every row's next obs, GAE there,
+            # and the advantages down once for the host shuffle's
+            # normalisation.
+            call_forward["gpu", Self.ROLLOUT_LEN * Self.N_ENVS](
                 self.critic,
-                TensorRefs[Self.CRITIC.ARITY](self.state.bootstrap_obs),
-                self.state.v1,
+                TensorRefs[Self.CRITIC.ARITY](self.state.next_obs_buf),
+                self.state.next_val_buf,
                 self.ctx,
             )
             self.device_rollout.gae(self.state, self.gamma, self.gae_lambda)
