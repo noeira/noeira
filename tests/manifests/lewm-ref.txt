@@ -19,3 +19,8 @@ tests/experimental/lewm/ref/test_ref_tta.mojo
 # for the renderer, `tools/lewm/sample_fixture_frames.py` -> /tmp/lewm_frames.
 tests/experimental/lewm/ref/test_pusht_replay.mojo
 tests/experimental/lewm/ref/test_pusht_render.mojo
+
+# P8 — INTACT's actor + Direct plan vs torch. Needs the converted history-free
+# PushT checkpoint in ~/.cache/noeira/lewm_pusht/intact/dump_pusht_s0
+# (tools/lewm/intact_reference.py) and session A's fixture.
+tests/experimental/lewm/ref/test_intact_direct.mojo

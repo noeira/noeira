@@ -47,6 +47,10 @@ last 3/9, all:2 8/9, staged 9/9, R 5 9/9); `--budget` env steps;
 `--stop-grad-target` detaches the target embeddings in the prediction loss
 (AdaJEPA's `detach_tgt`; LeWM itself trains without — only matters when the
 encoder adapts);
+`--planner cem | direct` (P8: INTACT's Direct plan — the actor reads each
+block from the latent, no cost, no CEM; the dump must carry `ours.actor.*`,
+`tools/lewm/intact_reference.py`; `--direct-ctx intact | aligned` its
+rollout's context pairing, `intact.mojo`; frozen arm only so far);
 `--shift none | noise:σ | dark:gain | swap` (E2: applied to EVERY observed
 frame, the dataset start and goal frames included); `--dyn` an E5 dynamics
 shift (`DynShift`: `kp:s,kv:s` sluggish agent, `friction:f`, `slide:r`
@@ -72,6 +76,7 @@ from noeira.experimental.lewm.ref_load import load_ref
 from noeira.experimental.lewm.ref_rollout import (
     LeWMRefRollout, RefEncoder, encode_ref, cem_step, PlanCost, REF_EMB, REF_ACT,
 )
+from noeira.experimental.lewm.intact import IntactDirect
 from noeira.experimental.lewm.ref_trainer import (
     LeWMRefTrainer, TrainerSnapshot, FillFromSnapshot, REF_T,
 )
@@ -98,6 +103,8 @@ comptime FRAME = PAIR_HW * 3
 struct Cfg(Copyable, Movable):
     var receding: Int
     var warm_start: Bool
+    var direct: Bool
+    var aligned: Bool
     var cost: PlanCost
     var budget: Int
     var tta_steps: Int
@@ -165,9 +172,11 @@ def _sync_planner(
 def _episode(
     e: Int, adapt: Bool, cfg: Cfg,
     mut env: PairEnv, mut enc: RefEncoder, mut roll: LeWMRefRollout[TARGET, S, HORIZON],
-    mut tr: LeWMRefTrainer[TARGET, TB], ctx: Optional[DeviceContext],
+    mut tr: LeWMRefTrainer[TARGET, TB], mut di: Optional[IntactDirect[TARGET, HORIZON]],
+    ctx: Optional[DeviceContext],
     start_pix: List[Scalar[DT]], goal_pix: List[Scalar[DT]], goal_state: List[Scalar[DT]],
     a_mean: List[Scalar[DT]], a_scale: List[Scalar[DT]], a_std_train: List[Scalar[DT]],
+    a_zero: List[Scalar[DT]],
 ) raises -> Outcome:
     # observations: the dataset start frame, then our renders — all shifted
     var first = List[Scalar[DT]](capacity=FRAME)
@@ -197,11 +206,17 @@ def _episode(
         var mean = init.copy()
         var std = List[Scalar[DT]](length=A, fill=Scalar[DT](1))
         var step_w = cfg.cost.weights(HORIZON, out.replans)
-        for it in range(ITERS):
-            var noise = gauss(cfg.seed * 1000003 + UInt64(e), S * A, UInt64((out.replans * ITERS + it) * S * A))
-            var st = cem_step[TARGET, S, HORIZON, K](roll, start_emb, goal_emb, mean, std, noise, step_w)
-            mean = st.mean.copy()
-            std = st.std.copy()
+        if cfg.direct:
+            # the actor's history: the last executed block (INTACT's eval),
+            # the normalised zero block before the first
+            var hist = acts[len(acts) - 1].copy() if len(acts) > 0 else a_zero.copy()
+            mean = di.value().plan(start_emb, goal_emb, hist, cfg.aligned)
+        else:
+            for it in range(ITERS):
+                var noise = gauss(cfg.seed * 1000003 + UInt64(e), S * A, UInt64((out.replans * ITERS + it) * S * A))
+                var st = cem_step[TARGET, S, HORIZON, K](roll, start_emb, goal_emb, mean, std, noise, step_w)
+                mean = st.mean.copy()
+                std = st.std.copy()
         out.replans += 1
         # swm warm start: the next replan's mean = this plan's unexecuted blocks, zero-padded
         var kept = A - cfg.receding * REF_ACT
@@ -269,6 +284,8 @@ def main() raises:
     var seed: UInt64 = 0
     var receding = 1
     var warm_start = True
+    var planner = String("cem")
+    var direct_ctx = String("intact")
     var cost_spec = String("staged")
     var budget = 100
     var arms = String("both")
@@ -297,6 +314,10 @@ def main() raises:
             seed = UInt64(Int(String(args[i + 1]))); i += 1
         elif a == "--receding":
             receding = Int(String(args[i + 1])); i += 1
+        elif a == "--planner":
+            planner = String(args[i + 1]); i += 1
+        elif a == "--direct-ctx":
+            direct_ctx = String(args[i + 1]); i += 1
         elif a == "--cold":
             warm_start = False
         elif a == "--cost":
@@ -332,12 +353,18 @@ def main() raises:
         raise Error("--tta-bn eval | train")
     if adam != "per-adapt" and adam != "per-episode":
         raise Error("--adam per-adapt | per-episode")
+    if planner != "cem" and planner != "direct":
+        raise Error("--planner cem | direct")
+    if direct_ctx != "intact" and direct_ctx != "aligned":
+        raise Error("--direct-ctx intact | aligned")
+    if planner == "direct" and arms != "frozen":
+        raise Error("--planner direct: --arms frozen (the adapted Direct actor is P8 I4.3)")
     var keep = _keep_for(subset)
     var touches_enc = len(keep) == 0
     for k in keep:
         if k.startswith("emb."):
             touches_enc = True
-    var cfg = Cfg(receding, warm_start, PlanCost.parse(cost_spec), budget, tta_steps, adam == "per-adapt", tta_bn == "train", stop_grad_target, keep^, touches_enc,
+    var cfg = Cfg(receding, warm_start, planner == "direct", direct_ctx == "aligned", PlanCost.parse(cost_spec), budget, tta_steps, adam == "per-adapt", tta_bn == "train", stop_grad_target, keep^, touches_enc,
                   VisualShift.parse(shift_spec), DynShift.parse(dyn_spec), seed)
     var run_frozen = arms == "both" or arms == "frozen"
     var run_adapt = arms == "both" or arms == "adapt"
@@ -357,6 +384,13 @@ def main() raises:
     var enc = RefEncoder.make[TARGET, Kaiming](ctx)
     _ = load_ref[TARGET](enc, dump, String("emb.0."), ctx)
     var roll = LeWMRefRollout[TARGET, S, HORIZON](dump, ctx)
+    var di: Optional[IntactDirect[TARGET, HORIZON]] = None
+    if cfg.direct:
+        di = IntactDirect[TARGET, HORIZON](dump, ctx)
+    # a raw zero block in the training normalisation (INTACT's episode start)
+    var a_zero = List[Scalar[DT]](capacity=REF_ACT)
+    for k in range(REF_ACT):
+        a_zero.append(Scalar[DT]((0.0 - Float64(a_mean[k % 2])) / Float64(a_std_train[k % 2])))
     var tr = LeWMRefTrainer[TARGET, TB](ctx, lr=tta_lr, wd=0.0, max_norm=1.0,
                                        sigreg_lambda=lam, dropout=False)
     _ = tr.load(dump)
@@ -364,7 +398,8 @@ def main() raises:
     tr.set_bn_training(False)  # measuring (both arms) must not move BN's running stats
     tr.set_stop_grad_target(cfg.stop_grad_target)
     var base = tr.export_params(List[String](), True)
-    print("AdaJEPA on", dump, ":", n_eps, "pairs from", first_pair, "; receding", receding, "warm" if warm_start else "cold", "cost", cost_spec,
+    print("AdaJEPA on", dump, ":", n_eps, "pairs from", first_pair, "; planner", planner + (" (" + direct_ctx + " ctx)" if planner == "direct" else ""),
+          "; receding", receding, "warm" if warm_start else "cold", "cost", cost_spec,
           "budget", budget, "; subset", subset, "(", len(cfg.keep), "prefixes ) lr", tta_lr,
           "steps", tta_steps, "Adam", adam, "BN", tta_bn, "stop-grad target" if stop_grad_target else "", "lambda", lam, "; shift", shift_spec, "; dyn", dyn_spec,
           "; base snapshot", len(base.names), "tensors")
@@ -392,8 +427,8 @@ def main() raises:
             if arm == 1:
                 tr.reset_optimizer()
             var t0 = perf_counter_ns()
-            var o = _episode(e, arm == 1, cfg, env, enc, roll, tr, ctx, start_pix, goal_pix,
-                             goal_state, a_mean, a_scale, a_std_train)
+            var o = _episode(e, arm == 1, cfg, env, enc, roll, tr, di, ctx, start_pix, goal_pix,
+                             goal_state, a_mean, a_scale, a_std_train, a_zero)
             if o.ok:
                 n_ok[arm] += 1
             pred_sum[arm] += o.pred_loss

@@ -176,6 +176,23 @@ struct LeWMRefRollout[target: StaticString, S: Int, HORIZON: Int]:
                 out.append(ph[s * HD + (L - 1) * Self.D + d])
         return out^
 
+    def embed_actions(mut self, actions: List[Scalar[DT]]) raises -> List[Scalar[DT]]:
+        """(S, HORIZON, ACT) z-scored blocks -> (S, HORIZON, D) action
+        embeddings. Per token, so a shorter sequence can be zero-padded."""
+        var a = _up[Self.target](actions, self.ctx)
+        var ae_t = Tensor.alloc(Self.S * Self.HORIZON * Self.D)
+        self.ae.forward[Self.target, Self.S](TensorRefs[1](a), ae_t, self.ctx)
+        return _down[Self.target](ae_t, Self.S * Self.HORIZON * Self.D, self.ctx)
+
+    def predict_ctx(
+        mut self, x_ctx: List[Scalar[DT]], c_ctx: List[Scalar[DT]], L: Int
+    ) raises -> List[Scalar[DT]]:
+        """One predictor step on (S, 3, D) left-aligned embedding / action-
+        embedding contexts of length L (tail zero): output token L − 1, (S, D).
+        The building block of a rollout whose actions are chosen step by step
+        (`intact.IntactDirect`)."""
+        return self._predict_last(x_ctx, c_ctx, L)
+
     def rollout(
         mut self, start_emb: List[Scalar[DT]], actions: List[Scalar[DT]]
     ) raises -> List[Scalar[DT]]:
