@@ -21,6 +21,7 @@ The actor reads the first 960 words (`Slice` at its head).
 """
 
 from std.math import sqrt
+from std.sys import get_defined_int
 
 from noeira.deep_agents.ppo import PPOAgent
 from noeira.deep_agents.primitives.gaussian_head import GaussianHead
@@ -36,12 +37,20 @@ from noeira.envs.robots.unitree_g1_walk_rp_config import (
 )
 
 
+comptime RP_ACTOR_LINVEL = get_defined_int["RP_ACTOR_LINVEL", 0]() != 0
+"""`-D RP_ACTOR_LINVEL=1`: the actor also sees the pelvis-frame linear
+velocity (env words 67-69, otherwise the critic's first privileged words).
+RoboParty's actor does not; it must estimate its velocity from the history.
+The env observation is the same either way — only the actor / privileged
+split moves (67 -> 70), so build the eval with the same define as the run."""
+comptime RP_EA = G1R_OBS_ACTOR + (3 if RP_ACTOR_LINVEL else 0)
+comptime RP_EP = G1R_OBS_DIM - RP_EA
 comptime RP_ACT = 29
 comptime RP_HIST = 1
 comptime RP_FRAMES = 10
-comptime RP_FRAME = G1R_OBS_ACTOR + RP_HIST * RP_ACT
+comptime RP_FRAME = RP_EA + RP_HIST * RP_ACT
 comptime RP_ACTOR_OBS = RP_FRAMES * RP_FRAME
-comptime RP_OBS = RP_ACTOR_OBS + RP_FRAMES * G1R_OBS_PRIV
+comptime RP_OBS = RP_ACTOR_OBS + RP_FRAMES * RP_EP
 comptime RP_OBS_CLIP: Float64 = 10.0
 comptime H1 = 512
 comptime H2 = 256
@@ -68,17 +77,17 @@ def rp_mirror_maps() -> Tuple[List[Int], List[Float64], List[Int], List[Float64]
     var oi = List[Int](length=RP_OBS, fill=0)
     var os = List[Float64](length=RP_OBS, fill=1.0)
     for f in range(RP_FRAMES):
-        for k in range(G1R_OBS_ACTOR):
+        for k in range(RP_EA):
             oi[f * RP_FRAME + k] = f * RP_FRAME + env_m[0][k]
             os[f * RP_FRAME + k] = env_m[1][k]
         for j in range(RP_ACT):
             var m = g1_mirror_joint(j)
-            oi[f * RP_FRAME + G1R_OBS_ACTOR + j] = f * RP_FRAME + G1R_OBS_ACTOR + m[0]
-            os[f * RP_FRAME + G1R_OBS_ACTOR + j] = m[1]
-        for k in range(G1R_OBS_PRIV):
-            var src = env_m[0][G1R_OBS_ACTOR + k] - G1R_OBS_ACTOR
-            oi[RP_ACTOR_OBS + f * G1R_OBS_PRIV + k] = RP_ACTOR_OBS + f * G1R_OBS_PRIV + src
-            os[RP_ACTOR_OBS + f * G1R_OBS_PRIV + k] = env_m[1][G1R_OBS_ACTOR + k]
+            oi[f * RP_FRAME + RP_EA + j] = f * RP_FRAME + RP_EA + m[0]
+            os[f * RP_FRAME + RP_EA + j] = m[1]
+        for k in range(RP_EP):
+            var src = env_m[0][RP_EA + k] - RP_EA
+            oi[RP_ACTOR_OBS + f * RP_EP + k] = RP_ACTOR_OBS + f * RP_EP + src
+            os[RP_ACTOR_OBS + f * RP_EP + k] = env_m[1][RP_EA + k]
     var ai = List[Int](length=RP_ACT, fill=0)
     var as_ = List[Float64](length=RP_ACT, fill=1.0)
     for j in range(RP_ACT):
@@ -116,12 +125,12 @@ struct WalkRPPolicy(Movable):
             self.last[j] = 0.0
 
     def _write_frame(mut self, f: Int, env_obs: List[Float64]):
-        for k in range(G1R_OBS_ACTOR):
+        for k in range(RP_EA):
             self.stack[f * RP_FRAME + k] = env_obs[k]
         for j in range(RP_ACT):
-            self.stack[f * RP_FRAME + G1R_OBS_ACTOR + j] = self.last[j]
-        for k in range(G1R_OBS_PRIV):
-            self.stack[RP_ACTOR_OBS + f * G1R_OBS_PRIV + k] = env_obs[G1R_OBS_ACTOR + k]
+            self.stack[f * RP_FRAME + RP_EA + j] = self.last[j]
+        for k in range(RP_EP):
+            self.stack[RP_ACTOR_OBS + f * RP_EP + k] = env_obs[RP_EA + k]
 
     def act(mut self, env_obs: List[Float64]) raises -> List[Float64]:
         if len(env_obs) != G1R_OBS_DIM:
@@ -134,9 +143,9 @@ struct WalkRPPolicy(Movable):
             for f in range(RP_FRAMES - 1, 0, -1):
                 for k in range(RP_FRAME):
                     self.stack[f * RP_FRAME + k] = self.stack[(f - 1) * RP_FRAME + k]
-                for k in range(G1R_OBS_PRIV):
-                    self.stack[RP_ACTOR_OBS + f * G1R_OBS_PRIV + k] = self.stack[
-                        RP_ACTOR_OBS + (f - 1) * G1R_OBS_PRIV + k
+                for k in range(RP_EP):
+                    self.stack[RP_ACTOR_OBS + f * RP_EP + k] = self.stack[
+                        RP_ACTOR_OBS + (f - 1) * RP_EP + k
                     ]
             self._write_frame(0, env_obs)
         for k in range(RP_OBS):

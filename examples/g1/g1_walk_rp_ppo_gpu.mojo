@@ -48,6 +48,7 @@ from noeira.nn.constants import DT
 
 from g1_walk_rp_policy import (
     RPActor, RPCritic, RP_OBS, RP_FRAMES, RP_HIST, RP_HEAD_CHILD, rp_mirror_maps,
+    RP_EA, RP_ACTOR_LINVEL,
 )
 
 
@@ -89,7 +90,8 @@ def main() raises:
         makedirs(out)
     seed_rng(seed)
     print("PPO (run_ppo_vec) on the G1 walker, RoboParty recipe | lanes", N_ENVS,
-          "| obs", RP_OBS, "(actor", RP_FRAMES * (G1R_OBS_ACTOR + RP_HIST * ACT),
+          "| obs", RP_OBS, "(actor", RP_FRAMES * (RP_EA + RP_HIST * ACT),
+          ", linvel in actor", RP_ACTOR_LINVEL,
           ") | act", ACT, "| frames", RP_FRAMES, "| rollout", ROLLOUT,
           "| minibatch", MINIBATCH, "x", N_MINIBATCHES, "| epochs", EPOCHS,
           "| lr", lr, "adaptive", adaptive, "| ent", ent, "| act-rate", act_rate,
@@ -145,7 +147,7 @@ def main() raises:
         )
         var res = run_ppo_vec[
             HIST=RP_HIST, ENV_GRAPH=ENV_GRAPH, TRAIN_GRAPH=TRAIN_GRAPH,
-            FRAMES=RP_FRAMES, E_ACTOR=G1R_OBS_ACTOR,
+            FRAMES=RP_FRAMES, E_ACTOR=RP_EA,
         ](agent, env, ctx, cfg, rms, logger, out + "/ckpt", out + "/obs_norm.txt")
         print("RESULT steps", res.steps, "| seconds", res.seconds,
               "| episodes", res.episodes, "| return (last 100)", res.mean_return,
