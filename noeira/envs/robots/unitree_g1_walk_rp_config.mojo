@@ -54,6 +54,7 @@ cost no meta word.
 
 from std.math import exp, sqrt
 from std.random.philox import Random as PhiloxRandom
+from std.sys import get_defined_int
 from layout import Layout, LayoutTensor
 from noeira.nn.core.tensor import TensorImpl
 from noeira.physics3d.fields import Data, DimsLike
@@ -218,6 +219,12 @@ comptime R_UPWARD: Int = 23
 comptime R_STAND_STILL: Int = 24
 comptime R_FEET_HEIGHT: Int = 25
 
+comptime G1R_FEET_AIR_W: Float64 = Float64(
+    get_defined_int["G1R_FEET_AIR_MILLI", 250]()
+) / 1000.0
+"""`feet_air_time`'s weight, theirs 0.25; `-D G1R_FEET_AIR_MILLI=1000` at
+`mojo build` raises it (the lever for a policy stuck standing — run rp5 at
+60-100 M never stepped)."""
 comptime G1R_TRACK_STD: Float64 = 0.5
 comptime G1R_AIR_THRESHOLD: Float64 = 0.4
 comptime G1R_SOFT_LIMIT: Float64 = 0.9
@@ -248,7 +255,7 @@ def g1r_weight(t: Int) -> Float64:
     elif t == R_TERMINATION:
         return -200.0
     elif t == R_FEET_AIR:
-        return 0.25
+        return G1R_FEET_AIR_W
     elif t == R_FEET_SLIDE:
         return -0.3
     elif t == R_FEET_FORCE:
