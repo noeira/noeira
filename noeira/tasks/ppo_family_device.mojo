@@ -14,9 +14,9 @@ named after (read that code for the WHY; this file only mirrors it):
                       `--dive-penalty`, success, the terminal row
   `_post_k`           the policy step's transition (`--repeat` terminal rows,
                       the smoothing penalty, the done write-back)
-  `_augment_k`        `_augment` (history, `TASK_PPO_TARGET_OBS` lead)
-  `_rms_*_k`          `RunningMeanStd.update` (diverged lanes masked) and
-                      `normalize_into`
+  `augment_k`, `update_rms_device`, `normalize_device`, `norm_reward`
+                      shared with the generic driver — in
+                      `deep_agents/training/obs_norm.mojo`
   `_ret_k` / `_rew_k` CleanRL's `NormalizeReward` and the episode records
   `_reset_k`          the lanes that ended: `ServoLag.reset_lane`,
                       `_target_reset`, `_hist_clear`, the smoothing's
@@ -48,6 +48,9 @@ from noeira.nn.core.ptr import mptr
 from noeira.nn.core.tensor import Tensor
 from noeira.deep_agents.training.batched_env import BatchedEnv
 from noeira.deep_agents.training.driver_onpolicy import OnPolicyBatchedCore
+from noeira.deep_agents.training.obs_norm import (
+    augment_k, norm_reward, update_rms_device, normalize_device,
+)
 from noeira.physics3d.gpu.constants import METADATA_SIZE, META_IDX_GOAL_HELD
 from noeira.tasks.delta_action import (
     DELTA_ACT, LAG_MAX_DELAY, ServoLag, ACT_HIST, TARGET_OBS,
@@ -406,122 +409,9 @@ def _post_k[N: Int, E_OBS: Int](
         )
 
 
-def _augment_k[N: Int, E_OBS: Int, W: Int, T: Int](
-    raw: _V[N * E_OBS],
-    hist: _V[N * W + 1],
-    tprev: _V[N * ACT],
-    qa: _V[ACT],
-    aug: _V[N * (E_OBS + W + T)],
-):
-    """`_augment`: the env row, the history, then (`TARGET_OBS`) the target's
-    lead over the joints. `hist` is sized `N*W + 1` so W = 0 still builds."""
-    comptime A = E_OBS + W + T
-    var e = Int(global_idx.x)
-    if e >= N:
-        return
-    for k in range(E_OBS):
-        aug[e * A + k] = raw[e * E_OBS + k]
-    for k in range(W):
-        aug[e * A + E_OBS + k] = hist[e * W + k]
-    comptime if T > 0:
-        for j in range(ACT):
-            var q = rebind[Scalar[DT]](
-                raw[e * E_OBS + Int(rebind[Scalar[DT]](qa[j]))]
-            )
-            aug[e * A + E_OBS + W + j] = rebind[Scalar[DT]](
-                tprev[e * ACT + j]
-            ) - q
-
-
 # ═══════════════════════════════════════════════════════════════════════════
 # running statistics (`RunningMeanStd`)
 # ═══════════════════════════════════════════════════════════════════════════
-
-
-def _rms_update_k[N: Int, D: Int](
-    x: _V[N * D],
-    skip: _V[N],
-    use_skip: Int32,
-    mean: _V[D],
-    var_: _V[D],
-    count: _V[1],
-):
-    """`RunningMeanStd.update`, one thread per dimension (each walks the
-    lanes in the host's order); rows with `skip` set are left out when
-    `use_skip`. The shared count is NOT written here (`_rms_count_k`), so
-    every dimension merges against the same old count."""
-    var k = Int(global_idx.x)
-    if k >= D:
-        return
-    var n = 0
-    var bm: Scalar[DT] = 0.0
-    for i in range(N):
-        if use_skip != 0 and rebind[Scalar[DT]](skip[i]) > Scalar[DT](0.5):
-            continue
-        n += 1
-        bm += rebind[Scalar[DT]](x[i * D + k])
-    if n == 0:
-        return
-    bm /= Scalar[DT](n)
-    var bv: Scalar[DT] = 0.0
-    for i in range(N):
-        if use_skip != 0 and rebind[Scalar[DT]](skip[i]) > Scalar[DT](0.5):
-            continue
-        var d = rebind[Scalar[DT]](x[i * D + k]) - bm
-        bv += d * d
-    bv /= Scalar[DT](n)
-    var c = rebind[Scalar[DT]](count[0])
-    var nf = Scalar[DT](n)
-    var tot = c + nf
-    var mk = rebind[Scalar[DT]](mean[k])
-    var delta = bm - mk
-    var m2 = rebind[Scalar[DT]](var_[k]) * c + bv * nf + delta * delta * c * nf / tot
-    mean[k] = mk + delta * nf / tot
-    var_[k] = m2 / tot
-
-
-def _rms_count_k[N: Int](
-    skip: _V[N], use_skip: Int32, count: _V[1],
-):
-    """The count's half of `RunningMeanStd.update`, after `_rms_update_k`."""
-    if Int(global_idx.x) != 0:
-        return
-    var n = 0
-    for i in range(N):
-        if use_skip != 0 and rebind[Scalar[DT]](skip[i]) > Scalar[DT](0.5):
-            continue
-        n += 1
-    if n > 0:
-        count[0] = rebind[Scalar[DT]](count[0]) + Scalar[DT](n)
-
-
-def _rms_normalize_k[N: Int, D: Int](
-    x: _V[N * D],
-    dst: _V[N * D],
-    mean: _V[D],
-    var_: _V[D],
-    clip: Scalar[DT],
-    zero: _V[N],
-    use_zero: Int32,
-):
-    """`RunningMeanStd.normalize_into`, then (`use_zero`) the diverged lanes'
-    rows zeroed, as `run_ppo` does to a diverged lane's terminal obs."""
-    var i = Int(global_idx.x)
-    if i >= N * D:
-        return
-    var e = i // D
-    var k = i % D
-    if use_zero != 0 and rebind[Scalar[DT]](zero[e]) > Scalar[DT](0.5):
-        dst[i] = Scalar[DT](0.0)
-        return
-    var v = (rebind[Scalar[DT]](x[i]) - rebind[Scalar[DT]](mean[k])) / fsqrt(
-        rebind[Scalar[DT]](var_[k]) + Scalar[DT](1e-8)
-    )
-    if v > clip:
-        v = clip
-    elif v < -clip:
-        v = -clip
-    dst[i] = v
 
 
 # ═══════════════════════════════════════════════════════════════════════════
@@ -562,15 +452,9 @@ def _rew_k[N: Int](
     var e = Int(global_idx.x)
     if e >= N:
         return
-    var scale = Scalar[DT](1.0) / fsqrt(
-        rebind[Scalar[DT]](ret_var[0]) + Scalar[DT](1e-8)
+    rew_n[e] = norm_reward(
+        rebind[Scalar[DT]](rew[e]), rebind[Scalar[DT]](ret_var[0]), clip
     )
-    var v = rebind[Scalar[DT]](rew[e]) * scale
-    if v > clip:
-        v = clip
-    elif v < -clip:
-        v = -clip
-    rew_n[e] = v
     if rebind[Scalar[DT]](done[e]) > Scalar[DT](0.5):
         ep[e * 3 + _EP_DONE] = Scalar[DT](1.0)
         ep[e * 3 + _EP_SUCC] = succ[e]
@@ -722,59 +606,6 @@ def lag_cfg_words(ref lag: ServoLag) -> List[Scalar[DT]]:
 # ═══════════════════════════════════════════════════════════════════════════
 # the rollout
 # ═══════════════════════════════════════════════════════════════════════════
-
-
-def _update_rms[N: Int, D: Int](
-    ctx: DeviceContext,
-    mut x: Tensor,
-    mut skip: Tensor,
-    mut mean: Tensor,
-    mut var_: Tensor,
-    mut count: Tensor,
-    use_skip: Bool,
-) raises:
-    """`RunningMeanStd.update` on the device: the per-dimension merge, then
-    the shared count."""
-    var us = Int32(1) if use_skip else Int32(0)
-    ctx.enqueue_function[_rms_update_k[N, D]](
-        x.lt["gpu", Layout.row_major(N * D)](),
-        skip.lt["gpu", Layout.row_major(N)](),
-        us,
-        mean.lt["gpu", Layout.row_major(D)](),
-        var_.lt["gpu", Layout.row_major(D)](),
-        count.lt["gpu", Layout.row_major(1)](),
-        grid_dim=(D + TPB - 1) // TPB, block_dim=TPB,
-    )
-    ctx.enqueue_function[_rms_count_k[N]](
-        skip.lt["gpu", Layout.row_major(N)](),
-        us,
-        count.lt["gpu", Layout.row_major(1)](),
-        grid_dim=1, block_dim=1,
-    )
-
-
-def _normalize[N: Int, D: Int](
-    ctx: DeviceContext,
-    mut src: Tensor,
-    mut dst: Tensor,
-    mut mean: Tensor,
-    mut var_: Tensor,
-    mut zero: Tensor,
-    clip: Float64,
-    zero_rows: Bool,
-) raises:
-    """`RunningMeanStd.normalize_into` on the device (`zero_rows`: the rows
-    flagged in `zero` written as 0)."""
-    ctx.enqueue_function[_rms_normalize_k[N, D]](
-        src.lt["gpu", Layout.row_major(N * D)](),
-        dst.lt["gpu", Layout.row_major(N * D)](),
-        mean.lt["gpu", Layout.row_major(D)](),
-        var_.lt["gpu", Layout.row_major(D)](),
-        Scalar[DT](clip),
-        zero.lt["gpu", Layout.row_major(N)](),
-        Int32(1) if zero_rows else Int32(0),
-        grid_dim=(N * D + TPB - 1) // TPB, block_dim=TPB,
-    )
 
 
 @fieldwise_init
@@ -1040,7 +871,7 @@ struct FamilyDeviceRollout[N_: Int, E_OBS_: Int](Movable):
     def _augment(mut self, raw_ptr: _Ptr) raises:
         comptime N = Self.N
         self.ctx.enqueue_function[
-            _augment_k[N, Self.E_OBS, Self.W, Self.T]
+            augment_k[N, Self.E_OBS, Self.W, Self.T, ACT]
         ](
             _V[N * Self.E_OBS](raw_ptr),
             self.hist.lt["gpu", Layout.row_major(N * Self.W + 1)](),
@@ -1084,11 +915,11 @@ struct FamilyDeviceRollout[N_: Int, E_OBS_: Int](Movable):
         lane, the first normalised observation."""
         self._reset_lanes(raw_ptr, mptr(self.zeros.dev.value().unsafe_ptr()), True)
         self._augment(raw_ptr)
-        _update_rms[Self.N, Self.OBS](
+        update_rms_device[Self.N, Self.OBS](
             self.ctx, self.aug, self.diverged, self.obs_mean, self.obs_var,
             self.obs_count, False,
         )
-        _normalize[Self.N, Self.OBS](
+        normalize_device[Self.N, Self.OBS](
             self.ctx, self.aug, self.cur_n, self.obs_mean, self.obs_var,
             self.diverged, self.cfg.obs_clip, False,
         )
@@ -1218,11 +1049,11 @@ struct FamilyDeviceRollout[N_: Int, E_OBS_: Int](Movable):
             grid_dim=Self._g(N), block_dim=TPB,
         )
         self._augment(mptr(self.raw_post.dev.value().unsafe_ptr()))
-        _update_rms[Self.N, Self.OBS](
+        update_rms_device[Self.N, Self.OBS](
             c, self.aug, self.diverged, self.obs_mean, self.obs_var,
             self.obs_count, True,
         )
-        _normalize[Self.N, Self.OBS](
+        normalize_device[Self.N, Self.OBS](
             c, self.aug, self.next_n, self.obs_mean, self.obs_var,
             self.diverged, cfg.obs_clip, True,
         )
@@ -1235,7 +1066,7 @@ struct FamilyDeviceRollout[N_: Int, E_OBS_: Int](Movable):
             Scalar[DT](cfg.gamma),
             grid_dim=Self._g(N), block_dim=TPB,
         )
-        _update_rms[Self.N, 1](
+        update_rms_device[Self.N, 1](
             c, self.rets, self.diverged, self.ret_mean, self.ret_var,
             self.ret_count, False,
         )
@@ -1281,7 +1112,7 @@ struct FamilyDeviceRollout[N_: Int, E_OBS_: Int](Movable):
             env.obs_ptr(), mptr(self.done_out.dev.value().unsafe_ptr()), False
         )
         self._augment(env.obs_ptr())
-        _normalize[Self.N, Self.OBS](
+        normalize_device[Self.N, Self.OBS](
             c, self.aug, self.cur_n, self.obs_mean, self.obs_var,
             self.diverged, cfg.obs_clip, False,
         )

@@ -80,6 +80,8 @@ from noeira.core.run_session import RunLogger, finish_run, run_logger
 from noeira.deep_agents.ppo import PPOAgent
 from noeira.deep_agents.training.driver_onpolicy import onpolicy_update_device
 from noeira.cuda import CUDAGraph
+# re-exported for the family's other readers (pixel DAgger, the SO-101 probes)
+from noeira.deep_agents.training.obs_norm import RunningMeanStd
 from noeira.tasks.ppo_family_device import (
     FamilyDeviceRollout, FamilyStepConfig,
 )
@@ -173,98 +175,6 @@ comptime AgentT[OBS: Int] = PPOAgent[
     "gpu", ActorNet[OBS], CriticNet[OBS], OBS, ACT_DIM, ROLLOUT, MINIBATCH,
     N_EPOCHS, N_ENVS,
 ]
-
-
-struct RunningMeanStd(Movable):
-    """CleanRL's running mean / variance (parallel Welford over batches)."""
-
-    var mean: List[Float64]
-    var var_: List[Float64]
-    var count: Float64
-
-    def __init__(out self, dim: Int):
-        self.mean = List[Float64](length=dim, fill=0.0)
-        self.var_ = List[Float64](length=dim, fill=1.0)
-        self.count = 1e-4
-
-    def update(
-        mut self, x: Pointer[Scalar[DT], MutAnyOrigin], n_rows: Int, dim: Int,
-        skip: List[Bool] = List[Bool](),
-    ):
-        """Rows with `skip[i]` set are left out (diverged lanes)."""
-        var bm = List[Float64](length=dim, fill=0.0)
-        var bv = List[Float64](length=dim, fill=0.0)
-        var n = 0
-        for i in range(n_rows):
-            if len(skip) > 0 and skip[i]:
-                continue
-            n += 1
-            for k in range(dim):
-                bm[k] += Float64(x[unsafe_offset = i * dim + k])
-        if n == 0:
-            return
-        for k in range(dim):
-            bm[k] /= Float64(n)
-        for i in range(n_rows):
-            if len(skip) > 0 and skip[i]:
-                continue
-            for k in range(dim):
-                var d = Float64(x[unsafe_offset = i * dim + k]) - bm[k]
-                bv[k] += d * d
-        for k in range(dim):
-            bv[k] /= Float64(n)
-        var tot = self.count + Float64(n)
-        for k in range(dim):
-            var delta = bm[k] - self.mean[k]
-            var m_a = self.var_[k] * self.count
-            var m_b = bv[k] * Float64(n)
-            var m2 = m_a + m_b + delta * delta * self.count * Float64(n) / tot
-            self.mean[k] += delta * Float64(n) / tot
-            self.var_[k] = m2 / tot
-        self.count = tot
-
-    def normalize_into(
-        self,
-        src: Pointer[Scalar[DT], MutAnyOrigin],
-        dst: Pointer[Scalar[DT], MutAnyOrigin],
-        n: Int,
-        dim: Int,
-        clip: Float64,
-    ):
-        for i in range(n):
-            for k in range(dim):
-                var v = (Float64(src[unsafe_offset = i * dim + k]) - self.mean[k]) / sqrt(
-                    self.var_[k] + 1e-8
-                )
-                if v > clip:
-                    v = clip
-                elif v < -clip:
-                    v = -clip
-                dst[unsafe_offset = i * dim + k] = Scalar[DT](v)
-
-    def load(mut self, path: String) raises:
-        var txt = String()
-        with open(path, "r") as f:
-            txt = f.read()
-        var lines = txt.split("\n")
-        self.count = Float64(String(lines[0].split(" ")[1]))
-        var m = lines[1].split(" ")
-        var v = lines[2].split(" ")
-        for k in range(len(self.mean)):
-            self.mean[k] = Float64(String(m[k + 1]))
-            self.var_[k] = Float64(String(v[k + 1]))
-
-    def save(self, path: String) raises:
-        var s = String("count ") + String(self.count) + "\n"
-        s += "mean"
-        for k in range(len(self.mean)):
-            s += " " + String(self.mean[k])
-        s += "\nvar"
-        for k in range(len(self.var_)):
-            s += " " + String(self.var_[k])
-        s += "\n"
-        with open(path, "w") as f:
-            f.write(s)
 
 
 def _delta_to_env(

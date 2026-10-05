@@ -44,11 +44,14 @@ from noeira.nn.core.tensor import Tensor
 from noeira.physics3d.gpu.constants import METADATA_SIZE, META_IDX_GOAL_HELD
 from noeira.tasks.delta_action import LAG_MAX_DELAY, ServoLag
 from noeira.tasks.ppo_family_driver import (
-    N_ENVS, RunningMeanStd, _delta_targets, _target_targets, _targets_to_env,
+    N_ENVS, _delta_targets, _target_targets, _targets_to_env,
+)
+from noeira.deep_agents.training.obs_norm import (
+    RunningMeanStd, augment_k, update_rms_device, normalize_device,
 )
 from noeira.tasks.ppo_family_device import (
-    ACT, _exec_noise_k, _smooth_k, _hist_push_k, _targets_k, _to_env_k, _reset_k, _tick_k, _post_k, _augment_k,
-    _ret_k, _rew_k, _update_rms, _normalize, lag_cfg_words,
+    ACT, _exec_noise_k, _smooth_k, _hist_push_k, _targets_k, _to_env_k, _reset_k, _tick_k, _post_k,
+    _ret_k, _rew_k, lag_cfg_words,
     _L_SIZE, _S_SIZE, _S_DIVERGED, _S_DIVE, _S_TICKS, _S_SPEN_SUM, _S_SPEN_N, _EP_DONE, _EP_SUCC,
     _EP_RET,
 )
@@ -358,7 +361,7 @@ def test_rms(ctx: DeviceContext) raises:
         host.update(mptr(xs.unsafe_ptr()), N, D, skip)
         var t_x = up(ctx, x)
         var t_sk = up(ctx, sk)
-        _update_rms[N, D](ctx, t_x, t_sk, t_mean, t_var, t_cnt, True)
+        update_rms_device[N, D](ctx, t_x, t_sk, t_mean, t_var, t_cnt, True)
         var m = down(ctx, t_mean)
         var v = down(ctx, t_var)
         var c = down(ctx, t_cnt)
@@ -373,7 +376,7 @@ def test_rms(ctx: DeviceContext) raises:
             for k in range(D):
                 want[e * D + k] = 0.0 if skip[e] else Float64(out_h[e * D + k])
         var t_o = zeros(ctx, N * D)
-        _normalize[N, D](ctx, t_x, t_o, t_mean, t_var, t_sk, 10.0, True)
+        normalize_device[N, D](ctx, t_x, t_o, t_mean, t_var, t_sk, 10.0, True)
         var o = down(ctx, t_o)
         check("normalize batch " + String(b), o, want, N * D, 1e-4, 1e-4)
 
@@ -436,7 +439,7 @@ def test_reward(ctx: DeviceContext) raises:
             Scalar[DT](0.99),
             grid_dim=G, block_dim=TPB,
         )
-        _update_rms[N, 1](ctx, t_rets, t_skip, t_rm, t_rv, t_rc, False)
+        update_rms_device[N, 1](ctx, t_rets, t_skip, t_rm, t_rv, t_rc, False)
         ctx.enqueue_function[_rew_k[N]](
             t_r.lt["gpu", Layout.row_major(N)](),
             t_dn.lt["gpu", Layout.row_major(N)](),
@@ -656,7 +659,7 @@ def test_augment(ctx: DeviceContext) raises:
     var t_tp = up(ctx, tprev)
     var t_qa = up(ctx, qa)
     var t_aug = zeros(ctx, N * A)
-    ctx.enqueue_function[_augment_k[N, E_OBS, W, T]](
+    ctx.enqueue_function[augment_k[N, E_OBS, W, T, ACT]](
         t_raw.lt["gpu", Layout.row_major(N * E_OBS)](),
         t_hist.lt["gpu", Layout.row_major(N * W + 1)](),
         t_tp.lt["gpu", Layout.row_major(N * ACT)](),
