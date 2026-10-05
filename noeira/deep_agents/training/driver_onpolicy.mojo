@@ -869,6 +869,7 @@ def onpolicy_update_device[
     ctx: Optional[DeviceContext],
     step: Int,
     mut train_graph: Optional[CUDAGraph],
+    quiet: Bool = False,
 ) raises -> Bool:
     """The device update at a rollout boundary (False, nothing done, between
     boundaries): `begin_update_device`, the minibatch step captured + replayed
@@ -878,7 +879,8 @@ def onpolicy_update_device[
     A driver that changes a host-side hyperparameter the step bakes into its
     kernel arguments (a learning rate or entropy coefficient set with
     `set_lr` / `set_entropy_coef`) drops `train_graph` (`= None`) after the
-    change, and the next update re-captures."""
+    change, and the next update re-captures (`quiet`: without the capture
+    line)."""
     if not trainer.begin_update_device(step):
         return False
     var c = ctx.value()
@@ -888,7 +890,10 @@ def onpolicy_update_device[
 
     for _ in range(trainer.minibatches_per_update()):
         comptime if USE_TRAIN_CUDA_GRAPH:
-            maybe_capture_replay[_minibatch](train_graph, c)
+            if quiet:
+                maybe_capture_replay[_minibatch, VERBOSE=False](train_graph, c)
+            else:
+                maybe_capture_replay[_minibatch](train_graph, c)
         else:
             trainer.train_minibatch_device()
         trainer.note_minibatch_update()

@@ -458,6 +458,7 @@ struct CUDAGraph(Movable):
 
 def maybe_capture_replay[
     STEP: def () capturing raises -> None,
+    VERBOSE: Bool = True,
 ](mut graph: Optional[CUDAGraph], ctx: DeviceContext) raises:
     """Capture `STEP` into `graph` on first call; replay it thereafter.
 
@@ -482,7 +483,10 @@ def maybe_capture_replay[
 
     Host bookkeeping (step counters, metric flush cadence) is intentionally
     NOT here — keep it in the caller's loop, advanced once per logical update,
-    so it stays correct whether the step ran directly or via replay."""
+    so it stays correct whether the step ran directly or via replay.
+
+    `VERBOSE=False` skips the node-count line — for a caller that re-captures
+    by design (a schedule baked into kernel arguments) and printed it once."""
     comptime if has_nvidia_gpu_accelerator():
         if not graph:
             STEP()
@@ -506,11 +510,12 @@ def maybe_capture_replay[
             # tiny/zero node count means capture silently failed — e.g. the
             # closure enqueued on a different stream than the one being
             # captured). Printed once per graph (first call only).
-            print(
-                "[CUDA Graph] maybe_capture_replay captured",
-                g.num_nodes(),
-                "nodes",
-            )
+            comptime if VERBOSE:
+                print(
+                    "[CUDA Graph] maybe_capture_replay captured",
+                    g.num_nodes(),
+                    "nodes",
+                )
             graph = g^
         elif graph.value().is_disabled():
             # Capture was never possible; the closure is the whole step.
