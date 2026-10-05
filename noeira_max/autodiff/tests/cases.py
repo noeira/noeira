@@ -239,6 +239,12 @@ INDEXING = Family(
              lambda o, w, i: o.gather(w, i, axis=0), lambda t, w, i: w[i]),
         Case("gather_axis1", (Arg((3, 7)), Arg(("n",), "int:7", diff=False)), (3, "n"),
              lambda o, w, i: o.gather(w, i, axis=1), lambda t, w, i: w[:, i]),
+        # Static index shapes take the spread scatter (8 and 2 table copies).
+        Case("gather_embedding_spread",
+             (Arg((7, 4)), Arg((8, 3), "int:7", diff=False)), (8, 3, 4),
+             lambda o, w, i: o.gather(w, i, axis=0), lambda t, w, i: w[i]),
+        Case("gather_axis1_spread", (Arg((3, 7)), Arg((6,), "int:7", diff=False)), (3, 6),
+             lambda o, w, i: o.gather(w, i, axis=1), lambda t, w, i: w[:, i]),
     ),
     # n > 7 draws repeated indices: the scatter must add, not overwrite.
     ({"n": 1, "t": 1}, {"n": 9, "t": 3}, {"n": 12, "t": 2}),

@@ -10,5 +10,7 @@ set -euo pipefail
 ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/../.." && pwd)"
 MAIN="$(dirname "$(git -C "$ROOT" rev-parse --path-format=absolute --git-common-dir)")"
 cd "$ROOT"
+# MAX manages its own CUDA (and its own graph capture): never under noeira's
+# CUDA interposer, which `pixi run` preloads on Linux.
 exec pixi run --manifest-path "$MAIN/pixi.toml" -e "${AUTODIFF_ENV:-default}" \
-    env PYTHONPATH="$ROOT${PYTHONPATH:+:$PYTHONPATH}" python "$@"
+    env -u LD_PRELOAD PYTHONPATH="$ROOT${PYTHONPATH:+:$PYTHONPATH}" python "$@"

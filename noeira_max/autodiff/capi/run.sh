@@ -24,5 +24,5 @@ noeira_max/autodiff/run.sh noeira_max/autodiff/capi/export_step.py "$OUT" --step
 pixi run --manifest-path "$MAIN/pixi.toml" -e "${AUTODIFF_ENV:-default}" bash -c '
     mojo build noeira_max/autodiff/capi/train_step.mojo -o "$0/train_step" \
         -Xlinker -L"$CONDA_PREFIX/lib" -Xlinker -lmax &&
-    "$0/train_step" "$0" "$1" > "$0/mojo.txt"' "$OUT" "$STEPS"
+    env -u LD_PRELOAD "$0/train_step" "$0" "$1" > "$0/mojo.txt"' "$OUT" "$STEPS"
 noeira_max/autodiff/run.sh noeira_max/autodiff/capi/compare.py "$OUT" "$STEPS"

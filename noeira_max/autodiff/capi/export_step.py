@@ -12,10 +12,11 @@ Writes, into OUT_DIR:
   ``--steps`` steps from the same bytes: one loss per line, then the median
   step time. The Mojo driver must reproduce the losses.
 
-    noeira_max/autodiff/run.sh noeira_max/autodiff/capi/export_step.py OUT_DIR [--tiny]
+    noeira_max/autodiff/run.sh noeira_max/autodiff/capi/export_step.py OUT_DIR [--tiny] [--device gpu]
 
 ``--tiny`` exports a one-buffer step (``b += x``) instead: the per-call floor
-of each driver, with no model in it.
+of each driver, with no model in it. ``--device gpu`` compiles the step for
+the accelerator; the Python reference then keeps every input on the device.
 """
 
 from __future__ import annotations
@@ -26,7 +27,7 @@ import time
 from pathlib import Path
 
 import numpy as np
-from max.driver import CPU, Buffer
+from max.driver import CPU, Accelerator, Buffer
 from max.dtype import DType
 from max.engine import InferenceSession
 from max.graph import BufferType, DeviceRef, Graph, TensorType, ops
@@ -93,6 +94,7 @@ def main() -> None:
     ap.add_argument("out", type=Path)
     ap.add_argument("--tiny", action="store_true")
     ap.add_argument("--steps", type=int, default=200)
+    ap.add_argument("--device", choices=["cpu", "gpu"], default="cpu")
     ap.add_argument("--layers", type=int, default=2)
     ap.add_argument("--dim", type=int, default=64)
     ap.add_argument("--heads", type=int, default=4)
@@ -101,9 +103,10 @@ def main() -> None:
     args = ap.parse_args()
     args.out.mkdir(parents=True, exist_ok=True)
 
-    dev = DeviceRef.CPU()
+    device = Accelerator() if args.device == "gpu" else CPU()
+    dev = DeviceRef.from_device(device)
     graph, inputs, counter = tiny_step(dev) if args.tiny else gpt_step(args, dev)
-    session = InferenceSession(devices=[CPU()])
+    session = InferenceSession(devices=[device])
     start = time.perf_counter()
     compiled = session.compile(graph)
     print(f"compiled in {time.perf_counter() - start:.1f} s", flush=True)
@@ -115,7 +118,7 @@ def main() -> None:
     model = session.init(compiled)
     print("inputs:", [s.name for s in model.input_metadata][:3], "...",
           f"({len(model.input_metadata)} in total)", flush=True)
-    buffers = [Buffer.from_numpy(np.array(a, copy=True)) for a in inputs]
+    buffers = [Buffer.from_numpy(np.array(a, copy=True)).to(device) for a in inputs]
     losses, times = [], []
     for _ in range(args.steps):
         start = time.perf_counter()

@@ -46,8 +46,10 @@ def main(out: Path, steps: int) -> int:
     print(f"MEF load from Mojo: {float(info.get('mef_load_ms', 'nan')):.1f} ms")
     if counter is not None:
         print(f"step counter read from Mojo's own memory: {counter} (in place across calls)")
-    print("capture:", info.get("capture_error") and f"error: {info['capture_error']}"
-          or f"ok, {info.get('capture_ok')}")
+    if "capture_error" in info:
+        print(f"capture: error: {info['capture_error']}")
+    elif "capture_ok" in info:
+        print(f"capture: ok, {info['capture_ok']}")
     for f in failures:
         print("FAIL:", f)
     return 1 if failures else 0

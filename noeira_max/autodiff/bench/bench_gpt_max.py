@@ -84,15 +84,16 @@ def main() -> None:
                layers=args.layers, dim=args.dim, batch=args.batch, seq=args.seq,
                dropout=args.dropout, build_s=build_s, compile_s=compiled.compile_seconds)
 
-    def run_steps(n: int) -> Buffer:
+    last: list[Buffer] = []  # the loss of the last step run, in either mode
+
+    def run_steps(n: int) -> None:
         if args.mode == "capture":
             for _ in range(n):
                 compiled.model.replay(CAPTURE_KEY, *inputs)
-            return outputs[0]
-        loss = None
+            last[:] = outputs[:1]  # every replay writes the captured outputs
+            return
         for _ in range(n):
-            loss = compiled(corpus_buffer)[0]
-        return loss
+            last[:] = compiled(corpus_buffer)[:1]
 
     # Warm up (the first execution, and the capture, happen here).
     first = compiled(corpus_buffer)[0].to_numpy().item()
@@ -102,7 +103,7 @@ def main() -> None:
     device.synchronize()
 
     start = time.perf_counter()
-    loss = run_steps(args.bench_steps)
+    run_steps(args.bench_steps)
     device.synchronize()
     elapsed = time.perf_counter() - start
     out["ms_per_step"] = 1000.0 * elapsed / args.bench_steps
@@ -116,10 +117,11 @@ def main() -> None:
         samples.append(1000.0 * (time.perf_counter() - t))
     out["median_synced_ms"] = statistics.median(samples)
     out["first_loss"] = first
-    out["loss"] = loss.to_numpy().item()
+    # The same step count in both modes: execute and capture must agree here.
+    out["loss"] = last[0].to_numpy().item()
     # The device counter proves the replays ran the step: anything short of
-    # the executions issued means a replay did nothing. In capture mode the
-    # capture itself may count as one more.
+    # the executions issued means a replay did nothing. (The capture itself
+    # records without running the step: on the 5090 both modes count 420/420.)
     out["steps_done"] = int(compiled.host_state()["step"].item())
     out["steps_issued"] = 1 + max(0, args.bench_steps - 1) + args.bench_steps + len(samples)
     print(f"steady train step {out['ms_per_step']:.3f} ms over {args.bench_steps} steps "
