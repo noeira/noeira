@@ -78,6 +78,8 @@ from max.gpu.host import DeviceBuffer, DeviceContext
 from noeira.core.run import RunContext, register_run
 from noeira.core.run_session import RunLogger, finish_run, run_logger
 from noeira.deep_agents.ppo import PPOAgent
+from noeira.deep_agents.training.driver_onpolicy import onpolicy_update_device
+from noeira.cuda import CUDAGraph
 from noeira.deep_agents.primitives.gaussian_head import GaussianHead
 from noeira.envs.phyics3d_batched_env import Phyics3dBatchedEnv
 from noeira.envs.phyics3d_env import Phyics3dEnvConfig
@@ -120,6 +122,13 @@ comptime N_ENVS = (
     4096 if is_defined["TASK_PPO_LANES_4096"]()
     else (256 if is_defined["TASK_PPO_LANES_256"]() else 1024)
 )
+# `-D TASK_PPO_TRAIN_GRAPH`: the K-epoch update through the trainer's device
+# path, one minibatch step captured into a CUDA graph and replayed
+# (`onpolicy_update_device`) — bit-identical to the eager update
+# (`tests/nn/test_ppo_train_graph_parity.mojo`). The lr / entropy schedules
+# change after every update and are kernel arguments, so the graph is dropped
+# after them and re-captured at the next update. Run through `pixi run`.
+comptime TRAIN_GRAPH = is_defined["TASK_PPO_TRAIN_GRAPH"]()
 comptime ROLLOUT = 16
 comptime N_MINIBATCHES = 32
 comptime MINIBATCH = N_ENVS * ROLLOUT // N_MINIBATCHES
@@ -921,6 +930,7 @@ def run_ppo[M: ModelDefLike, C: Phyics3dEnvConfig](
         var step = 0
         var it = 0
         var n_updates = 0
+        var train_graph: Optional[CUDAGraph] = None
         var t0 = perf_counter_ns()
         var next_ckpt = ckpt_every
         var ckpt_path = run.checkpoint_path(String("last"))
@@ -1126,7 +1136,14 @@ def run_ppo[M: ModelDefLike, C: Phyics3dEnvConfig](
             step += N_ENVS * repeat
             it += 1
             # 6. the update at the rollout boundary, then the schedules
-            if agent.trainer.train_step(step):
+            var updated: Bool
+            comptime if TRAIN_GRAPH:
+                updated = onpolicy_update_device[
+                    type_of(agent.trainer), True
+                ](agent.trainer, Optional(ctx), step, train_graph)
+            else:
+                updated = agent.trainer.train_step(step)
+            if updated:
                 n_updates += 1
                 var frac = 1.0 - Float64(n_updates) / Float64(max(n_updates_total, 1))
                 if frac < 0.0:
@@ -1136,6 +1153,8 @@ def run_ppo[M: ModelDefLike, C: Phyics3dEnvConfig](
                 agent.trainer.actor_train.set_entropy_coef(
                     Scalar[DT](ent1 + (ent0 - ent1) * frac)
                 )
+                # The new lr / entropy are kernel arguments: re-capture.
+                train_graph = None
                 # the window's success rate and return, per update
                 var n = len(hist_succ)
                 var lo = n - SUCCESS_WINDOW if n > SUCCESS_WINDOW else 0
