@@ -58,6 +58,7 @@ struct PPOActorTrainStep[
         ROLLOUT_LEN: Int,
         N_ENVS: Int,
         POLICY: AMPPolicy = NoAMP,
+        DEVICE_LOSS: Bool = False,
     ](
         mut self,
         mut state: OnPolicyState[
@@ -67,7 +68,9 @@ struct PPOActorTrainStep[
         mut actor_opt: Adam,
         max_grad_norm: Scalar[DT] = Scalar[DT](0.0),
     ) raises -> Scalar[DT]:
-        return self.inner.forward_backward[target, POLICY=POLICY](
+        return self.inner.forward_backward[
+            target, POLICY=POLICY, DEVICE_LOSS=DEVICE_LOSS
+        ](
             actor,
             actor_opt,
             state.mb_obs,

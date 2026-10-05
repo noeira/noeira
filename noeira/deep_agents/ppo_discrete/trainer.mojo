@@ -221,6 +221,11 @@ struct PPODiscreteTrainer[
     var _diag_clip: Tensor
     var _diag_ev: Tensor
     var _update_count: Int
+    var _device_update: Bool
+    """True once the update has run through the CUDA-graph surface
+    (`begin_update_device`): the losses then live on the device and the
+    networks re-pad their weights on every forward (`capture_recast`)."""
+    var _t_upd_start: Int
     var _total_train_steps: Int
 
     var timer: Timer
@@ -300,6 +305,8 @@ struct PPODiscreteTrainer[
         self._diag_ev = Tensor()
         self._update_count = 0
         self._total_train_steps = 0
+        self._device_update = False
+        self._t_upd_start = 0
         self.timer = Timer.new()
         self.ctx = None
 
@@ -692,6 +699,87 @@ struct PPODiscreteTrainer[
             self._diag_ev.lt["gpu", Layout.row_major(1)]()
         )
 
+    # ──────────────────────────────────────────────────────────────────
+    # CUDA-graph update surface (`USE_TRAIN_CUDA_GRAPH`, GPU only) — the
+    # `train_step` update split so the driver can capture one minibatch step
+    # and replay it. Same rollout gate, GAE, index resets and host shuffles
+    # (same RNG stream) as `train_step`; the minibatch work runs on device.
+    # ──────────────────────────────────────────────────────────────────
+
+    def begin_update_device(mut self, step_idx: Int) raises -> Bool:
+        _ = step_idx
+        comptime if Self.train_target != "gpu":
+            raise Error("begin_update_device: the CUDA-graph update is GPU-only")
+        if self.state.rollout_idx < Self.ROLLOUT_LEN:
+            return False
+        if not self._device_update:
+            # Under replay the optimizer's host version bump never runs, so the
+            # Linear weight caches must re-pad on EVERY forward (also the
+            # rollout's eager ones, which would otherwise keep the pad of the
+            # captured step's pre-update weights). Set once, kept on.
+            self.actor.set_attr["capture_recast"](Scalar[DT](1.0))
+            self.critic.set_attr["capture_recast"](Scalar[DT](1.0))
+            self._device_update = True
+
+        var t_gae = perf_counter_ns()
+        self.gae_step.step[
+            Self.train_target, 1, Self.MINIBATCH, Self.N_ENVS,
+        ](self.state, self.critic, self.gamma, self.gae_lambda)
+        self.timer.accumulate(Self._T_GAE, t_gae)
+
+        self._t_upd_start = perf_counter_ns()
+        self.gather_step.reset_indices[Self.train_target, Self.N_ENVS](
+            self.state
+        )
+        for epoch in range(Self.N_EPOCHS):
+            self.gather_step.shuffle_epoch[Self.train_target, Self.N_ENVS](
+                self.state
+            )
+            self.gather_step.stage_epoch_indices[Self.N_EPOCHS, Self.N_ENVS](
+                self.state, epoch
+            )
+        self.gather_step.upload_device_update[Self.N_EPOCHS, Self.N_ENVS](
+            self.state
+        )
+        return True
+
+    def minibatches_per_update(self) -> Int:
+        return Self.N_EPOCHS * Self.N_MINIBATCHES
+
+    def train_minibatch_device(mut self) raises:
+        """The captured step: gather + normalise, actor and critic updates
+        with device losses and device clipping, the device diagnostics, and
+        the minibatch counter. No host work, no sync."""
+        comptime if Self.train_target != "gpu":
+            raise Error("train_minibatch_device: GPU-only")
+        else:
+            self.gather_step.gather_device[Self.N_EPOCHS, Self.N_ENVS](
+                self.state
+            )
+            _ = self.actor_train.step[
+                Self.train_target, Self.ROLLOUT_LEN, Self.N_ENVS,
+                DEVICE_LOSS=True,
+            ](self.state, self.actor, self.actor_opt, self.max_grad_norm)
+            _ = self.critic_train.step[
+                Self.train_target, 1, Self.ROLLOUT_LEN, Self.N_ENVS,
+                DEVICE_LOSS=True,
+            ](self.state, self.critic, self.critic_opt, self.max_grad_norm)
+            self._accumulate_diag_gpu()
+            self.gather_step.advance_counter[Self.N_ENVS](self.state)
+
+    def note_minibatch_update(mut self):
+        self._update_count += 1
+        self._total_train_steps += 1
+
+    def end_update_device(mut self) raises:
+        # One sync per update so the "update" timer means what it does on the
+        # eager path (which synchronises every minibatch anyway).
+        self.ctx.value().synchronize()
+        self.timer.accumulate(Self._T_UPDATE, self._t_upd_start)
+        self.record_step.reset_rollout[
+            Self.train_target, Self.MINIBATCH, Self.N_ENVS,
+        ](self.state)
+
     def mean_return(self) -> Scalar[DT]:
         return self.tracker.mean_return()
 
@@ -732,9 +820,18 @@ struct PPODiscreteTrainer[
             kl_mean = self._kl_accum * inv
             clip_mean = self._clip_accum * inv
             ev_mean = self._ev_accum * inv
+        var policy_loss = self._actor_L_accum * inv
+        var critic_loss = self._critic_L_accum * inv
+        comptime if Self.train_target == "gpu":
+            if self._device_update:
+                # The CUDA-graph update keeps its losses on the device.
+                policy_loss = self.actor_train.inner.read_device_loss()
+                critic_loss = self.critic_train.read_device_loss(self.ctx)
+                self.actor_train.inner.reset_device_loss()
+                self.critic_train.reset_device_loss()
         var bundle = PPOMetrics(
-            policy_loss=LogScalar[DT](self._actor_L_accum * inv),
-            critic_loss=LogScalar[DT](self._critic_L_accum * inv),
+            policy_loss=LogScalar[DT](policy_loss),
+            critic_loss=LogScalar[DT](critic_loss),
             train_steps=LogScalar[DT](Scalar[DT](self._total_train_steps)),
             n_updates=LogScalar[DT](Scalar[DT](self._update_count)),
             entropy=LogScalar[DT](entropy_mean),

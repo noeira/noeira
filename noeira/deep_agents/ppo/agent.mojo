@@ -103,6 +103,7 @@ struct PPOAgent[
     def train[
         E: BatchedEnv,
         L: Logger = NoOpLogger,
+        USE_TRAIN_CUDA_GRAPH: Bool = False,
     ](
         mut self,
         mut env: E,
@@ -125,7 +126,9 @@ struct PPOAgent[
         `train_single()` instead.
 
         See `SACAgent.train_single` for `diag_every` / `checkpoint_*`
-        semantics.
+        semantics. `USE_TRAIN_CUDA_GRAPH` (GPU, NVIDIA): capture one minibatch
+        step of the K-epoch update into a CUDA graph and replay it (see
+        `_run_onpolicy_batched_body`); run through `pixi run`.
         """
         var ctx = self.trainer.state.ctx
         return run_onpolicy_train_batched[
@@ -136,6 +139,7 @@ struct PPOAgent[
             ],
             E,
             L,
+            USE_TRAIN_CUDA_GRAPH=USE_TRAIN_CUDA_GRAPH,
         ](
             ctx,
             self.trainer,

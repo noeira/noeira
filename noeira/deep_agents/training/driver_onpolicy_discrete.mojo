@@ -317,6 +317,7 @@ def run_onpolicy_discrete_train_batched[
     A: OnPolicyDiscreteAgentBatched,
     E: BatchedEnv,
     L: Logger = NoOpLogger,
+    USE_TRAIN_CUDA_GRAPH: Bool = False,
 ](
     ctx: Optional[DeviceContext],
     mut trainer: A,
@@ -378,7 +379,9 @@ def run_onpolicy_discrete_train_batched[
 
     # ONE shared loop body with the continuous batched driver — the
     # discrete action slot is just ACT ≡ 1 (one index-as-float per env).
-    return _run_onpolicy_batched_body[A, E, ACT, L](
+    return _run_onpolicy_batched_body[
+        A, E, ACT, L, USE_TRAIN_CUDA_GRAPH=USE_TRAIN_CUDA_GRAPH
+    ](
         ctx,
         trainer,
         env,

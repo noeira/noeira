@@ -22,6 +22,11 @@ Args (positional): [seed=1] [checkpoint_path=""] [max_env_steps=3000000]
     # CUDA
     pixi run -e nvidia mojo build -I . -D PPO_GPU examples/lunar_lander/ppo_lunar_lander_time_to_solve.mojo -o ppo_ll_gpu
     ./ppo_ll_gpu 1 ppo_ll_cuda_s1.ckpt
+    # CUDA, the K-epoch update captured into a CUDA graph (through pixi run:
+    # the CUDA interceptor must be preloaded, or the graph disables itself and
+    # the same device path runs eagerly)
+    pixi run -e nvidia mojo build -I . -D PPO_GPU -D PPO_TRAIN_GRAPH examples/lunar_lander/ppo_lunar_lander_time_to_solve.mojo -o ppo_ll_gpu_graph
+    pixi run ./ppo_ll_gpu_graph 1 ppo_ll_cuda_graph_s1.ckpt
 
 Render a checkpoint with `ppo_lunar_lander_render_gif.mojo`.
 """
@@ -46,6 +51,7 @@ from noeira.envs.lunar_lander import LunarLander
 
 
 comptime TARGET: StaticString = "gpu" if is_defined["PPO_GPU"]() else "cpu"
+comptime TRAIN_GRAPH = is_defined["PPO_TRAIN_GRAPH"]()
 
 comptime OBS_DIM = 8
 comptime N_ACTIONS = 4
@@ -115,7 +121,7 @@ def main() raises:
         ](ctx)
         ctx.synchronize()
         var t0 = perf_counter_ns()
-        _ = agent.train_batched(
+        _ = agent.train_batched[USE_TRAIN_CUDA_GRAPH=TRAIN_GRAPH](
             ctx, env, max_env_steps,
             rng_seed=UInt64(run_seed),
             print_every=50_000,
@@ -158,6 +164,7 @@ def main() raises:
     print("=" * 70)
     print(
         "RESULT backend=" + backend,
+        "train_graph=" + String(TRAIN_GRAPH),
         "seed=" + String(run_seed),
         "solved=" + String(solved),
         "wall_s=" + String(wall_s),

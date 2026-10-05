@@ -130,6 +130,7 @@ struct PPODiscreteAgent[
     def train_batched[
         E: BatchedEnv,
         L: Logger = NoOpLogger,
+        USE_TRAIN_CUDA_GRAPH: Bool = False,
     ](
         mut self,
         ctx: Optional[DeviceContext],
@@ -156,8 +157,15 @@ struct PPODiscreteAgent[
 
         `stop_at_mean_return` stops early once the windowed mean return
         reaches it with >= `stop_min_episodes` episodes done (see
-        `_run_onpolicy_batched_body`)."""
-        return run_onpolicy_discrete_train_batched[Self.TrainerT, E, L](
+        `_run_onpolicy_batched_body`).
+
+        `USE_TRAIN_CUDA_GRAPH` (GPU, NVIDIA): capture one minibatch step of
+        the K-epoch update into a CUDA graph and replay it (see
+        `_run_onpolicy_batched_body`). Run through `pixi run` so the CUDA
+        interceptor is preloaded."""
+        return run_onpolicy_discrete_train_batched[
+            Self.TrainerT, E, L, USE_TRAIN_CUDA_GRAPH=USE_TRAIN_CUDA_GRAPH
+        ](
             ctx,
             self.trainer,
             env,

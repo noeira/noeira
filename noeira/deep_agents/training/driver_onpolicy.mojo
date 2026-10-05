@@ -20,6 +20,8 @@ target consistently across env + trainer.
 from std.time import perf_counter_ns
 from max.gpu.host import DeviceContext, DeviceBuffer
 
+from noeira.cuda import CUDAGraph, maybe_capture_replay
+
 from noeira.core.logger import Logger, NoOpLogger
 from noeira.nn.constants import DT
 from noeira.utils.progress import IntervalProgress
@@ -375,6 +377,46 @@ trait OnPolicyBatchedCore(OnPolicyCheckpointable):
         unmarked (bootstrap kept)."""
         ...
 
+    # ─── CUDA-graph capture surface (`USE_TRAIN_CUDA_GRAPH`) ─────────────
+    #
+    # The K-epoch update split so the driver can capture ONE minibatch step
+    # and replay it: `begin_update_device` (host: GAE, the shuffles, one
+    # upload), then `minibatches_per_update()` x (`train_minibatch_device`
+    # captured/replayed + `note_minibatch_update` on the host), then
+    # `end_update_device`. Defaults raise: an agent that has not been
+    # migrated fails loudly instead of training without its update.
+
+    def begin_update_device(mut self, step_idx: Int) raises -> Bool:
+        """`train_step`'s rollout-boundary gate and everything before the
+        minibatch loop. False (nothing done) between boundaries."""
+        raise Error(
+            "begin_update_device: CUDA-graph capture not supported by this"
+            " on-policy agent (USE_TRAIN_CUDA_GRAPH must stay False)"
+        )
+
+    def minibatches_per_update(self) -> Int:
+        """`N_EPOCHS * N_MINIBATCHES` — captured-step replays per update."""
+        return 0
+
+    def train_minibatch_device(mut self) raises:
+        """One minibatch step, pure device kernels (no host work, no sync):
+        the body captured into the CUDA graph."""
+        raise Error(
+            "train_minibatch_device: CUDA-graph capture not supported by this"
+            " on-policy agent (USE_TRAIN_CUDA_GRAPH must stay False)"
+        )
+
+    def note_minibatch_update(mut self):
+        """Host bookkeeping for one replayed minibatch step."""
+        pass
+
+    def end_update_device(mut self) raises:
+        """After the last minibatch: what `train_step` does after its loop."""
+        raise Error(
+            "end_update_device: CUDA-graph capture not supported by this"
+            " on-policy agent (USE_TRAIN_CUDA_GRAPH must stay False)"
+        )
+
 
 trait OnPolicyAgentBatched(OnPolicyBatchedCore):
     """Continuous batched on-policy trait consumed by
@@ -397,6 +439,7 @@ def run_onpolicy_train_batched[
     A: OnPolicyAgentBatched,
     E: BatchedEnv,
     L: Logger = NoOpLogger,
+    USE_TRAIN_CUDA_GRAPH: Bool = False,
 ](
     ctx: Optional[DeviceContext],
     mut trainer: A,
@@ -475,7 +518,9 @@ def run_onpolicy_train_batched[
                 " env_target is 'gpu'"
             )
 
-    return _run_onpolicy_batched_body[A, E, ACT, L](
+    return _run_onpolicy_batched_body[
+        A, E, ACT, L, USE_TRAIN_CUDA_GRAPH=USE_TRAIN_CUDA_GRAPH
+    ](
         ctx,
         trainer,
         env,
@@ -499,6 +544,7 @@ def _run_onpolicy_batched_body[
     E: BatchedEnv,
     ACT: Int,
     L: Logger = NoOpLogger,
+    USE_TRAIN_CUDA_GRAPH: Bool = False,
 ](
     ctx: Optional[DeviceContext],
     mut trainer: A,
@@ -532,7 +578,16 @@ def _run_onpolicy_batched_body[
     `stop_min_episodes` episodes completed (pass the tracker's window
     size so the window holds real returns, not its initial fill) — the
     "solved" exit of a time-to-solve benchmark. The final checkpoint is
-    still written."""
+    still written.
+
+    `USE_TRAIN_CUDA_GRAPH` (GPU trainer): the K-epoch update runs through the
+    trainer's capture surface — one minibatch step captured into a CUDA graph
+    on the first update and replayed `minibatches_per_update()` times per
+    rollout, with the minibatch pool and indices uploaded once per rollout
+    instead of ten device syncs per minibatch. Needs the CUDA interceptor
+    (`pixi run`); without it the graph disables itself and the same device
+    path runs eagerly, so a run with and without it must match bit for bit.
+    On non-NVIDIA the device path runs eagerly (`maybe_capture_replay`)."""
     comptime env_target: StaticString = E.ENV_TARGET
     comptime OBS = A.AGENT_OBS_DIM
     comptime N_ENVS = A.AGENT_N_ENVS
@@ -571,6 +626,9 @@ def _run_onpolicy_batched_body[
         ckpt_enabled=checkpoint_path.byte_length() > 0,
     )
     var last_ep_count = trainer.ep_count()
+    # The captured minibatch step (`USE_TRAIN_CUDA_GRAPH`); None until the
+    # first update captures it.
+    var train_graph: Optional[CUDAGraph] = None
 
     while step_idx < total_env_steps:
         # ── 1. Snapshot env.obs_ptr() → prev_obs_h.
@@ -705,8 +763,22 @@ def _run_onpolicy_batched_body[
         step_idx += N_ENVS
         iter_idx += 1
 
-        # ── 8. Trainer update (returns True at K-epoch boundary).
-        _ = trainer.train_step(base_step + step_idx)
+        # ── 8. Trainer update (fires at the K-epoch boundary).
+        comptime if (
+            USE_TRAIN_CUDA_GRAPH and A.AGENT_TRAIN_TARGET == "gpu"
+        ):
+            if trainer.begin_update_device(base_step + step_idx):
+                var c = ctx.value()
+
+                def _minibatch() capturing raises -> None:
+                    trainer.train_minibatch_device()
+
+                for _ in range(trainer.minibatches_per_update()):
+                    maybe_capture_replay[_minibatch](train_graph, c)
+                    trainer.note_minibatch_update()
+                trainer.end_update_device()
+        else:
+            _ = trainer.train_step(base_step + step_idx)
 
         # Snapshot mean_return whenever an episode completes.
         var new_ep_count = trainer.ep_count()

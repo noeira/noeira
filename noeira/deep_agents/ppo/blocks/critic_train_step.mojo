@@ -56,6 +56,7 @@ struct PPOCriticTrainStep[
         ROLLOUT_LEN: Int,
         N_ENVS: Int,
         POLICY: AMPPolicy = NoAMP,
+        DEVICE_LOSS: Bool = False,
     ](
         mut self,
         mut state: OnPolicyState[
@@ -70,9 +71,19 @@ struct PPOCriticTrainStep[
         call_forward[target, MB, POLICY=POLICY](
             critic, TensorRefs[Self.CRITIC.ARITY](state.mb_obs), state.mb_v, state.ctx
         )
-        var loss = self.inner.forward[target, MB](
-            state.mb_v, state.mb_ret, state.ctx
-        )
+        # DEVICE_LOSS (GPU, CUDA-graph capture): the loss folds into the MSE
+        # block's device accumulator (`read_device_loss` at flush cadence) and 0
+        # is returned; otherwise the per-step host read.
+        var loss: Scalar[DT] = 0.0
+        comptime if DEVICE_LOSS:
+            comptime assert target == "gpu", "DEVICE_LOSS is GPU-only"
+            self.inner.forward_accumulate[target, MB](
+                state.mb_v, state.mb_ret, state.ctx
+            )
+        else:
+            loss = self.inner.forward[target, MB](
+                state.mb_v, state.mb_ret, state.ctx
+            )
         self.inner.vjp[target, MB](
             state.mb_v, state.mb_ret, state.mb_gv, state.ctx
         )
@@ -84,8 +95,23 @@ struct PPOCriticTrainStep[
             state.ctx,
         )
         if max_grad_norm > Scalar[DT](0.0):
-            _ = critic_opt.clip_grads[target, M=Self.CRITIC](
-                critic, max_grad_norm, state.ctx
-            )
+            comptime if DEVICE_LOSS:
+                critic_opt.clip_grads_device[target, M=Self.CRITIC](
+                    critic, max_grad_norm, state.ctx
+                )
+            else:
+                _ = critic_opt.clip_grads[target, M=Self.CRITIC](
+                    critic, max_grad_norm, state.ctx
+                )
         critic_opt.step[target, M=Self.CRITIC](critic, state.ctx)
         return loss
+
+    def read_device_loss(
+        mut self, ctx: Optional[DeviceContext]
+    ) raises -> Scalar[DT]:
+        """Mean of the `DEVICE_LOSS` minibatch losses since the last reset
+        (one D2H — flush cadence only)."""
+        return self.inner.read_accum["gpu"](ctx)
+
+    def reset_device_loss(mut self) raises:
+        self.inner.reset_accum["gpu"]()
