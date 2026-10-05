@@ -701,6 +701,12 @@ struct Trainer[
             comptime if Self.MADT != DT:
                 gxm = TensorImpl[Self.MADT].alloc_gpu(c, Self.BATCH * Self.IN)
 
+        comptime if Self.CAPTURE:
+            # Every version-gated weight cache (Linear's padded `w_pad`, the
+            # bf16 casts) refreshes on EVERY forward: a replay never bumps the
+            # host `version`, so the gate would let the eager eval after an
+            # epoch of replays read a cache one optimizer step stale.
+            self.model.set_attr["capture_recast"](Scalar[DT](1.0))
         for epoch in range(epochs):
             var t0 = perf_counter_ns()
             comptime if Self.CAPTURE:

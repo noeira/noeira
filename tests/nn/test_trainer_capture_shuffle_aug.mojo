@@ -120,9 +120,9 @@ def _run[
         print_progress=False, rng_seed=rng_seed, aug_seed=aug_seed,
     )
     save_params["gpu"](tr.model, "/tmp/trainer_cap_" + tag + ".ckpt", ctx)
-    print("  ", tag, "| loss", res.epoch_train_loss[0], "->",
-          res.epoch_train_loss[EPOCHS - 1], "| top-1",
-          res.epoch_test_top1[EPOCHS - 1])
+    for e in range(EPOCHS):
+        print("  ", tag, "| epoch", e, "| loss", res.epoch_train_loss[e],
+              "| top-1", res.epoch_test_top1[e])
     return res^
 
 

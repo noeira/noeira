@@ -13,7 +13,7 @@ Run (NVIDIA): pixi run -e nvidia mojo run -I . examples/nn/mlp/mlp_mnist_trainin
 from std.random import seed
 from std.testing import assert_true
 from std.time import perf_counter_ns
-from std.sys import is_defined
+from std.sys import get_defined_int, is_defined
 from max.gpu.host import DeviceContext
 
 from noeira.nn.datasets import MNIST
@@ -26,7 +26,8 @@ from noeira.nn.training.trainer import Trainer
 
 
 # `-D NN_TRAIN_GRAPH`: the training step captured in a CUDA graph (NVIDIA;
-# eager elsewhere). Needs `mojo build -D ...`, then run the binary.
+# eager elsewhere). `-D NN_EPOCHS=N` shortens the run (step timing). Needs
+# `mojo build -D ...`, then run the binary.
 comptime TRAIN_GRAPH = is_defined["NN_TRAIN_GRAPH"]()
 
 def main() raises:
@@ -35,7 +36,7 @@ def main() raises:
     comptime H2 = 128
     comptime NC = 10
     comptime BATCH = 100
-    comptime N_EPOCHS = 5
+    comptime N_EPOCHS = get_defined_int["NN_EPOCHS", 5]()
     comptime TARGET_ACC: Float64 = 0.97
 
     seed(42)

@@ -29,7 +29,7 @@ Run on NVIDIA:
 from std.random import seed
 from std.math import log, exp
 from std.time import perf_counter_ns
-from std.sys import is_defined
+from std.sys import get_defined_int, is_defined
 from max.gpu.host import DeviceContext
 
 from noeira.nn.datasets import CharTokenizer, load_text, train_val_split
@@ -57,7 +57,7 @@ comptime BASE_LR: Scalar[DT] = 1e-3
 comptime BETA2: Scalar[DT] = 0.99
 comptime WD: Scalar[DT] = 0.1
 
-comptime TOTAL_ITERS = 5000
+comptime TOTAL_ITERS = get_defined_int["NN_ITERS", 5000]()
 comptime WARMUP_ITERS = 100
 comptime EVAL_INTERVAL = 250
 comptime MIN_LR_SCALE: Float64 = 0.1
@@ -80,7 +80,8 @@ comptime GPT_MODEL = GPTDropTied[
 # `-D NN_TRAIN_GRAPH`: the training step captured in a CUDA graph (NVIDIA;
 # eager elsewhere). `-D NN_HOST_BATCH`: build each batch on the host (sample +
 # one-hot + upload) instead of on the device — the pre-device-batch baseline.
-# Defines need `mojo build -D ...`, then run the binary.
+# `-D NN_ITERS=N` shortens the run. Defines need `mojo build -D ...`, then
+# run the binary.
 comptime USE_CUDA_GRAPH = is_defined["NN_TRAIN_GRAPH"]()
 comptime DEVICE_BATCH = not is_defined["NN_HOST_BATCH"]()
 comptime GPT_AR = AutoregressiveTrainer[
