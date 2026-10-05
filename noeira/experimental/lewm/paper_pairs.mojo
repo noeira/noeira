@@ -16,6 +16,9 @@ same way — kept here once, not twice:
   * `video_frame`: the 512 canvas with the pair's own goal (for people);
   * `shift_frame`: AdaJEPA's E2 visual shifts — test-time perturbations of
     every observed frame, goal included;
+  * `DynShift`: E5 dynamics shifts — the env's physics changed at test time
+    (PD gains, contact friction, block sliding, action latency), images
+    untouched;
   * `tta_windows`: an episode's newest training windows, for adaptation.
 """
 
@@ -24,7 +27,7 @@ from std.random.philox import Random as PhiloxRandom
 from layout import Layout, LayoutTensor
 
 from noeira.nn.constants import DT
-from noeira.envs.pusht import PushTEnv
+from noeira.envs.pusht import PushTEnv, PConstants
 from noeira.envs.pusht.render_swm import render_pusht_swm_at, render_pusht_swm_canvas_goal
 
 
@@ -172,6 +175,63 @@ def shift_frame(
         for i in range(n):
             var v = Float64(hwc[off + i]) + shift.strength * 255.0 * Float64(z[i])
             hwc[off + i] = Scalar[DT](min(255.0, max(0.0, v)))
+
+
+# ── E5: dynamics shifts ───────────────────────────────────────────────────
+
+
+@fieldwise_init
+struct DynShift(Copyable, Movable, Writable):
+    """A test-time change of PushT's physics; the frames are untouched, so
+    the encoder and the cost landscape are not — only the transitions.
+
+      kp:s / kv:s   scale the agent's PD gains (100 / 20): `kp:0.25,kv:0.5`
+                    is a sluggish agent — the SO-101's slow real jaw;
+      friction:f    contact friction (the reference PushT is frictionless);
+      slide:r       the T's per-second velocity retention (0 = stops dead
+                    when released, the reference): the block coasts;
+      delay:n       the commanded target reaches the agent n env steps late
+                    (servo latency; the first n steps hold position)."""
+
+    var kp_scale: Float64
+    var kv_scale: Float64
+    var friction: Float64
+    var slide: Float64
+    var delay: Int
+
+    @staticmethod
+    def parse(spec: String) raises -> Self:
+        """`none`, or `key:value` pairs joined by commas."""
+        var d = Self(1.0, 1.0, 0.0, 0.0, 0)
+        if spec == "none":
+            return d^
+        for kv in spec.split(","):
+            var parts = String(kv).split(":")
+            if len(parts) != 2:
+                raise Error("--dyn: expected key:value, got " + String(kv))
+            var key = String(parts[0])
+            var v = Float64(String(parts[1]))
+            if key == "kp":
+                d.kp_scale = v
+            elif key == "kv":
+                d.kv_scale = v
+            elif key == "friction":
+                d.friction = v
+            elif key == "slide":
+                d.slide = v
+            elif key == "delay":
+                d.delay = Int(v)
+            else:
+                raise Error("--dyn: unknown key " + key + " (kp kv friction slide delay)")
+        return d^
+
+    def apply(self, mut env: PairEnv):
+        env.set_dynamics(
+            Scalar[DType.float32](PConstants.K_P * self.kp_scale),
+            Scalar[DType.float32](PConstants.K_V * self.kv_scale),
+            Scalar[DType.float32](self.friction),
+            Scalar[DType.float32](self.slide),
+        )
 
 
 # ── test-time adaptation windows ──────────────────────────────────────────

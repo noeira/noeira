@@ -48,7 +48,9 @@ last 3/9, all:2 8/9, staged 9/9, R 5 9/9); `--budget` env steps;
 (AdaJEPA's `detach_tgt`; LeWM itself trains without — only matters when the
 encoder adapts);
 `--shift none | noise:σ | dark:gain | swap` (E2: applied to EVERY observed
-frame, the dataset start and goal frames included); `--arms both | frozen |
+frame, the dataset start and goal frames included); `--dyn` an E5 dynamics
+shift (`DynShift`: `kp:s,kv:s` sluggish agent, `friction:f`, `slide:r`
+coasting block, `delay:n` action latency — physics only, frames untouched); `--arms both | frozen |
 adapt`.
 
     pixi run -e nvidia mojo run -I . examples/lewm/lewm_pusht_adajepa.mojo \\
@@ -75,7 +77,7 @@ from noeira.experimental.lewm.ref_trainer import (
 )
 from noeira.experimental.lewm.paper_pairs import (
     PairEnv, PAIR_HW, imagenet_from_hwc255, render_frame, gauss,
-    VisualShift, shift_frame, tta_windows, pair_margin,
+    VisualShift, shift_frame, tta_windows, pair_margin, DynShift,
 )
 
 
@@ -105,6 +107,7 @@ struct Cfg(Copyable, Movable):
     var keep: List[String]
     var touches_encoder: Bool
     var shift: VisualShift
+    var dyn: DynShift
     var seed: UInt64
 
 
@@ -182,6 +185,13 @@ def _episode(
     var out = Outcome(False, 0, 0, 0.0, 0.0, 0, 1e9)
     var step = 0
     var init = List[Scalar[DT]](length=A, fill=Scalar[DT](0))
+    # E5 action latency: commanded targets wait `delay` env steps (hold first)
+    var pend_x = List[Float64]()
+    var pend_y = List[Float64]()
+    var ag0 = env.agent_pos()
+    for _ in range(cfg.dyn.delay):
+        pend_x.append(Float64(ag0[0]))
+        pend_y.append(Float64(ag0[1]))
     while step < cfg.budget:
         var start_emb = encode_ref[TARGET, 1](enc, imagenet_from_hwc255(frames[len(frames) - 1], 0), ctx)
         var mean = init.copy()
@@ -208,9 +218,11 @@ def _episode(
                 block.append(Scalar[DT]((ax - Float64(a_mean[0])) / Float64(a_std_train[0])))
                 block.append(Scalar[DT]((ay - Float64(a_mean[1])) / Float64(a_std_train[1])))
                 var ag = env.agent_pos()
+                pend_x.append(Float64(ag[0]) + 100.0 * ax)
+                pend_y.append(Float64(ag[1]) + 100.0 * ay)
                 _ = env.step(PushTAction[DType.float32](
-                    Scalar[DType.float32](Float64(ag[0]) + 100.0 * ax),
-                    Scalar[DType.float32](Float64(ag[1]) + 100.0 * ay),
+                    Scalar[DType.float32](pend_x.pop(0)),
+                    Scalar[DType.float32](pend_y.pop(0)),
                 ))
                 step += 1
                 var mg = pair_margin(env, goal_state, e)
@@ -268,6 +280,7 @@ def main() raises:
     var stop_grad_target = False
     var lam = 0.09
     var shift_spec = String("none")
+    var dyn_spec = String("none")
     var args = argv()
     var i = 1
     while i < len(args):
@@ -306,6 +319,8 @@ def main() raises:
             tta_bn = String(args[i + 1]); i += 1
         elif a == "--lambda":
             lam = Float64(String(args[i + 1])); i += 1
+        elif a == "--dyn":
+            dyn_spec = String(args[i + 1]); i += 1
         elif a == "--shift":
             shift_spec = String(args[i + 1]); i += 1
         else:
@@ -323,7 +338,7 @@ def main() raises:
         if k.startswith("emb."):
             touches_enc = True
     var cfg = Cfg(receding, warm_start, PlanCost.parse(cost_spec), budget, tta_steps, adam == "per-adapt", tta_bn == "train", stop_grad_target, keep^, touches_enc,
-                  VisualShift.parse(shift_spec), seed)
+                  VisualShift.parse(shift_spec), DynShift.parse(dyn_spec), seed)
     var run_frozen = arms == "both" or arms == "frozen"
     var run_adapt = arms == "both" or arms == "adapt"
 
@@ -351,7 +366,7 @@ def main() raises:
     var base = tr.export_params(List[String](), True)
     print("AdaJEPA on", dump, ":", n_eps, "pairs from", first_pair, "; receding", receding, "warm" if warm_start else "cold", "cost", cost_spec,
           "budget", budget, "; subset", subset, "(", len(cfg.keep), "prefixes ) lr", tta_lr,
-          "steps", tta_steps, "Adam", adam, "BN", tta_bn, "stop-grad target" if stop_grad_target else "", "lambda", lam, "; shift", shift_spec,
+          "steps", tta_steps, "Adam", adam, "BN", tta_bn, "stop-grad target" if stop_grad_target else "", "lambda", lam, "; shift", shift_spec, "; dyn", dyn_spec,
           "; base snapshot", len(base.names), "tensors")
 
     var n_ok = List[Int](length=2, fill=0)
@@ -373,6 +388,7 @@ def main() raises:
                 agent_vy=Scalar[DType.float32](start_state[e * 7 + 6]),
                 settle=True,
             )
+            cfg.dyn.apply(env)
             if arm == 1:
                 tr.reset_optimizer()
             var t0 = perf_counter_ns()
