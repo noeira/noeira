@@ -26,6 +26,7 @@ from ..primitives.attention import (
     ScaledDotProductAttention, ScaledDotProductAttentionQKV,
 )
 from ..primitives.qkv_to_major import QKVToMajor
+from ..primitives.feed_forward_gelu import FeedForwardGELU
 from ..combinators.sequential import Sequential
 from ..combinators.residual import Residual
 from ..combinators.tokenwise import Tokenwise
@@ -106,7 +107,9 @@ comptime TransformerBlock[
 ]
 
 
-# TransformerBlockFused: `TransformerBlock` on `MultiHeadAttentionFused`.
+# TransformerBlockFused: `TransformerBlock` on `MultiHeadAttentionFused` and
+# `FeedForwardGELU` (the FFN as one module: cuBLASLt GELU epilogues on NVIDIA).
+# Same parameters as `TransformerBlock`; different child paths.
 comptime TransformerBlockFused[
     dim: Int, n_heads: Int, seq_len: Int, ff_dim: Int, causal: Bool = False,
     use_max: Bool = True, ADT: DType = DT,
@@ -120,7 +123,7 @@ comptime TransformerBlockFused[
     Residual[
         Sequential[
             Tokenwise[seq_len, LayerNorm[dim, ADT]],
-            TransformerFFN[seq_len, dim, ff_dim, ADT],
+            FeedForwardGELU[seq_len, dim, ff_dim, ADT],
         ]
     ],
 ]

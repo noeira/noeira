@@ -21,3 +21,4 @@ tests/nn/test_attention_gpu_shapes.mojo
 tests/nn/test_layer_norm_dparams_gpu.mojo
 tests/nn/test_layer_norm_storage.mojo
 tests/nn/test_linear_dw_gpu.mojo
+tests/nn/test_feed_forward_gelu.mojo

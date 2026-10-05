@@ -37,7 +37,7 @@ GPTDropTied child tree (for the surgery walks):
             [0] Residual(LN + MHADrop) ; .inner.children[1] = MHADrop =
                   Seq[Tok[Lin d,3d], AttnQKV, Tok[Lin d,d]@[2], Dropout]
             [1] Residual(LN + FFNDrop) ; .inner.children[1] = FFNDrop =
-                  Seq[Tok[Lin d,ff], GELU, Tok[Lin ff,d]@[2], Dropout]
+                  Seq[FeedForwardGELU (.fc2 = Lin ff,d), Dropout]
     [4] Tokenwise[LayerNorm]
     [5] Tokenwise[TiedLinear]     ← LM head (borrows [0]) ; = N-1
 """
@@ -52,11 +52,11 @@ from ..core.tensor import Tensor
 from ..primitives.linear import Linear
 from ..primitives.tied_linear import TiedLinear
 from ..primitives.layer_norm import LayerNorm
-from ..primitives.activations import GELUTanh
 from ..primitives.embedding import Embedding
 from ..primitives.bias_add import BiasAdd
 from ..primitives.attention import ScaledDotProductAttentionQKV
 from ..primitives.dropout import Dropout
+from ..primitives.feed_forward_gelu import FeedForwardGELU
 from ..combinators.sequential import Sequential
 from ..combinators.residual import Residual
 from ..combinators.repeat import Repeat
@@ -123,9 +123,7 @@ comptime TransformerFFNDrop[
     seq_len: Int, dim: Int, ff_dim: Int, dropout_p: Float64, seed: UInt64,
     ADT: DType = DT,
 ] = Sequential[
-    Tokenwise[seq_len, Linear[dim, ff_dim, ADT]],
-    GELUTanh[seq_len * ff_dim, ADT],
-    Tokenwise[seq_len, Linear[ff_dim, dim, ADT]],
+    FeedForwardGELU[seq_len, dim, ff_dim, ADT],
     Dropout[seq_len * dim, dropout_p, seed, ADT],
 ]
 
@@ -304,10 +302,10 @@ def gpt_scale_residual_proj[
             ctx,
         )
         # FFN-out c_proj: block.children[1] (Residual) .inner.children[1]
-        # (FFNDrop) .children[2] (Tok[Lin ff,d]) .inner.weight
+        # (FFNDrop) .children[0] (FeedForwardGELU) .fc2 (Lin ff,d) .weight
         _gpt_scale_weight[target, FD](
             net.children[3].children[L].children[1]
-            .inner.children[1].children[2].inner.weight.val,
+            .inner.children[1].children[0].fc2.weight.val,
             s,
             ctx,
         )
