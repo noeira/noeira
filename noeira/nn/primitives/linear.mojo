@@ -22,7 +22,8 @@ first binds the element to a named `ref` (`ref in0 = inputs[0]`) that lives for
 the whole function, then builds views from that.
 """
 
-from noeira.nn.core.mm import mm, bmm
+from noeira.nn.core.mm import mm, mm_bias, bmm
+from std.sys import has_nvidia_gpu_accelerator
 from std.sys import CompilationTarget
 from max.gpu import global_idx, thread_idx, block_idx
 from max.gpu.sync import barrier
@@ -895,8 +896,35 @@ struct Linear[IN_: Int, OUT_: Int, ADT: DType = DT](Module):
                             block_dim=256,
                         )
                     else:
-                        mm[A0=B, A1=Self.K_PAD, B0=Self.K_PAD, B1=Self.N_PAD, O0=B, O1=Self.OUT_](
-                            outd.dev.value(), self.x_pad.dev.value() if Self.NEEDS_PAD else in0d.dev.value(), self.w_pad.dev.value(), c
+                        comptime if has_nvidia_gpu_accelerator():
+                            # Bias in the GEMM epilogue (`mm_bias`): one launch.
+                            mm_bias[A0=B, A1=Self.K_PAD, B0=Self.K_PAD, B1=Self.N_PAD, O0=B, O1=Self.OUT_](
+                                outd.dev.value(), self.x_pad.dev.value() if Self.NEEDS_PAD else in0d.dev.value(), self.w_pad.dev.value(), bl, c
+                            )
+                        else:
+                            mm[A0=B, A1=Self.K_PAD, B0=Self.K_PAD, B1=Self.N_PAD, O0=B, O1=Self.OUT_](
+                                outd.dev.value(), self.x_pad.dev.value() if Self.NEEDS_PAD else in0d.dev.value(), self.w_pad.dev.value(), c
+                            )
+                            c.enqueue_function[_bias_add_kernel[DT]](
+                                outd.dev.value(),
+                                bl,
+                                Int64(B),
+                                Int64(Self.OUT_),
+                                grid_dim=(B * Self.OUT_ + 255) // 256,
+                                block_dim=256,
+                            )
+                else:
+                    comptime if has_nvidia_gpu_accelerator():
+                        mm_bias[A0=B, A1=Self.IN_, B0=Self.IN_, B1=Self.OUT_, O0=B, O1=Self.OUT_](
+                            outd.dev.value(), in0d.dev.value(),
+                            self.weight.val.dev.value(), bl, c,
+                        )
+                    else:
+                        _gemm_bkn[B, Self.IN_, Self.OUT_](
+                            outd.dev.value(),
+                            in0d.dev.value(),
+                            self.weight.val.dev.value(),
+                            c,
                         )
                         c.enqueue_function[_bias_add_kernel[DT]](
                             outd.dev.value(),
@@ -906,21 +934,6 @@ struct Linear[IN_: Int, OUT_: Int, ADT: DType = DT](Module):
                             grid_dim=(B * Self.OUT_ + 255) // 256,
                             block_dim=256,
                         )
-                else:
-                    _gemm_bkn[B, Self.IN_, Self.OUT_](
-                        outd.dev.value(),
-                        in0d.dev.value(),
-                        self.weight.val.dev.value(),
-                        c,
-                    )
-                    c.enqueue_function[_bias_add_kernel[DT]](
-                        outd.dev.value(),
-                        bl,
-                        Int64(B),
-                        Int64(Self.OUT_),
-                        grid_dim=(B * Self.OUT_ + 255) // 256,
-                        block_dim=256,
-                    )
         else:
             # ── bf16-flow path (GPU-only) ──
             comptime assert target == "gpu", "bf16-flow Linear is GPU-only"
