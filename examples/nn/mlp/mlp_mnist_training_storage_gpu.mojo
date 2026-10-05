@@ -13,6 +13,7 @@ Run (NVIDIA): pixi run -e nvidia mojo run -I . examples/nn/mlp/mlp_mnist_trainin
 from std.random import seed
 from std.testing import assert_true
 from std.time import perf_counter_ns
+from std.sys import is_defined
 from max.gpu.host import DeviceContext
 
 from noeira.nn.datasets import MNIST
@@ -23,6 +24,10 @@ from noeira.nn.primitives.linear_relu import LinearReLU
 from noeira.nn.combinators.sequential import Sequential
 from noeira.nn.training.trainer import Trainer
 
+
+# `-D NN_TRAIN_GRAPH`: the training step captured in a CUDA graph (NVIDIA;
+# eager elsewhere). Needs `mojo build -D ...`, then run the binary.
+comptime TRAIN_GRAPH = is_defined["NN_TRAIN_GRAPH"]()
 
 def main() raises:
     comptime IN_DIM = 784
@@ -44,7 +49,9 @@ def main() raises:
         Linear[H2, NC],
     ]
     print("initializing network (GPU)...")
-    var trainer = Trainer[Net, NC, IN_DIM, BATCH, "gpu"].make[Kaiming](
+    var trainer = Trainer[
+        Net, NC, IN_DIM, BATCH, "gpu", USE_TRAIN_CUDA_GRAPH=TRAIN_GRAPH
+    ].make[Kaiming](
         Optional(c), lr=1e-3
     )
 

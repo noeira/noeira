@@ -1,0 +1,15 @@
+# nn training-driver GPU manifest — `pixi run -e apple test-nn-gpu` (or -e nvidia)
+#
+# The trainers the nn examples (MNIST / CIFAR / ResNet / ViT / GPT) run
+# through. Nothing gated a GPT on the GPU before this manifest: `Embedding`'s
+# GPU forward stopped compiling with `49a56a667` (2026-10-02) and no test saw it.
+
+# --- AutoregressiveTrainer (the TinyShakespeare GPT driver) ---
+tests/nn/test_window_batch_device.mojo
+tests/nn/test_storage_autoregressive_trainer_smoke.mojo
+tests/nn/test_amp_autoregressive_trainer_bf16.mojo
+tests/nn/test_amp_gpt_bf16.mojo
+
+# --- Trainer.train_gpu (MNIST / CIFAR / ResNet / ViT driver) ---
+tests/nn/test_storage_trainer_augment_schedule_smoke.mojo
+tests/nn/test_trainer_capture_shuffle_aug.mojo

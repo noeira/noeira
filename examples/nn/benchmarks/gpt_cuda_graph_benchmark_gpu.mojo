@@ -1,20 +1,25 @@
-"""GPT CUDA-graph throughput benchmark — capture vs eager (NVIDIA).
+"""GPT training throughput — batch build (host / device) x step (eager / graph).
 
 Times steady-state next-token training throughput of the `AutoregressiveTrainer`
-with `USE_TRAIN_CUDA_GRAPH` OFF (eager: one `cuLaunchKernel` per primitive,
-~hundreds/step) vs ON (the per-step device compute is captured once and replayed
-as a single `cuGraphLaunch`/step). The data-build (host window sample + one-hot +
-resident upload) and the cosine-LR push stay eager in BOTH modes, so this
-isolates the kernel-launch-overhead win from the capture.
+on four columns:
+
+  - batch build: HOST (`make_batch` + one-hot on the CPU + a resident upload
+    that waits for the previous copy) or DEVICE (`DEVICE_BATCH`: the corpus
+    resident as int32, windows drawn and one-hot written by a kernel);
+  - step: EAGER (one launch per primitive, ~hundreds per step, plus a loss
+    read-back each step) or GRAPH (`USE_TRAIN_CUDA_GRAPH`: the device compute
+    captured once and replayed — with DEVICE, the batch build is inside it).
+
+host/eager is the trainer before the device batch; device/graph is the step
+with no host work at all but the cosine-LR push.
 
 Each mode: build the GPT, run BENCH_ITERS as warmup (the capture mode captures
 the graph on the first step), synchronize, then time a second BENCH_ITERS of
-pure training (no eval). Steps/s + speedup are printed. The two models are built
+pure training (no eval). Steps/s + speedup are printed. The models are built
 SEQUENTIALLY (each dies before the next) so peak memory == one model.
 
-⚠️ Capture is fp32-only (this GPT is fp32) and NVIDIA-only for real capture; on
-non-NVIDIA `maybe_capture_replay` runs eagerly so both columns are the eager
-path (speedup ≈ 1.0). On NVIDIA, whether capture wins depends on how
+⚠️ Real capture is NVIDIA-only; on non-NVIDIA `maybe_capture_replay` runs
+eagerly, so each graph column repeats its eager one. On NVIDIA, whether capture wins depends on how
 launch-bound the config is (smaller BATCH/seq = more launch-bound = bigger win).
 
 Run on NVIDIA:
@@ -62,14 +67,14 @@ comptime GPT_MODEL = GPTDropTied[
 
 
 def bench[
-    CAP: Bool
+    CAP: Bool, DEV: Bool
 ](ctx: DeviceContext, ref text: String) raises -> Float64:
     """Build the GPT once, warm up BENCH_ITERS (captures the graph when CAP),
     then time a second BENCH_ITERS of pure training. Returns steps/s. The
     trainer is destroyed at return so the next mode peaks at one model."""
     comptime AR = AutoregressiveTrainer[
         GPT_MODEL, AdamW, VOCAB, SEQ, BATCH, target="gpu",
-        USE_TRAIN_CUDA_GRAPH=CAP,
+        USE_TRAIN_CUDA_GRAPH=CAP, DEVICE_BATCH=DEV,
     ]
     var tok = CharTokenizer(text)
     var ids = tok.encode(text)
@@ -106,7 +111,7 @@ def bench[
 def main() raises:
     seed(42)
     print("=" * 70)
-    print("GPT CUDA-graph throughput benchmark — capture vs eager")
+    print("GPT training throughput — batch build x step")
     print("=" * 70)
     print(
         "  vocab=" + String(VOCAB) + " seq=" + String(SEQ)
@@ -125,16 +130,19 @@ def main() raises:
     # its own `bench` scope), so peak memory is still one model.
     var ctx = DeviceContext()
 
-    print("[bench] eager (USE_TRAIN_CUDA_GRAPH=False) ...")
-    var eager_sps = bench[False](ctx, text)
-    print("  eager:   " + String(eager_sps) + " steps/s")
-
-    print("[bench] capture (USE_TRAIN_CUDA_GRAPH=True) ...")
-    var cap_sps = bench[True](ctx, text)
-    print("  capture: " + String(cap_sps) + " steps/s")
-
-    print(
-        "\n  speedup (capture / eager) = "
-        + String(cap_sps / eager_sps) + "x"
-    )
+    var he = bench[False, False](ctx, text)
+    print("  host batch,   eager: " + _row(he, he))
+    var hg = bench[True, False](ctx, text)
+    print("  host batch,   graph: " + _row(hg, he))
+    var de = bench[False, True](ctx, text)
+    print("  device batch, eager: " + _row(de, he))
+    var dg = bench[True, True](ctx, text)
+    print("  device batch, graph: " + _row(dg, he))
     print("=" * 70)
+
+
+def _row(sps: Float64, base: Float64) -> String:
+    return (
+        String(sps) + " steps/s | " + String(1000.0 / sps) + " ms/step | "
+        + String(sps / base) + "x host/eager"
+    )

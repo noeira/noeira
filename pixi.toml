@@ -337,6 +337,7 @@ test-swm = { cmd = "bash scripts/run_tests.sh tests/manifests/swm.txt", descript
 test-fb = { cmd = "bash scripts/run_tests.sh tests/manifests/fb.txt", description = "Forward-Backward zero-shot RL gates (CPU; docs/BFM_ZERO_SHOT_RL.md)" }
 test-lewm = { cmd = "bash scripts/run_tests.sh tests/manifests/lewm.txt", description = "LeWorldModel port self-consistency (experimental, CPU, toy dims)" }
 test-lewm-gpu = { cmd = "bash scripts/run_tests.sh tests/manifests/lewm-gpu.txt", description = "LeWorldModel port GPU paths, toy dims (needs -e apple or -e nvidia)" }
+test-nn-gpu = { cmd = "bash scripts/run_tests.sh tests/manifests/nn-gpu.txt", description = "nn training drivers on the GPU: the GPT / classifier trainers the nn examples run through (needs -e apple or -e nvidia)" }
 # ⚠ The torch steps run WITHOUT the task's LD_PRELOAD: on Linux this project's
 # activation preloads `noeira/cuda/libcuda_intercept.so` (a dlsym hook), every
 # process of the task inherits it, and the CUDA build of torch in act-ref then

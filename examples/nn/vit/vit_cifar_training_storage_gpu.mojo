@@ -14,6 +14,7 @@ Run (NVIDIA): pixi run -e nvidia mojo run -I . examples/nn/vit/vit_cifar_trainin
 from std.random import seed
 from std.testing import assert_true
 from std.time import perf_counter_ns
+from std.sys import is_defined
 from max.gpu.host import DeviceContext
 
 from noeira.nn.datasets import CIFAR10
@@ -41,6 +42,9 @@ comptime IN_DIM = IN_CHANNELS * IMG_H * IMG_W
 comptime BATCH = 128
 comptime EPOCHS = 100
 comptime WARMUP_EPOCHS = 5
+# `-D NN_TRAIN_GRAPH`: the training step captured in a CUDA graph (NVIDIA;
+# eager elsewhere). Needs `mojo build -D ...`, then run the binary.
+comptime TRAIN_GRAPH = is_defined["NN_TRAIN_GRAPH"]()
 comptime BASE_LR: Scalar[DT] = 3e-4
 comptime WD: Scalar[DT] = 0.05
 
@@ -66,7 +70,8 @@ def main() raises:
 
     print("[init] building storage ViT on GPU...")
     var trainer = Trainer[
-        VIT_MODEL, NC, IN_DIM, BATCH, "gpu", OPT=AdamW
+        VIT_MODEL, NC, IN_DIM, BATCH, "gpu", OPT=AdamW,
+        USE_TRAIN_CUDA_GRAPH=TRAIN_GRAPH,
     ].make[Kaiming](Optional(c), lr=BASE_LR)
     # AdamW = storage Adam with decoupled weight decay; scalars read fresh each
     # step, so setting them post-make (after arena adopt) is fine.

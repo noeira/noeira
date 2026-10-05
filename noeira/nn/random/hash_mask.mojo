@@ -16,14 +16,21 @@ from std.random import random_ui64
 
 
 @always_inline
-def hash_keep(seed: UInt64, ctr: UInt64, idx: UInt64, p: Float32) -> Bool:
+def hash_u64(seed: UInt64, ctr: UInt64, idx: UInt64) -> UInt64:
+    """The 64 hashed bits of (seed, ctr, idx) — the draw every counter-hash
+    consumer (dropout masks, the device window sampler) reads."""
     var x = seed ^ (ctr * UInt64(0x9E3779B97F4A7C15)) ^ (idx * UInt64(0xD1B54A32D192ED03))
     x ^= x >> 30
     x *= UInt64(0xBF58476D1CE4E5B9)
     x ^= x >> 27
     x *= UInt64(0x94D049BB133111EB)
     x ^= x >> 31
-    var u = Float32(x >> 40) * Float32(1.0 / 16777216.0)
+    return x
+
+
+@always_inline
+def hash_keep(seed: UInt64, ctr: UInt64, idx: UInt64, p: Float32) -> Bool:
+    var u = Float32(hash_u64(seed, ctr, idx) >> 40) * Float32(1.0 / 16777216.0)
     return u >= p
 
 

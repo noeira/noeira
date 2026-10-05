@@ -38,6 +38,9 @@ from .shuffle_kernels import (
     fisher_yates_shuffle_kernel,
     increment_seed_kernel,
     gather_rows_kernel,
+    gather_rows_at_counter_kernel,
+    advance_counter_kernel,
+    reset_counter_kernel,
 )
 from .augmenter import Augmenter, IdentityAugmenter
 from ..optimizer.lr_scheduler import Scheduler, ConstantSchedule
@@ -82,11 +85,11 @@ struct Trainer[
     MODEL: Module, NC: Int, IN: Int, BATCH: Int, target: StaticString,
     POLICY: AMPPolicy = NoAMP,
     OPT: Optimizer = Adam,
-    # Opt-in CUDA-graph capture of the per-batch DEVICE compute (zero_grad →
-    # forward → CE accumulate → vjp → opt.step). The batch-build (the
-    # contiguous-slice D2D copy into FIXED owned `batch_x`/`batch_y`) stays
-    # eager; the captured graph reads those fixed buffers and replays. fp32-only
-    # + contiguous-sweep only (no shuffle/aug under capture in this pass).
+    # Opt-in CUDA-graph capture of the per-batch step: the batch gather into
+    # the FIXED owned `batch_x`/`batch_y` (offset from a device counter, so
+    # one capture serves every batch), zero_grad → forward → CE accumulate →
+    # vjp → opt.step. The per-epoch augmentation and shuffle run eagerly in
+    # place before the epoch's replays. fp32-only.
     # Default OFF — anything that ALLOCATES inside the captured region aborts
     # stream capture on NVIDIA. The dW GEMMs of Linear/Conv2D own their split-K
     # workspace now, but only where MAX's split-K dispatch applies (sm_80 /
@@ -337,18 +340,15 @@ struct Trainer[
             block_dim=TPB,
         )
 
-    # ── CUDA-graph capture path (compute-only, fp32, contiguous sweep) ──────
+    # ── CUDA-graph capture path (fp32): gather + compute, one graph ─────────
 
     def _compute_step_device(
         mut self, ctx: Optional[DeviceContext]
     ) raises:
-        """The PURE-DEVICE per-batch compute captured into the graph: zero_grad →
-        forward → CE accumulate → CE vjp → model.vjp → opt.step, reading the
-        FIXED owned `batch_x`/`batch_y` (the caller D2D-copies each batch's slice
-        into them eagerly before the replay). fp32-only (reaching here ⇒
-        `CAPTURE` ⇒ `MADT == DT`); the CE loss folds into the device accumulator,
-        drained at epoch end via `read_accum`. Must enqueue the SAME kernel
-        sequence every call (the captured graph stays valid on replay)."""
+        """The device compute of one batch: zero_grad → forward → CE accumulate
+        → CE vjp → model.vjp → opt.step, on the FIXED owned `batch_x`/`batch_y`.
+        fp32-only (reaching here ⇒ `CAPTURE` ⇒ `MADT == DT`); the CE loss folds
+        into the device accumulator, drained at epoch end via `read_accum`."""
         self.opt.zero_grad["gpu"](self.model, ctx)
         Self._amp_train_step[Self.BATCH](
             self.model,
@@ -365,34 +365,70 @@ struct Trainer[
         )
 
     def _epoch_captured[
-        N_TRAIN: Int
-    ](mut self, c: DeviceContext) raises:
-        """One contiguous-sweep epoch on the capture path. Each batch's slice is
-        D2D-copied (eager) from the resident `ds_x`/`ds_y` into the FIXED owned
-        `batch_x`/`batch_y`, then the device compute is captured on the first
-        batch and replayed on the rest. No shuffle / no aug (guarded in
-        `train_gpu`)."""
+        N_TRAIN: Int, USE_AUG: Bool
+    ](
+        mut self,
+        c: DeviceContext,
+        mut aug: Tensor,
+        mut indices: TensorImpl[DType.int32],
+        mut bctr: TensorImpl[DType.int32],
+    ) raises:
+        """One epoch on the capture path. The step — gather batch `bctr` of the
+        permutation `indices` from `aug` (USE_AUG) or the resident `ds_x` into
+        `batch_x`/`batch_y`, advance `bctr`, then the device compute — is
+        captured on the first batch of the run and replayed for every other.
+        The caller rewrote `aug` and `indices` in place for this epoch."""
         comptime n_batches = N_TRAIN // Self.BATCH
-        for nb in range(n_batches):
-            var x0 = nb * Self.BATCH * Self.IN
-            var y0 = nb * Self.BATCH * Self.NC
-            # Eager D2D copy: resident-set sub-view (source) → fixed batch slab.
-            var sx = self.ds_x.dev.value().create_sub_buffer[DT](
-                x0, Self.BATCH * Self.IN
-            )
-            c.enqueue_copy(rebind[Tensor](self.batch_x).dev.value(), sx)
-            var sy = self.ds_y.dev.value().create_sub_buffer[DT](
-                y0, Self.BATCH * Self.NC
-            )
-            c.enqueue_copy(self.batch_y.dev.value(), sy)
-            # Capture-once / replay the device compute. Move the slot into a
-            # disjoint local (`take` leaves it None) so the closure can borrow
-            # `self` without overlapping the slot's mut borrow.
+        comptime blocks_gx = (Self.BATCH * Self.IN + TPB - 1) // TPB
+        comptime blocks_gy = (Self.BATCH * Self.NC + TPB - 1) // TPB
+        comptime LX = Layout.row_major(N_TRAIN, Self.IN)
+        c.enqueue_function[reset_counter_kernel](
+            bctr.lt["gpu", Layout.row_major(1)](), grid_dim=1, block_dim=1
+        )
+        for _ in range(n_batches):
+            # Move the slot into a disjoint local (`take` leaves it None) so the
+            # closure can borrow `self` without overlapping the slot's borrow.
             var g = Optional[CUDAGraph](None)
             if self._train_graph:
                 g = Optional[CUDAGraph](self._train_graph.take())
 
             def _cap() capturing raises -> None:
+                var src = self.ds_x.lt["gpu", LX]()
+                comptime if USE_AUG:
+                    src = aug.lt["gpu", LX]()
+                c.enqueue_function[
+                    gather_rows_at_counter_kernel[
+                        N_TRAIN, Self.BATCH, Self.IN, DT
+                    ]
+                ](
+                    rebind[Tensor](self.batch_x).lt[
+                        "gpu", Layout.row_major(Self.BATCH, Self.IN)
+                    ](),
+                    src,
+                    indices.lt["gpu", Layout.row_major(N_TRAIN)](),
+                    bctr.lt["gpu", Layout.row_major(1)](),
+                    grid_dim=blocks_gx,
+                    block_dim=TPB,
+                )
+                c.enqueue_function[
+                    gather_rows_at_counter_kernel[
+                        N_TRAIN, Self.BATCH, Self.NC, DT
+                    ]
+                ](
+                    self.batch_y.lt[
+                        "gpu", Layout.row_major(Self.BATCH, Self.NC)
+                    ](),
+                    self.ds_y.lt["gpu", Layout.row_major(N_TRAIN, Self.NC)](),
+                    indices.lt["gpu", Layout.row_major(N_TRAIN)](),
+                    bctr.lt["gpu", Layout.row_major(1)](),
+                    grid_dim=blocks_gy,
+                    block_dim=TPB,
+                )
+                c.enqueue_function[advance_counter_kernel](
+                    bctr.lt["gpu", Layout.row_major(1)](),
+                    grid_dim=1,
+                    block_dim=1,
+                )
                 self._compute_step_device(Optional(c))
 
             maybe_capture_replay[_cap](g, c)
@@ -608,17 +644,6 @@ struct Trainer[
         comptime blocks_gy = (Self.BATCH * Self.NC + TPB - 1) // TPB
         comptime USE_AUG = not AUGMENTER.IS_NOOP
         comptime USE_SCHED = not SCHEDULER.IS_CONSTANT
-        comptime assert (
-            (not Self.CAPTURE) or (not USE_AUG)
-        ), "CUDA-graph capture does not support AUGMENTER yet (contiguous sweep only)"
-        # Capture supports the contiguous sweep only in this pass (shuffle gathers
-        # vary the on-device offset per batch → a separate concern).
-        comptime if Self.CAPTURE:
-            if shuffle:
-                raise Error(
-                    "train_gpu: USE_TRAIN_CUDA_GRAPH supports the contiguous"
-                    " sweep only (shuffle=False) in this pass"
-                )
         var c = ctx.value()
         var result = TrainResult.empty()
 
@@ -648,6 +673,18 @@ struct Trainer[
         var gy = Tensor()  # fp32 gather target (labels — always fp32 for loss)
         # bf16: owned MADT model-input (gx is cast into it). Unused for fp32.
         var gxm = TensorImpl[Self.MADT]()
+        # Capture: the device batch counter, and the permutation even without
+        # shuffle (identity = the contiguous sweep).
+        var bctr = TensorImpl[DType.int32]()
+        comptime if Self.CAPTURE:
+            bctr = TensorImpl[DType.int32].alloc_gpu(c, 1)
+            if not shuffle:
+                indices = TensorImpl[DType.int32].alloc_gpu(c, N_TRAIN)
+                c.enqueue_function[init_identity_indices_kernel[N_TRAIN]](
+                    indices.lt["gpu", Layout.row_major(N_TRAIN)](),
+                    grid_dim=blocks_init,
+                    block_dim=TPB,
+                )
         if shuffle:
             indices = TensorImpl[DType.int32].alloc_gpu(c, N_TRAIN)
             c.enqueue_function[init_identity_indices_kernel[N_TRAIN]](
@@ -684,35 +721,31 @@ struct Trainer[
                     )
             self.loss.reset_accum["gpu"]()
             self.model.set_attr["training"](Scalar[DT](1.0))
+            # (Re)build the augmented training set from the raw resident set,
+            # then this epoch's permutation (both in place, before any batch).
+            comptime if USE_AUG:
+                AUGMENTER.augment[N_TRAIN, Self.IN, DT](
+                    c,
+                    aug.lt["gpu", Layout.row_major(N_TRAIN, Self.IN)](),
+                    self.ds_x.lt["gpu", Layout.row_major(N_TRAIN, Self.IN)](),
+                    epoch,
+                    aug_seed,
+                )
+            if shuffle:
+                c.enqueue_function[fisher_yates_shuffle_kernel[N_TRAIN]](
+                    indices.lt["gpu", Layout.row_major(N_TRAIN)](),
+                    seed.lt["gpu", Layout.row_major(1)](),
+                    grid_dim=1,
+                    block_dim=1,
+                )
+                c.enqueue_function[increment_seed_kernel](
+                    seed.lt["gpu", Layout.row_major(1)](),
+                    grid_dim=1,
+                    block_dim=1,
+                )
             comptime if Self.CAPTURE:
-                # Contiguous-sweep capture: each batch's slice is D2D-copied into
-                # the FIXED owned `batch_x`/`batch_y` (eager), then the device
-                # compute is captured (first batch) / replayed (rest).
-                self._epoch_captured[N_TRAIN](c)
+                self._epoch_captured[N_TRAIN, USE_AUG](c, aug, indices, bctr)
             else:
-                # (Re)build the augmented training set from the raw resident set.
-                comptime if USE_AUG:
-                    AUGMENTER.augment[N_TRAIN, Self.IN, DT](
-                        c,
-                        aug.lt["gpu", Layout.row_major(N_TRAIN, Self.IN)](),
-                        self.ds_x.lt[
-                            "gpu", Layout.row_major(N_TRAIN, Self.IN)
-                        ](),
-                        epoch,
-                        aug_seed,
-                    )
-                if shuffle:
-                    c.enqueue_function[fisher_yates_shuffle_kernel[N_TRAIN]](
-                        indices.lt["gpu", Layout.row_major(N_TRAIN)](),
-                        seed.lt["gpu", Layout.row_major(1)](),
-                        grid_dim=1,
-                        block_dim=1,
-                    )
-                    c.enqueue_function[increment_seed_kernel](
-                        seed.lt["gpu", Layout.row_major(1)](),
-                        grid_dim=1,
-                        block_dim=1,
-                    )
                 for nb in range(n_batches):
                     if shuffle:
                         var off = nb * Self.BATCH
