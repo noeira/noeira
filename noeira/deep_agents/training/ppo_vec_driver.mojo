@@ -117,6 +117,17 @@ struct PPOVecConfig(Copyable, Movable):
     var obs_clip: Float64
     var rew_clip: Float64
     var act_rate_w: Float64
+    var act_smooth_w: Float64
+    """RoboParty's `action_smoothness_l2`: `w |a_t - 2 a_{t-1} + a_{t-2}|^2`,
+    charged like the action rate (0 until a lane has two previous actions)."""
+    var adaptive_kl: Bool
+    """rsl_rl's adaptive schedule, applied once per UPDATE (theirs: per
+    minibatch) so the update stays one graph: the update's mean approx-KL
+    above 2 x `desired_kl` divides the lr by 1.5, below half of it
+    multiplies it by 1.5, clamped to [`lr_min`, `lr_max`]. Excludes `anneal`."""
+    var desired_kl: Float64
+    var lr_min: Float64
+    var lr_max: Float64
     var obs_bound: Float64
     var rew_bound: Float64
     var seed: Int
@@ -144,6 +155,11 @@ struct PPOVecConfig(Copyable, Movable):
         obs_clip: Float64 = 10.0,
         rew_clip: Float64 = 10.0,
         act_rate_w: Float64 = 0.0,
+        act_smooth_w: Float64 = 0.0,
+        adaptive_kl: Bool = False,
+        desired_kl: Float64 = 0.01,
+        lr_min: Float64 = 1.0e-5,
+        lr_max: Float64 = 1.0e-2,
         obs_bound: Float64 = 1.0e3,
         rew_bound: Float64 = 1.0e3,
         seed: Int = 1,
@@ -164,6 +180,11 @@ struct PPOVecConfig(Copyable, Movable):
         self.obs_clip = obs_clip
         self.rew_clip = rew_clip
         self.act_rate_w = act_rate_w
+        self.act_smooth_w = act_smooth_w
+        self.adaptive_kl = adaptive_kl
+        self.desired_kl = desired_kl
+        self.lr_min = lr_min
+        self.lr_max = lr_max
         self.obs_bound = obs_bound
         self.rew_bound = rew_bound
         self.seed = seed
@@ -193,30 +214,42 @@ struct PPOVecResult(Copyable, Movable):
 def _pre_k[N: Int, ACT: Int, W: Int](
     act: _V[N * ACT],
     a_prev: _V[N * ACT],
+    a_prev2: _V[N * ACT],
     has_prev: _V[N],
     pen: _V[N],
     hist: _V[N * W + 1],
     stats: _V[N * _S_SIZE],
     w: Scalar[DT],
+    w2: Scalar[DT],
 ):
     """After the policy acted (`act` = the executed action): the action-rate
     penalty against the lane's previous action (0 on an episode's first
-    step), then the action pushed into the history, newest first."""
+    step) and the smoothness penalty against the two previous ones (0 until
+    there are two), then the action pushed into the history, newest first.
+    `has_prev` counts the previous actions a lane has, capped at 2."""
     var e = Int(global_idx.x)
     if e >= N:
         return
-    var hp = rebind[Scalar[DT]](has_prev[e]) > Scalar[DT](0.5)
+    var np_ = rebind[Scalar[DT]](has_prev[e])
+    var hp = np_ > Scalar[DT](0.5)
+    var hp2 = np_ > Scalar[DT](1.5)
     var d2: Scalar[DT] = 0.0
+    var s2: Scalar[DT] = 0.0
     for j in range(ACT):
         var a = rebind[Scalar[DT]](act[e * ACT + j])
+        var a1 = rebind[Scalar[DT]](a_prev[e * ACT + j])
         if hp:
-            var dd = a - rebind[Scalar[DT]](a_prev[e * ACT + j])
+            var dd = a - a1
             d2 += dd * dd
+        if hp2:
+            var ss = a - Scalar[DT](2.0) * a1 + rebind[Scalar[DT]](a_prev2[e * ACT + j])
+            s2 += ss * ss
+        a_prev2[e * ACT + j] = a1
         a_prev[e * ACT + j] = a
-    has_prev[e] = Scalar[DT](1.0)
-    var p = w * d2
+    has_prev[e] = np_ + Scalar[DT](1.0) if np_ < Scalar[DT](1.5) else Scalar[DT](2.0)
+    var p = w * d2 + w2 * s2
     pen[e] = p
-    if w > Scalar[DT](0.0):
+    if w > Scalar[DT](0.0) or w2 > Scalar[DT](0.0):
         stats[e * _S_SIZE + _S_PEN_SUM] = (
             rebind[Scalar[DT]](stats[e * _S_SIZE + _S_PEN_SUM]) + p
         )
@@ -335,20 +368,76 @@ def _reset_k[N: Int, W: Int](
     has_prev[e] = Scalar[DT](0.0)
 
 
+def _stack_k[N: Int, E_OBS: Int, EA: Int, W: Int, FRAMES: Int, MODE: Int](
+    raw: _V[N * E_OBS],
+    hist: _V[N * W + 1],
+    mask: _V[N],
+    aug: _V[N * (FRAMES * (EA + W) + FRAMES * (E_OBS - EA))],
+):
+    """The frame history (`FRAMES` > 1 or a privileged split). The policy's
+    observation is
+
+        [frame_0 .. frame_{F-1} | priv_0 .. priv_{F-1}]     newest first
+        frame = env[0:EA] ++ the action history (W words)
+        priv  = env[EA:E_OBS]
+
+    so an actor that reads the first `F (EA + W)` words never sees the
+    privileged part (a `Slice` at the head of the actor; the critic reads it
+    all). `aug` IS the history — persistent across steps:
+      MODE 0 (after a step): every lane shifts by one and writes its newest;
+      MODE 1 (start): every lane fills all F slots with its current frame;
+      MODE 2 (after a reset): lanes with `mask` set refill, the rest keep.
+    Filling every slot with the first frame is IsaacLab's `CircularBuffer`
+    (RoboParty's history) on its first push after a reset."""
+    comptime FA = EA + W
+    comptime EP = E_OBS - EA
+    comptime PB = FRAMES * FA
+    comptime A = PB + FRAMES * EP
+    var e = Int(global_idx.x)
+    if e >= N:
+        return
+    comptime if MODE == 2:
+        if rebind[Scalar[DT]](mask[e]) <= Scalar[DT](0.5):
+            return
+    comptime if MODE == 0:
+        for f in range(FRAMES - 1, 0, -1):
+            for k in range(FA):
+                aug[e * A + f * FA + k] = aug[e * A + (f - 1) * FA + k]
+            for k in range(EP):
+                aug[e * A + PB + f * EP + k] = aug[e * A + PB + (f - 1) * EP + k]
+    var f_hi = 1 if MODE == 0 else FRAMES
+    for f in range(f_hi):
+        for k in range(EA):
+            aug[e * A + f * FA + k] = raw[e * E_OBS + k]
+        for k in range(W):
+            aug[e * A + f * FA + EA + k] = hist[e * W + k]
+        for k in range(EP):
+            aug[e * A + PB + f * EP + k] = raw[e * E_OBS + EA + k]
+
+
 # ═══════════════════════════════════════════════════════════════════════════
 # the rollout's device state and its step
 # ═══════════════════════════════════════════════════════════════════════════
 
 
-struct PPOVecRollout[N_: Int, E_OBS_: Int, ACT_: Int, HIST_: Int](Movable):
+struct PPOVecRollout[
+    N_: Int, E_OBS_: Int, ACT_: Int, HIST_: Int, FRAMES_: Int = 1,
+    E_ACTOR_: Int = -1,
+](Movable):
     """The per-lane state of `run_ppo_vec` on the device. `OBS` is the
-    policy's observation: the env's `E_OBS` words, then `HIST` actions."""
+    policy's observation: the env's `E_OBS` words, then `HIST` actions — or,
+    with `FRAMES` > 1 or a privileged split `E_ACTOR` >= 0, the frame
+    history of `_stack_k`."""
 
     comptime N = Self.N_
     comptime E_OBS = Self.E_OBS_
     comptime ACT = Self.ACT_
     comptime W = Self.HIST_ * Self.ACT_
-    comptime OBS = Self.E_OBS + Self.W
+    comptime EA = Self.E_OBS if Self.E_ACTOR_ < 0 else Self.E_ACTOR_
+    comptime STACKED = Self.FRAMES_ > 1 or Self.E_ACTOR_ >= 0
+    comptime OBS = (
+        Self.FRAMES_ * (Self.EA + Self.W) + Self.FRAMES_ * (Self.E_OBS - Self.EA)
+    )
 
     var ctx: DeviceContext
     var cur_n: Tensor
@@ -356,6 +445,7 @@ struct PPOVecRollout[N_: Int, E_OBS_: Int, ACT_: Int, HIST_: Int](Movable):
     var aug: Tensor
     var hist: Tensor
     var a_prev: Tensor
+    var a_prev2: Tensor
     var has_prev: Tensor
     var pen: Tensor
     var tprev: Tensor  # `augment_k`'s target-lead input, unread (T = 0)
@@ -388,7 +478,10 @@ struct PPOVecRollout[N_: Int, E_OBS_: Int, ACT_: Int, HIST_: Int](Movable):
         self.next_n = Tensor.alloc_gpu(ctx, N * Self.OBS)
         self.aug = Tensor.alloc_gpu(ctx, N * Self.OBS)
         self.hist = Tensor.alloc_gpu(ctx, N * Self.W + 1)
+        comptime assert Self.FRAMES_ >= 1, "PPOVecRollout: FRAMES >= 1"
+        comptime assert Self.EA <= Self.E_OBS, "PPOVecRollout: E_ACTOR > E_OBS"
         self.a_prev = Tensor.alloc_gpu(ctx, N * Self.ACT)
+        self.a_prev2 = Tensor.alloc_gpu(ctx, N * Self.ACT)
         self.has_prev = Tensor.alloc_gpu(ctx, N)
         self.pen = Tensor.alloc_gpu(ctx, N)
         self.tprev = Tensor.alloc_gpu(ctx, N * Self.ACT)
@@ -489,23 +582,36 @@ struct PPOVecRollout[N_: Int, E_OBS_: Int, ACT_: Int, HIST_: Int](Movable):
 
     # ── the pieces ──────────────────────────────────────────────────────
 
-    def _augment(mut self, raw_ptr: _Ptr) raises:
+    def _augment[MODE: Int](mut self, raw_ptr: _Ptr) raises:
+        """MODE 0 after a step, 1 at the start, 2 after a reset (the frame
+        history's three updates; without one, every mode is `augment_k`)."""
         comptime N = Self.N
-        self.ctx.enqueue_function[
-            augment_k[N, Self.E_OBS, Self.W, 0, Self.ACT]
-        ](
-            _V[N * Self.E_OBS](raw_ptr),
-            self.hist.lt["gpu", Layout.row_major(N * Self.W + 1)](),
-            self.tprev.lt["gpu", Layout.row_major(N * Self.ACT)](),
-            self.qa.lt["gpu", Layout.row_major(Self.ACT)](),
-            self.aug.lt["gpu", Layout.row_major(N * Self.OBS)](),
-            grid_dim=Self._g(N), block_dim=TPB,
-        )
+        comptime if Self.STACKED:
+            self.ctx.enqueue_function[
+                _stack_k[N, Self.E_OBS, Self.EA, Self.W, Self.FRAMES_, MODE]
+            ](
+                _V[N * Self.E_OBS](raw_ptr),
+                self.hist.lt["gpu", Layout.row_major(N * Self.W + 1)](),
+                self.done_out.lt["gpu", Layout.row_major(N)](),
+                self.aug.lt["gpu", Layout.row_major(N * Self.OBS)](),
+                grid_dim=Self._g(N), block_dim=TPB,
+            )
+        else:
+            self.ctx.enqueue_function[
+                augment_k[N, Self.E_OBS, Self.W, 0, Self.ACT]
+            ](
+                _V[N * Self.E_OBS](raw_ptr),
+                self.hist.lt["gpu", Layout.row_major(N * Self.W + 1)](),
+                self.tprev.lt["gpu", Layout.row_major(N * Self.ACT)](),
+                self.qa.lt["gpu", Layout.row_major(Self.ACT)](),
+                self.aug.lt["gpu", Layout.row_major(N * Self.OBS)](),
+                grid_dim=Self._g(N), block_dim=TPB,
+            )
 
     def start(mut self, raw_ptr: _Ptr, ref cfg: PPOVecConfig) raises:
         """The first observation: the statistics updated with every lane
         (when on), then normalised."""
-        self._augment(raw_ptr)
+        self._augment[1](raw_ptr)
         if cfg.norm_obs:
             update_rms_device[Self.N, Self.OBS](
                 self.ctx, self.aug, self.diverged, self.obs_mean, self.obs_var,
@@ -542,11 +648,13 @@ struct PPOVecRollout[N_: Int, E_OBS_: Int, ACT_: Int, HIST_: Int](Movable):
         c.enqueue_function[_pre_k[N, Self.ACT, Self.W]](
             _V[N * Self.ACT](env.action_ptr()),
             self.a_prev.lt["gpu", Layout.row_major(N * Self.ACT)](),
+            self.a_prev2.lt["gpu", Layout.row_major(N * Self.ACT)](),
             self.has_prev.lt["gpu", Layout.row_major(N)](),
             self.pen.lt["gpu", Layout.row_major(N)](),
             self.hist.lt["gpu", Layout.row_major(N * Self.W + 1)](),
             self.stats.lt["gpu", Layout.row_major(N * _S_SIZE)](),
             Scalar[DT](cfg.act_rate_w),
+            Scalar[DT](cfg.act_smooth_w),
             grid_dim=Self._g(N), block_dim=TPB,
         )
 
@@ -576,7 +684,7 @@ struct PPOVecRollout[N_: Int, E_OBS_: Int, ACT_: Int, HIST_: Int](Movable):
             Scalar[DT](cfg.rew_bound),
             grid_dim=Self._g(N), block_dim=TPB,
         )
-        self._augment(env.obs_ptr())
+        self._augment[0](env.obs_ptr())
         if cfg.norm_obs:
             update_rms_device[Self.N, Self.OBS](
                 c, self.aug, self.diverged, self.obs_mean, self.obs_var,
@@ -642,7 +750,7 @@ struct PPOVecRollout[N_: Int, E_OBS_: Int, ACT_: Int, HIST_: Int](Movable):
             self.has_prev.lt["gpu", Layout.row_major(N)](),
             grid_dim=Self._g(N), block_dim=TPB,
         )
-        self._augment(env.obs_ptr())
+        self._augment[2](env.obs_ptr())
         normalize_device[Self.N, Self.OBS](
             c, self.aug, self.cur_n, self.obs_mean, self.obs_var,
             self.diverged, obs_clip, False,
@@ -680,6 +788,8 @@ def run_ppo_vec[
     HIST: Int = 0,
     ENV_GRAPH: Bool = False,
     TRAIN_GRAPH: Bool = False,
+    FRAMES: Int = 1,
+    E_ACTOR: Int = -1,
 ](
     mut agent: PPOAgent[
         "gpu", ACTOR, CRITIC, OBS, ACT, ROLLOUT, MINIBATCH, N_EPOCHS, N_ENVS
@@ -699,9 +809,13 @@ def run_ppo_vec[
     observation statistics (a fresh one, or an `--init` run's) and holds the
     final ones on return; both files are written every `cfg.ckpt_every`
     steps and at the end."""
-    comptime assert OBS == E.OBS_DIM + HIST * E.ACT_DIM, (
+    comptime R = PPOVecRollout[N_ENVS, E.OBS_DIM, ACT, HIST, FRAMES, E_ACTOR]
+    comptime assert OBS == R.OBS, (
         "run_ppo_vec: the agent's OBS must be the env's plus HIST actions"
+        " (x FRAMES, with the privileged words after the actor frames)"
     )
+    if cfg.adaptive_kl and cfg.anneal:
+        raise Error("run_ppo_vec: adaptive_kl and anneal are exclusive")
     comptime assert ACT == E.ACT_DIM, "run_ppo_vec: the agent's ACT is not the env's"
     if len(obs_rms.mean) != OBS:
         raise Error(
@@ -715,7 +829,7 @@ def run_ppo_vec[
     ) // per_update
     var gamma = agent.trainer.gamma
 
-    var dev = PPOVecRollout[N, E.OBS_DIM, ACT, HIST](ctx, cfg.episode_sync_every)
+    var dev = R(ctx, cfg.episode_sync_every)
     dev.stats_from_host(obs_rms)
     agent.trainer.enable_device_rollout(
         UInt64(cfg.seed) * UInt64(2654435761) + UInt64(1)
@@ -734,6 +848,7 @@ def run_ppo_vec[
     var step = 0
     var n_updates = 0
     var next_ckpt = cfg.ckpt_every if cfg.ckpt_every > 0 else -1
+    var cur_lr = cfg.lr
     var t0 = perf_counter_ns()
     while step < cfg.total_steps:
         dev.step[USE_ENV_GRAPH=ENV_GRAPH](
@@ -747,8 +862,24 @@ def run_ppo_vec[
         ](agent.trainer, Optional(ctx), step, train_graph, quiet=n_updates > 0)
         if updated:
             n_updates += 1
-            var lr = cfg.lr
+            var lr = cur_lr
             var ent = cfg.ent0
+            if cfg.adaptive_kl:
+                # the mean approx-KL of the diag accumulator (reset by every
+                # metrics flush, so with `log_every` = 1 it is this update's)
+                var kl = Float64(agent.trainer._kl_mean_dev.read["gpu"]())
+                var new_lr = cur_lr
+                if kl > 2.0 * cfg.desired_kl:
+                    new_lr = max(cfg.lr_min, cur_lr / 1.5)
+                elif kl > 0.0 and kl < 0.5 * cfg.desired_kl:
+                    new_lr = min(cfg.lr_max, cur_lr * 1.5)
+                if new_lr != cur_lr:
+                    cur_lr = new_lr
+                    agent.trainer.actor_opt.set_lr(Scalar[DT](cur_lr))
+                    agent.trainer.critic_opt.set_lr(Scalar[DT](cur_lr))
+                    # the lr is a kernel argument of the captured update
+                    train_graph = None
+                lr = cur_lr
             if cfg.anneal:
                 var frac = 1.0 - Float64(n_updates) / Float64(max(n_updates_total, 1))
                 if frac < 0.0:
@@ -778,7 +909,7 @@ def run_ppo_vec[
                     logger.log_scalar("sps", Float64(step) / secs, step)
                     logger.log_scalar("lr", lr, step)
                     logger.log_scalar("ent_coef", ent, step)
-                    if cfg.act_rate_w > 0.0:
+                    if cfg.act_rate_w > 0.0 or cfg.act_smooth_w > 0.0:
                         logger.log_scalar("act_rate_penalty", pen, step)
                     agent.trainer.flush_metrics_through_logger[L](
                         logger_ptr, step
@@ -786,7 +917,7 @@ def run_ppo_vec[
                 if print_now:
                     print("  step", step, "| return", mret, "| length", mlen,
                           "| episodes", len(ep_ret), "| diverged", diverged,
-                          "| act-rate penalty", pen,
+                          "| act penalty", pen, "| lr", lr,
                           "|", Int(Float64(step) / secs), "steps/s")
                 dev.reset_penalty_stats()
         if next_ckpt > 0 and step >= next_ckpt:

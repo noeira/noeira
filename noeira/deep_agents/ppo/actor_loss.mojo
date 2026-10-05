@@ -29,6 +29,7 @@ from noeira.nn.core.call import call_forward, call_vjp
 from noeira.nn.optimizer.adam import Adam
 from noeira.nn.core.initializer import Zero
 from .objective import PPOObjective
+from .mirror import ActorMirror
 from ..loss.loss_block import LossBlock
 from ..training.device_mean_accum import DeviceMeanAccum
 
@@ -49,6 +50,9 @@ struct PPOActorLoss[
     var _loss_mean_dev: DeviceMeanAccum
     """GPU: the per-minibatch mean loss, accumulated on the device by the
     `DEVICE_LOSS` path (read at flush cadence) instead of a per-step D2H."""
+    var mirror: ActorMirror[Self.OBS_DIM, Self.ACT_DIM, Self.BATCH]
+    """The opt-in mirror-symmetry pass (`mirror.mojo`); off until
+    `enable_mirror`."""
 
     def __init__(out self):
         self.objective = PPOObjective[Self.ACT_DIM]()
@@ -58,6 +62,19 @@ struct PPOActorLoss[
         self._grad_seed = Tensor()
         self._obs_grad = Tensor()
         self._loss_mean_dev = DeviceMeanAccum()
+        self.mirror = ActorMirror[Self.OBS_DIM, Self.ACT_DIM, Self.BATCH]()
+
+    def enable_mirror[target: StaticString](
+        mut self,
+        obs_idx: List[Int],
+        obs_sign: List[Float64],
+        act_idx: List[Int],
+        act_sign: List[Float64],
+        coeff: Float64,
+        ctx: Optional[DeviceContext] = None,
+    ) raises:
+        """Turn on the mirror-symmetry loss (`mirror.mojo`)."""
+        self.mirror.enable[target](obs_idx, obs_sign, act_idx, act_sign, coeff, ctx)
 
     @staticmethod
     def make[target: StaticString](
@@ -128,6 +145,11 @@ struct PPOActorLoss[
         comptime ACT = Self.ACT_DIM
 
         actor_opt.zero_grad[target, M = Self.ACTOR](actor, ctx)
+
+        # The mirror pass first (its grads accumulate; its forwards leave the
+        # caches on M_o s, which the PPO forward below rewrites).
+        if self.mirror.on:
+            self.mirror.add_grads[target](actor, mb_s, ctx)
 
         # actor.forward(s) → _in[0] (the [mu|log_std] actor output).
         call_forward[target, BB, POLICY=POLICY](
