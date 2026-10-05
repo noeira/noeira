@@ -92,7 +92,8 @@ class MLPInference:
 
         session = InferenceSession(devices=[self.drv])
         t0 = time.perf_counter()
-        self.model = session.init(session.compile(g))
+        self.compiled = session.compile(g)  # kept for export_mef (capi_mojo/bench)
+        self.model = session.init(self.compiled)
         self.compile_seconds = time.perf_counter() - t0
 
         # Persistent host + device inputs reused for steady-state timing.

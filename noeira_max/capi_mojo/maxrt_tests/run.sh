@@ -1,7 +1,9 @@
 #!/usr/bin/env bash
 # Exports the test MEFs (Python, once), builds the maxrt test binary (Mojo),
 # and runs it twice: inside the pixi env, then outside it with MODULAR_HOME
-# unset, which exercises maxrt's own runtime configuration (config.mojo).
+# unset, which exercises maxrt's own runtime configuration (config.mojo). On a
+# machine with an NVIDIA GPU, it then checks the Mojo <-> MAX device round trip
+# (probe_cuda_context.mojo).
 #
 #   noeira_max/capi_mojo/maxrt_tests/run.sh
 #   MAXRT_ENV=apple noeira_max/capi_mojo/maxrt_tests/run.sh    # + Metal
@@ -20,6 +22,15 @@ pixi run --manifest-path "$MAIN/pixi.toml" -e "$ENV" \
     -o "$OUT/test_maxrt" -Xlinker -L"$LIB" -Xlinker -lmax
 
 echo "== inside pixi ($ENV): MODULAR_HOME from activation"
-pixi run --manifest-path "$MAIN/pixi.toml" -e "$ENV" "$OUT/test_maxrt" "$OUT"
+pixi run --manifest-path "$MAIN/pixi.toml" -e "$ENV" env -u LD_PRELOAD "$OUT/test_maxrt" "$OUT"
 echo "== outside pixi: MODULAR_HOME unset, maxrt writes its own modular.cfg"
-env -u MODULAR_HOME -u CONDA_PREFIX "$OUT/test_maxrt" "$OUT"
+env -u MODULAR_HOME -u CONDA_PREFIX -u LD_PRELOAD "$OUT/test_maxrt" "$OUT"
+
+if command -v nvidia-smi > /dev/null; then
+    echo "== CUDA: a Mojo DeviceContext and MAX share device memory"
+    pixi run --manifest-path "$MAIN/pixi.toml" -e "$ENV" \
+        mojo build -I noeira_max/capi_mojo noeira_max/capi_mojo/maxrt_tests/probe_cuda_context.mojo \
+        -o "$OUT/probe_cuda_context" -Xlinker -L"$LIB" -Xlinker -lmax -Xlinker -lcuda
+    pixi run --manifest-path "$MAIN/pixi.toml" -e "$ENV" \
+        env -u LD_PRELOAD "$OUT/probe_cuda_context" "$OUT"
+fi
