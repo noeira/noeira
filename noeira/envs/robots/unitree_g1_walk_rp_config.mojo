@@ -753,12 +753,16 @@ def g1r_terms[
     )
     var kd_ = kl[1] - kr[1]
     terms[R_KNEE_DIST] = g1r_distance_band(kd_ if kd_ > 0.0 else -kd_, 0.18, 0.35)
-    # foot orientation: gravity in each foot frame, xy^2
+    # foot orientation: gravity in each foot frame, xy^2.
+    # ⚠ BODY `xquat` IS (x, y, z, w) — the root's `qpos[3:7]` is (w, x, y, z).
+    # The first draft read xquat as (w, x, y, z): exact at the stand (an
+    # identity read that way is a 180 deg yaw, gravity unchanged), wrong at
+    # any tilt — `test_unitree_g1_walk_rp` pitches the robot to catch it.
     for f in range(2):
         var b4 = (G1R_L_ANKLE_ROLL if f == 0 else G1R_R_ANKLE_ROLL) * 4
         var gf = _projected_gravity(
-            _rd[DTYPE](xquat[env, b4]), _rd[DTYPE](xquat[env, b4 + 1]),
-            _rd[DTYPE](xquat[env, b4 + 2]), _rd[DTYPE](xquat[env, b4 + 3]),
+            _rd[DTYPE](xquat[env, b4 + 3]), _rd[DTYPE](xquat[env, b4]),
+            _rd[DTYPE](xquat[env, b4 + 1]), _rd[DTYPE](xquat[env, b4 + 2]),
         )
         terms[R_FEET_ORIENT] += gf[0] * gf[0] + gf[1] * gf[1]
     # swing-foot clearance in single stance

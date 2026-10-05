@@ -22,7 +22,7 @@ CPU env, through the GPU hooks' own functions (`unitree_g1_walk_rp.mojo`):
   8. Every other term is non-zero somewhere in 1-5.
 """
 
-from std.math import abs, sqrt
+from std.math import abs, sqrt, sin, cos
 
 from layout import Layout
 
@@ -64,6 +64,7 @@ from noeira.envs.robots.unitree_g1_walk_rp_config import (
     R_TERMINATION,
     R_UPWARD,
     R_FEET_STUMBLE,
+    R_FEET_ORIENT,
     G1RContacts,
     g1r_contacts,
     g1r_stumble,
@@ -250,6 +251,41 @@ def check_side(mut hits: Hits) raises:
         _fail("a robot on its side did not terminate")
 
 
+def check_foot_orientation() raises:
+    """The whole robot pitched by 0.3 rad (joints default): each foot is
+    tilted 0.3 rad, so `feet_orientation_l2` = 2 sin^2(0.3). Catches a body
+    quaternion read in the wrong component order — exact at the stand, wrong
+    at any tilt."""
+    var env = E()
+    _start(env, 0.0)
+    var q = List[Float64]()
+    for i in range(NQ):
+        q.append(Float64(env.d.qpos.data[i]))
+    var v = List[Float64](length=NV, fill=0.0)
+    q[3] = cos(0.15)
+    q[5] = sin(0.15)
+    env.set_state(q, v)
+    var zero = List[Float64](length=ACT, fill=0.0)
+    var terms = Array[Float64, G1R_N_TERMS](fill=0.0)
+    _ = g1r_host_terms(env.d, zero, terms)
+    var want = 2.0 * sin(0.3) ** 2
+    print("  pitched 0.3 rad: feet_orientation_l2", terms[R_FEET_ORIENT], "want", want)
+    if abs(terms[R_FEET_ORIENT] - want) > 1e-6:
+        _fail("feet_orientation_l2 is not the feet's tilt")
+    # ⚠ A PITCH ALONE IS BLIND to a (w, x, y, z) / (x, y, z, w) mix-up (the
+    # mix-up gives the same squared tilt); a YAW is not: flat feet must read
+    # 0, the mix-up reads 2 sin^2(2 x 0.3).
+    q[3] = cos(0.3)
+    q[4] = 0.0
+    q[5] = 0.0
+    q[6] = sin(0.3)
+    env.set_state(q, v)
+    _ = g1r_host_terms(env.d, zero, terms)
+    print("  yawed 0.6 rad: feet_orientation_l2", terms[R_FEET_ORIENT], "want 0")
+    if abs(terms[R_FEET_ORIENT]) > 1e-6:
+        _fail("feet_orientation_l2 sees tilt in a yawed, flat foot: quaternion order")
+
+
 def check_resets() raises:
     var env = E()
     _ = env.reset()
@@ -421,6 +457,8 @@ def main() raises:
     check_limits(hits)
     print("5. on its side")
     check_side(hits)
+    print("5b. foot orientation under a known tilt")
+    check_foot_orientation()
     print("6. random resets, gain DR")
     check_resets()
     print("6b. mirror maps: against the model, against physics")
