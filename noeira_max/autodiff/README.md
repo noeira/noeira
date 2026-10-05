@@ -27,6 +27,7 @@ value, grads = value_and_grad(loss)(params, x, y)   # grads: same keys as params
 | `train.py` | `build_train_step`: forward + backward + update as one graph, parameters and state as buffers updated in place; MEF export / load |
 | `models/` | MLP and character GPT (dropout, in-graph batch sampling) as functions of a parameter dict |
 | `bench/` | The M2 benchmark (`bench_gpt_max.py`, `compile_scaling.py`, `torch_twin_math.py`, `run_5090.sh`) |
+| `capi/` | M3: the exported step trained from a Mojo binary through the MAX C API, no Python in the process (`run.sh` exports, builds, runs and compares) |
 | `tests/` | Gradcheck, torch golden VJPs, structural, vacuity, model parity, MAX findings |
 | `m0/` | The go/no-go probes |
 
