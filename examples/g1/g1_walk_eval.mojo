@@ -1,7 +1,7 @@
 """The G1 walker's L0 gates, on the CPU (G1_WALKER_PLAN §6).
 
     pixi run mojo build -I . examples/g1/g1_walk_eval.mojo -o build/g1_walk_eval
-    ./build/g1_walk_eval --run runs/g1_walk_s1 [--episodes 20] [--starts 5]
+    ./build/g1_walk_eval --run runs/g1_walk_s1 [--recipe mix|rp] [--episodes 20] [--starts 5]
 
 Loads `<run>/ckpt` and `<run>/obs_norm.txt` (`g1_walk_policy.WalkPolicy`),
 runs the CPU env in eval mode (no noise, no pushes, stand reset, the
@@ -49,12 +49,22 @@ from noeira.envs.robots.unitree_g1_walk_config import (
     g1_rotate_inverse,
 )
 
+from noeira.envs.robots.unitree_g1_walk_rp import (
+    UnitreeG1WalkRP, g1r_host_reset, g1r_host_terms,
+)
+from noeira.envs.robots.unitree_g1_walk_rp_config import (
+    G1R_N_TERMS, G1R_OBS_DIM, G1R_O_CMD, G1R_CMD_VX, G1R_CMD_VY, G1R_CMD_WZ,
+    G1R_CMD_TIMER, g1r_term_name, g1r_weight,
+)
+
 from g1_walk_policy import WalkPolicy
+from g1_walk_rp_policy import WalkRPPolicy
 
 comptime NQ = UnitreeG1WalkModel.NQ
 comptime NV = UnitreeG1WalkModel.NV
 comptime ACT = UnitreeG1WalkModel.ACTION_DIM
 comptime E = UnitreeG1Walk[False]
+comptime ER = UnitreeG1WalkRP[False]
 comptime DT_CTRL = 0.02
 
 
@@ -66,8 +76,41 @@ def _arg(name: String, default: String) raises -> String:
     return default
 
 
-struct Sim(Movable):
-    """The CPU env + the policy, stepped together."""
+trait WalkSim(Movable):
+    """A recipe's CPU env + its trained policy, stepped together — what the
+    gates below drive."""
+
+    def reset(mut self, seed: Int) raises:
+        ...
+
+    def command(mut self, vx: Float64, vy: Float64, wz: Float64):
+        ...
+
+    def step(mut self, log_terms: Bool) raises -> Bool:
+        """One control step; True = the episode ended (fell)."""
+        ...
+
+    def body_vel(self) -> Tuple[Float64, Float64, Float64]:
+        ...
+
+    def xy(self) -> Tuple[Float64, Float64]:
+        ...
+
+    def z(self) -> Float64:
+        ...
+
+    def print_terms(self):
+        ...
+
+
+def _random_heading_stand(mut qpos: List[Float64]):
+    var yaw = (random_float64() * 2.0 - 1.0) * 3.141592653589793
+    qpos[3] = cos(yaw / 2)
+    qpos[6] = sin(yaw / 2)
+
+
+struct MixSim(WalkSim):
+    """Runs s1-s6: the Playground / RoboParty mix (`unitree_g1_walk.mojo`)."""
 
     var env: E
     var pol: WalkPolicy
@@ -88,12 +131,10 @@ struct Sim(Movable):
         var o = self.env.reset()
         # the stand pose, with a random heading so no gate is axis-aligned
         g1_walk_host_reset(self.env.d, seed, False)
-        var yaw = (random_float64() * 2.0 - 1.0) * 3.141592653589793
-        self.env.d.qpos.data[3] = cos(yaw / 2)
-        self.env.d.qpos.data[6] = sin(yaw / 2)
         var q = List[Float64]()
         for i in range(NQ):
             q.append(Float64(self.env.d.qpos.data[i]))
+        _random_heading_stand(q)
         var v = List[Float64](length=NV, fill=0.0)
         self.env.set_state(q, v)
         self.env.current_step = 0
@@ -149,8 +190,95 @@ struct Sim(Movable):
     def z(self) -> Float64:
         return Float64(self.env.d.qpos.data[2])
 
+    def print_terms(self):
+        for t in range(G1_WALK_N_TERMS):
+            var m = self.term_sum[t] / Float64(max(self.term_n, 1))
+            print("    ", g1_walk_term_name(t), m, " -> ", g1_walk_weight(t) * m)
 
-def gate_falls(mut sim: Sim, episodes: Int) raises -> Int:
+
+struct RPSim(WalkSim):
+    """RoboParty's recipe (`unitree_g1_walk_rp.mojo`), 10-frame policy."""
+
+    var env: ER
+    var pol: WalkRPPolicy
+    var obs: List[Float64]
+    var terms: Array[Float64, G1R_N_TERMS]
+    var term_sum: List[Float64]
+    var term_n: Int
+
+    def __init__(out self, run_dir: String) raises:
+        self.env = ER()
+        self.pol = WalkRPPolicy(run_dir)
+        self.obs = List[Float64](length=G1R_OBS_DIM, fill=0.0)
+        self.terms = Array[Float64, G1R_N_TERMS](fill=0.0)
+        self.term_sum = List[Float64](length=G1R_N_TERMS, fill=0.0)
+        self.term_n = 0
+
+    def reset(mut self, seed: Int) raises:
+        _ = self.env.reset()
+        g1r_host_reset(self.env.d, seed, False)
+        var q = List[Float64]()
+        for i in range(NQ):
+            q.append(Float64(self.env.d.qpos.data[i]))
+        _random_heading_stand(q)
+        var v = List[Float64](length=NV, fill=0.0)
+        self.env.set_state(q, v)
+        self.env.current_step = 0
+        self.pol.reset()
+        self.command(0, 0, 0)
+        var o = self.env._get_obs()
+        for k in range(G1R_OBS_DIM):
+            self.obs[k] = Float64(o.data[k])
+        self.obs[G1R_O_CMD] = 0
+        self.obs[G1R_O_CMD + 1] = 0
+        self.obs[G1R_O_CMD + 2] = 0
+
+    def command(mut self, vx: Float64, vy: Float64, wz: Float64):
+        self.env.d.meta.data[G1R_CMD_VX] = vx
+        self.env.d.meta.data[G1R_CMD_VY] = vy
+        self.env.d.meta.data[G1R_CMD_WZ] = wz
+        self.env.d.meta.data[G1R_CMD_TIMER] = -1.0
+        self.obs[G1R_O_CMD] = vx
+        self.obs[G1R_O_CMD + 1] = vy
+        self.obs[G1R_O_CMD + 2] = wz
+
+    def step(mut self, log_terms: Bool) raises -> Bool:
+        var a = self.pol.act(self.obs)
+        var act = ContAction[ACT]()
+        for j in range(ACT):
+            act[j] = a[j]
+        var r = self.env.step(act)
+        var fell = g1r_host_terms(self.env.d, a, self.terms)
+        if log_terms:
+            for t in range(G1R_N_TERMS):
+                self.term_sum[t] += self.terms[t]
+            self.term_n += 1
+        for k in range(G1R_OBS_DIM):
+            self.obs[k] = Float64(r[0].data[k])
+        return fell
+
+    def body_vel(self) -> Tuple[Float64, Float64, Float64]:
+        var lv = g1_rotate_inverse(
+            Float64(self.env.d.qpos.data[3]), Float64(self.env.d.qpos.data[4]),
+            Float64(self.env.d.qpos.data[5]), Float64(self.env.d.qpos.data[6]),
+            Float64(self.env.d.qvel.data[0]), Float64(self.env.d.qvel.data[1]),
+            Float64(self.env.d.qvel.data[2]),
+        )
+        return (lv[0], lv[1], Float64(self.env.d.qvel.data[5]))
+
+    def xy(self) -> Tuple[Float64, Float64]:
+        return (Float64(self.env.d.qpos.data[0]), Float64(self.env.d.qpos.data[1]))
+
+    def z(self) -> Float64:
+        return Float64(self.env.d.qpos.data[2])
+
+    def print_terms(self):
+        for t in range(G1R_N_TERMS):
+            var m = self.term_sum[t] / Float64(max(self.term_n, 1))
+            print("    ", g1r_term_name(t), m, " -> ", g1r_weight(t) * m)
+
+
+def gate_falls[S: WalkSim](mut sim: S, episodes: Int) raises -> Int:
     var falls = 0
     for ep in range(episodes):
         sim.reset(1000 + ep)
@@ -169,7 +297,7 @@ def gate_falls(mut sim: Sim, episodes: Int) raises -> Int:
     return falls
 
 
-def gate_tracking(mut sim: Sim, starts: Int) raises:
+def gate_tracking[S: WalkSim](mut sim: S, starts: Int) raises:
     var vxs: List[Float64] = [0.0, 0.3, 0.6, 1.0]
     var wzs: List[Float64] = [-1.0, 0.0, 1.0]
     var worst_v = 0.0
@@ -217,7 +345,7 @@ def gate_tracking(mut sim: Sim, starts: Int) raises:
           "| falls", falls, "  (bars: v < 0.1, w < 0.15)")
 
 
-def gate_lag_stop_hold(mut sim: Sim, starts: Int) raises:
+def gate_lag_stop_hold[S: WalkSim](mut sim: S, starts: Int) raises:
     var rise_sum = 0.0
     var travel_sum = 0.0
     var settle_sum = 0.0
@@ -294,21 +422,31 @@ def gate_lag_stop_hold(mut sim: Sim, starts: Int) raises:
     print("  falls in these sequences", falls, "of", starts)
 
 
-def main() raises:
-    var run = _arg("--run", "runs/g1_walk_s1")
-    var episodes = Int(_arg("--episodes", "20"))
-    var starts = Int(_arg("--starts", "5"))
-    seed_rng(Int(_arg("--seed", "1")))
-    var sim = Sim(run)
-    print("G1 walker eval | run", run, "| episodes", episodes, "| starts", starts)
+def run_gates[S: WalkSim](mut sim: S, episodes: Int, starts: Int) raises:
     print("falls (random command sequences, 20 s)")
     var falls = gate_falls(sim, episodes)
     print("  FALLS", falls, "of", episodes, "  (bar 0)")
     print("  reward terms, mean per step over those rollouts (weight x mean):")
-    for t in range(G1_WALK_N_TERMS):
-        var m = sim.term_sum[t] / Float64(max(sim.term_n, 1))
-        print("    ", g1_walk_term_name(t), m, " -> ", g1_walk_weight(t) * m)
+    sim.print_terms()
     print("tracking")
     gate_tracking(sim, starts)
     print("lag / stop / hold")
     gate_lag_stop_hold(sim, starts)
+
+
+def main() raises:
+    var run = _arg("--run", "runs/g1_walk_s1")
+    var recipe = _arg("--recipe", "mix")
+    var episodes = Int(_arg("--episodes", "20"))
+    var starts = Int(_arg("--starts", "5"))
+    seed_rng(Int(_arg("--seed", "1")))
+    print("G1 walker eval | run", run, "| recipe", recipe, "| episodes", episodes,
+          "| starts", starts)
+    if recipe == "rp":
+        var sim = RPSim(run)
+        run_gates(sim, episodes, starts)
+    elif recipe == "mix":
+        var sim = MixSim(run)
+        run_gates(sim, episodes, starts)
+    else:
+        raise Error("--recipe must be mix or rp")

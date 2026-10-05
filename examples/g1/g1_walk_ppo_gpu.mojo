@@ -108,6 +108,13 @@ def main() raises:
             action_scale=Scalar[DT](WALK_ACTION_SCALE),
             log_std_init=Scalar[DT](log_std), max_grad_norm=1.0,
         )
+        # ⚠ `log_std_init` ABOVE IS NOT APPLIED: `PPOTrainer.make` drops it
+        # (`_ = log_std_init`, "the caller's responsibility"). Runs s1-s6
+        # (2026-10-05) all trained at the GaussianHead's default 0 whatever
+        # `--log-std` said. The head is the actor's 7th child.
+        agent.trainer.actor.children[6].set_log_std_init["gpu"](
+            Scalar[DT](log_std), ctx
+        )
         var env = EnvT(ctx)
         env.reset_batch[N_ENVS](ctx=ctx, rng_seed=UInt64(seed))
         ctx.synchronize()
