@@ -12,15 +12,19 @@ itself spans the full sequence. `causal=False` → bidirectional (ViT);
 `causal=True` → decoder (GPT). Input/output per sample: seq_len * dim.
 
   - `MultiHeadAttentionXL` / `MultiHeadAttention`
+  - `MultiHeadAttentionFused` (no `QKVToMajor`: the attention reads the QKV
+    projection's own layout)
   - `TransformerFFN`
-  - `TransformerBlock`
+  - `TransformerBlock` / `TransformerBlockFused`
 """
 
 from noeira.nn.constants import DT
 from ..primitives.linear import Linear
 from ..primitives.layer_norm import LayerNorm
 from ..primitives.activations import GELUTanh
-from ..primitives.attention import ScaledDotProductAttention
+from ..primitives.attention import (
+    ScaledDotProductAttention, ScaledDotProductAttentionQKV,
+)
 from ..primitives.qkv_to_major import QKVToMajor
 from ..combinators.sequential import Sequential
 from ..combinators.residual import Residual
@@ -53,6 +57,22 @@ comptime MultiHeadAttention[
 ]
 
 
+# MultiHeadAttentionFused: `MultiHeadAttention` without the `QKVToMajor`
+# child — `ScaledDotProductAttentionQKV` takes the QKV projection's token-major
+# output, and its fused GPU path reads that layout directly (one permutation
+# pass and its backward fewer per block). Same parameters as
+# `MultiHeadAttention`, but the out projection is child [2], not [3], so a
+# checkpoint of one does not load into the other.
+comptime MultiHeadAttentionFused[
+    dim: Int, n_heads: Int, seq_len: Int, causal: Bool = False,
+    use_max: Bool = True, ADT: DType = DT,
+] = Sequential[
+    Tokenwise[seq_len, Linear[dim, 3 * dim, ADT]],
+    ScaledDotProductAttentionQKV[dim, n_heads, seq_len, causal, use_max, ADT],
+    Tokenwise[seq_len, Linear[dim, dim, ADT]],
+]
+
+
 # TransformerFFN: per-token Linear → GELU → per-token Linear.
 # GELU is pointwise, so applying it to the flat (BATCH, seq_len*ff_dim) tensor
 # is identical to per-token — no Tokenwise wrapper needed.
@@ -75,6 +95,26 @@ comptime TransformerBlock[
         Sequential[
             Tokenwise[seq_len, LayerNorm[dim, ADT]],
             MultiHeadAttention[dim, n_heads, seq_len, causal, use_max, ADT],
+        ]
+    ],
+    Residual[
+        Sequential[
+            Tokenwise[seq_len, LayerNorm[dim, ADT]],
+            TransformerFFN[seq_len, dim, ff_dim, ADT],
+        ]
+    ],
+]
+
+
+# TransformerBlockFused: `TransformerBlock` on `MultiHeadAttentionFused`.
+comptime TransformerBlockFused[
+    dim: Int, n_heads: Int, seq_len: Int, ff_dim: Int, causal: Bool = False,
+    use_max: Bool = True, ADT: DType = DT,
+] = Sequential[
+    Residual[
+        Sequential[
+            Tokenwise[seq_len, LayerNorm[dim, ADT]],
+            MultiHeadAttentionFused[dim, n_heads, seq_len, causal, use_max, ADT],
         ]
     ],
     Residual[

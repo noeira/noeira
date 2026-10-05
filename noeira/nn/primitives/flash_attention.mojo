@@ -14,9 +14,11 @@ Each output element is owned by exactly one thread of one block, with no
 atomics: the result is deterministic, so an eager run and a CUDA-graph replay
 stay bit-identical. The price is computing S and dP in both backward kernels.
 
-Layouts are the leaf's own (per sample, heads interleaved in DIM):
-  input  [Q tokens | K tokens | V tokens], element (i, h, d) of Q at
-         i·DIM + h·HD + d, K at +S·DIM, V at +2·S·DIM;
+Layouts (per sample, heads interleaved in DIM):
+  input  `IL=False`: the leaf's [Q tokens | K tokens | V tokens], element
+         (i, h, d) of Q at i·DIM + h·HD + d, K at +S·DIM, V at +2·S·DIM;
+         `IL=True`: the QKV projection's own token-major output, token i at
+         i·3·DIM with q at +0, k at +DIM, v at +2·DIM (no `QKVToMajor`);
   output / grad_output [tokens], (i, h, d) at i·DIM + h·HD + d;
   grad_input = input's layout. Every element of the output and of the grad
   input is written (rows < S), so neither needs clearing.
@@ -204,7 +206,8 @@ def _pv[
 
 
 def _flash_fwd_kernel[
-    ADT: DType, H: Int, S: Int, HD: Int, CAUSAL: Bool, TQ: Int, TK: Int
+    ADT: DType, H: Int, S: Int, HD: Int, CAUSAL: Bool, TQ: Int, TK: Int,
+    IL: Bool = False,
 ](
     inp: Pointer[Scalar[ADT], MutAnyOrigin],
     outp: Pointer[Scalar[ADT], MutAnyOrigin],
@@ -216,6 +219,9 @@ def _flash_fwd_kernel[
     comptime DIM = H * HD
     comptime IN_DIM = 3 * S * DIM
     comptime OUT_DIM = S * DIM
+    comptime IS = 3 * DIM if IL else DIM  # input token stride
+    comptime KO = DIM if IL else S * DIM  # K, then V, offset in the input
+    comptime VO = 2 * DIM if IL else 2 * S * DIM
     comptime NT = TQ * TK // 16
     comptime CG = TK // 4
     comptime DPT = HD // CG
@@ -238,14 +244,14 @@ def _flash_fwd_kernel[
 
     var base = b * IN_DIM + h * HD
     _stash[TQ, HD, NT](
-        Qs, _fetch[ADT, TQ, HD, DIM, S, NT](inp, base, qt * TQ, t), t
+        Qs, _fetch[ADT, TQ, HD, IS, S, NT](inp, base, qt * TQ, t), t
     )
     comptime N_KT = (S + TK - 1) // TK
     var kt_end = N_KT
     comptime if CAUSAL:
         kt_end = min(N_KT, (qt * TQ + TQ - 1) // TK + 1)
-    var kreg = _fetch[ADT, TK, HD, DIM, S, NT](inp, base + S * DIM, 0, t)
-    var vreg = _fetch[ADT, TK, HD, DIM, S, NT](inp, base + 2 * S * DIM, 0, t)
+    var kreg = _fetch[ADT, TK, HD, IS, S, NT](inp, base + KO, 0, t)
+    var vreg = _fetch[ADT, TK, HD, IS, S, NT](inp, base + VO, 0, t)
 
     var m = SIMD[DT, 4](_NEG)
     var l = SIMD[DT, 4](0)
@@ -256,11 +262,11 @@ def _flash_fwd_kernel[
         _stash[TK, HD, NT](Vs, vreg, t)
         barrier()
         if kt + 1 < kt_end:
-            kreg = _fetch[ADT, TK, HD, DIM, S, NT](
-                inp, base + S * DIM, (kt + 1) * TK, t
+            kreg = _fetch[ADT, TK, HD, IS, S, NT](
+                inp, base + KO, (kt + 1) * TK, t
             )
-            vreg = _fetch[ADT, TK, HD, DIM, S, NT](
-                inp, base + 2 * S * DIM, (kt + 1) * TK, t
+            vreg = _fetch[ADT, TK, HD, IS, S, NT](
+                inp, base + VO, (kt + 1) * TK, t
             )
         var s = _qk[TQ, TK, HD](Qs, Ks, r0, tx)
         comptime for i in range(4):
@@ -333,7 +339,8 @@ def _flash_d_kernel[
 
 
 def _flash_bwd_dq_kernel[
-    ADT: DType, H: Int, S: Int, HD: Int, CAUSAL: Bool, TQ: Int, TK: Int
+    ADT: DType, H: Int, S: Int, HD: Int, CAUSAL: Bool, TQ: Int, TK: Int,
+    IL: Bool = False,
 ](
     inp: Pointer[Scalar[ADT], MutAnyOrigin],
     dout: Pointer[Scalar[ADT], MutAnyOrigin],
@@ -346,6 +353,9 @@ def _flash_bwd_dq_kernel[
     comptime DIM = H * HD
     comptime IN_DIM = 3 * S * DIM
     comptime OUT_DIM = S * DIM
+    comptime IS = 3 * DIM if IL else DIM  # input token stride
+    comptime KO = DIM if IL else S * DIM  # K, then V, offset in the input
+    comptime VO = 2 * DIM if IL else 2 * S * DIM
     comptime NT = TQ * TK // 16
     comptime CG = TK // 4
     comptime DPT = HD // CG
@@ -371,7 +381,7 @@ def _flash_bwd_dq_kernel[
     var base = b * IN_DIM + h * HD
     var obase = b * OUT_DIM + h * HD
     _stash[TQ, HD, NT](
-        Qs, _fetch[ADT, TQ, HD, DIM, S, NT](inp, base, qt * TQ, t), t
+        Qs, _fetch[ADT, TQ, HD, IS, S, NT](inp, base, qt * TQ, t), t
     )
     _stash[TQ, HD, NT](
         dOs, _fetch[ADT, TQ, HD, DIM, S, NT](dout, obase, qt * TQ, t), t
@@ -387,8 +397,8 @@ def _flash_bwd_dq_kernel[
     var kt_end = N_KT
     comptime if CAUSAL:
         kt_end = min(N_KT, (qt * TQ + TQ - 1) // TK + 1)
-    var kreg = _fetch[ADT, TK, HD, DIM, S, NT](inp, base + S * DIM, 0, t)
-    var vreg = _fetch[ADT, TK, HD, DIM, S, NT](inp, base + 2 * S * DIM, 0, t)
+    var kreg = _fetch[ADT, TK, HD, IS, S, NT](inp, base + KO, 0, t)
+    var vreg = _fetch[ADT, TK, HD, IS, S, NT](inp, base + VO, 0, t)
 
     var dq = SIMD[DT, 4 * DPT](0)
     for kt in range(kt_end):
@@ -397,11 +407,11 @@ def _flash_bwd_dq_kernel[
         _stash[TK, HD, NT](Vs, vreg, t)
         barrier()
         if kt + 1 < kt_end:
-            kreg = _fetch[ADT, TK, HD, DIM, S, NT](
-                inp, base + S * DIM, (kt + 1) * TK, t
+            kreg = _fetch[ADT, TK, HD, IS, S, NT](
+                inp, base + KO, (kt + 1) * TK, t
             )
-            vreg = _fetch[ADT, TK, HD, DIM, S, NT](
-                inp, base + 2 * S * DIM, (kt + 1) * TK, t
+            vreg = _fetch[ADT, TK, HD, IS, S, NT](
+                inp, base + VO, (kt + 1) * TK, t
             )
         var s = _qk[TQ, TK, HD](Qs, Ks, r0, tx)
         var dp = _qk[TQ, TK, HD](dOs, Vs, r0, tx)
@@ -421,14 +431,15 @@ def _flash_bwd_dq_kernel[
     comptime for i in range(4):
         var row = qt * TQ + r0 + i
         if row < S:
-            var gb = b * IN_DIM + row * DIM + h * HD
+            var gb = b * IN_DIM + row * IS + h * HD
             comptime for q in range(NC):
                 var v = _get4[4 * DPT, i * DPT + q * 4](dq) * scale
                 gin.unsafe_store[alignment=AL](gb + (tx + CG * q) * 4, v.cast[ADT]())
 
 
 def _flash_bwd_dkdv_kernel[
-    ADT: DType, H: Int, S: Int, HD: Int, CAUSAL: Bool, TQ: Int, TK: Int
+    ADT: DType, H: Int, S: Int, HD: Int, CAUSAL: Bool, TQ: Int, TK: Int,
+    IL: Bool = False,
 ](
     inp: Pointer[Scalar[ADT], MutAnyOrigin],
     dout: Pointer[Scalar[ADT], MutAnyOrigin],
@@ -446,6 +457,9 @@ def _flash_bwd_dkdv_kernel[
     comptime DIM = H * HD
     comptime IN_DIM = 3 * S * DIM
     comptime OUT_DIM = S * DIM
+    comptime IS = 3 * DIM if IL else DIM  # input token stride
+    comptime KO = DIM if IL else S * DIM  # K, then V, offset in the input
+    comptime VO = 2 * DIM if IL else 2 * S * DIM
     comptime NT = TQ * TK // 16
     comptime CG = TK // 4
     comptime DG = NT // (TK // 4)
@@ -477,18 +491,18 @@ def _flash_bwd_dkdv_kernel[
     var base = b * IN_DIM + h * HD
     var obase = b * OUT_DIM + h * HD
     _stash[TK, HD, NT](
-        Ks, _fetch[ADT, TK, HD, DIM, S, NT](inp, base + S * DIM, kt * TK, t), t
+        Ks, _fetch[ADT, TK, HD, IS, S, NT](inp, base + KO, kt * TK, t), t
     )
     _stash[TK, HD, NT](
         Vs,
-        _fetch[ADT, TK, HD, DIM, S, NT](inp, base + 2 * S * DIM, kt * TK, t),
+        _fetch[ADT, TK, HD, IS, S, NT](inp, base + VO, kt * TK, t),
         t,
     )
     comptime N_QT = (S + TQ - 1) // TQ
     var qt0 = 0
     comptime if CAUSAL:
         qt0 = (kt * TK) // TQ
-    var qreg = _fetch[ADT, TQ, HD, DIM, S, NT](inp, base, qt0 * TQ, t)
+    var qreg = _fetch[ADT, TQ, HD, IS, S, NT](inp, base, qt0 * TQ, t)
     var oreg = _fetch[ADT, TQ, HD, DIM, S, NT](dout, obase, qt0 * TQ, t)
 
     var dk = SIMD[DT, 4 * DPK](0)
@@ -499,7 +513,7 @@ def _flash_bwd_dkdv_kernel[
         _stash[TQ, HD, NT](dOs, oreg, t)
         barrier()
         if qt + 1 < N_QT:
-            qreg = _fetch[ADT, TQ, HD, DIM, S, NT](inp, base, (qt + 1) * TQ, t)
+            qreg = _fetch[ADT, TQ, HD, IS, S, NT](inp, base, (qt + 1) * TQ, t)
             oreg = _fetch[ADT, TQ, HD, DIM, S, NT](
                 dout, obase, (qt + 1) * TQ, t
             )
@@ -540,19 +554,20 @@ def _flash_bwd_dkdv_kernel[
     comptime for i in range(4):
         var key = kt * TK + k0 + i
         if key < S:
-            var gb = b * IN_DIM + key * DIM + h * HD
+            var gb = b * IN_DIM + key * IS + h * HD
             comptime for q in range(NCK):
                 var off = gb + (dg + DG * q) * 4
                 var kv = _get4[4 * DPK, i * DPK + q * 4](dk) * scale
-                gin.unsafe_store[alignment=AL](off + S * DIM, kv.cast[ADT]())
+                gin.unsafe_store[alignment=AL](off + KO, kv.cast[ADT]())
                 gin.unsafe_store[alignment=AL](
-                    off + 2 * S * DIM,
+                    off + VO,
                     _get4[4 * DPK, i * DPK + q * 4](dv).cast[ADT](),
                 )
 
 
 def flash_forward[
-    ADT: DType, H: Int, S: Int, HD: Int, CAUSAL: Bool, BH: Int
+    ADT: DType, H: Int, S: Int, HD: Int, CAUSAL: Bool, BH: Int,
+    IL: Bool = False,
 ](
     c: DeviceContext,
     inp: DeviceBuffer[ADT],
@@ -563,7 +578,7 @@ def flash_forward[
     """Enqueue the forward: `outp` [B, S·DIM], `o_cache` (fp32, same) and
     `lse` [BH·S] (log2 units)."""
     c.enqueue_function[
-        _flash_fwd_kernel[ADT, H, S, HD, CAUSAL, FWD_TQ, FWD_TK]
+        _flash_fwd_kernel[ADT, H, S, HD, CAUSAL, FWD_TQ, FWD_TK, IL]
     ](
         inp, outp, o_cache, lse,
         grid_dim=((S + FWD_TQ - 1) // FWD_TQ, BH),
@@ -572,7 +587,8 @@ def flash_forward[
 
 
 def flash_backward[
-    ADT: DType, H: Int, S: Int, HD: Int, CAUSAL: Bool, BH: Int
+    ADT: DType, H: Int, S: Int, HD: Int, CAUSAL: Bool, BH: Int,
+    IL: Bool = False,
 ](
     c: DeviceContext,
     inp: DeviceBuffer[ADT],
@@ -590,14 +606,14 @@ def flash_backward[
         grid_dim=(ROWS * WARP_SIZE + TPB - 1) // TPB, block_dim=TPB,
     )
     c.enqueue_function[
-        _flash_bwd_dq_kernel[ADT, H, S, HD, CAUSAL, DQ_TQ, DQ_TK]
+        _flash_bwd_dq_kernel[ADT, H, S, HD, CAUSAL, DQ_TQ, DQ_TK, IL]
     ](
         inp, dout, lse, dvec, gin,
         grid_dim=((S + DQ_TQ - 1) // DQ_TQ, BH),
         block_dim=DQ_TQ * DQ_TK // 16,
     )
     c.enqueue_function[
-        _flash_bwd_dkdv_kernel[ADT, H, S, HD, CAUSAL, KV_TQ, KV_TK]
+        _flash_bwd_dkdv_kernel[ADT, H, S, HD, CAUSAL, KV_TQ, KV_TK, IL]
     ](
         inp, dout, lse, dvec, gin,
         grid_dim=((S + KV_TK - 1) // KV_TK, BH),

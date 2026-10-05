@@ -35,7 +35,7 @@ GPTDropTied child tree (for the surgery walks):
     [3] Repeat[TransformerBlockDrop]
           .children[L] = block L (Sequential):
             [0] Residual(LN + MHADrop) ; .inner.children[1] = MHADrop =
-                  Seq[Tok[Lin d,3d], QKVToMajor, Attn, Tok[Lin d,d]@[3], Dropout]
+                  Seq[Tok[Lin d,3d], AttnQKV, Tok[Lin d,d]@[2], Dropout]
             [1] Residual(LN + FFNDrop) ; .inner.children[1] = FFNDrop =
                   Seq[Tok[Lin d,ff], GELU, Tok[Lin ff,d]@[2], Dropout]
     [4] Tokenwise[LayerNorm]
@@ -55,9 +55,8 @@ from ..primitives.layer_norm import LayerNorm
 from ..primitives.activations import GELUTanh
 from ..primitives.embedding import Embedding
 from ..primitives.bias_add import BiasAdd
-from ..primitives.attention import ScaledDotProductAttention
+from ..primitives.attention import ScaledDotProductAttentionQKV
 from ..primitives.dropout import Dropout
-from ..primitives.qkv_to_major import QKVToMajor
 from ..combinators.sequential import Sequential
 from ..combinators.residual import Residual
 from ..combinators.repeat import Repeat
@@ -114,8 +113,7 @@ comptime MultiHeadAttentionDrop[
     dropout_p: Float64, seed: UInt64, use_max: Bool = True, ADT: DType = DT,
 ] = Sequential[
     Tokenwise[seq_len, Linear[dim, 3 * dim, ADT]],
-    QKVToMajor[seq_len, dim, ADT],
-    ScaledDotProductAttention[dim, n_heads, seq_len, causal, use_max, ADT],
+    ScaledDotProductAttentionQKV[dim, n_heads, seq_len, causal, use_max, ADT],
     Tokenwise[seq_len, Linear[dim, dim, ADT]],
     Dropout[seq_len * dim, dropout_p, seed, ADT],
 ]
@@ -298,10 +296,10 @@ def gpt_scale_residual_proj[
     # previous "bind a_w and f_w, then use both" shape tripped over.
     for L in range(n_layers):
         # attn-out c_proj: block.children[0] (Residual) .inner.children[1]
-        # (MHADrop) .children[3] (Tok[Lin d,d]) .inner.weight
+        # (MHADrop) .children[2] (Tok[Lin d,d]) .inner.weight
         _gpt_scale_weight[target, DD](
             net.children[3].children[L].children[0]
-            .inner.children[1].children[3].inner.weight.val,
+            .inner.children[1].children[2].inner.weight.val,
             s,
             ctx,
         )

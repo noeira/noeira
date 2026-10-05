@@ -39,10 +39,11 @@ from noeira.nn.constants import DT, TPB
 from noeira.nn.random.hash_mask import hash_keep, new_dropout_seed
 from .flash_attention import flash_eligible, flash_forward, flash_backward
 from ..core.tensor import Tensor, TensorImpl
-from ..core.tensor_refs import TensorRefs
+from ..core.tensor_refs import TensorRefs, child_refs
 from ..core.module import Module
 from ..core.initializer import Initializer
 from ..core.amp import AMPPolicy, NoAMP
+from .qkv_to_major import QKVToMajor
 
 
 # ──────────────────────────────────────────────────────────────────────
@@ -1517,3 +1518,138 @@ struct ScaledDotProductAttention[
 
     # for_each_param / zero_grad inherit the Module reflection defaults
     # (no Param fields → no-op).
+
+
+struct ScaledDotProductAttentionQKV[
+    DIM: Int,
+    N_HEADS: Int,
+    SEQ_LEN: Int,
+    CAUSAL: Bool = False,
+    USE_MAX_KERNELS: Bool = True,
+    ADT: DType = DT,
+    P_DROP: Float64 = 0.0,
+](Module):
+    """`ScaledDotProductAttention` on the QKV projection's OWN layout: the
+    input is `Tokenwise[Linear[DIM, 3·DIM]]`'s token-major output (token i at
+    i·3·DIM, q / k / v at +0 / +DIM / +2·DIM), so a composition needs no
+    `QKVToMajor` in front of it.
+
+    Where the fused kernels apply (GPU, `USE_FLASH`) they read and write that
+    layout directly (`flash_forward[..., IL=True]`): the permutation and its
+    backward — two full passes over the [B, S, 3·DIM] activation — are gone.
+    Everywhere else (CPU, dropout, heads the fused path does not cover) it
+    permutes with its own `QKVToMajor` and runs `ScaledDotProductAttention`
+    unchanged, so the result is the one `QKVToMajor` + that leaf compute.
+
+    The compositions that predate it (`MultiHeadAttentionXL`, LeWM's and
+    SmolVLA's blocks) keep `QKVToMajor`: their child indices name checkpoint
+    parameters."""
+    comptime ATTN = ScaledDotProductAttention[
+        Self.DIM, Self.N_HEADS, Self.SEQ_LEN, Self.CAUSAL,
+        Self.USE_MAX_KERNELS, Self.ADT, Self.P_DROP,
+    ]
+    comptime PERM = QKVToMajor[Self.SEQ_LEN, Self.DIM, Self.ADT]
+    comptime ARITY: Int = 1
+    comptime ACT_DT = Self.ADT
+    comptime IN_DIMS = Array[Int, 1](fill=Self.SEQ_LEN * Self.DIM * 3)
+    comptime IN_DIM0 = Self.SEQ_LEN * Self.DIM * 3
+    comptime OUT_DIM = Self.SEQ_LEN * Self.DIM
+
+    var attn: Self.ATTN
+    var perm: Self.PERM
+    var major: TensorImpl[Self.ADT]  # fallback: the permuted input
+    var gmajor: TensorImpl[Self.ADT]  # fallback: its gradient
+
+    def __init__(out self):
+        self.attn = Self.ATTN()
+        self.perm = Self.PERM()
+        self.major = TensorImpl[Self.ADT]()
+        self.gmajor = TensorImpl[Self.ADT]()
+
+    @staticmethod
+    def make[
+        target: StaticString, INIT: Initializer
+    ](ctx: Optional[DeviceContext] = None) raises -> Self:
+        comptime assert target == "cpu" or target == "gpu", (
+            "ScaledDotProductAttentionQKV: target must be 'cpu' or 'gpu'"
+        )
+        comptime if target != "cpu":
+            if not ctx:
+                raise Error(
+                    "ScaledDotProductAttentionQKV.make[target='gpu']: ctx"
+                    " required"
+                )
+        return Self()
+
+    def set_attr[ATTR: StaticString](mut self, value: Scalar[DT]):
+        """Forwarded to the attention (`dropout`)."""
+        self.attn.set_attr[ATTR](value)
+
+    def release_buffers(mut self):
+        self.attn.release_buffers()
+        self.major.release()
+        self.gmajor.release()
+
+    def forward[
+        target: StaticString, B: Int, o: MutOrigin, POLICY: AMPPolicy = NoAMP
+    ](
+        mut self,
+        inputs: TensorRefs[1, o, Self.ACT_DT],
+        mut out: TensorImpl[Self.ACT_DT],
+        ctx: Optional[DeviceContext] = None,
+    ) raises:
+        comptime if target == "gpu" and Self.ATTN.USE_FLASH:
+            ref in0 = inputs[0]
+            var c = ctx.value()
+            out.ensure_gpu(c, B * Self.OUT_DIM)
+            self.attn.o_cache.ensure_gpu(c, B * Self.OUT_DIM)
+            self.attn.lse.ensure_gpu(c, B * Self.N_HEADS * Self.SEQ_LEN)
+            flash_forward[
+                Self.ADT, Self.N_HEADS, Self.SEQ_LEN, Self.ATTN.HEAD_DIM,
+                Self.CAUSAL, B * Self.N_HEADS, IL=True,
+            ](
+                c, in0.dev.value(), out.dev.value(),
+                self.attn.o_cache.dev.value(), self.attn.lse.dev.value(),
+            )
+        else:
+            self.perm.forward[target, B, POLICY=POLICY](inputs, self.major, ctx)
+            self.attn.forward[target, B, POLICY=POLICY](
+                child_refs[1, Self.ADT](self.major), out, ctx
+            )
+
+    def vjp[
+        target: StaticString, B: Int, ofi: MutOrigin, ogi: MutOrigin,
+        POLICY: AMPPolicy = NoAMP,
+    ](
+        mut self,
+        forward_input: TensorRefs[1, ofi, Self.ACT_DT],
+        mut grad_output: TensorImpl[Self.ACT_DT],
+        grad_inputs: TensorRefs[1, ogi, Self.ACT_DT],
+        ctx: Optional[DeviceContext] = None,
+    ) raises:
+        comptime if target == "gpu" and Self.ATTN.USE_FLASH:
+            ref fin = forward_input[0]
+            ref gin = grad_inputs[0]
+            var c = ctx.value()
+            gin.ensure_gpu(c, B * Self.IN_DIM0)
+            self.attn.dvec.ensure_gpu(c, B * Self.N_HEADS * Self.SEQ_LEN)
+            flash_backward[
+                Self.ADT, Self.N_HEADS, Self.SEQ_LEN, Self.ATTN.HEAD_DIM,
+                Self.CAUSAL, B * Self.N_HEADS, IL=True,
+            ](
+                c, fin.dev.value(), grad_output.dev.value(),
+                self.attn.o_cache.dev.value(), self.attn.lse.dev.value(),
+                self.attn.dvec.dev.value(), gin.dev.value(),
+            )
+        else:
+            self.attn.vjp[target, B, POLICY=POLICY](
+                child_refs[1, Self.ADT](self.major), grad_output,
+                child_refs[1, Self.ADT](self.gmajor), ctx,
+            )
+            self.perm.vjp[target, B, POLICY=POLICY](
+                forward_input, self.gmajor, grad_inputs, ctx
+            )
+
+    @staticmethod
+    def display_label() -> String:
+        return String("ScaledDotProductAttentionQKV")
