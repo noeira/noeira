@@ -20,8 +20,10 @@ is GPU-only. The reductions stay in LN_ACC (fp32) so accuracy is unchanged.
 """
 
 from std.math import sqrt
-from max.gpu import thread_idx, block_idx
+from max.gpu import thread_idx, block_idx, global_idx
 from max.gpu.primitives import block
+from max.gpu.sync import barrier
+from max.gpu.memory import AddressSpace
 from max.gpu.host import DeviceContext
 from std.utils.numerics import get_accum_type
 from layout import Layout, LayoutTensor, TileTensor, row_major
@@ -227,37 +229,85 @@ def _layer_norm_backward_dx_kernel[
             idx += LN_TPB
 
 
-def _layer_norm_backward_dparams_kernel[
-    BATCH: Int,
-    DIM: Int,
-    ADT: DType = DT,
+comptime _DP_COLS = 32
+comptime _DP_ROWS = 8
+comptime _DP_CHUNK = 1024
+"""Rows per partial sum of the γ / β gradients."""
+
+
+def _ln_dparams_partial_kernel[
+    BATCH: Int, DIM: Int, ADT: DType = DT
 ](
     grad_output: LayoutTensor[ADT, Layout.row_major(BATCH, DIM), MutAnyOrigin],
     cache_xhat: LayoutTensor[DT, Layout.row_major(BATCH, DIM), MutAnyOrigin],
+    part: LayoutTensor[
+        DT,
+        Layout.row_major(2 * ((BATCH + _DP_CHUNK - 1) // _DP_CHUNK) * DIM),
+        MutAnyOrigin,
+    ],
+):
+    """`part[c, j] = Σ go·x̂` and `part[CHUNKS + c, j] = Σ go` over the rows of
+    chunk c (`_DP_CHUNK` rows). Block (`_DP_COLS`, `_DP_ROWS`): lanes along j,
+    so a warp reads 32 consecutive columns of a row (coalesced); the
+    `_DP_ROWS` row-strided sums are reduced in a fixed order in shared memory.
+    Replaces one block per COLUMN with threads walking the rows, which read 32
+    different rows per warp load (`enqueue_bias_grad`'s fix, two sums)."""
+    comptime CHUNKS = (BATCH + _DP_CHUNK - 1) // _DP_CHUNK
+    var tx = Int(thread_idx.x)
+    var ty = Int(thread_idx.y)
+    var j = Int(block_idx.x) * _DP_COLS + tx
+    var ch = Int(block_idx.y)
+    var r0 = ch * _DP_CHUNK
+    var r1 = min(r0 + _DP_CHUNK, BATCH)
+    var acc = LayoutTensor[
+        DT, Layout.row_major(2 * _DP_ROWS, _DP_COLS), MutAnyOrigin,
+        address_space=AddressSpace.SHARED,
+    ].stack_allocation()
+    var sg: Scalar[DT] = 0
+    var sb: Scalar[DT] = 0
+    if j < DIM:
+        var r = r0 + ty
+        while r < r1:
+            var go = rebind[Scalar[ADT]](grad_output[r, j]).cast[DT]()
+            sg += go * rebind[Scalar[DT]](cache_xhat[r, j])
+            sb += go
+            r += _DP_ROWS
+    acc[ty, tx] = sg
+    acc[_DP_ROWS + ty, tx] = sb
+    barrier()
+    if ty == 0 and j < DIM:
+        var tg: Scalar[DT] = 0
+        var tb: Scalar[DT] = 0
+        comptime for k in range(_DP_ROWS):
+            tg += rebind[Scalar[DT]](acc[k, tx])
+            tb += rebind[Scalar[DT]](acc[_DP_ROWS + k, tx])
+        part[ch * DIM + j] = tg
+        part[(CHUNKS + ch) * DIM + j] = tb
+
+
+def _ln_dparams_final_kernel[
+    BATCH: Int, DIM: Int
+](
+    part: LayoutTensor[
+        DT,
+        Layout.row_major(2 * ((BATCH + _DP_CHUNK - 1) // _DP_CHUNK) * DIM),
+        MutAnyOrigin,
+    ],
     grad_gamma: LayoutTensor[DT, Layout.row_major(DIM), MutAnyOrigin],
     grad_beta: LayoutTensor[DT, Layout.row_major(DIM), MutAnyOrigin],
 ):
-    # γ/β grads accumulate into the fp32 master (`grad_gamma`/`grad_beta`); the
-    # bf16 `grad_output` operand is read `.cast[DT]()` UP to fp32, the cache is
-    # already fp32 → the whole accumulation is fp32.
-    var col = Int(block_idx.x)
-    var t = Int(thread_idx.x)
-    if col >= DIM:
-        return
-    var my_dg: Scalar[DT] = 0.0
-    var my_db: Scalar[DT] = 0.0
-    var bi = t
-    while bi < BATCH:
-        var go = rebind[Scalar[ADT]](grad_output[bi, col]).cast[DT]()
-        var xh = rebind[Scalar[DT]](cache_xhat[bi, col])
-        my_dg += go * xh
-        my_db += go
-        bi += LN_TPB
-    var total_dg = block.sum[block_size=LN_TPB, broadcast=False](val=my_dg)
-    var total_db = block.sum[block_size=LN_TPB, broadcast=False](val=my_db)
-    if t == 0:
-        grad_gamma[col] = rebind[Scalar[DT]](grad_gamma[col]) + total_dg[0]
-        grad_beta[col] = rebind[Scalar[DT]](grad_beta[col]) + total_db[0]
+    """`dγ[j] += Σ_c part[c, j]`, `dβ[j] += Σ_c part[CHUNKS + c, j]`, chunks
+    in order (deterministic)."""
+    comptime CHUNKS = (BATCH + _DP_CHUNK - 1) // _DP_CHUNK
+    var j = Int(global_idx.x)
+    if j < DIM:
+        var tg: Scalar[DT] = 0
+        var tb: Scalar[DT] = 0
+        for c in range(CHUNKS):
+            tg += rebind[Scalar[DT]](part[c * DIM + j])
+            tb += rebind[Scalar[DT]](part[(CHUNKS + c) * DIM + j])
+        grad_gamma[j] = rebind[Scalar[DT]](grad_gamma[j]) + tg
+        grad_beta[j] = rebind[Scalar[DT]](grad_beta[j]) + tb
 
 
 struct LayerNorm[DIM_: Int, ADT: DType = DT, EPS: Scalar[DT] = LN_EPS](Module):
@@ -275,12 +325,14 @@ struct LayerNorm[DIM_: Int, ADT: DType = DT, EPS: Scalar[DT] = LN_EPS](Module):
     var beta: Param["beta", False, Self.DIM_]
     var cache_xhat: Tensor  # [BATCH, DIM] — fp32 (fp32-internal)
     var cache_inv_std: Tensor  # [BATCH] — fp32
+    var dp_part: Tensor  # γ/β gradient partials [2 · chunks · DIM] — fp32
 
     def __init__(out self):
         self.gamma = Param["gamma", False, Self.DIM_]()
         self.beta = Param["beta", False, Self.DIM_]()
         self.cache_xhat = Tensor()
         self.cache_inv_std = Tensor()
+        self.dp_part = Tensor()
 
     @staticmethod
     def make[
@@ -301,6 +353,7 @@ struct LayerNorm[DIM_: Int, ADT: DType = DT, EPS: Scalar[DT] = LN_EPS](Module):
         """`cache_xhat` / `cache_inv_std`: rebuilt by every forward."""
         self.cache_xhat.release()
         self.cache_inv_std.release()
+        self.dp_part.release()
 
     def forward[
         target: StaticString, B: Int, o: MutOrigin, POLICY: AMPPolicy = NoAMP
@@ -515,16 +568,7 @@ struct LayerNorm[DIM_: Int, ADT: DType = DT, EPS: Scalar[DT] = LN_EPS](Module):
                     grid_dim=B,
                     block_dim=LN_TPB,
                 )
-                c.enqueue_function[
-                    _layer_norm_backward_dparams_kernel[B, Self.DIM_, Self.ADT]
-                ](
-                    god.lt["gpu", l2d](),
-                    self.cache_xhat.lt["gpu", l2d](),
-                    self.gamma.grd.lt["gpu", ld](),
-                    self.beta.grd.lt["gpu", ld](),
-                    grid_dim=Self.DIM_,
-                    block_dim=LN_TPB,
-                )
+                self._dparams_gpu[B](grad_output, c)
         else:
             # ── bf16-flow path (GPU-only). I/O activations cast at the boundary;
             #    grad math + γ/β masters + cache stay fp32 (fp32-internal). ──
@@ -547,16 +591,34 @@ struct LayerNorm[DIM_: Int, ADT: DType = DT, EPS: Scalar[DT] = LN_EPS](Module):
                 grid_dim=B,
                 block_dim=LN_TPB,
             )
-            c.enqueue_function[
-                _layer_norm_backward_dparams_kernel[B, Self.DIM_, Self.ADT]
-            ](
-                grad_output.lt["gpu", l2d](),
-                self.cache_xhat.lt["gpu", l2d](),
-                self.gamma.grd.lt["gpu", ld](),
-                self.beta.grd.lt["gpu", ld](),
-                grid_dim=Self.DIM_,
-                block_dim=LN_TPB,
-            )
+            self._dparams_gpu[B](grad_output, c)
+
+    def _dparams_gpu[B: Int](
+        mut self, mut go: TensorImpl[Self.ACT_DT], c: DeviceContext
+    ) raises:
+        """dγ += Σ go·x̂, dβ += Σ go over the B rows: chunk partials, then
+        the chunks summed in order."""
+        comptime CHUNKS = (B + _DP_CHUNK - 1) // _DP_CHUNK
+        comptime l2d = Layout.row_major(B, Self.DIM_)
+        comptime ld = Layout.row_major(Self.DIM_)
+        comptime lp = Layout.row_major(2 * CHUNKS * Self.DIM_)
+        self.dp_part.ensure_gpu(c, 2 * CHUNKS * Self.DIM_)
+        c.enqueue_function[
+            _ln_dparams_partial_kernel[B, Self.DIM_, Self.ADT]
+        ](
+            go.lt["gpu", l2d](),
+            self.cache_xhat.lt["gpu", l2d](),
+            self.dp_part.lt["gpu", lp](),
+            grid_dim=((Self.DIM_ + _DP_COLS - 1) // _DP_COLS, CHUNKS),
+            block_dim=(_DP_COLS, _DP_ROWS),
+        )
+        c.enqueue_function[_ln_dparams_final_kernel[B, Self.DIM_]](
+            self.dp_part.lt["gpu", lp](),
+            self.gamma.grd.lt["gpu", ld](),
+            self.beta.grd.lt["gpu", ld](),
+            grid_dim=(Self.DIM_ + 255) // 256,
+            block_dim=256,
+        )
 
     # for_each_param / zero_grad inherit the Module reflection defaults
     # (core/walkers.mojo auto-discovers the Param fields).
