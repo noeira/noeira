@@ -67,6 +67,7 @@ from .blocks.gae_step import PPOGAEStep
 from .blocks.minibatch_gather_step import PPOMinibatchGatherStep
 from .blocks.actor_train_step import PPOActorTrainStep
 from .blocks.critic_train_step import PPOCriticTrainStep
+from .blocks.device_rollout import PPODeviceRollout
 from .metrics import PPOMetrics
 from .objective import (
     LOG_STD_MIN,
@@ -283,6 +284,10 @@ struct PPOTrainer[
     (`begin_update_device`): the losses then live on the device and the
     networks re-pad their weights on every forward (`capture_recast`)."""
     var _t_upd_start: Int
+    var device_rollout: PPODeviceRollout
+    var _device_rollout: Bool
+    """True once `enable_device_rollout` ran: the rollout lives on the
+    device and the update runs GAE there (`begin_update_device`)."""
     # Never reset by `flush_*` — emitted as `train_steps` so the
     # downstream monitor can plot cumulative minibatch updates.
     var _total_train_steps: Int
@@ -373,6 +378,8 @@ struct PPOTrainer[
         self._total_train_steps = 0
         self._device_update = False
         self._t_upd_start = 0
+        self.device_rollout = PPODeviceRollout()
+        self._device_rollout = False
         self.timer = Timer.new()
         self.ctx = None
 
@@ -843,9 +850,21 @@ struct PPOTrainer[
             self._device_update = True
 
         var t_gae = perf_counter_ns()
-        self.gae_step.step[
-            Self.train_target, Self.ACT_DIM, Self.MINIBATCH, Self.N_ENVS,
-        ](self.state, self.critic, self.gamma, self.gae_lambda)
+        if self._device_rollout:
+            # The pool is on the device: bootstrap V(s_T), GAE there, and the
+            # advantages down once for the host shuffle's normalisation.
+            call_forward["gpu", Self.N_ENVS](
+                self.critic,
+                TensorRefs[Self.CRITIC.ARITY](self.state.bootstrap_obs),
+                self.state.v1,
+                self.ctx,
+            )
+            self.device_rollout.gae(self.state, self.gamma, self.gae_lambda)
+            self.state.adv_buf.download(self.ctx.value())
+        else:
+            self.gae_step.step[
+                Self.train_target, Self.ACT_DIM, Self.MINIBATCH, Self.N_ENVS,
+            ](self.state, self.critic, self.gamma, self.gae_lambda)
         self.timer.accumulate(Self._T_GAE, t_gae)
 
         self._t_upd_start = perf_counter_ns()
@@ -860,7 +879,7 @@ struct PPOTrainer[
                 self.state, epoch
             )
         self.gather_step.upload_device_update[Self.N_EPOCHS, Self.N_ENVS](
-            self.state
+            self.state, pool_on_device=self._device_rollout
         )
         return True
 
@@ -897,9 +916,67 @@ struct PPOTrainer[
         # eager path (which synchronises every minibatch anyway).
         self.ctx.value().synchronize()
         self.timer.accumulate(Self._T_UPDATE, self._t_upd_start)
-        self.record_step.reset_rollout[
-            Self.train_target, Self.MINIBATCH, Self.N_ENVS,
-        ](self.state)
+        if self._device_rollout:
+            self.device_rollout.reset_rollout(self.state)
+        else:
+            self.record_step.reset_rollout[
+                Self.train_target, Self.MINIBATCH, Self.N_ENVS,
+            ](self.state)
+
+    # ──────────────────────────────────────────────────────────────────
+    # Device-resident rollout (`DEVICE_ROLLOUT`, GPU only) — the act /
+    # record steps as kernels over the env's device buffers; see
+    # `ppo/blocks/device_rollout.mojo`.
+    # ──────────────────────────────────────────────────────────────────
+
+    def enable_device_rollout(mut self, seed: UInt64) raises:
+        comptime if Self.train_target != "gpu":
+            raise Error("enable_device_rollout: GPU-only")
+        if not self.device_rollout.ready():
+            self.device_rollout.setup(self.ctx.value(), seed)
+        self._device_rollout = True
+
+    def select_action_device(
+        mut self,
+        obs_ptr: Pointer[Scalar[DT], MutAnyOrigin],
+        action_ptr: Pointer[Scalar[DT], MutAnyOrigin],
+    ) raises:
+        comptime if Self.train_target != "gpu":
+            raise Error("select_action_device: GPU-only")
+        else:
+            self.device_rollout.copy_obs(self.state, obs_ptr)
+            call_forward["gpu", Self.N_ENVS](
+                self.actor,
+                TensorRefs[Self.ACTOR.ARITY](self.state.ob1),
+                self.state.ao1,
+                self.ctx,
+            )
+            call_forward["gpu", Self.N_ENVS](
+                self.critic,
+                TensorRefs[Self.CRITIC.ARITY](self.state.ob1),
+                self.state.v1,
+                self.ctx,
+            )
+            self.device_rollout.sample_continuous(
+                self.state, action_ptr, self.action_scale
+            )
+
+    def record_device(
+        mut self,
+        reward_ptr: Pointer[Scalar[DT], MutAnyOrigin],
+        next_obs_ptr: Pointer[Scalar[DT], MutAnyOrigin],
+        done_ptr: Pointer[Scalar[DT], MutAnyOrigin],
+        terminated_ptr: Pointer[Scalar[DT], MutAnyOrigin],
+    ) raises:
+        comptime if Self.train_target != "gpu":
+            raise Error("record_device: GPU-only")
+        else:
+            self.device_rollout.record(
+                self.state, reward_ptr, next_obs_ptr, done_ptr, terminated_ptr
+            )
+
+    def add_episode_return(mut self, ret: Scalar[DT]):
+        self.tracker.add_complete_return(ret)
 
     def mean_return(self) -> Scalar[DT]:
         return self.tracker.mean_return()

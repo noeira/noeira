@@ -15,6 +15,13 @@ and env, `max_grad_norm` on (so the device clip is exercised). Asserted:
     silently skipped its updates cannot pass by leaving two untrained nets
     equal.
 
+The DEVICE-RESIDENT rollout (`DEVICE_ROLLOUT`) samples with a device RNG,
+so it cannot match the host rollout; its own claim is checked instead: the
+device rollout with nothing captured against the same with the train, env
+step and env reset graphs all captured — byte-identical checkpoints, the same
+episodes, the expected update count, and episodes > 0 on LunarLander (the
+deferred episode readback actually delivered).
+
 On NVIDIA run it through `pixi run` (the CUDA interceptor), so the graph is
 really captured and replayed — it prints `captured N nodes`. Elsewhere the
 device path runs eagerly; the parity claim is the same.
@@ -72,7 +79,7 @@ comptime ContEnv = Phyics3dBatchedEnv[
 ]
 
 
-def _train_discrete[GRAPH: Bool](
+def _train_discrete[GRAPH: Bool, DEVICE: Bool = False](
     ctx: DeviceContext, path: String
 ) raises -> Tuple[Int, Int]:
     seed(11)
@@ -80,23 +87,27 @@ def _train_discrete[GRAPH: Bool](
         ctx=ctx, clip_eps=0.2, entropy_coef=0.01, max_grad_norm=0.5
     )
     var env = DiscEnv(ctx)
-    _ = agent.train_batched[USE_TRAIN_CUDA_GRAPH=GRAPH](
-        ctx, env, STEPS, rng_seed=UInt64(5), verbose=False
-    )
+    _ = agent.train_batched[
+        USE_TRAIN_CUDA_GRAPH=GRAPH,
+        DEVICE_ROLLOUT=DEVICE,
+        USE_ENV_CUDA_GRAPH=DEVICE and GRAPH,
+    ](ctx, env, STEPS, rng_seed=UInt64(5), verbose=False, episode_sync_every=4)
     ctx.synchronize()
     agent.save(path)
     return (agent.ep_count(), agent.trainer.total_train_steps())
 
 
-def _train_continuous[GRAPH: Bool](
+def _train_continuous[GRAPH: Bool, DEVICE: Bool = False](
     ctx: DeviceContext, path: String
 ) raises -> Tuple[Int, Int]:
     seed(11)
     var agent = ContAgent(ctx=ctx, max_grad_norm=0.5)
     var env = ContEnv(ctx)
-    _ = agent.train[USE_TRAIN_CUDA_GRAPH=GRAPH](
-        env, STEPS, rng_seed=UInt64(5), verbose=False
-    )
+    _ = agent.train[
+        USE_TRAIN_CUDA_GRAPH=GRAPH,
+        DEVICE_ROLLOUT=DEVICE,
+        USE_ENV_CUDA_GRAPH=DEVICE and GRAPH,
+    ](env, STEPS, rng_seed=UInt64(5), verbose=False, episode_sync_every=4)
     ctx.synchronize()
     agent.save(path)
     return (agent.ep_count(), agent.trainer.total_train_steps())
@@ -150,5 +161,29 @@ def main() raises:
         "continuous (HalfCheetah)", ce, cg,
         "/tmp/ppo_graph_parity_cont_eager.ckpt",
         "/tmp/ppo_graph_parity_cont_graph.ckpt",
+    )
+    var dde = _train_discrete[False, True](
+        ctx, "/tmp/ppo_graph_parity_disc_dev_eager.ckpt"
+    )
+    var ddg = _train_discrete[True, True](
+        ctx, "/tmp/ppo_graph_parity_disc_dev_graph.ckpt"
+    )
+    assert_true(dde[0] > 0, "device rollout delivered no LunarLander episode")
+    _assert_same(
+        "discrete device rollout", dde, ddg,
+        "/tmp/ppo_graph_parity_disc_dev_eager.ckpt",
+        "/tmp/ppo_graph_parity_disc_dev_graph.ckpt",
+    )
+
+    var cde = _train_continuous[False, True](
+        ctx, "/tmp/ppo_graph_parity_cont_dev_eager.ckpt"
+    )
+    var cdg = _train_continuous[True, True](
+        ctx, "/tmp/ppo_graph_parity_cont_dev_graph.ckpt"
+    )
+    _assert_same(
+        "continuous device rollout", cde, cdg,
+        "/tmp/ppo_graph_parity_cont_dev_eager.ckpt",
+        "/tmp/ppo_graph_parity_cont_dev_graph.ckpt",
     )
     print("ALL PASSED")

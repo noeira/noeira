@@ -261,21 +261,25 @@ struct PPOMinibatchGatherStep[
         mut state: OnPolicyState[
             Self.OBS, Self.ACT, Self.ROLLOUT_LEN, Self.MINIBATCH, N_ENVS,
         ],
+        pool_on_device: Bool = False,
     ) raises:
         """Once per rollout, after GAE and the epochs' `stage_epoch_indices`:
         the rollout pool and the indices to their EXISTING device buffers
         (`upload_resident`: no reallocation, so a captured gather stays
-        valid), and the minibatch counter to 0. All enqueued, no sync."""
+        valid), and the minibatch counter to 0. All enqueued, no sync.
+        `pool_on_device` (the device rollout recorded it there): the pool
+        upload is skipped — only the indices and advantages go up."""
         comptime RN = Self.ROLLOUT_LEN * N_ENVS
         comptime assert N_EPOCHS * RN < (1 << 24), (
             "PPOMinibatchGatherStep: the device path stores indices as DT;"
             " N_EPOCHS * ROLLOUT_LEN * N_ENVS must stay below 2^24"
         )
         var c = state.ctx.value()
-        state.obs_buf.upload_resident(c)
-        state.act_buf.upload_resident(c)
-        state.olp_buf.upload_resident(c)
-        state.ret_buf.upload_resident(c)
+        if not pool_on_device:
+            state.obs_buf.upload_resident(c)
+            state.act_buf.upload_resident(c)
+            state.olp_buf.upload_resident(c)
+            state.ret_buf.upload_resident(c)
         self._idx_all.ensure(N_EPOCHS * RN)
         self._idx_all.upload_resident(c)
         self._adv_all.ensure(N_EPOCHS * RN)

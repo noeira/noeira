@@ -33,6 +33,7 @@ from .driver_onpolicy import (
     OnPolicyCheckpointable,
     OnPolicyBatchedCore,
     _run_onpolicy_batched_body,
+    _run_onpolicy_device_body,
 )
 from .checkpoint import announce_checkpoint
 from ...io.artifact_sink import ArtifactSink
@@ -318,6 +319,8 @@ def run_onpolicy_discrete_train_batched[
     E: BatchedEnv,
     L: Logger = NoOpLogger,
     USE_TRAIN_CUDA_GRAPH: Bool = False,
+    DEVICE_ROLLOUT: Bool = False,
+    USE_ENV_CUDA_GRAPH: Bool = False,
 ](
     ctx: Optional[DeviceContext],
     mut trainer: A,
@@ -337,8 +340,10 @@ def run_onpolicy_discrete_train_batched[
     progress_label: String = "on-policy-disc",
     stop_at_mean_return: Optional[Scalar[DT]] = None,
     stop_min_episodes: Int = 0,
+    episode_sync_every: Int = 32,
 ) raises -> List[Scalar[DT]]:
-    """Discrete-action sibling of `run_onpolicy_train_batched`.
+    """Discrete-action sibling of `run_onpolicy_train_batched` (same
+    `DEVICE_ROLLOUT` / `USE_ENV_CUDA_GRAPH` / `episode_sync_every`).
 
     Same-target only (`env_target == train_target`) × any N_ENVS through
     the `BatchedEnv` trait. The discrete action is a single index per env;
@@ -379,24 +384,57 @@ def run_onpolicy_discrete_train_batched[
 
     # ONE shared loop body with the continuous batched driver — the
     # discrete action slot is just ACT ≡ 1 (one index-as-float per env).
-    return _run_onpolicy_batched_body[
-        A, E, ACT, L, USE_TRAIN_CUDA_GRAPH=USE_TRAIN_CUDA_GRAPH
-    ](
-        ctx,
-        trainer,
-        env,
-        total_env_steps,
-        rng_seed=rng_seed,
-        print_every=print_every,
-        verbose=verbose,
-        logger=logger,
-        diag_every=diag_every,
-        checkpoint_every=checkpoint_every,
-        checkpoint_path=checkpoint_path,
-        artifacts=artifacts,
-        run_dir=run_dir,
-        base_step=base_step,
-        progress_label=progress_label,
-        stop_at_mean_return=stop_at_mean_return,
-        stop_min_episodes=stop_min_episodes,
-    )
+    comptime if DEVICE_ROLLOUT:
+        comptime assert env_target == "gpu", (
+            "DEVICE_ROLLOUT needs a GPU env and a GPU trainer"
+        )
+        return _run_onpolicy_device_body[
+            A, E, ACT, L,
+            USE_TRAIN_CUDA_GRAPH=USE_TRAIN_CUDA_GRAPH,
+            USE_ENV_CUDA_GRAPH=USE_ENV_CUDA_GRAPH,
+        ](
+            ctx,
+            trainer,
+            env,
+            total_env_steps,
+            rng_seed=rng_seed,
+            print_every=print_every,
+            verbose=verbose,
+            logger=logger,
+            diag_every=diag_every,
+            checkpoint_every=checkpoint_every,
+            checkpoint_path=checkpoint_path,
+            artifacts=artifacts,
+            run_dir=run_dir,
+            base_step=base_step,
+            progress_label=progress_label,
+            episode_sync_every=episode_sync_every,
+            stop_at_mean_return=stop_at_mean_return,
+            stop_min_episodes=stop_min_episodes,
+        )
+    else:
+        comptime assert not USE_ENV_CUDA_GRAPH, (
+            "USE_ENV_CUDA_GRAPH needs DEVICE_ROLLOUT (the host-staged rollout"
+            " reads every env step back)"
+        )
+        return _run_onpolicy_batched_body[
+            A, E, ACT, L, USE_TRAIN_CUDA_GRAPH=USE_TRAIN_CUDA_GRAPH
+        ](
+            ctx,
+            trainer,
+            env,
+            total_env_steps,
+            rng_seed=rng_seed,
+            print_every=print_every,
+            verbose=verbose,
+            logger=logger,
+            diag_every=diag_every,
+            checkpoint_every=checkpoint_every,
+            checkpoint_path=checkpoint_path,
+            artifacts=artifacts,
+            run_dir=run_dir,
+            base_step=base_step,
+            progress_label=progress_label,
+            stop_at_mean_return=stop_at_mean_return,
+            stop_min_episodes=stop_min_episodes,
+        )

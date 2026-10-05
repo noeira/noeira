@@ -29,6 +29,7 @@ from noeira.core.env_traits import BoxContinuousActionEnv
 from .batched_env import BatchedEnv
 from .driver_scratch import DriverScratch
 from .blocks.cadence import DriverCadence
+from .blocks.episode_readback import EpisodeReturnRing
 from .checkpoint import announce_checkpoint
 from ...io.artifact_sink import ArtifactSink
 
@@ -417,6 +418,46 @@ trait OnPolicyBatchedCore(OnPolicyCheckpointable):
             " on-policy agent (USE_TRAIN_CUDA_GRAPH must stay False)"
         )
 
+    # ─── Device-resident rollout (`DEVICE_ROLLOUT`) ──────────────────────
+    #
+    # The rollout without the host: act on the env's device obs, write the
+    # env's device action, record from its device reward / done / terminated
+    # / next-obs, all as kernels; GAE on the device at the update. Episode
+    # returns reach the trainer through `add_episode_return`, from the
+    # driver's deferred readback ring. All pointers are DEVICE pointers.
+    # Defaults raise, like the capture surface above.
+
+    def enable_device_rollout(mut self, seed: UInt64) raises:
+        """Switch the trainer to the device rollout (its RNG seed) — once,
+        before the first `select_action_device`."""
+        raise Error(
+            "enable_device_rollout: this on-policy agent has no device"
+            " rollout (DEVICE_ROLLOUT must stay False)"
+        )
+
+    def select_action_device(
+        mut self,
+        obs_ptr: Pointer[Scalar[DT], MutAnyOrigin],
+        action_ptr: Pointer[Scalar[DT], MutAnyOrigin],
+    ) raises:
+        """Read the env's device obs, write its device action, cache the
+        sample / log p / V for `record_device` — no host work."""
+        raise Error("select_action_device: no device rollout")
+
+    def record_device(
+        mut self,
+        reward_ptr: Pointer[Scalar[DT], MutAnyOrigin],
+        next_obs_ptr: Pointer[Scalar[DT], MutAnyOrigin],
+        done_ptr: Pointer[Scalar[DT], MutAnyOrigin],
+        terminated_ptr: Pointer[Scalar[DT], MutAnyOrigin],
+    ) raises:
+        """Record this step's row from the env's device buffers."""
+        raise Error("record_device: no device rollout")
+
+    def add_episode_return(mut self, ret: Scalar[DT]):
+        """A completed episode's return, from the driver's readback ring."""
+        pass
+
 
 trait OnPolicyAgentBatched(OnPolicyBatchedCore):
     """Continuous batched on-policy trait consumed by
@@ -440,6 +481,8 @@ def run_onpolicy_train_batched[
     E: BatchedEnv,
     L: Logger = NoOpLogger,
     USE_TRAIN_CUDA_GRAPH: Bool = False,
+    DEVICE_ROLLOUT: Bool = False,
+    USE_ENV_CUDA_GRAPH: Bool = False,
 ](
     ctx: Optional[DeviceContext],
     mut trainer: A,
@@ -457,8 +500,13 @@ def run_onpolicy_train_batched[
     run_dir: String = "",
     base_step: Int = 0,
     progress_label: String = "on-policy",
+    episode_sync_every: Int = 32,
 ) raises -> List[Scalar[DT]]:
     """Tier-3 on-policy driver covering same-target combinations.
+
+    `DEVICE_ROLLOUT` (GPU env + trainer): the rollout stays on the device —
+    see `_run_onpolicy_device_body`; `USE_ENV_CUDA_GRAPH` then captures the
+    env step and reset, and `episode_sync_every` sets its episode readback.
 
     Same-target means `env_target == train_target` × any N_ENVS through
     the `BatchedEnv` trait:
@@ -518,25 +566,56 @@ def run_onpolicy_train_batched[
                 " env_target is 'gpu'"
             )
 
-    return _run_onpolicy_batched_body[
-        A, E, ACT, L, USE_TRAIN_CUDA_GRAPH=USE_TRAIN_CUDA_GRAPH
-    ](
-        ctx,
-        trainer,
-        env,
-        total_env_steps,
-        rng_seed=rng_seed,
-        print_every=print_every,
-        verbose=verbose,
-        logger=logger,
-        diag_every=diag_every,
-        checkpoint_every=checkpoint_every,
-        checkpoint_path=checkpoint_path,
-        artifacts=artifacts,
-        run_dir=run_dir,
-        base_step=base_step,
-        progress_label=progress_label,
-    )
+    comptime if DEVICE_ROLLOUT:
+        comptime assert env_target == "gpu", (
+            "DEVICE_ROLLOUT needs a GPU env and a GPU trainer"
+        )
+        return _run_onpolicy_device_body[
+            A, E, ACT, L,
+            USE_TRAIN_CUDA_GRAPH=USE_TRAIN_CUDA_GRAPH,
+            USE_ENV_CUDA_GRAPH=USE_ENV_CUDA_GRAPH,
+        ](
+            ctx,
+            trainer,
+            env,
+            total_env_steps,
+            rng_seed=rng_seed,
+            print_every=print_every,
+            verbose=verbose,
+            logger=logger,
+            diag_every=diag_every,
+            checkpoint_every=checkpoint_every,
+            checkpoint_path=checkpoint_path,
+            artifacts=artifacts,
+            run_dir=run_dir,
+            base_step=base_step,
+            progress_label=progress_label,
+            episode_sync_every=episode_sync_every,
+        )
+    else:
+        comptime assert not USE_ENV_CUDA_GRAPH, (
+            "USE_ENV_CUDA_GRAPH needs DEVICE_ROLLOUT (the host-staged rollout"
+            " reads every env step back)"
+        )
+        return _run_onpolicy_batched_body[
+            A, E, ACT, L, USE_TRAIN_CUDA_GRAPH=USE_TRAIN_CUDA_GRAPH
+        ](
+            ctx,
+            trainer,
+            env,
+            total_env_steps,
+            rng_seed=rng_seed,
+            print_every=print_every,
+            verbose=verbose,
+            logger=logger,
+            diag_every=diag_every,
+            checkpoint_every=checkpoint_every,
+            checkpoint_path=checkpoint_path,
+            artifacts=artifacts,
+            run_dir=run_dir,
+            base_step=base_step,
+            progress_label=progress_label,
+        )
 
 
 def _run_onpolicy_batched_body[
@@ -764,81 +843,293 @@ def _run_onpolicy_batched_body[
         iter_idx += 1
 
         # ── 8. Trainer update (fires at the K-epoch boundary).
-        comptime if (
-            USE_TRAIN_CUDA_GRAPH and A.AGENT_TRAIN_TARGET == "gpu"
+        _onpolicy_update[A, USE_TRAIN_CUDA_GRAPH, False](
+            trainer, ctx, base_step + step_idx, train_graph
+        )
+
+        if _onpolicy_iteration_tail[A, L](
+            trainer, cad, ep_returns, last_ep_count, step_idx, base_step,
+            stop_at_mean_return, stop_min_episodes, verbose, progress_label,
+            logger, checkpoint_path, artifacts, run_dir,
         ):
-            if trainer.begin_update_device(base_step + step_idx):
-                var c = ctx.value()
-
-                def _minibatch() capturing raises -> None:
-                    trainer.train_minibatch_device()
-
-                for _ in range(trainer.minibatches_per_update()):
-                    maybe_capture_replay[_minibatch](train_graph, c)
-                    trainer.note_minibatch_update()
-                trainer.end_update_device()
-        else:
-            _ = trainer.train_step(base_step + step_idx)
-
-        # Snapshot mean_return whenever an episode completes.
-        var new_ep_count = trainer.ep_count()
-        var reached_target = False
-        if new_ep_count > last_ep_count:
-            ep_returns.append(trainer.mean_return())
-            last_ep_count = new_ep_count
-            if stop_at_mean_return and new_ep_count >= stop_min_episodes:
-                reached_target = (
-                    trainer.mean_return() >= stop_at_mean_return.value()
-                )
-
-        var abs_step = base_step + step_idx
-
-        if reached_target:
-            if verbose:
-                print(
-                    "[" + progress_label + "] target mean return reached:",
-                    trainer.mean_return(),
-                    ">=",
-                    stop_at_mean_return.value(),
-                    "| step",
-                    abs_step,
-                    "| episodes",
-                    new_ep_count,
-                )
             break
 
-        cad.tick(step_idx, trainer.total_train_steps())
+    if cad.ckpt_on:
+        trainer.save_state(checkpoint_path)
+        announce_checkpoint(checkpoint_path, artifacts, run_dir)
 
-        if cad.print_due(step_idx):
-            cad.print_status(
-                abs_step, trainer.mean_return(), trainer.ep_count()
+    return ep_returns^
+
+
+def onpolicy_update_device[
+    A: OnPolicyBatchedCore,
+    USE_TRAIN_CUDA_GRAPH: Bool,
+](
+    mut trainer: A,
+    ctx: Optional[DeviceContext],
+    step: Int,
+    mut train_graph: Optional[CUDAGraph],
+) raises -> Bool:
+    """The device update at a rollout boundary (False, nothing done, between
+    boundaries): `begin_update_device`, the minibatch step captured + replayed
+    under `USE_TRAIN_CUDA_GRAPH` or called directly otherwise (the same
+    kernels: the two match bit for bit), `end_update_device`.
+
+    A driver that changes a host-side hyperparameter the step bakes into its
+    kernel arguments (a learning rate or entropy coefficient set with
+    `set_lr` / `set_entropy_coef`) drops `train_graph` (`= None`) after the
+    change, and the next update re-captures."""
+    if not trainer.begin_update_device(step):
+        return False
+    var c = ctx.value()
+
+    def _minibatch() capturing raises -> None:
+        trainer.train_minibatch_device()
+
+    for _ in range(trainer.minibatches_per_update()):
+        comptime if USE_TRAIN_CUDA_GRAPH:
+            maybe_capture_replay[_minibatch](train_graph, c)
+        else:
+            trainer.train_minibatch_device()
+        trainer.note_minibatch_update()
+    trainer.end_update_device()
+    return True
+
+
+def _onpolicy_update[
+    A: OnPolicyBatchedCore,
+    USE_TRAIN_CUDA_GRAPH: Bool,
+    DEVICE_ROLLOUT: Bool,
+](
+    mut trainer: A,
+    ctx: Optional[DeviceContext],
+    step: Int,
+    mut train_graph: Optional[CUDAGraph],
+) raises:
+    """The update at a rollout boundary, ONE dispatch for both loop bodies:
+    the device update (`onpolicy_update_device`) when the train graph is
+    asked for, and always on the device rollout (its pool lives on the
+    device; the host `train_step` cannot read it); the host `train_step`
+    otherwise."""
+    comptime if (
+        (USE_TRAIN_CUDA_GRAPH or DEVICE_ROLLOUT)
+        and A.AGENT_TRAIN_TARGET == "gpu"
+    ):
+        _ = onpolicy_update_device[A, USE_TRAIN_CUDA_GRAPH](
+            trainer, ctx, step, train_graph
+        )
+    else:
+        _ = trainer.train_step(step)
+
+
+def _onpolicy_iteration_tail[A: OnPolicyBatchedCore, L: Logger](
+    mut trainer: A,
+    mut cad: DriverCadence,
+    mut ep_returns: List[Scalar[DT]],
+    mut last_ep_count: Int,
+    step_idx: Int,
+    base_step: Int,
+    stop_at_mean_return: Optional[Scalar[DT]],
+    stop_min_episodes: Int,
+    verbose: Bool,
+    progress_label: String,
+    logger: Optional[Pointer[L, MutAnyOrigin]],
+    checkpoint_path: String,
+    artifacts: Optional[ArtifactSink],
+    run_dir: String,
+) raises -> Bool:
+    """After an iteration's update, ONE copy for both loop bodies: the
+    mean-return snapshot when an episode completed, the solved-exit check
+    (True = stop now), the progress / log / diag cadence and the periodic
+    checkpoint."""
+    var new_ep_count = trainer.ep_count()
+    var reached_target = False
+    if new_ep_count > last_ep_count:
+        ep_returns.append(trainer.mean_return())
+        last_ep_count = new_ep_count
+        if stop_at_mean_return and new_ep_count >= stop_min_episodes:
+            reached_target = (
+                trainer.mean_return() >= stop_at_mean_return.value()
             )
 
-        # Logger emit at the same cadence (independent of verbose). No
-        # forced flush (`buffer_size` auto-flush — see note in
-        # run_offpolicy_train). Comptime-elided when L=NoOpLogger (default).
-        comptime if L.ENABLED:
-            if Bool(logger) and cad.log_due(step_idx):
-                cad.log_status[L, False](
-                    logger,
-                    abs_step,
-                    trainer.mean_return(),
-                    trainer.ep_count(),
-                )
+    var abs_step = base_step + step_idx
 
-        # `diag_every` — drain the trainer's metric bundle through the
-        # logger at its own cadence. Default trait impl is no-op for
-        # trainers that haven't wired this up yet.
-        comptime if L.ENABLED:
-            if Bool(logger) and cad.diag_due(step_idx):
-                trainer.flush_metrics_through_logger[L](logger, abs_step)
+    if reached_target:
+        if verbose:
+            print(
+                "[" + progress_label + "] target mean return reached:",
+                trainer.mean_return(),
+                ">=",
+                stop_at_mean_return.value(),
+                "| step",
+                abs_step,
+                "| episodes",
+                new_ep_count,
+            )
+        return True
 
-        # `checkpoint_every` — overwrite `checkpoint_path` with the
-        # trainer's one-file v3 checkpoint. The trait default raises.
-        if cad.ckpt_due(step_idx):
-            trainer.save_state(checkpoint_path)
-            announce_checkpoint(checkpoint_path, artifacts, run_dir)
+    cad.tick(step_idx, trainer.total_train_steps())
 
+    if cad.print_due(step_idx):
+        cad.print_status(abs_step, trainer.mean_return(), trainer.ep_count())
+
+    # Logger emit at the same cadence (independent of verbose). No forced
+    # flush (`buffer_size` auto-flush — see note in run_offpolicy_train).
+    # Comptime-elided when L=NoOpLogger (default).
+    comptime if L.ENABLED:
+        if Bool(logger) and cad.log_due(step_idx):
+            cad.log_status[L, False](
+                logger, abs_step, trainer.mean_return(), trainer.ep_count()
+            )
+
+    # `diag_every` — drain the trainer's metric bundle through the logger at
+    # its own cadence. Default trait impl is no-op for trainers that haven't
+    # wired this up yet.
+    comptime if L.ENABLED:
+        if Bool(logger) and cad.diag_due(step_idx):
+            trainer.flush_metrics_through_logger[L](logger, abs_step)
+
+    # `checkpoint_every` — overwrite `checkpoint_path` with the trainer's
+    # one-file v3 checkpoint. The trait default raises.
+    if cad.ckpt_due(step_idx):
+        trainer.save_state(checkpoint_path)
+        announce_checkpoint(checkpoint_path, artifacts, run_dir)
+    return False
+
+
+def _run_onpolicy_device_body[
+    A: OnPolicyBatchedCore,
+    E: BatchedEnv,
+    ACT: Int,
+    L: Logger = NoOpLogger,
+    USE_TRAIN_CUDA_GRAPH: Bool = False,
+    USE_ENV_CUDA_GRAPH: Bool = False,
+](
+    ctx: Optional[DeviceContext],
+    mut trainer: A,
+    mut env: E,
+    total_env_steps: Int,
+    *,
+    rng_seed: UInt64,
+    print_every: Int,
+    verbose: Bool,
+    logger: Optional[Pointer[L, MutAnyOrigin]],
+    diag_every: Int,
+    checkpoint_every: Int,
+    checkpoint_path: String,
+    artifacts: Optional[ArtifactSink],
+    run_dir: String,
+    base_step: Int,
+    progress_label: String,
+    episode_sync_every: Int,
+    stop_at_mean_return: Optional[Scalar[DT]] = None,
+    stop_min_episodes: Int = 0,
+) raises -> List[Scalar[DT]]:
+    """The DEVICE-RESIDENT rollout loop (`DEVICE_ROLLOUT`, GPU env + trainer)
+    — the SAC GPU loop's mechanisms (`run_offpolicy_train_batched`):
+
+      1. `select_action_device`: act on the env's device obs, write its device
+         action (device sampling RNG, no host copy).
+      2. env step — captured and replayed under `USE_ENV_CUDA_GRAPH` (the
+         env's step must be RNG-free, as SAC's contract says).
+      3. `record_device`: the row from the env's device buffers.
+      4. episode returns through an `EpisodeReturnRing`: the reward / done
+         D2H enqueued without a sync, drained (ONE sync) every
+         `episode_sync_every` iterations or at an emit boundary.
+      5. selective reset — captured under `USE_ENV_CUDA_GRAPH` (its
+         randomness comes from the env's device counter).
+      6. the device update (`_onpolicy_update`), captured under
+         `USE_TRAIN_CUDA_GRAPH`.
+
+    The mean return lags by up to `episode_sync_every` iterations, as in SAC
+    — the solved exit (`stop_at_mean_return`) included: it is checked when
+    the ring drains, at most `episode_sync_every * N_ENVS` env steps late.
+    """
+    comptime N_ENVS = A.AGENT_N_ENVS
+    var c = ctx.value()
+
+    trainer.enable_device_rollout(rng_seed * UInt64(2654435761) + UInt64(1))
+    var ep_ring = EpisodeReturnRing[N_ENVS].make(c, episode_sync_every)
+
+    env.reset_batch[N_ENVS](ctx=ctx, rng_seed=rng_seed)
+
+    var ep_returns = List[Scalar[DT]]()
+    var step_idx: Int = 0
+    var iter_idx: Int = 0
+    var cad = DriverCadence.make(
+        print_every,
+        min_stride=N_ENVS,
+        label=progress_label,
+        verbose=verbose,
+        diag_every=diag_every,
+        checkpoint_every=checkpoint_every,
+        ckpt_enabled=checkpoint_path.byte_length() > 0,
+    )
+    var last_ep_count = trainer.ep_count()
+    var train_graph: Optional[CUDAGraph] = None
+    var env_graph: Optional[CUDAGraph] = None
+    var reset_graph: Optional[CUDAGraph] = None
+
+    while step_idx < total_env_steps:
+        # ── 1. Act on the device.
+        trainer.select_action_device(env.obs_ptr(), env.action_ptr())
+
+        # ── 2. Env step.
+        def _env_step() capturing raises -> None:
+            env.step_batch[N_ENVS](
+                ctx=ctx, rng_seed=rng_seed + UInt64(iter_idx + 1)
+            )
+
+        comptime if USE_ENV_CUDA_GRAPH:
+            maybe_capture_replay[_env_step](env_graph, c)
+        else:
+            _env_step()
+
+        # ── 3. Record from the env's device buffers (before the reset).
+        trainer.record_device(
+            env.reward_ptr(), env.obs_ptr(), env.done_ptr(),
+            env.terminated_ptr(),
+        )
+
+        # ── 4. Episode returns: enqueue now, drain when due.
+        ep_ring.enqueue(c, env.reward_ptr(), env.done_ptr())
+        var emit_now = cad.emit_boundary_imminent(
+            step_idx + N_ENVS, total_env_steps
+        )
+        if ep_ring.due(emit_now):
+            var completed = ep_ring.drain(c)
+            for i in range(len(completed)):
+                trainer.add_episode_return(completed[i])
+
+        # ── 5. Selective reset (the env's device RNG counter).
+        def _env_reset() capturing raises -> None:
+            env.selective_reset_batch[N_ENVS](
+                ctx=ctx, rng_seed=rng_seed + UInt64(iter_idx + 1) * UInt64(7)
+            )
+
+        comptime if USE_ENV_CUDA_GRAPH:
+            maybe_capture_replay[_env_reset](reset_graph, c)
+        else:
+            _env_reset()
+
+        step_idx += N_ENVS
+        iter_idx += 1
+
+        # ── 6. The device update.
+        _onpolicy_update[A, USE_TRAIN_CUDA_GRAPH, True](
+            trainer, ctx, base_step + step_idx, train_graph
+        )
+
+        if _onpolicy_iteration_tail[A, L](
+            trainer, cad, ep_returns, last_ep_count, step_idx, base_step,
+            stop_at_mean_return, stop_min_episodes, verbose, progress_label,
+            logger, checkpoint_path, artifacts, run_dir,
+        ):
+            break
+
+    var completed = ep_ring.drain(c)
+    for i in range(len(completed)):
+        trainer.add_episode_return(completed[i])
     if cad.ckpt_on:
         trainer.save_state(checkpoint_path)
         announce_checkpoint(checkpoint_path, artifacts, run_dir)

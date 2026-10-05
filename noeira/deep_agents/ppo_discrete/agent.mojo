@@ -131,6 +131,8 @@ struct PPODiscreteAgent[
         E: BatchedEnv,
         L: Logger = NoOpLogger,
         USE_TRAIN_CUDA_GRAPH: Bool = False,
+        DEVICE_ROLLOUT: Bool = False,
+        USE_ENV_CUDA_GRAPH: Bool = False,
     ](
         mut self,
         ctx: Optional[DeviceContext],
@@ -149,6 +151,7 @@ struct PPODiscreteAgent[
         base_step: Int = 0,
         stop_at_mean_return: Optional[Scalar[DT]] = None,
         stop_min_episodes: Int = 0,
+        episode_sync_every: Int = 32,
     ) raises -> List[Scalar[DT]]:
         """N_ENVS-wide discrete on-policy training via
         `run_onpolicy_discrete_train_batched`. Covers same-target
@@ -162,9 +165,17 @@ struct PPODiscreteAgent[
         `USE_TRAIN_CUDA_GRAPH` (GPU, NVIDIA): capture one minibatch step of
         the K-epoch update into a CUDA graph and replay it (see
         `_run_onpolicy_batched_body`). Run through `pixi run` so the CUDA
-        interceptor is preloaded."""
+        interceptor is preloaded.
+
+        `DEVICE_ROLLOUT` (GPU env + trainer): keep the rollout on the device
+        (device sampling, recording and GAE; episode returns read back every
+        `episode_sync_every` iterations); `USE_ENV_CUDA_GRAPH` then also
+        captures the env step and reset. See `_run_onpolicy_device_body`."""
         return run_onpolicy_discrete_train_batched[
-            Self.TrainerT, E, L, USE_TRAIN_CUDA_GRAPH=USE_TRAIN_CUDA_GRAPH
+            Self.TrainerT, E, L,
+            USE_TRAIN_CUDA_GRAPH=USE_TRAIN_CUDA_GRAPH,
+            DEVICE_ROLLOUT=DEVICE_ROLLOUT,
+            USE_ENV_CUDA_GRAPH=USE_ENV_CUDA_GRAPH,
         ](
             ctx,
             self.trainer,
@@ -182,6 +193,7 @@ struct PPODiscreteAgent[
             base_step=base_step,
             stop_at_mean_return=stop_at_mean_return,
             stop_min_episodes=stop_min_episodes,
+            episode_sync_every=episode_sync_every,
         )
 
     # ─── Evaluation ─────────────────────────────────────────────────────

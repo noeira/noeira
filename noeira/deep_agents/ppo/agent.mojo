@@ -104,6 +104,8 @@ struct PPOAgent[
         E: BatchedEnv,
         L: Logger = NoOpLogger,
         USE_TRAIN_CUDA_GRAPH: Bool = False,
+        DEVICE_ROLLOUT: Bool = False,
+        USE_ENV_CUDA_GRAPH: Bool = False,
     ](
         mut self,
         mut env: E,
@@ -118,6 +120,7 @@ struct PPOAgent[
         artifacts: Optional[ArtifactSink] = None,
         run_dir: String = "",
         checkpoint_every: Int = 0,
+        episode_sync_every: Int = 32,
     ) raises -> List[Scalar[DT]]:
         """On-policy training via `run_onpolicy_train_batched`.
 
@@ -129,6 +132,9 @@ struct PPOAgent[
         semantics. `USE_TRAIN_CUDA_GRAPH` (GPU, NVIDIA): capture one minibatch
         step of the K-epoch update into a CUDA graph and replay it (see
         `_run_onpolicy_batched_body`); run through `pixi run`.
+        `DEVICE_ROLLOUT` (GPU env + trainer): keep the rollout on the device;
+        `USE_ENV_CUDA_GRAPH` then also captures the env step and reset (see
+        `_run_onpolicy_device_body`).
         """
         var ctx = self.trainer.state.ctx
         return run_onpolicy_train_batched[
@@ -140,6 +146,8 @@ struct PPOAgent[
             E,
             L,
             USE_TRAIN_CUDA_GRAPH=USE_TRAIN_CUDA_GRAPH,
+            DEVICE_ROLLOUT=DEVICE_ROLLOUT,
+            USE_ENV_CUDA_GRAPH=USE_ENV_CUDA_GRAPH,
         ](
             ctx,
             self.trainer,
@@ -154,6 +162,7 @@ struct PPOAgent[
             checkpoint_path=checkpoint_path,
             artifacts=artifacts,
             run_dir=run_dir,
+            episode_sync_every=episode_sync_every,
         )
 
     def train_single[
