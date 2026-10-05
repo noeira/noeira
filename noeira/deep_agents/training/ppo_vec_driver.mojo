@@ -133,6 +133,10 @@ struct PPOVecConfig(Copyable, Movable):
     var seed: Int
     var ckpt_every: Int
     """Env steps between checkpoints (0 = only at the end)."""
+    var keep_ckpts: Bool
+    """Also keep every periodic checkpoint as `<path>_<step>` (and the
+    observation statistics beside it): a run that collapses later
+    overwrites the plain path with the collapsed policy."""
     var log_every: Int
     """Updates between logger flushes."""
     var print_every: Int
@@ -164,6 +168,7 @@ struct PPOVecConfig(Copyable, Movable):
         rew_bound: Float64 = 1.0e3,
         seed: Int = 1,
         ckpt_every: Int = 0,
+        keep_ckpts: Bool = False,
         log_every: Int = 1,
         print_every: Int = 10,
         window: Int = 100,
@@ -189,6 +194,7 @@ struct PPOVecConfig(Copyable, Movable):
         self.rew_bound = rew_bound
         self.seed = seed
         self.ckpt_every = ckpt_every
+        self.keep_ckpts = keep_ckpts
         self.log_every = max(log_every, 1)
         self.print_every = max(print_every, 1)
         self.window = max(window, 1)
@@ -924,6 +930,9 @@ def run_ppo_vec[
             agent.trainer.save_state(ckpt_path)
             dev.stats_to_host(obs_rms)
             obs_rms.save(obs_norm_path)
+            if cfg.keep_ckpts:
+                agent.trainer.save_state(ckpt_path + "_" + String(next_ckpt))
+                obs_rms.save(obs_norm_path + "_" + String(next_ckpt))
             next_ckpt += cfg.ckpt_every
     dev.drain(ep_ret, ep_len)
     dev.stats_to_host(obs_rms)

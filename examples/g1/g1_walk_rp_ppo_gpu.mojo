@@ -3,6 +3,10 @@
     pixi run -e nvidia mojo build -I . -D PPO_VEC_ENV_GRAPH -D PPO_VEC_TRAIN_GRAPH \\
         examples/g1/g1_walk_rp_ppo_gpu.mojo -o g1_walk_rp_ppo
     pixi run -e nvidia ./g1_walk_rp_ppo --steps 60000000 --seed 1 --out runs/rp_s1
+    pixi run -e nvidia ./g1_walk_rp_ppo ... --init runs/rp_s1 --out runs/rp_s1b   # resume
+
+`--init` loads the actor + critic and the observation statistics (Adam's
+moments are not checkpointed; the step count restarts at 0).
 
 The env is `UnitreeG1WalkRPBatched` (`unitree_g1_walk_rp_config.mojo`: their
 26 reward terms, terminations, resets, pushes, gain DR). The policy's
@@ -76,8 +80,11 @@ def main() raises:
     var log_std = Float64(_arg("--log-std", "0.0"))
     var adaptive = _arg("--adaptive-kl", "1") == "1"
     var mirror = Float64(_arg("--mirror", "0.2"))
+    var norm_rew = _arg("--norm-reward", "0") == "1"
+    var rew_bound = Float64(_arg("--rew-bound", "1000"))
     var ckpt_every = Int(_arg("--ckpt-every", "20000000"))
     var out = _arg("--out", "runs/g1_walk_rp_s" + String(seed))
+    var init = _arg("--init", "")
     if not exists(out):
         makedirs(out)
     seed_rng(seed)
@@ -86,7 +93,8 @@ def main() raises:
           ") | act", ACT, "| frames", RP_FRAMES, "| rollout", ROLLOUT,
           "| minibatch", MINIBATCH, "x", N_MINIBATCHES, "| epochs", EPOCHS,
           "| lr", lr, "adaptive", adaptive, "| ent", ent, "| act-rate", act_rate,
-          "| act-smooth", act_smooth, "| mirror", mirror, "| log-std", log_std, "| graphs",
+          "| act-smooth", act_smooth, "| mirror", mirror, "| norm-reward", norm_rew,
+          "| rew-bound", rew_bound, "| log-std", log_std, "| graphs",
           ENV_GRAPH, TRAIN_GRAPH, "| steps", steps, "| seed", seed, "| out", out)
     with DeviceContext() as ctx:
         var agent = PPOAgent[
@@ -101,6 +109,12 @@ def main() raises:
         agent.trainer.actor.children[RP_HEAD_CHILD].set_log_std_init["gpu"](
             Scalar[DT](log_std), ctx
         )
+        if init.byte_length() > 0:
+            # after the log-std: the checkpoint's own log-std wins
+            # (`load_state` writes resident — the optimiser's arena keeps
+            # the buffers it adopted)
+            agent.trainer.load_state(init + "/ckpt")
+            print("  init: actor + critic from", init + "/ckpt")
         if mirror > 0.0:
             var mm = rp_mirror_maps()
             agent.trainer.actor_train.inner.enable_mirror["gpu"](
@@ -118,10 +132,13 @@ def main() raises:
         env.d.meta.upload(ctx)
         ctx.synchronize()
         var rms = RunningMeanStd(RP_OBS)
+        if init.byte_length() > 0:
+            rms.load(init + "/obs_norm.txt")
         var logger = CsvLogger(out + "/metrics.csv")
         var cfg = PPOVecConfig(
             total_steps=steps, lr=lr, ent0=ent, ent1=ent, anneal=False,
-            norm_obs=True, norm_reward=False,
+            norm_obs=True, norm_reward=norm_rew, rew_bound=rew_bound,
+            keep_ckpts=True,
             act_rate_w=act_rate, act_smooth_w=act_smooth,
             adaptive_kl=adaptive, desired_kl=0.01,
             seed=seed, ckpt_every=ckpt_every, print_every=20,
