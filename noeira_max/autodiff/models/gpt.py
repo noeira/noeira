@@ -1,9 +1,11 @@
 """A character GPT with the block of the torch twin
 (``tools/nn/torch_nn_reference.py``): pre-LN, causal multi-head attention,
-tanh GELU, learned positions, the head tied to the token embedding.
+tanh GELU, learned positions, the head tied to the token embedding, and
+dropout where the twin has it (the embedding sum, each attention projection
+and each MLP output).
 
-No dropout here: M1 gates parity with ``p = 0``; M2 adds it with a seed
-buffer.
+Dropout draws random numbers, so a graph using it must set a seed
+(``build_train_step(..., uses_seed=True)`` does, from a seed buffer).
 """
 
 from __future__ import annotations
@@ -12,7 +14,8 @@ import math
 from dataclasses import dataclass
 
 import numpy as np
-from max.graph import TensorValue, ops
+from max.dtype import DType
+from max.graph import TensorType, TensorValue, ops
 
 from .common import cross_entropy, dense
 
@@ -24,6 +27,7 @@ class Config:
     dim: int = 32
     heads: int = 2
     layers: int = 2
+    dropout: float = 0.0
 
     @property
     def head_dim(self) -> int:
@@ -56,6 +60,34 @@ def init(cfg: Config, rng: np.random.Generator, dtype=np.float64) -> dict:
     return p
 
 
+def dropout(x: TensorValue, p: float) -> TensorValue:
+    """Inverted dropout: keeps each entry with probability ``1 - p``."""
+    if p == 0.0:
+        return x
+    draw = ops.random.uniform(TensorType(DType.float32, x.shape, x.device))
+    keep = ops.cast(ops.greater_equal(draw, p), x.dtype)
+    return x * keep * (1.0 / (1.0 - p))
+
+
+def sample_batch(
+    corpus: TensorValue, batch: int, seq: int
+) -> tuple[TensorValue, TensorValue]:
+    """Random windows of a device-resident ``int64`` corpus, drawn in the
+    graph: the inputs ``[batch, seq]`` and their next-token targets. A step
+    that samples its own batch has the same inputs every call."""
+    n = int(corpus.shape[0])
+    draw = ops.random.uniform(
+        TensorType(DType.float32, [batch, 1], corpus.device),
+        range=(0.0, float(n - seq - 1)),
+    )
+    starts = ops.cast(ops.floor(draw), DType.int64)
+    offsets = ops.constant(np.arange(seq + 1)[None, :], DType.int64, corpus.device)
+    window = ops.gather(corpus, starts + offsets, axis=0)
+    inputs = ops.slice_tensor(window, [slice(None), slice(0, seq)])
+    targets = ops.slice_tensor(window, [slice(None), slice(1, seq + 1)])
+    return inputs, targets
+
+
 def _heads(x: TensorValue, cfg: Config) -> TensorValue:
     """``[B, T, C]`` -> ``[B, H, T, D]``."""
     b, t = x.shape[0], x.shape[1]
@@ -80,25 +112,32 @@ def _attention(p: dict, l: int, x: TensorValue, cfg: Config) -> TensorValue:
     bias = ops.constant(causal.astype(x.dtype.to_numpy()), x.dtype, x.device)
     weights = ops.softmax(scores + bias)
     y = _merge(ops.matmul(weights, v), cfg)
-    return dense(y, p[f"h{l}.proj.w"], p[f"h{l}.proj.b"])
+    return dropout(dense(y, p[f"h{l}.proj.w"], p[f"h{l}.proj.b"]), cfg.dropout)
 
 
-def _mlp(p: dict, l: int, x: TensorValue) -> TensorValue:
+def _mlp(p: dict, l: int, x: TensorValue, cfg: Config) -> TensorValue:
     h = ops.gelu(dense(x, p[f"h{l}.fc1.w"], p[f"h{l}.fc1.b"]), approximate="tanh")
-    return dense(h, p[f"h{l}.fc2.w"], p[f"h{l}.fc2.b"])
+    return dropout(dense(h, p[f"h{l}.fc2.w"], p[f"h{l}.fc2.b"]), cfg.dropout)
 
 
 def forward(p: dict, idx: TensorValue, cfg: Config) -> TensorValue:
     """Token indices ``[B, T]`` -> logits ``[B, T, vocab]``."""
-    x = ops.gather(p["wte"], idx, axis=0) + p["wpe"]
+    x = dropout(ops.gather(p["wte"], idx, axis=0) + p["wpe"], cfg.dropout)
     for l in range(cfg.layers):
         x = x + _attention(
             p, l, ops.layer_norm(x, p[f"h{l}.ln1.w"], p[f"h{l}.ln1.b"], 1e-5), cfg
         )
-        x = x + _mlp(p, l, ops.layer_norm(x, p[f"h{l}.ln2.w"], p[f"h{l}.ln2.b"], 1e-5))
+        x = x + _mlp(
+            p, l, ops.layer_norm(x, p[f"h{l}.ln2.w"], p[f"h{l}.ln2.b"], 1e-5), cfg
+        )
     x = ops.layer_norm(x, p["lnf.w"], p["lnf.b"], 1e-5)
     return ops.matmul(x, ops.transpose(p["wte"], 0, 1))  # tied head
 
 
 def loss(p: dict, idx: TensorValue, targets: TensorValue, cfg: Config) -> TensorValue:
     return cross_entropy(forward(p, idx, cfg), targets)
+
+
+def decays(name: str, shape: tuple) -> bool:
+    """The twin's AdamW groups: decay every matrix except the positions."""
+    return len(shape) >= 2 and name != "wpe"

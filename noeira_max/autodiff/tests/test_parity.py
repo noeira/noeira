@@ -64,35 +64,50 @@ def train(graph, init: dict, batches, steps: int):
     return losses, dict(zip(names, params)), compile_seconds
 
 
+def torch_parity(
+    model: str, init, batches, losses, final, steps: int, lr: float,
+    config=(), **fields,
+) -> dict:
+    """Retrains ``model`` in torch (``parity_torch.py``, act-ref env) from
+    ``init`` on ``batches`` and compares with our ``losses`` and ``final``
+    parameters. ``fields`` carry the optimizer's settings."""
+    with tempfile.TemporaryDirectory() as tmp:
+        npz, report = Path(tmp) / "parity.npz", Path(tmp) / "torch.json"
+        arrays = {f"init.{n}": v for n, v in init.items()}
+        arrays |= {f"final.{n}": v for n, v in final.items()}
+        for s in range(steps):
+            arrays[f"x{s}"], arrays[f"y{s}"] = batches[s % len(batches)]
+        np.savez(
+            npz, names=np.array(list(init)), steps=steps, lr=lr,
+            losses=np.array(losses), config=np.array(config), **fields, **arrays,
+        )
+        env = {k: v for k, v in os.environ.items() if k != "LD_PRELOAD"}
+        proc = subprocess.run(
+            [str(TORCH_PYTHON), str(TORCH_SIDE), model, str(npz), str(report)],
+            env=env, capture_output=True, text=True,
+        )
+        if proc.returncode != 0:
+            raise RuntimeError(f"torch side failed:\n{proc.stderr[-3000:]}")
+        return json.loads(report.read_text())
+
+
+def report(tag: str, losses, result) -> tuple[float, float]:
+    worst_loss = max(result["loss_rel_diff"])
+    worst_param = max(result["param_rel_diff"].values())
+    print(
+        f"\n[{tag}] loss {losses[0]:.6f} -> {losses[-1]:.6f} "
+        f"(torch {result['torch_losses'][-1]:.6f}); worst loss rel. diff "
+        f"{worst_loss:.1e}, worst parameter rel. diff {worst_param:.1e}",
+        flush=True,
+    )
+    return worst_loss, worst_param
+
+
 @unittest.skipUnless(TORCH_PYTHON.exists(), f"no act-ref env at {TORCH_PYTHON}")
 class ParityTest(unittest.TestCase):
     def _compare(self, model: str, init, batches, losses, final, lr, config=()):
-        with tempfile.TemporaryDirectory() as tmp:
-            npz, report = Path(tmp) / "parity.npz", Path(tmp) / "torch.json"
-            arrays = {f"init.{n}": v for n, v in init.items()}
-            arrays |= {f"final.{n}": v for n, v in final.items()}
-            for s in range(STEPS):
-                arrays[f"x{s}"], arrays[f"y{s}"] = batches[s % len(batches)]
-            np.savez(
-                npz, names=np.array(list(init)), steps=STEPS, lr=lr,
-                losses=np.array(losses), config=np.array(config), **arrays,
-            )
-            env = {k: v for k, v in os.environ.items() if k != "LD_PRELOAD"}
-            proc = subprocess.run(
-                [str(TORCH_PYTHON), str(TORCH_SIDE), model, str(npz), str(report)],
-                env=env, capture_output=True, text=True,
-            )
-            self.assertEqual(proc.returncode, 0, proc.stderr[-3000:])
-            result = json.loads(report.read_text())
-
-        worst_loss = max(result["loss_rel_diff"])
-        worst_param = max(result["param_rel_diff"].values())
-        print(
-            f"\n[{model}] loss {losses[0]:.6f} -> {losses[-1]:.6f} "
-            f"(torch {result['torch_losses'][-1]:.6f}); worst loss rel. diff "
-            f"{worst_loss:.1e}, worst parameter rel. diff {worst_param:.1e}",
-            flush=True,
-        )
+        result = torch_parity(model, init, batches, losses, final, STEPS, lr, config)
+        worst_loss, worst_param = report(model, losses, result)
         self.assertLess(losses[-1], losses[0], "the model did not train")
         self.assertLess(worst_loss, LOSS_RTOL)
         self.assertLess(worst_param, PARAM_RTOL)

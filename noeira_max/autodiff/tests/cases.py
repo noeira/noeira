@@ -254,6 +254,14 @@ def _causal_mask(o, n, device):
     return o.constant(np.tril(np.ones((n, n), dtype=bool)), o.DType.bool, device)
 
 
+def _dropout_fixed_seed(o, x):
+    """Inverted dropout with a constant seed: the same mask on every
+    execution, so finite differences see a fixed linear map."""
+    o.random.set_seed(7)
+    draw = o.random.uniform(o.TensorType(o.DType.float32, x.shape, x.device))
+    return x * o.cast(o.greater_equal(draw, 0.5), x.dtype) * 2.0
+
+
 def _attention(o, q, k, v):
     n = int(q.shape[0])
     scores = o.matmul(q, o.transpose(k, 0, 1)) * (1.0 / np.sqrt(int(q.shape[1])))
@@ -282,6 +290,8 @@ NN = Family(
                 o.sum(o.logsoftmax(z) * _one_hot(o, y, 5), axis=1), axis=0),
             lambda t, z, y: t.nn.functional.cross_entropy(z, y).reshape(1, 1),
         ),
+        # No torch twin: torch draws other masks.
+        Case("dropout_fixed_seed", (Arg(X),), X, _dropout_fixed_seed),
         Case(
             "causal_attention",
             (Arg((5, 4)), Arg((5, 4)), Arg((5, 4))),

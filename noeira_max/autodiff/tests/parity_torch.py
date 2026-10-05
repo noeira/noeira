@@ -1,6 +1,7 @@
-"""Torch side of the model-level parity test (``act-ref`` env, never imports
-MAX): the same models, from the same initial weights, trained with SGD on the
-same batches, in float64.
+"""Torch side of the model-level parity tests (``act-ref`` env, never imports
+MAX): the same models, from the same initial weights, trained on the same
+batches, in float64, with SGD (M1) or with the twin's AdamW recipe (M2:
+parameter groups, warmup + cosine schedule, global-norm clipping).
 
     env -u LD_PRELOAD .pixi/envs/act-ref/bin/python \\
         noeira_max/autodiff/tests/parity_torch.py {mlp|gpt} IN.npz OUT.json
@@ -9,6 +10,7 @@ same batches, in float64.
 from __future__ import annotations
 
 import json
+import math
 import sys
 from pathlib import Path
 
@@ -47,6 +49,56 @@ def gpt_loss(p, idx, targets, cfg):
     return F.cross_entropy(logits.reshape(-1, vocab), targets.reshape(-1))
 
 
+def lr_scale(it, warmup, total, min_scale):
+    """The twin's ``lr_at``; ``warmup == 0`` means a constant rate."""
+    if warmup == 0:
+        return 1.0
+    if it < warmup:
+        return (it + 1) / warmup
+    prog = min(1.0, (it - warmup) / max(1, total - warmup))
+    return min_scale + (1 - min_scale) * 0.5 * (1 + math.cos(math.pi * prog))
+
+
+def train_sgd(loss_fn, params, data, names, steps, lr):
+    step = torch.func.grad_and_value(loss_fn)
+    losses = []
+    for s in range(steps):
+        grads, loss = step(params, torch.from_numpy(data[f"x{s}"]), torch.from_numpy(data[f"y{s}"]))
+        losses.append(loss.item())
+        params = {n: params[n] - lr * grads[n] for n in names}
+    return losses, params
+
+
+def train_adamw(loss_fn, params, data, names, steps, lr):
+    """The twin's loop: set the scheduled rate, backward, clip, step."""
+    params = {n: p.clone().requires_grad_(True) for n, p in params.items()}
+    decay = [bool(d) for d in data["decay"]]
+    groups = [
+        {"params": [params[n] for n, d in zip(names, decay) if d],
+         "weight_decay": float(data["weight_decay"])},
+        {"params": [params[n] for n, d in zip(names, decay) if not d], "weight_decay": 0.0},
+    ]
+    b1, b2 = (float(b) for b in data["betas"])
+    opt = torch.optim.AdamW(
+        [g for g in groups if g["params"]], lr=lr, betas=(b1, b2),
+        eps=float(data["eps"]), foreach=False,
+    )
+    warmup, total, min_scale = int(data["warmup"]), int(data["total"]), float(data["min_scale"])
+    clip = float(data["clip"])
+    losses = []
+    for s in range(steps):
+        for group in opt.param_groups:
+            group["lr"] = lr * lr_scale(s, warmup, total, min_scale)
+        loss = loss_fn(params, torch.from_numpy(data[f"x{s}"]), torch.from_numpy(data[f"y{s}"]))
+        opt.zero_grad(set_to_none=True)
+        loss.backward()
+        if clip > 0:
+            torch.nn.utils.clip_grad_norm_(list(params.values()), clip)
+        opt.step()
+        losses.append(loss.item())
+    return losses, {n: p.detach() for n, p in params.items()}
+
+
 def main(model: str, npz_path: str, out_path: str) -> None:
     data = np.load(npz_path)
     names = [str(n) for n in data["names"]]
@@ -58,14 +110,9 @@ def main(model: str, npz_path: str, out_path: str) -> None:
         cfg = tuple(int(v) for v in data["config"])
         loss_fn = lambda p, x, y: gpt_loss(p, x, y, cfg)  # noqa: E731
 
-    step = torch.func.grad_and_value(loss_fn)
-    losses = []
-    for s in range(steps):
-        x = torch.from_numpy(data[f"x{s}"])
-        y = torch.from_numpy(data[f"y{s}"])
-        grads, loss = step(params, x, y)
-        losses.append(loss.item())
-        params = {n: params[n] - lr * grads[n] for n in names}
+    optimizer = str(data["optim"]) if "optim" in data else "sgd"
+    train = train_adamw if optimizer == "adamw" else train_sgd
+    losses, params = train(loss_fn, params, data, names, steps, lr)
 
     ours = data["losses"]
     param_diff = {

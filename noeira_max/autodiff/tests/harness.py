@@ -33,6 +33,7 @@ OPS = types.SimpleNamespace(
     **{n: getattr(ops, n) for n in dir(ops) if not n.startswith("_")}
 )
 OPS.DType = DType
+OPS.TensorType = TensorType
 
 DIRECTIONS = 3
 
