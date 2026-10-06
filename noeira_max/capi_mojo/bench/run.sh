@@ -9,6 +9,7 @@
 #
 #   noeira_max/capi_mojo/bench/run.sh            # (c)-(e) only
 #   noeira_max/capi_mojo/bench/run.sh --all      # every column
+#   noeira_max/capi_mojo/bench/run.sh --stream   # M1.4: Mojo kernels on MAX's own stream
 set -euo pipefail
 ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/../../.." && pwd)"
 MAIN="$(dirname "$(git -C "$ROOT" rev-parse --path-format=absolute --git-common-dir)")"
@@ -21,6 +22,15 @@ mkdir -p "$OUT"
 
 "${PIXI[@]}" env -u LD_PRELOAD PYTHONPATH="$ROOT" \
     python noeira_max/capi_mojo/bench/make_mlp_mefs.py "$OUT"
+if [[ "${1:-}" == "--stream" ]]; then
+    # The one MAX run WITH noeira's interposer preloaded: it is how the
+    # benchmark finds MAX's stream, which the C API does not expose.
+    "${PIXI[@]}" mojo build -I noeira_max/capi_mojo noeira_max/capi_mojo/bench/bench_shared_stream.mojo \
+        -o "$OUT/bench_shared_stream" -Xlinker -L"$LIB" -Xlinker -lmax
+    echo "== M1.4: one stream for Mojo and MAX"
+    "${PIXI[@]}" "$OUT/bench_shared_stream" "$OUT"
+    exit 0
+fi
 "${PIXI[@]}" mojo build -I noeira_max/capi_mojo noeira_max/capi_mojo/bench/bench_capi.mojo \
     -o "$OUT/bench_capi" -Xlinker -L"$LIB" -Xlinker -lmax
 echo "== (c)-(e): MAX C API from Mojo"
