@@ -7,7 +7,7 @@
 #
 #   noeira_max/autodiff/bench/run_5090.sh                # every section
 #   noeira_max/autodiff/bench/run_5090.sh --smoke        # torch + max: 1 layer, 5 steps
-#   noeira_max/autodiff/bench/run_5090.sh torch max      # some of: torch max scaling fit kernels
+#   noeira_max/autodiff/bench/run_5090.sh torch max      # some of: torch max scaling fit kernels mlp
 set -uo pipefail
 ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/../../.." && pwd)"
 MAIN="$(dirname "$(git -C "$ROOT" rev-parse --path-format=absolute --git-common-dir)")"
@@ -80,6 +80,29 @@ if want kernels; then
             noeira_max/autodiff/bench/bench_gpt_max.py --mode execute --layer-norm "$1" \
             --attention "$2" --bench-steps "$STEPS" "${SIZE[@]}"
     done
+fi
+
+if want mlp; then
+    # Small MLP train steps at the shapes of noeira's RL networks (mlp_step.py):
+    # a SAC critic and a PPO network, each executed with a cold compile, then
+    # captured, then profiled (captured) and summarised into kernels per step,
+    # GEMM paths and memsets (nsys_summary.py). No dataset needed.
+    PROF="${PROF:-${OUT%.log}_mlp_nsys}"
+    mkdir -p "$PROF"
+    for shape in sac ppo; do
+        run "mlp $shape, execute, cold compile" "$RUN" noeira_max/autodiff/bench/mlp_step.py \
+            --shape "$shape" --mode execute --cold --bench-steps "$STEPS"
+        run "mlp $shape, capture" "$RUN" noeira_max/autodiff/bench/mlp_step.py \
+            --shape "$shape" --mode capture --bench-steps "$STEPS"
+        run "mlp $shape, nsys" nsys profile -o "$PROF/$shape" --force-overwrite=true \
+            --cuda-graph-trace=node "$RUN" noeira_max/autodiff/bench/mlp_step.py \
+            --shape "$shape" --mode capture --bench-steps 100 --json "$PROF/$shape.json"
+        nsys stats --report cuda_gpu_kern_sum,cuda_gpu_mem_time_sum,cuda_gpu_mem_size_sum \
+            --format csv --force-export=true --force-overwrite=true \
+            -o "$PROF/$shape" "$PROF/$shape.nsys-rep" > "$PROF/$shape.stats.log" 2>&1
+        run "mlp $shape, kernels per step" "$RUN" noeira_max/autodiff/bench/nsys_summary.py "$PROF/$shape"
+    done
+    echo "mlp profiles in $PROF"
 fi
 
 if want scaling; then

@@ -27,7 +27,7 @@ value, grads = value_and_grad(loss)(params, x, y)   # grads: same keys as params
 | `optim.py` | SGD and AdamW emitted into the graph: schedule, bias correction and clipping from a device step counter |
 | `train.py` | `build_train_step`: forward + backward + update as one graph, parameters and state as buffers updated in place; MEF export / load |
 | `models/` | MLP and character GPT (dropout, in-graph batch sampling) as functions of a parameter dict |
-| `bench/` | The GPT train step against torch (`bench_gpt_max.py`, `torch_twin_math.py`), compile time (`compile_scaling.py`, `buffer_order_compile_time.py`), kernel-backed rules (`layer_norm_kernel.py`, `attention_kernel.py`), single ops (`kernel_probe.py`); `run_5090.sh` runs them on one GPU |
+| `bench/` | The GPT train step against torch (`bench_gpt_max.py`, `torch_twin_math.py`), compile time (`compile_scaling.py`, `buffer_order_compile_time.py`), kernel-backed rules (`layer_norm_kernel.py`, `attention_kernel.py`), single ops (`kernel_probe.py`), small MLP train steps at RL shapes (`mlp_step.py`, profiled with `nsys_summary.py`); `run_5090.sh` runs them on one GPU |
 | `capi/` | The exported step, trained from a Mojo binary through the MAX C API with no Python in the process (`run.sh` exports, builds, runs and compares) |
 | `tests/` | Gradcheck, torch golden VJPs, structural, vacuity, model parity, MAX findings |
 | `probes/` | The first probes of MAX's graph internals: op names, buffers, the compile cache, a 40-line reverse walk |
