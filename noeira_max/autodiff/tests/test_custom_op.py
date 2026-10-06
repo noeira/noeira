@@ -1,7 +1,7 @@
-"""Kernel-backed rules (plan M4): Mojo custom-op pairs whose VJP rule hands
-the forward's residuals to the backward kernel (``rules/custom.py``, RFC
-§6.3). LayerNorm (residuals: mean, rstd), and causal attention with noeira's
-fused kernels (residuals: the output and each row's log-sum-exp).
+"""Kernel-backed rules: Mojo custom-op pairs whose VJP rule hands the
+forward's residuals to the backward kernel (``rules/custom.py``). LayerNorm
+(residuals: mean, rstd), and causal attention with noeira's fused kernels
+(residuals: the output and each row's log-sum-exp).
 
     noeira_max/autodiff/run.sh -m unittest noeira_max.autodiff.tests.test_custom_op -v
 """
@@ -23,8 +23,8 @@ from noeira_max.autodiff.models.common import attention_kernel, layer_norm_kerne
 from noeira_max.autodiff.rules import custom
 
 SHAPE = (2, 3, 5)
-# ops.layer_norm's epsilon is a float32 constant even for float64 input
-# (results doc §5.4): use the same value on both sides.
+# ops.layer_norm's epsilon is a float32 constant even for float64 input:
+# use the same value on both sides.
 EPS = float(np.float32(1e-5))
 _SESSION = None
 

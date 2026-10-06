@@ -1,12 +1,11 @@
-"""A whole train step as one MAX graph: forward, backward, optimizer update
-(plan §4, M2; RFC §6.5).
+"""A whole train step as one MAX graph: forward, backward, optimizer update.
 
 The parameters, the optimizer state (moments and the step counter) and,
 when the step draws random numbers, a seed are ``BufferType`` inputs that the
 graph stores into: one execution is one step, nothing is copied between
 steps, and only the loss leaves the step, as a device tensor. A step whose
 batch is drawn in the graph from a device-resident corpus has the same inputs
-on every call, which is what device-graph capture needs (RFC C1-C3).
+on every call, which is what device-graph capture needs.
 """
 
 from __future__ import annotations

@@ -1,4 +1,4 @@
-"""M0 probe 5: a 40-line reverse walk. f(x, w) = sum(relu(x@w) * (x@w)), with
+"""Probe: a 40-line reverse walk. f(x, w) = sum(relu(x@w) * (x@w)), with
 x@w used twice (fan-out), rules keyed by MLIR op NAME, gradients checked in f64."""
 import numpy as np
 from max import _core

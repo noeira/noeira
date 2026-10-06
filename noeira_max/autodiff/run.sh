@@ -4,7 +4,7 @@
 # PYTHONPATH. Works from the main checkout too.
 #
 #   noeira_max/autodiff/run.sh -m unittest discover -s noeira_max/autodiff/tests -t .
-#   noeira_max/autodiff/run.sh noeira_max/autodiff/m0/probe_transform.py
+#   noeira_max/autodiff/run.sh noeira_max/autodiff/probes/probe_transform.py
 #   AUTODIFF_ENV=act-ref noeira_max/autodiff/run.sh ...   # another pixi env
 set -euo pipefail
 ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/../.." && pwd)"

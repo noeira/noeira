@@ -1,5 +1,5 @@
 #!/usr/bin/env bash
-# M3: train with the MAX train step from Mojo, through the C API, with no
+# Train with the MAX train step from Mojo, through the C API, with no
 # Python in the process. Exports the step (Python, once), builds the Mojo
 # driver, runs it, and compares its losses with the same compiled step
 # driven from Python.

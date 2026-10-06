@@ -19,7 +19,7 @@ from max.engine import InferenceSession
 from max.graph import DeviceRef, Graph, TensorType, ops
 
 DEV = DeviceRef.CPU()
-# Seen on the M1 (macOS arm64), not on an x86-64 Linux host (EPYC, 2026-10-06).
+# Seen on an Apple M1 (macOS arm64), not on an x86-64 Linux host (EPYC, 2026-10-06).
 _MAC_ONLY_FAILURE = unittest.expectedFailure if sys.platform == "darwin" else (lambda test: test)
 _SESSION = InferenceSession(devices=[CPU()])
 

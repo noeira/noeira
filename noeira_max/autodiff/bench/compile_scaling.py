@@ -1,4 +1,4 @@
-"""Compile time against depth (plan M2): the GPT forward alone (loss only)
+"""Compile time against depth: the GPT forward alone (loss only)
 and the whole train step (forward, backward, AdamW).
 
 MAX caches compiled models by graph BODY (the graph's name is not in the key)

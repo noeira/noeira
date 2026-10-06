@@ -1,4 +1,4 @@
-"""Custom ops: a rule per kernel symbol (plan M4, RFC §6.3).
+"""Custom ops: a rule per kernel symbol.
 
 Every custom op is ``mo.custom``; the ``symbol`` attribute names the Mojo
 kernel. ``defvjp_custom(symbol)`` registers that kernel's VJP. The ones here

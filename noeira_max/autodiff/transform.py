@@ -1,4 +1,4 @@
-"""Reverse-mode AD as a graph transform (plan §3.2).
+"""Reverse-mode AD as a graph transform.
 
 ``fun`` runs in the graph being built, so its ops land in the enclosing block.
 The transform then walks those ops backwards and emits each one's VJP into

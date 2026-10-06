@@ -123,7 +123,7 @@ class TransformTest(unittest.TestCase):
 
 
 class ExperimentalTensorTest(unittest.TestCase):
-    """The RFC's user-facing path: ``max.experimental`` tensors, traced and
+    """The user-facing path of ``max.experimental``: tensors traced and
     compiled by ``compilation.compile``, gradient taken inside the trace."""
 
     def test_value_and_grad_inside_compile(self):

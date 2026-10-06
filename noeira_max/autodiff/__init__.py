@@ -1,6 +1,6 @@
 """Reverse-mode autodiff for MAX graphs, as a graph transform.
 
-A prototype (see ``docs/PROTOTYPE_MAX_AUTODIFF_PLAN.md``): ``vjp``,
+A prototype for MAX 26.6 (see ``README.md``): ``vjp``,
 ``value_and_grad`` and ``grad`` work while a graph is being built, inside a
 ``max.graph.Graph`` or a function given to
 ``max.experimental.compilation.compile``, and emit the backward pass into

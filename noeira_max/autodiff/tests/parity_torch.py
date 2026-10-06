@@ -1,7 +1,7 @@
 """Torch side of the model-level parity tests (``act-ref`` env, never imports
 MAX): the same models, from the same initial weights, trained on the same
-batches, in float64, with SGD (M1) or with the twin's AdamW recipe (M2:
-parameter groups, warmup + cosine schedule, global-norm clipping).
+batches, in float64, with SGD or with the twin's AdamW recipe (parameter
+groups, warmup + cosine schedule, global-norm clipping).
 
     env -u LD_PRELOAD .pixi/envs/act-ref/bin/python \\
         noeira_max/autodiff/tests/parity_torch.py {mlp|gpt} IN.npz OUT.json

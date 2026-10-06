@@ -1,4 +1,4 @@
-"""M0 probe: which op classes does a freshly staged graph contain, and can we
+"""Probe: which op classes does a freshly staged graph contain, and can we
 append ops after the function returns?"""
 import time
 import numpy as np

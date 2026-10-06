@@ -1,7 +1,7 @@
 """The torch twin (``tools/nn/torch_nn_reference.py``) with flash attention
 off: SDPA restricted to its MATH backend, which materialises the scores as
-the MAX step does. This column separates the missing flash-attention backward
-(RFC K3) from the cost of the AD transform itself.
+the MAX step does. Its time separates the cost of the missing flash-attention
+backward (MAX 26.6 has none) from the cost of the AD transform itself.
 
     env -u LD_PRELOAD .pixi/envs/act-ref/bin/python \\
         noeira_max/autodiff/bench/torch_twin_math.py gpt --mode compile --bench-steps 50

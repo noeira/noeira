@@ -1,4 +1,4 @@
-"""Composite against kernel-backed causal attention (plan M4): speed and
+"""Composite against kernel-backed causal attention: speed and
 memory of ``value_and_grad`` of ``sum(attn(qkv) * w)``, at the GPT
 benchmark's shape (B 64, T 256, 6 heads of 64).
 

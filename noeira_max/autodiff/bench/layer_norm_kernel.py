@@ -1,4 +1,4 @@
-"""Composite against kernel-backed layer norm (plan M4): speed and memory of
+"""Composite against kernel-backed layer norm: speed and memory of
 ``value_and_grad`` of ``sum(LN(x) * w)``, at the GPT benchmark's shape.
 
 - composite: ``ops.layer_norm`` and its rule (``rules/nn.py``), which

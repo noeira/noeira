@@ -30,7 +30,7 @@ class Config:
     dropout: float = 0.0
     layer_norm: str = "composite"
     """``composite``: ``ops.layer_norm`` and its composite rule; ``kernel``:
-    the Mojo custom-op pair (``kernels/layer_norm.mojo``, plan M4)."""
+    the Mojo custom-op pair (``kernels/layer_norm.mojo``)."""
     attention: str = "composite"
     """``composite``: the scores materialised (matmul, bias, softmax, matmul)
     and their rules; ``kernel``: noeira's fused attention as a custom-op pair

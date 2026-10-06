@@ -1,4 +1,4 @@
-"""M0 probe 6: op-name table for the M1 rule set, Value.owner, constant
+"""Probe: the op-name table for the first rule set, Value.owner, constant
 decoding, generic-op attributes, and source locations."""
 import numpy as np
 from max import _core

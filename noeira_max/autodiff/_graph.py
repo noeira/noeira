@@ -1,7 +1,7 @@
 """Every private MAX API the transform touches, in one place.
 
-This module *is* the list the results doc reports as "what MAX would need to
-make public" (plan §1, rule 4). Nothing else in the package may import
+This module *is* the list of what MAX would need to make public for the
+transform to live outside it. Nothing else in the package may import
 ``max._core``, ``max._mlir`` or read an underscore attribute of a MAX object.
 
 What it needs, and why:
@@ -21,7 +21,7 @@ What it needs, and why:
 - ``TensorValue._mlir_value``: the value identity the walk keys on.
 
 Reflecting generically over the typed bindings' properties can segfault
-(M0, probe 2), so only the properties named here are ever read.
+(``probes/probe_ops2.py``), so only the properties named here are ever read.
 """
 
 from __future__ import annotations

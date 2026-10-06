@@ -1,9 +1,9 @@
 """Fused NN ops, with composite rules.
 
 ``mo.reduce.layer_norm`` returns ``y`` only, so its rule recomputes the mean
-and the reciprocal standard deviation from the input: the residual contract
-of RFC §6.2, missing. A kernel-backed rule (M4) would take them from the
-forward instead.
+and the reciprocal standard deviation from the input: a MAX op cannot hand
+residuals to its backward. The kernel-backed rule (``rules/custom.py``) takes
+them from the forward instead.
 """
 
 from __future__ import annotations

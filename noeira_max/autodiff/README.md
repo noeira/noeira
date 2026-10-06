@@ -22,14 +22,15 @@ value, grads = value_and_grad(loss)(params, x, y)   # grads: same keys as params
 | `_graph.py` | Every private MAX API the transform touches, in one module |
 | `transform.py` | `vjp`, `value_and_grad`, `grad` |
 | `registry.py` | `defvjp(name)` / `nondiff(name)`; rules are keyed by MLIR op name |
-| `rules/` | 42 VJP rules: linalg, elementwise, reduction, shape, indexing, nn |
+| `rules/` | 42 VJP rules (linalg, elementwise, reduction, shape, indexing, nn), and the rules of Mojo custom ops (`custom.py`) |
+| `kernels/` | Mojo custom ops for kernel-backed rules: LayerNorm, and noeira's fused attention. Each is a forward that returns its residuals and a backward that takes them |
 | `optim.py` | SGD and AdamW emitted into the graph: schedule, bias correction and clipping from a device step counter |
 | `train.py` | `build_train_step`: forward + backward + update as one graph, parameters and state as buffers updated in place; MEF export / load |
 | `models/` | MLP and character GPT (dropout, in-graph batch sampling) as functions of a parameter dict |
-| `bench/` | The M2 benchmark (`bench_gpt_max.py`, `compile_scaling.py`, `torch_twin_math.py`, `run_5090.sh`) |
-| `capi/` | M3: the exported step trained from a Mojo binary through the MAX C API, no Python in the process (`run.sh` exports, builds, runs and compares) |
+| `bench/` | The GPT train step against torch (`bench_gpt_max.py`, `torch_twin_math.py`), compile time (`compile_scaling.py`, `buffer_order_compile_time.py`), kernel-backed rules (`layer_norm_kernel.py`, `attention_kernel.py`), single ops (`kernel_probe.py`); `run_5090.sh` runs them on one GPU |
+| `capi/` | The exported step, trained from a Mojo binary through the MAX C API with no Python in the process (`run.sh` exports, builds, runs and compares) |
 | `tests/` | Gradcheck, torch golden VJPs, structural, vacuity, model parity, MAX findings |
-| `m0/` | The go/no-go probes |
+| `probes/` | The first probes of MAX's graph internals: op names, buffers, the compile cache, a 40-line reverse walk |
 
 Run the tests from the repo root (the torch side needs the `act-ref` env):
 

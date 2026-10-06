@@ -1,5 +1,5 @@
 """The gradcheck can fail: inject the defects the rules guard against, and
-check that the suite catches each one (plan §4, M1, test 4).
+check that the suite catches each one.
 
     noeira_max/autodiff/run.sh -m unittest noeira_max.autodiff.tests.test_vacuity -v
 """

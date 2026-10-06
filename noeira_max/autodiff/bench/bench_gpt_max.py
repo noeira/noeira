@@ -1,4 +1,4 @@
-"""The torch twin's char-GPT recipe as ONE compiled MAX train step (plan M2).
+"""The torch twin's char-GPT recipe as ONE compiled MAX train step.
 
 Same recipe as ``tools/nn/torch_nn_reference.py gpt``: 6 layers x 384, 6
 heads, sequence 256, batch 64, dropout 0.2, tied head, AdamW 1e-3
@@ -54,9 +54,9 @@ def main() -> None:
                     help="time this many steps after as many warmup steps (the twin's flag)")
     ap.add_argument("--seed", type=int, default=42)
     ap.add_argument("--layer-norm", choices=["composite", "kernel"], default="composite",
-                    help="ops.layer_norm and its composite rule, or the Mojo custom ops (M4)")
+                    help="ops.layer_norm and its composite rule, or the Mojo custom ops (kernels/)")
     ap.add_argument("--attention", choices=["composite", "kernel"], default="composite",
-                    help="the scores materialised, or noeira's fused attention as custom ops (M4)")
+                    help="the scores materialised, or noeira's fused attention as custom ops (kernels/)")
     args = ap.parse_args()
 
     device = Accelerator() if args.device == "gpu" and accelerator_count() else CPU()

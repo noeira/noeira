@@ -1,4 +1,4 @@
-"""The VJP rule registry, keyed by MLIR op name (plan §3.3).
+"""The VJP rule registry, keyed by MLIR op name.
 
 A rule receives a :class:`RuleContext` and returns one cotangent per op input,
 ``None`` where it contributes nothing. Rules emit their ops through the public

@@ -23,8 +23,8 @@ def cross_entropy(logits: TensorValue, targets: TensorValue) -> TensorValue:
     """Mean cross-entropy over every leading position, as ``[1, 1]``.
 
     ``logits`` is ``[..., classes]``, ``targets`` the integer labels
-    ``[...]``. The one-hot is built in the graph from the labels; a fused
-    loss would be RFC K6.
+    ``[...]``. The one-hot is built in the graph from the labels; MAX has no
+    fused cross-entropy kernel.
     """
     classes = int(logits.shape[-1])
     flat = ops.reshape(logits, [-1, classes])

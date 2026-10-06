@@ -1,5 +1,5 @@
 """Trains with a MAX train step from Mojo, through the MAX C API: no Python
-in the process (plan §4, M3).
+in the process.
 
 `export_step.py` writes the compiled step (`step.mef`), every input's initial
 bytes (`step.inputs`) and their layout (`step.manifest`). This program owns

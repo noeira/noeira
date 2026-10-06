@@ -2,7 +2,8 @@
 
 ``rmo.matmul`` has no transpose flags, so every product with a transposed
 operand is an explicit ``transpose`` followed by a ``matmul``: whether the
-compiler folds the transpose into the GEMM is an M2 measurement (RFC K1).
+compiler folds the transpose into the GEMM depends on the case: in the GPT
+train step on an RTX 5090, materialised transposes took 9% of the step.
 """
 
 from __future__ import annotations

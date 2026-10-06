@@ -1,5 +1,5 @@
 """Times, alone, the ops that dominate the GPT train step's profile on the
-5090 (plan M2), and the alternatives a rule could emit instead:
+5090, and the alternatives a rule could emit instead:
 
 - ``embedding``: the embedding gradient, ``scatter_nd_add`` of the
   [batch, seq, dim] cotangent into the [vocab, dim] table, against a spread

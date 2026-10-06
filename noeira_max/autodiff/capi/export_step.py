@@ -1,4 +1,4 @@
-"""Exports a train step for the Mojo driver (plan §4, M3).
+"""Exports a train step for the Mojo driver (``train_step.mojo``).
 
 Writes, into OUT_DIR:
 

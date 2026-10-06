@@ -1,4 +1,4 @@
-"""Model-level parity with PyTorch (plan §4, M1): the MLP and a tiny GPT,
+"""Model-level parity with PyTorch: the MLP and a tiny GPT,
 from identical initial weights, 50 SGD steps on fixed batches, float64 on
 CPU. Loss curves and final parameters are compared.
 

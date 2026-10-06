@@ -5,7 +5,7 @@ stored. "interleaved" emits load b1, store b1, load b2, store b2, ...;
 "phased" emits every load, then every store. A train step updates every
 parameter and every optimizer moment in place, so N is in the hundreds.
 
-Measured on an M1 CPU with MAX 26.6 (results doc, M2): interleaved 7.7 s at
+Measured on an Apple M1 CPU with MAX 26.6: interleaved 7.7 s at
 N = 10, 24.9 s at 30, over 240 s at 40; phased 7.4 s at 10, 11.1 s at 170.
 
     noeira_max/autodiff/run.sh noeira_max/autodiff/bench/buffer_order_compile_time.py

@@ -1,9 +1,10 @@
-"""Optimizers that emit their update into the train-step graph (plan §4, M2).
+"""Optimizers that emit their update into the train-step graph.
 
 Parameters and optimizer state are buffers of the graph, updated in place by
 ``buffer_store``. The step counter is one of those buffers, so the learning
 rate schedule and Adam's bias correction are computed on the device from it,
-never on the host (RFC §6.4, capture conditions C1 and C2).
+never on the host. So every call of the step takes the same inputs, which is
+what device-graph capture needs.
 
 The arithmetic follows PyTorch's single-tensor implementations op for op
 (``lerp``, ``addcmul``, ``addcdiv``), so the float64 parity test can be tight.

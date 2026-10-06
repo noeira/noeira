@@ -1,4 +1,4 @@
-"""LayerNorm as two MAX custom ops, for the kernel-backed rule (plan M4).
+"""LayerNorm as two MAX custom ops, for the kernel-backed rule (`rules/custom.py`).
 
 - `noeira_layer_norm_fwd`: `x [R, D]`, `gamma [D]`, `beta [D]`, `eps [1]`
   -> `y [R, D]` **and the residuals** `mean [R, 1]`, `rstd [R, 1]`.

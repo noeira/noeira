@@ -1,4 +1,4 @@
-"""M0 probe 4: does a compiled step mutate a BufferLayout argument in place,
+"""Probe: does a compiled step mutate a BufferLayout argument in place,
 across calls, with a device-side step counter? And does export_mef work?"""
 import os, tempfile, time
 import numpy as np

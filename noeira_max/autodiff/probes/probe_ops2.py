@@ -1,4 +1,4 @@
-"""M0 probe 2: op classes of the nanoGPT op set, compile-time warm vs cold,
+"""Probe: op classes of the nanoGPT op set, compile-time warm vs cold,
 and whether the eager interpreter runs an rmo graph in float64."""
 import time
 import numpy as np

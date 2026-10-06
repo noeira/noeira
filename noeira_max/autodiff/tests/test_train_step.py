@@ -1,4 +1,4 @@
-"""The whole train step as one compiled graph (plan §4, M2): parameters,
+"""The whole train step as one compiled graph: parameters,
 moments and the step counter are buffers updated in place; the schedule,
 bias correction and clipping run on the device.
 
@@ -124,8 +124,8 @@ class TrainStepTest(unittest.TestCase):
             np.testing.assert_array_equal(reloaded.host_params()[name], value)
         self.assertEqual(reloaded.host_state()["step"].item(), 3)
 
-    def test_rfc_sketch_runs_as_written(self):
-        """RFC §5's train step, as written there but for ``mutable=``: the
+    def test_experimental_api_train_step(self):
+        """A train step written with ``max.experimental``: the
         parameters and optimizer state are ``BufferLayout`` specs given to
         ``compilation.compile``, the step is traced over ``max.experimental``
         tensors, and it stores in place. It must match ``build_train_step``
@@ -170,7 +170,7 @@ class TrainStepTest(unittest.TestCase):
         self.assertEqual(state["step"].to_numpy().item(), 3)
 
     def test_dropout_draws_new_masks_every_step(self):
-        """The seed is a buffer bumped in the graph (RFC C3): with the
+        """The seed is a buffer bumped in the graph: with the
         parameters frozen (lr 0) and one batch, every step's loss differs, and
         a fresh run from the same seed repeats the sequence."""
         cfg = gpt.Config(layers=1, dropout=0.5)

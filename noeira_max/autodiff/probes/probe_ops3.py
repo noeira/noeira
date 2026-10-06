@@ -1,4 +1,4 @@
-"""M0 probe 3: on-disk compile cache across processes, float64 for the fused
+"""Probe: on-disk compile cache across processes, float64 for the fused
 ops, and how to name an op that has no typed binding."""
 import sys, time
 import numpy as np
