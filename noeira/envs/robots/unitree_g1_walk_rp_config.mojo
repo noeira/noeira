@@ -526,6 +526,19 @@ def _terminating(b: Int) -> Bool:
     )
 
 
+@always_inline
+def _arm_torso(a: Int, b: Int) -> Bool:
+    """An upper-body self-contact that is the G1's resting geometry, not a
+    fault: the waist / torso (22-24) against an arm link (25-40), or two
+    links of the SAME arm (left 25-32, right 33-40). Left arm against right
+    arm, and anything against the floor, still count."""
+    var ta = a >= 22 and a <= 24
+    var tb = b >= 22 and b <= 24
+    var aa = a >= 25 and a <= 40
+    var ab = b >= 25 and b <= 40
+    return (ta and ab) or (tb and aa) or (aa and ab and ((a <= 32) == (b <= 32)))
+
+
 @fieldwise_init
 struct G1RContacts(Copyable, ImplicitlyCopyable, Movable):
     """One scan of a lane's contact records."""
@@ -596,7 +609,15 @@ def g1r_contacts[
                 out.frz += sgn * f_n * nz
                 out.fr_tan += ft
             else:
-                if body < 64 and (seen >> UInt64(body)) & 1 == 0:
+                # ⚠ ARM AGAINST TORSO IS NOT "UNDESIRED" ON THIS BODY. On BFM's
+                # G1 the upper arms hang against the torso mesh and a walking
+                # gait brushes them every step: under RoboParty's reward, s6's
+                # walk paid -2.10 / s here (torso-upper-arm pairs, 33 k records
+                # in 8 k steps) against +0.32 / s of extra tracking — standing
+                # still won (runs rp5-rp7). On their RPO the arms clear the
+                # torso, so the term never charged a gait. Floor contacts and
+                # leg-leg contacts still count.
+                if not _arm_torso(body, other) and body < 64 and (seen >> UInt64(body)) & 1 == 0:
                     seen = seen | (UInt64(1) << UInt64(body))
                     out.undesired += 1
                 # ⚠ AGAINST THE WORLD ONLY. RoboParty terminates on any
