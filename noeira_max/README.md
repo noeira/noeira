@@ -19,6 +19,7 @@ It answers three questions for "should noeira incorporate MAX?":
 | `benchmark_nn_baseline.mojo` | Pure-nn native GPU forward on the SAME shapes — the apples-to-apples "why incorporate MAX?" baseline. |
 | `probe_c_api.sh` | Path-B feasibility probe: is the MAX C API linkable + is there a MEF-export path? Prints GO/NO-GO. Run under `-e nvidia`; on macOS it reports a false NO-GO (see Path B). |
 | `capi_mojo/maxrt/` | Path B: a Mojo binding to the MAX C API (load a MEF, lend host or device buffers, execute, capture, replay). Tests in `capi_mojo/maxrt_tests/`, a training example in `capi_mojo/examples/`. |
+| `capi_mojo/run_mef.mojo`, `capi_mojo/build_mef.py` | The smallest Mojo → C API program: raw `external_call`s that run a CPU vector add from a MEF (`capi_mojo/README.md`). |
 | `capi_mojo/bench/` | Columns (c)–(e) of the CUDA table: `run.sh` exports the MLP MEFs, builds and runs `bench_capi.mojo`; `run.sh --all` reruns every column on the same box. |
 | `graph_mlp_example.py`, `graph_relu_example.py` | Original MAX reference snippets (kept for reference). |
 
