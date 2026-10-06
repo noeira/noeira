@@ -27,22 +27,36 @@ MAX 26.6.0 and Mojo 1.1.0 throughout. GPU numbers are from an RTX 5090 (driver 5
 ### Running MAX models from Mojo
 
 An RL actor MLP (17 → 256 → 256 → 6) and a wider one (256 → 512 → 512 → 64), in µs per
-call, each call synchronised (median of 1,000), all from one session:
+call on an RTX 5090:
 
-| Shape | (c) C API, host in and out | (d) C API, device buffers | (e) (d), captured | (f) noeira nn | (g) noeira nn, captured |
-|---|---|---|---|---|---|
-| actor, batch 1 | 28.6 | 15.9 | **8.3** | 18.4 | 12.7 |
-| actor, batch 64 | 74.4 | 64.9 | **48.7** | 57.4 | 49.4 |
-| actor, batch 1024 | 90.2 | 71.1 | **50.4** | 62.4 | 53.2 |
-| wide, batch 1 | 39.6 | 24.0 | **9.2** | 16.4 | 13.0 |
-| wide, batch 1024 | 145.9 | 81.8 | **66.0** | 91.1 | 82.7 |
+| Shape | (a) MAX compute only, timed from Python | (b) Through Python, from Mojo | (c) C API, host buffers | (d) C API, device buffers | (e) C API, device buffers, captured | (f) noeira nn | (g) noeira nn, captured* |
+|---|---|---|---|---|---|---|---|
+| actor, batch 1 | 26.8 | 48.5 | 36.5 | 24.1 | **8.2** | 21.5 | 12.7 |
+| actor, batch 64 | 52.1 | 86.2 | 74.8 | 69.1 | **48.4** | 53.2 | 49.4 |
+| actor, batch 1024 | 53.0 | 86.9 | 85.2 | 69.4 | **49.9** | 55.3 | 53.2 |
+| wide, batch 1 | 19.0 | 36.4 | 35.6 | 24.0 | **9.1** | 20.5 | 13.0 |
+| wide, batch 1024 | 64.4 | 144.2 | 131.4 | 79.6 | **65.3** | 91.2 | 82.7 |
 
-- **Each layer of overhead can be removed.** Through Python interop, the actor at batch 1
-  takes 48.5 µs (MAX's compute alone, timed from Python: 26.8). The C API removes Python's
-  glue (28.6), lending device buffers removes the copies (15.9), and capture removes MAX's
-  per-call host cost (8.3; 4.1 pipelined).
+What each column runs:
+- **(a)** MAX's device compute alone, calls back to back, timed from Python: a floor, not
+  the latency a caller sees.
+- **(b)** The whole call from Mojo through Python interop: the input copied to the device,
+  the model executed, the output copied back (`benchmark_interop.mojo`).
+- **(c)** The same through the C API, with no Python in the process (`capi_mojo/bench/`).
+- **(d)** The input in a Mojo device buffer, lent to MAX once by address: no copies.
+- **(e)** (d) recorded once as a CUDA graph, and that graph replayed on every call.
+- **(f)** noeira's nn forward on the same MLPs (`benchmark_nn_baseline.mojo`); **(g)** that
+  forward recorded once as a CUDA graph and replayed (`capi_mojo/bench/bench_nn_capture.mojo`).
+
+(a) and (b) are means over 2,000 calls; (c) to (g) are medians over 1,000 or 2,000 calls,
+each synchronised. (a) to (f) come from one session. *(g) comes from a later session on the same GPU model: there, (e) reproduced
+within 1% (8.3 µs at actor batch 1) and (f), on a newer noeira, measured 18.4 µs.
+
+- **Each layer of overhead can be removed.** At actor batch 1, the C API removes Python's
+  glue (48.5 → 36.5 µs), lending device buffers removes the copies (24.1), and capture
+  removes MAX's per-call host cost (8.2; 4.1 pipelined).
 - **With device buffers and capture, MAX runs these MLPs faster than noeira's nn, captured
-  or not**: 8.3 against 12.7 µs at batch 1. Where both are GPU-bound (actor, batch 64 and
+  or not**: 8.2 against 12.7 µs at batch 1. Where both are GPU-bound (actor, batch 64 and
   1024), they are within a few µs.
 - **Mojo and MAX share the CUDA context and its allocator**, so device buffers pass both
   ways by address, but not a stream: each hand-off is a host synchronisation, about 3 µs.
@@ -52,7 +66,8 @@ call, each call synchronised (median of 1,000), all from one session:
   C API does not expose its stream, so that benchmark finds it through noeira's CUDA
   interposer.
 - MAX compiles each MLP in about 30 s on CUDA, about 1 s once cached.
-- (c) and (d) vary by up to 8 µs between processes (MAX's host cost per call); replays do not.
+- (c) and (d) vary by up to 8 µs between processes (MAX's host cost per call; 28.6 and
+  15.9 µs at actor batch 1 in the later session); replays do not.
 
 The first measurements, in June 2026, went through Python only. MAX's delivered latency
 was then 2.7–4× nn's on NVIDIA. That gap was Python's glue and the host copies (the
@@ -111,7 +126,7 @@ From the repo root. The scripts use the main checkout's pixi env (`default`; `MA
 or `AUTODIFF_ENV` select another), so they also work from a git worktree.
 
 ```bash
-noeira_max/capi_mojo/bench/run.sh [--all | --stream]   # NVIDIA: (c)-(e); --all adds the Python path and nn
+noeira_max/capi_mojo/bench/run.sh [--all | --stream]   # NVIDIA: (c)-(e); --all adds (a), (b), (f); --stream the shared stream
 noeira_max/capi_mojo/maxrt_tests/run.sh                 # maxrt's tests (MAXRT_ENV=apple: Metal too)
 noeira_max/graph_mojo/run.sh                            # regenerate the builder, parity tests, example
 noeira_max/staged_vs_eager/run.sh [--gpu]               # the crossover sweep, CPU or CUDA
@@ -121,6 +136,7 @@ noeira_max/autodiff/run.sh -m unittest discover -s noeira_max/autodiff/tests -t 
 pixi run -e apple  bash -c 'mojo build -I . noeira_max/benchmark_interop.mojo -o /tmp/bench && /tmp/bench'
 pixi run -e nvidia bash -c 'mojo build -I . noeira_max/benchmark_interop.mojo -o /tmp/bench && /tmp/bench'
 pixi run -e nvidia mojo run -I . noeira_max/benchmark_nn_baseline.mojo
+pixi run -e nvidia mojo run -I . noeira_max/capi_mojo/bench/bench_nn_capture.mojo   # (f) and (g)
 ```
 
 ## Notes
