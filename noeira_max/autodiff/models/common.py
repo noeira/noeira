@@ -70,6 +70,10 @@ def attention_kernel(qkv: TensorValue, heads: int) -> TensorValue:
     _graph.import_kernels(Graph.current, KERNELS)
     b, t, c3 = (int(d) for d in qkv.shape)
     c = c3 // 3
+    if qkv.device.is_gpu() and (c // heads) % 32:
+        # Caught here, the graph compiler would report it as a MAX bug.
+        raise ValueError(f"noeira's GPU attention kernels need a head dim that is a multiple "
+                         f"of 32 (16 on Apple GPUs), got {c // heads}")
     o, _ = ops.custom(
         "noeira_attention_fwd",
         device=qkv.device,

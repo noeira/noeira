@@ -12,7 +12,8 @@ rule: noeira's fused (flash) attention on the GPU, plain loops on the CPU.
 
 Every size is a compile-time parameter (`ops.custom(parameters=...)`), as
 noeira's kernels take them. The scale is 1/sqrt(HD). The GPU path enqueues noeira's FlashAttention-2
-kernels (`flash_attention.mojo`; float32, `lse` in log2 units). The CPU path
+kernels (`flash_attention.mojo`; float32, `lse` in log2 units; the head dim
+a multiple of 32 with NVIDIA's tiles, 16 with Apple's). The CPU path
 is O(S²) loops in any dtype (natural log), for float64 gradchecks. A graph
 uses one path, whose forward and backward agree.
 """

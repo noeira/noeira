@@ -153,7 +153,11 @@ class KernelBackedLayerNorm(unittest.TestCase):
         self.assertGreater(rel(got[4], want[4]), 0.1)
 
 
-ATTN = gpt.Config(seq=8, dim=32, heads=2)  # head dim 16: Apple's tiles need a multiple of 16
+# Head dim 64. noeira's GPU kernels split it over a tile's threads, which
+# needs a multiple of 32 with NVIDIA's tiles (16 with Apple's). And its scale,
+# 1/8, is a float32: MAX's fused CPU attention, which the float64 composite
+# compiles to, holds the scale in float32 (test_max_findings).
+ATTN = gpt.Config(seq=8, dim=128, heads=2)
 ATTN_SHAPE = (2, ATTN.seq, 3 * ATTN.dim)
 
 

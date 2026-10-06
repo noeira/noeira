@@ -8,6 +8,8 @@ means the release fixed it, and the workaround can go.
 
 from __future__ import annotations
 
+import math
+import sys
 import unittest
 
 import numpy as np
@@ -17,6 +19,8 @@ from max.engine import InferenceSession
 from max.graph import DeviceRef, Graph, TensorType, ops
 
 DEV = DeviceRef.CPU()
+# Seen on the M1 (macOS arm64), not on an x86-64 Linux host (EPYC, 2026-10-06).
+_MAC_ONLY_FAILURE = unittest.expectedFailure if sys.platform == "darwin" else (lambda test: test)
 _SESSION = InferenceSession(devices=[CPU()])
 
 
@@ -66,10 +70,30 @@ class MaskedAttentionTest(unittest.TestCase):
         np.testing.assert_allclose(y, ref, rtol=1e-4, atol=1e-5)
 
 
+def _fused_attention_error(d):
+    """``softmax(q·kᵀ/sqrt(d))·v`` in float64 on the CPU, which MAX compiles to
+    its fused attention kernel: that kernel's names, and y's largest error
+    relative to max |y|."""
+    shape = [2, 2, 8, d]
+    s = 1.0 / math.sqrt(d)
+    with Graph(f"attn_scale_{d}", input_types=[TensorType(DType.float64, shape, DEV)] * 3) as g:
+        q, k, v = g.inputs
+        g.output(ops.matmul(ops.softmax(ops.matmul(q, ops.transpose(k, -1, -2)) * s), v))
+    model = _SESSION.load(g)
+    rng = np.random.default_rng(0)
+    q, k, v = (rng.standard_normal(shape) for _ in range(3))
+    (y,) = (b.to_numpy() for b in model.execute(*map(Buffer.from_numpy, (q, k, v))))
+    scores = q @ np.swapaxes(k, -1, -2) * s
+    w = np.exp(scores - scores.max(-1, keepdims=True))
+    ref = (w / w.sum(-1, keepdims=True)) @ v
+    fused = [n for n in model.kernel_summaries if "flash_attention" in n]
+    return fused, float(np.max(np.abs(y - ref)) / np.max(np.abs(ref)))
+
+
 class Float64PrecisionTest(unittest.TestCase):
     """Float64 kernels that are only float32-accurate."""
 
-    @unittest.expectedFailure
+    @_MAC_ONLY_FAILURE
     def test_mean_scale_is_exact(self):
         # 3 * float32(1/3) = 1.0000000298023224, which MAX returns.
         with Graph("mean", input_types=[TensorType(DType.float64, [1, 3], DEV)]) as g:
@@ -86,6 +110,20 @@ class Float64PrecisionTest(unittest.TestCase):
             g.output(ops.erf(g.inputs[0]))
         (y,) = _run(g, x)
         np.testing.assert_allclose(y, [erf(v) for v in x], rtol=1e-12)
+
+    @unittest.expectedFailure
+    def test_fused_attention_scale_is_float64(self):
+        # Head dim 32: 1/sqrt(32) is not a float32. y matches numpy run with
+        # the float32-rounded scale to 3e-13, and with the true one to 1e-8.
+        _, err = _fused_attention_error(32)
+        self.assertLess(err, 1e-11)
+
+    def test_fused_attention_with_a_float32_exact_scale(self):
+        # Head dim 64: 1/8 is a float32, and the same fused kernel is exact.
+        # Head dims that are powers of 4 hide the finding.
+        fused, err = _fused_attention_error(64)
+        self.assertTrue(fused, "the graph was not fused")
+        self.assertLess(err, 1e-11)
 
 
 class SplitTest(unittest.TestCase):
