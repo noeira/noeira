@@ -1,7 +1,7 @@
 """Trains with an exported MAX train step from Mojo, on `maxrt`.
 
-The workload of the autodiff prototype's Mojo driver (branch
-`proto/max-autodiff`, `noeira_max/autodiff/capi/`): a GPT train step
+The workload of the autodiff prototype's Mojo driver
+(`noeira_max/autodiff/capi/`): a GPT train step
 (forward, backward, AdamW) whose parameters, moments, step counter and seed
 are buffers it stores into. Its exporter writes `step.mef`, every input's
 initial bytes (`step.inputs`) and their layout (`step.manifest`: int64s
