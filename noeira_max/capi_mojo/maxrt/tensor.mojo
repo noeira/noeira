@@ -166,9 +166,9 @@ struct Tensor(Movable):
         """A copy on `device`, which owns its memory, complete on return.
 
         `M_copyTensorToDevice` returns before the copy is done: on the host
-        (MAX 26.6, M1), a read right after it saw stale values in up to 20% of
-        the elements, and none after `M_synchronizeDevice`. So both devices
-        are synchronised here.
+        (MAX 26.6, Apple M1), a read right after it saw stale values in up
+        to 20% of the elements, and none after `M_synchronizeDevice`. So both
+        devices are synchronised here.
         """
         var status = Status()
         var copy = capi.M_copyTensorToDevice(self._t, device, status.handle)

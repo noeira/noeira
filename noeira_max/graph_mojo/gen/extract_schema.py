@@ -123,7 +123,8 @@ def extract(stub: Path) -> dict:
             "n_results": results or 1,
             "n_results_known": results > 0,
         })
-    return {"source": str(stub), "ops": ops}
+    # The stub's path inside the environment, not on this machine.
+    return {"source": stub.as_posix().split("site-packages/")[-1], "ops": ops}
 
 
 def report(schema: dict) -> str:

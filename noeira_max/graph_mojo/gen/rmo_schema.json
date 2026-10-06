@@ -1,5 +1,5 @@
 {
- "source": "/Users/denislaboureyras/Documents/noeira/dev/noeira/.pixi/envs/default/lib/python3.13/site-packages/max/_core/dialects/rmo/__init__.pyi",
+ "source": "max/_core/dialects/rmo/__init__.pyi",
  "ops": [
   {
    "class": "MoReduceArgMaxOp",

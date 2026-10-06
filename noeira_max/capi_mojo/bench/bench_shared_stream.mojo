@@ -1,9 +1,9 @@
-"""M1.4, the stream experiment: a "Mojo kernel -> MAX model -> Mojo kernel"
+"""The stream experiment: a "Mojo kernel -> MAX model -> Mojo kernel"
 loop on one CUDA stream, against the same loop on two streams with the host
 synchronisations a correct hand-off needs today.
 
-MAX's C API does not expose its stream (RFC item 1c), so this is the plan's
-deliberate hack:
+MAX's C API does not expose its stream, so this is a deliberate hack, to
+measure what a supported way to share it would buy:
 - noeira's CUDA interposer (`noeira/cuda/cuda_intercept.c`, which `pixi run`
   preloads on Linux) records the stream of every kernel launch. Read right
   after a MAX execute, it is MAX's stream;

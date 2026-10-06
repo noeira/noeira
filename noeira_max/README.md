@@ -1,8 +1,8 @@
 # noeira_max — MAX-as-inference-backend prototype
 
 A small prototype probing **MAX as an *inference* backend for noeira**, driven from Mojo
-via Python interop. Companion to `docs/MAX_TRAINING_ASSESSMENT.md` (which covers why
-*training* on MAX is blocked today). v1 scope is **MLP inference only**.
+via Python interop. *Training* on MAX is prototyped separately, in `autodiff/`. v1
+scope is **MLP inference only**.
 
 It answers three questions for "should noeira incorporate MAX?":
 

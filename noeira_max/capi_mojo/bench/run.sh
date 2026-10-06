@@ -9,7 +9,7 @@
 #
 #   noeira_max/capi_mojo/bench/run.sh            # (c)-(e) only
 #   noeira_max/capi_mojo/bench/run.sh --all      # every column
-#   noeira_max/capi_mojo/bench/run.sh --stream   # M1.4: Mojo kernels on MAX's own stream
+#   noeira_max/capi_mojo/bench/run.sh --stream   # Mojo kernels on MAX's own stream
 set -euo pipefail
 ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/../../.." && pwd)"
 MAIN="$(dirname "$(git -C "$ROOT" rev-parse --path-format=absolute --git-common-dir)")"
@@ -27,7 +27,7 @@ if [[ "${1:-}" == "--stream" ]]; then
     # benchmark finds MAX's stream, which the C API does not expose.
     "${PIXI[@]}" mojo build -I noeira_max/capi_mojo noeira_max/capi_mojo/bench/bench_shared_stream.mojo \
         -o "$OUT/bench_shared_stream" -Xlinker -L"$LIB" -Xlinker -lmax
-    echo "== M1.4: one stream for Mojo and MAX"
+    echo "== one stream for Mojo and MAX"
     "${PIXI[@]}" "$OUT/bench_shared_stream" "$OUT"
     exit 0
 fi

@@ -6,8 +6,8 @@ activation sets `MODULAR_HOME`; elsewhere `M_initModel` fails with `unable to
 locate compiler_rt /lib/libKGENCompilerRTShared.so`. When `MODULAR_HOME` is
 unset, `ensure_modular_home` locates the `libmax` this process linked
 (`dlsym` + `dladdr`), writes a minimal `modular.cfg` next to the environment
-it came from, and sets `MODULAR_HOME` to it. A workaround for
-RFC_MAX_FROM_MOJO item 1a: the runtime should find itself.
+it came from, and sets `MODULAR_HOME` to it: a workaround until the runtime
+can find itself.
 """
 
 from std.ffi import external_call

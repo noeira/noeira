@@ -28,7 +28,7 @@ def main(out: Path) -> None:
     for name, in_dim, hidden, out_dim, batch in SHAPES:
         mlp = MLPInference(in_dim, hidden, out_dim, batch, device="gpu")
         if not mlp.on_gpu:
-            raise SystemExit("no accelerator: the M1.2 MEFs are GPU models")
+            raise SystemExit("no accelerator: these MEFs are GPU models")
         mlp.compiled.export_mef(out / f"{name}.mef")
         x = mlp.make_host_input()
         x.tofile(out / f"{name}.in")
