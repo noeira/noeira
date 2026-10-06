@@ -148,7 +148,10 @@ struct Tensor(Movable):
         return capi.M_getTensorData(self._t)
 
     def on_host(self) -> Bool:
-        return capi.M_isHostDevice(capi.M_getTensorDevice(self._t))
+        var device = capi.M_getTensorDevice(self._t)  # ours to free (tensor.h)
+        var host = capi.M_isHostDevice(device)
+        capi.M_freeDevice(device)
+        return host
 
     def data[T: AnyType](ref self) raises -> Pointer[T, origin_of(self)]:
         if not self.on_host():
@@ -160,10 +163,24 @@ struct Tensor(Movable):
         return self.data[Scalar[dtype]]()[unsafe_offset=0]
 
     def to_device(self, device: capi.Handle) raises -> Tensor:
-        """A copy on `device`, which owns its memory."""
+        """A copy on `device`, which owns its memory, complete on return.
+
+        `M_copyTensorToDevice` returns before the copy is done: on the host
+        (MAX 26.6, M1), a read right after it saw stale values in up to 20% of
+        the elements, and none after `M_synchronizeDevice`. So both devices
+        are synchronised here.
+        """
         var status = Status()
         var copy = capi.M_copyTensorToDevice(self._t, device, status.handle)
         status.check("M_copyTensorToDevice")
+        var source = capi.M_getTensorDevice(self._t)
+        var synced = Status()
+        capi.M_synchronizeDevice(source, synced.handle)
+        capi.M_freeDevice(source)
+        synced.check("M_synchronizeDevice (the copy's source)")
+        var done = Status()
+        capi.M_synchronizeDevice(device, done.handle)
+        done.check("M_synchronizeDevice (the copy's destination)")
         return Tensor(self._shared, None, copy)
 
     def to_host(self) raises -> Tensor:

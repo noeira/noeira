@@ -64,6 +64,29 @@ def test_in_place_across_calls(dir: String) raises:
     expect(outputs.tensor("output1").data[Float32]()[unsafe_offset=7] == 4.0, "second output")
 
 
+def test_copy_is_complete(dir: String) raises:
+    """`to_host()` returns a finished copy. `M_copyTensorToDevice` itself
+    returns before the copy is done: read at once, up to 20% of the elements
+    were stale (host, MAX 26.6), so `Tensor.to_device` synchronises."""
+    var rt = Runtime()
+    var model = rt.load(dir + "/add.mef")
+    var n = 65536
+    for trial in range(5):
+        var inputs = rt.tensor_map()
+        var a = HostBuffer(4 * n)
+        var b = HostBuffer(4 * n)
+        fill(a, n, 1.0, Float32(trial))
+        fill(b, n, 0.5, 0.0)
+        inputs.borrow("input0", a^, DType.float32, [n])
+        inputs.borrow("input1", b^, DType.float32, [n])
+        var out = model.execute(inputs).tensor("output0")
+        var copy = out.to_host()
+        var direct = out.data[Float32]()
+        var copied = copy.data[Float32]()
+        for i in range(n):
+            expect(copied[unsafe_offset=i] == direct[unsafe_offset=i], "copy element " + String(i))
+
+
 def test_errors(dir: String) raises:
     var rt = Runtime()
     var raised = False
@@ -196,7 +219,7 @@ def main() raises:
     var dir = String(args[1])
     var failed = 0
     var names: List[String] = [
-        "version", "add_symbolic", "in_place_across_calls", "errors",
+        "version", "add_symbolic", "in_place_across_calls", "copy_is_complete", "errors",
         "lifetimes", "capture_on_cpu", "accelerator",
     ]
     for name in names:
@@ -207,6 +230,8 @@ def main() raises:
                 test_add_symbolic(dir)
             elif name == "in_place_across_calls":
                 test_in_place_across_calls(dir)
+            elif name == "copy_is_complete":
+                test_copy_is_complete(dir)
             elif name == "errors":
                 test_errors(dir)
             elif name == "lifetimes":

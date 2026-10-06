@@ -1,0 +1,5936 @@
+{
+ "source": "/Users/denislaboureyras/Documents/noeira/dev/noeira/.pixi/envs/default/lib/python3.13/site-packages/max/_core/dialects/rmo/__init__.pyi",
+ "ops": [
+  {
+   "class": "MoReduceArgMaxOp",
+   "mlir_name": "rmo.mo.reduce.arg_max",
+   "mlir_name_source": "docstring",
+   "summary": "This op is equivalent to reduce_max, but returns indices instead of values.",
+   "doc": "This op is equivalent to reduce_max, but returns indices instead of values.\n\nThe axis attribute specifies the reduction axis.\n\nLike reductions, the output shape is the same as the input shape, except for\nthe reduced axis which is set to 1. Moreover, the value of `axis` follows\nnumpy semantics, e.g., -1 represents the last axis.\n\nFor identical maximum values, the lowest index is returned.\n\nExample:\n\n```mlir\n  %0 = mo.constant {\n    value = #M.dense_array<0, 1, 3, 2> : tensor<2x2xsi32>\n  } : !mo.tensor<[2, 2], si32>\n  %1 = rmo.mo.reduce.arg_max(%0) {axis = 1 : index} : (!mo.tensor<[2, 2], si32>) -> !mo.tensor<[2, 1], si64>\n```",
+   "forms": [
+    {
+     "kind": "explicit",
+     "params": [
+      {
+       "name": "result",
+       "role": "result",
+       "kind": "tensor"
+      },
+      {
+       "name": "input",
+       "role": "operand",
+       "kind": "tensor"
+      },
+      {
+       "name": "axis",
+       "role": "attribute",
+       "kind": "index"
+      },
+      {
+       "name": "output_param_decls",
+       "role": "param_decls",
+       "kind": "param_decls"
+      }
+     ]
+    }
+   ],
+   "n_results": 1,
+   "n_results_known": true
+  },
+  {
+   "class": "MoReduceArgMinOp",
+   "mlir_name": "rmo.mo.reduce.arg_min",
+   "mlir_name_source": "docstring",
+   "summary": "This op is equivalent to reduce_min, but returns indices instead of values.",
+   "doc": "This op is equivalent to reduce_min, but returns indices instead of values.\n\nThe axis attribute specifies the reduction axis.\n\nLike reductions, the output shape is the same as the input shape, except for\nthe reduced axis which is set to 1. Moreover, the value of `axis` follows\nnumpy semantics, e.g., -1 represents the last axis.\n\nFor identical minimum values, the lowest index is returned.\n\nExample:\n\n```mlir\n  %0 = mo.constant {\n    value = #M.dense_array<0, 1, 3, 2> : tensor<2x2xsi32>\n  } : !mo.tensor<[2, 2], si32>\n  %axis = mo.constant {\n    value = #M.dense_array<1> : tensor<si32>\n  } : !mo.tensor<[], si32>\n  %1 = rmo.mo.reduce.arg_min(%0, %axis) : (!mo.tensor<[2, 2], si32>) -> !mo.tensor<[2, 1], si64>\n```",
+   "forms": [
+    {
+     "kind": "explicit",
+     "params": [
+      {
+       "name": "result",
+       "role": "result",
+       "kind": "tensor"
+      },
+      {
+       "name": "input",
+       "role": "operand",
+       "kind": "tensor"
+      },
+      {
+       "name": "axis",
+       "role": "attribute",
+       "kind": "index"
+      },
+      {
+       "name": "output_param_decls",
+       "role": "param_decls",
+       "kind": "param_decls"
+      }
+     ]
+    }
+   ],
+   "n_results": 1,
+   "n_results_known": true
+  },
+  {
+   "class": "MoReduceMaxOp",
+   "mlir_name": "rmo.mo.reduce.max",
+   "mlir_name_source": "docstring",
+   "summary": "Reduces `input` elements across `axis` to their maximum, changing that axis's dimension to 1 in the output shape.",
+   "doc": "Reduces `input` elements across `axis` to their maximum, changing that\naxis's dimension to 1 in the output shape.\n\nThe value of `axis` follows numpy semantics, e.g., -1 represents the last\naxis.\n\nExample:\n\n```mlir\n  %arg: !mo.tensor<[2, 3], f32>\n  %res = rmo.mo.reduce.max(%arg) {axis = 1 : index} : (\n    !mo.tensor<[2, 3], f32>) -> !mo.tensor<[2, 1], f32>\n```",
+   "forms": [
+    {
+     "kind": "explicit",
+     "params": [
+      {
+       "name": "result",
+       "role": "result",
+       "kind": "tensor"
+      },
+      {
+       "name": "input",
+       "role": "operand",
+       "kind": "tensor"
+      },
+      {
+       "name": "axis",
+       "role": "attribute",
+       "kind": "index"
+      },
+      {
+       "name": "output_param_decls",
+       "role": "param_decls",
+       "kind": "param_decls"
+      }
+     ]
+    }
+   ],
+   "n_results": 1,
+   "n_results_known": true
+  },
+  {
+   "class": "MoReduceMinOp",
+   "mlir_name": "rmo.mo.reduce.min",
+   "mlir_name_source": "docstring",
+   "summary": "Reduces `input` elements across `axis` to their minimum, changing that axis's dimension to 1 in the output shape.",
+   "doc": "Reduces `input` elements across `axis` to their minimum, changing that\naxis's dimension to 1 in the output shape.\n\nThe value of `axis` follows numpy semantics, e.g., -1 represents the last\naxis.\n\nExample:\n\n```mlir\n  %arg: !mo.tensor<[2, 3], f32>\n  %res = rmo.mo.reduce.min(%arg) {axis = 1 : index} : (\n    !mo.tensor<[2, 3], f32>) -> !mo.tensor<[2, 1], f32>\n```",
+   "forms": [
+    {
+     "kind": "explicit",
+     "params": [
+      {
+       "name": "result",
+       "role": "result",
+       "kind": "tensor"
+      },
+      {
+       "name": "input",
+       "role": "operand",
+       "kind": "tensor"
+      },
+      {
+       "name": "axis",
+       "role": "attribute",
+       "kind": "index"
+      },
+      {
+       "name": "output_param_decls",
+       "role": "param_decls",
+       "kind": "param_decls"
+      }
+     ]
+    }
+   ],
+   "n_results": 1,
+   "n_results_known": true
+  },
+  {
+   "class": "MoAtanhOp",
+   "mlir_name": "rmo.mo.atanh",
+   "mlir_name_source": "derived",
+   "summary": "Computes `atanh(x)`, where `x` is input tensor.",
+   "doc": "Computes `atanh(x)`, where `x` is input tensor.\n\nExample:\n\n```mlir\n  %arg: !mo.tensor<[2, 3], f32>\n  %res = rmo.mo.tanh(%arg) : !mo.tensor<[2, 3], f32>\n```",
+   "forms": [
+    {
+     "kind": "explicit",
+     "params": [
+      {
+       "name": "result",
+       "role": "result",
+       "kind": "tensor"
+      },
+      {
+       "name": "input",
+       "role": "operand",
+       "kind": "tensor"
+      },
+      {
+       "name": "output_param_decls",
+       "role": "param_decls",
+       "kind": "param_decls"
+      }
+     ]
+    }
+   ],
+   "n_results": 1,
+   "n_results_known": true
+  },
+  {
+   "class": "MoAbsOp",
+   "mlir_name": "rmo.mo.abs",
+   "mlir_name_source": "docstring",
+   "summary": "Returns `abs(x)`, where `x` is the input tensors.",
+   "doc": "Returns `abs(x)`, where `x` is the input tensors.\n\nExample:\n\n```mlir\n  %arg: !mo.tensor<[2, 3], f32>\n  %res = rmo.mo.abs(%arg) : !mo.tensor<[2, 3], f32>\n```",
+   "forms": [
+    {
+     "kind": "explicit",
+     "params": [
+      {
+       "name": "result",
+       "role": "result",
+       "kind": "tensor"
+      },
+      {
+       "name": "input",
+       "role": "operand",
+       "kind": "tensor"
+      },
+      {
+       "name": "output_param_decls",
+       "role": "param_decls",
+       "kind": "param_decls"
+      }
+     ]
+    }
+   ],
+   "n_results": 1,
+   "n_results_known": true
+  },
+  {
+   "class": "MoAddOp",
+   "mlir_name": "rmo.mo.add",
+   "mlir_name_source": "derived",
+   "summary": "Does a non-broadcasted elementwise addition.",
+   "doc": "Does a non-broadcasted elementwise addition.",
+   "forms": [
+    {
+     "kind": "explicit",
+     "params": [
+      {
+       "name": "result",
+       "role": "result",
+       "kind": "tensor"
+      },
+      {
+       "name": "input_x",
+       "role": "operand",
+       "kind": "tensor"
+      },
+      {
+       "name": "input_y",
+       "role": "operand",
+       "kind": "tensor"
+      },
+      {
+       "name": "output_param_decls",
+       "role": "param_decls",
+       "kind": "param_decls"
+      }
+     ]
+    }
+   ],
+   "n_results": 1,
+   "n_results_known": true
+  },
+  {
+   "class": "MoAndOp",
+   "mlir_name": "rmo.mo.and",
+   "mlir_name_source": "docstring",
+   "summary": "Returns `x and y`, where `x` and `y` are input boolean tensors.",
+   "doc": "Returns `x and y`, where `x` and `y` are input boolean tensors.\n\nExample:\n\n```mlir\n  %lhs: !mo.tensor<[2, 3], bool>\n  %rhs: !mo.tensor<[2, 3], bool>\n  %res = rmo.mo.and(%lhs, %rhs) : (!mo.tensor<[2, 3], bool>,\n                                  !mo.tensor<[2, 3], bool>\n                                  ) -> !mo.tensor<[2, 3], bool>\n```",
+   "forms": [
+    {
+     "kind": "explicit",
+     "params": [
+      {
+       "name": "result",
+       "role": "result",
+       "kind": "tensor"
+      },
+      {
+       "name": "input_x",
+       "role": "operand",
+       "kind": "tensor"
+      },
+      {
+       "name": "input_y",
+       "role": "operand",
+       "kind": "tensor"
+      },
+      {
+       "name": "output_param_decls",
+       "role": "param_decls",
+       "kind": "param_decls"
+      }
+     ]
+    }
+   ],
+   "n_results": 1,
+   "n_results_known": true
+  },
+  {
+   "class": "MoArgNonzeroOp",
+   "mlir_name": "rmo.mo.arg_nonzero",
+   "mlir_name_source": "docstring",
+   "summary": "Returns a tensor of coordinates of the nonzero values in the given tensor. The return value is a 2D tensor of shape [nnz x rank_in], where nnz is the number of nonzero elements in the input tensor, and rank_in is the rank of the input tensor. Coordinates are generated in row-major order.",
+   "doc": "Returns a tensor of coordinates of the nonzero values in the given tensor.\nThe return value is a 2D tensor of shape [nnz x rank_in], where nnz is the\nnumber of nonzero elements in the input tensor, and rank_in is the rank of\nthe input tensor. Coordinates are generated in row-major order.\n\nExample:\n\n```mlir\n  %0 = mo.constant {\n    value = #M.dense_array<0, 1, 2, 3, 4, 5, 6, 7, 8> : tensor<3x3xsi32>\n  } : !mo.tensor<[3, 3], si32>\n  %1 = rmo.mo.arg_nonzero(%0) : (!mo.tensor<[3, 3], si32>) -> !mo.tensor<[?, 2], si64>\n```",
+   "forms": [
+    {
+     "kind": "explicit",
+     "params": [
+      {
+       "name": "result",
+       "role": "result",
+       "kind": "tensor"
+      },
+      {
+       "name": "input",
+       "role": "operand",
+       "kind": "tensor"
+      },
+      {
+       "name": "output_param_decls",
+       "role": "param_decls",
+       "kind": "param_decls"
+      }
+     ]
+    }
+   ],
+   "n_results": 1,
+   "n_results_known": true
+  },
+  {
+   "class": "MoAvgPoolCeilModeTrueOp",
+   "mlir_name": "rmo.mo.avg_pool_ceil_mode_true",
+   "mlir_name_source": "docstring",
+   "summary": "Computes average pooling with the given filter shape, strides, and dilations.",
+   "doc": "Computes average pooling with the given filter shape, strides, and dilations.\n\nThe op supports 2d avg pooling (so input and filter must be\n4D), with the following layout assumption:\n- input has layout NHWC, i.e., (batch_size, height, width, in_channels)\n\nAll hyperparameters (i.e. strides, dilations, padding) must be of rank 1, or\nunranked. If the input has static rank, all hyperparameters with static\nshape must have sizes of `input_rank - 2`, except padding, which must have size\n`2 * (input_rank - 2)`. Individual elements in the hyperparameters applies to\ncorresponding dimensions of the input (after ignoring the batch and channel dimensions),\nwith padding representing a before/after pair for each axis. The padding values\nare expected to take the form (pad_dim1_before, pad_dim1_after, pad_dim2_before,\npad_dim2_after...). In 2D Convolution, dim1 here represents H and dim2 represents W.\n\nThis op currently only supports strides and dilations on the filter.\n\nExample:\n\n```mlir\n  %fs = mo.constant {\n    value = #M.dense_array<3, 3> : tensor<2xsi64>} : !mo.tensor<[2], si64>\n  %st = mo.constant {\n    value = #M.dense_array<2, 2> : tensor<2xsi64>} : !mo.tensor<[2], si64>\n  %di = mo.constant {\n    value = #M.dense_array<1, 1> : tensor<2xsi64>} : !mo.tensor<[2], si64>\n  %pa = mo.constant {\n    value = #M.dense_array<0, 0, 0, 0> : tensor<4xsi64>} : !mo.tensor<[4], si64>\n  %res = rmo.mo.avg_pool_ceil_mode_true(%arg) [\n      filter_shape = %fs, strides = %st, dilations = %di, paddings = %pa\n  ] : (\n    !mo.tensor<[1, 4, 4, 1], f32>, !mo.tensor<[2], si64>,\n    !mo.tensor<[2], si64>, !mo.tensor<[2], si64>, !mo.tensor<[4], si64>\n  ) -> !mo.tensor<[1, 2, 2, 1], f32>\n```",
+   "forms": [
+    {
+     "kind": "explicit",
+     "params": [
+      {
+       "name": "result",
+       "role": "result",
+       "kind": "tensor"
+      },
+      {
+       "name": "input",
+       "role": "operand",
+       "kind": "tensor"
+      },
+      {
+       "name": "filter_shape",
+       "role": "operand",
+       "kind": "tensor"
+      },
+      {
+       "name": "strides",
+       "role": "operand",
+       "kind": "tensor"
+      },
+      {
+       "name": "dilations",
+       "role": "operand",
+       "kind": "tensor"
+      },
+      {
+       "name": "paddings",
+       "role": "operand",
+       "kind": "tensor"
+      },
+      {
+       "name": "count_boundary",
+       "role": "attribute",
+       "kind": "bool_attr"
+      },
+      {
+       "name": "output_param_decls",
+       "role": "param_decls",
+       "kind": "param_decls"
+      }
+     ]
+    }
+   ],
+   "n_results": 1,
+   "n_results_known": true
+  },
+  {
+   "class": "MoAvgPoolOp",
+   "mlir_name": "rmo.mo.avg_pool",
+   "mlir_name_source": "docstring",
+   "summary": "Computes average pooling with the given filter shape, strides, and dilations.",
+   "doc": "Computes average pooling with the given filter shape, strides, and dilations.\n\nThe op supports 2D avg pooling (so input and filter must be\n4D), with the following layout assumption:\n- input has layout NHWC, i.e., (batch_size, height, width, in_channels)\n\nAll hyperparameters (i.e. `strides`, `dilations`, `padding`) must be of rank 1, or\nunranked. If the input has static rank, all hyperparameters with static\nshape must have sizes of `input_rank - 2`, except padding, which must have size\n`2 * (input_rank - 2)`. Individual elements in the hyperparameters applies to\ncorresponding dimensions of the input (after ignoring the batch and channel dimensions),\nwith padding representing a before/after pair for each axis. The padding values\nare expected to take the form (pad_dim1_before, pad_dim1_after, pad_dim2_before,\npad_dim2_after...). In 2D Convolution, dim1 here represents H and dim2 represents W.\n\nThis op currently only supports strides and dilations on the filter.\n\nExample:\n\n```mlir\n  %fs = mo.constant {\n    value = #M.dense_array<2, 2> : tensor<2xsi64>} : !mo.tensor<[2], si64>\n  %st = mo.constant {\n    value = #M.dense_array<1, 2> : tensor<2xsi64>} : !mo.tensor<[2], si64>\n  %di = mo.constant {\n    value = #M.dense_array<1, 1> : tensor<2xsi64>} : !mo.tensor<[2], si64>\n  %pa = mo.constant {\n    value = #M.dense_array<0, 0, 0, 0> : tensor<4xsi64>} : !mo.tensor<[4], si64>\n  %res = rmo.mo.avg_pool(%arg) [\n      filter_shape = %fs, strides = %st, dilations = %di, paddings = %pa\n  ] : (\n    !mo.tensor<[20, 10, 10, 32], f32>, !mo.tensor<[2], si64>,\n    !mo.tensor<[2], si64>, !mo.tensor<[2], si64>, !mo.tensor<[4], si64>\n  ) -> !mo.tensor<[20, 9, 5, 32], f32>\n```",
+   "forms": [
+    {
+     "kind": "explicit",
+     "params": [
+      {
+       "name": "result",
+       "role": "result",
+       "kind": "tensor"
+      },
+      {
+       "name": "input",
+       "role": "operand",
+       "kind": "tensor"
+      },
+      {
+       "name": "filter_shape",
+       "role": "operand",
+       "kind": "tensor"
+      },
+      {
+       "name": "strides",
+       "role": "operand",
+       "kind": "tensor"
+      },
+      {
+       "name": "dilations",
+       "role": "operand",
+       "kind": "tensor"
+      },
+      {
+       "name": "paddings",
+       "role": "operand",
+       "kind": "tensor"
+      },
+      {
+       "name": "count_boundary",
+       "role": "attribute",
+       "kind": "bool_attr"
+      },
+      {
+       "name": "output_param_decls",
+       "role": "param_decls",
+       "kind": "param_decls"
+      }
+     ]
+    }
+   ],
+   "n_results": 1,
+   "n_results_known": true
+  },
+  {
+   "class": "MoLinalgBandPartOp",
+   "mlir_name": "rmo.mo.linalg.band_part",
+   "mlir_name_source": "docstring",
+   "summary": "Copies a tensor setting everything outside central (diagonal) band of the matrices to zero, where all but the last two axes are effectively batches, and the last two axes define sub matrices.",
+   "doc": "Copies a tensor setting everything outside central (diagonal) band of the\nmatrices to zero, where all but the last two axes are effectively batches,\nand the last two axes define sub matrices.\n\nAssumes the input has dimensions [I, J, ..., M, N], then the output tensor\nhas the same shape as the input, and the values values are given by\n\nout[i, j, ..., m, n] = in_band(m, n) * input[i, j,  ..., m, n].\n\nWith the indicator function\n\nin_band(m, n) = ((num_lower < 0 || (m - n) <= num_lower)) &&\n                 (num_upper < 0 || (n - m) <= num_upper))\n\nIf `exclude` is set, the selection is reverted: The elements in band are set\nto zero while the elements outside the band are copied to the output tensor.\n\nPlease explicitly note that with negative values, this kernel returns the\nentire lower or upper triangle of the matrix, and otherwise returns\na diagonal band around the main diagonal of the matrix.\n\nExample:\n\n```mlir\n  %arg: !mo.tensor<[3, 2, 3], f32>\n  %num_lower = mo.constant {\n    value = #M.dense_array<-1> : tensor<1xsi64>} : !mo.tensor<[], si64>\n  %num_upper = mo.constant {\n    value = #M.dense_array<1> : tensor<1xsi64>} : !mo.tensor<[], si64>\n  %exclude = mo.constant {\n    value = #M.dense_array<0> : tensor<1xui8>} : !mo.tensor<[], bool>\n  %res = rmo.mo.linalg.band_part(%arg, %num_lower, %num_upper, %exclude) : (\n    !mo.tensor<[3, 2, 3], f32>, !mo.tensor<[], si64>, !mo.tensor<[], si64>,\n    !mo.tensor<[], bool>\n    ) -> !mo.tensor<[3, 2, 3], f32>\n```",
+   "forms": [
+    {
+     "kind": "explicit",
+     "params": [
+      {
+       "name": "result",
+       "role": "result",
+       "kind": "tensor"
+      },
+      {
+       "name": "input",
+       "role": "operand",
+       "kind": "tensor"
+      },
+      {
+       "name": "num_lower",
+       "role": "operand",
+       "kind": "tensor"
+      },
+      {
+       "name": "num_upper",
+       "role": "operand",
+       "kind": "tensor"
+      },
+      {
+       "name": "exclude",
+       "role": "operand",
+       "kind": "tensor"
+      },
+      {
+       "name": "output_param_decls",
+       "role": "param_decls",
+       "kind": "param_decls"
+      }
+     ]
+    }
+   ],
+   "n_results": 1,
+   "n_results_known": true
+  },
+  {
+   "class": "MoBottomKOp",
+   "mlir_name": "rmo.mo.bottom_k",
+   "mlir_name_source": "docstring",
+   "summary": "Computes the bottom (lowest) values and their corresponding indices in a tensor along a specified axis. Returned values along the axis are always sorted (stable).",
+   "doc": "Computes the bottom (lowest) values and their corresponding indices in a\ntensor along a specified axis. Returned values along the axis are always\nsorted (stable).\n\nExample:\n```mlir\n  %in = mo.constant {\n    value = #M.dense_array<0, 1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11> : tensor<2x6xsi64>\n  } : !mo.tensor<[2, 6], si64>\n  %k = mo.constant {device = #M.device_ref<\"cpu\", 0>, value = #M.dense_array<3> : tensor<si64> } : !mo.tensor<[], si64>\n  %axis = mo.constant {device = #M.device_ref<\"cpu\", 0>, value = #M.dense_array<1> : tensor<si64> } : !mo.tensor<[], si64>\n  %sorted = mo.constant {device = #M.device_ref<\"cpu\", 0>, value = #M.dense_array<1> : tensor<1xi1> } : !mo.tensor<[], bool>\n  %values, %indices = rmo.mo.bottom_k(%in, %k, %axis, %sorted) : (\n    !mo.tensor<[2, 6], si64>, !mo.tensor<[], si64>, !mo.tensor<[], si64>, !mo.tensor<[], bool>\n  ) -> (\n    !mo.tensor<[2, 3], si64>, !mo.tensor<[2, 3], si64>\n  )\n```",
+   "forms": [
+    {
+     "kind": "explicit",
+     "params": [
+      {
+       "name": "values",
+       "role": "result",
+       "kind": "tensor"
+      },
+      {
+       "name": "indices",
+       "role": "result",
+       "kind": "tensor"
+      },
+      {
+       "name": "input",
+       "role": "operand",
+       "kind": "tensor"
+      },
+      {
+       "name": "_k",
+       "role": "operand",
+       "kind": "tensor"
+      },
+      {
+       "name": "axis",
+       "role": "operand",
+       "kind": "tensor"
+      },
+      {
+       "name": "sorted",
+       "role": "operand",
+       "kind": "tensor"
+      },
+      {
+       "name": "output_param_decls",
+       "role": "param_decls",
+       "kind": "param_decls"
+      }
+     ]
+    }
+   ],
+   "n_results": 2,
+   "n_results_known": true
+  },
+  {
+   "class": "MoBroadcastShapeOp",
+   "mlir_name": "rmo.mo.broadcast_shape",
+   "mlir_name_source": "derived",
+   "summary": "Given two tensors representing shapes, calculate the result of broadcasting the shapes.",
+   "doc": "Given two tensors representing shapes, calculate the result of broadcasting\nthe shapes.",
+   "forms": [
+    {
+     "kind": "explicit",
+     "params": [
+      {
+       "name": "shape",
+       "role": "result",
+       "kind": "tensor"
+      },
+      {
+       "name": "input_x",
+       "role": "operand",
+       "kind": "tensor"
+      },
+      {
+       "name": "input_y",
+       "role": "operand",
+       "kind": "tensor"
+      },
+      {
+       "name": "output_param_decls",
+       "role": "param_decls",
+       "kind": "param_decls"
+      }
+     ]
+    }
+   ],
+   "n_results": 1,
+   "n_results_known": true
+  },
+  {
+   "class": "MoBroadcastToOp",
+   "mlir_name": "rmo.mo.broadcast_to",
+   "mlir_name_source": "derived",
+   "summary": "Broadcast the given `input` to the shape represented in `newShape`.",
+   "doc": "Broadcast the given `input` to the shape represented in `newShape`.",
+   "forms": [
+    {
+     "kind": "explicit",
+     "params": [
+      {
+       "name": "result",
+       "role": "result",
+       "kind": "tensor"
+      },
+      {
+       "name": "input",
+       "role": "operand",
+       "kind": "tensor"
+      },
+      {
+       "name": "new_shape",
+       "role": "operand",
+       "kind": "tensor"
+      },
+      {
+       "name": "output_param_decls",
+       "role": "param_decls",
+       "kind": "param_decls"
+      }
+     ]
+    }
+   ],
+   "n_results": 1,
+   "n_results_known": true
+  },
+  {
+   "class": "MoCastOp",
+   "mlir_name": "rmo.mo.cast",
+   "mlir_name_source": "derived",
+   "summary": "Casts the given data, changing from one dtype to another.",
+   "doc": "Casts the given data, changing from one dtype to another.",
+   "forms": [
+    {
+     "kind": "explicit",
+     "params": [
+      {
+       "name": "result",
+       "role": "result",
+       "kind": "tensor"
+      },
+      {
+       "name": "input",
+       "role": "operand",
+       "kind": "tensor"
+      },
+      {
+       "name": "output_param_decls",
+       "role": "param_decls",
+       "kind": "param_decls"
+      }
+     ]
+    },
+    {
+     "kind": "inferred",
+     "params": [
+      {
+       "name": "input",
+       "role": "operand",
+       "kind": "tensor"
+      },
+      {
+       "name": "dtype",
+       "role": "attribute",
+       "kind": "dtype"
+      }
+     ]
+    }
+   ],
+   "n_results": 1,
+   "n_results_known": true
+  },
+  {
+   "class": "MoCeilOp",
+   "mlir_name": "rmo.mo.ceil",
+   "mlir_name_source": "docstring",
+   "summary": "Returns the elementwise smallest integer greater than `x`, where `x` is input tensor.",
+   "doc": "Returns the elementwise smallest integer greater than `x`, where `x` is\ninput tensor.\n\n```mlir\n  %arg: !mo.tensor<[2, 3], f32>\n  %res = rmo.mo.ceil(%arg) : !mo.tensor<[2, 3], f32>\n```",
+   "forms": [
+    {
+     "kind": "explicit",
+     "params": [
+      {
+       "name": "result",
+       "role": "result",
+       "kind": "tensor"
+      },
+      {
+       "name": "input",
+       "role": "operand",
+       "kind": "tensor"
+      },
+      {
+       "name": "output_param_decls",
+       "role": "param_decls",
+       "kind": "param_decls"
+      }
+     ]
+    }
+   ],
+   "n_results": 1,
+   "n_results_known": true
+  },
+  {
+   "class": "MoConvOp",
+   "mlir_name": "rmo.mo.conv",
+   "mlir_name_source": "docstring",
+   "summary": "Computes the convolution product of the input with the given filter, strides, dilations, paddings, and groups.",
+   "doc": "Computes the convolution product of the input with the given filter,\nstrides, dilations, paddings, and groups.\n\nThe op supports 1D-3D convolution, with the following layout assumptions:\n- input has channel last layout. For 2D, that's NHWC, i.e.,\n  (batch_size, height, width, in_channels)\n- filter has layout RSCF, i.e.,\n  (height, width, in_channels / num_groups, out_channels)\n\n`strides`, `dilations`, and `padding` must be of rank 1, or unranked.\nIf the input has static rank, all hyperparameters with static shape must\nhave sizes of `input_rank - 2`, except padding, which must have\nsize `2 * (input_rank - 2)`. Individual elements in the hyperparameters\napply to corresponding dimensions of the input (after ignoring the batch\nand channel dimensions), with padding representing a before/after pair for\neach axis.\n\nThe padding values are expected to take the form (pad_dim1_before,\npad_dim1_after, pad_dim2_before, pad_dim2_after...) and represent padding\n0's before and after the indicated *spatial* dimensions in `input`. In 2D\nConvolution, dim1 here represents H and dim2 represents W. In python like\nsyntax, padding a 2x3 spatial `input` with [0, 1, 2, 1] would yield:\n\n```python\ninput = [\n  [1, 2, 3],\n  [4, 5, 6]\n]\n# Shape is 2x3\n\npadded_input = [\n  [0, 0, 1, 2, 3, 0],\n  [0, 0, 4, 5, 6, 0]\n  [0, 0, 0, 0, 0, 0]\n]\n# Shape is 3x6\n```\n\nThe input, output and filter tensors' ranks must match if statically known.\n\n`num_groups` must be a ranked scalar. The number of input and output\nchannels must both be divisible by the number of groups `num_groups`.\n\nThis op currently only supports strides and padding on the input.\n\nExample:\n\n```mlir\n  %st = mo.constant {device = #M.device_ref<\"cpu\", 0>, value = #M.dense_array<1, 1> : tensor<2xsi64>}\n    : !mo.tensor<[2], si64>\n  %di = mo.constant {device = #M.device_ref<\"cpu\", 0>, value = #M.dense_array<1, 1> : tensor<2xsi64>}\n    : !mo.tensor<[2], si64>\n  %pa = mo.constant {device = #M.device_ref<\"cpu\", 0>, value = #M.dense_array<0, 0, 0, 0> : tensor<4xsi64>}\n    : !mo.tensor<[4], si64>\n  %ng = mo.constant {device = #M.device_ref<\"cpu\", 0>, value = #M.dense_array<1> : tensor<si64>}\n    : %!mo.tensor<[], si64>\n  %res = rmo.mo.conv(%input, %filter) [strides = %st, dilations = %di, paddings = %pa, num_groups = %ng] : (\n    !mo.tensor<[10, 5, 5, 32], f32>, !mo.tensor<[2, 2, 32, 64], f32>,\n    !mo.tensor<[2], si64>, !mo.tensor<[2], si64>, !mo.tensor<[4], si64>, !mo.tensor<[], si64>\n  ) -> !mo.tensor<[10, 4, 4, 64], f32>\n```",
+   "forms": [
+    {
+     "kind": "explicit",
+     "params": [
+      {
+       "name": "result",
+       "role": "result",
+       "kind": "tensor"
+      },
+      {
+       "name": "input",
+       "role": "operand",
+       "kind": "tensor"
+      },
+      {
+       "name": "filter",
+       "role": "operand",
+       "kind": "tensor"
+      },
+      {
+       "name": "strides",
+       "role": "operand",
+       "kind": "tensor"
+      },
+      {
+       "name": "dilations",
+       "role": "operand",
+       "kind": "tensor"
+      },
+      {
+       "name": "paddings",
+       "role": "operand",
+       "kind": "tensor"
+      },
+      {
+       "name": "num_groups",
+       "role": "operand",
+       "kind": "tensor"
+      },
+      {
+       "name": "input_layout",
+       "role": "attribute",
+       "kind": "string_attr"
+      },
+      {
+       "name": "filter_layout",
+       "role": "attribute",
+       "kind": "string_attr"
+      },
+      {
+       "name": "output_param_decls",
+       "role": "param_decls",
+       "kind": "param_decls"
+      }
+     ]
+    }
+   ],
+   "n_results": 1,
+   "n_results_known": true
+  },
+  {
+   "class": "MoConvTransposeOp",
+   "mlir_name": "rmo.mo.conv_transpose",
+   "mlir_name_source": "docstring",
+   "summary": "This op effectively computes the gradient of a convolution with respect to its input (as if the original convolution operation had the same filter and hyperparameters as this op). A visualization of the computation can be found in https://d2l.ai/chapter_computer-vision/transposed-conv.html.",
+   "doc": "This op effectively computes the gradient of a convolution with\nrespect to its input (as if the original convolution operation had the same\nfilter and hyperparameters as this op). A visualization of the computation\ncan be found in https://d2l.ai/chapter_computer-vision/transposed-conv.html.\n\nThe op supports 1D-3D spatial dimensions, with the following layout\nassumptions (note the `out_channel` is w.r.t. the original convolution):\n- input has channel last layout.For 2D, that's NHWC, i.e.,\n  (batch_size, height, width, out_channels)\n- filter has layout RSFC, i.e., (height, width, out_channels, in_channels)\n\nAll hyperparameters (i.e. strides, dilations, padding, output_paddings) must\nbe of rank 1, or unranked. If the input has static rank, all hyperparameters\nwith static shape must have sizes of `input_rank - 2`, except padding, which\nmust have size `2 * (input_rank - 2)`. Individual elements in the\nhyperparameters applies to corresponding dimensions of the input (after\nignoring the batch and channel dimensions), with padding representing a\nbefore/after pair for each axis.\n\nThe padding values are expected to take the form (pad_dim1_before,\npad_dim1_after, pad_dim2_before, pad_dim2_after...) and represent padding\n0's before and after the indicated *spatial* dimensions in `input`. In 2D\nConvTranspose, dim1 here represents H_out and dim2 represents W_out. In\npython like syntax, padding a 2x4 spatial `output` with [0, 1, 2, 1] would\nyield:\n\n```python\noutput = [\n  [1, 2, 3, 4],\n  [5, 6, 7, 8]\n]\n# Shape is 2x4\n\npadded_input = [\n  [3],\n]\n# Shape is 1x1\n```\n\nThe `output_paddings` argument is meant to resolve the ambiguity of multiple\npotential output shapes when any stride is greater than 1. Basically,\nwe'll add `output_paddings[i]` number of zeros at the end of output's ith\naxis. We only support output_paddings = 0.\n\nThe input, output and filter tensors' ranks must match if statically known.\n\nExample:\n\n```mlir\n  %st = mo.constant {device = #M.device_ref<\"cpu\", 0>, value = #M.dense_array<1, 1> : tensor<2xsi64>}\n    : !mo.tensor<[2], si64>\n  %di = mo.constant {device = #M.device_ref<\"cpu\", 0>, value = #M.dense_array<1, 1> : tensor<2xsi64>}\n    : !mo.tensor<[2], si64>\n  %pa = mo.constant {device = #M.device_ref<\"cpu\", 0>, value = #M.dense_array<0, 0, 0, 0> : tensor<4xsi64>}\n    : !mo.tensor<[4], si64>\n  %op = mo.constant {device = #M.device_ref<\"cpu\", 0>, value = #M.dense_array<0, 0> : tensor<2xsi64>}\n    : !mo.tensor<[2], si64>\n  %res = rmo.mo.conv_transpose(%input, %filter)\n    [strides = %st, dilations = %di, paddings = %pa, output_paddings = %op] : (\n    !mo.tensor<[10, 4, 4, 64], f32>, !mo.tensor<[2, 2, 32, 64], f32>,\n    !mo.tensor<[2], si64>, !mo.tensor<[2], si64>, !mo.tensor<[4], si64>,\n    !mo.tensor<[2], si64>\n  ) -> !mo.tensor<[10, 5, 5, 32], f32>\n```",
+   "forms": [
+    {
+     "kind": "explicit",
+     "params": [
+      {
+       "name": "result",
+       "role": "result",
+       "kind": "tensor"
+      },
+      {
+       "name": "input",
+       "role": "operand",
+       "kind": "tensor"
+      },
+      {
+       "name": "filter",
+       "role": "operand",
+       "kind": "tensor"
+      },
+      {
+       "name": "strides",
+       "role": "operand",
+       "kind": "tensor"
+      },
+      {
+       "name": "dilations",
+       "role": "operand",
+       "kind": "tensor"
+      },
+      {
+       "name": "paddings",
+       "role": "operand",
+       "kind": "tensor"
+      },
+      {
+       "name": "output_paddings",
+       "role": "operand",
+       "kind": "tensor"
+      },
+      {
+       "name": "input_layout",
+       "role": "attribute",
+       "kind": "string_attr"
+      },
+      {
+       "name": "filter_layout",
+       "role": "attribute",
+       "kind": "string_attr"
+      },
+      {
+       "name": "output_param_decls",
+       "role": "param_decls",
+       "kind": "param_decls"
+      }
+     ]
+    }
+   ],
+   "n_results": 1,
+   "n_results_known": true
+  },
+  {
+   "class": "MoCosOp",
+   "mlir_name": "rmo.mo.cos",
+   "mlir_name_source": "docstring",
+   "summary": "Returns `cos(x)`, where `x` is input tensor.",
+   "doc": "Returns `cos(x)`, where `x` is input tensor.\n\nExample:\n```mlir\n  %arg : !mo.tensor<[2, 3], f32>\n  %res = rmo.mo.cos(%arg) : !mo.tensor<[2, 3], f32>\n```",
+   "forms": [
+    {
+     "kind": "explicit",
+     "params": [
+      {
+       "name": "result",
+       "role": "result",
+       "kind": "tensor"
+      },
+      {
+       "name": "input",
+       "role": "operand",
+       "kind": "tensor"
+      },
+      {
+       "name": "output_param_decls",
+       "role": "param_decls",
+       "kind": "param_decls"
+      }
+     ]
+    }
+   ],
+   "n_results": 1,
+   "n_results_known": true
+  },
+  {
+   "class": "MoCumsumOp",
+   "mlir_name": "rmo.mo.cumsum",
+   "mlir_name_source": "docstring",
+   "summary": "Returns the cumulative summation of input tensors along an axis. By default, it copies the first element as is. If the `exclusive` attribute is set to 1, then the first element is excluded. The `reverse` attribute causes the summation to be done in the opposite direction of the axis.",
+   "doc": "Returns the cumulative summation of input tensors along an axis. By default,\nit copies the first element as is. If the `exclusive` attribute is set to 1,\nthen the first element is excluded. The `reverse` attribute causes the\nsummation to be done in the opposite direction of the axis.\n\nThe value of `axis` follows numpy semantics, e.g., -1 represents the last\naxis.\n\nExample of outputs:\n\n```\n  input_x = [1, 2, 3]\n  axis=0\n  output = [1, 3, 6]\n  exclusive=1\n  output = [0, 1, 3]\n  exclusive=0\n  reverse=1\n  output = [6, 5, 3]\n  exclusive=1\n  reverse=1\n  output = [5, 3, 0]\n```\n\nExample:\n\n```mlir\n%arg: !mo.tensor<[2, 3], f32>\n%res = rmo.mo.cumsum(%arg) {axis = 0 : index, exclusive = 1 : index, reverse = 0 : index} : (\n  !mo.tensor<[2, 3], f32>) -> !mo.tensor<[2, 3], f32>\n```",
+   "forms": [
+    {
+     "kind": "explicit",
+     "params": [
+      {
+       "name": "result",
+       "role": "result",
+       "kind": "tensor"
+      },
+      {
+       "name": "input",
+       "role": "operand",
+       "kind": "tensor"
+      },
+      {
+       "name": "axis",
+       "role": "attribute",
+       "kind": "index"
+      },
+      {
+       "name": "exclusive",
+       "role": "attribute",
+       "kind": "index"
+      },
+      {
+       "name": "reverse",
+       "role": "attribute",
+       "kind": "index"
+      },
+      {
+       "name": "output_param_decls",
+       "role": "param_decls",
+       "kind": "param_decls"
+      }
+     ]
+    }
+   ],
+   "n_results": 1,
+   "n_results_known": true
+  },
+  {
+   "class": "MoDivOp",
+   "mlir_name": "rmo.mo.div",
+   "mlir_name_source": "derived",
+   "summary": "Does a non-broadcasted elementwise division.",
+   "doc": "Does a non-broadcasted elementwise division.",
+   "forms": [
+    {
+     "kind": "explicit",
+     "params": [
+      {
+       "name": "result",
+       "role": "result",
+       "kind": "tensor"
+      },
+      {
+       "name": "input_x",
+       "role": "operand",
+       "kind": "tensor"
+      },
+      {
+       "name": "input_y",
+       "role": "operand",
+       "kind": "tensor"
+      },
+      {
+       "name": "output_param_decls",
+       "role": "param_decls",
+       "kind": "param_decls"
+      }
+     ]
+    }
+   ],
+   "n_results": 1,
+   "n_results_known": true
+  },
+  {
+   "class": "MoEqualOp",
+   "mlir_name": "rmo.mo.equal",
+   "mlir_name_source": "docstring",
+   "summary": "Returns `x == y`, where `x` and `y` are input tensors.",
+   "doc": "Returns `x == y`, where `x` and `y` are input tensors.\n\nExample:\n\n```mlir\n  %lhs: !mo.tensor<[2, 3], f32>\n  %rhs: !mo.tensor<[2, 3], f32>\n  %res = rmo.mo.equal(%lhs, %rhs) : (!mo.tensor<[2, 3], f32>,\n                                    !mo.tensor<[2, 3], f32>\n                                    ) -> !mo.tensor<[2, 3], bool>\n```",
+   "forms": [
+    {
+     "kind": "explicit",
+     "params": [
+      {
+       "name": "result",
+       "role": "result",
+       "kind": "tensor"
+      },
+      {
+       "name": "input_x",
+       "role": "operand",
+       "kind": "tensor"
+      },
+      {
+       "name": "input_y",
+       "role": "operand",
+       "kind": "tensor"
+      },
+      {
+       "name": "output_param_decls",
+       "role": "param_decls",
+       "kind": "param_decls"
+      }
+     ]
+    }
+   ],
+   "n_results": 1,
+   "n_results_known": true
+  },
+  {
+   "class": "MoErfOp",
+   "mlir_name": "rmo.mo.erf",
+   "mlir_name_source": "docstring",
+   "summary": "Computes the Gauss error function of the input tensor elements.",
+   "doc": "Computes the Gauss error function of the input tensor elements.\n\nExample:\n\n```mlir\n  %arg: !mo.tensor<[2, 3], f32>\n  %res = rmo.mo.erf(%arg) : !mo.tensor<[2, 3], f32>\n```",
+   "forms": [
+    {
+     "kind": "explicit",
+     "params": [
+      {
+       "name": "result",
+       "role": "result",
+       "kind": "tensor"
+      },
+      {
+       "name": "input",
+       "role": "operand",
+       "kind": "tensor"
+      },
+      {
+       "name": "output_param_decls",
+       "role": "param_decls",
+       "kind": "param_decls"
+      }
+     ]
+    }
+   ],
+   "n_results": 1,
+   "n_results_known": true
+  },
+  {
+   "class": "MoExpOp",
+   "mlir_name": "rmo.mo.exp",
+   "mlir_name_source": "docstring",
+   "summary": "Returns `exp(x)`, where `x` is the input tensor.",
+   "doc": "Returns `exp(x)`, where `x` is the input tensor.\n\nExample:\n\n```mlir\n  %arg: !mo.tensor<[2, 3], f32>\n  %res = rmo.mo.exp(%arg) : !mo.tensor<[2, 3], f32>\n```",
+   "forms": [
+    {
+     "kind": "explicit",
+     "params": [
+      {
+       "name": "result",
+       "role": "result",
+       "kind": "tensor"
+      },
+      {
+       "name": "input",
+       "role": "operand",
+       "kind": "tensor"
+      },
+      {
+       "name": "output_param_decls",
+       "role": "param_decls",
+       "kind": "param_decls"
+      }
+     ]
+    }
+   ],
+   "n_results": 1,
+   "n_results_known": true
+  },
+  {
+   "class": "MoFloorOp",
+   "mlir_name": "rmo.mo.floor",
+   "mlir_name_source": "docstring",
+   "summary": "Returns the elementwise largest integer not greater than `x`, where `x` is input tensor.",
+   "doc": "Returns the elementwise largest integer not greater than `x`, where `x` is\ninput tensor.\n\n```mlir\n  %arg: !mo.tensor<[2, 3], f32>\n  %res = rmo.mo.floor(%arg) : !mo.tensor<[2, 3], f32>\n```",
+   "forms": [
+    {
+     "kind": "explicit",
+     "params": [
+      {
+       "name": "result",
+       "role": "result",
+       "kind": "tensor"
+      },
+      {
+       "name": "input",
+       "role": "operand",
+       "kind": "tensor"
+      },
+      {
+       "name": "output_param_decls",
+       "role": "param_decls",
+       "kind": "param_decls"
+      }
+     ]
+    }
+   ],
+   "n_results": 1,
+   "n_results_known": true
+  },
+  {
+   "class": "MoGatherNdOp",
+   "mlir_name": "rmo.mo.gather_nd",
+   "mlir_name_source": "docstring",
+   "summary": "Variant of `mo.gather` that accepts multi-dimensional indices.",
+   "doc": "Variant of `mo.gather` that accepts multi-dimensional indices.\n\nThe last dimension stores the index whereas\nthe outer dimensions act like batch dimensions. The size of the last\ndimension is at most the rank of the input. When the dimension size is less\nthan the rank of the input, slices of the input are gathered, starting from\nthe leftmost dimension.\n\n```\noutput_shape = (\n    batch_dims_shape + list(indices.shape)[batch_dims:-1]\n    if (indices.shape[-1] == data_rank - batch_dims)\n    else batch_dims_shape\n    + list(indices.shape)[batch_dims:-1]\n    + list(data.shape)[batch_dims + indices.shape[-1] :]\n)\n```\n\n```mlir\n  %input = mo.constant {device = #M.device_ref<\"cpu\", 0>, value =\n    #M.dense_array<0, 1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15> :\n    tensor<2x2x4xsi64>} : !mo.tensor<[2, 2, 4], si64>\n  %indices = mo.constant {device = #M.device_ref<\"cpu\", 0>, value = #M.dense_array<0, 0, 0> : tensor<3xsi64>} :\n    !mo.tensor<[3], si64>\n\n  %result = rmo.mo.gather_nd(%input, %indices) {batchDims = 0} :\n    (!mo.tensor<[2, 2, 4], si64>, !mo.tensor<[3], si64>) ->\n    !mo.tensor<[], si64>\n```",
+   "forms": [
+    {
+     "kind": "explicit",
+     "params": [
+      {
+       "name": "result",
+       "role": "result",
+       "kind": "tensor"
+      },
+      {
+       "name": "input",
+       "role": "operand",
+       "kind": "tensor"
+      },
+      {
+       "name": "indices",
+       "role": "operand",
+       "kind": "tensor"
+      },
+      {
+       "name": "batch_dims",
+       "role": "attribute",
+       "kind": "index"
+      },
+      {
+       "name": "output_param_decls",
+       "role": "param_decls",
+       "kind": "param_decls"
+      }
+     ]
+    }
+   ],
+   "n_results": 1,
+   "n_results_known": true
+  },
+  {
+   "class": "MoGatherOp",
+   "mlir_name": "rmo.mo.gather",
+   "mlir_name_source": "docstring",
+   "summary": "Gathers slices from input's axis according to indices.",
+   "doc": "Gathers slices from input's axis according to indices.\n\nIf input and indices are statically ranked, the output rank must be\n`inputRank - 1 + indicesRank`. In general, the output satisfies the\nfollowing:\n```\noutput[a_0, ..., a_n, i, ..., j, b_0, ... b_n] =\n  input[a_0, ..., a_n, indices[i, ..., j], b_0, ..., b_n]\n```\nwhere `indices` appears at given axis of input.\n\nThe values of `axis` and `indices` follows numpy semantics, e.g., -1\nrepresents the last axis. `axis` is a compile-time `index` attribute.\n\nExample:\n\n```mlir\n  %input : !mo.tensor<[2, 2], f32>\n  %indices: !mo.tensor<[2], si64>\n  %res = rmo.mo.gather(%input, %indices) {axis = 0 : index} : (\n    !mo.tensor<[2, 2], f32>, !mo.tensor<[2], si64>\n  ) -> !mo.tensor<[2, 2], f32>\n```",
+   "forms": [
+    {
+     "kind": "explicit",
+     "params": [
+      {
+       "name": "result",
+       "role": "result",
+       "kind": "tensor"
+      },
+      {
+       "name": "input",
+       "role": "operand",
+       "kind": "tensor"
+      },
+      {
+       "name": "indices",
+       "role": "operand",
+       "kind": "tensor"
+      },
+      {
+       "name": "axis",
+       "role": "attribute",
+       "kind": "index"
+      },
+      {
+       "name": "output_param_decls",
+       "role": "param_decls",
+       "kind": "param_decls"
+      }
+     ]
+    }
+   ],
+   "n_results": 1,
+   "n_results_known": true
+  },
+  {
+   "class": "MoGeluOp",
+   "mlir_name": "rmo.mo.gelu",
+   "mlir_name_source": "docstring",
+   "summary": "Returns the exact GELU activation `0.5 * x * (1 + erf(x / sqrt(2)))`, where `x` is the input tensor.",
+   "doc": "Returns the exact GELU activation `0.5 * x * (1 + erf(x / sqrt(2)))`, where\n`x` is the input tensor.\n\nExample:\n\n```mlir\n  %arg: !mo.tensor<[2, 3], f32>\n  %res = rmo.mo.gelu(%arg) : !mo.tensor<[2, 3], f32>\n```",
+   "forms": [
+    {
+     "kind": "explicit",
+     "params": [
+      {
+       "name": "result",
+       "role": "result",
+       "kind": "tensor"
+      },
+      {
+       "name": "input",
+       "role": "operand",
+       "kind": "tensor"
+      },
+      {
+       "name": "output_param_decls",
+       "role": "param_decls",
+       "kind": "param_decls"
+      }
+     ]
+    }
+   ],
+   "n_results": 1,
+   "n_results_known": true
+  },
+  {
+   "class": "MoGeluQuickOp",
+   "mlir_name": "rmo.mo.gelu_quick",
+   "mlir_name_source": "docstring",
+   "summary": "Returns the quick approximation of GELU `x * sigmoid(1.702 * x)`, where `x` is the input tensor.",
+   "doc": "Returns the quick approximation of GELU `x * sigmoid(1.702 * x)`, where `x`\nis the input tensor.\n\nExample:\n\n```mlir\n  %arg: !mo.tensor<[2, 3], f32>\n  %res = rmo.mo.gelu_quick(%arg) : !mo.tensor<[2, 3], f32>\n```",
+   "forms": [
+    {
+     "kind": "explicit",
+     "params": [
+      {
+       "name": "result",
+       "role": "result",
+       "kind": "tensor"
+      },
+      {
+       "name": "input",
+       "role": "operand",
+       "kind": "tensor"
+      },
+      {
+       "name": "output_param_decls",
+       "role": "param_decls",
+       "kind": "param_decls"
+      }
+     ]
+    }
+   ],
+   "n_results": 1,
+   "n_results_known": true
+  },
+  {
+   "class": "MoGeluTanhOp",
+   "mlir_name": "rmo.mo.gelu_tanh",
+   "mlir_name_source": "docstring",
+   "summary": "Returns the tanh approximation of GELU `0.5 * x * (1 + tanh(0.7978845608028654 * (x + 0.044715 * x^3)))`, where `x` is the input tensor.",
+   "doc": "Returns the tanh approximation of GELU\n`0.5 * x * (1 + tanh(0.7978845608028654 * (x + 0.044715 * x^3)))`, where\n`x` is the input tensor.\n\nExample:\n\n```mlir\n  %arg: !mo.tensor<[2, 3], f32>\n  %res = rmo.mo.gelu_tanh(%arg) : !mo.tensor<[2, 3], f32>\n```",
+   "forms": [
+    {
+     "kind": "explicit",
+     "params": [
+      {
+       "name": "result",
+       "role": "result",
+       "kind": "tensor"
+      },
+      {
+       "name": "input",
+       "role": "operand",
+       "kind": "tensor"
+      },
+      {
+       "name": "output_param_decls",
+       "role": "param_decls",
+       "kind": "param_decls"
+      }
+     ]
+    }
+   ],
+   "n_results": 1,
+   "n_results_known": true
+  },
+  {
+   "class": "MoGreaterEqualOp",
+   "mlir_name": "rmo.mo.greater_equal",
+   "mlir_name_source": "docstring",
+   "summary": "Returns `x >= y`, where `x` and `y` are input tensors.",
+   "doc": "Returns `x >= y`, where `x` and `y` are input tensors.\n\nExample:\n\n```mlir\n  %lhs: !mo.tensor<[2, 3], f32>\n  %rhs: !mo.tensor<[2, 3], f32>\n  %res = rmo.mo.greater_equal(%lhs, %rhs) : (!mo.tensor<[2, 3], f32>,\n                                            !mo.tensor<[2, 3], f32>\n                                            ) -> !mo.tensor<[2, 3], bool>\n```",
+   "forms": [
+    {
+     "kind": "explicit",
+     "params": [
+      {
+       "name": "result",
+       "role": "result",
+       "kind": "tensor"
+      },
+      {
+       "name": "input_x",
+       "role": "operand",
+       "kind": "tensor"
+      },
+      {
+       "name": "input_y",
+       "role": "operand",
+       "kind": "tensor"
+      },
+      {
+       "name": "output_param_decls",
+       "role": "param_decls",
+       "kind": "param_decls"
+      }
+     ]
+    }
+   ],
+   "n_results": 1,
+   "n_results_known": true
+  },
+  {
+   "class": "MoGreaterOp",
+   "mlir_name": "rmo.mo.greater",
+   "mlir_name_source": "docstring",
+   "summary": "Returns `x > y`, where `x` and `y` are input tensors.",
+   "doc": "Returns `x > y`, where `x` and `y` are input tensors.\n\nExample:\n\n```mlir\n  %lhs: !mo.tensor<[2, 3], f32>\n  %rhs: !mo.tensor<[2, 3], f32>\n  %res = rmo.mo.greater(%lhs, %rhs) : (!mo.tensor<[2, 3], f32>,\n                                      !mo.tensor<[2, 3], f32>\n                                      ) -> !mo.tensor<[2, 3], bool>\n```",
+   "forms": [
+    {
+     "kind": "explicit",
+     "params": [
+      {
+       "name": "result",
+       "role": "result",
+       "kind": "tensor"
+      },
+      {
+       "name": "input_x",
+       "role": "operand",
+       "kind": "tensor"
+      },
+      {
+       "name": "input_y",
+       "role": "operand",
+       "kind": "tensor"
+      },
+      {
+       "name": "output_param_decls",
+       "role": "param_decls",
+       "kind": "param_decls"
+      }
+     ]
+    }
+   ],
+   "n_results": 1,
+   "n_results_known": true
+  },
+  {
+   "class": "MoIsInfOp",
+   "mlir_name": "rmo.mo.is_inf",
+   "mlir_name_source": "docstring",
+   "summary": "Returns true if `x` represents a floating point Inf, where `x` is input tensor.",
+   "doc": "Returns true if `x` represents a floating point Inf, where `x` is input\ntensor.\n\nExample:\n\n```mlir\n  %x: !mo.tensor<[2, 3], f32>\n  %res = rmo.mo.is_inf(%x) : (!mo.tensor<[2, 3], f32>\n                        ) -> !mo.tensor<[2, 3], bool>\n```",
+   "forms": [
+    {
+     "kind": "explicit",
+     "params": [
+      {
+       "name": "result",
+       "role": "result",
+       "kind": "tensor"
+      },
+      {
+       "name": "input_x",
+       "role": "operand",
+       "kind": "tensor"
+      },
+      {
+       "name": "output_param_decls",
+       "role": "param_decls",
+       "kind": "param_decls"
+      }
+     ]
+    }
+   ],
+   "n_results": 1,
+   "n_results_known": true
+  },
+  {
+   "class": "MoIsNanOp",
+   "mlir_name": "rmo.mo.is_nan",
+   "mlir_name_source": "docstring",
+   "summary": "Returns true if `x` represents a floating point NaN, where `x` is input tensor.",
+   "doc": "Returns true if `x` represents a floating point NaN, where `x` is input\ntensor.\n\nExample:\n\n```mlir\n  %x: !mo.tensor<[2, 3], f32>\n  %res = rmo.mo.is_nan(%x) : (!mo.tensor<[2, 3], f32>\n                        ) -> !mo.tensor<[2, 3], bool>\n```",
+   "forms": [
+    {
+     "kind": "explicit",
+     "params": [
+      {
+       "name": "result",
+       "role": "result",
+       "kind": "tensor"
+      },
+      {
+       "name": "input_x",
+       "role": "operand",
+       "kind": "tensor"
+      },
+      {
+       "name": "output_param_decls",
+       "role": "param_decls",
+       "kind": "param_decls"
+      }
+     ]
+    }
+   ],
+   "n_results": 1,
+   "n_results_known": true
+  },
+  {
+   "class": "MoLog1pOp",
+   "mlir_name": "rmo.mo.log1p",
+   "mlir_name_source": "docstring",
+   "summary": "Returns `log(1 + x)`, maintaining accuracy for small `x` that could otherwise lead to floating-point roundings of the kind `1 + x = 1`.",
+   "doc": "Returns `log(1 + x)`, maintaining accuracy for small `x` that could\notherwise lead to floating-point roundings of the kind `1 + x = 1`.\n\nExample:\n\n```mlir\n  %arg: !mo.tensor<[2, 3], f32>\n  %res = rmo.mo.log1p(%arg) : !mo.tensor<[2, 3], f32>\n```",
+   "forms": [
+    {
+     "kind": "explicit",
+     "params": [
+      {
+       "name": "result",
+       "role": "result",
+       "kind": "tensor"
+      },
+      {
+       "name": "input",
+       "role": "operand",
+       "kind": "tensor"
+      },
+      {
+       "name": "output_param_decls",
+       "role": "param_decls",
+       "kind": "param_decls"
+      }
+     ]
+    }
+   ],
+   "n_results": 1,
+   "n_results_known": true
+  },
+  {
+   "class": "MoLogOp",
+   "mlir_name": "rmo.mo.log",
+   "mlir_name_source": "docstring",
+   "summary": "Returns the natural logarithm, `log(x)`.",
+   "doc": "Returns the natural logarithm, `log(x)`.\n\nExample:\n\n```mlir\n  %arg: !mo.tensor<[2, 3], f32>\n  %res = rmo.mo.log(%arg) : !mo.tensor<[2, 3], f32>\n```",
+   "forms": [
+    {
+     "kind": "explicit",
+     "params": [
+      {
+       "name": "result",
+       "role": "result",
+       "kind": "tensor"
+      },
+      {
+       "name": "input",
+       "role": "operand",
+       "kind": "tensor"
+      },
+      {
+       "name": "output_param_decls",
+       "role": "param_decls",
+       "kind": "param_decls"
+      }
+     ]
+    }
+   ],
+   "n_results": 1,
+   "n_results_known": true
+  },
+  {
+   "class": "MoReduceLogsoftmaxOp",
+   "mlir_name": "rmo.mo.reduce.logsoftmax",
+   "mlir_name_source": "docstring",
+   "summary": "Returns `log(softmax(x))`, where `x` is input tensor.",
+   "doc": "Returns `log(softmax(x))`, where `x` is input tensor.\n\nThe softmax is applied along the last axis.\n\nExample:\n\n```mlir\n  %arg: !mo.tensor<[2, 3], f32>\n  %res = rmo.mo.reduce.logsoftmax(%arg) : !mo.tensor<[2, 3], f32>\n```",
+   "forms": [
+    {
+     "kind": "explicit",
+     "params": [
+      {
+       "name": "result",
+       "role": "result",
+       "kind": "tensor"
+      },
+      {
+       "name": "input",
+       "role": "operand",
+       "kind": "tensor"
+      },
+      {
+       "name": "axis",
+       "role": "attribute",
+       "kind": "index"
+      },
+      {
+       "name": "output_param_decls",
+       "role": "param_decls",
+       "kind": "param_decls"
+      }
+     ]
+    }
+   ],
+   "n_results": 1,
+   "n_results_known": true
+  },
+  {
+   "class": "MoMaxOp",
+   "mlir_name": "rmo.mo.max",
+   "mlir_name_source": "derived",
+   "summary": "Does a non-broadcasted elementwise maximum.",
+   "doc": "Does a non-broadcasted elementwise maximum.",
+   "forms": [
+    {
+     "kind": "explicit",
+     "params": [
+      {
+       "name": "result",
+       "role": "result",
+       "kind": "tensor"
+      },
+      {
+       "name": "input_x",
+       "role": "operand",
+       "kind": "tensor"
+      },
+      {
+       "name": "input_y",
+       "role": "operand",
+       "kind": "tensor"
+      },
+      {
+       "name": "output_param_decls",
+       "role": "param_decls",
+       "kind": "param_decls"
+      }
+     ]
+    }
+   ],
+   "n_results": 1,
+   "n_results_known": true
+  },
+  {
+   "class": "MoMaxPoolCeilModeTrueOp",
+   "mlir_name": "rmo.mo.max_pool_ceil_mode_true",
+   "mlir_name_source": "docstring",
+   "summary": "Computes max pooling with the given filter shape, strides, and dilations.",
+   "doc": "Computes max pooling with the given filter shape, strides, and dilations.\n\nThe op supports 2d max pooling (so input and filter must be\n4D), with the following layout assumption:\n- input has layout NHWC, i.e., (batch_size, height, width, in_channels)\n\nAll hyperparameters (i.e. strides, dilations, padding) must be of rank 1, or\nunranked. If the input has static rank, all hyperparameters with static\nshape must have sizes of `input_rank - 2`, except padding, which must have size\n`2 * (input_rank - 2)`. Individual elements in the hyperparameters applies to\ncorresponding dimensions of the input (after ignoring the batch and channel dimensions),\nwith padding representing a before/after pair for each axis. The padding values\nare expected to take the form (pad_dim1_before, pad_dim1_after, pad_dim2_before,\npad_dim2_after...). In 2D Convolution, dim1 here represents H and dim2 represents W.\n\nThis op currently only supports strides and dilations on the filter.\n\nExample:\n\n```mlir\n  %fs = mo.constant {\n    value = #M.dense_array<3, 3> : tensor<2xsi64>} : !mo.tensor<[2], si64>\n  %st = mo.constant {\n    value = #M.dense_array<2, 2> : tensor<2xsi64>} : !mo.tensor<[2], si64>\n  %di = mo.constant {\n    value = #M.dense_array<1, 1> : tensor<2xsi64>} : !mo.tensor<[2], si64>\n  %pa = mo.constant {\n    value = #M.dense_array<0, 0, 0, 0> : tensor<4xsi64>} : !mo.tensor<[4], si64>\n  %res = rmo.mo.max_pool_ceil_mode_true(%arg) [\n      filter_shape = %fs, strides = %st, dilations = %di, paddings = %pa\n  ] : (\n    !mo.tensor<[1, 4, 4, 1], f32>, !mo.tensor<[2], si64>,\n    !mo.tensor<[2], si64>, !mo.tensor<[2], si64>, !mo.tensor<[4], si64>\n  ) -> !mo.tensor<[1, 2, 2, 1], f32>\n```",
+   "forms": [
+    {
+     "kind": "explicit",
+     "params": [
+      {
+       "name": "result",
+       "role": "result",
+       "kind": "tensor"
+      },
+      {
+       "name": "input",
+       "role": "operand",
+       "kind": "tensor"
+      },
+      {
+       "name": "filter_shape",
+       "role": "operand",
+       "kind": "tensor"
+      },
+      {
+       "name": "strides",
+       "role": "operand",
+       "kind": "tensor"
+      },
+      {
+       "name": "dilations",
+       "role": "operand",
+       "kind": "tensor"
+      },
+      {
+       "name": "paddings",
+       "role": "operand",
+       "kind": "tensor"
+      },
+      {
+       "name": "output_param_decls",
+       "role": "param_decls",
+       "kind": "param_decls"
+      }
+     ]
+    }
+   ],
+   "n_results": 1,
+   "n_results_known": true
+  },
+  {
+   "class": "MoMaxPoolOp",
+   "mlir_name": "rmo.mo.max_pool",
+   "mlir_name_source": "docstring",
+   "summary": "Computes max pooling with the given filter shape, strides, and dilations.",
+   "doc": "Computes max pooling with the given filter shape, strides, and dilations.\n\nFor now the op only supports 2d max pooling (so input and filter must be\n4D), with the following layout assumption:\n- input has layout NHWC, i.e., (batch_size, height, width, in_channels)\n\nAll hyperparameters (i.e. strides, dilations, padding) must be of rank 1, or\nunranked. If the input has static rank, all hyperparameters with static\nshape must have sizes of `input_rank - 2`, except padding, which must have size\n`2 * (input_rank - 2)`. Individual elements in the hyperparameters applies to\ncorresponding dimensions of the input (after ignoring the batch and channel dimensions),\nwith padding representing a before/after pair for each axis. The padding values\nare expected to take the form (pad_dim1_before, pad_dim1_after, pad_dim2_before,\npad_dim2_after...). In 2D Convolution, dim1 here represents H and dim2 represents W.\n\nThis op currently only supports strides and dilations on the filter.\n\nExample:\n\n```mlir\n  %fs = mo.constant {\n    value = #M.dense_array<2, 2> : tensor<2xsi64>} : !mo.tensor<[2], si64>\n  %st = mo.constant {\n    value = #M.dense_array<1, 2> : tensor<2xsi64>} : !mo.tensor<[2], si64>\n  %di = mo.constant {\n    value = #M.dense_array<1, 1> : tensor<2xsi64>} : !mo.tensor<[2], si64>\n  %pa = mo.constant {\n    value = #M.dense_array<0, 0, 0, 0> : tensor<4xsi64>} : !mo.tensor<[4], si64>\n  %res = rmo.mo.max_pool(%arg) [\n      filter_shape = %fs, strides = %st, dilations = %di, paddings = %pa\n  ] : (\n    !mo.tensor<[20, 10, 10, 32], f32>, !mo.tensor<[2], si64>,\n    !mo.tensor<[2], si64>, !mo.tensor<[2], si64>, !mo.tensor<[4], si64>\n  ) -> !mo.tensor<[20, 9, 5, 32], f32>\n```",
+   "forms": [
+    {
+     "kind": "explicit",
+     "params": [
+      {
+       "name": "result",
+       "role": "result",
+       "kind": "tensor"
+      },
+      {
+       "name": "input",
+       "role": "operand",
+       "kind": "tensor"
+      },
+      {
+       "name": "filter_shape",
+       "role": "operand",
+       "kind": "tensor"
+      },
+      {
+       "name": "strides",
+       "role": "operand",
+       "kind": "tensor"
+      },
+      {
+       "name": "dilations",
+       "role": "operand",
+       "kind": "tensor"
+      },
+      {
+       "name": "paddings",
+       "role": "operand",
+       "kind": "tensor"
+      },
+      {
+       "name": "output_param_decls",
+       "role": "param_decls",
+       "kind": "param_decls"
+      }
+     ]
+    }
+   ],
+   "n_results": 1,
+   "n_results_known": true
+  },
+  {
+   "class": "MoReduceMeanOp",
+   "mlir_name": "rmo.mo.reduce.mean",
+   "mlir_name_source": "docstring",
+   "summary": "Reduces `input` elements across `axis` to their mean value, changng that axis's dimension to 1.",
+   "doc": "Reduces `input` elements across `axis` to their mean value, changng that\naxis's dimension to 1.\n\nThe value of `axis` follows numpy semantics, e.g., -1 represents the last\naxis.\n\nExample:\n\n```mlir\n  %arg: !mo.tensor<[2, 3], f32>\n  %res = rmo.mo.reduce.mean(%arg) {axis = 1 : index} : (\n    !mo.tensor<[2, 3], f32>) -> !mo.tensor<[2, 1], f32>\n```",
+   "forms": [
+    {
+     "kind": "explicit",
+     "params": [
+      {
+       "name": "result",
+       "role": "result",
+       "kind": "tensor"
+      },
+      {
+       "name": "input",
+       "role": "operand",
+       "kind": "tensor"
+      },
+      {
+       "name": "axis",
+       "role": "attribute",
+       "kind": "index"
+      },
+      {
+       "name": "output_param_decls",
+       "role": "param_decls",
+       "kind": "param_decls"
+      }
+     ]
+    }
+   ],
+   "n_results": 1,
+   "n_results_known": true
+  },
+  {
+   "class": "MoMinOp",
+   "mlir_name": "rmo.mo.min",
+   "mlir_name_source": "derived",
+   "summary": "Does a non-broadcasted elementwise minimum.",
+   "doc": "Does a non-broadcasted elementwise minimum.",
+   "forms": [
+    {
+     "kind": "explicit",
+     "params": [
+      {
+       "name": "result",
+       "role": "result",
+       "kind": "tensor"
+      },
+      {
+       "name": "input_x",
+       "role": "operand",
+       "kind": "tensor"
+      },
+      {
+       "name": "input_y",
+       "role": "operand",
+       "kind": "tensor"
+      },
+      {
+       "name": "output_param_decls",
+       "role": "param_decls",
+       "kind": "param_decls"
+      }
+     ]
+    }
+   ],
+   "n_results": 1,
+   "n_results_known": true
+  },
+  {
+   "class": "MoModOp",
+   "mlir_name": "rmo.mo.mod",
+   "mlir_name_source": "derived",
+   "summary": "Does a non-broadcasted elementwise modulus.",
+   "doc": "Does a non-broadcasted elementwise modulus.",
+   "forms": [
+    {
+     "kind": "explicit",
+     "params": [
+      {
+       "name": "result",
+       "role": "result",
+       "kind": "tensor"
+      },
+      {
+       "name": "input_x",
+       "role": "operand",
+       "kind": "tensor"
+      },
+      {
+       "name": "input_y",
+       "role": "operand",
+       "kind": "tensor"
+      },
+      {
+       "name": "output_param_decls",
+       "role": "param_decls",
+       "kind": "param_decls"
+      }
+     ]
+    }
+   ],
+   "n_results": 1,
+   "n_results_known": true
+  },
+  {
+   "class": "MoMulOp",
+   "mlir_name": "rmo.mo.mul",
+   "mlir_name_source": "derived",
+   "summary": "Does a non-broadcasted elementwise multiplication.",
+   "doc": "Does a non-broadcasted elementwise multiplication.",
+   "forms": [
+    {
+     "kind": "explicit",
+     "params": [
+      {
+       "name": "result",
+       "role": "result",
+       "kind": "tensor"
+      },
+      {
+       "name": "input_x",
+       "role": "operand",
+       "kind": "tensor"
+      },
+      {
+       "name": "input_y",
+       "role": "operand",
+       "kind": "tensor"
+      },
+      {
+       "name": "output_param_decls",
+       "role": "param_decls",
+       "kind": "param_decls"
+      }
+     ]
+    }
+   ],
+   "n_results": 1,
+   "n_results_known": true
+  },
+  {
+   "class": "MoMutableLoadOp",
+   "mlir_name": "rmo.mo.mutable_load",
+   "mlir_name_source": "derived",
+   "summary": "",
+   "doc": "",
+   "forms": [
+    {
+     "kind": "explicit",
+     "params": [
+      {
+       "name": "out_tensor",
+       "role": "result",
+       "kind": "tensor"
+      },
+      {
+       "name": "out_chain",
+       "role": "result",
+       "kind": "chain"
+      },
+      {
+       "name": "in_buffer",
+       "role": "operand",
+       "kind": "buffer"
+      },
+      {
+       "name": "output_param_decls",
+       "role": "param_decls",
+       "kind": "param_decls"
+      },
+      {
+       "name": "in_chain",
+       "role": "operand",
+       "kind": "chain"
+      }
+     ]
+    }
+   ],
+   "n_results": 2,
+   "n_results_known": true
+  },
+  {
+   "class": "MoMutableStoreOp",
+   "mlir_name": "rmo.mo.mutable_store",
+   "mlir_name_source": "derived",
+   "summary": "",
+   "doc": "",
+   "forms": [
+    {
+     "kind": "explicit",
+     "params": [
+      {
+       "name": "out_chain",
+       "role": "result",
+       "kind": "chain"
+      },
+      {
+       "name": "in_buffer",
+       "role": "operand",
+       "kind": "buffer"
+      },
+      {
+       "name": "in_tensor",
+       "role": "operand",
+       "kind": "tensor"
+      },
+      {
+       "name": "output_param_decls",
+       "role": "param_decls",
+       "kind": "param_decls"
+      },
+      {
+       "name": "in_chain",
+       "role": "operand",
+       "kind": "chain"
+      }
+     ]
+    }
+   ],
+   "n_results": 1,
+   "n_results_known": true
+  },
+  {
+   "class": "MoMutableStoreSliceOp",
+   "mlir_name": "rmo.mo.mutable_store_slice",
+   "mlir_name_source": "derived",
+   "summary": "",
+   "doc": "",
+   "forms": [
+    {
+     "kind": "explicit",
+     "params": [
+      {
+       "name": "out_chain",
+       "role": "result",
+       "kind": "chain"
+      },
+      {
+       "name": "in_buffer",
+       "role": "operand",
+       "kind": "buffer"
+      },
+      {
+       "name": "slice",
+       "role": "operand",
+       "kind": "tensor"
+      },
+      {
+       "name": "start",
+       "role": "operand",
+       "kind": "tensor"
+      },
+      {
+       "name": "stop",
+       "role": "operand",
+       "kind": "tensor"
+      },
+      {
+       "name": "step",
+       "role": "operand",
+       "kind": "tensor"
+      },
+      {
+       "name": "output_param_decls",
+       "role": "param_decls",
+       "kind": "param_decls"
+      },
+      {
+       "name": "in_chain",
+       "role": "operand",
+       "kind": "chain"
+      }
+     ]
+    }
+   ],
+   "n_results": 1,
+   "n_results_known": true
+  },
+  {
+   "class": "MoNegativeOp",
+   "mlir_name": "rmo.mo.negative",
+   "mlir_name_source": "docstring",
+   "summary": "Returns `-x`, where `x` is input tensor.",
+   "doc": "Returns `-x`, where `x` is input tensor.\n\nExample:\n\n```mlir\n  %arg: !mo.tensor<[2, 3], f32>\n  %res = rmo.mo.negative(%arg) : !mo.tensor<[2, 3], f32>\n```",
+   "forms": [
+    {
+     "kind": "explicit",
+     "params": [
+      {
+       "name": "result",
+       "role": "result",
+       "kind": "tensor"
+      },
+      {
+       "name": "input",
+       "role": "operand",
+       "kind": "tensor"
+      },
+      {
+       "name": "output_param_decls",
+       "role": "param_decls",
+       "kind": "param_decls"
+      }
+     ]
+    }
+   ],
+   "n_results": 1,
+   "n_results_known": true
+  },
+  {
+   "class": "MoNonMaximumSuppressionOp",
+   "mlir_name": "rmo.mo.non_maximum_suppression",
+   "mlir_name_source": "docstring",
+   "summary": "Filters out boxes that have high intersection-over-union (IOU).",
+   "doc": "Filters out boxes that have high intersection-over-union (IOU).\n\n`boxes` is supplied as [y1, x1, y2, x2] where (y1, x1) and (y2, x2) are the\ncoordinates of any diagonal pair of box corners and the coordinates can be\nprovided as normalized (i.e., lying in the interval [0, 1]) or absolute.\n\n Example:\n\n ```mlir\n   %boxes : !mo.tensor<[1, 6, 4], f32>\n   %scores : !mo.tensor<[1, 1, 6], f32>\n   %maxOutputBoxesPerClass : !mo.tensor<[], si64>\n   %iouThreshold : !mo.tensor<[], f32>\n   %scoreThreshold : !mo.tensor<[], f32>\n   %res = rmo.mo.non_maximum_suppression(%boxes, %scores, %maxOutputBoxesPerClass, %iouThreshold, %scoreThreshold)\n     : (!mo.tensor<[1, 6, 4], f32>, !mo.tensor<[1, 1, 6], f32>, !mo.tensor<[], si64>, !mo.tensor<[], f32>, !mo.tensor<[], f32>)\n     -> !mo.tensor<[?, ?], si64>\n ```",
+   "forms": [
+    {
+     "kind": "explicit",
+     "params": [
+      {
+       "name": "output",
+       "role": "result",
+       "kind": "tensor"
+      },
+      {
+       "name": "boxes",
+       "role": "operand",
+       "kind": "tensor"
+      },
+      {
+       "name": "scores",
+       "role": "operand",
+       "kind": "tensor"
+      },
+      {
+       "name": "max_output_boxes_per_class",
+       "role": "operand",
+       "kind": "tensor"
+      },
+      {
+       "name": "iou_threshold",
+       "role": "operand",
+       "kind": "tensor"
+      },
+      {
+       "name": "score_threshold",
+       "role": "operand",
+       "kind": "tensor"
+      },
+      {
+       "name": "output_param_decls",
+       "role": "param_decls",
+       "kind": "param_decls"
+      }
+     ]
+    }
+   ],
+   "n_results": 1,
+   "n_results_known": true
+  },
+  {
+   "class": "MoNotEqualOp",
+   "mlir_name": "rmo.mo.not_equal",
+   "mlir_name_source": "docstring",
+   "summary": "Returns elementwise `x != y`, where `x` and `y` are input tensors.",
+   "doc": "Returns elementwise `x != y`, where `x` and `y` are input tensors.\n\nExample:\n\n```mlir\n  %lhs: !mo.tensor<[2, 3], f32>\n  %rhs: !mo.tensor<[2, 3], f32>\n  %res = rmo.mo.not_equal(%lhs, %rhs) : (!mo.tensor<[2, 3], f32>,\n                                        !mo.tensor<[2, 3], f32>\n                                        ) -> !mo.tensor<[2, 3], bool>\n```",
+   "forms": [
+    {
+     "kind": "explicit",
+     "params": [
+      {
+       "name": "result",
+       "role": "result",
+       "kind": "tensor"
+      },
+      {
+       "name": "input_x",
+       "role": "operand",
+       "kind": "tensor"
+      },
+      {
+       "name": "input_y",
+       "role": "operand",
+       "kind": "tensor"
+      },
+      {
+       "name": "output_param_decls",
+       "role": "param_decls",
+       "kind": "param_decls"
+      }
+     ]
+    }
+   ],
+   "n_results": 1,
+   "n_results_known": true
+  },
+  {
+   "class": "MoNotOp",
+   "mlir_name": "rmo.mo.not",
+   "mlir_name_source": "docstring",
+   "summary": "Returns `not x` on given input, where input is a boolean tensor.",
+   "doc": "Returns `not x` on given input, where input is a boolean tensor.\n\nExample:\n\n```mlir\n  %in: !mo.tensor<[2, 3], bool>\n  %res = rmo.mo.not(%in) : (!mo.tensor<[2, 3], bool>) -> !mo.tensor<[2, 3], bool>\n```",
+   "forms": [
+    {
+     "kind": "explicit",
+     "params": [
+      {
+       "name": "result",
+       "role": "result",
+       "kind": "tensor"
+      },
+      {
+       "name": "input",
+       "role": "operand",
+       "kind": "tensor"
+      },
+      {
+       "name": "output_param_decls",
+       "role": "param_decls",
+       "kind": "param_decls"
+      }
+     ]
+    }
+   ],
+   "n_results": 1,
+   "n_results_known": true
+  },
+  {
+   "class": "MoOrOp",
+   "mlir_name": "rmo.mo.or",
+   "mlir_name_source": "docstring",
+   "summary": "Returns `x or y`, where `x` and `y` are input boolean tensors.",
+   "doc": "Returns `x or y`, where `x` and `y` are input boolean tensors.\n\nExample:\n\n```mlir\n  %lhs: !mo.tensor<[2, 3], bool>\n  %rhs: !mo.tensor<[2, 3], bool>\n  %res = rmo.mo.or(%lhs, %rhs) : (!mo.tensor<[2, 3], bool>,\n                                 !mo.tensor<[2, 3], bool>\n                                 ) -> !mo.tensor<[2, 3], bool>\n```",
+   "forms": [
+    {
+     "kind": "explicit",
+     "params": [
+      {
+       "name": "result",
+       "role": "result",
+       "kind": "tensor"
+      },
+      {
+       "name": "input_x",
+       "role": "operand",
+       "kind": "tensor"
+      },
+      {
+       "name": "input_y",
+       "role": "operand",
+       "kind": "tensor"
+      },
+      {
+       "name": "output_param_decls",
+       "role": "param_decls",
+       "kind": "param_decls"
+      }
+     ]
+    }
+   ],
+   "n_results": 1,
+   "n_results_known": true
+  },
+  {
+   "class": "MoPadConstantOp",
+   "mlir_name": "rmo.mo.pad_constant",
+   "mlir_name_source": "derived",
+   "summary": "Pads the `input` tensor with a scalar tensor `constant` according to the `paddings`. Assumes input has rank `N`, the `paddings` tensor should have shape `(2 * N)`, where each consecutive pair of elements has the form `[before, after]`, indicating how many of `constant` to add before and after the contents of `input` in that dimension. The size of each dimension D of the padded output is: `paddings[2*D] + input.dim(D) + paddings[2*D+1]`.",
+   "doc": "Pads the `input` tensor with a scalar tensor `constant` according to the\n`paddings`. Assumes input has rank `N`, the `paddings` tensor should have\nshape `(2 * N)`, where each consecutive pair of elements has the form\n`[before, after]`, indicating how many of `constant` to add before and after\nthe contents of `input` in that dimension. The size of each dimension D of\nthe padded output is: `paddings[2*D] + input.dim(D) + paddings[2*D+1]`.\n\nExample:\n\n```mlir\n  %input: !mo.tensor<[2, 3], f32>\n  %constant = mo.constant {\n    value = #M.dense_array<1.0> : tensor<f32>} : !mo.tensor<[], f32>\n  %paddings = mo.constant {\n    value = #M.dense_array<1, 0, 1, 1> : tensor<4xsi64>\n  } : !mo.tensor<[4], si64>\n  %output =   mo.pad.constant(%input, %paddings, %constant) : (\n    !mo.tensor<[2, 3], f32>, !mo.tensor<[4], si64>, !mo.tensor<[], f32>\n  ) -> !mo.tensor<[3, 5], f32>\n```",
+   "forms": [
+    {
+     "kind": "explicit",
+     "params": [
+      {
+       "name": "result",
+       "role": "result",
+       "kind": "tensor"
+      },
+      {
+       "name": "input",
+       "role": "operand",
+       "kind": "tensor"
+      },
+      {
+       "name": "paddings",
+       "role": "operand",
+       "kind": "tensor"
+      },
+      {
+       "name": "constant",
+       "role": "operand",
+       "kind": "tensor"
+      },
+      {
+       "name": "output_param_decls",
+       "role": "param_decls",
+       "kind": "param_decls"
+      }
+     ]
+    }
+   ],
+   "n_results": 1,
+   "n_results_known": true
+  },
+  {
+   "class": "MoPadReflectOp",
+   "mlir_name": "rmo.mo.pad_reflect",
+   "mlir_name_source": "derived",
+   "summary": "Pads the `input` tensor by reflecting it according to the `paddings`. Assumes input has rank `N`, the `paddings` tensor should have shape `(2 * N)`, where each consecutive pair of elements has the form `[before, after]`, indicating how many of `constant` to add before and after the contents of `input` in that dimension. The size of each dimension D of the padded output is: `paddings[2*D] + input.dim(D) + paddings[2*D+1]`.",
+   "doc": "Pads the `input` tensor by reflecting it according to the `paddings`.\nAssumes input has rank `N`, the `paddings` tensor should have shape `(2 *\nN)`, where each consecutive pair of elements has the form `[before, after]`,\nindicating how many of `constant` to add before and after the contents of\n`input` in that dimension. The size of each dimension D of the padded output\nis: `paddings[2*D] + input.dim(D) + paddings[2*D+1]`.\n\n`paddings[D, 0] + input.dim(D) + paddings[D, 1]`.\n\nExample:\n\n```mlir\n  %input: !mo.tensor<[2, 3], f32>\n  %paddings = mo.constant {\n    value = #M.dense_array<1, 0, 1, 1> : tensor<4xsi64>\n  } : !mo.tensor<[4], si64>\n  %output   = mo.pad.reflect(%input, %paddings) : (\n    !mo.tensor<[2, 3], f32>, !mo.tensor<[4], si64>) ->\n    !mo.tensor<[3, 5], f32>\n```",
+   "forms": [
+    {
+     "kind": "explicit",
+     "params": [
+      {
+       "name": "result",
+       "role": "result",
+       "kind": "tensor"
+      },
+      {
+       "name": "input",
+       "role": "operand",
+       "kind": "tensor"
+      },
+      {
+       "name": "paddings",
+       "role": "operand",
+       "kind": "tensor"
+      },
+      {
+       "name": "output_param_decls",
+       "role": "param_decls",
+       "kind": "param_decls"
+      }
+     ]
+    }
+   ],
+   "n_results": 1,
+   "n_results_known": true
+  },
+  {
+   "class": "MoPadRepeatOp",
+   "mlir_name": "rmo.mo.pad_repeat",
+   "mlir_name_source": "derived",
+   "summary": "Pads the `input` tensor by repeating border values according to `paddings`. Assumes input has rank `N`, the `paddings` tensor should have shape `(2 * N)`, where each consecutive pair of elements has the form `[before, after]`, indicating how many of `constant` to add before and after the contents of `input` in that dimension. The size of each dimension D of the padded output is: `paddings[2*D] + input.dim(D) + paddings[2*D+1]`.",
+   "doc": "Pads the `input` tensor by repeating border values according to `paddings`.\nAssumes input has rank `N`, the `paddings` tensor should have shape `(2 *\nN)`, where each consecutive pair of elements has the form `[before, after]`,\nindicating how many of `constant` to add before and after the contents of\n`input` in that dimension. The size of each dimension D of the padded output\nis: `paddings[2*D] + input.dim(D) + paddings[2*D+1]`.\n\n`paddings[D, 0] + input.dim(D) + paddings[D, 1]`.\n\nExample:\n\n```mlir\n  %input: !mo.tensor<[2, 3], f32>\n  %paddings = mo.constant {\n    value = #M.dense_array<1, 0, 1, 1> : tensor<4xsi64>\n  } : !mo.tensor<[4], si64>\n  %output   = mo.pad.repeat(%input, %paddings) : (\n    !mo.tensor<[2, 3], f32>, !mo.tensor<[4], si64>) ->\n    !mo.tensor<[3, 5], f32>\n```",
+   "forms": [
+    {
+     "kind": "explicit",
+     "params": [
+      {
+       "name": "result",
+       "role": "result",
+       "kind": "tensor"
+      },
+      {
+       "name": "input",
+       "role": "operand",
+       "kind": "tensor"
+      },
+      {
+       "name": "paddings",
+       "role": "operand",
+       "kind": "tensor"
+      },
+      {
+       "name": "output_param_decls",
+       "role": "param_decls",
+       "kind": "param_decls"
+      }
+     ]
+    }
+   ],
+   "n_results": 1,
+   "n_results_known": true
+  },
+  {
+   "class": "MoPowOp",
+   "mlir_name": "rmo.mo.pow",
+   "mlir_name_source": "derived",
+   "summary": "Does a non-broadcasted elementwise power. Allows mixed precision operands.",
+   "doc": "Does a non-broadcasted elementwise power. Allows mixed precision operands.",
+   "forms": [
+    {
+     "kind": "explicit",
+     "params": [
+      {
+       "name": "result",
+       "role": "result",
+       "kind": "tensor"
+      },
+      {
+       "name": "input_x",
+       "role": "operand",
+       "kind": "tensor"
+      },
+      {
+       "name": "input_y",
+       "role": "operand",
+       "kind": "tensor"
+      },
+      {
+       "name": "output_param_decls",
+       "role": "param_decls",
+       "kind": "param_decls"
+      }
+     ]
+    }
+   ],
+   "n_results": 1,
+   "n_results_known": true
+  },
+  {
+   "class": "MoRandomNormalOp",
+   "mlir_name": "rmo.mo.random.normal",
+   "mlir_name_source": "docstring",
+   "summary": "Returns a tensor with shape `shape` populated with random values from a   normal distribution, with the mean of the distribution equal to `mean`   and the standard deviation equal to `variance`.",
+   "doc": "Returns a tensor with shape `shape` populated with random values from a\n  normal distribution, with the mean of the distribution equal to `mean`\n  and the standard deviation equal to `variance`.\n\nExample:\n  ```mlir\n    %size = mo.constant {\n      value = #M.dense_array<1, 1, 7, 8> : tensor<4xsi64>} : !mo.tensor<[4], si64>\n    %mean = mo.constant {\n      value = #M.dense_array<2.0> : tensor<1xf32> } : !mo.tensor<[], f32>\n    %variance = mo.constant {\n      value = #M.dense_array<0.5> : tensor<1xf32> } : !mo.tensor<[], f32>\n    %seed = mo.constant {\n      value = #M.dense_array<1> : tensor<1xui64> } : !mo.tensor<[1], ui64>\n    %res = rmo.mo.random.normal(%size, %mean, %variance, %seed) :\n          (!mo.tensor<[4], si64>, !mo.tensor<[], f32>, !mo.tensor<[], f32>,\n          !mo.tensor<[1], ui64>) -> !mo.tensor<[1, 1, 7, 8], f32>\n  ```",
+   "forms": [
+    {
+     "kind": "explicit",
+     "params": [
+      {
+       "name": "result",
+       "role": "result",
+       "kind": "tensor"
+      },
+      {
+       "name": "shape",
+       "role": "operand",
+       "kind": "tensor"
+      },
+      {
+       "name": "mean",
+       "role": "operand",
+       "kind": "tensor"
+      },
+      {
+       "name": "variance",
+       "role": "operand",
+       "kind": "tensor"
+      },
+      {
+       "name": "seed",
+       "role": "operand",
+       "kind": "tensor"
+      },
+      {
+       "name": "output_param_decls",
+       "role": "param_decls",
+       "kind": "param_decls"
+      }
+     ]
+    }
+   ],
+   "n_results": 1,
+   "n_results_known": true
+  },
+  {
+   "class": "MoRandomUniformOp",
+   "mlir_name": "rmo.mo.random.uniform",
+   "mlir_name_source": "docstring",
+   "summary": "Returns a tensor with shape `shape` populated with random values from a uniform distribution on the half-open interval [lowerBound, upperBound).",
+   "doc": "Returns a tensor with shape `shape` populated with random values from a\nuniform distribution on the half-open interval [lowerBound, upperBound).\n\nExample:\n```mlir\n%size = mo.constant {\n  value = #M.dense_array<1, 1, 7, 8> : tensor<4xsi64>} : !mo.tensor<[4], si64>\n%lowerBound = mo.constant {\n  value = #M.dense_array<2.0> : tensor<1xf32> } : !mo.tensor<[], f32>\n%upperBound = mo.constant {\n  value = #M.dense_array<0.5> : tensor<1xf32> } : !mo.tensor<[], f32>\n%seed = mo.constant {\n  value = #M.dense_array<1> : tensor<1xui64> } : !mo.tensor<[1], ui64>\n%res = rmo.mo.random.uniform(%size, %lowerBound, %upperBound, %seed) :\n      (!mo.tensor<[4], si64>, !mo.tensor<[], f32>, !mo.tensor<[], f32>,\n      !mo.tensor<[1], ui64>) -> !mo.tensor<[1, 1, 7, 8], f32>\n```",
+   "forms": [
+    {
+     "kind": "explicit",
+     "params": [
+      {
+       "name": "result",
+       "role": "result",
+       "kind": "tensor"
+      },
+      {
+       "name": "shape",
+       "role": "operand",
+       "kind": "tensor"
+      },
+      {
+       "name": "lower_bound",
+       "role": "operand",
+       "kind": "tensor"
+      },
+      {
+       "name": "upper_bound",
+       "role": "operand",
+       "kind": "tensor"
+      },
+      {
+       "name": "seed",
+       "role": "operand",
+       "kind": "tensor"
+      },
+      {
+       "name": "output_param_decls",
+       "role": "param_decls",
+       "kind": "param_decls"
+      }
+     ]
+    }
+   ],
+   "n_results": 1,
+   "n_results_known": true
+  },
+  {
+   "class": "MoRangeOp",
+   "mlir_name": "rmo.mo.range",
+   "mlir_name_source": "docstring",
+   "summary": "Creates a sequence of numbers. The sequence goes from `start` with increments of size `step` up to (but not including) `limit`. All arguments are mandatory and must have the same element type.",
+   "doc": "Creates a sequence of numbers. The sequence goes from `start` with\nincrements of size `step` up to (but not including) `limit`. All arguments\nare mandatory and must have the same element type.\n\nNote the following restrictions on input values:\n1. `step` must be non-zero\n2. `limit - start` must be zero or have the same sign as `step`\n\nExample:\n\n```mlir\n  %limit : !mo.tensor<[], f32>\n  %start = mo.constant {\n    value = #M.dense_array<0.0> : tensor<f32>} : !mo.tensor<[], f32>\n  %step = mo.constant {\n    value = #M.dense_array<1.5> : tensor<f32>} : !mo.tensor<[], f32>\n  %res = rmo.mo.range(%start, %limit, %step) : (\n    !mo.tensor<[], f32>, !mo.tensor<[], f32>, !mo.tensor<[], f32>\n  ) -> !mo.tensor<[?], f32>\n\n  %startInt = mo.constant {\n    value = #M.dense_array<1> : tensor<si32>} : !mo.tensor<[], si32>\n  %stepInt = mo.constant {\n    value = #M.dense_array<2> : tensor<si32>} : !mo.tensor<[], si32>\n  %limitInt = mo.constant {\n    value = #M.dense_array<11> : tensor<si32>} : !mo.tensor<[], si32>\n  %oddNumbersBelowTen = rmo.mo.range(%startInt, %limitInt, %stepInt) : (\n    !mo.tensor<[], si32>, !mo.tensor<[], si32>, !mo.tensor<[], si32>\n  ) -> !mo.tensor<[5], si32>\n```",
+   "forms": [
+    {
+     "kind": "explicit",
+     "params": [
+      {
+       "name": "result",
+       "role": "result",
+       "kind": "tensor"
+      },
+      {
+       "name": "start",
+       "role": "operand",
+       "kind": "tensor"
+      },
+      {
+       "name": "limit",
+       "role": "operand",
+       "kind": "tensor"
+      },
+      {
+       "name": "step",
+       "role": "operand",
+       "kind": "tensor"
+      },
+      {
+       "name": "output_param_decls",
+       "role": "param_decls",
+       "kind": "param_decls"
+      }
+     ]
+    }
+   ],
+   "n_results": 1,
+   "n_results_known": true
+  },
+  {
+   "class": "MoReduceAddOp",
+   "mlir_name": "rmo.mo.reduce.add",
+   "mlir_name_source": "docstring",
+   "summary": "Reduces `input` elements across `axis` to their sum, changing that axis's dimension to 1 in the output shape.",
+   "doc": "Reduces `input` elements across `axis` to their sum, changing that axis's\ndimension to 1 in the output shape.\n\nThe value of `axis` follows numpy semantics, e.g., -1 represents the last\naxis.\n\nExample:\n\n```mlir\n  %arg: !mo.tensor<[2, 3], f32>\n  %res = rmo.mo.reduce.add(%arg) {axis = 1 : index} : (\n    !mo.tensor<[2, 3], f32>) -> !mo.tensor<[2, 1], f32>\n```",
+   "forms": [
+    {
+     "kind": "explicit",
+     "params": [
+      {
+       "name": "result",
+       "role": "result",
+       "kind": "tensor"
+      },
+      {
+       "name": "input",
+       "role": "operand",
+       "kind": "tensor"
+      },
+      {
+       "name": "axis",
+       "role": "attribute",
+       "kind": "index"
+      },
+      {
+       "name": "output_param_decls",
+       "role": "param_decls",
+       "kind": "param_decls"
+      }
+     ]
+    }
+   ],
+   "n_results": 1,
+   "n_results_known": true
+  },
+  {
+   "class": "MoReduceMulOp",
+   "mlir_name": "rmo.mo.reduce.mul",
+   "mlir_name_source": "docstring",
+   "summary": "Reduces `input` elements across `axis` to their product, changing that axis's dimension to 1 in the output shape.",
+   "doc": "Reduces `input` elements across `axis` to their product, changing that\naxis's dimension to 1 in the output shape.\n\nThe value of `axis` follows numpy semantics, e.g., -1 represents the last\naxis.\n\nExample:\n\n```mlir\n  %arg: !mo.tensor<[2, 3], f32>\n  %res = rmo.mo.reduce.mul(%arg) {axis = 1 : index} : (\n    !mo.tensor<[2, 3], f32>) -> !mo.tensor<[2, 1], f32>\n```",
+   "forms": [
+    {
+     "kind": "explicit",
+     "params": [
+      {
+       "name": "result",
+       "role": "result",
+       "kind": "tensor"
+      },
+      {
+       "name": "input",
+       "role": "operand",
+       "kind": "tensor"
+      },
+      {
+       "name": "axis",
+       "role": "attribute",
+       "kind": "index"
+      },
+      {
+       "name": "output_param_decls",
+       "role": "param_decls",
+       "kind": "param_decls"
+      }
+     ]
+    }
+   ],
+   "n_results": 1,
+   "n_results_known": true
+  },
+  {
+   "class": "MoReluOp",
+   "mlir_name": "rmo.mo.relu",
+   "mlir_name_source": "docstring",
+   "summary": "Returns `max(0, x)`, where `x` is the input tensor.",
+   "doc": "Returns `max(0, x)`, where `x` is the input tensor.\n\nExample:\n\n```mlir\n  %arg: !mo.tensor<[2, 3], f32>\n  %res = rmo.mo.relu(%arg) : !mo.tensor<[2, 3], f32>\n```",
+   "forms": [
+    {
+     "kind": "explicit",
+     "params": [
+      {
+       "name": "result",
+       "role": "result",
+       "kind": "tensor"
+      },
+      {
+       "name": "input",
+       "role": "operand",
+       "kind": "tensor"
+      },
+      {
+       "name": "output_param_decls",
+       "role": "param_decls",
+       "kind": "param_decls"
+      }
+     ]
+    }
+   ],
+   "n_results": 1,
+   "n_results_known": true
+  },
+  {
+   "class": "MoReshapeOp",
+   "mlir_name": "rmo.mo.reshape",
+   "mlir_name_source": "derived",
+   "summary": "Reshape the `input` tensor to the shape represented in `newShape`.",
+   "doc": "Reshape the `input` tensor to the shape represented in `newShape`.",
+   "forms": [
+    {
+     "kind": "explicit",
+     "params": [
+      {
+       "name": "result",
+       "role": "result",
+       "kind": "tensor"
+      },
+      {
+       "name": "input",
+       "role": "operand",
+       "kind": "tensor"
+      },
+      {
+       "name": "new_shape",
+       "role": "operand",
+       "kind": "tensor"
+      },
+      {
+       "name": "output_param_decls",
+       "role": "param_decls",
+       "kind": "param_decls"
+      }
+     ]
+    }
+   ],
+   "n_results": 1,
+   "n_results_known": true
+  },
+  {
+   "class": "MoResizeBicubicOp",
+   "mlir_name": "rmo.resize.bicubic",
+   "mlir_name_source": "docstring",
+   "summary": "Resizes a tensor to a new shape using the bicubic interpolation algorithm.",
+   "doc": "Resizes a tensor to a new shape using the bicubic interpolation algorithm.\n\nBicubic interpolation uses a 4x4 pixel neighborhood and cubic polynomials\nto produce smoother results than linear interpolation. This implementation\nuses Keys' cubic convolution with a = -0.5.\n\nExample:\n```mlir\n  %input : !mo.tensor<[1, 3, 224, 224], f32>\n  %size = mo.constant {\n    value = #M.dense_array<1, 3, 448, 448> : tensor<4xsi64>} : !mo.tensor<[4], si64>\n  %res = rmo.resize.bicubic(%input, %size) :\n    (!mo.tensor<[1, 3, 224, 224], f32>, !mo.tensor<[4], si64>) ->\n      !mo.tensor<[1, 3, 448, 448], f32>\n```",
+   "forms": [
+    {
+     "kind": "explicit",
+     "params": [
+      {
+       "name": "result",
+       "role": "result",
+       "kind": "tensor"
+      },
+      {
+       "name": "input",
+       "role": "operand",
+       "kind": "tensor"
+      },
+      {
+       "name": "size",
+       "role": "operand",
+       "kind": "tensor"
+      },
+      {
+       "name": "output_param_decls",
+       "role": "param_decls",
+       "kind": "param_decls"
+      }
+     ]
+    }
+   ],
+   "n_results": 1,
+   "n_results_known": true
+  },
+  {
+   "class": "MoResizeLinearOp",
+   "mlir_name": "rmo.mo.resize_linear",
+   "mlir_name_source": "derived",
+   "summary": "Resizes a tensor to a new shape using the linear algorithm.",
+   "doc": "Resizes a tensor to a new shape using the linear algorithm.\n\nThe coordinate transform mode can be half-pixel, align-corners or asymmetric.\n\nWhen set to true, the antialias attribute causes an antialiasing filter to be applied\nwhen downscaling.",
+   "forms": [
+    {
+     "kind": "explicit",
+     "params": [
+      {
+       "name": "result",
+       "role": "result",
+       "kind": "tensor"
+      },
+      {
+       "name": "input",
+       "role": "operand",
+       "kind": "tensor"
+      },
+      {
+       "name": "size",
+       "role": "operand",
+       "kind": "tensor"
+      },
+      {
+       "name": "coordinate_transform_mode",
+       "role": "unmapped",
+       "kind": "max._core.dialects.mo.CoordinateTransformModeAttr",
+       "why": "enum attribute, values not in the stub"
+      },
+      {
+       "name": "antialias",
+       "role": "attribute",
+       "kind": "bool_attr"
+      },
+      {
+       "name": "output_param_decls",
+       "role": "param_decls",
+       "kind": "param_decls"
+      }
+     ]
+    }
+   ],
+   "n_results": 1,
+   "n_results_known": true
+  },
+  {
+   "class": "MoResizeNearestOp",
+   "mlir_name": "rmo.resize.nearest",
+   "mlir_name_source": "docstring",
+   "summary": "Resizes a tensor to a new shape using the nearest-neighbor algorithm.",
+   "doc": "Resizes a tensor to a new shape using the nearest-neighbor algorithm.\n\nThe coordinate transform mode can be half-pixel, align-corners or asymmetric.\n\nThe values for round mode are:\n  - 0: HalfDown\n  - 1: HalfUp\n  - 2: Floor\n  - 3: Ceil\n\nRound mode is HalfDown (0) by default.\n\nExample:\n```mlir\n  %input : !mo.tensor<[1, 1, 2, 2], f32>\n  %size = mo.constant {\n    value = #M.dense_array<1, 1, 7, 8> : tensor<4xsi64>} : !mo.tensor<[4], si64>\n  %res = rmo.resize.nearest(%input, %size) {\n    coordinate_transform_mode = 0,\n    round_mode = 2}:\n    (!mo.tensor<[1, 1, 2, 2], f32>, !mo.tensor<[4], si64>) ->\n      !mo.tensor<[1, 1, 7, 8], f32>\n```",
+   "forms": [
+    {
+     "kind": "explicit",
+     "params": [
+      {
+       "name": "result",
+       "role": "result",
+       "kind": "tensor"
+      },
+      {
+       "name": "input",
+       "role": "operand",
+       "kind": "tensor"
+      },
+      {
+       "name": "size",
+       "role": "operand",
+       "kind": "tensor"
+      },
+      {
+       "name": "coordinate_transform_mode",
+       "role": "unmapped",
+       "kind": "max._core.dialects.mo.CoordinateTransformModeAttr",
+       "why": "enum attribute, values not in the stub"
+      },
+      {
+       "name": "round_mode",
+       "role": "attribute",
+       "kind": "index"
+      },
+      {
+       "name": "output_param_decls",
+       "role": "param_decls",
+       "kind": "param_decls"
+      }
+     ]
+    }
+   ],
+   "n_results": 1,
+   "n_results_known": true
+  },
+  {
+   "class": "MoRoiAlignOp",
+   "mlir_name": "rmo.mo.roi_align",
+   "mlir_name_source": "docstring",
+   "summary": "ROI align consumes an input tensor and regions of interest in which to apply pooling.",
+   "doc": "ROI align consumes an input tensor and regions of interest in which to apply pooling.\n\nExample:\n```mlir\n  %inp: !mo.tensor<[1, 10, 10, 1], f32>\n  %rois: !mo.tensor<[1, 5], f32>\n  %output_height = mo.constant {device = #M.device_ref<\"cpu\", 0>, value = #M.dense_array<5> : tensor<1xsi64>} : !mo.tensor<[], si64>\n  %spatial_scale = mo.constant {device = #M.device_ref<\"cpu\", 0>, value = #M.dense_array<1.0> : tensor<1xf32>} : !mo.tensor<[], f32>\n  %sampling_ratio = mo.constant {device = #M.device_ref<\"cpu\", 0>, value = #M.dense_array<2.0> : tensor<1xf32>} : !mo.tensor<[], f32>\n\n  %res = rmo.mo.roi_align(%inp, %rois, %output_height, %output_height, %spatial_scale, %sampling_ratio)\n    {aligned = false,  mode = \"AVG\"}\n    : (!mo.tensor<[1, 10, 10, 1], f32>,\n      !mo.tensor<[1, 5], f32>,\n      !mo.tensor<[], si64>,\n      !mo.tensor<[], si64>,\n      !mo.tensor<[], f32>,\n      !mo.tensor<[], f32>) -> !mo.tensor<[1, 5, 5, 1], f32>\n```",
+   "forms": [
+    {
+     "kind": "explicit",
+     "params": [
+      {
+       "name": "result",
+       "role": "result",
+       "kind": "tensor"
+      },
+      {
+       "name": "input",
+       "role": "operand",
+       "kind": "tensor"
+      },
+      {
+       "name": "rois",
+       "role": "operand",
+       "kind": "tensor"
+      },
+      {
+       "name": "output_height",
+       "role": "operand",
+       "kind": "tensor"
+      },
+      {
+       "name": "output_width",
+       "role": "operand",
+       "kind": "tensor"
+      },
+      {
+       "name": "spatial_scale",
+       "role": "operand",
+       "kind": "tensor"
+      },
+      {
+       "name": "sampling_ratio",
+       "role": "operand",
+       "kind": "tensor"
+      },
+      {
+       "name": "aligned",
+       "role": "attribute",
+       "kind": "bool_attr"
+      },
+      {
+       "name": "mode",
+       "role": "attribute",
+       "kind": "string_attr"
+      },
+      {
+       "name": "output_param_decls",
+       "role": "param_decls",
+       "kind": "param_decls"
+      }
+     ]
+    }
+   ],
+   "n_results": 1,
+   "n_results_known": true
+  },
+  {
+   "class": "MoRoundOp",
+   "mlir_name": "rmo.mo.round",
+   "mlir_name_source": "docstring",
+   "summary": "Returns the elementwise nearest integer, with ties going away from zero.",
+   "doc": "Returns the elementwise nearest integer, with ties going away from zero.\n\n```mlir\n  %arg: !mo.tensor<[2, 3], f32>\n  %res = rmo.mo.round(%arg) : !mo.tensor<[2, 3], f32>\n```",
+   "forms": [
+    {
+     "kind": "explicit",
+     "params": [
+      {
+       "name": "result",
+       "role": "result",
+       "kind": "tensor"
+      },
+      {
+       "name": "input",
+       "role": "operand",
+       "kind": "tensor"
+      },
+      {
+       "name": "output_param_decls",
+       "role": "param_decls",
+       "kind": "param_decls"
+      }
+     ]
+    }
+   ],
+   "n_results": 1,
+   "n_results_known": true
+  },
+  {
+   "class": "MoRsqrtOp",
+   "mlir_name": "rmo.mo.rsqrt",
+   "mlir_name_source": "docstring",
+   "summary": "Returns `1/sqrt(x)`, where `x` is the input tensor.",
+   "doc": "Returns `1/sqrt(x)`, where `x` is the input tensor.\n\nExample:\n\n```mlir\n  %arg: !mo.tensor<[2, 3], f32>\n  %res = rmo.mo.rsqrt(%arg) : !mo.tensor<[2, 3], f32>\n```",
+   "forms": [
+    {
+     "kind": "explicit",
+     "params": [
+      {
+       "name": "result",
+       "role": "result",
+       "kind": "tensor"
+      },
+      {
+       "name": "input",
+       "role": "operand",
+       "kind": "tensor"
+      },
+      {
+       "name": "output_param_decls",
+       "role": "param_decls",
+       "kind": "param_decls"
+      }
+     ]
+    }
+   ],
+   "n_results": 1,
+   "n_results_known": true
+  },
+  {
+   "class": "MoScatterAddOp",
+   "mlir_name": "rmo.mo.scatter.add",
+   "mlir_name_source": "docstring",
+   "summary": "Produces an output tensor by scattering elements from updates to input according to indices, and it stores the sum of elements with duplicate indices.",
+   "doc": "Produces an output tensor by scattering elements from updates to input\naccording to indices, and it stores the sum of elements with duplicate\nindices.\n\nIt takes in `input`, `updates` and `indices` tensors of the same rank, and a\nscalar axis. The output is a copy of the input, with certain elements\nupdated based on `updates` and `indices`.\n\nFor each entry in `indices`, the target index for `input` is obtained by\nmaking a copy of the entry's own index, and then updating the `axis`\ndimension with the value of the `indices` entry. Then the element at this\ntarget index is combined with existing element via addition.\n\nFor instance, in a 2D tensor case, the update corresponding to the [i][j] entry\nis performed as below:\n```\n  output[indices[i][j]][j] += updates[i][j] if axis = 0,\n  output[i][indices[i][j]] += updates[i][j] if axis = 1,\n```\n\nExample:\n\n```mlir\n  %input:   !mo.tensor<[4, 4], f32>\n  %updates: !mo.tensor<[2, 3], f32>\n  %indices: !mo.tensor<[2, 3], si64>\n  %res = rmo.mo.scatter.add(%inputs, %updates, %indices) : (\n    !mo.tensor<[4, 4], f32>, !mo.tensor<[2, 3], f32>, !mo.tensor<[2, 3], si64>\n  ) -> !mo.tensor<[4, 4], f32>\n```",
+   "forms": [
+    {
+     "kind": "explicit",
+     "params": [
+      {
+       "name": "result",
+       "role": "result",
+       "kind": "tensor"
+      },
+      {
+       "name": "input",
+       "role": "operand",
+       "kind": "tensor"
+      },
+      {
+       "name": "updates",
+       "role": "operand",
+       "kind": "tensor"
+      },
+      {
+       "name": "indices",
+       "role": "operand",
+       "kind": "tensor"
+      },
+      {
+       "name": "axis",
+       "role": "operand",
+       "kind": "tensor"
+      },
+      {
+       "name": "output_param_decls",
+       "role": "param_decls",
+       "kind": "param_decls"
+      }
+     ]
+    }
+   ],
+   "n_results": 1,
+   "n_results_known": true
+  },
+  {
+   "class": "MoScatterMaxOp",
+   "mlir_name": "rmo.mo.scatter.max",
+   "mlir_name_source": "docstring",
+   "summary": "Produces an output tensor by scattering elements from updates to input according to indices, and it stores the maximum of elements with duplicate indices.",
+   "doc": "Produces an output tensor by scattering elements from updates to input\naccording to indices, and it stores the maximum of elements with duplicate\nindices.\n\nIt takes in `input`, `updates` and `indices` tensors of the same rank, and a\nscalar axis. The output is a copy of the input, with certain elements\nupdated based on `updates` and `indices`.\n\nFor each entry in `indices`, the target index for `input` is obtained by\nmaking a copy of the entry's own index, and then updating the `axis`\ndimension with the value of the `indices` entry. Then the element at this\ntarget index is combined with existing element via maximum.\n\nFor instance, in a 2D tensor case, the update corresponding to the [i][j] entry\nis performed as below:\n```\n  output[indices[i][j]][j] = max(output[indices[i][j]][j], updates[i][j]) if axis = 0,\n  output[i][indices[i][j]] = max(output[i][indices[i][j]], updates[i][j]) if axis = 1,\n```\n\nExample:\n\n```mlir\n  %input:   !mo.tensor<[4, 4], f32>\n  %updates: !mo.tensor<[2, 3], f32>\n  %indices: !mo.tensor<[2, 3], si64>\n  %res = rmo.mo.scatter.max(%inputs, %updates, %indices) : (\n    !mo.tensor<[4, 4], f32>, !mo.tensor<[2, 3], f32>, !mo.tensor<[2, 3], si64>\n  ) -> !mo.tensor<[4, 4], f32>\n```",
+   "forms": [
+    {
+     "kind": "explicit",
+     "params": [
+      {
+       "name": "result",
+       "role": "result",
+       "kind": "tensor"
+      },
+      {
+       "name": "input",
+       "role": "operand",
+       "kind": "tensor"
+      },
+      {
+       "name": "updates",
+       "role": "operand",
+       "kind": "tensor"
+      },
+      {
+       "name": "indices",
+       "role": "operand",
+       "kind": "tensor"
+      },
+      {
+       "name": "axis",
+       "role": "operand",
+       "kind": "tensor"
+      },
+      {
+       "name": "output_param_decls",
+       "role": "param_decls",
+       "kind": "param_decls"
+      }
+     ]
+    }
+   ],
+   "n_results": 1,
+   "n_results_known": true
+  },
+  {
+   "class": "MoScatterMinOp",
+   "mlir_name": "rmo.mo.scatter.min",
+   "mlir_name_source": "docstring",
+   "summary": "Produces an output tensor by scattering elements from updates to input according to indices, and it stores the minimum of elements with duplicate indices.",
+   "doc": "Produces an output tensor by scattering elements from updates to input\naccording to indices, and it stores the minimum of elements with duplicate\nindices.\n\nIt takes in `input`, `updates` and `indices` tensors of the same rank, and a\nscalar axis. The output is a copy of the input, with certain elements\nupdated based on `updates` and `indices`.\n\nFor each entry in `indices`, the target index for `input` is obtained by\nmaking a copy of the entry's own index, and then updating the `axis`\ndimension with the value of the `indices` entry. Then the element at this\ntarget index is combined with existing element via minimum.\n\nFor instance, in a 2D tensor case, the update corresponding to the [i][j] entry\nis performed as below:\n```\n  output[indices[i][j]][j] = min(output[indices[i][j]][j], updates[i][j]) if axis = 0,\n  output[i][indices[i][j]] = min(output[i][indices[i][j]], updates[i][j]) if axis = 1,\n```\n\nExample:\n\n```mlir\n  %input:   !mo.tensor<[4, 4], f32>\n  %updates: !mo.tensor<[2, 3], f32>\n  %indices: !mo.tensor<[2, 3], si64>\n  %res = rmo.mo.scatter.min(%inputs, %updates, %indices) : (\n    !mo.tensor<[4, 4], f32>, !mo.tensor<[2, 3], f32>, !mo.tensor<[2, 3], si64>\n  ) -> !mo.tensor<[4, 4], f32>\n```",
+   "forms": [
+    {
+     "kind": "explicit",
+     "params": [
+      {
+       "name": "result",
+       "role": "result",
+       "kind": "tensor"
+      },
+      {
+       "name": "input",
+       "role": "operand",
+       "kind": "tensor"
+      },
+      {
+       "name": "updates",
+       "role": "operand",
+       "kind": "tensor"
+      },
+      {
+       "name": "indices",
+       "role": "operand",
+       "kind": "tensor"
+      },
+      {
+       "name": "axis",
+       "role": "operand",
+       "kind": "tensor"
+      },
+      {
+       "name": "output_param_decls",
+       "role": "param_decls",
+       "kind": "param_decls"
+      }
+     ]
+    }
+   ],
+   "n_results": 1,
+   "n_results_known": true
+  },
+  {
+   "class": "MoScatterMulOp",
+   "mlir_name": "rmo.mo.scatter.mul",
+   "mlir_name_source": "docstring",
+   "summary": "Produces an output tensor by scattering elements from updates to input according to indices, and it stores the product of elements with duplicate indices.",
+   "doc": "Produces an output tensor by scattering elements from updates to input\naccording to indices, and it stores the product of elements with duplicate\nindices.\n\nIt takes in `input`, `updates` and `indices` tensors of the same rank, and a\nscalar axis. The output is a copy of the input, with certain elements\nupdated based on `updates` and `indices`.\n\nFor each entry in `indices`, the target index for `input` is obtained by\nmaking a copy of the entry's own index, and then updating the `axis`\ndimension with the value of the `indices` entry. Then the element at this\ntarget index is combined with existing element via multiplication.\n\nFor instance, in a 2D tensor case, the update corresponding to the [i][j] entry\nis performed as below:\n```\n  output[indices[i][j]][j] *= updates[i][j] if axis = 0,\n  output[i][indices[i][j]] *= updates[i][j] if axis = 1,\n```\n\nExample:\n\n```mlir\n  %input:   !mo.tensor<[4, 4], f32>\n  %updates: !mo.tensor<[2, 3], f32>\n  %indices: !mo.tensor<[2, 3], si64>\n  %res = rmo.mo.scatter.mul(%inputs, %updates, %indices) : (\n    !mo.tensor<[4, 4], f32>, !mo.tensor<[2, 3], f32>, !mo.tensor<[2, 3], si64>\n  ) -> !mo.tensor<[4, 4], f32>\n```",
+   "forms": [
+    {
+     "kind": "explicit",
+     "params": [
+      {
+       "name": "result",
+       "role": "result",
+       "kind": "tensor"
+      },
+      {
+       "name": "input",
+       "role": "operand",
+       "kind": "tensor"
+      },
+      {
+       "name": "updates",
+       "role": "operand",
+       "kind": "tensor"
+      },
+      {
+       "name": "indices",
+       "role": "operand",
+       "kind": "tensor"
+      },
+      {
+       "name": "axis",
+       "role": "operand",
+       "kind": "tensor"
+      },
+      {
+       "name": "output_param_decls",
+       "role": "param_decls",
+       "kind": "param_decls"
+      }
+     ]
+    }
+   ],
+   "n_results": 1,
+   "n_results_known": true
+  },
+  {
+   "class": "MoScatterNdAddOp",
+   "mlir_name": "rmo.mo.scatter_nd.add",
+   "mlir_name_source": "docstring",
+   "summary": "Produces an output tensor by scattering slices from updates to input according to indices, and it stores the sum of any duplicate indices.",
+   "doc": "Produces an output tensor by scattering slices from updates to input\naccording to indices, and it stores the sum of any duplicate indices.\n\nSpecifically, it treats the last dimension of indices as a vector of\nintegers used to index into a copy of the input, and it replaces that\nresulting slice (or scalar) with corresponding slice (or scalar) from\nthe updates tensor.\n\nNote that the `slice` shows up in case where the index vector length is\nshorter than the rank of input tensor, i.e., the op will slice the leading\ndimensions.\n\nExample:\n\n```mlir\n  %input:   !mo.tensor<[4, 2], f32>\n  %updates: !mo.tensor<[1, 3, 2], f32>\n  %indices: !mo.tensor<[1, 3, 1], si64>\n  %res = rmo.mo.scatter_nd.add(%inputs, %updates, %indices) : (\n    !mo.tensor<[4, 2], f32>, !mo.tensor<[1, 3, 2], f32>, !mo.tensor<[1, 3, 1], si64>\n  ) -> !mo.tensor<[4, 2], f32>\n```",
+   "forms": [
+    {
+     "kind": "explicit",
+     "params": [
+      {
+       "name": "result",
+       "role": "result",
+       "kind": "tensor"
+      },
+      {
+       "name": "input",
+       "role": "operand",
+       "kind": "tensor"
+      },
+      {
+       "name": "updates",
+       "role": "operand",
+       "kind": "tensor"
+      },
+      {
+       "name": "indices",
+       "role": "operand",
+       "kind": "tensor"
+      },
+      {
+       "name": "output_param_decls",
+       "role": "param_decls",
+       "kind": "param_decls"
+      }
+     ]
+    }
+   ],
+   "n_results": 1,
+   "n_results_known": true
+  },
+  {
+   "class": "MoScatterNdMaxOp",
+   "mlir_name": "rmo.mo.scatter_nd.max",
+   "mlir_name_source": "docstring",
+   "summary": "Produces an output tensor by scattering slices from updates to input according to indices, and it stores the maximum of any duplicate indices.",
+   "doc": "Produces an output tensor by scattering slices from updates to input\naccording to indices, and it stores the maximum of any duplicate indices.\n\nSpecifically, it treats the last dimension of indices as a vector of\nintegers used to index into a copy of the input, and it replaces that\nresulting slice (or scalar) with corresponding slice (or scalar) from\nthe updates tensor.\n\nNote that the `slice` shows up in case where the index vector length is\nshorter than the rank of input tensor, i.e., the op will slice the leading\ndimensions.\n\nExample:\n\n```mlir\n  %input:   !mo.tensor<[4, 2], f32>\n  %updates: !mo.tensor<[1, 3, 2], f32>\n  %indices: !mo.tensor<[1, 3, 1], si64>\n  %res = rmo.mo.scatter_nd.max(%inputs, %updates, %indices) : (\n    !mo.tensor<[4, 2], f32>, !mo.tensor<[1, 3, 2], f32>, !mo.tensor<[1, 3, 1], si64>\n  ) -> !mo.tensor<[4, 2], f32>\n```",
+   "forms": [
+    {
+     "kind": "explicit",
+     "params": [
+      {
+       "name": "result",
+       "role": "result",
+       "kind": "tensor"
+      },
+      {
+       "name": "input",
+       "role": "operand",
+       "kind": "tensor"
+      },
+      {
+       "name": "updates",
+       "role": "operand",
+       "kind": "tensor"
+      },
+      {
+       "name": "indices",
+       "role": "operand",
+       "kind": "tensor"
+      },
+      {
+       "name": "output_param_decls",
+       "role": "param_decls",
+       "kind": "param_decls"
+      }
+     ]
+    }
+   ],
+   "n_results": 1,
+   "n_results_known": true
+  },
+  {
+   "class": "MoScatterNdMinOp",
+   "mlir_name": "rmo.mo.scatter_nd.min",
+   "mlir_name_source": "docstring",
+   "summary": "Produces an output tensor by scattering slices from updates to input according to indices, and it stores the minimum of any duplicate indices.",
+   "doc": "Produces an output tensor by scattering slices from updates to input\naccording to indices, and it stores the minimum of any duplicate indices.\n\nSpecifically, it treats the last dimension of indices as a vector of\nintegers used to index into a copy of the input, and it replaces that\nresulting slice (or scalar) with corresponding slice (or scalar) from\nthe updates tensor.\n\nNote that the `slice` shows up in case where the index vector length is\nshorter than the rank of input tensor, i.e., the op will slice the leading\ndimensions.\n\nExample:\n\n```mlir\n  %input:   !mo.tensor<[4, 2], f32>\n  %updates: !mo.tensor<[1, 3, 2], f32>\n  %indices: !mo.tensor<[1, 3, 1], si64>\n  %res = rmo.mo.scatter_nd.min(%inputs, %updates, %indices) : (\n    !mo.tensor<[4, 2], f32>, !mo.tensor<[1, 3, 2], f32>, !mo.tensor<[1, 3, 1], si64>\n  ) -> !mo.tensor<[4, 2], f32>\n```",
+   "forms": [
+    {
+     "kind": "explicit",
+     "params": [
+      {
+       "name": "result",
+       "role": "result",
+       "kind": "tensor"
+      },
+      {
+       "name": "input",
+       "role": "operand",
+       "kind": "tensor"
+      },
+      {
+       "name": "updates",
+       "role": "operand",
+       "kind": "tensor"
+      },
+      {
+       "name": "indices",
+       "role": "operand",
+       "kind": "tensor"
+      },
+      {
+       "name": "output_param_decls",
+       "role": "param_decls",
+       "kind": "param_decls"
+      }
+     ]
+    }
+   ],
+   "n_results": 1,
+   "n_results_known": true
+  },
+  {
+   "class": "MoScatterNdMulOp",
+   "mlir_name": "rmo.mo.scatter_nd.mul",
+   "mlir_name_source": "docstring",
+   "summary": "Produces an output tensor by scattering slices from updates to input according to indices, and it stores the product of any duplicate indices.",
+   "doc": "Produces an output tensor by scattering slices from updates to input\naccording to indices, and it stores the product of any duplicate indices.\n\nSpecifically, it treats the last dimension of indices as a vector of\nintegers used to index into a copy of the input, and it replaces that\nresulting slice (or scalar) with corresponding slice (or scalar) from\nthe updates tensor.\n\nNote that the `slice` shows up in case where the index vector length is\nshorter than the rank of input tensor, i.e., the op will slice the leading\ndimensions.\n\nExample:\n\n```mlir\n  %input:   !mo.tensor<[4, 2], f32>\n  %updates: !mo.tensor<[1, 3, 2], f32>\n  %indices: !mo.tensor<[1, 3, 1], si64>\n  %res = rmo.mo.scatter_nd.mul(%inputs, %updates, %indices) : (\n    !mo.tensor<[4, 2], f32>, !mo.tensor<[1, 3, 2], f32>, !mo.tensor<[1, 3, 1], si64>\n  ) -> !mo.tensor<[4, 2], f32>\n```",
+   "forms": [
+    {
+     "kind": "explicit",
+     "params": [
+      {
+       "name": "result",
+       "role": "result",
+       "kind": "tensor"
+      },
+      {
+       "name": "input",
+       "role": "operand",
+       "kind": "tensor"
+      },
+      {
+       "name": "updates",
+       "role": "operand",
+       "kind": "tensor"
+      },
+      {
+       "name": "indices",
+       "role": "operand",
+       "kind": "tensor"
+      },
+      {
+       "name": "output_param_decls",
+       "role": "param_decls",
+       "kind": "param_decls"
+      }
+     ]
+    }
+   ],
+   "n_results": 1,
+   "n_results_known": true
+  },
+  {
+   "class": "MoScatterNdOp",
+   "mlir_name": "rmo.mo.scatter_nd",
+   "mlir_name_source": "docstring",
+   "summary": "Produces an output tensor by scattering slices from updates to input according to indices.",
+   "doc": "Produces an output tensor by scattering slices from updates to input\naccording to indices.\n\nSpecifically, it treats the last dimension of indices as a vector of\nintegers used to index into a copy of the input, and it replaces that\nresulting slice (or scalar) with corresponding slice (or scalar) from\nthe updates tensor.\n\nNote that the `slice` shows up in case where the index vector length is\nshorter than the rank of input tensor, i.e., the op will slice the leading\ndimensions.\n\nExample:\n\n```mlir\n  %input:   !mo.tensor<[4, 2], f32>\n  %updates: !mo.tensor<[1, 3, 2], f32>\n  %indices: !mo.tensor<[1, 3, 1], si64>\n  %res = rmo.mo.scatter_nd(%inputs, %updates, %indices) : (\n    !mo.tensor<[4, 2], f32>, !mo.tensor<[1, 3, 2], f32>, !mo.tensor<[1, 3, 1], si64>\n  ) -> !mo.tensor<[4, 2], f32>\n```",
+   "forms": [
+    {
+     "kind": "explicit",
+     "params": [
+      {
+       "name": "result",
+       "role": "result",
+       "kind": "tensor"
+      },
+      {
+       "name": "input",
+       "role": "operand",
+       "kind": "tensor"
+      },
+      {
+       "name": "updates",
+       "role": "operand",
+       "kind": "tensor"
+      },
+      {
+       "name": "indices",
+       "role": "operand",
+       "kind": "tensor"
+      },
+      {
+       "name": "output_param_decls",
+       "role": "param_decls",
+       "kind": "param_decls"
+      }
+     ]
+    }
+   ],
+   "n_results": 1,
+   "n_results_known": true
+  },
+  {
+   "class": "MoScatterOp",
+   "mlir_name": "rmo.mo.scatter",
+   "mlir_name_source": "docstring",
+   "summary": "Produces an output tensor by scattering elements from updates to input according to indices.",
+   "doc": "Produces an output tensor by scattering elements from updates to input\naccording to indices.\n\nIt takes in `input`, `updates` and `indices` tensors of the same rank, and a\nscalar `axis` compile-time `index` attribute. The output is a copy of the\ninput, with certain elements updated based on `updates` and `indices`.\n\nFor each entry in `indices`, the target index for `input` is obtained by\nmaking a copy of the entry's own index, and then updating the `axis`\ndimension with the value of the `indices` entry. Then the element at this\ntarget index is updated to the corresponding entry in `updates`.\n\nFor instance, in a 2D tensor case, the update corresponding to the [i][j] entry\nis performed as below:\n```\n  output[indices[i][j]][j] = updates[i][j] if axis = 0,\n  output[i][indices[i][j]] = updates[i][j] if axis = 1,\n```\n\nExample:\n\n```mlir\n  %input:   !mo.tensor<[4, 4], f32>\n  %updates: !mo.tensor<[2, 3], f32>\n  %indices: !mo.tensor<[2, 3], si64>\n  %res = rmo.mo.scatter(%inputs, %updates, %indices) {axis = 0 : index} : (\n    !mo.tensor<[4, 4], f32>, !mo.tensor<[2, 3], f32>, !mo.tensor<[2, 3], si64>\n  ) -> !mo.tensor<[4, 4], f32>\n```",
+   "forms": [
+    {
+     "kind": "explicit",
+     "params": [
+      {
+       "name": "result",
+       "role": "result",
+       "kind": "tensor"
+      },
+      {
+       "name": "input",
+       "role": "operand",
+       "kind": "tensor"
+      },
+      {
+       "name": "updates",
+       "role": "operand",
+       "kind": "tensor"
+      },
+      {
+       "name": "indices",
+       "role": "operand",
+       "kind": "tensor"
+      },
+      {
+       "name": "axis",
+       "role": "attribute",
+       "kind": "index"
+      },
+      {
+       "name": "output_param_decls",
+       "role": "param_decls",
+       "kind": "param_decls"
+      }
+     ]
+    }
+   ],
+   "n_results": 1,
+   "n_results_known": true
+  },
+  {
+   "class": "MoSelectOp",
+   "mlir_name": "rmo.mo.select",
+   "mlir_name_source": "docstring",
+   "summary": "Returns `cond ? x : y` (element-wise), where `cond`, `x` and `y` are input tensors.",
+   "doc": "Returns `cond ? x : y` (element-wise), where `cond`, `x` and `y` are input\ntensors.\n\nExample:\n\n```mlir\n  %cond: !mo.tensor<[2, 3], bool>\n  %x: !mo.tensor<[2, 3], f32>\n  %y: !mo.tensor<[2, 3], f32>\n  %res = rmo.mo.select(%cond, %x, %y) : !mo.tensor<[2, 3], f32>\n```",
+   "forms": [
+    {
+     "kind": "explicit",
+     "params": [
+      {
+       "name": "result",
+       "role": "result",
+       "kind": "tensor"
+      },
+      {
+       "name": "cond",
+       "role": "operand",
+       "kind": "tensor"
+      },
+      {
+       "name": "x",
+       "role": "operand",
+       "kind": "tensor"
+      },
+      {
+       "name": "y",
+       "role": "operand",
+       "kind": "tensor"
+      },
+      {
+       "name": "output_param_decls",
+       "role": "param_decls",
+       "kind": "param_decls"
+      }
+     ]
+    }
+   ],
+   "n_results": 1,
+   "n_results_known": true
+  },
+  {
+   "class": "MoShapeOfOp",
+   "mlir_name": "rmo.mo.shape_of",
+   "mlir_name_source": "derived",
+   "summary": "Calculates the runtime shape of the given tensor as a tensor.",
+   "doc": "Calculates the runtime shape of the given tensor as a tensor.",
+   "forms": [
+    {
+     "kind": "explicit",
+     "params": [
+      {
+       "name": "shape",
+       "role": "result",
+       "kind": "tensor"
+      },
+      {
+       "name": "input",
+       "role": "operand",
+       "kind": "tensor"
+      },
+      {
+       "name": "output_param_decls",
+       "role": "param_decls",
+       "kind": "param_decls"
+      }
+     ]
+    }
+   ],
+   "n_results": 1,
+   "n_results_known": true
+  },
+  {
+   "class": "MoSigmoidOp",
+   "mlir_name": "rmo.mo.sigmoid",
+   "mlir_name_source": "docstring",
+   "summary": "Returns the sigmoid activation `1 / (1 + exp(-x))`, where `x` is the input tensor.",
+   "doc": "Returns the sigmoid activation `1 / (1 + exp(-x))`, where `x` is the input\ntensor.\n\nExample:\n\n```mlir\n  %arg: !mo.tensor<[2, 3], f32>\n  %res = rmo.mo.sigmoid(%arg) : !mo.tensor<[2, 3], f32>\n```",
+   "forms": [
+    {
+     "kind": "explicit",
+     "params": [
+      {
+       "name": "result",
+       "role": "result",
+       "kind": "tensor"
+      },
+      {
+       "name": "input",
+       "role": "operand",
+       "kind": "tensor"
+      },
+      {
+       "name": "output_param_decls",
+       "role": "param_decls",
+       "kind": "param_decls"
+      }
+     ]
+    }
+   ],
+   "n_results": 1,
+   "n_results_known": true
+  },
+  {
+   "class": "MoSiluOp",
+   "mlir_name": "rmo.mo.silu",
+   "mlir_name_source": "docstring",
+   "summary": "Returns the SiLU (Swish) activation `x * sigmoid(x)`, where `x` is the input tensor.",
+   "doc": "Returns the SiLU (Swish) activation `x * sigmoid(x)`, where `x` is the input\ntensor.\n\nExample:\n\n```mlir\n  %arg: !mo.tensor<[2, 3], f32>\n  %res = rmo.mo.silu(%arg) : !mo.tensor<[2, 3], f32>\n```",
+   "forms": [
+    {
+     "kind": "explicit",
+     "params": [
+      {
+       "name": "result",
+       "role": "result",
+       "kind": "tensor"
+      },
+      {
+       "name": "input",
+       "role": "operand",
+       "kind": "tensor"
+      },
+      {
+       "name": "output_param_decls",
+       "role": "param_decls",
+       "kind": "param_decls"
+      }
+     ]
+    }
+   ],
+   "n_results": 1,
+   "n_results_known": true
+  },
+  {
+   "class": "MoSinOp",
+   "mlir_name": "rmo.mo.sin",
+   "mlir_name_source": "docstring",
+   "summary": "Returns `sin(x)`, where `x` is input tensor.",
+   "doc": "Returns `sin(x)`, where `x` is input tensor.\n\nExample:\n```mlir\n  %arg : !mo.tensor<[2, 3], f32>\n  %res = rmo.mo.sin(%arg) : !mo.tensor<[2, 3], f32>\n```",
+   "forms": [
+    {
+     "kind": "explicit",
+     "params": [
+      {
+       "name": "result",
+       "role": "result",
+       "kind": "tensor"
+      },
+      {
+       "name": "input",
+       "role": "operand",
+       "kind": "tensor"
+      },
+      {
+       "name": "output_param_decls",
+       "role": "param_decls",
+       "kind": "param_decls"
+      }
+     ]
+    }
+   ],
+   "n_results": 1,
+   "n_results_known": true
+  },
+  {
+   "class": "MoSliceOp",
+   "mlir_name": "rmo.mo.slice",
+   "mlir_name_source": "docstring",
+   "summary": "Returns a new tensor with a subset of the elements from an N-dimensional `input` tensor. The subset is chosen using the `start`, `stop`, and `step` 1D index tensors; each index tensor has N elements, one for each dimension of the `input` tensor.",
+   "doc": "Returns a new tensor with a subset of the elements from an N-dimensional\n`input` tensor. The subset is chosen using the `start`, `stop`, and `step`\n1D index tensors; each index tensor has N elements, one for each dimension\nof the `input` tensor.\n\nThe semantics follows the numpy index semantics, such that\n1. For each dimension `i`, `start[i]:stop[i]:step[i]` represents the\n   \"indexing\" along that dimension.\n2. Negative indices are supported for `start` and `stop`, e.g., -1\n   represents the largest axis.\n3. Out of bound indices in `start` and `stop` will be clamped to\n   [-dim, dim], where `dim` is the dimension in the corresponding axis.\n4. `step` must contain nonzero elements. Negative steps are supported.\n\nNote: the order in which negative indices are resolved matches that of\npython for `start:\n\n1. Normalize negative indices by adding the dimension size.\n2. Apply clipping logic.\n\nThis means the equivalent mo.slice for l[:-1:-1] returns an empty result.\nIf we want to reverse the values in `l` we should do l[:-N-1:-1] where\nN is the dimension size. Numbers smaller than -N-1 should also work.\n\nExample:\n```mlir\n  %input: !mo.tensor<[?, ?], f32>\n  %start: !mo.tensor<[2], si64> // [1, -6]\n  %stop: !mo.tensor<[2], si32>  // [-3, 6]\n  %step: !mo.tensor<[2], si64>  // [5, 1]\n  // equivalent to this in numpy: `input[1:-3:5, -6:6:1]`\n  %res = rmo.mo.slice(%input, %start, %stop, %step) : (\n    !mo.tensor<[10, 10], f32>,\n    !mo.tensor<[2], si64>,\n    !mo.tensor<[2], si32>,\n    !mo.tensor<[2], si64>\n  ) -> !mo.tensor<[?, ?], f32>\n```",
+   "forms": [
+    {
+     "kind": "explicit",
+     "params": [
+      {
+       "name": "result",
+       "role": "result",
+       "kind": "tensor"
+      },
+      {
+       "name": "input",
+       "role": "operand",
+       "kind": "tensor"
+      },
+      {
+       "name": "start",
+       "role": "operand",
+       "kind": "tensor"
+      },
+      {
+       "name": "stop",
+       "role": "operand",
+       "kind": "tensor"
+      },
+      {
+       "name": "step",
+       "role": "operand",
+       "kind": "tensor"
+      },
+      {
+       "name": "output_param_decls",
+       "role": "param_decls",
+       "kind": "param_decls"
+      }
+     ]
+    }
+   ],
+   "n_results": 1,
+   "n_results_known": true
+  },
+  {
+   "class": "MoReduceSoftmaxOp",
+   "mlir_name": "rmo.mo.reduce.softmax",
+   "mlir_name_source": "docstring",
+   "summary": "Returns `exp(input) / sum(exp(input))`, where `x` is input tensor.",
+   "doc": "Returns `exp(input) / sum(exp(input))`, where `x` is input tensor.\n\nThe `sum` reduction is applieed along the last axis.\n\nExample:\n\n```mlir\n  %arg: !mo.tensor<[2, 3], f32>\n  %res = rmo.mo.reduce.softmax(%arg) : !mo.tensor<[2, 3], f32>\n```",
+   "forms": [
+    {
+     "kind": "explicit",
+     "params": [
+      {
+       "name": "result",
+       "role": "result",
+       "kind": "tensor"
+      },
+      {
+       "name": "input",
+       "role": "operand",
+       "kind": "tensor"
+      },
+      {
+       "name": "axis",
+       "role": "attribute",
+       "kind": "index"
+      },
+      {
+       "name": "output_param_decls",
+       "role": "param_decls",
+       "kind": "param_decls"
+      }
+     ]
+    }
+   ],
+   "n_results": 1,
+   "n_results_known": true
+  },
+  {
+   "class": "MoSqrtOp",
+   "mlir_name": "rmo.mo.sqrt",
+   "mlir_name_source": "docstring",
+   "summary": "Returns `sqrt(x)`, where `x` is the input tensor.",
+   "doc": "Returns `sqrt(x)`, where `x` is the input tensor.\n\nExample:\n\n```mlir\n  %arg: !mo.tensor<[2, 3], f32>\n  %res = rmo.mo.sqrt(%arg) : !mo.tensor<[2, 3], f32>\n```",
+   "forms": [
+    {
+     "kind": "explicit",
+     "params": [
+      {
+       "name": "result",
+       "role": "result",
+       "kind": "tensor"
+      },
+      {
+       "name": "input",
+       "role": "operand",
+       "kind": "tensor"
+      },
+      {
+       "name": "output_param_decls",
+       "role": "param_decls",
+       "kind": "param_decls"
+      }
+     ]
+    }
+   ],
+   "n_results": 1,
+   "n_results_known": true
+  },
+  {
+   "class": "MoSqueezeShapeOp",
+   "mlir_name": "rmo.mo.squeeze_shape",
+   "mlir_name_source": "docstring",
+   "summary": "Calculates the shape from squeeze like operators. Given an input shape vector representing a tensor of rank `N`, and a list of indices of length `M`, returns a new shape vector representing a tensor of rank `N - M`. The indices represent the 0-based index of dimensions in the original rank `N` tensor.",
+   "doc": "Calculates the shape from squeeze like operators. Given an input shape\nvector representing a tensor of rank `N`, and a list of indices of length\n`M`, returns a new shape vector representing a tensor of rank `N - M`. The\nindices represent the 0-based index of dimensions in the original rank `N`\ntensor.\n\nThe indicated indices must represent dimensions of size 1. If\nan index does not point to a dimension to size 1, an error is thrown\ninstead.\n\nThis operator supports negative indexing with python-like semantics.\nThat is all indices must be in [-N, N), if an index is < 0, it is as if\nwe added `N` to it.\n\nExample:\n\n```mlir\n  %input_shape : !mo.tensor<[8], si32>\n  %indices : !mo.tensor<[4], si32>\n  %res = rmo.mo.squeeze_shape(%input_shape, %indices) : (!mo.tensor<[8], si32>, !mo.tensor<[4], si32>) -> !mo.tensor<[4], si32>\n```",
+   "forms": [
+    {
+     "kind": "explicit",
+     "params": [
+      {
+       "name": "result",
+       "role": "result",
+       "kind": "tensor"
+      },
+      {
+       "name": "input_shape",
+       "role": "operand",
+       "kind": "tensor"
+      },
+      {
+       "name": "remove_indices",
+       "role": "operand",
+       "kind": "tensor"
+      },
+      {
+       "name": "output_param_decls",
+       "role": "param_decls",
+       "kind": "param_decls"
+      }
+     ]
+    }
+   ],
+   "n_results": 1,
+   "n_results_known": true
+  },
+  {
+   "class": "MoSubOp",
+   "mlir_name": "rmo.mo.sub",
+   "mlir_name_source": "derived",
+   "summary": "Does a non-broadcasted elementwise subtraction.",
+   "doc": "Does a non-broadcasted elementwise subtraction.",
+   "forms": [
+    {
+     "kind": "explicit",
+     "params": [
+      {
+       "name": "result",
+       "role": "result",
+       "kind": "tensor"
+      },
+      {
+       "name": "input_x",
+       "role": "operand",
+       "kind": "tensor"
+      },
+      {
+       "name": "input_y",
+       "role": "operand",
+       "kind": "tensor"
+      },
+      {
+       "name": "output_param_decls",
+       "role": "param_decls",
+       "kind": "param_decls"
+      }
+     ]
+    }
+   ],
+   "n_results": 1,
+   "n_results_known": true
+  },
+  {
+   "class": "MoTanhOp",
+   "mlir_name": "rmo.mo.tanh",
+   "mlir_name_source": "docstring",
+   "summary": "Computes `tanh(x)`, where `x` is input tensor.",
+   "doc": "Computes `tanh(x)`, where `x` is input tensor.\n\nExample:\n\n```mlir\n  %arg: !mo.tensor<[2, 3], f32>\n  %res = rmo.mo.tanh(%arg) : !mo.tensor<[2, 3], f32>\n```",
+   "forms": [
+    {
+     "kind": "explicit",
+     "params": [
+      {
+       "name": "result",
+       "role": "result",
+       "kind": "tensor"
+      },
+      {
+       "name": "input",
+       "role": "operand",
+       "kind": "tensor"
+      },
+      {
+       "name": "output_param_decls",
+       "role": "param_decls",
+       "kind": "param_decls"
+      }
+     ]
+    }
+   ],
+   "n_results": 1,
+   "n_results_known": true
+  },
+  {
+   "class": "MoTileOp",
+   "mlir_name": "rmo.mo.tile",
+   "mlir_name_source": "docstring",
+   "summary": "Returns a new Tensor as the result of copying the input tensor N_i times on each dimension, where N_i = tiles[i].",
+   "doc": "Returns a new Tensor as the result of copying the input tensor N_i times\non each dimension, where N_i = tiles[i].\n\nThe i-th dimension of output shape will be the ith dimension of input shape\nmultiplied by N_i.\n\nExample:\n\n```mlir\n  %input : !mo.tensor<[2, 3], f32>\n  %repeats : !mo.tensor<[2], si64>\n  %res = rmo.mo.tile(%input, %repeats) : (\n    !mo.tensor<[2, 3], f32>, !mo.tensor<[2], si64>) -> !mo.tensor<[?, ?], f32>\n```",
+   "forms": [
+    {
+     "kind": "explicit",
+     "params": [
+      {
+       "name": "result",
+       "role": "result",
+       "kind": "tensor"
+      },
+      {
+       "name": "input",
+       "role": "operand",
+       "kind": "tensor"
+      },
+      {
+       "name": "repeats",
+       "role": "operand",
+       "kind": "tensor"
+      },
+      {
+       "name": "output_param_decls",
+       "role": "param_decls",
+       "kind": "param_decls"
+      }
+     ]
+    }
+   ],
+   "n_results": 1,
+   "n_results_known": true
+  },
+  {
+   "class": "MoTransposeOp",
+   "mlir_name": "rmo.mo.transpose",
+   "mlir_name_source": "docstring",
+   "summary": "Returns a new Tensor as the result of permuting the dimensions of the input tensor according to the value of perm.",
+   "doc": "Returns a new Tensor as the result of permuting the dimensions of the input\ntensor according to the value of perm.\n\nNote that `perm` must contain unique values from `[0, input_rank)`.\n\nExample:\n\n```mlir\n  %input : !mo.tensor<[2, 3], f32>\n  %perm : !mo.tensor<[2], si64>\n  %res = rmo.mo.transpose(%input, %perm) : (\n    !mo.tensor<[2, 3], f32>, !mo.tensor<[2], si64>) -> !mo.tensor<[3, 2], f32>\n\n  %input : !mo.tensor<[?, 5, ?], f32>\n  %perm : !mo.tensor<[3], si32>\n  %res = rmo.mo.transpose(%input, %perm) : (\n    !mo.tensor<[?, 5, ?], f32>, !mo.tensor<[3], si32>\n  ) -> !mo.tensor<[?, ?, 5], f32>\n```",
+   "forms": [
+    {
+     "kind": "explicit",
+     "params": [
+      {
+       "name": "result",
+       "role": "result",
+       "kind": "tensor"
+      },
+      {
+       "name": "input",
+       "role": "operand",
+       "kind": "tensor"
+      },
+      {
+       "name": "perm",
+       "role": "operand",
+       "kind": "tensor"
+      },
+      {
+       "name": "output_param_decls",
+       "role": "param_decls",
+       "kind": "param_decls"
+      }
+     ]
+    }
+   ],
+   "n_results": 1,
+   "n_results_known": true
+  },
+  {
+   "class": "MoTruncOp",
+   "mlir_name": "rmo.mo.trunc",
+   "mlir_name_source": "docstring",
+   "summary": "Returns the elementwise integer from truncating the decimal. Also known as round-toward-zero.",
+   "doc": "Returns the elementwise integer from truncating the decimal. Also known\nas round-toward-zero.\n\n```mlir\n  %arg: !mo.tensor<[2, 3], f32>\n  %res = rmo.mo.trunc(%arg) : !mo.tensor<[2, 3], f32>\n```",
+   "forms": [
+    {
+     "kind": "explicit",
+     "params": [
+      {
+       "name": "result",
+       "role": "result",
+       "kind": "tensor"
+      },
+      {
+       "name": "input",
+       "role": "operand",
+       "kind": "tensor"
+      },
+      {
+       "name": "output_param_decls",
+       "role": "param_decls",
+       "kind": "param_decls"
+      }
+     ]
+    }
+   ],
+   "n_results": 1,
+   "n_results_known": true
+  },
+  {
+   "class": "MoXorOp",
+   "mlir_name": "rmo.mo.xor",
+   "mlir_name_source": "docstring",
+   "summary": "Returns `x xor y`, where `x` and `y` are input boolean tensors.",
+   "doc": "Returns `x xor y`, where `x` and `y` are input boolean tensors.\n\nExample:\n\n```mlir\n  %lhs: !mo.tensor<[2, 3], bool>\n  %rhs: !mo.tensor<[2, 3], bool>\n  %res = rmo.mo.xor(%lhs, %rhs) : (!mo.tensor<[2, 3], bool>,\n                                  !mo.tensor<[2, 3], bool>\n                                  ) -> !mo.tensor<[2, 3], bool>\n```",
+   "forms": [
+    {
+     "kind": "explicit",
+     "params": [
+      {
+       "name": "result",
+       "role": "result",
+       "kind": "tensor"
+      },
+      {
+       "name": "input_x",
+       "role": "operand",
+       "kind": "tensor"
+      },
+      {
+       "name": "input_y",
+       "role": "operand",
+       "kind": "tensor"
+      },
+      {
+       "name": "output_param_decls",
+       "role": "param_decls",
+       "kind": "param_decls"
+      }
+     ]
+    }
+   ],
+   "n_results": 1,
+   "n_results_known": true
+  },
+  {
+   "class": "AddOp",
+   "mlir_name": "rmo.add",
+   "mlir_name_source": "derived",
+   "summary": "A flexible binary elementwise add operation with implicit broadcasting and implicit dtype promotion.",
+   "doc": "A flexible binary elementwise add operation with implicit broadcasting and implicit dtype promotion.",
+   "forms": [
+    {
+     "kind": "explicit",
+     "params": [
+      {
+       "name": "result",
+       "role": "result",
+       "kind": "tensor"
+      },
+      {
+       "name": "input_x",
+       "role": "operand",
+       "kind": "tensor"
+      },
+      {
+       "name": "input_y",
+       "role": "operand",
+       "kind": "tensor"
+      },
+      {
+       "name": "output_param_decls",
+       "role": "param_decls",
+       "kind": "param_decls"
+      }
+     ]
+    },
+    {
+     "kind": "inferred",
+     "params": [
+      {
+       "name": "input_x",
+       "role": "operand",
+       "kind": "tensor"
+      },
+      {
+       "name": "input_y",
+       "role": "operand",
+       "kind": "tensor"
+      },
+      {
+       "name": "output_param_decls",
+       "role": "param_decls",
+       "kind": "param_decls"
+      }
+     ]
+    },
+    {
+     "kind": "inferred",
+     "params": [
+      {
+       "name": "input_x",
+       "role": "operand",
+       "kind": "tensor"
+      },
+      {
+       "name": "input_y",
+       "role": "operand",
+       "kind": "tensor"
+      },
+      {
+       "name": "output_param_decls",
+       "role": "param_decls",
+       "kind": "param_decls",
+       "default": true
+      }
+     ]
+    }
+   ],
+   "n_results": 1,
+   "n_results_known": true
+  },
+  {
+   "class": "AndOp",
+   "mlir_name": "rmo.and",
+   "mlir_name_source": "docstring",
+   "summary": "A flexible binary elementwise and comparison operation with implicit broadcasting.",
+   "doc": "A flexible binary elementwise and comparison operation with implicit broadcasting.\n\nReturns elementwise `x & y`, where `x` and `y` are boolean input tensors.\n\nExample:\n\n```mlir\n  %lhs: !mo.tensor<[2, 2, 3], bool>\n  %rhs: !mo.tensor<[2, 3], bool>\n  %res = rmo.and(%lhs, %rhs) : (!mo.tensor<[2, 2, 3], bool>,\n                                !mo.tensor<[2, 3], bool>\n                                ) -> !mo.tensor<[2, 2, 3], bool>\n```",
+   "forms": [
+    {
+     "kind": "explicit",
+     "params": [
+      {
+       "name": "result",
+       "role": "result",
+       "kind": "tensor"
+      },
+      {
+       "name": "input_x",
+       "role": "operand",
+       "kind": "tensor"
+      },
+      {
+       "name": "input_y",
+       "role": "operand",
+       "kind": "tensor"
+      },
+      {
+       "name": "output_param_decls",
+       "role": "param_decls",
+       "kind": "param_decls"
+      }
+     ]
+    },
+    {
+     "kind": "inferred",
+     "params": [
+      {
+       "name": "input_x",
+       "role": "operand",
+       "kind": "tensor"
+      },
+      {
+       "name": "input_y",
+       "role": "operand",
+       "kind": "tensor"
+      },
+      {
+       "name": "output_param_decls",
+       "role": "param_decls",
+       "kind": "param_decls"
+      }
+     ]
+    },
+    {
+     "kind": "inferred",
+     "params": [
+      {
+       "name": "input_x",
+       "role": "operand",
+       "kind": "tensor"
+      },
+      {
+       "name": "input_y",
+       "role": "operand",
+       "kind": "tensor"
+      },
+      {
+       "name": "output_param_decls",
+       "role": "param_decls",
+       "kind": "param_decls",
+       "default": true
+      }
+     ]
+    }
+   ],
+   "n_results": 1,
+   "n_results_known": true
+  },
+  {
+   "class": "AvgPoolOp",
+   "mlir_name": "rmo.avg_pool",
+   "mlir_name_source": "docstring",
+   "summary": "Computes average pooling with the given filter shape, strides, and dilations.",
+   "doc": "Computes average pooling with the given filter shape, strides, and dilations.\n\nFor now the op only supports 2d average pooling (so input must be\n4D), with the following layout assumption:\n- input has layout NHWC, i.e., (batch_size, height, width, in_channels)\n\nAll hyperparameters (i.e. strides, dilations, padding) must be of rank 1, or\nunranked. If the input has static rank, all hyperparameters with static\nshape must have sizes of `input_rank - 2`, except padding, which must have size\n`2 * (input_rank - 2)`. Individual elements in the hyperparameters applies to\ncorresponding dimensions of the input (after ignoring the batch and channel dimensions),\nwith padding representing a before/after pair for each axis. The padding values\nare expected to take the form (pad_dim1_before, pad_dim1_after, pad_dim2_before,\npad_dim2_after...). In 2D Convolution, dim1 here represents H and dim2 represents W.\n\nExample:\n\n```mlir\n%res = rmo.avg_pool(%input) {\n  filter_shape = #mosh<ape<2, 3>> : !mosh.ape\n  strides = #mosh<ape<2, 3>> : !mosh.ape\n  dilations = #mosh<ape<1, 1>> : !mosh.ape\n  paddings = #mosh<ape<0, 0, 0, 0>> : !mosh.ape\n  ceil_mode = false\n  count_boundary = true\n} : (\n  !mo.tensor<[1, 6, 15, 1], f32>,\n) -> !mo.tensor<[1, 3, 5, 1], f32>\n```",
+   "forms": [
+    {
+     "kind": "explicit",
+     "params": [
+      {
+       "name": "result",
+       "role": "result",
+       "kind": "tensor"
+      },
+      {
+       "name": "input",
+       "role": "operand",
+       "kind": "tensor"
+      },
+      {
+       "name": "filter_shape",
+       "role": "attribute",
+       "kind": "shape"
+      },
+      {
+       "name": "strides",
+       "role": "attribute",
+       "kind": "shape"
+      },
+      {
+       "name": "dilations",
+       "role": "attribute",
+       "kind": "shape"
+      },
+      {
+       "name": "paddings",
+       "role": "attribute",
+       "kind": "shape"
+      },
+      {
+       "name": "ceil_mode",
+       "role": "attribute",
+       "kind": "bool_attr"
+      },
+      {
+       "name": "count_boundary",
+       "role": "attribute",
+       "kind": "bool_attr"
+      }
+     ]
+    },
+    {
+     "kind": "inferred",
+     "params": [
+      {
+       "name": "input",
+       "role": "operand",
+       "kind": "tensor"
+      },
+      {
+       "name": "filter_shape",
+       "role": "attribute",
+       "kind": "shape"
+      },
+      {
+       "name": "strides",
+       "role": "attribute",
+       "kind": "shape"
+      },
+      {
+       "name": "dilations",
+       "role": "attribute",
+       "kind": "shape"
+      },
+      {
+       "name": "paddings",
+       "role": "attribute",
+       "kind": "shape"
+      },
+      {
+       "name": "ceil_mode",
+       "role": "attribute",
+       "kind": "bool_attr"
+      },
+      {
+       "name": "count_boundary",
+       "role": "attribute",
+       "kind": "bool_attr"
+      }
+     ]
+    },
+    {
+     "kind": "inferred",
+     "params": [
+      {
+       "name": "input",
+       "role": "operand",
+       "kind": "tensor"
+      },
+      {
+       "name": "filter_shape",
+       "role": "attribute",
+       "kind": "shape"
+      },
+      {
+       "name": "strides",
+       "role": "attribute",
+       "kind": "shape"
+      },
+      {
+       "name": "dilations",
+       "role": "attribute",
+       "kind": "shape"
+      },
+      {
+       "name": "paddings",
+       "role": "attribute",
+       "kind": "shape"
+      },
+      {
+       "name": "ceil_mode",
+       "role": "attribute",
+       "kind": "bool"
+      },
+      {
+       "name": "count_boundary",
+       "role": "attribute",
+       "kind": "bool"
+      }
+     ]
+    }
+   ],
+   "n_results": 1,
+   "n_results_known": true
+  },
+  {
+   "class": "BroadcastLikeOp",
+   "mlir_name": "rmo.broadcast_like",
+   "mlir_name_source": "derived",
+   "summary": "Equivalent to the following:",
+   "doc": "Equivalent to the following:\n\n  ```\n  %shape_of = rmo.shape_of(%like)\n  %result = rmo.broadcast_to(%broadcast, %shape_of)\n  ```",
+   "forms": [
+    {
+     "kind": "explicit",
+     "params": [
+      {
+       "name": "result",
+       "role": "result",
+       "kind": "tensor"
+      },
+      {
+       "name": "input",
+       "role": "operand",
+       "kind": "tensor"
+      },
+      {
+       "name": "shape_like",
+       "role": "operand",
+       "kind": "tensor"
+      },
+      {
+       "name": "output_param_decls",
+       "role": "param_decls",
+       "kind": "param_decls"
+      }
+     ]
+    },
+    {
+     "kind": "inferred",
+     "params": [
+      {
+       "name": "input",
+       "role": "operand",
+       "kind": "tensor"
+      },
+      {
+       "name": "shape_like",
+       "role": "operand",
+       "kind": "tensor"
+      }
+     ]
+    }
+   ],
+   "n_results": 1,
+   "n_results_known": true
+  },
+  {
+   "class": "BroadcastToOp",
+   "mlir_name": "rmo.broadcast_to",
+   "mlir_name_source": "derived",
+   "summary": "Broadcasts the input tensor to the specified shape.",
+   "doc": "Broadcasts the input tensor to the specified shape.\n\nShape restrictions:\n1. `newShape` must have known rank.\n2. `newShape` may not contain any dynamic dimensions.",
+   "forms": [
+    {
+     "kind": "explicit",
+     "params": [
+      {
+       "name": "result",
+       "role": "result",
+       "kind": "tensor"
+      },
+      {
+       "name": "input",
+       "role": "operand",
+       "kind": "tensor"
+      },
+      {
+       "name": "new_shape",
+       "role": "attribute",
+       "kind": "shape"
+      }
+     ]
+    },
+    {
+     "kind": "inferred",
+     "params": [
+      {
+       "name": "input",
+       "role": "operand",
+       "kind": "tensor"
+      },
+      {
+       "name": "new_shape",
+       "role": "attribute",
+       "kind": "shape"
+      }
+     ]
+    }
+   ],
+   "n_results": 1,
+   "n_results_known": true
+  },
+  {
+   "class": "ConvOp",
+   "mlir_name": "rmo.conv",
+   "mlir_name_source": "docstring",
+   "summary": "Computes the convolution product of the input with the given filter, strides, dilations, paddings, and groups.",
+   "doc": "Computes the convolution product of the input with the given filter,\nstrides, dilations, paddings, and groups.\n\nThe op supports 1D-3D convolution, with the following layout assumptions:\n- input has channel last layout. For 2D, that's NHWC, i.e.,\n  (batch_size, height, width, in_channels)\n- filter has layout FCRS, i.e.,\n  (out_channels, in_channels / num_groups, height, width)\n\nThe filter layout is determined by the layout attribute on the filter\ntensor type. Supported layouts include FCRS (default), RSCF (legacy),\nand packed variants like FRSCf.\n\n`strides`, `dilations`, and `padding` are all shape attributes.\nIf the input has static rank, and must have have sizes of `input_rank - 2`,\nexcept padding, which must have size `2 * (input_rank - 2)`. Individual\nelements in the hyperparameters apply to corresponding dimensions of the\ninput (after ignoring the batch and channel dimensions), with padding\nrepresenting a before/after pair for each axis.\n\nThe padding values are expected to take the form (pad_dim1_before,\npad_dim1_after, pad_dim2_before, pad_dim2_after...) and represent padding\n0's before and after the indicated *spatial* dimensions in `input`. In 2D\nConvolution, dim1 here represents H and dim2 represents W. In python like\nsyntax, padding a 2x3 spatial `input` with [0, 1, 2, 1] would yield:\n\n```python\ninput = [\n  [1, 2, 3],\n  [4, 5, 6]\n]\n# Shape is 2x3\n\npadded_input = [\n  [0, 0, 1, 2, 3, 0],\n  [0, 0, 4, 5, 6, 0]\n  [0, 0, 0, 0, 0, 0]\n]\n# Shape is 3x6\n```\n\nThe input, output and filter tensors' ranks must match.\n\nThe number of input and output channels must both be divisible by the number\nof groups `num_groups`.\n\nExample:\n\n```mlir\n%input: !mo.tensor<[10, 5, 5, 32], f32>,\n%filter: !mo.tensor<[64, 32, 2, 2], f32>\n\n%result = rmo.conv(%input, %filter) {\n  strides = #mosh<ape[2, 2]> : !mosh.ape,\n  paddings = #mosh<ape[0, 0, 0, 0]> : !mosh.ape,\n  dilations = #mosh<ape[1, 1]> : !mosh.ape,\n  num_groups = 1 : si64\n} : (\n  !mo.tensor<[10, 5, 5, 32], f32>, !mo.tensor<[64, 32, 2, 2], f32>\n) -> !mo.tensor<[10, 4, 4, 64], f32>\n```",
+   "forms": [
+    {
+     "kind": "explicit",
+     "params": [
+      {
+       "name": "result",
+       "role": "result",
+       "kind": "tensor"
+      },
+      {
+       "name": "input",
+       "role": "operand",
+       "kind": "tensor"
+      },
+      {
+       "name": "filter",
+       "role": "operand",
+       "kind": "tensor"
+      },
+      {
+       "name": "strides",
+       "role": "attribute",
+       "kind": "shape"
+      },
+      {
+       "name": "dilations",
+       "role": "attribute",
+       "kind": "shape"
+      },
+      {
+       "name": "paddings",
+       "role": "attribute",
+       "kind": "shape"
+      },
+      {
+       "name": "num_groups",
+       "role": "attribute",
+       "kind": "index"
+      },
+      {
+       "name": "input_layout",
+       "role": "attribute",
+       "kind": "string_attr"
+      }
+     ]
+    },
+    {
+     "kind": "inferred",
+     "params": [
+      {
+       "name": "input",
+       "role": "operand",
+       "kind": "tensor"
+      },
+      {
+       "name": "filter",
+       "role": "operand",
+       "kind": "tensor"
+      },
+      {
+       "name": "strides",
+       "role": "attribute",
+       "kind": "shape"
+      },
+      {
+       "name": "dilations",
+       "role": "attribute",
+       "kind": "shape"
+      },
+      {
+       "name": "paddings",
+       "role": "attribute",
+       "kind": "shape"
+      },
+      {
+       "name": "num_groups",
+       "role": "attribute",
+       "kind": "index"
+      },
+      {
+       "name": "input_layout",
+       "role": "attribute",
+       "kind": "string_attr"
+      }
+     ]
+    },
+    {
+     "kind": "inferred",
+     "params": [
+      {
+       "name": "input",
+       "role": "operand",
+       "kind": "tensor"
+      },
+      {
+       "name": "filter",
+       "role": "operand",
+       "kind": "tensor"
+      },
+      {
+       "name": "strides",
+       "role": "attribute",
+       "kind": "shape"
+      },
+      {
+       "name": "dilations",
+       "role": "attribute",
+       "kind": "shape"
+      },
+      {
+       "name": "paddings",
+       "role": "attribute",
+       "kind": "shape"
+      },
+      {
+       "name": "num_groups",
+       "role": "attribute",
+       "kind": "int"
+      },
+      {
+       "name": "input_layout",
+       "role": "attribute",
+       "kind": "string",
+       "default": true
+      }
+     ]
+    }
+   ],
+   "n_results": 1,
+   "n_results_known": true
+  },
+  {
+   "class": "ConvTransposeOp",
+   "mlir_name": "rmo.conv_transpose",
+   "mlir_name_source": "docstring",
+   "summary": "This op effectively computes the gradient of a convolution with respect to its input (as if the original convolution operation had the same filter and hyperparameters as this op). A visualization of the computation can be found in https://d2l.ai/chapter_computer-vision/transposed-conv.html.",
+   "doc": "This op effectively computes the gradient of a convolution with\nrespect to its input (as if the original convolution operation had the same\nfilter and hyperparameters as this op). A visualization of the computation\ncan be found in https://d2l.ai/chapter_computer-vision/transposed-conv.html.\n\nThe op supports 1D-3D spatial dimensions, with the following layout\nassumptions (note the `out_channel` is w.r.t. the original convolution):\n- input has channel last layout.For 2D, that's NHWC, i.e.,\n  (batch_size, height, width, out_channels)\n- filter has layout RSFC, i.e., (height, width, out_channels, in_channels)\n\nAll hyperparameters (i.e. strides, dilations, padding, output_paddings) must\nbe of rank 1, or unranked. If the input has static rank, all hyperparameters\nwith static shape must have sizes of `input_rank - 2`, except padding, which\nmust have size `2 * (input_rank - 2)`. Individual elements in the\nhyperparameters applies to corresponding dimensions of the input (after\nignoring the batch and channel dimensions), with padding representing a\nbefore/after pair for each axis.\n\nThe padding values are expected to take the form (pad_dim1_before,\npad_dim1_after, pad_dim2_before, pad_dim2_after...) and represent padding\n0's before and after the indicated *spatial* dimensions in `input`. In 2D\nConvTranspose, dim1 here represents H_out and dim2 represents W_out. In\npython like syntax, padding a 2x4 spatial `output` with [0, 1, 2, 1] would\nyield:\n\n```python\noutput = [\n  [1, 2, 3, 4],\n  [5, 6, 7, 8]\n]\n# Shape is 2x4\n\npadded_input = [\n  [3],\n]\n# Shape is 1x1\n```\n\nThe `output_paddings` argument is meant to resolve the ambiguity of multiple\npotential output shapes when any stride is greater than 1. Basically,\nwe'll add `output_paddings[i]` number of zeros at the end of output's ith\naxis. We only support output_paddings = 0.\n\nThe input, output and filter tensors' ranks must match if statically known.\n\nExample:\n\n```mlir\n%res = rmo.conv_transpose(%input, %filter) {\n  strides = #mosh<ape<1, 1>> : !mosh.ape\n  dilations = #mosh<ape<1, 1>> : !mosh.ape\n  paddings = #mosh<ape<0, 0, 0, 0>> : !mosh.ape\n  output_paddings = #mosh<ape<0, 0>> : !mosh.ape\n} : (\n  !mo.tensor<[10, 4, 4, 64], f32>, !mo.tensor<[2, 2, 32, 64], f32>,\n) -> !mo.tensor<[10, 5, 5, 32], f32>\n```",
+   "forms": [
+    {
+     "kind": "explicit",
+     "params": [
+      {
+       "name": "result",
+       "role": "result",
+       "kind": "tensor"
+      },
+      {
+       "name": "input",
+       "role": "operand",
+       "kind": "tensor"
+      },
+      {
+       "name": "filter",
+       "role": "operand",
+       "kind": "tensor"
+      },
+      {
+       "name": "strides",
+       "role": "attribute",
+       "kind": "shape"
+      },
+      {
+       "name": "dilations",
+       "role": "attribute",
+       "kind": "shape"
+      },
+      {
+       "name": "paddings",
+       "role": "attribute",
+       "kind": "shape"
+      },
+      {
+       "name": "output_paddings",
+       "role": "attribute",
+       "kind": "shape"
+      },
+      {
+       "name": "input_layout",
+       "role": "attribute",
+       "kind": "string_attr"
+      }
+     ]
+    },
+    {
+     "kind": "inferred",
+     "params": [
+      {
+       "name": "input",
+       "role": "operand",
+       "kind": "tensor"
+      },
+      {
+       "name": "filter",
+       "role": "operand",
+       "kind": "tensor"
+      },
+      {
+       "name": "strides",
+       "role": "attribute",
+       "kind": "shape"
+      },
+      {
+       "name": "dilations",
+       "role": "attribute",
+       "kind": "shape"
+      },
+      {
+       "name": "paddings",
+       "role": "attribute",
+       "kind": "shape"
+      },
+      {
+       "name": "output_paddings",
+       "role": "attribute",
+       "kind": "shape"
+      },
+      {
+       "name": "input_layout",
+       "role": "attribute",
+       "kind": "string_attr"
+      }
+     ]
+    },
+    {
+     "kind": "inferred",
+     "params": [
+      {
+       "name": "input",
+       "role": "operand",
+       "kind": "tensor"
+      },
+      {
+       "name": "filter",
+       "role": "operand",
+       "kind": "tensor"
+      },
+      {
+       "name": "strides",
+       "role": "attribute",
+       "kind": "shape"
+      },
+      {
+       "name": "dilations",
+       "role": "attribute",
+       "kind": "shape"
+      },
+      {
+       "name": "paddings",
+       "role": "attribute",
+       "kind": "shape"
+      },
+      {
+       "name": "output_paddings",
+       "role": "attribute",
+       "kind": "shape"
+      },
+      {
+       "name": "input_layout",
+       "role": "attribute",
+       "kind": "string",
+       "default": true
+      }
+     ]
+    }
+   ],
+   "n_results": 1,
+   "n_results_known": true
+  },
+  {
+   "class": "DivOp",
+   "mlir_name": "rmo.div",
+   "mlir_name_source": "derived",
+   "summary": "A flexible binary elementwise div operation with implicit broadcasting and implicit dtype promotion.",
+   "doc": "A flexible binary elementwise div operation with implicit broadcasting and implicit dtype promotion.",
+   "forms": [
+    {
+     "kind": "explicit",
+     "params": [
+      {
+       "name": "result",
+       "role": "result",
+       "kind": "tensor"
+      },
+      {
+       "name": "input_x",
+       "role": "operand",
+       "kind": "tensor"
+      },
+      {
+       "name": "input_y",
+       "role": "operand",
+       "kind": "tensor"
+      },
+      {
+       "name": "output_param_decls",
+       "role": "param_decls",
+       "kind": "param_decls"
+      }
+     ]
+    },
+    {
+     "kind": "inferred",
+     "params": [
+      {
+       "name": "input_x",
+       "role": "operand",
+       "kind": "tensor"
+      },
+      {
+       "name": "input_y",
+       "role": "operand",
+       "kind": "tensor"
+      },
+      {
+       "name": "output_param_decls",
+       "role": "param_decls",
+       "kind": "param_decls"
+      }
+     ]
+    },
+    {
+     "kind": "inferred",
+     "params": [
+      {
+       "name": "input_x",
+       "role": "operand",
+       "kind": "tensor"
+      },
+      {
+       "name": "input_y",
+       "role": "operand",
+       "kind": "tensor"
+      },
+      {
+       "name": "output_param_decls",
+       "role": "param_decls",
+       "kind": "param_decls",
+       "default": true
+      }
+     ]
+    }
+   ],
+   "n_results": 1,
+   "n_results_known": true
+  },
+  {
+   "class": "EqualOp",
+   "mlir_name": "rmo.equal",
+   "mlir_name_source": "docstring",
+   "summary": "A flexible binary elementwise equality comparison operation with implicit broadcasting and implicit dtype promotion.",
+   "doc": "A flexible binary elementwise equality comparison operation with implicit broadcasting and implicit dtype promotion.\n\nReturns `x == y`, where `x` and `y` are input tensors.\n\nExample:\n\n```mlir\n  %lhs: !mo.tensor<[2, 2, 3], f32>\n  %rhs: !mo.tensor<[2, 3], f64>\n  %res = rmo.equal(%lhs, %rhs) : (!mo.tensor<[2, 2, 3], f32>,\n                                    !mo.tensor<[2, 3], f64>\n                                    ) -> !mo.tensor<[2, 2, 3], bool>\n```",
+   "forms": [
+    {
+     "kind": "explicit",
+     "params": [
+      {
+       "name": "result",
+       "role": "result",
+       "kind": "tensor"
+      },
+      {
+       "name": "input_x",
+       "role": "operand",
+       "kind": "tensor"
+      },
+      {
+       "name": "input_y",
+       "role": "operand",
+       "kind": "tensor"
+      },
+      {
+       "name": "output_param_decls",
+       "role": "param_decls",
+       "kind": "param_decls"
+      }
+     ]
+    },
+    {
+     "kind": "inferred",
+     "params": [
+      {
+       "name": "input_x",
+       "role": "operand",
+       "kind": "tensor"
+      },
+      {
+       "name": "input_y",
+       "role": "operand",
+       "kind": "tensor"
+      },
+      {
+       "name": "output_param_decls",
+       "role": "param_decls",
+       "kind": "param_decls"
+      }
+     ]
+    },
+    {
+     "kind": "inferred",
+     "params": [
+      {
+       "name": "input_x",
+       "role": "operand",
+       "kind": "tensor"
+      },
+      {
+       "name": "input_y",
+       "role": "operand",
+       "kind": "tensor"
+      },
+      {
+       "name": "output_param_decls",
+       "role": "param_decls",
+       "kind": "param_decls",
+       "default": true
+      }
+     ]
+    }
+   ],
+   "n_results": 1,
+   "n_results_known": true
+  },
+  {
+   "class": "GreaterEqualOp",
+   "mlir_name": "rmo.greater_equal",
+   "mlir_name_source": "docstring",
+   "summary": "A flexible binary elementwise greater than or equal to comparison operation with implicit broadcasting and implicit dtype promotion.",
+   "doc": "A flexible binary elementwise greater than or equal to comparison operation with implicit broadcasting and implicit dtype promotion.\n\nReturns `x >= y`, where `x` and `y` are input tensors.\n\nExample:\n\n```mlir\n  %lhs: !mo.tensor<[2, 2, 3], f32>\n  %rhs: !mo.tensor<[2, 3], f64>\n  %res = rmo.greater_equal(%lhs, %rhs) : (!mo.tensor<[2, 2, 3], f32>,\n                                    !mo.tensor<[2, 3], f64>\n                                    ) -> !mo.tensor<[2, 2, 3], bool>\n```",
+   "forms": [
+    {
+     "kind": "explicit",
+     "params": [
+      {
+       "name": "result",
+       "role": "result",
+       "kind": "tensor"
+      },
+      {
+       "name": "input_x",
+       "role": "operand",
+       "kind": "tensor"
+      },
+      {
+       "name": "input_y",
+       "role": "operand",
+       "kind": "tensor"
+      },
+      {
+       "name": "output_param_decls",
+       "role": "param_decls",
+       "kind": "param_decls"
+      }
+     ]
+    },
+    {
+     "kind": "inferred",
+     "params": [
+      {
+       "name": "input_x",
+       "role": "operand",
+       "kind": "tensor"
+      },
+      {
+       "name": "input_y",
+       "role": "operand",
+       "kind": "tensor"
+      },
+      {
+       "name": "output_param_decls",
+       "role": "param_decls",
+       "kind": "param_decls"
+      }
+     ]
+    },
+    {
+     "kind": "inferred",
+     "params": [
+      {
+       "name": "input_x",
+       "role": "operand",
+       "kind": "tensor"
+      },
+      {
+       "name": "input_y",
+       "role": "operand",
+       "kind": "tensor"
+      },
+      {
+       "name": "output_param_decls",
+       "role": "param_decls",
+       "kind": "param_decls",
+       "default": true
+      }
+     ]
+    }
+   ],
+   "n_results": 1,
+   "n_results_known": true
+  },
+  {
+   "class": "GreaterOp",
+   "mlir_name": "rmo.greater",
+   "mlir_name_source": "docstring",
+   "summary": "A flexible binary elementwise greater than comparison operation with implicit broadcasting and implicit dtype promotion.",
+   "doc": "A flexible binary elementwise greater than comparison operation with implicit broadcasting and implicit dtype promotion.\n\nReturns `x > y`, where `x` and `y` are input tensors.\n\nExample:\n\n```mlir\n  %lhs: !mo.tensor<[2, 2, 3], f32>\n  %rhs: !mo.tensor<[2, 3], f64>\n  %res = rmo.greater(%lhs, %rhs) : (!mo.tensor<[2, 2, 3], f32>,\n                                    !mo.tensor<[2, 3], f64>\n                                    ) -> !mo.tensor<[2, 2, 3], bool>\n```",
+   "forms": [
+    {
+     "kind": "explicit",
+     "params": [
+      {
+       "name": "result",
+       "role": "result",
+       "kind": "tensor"
+      },
+      {
+       "name": "input_x",
+       "role": "operand",
+       "kind": "tensor"
+      },
+      {
+       "name": "input_y",
+       "role": "operand",
+       "kind": "tensor"
+      },
+      {
+       "name": "output_param_decls",
+       "role": "param_decls",
+       "kind": "param_decls"
+      }
+     ]
+    },
+    {
+     "kind": "inferred",
+     "params": [
+      {
+       "name": "input_x",
+       "role": "operand",
+       "kind": "tensor"
+      },
+      {
+       "name": "input_y",
+       "role": "operand",
+       "kind": "tensor"
+      },
+      {
+       "name": "output_param_decls",
+       "role": "param_decls",
+       "kind": "param_decls"
+      }
+     ]
+    },
+    {
+     "kind": "inferred",
+     "params": [
+      {
+       "name": "input_x",
+       "role": "operand",
+       "kind": "tensor"
+      },
+      {
+       "name": "input_y",
+       "role": "operand",
+       "kind": "tensor"
+      },
+      {
+       "name": "output_param_decls",
+       "role": "param_decls",
+       "kind": "param_decls",
+       "default": true
+      }
+     ]
+    }
+   ],
+   "n_results": 1,
+   "n_results_known": true
+  },
+  {
+   "class": "MatmulOp",
+   "mlir_name": "rmo.matmul",
+   "mlir_name_source": "derived",
+   "summary": "Performs general matrix multiplication with broadcasting.",
+   "doc": "Performs general matrix multiplication with broadcasting.\n\nIf the lhs is 1d, it will be reshaped to `1xD`.\nIf the rhs is 1d, it will be reshaped to `Dx1`.\nIn both cases, the addition `1` dimensions will be removed from the output shape.\n\nFor the multiplication, the innermost (rightmost) 2 dimensions are treated as a maxtrix.\nThe lhs matrix will have the shape `MxK`.\nThe rhs matrix will have the shape `KxN`.\nThe output will have the shape `MxN`\nThe `K` dimensions must be equivalent in both matrices.\n\nThe remaining outer dimensions will be broadcasted.\n\nExample shapes with outputs:\n[K] @ [K] -> []\n[5, K] @ [K] -> [5]\n[K] @ [K, 6] -> [6]\n[4, K] @ [K, 6] -> [4, 6]\n[8, 10, 4, K] @ [8, 1, K, 6] -> [8, 10, 4, 6]\n[10, 4, K] @ [K, 6] -> [10, 4, 6]\n[10, 4, K] @ [K] -> [10, 4]\n[K] @ [10, 4, K, 7] -> [10, 4, 7]",
+   "forms": [
+    {
+     "kind": "explicit",
+     "params": [
+      {
+       "name": "result",
+       "role": "result",
+       "kind": "tensor"
+      },
+      {
+       "name": "input_x",
+       "role": "operand",
+       "kind": "tensor"
+      },
+      {
+       "name": "input_y",
+       "role": "operand",
+       "kind": "tensor"
+      }
+     ]
+    },
+    {
+     "kind": "inferred",
+     "params": [
+      {
+       "name": "input_x",
+       "role": "operand",
+       "kind": "tensor"
+      },
+      {
+       "name": "input_y",
+       "role": "operand",
+       "kind": "tensor"
+      }
+     ]
+    }
+   ],
+   "n_results": 1,
+   "n_results_known": true
+  },
+  {
+   "class": "MaxOp",
+   "mlir_name": "rmo.max",
+   "mlir_name_source": "derived",
+   "summary": "A flexible binary elementwise max operation with implicit broadcasting and implicit dtype promotion.",
+   "doc": "A flexible binary elementwise max operation with implicit broadcasting and implicit dtype promotion.",
+   "forms": [
+    {
+     "kind": "explicit",
+     "params": [
+      {
+       "name": "result",
+       "role": "result",
+       "kind": "tensor"
+      },
+      {
+       "name": "input_x",
+       "role": "operand",
+       "kind": "tensor"
+      },
+      {
+       "name": "input_y",
+       "role": "operand",
+       "kind": "tensor"
+      },
+      {
+       "name": "output_param_decls",
+       "role": "param_decls",
+       "kind": "param_decls"
+      }
+     ]
+    },
+    {
+     "kind": "inferred",
+     "params": [
+      {
+       "name": "input_x",
+       "role": "operand",
+       "kind": "tensor"
+      },
+      {
+       "name": "input_y",
+       "role": "operand",
+       "kind": "tensor"
+      },
+      {
+       "name": "output_param_decls",
+       "role": "param_decls",
+       "kind": "param_decls"
+      }
+     ]
+    },
+    {
+     "kind": "inferred",
+     "params": [
+      {
+       "name": "input_x",
+       "role": "operand",
+       "kind": "tensor"
+      },
+      {
+       "name": "input_y",
+       "role": "operand",
+       "kind": "tensor"
+      },
+      {
+       "name": "output_param_decls",
+       "role": "param_decls",
+       "kind": "param_decls",
+       "default": true
+      }
+     ]
+    }
+   ],
+   "n_results": 1,
+   "n_results_known": true
+  },
+  {
+   "class": "MaxPoolOp",
+   "mlir_name": "rmo.max_pool",
+   "mlir_name_source": "docstring",
+   "summary": "Computes max pooling with the given filter shape, strides, and dilations.",
+   "doc": "Computes max pooling with the given filter shape, strides, and dilations.\n\nFor now the op only supports 2d max pooling (so input must be\n4D), with the following layout assumption:\n- input has layout NHWC, i.e., (batch_size, height, width, in_channels)\n\nAll hyperparameters (i.e. strides, dilations, padding) must be of rank 1, or\nunranked. If the input has static rank, all hyperparameters with static\nshape must have sizes of `input_rank - 2`, except padding, which must have size\n`2 * (input_rank - 2)`. Individual elements in the hyperparameters applies to\ncorresponding dimensions of the input (after ignoring the batch and channel dimensions),\nwith padding representing a before/after pair for each axis. The padding values\nare expected to take the form (pad_dim1_before, pad_dim1_after, pad_dim2_before,\npad_dim2_after...). In 2D Convolution, dim1 here represents H and dim2 represents W.\n\nExample:\n\n```mlir\n%res = rmo.max_pool(%input) {\n  filter_shape = #mosh<ape<2, 3>> : !mosh.ape\n  strides = #mosh<ape<2, 3>> : !mosh.ape\n  dilations = #mosh<ape<1, 1>> : !mosh.ape\n  paddings = #mosh<ape<0, 0, 0, 0>> : !mosh.ape\n  ceil_mode = false\n} : (\n  !mo.tensor<[1, 6, 15, 1], f32>,\n) -> !mo.tensor<[1, 3, 5, 1], f32>\n```",
+   "forms": [
+    {
+     "kind": "explicit",
+     "params": [
+      {
+       "name": "result",
+       "role": "result",
+       "kind": "tensor"
+      },
+      {
+       "name": "input",
+       "role": "operand",
+       "kind": "tensor"
+      },
+      {
+       "name": "filter_shape",
+       "role": "attribute",
+       "kind": "shape"
+      },
+      {
+       "name": "strides",
+       "role": "attribute",
+       "kind": "shape"
+      },
+      {
+       "name": "dilations",
+       "role": "attribute",
+       "kind": "shape"
+      },
+      {
+       "name": "paddings",
+       "role": "attribute",
+       "kind": "shape"
+      },
+      {
+       "name": "ceil_mode",
+       "role": "attribute",
+       "kind": "bool_attr"
+      }
+     ]
+    },
+    {
+     "kind": "inferred",
+     "params": [
+      {
+       "name": "input",
+       "role": "operand",
+       "kind": "tensor"
+      },
+      {
+       "name": "filter_shape",
+       "role": "attribute",
+       "kind": "shape"
+      },
+      {
+       "name": "strides",
+       "role": "attribute",
+       "kind": "shape"
+      },
+      {
+       "name": "dilations",
+       "role": "attribute",
+       "kind": "shape"
+      },
+      {
+       "name": "paddings",
+       "role": "attribute",
+       "kind": "shape"
+      },
+      {
+       "name": "ceil_mode",
+       "role": "attribute",
+       "kind": "bool_attr"
+      }
+     ]
+    },
+    {
+     "kind": "inferred",
+     "params": [
+      {
+       "name": "input",
+       "role": "operand",
+       "kind": "tensor"
+      },
+      {
+       "name": "filter_shape",
+       "role": "attribute",
+       "kind": "shape"
+      },
+      {
+       "name": "strides",
+       "role": "attribute",
+       "kind": "shape"
+      },
+      {
+       "name": "dilations",
+       "role": "attribute",
+       "kind": "shape"
+      },
+      {
+       "name": "paddings",
+       "role": "attribute",
+       "kind": "shape"
+      },
+      {
+       "name": "ceil_mode",
+       "role": "attribute",
+       "kind": "bool"
+      }
+     ]
+    }
+   ],
+   "n_results": 1,
+   "n_results_known": true
+  },
+  {
+   "class": "MinOp",
+   "mlir_name": "rmo.min",
+   "mlir_name_source": "derived",
+   "summary": "A flexible binary elementwise min operation with implicit broadcasting and implicit dtype promotion.",
+   "doc": "A flexible binary elementwise min operation with implicit broadcasting and implicit dtype promotion.",
+   "forms": [
+    {
+     "kind": "explicit",
+     "params": [
+      {
+       "name": "result",
+       "role": "result",
+       "kind": "tensor"
+      },
+      {
+       "name": "input_x",
+       "role": "operand",
+       "kind": "tensor"
+      },
+      {
+       "name": "input_y",
+       "role": "operand",
+       "kind": "tensor"
+      },
+      {
+       "name": "output_param_decls",
+       "role": "param_decls",
+       "kind": "param_decls"
+      }
+     ]
+    },
+    {
+     "kind": "inferred",
+     "params": [
+      {
+       "name": "input_x",
+       "role": "operand",
+       "kind": "tensor"
+      },
+      {
+       "name": "input_y",
+       "role": "operand",
+       "kind": "tensor"
+      },
+      {
+       "name": "output_param_decls",
+       "role": "param_decls",
+       "kind": "param_decls"
+      }
+     ]
+    },
+    {
+     "kind": "inferred",
+     "params": [
+      {
+       "name": "input_x",
+       "role": "operand",
+       "kind": "tensor"
+      },
+      {
+       "name": "input_y",
+       "role": "operand",
+       "kind": "tensor"
+      },
+      {
+       "name": "output_param_decls",
+       "role": "param_decls",
+       "kind": "param_decls",
+       "default": true
+      }
+     ]
+    }
+   ],
+   "n_results": 1,
+   "n_results_known": true
+  },
+  {
+   "class": "ModOp",
+   "mlir_name": "rmo.mo.d",
+   "mlir_name_source": "derived",
+   "summary": "A flexible binary elementwise mod operation with implicit broadcasting and implicit dtype promotion.",
+   "doc": "A flexible binary elementwise mod operation with implicit broadcasting and implicit dtype promotion.",
+   "forms": [
+    {
+     "kind": "explicit",
+     "params": [
+      {
+       "name": "result",
+       "role": "result",
+       "kind": "tensor"
+      },
+      {
+       "name": "input_x",
+       "role": "operand",
+       "kind": "tensor"
+      },
+      {
+       "name": "input_y",
+       "role": "operand",
+       "kind": "tensor"
+      },
+      {
+       "name": "output_param_decls",
+       "role": "param_decls",
+       "kind": "param_decls"
+      }
+     ]
+    },
+    {
+     "kind": "inferred",
+     "params": [
+      {
+       "name": "input_x",
+       "role": "operand",
+       "kind": "tensor"
+      },
+      {
+       "name": "input_y",
+       "role": "operand",
+       "kind": "tensor"
+      },
+      {
+       "name": "output_param_decls",
+       "role": "param_decls",
+       "kind": "param_decls"
+      }
+     ]
+    },
+    {
+     "kind": "inferred",
+     "params": [
+      {
+       "name": "input_x",
+       "role": "operand",
+       "kind": "tensor"
+      },
+      {
+       "name": "input_y",
+       "role": "operand",
+       "kind": "tensor"
+      },
+      {
+       "name": "output_param_decls",
+       "role": "param_decls",
+       "kind": "param_decls",
+       "default": true
+      }
+     ]
+    }
+   ],
+   "n_results": 1,
+   "n_results_known": true
+  },
+  {
+   "class": "MulOp",
+   "mlir_name": "rmo.mul",
+   "mlir_name_source": "derived",
+   "summary": "A flexible binary elementwise mul operation with implicit broadcasting and implicit dtype promotion.",
+   "doc": "A flexible binary elementwise mul operation with implicit broadcasting and implicit dtype promotion.",
+   "forms": [
+    {
+     "kind": "explicit",
+     "params": [
+      {
+       "name": "result",
+       "role": "result",
+       "kind": "tensor"
+      },
+      {
+       "name": "input_x",
+       "role": "operand",
+       "kind": "tensor"
+      },
+      {
+       "name": "input_y",
+       "role": "operand",
+       "kind": "tensor"
+      },
+      {
+       "name": "output_param_decls",
+       "role": "param_decls",
+       "kind": "param_decls"
+      }
+     ]
+    },
+    {
+     "kind": "inferred",
+     "params": [
+      {
+       "name": "input_x",
+       "role": "operand",
+       "kind": "tensor"
+      },
+      {
+       "name": "input_y",
+       "role": "operand",
+       "kind": "tensor"
+      },
+      {
+       "name": "output_param_decls",
+       "role": "param_decls",
+       "kind": "param_decls"
+      }
+     ]
+    },
+    {
+     "kind": "inferred",
+     "params": [
+      {
+       "name": "input_x",
+       "role": "operand",
+       "kind": "tensor"
+      },
+      {
+       "name": "input_y",
+       "role": "operand",
+       "kind": "tensor"
+      },
+      {
+       "name": "output_param_decls",
+       "role": "param_decls",
+       "kind": "param_decls",
+       "default": true
+      }
+     ]
+    }
+   ],
+   "n_results": 1,
+   "n_results_known": true
+  },
+  {
+   "class": "NotEqualOp",
+   "mlir_name": "rmo.not_equal",
+   "mlir_name_source": "docstring",
+   "summary": "A flexible binary elementwise not equal comparison operation with implicit broadcasting and implicit dtype promotion.",
+   "doc": "A flexible binary elementwise not equal comparison operation with implicit broadcasting and implicit dtype promotion.\n\nReturns elementwise `x != y`, where `x` and `y` are input tensors.\n\nExample:\n\n```mlir\n  %lhs: !mo.tensor<[2, 2, 3], f32>\n  %rhs: !mo.tensor<[2, 3], f64>\n  %res = rmo.not_equal(%lhs, %rhs) : (!mo.tensor<[2, 2, 3], f32>,\n                                    !mo.tensor<[2, 3], f64>\n                                    ) -> !mo.tensor<[2, 2, 3], bool>\n```",
+   "forms": [
+    {
+     "kind": "explicit",
+     "params": [
+      {
+       "name": "result",
+       "role": "result",
+       "kind": "tensor"
+      },
+      {
+       "name": "input_x",
+       "role": "operand",
+       "kind": "tensor"
+      },
+      {
+       "name": "input_y",
+       "role": "operand",
+       "kind": "tensor"
+      },
+      {
+       "name": "output_param_decls",
+       "role": "param_decls",
+       "kind": "param_decls"
+      }
+     ]
+    },
+    {
+     "kind": "inferred",
+     "params": [
+      {
+       "name": "input_x",
+       "role": "operand",
+       "kind": "tensor"
+      },
+      {
+       "name": "input_y",
+       "role": "operand",
+       "kind": "tensor"
+      },
+      {
+       "name": "output_param_decls",
+       "role": "param_decls",
+       "kind": "param_decls"
+      }
+     ]
+    },
+    {
+     "kind": "inferred",
+     "params": [
+      {
+       "name": "input_x",
+       "role": "operand",
+       "kind": "tensor"
+      },
+      {
+       "name": "input_y",
+       "role": "operand",
+       "kind": "tensor"
+      },
+      {
+       "name": "output_param_decls",
+       "role": "param_decls",
+       "kind": "param_decls",
+       "default": true
+      }
+     ]
+    }
+   ],
+   "n_results": 1,
+   "n_results_known": true
+  },
+  {
+   "class": "OrOp",
+   "mlir_name": "rmo.or",
+   "mlir_name_source": "docstring",
+   "summary": "A flexible binary elementwise or comparison operation with implicit broadcasting.",
+   "doc": "A flexible binary elementwise or comparison operation with implicit broadcasting.\n\nReturns elementwise `x | y`, where `x` and `y` are boolean input tensors.\n\nExample:\n\n```mlir\n  %lhs: !mo.tensor<[2, 2, 3], bool>\n  %rhs: !mo.tensor<[2, 3], bool>\n  %res = rmo.or(%lhs, %rhs) : (!mo.tensor<[2, 2, 3], bool>,\n                                !mo.tensor<[2, 3], bool>\n                                ) -> !mo.tensor<[2, 2, 3], bool>\n```",
+   "forms": [
+    {
+     "kind": "explicit",
+     "params": [
+      {
+       "name": "result",
+       "role": "result",
+       "kind": "tensor"
+      },
+      {
+       "name": "input_x",
+       "role": "operand",
+       "kind": "tensor"
+      },
+      {
+       "name": "input_y",
+       "role": "operand",
+       "kind": "tensor"
+      },
+      {
+       "name": "output_param_decls",
+       "role": "param_decls",
+       "kind": "param_decls"
+      }
+     ]
+    },
+    {
+     "kind": "inferred",
+     "params": [
+      {
+       "name": "input_x",
+       "role": "operand",
+       "kind": "tensor"
+      },
+      {
+       "name": "input_y",
+       "role": "operand",
+       "kind": "tensor"
+      },
+      {
+       "name": "output_param_decls",
+       "role": "param_decls",
+       "kind": "param_decls"
+      }
+     ]
+    },
+    {
+     "kind": "inferred",
+     "params": [
+      {
+       "name": "input_x",
+       "role": "operand",
+       "kind": "tensor"
+      },
+      {
+       "name": "input_y",
+       "role": "operand",
+       "kind": "tensor"
+      },
+      {
+       "name": "output_param_decls",
+       "role": "param_decls",
+       "kind": "param_decls",
+       "default": true
+      }
+     ]
+    }
+   ],
+   "n_results": 1,
+   "n_results_known": true
+  },
+  {
+   "class": "PowOp",
+   "mlir_name": "rmo.pow",
+   "mlir_name_source": "derived",
+   "summary": "A flexible binary elementwise pow operation with implicit broadcasting and implicit dtype promotion.",
+   "doc": "A flexible binary elementwise pow operation with implicit broadcasting and implicit dtype promotion.",
+   "forms": [
+    {
+     "kind": "explicit",
+     "params": [
+      {
+       "name": "result",
+       "role": "result",
+       "kind": "tensor"
+      },
+      {
+       "name": "input_x",
+       "role": "operand",
+       "kind": "tensor"
+      },
+      {
+       "name": "input_y",
+       "role": "operand",
+       "kind": "tensor"
+      },
+      {
+       "name": "output_param_decls",
+       "role": "param_decls",
+       "kind": "param_decls"
+      }
+     ]
+    },
+    {
+     "kind": "inferred",
+     "params": [
+      {
+       "name": "input_x",
+       "role": "operand",
+       "kind": "tensor"
+      },
+      {
+       "name": "input_y",
+       "role": "operand",
+       "kind": "tensor"
+      },
+      {
+       "name": "output_param_decls",
+       "role": "param_decls",
+       "kind": "param_decls"
+      }
+     ]
+    },
+    {
+     "kind": "inferred",
+     "params": [
+      {
+       "name": "input_x",
+       "role": "operand",
+       "kind": "tensor"
+      },
+      {
+       "name": "input_y",
+       "role": "operand",
+       "kind": "tensor"
+      },
+      {
+       "name": "output_param_decls",
+       "role": "param_decls",
+       "kind": "param_decls",
+       "default": true
+      }
+     ]
+    }
+   ],
+   "n_results": 1,
+   "n_results_known": true
+  },
+  {
+   "class": "RebindTensorShapeOp",
+   "mlir_name": "rmo.rebind_tensor_shape",
+   "mlir_name_source": "derived",
+   "summary": "Unlike `mo.rebind` this also has the semantics of doing a runtime check that the given shapes are compatible.",
+   "doc": "Unlike `mo.rebind` this also has the semantics of doing a runtime check\nthat the given shapes are compatible.\n\nRight now this is modeled as a side-effect of the operation due to\nlimitations of modeling assertions in our stack. In the future this will\nchange and this operation may return either an error or a tensor.",
+   "forms": [
+    {
+     "kind": "explicit",
+     "params": [
+      {
+       "name": "output",
+       "role": "result",
+       "kind": "tensor"
+      },
+      {
+       "name": "input",
+       "role": "operand",
+       "kind": "tensor"
+      },
+      {
+       "name": "output_param_decls",
+       "role": "param_decls",
+       "kind": "param_decls"
+      },
+      {
+       "name": "message",
+       "role": "attribute",
+       "kind": "string_attr"
+      }
+     ]
+    },
+    {
+     "kind": "inferred",
+     "params": [
+      {
+       "name": "input",
+       "role": "operand",
+       "kind": "tensor"
+      },
+      {
+       "name": "new_shape",
+       "role": "attribute",
+       "kind": "shape"
+      },
+      {
+       "name": "output_param_decls",
+       "role": "param_decls",
+       "kind": "param_decls",
+       "default": true
+      }
+     ]
+    },
+    {
+     "kind": "inferred",
+     "params": [
+      {
+       "name": "input",
+       "role": "operand",
+       "kind": "tensor"
+      },
+      {
+       "name": "new_shape",
+       "role": "attribute",
+       "kind": "shape"
+      },
+      {
+       "name": "message",
+       "role": "attribute",
+       "kind": "string"
+      },
+      {
+       "name": "output_param_decls",
+       "role": "param_decls",
+       "kind": "param_decls",
+       "default": true
+      }
+     ]
+    }
+   ],
+   "n_results": 1,
+   "n_results_known": true
+  },
+  {
+   "class": "ReshapeOp",
+   "mlir_name": "rmo.reshape",
+   "mlir_name_source": "derived",
+   "summary": "Returns a tensor with the same underlying data as `input`, but the shape of `newShape`.",
+   "doc": "Returns a tensor with the same underlying data as `input`, but the shape of `newShape`.\n\nA static dimension set to `-1` will be automatically computed.\n\nShape restrictions:\n1. `newShape` must have known rank.\n2. `newShape` may not contain any dynamic dimensions.",
+   "forms": [
+    {
+     "kind": "explicit",
+     "params": [
+      {
+       "name": "result",
+       "role": "result",
+       "kind": "tensor"
+      },
+      {
+       "name": "input",
+       "role": "operand",
+       "kind": "tensor"
+      },
+      {
+       "name": "new_shape",
+       "role": "attribute",
+       "kind": "shape"
+      }
+     ]
+    },
+    {
+     "kind": "inferred",
+     "params": [
+      {
+       "name": "input",
+       "role": "operand",
+       "kind": "tensor"
+      },
+      {
+       "name": "new_shape",
+       "role": "attribute",
+       "kind": "shape"
+      }
+     ]
+    }
+   ],
+   "n_results": 1,
+   "n_results_known": true
+  },
+  {
+   "class": "SelectOp",
+   "mlir_name": "rmo.select",
+   "mlir_name_source": "docstring",
+   "summary": "Returns `cond ? x : y` (element-wise), where `cond`, `x` and `y` are input tensors.",
+   "doc": "Returns `cond ? x : y` (element-wise), where `cond`, `x` and `y` are input\ntensors.\n\nBroadcasting is handled by first calculating the common shape between `x` and `y`.\nThen, the `cond` shape and common shape are merged to figure out the final shape.\nAll inputs are broadcast to the same final shape.\n\nDtype casting only applies to the `x` and `y` inputs. `cond` must be a bool.\n\nExample:\n\n```mlir\n  %cond: !mo.tensor<[2, 3], bool>\n  %x: !mo.tensor<[1, 3], f32>\n  %y: !mo.tensor<[2, 3], i8>\n  %res = rmo.select(%cond, %x, %y) : !mo.tensor<[2, 3], f32>\n```",
+   "forms": [
+    {
+     "kind": "explicit",
+     "params": [
+      {
+       "name": "result",
+       "role": "result",
+       "kind": "tensor"
+      },
+      {
+       "name": "cond",
+       "role": "operand",
+       "kind": "tensor"
+      },
+      {
+       "name": "input_x",
+       "role": "operand",
+       "kind": "tensor"
+      },
+      {
+       "name": "input_y",
+       "role": "operand",
+       "kind": "tensor"
+      }
+     ]
+    },
+    {
+     "kind": "inferred",
+     "params": [
+      {
+       "name": "cond",
+       "role": "operand",
+       "kind": "tensor"
+      },
+      {
+       "name": "input_x",
+       "role": "operand",
+       "kind": "tensor"
+      },
+      {
+       "name": "input_y",
+       "role": "operand",
+       "kind": "tensor"
+      }
+     ]
+    }
+   ],
+   "n_results": 1,
+   "n_results_known": true
+  },
+  {
+   "class": "ShapeToTensorOp",
+   "mlir_name": "rmo.shape_to_tensor",
+   "mlir_name_source": "derived",
+   "summary": "Converts a statically known shape attr into a 1d tensor of the shape.",
+   "doc": "Converts a statically known shape attr into a 1d tensor of the shape.",
+   "forms": [
+    {
+     "kind": "explicit",
+     "params": [
+      {
+       "name": "result",
+       "role": "result",
+       "kind": "tensor"
+      },
+      {
+       "name": "shape",
+       "role": "attribute",
+       "kind": "shape"
+      }
+     ]
+    }
+   ],
+   "n_results": 1,
+   "n_results_known": true
+  },
+  {
+   "class": "SliceOp",
+   "mlir_name": "rmo.slice",
+   "mlir_name_source": "docstring",
+   "summary": "Returns a new tensor with a subset of the elements from an N-dimensional `input` tensor. The subset is chosen using the `starts`, `stops`, and `steps` shape attributes. Each shape attributes has N elements, one for each dimension of the `input` tensor.",
+   "doc": "Returns a new tensor with a subset of the elements from an N-dimensional\n`input` tensor. The subset is chosen using the `starts`, `stops`, and\n`steps` shape attributes.\nEach shape attributes has N elements, one for each dimension of the `input`\ntensor.\n\nThe semantics follows the numpy index semantics, such that\n1. For each dimension `i`, `starts[i]:stops[i]:steps[i]` represents the\n   \"indexing\" along that dimension.\n2. Negative indices are supported for `starts` and `stops`, e.g., -1\n   represents the largest axis.\n3. Unlike `mo.slice`, Out of bound indices in `starts` and `stops` are not\n   allowed and each must be in [-dim, dim], where `dim` is the dimension in\n   the corresponding axis.\n4. `step` must contain nonzero elements. Negative steps are supported.\n\nNote: the order in which negative indices are resolved matches that of\npython for `start:\n\n1. Normalize negative indices by adding the dimension size.\n2. Apply clipping logic.\n\nThis means the equivalent mo.slice for l[:-1:-1] returns an empty result.\nIf we want to reverse the values in `l` we should do l[:-N-1:-1] where\nN is the dimension size. Numbers smaller than -N-1 should also work.\n\nExample:\n```mlir\n  %input: !mo.tensor<[10, 10], f32>\n\n  // equivalent to this in numpy: `input[1:-3:5, -6:6:1]`\n  %res = rmo.slice(%input) {starts = #mosh<ape[1, -6]> : !mosh.ape, steps = #mosh<ape[5, 1]> : !mosh.ape, stops = #mosh<ape[-3, 6]> : !mosh.ape} : (\n    !mo.tensor<[10, 10], f32>,\n  ) -> !mo.tensor<[2, 2], f32>\n```",
+   "forms": [
+    {
+     "kind": "explicit",
+     "params": [
+      {
+       "name": "result",
+       "role": "result",
+       "kind": "tensor"
+      },
+      {
+       "name": "input",
+       "role": "operand",
+       "kind": "tensor"
+      },
+      {
+       "name": "starts",
+       "role": "attribute",
+       "kind": "shape"
+      },
+      {
+       "name": "stops",
+       "role": "attribute",
+       "kind": "shape"
+      },
+      {
+       "name": "steps",
+       "role": "attribute",
+       "kind": "shape"
+      },
+      {
+       "name": "output_param_decls",
+       "role": "param_decls",
+       "kind": "param_decls"
+      }
+     ]
+    },
+    {
+     "kind": "inferred",
+     "params": [
+      {
+       "name": "input",
+       "role": "operand",
+       "kind": "tensor"
+      },
+      {
+       "name": "starts",
+       "role": "attribute",
+       "kind": "shape"
+      },
+      {
+       "name": "stops",
+       "role": "attribute",
+       "kind": "shape"
+      },
+      {
+       "name": "steps",
+       "role": "attribute",
+       "kind": "shape"
+      },
+      {
+       "name": "output_param_decls",
+       "role": "param_decls",
+       "kind": "param_decls"
+      }
+     ]
+    },
+    {
+     "kind": "inferred",
+     "params": [
+      {
+       "name": "input",
+       "role": "operand",
+       "kind": "tensor"
+      },
+      {
+       "name": "starts",
+       "role": "attribute",
+       "kind": "shape"
+      },
+      {
+       "name": "stops",
+       "role": "attribute",
+       "kind": "shape"
+      },
+      {
+       "name": "steps",
+       "role": "attribute",
+       "kind": "shape"
+      },
+      {
+       "name": "output_param_decls",
+       "role": "param_decls",
+       "kind": "param_decls",
+       "default": true
+      }
+     ]
+    }
+   ],
+   "n_results": 1,
+   "n_results_known": true
+  },
+  {
+   "class": "SubOp",
+   "mlir_name": "rmo.sub",
+   "mlir_name_source": "derived",
+   "summary": "A flexible binary elementwise sub operation with implicit broadcasting and implicit dtype promotion.",
+   "doc": "A flexible binary elementwise sub operation with implicit broadcasting and implicit dtype promotion.",
+   "forms": [
+    {
+     "kind": "explicit",
+     "params": [
+      {
+       "name": "result",
+       "role": "result",
+       "kind": "tensor"
+      },
+      {
+       "name": "input_x",
+       "role": "operand",
+       "kind": "tensor"
+      },
+      {
+       "name": "input_y",
+       "role": "operand",
+       "kind": "tensor"
+      },
+      {
+       "name": "output_param_decls",
+       "role": "param_decls",
+       "kind": "param_decls"
+      }
+     ]
+    },
+    {
+     "kind": "inferred",
+     "params": [
+      {
+       "name": "input_x",
+       "role": "operand",
+       "kind": "tensor"
+      },
+      {
+       "name": "input_y",
+       "role": "operand",
+       "kind": "tensor"
+      },
+      {
+       "name": "output_param_decls",
+       "role": "param_decls",
+       "kind": "param_decls"
+      }
+     ]
+    },
+    {
+     "kind": "inferred",
+     "params": [
+      {
+       "name": "input_x",
+       "role": "operand",
+       "kind": "tensor"
+      },
+      {
+       "name": "input_y",
+       "role": "operand",
+       "kind": "tensor"
+      },
+      {
+       "name": "output_param_decls",
+       "role": "param_decls",
+       "kind": "param_decls",
+       "default": true
+      }
+     ]
+    }
+   ],
+   "n_results": 1,
+   "n_results_known": true
+  },
+  {
+   "class": "TopKOp",
+   "mlir_name": "rmo.top_k",
+   "mlir_name_source": "docstring",
+   "summary": "Computes the largest values and their corresponding indices in a tensor along a specified axis. Returns values sorted along the axis.",
+   "doc": "Computes the largest values and their corresponding indices in a tensor\nalong a specified axis.\nReturns values sorted along the axis.\n\naxis: The axis to compute the largest values over.\n  The axis must be in [-rank, rank).\nk: The number of values to compute.\n\nExample:\n```mlir\n  %input: !mo.tensor<[2, 6], si64>\n  %values, %indices = rmo.top_k(%input) {k = 3, axis = 1} :\n    (!mo.tensor<[2, 6], si64>) ->\n    (!mo.tensor<[2, 3], si64>, !mo.tensor<[2, 3], si64>)\n```",
+   "forms": [
+    {
+     "kind": "explicit",
+     "params": [
+      {
+       "name": "values",
+       "role": "result",
+       "kind": "tensor"
+      },
+      {
+       "name": "indices",
+       "role": "result",
+       "kind": "tensor"
+      },
+      {
+       "name": "input",
+       "role": "operand",
+       "kind": "tensor"
+      },
+      {
+       "name": "k",
+       "role": "attribute",
+       "kind": "index"
+      },
+      {
+       "name": "axis",
+       "role": "attribute",
+       "kind": "index"
+      },
+      {
+       "name": "output_param_decls",
+       "role": "param_decls",
+       "kind": "param_decls"
+      }
+     ]
+    },
+    {
+     "kind": "inferred",
+     "params": [
+      {
+       "name": "input",
+       "role": "operand",
+       "kind": "tensor"
+      },
+      {
+       "name": "k",
+       "role": "attribute",
+       "kind": "index"
+      },
+      {
+       "name": "axis",
+       "role": "attribute",
+       "kind": "index"
+      },
+      {
+       "name": "output_param_decls",
+       "role": "param_decls",
+       "kind": "param_decls"
+      }
+     ]
+    },
+    {
+     "kind": "inferred",
+     "params": [
+      {
+       "name": "input",
+       "role": "operand",
+       "kind": "tensor"
+      },
+      {
+       "name": "k",
+       "role": "attribute",
+       "kind": "int"
+      },
+      {
+       "name": "axis",
+       "role": "attribute",
+       "kind": "int"
+      },
+      {
+       "name": "output_param_decls",
+       "role": "param_decls",
+       "kind": "param_decls",
+       "default": true
+      }
+     ]
+    }
+   ],
+   "n_results": 2,
+   "n_results_known": true
+  },
+  {
+   "class": "XorOp",
+   "mlir_name": "rmo.xor",
+   "mlir_name_source": "docstring",
+   "summary": "A flexible binary elementwise xor comparison operation with implicit broadcasting.",
+   "doc": "A flexible binary elementwise xor comparison operation with implicit broadcasting.\n\nReturns elementwise `x ^ y`, where `x` and `y` are boolean input tensors.\n\nExample:\n\n```mlir\n  %lhs: !mo.tensor<[2, 2, 3], bool>\n  %rhs: !mo.tensor<[2, 3], bool>\n  %res = rmo.xor(%lhs, %rhs) : (!mo.tensor<[2, 2, 3], bool>,\n                                !mo.tensor<[2, 3], bool>\n                                ) -> !mo.tensor<[2, 2, 3], bool>\n```",
+   "forms": [
+    {
+     "kind": "explicit",
+     "params": [
+      {
+       "name": "result",
+       "role": "result",
+       "kind": "tensor"
+      },
+      {
+       "name": "input_x",
+       "role": "operand",
+       "kind": "tensor"
+      },
+      {
+       "name": "input_y",
+       "role": "operand",
+       "kind": "tensor"
+      },
+      {
+       "name": "output_param_decls",
+       "role": "param_decls",
+       "kind": "param_decls"
+      }
+     ]
+    },
+    {
+     "kind": "inferred",
+     "params": [
+      {
+       "name": "input_x",
+       "role": "operand",
+       "kind": "tensor"
+      },
+      {
+       "name": "input_y",
+       "role": "operand",
+       "kind": "tensor"
+      },
+      {
+       "name": "output_param_decls",
+       "role": "param_decls",
+       "kind": "param_decls"
+      }
+     ]
+    },
+    {
+     "kind": "inferred",
+     "params": [
+      {
+       "name": "input_x",
+       "role": "operand",
+       "kind": "tensor"
+      },
+      {
+       "name": "input_y",
+       "role": "operand",
+       "kind": "tensor"
+      },
+      {
+       "name": "output_param_decls",
+       "role": "param_decls",
+       "kind": "param_decls",
+       "default": true
+      }
+     ]
+    }
+   ],
+   "n_results": 1,
+   "n_results_known": true
+  }
+ ]
+}
