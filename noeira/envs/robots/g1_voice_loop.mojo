@@ -205,8 +205,9 @@ struct G1VoiceConfig(Copyable, Movable):
     """ISO-639-1 pinned on the recogniser. ⚠ "" lets Whisper auto-detect from
     a one-word utterance, which is how "cours" came back "cool" (§12.56)."""
     var stt_spec: String
-    """`hf` or `groq`. ⚠ Only a multipart backend takes a text vocabulary
-    prompt; the HF endpoint RAISES on one, so `vocab` is sent to `groq` only."""
+    """`hf`, `groq` or `local:<base_url>` (e.g. `local:http://127.0.0.1:8765/v1`).
+    ⚠ Only a multipart backend takes a text vocabulary prompt; the HF endpoint
+    RAISES on one, so `vocab` is sent to `groq` and `local:` only."""
     var vocab: String
     var vad: Bool
     var mute: Bool
@@ -309,10 +310,17 @@ struct G1VoiceLoop(Movable):
         BEFORE its loop starts rather than be swallowed inside one."""
         self.cfg = cfg^
         self.jev = JevClient.from_env()
-        self.stt = (
-            SpeechToText.groq() if self.cfg.stt_spec == "groq"
-            else SpeechToText.huggingface()
-        )
+        # `local:<base_url>` is any OpenAI-compatible server on this machine
+        # (Phonon-2's `phonon serve`: English only, `language` is ignored,
+        # `prompt` is read as a hotword list — at most 25 words).
+        if self.cfg.stt_spec.startswith("local:"):
+            self.stt = SpeechToText.openai_compatible(
+                String(self.cfg.stt_spec[byte=6:]), String("phonon-2")
+            )
+        elif self.cfg.stt_spec == "groq":
+            self.stt = SpeechToText.groq()
+        else:
+            self.stt = SpeechToText.huggingface()
         if self.cfg.lang != "":
             self.stt.language = self.cfg.lang
         # ⚠ THE VOCABULARY GOES ONLY TO A BACKEND THAT TAKES ONE. HF's Whisper
