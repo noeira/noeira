@@ -14,7 +14,10 @@ What it needs, and why:
   several ops take their parameters as constant operands (a transpose's
   permutation, ``split``'s sizes, ``layer_norm``'s epsilon).
 - ``max._mlir.ir.Operation._CAPICreate``: read an attribute of an op that has
-  no typed binding (``rmo.concat``).
+  no typed binding (``rmo.concat``, and a custom op's ``symbol``).
+- ``Graph._import_kernels``: add a Mojo custom-op package to a graph that is
+  already being built (the public route, ``custom_extensions=``, is fixed
+  when the graph is created).
 - ``TensorValue._mlir_value``: the value identity the walk keys on.
 
 Reflecting generically over the typed bindings' properties can segfault
@@ -66,7 +69,9 @@ def wrap(k: Key) -> Value:
 
 
 def operands(op: _core.Operation) -> list[Key]:
-    return [operand.value for operand in op.operands]
+    # A typed op lists `OpOperand`s; an op without a typed binding (a custom
+    # op's `mo.custom`) lists the `Value`s themselves.
+    return [o if isinstance(o, _core.Value) else o.value for o in op.operands]
 
 
 def results(op: _core.Operation) -> list[Key]:
@@ -143,6 +148,14 @@ def attr(op: _core.Operation, name: str) -> Any:
     as properties (``.axis``, ``.new_shape``), which rules read directly.
     """
     attribute = ir.Operation._CAPICreate(op._CAPIPtr).attributes[name]
-    if isinstance(attribute, ir.IntegerAttr):
+    if isinstance(attribute, ir.IntegerAttr | ir.StringAttr):
         return attribute.value
     return attribute
+
+
+def import_kernels(graph: Graph, path: Any) -> None:
+    """Makes the Mojo custom ops in ``path`` available to ``graph``, once."""
+    loaded = graph.__dict__.setdefault("_autodiff_kernel_paths", set())
+    if str(path) not in loaded:
+        graph._import_kernels([path])
+        loaded.add(str(path))

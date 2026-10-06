@@ -17,7 +17,7 @@ import numpy as np
 from max.dtype import DType
 from max.graph import TensorType, TensorValue, ops
 
-from .common import cross_entropy, dense
+from .common import attention_kernel, cross_entropy, dense, layer_norm_kernel
 
 
 @dataclass(frozen=True)
@@ -28,6 +28,13 @@ class Config:
     heads: int = 2
     layers: int = 2
     dropout: float = 0.0
+    layer_norm: str = "composite"
+    """``composite``: ``ops.layer_norm`` and its composite rule; ``kernel``:
+    the Mojo custom-op pair (``kernels/layer_norm.mojo``, plan M4)."""
+    attention: str = "composite"
+    """``composite``: the scores materialised (matmul, bias, softmax, matmul)
+    and their rules; ``kernel``: noeira's fused attention as a custom-op pair
+    (``kernels/attention.mojo``)."""
 
     @property
     def head_dim(self) -> int:
@@ -100,18 +107,27 @@ def _merge(x: TensorValue, cfg: Config) -> TensorValue:
     return ops.reshape(x, [x.shape[0], x.shape[1], cfg.dim])
 
 
-def _attention(p: dict, l: int, x: TensorValue, cfg: Config) -> TensorValue:
-    qkv = dense(x, p[f"h{l}.qkv.w"], p[f"h{l}.qkv.b"])
+def causal_attention(qkv: TensorValue, cfg: Config) -> TensorValue:
+    """``softmax(q·kᵀ/sqrt(d) + causal bias)·v`` over ``qkv [B, T, 3·C]``,
+    heads merged: the composite form, every op differentiated by its rule."""
     q, k, v = (_heads(t, cfg) for t in ops.split(qkv, [cfg.dim] * 3, axis=2))
     scores = ops.matmul(q, ops.transpose(k, -1, -2)) * (1.0 / math.sqrt(cfg.head_dim))
     # The causal mask is an additive -inf bias, NOT `where(mask, scores,
     # -inf)`: MAX 26.6 on CPU returns all NaN for that select form once the
     # batch dims exceed 1 (tests/test_max_findings.py).
-    t = int(x.shape[1])
+    t = int(qkv.shape[1])
     causal = np.where(np.tril(np.ones((t, t), dtype=bool)), 0.0, -np.inf)
-    bias = ops.constant(causal.astype(x.dtype.to_numpy()), x.dtype, x.device)
+    bias = ops.constant(causal.astype(qkv.dtype.to_numpy()), qkv.dtype, qkv.device)
     weights = ops.softmax(scores + bias)
-    y = _merge(ops.matmul(weights, v), cfg)
+    return _merge(ops.matmul(weights, v), cfg)
+
+
+def _attention(p: dict, l: int, x: TensorValue, cfg: Config) -> TensorValue:
+    qkv = dense(x, p[f"h{l}.qkv.w"], p[f"h{l}.qkv.b"])
+    if cfg.attention == "kernel":
+        y = attention_kernel(qkv, cfg.heads)
+    else:
+        y = causal_attention(qkv, cfg)
     return dropout(dense(y, p[f"h{l}.proj.w"], p[f"h{l}.proj.b"]), cfg.dropout)
 
 
@@ -120,17 +136,19 @@ def _mlp(p: dict, l: int, x: TensorValue, cfg: Config) -> TensorValue:
     return dropout(dense(h, p[f"h{l}.fc2.w"], p[f"h{l}.fc2.b"]), cfg.dropout)
 
 
+def _norm(x: TensorValue, gamma: TensorValue, beta: TensorValue, cfg: Config) -> TensorValue:
+    if cfg.layer_norm == "kernel":
+        return layer_norm_kernel(x, gamma, beta, 1e-5)
+    return ops.layer_norm(x, gamma, beta, 1e-5)
+
+
 def forward(p: dict, idx: TensorValue, cfg: Config) -> TensorValue:
     """Token indices ``[B, T]`` -> logits ``[B, T, vocab]``."""
     x = dropout(ops.gather(p["wte"], idx, axis=0) + p["wpe"], cfg.dropout)
     for l in range(cfg.layers):
-        x = x + _attention(
-            p, l, ops.layer_norm(x, p[f"h{l}.ln1.w"], p[f"h{l}.ln1.b"], 1e-5), cfg
-        )
-        x = x + _mlp(
-            p, l, ops.layer_norm(x, p[f"h{l}.ln2.w"], p[f"h{l}.ln2.b"], 1e-5), cfg
-        )
-    x = ops.layer_norm(x, p["lnf.w"], p["lnf.b"], 1e-5)
+        x = x + _attention(p, l, _norm(x, p[f"h{l}.ln1.w"], p[f"h{l}.ln1.b"], cfg), cfg)
+        x = x + _mlp(p, l, _norm(x, p[f"h{l}.ln2.w"], p[f"h{l}.ln2.b"], cfg), cfg)
+    x = _norm(x, p["lnf.w"], p["lnf.b"], cfg)
     return ops.matmul(x, ops.transpose(p["wte"], 0, 1))  # tied head
 
 

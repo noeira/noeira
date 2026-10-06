@@ -6,7 +6,7 @@
 #
 #   noeira_max/autodiff/bench/run_5090.sh                # every section
 #   noeira_max/autodiff/bench/run_5090.sh --smoke        # torch + max: 1 layer, 5 steps
-#   noeira_max/autodiff/bench/run_5090.sh torch max      # some of: torch max scaling fit
+#   noeira_max/autodiff/bench/run_5090.sh torch max      # some of: torch max scaling fit m4
 set -uo pipefail
 ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/../../.." && pwd)"
 MAIN="$(dirname "$(git -C "$ROOT" rev-parse --path-format=absolute --git-common-dir)")"
@@ -64,6 +64,20 @@ if want max; then
     for mode in execute capture; do
         run "max $mode" "$RUN" noeira_max/autodiff/bench/bench_gpt_max.py --mode "$mode" \
             --bench-steps "$STEPS" "${SIZE[@]}"
+    done
+fi
+
+if want m4; then
+    # M4: kernel-backed rules (Mojo custom ops, forward + backward +
+    # residuals): LayerNorm, and noeira's fused attention. Each alone, then
+    # in the 6-layer step, against the composite rules.
+    run "m4 layer norm, alone" "$RUN" noeira_max/autodiff/bench/layer_norm_kernel.py --device gpu
+    run "m4 attention, alone" "$RUN" noeira_max/autodiff/bench/attention_kernel.py --device gpu
+    for kinds in "composite composite" "kernel composite" "composite kernel" "kernel kernel"; do
+        set -- $kinds
+        run "m4 max execute, layer norm $1, attention $2" "$RUN" \
+            noeira_max/autodiff/bench/bench_gpt_max.py --mode execute --layer-norm "$1" \
+            --attention "$2" --bench-steps "$STEPS" "${SIZE[@]}"
     done
 fi
 

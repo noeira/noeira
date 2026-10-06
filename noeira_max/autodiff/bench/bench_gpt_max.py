@@ -53,12 +53,17 @@ def main() -> None:
     ap.add_argument("--bench-steps", type=int, default=50,
                     help="time this many steps after as many warmup steps (the twin's flag)")
     ap.add_argument("--seed", type=int, default=42)
+    ap.add_argument("--layer-norm", choices=["composite", "kernel"], default="composite",
+                    help="ops.layer_norm and its composite rule, or the Mojo custom ops (M4)")
+    ap.add_argument("--attention", choices=["composite", "kernel"], default="composite",
+                    help="the scores materialised, or noeira's fused attention as custom ops (M4)")
     args = ap.parse_args()
 
     device = Accelerator() if args.device == "gpu" and accelerator_count() else CPU()
     dev = DeviceRef.from_device(device)
     cfg = gpt.Config(seq=args.seq, dim=args.dim, heads=args.heads,
-                     layers=args.layers, dropout=args.dropout)
+                     layers=args.layers, dropout=args.dropout, layer_norm=args.layer_norm,
+                     attention=args.attention)
     init = gpt.init(cfg, np.random.default_rng(args.seed), dtype=np.float32)
     _, tokens = data.shakespeare_vocab()
     corpus = tokens[: len(tokens) * 9 // 10]  # the twin's train split
@@ -71,7 +76,8 @@ def main() -> None:
     step = build_train_step(
         lambda p, c: gpt.loss(p, *gpt.sample_batch(c, args.batch, cfg.seq), cfg),
         init, opt, [TensorType(DType.int64, [len(corpus)], dev)], dev,
-        uses_seed=True, name=f"gpt{args.layers}x{args.dim}_train_step",
+        uses_seed=True,
+        name=f"gpt{args.layers}x{args.dim}_ln_{args.layer_norm}_attn_{args.attention}_train_step",
     )
     build_s = time.perf_counter() - start
     compiled = CompiledStep(step, init, opt, device, seed=args.seed)
@@ -81,6 +87,7 @@ def main() -> None:
           f"{build_s:.1f} s, compiled in {compiled.compile_seconds:.1f} s", flush=True)
 
     out = dict(model="gpt", framework="max", mode=args.mode, device=str(device),
+               layer_norm=args.layer_norm, attention=args.attention,
                layers=args.layers, dim=args.dim, batch=args.batch, seq=args.seq,
                dropout=args.dropout, build_s=build_s, compile_s=compiled.compile_seconds)
 
