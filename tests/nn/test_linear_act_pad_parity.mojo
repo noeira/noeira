@@ -43,6 +43,7 @@ device, so the padded branch is live on Metal as well.
 """
 
 from std.math import abs
+from noeira.nn.core.cublas_gemm import CUBLAS_BWD
 from max.gpu.host import DeviceContext
 
 from noeira.nn.constants import DT
@@ -266,6 +267,14 @@ def check_n[
 
 
 def main() raises:
+    comptime if CUBLAS_BWD:
+        # The padded branch does not run on NVIDIA (unless built with
+        # `-D NN_GEMM_PATH=max`): a shape that would need padding goes through
+        # `cublas_gemm` unpadded (`use_cublas_fwd`), and so does the backward.
+        # Nothing here to compare; the GPU-vs-CPU gate for those paths is
+        # `test_linear_act_gpu`.
+        print("NVIDIA: LinearAct's padded path is not used (cuBLAS); see test_linear_act_gpu")
+        return
     with DeviceContext() as ctx:
         print("LinearAct padded vs a ZERO-EXTENDED aligned control, same device")
         var n_run = 0

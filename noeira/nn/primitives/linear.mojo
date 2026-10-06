@@ -23,7 +23,7 @@ the whole function, then builds views from that.
 """
 
 from noeira.nn.core.mm import mm, mm_bias, bmm
-from noeira.nn.core.cublas_gemm import cublas_gemm, CUBLAS_WS_BYTES
+from noeira.nn.core.cublas_gemm import cublas_gemm, CUBLAS_BWD, cublas_fwd, cublas_tf32
 from std.sys import has_nvidia_gpu_accelerator
 from std.sys import CompilationTarget
 from max.gpu import global_idx, thread_idx, block_idx
@@ -557,6 +557,17 @@ struct Linear[IN_: Int, OUT_: Int, ADT: DType = DT](Module):
     comptime N_PAD_TO = 128
     comptime N_PAD = Self._round_up(Self.OUT_, Self.N_PAD_TO)
     comptime NEEDS_N_PAD = Self.N_PAD != Self.OUT_
+    # NVIDIA fp32: the forward GEMM runs on `cublas_gemm` (unpadded, one GEMM
+    # + one bias kernel) except in the three regimes where MAX's measured
+    # faster (`cublas_fwd`: batch 1 on an aligned shape, batch >= 16384 with a
+    # mid-size K, a 2^25-element weight at batch <= 32), which keep the MAX
+    # paths below. Where MAX needs padding its multistage GEMM runs a 128-wide
+    # tile over what is, for an RL trunk, an 8- or 64-wide layer (8 -> 64 does
+    # 32x the useful work), plus the x_pad / w_pad copies. `NN_GEMM_PATH`
+    # (`cublas_gemm.mojo`) overrides for A/B runs.
+    @staticmethod
+    def use_cublas_fwd[B: Int]() -> Bool:
+        return cublas_fwd(B, Self.OUT_, Self.IN_, Self.NEEDS_PAD or Self.NEEDS_N_PAD)
     comptime WPAD_SIZE = Self.K_PAD * Self.N_PAD
 
     @staticmethod
@@ -623,9 +634,6 @@ struct Linear[IN_: Int, OUT_: Int, ADT: DType = DT](Module):
     var gb_part: Tensor
     """Bias-gradient chunk partials (`enqueue_bias_grad`), [B / 1024, OUT_]."""
     var sk_ws: Tensor
-    # cuBLAS workspace of the NVIDIA backward (`cublas_gemm`);
-    # sized once, persists like `sk_ws`.
-    var blas_ws: TensorImpl[DType.uint8]
     """Split-K reduction workspace for the dW GEMM, `[P, K_PAD, N_PAD]`.
 
     `linalg.matmul` allocates this per call and frees it again
@@ -667,7 +675,6 @@ struct Linear[IN_: Int, OUT_: Int, ADT: DType = DT](Module):
         self.cT_pad = Tensor()
         self.dW_pad = Tensor()
         self.sk_ws = Tensor()
-        self.blas_ws = TensorImpl[DType.uint8]()
         self._sk_p = -1
         self.gi_pad = Tensor()
         self.gb_part = Tensor()
@@ -873,7 +880,21 @@ struct Linear[IN_: Int, OUT_: Int, ADT: DType = DT](Module):
                 # appended columns are 0); only the GEMM's tiling — and hence
                 # its fp32 reduction ORDER — moves, which can shift a result by
                 # an ulp. Padding N adds columns nothing ever reads.
-                comptime if Self.NEEDS_PAD or Self.NEEDS_N_PAD:
+                comptime if Self.use_cublas_fwd[B]():
+                    cublas_gemm[False, False, cublas_tf32(B, Self.OUT_, Self.IN_)](
+                        c, outd.dev.value(), in0d.dev.value(),
+                        self.weight.val.dev.value(),
+                        B, Self.OUT_, Self.IN_, 0.0,
+                    )
+                    c.enqueue_function[_bias_add_kernel[DT]](
+                        outd.dev.value(),
+                        bl,
+                        Int64(B),
+                        Int64(Self.OUT_),
+                        grid_dim=(B * Self.OUT_ + 255) // 256,
+                        block_dim=256,
+                    )
+                elif Self.NEEDS_PAD or Self.NEEDS_N_PAD:
                     self._ensure_w_pad(c)
                     # The activation only needs a copy when K is padded; when
                     # only N is padded, K_PAD == IN_ and `in0d` is already the
@@ -1069,7 +1090,7 @@ struct Linear[IN_: Int, OUT_: Int, ADT: DType = DT](Module):
             else:
                 var c = ctx.value()
                 gind.ensure_gpu(c, B * Self.IN_)
-                comptime if has_nvidia_gpu_accelerator():
+                comptime if CUBLAS_BWD:
                     # NVIDIA: both GEMMs through cuBLAS on the UNPADDED
                     # operands (`cublas_gemm`): grad_w += xᵀ @ go (β = 1, no
                     # transposed copy, no temporary, no accumulate kernel) and
@@ -1079,15 +1100,14 @@ struct Linear[IN_: Int, OUT_: Int, ADT: DType = DT](Module):
                     var gol = god.dev.value()
                     var gbl = self.bias.grd.dev.value()
                     enqueue_bias_grad[DT](c, gol, gbl, B, Self.OUT_, self.gb_part)
-                    self.blas_ws.ensure_gpu(c, CUBLAS_WS_BYTES)
-                    cublas_gemm[True, False](
+                    cublas_gemm[True, False, cublas_tf32(B, Self.OUT_, Self.IN_)](
                         c, self.weight.grd.dev.value(), find.dev.value(),
-                        god.dev.value(), self.blas_ws.dev.value(),
+                        god.dev.value(),
                         Self.IN_, Self.OUT_, B, 1.0,
                     )
-                    cublas_gemm[False, True](
+                    cublas_gemm[False, True, cublas_tf32(B, Self.OUT_, Self.IN_)](
                         c, gind.dev.value(), god.dev.value(),
-                        self.weight.val.dev.value(), self.blas_ws.dev.value(),
+                        self.weight.val.dev.value(),
                         B, Self.IN_, Self.OUT_, 0.0,
                     )
                 else:

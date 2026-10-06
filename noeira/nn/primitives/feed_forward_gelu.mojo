@@ -43,7 +43,7 @@ from ..core.initializer import Initializer
 from ..core.amp import AMPPolicy, NoAMP
 from ..core.param import ParamVisitor
 from ..core.walkers import join_name
-from ..core.cublas_gemm import cublas_gemm, CUBLAS_WS_BYTES
+from ..core.cublas_gemm import cublas_gemm, cublas_tf32
 from .linear import Linear, enqueue_bias_grad
 from .activations import GELUTanh
 from .ops.gelu_tanh_op import GELUTanhOp
@@ -179,21 +179,19 @@ struct FeedForwardGELU[S: Int, D: Int, FF: Int, ADT: DType = DT](Module):
             var c = ctx.value()
             dh.ensure_gpu(c, R * Self.FF)
             gin.ensure_gpu(c, R * Self.D)
-            self.fc2.blas_ws.ensure_gpu(c, CUBLAS_WS_BYTES)
-            var ws = self.fc2.blas_ws.dev.value()
             # fc2: db2 += Σ go, dW2 += hᵀ·go.
             enqueue_bias_grad[DT](
                 c, go.dev.value(), self.fc2.bias.grd.dev.value(), R, Self.D,
                 self.fc2.gb_part,
             )
-            cublas_gemm[True, False](
+            cublas_gemm[True, False, cublas_tf32(R, Self.D, Self.FF)](
                 c, self.fc2.weight.grd.dev.value(), hd.dev.value(),
-                go.dev.value(), ws, Self.FF, Self.D, R, 1.0,
+                go.dev.value(), Self.FF, Self.D, R, 1.0,
             )
             # dh = go·W2ᵀ (cuBLAS), then dz = GELU'(z) ⊙ dh.
-            cublas_gemm[False, True](
+            cublas_gemm[False, True, cublas_tf32(R, Self.D, Self.FF)](
                 c, dh.dev.value(), go.dev.value(),
-                self.fc2.weight.val.dev.value(), ws, R, Self.FF, Self.D, 0.0,
+                self.fc2.weight.val.dev.value(), R, Self.FF, Self.D, 0.0,
             )
             self.act.vjp[target, R, POLICY=POLICY](
                 child_refs[1, Self.ADT](self.z), self.gh,
@@ -204,13 +202,13 @@ struct FeedForwardGELU[S: Int, D: Int, FF: Int, ADT: DType = DT](Module):
                 c, dz.dev.value(), self.fc1.bias.grd.dev.value(), R, Self.FF,
                 self.fc1.gb_part,
             )
-            cublas_gemm[True, False](
+            cublas_gemm[True, False, cublas_tf32(R, Self.D, Self.FF)](
                 c, self.fc1.weight.grd.dev.value(), x.dev.value(),
-                dz.dev.value(), ws, Self.D, Self.FF, R, 1.0,
+                dz.dev.value(), Self.D, Self.FF, R, 1.0,
             )
-            cublas_gemm[False, True](
+            cublas_gemm[False, True, cublas_tf32(R, Self.D, Self.FF)](
                 c, gin.dev.value(), dz.dev.value(),
-                self.fc1.weight.val.dev.value(), ws, R, Self.D, Self.FF, 0.0,
+                self.fc1.weight.val.dev.value(), R, Self.D, Self.FF, 0.0,
             )
         else:
             self.fc2.vjp[target, R, POLICY=POLICY](

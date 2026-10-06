@@ -1,19 +1,21 @@
-"""Linear's GPU forward and backward against its CPU path, at transformer
-and RL shapes.
+"""LinearAct's GPU forward and backward against its CPU path, at RL shapes.
 
-On NVIDIA the backward is two cuBLAS calls on the unpadded operands
-(`cublas_gemm`: dW += xᵀ·go with β = 1, dx = go·Wᵀ), and the forward of a
-shape MAX would need padded is `cublas_gemm` + a bias kernel (`use_cublas_fwd`);
-aligned shapes keep `mm_bias`. Apple keeps the transpose + GEMM everywhere.
-Each shape runs the vjp TWICE without zero_grad: the weight and bias
-gradients must accumulate. Compared in std units of the CPU value: y, dW, dB
-and dx.
+On NVIDIA the fp32 forward GEMM of a shape MAX would need padded runs through
+`cublas_gemm` (unpadded) + the fused bias/activation kernel, and the backward
+is always two cuBLAS calls (dW += xᵀ·go with β = 1, dx = go·Wᵀ). On Apple
+the padded / unpadded MAX paths run as before. Each shape runs the vjp TWICE
+without zero_grad: the weight and bias gradients must accumulate (the vjp
+gates grad_output in place, on both sides, so the second call sees the gated
+grad on both). Compared in std units of the CPU value: y, dx, dW, dB.
 
-Tolerance per backend: the CUDA GEMMs (MAX's and cuBLAS's) run TF32, ~1e-3
-relative — a band written on Metal's float32 would fail them for no defect
-(`test_linear_pad_parity` does exactly that); Metal is held to 1e-4.
+Tanh, not ReLU: under TF32 a pre-activation near 0 can flip ReLU's gate, and
+the difference is then the size of the gradient, not of the precision
+(`_a_discontinuity_makes_per_element_parity_undecidable`). The GEMM paths are
+the same for every activation.
 
-    pixi run -e apple mojo run -I . tests/nn/test_linear_dw_gpu.mojo
+Tolerance per backend: TF32 on CUDA (1e-2 std units), float32 on Metal (1e-4).
+
+    pixi run -e apple mojo run -I . tests/nn/test_linear_act_gpu.mojo
 """
 
 from std.math import sqrt, abs
@@ -26,7 +28,7 @@ from noeira.nn.constants import DT
 from noeira.nn.core.tensor import Tensor
 from noeira.nn.core.tensor_refs import TensorRefs
 from noeira.nn.core.initializer import Kaiming
-from noeira.nn.primitives.linear import Linear
+from noeira.nn.primitives.linear_tanh import LinearTanh
 
 
 comptime TOL = 1e-2 if has_nvidia_gpu_accelerator() else 1e-4
@@ -47,7 +49,7 @@ def _err(ref_: List[Scalar[DT]], got: List[Scalar[DT]], n: Int) -> Float64:
 
 
 def check[IN: Int, OUT: Int, B: Int](ctx: DeviceContext) raises -> Bool:
-    comptime L = Linear[IN, OUT]
+    comptime L = LinearTanh[IN, OUT]
     seed(IN * 7 + OUT)
     var lc = L.make["cpu", Kaiming]()
     var lg = L.make["gpu", Kaiming](ctx)
@@ -64,15 +66,13 @@ def check[IN: Int, OUT: Int, B: Int](ctx: DeviceContext) raises -> Bool:
     lg.weight.val.version += 1
     var x = Tensor.alloc(B * IN)
     var go = Tensor.alloc(B * OUT)
-    for i in range(B * IN):
-        x.data[i] = Scalar[DT](random_float64(-1, 1))
-    for i in range(B * OUT):
-        go.data[i] = Scalar[DT](random_float64(-1, 1))
     var xg = Tensor.alloc(B * IN)
     var gog = Tensor.alloc(B * OUT)
     for i in range(B * IN):
+        x.data[i] = Scalar[DT](random_float64(-1, 1))
         xg.data[i] = x.data[i]
     for i in range(B * OUT):
+        go.data[i] = Scalar[DT](random_float64(-1, 1))
         gog.data[i] = go.data[i]
     xg.upload(ctx)
     gog.upload(ctx)
@@ -91,43 +91,36 @@ def check[IN: Int, OUT: Int, B: Int](ctx: DeviceContext) raises -> Bool:
     lg.vjp["gpu", B](TensorRefs[1](xg), gog, TensorRefs[1](gig), Optional(ctx))
     ctx.synchronize()
     yg.download(ctx)
+    gig.download(ctx)
     lg.weight.grd.download(ctx)
     lg.bias.grd.download(ctx)
-    gig.download(ctx)
 
     var ey = _err(yc.data, yg.data, B * OUT)
+    var ex = _err(gic.data, gig.data, B * IN)
     var ew = _err(lc.weight.grd.data, lg.weight.grd.data, L.W_SIZE)
     var eb = _err(lc.bias.grd.data, lg.bias.grd.data, L.B_SIZE)
-    var ex = _err(gic.data, gig.data, B * IN)
+    # The band must be able to fail: half the true dW is far outside it.
     var half = List[Scalar[DT]]()
     for i in range(L.W_SIZE):
         half.append(lc.weight.grd.data[i] * Scalar[DT](0.5))
     var eh = _err(lc.weight.grd.data, half, L.W_SIZE)
-    var mag = 0.0
-    for i in range(B * IN):
-        mag = max(mag, abs(Float64(gig.data[i])))
-    var ok = ey < TOL and ew < TOL and eb < TOL and ex < TOL and eh > 100 * TOL and mag > 0.0
+    var ok = ey < TOL and ex < TOL and ew < TOL and eb < TOL and eh > 100 * TOL
     print(
-        "  [", IN, "->", OUT, "] B=", B, " pad=", L.NEEDS_PAD or L.NEEDS_N_PAD,
-        " cublas_fwd=", L.use_cublas_fwd[B](), " y ", ey, " dW ", ew, " dB ", eb, " dx ", ex, " (dW vs half: ", eh, ", |dx|max ", mag, ")",
-        "" if ok else " ✗", sep="",
+        "  [", IN, "->", OUT, "] B=", B, " cublas_fwd=", L.use_cublas_fwd[B](),
+        " | y ", ey, " dx ", ex, " dW ", ew, " dB ", eb,
+        " (dW vs half: ", eh, ")", "" if ok else " ✗", sep="",
     )
     return ok
 
 
 def main() raises:
-    print("Linear GPU vs CPU (std units, tol", TOL, "), forward + two vjps")
+    print("LinearTanh GPU vs CPU (std units, tol", TOL, "), forward + two vjps")
     var ctx = DeviceContext()
     var ok = True
-    ok = check[384, 1152, 1024](ctx) and ok   # GPT qkv projection
-    ok = check[1536, 384, 512](ctx) and ok    # GPT fc2
-    ok = check[192, 768, 640](ctx) and ok     # ViT fc1
-    ok = check[100, 64, 96](ctx) and ok       # padded
-    ok = check[64, 4, 64](ctx) and ok         # PPO LunarLander actor head
-    ok = check[256, 1, 256](ctx) and ok       # SAC critic head (N = 1)
-    ok = check[11, 64, 64](ctx) and ok        # PPO Hopper trunk, minibatch
-    ok = check[11, 64, 128](ctx) and ok       # PPO Hopper trunk, acting (128 lanes)
-    ok = check[64, 64, 2048](ctx) and ok      # PPO Hopper critic, GAE pass
-    ok = check[64, 1, 2048](ctx) and ok       # PPO Hopper critic head, GAE pass
-    assert_true(ok, "GPU backward off the CPU path")
+    ok = check[8, 64, 64](ctx) and ok      # PPO LunarLander trunk, layer 1
+    ok = check[64, 64, 64](ctx) and ok     # PPO trunk, layer 2
+    ok = check[23, 256, 256](ctx) and ok   # SAC critic, layer 1 (obs | act)
+    ok = check[256, 256, 256](ctx) and ok  # SAC trunk, layer 2 (MAX's gate passes)
+    ok = check[17, 256, 1](ctx) and ok     # acting batch of one
+    assert_true(ok, "LinearAct GPU off its CPU path")
     print("PASS")
