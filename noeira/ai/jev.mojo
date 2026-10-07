@@ -34,6 +34,8 @@ ask a human, stop) below it; a choice read without its confidence throws the
 calibration away.
 """
 
+from std.os import getenv
+
 from noeira.io.http import HttpClient
 from noeira.io.json import J_NUMBER, J_OBJECT, J_STRING, JsonDoc, JsonWriter, parse_json
 
@@ -210,7 +212,13 @@ struct JevClient(Movable):
         self.url = url^
         self.model = model^
         self.retries = 2
-        self._http = HttpClient(30000, 10000)
+        # `JEV_TIMEOUT_MS`: a local server can be far slower than the API —
+        # Kev-9B on a Jetson Orin takes ~31 s for the G1 demo's seven questions.
+        var timeout_ms = 30000
+        var t = getenv("JEV_TIMEOUT_MS")
+        if t.byte_length() > 0:
+            timeout_ms = atol(t)
+        self._http = HttpClient(timeout_ms, 10000)
         # A local server without auth gets no header at all, never a bare
         # `Bearer ` (see `keys.mojo`).
         if key.byte_length() > 0:
