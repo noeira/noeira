@@ -14,6 +14,7 @@ package.
 | `capi_mojo/examples/train_from_mef.mojo` | A train step exported by `autodiff/`, trained from Mojo on `maxrt` (CPU, or GPU with capture). |
 | `capi_mojo/run_mef.mojo`, `capi_mojo/build_mef.py` | The smallest Mojo program on the C API: raw `external_call`s. See `capi_mojo/README.md`. |
 | `graph_mojo/` | A Mojo graph builder generated from MAX's op stubs (121 ops), with parity tests against `max.graph`. |
+| `train_from_mojo/` | Train steps defined in Mojo (model, loss, AdamW; noeira's kernel pairs as custom ops), differentiated by `autodiff/`'s transform at setup, trained on MAX through `maxrt`. Gated against the same steps built in Python. See `train_from_mojo/README.md`. |
 | `staged_vs_eager/` | One MLP of noeira layers, run eagerly on noeira's kernels or staged as a MAX graph on the same memory, and the latency crossover between the two. |
 | `mlp_inference.py`, `benchmark_interop.mojo` | MAX from Mojo through Python interop: `MLPInference`, a configurable MLP compiled once on MAX, and the benchmark that splits its cost into compute, transfers and Python glue. |
 | `benchmark_nn_baseline.mojo` | noeira's nn on the same MLPs: the baseline. |
@@ -120,6 +121,22 @@ The crossover follows MAX's executor cost per call:
 - MAX 26.6 behaviours found along the way are pinned as expected failures in
   `autodiff/tests/test_max_findings.py`.
 
+### Training from Mojo
+
+`train_from_mojo/` joins the two halves above. A Mojo program builds its whole train step with the generated builder:
+- the parameter and moment buffers;
+- the forward pass, with noeira's LayerNorm and attention kernel pairs as custom ops;
+- the loss;
+- AdamW's in-place update.
+
+One call hands the ops it emitted to `autodiff/`'s transform, which adds the backward pass. MAX compiles the step, and `maxrt` runs every step with no Python.
+
+- On the M1's CPU, each step tested prints the same MLIR as the step the Python prototype builds, so MAX's compile cache serves one from the other. It trains bit for bit like it, every loss and every final buffer:
+  - three RL-sized MLPs;
+  - an MLP with the LayerNorm pair;
+  - the 2-layer GPT with both kernel pairs.
+- The step can train noeira nn layers' own weights: their `Param` memory is lent to MAX as the parameter buffers, and nn's forward then runs on the trained weights.
+
 ## How to run
 
 From the repo root. The scripts use the main checkout's pixi env (`default`; `MAXRT_ENV`
@@ -130,6 +147,7 @@ noeira_max/capi_mojo/bench/run.sh [--all | --stream]   # NVIDIA: (c)-(e); --all 
 noeira_max/capi_mojo/maxrt_tests/run.sh                 # maxrt's tests (MAXRT_ENV=apple: Metal too)
 noeira_max/graph_mojo/run.sh                            # regenerate the builder, parity tests, example
 noeira_max/staged_vs_eager/run.sh [--gpu]               # the crossover sweep, CPU or CUDA
+noeira_max/train_from_mojo/run.sh [--nn] [--gpu]         # train steps built in Mojo, against Python's
 noeira_max/autodiff/run.sh -m unittest discover -s noeira_max/autodiff/tests -t .
 
 # Through Python interop: build to a binary, and run it inside pixi

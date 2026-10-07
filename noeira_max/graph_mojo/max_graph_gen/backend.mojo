@@ -54,22 +54,28 @@ struct Dim(Copyable, Movable, Writable):
 
 
 struct TensorType(Copyable, Movable, Writable):
-    """A tensor's dtype, shape and device (`"cpu"` or `"gpu"`)."""
+    """A tensor's dtype, shape and device (`"cpu"` or `"gpu"`). With
+    `is_buffer`, a mutable buffer (`max.graph.BufferType`): a graph input
+    the graph reads with `buffer_load` and writes with `buffer_store`."""
 
     var dtype: DType
     var shape: List[Dim]
     var device: String
+    var is_buffer: Bool
 
-    def __init__(out self, dtype: DType, var shape: List[Dim], device: String = "cpu"):
+    def __init__(
+        out self, dtype: DType, var shape: List[Dim], device: String = "cpu", is_buffer: Bool = False
+    ):
         self.dtype = dtype
         self.shape = shape^
         self.device = device
+        self.is_buffer = is_buffer
 
     def rank(self) -> Int:
         return len(self.shape)
 
     def write_to(self, mut writer: Some[Writer]):
-        writer.write("TensorType(", self.dtype, ", [")
+        writer.write("BufferType(" if self.is_buffer else "TensorType(", self.dtype, ", [")
         for i in range(len(self.shape)):
             if i > 0:
                 writer.write(", ")
@@ -241,6 +247,7 @@ def _py_type(t: TensorType) raises -> PythonObject:
     _ = out.append(PythonObject(String(t.dtype)))
     _ = out.append(_py_dims(t.shape))
     _ = out.append(PythonObject(t.device))
+    _ = out.append(PythonObject(t.is_buffer))
     return out
 
 
@@ -287,7 +294,9 @@ def value_from_py(pair: PythonObject) raises -> Value:
             dims.append(Dim(Int(py=d)))
         else:
             dims.append(Dim.symbolic(String(d)))
-    var type = TensorType(dtype_from_name(String(desc[0])), dims^, String(desc[2]))
+    var type = TensorType(
+        dtype_from_name(String(desc[0])), dims^, String(desc[2]), is_buffer=Bool(py=desc[3])
+    )
     return Value(pair[0], type^)
 
 
