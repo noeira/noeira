@@ -116,6 +116,12 @@ struct _InjectVisitor(ParamVisitor, ParamVisitorRT):
             )
         for i in range(n):
             param.data[i] = buf[i]
+        # A WRITE: advance `version`, or the version-gated derived weight caches
+        # of the destination (`Linear` / `LinearAct` / `Conv2D` `w_pad`, the
+        # bf16 `w_bf` of those and `Embedding`) keep serving the PRE-COPY
+        # weight once it has run a forward — a promoted / target net silently
+        # evaluated with its old weights. `checkpoint.mojo` load does the same.
+        param.version += 1
         comptime if target == "gpu":
             param.upload(ctx.value())
         self.cur += 1

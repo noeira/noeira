@@ -532,8 +532,8 @@ struct NoisyLinear[IN_: Int, OUT_: Int](Module):
                 )
             comptime nb_w = (Self.W_SIZE + TPB - 1) // TPB
             c.enqueue_function[_accum_kernel](
-                self.mu_w.grd.lt["gpu", lw](),
-                self.dW_tmp.lt["gpu", lw](),
+                self.mu_w.grd.dev.value(),
+                self.dW_tmp.dev.value(),
                 Int64(Self.W_SIZE),
                 grid_dim=nb_w,
                 block_dim=TPB,

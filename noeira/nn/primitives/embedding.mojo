@@ -31,6 +31,7 @@ from noeira.nn.core.splitk_gemm import (
 )
 
 from noeira.nn.constants import DT, TPB
+from ..core.polyak import polyak_tensor
 from ..core.tensor import Tensor, TensorImpl
 from ..core.tensor_refs import TensorRefs
 from ..core.module import Module
@@ -153,6 +154,24 @@ struct Embedding[VOCAB_: Int, EMBED_DIM_: Int, ADT: DType = DT](Module):
             e.weight.val, Self.W_SIZE, Self.VOCAB_, Self.EMBED_DIM_, ctx
         )
         return e^
+
+    def polyak_from[
+        target: StaticString
+    ](
+        mut self,
+        mut src: Self,
+        tau: Scalar[DT],
+        ctx: Optional[DeviceContext],
+    ) raises:
+        """Soft-update toward `src` (target <- online). The `Module`
+        default is a NO-OP, so without this override a target net containing
+        this layer would keep its init values forever while the online copy
+        trains (the `LayerNorm` / `Conv2D` bug class; audit 2026-10-07)."""
+        polyak_tensor[target, Self.W_SIZE](self.weight.val, src.weight.val, tau, ctx)
+        # `polyak_tensor` writes in place without bumping `val.version`: drop the
+        # version-gated bf16 weight cache so the next forward recasts it.
+        self._w_cast_version = -1
+
 
     def forward[
         target: StaticString, B: Int, o: MutOrigin, POLICY: AMPPolicy = NoAMP

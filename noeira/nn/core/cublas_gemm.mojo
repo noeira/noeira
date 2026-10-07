@@ -59,7 +59,9 @@ comptime GEMM_PATH = get_defined_string["NN_GEMM_PATH", "auto"]()
     paths before cuBLAS);
   - `cublas`: `cublas_gemm` for every forward and backward GEMM;
   - `fwdmax` / `bwdmax`: MAX's GEMMs for the forward / the backward only, the
-    other direction as `auto` (to bisect a difference between the two)."""
+    other direction as `auto` (to bisect a difference between the two);
+  - `linmax` / `convmax`: MAX's GEMMs for `Linear` / `LinearAct` only, or for
+    `Conv2D` only (bisects a model-level difference between the two)."""
 
 comptime CUBLAS_FP32 = is_defined["NN_CUBLAS_FP32"]()
 """`-D NN_CUBLAS_FP32`: `cublas_gemm` computes every GEMM in full fp32."""
@@ -81,7 +83,7 @@ def cublas_tf32(m: Int, n: Int, k: Int) -> Bool:
         return False
     return m * n * k >= (1 << 24)
 
-comptime CUBLAS_BWD = has_nvidia_gpu_accelerator() and GEMM_PATH != "max" and GEMM_PATH != "bwdmax"
+comptime CUBLAS_BWD = has_nvidia_gpu_accelerator() and GEMM_PATH != "max" and GEMM_PATH != "bwdmax" and GEMM_PATH != "linmax"
 """The NVIDIA fp32 backward of `Linear` / `LinearAct` runs on `cublas_gemm`."""
 
 
@@ -105,7 +107,7 @@ def cublas_fwd(m: Int, n: Int, k: Int, padded: Bool) -> Bool:
         streaming (DreamerV3's [16, 3072] @ [3072, 13824]: 109 vs 144 us).
 
     With this rule every measured shape is within 4% of the faster path."""
-    if not has_nvidia_gpu_accelerator() or GEMM_PATH == "max" or GEMM_PATH == "fwdmax":
+    if not has_nvidia_gpu_accelerator() or GEMM_PATH == "max" or GEMM_PATH == "fwdmax" or GEMM_PATH == "linmax":
         return False
     if GEMM_PATH == "cublas":
         return True

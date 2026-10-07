@@ -38,7 +38,8 @@ def main() raises:
     comptime N_EPOCHS = get_defined_int["NN_EPOCHS", 15]()
     comptime TARGET_ACC: Float64 = 0.65
 
-    seed(42)
+    comptime SEED = get_defined_int["NN_SEED", 42]()  # `-D NN_SEED=N`: another run
+    seed(SEED)
     print("loading CIFAR-10...")
     var ds = CIFAR10()
     var c = DeviceContext()

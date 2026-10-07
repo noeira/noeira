@@ -32,6 +32,7 @@ from std.random import seed
 from std.time import perf_counter_ns
 from std.memory import Pointer
 
+from std.sys.defines import get_defined_int
 from max.gpu.host import DeviceContext
 
 from noeira.core.run import RunContext, register_run
@@ -95,7 +96,7 @@ comptime HIT_REWARD = 0.0
 # Replay ratio = GRAD_STEPS / N_ENVS = 16/64 = 0.25 (CleanRL train_freq=4).
 comptime GRAD_STEPS = 16
 comptime WARMUP = 20_000
-comptime NUM_STEPS = 5_000_000
+comptime NUM_STEPS = get_defined_int["RB_STEPS", 5_000_000]()  # `-D RB_STEPS=N`: shorter run
 comptime LR = Scalar[DT](6.25e-5)
 
 # Checkpointing. The CNN q-net + optimizer + epsilon are written to the run's
@@ -116,7 +117,7 @@ comptime PongPixelBatched = BatchedGpuDiscreteEnv[
 
 
 def main() raises:
-    seed(42)
+    seed(get_defined_int["RB_SEED", 42]())  # `-D RB_SEED=N`: another run
     print("=" * 70)
     print("Rainbow DQN CNN GPU Training on Pong — Pixel (deep_agents)")
     print("=" * 70)
@@ -224,7 +225,7 @@ def main() raises:
             ](
                 env,
                 NUM_STEPS,
-                rng_seed=UInt64(42),
+                rng_seed=UInt64(get_defined_int["RB_SEED", 42]()),
                 updates_per_step=GRAD_STEPS,
                 print_every=20_000,
                 verbose=True,

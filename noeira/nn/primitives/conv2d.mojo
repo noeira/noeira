@@ -24,7 +24,14 @@ legacy package (which gets deleted at the end of the migration).
 """
 
 from noeira.nn.core.mm import mm, bmm
-from std.sys import CompilationTarget
+from noeira.nn.core.cublas_gemm import cublas_gemm, cublas_tf32, GEMM_PATH
+from noeira.nn.core.cudnn_conv import (
+    CONV_PATH,
+    cudnn_conv_forward,
+    cudnn_conv_backward_data,
+    cudnn_conv_backward_filter,
+)
+from std.sys import CompilationTarget, has_nvidia_gpu_accelerator
 from max.gpu import thread_idx, block_idx, block_dim, global_idx
 from max.gpu.primitives import block
 from max.gpu.host import DeviceContext, DeviceBuffer
@@ -51,7 +58,7 @@ from ..core.param import Param, ParamVisitor
 from ..core.initializer import Initializer
 from ..core.amp import AMPPolicy, NoAMP
 from ..core.polyak import polyak_tensor
-from .linear import _cast_f2b_kernel, BF16
+from .linear import _cast_f2b_kernel, BF16, enqueue_bias_grad
 
 
 comptime CONV_DW_TPB: Int = 128
@@ -745,6 +752,45 @@ def _backward_db_kernel[
         grad_bias[oc] = rebind[Scalar[DT]](grad_bias[oc]) + total[0]
 
 
+def _rowsum_kernel[ROWS: Int, COLS: Int](
+    src: LayoutTensor[DT, Layout.row_major(ROWS, COLS), MutAnyOrigin],
+    dst: LayoutTensor[DT, Layout.row_major(ROWS), MutAnyOrigin],
+):
+    """`dst[r] = Σ_c src[r, c]`, one block per row (coalesced along c).
+    Stage 1 of the NCHW bias gradient: rows are (sample, channel), columns
+    the contiguous OH·OW positions."""
+    var r = Int(block_idx.x)
+    var t = Int(thread_idx.x)
+    var acc: Scalar[DT] = 0
+    var c = t
+    while c < COLS:
+        acc += rebind[Scalar[DT]](src[r, c])
+        c += CONV_DW_TPB
+    var total = block.sum[block_size=CONV_DW_TPB, broadcast=False](val=acc)
+    if t == 0:
+        dst[r] = total[0]
+
+
+def _bias_add_out_kernel[
+    BATCH: Int, OC: Int, SO: Int, OUT_FLAT: Int, LAYOUT: Int = LAYOUT_NCHW
+](
+    dst: LayoutTensor[DT, Layout.row_major(BATCH, OUT_FLAT), MutAnyOrigin],
+    bias: LayoutTensor[DT, Layout.row_major(OC), MutAnyOrigin],
+):
+    """`dst[b, oc, s] += bias[oc]` in place, in either layout — the bias of
+    the cuDNN forward, which writes the convolution alone."""
+    var idx = Int(global_idx.x)
+    if idx < BATCH * OUT_FLAT:
+        var b = idx // OUT_FLAT
+        var r = idx % OUT_FLAT
+        var oc: Int
+        comptime if LAYOUT == LAYOUT_NHWC:
+            oc = r % OC
+        else:
+            oc = r // SO
+        dst[b, r] = rebind[Scalar[DT]](dst[b, r]) + rebind[Scalar[DT]](bias[oc])
+
+
 # ── Conv2D ────────────────────────────────────────────────────────────────
 
 # NOTE: the conv dW's tile-config dispatch lives in
@@ -856,11 +902,64 @@ struct Conv2D[
     # ⚠ The dW win only exists WITH a tuned partition count. At MAX's own P=8
     # the padded GEMM is 0.21x -- a 5x REGRESSION versus the vendor path. The
     # pad and `splitk_gemm` are one change, not two.
+    comptime KEEP_MAX = (
+        CONV_PATH == "auto"
+        and Self.IC_ == 1
+        and Self.OC_ <= 16
+        and Self.COL >= 25
+        and Self.COL <= 64
+    )
+    """The one regime where neither cuBLAS nor cuDNN beat MAX's padded GEMMs
+    (`benchmarks/bench_conv2d_paths_gpu.mojo`, RTX 5090): a single-input-
+    channel conv with a 25-64 long contraction and <= 16 outputs (MNIST conv1:
+    58 us vs 99 cuDNN, 116 im2col). A property of the layer, not of the
+    batch, because it decides the padding below."""
+    comptime CUB = has_nvidia_gpu_accelerator() and GEMM_PATH != "max" and GEMM_PATH != "convmax" and not Self.KEEP_MAX
+    """NVIDIA fp32: the three GEMMs (forward, dW, d_col) run on `cublas_gemm`,
+    UNPADDED: cuBLAS takes any shape without the per-call workspace that MAX's
+    fallback allocates, so `CPAD == COL` and `OCPAD == OC_` below and none of
+    the padding exists. MAX's padded GEMMs stay for Apple and for
+    `-D NN_GEMM_PATH=max` (A/B runs)."""
+    @staticmethod
+    def use_cudnn[B: Int]() -> Bool:
+        """NVIDIA fp32: run this layer's forward and backward through cuDNN
+        (`cudnn_conv`) instead of im2col + GEMM. `NN_CONV_PATH` selects;
+        `auto` is the per-shape rule below."""
+        comptime if not has_nvidia_gpu_accelerator() or Self.ADT != DT or GEMM_PATH == "max" or GEMM_PATH == "convmax":
+            return False
+        comptime if CONV_PATH == "cudnn":
+            return True
+        comptime if CONV_PATH == "im2col":
+            return False
+        # `auto`: measured per shape on an RTX 5090 (80 shapes from every
+        # agent and example; cuDNN restricted to its deterministic GEMM
+        # algorithms, `cudnn_conv`). cuDNN's implicit GEMM wins where the
+        # im2col matrix is large: stride-1 3x3 / 5x5 convs with >= 12 input
+        # channels over >= 30k output positions, or heavy ones (contraction
+        # >= 2304 at >= 9k positions); NHWC (cuDNN's layout); OC == 1 (the
+        # im2col path's matvec: 4.4 ms vs 1.1 ms on DreamerV3's decoder
+        # output); 16-channel 1x1 heads. Stems, stride-2 layers and small
+        # spatial sizes stay on im2col + cuBLAS. With this rule no measured
+        # shape is slower than MAX's padded path (median 1.48x faster).
+        comptime BS = B * Self.SO
+        comptime if Self.OC_ == 1:
+            return True
+        comptime if Self.KEEP_MAX:
+            return False
+        comptime if Self.K_ == 1 and Self.OC_ <= 16 and Self.IC_ >= 32:
+            return True
+        comptime if Self.LAYOUT == LAYOUT_NHWC and Self.IC_ >= 12:
+            return True
+        return (
+            Self.S_ == 1 and Self.K_ >= 3 and Self.IC_ >= 12
+            and (BS >= 30_000 or (BS >= 9_000 and Self.COL >= 2304))
+        )
+
     comptime PAD_TO = 128
     comptime K_MIN = 128
-    comptime CPAD = Self._round_up(Self.COL, Self.PAD_TO) if Self._round_up(
+    comptime CPAD = Self.COL if Self.CUB else (Self._round_up(Self.COL, Self.PAD_TO) if Self._round_up(
         Self.COL, Self.PAD_TO
-    ) > Self.K_MIN else Self.K_MIN
+    ) > Self.K_MIN else Self.K_MIN)
     comptime NEEDS_COL_PAD = Self.CPAD != Self.COL
     """The im2col row stride the fp32 GPU path uses — `COL` rounded up to
     `PAD_TO`, and exactly `COL` when it is already aligned (then every kernel
@@ -886,9 +985,9 @@ struct Conv2D[
     # d_col GEMM has N = `BS` = BATCH*OH*OW — a batch-times-spatial size that
     # is not ours to pad. Those stay on the vendor path.
     comptime N_PAD_TO = 128
-    comptime OCPAD = Self._round_up(
+    comptime OCPAD = Self.OC_ if Self.CUB else (Self._round_up(
         Self.OC_, Self.N_PAD_TO
-    ) if Self.OC_ != 1 else 1
+    ) if Self.OC_ != 1 else 1)
     comptime NEEDS_OC_PAD = Self.OCPAD != Self.OC_
     comptime NEEDS_W_PAD = Self.NEEDS_COL_PAD or Self.NEEDS_OC_PAD
     comptime WPAD_SIZE = Self.OCPAD * Self.CPAD
@@ -989,6 +1088,10 @@ struct Conv2D[
     # so wherever BN's single-field cache is valid at vjp, `col_t` is too).
     # 0 = no forward has populated the col yet.
     var _col_src_ptr: Int
+    var db_rows: Tensor
+    """[B·OC] per-(sample, channel) sums: stage 1 of the NCHW bias grad."""
+    var db_part: Tensor
+    """Chunk partials of `enqueue_bias_grad` (stage 2)."""
 
     def __init__(out self):
         self.weight = Param["weight", True, Self.W_SIZE]()
@@ -1013,6 +1116,8 @@ struct Conv2D[
         self._w_cast_version = -1  # < any real version → first forward casts
         self._force_recast = False
         self._col_src_ptr = 0
+        self.db_rows = Tensor()
+        self.db_part = Tensor()
 
     def set_attr[ATTR: StaticString](mut self, value: Scalar[DT]):
         comptime if ATTR == "capture_recast":
@@ -1193,6 +1298,22 @@ struct Conv2D[
                 var c = ctx.value()
                 comptime BS = B * Self.SO
                 outd.ensure_gpu(c, B * Self.OUT_FLAT)
+                comptime if Self.use_cudnn[B]():
+                    cudnn_conv_forward[
+                        B, Self.IC_, Self.OC_, Self.K_, Self.S_, Self.P_,
+                        Self.H_, Self.W_, Self.LAYOUT == LAYOUT_NHWC,
+                        cublas_tf32(BS, Self.OC_, Self.COL),
+                    ](c, outd.dev.value(), in0d.dev.value(), self.weight.val.dev.value())
+                    comptime nb_b = (B * Self.OUT_FLAT + CONV_TPB - 1) // CONV_TPB
+                    c.enqueue_function[
+                        _bias_add_out_kernel[B, Self.OC_, Self.SO, Self.OUT_FLAT, Self.LAYOUT]
+                    ](
+                        outd.lt["gpu", Layout.row_major(B, Self.OUT_FLAT)](),
+                        self.bias.val.lt["gpu", Layout.row_major(Self.OC_)](),
+                        grid_dim=nb_b,
+                        block_dim=CONV_TPB,
+                    )
+                    return
                 # K-aligned im2col stride (== COL when already aligned).
                 self.col_t.ensure_gpu(c, BS * Self.CPAD)
                 self.outp_t.ensure_gpu(c, BS * Self.OCPAD)
@@ -1247,37 +1368,45 @@ struct Conv2D[
                     # The padded columns are zero on BOTH operands, so they
                     # contribute exactly 0 — the result is the unpadded GEMM's,
                     # bit for bit, at an aligned contraction length.
-                    var w_buf = self._w_col_buf(c)
-                    var col_tt = TileTensor(
-                        self.col_t.dev.value(), row_major[BS, Self.CPAD]()
-                    )
-                    var w_tt = TileTensor(
-                        w_buf, row_major[Self.OCPAD, Self.CPAD]()
-                    )
-                    var outp_tt = TileTensor(
-                        self.outp_t.dev.value(), row_major[BS, Self.OCPAD]()
-                    )
-                    # Same treatment as the dW, and for the same reason:
-                    # once `CPAD >= 2048` MAX partitions K here too and
-                    # allocates its reduction workspace per call, which is a
-                    # capture blocker. See `sk_ws_fwd`.
-                    comptime if splitk_path_applies[c.default_device_info]():
-                        if self._sk_p_fwd < 0:
-                            self._decide_sk_p_fwd(BS, c)
-                        if self._sk_p_fwd > 1:
-                            dispatch_splitk_gemm[transpose_b=True](
-                                outp_tt, col_tt, w_tt,
-                                BS, Self.OCPAD, Self.CPAD,
-                                self._sk_p_fwd, self.sk_ws_fwd, c,
-                            )
+                    comptime if Self.CUB:
+                        # out[BS, OC] = col[BS, COL] @ W[OC, COL]ᵀ, unpadded.
+                        cublas_gemm[False, True, cublas_tf32(BS, Self.OC_, Self.COL)](
+                            c, self.outp_t.dev.value(), self.col_t.dev.value(),
+                            self.weight.val.dev.value(),
+                            BS, Self.OC_, Self.COL, 0.0,
+                        )
+                    else:
+                        var w_buf = self._w_col_buf(c)
+                        var col_tt = TileTensor(
+                            self.col_t.dev.value(), row_major[BS, Self.CPAD]()
+                        )
+                        var w_tt = TileTensor(
+                            w_buf, row_major[Self.OCPAD, Self.CPAD]()
+                        )
+                        var outp_tt = TileTensor(
+                            self.outp_t.dev.value(), row_major[BS, Self.OCPAD]()
+                        )
+                        # Same treatment as the dW, and for the same reason:
+                        # once `CPAD >= 2048` MAX partitions K here too and
+                        # allocates its reduction workspace per call, which is a
+                        # capture blocker. See `sk_ws_fwd`.
+                        comptime if splitk_path_applies[c.default_device_info]():
+                            if self._sk_p_fwd < 0:
+                                self._decide_sk_p_fwd(BS, c)
+                            if self._sk_p_fwd > 1:
+                                dispatch_splitk_gemm[transpose_b=True](
+                                    outp_tt, col_tt, w_tt,
+                                    BS, Self.OCPAD, Self.CPAD,
+                                    self._sk_p_fwd, self.sk_ws_fwd, c,
+                                )
+                            else:
+                                mm[transpose_b=True, A0=BS, A1=Self.CPAD, B0=Self.OCPAD, B1=Self.CPAD, O0=BS, O1=Self.OCPAD](
+                                    self.outp_t.dev.value(), self.col_t.dev.value(), w_buf, c
+                                )
                         else:
                             mm[transpose_b=True, A0=BS, A1=Self.CPAD, B0=Self.OCPAD, B1=Self.CPAD, O0=BS, O1=Self.OCPAD](
                                 self.outp_t.dev.value(), self.col_t.dev.value(), w_buf, c
                             )
-                    else:
-                        mm[transpose_b=True, A0=BS, A1=Self.CPAD, B0=Self.OCPAD, B1=Self.CPAD, O0=BS, O1=Self.OCPAD](
-                            self.outp_t.dev.value(), self.col_t.dev.value(), w_buf, c
-                        )
                     # (3) scatter → output[B, OC·SO] + bias
                     comptime nb_sc = (
                         B * Self.OUT_FLAT + CONV_TPB - 1
@@ -1430,6 +1559,29 @@ struct Conv2D[
         self._sk_p = decide_partitions(Self.OC_, Self.CPAD, BS, ctx)
         if self._sk_p > 1:
             self.sk_ws.ensure_gpu(ctx, self._sk_p * Self.OC_ * Self.CPAD)
+
+    def _enqueue_db[B: Int](mut self, c: DeviceContext, mut god: Tensor) raises:
+        """`grad_bias += Σ_{b, s} grad_output[b, oc, s]`, deterministic, in two
+        passes. The old `_backward_db_kernel` gave each channel ONE block
+        walking B·OH·OW values: 16 blocks on a 170-SM card for a ResNet stem,
+        ~118 us at batch 100 x 32x32 — longer than cuDNN's whole dgrad.
+        NCHW: per-(b, oc) row sums over the contiguous OH·OW, then the
+        [B, OC] column sum. NHWC: grad_output already is [B·OH·OW, OC]."""
+        comptime if Self.LAYOUT == LAYOUT_NHWC:
+            enqueue_bias_grad[DT](
+                c, god.dev.value(), self.bias.grd.dev.value(), B * Self.SO, Self.OC_, self.db_part
+            )
+        else:
+            self.db_rows.ensure_gpu(c, B * Self.OC_)
+            c.enqueue_function[_rowsum_kernel[B * Self.OC_, Self.SO]](
+                god.lt["gpu", Layout.row_major(B * Self.OC_, Self.SO)](),
+                self.db_rows.lt["gpu", Layout.row_major(B * Self.OC_)](),
+                grid_dim=B * Self.OC_,
+                block_dim=CONV_DW_TPB,
+            )
+            enqueue_bias_grad[DT](
+                c, self.db_rows.dev.value(), self.bias.grd.dev.value(), B, Self.OC_, self.db_part
+            )
 
     def vjp[
         target: StaticString,
@@ -1623,6 +1775,19 @@ struct Conv2D[
             var c = ctx.value()
             comptime BS = B * Self.SO
             gind.ensure_gpu(c, B * Self.IN_FLAT)
+            comptime if Self.use_cudnn[B]():
+                comptime NHWC = Self.LAYOUT == LAYOUT_NHWC
+                comptime TF = cublas_tf32(BS, Self.OC_, Self.COL)
+                cudnn_conv_backward_filter[
+                    B, Self.IC_, Self.OC_, Self.K_, Self.S_, Self.P_,
+                    Self.H_, Self.W_, NHWC, TF,
+                ](c, self.weight.grd.dev.value(), find.dev.value(), god.dev.value())
+                self._enqueue_db[B](c, god)
+                cudnn_conv_backward_data[
+                    B, Self.IC_, Self.OC_, Self.K_, Self.S_, Self.P_,
+                    Self.H_, Self.W_, NHWC, TF,
+                ](c, gind.dev.value(), self.weight.val.dev.value(), god.dev.value())
+                return
             self.col_t.ensure_gpu(c, BS * Self.CPAD)
             self.goT_t.ensure_gpu(c, Self.OC_ * BS)
             # [OC, CPAD] when padding — the dW GEMM's OUTPUT width is COL, the
@@ -1679,91 +1844,95 @@ struct Conv2D[
                 grid_dim=nb_got,
                 block_dim=TPB,
             )
-            # (3) dW_tmp = goᵀ @ col → accumulate into grad_w
-            var goT_tt = TileTensor(
-                self.goT_t.dev.value(), row_major[Self.OC_, BS]()
-            )
-            var col_tt = TileTensor(
-                self.col_t.dev.value(), row_major[BS, Self.CPAD]()
-            )
-            var dW_tmp_tt = TileTensor(
-                self.dW_tmp.dev.value(), row_major[Self.OC_, Self.CPAD]()
-            )
-            # ── dW: split-K on OUR workspace, or plain matmul ──────────
-            # `[OC, BS] @ [BS, CPAD]`: K is `batch * OH * OW`, so this is the
-            # longest-K GEMM in the model and the one `select_config`
-            # under-partitions worst (a ResNet18 stem is TWO tiles, so MAX's
-            # P=8 puts 16 blocks on a 170-SM card). Inert unless MAX's own
-            # dispatch would have reached a partitioned `multistage_gemm`.
-            comptime if splitk_path_applies[c.default_device_info]():
-                if self._sk_p < 0:
-                    self._decide_sk_p(BS, c)
-                if self._sk_p > 1:
-                    dispatch_splitk_gemm(
-                        dW_tmp_tt, goT_tt, col_tt,
-                        Self.OC_, Self.CPAD, BS,
-                        self._sk_p, self.sk_ws, c,
-                    )
+            # (3) grad_w += goᵀ @ col
+            comptime if Self.CUB:
+                # One cuBLAS call, β = 1 straight into the master grad: no
+                # temporary, no accumulate kernel, no padding.
+                cublas_gemm[False, False, cublas_tf32(BS, Self.OC_, Self.COL)](
+                    c, self.weight.grd.dev.value(), self.goT_t.dev.value(),
+                    self.col_t.dev.value(),
+                    Self.OC_, Self.COL, BS, 1.0,
+                )
+            else:
+                # (3) dW_tmp = goᵀ @ col → accumulate into grad_w
+                var goT_tt = TileTensor(
+                    self.goT_t.dev.value(), row_major[Self.OC_, BS]()
+                )
+                var col_tt = TileTensor(
+                    self.col_t.dev.value(), row_major[BS, Self.CPAD]()
+                )
+                var dW_tmp_tt = TileTensor(
+                    self.dW_tmp.dev.value(), row_major[Self.OC_, Self.CPAD]()
+                )
+                # ── dW: split-K on OUR workspace, or plain matmul ──────────
+                # `[OC, BS] @ [BS, CPAD]`: K is `batch * OH * OW`, so this is the
+                # longest-K GEMM in the model and the one `select_config`
+                # under-partitions worst (a ResNet18 stem is TWO tiles, so MAX's
+                # P=8 puts 16 blocks on a 170-SM card). Inert unless MAX's own
+                # dispatch would have reached a partitioned `multistage_gemm`.
+                comptime if splitk_path_applies[c.default_device_info]():
+                    if self._sk_p < 0:
+                        self._decide_sk_p(BS, c)
+                    if self._sk_p > 1:
+                        dispatch_splitk_gemm(
+                            dW_tmp_tt, goT_tt, col_tt,
+                            Self.OC_, Self.CPAD, BS,
+                            self._sk_p, self.sk_ws, c,
+                        )
+                    else:
+                        mm[A0=Self.OC_, A1=BS, B0=BS, B1=Self.CPAD, O0=Self.OC_, O1=Self.CPAD](
+                            self.dW_tmp.dev.value(), self.goT_t.dev.value(), self.col_t.dev.value(), c
+                        )
                 else:
                     mm[A0=Self.OC_, A1=BS, B0=BS, B1=Self.CPAD, O0=Self.OC_, O1=Self.CPAD](
                         self.dW_tmp.dev.value(), self.goT_t.dev.value(), self.col_t.dev.value(), c
                     )
-            else:
-                mm[A0=Self.OC_, A1=BS, B0=BS, B1=Self.CPAD, O0=Self.OC_, O1=Self.CPAD](
-                    self.dW_tmp.dev.value(), self.goT_t.dev.value(), self.col_t.dev.value(), c
-                )
-            # ⚠ STRIDED accumulate: dW comes back `[OC, CPAD]` and the master
-            # grad is `[OC, COL]`. A flat add folds each row's padding into the
-            # next row's leading weights — see `_accum_w_2d_kernel`.
-            comptime nb_acc = (Self.W_SIZE + TPB - 1) // TPB
-            comptime if Self.NEEDS_COL_PAD:
-                c.enqueue_function[
-                    _accum_w_2d_kernel[Self.OC_, Self.COL, Self.CPAD]
-                ](
-                    self.weight.grd.lt["gpu", Layout.row_major(Self.W_SIZE)](),
-                    self.dW_tmp.lt["gpu", Layout.row_major(Self.DWPAD_SIZE)](),
-                    grid_dim=nb_acc,
-                    block_dim=TPB,
-                )
-            else:
-                c.enqueue_function[_accum_kernel[Self.W_SIZE]](
-                    self.weight.grd.lt["gpu", Layout.row_major(Self.W_SIZE)](),
-                    self.dW_tmp.lt["gpu", Layout.row_major(Self.W_SIZE)](),
-                    grid_dim=nb_acc,
-                    block_dim=TPB,
-                )
-            # (4) d_bias — 1 block per OC
-            c.enqueue_function[
-                _backward_db_kernel[
-                    B,
-                    Self.OC_,
-                    Self.OH,
-                    Self.OW,
-                    Self.OUT_FLAT,
-                    DT,
-                    Self.LAYOUT,
-                ]
-            ](
-                god.lt["gpu", Layout.row_major(B, Self.OUT_FLAT)](),
-                self.bias.grd.lt["gpu", Layout.row_major(Self.OC_)](),
-                grid_dim=Self.OC_,
-                block_dim=CONV_DW_TPB,
-            )
+                # ⚠ STRIDED accumulate: dW comes back `[OC, CPAD]` and the master
+                # grad is `[OC, COL]`. A flat add folds each row's padding into the
+                # next row's leading weights — see `_accum_w_2d_kernel`.
+                comptime nb_acc = (Self.W_SIZE + TPB - 1) // TPB
+                comptime if Self.NEEDS_COL_PAD:
+                    c.enqueue_function[
+                        _accum_w_2d_kernel[Self.OC_, Self.COL, Self.CPAD]
+                    ](
+                        self.weight.grd.lt["gpu", Layout.row_major(Self.W_SIZE)](),
+                        self.dW_tmp.lt["gpu", Layout.row_major(Self.DWPAD_SIZE)](),
+                        grid_dim=nb_acc,
+                        block_dim=TPB,
+                    )
+                else:
+                    c.enqueue_function[_accum_kernel[Self.W_SIZE]](
+                        self.weight.grd.lt["gpu", Layout.row_major(Self.W_SIZE)](),
+                        self.dW_tmp.lt["gpu", Layout.row_major(Self.W_SIZE)](),
+                        grid_dim=nb_acc,
+                        block_dim=TPB,
+                    )
+            # (4) d_bias — two-pass, deterministic (`_enqueue_db`)
+            self._enqueue_db[B](c, god)
             # (5) d_input (O2): d_colᵀ[COL,BS] = Wᵀ[COL,OC] @ goᵀ[OC,BS] reusing
             # the goᵀ from (2) — NO `_go_pack` kernel — then the coalesced col2im
             # reading the transposed d_colᵀ. col_t (free after the dW GEMM) is
             # reused as the [COL, BS] d_colᵀ buffer.
-            self.wT_t.ensure_gpu(c, Self.COL * Self.OC_)
-            comptime nb_wt = (Self.OC_ * Self.COL + TPB - 1) // TPB
-            c.enqueue_function[_wT_transpose_kernel[Self.OC_, Self.COL]](
-                self.weight.val.lt["gpu", Layout.row_major(Self.OC_, Self.COL)](),
-                self.wT_t.lt["gpu", Layout.row_major(Self.COL, Self.OC_)](),
-                grid_dim=nb_wt,
-                block_dim=TPB,
-            )
-            mm[A0=Self.COL, A1=Self.OC_, B0=Self.OC_, B1=BS, O0=Self.COL, O1=BS](
-                self.col_t.dev.value(), self.wT_t.dev.value(), self.goT_t.dev.value(), c
-            )
+            comptime if Self.CUB:
+                # d_colᵀ[COL, BS] = W[OC, COL]ᵀ @ goᵀ[OC, BS]: cuBLAS takes the
+                # transpose, so no Wᵀ copy.
+                cublas_gemm[True, False, cublas_tf32(BS, Self.OC_, Self.COL)](
+                    c, self.col_t.dev.value(), self.weight.val.dev.value(),
+                    self.goT_t.dev.value(),
+                    Self.COL, BS, Self.OC_, 0.0,
+                )
+            else:
+                self.wT_t.ensure_gpu(c, Self.COL * Self.OC_)
+                comptime nb_wt = (Self.OC_ * Self.COL + TPB - 1) // TPB
+                c.enqueue_function[_wT_transpose_kernel[Self.OC_, Self.COL]](
+                    self.weight.val.lt["gpu", Layout.row_major(Self.OC_, Self.COL)](),
+                    self.wT_t.lt["gpu", Layout.row_major(Self.COL, Self.OC_)](),
+                    grid_dim=nb_wt,
+                    block_dim=TPB,
+                )
+                mm[A0=Self.COL, A1=Self.OC_, B0=Self.OC_, B1=BS, O0=Self.COL, O1=BS](
+                    self.col_t.dev.value(), self.wT_t.dev.value(), self.goT_t.dev.value(), c
+                )
             comptime nb_dx = (B * Self.IN_FLAT + CONV_DW_TPB - 1) // CONV_DW_TPB
             c.enqueue_function[
                 _dx_col2im_kernel[
@@ -1789,6 +1958,9 @@ struct Conv2D[
                 grid_dim=nb_dx,
                 block_dim=CONV_DW_TPB,
             )
+            # col_t now holds d_colᵀ, not this input's im2col: a second vjp
+            # on the same forward must recompute it, not reuse it (A2).
+            self._col_src_ptr = 0
         else:
             # ── bf16-flow path (GPU-only) ──
             comptime assert target == "gpu", "bf16-flow Conv2D is GPU-only"
@@ -1926,6 +2098,8 @@ struct Conv2D[
                 grid_dim=nb_dx,
                 block_dim=CONV_DW_TPB,
             )
+            # col_t_bf now holds d_colᵀ (see the fp32 path): invalidate A2.
+            self._col_src_ptr = 0
 
     def polyak_from[
         target: StaticString
@@ -1945,6 +2119,16 @@ struct Conv2D[
         polyak_tensor[target, Self.B_SIZE](
             self.bias.val, src.bias.val, tau, ctx
         )
+        # ⚠ `polyak_tensor` writes `weight.val` IN PLACE without bumping
+        # `val.version`, so the padded (`w_pad`) and bf16 (`w_bf`) weight
+        # caches would keep serving the PRE-SYNC weight: a target conv net
+        # frozen at its init weights. `Linear` / `LinearAct` learned this from
+        # a DQN smoke (eval 200 -> 9); this one was missing it, and Rainbow on
+        # pixel Pong stopped learning on the padded MAX path (1M steps: mean
+        # return -20.9 vs +16 once fixed). Gate: `test_conv2d_gpu`
+        # (`check_polyak`).
+        self._w_pad_version = -1
+        self._w_cast_version = -1
 
     # for_each_param / zero_grad inherit the Module reflection defaults
     # (core/walkers.mojo auto-discovers the Param fields).

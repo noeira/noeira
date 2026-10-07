@@ -49,7 +49,8 @@ def main() raises:
     comptime N_EPOCHS = get_defined_int["NN_EPOCHS", 50]()
     comptime TARGET_ACC: Float64 = 0.80
 
-    seed(42)
+    comptime SEED = get_defined_int["NN_SEED", 42]()  # `-D NN_SEED=N`: another run
+    seed(SEED)
     print("loading CIFAR-10...")
     var ds = CIFAR10()
     var c = DeviceContext()
@@ -97,8 +98,8 @@ def main() raises:
         Optional(c),
         epochs=N_EPOCHS,
         shuffle=True,
-        rng_seed=UInt64(42),
-        aug_seed=UInt64(1000),
+        rng_seed=UInt64(SEED),
+        aug_seed=UInt64(1000 + SEED - 42),
     )
 
     var best_acc: Float64 = 0.0
