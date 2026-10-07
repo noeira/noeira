@@ -156,15 +156,22 @@ def nn_forward_error[target: StaticString](
 
 def run[target: StaticString](dir: String, steps: Int, bump: Bool) raises:
     comptime gpu = target == "gpu"
-    var ctx = Optional(DeviceContext()) if gpu else Optional[DeviceContext](None)
+    var rt = Runtime(accelerator=gpu)
+    # Not `Optional(DeviceContext()) if gpu else None`: with a condition known
+    # at compile time, Mojo 1.1 hands back a dead context from that
+    # expression, and its first buffer crashes inside AsyncRT (SIGSEGV on
+    # CUDA, SIGTRAP on Metal). A runtime condition, or `comptime if`, is fine.
+    var ctx = Optional[DeviceContext](None)
+    comptime if gpu:
+        ctx = Optional(DeviceContext())
+    var net = Critic[target](ctx)
     var s = shape_named("sac")
     var n = 2 * (len(s.dims) - 1)
     var device = String(target)
     var glue = Python.import_module(GLUE)
     var builtins = Python.import_module("builtins")
 
-    # nn's layers, initialised by nn: their initial weights seed the reference.
-    var net = Critic[target](ctx)
+    # nn's initial weights seed the reference.
     var init = builtins.dict()
     for k in range(n):
         init[PythonObject(param_name(k))] = net.param_numpy(k, ctx, py_list(input_shape(s, k)))
@@ -182,7 +189,6 @@ def run[target: StaticString](dir: String, steps: Int, bump: Bool) raises:
 
     var g = build_mlp_step(s, device, LR)
     var text = String(glue.graph_text(g.backend.graph))
-    var rt = Runtime(accelerator=gpu)
     var model = g.compile(rt, dir + "/" + step_name(s) + ".mef", device)
     print("[mojo] built and compiled", step_name(s), "in", g.compile_seconds, "s on", device)
 

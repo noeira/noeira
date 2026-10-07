@@ -131,7 +131,7 @@ The crossover follows MAX's executor cost per call:
 
 One call hands the ops it emitted to `autodiff/`'s transform, which adds the backward pass. MAX compiles the step, and `maxrt` runs every step with no Python.
 
-- On the M1's CPU, each step tested prints the same MLIR as the step the Python prototype builds, so MAX's compile cache serves one from the other. It trains bit for bit like it, every loss and every final buffer:
+- On the M1's CPU and on an RTX 5090, each step tested prints the same MLIR as the step the Python prototype builds, so MAX's compile cache serves one from the other. It trains bit for bit like it, every loss and every final buffer:
   - three RL-sized MLPs;
   - an MLP with the LayerNorm pair;
   - the 2-layer GPT with both kernel pairs.

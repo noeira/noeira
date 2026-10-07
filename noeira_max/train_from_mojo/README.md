@@ -26,7 +26,9 @@ Each program builds a step in Mojo and the same step with the Python prototype (
 - **every step's loss**, bit for bit;
 - **every final parameter, moment and the step counter**, bit for bit.
 
-| Program | Step | Result (Apple M1, CPU) |
+Every program passes on the Apple M1's CPU and on an RTX 5090 (`--gpu`, buffers on the device, lent by address). On CUDA both sides of the gate run in TF32, and they still agree bit for bit.
+
+| Program | Step | Result (M1 CPU; RTX 5090) |
 |---|---|---|
 | `train_mlp.mojo --shape small/ppo/sac` | MLP, MSE, AdamW: 8-16-16-4 ReLU; PPO 8-64-64-4 tanh; SAC critic 23-256-256-1 ReLU | identical text; 100 of 100 losses and every buffer bit-identical |
 | `train_mlp.mojo --mutate` | the same with twice the learning rate | caught: text, losses and buffers all differ |
@@ -39,7 +41,7 @@ noeira_max/train_from_mojo/run.sh [--shape small|ppo|sac] [--steps N] [--gpu]   
 noeira_max/train_from_mojo/run.sh --nn [--steps N] [--gpu] [--no-bump]          # the nn hybrid
 ```
 
-`--gpu` copies every buffer to the device once and lends its device address; it is written for CUDA and has not been run yet. On Metal, MAX 26.6 cannot share device memory through the C API (`../capi_mojo/`), so these programs cannot keep their state on an Apple GPU.
+`--gpu` copies every buffer to the device once and lends its device address (the nn hybrid lends nn's own device buffers). On Metal, MAX 26.6 cannot share device memory through the C API (`../capi_mojo/`), so these programs cannot keep their state on an Apple GPU.
 
 ## Files
 
@@ -58,9 +60,10 @@ noeira_max/train_from_mojo/run.sh --nn [--steps N] [--gpu] [--no-bump]          
   - Custom ops (`mo.custom`) and casts (`mo.cast`) come from the Python backend, like constants. `max.graph.ops.cast` emits the `mo` dialect's `mo.cast`. The generated `rmo.mo.cast` is a different op that computes the same values, so a graph built with it trains identically but has different text, and so a different compile-cache key.
   - A rank-0 constant must be made from a Python number: a 0-d NumPy array becomes shape `[1]`.
 - **The transform loads a dict of parameters in sorted key order** (`tree_utils.flatten` sorts keys). The Mojo builders load in that order, so that the graphs' text matches.
-- **nn's derived weights.** nn caches derived copies of a weight (zero-padded on the GPU, bf16) and refreshes them when the optimizer bumps `Param.version`. A MAX step writes the weights behind nn's back, so `train_nn_mlp` bumps the versions after training. On the CPU the bump changes nothing, because no copy is cached there. `--no-bump` skips it, to look for the stale copy on CUDA (not run yet).
+- **nn's derived weights.** nn caches derived copies of a weight (zero-padded on the GPU, bf16) and refreshes them when the optimizer bumps `Param.version`. A MAX step writes the weights behind nn's back, so `train_nn_mlp` bumps the versions after training. The bump changed nothing on either device: on the CPU no copy is cached, and on the 5090 nn's forward for these shapes goes through cuBLAS with no padded copy. `--no-bump` skips it, for shapes and paths that do cache one.
 - **Mojo frees a value at its last use, before a call that only received its address.** This happened twice at the Python boundary:
   - a NumPy array was released inside the argument list of `HostBuffer(copy_from=address(a), nbytes=a.nbytes)`, before the copy ran;
   - an nn output tensor was released before Python copied it.
 
   Each read stale bytes, with no error: small arrays survived, and the first element of the large one did not. Every such read now goes through a helper that receives the owner (`host_copy`, `to_numpy`).
+- **A conditional expression with a compile-time condition returned a dead `DeviceContext`.** `Optional(DeviceContext()) if gpu else None`, with `gpu` a `comptime` value, gave a context whose first buffer crashed inside AsyncRT: SIGSEGV on CUDA, SIGTRAP on Metal. The same expression with a runtime condition works, and so does `comptime if`, which `train_nn_mlp` now uses (Mojo 1.1.0).
