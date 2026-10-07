@@ -37,7 +37,7 @@ calibration away.
 from noeira.io.http import HttpClient
 from noeira.io.json import J_NUMBER, J_OBJECT, J_STRING, JsonDoc, JsonWriter, parse_json
 
-from noeira.ai.keys import api_key
+from noeira.ai.keys import api_key, find_api_key
 from noeira.ai.transport import warm_up, ApiCall, CALL_IDLE
 
 
@@ -211,7 +211,10 @@ struct JevClient(Movable):
         self.model = model^
         self.retries = 2
         self._http = HttpClient(30000, 10000)
-        self._http.bearer(key)
+        # A local server without auth gets no header at all, never a bare
+        # `Bearer ` (see `keys.mojo`).
+        if key.byte_length() > 0:
+            self._http.bearer(key)
         self._call = ApiCall()
 
     def __init__(out self, *, deinit move: Self):
@@ -223,6 +226,13 @@ struct JevClient(Movable):
 
     @staticmethod
     def from_env(var model: String = String("jev-latest")) raises -> JevClient:
+        """`JEV_URL` (environment or `.env`) points every caller at a
+        Jev-compatible server instead — `laya-serve` on this machine:
+        `http://127.0.0.1:8766/v1/systemone`. Its key is `LAYA_API_KEY`,
+        optional; the TypeSafe key is never sent there."""
+        var local = find_api_key(["JEV_URL"])
+        if local.byte_length() > 0:
+            return JevClient(find_api_key(["LAYA_API_KEY"]), model^, local^)
         var key = api_key(["JEV_API_KEY", "TYPESAFE_API_KEY"])
         return JevClient(key^, model^)
 
