@@ -2,8 +2,13 @@
 like-for-like partner of MAX's captured column (e), next to the uncaptured
 column (f) measured in the same run.
 
-The five MLPs of `benchmark_nn_baseline.mojo` (Linear, ReLU, Linear, ReLU,
-Linear). The forward is captured once with `noeira.cuda.CUDAGraph` and
+The five MLPs of `benchmark_nn_baseline.mojo`, two ways:
+- unfused, as that baseline builds them: Linear, ReLU, Linear, ReLU, Linear;
+- fused: LinearReLU, LinearReLU, Linear, nn's GEMM + bias + ReLU in one
+  layer (one fewer kernel per hidden layer), which is what a tuned nn model
+  uses, and what MAX's compiler does to the same graph.
+
+The forward is captured once with `noeira.cuda.CUDAGraph` and
 replayed on Mojo's own stream, the one an eager forward uses:
 
 - synchronised: per call, the forward (or a replay), then
@@ -36,7 +41,10 @@ from noeira.nn.core.initializer import Kaiming
 from noeira.nn.core.tensor import Tensor
 from noeira.nn.core.tensor_refs import TensorRefs
 from noeira.nn.primitives.activations import ReLU
+from noeira.nn.core.call import call_forward
+from noeira.nn.core.module import Module
 from noeira.nn.primitives.linear import Linear
+from noeira.nn.primitives.linear_relu import LinearReLU
 
 comptime WARMUP = 100
 comptime CALLS = 1000
@@ -50,9 +58,19 @@ def median_us(mut samples: List[Int]) -> Float64:
 def bench[
     IN: Int, H1: Int, H2: Int, OUT: Int, BATCH: Int
 ](ctx: DeviceContext, name: String) raises:
-    comptime MLP = Sequential[
-        Linear[IN, H1], ReLU[H1], Linear[H1, H2], ReLU[H2], Linear[H2, OUT]
-    ]
+    measure[
+        Sequential[Linear[IN, H1], ReLU[H1], Linear[H1, H2], ReLU[H2], Linear[H2, OUT]],
+        IN, H1, H2, OUT, BATCH,
+    ](ctx, name, "unfused")
+    measure[
+        Sequential[LinearReLU[IN, H1], LinearReLU[H1, H2], Linear[H2, OUT]],
+        IN, H1, H2, OUT, BATCH,
+    ](ctx, name, "fused")
+
+
+def measure[
+    MLP: Module, IN: Int, H1: Int, H2: Int, OUT: Int, BATCH: Int
+](ctx: DeviceContext, name: String, layers: String) raises:
     var net = MLP.make["gpu", Kaiming](Optional(ctx))
     var x = Tensor.alloc(BATCH * IN)
     for i in range(BATCH * IN):
@@ -63,19 +81,19 @@ def bench[
     # (f) eager. The warmup also allocates every device buffer, so that the
     # capture below records no allocation.
     for _ in range(WARMUP):
-        net.forward["gpu", BATCH](TensorRefs[1](x), y, Optional(ctx))
+        call_forward["gpu", BATCH](net, TensorRefs[1](x), y, Optional(ctx))
     ctx.synchronize()
     y.download(ctx)
     var want = y.data.copy()
     var eager = List[Int]()
     for _ in range(CALLS):
         var t = perf_counter_ns()
-        net.forward["gpu", BATCH](TensorRefs[1](x), y, Optional(ctx))
+        call_forward["gpu", BATCH](net, TensorRefs[1](x), y, Optional(ctx))
         ctx.synchronize()
         eager.append(Int(perf_counter_ns() - t))
     var t0 = perf_counter_ns()
     for _ in range(CALLS):
-        net.forward["gpu", BATCH](TensorRefs[1](x), y, Optional(ctx))
+        call_forward["gpu", BATCH](net, TensorRefs[1](x), y, Optional(ctx))
     ctx.synchronize()
     var eager_pipelined = Float64(perf_counter_ns() - t0) / Float64(CALLS) / 1000.0
 
@@ -84,7 +102,7 @@ def bench[
     if graph.is_disabled():
         raise Error("capture is disabled: run under `pixi run` (the CUDA interposer must be preloaded)")
     graph.begin_capture()
-    net.forward["gpu", BATCH](TensorRefs[1](x), y, Optional(ctx))
+    call_forward["gpu", BATCH](net, TensorRefs[1](x), y, Optional(ctx))
     graph.end_capture()
     for i in range(BATCH * OUT):
         y.data[i] = 0
@@ -113,7 +131,7 @@ def bench[
     var captured_pipelined = Float64(perf_counter_ns() - t0) / Float64(CALLS) / 1000.0
 
     print(
-        "RESULT {\"shape\": \"" + name + "\", \"dims\": \"" + String(IN) + "->" + String(H1)
+        "RESULT {\"shape\": \"" + name + "\", \"layers\": \"" + layers + "\", \"dims\": \"" + String(IN) + "->" + String(H1)
         + "->" + String(H2) + "->" + String(OUT) + "\", \"batch\": " + String(BATCH)
         + ", \"graph_nodes\": " + String(graph.num_nodes())
         + ", \"f_eager_us\": " + String(median_us(eager))

@@ -3,10 +3,13 @@ back, and checking a run against the Python prototype's."""
 
 from std.python import Python, PythonObject
 
-from maxrt import HostBuffer, Runtime, Tensor, TensorMap
+from std.time import perf_counter_ns
+
+from maxrt import HostBuffer, Model, Runtime, Tensor, TensorMap
 
 
 comptime GLUE = "noeira_max.train_from_mojo.py_grad"
+comptime CAPTURE_KEY: UInt64 = 1
 
 
 def host_copy(array: PythonObject) raises -> HostBuffer:
@@ -100,3 +103,70 @@ def check(
     if differ > 0:
         failures += 1
     return failures
+
+
+def train(
+    model: Model, inputs: TensorMap, count: Int, steps: Int, gpu: Bool, capture: Bool,
+    mut losses: List[Float32], mut times: List[Int], mut lent: List[Tensor],
+    mut outputs: List[Tensor],
+) raises:
+    """Runs `steps` steps, appending each loss and each step's time (ns; the
+    loss is copied back every step, so each step is synchronised).
+
+    With `capture` (CUDA), step 0 executes, then the step is captured as a
+    device graph over the `count` inputs (left in `lent`) and every later
+    step replays it: the same kernels on the same buffers, with no per-call
+    host work in MAX's executor.
+
+    Every replay writes the captured outputs (left in `outputs`), so the
+    caller keeps them alive for as long as it replays. Freed when this
+    function returned, the next replays wrote freed device memory
+    (CUDA_ERROR_ILLEGAL_ADDRESS, reported by a later kernel)."""
+    for k in range(steps):
+        var t = perf_counter_ns()
+        var loss: Float32
+        if capture and k > 0:
+            if k == 1:
+                for i in range(count):
+                    lent.append(inputs.tensor("input" + String(i)))
+                outputs = model.capture(CAPTURE_KEY, lent)
+                t = perf_counter_ns()  # the capture itself is not a step
+            model.replay(CAPTURE_KEY, lent)
+            loss = outputs[0].to_host().item[DType.float32]()
+        else:
+            var out = model.execute(inputs).tensor("output0")
+            loss = out.to_host().item[DType.float32]() if gpu else out.item[DType.float32]()
+        times.append(Int(perf_counter_ns() - t))
+        losses.append(loss)
+
+
+def pipelined_us(
+    model: Model, inputs: TensorMap, lent: List[Tensor], rt: Runtime, iters: Int, replay: Bool,
+    keep_outputs: Bool = False,
+) raises -> Float64:
+    """Microseconds per step for `iters` steps back to back, one
+    synchronisation at the end: executed, or replayed (after `train` with
+    `capture`). These are further training steps."""
+    rt.synchronize()
+    var keep = List[TensorMap]()  # each call's outputs, alive until the synchronisation
+    var t = perf_counter_ns()
+    for _ in range(iters):
+        if replay:
+            model.replay(CAPTURE_KEY, lent)
+        elif keep_outputs:
+            keep.append(model.execute(inputs))
+        else:
+            _ = model.execute(inputs)
+    rt.synchronize()
+    var us = Float64(perf_counter_ns() - t) / Float64(iters) / 1000.0
+    _ = keep^
+    return us
+
+
+def median_us(times: List[Int], skip: Int = 0) -> Float64:
+    """The median of `times` (ns) after the first `skip`, in microseconds."""
+    var rest = List[Int]()
+    for i in range(skip, len(times)):
+        rest.append(times[i])
+    sort(rest)
+    return Float64(rest[len(rest) // 2]) / 1000.0

@@ -12,7 +12,7 @@ GPT samples it from a corpus in the graph, which this gate leaves out.
 Gated like `train_mlp.mojo` against the same step built in Python
 (`py_grad.gpt_reference`): graph text, every loss, the final buffers.
 
-    ./train_gpt OUT_DIR [--steps N] [--layers L] [--gpu]
+    ./train_gpt OUT_DIR [--steps N] [--layers L] [--gpu] [--capture] [--no-reference]
 """
 
 from std.python import Python, PythonObject
@@ -23,7 +23,9 @@ from max_graph_gen import (
     Dim, Graph, TensorType, Value, buffer_load, constant, custom, gather, gelu_tanh, reshape,
     transpose,
 )
-from max_train import AdamW, Tape, check, cross_entropy, host_copy, lend, numbers, read
+from max_train import (
+    AdamW, Tape, check, cross_entropy, host_copy, lend, median_us, numbers, pipelined_us, read, train,
+)
 from maxrt import HostBuffer, Runtime, Tensor
 
 comptime GLUE = "noeira_max.train_from_mojo.py_grad"
@@ -166,6 +168,8 @@ def main() raises:
     var steps = 30
     var layers = 2
     var gpu = False
+    var capture = False
+    var reference = True
     var i = 2
     while i < len(args):
         if args[i] == "--steps":
@@ -176,6 +180,11 @@ def main() raises:
             i += 1
         elif args[i] == "--gpu":
             gpu = True
+        elif args[i] == "--no-reference":  # time only: no Python model in the process
+            reference = False
+        elif args[i] == "--capture":  # CUDA: replay the captured step
+            gpu = True
+            capture = True
         else:
             raise Error("unknown flag " + String(args[i]))
         i += 1
@@ -223,15 +232,21 @@ def main() raises:
 
     var losses = List[Float32]()
     var times = List[Int]()
-    for _ in range(steps):
-        var t = perf_counter_ns()
-        var out = model.execute(inputs).tensor("output0")
-        losses.append(out.to_host().item[DType.float32]() if gpu else out.item[DType.float32]())
-        times.append(Int(perf_counter_ns() - t))
-    sort(times)
-    print("[mojo]", steps, "steps; loss", losses[0], "->", losses[len(losses) - 1],
-          "; median step", Float64(times[len(times) // 2]) / 1000.0, "us (C API, no Python)")
+    var lent = List[Tensor]()
+    var outputs = List[Tensor]()  # rewritten by every replay: alive while replaying
+    train(model, inputs, 3 * n + 3, steps, gpu, capture, losses, times, lent, outputs)
+    print("[mojo]", steps, "steps", "(captured from step 1)" if capture else "", "; loss", losses[0], "->",
+          losses[len(losses) - 1], "; median step", median_us(times, 1), "us, loss copied back each step")
 
+    if not reference:
+        if gpu:
+            print("[mojo] pipelined, 200 steps, every output map kept until the end:",
+                  pipelined_us(model, inputs, lent, rt, 200, False, keep_outputs=True), "us per step")
+            print("[mojo] pipelined, 200 steps: executed", pipelined_us(model, inputs, lent, rt, 200, False),
+                  "us per step" + (String("; replayed ") + String(pipelined_us(model, inputs, lent, rt, 200, True))
+                  + " us per step" if capture else String("")))
+        _ = outputs^
+        return
     var ref_out = glue.gpt_reference(cfg, B, 0, steps, "gpt_train_step", LR, device)
     print("[python] reference compiled in", Float64(py=ref_out["compile_s"]), "s")
     var check_names = List[String]()
@@ -259,3 +274,9 @@ def main() raises:
     if failures > 0:
         raise Error("FAIL: the Mojo-built GPT step differs from the Python one")
     print("PASS: the GPT step built in Mojo is the Python prototype's, bit for bit")
+    if gpu:
+        # Further steps, back to back: the step's own cost, with no per-step copy.
+        print("[mojo] pipelined, 200 steps: executed", pipelined_us(model, inputs, lent, rt, 200, False),
+              "us per step" + (String("; replayed ") + String(pipelined_us(model, inputs, lent, rt, 200, True))
+              + " us per step" if capture else String("")))
+    _ = outputs^  # replays write into it until here

@@ -17,7 +17,7 @@ weights and batch, and runs it as many steps. Checked:
 then fail (it is not vacuous).
 
     noeira_max/train_from_mojo/run.sh [--gpu]
-    ./train_mlp OUT_DIR [--shape small|ppo|sac] [--steps N] [--gpu] [--mutate]
+    ./train_mlp OUT_DIR [--shape small|ppo|sac] [--steps N] [--gpu] [--capture] [--mutate]
 """
 
 from std.python import Python, PythonObject
@@ -25,8 +25,8 @@ from std.sys import argv
 from std.time import perf_counter_ns
 
 from max_train import (
-    Shape, build_mlp_step, check, host_copy, input_shape, lend, numbers, param_name, read,
-    shape_named, state_names, step_name,
+    Shape, build_mlp_step, check, host_copy, input_shape, lend, median_us, numbers, param_name,
+    pipelined_us, read, shape_named, state_names, step_name, train,
 )
 from maxrt import HostBuffer, Runtime, Tensor
 
@@ -41,6 +41,7 @@ def main() raises:
     var steps = 20
     var gpu = False
     var mutate = False
+    var capture = False
     var i = 2
     while i < len(args):
         if args[i] == "--shape":
@@ -51,6 +52,9 @@ def main() raises:
             i += 1
         elif args[i] == "--gpu":
             gpu = True
+        elif args[i] == "--capture":  # CUDA: replay the captured step
+            gpu = True
+            capture = True
         elif args[i] == "--mutate":
             mutate = True
         else:
@@ -90,15 +94,11 @@ def main() raises:
     # Train: C API only.
     var losses = List[Float32]()
     var times = List[Int]()
-    for _ in range(steps):
-        var t = perf_counter_ns()
-        var out = model.execute(inputs).tensor("output0")
-        var loss = out.to_host().item[DType.float32]() if gpu else out.item[DType.float32]()
-        times.append(Int(perf_counter_ns() - t))
-        losses.append(loss)
-    sort(times)
-    print("[mojo]", steps, "steps; loss", losses[0], "->", losses[len(losses) - 1],
-          "; median step", Float64(times[len(times) // 2]) / 1000.0, "us (C API, no Python)")
+    var lent = List[Tensor]()
+    var outputs = List[Tensor]()  # rewritten by every replay: alive while replaying
+    train(model, inputs, 3 * n + 3, steps, gpu, capture, losses, times, lent, outputs)
+    print("[mojo]", steps, "steps", "(captured from step 1)" if capture else "", "; loss", losses[0], "->",
+          losses[len(losses) - 1], "; median step", median_us(times, 1), "us, loss copied back each step")
 
     # The same step from the Python prototype.
     var ref_out = glue.reference(py_dims, s.batch, 0, steps, step_name(s), s.act, LR, device)
@@ -120,3 +120,9 @@ def main() raises:
     if failures > 0:
         raise Error("FAIL: the Mojo-built step differs from the Python one")
     print("PASS: the train step built in Mojo is the Python prototype's step, bit for bit")
+    if gpu:
+        # Further steps, back to back: the step's own cost, with no per-step copy.
+        print("[mojo] pipelined, 1000 steps: executed", pipelined_us(model, inputs, lent, rt, 1000, False),
+              "us per step" + (String("; replayed ") + String(pipelined_us(model, inputs, lent, rt, 1000, True))
+              + " us per step" if capture else String("")))
+    _ = outputs^  # replays write into it until here

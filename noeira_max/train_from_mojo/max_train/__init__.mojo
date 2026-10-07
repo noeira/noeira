@@ -12,7 +12,7 @@ Build with `-I noeira_max/train_from_mojo -I noeira_max/graph_mojo
 repo root on PYTHONPATH.
 """
 
-from .gate import check, host_copy, lend, read
+from .gate import check, host_copy, lend, median_us, pipelined_us, read, train
 from .mlp import (
     Shape, build_mlp_step, input_shape, numbers, param_dims, param_name, shape_named, state_names,
     step_name,

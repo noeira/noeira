@@ -56,9 +56,17 @@ within 1% (8.3 µs at actor batch 1) and (f), on a newer noeira, measured 18.4 �
 - **Each layer of overhead can be removed.** At actor batch 1, the C API removes Python's
   glue (48.5 → 36.5 µs), lending device buffers removes the copies (24.1), and capture
   removes MAX's per-call host cost (8.2; 4.1 pipelined).
-- **With device buffers and capture, MAX runs these MLPs faster than noeira's nn, captured
-  or not**: 8.2 against 12.7 µs at batch 1. Where both are GPU-bound (actor, batch 64 and
-  1024), they are within a few µs.
+- **With device buffers and capture, MAX ran these MLPs faster than noeira's nn**: 8.2 against
+  12.7 µs at batch 1, within a few µs at batch 64 and 1024. **That no longer holds from batch
+  64.** Re-measured on 2026-10-07 in one session against today's nn (cuBLAS GEMMs since
+  `c6355224a`; unfused and fused layers, `capi_mojo/bench/bench_nn_capture.mojo`), captured,
+  µs synchronised:
+  - actor, batch 1: MAX 13.2, nn fused 14.2;
+  - actor, batch 64: MAX 53.9, nn fused 22.3;
+  - actor, batch 1024: MAX 55.5, nn fused 26.1;
+  - wide, batch 1024: MAX 69.5, nn fused 31.7.
+
+  MAX keeps a small edge at batch 1 only.
 - **Mojo and MAX share the CUDA context and its allocator**, so device buffers pass both
   ways by address, but not a stream: each hand-off is a host synchronisation, about 3 µs.
   With Mojo's kernels on MAX's stream (`capi_mojo/bench/run.sh --stream`), a "Mojo kernel →
