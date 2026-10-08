@@ -57,10 +57,11 @@ string instead.
 
 from std.time import perf_counter_ns
 
-from noeira.ai.audio_io import MicCapture, rms, LocalVoice
+from noeira.ai.audio_io import MicCapture, rms, LocalVoice, os_voice_for
 from noeira.ai.chat import ChatClient, ChatMessage, ToolSpec
 from noeira.ai.jev import JevClient, JevQuestions
-from noeira.ai.speech import SpeechToText, STT_RAW
+from noeira.ai.speech import SpeechToText, STT_RAW, TextToSpeech
+from noeira.io.fileio import write_file_atomic
 from noeira.io.wav import WavAudio
 from noeira.envs.robots.g1_command_bank import G1CommandBank
 from noeira.envs.robots.g1_command_language import (
@@ -110,6 +111,8 @@ comptime VL_REFUSED: Int = 5
 comptime VL_STT_DEADLINE_S: Float64 = 20.0
 comptime VL_JEV_DEADLINE_S: Float64 = 12.0
 comptime VL_CHAT_DEADLINE_S: Float64 = 30.0
+comptime VL_TTS_DEADLINE_S: Float64 = 5.0
+"""A reply synthesised later than this is spoken by the OS voice instead."""
 
 # ⚠ AND THE TAIL IS A CAPTURE-BUFFER DRAIN, NOT A DURATION GUESS. `speaking()`
 # goes false the instant playback ends, but ffmpeg's pipe is 64 KiB — about
@@ -252,6 +255,15 @@ struct G1VoiceConfig(Copyable, Movable):
     var chain: Bool
     """Ask for a second and third step. A caller that runs only the first step
     turns it off, and a local model then answers two rows fewer."""
+    var tts_spec: String
+    """"" = the OS voice (`say` / `espeak`); `local:<base_url>` = an
+    OpenAI-compatible `/audio/speech` server on this machine (Kokoro-82M,
+    `kokoro_serve.py`). A failed or late synthesis falls back to the OS voice."""
+    var tts_voice: String
+    """"" picks by `lang`: Kokoro `af_heart` (en) / `ff_siwis` (fr), or
+    `os_voice_for(lang)`. Otherwise the voice's name for the backend in use."""
+    var tts_dl: Float64
+    """Seconds a synthesis may take before the OS voice says it instead."""
 
     def __init__(out self):
         self.lang = String("")
@@ -279,6 +291,9 @@ struct G1VoiceConfig(Copyable, Movable):
         self.llm_spec = String("hf")
         self.request_wording = False
         self.chain = True
+        self.tts_spec = String("")
+        self.tts_voice = String("")
+        self.tts_dl = VL_TTS_DEADLINE_S
 
 
 struct G1VoiceLoop(Movable):
@@ -287,6 +302,15 @@ struct G1VoiceLoop(Movable):
 
     var mic: MicCapture
     var voice: LocalVoice
+    var tts: Optional[TextToSpeech]
+    """`tts_spec` set: the synthesiser. Its WAV is played through `voice`, so
+    `voice.speaking()` stays the one end signal."""
+    var tts_busy: Bool
+    """A reply is being synthesised: the robot is about to speak, and the
+    echo gate counts it as speaking."""
+    var tts_text: String
+    """What is being synthesised, for the OS-voice fallback."""
+    var tts_t0: Int
     var stt: SpeechToText
     var jev: JevClient
     var llm: ChatClient
@@ -366,7 +390,27 @@ struct G1VoiceLoop(Movable):
             String("chat_template_kwargs"),
             String('{"enable_thinking": false}'),
         )
-        self.voice = LocalVoice()
+        # ⚠ THE VOICE FOLLOWS THE REPLY'S LANGUAGE, not the system's — a
+        # French Mac's default voice read the English demo with a French accent
+        self.voice = LocalVoice(
+            self.cfg.tts_voice if (self.cfg.tts_spec == ""
+                                   and self.cfg.tts_voice != "")
+            else os_voice_for(self.cfg.lang)
+        )
+        self.tts = None
+        if self.cfg.tts_spec.startswith("local:"):
+            var kv = self.cfg.tts_voice
+            if kv == "":
+                kv = String("ff_siwis") if self.cfg.lang == "fr" else String("af_heart")
+            self.tts = TextToSpeech.openai_compatible(
+                String(self.cfg.tts_spec[byte=6:]), String("kokoro"), kv^
+            )
+        elif self.cfg.tts_spec != "":
+            raise Error("tts: unknown spec '" + self.cfg.tts_spec
+                        + "' — \"\" (the OS voice) or local:<base_url>")
+        self.tts_busy = False
+        self.tts_text = String("")
+        self.tts_t0 = 0
         # ⚠ `MicCapture.start` IS THE CONSTRUCTOR — it opens the device, so
         # there is no separate `start()` for it and the field cannot be a
         # not-yet-opened capture. A failure here raises out of `__init__`,
@@ -427,6 +471,10 @@ struct G1VoiceLoop(Movable):
     def __init__(out self, *, deinit move: Self):
         self.mic = move.mic^
         self.voice = move.voice^
+        self.tts = move.tts^
+        self.tts_busy = move.tts_busy
+        self.tts_text = move.tts_text^
+        self.tts_t0 = move.tts_t0
         self.stt = move.stt^
         self.jev = move.jev^
         self.llm = move.llm^
@@ -475,6 +523,7 @@ struct G1VoiceLoop(Movable):
             self.mic.stop()
         except:
             pass
+        self._tts_cancel()
         try:
             self.voice.stop()
         except:
@@ -484,11 +533,70 @@ struct G1VoiceLoop(Movable):
         """Speak, and never raise. ⚠ THE ONLY WAY THE CALLER SHOULD SPEAK.
         The echo gate reads `voice.speaking()`, so a caller that owned its own
         TTS would reopen §12.56's race — two voices and one "done"."""
+        # ⚠ ONE UTTERANCE AT A TIME, as `LocalVoice` says: a new reply cuts
+        # off the one playing AND the one still being synthesised
+        self._tts_cancel()
         try:
-            self.voice.say(text)
+            self.voice.stop()
         except:
             pass
+        var started = False
+        if self.tts:
+            try:
+                self.tts.value().start(text)
+                self.tts_busy = True
+                self.tts_text = text
+                self.tts_t0 = perf_counter_ns()
+                started = True
+            except e:
+                self.note = String("[tts] could not start: ") + String(e)
+        if not started:
+            try:
+                self.voice.say(text)
+            except:
+                pass
         self.mute_until = perf_counter_ns() + _vl_ns(VL_ECHO_TAIL_S)
+
+    def _tts_cancel(mut self):
+        if self.tts_busy:
+            try:
+                self.tts.value().cancel()
+            except:
+                pass
+            self.tts_busy = False
+
+    def _tts_step(mut self):
+        """The synthesis in flight: play its WAV once it is in, or fall back
+        to the OS voice when it fails or misses `tts_dl`. Never raises."""
+        if not self.tts_busy:
+            return
+        var el = Float64(perf_counter_ns() - self.tts_t0) / 1e9
+        var ready = False
+        if el > self.cfg.tts_dl:
+            self._tts_cancel()
+            self.note = String("[tts] GAVE UP after ") + _vl_f2(el) + String(" s — OS voice")
+        else:
+            try:
+                ready = self.tts.value().poll()
+            except:
+                ready = True
+            if not ready:
+                return
+            self.tts_busy = False
+            try:
+                var wav = self.tts.value().result_wav_bytes()
+                var path = (String("/tmp/noeira_tts_") + String(perf_counter_ns())
+                            + String(".wav"))
+                write_file_atomic(path, wav)
+                self.voice.play(path)
+                self.note = String("[tts] ") + String(Int(el * 1000.0)) + String(" ms")
+                return
+            except e:
+                self.note = String("[tts] FAILED: ") + String(e) + String(" — OS voice")
+        try:
+            self.voice.say(self.tts_text)
+        except:
+            pass
 
     def force(mut self):
         """TAB: end the current segment now, or start one. For a room too loud
@@ -556,6 +664,8 @@ struct G1VoiceLoop(Movable):
         """⚠ A GATE THAT RAISES WOULD TAKE THE LOOP DOWN, and the safe default
         is to assume we ARE talking rather than open the microphone onto our
         own voice."""
+        if self.tts_busy:
+            return True
         try:
             return self.voice.speaking()
         except:
@@ -572,6 +682,7 @@ struct G1VoiceLoop(Movable):
         from the robot's own command clock, which this object does not have.
         """
         var ev = G1VoiceEvent.none()
+        self._tts_step()
 
         # ── the microphone, every frame ───────────────────────────────
         # ⚠ READ EVEN WHILE THE ROBOT SPEAKS. The pipe is 64 KiB, about 2 s,
