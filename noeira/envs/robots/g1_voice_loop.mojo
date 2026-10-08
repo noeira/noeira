@@ -297,6 +297,9 @@ struct G1VoiceLoop(Movable):
     var asked: String
     """The state the current decision was asked with, for its second
     request."""
+    var dest_ms: Float64
+    """`request_wording`: how long the first request of the current decision
+    took, 0 when it was the only one. Shown in the decision's note."""
     var spec_q: JevQuestions
     var has_pool: Bool
     var pool: G1Pool
@@ -382,6 +385,7 @@ struct G1VoiceLoop(Movable):
                 self.cfg.chain,
             )
         self.asked = String("")
+        self.dest_ms = 0.0
         self.spec_q = g1_spec_questions(True)
         self.has_pool = self.cfg.pool_path != ""
         # ⚠ A ONE-ROW PLACEHOLDER when there is no pool: `G1Pool` is not
@@ -430,6 +434,7 @@ struct G1VoiceLoop(Movable):
         self.quest = move.quest^
         self.dest_q = move.dest_q^
         self.asked = move.asked^
+        self.dest_ms = move.dest_ms
         self.spec_q = move.spec_q^
         self.has_pool = move.has_pool
         self.pool = move.pool^
@@ -758,6 +763,7 @@ struct G1VoiceLoop(Movable):
                     else:
                         try:
                             self.asked = g1_command_state(self.heard, ctx)
+                            self.dest_ms = 0.0
                             if self._two_requests():
                                 self.jev.start(self.asked, self.dest_q)
                                 self.state = VL_ST_DEST
@@ -885,9 +891,9 @@ struct G1VoiceLoop(Movable):
                 ev.text = self.heard
                 self.note = (String("[world] ") + dest + String(" ")
                              + _vl_f2(ans.probability(String("destination"), dest))
-                             + String(" (") + _vl_f2(ans.latency_ms)
-                             + String(" ms)"))
+                             + self._jev_ms(ans.latency_ms))
                 return ev^
+            self.dest_ms = ans.latency_ms
             # ⚠ THE SAME STATE, not a fresh one: the robot may have moved on
             # while the first request was answered, and the two answers must
             # be about the same moment.
@@ -897,6 +903,14 @@ struct G1VoiceLoop(Movable):
         except e:
             self.note = String("[jev] FAILED: ") + String(e)
         return ev^
+
+    def _jev_ms(self, ms: Float64) -> String:
+        """`  (jev 3412 ms)`, or `  (jev 680 + 2290 ms)` after two requests:
+        the wait a listener sees between the transcript and the robot."""
+        var s = String("  (jev ")
+        if self.dest_ms > 0.0:
+            s += String(Int(self.dest_ms)) + String(" + ")
+        return s + String(Int(ms)) + String(" ms)")
 
     def _decide(mut self, ref ctx: G1Context, ref bank: G1CommandBank) -> G1VoiceEvent:
         """The decision, and the four ways it can go."""
@@ -923,7 +937,8 @@ struct G1VoiceLoop(Movable):
                 ev.kind = VL_WORLD
                 ev.destination = self.pick.destination
                 self.note = (String("[world] ") + self.pick.destination
-                             + String(" ") + _vl_f2(self.pick.dest_conf))
+                             + String(" ") + _vl_f2(self.pick.dest_conf)
+                             + self._jev_ms(ans.latency_ms))
             elif self.pick.name != "":
                 ev.kind = VL_COMMAND
                 ev.name = self.pick.name
@@ -936,7 +951,8 @@ struct G1VoiceLoop(Movable):
                 self.note = (String("[pick] ") + self.pick.name + String(" ")
                              + _vl_f2(self.pick.conf) + String("  P(none) ")
                              + _vl_f2(self.pick.p_none) + String("  world ")
-                             + _vl_f2(self.pick.needs_world))
+                             + _vl_f2(self.pick.needs_world)
+                             + self._jev_ms(ans.latency_ms))
             elif self.pick.talk:
                 # ⚠ Nothing about the robot's motion changes — it goes on
                 # doing whatever it was doing while it replies.
@@ -947,7 +963,8 @@ struct G1VoiceLoop(Movable):
                         msgs, self.cfg.chat_sys, List[ToolSpec](), False
                     )
                     self.t_wait = perf_counter_ns()
-                    self.note = String("[talk] ") + _vl_f2(self.pick.conf)
+                    self.note = (String("[talk] ") + _vl_f2(self.pick.conf)
+                                 + self._jev_ms(ans.latency_ms))
                     self.state = VL_ST_CHAT
                     got = True
                 except e:
@@ -969,6 +986,7 @@ struct G1VoiceLoop(Movable):
                         self.t_wait = perf_counter_ns()
                         self.note = (String("[miss] P(none) ")
                                      + _vl_f2(self.pick.p_none)
+                                     + self._jev_ms(ans.latency_ms)
                                      + String(" — asking for a reward spec"))
                         self.state = VL_ST_SPEC
                         got = True
@@ -986,7 +1004,8 @@ struct G1VoiceLoop(Movable):
                                  + String("  addressed ")
                                  + _vl_f2(self.pick.addressed)
                                  + String("  world ")
-                                 + _vl_f2(self.pick.needs_world))
+                                 + _vl_f2(self.pick.needs_world)
+                                 + self._jev_ms(ans.latency_ms))
         except e:
             self.note = String("[jev] FAILED: ") + String(e)
         # ⚠ ONLY when the decision did not hand off. The talk and spec
