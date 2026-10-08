@@ -18,9 +18,14 @@ sim scene; d_pair ~ d_rand = it does not. The real latents' own d_step /
 d_rand are printed too: a real cluster much tighter than the sim one makes a
 low real PREDICTION loss (`lewm_so101_real_check`) meaningless.
 
-The REAL cost landscape: along each whole real episode (every `--stride`
-ticks), the latent distance to the episode's LAST frame against the ticks
-still to go — Spearman per episode, averaged. A domain OFFSET (real cloud
+The REAL cost landscape: along each real episode (every `--stride` ticks)
+up to its RELEASE — the first tick at which the follower's gripper rises
+above 20 (LeRobot 0..100) after holding the cube, i.e. after >= 20
+consecutive ticks stalled at 8..17 (open reads ~26-33, shut 0-9, ON the
+printed cube ~12) — the latent distance to the
+release frame against the ticks still to go; Spearman per episode,
+averaged. (Up to the release, not the last frame: the teleop episodes return
+the arm to rest, so their last frame looks like their first.) A domain OFFSET (real cloud
 displaced from the sim one) leaves it intact; a critic comparing predictions
 with a real goal frame needs exactly this to be high.
 
@@ -39,7 +44,8 @@ from noeira.nn.core.tensor_refs import TensorRefs
 from noeira.nn.core.initializer import Kaiming
 from noeira.experimental.lewm.ref_model import LeWMEncoderRef
 from noeira.experimental.lewm.ref_load import load_ref
-from noeira.experimental.lewm.so101_data import So101WMData, CAMS
+from noeira.experimental.lewm.so101_data import So101WMData, CAMS, JOINTS
+from noeira.data.store import TrajectoryStore
 
 
 comptime R = 112
@@ -233,9 +239,27 @@ def main() raises:
                 continue
             var w = s.split(" ")
             real_starts.append(Int(String(w[2])))
+    var qst = TrajectoryStore(real)
+    var qp = qst.load_column[DType.float32](String("qpos"), max_bytes=1 << 30)
+    var n_release = 0
     for e in range(len(real_starts)):
         var a = real_starts[e]
         var b = real_starts[e + 1] if e + 1 < len(real_starts) else rd.n_rows
+        # the release: >= 20 ticks stalled on the cube (8..17), then > 20
+        var held = 0
+        var holding = False
+        for t in range(a, b):
+            var g = Float64(qp[t * JOINTS + JOINTS - 1])
+            if g >= 8.0 and g <= 17.0:
+                held += 1
+                if held >= 20:
+                    holding = True
+            else:
+                held = 0
+            if holding and g > 20.0:
+                b = t + 1
+                n_release += 1
+                break
         ep_start.append(len(rows_all))
         var t = a
         while t < b:
@@ -255,8 +279,9 @@ def main() raises:
             togo.append(Float64(m - 1 - i))
         rho_sum += _spearman(cost, togo)
         n_ep += 1
-    print("  REAL cost landscape: Spearman(dist to the episode's last frame, ticks to go)",
-          Float32(rho_sum / Float64(max(n_ep, 1))), "over", n_ep, "episodes (1 = monotone)")
+    print("  REAL cost landscape: Spearman(dist to the release frame, ticks to go)",
+          Float32(rho_sum / Float64(max(n_ep, 1))), "over", n_ep, "episodes (", n_release,
+          "with a detected release; the others to their last frame ) (1 = monotone)")
     print("  top-1 real -> own twin (same episode, within 5 ticks):", hit, "/", n,
           "=", Float32(100.0 * Float64(hit) / Float64(n)), "% | chance ~",
           Float32(100.0 * 3.0 / Float64(n)), "%")
