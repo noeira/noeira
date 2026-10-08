@@ -42,12 +42,15 @@ been reaching down past the desk — shoulder_lift > 1.35 AND elbow_flex <
 shoulder_lift -0.1..0.5, elbow 0.35..1.4), the sim's rigid desk absorbs it
 and the real tower does not),
 --no-release-stop (by default a run ENDS 0.5 s after a RELEASE: the jaw held
-an object — commanded more closed than it is, above 0.05 rad and not moving,
+an object — commanded more closed than it is, above 0 rad and not moving,
 for 10 ticks — and then opened past 0.6 rad for 10 ticks. The sim's episode
 ends at the success; a student run on past it pecked at the bowl for 14 s,
-7 Oct. An empty close (jaw below 0.03 rad) forgets the grasp. On that run's log
-it ends the run at 6.9 s and ignores the first, empty close; it fires on all
-30 gate rollouts of pixel_bowl_gcap, after the release),
+7 Oct. An empty close (jaw below -0.05 rad; the real jaw closes empty at
+-0.15) forgets the grasp. ⚠ ABOVE 0, NOT 0.05: the real jaw holds the 25 mm
+cube at 0.12 rad at the pinch but at 0.04 when the cube sits deep, by the
+servo — a 0.05 threshold missed that grasp, its drop beside the bowl, and the
+run went on retrying for 14 s (8 Oct). Fires on all three real runs' logs and
+on all 30 gate rollouts of pixel_bowl_gcap, after the release),
 --keep-dynamic-fps (by default each /dev camera gets `v4l2-ctl -c
 exposure_dynamic_framerate=0` at open: with it ON, both rig cameras were
 found so, a UVC camera may drop to ~10 fps to lengthen its exposure as the
@@ -895,7 +898,7 @@ def main() raises:
                       + "s  a:" + line2)
             # the RELEASE STOP (see --no-release-stop in the header)
             var g = q[ACT - 1]
-            if g > 0.05 and grip_tgt < g - 0.1 and abs(qd[ACT - 1]) < 0.3:
+            if g > 0.0 and grip_tgt < g - 0.1 and abs(qd[ACT - 1]) < 0.3:
                 blocked += 1
                 if blocked >= 10 and not grasped:
                     grasped = True
@@ -903,7 +906,7 @@ def main() raises:
                           + " rad by an object")
             else:
                 blocked = 0
-            if grasped and g < 0.03:
+            if grasped and g < -0.05:
                 grasped = False
                 open_ticks = 0
                 print("  the jaw closed empty — the grasp is forgotten")
