@@ -43,15 +43,23 @@ def _arg(args: List[String], key: String, default: String) -> String:
 
 
 def _pred_loss(
-    mut tr: TR, data: So101WMData[R], batches: Int,
+    mut tr: TR, data: So101WMData[R], batches: Int, shuffle: Bool = False,
 ) raises -> Tuple[Float64, Float64]:
-    """Mean and std over `batches` random windows (train + val starts)."""
+    """Mean and std over `batches` random windows (train + val starts). With
+    `shuffle` every window gets the NEXT window's actions (the batch rolled
+    by one): a predictor that reads its actions loses accuracy, one that
+    ignores them does not."""
     var pix = List[Scalar[DT]](length=B * TR.PIX, fill=Scalar[DT](0))
     var act = List[Scalar[DT]](length=B * TR.ACT, fill=Scalar[DT](0))
     var vals = List[Float64]()
     for k in range(batches):
         var starts = data.sample(k % 2 == 1 and len(data.val_starts) > 0, B)
         data.fill(starts, pix, act)
+        if shuffle:
+            var rolled = act.copy()
+            for i in range(len(act)):
+                rolled[i] = act[(i + TR.ACT) % len(act)]
+            act = rolled^
         vals.append(tr.loss_of(pix, act).pred_loss)
     var m = 0.0
     for v in vals:
@@ -107,6 +115,8 @@ def main() raises:
     _action_spread(rd, String("real"))
     var lr_ = _pred_loss(tr, rd, batches)
     print("  real pred loss:", lr_[0], "+/-", lr_[1])
+    var lrs = _pred_loss(tr, rd, batches, shuffle=True)
+    print("  real pred loss, actions SHUFFLED:", lrs[0], "+/-", lrs[1], "| x", lrs[0] / lr_[0])
     if sim.byte_length() > 0:
         var sp = List[String]()
         sp.append(sim)
@@ -115,4 +125,6 @@ def main() raises:
         _action_spread(sd, String("sim"))
         var ls = _pred_loss(tr, sd, batches)
         print("  sim pred loss:", ls[0], "+/-", ls[1])
+        var lss = _pred_loss(tr, sd, batches, shuffle=True)
+        print("  sim pred loss, actions SHUFFLED:", lss[0], "+/-", lss[1], "| x", lss[0] / ls[0])
         print("  real / sim:", lr_[0] / ls[0], "(gate: <= ~2)")

@@ -286,6 +286,46 @@ def main() raises:
     print("  real latents among themselves: d_step", Float32(d_step_r), "| d_rand", Float32(d_rand_r),
           "(a collapsed real cluster makes real prediction trivially easy)")
     print("  d_pair / d_step", Float32(d_pair / d_step), "| d_pair / d_rand", Float32(d_pair / d_rand))
+    # Is the gap an OFFSET? Subtract (a) the mean real − sim offset over every
+    # pair, (b) each episode's offset at its FIRST frame (a deploy can render
+    # the sim twin of its start frame: the scene is rebuilt, q is read), then
+    # re-measure the twin distance and the retrieval.
+    var off_g = List[Float64](length=EMB, fill=0.0)
+    for i in range(n):
+        for d in range(EMB):
+            off_g[d] += (zr[i][d] - zs[i][d]) / Float64(n)
+    for mode in range(2):
+        var zc = List[List[Float64]]()
+        for i in range(n):
+            var s0 = i
+            while s0 > 0 and ep_of[s0 - 1] == ep_of[i]:
+                s0 -= 1
+            var z = zr[i].copy()
+            for d in range(EMB):
+                z[d] -= off_g[d] if mode == 0 else zr[s0][d] - zs[s0][d]
+            zc.append(z^)
+        var dp = 0.0
+        var dp_late = 0.0
+        var n_late = 0
+        var h = 0
+        for i in range(n):
+            var dd = _dist(zc[i], zs[i])
+            dp += dd
+            if t_of[i] >= 30:
+                dp_late += dd
+                n_late += 1
+            var best = 0
+            var bd = 1e30
+            for j in range(n):
+                var d = _dist(zc[i], zs[j])
+                if d < bd:
+                    bd = d
+                    best = j
+            if ep_of[best] == ep_of[i] and abs(t_of[best] - t_of[i]) <= 5:
+                h += 1
+        print("  offset-corrected (", "global mean" if mode == 0 else "per-episode start frame",
+              ") d_pair", Float32(dp / Float64(n)), "| ticks >= 30 only", Float32(dp_late / Float64(max(n_late, 1))),
+              "| top-1", Float32(100.0 * Float64(h) / Float64(n)), "%")
     var land_r = _landscape(enc, real, True, stride, ctx)
     print("  REAL cost landscape: Spearman(dist to the release frame, ticks to go)",
           Float32(land_r[0]), "over", land_r[1], "episodes,", land_r[2], "with a detected release")
