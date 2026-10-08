@@ -2,6 +2,7 @@
 
     bb = Qwen35Backbone("~/.cache/noeira/local-ai/kev9b-gptq-q4g32")       # MLX-format GPTQ Q4_0 checkpoint
     hs = bb.hidden([[t0, t1, ...], [...]])                                 # final hidden states per row, fp32
+    hp, hr = bb.hidden_shared(prefix, [suffix_1, ...])                     # the prefix computed ONCE
 
 Why: Kev on the Jetson Orin spends ~43 % of a decision in MLX's naive 6-bit matmul and ~50 % in mlx-lm's per-token
 DeltaNet loop (off Apple GPUs it has no fused kernel). This graph uses, from MAX 26.6:
@@ -15,8 +16,16 @@ RoPE (64 of 256 dims, theta 1e7, half-split), gated attention (sigmoid gate), ga
 SwiGLU MLP, bf16 residuals. MAX's qwen3_5 ARCHITECTURE is not reused: it reads NVFP4/FP8 checkpoints only and
 needs the serving stack (paged KV cache, state-cache pool) that a three-row prefill does not.
 
-All rows of one Kev request go in ONE call: the DeltaNet ops are ragged by design (row offsets + one state slot per
-row), attention gets a block-diagonal causal mask from per-token row ids, and RoPE positions restart per row.
+A Kev request's STATE — the prefix every question row starts with — is computed ONCE, by a PREFIX graph (one row
+from zero state) that also returns each attention layer's K and V and leaves its final DeltaNet states in its pool
+buffers. A ROWS graph then runs all question rows in one ragged call: each DeltaNet pool slot starts from the
+prefix's state (one store per pool, before the pool's one in-place op), attention sees the prefix's K/V plus the
+query's own row causally, and positions continue from the prefix.
+⚠ ON THE ORIN, RUN WITH `MODULAR_DEVICE_CONTEXT_MEMORY_MANAGER_VMM=0`. With MAX 26.6's default VMM memory manager
+(a 15 GB reserved chunk, mapped as it grows), calls hit CUDA_ERROR_ILLEGAL_ADDRESS at random once the device cache
+filled (3.75-4.25 GB in use): never in device-sync mode, never at small sizes, in this two-graph form and in a
+single-graph one. With VMM off, 16 alternating calls of both paths ran clean. The step-3 graph (state recomputed per
+row) never filled the cache.
 
 The checkpoint is read straight from its safetensors header (NumPy memory map: no MLX, no torch needed — the Orin).
 Q4 linears are MLX affine 4-bit g32 with bias = -8 * scale (gptq_kev.py); each is converted to llama.cpp Q4_0
@@ -122,7 +131,9 @@ class Qwen35Backbone:
         self._repack_graphs = {}
         self.names, self.types, self.bufs = [], [], []
         self._load_weights()
-        self.model = self.session.load(self._build_graph())
+        self._pool_cache = {}
+        self.prefix_model = self.session.load(self._build_graph("prefix"))
+        self.rows_model = self.session.load(self._build_graph("rows"))
 
     # weights -> device buffers (graph inputs, in a fixed order) ───────────────
 
@@ -193,43 +204,73 @@ class Qwen35Backbone:
 
     # graph ────────────────────────────────────────────────────────────────────
 
-    def _build_graph(self) -> Graph:
-        T, B, B1 = "T", "B", "B1"
-        dyn = [
-            TensorType(F32, [T, self.D], device=self.dref),  # h0 (embeddings)
-            TensorType(DType.int32, [T], device=self.dref),  # position within its row
-            TensorType(DType.int32, [T], device=self.dref),  # row id
-            TensorType(DType.uint32, [B1], device=self.dref),  # row offsets
-            TensorType(DType.uint32, [B], device=self.dref),  # state slot per row
-        ]
+    def _build_graph(self, kind: str) -> Graph:
+        """`prefix`: ONE row from zero state — its hidden states, each attention layer's K and V, and its final
+        DeltaNet states left in the pool buffers. `rows`: B rows, each continuing from those states (copied into
+        every slot first) and attending to the prefix's K/V plus its own row, causally."""
+        T, P, B, B1 = "T", "P", "B", "B1"
+        d = self.dref
         nlin = sum(1 for p in self.plan if p["linear"])
-        pools = []
+        natt = len(self.plan) - nlin
+        n = 1 if kind == "prefix" else B
+        L = T if kind == "rows" else P
+        dyn = [TensorType(F32, [L, self.D], device=d), TensorType(DType.int32, [L], device=d)]
+        if kind == "rows":
+            dyn.append(TensorType(DType.int32, [T], device=d))  # row id
+        dyn += [TensorType(DType.uint32, [2 if kind == "prefix" else B1], device=d),
+                TensorType(DType.uint32, [1 if kind == "prefix" else B], device=d)]
+        conv_shape, rec_shape = [self.conv_dim, self.ck - 1], [self.nv, self.kd, self.vd]
+        pools, extra = [], []
         for _ in range(nlin):
-            pools.append(BufferType(F32, [B, self.conv_dim, self.ck - 1], device=self.dref))
-            pools.append(BufferType(F32, [B, self.nv, self.kd, self.vd], device=self.dref))
-        with Graph("kev_qwen35_backbone", input_types=dyn + pools + self.types, custom_extensions=[KERNELS]) as g:
-            h0, pos, rid, offs, slots = (v.tensor for v in g.inputs[:5])
-            pool_vals = [v.buffer for v in g.inputs[5:5 + 2 * nlin]]
-            W = dict(zip(self.names, (v.tensor for v in g.inputs[5 + 2 * nlin:])))
+            pools += [BufferType(F32, [n] + conv_shape, device=d), BufferType(F32, [n] + rec_shape, device=d)]
+        if kind == "rows":
+            for _ in range(nlin):  # the prefix's final states (its pool buffers, read as tensors)
+                extra += [TensorType(F32, [1] + conv_shape, device=d), TensorType(F32, [1] + rec_shape, device=d)]
+            for _ in range(natt):  # the prefix's K and V per attention layer
+                extra += [TensorType(BF16, [P, self.Hkv, self.hd], device=d)] * 2
+        with Graph(f"kev_qwen35_{kind}", input_types=dyn + pools + extra + self.types,
+                   custom_extensions=[KERNELS]) as g:
+            vals = list(g.inputs)
+            nd = len(dyn)
+            if kind == "rows":
+                h0, pos, rid, offs, slots = (v.tensor for v in vals[:nd])
+            else:
+                h0, pos, offs, slots = (v.tensor for v in vals[:nd])
+                rid = None
+            pool_vals = [v.buffer for v in vals[nd:nd + 2 * nlin]]
+            ex = [v.tensor for v in vals[nd + 2 * nlin:nd + 2 * nlin + len(extra)]]
+            W = dict(zip(self.names, (v.tensor for v in vals[nd + 2 * nlin + len(extra):])))
             self._W = W
+            # every slot starts from zero (prefix) or from the prefix's final state (rows); ONE store per pool,
+            # before the pool's one in-place op
+            for k, pool in enumerate(pool_vals):
+                src = ex[k] if kind == "rows" else ops.constant(0.0, F32, device=d)
+                ops.buffer_store(pool, ops.broadcast_to(src, pool.shape))
+            kv = ex[2 * nlin:]
             x = ops.cast(h0, BF16)
             cos, sin = self._rope_tables(pos)
-            mask = self._mask(pos, rid)
-            li = 0
+            mask = self._mask(pos, rid, kv[0].shape[0] if kind == "rows" else None)
+            out_kv = []
+            li = ai = 0
             for i, layer in enumerate(self.plan):
                 lp = f"layers.{i}."
                 xn = self._rms(x, W[lp + "input_layernorm"])
                 if layer["linear"]:
-                    r = self._deltanet(xn, lp + "linear_attn.", layer, pool_vals[2 * li], pool_vals[2 * li + 1], slots, offs)
+                    r = self._deltanet(xn, lp + "linear_attn.", layer, pool_vals[2 * li], pool_vals[2 * li + 1],
+                                       slots, offs)
                     li += 1
                 else:
-                    r = self._attention(xn, lp + "self_attn.", layer, cos, sin, mask)
+                    pkv = (kv[2 * ai], kv[2 * ai + 1]) if kind == "rows" else None
+                    r, k_, v_ = self._attention(xn, lp + "self_attn.", layer, cos, sin, mask, pkv)
+                    out_kv += [k_, v_]
+                    ai += 1
                 h = x + r
                 hn = self._rms(h, W[lp + "post_attention_layernorm"])
                 g_ = self._mm(hn, lp + "mlp.gate_proj", layer["gate_proj"])
                 u_ = self._mm(hn, lp + "mlp.up_proj", layer["up_proj"])
                 x = h + self._mm(ops.silu(g_) * u_, lp + "mlp.down_proj", layer["down_proj"])
-            g.output(ops.cast(self._rms(x, W["norm"]), F32))
+            hid = ops.cast(self._rms(x, W["norm"]), F32)
+            g.output(*([hid] + out_kv if kind == "prefix" else [hid]))
         return g
 
     def _mm(self, x, name, kind):
@@ -257,12 +298,18 @@ class Qwen35Backbone:
         out = ops.concat([x1 * cos - x2 * sin, x2 * cos + x1 * sin, rest], axis=-1)
         return ops.cast(out, BF16)
 
-    def _mask(self, pos, rid):
-        same = ops.equal(ops.unsqueeze(rid, 1), ops.unsqueeze(rid, 0))
+    def _mask(self, pos, rid, P):
         causal = ops.greater_equal(ops.unsqueeze(pos, 1), ops.unsqueeze(pos, 0))
-        return ops.logical_and(same, causal)  # [T, T]: query i may see key j
+        if rid is None:
+            return causal  # [P, P]: one row
+        own = ops.logical_and(ops.equal(ops.unsqueeze(rid, 1), ops.unsqueeze(rid, 0)), causal)
+        T = pos.shape[0]
+        # [T, P + T]: every prefix key, then the query's own row causally
+        allp = ops.broadcast_to(ops.constant(True, DType.bool, device=self.dref), [T, P])
+        return ops.concat([allp, own], axis=1)
 
-    def _attention(self, xn, sp, layer, cos, sin, mask):
+    def _attention(self, xn, sp, layer, cos, sin, mask, prefix_kv):
+        """The block's output, and THIS call's K and V (post-norm, post-RoPE) for a prefix graph to hand on."""
         T = xn.shape[0]
         qg = ops.reshape(self._mm(xn, sp + "q_proj", layer["q_proj"]), [T, self.H, 2 * self.hd])
         q, gate = qg[:, :, :self.hd], qg[:, :, self.hd:]
@@ -271,20 +318,22 @@ class Qwen35Backbone:
         v = ops.reshape(self._mm(xn, sp + "v_proj", layer["v_proj"]), [T, self.Hkv, self.hd])
         q = self._rope(self._rms(q, self._W[sp + "q_norm"]), cos, sin)
         k = self._rope(self._rms(k, self._W[sp + "k_norm"]), cos, sin)
+        ka, va = (k, v) if prefix_kv is None else (ops.concat([prefix_kv[0], k], 0), ops.concat([prefix_kv[1], v], 0))
         rep = self.H // self.Hkv
 
-        def heads(t):  # [T, Hkv, hd] -> [H, T, hd], query head h reads kv head h // rep (repeat_interleave: CPU only)
-            t = ops.broadcast_to(ops.unsqueeze(t, 2), [T, self.Hkv, rep, self.hd])
-            return ops.transpose(ops.reshape(t, [T, self.H, self.hd]), 0, 1)
+        def heads(t):  # [S, Hkv, hd] -> [H, S, hd], query head h reads kv head h // rep (repeat_interleave: CPU only)
+            S = t.shape[0]
+            t = ops.broadcast_to(ops.unsqueeze(t, 2), [S, self.Hkv, rep, self.hd])
+            return ops.transpose(ops.reshape(t, [S, self.H, self.hd]), 0, 1)
 
-        kh, vh = heads(k), heads(v)
+        kh, vh = heads(ka), heads(va)
         qh = ops.transpose(q, 0, 1)
         s = ops.matmul(ops.cast(qh, F32), ops.transpose(ops.cast(kh, F32), 1, 2)) * (self.hd ** -0.5)
         s = ops.where(ops.unsqueeze(mask, 0), s, ops.constant(-1e30, F32, device=self.dref))
         p = ops.softmax(s)
         o = ops.cast(ops.matmul(p, ops.cast(vh, F32)), BF16)  # [H, T, hd]
         o = ops.reshape(ops.transpose(o, 0, 1), [T, self.H * self.hd])
-        return self._mm(o * ops.sigmoid(gate), sp + "o_proj", layer["o_proj"])
+        return self._mm(o * ops.sigmoid(gate), sp + "o_proj", layer["o_proj"]), k, v
 
     def _deltanet(self, xn, lp, layer, conv_pool, rec_pool, slots, offs):
         T = xn.shape[0]
@@ -314,20 +363,40 @@ class Qwen35Backbone:
         wq, s, b = self.emb
         return deq8(np.asarray(wq[ids]), np.asarray(s[ids]), np.asarray(b[ids]), self.emb_gs)
 
+    def _pools(self, n):
+        """Persistent pool buffers for `n` slots: every graph overwrites them before use, so no zeros are uploaded."""
+        if n not in self._pool_cache:
+            bufs = []
+            for p in self.plan:
+                if p["linear"]:
+                    bufs.append(Buffer.from_numpy(np.empty((n, self.conv_dim, self.ck - 1), np.float32)).to(self.dev))
+                    bufs.append(Buffer.from_numpy(np.empty((n, self.nv, self.kd, self.vd), np.float32)).to(self.dev))
+            self._pool_cache[n] = bufs
+        return self._pool_cache[n]
+
+    def _prefix(self, ids: list[int]):
+        """One row from zero state: (hidden fp32, [K, V per attention layer]); its final states stay in _pools(1)."""
+        P = len(ids)
+        dyn = [Buffer.from_numpy(a).to(self.dev) for a in
+               (self.embed(np.asarray(ids, dtype=np.int64)).astype(np.float32), np.arange(P, dtype=np.int32),
+                np.array([0, P], np.uint32), np.zeros(1, np.uint32))]
+        out = self.prefix_model.execute(*dyn, *self._pools(1), *self.bufs)
+        return out[0], out[1:]
+
     def hidden(self, rows: list[list[int]]) -> list[np.ndarray]:
-        """Final hidden states (fp32) of each token row, all rows in one call."""
+        """Final hidden states (fp32) of each token row, each row computed whole (one prefix-graph call per row)."""
+        return [self._prefix(r)[0].to_numpy() for r in rows]
+
+    def hidden_shared(self, prefix: list[int], rows: list[list[int]]) -> tuple[np.ndarray, list[np.ndarray]]:
+        """The rows `prefix + r` for each r in `rows`, the prefix computed ONCE: (prefix states, suffix states)."""
+        assert prefix, "hidden_shared needs a non-empty prefix (use hidden() for whole rows)"
+        hp, kv = self._prefix(prefix)
+        P, lens, nb = len(prefix), [len(r) for r in rows], len(rows)
         ids = np.concatenate([np.asarray(r, dtype=np.int64) for r in rows])
-        lens = [len(r) for r in rows]
-        pos = np.concatenate([np.arange(n, dtype=np.int32) for n in lens])
+        pos = np.concatenate([np.arange(P, P + n, dtype=np.int32) for n in lens])
         rid = np.concatenate([np.full(n, i, dtype=np.int32) for i, n in enumerate(lens)])
         offs = np.concatenate([[0], np.cumsum(lens)]).astype(np.uint32)
-        nb = len(rows)
         dyn = [Buffer.from_numpy(a).to(self.dev) for a in
                (self.embed(ids).astype(np.float32), pos, rid, offs, np.arange(nb, dtype=np.uint32))]
-        pools = []
-        for p in self.plan:
-            if p["linear"]:
-                pools.append(Buffer.from_numpy(np.zeros((nb, self.conv_dim, self.ck - 1), np.float32)).to(self.dev))
-                pools.append(Buffer.from_numpy(np.zeros((nb, self.nv, self.kd, self.vd), np.float32)).to(self.dev))
-        out = self.model.execute(*dyn, *pools, *self.bufs)[0].to_numpy()
-        return np.split(out, np.cumsum(lens)[:-1])
+        out = self.rows_model.execute(*dyn, *self._pools(nb), *self._pools(1), *kv, *self.bufs)[0].to_numpy()
+        return hp.to_numpy(), np.split(out, np.cumsum(lens)[:-1])
