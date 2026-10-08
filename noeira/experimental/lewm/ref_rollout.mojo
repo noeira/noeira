@@ -87,15 +87,16 @@ def encode_ref[target: StaticString, N: Int](
     return _down[target](out, N * REF_EMB, ctx)
 
 
-struct LeWMRefRollout[target: StaticString, S: Int, HORIZON: Int]:
+struct LeWMRefRollout[target: StaticString, S: Int, HORIZON: Int, ACT: Int = REF_ACT]:
     """S candidate action sequences of HORIZON blocks, rolled out from one
     start embedding. The predictor and action embedder of the published
-    model, loaded by the loss graph's walk names (`ref_load`)."""
+    model, loaded by the loss graph's walk names (`ref_load`). `ACT` is the
+    action block's width (PushT 10; the SO-101 model 30)."""
 
     comptime D = REF_EMB
     comptime H = REF_CTX
 
-    var ae: ActionEmbedderRef[Self.HORIZON, REF_ACT, REF_EMB]
+    var ae: ActionEmbedderRef[Self.HORIZON, Self.ACT, REF_EMB]
     var pe: BiasAdd[REF_CTX * REF_EMB]
     var pred: RepeatConditional[
         REF_DEPTH,
@@ -107,7 +108,7 @@ struct LeWMRefRollout[target: StaticString, S: Int, HORIZON: Int]:
 
     def __init__(out self, dump_dir: String, ctx: Optional[DeviceContext]) raises:
         self.ctx = ctx
-        self.ae = ActionEmbedderRef[Self.HORIZON, REF_ACT, REF_EMB].make[
+        self.ae = ActionEmbedderRef[Self.HORIZON, Self.ACT, REF_EMB].make[
             Self.target, Kaiming
         ](ctx)
         self.pe = BiasAdd[REF_CTX * REF_EMB].make[Self.target, Kaiming](ctx)
@@ -198,18 +199,26 @@ struct LeWMRefRollout[target: StaticString, S: Int, HORIZON: Int]:
     ) raises -> List[Scalar[DT]]:
         """start_emb (D), actions (S, HORIZON, ACT) z-scored ->
         predicted embeddings (S, HORIZON + 1, D); entry 0 is the start."""
+        return self.rollout_ctx(start_emb, 1, actions)
+
+    def rollout_ctx(
+        mut self, obs_embs: List[Scalar[DT]], n_obs: Int, actions: List[Scalar[DT]]
+    ) raises -> List[Scalar[DT]]:
+        """`rollout` from `n_obs` OBSERVED embeddings (n_obs, D), shared by
+        every row: entries 0 ..< n_obs of the result are those, the rest are
+        predicted. `actions` (S, HORIZON, ACT): block k is the one taken after
+        frame k, so blocks 0 ..< n_obs − 1 are the executed ones (identical
+        across rows) and the rest are the candidates'."""
         comptime D = Self.D
         comptime T1 = Self.HORIZON + 1
-        var a = _up[Self.target](actions, self.ctx)
-        var ae_t = Tensor.alloc(Self.S * Self.HORIZON * D)
-        self.ae.forward[Self.target, Self.S](TensorRefs[1](a), ae_t, self.ctx)
-        var act_emb = _down[Self.target](ae_t, Self.S * Self.HORIZON * D, self.ctx)
+        var act_emb = self.embed_actions(actions)
 
         var embs = List[Scalar[DT]](length=Self.S * T1 * D, fill=Scalar[DT](0))
         for s in range(Self.S):
-            for d in range(D):
-                embs[(s * T1) * D + d] = start_emb[d]
-        for t in range(Self.HORIZON):
+            for k in range(n_obs):
+                for d in range(D):
+                    embs[(s * T1 + k) * D + d] = obs_embs[k * D + d]
+        for t in range(n_obs - 1, Self.HORIZON):
             var lo = max(0, t + 1 - Self.H)
             var L = t + 1 - lo
             var x = List[Scalar[DT]](length=Self.S * Self.H * D, fill=Scalar[DT](0))
