@@ -23,6 +23,19 @@ lead and the ctrlrange), and the critic can compute it for any proposal
 target from the arm's own pose (target mode starts at q). Windows stay inside
 one episode; the split is by episode (`VAL_EVERY`-th episode of each store
 held out).
+
+## Real teleop stores (`teleop=True`, S2)
+
+`act_so101_import_dataset.mojo --undistort` stores: `images`
+(2 × 3 × 240 × 320, undistorted to the sim pinhole), `qpos` and `action` in
+LeRobot units — the follower's joints and the LEADER's. Frames go through the
+same `AreaResize` as the sim renders; the commanded target is the leader's
+position (the follower tracks it), in model radians through
+`So101TowerUnits` with the FOLLOWER joint zero; the first tick's change is
+from the follower's pose. ⚠ teleop has no target-mode clamp (lead ≤ 0.3 rad
+per joint): its target changes can be larger than any the sim teacher made.
+Normalise real windows with the TRAINING run's statistics
+(`load_action_stats`), never their own.
 """
 
 from std.math import sqrt
@@ -34,6 +47,8 @@ from noeira.physics3d.parser.runtime_load import parse_model_runtime
 from noeira.tasks.family import scene_path
 from noeira.tasks.spec import load_family
 from noeira.tasks.so101_tower_xml import So101TowerModel
+from noeira.tasks.so101_tower_rig import So101TowerUnits, RIG_JOINT_ZERO_FOLLOWER
+from .so101_frames import AreaResize
 
 
 comptime T = 4
@@ -84,8 +99,9 @@ struct So101WMData[R: Int](Movable):
     var n_rows: Int
     var n_episodes: Int
 
-    def __init__(out self, paths: List[String]) raises:
+    def __init__(out self, paths: List[String], teleop: Bool = False) raises:
         var rig = So101Rig()
+        var units = So101TowerUnits(String(RIG_JOINT_ZERO_FOLLOWER))
         self.images = List[UInt8]()
         self.dtarget = List[Float32]()
         self.train_starts = List[Int]()
@@ -96,30 +112,56 @@ struct So101WMData[R: Int](Movable):
         for p in paths:
             var st = TrajectoryStore(p)
             var spec = st.column(String("images"))
-            if spec.row_dim() != Self.FRAME:
-                raise Error("So101WMData: " + p + " images row is " + String(spec.row_dim())
-                            + " values, expected " + String(Self.FRAME)
-                            + " (2 x 3 x R x R; render with --resize R)")
             var n = st.n_rows()
-            var im = st.load_column[DType.uint8](String("images"), max_bytes=1 << 40)
-            var state = st.load_column[DType.float64](String("state"), max_bytes=1 << 34)
-            var asim = st.load_column[DType.float32](String("action_sim"), max_bytes=1 << 34)
             var base = self.n_rows
-            self.images.extend(im^)
+            var tgt = List[Float64](length=n * JOINTS, fill=0.0)
+            var q0 = List[Float64](length=n * JOINTS, fill=0.0)
+            if teleop:
+                if spec.row_dim() != CAMS * 3 * 240 * 320:
+                    raise Error("So101WMData: " + p + " is not a 2 x 3 x 240 x 320 teleop store")
+                # streamed: a teleop store is GBs (7.5 for the printed set)
+                var rz = AreaResize(3, 240, 320, Self.R)
+                comptime CHUNK = 256
+                comptime FULL = CAMS * 3 * 240 * 320
+                var buf = List[UInt8](length=CHUNK * FULL, fill=UInt8(0))
+                var r0 = 0
+                while r0 < n:
+                    var r1 = min(n, r0 + CHUNK)
+                    st.read_range[DType.uint8](
+                        String("images"), r0, r1,
+                        rebind[Pointer[Scalar[DType.uint8], MutAnyOrigin]](buf.unsafe_ptr()),
+                    )
+                    var small = rz.frames(buf, (r1 - r0) * CAMS)
+                    self.images.extend(small^)
+                    r0 = r1
+                var qp = st.load_column[DType.float32](String("qpos"), max_bytes=1 << 34)
+                var ac = st.load_column[DType.float32](String("action"), max_bytes=1 << 34)
+                for r in range(n):
+                    for j in range(JOINTS):
+                        tgt[r * JOINTS + j] = units.lerobot_to_joint(j, Float64(ac[r * JOINTS + j]))
+                        q0[r * JOINTS + j] = units.lerobot_to_joint(j, Float64(qp[r * JOINTS + j]))
+            else:
+                if spec.row_dim() != Self.FRAME:
+                    raise Error("So101WMData: " + p + " images row is " + String(spec.row_dim())
+                                + " values, expected " + String(Self.FRAME)
+                                + " (2 x 3 x R x R; render with --resize R)")
+                var im = st.load_column[DType.uint8](String("images"), max_bytes=1 << 40)
+                self.images.extend(im^)
+                var state = st.load_column[DType.float64](String("state"), max_bytes=1 << 34)
+                var asim = st.load_column[DType.float32](String("action_sim"), max_bytes=1 << 34)
+                for r in range(n):
+                    for j in range(JOINTS):
+                        var mid = 0.5 * (rig.lo[j] + rig.hi[j])
+                        var half = 0.5 * (rig.hi[j] - rig.lo[j])
+                        tgt[r * JOINTS + j] = mid + half * Float64(asim[r * JOINTS + j])
+                        q0[r * JOINTS + j] = Float64(state[r * nqv + rig.qa[j]])
             for e in range(st.n_episodes()):
                 var off = Int(st.episodes.ep_offset[e])
                 var ln = Int(st.episodes.ep_len[e])
                 for r in range(off, off + ln):
                     for j in range(JOINTS):
-                        var mid = 0.5 * (rig.lo[j] + rig.hi[j])
-                        var half = 0.5 * (rig.hi[j] - rig.lo[j])
-                        var tg = mid + half * Float64(asim[r * JOINTS + j])
-                        var prev: Float64
-                        if r == off:
-                            prev = Float64(state[r * nqv + rig.qa[j]])
-                        else:
-                            prev = mid + half * Float64(asim[(r - 1) * JOINTS + j])
-                        self.dtarget.append(Float32(tg - prev))
+                        var prev = q0[r * JOINTS + j] if r == off else tgt[(r - 1) * JOINTS + j]
+                        self.dtarget.append(Float32(tgt[r * JOINTS + j] - prev))
                 # windows: T frames FS apart and their T action blocks
                 var last = off + ln - T * FS
                 var val = (self.n_episodes % VAL_EVERY) == VAL_EVERY - 1
@@ -143,6 +185,22 @@ struct So101WMData[R: Int](Movable):
                 self.a_std[j] += (Float64(self.dtarget[r * JOINTS + j]) - self.a_mean[j]) ** 2
         for j in range(JOINTS):
             self.a_std[j] = max(sqrt(self.a_std[j] / Float64(self.n_rows)), 1e-6)
+
+    def load_action_stats(mut self, path: String) raises:
+        """Replace the normaliser with a training run's `action_stats.txt`
+        (one `mean std` line per joint after the header)."""
+        var j = 0
+        with open(path, "r") as f:
+            for ln in f.read().split("\n"):
+                var s = String(ln.strip())
+                if s.byte_length() == 0 or s.startswith("#"):
+                    continue
+                var w = s.split(" ")
+                self.a_mean[j] = Float64(String(w[0]))
+                self.a_std[j] = Float64(String(w[1]))
+                j += 1
+        if j != JOINTS:
+            raise Error("load_action_stats: " + path + " has " + String(j) + " joints")
 
     def fill(
         self, starts: List[Int], mut pix: List[Scalar[DT]], mut act: List[Scalar[DT]]
