@@ -71,6 +71,16 @@ printed 99 dB, byte-identical, on both cameras).
 shrinks the sim's flat colours several-fold. Check free disk before a full
 file: the tool prints the running size.
 
+## `--resize R` — the world model's frames, stored small
+
+`--resize R` stores each camera area-averaged to R × R
+(`experimental/lewm/so101_frames.AreaResize`, the SAME resampler the real
+frames go through in SO101_LEWM_PLAN S2; the 4:3 aspect is squashed on
+purpose, identically in both domains): `images` becomes (2 × 3 × R × R).
+Rendering is unchanged — 320 × 240, 4x MSAA — and the host check still runs
+on the full-size first row. A 1 M-row world-model store at R = 112 is ~10×
+smaller than at 320 × 240.
+
 ## `--look calibrated|legacy` — the rig's lights and colours
 
 `calibrated` (the default since 2026-09-24) renders the scene as composed:
@@ -112,6 +122,7 @@ from std.time import perf_counter_ns
 from max.gpu.host import DeviceContext
 
 from noeira.data.column import ColumnSpec
+from noeira.experimental.lewm.so101_frames import AreaResize
 from noeira.data.store import TrajectoryStoreWriter
 from noeira.deep_agents.demos.file import DemoSet, read_demo_file
 from noeira.envs.phyics3d_env import Phyics3dEnv
@@ -194,7 +205,7 @@ def _usage() -> String:
         " [--deflate 0-9]"
         " [--no-host-check] [--dr off|light|full] [--dr-seed N]"
         " [--dr-preview K] [--joint-zero none|follower|follower-v1]"
-        " [--look calibrated|legacy]"
+        " [--look calibrated|legacy] [--resize R]"
     )
 
 
@@ -218,6 +229,7 @@ def main() raises:
     var dr_preview = 0
     var joint_zero = String(RIG_JOINT_ZERO_NONE)
     var look = String(RIG_LOOK_CALIBRATED)
+    var resize = 0
     var i = 1
     while i < len(args):
         var a = String(args[i])
@@ -251,6 +263,8 @@ def main() raises:
                 joint_zero = v
             elif a == "--look":
                 look = v
+            elif a == "--resize":
+                resize = Int(v)
             else:
                 raise Error("unknown option " + a + "\n" + _usage())
             i += 1
@@ -337,7 +351,8 @@ def main() raises:
     var cols = List[ColumnSpec]()
     cols.append(ColumnSpec(String("qpos"), DType.float32, ACT))
     cols.append(ColumnSpec(String("action"), DType.float32, ACT))
-    cols.append(ColumnSpec(String("images"), DType.uint8, N_CAMS * CAM_ELEMS))
+    var out_elems = 3 * resize * resize if resize > 0 else CAM_ELEMS
+    cols.append(ColumnSpec(String("images"), DType.uint8, N_CAMS * out_elems))
     cols.append(ColumnSpec(String("state"), DType.float64, STATE_DIM))
     cols.append(ColumnSpec(String("action_sim"), DType.float32, ACT))
     if dr_on:
@@ -354,7 +369,10 @@ def main() raises:
             + "x" + String(CAM_H) + " " + String(SAMPLES) + "x MSAA, groups"
             " 0+2, row 0 = top, slot 0 overhead / 1 wrist, frame r = obs r;"
             " qpos/action in LeRobot units (deg, gripper 0..100), "
-            + units.describe() + "; look " + look + "; dr "
+            + units.describe() + "; look " + look
+            + ("; images area-resized to " + String(resize) + "x" + String(resize)
+               + " (so101_frames.AreaResize)" if resize > 0 else "")
+            + "; dr "
             + String(dr_cfg)
             + (" (one draw per launch, see dr_draw; " + tower_camera_dr_describe()
                + ")" if dr_on else ""),
@@ -372,6 +390,10 @@ def main() raises:
     var asb = unsafe_alloc[Scalar[DType.float32]](LANES * ACT).as_unsafe_any_origin()
     var sb = unsafe_alloc[Scalar[DType.float64]](LANES * STATE_DIM).as_unsafe_any_origin()
     var drb = unsafe_alloc[Scalar[DType.int32]](LANES).as_unsafe_any_origin()
+    var imr = unsafe_alloc[Scalar[DType.uint8]](
+        LANES * N_CAMS * out_elems
+    ).as_unsafe_any_origin()
+    var resizer = AreaResize(3, CAM_H, CAM_W, resize if resize > 0 else 1)
     var launch = 0
     var first_frames = List[UInt8]()   # row 0, both cameras, for the host check
     var first_state = List[Float64]()
@@ -564,7 +586,16 @@ def main() raises:
                 var tio = perf_counter_ns()
                 w.append[DType.float32](String("qpos"), qb, n)
                 w.append[DType.float32](String("action"), ab, n)
-                w.append[DType.uint8](String("images"), im, n)
+                if resize > 0:
+                    var full = List[UInt8](length=n * N_CAMS * CAM_ELEMS, fill=UInt8(0))
+                    for k in range(n * N_CAMS * CAM_ELEMS):
+                        full[k] = im[unsafe_offset=k]
+                    var small = resizer.frames(full, n * N_CAMS)
+                    for k in range(n * N_CAMS * out_elems):
+                        imr[unsafe_offset=k] = small[k]
+                    w.append[DType.uint8](String("images"), imr, n)
+                else:
+                    w.append[DType.uint8](String("images"), im, n)
                 w.append[DType.float64](String("state"), sb, n)
                 w.append[DType.float32](String("action_sim"), asb, n)
                 if dr_on:
