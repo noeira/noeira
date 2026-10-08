@@ -500,11 +500,27 @@ struct RefStepStats(Copyable, Movable, Writable):
     """The pre-clip total norm (torch `clip_grad_norm_`'s return)."""
 
 
-struct LeWMRefTrainer[target: StaticString, B: Int](Movable):
-    comptime PIX = REF_T * 3 * REF_IMG * REF_IMG
-    comptime ACT = REF_T * REF_ACT_IN
+struct LeWMRefTrainer[
+    target: StaticString, B: Int,
+    IN_CH: Int = 3, IMG: Int = REF_IMG, ACT_IN: Int = REF_ACT_IN,
+](Movable):
+    """The LeWM training step. The defaults are the published PushT model;
+    `IN_CH` / `IMG` / `ACT_IN` re-shape it for another rig (SO-101: the two
+    cameras stacked as 6 channels at 112, 30-D action blocks —
+    noeira-docs/SO101_LEWM_PLAN.md S1). The uint8 staging path
+    (`staging` / `submit_staged`) is PushT's layout only; other shapes feed
+    normalised floats through `train_step` / `loss_of`."""
 
-    var graph: LeWMRefGraph
+    comptime PIX = REF_T * Self.IN_CH * Self.IMG * Self.IMG
+    comptime ACT = REF_T * Self.ACT_IN
+    comptime Graph = LeWMLossGraphRef[
+        Self.IN_CH, Self.IMG, 14, 192, 3, 12, 192, 2048,
+        REF_T, Self.ACT_IN, 3, 1,
+        16, 64, 2048, 6,
+        1024, 17,
+    ]
+
+    var graph: Self.Graph
     var opt: _AdamWAll
     var max_norm: Float64
     var ctx: Optional[DeviceContext]
@@ -543,7 +559,7 @@ struct LeWMRefTrainer[target: StaticString, B: Int](Movable):
         dropout: Bool = False,
     ) raises:
         comptime assert Self.target == "cpu" or Self.target == "gpu"
-        self.graph = LeWMRefGraph.make[Self.target, Kaiming](ctx)
+        self.graph = Self.Graph.make[Self.target, Kaiming](ctx)
         # the 12 ViT blocks recompute their forward in the vjp (ref_model)
         self.graph.set_node_attr["emb", "checkpoint"](Scalar[DT](1 if checkpoint else 0))
         # the predictor's dropout (ref_model.PRED_DROPOUT): the recipe trains
@@ -627,6 +643,7 @@ struct LeWMRefTrainer[target: StaticString, B: Int](Movable):
         ⚠ Slot s is read by an ASYNC copy once submitted: refill it only
         after the `finish()` of the step that read it."""
         comptime assert Self.target == "gpu", "staging: GPU only"
+        comptime assert Self.IN_CH == 3 and Self.IMG == REF_IMG, "staging: PushT's layout only"
         if len(self.pix_host) == 0:
             var c = self.ctx.value()
             for _ in range(2):
