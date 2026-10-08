@@ -66,6 +66,7 @@ from noeira.envs.robots.g1_command_bank import G1CommandBank
 from noeira.envs.robots.g1_command_language import (
     g1_command_questions, g1_decide, g1_decide_chain, g1_command_state,
     g1_since_word, G1Context, G1LangPick, G1_Q_EXTENT,
+    g1_destination_questions, g1_route_destination,
 )
 from noeira.envs.robots.g1_reward_vocab import G1Term
 from noeira.envs.robots.g1_spec import (
@@ -81,6 +82,8 @@ comptime VL_ST_STT: Int = 2
 comptime VL_ST_JEV: Int = 3
 comptime VL_ST_SPEC: Int = 4
 comptime VL_ST_CHAT: Int = 5
+comptime VL_ST_DEST: Int = 6
+"""The first of the two requests `request_wording` makes: destination only."""
 
 # ── the events ────────────────────────────────────────────────────────────
 comptime VL_NONE: Int = 0
@@ -240,10 +243,12 @@ struct G1VoiceConfig(Copyable, Movable):
     """Passed to `ChatClient.from_spec` — `hf`, `openai`, `anthropic`, or a
     local openai-compatible base URL."""
     var request_wording: Bool
-    """Ask the destination as a REQUEST with a yes/no gate
-    (`g1_command_questions(request_wording=True)`), the wording measured on a
-    local Jev-compatible model. ⚠ OFF BY DEFAULT: hosted Jev was measured on
-    the default wording. The caller fills `G1Context`'s place fields."""
+    """Ask the destination as a REQUEST with a yes/no gate, the wording
+    measured on a local Jev-compatible model, in a request of its OWN
+    (`g1_destination_questions`) — the commands are asked in a second request
+    only when it routes nothing, so a goto costs the short request alone.
+    ⚠ OFF BY DEFAULT: hosted Jev was measured on the default wording, in one
+    request. The caller fills `G1Context`'s place fields."""
     var chain: Bool
     """Ask for a second and third step. A caller that runs only the first step
     turns it off, and a local model then answers two rows fewer."""
@@ -287,6 +292,11 @@ struct G1VoiceLoop(Movable):
     var llm: ChatClient
     var cfg: G1VoiceConfig
     var quest: JevQuestions
+    var dest_q: JevQuestions
+    """`request_wording` only: the first request. Empty otherwise."""
+    var asked: String
+    """The state the current decision was asked with, for its second
+    request."""
     var spec_q: JevQuestions
     var has_pool: Bool
     var pool: G1Pool
@@ -359,10 +369,19 @@ struct G1VoiceLoop(Movable):
         # not-yet-opened capture. A failure here raises out of `__init__`,
         # which is where a missing microphone should stop a program.
         self.mic = MicCapture.start(16000, self.cfg.mic_dev)
-        self.quest = g1_command_questions(
-            bank, True, self.cfg.destinations, self.cfg.dest_descs,
-            self.cfg.request_wording, self.cfg.chain,
-        )
+        self.dest_q = JevQuestions()
+        if self.cfg.request_wording and len(self.cfg.destinations) > 0:
+            # two requests: the destination first, then the commands WITHOUT it
+            self.dest_q = g1_destination_questions(self.cfg.destinations)
+            self.quest = g1_command_questions(
+                bank, True, List[String](), List[String](), self.cfg.chain,
+            )
+        else:
+            self.quest = g1_command_questions(
+                bank, True, self.cfg.destinations, self.cfg.dest_descs,
+                self.cfg.chain,
+            )
+        self.asked = String("")
         self.spec_q = g1_spec_questions(True)
         self.has_pool = self.cfg.pool_path != ""
         # ⚠ A ONE-ROW PLACEHOLDER when there is no pool: `G1Pool` is not
@@ -409,6 +428,8 @@ struct G1VoiceLoop(Movable):
         self.llm = move.llm^
         self.cfg = move.cfg^
         self.quest = move.quest^
+        self.dest_q = move.dest_q^
+        self.asked = move.asked^
         self.spec_q = move.spec_q^
         self.has_pool = move.has_pool
         self.pool = move.pool^
@@ -736,16 +757,39 @@ struct G1VoiceLoop(Movable):
                         self.state = VL_ST_IDLE
                     else:
                         try:
-                            self.jev.start(
-                                g1_command_state(self.heard, ctx), self.quest
-                            )
+                            self.asked = g1_command_state(self.heard, ctx)
+                            if self._two_requests():
+                                self.jev.start(self.asked, self.dest_q)
+                                self.state = VL_ST_DEST
+                            else:
+                                self.jev.start(self.asked, self.quest)
+                                self.state = VL_ST_JEV
                             self.t_wait = perf_counter_ns()
-                            self.state = VL_ST_JEV
                         except e:
                             self.note = String("[jev] could not start: ") \
                                         + String(e)
                             self.state = VL_ST_IDLE
                         ev.text = self.heard
+
+        # ── deciding: the destination request (`request_wording`) ──────
+        elif self.state == VL_ST_DEST:
+            var el = Float64(perf_counter_ns() - self.t_wait) / 1e9
+            if el > self.cfg.jev_dl:
+                self.note = (String("[jev] GAVE UP after ") + _vl_f2(el)
+                             + String(" s"))
+                try:
+                    self.jev.cancel()
+                except:
+                    pass
+                self.state = VL_ST_IDLE
+            else:
+                var ready = False
+                try:
+                    ready = self.jev.poll()
+                except:
+                    ready = True
+                if ready:
+                    ev = self._destination()
 
         # ── deciding ──────────────────────────────────────────────────
         elif self.state == VL_ST_JEV:
@@ -825,17 +869,48 @@ struct G1VoiceLoop(Movable):
 
         return ev^
 
+    def _two_requests(self) -> Bool:
+        return self.cfg.request_wording and len(self.cfg.destinations) > 0
+
+    def _destination(mut self) -> G1VoiceEvent:
+        """The first request's answer: a goto, or the commands' request."""
+        var ev = G1VoiceEvent.none()
+        self.state = VL_ST_IDLE
+        try:
+            var ans = self.jev.result()
+            var dest = g1_route_destination(ans)
+            if dest != "":
+                ev.kind = VL_WORLD
+                ev.destination = dest
+                ev.text = self.heard
+                self.note = (String("[world] ") + dest + String(" ")
+                             + _vl_f2(ans.probability(String("destination"), dest))
+                             + String(" (") + _vl_f2(ans.latency_ms)
+                             + String(" ms)"))
+                return ev^
+            # ⚠ THE SAME STATE, not a fresh one: the robot may have moved on
+            # while the first request was answered, and the two answers must
+            # be about the same moment.
+            self.jev.start(self.asked, self.quest)
+            self.t_wait = perf_counter_ns()
+            self.state = VL_ST_JEV
+        except e:
+            self.note = String("[jev] FAILED: ") + String(e)
+        return ev^
+
     def _decide(mut self, ref ctx: G1Context, ref bank: G1CommandBank) -> G1VoiceEvent:
         """The decision, and the four ways it can go."""
         var ev = G1VoiceEvent.none()
         var got = False
         try:
             var ans = self.jev.result()
+            # with two requests the destination was decided already, and
+            # these answers carry no destination question
+            var two = self._two_requests()
             self.pick = g1_decide(
                 ans, bank, self.cfg.max_none, self.cfg.min_top, 0.5, True,
-                len(self.cfg.destinations) > 0, 0.5,
-                0.40 if self.cfg.request_wording else 0.5,
-                self.cfg.refuse_placeless, self.cfg.request_wording,
+                len(self.cfg.destinations) > 0 and not two, 0.5, 0.5,
+                self.cfg.refuse_placeless, dest_decided=two,
             )
             ev.conf = self.pick.conf
             ev.p_none = self.pick.p_none
@@ -980,6 +1055,9 @@ struct G1VoiceLoop(Movable):
         if self.state == VL_ST_STT:
             return (String("transcribing ") + _vl_f2(el) + String("s / ")
                     + _vl_f2(self.cfg.stt_dl) + String("s"))
+        if self.state == VL_ST_DEST:
+            return (String("deciding: where? ") + _vl_f2(el) + String("s / ")
+                    + _vl_f2(self.cfg.jev_dl) + String("s"))
         if self.state == VL_ST_JEV:
             return (String("deciding ") + _vl_f2(el) + String("s / ")
                     + _vl_f2(self.cfg.jev_dl) + String("s"))
