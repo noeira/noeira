@@ -21,11 +21,11 @@ from zero state) that also returns each attention layer's K and V and leaves its
 buffers. A ROWS graph then runs all question rows in one ragged call: each DeltaNet pool slot starts from the
 prefix's state (one store per pool, before the pool's one in-place op), attention sees the prefix's K/V plus the
 query's own row causally, and positions continue from the prefix.
-⚠ ON THE ORIN, RUN WITH `MODULAR_DEVICE_CONTEXT_MEMORY_MANAGER_VMM=0`. With MAX 26.6's default VMM memory manager
-(a 15 GB reserved chunk, mapped as it grows), calls hit CUDA_ERROR_ILLEGAL_ADDRESS at random once the device cache
-filled (3.75-4.25 GB in use): never in device-sync mode, never at small sizes, in this two-graph form and in a
-single-graph one. With VMM off, 16 alternating calls of both paths ran clean. The step-3 graph (state recomputed per
-row) never filled the cache.
+⚠ ON THE 16 GB ORIN, MEMORY PRESSURE SHOWS UP AS CUDA_ERROR_ILLEGAL_ADDRESS, not as an allocation failure: random
+faults in whichever kernel ran next, then every call failing, with MAX's "oom log" showing its device cache full.
+Kev (kev.serve + torch + MLX + this graph) beside Phonon faulted within a few requests, with this graph and with the
+step-3 one; Kev alone, or the slim server (projects/g1 kev_serve_slim.py: no torch / MLX) beside Phonon, ran 40-50
+requests clean. `MODULAR_DEVICE_CONTEXT_MEMORY_MANAGER_VMM=0` made it rarer, not gone.
 
 The checkpoint is read straight from its safetensors header (NumPy memory map: no MLX, no torch needed — the Orin).
 Q4 linears are MLX affine 4-bit g32 with bias = -8 * scale (gptq_kev.py); each is converted to llama.cpp Q4_0
