@@ -196,6 +196,7 @@ def main() raises:
     var nrm = List[Scalar[DT]](length=OBS, fill=Scalar[DT](0))
     var ao = List[Scalar[DT]](length=ACT, fill=Scalar[DT](0))
     var n_ok = 0
+    var n_empty_first = 0
     for ep in range(episodes):
         _ = env.reset()
         for k in range(len(mw[0])):
@@ -243,6 +244,13 @@ def main() raises:
         var held = False
         var t_held = -1
         var flips = 0
+        # ⚠ EMPTY CLOSES: the jaw fully shut (< -0.10 rad: on the brick it
+        # stalls near +0.10) after having opened (> 0.20), counted once per
+        # close; "first close empty" = one happened before the brick rose 2 cm
+        var jaw_open = False
+        var n_empty = 0
+        var t_first_empty = -1
+        var lifted = False
         var a_last = List[Float64](length=ACT, fill=0.0)
         if not quiet:
             var l0 = String("── episode ") + String(ep) + " start q:"
@@ -312,6 +320,16 @@ def main() raises:
             var zb = Float64(env.d.xpos.data[brick * 3 + 2])
             if zb - z0 > rise:
                 rise = zb - z0
+            if rise > 0.02:
+                lifted = True
+            var jaw = Float64(env.d.qpos.data[qa[ACT - 1]])
+            if jaw > 0.20:
+                jaw_open = True
+            elif jaw < -0.10 and jaw_open:
+                jaw_open = False
+                n_empty += 1
+                if t_first_empty < 0 and not lifted:
+                    t_first_empty = t
             # the task's own goal word, as the driver's success count reads it
             if rdone[1]:
                 if not held:
@@ -319,8 +337,12 @@ def main() raises:
                 held = True
         if held:
             n_ok += 1
+        if t_first_empty >= 0:
+            n_empty_first += 1
         var steps = So101TowerConfig.MAX_STEPS // repeat
         print("   episode", ep, "| brick max rise", fixed(rise * 1000.0, 1),
               "mm | goal held:", held, "at", fixed(Float64(t_held) * period, 2),
-              "s | arm sign flips per step", fixed(Float64(flips) / Float64(steps), 3))
-    print("probe:", n_ok, "/", episodes, "episodes reached the goal")
+              "s | empty closes", n_empty, "(first at tick", t_first_empty,
+              ") | arm sign flips per step", fixed(Float64(flips) / Float64(steps), 3))
+    print("probe:", n_ok, "/", episodes, "episodes reached the goal |",
+          n_empty_first, "closed EMPTY before the first lift")
