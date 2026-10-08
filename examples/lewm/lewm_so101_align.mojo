@@ -31,6 +31,7 @@ with a real goal frame needs exactly this to be high.
 
     build/so101_align --dump <run>/epoch_7 --real <teleop store> \\
         --twin twin.rendered.h5 --map twin.demo.map.txt
+    build/so101_align --dump <run>/epoch_7 --landscape STORE --kind sim|teleop
 """
 
 from std.sys import argv
@@ -135,6 +136,62 @@ def _dist(a: List[Float64], b: List[Float64]) -> Float64:
     return sqrt(s)
 
 
+def _landscape(
+    mut enc: Enc, store: String, teleop: Bool, stride: Int, ctx: Optional[DeviceContext]
+) raises -> Tuple[Float64, Int, Int]:
+    """Spearman(latent distance to the release frame, ticks to go), averaged
+    over a store's episodes (see the header); (rho, episodes, releases)."""
+    var paths = List[String]()
+    paths.append(store)
+    var data = So101WMData[R](paths, teleop=teleop)
+    var st = TrajectoryStore(store)
+    var qp = st.load_column[DType.float32](String("qpos"), max_bytes=1 << 30)
+    var rows_all = List[Int]()
+    var ep_start = List[Int]()
+    var ep_len = List[Int]()
+    var n_release = 0
+    for e in range(st.n_episodes()):
+        var a = Int(st.episodes.ep_offset[e])
+        var b = a + Int(st.episodes.ep_len[e])
+        # the release: >= 20 ticks stalled on the cube (8..17), then > 20
+        var held = 0
+        var holding = False
+        for t in range(a, b):
+            var g = Float64(qp[t * JOINTS + JOINTS - 1])
+            if g >= 8.0 and g <= 17.0:
+                held += 1
+                if held >= 20:
+                    holding = True
+            else:
+                held = 0
+            if holding and g > 20.0:
+                b = t + 1
+                n_release += 1
+                break
+        ep_start.append(len(rows_all))
+        var t = a
+        while t < b:
+            rows_all.append(t)
+            t += stride
+        ep_len.append(len(rows_all) - ep_start[e])
+    var z = _encode(enc, data, rows_all, ctx)
+    var rho = 0.0
+    var n_ep = 0
+    for e in range(len(ep_start)):
+        var s0 = ep_start[e]
+        var m = ep_len[e]
+        if m < 4:
+            continue
+        var cost = List[Float64]()
+        var togo = List[Float64]()
+        for i in range(m):
+            cost.append(_dist(z[s0 + i], z[s0 + m - 1]))
+            togo.append(Float64(m - 1 - i))
+        rho += _spearman(cost, togo)
+        n_ep += 1
+    return (rho / Float64(max(n_ep, 1)), n_ep, n_release)
+
+
 def main() raises:
     var args = List[String]()
     for a in argv():
@@ -149,6 +206,13 @@ def main() raises:
     var ctx = Optional(c)
     var enc = Enc.make["gpu", Kaiming](ctx)
     var n_loaded = load_ref["gpu"](enc, dump, String("emb.0."), ctx)
+    var land = _arg(args, "--landscape", "")
+    if land.byte_length() > 0:
+        var kind = _arg(args, "--kind", "sim")
+        var res = _landscape(enc, land, kind == "teleop", stride, ctx)
+        print("S2 cost landscape |", kind, land, "| Spearman(dist to the release frame, ticks to go)",
+              Float32(res[0]), "over", res[1], "episodes,", res[2], "with a detected release")
+        return
     var rp = List[String]()
     rp.append(real)
     var rd = So101WMData[R](rp, teleop=True)
@@ -222,66 +286,9 @@ def main() raises:
     print("  real latents among themselves: d_step", Float32(d_step_r), "| d_rand", Float32(d_rand_r),
           "(a collapsed real cluster makes real prediction trivially easy)")
     print("  d_pair / d_step", Float32(d_pair / d_step), "| d_pair / d_rand", Float32(d_pair / d_rand))
-    # the real cost landscape along whole real episodes
-    var rho_sum = 0.0
-    var n_ep = 0
-    var rows_all = List[Int]()
-    var ep_start = List[Int]()
-    var real_starts = List[Int]()
-    var real_lens = List[Int]()
-    var st_off = 0
-    # episode bounds of the real store, from the window starts' gaps is not
-    # enough: re-read them from the twin map's real offsets and the next one
-    with open(mapf, "r") as f:
-        for ln in f.read().split("\n"):
-            var s = String(ln.strip())
-            if s.byte_length() == 0 or s.startswith("#"):
-                continue
-            var w = s.split(" ")
-            real_starts.append(Int(String(w[2])))
-    var qst = TrajectoryStore(real)
-    var qp = qst.load_column[DType.float32](String("qpos"), max_bytes=1 << 30)
-    var n_release = 0
-    for e in range(len(real_starts)):
-        var a = real_starts[e]
-        var b = real_starts[e + 1] if e + 1 < len(real_starts) else rd.n_rows
-        # the release: >= 20 ticks stalled on the cube (8..17), then > 20
-        var held = 0
-        var holding = False
-        for t in range(a, b):
-            var g = Float64(qp[t * JOINTS + JOINTS - 1])
-            if g >= 8.0 and g <= 17.0:
-                held += 1
-                if held >= 20:
-                    holding = True
-            else:
-                held = 0
-            if holding and g > 20.0:
-                b = t + 1
-                n_release += 1
-                break
-        ep_start.append(len(rows_all))
-        var t = a
-        while t < b:
-            rows_all.append(t)
-            t += stride
-        real_lens.append(len(rows_all) - ep_start[e])
-    var zall = _encode(enc, rd, rows_all, ctx)
-    for e in range(len(real_starts)):
-        var s0 = ep_start[e]
-        var m = real_lens[e]
-        if m < 4:
-            continue
-        var cost = List[Float64]()
-        var togo = List[Float64]()
-        for i in range(m):
-            cost.append(_dist(zall[s0 + i], zall[s0 + m - 1]))
-            togo.append(Float64(m - 1 - i))
-        rho_sum += _spearman(cost, togo)
-        n_ep += 1
+    var land_r = _landscape(enc, real, True, stride, ctx)
     print("  REAL cost landscape: Spearman(dist to the release frame, ticks to go)",
-          Float32(rho_sum / Float64(max(n_ep, 1))), "over", n_ep, "episodes (", n_release,
-          "with a detected release; the others to their last frame ) (1 = monotone)")
+          Float32(land_r[0]), "over", land_r[1], "episodes,", land_r[2], "with a detected release")
     print("  top-1 real -> own twin (same episode, within 5 ticks):", hit, "/", n,
           "=", Float32(100.0 * Float64(hit) / Float64(n)), "% | chance ~",
           Float32(100.0 * 3.0 / Float64(n)), "%")
