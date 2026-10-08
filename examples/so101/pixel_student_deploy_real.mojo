@@ -26,7 +26,9 @@ CSV (overhead first), --port, --fourcc, --undistort DIR (projects/so101-tower/
 cameras), --arm, --seconds (20), --no-return, --no-start-pose, --snap DIR,
 --gripper-sign 0|1 (default: the manifest's), --step-ticks (80), --force-dark,
 --record DIR (per-tick CSV of q, qd, action, target + the two frames every
-16 ticks — what a run did, to lay beside `pixel_student_probe_sim.mojo`),
+16 ticks — what a run did, to lay beside `pixel_student_probe_sim.mojo`; the
+frames are COPIED during the run and written as PNGs after it: written in the
+loop, each one cost a ~106 ms tick, which held the loop at 27 Hz),
 --grip-offset X (rad, default 0: added to the GRIPPER angle the policy SEES,
 not to the one the commands use — the real jaws read ~0.05 rad more closed
 on the 25 mm cube than the sim's, 0.063 vs 0.10-0.14, and a student never
@@ -39,6 +41,13 @@ been reaching down past the desk — shoulder_lift > 1.35 AND elbow_flex <
 -1.35 rad — for 3 ticks: no sim grasp is made there (they close at
 shoulder_lift -0.1..0.5, elbow 0.35..1.4), the sim's rigid desk absorbs it
 and the real tower does not),
+--no-release-stop (by default a run ENDS 0.5 s after a RELEASE: the jaw held
+an object — commanded more closed than it is, above 0.05 rad and not moving,
+for 10 ticks — and then opened past 0.6 rad for 10 ticks. The sim's episode
+ends at the success; a student run on past it pecked at the bowl for 14 s,
+7 Oct. An empty close (jaw below 0.03 rad) forgets the grasp. On that run's log
+it ends the run at 6.9 s and ignores the first, empty close; it fires on all
+30 gate rollouts of pixel_bowl_gcap, after the release),
 --keep-dynamic-fps (by default each /dev camera gets `v4l2-ctl -c
 exposure_dynamic_framerate=0` at open: with it ON, both rig cameras were
 found so, a UVC camera may drop to ~10 fps to lengthen its exposure as the
@@ -318,6 +327,7 @@ def main() raises:
     var act_ema = Float64(_arg(args, "--act-ema", "0"))
     var start_grip = _arg(args, "--start-grip", "")
     var dive_guard = not _flag(args, "--no-dive-guard")
+    var release_stop = not _flag(args, "--no-release-stop")
 
     print("=" * 74)
     print("PIXEL STUDENT on the physical SO-101 — sim-to-real")
@@ -717,6 +727,19 @@ def main() raises:
     var sum_read = 0.0
     var sum_write = 0.0
     var worst_tick = 0.0
+    # the RELEASE STOP's state: the gripper's last commanded target, ticks the
+    # jaw has been blocked by an object, whether a grasp was seen, ticks open
+    # after it, and the tick the run is to end at once the release is seen
+    var grip_tgt = 0.0
+    var blocked = 0
+    var grasped = False
+    var open_ticks = 0
+    var end_at = -1
+    # --record's frames, copied in the loop and written after it
+    var snap_frames = List[List[List[UInt8]]]()
+    var snap_xs = List[List[Scalar[DT]]]()
+    var snap_q = List[List[Float64]]()
+    var snap_tags = List[String]()
     var rec_csv = String("t_s,q0,q1,q2,q3,q4,q5,qd0,qd1,qd2,qd3,qd4,qd5,a0,a1,a2,a3,a4,a5,tgt0,tgt1,tgt2,tgt3,tgt4,tgt5\n")
     if rec_dir.byte_length() > 0:
         makedirs(rec_dir, exist_ok=True)
@@ -753,6 +776,9 @@ def main() raises:
     dive_ticks = 0
     if act_ema > 0.0:
         print("  --act-ema", act_ema, "on the arm's action words")
+    if release_stop:
+        print("  the run ends 0.5 s after the jaw releases a grasped object"
+              " (--no-release-stop to run the full time)")
     var line2 = String("")
     var ra = String("")
     var rt = String("")
@@ -839,6 +865,8 @@ def main() raises:
                     if tgt <= lo[j] or tgt >= hi[j]:
                         clamped += 1
                     goals[j] = jmap.from_sim(arm.cal, j, tgt)
+                    if j == ACT - 1:
+                        grip_tgt = tgt
                     line2 += " " + col(a, 6, 2)
                     ra += "," + String(a)
                     rt += "," + String(tgt)
@@ -850,7 +878,10 @@ def main() raises:
                     row += "," + String(qd[j])
                 rec_csv += row + ra + rt + "\n"
                 if ticks % 16 == 0:
-                    _snap(rec_dir, frames, xs, q, String("_") + String(ticks))
+                    snap_frames.append(frames.copy())
+                    snap_xs.append(xs.copy())
+                    snap_q.append(q.copy())
+                    snap_tags.append(String("_") + String(ticks))
             if arm_it:
                 var tw0 = perf_counter_ns()
                 arm.write_goals(Span(goals))
@@ -862,7 +893,31 @@ def main() raises:
             if ticks % 15 == 0:
                 print("  t=" + pad_left(fixed(Float64(perf_counter_ns() - loop_t0) / 1e9, 1), 5)
                       + "s  a:" + line2)
+            # the RELEASE STOP (see --no-release-stop in the header)
+            var g = q[ACT - 1]
+            if g > 0.05 and grip_tgt < g - 0.1 and abs(qd[ACT - 1]) < 0.3:
+                blocked += 1
+                if blocked >= 10 and not grasped:
+                    grasped = True
+                    print("  grasp: the jaw is held open at " + fixed(g, 2)
+                          + " rad by an object")
+            else:
+                blocked = 0
+            if grasped and g < 0.03:
+                grasped = False
+                open_ticks = 0
+                print("  the jaw closed empty — the grasp is forgotten")
+            if grasped and g > 0.6:
+                open_ticks += 1
+            else:
+                open_ticks = 0
+            if release_stop and grasped and open_ticks >= 10 and end_at < 0:
+                end_at = ticks + 16
+                print("  release seen at t=" + fixed(Float64(perf_counter_ns() - loop_t0) / 1e9, 1)
+                      + " s — the run ends in 0.5 s")
             ticks += 1
+            if end_at >= 0 and ticks >= end_at:
+                break
             var dt = Float64(perf_counter_ns() - tt) / 1e6
             if dt > worst_tick:
                 worst_tick = dt
@@ -876,6 +931,11 @@ def main() raises:
                 print("  wrote " + rec_dir + "/ticks.csv")
             except:
                 print("  ⚠ could not write the tick log")
+            for k in range(len(snap_tags)):
+                try:
+                    _snap(rec_dir, snap_frames[k], snap_xs[k], snap_q[k], snap_tags[k])
+                except:
+                    print("  ⚠ could not write the frames " + snap_tags[k])
         # after a DIVE stop, lift clear of the desk first: shoulder_lift alone
         # back to 0.3 rad (the arm rises away from the desk), the other joints
         # held — the straight return from the dive pose did not arrive twice
