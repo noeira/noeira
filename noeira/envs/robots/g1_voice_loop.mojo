@@ -239,6 +239,14 @@ struct G1VoiceConfig(Copyable, Movable):
     var llm_spec: String
     """Passed to `ChatClient.from_spec` — `hf`, `openai`, `anthropic`, or a
     local openai-compatible base URL."""
+    var request_wording: Bool
+    """Ask the destination as a REQUEST with a yes/no gate
+    (`g1_command_questions(request_wording=True)`), the wording measured on a
+    local Jev-compatible model. ⚠ OFF BY DEFAULT: hosted Jev was measured on
+    the default wording. The caller fills `G1Context`'s place fields."""
+    var chain: Bool
+    """Ask for a second and third step. A caller that runs only the first step
+    turns it off, and a local model then answers two rows fewer."""
 
     def __init__(out self):
         self.lang = String("")
@@ -264,6 +272,8 @@ struct G1VoiceConfig(Copyable, Movable):
         self.mic_dev = String("")
         self.refuse_placeless = False
         self.llm_spec = String("hf")
+        self.request_wording = False
+        self.chain = True
 
 
 struct G1VoiceLoop(Movable):
@@ -350,7 +360,8 @@ struct G1VoiceLoop(Movable):
         # which is where a missing microphone should stop a program.
         self.mic = MicCapture.start(16000, self.cfg.mic_dev)
         self.quest = g1_command_questions(
-            bank, True, self.cfg.destinations, self.cfg.dest_descs
+            bank, True, self.cfg.destinations, self.cfg.dest_descs,
+            self.cfg.request_wording, self.cfg.chain,
         )
         self.spec_q = g1_spec_questions(True)
         self.has_pool = self.cfg.pool_path != ""
@@ -822,8 +833,9 @@ struct G1VoiceLoop(Movable):
             var ans = self.jev.result()
             self.pick = g1_decide(
                 ans, bank, self.cfg.max_none, self.cfg.min_top, 0.5, True,
-                len(self.cfg.destinations) > 0, 0.5, 0.5,
-                self.cfg.refuse_placeless,
+                len(self.cfg.destinations) > 0, 0.5,
+                0.40 if self.cfg.request_wording else 0.5,
+                self.cfg.refuse_placeless, self.cfg.request_wording,
             )
             ev.conf = self.pick.conf
             ev.p_none = self.pick.p_none
@@ -841,10 +853,11 @@ struct G1VoiceLoop(Movable):
                 ev.kind = VL_COMMAND
                 ev.name = self.pick.name
                 ev.extent = ans.score(String(G1_Q_EXTENT))
-                var rest = g1_decide_chain(ans, bank)
-                for si in range(len(rest)):
-                    ev.chain.append(rest[si].name)
-                    ev.chain_conf.append(rest[si].conf)
+                if self.cfg.chain:
+                    var rest = g1_decide_chain(ans, bank)
+                    for si in range(len(rest)):
+                        ev.chain.append(rest[si].name)
+                        ev.chain_conf.append(rest[si].conf)
                 self.note = (String("[pick] ") + self.pick.name + String(" ")
                              + _vl_f2(self.pick.conf) + String("  P(none) ")
                              + _vl_f2(self.pick.p_none) + String("  world ")

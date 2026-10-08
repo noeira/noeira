@@ -85,6 +85,9 @@ comptime G1_Q_ADDRESSED: String = "addressed"
 # cache-miss path can claim it, which is why this question is answered in the
 # same call and checked before `P(none)`.
 comptime G1_Q_DESTINATION: String = "destination"
+# The yes/no gate of the REQUEST wording (`request_wording=True`); see
+# `g1_command_questions`.
+comptime G1_Q_IS_REQUEST: String = "is_request"
 comptime G1_OPT_NONE: String = "none"
 # ⚠ `talk` IS AN OPTION, NOT A REFUSAL. "Bonjour, comment vas-tu ?" used to
 # come back "not addressed to the robot" — technically true and completely
@@ -203,11 +206,25 @@ struct G1Context(Copyable, Movable):
     out — the caller keeps the clock, this keeps the word."""
     var recent: List[String]
     """MOST RECENT FIRST, `doing` excluded, at most `G1_N_RECENT`."""
+    var places: Bool
+    """Send the three place fields below. OFF by default: a caller with no
+    world (the bank viewer, `g1say`) and the measured Jev path send exactly
+    the state they always sent."""
+    var walking_to: String
+    """The destination being walked to now, "" for none."""
+    var at: String
+    """The destination the robot stands in now, "" for none."""
+    var arrived: String
+    """The destination it last arrived at, "" for none."""
 
     def __init__(out self):
         self.doing = String("")
         self.since_s = 0.0
         self.recent = List[String]()
+        self.places = False
+        self.walking_to = String("")
+        self.at = String("")
+        self.arrived = String("")
 
     def began(mut self, name: String):
         """Record that `name` has just started.
@@ -251,7 +268,14 @@ def g1_command_state(instruction: String, ref ctx: G1Context) raises -> String:
     # the same length and a state whose keys are always present are what make
     # the answers comparable across calls; a missing key reads as a different
     # question.
-    w.member("doing", ctx.doing if ctx.doing != "" else String("nothing"))
+    # ⚠ THE KEY'S NAME IS PART OF THE QUESTION. With the place fields, Kev-9B
+    # read `doing: goto:sofa` + "the fridge is white" as a request (gate 0.93,
+    # sofa 0.94) and `robot_is_doing: goto:sofa` as none (gate 0.06) — the
+    # name the request wording was tuned with.
+    w.member(
+        "robot_is_doing" if ctx.places else "doing",
+        ctx.doing if ctx.doing != "" else String("nothing"),
+    )
     w.member("doing_since", g1_since_word(ctx.since_s))
     w.key("did_before")
     w.begin_array()
@@ -259,6 +283,12 @@ def g1_command_state(instruction: String, ref ctx: G1Context) raises -> String:
         w.string(ctx.recent[i])
     w.end_array()
     w.member("last_arm_raised", ctx.last_arm() if ctx.last_arm() != "" else String("none"))
+    # ⚠ THE REQUEST WORDING RESOLVES "back" AND "instead" AGAINST THESE, so
+    # they are sent with it; the names are the ones that wording was tuned on.
+    if ctx.places:
+        w.member("currently_walking_to", ctx.walking_to if ctx.walking_to != "" else String("none"))
+        w.member("currently_at", ctx.at if ctx.at != "" else String("none"))
+        w.member("last_arrived_at", ctx.arrived if ctx.arrived != "" else String("none"))
     w.end_object()
     return w.done()
 
@@ -306,8 +336,16 @@ def g1_command_questions(
     with_addressed: Bool = False,
     destinations: List[String] = List[String](),
     dest_descs: List[String] = List[String](),
+    request_wording: Bool = False,
+    with_chain: Bool = True,
 ) raises -> JevQuestions:
     """The choice over the bank, plus the two cheap guards.
+
+    `request_wording` asks the destination as a REQUEST, with a yes/no gate
+    beside it (`G1_Q_IS_REQUEST`); `g1_decide(request_gate=True)` reads it.
+    `with_chain=False` drops the second and third command questions, for a
+    caller that runs the first step only — on a local model each question is
+    a row of its own, and those two are the longest.
 
     ⚠ The option descriptions are GENERATED from each compound
     (`bank.describe`). A hand-written blurb would drift from the terms the
@@ -339,23 +377,24 @@ def g1_command_questions(
     # ⚠ THE SAME OPTION LIST, so a second step is chosen from exactly what
     # the robot can do. `none` on step 2 means the instruction was one
     # command, which is the common case and must stay cheap.
-    q.choice(
-        String(G1_Q_CMD2),
-        String(
-            "If the instruction asks the robot to do a SECOND thing after the"
-            " first, which command is it? Pick `none` when the instruction"
-            " asks for only one thing."
-        ),
-        options, descs,
-    )
-    q.choice(
-        String(G1_Q_CMD3),
-        String(
-            "If the instruction asks for a THIRD thing after the second,"
-            " which command is it? Pick `none` otherwise."
-        ),
-        options, descs,
-    )
+    if with_chain:
+        q.choice(
+            String(G1_Q_CMD2),
+            String(
+                "If the instruction asks the robot to do a SECOND thing after the"
+                " first, which command is it? Pick `none` when the instruction"
+                " asks for only one thing."
+            ),
+            options, descs,
+        )
+        q.choice(
+            String(G1_Q_CMD3),
+            String(
+                "If the instruction asks for a THIRD thing after the second,"
+                " which command is it? Pick `none` otherwise."
+            ),
+            options, descs,
+        )
     # ⚠ THE EXTENT IS ORDERED, WHICH IS WHY IT IS A `score`. "a metre" and
     # "ten metres" are not unrelated labels, and the answer is the EXPECTED
     # level — a float between them — so "a couple of metres" lands between
@@ -403,25 +442,71 @@ def g1_command_questions(
         var ddesc = List[String]()
         for i in range(len(destinations)):
             dops.append(destinations[i])
-            ddesc.append(
-                dest_descs[i] if len(dest_descs) > 0 else destinations[i]
-            )
+            if request_wording:
+                ddesc.append(
+                    String("the instruction asks the robot to go to the ")
+                    + destinations[i]
+                )
+            else:
+                ddesc.append(
+                    dest_descs[i] if len(dest_descs) > 0 else destinations[i]
+                )
         # ⚠ `none` LAST AND ALWAYS, for the same reason the command question
         # has one: without it the model must name a place, and "lève le bras
         # droit" would acquire a destination.
         dops.append(String(G1_OPT_NONE))
-        ddesc.append(String(
-            "the instruction names no place or thing to go to"
-        ))
-        q.choice(
-            String(G1_Q_DESTINATION),
-            String(
-                "Does the instruction tell the robot to GO somewhere, or to a"
-                " particular object? If so, which one? Pick `none` when it"
-                " asks for a movement or a posture rather than a destination."
-            ),
-            dops, ddesc,
-        )
+        if request_wording:
+            ddesc.append(String(
+                "no request to go anywhere: a statement or a question about a"
+                " place, a negation or a cancellation, thanks or a greeting, or"
+                " a movement without a destination"
+            ))
+            # ⚠ A PLACE THAT IS MENTIONED IS NOT A PLACE THAT IS ASKED FOR.
+            # On a local Jev-compatible model (Kev-9B) the question above
+            # answered "the door is made of wood" -> door and "where is the
+            # door?" -> door: a keyword match, six wrong places in 24 traps.
+            # Asking whether the sentence REQUESTS a place, and asking it a
+            # second time as a yes/no question, took that set to 0 wrong
+            # places (22/24), and a held-out set to 21/24, 0 wrong. Those
+            # numbers were measured on this wording and these option texts;
+            # an edit to either needs a re-measure.
+            q.choice(
+                String(G1_Q_DESTINATION),
+                String(
+                    "Does the instruction REQUEST that the robot go to one of"
+                    " these places, and if so which one? Only a command or a"
+                    " stated need asks the robot to move (\"go to the table\","
+                    " \"I'm thirsty\" = the fridge). A sentence that only"
+                    " mentions or describes a place, or asks a question about"
+                    " it, is not a request: choose none. A negation or a"
+                    " cancellation (\"don't go to X\", \"not X\", \"cancel"
+                    " X\") is not a request to go to X: choose none. If the"
+                    " robot is already walking somewhere, a request for another"
+                    " place replaces it."
+                ),
+                dops, ddesc,
+            )
+            q.noul(
+                String(G1_Q_IS_REQUEST),
+                String(
+                    "Is the instruction a request for the robot to go to a"
+                    " place, rather than a statement, a question, a negation,"
+                    " a cancellation, thanks or a greeting?"
+                ),
+            )
+        else:
+            ddesc.append(String(
+                "the instruction names no place or thing to go to"
+            ))
+            q.choice(
+                String(G1_Q_DESTINATION),
+                String(
+                    "Does the instruction tell the robot to GO somewhere, or to a"
+                    " particular object? If so, which one? Pick `none` when it"
+                    " asks for a movement or a posture rather than a destination."
+                ),
+                dops, ddesc,
+            )
     if with_addressed:
         q.noul(
             String(G1_Q_ADDRESSED),
@@ -629,6 +714,9 @@ def g1_decide(
     min_world: Float64 = 0.5,
     min_dest: Float64 = 0.5,
     refuse_placeless: Bool = False,
+    request_gate: Bool = False,
+    max_dest_none: Float64 = 0.25,
+    min_request: Float64 = 0.5,
 ) raises -> G1LangPick:
     """Apply the rule above. Returns an empty `name` with a `reason` set when
     the honest answer is to do nothing."""
@@ -651,6 +739,25 @@ def g1_decide(
             r.conf = p
             r.name = g1_resolve(nm)
             r.best = nm
+
+    # ⚠ THE REQUEST GATE GOES FIRST, AHEAD OF `addressed` AND `talk`. Its
+    # yes/no question already asks whether the sentence is a request rather
+    # than thanks, a greeting or a remark, and on Kev-9B `addressed` refused
+    # "go to the fridge" itself (0.45) while the robot was walking elsewhere.
+    # The destination is then decided by exactly the rule it was measured
+    # with, whatever the other questions say.
+    if with_destination and request_gate:
+        var qpick = ans.choice(String(G1_Q_DESTINATION))
+        if (
+            qpick != G1_OPT_NONE
+            and ans.probability(String(G1_Q_DESTINATION), qpick) >= min_dest
+            and ans.probability(String(G1_Q_DESTINATION), String(G1_OPT_NONE)) <= max_dest_none
+            and ans.noul(String(G1_Q_IS_REQUEST)) >= min_request
+        ):
+            r.destination = qpick
+            r.dest_conf = ans.probability(String(G1_Q_DESTINATION), qpick)
+            r.name = String("")
+            return r^
 
     if with_addressed and r.addressed < min_addressed:
         r.reason = String("not addressed to the robot")
@@ -689,7 +796,9 @@ def g1_decide(
     # `none` is the only escape. Requiring both means a route happens when the
     # instruction is about going somewhere AND the somewhere is one this scene
     # has.
-    if with_destination:
+    #
+    # (`request_gate` decided the destination above, before `addressed`.)
+    if with_destination and not request_gate:
         var dpick = ans.choice(String(G1_Q_DESTINATION))
         var dconf = ans.probability(String(G1_Q_DESTINATION), dpick)
         if (dpick != G1_OPT_NONE and dconf >= min_dest
