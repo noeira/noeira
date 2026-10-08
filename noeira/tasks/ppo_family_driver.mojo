@@ -112,7 +112,7 @@ from noeira.tasks.posed_reset import task_meta_words
 from noeira.tasks.shaping import reward_mode_words
 from noeira.tasks.delta_action import (
     DELTA_ACT, DELTA_ARM, DELTA_GRIPPER, delta_scale, delta_target, ServoLag,
-    ACT_HIST, TARGET_OBS, target_step,
+    ACT_HIST, TARGET_OBS, target_step, JAW_OPEN, JAW_SHUT_EMPTY,
 )
 # `ACT_HIST` (`-D TASK_PPO_ACT_HIST=K`): the last K executed actions after the
 # env's observation — see `delta_action.ACT_HIST`. A run trained without it is
@@ -570,6 +570,12 @@ def run_ppo[M: ModelDefLike, C: Phyics3dEnvConfig](
     # rigid desk absorbs the push; on the real arm it drove into the desk and
     # rocked the clamped tower.
     var dive_w = Float64(_arg(args, "--dive-penalty", "0"))
+    # ⚠ `--empty-close-penalty W`: each EMPTY CLOSE (`delta_action.JAW_OPEN`
+    # -> `JAW_SHUT_EMPTY`, once per close event, not per tick shut) costs W.
+    # Why: the teacher fd368031 misses its first grasp in 25 % of episodes and
+    # regrasps — free under the success metric, a knocked or dropped cube on
+    # the real arm. Host rollout only.
+    var empty_w = Float64(_arg(args, "--empty-close-penalty", "0"))
     # `--target-lead L` (`--action target`): the target stays within L rad of
     # the measured joint (`delta_action.target_step`); 0 = unbounded
     var target_lead = Float64(_arg(args, "--target-lead", "0"))
@@ -685,6 +691,7 @@ def run_ppo[M: ModelDefLike, C: Phyics3dEnvConfig](
     logger.set_config("repeat", String(repeat))
     logger.set_config("smooth_penalty", String(smooth_w))
     logger.set_config("dive_penalty", String(dive_w))
+    logger.set_config("empty_close_penalty", String(empty_w))
     logger.set_config("horizon", String(C.MAX_STEPS))
     logger.set_config("obs_norm", "running, clip 10")
     logger.set_config("reward_norm", "discounted-return std, clip 10")
@@ -772,6 +779,11 @@ def run_ppo[M: ModelDefLike, C: Phyics3dEnvConfig](
         var spen_n = 0
         var dive_ticks = 0
         var all_ticks = 0
+        # `--empty-close-penalty`: per lane, has the jaw opened since its last
+        # close; and the window's empty closes and finished episodes
+        var jaw_open = List[Bool](length=N_ENVS, fill=False)
+        var empty_n = 0
+        var empty_eps = 0
         var lag = ServoLag.parse(
             N_ENVS, lag_tau, lag_delay, Float64(C.FRAME_SKIP) * M.TIMESTEP
         )
@@ -826,6 +838,9 @@ def run_ppo[M: ModelDefLike, C: Phyics3dEnvConfig](
         var reset_graph: Optional[CUDAGraph] = None
         var meta_ptr = mptr(env.d.meta.dev.value().unsafe_ptr())
         comptime if DEVICE_ROLLOUT:
+            if empty_w > 0.0:
+                raise Error("ppo task: --empty-close-penalty is host-rollout"
+                            " only (not TASK_PPO_DEVICE_ROLLOUT)")
             var mode = 0 if action_mode == "absolute" else (
                 1 if action_mode == "delta" else 2
             )
@@ -988,6 +1003,14 @@ def run_ppo[M: ModelDefLike, C: Phyics3dEnvConfig](
                                 if q1 > 1.35 and q2 < -1.35:
                                     rsum[e] -= dive_w
                                     dive_ticks += 1
+                            if empty_w > 0.0:
+                                var jaw = Float64(rp_t[unsafe_offset = e * E_OBS + a_qa[ACT_DIM - 1]])
+                                if jaw > JAW_OPEN:
+                                    jaw_open[e] = True
+                                elif jaw < JAW_SHUT_EMPTY and jaw_open[e]:
+                                    jaw_open[e] = False
+                                    rsum[e] -= empty_w
+                                    empty_n += 1
                             if env.d.meta.data[e * METADATA_SIZE + META_IDX_GOAL_HELD] > Scalar[DT](0.5):
                                 succ[e] = True
                             if dh_t[unsafe_offset=e] > Scalar[DT](0.5):
@@ -1086,6 +1109,8 @@ def run_ppo[M: ModelDefLike, C: Phyics3dEnvConfig](
                         _target_reset(tprev, arm_q, e)
                         _hist_clear(hist, e)
                         has_prev[e] = False
+                        jaw_open[e] = False
+                        empty_eps += 1
                 _augment[E_OBS](rp2, hist, tprev, a_qa, mptr(aug.unsafe_ptr()))
                 obs_rms.normalize_into(
                     mptr(aug.unsafe_ptr()), mptr(cur_n.unsafe_ptr()), N_ENVS, OBS, OBS_CLIP,
@@ -1166,6 +1191,10 @@ def run_ppo[M: ModelDefLike, C: Phyics3dEnvConfig](
                         print("  dive fraction", Float64(dive_ticks) / Float64(all_ticks))
                         dive_ticks = 0
                         all_ticks = 0
+                    if empty_w > 0.0 and empty_eps > 0:
+                        print("  empty closes per episode", Float64(empty_n) / Float64(empty_eps))
+                        empty_n = 0
+                        empty_eps = 0
                     comptime if DEVICE_ROLLOUT:
                         dev.value().reset_window_stats()
                     print("  step", step, "| success", rate, "over", nw,
@@ -1219,6 +1248,13 @@ def run_ppo[M: ModelDefLike, C: Phyics3dEnvConfig](
             # the start state per lane (after the first step), for the
             # per-episode CSV: brick x, y, quat (x y z w — `xquat`'s order); bowl x, y
             var start = List[Float64](length=N_ENVS * 8, fill=0.0)
+            # ⚠ THE FIRST GRASP: an empty close (`delta_action.JAW_OPEN` ->
+            # `JAW_SHUT_EMPTY`) before the brick first rose 2 cm, and the step
+            # it first rose — a teacher that succeeds by miss-and-regrasp, or
+            # one that hesitates, shows here and not in the success rate
+            var e_open = List[Bool](length=N_ENVS, fill=False)
+            var empty_first = List[Bool](length=N_ENVS, fill=False)
+            var t_lift = List[Int](length=N_ENVS, fill=-1)
             for t in range(C.MAX_STEPS - 1):
                 var rq = mptr(raw_h.unsafe_ptr())
                 # the policy acts every `repeat` ticks; its targets are held
@@ -1290,6 +1326,15 @@ def run_ppo[M: ModelDefLike, C: Phyics3dEnvConfig](
                     var dz = za - z0[e]
                     if dz > rise[e]:
                         rise[e] = dz
+                    if dz > 0.02 and t_lift[e] < 0:
+                        t_lift[e] = t
+                    var jaw = Float64(mptr(raw_h.unsafe_ptr())[unsafe_offset = e * E_OBS + a_qa[ACT_DIM - 1]])
+                    if jaw > JAW_OPEN:
+                        e_open[e] = True
+                    elif jaw < JAW_SHUT_EMPTY and e_open[e]:
+                        e_open[e] = False
+                        if t_lift[e] < 0:
+                            empty_first[e] = True
                     var h = sqrt(ex * ex + ey * ey)
                     if h < hmin[e]:
                         hmin[e] = h
@@ -1342,7 +1387,8 @@ def run_ppo[M: ModelDefLike, C: Phyics3dEnvConfig](
             # one row per episode: where it started, how far it got
             var csv = String(
                 "lane,brick_x,brick_y,qx,qy,qz,qw,bowl_x,bowl_y,"
-                + "rise_max,h_min,over,success,held_end,dz_end,h_end,t_held\n"
+                + "rise_max,h_min,over,success,held_end,dz_end,h_end,t_held,"
+                + "empty_first,t_lift\n"
             )
             for e in range(N_ENVS):
                 csv += String(e)
@@ -1353,7 +1399,8 @@ def run_ppo[M: ModelDefLike, C: Phyics3dEnvConfig](
                 csv += "," + ("1" if held[e] else "0")
                 csv += "," + ("1" if held_end[e] else "0")
                 csv += "," + String(dz_end[e]) + "," + String(h_end[e])
-                csv += "," + String(t_held[e]) + "\n"
+                csv += "," + String(t_held[e])
+                csv += "," + ("1" if empty_first[e] else "0") + "," + String(t_lift[e]) + "\n"
             var csv_path = run.dir + "/eval_lanes_round" + String(rnd) + ".csv"
             with open(csv_path, "w") as f:
                 f.write(csv)
@@ -1376,6 +1423,18 @@ def run_ppo[M: ModelDefLike, C: Phyics3dEnvConfig](
                       ts[len(ts) // 2], "p90", ts[(9 * len(ts)) // 10],
                       "| p50", Float64(ts[len(ts) // 2]) * dt_s, "s | in the last quarter",
                       late, "of", len(ts))
+            var n_empty_first = 0
+            var tl = List[Int]()
+            for e in range(N_ENVS):
+                if empty_first[e]:
+                    n_empty_first += 1
+                if t_lift[e] >= 0:
+                    tl.append(t_lift[e])
+            if len(tl) > 0:
+                sort(tl)
+                print("  greedy eval round", rnd, "| EMPTY FIRST CLOSE", n_empty_first,
+                      "/", N_ENVS, "| first lift (2 cm) at step p25", tl[len(tl) // 4],
+                      "p50", tl[len(tl) // 2], "p90", tl[(9 * len(tl)) // 10])
             print("  greedy eval round", rnd, "endings of the", N_ENVS - n_end,
                   "not held at the end | brick > 2 cm up (carried, hovering or on the rim)", f_up,
                   "| resting inside the rim, not Near", f_rim_in,

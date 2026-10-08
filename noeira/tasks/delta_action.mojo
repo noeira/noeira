@@ -123,6 +123,20 @@ def target_step(
     return t
 
 
+comptime JAW_OPEN: Float64 = 0.20
+comptime JAW_SHUT_EMPTY: Float64 = -0.10
+"""An EMPTY CLOSE, in model radians of the gripper joint: the jaw opened past
+`JAW_OPEN`, then shut past `JAW_SHUT_EMPTY` — on the brick it stalls near
++0.10 (sim) / +0.12-0.15 (real), so only a close on nothing gets below
+-0.10 (the commanded floor is -0.17). One event per open -> shut. Read by
+the PPO driver's `--empty-close-penalty` and its greedy eval, and by
+`examples/so101/ppo_state_probe_sim.mojo` — one rule. ⚠ WHY: fd368031 (76.8 %)
+closes empty before its first lift in 25 % of random placements and 22/30
+of the shifted real scenes, then regrasps — PPO's success (goal held at any
+step) never charged the miss, and on the real arm the miss knocks or
+drops the cube."""
+
+
 comptime LAG_MAX_DELAY: Int = 4
 """Control ticks of command delay the servo model can hold."""
 

@@ -42,6 +42,7 @@ from noeira.nn.core.ptr import mptr
 from noeira.physics3d.parser.runtime_load import parse_model_runtime
 from noeira.tasks.delta_action import (
     DELTA_ACT, ACT_HIST, TARGET_OBS, ServoLag, delta_target, target_step,
+    JAW_OPEN, JAW_SHUT_EMPTY,
 )
 from noeira.tasks.eval import region_sites, region_rects, region_half_heights
 from noeira.tasks.family import scene_path
@@ -251,6 +252,7 @@ def main() raises:
         var n_empty = 0
         var t_first_empty = -1
         var lifted = False
+        var t_lift = -1
         var a_last = List[Float64](length=ACT, fill=0.0)
         if not quiet:
             var l0 = String("── episode ") + String(ep) + " start q:"
@@ -321,11 +323,13 @@ def main() raises:
             if zb - z0 > rise:
                 rise = zb - z0
             if rise > 0.02:
+                if not lifted:
+                    t_lift = t
                 lifted = True
             var jaw = Float64(env.d.qpos.data[qa[ACT - 1]])
-            if jaw > 0.20:
+            if jaw > JAW_OPEN:
                 jaw_open = True
-            elif jaw < -0.10 and jaw_open:
+            elif jaw < JAW_SHUT_EMPTY and jaw_open:
                 jaw_open = False
                 n_empty += 1
                 if t_first_empty < 0 and not lifted:
@@ -342,7 +346,8 @@ def main() raises:
         var steps = So101TowerConfig.MAX_STEPS // repeat
         print("   episode", ep, "| brick max rise", fixed(rise * 1000.0, 1),
               "mm | goal held:", held, "at", fixed(Float64(t_held) * period, 2),
-              "s | empty closes", n_empty, "(first at tick", t_first_empty,
+              "s | first lift at tick", t_lift,
+              "| empty closes", n_empty, "(first at tick", t_first_empty,
               ") | arm sign flips per step", fixed(Float64(flips) / Float64(steps), 3))
     print("probe:", n_ok, "/", episodes, "episodes reached the goal |",
           n_empty_first, "closed EMPTY before the first lift")
