@@ -37,7 +37,7 @@ Use via one-line aliases (see linear_tanh.mojo / linear_mish.mojo / …):
 """
 
 from std.sys import CompilationTarget, has_nvidia_gpu_accelerator
-from noeira.nn.core.cublas_gemm import cublas_gemm, CUBLAS_BWD, cublas_fwd, cublas_tf32
+from noeira.nn.core.cublas_gemm import cublas_gemm, CUBLAS_BWD, cublas_fwd, cublas_tf32, cublas_gemm_lp, GEMM_PATH
 from max.gpu import global_idx
 from max.gpu.host import DeviceContext
 from layout import Layout, LayoutTensor, TileTensor, row_major
@@ -245,6 +245,16 @@ struct LinearAct[IN_: Int, OUT_: Int, OP: ElementOp, ADT: DType = DT](Module):
     @staticmethod
     def _round_up(v: Int, to: Int) -> Int:
         return ((v + to - 1) // to) * to
+    # NVIDIA bf16-flow: the three GEMMs on `cublas_gemm_lp`, as `Linear`'s
+    # (dW straight into the fp32 master grad: no x transpose, no dW
+    # temporary, no accumulate kernel). MAX's GEMMs stay for Apple and
+    # `NN_GEMM_PATH=max` / `linmax`.
+    comptime CUB_LP = (
+        has_nvidia_gpu_accelerator()
+        and GEMM_PATH != "max"
+        and GEMM_PATH != "linmax"
+    )
+
     # Activation-flow dtype. `LinearAct[IN, OUT, OP]` = fp32 (ACT_DT == DT, the
     # legacy path); `LinearAct[IN, OUT, OP, bfloat16]` flows activations at bf16.
     comptime ACT_DT = Self.ADT
@@ -568,13 +578,19 @@ struct LinearAct[IN_: Int, OUT_: Int, OP: ElementOp, ADT: DType = DT](Module):
                 grid_dim=(Self.B_SIZE + 255) // 256,
                 block_dim=256,
             )
-            var x_v = TileTensor(in0.dev.value(), row_major[B, Self.IN_]())
-            var w_bf_v = TileTensor(
-                self.w_bf.dev.value(), row_major[Self.IN_, Self.OUT_]()
-            )
-            var out_v = TileTensor(out.dev.value(), row_major[B, Self.OUT_]())
-            # bf16-in → bf16-out GEMM (fp32 accumulation is automatic).
-            max_matmul[target="gpu"](out_v, x_v, w_bf_v, c)
+            comptime if Self.CUB_LP:
+                cublas_gemm_lp[False, False, Self.ADT, Self.ADT](
+                    c, out.dev.value(), in0.dev.value(), self.w_bf.dev.value(),
+                    B, Self.OUT_, Self.IN_, 0.0,
+                )
+            else:
+                var x_v = TileTensor(in0.dev.value(), row_major[B, Self.IN_]())
+                var w_bf_v = TileTensor(
+                    self.w_bf.dev.value(), row_major[Self.IN_, Self.OUT_]()
+                )
+                var out_v = TileTensor(out.dev.value(), row_major[B, Self.OUT_]())
+                # bf16-in → bf16-out GEMM (fp32 accumulation is automatic).
+                max_matmul[target="gpu"](out_v, x_v, w_bf_v, c)
             c.enqueue_function[
                 _bias_act_cache_kernel[B, Self.OUT_, Self.OP, Self.ADT]
             ](
@@ -886,8 +902,6 @@ struct LinearAct[IN_: Int, OUT_: Int, OP: ElementOp, ADT: DType = DT](Module):
             ), "bf16-flow LinearAct is GPU-only"
             var c = ctx.value()
             gin.ensure_gpu(c, B * Self.IN_)
-            self.cacheT_bf.ensure_gpu(c, Self.IN_ * B)
-            self.dW_tmp.ensure_gpu(c, Self.W_SIZE)
             # gate the bf16 grad by the bf16 activation cache (cast UP to fp32 for
             # OP.backward, back DOWN to bf16 — the gated grad stays bf16).
             c.enqueue_function[
@@ -902,6 +916,23 @@ struct LinearAct[IN_: Int, OUT_: Int, OP: ElementOp, ADT: DType = DT](Module):
             enqueue_bias_grad[Self.ADT](
                 c, grad_output.dev.value(), self.bias.grd.dev.value(), B, Self.OUT_, self.gb_part
             )
+            comptime if Self.CUB_LP:
+                # W: the forward's cast (see `Linear.vjp`).
+                if self.weight.val.version != self._w_cast_version:
+                    self._ensure_w_bf(c)
+                # grad_w[IN, OUT] += xᵀ @ go, bf16 operands -> fp32 master grad.
+                cublas_gemm_lp[True, False, Self.ADT, DT](
+                    c, self.weight.grd.dev.value(), fin.dev.value(),
+                    grad_output.dev.value(), Self.IN_, Self.OUT_, B, 1.0,
+                )
+                # grad_x[B, IN] = go @ Wᵀ (bf16 out).
+                cublas_gemm_lp[False, True, Self.ADT, Self.ADT](
+                    c, gin.dev.value(), grad_output.dev.value(),
+                    self.w_bf.dev.value(), B, Self.IN_, Self.OUT_, 0.0,
+                )
+                return
+            self.cacheT_bf.ensure_gpu(c, Self.IN_ * B)
+            self.dW_tmp.ensure_gpu(c, Self.W_SIZE)
             # grad_w += cacheᵀ @ go: transpose the bf16 fwd-input → bf16 cacheT_bf
             # (B1' tiled), then a bf16-in → FP32-out GEMM into fp32 dW_tmp, then
             # accumulate into the fp32 master grad. W reuses the forward's cast.

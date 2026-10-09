@@ -25,6 +25,10 @@ from noeira.nn.core.tensor import Tensor, TensorImpl
 from noeira.nn.core.tensor_refs import TensorRefs
 from noeira.nn.core.initializer import Deterministic
 from noeira.nn.primitives.linear import Linear
+from noeira.nn.primitives.linear_act import LinearAct
+from noeira.nn.core.element_op import ElementOp
+from noeira.nn.primitives.ops.relu_op import ReLUOp
+from noeira.nn.primitives.ops.tanh_op import TanhOp
 
 
 comptime BF16 = DType.bfloat16
@@ -132,6 +136,79 @@ def check[IN: Int, OUT: Int, B: Int](name: String, c: DeviceContext) raises -> B
     return ok
 
 
+def check_act[OP: ElementOp, IN: Int, OUT: Int, B: Int](name: String, c: DeviceContext) raises -> Bool:
+    """`check` for `LinearAct[IN, OUT, OP]`: bf16-flow against fp32.
+
+    The pre-activations are kept away from 0 (weights x 0.1 so |x·W| ~ 0.1,
+    bias alternating +1 / -1: half the units on, half off). Near 0 a ReLU's
+    gate is undecidable between two precisions — bf16 rounding flips the
+    sign of z, so that element's gradient is go in one and 0 in the other —
+    and a few flips dominated dB at batch 96 (0.13 on the MAX path before
+    cuBLAS, which is not a defect of either)."""
+    comptime W = IN * OUT
+    var amp = LinearAct[IN, OUT, OP, BF16].make["gpu", Deterministic](Optional(c))
+    var fp = LinearAct[IN, OUT, OP].make["gpu", Deterministic](Optional(c))
+    for k in range(W):
+        amp.weight.val.data[k] = _rand(k) * Scalar[DT](0.1)
+        fp.weight.val.data[k] = amp.weight.val.data[k]
+    for k in range(OUT):
+        amp.bias.val.data[k] = Scalar[DT](1.0) if k % 2 == 0 else Scalar[DT](-1.0)
+        fp.bias.val.data[k] = amp.bias.val.data[k]
+    amp.weight.val.upload(c); amp.bias.val.upload(c)
+    fp.weight.val.upload(c); fp.bias.val.upload(c)
+    amp.weight.val.version += 1
+    var x = Tensor.alloc(B * IN)
+    var xb = TensorImpl[BF16].alloc(B * IN)
+    for i in range(B * IN):
+        x.data[i] = _rand(i + 7)
+        xb.data[i] = x.data[i].cast[BF16]()
+    x.upload(c); xb.upload(c)
+    var ya = TensorImpl[BF16].alloc(B * OUT)
+    var yf = Tensor.alloc(B * OUT)
+    amp.forward["gpu", B](TensorRefs[1, ADT=BF16](xb), ya, Optional(c))
+    fp.forward["gpu", B](TensorRefs[1](x), yf, Optional(c))
+    ya.download(c); yf.download(c)
+    var e_fwd = _relerr(_to_f32(ya, B * OUT), yf, B * OUT)
+    var go = Tensor.alloc(B * OUT)
+    var gob = TensorImpl[BF16].alloc(B * OUT)
+    for i in range(B * OUT):
+        go.data[i] = _rand(i + 31)
+        gob.data[i] = go.data[i].cast[BF16]()
+    go.upload(c); gob.upload(c)
+    var gia = TensorImpl[BF16].alloc(B * IN)
+    var gif = Tensor.alloc(B * IN)
+    amp.zero_grad["gpu"](Optional(c))
+    fp.zero_grad["gpu"](Optional(c))
+    for _ in range(2):
+        # The act-gate rewrites grad_output in place: refresh it each time.
+        go.upload(c); gob.upload(c)
+        amp.vjp["gpu", B](
+            TensorRefs[1, ADT=BF16](xb), gob, TensorRefs[1, ADT=BF16](gia),
+            Optional(c),
+        )
+        fp.vjp["gpu", B](TensorRefs[1](x), go, TensorRefs[1](gif), Optional(c))
+    gia.download(c); gif.download(c)
+    amp.weight.grd.download(c); fp.weight.grd.download(c)
+    amp.bias.grd.download(c); fp.bias.grd.download(c)
+    var e_gx = _relerr(_to_f32(gia, B * IN), gif, B * IN)
+    var e_gw = _relerr(amp.weight.grd, fp.weight.grd, W)
+    var e_gb = _relerr(amp.bias.grd, fp.bias.grd, OUT)
+    var half = Tensor.alloc(W)
+    for k in range(W):
+        half.data[k] = fp.weight.grd.data[k] * Scalar[DT](0.5)
+    var e_half = _relerr(half, fp.weight.grd, W)
+    var ok = (
+        e_fwd < RELTOL and e_gx < RELTOL and e_gw < RELTOL and e_gb < RELTOL
+        and e_half > 4 * RELTOL
+    )
+    print(
+        "  ", name, " [", IN, "->", OUT, "] B=", B, " | y ", e_fwd, " dx ", e_gx,
+        " dW ", e_gw, " dB ", e_gb, " (half-dW control ", e_half, ")",
+        "" if ok else " FAIL", sep="",
+    )
+    return ok
+
+
 def main() raises:
     print("AMP Linear bf16 vs fp32 numeric parity — forward + two vjps, rel.err <", RELTOL)
     var c = DeviceContext()
@@ -143,5 +220,8 @@ def main() raises:
     ok = check[1536, 384, 2048]("GPT fc2", c) and ok
     ok = check[384, 65, 512]("odd head", c) and ok
     ok = check[100, 64, 96]("unaligned", c) and ok
+    ok = check_act[ReLUOp, 256, 256, 256]("LinearReLU square", c) and ok
+    ok = check_act[ReLUOp, 100, 64, 96]("LinearReLU unaligned", c) and ok
+    ok = check_act[TanhOp, 384, 1536, 2048]("LinearTanh wide", c) and ok
     assert_true(ok, "AMP Linear bf16 vs fp32 parity")
     print("ALL PASSED")
