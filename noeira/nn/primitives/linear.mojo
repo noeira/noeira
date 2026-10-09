@@ -23,7 +23,7 @@ the whole function, then builds views from that.
 """
 
 from noeira.nn.core.mm import mm, mm_bias, bmm
-from noeira.nn.core.cublaslt_gemm import cublaslt_gemm, EPI_BIAS
+from noeira.nn.core.cublaslt_gemm import cublaslt_gemm, EPI_BIAS, LT_BIAS
 from noeira.nn.core.cublas_gemm import cublas_gemm, cublas_gemm_lp, GEMM_PATH, CUBLAS_BWD, cublas_fwd, cublas_tf32
 from std.sys import has_nvidia_gpu_accelerator
 from std.sys import CompilationTarget
@@ -892,7 +892,14 @@ struct Linear[IN_: Int, OUT_: Int, ADT: DType = DT](Module):
                 # appended columns are 0); only the GEMM's tiling — and hence
                 # its fp32 reduction ORDER — moves, which can shift a result by
                 # an ulp. Padding N adds columns nothing ever reads.
-                comptime if Self.use_cublas_fwd[B]():
+                comptime if Self.use_cublas_fwd[B]() and LT_BIAS:
+                    cublaslt_gemm[False, False, DT, DT, cublas_tf32(B, Self.OUT_, Self.IN_)](
+                        c, outd.dev.value(), in0d.dev.value(),
+                        self.weight.val.dev.value(),
+                        B, Self.OUT_, Self.IN_, EPI_BIAS,
+                        bias=Int(bl.unsafe_ptr()),
+                    )
+                elif Self.use_cublas_fwd[B]():
                     cublas_gemm[False, False, cublas_tf32(B, Self.OUT_, Self.IN_)](
                         c, outd.dev.value(), in0d.dev.value(),
                         self.weight.val.dev.value(),
