@@ -549,6 +549,85 @@ struct ProcessGroup[N: Int](Movable):
         else:
             raise Error("all_gather_rows: MAX comm needs NVIDIA GPUs")
 
+    def all_gather_into(
+        mut self,
+        srcs: List[DeviceBuffer[DT]],
+        dsts: List[DeviceBuffer[DT]],
+        rows: Int,
+        unit: Int,
+    ) raises:
+        """Out of place: rank k's `shard_rows(rows, N, k)` rows, held
+        contiguously at the start of `srcs[k]`, land at the same rows of every
+        rank's `dsts[r]` (viewed as `[rows, unit]`). ZeRO-3's per-unit weight
+        gather (shard -> full unit) and ZeRO-2's refresh of the replicas.
+
+        The caller keeps the sources unwritten until every rank has read them
+        and does not read the destinations before the gather ends; the P2P
+        kernels barrier at both ends, and the naive path is bracketed by
+        `_stream_barrier` here."""
+        if Self.N == 1:
+            if rows > 0:
+                self.ctxs[0].enqueue_copy(
+                    dsts[0].create_sub_buffer[DT](0, rows * unit),
+                    srcs[0].create_sub_buffer[DT](0, rows * unit),
+                )
+            return
+        if self.backend == BACKEND_SHARED:
+            var c = self.ctxs[0]
+            for k in range(Self.N):
+                var sh = shard_rows(rows, Self.N, k)
+                var off = sh[0] * unit
+                var n = sh[1] * unit
+                if n == 0:
+                    continue
+                var src = srcs[k].create_sub_buffer[DT](0, n)
+                for r in range(Self.N):
+                    c.enqueue_copy(dsts[r].create_sub_buffer[DT](off, n), src)
+            return
+        comptime if has_nvidia_gpu_accelerator() and Self.N >= 2:
+            comptime T1 = TileTensor[DT, type_of(row_major(0)), MutAnyOrigin]
+            comptime InT = TileTensor[
+                DT, type_of(row_major(0)), ImmutAnyOrigin
+            ]
+            var in_t = Array[InT, Self.N](uninitialized=True)
+            var out_t = Array[T1, Self.N * Self.N](uninitialized=True)
+            for k in range(Self.N):
+                var sh = shard_rows(rows, Self.N, k)
+                var off = sh[0] * unit
+                var n = sh[1] * unit
+                in_t[k] = TileTensor(
+                    rebind[ImmPointer[Scalar[DT], ImmutAnyOrigin]](
+                        srcs[k].unsafe_ptr()
+                    ),
+                    row_major(n),
+                )
+                for r in range(Self.N):
+                    out_t[r * Self.N + k] = TileTensor(
+                        rebind[MutPointer[Scalar[DT], MutAnyOrigin]](
+                            dsts[r].unsafe_ptr().unsafe_offset(off)
+                        ),
+                        row_major(n),
+                    )
+            var sigs = self._rank_sigs()
+            if self.backend == BACKEND_NAIVE:
+                self._stream_barrier()
+            comptime for r in range(Self.N):
+                allgather[ngpus=Self.N](
+                    in_t, out_t, sigs, self.ctxs[r], my_rank=r
+                )
+            if self.backend == BACKEND_NAIVE:
+                self._stream_barrier()
+        else:
+            raise Error("all_gather_into: MAX comm needs NVIDIA GPUs")
+
+    def stream_barrier(self) raises:
+        """Every rank's stream waits for every peer's (device-side). For a
+        driver that orders its own reads of peers' buffers; no-op on the
+        simulator, whose ranks share one stream."""
+        if Self.N == 1 or self.backend == BACKEND_SHARED:
+            return
+        self._stream_barrier()
+
     def _rank_sigs(
         mut self,
     ) -> Array[MutPointer[Signal, MutAnyOrigin], MAX_GPUS]:

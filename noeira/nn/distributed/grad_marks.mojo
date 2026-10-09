@@ -28,6 +28,15 @@ as final only at the end of the backward.
 Events are pooled by mark slot and reused every step. That is safe because
 CUDA's wait captures the event's most recent record at the time the wait is
 enqueued, and the host enqueues step s's waits before step s+1 re-records.
+
+Unit hooks (ZeRO-2/3, `zero_sharded.mojo`). The same wrapper is a sharding
+unit: a sharded driver registers one callback (`UnitHooks`) that the wrapper
+calls before its forward, before its vjp and after its vjp, with its unit
+index and rank. Those are assigned by an ASSIGNING parameter walk: while
+`UnitHooks.assigning` is set, each wrapper takes the next unit index and
+reports it as `cur_unit` to the visitor for the parameters it holds, so one
+walk gives the driver both the unit of every parameter and numbered
+wrappers. With no driver registered the wrapper behaves as above.
 """
 
 from std.ffi import _get_global_or_null, external_call
@@ -117,10 +126,90 @@ def grad_marks() raises -> GradMarksPtr:
         var p = alloc(AllocLayout[GradMarks].single()).unsafe_leak()
         p.unsafe_write(GradMarks())
         external_call["KGEN_CompilerRT_InsertGlobal", NoneType](
-            StringSlice(_REGISTRY), p.bitcast[NoneType]()
+            StringSlice(_REGISTRY), p.unsafe_bitcast[NoneType]()
         )
         g = _get_global_or_null(_REGISTRY)
     return g.value().unsafe_bitcast[GradMarks]()
+
+
+# ── unit hooks (sharded drivers) ─────────────────────────────────────────────
+
+comptime HOOK_PRE_FORWARD = 0
+comptime HOOK_PRE_VJP = 1
+comptime HOOK_POST_VJP = 2
+
+comptime UnitHookFn = def(Int, Int, Int, Int, DeviceContext) raises thin
+"""`(state, event, unit, rank, ctx)`: `state` is the driver's address."""
+
+
+def _no_hook(
+    state: Int, event: Int, unit: Int, rank: Int, ctx: DeviceContext
+) raises:
+    pass
+
+
+comptime _UNIT_HOOKS = "NOEIRA_UNIT_HOOKS"
+
+
+struct UnitHooks(Movable):
+    """Process-wide: the sharded driver whose hooks are live, and the state
+    of an assigning walk."""
+
+    var assigning: Bool
+    var assign_rank: Int
+    var next_unit: Int
+    var cur_unit: Int
+    """Unit whose parameters the walk is visiting; -1 outside every wrapper."""
+    var active: Bool
+    var state: Int
+    var call: UnitHookFn
+
+    def __init__(out self):
+        self.assigning = False
+        self.assign_rank = -1
+        self.next_unit = 0
+        self.cur_unit = -1
+        self.active = False
+        self.state = 0
+        self.call = _no_hook
+
+    def begin_assign(mut self, rank: Int):
+        self.assigning = True
+        self.assign_rank = rank
+        self.next_unit = 0
+        self.cur_unit = -1
+
+    def end_assign(mut self):
+        self.assigning = False
+        self.cur_unit = -1
+
+    def register(mut self, state: Int, call: UnitHookFn) raises:
+        if self.active:
+            raise Error("UnitHooks: another sharded driver is active")
+        self.state = state
+        self.call = call
+        self.active = True
+
+    def unregister(mut self):
+        self.active = False
+        self.state = 0
+        self.call = _no_hook
+
+
+comptime UnitHooksPtr = Pointer[UnitHooks, UntrackedOrigin[mut=True]]
+
+
+def unit_hooks() raises -> UnitHooksPtr:
+    """The process-wide unit hook registry, created on first use."""
+    var g = _get_global_or_null(_UNIT_HOOKS)
+    if not g:
+        var p = alloc(AllocLayout[UnitHooks].single()).unsafe_leak()
+        p.unsafe_write(UnitHooks())
+        external_call["KGEN_CompilerRT_InsertGlobal", NoneType](
+            StringSlice(_UNIT_HOOKS), p.unsafe_bitcast[NoneType]()
+        )
+        g = _get_global_or_null(_UNIT_HOOKS)
+    return g.value().unsafe_bitcast[UnitHooks]()
 
 
 struct GradSpan(ParamVisitor):
@@ -160,14 +249,32 @@ struct GradReady[INNER: Module, ACTIVE: Bool = True](Module):
     comptime ACT_DT = Self.INNER.ACT_DT
 
     var inner: Self.INNER
+    var unit: Int
+    """Unit index (forward order), set by an assigning walk; -1 before."""
+    var rank: Int
+    """Rank of the replica this wrapper belongs to, set with `unit`."""
 
     def __init__(out self):
         self.inner = Self.INNER()
+        self.unit = -1
+        self.rank = -1
 
     def __init__[
         target: StaticString, INIT: Initializer
     ](out self, *, ctx: Optional[DeviceContext]) raises:
         self.inner = Self.INNER.make[target, INIT](ctx)
+        self.unit = -1
+        self.rank = -1
+
+    def _hook(self, event: Int, ctx: DeviceContext) raises:
+        var h = unit_hooks()
+        if h[].active:
+            if self.unit < 0:
+                raise Error(
+                    "GradReady: unit not assigned (the sharded driver's"
+                    " assigning walk did not reach this wrapper)"
+                )
+            h[].call(h[].state, event, self.unit, self.rank, ctx)
 
     @staticmethod
     def make[
@@ -183,6 +290,9 @@ struct GradReady[INNER: Module, ACTIVE: Bool = True](Module):
         mut out: TensorImpl[Self.ACT_DT],
         ctx: Optional[DeviceContext] = None,
     ) raises:
+        comptime if Self.ACTIVE and target != "cpu":
+            if ctx:
+                self._hook(HOOK_PRE_FORWARD, ctx.value())
         self.inner.forward[target, B, POLICY=POLICY](inputs, out, ctx)
 
     def vjp[
@@ -195,11 +305,17 @@ struct GradReady[INNER: Module, ACTIVE: Bool = True](Module):
         grad_inputs: TensorRefs[Self.ARITY, ogi, Self.ACT_DT],
         ctx: Optional[DeviceContext] = None,
     ) raises:
+        comptime if Self.ACTIVE and target != "cpu":
+            if ctx:
+                self._hook(HOOK_PRE_VJP, ctx.value())
         self.inner.vjp[target, B, POLICY=POLICY](
             forward_input, grad_output, grad_inputs, ctx
         )
         comptime if Self.ACTIVE and target != "cpu":
             if not ctx:
+                return
+            if unit_hooks()[].active:
+                self._hook(HOOK_POST_VJP, ctx.value())
                 return
             var reg = grad_marks()
             if not reg[].active:
@@ -213,6 +329,18 @@ struct GradReady[INNER: Module, ACTIVE: Bool = True](Module):
         target: StaticString, V: ParamVisitor
     ](mut self, mut visitor: V, ctx: Optional[DeviceContext],
       prefix: String = String("")) raises:
+        comptime if Self.ACTIVE:
+            var h = unit_hooks()
+            if h[].assigning:
+                if h[].cur_unit != -1:
+                    raise Error("GradReady: nested units are not supported")
+                self.unit = h[].next_unit
+                self.rank = h[].assign_rank
+                h[].next_unit += 1
+                h[].cur_unit = self.unit
+                self.inner.for_each_param[target](visitor, ctx, prefix)
+                h[].cur_unit = -1
+                return
         self.inner.for_each_param[target](visitor, ctx, prefix)
 
     def for_each_state[

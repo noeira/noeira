@@ -19,7 +19,13 @@ Defines (`mojo build -D ...`, then run the binary):
                   context, the simulator; runs on a Mac or one GPU)
   GPT_FULL        nanoGPT 6x384, seq 256 (default: a 2x64, seq 64 dev config)
   ZERO1           timing mode with ZeRO-1 instead of DDP
-  ZERO_GATE       DDP vs ZeRO-1 at N ranks (clip on, dropout off)
+  ZERO=s          2 or 3: timing mode with ZeroSharded (ZeRO-2 / ZeRO-3,
+                  per-block units, collectives inside the backward on
+                  RankFibers); eager only
+  ZERO_SLOTS=k    ZeroSharded's unit slots (default 1)
+  ZERO_GATE       DDP vs ZeRO-1 at N ranks (clip on, dropout off); with
+                  ZERO=2|3, DDP vs ZeRO-2|3, and on devices also ZeRO on
+                  the devices vs ZeRO on the simulator (bit for bit at N=2)
   B_LOCAL=b       rows per rank in timing mode (default 64 full / 8 dev)
   NN_ITERS=k      timed steps (default 50)
   GRAPH=g         0 eager (default); 1 one CUDA graph per GPU, collective
@@ -37,6 +43,7 @@ Mac:     pixi run -e apple mojo run -I . examples/nn/distributed/gpt_ddp.mojo
 from std.random import seed, random_ui64
 from std.sys import get_defined_int, is_defined
 from std.time import perf_counter_ns
+from std.memory import Pointer
 from max.gpu.host import DeviceContext
 from layout import Layout
 
@@ -56,6 +63,8 @@ from noeira.nn.training.window_batch_kernels import advance_step_kernel
 from noeira.nn.distributed.process_group import ProcessGroup, backend_name
 from noeira.nn.distributed.data_parallel import DataParallel
 from noeira.nn.distributed.zero import Zero1
+from noeira.nn.distributed.zero_sharded import ZeroSharded
+from noeira.nn.distributed.fibers import RankStep
 from noeira.nn.distributed.shard_batch import window_onehot_shard_kernel
 from noeira.nn.distributed.rank_graphs import RankGraphs
 
@@ -76,6 +85,11 @@ comptime OVERLAP = is_defined["OVERLAP"]()
 """DDP reduces gradient buckets on a second stream per GPU while the backward
 runs (`DataParallel.enable_overlap`), one mark per transformer block."""
 comptime BUCKET_MB = get_defined_int["BUCKET_MB", 8]()
+comptime ZERO = get_defined_int["ZERO", 0]()
+"""2 or 3: ZeroSharded (ZeRO-2 / ZeRO-3) instead of DDP."""
+comptime ZERO_SLOTS = get_defined_int["ZERO_SLOTS", 1]()
+comptime MARKS = OVERLAP or ZERO >= 2
+"""Every block a `GradReady` unit: overlap's buckets, ZeroSharded's units."""
 
 comptime VOCAB = 65
 comptime SEQ = 256 if FULL else 64
@@ -99,12 +113,12 @@ comptime CLIP: Scalar[DT] = 0.0 if is_defined["NO_CLIP"]() else 1.0  # 0 = no cl
 comptime DROPOUT_P: Float64 = 0.0 if (GATE or ZERO_GATE) else 0.2
 comptime SEED_BASE = UInt64(0xC0FFEE)
 comptime USE_MAX_ATTN = True
-# The GPT with a gradient mark after each block, compiled in only with
-# OVERLAP (`GPTMarked[..., ACTIVE=False]` trains bit-identically to
-# `GPTDropTied`: tests/nn/distributed/test_gpt_marked.mojo).
+# The GPT with a unit wrapper around each block, compiled in only with
+# OVERLAP or ZERO >= 2 (`GPTMarked[..., ACTIVE=False]` trains bit-identically
+# to `GPTDropTied`: tests/nn/distributed/test_gpt_marked.mojo).
 comptime NET = GPTMarked[
     VOCAB, SEQ, EMBED, HEADS, LAYERS, FF_MULT, True, DROPOUT_P, SEED_BASE,
-    USE_MAX_ATTN, OVERLAP,
+    USE_MAX_ATTN, MARKS,
 ]
 comptime ROW = SEQ * VOCAB
 comptime LOSS = SequenceCrossEntropyLoss[SEQ, VOCAB]
@@ -209,11 +223,11 @@ def _surgery(mut net: NET, c: DeviceContext) raises:
     """nanoGPT's scaled residual init + the tied head, on one replica."""
     gpt_marked_scale_residual_proj[
         "gpu", VOCAB, SEQ, EMBED, HEADS, LAYERS, FF_MULT, True, DROPOUT_P,
-        SEED_BASE, USE_MAX_ATTN, OVERLAP,
+        SEED_BASE, USE_MAX_ATTN, MARKS,
     ](net, Optional(c))
     gpt_marked_wire_tie[
         VOCAB, SEQ, EMBED, HEADS, LAYERS, FF_MULT, True, DROPOUT_P,
-        SEED_BASE, USE_MAX_ATTN, OVERLAP,
+        SEED_BASE, USE_MAX_ATTN, MARKS,
     ](net)
 
 
@@ -419,8 +433,107 @@ struct _ZeroJob[N: Int, BL: Int](_Job):
         return self.z.state_bytes_per_rank(0)
 
 
+struct _ShardStep[N: Int, BL: Int, STAGE: Int](RankStep):
+    """Rank r's step on its fiber. One per rank: it owns the rank's buffers
+    and reaches its replica through the driver's address (`z`, refreshed by
+    the job before every step: the job moves after it is built)."""
+
+    var z: Int
+    var rk: _Rank
+
+    def __init__(out self, var rk: _Rank):
+        self.z = 0
+        self.rk = rk^
+
+    def run_rank(mut self, r: Int) raises:
+        var zp = Pointer[
+            ZeroSharded[NET, Self.N, Self.STAGE], MutUntrackedOrigin
+        ](unsafe_from_address=self.z)
+        _rank_step[Self.BL](zp[].nets[r], zp[].ctx(r), self.rk, r)
+
+
+struct _ShardJob[N: Int, BL: Int, STAGE: Int, SIM: Bool = False](_Job):
+    """ZeRO-2 / ZeRO-3: the unit collectives run inside `compute` (the
+    fibers' rendezvous); `comm` has nothing left to do."""
+
+    var z: ZeroSharded[NET, Self.N, Self.STAGE]
+    var steps: List[_ShardStep[Self.N, Self.BL, Self.STAGE]]
+
+    def __init__(out self, ctx: DeviceContext, ids: List[Int]) raises:
+        seed(42)
+        var seed_word = random_ui64(0, UInt64.MAX)
+        # Signal payload: the naive path allreduces one unit at a time.
+        self.z = ZeroSharded[NET, Self.N, Self.STAGE].make[Normal[0.0, 0.02]](
+            _make_pg[Self.N, Self.SIM](ctx, 4 << 20),
+            lr=LR, beta2=BETA2, wd=WD, slots=ZERO_SLOTS,
+        )
+        for r in range(Self.N):
+            _surgery(self.z.nets[r], self.z.ctx(r))
+        self.z.synchronize()
+        self.z.sync_params()
+        self.steps = List[_ShardStep[Self.N, Self.BL, Self.STAGE]]()
+        for r in range(Self.N):
+            self.steps.append(
+                _ShardStep[Self.N, Self.BL, Self.STAGE](
+                    _Rank(self.z.ctx(r), Self.BL, ids, seed_word)
+                )
+            )
+        self.z.synchronize()
+
+    def compute(mut self) raises:
+        var a = Int(Pointer(to=self.z))
+        for r in range(Self.N):
+            self.steps[r].z = a
+        self.z.forward_backward(self.steps)
+
+    def comm(mut self) raises:
+        pass
+
+    def update(mut self) raises:
+        self.z.clip_grads_device(CLIP)
+        self.z.step()
+
+    def synchronize(self) raises:
+        self.z.synchronize()
+
+    def graph_ctxs(self) -> List[DeviceContext]:
+        return self.z.pg.graph_ctxs()
+
+    def describe(self) -> String:
+        return self.z.layout_summary()
+
+    def capturable_collectives(self) -> Bool:
+        return False
+
+    def collectives_in_update(self) -> Bool:
+        return True
+
+    def losses(mut self, reset: Bool) raises -> Float64:
+        var l = 0.0
+        for r in range(Self.N):
+            l += Float64(
+                self.steps[r].rk.loss.read_accum["gpu"](Optional(self.z.ctx(r)))
+            )
+            if reset:
+                self.steps[r].rk.loss.reset_accum["gpu"]()
+        return l / Float64(Self.N)
+
+    def download(mut self, r: Int) raises -> List[Scalar[DT]]:
+        return self.z.download_params(r)
+
+    def arena(self) -> Int:
+        return self.z.arena_total()
+
+    def state_bytes(self) -> Int:
+        return self.z.state_bytes_per_rank(0)
+
+
 def _graph_mode[J: _Job](job: J) raises -> Int:
     """The capture mode this backend allows for the requested one."""
+    comptime if ZERO >= 2 and GRAPH != GRAPH_EAGER:
+        print("  [graph] ZERO=" + String(ZERO) + ": the step runs on fibers,"
+              " eager only")
+        return GRAPH_EAGER
     comptime if OVERLAP and GRAPH != GRAPH_EAGER:
         # The overlapped collective lives INSIDE the backward's timeline, so
         # it is captured with the step or the step runs eagerly.
@@ -491,7 +604,7 @@ def _run[J: _Job, N: Int](
     res.ms_per_step = Float64(perf_counter_ns() - t0) / 1e6 / Float64(max(steps, 1))
     var d = job.describe()
     if d.byte_length() > 0:
-        print("  [overlap]", d)
+        print("  [" + ("zero" if ZERO >= 2 else "overlap") + "]", d)
     comptime if not PER_STEP_LOSS:
         res.losses.append(job.losses(False))
     if keep_params:
@@ -512,6 +625,14 @@ def _run_zero[N: Int, BL: Int](
     ctx: DeviceContext, ids: List[Int], steps: Int, warmup: Int, keep: Bool
 ) raises -> _Result:
     return _run[_ZeroJob[N, BL], N](_ZeroJob[N, BL](ctx, ids), steps, warmup, keep)
+
+
+def _run_shard[N: Int, BL: Int, STAGE: Int, SIM: Bool = False](
+    ctx: DeviceContext, ids: List[Int], steps: Int, warmup: Int, keep: Bool
+) raises -> _Result:
+    return _run[_ShardJob[N, BL, STAGE, SIM], N](
+        _ShardJob[N, BL, STAGE, SIM](ctx, ids), steps, warmup, keep
+    )
 
 
 def _max_abs_diff(a: List[Scalar[DT]], b: List[Scalar[DT]]) -> Float64:
@@ -535,9 +656,14 @@ def main() raises:
         + (" devices" if USE_DEVICES else " shared-context simulator")
         + " GRAPH=" + String(GRAPH) + (" NO_COMM" if NO_COMM else "")
         + (" OVERLAP buckets<=" + String(BUCKET_MB) + "MB" if OVERLAP else "")
+        + (" ZeRO-" + String(ZERO) + " slots " + String(ZERO_SLOTS) if ZERO >= 2 else "")
     )
-    comptime assert not (OVERLAP and (ZERO1 or ZERO_GATE)), (
-        "OVERLAP buckets DDP's allreduce only, not ZeRO-1's reduce-scatter"
+    comptime assert not (OVERLAP and (ZERO1 or ZERO_GATE or ZERO >= 2)), (
+        "OVERLAP buckets DDP's allreduce only, not ZeRO's reduce-scatters"
+    )
+    comptime assert ZERO == 0 or ZERO == 2 or ZERO == 3, "ZERO is 2 or 3"
+    comptime assert not (ZERO >= 2 and (ZERO1 or NO_COMM)), (
+        "ZERO=2|3 excludes ZERO1 and NO_COMM (its collectives run in the backward)"
     )
 
     comptime if GATE:
@@ -582,6 +708,45 @@ def main() raises:
         if one.losses[GATE_ITERS - 1] > one.losses[0] - 0.3:
             raise Error("GATE FAIL: the reference run did not train")
         print("GPT DDP GATE: replicas bit-identical; N-vs-1 differences above")
+    elif ZERO_GATE and ZERO >= 2:
+        comptime BL = B_GATE // NGPUS
+        print("[zero gate] DDP vs ZeRO-" + String(ZERO) + ", N=" + String(NGPUS)
+              + " x B=" + String(BL) + ", clip " + String(CLIP) + ", "
+              + String(GATE_ITERS) + " steps, slots " + String(ZERO_SLOTS))
+        var d = _run_ddp[NGPUS, BL](ctx, split.train, GATE_ITERS, 0, True)
+        var z = _run_shard[NGPUS, BL, ZERO](ctx, split.train, GATE_ITERS, 0, True)
+        var dl = 0.0
+        for i in range(GATE_ITERS):
+            dl = max(dl, abs(d.losses[i] - z.losses[i]))
+        var dzp = 0.0
+        var drep = 0.0
+        for r in range(NGPUS):
+            dzp = max(dzp, _max_abs_diff(d.params[r], z.params[r]))
+            drep = max(drep, _max_abs_diff(z.params[0], z.params[r]))
+        print("  arena =", d.arena, " loss", d.losses[0], "->", d.losses[GATE_ITERS - 1])
+        print("  max|loss DDP - ZeRO| =", dl, " max|param DDP - ZeRO| =", dzp)
+        print("  ZeRO replica agreement =", drep)
+        print("  state bytes/rank: DDP", d.state_bytes, " ZeRO-" + String(ZERO), z.state_bytes)
+        if drep != 0.0:
+            raise Error("ZERO GATE FAIL: replicas drifted apart")
+        comptime if is_defined["NO_CLIP"]():
+            if dl != 0.0 or dzp != 0.0:
+                raise Error("ZERO GATE FAIL: not bit-identical to DDP without clip")
+        comptime if USE_DEVICES:
+            # Same N and kernels on one GPU: the device collectives must
+            # reproduce the simulator's sums bit for bit at N = 2.
+            var sim = _run_shard[NGPUS, BL, ZERO, True](
+                ctx, split.train, GATE_ITERS, 0, True
+            )
+            var dsl = 0.0
+            for i in range(GATE_ITERS):
+                dsl = max(dsl, abs(sim.losses[i] - z.losses[i]))
+            var dsp = _max_abs_diff(sim.params[0], z.params[0])
+            print("  devices vs simulator (same N): max|loss| =", dsl,
+                  " max|param| =", dsp)
+            if NGPUS == 2 and (dsl != 0.0 or dsp != 0.0):
+                raise Error("ZERO GATE FAIL: MAX comm differs from the exact 2-rank sum")
+        print("GPT ZERO-" + String(ZERO) + " GATE done")
     elif ZERO_GATE:
         comptime BL = B_GATE // NGPUS
         print("[zero gate] DDP vs ZeRO-1, N=" + String(NGPUS) + " x B=" + String(BL)
@@ -605,12 +770,17 @@ def main() raises:
         print("GPT ZERO-1 GATE done")
     else:
         var res: _Result
-        comptime if ZERO1:
+        comptime if ZERO >= 2:
+            res = _run_shard[NGPUS, B_LOCAL, ZERO](ctx, split.train, ITERS, WARMUP, False)
+        elif ZERO1:
             res = _run_zero[NGPUS, B_LOCAL](ctx, split.train, ITERS, WARMUP, False)
         else:
             res = _run_ddp[NGPUS, B_LOCAL](ctx, split.train, ITERS, WARMUP, False)
         var tokens = Float64(NGPUS * B_LOCAL * SEQ)
-        print("  " + ("ZeRO-1" if ZERO1 else "DDP") + "  arena =", res.arena,
+        var name = String("ZeRO-") + String(ZERO) if ZERO >= 2 else (
+            String("ZeRO-1") if ZERO1 else String("DDP")
+        )
+        print("  " + name + "  arena =", res.arena,
               " B_LOCAL =", B_LOCAL, " global batch =", NGPUS * B_LOCAL,
               " state MB/rank =", Float64(res.state_bytes) / 1e6)
         print("  ms/step =", res.ms_per_step,
