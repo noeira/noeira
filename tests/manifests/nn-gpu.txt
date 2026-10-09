@@ -16,6 +16,7 @@ tests/nn/test_trainer_capture_shuffle_aug.mojo
 
 # --- kernels the nn examples spend their step in ---
 tests/nn/test_flash_attention.mojo
+tests/nn/test_flash_attention_mma_gpu.mojo
 tests/nn/test_attention_qkv_layout.mojo
 tests/nn/test_attention_gpu_shapes.mojo
 tests/nn/test_layer_norm_dparams_gpu.mojo

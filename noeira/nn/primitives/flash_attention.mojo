@@ -50,6 +50,11 @@ from max.gpu.host import DeviceContext, DeviceBuffer
 from layout import Layout, LayoutTensor
 
 from noeira.nn.constants import DT, TPB
+from std.sys.defines import get_defined_string
+from .flash_attention_mma import (
+    mma_eligible, MMA_TQ, MMA_TK, MMA_WARPS,
+    _mma_fwd_kernel, _mma_dq_kernel, _mma_dkdv_kernel,
+)
 
 
 comptime _NV = has_nvidia_gpu_accelerator()
@@ -59,6 +64,16 @@ comptime DQ_TQ = 32 if _NV else 16
 comptime DQ_TK = 32 if _NV else 16
 comptime KV_TK = 32 if _NV else 16
 comptime KV_TQ = 32 if _NV else 16
+
+comptime ATTN_PATH = get_defined_string["NN_ATTN_PATH", "auto"]()
+"""`auto`: bf16 activations on NVIDIA run the tensor-core kernels
+(`flash_attention_mma.mojo`); `simt`: the fp32 CUDA-core kernels below for
+every dtype (the path before, for A/B runs)."""
+
+
+def _use_mma[ADT: DType, HD: Int, H: Int]() -> Bool:
+    return _NV and ATTN_PATH != "simt" and mma_eligible[ADT, HD, H]()
+
 
 comptime _NEG = Scalar[DT](-1e30)
 comptime _LOG2E = Scalar[DT](1.4426950408889634)
@@ -577,6 +592,13 @@ def flash_forward[
 ) raises:
     """Enqueue the forward: `outp` [B, S·DIM], `o_cache` (fp32, same) and
     `lse` [BH·S] (log2 units)."""
+    comptime if _use_mma[ADT, HD, H]():
+        c.enqueue_function[_mma_fwd_kernel[ADT, H, S, HD, CAUSAL, IL]](
+            inp, outp, o_cache, lse,
+            grid_dim=((S + MMA_TQ - 1) // MMA_TQ, BH),
+            block_dim=MMA_WARPS * WARP_SIZE,
+        )
+        return
     c.enqueue_function[
         _flash_fwd_kernel[ADT, H, S, HD, CAUSAL, FWD_TQ, FWD_TK, IL]
     ](
@@ -605,6 +627,18 @@ def flash_backward[
         dout, o_cache, dvec,
         grid_dim=(ROWS * WARP_SIZE + TPB - 1) // TPB, block_dim=TPB,
     )
+    comptime if _use_mma[ADT, HD, H]():
+        c.enqueue_function[_mma_dq_kernel[ADT, H, S, HD, CAUSAL, IL]](
+            inp, dout, lse, dvec, gin,
+            grid_dim=((S + MMA_TQ - 1) // MMA_TQ, BH),
+            block_dim=MMA_WARPS * WARP_SIZE,
+        )
+        c.enqueue_function[_mma_dkdv_kernel[ADT, H, S, HD, CAUSAL, IL]](
+            inp, dout, lse, dvec, gin,
+            grid_dim=((S + MMA_TK - 1) // MMA_TK, BH),
+            block_dim=MMA_WARPS * WARP_SIZE,
+        )
+        return
     c.enqueue_function[
         _flash_bwd_dq_kernel[ADT, H, S, HD, CAUSAL, DQ_TQ, DQ_TK, IL]
     ](
