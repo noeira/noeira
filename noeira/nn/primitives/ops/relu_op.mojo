@@ -19,6 +19,7 @@ struct ReLUOp(ElementOp):
     """ReLU activation with input-cache backward (`owns_cache=False`)."""
 
     comptime owns_cache = False
+    comptime is_relu = True
 
     @staticmethod
     def display_label() -> String:

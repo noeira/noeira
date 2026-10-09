@@ -38,6 +38,7 @@ Use via one-line aliases (see linear_tanh.mojo / linear_mish.mojo / …):
 
 from std.sys import CompilationTarget, has_nvidia_gpu_accelerator
 from noeira.nn.core.cublas_gemm import cublas_gemm, CUBLAS_BWD, cublas_fwd, cublas_tf32, cublas_gemm_lp, GEMM_PATH
+from noeira.nn.core.cublaslt_gemm import cublaslt_gemm, EPI_RELU_AUX_BIAS, LT_RELU
 from max.gpu import global_idx
 from max.gpu.host import DeviceContext
 from layout import Layout, LayoutTensor, TileTensor, row_major
@@ -180,6 +181,20 @@ def _act_gate_kernel[
             go[b, j] = OP.backward_scalar(c.cast[DT](), g.cast[DT]()).cast[ADT]()
 
 
+def _relu_mask_gate_kernel[B: Int, OUT: Int, LD: Int](
+    go: Pointer[Scalar[DT], MutAnyOrigin],
+    mask: Pointer[Scalar[DT], MutAnyOrigin],
+):
+    """ReLU gate from the cuBLASLt `RELU_AUX_BIAS` bitmask (`mask` holds
+    bytes): go[b, j] = 0 where bit b * LD + j is clear (z <= 0)."""
+    var idx = Int(global_idx.x)
+    if idx < B * OUT:
+        var bit = (idx // OUT) * LD + idx % OUT
+        var byte = mask.bitcast[UInt8]()[unsafe_offset=bit >> 3]
+        if (byte >> UInt8(bit & 7)) & 1 == 0:
+            go[unsafe_offset=idx] = 0
+
+
 struct LinearAct[IN_: Int, OUT_: Int, OP: ElementOp, ADT: DType = DT](Module):
     comptime ARITY = 1
     comptime IN_DIMS = Array[Int, 1](fill=Self.IN_)
@@ -241,6 +256,25 @@ struct LinearAct[IN_: Int, OUT_: Int, OP: ElementOp, ADT: DType = DT](Module):
     @staticmethod
     def use_cublas_fwd[B: Int]() -> Bool:
         return cublas_fwd(B, Self.OUT_, Self.IN_, Self.PADDED)
+
+    # NVIDIA fp32 ReLU on cuBLAS (`NN_LT_RELU`): bias + ReLU run in the GEMM's
+    # cuBLASLt epilogue, and `cache` holds its bitmask of z > 0 (row stride
+    # MASK_LD bits) instead of z — all the ReLU gate reads. Only where it
+    # measured faster (`bench_linear_gemm_paths_gpu.mojo` parts 1-3 and 5, 42
+    # ReLU shapes, RTX 5090): every fp32 shape at batch > 1 (forward 1.04-
+    # 1.19x) and the TF32 ones with K >= 1024 (1.07-1.13x). It lost at batch
+    # 1 (0.86-0.92x: the GEMV is cheaper than a GEMM with an epilogue) and on
+    # every TF32 shape with K <= 512 (0.83-0.99x), so those keep the GEMM +
+    # bias/activation kernel.
+    comptime MASK_LD = Self._round_up(Self.OUT_, 128)
+
+    @staticmethod
+    def use_lt_relu[B: Int]() -> Bool:
+        return (
+            LT_RELU and Self.OP.is_relu and Self.ACT_DT == DT
+            and Self.use_cublas_fwd[B]() and B > 1
+            and (not cublas_tf32(B, Self.OUT_, Self.IN_) or Self.IN_ >= 1024)
+        )
 
     @staticmethod
     def _round_up(v: Int, to: Int) -> Int:
@@ -477,9 +511,23 @@ struct LinearAct[IN_: Int, OUT_: Int, OP: ElementOp, ADT: DType = DT](Module):
             else:
                 var c = ctx.value()
                 outd.ensure_gpu(c, B * Self.OUT_)
-                cached.ensure_gpu(c, B * Self.OUT_)
+                # The bitmask takes B * MASK_LD / 8 bytes: more than z only
+                # when OUT_ < 4.
+                cached.ensure_gpu(
+                    c, max(B * Self.OUT_, B * Self.MASK_LD // 32)
+                    if Self.use_lt_relu[B]() else B * Self.OUT_,
+                )
                 var out_v = TileTensor(outd.dev.value(), row_major[B, Self.OUT_]())
-                comptime if Self.use_cublas_fwd[B]():
+                comptime if Self.use_lt_relu[B]():
+                    cublaslt_gemm[False, False, DT, DT, cublas_tf32(B, Self.OUT_, Self.IN_)](
+                        c, outd.dev.value(), in0d.dev.value(),
+                        self.weight.val.dev.value(),
+                        B, Self.OUT_, Self.IN_, EPI_RELU_AUX_BIAS,
+                        bias=Int(self.bias.val.dev.value().unsafe_ptr()),
+                        aux=Int(cached.dev.value().unsafe_ptr()),
+                        aux_ld=Self.MASK_LD,
+                    )
+                elif Self.use_cublas_fwd[B]():
                     cublas_gemm[False, False, cublas_tf32(B, Self.OUT_, Self.IN_)](
                         c, outd.dev.value(), in0d.dev.value(),
                         self.weight.val.dev.value(),
@@ -698,12 +746,21 @@ struct LinearAct[IN_: Int, OUT_: Int, OP: ElementOp, ADT: DType = DT](Module):
                 var c = ctx.value()
                 gind.ensure_gpu(c, B * Self.IN_)
                 # gate grad by activation derivative
-                c.enqueue_function[_act_gate_kernel[B, Self.OUT_, Self.OP]](
-                    god.lt["gpu", Layout.row_major(B, Self.OUT_)](),
-                    cached.lt["gpu", Layout.row_major(B, Self.OUT_)](),
-                    grid_dim=(M + TPB - 1) // TPB,
-                    block_dim=TPB,
-                )
+                comptime if Self.use_lt_relu[B]():
+                    c.enqueue_function[
+                        _relu_mask_gate_kernel[B, Self.OUT_, Self.MASK_LD]
+                    ](
+                        god.dev.value(), cached.dev.value(),
+                        grid_dim=(M + TPB - 1) // TPB,
+                        block_dim=TPB,
+                    )
+                else:
+                    c.enqueue_function[_act_gate_kernel[B, Self.OUT_, Self.OP]](
+                        god.lt["gpu", Layout.row_major(B, Self.OUT_)](),
+                        cached.lt["gpu", Layout.row_major(B, Self.OUT_)](),
+                        grid_dim=(M + TPB - 1) // TPB,
+                        block_dim=TPB,
+                    )
                 enqueue_bias_grad[DT](
                     c, god.dev.value(), self.bias.grd.dev.value(), B, Self.OUT_, self.gb_part
                 )

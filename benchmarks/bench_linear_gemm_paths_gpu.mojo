@@ -26,8 +26,11 @@ step in training.
 
 `BL_PART=4` times the bf16-flow `LinearAct` / `Linear` (bf16 activations,
 fp32 master weights): `NN_GEMM_PATH=linmax` = MAX's GEMMs (the path before),
-`auto` = cuBLAS. `-D NN_LT_BIAS=1` puts the fp32 `Linear` forward's bias in a
-cuBLASLt epilogue (parts 1-3; `cublaslt_gemm.mojo`).
+`auto` = cuBLAS. `-D NN_LT_BIAS=0` takes the fp32 `Linear` forward's bias
+out of its cuBLASLt epilogue (parts 1-3; `cublaslt_gemm.mojo`), `-D
+NN_LT_RELU=0` the fp32 `LinearAct[.., ReLUOp]` forward's bias + ReLU (the
+`LinearReLU` rows; `BL_PART=5` = extra ReLU shapes that set
+`LinearAct.use_lt_relu`'s rule).
 
 NVIDIA only (the `max` / `cublas` switch does nothing elsewhere). Run through
 `pixi run` so the CUDA interceptor is preloaded (graph capture needs it).
@@ -41,7 +44,7 @@ from max.gpu.host import DeviceContext
 from noeira.cuda.graph import CUDAGraph, maybe_capture_replay
 from noeira.nn.constants import DT
 from noeira.nn.core.tensor import Tensor, TensorImpl
-from noeira.nn.core.cublaslt_gemm import LT_BIAS
+from noeira.nn.core.cublaslt_gemm import LT_BIAS, LT_RELU
 from noeira.nn.core.tensor_refs import TensorRefs
 from noeira.nn.core.initializer import Kaiming
 from noeira.nn.core.element_op import ElementOp
@@ -89,7 +92,7 @@ def _replay_us[
 
 def _row(kind: String, IN: Int, OUT: Int, B: Int, cub: Bool, f: Float64, fb: Float64):
     print(
-        "ROW path=", GEMM_PATH, " lt_bias=", LT_BIAS, " kind=", kind, " in=", IN, " out=", OUT,
+        "ROW path=", GEMM_PATH, " lt_bias=", LT_BIAS, " lt_relu=", LT_RELU, " kind=", kind, " in=", IN, " out=", OUT,
         " b=", B, " cublas_fwd=", cub, " fwd_us=", f, " fwdbwd_us=", fb,
         sep="",
     )
@@ -333,6 +336,25 @@ def main() raises:
         bench_linear[768, 192, 8192](ctx)  # ViT fc2
         bench_linear[192, 10, 128](ctx)  # ViT head
         bench_linear[128, 65, 512](ctx)  # LSTM head
+    comptime if PART == 5:  # fp32 ReLU: the regime probe behind `use_lt_relu`
+        bench_act[17, 256, 1, ReLUOp]("LinearReLU", ctx)
+        bench_act[23, 256, 1, ReLUOp]("LinearReLU", ctx)
+        bench_act[64, 64, 1, ReLUOp]("LinearReLU", ctx)
+        bench_act[4, 128, 1, ReLUOp]("LinearReLU", ctx)
+        bench_act[256, 256, 256, ReLUOp]("LinearReLU", ctx)
+        bench_act[223, 1024, 256, ReLUOp]("LinearReLU", ctx)
+        bench_act[223, 1024, 64, ReLUOp]("LinearReLU", ctx)
+        bench_act[256, 256, 128, ReLUOp]("LinearReLU", ctx)
+        bench_act[64, 64, 16384, ReLUOp]("LinearReLU", ctx)
+        bench_act[128, 128, 1024, ReLUOp]("LinearReLU", ctx)
+        bench_act[256, 256, 1024, ReLUOp]("LinearReLU", ctx)
+        bench_act[256, 256, 4096, ReLUOp]("LinearReLU", ctx)
+        bench_act[64, 256, 4096, ReLUOp]("LinearReLU", ctx)
+        bench_act[100, 512, 2048, ReLUOp]("LinearReLU", ctx)
+        bench_act[256, 1024, 256, ReLUOp]("LinearReLU", ctx)
+        bench_act[128, 512, 512, ReLUOp]("LinearReLU", ctx)
+        bench_act[512, 512, 256, ReLUOp]("LinearReLU", ctx)
+        bench_act[512, 256, 256, ReLUOp]("LinearReLU", ctx)
     comptime if PART == 4:
         bench_act_bf16[17, 256, 256, ReLUOp]("LinearReLU", ctx)  # SAC HC actor
         bench_act_bf16[256, 256, 256, ReLUOp]("LinearReLU", ctx)  # SAC trunk
