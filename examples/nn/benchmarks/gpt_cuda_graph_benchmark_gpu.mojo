@@ -25,10 +25,19 @@ launch-bound the config is (smaller BATCH/seq = more launch-bound = bigger win).
 Run on NVIDIA:
     pixi run -e nvidia mojo run -I . \
         examples/nn/benchmarks/gpt_cuda_graph_benchmark_gpu.mojo
+
+Switches (`mojo build -D`, a `mojo run -D` can reuse a stale compile):
+  - `GPT_BENCH_DTYPE=bf16`: the bf16-flow GPT (bf16 activations; fp32 master
+    weights, loss, softmax / LayerNorm stats and AdamW), as
+    `transformer/gpt_tinyshakespeare_training_bf16_gpu.mojo` — the twin of
+    PyTorch's `autocast(bfloat16)` (`tools/nn/torch_nn_reference.py --amp bf16`);
+  - `GPT_BENCH_COLS=devgraph`: only the device-batch / graph column (the one
+    compared with PyTorch's `reduce-overhead`), one model to compile not four.
 """
 
 from std.random import seed
 from std.time import perf_counter_ns
+from std.sys.defines import get_defined_string
 from max.gpu.host import DeviceContext
 
 from noeira.nn.datasets import CharTokenizer, load_text, train_val_split
@@ -57,12 +66,16 @@ comptime USE_MAX_ATTN = True
 comptime DROPOUT_P: Float64 = 0.2
 comptime GRAD_CLIP: Scalar[DT] = 1.0
 
+comptime DTYPE_NAME = get_defined_string["GPT_BENCH_DTYPE", "fp32"]()
+comptime ADT = DType.bfloat16 if DTYPE_NAME == "bf16" else DT
+comptime ALL_COLS = get_defined_string["GPT_BENCH_COLS", "all"]() == "all"
+
 # Per-phase iteration count (warmup phase + timed phase each run this many).
 comptime BENCH_ITERS = 300
 
 comptime GPT_MODEL = GPTDropTied[
     VOCAB, SEQ, EMBED, HEADS, LAYERS, FF_MULT, True, DROPOUT_P,
-    UInt64(0xC0FFEE), USE_MAX_ATTN,
+    UInt64(0xC0FFEE), USE_MAX_ATTN, ADT,
 ]
 
 
@@ -88,11 +101,11 @@ def bench[
     )
     gpt_scale_residual_proj[
         "gpu", VOCAB, SEQ, EMBED, HEADS, LAYERS, FF_MULT, True, DROPOUT_P,
-        UInt64(0xC0FFEE), USE_MAX_ATTN,
+        UInt64(0xC0FFEE), USE_MAX_ATTN, ADT,
     ](artr.net, Optional(ctx))
     gpt_wire_tie[
         "gpu", VOCAB, SEQ, EMBED, HEADS, LAYERS, FF_MULT, True, DROPOUT_P,
-        UInt64(0xC0FFEE), USE_MAX_ATTN,
+        UInt64(0xC0FFEE), USE_MAX_ATTN, ADT,
     ](artr.net)
     ctx.synchronize()
 
@@ -118,6 +131,7 @@ def main() raises:
         + " embed=" + String(EMBED) + " heads=" + String(HEADS)
         + " layers=" + String(LAYERS) + " batch=" + String(BATCH)
         + " | bench_iters=" + String(BENCH_ITERS) + " (×2 phases/mode)"
+        + " | activations " + String(ADT)
     )
 
     print("\n[data] loading TinyShakespeare...")
@@ -130,14 +144,18 @@ def main() raises:
     # its own `bench` scope), so peak memory is still one model.
     var ctx = DeviceContext()
 
-    var he = bench[False, False](ctx, text)
-    print("  host batch,   eager: " + _row(he, he))
-    var hg = bench[True, False](ctx, text)
-    print("  host batch,   graph: " + _row(hg, he))
-    var de = bench[False, True](ctx, text)
-    print("  device batch, eager: " + _row(de, he))
-    var dg = bench[True, True](ctx, text)
-    print("  device batch, graph: " + _row(dg, he))
+    comptime if ALL_COLS:
+        var he = bench[False, False](ctx, text)
+        print("  host batch,   eager: " + _row(he, he))
+        var hg = bench[True, False](ctx, text)
+        print("  host batch,   graph: " + _row(hg, he))
+        var de = bench[False, True](ctx, text)
+        print("  device batch, eager: " + _row(de, he))
+        var dg = bench[True, True](ctx, text)
+        print("  device batch, graph: " + _row(dg, he))
+    else:
+        var dg = bench[True, True](ctx, text)
+        print("  device batch, graph: " + _row(dg, dg))
     print("=" * 70)
 
 

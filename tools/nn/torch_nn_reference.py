@@ -359,6 +359,9 @@ def run_gpt(args, dev):
     gen = torch.Generator(device=dev).manual_seed(args.seed)
     ar = torch.arange(seq, device=dev)
 
+    def amp():  # `--amp bf16` = standard mixed precision: fp32 master weights
+        return torch.autocast(dev.type, dtype=torch.bfloat16, enabled=args.amp == "bf16")
+
     def batch(src, n):
         s = torch.randint(0, src.numel() - seq, (n,), device=dev, generator=gen)
         w = s[:, None] + ar[None, :]
@@ -374,7 +377,8 @@ def run_gpt(args, dev):
         for g in opt.param_groups:
             g["lr"] = base_lr * lr_at(it)
         x, y = batch(train, b)
-        loss = F.cross_entropy(model(x).view(-1, len(chars)), y.view(-1))
+        with amp():
+            loss = F.cross_entropy(model(x).view(-1, len(chars)), y.view(-1))
         opt.zero_grad(set_to_none=True)
         loss.backward()
         torch.nn.utils.clip_grad_norm_(net.parameters(), 1.0)
@@ -385,14 +389,14 @@ def run_gpt(args, dev):
 
     def val_loss():
         net.eval()
-        with torch.no_grad():
+        with torch.no_grad(), amp():
             tot = sum(F.cross_entropy(model(vx[i:i + b]).view(-1, len(chars)),
                                       vy[i:i + b].reshape(-1)) for i in range(0, 256, b))
         net.train()
         return (tot / (256 // b)).item()
 
-    print(f"[gpt] mode={args.mode} tf32={args.tf32} iters={iters} torch={torch.__version__}")
-    out = dict(model="gpt", mode=args.mode, tf32=args.tf32, batch=b, iters=iters)
+    print(f"[gpt] mode={args.mode} tf32={args.tf32} amp={args.amp} iters={iters} torch={torch.__version__}")
+    out = dict(model="gpt", mode=args.mode, tf32=args.tf32, amp=args.amp, batch=b, iters=iters)
     if args.bench_steps:
         net.train()
         for it in range(args.bench_steps):        # warmup: compile, capture
@@ -429,6 +433,8 @@ def main():
     ap.add_argument("--iters", type=int, default=0, help="override (gpt)")
     ap.add_argument("--bench-steps", type=int, default=0,
                     help="gpt: time this many steps after as many warmup steps, no eval")
+    ap.add_argument("--amp", choices=["off", "bf16"], default="off",
+                    help="gpt: autocast(bfloat16) around forward + loss (fp32 master weights)")
     ap.add_argument("--seed", type=int, default=42)
     args = ap.parse_args()
     dev = torch.device("cuda" if torch.cuda.is_available() else
