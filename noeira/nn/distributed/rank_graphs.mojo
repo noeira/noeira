@@ -104,7 +104,20 @@ struct RankGraphs(Movable):
         for i in range(len(self.ctxs)):
             with self.ctxs[i].push_context():
                 self.graphs[i].begin_capture()
-        STEP()
+        try:
+            STEP()
+        except e:
+            # Close every capture before the error unwinds: a buffer freed
+            # while its stream still captures aborts the process
+            # (STREAM_CAPTURE_UNSUPPORTED in ~DeviceBuffer) and hides `e`.
+            for i in range(len(self.ctxs)):
+                try:
+                    with self.ctxs[i].push_context():
+                        self.graphs[i].end_capture()
+                except:
+                    pass
+            self.state = _DISABLED
+            raise e^
         for i in range(len(self.ctxs)):
             with self.ctxs[i].push_context():
                 self.graphs[i].end_capture()

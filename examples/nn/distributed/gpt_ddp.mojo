@@ -150,8 +150,12 @@ struct _Result(Movable):
         self.state_bytes = 0
 
 
-def _make_pg[N: Int](ctx: DeviceContext, max_elems: Int) raises -> ProcessGroup[N]:
-    comptime if USE_DEVICES and N >= 2:
+def _make_pg[N: Int, SIM: Bool = False](
+    ctx: DeviceContext, max_elems: Int
+) raises -> ProcessGroup[N]:
+    """`SIM`: the shared-context simulator even under `DDP_DEVICES` (the
+    gate's exact reference for the MAX comm path)."""
+    comptime if USE_DEVICES and N >= 2 and not SIM:
         return ProcessGroup[N].devices(max_elems)
     else:
         return ProcessGroup[N].shared(ctx)
@@ -265,7 +269,7 @@ def _make_ranks[N: Int, BL: Int](
     return ranks^
 
 
-struct _DdpJob[N: Int, BL: Int](_Job):
+struct _DdpJob[N: Int, BL: Int, SIM: Bool = False](_Job):
     var dp: DataParallel[NET, Self.N]
     var ranks: List[_Rank]
 
@@ -273,7 +277,7 @@ struct _DdpJob[N: Int, BL: Int](_Job):
         seed(42)
         var seed_word = random_ui64(0, UInt64.MAX)
         self.dp = DataParallel[NET, Self.N].make[Normal[0.0, 0.02]](
-            _make_pg[Self.N](ctx, 16 << 20), lr=LR, beta2=BETA2, wd=WD
+            _make_pg[Self.N, Self.SIM](ctx, 16 << 20), lr=LR, beta2=BETA2, wd=WD
         )
         for r in range(Self.N):
             _surgery(self.dp.nets[r], self.dp.ctx(r))
@@ -453,10 +457,12 @@ def _run[J: _Job, N: Int](
     return res^
 
 
-def _run_ddp[N: Int, BL: Int](
+def _run_ddp[N: Int, BL: Int, SIM: Bool = False](
     ctx: DeviceContext, ids: List[Int], steps: Int, warmup: Int, keep: Bool
 ) raises -> _Result:
-    return _run[_DdpJob[N, BL], N](_DdpJob[N, BL](ctx, ids), steps, warmup, keep)
+    return _run[_DdpJob[N, BL, SIM], N](
+        _DdpJob[N, BL, SIM](ctx, ids), steps, warmup, keep
+    )
 
 
 def _run_zero[N: Int, BL: Int](
@@ -504,8 +510,28 @@ def main() raises:
         print("  max|loss N1 - N" + String(NGPUS) + "| =", dl)
         print("  max|param N1 - N" + String(NGPUS) + "| =", dp_)
         print("  replica agreement max|rank0 - rank r| =", drep)
+        print("  per-step loss N1 / N" + String(NGPUS) + ":")
+        for i in range(GATE_ITERS):
+            if i < 3 or i % 5 == 4:
+                print("    step", i, one.losses[i], many.losses[i],
+                      " diff", one.losses[i] - many.losses[i])
         if drep != 0.0:
             raise Error("GATE FAIL: replicas drifted apart")
+        comptime if USE_DEVICES:
+            # Same N, same per-rank shapes and kernels, on ONE GPU: a sum of
+            # two values is exact, so MAX comm must reproduce it bit for bit.
+            # This isolates the comm path from the N-vs-1 shape differences.
+            var sim = _run_ddp[NGPUS, B_GATE // NGPUS, True](
+                ctx, split.train, GATE_ITERS, 0, True
+            )
+            var dsl = 0.0
+            for i in range(GATE_ITERS):
+                dsl = max(dsl, abs(sim.losses[i] - many.losses[i]))
+            var dsp = _max_abs_diff(sim.params[0], many.params[0])
+            print("  devices vs simulator (same N): max|loss| =", dsl,
+                  " max|param| =", dsp)
+            if NGPUS == 2 and (dsl != 0.0 or dsp != 0.0):
+                raise Error("GATE FAIL: MAX comm differs from the exact 2-rank sum")
         if one.losses[GATE_ITERS - 1] > one.losses[0] - 0.3:
             raise Error("GATE FAIL: the reference run did not train")
         print("GPT DDP GATE: replicas bit-identical; N-vs-1 differences above")

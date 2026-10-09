@@ -297,8 +297,18 @@ def main() raises:
     var moved = _max_abs_diff(eager[0], init)
     print("  eager run moved the weights by", moved)
     assert_true(moved > 1e-3, "gate vacuous: the parameters barely moved")
-    _gate("DDP whole", _ddp[WHOLE](ctx), eager)
+    # Without P2P (MAX's host-staged collectives allocate per call) only the
+    # split mode can capture: the collective runs eagerly between two graphs.
+    var whole = fresh.dp.pg.capturable_collectives()
+    if whole:
+        _gate("DDP whole", _ddp[WHOLE](ctx), eager)
+    else:
+        print("  DDP whole: SKIPPED, backend", fresh.dp.pg.backend,
+              "cannot capture its collectives")
     _gate("DDP split", _ddp[SPLIT](ctx), eager)
-    var z_eager = _zero[False](ctx)
-    _gate("ZeRO-1 whole", _zero[True](ctx), z_eager)
+    if whole:
+        var z_eager = _zero[False](ctx)
+        _gate("ZeRO-1 whole", _zero[True](ctx), z_eager)
+    else:
+        print("  ZeRO-1 whole: SKIPPED (its update runs a collective)")
     print("RANK GRAPH GATES OK")

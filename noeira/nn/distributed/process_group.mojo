@@ -217,6 +217,25 @@ struct ProcessGroup[N: Int](Movable):
         aborts a capture; the P2P and simulator paths allocate nothing."""
         return self.backend != BACKEND_NAIVE
 
+    def _stream_barrier(self) raises:
+        """Every rank's stream waits for everything already enqueued on every
+        other rank's stream (device-side events, no host sync).
+
+        Needed around MAX's NAIVE collectives only. There rank r's stream
+        copies peer k's input buffer (`enqueue_copy(scratch, in_k)`,
+        `_allreduce_naive_single`) with no ordering against rank k's stream:
+        it can read `in_k` before rank k's backward finished writing it, and
+        rank k can overwrite `in_k` (the 1/N scale, the next `zero_grad`)
+        before rank r copied it. The P2P kernels order both through their
+        Signal barriers. Without this the GPT gate drifted (replicas 2.2e-2
+        apart after 30 steps, H200 NVL, PCIe without native atomics).
+        Called before a collective (its inputs are complete) and after it
+        (no rank moves on while a peer still reads its buffers)."""
+        for r in range(Self.N):
+            for k in range(Self.N):
+                if k != r:
+                    self.ctxs[r].enqueue_wait_for(self.ctxs[k])
+
     # ── collectives ──────────────────────────────────────────────────────────
 
     def allreduce_sum(
@@ -247,7 +266,11 @@ struct ProcessGroup[N: Int](Movable):
                 + " elements but the Signal payloads were sized for "
                 + String(self.max_elems)
             )
+        if self.backend == BACKEND_NAIVE:
+            self._stream_barrier()
         self._allreduce_comm(ins, outs, n)
+        if self.backend == BACKEND_NAIVE:
+            self._stream_barrier()
 
     def _allreduce_shared(
         mut self,
@@ -419,10 +442,14 @@ struct ProcessGroup[N: Int](Movable):
                         row_major(n),
                     )
             var sigs = self._rank_sigs()
+            if self.backend == BACKEND_NAIVE:
+                self._stream_barrier()
             comptime for r in range(Self.N):
                 allgather[ngpus=Self.N](
                     in_t, out_t, sigs, self.ctxs[r], my_rank=r
                 )
+            if self.backend == BACKEND_NAIVE:
+                self._stream_barrier()
         else:
             raise Error("all_gather_rows: MAX comm needs NVIDIA GPUs")
 
