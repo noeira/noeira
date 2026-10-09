@@ -32,6 +32,8 @@ from layout import TileTensor, row_major
 from comm import Signal, MAX_GPUS
 from comm.sync import enable_p2p, init_signal_buffer
 from comm.allreduce import allreduce
+from comm.reducescatter import reducescatter
+from comm.allgather import allgather
 
 from noeira.nn.constants import DT, TPB
 
@@ -50,6 +52,23 @@ def backend_name(b: Int) -> String:
     if b == BACKEND_P2P:
         return "p2p"
     return "naive"
+
+
+# ── shard partition ──────────────────────────────────────────────────────────
+
+
+def shard_rows(rows: Int, nranks: Int, r: Int) -> Tuple[Int, Int]:
+    """Rank r's `(first_row, n_rows)` when `rows` rows are split over `nranks`.
+
+    ⚠ This is MAX's `ReduceScatterConfig` partition (`rank_unit_start` /
+    `rank_units`), transcribed: rows split evenly, the first `rows % nranks`
+    ranks take one more. The MAX backend does not take a partition as input, it
+    COMPUTES this one, so the simulator and the sharded optimizer must use the
+    same formula or rank r's optimizer would update rows another rank reduced.
+    """
+    var part = rows // nranks
+    var rem = rows % nranks
+    return (r * part + min(r, rem), part + (1 if r < rem else 0))
 
 
 # ── local kernels (shared backend, and the scaled copy-back) ─────────────────
@@ -247,16 +266,7 @@ struct ProcessGroup[N: Int](Movable):
                     ),
                     row_major(n),
                 )
-            var sigs = Array[MutPointer[Signal, MutAnyOrigin], MAX_GPUS](
-                uninitialized=True
-            )
-            for k in range(Self.N):
-                sigs[k] = (
-                    self._sig_bufs[k]
-                    .unsafe_ptr()
-                    .unsafe_bitcast[Signal]()
-                    .as_unsafe_any_origin()
-                )
+            var sigs = self._rank_sigs()
             comptime for r in range(Self.N):
                 var out_t = TileTensor(
                     rebind[MutPointer[Scalar[DT], MutAnyOrigin]](
@@ -267,6 +277,152 @@ struct ProcessGroup[N: Int](Movable):
                 allreduce[ngpus=Self.N](in_t, out_t, sigs, self.ctxs[r])
         else:
             raise Error("allreduce_sum: MAX comm collectives need NVIDIA GPUs")
+
+    def reduce_scatter_sum(
+        mut self,
+        ins: List[DeviceBuffer[DT]],
+        outs: List[DeviceBuffer[DT]],
+        rows: Int,
+        unit: Int,
+    ) raises:
+        """`outs[r] = sum_k ins[k][rows of r]`, every rank.
+
+        The inputs are viewed as `[rows, unit]`; rank r receives its
+        `shard_rows(rows, N, r)` rows (`n_rows * unit` elements in `outs[r]`).
+        MAX's reduce-scatter has NO non-P2P path: on `BACKEND_NAIVE` this
+        raises, and the caller falls back to an allreduce."""
+        if Self.N == 1:
+            if rows > 0:
+                self.ctxs[0].enqueue_copy(
+                    outs[0].create_sub_buffer[DT](0, rows * unit),
+                    ins[0].create_sub_buffer[DT](0, rows * unit),
+                )
+            return
+        if self.backend == BACKEND_SHARED:
+            var c = self.ctxs[0]
+            for r in range(Self.N):
+                var sh = shard_rows(rows, Self.N, r)
+                var off = sh[0] * unit
+                var n = sh[1] * unit
+                if n == 0:
+                    continue
+                var acc = outs[r].create_sub_buffer[DT](0, n)
+                # Rank order 0..N-1, as `_allreduce_shared`: the shard of the
+                # sum is bit-identical to the same rows of the allreduce.
+                c.enqueue_copy(acc, ins[0].create_sub_buffer[DT](off, n))
+                for k in range(1, Self.N):
+                    _accum(acc, ins[k].create_sub_buffer[DT](off, n), n, c)
+            return
+        if self.backend != BACKEND_P2P:
+            raise Error(
+                "reduce_scatter_sum: MAX's reduce-scatter requires P2P access"
+            )
+        comptime if has_nvidia_gpu_accelerator() and Self.N >= 2:
+            comptime InT = TileTensor[
+                DT, type_of(row_major(0, 0)), ImmutAnyOrigin
+            ]
+            comptime OutT = TileTensor[
+                DT, type_of(row_major(0, 0)), MutAnyOrigin
+            ]
+            var in_t = Array[InT, Self.N](uninitialized=True)
+            var out_t = Array[OutT, Self.N](uninitialized=True)
+            for k in range(Self.N):
+                in_t[k] = TileTensor(
+                    rebind[ImmPointer[Scalar[DT], ImmutAnyOrigin]](
+                        ins[k].unsafe_ptr()
+                    ),
+                    row_major(rows, unit),
+                )
+                var sh = shard_rows(rows, Self.N, k)
+                out_t[k] = TileTensor(
+                    rebind[MutPointer[Scalar[DT], MutAnyOrigin]](
+                        outs[k].unsafe_ptr()
+                    ),
+                    row_major(sh[1], unit),
+                )
+            var sigs = self._rank_sigs()
+            comptime for r in range(Self.N):
+                reducescatter[ngpus=Self.N](
+                    in_t, out_t, sigs, self.ctxs[r], my_rank=r
+                )
+        else:
+            raise Error("reduce_scatter_sum: MAX comm needs NVIDIA GPUs")
+
+    def all_gather_rows(
+        mut self, bufs: List[DeviceBuffer[DT]], rows: Int, unit: Int
+    ) raises:
+        """In place over full-length buffers viewed as `[rows, unit]`: every
+        rank's own `shard_rows` rows are copied into the same rows of every
+        other rank's buffer.
+
+        On the MAX backend the outputs are sub-buffers of the destination
+        buffers themselves (`allgather` writes one output per source rank), so
+        nothing is staged. ⚠ The self slot (rank r's own shard into rank r)
+        aliases input and output: each element is read and rewritten with its
+        own value — M3 checks MAX tolerates that on the box."""
+        if Self.N == 1:
+            return
+        if self.backend == BACKEND_SHARED:
+            var c = self.ctxs[0]
+            for k in range(Self.N):
+                var sh = shard_rows(rows, Self.N, k)
+                var off = sh[0] * unit
+                var n = sh[1] * unit
+                if n == 0:
+                    continue
+                var src = bufs[k].create_sub_buffer[DT](off, n)
+                for r in range(Self.N):
+                    if r != k:
+                        c.enqueue_copy(
+                            bufs[r].create_sub_buffer[DT](off, n), src
+                        )
+            return
+        comptime if has_nvidia_gpu_accelerator() and Self.N >= 2:
+            comptime T1 = TileTensor[DT, type_of(row_major(0)), MutAnyOrigin]
+            comptime InT = TileTensor[
+                DT, type_of(row_major(0)), ImmutAnyOrigin
+            ]
+            var in_t = Array[InT, Self.N](uninitialized=True)
+            var out_t = Array[T1, Self.N * Self.N](uninitialized=True)
+            for k in range(Self.N):
+                var sh = shard_rows(rows, Self.N, k)
+                var off = sh[0] * unit
+                var n = sh[1] * unit
+                in_t[k] = TileTensor(
+                    rebind[ImmPointer[Scalar[DT], ImmutAnyOrigin]](
+                        bufs[k].unsafe_ptr().unsafe_offset(off)
+                    ),
+                    row_major(n),
+                )
+                for r in range(Self.N):
+                    out_t[r * Self.N + k] = TileTensor(
+                        rebind[MutPointer[Scalar[DT], MutAnyOrigin]](
+                            bufs[r].unsafe_ptr().unsafe_offset(off)
+                        ),
+                        row_major(n),
+                    )
+            var sigs = self._rank_sigs()
+            comptime for r in range(Self.N):
+                allgather[ngpus=Self.N](
+                    in_t, out_t, sigs, self.ctxs[r], my_rank=r
+                )
+        else:
+            raise Error("all_gather_rows: MAX comm needs NVIDIA GPUs")
+
+    def _rank_sigs(
+        mut self,
+    ) -> Array[MutPointer[Signal, MutAnyOrigin], MAX_GPUS]:
+        var sigs = Array[MutPointer[Signal, MutAnyOrigin], MAX_GPUS](
+            uninitialized=True
+        )
+        for k in range(len(self._sig_bufs)):
+            sigs[k] = (
+                self._sig_bufs[k]
+                .unsafe_ptr()
+                .unsafe_bitcast[Signal]()
+                .as_unsafe_any_origin()
+            )
+        return sigs^
 
     def broadcast(
         mut self, root: Int, bufs: List[DeviceBuffer[DT]], n: Int

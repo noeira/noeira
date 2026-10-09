@@ -167,6 +167,12 @@ struct DataParallel[M: Module, N: Int](Movable):
     def synchronize(self) raises:
         self.pg.synchronize()
 
+    def state_bytes_per_rank(self) -> Int:
+        """Bytes of weights + gradients + optimizer state per rank: val, grd,
+        the allreduce scratch `red`, Adam's m and v (no activations, no Signal
+        payload)."""
+        return 5 * self.total * 4
+
     def download_params(mut self, r: Int) raises -> List[Scalar[DT]]:
         """Rank r's whole parameter arena on the host (gaps included)."""
         var c = self.pg.ctx(r)
