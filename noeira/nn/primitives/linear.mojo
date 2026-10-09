@@ -23,7 +23,7 @@ the whole function, then builds views from that.
 """
 
 from noeira.nn.core.mm import mm, mm_bias, bmm
-from noeira.nn.core.cublas_gemm import cublas_gemm, CUBLAS_BWD, cublas_fwd, cublas_tf32
+from noeira.nn.core.cublas_gemm import cublas_gemm, cublas_gemm_lp, GEMM_PATH, CUBLAS_BWD, cublas_fwd, cublas_tf32
 from std.sys import has_nvidia_gpu_accelerator
 from std.sys import CompilationTarget
 from max.gpu import global_idx, thread_idx, block_idx
@@ -70,6 +70,24 @@ def _bias_add_kernel[
     var idx = Int(global_idx.x)
     if idx < Int(b_arg) * n_out:
         o[unsafe_offset=idx] += bias[unsafe_offset=idx % n_out]
+
+
+def _bias_add_f32b_kernel[
+    ADT: DType
+](
+    o: Pointer[Scalar[ADT], MutAnyOrigin],
+    bias: Pointer[Scalar[DT], MutAnyOrigin],
+    b_arg: Int64,
+    out_arg: Int64,
+):
+    """`o[b, j] += bias[j]` with a low-precision `o` and the fp32 master
+    bias, added in fp32 and rounded once (no per-forward bias cast)."""
+    var n_out = Int(out_arg)
+    var idx = Int(global_idx.x)
+    if idx < Int(b_arg) * n_out:
+        o[unsafe_offset=idx] = (
+            o[unsafe_offset=idx].cast[DT]() + bias[unsafe_offset=idx % n_out]
+        ).cast[ADT]()
 
 
 # Naive grad_w transpose (one thread/elem, strided read). Still used by
@@ -574,6 +592,17 @@ struct Linear[IN_: Int, OUT_: Int, ADT: DType = DT](Module):
     def _round_up(v: Int, to: Int) -> Int:
         return ((v + to - 1) // to) * to
 
+    # NVIDIA bf16-flow: the three GEMMs on `cublas_gemm_lp` (bf16 operands,
+    # fp32 accumulation). dW reads x transposed and adds straight into the
+    # fp32 master grad (beta = 1): no transposed copy of x, no dW temporary,
+    # no accumulate kernel. MAX's `mm` (the path before) stays for Apple and
+    # `NN_GEMM_PATH=max` / `linmax`.
+    comptime CUB_LP = (
+        has_nvidia_gpu_accelerator()
+        and GEMM_PATH != "max"
+        and GEMM_PATH != "linmax"
+    )
+
     # Activation-flow dtype (satisfies the Module trait). `Linear[IN, OUT]` =
     # fp32 (ACT_DT == DT, the legacy path); `Linear[IN, OUT, bfloat16]` flows
     # activations at bf16 (the AMP "Step B" memory win).
@@ -974,6 +1003,21 @@ struct Linear[IN_: Int, OUT_: Int, ADT: DType = DT](Module):
             # x (in0) is ALREADY bf16 — no input cast. W: cached bf16 (recast
             # only on a version bump). bias: cheap per-forward DT→bf16 cast.
             self._ensure_w_bf(c)
+            comptime if Self.CUB_LP:
+                # bias read at fp32 by the add: no bias cast.
+                cublas_gemm_lp[False, False, Self.ADT, Self.ADT](
+                    c, out.dev.value(), in0.dev.value(), self.w_bf.dev.value(),
+                    B, Self.OUT_, Self.IN_, 0.0,
+                )
+                c.enqueue_function[_bias_add_f32b_kernel[Self.ADT]](
+                    out.dev.value(),
+                    self.bias.val.dev.value(),
+                    Int64(B),
+                    Int64(Self.OUT_),
+                    grid_dim=(B * Self.OUT_ + 255) // 256,
+                    block_dim=256,
+                )
+                return
             self.b_a.ensure_gpu(c, Self.B_SIZE)
             c.enqueue_function[_cast_f2b_kernel](
                 self.bias.val.dev.value(),
@@ -1310,12 +1354,30 @@ struct Linear[IN_: Int, OUT_: Int, ADT: DType = DT](Module):
             comptime assert target == "gpu", "bf16-flow Linear is GPU-only"
             var c = ctx.value()
             gin.ensure_gpu(c, B * Self.IN_)
-            self.cacheT_bf.ensure_gpu(c, Self.IN_ * B)
-            self.dW_tmp.ensure_gpu(c, Self.W_SIZE)
             # grad_b += colsum(go): bf16 go → fp32 master grad (fp32 accumulator).
             var gol = grad_output.dev.value()
             var gbl = self.bias.grd.dev.value()
             enqueue_bias_grad[Self.ADT](c, gol, gbl, B, Self.OUT_, self.gb_part)
+            comptime if Self.CUB_LP:
+                # W: the forward's cast. No `_ensure_w_bf` here: under capture
+                # it recasts unconditionally, and no optimizer step runs
+                # between a forward and its vjp, so that cast is still valid.
+                # Eager, a version bump without a forward would leave it stale.
+                if self.weight.val.version != self._w_cast_version:
+                    self._ensure_w_bf(c)
+                # grad_w[IN, OUT] += xᵀ @ go, bf16 operands -> fp32 master grad.
+                cublas_gemm_lp[True, False, Self.ADT, DT](
+                    c, self.weight.grd.dev.value(), fin.dev.value(), gol,
+                    Self.IN_, Self.OUT_, B, 1.0,
+                )
+                # grad_x[B, IN] = go @ Wᵀ (bf16 out — gin flows at bf16).
+                cublas_gemm_lp[False, True, Self.ADT, Self.ADT](
+                    c, gin.dev.value(), gol, self.w_bf.dev.value(),
+                    B, Self.IN_, Self.OUT_, 0.0,
+                )
+                return
+            self.cacheT_bf.ensure_gpu(c, Self.IN_ * B)
+            self.dW_tmp.ensure_gpu(c, Self.W_SIZE)
             # grad_w += cacheᵀ @ go. `fin`/`go` are ALREADY bf16 (no cast).
             # Transpose the bf16 fwd-input directly → bf16 cacheT_bf, then a
             # bf16-in → FP32-out GEMM into the fp32 dW_tmp, then accumulate into

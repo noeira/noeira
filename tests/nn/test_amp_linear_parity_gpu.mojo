@@ -6,6 +6,12 @@ the bf16 path (cached weight forward + bf16 backward grad_w/grad_x) against the
 fp32 path on realistic, NON-cancelling random data, where bf16 should track fp32
 to a few percent.
 
+Each shape runs the backward TWICE without zero_grad: grad_w / grad_b must
+accumulate (on NVIDIA the bf16 dW GEMM adds straight into the fp32 master
+grad, beta = 1), and a halved grad_w control must fail the band. Shapes: the
+GPT's four per-layer GEMMs (rows = a slice of batch x seq), an odd-width
+head, an unaligned small layer, and the original 256 x 256.
+
 Run on NVIDIA:
   pixi run -e nvidia mojo run -I . tests/nn/test_amp_linear_parity_gpu.mojo
 (On Apple it will "FAIL" purely due to the known Metal bf16 linalg bug — expected.)
@@ -22,10 +28,6 @@ from noeira.nn.primitives.linear import Linear
 
 
 comptime BF16 = DType.bfloat16
-comptime IN = 256
-comptime OUT = 256
-comptime B = 64
-comptime W = IN * OUT
 comptime RELTOL = Scalar[DT](0.05)   # bf16 vs fp32, non-cancelling data
 
 
@@ -59,11 +61,8 @@ def _relerr(a: Tensor, b: Tensor, n: Int) -> Scalar[DT]:
     return md / mr
 
 
-def main() raises:
-    print("=" * 70)
-    print("AMP Linear bf16 vs fp32 numeric parity (Phase 1+2) —", IN, "x", OUT, "B", B)
-    print("=" * 70)
-    var c = DeviceContext()
+def check[IN: Int, OUT: Int, B: Int](name: String, c: DeviceContext) raises -> Bool:
+    comptime W = IN * OUT
     var amp = Linear[IN, OUT, BF16].make["gpu", Deterministic](Optional(c))
     var fp = Linear[IN, OUT].make["gpu", Deterministic](Optional(c))
 
@@ -93,7 +92,7 @@ def main() raises:
     ya.download(c); yf.download(c)
     var e_fwd = _relerr(_to_f32(ya, B * OUT), yf, B * OUT)
 
-    # ---- backward ----
+    # ---- backward, twice (grads accumulate) ----
     var go = Tensor.alloc(B * OUT)
     var gob = TensorImpl[BF16].alloc(B * OUT)
     for i in range(B * OUT):
@@ -104,19 +103,45 @@ def main() raises:
     var gif = Tensor.alloc(B * IN)
     amp.zero_grad["gpu"](Optional(c))
     fp.zero_grad["gpu"](Optional(c))
-    amp.vjp["gpu", B](
-        TensorRefs[1, ADT=BF16](xb), gob, TensorRefs[1, ADT=BF16](gia),
-        Optional(c),
-    )
-    fp.vjp["gpu", B](TensorRefs[1](x), go, TensorRefs[1](gif), Optional(c))
+    for _ in range(2):
+        amp.vjp["gpu", B](
+            TensorRefs[1, ADT=BF16](xb), gob, TensorRefs[1, ADT=BF16](gia),
+            Optional(c),
+        )
+        fp.vjp["gpu", B](TensorRefs[1](x), go, TensorRefs[1](gif), Optional(c))
     gia.download(c); gif.download(c)
     amp.weight.grd.download(c); fp.weight.grd.download(c)
+    amp.bias.grd.download(c); fp.bias.grd.download(c)
     var e_gx = _relerr(_to_f32(gia, B * IN), gif, B * IN)
     var e_gw = _relerr(amp.weight.grd, fp.weight.grd, W)
+    var e_gb = _relerr(amp.bias.grd, fp.bias.grd, OUT)
+    var half = Tensor.alloc(W)
+    for k in range(W):
+        half.data[k] = fp.weight.grd.data[k] * Scalar[DT](0.5)
+    var e_half = _relerr(half, fp.weight.grd, W)
 
-    print("  forward   rel.err =", e_fwd, "OK" if e_fwd < RELTOL else "FAIL")
-    print("  grad_x    rel.err =", e_gx, "OK" if e_gx < RELTOL else "FAIL")
-    print("  grad_w    rel.err =", e_gw, "OK" if e_gw < RELTOL else "FAIL")
-    var ok = e_fwd < RELTOL and e_gx < RELTOL and e_gw < RELTOL
+    var ok = (
+        e_fwd < RELTOL and e_gx < RELTOL and e_gw < RELTOL and e_gb < RELTOL
+        and e_half > 4 * RELTOL
+    )
+    print(
+        "  ", name, " [", IN, "->", OUT, "] B=", B, " | y ", e_fwd, " dx ", e_gx,
+        " dW ", e_gw, " dB ", e_gb, " (half-dW control ", e_half, ")",
+        "" if ok else " FAIL", sep="",
+    )
+    return ok
+
+
+def main() raises:
+    print("AMP Linear bf16 vs fp32 numeric parity — forward + two vjps, rel.err <", RELTOL)
+    var c = DeviceContext()
+    var ok = True
+    ok = check[256, 256, 64]("square", c) and ok
+    ok = check[384, 1152, 2048]("GPT qkv", c) and ok
+    ok = check[384, 384, 2048]("GPT attn proj", c) and ok
+    ok = check[384, 1536, 2048]("GPT fc1", c) and ok
+    ok = check[1536, 384, 2048]("GPT fc2", c) and ok
+    ok = check[384, 65, 512]("odd head", c) and ok
+    ok = check[100, 64, 96]("unaligned", c) and ok
     assert_true(ok, "AMP Linear bf16 vs fp32 parity")
     print("ALL PASSED")

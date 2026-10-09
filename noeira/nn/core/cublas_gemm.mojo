@@ -169,8 +169,45 @@ def cublas_gemm[
     out = op(a)·op(b) is outᵀ = op(b)ᵀ·op(a)ᵀ: cuBLAS gets (b, a) with the
     same transpose flags, dims (N, M, K) and the operands' own row strides as
     leading dimensions — MAX's own `c_row_major` mapping."""
-    comptime assert has_nvidia_gpu_accelerator(), "cuBLAS is NVIDIA-only"
     comptime assert DT == DType.float32, "cublas_gemm: fp32 only"
+    _gemm_ex[TA, TB, DT, DT, TF32](c, dst, a, b, M, N, K, beta)
+
+
+def cublas_gemm_lp[
+    TA: Bool, TB: Bool, IN_DT: DType, OUT_DT: DType
+](
+    c: DeviceContext,
+    dst: DeviceBuffer[OUT_DT],
+    a: DeviceBuffer[IN_DT],
+    b: DeviceBuffer[IN_DT],
+    M: Int,
+    N: Int,
+    K: Int,
+    beta: Float32,
+) raises:
+    """`cublas_gemm` with low-precision operands, for the bf16-flow `Linear`:
+    `a` and `b` are `IN_DT` (bf16), `dst` is `OUT_DT` — bf16 for an
+    activation (y, dx), fp32 for the master weight gradient, accumulated in
+    place with `beta = 1`. Accumulation is fp32 (`COMPUTE_32F`) either way;
+    bf16 operands run on the tensor cores without a TF32 mode."""
+    _gemm_ex[TA, TB, IN_DT, OUT_DT, False](c, dst, a, b, M, N, K, beta)
+
+
+def _gemm_ex[
+    TA: Bool, TB: Bool, IN_DT: DType, OUT_DT: DType, TF32: Bool
+](
+    c: DeviceContext,
+    dst: DeviceBuffer[OUT_DT],
+    a: DeviceBuffer[IN_DT],
+    b: DeviceBuffer[IN_DT],
+    M: Int,
+    N: Int,
+    K: Int,
+    beta: Float32,
+) raises:
+    """The one `cublasGemmEx` call behind `cublas_gemm` / `cublas_gemm_lp`
+    (row-major mapping in `cublas_gemm`'s docstring)."""
+    comptime assert has_nvidia_gpu_accelerator(), "cuBLAS is NVIDIA-only"
     var ws = _shared_workspace(c)
     var handle = _get_global_handle[DT, Backend.CUBLAS](c)._get_cublas()
     check_cublas_error(
@@ -199,20 +236,20 @@ def cublas_gemm[
             .as_imm()
             .as_unsafe_any_origin(),
             _ffi_void_ptr(b.unsafe_ptr()),
-            _convert_to_cublas_datatype[DT](),
+            _convert_to_cublas_datatype[IN_DT](),
             Int32(ldb),
             _ffi_void_ptr(a.unsafe_ptr()),
-            _convert_to_cublas_datatype[DT](),
+            _convert_to_cublas_datatype[IN_DT](),
             Int32(lda),
             UnsafePointer(to=beta_v)
             .bitcast[NoneType]()
             .as_imm()
             .as_unsafe_any_origin(),
             _ffi_void_ptr(dst.unsafe_ptr()),
-            _convert_to_cublas_datatype[DT](),
+            _convert_to_cublas_datatype[OUT_DT](),
             Int32(N),
             ComputeType.COMPUTE_32F_FAST_TF32 if TF32 else ComputeType.COMPUTE_32F,
             Algorithm.DEFAULT,
         ),
-        msg=String("cublas_gemm: [", M, "x", N, "] K=", K, " TA=", TA, " TB=", TB),
+        msg=String("cublas_gemm: [", M, "x", N, "] K=", K, " TA=", TA, " TB=", TB, " ", IN_DT, "->", OUT_DT),
     )
