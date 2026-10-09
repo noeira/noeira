@@ -23,6 +23,7 @@ the whole function, then builds views from that.
 """
 
 from noeira.nn.core.mm import mm, mm_bias, bmm
+from noeira.nn.core.cublaslt_gemm import cublaslt_gemm, EPI_BIAS
 from noeira.nn.core.cublas_gemm import cublas_gemm, cublas_gemm_lp, GEMM_PATH, CUBLAS_BWD, cublas_fwd, cublas_tf32
 from std.sys import has_nvidia_gpu_accelerator
 from std.sys import CompilationTarget
@@ -70,24 +71,6 @@ def _bias_add_kernel[
     var idx = Int(global_idx.x)
     if idx < Int(b_arg) * n_out:
         o[unsafe_offset=idx] += bias[unsafe_offset=idx % n_out]
-
-
-def _bias_add_f32b_kernel[
-    ADT: DType
-](
-    o: Pointer[Scalar[ADT], MutAnyOrigin],
-    bias: Pointer[Scalar[DT], MutAnyOrigin],
-    b_arg: Int64,
-    out_arg: Int64,
-):
-    """`o[b, j] += bias[j]` with a low-precision `o` and the fp32 master
-    bias, added in fp32 and rounded once (no per-forward bias cast)."""
-    var n_out = Int(out_arg)
-    var idx = Int(global_idx.x)
-    if idx < Int(b_arg) * n_out:
-        o[unsafe_offset=idx] = (
-            o[unsafe_offset=idx].cast[DT]() + bias[unsafe_offset=idx % n_out]
-        ).cast[ADT]()
 
 
 # Naive grad_w transpose (one thread/elem, strided read). Still used by
@@ -1004,18 +987,21 @@ struct Linear[IN_: Int, OUT_: Int, ADT: DType = DT](Module):
             # only on a version bump). bias: cheap per-forward DT→bf16 cast.
             self._ensure_w_bf(c)
             comptime if Self.CUB_LP:
-                # bias read at fp32 by the add: no bias cast.
-                cublas_gemm_lp[False, False, Self.ADT, Self.ADT](
-                    c, out.dev.value(), in0.dev.value(), self.w_bf.dev.value(),
-                    B, Self.OUT_, Self.IN_, 0.0,
-                )
-                c.enqueue_function[_bias_add_f32b_kernel[Self.ADT]](
-                    out.dev.value(),
+                # One cuBLASLt GEMM with the bias added in its epilogue (no
+                # separate pass over [B, OUT]). The bias must be bf16 for a
+                # bf16 output: the OUT-element cast below (`b_a`).
+                self.b_a.ensure_gpu(c, Self.B_SIZE)
+                c.enqueue_function[_cast_f2b_kernel](
                     self.bias.val.dev.value(),
-                    Int64(B),
-                    Int64(Self.OUT_),
-                    grid_dim=(B * Self.OUT_ + 255) // 256,
+                    self.b_a.dev.value(),
+                    Int64(Self.B_SIZE),
+                    grid_dim=(Self.B_SIZE + 255) // 256,
                     block_dim=256,
+                )
+                cublaslt_gemm[False, False, Self.ADT, Self.ADT](
+                    c, out.dev.value(), in0.dev.value(), self.w_bf.dev.value(),
+                    B, Self.OUT_, Self.IN_, EPI_BIAS,
+                    bias=Int(self.b_a.dev.value().unsafe_ptr()),
                 )
                 return
             self.b_a.ensure_gpu(c, Self.B_SIZE)

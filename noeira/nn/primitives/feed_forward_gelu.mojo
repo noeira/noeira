@@ -43,8 +43,9 @@ from ..core.initializer import Initializer
 from ..core.amp import AMPPolicy, NoAMP
 from ..core.param import ParamVisitor
 from ..core.walkers import join_name
-from ..core.cublas_gemm import cublas_gemm, cublas_tf32
-from .linear import Linear, enqueue_bias_grad
+from ..core.cublas_gemm import cublas_gemm, cublas_tf32, cublas_gemm_lp
+from ..core.cublaslt_gemm import cublaslt_gemm, EPI_GELU_AUX_BIAS, EPI_DGELU
+from .linear import Linear, enqueue_bias_grad, _cast_f2b_kernel
 from .activations import GELUTanh
 from .ops.gelu_tanh_op import GELUTanhOp
 from max.gpu.host import DeviceBuffer
@@ -100,6 +101,12 @@ struct FeedForwardGELU[S: Int, D: Int, FF: Int, ADT: DType = DT](Module):
     comptime OUT_DIM = Self.S * Self.D
     # The fused path: NVIDIA, fp32 activations.
     comptime FUSED = has_nvidia_gpu_accelerator() and Self.ADT == DT
+    # The bf16 fused path: NVIDIA bf16 activations, where cuBLASLt's GELU
+    # epilogues run inside the GEMM (`cublaslt_gemm.mojo`): fc1 + bias + GELU
+    # in one GEMM that also stores z, and dz = (go·W2ᵀ) ⊙ GELU'(z) in one.
+    comptime LT_FUSED = (
+        Self.ADT == DType.bfloat16 and Linear[Self.D, Self.FF, Self.ADT].CUB_LP
+    )
 
     var fc1: Linear[Self.D, Self.FF, Self.ADT]
     var act: GELUTanh[Self.FF, Self.ADT]
@@ -148,6 +155,28 @@ struct FeedForwardGELU[S: Int, D: Int, FF: Int, ADT: DType = DT](Module):
                 rebind[Tensor](x).dev.value(),
                 self.fc1.weight.val.dev.value(), self.fc1.bias.val.dev.value(),
                 c,
+            )
+        elif target == "gpu" and Self.LT_FUSED:
+            ref x = inputs[0]
+            var c = ctx.value()
+            self.z.ensure_gpu(c, R * Self.FF)
+            self.h.ensure_gpu(c, R * Self.FF)
+            self.fc1._ensure_w_bf(c)
+            self.fc1.b_a.ensure_gpu(c, Self.FF)
+            c.enqueue_function[_cast_f2b_kernel](
+                self.fc1.bias.val.dev.value(),
+                self.fc1.b_a.dev.value(),
+                Int64(Self.FF),
+                grid_dim=(Self.FF + 255) // 256,
+                block_dim=256,
+            )
+            # h = GELU(x·W1 + b1), z = x·W1 + b1 (the epilogue's aux output).
+            cublaslt_gemm[False, False, Self.ADT, Self.ADT](
+                c, self.h.dev.value(), x.dev.value(), self.fc1.w_bf.dev.value(),
+                R, Self.FF, Self.D, EPI_GELU_AUX_BIAS,
+                bias=Int(self.fc1.b_a.dev.value().unsafe_ptr()),
+                aux=Int(self.z.dev.value().unsafe_ptr()),
+                aux_ld=Self.FF,
             )
         else:
             self.fc1.forward[target, R, POLICY=POLICY](inputs, self.z, ctx)
@@ -209,6 +238,33 @@ struct FeedForwardGELU[S: Int, D: Int, FF: Int, ADT: DType = DT](Module):
             cublas_gemm[False, True, cublas_tf32(R, Self.D, Self.FF)](
                 c, gin.dev.value(), dz.dev.value(),
                 self.fc1.weight.val.dev.value(), R, Self.D, Self.FF, 0.0,
+            )
+        elif target == "gpu" and Self.LT_FUSED:
+            var c = ctx.value()
+            self.gz.ensure_gpu(c, R * Self.FF)
+            var gol = grad_output.dev.value()
+            # fc2: db2 += Σ go, dW2 += hᵀ·go (fp32 master grads).
+            enqueue_bias_grad[Self.ADT](
+                c, gol, self.fc2.bias.grd.dev.value(), R, Self.D,
+                self.fc2.gb_part,
+            )
+            cublas_gemm_lp[True, False, Self.ADT, DT](
+                c, self.fc2.weight.grd.dev.value(), self.h.dev.value(), gol,
+                Self.FF, Self.D, R, 1.0,
+            )
+            # dz = (go·W2ᵀ) ⊙ GELU'(z): one GEMM, GELU' in its epilogue. W2:
+            # the forward's cast (see `Linear.vjp`).
+            if self.fc2.weight.val.version != self.fc2._w_cast_version:
+                self.fc2._ensure_w_bf(c)
+            cublaslt_gemm[False, True, Self.ADT, Self.ADT](
+                c, self.gz.dev.value(), gol, self.fc2.w_bf.dev.value(),
+                R, Self.FF, Self.D, EPI_DGELU,
+                aux=Int(self.z.dev.value().unsafe_ptr()),
+                aux_ld=Self.FF,
+            )
+            # fc1: db1, dW1, dx — the plain bf16 Linear backward.
+            self.fc1.vjp[target, R, POLICY=POLICY](
+                forward_input, self.gz, grad_inputs, ctx
             )
         else:
             self.fc2.vjp[target, R, POLICY=POLICY](
