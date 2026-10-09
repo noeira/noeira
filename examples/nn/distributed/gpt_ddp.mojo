@@ -47,7 +47,11 @@ from noeira.nn.core.initializer import Normal
 from noeira.nn.core.ptr import mptr
 from noeira.nn.datasets import CharTokenizer, load_text, train_val_split
 from noeira.nn.loss.sequence_cross_entropy import SequenceCrossEntropyLoss
-from noeira.nn.models.gpt import GPTDropTied, gpt_scale_residual_proj, gpt_wire_tie
+from noeira.nn.distributed.gpt_marked import (
+    GPTMarked,
+    gpt_marked_scale_residual_proj,
+    gpt_marked_wire_tie,
+)
 from noeira.nn.training.window_batch_kernels import advance_step_kernel
 from noeira.nn.distributed.process_group import ProcessGroup, backend_name
 from noeira.nn.distributed.data_parallel import DataParallel
@@ -68,6 +72,10 @@ comptime GRAPH_SPLIT = 2
 comptime GRAPH = get_defined_int["GRAPH", GRAPH_EAGER]()
 comptime NO_COMM = is_defined["NO_COMM"]()
 comptime NGPUS = get_defined_int["NGPUS", 2]()
+comptime OVERLAP = is_defined["OVERLAP"]()
+"""DDP reduces gradient buckets on a second stream per GPU while the backward
+runs (`DataParallel.enable_overlap`), one mark per transformer block."""
+comptime BUCKET_MB = get_defined_int["BUCKET_MB", 8]()
 
 comptime VOCAB = 65
 comptime SEQ = 256 if FULL else 64
@@ -91,9 +99,12 @@ comptime CLIP: Scalar[DT] = 0.0 if is_defined["NO_CLIP"]() else 1.0  # 0 = no cl
 comptime DROPOUT_P: Float64 = 0.0 if (GATE or ZERO_GATE) else 0.2
 comptime SEED_BASE = UInt64(0xC0FFEE)
 comptime USE_MAX_ATTN = True
-comptime NET = GPTDropTied[
+# The GPT with a gradient mark after each block, compiled in only with
+# OVERLAP (`GPTMarked[..., ACTIVE=False]` trains bit-identically to
+# `GPTDropTied`: tests/nn/distributed/test_gpt_marked.mojo).
+comptime NET = GPTMarked[
     VOCAB, SEQ, EMBED, HEADS, LAYERS, FF_MULT, True, DROPOUT_P, SEED_BASE,
-    USE_MAX_ATTN,
+    USE_MAX_ATTN, OVERLAP,
 ]
 comptime ROW = SEQ * VOCAB
 comptime LOSS = SequenceCrossEntropyLoss[SEQ, VOCAB]
@@ -196,13 +207,13 @@ def _rank_step[BL: Int](
 
 def _surgery(mut net: NET, c: DeviceContext) raises:
     """nanoGPT's scaled residual init + the tied head, on one replica."""
-    gpt_scale_residual_proj[
+    gpt_marked_scale_residual_proj[
         "gpu", VOCAB, SEQ, EMBED, HEADS, LAYERS, FF_MULT, True, DROPOUT_P,
-        SEED_BASE, USE_MAX_ATTN,
+        SEED_BASE, USE_MAX_ATTN, OVERLAP,
     ](net, Optional(c))
-    gpt_wire_tie[
-        "gpu", VOCAB, SEQ, EMBED, HEADS, LAYERS, FF_MULT, True, DROPOUT_P,
-        SEED_BASE, USE_MAX_ATTN,
+    gpt_marked_wire_tie[
+        VOCAB, SEQ, EMBED, HEADS, LAYERS, FF_MULT, True, DROPOUT_P,
+        SEED_BASE, USE_MAX_ATTN, OVERLAP,
     ](net)
 
 
@@ -225,6 +236,10 @@ trait _Job(Movable & Deinitable):
         ...
 
     def graph_ctxs(self) -> List[DeviceContext]:
+        ...
+
+    def describe(self) -> String:
+        """Extra line for the report (the bucket plan), or empty."""
         ...
 
     def capturable_collectives(self) -> Bool:
@@ -286,6 +301,9 @@ struct _DdpJob[N: Int, BL: Int, SIM: Bool = False](_Job):
                 # step, so the rebuild kernel is in the graph, not skipped by a
                 # host-side version check frozen at capture time.
                 self.dp.nets[r].set_attr["capture_recast"](Scalar[DT](1.0))
+        comptime if OVERLAP:
+            # MB -> fp32 elements; 0 = one bucket per mark (no merging)
+            self.dp.enable_overlap(max(1, BUCKET_MB << 18))
         self.dp.synchronize()
         self.dp.sync_params()
         self.ranks = _make_ranks[Self.N, Self.BL](self.dp.pg.ctxs, ids, seed_word)
@@ -293,11 +311,22 @@ struct _DdpJob[N: Int, BL: Int, SIM: Bool = False](_Job):
 
     def compute(mut self) raises:
         self.dp.zero_grad()
+        self.dp.begin_backward()
         for r in range(Self.N):
             _rank_step[Self.BL](self.dp.nets[r], self.dp.ctx(r), self.ranks[r], r)
 
     def comm(mut self) raises:
-        self.dp.allreduce_grads()
+        # With overlap: every bucket on the comm streams, each waiting for
+        # its mark (recorded during `compute`), then the join and the 1/N.
+        self.dp.reduce_grads()
+
+    def describe(self) -> String:
+        comptime if OVERLAP:
+            if self.dp.n_marks < 0:  # N = 1: nothing to reduce, no plan
+                return String("")
+            return self.dp.bucket_summary()
+        else:
+            return String("")
 
     def update(mut self) raises:
         self.dp.clip_grads_device(CLIP)
@@ -368,6 +397,9 @@ struct _ZeroJob[N: Int, BL: Int](_Job):
     def graph_ctxs(self) -> List[DeviceContext]:
         return self.z.pg.graph_ctxs()
 
+    def describe(self) -> String:
+        return String("")
+
     def capturable_collectives(self) -> Bool:
         return self.z.pg.capturable_collectives()
 
@@ -389,6 +421,14 @@ struct _ZeroJob[N: Int, BL: Int](_Job):
 
 def _graph_mode[J: _Job](job: J) raises -> Int:
     """The capture mode this backend allows for the requested one."""
+    comptime if OVERLAP and GRAPH != GRAPH_EAGER:
+        # The overlapped collective lives INSIDE the backward's timeline, so
+        # it is captured with the step or the step runs eagerly.
+        if job.capturable_collectives():
+            return GRAPH_WHOLE
+        print("  [graph] OVERLAP: this backend's collectives cannot be"
+              " captured, so the step runs eager")
+        return GRAPH_EAGER
     comptime if GRAPH == GRAPH_WHOLE:
         if job.capturable_collectives():
             return GRAPH_WHOLE
@@ -449,6 +489,9 @@ def _run[J: _Job, N: Int](
             res.losses.append(job.losses(True))
     job.synchronize()
     res.ms_per_step = Float64(perf_counter_ns() - t0) / 1e6 / Float64(max(steps, 1))
+    var d = job.describe()
+    if d.byte_length() > 0:
+        print("  [overlap]", d)
     comptime if not PER_STEP_LOSS:
         res.losses.append(job.losses(False))
     if keep_params:
@@ -491,6 +534,10 @@ def main() raises:
         + " seq=" + String(SEQ) + " N=" + String(NGPUS)
         + (" devices" if USE_DEVICES else " shared-context simulator")
         + " GRAPH=" + String(GRAPH) + (" NO_COMM" if NO_COMM else "")
+        + (" OVERLAP buckets<=" + String(BUCKET_MB) + "MB" if OVERLAP else "")
+    )
+    comptime assert not (OVERLAP and (ZERO1 or ZERO_GATE)), (
+        "OVERLAP buckets DDP's allreduce only, not ZeRO-1's reduce-scatter"
     )
 
     comptime if GATE:

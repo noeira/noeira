@@ -27,17 +27,59 @@ back into `grd` scaled by 1/N in one kernel, because MAX's 1-stage allreduce
 writes its output while peers still read its input (no in-place). That costs
 one arena of memory per GPU and one elementwise pass; M0 measures whether the
 2-stage path (the one large arenas take) can run in place.
+
+Overlap (`enable_overlap`): instead of one allreduce after the backward,
+buckets of the arena are reduced on a second stream per GPU while the backward
+still runs. The model marks where its gradients are final by wrapping modules
+in `GradReady[..., ACTIVE=True]` (`grad_marks.mojo`). The step becomes
+
+        dp.zero_grad()
+        dp.begin_backward()
+        for r in range(N): forward + loss + vjp, rank by rank
+        dp.reduce_grads()      # buckets on the comm streams, joined, then 1/N
+        ...
+
+`reduce_grads` without overlap is `allreduce_grads`.
 """
 
+from std.sys import size_of
 from max.gpu.host import DeviceBuffer, DeviceContext
 
 from noeira.nn.constants import DT
 from noeira.nn.core.tensor import Tensor
 from noeira.nn.core.module import Module
 from noeira.nn.core.initializer import Initializer
+from noeira.nn.core.param import ParamVisitor
 from noeira.nn.optimizer.adam import Adam
 
-from .process_group import ProcessGroup, scale_copy
+from .process_group import ProcessGroup, scale_copy, BACKEND_P2P
+from .grad_marks import grad_marks, GradSpan
+from .buckets import Bucket, plan_buckets
+
+
+struct _ParamSlices(ParamVisitor):
+    """Every parameter's gradient address and length, in walk order."""
+
+    var addr: List[Int]
+    var n: List[Int]
+
+    def __init__(out self):
+        self.addr = List[Int]()
+        self.n = List[Int]()
+
+    def visit[target: StaticString, N: Int](
+        mut self,
+        name: String,
+        mut param: Tensor,
+        mut grad: Tensor,
+        mut m: Tensor,
+        mut v: Tensor,
+        apply_decay: Bool,
+        ctx: Optional[DeviceContext],
+    ) raises:
+        if grad.dev:
+            self.addr.append(Int(grad.dev.value().unsafe_ptr()))
+            self.n.append(N)
 
 
 struct DataParallel[M: Module, N: Int](Movable):
@@ -48,6 +90,12 @@ struct DataParallel[M: Module, N: Int](Movable):
     """Per-rank allreduce output, arena-sized."""
     var total: Int
     """Arena length in elements (identical on every rank)."""
+    var overlap: Bool
+    var bucket_elems: Int
+    var buckets: List[Bucket]
+    """Planned on the first overlapped step, from rank 0's marks."""
+    var n_marks: Int
+    """Marks per rank per backward; -1 until planned."""
 
     def __init__(
         out self,
@@ -62,6 +110,10 @@ struct DataParallel[M: Module, N: Int](Movable):
         self.opts = opts^
         self.red = red^
         self.total = total
+        self.overlap = False
+        self.bucket_elems = 0
+        self.buckets = List[Bucket]()
+        self.n_marks = -1
 
     @staticmethod
     def make[
@@ -131,6 +183,134 @@ struct DataParallel[M: Module, N: Int](Movable):
         var inv_n = Scalar[DT](1.0) / Scalar[DT](Self.N)
         for r in range(Self.N):
             scale_copy(ins[r], outs[r], inv_n, self.total, self.pg.ctx(r))
+
+    # ── overlap ─────────────────────────────────────────────────────────────
+
+    def enable_overlap(mut self, bucket_elems: Int) raises:
+        """Reduce gradient buckets of up to `bucket_elems` elements on a
+        second stream per GPU, each as soon as the backward has finished it.
+        Needs the model to mark its gradients (`GradReady[..., True]`)."""
+        self.pg.enable_comm_streams()
+        _ = grad_marks()
+        self.overlap = True
+        self.bucket_elems = bucket_elems
+
+    def begin_backward(mut self) raises:
+        """Call before the first rank's vjp of a step (no-op without overlap)."""
+        if self.overlap and Self.N > 1:
+            grad_marks()[].begin()
+
+    def reduce_grads(mut self) raises:
+        """Call once every rank's vjp is enqueued: `grd_r` becomes the mean
+        over ranks, as `allreduce_grads`, with the buckets overlapped."""
+        if not self.overlap or Self.N == 1:
+            self.allreduce_grads()
+            return
+        var reg = grad_marks()
+        reg[].end()
+        var count = len(reg[].marks)
+        if self.n_marks < 0:
+            self._plan(count)
+        elif count != Self.N * self.n_marks:
+            raise Error(
+                "DataParallel.reduce_grads: " + String(count)
+                + " marks this step, planned for " + String(Self.N * self.n_marks)
+            )
+        var k_end = self.n_marks
+        # On P2P the kernels synchronize the ranks themselves, so each comm
+        # stream waits only for its own rank. The naive and shared backends
+        # read peers' buffers with no ordering of their own: wait for all.
+        var all_ranks = self.pg.backend != BACKEND_P2P
+        for b in range(len(self.buckets)):
+            ref bk = self.buckets[b]
+            for r in range(Self.N):
+                var cc = self.pg.comm_ctx(r)
+                for k in range(Self.N):
+                    if not all_ranks and k != r:
+                        continue
+                    var slot = -1
+                    if bk.ready < k_end:
+                        slot = reg[].marks[k * k_end + bk.ready].slot
+                    if slot >= 0:
+                        cc.stream().enqueue_wait_for(reg[].event(slot))
+                    else:
+                        cc.enqueue_wait_for(self.pg.ctx(k))
+            var ins = List[DeviceBuffer[DT]](capacity=Self.N)
+            var outs = List[DeviceBuffer[DT]](capacity=Self.N)
+            for r in range(Self.N):
+                ins.append(
+                    self.opts[r].arena.grd.dev.value().create_sub_buffer[DT](
+                        bk.off, bk.n
+                    )
+                )
+                outs.append(
+                    self.red[r].dev.value().create_sub_buffer[DT](bk.off, bk.n)
+                )
+            self.pg.allreduce_sum_comm(ins, outs, bk.n)
+        # Join: no main stream touches grd or red before every comm stream
+        # that reads them is done.
+        for r in range(Self.N):
+            for k in range(Self.N):
+                if not all_ranks and k != r:
+                    continue
+                self.pg.ctx(r).enqueue_wait_for(self.pg.comm_ctx(k))
+        var inv_n = Scalar[DT](1.0) / Scalar[DT](Self.N)
+        for r in range(Self.N):
+            scale_copy(
+                self.opts[r].arena.grd.dev.value(),
+                self.red[r].dev.value(),
+                inv_n,
+                self.total,
+                self.pg.ctx(r),
+            )
+
+    def _plan(mut self, count: Int) raises:
+        """Bucket plan from rank 0's marks; checks every rank marked the same
+        arena slices."""
+        if count == 0 or count % Self.N != 0:
+            raise Error(
+                "DataParallel overlap: " + String(count) + " marks for "
+                + String(Self.N) + " ranks (wrap modules in GradReady[..., True])"
+            )
+        var k_end = count // Self.N
+        var reg = grad_marks()
+        comptime ES = size_of[Scalar[DT]]()
+        var base0 = Int(self.opts[0].arena.grd.dev.value().unsafe_ptr())
+        var lo = List[Int](capacity=k_end)
+        var hi = List[Int](capacity=k_end)
+        for i in range(k_end):
+            lo.append((reg[].marks[i].lo - base0) // ES)
+            hi.append((reg[].marks[i].hi - base0) // ES)
+        for r in range(1, Self.N):
+            var base = Int(self.opts[r].arena.grd.dev.value().unsafe_ptr())
+            for i in range(k_end):
+                ref m = reg[].marks[r * k_end + i]
+                if (m.lo - base) // ES != lo[i] or (m.hi - base) // ES != hi[i]:
+                    raise Error(
+                        "DataParallel overlap: rank " + String(r) + " mark "
+                        + String(i) + " covers another arena slice than rank 0's"
+                    )
+        var sl = _ParamSlices()
+        self.nets[0].for_each_param["gpu"](sl, Optional(self.pg.ctx(0)))
+        var starts = List[Int](capacity=len(sl.addr))
+        var sizes = List[Int](capacity=len(sl.addr))
+        for i in range(len(sl.addr)):
+            starts.append((sl.addr[i] - base0) // ES)
+            sizes.append(sl.n[i])
+        self.buckets = plan_buckets(
+            starts, sizes, self.total, lo, hi, self.bucket_elems
+        )
+        self.n_marks = k_end
+
+    def bucket_summary(self) -> String:
+        """`n buckets: [off+n @ready] ...` (after the first overlapped step)."""
+        var s = String(len(self.buckets), " buckets of <= ", self.bucket_elems,
+                       " elems, ", self.n_marks, " marks/rank:")
+        for b in range(len(self.buckets)):
+            ref bk = self.buckets[b]
+            s += String(" [", bk.off, "+", bk.n, " @",
+                        "end" if bk.ready == self.n_marks else String(bk.ready), "]")
+        return s
 
     def clip_grads(mut self, max_norm: Scalar[DT]) raises -> Scalar[DT]:
         """Global grad-norm clip on every rank; returns rank 0's pre-clip norm.

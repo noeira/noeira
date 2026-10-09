@@ -27,6 +27,7 @@ from std.collections import Array
 
 from max.gpu import global_idx
 from max.gpu.host import DeviceBuffer, DeviceContext
+from max.gpu.host._nvidia_cuda import CUDA
 
 from layout import TileTensor, row_major
 from comm import Signal, MAX_GPUS
@@ -122,6 +123,20 @@ def _accum(
     )
 
 
+def view_on(
+    c: DeviceContext, buf: DeviceBuffer[DT], n: Int
+) raises -> DeviceBuffer[DT]:
+    """A non-owning view of `buf`'s first `n` elements, bound to `c` (same
+    device). How MAX's own naive allreduce hands one context's buffers to
+    another (`_allreduce_naive_single`)."""
+    return DeviceBuffer[DT](
+        c,
+        rebind[MutPointer[Scalar[DT], MutAnyOrigin]](buf.unsafe_ptr()),
+        n,
+        owning=False,
+    )
+
+
 # ── the group ────────────────────────────────────────────────────────────────
 
 
@@ -132,6 +147,11 @@ struct ProcessGroup[N: Int](Movable):
     var max_elems: Int
     """Largest collective (in fp32 elements) the Signal payloads are sized for."""
     var _sig_bufs: List[DeviceBuffer[DType.uint8]]
+    var comm_ctxs: List[DeviceContext]
+    """A SECOND context per rank, on the same GPU, for collectives that
+    overlap the backward (`enable_comm_streams`). Empty until enabled. A
+    `DeviceContext` is one stream, so a second context on a device is a
+    second stream there; MAX's collectives take a context, not a stream."""
 
     def __init__(
         out self,
@@ -144,6 +164,7 @@ struct ProcessGroup[N: Int](Movable):
         self.backend = backend
         self.max_elems = max_elems
         self._sig_bufs = sig_bufs^
+        self.comm_ctxs = List[DeviceContext]()
 
     @staticmethod
     def shared(ctx: DeviceContext) -> Self:
@@ -196,9 +217,43 @@ struct ProcessGroup[N: Int](Movable):
         return self.ctxs[r]
 
     def synchronize(self) raises:
-        """Wait for every rank's stream."""
+        """Wait for every rank's stream (and its comm stream, if any)."""
         for r in range(Self.N):
             self.ctxs[r].synchronize()
+        for r in range(len(self.comm_ctxs)):
+            self.comm_ctxs[r].synchronize()
+
+    def enable_comm_streams(mut self) raises:
+        """Create one comm context per rank on the rank's GPU (idempotent).
+
+        Shared backend: ONE extra context, shared by every rank like the main
+        one. On NVIDIA, prints a warning if MAX hands back the main stream
+        (then nothing overlaps, but every result is unchanged)."""
+        if len(self.comm_ctxs) > 0:
+            return
+        if self.backend == BACKEND_SHARED:
+            var c = DeviceContext(device_id=Int(self.ctxs[0].id()))
+            for _ in range(Self.N):
+                self.comm_ctxs.append(c)
+        else:
+            for r in range(Self.N):
+                self.comm_ctxs.append(DeviceContext(device_id=r))
+        comptime if has_nvidia_gpu_accelerator():
+            var a = CUDA(self.ctxs[0].stream())
+            var b = CUDA(self.comm_ctxs[0].stream())
+            var pa = Int(a.value()) if a else 0
+            var pb = Int(b.value()) if b else 0
+            if pa == pb:
+                print(
+                    "[ProcessGroup] WARNING: the comm context runs on the"
+                    " main stream; collectives will not overlap compute"
+                )
+
+    def comm_ctx(self, r: Int) -> DeviceContext:
+        return self.comm_ctxs[r]
+
+    def has_comm_streams(self) -> Bool:
+        return len(self.comm_ctxs) > 0
 
     def graph_ctxs(self) -> List[DeviceContext]:
         """The distinct contexts, one graph each (`RankGraphs`): every rank's
@@ -257,8 +312,48 @@ struct ProcessGroup[N: Int](Movable):
                 )
             return
         if self.backend == BACKEND_SHARED:
-            self._allreduce_shared(ins, outs, n)
+            var c = self.ctxs[0]
+            self._allreduce_shared(ins, outs, n, c)
             return
+        self._check_payload(n)
+        if self.backend == BACKEND_NAIVE:
+            self._stream_barrier()
+        self._allreduce_comm[False](ins, outs, n)
+        if self.backend == BACKEND_NAIVE:
+            self._stream_barrier()
+
+    def allreduce_sum_comm(
+        mut self,
+        ins: List[DeviceBuffer[DT]],
+        outs: List[DeviceBuffer[DT]],
+        n: Int,
+    ) raises:
+        """`allreduce_sum` enqueued on the COMM contexts, with NO ordering of
+        its own: the caller makes each comm stream wait for the inputs (every
+        rank's, on the naive and shared backends, whose ranks read their
+        peers' buffers) and makes the main streams wait for it before they
+        touch `ins` or `outs` again (`DataParallel` with overlap)."""
+        if Self.N == 1:
+            if n > 0:
+                var c = self.comm_ctxs[0]
+                c.enqueue_copy(view_on(c, outs[0], n), view_on(c, ins[0], n))
+            return
+        if self.backend == BACKEND_SHARED:
+            # MAX refuses a copy whose destination was allocated by another
+            # context ("device context does not match context of dst"), even
+            # on the same device: hand the comm context views of the buffers.
+            var c = self.comm_ctxs[0]
+            var vi = List[DeviceBuffer[DT]](capacity=Self.N)
+            var vo = List[DeviceBuffer[DT]](capacity=Self.N)
+            for r in range(Self.N):
+                vi.append(view_on(c, ins[r], n))
+                vo.append(view_on(c, outs[r], n))
+            self._allreduce_shared(vi, vo, n, c)
+            return
+        self._check_payload(n)
+        self._allreduce_comm[True](ins, outs, n)
+
+    def _check_payload(self, n: Int) raises:
         if n > self.max_elems:
             raise Error(
                 "allreduce_sum: "
@@ -266,21 +361,16 @@ struct ProcessGroup[N: Int](Movable):
                 + " elements but the Signal payloads were sized for "
                 + String(self.max_elems)
             )
-        if self.backend == BACKEND_NAIVE:
-            self._stream_barrier()
-        self._allreduce_comm(ins, outs, n)
-        if self.backend == BACKEND_NAIVE:
-            self._stream_barrier()
 
     def _allreduce_shared(
         mut self,
         ins: List[DeviceBuffer[DT]],
         outs: List[DeviceBuffer[DT]],
         n: Int,
+        c: DeviceContext,
     ) raises:
         if n == 0:
             return
-        var c = self.ctxs[0]
         var acc = outs[0].create_sub_buffer[DT](0, n)
         c.enqueue_copy(acc, ins[0].create_sub_buffer[DT](0, n))
         for k in range(1, Self.N):
@@ -288,12 +378,15 @@ struct ProcessGroup[N: Int](Movable):
         for r in range(1, Self.N):
             c.enqueue_copy(outs[r].create_sub_buffer[DT](0, n), acc)
 
-    def _allreduce_comm(
+    def _allreduce_comm[
+        ON_COMM: Bool
+    ](
         mut self,
         ins: List[DeviceBuffer[DT]],
         outs: List[DeviceBuffer[DT]],
         n: Int,
     ) raises:
+        """MAX `comm` allreduce on the main contexts, or on the comm ones."""
         comptime if has_nvidia_gpu_accelerator() and Self.N >= 2:
             comptime InT = TileTensor[
                 DT, type_of(row_major(0)), ImmutAnyOrigin
@@ -314,7 +407,10 @@ struct ProcessGroup[N: Int](Movable):
                     ),
                     row_major(n),
                 )
-                allreduce[ngpus=Self.N](in_t, out_t, sigs, self.ctxs[r])
+                comptime if ON_COMM:
+                    allreduce[ngpus=Self.N](in_t, out_t, sigs, self.comm_ctxs[r])
+                else:
+                    allreduce[ngpus=Self.N](in_t, out_t, sigs, self.ctxs[r])
         else:
             raise Error("allreduce_sum: MAX comm collectives need NVIDIA GPUs")
 
