@@ -30,7 +30,14 @@ def lend(
     """Lends `buffer` as input `index`: owned by the map on the host; on an
     accelerator, copied to the device once and lent by address (host memory
     lent under an accelerator is staged on every call, and the step's stores
-    into it are lost)."""
+    into it are lost).
+
+    The map holds only the device copy's address: the caller keeps
+    `on_device` alive for as long as the model executes. Freed at its last
+    use, the copies went back to MAX's memory pool while the step still
+    wrote through their addresses; back to back, the pool handed them out
+    again and the step faulted (CUDA_ERROR_ILLEGAL_ADDRESS, reported by
+    whichever kernel ran next)."""
     var name = "input" + String(index)
     if gpu:
         staging.borrow(name, buffer^, dtype, shape)

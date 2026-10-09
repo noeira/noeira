@@ -15,6 +15,7 @@ and batch, and the same train step built and run by the Python prototype.
 from __future__ import annotations
 
 import ctypes
+import hashlib
 
 import numpy as np
 from max.driver import CPU, Accelerator, Buffer
@@ -137,6 +138,15 @@ def forward_error(got: np.ndarray, params: dict, x: np.ndarray, act: str, layers
             h = np.maximum(h, 0.0) if act == "relu" else np.tanh(h)
     got = np.asarray(got, np.float64).reshape(h.shape)
     return float(np.max(np.abs(got - h)) / max(float(np.max(np.abs(h))), 1e-30))
+
+
+def digest(arrays: list) -> str:
+    """A SHA-256 of the arrays' bytes, in order: two runs left the same
+    buffers iff their digests match."""
+    h = hashlib.sha256()
+    for a in arrays:
+        h.update(np.ascontiguousarray(a, np.float32).tobytes())
+    return h.hexdigest()[:16]
 
 
 def to_list(array: np.ndarray) -> list:

@@ -52,6 +52,7 @@ noeira_max/train_from_mojo/run.sh --nn [--steps N] [--gpu] [--no-bump]          
 | `max_train/gate.mojo` | Lending buffers to `maxrt`, reading them back, comparing a run with the reference |
 | `py_grad.py` | The Python half: `snapshot` and `backward` (the transform), the problems, and the reference runs |
 | `train_mlp.mojo`, `train_ln_mlp.mojo`, `train_gpt.mojo`, `train_nn_mlp.mojo` | The programs above |
+| `probe_back_to_back.py` | The Python-built GPT step, synchronised against back to back, with LayerNorm and attention each as noeira's kernel or MAX's composite |
 
 ## Notes
 
@@ -66,4 +67,5 @@ noeira_max/train_from_mojo/run.sh --nn [--steps N] [--gpu] [--no-bump]          
   - an nn output tensor was released before Python copied it.
 
   Each read stale bytes, with no error: small arrays survived, and the first element of the large one did not. Every such read now goes through a helper that receives the owner (`host_copy`, `to_numpy`).
+- **The same rule held for the device copies lent to MAX.** `lend` gives MAX only a copy's address; the copies live in `on_device`. `train_gpt` freed them at their last use while the step still wrote through their addresses. Synchronised, MAX's memory pool reused the same blocks and the step ran correctly on freed memory; back to back, the pool handed them out again and the step faulted (CUDA_ERROR_ILLEGAL_ADDRESS, reported by whichever kernel ran next). Every program now keeps `on_device` alive to its end. `train_gpt --extra N [--extra-sync]` runs N more steps back to back (or synchronised) and prints a digest of every buffer: the two must match.
 - **A conditional expression with a compile-time condition returned a dead `DeviceContext`.** `Optional(DeviceContext()) if gpu else None`, with `gpu` a `comptime` value, gave a context whose first buffer crashed inside AsyncRT: SIGSEGV on CUDA, SIGTRAP on Metal. The same expression with a runtime condition works, and so does `comptime if`, which `train_nn_mlp` now uses (Mojo 1.1.0).

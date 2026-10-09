@@ -126,3 +126,4 @@ def main() raises:
               "us per step" + (String("; replayed ") + String(pipelined_us(model, inputs, lent, rt, 1000, True))
               + " us per step" if capture else String("")))
     _ = outputs^  # replays write into it until here
+    _ = on_device^  # MAX reads and writes these through the lent addresses until here

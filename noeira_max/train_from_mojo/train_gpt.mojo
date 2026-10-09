@@ -13,6 +13,7 @@ Gated like `train_mlp.mojo` against the same step built in Python
 (`py_grad.gpt_reference`): graph text, every loss, the final buffers.
 
     ./train_gpt OUT_DIR [--steps N] [--layers L] [--gpu] [--capture] [--no-reference]
+                        [--extra N [--extra-sync]]
 """
 
 from std.python import Python, PythonObject
@@ -170,6 +171,8 @@ def main() raises:
     var gpu = False
     var capture = False
     var reference = True
+    var extra = 0
+    var extra_sync = False
     var i = 2
     while i < len(args):
         if args[i] == "--steps":
@@ -180,6 +183,11 @@ def main() raises:
             i += 1
         elif args[i] == "--gpu":
             gpu = True
+        elif args[i] == "--extra":  # then N more steps and a digest of the buffers
+            extra = Int(String(args[i + 1]))
+            i += 1
+        elif args[i] == "--extra-sync":  # ... each synchronised, not back to back
+            extra_sync = True
         elif args[i] == "--no-reference":  # time only: no Python model in the process
             reference = False
         elif args[i] == "--capture":  # CUDA: replay the captured step
@@ -238,6 +246,30 @@ def main() raises:
     print("[mojo]", steps, "steps", "(captured from step 1)" if capture else "", "; loss", losses[0], "->",
           losses[len(losses) - 1], "; median step", median_us(times, 1), "us, loss copied back each step")
 
+    if extra > 0:
+        # Further steps, synchronised (each loss copied back) or back to back,
+        # then a digest of every buffer: the two must leave the same state.
+        if extra_sync:
+            var more = List[Float32]()
+            var more_times = List[Int]()
+            var more_lent = List[Tensor]()
+            var more_outputs = List[Tensor]()
+            train(model, inputs, 3 * n + 3, extra, gpu, False, more, more_times, more_lent, more_outputs)
+        else:
+            _ = pipelined_us(model, inputs, lent, rt, extra, False, keep_outputs=True)
+        rt.synchronize()
+        var state = builtins.list()
+        for k in range(3 * n + 1):
+            var shape = shapes[k].copy() if k < n else ([1] if k == n else shapes[(k - n - 1) // 2].copy())
+            var py_shape = builtins.list()
+            for d in shape:
+                _ = py_shape.append(PythonObject(d))
+            _ = state.append(read(inputs, on_device, gpu, k, glue, py_shape))
+        print("[mojo]", extra, "more steps,", "synchronised" if extra_sync else "back to back",
+              "; buffers digest", String(glue.digest(state)))
+        _ = outputs^
+        _ = on_device^  # MAX reads and writes these through the lent addresses until here
+        return
     if not reference:
         if gpu:
             print("[mojo] pipelined, 200 steps, every output map kept until the end:",
@@ -246,6 +278,7 @@ def main() raises:
                   "us per step" + (String("; replayed ") + String(pipelined_us(model, inputs, lent, rt, 200, True))
                   + " us per step" if capture else String("")))
         _ = outputs^
+        _ = on_device^  # MAX reads and writes these through the lent addresses until here
         return
     var ref_out = glue.gpt_reference(cfg, B, 0, steps, "gpt_train_step", LR, device)
     print("[python] reference compiled in", Float64(py=ref_out["compile_s"]), "s")
@@ -280,3 +313,4 @@ def main() raises:
               "us per step" + (String("; replayed ") + String(pipelined_us(model, inputs, lent, rt, 200, True))
               + " us per step" if capture else String("")))
     _ = outputs^  # replays write into it until here
+    _ = on_device^  # MAX reads and writes these through the lent addresses until here
