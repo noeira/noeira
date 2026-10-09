@@ -37,7 +37,7 @@ from linalg.bmm import batched_matmul
 
 from noeira.nn.constants import DT, TPB
 from noeira.nn.random.hash_mask import hash_keep, new_dropout_seed
-from .flash_attention import flash_eligible, flash_forward, flash_backward
+from .flash_attention import flash_eligible, flash_forward, flash_backward, flash_o_dtype
 from ..core.tensor import Tensor, TensorImpl
 from ..core.tensor_refs import TensorRefs, child_refs
 from ..core.module import Module
@@ -712,6 +712,7 @@ struct ScaledDotProductAttention[
     # bf16 boundary (read→fp32, write→bf16). bf16-flow is GPU-only.
     comptime ACT_DT = Self.ADT
     comptime HEAD_DIM: Int = Self.DIM // Self.N_HEADS
+    comptime OC_DT = flash_o_dtype[Self.ADT, Self.HEAD_DIM, Self.N_HEADS]()
     comptime IN_DIMS = Array[Int, 1](fill=Self.SEQ_LEN * Self.DIM * 3)
     # `Array` is not `ImplicitlyCopyable` (Mojo 1.0): indexing the comptime
     # `IN_DIMS` from a runtime context would materialize the whole array.
@@ -743,9 +744,10 @@ struct ScaledDotProductAttention[
     var ss0: Tensor  # scores slot 0
     var ss1: Tensor  # scores slot 1
     var sp4: Tensor  # packed slot 4: Vᵀ for the backward's dout·Vᵀ
-    # USE_FLASH cache: O (fp32, [B, SEQ·DIM]), L = log-sum-exp [B·H·SEQ], and
+    # USE_FLASH cache: O ([B, SEQ·DIM], at `OC_DT`: bf16 on the tensor-core
+    # path, fp32 for the CUDA-core kernels), L = log-sum-exp [B·H·SEQ], and
     # D = Σ dO·O [B·H·SEQ] (vjp scratch).
-    var o_cache: Tensor
+    var o_cache: TensorImpl[Self.OC_DT]
     var lse: Tensor
     var dvec: Tensor
     # attention dropout (P_DROP > 0): see the struct docstring
@@ -767,7 +769,7 @@ struct ScaledDotProductAttention[
         self.ss0 = Tensor()
         self.ss1 = Tensor()
         self.sp4 = Tensor()
-        self.o_cache = Tensor()
+        self.o_cache = TensorImpl[Self.OC_DT]()
         self.lse = Tensor()
         self.dvec = Tensor()
         self.drop_on = True
@@ -915,7 +917,7 @@ struct ScaledDotProductAttention[
         self.lse.ensure_gpu(c, B * Self.N_HEADS * Self.SEQ_LEN)
         flash_forward[
             Self.ADT, Self.N_HEADS, Self.SEQ_LEN, Self.HEAD_DIM, Self.CAUSAL,
-            B * Self.N_HEADS,
+            B * Self.N_HEADS, OC=Self.OC_DT,
         ](
             c, in0.dev.value(), out.dev.value(), self.o_cache.dev.value(),
             self.lse.dev.value(),
@@ -1205,7 +1207,7 @@ struct ScaledDotProductAttention[
         self.dvec.ensure_gpu(c, B * Self.N_HEADS * Self.SEQ_LEN)
         flash_backward[
             Self.ADT, Self.N_HEADS, Self.SEQ_LEN, Self.HEAD_DIM, Self.CAUSAL,
-            B * Self.N_HEADS,
+            B * Self.N_HEADS, OC=Self.OC_DT,
         ](
             c, fin.dev.value(), grad_output.dev.value(),
             self.o_cache.dev.value(), self.lse.dev.value(),
@@ -1606,7 +1608,7 @@ struct ScaledDotProductAttentionQKV[
             self.attn.lse.ensure_gpu(c, B * Self.N_HEADS * Self.SEQ_LEN)
             flash_forward[
                 Self.ADT, Self.N_HEADS, Self.SEQ_LEN, Self.ATTN.HEAD_DIM,
-                Self.CAUSAL, B * Self.N_HEADS, IL=True,
+                Self.CAUSAL, B * Self.N_HEADS, IL=True, OC=Self.ATTN.OC_DT,
             ](
                 c, in0.dev.value(), out.dev.value(),
                 self.attn.o_cache.dev.value(), self.attn.lse.dev.value(),
@@ -1635,7 +1637,7 @@ struct ScaledDotProductAttentionQKV[
             self.attn.dvec.ensure_gpu(c, B * Self.N_HEADS * Self.SEQ_LEN)
             flash_backward[
                 Self.ADT, Self.N_HEADS, Self.SEQ_LEN, Self.ATTN.HEAD_DIM,
-                Self.CAUSAL, B * Self.N_HEADS, IL=True,
+                Self.CAUSAL, B * Self.N_HEADS, IL=True, OC=Self.ATTN.OC_DT,
             ](
                 c, fin.dev.value(), grad_output.dev.value(),
                 self.attn.o_cache.dev.value(), self.attn.lse.dev.value(),

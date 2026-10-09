@@ -24,6 +24,14 @@ no launch overhead, kernels back to back), averaged over NREP replays:
 MAX path then re-pads the weight on every call, as it does once per optimizer
 step in training.
 
+`BL_PART=4` times the bf16-flow `LinearAct` / `Linear` (bf16 activations,
+fp32 master weights): `NN_GEMM_PATH=linmax` = MAX's GEMMs (the path before),
+`auto` = cuBLAS. `-D NN_LT_BIAS=0` takes the fp32 `Linear` forward's bias
+out of its cuBLASLt epilogue (parts 1-3; `cublaslt_gemm.mojo`), `-D
+NN_LT_RELU=0` the fp32 `LinearAct[.., ReLUOp]` forward's bias + ReLU (the
+`LinearReLU` rows; `BL_PART=5` = extra ReLU shapes that set
+`LinearAct.use_lt_relu`'s rule).
+
 NVIDIA only (the `max` / `cublas` switch does nothing elsewhere). Run through
 `pixi run` so the CUDA interceptor is preloaded (graph capture needs it).
 """
@@ -35,7 +43,8 @@ from max.gpu.host import DeviceContext
 
 from noeira.cuda.graph import CUDAGraph, maybe_capture_replay
 from noeira.nn.constants import DT
-from noeira.nn.core.tensor import Tensor
+from noeira.nn.core.tensor import Tensor, TensorImpl
+from noeira.nn.core.cublaslt_gemm import LT_BIAS, LT_RELU
 from noeira.nn.core.tensor_refs import TensorRefs
 from noeira.nn.core.initializer import Kaiming
 from noeira.nn.core.element_op import ElementOp
@@ -83,7 +92,7 @@ def _replay_us[
 
 def _row(kind: String, IN: Int, OUT: Int, B: Int, cub: Bool, f: Float64, fb: Float64):
     print(
-        "ROW path=", GEMM_PATH, " kind=", kind, " in=", IN, " out=", OUT,
+        "ROW path=", GEMM_PATH, " lt_bias=", LT_BIAS, " lt_relu=", LT_RELU, " kind=", kind, " in=", IN, " out=", OUT,
         " b=", B, " cublas_fwd=", cub, " fwd_us=", f, " fwdbwd_us=", fb,
         sep="",
     )
@@ -150,6 +159,51 @@ def bench_act[IN: Int, OUT: Int, B: Int, OP: ElementOp](kind: String, ctx: Devic
     var f = _replay_us[_f](ctx)
     var fb = _replay_us[_fb](ctx)
     _row(kind, IN, OUT, B, L.use_cublas_fwd[B](), f, fb)
+    _ = m^
+    _ = x^
+    _ = go^
+    _ = y^
+    _ = gi^
+
+
+comptime BF16 = DType.bfloat16
+
+
+def _fill_bf(mut t: TensorImpl[BF16], n: Int, ctx: DeviceContext) raises:
+    t = TensorImpl[BF16].alloc(n)
+    for i in range(n):
+        t.data[i] = Scalar[DT](random_float64(-1, 1)).cast[BF16]()
+    t.upload(ctx)
+
+
+def bench_act_bf16[IN: Int, OUT: Int, B: Int, OP: ElementOp](kind: String, ctx: DeviceContext) raises:
+    """`bench_act` for the bf16-flow `LinearAct[IN, OUT, OP, bf16]`."""
+    comptime L = LinearAct[IN, OUT, OP, BF16]
+    seed(IN * 31 + OUT)
+    var m = L.make["gpu", Kaiming](Optional(ctx))
+    m.set_attr["capture_recast"](Scalar[DT](1.0))
+    var x = TensorImpl[BF16]()
+    var go = TensorImpl[BF16]()
+    _fill_bf(x, B * IN, ctx)
+    _fill_bf(go, B * OUT, ctx)
+    var y = TensorImpl[BF16]()
+    var gi = TensorImpl[BF16]()
+    m.forward["gpu", B](TensorRefs[1, ADT=BF16](x), y, Optional(ctx))
+    m.vjp["gpu", B](TensorRefs[1, ADT=BF16](x), go, TensorRefs[1, ADT=BF16](gi), Optional(ctx))
+    ctx.synchronize()
+
+    def _f() capturing raises -> None:
+        for _ in range(R):
+            m.forward["gpu", B](TensorRefs[1, ADT=BF16](x), y, Optional(ctx))
+
+    def _fb() capturing raises -> None:
+        for _ in range(R):
+            m.forward["gpu", B](TensorRefs[1, ADT=BF16](x), y, Optional(ctx))
+            m.vjp["gpu", B](TensorRefs[1, ADT=BF16](x), go, TensorRefs[1, ADT=BF16](gi), Optional(ctx))
+
+    var f = _replay_us[_f](ctx)
+    var fb = _replay_us[_fb](ctx)
+    _row(kind + "_bf16", IN, OUT, B, False, f, fb)
     _ = m^
     _ = x^
     _ = go^
@@ -282,3 +336,31 @@ def main() raises:
         bench_linear[768, 192, 8192](ctx)  # ViT fc2
         bench_linear[192, 10, 128](ctx)  # ViT head
         bench_linear[128, 65, 512](ctx)  # LSTM head
+    comptime if PART == 5:  # fp32 ReLU: the regime probe behind `use_lt_relu`
+        bench_act[17, 256, 1, ReLUOp]("LinearReLU", ctx)
+        bench_act[23, 256, 1, ReLUOp]("LinearReLU", ctx)
+        bench_act[64, 64, 1, ReLUOp]("LinearReLU", ctx)
+        bench_act[4, 128, 1, ReLUOp]("LinearReLU", ctx)
+        bench_act[256, 256, 256, ReLUOp]("LinearReLU", ctx)
+        bench_act[223, 1024, 256, ReLUOp]("LinearReLU", ctx)
+        bench_act[223, 1024, 64, ReLUOp]("LinearReLU", ctx)
+        bench_act[256, 256, 128, ReLUOp]("LinearReLU", ctx)
+        bench_act[64, 64, 16384, ReLUOp]("LinearReLU", ctx)
+        bench_act[128, 128, 1024, ReLUOp]("LinearReLU", ctx)
+        bench_act[256, 256, 1024, ReLUOp]("LinearReLU", ctx)
+        bench_act[256, 256, 4096, ReLUOp]("LinearReLU", ctx)
+        bench_act[64, 256, 4096, ReLUOp]("LinearReLU", ctx)
+        bench_act[100, 512, 2048, ReLUOp]("LinearReLU", ctx)
+        bench_act[256, 1024, 256, ReLUOp]("LinearReLU", ctx)
+        bench_act[128, 512, 512, ReLUOp]("LinearReLU", ctx)
+        bench_act[512, 512, 256, ReLUOp]("LinearReLU", ctx)
+        bench_act[512, 256, 256, ReLUOp]("LinearReLU", ctx)
+    comptime if PART == 4:
+        bench_act_bf16[17, 256, 256, ReLUOp]("LinearReLU", ctx)  # SAC HC actor
+        bench_act_bf16[256, 256, 256, ReLUOp]("LinearReLU", ctx)  # SAC trunk
+        bench_act_bf16[256, 256, 32, ReLUOp]("LinearReLU", ctx)  # SAC acting
+        bench_act_bf16[1024, 1024, 256, ReLUOp]("LinearReLU", ctx)  # SAC dm dog
+        bench_act_bf16[64, 64, 16384, TanhOp]("LinearTanh", ctx)  # PPO LL GAE
+        bench_act_bf16[784, 256, 100, ReLUOp]("LinearReLU", ctx)  # MNIST MLP
+        bench_act_bf16[3136, 512, 32, ReLUOp]("LinearReLU", ctx)  # Rainbow CNN
+        bench_act_bf16[384, 1536, 16384, TanhOp]("LinearTanh", ctx)  # GPT-size

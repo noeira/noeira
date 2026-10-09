@@ -39,6 +39,7 @@ NVIDIA only.
 """
 
 from std.sys import has_nvidia_gpu_accelerator
+from std.sys.defines import get_defined_string
 from std.ffi import _get_global_or_null, external_call
 from std.memory.alloc import Layout as AllocLayout
 from max.gpu.host import DeviceContext, DeviceBuffer
@@ -55,10 +56,35 @@ from _cublas.cublas import ComputeType
 from noeira.nn.core.cublas_gemm import _shared_workspace, CUBLAS_WS_BYTES
 
 
+comptime LT_BIAS = get_defined_string["NN_LT_BIAS", "1"]() == "1"
+"""The fp32 `Linear` forward on cuBLAS takes its bias in a cuBLASLt epilogue
+instead of a separate kernel (default). Measured on the 86 shapes whose
+forward is on cuBLAS (`bench_linear_gemm_paths_gpu.mojo`, RTX 5090): faster
+on every one, median 1.14x, 1.02-1.53x (one launch fewer: a 2 us head at
+batch 1 takes 1.3). `-D NN_LT_BIAS=0`: the GEMM + bias kernel (A/B)."""
+
 comptime EPI_NONE = 0
 comptime EPI_BIAS = 1
 comptime EPI_GELU_AUX_BIAS = 2
 comptime EPI_DGELU = 3
+comptime EPI_RELU_AUX_BIAS = 4
+"""y = relu(acc + bias) and a BITMASK of (acc + bias > 0) in `aux`: one bit
+per element, bit (row r, column j) at bit index r * aux_ld + j of the byte
+array, aux_ld a multiple of 128 (cuBLASLt's rule)."""
+
+comptime LT_RELU = get_defined_string["NN_LT_RELU", "1"]() == "1"
+"""The fp32 `LinearAct[.., ReLUOp]` forward on cuBLAS runs bias + ReLU in a
+cuBLASLt `RELU_AUX_BIAS` epilogue, caching the bitmask instead of z — where
+it measured faster (`LinearAct.use_lt_relu`). `-D NN_LT_RELU=0`: the GEMM +
+bias/activation kernel everywhere (A/B)."""
+
+
+def _has_bias(e: Int) -> Bool:
+    return e == EPI_BIAS or e == EPI_GELU_AUX_BIAS or e == EPI_RELU_AUX_BIAS
+
+
+def _has_aux(e: Int) -> Bool:
+    return e == EPI_GELU_AUX_BIAS or e == EPI_DGELU or e == EPI_RELU_AUX_BIAS
 
 comptime _HEUR_BYTES = 96
 """sizeof(cublasLtMatmulHeuristicResult_t): algo (64) + workspaceSize (8) +
@@ -81,6 +107,8 @@ def _epi(e: Int) -> Int32:
         return Int32(Epilogue.GELU_AUX_BIAS._value)
     if e == EPI_DGELU:
         return Int32(Epilogue.DGELU._value)
+    if e == EPI_RELU_AUX_BIAS:
+        return Int32(Epilogue.RELU_AUX_BIAS._value)
     return Int32(Epilogue.DEFAULT._value)
 
 
@@ -192,11 +220,12 @@ struct _Plan(Copyable, Movable):
 
 
 def _plan[
-    TA: Bool, TB: Bool, IN_DT: DType, OUT_DT: DType, BIAS_DT: DType
+    TA: Bool, TB: Bool, IN_DT: DType, OUT_DT: DType, BIAS_DT: DType,
+    TF32: Bool = False,
 ](c: DeviceContext, M: Int, N: Int, K: Int, epi: Int, aux_ld: Int) raises -> _Plan:
     var name = String(
         "NOEIRA_CUBLASLT_PLAN_", c.id(), "_", M, "x", N, "x", K, "_", TA, TB,
-        "_", IN_DT, OUT_DT, BIAS_DT, "_", epi, "_", aux_ld,
+        "_", IN_DT, OUT_DT, BIAS_DT, "_", epi, "_", aux_ld, "_", TF32,
     )
     var g = _get_global_or_null(name)
     if g:
@@ -209,7 +238,9 @@ def _plan[
             "cublasLtMatmulDescCreate", def(Int, Int32, Int32) thin abi("C") -> Int32
         ]()(
             Int(dp),
-            Int32(ComputeType.COMPUTE_32F._value),
+            Int32(
+                ComputeType.COMPUTE_32F_FAST_TF32._value if TF32 else ComputeType.COMPUTE_32F._value
+            ),
             Int32(DataType.R_32F._value),
         ),
         "cublasLtMatmulDescCreate",
@@ -220,9 +251,9 @@ def _plan[
     _set_i32(desc, Int32(Attr.CUBLASLT_MATMUL_DESC_TRANSA._value), Int32(1 if TB else 0))
     _set_i32(desc, Int32(Attr.CUBLASLT_MATMUL_DESC_TRANSB._value), Int32(1 if TA else 0))
     _set_i32(desc, Int32(Attr.CUBLASLT_MATMUL_DESC_EPILOGUE._value), _epi(epi))
-    if epi == EPI_BIAS or epi == EPI_GELU_AUX_BIAS:
+    if _has_bias(epi):
         _set_i32(desc, Int32(Attr.CUBLASLT_MATMUL_DESC_BIAS_DATA_TYPE._value), _dt[BIAS_DT]())
-    if epi == EPI_GELU_AUX_BIAS or epi == EPI_DGELU:
+    if _has_aux(epi):
         _set_i64(desc, Int32(Attr.CUBLASLT_MATMUL_DESC_EPILOGUE_AUX_LD._value), Int64(aux_ld))
     # Column-major: A = b as stored ([K, N] row-major = N x K col... see doc),
     # B = a, D = outᵀ (N rows, M cols, ld N).
@@ -267,7 +298,7 @@ def _plan[
 
 
 def cublaslt_gemm[
-    TA: Bool, TB: Bool, IN_DT: DType, OUT_DT: DType
+    TA: Bool, TB: Bool, IN_DT: DType, OUT_DT: DType, TF32: Bool = False
 ](
     c: DeviceContext,
     dst: DeviceBuffer[OUT_DT],
@@ -285,14 +316,16 @@ def cublaslt_gemm[
     (op as `cublas_gemm`). `bias`: device pointer to N `OUT_DT` values
     (`EPI_BIAS`, `EPI_GELU_AUX_BIAS`). `aux`: device pointer to the [M, N]
     pre-activation, row stride `aux_ld` — written by `EPI_GELU_AUX_BIAS`,
-    read by `EPI_DGELU`. beta = 0."""
+    read by `EPI_DGELU` — or the `EPI_RELU_AUX_BIAS` bitmask. beta = 0.
+    `TF32`: fp32 operands computed in TF32 (`cublas_tf32`'s rule), else full
+    fp32 / bf16 accumulation in fp32."""
     comptime assert has_nvidia_gpu_accelerator(), "cuBLASLt is NVIDIA-only"
     # The bias is OUT_DT: cuBLASLt rejects an fp32 bias with a bf16 output
     # (INVALID_VALUE from the heuristic on cuBLAS 12.9).
-    var plan = _plan[TA, TB, IN_DT, OUT_DT, OUT_DT](c, M, N, K, epi, aux_ld)
-    if epi == EPI_BIAS or epi == EPI_GELU_AUX_BIAS:
+    var plan = _plan[TA, TB, IN_DT, OUT_DT, OUT_DT, TF32](c, M, N, K, epi, aux_ld)
+    if _has_bias(epi):
         _set_i64(plan.desc, Int32(Attr.CUBLASLT_MATMUL_DESC_BIAS_POINTER._value), Int64(bias))
-    if epi == EPI_GELU_AUX_BIAS or epi == EPI_DGELU:
+    if _has_aux(epi):
         _set_i64(plan.desc, Int32(Attr.CUBLASLT_MATMUL_DESC_EPILOGUE_AUX_POINTER._value), Int64(aux))
     var ws = _shared_workspace(c)
     var ab = _alpha_beta()

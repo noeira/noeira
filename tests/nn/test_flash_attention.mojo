@@ -23,6 +23,7 @@ backward is deterministic). Non-vacuity: the compiled path is the fused one
 from std.math import sqrt, abs
 from std.random import seed, random_float64
 from std.testing import assert_true
+from std.sys import has_nvidia_gpu_accelerator
 from max.gpu.host import DeviceContext
 
 from noeira.nn.constants import DT
@@ -30,11 +31,16 @@ from noeira.nn.core.tensor import Tensor
 from noeira.nn.core.tensor_refs import TensorRefs
 from noeira.nn.core.initializer import Kaiming
 from noeira.nn.primitives.attention import ScaledDotProductAttention
+from noeira.nn.primitives.flash_attention import ATTN_PATH
 
 
-comptime TOL = 1e-4
-"""Both sides float32 in different orders; a semantic error (a mask, a tile
-edge, a transpose) is O(1)."""
+comptime TF32 = has_nvidia_gpu_accelerator() and ATTN_PATH == "auto"
+comptime TOL = 1e-2 if TF32 else 1e-4
+"""Both sides float32 in different orders: 1e-4. On NVIDIA the default path
+is TF32 on the tensor cores (`flash_attention_tf32.mojo`): 1e-2, the band
+every TF32 GEMM gate here uses (measured 0.0013-0.0078; `-D
+NN_ATTN_PATH=no_tf32` restores strict fp32 and 1e-4). A semantic error (a
+mask, a tile edge, a transpose) is O(1)."""
 
 
 def _err(ref_: List[Scalar[DT]], got: List[Scalar[DT]]) -> Float64:
@@ -150,7 +156,10 @@ def _causal_fed_bidirectional(ctx: DeviceContext) raises -> Float64:
 
 
 def main() raises:
-    print("ScaledDotProductAttention fused GPU vs CPU (std units, tol", TOL, ")")
+    print(
+        "ScaledDotProductAttention fused GPU vs CPU (std units, tol", TOL,
+        ", TF32" if TF32 else ", fp32", ")",
+    )
     var c = DeviceContext()
     var fails = 0
     fails += _shape[192, 3, 257, False, 2](String("ViT-tiny 257x(3x64)     "), c)
