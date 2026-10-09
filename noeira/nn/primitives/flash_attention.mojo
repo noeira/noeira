@@ -55,6 +55,10 @@ from .flash_attention_mma import (
     mma_eligible, MMA_TQ, MMA_TK, MMA_WARPS,
     _mma_fwd_kernel, _mma_dq_kernel, _mma_dkdv_kernel,
 )
+from .flash_attention_tf32 import (
+    tf32_eligible, TF_TQ, TF_WARPS,
+    _tf32_fwd_kernel, _tf32_dq_kernel, _tf32_dkdv_kernel,
+)
 
 
 comptime _NV = has_nvidia_gpu_accelerator()
@@ -66,13 +70,19 @@ comptime KV_TK = 32 if _NV else 16
 comptime KV_TQ = 32 if _NV else 16
 
 comptime ATTN_PATH = get_defined_string["NN_ATTN_PATH", "auto"]()
-"""`auto`: bf16 activations on NVIDIA run the tensor-core kernels
-(`flash_attention_mma.mojo`); `simt`: the fp32 CUDA-core kernels below for
-every dtype (the path before, for A/B runs)."""
+"""`auto`: on NVIDIA, bf16 activations run the bf16 tensor-core kernels
+(`flash_attention_mma.mojo`) and fp32 activations the TF32 ones
+(`flash_attention_tf32.mojo`); `no_tf32`: fp32 stays on the CUDA-core
+kernels below (strict fp32), bf16 as `auto`; `simt`: the CUDA-core kernels
+for every dtype (the path before, for A/B runs)."""
 
 
 def _use_mma[ADT: DType, HD: Int, H: Int]() -> Bool:
     return _NV and ATTN_PATH != "simt" and mma_eligible[ADT, HD, H]()
+
+
+def _use_tf32[ADT: DType, HD: Int, H: Int]() -> Bool:
+    return _NV and ATTN_PATH == "auto" and tf32_eligible[ADT, HD, H]()
 
 
 def flash_o_dtype[ADT: DType, HD: Int, H: Int]() -> DType:
@@ -606,6 +616,13 @@ def flash_forward[
             grid_dim=((S + MMA_TQ - 1) // MMA_TQ, BH),
             block_dim=MMA_WARPS * WARP_SIZE,
         )
+    elif _use_tf32[ADT, HD, H]():
+        c.enqueue_function[_tf32_fwd_kernel[H, S, HD, CAUSAL, IL]](
+            rebind[DeviceBuffer[DT]](inp), rebind[DeviceBuffer[DT]](outp),
+            rebind[DeviceBuffer[DT]](o_cache), lse,
+            grid_dim=((S + TF_TQ - 1) // TF_TQ, BH),
+            block_dim=TF_WARPS * WARP_SIZE,
+        )
     else:
         c.enqueue_function[
             _flash_fwd_kernel[ADT, H, S, HD, CAUSAL, FWD_TQ, FWD_TK, IL]
@@ -642,6 +659,21 @@ def flash_backward[
             inp, dout, lse, dvec, gin,
             grid_dim=((S + MMA_TK - 1) // MMA_TK, BH),
             block_dim=MMA_WARPS * WARP_SIZE,
+        )
+    elif _use_tf32[ADT, HD, H]():
+        # D = Σ dO·O inside the dQ kernel (it writes `dvec` for dK/dV).
+        c.enqueue_function[_tf32_dq_kernel[H, S, HD, CAUSAL, IL]](
+            rebind[DeviceBuffer[DT]](inp), rebind[DeviceBuffer[DT]](dout),
+            rebind[DeviceBuffer[DT]](o_cache), lse, dvec,
+            rebind[DeviceBuffer[DT]](gin),
+            grid_dim=((S + TF_TQ - 1) // TF_TQ, BH),
+            block_dim=TF_WARPS * WARP_SIZE,
+        )
+        c.enqueue_function[_tf32_dkdv_kernel[H, S, HD, CAUSAL, IL]](
+            rebind[DeviceBuffer[DT]](inp), rebind[DeviceBuffer[DT]](dout),
+            lse, dvec, rebind[DeviceBuffer[DT]](gin),
+            grid_dim=((S + TF_TQ - 1) // TF_TQ, BH),
+            block_dim=TF_WARPS * WARP_SIZE,
         )
     else:
         c.enqueue_function[_flash_d_kernel[ADT, H, S, HD, ROWS]](
