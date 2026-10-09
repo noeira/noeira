@@ -22,6 +22,12 @@ Defines (`mojo build -D ...`, then run the binary):
   ZERO_GATE       DDP vs ZeRO-1 at N ranks (clip on, dropout off)
   B_LOCAL=b       rows per rank in timing mode (default 64 full / 8 dev)
   NN_ITERS=k      timed steps (default 50)
+  GRAPH=g         0 eager (default); 1 one CUDA graph per GPU, collective
+                  inside; 2 compute captured, collective eager between two
+                  graphs (forced when the backend cannot capture it: no P2P).
+                  Real capture is NVIDIA-only; elsewhere every mode is eager.
+  NO_COMM         skip the gradient collective (timing only, wrong numerics):
+                  step time with minus without = the exposed collective
 
 Mac:     pixi run -e apple mojo run -I . examples/nn/distributed/gpt_ddp.mojo
 2 GPUs:  pixi run -e nvidia mojo build -I . -D DDP_DEVICES -D GPT_FULL \
@@ -47,6 +53,7 @@ from noeira.nn.distributed.process_group import ProcessGroup, backend_name
 from noeira.nn.distributed.data_parallel import DataParallel
 from noeira.nn.distributed.zero import Zero1
 from noeira.nn.distributed.shard_batch import window_onehot_shard_kernel
+from noeira.nn.distributed.rank_graphs import RankGraphs
 
 
 comptime FULL = is_defined["GPT_FULL"]()
@@ -55,6 +62,11 @@ comptime ZERO_GATE = is_defined["ZERO_GATE"]()
 comptime ZERO1 = is_defined["ZERO1"]()
 comptime PER_STEP_LOSS = GATE or ZERO_GATE
 comptime USE_DEVICES = is_defined["DDP_DEVICES"]()
+comptime GRAPH_EAGER = 0
+comptime GRAPH_WHOLE = 1
+comptime GRAPH_SPLIT = 2
+comptime GRAPH = get_defined_int["GRAPH", GRAPH_EAGER]()
+comptime NO_COMM = is_defined["NO_COMM"]()
 comptime NGPUS = get_defined_int["NGPUS", 2]()
 
 comptime VOCAB = 65
@@ -190,6 +202,48 @@ def _surgery(mut net: NET, c: DeviceContext) raises:
     ](net)
 
 
+trait _Job(Movable & Deinitable):
+    """One data-parallel run: the wrapper (DDP or ZeRO-1) plus every rank's
+    buffers, owned in ONE struct so a capturing closure mentions only it.
+    The step is `compute` (every rank: batch, forward, loss, vjp), `comm` (the
+    gradient collective) and `update` (clip, optimizer, ZeRO's all-gather)."""
+
+    def compute(mut self) raises:
+        ...
+
+    def comm(mut self) raises:
+        ...
+
+    def update(mut self) raises:
+        ...
+
+    def synchronize(self) raises:
+        ...
+
+    def graph_ctxs(self) -> List[DeviceContext]:
+        ...
+
+    def capturable_collectives(self) -> Bool:
+        ...
+
+    def collectives_in_update(self) -> Bool:
+        """Whether `update` runs a collective (ZeRO-1's all-gather and norm
+        allreduce), so even a split capture needs capturable collectives."""
+        ...
+
+    def losses(mut self, reset: Bool) raises -> Float64:
+        ...
+
+    def download(mut self, r: Int) raises -> List[Scalar[DT]]:
+        ...
+
+    def arena(self) -> Int:
+        ...
+
+    def state_bytes(self) -> Int:
+        ...
+
+
 def _losses[N: Int](
     mut ranks: List[_Rank], ctxs: List[DeviceContext], reset: Bool
 ) raises -> Float64:
@@ -202,84 +256,213 @@ def _losses[N: Int](
     return l / Float64(N)
 
 
-def _run[N: Int, BL: Int, ZERO: Bool](
-    ctx: DeviceContext, ids: List[Int], steps: Int, warmup: Int, keep_params: Bool
-) raises -> _Result:
-    """`steps` timed steps after `warmup`, with DDP (`DataParallel`) or ZeRO-1
-    (`Zero1`). The two loops are the same; Mojo has no duck-typed generics and
-    the two wrappers share no trait, so the loop is spelled twice."""
-    seed(42)
-    var seed_word = random_ui64(0, UInt64.MAX)
-    var res = _Result()
-    comptime if ZERO:
-        var z = Zero1[NET, N].make[Normal[0.0, 0.02]](
-            _make_pg[N](ctx, 16 << 20), lr=LR, beta2=BETA2, wd=WD
+def _make_ranks[N: Int, BL: Int](
+    ctxs: List[DeviceContext], ids: List[Int], seed_word: UInt64
+) raises -> List[_Rank]:
+    var ranks = List[_Rank](capacity=N)
+    for r in range(N):
+        ranks.append(_Rank(ctxs[r], BL, ids, seed_word))
+    return ranks^
+
+
+struct _DdpJob[N: Int, BL: Int](_Job):
+    var dp: DataParallel[NET, Self.N]
+    var ranks: List[_Rank]
+
+    def __init__(out self, ctx: DeviceContext, ids: List[Int]) raises:
+        seed(42)
+        var seed_word = random_ui64(0, UInt64.MAX)
+        self.dp = DataParallel[NET, Self.N].make[Normal[0.0, 0.02]](
+            _make_pg[Self.N](ctx, 16 << 20), lr=LR, beta2=BETA2, wd=WD
         )
-        for r in range(N):
-            _surgery(z.nets[r], z.ctx(r))
-        z.synchronize()
-        z.sync_params()
-        var ranks = List[_Rank](capacity=N)
-        for r in range(N):
-            ranks.append(_Rank(z.ctx(r), BL, ids, seed_word))
-        z.synchronize()
-        res.arena = z.total
-        res.state_bytes = z.state_bytes_per_rank(0)
-        var t0 = perf_counter_ns()
-        for it in range(warmup + steps):
-            if it == warmup:
-                z.synchronize()
-                t0 = perf_counter_ns()
-            z.zero_grad()
-            for r in range(N):
-                _rank_step[BL](z.nets[r], z.ctx(r), ranks[r], r)
-            z.reduce_scatter_grads()
-            z.clip_grads_device(CLIP)
-            z.step()
-            comptime if PER_STEP_LOSS:
-                res.losses.append(_losses[N](ranks, z.pg.ctxs, True))
-        z.synchronize()
-        res.ms_per_step = Float64(perf_counter_ns() - t0) / 1e6 / Float64(max(steps, 1))
-        comptime if not PER_STEP_LOSS:
-            res.losses.append(_losses[N](ranks, z.pg.ctxs, False))
-        if keep_params:
-            for r in range(N):
-                res.params.append(z.download_params(r))
+        for r in range(Self.N):
+            _surgery(self.dp.nets[r], self.dp.ctx(r))
+            comptime if GRAPH != GRAPH_EAGER:
+                # Weight-derived caches (padded / cast copies) rebuild on every
+                # step, so the rebuild kernel is in the graph, not skipped by a
+                # host-side version check frozen at capture time.
+                self.dp.nets[r].set_attr["capture_recast"](Scalar[DT](1.0))
+        self.dp.synchronize()
+        self.dp.sync_params()
+        self.ranks = _make_ranks[Self.N, Self.BL](self.dp.pg.ctxs, ids, seed_word)
+        self.dp.synchronize()
+
+    def compute(mut self) raises:
+        self.dp.zero_grad()
+        for r in range(Self.N):
+            _rank_step[Self.BL](self.dp.nets[r], self.dp.ctx(r), self.ranks[r], r)
+
+    def comm(mut self) raises:
+        self.dp.allreduce_grads()
+
+    def update(mut self) raises:
+        self.dp.clip_grads_device(CLIP)
+        self.dp.step()
+
+    def synchronize(self) raises:
+        self.dp.synchronize()
+
+    def graph_ctxs(self) -> List[DeviceContext]:
+        return self.dp.pg.graph_ctxs()
+
+    def capturable_collectives(self) -> Bool:
+        return self.dp.pg.capturable_collectives()
+
+    def collectives_in_update(self) -> Bool:
+        return False
+
+    def losses(mut self, reset: Bool) raises -> Float64:
+        return _losses[Self.N](self.ranks, self.dp.pg.ctxs, reset)
+
+    def download(mut self, r: Int) raises -> List[Scalar[DT]]:
+        return self.dp.download_params(r)
+
+    def arena(self) -> Int:
+        return self.dp.total
+
+    def state_bytes(self) -> Int:
+        return self.dp.state_bytes_per_rank()
+
+
+struct _ZeroJob[N: Int, BL: Int](_Job):
+    var z: Zero1[NET, Self.N]
+    var ranks: List[_Rank]
+
+    def __init__(out self, ctx: DeviceContext, ids: List[Int]) raises:
+        seed(42)
+        var seed_word = random_ui64(0, UInt64.MAX)
+        self.z = Zero1[NET, Self.N].make[Normal[0.0, 0.02]](
+            _make_pg[Self.N](ctx, 16 << 20), lr=LR, beta2=BETA2, wd=WD
+        )
+        for r in range(Self.N):
+            _surgery(self.z.nets[r], self.z.ctx(r))
+            comptime if GRAPH != GRAPH_EAGER:
+                # Weight-derived caches (padded / cast copies) rebuild on every
+                # step, so the rebuild kernel is in the graph, not skipped by a
+                # host-side version check frozen at capture time.
+                self.z.nets[r].set_attr["capture_recast"](Scalar[DT](1.0))
+        self.z.synchronize()
+        self.z.sync_params()
+        self.ranks = _make_ranks[Self.N, Self.BL](self.z.pg.ctxs, ids, seed_word)
+        self.z.synchronize()
+
+    def compute(mut self) raises:
+        self.z.zero_grad()
+        for r in range(Self.N):
+            _rank_step[Self.BL](self.z.nets[r], self.z.ctx(r), self.ranks[r], r)
+
+    def comm(mut self) raises:
+        self.z.reduce_scatter_grads()
+
+    def update(mut self) raises:
+        self.z.clip_grads_device(CLIP)
+        self.z.step()
+
+    def synchronize(self) raises:
+        self.z.synchronize()
+
+    def graph_ctxs(self) -> List[DeviceContext]:
+        return self.z.pg.graph_ctxs()
+
+    def capturable_collectives(self) -> Bool:
+        return self.z.pg.capturable_collectives()
+
+    def collectives_in_update(self) -> Bool:
+        return Self.N > 1
+
+    def losses(mut self, reset: Bool) raises -> Float64:
+        return _losses[Self.N](self.ranks, self.z.pg.ctxs, reset)
+
+    def download(mut self, r: Int) raises -> List[Scalar[DT]]:
+        return self.z.download_params(r)
+
+    def arena(self) -> Int:
+        return self.z.total
+
+    def state_bytes(self) -> Int:
+        return self.z.state_bytes_per_rank(0)
+
+
+def _graph_mode[J: _Job](job: J) raises -> Int:
+    """The capture mode this backend allows for the requested one."""
+    comptime if GRAPH == GRAPH_WHOLE:
+        if job.capturable_collectives():
+            return GRAPH_WHOLE
+        if job.collectives_in_update():
+            raise Error("GRAPH: this backend's collectives cannot be captured"
+                        " and ZeRO-1 runs one inside its update; use GRAPH=0")
+        print("  [graph] collectives not capturable on this backend:"
+              " compute-only capture, collective eager (GRAPH=2)")
+        return GRAPH_SPLIT
+    elif GRAPH == GRAPH_SPLIT:
+        if job.collectives_in_update() and not job.capturable_collectives():
+            raise Error("GRAPH=2: ZeRO-1's update runs a collective this"
+                        " backend cannot capture; use GRAPH=0")
+        return GRAPH_SPLIT
     else:
-        var dp = DataParallel[NET, N].make[Normal[0.0, 0.02]](
-            _make_pg[N](ctx, 16 << 20), lr=LR, beta2=BETA2, wd=WD
-        )
+        return GRAPH_EAGER
+
+
+def _run[J: _Job, N: Int](
+    var job: J, steps: Int, warmup: Int, keep_params: Bool
+) raises -> _Result:
+    """`steps` timed steps after `warmup`, eager or captured (`GRAPH`)."""
+    var res = _Result()
+    res.arena = job.arena()
+    res.state_bytes = job.state_bytes()
+    var mode = _graph_mode(job)
+    var whole = RankGraphs(job.graph_ctxs())
+    var pre = RankGraphs(job.graph_ctxs())
+    var post = RankGraphs(job.graph_ctxs())
+
+    def _step() capturing raises -> None:
+        job.compute()
+        comptime if not NO_COMM:
+            job.comm()
+        job.update()
+
+    def _compute() capturing raises -> None:
+        job.compute()
+
+    def _update() capturing raises -> None:
+        job.update()
+
+    var t0 = perf_counter_ns()
+    for it in range(warmup + steps):
+        if it == warmup:
+            job.synchronize()
+            t0 = perf_counter_ns()
+        if mode == GRAPH_WHOLE:
+            whole.run[_step]()
+        elif mode == GRAPH_SPLIT:
+            pre.run[_compute]()
+            comptime if not NO_COMM:
+                job.comm()
+            post.run[_update]()
+        else:
+            _step()
+        comptime if PER_STEP_LOSS:
+            res.losses.append(job.losses(True))
+    job.synchronize()
+    res.ms_per_step = Float64(perf_counter_ns() - t0) / 1e6 / Float64(max(steps, 1))
+    comptime if not PER_STEP_LOSS:
+        res.losses.append(job.losses(False))
+    if keep_params:
         for r in range(N):
-            _surgery(dp.nets[r], dp.ctx(r))
-        dp.synchronize()
-        dp.sync_params()
-        var ranks = List[_Rank](capacity=N)
-        for r in range(N):
-            ranks.append(_Rank(dp.ctx(r), BL, ids, seed_word))
-        dp.synchronize()
-        res.arena = dp.total
-        res.state_bytes = dp.state_bytes_per_rank()
-        var t0 = perf_counter_ns()
-        for it in range(warmup + steps):
-            if it == warmup:
-                dp.synchronize()
-                t0 = perf_counter_ns()
-            dp.zero_grad()
-            for r in range(N):
-                _rank_step[BL](dp.nets[r], dp.ctx(r), ranks[r], r)
-            dp.allreduce_grads()
-            dp.clip_grads_device(CLIP)
-            dp.step()
-            comptime if PER_STEP_LOSS:
-                res.losses.append(_losses[N](ranks, dp.pg.ctxs, True))
-        dp.synchronize()
-        res.ms_per_step = Float64(perf_counter_ns() - t0) / 1e6 / Float64(max(steps, 1))
-        comptime if not PER_STEP_LOSS:
-            res.losses.append(_losses[N](ranks, dp.pg.ctxs, False))
-        if keep_params:
-            for r in range(N):
-                res.params.append(dp.download_params(r))
+            res.params.append(job.download(r))
     return res^
+
+
+def _run_ddp[N: Int, BL: Int](
+    ctx: DeviceContext, ids: List[Int], steps: Int, warmup: Int, keep: Bool
+) raises -> _Result:
+    return _run[_DdpJob[N, BL], N](_DdpJob[N, BL](ctx, ids), steps, warmup, keep)
+
+
+def _run_zero[N: Int, BL: Int](
+    ctx: DeviceContext, ids: List[Int], steps: Int, warmup: Int, keep: Bool
+) raises -> _Result:
+    return _run[_ZeroJob[N, BL], N](_ZeroJob[N, BL](ctx, ids), steps, warmup, keep)
 
 
 def _max_abs_diff(a: List[Scalar[DT]], b: List[Scalar[DT]]) -> Float64:
@@ -301,14 +484,15 @@ def main() raises:
         "GPT DDP: layers=" + String(LAYERS) + " embed=" + String(EMBED)
         + " seq=" + String(SEQ) + " N=" + String(NGPUS)
         + (" devices" if USE_DEVICES else " shared-context simulator")
+        + " GRAPH=" + String(GRAPH) + (" NO_COMM" if NO_COMM else "")
     )
 
     comptime if GATE:
         comptime assert B_GATE % NGPUS == 0, "B_GATE must divide by NGPUS"
         print("[gate] N=1 x B=" + String(B_GATE) + " vs N=" + String(NGPUS)
               + " x B=" + String(B_GATE // NGPUS) + ", " + String(GATE_ITERS) + " steps")
-        var one = _run[1, B_GATE, False](ctx, split.train, GATE_ITERS, 0, True)
-        var many = _run[NGPUS, B_GATE // NGPUS, False](ctx, split.train, GATE_ITERS, 0, True)
+        var one = _run_ddp[1, B_GATE](ctx, split.train, GATE_ITERS, 0, True)
+        var many = _run_ddp[NGPUS, B_GATE // NGPUS](ctx, split.train, GATE_ITERS, 0, True)
         var dl = 0.0
         for i in range(GATE_ITERS):
             dl = max(dl, abs(one.losses[i] - many.losses[i]))
@@ -329,8 +513,8 @@ def main() raises:
         comptime BL = B_GATE // NGPUS
         print("[zero gate] DDP vs ZeRO-1, N=" + String(NGPUS) + " x B=" + String(BL)
               + ", clip " + String(CLIP) + ", " + String(GATE_ITERS) + " steps")
-        var d = _run[NGPUS, BL, False](ctx, split.train, GATE_ITERS, 0, True)
-        var z = _run[NGPUS, BL, True](ctx, split.train, GATE_ITERS, 0, True)
+        var d = _run_ddp[NGPUS, BL](ctx, split.train, GATE_ITERS, 0, True)
+        var z = _run_zero[NGPUS, BL](ctx, split.train, GATE_ITERS, 0, True)
         var dl = 0.0
         for i in range(GATE_ITERS):
             dl = max(dl, abs(d.losses[i] - z.losses[i]))
@@ -347,7 +531,11 @@ def main() raises:
             raise Error("ZERO GATE FAIL: replicas drifted apart")
         print("GPT ZERO-1 GATE done")
     else:
-        var res = _run[NGPUS, B_LOCAL, ZERO1](ctx, split.train, ITERS, WARMUP, False)
+        var res: _Result
+        comptime if ZERO1:
+            res = _run_zero[NGPUS, B_LOCAL](ctx, split.train, ITERS, WARMUP, False)
+        else:
+            res = _run_ddp[NGPUS, B_LOCAL](ctx, split.train, ITERS, WARMUP, False)
         var tokens = Float64(NGPUS * B_LOCAL * SEQ)
         print("  " + ("ZeRO-1" if ZERO1 else "DDP") + "  arena =", res.arena,
               " B_LOCAL =", B_LOCAL, " global batch =", NGPUS * B_LOCAL,

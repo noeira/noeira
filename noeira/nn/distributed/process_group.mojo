@@ -200,6 +200,23 @@ struct ProcessGroup[N: Int](Movable):
         for r in range(Self.N):
             self.ctxs[r].synchronize()
 
+    def graph_ctxs(self) -> List[DeviceContext]:
+        """The distinct contexts, one graph each (`RankGraphs`): every rank's
+        on the devices, the one shared context on the simulator."""
+        var out = List[DeviceContext]()
+        if self.backend == BACKEND_SHARED:
+            out.append(self.ctxs[0])
+        else:
+            for r in range(Self.N):
+                out.append(self.ctxs[r])
+        return out^
+
+    def capturable_collectives(self) -> Bool:
+        """Whether a collective may sit inside a captured graph. The NAIVE
+        (host-staged) allreduce allocates its staging buffers per call, which
+        aborts a capture; the P2P and simulator paths allocate nothing."""
+        return self.backend != BACKEND_NAIVE
+
     # ── collectives ──────────────────────────────────────────────────────────
 
     def allreduce_sum(
