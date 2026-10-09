@@ -75,6 +75,13 @@ def _use_mma[ADT: DType, HD: Int, H: Int]() -> Bool:
     return _NV and ATTN_PATH != "simt" and mma_eligible[ADT, HD, H]()
 
 
+def flash_o_dtype[ADT: DType, HD: Int, H: Int]() -> DType:
+    """The dtype of the O cache the backward reads: the activation dtype on
+    the tensor-core path (bf16, as FA2 — half the bytes written by the
+    forward and read for D), fp32 for the CUDA-core kernels."""
+    return ADT if _use_mma[ADT, HD, H]() else DT
+
+
 comptime _NEG = Scalar[DT](-1e30)
 comptime _LOG2E = Scalar[DT](1.4426950408889634)
 
@@ -582,40 +589,41 @@ def _flash_bwd_dkdv_kernel[
 
 def flash_forward[
     ADT: DType, H: Int, S: Int, HD: Int, CAUSAL: Bool, BH: Int,
-    IL: Bool = False,
+    IL: Bool = False, OC: DType = DT,
 ](
     c: DeviceContext,
     inp: DeviceBuffer[ADT],
     outp: DeviceBuffer[ADT],
-    o_cache: DeviceBuffer[DT],
+    o_cache: DeviceBuffer[OC],
     lse: DeviceBuffer[DT],
 ) raises:
-    """Enqueue the forward: `outp` [B, S·DIM], `o_cache` (fp32, same) and
-    `lse` [BH·S] (log2 units)."""
+    """Enqueue the forward: `outp` [B, S·DIM], `o_cache` (same, at `OC` =
+    `flash_o_dtype`) and `lse` [BH·S] (log2 units)."""
+    comptime assert OC == flash_o_dtype[ADT, HD, H](), "o_cache dtype"
     comptime if _use_mma[ADT, HD, H]():
         c.enqueue_function[_mma_fwd_kernel[ADT, H, S, HD, CAUSAL, IL]](
-            inp, outp, o_cache, lse,
+            inp, outp, rebind[DeviceBuffer[ADT]](o_cache), lse,
             grid_dim=((S + MMA_TQ - 1) // MMA_TQ, BH),
             block_dim=MMA_WARPS * WARP_SIZE,
         )
-        return
-    c.enqueue_function[
-        _flash_fwd_kernel[ADT, H, S, HD, CAUSAL, FWD_TQ, FWD_TK, IL]
-    ](
-        inp, outp, o_cache, lse,
-        grid_dim=((S + FWD_TQ - 1) // FWD_TQ, BH),
-        block_dim=FWD_TQ * FWD_TK // 16,
-    )
+    else:
+        c.enqueue_function[
+            _flash_fwd_kernel[ADT, H, S, HD, CAUSAL, FWD_TQ, FWD_TK, IL]
+        ](
+            inp, outp, rebind[DeviceBuffer[DT]](o_cache), lse,
+            grid_dim=((S + FWD_TQ - 1) // FWD_TQ, BH),
+            block_dim=FWD_TQ * FWD_TK // 16,
+        )
 
 
 def flash_backward[
     ADT: DType, H: Int, S: Int, HD: Int, CAUSAL: Bool, BH: Int,
-    IL: Bool = False,
+    IL: Bool = False, OC: DType = DT,
 ](
     c: DeviceContext,
     inp: DeviceBuffer[ADT],
     dout: DeviceBuffer[ADT],
-    o_cache: DeviceBuffer[DT],
+    o_cache: DeviceBuffer[OC],
     lse: DeviceBuffer[DT],
     dvec: DeviceBuffer[DT],
     gin: DeviceBuffer[ADT],
@@ -623,13 +631,10 @@ def flash_backward[
     """Enqueue D = Σ dO·O, then dQ, then dK / dV into `gin` (the input's
     layout, every element written)."""
     comptime ROWS = BH * S
-    c.enqueue_function[_flash_d_kernel[ADT, H, S, HD, ROWS]](
-        dout, o_cache, dvec,
-        grid_dim=(ROWS * WARP_SIZE + TPB - 1) // TPB, block_dim=TPB,
-    )
     comptime if _use_mma[ADT, HD, H]():
+        # D = Σ dO·O inside the dQ kernel (it writes `dvec` for dK/dV).
         c.enqueue_function[_mma_dq_kernel[ADT, H, S, HD, CAUSAL, IL]](
-            inp, dout, lse, dvec, gin,
+            inp, dout, rebind[DeviceBuffer[ADT]](o_cache), lse, dvec, gin,
             grid_dim=((S + MMA_TQ - 1) // MMA_TQ, BH),
             block_dim=MMA_WARPS * WARP_SIZE,
         )
@@ -638,18 +643,22 @@ def flash_backward[
             grid_dim=((S + MMA_TK - 1) // MMA_TK, BH),
             block_dim=MMA_WARPS * WARP_SIZE,
         )
-        return
-    c.enqueue_function[
-        _flash_bwd_dq_kernel[ADT, H, S, HD, CAUSAL, DQ_TQ, DQ_TK, IL]
-    ](
-        inp, dout, lse, dvec, gin,
-        grid_dim=((S + DQ_TQ - 1) // DQ_TQ, BH),
-        block_dim=DQ_TQ * DQ_TK // 16,
-    )
-    c.enqueue_function[
-        _flash_bwd_dkdv_kernel[ADT, H, S, HD, CAUSAL, KV_TQ, KV_TK, IL]
-    ](
-        inp, dout, lse, dvec, gin,
-        grid_dim=((S + KV_TK - 1) // KV_TK, BH),
-        block_dim=KV_TQ * KV_TK // 16,
-    )
+    else:
+        c.enqueue_function[_flash_d_kernel[ADT, H, S, HD, ROWS]](
+            dout, rebind[DeviceBuffer[DT]](o_cache), dvec,
+            grid_dim=(ROWS * WARP_SIZE + TPB - 1) // TPB, block_dim=TPB,
+        )
+        c.enqueue_function[
+            _flash_bwd_dq_kernel[ADT, H, S, HD, CAUSAL, DQ_TQ, DQ_TK, IL]
+        ](
+            inp, dout, lse, dvec, gin,
+            grid_dim=((S + DQ_TQ - 1) // DQ_TQ, BH),
+            block_dim=DQ_TQ * DQ_TK // 16,
+        )
+        c.enqueue_function[
+            _flash_bwd_dkdv_kernel[ADT, H, S, HD, CAUSAL, KV_TQ, KV_TK, IL]
+        ](
+            inp, dout, lse, dvec, gin,
+            grid_dim=((S + KV_TK - 1) // KV_TK, BH),
+            block_dim=KV_TQ * KV_TK // 16,
+        )
