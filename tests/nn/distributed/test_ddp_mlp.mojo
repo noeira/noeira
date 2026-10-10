@@ -23,7 +23,7 @@ Run (GPUs):  pixi run -e nvidia mojo build -D DDP_DEVICES -I . tests/nn/distribu
 """
 
 from std.random import seed
-from std.sys import is_defined
+from std.sys import is_defined, has_accelerator
 from std.testing import assert_true
 from max.gpu.host import DeviceContext
 
@@ -209,6 +209,9 @@ def _max_abs(a: List[Scalar[DT]]) -> Float64:
 
 def main() raises:
     print("DDP correctness gates (MLP", D, "->", H, "->", O, ", B =", B, ", K =", K, ")")
+    comptime if not has_accelerator():
+        print("No accelerator — skipping (the distributed gates need a GPU, or Metal for the simulator)")
+        return
     var ctx = DeviceContext()
 
     # ── Gate 1: N = 1 identity ────────────────────────────────────────────────

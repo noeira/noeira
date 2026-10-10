@@ -28,7 +28,7 @@ NVIDIA: build with `mojo build`, run the binary under `pixi run -e nvidia`
 """
 
 from std.random import seed
-from std.sys import is_defined
+from std.sys import is_defined, has_accelerator
 from std.testing import assert_true, assert_equal
 from max.gpu.host import DeviceContext
 
@@ -240,6 +240,9 @@ def main() raises:
           " B =", B, " K =", K,
           " (devices)" if USE_DEVICES else " (shared-context simulator)")
     _test_plan()
+    comptime if not has_accelerator():
+        print("No accelerator — skipping the training gates (they need a GPU, or Metal for the simulator)")
+        return
     var ctx = DeviceContext()
     var plain = _run[PLAIN, False](ctx, 0, "plain")
     var fresh = _Job[PLAIN](ctx, 0)

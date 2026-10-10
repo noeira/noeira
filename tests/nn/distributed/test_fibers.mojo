@@ -18,6 +18,7 @@
 Run:  pixi run -e apple mojo build -I . tests/nn/distributed/test_fibers.mojo -o $B/tf && $B/tf
 """
 
+from std.sys import has_accelerator
 from std.testing import assert_true, assert_equal
 from std.memory import Pointer
 from max.gpu.host import DeviceContext, DeviceBuffer
@@ -235,6 +236,9 @@ def _test_mismatch() raises:
 
 def main() raises:
     print("RankFibers gates:", NR, "ranks,", K, "rendezvous")
+    comptime if not has_accelerator():
+        print("No accelerator — skipping (the distributed gates need a GPU, or Metal for the simulator)")
+        return
     _test_order()
     _test_state()
     _test_gpu(DeviceContext())

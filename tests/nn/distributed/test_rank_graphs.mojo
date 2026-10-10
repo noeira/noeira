@@ -32,7 +32,7 @@ NVIDIA (the interceptor needs the pixi activation's LD_PRELOAD):
 """
 
 from std.random import seed
-from std.sys import is_defined, has_nvidia_gpu_accelerator
+from std.sys import is_defined, has_nvidia_gpu_accelerator, has_accelerator
 from std.testing import assert_true
 from std.ffi import OwnedDLHandle
 from max.gpu.host import DeviceContext
@@ -289,6 +289,9 @@ def _stream_probe(ctx: DeviceContext) raises:
 def main() raises:
     print("RankGraphs gates: MLP", D, "->", H, "->", O, " N =", N, " B =", B,
           " K =", K, " (devices)" if USE_DEVICES else " (shared-context simulator)")
+    comptime if not has_accelerator():
+        print("No accelerator — skipping (the distributed gates need a GPU, or Metal for the simulator)")
+        return
     var ctx = DeviceContext()
     _stream_probe(ctx)
     var eager = _ddp[EAGER](ctx)

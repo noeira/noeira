@@ -17,7 +17,7 @@ Run (Mac):  pixi run -e apple mojo run -I . tests/nn/distributed/test_zero1.mojo
 """
 
 from std.random import seed
-from std.sys import is_defined
+from std.sys import is_defined, has_accelerator
 from std.testing import assert_true
 from std.memory import bitcast
 from max.gpu.host import DeviceContext
@@ -212,6 +212,9 @@ def _ddp_init(ctx: DeviceContext) raises -> List[Scalar[DT]]:
 
 def main() raises:
     print("ZeRO-1 vs DDP (MLP", D, "->", H, "->", O, ", B =", B, ", K =", K, ", AdamW wd =", WD, ")")
+    comptime if not has_accelerator():
+        print("No accelerator — skipping (the distributed gates need a GPU, or Metal for the simulator)")
+        return
     var ctx = DeviceContext()
     # The partition is MAX's: 51 rows over 4 ranks -> 13, 13, 13, 12.
     var p = shard_rows(51, 4, 3)

@@ -18,7 +18,7 @@ NVIDIA, 2 GPUs: add `-D DDP_DEVICES` (MAX comm, N = 2 only).
 """
 
 from std.random import seed
-from std.sys import is_defined
+from std.sys import is_defined, has_accelerator
 from std.testing import assert_true
 from std.memory import Pointer, bitcast
 from max.gpu.host import DeviceContext
@@ -258,6 +258,9 @@ def _gate[N: Int](ctx: DeviceContext, init: List[Scalar[DT]]) raises:
 def main() raises:
     print("ZeRO-2 / ZeRO-3 vs DDP: MLP", D, "->", H, "->", H, "->", O,
           " B =", B, " K =", K, " AdamW wd =", WD)
+    comptime if not has_accelerator():
+        print("No accelerator — skipping (the distributed gates need a GPU, or Metal for the simulator)")
+        return
     var ctx = DeviceContext()
     seed(7)
     var dp1 = DataParallel[NET, 1].make[Xavier](ProcessGroup[1].shared(ctx), lr=LR)

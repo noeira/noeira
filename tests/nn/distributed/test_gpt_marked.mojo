@@ -16,6 +16,7 @@ Run:  pixi run -e apple mojo run -I . tests/nn/distributed/test_gpt_marked.mojo
 """
 
 from std.random import seed
+from std.sys import has_accelerator
 from std.testing import assert_true
 from max.gpu.host import DeviceContext
 
@@ -165,6 +166,9 @@ def _gate(name: String, got: _Out, ref_: _Out) raises:
 
 def main() raises:
     print("GPTMarked vs GPTDropTied:", LAYERS, "x", EMBED, " seq", SEQ, " K =", K)
+    comptime if not has_accelerator():
+        print("No accelerator — skipping (the distributed gates need a GPU, or Metal for the simulator)")
+        return
     var ctx = DeviceContext()
     var plain = _plain(ctx)
     print("  plain loss", plain.losses[0], "->", plain.losses[K - 1])
