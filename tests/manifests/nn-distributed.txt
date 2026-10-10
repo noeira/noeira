@@ -1,0 +1,24 @@
+# nn/distributed simulator manifest — `pixi run -e apple test-nn-distributed`
+# (or -e nvidia).
+#
+# Every gate here runs all N ranks on ONE device (ProcessGroup.shared), so a
+# Mac or a single GPU is enough; the multi-GPU form of each test is a build
+# with `-D DDP_DEVICES` on a 2-GPU box. Each test compares a distributed run
+# against plain DDP or a plain training loop, bit for bit where the arithmetic
+# allows. Without an accelerator every entry prints a skip and passes.
+
+# --- scheduling and DDP ---
+tests/nn/distributed/test_fibers.mojo
+tests/nn/distributed/test_ddp_mlp.mojo
+tests/nn/distributed/test_rank_graphs.mojo
+
+# --- sharded optimizers ---
+tests/nn/distributed/test_zero1.mojo
+tests/nn/distributed/test_zero_sharded.mojo
+
+# --- overlap (gradient marks, buckets) ---
+tests/nn/distributed/test_overlap.mojo
+
+# --- the GPT with marked blocks ---
+tests/nn/distributed/test_gpt_marked.mojo
+tests/nn/distributed/test_gpt_zero.mojo
