@@ -263,6 +263,37 @@ struct Param[NAME: StaticString, APPLY_DECAY: Bool, SIZE: Int](IsParam):
     def param_decay(self) -> Bool:
         return Self.APPLY_DECAY
 
+    # ── Frozen params ──────────────────────────────────────────────────
+    # A Param whose `grd` is EMPTY is frozen: it keeps its value, its name
+    # and its place in the walk (so a checkpoint, a safetensors map or a
+    # torch-name map sees exactly what it saw before), and it has no
+    # gradient and no optimizer state. The predicate is the storage itself,
+    # the convention `State.visit_with` already uses when it hands a visitor
+    # an empty `grad`.
+    def is_frozen(self) -> Bool:
+        return self.grd.n == 0
+
+    def freeze(mut self):
+        """Release the gradient and the optimizer moments, host and device.
+        The value is untouched."""
+        self.grd.release()
+        self.m.release()
+        self.v.release()
+
+    def unfreeze[
+        target: StaticString
+    ](mut self, ctx: Optional[DeviceContext] = None) raises:
+        """Give a frozen param its gradient back, zeroed and allocated the
+        way `make` allocates it. A no-op on a trainable param. The moments
+        come back lazily, on the optimizer's next step, as for a new param."""
+        if self.grd.n > 0:
+            return
+        self.grd = Tensor.alloc(Self.SIZE)
+        comptime if target == "gpu":
+            var c = ctx.value()
+            self.grd.ensure_gpu(c, Self.SIZE)
+            self.grd.dev.value().enqueue_fill(Scalar[DT](0))
+
     def visit_with[target: StaticString, V: ParamVisitor](
         mut self,
         mut visitor: V,
@@ -277,6 +308,8 @@ struct Param[NAME: StaticString, APPLY_DECAY: Bool, SIZE: Int](IsParam):
     def zero_grad[
         target: StaticString
     ](mut self, ctx: Optional[DeviceContext]) raises:
+        if self.grd.n == 0:  # frozen: nothing to zero
+            return
         comptime if target == "cpu":
             for k in range(Self.SIZE):
                 self.grd.data[k] = Scalar[DT](0)
