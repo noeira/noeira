@@ -333,9 +333,14 @@ pass. The first run of this file did exactly that and printed 2.034 -> 1.008
 across two Adam steps at lr 1e-4: a redraw, not learning, and unfalsifiable
 either way. The groups are now built once and reused verbatim."""
 
+comptime VLM_Q4 = get_defined_int["SMOLVLA_VLM_Q4", 0]() != 0
+"""`-D SMOLVLA_VLM_Q4=1`: the VLM's 16 text layers in int4 (`nn/quant`, RTN
+Q4_0 from the published weights at load). The tower is frozen in every regime
+this file trains, so the held-out loss of a checkpoint (`SMOLVLA_INIT`,
+`SMOLVLA_STEPS=0`) with an int4 VLM is the int4 deploy's loss."""
 comptime Pol = SmolVLAPolicy[
     N_CAM, N_LANG, CHUNK, STEPS_EULER, B, SMOLLM_LAYERS, SIGLIP_LAYERS, True,
-    EXPERT_R, TOWER_R,
+    EXPERT_R, TOWER_R, VLM_Q4,
 ]
 comptime Step = SmolVLATrainStep[
     CHUNK, ADIM_REAL, PAD, SMOLVLA_EXPERT_W, B, SMOLLM_LAYERS, EXPERT_FF,
@@ -634,6 +639,9 @@ def trainable_values[
 
 
 def main() raises:
+    comptime assert not (VLM_Q4 and TOWER_R > 0), (
+        "SMOLVLA_VLM_Q4 with SMOLVLA_TOWER_R is QLoRA, a later milestone"
+    )
     print("=" * 74)
     print("SmolVLA fine-tune — SO-ARM101")
     print("=" * 74)

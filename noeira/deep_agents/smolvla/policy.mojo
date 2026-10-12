@@ -643,6 +643,11 @@ struct SmolVLAPolicy[
     # the adapters); the adapters start at PEFT's initialisation, a no-op.
     EXPERT_R: Int = 0,
     TOWER_R: Int = 0,
+    # The VLM's 16 text layers in int4 (`nn/quant`, Q4_0): `load` quantizes
+    # their 112 linears from the published weights by round-to-nearest, and
+    # the prefill runs them through MAX's int4 GEMM on NVIDIA. False, the
+    # default, is today's fp32 tower exactly.
+    VLM_Q4: Bool = False,
 ](Movable):
     """Every component of SmolVLA in one object: pixels and a pose in, joint
     angles out.
@@ -697,7 +702,7 @@ struct SmolVLAPolicy[
     comptime VOCAB: Int = 49280
 
     comptime Tower = SmolVLMTextLayers[
-        Self.L, Self.W, SMOLLM_FF, SMOLLM_KV_W, Self.TOWER_R
+        Self.L, Self.W, SMOLLM_FF, SMOLLM_KV_W, Self.TOWER_R, Self.VLM_Q4
     ]
     comptime Expert = SmolVLAExpert[
         Self.L, SMOLVLA_EXPERT_W, EXPERT_FF, SMOLLM_DIM, SMOLLM_KV_W, 2,
@@ -709,7 +714,7 @@ struct SmolVLAPolicy[
     comptime Pre = SmolVLAPrefill[
         Self.P, Self.CHUNK, Self.B, Self.LAYERS, SMOLLM_DIM, SMOLLM_FF,
         SMOLLM_HEADS, SMOLLM_KV_HEADS, SMOLLM_HEAD_DIM, SMOLLM_THETA,
-        Self.RECORD, Self.TOWER_R,
+        Self.RECORD, Self.TOWER_R, Self.VLM_Q4,
     ]
     comptime Den = SmolVLADenoise[
         Self.P, Self.CHUNK, Self.B, Self.LAYERS, SMOLVLA_EXPERT_W, EXPERT_FF,
@@ -917,8 +922,14 @@ struct SmolVLAPolicy[
         var _ref2 = ParamVisitorRef.of[type_of(tl), target](tl)
         self.tower.for_each_base_param[target](_ref2, ctx)
         tl.report(String("text"))
+        # An int4 tower's walk is its norms; its 112 linears are quantized
+        # from the same file, through the same map, and claim their entries
+        # (each weight and its zero bias) here.
+        var q4_claimed = 0
+        comptime if Self.VLM_Q4:
+            q4_claimed = self.tower.load_q4[target](tl.file, tl.map, ctx)
         _claimed_every_entry(
-            String("text"), len(tl.loaded) + len(tl.zeroed),
+            String("text"), len(tl.loaded) + len(tl.zeroed) + q4_claimed,
             len(tl.map.ours),
         )
 

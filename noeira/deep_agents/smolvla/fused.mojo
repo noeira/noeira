@@ -104,8 +104,10 @@ struct SmolVLAPrefill[
     # V2 stage 7. See `SmolVLADenoise`'s RECORD — same parameter, same reason.
     RECORD: Bool = False,
     # The tower's LoRA rank (`layer_weights.mojo`); 0 = no adapters, and every
-    # `lora_fwd` / `lora_vjp` below compiles to nothing.
+    # adapter hook inside `proj_fwd` / `proj_vjp` compiles to nothing.
     LORA_R: Int = 0,
+    # The tower's linears are int4 `QLinear`s (`layer_weights.mojo`, Q4).
+    Q4: Bool = False,
 ](Movable):
     """The prefill driver. Owns the stateless leaves and every scratch slab, so
     one instance runs all 16 layers without allocating in the loop."""
@@ -255,7 +257,7 @@ struct SmolVLAPrefill[
     ](
         mut self,
         mut tower: SmolVLMTextLayers[
-            Self.LAYERS, Self.W, Self.FF, Self.KVW, Self.LORA_R
+            Self.LAYERS, Self.W, Self.FF, Self.KVW, Self.LORA_R, Self.Q4
         ],
         mut cache: SmolVLAKVCache[
             Self.LAYERS, Self.P, Self.SUFFIX, Self.N_KV, Self.HD, Self.B
@@ -289,22 +291,13 @@ struct SmolVLAPrefill[
             tower.layers[i].input_layernorm.forward[target, TOK](
                 TensorRefs[1](PK[Self.X]), PK[Self.H], ctx
             )
-            tower.layers[i].q.forward[target, TOK](
+            tower.layers[i].proj_fwd[LORA_Q, target, TOK](
                 TensorRefs[1](PK[Self.H]), PK[Self.Q], ctx
             )
-            tower.layers[i].lora_fwd[LORA_Q, target, TOK](
-                TensorRefs[1](PK[Self.H]), PK[Self.Q], ctx
-            )
-            tower.layers[i].k.forward[target, TOK](
+            tower.layers[i].proj_fwd[LORA_K, target, TOK](
                 TensorRefs[1](PK[Self.H]), PK[Self.K], ctx
             )
-            tower.layers[i].lora_fwd[LORA_K, target, TOK](
-                TensorRefs[1](PK[Self.H]), PK[Self.K], ctx
-            )
-            tower.layers[i].v.forward[target, TOK](
-                TensorRefs[1](PK[Self.H]), PK[Self.V], ctx
-            )
-            tower.layers[i].lora_fwd[LORA_V, target, TOK](
+            tower.layers[i].proj_fwd[LORA_V, target, TOK](
                 TensorRefs[1](PK[Self.H]), PK[Self.V], ctx
             )
             # RoPE on q and k, never on v.
@@ -333,10 +326,7 @@ struct SmolVLAPrefill[
             self.attn.forward[target, Self.B](
                 TensorRefs[1](PK[Self.PACKED]), PK[Self.ATT], ctx
             )
-            tower.layers[i].o.forward[target, TOK](
-                TensorRefs[1](PK[Self.ATT]), PK[Self.AO], ctx
-            )
-            tower.layers[i].lora_fwd[LORA_O, target, TOK](
+            tower.layers[i].proj_fwd[LORA_O, target, TOK](
                 TensorRefs[1](PK[Self.ATT]), PK[Self.AO], ctx
             )
             self.res.forward[target, Self.B](
@@ -348,16 +338,10 @@ struct SmolVLAPrefill[
             tower.layers[i].post_attention_layernorm.forward[target, TOK](
                 TensorRefs[1](PK[Self.X2]), PK[Self.H2], ctx
             )
-            tower.layers[i].mlp.gate.forward[target, TOK](
+            tower.layers[i].proj_fwd[LORA_GATE, target, TOK](
                 TensorRefs[1](PK[Self.H2]), PK[Self.GATE], ctx
             )
-            tower.layers[i].lora_fwd[LORA_GATE, target, TOK](
-                TensorRefs[1](PK[Self.H2]), PK[Self.GATE], ctx
-            )
-            tower.layers[i].mlp.up.forward[target, TOK](
-                TensorRefs[1](PK[Self.H2]), PK[Self.UP], ctx
-            )
-            tower.layers[i].lora_fwd[LORA_UP, target, TOK](
+            tower.layers[i].proj_fwd[LORA_UP, target, TOK](
                 TensorRefs[1](PK[Self.H2]), PK[Self.UP], ctx
             )
             # ⚠ (up, gate): SwiGLU reads [u ‖ v] -> u * silu(v), and the
@@ -370,10 +354,7 @@ struct SmolVLAPrefill[
             self.glu.forward[target, Self.B](
                 TensorRefs[1](PK[Self.CAT]), PK[Self.GLU], ctx
             )
-            tower.layers[i].mlp.down.forward[target, TOK](
-                TensorRefs[1](PK[Self.GLU]), PK[Self.DOWN], ctx
-            )
-            tower.layers[i].lora_fwd[LORA_DOWN, target, TOK](
+            tower.layers[i].proj_fwd[LORA_DOWN, target, TOK](
                 TensorRefs[1](PK[Self.GLU]), PK[Self.DOWN], ctx
             )
             self.res.forward[target, Self.B](
@@ -409,7 +390,7 @@ struct SmolVLAPrefill[
     ](
         mut self,
         mut tower: SmolVLMTextLayers[
-            Self.LAYERS, Self.W, Self.FF, Self.KVW, Self.LORA_R
+            Self.LAYERS, Self.W, Self.FF, Self.KVW, Self.LORA_R, Self.Q4
         ],
         mut grad_cache_k: Tensor,
         mut grad_cache_v: Tensor,
@@ -456,6 +437,9 @@ struct SmolVLAPrefill[
         comptime CACHE_LAYER = Self.B * Self.P * Self.KVW
 
         zero_into[target, XN](self.g[Self.GXO], ctx)
+        # An int4 tower's grad_input dequantizes: one shared scratch.
+        comptime if Self.Q4 and target == "gpu":
+            tower.ensure_q4_scratch(ctx.value())
 
         for ridx in range(Self.LAYERS):
             var i = Self.LAYERS - 1 - ridx
@@ -468,11 +452,7 @@ struct SmolVLAPrefill[
                 TensorRefs[2](self.g[Self.GX2], self.g[Self.GDOWN]),
                 ctx,
             )
-            tower.layers[i].mlp.down.vjp[target, TOK](
-                TensorRefs[1](PK[Self.GLU]), self.g[Self.GDOWN],
-                TensorRefs[1](self.g[Self.GGLU]), ctx,
-            )
-            tower.layers[i].lora_vjp[LORA_DOWN, target, TOK](
+            tower.layers[i].proj_vjp[LORA_DOWN, target, TOK](
                 TensorRefs[1](PK[Self.GLU]), self.g[Self.GDOWN],
                 TensorRefs[1](self.g[Self.GGLU]), ctx,
             )
@@ -492,19 +472,11 @@ struct SmolVLAPrefill[
                 TensorRefs[2](self.g[Self.GUP], self.g[Self.GGATE]),
                 ctx,
             )
-            tower.layers[i].mlp.up.vjp[target, TOK](
+            tower.layers[i].proj_vjp[LORA_UP, target, TOK](
                 TensorRefs[1](PK[Self.H2]), self.g[Self.GUP],
                 TensorRefs[1](self.g[Self.GHA]), ctx,
             )
-            tower.layers[i].lora_vjp[LORA_UP, target, TOK](
-                TensorRefs[1](PK[Self.H2]), self.g[Self.GUP],
-                TensorRefs[1](self.g[Self.GHA]), ctx,
-            )
-            tower.layers[i].mlp.gate.vjp[target, TOK](
-                TensorRefs[1](PK[Self.H2]), self.g[Self.GGATE],
-                TensorRefs[1](self.g[Self.GHB]), ctx,
-            )
-            tower.layers[i].lora_vjp[LORA_GATE, target, TOK](
+            tower.layers[i].proj_vjp[LORA_GATE, target, TOK](
                 TensorRefs[1](PK[Self.H2]), self.g[Self.GGATE],
                 TensorRefs[1](self.g[Self.GHB]), ctx,
             )
@@ -522,11 +494,7 @@ struct SmolVLAPrefill[
                 TensorRefs[2](self.g[Self.GHC], self.g[Self.GAO]),
                 ctx,
             )
-            tower.layers[i].o.vjp[target, TOK](
-                TensorRefs[1](PK[Self.ATT]), self.g[Self.GAO],
-                TensorRefs[1](self.g[Self.GATT]), ctx,
-            )
-            tower.layers[i].lora_vjp[LORA_O, target, TOK](
+            tower.layers[i].proj_vjp[LORA_O, target, TOK](
                 TensorRefs[1](PK[Self.ATT]), self.g[Self.GAO],
                 TensorRefs[1](self.g[Self.GATT]), ctx,
             )
@@ -575,27 +543,15 @@ struct SmolVLAPrefill[
                 TensorRefs[1](PK[Self.Q]), self.g[Self.GQR],
                 TensorRefs[1](self.g[Self.GQ]), ctx,
             )
-            tower.layers[i].q.vjp[target, TOK](
+            tower.layers[i].proj_vjp[LORA_Q, target, TOK](
                 TensorRefs[1](PK[Self.H]), self.g[Self.GQ],
                 TensorRefs[1](self.g[Self.GHA]), ctx,
             )
-            tower.layers[i].lora_vjp[LORA_Q, target, TOK](
-                TensorRefs[1](PK[Self.H]), self.g[Self.GQ],
-                TensorRefs[1](self.g[Self.GHA]), ctx,
-            )
-            tower.layers[i].k.vjp[target, TOK](
+            tower.layers[i].proj_vjp[LORA_K, target, TOK](
                 TensorRefs[1](PK[Self.H]), self.g[Self.GK],
                 TensorRefs[1](self.g[Self.GHB]), ctx,
             )
-            tower.layers[i].lora_vjp[LORA_K, target, TOK](
-                TensorRefs[1](PK[Self.H]), self.g[Self.GK],
-                TensorRefs[1](self.g[Self.GHB]), ctx,
-            )
-            tower.layers[i].v.vjp[target, TOK](
-                TensorRefs[1](PK[Self.H]), self.g[Self.GV],
-                TensorRefs[1](self.g[Self.GXO]), ctx,
-            )
-            tower.layers[i].lora_vjp[LORA_V, target, TOK](
+            tower.layers[i].proj_vjp[LORA_V, target, TOK](
                 TensorRefs[1](PK[Self.H]), self.g[Self.GV],
                 TensorRefs[1](self.g[Self.GXO]), ctx,
             )

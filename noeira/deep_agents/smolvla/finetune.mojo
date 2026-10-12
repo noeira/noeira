@@ -370,7 +370,7 @@ def load_trainables[
 
 
 def adopt_trainables_tower[
-    TL: Int, TW: Int, TFF: Int, TKV: Int, TR: Int, //,
+    TL: Int, TW: Int, TFF: Int, TKV: Int, TR: Int, TQ: Bool, //,
     target: StaticString,
     LAYERS: Int, EW: Int, EFF: Int, W: Int, KVW: Int, ADIM: Int,
     E_R: Int = 0,
@@ -381,7 +381,7 @@ def adopt_trainables_tower[
     mut time_mlp_in: Linear[2 * EW, EW],
     mut time_mlp_out: Linear[EW, EW],
     mut action_out: Linear[EW, ADIM],
-    mut tower: SmolVLMTextLayers[TL, TW, TFF, TKV, TR],
+    mut tower: SmolVLMTextLayers[TL, TW, TFF, TKV, TR, TQ],
     ctx: Optional[DeviceContext] = None,
 ) raises:
     """`adopt_trainables` plus the text tower, whose frozen base the arena
@@ -396,7 +396,7 @@ def adopt_trainables_tower[
 
 
 def save_trainables_tower[
-    TL: Int, TW: Int, TFF: Int, TKV: Int, TR: Int, //,
+    TL: Int, TW: Int, TFF: Int, TKV: Int, TR: Int, TQ: Bool, //,
     target: StaticString,
     LAYERS: Int, EW: Int, EFF: Int, W: Int, KVW: Int, ADIM: Int,
     E_R: Int = 0,
@@ -407,7 +407,7 @@ def save_trainables_tower[
     mut time_mlp_in: Linear[2 * EW, EW],
     mut time_mlp_out: Linear[EW, EW],
     mut action_out: Linear[EW, ADIM],
-    mut tower: SmolVLMTextLayers[TL, TW, TFF, TKV, TR],
+    mut tower: SmolVLMTextLayers[TL, TW, TFF, TKV, TR, TQ],
     save_moments: Bool = True,
     ctx: Optional[DeviceContext] = None,
     scalars: CheckpointScalars = CheckpointScalars(),
@@ -422,7 +422,7 @@ def save_trainables_tower[
 
 
 def load_trainables_tower[
-    TL: Int, TW: Int, TFF: Int, TKV: Int, TR: Int, //,
+    TL: Int, TW: Int, TFF: Int, TKV: Int, TR: Int, TQ: Bool, //,
     target: StaticString,
     LAYERS: Int, EW: Int, EFF: Int, W: Int, KVW: Int, ADIM: Int,
     E_R: Int = 0,
@@ -433,7 +433,7 @@ def load_trainables_tower[
     mut time_mlp_in: Linear[2 * EW, EW],
     mut time_mlp_out: Linear[EW, EW],
     mut action_out: Linear[EW, ADIM],
-    mut tower: SmolVLMTextLayers[TL, TW, TFF, TKV, TR],
+    mut tower: SmolVLMTextLayers[TL, TW, TFF, TKV, TR, TQ],
     ctx: Optional[DeviceContext] = None,
 ) raises -> CheckpointScalars:
     """What `save_trainables_tower` wrote, over an already-loaded base."""

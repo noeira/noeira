@@ -47,12 +47,23 @@ every gradient buffer after load (`SmolVLAPolicy.freeze_all`). Built with
 `-D NN_INFERENCE_ONLY` none is ever allocated. On Linux the probe prints the
 system's MemAvailable at each stage: on the Orin, CPU and GPU share that one
 pool, so a stage's drop is what the policy actually holds.
+
+## Optional: the VLM in int4
+
+    mojo build ... -D SMOLVLA_VLM_Q4=1 ...
+
+builds the 16 text layers as int4 `QLinear`s (`nn/quant`): `load` quantizes
+their 112 linears from the published weights (round-to-nearest, Q4_0), and the
+prefill runs MAX's int4 GEMM on NVIDIA. On NVIDIA the probe then keeps only the
+repacked blocks that GEMM reads (`keep_only_repacked`), as an inference deploy
+would.
 """
 
 from std.ffi import OwnedDLHandle, c_int
 from std.math import sqrt
 from std.os import getenv
 from std.os.path import exists
+from std.sys import get_defined_int
 from std.time import perf_counter_ns
 from std.testing import assert_true
 from max.gpu.host import DeviceContext
@@ -73,6 +84,8 @@ from noeira.deep_agents.smolvla.text import SMOLLM_DIM, SMOLLM_LAYERS, SMOLLM_KV
 from noeira.deep_agents.smolvla.expert import EXPERT_FF
 from noeira.nn.core.initializer import Deterministic
 from noeira.nn.primitives.linear import Linear
+from noeira.nn.core.param import NN_INFERENCE_ONLY
+from noeira.nn.quant.qlinear import Q4_INT4_GEMM
 from noeira.vision.resize_pad import SIGLIP_INPUT
 
 comptime TARGET = "gpu"
@@ -93,7 +106,9 @@ comptime N_LANG = 6
 comptime CHUNK = 50
 comptime STEPS = 10
 comptime FPS = 30
-comptime Pol = SmolVLAPolicy[N_CAM, N_LANG, CHUNK, STEPS, 1]
+comptime VLM_Q4 = get_defined_int["SMOLVLA_VLM_Q4", 0]() != 0
+"""`-D SMOLVLA_VLM_Q4=1`: the VLM's text layers in int4 (module docstring)."""
+comptime Pol = SmolVLAPolicy[N_CAM, N_LANG, CHUNK, STEPS, 1, VLM_Q4=VLM_Q4]
 comptime CAM_W = 640
 comptime CAM_H = 480
 comptime RDIM = 6
@@ -168,10 +183,19 @@ def main() raises:
     mem_line(String("start"), mem0)
     var d = DeviceContext()
     mem_line(String("after the device context"), mem0)
-    print("  building every layer (3.2 GB) …")
+    print("  building every layer …  (VLM text layers int4:", VLM_Q4,
+          "| gradients allocated:", not NN_INFERENCE_ONLY, ")")
     var pol = Pol.make[TARGET](Optional(d))
-    mem_line(String("after make (values + gradients)"), mem0)
+    mem_line(
+        String("after make (values + gradients)") if not NN_INFERENCE_ONLY
+        else String("after make (values only, NN_INFERENCE_ONLY)"),
+        mem0,
+    )
     pol.load[TARGET](path, Optional(d))
+    comptime if VLM_Q4 and Q4_INT4_GEMM:
+        mem_line(String("after load (int4 VLM: blocks + repacked)"), mem0)
+        pol.tower.keep_only_repacked()
+        print("  int4 VLM: kept only the repacked blocks MAX's GEMM reads")
     var ckpt = getenv("SMOLVLA_CKPT")
     if ckpt.byte_length() > 0:
         var sp_unused = Linear[SMOLVLA_STATE_DIM, SMOLLM_DIM].make[
@@ -282,6 +306,17 @@ def main() raises:
         print("     max |delta action| =", worst, "  rms =",
               sqrt(ss / Float64(max(n_cmp, 1))), "  over", n_cmp,
               "chunk values (the action's units)")
+        # `SMOLVLA_DUMP_ACTIONS=<file>`: the fused path's chunk for this fixed
+        # observation, one value per line, so two builds (fp32 and int4 VLM)
+        # can be compared in the action's units without both in one process.
+        var dump = getenv("SMOLVLA_DUMP_ACTIONS")
+        if dump.byte_length() > 0:
+            var text = String()
+            for i in range(len(act_fused)):
+                text += String(act_fused[i]) + "\n"
+            with open(dump, "w") as fo:
+                fo.write(text)
+            print("     chunk written to", dump)
 
     # ── end to end, the honest total ─────────────────────────────────────
     var launches_before = _launch_count()
