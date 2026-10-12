@@ -56,15 +56,16 @@ that still has gradients: it would train nothing.
 ## Paths
 
 CPU: one `cblas_sgemm` per product on macOS, whose alpha and beta carry the
-scale and the accumulation; plain loops elsewhere. GPU: MAX's matmul for the
-products, small kernels for the scale, the accumulations and the transposes
-of the two [T, R_PAD] matrices. xᵀ is never formed: dA is formed as
-(ghᵀ x)ᵀ, which is R_PAD × IN.
-
-⚠ On NVIDIA this generic path runs MAX's matmul with N = R_PAD, which MAX
-sends to its allocating vendor fallback (`Linear`'s N-padding notes). A
-cuBLAS path, whose alpha and beta also remove every elementwise kernel, is
-the NVIDIA follow-up. fp32 only: the bf16-flow adapter comes with QLoRA.
+scale and the accumulation; plain loops elsewhere. NVIDIA (`CUBLAS_BWD`, as
+`Linear`'s backward): one `cublas_gemm` per product, the same alpha / beta and
+the transposes as flags, so no kernel but the GEMMs and no allocation (a
+captured step stays capturable), in the base layer's precision
+(`cublas_tf32(T, OUT, IN)`: a layer gets one). Other GPUs (Metal): MAX's
+matmul for the products, small kernels for the scale, the accumulations and
+the transposes of the two [T, R_PAD] matrices; xᵀ is never formed, dA is
+(ghᵀ x)ᵀ, which is R_PAD × IN. MAX's matmul is not used on NVIDIA because an
+N of R_PAD sends it to its allocating vendor fallback (`Linear`'s N-padding
+notes). fp32 only: the bf16-flow adapter comes with QLoRA.
 """
 
 from std.math import sqrt
@@ -87,6 +88,7 @@ from ..core.initializer import Initializer
 from ..core.amp import AMPPolicy, NoAMP
 from ..core.walkers import join_name
 from ..core.mm import mm
+from ..core.cublas_gemm import cublas_gemm, cublas_tf32, CUBLAS_BWD
 from ..core.polyak import polyak_tensor
 from ..primitives.linear import Linear
 
@@ -373,6 +375,19 @@ struct LoRAAdapter[
                 self.h, Self.R_PAD, self.lora_B.val, Self.OUT,
                 1.0, y, Self.OUT,
             )
+        elif CUBLAS_BWD:
+            comptime TF = cublas_tf32(T, Self.OUT, Self.IN)
+            var c = ctx.value()
+            self.h.ensure_gpu(c, T * Self.R_PAD)
+            cublas_gemm[False, False, TF](
+                c, self.h.dev.value(), x.dev.value(),
+                self.lora_A.val.dev.value(), T, Self.R_PAD, Self.IN, 0.0,
+            )
+            cublas_gemm[False, False, TF](
+                c, y.dev.value(), self.h.dev.value(),
+                self.lora_B.val.dev.value(), T, Self.OUT, Self.R_PAD, 1.0,
+                alpha=Float32(s),
+            )
         else:
             var c = ctx.value()
             self.h.ensure_gpu(c, T * Self.R_PAD)
@@ -450,6 +465,35 @@ struct LoRAAdapter[
                 T, Self.IN, Self.R_PAD, 1.0,
                 self.gh, Self.R_PAD, self.lora_A.val, Self.R_PAD,
                 1.0, gx, Self.IN,
+            )
+        elif CUBLAS_BWD:
+            comptime TF = cublas_tf32(T, Self.OUT, Self.IN)
+            var c = ctx.value()
+            if want_dB:
+                self.h.ensure_gpu(c, T * Self.R_PAD)
+                cublas_gemm[False, False, TF](
+                    c, self.h.dev.value(), x.dev.value(),
+                    self.lora_A.val.dev.value(), T, Self.R_PAD, Self.IN, 0.0,
+                )
+                cublas_gemm[True, False, TF](
+                    c, self.lora_B.grd.dev.value(), self.h.dev.value(),
+                    g.dev.value(), Self.R_PAD, Self.OUT, T, 1.0,
+                    alpha=Float32(s),
+                )
+            self.gh.ensure_gpu(c, T * Self.R_PAD)
+            cublas_gemm[False, True, TF](
+                c, self.gh.dev.value(), g.dev.value(),
+                self.lora_B.val.dev.value(), T, Self.R_PAD, Self.OUT, 0.0,
+                alpha=Float32(s),
+            )
+            if want_dA:
+                cublas_gemm[True, False, TF](
+                    c, self.lora_A.grd.dev.value(), x.dev.value(),
+                    self.gh.dev.value(), Self.IN, Self.R_PAD, T, 1.0,
+                )
+            cublas_gemm[False, True, TF](
+                c, gx.dev.value(), self.gh.dev.value(),
+                self.lora_A.val.dev.value(), T, Self.IN, Self.R_PAD, 1.0,
             )
         else:
             var c = ctx.value()
@@ -568,6 +612,12 @@ struct LoRAAdapter[
                 Self.IN, Self.OUT, Self.R_PAD, s,
                 self.lora_A.val, Self.R_PAD, self.lora_B.val, Self.OUT,
                 1.0, w, Self.OUT,
+            )
+        elif CUBLAS_BWD:
+            cublas_gemm[False, False, False](
+                ctx.value(), w.dev.value(), self.lora_A.val.dev.value(),
+                self.lora_B.val.dev.value(), Self.IN, Self.OUT, Self.R_PAD,
+                1.0, alpha=Float32(s),
             )
         else:
             var c = ctx.value()
