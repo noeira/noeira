@@ -261,6 +261,14 @@ def main() raises:
     var sigma = Float64(_arg(args, "--k-sigma", "0.3"))
     var hz = Int(_arg(args, "--h", "3"))
     var window = Int(_arg(args, "--window", "8"))
+    # the objective (S3 v2, 12 Oct: tracking the teacher's path step by step
+    # with a model that ranks well dragged the arm along the TEACHER's pace,
+    # 10/30): `--goal-ahead G` > 0 scores every predicted step against ONE
+    # reference latent G model steps past the current progress (progress,
+    # not pace); `--min-margin M` keeps δ0 unless the best candidate's cost
+    # is below (1 − M) × δ0's (the student unless clearly better)
+    var goal_ahead = Int(_arg(args, "--goal-ahead", "0"))
+    var min_margin = Float64(_arg(args, "--min-margin", "0"))
     var rng = Int(_arg(args, "--rng", "0"))
     # every N-th decision: EXECUTE every candidate from the same sim state
     # (snapshot -> 5·h ticks -> render, encode -> restore) and compare the
@@ -369,7 +377,8 @@ def main() raises:
             r += FS
         print("critic: world model", wm, "(", n_enc, "encoder tensors ) | reference",
               ref_path, "|", n0, "ticks ->", n_ref, "latents | K", K, "| sigma", sigma,
-              "| h", hz, "| window", window, "| proprio", prop.on)
+              "| h", hz, "| window", window, "| proprio", prop.on, "| goal ahead", goal_ahead,
+              "| min margin", min_margin)
     print("critic: mode", mode, "| student", ckpt)
 
     var env = E(ctx)
@@ -557,7 +566,7 @@ def main() raises:
                 var costs = List[Float64](length=K, fill=0.0)
                 for c in range(K):
                     for h in range(hz):
-                        var gi = min(n_ref - 1, i_star + 1 + h)
+                        var gi = min(n_ref - 1, i_star + 1 + h) if goal_ahead <= 0 else min(n_ref - 1, i_star + goal_ahead)
                         costs[c] += _d2(embs, (c * (HOR + 1) + n_obs + h) * EMB, z_ref, gi * EMB)
                 if rank_every > 0 and n_dec % rank_every == 0:
                     var qs = List[Float64](length=NQ, fill=0.0)
@@ -614,7 +623,7 @@ def main() raises:
                             prop.add(zh, _words(qn, qdn, tp), octx)
                             for d in range(EMB):
                                 z_act[(c * hz + h) * EMB + d] = zh[d]
-                            var gi = min(n_ref - 1, i_star + 1 + h)
+                            var gi = min(n_ref - 1, i_star + 1 + h) if goal_ahead <= 0 else min(n_ref - 1, i_star + goal_ahead)
                             real_cost[c] += _d2(zh, 0, z_ref, gi * EMB)
                     # restore the decision's state (and the render buffers' pose)
                     env.set_state(qs, vs)
@@ -651,6 +660,8 @@ def main() raises:
                     for c in range(1, K):
                         if costs[c] < costs[pick]:
                             pick = c
+                    if costs[pick] > (1.0 - min_margin) * costs[0]:
+                        pick = 0
                 else:
                     pick = Int(random_ui64(0, UInt64(K - 1)))
                 var b1 = n_obs * EMB

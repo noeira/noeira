@@ -132,6 +132,26 @@ def _action_spread(data: So101WMData[R], label: String):
     print(line)
 
 
+def _prop_spread(data: So101WMData[R], label: String):
+    """The data's proprio words in the (loaded) normaliser's units: a word
+    far from mean 0 / std 1 on real is a sim-to-real mismatch the model
+    reads directly."""
+    var names: List[String] = ["q", "qd", "lead"]
+    for g in range(3):
+        var line = String("  ") + label + " proprio " + names[g] + " (mean / std):"
+        for j in range(JOINTS):
+            var k = g * JOINTS + j
+            var m = 0.0
+            var s2 = 0.0
+            for r in range(data.n_rows):
+                var z = (Float64(data.prop[r * PROP + k]) - data.p_mean[k]) / data.p_std[k]
+                m += z
+                s2 += z * z
+            m /= Float64(data.n_rows)
+            line += " " + String(Float32(m)) + "/" + String(Float32(sqrt(max(s2 / Float64(data.n_rows) - m * m, 0.0))))
+        print(line)
+
+
 def _check[TRT: WMWindowLoss](
     mut tr: TRT, real: String, sim: String, stats: String, pstats: String, batches: Int,
 ) raises:
@@ -144,6 +164,8 @@ def _check[TRT: WMWindowLoss](
     print("  real:", rd.n_rows, "rows,", rd.n_episodes, "episodes,",
           len(rd.train_starts) + len(rd.val_starts), "windows")
     _action_spread(rd, String("real"))
+    if PROPRIO:
+        _prop_spread(rd, String("real"))
     var lr_ = _losses(tr, rd, batches)
     _report(String("real"), lr_)
     if sim.byte_length() > 0:
