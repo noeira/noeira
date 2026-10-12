@@ -47,6 +47,10 @@ want() { [[ " $STAGES " == *" $1 "* ]] && [ ! -f "$D/$1.done" ]; }
 
 if want build; then
   say "build"
+  # the rerenderer's PNG check writes through the HTTP shim's library; a
+  # fresh worktree has none (git-ignored build product)
+  [ -f noeira/io/libnra_http.so ] || pixi run -e "$PIXI_ENV" build-http > "$D/build_http.log" 2>&1 \
+    || { say "BUILD-FAILED http shim"; exit 1; }
   mojo build -I . -D TASK_PPO_ACT_HIST=3 -D TASK_PPO_TARGET_OBS \
     examples/so101/ppo_state_probe_sim.mojo -o build/ppo_state_probe > "$D/build_probe.log" 2>&1 \
     || { say "BUILD-FAILED probe"; exit 1; }
