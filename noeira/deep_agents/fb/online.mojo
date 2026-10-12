@@ -579,6 +579,16 @@ struct FBOnlineAgent[
     var z_pin: Tensor          # LANES * D
     var z_pin_mask: Tensor     # LANES, 1 = pinned
     var z_pin_on: Bool
+    # ── an EXTERNAL exploration-z source (opt-in, `enable_zsrc`): FB-MEBE's
+    # inverse-density `z = B(s)` pool (`fb/online_mebe.mojo`). When on, it
+    # REPLACES two sources: the lanes draw from it (probability `zbuf_frac`)
+    # instead of the ZBuffer, and the relabel's non-uniform share draws from
+    # it instead of `B(s+)` of the batch — the release's `refresh_z` and
+    # `sample_mixed_z`. `BATCH` rows, rewritten in place by its owner
+    # between steps (eager), so the captured step reads a fixed pointer.
+    var zsrc: Tensor           # BATCH * D
+    var zsrc_fill: Optional[DeviceBuffer[DType.int32]]
+    var zsrc_on: Bool
 
     def __init__(out self):
         self.t = Self.TrainerT()
@@ -648,6 +658,9 @@ struct FBOnlineAgent[
         self.z_pin = Tensor()
         self.z_pin_mask = Tensor()
         self.z_pin_on = False
+        self.zsrc = Tensor()
+        self.zsrc_fill = None
+        self.zsrc_on = False
 
     @staticmethod
     def make[
@@ -1040,15 +1053,22 @@ struct FBOnlineAgent[
             grid_dim=_blocks(NP), block_dim=TPB,
         )
         self._roll_off += UInt64(2 * NP)
+        # the lanes' non-uniform source: the ZBuffer, or the external pool
+        var zsrc_ptr = mptr(self.zbuf.dev.value().unsafe_ptr())
+        var fill_ptr = mptr(self.zbuf_fill.value().unsafe_ptr())
+        if self.zsrc_on:
+            zsrc_ptr = mptr(self.zsrc.dev.value().unsafe_ptr())
+            fill_ptr = mptr(self.zsrc_fill.value().unsafe_ptr())
+        var zsrc_fill = LayoutTensor[
+            DType.int32, Layout.row_major(1), MutAnyOrigin
+        ](fill_ptr)
         c.enqueue_function[
             z_lane_resample_kernel[Self.D, Self.LANES, Self.ZBUF]
         ](
             mptr(self.z_lane.dev.value().unsafe_ptr()),
             mptr(self._gauss_lane.dev.value().unsafe_ptr()),
-            mptr(self.zbuf.dev.value().unsafe_ptr()),
-            LayoutTensor[DType.int32, Layout.row_major(1)](
-                self.zbuf_fill.value()
-            ),
+            zsrc_ptr,
+            zsrc_fill,
             mptr(self._pick_lane.dev.value().unsafe_ptr()),
             Int32(self._act_iter),
             Int32(self.z_hold),
@@ -1082,6 +1102,29 @@ struct FBOnlineAgent[
         self.z_pin.upload(self.ctx.value())
         self.z_pin_mask.upload(self.ctx.value())
         self.z_pin_on = True
+
+    def enable_zsrc(mut self) raises:
+        """Switch the lanes' and the relabel's non-uniform `z` source to the
+        external pool `zsrc` (`BATCH` rows). ⚠ BEFORE any capture: the
+        captured relabel reads the pointer chosen here. The pool starts on
+        the sphere (uniform draws), so a lane or a relabel that reads it
+        before its owner's first refresh gets a uniform `z`, not zeros."""
+        var c = self.ctx.value()
+        ensure_t["gpu"](self.zsrc, Self.BATCH * Self.D, self.ctx)
+        box_muller_normal_gpu[Self.BATCH * Self.D](
+            c, mptr(self.zsrc.dev.value().unsafe_ptr()),
+            self._roll_seed + 9001, UInt64(0),
+        )
+        c.enqueue_function[project_sphere_kernel[Self.D, Self.BATCH]](
+            mptr(self.zsrc.dev.value().unsafe_ptr()),
+            Scalar[DT](sqrt(Float64(Self.D))),
+            grid_dim=_blocks(Self.BATCH), block_dim=TPB,
+        )
+        var f = c.enqueue_create_buffer[DType.int32](1)
+        f.enqueue_fill(Int32(Self.BATCH))
+        self.zsrc_fill = f^
+        c.synchronize()
+        self.zsrc_on = True
 
     def _policy_into(
         mut self,
@@ -1438,10 +1481,14 @@ struct FBOnlineAgent[
             off_lt, grid_dim=1, block_dim=1
         )
         var keep_from = Int32(Self.EXPERT_ROWS) if self._expert_n > 0 else Int32(0)
+        # the non-uniform share: `B(s+)` of the batch, or the external pool
+        var goal_src = mptr(self.t.b_sp.dev.value().unsafe_ptr())
+        if self.zsrc_on:
+            goal_src = mptr(self.zsrc.dev.value().unsafe_ptr())
         c.enqueue_function[z_relabel_kernel[Self.D, Self.BATCH]](
             mptr(self.t.bz.dev.value().unsafe_ptr()),
             mptr(self.gauss.dev.value().unsafe_ptr()),
-            mptr(self.t.b_sp.dev.value().unsafe_ptr()),
+            goal_src,
             mptr(self.pick.dev.value().unsafe_ptr()),
             Scalar[DT](self.keep_frac), Scalar[DT](self.uniform_frac),
             keep_from,

@@ -41,6 +41,11 @@ tests/deep_agents/test_fb_ring_derived_next.mojo
 # driver runs end to end, two device steps advance the counters, and the
 # checkpoint loads into the CPU FBTrainer the eval scripts build. ~5 min.
 tests/deep_agents/test_fb_online_smoke.mojo
+# FB-MEBE online (FB_MEBE_G1_PLAN.md §2): the pool refresh writes B(s) of
+# real ring rows, inverse-density, filter honoured; boundaries on the
+# truncation schedule; the r_reg column equals its host recomputation row by
+# row; the driver runs with the step captured.
+tests/deep_agents/test_fb_mebe_online_smoke.mojo
 
 # The batched GPU walker raises `done` at MAX_STEPS on every lane — the env
 # side of the `episodes 0` symptom of the first online run (§18.7). ~2 min.

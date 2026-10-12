@@ -267,6 +267,11 @@ struct FBTrainer[
     # the captured kernel sequence is fixed.
     var g_pi_extra: Tensor
     var has_pi_extra: Bool
+    # ⚠ `True` adds `g_pi_extra` RAW even with BC off — the actor loss is then
+    # `−Q_fb − λ·Q_x`, FB-MEBE's released form (`agent_meta/fb/agent.py`,
+    # `reg_coeff 20` against an unscaled `Q_critic`), instead of BFM-Zero's
+    # `−Q_fb − λ·|Q_fb|·Q_x`. Fixed at construction like `has_pi_extra`.
+    var pi_extra_raw: Bool
     # ── the batch itself ────────────────────────────────────────────────
     # Owned, not passed per step. `TensorRefs[N, o]` requires every tensor in
     # a pack to share ONE origin, so a `train_step(s, a, ...)` taking five
@@ -416,6 +421,7 @@ struct FBTrainer[
         self.bc_mask = Tensor()
         self.g_pi_extra = Tensor()
         self.has_pi_extra = False
+        self.pi_extra_raw = False
         self.bs = Tensor()
         self.ba = Tensor()
         self.bsn = Tensor()
@@ -498,6 +504,7 @@ struct FBTrainer[
         self.bc_mask = move.bc_mask^
         self.g_pi_extra = move.g_pi_extra^
         self.has_pi_extra = move.has_pi_extra
+        self.pi_extra_raw = move.pi_extra_raw
         self.bs = move.bs^
         self.ba = move.ba^
         self.bsn = move.bsn^
@@ -1132,7 +1139,7 @@ struct FBTrainer[
         # + the external term (FB-CPR's `−reg·∂Q_D/∂π`), see `g_pi_extra`.
         # `acc_mag` holds THIS step's `mean |F·z|`, so the scale is not lagged.
         if self.has_pi_extra:
-            if self.bc_weight > 0.0:
+            if self.bc_weight > 0.0 or self.pi_extra_raw:
                 axpy_t[T, Self._NA](self.g_pi, self.g_pi_extra, Scalar[DT](1.0), c)
             else:
                 axpy_by_mag_t[T, Self._NA](
