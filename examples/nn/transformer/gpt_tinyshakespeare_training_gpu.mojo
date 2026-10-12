@@ -29,6 +29,7 @@ Run on NVIDIA:
 from std.random import seed
 from std.math import log, exp
 from std.time import perf_counter_ns
+from std.sys import get_defined_int, is_defined
 from max.gpu.host import DeviceContext
 
 from noeira.nn.datasets import CharTokenizer, load_text, train_val_split
@@ -56,7 +57,7 @@ comptime BASE_LR: Scalar[DT] = 1e-3
 comptime BETA2: Scalar[DT] = 0.99
 comptime WD: Scalar[DT] = 0.1
 
-comptime TOTAL_ITERS = 5000
+comptime TOTAL_ITERS = get_defined_int["NN_ITERS", 5000]()
 comptime WARMUP_ITERS = 100
 comptime EVAL_INTERVAL = 250
 comptime MIN_LR_SCALE: Float64 = 0.1
@@ -76,17 +77,16 @@ comptime GPT_MODEL = GPTDropTied[
     VOCAB, SEQ, EMBED, HEADS, LAYERS, FF_MULT, True, DROPOUT_P,
     UInt64(0xC0FFEE), USE_MAX_ATTN,
 ]
-# CUDA-graph capture of the per-step DEVICE compute (forward → SeqCE → vjp →
-# grad-clip → opt.step); the host batch-build stays eager. Eligible here because
-# this GPT is fp32 (ACT_DT == DT). No-op on non-NVIDIA (runs eagerly,
-# bit-identical). ⚠️ On NVIDIA this is EXPECTED to abort inside `linalg.matmul`'s
-# split-K workspace allocation (a per-call DeviceBuffer alloc is illegal under
-# stream capture) — the known nn-GEMM blocker. Flip to False to fall back to the
-# eager path until a capture-safe GEMM lands.
-comptime USE_CUDA_GRAPH = True
+# `-D NN_TRAIN_GRAPH`: the training step captured in a CUDA graph (NVIDIA;
+# eager elsewhere). `-D NN_HOST_BATCH`: build each batch on the host (sample +
+# one-hot + upload) instead of on the device — the pre-device-batch baseline.
+# `-D NN_ITERS=N` shortens the run. Defines need `mojo build -D ...`, then
+# run the binary.
+comptime USE_CUDA_GRAPH = is_defined["NN_TRAIN_GRAPH"]()
+comptime DEVICE_BATCH = not is_defined["NN_HOST_BATCH"]()
 comptime GPT_AR = AutoregressiveTrainer[
     GPT_MODEL, AdamW, VOCAB, SEQ, BATCH, target="gpu",
-    USE_TRAIN_CUDA_GRAPH=USE_CUDA_GRAPH,
+    USE_TRAIN_CUDA_GRAPH=USE_CUDA_GRAPH, DEVICE_BATCH=DEVICE_BATCH,
 ]
 
 

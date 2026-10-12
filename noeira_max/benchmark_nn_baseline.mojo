@@ -17,7 +17,7 @@ This file is pure nn (no Python / no max.engine), so plain `mojo run` is fine:
 """
 
 from std.time import perf_counter_ns
-from std.gpu.host import DeviceContext
+from max.gpu.host import DeviceContext
 
 from noeira.nn.constants import DT
 from noeira.nn.combinators.sequential import Sequential
@@ -72,6 +72,17 @@ def bench_nn[
     ctx.synchronize()
     var per = Float64(perf_counter_ns() - t0) / Float64(iters) / 1000.0  # us
 
+    # Per call, synchronised: what a caller that needs the output waits (the
+    # protocol of the C-API columns (d)/(e) in capi_mojo/bench/bench_capi.mojo).
+    var samples = List[Int]()
+    for _ in range(iters):
+        var t = perf_counter_ns()
+        net.forward["gpu", BATCH](TensorRefs[1](x), y, Optional(ctx))
+        ctx.synchronize()
+        samples.append(Int(perf_counter_ns() - t))
+    sort(samples)
+    var synced = Float64(samples[len(samples) // 2]) / 1000.0
+
     var params = (IN * H1 + H1) + (H1 * H2 + H2) + (H2 * OUT + OUT)
     print(
         "  "
@@ -90,7 +101,9 @@ def bench_nn[
         + String(params)
         + "   nn forward = "
         + f2(per)
-        + " us/call"
+        + " us/call (synced per call: median "
+        + f2(synced)
+        + " us)"
     )
 
 

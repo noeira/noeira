@@ -16,7 +16,7 @@ from ..primitives.token_mean import TokenMean
 from ..combinators.sequential import Sequential
 from ..combinators.repeat import Repeat
 from ..combinators.tokenwise import Tokenwise
-from .transformer import TransformerBlock
+from .transformer import TransformerBlockFused
 
 
 # PatchEmbed: image → patch tokens.
@@ -36,7 +36,7 @@ comptime PatchEmbed[
 
 
 # ViT: Vision Transformer encoder + classification head (non-causal).
-#   PatchEmbed → position BiasAdd → N×TransformerBlock → LayerNorm →
+#   PatchEmbed → position BiasAdd → N×TransformerBlockFused → LayerNorm →
 #   TokenMean (mean-pool patches) → Linear head.
 comptime ViT[
     in_channels: Int,
@@ -55,7 +55,7 @@ comptime ViT[
     BiasAdd[n_patches * embed_dim],
     Repeat[
         n_layers,
-        TransformerBlock[
+        TransformerBlockFused[
             embed_dim, n_heads, n_patches, ff_mult * embed_dim, False, use_max
         ],
     ],

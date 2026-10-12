@@ -1,0 +1,33 @@
+# nn training-driver GPU manifest — `pixi run -e apple test-nn-gpu` (or -e nvidia)
+#
+# The trainers the nn examples (MNIST / CIFAR / ResNet / ViT / GPT) run
+# through. Nothing gated a GPT on the GPU before this manifest: `Embedding`'s
+# GPU forward stopped compiling with `49a56a667` (2026-10-02) and no test saw it.
+
+# --- AutoregressiveTrainer (the TinyShakespeare GPT driver) ---
+tests/nn/test_window_batch_device.mojo
+tests/nn/test_storage_autoregressive_trainer_smoke.mojo
+tests/nn/test_amp_autoregressive_trainer_bf16.mojo
+tests/nn/test_amp_gpt_bf16.mojo
+
+# --- Trainer.train_gpu (MNIST / CIFAR / ResNet / ViT driver) ---
+tests/nn/test_storage_trainer_augment_schedule_smoke.mojo
+tests/nn/test_trainer_capture_shuffle_aug.mojo
+
+# --- kernels the nn examples spend their step in ---
+tests/nn/test_flash_attention.mojo
+tests/nn/test_flash_attention_mma_gpu.mojo
+tests/nn/test_attention_qkv_layout.mojo
+tests/nn/test_attention_gpu_shapes.mojo
+tests/nn/test_layer_norm_dparams_gpu.mojo
+tests/nn/test_layer_norm_storage.mojo
+tests/nn/test_linear_dw_gpu.mojo
+tests/nn/test_linear_act_gpu.mojo
+tests/nn/test_linear_relu_gpu.mojo
+tests/nn/test_conv2d_gpu.mojo
+tests/nn/test_polyak_and_copy_sync.mojo
+tests/nn/test_feed_forward_gelu.mojo
+
+# --- dropout: the masks, and every Repeat copy (every GPT block) on its own ---
+tests/nn/test_dropout_storage.mojo
+tests/nn/test_dropout_repeat_copies.mojo

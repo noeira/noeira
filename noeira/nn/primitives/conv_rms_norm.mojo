@@ -26,6 +26,7 @@ from std.utils.numerics import get_accum_type
 from layout import Layout, LayoutTensor, TileTensor, row_major
 
 from noeira.nn.constants import DT, CPU_SIMD_W
+from ..core.polyak import polyak_tensor
 from ..core.tensor import Tensor
 from ..core.tensor_refs import TensorRefs
 from ..core.module import Module
@@ -167,6 +168,21 @@ struct ConvRMSNorm[C_: Int, HW_: Int](Module):
         comptime if target != "cpu":
             rn.gamma.val.upload(ctx.value())
         return rn^
+
+    def polyak_from[
+        target: StaticString
+    ](
+        mut self,
+        mut src: Self,
+        tau: Scalar[DT],
+        ctx: Optional[DeviceContext],
+    ) raises:
+        """Soft-update toward `src` (target <- online). The `Module`
+        default is a NO-OP, so without this override a target net containing
+        this layer would keep its init values forever while the online copy
+        trains (the `LayerNorm` / `Conv2D` bug class; audit 2026-10-07)."""
+        polyak_tensor[target, Self.C_](self.gamma.val, src.gamma.val, tau, ctx)
+
 
     def forward[
         target: StaticString, B: Int, o: MutOrigin, POLICY: AMPPolicy = NoAMP

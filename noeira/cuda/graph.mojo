@@ -38,6 +38,7 @@ from std.ffi import OwnedDLHandle, c_int
 from std.memory import alloc, dealloc
 from std.os import getenv
 from max.gpu.host import DeviceContext
+from max.gpu.host._nvidia_cuda import CUDA
 
 
 comptime _CUptr = Pointer[NoneType, MutUntrackedOrigin]
@@ -166,12 +167,25 @@ struct CUDAGraph(Movable):
     # an already-open handle is a hash lookup; against a graph launch plus a
     # stream synchronize it is not measurable.
 
-    def __init__(out self, ctx: DeviceContext) raises:
+    def __init__(
+        out self, ctx: DeviceContext, *, stream_of_context: Bool = False
+    ) raises:
         """Initialize CUDA graph capture.
 
         On NVIDIA: loads interceptor, discovers Mojo's internal stream.
         Requires at least one prior kernel launch for stream discovery.
         On non-NVIDIA: disabled state, all methods are no-ops.
+
+        `stream_of_context=True` captures `ctx`'s OWN stream, asked of MAX
+        (`CUDA(ctx.stream())`, the handle noeira's cuBLASLt path already
+        launches on), instead of the interceptor's `g_mojo_stream` — which is
+        ONE process-wide value, the stream of whichever kernel launched last.
+        With several contexts that is the wrong stream for all but one of them
+        (`cuStreamBeginCapture` error 400 in the multi-GPU spike). The caller
+        must make `ctx` current (`with ctx.push_context():`) around this
+        constructor and every capture/replay call, because the replay stream
+        and the instantiated graph belong to the current context. Default off:
+        single-context callers keep the discovered stream.
         """
         self._ctx = ctx  # keep the context alive — see the field comment
         self._state = 0
@@ -221,6 +235,13 @@ struct CUDAGraph(Movable):
             # Get Mojo's internal stream
             var get_stream = self._lib.get_function[_CUptr]("intercept_get_mojo_stream")
             self._mojo_stream = get_stream()
+            if stream_of_context and Int(self._mojo_stream) != 0:
+                # The interceptor is hooked (it has seen a launch), so its
+                # driver entry points work; its stream may be another context's.
+                var own = CUDA(ctx.stream())
+                if not own:
+                    raise Error("[CUDAGraph] MAX returned no stream for this context")
+                self._mojo_stream = _CUptr(unsafe_from_address=Int(own.value()))
 
             if Int(self._mojo_stream) == 0:
                 # A NULL stream has TWO causes and they need opposite fixes.
@@ -458,6 +479,7 @@ struct CUDAGraph(Movable):
 
 def maybe_capture_replay[
     STEP: def () capturing raises -> None,
+    VERBOSE: Bool = True,
 ](mut graph: Optional[CUDAGraph], ctx: DeviceContext) raises:
     """Capture `STEP` into `graph` on first call; replay it thereafter.
 
@@ -482,7 +504,10 @@ def maybe_capture_replay[
 
     Host bookkeeping (step counters, metric flush cadence) is intentionally
     NOT here — keep it in the caller's loop, advanced once per logical update,
-    so it stays correct whether the step ran directly or via replay."""
+    so it stays correct whether the step ran directly or via replay.
+
+    `VERBOSE=False` skips the node-count line — for a caller that re-captures
+    by design (a schedule baked into kernel arguments) and printed it once."""
     comptime if has_nvidia_gpu_accelerator():
         if not graph:
             STEP()
@@ -506,11 +531,12 @@ def maybe_capture_replay[
             # tiny/zero node count means capture silently failed — e.g. the
             # closure enqueued on a different stream than the one being
             # captured). Printed once per graph (first call only).
-            print(
-                "[CUDA Graph] maybe_capture_replay captured",
-                g.num_nodes(),
-                "nodes",
-            )
+            comptime if VERBOSE:
+                print(
+                    "[CUDA Graph] maybe_capture_replay captured",
+                    g.num_nodes(),
+                    "nodes",
+                )
             graph = g^
         elif graph.value().is_disabled():
             # Capture was never possible; the closure is the whole step.

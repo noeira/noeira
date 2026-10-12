@@ -23,6 +23,8 @@ from std.sys import has_nvidia_gpu_accelerator
 from max.gpu.host import DeviceContext, DeviceBuffer
 from layout import TileTensor, row_major
 from linalg.matmul import matmul as max_matmul
+from linalg.utils import elementwise_epilogue_type
+from std.utils.index import IndexList
 from linalg.bmm import batched_matmul
 
 
@@ -58,6 +60,51 @@ def mm[
         var bv = TileTensor(b, row_major(B0, B1))
         var ov = TileTensor(o, row_major(O0, O1))
         max_matmul[transpose_b=transpose_b, target="gpu"](ov, av, bv, c)
+
+
+@always_inline
+def mm_bias[
+    *, A0: Int, A1: Int, B0: Int, B1: Int, O0: Int, O1: Int, dt: DType,
+](
+    mut o: DeviceBuffer[dt],
+    a: DeviceBuffer[dt],
+    b: DeviceBuffer[dt],
+    bias: DeviceBuffer[dt],
+    c: DeviceContext,
+) raises:
+    """`o[O0, O1] = a[A0, A1] @ b[B0, B1] + bias[O1]` in ONE launch: the bias
+    is added in MAX's GEMM epilogue (`elementwise_lambda_fn`, run on each
+    output tile before its store), so the separate bias pass — a full
+    read-modify-write of the output — is gone.
+
+    NVIDIA only. On Metal a buffer reached only through the epilogue closure
+    is not made resident and reads as zeros with no error
+    (`benchmarks/bench_matmul_epilogue_fusion.mojo`, `residency_repro`).
+    The stored value is the GEMM's fp32 result plus the bias, the same
+    operation the separate pass did."""
+    comptime assert has_nvidia_gpu_accelerator(), (
+        "mm_bias: the epilogue's captured bias is not resident on Metal"
+    )
+    var av = TileTensor(a, row_major[A0, A1]())
+    var bv = TileTensor(b, row_major[B0, B1]())
+    var ov = TileTensor(o, row_major[O0, O1]())
+    var biasv = TileTensor(bias, row_major[O1]())
+
+    @__parameter
+    @always_inline
+    @__copy_capture(ov, biasv)
+    def _add_bias[
+        dtype: DType, width: SIMDLength, *, alignment: Int = 1
+    ](coords: IndexList[2], val: SIMD[dtype, width]) capturing -> None:
+        var out = val.cast[dt]()
+        comptime for i in range(width):
+            out[i] += rebind[Scalar[dt]](biasv[coords[1] + i])
+        ov.store_linear[alignment=alignment](coords, out)
+
+    max_matmul[
+        target="gpu",
+        elementwise_lambda_fn=Optional[elementwise_epilogue_type](_add_bias),
+    ](ov, av, bv, c)
 
 
 @always_inline

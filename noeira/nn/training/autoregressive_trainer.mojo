@@ -33,7 +33,7 @@ GPU-only for now (eval + generation use device buffers). A recurrent model
 """
 
 from std.math import exp, cos
-from std.random import random_float64
+from std.random import random_float64, random_ui64
 from max.gpu.host import DeviceContext
 from layout import Layout
 
@@ -47,6 +47,8 @@ from ..loss.sequence_cross_entropy import SequenceCrossEntropyLoss
 from .trainer import _cast_kernel  # AMP boundary cast (fp32 ↔ MADT)
 from noeira.nn.datasets import CharTokenizer, DatasetSplit, make_batch
 from noeira.cuda import CUDAGraph, maybe_capture_replay
+from noeira.nn.core.ptr import mptr
+from .window_batch_kernels import window_onehot_kernel, advance_step_kernel
 
 
 struct AutoregressiveTrainer[
@@ -57,14 +59,22 @@ struct AutoregressiveTrainer[
     BATCH: Int,
     target: StaticString = "gpu",
     # Opt-in CUDA-graph capture of the per-step DEVICE compute (forward → SeqCE
-    # accumulate → vjp → grad-clip → opt.step). The batch-build (host sampling +
-    # one-hot + upload into the PERSISTENT `in_t`/`tgt_t` buffers) stays eager;
-    # the captured graph reads those fixed buffers and replays. fp32-only (the
+    # accumulate → vjp → grad-clip → opt.step). With DEVICE_BATCH the batch
+    # build is captured too; without it the host build (sampling + one-hot +
+    # upload into the PERSISTENT `in_t`/`tgt_t` buffers) stays eager and the
+    # captured graph reads those fixed buffers. fp32-only (the
     # AMP step has a host-side version bump). Default OFF — on NVIDIA the nn
     # GEMM (`linalg.matmul`) allocates a split-K workspace per call, illegal
     # under stream capture; enable only once that's resolved. No-op on
     # non-NVIDIA (runs eagerly, bit-identical).
     USE_TRAIN_CUDA_GRAPH: Bool = False,
+    # Training batches built ON THE DEVICE (`window_batch_kernels`): the train
+    # corpus resident as int32, window starts drawn from a counter hash, the
+    # one-hots written by a kernel — no host loop, no H2D, no wait on the
+    # previous step, and the build rides inside the captured graph. False =
+    # the host `make_batch` + one-hot + upload (the before/after baseline).
+    # Eval and generation build on the host either way.
+    DEVICE_BATCH: Bool = True,
 ](Movable):
     comptime IN_DIM = Self.SEQ * Self.VOCAB
     comptime OUT_DIM = Self.SEQ * Self.VOCAB
@@ -108,6 +118,11 @@ struct AutoregressiveTrainer[
     # Lazily-captured per-step compute graph (None until the first capture). Only
     # touched on the `CAPTURE` path; a no-op slot otherwise.
     var _train_graph: Optional[CUDAGraph]
+    # DEVICE_BATCH: the resident train corpus (int32), [seed, step], and the
+    # last batch's window starts (read by the gate only).
+    var corpus_dev: TensorImpl[DType.int32]
+    var rng_dev: TensorImpl[DType.uint64]
+    var starts_dev: TensorImpl[DType.int32]
 
     def __init__(
         out self,
@@ -144,6 +159,9 @@ struct AutoregressiveTrainer[
         self.min_lr_scale = min_lr_scale
         self.grad_clip = grad_clip
         self._train_graph = None
+        self.corpus_dev = TensorImpl[DType.int32]()
+        self.rng_dev = TensorImpl[DType.uint64]()
+        self.starts_dev = TensorImpl[DType.int32]()
 
     # ----- Factory --------------------------------------------------------
 
@@ -180,7 +198,68 @@ struct AutoregressiveTrainer[
         # tie-wiring (which points the head at the embedding `Tensor` cells)
         # and scaled-init surgery operate on the arena-backed buffers.
         s.opt.adopt[Self.target](s.net, Optional(s.ctx))
+        comptime if Self.DEVICE_BATCH:
+            s._init_device_batch()
         return s^
+
+    def _init_device_batch(mut self) raises:
+        """Upload the train corpus as int32 and seed the window sampler from
+        the process RNG (reproducible under `std.random.seed`). Allocates the
+        one-hot buffers at full batch size so the graph's pointers never move."""
+        var n = len(self.train_ids)
+        if n < Self.SEQ + 1:
+            raise Error("DEVICE_BATCH: train corpus shorter than SEQ + 1")
+        self.corpus_dev.ensure(n)
+        for i in range(n):
+            self.corpus_dev.data[i] = Int32(self.train_ids[i])
+        self.corpus_dev.n = n
+        self.corpus_dev.upload(self.ctx)
+        self.rng_dev.ensure(2)
+        self.rng_dev.data[0] = random_ui64(0, UInt64.MAX)
+        self.rng_dev.data[1] = 0
+        self.rng_dev.n = 2
+        self.rng_dev.upload(self.ctx)
+        self.starts_dev = TensorImpl[DType.int32].alloc_gpu(self.ctx, Self.BATCH)
+        comptime TOTAL = Self.BATCH * Self.IN_DIM
+        self.in_t.n = TOTAL
+        self.in_t.ensure_gpu(self.ctx, TOTAL)
+        self.tgt_t.n = TOTAL
+        self.tgt_t.ensure_gpu(self.ctx, TOTAL)
+
+    def _device_batch(mut self) raises:
+        """Enqueue one training batch's build into `in_t` / `tgt_t` (device
+        only: capture-safe). """
+        comptime TOTAL = Self.BATCH * Self.IN_DIM
+        # `in_t` / `tgt_t` keep their full-batch allocation: eval refills them
+        # at the same size, generation uses its own scratch.
+        self.in_t.n = TOTAL
+        self.tgt_t.n = TOTAL
+        self.ctx.enqueue_function[
+            window_onehot_kernel[Self.MADT, Self.BATCH, Self.SEQ, Self.VOCAB]
+        ](
+            mptr(self.corpus_dev.dev.value().unsafe_ptr()),
+            Int64(self.corpus_dev.n - Self.SEQ),
+            self.rng_dev.lt["gpu", Layout.row_major(2)](),
+            self.in_t.lt["gpu", Layout.row_major(TOTAL)](),
+            self.tgt_t.lt["gpu", Layout.row_major(TOTAL)](),
+            self.starts_dev.lt["gpu", Layout.row_major(Self.BATCH)](),
+            grid_dim=(TOTAL + TPB - 1) // TPB,
+            block_dim=TPB,
+        )
+        self.ctx.enqueue_function[advance_step_kernel](
+            self.rng_dev.lt["gpu", Layout.row_major(2)](),
+            grid_dim=1,
+            block_dim=1,
+        )
+
+    def _host_batch(mut self) raises:
+        """The host build: sample windows, one-hot, upload (waits for the
+        previous upload's copy to drain)."""
+        var mb = make_batch(self.train_ids, Self.BATCH, Self.SEQ)
+        Self._upload_onehot[Self.MADT](
+            self.ctx, self.in_t, mb.inputs, Self.BATCH
+        )
+        Self._upload_onehot[DT](self.ctx, self.tgt_t, mb.targets, Self.BATCH)
 
     # ----- Schedule + one-hot helpers ------------------------------------
 
@@ -389,11 +468,10 @@ struct AutoregressiveTrainer[
         run one forward → SeqCE → vjp → grad-clip → optimizer step. Returns the
         (pre-step) train CE for this batch."""
         self.opt.set_lr(self.base_lr * self._lr_scale(it))
-        var mb = make_batch(self.train_ids, Self.BATCH, Self.SEQ)
-        Self._upload_onehot[Self.MADT](
-            self.ctx, self.in_t, mb.inputs, Self.BATCH
-        )
-        Self._upload_onehot[DT](self.ctx, self.tgt_t, mb.targets, Self.BATCH)
+        comptime if Self.DEVICE_BATCH:
+            self._device_batch()
+        else:
+            self._host_batch()
         self.opt.zero_grad[Self.target](self.net, Optional(self.ctx))
         self.net.forward[Self.target, Self.BATCH](
             child_refs[Self.NET.ARITY, Self.MADT](self.in_t),
@@ -422,8 +500,9 @@ struct AutoregressiveTrainer[
         """The PURE-DEVICE compute captured into the graph: zero_grad → forward →
         SeqCE accumulate → SeqCE vjp → net.vjp → (device grad-clip) → opt.step.
 
-        Reads the PERSISTENT `in_t`/`tgt_t` (refreshed eagerly before each
-        replay). The per-step train CE is folded into the loss's DEVICE
+        DEVICE_BATCH: first builds the batch into `in_t`/`tgt_t` (device
+        kernels, captured). Otherwise reads them as the host refreshed them
+        eagerly before the replay. The per-step train CE is folded into the loss's DEVICE
         accumulator (drained at flush) — never read here, since a D2H would break
         capture. Must enqueue the SAME kernel sequence every call.
 
@@ -433,6 +512,8 @@ struct AutoregressiveTrainer[
         ride the graph). The cached-bf16 weight recast inside `net.forward` is
         also a captured device kernel (see the `CAPTURE` note)."""
         var ctxo = Optional(self.ctx)
+        comptime if Self.DEVICE_BATCH:
+            self._device_batch()
         self.opt.zero_grad["gpu"](self.net, ctxo)
         self.net.forward["gpu", Self.BATCH](
             child_refs[Self.NET.ARITY, Self.MADT](self.in_t),
@@ -473,20 +554,17 @@ struct AutoregressiveTrainer[
         self.opt.step["gpu"](self.net, ctxo)
 
     def _train_step_captured(mut self, it: Int) raises:
-        """One captured/replayed train step. The batch-build (host window sample
-        + one-hot + RESIDENT upload into the persistent `in_t`/`tgt_t`) and the
-        LR push run EAGERLY; the device compute is captured on the first call and
+        """One captured/replayed train step. The LR push (and, without
+        DEVICE_BATCH, the host batch build into the persistent `in_t`/`tgt_t`)
+        run EAGERLY; the device compute is captured on the first call and
         replayed thereafter. The LR is pushed onto the device (`push_lr_device`)
         so the captured `opt.step` reads the FRESH cosine LR each replay instead
         of a host-baked capture-time value."""
         self.opt.push_lr_device["gpu"](
             self.base_lr * self._lr_scale(it), Optional(self.ctx)
         )
-        var mb = make_batch(self.train_ids, Self.BATCH, Self.SEQ)
-        Self._upload_onehot[Self.MADT](
-            self.ctx, self.in_t, mb.inputs, Self.BATCH
-        )
-        Self._upload_onehot[DT](self.ctx, self.tgt_t, mb.targets, Self.BATCH)
+        comptime if not Self.DEVICE_BATCH:
+            self._host_batch()
         # Move the slot into a disjoint local for the capture call (`take` leaves
         # it None) so the closure can borrow `self` without overlapping the
         # slot's mut borrow (mirrors the MBPO dynamics-graph pattern).

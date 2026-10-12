@@ -31,6 +31,7 @@ from noeira.nn.core.splitk_gemm import (
 )
 
 from noeira.nn.constants import DT, TPB
+from ..core.polyak import polyak_tensor
 from ..core.tensor import Tensor, TensorImpl
 from ..core.tensor_refs import TensorRefs
 from ..core.module import Module
@@ -154,6 +155,24 @@ struct Embedding[VOCAB_: Int, EMBED_DIM_: Int, ADT: DType = DT](Module):
         )
         return e^
 
+    def polyak_from[
+        target: StaticString
+    ](
+        mut self,
+        mut src: Self,
+        tau: Scalar[DT],
+        ctx: Optional[DeviceContext],
+    ) raises:
+        """Soft-update toward `src` (target <- online). The `Module`
+        default is a NO-OP, so without this override a target net containing
+        this layer would keep its init values forever while the online copy
+        trains (the `LayerNorm` / `Conv2D` bug class; audit 2026-10-07)."""
+        polyak_tensor[target, Self.W_SIZE](self.weight.val, src.weight.val, tau, ctx)
+        # `polyak_tensor` writes in place without bumping `val.version`: drop the
+        # version-gated bf16 weight cache so the next forward recasts it.
+        self._w_cast_version = -1
+
+
     def forward[
         target: StaticString, B: Int, o: MutOrigin, POLICY: AMPPolicy = NoAMP
     ](
@@ -196,8 +215,6 @@ struct Embedding[VOCAB_: Int, EMBED_DIM_: Int, ADT: DType = DT](Module):
                 var c = ctx.value()
                 outd.ensure_gpu(c, B * Self.EMBED_DIM_)
                 self.cache_inT.ensure_gpu(c, Self.VOCAB_ * B)
-                comptime lbv = Layout.row_major(B, Self.VOCAB_)
-                comptime lvb = Layout.row_major(Self.VOCAB_, B)
                 # out[B, ED] = input[B, VOCAB] @ weight[VOCAB, ED]
                 mm[A0=B, A1=Self.VOCAB_, B0=Self.VOCAB_, B1=Self.EMBED_DIM_, O0=B, O1=Self.EMBED_DIM_](
                     outd.dev.value(), in0d.dev.value(), self.weight.val.dev.value(), c
@@ -205,8 +222,8 @@ struct Embedding[VOCAB_: Int, EMBED_DIM_: Int, ADT: DType = DT](Module):
                 # cache_inᵀ[VOCAB, B] = input[B, VOCAB]ᵀ  (for grad_w in
                 # backward), via Linear's B1' tiled transpose.
                 c.enqueue_function[_transpose_tiled_kernel[DT]](
-                    in0d.lt["gpu", lbv](),
-                    self.cache_inT.lt["gpu", lvb](),
+                    in0d.dev.value(),
+                    self.cache_inT.dev.value(),
                     Int64(B),
                     Int64(Self.VOCAB_),
                     grid_dim=(
@@ -223,8 +240,6 @@ struct Embedding[VOCAB_: Int, EMBED_DIM_: Int, ADT: DType = DT](Module):
             var c = ctx.value()
             out.ensure_gpu(c, B * Self.EMBED_DIM_)
             self.cache_inT_bf.ensure_gpu(c, Self.VOCAB_ * B)
-            comptime lbv = Layout.row_major(B, Self.VOCAB_)
-            comptime lvb = Layout.row_major(Self.VOCAB_, B)
             # input (in0) is ALREADY bf16 — no input cast. W: cached bf16 (recast
             # only on a version bump). out[B, ED] = input[B, VOCAB] @ W[VOCAB, ED]
             # bf16-in → bf16-out GEMM (fp32 accumulation is automatic).
@@ -235,8 +250,8 @@ struct Embedding[VOCAB_: Int, EMBED_DIM_: Int, ADT: DType = DT](Module):
             # cache_inᵀ[VOCAB, B] = input[B, VOCAB]ᵀ at bf16 (for grad_w), via
             # Linear's dtype-parametric tiled transpose (bf16 in → bf16 out).
             c.enqueue_function[_transpose_tiled_kernel[Self.ADT]](
-                in0.lt["gpu", lbv](),
-                self.cache_inT_bf.lt["gpu", lvb](),
+                in0.dev.value(),
+                self.cache_inT_bf.dev.value(),
                 Int64(B),
                 Int64(Self.VOCAB_),
                 grid_dim=(

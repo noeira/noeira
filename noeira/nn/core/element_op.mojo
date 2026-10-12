@@ -36,6 +36,10 @@ trait ElementOp(Movable & Deinitable):
     """If True, backward reads `y = f(x)` from an owned cache buffer.
     If False, backward reads `x` from the forward input pointer (alias)."""
 
+    comptime is_relu: Bool = False
+    """True for `ReLUOp` only: `LinearAct` then fuses bias + activation into
+    a cuBLASLt `RELU_AUX_BIAS` epilogue on NVIDIA (`NN_LT_RELU`)."""
+
     @staticmethod
     def forward_scalar(x: Scalar[DT]) -> Scalar[DT]:
         ...

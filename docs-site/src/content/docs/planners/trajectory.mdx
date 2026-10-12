@@ -101,8 +101,8 @@ var planner = ContinuousCEMOptimizer[BATCH, ACT_DIM](
 var best = planner.optimize(callback, best_plan_out_ptr)
 ```
 
-Those are the LeWM PushT settings — 300 candidates, 30 iterations, top-30
-elites.
+Those are the LeWM PushT paper settings — 300 candidates, 30 iterations,
+top-30 elites.
 
 :::tip[Why `horizon` is a runtime argument and not a compile-time parameter]
 Everything else in the codebase pushes dimensions to compile time. Horizon is
@@ -242,9 +242,9 @@ For CEM and the random shooter, implement `ScorePlanCallback` — one plan in, o
 scalar out, lower is better. If you are scoring many candidates per iteration,
 implement `BatchedScorePlanCallback` as well: it hands you all `K` plans at once
 so you can run a single rollout instead of `K` sequential ones. That change is
-worth far more than it sounds. LeWM's paper-configuration evaluation was
-spending roughly a hundred thousand host syncs per pass before the batched path
-collapsed them to one per iteration.
+worth far more than it sounds. The first LeWM port's paper-configuration
+evaluation was spending roughly a hundred thousand host syncs per pass before
+the batched path collapsed them to one per iteration.
 
 For MPPI, implement `RolloutCallbackCPU` or `RolloutCallbackGPU` — three
 methods: `policy_action` for the prior-seeded trajectories, `rollout_step` for

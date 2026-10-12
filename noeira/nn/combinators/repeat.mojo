@@ -6,6 +6,12 @@ wiring (whose `__getitem__` MutAnyOrigin pin lets adjacent slabs alias safely),
 just stored in a `List[Inner]` indexed by the comptime stage. Requires
 `Inner.IN_DIMS[0] == Inner.OUT_DIM`. `shared=True` is not supported (would need
 per-application caches); pass the default `shared=False` (independent copies).
+
+Independent randomness too: `make` sends copy i `set_attr["rng_copy"](i)`, so
+a `Dropout` in the block draws copy i's masks from its own Philox subsequence.
+The copies share one type, hence one comptime seed, and before this every
+copy drew the same mask at every forward (every GPT block dropped the same
+entries). Copy 0 keeps the stream a lone layer draws.
 """
 
 from max.gpu.host import DeviceContext
@@ -50,8 +56,10 @@ struct Repeat[N: Int, Inner: Module, shared: Bool = False](Module):
         target: StaticString, INIT: Initializer
     ](ctx: Optional[DeviceContext] = None) raises -> Self:
         var r = Self()
-        for _ in range(Self.N):
-            r.children.append(Self.Inner.make[target, INIT](ctx))
+        for i in range(Self.N):
+            var c = Self.Inner.make[target, INIT](ctx)
+            c.set_attr["rng_copy"](Scalar[DT](i))
+            r.children.append(c^)
         return r^
 
     def forward[

@@ -1,12 +1,23 @@
 """Does the K/N alignment padding change what `Linear` computes?
 
 The padded columns are exactly 0, so the dot products must be unchanged up to
-fp32 reduction-order noise. Checks an UNALIGNED width (518, which now pads to
-544) and an ALIGNED one (512, which takes the untouched path) against the CPU
-forward, and confirms the aligned case is bit-identical to before.
+reduction-order noise. Checks UNALIGNED widths (padding active) and ALIGNED
+ones (the untouched path) against the CPU forward, in std units of the CPU
+output: a padding bug (a wrong stride, a column folded into the next row) is
+O(1) there.
+
+Band per backend: 1e-4 on Metal (fp32 both sides); 1e-2 on CUDA, where these
+shapes run in TF32 (MAX's multistage kernel or `cublas_tf32`'s rule) — a
+per-element relative band of 1e-4 read TF32 rounding of near-zero outputs as
+a 10 % error. On NVIDIA the default routing sends every shape here to
+`cublas_gemm` UNPADDED (`cublas_fwd`, printed per shape); the padded MAX path
+runs with `-D NN_GEMM_PATH=max`:
+
+    pixi run -e default mojo run -I . -D NN_GEMM_PATH=max tests/nn/test_linear_pad_parity.mojo
 """
 
-from std.math import abs
+from std.math import abs, sqrt
+from std.sys import has_nvidia_gpu_accelerator
 from max.gpu.host import DeviceContext
 
 from noeira.nn.constants import DT
@@ -16,12 +27,15 @@ from noeira.nn.core.initializer import Kaiming
 from noeira.nn.primitives.linear import Linear
 
 
+comptime TOL = 1e-2 if has_nvidia_gpu_accelerator() else 1e-4
+
+
 def check[IN: Int, OUT: Int, B: Int](ctx: DeviceContext) raises:
     comptime L = Linear[IN, OUT]
     print(
         "  IN=", IN, " OUT=", OUT, " B=", B, "   K_PAD=", L.K_PAD,
         " (", L.NEEDS_PAD, ")  N_PAD=", L.N_PAD, " (", L.NEEDS_N_PAD, ")",
-        sep="",
+        "  cublas_fwd=", L.use_cublas_fwd[B](), sep="",
     )
 
     # Same weights on both devices: build on CPU, copy the slab, upload.
@@ -54,30 +68,30 @@ def check[IN: Int, OUT: Int, B: Int](ctx: DeviceContext) raises:
     ctx.synchronize()
 
     var max_abs = Float64(0)
-    var max_rel = Float64(0)
+    var mean = Float64(0)
     for i in range(B * OUT):
-        var a = Float64(yc.data[i])
-        var b = Float64(yg.data[i])
-        var d = abs(a - b)
-        if d > max_abs:
-            max_abs = d
-        var denom = abs(a) if abs(a) > 1e-6 else 1e-6
-        if d / denom > max_rel:
-            max_rel = d / denom
+        mean += Float64(yc.data[i])
+        max_abs = max(max_abs, abs(Float64(yc.data[i]) - Float64(yg.data[i])))
+    mean /= Float64(B * OUT)
+    var var_ = Float64(0)
+    for i in range(B * OUT):
+        var_ += (Float64(yc.data[i]) - mean) ** 2
+    var sd = sqrt(var_ / Float64(B * OUT))
+    var err = max_abs / (sd if sd > 0.0 else 1.0)
     # ⚠ NON-VACUITY: a comparison of two all-zero buffers also reports 0.0.
     var mag = Float64(0)
     for i in range(B * OUT):
         if abs(Float64(yg.data[i])) > mag:
             mag = abs(Float64(yg.data[i]))
     print(
-        "     max_abs=", max_abs, "  max_rel=", max_rel,
+        "     max_abs=", max_abs, "  err=", err, " std units",
         "   |gpu|max=", mag, "  cpu[0]=", yc.data[0], " gpu[0]=", yg.data[0],
         sep="",
     )
     if mag == 0.0:
         raise Error("VACUOUS: the GPU output is all zeros")
-    if max_rel > 1e-4:
-        raise Error("PADDING CHANGED THE RESULT — max_rel " + String(max_rel))
+    if err > TOL:
+        raise Error("PADDING CHANGED THE RESULT — " + String(err) + " std units")
 
 
 def main() raises:

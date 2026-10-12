@@ -174,6 +174,72 @@ var agent = PPOAgent[
 This is where PPO becomes practical: its appetite for samples is satisfied by
 stepping 32 environments per iteration on-device.
 
+### Keeping the rollout on the device
+
+By default the batched driver stages the rollout on the host. Every env step
+it copies the observation, reward and done flags back, samples on the host and
+records into host lists. Each minibatch then uploads its tensors and reads its
+losses back. Three compile-time flags on `train` (and on `PPODiscreteAgent`'s
+`train_batched`) remove those round trips. All three are off by default:
+
+| Flag | What moves to the device |
+|---|---|
+| `USE_TRAIN_CUDA_GRAPH` | the K-epoch update: one minibatch step is captured and replayed per minibatch |
+| `DEVICE_ROLLOUT` | action sampling, recording and GAE; episode returns come back through a ring every 32 steps |
+| `USE_ENV_CUDA_GRAPH` | the env step and the reset, captured (needs `DEVICE_ROLLOUT` and an env step that draws no random numbers) |
+
+The captured update is bit-identical to the eager one. The device rollout
+samples with a device RNG, so its trajectories differ from the host rollout's,
+but with and without its graphs it writes byte-identical checkpoints
+(`tests/nn/test_ppo_train_graph_parity.mojo`, discrete and continuous).
+
+LunarLander on an RTX 5090: 11.8k env steps/s staged on the host, 17.2k with
+the captured update, and 18.8k with everything on the device and captured.
+With the [cuBLAS GEMM routing](/nn/primitives/#where-the-gemms-run-on-nvidia)
+on top it reaches 25.4k.
+
+```bash
+pixi run -e nvidia mojo build -I . -D PPO_GPU -D PPO_DEVICE_ROLLOUT -D PPO_ENV_GRAPH -D PPO_TRAIN_GRAPH \
+    examples/lunar_lander/ppo_lunar_lander_time_to_solve.mojo -o ppo_ll_gpu_dev
+pixi run ./ppo_ll_gpu_dev 1 ppo_ll_cuda_dev_s1.ckpt
+```
+
+Run the binary through `pixi run`: the graphs need the CUDA interceptor that
+the `nvidia` environment preloads. Without it they disable themselves and the
+same device path runs eagerly.
+
+### `run_ppo_vec`: any GPU-batched environment
+
+`run_ppo_vec` (`noeira/deep_agents/training/ppo_vec_driver.mojo`) is continuous
+PPO over any GPU-batched environment, with the rollout always on the device.
+The env step, the reset and the update can each be captured
+(`ENV_GRAPH`, `TRAIN_GRAPH`). Its options are opt-in, most of them fields of
+`PPOVecConfig`:
+
+- **Observation.** The env's row followed by the last `HIST` executed actions.
+  `FRAMES` stacks a per-lane history of K frames, newest first, as IsaacLab
+  does. `E_ACTOR` splits each frame into actor words and privileged words:
+  an actor with a `Slice` at its head reads only the actor prefix, which gives
+  a privileged critic with no trainer change.
+- **Normalisation.** Running observation statistics and CleanRL's
+  `NormalizeReward`, each switchable.
+- **Schedules.** The learning rate and the entropy coefficient annealed
+  linearly or held fixed, or rsl_rl's adaptive-KL learning rate
+  (`adaptive_kl`). Adaptive KL is applied once per update, so the update stays
+  one graph.
+- **Penalties.** Action rate `w·|a_t − a_{t−1}|²` (`act_rate_w`) and
+  smoothness `w·|a_t − 2a_{t−1} + a_{t−2}|²` (`act_smooth_w`).
+- **Mirror symmetry.** An opt-in loss on the actor mean
+  (`PPOActorLoss.enable_mirror`, `noeira/deep_agents/ppo/mirror.mojo`).
+- **A divergence guard.** A lane whose observation or reward goes non-finite or
+  out of bounds is ended as terminated and counted.
+
+A checkpoint is the trainer's v3 checkpoint plus `obs_norm.txt`. On Hopper
+(`examples/hopper/ppo_hopper_vec_gpu.mojo`, CleanRL's MuJoCo recipe, 128
+lanes), the last-100 return at 2M steps is 1639 / 2911 / 2722 over seeds 1–3,
+at about 7k env steps/s. The
+[G1 walker](/environments/robots/#the-g1-walker) trains through it.
+
 ## Discrete actions
 
 PPO handles both action types, through separate packages:
@@ -196,6 +262,15 @@ in the rollout.
 
 Use `was_terminated()` rather than `done` when computing GAE. See
 [Traits](/concepts/traits/).
+
+The on-policy drivers store each row's pre-reset next observation. A
+truncated row bootstraps from the value of its **own** final state, and the
+advantage recursion stops at the episode boundary. Until October 2026 they
+bootstrapped a truncation from the *next* episode's first state, and every
+task-family run was affected. With the fix, `lift_brick`'s greedy success
+went from 97.9 / 92.7 / 92.4 % to 96.3 / 95.5 / 94.7 % over three seeds.
+`tests/nn/test_ppo_gae_truncation.mojo` gates the host and device paths against
+the formula written out.
 :::
 
 **Observation normalization.** PPO is more sensitive to observation scale than
@@ -221,6 +296,11 @@ the comparison.
 pixi run mojo run -I . examples/cartpole/cartpole_ppo.mojo
 pixi run mojo run -I . examples/half_cheetah/ppo_half_cheetah_training.mojo
 pixi run -e nvidia mojo run -I . examples/craftax_classic/ppo_training_gpu.mojo
+
+# run_ppo_vec on Hopper, env step and update captured
+pixi run -e nvidia mojo build -I . -D PPO_VEC_ENV_GRAPH -D PPO_VEC_TRAIN_GRAPH \
+    examples/hopper/ppo_hopper_vec_gpu.mojo -o ppo_hopper_vec
+pixi run -e nvidia ./ppo_hopper_vec --steps 2000000 --seed 1
 ```
 
 ## Next

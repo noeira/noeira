@@ -1,8 +1,8 @@
 """noeira_max — a small MAX-based package for evaluating MAX as an inference backend
 for noeira, driven from Mojo via Python interop.
 
-v1 scope: MLP *inference* only (training is out of scope — see
-docs/MAX_TRAINING_ASSESSMENT.md for why training-on-MAX is blocked today).
+v1 scope: MLP *inference* only. Training on MAX is prototyped separately, in
+``noeira_max/autodiff``.
 
 The public surface is :class:`noeira_max.mlp_inference.MLPInference`, a configurable
 MLP whose dims/batch/device are all variables so multiple shapes can be swept,

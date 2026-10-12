@@ -15,6 +15,7 @@ from noeira.nn.primitives.ops.gelu_tanh_op import GELUTanhOp
 from noeira.nn.primitives.ops.gelu_op import GELUOp
 from noeira.nn.primitives.ops.mish_op import MishOp
 from noeira.nn.primitives.ops.swish_op import SwishOp
+from noeira.nn.primitives.ops.elu_op import ELUOp
 from noeira.nn.primitives.ops.symlog_op import SymlogOp
 
 
@@ -34,4 +35,6 @@ comptime GELUTanh[DIM: Int, ADT: DType = DT] = Elementwise[DIM, GELUTanhOp, ADT]
 it for torch's.)"""
 comptime Mish[DIM: Int, ADT: DType = DT] = Elementwise[DIM, MishOp, ADT]
 comptime Swish[DIM: Int, ADT: DType = DT] = Elementwise[DIM, SwishOp, ADT]
+comptime ELU[DIM: Int, ADT: DType = DT] = Elementwise[DIM, ELUOp, ADT]
+"""ELU, alpha 1 = torch's `nn.ELU()` (rsl_rl's default activation)."""
 comptime Symlog[DIM: Int, ADT: DType = DT] = Elementwise[DIM, SymlogOp, ADT]

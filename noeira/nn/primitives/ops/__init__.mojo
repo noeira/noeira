@@ -11,6 +11,7 @@ from .tanh_op import TanhOp
 from .relu_op import ReLUOp
 from .symlog_op import SymlogOp
 from .swish_op import SwishOp
+from .elu_op import ELUOp
 from .mish_op import MishOp
 from .sigmoid_op import SigmoidOp
 from .gelu_tanh_op import GELUTanhOp

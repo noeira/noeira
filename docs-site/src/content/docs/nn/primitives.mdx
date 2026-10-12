@@ -49,6 +49,39 @@ The fused variants are what the GPU examples use throughout. `Linear` followed
 by `ReLU` is two kernels; `LinearReLU` is one, and in an inner training loop
 evaluated millions of times that difference is real.
 
+`FeedForwardGELU[S, D, FF]` is a transformer FFN, `Tok[Linear] → GELUTanh →
+Tok[Linear]`, as one module. On NVIDIA it computes fc1's GELU in the GEMM's
+epilogue, so the separate GELU pass over the hidden activations is gone. The
+GPT and the classifier ViT use it; elsewhere it runs its three children as the
+`Sequential` would.
+
+### Where the GEMMs run on NVIDIA
+
+On NVIDIA, `Linear`, `LinearAct` and `Conv2D` choose their GEMM per shape, by a
+rule measured on the shapes noeira's agents and examples actually use:
+
+- **Backward** always runs on cuBLAS (`noeira/nn/core/cublas_gemm.mojo`), on
+  the unpadded operands. MAX's GEMM rejects `transpose_a` and falls back to an
+  allocating path unless `N % 128 == 0`, so the old backward transposed and
+  padded. An 8 → 64 RL trunk did 32× its work.
+- **Forward** runs on cuBLAS too, except where MAX measured faster: batch 1 on
+  an aligned shape, very large batches with a mid-sized K, or a 2²⁵-element
+  weight at a small batch.
+- **Epilogues.** The bias, and for `LinearReLU` the bias and the ReLU, go in a
+  cuBLASLt epilogue (`noeira/nn/core/cublaslt_gemm.mojo`) on the shapes where
+  that measured faster. The bf16 path fuses the bias, and `FeedForwardGELU`'s
+  GELU, the same way.
+- **Precision.** Full fp32 below 2²⁴ multiply-adds per layer, TF32 above. With
+  every GEMM in TF32, PPO stalled on Hopper in 7 of 20 seeds, against 2 of 20
+  before.
+
+On an RTX 5090, fwd+bwd was faster than the old path on all 119 measured
+shapes (median 2.9×). End to end: PPO LunarLander 19.8k → 25.4k env steps/s;
+SAC HalfCheetah (32 envs, 200k steps) 200 → 87 s. Apple keeps MAX's GEMMs.
+
+For A/B runs, `-D NN_GEMM_PATH=auto|max|cublas|fwdmax|bwdmax` forces a route,
+and `-D NN_CUBLAS_FP32` turns TF32 off.
+
 :::caution[Weight tying is the dominant lever in small language models]
 On character-level GPT, tying the output projection to the embedding was worth
 more than any other single change. `TiedLinear` exists for exactly this.
@@ -68,18 +101,25 @@ more than any other single change. `TiedLinear` exists for exactly this.
 Unlike `Linear`, `Conv2D` has no fused-activation form: follow it with an
 activation module.
 
-:::note[Conv is bandwidth-bound, not GEMM-bound]
-Profiling the zero-series convolutional nets showed the bottleneck is memory
-bandwidth rather than matrix-multiply throughput. Hand-written GEMMs *lose* to
-the library `max_matmul` here. If you are optimizing a conv path, look at data
-movement first.
-:::
+On NVIDIA, `Conv2D` picks its path per shape. Its three im2col GEMMs (forward,
+dW, d_col) run unpadded on cuBLAS. Large stride-1 convolutions, `OC = 1` and
+small 1×1 heads go to cuDNN (`noeira/nn/core/cudnn_conv.mojo`). `Conv2D.use_cudnn`
+holds that rule, measured on 80 shapes from every agent and example: none got
+slower, median 1.49×. cuDNN's algorithm is the top of its own heuristic ranking
+among its deterministic GEMM algorithms. Timing-based selection (`cudnnFind`)
+picked different algorithms in different processes, so one binary trained
+differently from run to run.
+
+On an RTX 5090, ResNet-20 went from 6.16 to 2.84 ms per step, level with
+`torch.compile` plus CUDA graphs. The CIFAR CNN went from 2.36 to 1.35 ms
+(PyTorch: 1.33).
 
 ## Attention and transformers
 
 | Module | Notes |
 |---|---|
 | `ScaledDotProductAttention` | self-attention over one packed `[Q\|K\|V]` input |
+| `ScaledDotProductAttentionQKV` | the same, reading the QKV projection's token-major output directly — no `QKVToMajor` pass |
 | `MaskedAttention` | causal masking — one `[SEQ, SEQ]` bias shared by the batch |
 | `CrossAttention[DIM, N_HEADS, Q_LEN, KV_LEN, MASKED]` | separate query and key/value streams, optional per-sample key padding mask |
 | `SelfAttentionPos` · `SelfAttentionPosMasked` | `CrossAttention` at `Q_LEN == KV_LEN` — DETR self-attention |
@@ -138,6 +178,31 @@ The same holds for RoPE's pairing, `RepeatKVHeads`' grouping and
 :::
 
 ### Attention performance
+
+**Self-attention is fused on the GPU by default.** `ScaledDotProductAttention`
+and `ScaledDotProductAttentionQKV` take `FLASH=True`. When there is no
+attention dropout and the head dim is at most 64 and a multiple of the tile
+width (32 on NVIDIA, 16 on Apple), they run FlashAttention-2 forward and
+backward. The forward keeps only the output and each row's log-sum-exp, with no
+`[B, H, S, S]` score matrix. The backward recomputes the probabilities and
+uses no atomics, so an eager run and a CUDA-graph replay stay bit-identical.
+Which kernels run depends on the activation dtype and the device:
+
+| Activations | NVIDIA | Apple |
+|---|---|---|
+| fp32 | tensor cores in TF32 (`flash_attention_tf32.mojo`) | fp32 kernels (`flash_attention.mojo`) |
+| bf16 | tensor cores, bf16 operands, fp32 accumulators (`flash_attention_mma.mojo`) | — |
+
+`-D NN_ATTN_PATH=no_tf32` keeps NVIDIA on the strict fp32 kernels. The TF32
+kernels round their operands to TF32 rather than truncating them, as the
+tensor core would, which would bias every softmax weight down. Dropout, wider
+heads and the CPU keep the pack / bmm / softmax / bmm path.
+
+On an RTX 5090, the TinyShakespeare GPT (6 × 384, sequence 256, batch 64)
+trains a step in 19.4 ms in fp32 and 10.74 ms in bf16. PyTorch 2.12 takes
+21.35 and 10.81 ms (reduce-overhead, same box). MAX's own FA2 kernel was read
+first: it admits head dim 64 only on sm90 / sm100 / A100, by GPU name, and it
+has no backward.
 
 `CrossAttention` has a second, **inference-only** GPU forward: a fused
 online-softmax kernel that never materialises the score matrix. It is off by
@@ -210,12 +275,23 @@ that evaluates catastrophically while looking fine.
 
 ## Activations
 
-`ReLU`, `Tanh`, `Sigmoid`, `GELU`, `Mish`, `SiLU`, `Swish`, `Symlog`,
-`Clamp`, `Scale`.
+`ReLU`, `Tanh`, `Sigmoid`, `GELU`, `GELUTanh`, `ELU`, `Mish`, `SiLU`,
+`Swish`, `Symlog`, `Clamp`, `Scale`.
 
 ```mojo
 from noeira.nn.primitives.activations import ReLU, Tanh, Sigmoid
 ```
+
+:::caution[`GELU` is the erf form]
+`GELU` is PyTorch's exact GELU (`nn.GELU()`, Hugging Face's `"gelu"`).
+`GELUTanh` is the tanh approximation: JAX's default, Hugging Face's
+`"gelu_pytorch_tanh"`. When porting a model, pick the one its config names.
+The two differ by up to about 5e-4. A parity check at a loose band passes
+either one, and so does every shape and NaN test.
+:::
+
+`ELU` (alpha 1) is PyTorch's `nn.ELU`, the activation of the rsl_rl-style
+locomotion networks.
 
 `Symlog` — `sign(x)·log(1+|x|)` — compresses unbounded targets and appears
 throughout DreamerV3.
@@ -236,8 +312,23 @@ These are why `nn` is not a general-purpose framework wearing an RL hat:
 
 ## Utility
 
-`Add`, `BiasAdd`, `Elementwise`, `BinaryElementwise`, `Dropout`, `GatherCols`,
-`ReduceMax`, `Concat`, `Slice`, `SpaceTimeTranspose`, `MAEReplacer`.
+`Add`, `BiasAdd`, `Elementwise`, `BinaryElementwise`, `Dropout`, `HashDropout`,
+`GradGate`, `GatherCols`, `ReduceMax`, `Concat`, `Slice`, `SpaceTimeTranspose`,
+`MAEReplacer`.
+
+`Dropout` draws its masks from a Philox stream keyed by a compile-time seed.
+Inside a `Repeat`, copy `i` draws from subsequence `i`. Before this was fixed,
+the N copies shared one seed and every GPT block dropped the same entries as
+the others. `set_attr["rng_stream"](k)` moves a replica onto stream `k`; the
+[distributed trainer](/nn/distributed/) gives rank `r` stream `r`.
+`RepeatConditional` does not give its copies separate subsequences; use
+`HashDropout` there. Its mask is a hash of its own seed, a counter and the
+element index, so the backward redraws the mask instead of caching it, and CPU
+and GPU draw the same masks.
+
+`GradGate` is the identity going forward and a stop-gradient you can switch at
+run time (`set_attr["stop_grad"](1)`). Switched off, it trains bit-identically
+to a graph without it.
 
 ## A note on GEMM
 

@@ -16,6 +16,7 @@ from std.sys.info import has_nvidia_gpu_accelerator
 from layout import Layout, LayoutTensor, TileTensor, row_major
 
 from noeira.nn.constants import CPU_SIMD_W, DT, LAYOUT_NCHW, LAYOUT_NHWC
+from ..core.polyak import polyak_tensor
 from ..core.tensor import Tensor, TensorImpl
 from .linear import _cast_f2b_kernel, _cast_b2f_kernel
 from ..core.tensor_refs import TensorRefs
@@ -976,6 +977,26 @@ struct BatchNorm2D[
             self.training = value != Scalar[DT](0.0)
         comptime if ATTR == "frozen":
             self.frozen = value != Scalar[DT](0.0)
+
+    def polyak_from[
+        target: StaticString
+    ](
+        mut self,
+        mut src: Self,
+        tau: Scalar[DT],
+        ctx: Optional[DeviceContext],
+    ) raises:
+        """Soft-update toward `src` (target <- online). The `Module`
+        default is a NO-OP, so without this override a target net containing
+        this layer would keep its init values forever while the online copy
+        trains (the `LayerNorm` / `Conv2D` bug class; audit 2026-10-07)."""
+        polyak_tensor[target, Self.C_](self.gamma.val, src.gamma.val, tau, ctx)
+        polyak_tensor[target, Self.C_](self.beta.val, src.beta.val, tau, ctx)
+        # The running statistics follow too: with tau = 1 this is the hard sync
+        # `hard_copy` does (params AND State).
+        polyak_tensor[target, Self.C_](self.running_mean.t, src.running_mean.t, tau, ctx)
+        polyak_tensor[target, Self.C_](self.running_var.t, src.running_var.t, tau, ctx)
+
 
     def forward[
         target: StaticString, B: Int, o: MutOrigin, POLICY: AMPPolicy = NoAMP

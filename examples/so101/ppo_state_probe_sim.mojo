@@ -6,6 +6,7 @@
         [--arm-pose "q0 q1 q2 q3 q4 q5" | FILE]  [--brick x,y] [--bowl x,y]
         [--lag-tau 50,50 --lag-delay 2,2] [--lag-vmax 1.1,1.1] [--elbow-max 1.56]
         [--lag-tau-j "lo,hi;..." --lag-delay-j ... --lag-vmax-j ...] [--lag-offset-j "lo,hi;..."] [--lag-period lo,hi]
+        [--demos OUT.demo [--exec-noise SIGMA] [--post-goal TICKS]]
 
 The state teacher's counterpart of `pixel_student_probe_sim.mojo`, for the
 same gate: the real scene rebuilt (`--arm-pose` from the run's pose_0,
@@ -21,6 +22,30 @@ Everything the action needs is read from the run's `metrics.config.kv`
 `target_obs`): it refuses otherwise, since a policy fed a differently laid
 out observation still acts — wrongly, and silently.
 
+## `--demos`: the teacher's rollouts as a world-model dataset
+
+Every tick of every episode (successes AND failures) as one `.demo` row
+(`deep_agents/demos/file.mojo`), readable by `tower_demo_rerender.mojo`:
+
+    obs   (NQ + NV + 6)  the full sim state BEFORE the step (qpos, qvel — the
+                         rerender poses the cameras from its first NQ + NV
+                         words), then the executed policy action `a` in
+                         [-1, 1] (target mode: the step from the previous
+                         commanded target, noise included)
+    act   (6)            the COMMANDED target, normalised onto each
+                         actuator's ctrlrange (the rerender's `action_sim`
+                         convention); the servo lag acts on it afterwards
+    rew                  1 once the task's goal has held, else 0
+
+`--exec-noise SIGMA` adds N(0, SIGMA) to the clipped action before
+`target_step` (then clips again) and feeds the noisy action to the target
+and the action history, so the teacher's next observation is consistent with
+what was executed (noeira-03's rule). `--post-goal TICKS` (default 31, ~1 s)
+ends the recording that many ticks after the goal first holds: past it the
+teacher is out of distribution (the real arm pecked at the bowl). The host
+RNG is seeded from `--seed`, so the lag and noise draws are reproducible.
+The file is written every 100 episodes and at the end.
+
 ⚠ THE OBSERVATION IS THE DRIVER'S. The task's `meta` words (goal tape,
 active mask, shaping) and the family's region table are written into the env
 before the episode, as `ppo_family_driver.run_ppo` does per lane — without
@@ -29,12 +54,15 @@ version failed 0 / 3 so). Checked at the start of every episode: the brick
 and bowl words of the observation must equal their `qpos`.
 """
 
+from std.math import sqrt, log, cos, pi
 from std.os.path import exists
+from std.random import seed as rng_seed, random_float64
 from std.sys import argv
 
 from max.gpu.host import DeviceContext
 
 from noeira.core.cont_action import ContAction
+from noeira.deep_agents.demos.file import DemoSet, write_demo_file
 from noeira.deep_agents.ppo import PPOAgent
 from noeira.envs.phyics3d_env import Phyics3dEnv
 from noeira.nn.constants import DT
@@ -42,6 +70,7 @@ from noeira.nn.core.ptr import mptr
 from noeira.physics3d.parser.runtime_load import parse_model_runtime
 from noeira.tasks.delta_action import (
     DELTA_ACT, ACT_HIST, TARGET_OBS, ServoLag, delta_target, target_step,
+    JAW_OPEN, JAW_SHUT_EMPTY,
 )
 from noeira.tasks.eval import region_sites, region_rects, region_half_heights
 from noeira.tasks.family import scene_path
@@ -115,6 +144,11 @@ def main() raises:
     var brick_xy = _arg(args, "--brick", "")
     var bowl_xy = _arg(args, "--bowl", "")
     var quiet = _arg(args, "--quiet", "0") == "1"
+    var demos_out = _arg(args, "--demos", "")
+    var exec_noise = Float64(_arg(args, "--exec-noise", "0"))
+    var post_goal = Int(_arg(args, "--post-goal", "31"))
+    var recording = demos_out.byte_length() > 0
+    rng_seed(seed0)
     var debug = _arg(args, "--debug", "0") == "1"
 
     # ── the run: its action and its observation layout ──────────────────
@@ -147,15 +181,22 @@ def main() raises:
     var f = load_family(String(FAMILY_PATH))
     var fmd = parse_model_runtime(scene_path(f))
     var jadr = List[Int]()
+    var jdadr = List[Int]()
     var acc = 0
+    var acc_v = 0
     for i in range(len(fmd.joints)):
         jadr.append(acc)
+        jdadr.append(acc_v)
         acc += fmd.joints[i].nq
+        acc_v += fmd.joints[i].nv
     var qa = List[Int]()
+    var jaw_dof = -1
     var lo = List[Float64]()
     var hi = List[Float64]()
     for i in range(ACT):
         qa.append(jadr[fmd.actuators[i].joint_id])
+        if i == ACT - 1:
+            jaw_dof = jdadr[fmd.actuators[i].joint_id]
         lo.append(fmd.actuators[i].ctrl_min)
         hi.append(fmd.actuators[i].ctrl_max)
     var brick = -1
@@ -192,10 +233,19 @@ def main() raises:
               _arg(args, "--lag-delay", ""), "ticks | arm speed cap",
               lag.vmax_lo, "-", lag.vmax_hi, "rad/s | elbow max", lag.elbow_max)
 
+    comptime D_OBS = NQ + NV + ACT
+    var demos = DemoSet(D_OBS, ACT)
+    var d_prev = List[Float32](length=D_OBS, fill=0)
+    var d_next = List[Float32](length=D_OBS, fill=0)
+    var d_act = List[Float32](length=ACT, fill=0)
     var raw = List[Scalar[DT]](length=OBS, fill=Scalar[DT](0))
     var nrm = List[Scalar[DT]](length=OBS, fill=Scalar[DT](0))
     var ao = List[Scalar[DT]](length=ACT, fill=Scalar[DT](0))
     var n_ok = 0
+    var n_empty_first = 0
+    var n_fc_empty = 0
+    var n_fc_grasp = 0
+    var slides = List[Float64]()
     for ep in range(episodes):
         _ = env.reset()
         for k in range(len(mw[0])):
@@ -234,7 +284,11 @@ def main() raises:
         var q = List[Float64](length=ACT, fill=0.0)
         for j in range(ACT):
             q[j] = Float64(env.d.qpos.data[qa[j]])
-        lag.reset_lane(0, q, 0, 0.5, 0.5)
+        if recording:
+            lag.reset_lane(0, q, 0, random_float64(), random_float64(), random_float64())
+            demos.begin_episode()
+        else:
+            lag.reset_lane(0, q, 0, 0.5, 0.5)
         var tprev = q.copy()
         var tg = q.copy()
         var hist = List[Float64](length=W, fill=0.0)
@@ -243,6 +297,29 @@ def main() raises:
         var held = False
         var t_held = -1
         var flips = 0
+        # ⚠ EMPTY CLOSES: the jaw fully shut (< -0.10 rad: on the brick it
+        # stalls near +0.10) after having opened (> 0.20), counted once per
+        # close; "first close empty" = one happened before the brick rose 2 cm
+        var jaw_open = False
+        var n_empty = 0
+        var t_first_empty = -1
+        var lifted = False
+        var t_lift = -1
+        # ⚠ the FIRST CLOSE, as the pixel probe classifies it (noeira-1d's
+        # rule): after the jaw first opens past JAW_OPEN, the close that
+        # follows is EMPTY if the jaw goes below JAW_SHUT_EMPTY, a GRASP if
+        # it stalls (q > -0.05, target < q - 0.1, |qd| < 0.3) for 10 ticks
+        var fc_armed = False
+        var fc = 0  # 0 undecided, 1 empty, 2 grasp
+        var fc_t = -1
+        var stall = 0
+        # how far the brick slid ON THE DESK (within 5 mm of its lowest z)
+        # before it first rose 2 cm (c5e87d7d0's measure)
+        var bx0 = Float64(env.d.xpos.data[brick * 3])
+        var by0 = Float64(env.d.xpos.data[brick * 3 + 1])
+        var z_desk = z0
+        var off_desk = False
+        var push = 0.0
         var a_last = List[Float64](length=ACT, fill=0.0)
         if not quiet:
             var l0 = String("── episode ") + String(ep) + " start q:"
@@ -274,6 +351,10 @@ def main() raises:
                 for j in range(ACT):
                     var a = Float64(ao[j])
                     a = 1.0 if a > 1.0 else (-1.0 if a < -1.0 else a)
+                    if exec_noise > 0.0:
+                        var u1 = max(random_float64(), 1e-12)
+                        a += exec_noise * sqrt(-2.0 * log(u1)) * cos(2.0 * pi * random_float64())
+                        a = 1.0 if a > 1.0 else (-1.0 if a < -1.0 else a)
                     if j < ACT - 1 and t > 0 and a * a_last[j] < 0.0:
                         flips += 1
                     a_last[j] = a
@@ -300,6 +381,14 @@ def main() raises:
                 act.data[j] = (u - mid) / half
                 act_l[j] = Float64(act.data[j])
             lag.advance()
+            if recording:
+                for k in range(NQ):
+                    d_prev[k] = Float32(env.d.qpos.data[k])
+                for k in range(NV):
+                    d_prev[NQ + k] = Float32(env.d.qvel.data[k])
+                for j in range(ACT):
+                    d_prev[NQ + NV + j] = Float32(a_last[j])
+                    d_act[j] = Float32((tg[j] - 0.5 * (lo[j] + hi[j])) / (0.5 * (hi[j] - lo[j])))
             var res = env.step(act)
             obs = res[0].copy()
             # ⚠ the CPU env's own reward hook is a constant zero (the family's
@@ -312,15 +401,87 @@ def main() raises:
             var zb = Float64(env.d.xpos.data[brick * 3 + 2])
             if zb - z0 > rise:
                 rise = zb - z0
+            if rise > 0.02:
+                if not lifted:
+                    t_lift = t
+                lifted = True
+            z_desk = min(z_desk, zb)
+            if zb - z_desk > 0.02:
+                off_desk = True
+            if not off_desk and zb - z_desk < 0.005:
+                var px = Float64(env.d.xpos.data[brick * 3]) - bx0
+                var py = Float64(env.d.xpos.data[brick * 3 + 1]) - by0
+                push = max(push, (px * px + py * py) ** 0.5)
+            var jaw = Float64(env.d.qpos.data[qa[ACT - 1]])
+            if fc == 0:
+                if jaw > JAW_OPEN:
+                    fc_armed = True
+                elif fc_armed:
+                    var qd = Float64(env.d.qvel.data[jaw_dof])
+                    if jaw < JAW_SHUT_EMPTY:
+                        fc = 1
+                        fc_t = t
+                    elif jaw > -0.05 and tg[ACT - 1] < jaw - 0.1 and abs(qd) < 0.3:
+                        stall += 1
+                        if stall >= 10:
+                            fc = 2
+                            fc_t = t
+                    else:
+                        stall = 0
+            if jaw > JAW_OPEN:
+                jaw_open = True
+            elif jaw < JAW_SHUT_EMPTY and jaw_open:
+                jaw_open = False
+                n_empty += 1
+                if t_first_empty < 0 and not lifted:
+                    t_first_empty = t
             # the task's own goal word, as the driver's success count reads it
             if rdone[1]:
                 if not held:
                     t_held = t
                 held = True
+            if recording:
+                for k in range(NQ):
+                    d_next[k] = Float32(env.d.qpos.data[k])
+                for k in range(NV):
+                    d_next[NQ + k] = Float32(env.d.qvel.data[k])
+                for j in range(ACT):
+                    d_next[NQ + NV + j] = d_prev[NQ + NV + j]
+                demos.add(d_prev, d_act, 1.0 if held else 0.0, d_next, 0.0)
+                if held and t - t_held >= post_goal:
+                    break
+        if recording:
+            demos.end_episode(success=held)
+            if (ep + 1) % 100 == 0:
+                write_demo_file(demos_out, demos)
         if held:
             n_ok += 1
+        if t_first_empty >= 0:
+            n_empty_first += 1
+        if fc == 1:
+            n_fc_empty += 1
+        elif fc == 2:
+            n_fc_grasp += 1
+        slides.append(push)
         var steps = So101TowerConfig.MAX_STEPS // repeat
         print("   episode", ep, "| brick max rise", fixed(rise * 1000.0, 1),
               "mm | goal held:", held, "at", fixed(Float64(t_held) * period, 2),
-              "s | arm sign flips per step", fixed(Float64(flips) / Float64(steps), 3))
-    print("probe:", n_ok, "/", episodes, "episodes reached the goal")
+              "s | first lift at tick", t_lift,
+              "| first close", ("empty" if fc == 1 else ("grasp" if fc == 2 else "none")),
+              "at tick", fc_t, "| slid before the lift", fixed(push * 1000.0, 1), "mm",
+              "| empty closes", n_empty, "(first at tick", t_first_empty,
+              ") | arm sign flips per step", fixed(Float64(flips) / Float64(steps), 3))
+    if recording:
+        write_demo_file(demos_out, demos)
+        print("probe: wrote", demos_out, "|", demos.summary())
+    print("probe:", n_ok, "/", episodes, "episodes reached the goal |",
+          n_empty_first, "closed EMPTY before the first lift")
+    var n_slide80 = 0
+    var max_slide = 0.0
+    for i in range(len(slides)):
+        if slides[i] > 0.08:
+            n_slide80 += 1
+        max_slide = max(max_slide, slides[i])
+    print("probe: first close empty", n_fc_empty, "| grasp", n_fc_grasp, "| none",
+          episodes - n_fc_empty - n_fc_grasp, "| slid > 80 mm before the lift",
+          n_slide80, "| max slide", fixed(max_slide * 1000.0, 1), "mm")

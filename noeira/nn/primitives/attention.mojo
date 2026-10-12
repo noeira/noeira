@@ -37,11 +37,13 @@ from linalg.bmm import batched_matmul
 
 from noeira.nn.constants import DT, TPB
 from noeira.nn.random.hash_mask import hash_keep, new_dropout_seed
+from .flash_attention import flash_eligible, flash_forward, flash_backward, flash_o_dtype
 from ..core.tensor import Tensor, TensorImpl
-from ..core.tensor_refs import TensorRefs
+from ..core.tensor_refs import TensorRefs, child_refs
 from ..core.module import Module
 from ..core.initializer import Initializer
 from ..core.amp import AMPPolicy, NoAMP
+from .qkv_to_major import QKVToMajor
 
 
 # ──────────────────────────────────────────────────────────────────────
@@ -686,12 +688,21 @@ struct ScaledDotProductAttention[
     USE_MAX_KERNELS: Bool = True,
     ADT: DType = DT,
     P_DROP: Float64 = 0.0,
+    FLASH: Bool = True,
 ](Module):
     """`P_DROP` > 0: dropout on the attention WEIGHTS while training (torch's
     `scaled_dot_product_attention(dropout_p=…)`): A·V uses a·m/(1-p) while the
     cache keeps a for the softmax JVP; the mask is a counter hash
     (`hash_mask.mojo`), redrawn in the vjp. Switched by `set_attr["dropout"]`
-    (ON by default); fp32 + the bmm path only. 0 compiles it out."""
+    (ON by default); fp32 + the bmm path only. 0 compiles it out.
+
+    `FLASH` (default on): on the GPU, when `flash_eligible` (no dropout, head
+    dim ≤ 64 and a multiple of the tile width: 32 on NVIDIA, 16 elsewhere) and
+    `USE_MAX_KERNELS`, the fused kernels of
+    `flash_attention.mojo` replace the pack / bmm / softmax / bmm / unpack
+    chain: no [B, H, S, S] scores, no Q/K/V copy — the cache is O and the
+    per-row log-sum-exp, and the vjp reads Q/K/V from `forward_input`.
+    Everything else (CPU, dropout, wider heads) takes the paths below."""
     comptime ARITY: Int = 1
     # Activation-flow dtype (satisfies the Module trait). `ScaledDotProduct
     # Attention[D, H, S]` = fp32 (ACT_DT == DT, the legacy path, byte-identical);
@@ -701,6 +712,7 @@ struct ScaledDotProductAttention[
     # bf16 boundary (read→fp32, write→bf16). bf16-flow is GPU-only.
     comptime ACT_DT = Self.ADT
     comptime HEAD_DIM: Int = Self.DIM // Self.N_HEADS
+    comptime OC_DT = flash_o_dtype[Self.ADT, Self.HEAD_DIM, Self.N_HEADS]()
     comptime IN_DIMS = Array[Int, 1](fill=Self.SEQ_LEN * Self.DIM * 3)
     # `Array` is not `ImplicitlyCopyable` (Mojo 1.0): indexing the comptime
     # `IN_DIMS` from a runtime context would materialize the whole array.
@@ -713,6 +725,10 @@ struct ScaledDotProductAttention[
     comptime CACHE_SIZE: Int = (
         3 * Self.SEQ_LEN * Self.DIM
         + Self.N_HEADS * Self.SEQ_LEN * Self.SEQ_LEN
+    )
+    comptime USE_FLASH: Bool = (
+        Self.FLASH and Self.USE_MAX_KERNELS
+        and flash_eligible[Self.HEAD_DIM, Self.P_DROP]()
     )
 
     # Cache (leaf-owned, output-caching) — [BATCH, CACHE_SIZE], lazy.
@@ -728,6 +744,12 @@ struct ScaledDotProductAttention[
     var ss0: Tensor  # scores slot 0
     var ss1: Tensor  # scores slot 1
     var sp4: Tensor  # packed slot 4: Vᵀ for the backward's dout·Vᵀ
+    # USE_FLASH cache: O ([B, SEQ·DIM], at `OC_DT`: bf16 on the tensor-core
+    # path, fp32 for the CUDA-core kernels), L = log-sum-exp [B·H·SEQ], and
+    # D = Σ dO·O [B·H·SEQ] (vjp scratch).
+    var o_cache: TensorImpl[Self.OC_DT]
+    var lse: Tensor
+    var dvec: Tensor
     # attention dropout (P_DROP > 0): see the struct docstring
     var drop_on: Bool
     var drop_seed: UInt64
@@ -747,6 +769,9 @@ struct ScaledDotProductAttention[
         self.ss0 = Tensor()
         self.ss1 = Tensor()
         self.sp4 = Tensor()
+        self.o_cache = TensorImpl[Self.OC_DT]()
+        self.lse = Tensor()
+        self.dvec = Tensor()
         self.drop_on = True
         self.drop_seed = new_dropout_seed()
         self.drop_ctr = 0
@@ -824,6 +849,9 @@ struct ScaledDotProductAttention[
         self.ss0.release()
         self.ss1.release()
         self.sp4.release()
+        self.o_cache.release()
+        self.lse.release()
+        self.dvec.release()
 
     def forward[
         target: StaticString, B: Int, o: MutOrigin, POLICY: AMPPolicy = NoAMP
@@ -852,11 +880,14 @@ struct ScaledDotProductAttention[
             else:
                 var c = ctx.value()
                 out.ensure_gpu(c, B * Self.OUT_DIM)
-                self.cache.ensure_gpu(c, B * Self.CACHE_SIZE)
-                comptime if Self.USE_MAX_KERNELS:
-                    self._forward_gpu_bmm[B](in0, out, c)
+                comptime if Self.USE_FLASH:
+                    self._forward_gpu_flash[B](in0, out, c)
                 else:
-                    self._forward_gpu_custom[B](in0, out, c)
+                    self.cache.ensure_gpu(c, B * Self.CACHE_SIZE)
+                    comptime if Self.USE_MAX_KERNELS:
+                        self._forward_gpu_bmm[B](in0, out, c)
+                    else:
+                        self._forward_gpu_custom[B](in0, out, c)
         else:
             # ── bf16-flow path (GPU-only). Activations cast at the I/O boundary;
             #    cache + QKᵀ/softmax/attn·V stay fp32 (the leaf is fp32-internal).
@@ -865,11 +896,32 @@ struct ScaledDotProductAttention[
             ), "bf16-flow ScaledDotProductAttention is GPU-only"
             var c = ctx.value()
             out.ensure_gpu(c, B * Self.OUT_DIM)
-            self.cache.ensure_gpu(c, B * Self.CACHE_SIZE)
-            comptime if Self.USE_MAX_KERNELS:
-                self._forward_gpu_bmm[B](in0, out, c)
+            comptime if Self.USE_FLASH:
+                self._forward_gpu_flash[B](in0, out, c)
             else:
-                self._forward_gpu_custom[B](in0, out, c)
+                self.cache.ensure_gpu(c, B * Self.CACHE_SIZE)
+                comptime if Self.USE_MAX_KERNELS:
+                    self._forward_gpu_bmm[B](in0, out, c)
+                else:
+                    self._forward_gpu_custom[B](in0, out, c)
+
+    def _forward_gpu_flash[
+        B: Int
+    ](
+        mut self,
+        mut in0: TensorImpl[Self.ACT_DT],
+        mut out: TensorImpl[Self.ACT_DT],
+        c: DeviceContext,
+    ) raises:
+        self.o_cache.ensure_gpu(c, B * Self.OUT_DIM)
+        self.lse.ensure_gpu(c, B * Self.N_HEADS * Self.SEQ_LEN)
+        flash_forward[
+            Self.ADT, Self.N_HEADS, Self.SEQ_LEN, Self.HEAD_DIM, Self.CAUSAL,
+            B * Self.N_HEADS, OC=Self.OC_DT,
+        ](
+            c, in0.dev.value(), out.dev.value(), self.o_cache.dev.value(),
+            self.lse.dev.value(),
+        )
 
     def _forward_gpu_custom[
         B: Int
@@ -1105,8 +1157,8 @@ struct ScaledDotProductAttention[
         grad_inputs: TensorRefs[1, ogi, Self.ACT_DT],
         ctx: Optional[DeviceContext] = None,
     ) raises:
-        # forward_input unused — this leaf is output-caching (reads only the
-        # cache + grad_output).
+        # forward_input is read by the USE_FLASH path only (Q/K/V); the others
+        # are output-caching (cache + grad_output).
         ref gin = grad_inputs[0]
         comptime if Self.ACT_DT == DT:
             # ── fp32 path (legacy NoAMP, byte-identical) ──
@@ -1119,7 +1171,10 @@ struct ScaledDotProductAttention[
             else:
                 var c = ctx.value()
                 gin.ensure_gpu(c, B * Self.IN_DIM0)
-                comptime if Self.USE_MAX_KERNELS:
+                comptime if Self.USE_FLASH:
+                    ref fin = forward_input[0]
+                    self._vjp_gpu_flash[B](fin, grad_output, gin, c)
+                elif Self.USE_MAX_KERNELS:
                     self._vjp_gpu_bmm[B](grad_output, gin, c)
                 else:
                     self._vjp_gpu_custom[B](grad_output, gin, c)
@@ -1131,10 +1186,33 @@ struct ScaledDotProductAttention[
             ), "bf16-flow ScaledDotProductAttention is GPU-only"
             var c = ctx.value()
             gin.ensure_gpu(c, B * Self.IN_DIM0)
-            comptime if Self.USE_MAX_KERNELS:
+            comptime if Self.USE_FLASH:
+                ref fin = forward_input[0]
+                self._vjp_gpu_flash[B](fin, grad_output, gin, c)
+            elif Self.USE_MAX_KERNELS:
                 self._vjp_gpu_bmm[B](grad_output, gin, c)
             else:
                 self._vjp_gpu_custom[B](grad_output, gin, c)
+
+    def _vjp_gpu_flash[
+        B: Int
+    ](
+        mut self,
+        mut fin: TensorImpl[Self.ACT_DT],
+        mut grad_output: TensorImpl[Self.ACT_DT],
+        mut gin: TensorImpl[Self.ACT_DT],
+        c: DeviceContext,
+    ) raises:
+        """D = Σ dO·O, dQ, then dK / dV (`flash_backward`)."""
+        self.dvec.ensure_gpu(c, B * Self.N_HEADS * Self.SEQ_LEN)
+        flash_backward[
+            Self.ADT, Self.N_HEADS, Self.SEQ_LEN, Self.HEAD_DIM, Self.CAUSAL,
+            B * Self.N_HEADS, OC=Self.OC_DT,
+        ](
+            c, fin.dev.value(), grad_output.dev.value(),
+            self.o_cache.dev.value(), self.lse.dev.value(),
+            self.dvec.dev.value(), gin.dev.value(),
+        )
 
     def _vjp_gpu_custom[
         B: Int
@@ -1442,3 +1520,138 @@ struct ScaledDotProductAttention[
 
     # for_each_param / zero_grad inherit the Module reflection defaults
     # (no Param fields → no-op).
+
+
+struct ScaledDotProductAttentionQKV[
+    DIM: Int,
+    N_HEADS: Int,
+    SEQ_LEN: Int,
+    CAUSAL: Bool = False,
+    USE_MAX_KERNELS: Bool = True,
+    ADT: DType = DT,
+    P_DROP: Float64 = 0.0,
+](Module):
+    """`ScaledDotProductAttention` on the QKV projection's OWN layout: the
+    input is `Tokenwise[Linear[DIM, 3·DIM]]`'s token-major output (token i at
+    i·3·DIM, q / k / v at +0 / +DIM / +2·DIM), so a composition needs no
+    `QKVToMajor` in front of it.
+
+    Where the fused kernels apply (GPU, `USE_FLASH`) they read and write that
+    layout directly (`flash_forward[..., IL=True]`): the permutation and its
+    backward — two full passes over the [B, S, 3·DIM] activation — are gone.
+    Everywhere else (CPU, dropout, heads the fused path does not cover) it
+    permutes with its own `QKVToMajor` and runs `ScaledDotProductAttention`
+    unchanged, so the result is the one `QKVToMajor` + that leaf compute.
+
+    The compositions that predate it (`MultiHeadAttentionXL`, LeWM's and
+    SmolVLA's blocks) keep `QKVToMajor`: their child indices name checkpoint
+    parameters."""
+    comptime ATTN = ScaledDotProductAttention[
+        Self.DIM, Self.N_HEADS, Self.SEQ_LEN, Self.CAUSAL,
+        Self.USE_MAX_KERNELS, Self.ADT, Self.P_DROP,
+    ]
+    comptime PERM = QKVToMajor[Self.SEQ_LEN, Self.DIM, Self.ADT]
+    comptime ARITY: Int = 1
+    comptime ACT_DT = Self.ADT
+    comptime IN_DIMS = Array[Int, 1](fill=Self.SEQ_LEN * Self.DIM * 3)
+    comptime IN_DIM0 = Self.SEQ_LEN * Self.DIM * 3
+    comptime OUT_DIM = Self.SEQ_LEN * Self.DIM
+
+    var attn: Self.ATTN
+    var perm: Self.PERM
+    var major: TensorImpl[Self.ADT]  # fallback: the permuted input
+    var gmajor: TensorImpl[Self.ADT]  # fallback: its gradient
+
+    def __init__(out self):
+        self.attn = Self.ATTN()
+        self.perm = Self.PERM()
+        self.major = TensorImpl[Self.ADT]()
+        self.gmajor = TensorImpl[Self.ADT]()
+
+    @staticmethod
+    def make[
+        target: StaticString, INIT: Initializer
+    ](ctx: Optional[DeviceContext] = None) raises -> Self:
+        comptime assert target == "cpu" or target == "gpu", (
+            "ScaledDotProductAttentionQKV: target must be 'cpu' or 'gpu'"
+        )
+        comptime if target != "cpu":
+            if not ctx:
+                raise Error(
+                    "ScaledDotProductAttentionQKV.make[target='gpu']: ctx"
+                    " required"
+                )
+        return Self()
+
+    def set_attr[ATTR: StaticString](mut self, value: Scalar[DT]):
+        """Forwarded to the attention (`dropout`)."""
+        self.attn.set_attr[ATTR](value)
+
+    def release_buffers(mut self):
+        self.attn.release_buffers()
+        self.major.release()
+        self.gmajor.release()
+
+    def forward[
+        target: StaticString, B: Int, o: MutOrigin, POLICY: AMPPolicy = NoAMP
+    ](
+        mut self,
+        inputs: TensorRefs[1, o, Self.ACT_DT],
+        mut out: TensorImpl[Self.ACT_DT],
+        ctx: Optional[DeviceContext] = None,
+    ) raises:
+        comptime if target == "gpu" and Self.ATTN.USE_FLASH:
+            ref in0 = inputs[0]
+            var c = ctx.value()
+            out.ensure_gpu(c, B * Self.OUT_DIM)
+            self.attn.o_cache.ensure_gpu(c, B * Self.OUT_DIM)
+            self.attn.lse.ensure_gpu(c, B * Self.N_HEADS * Self.SEQ_LEN)
+            flash_forward[
+                Self.ADT, Self.N_HEADS, Self.SEQ_LEN, Self.ATTN.HEAD_DIM,
+                Self.CAUSAL, B * Self.N_HEADS, IL=True, OC=Self.ATTN.OC_DT,
+            ](
+                c, in0.dev.value(), out.dev.value(),
+                self.attn.o_cache.dev.value(), self.attn.lse.dev.value(),
+            )
+        else:
+            self.perm.forward[target, B, POLICY=POLICY](inputs, self.major, ctx)
+            self.attn.forward[target, B, POLICY=POLICY](
+                child_refs[1, Self.ADT](self.major), out, ctx
+            )
+
+    def vjp[
+        target: StaticString, B: Int, ofi: MutOrigin, ogi: MutOrigin,
+        POLICY: AMPPolicy = NoAMP,
+    ](
+        mut self,
+        forward_input: TensorRefs[1, ofi, Self.ACT_DT],
+        mut grad_output: TensorImpl[Self.ACT_DT],
+        grad_inputs: TensorRefs[1, ogi, Self.ACT_DT],
+        ctx: Optional[DeviceContext] = None,
+    ) raises:
+        comptime if target == "gpu" and Self.ATTN.USE_FLASH:
+            ref fin = forward_input[0]
+            ref gin = grad_inputs[0]
+            var c = ctx.value()
+            gin.ensure_gpu(c, B * Self.IN_DIM0)
+            self.attn.dvec.ensure_gpu(c, B * Self.N_HEADS * Self.SEQ_LEN)
+            flash_backward[
+                Self.ADT, Self.N_HEADS, Self.SEQ_LEN, Self.ATTN.HEAD_DIM,
+                Self.CAUSAL, B * Self.N_HEADS, IL=True, OC=Self.ATTN.OC_DT,
+            ](
+                c, fin.dev.value(), grad_output.dev.value(),
+                self.attn.o_cache.dev.value(), self.attn.lse.dev.value(),
+                self.attn.dvec.dev.value(), gin.dev.value(),
+            )
+        else:
+            self.attn.vjp[target, B, POLICY=POLICY](
+                child_refs[1, Self.ADT](self.major), grad_output,
+                child_refs[1, Self.ADT](self.gmajor), ctx,
+            )
+            self.perm.vjp[target, B, POLICY=POLICY](
+                forward_input, self.gmajor, grad_inputs, ctx
+            )
+
+    @staticmethod
+    def display_label() -> String:
+        return String("ScaledDotProductAttentionQKV")

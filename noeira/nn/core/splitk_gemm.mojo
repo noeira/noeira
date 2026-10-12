@@ -1,9 +1,17 @@
 """Split-K GEMM on a caller-owned workspace.
 
+⚠ LINE NUMBERS ARE PINNED TO MAX v26.6.0, the release pixi ships, and the
+tree checked out at `references/modular-max-v26.6.0/max/kernels/src/`. Do not
+look them up on `main`: the file moves every week (the split-K allocation was
+at :2714 there on 2026-10-09). Main was re-read on that date and nothing below
+had changed except the line numbers — still one allocation per call on every
+NVIDIA path, and `select_config` byte-identical. When pixi moves to a new
+release, re-check the claims against that release's tree and bump this pin.
+
 WHY THIS EXISTS
 ---------------
 `linalg.matmul` allocates its split-K reduction workspace on EVERY call
-(`matmul/gpu/__init__.mojo:1845`, freed at `:1915`). That costs a
+(`linalg/matmul/gpu/__init__.mojo:1890`, freed at `:1960`). That costs a
 `cuMemAlloc_v2`/`cuMemFree_v2` pair per GEMM, and — because a synchronous
 driver allocation is illegal inside a capture region — it makes any training
 step containing a split-K GEMM impossible to put in a CUDA graph.
@@ -55,17 +63,17 @@ allocate-per-call pattern is MAX-wide, and on H100 and B200 it is WORSE than
 on the multistage path, two buffers and a memset instead of one buffer:
 
     sm_80/89/120   multistage_gemm                     `work_space_data`
-                   (matmul/gpu/__init__.mojo:1845)     freed at :1915
+                   (matmul/gpu/__init__.mojo:1890)     freed at :1960
 
     sm_90 (H100)   warp_specialize_gemm_with_          `workspace_data` +
                    multicasting_splitk                 `locks_ptr`, plus an
-                   (sm90/matmul.mojo:689, :852, :867)  enqueue_memset; both
+                   (sm90/matmul.mojo:707, :870, :885)  enqueue_memset; both
                                                        freed with `_ = x^`
 
     sm_100 (B200)  _blackwell_matmul_tma_umma_         `reduction_workspace` +
                    warp_specialized_split_k            `locks_buffer`, plus an
                    (sm100_structured/default/          enqueue_memset; both
-                    matmul.mojo:485, :670, :673)       freed with `_ = x^`
+                    matmul.mojo:500, :687, :703)       freed with `_ = x^`
 
 So both consequences carry to every NVIDIA architecture: the per-call
 allocator tax, and — since a synchronous driver allocation is illegal inside a
@@ -121,11 +129,17 @@ def splitk_path_applies[info: GPUInfo]() -> Bool:
 def multistage_shape_ok(m: Int, n: Int, k: Int) -> Bool:
     """Would MAX's own dispatch hand THIS shape to `multistage_gemm`?
 
-    This is `multi_gemm_cond` from `matmul/gpu/__init__.mojo:591`, reduced to
-    its generic-NVIDIA form (both `h100_matmul_cond` and `amdgpu_matmul_cond`
-    are False on the parts `splitk_path_applies` admits):
+    This is `multi_gemm_cond` from `matmul/gpu/__init__.mojo:608` (v26.6.0),
+    reduced to its generic-NVIDIA form (both `h100_matmul_cond` and
+    `amdgpu_matmul_cond` are False on the parts `splitk_path_applies` admits):
 
         m > 1  and  n % 128 == 0  and  k % 32 == 0  and  k >= 128
+
+    MAX also requires N and K to be STATIC (`has_static_NK`, `:618`) before
+    it considers multistage at all; a dynamic one goes to the vendor
+    fallback. That is not checked here because it cannot fail at this call:
+    `splitk_gemm` already needs a static N (`layout.shape[1].value()`), and
+    every Module that routes through it has compile-time dims.
 
     ⚠ CHECKING THIS IS NOT OPTIONAL, and `select_config` is not a substitute.
     `select_config` is a CONFIG CHOOSER that MAX only reaches AFTER
@@ -152,7 +166,7 @@ def partitions_legal(K: Int, P: Int, BK: Int) -> Bool:
 
     `multistage_gemm_split_k_kernel` carves K with
     `LayoutTensor.split[axis, split_alignment=BK]`, whose body is
-    (`layout_tensor.mojo:3870`):
+    (`layout/layout_tensor.mojo:3864`, v26.6.0):
 
         part   = align_up(K // P, BK)          <- FLOOR divide, then align UP
         size_i = min(part, K - i * part)
@@ -246,7 +260,7 @@ def splitk_gemm[
 ) raises:
     """`multistage_gemm`'s split-K branch, on `ws` instead of a fresh buffer.
 
-    Mirrors `matmul/gpu/__init__.mojo:1840-1915` with its
+    Mirrors `matmul/gpu/__init__.mojo:1884-1960` (v26.6.0) with its
     `enqueue_create_buffer` / `_ = work_space_data^` pair removed. `ws` must
     already hold at least `num_partitions * M * N` elements — size it with
     `ensure_gpu` on an eager step, never inside a capture region.

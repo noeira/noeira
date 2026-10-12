@@ -105,6 +105,25 @@ def _speech_command(
     return cmd + "-f " + quote_arg(text_path)
 
 
+def os_voice_for(lang: String) -> String:
+    """The OS voice for a reply in `lang`, "" for the system's default.
+
+    ⚠ THE DEFAULT IS THE SYSTEM LANGUAGE'S VOICE, not the reply's: on a French
+    Mac, `say` reads English with a French voice. English gets a native one —
+    Samantha (macOS, installed with the system) / `en-us` (espeak). French on
+    Linux names espeak's `fr`; anything else keeps the default."""
+    comptime if CompilationTarget.is_macos():
+        if lang == "en":
+            return String("Samantha")
+        return String("")
+    else:
+        if lang == "en":
+            return String("en-us")
+        if lang == "fr":
+            return String("fr")
+        return String("")
+
+
 def _write_text(path: String, text: String) raises:
     var f = open(path, "w")
     f.write(text)
@@ -181,6 +200,8 @@ struct LocalVoice(Movable):
     var _pipe: Optional[Pipe]
     var _pid: Int
     var _text_path: String
+    """The file the current utterance reads (`say`) or plays (`play`), deleted
+    when it ends."""
 
     def __init__(out self, var voice: String = String("")):
         self.voice = voice^
@@ -207,6 +228,21 @@ struct LocalVoice(Movable):
         var pipe = Pipe(
             "echo $$; exec " + _speech_command(self._text_path, self.voice, out_path)
         )
+        self._pid = _read_pid(pipe)
+        self._pipe = pipe^
+
+    def play(mut self, wav_path: String) raises:
+        """Start playing a WAV file (a synthesised reply) — `afplay` / `aplay`
+        — with the same `speaking()` and the same one-at-a-time rule as `say`.
+        The file is DELETED when playback ends or is cut off."""
+        self.stop()
+        self._text_path = wav_path
+        var cmd: String
+        comptime if CompilationTarget.is_macos():
+            cmd = "afplay " + quote_arg(wav_path)
+        else:
+            cmd = "aplay -q " + quote_arg(wav_path)
+        var pipe = Pipe("echo $$; exec " + cmd)
         self._pid = _read_pid(pipe)
         self._pipe = pipe^
 

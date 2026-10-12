@@ -17,6 +17,7 @@ Run (NVIDIA): pixi run -e nvidia mojo run -I . examples/nn/resnet/resnet20_cifar
 
 from std.random import seed
 from std.testing import assert_true
+from std.sys import get_defined_int, is_defined
 from max.gpu.host import DeviceContext
 
 from noeira.nn.datasets import CIFAR10
@@ -36,14 +37,20 @@ from noeira.nn.training.augmenter import CIFAR10CropFlipAugmenter
 from noeira.nn.optimizer.lr_scheduler import WarmupCosineSchedule
 
 
+# `-D NN_TRAIN_GRAPH`: the training step captured in a CUDA graph (NVIDIA;
+# eager elsewhere). `-D NN_EPOCHS=N` shortens the run (step timing). Needs
+# `mojo build -D ...`, then run the binary.
+comptime TRAIN_GRAPH = is_defined["NN_TRAIN_GRAPH"]()
+
 def main() raises:
     comptime IN_DIM = 3 * 32 * 32
     comptime NC = 10
     comptime BATCH = 100
-    comptime N_EPOCHS = 50
+    comptime N_EPOCHS = get_defined_int["NN_EPOCHS", 50]()
     comptime TARGET_ACC: Float64 = 0.80
 
-    seed(42)
+    comptime SEED = get_defined_int["NN_SEED", 42]()  # `-D NN_SEED=N`: another run
+    seed(SEED)
     print("loading CIFAR-10...")
     var ds = CIFAR10()
     var c = DeviceContext()
@@ -65,7 +72,9 @@ def main() raises:
     ]
 
     print("initializing ResNet-20 on GPU (this compile is long)...")
-    var trainer = Trainer[Net, NC, IN_DIM, BATCH, "gpu"].make[Kaiming](
+    var trainer = Trainer[
+        Net, NC, IN_DIM, BATCH, "gpu", USE_TRAIN_CUDA_GRAPH=TRAIN_GRAPH
+    ].make[Kaiming](
         Optional(c), lr=1e-3
     )
 
@@ -89,8 +98,8 @@ def main() raises:
         Optional(c),
         epochs=N_EPOCHS,
         shuffle=True,
-        rng_seed=UInt64(42),
-        aug_seed=UInt64(1000),
+        rng_seed=UInt64(SEED),
+        aug_seed=UInt64(1000 + SEED - 42),
     )
 
     var best_acc: Float64 = 0.0

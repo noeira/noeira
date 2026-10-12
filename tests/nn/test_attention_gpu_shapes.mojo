@@ -8,6 +8,10 @@ forward caches for the vjp, and the input gradient. Each shape runs TWICE on
 the same module, so a kernel reading stale scratch from the first call shows
 on the second (`docs/CROSS_ATTENTION_OPTIMIZATION.md` §3).
 
+Pinned to the bmm path (`FLASH=False`): it caches the softmax weights this
+test compares, and it is the path dropout and heads wider than 64 take. The
+fused path is `test_flash_attention.mojo`.
+
 Shapes: LeWM's ViT-tiny (257 tokens, 3 x 64, bidirectional), a causal GPT-ish
 block (64 tokens, 4 x 32), LeWM's predictor (3 tokens, 16 x 64, causal).
 
@@ -51,7 +55,7 @@ def _err(cpu: List[Scalar[DT]], gpu: List[Scalar[DT]]) -> Float64:
 def _run[
     target: StaticString, DIM: Int, H: Int, S: Int, CAUSAL: Bool, B: Int
 ](
-    mut m: ScaledDotProductAttention[DIM, H, S, CAUSAL],
+    mut m: ScaledDotProductAttention[DIM, H, S, CAUSAL, FLASH=False],
     x: List[Scalar[DT]], g: List[Scalar[DT]], ctx: Optional[DeviceContext],
 ) raises -> List[List[Scalar[DT]]]:
     comptime IN = 3 * S * DIM
@@ -102,8 +106,8 @@ def _shape[
         x.append(Scalar[DT](random_float64(-2, 2)))
     for _ in range(B * S * DIM):
         g.append(Scalar[DT](random_float64(-1, 1)))
-    var mc = ScaledDotProductAttention[DIM, H, S, CAUSAL].make["cpu", Kaiming](None)
-    var mg = ScaledDotProductAttention[DIM, H, S, CAUSAL].make["gpu", Kaiming](Optional(ctx))
+    var mc = ScaledDotProductAttention[DIM, H, S, CAUSAL, FLASH=False].make["cpu", Kaiming](None)
+    var mg = ScaledDotProductAttention[DIM, H, S, CAUSAL, FLASH=False].make["gpu", Kaiming](Optional(ctx))
     var ref_ = _run["cpu", DIM, H, S, CAUSAL, B](mc, x, g, None)
     var fails = 0
     for rep in range(2):

@@ -47,7 +47,7 @@ def f2(x: Float64) -> String:
 
 def pad(s: String, width: Int) -> String:
     var out = s
-    while len(out) < width:
+    while out.byte_length() < width:
         out = out + " "
     return out
 

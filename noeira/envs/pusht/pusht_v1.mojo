@@ -148,6 +148,13 @@ struct PushTEnv[DTYPE: DType](
     var last_target_x: Scalar[dtype]
     var last_target_y: Scalar[dtype]
 
+    # Physics knobs, the `PConstants` values unless `set_dynamics` changes them
+    # (test-time dynamics shifts — the reference env never does).
+    var k_p: Scalar[dtype]
+    var k_v: Scalar[dtype]
+    var friction: Scalar[dtype]
+    var block_damping: Scalar[dtype]
+
     # Renderer (RenderableEnv)
     var _renderer: Optional[Pointer[Renderer2D, MutUntrackedOrigin]]
     var _renderer_initialized: Bool
@@ -177,6 +184,10 @@ struct PushTEnv[DTYPE: DType](
         self.rng_counter = 0
         self.last_target_x = Scalar[dtype](256.0)
         self.last_target_y = Scalar[dtype](256.0)
+        self.k_p = Scalar[dtype](PConstants.K_P)
+        self.k_v = Scalar[dtype](PConstants.K_V)
+        self.friction = Scalar[dtype](PConstants.FRICTION)
+        self.block_damping = Scalar[dtype](PConstants.BLOCK_DAMPING)
         self._renderer = None
         self._renderer_initialized = False
         self._reset_internal()
@@ -190,6 +201,10 @@ struct PushTEnv[DTYPE: DType](
         self.rng_counter = copy.rng_counter
         self.last_target_x = copy.last_target_x
         self.last_target_y = copy.last_target_y
+        self.k_p = copy.k_p
+        self.k_v = copy.k_v
+        self.friction = copy.friction
+        self.block_damping = copy.block_damping
         # Don't transfer renderer; fresh instance starts uninitialized.
         self._renderer = None
         self._renderer_initialized = False
@@ -203,6 +218,10 @@ struct PushTEnv[DTYPE: DType](
         self.rng_counter = move.rng_counter
         self.last_target_x = move.last_target_x
         self.last_target_y = move.last_target_y
+        self.k_p = move.k_p
+        self.k_v = move.k_v
+        self.friction = move.friction
+        self.block_damping = move.block_damping
         self._renderer = move._renderer
         self._renderer_initialized = move._renderer_initialized
 
@@ -389,17 +408,33 @@ struct PushTEnv[DTYPE: DType](
             0,
             target_x,
             target_y,
-            Scalar[dtype](PConstants.K_P),
-            Scalar[dtype](PConstants.K_V),
+            self.k_p,
+            self.k_v,
             Scalar[dtype](PConstants.DT),
             Scalar[dtype](PConstants.WORLD_MIN),
             Scalar[dtype](PConstants.WORLD_MAX),
-            Scalar[dtype](PConstants.FRICTION),
+            self.friction,
             Scalar[dtype](PConstants.RESTITUTION),
             Scalar[dtype](0.2),
             Scalar[dtype](0.005),
-            Scalar[dtype](PConstants.BLOCK_DAMPING),
+            self.block_damping,
         )
+
+    def set_dynamics(
+        mut self,
+        k_p: Scalar[dtype],
+        k_v: Scalar[dtype],
+        friction: Scalar[dtype],
+        block_damping: Scalar[dtype],
+    ):
+        """Change the physics from the next substep on: the agent's PD gains,
+        the contact friction and the T's per-second velocity retention
+        (`PConstants` documents each default). A test-time dynamics shift
+        (LeWM P7 E5); the reference env never calls it."""
+        self.k_p = k_p
+        self.k_v = k_v
+        self.friction = friction
+        self.block_damping = block_damping
 
     # =========================================================================
     # Env trait methods
@@ -441,7 +476,7 @@ struct PushTEnv[DTYPE: DType](
         s[0, ao + IDX_VX] = agent_vx
         s[0, ao + IDX_VY] = agent_vy
         if settle:
-            var r = Scalar[dtype](PConstants.K_V / PConstants.K_P)
+            var r = self.k_v / self.k_p
             self._substep(agent_x + r * agent_vx, agent_y + r * agent_vy)
             s = self._state_view()
         s[0, PushTLayout.CONTACT_COUNT_OFFSET] = Scalar[dtype](0.0)

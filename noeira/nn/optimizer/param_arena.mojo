@@ -68,6 +68,7 @@ struct ParamArena(Movable & ParamVisitor & ParamVisitorRT):
     var grd: Tensor  # contiguous gradient arena
     var decay_mask: Tensor  # per-element 0/1 weight-decay gate
     var total: Int
+    var capacity: Int  # allocated length of `val`/`grd` (>= total; see `adopt`'s `pad_to`)
     var adopted: Bool
     var _off: Int  # running offset during the placement walk
 
@@ -76,6 +77,7 @@ struct ParamArena(Movable & ParamVisitor & ParamVisitorRT):
         self.grd = Tensor()
         self.decay_mask = Tensor()
         self.total = 0
+        self.capacity = 0
         self.adopted = False
         self._off = 0
 
@@ -119,9 +121,20 @@ struct ParamArena(Movable & ParamVisitor & ParamVisitorRT):
         self.visit_rt[target](name, param, grad, m, v, N, apply_decay, ctx)
     def adopt[
         target: StaticString, M: ParamWalkable
-    ](mut self, mut model: M, ctx: Optional[DeviceContext] = None) raises:
+    ](
+        mut self,
+        mut model: M,
+        ctx: Optional[DeviceContext] = None,
+        pad_to: Int = 1,
+    ) raises:
         """Pack `model` into the arena (GPU); NO-OP on CPU. Call ONCE after the
-        model is made + initialized, before the first step."""
+        model is made + initialized, before the first step.
+
+        `pad_to` rounds the ALLOCATION of `val`/`grd` up to a multiple of it
+        (`capacity`); `total` and everything that walks `[0, total)` are
+        unchanged, and the tail stays zero. A sharded optimizer uses it to view
+        the arena as `[capacity / PARAM_ALIGN, PARAM_ALIGN]` rows
+        (`nn/distributed/zero.mojo`). The default 1 allocates exactly `total`."""
         comptime if target == "gpu":
             var c = ctx.value()
             var nps = named_params["gpu"](model)
@@ -141,8 +154,9 @@ struct ParamArena(Movable & ParamVisitor & ParamVisitorRT):
             dm.upload(c)
             self.decay_mask = dm^
 
-            self.val = Tensor.alloc_gpu(c, total)  # zeroed
-            self.grd = Tensor.alloc_gpu(c, total)
+            self.capacity = ((total + pad_to - 1) // pad_to) * pad_to
+            self.val = Tensor.alloc_gpu(c, self.capacity)  # zeroed
+            self.grd = Tensor.alloc_gpu(c, self.capacity)
             self._off = 0
             walk_params["gpu"](model, self, Optional(c))
             self.adopted = True
@@ -188,6 +202,7 @@ struct ParamArena(Movable & ParamVisitor & ParamVisitorRT):
             dm.upload(c)
             self.decay_mask = dm^
 
+            self.capacity = total
             self.val = Tensor.alloc_gpu(c, total)
             self.grd = Tensor.alloc_gpu(c, total)
             # ⚠ `_off` is reset ONCE and then advances ACROSS the models —

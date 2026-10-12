@@ -194,6 +194,13 @@ def main() raises:
         var z0 = Float64(env.d.xpos.data[brick * 3 + 2]) if brick >= 0 else 0.0
         var rise = 0.0
         var held = False
+        # how far the brick slid ON THE DESK before it first rose 2 cm off
+        # it: a jaw coming down on it can shove it out of reach
+        var bx0 = Float64(env.d.xpos.data[brick * 3]) if brick >= 0 else 0.0
+        var by0 = Float64(env.d.xpos.data[brick * 3 + 1]) if brick >= 0 else 0.0
+        var push = 0.0
+        var z_desk = z0  # the brick is dropped ~1 cm above the desk: its lowest z
+        var lifted = False
         print("── episode", ep, "(placement seed", seed0 + ep, ")")
         var line0 = String("   start q:")
         for j in range(ACT):
@@ -308,8 +315,13 @@ def main() raises:
                     row += "," + String(Float64(env.d.qvel.data[da[j]]))
                 rec_csv += row + ra + rt + "\n"
             if t % 15 == 0:
+                var bl = String("")
+                if brick >= 0:
+                    bl = ("  brick " + fixed(Float64(env.d.xpos.data[brick * 3]), 3) + " "
+                          + fixed(Float64(env.d.xpos.data[brick * 3 + 1]), 3) + " "
+                          + fixed(Float64(env.d.xpos.data[brick * 3 + 2]), 3))
                 print("  t=" + pad_left(fixed(Float64(t) * man.control_period_s, 1), 5)
-                      + "s  a:" + line)
+                      + "s  a:" + line + bl)
             lag.advance()
             var res = env.step(act)
             obs = res[0].copy()
@@ -317,6 +329,13 @@ def main() raises:
                 var zb = Float64(env.d.xpos.data[brick * 3 + 2])
                 if zb - z0 > rise:
                     rise = zb - z0
+                z_desk = min(z_desk, zb)
+                if zb - z_desk > 0.02:
+                    lifted = True
+                if not lifted and zb - z_desk < 0.005:
+                    var px = Float64(env.d.xpos.data[brick * 3]) - bx0
+                    var py = Float64(env.d.xpos.data[brick * 3 + 1]) - by0
+                    push = max(push, (px * px + py * py) ** 0.5)
                 if bowl >= 0:
                     var ex = Float64(env.d.xpos.data[brick * 3] - env.d.xpos.data[bowl * 3])
                     var ey = Float64(env.d.xpos.data[brick * 3 + 1] - env.d.xpos.data[bowl * 3 + 1])
@@ -325,7 +344,8 @@ def main() raises:
                         held = True
         if held:
             n_ok += 1
-        print("   brick max rise", fixed(rise * 1000.0, 1), "mm | Near held:", held,
+        print("   brick max rise", fixed(rise * 1000.0, 1), "mm | slid before the lift",
+              fixed(push * 1000.0, 1), "mm | Near held:", held,
               "| targets at a joint limit", at_lim)
     print("probe:", n_ok, "/", episodes, "episodes reached the goal")
     if rec_path.byte_length() > 0:

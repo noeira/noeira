@@ -7,7 +7,10 @@ CACHE MECHANISM (dtype-agnostic, so it holds on Apple too) via change-detection:
                      with NEW weights, the forward output CHANGES (recast fired).
   (B) reuse        — WITHOUT a version bump, a changed weight.val is IGNORED
                      (the cached cast is reused) → output is byte-identical.
-  (C) integration  — Adam.step bumps weight.val.version (the wiring is live).
+  (C) integration  — Adam.step advances weight.val.version (the wiring is live).
+                     Advances, not "+1": the per-param path bumps at the write
+                     AND in `step`'s walk (adam.mojo, on purpose: graph trainers
+                     never call `step`), and the caches compare with `!=`.
 
 NOTE: bf16 NUMERIC correctness (bf16 GEMM ≈ fp32) is NOT asserted here because
 `linalg.matmul` MIS-COMPUTES bf16 GEMMs on Apple Metal at realistic dims (verified:
@@ -108,7 +111,7 @@ def main() raises:
     opt.zero_grad["gpu"](m, Optional(c))
     opt.step["gpu"](m, Optional(c))
     var v1 = m.weight.val.version
-    var c_ok = v1 == v0 + 1
+    var c_ok = v1 > v0
     print("  (C) per-param     weight.version", v0, "->", v1, "OK" if c_ok else "FAIL")
 
     # (D) integration, ARENA path: adopt() + step bumps the version too (the
@@ -121,7 +124,7 @@ def main() raises:
     optA.zero_grad["gpu"](ma, Optional(c))
     optA.step["gpu"](ma, Optional(c))
     var av1 = ma.weight.val.version
-    var d_ok = av1 == av0 + 1
+    var d_ok = av1 > av0
     print("  (D) arena         weight.version", av0, "->", av1, "OK" if d_ok else "FAIL")
 
     # (E) bf16 BACKWARD executes end-to-end (run-check only — Apple Metal bf16

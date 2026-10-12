@@ -16,6 +16,7 @@ one origin (§B0) for the `TensorRefs[4]` the leaf consumes; grad_inputs land in
 second pool. `forward_backward` returns the mean per-batch loss for logging.
 """
 
+from layout import Layout
 from max.gpu.host import DeviceContext
 
 from noeira.nn.constants import DT
@@ -28,7 +29,9 @@ from noeira.nn.core.call import call_forward, call_vjp
 from noeira.nn.optimizer.adam import Adam
 from noeira.nn.core.initializer import Zero
 from .objective import PPOObjective
+from .mirror import ActorMirror
 from ..loss.loss_block import LossBlock
+from ..training.device_mean_accum import DeviceMeanAccum
 
 
 struct PPOActorLoss[
@@ -44,6 +47,12 @@ struct PPOActorLoss[
     var _loss_out: Tensor    # [B] loss_per_b
     var _grad_seed: Tensor   # [B] = 1/BATCH backward seed
     var _obs_grad: Tensor    # [B*OBS] unused grad sink for actor.vjp
+    var _loss_mean_dev: DeviceMeanAccum
+    """GPU: the per-minibatch mean loss, accumulated on the device by the
+    `DEVICE_LOSS` path (read at flush cadence) instead of a per-step D2H."""
+    var mirror: ActorMirror[Self.OBS_DIM, Self.ACT_DIM, Self.BATCH]
+    """The opt-in mirror-symmetry pass (`mirror.mojo`); off until
+    `enable_mirror`."""
 
     def __init__(out self):
         self.objective = PPOObjective[Self.ACT_DIM]()
@@ -52,6 +61,20 @@ struct PPOActorLoss[
         self._loss_out = Tensor()
         self._grad_seed = Tensor()
         self._obs_grad = Tensor()
+        self._loss_mean_dev = DeviceMeanAccum()
+        self.mirror = ActorMirror[Self.OBS_DIM, Self.ACT_DIM, Self.BATCH]()
+
+    def enable_mirror[target: StaticString](
+        mut self,
+        obs_idx: List[Int],
+        obs_sign: List[Float64],
+        act_idx: List[Int],
+        act_sign: List[Float64],
+        coeff: Float64,
+        ctx: Optional[DeviceContext] = None,
+    ) raises:
+        """Turn on the mirror-symmetry loss (`mirror.mojo`)."""
+        self.mirror.enable[target](obs_idx, obs_sign, act_idx, act_sign, coeff, ctx)
 
     @staticmethod
     def make[target: StaticString](
@@ -77,6 +100,7 @@ struct PPOActorLoss[
             blk._grad_seed.data[b] = Scalar[DT](1.0) / Scalar[DT](Self.BATCH)
         comptime if target == "gpu":
             blk._grad_seed.upload(ctx.value())
+            blk._loss_mean_dev = DeviceMeanAccum.make["gpu"](ctx=ctx)
         return blk^
 
     def set_clip_eps(mut self, value: Scalar[DT]):
@@ -105,6 +129,7 @@ struct PPOActorLoss[
     def forward_backward[
         target: StaticString,
         POLICY: AMPPolicy = NoAMP,
+        DEVICE_LOSS: Bool = False,
     ](
         mut self,
         mut actor: Self.ACTOR,
@@ -120,6 +145,11 @@ struct PPOActorLoss[
         comptime ACT = Self.ACT_DIM
 
         actor_opt.zero_grad[target, M = Self.ACTOR](actor, ctx)
+
+        # The mirror pass first (its grads accumulate; its forwards leave the
+        # caches on M_o s, which the PPO forward below rewrites).
+        if self.mirror.on:
+            self.mirror.add_grads[target](actor, mb_s, ctx)
 
         # actor.forward(s) → _in[0] (the [mu|log_std] actor output).
         call_forward[target, BB, POLICY=POLICY](
@@ -137,13 +167,23 @@ struct PPOActorLoss[
             ctx,
         )
 
-        # Mean loss for logging (host reduction; D2H on GPU).
-        comptime if target == "gpu":
-            self._loss_out.download(ctx.value())
-        var loss_sum: Scalar[DT] = 0.0
-        for b in range(BB):
-            loss_sum += self._loss_out.data[b]
-        var loss_mean = loss_sum / Scalar[DT](BB)
+        # Mean loss for logging. DEVICE_LOSS (GPU, CUDA-graph capture): folded
+        # into `_loss_mean_dev` on the device, no D2H, and 0 is returned — the
+        # caller reads `read_device_loss` at flush cadence. Otherwise the host
+        # reduction (D2H on GPU).
+        var loss_mean: Scalar[DT] = 0.0
+        comptime if DEVICE_LOSS:
+            comptime assert target == "gpu", "DEVICE_LOSS is GPU-only"
+            self._loss_mean_dev.accumulate_gpu_lt[BB](
+                self._loss_out.lt["gpu", Layout.row_major(BB)]()
+            )
+        else:
+            comptime if target == "gpu":
+                self._loss_out.download(ctx.value())
+            var loss_sum: Scalar[DT] = 0.0
+            for b in range(BB):
+                loss_sum += self._loss_out.data[b]
+            loss_mean = loss_sum / Scalar[DT](BB)
 
         # Backward: seed 1/BATCH → grad_actor_out (+ zeroed rollout grads).
         self.objective.vjp[target, BB, POLICY=POLICY](
@@ -164,8 +204,22 @@ struct PPOActorLoss[
         )
 
         if max_grad_norm > Scalar[DT](0.0):
-            _ = actor_opt.clip_grads[target, M = Self.ACTOR](
-                actor, max_grad_norm, ctx
-            )
+            # The device clip (no D2H of the norm) under capture.
+            comptime if DEVICE_LOSS:
+                actor_opt.clip_grads_device[target, M = Self.ACTOR](
+                    actor, max_grad_norm, ctx
+                )
+            else:
+                _ = actor_opt.clip_grads[target, M = Self.ACTOR](
+                    actor, max_grad_norm, ctx
+                )
         actor_opt.step[target, M = Self.ACTOR](actor, ctx)
         return loss_mean
+
+    def read_device_loss(mut self) raises -> Scalar[DT]:
+        """Mean of the `DEVICE_LOSS` minibatch losses since the last reset
+        (one D2H — flush cadence only)."""
+        return self._loss_mean_dev.read["gpu"]()
+
+    def reset_device_loss(mut self) raises:
+        self._loss_mean_dev.reset["gpu"]()

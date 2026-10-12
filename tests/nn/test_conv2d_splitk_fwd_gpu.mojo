@@ -37,6 +37,8 @@ from noeira.nn.core.tensor import Tensor
 from noeira.nn.core.tensor_refs import TensorRefs
 from noeira.nn.core.initializer import Kaiming
 from noeira.nn.core.splitk_gemm import splitk_path_applies
+from noeira.nn.core.cublas_gemm import GEMM_PATH
+from std.sys import has_nvidia_gpu_accelerator
 from noeira.nn.primitives.conv2d import Conv2D
 
 
@@ -118,6 +120,13 @@ def check[
 
 
 def main() raises:
+    comptime if has_nvidia_gpu_accelerator() and GEMM_PATH != "max":
+        # On NVIDIA these shapes run on cuBLAS / cuDNN (`Conv2D.CUB`,
+        # `Conv2D.use_cudnn`), never on MAX's split-K GEMM. Build with
+        # `-D NN_GEMM_PATH=max` to test that path; the GPU-vs-CPU gate for the
+        # NVIDIA paths is `test_conv2d_gpu`.
+        print("NVIDIA: Conv2D does not use MAX's split-K GEMM here (cuBLAS / cuDNN); see test_conv2d_gpu")
+        return
     comptime if not splitk_path_applies[DeviceContext.default_device_info]():
         print(
             "split-K path does not apply on this device (Apple / AMD / H100 /"

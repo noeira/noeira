@@ -22,8 +22,8 @@ Driver contract:
     rollout uses cached unbounded action for PPO math).
   - `done_ptr` is treated as truncation by default. Real terminals
     need `mark_terminal(env_idx)`.
-  - `next_obs_ptr` is cached in `bootstrap_obs` (N_ENVS × OBS) every
-    step — at rollout end it already holds the right per-env value.
+  - `next_obs_ptr` (the PRE-RESET obs after the step) is stored per row in
+    `next_obs_buf`: GAE bootstraps a truncated episode from it.
 """
 
 from max.gpu.host import DeviceContext
@@ -82,7 +82,7 @@ struct PPORecordStep[
         ref val_buf = state.val_buf.data
         ref rew_buf = state.rew_buf.data
         ref done_buf = state.done_buf.data
-        ref boot_buf = state.bootstrap_obs.data
+        ref next_buf = state.next_obs_buf.data
         ref ca = state.cached_action.data
         ref clp = state.cached_log_prob.data
         ref cval = state.cached_value.data
@@ -99,7 +99,7 @@ struct PPORecordStep[
             done_buf[row_base + e] = done_ptr[unsafe_offset=e]
             # term_buf stays at 0 unless caller marks terminal explicitly.
             for d in range(Self.OBS):
-                boot_buf[e * Self.OBS + d] = next_obs_ptr[unsafe_offset=e * Self.OBS + d]
+                next_buf[(row_base + e) * Self.OBS + d] = next_obs_ptr[unsafe_offset=e * Self.OBS + d]
         state.rollout_idx += 1
 
     def mark_terminal[

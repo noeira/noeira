@@ -57,15 +57,17 @@ string instead.
 
 from std.time import perf_counter_ns
 
-from noeira.ai.audio_io import MicCapture, rms, LocalVoice
+from noeira.ai.audio_io import MicCapture, rms, LocalVoice, os_voice_for
 from noeira.ai.chat import ChatClient, ChatMessage, ToolSpec
 from noeira.ai.jev import JevClient, JevQuestions
-from noeira.ai.speech import SpeechToText, STT_RAW
+from noeira.ai.speech import SpeechToText, STT_RAW, TextToSpeech
+from noeira.io.fileio import write_file_atomic
 from noeira.io.wav import WavAudio
 from noeira.envs.robots.g1_command_bank import G1CommandBank
 from noeira.envs.robots.g1_command_language import (
     g1_command_questions, g1_decide, g1_decide_chain, g1_command_state,
     g1_since_word, G1Context, G1LangPick, G1_Q_EXTENT,
+    g1_destination_questions, g1_route_destination,
 )
 from noeira.envs.robots.g1_reward_vocab import G1Term
 from noeira.envs.robots.g1_spec import (
@@ -81,6 +83,8 @@ comptime VL_ST_STT: Int = 2
 comptime VL_ST_JEV: Int = 3
 comptime VL_ST_SPEC: Int = 4
 comptime VL_ST_CHAT: Int = 5
+comptime VL_ST_DEST: Int = 6
+"""The first of the two requests `request_wording` makes: destination only."""
 
 # ── the events ────────────────────────────────────────────────────────────
 comptime VL_NONE: Int = 0
@@ -107,6 +111,8 @@ comptime VL_REFUSED: Int = 5
 comptime VL_STT_DEADLINE_S: Float64 = 20.0
 comptime VL_JEV_DEADLINE_S: Float64 = 12.0
 comptime VL_CHAT_DEADLINE_S: Float64 = 30.0
+comptime VL_TTS_DEADLINE_S: Float64 = 5.0
+"""A reply synthesised later than this is spoken by the OS voice instead."""
 
 # ⚠ AND THE TAIL IS A CAPTURE-BUFFER DRAIN, NOT A DURATION GUESS. `speaking()`
 # goes false the instant playback ends, but ffmpeg's pipe is 64 KiB — about
@@ -205,8 +211,9 @@ struct G1VoiceConfig(Copyable, Movable):
     """ISO-639-1 pinned on the recogniser. ⚠ "" lets Whisper auto-detect from
     a one-word utterance, which is how "cours" came back "cool" (§12.56)."""
     var stt_spec: String
-    """`hf` or `groq`. ⚠ Only a multipart backend takes a text vocabulary
-    prompt; the HF endpoint RAISES on one, so `vocab` is sent to `groq` only."""
+    """`hf`, `groq` or `local:<base_url>` (e.g. `local:http://127.0.0.1:8765/v1`).
+    ⚠ Only a multipart backend takes a text vocabulary prompt; the HF endpoint
+    RAISES on one, so `vocab` is sent to `groq` and `local:` only."""
     var vocab: String
     var vad: Bool
     var mute: Bool
@@ -238,6 +245,25 @@ struct G1VoiceConfig(Copyable, Movable):
     var llm_spec: String
     """Passed to `ChatClient.from_spec` — `hf`, `openai`, `anthropic`, or a
     local openai-compatible base URL."""
+    var request_wording: Bool
+    """Ask the destination as a REQUEST with a yes/no gate, the wording
+    measured on a local Jev-compatible model, in a request of its OWN
+    (`g1_destination_questions`) — the commands are asked in a second request
+    only when it routes nothing, so a goto costs the short request alone.
+    ⚠ OFF BY DEFAULT: hosted Jev was measured on the default wording, in one
+    request. The caller fills `G1Context`'s place fields."""
+    var chain: Bool
+    """Ask for a second and third step. A caller that runs only the first step
+    turns it off, and a local model then answers two rows fewer."""
+    var tts_spec: String
+    """"" = the OS voice (`say` / `espeak`); `local:<base_url>` = an
+    OpenAI-compatible `/audio/speech` server on this machine (Kokoro-82M,
+    `kokoro_serve.py`). A failed or late synthesis falls back to the OS voice."""
+    var tts_voice: String
+    """"" picks by `lang`: Kokoro `af_heart` (en) / `ff_siwis` (fr), or
+    `os_voice_for(lang)`. Otherwise the voice's name for the backend in use."""
+    var tts_dl: Float64
+    """Seconds a synthesis may take before the OS voice says it instead."""
 
     def __init__(out self):
         self.lang = String("")
@@ -263,6 +289,11 @@ struct G1VoiceConfig(Copyable, Movable):
         self.mic_dev = String("")
         self.refuse_placeless = False
         self.llm_spec = String("hf")
+        self.request_wording = False
+        self.chain = True
+        self.tts_spec = String("")
+        self.tts_voice = String("")
+        self.tts_dl = VL_TTS_DEADLINE_S
 
 
 struct G1VoiceLoop(Movable):
@@ -271,11 +302,28 @@ struct G1VoiceLoop(Movable):
 
     var mic: MicCapture
     var voice: LocalVoice
+    var tts: Optional[TextToSpeech]
+    """`tts_spec` set: the synthesiser. Its WAV is played through `voice`, so
+    `voice.speaking()` stays the one end signal."""
+    var tts_busy: Bool
+    """A reply is being synthesised: the robot is about to speak, and the
+    echo gate counts it as speaking."""
+    var tts_text: String
+    """What is being synthesised, for the OS-voice fallback."""
+    var tts_t0: Int
     var stt: SpeechToText
     var jev: JevClient
     var llm: ChatClient
     var cfg: G1VoiceConfig
     var quest: JevQuestions
+    var dest_q: JevQuestions
+    """`request_wording` only: the first request. Empty otherwise."""
+    var asked: String
+    """The state the current decision was asked with, for its second
+    request."""
+    var dest_ms: Float64
+    """`request_wording`: how long the first request of the current decision
+    took, 0 when it was the only one. Shown in the decision's note."""
     var spec_q: JevQuestions
     var has_pool: Bool
     var pool: G1Pool
@@ -309,10 +357,17 @@ struct G1VoiceLoop(Movable):
         BEFORE its loop starts rather than be swallowed inside one."""
         self.cfg = cfg^
         self.jev = JevClient.from_env()
-        self.stt = (
-            SpeechToText.groq() if self.cfg.stt_spec == "groq"
-            else SpeechToText.huggingface()
-        )
+        # `local:<base_url>` is any OpenAI-compatible server on this machine
+        # (Phonon-2's `phonon serve`: English only, `language` is ignored,
+        # `prompt` is read as a hotword list — at most 25 words).
+        if self.cfg.stt_spec.startswith("local:"):
+            self.stt = SpeechToText.openai_compatible(
+                String(self.cfg.stt_spec[byte=6:]), String("phonon-2")
+            )
+        elif self.cfg.stt_spec == "groq":
+            self.stt = SpeechToText.groq()
+        else:
+            self.stt = SpeechToText.huggingface()
         if self.cfg.lang != "":
             self.stt.language = self.cfg.lang
         # ⚠ THE VOCABULARY GOES ONLY TO A BACKEND THAT TAKES ONE. HF's Whisper
@@ -335,15 +390,46 @@ struct G1VoiceLoop(Movable):
             String("chat_template_kwargs"),
             String('{"enable_thinking": false}'),
         )
-        self.voice = LocalVoice()
+        # ⚠ THE VOICE FOLLOWS THE REPLY'S LANGUAGE, not the system's — a
+        # French Mac's default voice read the English demo with a French accent
+        self.voice = LocalVoice(
+            self.cfg.tts_voice if (self.cfg.tts_spec == ""
+                                   and self.cfg.tts_voice != "")
+            else os_voice_for(self.cfg.lang)
+        )
+        self.tts = None
+        if self.cfg.tts_spec.startswith("local:"):
+            var kv = self.cfg.tts_voice
+            if kv == "":
+                kv = String("ff_siwis") if self.cfg.lang == "fr" else String("af_heart")
+            self.tts = TextToSpeech.openai_compatible(
+                String(self.cfg.tts_spec[byte=6:]), String("kokoro"), kv^
+            )
+        elif self.cfg.tts_spec != "":
+            raise Error("tts: unknown spec '" + self.cfg.tts_spec
+                        + "' — \"\" (the OS voice) or local:<base_url>")
+        self.tts_busy = False
+        self.tts_text = String("")
+        self.tts_t0 = 0
         # ⚠ `MicCapture.start` IS THE CONSTRUCTOR — it opens the device, so
         # there is no separate `start()` for it and the field cannot be a
         # not-yet-opened capture. A failure here raises out of `__init__`,
         # which is where a missing microphone should stop a program.
         self.mic = MicCapture.start(16000, self.cfg.mic_dev)
-        self.quest = g1_command_questions(
-            bank, True, self.cfg.destinations, self.cfg.dest_descs
-        )
+        self.dest_q = JevQuestions()
+        if self.cfg.request_wording and len(self.cfg.destinations) > 0:
+            # two requests: the destination first, then the commands WITHOUT it
+            self.dest_q = g1_destination_questions(self.cfg.destinations)
+            self.quest = g1_command_questions(
+                bank, True, List[String](), List[String](), self.cfg.chain,
+            )
+        else:
+            self.quest = g1_command_questions(
+                bank, True, self.cfg.destinations, self.cfg.dest_descs,
+                self.cfg.chain,
+            )
+        self.asked = String("")
+        self.dest_ms = 0.0
         self.spec_q = g1_spec_questions(True)
         self.has_pool = self.cfg.pool_path != ""
         # ⚠ A ONE-ROW PLACEHOLDER when there is no pool: `G1Pool` is not
@@ -385,11 +471,18 @@ struct G1VoiceLoop(Movable):
     def __init__(out self, *, deinit move: Self):
         self.mic = move.mic^
         self.voice = move.voice^
+        self.tts = move.tts^
+        self.tts_busy = move.tts_busy
+        self.tts_text = move.tts_text^
+        self.tts_t0 = move.tts_t0
         self.stt = move.stt^
         self.jev = move.jev^
         self.llm = move.llm^
         self.cfg = move.cfg^
         self.quest = move.quest^
+        self.dest_q = move.dest_q^
+        self.asked = move.asked^
+        self.dest_ms = move.dest_ms
         self.spec_q = move.spec_q^
         self.has_pool = move.has_pool
         self.pool = move.pool^
@@ -430,6 +523,7 @@ struct G1VoiceLoop(Movable):
             self.mic.stop()
         except:
             pass
+        self._tts_cancel()
         try:
             self.voice.stop()
         except:
@@ -439,11 +533,70 @@ struct G1VoiceLoop(Movable):
         """Speak, and never raise. ⚠ THE ONLY WAY THE CALLER SHOULD SPEAK.
         The echo gate reads `voice.speaking()`, so a caller that owned its own
         TTS would reopen §12.56's race — two voices and one "done"."""
+        # ⚠ ONE UTTERANCE AT A TIME, as `LocalVoice` says: a new reply cuts
+        # off the one playing AND the one still being synthesised
+        self._tts_cancel()
         try:
-            self.voice.say(text)
+            self.voice.stop()
         except:
             pass
+        var started = False
+        if self.tts:
+            try:
+                self.tts.value().start(text)
+                self.tts_busy = True
+                self.tts_text = text
+                self.tts_t0 = perf_counter_ns()
+                started = True
+            except e:
+                self.note = String("[tts] could not start: ") + String(e)
+        if not started:
+            try:
+                self.voice.say(text)
+            except:
+                pass
         self.mute_until = perf_counter_ns() + _vl_ns(VL_ECHO_TAIL_S)
+
+    def _tts_cancel(mut self):
+        if self.tts_busy:
+            try:
+                self.tts.value().cancel()
+            except:
+                pass
+            self.tts_busy = False
+
+    def _tts_step(mut self):
+        """The synthesis in flight: play its WAV once it is in, or fall back
+        to the OS voice when it fails or misses `tts_dl`. Never raises."""
+        if not self.tts_busy:
+            return
+        var el = Float64(perf_counter_ns() - self.tts_t0) / 1e9
+        var ready = False
+        if el > self.cfg.tts_dl:
+            self._tts_cancel()
+            self.note = String("[tts] GAVE UP after ") + _vl_f2(el) + String(" s — OS voice")
+        else:
+            try:
+                ready = self.tts.value().poll()
+            except:
+                ready = True
+            if not ready:
+                return
+            self.tts_busy = False
+            try:
+                var wav = self.tts.value().result_wav_bytes()
+                var path = (String("/tmp/noeira_tts_") + String(perf_counter_ns())
+                            + String(".wav"))
+                write_file_atomic(path, wav)
+                self.voice.play(path)
+                self.note = String("[tts] ") + String(Int(el * 1000.0)) + String(" ms")
+                return
+            except e:
+                self.note = String("[tts] FAILED: ") + String(e) + String(" — OS voice")
+        try:
+            self.voice.say(self.tts_text)
+        except:
+            pass
 
     def force(mut self):
         """TAB: end the current segment now, or start one. For a room too loud
@@ -511,6 +664,8 @@ struct G1VoiceLoop(Movable):
         """⚠ A GATE THAT RAISES WOULD TAKE THE LOOP DOWN, and the safe default
         is to assume we ARE talking rather than open the microphone onto our
         own voice."""
+        if self.tts_busy:
+            return True
         try:
             return self.voice.speaking()
         except:
@@ -527,6 +682,7 @@ struct G1VoiceLoop(Movable):
         from the robot's own command clock, which this object does not have.
         """
         var ev = G1VoiceEvent.none()
+        self._tts_step()
 
         # ── the microphone, every frame ───────────────────────────────
         # ⚠ READ EVEN WHILE THE ROBOT SPEAKS. The pipe is 64 KiB, about 2 s,
@@ -717,16 +873,40 @@ struct G1VoiceLoop(Movable):
                         self.state = VL_ST_IDLE
                     else:
                         try:
-                            self.jev.start(
-                                g1_command_state(self.heard, ctx), self.quest
-                            )
+                            self.asked = g1_command_state(self.heard, ctx)
+                            self.dest_ms = 0.0
+                            if self._two_requests():
+                                self.jev.start(self.asked, self.dest_q)
+                                self.state = VL_ST_DEST
+                            else:
+                                self.jev.start(self.asked, self.quest)
+                                self.state = VL_ST_JEV
                             self.t_wait = perf_counter_ns()
-                            self.state = VL_ST_JEV
                         except e:
                             self.note = String("[jev] could not start: ") \
                                         + String(e)
                             self.state = VL_ST_IDLE
                         ev.text = self.heard
+
+        # ── deciding: the destination request (`request_wording`) ──────
+        elif self.state == VL_ST_DEST:
+            var el = Float64(perf_counter_ns() - self.t_wait) / 1e9
+            if el > self.cfg.jev_dl:
+                self.note = (String("[jev] GAVE UP after ") + _vl_f2(el)
+                             + String(" s"))
+                try:
+                    self.jev.cancel()
+                except:
+                    pass
+                self.state = VL_ST_IDLE
+            else:
+                var ready = False
+                try:
+                    ready = self.jev.poll()
+                except:
+                    ready = True
+                if ready:
+                    ev = self._destination()
 
         # ── deciding ──────────────────────────────────────────────────
         elif self.state == VL_ST_JEV:
@@ -806,16 +986,56 @@ struct G1VoiceLoop(Movable):
 
         return ev^
 
+    def _two_requests(self) -> Bool:
+        return self.cfg.request_wording and len(self.cfg.destinations) > 0
+
+    def _destination(mut self) -> G1VoiceEvent:
+        """The first request's answer: a goto, or the commands' request."""
+        var ev = G1VoiceEvent.none()
+        self.state = VL_ST_IDLE
+        try:
+            var ans = self.jev.result()
+            var dest = g1_route_destination(ans)
+            if dest != "":
+                ev.kind = VL_WORLD
+                ev.destination = dest
+                ev.text = self.heard
+                self.note = (String("[world] ") + dest + String(" ")
+                             + _vl_f2(ans.probability(String("destination"), dest))
+                             + self._jev_ms(ans.latency_ms))
+                return ev^
+            self.dest_ms = ans.latency_ms
+            # ⚠ THE SAME STATE, not a fresh one: the robot may have moved on
+            # while the first request was answered, and the two answers must
+            # be about the same moment.
+            self.jev.start(self.asked, self.quest)
+            self.t_wait = perf_counter_ns()
+            self.state = VL_ST_JEV
+        except e:
+            self.note = String("[jev] FAILED: ") + String(e)
+        return ev^
+
+    def _jev_ms(self, ms: Float64) -> String:
+        """`  (jev 3412 ms)`, or `  (jev 680 + 2290 ms)` after two requests:
+        the wait a listener sees between the transcript and the robot."""
+        var s = String("  (jev ")
+        if self.dest_ms > 0.0:
+            s += String(Int(self.dest_ms)) + String(" + ")
+        return s + String(Int(ms)) + String(" ms)")
+
     def _decide(mut self, ref ctx: G1Context, ref bank: G1CommandBank) -> G1VoiceEvent:
         """The decision, and the four ways it can go."""
         var ev = G1VoiceEvent.none()
         var got = False
         try:
             var ans = self.jev.result()
+            # with two requests the destination was decided already, and
+            # these answers carry no destination question
+            var two = self._two_requests()
             self.pick = g1_decide(
                 ans, bank, self.cfg.max_none, self.cfg.min_top, 0.5, True,
-                len(self.cfg.destinations) > 0, 0.5, 0.5,
-                self.cfg.refuse_placeless,
+                len(self.cfg.destinations) > 0 and not two, 0.5, 0.5,
+                self.cfg.refuse_placeless, dest_decided=two,
             )
             ev.conf = self.pick.conf
             ev.p_none = self.pick.p_none
@@ -828,19 +1048,22 @@ struct G1VoiceLoop(Movable):
                 ev.kind = VL_WORLD
                 ev.destination = self.pick.destination
                 self.note = (String("[world] ") + self.pick.destination
-                             + String(" ") + _vl_f2(self.pick.dest_conf))
+                             + String(" ") + _vl_f2(self.pick.dest_conf)
+                             + self._jev_ms(ans.latency_ms))
             elif self.pick.name != "":
                 ev.kind = VL_COMMAND
                 ev.name = self.pick.name
                 ev.extent = ans.score(String(G1_Q_EXTENT))
-                var rest = g1_decide_chain(ans, bank)
-                for si in range(len(rest)):
-                    ev.chain.append(rest[si].name)
-                    ev.chain_conf.append(rest[si].conf)
+                if self.cfg.chain:
+                    var rest = g1_decide_chain(ans, bank)
+                    for si in range(len(rest)):
+                        ev.chain.append(rest[si].name)
+                        ev.chain_conf.append(rest[si].conf)
                 self.note = (String("[pick] ") + self.pick.name + String(" ")
                              + _vl_f2(self.pick.conf) + String("  P(none) ")
                              + _vl_f2(self.pick.p_none) + String("  world ")
-                             + _vl_f2(self.pick.needs_world))
+                             + _vl_f2(self.pick.needs_world)
+                             + self._jev_ms(ans.latency_ms))
             elif self.pick.talk:
                 # ⚠ Nothing about the robot's motion changes — it goes on
                 # doing whatever it was doing while it replies.
@@ -851,7 +1074,8 @@ struct G1VoiceLoop(Movable):
                         msgs, self.cfg.chat_sys, List[ToolSpec](), False
                     )
                     self.t_wait = perf_counter_ns()
-                    self.note = String("[talk] ") + _vl_f2(self.pick.conf)
+                    self.note = (String("[talk] ") + _vl_f2(self.pick.conf)
+                                 + self._jev_ms(ans.latency_ms))
                     self.state = VL_ST_CHAT
                     got = True
                 except e:
@@ -873,6 +1097,7 @@ struct G1VoiceLoop(Movable):
                         self.t_wait = perf_counter_ns()
                         self.note = (String("[miss] P(none) ")
                                      + _vl_f2(self.pick.p_none)
+                                     + self._jev_ms(ans.latency_ms)
                                      + String(" — asking for a reward spec"))
                         self.state = VL_ST_SPEC
                         got = True
@@ -890,7 +1115,8 @@ struct G1VoiceLoop(Movable):
                                  + String("  addressed ")
                                  + _vl_f2(self.pick.addressed)
                                  + String("  world ")
-                                 + _vl_f2(self.pick.needs_world))
+                                 + _vl_f2(self.pick.needs_world)
+                                 + self._jev_ms(ans.latency_ms))
         except e:
             self.note = String("[jev] FAILED: ") + String(e)
         # ⚠ ONLY when the decision did not hand off. The talk and spec
@@ -959,6 +1185,9 @@ struct G1VoiceLoop(Movable):
         if self.state == VL_ST_STT:
             return (String("transcribing ") + _vl_f2(el) + String("s / ")
                     + _vl_f2(self.cfg.stt_dl) + String("s"))
+        if self.state == VL_ST_DEST:
+            return (String("deciding: where? ") + _vl_f2(el) + String("s / ")
+                    + _vl_f2(self.cfg.jev_dl) + String("s"))
         if self.state == VL_ST_JEV:
             return (String("deciding ") + _vl_f2(el) + String("s / ")
                     + _vl_f2(self.cfg.jev_dl) + String("s"))

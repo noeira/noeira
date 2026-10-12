@@ -30,6 +30,8 @@
 # AdaJEPA blocks (default "e1 e2 e3"; E1/E2 done 2026-10-04: no success gain,
 # yet the prediction loss drops 27 % on epoch_0 and 71 % under dark). E4
 # probes those two cases: stop-gradient target, 10x LR, λ = 0, the whole model.
+# E5 (BLOCKS=e5, epoch_7 only, ~2.7 h): dynamics shifts — the SO-101's likely
+# sim-to-real gap.
 set -u
 RUN=${RUN:-/workspace/lewm_train}
 FIX=${FIX:-/workspace/fixture}
@@ -99,6 +101,19 @@ e4() {
   ada e4_e0_sg        --dump "$RUN/epoch_0" --stop-grad-target
   ada e4_e0_lr10x     --dump "$RUN/epoch_0" --tta-lr 5e-4
   ada e4_e0_lambda0   --dump "$RUN/epoch_0" --lambda 0
+}
+
+# ── 6. E5: DYNAMICS shifts — the frames stay clean, so the encoder and the
+#       cost landscape are intact and only the transitions are wrong: what a
+#       one-step prediction loss corrects (AdaJEPA's own best case, maze
+#       mass / damping). Calibrated 2026-10-05 (epoch_7 frozen, pairs 3-11,
+#       receding 5): each 3 / 9 vs 9 / 9 clean; friction:0.5 had no effect,
+#       kp:0.1,kv:0.3 0 / 9. ─────────────────────────────────────────────
+e5() {
+  ada e5_slow         --dump "$RUN/epoch_7" --dyn kp:0.25,kv:0.5
+  ada e5_slide        --dump "$RUN/epoch_7" --dyn slide:0.5
+  ada e5_delay        --dump "$RUN/epoch_7" --dyn delay:1
+  ada e5_slow_lr10x   --dump "$RUN/epoch_7" --dyn kp:0.25,kv:0.5 --tta-lr 5e-4
 }
 
 for B in ${BLOCKS:-e1 e2 e3}; do $B; done

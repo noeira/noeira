@@ -36,6 +36,7 @@ from noeira.nn.core.checkpoint import (
     _write_file_bytes, _read_file_bytes, _is_v3_header,
 )
 from noeira.nn.core.param import ParamVisitor, walk_params, ParamVisitorRef
+from noeira.nn.core.hard_copy import hard_copy
 from noeira.nn.primitives.ops.swish_op import SwishOp
 from noeira.nn.optimizer.dreamer_opt import DreamerOpt
 from noeira.nn.optimizer.schedules import LinearWarmupSchedule
@@ -237,7 +238,11 @@ struct DreamerV3Trainer[
         var rew = Self.RewT.make[Self.train_target, INIT = Self.NET_INIT](ctx=ctx)
         var con = Self.ConT.make[Self.train_target, INIT = Self.NET_INIT](ctx=ctx)
         var value = Self.ValT.make[Self.train_target, INIT = Self.NET_INIT](ctx=ctx)
+        # slowvalue starts as a COPY of value (the reference's EMA target): an
+        # independent init made the value loss's slowreg term pull value
+        # toward an unrelated net until the EMA caught up.
         var slowvalue = Self.ValT.make[Self.train_target, INIT = Self.NET_INIT](ctx=ctx)
+        hard_copy[Self.train_target](value, slowvalue, ctx)
         var policy = Self.PolT.make[Self.train_target, INIT = Self.NET_INIT](ctx=ctx)
         var imagine = Self.ImagT.make[Self.train_target, INIT = Self.NET_INIT](ctx=ctx)
 
@@ -246,9 +251,10 @@ struct DreamerV3Trainer[
         # by default; Kaiming restores positive-reward optimism for CartPole),
         # and the policy output with the reference's fixed outscale 0.01
         # (ScaledKaiming[1,100]). No post-hoc name-path scaling — a mismatch
-        # is now a compile error instead of a silent no-op. slowvalue shares
-        # ValT, so it starts neutral too (the value loss regularizes TOWARD
-        # slowvalue with slowreg=1, so a non-neutral slowvalue would pull it).
+        # is now a compile error instead of a silent no-op. slowvalue is a
+        # copy of value, so it starts neutral too (the value loss regularizes
+        # TOWARD slowvalue with slowreg=1, so a non-neutral slowvalue would
+        # pull it).
 
         # Storage DreamerOpt is driven INSIDE the blocks (graph.for_each_param /
         # opt.step[target, M]); the trainer just constructs them with the lr.
@@ -1200,6 +1206,7 @@ struct DreamerV3Trainer[
         self.slowvalue = Self.ValT.make[Self.train_target, INIT = Self.NET_INIT](
             ctx=self.ctx
         )
+        hard_copy[Self.train_target](self.value, self.slowvalue, self.ctx)
         self.policy = Self.PolT.make[Self.train_target, INIT = Self.NET_INIT](
             ctx=self.ctx
         )

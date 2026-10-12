@@ -260,6 +260,7 @@ export default defineConfig({
 								{ label: 'Combinators and models', slug: 'nn/combinators' },
 								{ label: 'Optimizers, losses, init', slug: 'nn/optimizers' },
 								{ label: 'Training', slug: 'nn/training' },
+								{ label: 'Distributed training', slug: 'nn/distributed' },
 							],
 						},
 						{
@@ -288,6 +289,7 @@ export default defineConfig({
 							items: [
 								{ label: 'Logging and metrics', slug: 'tooling/logging' },
 								{ label: 'noeira cloud', slug: 'tooling/monitor' },
+								{ label: 'Model APIs', slug: 'tooling/ai' },
 							],
 						},
 					],

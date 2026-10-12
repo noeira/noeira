@@ -85,3 +85,47 @@ def gather_rows_kernel[
     var d = i % DIM
     var src = Int(indices[Int(offset) + b])
     batch_out[b, d] = full[src, d]
+
+
+@always_inline
+def gather_rows_at_counter_kernel[
+    N_TOTAL: Int,
+    BATCH: Int,
+    DIM: Int,
+    dtype: DType,
+](
+    batch_out: LayoutTensor[dtype, Layout.row_major(BATCH, DIM), MutAnyOrigin],
+    full: LayoutTensor[dtype, Layout.row_major(N_TOTAL, DIM), MutAnyOrigin],
+    indices: LayoutTensor[DType.int32, Layout.row_major(N_TOTAL), MutAnyOrigin],
+    counter: LayoutTensor[DType.int32, Layout.row_major(1), MutAnyOrigin],
+):
+    """`gather_rows_kernel` at offset `counter[0] * BATCH`, read from device
+    memory: the same launch serves every batch of the epoch, so it can be
+    captured once and replayed (`advance_counter_kernel` moves to the next
+    batch)."""
+    var i = Int(block_dim.x * block_idx.x + thread_idx.x)
+    if i >= BATCH * DIM:
+        return
+    var b = i // DIM
+    var d = i % DIM
+    var off = Int(counter.ptr[unsafe_offset=0]) * BATCH
+    var src = Int(indices[off + b])
+    batch_out[b, d] = full[src, d]
+
+
+@always_inline
+def advance_counter_kernel(
+    counter: LayoutTensor[DType.int32, Layout.row_major(1), MutAnyOrigin],
+):
+    """counter += 1 (one thread)."""
+    if Int(thread_idx.x) == 0 and Int(block_idx.x) == 0:
+        counter.ptr[unsafe_offset=0] = counter.ptr[unsafe_offset=0] + 1
+
+
+@always_inline
+def reset_counter_kernel(
+    counter: LayoutTensor[DType.int32, Layout.row_major(1), MutAnyOrigin],
+):
+    """counter = 0 (one thread)."""
+    if Int(thread_idx.x) == 0 and Int(block_idx.x) == 0:
+        counter.ptr[unsafe_offset=0] = 0

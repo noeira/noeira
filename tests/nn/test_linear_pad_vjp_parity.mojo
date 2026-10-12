@@ -10,50 +10,57 @@ and the padded `dW` comes back as `[K_PAD, N_PAD]`, whose ROW STRIDE differs
 from the master grad's `[IN_, OUT_]`. A flat accumulate would fold the padded
 columns into the next row's gradient — a wrong gradient that still trains, just
 worse. That is the specific defect this gate exists to catch, so it compares
-grad_input, grad_w AND grad_bias element by element against the CPU backward.
+grad_input, grad_w AND grad_bias against the CPU backward, in std units of the
+CPU value (that defect is O(1) there).
+
+Band per backend: 1e-4 on Metal (fp32 both sides), 1e-2 on CUDA (TF32 GEMMs;
+a per-element relative band read TF32 rounding of near-zero entries as an
+error). On NVIDIA the backward runs on `cublas_gemm` unpadded (`CUBLAS_BWD`,
+printed); the padded MAX backward runs with `-D NN_GEMM_PATH=max`.
 
     pixi run -e apple mojo run -I . tests/nn/test_linear_pad_vjp_parity.mojo
+    pixi run -e default mojo run -I . -D NN_GEMM_PATH=max tests/nn/test_linear_pad_vjp_parity.mojo
 """
 
-from std.math import abs
+from std.math import abs, sqrt
+from std.sys import has_nvidia_gpu_accelerator
 from max.gpu.host import DeviceContext
 
 from noeira.nn.constants import DT
 from noeira.nn.core.tensor import Tensor
 from noeira.nn.core.tensor_refs import TensorRefs
 from noeira.nn.core.initializer import Kaiming
+from noeira.nn.core.cublas_gemm import CUBLAS_BWD
 from noeira.nn.primitives.linear import Linear
 
 
-def _cmp(
-    name: String, cpu: Tensor, gpu: Tensor, n: Int, tol: Float64,
-    floor_frac: Float64 = 0.0,
-) raises -> Float64:
-    """Per-element relative error; the denominator is floored at 1e-6, or at
-    `floor_frac` x the tensor's largest |element| when that is larger.
+comptime TOL = 1e-2 if has_nvidia_gpu_accelerator() else 1e-4
 
-    grad_bias uses floor_frac 0.1: it is a column SUM over the batch, and the
-    upstream pattern here makes some columns cancel to exactly 0 — the CPU
-    returns -4.5e-8 there and the GPU's chunked reduction (a different order)
-    -1.5e-7, both roundoff of zero, which a 1e-6 floor reads as a 10 % error.
-    A wrong reduction (a lost chunk, a wrong column) is off by O(the value)."""
-    var max_rel = Float64(0)
+
+def _cmp(name: String, cpu: Tensor, gpu: Tensor, n: Int) raises -> Float64:
+    """Max |gpu - cpu| in std units of the CPU tensor. (A per-element
+    relative error read roundoff of entries that cancel to ~0 — grad_bias
+    column sums, TF32 outputs — as a 10 % error; a wrong reduction or stride
+    is off by O(the value).)"""
     var mag = Float64(0)
+    var mean = Float64(0)
+    var max_abs = Float64(0)
     for i in range(n):
         mag = max(mag, abs(Float64(cpu.data[i])))
+        mean += Float64(cpu.data[i])
+        max_abs = max(max_abs, abs(Float64(gpu.data[i]) - Float64(cpu.data[i])))
+    mean /= Float64(n)
+    var var_ = Float64(0)
     for i in range(n):
-        var a = Float64(cpu.data[i])
-        var b = Float64(gpu.data[i])
-        var denom = max(abs(a), max(1e-6, floor_frac * mag))
-        var r = abs(a - b) / denom
-        if r > max_rel:
-            max_rel = r
+        var_ += (Float64(cpu.data[i]) - mean) ** 2
+    var sd = sqrt(var_ / Float64(n))
     # ⚠ NON-VACUITY: an all-zero gradient would compare equal to anything.
     if mag == 0.0:
         raise Error("VACUOUS: " + name + " is identically zero")
-    if max_rel > tol:
-        raise Error(name + " mismatch: max_rel=" + String(max_rel))
-    return max_rel
+    var err = max_abs / (sd if sd > 0.0 else mag)
+    if err > TOL:
+        raise Error(name + " mismatch: " + String(err) + " std units")
+    return err
 
 
 def check[IN: Int, OUT: Int, B: Int](ctx: DeviceContext) raises:
@@ -108,9 +115,9 @@ def check[IN: Int, OUT: Int, B: Int](ctx: DeviceContext) raises:
     lg.bias.grd.download(ctx)
     ctx.synchronize()
 
-    var r_gi = _cmp("grad_input", gic, gig, B * IN, 1e-4)
-    var r_gw = _cmp("grad_w", lc.weight.grd, lg.weight.grd, L.W_SIZE, 1e-4)
-    var r_gb = _cmp("grad_bias", lc.bias.grd, lg.bias.grd, L.B_SIZE, 1e-4, 0.1)
+    var r_gi = _cmp("grad_input", gic, gig, B * IN)
+    var r_gw = _cmp("grad_w", lc.weight.grd, lg.weight.grd, L.W_SIZE)
+    var r_gb = _cmp("grad_bias", lc.bias.grd, lg.bias.grd, L.B_SIZE)
     print(
         "     grad_input ", r_gi, "   grad_w ", r_gw, "   grad_bias ", r_gb,
         sep="",
@@ -119,7 +126,10 @@ def check[IN: Int, OUT: Int, B: Int](ctx: DeviceContext) raises:
 
 def main() raises:
     var ctx = DeviceContext()
-    print("Linear vjp K/N-padding parity —", ctx.name())
+    print(
+        "Linear vjp K/N-padding parity —", ctx.name(), "| cuBLAS backward:",
+        CUBLAS_BWD, "| tol", TOL, "std units",
+    )
     print()
     print("== N padded (the two-hot / policy / termination heads) ==")
     check[512, 101, 256](ctx)     # BINS=101

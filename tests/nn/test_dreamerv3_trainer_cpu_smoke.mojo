@@ -6,13 +6,15 @@ nonzero. Then constructs a DreamerV3Agent and calls select_action once,
 asserting a finite action. Gate for the trainer.mojo / agent.mojo storage port.
 """
 
-from std.math import isfinite
+from std.math import isfinite, abs
 from std.random import random_float64
 from std.memory import alloc
 
 from noeira.nn.constants import DT
 from noeira.deep_agents.dreamerv3.trainer import DreamerV3Trainer
 from noeira.deep_agents.dreamerv3.agent import DreamerV3Agent
+from noeira.nn.core.param import walk_params
+from noeira.nn.core.hard_copy import _CollectVisitor
 
 
 comptime OBS = 3
@@ -120,7 +122,38 @@ def test_agent_select_action() raises:
     print("test_agent_select_action: OK (action finite + in [-1,1])")
 
 
+def _slow_minus_value(mut tr: TrainerT) raises -> Float64:
+    """Max |slowvalue - value| over every param (and the param count must
+    match, so an empty walk cannot pass)."""
+    var a = _CollectVisitor()
+    var b = _CollectVisitor()
+    walk_params["cpu"](tr.value, a, tr.ctx)
+    walk_params["cpu"](tr.slowvalue, b, tr.ctx)
+    if len(a.vals) == 0 or len(a.vals) != len(b.vals):
+        raise Error("value / slowvalue param walks differ in length")
+    var w = 0.0
+    for i in range(len(a.vals)):
+        for j in range(len(a.vals[i])):
+            w = max(w, abs(Float64(a.vals[i][j]) - Float64(b.vals[i][j])))
+    return w
+
+
+def test_slowvalue_starts_as_value_copy() raises:
+    """slowvalue is the value net's EMA target: it must START equal to value
+    (it was an independent random init), at make() and after reset_ac()."""
+    var tr = TrainerT.make(learning_starts=8)
+    var d0 = _slow_minus_value(tr)
+    if d0 != 0.0:
+        raise Error("slowvalue != value after make(): max diff " + String(d0))
+    tr.reset_ac()
+    var d1 = _slow_minus_value(tr)
+    if d1 != 0.0:
+        raise Error("slowvalue != value after reset_ac(): max diff " + String(d1))
+    print("test_slowvalue_starts_as_value_copy: OK (make + reset_ac)")
+
+
 def main() raises:
+    test_slowvalue_starts_as_value_copy()
     test_trainer_train_step()
     test_agent_select_action()
     print("ALL DREAMERV3 STORAGE CPU SMOKE TESTS PASSED")

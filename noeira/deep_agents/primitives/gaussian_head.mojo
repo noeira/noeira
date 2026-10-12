@@ -19,6 +19,7 @@ from max.gpu.host import DeviceContext
 from layout import Layout, LayoutTensor, TileTensor, row_major
 
 from noeira.nn.constants import DT, TPB
+from noeira.nn.core.polyak import polyak_tensor
 from noeira.nn.core.tensor import Tensor
 from noeira.nn.core.tensor_refs import TensorRefs
 from noeira.nn.core.module import Module
@@ -194,6 +195,23 @@ struct GaussianHead[IN: Int, ACT: Int](Module):
             self.log_std.val.upload_resident(ctx.value())
 
     # ----- Forward ---------------------------------------------------------
+
+    def polyak_from[
+        target: StaticString
+    ](
+        mut self,
+        mut src: Self,
+        tau: Scalar[DT],
+        ctx: Optional[DeviceContext],
+    ) raises:
+        """Soft-update toward `src` (target <- online). The `Module`
+        default is a NO-OP, so without this override a target net containing
+        this layer would keep its init values forever while the online copy
+        trains (the `LayerNorm` / `Conv2D` bug class; audit 2026-10-07)."""
+        polyak_tensor[target, Self.W_SIZE](self.weight.val, src.weight.val, tau, ctx)
+        polyak_tensor[target, Self.B_SIZE](self.bias.val, src.bias.val, tau, ctx)
+        polyak_tensor[target, Self.LS_SIZE](self.log_std.val, src.log_std.val, tau, ctx)
+
 
     def forward[
         target: StaticString, B: Int, o: MutOrigin, POLICY: AMPPolicy = NoAMP
