@@ -104,7 +104,7 @@ def main() raises:
         # In place: output aliases input. Bypasses allreduce_sum's contract on
         # purpose — this is the M0 question.
         _fill(pg, sub_in, n)
-        pg._allreduce_comm(sub_in, sub_in, n)
+        pg._allreduce_comm[False](sub_in, sub_in, n)
         pg.synchronize()
         var ok_inplace = _check(pg, sub_in, n)
 
