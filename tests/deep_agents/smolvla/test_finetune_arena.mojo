@@ -10,8 +10,8 @@
 reallocates. Calling it per component therefore leaves only the LAST one in
 the arena **while `adopted` reads True**, so the grouped step updates one
 fifth of the model and every other component silently stops training. That is
-leg [1], and it is a count: the arena's total must equal the sum over all
-five walks.
+leg [1], and it is a count: the arena's total must equal the five walks laid
+end to end, each param starting on a `PARAM_ALIGN` boundary.
 
 `configuration_smolvla.py` sets `optimizer_grad_clip_norm = 10`. Clipping each
 component to 10 INDEPENDENTLY is not clipping their joint norm to 10 — five
@@ -34,6 +34,7 @@ from noeira.nn.core.tensor import Tensor
 from noeira.nn.core.initializer import Deterministic
 from noeira.nn.core.named_params import named_params
 from noeira.nn.optimizer.adam import Adam
+from noeira.nn.optimizer.param_arena import align_param_off
 from noeira.nn.primitives.linear import Linear
 from noeira.deep_agents.smolvla.text import SMOLLM_THETA
 from noeira.deep_agents.smolvla.expert import SmolVLAExpert
@@ -88,23 +89,28 @@ def _count(
     mut e: Expert, mut ai: AIn, mut ti: TIn, mut to: TOut, mut ao: AOut,
     d: DeviceContext,
 ) raises -> Int:
-    """Elements across all five walks — what the arena must equal."""
+    """Elements across all five walks — what the arena must equal.
+
+    ⚠ The arena starts every param on a `PARAM_ALIGN` boundary, so this is one
+    running offset over the five walks in adoption order, each param's start
+    rounded up by `align_param_off` — not the bare sum of the sizes, which
+    the arena exceeds by its padding."""
     var n = 0
     var a = named_params["gpu"](e, Optional(d))
     for i in range(len(a)):
-        n += a[i].size
+        n = align_param_off(n) + a[i].size
     var b = named_params["gpu"](ai, Optional(d))
     for i in range(len(b)):
-        n += b[i].size
+        n = align_param_off(n) + b[i].size
     var c = named_params["gpu"](ti, Optional(d))
     for i in range(len(c)):
-        n += c[i].size
+        n = align_param_off(n) + c[i].size
     var f = named_params["gpu"](to, Optional(d))
     for i in range(len(f)):
-        n += f[i].size
+        n = align_param_off(n) + f[i].size
     var g = named_params["gpu"](ao, Optional(d))
     for i in range(len(g)):
-        n += g[i].size
+        n = align_param_off(n) + g[i].size
     return n
 
 
