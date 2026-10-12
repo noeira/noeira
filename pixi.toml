@@ -185,6 +185,10 @@ transformers = ">=4.50"
 # as-is by `tools/lewm/`) reshapes with einops. Its encoder is HF's ViTModel,
 # which is why `transformers` above serves LeWM too.
 einops = ">=0.7"
+# PEFT, the reference LoRA implementation, for gating noeira/nn/peft (adapter
+# forward/vjp parity, PEFT-format adapter I/O) and for making adapters MAX serve
+# can load. Same argument as transformers above: gate against what everyone uses.
+peft = ">=0.17"
 
 [feature.cpu.dependencies]
 # CPU-only environment for CI and headless test runs: base deps WITHOUT the
