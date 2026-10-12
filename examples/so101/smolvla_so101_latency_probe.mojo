@@ -34,10 +34,25 @@ deciding WHAT to optimise, not for adding up.
 
 ⚠ Needs the published weights (~907 MB, cached) and instantiates every layer:
 402,737,376 params x 4 bytes x 2 (host AND device) = **3.2 GB**. One policy.
+
+## Optional: a fine-tune's weights, and the memory the deploy keeps
+
+    SMOLVLA_CKPT=<run's best.ckpt or a merged LoRA checkpoint> /tmp/svla_probe
+    SMOLVLA_FREEZE=1 /tmp/svla_probe        # freeze_all after load, as the deploy does
+
+`SMOLVLA_CKPT` loads a fine-tune's trainable set over the published weights
+(`load_trainables`, the deploy's `--ckpt`): the latency of a fine-tuned or
+merged-LoRA policy against the base's, on one build. `SMOLVLA_FREEZE=1` frees
+every gradient buffer after load (`SmolVLAPolicy.freeze_all`). Built with
+`-D NN_INFERENCE_ONLY` none is ever allocated. On Linux the probe prints the
+system's MemAvailable at each stage: on the Orin, CPU and GPU share that one
+pool, so a stage's drop is what the policy actually holds.
 """
 
 from std.ffi import OwnedDLHandle, c_int
 from std.math import sqrt
+from std.os import getenv
+from std.os.path import exists
 from std.time import perf_counter_ns
 from std.testing import assert_true
 from max.gpu.host import DeviceContext
@@ -50,6 +65,14 @@ from noeira.deep_agents.smolvla.normalize import SmolVLAStats, normalize_state
 from noeira.deep_agents.smolvla.heads import SMOLVLA_CONNECTOR_IN
 from noeira.deep_agents.smolvla.observation import fill_camera_images
 from noeira.deep_agents.smolvla.tasks import TaskTokens
+from noeira.deep_agents.smolvla.finetune import load_trainables
+from noeira.deep_agents.smolvla.heads import (
+    SMOLVLA_EXPERT_W, SMOLVLA_STATE_DIM, SMOLVLA_ACTION_DIM,
+)
+from noeira.deep_agents.smolvla.text import SMOLLM_DIM, SMOLLM_LAYERS, SMOLLM_KV_W
+from noeira.deep_agents.smolvla.expert import EXPERT_FF
+from noeira.nn.core.initializer import Deterministic
+from noeira.nn.primitives.linear import Linear
 from noeira.vision.resize_pad import SIGLIP_INPUT
 
 comptime TARGET = "gpu"
@@ -105,6 +128,31 @@ def ms(ns: Int) -> Float64:
     return Float64(ns) / 1.0e6
 
 
+def mem_available_mb() -> Int:
+    """MemAvailable from /proc/meminfo in MB, or -1 off Linux. On the Orin
+    the CPU and the GPU allocate from this one pool."""
+    try:
+        if not exists("/proc/meminfo"):
+            return -1
+        var f = open(String("/proc/meminfo"), "r")
+        var text = f.read()
+        f.close()
+        for line in text.splitlines():
+            if line.startswith("MemAvailable:"):
+                var parts = line.split()
+                return Int(String(parts[1])) // 1024
+        return -1
+    except:
+        return -1
+
+
+def mem_line(label: String, start_mb: Int):
+    var now = mem_available_mb()
+    if now >= 0:
+        print("  memory  " + label + ": MemAvailable " + String(now)
+              + " MB  (held since start " + String(start_mb - now) + " MB)")
+
+
 def main() raises:
     print("=" * 70)
     print("SmolVLA query latency —", TARGET, ", batch 1,", N_CAM, "cameras")
@@ -116,10 +164,34 @@ def main() raises:
           Pol.P)
 
     var path = hf_download_file(REPO, String("model.safetensors"), HF_MODEL)
+    var mem0 = mem_available_mb()
+    mem_line(String("start"), mem0)
     var d = DeviceContext()
+    mem_line(String("after the device context"), mem0)
     print("  building every layer (3.2 GB) …")
     var pol = Pol.make[TARGET](Optional(d))
+    mem_line(String("after make (values + gradients)"), mem0)
     pol.load[TARGET](path, Optional(d))
+    var ckpt = getenv("SMOLVLA_CKPT")
+    if ckpt.byte_length() > 0:
+        var sp_unused = Linear[SMOLVLA_STATE_DIM, SMOLLM_DIM].make[
+            TARGET, Deterministic
+        ](Optional(d))
+        _ = load_trainables[
+            TARGET, SMOLLM_LAYERS, SMOLVLA_EXPERT_W, EXPERT_FF, SMOLLM_DIM,
+            SMOLLM_KV_W, SMOLVLA_ACTION_DIM,
+        ](
+            ckpt, pol.expert, pol.action_in, pol.time_mlp_in,
+            pol.time_mlp_out, pol.action_out, sp_unused, Optional(d),
+        )
+        print("  weights: lerobot/smolvla_base + " + ckpt)
+    else:
+        print("  weights: lerobot/smolvla_base")
+    mem_line(String("after load"), mem0)
+    if getenv("SMOLVLA_FREEZE").byte_length() > 0:
+        var n_frozen = pol.freeze_all[TARGET](Optional(d))
+        print("  froze " + String(n_frozen) + " values (freeze_all, as the deploy does)")
+        mem_line(String("after freeze_all"), mem0)
 
     # The recording's own scale. Not the point of this probe, but a policy
     # without stats refuses to run.
@@ -174,6 +246,7 @@ def main() raises:
         )
     comptime if TARGET != "cpu":
         d.synchronize()
+    mem_line(String("after the warm-up queries"), mem0)
 
     # ── the fused vision attention against the two-pass path ─────────────
     # The deploy runs the vision towers' attention FUSED (no softmax cache;
