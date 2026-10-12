@@ -408,12 +408,12 @@ struct SmolVLAPrefill[
         reasonable and is missing most of itself; taking only the cache side
         silently deletes the prefix's internal structure.
 
-        ⚠ **No VLM weight gradient is wanted** — the tower is frozen — but
-        `Linear.vjp` forms one anyway, because it has no flag to skip dW.
-        That is roughly double the backward cost of this pass and it pollutes
-        `.grd` on frozen parameters, which nothing zeroes. Named here rather
-        than discovered later; the fix is a `NO_DW` parameter on `Linear.vjp`
-        and it belongs with the Jetson work.
+        ⚠ **No VLM weight gradient is wanted** — the tower is frozen. Freeze
+        it (`SmolVLAPolicy.freeze_backbone`, or `FreezeParams` over the tower)
+        and `Linear.vjp` / `RMSNorm.vjp` form grad_input only: no dW GEMM, no
+        bias or gamma sums, no gradient buffers. On an unfrozen tower they
+        still form and accumulate every weight gradient, which nothing reads
+        or zeroes (1.30x on a 5090 at one observation, 4.2x on Metal).
         """
         comptime assert Self.RECORD, (
             "SmolVLAPrefill.backward needs RECORD=True — the non-recording"

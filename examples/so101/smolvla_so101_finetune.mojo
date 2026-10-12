@@ -207,6 +207,7 @@ from noeira.io.hf import hf_download_file, HF_MODEL, HF_DATASET
 from noeira.io.hdf5 import H5Dataset
 
 from noeira.deep_agents.smolvla.policy import SmolVLAPolicy
+from noeira.nn.peft.freeze import freeze_params
 from noeira.deep_agents.smolvla.recording import SO101_N_LANG, SO101_TASKS
 from noeira.deep_agents.smolvla.normalize import SmolVLAStats
 from noeira.deep_agents.smolvla.tasks import TaskTokens
@@ -603,7 +604,12 @@ def main() raises:
     var pol = Pol.make["gpu", Deterministic](Optional(ctx))
     pol.load["gpu"](weights, Optional(ctx))
     pol.load_stats(stats_path)
-    print("  policy  loaded")
+    # Everything `train_expert_only` leaves untrained gives its gradient
+    # buffers back; `state_proj` too, which this recipe does not train
+    # (`train_state_proj = False`, see the header). Before any adopt.
+    var n_frozen = pol.freeze_backbone["gpu"](Optional(ctx))
+    n_frozen += freeze_params["gpu"](pol.state_proj, Optional(ctx))
+    print("  policy  loaded, " + String(n_frozen) + " values frozen")
 
     # `SMOLVLA_PROJECT` files the run under a project (`project-promote`
     # promotes into the RUN's project); unset keeps the historical `so101`.

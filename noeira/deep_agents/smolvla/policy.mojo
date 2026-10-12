@@ -53,6 +53,7 @@ from .names import (
 )
 from noeira.io.safetensors import SafeTensors
 from noeira.nn.core.torch_names import LoadTorchNamed
+from noeira.nn.peft.freeze import freeze_params, FreezeParams
 
 
 def _claimed_every_entry(
@@ -959,6 +960,44 @@ struct SmolVLAPolicy[
                      + len(ml.loaded))
             + " tensors loaded (lm_head's 1 skipped by design)"
         )
+
+    def freeze_backbone[
+        target: StaticString
+    ](mut self, ctx: Optional[DeviceContext] = None) raises -> Int:
+        """Freeze the vision tower, the connector, the token embedding and
+        the 16 text layers: what `train_expert_only` never trains, minus
+        `state_proj`, whose regime the caller picks. Returns the number of
+        values frozen.
+
+        Their gradient buffers (two copies each on a GPU: host and device)
+        are released, and the text tower's backward, which `train_state_proj`
+        runs, then forms grad_input only (`Linear`, `RMSNorm`). The vision
+        tower, connector and embedding are upstream of nothing trained, so
+        their backward never runs. Values, names and checkpoint maps are
+        unchanged.
+
+        ⚠ Before the optimizer adopts anything; see `noeira/nn/peft/freeze.mojo`.
+        """
+        var n = freeze_params[target](self.vision, ctx)
+        n += freeze_params[target](self.connector, ctx)
+        n += freeze_params[target](self.embed, ctx)
+        var f = FreezeParams()
+        self.tower.for_each_param[target](f, ctx)
+        return n + f.values
+
+    def freeze_all[
+        target: StaticString
+    ](mut self, ctx: Optional[DeviceContext] = None) raises -> Int:
+        """Freeze every parameter: the deploy, where nothing trains. Returns
+        the number of values frozen."""
+        var n = self.freeze_backbone[target](ctx)
+        n += freeze_params[target](self.expert, ctx)
+        n += freeze_params[target](self.state_proj, ctx)
+        n += freeze_params[target](self.action_in, ctx)
+        n += freeze_params[target](self.time_mlp_in, ctx)
+        n += freeze_params[target](self.time_mlp_out, ctx)
+        n += freeze_params[target](self.action_out, ctx)
+        return n
 
     def build_prefix[
         target: StaticString
