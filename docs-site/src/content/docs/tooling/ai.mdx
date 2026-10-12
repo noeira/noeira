@@ -1,0 +1,106 @@
+---
+title: Model APIs
+description: noeira.ai — chat and vision models, speech-to-text, text-to-speech and Jev decisions over HTTP from Mojo, hosted or on your own machine, with no Python and no SDK.
+---
+
+import Maturity from '~/components/Maturity.astro';
+
+<Maturity level="beta" note="Gated against a mock server with no key and no network. The G1 voice demo is its main user." />
+
+`noeira.ai` calls off-the-shelf models from Mojo: language and vision models,
+speech in and out, and typed decisions. It is for the parts of a robot program
+that plan, label or talk. A network round trip takes 100 ms to several seconds,
+with a long tail, so **never** put one inside the loop that drives joints.
+
+Everything rides on `noeira/io/http.mojo`, a libcurl shim built once, plus the
+JSON, base64, PNG and WAV codecs in `noeira/io/`. There is no Python and no
+vendor SDK, so a demo binary links nothing new.
+
+```bash
+pixi run build-http        # once
+pixi run mojo run -I . examples/ai/chat_ask.mojo anthropic "Name three grasp types."
+```
+
+| Module | What |
+|---|---|
+| `chat` | language and vision models: Claude (Anthropic Messages) and every OpenAI-compatible server — OpenAI, the Hugging Face router, Groq, OpenRouter, and local Ollama / llama.cpp / vLLM. Images, tool calls, streaming, `Conversation` |
+| `speech` | speech-to-text (Whisper via OpenAI, Groq, Hugging Face or a local server) and text-to-speech |
+| `jev` | Jev decisions: typed, calibrated choices over closed option sets |
+| `audio_io` | record from the microphone and play a WAV |
+| `keys` | API keys from the environment, then `.env` |
+| `transport` | the shared POST: retries on 429 / 5xx, the server's error body in the message, timing |
+
+## Choosing a model with one string
+
+`ChatClient.from_spec` takes `provider[:model]`, so a demo can take the model
+as a flag:
+
+```
+anthropic                     anthropic:claude-haiku-4-5
+openai:<model>                hf:Qwen/Qwen3.5-9B
+groq:<model>                  openrouter:<vendor>/<model>
+ollama:qwen2.5vl:7b           http://localhost:8080/v1:<model>
+```
+
+The first colon splits, so an Ollama tag keeps its own colon. A URL spec splits
+at the last colon instead. Local servers speak the OpenAI wire format, so
+moving a demo from a hosted model to one on your machine changes this string
+and nothing else.
+
+## Keys
+
+A client looks for its key in the process environment, then in `./.env`, then
+in `$PIXI_PROJECT_ROOT/.env`. The names are the providers' own:
+`ANTHROPIC_API_KEY`, `OPENAI_API_KEY`, `GROQ_API_KEY`, `HF_TOKEN`. An empty key
+is refused before the request, naming the variables that were tried. A server
+would answer it with a 401 that reads exactly like a wrong key.
+
+## Calls that do not block
+
+Every client has a blocking form (`chat()`, `transcribe()`, `decide()`) and a
+polled one. `start(...)` returns at once, `poll(0)` advances the call without
+waiting, and `result()` collects it. `ChatClient.poll` also returns the text
+that has streamed in since the last poll:
+
+```mojo
+conv.start(llm); jev.start(state, q)
+while running:
+    caption += llm.poll()          # "" when nothing new
+    if jev.poll(): act(jev.result())
+    step_and_draw()
+```
+
+No thread is involved: libcurl's multi interface does the I/O inside `poll`,
+so one loop drives any number of clients, each with one call in flight. A
+poll costs under 0.5 ms on a warm connection. A client's **first** call pays
+its TLS handshake inside one poll (8 to 42 ms), so call `warm_up()` before the
+loop. `examples/ai/background_loop.mojo` is a 60 Hz loop with two calls in
+flight.
+
+## On your own machine
+
+- **Speech-to-text.** `SpeechToText.openai_compatible(url, model)` talks to any
+  local Whisper-style server. Through Phonon-2 (Parakeet-TDT 0.6B, English
+  only) on an M1 Pro, a 1 to 2 s command transcribes in 40 to 50 ms, against
+  about 950 ms for the Hugging Face Whisper endpoint.
+- **Text-to-speech.** `TextToSpeech` speaks OpenAI's `/audio/speech`, which
+  Kokoro-FastAPI and speaches serve locally.
+- **Jev.** `JEV_URL` points every Jev caller at a compatible server on your
+  machine. Its key, if it needs one, is `LAYA_API_KEY`, and the hosted key is
+  never sent there. `JEV_TIMEOUT_MS` raises the 30 s timeout for a slow local
+  model.
+
+The G1 voice loop takes all three: `stt_spec = local:<base_url>`,
+`tts_spec = local:<base_url>`, and the Jev environment variables.
+
+## Gates
+
+`tests/ai/test_ai_clients.mojo` runs every client against
+`tools/ai/mock_ai_server.py`, so it needs no API key and no network. It is in
+the `test-io` manifest beside `tests/ai/test_mic_capture.mojo` and
+`tests/ai/test_local_voice.mojo`.
+
+## Next
+
+- [Robots](/robots/) — where these calls meet hardware
+- [Logging and metrics](/tooling/logging/) — the rest of the tooling

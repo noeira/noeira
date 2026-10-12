@@ -1,0 +1,179 @@
+---
+title: Distributed training
+description: Data-parallel training over N GPUs from one process — DDP and ZeRO-1, -2 and -3 behind one interface, a trainer over it, and a simulator that runs every rank on one device.
+---
+
+import Maturity from '~/components/Maturity.astro';
+import Paper from '~/components/Paper.astro';
+import Papers from '~/components/Papers.astro';
+
+<Maturity level="experimental" note="DDP and ZeRO-1 have run on two H200 NVL GPUs. Overlap, ZeRO-2 and ZeRO-3 are gated on the simulator only." />
+
+`noeira.nn.distributed` trains one model on N GPUs, with each rank's share of
+the batch. One host thread drives every GPU, because that is how MAX's `comm`
+collectives are built: each collective is N per-device calls, all enqueued
+before any of them can finish.
+
+```mojo
+from noeira.nn.distributed.process_group import ProcessGroup
+from noeira.nn.distributed.data_parallel import DataParallel
+from noeira.nn.distributed.zero import Zero1
+from noeira.nn.distributed.zero_sharded import ZeroSharded
+from noeira.nn.distributed.autoregressive_trainer import (
+    DistributedAutoregressiveTrainer,
+)
+```
+
+<Papers label="Reference">
+	<Paper
+		title="ZeRO: Memory Optimizations Toward Training Trillion Parameter Models"
+		authors="Rajbhandari, Rasley, Ruwase, He"
+		year="2019"
+		arxiv="1910.02054"
+	/>
+</Papers>
+
+## Four strategies, one interface
+
+A strategy owns one replica of the model per rank, the optimizer state and the
+collectives that keep the replicas in step. All four implement
+`ShardingStrategy`, so a trainer drives them without naming a stage:
+
+| Strategy | What each rank holds | FSDP's name |
+|---|---|---|
+| `DataParallel[M, N]` | full weights, gradients and Adam state; gradients all-reduced | `NO_SHARD` |
+| `Zero1[M, N]` | full weights and gradients; Adam state sharded | — |
+| `ZeroSharded[M, N, 2]` | full weights; gradients and Adam state sharded | `SHARD_GRAD_OP` |
+| `ZeroSharded[M, N, 3]` | weights sharded too, each block gathered when the forward or backward needs it | `FULL_SHARD` |
+
+The step is the same for every strategy:
+
+```mojo
+dist.set_lr(lr)
+dist.forward_backward(bodies)   # each rank's forward, loss and vjp; on return
+                                # every rank holds its part of the mean gradient
+dist.clip_grads_device(max_norm)
+dist.step()
+```
+
+DDP and ZeRO-1 work over the parameter arena: one flat buffer per replica for
+the weights, one for the gradients. ZeRO-2 and ZeRO-3 shard **unit by unit**,
+where a unit is a block wrapped in `GradReady`. Their collectives sit inside
+the backward, between the ranks' vjps of one block. noeira's backward is one
+composed vjp per replica, so `RankFibers` runs each rank's step on its own OS
+thread. A baton passes between them so only one enqueues at a time, and the
+last rank to reach a unit enqueues that unit's collective for every rank.
+
+State per GPU for the nanoGPT-size char GPT (6 × 384) at N = 8, from the
+allocations themselves (`examples/nn/distributed/zero_memory.mojo`):
+
+| | DDP | ZeRO-2 | ZeRO-3 |
+|---|---|---|---|
+| weights, gradients, optimizer state | 215.4 MB | 72.2 MB | 36.7 MB |
+
+## Training a GPT
+
+`DistributedAutoregressiveTrainer` has `AutoregressiveTrainer`'s surface
+(`fit`, `val_loss`, `generate`) over any strategy. Each rank builds its rows of
+the global batch on its own device and evaluation is split over the ranks.
+Generation runs on rank 0 alone unless the weights are sharded.
+
+```mojo
+var pg = ProcessGroup[N].devices_or_simulator(ctx, MAX_COLLECTIVE)
+var dist = S.make[Normal[0.0, 0.02]](pg^, lr=BASE_LR, beta2=BETA2, wd=WD)
+var tr = DistributedAutoregressiveTrainer[S, VOCAB, SEQ, B_RANK].make_from(
+    dist^, tok^, split^,
+    BASE_LR, WARMUP_ITERS, TOTAL_ITERS, MIN_LR_SCALE, GRAD_CLIP,
+)
+var val = tr.fit(eval_every=250, n_val_windows=256)
+```
+
+`S` is the strategy type; the example picks it with `-D ZERO=0|1|2|3`:
+
+```bash
+# 4 NVIDIA GPUs, ZeRO-3
+pixi run -e nvidia mojo build -I . -D NGPUS=4 -D ZERO=3 \
+    examples/nn/distributed/gpt_tinyshakespeare_distributed.mojo -o /tmp/gpt_dist && /tmp/gpt_dist
+
+# Mac: every rank on one device
+pixi run -e apple mojo build -I . -Xlinker -ld_classic -D ZERO=3 \
+    examples/nn/distributed/gpt_tinyshakespeare_distributed.mojo -o /tmp/gpt_dist && /tmp/gpt_dist
+```
+
+`-Xlinker -ld_classic` is needed on macOS: the nested strategy, trainer and
+model types mangle to a symbol longer than the new linker accepts.
+
+Every replica's dropout runs on its own stream: the trainer sets
+`rng_stream = r` on rank `r`. A dropout's seed is a type parameter, so without
+this every replica drew the same masks on different rows.
+
+## The process group
+
+`ProcessGroup[N]` owns the N `DeviceContext`s, peer access and MAX's signal
+buffers, and exposes allreduce, reduce-scatter and all-gather over flat fp32
+buffers. There are two kinds of group:
+
+- **`devices(max_elems)`** puts rank `r` on GPU `r`. With peer access between
+  every pair of GPUs it uses MAX's P2P collectives. Without it, MAX's
+  host-staged "naive" allreduce.
+- **`shared(ctx)`** is a simulator: every rank on one context, collectives as
+  local kernels. It gives no speedup, but the data flow is the same, so the
+  correctness gates run on a Mac or a single GPU before a multi-GPU box is
+  rented. On two H200 NVL GPUs, devices against simulator differ by exactly
+  0.0 in loss and parameters over 30 full-GPT steps.
+
+`devices_or_simulator` picks the first when N NVIDIA GPUs are visible.
+
+:::caution[MAX's naive collectives do not order streams]
+MAX's naive allreduce copies each peer's input from the local stream, with no
+ordering against the peer's stream. A rank could read a gradient its peer was
+still writing. On two H200 NVL GPUs (PCIe P2P without native atomics, so MAX
+picks naive), the GPT's replicas drifted 2.2e-2 apart in 30 steps.
+`ProcessGroup` makes every stream wait for every other before and after a
+naive collective. MAX's reduce-scatter has no naive path at all, so without
+P2P a ZeRO stage falls back to an allreduce.
+:::
+
+## Overlap and graphs
+
+`DataParallel.enable_overlap` reduces the gradient in buckets on a second
+stream per GPU while the backward is still running, as PyTorch DDP does. A
+`GradReady` wrapper records each block's gradient range and a device event
+after its vjp. `plan_buckets` turns those marks into buckets in backward order,
+merged up to a size target. Before overlap, the 3.8 ms allreduce on two H200
+NVL GPUs was fully exposed: 79 % weak scaling, against PyTorch DDP's 92 %.
+Metal has no stream handle, so there every bucket waits for the whole backward:
+same results, no overlap.
+
+`RankGraphs` captures one CUDA graph per GPU and replays them back to back.
+`examples/nn/distributed/gpt_ddp.mojo` times the variants: `-D GRAPH=1` puts
+the collective inside the graph, and `-D GRAPH=2` captures the compute and
+runs the collective eagerly, which is forced without P2P.
+
+## Gates
+
+```bash
+pixi run -e apple test-nn-distributed     # or -e nvidia
+```
+
+The ten gates in `tests/manifests/nn-distributed.txt` run every rank on one
+device. Each compares a distributed run with plain DDP or with a plain
+training loop:
+
+- At N = 1, DDP is bit-identical to the plain loop, and the trainer to
+  `AutoregressiveTrainer` (weights, learning rate, generated text).
+- At N = 2, the four strategies match each other bit for bit through the
+  trainer.
+- Against DDP without clipping, every ZeRO stage is bit-identical on an MLP
+  at N = 1 to 4. On the GPT, ZeRO-1 matches at N = 2, and ZeRO-2 and ZeRO-3
+  at N = 2 and 3.
+- With clipping, they differ only in the order the global norm is summed.
+
+The multi-GPU form of each test is a build with `-D DDP_DEVICES` on a two-GPU
+box. Without an accelerator every gate prints a skip and passes.
+
+## Next
+
+- [Training](/nn/training/) — the single-GPU trainers these wrap
+- [Combinators and models](/nn/combinators/) — the GPT and `Repeat`
+- [CPU and GPU paths](/concepts/cpu-gpu/) — CUDA-graph capture

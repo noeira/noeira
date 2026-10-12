@@ -17,7 +17,7 @@ and each is checked against MuJoCo stepping that same file.
 |---|---|---|---|---|
 | SO-ARM100 | MuJoCo Menagerie `trs_so_arm100` | 5 + gripper | `SoArm100Reach` | yes |
 | SO-ARM101 | The Robot Studio's `Simulation/SO101` (`new_calib`) | 5 + gripper | `SoArm101Reach`, the SO-101 task families | yes |
-| Unitree G1 | BFM-Zero's sim-to-sim `g1_29dof` | 29 + floating base | `UnitreeG1`, `UnitreeG1Batched` | NVIDIA only |
+| Unitree G1 | BFM-Zero's sim-to-sim `g1_29dof` | 29 + floating base | `UnitreeG1`, `UnitreeG1Batched`; the walkers `UnitreeG1Walk`, `UnitreeG1WalkRP` | NVIDIA only |
 | Franka Panda | robosuite's Panda, gripper and mount, vendored | 7 + gripper | the [LIBERO](/environments/libero/) scenes | yes |
 
 ## SO-ARM100 and SO-ARM101
@@ -115,6 +115,57 @@ pipeline's own dump.
 The G1 gates — the environment against MuJoCo, the motion store against our
 kinematics, the privileged observation against the reference function — run
 with `pixi run test-g1` once those artefacts exist.
+
+### The G1 walker
+
+A second pair of environments puts the same body, under the same torque PD, in
+a **velocity-tracking** task trained with PPO. Commands are a forward speed, a
+lateral speed and a turn rate. They are redrawn during the episode, with a
+share of exact zeros so the policy also learns to stand. Resets are random, and
+the robot gets pushes and observation noise. There are two reward recipes:
+
+| Environments | Recipe | Observation | Reward |
+|---|---|---|---|
+| `UnitreeG1Walk`, `UnitreeG1WalkBatched` | Playground's G1 joystick terms plus RoboParty's standing terms | 70 values | 17 logged terms |
+| `UnitreeG1WalkRP`, `UnitreeG1WalkRPBatched` | RoboParty's interrupt-task recipe (BSD-3), with per-joint kp / kd randomisation | 67 actor + 15 privileged | their 26 terms and weights |
+
+```mojo
+from noeira.envs.robots.unitree_g1_walk import UnitreeG1Walk, UnitreeG1WalkBatched
+from noeira.envs.robots.unitree_g1_walk_rp import UnitreeG1WalkRP, UnitreeG1WalkRPBatched
+```
+
+Both train with [`run_ppo_vec`](/algorithms/ppo/#run_ppo_vec-any-gpu-batched-environment).
+The RoboParty example follows their PPO: 10 stacked frames, a privileged
+critic, adaptive KL, action-rate and smoothness penalties, a mirror-symmetry
+loss at 0.2, and 512-256-128 ELU networks. The G1 mirror maps match the
+model's joint ranges, defaults and gains exactly, and a mirrored state agrees
+with the mirrored physics after a step.
+
+```bash
+pixi run -e nvidia mojo build -I . -D PPO_VEC_ENV_GRAPH -D PPO_VEC_TRAIN_GRAPH \
+    examples/g1/g1_walk_rp_ppo_gpu.mojo -o g1_walk_rp_ppo
+pixi run -e nvidia ./g1_walk_rp_ppo --steps 60000000 --seed 1 --out runs/rp_s1
+```
+
+`examples/g1/g1_walk_eval.mojo` scores a checkpoint on the CPU: falls under
+random commands, tracking error, lag, stopping distance and drift while
+holding. `--recipe switch` runs a walker while the command is non-zero and a
+stander at zero. The walk-to-stand handover is gated on the body being slow
+on both feet, because an immediate handover fell 5 times in 5. With a mix-recipe
+walker and a RoboParty stander: no falls in 20 random-command episodes, 1 fall
+in 8 stops from 1 m/s, and 6 cm of drift while holding.
+
+:::caution[Not a solved walker yet]
+Neither recipe does both jobs alone. The mix recipe walks, but drifts 0.45 to
+0.65 m while holding. The RoboParty runs so far stand within 2 cm but do not
+step. One cause has been removed since: the G1's upper arms hang against its
+torso, and RoboParty's undesired-contact term charged a walking policy more for
+that than tracking paid it. The switch controller above is the working
+combination. The batched walkers are NVIDIA-only, like `UnitreeG1Batched`.
+Their gates are
+`tests/robots/test_unitree_g1_walk.mojo`, `tests/robots/test_unitree_g1_walk_rp.mojo`
+and their `_gpu` twins.
+:::
 
 ## Franka Panda
 

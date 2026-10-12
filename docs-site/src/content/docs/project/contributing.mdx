@@ -124,7 +124,7 @@ If you are looking for something to work on, these are known and documented:
 | Elliptic contacts | Drift vs. MuJoCo; affects Sawyer |
 | CarRacing | Reward shaping unfinished |
 | Env CUDA-graph capture | Blocked by the cooperative blocked-Newton kernel |
-| nn Trainer capture | The dW GEMMs of `Linear`, `Conv2D` and their relatives now run split-K on a workspace they own (`noeira/nn/core/splitk_gemm.mojo`, on sm_80 / sm_89 / sm_120), but the supervised `Trainer`'s `USE_TRAIN_CUDA_GRAPH` still defaults to off |
+| nn Trainer capture | Captured training now runs with shuffle and augmentation and matches the eager run byte for byte, and on NVIDIA most GEMMs run on cuBLAS over a workspace they own. The supervised `Trainer`'s `USE_TRAIN_CUDA_GRAPH` still defaults to off, and stays fp32-only |
 | NHWC conv | End-to-end migration designed but not landed |
 | Documentation | README and package READMEs have drifted from the code |
 

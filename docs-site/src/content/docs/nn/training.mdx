@@ -89,9 +89,16 @@ pixi run -e nvidia mojo run -I . examples/nn/resnet/resnet20_cifar10_bf16_amp_gp
 
 ## CUDA-graph capture
 
-`USE_TRAIN_CUDA_GRAPH=True` captures the per-batch device compute — zero-grad,
-forward, loss accumulate, `vjp`, optimizer step — as a graph and replays it. The
-batch build stays eager, and the captured graph reads fixed buffers.
+`USE_TRAIN_CUDA_GRAPH=True` captures the per-batch device compute — batch
+gather, zero-grad, forward, loss accumulate, `vjp`, optimizer step — as a graph
+and replays it once per batch. The gather reads its offset from a device
+counter, so one capture serves every batch of the epoch. Per-epoch shuffling
+and augmentation run eagerly, in place, before the replays.
+
+An eager run and a captured run of the same seed give equal losses and top-1
+every epoch and byte-identical checkpoints
+(`tests/nn/test_trainer_capture_shuffle_aug.mojo`, with real replays on an RTX
+5090).
 
 :::caution[Off by default, and for a specific reason]
 Stream capture forbids any device allocation inside the captured region, and
@@ -108,8 +115,8 @@ capture can therefore still abort in a shape- and hardware-dependent way.
 Owning the workspace also pays outside capture: on an RTX 5090, ACT's dW
 GEMMs went from 3.05 to 0.35 ms per step once the partition count was tuned.
 
-It is fp32-only and contiguous-sweep only — no shuffle or augmentation under
-capture. On non-NVIDIA targets the flag is a no-op and the run is bit-identical.
+It is fp32-only: under a bf16 `POLICY` the flag is ignored. On non-NVIDIA
+targets it is a no-op and the run is bit-identical.
 
 The RL drivers in `deep_agents/training` are a different code path and *do*
 capture by default; see [CPU and GPU paths](/concepts/cpu-gpu/).
@@ -120,7 +127,34 @@ capture by default; see [CPU and GPU paths](/concepts/cpu-gpu/).
 | Trainer | Purpose |
 |---|---|
 | `AutoregressiveTrainer` | sequence models — GPT on TinyShakespeare |
+| `DistributedAutoregressiveTrainer` | the same over N ranks, DDP or ZeRO-1/2/3 — see [Distributed training](/nn/distributed/) |
 | `Augmenter` | data augmentation for image training |
+
+`AutoregressiveTrainer` builds its batches on the device (`DEVICE_BATCH=True`,
+the default). The corpus is resident as int32. One kernel draws each row's
+window start from a hash of (seed, step, row) and writes the input and target
+one-hots, so under `USE_TRAIN_CUDA_GRAPH` the batch build is inside the graph.
+`DEVICE_BATCH=False` keeps the host path as the baseline.
+
+## Against PyTorch
+
+Each nn example has a PyTorch twin in `tools/nn/torch_nn_reference.py`: same
+recipe, batch size and data files, with the data resident on the GPU as ours
+is. It runs eager, under `torch.compile`, or captured in CUDA graphs
+(reduce-overhead), with TF32 on and fused Adam. Time per training step on one
+RTX 5090:
+
+| Model | noeira (device batch + CUDA graph) | PyTorch 2.12, compiled + CUDA graphs |
+|---|---|---|
+| TinyShakespeare GPT, fp32 | 19.40 ms | 21.35 ms |
+| TinyShakespeare GPT, bf16 AMP | 10.74 ms | 10.81 ms |
+| ResNet-20, CIFAR-10 | 2.84 ms | 2.84 ms |
+| CIFAR CNN | 1.35 ms | 1.33 ms |
+
+The GPT benchmark is `examples/nn/benchmarks/gpt_cuda_graph_benchmark_gpu.mojo`
+(`-D GPT_BENCH_DTYPE=bf16` for the AMP column). Final validation losses over
+three seeds agree within seed noise: fp32 GPT 1.824 / 1.847 / 1.824 with the
+TF32 attention, against 1.836 / 1.837 / 1.828 with the fp32 kernels.
 
 ## Datasets
 

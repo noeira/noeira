@@ -54,6 +54,10 @@ var trainer = Trainer[Net, NC, IN_DIM, BATCH, "gpu"].make[Kaiming](
 		[The supervised Trainer](/nn/training/) — whole-dataset GPU runs, AMP,
 		optional CUDA-graph capture, and the bundled datasets.
 	</Card>
+	<Card title="Distributed training" icon="random">
+		[DDP and ZeRO-1/2/3](/nn/distributed/) behind one interface, over N GPUs
+		from one process — or every rank simulated on one device.
+	</Card>
 </CardGrid>
 
 ## The design in one page
@@ -85,8 +89,10 @@ LinearReLU[D, H]        # one module, one fused kernel
 ```
 
 `MatMul+Bias+Activation` collapses into a single GPU kernel this way
-(`LinearAct` and its aliases). Nothing fuses automatically, and convolutions
-have no fused-activation form.
+(`LinearAct` and its aliases). Nothing fuses automatically across modules, and
+convolutions have no fused-activation form. Inside a module, the NVIDIA path
+folds the bias, and where it measured faster the activation, into the GEMM's
+epilogue; see [where the GEMMs run](/nn/primitives/#where-the-gemms-run-on-nvidia).
 
 ## A complete example
 
@@ -146,13 +152,15 @@ sub-buffer view — no per-batch host-to-device transfer.
 ```
 noeira/nn/
 ├── core/          Module trait, Param, Tensor, initializers, checkpoint, AMP,
-│                  safetensors + PyTorch name maps, split-K GEMM
-├── primitives/    70+ leaf layers
-├── combinators/   Sequential, Residual, Parallel, Repeat, ComputeGraph
+│                  safetensors + PyTorch name maps, split-K GEMM,
+│                  cuBLAS / cuBLASLt / cuDNN bindings
+├── primitives/    70+ leaf layers, fused attention kernels
+├── combinators/   Sequential, Residual, Parallel, Repeat, Checkpointed, ComputeGraph
 ├── models/        ResNet blocks, ResNet-18, GPT, ViT, conv and CIFAR feature nets
 ├── optimizer/     SGD, Adam, AdamW, grad clipping, LR schedules
 ├── loss/          CrossEntropy, MSE, SoftCE, TwoHot, GaussianNLL
 ├── training/      Trainer, autoregressive trainer, augmenter
+├── distributed/   process group, DDP, ZeRO-1/2/3, the distributed trainer
 ├── datasets/      MNIST, CIFAR-10, TinyShakespeare, lewm_pusht
 └── random/        host RNG (box-muller, gaussian)
 ```
@@ -169,3 +177,4 @@ went with it in the storage sunset. Older documentation says otherwise.
 - [Modules and Params](/nn/modules/) — the storage design in detail
 - [Primitives](/nn/primitives/) — the layer catalogue
 - [Training](/nn/training/) — the Trainer, AMP and CUDA graphs
+- [Distributed training](/nn/distributed/) — the same over N GPUs

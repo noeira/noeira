@@ -70,8 +70,7 @@ knowing which paths are load-bearing:
 | `MPPICPU` | TD-MPC2 evaluation, and the LQ property tests |
 | `GenericGPUMCTS`, `GumbelGPUMCTS` | [MuZero](/algorithms/muzero/), [AlphaZero](/algorithms/alphazero/) |
 | `SampledGumbelGPUMCTS` | [EfficientZero V2](/algorithms/efficient-zero-v2/), continuous actions |
-| `ContinuousCEMOptimizer` | LeWM, in `noeira/experimental/` |
-| `CategoricalCEMOptimizer`, `CategoricalRandomShooter` | LeWM evaluation, model-quality diagnostics |
+| `ContinuousCEMOptimizer`, `CategoricalCEMOptimizer`, `CategoricalRandomShooter` | **nothing yet** — tested; the LeWM port that used them was replaced by the reference-exact one, which carries its own CEM step to match stable-worldmodel |
 | `ILQRCPU`, `ILQRGPUBatched` | **nothing yet** — tested, not adopted |
 
 :::note[iLQR is implemented, not integrated]

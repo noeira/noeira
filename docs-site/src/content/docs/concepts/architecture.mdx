@@ -45,7 +45,7 @@ noeira/
 │   ├── demos/      The .demo format, recorders, DAgger handover
 │   ├── training/   CPU/GPU drivers, BatchedEnv wrappers
 │   └── core/ primitives/ loss/ data/ zero/
-├── nn/             Deep-learning framework (Module + Param)
+├── nn/             Deep-learning framework (Module + Param), distributed training
 ├── data/           Trajectory store, replay buffers, LeRobot v3-format datasets
 ├── io/             Native HDF5, Parquet, video, JSON, HTTP, safetensors, serial
 ├── physics3d/      MuJoCo-inspired generalized-coordinates engine
@@ -54,6 +54,7 @@ noeira/
 ├── tasks/          The task layer: families, goals, placement, evaluation
 ├── planners/       Trajectory optimizers (MPPI, CEM, iLQR) + GPU tree search
 ├── robot/          Robot drivers — today the SO-101 over its Feetech servo bus
+├── ai/             Hosted and local models over HTTP: chat, vision, speech, Jev
 ├── vision/         Cameras, calibration, the OpenCV shim
 ├── render/         SDL3 renderers, ImGui viewers, video recording
 ├── math3d/         Vec3, Quat, Mat3, Mat4 (+ GPU variants)
@@ -100,13 +101,14 @@ through **`data`** and **`io`**.
 [`noeira.nn`](/nn/) — networks assembled from small `Module` blocks, each
 `Param` owning its value and gradient tensors.
 
-- **70+ primitives**: Linear, Conv2D, attention (fused, and MAX's flash
-  attention on NVIDIA), RoPE, LSTMCell, NoisyLinear, LayerNorm/RMSNorm
+- **70+ primitives**: Linear, Conv2D, FlashAttention-2 forward and backward
+  (on the tensor cores on NVIDIA), RoPE, LSTMCell, NoisyLinear, LayerNorm/RMSNorm
 - **Combinators**: Sequential, Residual, Parallel, Repeat
 - **Pre-built models**: ResNet, GPT, ViT, LSTM
 - **Optimizers**: SGD, Adam, AdamW, with grouped multi-tensor apply
 - **Fused primitives**: `LinearAct` runs matmul, bias and activation as one GPU kernel — fusion is a module you choose, not a compiler pass
-- **Training**: supervised `Trainer` with AMP and CUDA-graph capture
+- **Training**: supervised `Trainer` with AMP and CUDA-graph capture;
+  [DDP and ZeRO-1/2/3](/nn/distributed/) over N GPUs
 
 **`data`** is the trajectory store (HDF5), the replay buffers the off-policy
 agents sample from, and datasets in the LeRobot v3 format, read and written
@@ -149,7 +151,9 @@ in a matrix:
 | **On-policy** | `run_onpolicy_train` | `run_onpolicy_train_batched` |
 
 each with CPU and GPU variants. `BatchedEnv` wrappers such as
-`Phyics3dBatchedEnv` adapt an environment to the batched interface. The newer
+`Phyics3dBatchedEnv` adapt an environment to the batched interface.
+`run_ppo_vec` is continuous PPO over any GPU-batched environment with the
+whole rollout on the device; see [PPO](/algorithms/ppo/). The newer
 drivers (task families, ACT, Forward-Backward, the G1) record each run as a
 `RunContext`: a directory with its own record, checkpoints and metrics, filed
 under a project and mirrored to [noeira cloud](/tooling/monitor/).

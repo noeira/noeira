@@ -143,6 +143,10 @@ graph, and the shared off-policy driver itself defaults both to `False`. Check
 the facade you use, and set the flags explicitly in a script you care about.
 The flags do nothing on non-NVIDIA targets.
 
+The on-policy drivers take the same two flags and a third, `DEVICE_ROLLOUT`,
+which keeps the rollout itself on the device; all three default to off. See
+[PPO](/algorithms/ppo/#keeping-the-rollout-on-the-device).
+
 :::caution[Environment capture is not always safe]
 `USE_ENV_CUDA_GRAPH` is separate from `USE_TRAIN_CUDA_GRAPH` for a reason. The
 physics3d path solves pyramidal contacts with a one-environment-per-block

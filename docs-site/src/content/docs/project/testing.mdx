@@ -52,7 +52,7 @@ Each header says what the gates need before they can run.
 |---|---|---|
 | `test-smoke` | `smoke.txt` | nothing — the CI tier |
 | `examples-compile` | `examples-compile.txt` | nothing (compile only) |
-| `test-io` | `io.txt` | Parquet, resize and synthetic LeRobot dumps from `tools/io/` and `tools/act/` |
+| `test-io` | `io.txt` | Parquet, resize and synthetic LeRobot dumps from `tools/io/` and `tools/act/`; the `noeira.ai` clients run against a local mock server |
 | `test-act` | `act.txt` | the PyTorch ACT reference dump (`-e act-ref`) and a converted LeRobot store |
 | `test-act-gpu` | `act-gpu.txt` | `-e apple` or `-e nvidia` |
 | `test-interop` | `interop.txt` | `act-ref` dumps — safetensors and torch-name interop |
@@ -63,12 +63,17 @@ Each header says what the gates need before they can run.
 | `test-fb` | `fb.txt` | nothing — Forward-Backward, CPU |
 | `test-fb-gpu` | `fb-gpu.txt` | `-e nvidia` or `-e apple` |
 | `test-g1` | `g1.txt` | the baked Unitree G1 assets and motion file |
+| `test-nn-gpu` | `nn-gpu.txt` | `-e apple` or `-e nvidia` — the trainers the nn examples run through and the kernels they spend their step in |
+| `test-nn-distributed` | `nn-distributed.txt` | `-e apple` or `-e nvidia` — DDP and ZeRO on the one-device simulator |
+| `test-lewm` | `lewm.txt` | nothing — experimental, CPU, toy dims |
+| `test-lewm-gpu` | `lewm-gpu.txt` | `-e apple` or `-e nvidia` |
+| `test-lewm-ref` | `lewm-ref.txt` | `pixi run dump-lewm-ref` first; a GPU environment |
 | `test-bfm-ref` | `bfm-ref.txt` | runs in `-e act-ref` (PyTorch in-process) |
 | `test-physics3d-mujoco` | `physics3d-mujoco.txt` | the pixi MuJoCo 3.12 runtime; about two hours |
 | `test-physics3d-gpu` | `physics3d-gpu.txt` | `-e nvidia` |
 | `test-concurrent` | `concurrent.txt` | nothing — the pthread / ring / atomics backbone |
 | `test-swm` | `swm.txt` | nothing — experimental, CPU |
-| — | `vision.txt` | `pixi run build-opencv`; run with `bash scripts/run_tests.sh tests/manifests/vision.txt` |
+| `test-vision` | `vision.txt` | the OpenCV shim, which the task builds first (`build-opencv`) |
 
 All manifests live in `tests/manifests/`.
 
