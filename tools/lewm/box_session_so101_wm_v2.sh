@@ -29,9 +29,12 @@ cd "$(dirname "$0")/../.."
 REPO=$(pwd)
 mkdir -p "$D" build
 command -v pixi > /dev/null || export PATH=/workspace/.pixi-bin/bin:$HOME/.pixi/bin:$PATH
-# the shell-hook before `set -u`'s reach: it reads NVCC_PREPEND_FLAGS unset
+# the shell-hook before `set -u`'s reach: it reads NVCC_PREPEND_FLAGS unset.
+# PIXI_ENV: `nvidia` where installed, else `default` (= the nvidia feature
+# set; a box that has only it would pay ~11 GB of disk for a second copy)
+PIXI_ENV=${PIXI_ENV:-$([ -d .pixi/envs/nvidia ] && echo nvidia || echo default)}
 set +u
-eval "$(pixi shell-hook -e nvidia)"
+eval "$(pixi shell-hook -e "$PIXI_ENV")"
 set -u
 RUN=runs/2026-10-08_ppo-so101_tower_cube_in_bowl_cc10f7bb
 LAG=(--lag-tau 30,120 --lag-delay 1,3
