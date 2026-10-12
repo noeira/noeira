@@ -491,6 +491,36 @@ struct _DumpWriter(ParamVisitor):
         self.manifest += "ours." + name + "\t" + String(N) + "\n"
 
 
+trait WMWindowLoss:
+    """An eval-mode loss on a batch of windows, shared by the SO-101 world
+    models' offline checks (`lewm_so101_real_check`): (prediction loss,
+    copy-last loss). The copy-last loss scores the context latents
+    themselves as the prediction (frame t's latent for frame t + 1), from
+    the graph's own `ctx_x` and `tgt` nodes — the baseline a predictor must
+    beat to have learnt any dynamics. `pro` is ignored by a model without
+    proprioception."""
+
+    def window_losses(
+        mut self, pix: List[Scalar[DT]], act: List[Scalar[DT]], pro: List[Scalar[DT]]
+    ) raises -> Tuple[Float64, Float64]:
+        ...
+
+
+def copy_last_loss[
+    target: StaticString, B: Int, HD: Int
+](mut ctx_x: Tensor, mut tgt: Tensor, ctx: Optional[DeviceContext]) raises -> Float64:
+    """mean((ctx_x − tgt)²) over (B, H·D): frame t's latent as frame t + 1's."""
+    comptime if target == "gpu":
+        ctx.value().synchronize()
+        ctx_x.download(ctx.value())
+        tgt.download(ctx.value())
+    var s = 0.0
+    for i in range(B * HD):
+        var d = Float64(ctx_x.data[i]) - Float64(tgt.data[i])
+        s += d * d
+    return s / Float64(B * HD)
+
+
 @fieldwise_init
 struct RefStepStats(Copyable, Movable, Writable):
     var loss: Float64
@@ -503,7 +533,7 @@ struct RefStepStats(Copyable, Movable, Writable):
 struct LeWMRefTrainer[
     target: StaticString, B: Int,
     IN_CH: Int = 3, IMG: Int = REF_IMG, ACT_IN: Int = REF_ACT_IN,
-](Movable):
+](Movable, WMWindowLoss):
     """The LeWM training step. The defaults are the published PushT model;
     `IN_CH` / `IMG` / `ACT_IN` re-shape it for another rig (SO-101: the two
     cameras stacked as 6 channels at 112, 30-D action blocks —
@@ -731,6 +761,16 @@ struct LeWMRefTrainer[
         stats.pred_loss /= Float64(Self.B)
         stats.sigreg_loss /= Float64(Self.B)
         return stats^
+
+    def window_losses(
+        mut self, pix: List[Scalar[DT]], act: List[Scalar[DT]], pro: List[Scalar[DT]]
+    ) raises -> Tuple[Float64, Float64]:
+        """`WMWindowLoss`: (pred loss, copy-last loss); `pro` unused."""
+        var st = self.loss_of(pix, act)
+        var c = copy_last_loss[Self.target, Self.B, 3 * 192](
+            self.graph.node_output["ctx_x"](), self.graph.node_output["tgt"](), self.ctx
+        )
+        return (st.pred_loss, c)
 
     def set_eval(mut self):
         """Lightning's `model.eval()`: BatchNorm on its running statistics,

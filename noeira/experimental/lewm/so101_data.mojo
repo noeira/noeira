@@ -36,6 +36,16 @@ from the follower's pose. ⚠ teleop has no target-mode clamp (lead ≤ 0.3 rad
 per joint): its target changes can be larger than any the sim teacher made.
 Normalise real windows with the TRAINING run's statistics
 (`load_action_stats`), never their own.
+
+## Proprioception (v2, `PROP` = 18 words per frame)
+
+Per row: the arm's six joints `q`, their velocities `qd`, and the LEAD of
+the last commanded target over the joints (`tgt[r − 1] − q[r]`, 0 on an
+episode's first row: target mode starts at q) — the pixel student's own
+proprio words, in model radians. Sim: `q` and `qd` from `state`. Teleop: `q`
+from the follower's qpos, `qd` the finite difference at the recording's
+30 fps (no qvel is recorded), the lead from the LEADER's previous position.
+z-scored per word with the training run's `prop_stats.txt`.
 """
 
 from std.math import sqrt
@@ -57,6 +67,9 @@ comptime JOINTS = 6
 comptime ACT_IN = FS * JOINTS
 comptime CAMS = 2
 comptime VAL_EVERY = 10
+comptime PROP = 3 * JOINTS
+"""Proprio words per frame: q, qd, target lead."""
+comptime TELEOP_DT = 1.0 / 30.0
 comptime FAMILY_PATH = "noeira/tasks/families/so101_tower.family"
 
 
@@ -64,6 +77,8 @@ struct So101Rig(Movable):
     """The arm's qpos addresses and actuator ranges, from the family model."""
 
     var qa: List[Int]
+    var da: List[Int]
+    """The arm joints' qvel addresses."""
     var lo: List[Float64]
     var hi: List[Float64]
 
@@ -71,15 +86,21 @@ struct So101Rig(Movable):
         var f = load_family(String(FAMILY_PATH))
         var fmd = parse_model_runtime(scene_path(f))
         var jadr = List[Int]()
+        var jdadr = List[Int]()
         var acc = 0
+        var accv = 0
         for i in range(len(fmd.joints)):
             jadr.append(acc)
+            jdadr.append(accv)
             acc += fmd.joints[i].nq
+            accv += fmd.joints[i].nv
         self.qa = List[Int]()
+        self.da = List[Int]()
         self.lo = List[Float64]()
         self.hi = List[Float64]()
         for i in range(JOINTS):
             self.qa.append(jadr[fmd.actuators[i].joint_id])
+            self.da.append(jdadr[fmd.actuators[i].joint_id])
             self.lo.append(fmd.actuators[i].ctrl_min)
             self.hi.append(fmd.actuators[i].ctrl_max)
 
@@ -94,6 +115,10 @@ struct So101WMData[R: Int](Movable):
     """(rows, 6) per-tick change of the commanded target, radians."""
     var a_mean: List[Float64]
     var a_std: List[Float64]
+    var prop: List[Float32]
+    """(rows, PROP) raw proprio words (see the header)."""
+    var p_mean: List[Float64]
+    var p_std: List[Float64]
     var train_starts: List[Int]
     var val_starts: List[Int]
     var n_rows: Int
@@ -104,6 +129,7 @@ struct So101WMData[R: Int](Movable):
         var units = So101TowerUnits(String(RIG_JOINT_ZERO_FOLLOWER))
         self.images = List[UInt8]()
         self.dtarget = List[Float32]()
+        self.prop = List[Float32]()
         self.train_starts = List[Int]()
         self.val_starts = List[Int]()
         self.n_rows = 0
@@ -116,6 +142,7 @@ struct So101WMData[R: Int](Movable):
             var base = self.n_rows
             var tgt = List[Float64](length=n * JOINTS, fill=0.0)
             var q0 = List[Float64](length=n * JOINTS, fill=0.0)
+            var qd0 = List[Float64](length=n * JOINTS, fill=0.0)
             if teleop:
                 if spec.row_dim() != CAMS * 3 * 240 * 320:
                     raise Error("So101WMData: " + p + " is not a 2 x 3 x 240 x 320 teleop store")
@@ -155,6 +182,7 @@ struct So101WMData[R: Int](Movable):
                         var half = 0.5 * (rig.hi[j] - rig.lo[j])
                         tgt[r * JOINTS + j] = mid + half * Float64(asim[r * JOINTS + j])
                         q0[r * JOINTS + j] = Float64(state[r * nqv + rig.qa[j]])
+                        qd0[r * JOINTS + j] = Float64(state[r * nqv + So101TowerModel.NQ + rig.da[j]])
             for e in range(st.n_episodes()):
                 var off = Int(st.episodes.ep_offset[e])
                 var ln = Int(st.episodes.ep_len[e])
@@ -162,6 +190,16 @@ struct So101WMData[R: Int](Movable):
                     for j in range(JOINTS):
                         var prev = q0[r * JOINTS + j] if r == off else tgt[(r - 1) * JOINTS + j]
                         self.dtarget.append(Float32(tgt[r * JOINTS + j] - prev))
+                    for j in range(JOINTS):
+                        self.prop.append(Float32(q0[r * JOINTS + j]))
+                    for j in range(JOINTS):
+                        var v = qd0[r * JOINTS + j]
+                        if teleop:
+                            v = 0.0 if r == off else (q0[r * JOINTS + j] - q0[(r - 1) * JOINTS + j]) / TELEOP_DT
+                        self.prop.append(Float32(v))
+                    for j in range(JOINTS):
+                        var lead = 0.0 if r == off else tgt[(r - 1) * JOINTS + j] - q0[r * JOINTS + j]
+                        self.prop.append(Float32(lead))
                 # windows: T frames FS apart and their T action blocks
                 var last = off + ln - T * FS
                 var val = (self.n_episodes % VAL_EVERY) == VAL_EVERY - 1
@@ -185,6 +223,18 @@ struct So101WMData[R: Int](Movable):
                 self.a_std[j] += (Float64(self.dtarget[r * JOINTS + j]) - self.a_mean[j]) ** 2
         for j in range(JOINTS):
             self.a_std[j] = max(sqrt(self.a_std[j] / Float64(self.n_rows)), 1e-6)
+        self.p_mean = List[Float64](length=PROP, fill=0.0)
+        self.p_std = List[Float64](length=PROP, fill=0.0)
+        for r in range(self.n_rows):
+            for k in range(PROP):
+                self.p_mean[k] += Float64(self.prop[r * PROP + k])
+        for k in range(PROP):
+            self.p_mean[k] /= Float64(self.n_rows)
+        for r in range(self.n_rows):
+            for k in range(PROP):
+                self.p_std[k] += (Float64(self.prop[r * PROP + k]) - self.p_mean[k]) ** 2
+        for k in range(PROP):
+            self.p_std[k] = max(sqrt(self.p_std[k] / Float64(self.n_rows)), 1e-6)
 
     def load_action_stats(mut self, path: String) raises:
         """Replace the normaliser with a training run's `action_stats.txt`
@@ -201,6 +251,39 @@ struct So101WMData[R: Int](Movable):
                 j += 1
         if j != JOINTS:
             raise Error("load_action_stats: " + path + " has " + String(j) + " joints")
+
+    def load_prop_stats(mut self, path: String) raises:
+        """Replace the proprio normaliser with a training run's
+        `prop_stats.txt` (one `mean std` line per word after the header)."""
+        var k = 0
+        with open(path, "r") as f:
+            for ln in f.read().split("\n"):
+                var s = String(ln.strip())
+                if s.byte_length() == 0 or s.startswith("#"):
+                    continue
+                var w = s.split(" ")
+                self.p_mean[k] = Float64(String(w[0]))
+                self.p_std[k] = Float64(String(w[1]))
+                k += 1
+        if k != PROP:
+            raise Error("load_prop_stats: " + path + " has " + String(k) + " words")
+
+    def prop_stats_text(self) -> String:
+        var s = String("# per-frame proprio word (q x6, qd x6, target lead x6; rad, rad/s): mean std\n")
+        for k in range(PROP):
+            s += String(self.p_mean[k]) + " " + String(self.p_std[k]) + "\n"
+        return s^
+
+    def fill_prop(self, starts: List[Int], mut pro: List[Scalar[DT]]):
+        """The windows' proprio, (B, T, PROP) z-scored."""
+        var b = 0
+        for r0 in starts:
+            for t in range(T):
+                var row = r0 + t * FS
+                for k in range(PROP):
+                    var v = (Float64(self.prop[row * PROP + k]) - self.p_mean[k]) / self.p_std[k]
+                    pro[(b * T + t) * PROP + k] = Scalar[DT](v)
+            b += 1
 
     def fill(
         self, starts: List[Int], mut pix: List[Scalar[DT]], mut act: List[Scalar[DT]]

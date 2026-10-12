@@ -410,3 +410,73 @@ the first H action embeddings; NO stop-gradient on the target — `tgt_sg` is a
 ⚠ `MSEPerSample` is per-sample mean; the trainer's 1/B seed makes the batch
 mean = torch's `.mean()` over (B, H, EMB). `PROJ_H` serves both projectors
 (2048 for the paper)."""
+
+
+comptime LeWMLossGraphProprio[
+    IN_CH: Int,
+    IMG: Int,
+    PATCH: Int,
+    HIDDEN: Int,
+    ENC_HEADS: Int,
+    ENC_LAYERS: Int,
+    EMB: Int,
+    PROJ_H: Int,
+    T: Int,
+    ACT: Int,
+    PROP: Int,
+    H: Int,
+    N_PREDS: Int,
+    PRED_HEADS: Int,
+    PRED_DIM_HEAD: Int,
+    PRED_FF: Int,
+    DEPTH: Int,
+    SIG_PROJ: Int,
+    SIG_KNOTS: Int,
+] = ComputeGraph[
+    InputSlot["pixels", T * IN_CH * IMG * IMG],
+    InputSlot["actions", T * ACT],
+    InputSlot["proprio", T * PROP],
+    Node[
+        "emb",
+        Tokenwise[
+            T,
+            LeWMEncoderRef[
+                IN_CH, IMG, PATCH, HIDDEN, ENC_HEADS, ENC_LAYERS, EMB, PROJ_H
+            ],
+        ],
+        "pixels",
+    ],
+    Node["prop_emb", ActionEmbedderRef[T, PROP, EMB], "proprio"],
+    Node["z", Add[T * EMB], "emb", "prop_emb"],
+    Node["act_emb", ActionEmbedderRef[T, ACT, EMB], "actions"],
+    Node["ctx_x", Slice[T * EMB, 0, H * EMB], "z"],
+    Node["ctx_a", Slice[T * EMB, 0, H * EMB], "act_emb"],
+    Node["tgt", Slice[T * EMB, N_PREDS * EMB, (N_PREDS + H) * EMB], "z"],
+    Node["tgt_sg", GradGate[H * EMB], "tgt"],
+    Node["x_pe", BiasAdd[H * EMB], "ctx_x"],
+    Node[
+        "pred_raw",
+        RepeatConditional[
+            DEPTH,
+            ConditionalTransformerBlockRef[
+                EMB, PRED_HEADS, H, PRED_FF, PRED_DIM_HEAD
+            ],
+        ],
+        "x_pe",
+        "ctx_a",
+    ],
+    Node["pred_ln", Tokenwise[H, LayerNorm[EMB, DT, TORCH_LN_EPS]], "pred_raw"],
+    Node["pred", Tokenwise[H, ProjectorRef[EMB, PROJ_H, EMB]], "pred_ln"],
+    Node["pl", MSEPerSample[H * EMB], "pred", "tgt_sg"],
+    Node["sig", SIGReg[EMB, T, SIG_PROJ, SIG_KNOTS], "z"],
+    Node["sig_s", Scale[1], "sig"],
+    Node["loss", Add[1], "pl", "sig_s"],
+]
+"""`LeWMLossGraphRef` with PROPRIOCEPTION in the latent (DINO-WM's recipe;
+noeira-docs/SO101_LEWM_PLAN.md S1 v2): each frame's `PROP` proprio words go
+through their own embedder (`prop_emb`, the action embedder's shape) and are
+ADDED to the image latent, z = enc(pixels) + prop_emb(proprio). Everything
+downstream — the predictor's context, its targets, SIGReg — reads z, so the
+prediction loss scores the next frame's arm state as well as its picture, and
+a planner's cost sees it. Node names are the reference's (`emb` is still the
+image encoder: `emb.0.*` loads unchanged), plus `prop_emb` and `z`."""

@@ -23,6 +23,11 @@ ticks — one world-model step — the critic
        Σ_h ‖ẑ_{t+h} − z_ref[i* + h]‖², h = 1 .. H;
     5. adds the winner's δ to the student's word on each of the next 5 ticks.
 
+A v2 dump (`-D SO101_WM_PROPRIO=1` training: `prop_emb.*` present) adds
+each latent's proprio — q, qd and the last target's lead, z-scored with
+`--pstats` (default `prop_stats.txt` beside `--stats`) — to the observed,
+reference and rank-test latents alike; a v1 dump runs as before.
+
 `--mode student` runs the student alone (the gate's baseline through this
 code), `critic` picks the argmin, `random` picks a uniformly random candidate
 (the control: does the RANKING help, or the noise?).
@@ -84,11 +89,11 @@ from noeira.tasks.so101_tower_rig import (
 from noeira.tasks.so101_tower_xml import So101TowerModel
 from noeira.tasks.spec import load_family
 from noeira.data.store import TrajectoryStore
-from noeira.experimental.lewm.ref_model import LeWMEncoderRef
+from noeira.experimental.lewm.ref_model import LeWMEncoderRef, ActionEmbedderRef
 from noeira.experimental.lewm.ref_load import load_ref
 from noeira.experimental.lewm.ref_rollout import LeWMRefRollout, REF_CTX
 from noeira.experimental.lewm.so101_frames import AreaResize
-from noeira.experimental.lewm.so101_data import FS, JOINTS, ACT_IN, CAMS
+from noeira.experimental.lewm.so101_data import FS, JOINTS, ACT_IN, CAMS, PROP, So101WMData
 
 comptime E = Phyics3dEnv[So101TowerModel, So101TowerConfig, DT, False]
 comptime NQ = So101TowerModel.NQ
@@ -103,6 +108,7 @@ comptime HMAX = get_defined_int["CRITIC_HMAX", 4]()
 """The most model steps `--h` may ask for (the rollout's buffer)."""
 comptime HOR = REF_CTX - 1 + HMAX
 comptime Roll = LeWMRefRollout["gpu", K, HOR, ACT_IN]
+comptime PropEmb = ActionEmbedderRef[1, PROP, EMB]
 comptime POST_GOAL = 31
 """Ticks run after the brick first reaches the bowl."""
 
@@ -141,6 +147,67 @@ def _encode(
     for d in range(EMB):
         z.append(y.data[d])
     return z^
+
+
+struct _Prop(Movable):
+    """A v2 model's proprio embedder (`prop_emb.*`, `ref_model.
+    LeWMLossGraphProprio`): z = enc(frame) + prop_emb(q, qd, lead z-scored with
+    the run's `prop_stats.txt`). Off for a v1 dump (no `prop_emb` tensors)."""
+
+    var on: Bool
+    var mod: PropEmb
+    var mean: List[Float64]
+    var std: List[Float64]
+
+    def __init__(out self, wm: String, pstats: String, ctx: Optional[DeviceContext]) raises:
+        self.on = exists(wm + "/ours.prop_emb.0.0.weight.bin")
+        self.mod = PropEmb.make["gpu", Kaiming](ctx)
+        self.mean = List[Float64](length=PROP, fill=0.0)
+        self.std = List[Float64](length=PROP, fill=1.0)
+        if not self.on:
+            return
+        _ = load_ref["gpu"](self.mod, wm, String("prop_emb."), ctx)
+        var k = 0
+        with open(pstats, "r") as fh:
+            for ln in fh.read().split("\n"):
+                var s = String(ln.strip())
+                if s.byte_length() == 0 or s.startswith("#"):
+                    continue
+                var w = s.split(" ")
+                self.mean[k] = Float64(String(w[0]))
+                self.std[k] = Float64(String(w[1]))
+                k += 1
+        if k != PROP:
+            raise Error("critic: " + pstats + " has " + String(k) + " proprio words")
+
+    def add(
+        mut self, mut z: List[Scalar[DT]], words: List[Float64], ctx: Optional[DeviceContext]
+    ) raises:
+        """z += prop_emb(words) (raw q, qd, lead); a no-op for a v1 model."""
+        if not self.on:
+            return
+        var x = Tensor.alloc(PROP)
+        for k in range(PROP):
+            x.data[k] = Scalar[DT]((words[k] - self.mean[k]) / self.std[k])
+        x.upload(ctx.value())
+        var y = Tensor.alloc(EMB)
+        self.mod.forward["gpu", 1](TensorRefs[1](x), y, ctx)
+        ctx.value().synchronize()
+        y.download(ctx.value())
+        for d in range(EMB):
+            z[d] += y.data[d]
+
+
+def _words(q: List[Float64], qd: List[Float64], tprev: List[Float64]) -> List[Float64]:
+    """The proprio words of a state: q, qd, and the last target's lead."""
+    var w = List[Float64](capacity=PROP)
+    for j in range(JOINTS):
+        w.append(q[j])
+    for j in range(JOINTS):
+        w.append(qd[j])
+    for j in range(JOINTS):
+        w.append(tprev[j] - q[j])
+    return w^
 
 
 def _d2(a: List[Scalar[DT]], ao: Int, b: List[Scalar[DT]], bo: Int) -> Float64:
@@ -270,6 +337,7 @@ def main() raises:
     var z_ref = List[Scalar[DT]]()
     var n_ref = 0
     var roll = Roll(wm, octx)
+    var prop = _Prop(wm, _arg(args, "--pstats", String(stats[byte = 0 : stats.rfind("/") + 1]) + "prop_stats.txt"), octx)
     if True:
         var n_enc = load_ref["gpu"](enc, wm, String("emb.0."), octx)
         enc.set_attr["training"](Scalar[DT](0.0))
@@ -283,17 +351,25 @@ def main() raises:
                 a_mean[j] = Float64(String(w[0]))
                 a_std[j] = Float64(String(w[1]))
                 j += 1
-        var st = TrajectoryStore(ref_path)
-        var ims = st.load_column[DType.uint8](String("images"), max_bytes=1 << 32)
-        var n0 = Int(st.episodes.ep_len[0])
+        # the reference through the training loader: its frames and its
+        # proprio words exactly as the model was trained on them
+        var rp = List[String]()
+        rp.append(ref_path)
+        var rdat = So101WMData[R](rp)
+        var n0 = Int(TrajectoryStore(ref_path).episodes.ep_len[0])
         var r = 0
         while r < n0:
-            z_ref.extend(_encode(enc, ims, r * FR, octx))
+            var zr = _encode(enc, rdat.images, r * FR, octx)
+            var w = List[Float64](capacity=PROP)
+            for k in range(PROP):
+                w.append(Float64(rdat.prop[r * PROP + k]))
+            prop.add(zr, w, octx)
+            z_ref.extend(zr^)
             n_ref += 1
             r += FS
         print("critic: world model", wm, "(", n_enc, "encoder tensors ) | reference",
               ref_path, "|", n0, "ticks ->", n_ref, "latents | K", K, "| sigma", sigma,
-              "| h", hz, "| window", window)
+              "| h", hz, "| window", window, "| proprio", prop.on)
     print("critic: mode", mode, "| student", ckpt)
 
     var env = E(ctx)
@@ -423,6 +499,7 @@ def main() raises:
                     )
                 var small = resizer.frames(full, CAMS)
                 var z = _encode(enc, small, 0, octx)
+                prop.add(z, _words(q, qd, tprev), octx)
                 if len(z_pred) > 0:
                     err += sqrt(_d2(z, 0, z_pred, 0))
                     copy_err += sqrt(_d2(z, 0, z_hist[len(z_hist) - 1], 0))
@@ -529,6 +606,12 @@ def main() raises:
                                     slot * 3 * RIG_NPIX,
                                 )
                             var zh = _encode(enc, resizer.frames(full, CAMS), 0, octx)
+                            var qn = List[Float64](length=ACT, fill=0.0)
+                            var qdn = List[Float64](length=ACT, fill=0.0)
+                            for j in range(ACT):
+                                qn[j] = Float64(env.d.qpos.data[qa[j]])
+                                qdn[j] = Float64(env.d.qvel.data[da[j]])
+                            prop.add(zh, _words(qn, qdn, tp), octx)
                             for d in range(EMB):
                                 z_act[(c * hz + h) * EMB + d] = zh[d]
                             var gi = min(n_ref - 1, i_star + 1 + h)
