@@ -1,0 +1,10 @@
+# Frozen parameters and, later, LoRA / int4 (noeira/nn/peft, noeira/nn/quant).
+#   pixi run test-peft            (CPU; the *_gpu entries need an accelerator)
+tests/nn/peft/test_linear_freeze.mojo
+tests/nn/peft/test_linear_freeze_gpu.mojo
+tests/nn/peft/test_freeze_params.mojo
+tests/nn/peft/test_freeze_params_gpu.mojo
+tests/nn/peft/test_freeze_optimizers.mojo
+tests/nn/peft/test_freeze_optimizers_gpu.mojo
+tests/nn/peft/test_frozen_checkpoint.mojo
+tests/deep_agents/smolvla/test_train_state_proj_frozen_tower.mojo

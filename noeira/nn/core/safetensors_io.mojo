@@ -169,6 +169,12 @@ def fill_param(
         param.data[i] = Scalar[DT](vals[i])
     if ctx:
         param.upload_resident(ctx.value())
+    # ⚠ A load is a write, so it advances `version`, as the checkpoint readers
+    # do: `Linear` caches derived copies of its weight (`w_pad`, `w_bf`) gated
+    # on it. Without the bump, a forward run before this load keeps serving
+    # the old weight. A trained layer hid that until its first optimizer step;
+    # a frozen layer is never stepped and would serve it forever.
+    param.version += 1
 
 
 def save_safetensors[

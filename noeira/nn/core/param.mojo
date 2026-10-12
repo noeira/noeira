@@ -18,6 +18,7 @@ from max.gpu.host import DeviceContext
 
 from noeira.nn.constants import DT
 from std.memory import UnsafePointer
+from std.sys.defines import is_defined
 from .tensor import Tensor
 from .fill import fill_dev
 
@@ -229,6 +230,17 @@ trait IsParam(Movable & Deinitable):
         ...
 
 
+comptime NN_INFERENCE_ONLY = is_defined["NN_INFERENCE_ONLY"]()
+"""`-D NN_INFERENCE_ONLY`: `Param.make` allocates no gradient, so every
+parameter is frozen from birth (see "Frozen params" below). For a binary that
+never trains, such as a robot deploy: the gradient's host and device copies
+are never allocated, where `freeze` after `make` hands them back (the host
+copy to the OS, the device copy to MAX's pool, for this process to reuse).
+
+⚠ A training binary built with it trains nothing. The optimizers skip frozen
+parameters, and adopting a model whose parameters are all frozen raises."""
+
+
 struct Param[NAME: StaticString, APPLY_DECAY: Bool, SIZE: Int](IsParam):
     var val: Tensor
     var grd: Tensor
@@ -250,11 +262,12 @@ struct Param[NAME: StaticString, APPLY_DECAY: Bool, SIZE: Int](IsParam):
         allocates `val.dev`. On GPU `grd.dev` is allocated + zeroed here."""
         var p = Self()
         p.val = Tensor.alloc(Self.SIZE)
-        p.grd = Tensor.alloc(Self.SIZE)
-        comptime if target == "gpu":
-            var c = ctx.value()
-            p.grd.ensure_gpu(c, Self.SIZE)
-            p.grd.dev.value().enqueue_fill(Scalar[DT](0))
+        comptime if not NN_INFERENCE_ONLY:
+            p.grd = Tensor.alloc(Self.SIZE)
+            comptime if target == "gpu":
+                var c = ctx.value()
+                p.grd.ensure_gpu(c, Self.SIZE)
+                p.grd.dev.value().enqueue_fill(Scalar[DT](0))
         return p^
 
     def param_name(self) -> StaticString:

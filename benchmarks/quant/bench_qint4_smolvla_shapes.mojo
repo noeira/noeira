@@ -1,7 +1,7 @@
 # +--------------------------------------------------------------------------+ #
 # | MAX's int4 GEMM at SmolVLA's shapes: which compile, which are right
 # +--------------------------------------------------------------------------+ #
-"""Q0 task 5 of `noeira-docs/LORA_QUANTIZATION_PLAN.md` (results §Q0.6).
+"""Q0 of the LoRA / int4 prototype: the Q4_0 padding policy for SmolVLA.
 
 `multistage_gemm_q` (MAX's Q4_0 tensor-core GEMM, NVIDIA only) after
 `gpu_qint4_repack_Q4_0`, against a host dequantize-and-multiply of the same

@@ -323,6 +323,9 @@ struct RMSNorm[DIM_: Int, EPS: Scalar[DT] = RMS_EPS](Module):
         ctx: Optional[DeviceContext] = None,
     ) raises:
         ref gin = grad_inputs[0]
+        # A frozen gamma (empty gradient, `Param.freeze`) gets no dγ; the
+        # input gradient does not read it and is unchanged.
+        var want_dg = self.gamma.grd.n > 0
         comptime if target == "cpu":
             gin.ensure(B * Self.DIM_)
             var inv_v = TileTensor(self.cache_inv_rms.data, row_major[B]())
@@ -366,18 +369,19 @@ struct RMSNorm[DIM_: Int, EPS: Scalar[DT] = RMS_EPS](Module):
                     )
                     d += 1
                 # dγ += go·n  (accumulated across the batch)
-                d = 0
-                while d + W <= Self.DIM_:
-                    gg_p.unsafe_store(
-                        d,
-                        gg_p.unsafe_load[width=W](d)
-                        + go_p.unsafe_load[width=W](row + d)
-                        * nm_p.unsafe_load[width=W](row + d),
-                    )
-                    d += W
-                while d < Self.DIM_:
-                    gg_p[unsafe_offset=d] = gg_p[unsafe_offset=d] + go_p[unsafe_offset=row + d] * nm_p[unsafe_offset=row + d]
-                    d += 1
+                if want_dg:
+                    d = 0
+                    while d + W <= Self.DIM_:
+                        gg_p.unsafe_store(
+                            d,
+                            gg_p.unsafe_load[width=W](d)
+                            + go_p.unsafe_load[width=W](row + d)
+                            * nm_p.unsafe_load[width=W](row + d),
+                        )
+                        d += W
+                    while d < Self.DIM_:
+                        gg_p[unsafe_offset=d] = gg_p[unsafe_offset=d] + go_p[unsafe_offset=row + d] * nm_p[unsafe_offset=row + d]
+                        d += 1
         else:
             var c = ctx.value()
             gin.ensure_gpu(c, B * Self.DIM_)
@@ -393,13 +397,14 @@ struct RMSNorm[DIM_: Int, EPS: Scalar[DT] = RMS_EPS](Module):
                 grid_dim=B,
                 block_dim=RMS_TPB,
             )
-            c.enqueue_function[_rms_norm_backward_dgamma_kernel[B, Self.DIM_]](
-                grad_output.lt["gpu", l2d](),
-                self.cache_norm.lt["gpu", l2d](),
-                self.gamma.grd.lt["gpu", ld](),
-                grid_dim=Self.DIM_,
-                block_dim=RMS_TPB,
-            )
+            if want_dg:
+                c.enqueue_function[_rms_norm_backward_dgamma_kernel[B, Self.DIM_]](
+                    grad_output.lt["gpu", l2d](),
+                    self.cache_norm.lt["gpu", l2d](),
+                    self.gamma.grd.lt["gpu", ld](),
+                    grid_dim=Self.DIM_,
+                    block_dim=RMS_TPB,
+                )
 
     # for_each_param / zero_grad inherit the Module reflection defaults
     # (core/walkers.mojo auto-discovers the Param fields).
