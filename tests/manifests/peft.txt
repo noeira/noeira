@@ -10,3 +10,4 @@ tests/nn/peft/test_frozen_checkpoint.mojo
 tests/deep_agents/smolvla/test_train_state_proj_frozen_tower.mojo
 tests/nn/peft/test_lora.mojo
 tests/nn/peft/test_lora_gpu.mojo
+tests/nn/peft/test_peft_io.mojo
