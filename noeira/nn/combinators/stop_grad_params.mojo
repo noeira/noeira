@@ -56,6 +56,8 @@ struct _GradStash(ParamVisitor, ParamVisitorRT):
         mut m: Tensor, mut v: Tensor, n: Int, apply_decay: Bool,
         ctx: Optional[DeviceContext],
     ) raises:
+        if grad.n == 0:  # frozen param: no gradient, nothing to do
+            return
         if not self.restoring:
             # Grow ONLY on the first backward; `ensure`/`ensure_gpu` are
             # monotone, so every later call finds the buffer already big

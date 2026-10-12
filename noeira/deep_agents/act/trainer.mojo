@@ -175,6 +175,8 @@ struct _SumSq(ParamVisitor, ParamVisitorRT):
         apply_decay: Bool,
         ctx: Optional[DeviceContext],
     ) raises:
+        if grad.n == 0:  # frozen param: no gradient, nothing to do
+            return
         comptime if target != "cpu":
             grad.download(ctx.value())
         for i in range(n):
@@ -215,6 +217,8 @@ struct _ScaleGrads(ParamVisitor, ParamVisitorRT):
         apply_decay: Bool,
         ctx: Optional[DeviceContext],
     ) raises:
+        if grad.n == 0:  # frozen param: no gradient, nothing to do
+            return
         comptime if target != "cpu":
             # ⚠ Unreachable: the GPU clip is the optimizer's arena path. Kept
             # only so the visitor stays target-generic — and `upload` here

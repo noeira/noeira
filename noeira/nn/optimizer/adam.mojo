@@ -233,6 +233,9 @@ struct _MomentPlacer(ParamVisitor, ParamVisitorRT):
         apply_decay: Bool,
         ctx: Optional[DeviceContext],
     ) raises:
+        # Frozen: no slot, the same test `ParamArena` places by.
+        if grad.n == 0:
+            return
         comptime if target == "gpu":
             # Same rounding as `ParamArena` — the moments alias val/grd BY
             # OFFSET, so the two walks must land on identical boundaries.
@@ -746,6 +749,10 @@ struct Adam(Movable, ParamVisitor, ParamVisitorRT, Optimizer):
         ctx: Optional[DeviceContext],
     ) raises:
         """`visit` with the size at runtime (see `ParamVisitorRef`)."""
+        # Frozen: no update, no moments allocated, no version bump (nothing
+        # was written). First, before `m.ensure` / `ensure_gpu` below.
+        if grad.n == 0:
+            return
         comptime if target == "cpu":
             m.ensure(n)
             v.ensure(n)

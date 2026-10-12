@@ -19,9 +19,9 @@ moments (as after an Adam step), then:
   [3] load into a model with the SAME layers frozen: values bit-identical,
       the frozen params still frozen, no moments allocated for them
   [4] an OLD checkpoint (everything trainable, moments everywhere) into the
-      frozen model: it loads, values bit-identical. Reports whether the
-      reader allocated moments for the frozen params: it does today, which
-      is a Q1 item (R2), not a correctness defect
+      frozen model: it loads, values bit-identical, and the reader reads past
+      the frozen params' moments instead of allocating them again
+  [5] the same with a v2 (text) checkpoint: the other reader
 """
 
 from std.testing import assert_true
@@ -32,7 +32,10 @@ from noeira.nn.constants import DT
 from noeira.nn.core.tensor import Tensor
 from noeira.nn.core.param import ParamVisitor, ParamVisitorRT
 from noeira.nn.core.initializer import Deterministic
-from noeira.nn.core.checkpoint import save_params, load_params
+from noeira.nn.core.checkpoint import (
+    save_params, load_params, LegacyV2CheckpointWriter,
+)
+from noeira.nn.core.param import walk_params
 from noeira.io.fileio import read_file_bytes
 from noeira.deep_agents.smolvla.expert import SmolVLAExpert
 
@@ -218,8 +221,40 @@ def main() raises:
         if ref_.frozen[j] and goto.m_sizes[j] > 0:
             alloc_m += 1
     print("  [4] old checkpoint into the frozen model: value mismatches",
-          bad_vo, " frozen params given moments by the reader", alloc_m,
-          "(Q1: skip them, R2)")
+          bad_vo, " frozen params given moments by the reader", alloc_m)
     assert_true(bad_vo == 0, "an old checkpoint loads different values")
+    assert_true(alloc_m == 0, "the v3 reader gave a frozen param moments")
+
+    # [5] the v2 text reader, same old-checkpoint case
+    var path_v2 = String("/tmp/noeira_test_frozen_ckpt_v2.txt")
+    var old = Expert.make["cpu", Deterministic]()
+    var seed2 = Probe(0)
+    old.for_each_param["cpu"](seed2, None)
+    var w2 = LegacyV2CheckpointWriter(True)
+    walk_params["cpu"](old, w2, None)
+    with open(path_v2, "w") as fh:
+        fh.write(w2.content)
+    var dst2 = Expert.make["cpu", Deterministic]()
+    _freeze_two(dst2)
+    _ = load_params["cpu"](dst2, path_v2)
+    var got2 = _record(dst2)
+    var bad_v2 = 0
+    for i in range(len(ref_.vals)):
+        if got2.vals[i] != ref_.vals[i]:
+            bad_v2 += 1
+    var alloc_v2 = 0
+    var trained_m = 0
+    for j in range(len(ref_.names)):
+        if ref_.frozen[j] and got2.m_sizes[j] > 0:
+            alloc_v2 += 1
+        if not ref_.frozen[j] and got2.m_sizes[j] > 0:
+            trained_m += 1
+    print("  [5] v2 checkpoint into the frozen model: value mismatches", bad_v2,
+          " frozen params given moments", alloc_v2, " trainable ones with moments",
+          trained_m, "of", len(ref_.names) - n_frozen)
+    assert_true(bad_v2 == 0, "a v2 checkpoint loads different values")
+    assert_true(alloc_v2 == 0, "the v2 reader gave a frozen param moments")
+    assert_true(trained_m == len(ref_.names) - n_frozen,
+                "the v2 reader lost a trainable param's moments")
 
     print("PASSED")

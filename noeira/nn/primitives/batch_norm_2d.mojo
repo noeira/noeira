@@ -1400,6 +1400,10 @@ struct BatchNorm2D[
         )
         if not self.frozen:
             return
+        # A released gradient (`Param.freeze`) has nothing to zero, and
+        # `ensure_gpu` below would allocate it again.
+        if self.gamma.grd.n == 0 or self.beta.grd.n == 0:
+            return
         # gamma/beta are `register_buffer` in the reference — constants.
         comptime if target == "cpu":
             for k in range(Self.C_):

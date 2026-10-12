@@ -138,6 +138,8 @@ struct _Collect(ParamVisitor):
         apply_decay: Bool,
         ctx: Optional[DeviceContext],
     ) raises:
+        if grad.n == 0:  # frozen param: no gradient, nothing to do
+            return
         self.unit.append(unit_hooks()[].cur_unit)
         self.n.append(N)
         self.decay.append(apply_decay)
@@ -170,6 +172,8 @@ struct _Bind(ParamVisitor):
         apply_decay: Bool,
         ctx: Optional[DeviceContext],
     ) raises:
+        if grad.n == 0:  # frozen param: no gradient, nothing to do
+            return
         if not param.dev:
             raise Error("ZeroSharded: parameter " + name + " has no device buffer")
         self.c.enqueue_copy(self.stage[self.i], param.dev.value())

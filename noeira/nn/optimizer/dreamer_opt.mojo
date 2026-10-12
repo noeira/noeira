@@ -282,6 +282,8 @@ struct DreamerOpt(Movable, ParamVisitor, ParamVisitorRT, Optimizer):
         apply_decay: Bool,  # DreamerV3 config wd=0 → ignored (no decay term)
         ctx: Optional[DeviceContext],
     ) raises:
+        if grad.n == 0:  # frozen param: no gradient, nothing to do
+            return
         comptime if target == "cpu":
             m.ensure(n)  # mu (momentum) — lazy zero-alloc on first step
             v.ensure(n)  # nu (rms)

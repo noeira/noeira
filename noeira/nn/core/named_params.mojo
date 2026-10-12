@@ -24,11 +24,18 @@ struct NamedParam(Copyable):
     var name: String
     var size: Int
     var decay: Bool
+    var trainable: Bool
+    """False for a frozen param (empty gradient, `Param.freeze`) and for every
+    State. ⚠ The optimizer arena sizes itself from this flag and places by the
+    same test (`grad.n > 0`), so the two must stay one rule."""
 
-    def __init__(out self, name: String, size: Int, decay: Bool):
+    def __init__(
+        out self, name: String, size: Int, decay: Bool, trainable: Bool = True
+    ):
         self.name = name
         self.size = size
         self.decay = decay
+        self.trainable = trainable
 
 
 struct _NamedCollector(ParamVisitor, ParamVisitorRT):
@@ -52,7 +59,7 @@ struct _NamedCollector(ParamVisitor, ParamVisitorRT):
         apply_decay: Bool,
         ctx: Optional[DeviceContext],
     ) raises:
-        self.items.append(NamedParam(name, n, apply_decay))
+        self.items.append(NamedParam(name, n, apply_decay, grad.n > 0))
 
     def visit[target: StaticString, N: Int](
         mut self,
@@ -68,8 +75,9 @@ struct _NamedCollector(ParamVisitor, ParamVisitorRT):
 def named_params[
     target: StaticString, M: ParamWalkable
 ](mut model: M, ctx: Optional[DeviceContext] = None) raises -> List[NamedParam]:
-    """Flat (name, size, decay) list of every trainable Param, in
-    `for_each_param` walk order with dotted names."""
+    """Flat (name, size, decay, trainable) list of every Param, frozen ones
+    included (`trainable = False`), in `for_each_param` walk order with dotted
+    names."""
     var c = _NamedCollector()
     walk_params[target](model, c, ctx)
     return c.items.copy()

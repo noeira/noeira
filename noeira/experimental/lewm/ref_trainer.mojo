@@ -189,6 +189,8 @@ struct _MaskKeep(ParamVisitor):
         mut m: Tensor, mut v: Tensor, apply_decay: Bool,
         ctx: Optional[DeviceContext],
     ) raises:
+        if grad.n == 0:  # frozen param: no gradient, nothing to do
+            return
         if _kept(name, self.keep):
             return
         comptime if target == "cpu":
@@ -300,6 +302,8 @@ struct _MaskPredQKVBias(ParamVisitor):
         mut m: Tensor, mut v: Tensor, apply_decay: Bool,
         ctx: Optional[DeviceContext],
     ) raises:
+        if grad.n == 0:  # frozen param: no gradient, nothing to do
+            return
         if not _is_pred_qkv_bias(name):
             return
         self.n_masked += 1
@@ -330,6 +334,8 @@ struct _GradSumSq(ParamVisitor):
         mut m: Tensor, mut v: Tensor, apply_decay: Bool,
         ctx: Optional[DeviceContext],
     ) raises:
+        if grad.n == 0:  # frozen param: no gradient, nothing to do
+            return
         comptime if target == "gpu":
             ctx.value().enqueue_function[_sum_sq_kernel_rt](
                 grad.dev.value(),
@@ -358,6 +364,8 @@ struct _GradScale(ParamVisitor):
         mut m: Tensor, mut v: Tensor, apply_decay: Bool,
         ctx: Optional[DeviceContext],
     ) raises:
+        if grad.n == 0:  # frozen param: no gradient, nothing to do
+            return
         comptime if target == "cpu":
             for i in range(N):
                 grad.data[i] = grad.data[i] * self.scale
@@ -381,6 +389,8 @@ struct _GradScaleDev(ParamVisitor):
         mut m: Tensor, mut v: Tensor, apply_decay: Bool,
         ctx: Optional[DeviceContext],
     ) raises:
+        if grad.n == 0:  # frozen param: no gradient, nothing to do
+            return
         ctx.value().enqueue_function[_scale_by_dev_kernel](
             grad.dev.value(), Int64(N), self.coef,
             grid_dim=(N + TPB - 1) // TPB, block_dim=TPB,
