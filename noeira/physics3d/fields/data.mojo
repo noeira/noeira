@@ -438,8 +438,12 @@ struct Data[
         self.ccd_ws.upload(ctx)
         self.coll_stage.upload(ctx)
         self.coll_flat.upload(ctx)
-        if Self.NSITE > 0:
-            self.site_xpos.upload(ctx)
+        # ⚠ UNCONDITIONAL, like `site_xpos_acc`: the GPU sensor stage binds
+        # `site_xpos` for every model with a sensor, sites or not (walker:
+        # one subtreelinvel sensor, no site) — a guard on NSITE left it with
+        # no device buffer and aborted every batched walker step on
+        # `Optional.value()` (tests/dm_control/test_walker_batched_truncation_gpu).
+        self.site_xpos.upload(ctx)
         self.cfrc_ext.upload(ctx)
         self.cvel.upload(ctx)
         self.cinert.upload(ctx)
