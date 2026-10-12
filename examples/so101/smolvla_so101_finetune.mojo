@@ -80,6 +80,7 @@ is read from `tools/vla/`.
 | `SMOLVLA_LR` | the PEAK learning rate, default 1e-4 (the decay floor stays the reference's 2.5e-6) |
 | `SMOLVLA_SEED` | seeds the training rows, noise and timesteps, and any LoRA adapter's initialisation; the held-out groups do NOT move with it (see `VAL_NOISE_SEED`). Unset keeps the historical streams |
 | `SMOLVLA_LORA_ALPHA` | PEFT's `lora_alpha` for a `-D SMOLVLA_EXPERT_R` / `-D SMOLVLA_TOWER_R` build, default 32 |
+| `SMOLVLA_MERGE_OUT` | expert-LoRA builds only: after training, merge the BEST checkpoint's adapters into the expert's weights, check the merged model's held-out loss against the adapted one's, and write a PLAIN checkpoint there (no adapters, no moments) that the deploy loads as any fine-tune's `--ckpt` |
 | `SMOLVLA_CKPT` | checkpoint path prefix (`<prefix>_best.ckpt` / `_last.ckpt`); default the run's own `runs/<id>/checkpoints/best.ckpt` / `last.ckpt` |
 | `SMOLVLA_INIT` | a `*_best.ckpt` to start from, applied ON TOP of the base checkpoint |
 | `SMOLVLA_VAL_EPISODES` | episodes held out at the END of the recording; default one fifth. **`0` trains on every episode** — see below |
@@ -187,7 +188,7 @@ the sixteen VLM layers over 140 tokens, which the profile line now shows on
 its own.
 """
 
-from std.math import cos, pi
+from std.math import abs, cos, pi
 from std.os import getenv
 from std.random import seed
 from std.sys.defines import get_defined_int
@@ -201,7 +202,7 @@ from noeira.nn.core.tensor import Tensor
 from noeira.nn.core.checkpoint import CheckpointScalars
 from noeira.nn.core.initializer import Deterministic
 from noeira.nn.core.named_params import named_params
-from noeira.nn.core.param import ParamWalkable
+from noeira.nn.core.param import ParamWalkable, ParamVisitor, ParamVisitorRT
 from noeira.nn.optimizer.adam import Adam
 from noeira.nn.primitives.linear import Linear
 from noeira.core.run import RunContext, register_run
@@ -235,7 +236,7 @@ from noeira.deep_agents.smolvla.heads import (
 from noeira.deep_agents.smolvla.text import (
     SMOLLM_DIM, SMOLLM_LAYERS, SMOLLM_KV_W,
 )
-from noeira.deep_agents.smolvla.expert import EXPERT_FF
+from noeira.deep_agents.smolvla.expert import EXPERT_FF, SmolVLAExpert
 from noeira.deep_agents.smolvla.vision import SIGLIP_LAYERS
 
 # ── the recording ────────────────────────────────────────────────────────
@@ -341,6 +342,10 @@ comptime Step = SmolVLATrainStep[
     SMOLLM_DIM, E_R=EXPERT_R,
 ]
 comptime Sampler = SmolVLABatchSampler[SDIM, ADIM_REAL, PAD, CHUNK, B]
+comptime PlainExpert = SmolVLAExpert[
+    SMOLLM_LAYERS, SMOLVLA_EXPERT_W, EXPERT_FF, SMOLLM_DIM, SMOLLM_KV_W, 2
+]
+"""The deploy's expert type: what a merged LoRA expert is copied into."""
 comptime IMG_ELEMS = N_CAM * 3 * SRC_H * SRC_W
 comptime AN = B * CHUNK * PAD
 comptime VSEG = Pol.Prefix.IMG_SEG
@@ -546,6 +551,71 @@ def draw_group(
             + " is outside (0, " + String(micro * B * CHUNK) + "]"
         )
     return gr^
+
+
+struct _Collect(Movable, ParamVisitor, ParamVisitorRT):
+    """Every visited value, downloaded, and each param's size."""
+
+    var vals: List[Scalar[DT]]
+    var sizes: List[Int]
+
+    def __init__(out self):
+        self.vals = List[Scalar[DT]]()
+        self.sizes = List[Int]()
+
+    def visit_rt[target: StaticString](
+        mut self, name: String, mut param: Tensor, mut grad: Tensor,
+        mut m: Tensor, mut v: Tensor, n: Int, apply_decay: Bool,
+        ctx: Optional[DeviceContext],
+    ) raises:
+        comptime if target == "gpu":
+            param.download(ctx.value())
+        for i in range(n):
+            self.vals.append(param.data[i])
+        self.sizes.append(n)
+
+    def visit[target: StaticString, N: Int](
+        mut self, name: String, mut param: Tensor, mut grad: Tensor,
+        mut m: Tensor, mut v: Tensor, apply_decay: Bool,
+        ctx: Optional[DeviceContext],
+    ) raises:
+        self.visit_rt[target](name, param, grad, m, v, N, apply_decay, ctx)
+
+
+struct _Fill(Movable, ParamVisitor, ParamVisitorRT):
+    """Writes `_Collect`'s values back, param by param, refusing a size
+    that differs: the two walks must be the same params in the same order."""
+
+    var src: _Collect
+    var pos: Int
+    var k: Int
+
+    def __init__(out self, var src: _Collect):
+        self.src = src^
+        self.pos = 0
+        self.k = 0
+
+    def visit_rt[target: StaticString](
+        mut self, name: String, mut param: Tensor, mut grad: Tensor,
+        mut m: Tensor, mut v: Tensor, n: Int, apply_decay: Bool,
+        ctx: Optional[DeviceContext],
+    ) raises:
+        if self.k >= len(self.src.sizes) or self.src.sizes[self.k] != n:
+            raise Error("merge copy: '" + name + "' has no matching source param")
+        for i in range(n):
+            param.data[i] = self.src.vals[self.pos + i]
+        comptime if target == "gpu":
+            param.upload_resident(ctx.value())
+        param.version += 1
+        self.pos += n
+        self.k += 1
+
+    def visit[target: StaticString, N: Int](
+        mut self, name: String, mut param: Tensor, mut grad: Tensor,
+        mut m: Tensor, mut v: Tensor, apply_decay: Bool,
+        ctx: Optional[DeviceContext],
+    ) raises:
+        self.visit_rt[target](name, param, grad, m, v, N, apply_decay, ctx)
 
 
 def trainable_values[
@@ -1039,6 +1109,65 @@ def main() raises:
             # need — `SmolVLATrainStep.run` does both. The gradients it leaves
             # are discarded by the next step's `zero_trainable_grads`, above.
             # Correct, and about twice the cost it should be.
+
+    # ── the merged checkpoint, for the deploy ────────────────────────────
+    comptime if EXPERT_R > 0 and TOWER_R == 0:
+        var merge_out = getenv("SMOLVLA_MERGE_OUT")
+        if merge_out.byte_length() > 0:
+            if exists(best_ckpt):
+                _ = load_trainables[
+                    "gpu", SMOLLM_LAYERS, SMOLVLA_EXPERT_W, EXPERT_FF,
+                    SMOLLM_DIM, SMOLLM_KV_W, PAD, E_R=EXPERT_R,
+                ](
+                    best_ckpt, pol.expert, pol.action_in, pol.time_mlp_in,
+                    pol.time_mlp_out, pol.action_out, sp_frozen,
+                    Optional(ctx),
+                )
+            var v_lora = 0.0
+            for vi in range(VAL_GROUPS):
+                for m in range(micro):
+                    v_lora += run_one(
+                        m, vgroups[vi], sam, tasks, pol, st, img_col, row,
+                        images, scratch, acts_t, valid_t, noise_t, times_t,
+                        x_t, u_t, ctx, ph, vcache, seg, gx_pre,
+                    )
+            v_lora /= Float64(VAL_GROUPS)
+            pol.expert.merge_lora["gpu"](Optional(ctx))
+            var v_merged = 0.0
+            for vi in range(VAL_GROUPS):
+                for m in range(micro):
+                    v_merged += run_one(
+                        m, vgroups[vi], sam, tasks, pol, st, img_col, row,
+                        images, scratch, acts_t, valid_t, noise_t, times_t,
+                        x_t, u_t, ctx, ph, vcache, seg, gx_pre,
+                    )
+            v_merged /= Float64(VAL_GROUPS)
+            var rel = abs(v_merged - v_lora) / v_lora
+            print("  merge   " + val_label + " adapted " + String(v_lora)
+                  + "  merged " + String(v_merged) + "  (rel "
+                  + String(rel) + ")")
+            if rel > 1.0e-4:
+                raise Error(
+                    "the merged expert does not compute what the adapted one"
+                    " did (rel " + String(rel) + "): no checkpoint written"
+                )
+            var col = _Collect()
+            pol.expert.for_each_base_param["gpu"](col, Optional(ctx))
+            var plain = PlainExpert.make["gpu", Deterministic](Optional(ctx))
+            var fill = _Fill(col^)
+            plain.for_each_param["gpu"](fill, Optional(ctx))
+            if fill.k != len(fill.src.sizes):
+                raise Error("merge copy: the plain expert walked fewer params")
+            save_trainables[
+                "gpu", SMOLLM_LAYERS, SMOLVLA_EXPERT_W, EXPERT_FF, SMOLLM_DIM,
+                SMOLLM_KV_W, PAD,
+            ](
+                merge_out, plain, pol.action_in, pol.time_mlp_in,
+                pol.time_mlp_out, pol.action_out, sp_frozen, False,
+                Optional(ctx),
+            )
+            print("  merge   plain checkpoint (no adapters, no moments) -> "
+                  + merge_out + "   deploy it with --ckpt")
 
     finish_run(
         run, logger, artifacts,

@@ -12,7 +12,9 @@ toy size on the GPU, through the same helpers the program calls.
       the four projections, and after 12 steps (arena, global clip) every
       base value is bit-unchanged, every adapter's A and B and every
       projection moved, the loss fell, and the optimizer's version bump left
-      the frozen weights' versions alone while it advanced the projections'
+      the frozen weights' versions alone while it advanced the projections';
+      then `merge_lora` folds every adapter into its weight and the loss is
+      unchanged (what `SMOLVLA_MERGE_OUT` relies on)
   [2] LoRA on the TEXT TOWER (`-D SMOLVLA_TOWER_R`): the expert trains in
       full, the tower's base is frozen by `freeze_backbone`'s base walk, and
       its adapters train through the prefill's backward.
@@ -285,6 +287,20 @@ def leg_expert(c: DeviceContext) raises:
     assert_true(l1 < l0, "the loss did not fall")
     assert_true(v_frozen1 == v_frozen0, "the optimizer bumped a frozen weight's version")
     assert_true(v_proj1 > v_proj0, "the optimizer did not bump a trained weight's version")
+
+    # merge: the same loss from the base GEMMs alone
+    var la = st.run["gpu", P](
+        e, cache, den, ai, ti, to, ao, d.x_t, d.u_t, d.valid, B * CHUNK, ctx
+    )
+    e.merge_lora["gpu"](ctx)
+    var lm = st.run["gpu", P](
+        e, cache, den, ai, ti, to, ao, d.x_t, d.u_t, d.valid, B * CHUNK, ctx
+    )
+    var v_merged = e.self_layers[0].q.weight.val.version
+    print("      merged: loss adapted", la, " merged", lm, " rel", abs(lm - la) / la,
+          "; merged q version", v_frozen1, "->", v_merged)
+    assert_true(abs(lm - la) / la < 1e-5, "the merged expert computes something else")
+    assert_true(v_merged > v_frozen1, "merging did not bump the weight's version")
 
 
 # ── [2] LoRA on the text tower ──────────────────────────────────────────

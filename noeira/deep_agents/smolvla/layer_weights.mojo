@@ -282,6 +282,30 @@ struct DecoderLayerWeights[
         self.o_lora.alpha = alpha
         self.mlp.set_lora_alpha(alpha)
 
+    def merge_lora[
+        target: StaticString
+    ](mut self, ctx: Optional[DeviceContext] = None) raises:
+        """Fold each of the seven adapters into its linear's weight
+        (`LoRAAdapter.merge_into`, which bumps the weight's version) and
+        freeze it: the layer then computes the same function with its base
+        GEMMs alone, and a merged adapter takes no gradient. Nothing at
+        R = 0."""
+        comptime if Self.LORA_R > 0:
+            self.q_lora.merge_into[target](self.q.weight.val, ctx)
+            self.k_lora.merge_into[target](self.k.weight.val, ctx)
+            self.v_lora.merge_into[target](self.v.weight.val, ctx)
+            self.o_lora.merge_into[target](self.o.weight.val, ctx)
+            self.mlp.gate_lora.merge_into[target](self.mlp.gate.weight.val, ctx)
+            self.mlp.up_lora.merge_into[target](self.mlp.up.weight.val, ctx)
+            self.mlp.down_lora.merge_into[target](self.mlp.down.weight.val, ctx)
+            self.q_lora.freeze()
+            self.k_lora.freeze()
+            self.v_lora.freeze()
+            self.o_lora.freeze()
+            self.mlp.gate_lora.freeze()
+            self.mlp.up_lora.freeze()
+            self.mlp.down_lora.freeze()
+
     def zero_grad[
         target: StaticString
     ](mut self, ctx: Optional[DeviceContext]) raises:

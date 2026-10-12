@@ -174,6 +174,16 @@ struct SmolVLAExpert[
         for i in range(Self.N_CROSS):
             self.cross_layers[i].set_lora_alpha(alpha)
 
+    def merge_lora[
+        target: StaticString
+    ](mut self, ctx: Optional[DeviceContext] = None) raises:
+        """Every layer's `merge_lora`: the expert's base weights then hold
+        W + s · A B and its base walk is a plain expert's."""
+        for i in range(Self.N_SELF):
+            self.self_layers[i].merge_lora[target](ctx)
+        for i in range(Self.N_CROSS):
+            self.cross_layers[i].merge_lora[target](ctx)
+
     def zero_grad[
         target: StaticString
     ](mut self, ctx: Optional[DeviceContext]) raises:
