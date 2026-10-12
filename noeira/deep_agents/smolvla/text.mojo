@@ -56,15 +56,18 @@ struct SmolVLMTextLayers[
     W: Int = SMOLLM_DIM,
     FF: Int = SMOLLM_FF,
     KVW: Int = SMOLLM_KV_W,
+    LORA_R: Int = 0,
 ](Movable):
     """16 layers plus the final norm, walked under the checkpoint's index.
 
     `KV_IN == W`: every VLM layer projects K/V from its own stream. (The expert
     is the one whose odd layers project the VLM's cached K/V instead.)
+    `LORA_R > 0` puts a LoRA adapter beside each of every layer's seven linears
+    (`layer_weights.mojo`).
     """
 
     comptime Layer = DecoderLayerWeights[
-        Self.W, Self.FF, Self.W, Self.KVW, Self.W
+        Self.W, Self.FF, Self.W, Self.KVW, Self.W, Self.LORA_R
     ]
 
     var layers: List[Self.Layer]

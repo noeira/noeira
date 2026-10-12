@@ -80,16 +80,19 @@ struct SmolVLAExpert[
     QW: Int = VLM_W,
     KVW: Int = VLM_KV_W,
     SELF_EVERY: Int = EXPERT_SELF_EVERY,
+    LORA_R: Int = 0,
 ](ParamWalkable):
-    """All 16 layers plus the final norm, walked under the CHECKPOINT's index."""
+    """All 16 layers plus the final norm, walked under the CHECKPOINT's index.
+    `LORA_R > 0` puts a LoRA adapter beside each of every layer's seven
+    linears (`layer_weights.mojo`)."""
 
     comptime N_SELF: Int = (Self.LAYERS + Self.SELF_EVERY - 1) // Self.SELF_EVERY
     comptime N_CROSS: Int = Self.LAYERS - Self.N_SELF
     comptime SelfLayer = DecoderLayerWeights[
-        Self.W, Self.FF, Self.QW, Self.KVW, Self.W
+        Self.W, Self.FF, Self.QW, Self.KVW, Self.W, Self.LORA_R
     ]
     comptime CrossLayer = DecoderLayerWeights[
-        Self.W, Self.FF, Self.QW, Self.KVW, Self.KVW
+        Self.W, Self.FF, Self.QW, Self.KVW, Self.KVW, Self.LORA_R
     ]
 
     var self_layers: List[Self.SelfLayer]

@@ -11,3 +11,5 @@ tests/deep_agents/smolvla/test_train_state_proj_frozen_tower.mojo
 tests/nn/peft/test_lora.mojo
 tests/nn/peft/test_lora_gpu.mojo
 tests/nn/peft/test_peft_io.mojo
+tests/deep_agents/smolvla/test_lora_wiring.mojo
+tests/deep_agents/smolvla/test_lora_wiring_gpu.mojo

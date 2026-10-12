@@ -347,16 +347,19 @@ struct LoRAAdapter[
 
     # ── forward / vjp ──────────────────────────────────────────────────
     def forward_add[
-        target: StaticString, T: Int
+        target: StaticString, T: Int, o: MutOrigin
     ](
         mut self,
-        x: Tensor,
+        inputs: TensorRefs[1, o],
         mut y: Tensor,
         ctx: Optional[DeviceContext] = None,
     ) raises:
-        """`y[T, OUT] += s · (x[T, IN] A) B`. Nothing once merged."""
+        """`y[T, OUT] += s · (x[T, IN] A) B`, called with the base linear's
+        own `inputs` and `out` right after its `forward`. Nothing once
+        merged."""
         if self.merged:
             return
+        ref x = inputs[0]
         var s = Scalar[DT](self.scale())
         comptime if target == "cpu":
             self.h.ensure(T * Self.R_PAD)
@@ -391,18 +394,22 @@ struct LoRAAdapter[
             )
 
     def vjp_add[
-        target: StaticString, T: Int
+        target: StaticString, T: Int, ofi: MutOrigin, ogi: MutOrigin
     ](
         mut self,
-        x: Tensor,
-        g: Tensor,
-        mut gx: Tensor,
+        forward_input: TensorRefs[1, ofi],
+        mut grad_output: Tensor,
+        grad_inputs: TensorRefs[1, ogi],
         ctx: Optional[DeviceContext] = None,
     ) raises:
         """With gh = s · g Bᵀ: dB += s · hᵀ g, dA += xᵀ gh, and
-        `gx[T, IN] += gh Aᵀ`. `g` is the base layer's grad_output and `gx`
-        already holds its grad_input (`Linear.vjp` overwrites it), which the
-        adapter's share is added onto. A frozen adapter forms gx only."""
+        `gx[T, IN] += gh Aᵀ`. Called with the base linear's own arguments
+        right after its `vjp`: `grad_inputs` already holds the base's
+        grad_input (`Linear.vjp` overwrites it), which the adapter's share is
+        added onto. A frozen adapter forms gx only."""
+        ref x = forward_input[0]
+        ref g = grad_output
+        ref gx = grad_inputs[0]
         var want_dA = self.lora_A.grd.n > 0
         var want_dB = self.lora_B.grd.n > 0
         if self.merged:
@@ -541,6 +548,14 @@ struct LoRAAdapter[
         self._add_delta[target](w, -Scalar[DT](self.scale()), ctx)
         self.merged = False
 
+    def add_into[
+        target: StaticString
+    ](mut self, mut w: Tensor, ctx: Optional[DeviceContext] = None) raises:
+        """`w[IN, OUT] += s · A B` WITHOUT marking the adapter merged: the
+        merge's arithmetic applied to a COPY of the base layer, which is what
+        a gate comparing an adapted layer with its merged twin needs."""
+        self._add_delta[target](w, Scalar[DT](self.scale()), ctx)
+
     def _add_delta[
         target: StaticString
     ](
@@ -631,8 +646,7 @@ struct LoRALinear[
         ctx: Optional[DeviceContext] = None,
     ) raises:
         self.base.forward[target, B, o, POLICY](inputs, out, ctx)
-        ref x = inputs[0]
-        self.adapter.forward_add[target, B](x, out, ctx)
+        self.adapter.forward_add[target, B](inputs, out, ctx)
 
     def vjp[
         target: StaticString,
@@ -650,9 +664,9 @@ struct LoRALinear[
         self.base.vjp[target, B, ofi, ogi, POLICY](
             forward_input, grad_output, grad_inputs, ctx
         )
-        ref x = forward_input[0]
-        ref gx = grad_inputs[0]
-        self.adapter.vjp_add[target, B](x, grad_output, gx, ctx)
+        self.adapter.vjp_add[target, B](
+            forward_input, grad_output, grad_inputs, ctx
+        )
 
     def for_each_param[
         target: StaticString, V: ParamVisitor
