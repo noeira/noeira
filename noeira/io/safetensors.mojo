@@ -637,7 +637,7 @@ struct SafeTensorsWriter(Movable):
     var begins: List[Int]
     var ends: List[Int]
     var dtypes: List[Int]
-    """Per tensor, the header's dtype: `ST_F32` or `ST_BF16`."""
+    """Per tensor, the header's dtype: `ST_F32`, `ST_BF16` or `ST_U8`."""
     var data: List[UInt8]
     var meta_keys: List[String]
     var meta_vals: List[String]
@@ -765,6 +765,30 @@ struct SafeTensorsWriter(Movable):
         self.dtypes.append(ST_BF16)
         self.begins.append(begin)
         self.ends.append(begin + count * 2)
+
+    def add_u8(
+        mut self,
+        var name: String,
+        ref shape: List[Int],
+        ref vals: List[UInt8],
+        count: Int,
+    ) raises:
+        """Append the first `count` bytes of `vals` under `name` as U8, with
+        the declared `shape`. For quantized weights, whose blocks are bytes
+        (`nn/quant/q4_0.mojo`); `SafeTensors.read_raw` reads them back."""
+        self._entry(name, shape, count, len(vals))
+        var begin = len(self.data)
+        self.data.resize(begin + count, 0)
+        if count > 0:
+            unsafe_memcpy(
+                dest=self.data.unsafe_ptr().unsafe_offset(begin),
+                src=vals.unsafe_ptr(),
+                count=count,
+            )
+        self.names.append(name^)
+        self.dtypes.append(ST_U8)
+        self.begins.append(begin)
+        self.ends.append(begin + count)
 
     def add_f32_list(
         mut self, var name: String, ref shape: List[Int], ref vals: List[Float32]

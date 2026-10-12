@@ -70,14 +70,8 @@ notes). fp32 only: the bf16-flow adapter comes with QLoRA.
 
 from std.math import sqrt
 from std.random import random_float64
-from std.sys import CompilationTarget
 from max.gpu import global_idx
 from max.gpu.host import DeviceContext
-from linalg.matmul.cpu.apple_accelerate import (
-    get_cblas_f32_function,
-    _CBLASOrder,
-    _CBLASTranspose,
-)
 
 from noeira.nn.constants import DT
 from ..core.tensor import Tensor
@@ -88,6 +82,7 @@ from ..core.initializer import Initializer
 from ..core.amp import AMPPolicy, NoAMP
 from ..core.walkers import join_name
 from ..core.mm import mm
+from ..core.cpu_gemm import gemm_cpu
 from ..core.cublas_gemm import cublas_gemm, cublas_tf32, CUBLAS_BWD
 from ..core.polyak import polyak_tensor
 from ..primitives.linear import Linear
@@ -153,60 +148,6 @@ def _accum_transposed_kernel(
 @always_inline
 def _blocks(n: Int) -> Int:
     return (n + 255) // 256
-
-
-# ── CPU GEMM ───────────────────────────────────────────────────────────
-
-
-def _gemm_cpu[
-    TA: Bool, TB: Bool
-](
-    M: Int,
-    N: Int,
-    K: Int,
-    alpha: Float32,
-    a: Tensor,
-    lda: Int,
-    b: Tensor,
-    ldb: Int,
-    beta: Float32,
-    mut c: Tensor,
-    ldc: Int,
-) raises:
-    """`c[M, N] = alpha · op(a) @ op(b) + beta · c`, row-major fp32: op(a) is
-    a[M, K] (row stride `lda`), or a[K, M]ᵀ when `TA`; op(b) is b[K, N], or
-    b[N, K]ᵀ when `TB`. As in BLAS, `c` is not read when beta is 0."""
-    comptime assert DT == DType.float32, "LoRA's CPU GEMM is fp32"
-    comptime if CompilationTarget.is_macos():
-        var cblas = get_cblas_f32_function()
-        cblas(
-            _CBLASOrder.ROW_MAJOR,
-            _CBLASTranspose.TRANSPOSE if TA else _CBLASTranspose.NO_TRANSPOSE,
-            _CBLASTranspose.TRANSPOSE if TB else _CBLASTranspose.NO_TRANSPOSE,
-            Int32(M),
-            Int32(N),
-            Int32(K),
-            alpha,
-            rebind[Pointer[Float32, ImmutAnyOrigin]](a.data.unsafe_ptr()),
-            Int32(lda),
-            rebind[Pointer[Float32, ImmutAnyOrigin]](b.data.unsafe_ptr()),
-            Int32(ldb),
-            beta,
-            rebind[Pointer[Float32, MutAnyOrigin]](c.data.unsafe_ptr()),
-            Int32(ldc),
-        )
-    else:
-        for i in range(M):
-            for j in range(N):
-                var acc = Float32(0)
-                for k in range(K):
-                    var av = a.data[k * lda + i] if TA else a.data[i * lda + k]
-                    var bv = b.data[j * ldb + k] if TB else b.data[k * ldb + j]
-                    acc += av * bv
-                var prev = Float32(0)
-                if beta != 0:
-                    prev = beta * c.data[i * ldc + j]
-                c.data[i * ldc + j] = alpha * acc + prev
 
 
 # ── the adapter ────────────────────────────────────────────────────────
@@ -365,12 +306,12 @@ struct LoRAAdapter[
         var s = Scalar[DT](self.scale())
         comptime if target == "cpu":
             self.h.ensure(T * Self.R_PAD)
-            _gemm_cpu[False, False](
+            gemm_cpu[False, False](
                 T, Self.R_PAD, Self.IN, 1.0,
                 x, Self.IN, self.lora_A.val, Self.R_PAD,
                 0.0, self.h, Self.R_PAD,
             )
-            _gemm_cpu[False, False](
+            gemm_cpu[False, False](
                 T, Self.OUT, Self.R_PAD, s,
                 self.h, Self.R_PAD, self.lora_B.val, Self.OUT,
                 1.0, y, Self.OUT,
@@ -440,28 +381,28 @@ struct LoRAAdapter[
             self.gh.ensure(T * Self.R_PAD)
             if want_dB:
                 self.h.ensure(T * Self.R_PAD)
-                _gemm_cpu[False, False](
+                gemm_cpu[False, False](
                     T, Self.R_PAD, Self.IN, 1.0,
                     x, Self.IN, self.lora_A.val, Self.R_PAD,
                     0.0, self.h, Self.R_PAD,
                 )
-                _gemm_cpu[True, False](
+                gemm_cpu[True, False](
                     Self.R_PAD, Self.OUT, T, s,
                     self.h, Self.R_PAD, g, Self.OUT,
                     1.0, self.lora_B.grd, Self.OUT,
                 )
-            _gemm_cpu[False, True](
+            gemm_cpu[False, True](
                 T, Self.R_PAD, Self.OUT, s,
                 g, Self.OUT, self.lora_B.val, Self.OUT,
                 0.0, self.gh, Self.R_PAD,
             )
             if want_dA:
-                _gemm_cpu[True, False](
+                gemm_cpu[True, False](
                     Self.IN, Self.R_PAD, T, 1.0,
                     x, Self.IN, self.gh, Self.R_PAD,
                     1.0, self.lora_A.grd, Self.R_PAD,
                 )
-            _gemm_cpu[False, True](
+            gemm_cpu[False, True](
                 T, Self.IN, Self.R_PAD, 1.0,
                 self.gh, Self.R_PAD, self.lora_A.val, Self.R_PAD,
                 1.0, gx, Self.IN,
@@ -608,7 +549,7 @@ struct LoRAAdapter[
         """`w += s · A B`, then a version bump: `Linear`'s padded and bf16
         weight copies are rebuilt only when `weight.val.version` moves."""
         comptime if target == "cpu":
-            _gemm_cpu[False, False](
+            gemm_cpu[False, False](
                 Self.IN, Self.OUT, Self.R_PAD, s,
                 self.lora_A.val, Self.R_PAD, self.lora_B.val, Self.OUT,
                 1.0, w, Self.OUT,
