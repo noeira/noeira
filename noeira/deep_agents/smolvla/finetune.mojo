@@ -56,6 +56,24 @@ each time, so five calls leave only the last component adopted while
 norm to 10** — with five components the total can pass through at up to
 sqrt(5)x the limit. That is why the arena is what unlocks the clip rather
 than being merely faster.
+
+## LoRA
+
+`E_R > 0` is the expert with an adapter beside each of its linears. Freeze its
+base first (`SmolVLAPolicy.freeze_expert_base`): the five components keep
+their places, the arena adopts only what still has a gradient, and every
+helper here is unchanged.
+
+LoRA on the TEXT tower adds a sixth component that is not `state_proj`: the
+tower, whose base `freeze_backbone` freezes and whose adapters train. The
+arena must take all six in one `adopt_multi`, and the checkpoint must hold the
+adapters, so `adopt_trainables_tower`, `save_trainables_tower` and
+`load_trainables_tower` list the six. Zeroing, clipping and the update need no
+variant: adopted, they are one fill, one norm and one grouped kernel over the
+whole arena, the tower's adapters included, and the adapters cache no derived
+weight that a version bump would have to invalidate. The tower regime needs
+the arena (`adopt_trainables_tower`), and the prefill's backward each
+observation (`SmolVLAPrefill.backward`) to form the adapters' gradients.
 """
 
 from max.gpu.host import DeviceContext
@@ -71,6 +89,7 @@ from noeira.nn.optimizer.adam import Adam
 from noeira.nn.primitives.linear import Linear
 
 from .expert import SmolVLAExpert
+from .text import SmolVLMTextLayers
 from .grad_ops import suffix_tail
 
 
@@ -109,9 +128,10 @@ def adopt_trainables[
     target: StaticString,
     LAYERS: Int, EW: Int, EFF: Int, W: Int, KVW: Int, ADIM: Int,
     SDIM: Int = 32, VW: Int = 960, TRAIN_STATE_PROJ: Bool = False,
+    E_R: Int = 0,
 ](
     mut opt: Adam,
-    mut expert: SmolVLAExpert[LAYERS, EW, EFF, W, KVW, 2],
+    mut expert: SmolVLAExpert[LAYERS, EW, EFF, W, KVW, 2, E_R],
     mut action_in: Linear[ADIM, EW],
     mut time_mlp_in: Linear[2 * EW, EW],
     mut time_mlp_out: Linear[EW, EW],
@@ -161,9 +181,10 @@ def zero_trainable_grads[
     target: StaticString,
     LAYERS: Int, EW: Int, EFF: Int, W: Int, KVW: Int, ADIM: Int,
     SDIM: Int = 32, VW: Int = 960, TRAIN_STATE_PROJ: Bool = False,
+    E_R: Int = 0,
 ](
     mut opt: Adam,
-    mut expert: SmolVLAExpert[LAYERS, EW, EFF, W, KVW, 2],
+    mut expert: SmolVLAExpert[LAYERS, EW, EFF, W, KVW, 2, E_R],
     mut action_in: Linear[ADIM, EW],
     mut time_mlp_in: Linear[2 * EW, EW],
     mut time_mlp_out: Linear[EW, EW],
@@ -201,9 +222,10 @@ def adam_step_trainables[
     target: StaticString,
     LAYERS: Int, EW: Int, EFF: Int, W: Int, KVW: Int, ADIM: Int,
     SDIM: Int = 32, VW: Int = 960, TRAIN_STATE_PROJ: Bool = False,
+    E_R: Int = 0,
 ](
     mut opt: Adam,
-    mut expert: SmolVLAExpert[LAYERS, EW, EFF, W, KVW, 2],
+    mut expert: SmolVLAExpert[LAYERS, EW, EFF, W, KVW, 2, E_R],
     mut action_in: Linear[ADIM, EW],
     mut time_mlp_in: Linear[2 * EW, EW],
     mut time_mlp_out: Linear[EW, EW],
@@ -260,9 +282,10 @@ def save_trainables[
     target: StaticString,
     LAYERS: Int, EW: Int, EFF: Int, W: Int, KVW: Int, ADIM: Int,
     SDIM: Int = 32, VW: Int = 960, TRAIN_STATE_PROJ: Bool = False,
+    E_R: Int = 0,
 ](
     path: String,
-    mut expert: SmolVLAExpert[LAYERS, EW, EFF, W, KVW, 2],
+    mut expert: SmolVLAExpert[LAYERS, EW, EFF, W, KVW, 2, E_R],
     mut action_in: Linear[ADIM, EW],
     mut time_mlp_in: Linear[2 * EW, EW],
     mut time_mlp_out: Linear[EW, EW],
@@ -311,9 +334,10 @@ def load_trainables[
     target: StaticString,
     LAYERS: Int, EW: Int, EFF: Int, W: Int, KVW: Int, ADIM: Int,
     SDIM: Int = 32, VW: Int = 960, TRAIN_STATE_PROJ: Bool = False,
+    E_R: Int = 0,
 ](
     path: String,
-    mut expert: SmolVLAExpert[LAYERS, EW, EFF, W, KVW, 2],
+    mut expert: SmolVLAExpert[LAYERS, EW, EFF, W, KVW, 2, E_R],
     mut action_in: Linear[ADIM, EW],
     mut time_mlp_in: Linear[2 * EW, EW],
     mut time_mlp_out: Linear[EW, EW],
@@ -340,3 +364,80 @@ def load_trainables[
             path, ctx, expert, action_in, time_mlp_in, time_mlp_out,
             action_out,
         )
+
+
+# ── LoRA on the text tower: the six components ─────────────────────────
+
+
+def adopt_trainables_tower[
+    TL: Int, TW: Int, TFF: Int, TKV: Int, TR: Int, //,
+    target: StaticString,
+    LAYERS: Int, EW: Int, EFF: Int, W: Int, KVW: Int, ADIM: Int,
+    E_R: Int = 0,
+](
+    mut opt: Adam,
+    mut expert: SmolVLAExpert[LAYERS, EW, EFF, W, KVW, 2, E_R],
+    mut action_in: Linear[ADIM, EW],
+    mut time_mlp_in: Linear[2 * EW, EW],
+    mut time_mlp_out: Linear[EW, EW],
+    mut action_out: Linear[EW, ADIM],
+    mut tower: SmolVLMTextLayers[TL, TW, TFF, TKV, TR],
+    ctx: Optional[DeviceContext] = None,
+) raises:
+    """`adopt_trainables` plus the text tower, whose frozen base the arena
+    skips and whose adapters it adopts. Freeze the backbone first."""
+    comptime assert TR > 0, (
+        "adopt_trainables_tower: the tower has no adapters; use"
+        " adopt_trainables"
+    )
+    opt.adopt_multi[target](
+        ctx, expert, action_in, time_mlp_in, time_mlp_out, action_out, tower
+    )
+
+
+def save_trainables_tower[
+    TL: Int, TW: Int, TFF: Int, TKV: Int, TR: Int, //,
+    target: StaticString,
+    LAYERS: Int, EW: Int, EFF: Int, W: Int, KVW: Int, ADIM: Int,
+    E_R: Int = 0,
+](
+    path: String,
+    mut expert: SmolVLAExpert[LAYERS, EW, EFF, W, KVW, 2, E_R],
+    mut action_in: Linear[ADIM, EW],
+    mut time_mlp_in: Linear[2 * EW, EW],
+    mut time_mlp_out: Linear[EW, EW],
+    mut action_out: Linear[EW, ADIM],
+    mut tower: SmolVLMTextLayers[TL, TW, TFF, TKV, TR],
+    save_moments: Bool = True,
+    ctx: Optional[DeviceContext] = None,
+    scalars: CheckpointScalars = CheckpointScalars(),
+) raises:
+    """`save_trainables` plus the tower: its adapters with their moments and,
+    without moments, the frozen text weights (the v3 walk writes every
+    param; the base values are lerobot/smolvla_base's, unchanged)."""
+    save_params_multi[target](
+        path, ctx, save_moments, expert, action_in, time_mlp_in,
+        time_mlp_out, action_out, tower, scalars=scalars,
+    )
+
+
+def load_trainables_tower[
+    TL: Int, TW: Int, TFF: Int, TKV: Int, TR: Int, //,
+    target: StaticString,
+    LAYERS: Int, EW: Int, EFF: Int, W: Int, KVW: Int, ADIM: Int,
+    E_R: Int = 0,
+](
+    path: String,
+    mut expert: SmolVLAExpert[LAYERS, EW, EFF, W, KVW, 2, E_R],
+    mut action_in: Linear[ADIM, EW],
+    mut time_mlp_in: Linear[2 * EW, EW],
+    mut time_mlp_out: Linear[EW, EW],
+    mut action_out: Linear[EW, ADIM],
+    mut tower: SmolVLMTextLayers[TL, TW, TFF, TKV, TR],
+    ctx: Optional[DeviceContext] = None,
+) raises -> CheckpointScalars:
+    """What `save_trainables_tower` wrote, over an already-loaded base."""
+    return load_params_multi[target](
+        path, ctx, expert, action_in, time_mlp_in, time_mlp_out, action_out,
+        tower,
+    )

@@ -77,7 +77,9 @@ is read from `tools/vla/`.
 | `SMOLVLA_TASKS` | the tokenised instruction table; defaults to the checked-in one for this recording |
 | `SMOLVLA_STEPS` | optimizer steps, without a rebuild. ⚠ **A SHORT RUN IS NOT A GENTLE RUN** — see below |
 | `SMOLVLA_ACCUM` | observations per optimizer step (default 64, the reference's batch size); a multiple of the build's `B` |
-| `SMOLVLA_LR` | default 1e-4 |
+| `SMOLVLA_LR` | the PEAK learning rate, default 1e-4 (the decay floor stays the reference's 2.5e-6) |
+| `SMOLVLA_SEED` | seeds the training rows, noise and timesteps, and any LoRA adapter's initialisation; the held-out groups do NOT move with it (see `VAL_NOISE_SEED`). Unset keeps the historical streams |
+| `SMOLVLA_LORA_ALPHA` | PEFT's `lora_alpha` for a `-D SMOLVLA_EXPERT_R` / `-D SMOLVLA_TOWER_R` build, default 32 |
 | `SMOLVLA_CKPT` | checkpoint path prefix (`<prefix>_best.ckpt` / `_last.ckpt`); default the run's own `runs/<id>/checkpoints/best.ckpt` / `last.ckpt` |
 | `SMOLVLA_INIT` | a `*_best.ckpt` to start from, applied ON TOP of the base checkpoint |
 | `SMOLVLA_VAL_EPISODES` | episodes held out at the END of the recording; default one fifth. **`0` trains on every episode** — see below |
@@ -187,6 +189,8 @@ its own.
 
 from std.math import cos, pi
 from std.os import getenv
+from std.random import seed
+from std.sys.defines import get_defined_int
 from std.os.path import exists
 from std.time import perf_counter_ns
 from max.gpu.host import DeviceContext
@@ -196,6 +200,8 @@ from noeira.nn.core.ptr import mptr
 from noeira.nn.core.tensor import Tensor
 from noeira.nn.core.checkpoint import CheckpointScalars
 from noeira.nn.core.initializer import Deterministic
+from noeira.nn.core.named_params import named_params
+from noeira.nn.core.param import ParamWalkable
 from noeira.nn.optimizer.adam import Adam
 from noeira.nn.primitives.linear import Linear
 from noeira.core.run import RunContext, register_run
@@ -218,6 +224,7 @@ from noeira.deep_agents.smolvla.vision_cache import VisionCache
 from noeira.deep_agents.smolvla.finetune import (
     zero_trainable_grads, adam_step_trainables, save_trainables,
     load_trainables, adopt_trainables, clip_trainables,
+    adopt_trainables_tower, save_trainables_tower, load_trainables_tower,
 )
 from noeira.deep_agents.smolvla.flow_loss import (
     build_xt_ut, sample_noise, sample_times,
@@ -263,6 +270,17 @@ at 8 and ~20 GB at 64 on top of the 3.2 GB policy. 8 fits a 5090 with room;
 raise it once the number below says the launches still dominate."""
 comptime PAD = SMOLVLA_ACTION_DIM
 
+comptime EXPERT_R = get_defined_int["SMOLVLA_EXPERT_R", 0]()
+"""LoRA rank beside every expert linear (`mojo build -D SMOLVLA_EXPERT_R=16`).
+0, the default, is the shipped recipe: the expert itself trains. Nonzero
+freezes the expert's own weights and trains its adapters and the four
+projections — LoRA on the expert."""
+comptime TOWER_R = get_defined_int["SMOLVLA_TOWER_R", 0]()
+"""LoRA rank beside every linear of the 16 text layers (`-D SMOLVLA_TOWER_R`):
+the shipped recipe PLUS the frozen VLM adapted. Its adapters' gradient comes
+through the prefill's backward, run on every observation (`run_one`); the
+vision cache stays exact, as the image segment is upstream of the tower."""
+
 comptime REPO = String("lerobot/smolvla_base")
 comptime DEFAULT_TASKS = String(SO101_TASKS)
 comptime DEFAULT_DATA_REPO = String("DenisLabs/record-test_20260828_092736")
@@ -298,6 +316,12 @@ does not fail, it just wastes the checkpoint you started from."""
 comptime VAL_EVERY = 200
 comptime VAL_GROUPS = 8
 comptime LOG_EVERY = 10
+comptime VAL_NOISE_SEED = 0x5EED_0A1
+"""The global RNG's seed for drawing the held-out groups' noise and timesteps,
+set just before they are drawn and replaced by the run's seed after. Without
+it the held-out PROBLEM would depend on whatever consumed the global RNG
+before (a LoRA adapter's initialisation does), so arms and seeds would be
+scored on different noise."""
 comptime VAL_SEED: UInt64 = 0x5DEECE66D
 """⚠ The seed the held-out groups are drawn with, ONCE, before training.
 
@@ -309,11 +333,12 @@ across two Adam steps at lr 1e-4: a redraw, not learning, and unfalsifiable
 either way. The groups are now built once and reused verbatim."""
 
 comptime Pol = SmolVLAPolicy[
-    N_CAM, N_LANG, CHUNK, STEPS_EULER, B, SMOLLM_LAYERS, SIGLIP_LAYERS, True
+    N_CAM, N_LANG, CHUNK, STEPS_EULER, B, SMOLLM_LAYERS, SIGLIP_LAYERS, True,
+    EXPERT_R, TOWER_R,
 ]
 comptime Step = SmolVLATrainStep[
     CHUNK, ADIM_REAL, PAD, SMOLVLA_EXPERT_W, B, SMOLLM_LAYERS, EXPERT_FF,
-    SMOLLM_DIM,
+    SMOLLM_DIM, E_R=EXPERT_R,
 ]
 comptime Sampler = SmolVLABatchSampler[SDIM, ADIM_REAL, PAD, CHUNK, B]
 comptime IMG_ELEMS = N_CAM * 3 * SRC_H * SRC_W
@@ -324,7 +349,7 @@ comptime VC_FLUSH_EVERY = 200
 comptime VC_PRINT_EVERY = 1000
 
 
-def lr_at(step: Int, total: Int) -> Float64:
+def lr_at(step: Int, total: Int, peak: Float64) -> Float64:
     """`CosineDecayWithWarmupSchedulerConfig`, transcribed.
 
     ⚠ Including its AUTO-SCALING: when a run is shorter than `DECAY_STEPS` the
@@ -345,11 +370,11 @@ def lr_at(step: Int, total: Int) -> Float64:
         # linear from peak/(warm+1) up to peak
         var frac = 1.0 - Float64(step) / Float64(warm)
         var mult = (1.0 / Float64(warm + 1) - 1.0) * frac + 1.0
-        return PEAK_LR * mult
+        return peak * mult
     var st = step if step < dec else dec
     var cd = 0.5 * (1.0 + cos(pi * Float64(st) / Float64(dec)))
-    var alpha = DECAY_LR / PEAK_LR
-    return PEAK_LR * ((1.0 - alpha) * cd + alpha)
+    var alpha = DECAY_LR / peak
+    return peak * ((1.0 - alpha) * cd + alpha)
 
 
 def _need(name: String) raises -> String:
@@ -523,6 +548,21 @@ def draw_group(
     return gr^
 
 
+def trainable_values[
+    M: ParamWalkable
+](mut m: M, ctx: DeviceContext) raises -> Tuple[Int, Int]:
+    """(values with a gradient, of which LoRA adapter values)."""
+    var nps = named_params["gpu"](m, Optional(ctx))
+    var t = 0
+    var a = 0
+    for i in range(len(nps)):
+        if nps[i].trainable:
+            t += nps[i].size
+            if "lora_" in nps[i].name:
+                a += nps[i].size
+    return (t, a)
+
+
 def main() raises:
     print("=" * 74)
     print("SmolVLA fine-tune — SO-ARM101")
@@ -578,6 +618,20 @@ def main() raises:
     var micro = accum // B
     var e_val = getenv("SMOLVLA_VAL_EPISODES")
     var profile = getenv("SMOLVLA_PROFILE").byte_length() > 0
+    var peak_lr = PEAK_LR
+    var e_lr = getenv("SMOLVLA_LR")
+    if e_lr.byte_length() > 0:
+        peak_lr = Float64(e_lr)
+    var e_seed = getenv("SMOLVLA_SEED")
+    var run_seed = 0
+    if e_seed.byte_length() > 0:
+        run_seed = Int(e_seed)
+        # Before the policy is built: a LoRA adapter's A is drawn from it.
+        seed(run_seed)
+    var lora_alpha = 32.0
+    var e_alpha = getenv("SMOLVLA_LORA_ALPHA")
+    if e_alpha.byte_length() > 0:
+        lora_alpha = Float64(e_alpha)
 
     var ctx = DeviceContext()
     print("  device  " + String(ctx.name()))
@@ -585,8 +639,11 @@ def main() raises:
     print("  stats   " + stats_path)
     print("  steps   " + String(steps) + " x " + String(accum)
           + " observations (" + String(micro) + " x B=" + String(B)
-          + ")   peak lr " + String(PEAK_LR) + ", warmup "
+          + ")   peak lr " + String(peak_lr) + ", warmup "
           + String(WARMUP_STEPS) + " (auto-scaled), beta2 " + String(BETA2))
+    print("  lora    expert R " + String(EXPERT_R) + ", text tower R "
+          + String(TOWER_R) + ", alpha " + String(lora_alpha)
+          + "   seed " + (e_seed if e_seed.byte_length() > 0 else String("(unset)")))
 
     var tasks = TaskTokens(tasks_path)
     var n_lang = tasks.n_lang()
@@ -609,7 +666,28 @@ def main() raises:
     # (`train_state_proj = False`, see the header). Before any adopt.
     var n_frozen = pol.freeze_backbone["gpu"](Optional(ctx))
     n_frozen += freeze_params["gpu"](pol.state_proj, Optional(ctx))
+    comptime if EXPERT_R > 0:
+        # LoRA on the expert: its own weights freeze, its adapters train.
+        n_frozen += pol.freeze_expert_base["gpu"](Optional(ctx))
+    comptime if EXPERT_R > 0 or TOWER_R > 0:
+        pol.expert.set_lora_alpha(lora_alpha)
+        pol.tower.set_lora_alpha(lora_alpha)
     print("  policy  loaded, " + String(n_frozen) + " values frozen")
+    var tv_e = trainable_values(pol.expert, ctx)
+    var tv_t = trainable_values(pol.tower, ctx)
+    var tv_p = (
+        trainable_values(pol.action_in, ctx)[0]
+        + trainable_values(pol.time_mlp_in, ctx)[0]
+        + trainable_values(pol.time_mlp_out, ctx)[0]
+        + trainable_values(pol.action_out, ctx)[0]
+    )
+    var n_train = tv_e[0] + tv_t[0] + tv_p
+    var n_lora = tv_e[1] + tv_t[1]
+    print("  train   " + String(n_train) + " values: expert " + String(tv_e[0])
+          + " (adapters " + String(tv_e[1]) + "), projections " + String(tv_p)
+          + ", text tower " + String(tv_t[0]) + " (adapters " + String(tv_t[1])
+          + ");  adapters " + String(Float64(n_lora) * 4.0 / 1.0e6)
+          + " MB fp32")
 
     # `SMOLVLA_PROJECT` files the run under a project (`project-promote`
     # promotes into the RUN's project); unset keeps the historical `so101`.
@@ -640,7 +718,9 @@ def main() raises:
         last_ckpt = ckpt + "_last.ckpt"
         best_ckpt = ckpt + "_best.ckpt"
 
-    var sam = Sampler(store_path, SmolVLAStats.from_stats_json(stats_path))
+    var sam = Sampler(
+        store_path, SmolVLAStats.from_stats_json(stats_path), UInt64(run_seed)
+    )
     var n_ep = sam.store.n_episodes()
     var n_rows = sam.n_rows()
     var n_val_ep = n_ep // 5
@@ -699,7 +779,12 @@ def main() raises:
     logger.set_config("store", store_path)
     logger.set_config("chunk", String(CHUNK))
     logger.set_config("accum", String(accum))
-    logger.set_config("peak_lr", String(PEAK_LR))
+    logger.set_config("peak_lr", String(peak_lr))
+    logger.set_config("lora_expert_r", String(EXPERT_R))
+    logger.set_config("lora_tower_r", String(TOWER_R))
+    logger.set_config("lora_alpha", String(lora_alpha))
+    logger.set_config("seed", e_seed)
+    logger.set_config("trainable_values", String(n_train))
     logger.set_config("beta2", String(BETA2))
     logger.set_config("warmup", String(WARMUP_STEPS))
     register_run(run, logger)
@@ -715,7 +800,7 @@ def main() raises:
     # Same flag, same caveat: on, it drains at every stage boundary.
     pol.denoiser.profile = profile
     var opt = Adam(
-        lr=Scalar[DT](lr_at(0, steps)), beta1=BETA1, beta2=BETA2, eps=EPS,
+        lr=Scalar[DT](lr_at(0, steps, peak_lr)), beta1=BETA1, beta2=BETA2, eps=EPS,
         wd=WD,
     )
     var sp_frozen = Linear[SMOLVLA_STATE_DIM, SMOLLM_DIM].make[
@@ -732,13 +817,23 @@ def main() raises:
     # random prefix, with nothing to say so.
     var init_from = getenv("SMOLVLA_INIT")
     if init_from.byte_length() > 0:
-        var init_sc = load_trainables[
-            "gpu", SMOLLM_LAYERS, SMOLVLA_EXPERT_W, EXPERT_FF, SMOLLM_DIM,
-            SMOLLM_KV_W, PAD,
-        ](
-            init_from, pol.expert, pol.action_in, pol.time_mlp_in,
-            pol.time_mlp_out, pol.action_out, sp_frozen, Optional(ctx),
-        )
+        var init_sc = CheckpointScalars()
+        comptime if TOWER_R > 0:
+            init_sc = load_trainables_tower[
+                "gpu", SMOLLM_LAYERS, SMOLVLA_EXPERT_W, EXPERT_FF, SMOLLM_DIM,
+                SMOLLM_KV_W, PAD, E_R=EXPERT_R,
+            ](
+                init_from, pol.expert, pol.action_in, pol.time_mlp_in,
+                pol.time_mlp_out, pol.action_out, pol.tower, Optional(ctx),
+            )
+        else:
+            init_sc = load_trainables[
+                "gpu", SMOLLM_LAYERS, SMOLVLA_EXPERT_W, EXPERT_FF, SMOLLM_DIM,
+                SMOLLM_KV_W, PAD, E_R=EXPERT_R,
+            ](
+                init_from, pol.expert, pol.action_in, pol.time_mlp_in,
+                pol.time_mlp_out, pol.action_out, sp_frozen, Optional(ctx),
+            )
         # The moments came back with the weights; their step count must too,
         # or the bias correction restarts at step 1 against settled moments.
         opt.take_step_state(init_sc, "opt")
@@ -748,13 +843,22 @@ def main() raises:
     # adopting rebinds every Param to a slice of one arena, so it must happen
     # once the values are final. It buys the grouped update AND the global
     # grad-norm clip, which cannot be done component-by-component.
-    adopt_trainables[
-        "gpu", SMOLLM_LAYERS, SMOLVLA_EXPERT_W, EXPERT_FF, SMOLLM_DIM,
-        SMOLLM_KV_W, PAD,
-    ](
-        opt, pol.expert, pol.action_in, pol.time_mlp_in, pol.time_mlp_out,
-        pol.action_out, sp_frozen, Optional(ctx),
-    )
+    comptime if TOWER_R > 0:
+        adopt_trainables_tower[
+            "gpu", SMOLLM_LAYERS, SMOLVLA_EXPERT_W, EXPERT_FF, SMOLLM_DIM,
+            SMOLLM_KV_W, PAD, E_R=EXPERT_R,
+        ](
+            opt, pol.expert, pol.action_in, pol.time_mlp_in,
+            pol.time_mlp_out, pol.action_out, pol.tower, Optional(ctx),
+        )
+    else:
+        adopt_trainables[
+            "gpu", SMOLLM_LAYERS, SMOLVLA_EXPERT_W, EXPERT_FF, SMOLLM_DIM,
+            SMOLLM_KV_W, PAD, E_R=EXPERT_R,
+        ](
+            opt, pol.expert, pol.action_in, pol.time_mlp_in,
+            pol.time_mlp_out, pol.action_out, sp_frozen, Optional(ctx),
+        )
     print("  arena   " + String(opt.arena.total)
           + " trainable elements, grouped update + global clip at "
           + String(CLIP_NORM))
@@ -768,6 +872,9 @@ def main() raises:
     var times_t = Tensor.alloc(B)
     var x_t = Tensor.alloc(AN)
     var u_t = Tensor.alloc(AN)
+    var gx_pre = Tensor.alloc_gpu(ctx, B * Pol.P * SMOLLM_DIM if TOWER_R > 0 else 1)
+    """dL/d(prefix embeddings), the prefill backward's destination when the
+    text tower has adapters: written and dropped, as `state_proj` is frozen."""
     var row = List[Scalar[DType.uint8]](unsafe_uninit_length=IMG_ELEMS)
     var img_col = sam.store.open_column[DType.uint8](String("images"))
 
@@ -797,12 +904,16 @@ def main() raises:
     # the policy did.
     var keep_rng = sam.rng
     sam.rng = VAL_SEED
+    if e_seed.byte_length() > 0:
+        seed(VAL_NOISE_SEED)
     var vgroups = List[Group]()
     for _ in range(VAL_GROUPS):
         vgroups.append(
             draw_group(sam, micro, val_lo, n_rows, state_t, acts_t, valid_t)
         )
     sam.rng = keep_rng
+    if e_seed.byte_length() > 0:
+        seed(run_seed + 1)
     print("  val     " + String(VAL_GROUPS) + " fixed groups x "
           + String(accum) + " observations, drawn once from rows ["
           + String(val_lo) + ", " + String(n_rows) + ")  " + val_label)
@@ -819,7 +930,7 @@ def main() raises:
             base_sum += run_one(
                 m, vgroups[vi], sam, tasks, pol, st, img_col, row, images,
                 scratch, acts_t, valid_t, noise_t, times_t, x_t, u_t, ctx,
-                ph, vcache, seg,
+                ph, vcache, seg, gx_pre,
             )
     var base_val = base_sum / Float64(VAL_GROUPS)
     var best_val = base_val
@@ -843,10 +954,10 @@ def main() raises:
         # the GPU-arena path — "a no-op stub for CPU/non-adopted (use host
         # set_lr + a host schedule there)". Calling it here would have looked
         # like a schedule and done nothing.
-        opt.set_lr(Scalar[DT](lr_at(s, steps)))
+        opt.set_lr(Scalar[DT](lr_at(s, steps, peak_lr)))
         zero_trainable_grads[
             "gpu", SMOLLM_LAYERS, SMOLVLA_EXPERT_W, EXPERT_FF, SMOLLM_DIM,
-            SMOLLM_KV_W, PAD,
+            SMOLLM_KV_W, PAD, E_R=EXPERT_R,
         ](
             opt, pol.expert, pol.action_in, pol.time_mlp_in,
             pol.time_mlp_out, pol.action_out, sp_frozen, Optional(ctx),
@@ -857,7 +968,7 @@ def main() raises:
             loss += run_one(
                 m, gr, sam, tasks, pol, st, img_col, row, images, scratch,
                 acts_t, valid_t, noise_t, times_t, x_t, u_t, ctx, ph,
-                vcache, seg,
+                vcache, seg, gx_pre,
             )
         # ⚠ Clip BEFORE the step, over the JOINT norm of the whole trainable
         # set — `optimizer_grad_clip_norm = 10` in the reference. Clipping the
@@ -866,7 +977,7 @@ def main() raises:
         var gnorm = clip_trainables["gpu"](opt, CLIP_NORM, Optional(ctx))
         adam_step_trainables[
             "gpu", SMOLLM_LAYERS, SMOLVLA_EXPERT_W, EXPERT_FF, SMOLLM_DIM,
-            SMOLLM_KV_W, PAD,
+            SMOLLM_KV_W, PAD, E_R=EXPERT_R,
         ](
             opt, pol.expert, pol.action_in, pol.time_mlp_in,
             pol.time_mlp_out, pol.action_out, sp_frozen, Optional(ctx),
@@ -897,7 +1008,7 @@ def main() raises:
                     vsum += run_one(
                         m, vgroups[vi], sam, tasks, pol, st, img_col, row,
                         images, scratch, acts_t, valid_t, noise_t, times_t,
-                        x_t, u_t, ctx, ph, vcache, seg,
+                        x_t, u_t, ctx, ph, vcache, seg, gx_pre,
                     )
             var vloss = vsum / Float64(VAL_GROUPS)
             print(
@@ -917,25 +1028,11 @@ def main() raises:
             # the final weights are not the ones worth keeping.
             var opt_sc = CheckpointScalars()
             opt.put_step_state(opt_sc, "opt")
-            save_trainables[
-                "gpu", SMOLLM_LAYERS, SMOLVLA_EXPERT_W, EXPERT_FF, SMOLLM_DIM,
-                SMOLLM_KV_W, PAD,
-            ](
-                last_ckpt, pol.expert, pol.action_in,
-                pol.time_mlp_in, pol.time_mlp_out, pol.action_out, sp_frozen,
-                True, Optional(ctx), scalars=opt_sc,
-            )
+            save_ckpt(last_ckpt, pol, sp_frozen, ctx, opt_sc)
             announce_checkpoint(last_ckpt, artifacts, run.dir)
             if vloss < best_val:
                 best_val = vloss
-                save_trainables[
-                    "gpu", SMOLLM_LAYERS, SMOLVLA_EXPERT_W, EXPERT_FF,
-                    SMOLLM_DIM, SMOLLM_KV_W, PAD,
-                ](
-                    best_ckpt, pol.expert, pol.action_in,
-                    pol.time_mlp_in, pol.time_mlp_out, pol.action_out,
-                    sp_frozen, True, Optional(ctx), scalars=opt_sc,
-                )
+                save_ckpt(best_ckpt, pol, sp_frozen, ctx, opt_sc)
                 announce_checkpoint(best_ckpt, artifacts, run.dir)
                 print("      saved " + best_ckpt)
             # ⚠ Validation ran `run_one`, which does a BACKWARD it does not
@@ -960,6 +1057,35 @@ def main() raises:
               " subset. Deploy last.ckpt, at the step count the held-out"
               " run chose.")
     print("done")
+
+
+def save_ckpt(
+    path: String,
+    mut pol: Pol,
+    mut sp_frozen: Linear[SMOLVLA_STATE_DIM, SMOLLM_DIM],
+    ctx: DeviceContext,
+    sc: CheckpointScalars,
+) raises:
+    """The trainable set to one v3 checkpoint, moments included; with text-
+    tower adapters, the tower too (`save_trainables_tower`)."""
+    comptime if TOWER_R > 0:
+        save_trainables_tower[
+            "gpu", SMOLLM_LAYERS, SMOLVLA_EXPERT_W, EXPERT_FF, SMOLLM_DIM,
+            SMOLLM_KV_W, PAD, E_R=EXPERT_R,
+        ](
+            path, pol.expert, pol.action_in, pol.time_mlp_in,
+            pol.time_mlp_out, pol.action_out, pol.tower, True, Optional(ctx),
+            scalars=sc,
+        )
+    else:
+        save_trainables[
+            "gpu", SMOLLM_LAYERS, SMOLVLA_EXPERT_W, EXPERT_FF, SMOLLM_DIM,
+            SMOLLM_KV_W, PAD, E_R=EXPERT_R,
+        ](
+            path, pol.expert, pol.action_in, pol.time_mlp_in,
+            pol.time_mlp_out, pol.action_out, sp_frozen, True, Optional(ctx),
+            scalars=sc,
+        )
 
 
 def fresh_segment(
@@ -1088,8 +1214,12 @@ def run_one(
     mut ph: Phases,
     mut vcache: VisionCache,
     mut seg: List[Float32],
+    mut gx_pre: Tensor,
 ) raises -> Float64:
     """One observation: its prefix, its interpolant, one denoising step.
+    With text-tower adapters, also the prefill's backward from the cache
+    gradient the expert's backward left in `st`, which forms their
+    gradients.
 
     ⚠ The timers split HOST from DEVICE, and they can only be read that way
     because each phase ENDS in a synchronisation: `fill_store_images`
@@ -1164,6 +1294,11 @@ def run_one(
         pol.time_mlp_out, pol.action_out, x_t, u_t, valid_t, gr.total_valid,
         Optional(ctx),
     )
+    comptime if TOWER_R > 0:
+        pol.prefill.backward["gpu"](
+            pol.tower, st.pool[Step.GCK], st.pool[Step.GCV], gx_pre,
+            Optional(ctx),
+        )
     ph.step += Int(perf_counter_ns() - t_step)
     ph.n += B
     return l

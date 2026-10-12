@@ -357,6 +357,12 @@ struct ParamVersionBump(ParamVisitor, ParamVisitorRT):
         apply_decay: Bool,
         ctx: Optional[DeviceContext],
     ) raises:
+        # A frozen param (empty gradient) is never written by an optimizer,
+        # so its value did not change and neither does its version: a bump
+        # would only make `Linear` rebuild a padded or bf16 copy of a weight
+        # that is the same as before, every step (LoRA's frozen bases).
+        if grad.n == 0:
+            return
         param.version += 1
 
     def visit[target: StaticString, N: Int](

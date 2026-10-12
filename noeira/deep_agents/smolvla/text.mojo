@@ -32,7 +32,7 @@ from max.gpu.host import DeviceContext
 
 from noeira.nn.constants import DT
 from noeira.nn.core.initializer import Initializer
-from noeira.nn.core.param import ParamVisitor
+from noeira.nn.core.param import ParamVisitor, ParamWalkable
 from noeira.nn.core.walkers import join_name
 from noeira.nn.primitives.rms_norm import RMSNorm
 from .layer_weights import DecoderLayerWeights, SmolNorm
@@ -57,7 +57,7 @@ struct SmolVLMTextLayers[
     FF: Int = SMOLLM_FF,
     KVW: Int = SMOLLM_KV_W,
     LORA_R: Int = 0,
-](Movable):
+](ParamWalkable):
     """16 layers plus the final norm, walked under the checkpoint's index.
 
     `KV_IN == W`: every VLM layer projects K/V from its own stream. (The expert
@@ -102,3 +102,47 @@ struct SmolVLMTextLayers[
         self.norm.for_each_param[target](
             vis, ctx, join_name(prefix, String("norm"))
         )
+
+    def for_each_base_param[
+        target: StaticString, V: ParamVisitor
+    ](mut self, mut vis: V, ctx: Optional[DeviceContext],
+      prefix: String = String("")) raises:
+        """`for_each_param` without the LoRA adapters: what the checkpoint's
+        name map describes (`SmolVLAPolicy.load`) and what freezing the
+        backbone freezes. The same walk as `for_each_param` at `LORA_R = 0`."""
+        for i in range(Self.LAYERS):
+            self.layers[i].walk[target, V, False](
+                vis, ctx, join_name(prefix, String("layers." + String(i)))
+            )
+        self.norm.for_each_param[target](
+            vis, ctx, join_name(prefix, String("norm"))
+        )
+
+    def zero_grad[
+        target: StaticString
+    ](mut self, ctx: Optional[DeviceContext]) raises:
+        """⚠ The SAME layers and norm as `for_each_param`. A frozen param has
+        nothing to zero, so on a frozen tower this zeroes the adapters only."""
+        for i in range(Self.LAYERS):
+            self.layers[i].zero_grad[target](ctx)
+        self.norm.zero_grad[target](ctx)
+
+    def for_each_state[
+        target: StaticString, V: ParamVisitor
+    ](mut self, mut vis: V, ctx: Optional[DeviceContext],
+      prefix: String = String("")) raises:
+        """The State walk, in the SAME order as `for_each_param`. No leaf here
+        holds State; `ParamWalkable` (the optimizer arena, the checkpoints)
+        asks for the walk, which LoRA on the tower needs."""
+        for i in range(Self.LAYERS):
+            self.layers[i].walk_state[target](
+                vis, ctx, join_name(prefix, String("layers." + String(i)))
+            )
+        self.norm.for_each_state[target](
+            vis, ctx, join_name(prefix, String("norm"))
+        )
+
+    def set_lora_alpha(mut self, alpha: Float64):
+        """PEFT's `lora_alpha` for every adapter; nothing at `LORA_R = 0`."""
+        for i in range(Self.LAYERS):
+            self.layers[i].set_lora_alpha(alpha)

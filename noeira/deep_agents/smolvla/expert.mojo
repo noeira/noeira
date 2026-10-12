@@ -146,6 +146,34 @@ struct SmolVLAExpert[
             vis, ctx, join_name(prefix, String("norm"))
         )
 
+    def for_each_base_param[
+        target: StaticString, V: ParamVisitor
+    ](mut self, mut vis: V, ctx: Optional[DeviceContext],
+      prefix: String = String("")) raises:
+        """`for_each_param` without the LoRA adapters: what the checkpoint's
+        name map describes (`SmolVLAPolicy.load`) and what freezing the base
+        for LoRA training freezes. The same walk at `LORA_R = 0`."""
+        for i in range(Self.LAYERS):
+            var name = join_name(prefix, String("layers." + String(i)))
+            if Self.is_self_layer(i):
+                self.self_layers[i // Self.SELF_EVERY].walk[target, V, False](
+                    vis, ctx, name
+                )
+            else:
+                self.cross_layers[i // Self.SELF_EVERY].walk[target, V, False](
+                    vis, ctx, name
+                )
+        self.norm.for_each_param[target](
+            vis, ctx, join_name(prefix, String("norm"))
+        )
+
+    def set_lora_alpha(mut self, alpha: Float64):
+        """PEFT's `lora_alpha` for every adapter; nothing at `LORA_R = 0`."""
+        for i in range(Self.N_SELF):
+            self.self_layers[i].set_lora_alpha(alpha)
+        for i in range(Self.N_CROSS):
+            self.cross_layers[i].set_lora_alpha(alpha)
+
     def zero_grad[
         target: StaticString
     ](mut self, ctx: Optional[DeviceContext]) raises:

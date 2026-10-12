@@ -13,3 +13,4 @@ tests/nn/peft/test_lora_gpu.mojo
 tests/nn/peft/test_peft_io.mojo
 tests/deep_agents/smolvla/test_lora_wiring.mojo
 tests/deep_agents/smolvla/test_lora_wiring_gpu.mojo
+tests/deep_agents/smolvla/test_finetune_lora.mojo

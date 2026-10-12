@@ -34,6 +34,11 @@ parameters and expose them by name; the loop that drives them lives in
 after every linear's `forward` / `vjp`; at `LORA_R = 0`, the default, the
 adapters are never built or walked and both calls compile to nothing, so the
 type, its walk and every checkpoint are what they were.
+
+`walk[..., WITH_LORA=False]` walks the base parameters only: what the
+checkpoint name maps describe (`SmolVLAPolicy.load`) and what freezing the
+base for LoRA training freezes. The default walk, the optimizers' and the
+checkpoints', includes the adapters.
 """
 
 from max.gpu.host import DeviceContext
@@ -110,20 +115,27 @@ struct DecoderMLP[W: Int, FF: Int, LORA_R: Int = 0](Movable):
         return m^
 
     def walk[
-        target: StaticString, V: ParamVisitor
+        target: StaticString, V: ParamVisitor, WITH_LORA: Bool = True
     ](mut self, mut v: V, ctx: Optional[DeviceContext], prefix: String) raises:
+        comptime LORA = Self.LORA_R > 0 and WITH_LORA
         var g = join_name(prefix, String("gate"))
         var u = join_name(prefix, String("up"))
         var d = join_name(prefix, String("down"))
         self.gate.for_each_param[target](v, ctx, g)
-        comptime if Self.LORA_R > 0:
+        comptime if LORA:
             self.gate_lora.walk[target](v, ctx, g)
         self.up.for_each_param[target](v, ctx, u)
-        comptime if Self.LORA_R > 0:
+        comptime if LORA:
             self.up_lora.walk[target](v, ctx, u)
         self.down.for_each_param[target](v, ctx, d)
-        comptime if Self.LORA_R > 0:
+        comptime if LORA:
             self.down_lora.walk[target](v, ctx, d)
+
+    def set_lora_alpha(mut self, alpha: Float64):
+        """PEFT's `lora_alpha` for the three adapters; nothing at R = 0."""
+        self.gate_lora.alpha = alpha
+        self.up_lora.alpha = alpha
+        self.down_lora.alpha = alpha
 
     def zero_grad[
         target: StaticString
@@ -231,9 +243,10 @@ struct DecoderLayerWeights[
         return l^
 
     def walk[
-        target: StaticString, V: ParamVisitor
+        target: StaticString, V: ParamVisitor, WITH_LORA: Bool = True
     ](mut self, mut vis: V, ctx: Optional[DeviceContext],
       prefix: String) raises:
+        comptime LORA = Self.LORA_R > 0 and WITH_LORA
         self.input_layernorm.for_each_param[target](
             vis, ctx, join_name(prefix, String("input_layernorm"))
         )
@@ -243,21 +256,31 @@ struct DecoderLayerWeights[
         var nv = join_name(sa, String("v"))
         var no = join_name(sa, String("o"))
         self.q.for_each_param[target](vis, ctx, nq)
-        comptime if Self.LORA_R > 0:
+        comptime if LORA:
             self.q_lora.walk[target](vis, ctx, nq)
         self.k.for_each_param[target](vis, ctx, nk)
-        comptime if Self.LORA_R > 0:
+        comptime if LORA:
             self.k_lora.walk[target](vis, ctx, nk)
         self.v.for_each_param[target](vis, ctx, nv)
-        comptime if Self.LORA_R > 0:
+        comptime if LORA:
             self.v_lora.walk[target](vis, ctx, nv)
         self.o.for_each_param[target](vis, ctx, no)
-        comptime if Self.LORA_R > 0:
+        comptime if LORA:
             self.o_lora.walk[target](vis, ctx, no)
         self.post_attention_layernorm.for_each_param[target](
             vis, ctx, join_name(prefix, String("post_attention_layernorm"))
         )
-        self.mlp.walk[target](vis, ctx, join_name(prefix, String("mlp")))
+        self.mlp.walk[target, V, WITH_LORA](
+            vis, ctx, join_name(prefix, String("mlp"))
+        )
+
+    def set_lora_alpha(mut self, alpha: Float64):
+        """PEFT's `lora_alpha` for the seven adapters; nothing at R = 0."""
+        self.q_lora.alpha = alpha
+        self.k_lora.alpha = alpha
+        self.v_lora.alpha = alpha
+        self.o_lora.alpha = alpha
+        self.mlp.set_lora_alpha(alpha)
 
     def zero_grad[
         target: StaticString
