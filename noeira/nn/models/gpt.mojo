@@ -104,8 +104,10 @@ comptime GPT[
 # Three nanoGPT dropout points: (1) after token+position embedding, (2) after
 # MHA's output projection, (3) after the FFN's output projection. Within a
 # block MHA-dropout uses seed_base+1, FFN-dropout seed_base+2, input dropout
-# seed_base+0 (Repeat reuses one block type → seeds correlated across depth,
-# same as legacy; the per-forward counter still refreshes them each step).
+# seed_base+0. Repeat reuses one block type, so every block has the same
+# seeds; `Repeat.make` puts block L's dropouts on Philox subsequence L, so
+# the blocks draw independent masks (until 2026-10-12 every block drew the
+# SAME masks — `tests/nn/test_dropout_repeat_copies.mojo`).
 
 
 comptime MultiHeadAttentionDrop[

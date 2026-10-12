@@ -10,7 +10,8 @@ the same trainer code; only the strategy type differs. Checked against DDP:
     with the same kernels on the same windows and dropout masks, every
     reduction sums the ranks in the same order, and Adam is elementwise.
   - DDP's two replicas end equal, the run trains (non-vacuous), and each
-    rank's replica is on its own dropout stream.
+    rank's replica is on its own dropout stream, with each block on its own
+    `Repeat` copy (Philox subsequence).
 
 And, on the model alone: `set_attr["rng_stream"](1)` reaches the GPT's
 dropouts and moves their masks, while stream 0 is the default sequence.
@@ -110,6 +111,19 @@ def _train[S: ShardingStrategy](ctx: DeviceContext, text: String) raises -> _Run
             gpt.children[2].stream_base == UInt64(r) << 48,
             "rank " + String(r) + " is not on its own dropout stream",
         )
+        for L in range(LAYERS):
+            # Block L's attention-out dropout, through the block's GradReady
+            # (`.inner`): rank r's stream, and `Repeat` copy L's subsequence.
+            ref d = (
+                gpt.children[3].children[L].inner.children[0]
+                .inner.children[1].children[3]
+            )
+            assert_true(
+                d.stream_base == UInt64(r) << 48
+                and d.subsequence == UInt64(L),
+                "rank " + String(r) + " block " + String(L)
+                + ": dropout not on its rank's stream and its block's copy",
+            )
     var out = _Run()
     for it in range(K):
         tr.train_step(it)

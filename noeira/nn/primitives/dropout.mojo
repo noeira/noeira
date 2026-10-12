@@ -27,6 +27,15 @@ The seed is a type parameter, so data-parallel replicas of one model would
 otherwise draw the same masks on different rows; a distributed trainer puts
 rank r on stream r. Stream 0 is the unchanged sequence.
 
+Copies (`set_attr["rng_copy"](i)`, sent by `Repeat.make` to its copy i):
+every draw uses Philox subsequence i. The copies of a repeated block share
+one type, hence one SEED, and with the same counter they drew the SAME mask
+at every forward (every GPT block dropped the same entries until
+2026-10-12). Subsequence 0 (copy 0, and every dropout outside a `Repeat`)
+is the unchanged sequence. The attr appends 16 bits, so the copies of a
+nested `Repeat` stay distinct (the outer index lands in the low bits: the
+outer `make` runs after the inner one).
+
 Math note (carried verbatim): mask = scale if u >= p else 0, with
 scale = 1/(1-p), threshold = p, u ~ U(0,1) from PhiloxRandom.step_uniform().
 
@@ -59,11 +68,12 @@ from ..core.amp import AMPPolicy, NoAMP
 
 
 # ──────────────────────────────────────────────────────────────────────
-# GPU kernels — flat 1-D launch over BATCH·DIM. PhiloxRandom seeded with
-# the per-layer SEED and offset (base_offset + idx) so each (forward,
-# lane) pair has a fresh seed. Carried VERBATIM from legacy, except the
-# train kernel reads `base_offset` from a 1-elem device buffer (storage
-# RNG idiom) instead of a baked scalar arg.
+# GPU kernels — flat 1-D launch over BATCH·DIM. PhiloxRandom keyed by the
+# type's SEED, on the instance's subsequence (its `Repeat` copy), at offset
+# (stream_base + base_offset + idx), so each (forward, lane) pair draws a
+# fresh number. Carried VERBATIM from legacy, except the train kernel reads
+# `base_offset` from a 1-elem device buffer (storage RNG idiom) instead of a
+# baked scalar arg, and the stream and subsequence arguments.
 #
 # Dtype-parametric (`ADT`): the fp32 path runs the mask-apply at DT, the
 # bf16-flow path at bfloat16 (input/output/mask all bf16). The RNG draw +
@@ -82,13 +92,16 @@ def _dropout_train_forward_kernel[
     threshold: Scalar[DT],
     scale: Scalar[DT],
     stream_base: UInt64,
+    subsequence: UInt64,
 ):
     var idx = Int(block_dim.x * block_idx.x + thread_idx.x)
     if idx >= N:
         return
     var base_offset = rebind[UInt64](offset_buf[0])
     var rng = PhiloxRandom(
-        seed=SEED, offset=stream_base + base_offset + UInt64(idx),
+        seed=SEED,
+        subsequence=subsequence,
+        offset=stream_base + base_offset + UInt64(idx),
     )
     var rand = Scalar[DT](rng.step_uniform()[0])
     var mask: Scalar[DT] = scale if rand >= threshold else Scalar[DT](0.0)
@@ -148,6 +161,9 @@ struct Dropout[
     var call_counter: UInt64  # host CPU Philox counter (legacy slot 0)
     var stream_base: UInt64
     """Added to every draw's Philox offset: `rng_stream << 48` (0 = default)."""
+    var subsequence: UInt64
+    """Every draw's Philox subsequence: the `Repeat` copy this dropout sits in
+    (`rng_copy`; 0 = the first copy, or not repeated)."""
     # [BATCH, DIM] scaled mask (0 or 1/(1-p)) — an ACTIVATION → stored at the
     # flow dtype `Self.ADT` (bf16 in the bf16-flow path).
     var cache_mask: TensorImpl[Self.ADT]
@@ -157,6 +173,7 @@ struct Dropout[
         self.training = True
         self.call_counter = 0
         self.stream_base = 0
+        self.subsequence = 0
         self.cache_mask = TensorImpl[Self.ADT]()
         self.noise_offset = TensorImpl[DType.uint64]()
 
@@ -200,6 +217,10 @@ struct Dropout[
         elif ATTR == "rng_stream":
             # A rank index: an integer far below fp32's 2^24.
             self.stream_base = UInt64(Int(value)) << 48
+        elif ATTR == "rng_copy":
+            # A `Repeat` copy index (< 2^16), appended below the copy
+            # indices of any `Repeat` nested inside that copy.
+            self.subsequence = (self.subsequence << 16) | UInt64(Int(value))
 
     def set_seed(mut self) raises:
         """Reset the per-instance RNG counters to the start of the stream."""
@@ -255,6 +276,7 @@ struct Dropout[
                         var idx = b * Self.DIM_ + i
                         var rng = PhiloxRandom(
                             seed=Self.SEED,
+                            subsequence=self.subsequence,
                             offset=base_offset + UInt64(idx),
                         )
                         var rand = Scalar[DT](rng.step_uniform()[0])
@@ -293,6 +315,7 @@ struct Dropout[
                     threshold,
                     scale,
                     self.stream_base,
+                    self.subsequence,
                     grid_dim=n_blocks,
                     block_dim=TPB,
                 )
@@ -334,6 +357,7 @@ struct Dropout[
                 threshold,
                 scale,
                 self.stream_base,
+                self.subsequence,
                 grid_dim=n_blocks,
                 block_dim=TPB,
             )

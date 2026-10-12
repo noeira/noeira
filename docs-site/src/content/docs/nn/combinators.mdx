@@ -68,7 +68,9 @@ comptime Block = Residual[Sequential[Linear[D, D], ReLU[D], Linear[D, D]]]
 ```
 
 **`Repeat[M, N]`** — `N` independent copies in sequence. Each gets its own
-parameters; the count is compile-time, so there is no runtime loop.
+parameters and its own random stream (a `Dropout` in the block draws a
+different mask in each copy); the count is compile-time, so there is no
+runtime loop.
 
 ```mojo
 comptime Trunk = Repeat[6, Block]      # six residual blocks

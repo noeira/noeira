@@ -27,3 +27,7 @@ tests/nn/test_linear_relu_gpu.mojo
 tests/nn/test_conv2d_gpu.mojo
 tests/nn/test_polyak_and_copy_sync.mojo
 tests/nn/test_feed_forward_gelu.mojo
+
+# --- dropout: the masks, and every Repeat copy (every GPT block) on its own ---
+tests/nn/test_dropout_storage.mojo
+tests/nn/test_dropout_repeat_copies.mojo

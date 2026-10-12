@@ -9,11 +9,13 @@ backward REDRAWS it from the counter the forward used — no mask cache — and
 CPU and GPU draw identical masks.
 
 Why not `Dropout`: its seed is a comptime parameter, so the copies of a block
-inside `Repeat` / `RepeatConditional` would all draw the SAME mask; and it is
-switched by `"training"`, the attribute BatchNorm uses, so a BN in train mode
-could not run beside a dropout that is off. Here the seed is drawn per
-instance at construction (`std.random`) and the switch is `"dropout"` (0/1),
-ON by default. (The counter lives on the host: not CUDA-graph capturable.)
+inside `RepeatConditional` would all draw the SAME mask (`Repeat` gives each
+copy its own Philox subsequence since 2026-10-12; `RepeatConditional` does
+not); and it is switched by `"training"`, the attribute BatchNorm uses, so a
+BN in train mode could not run beside a dropout that is off. Here the seed
+is drawn per instance at construction (`std.random`) and the switch is
+`"dropout"` (0/1), ON by default. (The counter lives on the host: not
+CUDA-graph capturable.)
 """
 
 from max.gpu import global_idx
