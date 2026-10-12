@@ -642,6 +642,19 @@ def _max_abs_diff(a: List[Scalar[DT]], b: List[Scalar[DT]]) -> Float64:
     return m
 
 
+def _print_loss_steps(a: List[Float64], b: List[Float64], label: String):
+    """The DDP gate's per-step sample, plus the step of the largest gap: a
+    gap that grows from rounding shows as a curve, one wrong step as a jump."""
+    var worst = 0
+    for i in range(len(a)):
+        if abs(a[i] - b[i]) > abs(a[worst] - b[worst]):
+            worst = i
+    print("  per-step loss " + label + ":")
+    for i in range(len(a)):
+        if i < 3 or i % 5 == 4 or i == worst:
+            print("    step", i, a[i], b[i], " diff", a[i] - b[i])
+
+
 def main() raises:
     var text = load_text()
     var tok = CharTokenizer(text)
@@ -727,6 +740,7 @@ def main() raises:
         print("  max|loss DDP - ZeRO| =", dl, " max|param DDP - ZeRO| =", dzp)
         print("  ZeRO replica agreement =", drep)
         print("  state bytes/rank: DDP", d.state_bytes, " ZeRO-" + String(ZERO), z.state_bytes)
+        _print_loss_steps(d.losses, z.losses, "DDP / ZeRO-" + String(ZERO))
         if drep != 0.0:
             raise Error("ZERO GATE FAIL: replicas drifted apart")
         comptime if is_defined["NO_CLIP"]():
@@ -765,6 +779,7 @@ def main() raises:
         print("  max|loss DDP - ZeRO1| =", dl, " max|param DDP - ZeRO1| =", dzp)
         print("  ZeRO-1 replica agreement =", drep)
         print("  state bytes/rank: DDP", d.state_bytes, " ZeRO-1", z.state_bytes)
+        _print_loss_steps(d.losses, z.losses, "DDP / ZeRO-1")
         if drep != 0.0:
             raise Error("ZERO GATE FAIL: replicas drifted apart")
         print("GPT ZERO-1 GATE done")
