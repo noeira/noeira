@@ -61,7 +61,9 @@ from max.gpu.host import DeviceContext, DeviceBuffer
 from layout import Coord, Idx, TileTensor, row_major
 from linalg.utils_gpu import MatmulConfig
 
-from quantization.qmatmul_gpu import gpu_qint4_repack_Q4_0, multistage_gemm_q
+from quantization.qmatmul_gpu import (
+    gpu_qint4_repack_Q4_0, multistage_gemm_q, q_smem_usage,
+)
 
 
 comptime GS = 32
@@ -93,6 +95,16 @@ comptime SMALL2 = Cfg(
     block_tile_shape=Index(64, 128, 32), warp_tile_shape=Index(64, 64, 32),
     num_pipeline_stages=4, num_k_partitions=1, num_warp_k_partitions=2,
 )
+comptime SMALL4_S3 = Cfg(
+    block_tile_shape=Index(64, 128, 32), warp_tile_shape=Index(64, 64, 32),
+    num_pipeline_stages=3, num_k_partitions=1, num_warp_k_partitions=4,
+)
+"""SMALL4 with 3 stages: what MAX's own shared-memory fallback would pick if
+its budget were the per-block limit. On an RTX 5090 SMALL4 needs 102,400 bytes
+of dynamic shared memory; MAX's table gives consumer Blackwell 100 KB "per
+multiprocessor", so `multistage_gemm_q` does not fall back, and the driver
+refuses the kernel (per-block opt-in max on sm_120 is 101,376 bytes: CUDA
+reserves 1 KB per block). The Orin's 163 KB never met it."""
 comptime LARGE = Cfg(
     block_tile_shape=Index(128, 128, 32), warp_tile_shape=Index(64, 64, 32),
     num_pipeline_stages=5, num_k_partitions=1, num_warp_k_partitions=1,
@@ -112,14 +124,34 @@ struct Verdict(Copyable, Movable):
     var rel: Float64
     var nans: Int
     var us: Float64
+    var error: String
+    """Non-empty when the kernel did not load or launch."""
 
     def __init__(out self, rel: Float64, nans: Int, us: Float64):
         self.rel = rel
         self.nans = nans
         self.us = us
+        self.error = String("")
+
+    def __init__(out self, *, error: String):
+        self.rel = -1.0
+        self.nans = 0
+        self.us = 0.0
+        self.error = error
 
     def ok(self) -> Bool:
-        return self.nans == 0 and self.rel < TOL
+        return self.error == "" and self.nans == 0 and self.rel < TOL
+
+
+def try_cfg[N: Int, K: Int, CFG: Cfg](
+    ctx: DeviceContext, bpk_d: DeviceBuffer[DType.uint8],
+    M: Int, ref a_h: List[BFloat16], ref c_ref: List[Float32],
+) -> Verdict:
+    """`run_cfg`, with a load or launch failure reported instead of fatal."""
+    try:
+        return run_cfg[N, K, CFG](ctx, bpk_d, M, a_h, c_ref)
+    except e:
+        return Verdict(error=String(e))
 
 
 def run_cfg[N: Int, K: Int, CFG: Cfg](
@@ -175,6 +207,8 @@ def run_cfg[N: Int, K: Int, CFG: Cfg](
 
 
 def _cell(v: Verdict, expect_ok: Bool, mut refuted: Int) -> String:
+    if v.error != "":
+        return "LAUNCH FAILED: " + v.error
     var got = "OK" if v.ok() else "WRONG"
     var want = "OK" if expect_ok else "WRONG"
     if v.ok() != expect_ok:
@@ -237,13 +271,16 @@ def run_shape[N: Int, K: Int](
                 for k in range(K):
                     acc += Float64(ap[m * K + k].cast[DType.float32]()) * Float64(wp[n * K + k])
                 c_ref.append(Float32(acc))
-        var v4 = run_cfg[N, K, SMALL4](ctx, bpk_d, M, a_h, c_ref)
-        var v2 = run_cfg[N, K, SMALL2](ctx, bpk_d, M, a_h, c_ref)
-        var vl = run_cfg[N, K, LARGE](ctx, bpk_d, M, a_h, c_ref)
+        # The configs that load first; noeira's warp-K 4 one last.
+        var v2 = try_cfg[N, K, SMALL2](ctx, bpk_d, M, a_h, c_ref)
+        var vl = try_cfg[N, K, LARGE](ctx, bpk_d, M, a_h, c_ref)
+        var v3 = try_cfg[N, K, SMALL4_S3](ctx, bpk_d, M, a_h, c_ref)
+        var v4 = try_cfg[N, K, SMALL4](ctx, bpk_d, M, a_h, c_ref)
         print("    M=", M, sep="")
-        print("      small-M warp-K 4 (noeira's)  ", _cell(v4, p4, refuted))
-        print("      small-M warp-K 2             ", _cell(v2, p2, refuted))
+        print("      small-M warp-K 2, 4 stages   ", _cell(v2, p2, refuted))
         print("      large-M warp-K 1 (noeira's)  ", _cell(vl, pl, refuted))
+        print("      small-M warp-K 4, 3 stages   ", _cell(v3, p4, refuted))
+        print("      small-M warp-K 4 (noeira's)  ", _cell(v4, p4, refuted))
     _ = b_h^  # the reference read through `bp`: keep the host buffer alive
 
 
@@ -256,6 +293,11 @@ def main() raises:
     var ctx = DeviceContext()
     print("MAX multistage_gemm_q (Q4_0, g32) at SmolVLA's text shapes, on",
           ctx.name())
+    print("dynamic shared memory per block (bytes): small-M warp-K 4",
+          q_smem_usage[SMALL4, GS](), "| 3 stages", q_smem_usage[SMALL4_S3, GS](),
+          "| warp-K 2", q_smem_usage[SMALL2, GS](), "| large-M",
+          q_smem_usage[LARGE, GS](), "| MAX's budget",
+          ctx.default_device_info.shared_memory_per_multiprocessor)
     var refuted = 0
     # predictions: (small-M warp-K 4, small-M warp-K 2, large-M) right?
     comptime if not UNPADDED:
