@@ -21,6 +21,12 @@ LayoutTensor passed via `lt_gpu`, NO raw ptr); after the draw the offset is
 advanced with the shared `advance_rng_offset_kernel`. That keeps the device
 offset capture-friendly and the surface unsafe_ptr-free.
 
+Streams (`set_attr["rng_stream"](k)`, default 0): every draw's Philox offset
+is moved by `k << 48`, so stream k's masks are independent of stream 0's.
+The seed is a type parameter, so data-parallel replicas of one model would
+otherwise draw the same masks on different rows; a distributed trainer puts
+rank r on stream r. Stream 0 is the unchanged sequence.
+
 Math note (carried verbatim): mask = scale if u >= p else 0, with
 scale = 1/(1-p), threshold = p, u ~ U(0,1) from PhiloxRandom.step_uniform().
 
@@ -75,13 +81,14 @@ def _dropout_train_forward_kernel[
     offset_buf: LayoutTensor[DType.uint64, Layout.row_major(1), MutAnyOrigin],
     threshold: Scalar[DT],
     scale: Scalar[DT],
+    stream_base: UInt64,
 ):
     var idx = Int(block_dim.x * block_idx.x + thread_idx.x)
     if idx >= N:
         return
     var base_offset = rebind[UInt64](offset_buf[0])
     var rng = PhiloxRandom(
-        seed=SEED, offset=base_offset + UInt64(idx),
+        seed=SEED, offset=stream_base + base_offset + UInt64(idx),
     )
     var rand = Scalar[DT](rng.step_uniform()[0])
     var mask: Scalar[DT] = scale if rand >= threshold else Scalar[DT](0.0)
@@ -139,6 +146,8 @@ struct Dropout[
     # Runtime state.
     var training: Bool
     var call_counter: UInt64  # host CPU Philox counter (legacy slot 0)
+    var stream_base: UInt64
+    """Added to every draw's Philox offset: `rng_stream << 48` (0 = default)."""
     # [BATCH, DIM] scaled mask (0 or 1/(1-p)) — an ACTIVATION → stored at the
     # flow dtype `Self.ADT` (bf16 in the bf16-flow path).
     var cache_mask: TensorImpl[Self.ADT]
@@ -147,6 +156,7 @@ struct Dropout[
     def __init__(out self):
         self.training = True
         self.call_counter = 0
+        self.stream_base = 0
         self.cache_mask = TensorImpl[Self.ADT]()
         self.noise_offset = TensorImpl[DType.uint64]()
 
@@ -187,6 +197,9 @@ struct Dropout[
         """
         comptime if ATTR == "training":
             self.training = value != Scalar[DT](0.0)
+        elif ATTR == "rng_stream":
+            # A rank index: an integer far below fp32's 2^24.
+            self.stream_base = UInt64(Int(value)) << 48
 
     def set_seed(mut self) raises:
         """Reset the per-instance RNG counters to the start of the stream."""
@@ -234,7 +247,9 @@ struct Dropout[
                 var scale = Scalar[DT](1.0 / (1.0 - Self.p))
                 var threshold = Scalar[DT](Self.p)
                 var zero = Scalar[DT](0.0)
-                var base_offset = self.call_counter * UInt64(N)
+                var base_offset = (
+                    self.stream_base + self.call_counter * UInt64(N)
+                )
                 for b in range(B):
                     for i in range(Self.DIM_):
                         var idx = b * Self.DIM_ + i
@@ -277,6 +292,7 @@ struct Dropout[
                     self.noise_offset.lt["gpu", loff](),
                     threshold,
                     scale,
+                    self.stream_base,
                     grid_dim=n_blocks,
                     block_dim=TPB,
                 )
@@ -317,6 +333,7 @@ struct Dropout[
                 self.noise_offset.lt["gpu", loff](),
                 threshold,
                 scale,
+                self.stream_base,
                 grid_dim=n_blocks,
                 block_dim=TPB,
             )

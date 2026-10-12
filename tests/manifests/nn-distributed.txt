@@ -22,3 +22,7 @@ tests/nn/distributed/test_overlap.mojo
 # --- the GPT with marked blocks ---
 tests/nn/distributed/test_gpt_marked.mojo
 tests/nn/distributed/test_gpt_zero.mojo
+
+# --- the trainer over ShardingStrategy ---
+tests/nn/distributed/test_dist_trainer_single.mojo
+tests/nn/distributed/test_dist_trainer_strategies.mojo

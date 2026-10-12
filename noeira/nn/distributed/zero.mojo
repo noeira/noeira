@@ -28,6 +28,10 @@ Memory per GPU (fp32, Ψ = arena elements):
 Out of scope here: checkpoints (per-parameter moment views no longer exist;
 `_MomentPlacer` is not run), the device LR schedule, and AMP's bf16 weight
 caches beyond the version bump.
+
+As a `ShardingStrategy` (strategy.mojo), the gradient half of the step is
+`forward_backward(bodies)`: `zero_grad`, every rank's body, then
+`reduce_scatter_grads`.
 """
 
 from max.gpu.host import DeviceBuffer, DeviceContext
@@ -53,6 +57,8 @@ from .process_group import (
     shard_rows,
     scale_copy,
 )
+from .fibers import RankStep
+from .strategy import ShardingStrategy, check_bodies
 
 from std.math import sqrt
 from max.gpu import global_idx, thread_idx
@@ -150,7 +156,11 @@ struct _Shard(Movable):
         self.norm = Tensor.alloc_gpu(c, 1)
 
 
-struct Zero1[M: Module, N: Int](Movable):
+struct Zero1[M: Module, N: Int](Movable, ShardingStrategy):
+    comptime Net = Self.M
+    comptime RANKS = Self.N
+    comptime REPLICATED = True
+
     var pg: ProcessGroup[Self.N]
     var nets: List[Self.M]
     var arenas: List[ParamArena]
@@ -234,8 +244,15 @@ struct Zero1[M: Module, N: Int](Movable):
             lr, beta1, beta2, eps, wd,
         )
 
+    @staticmethod
+    def name() -> String:
+        return String("ZeRO-1")
+
     def ctx(self, r: Int) -> DeviceContext:
         return self.pg.ctx(r)
+
+    def net(mut self, r: Int) -> ref[MutAnyOrigin] Self.M:
+        return self.nets[r]
 
     def sync_params(mut self) raises:
         """Copy rank 0's whole parameter arena to every rank."""
@@ -247,6 +264,22 @@ struct Zero1[M: Module, N: Int](Movable):
     def zero_grad(mut self) raises:
         for r in range(Self.N):
             self.arenas[r].zero_grad(self.pg.ctx(r))
+
+    def forward_backward[B: RankStep](mut self, mut bodies: List[B]) raises:
+        """`zero_grad`, every rank's body (forward, loss, vjp) rank by rank,
+        then `reduce_scatter_grads`: each rank holds its shard of the mean
+        gradient."""
+        check_bodies(len(bodies), Self.N, "Zero1.forward_backward")
+        self.zero_grad()
+        for r in range(Self.N):
+            bodies[r].run_rank(r)
+        self.reduce_scatter_grads()
+
+    def forward_only[B: RankStep](mut self, mut bodies: List[B]) raises:
+        """Every rank's body, rank by rank (each rank holds every weight)."""
+        check_bodies(len(bodies), Self.N, "Zero1.forward_only")
+        for r in range(Self.N):
+            bodies[r].run_rank(r)
 
     def reduce_scatter_grads(mut self) raises:
         """`gshard_r = (1/N) * sum_k grd_k[shard r]` on every rank.

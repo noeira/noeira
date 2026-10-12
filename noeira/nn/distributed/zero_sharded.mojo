@@ -64,6 +64,13 @@ collectives with `_stream_barrier`. `forward_backward` and `step` add one
 barrier each at the boundary where a rank's shard is read by peers (gathers)
 and then overwritten (Adam).
 
+Forward only (eval, generation: `forward_only(bodies)`). ZeRO-2 holds the
+replicated weights, so the bodies run rank by rank with no collective.
+ZeRO-3 holds no full copy of the weights anywhere, so its forward is
+collective: the bodies run on `RankFibers` and every unit's weights are
+gathered at its pre-forward hook, as in the training step, with no
+reduce-scatter.
+
 Limits: a tied parameter must sit in one unit (the GPT's sit in the root);
 one vjp per unit per step (no micro-batch accumulation: the slot is zeroed
 and scattered each time); collectives run on the main streams (no comm-stream
@@ -111,6 +118,7 @@ from .fibers import (
     fibers_active,
     fiber_current,
 )
+from .strategy import ShardingStrategy, check_bodies
 
 
 # ── walks ────────────────────────────────────────────────────────────────────
@@ -262,7 +270,11 @@ def _zero_hook[
         z[]._zero_gslot(unit, rank)
 
 
-struct ZeroSharded[M: Module, N: Int, STAGE: Int](Movable):
+struct ZeroSharded[M: Module, N: Int, STAGE: Int](Movable, ShardingStrategy):
+    comptime Net = Self.M
+    comptime RANKS = Self.N
+    comptime REPLICATED = Self.STAGE == 2
+
     var pg: ProcessGroup[Self.N]
     var nets: List[Self.M]
     var rs: List[_RankState]
@@ -333,7 +345,24 @@ struct ZeroSharded[M: Module, N: Int, STAGE: Int](Movable):
         beta2: Scalar[DT] = 0.999,
         eps: Scalar[DT] = 1e-8,
         wd: Scalar[DT] = 0.0,
-        slots: Int = 1,
+    ) raises -> Self:
+        """`make` with one unit slot (the `ShardingStrategy` signature)."""
+        return Self.make[INIT](
+            pg^, lr, beta1=beta1, beta2=beta2, eps=eps, wd=wd, slots=1
+        )
+
+    @staticmethod
+    def make[
+        INIT: Initializer
+    ](
+        var pg: ProcessGroup[Self.N],
+        lr: Scalar[DT],
+        beta1: Scalar[DT] = 0.9,
+        beta2: Scalar[DT] = 0.999,
+        eps: Scalar[DT] = 1e-8,
+        wd: Scalar[DT] = 0.0,
+        *,
+        slots: Int,
     ) raises -> Self:
         """One replica per rank, with its own standalone parameters. Do any
         per-replica surgery (scaled init, weight tying), then `sync_params`,
@@ -348,8 +377,15 @@ struct ZeroSharded[M: Module, N: Int, STAGE: Int](Movable):
             nets.append(Self.M.make["gpu", INIT](Optional(pg.ctx(r))))
         return Self(pg^, nets^, slots, lr, beta1, beta2, eps, wd)
 
+    @staticmethod
+    def name() -> String:
+        return String("ZeRO-", Self.STAGE)
+
     def ctx(self, r: Int) -> DeviceContext:
         return self.pg.ctx(r)
+
+    def net(mut self, r: Int) -> ref[MutAnyOrigin] Self.M:
+        return self.nets[r]
 
     # ── setup ────────────────────────────────────────────────────────────────
 
@@ -643,6 +679,35 @@ struct ZeroSharded[M: Module, N: Int, STAGE: Int](Movable):
             h[].unregister()
             raise e^
         h[].unregister()
+
+    def forward_only[B: RankStep](mut self, mut bodies: List[B]) raises:
+        """`bodies[r].run_rank(r)` for bodies that run a forward only. ZeRO-2:
+        rank by rank, on the replicated weights. ZeRO-3: on `RankFibers`, each
+        unit's weights gathered at its pre-forward hook (the slot table starts
+        empty: the last step's Adam changed every shard)."""
+        if not self.bound:
+            raise Error("ZeroSharded: call sync_params() first")
+        check_bodies(len(bodies), Self.N, "ZeroSharded.forward_only")
+        comptime if Self.STAGE == 2:
+            for r in range(Self.N):
+                bodies[r].run_rank(r)
+        else:
+            var cv = self.cells.view()
+            for s in range(self.slots):
+                cv.release_store(s, -1)
+            # Peers' Adam (last step) wrote the shards every gather reads.
+            self.pg.stream_barrier()
+            var h = unit_hooks()
+            h[].register(
+                Int(Pointer(to=self)), _zero_hook[Self.M, Self.N, Self.STAGE]
+            )
+            try:
+                self._gather_unit(self.n_wrapped)
+                RankFibers.run(bodies)
+            except e:
+                h[].unregister()
+                raise e^
+            h[].unregister()
 
     def clip_grads_device(mut self, max_norm: Scalar[DT]) raises:
         """Global grad-norm clip over the gradient shards (`Zero1`'s rule):

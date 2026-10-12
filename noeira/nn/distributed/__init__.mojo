@@ -4,7 +4,10 @@
 shared-context simulator), `DataParallel` (DDP over `ParamArena`, optionally
 overlapped with the backward), `Zero1` (sharded optimizer state) and
 `ZeroSharded` (ZeRO-2 / ZeRO-3 over per-block units, its step on
-`RankFibers`). See `docs/DISTRIBUTED_TRAINING_PLAN.md` and
+`RankFibers`). The three implement one interface, `ShardingStrategy`, which
+`DistributedAutoregressiveTrainer` drives without naming a stage
+(`examples/nn/distributed/gpt_tinyshakespeare_distributed.mojo`). See
+`docs/DISTRIBUTED_TRAINING_PLAN.md` and
 `docs/DISTRIBUTED_TRAINING_RESULTS.md`. The simulator gates run with
 `pixi run -e apple test-nn-distributed` (or `-e nvidia`).
 """

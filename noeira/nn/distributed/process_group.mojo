@@ -17,6 +17,8 @@ Two kinds of group:
   so the data-parallel correctness gates run on a Mac or a single GPU before
   any multi-GPU box is rented. Its allreduce reduces in rank order 0..N-1 into
   one buffer and copies it out, so every rank receives the same bits.
+- `ProcessGroup[N].devices_or_simulator(ctx, max_elems)` — the first when N
+  NVIDIA GPUs are visible, else the second.
 
 The allreduce here is a SUM. The 1/N of a mean is left to the caller, which
 folds it into the copy back into the gradient arena (`DataParallel`).
@@ -212,6 +214,18 @@ struct ProcessGroup[N: Int](Movable):
         return Self(
             ctxs^, BACKEND_P2P if p2p else BACKEND_NAIVE, max_elems, sigs^
         )
+
+    @staticmethod
+    def devices_or_simulator(ctx: DeviceContext, max_elems: Int) raises -> Self:
+        """`devices(max_elems)` when this process sees N NVIDIA GPUs, else
+        `shared(ctx)`: the same program trains on a multi-GPU box and runs
+        its ranks on one device (a Mac, a single GPU) everywhere else."""
+        comptime if has_nvidia_gpu_accelerator() and Self.N >= 2 and (
+            Self.N <= MAX_GPUS
+        ):
+            if DeviceContext.number_of_devices() >= Self.N:
+                return Self.devices(max_elems)
+        return Self.shared(ctx)
 
     def ctx(self, r: Int) -> DeviceContext:
         return self.ctxs[r]
