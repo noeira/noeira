@@ -350,9 +350,13 @@ either way. The groups are now built once and reused verbatim."""
 
 comptime VLM_Q4 = get_defined_int["SMOLVLA_VLM_Q4", 0]() != 0
 """`-D SMOLVLA_VLM_Q4=1`: the VLM's 16 text layers in int4 (`nn/quant`, RTN
-Q4_0 from the published weights at load). The tower is frozen in every regime
+Q4_0 from the published weights at load, or GPTQ's blocks with
+`SMOLVLA_VLM_Q4_BLOCKS`). The tower's own weights are frozen in every regime
 this file trains, so the held-out loss of a checkpoint (`SMOLVLA_INIT`,
-`SMOLVLA_STEPS=0`) with an int4 VLM is the int4 deploy's loss."""
+`SMOLVLA_STEPS=0`) with an int4 VLM is the int4 deploy's loss. With
+`-D SMOLVLA_TOWER_R` too, the text adapters train over the int4 weights:
+QLoRA (`nn/quant/qlora.mojo`), the input gradient through each int4 linear
+by its dequantized weight, the adapters unmerged."""
 comptime Pol = SmolVLAPolicy[
     N_CAM, N_LANG, CHUNK, STEPS_EULER, B, SMOLLM_LAYERS, SIGLIP_LAYERS, True,
     EXPERT_R, TOWER_R, VLM_Q4,
@@ -658,9 +662,6 @@ def trainable_values[
 
 
 def main() raises:
-    comptime assert not (VLM_Q4 and TOWER_R > 0), (
-        "SMOLVLA_VLM_Q4 with SMOLVLA_TOWER_R is QLoRA, a later milestone"
-    )
     print("=" * 74)
     print("SmolVLA fine-tune — SO-ARM101")
     print("=" * 74)

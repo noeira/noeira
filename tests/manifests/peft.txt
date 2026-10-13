@@ -23,3 +23,7 @@ tests/nn/quant/test_cholesky.mojo
 tests/nn/quant/test_gptq.mojo
 tests/deep_agents/smolvla/test_gptq_tower.mojo
 tests/deep_agents/smolvla/test_gptq_tower_gpu.mojo
+tests/nn/quant/test_qlora.mojo
+tests/nn/quant/test_qlora_gpu.mojo
+tests/deep_agents/smolvla/test_qlora_tower.mojo
+tests/deep_agents/smolvla/test_qlora_tower_gpu.mojo
