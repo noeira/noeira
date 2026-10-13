@@ -88,6 +88,8 @@ is read from `tools/vla/`.
 | `SMOLVLA_VLM_Q4_BLOCKS` | `-D SMOLVLA_VLM_Q4=1` builds only: read the int4 VLM's Q4_0 blocks from this file (made by `SMOLVLA_GPTQ_OUT`) instead of quantizing the published weights by round-to-nearest |
 | `SMOLVLA_GPTQ_OUT` | fp32 builds only: before the baseline, calibrate the VLM's 16 text layers on TRAINING observations, layer by layer, write their Q4_0 blocks to this file, and leave the dequantized weights in the tower, so the baseline that follows is the quantized VLM's held-out loss (fp32 activations). See `gptq_calib.mojo` |
 | `SMOLVLA_GPTQ_N` | calibration observations for `SMOLVLA_GPTQ_OUT`, a multiple of `B` (default 256), drawn from the training rows with a fixed seed |
+| `SMOLVLA_GPTQ_DAMP` | GPTQ's damping, as a fraction of the Hessian's mean diagonal (default 0.01, the reference's) |
+| `SMOLVLA_VAL_DUMP` | write every held-out observation's share of its group's baseline loss to this file, for paired comparisons between builds |
 | `SMOLVLA_GPTQ_METHOD` | `gptq` (default) or `rtn`: the blocks `SMOLVLA_GPTQ_OUT` keeps; both objectives are printed either way |
 | `SMOLVLA_VISION_CACHE` | path of the vision cache; default `<store>.vision.bin`; `off` recomputes the tower every observation (the pre-cache path, kept for A/B) |
 | `SMOLVLA_NO_MONITOR` | force the metrics logger inert |
@@ -226,6 +228,7 @@ from noeira.deep_agents.smolvla.dataset import SmolVLABatchSampler
 from noeira.deep_agents.smolvla.observation import fill_store_images
 from noeira.deep_agents.smolvla.train_step import SmolVLATrainStep
 from noeira.deep_agents.smolvla.vision_cache import VisionCache
+from noeira.io.fileio import write_text_atomic
 from noeira.deep_agents.smolvla.gptq_calib import (
     calibrate_tower_q4, save_q4_blocks, Q4_GPTQ, Q4_RTN, Q4ProjStat,
 )
@@ -1067,13 +1070,23 @@ def main() raises:
     # fine-tune has to beat.
     var ph = Phases()
     var base_sum = 0.0
+    # `SMOLVLA_VAL_DUMP=<file>`: every micro-batch's share of its group's
+    # loss, one line each (group, micro-batch, value), for paired
+    # comparisons between builds scored on these same groups.
+    var val_dump = getenv("SMOLVLA_VAL_DUMP")
+    var dump_txt = String("# group micro loss_share\n")
     for vi in range(VAL_GROUPS):
         for m in range(micro):
-            base_sum += run_one(
+            var lm = run_one(
                 m, vgroups[vi], sam, tasks, pol, st, img_col, row, images,
                 scratch, acts_t, valid_t, noise_t, times_t, x_t, u_t, ctx,
                 ph, vcache, seg, gx_pre,
             )
+            base_sum += lm
+            dump_txt += String(vi) + " " + String(m) + " " + String(lm) + "\n"
+    if val_dump.byte_length() > 0:
+        write_text_atomic(val_dump, dump_txt)
+        print("  val     per-micro-batch losses -> " + val_dump)
     var base_val = base_sum / Float64(VAL_GROUPS)
     var best_val = base_val
     print("  BASELINE " + val_label + " (lerobot/smolvla_base, 0 updates): "
@@ -1386,11 +1399,16 @@ def _calibrate_vlm(
           + String(lo_row) + ", " + String(hi_row) + "] of the training range [0, "
           + String(split) + ")" + ("" if held_out else " (nothing is held out)")
           + ", " + String(Pol.P) + " tokens each; method "
-          + ("GPTQ" if method == Q4_GPTQ else "RTN"))
+          + ("GPTQ" if method == Q4_GPTQ else "RTN")
+          + ", damping " + getenv("SMOLVLA_GPTQ_DAMP", "0.01"))
     var blocks = List[List[UInt8]]()
+    var damp = 0.01
+    var e_d = getenv("SMOLVLA_GPTQ_DAMP")
+    if e_d.byte_length() > 0:
+        damp = Float64(e_d)
     var stats = calibrate_tower_q4["gpu"](
         pol.prefill, pol.tower, pol.cache, xs, method, blocks, Optional(ctx),
-        verbose=True,
+        verbose=True, damp_frac=damp,
     )
     var dims = List[Tuple[Int, Int]]()
     for which in range(7):
@@ -1398,7 +1416,8 @@ def _calibrate_vlm(
     save_q4_blocks(
         path, text_name_map(), blocks, SMOLLM_LAYERS, dims, method,
         String(n_cal) + " training observations of " + store_path
-        + ", rows sampled with seed " + String(GPTQ_SEED),
+        + ", rows sampled with seed " + String(GPTQ_SEED) + ", damping "
+        + getenv("SMOLVLA_GPTQ_DAMP", "0.01"),
     )
     # Read back: the file must hold every byte the calibration produced.
     var back = SafeTensors(path)

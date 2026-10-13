@@ -102,6 +102,7 @@ def quantize_layer_q4[
     mut blocks: List[List[UInt8]],
     mut stats: List[Q4ProjStat],
     ctx: Optional[DeviceContext] = None,
+    damp_frac: Float64 = 0.01,
 ) raises:
     """Steps 2 and 3 of the module docstring for one layer: the seven
     projections' blocks appended to `blocks` (LORA_Q .. LORA_DOWN), their
@@ -124,7 +125,7 @@ def quantize_layer_q4[
         st.obj_rtn = q4_0_objective(w, qr, dr, n, k, hs[slot].h)
         var qg = List[UInt8]()
         var dg = List[Float32]()
-        var gs = gptq_q4_0(w, n, k, hs[slot].h.copy(), qg, dg)
+        var gs = gptq_q4_0(w, n, k, hs[slot].h.copy(), qg, dg, damp_frac)
         st.dead = gs.dead
         st.obj_gptq = q4_0_objective(w, qg, dg, n, k, hs[slot].h)
         var b = _blocks(qg, dg, n, k) if method == Q4_GPTQ else _blocks(qr, dr, n, k)
@@ -160,6 +161,7 @@ def calibrate_tower_q4[
     mut blocks: List[List[UInt8]],
     ctx: Optional[DeviceContext] = None,
     verbose: Bool = False,
+    damp_frac: Float64 = 0.01,
 ) raises -> List[Q4ProjStat]:
     """The module docstring's sequence over the whole tower. `xs` are the
     prefill inputs (B·P·W floats each); `blocks` gets L·7 entries in layer,
@@ -191,7 +193,9 @@ def calibrate_tower_q4[
             prefill.run[target](tower, cache, x, out, ctx)
         var hs = tower.layers[i].hessian_take()
         var first = len(stats)
-        quantize_layer_q4[target](tower.layers[i], i, hs^, method, blocks, stats, ctx)
+        quantize_layer_q4[target](
+            tower.layers[i], i, hs^, method, blocks, stats, ctx, damp_frac
+        )
         if verbose:
             var line = String("  layer ") + String(i) + ": rows " + String(stats[first].rows)
             for s in range(first, len(stats)):
