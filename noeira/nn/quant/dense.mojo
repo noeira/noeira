@@ -123,6 +123,26 @@ def _tile[
                 c[unsafe_offset = ii * ldc + jj] += alpha * acc
 
 
+def gemm_acc_serial[
+    dt: DType
+](
+    M: Int,
+    N: Int,
+    K: Int,
+    alpha: Scalar[dt],
+    a: Pointer[Scalar[dt], MutAnyOrigin],
+    lda: Int,
+    b: Pointer[Scalar[dt], MutAnyOrigin],
+    ldb: Int,
+    c: Pointer[Scalar[dt], MutAnyOrigin],
+    ldc: Int,
+):
+    """`gemm_acc` on the calling thread, for callers that are themselves
+    one task of a `parallelize`."""
+    for j0 in range(0, N, _NB):
+        _tile[dt](0, M, j0, min(j0 + _NB, N), K, alpha, a, lda, b, ldb, c, ldc)
+
+
 def gemm_acc[
     dt: DType
 ](

@@ -94,6 +94,33 @@ def f16_value(bits: UInt16) -> Float32:
     return bitcast[DType.float16](bits).cast[DType.float32]()
 
 
+@always_inline
+def q4_0_group_scale(g: Pointer[Float32, MutAnyOrigin]) -> Float32:
+    """The grid's scale for the 32 weights at `g` (module docstring): the
+    FIRST element of largest magnitude over -8, 1e-8 if that is 0, rounded
+    to bf16. The one definition RTN and GPTQ share."""
+    var best = 0
+    var best_abs = abs(g[unsafe_offset=0])
+    for j in range(1, Q4_GROUP):
+        var a = abs(g[unsafe_offset=j])
+        if a > best_abs:
+            best_abs = a
+            best = j
+    var d = g[unsafe_offset=best] / Float32(-8.0)
+    if d == 0.0:
+        d = Float32(1e-8)
+    return bf16_round(d)
+
+
+@always_inline
+def q4_0_code(w: Float32, d: Float32) -> UInt8:
+    """clip(round(w / d) + 8, 0, 15), ties to even: the code of `w` at
+    scale `d`. Its value is (code - 8) · d."""
+    var v = round_half_even(w / d) + 8.0
+    v = min(max(v, Float32(0.0)), Float32(15.0))
+    return UInt8(Int(v))
+
+
 def quantize_rtn_q4_0(
     ref w: List[Float32],
     n: Int,
@@ -117,27 +144,14 @@ def quantize_rtn_q4_0(
     var groups = k // Q4_GROUP
     q = List[UInt8](length=n * k, fill=0)
     d = List[Float32](length=n * groups, fill=0)
-    var wp = w.unsafe_ptr()
+    var wp = rebind[Pointer[Float32, MutAnyOrigin]](w.unsafe_ptr())
     for r in range(n):
         for g in range(groups):
             var base = r * k + g * Q4_GROUP
-            # The signed max: the FIRST element of largest magnitude.
-            var best = 0
-            var best_abs = abs(wp[unsafe_offset=base])
-            for j in range(1, Q4_GROUP):
-                var a = abs(wp[unsafe_offset=base + j])
-                if a > best_abs:
-                    best_abs = a
-                    best = j
-            var dg = wp[unsafe_offset=base + best] / Float32(-8.0)
-            if dg == 0.0:
-                dg = Float32(1e-8)
-            dg = bf16_round(dg)
+            var dg = q4_0_group_scale(wp.unsafe_offset(base))
             d[r * groups + g] = dg
             for j in range(Q4_GROUP):
-                var v = round_half_even(wp[unsafe_offset=base + j] / dg) + 8.0
-                v = min(max(v, Float32(0.0)), Float32(15.0))
-                q[base + j] = UInt8(Int(v))
+                q[base + j] = q4_0_code(wp[unsafe_offset=base + j], dg)
 
 
 def pack_q4_0(

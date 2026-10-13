@@ -20,3 +20,4 @@ tests/nn/quant/test_qlinear_gpu.mojo
 tests/deep_agents/smolvla/test_q4_tower.mojo
 tests/deep_agents/smolvla/test_q4_tower_gpu.mojo
 tests/nn/quant/test_cholesky.mojo
+tests/nn/quant/test_gptq.mojo
