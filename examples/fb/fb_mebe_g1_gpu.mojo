@@ -205,6 +205,11 @@ def main() raises:
     var seg_b = seg_steps // N_ENVS
     if seg_b < 1:
         raise Error("--segment must be >= N_ENVS")
+    # whole segments only: a 20 M run at 1 M segments is 19 531 batched steps,
+    # and the remainder made a 21st segment of 11 k steps whose checkpoint
+    # and eval duplicated the 20th (run gfb_s1)
+    if n_batched >= seg_b:
+        n_batched = (n_batched // seg_b) * seg_b
     var n_seg = (n_batched + seg_b - 1) // seg_b
 
     var run = RunContext(
