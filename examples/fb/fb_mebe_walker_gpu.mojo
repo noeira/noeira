@@ -146,6 +146,14 @@ def _main[BN: Module]() raises:
     var act_l2 = atof(_flag(String("--act-l2"), String(ACT_L2)))
     var seed_v = atol(_flag(String("--seed"), String(SEED)))
     var tag = _flag(String("--tag"), String(""))
+    # ablation knobs — the defaults ARE the release mixture; the W0 → W0p
+    # split (plan §10.5) sets the old driver's values one axis at a time:
+    # `--zbuf-frac 0.5 --keep-frac 0.2` (lanes half ZBuffer, relabel keeps
+    # 20 %, half B(s+)), `--z-hold 150`, `--episode-len 0` (no truncation
+    # boundary). `--zbuf-frac` replaces the explore share, so it is sphere-only.
+    var zbuf_s = _flag(String("--zbuf-frac"), String(""))
+    var keep_frac = atof(_flag(String("--keep-frac"), String(0.0)))
+    var episode_len = atol(_flag(String("--episode-len"), String(EPISODE_LEN)))
     if explore != "mebe" and explore != "sphere":
         raise Error("--explore must be 'mebe' or 'sphere'")
     var mebe = explore == "mebe"
@@ -180,6 +188,10 @@ def _main[BN: Module]() raises:
     # sphere arms: no pool, and the base's non-uniform share at 0 — lanes and
     # relabel draw the sphere only (the paper's undirected FB / FB-Reg)
     var explore_frac = 0.8 if mebe else 0.0
+    if zbuf_s.byte_length() > 0:
+        if mebe:
+            raise Error("--zbuf-frac is for --explore sphere (mebe's share is the pool's)")
+        explore_frac = atof(zbuf_s)
 
     seed(seed_v)
     print("=" * 70)
@@ -192,6 +204,7 @@ def _main[BN: Module]() raises:
     print("  N_ENVS / BATCH / D  =", N_ENVS, "/", BATCH, "/", D)
     print("  env steps           =", total, " in", n_segments, "segments of", seg)
     print("  ups / warmup / hold =", ups, "/", warmup, "/", z_hold)
+    print("  keep_frac / ep_len  =", keep_frac, "/", episode_len)
     print("  act_l2 @ margin     =", act_l2, "@", ACT_MARGIN, "  seed", seed_v)
     print("  tag                 = '", tag, "'   run:", run.dir)
     print("=" * 70)
@@ -225,6 +238,9 @@ def _main[BN: Module]() raises:
         logger.set_config("hidden", String(WALKER_HID))
         logger.set_config("updates_per_iter", String(ups))
         logger.set_config("z_hold", String(z_hold))
+        logger.set_config("explore_frac", String(explore_frac))
+        logger.set_config("keep_frac", String(keep_frac))
+        logger.set_config("episode_len", String(episode_len))
         logger.set_config("seed", String(seed_v))
         logger.set_config("tag", tag)
         var logger_ptr = Pointer(to=logger).as_unsafe_any_origin()
@@ -236,8 +252,8 @@ def _main[BN: Module]() raises:
             max_grad_norm=MAX_GRAD_NORM, act_l2_weight=act_l2,
             act_l2_margin=ACT_MARGIN, learning_starts=warmup,
             action_scale=1.0, expl_std=EXPL_STD, z_hold=z_hold,
-            explore_frac=explore_frac, keep_frac=0.0, window_size=100,
-            seed=UInt64(seed_v), episode_len=EPISODE_LEN,
+            explore_frac=explore_frac, keep_frac=keep_frac, window_size=100,
+            seed=UInt64(seed_v), episode_len=episode_len,
         )
         var env = EnvT(ctx)
         register_run(run, logger)
