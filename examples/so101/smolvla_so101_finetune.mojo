@@ -206,7 +206,7 @@ from noeira.nn.core.tensor import Tensor
 from noeira.nn.core.checkpoint import CheckpointScalars
 from noeira.nn.core.initializer import Deterministic
 from noeira.nn.core.named_params import named_params
-from noeira.nn.core.param import ParamWalkable, ParamVisitor, ParamVisitorRT
+from noeira.nn.core.param import ParamWalkable, ParamVisitor, ParamVisitorRT, NN_INFERENCE_ONLY
 from noeira.nn.optimizer.adam import Adam
 from noeira.nn.primitives.linear import Linear
 from noeira.core.run import RunContext, register_run
@@ -263,9 +263,11 @@ cannot hold two — a multi-task fine-tune needs a padding decision first."""
 
 comptime CHUNK = 50
 comptime STEPS_EULER = 10        # inference only; training denoises ONCE
-comptime B = 8
+comptime B = get_defined_int["SMOLVLA_B", 8]()
 """⚠ Observations per FORWARD — the batch the expert, the prefill and the
-backward run over at once. A comptime, so changing it is a rebuild.
+backward run over at once. A comptime, so changing it is a rebuild
+(`-D SMOLVLA_B=1`: what a 16 GB laptop can hold, and the only build that can
+run with the vision cache off).
 
 Why not 1: at B = 1 the step is LAUNCH-BOUND. With the vision cache and the
 element-indexed attention backward, a 5090 spent 33 ms per observation on
@@ -708,6 +710,15 @@ def main() raises:
             + " (observations per forward)"
         )
     var micro = accum // B
+    comptime if NN_INFERENCE_ONLY:
+        # No gradient buffer exists anywhere, so every weight behaves as
+        # frozen: the step's forward and loss are the trained build's, its
+        # backward forms input gradients only. An evaluation build.
+        if steps != 0:
+            raise Error(
+                "an NN_INFERENCE_ONLY build has no gradients to train with:"
+                " SMOLVLA_STEPS=0 only (held-out baseline, int4 calibration)"
+            )
     var e_val = getenv("SMOLVLA_VAL_EPISODES")
     var profile = getenv("SMOLVLA_PROFILE").byte_length() > 0
     var peak_lr = PEAK_LR
@@ -941,8 +952,11 @@ def main() raises:
     # ⚠ AFTER the base checkpoint and any resume, BEFORE the first step:
     # adopting rebinds every Param to a slice of one arena, so it must happen
     # once the values are final. It buys the grouped update AND the global
-    # grad-norm clip, which cannot be done component-by-component.
-    comptime if TOWER_R > 0:
+    # grad-norm clip, which cannot be done component-by-component. An
+    # NN_INFERENCE_ONLY build has nothing to adopt (no gradients).
+    comptime if NN_INFERENCE_ONLY:
+        pass
+    elif TOWER_R > 0:
         adopt_trainables_tower[
             "gpu", SMOLLM_LAYERS, SMOLVLA_EXPERT_W, EXPERT_FF, SMOLLM_DIM,
             SMOLLM_KV_W, PAD, E_R=EXPERT_R,
