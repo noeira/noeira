@@ -77,7 +77,7 @@ from noeira.deep_agents.smolvla.normalize import SmolVLAStats, normalize_state
 from noeira.deep_agents.smolvla.heads import SMOLVLA_CONNECTOR_IN
 from noeira.deep_agents.smolvla.observation import fill_camera_images
 from noeira.deep_agents.smolvla.tasks import TaskTokens
-from noeira.deep_agents.smolvla.finetune import load_trainables
+from noeira.deep_agents.smolvla.finetune import load_trainables, load_trainables_tower
 from noeira.deep_agents.smolvla.heads import (
     SMOLVLA_EXPERT_W, SMOLVLA_STATE_DIM, SMOLVLA_ACTION_DIM,
 )
@@ -109,7 +109,14 @@ comptime STEPS = 10
 comptime FPS = 30
 comptime VLM_Q4 = get_defined_int["SMOLVLA_VLM_Q4", 0]() != 0
 """`-D SMOLVLA_VLM_Q4=1`: the VLM's text layers in int4 (module docstring)."""
-comptime Pol = SmolVLAPolicy[N_CAM, N_LANG, CHUNK, STEPS, 1, VLM_Q4=VLM_Q4]
+comptime TOWER_R = get_defined_int["SMOLVLA_TOWER_R", 0]()
+"""`-D SMOLVLA_TOWER_R=16`: LoRA adapters on the text layers, as a text-LoRA
+fine-tune trained them (`SMOLVLA_CKPT` loads them, `SMOLVLA_LORA_ALPHA` their
+α, default 32). Unmerged: with `-D SMOLVLA_VLM_Q4=1` this is the QLoRA
+deploy (int4 weights cannot take a merge)."""
+comptime Pol = SmolVLAPolicy[
+    N_CAM, N_LANG, CHUNK, STEPS, 1, TOWER_R=TOWER_R, VLM_Q4=VLM_Q4
+]
 comptime CAM_W = 640
 comptime CAM_H = 480
 comptime RDIM = 6
@@ -206,13 +213,28 @@ def main() raises:
         var sp_unused = Linear[SMOLVLA_STATE_DIM, SMOLLM_DIM].make[
             TARGET, Deterministic
         ](Optional(d))
-        _ = load_trainables[
-            TARGET, SMOLLM_LAYERS, SMOLVLA_EXPERT_W, EXPERT_FF, SMOLLM_DIM,
-            SMOLLM_KV_W, SMOLVLA_ACTION_DIM,
-        ](
-            ckpt, pol.expert, pol.action_in, pol.time_mlp_in,
-            pol.time_mlp_out, pol.action_out, sp_unused, Optional(d),
-        )
+        comptime if TOWER_R > 0:
+            _ = load_trainables_tower[
+                TARGET, SMOLLM_LAYERS, SMOLVLA_EXPERT_W, EXPERT_FF, SMOLLM_DIM,
+                SMOLLM_KV_W, SMOLVLA_ACTION_DIM,
+            ](
+                ckpt, pol.expert, pol.action_in, pol.time_mlp_in,
+                pol.time_mlp_out, pol.action_out, pol.tower, Optional(d),
+            )
+            var alpha = 32.0
+            var e_a = getenv("SMOLVLA_LORA_ALPHA")
+            if e_a.byte_length() > 0:
+                alpha = Float64(e_a)
+            pol.tower.set_lora_alpha(alpha)
+            print("  text adapters: rank", TOWER_R, ", alpha", alpha, ", unmerged")
+        else:
+            _ = load_trainables[
+                TARGET, SMOLLM_LAYERS, SMOLVLA_EXPERT_W, EXPERT_FF, SMOLLM_DIM,
+                SMOLLM_KV_W, SMOLVLA_ACTION_DIM,
+            ](
+                ckpt, pol.expert, pol.action_in, pol.time_mlp_in,
+                pol.time_mlp_out, pol.action_out, sp_unused, Optional(d),
+            )
         print("  weights: lerobot/smolvla_base + " + ckpt)
     else:
         print("  weights: lerobot/smolvla_base")
