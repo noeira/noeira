@@ -1133,6 +1133,30 @@ struct FBOnlineAgent[
         std: Float64,
     ) raises:
         """`action = clamp(pi_z(obs, z_lane) + std·n) · scale` for all lanes."""
+        self._policy_into_z(
+            obs_ptr, mptr(self.z_lane.dev.value().unsafe_ptr()), action_ptr, std
+        )
+
+    def policy_with_z(
+        mut self,
+        obs_ptr: Pointer[Scalar[DT], MutAnyOrigin],
+        z_ptr: Pointer[Scalar[DT], MutAnyOrigin],
+        action_ptr: Pointer[Scalar[DT], MutAnyOrigin],
+    ) raises:
+        """Greedy `pi(obs, z)` for `LANES` rows under a CALLER's z (`LANES·D`
+        device floats), for an eval env of the same width: the lanes' own z
+        and RNG offsets are untouched, so an eval between training steps
+        leaves the rollout exactly where it was. Raw obs; the normaliser
+        (if on) is applied here, as for the rollout."""
+        self._policy_into_z(obs_ptr, z_ptr, action_ptr, 0.0)
+
+    def _policy_into_z(
+        mut self,
+        obs_ptr: Pointer[Scalar[DT], MutAnyOrigin],
+        z_ptr: Pointer[Scalar[DT], MutAnyOrigin],
+        action_ptr: Pointer[Scalar[DT], MutAnyOrigin],
+        std: Float64,
+    ) raises:
         var c = self.ctx.value()
         comptime NA = Self.LANES * Self.ACT
         var src = obs_ptr
@@ -1141,7 +1165,7 @@ struct FBOnlineAgent[
             src = mptr(self._obs_scratch.dev.value().unsafe_ptr())
         c.enqueue_function[pack2_kernel[Self.OBS, Self.D, Self.LANES]](
             src,
-            mptr(self.z_lane.dev.value().unsafe_ptr()),
+            z_ptr,
             mptr(self._ain.dev.value().unsafe_ptr()),
             grid_dim=_blocks(Self.LANES * Self.A_IN), block_dim=TPB,
         )

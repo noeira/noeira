@@ -279,6 +279,10 @@ struct FBMebeOnlineAgent[
     # ── scheduled truncation (see `episode_len` in `make`) ─────────────
     var episode_len: Int
     var _n_record: Int
+    # ── ring-row embedding for evals (`embed_rows`), allocated on first use
+    var _e_idx: Optional[DeviceBuffer[IDX_DT]]
+    var _e_obs: Tensor     # BATCH * OBS
+    var _e_b: Tensor       # BATCH * D
 
     def __init__(out self):
         self.base = Self.Base()
@@ -301,6 +305,9 @@ struct FBMebeOnlineAgent[
         self.last_report = InverseDensityReport()
         self.episode_len = 0
         self._n_record = 0
+        self._e_idx = None
+        self._e_obs = Tensor()
+        self._e_b = Tensor()
 
     def __init__(out self, *, deinit move: Self):
         self.base = move.base^
@@ -323,6 +330,9 @@ struct FBMebeOnlineAgent[
         self.last_report = move.last_report^
         self.episode_len = move.episode_len
         self._n_record = move._n_record
+        self._e_idx = move._e_idx^
+        self._e_obs = move._e_obs^
+        self._e_b = move._e_b^
 
     @staticmethod
     def make[
@@ -529,6 +539,115 @@ struct FBMebeOnlineAgent[
         )
         self._n_refresh += 1
 
+    # ── ring access for evals and diagnostics (eager) ──────────────────
+
+    def embed_rows(
+        mut self,
+        ref rows: List[Int],
+        mut raw: List[Scalar[DT]],
+        mut b: List[Scalar[DT]],
+    ) raises:
+        """`B(s)` of ring rows, `BATCH` at a time, with the CURRENT
+        normaliser and B: `raw` gets each row's stored (unnormalised)
+        `STORE_OBS` columns — what a reward reads — and `b` its `D`-wide
+        embedding, unprojected (what `z_from_reward` averages). The ring
+        is the reward pool of a data-free arm (plan §2 B4)."""
+        var c = self.ctx.value()
+        if not self._e_idx:
+            self._e_idx = c.enqueue_create_buffer[IDX_DT](Self.BATCH)
+            ensure_t["gpu"](self._e_obs, Self.BATCH * Self.OBS, self.ctx)
+            # the derived tail of a gathered row is never written; B's
+            # filter reads the stored prefix
+            self._e_obs.dev.value().enqueue_fill(Scalar[DT](0.0))
+            ensure_t["gpu"](self._e_b, Self.BATCH * Self.D, self.ctx)
+        var n = len(rows)
+        for i in range(n):
+            if rows[i] < 0 or rows[i] >= self.base.size:
+                raise Error("embed_rows: row outside the ring's fill")
+        raw = List[Scalar[DT]](length=n * Self.STORE_OBS, fill=Scalar[DT](0))
+        b = List[Scalar[DT]](length=n * Self.D, fill=Scalar[DT](0))
+        var hidx = c.enqueue_create_host_buffer[IDX_DT](Self.BATCH)
+        var hraw = c.enqueue_create_host_buffer[DT](Self.BATCH * Self.OBS)
+        var hb = c.enqueue_create_host_buffer[DT](Self.BATCH * Self.D)
+        var done = 0
+        while done < n:
+            var take = Self.BATCH if n - done >= Self.BATCH else n - done
+            for i in range(Self.BATCH):
+                hidx[i] = Scalar[IDX_DT](rows[done + (i if i < take else 0)])
+            c.enqueue_copy(self._e_idx.value(), hidx)
+            c.enqueue_function[
+                gather_rows_into_kernel[Self.STORE_OBS, Self.OBS, Self.BATCH]
+            ](
+                mptr(self.base.r_obs.dev.value().unsafe_ptr()),
+                mptr(self._e_idx.value().unsafe_ptr()),
+                mptr(self._e_obs.dev.value().unsafe_ptr()),
+                grid_dim=_blocks(Self.BATCH * Self.STORE_OBS), block_dim=TPB,
+            )
+            c.enqueue_copy(hraw, self._e_obs.dev.value())
+            if self.base.obs_ema.enabled:
+                self.base.obs_ema.apply[Self.BATCH](self._e_obs)
+            call_forward["gpu", Self.BATCH](
+                self.base.t.bnet.online, TensorRefs[1, MutAnyOrigin](self._e_obs),
+                self._e_b, self.ctx,
+            )
+            c.enqueue_copy(hb, self._e_b.dev.value())
+            c.synchronize()
+            for i in range(take):
+                for k in range(Self.STORE_OBS):
+                    raw[(done + i) * Self.STORE_OBS + k] = hraw[i * Self.OBS + k]
+                for k in range(Self.D):
+                    b[(done + i) * Self.D + k] = hb[i * Self.D + k]
+            done += take
+
+    def sample_ring_cols(
+        mut self, ref cols: List[Int], n: Int, seed: UInt64
+    ) raises -> List[Float64]:
+        """`n` ring rows drawn uniformly over the fill, `len(cols)` stored
+        columns each, row-major on the host — the coverage readouts (plan §4
+        early kill checks). Allocates per call; never on a hot path."""
+        var c = self.ctx.value()
+        var size = self.base.size
+        if size < 1:
+            raise Error("sample_ring_cols: the ring is empty")
+        var nc = len(cols)
+        for k in range(nc):
+            if cols[k] < 0 or cols[k] >= Self.STORE_OBS:
+                raise Error("sample_ring_cols: column outside the stored obs")
+        var rng = SplitMix64(seed)
+        var hidx = c.enqueue_create_host_buffer[IDX_DT](n)
+        for i in range(n):
+            hidx[i] = Scalar[IDX_DT](rng.below(size))
+        var didx = c.enqueue_create_buffer[IDX_DT](n)
+        c.enqueue_copy(didx, hidx)
+        var hcols = c.enqueue_create_host_buffer[DType.int32](nc)
+        for k in range(nc):
+            hcols[k] = Int32(cols[k])
+        var dcols = c.enqueue_create_buffer[DType.int32](nc)
+        c.enqueue_copy(dcols, hcols)
+        var dout = c.enqueue_create_buffer[DT](n * nc)
+        c.enqueue_function[gather_cols_kernel[Self.STORE_OBS]](
+            mptr(self.base.r_obs.dev.value().unsafe_ptr()),
+            mptr(didx.unsafe_ptr()), mptr(dcols.unsafe_ptr()),
+            mptr(dout.unsafe_ptr()), Int32(n), Int32(nc),
+            grid_dim=(n * nc + TPB - 1) // TPB, block_dim=TPB,
+        )
+        var hout = c.enqueue_create_host_buffer[DT](n * nc)
+        c.enqueue_copy(hout, dout)
+        c.synchronize()
+        var out = List[Float64](length=n * nc, fill=0.0)
+        for i in range(n * nc):
+            out[i] = Float64(hout[i])
+        return out^
+
+    def policy_with_z(
+        mut self,
+        obs_ptr: Pointer[Scalar[DT], MutAnyOrigin],
+        z_ptr: Pointer[Scalar[DT], MutAnyOrigin],
+        action_ptr: Pointer[Scalar[DT], MutAnyOrigin],
+    ) raises:
+        """`FBOnlineAgent.policy_with_z` — greedy under a caller's z."""
+        self.base.policy_with_z(obs_ptr, z_ptr, action_ptr)
+
     # ── the training step ────────────────────────────────────────────────
 
     def _train_kernels(mut self) raises:
@@ -643,7 +762,11 @@ struct FBMebeOnlineAgent[
     ) raises:
         """The regularity reward FIRST, at the row the base is about to
         write (`base.pos`, `base.bnd_next` as they stand), then the base's
-        own record, which advances both."""
+        own record, which advances both.
+
+        ⚠ `prev_obs_dev` / `obs_dev` are `STORE_OBS`-strided, as the base's
+        ring store reads them (the G1 driver passes the env's 527-D rows for
+        a 928-D packed agent). The q̇ difference strides the same way."""
         comptime assert N_ENVS == Self.LANES, (
             "FBMebeOnlineAgent: the driver's N_ENVS must equal the agent's LANES"
         )
@@ -652,7 +775,7 @@ struct FBMebeOnlineAgent[
         self._n_record += 1
         if self.use_reg:
             ctx.enqueue_function[
-                reg_reward_kernel[Self.OBS, Self.ACT, Self.LANES, Self.CAP]
+                reg_reward_kernel[Self.STORE_OBS, Self.ACT, Self.LANES, Self.CAP]
             ](
                 mptr(prev_obs_dev.unsafe_ptr()),
                 mptr(obs_dev.unsafe_ptr()),

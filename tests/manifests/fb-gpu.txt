@@ -68,3 +68,10 @@ tests/nn/test_arena_slice_alignment_gpu.mojo
 # FRESH grad stash per backward, so B-net's `RMSNorm[256]` gamma was a 1 KB
 # device alloc+free on every vjp — illegal inside a CUDA-graph capture. Cheap.
 tests/nn/test_stop_grad_params_reuse_gpu.mojo
+
+# FB-MEBE's G1 pieces (FB_MEBE_G1_PLAN.md §12): B on ϑ_g = the bare MLP on
+# gathered columns; the 22-task suite peaks at each target and drops only on
+# the axes it names; the fall kernel resets every `delay` steps as a boundary;
+# on a 64-lane G1 (NVIDIA only) the reset noise stays in its lanes and band,
+# and the regularity terms equal a host recomputation. ~1 min.
+tests/deep_agents/test_fb_mebe_g1.mojo
