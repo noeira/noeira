@@ -11,7 +11,7 @@ that claim, because it changes nothing else: same `FBTrainer`, same nets as
     pixi run -e nvidia mojo run -I . examples/fb/fb_online_walker_gpu.mojo \
         [--steps N] [--ups K] [--warmup N] [--z-hold N] [--bc X] [--ortho X] \
         [--lr-b X] [--expl-std X] [--act-l2 X] [--act-margin X] [--tag NAME] \
-        [--store PATH|""] [--expert-max N]
+        [--store PATH|""] [--expert-max N] [--seed N]
 
 Then score it — the online arm has its OWN eval, because the batched env's
 observation is dm_control's 24-D vector and not the store's `[qpos | qvel]`:
@@ -190,6 +190,8 @@ def main() raises:
     var lr_b = atof(_flag(String("--lr-b"), String(LR_B)))
     var expl = atof(_flag(String("--expl-std"), String(EXPL_STD)))
     var tag = _flag(String("--tag"), String(""))
+    # the a3c null and W0 were both this ONE default seed (FB_MEBE_G1_PLAN §11.1)
+    var seed_v = atol(_flag(String("--seed"), String(SEED)))
     # ⚠⚠ ONE OF **FIVE** COPIES OF THIS BLOCK IN THE FB FAMILY, all replaced by
     # `RunContext` together. Deriving three paths from a `--tag` a human has to
     # remember to vary is one forgotten flag away from a run silently
@@ -211,7 +213,7 @@ def main() raises:
     var seg = SEGMENT_STEPS if SEGMENT_STEPS < total else total
     var n_segments = (total + seg - 1) // seg
 
-    seed(SEED)
+    seed(seed_v)
     print("=" * 70)
     print("FB ONLINE — dm_control walker, batched GPU, no dataset")
     print("=" * 70)
@@ -225,7 +227,7 @@ def main() raises:
     print("  expert store        =", store_path if use_expert else "(none — pure online)",
           " rows/batch", EXPERT_ROWS if use_expert else 0)
     print("  CUDA graph (train)  =", USE_TRAIN_CUDA_GRAPH)
-    print("  tag                 = '", tag, "'")
+    print("  tag                 = '", tag, "'   seed", seed_v)
     print("=" * 70)
 
     with DeviceContext() as ctx:
@@ -257,6 +259,7 @@ def main() raises:
         logger.set_config("ortho_weight", String(ortho_w))
         logger.set_config("lr_b", String(lr_b if lr_b >= 0.0 else 3e-4))
         logger.set_config("max_grad_norm", String(MAX_GRAD_NORM))
+        logger.set_config("seed", String(seed_v))
         logger.set_config("tag", tag)
         var logger_ptr = Pointer(to=logger).as_unsafe_any_origin()
 
@@ -275,7 +278,7 @@ def main() raises:
             z_hold=z_hold,
             window_size=100,
             initial_episode_fill=0.0,
-            seed=UInt64(SEED),
+            seed=UInt64(seed_v),
         )
         var env = EnvT(ctx)
 
@@ -385,7 +388,7 @@ def main() raises:
                 L=LoggerT,
             ](
                 Optional(ctx), agent, env, this_seg,
-                rng_seed=UInt64(SEED + s),
+                rng_seed=UInt64(seed_v + s),
                 updates_per_step=ups,
                 print_every=PRINT_EVERY,
                 verbose=True,
