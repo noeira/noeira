@@ -82,6 +82,8 @@ is read from `tools/vla/`.
 | `SMOLVLA_LORA_ALPHA` | PEFT's `lora_alpha` for a `-D SMOLVLA_EXPERT_R` / `-D SMOLVLA_TOWER_R` build, default 32 |
 | `SMOLVLA_MERGE_OUT` | expert-LoRA builds only: after training, merge the BEST checkpoint's adapters into the expert's weights, check the merged model's held-out loss against the adapted one's, and write a PLAIN checkpoint there (no adapters, no moments) that the deploy loads as any fine-tune's `--ckpt` |
 | `SMOLVLA_CKPT` | checkpoint path prefix (`<prefix>_best.ckpt` / `_last.ckpt`); default the run's own `runs/<id>/checkpoints/best.ckpt` / `last.ckpt` |
+| `SMOLVLA_CKPT=off` | write no checkpoint at all: the held-out curve only |
+| `SMOLVLA_CKPT_MOMENTS` | `0`: checkpoints without Adam's moments (half the size, and half the memory spike of writing one). A resume from them restarts the optimizer cold |
 | `SMOLVLA_INIT` | a `*_best.ckpt` to start from, applied ON TOP of the base checkpoint |
 | `SMOLVLA_VAL_EPISODES` | episodes held out at the END of the recording; default one fifth. **`0` trains on every episode** — see below |
 | `SMOLVLA_PROFILE` | set to anything: per-phase wall times (host images / prefix / suffix forward / backward) in the log line, at the cost of three extra drains per observation |
@@ -828,6 +830,10 @@ def main() raises:
     var ckpt = getenv("SMOLVLA_CKPT")
     var last_ckpt = run.checkpoint_path(String("last"))
     var best_ckpt = run.checkpoint_path(String("best"))
+    # `SMOLVLA_CKPT=off`: no checkpoint is written (the curve only). Writing
+    # one builds the file in memory, which a 16 GB Orin training the fp32
+    # text tower's adapters cannot spare.
+    var ckpt_off = ckpt == "off"
     if ckpt.byte_length() > 0:
         last_ckpt = ckpt + "_last.ckpt"
         best_ckpt = ckpt + "_best.ckpt"
@@ -1184,13 +1190,15 @@ def main() raises:
             # the final weights are not the ones worth keeping.
             var opt_sc = CheckpointScalars()
             opt.put_step_state(opt_sc, "opt")
-            save_ckpt(last_ckpt, pol, sp_frozen, ctx, opt_sc)
-            announce_checkpoint(last_ckpt, artifacts, run.dir)
+            if not ckpt_off:
+                save_ckpt(last_ckpt, pol, sp_frozen, ctx, opt_sc)
+                announce_checkpoint(last_ckpt, artifacts, run.dir)
             if vloss < best_val:
                 best_val = vloss
-                save_ckpt(best_ckpt, pol, sp_frozen, ctx, opt_sc)
-                announce_checkpoint(best_ckpt, artifacts, run.dir)
-                print("      saved " + best_ckpt)
+                if not ckpt_off:
+                    save_ckpt(best_ckpt, pol, sp_frozen, ctx, opt_sc)
+                    announce_checkpoint(best_ckpt, artifacts, run.dir)
+                    print("      saved " + best_ckpt)
             # ⚠ Validation ran `run_one`, which does a BACKWARD it does not
             # need — `SmolVLATrainStep.run` does both. The gradients it leaves
             # are discarded by the next step's `zero_trainable_grads`, above.
@@ -1281,15 +1289,18 @@ def save_ckpt(
     ctx: DeviceContext,
     sc: CheckpointScalars,
 ) raises:
-    """The trainable set to one v3 checkpoint, moments included; with text-
-    tower adapters, the tower too (`save_trainables_tower`)."""
+    """The trainable set to one v3 checkpoint, moments included unless
+    `SMOLVLA_CKPT_MOMENTS=0`; with text-tower adapters, the tower too
+    (`save_trainables_tower`). The file is built in memory first: on a 16 GB
+    Orin the moments' share of that spike is what does not fit."""
+    var moments = getenv("SMOLVLA_CKPT_MOMENTS") != "0"
     comptime if TOWER_R > 0:
         save_trainables_tower[
             "gpu", SMOLLM_LAYERS, SMOLVLA_EXPERT_W, EXPERT_FF, SMOLLM_DIM,
             SMOLLM_KV_W, PAD, E_R=EXPERT_R,
         ](
             path, pol.expert, pol.action_in, pol.time_mlp_in,
-            pol.time_mlp_out, pol.action_out, pol.tower, True, Optional(ctx),
+            pol.time_mlp_out, pol.action_out, pol.tower, moments, Optional(ctx),
             scalars=sc,
         )
     else:
@@ -1298,7 +1309,7 @@ def save_ckpt(
             SMOLLM_KV_W, PAD, E_R=EXPERT_R,
         ](
             path, pol.expert, pol.action_in, pol.time_mlp_in,
-            pol.time_mlp_out, pol.action_out, sp_frozen, True, Optional(ctx),
+            pol.time_mlp_out, pol.action_out, sp_frozen, moments, Optional(ctx),
             scalars=sc,
         )
 
