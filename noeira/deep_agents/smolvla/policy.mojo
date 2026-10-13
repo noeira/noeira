@@ -756,6 +756,10 @@ struct SmolVLAPolicy[
     var prefill_out: Tensor
     var state_buf: Tensor
     var chunk_buf: Tensor
+    # `VLM_Q4` only: a Q4_0 blocks file (GPTQ, `gptq_calib.mojo`) that `load`
+    # reads the text tower's linears from. Empty (the default): RTN from the
+    # fp32 weights.
+    var vlm_q4_blocks: String
 
     def __init__(out self):
         comptime assert Self.N_CAM >= 1, "SmolVLAPolicy: need a camera"
@@ -780,6 +784,7 @@ struct SmolVLAPolicy[
         self.prefill_out = Tensor()
         self.state_buf = Tensor()
         self.chunk_buf = Tensor()
+        self.vlm_q4_blocks = String()
 
     def __init__(out self, *, deinit move: Self):
         self.vision = move.vision^
@@ -802,6 +807,7 @@ struct SmolVLAPolicy[
         self.prefill_out = move.prefill_out^
         self.state_buf = move.state_buf^
         self.chunk_buf = move.chunk_buf^
+        self.vlm_q4_blocks = move.vlm_q4_blocks^
 
     @staticmethod
     def make[
@@ -927,7 +933,15 @@ struct SmolVLAPolicy[
         # (each weight and its zero bias) here.
         var q4_claimed = 0
         comptime if Self.VLM_Q4:
-            q4_claimed = self.tower.load_q4[target](tl.file, tl.map, ctx)
+            q4_claimed = self.tower.load_q4[target](
+                tl.file, tl.map, ctx, self.vlm_q4_blocks
+            )
+        else:
+            if self.vlm_q4_blocks:
+                raise Error(
+                    "SmolVLAPolicy.load: a Q4_0 blocks file ("
+                    + self.vlm_q4_blocks + ") for a policy built without VLM_Q4"
+                )
         _claimed_every_entry(
             String("text"), len(tl.loaded) + len(tl.zeroed) + q4_claimed,
             len(tl.map.ours),

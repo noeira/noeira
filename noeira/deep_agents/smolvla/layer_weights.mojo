@@ -53,6 +53,20 @@ placeholders that are never built, and the layer is what it was.
 `fused.mojo` drives a projection with `proj_fwd` / `proj_vjp`: the base
 linear (`Linear` or `QLinear`), then its adapter's hook, in that order, which
 is what the loop called before these two existed.
+
+`load_q4` quantizes the fp32 weights by round-to-nearest; `load_q4_blocks`
+reads Q4_0 blocks made beforehand (GPTQ, `gptq_calib.mojo`) from a file that
+keys each linear by the checkpoint's own name plus `.q4_0`
+(`q4_blocks_key`).
+
+## Calibration taps (GPTQ)
+
+`hessian_start` gives the layer four `HessianAccumulator`s, and from then on
+`proj_fwd` adds each projection's input to the one its linear reads: q / k / v
+share the attention input (a self-attention layer: `KV_IN == W`), gate / up
+the MLP input, o and down their own. `hessian_take` hands them back and
+turns the taps off. With no accumulators, the default, `proj_fwd` checks one
+list length and does what it did.
 """
 
 from max.gpu.host import DeviceContext
@@ -66,7 +80,8 @@ from noeira.nn.core.walkers import join_name
 from noeira.nn.primitives.linear import Linear
 from noeira.nn.primitives.rms_norm import RMSNorm
 from noeira.nn.peft.lora import LoRAAdapter
-from noeira.nn.quant.q4_0 import Q4_GROUP
+from noeira.nn.quant.q4_0 import Q4_GROUP, Q4_BLOCK
+from noeira.nn.quant.hessian import HessianAccumulator
 from noeira.nn.quant.qlinear import QLinear
 from noeira.nn.core.torch_names import TorchNameMap, TN_ZEROS
 from noeira.io.safetensors import SafeTensors
@@ -88,6 +103,43 @@ comptime LORA_O = 3
 comptime LORA_GATE = 4
 comptime LORA_UP = 5
 comptime LORA_DOWN = 6
+
+# The four calibration Hessians of a layer (`hessian_start`): the inputs of
+# q / k / v, of o, of gate / up, and of down.
+comptime HESS_ATTN = 0
+comptime HESS_O = 1
+comptime HESS_MLP = 2
+comptime HESS_DOWN = 3
+
+
+def q4_proj_name(which: Int) -> String:
+    """Projection `which` (LORA_Q .. LORA_DOWN) as our name inside a layer:
+    `self_attn.q` .. `mlp.down`."""
+    var names: List[String] = [
+        "self_attn.q", "self_attn.k", "self_attn.v", "self_attn.o",
+        "mlp.gate", "mlp.up", "mlp.down",
+    ]
+    return names[which]
+
+
+def q4_hess_slot(which: Int) -> Int:
+    """The calibration Hessian projection `which` reads (HESS_*)."""
+    if which <= LORA_V:
+        return HESS_ATTN
+    if which == LORA_O:
+        return HESS_O
+    if which <= LORA_UP:
+        return HESS_MLP
+    return HESS_DOWN
+
+
+def q4_blocks_key(ref names: TorchNameMap, ours: String) raises -> String:
+    """The key of a linear's Q4_0 blocks in a blocks file: the checkpoint's
+    name for `<ours>.weight`, plus `.q4_0`."""
+    var wi = names.index_of_ours(ours + ".weight")
+    if wi < 0:
+        raise Error("q4_blocks_key: the name map has no '" + ours + ".weight'")
+    return names.theirs[wi] + ".q4_0"
 
 
 struct DecoderMLP[W: Int, FF: Int, LORA_R: Int = 0, Q4: Bool = False](Movable):
@@ -248,6 +300,8 @@ struct DecoderLayerWeights[
     var k_q4: QLinear[Self.QI_KV, Self.QO_KVW]
     var v_q4: QLinear[Self.QI_KV, Self.QO_KVW]
     var o_q4: QLinear[Self.QI_QW, Self.QO_W]
+    # Calibration taps: empty unless `hessian_start` (module docstring).
+    var hess: List[HessianAccumulator]
 
     def __init__(out self):
         self.input_layernorm = SmolNorm[Self.W]()
@@ -265,6 +319,7 @@ struct DecoderLayerWeights[
         self.k_q4 = QLinear[Self.QI_KV, Self.QO_KVW]()
         self.v_q4 = QLinear[Self.QI_KV, Self.QO_KVW]()
         self.o_q4 = QLinear[Self.QI_QW, Self.QO_W]()
+        self.hess = List[HessianAccumulator]()
 
     def __init__(out self, *, deinit move: Self):
         self.input_layernorm = move.input_layernorm^
@@ -282,6 +337,7 @@ struct DecoderLayerWeights[
         self.k_q4 = move.k_q4^
         self.v_q4 = move.v_q4^
         self.o_q4 = move.o_q4^
+        self.hess = move.hess^
 
     @staticmethod
     def make[
@@ -406,7 +462,17 @@ struct DecoderLayerWeights[
     ) raises:
         """Projection WHICH (`LORA_Q` .. `LORA_DOWN`): its linear's forward
         (`Linear`, or `QLinear` at `Q4`), then its adapter's share
-        (`lora_fwd`, nothing at `LORA_R = 0`)."""
+        (`lora_fwd`, nothing at `LORA_R = 0`). With calibration taps on
+        (`hessian_start`), the input first goes into its Hessian."""
+        if len(self.hess) > 0:
+            comptime if WHICH == LORA_Q:
+                self.hess[HESS_ATTN].add[target](inputs[0], T, ctx)
+            elif WHICH == LORA_O:
+                self.hess[HESS_O].add[target](inputs[0], T, ctx)
+            elif WHICH == LORA_GATE:
+                self.hess[HESS_MLP].add[target](inputs[0], T, ctx)
+            elif WHICH == LORA_DOWN:
+                self.hess[HESS_DOWN].add[target](inputs[0], T, ctx)
         comptime if Self.Q4:
             comptime if WHICH == LORA_Q:
                 self.q_q4.forward[target, T](inputs, out, ctx)
@@ -502,18 +568,123 @@ struct DecoderLayerWeights[
         `<prefix>.self_attn.q.weight` and so on), quantized by round-to-
         nearest on the Q4_0 grid. Returns the map entries claimed: each
         weight and its zero bias (the published layers have none)."""
+        return self._load_q4[target](st, names, prefix, st, False, ctx)
+
+    def load_q4_blocks[
+        target: StaticString
+    ](
+        mut self,
+        ref st: SafeTensors,
+        ref names: TorchNameMap,
+        prefix: String,
+        ref blocks: SafeTensors,
+        ctx: Optional[DeviceContext] = None,
+    ) raises -> Int:
+        """`load_q4` with the seven linears' Q4_0 blocks read from `blocks`
+        (keys `q4_blocks_key`, U8 [OUT, IN / 32 · 18]) instead of quantized
+        from `st`, whose shapes and zero biases are still checked."""
+        return self._load_q4[target](st, names, prefix, blocks, True, ctx)
+
+    def _load_q4[
+        target: StaticString
+    ](
+        mut self,
+        st: SafeTensors,
+        names: TorchNameMap,
+        prefix: String,
+        blocks: SafeTensors,
+        from_blocks: Bool,
+        ctx: Optional[DeviceContext],
+    ) raises -> Int:
         comptime assert Self.Q4, "load_q4: this layer is not int4 (Q4 = False)"
-        var sa = join_name(prefix, String("self_attn"))
-        var mp = join_name(prefix, String("mlp"))
         var n = 0
-        n += _load_one_q4[target](self.q_q4, st, names, join_name(sa, String("q")), ctx)
-        n += _load_one_q4[target](self.k_q4, st, names, join_name(sa, String("k")), ctx)
-        n += _load_one_q4[target](self.v_q4, st, names, join_name(sa, String("v")), ctx)
-        n += _load_one_q4[target](self.o_q4, st, names, join_name(sa, String("o")), ctx)
-        n += _load_one_q4[target](self.mlp.gate_q4, st, names, join_name(mp, String("gate")), ctx)
-        n += _load_one_q4[target](self.mlp.up_q4, st, names, join_name(mp, String("up")), ctx)
-        n += _load_one_q4[target](self.mlp.down_q4, st, names, join_name(mp, String("down")), ctx)
+        n += _load_one_q4[target](self.q_q4, st, names, join_name(prefix, q4_proj_name(LORA_Q)), blocks, from_blocks, ctx)
+        n += _load_one_q4[target](self.k_q4, st, names, join_name(prefix, q4_proj_name(LORA_K)), blocks, from_blocks, ctx)
+        n += _load_one_q4[target](self.v_q4, st, names, join_name(prefix, q4_proj_name(LORA_V)), blocks, from_blocks, ctx)
+        n += _load_one_q4[target](self.o_q4, st, names, join_name(prefix, q4_proj_name(LORA_O)), blocks, from_blocks, ctx)
+        n += _load_one_q4[target](self.mlp.gate_q4, st, names, join_name(prefix, q4_proj_name(LORA_GATE)), blocks, from_blocks, ctx)
+        n += _load_one_q4[target](self.mlp.up_q4, st, names, join_name(prefix, q4_proj_name(LORA_UP)), blocks, from_blocks, ctx)
+        n += _load_one_q4[target](self.mlp.down_q4, st, names, join_name(prefix, q4_proj_name(LORA_DOWN)), blocks, from_blocks, ctx)
         return n
+
+    # ── calibration (GPTQ) ─────────────────────────────────────────────
+    def hessian_start(mut self):
+        """Turn the calibration taps on with four zeroed Hessians (module
+        docstring). Self-attention layers only: q, k and v must read the
+        same input."""
+        comptime assert Self.KV_IN == Self.W, (
+            "hessian_start: a cross-attention layer's k / v read the cache,"
+            " not the attention input"
+        )
+        self.hess = [
+            HessianAccumulator(Self.W),
+            HessianAccumulator(Self.QW),
+            HessianAccumulator(Self.W),
+            HessianAccumulator(Self.FF),
+        ]
+
+    def hessian_take(mut self) -> List[HessianAccumulator]:
+        """The four Hessians (HESS_*), and the taps off."""
+        var out = self.hess^
+        self.hess = List[HessianAccumulator]()
+        return out^
+
+    def base_weight(self, which: Int) raises -> List[Float32]:
+        """Projection `which`'s fp32 weight as [OUT, IN] (torch's
+        orientation, the one Q4_0 and GPTQ use), from the host copy."""
+        comptime assert not Self.Q4, "base_weight: an int4 layer has no fp32 weight"
+        if which == LORA_Q:
+            return _lin_out_in(self.q)
+        if which == LORA_K:
+            return _lin_out_in(self.k)
+        if which == LORA_V:
+            return _lin_out_in(self.v)
+        if which == LORA_O:
+            return _lin_out_in(self.o)
+        if which == LORA_GATE:
+            return _lin_out_in(self.mlp.gate)
+        if which == LORA_UP:
+            return _lin_out_in(self.mlp.up)
+        return _lin_out_in(self.mlp.down)
+
+    def set_base_weight[
+        target: StaticString
+    ](
+        mut self,
+        which: Int,
+        ref w: List[Float32],
+        ctx: Optional[DeviceContext] = None,
+    ) raises:
+        """Overwrite projection `which`'s fp32 weight with `w` [OUT, IN] (a
+        dequantized one, for sequential calibration), on the host and the
+        device, and bump its version so the weight caches refresh."""
+        comptime assert not Self.Q4, "set_base_weight: an int4 layer has no fp32 weight"
+        if which == LORA_Q:
+            _lin_set[target](self.q, w, ctx)
+        elif which == LORA_K:
+            _lin_set[target](self.k, w, ctx)
+        elif which == LORA_V:
+            _lin_set[target](self.v, w, ctx)
+        elif which == LORA_O:
+            _lin_set[target](self.o, w, ctx)
+        elif which == LORA_GATE:
+            _lin_set[target](self.mlp.gate, w, ctx)
+        elif which == LORA_UP:
+            _lin_set[target](self.mlp.up, w, ctx)
+        else:
+            _lin_set[target](self.mlp.down, w, ctx)
+
+    def proj_dims(self, which: Int) -> Tuple[Int, Int]:
+        """(IN, OUT) of projection `which`."""
+        if which == LORA_Q:
+            return (Self.W, Self.QW)
+        if which <= LORA_V:
+            return (Self.KV_IN, Self.KVW)
+        if which == LORA_O:
+            return (Self.QW, Self.W)
+        if which <= LORA_UP:
+            return (Self.W, Self.FF)
+        return (Self.FF, Self.W)
 
     def share_q4_scratch(mut self, buf: DeviceBuffer[DT], n: Int) raises:
         """Point the seven `QLinear`s' dequantize scratch at `buf`."""
@@ -617,19 +788,52 @@ struct DecoderLayerWeights[
         self.mlp.walk_state[target](vis, ctx, join_name(prefix, String("mlp")))
 
 
+def _lin_out_in[IN: Int, OUT: Int](ref lin: Linear[IN, OUT]) -> List[Float32]:
+    """A `Linear`'s [IN, OUT] weight as [OUT, IN], from its host copy."""
+    var w = List[Float32](length=OUT * IN, fill=0)
+    for i in range(IN):
+        for o in range(OUT):
+            w[o * IN + i] = Float32(lin.weight.val.data[i * OUT + o])
+    return w^
+
+
+def _lin_set[
+    target: StaticString, IN: Int, OUT: Int
+](
+    mut lin: Linear[IN, OUT],
+    ref w: List[Float32],
+    ctx: Optional[DeviceContext],
+) raises:
+    """`w` [OUT, IN] into a `Linear`'s [IN, OUT] weight, host and device,
+    with the version bump that refreshes its caches."""
+    if len(w) != OUT * IN:
+        raise Error("set_base_weight: " + String(len(w)) + " values for ["
+                    + String(OUT) + ", " + String(IN) + "]")
+    for i in range(IN):
+        for o in range(OUT):
+            lin.weight.val.data[i * OUT + o] = Scalar[DT](w[o * IN + i])
+    comptime if target != "cpu":
+        lin.weight.val.upload_resident(ctx.value())
+    lin.weight.val.version += 1
+
+
 def _load_one_q4[
     target: StaticString, IN: Int, OUT: Int
 ](
     mut ql: QLinear[IN, OUT],
-    ref st: SafeTensors,
-    ref names: TorchNameMap,
+    st: SafeTensors,
+    names: TorchNameMap,
     ours: String,
+    blocks: SafeTensors,
+    from_blocks: Bool,
     ctx: Optional[DeviceContext],
 ) raises -> Int:
     """One projection: our `<ours>.weight` -> the file's name through the
-    map, read as fp32, checked against [OUT, IN] (the torch orientation
-    `QLinear` keeps), RTN-quantized. Returns 2: the weight and the bias the
-    map fills with zeros (a `QLinear` has none, which is that zero)."""
+    map, checked against [OUT, IN] (the torch orientation `QLinear` keeps),
+    then read as fp32 and RTN-quantized, or (`from_blocks`) its Q4_0 blocks
+    read from `blocks` at `q4_blocks_key`. Returns 2: the weight and the
+    bias the map fills with zeros (a `QLinear` has none, which is that
+    zero)."""
     var wi = names.index_of_ours(ours + ".weight")
     if wi < 0:
         raise Error("load_q4: the name map has no '" + ours + ".weight'")
@@ -646,6 +850,17 @@ def _load_one_q4[
             "load_q4: '" + theirs + "' is " + st.shape_str(theirs)
             + ", expected [" + String(OUT) + ", " + String(IN) + "]"
         )
+    if from_blocks:
+        var key = theirs + ".q4_0"
+        var bshape = blocks.shape(key)
+        var row = (IN // Q4_GROUP) * Q4_BLOCK
+        if len(bshape) != 2 or bshape[0] != OUT or bshape[1] != row:
+            raise Error(
+                "load_q4_blocks: '" + key + "' is " + blocks.shape_str(key)
+                + ", expected [" + String(OUT) + ", " + String(row) + "]"
+            )
+        ql.set_blocks[target](blocks.read_raw(key), ctx)
+        return 2
     var w = st.read_f32(theirs)
     ql.set_weight[target](w, ctx)
     return 2

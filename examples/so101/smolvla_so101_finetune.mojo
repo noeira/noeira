@@ -85,6 +85,10 @@ is read from `tools/vla/`.
 | `SMOLVLA_INIT` | a `*_best.ckpt` to start from, applied ON TOP of the base checkpoint |
 | `SMOLVLA_VAL_EPISODES` | episodes held out at the END of the recording; default one fifth. **`0` trains on every episode** — see below |
 | `SMOLVLA_PROFILE` | set to anything: per-phase wall times (host images / prefix / suffix forward / backward) in the log line, at the cost of three extra drains per observation |
+| `SMOLVLA_VLM_Q4_BLOCKS` | `-D SMOLVLA_VLM_Q4=1` builds only: read the int4 VLM's Q4_0 blocks from this file (made by `SMOLVLA_GPTQ_OUT`) instead of quantizing the published weights by round-to-nearest |
+| `SMOLVLA_GPTQ_OUT` | fp32 builds only: before the baseline, calibrate the VLM's 16 text layers on TRAINING observations, layer by layer, write their Q4_0 blocks to this file, and leave the dequantized weights in the tower, so the baseline that follows is the quantized VLM's held-out loss (fp32 activations). See `gptq_calib.mojo` |
+| `SMOLVLA_GPTQ_N` | calibration observations for `SMOLVLA_GPTQ_OUT`, a multiple of `B` (default 256), drawn from the training rows with a fixed seed |
+| `SMOLVLA_GPTQ_METHOD` | `gptq` (default) or `rtn`: the blocks `SMOLVLA_GPTQ_OUT` keeps; both objectives are printed either way |
 | `SMOLVLA_VISION_CACHE` | path of the vision cache; default `<store>.vision.bin`; `off` recomputes the tower every observation (the pre-cache path, kept for A/B) |
 | `SMOLVLA_NO_MONITOR` | force the metrics logger inert |
 | `SMOLVLA_PROJECT` | the project the run is filed under (default `so101`); must exist on the box. `project-promote` promotes into the run's project |
@@ -222,6 +226,12 @@ from noeira.deep_agents.smolvla.dataset import SmolVLABatchSampler
 from noeira.deep_agents.smolvla.observation import fill_store_images
 from noeira.deep_agents.smolvla.train_step import SmolVLATrainStep
 from noeira.deep_agents.smolvla.vision_cache import VisionCache
+from noeira.deep_agents.smolvla.gptq_calib import (
+    calibrate_tower_q4, save_q4_blocks, Q4_GPTQ, Q4_RTN, Q4ProjStat,
+)
+from noeira.deep_agents.smolvla.names import text_name_map
+from noeira.deep_agents.smolvla.layer_weights import q4_proj_name, q4_blocks_key
+from noeira.io.safetensors import SafeTensors
 from noeira.deep_agents.smolvla.finetune import (
     zero_trainable_grads, adam_step_trainables, save_trainables,
     load_trainables, adopt_trainables, clip_trainables,
@@ -355,6 +365,10 @@ comptime IMG_ELEMS = N_CAM * 3 * SRC_H * SRC_W
 comptime AN = B * CHUNK * PAD
 comptime VSEG = Pol.Prefix.IMG_SEG
 """One vision-cache row: N_CAM x 64 tokens x 960, fp32 — 491 520 bytes."""
+comptime GPTQ_SEED: UInt64 = 0x6E7_0C0DE
+"""The row sampler's seed for the calibration observations of
+`SMOLVLA_GPTQ_OUT`: the same rows on every run, so a blocks file names its
+calibration."""
 comptime VC_FLUSH_EVERY = 200
 comptime VC_PRINT_EVERY = 1000
 
@@ -737,6 +751,13 @@ def main() raises:
     print("  loading lerobot/smolvla_base ...")
     var weights = hf_download_file(REPO, String("model.safetensors"), HF_MODEL)
     var pol = Pol.make["gpu", Deterministic](Optional(ctx))
+    var q4_blocks = getenv("SMOLVLA_VLM_Q4_BLOCKS")
+    if q4_blocks.byte_length() > 0:
+        # `load` refuses it on a build without VLM_Q4.
+        pol.vlm_q4_blocks = q4_blocks
+        print("  int4    the VLM's Q4_0 blocks from " + q4_blocks)
+    elif VLM_Q4:
+        print("  int4    the VLM by round-to-nearest from the published weights")
     pol.load["gpu"](weights, Optional(ctx))
     pol.load_stats(stats_path)
     # Everything `train_expert_only` leaves untrained gives its gradient
@@ -996,6 +1017,35 @@ def main() raises:
           + String(accum) + " observations, drawn once from rows ["
           + String(val_lo) + ", " + String(n_rows) + ")  " + val_label)
 
+    # ── int4 calibration, AFTER the held-out groups are drawn (it consumes
+    # the global RNG) and BEFORE the baseline, which then scores it ───────
+    var gptq_out = getenv("SMOLVLA_GPTQ_OUT")
+    if gptq_out.byte_length() > 0:
+        comptime if VLM_Q4 or TOWER_R > 0:
+            raise Error(
+                "SMOLVLA_GPTQ_OUT calibrates the fp32 VLM: build without"
+                " SMOLVLA_VLM_Q4 and SMOLVLA_TOWER_R"
+            )
+        else:
+            var n_cal = 256
+            var e_n = getenv("SMOLVLA_GPTQ_N")
+            if e_n.byte_length() > 0:
+                n_cal = Int(e_n)
+            var e_m = getenv("SMOLVLA_GPTQ_METHOD")
+            var method = Q4_GPTQ
+            if e_m == "rtn":
+                method = Q4_RTN
+            elif e_m.byte_length() > 0 and e_m != "gptq":
+                raise Error("SMOLVLA_GPTQ_METHOD=" + e_m + ": gptq or rtn")
+            if n_cal <= 0 or n_cal % B != 0:
+                raise Error("SMOLVLA_GPTQ_N=" + String(n_cal)
+                            + " must be a positive multiple of B = " + String(B))
+            calibrate_vlm(
+                gptq_out, store_path, n_cal, method, split, held_out, pol, sam, tasks,
+                img_col, row, images, scratch, state_t, acts_t, valid_t,
+                vcache, seg, ctx,
+            )
+
     # ── the BASELINE, before a single update ─────────────────────────────
     # ⚠ Without this every held-out number is post-update and "the loss fell"
     # has nothing to fall FROM. It is also the only number that says anything
@@ -1223,6 +1273,154 @@ def save_ckpt(
             pol.time_mlp_out, pol.action_out, sp_frozen, True, Optional(ctx),
             scalars=sc,
         )
+
+
+def calibrate_vlm(
+    path: String,
+    store_path: String,
+    n_cal: Int,
+    method: Int,
+    split: Int,
+    held_out: Bool,
+    mut pol: Pol,
+    mut sam: Sampler,
+    ref tasks: TaskTokens,
+    mut img_col: H5Dataset,
+    mut row: List[Scalar[DType.uint8]],
+    mut images: Tensor,
+    mut scratch: List[Float32],
+    mut state_t: Tensor,
+    mut acts_t: Tensor,
+    mut valid_t: Tensor,
+    mut vcache: VisionCache,
+    mut seg: List[Float32],
+    ctx: DeviceContext,
+) raises:
+    """`SMOLVLA_GPTQ_OUT`: `n_cal` TRAINING observations (rows [0, split),
+    fixed seed) through the prefix, their prefill inputs kept, then
+    `calibrate_tower_q4` over the 16 text layers and the blocks file. The
+    tower keeps deq(Ŵ), so the held-out baseline that follows scores it."""
+    comptime if VLM_Q4 or TOWER_R > 0:
+        raise Error("calibrate_vlm: an fp32 build without tower adapters only")
+    else:
+        _calibrate_vlm(
+            path, store_path, n_cal, method, split, held_out, pol, sam, tasks,
+            img_col, row, images, scratch, state_t, acts_t, valid_t, vcache,
+            seg, ctx,
+        )
+
+
+def _calibrate_vlm(
+    path: String,
+    store_path: String,
+    n_cal: Int,
+    method: Int,
+    split: Int,
+    held_out: Bool,
+    mut pol: Pol,
+    mut sam: Sampler,
+    ref tasks: TaskTokens,
+    mut img_col: H5Dataset,
+    mut row: List[Scalar[DType.uint8]],
+    mut images: Tensor,
+    mut scratch: List[Float32],
+    mut state_t: Tensor,
+    mut acts_t: Tensor,
+    mut valid_t: Tensor,
+    mut vcache: VisionCache,
+    mut seg: List[Float32],
+    ctx: DeviceContext,
+) raises:
+    var t0 = perf_counter_ns()
+    var keep_rng = sam.rng
+    sam.rng = GPTQ_SEED
+    var gr = draw_group(sam, n_cal // B, 0, split, state_t, acts_t, valid_t)
+    sam.rng = keep_rng
+    var xs = List[List[Float32]]()
+    comptime XN = B * Pol.P * SMOLLM_DIM
+    for m in range(n_cal // B):
+        var lang = List[Int]()
+        var rs = List[Float32]()
+        for b in range(B):
+            var ids = tasks.for_index(gr.tasks[m * B + b])
+            for t in range(len(ids)):
+                lang.append(ids[t])
+            for j in range(SDIM):
+                rs.append(gr.raw_state[(m * B + b) * SDIM + j])
+        if vcache.active:
+            for b in range(B):
+                vcache.read_row(gr.rows[m * B + b], seg, b * VSEG)
+            pol.build_prefix_from_segment["gpu"](seg, lang, rs, Optional(ctx))
+        else:
+            var g = gr.rows[m * B]
+            img_col.read_range[DType.uint8](g, g + 1, mptr(row))
+            fill_store_images["gpu", N_CAM](
+                row, SRC_W, SRC_H, images, scratch, Optional(ctx)
+            )
+            pol.build_prefix["gpu"](images, lang, rs, Optional(ctx))
+        pol.prefix_buf.download(ctx)
+        var x = List[Float32](capacity=XN)
+        for i in range(XN):
+            x.append(Float32(pol.prefix_buf.data[i]))
+        xs.append(x^)
+    var lo_row = gr.rows[0]
+    var hi_row = gr.rows[0]
+    for r in gr.rows:
+        lo_row = min(lo_row, r)
+        hi_row = max(hi_row, r)
+    print("  int4    calibration: " + String(n_cal) + " observations from rows ["
+          + String(lo_row) + ", " + String(hi_row) + "] of the training range [0, "
+          + String(split) + ")" + ("" if held_out else " (nothing is held out)")
+          + ", " + String(Pol.P) + " tokens each; method "
+          + ("GPTQ" if method == Q4_GPTQ else "RTN"))
+    var blocks = List[List[UInt8]]()
+    var stats = calibrate_tower_q4["gpu"](
+        pol.prefill, pol.tower, pol.cache, xs, method, blocks, Optional(ctx),
+        verbose=True,
+    )
+    var dims = List[Tuple[Int, Int]]()
+    for which in range(7):
+        dims.append(pol.tower.layers[0].proj_dims(which))
+    save_q4_blocks(
+        path, text_name_map(), blocks, SMOLLM_LAYERS, dims, method,
+        String(n_cal) + " training observations of " + store_path
+        + ", rows sampled with seed " + String(GPTQ_SEED),
+    )
+    # Read back: the file must hold every byte the calibration produced.
+    var back = SafeTensors(path)
+    var names = text_name_map()
+    var bad = 0
+    for i in range(SMOLLM_LAYERS):
+        for which in range(7):
+            var got = back.read_raw(
+                q4_blocks_key(names, String("layers.") + String(i) + "."
+                              + q4_proj_name(which))
+            )
+            ref want = blocks[i * 7 + which]
+            if len(got) != len(want):
+                bad += 1
+                continue
+            for e in range(len(want)):
+                if got[e] != want[e]:
+                    bad += 1
+                    break
+    if bad > 0:
+        raise Error("calibrate_vlm: " + String(bad) + " linears differ in " + path)
+    # Per projection kind, over the 16 layers: Σ objective GPTQ / Σ RTN.
+    var line = String("  int4    Σ objective GPTQ / RTN over the layers:")
+    for which in range(7):
+        var g = Float64(0)
+        var r = Float64(0)
+        for st in stats:
+            if st.which == which:
+                g += st.obj_gptq
+                r += st.obj_rtn
+        line += "  " + q4_proj_name(which) + " " + String(g / r)
+    print(line)
+    print("  int4    wrote " + path + " (" + String(len(blocks))
+          + " linears, read back identical) in "
+          + String(Float64(perf_counter_ns() - t0) / 1e9) + " s; the tower now"
+          " holds the dequantized weights")
 
 
 def fresh_segment(

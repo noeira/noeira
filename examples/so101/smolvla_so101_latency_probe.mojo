@@ -56,7 +56,8 @@ builds the 16 text layers as int4 `QLinear`s (`nn/quant`): `load` quantizes
 their 112 linears from the published weights (round-to-nearest, Q4_0), and the
 prefill runs MAX's int4 GEMM on NVIDIA. On NVIDIA the probe then keeps only the
 repacked blocks that GEMM reads (`keep_only_repacked`), as an inference deploy
-would.
+would. `SMOLVLA_VLM_Q4_BLOCKS=<file>` loads the 112 linears' Q4_0 blocks from
+a GPTQ calibration instead (`smolvla_so101_finetune.mojo`, `SMOLVLA_GPTQ_OUT`).
 """
 
 from std.ffi import OwnedDLHandle, c_int
@@ -191,6 +192,10 @@ def main() raises:
         else String("after make (values only, NN_INFERENCE_ONLY)"),
         mem0,
     )
+    var q4_blocks = getenv("SMOLVLA_VLM_Q4_BLOCKS")
+    if q4_blocks.byte_length() > 0:
+        pol.vlm_q4_blocks = q4_blocks
+        print("  int4 VLM: Q4_0 blocks from", q4_blocks)
     pol.load[TARGET](path, Optional(d))
     comptime if VLM_Q4 and Q4_INT4_GEMM:
         mem_line(String("after load (int4 VLM: blocks + repacked)"), mem0)

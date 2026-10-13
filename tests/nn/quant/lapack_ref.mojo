@@ -7,25 +7,10 @@ same matrix, and LAPACK's upper factor U (Uᵀ U = H) read back row-major is
 our lower L (L Lᵀ = H): so 'U' below, on our row-major arrays, means L.
 """
 
+from std.ffi import OwnedDLHandle
 from std.sys import CompilationTarget
-from linalg.matmul.cpu.apple_accelerate import _get_dylib_function
 
-comptime _potrf_t = def(
-    Pointer[Int8, MutAnyOrigin],
-    Pointer[Int32, MutAnyOrigin],
-    Pointer[Float64, MutAnyOrigin],
-    Pointer[Int32, MutAnyOrigin],
-    Pointer[Int32, MutAnyOrigin],
-) thin -> Int32
-
-comptime _trtri_t = def(
-    Pointer[Int8, MutAnyOrigin],
-    Pointer[Int8, MutAnyOrigin],
-    Pointer[Int32, MutAnyOrigin],
-    Pointer[Float64, MutAnyOrigin],
-    Pointer[Int32, MutAnyOrigin],
-    Pointer[Int32, MutAnyOrigin],
-) thin -> Int32
+comptime _ACCELERATE = "/System/Library/Frameworks/Accelerate.framework/Accelerate"
 
 
 def _p[T: DType](mut v: List[Scalar[T]]) -> Pointer[Scalar[T], MutAnyOrigin]:
@@ -39,7 +24,9 @@ def lapack_potrf_lower(ref h: List[Float64], n: Int) raises -> List[Float64]:
         var uplo: List[Int8] = [Int8(ord("U"))]
         var nn: List[Int32] = [Int32(n)]
         var info: List[Int32] = [Int32(0)]
-        var f = _get_dylib_function["dpotrf_", _potrf_t]()
+        var lib = OwnedDLHandle(_ACCELERATE)
+        # `get_function`'s parameter is the symbol's RETURN type.
+        var f = lib.get_function[Int32]("dpotrf_")
         _ = f(_p(uplo), _p(nn), _p(a), _p(nn), _p(info))
         if info[0] != 0:
             raise Error("dpotrf_ info " + String(info[0]))
@@ -59,7 +46,8 @@ def lapack_trtri_lower(ref l: List[Float64], n: Int) raises -> List[Float64]:
         var diag: List[Int8] = [Int8(ord("N"))]
         var nn: List[Int32] = [Int32(n)]
         var info: List[Int32] = [Int32(0)]
-        var f = _get_dylib_function["dtrtri_", _trtri_t]()
+        var lib = OwnedDLHandle(_ACCELERATE)
+        var f = lib.get_function[Int32]("dtrtri_")
         _ = f(_p(uplo), _p(diag), _p(nn), _p(a), _p(nn), _p(info))
         if info[0] != 0:
             raise Error("dtrtri_ info " + String(info[0]))

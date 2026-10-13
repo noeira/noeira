@@ -167,19 +167,28 @@ struct SmolVLMTextLayers[
         ref st: SafeTensors,
         ref names: TorchNameMap,
         ctx: Optional[DeviceContext] = None,
+        blocks_path: String = "",
     ) raises -> Int:
         """Quantize the 112 linears of the published weights `st` into the
-        int4 layers (`DecoderLayerWeights.load_q4`), through the text name map.
-        The norms load through the walk, as before. Returns the map entries
-        claimed (each weight and its zero bias). On a GPU whose forward
-        dequantizes (Metal, or `NN_Q4_PATH=deq`), the layers then share one
-        dequantize scratch."""
+        int4 layers (`DecoderLayerWeights.load_q4`), through the text name map;
+        or, with `blocks_path`, read their Q4_0 blocks from that file
+        (`load_q4_blocks`: GPTQ's output, `gptq_calib.mojo`). The norms load
+        through the walk, as before. Returns the map entries claimed (each
+        weight and its zero bias). On a GPU whose forward dequantizes (Metal,
+        or `NN_Q4_PATH=deq`), the layers then share one dequantize scratch."""
         comptime assert Self.Q4, "load_q4: this tower is not int4 (Q4 = False)"
         var n = 0
-        for i in range(Self.LAYERS):
-            n += self.layers[i].load_q4[target](
-                st, names, String("layers.") + String(i), ctx
-            )
+        if blocks_path:
+            var bf = SafeTensors(blocks_path)
+            for i in range(Self.LAYERS):
+                n += self.layers[i].load_q4_blocks[target](
+                    st, names, String("layers.") + String(i), bf, ctx
+                )
+        else:
+            for i in range(Self.LAYERS):
+                n += self.layers[i].load_q4[target](
+                    st, names, String("layers.") + String(i), ctx
+                )
         comptime if target == "gpu" and not Q4_INT4_GEMM:
             self.ensure_q4_scratch(ctx.value())
         return n
