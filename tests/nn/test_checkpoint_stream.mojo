@@ -13,6 +13,12 @@ rename it on `commit`, instead of building the whole file in memory first.
    leaves the previous checkpoint at the path untouched; committing replaces
    it, and the file loads back.
 4. Misuse raises: `commit` twice, and `commit` on an in-memory writer.
+5. No host copies (GPU): a streamed save of a trained model leaves every
+   parameter and moment without a host staging buffer it did not have
+   before; the in-memory writer's `download` gives them one (the control,
+   without which the count would gate nothing). On a Jetson those copies are
+   what killed a save with moments after the file stopped being built in
+   memory.
 
 Run: pixi run -e apple mojo run -I . tests/nn/test_checkpoint_stream.mojo
 """
@@ -24,6 +30,7 @@ from noeira.nn.constants import DT
 from noeira.nn.core.tensor import Tensor
 from noeira.nn.core.tensor_refs import TensorRefs
 from noeira.nn.core.initializer import Deterministic
+from noeira.nn.core.param import ParamVisitor
 from noeira.nn.core.checkpoint import (
     save_params, load_params, save_params_multi, write_model,
     BinaryCheckpointWriter, CheckpointScalars, _read_file_bytes,
@@ -104,6 +111,7 @@ def _identity[target: StaticString](
     var p3 = "/tmp/ckpt_stream_" + tag + "_chunked.ckpt"
     var w = BinaryCheckpointWriter.to_file(p3, True)
     w.chunk = 7
+    w.stage_elems = 5
     write_model[target](w, net, ctx)
     w.write_scalars(_scalars())
     var streamed = w.bytes_written
@@ -124,6 +132,47 @@ def _identity[target: StaticString](
         d1 == 0 and d2 == 0 and d3 == 0 and has_moments
         and streamed == len(ref1.content)
     )
+
+
+struct _HostCopies(ParamVisitor):
+    """Counts the parameter and moment tensors that hold a host staging
+    buffer."""
+    var n: Int
+
+    def __init__(out self):
+        self.n = 0
+
+    def visit[target: StaticString, N: Int](
+        mut self, name: String, mut param: Tensor, mut grad: Tensor,
+        mut m: Tensor, mut v: Tensor, apply_decay: Bool,
+        ctx: Optional[DeviceContext],
+    ) raises:
+        if param.hbuf:
+            self.n += 1
+        if m.hbuf:
+            self.n += 1
+        if v.hbuf:
+            self.n += 1
+
+
+def _host_copies(ctx: DeviceContext) raises -> Bool:
+    var net = NET.make["gpu", Deterministic](Optional(ctx))
+    _train3["gpu"](net, Optional(ctx))
+    var before = _HostCopies()
+    net.for_each_param["gpu"](before, Optional(ctx))
+    save_params["gpu"](net, "/tmp/ckpt_stream_hostcopies.ckpt", Optional(ctx))
+    var streamed = _HostCopies()
+    net.for_each_param["gpu"](streamed, Optional(ctx))
+    var w = BinaryCheckpointWriter(True)
+    write_model["gpu"](w, net, Optional(ctx))
+    var in_memory = _HostCopies()
+    net.for_each_param["gpu"](in_memory, Optional(ctx))
+    print(
+        "  host staging buffers (params + moments): before", before.n,
+        "| after a streamed save", streamed.n,
+        "| after the in-memory writer", in_memory.n,
+    )
+    return streamed.n == before.n and in_memory.n > before.n
 
 
 def _atomic() raises -> Bool:
@@ -180,5 +229,9 @@ def main() raises:
     var ok_gpu = _identity["gpu"](Optional(ctx), "gpu")
     var ok_atomic = _atomic()
     var ok_misuse = _misuse()
-    assert_true(ok_cpu and ok_gpu and ok_atomic and ok_misuse, "streaming checkpoint")
+    var ok_host = _host_copies(ctx)
+    assert_true(
+        ok_cpu and ok_gpu and ok_atomic and ok_misuse and ok_host,
+        "streaming checkpoint",
+    )
     print("PASSED")

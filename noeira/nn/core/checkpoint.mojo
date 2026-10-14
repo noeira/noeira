@@ -44,7 +44,7 @@ download on save / upload on load.
 
 from noeira.core.bytes import string_from_bytes
 
-from max.gpu.host import DeviceContext
+from max.gpu.host import DeviceContext, HostBuffer
 from std.memory import bitcast, unsafe_memcpy
 from std.sys.info import size_of
 
@@ -57,6 +57,9 @@ from .param import ParamWalkable
 comptime _WRITE_CHUNK = 1 << 30
 """The streaming writer's largest single `write(2)`: the same 1 GiB bound as
 `noeira/io/fileio.mojo`'s chunked writes."""
+
+comptime _STAGE_ELEMS = 1 << 24
+"""Values per device-to-host copy in the streaming writer (64 MB of fp32)."""
 
 
 def _write_file_bytes(var path: String, content: List[UInt8]) raises:
@@ -335,7 +338,17 @@ struct BinaryCheckpointWriter(ParamVisitor, ParamVisitorRT):
     the frozen fp32 text tower among them) trained, then died at its first
     save with 144 MB of memory left. Streaming holds one header line at a
     time; the payloads go to the file straight from each tensor's host buffer.
-    `save_params` and `save_params_multi` stream."""
+    `save_params` and `save_params_multi` stream.
+
+    ⚠ On a GPU the streaming sink does NOT `download` a tensor. `download`
+    keeps two host copies of it for good (a pinned staging buffer and the
+    `data` list), and for Adam's m and v those copies did not exist before the
+    save: on the same Orin run, a checkpoint with moments still died at 429 MB
+    after the file stopped being built in memory. The streaming sink copies
+    each device tensor through one reusable staging buffer of `stage_elems`
+    values instead, so a save holds 64 MB of staging, whatever the model. A
+    side effect `download` had is gone with it: saving no longer refreshes
+    the tensors' host `data`. The in-memory sink still downloads."""
     var content: List[UInt8]
     var mode: Int
     var save_moments: Bool
@@ -348,6 +361,11 @@ struct BinaryCheckpointWriter(ParamVisitor, ParamVisitorRT):
     var chunk: Int
     """The largest single write to the file (`_WRITE_CHUNK`); a test lowers it
     to drive the chunk loop."""
+    var _stage: Optional[HostBuffer[DT]]
+    """The streaming sink's one device-to-host staging buffer, made on the
+    first GPU tensor and reused for every copy."""
+    var stage_elems: Int
+    """Values per staged copy (`_STAGE_ELEMS`); a test lowers it."""
 
     def __init__(out self, save_moments: Bool = True):
         self.content = List[UInt8]()
@@ -357,6 +375,8 @@ struct BinaryCheckpointWriter(ParamVisitor, ParamVisitorRT):
         self._path = String("")
         self.bytes_written = 0
         self.chunk = _WRITE_CHUNK
+        self._stage = None
+        self.stage_elems = _STAGE_ELEMS
         var hb = String("storage-ckpt v3\n").as_bytes()
         self._append_mem(hb.unsafe_ptr(), len(hb))
 
@@ -374,6 +394,8 @@ struct BinaryCheckpointWriter(ParamVisitor, ParamVisitorRT):
         self._path = path
         self.bytes_written = 0
         self.chunk = _WRITE_CHUNK
+        self._stage = None
+        self.stage_elems = _STAGE_ELEMS
         self._put_str(String("storage-ckpt v3\n"))
 
     def commit(mut self) raises:
@@ -417,6 +439,38 @@ struct BinaryCheckpointWriter(ParamVisitor, ParamVisitorRT):
         comptime SB = size_of[Scalar[DT]]()
         self._put_bytes(t.data.unsafe_ptr().unsafe_bitcast[UInt8](), n * SB)
 
+    def _put_device_vals(
+        mut self, t: Tensor, n: Int, ctx: DeviceContext
+    ) raises:
+        """The first `n` values of `t`'s DEVICE buffer, `stage_elems` at a
+        time through the one staging buffer (see the struct docstring)."""
+        comptime SB = size_of[Scalar[DT]]()
+        if not self._stage:
+            self._stage = ctx.enqueue_create_host_buffer[DT](self.stage_elems)
+        var off = 0
+        while off < n:
+            var take = min(n - off, self.stage_elems)
+            var src = t.dev.value().create_sub_buffer[DT](off, take)
+            var dst = self._stage.value().create_sub_buffer[DT](0, take)
+            ctx.enqueue_copy(dst, src)
+            ctx.synchronize()
+            self._put_bytes(
+                self._stage.value().unsafe_ptr().unsafe_bitcast[UInt8](),
+                take * SB,
+            )
+            off += take
+
+    def _put_tensor[target: StaticString](
+        mut self, t: Tensor, n: Int, ctx: Optional[DeviceContext]
+    ) raises:
+        """A GPU tensor streams from its device buffer; any other from `data`
+        (which the in-memory sink downloaded first)."""
+        comptime if target == "gpu":
+            if self._file:
+                self._put_device_vals(t, n, ctx.value())
+                return
+        self._put_vals(t, n)
+
     def _put_f64(mut self, x: Float64) raises:
         var b = List[UInt8](length=8, fill=0)
         var bits = bitcast[DType.uint64](x)
@@ -436,25 +490,25 @@ struct BinaryCheckpointWriter(ParamVisitor, ParamVisitorRT):
         mut m: Tensor, mut v: Tensor, n: Int, apply_decay: Bool,
         ctx: Optional[DeviceContext],
     ) raises:
-        comptime if target == "gpu":
-            param.download(ctx.value())
-        if self.mode == 1:  # State
-            self._put_str("S " + name + " " + String(n) + "\n")
-            self._put_vals(param, n)
-            return
         var has_m = self.save_moments and m.n >= n and v.n >= n
         comptime if target == "gpu":
-            if has_m:
-                m.download(ctx.value())
-                v.download(ctx.value())
+            if not self._file:  # the in-memory sink reads `data`
+                param.download(ctx.value())
+                if self.mode == 0 and has_m:
+                    m.download(ctx.value())
+                    v.download(ctx.value())
+        if self.mode == 1:  # State
+            self._put_str("S " + name + " " + String(n) + "\n")
+            self._put_tensor[target](param, n, ctx)
+            return
         self._put_str(
             "P " + name + " " + String(n) + " "
             + ("1" if has_m else "0") + "\n"
         )
-        self._put_vals(param, n)
+        self._put_tensor[target](param, n, ctx)
         if has_m:
-            self._put_vals(m, n)
-            self._put_vals(v, n)
+            self._put_tensor[target](m, n, ctx)
+            self._put_tensor[target](v, n, ctx)
 
     def visit[target: StaticString, N: Int](
         mut self,
