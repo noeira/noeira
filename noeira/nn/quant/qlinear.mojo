@@ -26,8 +26,9 @@ per element), not the fp32 path's; the gate compares within 1e-2.
 ## Padding (NVIDIA)
 
 MAX's repack (`gpu_qint4_repack_Q4_0`) instantiates only when N % 128 == 0
-and K % 1024 == 0 (results doc, Q0.6), and a K that is not a multiple of 1024
-would also leave the warp-K split of noeira's configs uneven. So the blocks
+and K % 1024 == 0 (its masked tile does not compile on a nested layout), and
+a K that is not a multiple of 1024 would also leave the warp-K split of
+noeira's configs uneven. So the blocks
 are padded once, at load, to [N_PAD, K_PAD] with zero groups (d = 0, which
 decode to 0 whatever the nibbles), x is padded with zero columns, and the
 extra output columns are never read. SmolVLA's text layer pays +14.7 % bytes.
@@ -40,20 +41,20 @@ noeira's, picked by `NN_Q4_CFG`:
     small2  64x128x32, warp-K 2, 4 stages   51.2 KB  (default)
     small   64x128x32, warp-K 4, 3 stages   76.8 KB
     small4  64x128x32, warp-K 4, 4 stages  102.4 KB  (Kev's on the Orin; refused on consumer
-                                                      Blackwell, results doc Q0.6)
+                                                      Blackwell: 101,376 B per block)
     large   128x128x32, warp-K 1, 5 stages  65.5 KB
 
 small2 is the fastest or tied at every SmolVLA text shape at the prefill's 135
 tokens on the Orin (the GEMM alone: 37 / 25 / 82 / 92 us against 42 / 29 /
 104 / 94 for small, `benchmarks/quant/bench_qlinear_smolvla.mojo`), and tied
-with small on an RTX 5090 (14 us, results doc Q0.6).
+with small on an RTX 5090 (14 us).
 
 ## Inference-only builds keep only the repacked blocks
 
 With `-D NN_INFERENCE_ONLY` on NVIDIA nothing can take a vjp, and the forward
 reads only the repacked blocks, so `set_blocks` never keeps the logical ones:
 no host copy, no device copy. On the Orin that is not a nicety. Memory freed
-after load is not handed back to the board (results doc, Q1.4), so a copy
+after load is not handed back to the board (the process keeps it), so a copy
 dropped later by `keep_only_repacked` is a copy the process still holds.
 
 ## The dequantized weight is a scratch

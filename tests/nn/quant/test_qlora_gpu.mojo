@@ -7,7 +7,7 @@ text shapes at the prefill's T = 135, rank 16.
 
 Bands: Metal runs fp32 GEMMs on both sides (1e-5). On NVIDIA the forward is
 MAX's int4 GEMM with bf16 activations against an fp32 GEMM, and both
-grad_inputs and adapter gradients are TF32 cuBLAS GEMMs: the plan's 1e-2.
+grad_inputs and adapter gradients are TF32 cuBLAS GEMMs: 1e-2.
 """
 
 from std.sys import has_nvidia_gpu_accelerator

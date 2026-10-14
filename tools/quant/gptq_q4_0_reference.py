@@ -20,8 +20,8 @@ their GPTQ codes, scales and objectives, computed in numpy.
         after the block: w[:, end:] -= E @ U[block, end:]
 
 This is the GPTQ pipeline that quantized Kev for MAX, transcribed from MLX to
-numpy; the agreement of this transcription with it on this file's cases is
-recorded in the results doc. Both run the loop in fp32, so they agree up to
+numpy; this transcription agrees with it on every code and scale of this
+file's cases (checked once, on MLX's CPU and Metal). Both run the loop in fp32, so they agree up to
 the order of floating-point operations (see `test_gptq.mojo`).
 
 ## The cases

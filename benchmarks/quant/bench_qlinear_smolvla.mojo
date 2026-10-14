@@ -77,7 +77,7 @@ def row[IN: Int, OUT: Int, T: Int](ctx: DeviceContext, label: String) raises:
     lin.vjp["gpu", T](TensorRefs[1](x), g, TensorRefs[1](gx), c)
     ql.vjp["gpu", T](TensorRefs[1](x), g, TensorRefs[1](gx), c)
     # small4 needs 102,400 B of shared memory per block: the Orin has 164 KB,
-    # consumer Blackwell refuses it (results doc, Q0.6).
+    # consumer Blackwell's per-block opt-in is 101,376 B and refuses it.
     var small4 = ctx.default_device_info.shared_memory_per_multiprocessor > 102400
     comptime if INT4:
         ql._gemm_q4[T, Q4_SMALL](ctx)

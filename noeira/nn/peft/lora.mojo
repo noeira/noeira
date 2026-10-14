@@ -27,7 +27,7 @@ U(-1/√IN, 1/√IN), and B = 0, so the adapter starts as an exact no-op.
 
 The params hold `R_PAD = round_up(R, PAD_R)` columns of A and rows of B: the
 logical R first, zeros after. MAX's GEMM on Metal is ~4x slower when a
-contraction dim is not a multiple of 16 (the Q0 measurement), R is the
+contraction dim is not a multiple of 16 (measured on an M1), R is the
 contraction of `h B` and of `gh Aᵀ`, and 8 is a common rank. The pad is exact
 and STAYS zero under training: a pad column of A meets only pad rows of B, so
 `h_pad = x A_pad = 0`, `dB_pad = s hᵀ_pad g = 0` and `dA_pad = xᵀ (s g

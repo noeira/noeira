@@ -15,7 +15,7 @@ the one place the convention flips. A row of OUT holds IN / 32 blocks.
 ## The RTN grid
 
 `quantize_rtn_q4_0` is round-to-nearest on the grid of the reference GPTQ
-pipeline that produced Kev's int4 weights (results doc, Q4):
+pipeline that produced Kev's int4 weights:
 
     d = (the group's element of largest magnitude, the FIRST one on a tie) / -8
     d = 1e-8 where that is 0, then d rounded to bf16 (ties to even)

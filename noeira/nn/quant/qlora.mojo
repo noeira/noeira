@@ -14,9 +14,9 @@ dequantized weight).
 
 ## Activations stay fp32
 
-The plan sketched QLoRA with bf16-flow activations, because MAX's int4 GEMM
+QLoRA could run with bf16-flow activations, because MAX's int4 GEMM
 takes and returns bf16. `QLinear` already keeps fp32 at its boundary and
-casts inside (results doc, Q4.2), and SmolVLA's towers are fp32 end to end,
+casts inside, and SmolVLA's towers are fp32 end to end,
 so the pairing is fp32 too. A bf16-flow tower would drop `QLinear`'s two cast
 kernels; it is a change to the whole prefill, not to this layer.
 

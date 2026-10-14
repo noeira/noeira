@@ -33,7 +33,7 @@ first version of this gate expected four, forgetting q; the count caught it.)
 the 1e-6 of the activations: each side is a separate fp32 GEMM over
 activations that already differ by ~1e-6 between the two models, and an
 adapter's gradient is a small difference of large terms. A wiring fault is
-O(1) (a hook removed: see the results doc), four orders above the band.
+O(1) (checked by removing a hook), four orders above the band.
 """
 
 from std.math import abs

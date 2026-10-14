@@ -8,7 +8,7 @@
       forward and grad_input against `Linear` over the same deq(W). Metal and
       `NN_Q4_PATH=deq` run fp32 GEMMs on both sides: 1e-5. NVIDIA's forward
       is MAX's int4 GEMM with bf16 activations, and both grad_inputs are TF32
-      cuBLAS GEMMs at these sizes: the plan's 1e-2
+      cuBLAS GEMMs at these sizes: 1e-2
   [2] scratch: a second forward and vjp allocate nothing (every scratch
       buffer keeps its device address), and two layers sharing one
       dequantize scratch use that buffer and still compute the same outputs

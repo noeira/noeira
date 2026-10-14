@@ -16,8 +16,9 @@ round-to-nearest Q4_0 codes and scales, computed in numpy.
     q = clip(round(w / d) + 8, 0, 15), numpy's round (ties to even)
 
 This is the grid of the GPTQ pipeline that quantized Kev for MAX (its `--rtn`
-mode). That pipeline is written in MLX; the equality of this numpy
-transcription with it, on this file's matrix, is recorded in the results doc.
+mode). That pipeline is written in MLX; this numpy transcription equals it
+on every code and scale of this file's matrix (checked once, on MLX's CPU
+and Metal).
 
 ## The matrix
 

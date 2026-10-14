@@ -6,7 +6,7 @@
 A frozen `Linear[IN, OUT]` (the LoRA regime: no dW) against the same layer plus
 a trainable `LoRAAdapter` of rank R, at SmolVLA's text-tower shapes
 (q/o 960 -> 960, gate/up 960 -> 2560, down 2560 -> 960), R in {8, 16, 32, 64}
-and T in {64, 960, 7680} tokens per call (the plan's grid: one observation's
+and T in {64, 960, 7680} tokens per call (one observation's
 expert suffix, one prefix, a batch of eight prefixes).
 
     forward   base `forward`       vs  base `forward` + `forward_add`

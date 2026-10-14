@@ -22,7 +22,7 @@ layers to the path the torch model gives it (SmolVLA: `names.mojo`).
 `target_modules` is written as the full paths, not leaf names. PEFT matches a
 target against a module name by equality or by a ".target" suffix, so a leaf
 name such as `q_proj` would also adapt every other `q_proj` of the torch model
-(the vision tower's, in SmolVLA: the Q0 finding), which this adapter has no
+(the vision tower's, in SmolVLA), which this adapter has no
 weights for.
 
 ## What the reader refuses

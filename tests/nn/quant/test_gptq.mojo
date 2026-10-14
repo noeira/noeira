@@ -8,7 +8,7 @@
     floating-point-order flips: at least 90 % of rows identical code for
     code, and every scale identical in those rows. The numpy reference
     itself agrees with the MLX pipeline it transcribes on every code and
-    scale of both cases (results doc, Q5).
+    scale of both cases (checked once, outside this suite).
 [2] A diagonal Hessian propagates no error (U is diagonal), so GPTQ must
     then BE RTN: codes and scales bit-identical to `quantize_rtn_q4_0`.
 [3] `q4_0_objective` reproduces the reference's RTN objective, and GPTQ's
