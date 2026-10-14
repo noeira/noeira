@@ -261,6 +261,7 @@ export default defineConfig({
 								{ label: 'Optimizers, losses, init', slug: 'nn/optimizers' },
 								{ label: 'Training', slug: 'nn/training' },
 								{ label: 'Distributed training', slug: 'nn/distributed' },
+								{ label: 'Frozen weights, LoRA, int4', slug: 'nn/peft-quant' },
 							],
 						},
 						{

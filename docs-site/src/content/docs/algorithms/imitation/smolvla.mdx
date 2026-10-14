@@ -207,7 +207,7 @@ measured, so it is not the default.
 | Measurement | Result | What it does not say |
 |---|---|---|
 | Inference | all 500 checkpoint tensors mapped and loaded | — |
-| Fine-tune, RTX 5090, 2000 steps × 64 observations | held-out flow-matching loss **0.5509 → 0.2170**, over 10 episodes never trained on | a loss is not a success rate |
+| Fine-tune, RTX 5090, 2000 steps × 8 observations | held-out flow-matching loss **0.5509 → 0.2170**, over 10 episodes never trained on | a loss is not a success rate |
 | Real arm, first success | on 20 Sep 2026 the policy **picked up the cube and dropped it into the bowl** | roughly 20% of attempts by informal count — not a measured rate; more and better data needed |
 | Real arm, best control configuration (`--threaded --smooth 9 --ensemble`, 4 Euler steps) | query 2329 → **491 ms**; control rate 17.4 → **27.2 Hz**; jump at chunk handover 63.6° → **15.1°** | latency and smoothness, not success |
 | Expert attention kernels | **6.1×** faster on the Orin, **68×** on an RTX 5090, over the previous kernel | a kernel speed-up, measured in isolation |

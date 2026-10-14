@@ -61,13 +61,17 @@ P <dotted-name> <size> <has_moments:0|1>\n
 S <dotted-name> <size>\n
 <size raw payload bytes>
 ...
+K <name>\n
+<8 raw Float64 bytes>
 ```
 
-`P` sections are parameters, `S` sections are module state. Names are dotted
-paths derived from the module walk — `"0.weight"` for the first layer's weights
-in a `Sequential`.
+`P` sections are parameters, `S` sections are module state, `K` sections are
+training scalars that are not tensors (an ε schedule, a step counter, SAC's
+temperature, Adam's step count), after every tensor. Names are dotted paths
+derived from the module walk — `"0.weight"` for the first layer's weights in a
+`Sequential`.
 
-Three properties are worth knowing about:
+Four properties are worth knowing about:
 
 **Names are validated on load.** The dotted name and size of each section are
 checked against the in-memory walk order. A mismatch raises rather than loading
@@ -77,6 +81,15 @@ the one trying to load.
 **Writes are atomic.** The payload lands in a temporary file and is renamed over
 the target only once fully written. A crash mid-save cannot destroy the
 previous good checkpoint.
+
+**Saves stream.** Each section goes to the file as the walk reaches it,
+straight from the tensor's host buffer; the file is never built in memory. A
+save therefore needs almost no memory beyond the model: saving a 1.07 GB model
+on an M1 peaks 0.17 GB above the model alone, where building the file first
+cost 1.1 to 1.8 GB more. On a 16 GB Jetson that difference decided whether a
+fine-tune could checkpoint at all. `BinaryCheckpointWriter.to_file(path)` and
+`commit()` are the streaming writer; `BinaryCheckpointWriter()` still builds the
+bytes in memory for a caller that wants them.
 
 **I/O is chunked at 1 GiB.** This is not incidental — see the v2 note below.
 
@@ -99,18 +112,15 @@ moments and no replay buffer; where an agent has target networks, they are
 hard-copied from the online ones on load. A resumed run re-warms its
 optimizers.
 
-| Trainer | `save_state` writes |
-|---|---|
-| SAC | v3: actor + both online critics, in one file. The entropy temperature is not saved. |
-| DQN, C51, TD3, DDPG, PPO, PPO-discrete, REDQ, REDQ-OFE, MBPO | the **v2 text layout**, through a single plain `write` — not chunked and not atomic. DQN and C51 add their ε-schedule and step counter as `key=value` lines; MBPO adds its dynamics ensemble. |
+Every trainer writes v3, streamed and atomic. The `K` scalars carry the state
+that is not a tensor:
 
-:::caution[Some trainers still write v2]
-The trainers in the second row have not moved to the binary writer. The
-2 GiB truncation described below only matters for very large networks, but
-even a small save is not atomic: a crash mid-save can leave a truncated file
-where the previous checkpoint was.
-Copy a checkpoint you care about before training over the same path again.
-:::
+| Trainer | `K` scalars besides the step counter |
+|---|---|
+| SAC, REDQ, REDQ-OFE | the entropy temperature α |
+| MBPO | α, and which ensemble members are the elites (the ensemble itself is in the tensors) |
+| DQN, C51 | the ε schedule: `epsilon`, `epsilon_decay`, `epsilon_min` |
+| TD3, DDPG, PPO, PPO-discrete | none |
 
 ## GPU parameters
 
