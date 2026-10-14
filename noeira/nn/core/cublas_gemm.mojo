@@ -159,8 +159,9 @@ def cublas_gemm[
     N: Int,
     K: Int,
     beta: Float32,
+    alpha: Float32 = 1.0,
 ) raises:
-    """`dst[M, N] = op(a) @ op(b) + beta · dst`, all row-major fp32 (computed
+    """`dst[M, N] = alpha · op(a) @ op(b) + beta · dst`, all row-major fp32 (computed
     in TF32 when `TF32`, else full fp32; see `cublas_tf32`): op(a) is a[M, K], or a[K, M]ᵀ when `TA`; op(b) is b[K, N], or
     b[N, K]ᵀ when `TB`. The workspace is the context's shared one
     (`_shared_workspace`).
@@ -170,7 +171,7 @@ def cublas_gemm[
     same transpose flags, dims (N, M, K) and the operands' own row strides as
     leading dimensions — MAX's own `c_row_major` mapping."""
     comptime assert DT == DType.float32, "cublas_gemm: fp32 only"
-    _gemm_ex[TA, TB, DT, DT, TF32](c, dst, a, b, M, N, K, beta)
+    _gemm_ex[TA, TB, DT, DT, TF32](c, dst, a, b, M, N, K, beta, alpha)
 
 
 def cublas_gemm_lp[
@@ -204,6 +205,7 @@ def _gemm_ex[
     N: Int,
     K: Int,
     beta: Float32,
+    alpha: Float32 = 1.0,
 ) raises:
     """The one `cublasGemmEx` call behind `cublas_gemm` / `cublas_gemm_lp`
     (row-major mapping in `cublas_gemm`'s docstring)."""
@@ -219,7 +221,7 @@ def _gemm_ex[
             cublasMath_t.CUBLAS_TF32_TENSOR_OP_MATH if TF32 else cublasMath_t.CUBLAS_DEFAULT_MATH,
         )
     )
-    var alpha = Float32(1.0)
+    var alpha_v = alpha
     var beta_v = beta
     var lda = M if TA else K
     var ldb = K if TB else N
@@ -231,7 +233,7 @@ def _gemm_ex[
             Int32(N),
             Int32(M),
             Int32(K),
-            UnsafePointer(to=alpha)
+            UnsafePointer(to=alpha_v)
             .bitcast[NoneType]()
             .as_imm()
             .as_unsafe_any_origin(),

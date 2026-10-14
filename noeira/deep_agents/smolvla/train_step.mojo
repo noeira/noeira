@@ -81,8 +81,10 @@ struct SmolVLATrainStep[
     HD: Int = SMOLLM_HEAD_DIM,
     THETA: Float64 = SMOLLM_THETA,
     KVW: Int = SMOLLM_KV_W,
+    E_R: Int = 0,
 ](Movable):
-    """`ADIM` is the padded action width (32); `ADIM_REAL` is the robot's."""
+    """`ADIM` is the padded action width (32); `ADIM_REAL` is the robot's.
+    `E_R` is the expert's LoRA rank (`layer_weights.mojo`), 0 for none."""
 
     comptime XN: Int = Self.B * Self.CHUNK * Self.ADIM
     comptime AN: Int = Self.B * Self.CHUNK * Self.EW
@@ -180,7 +182,7 @@ struct SmolVLATrainStep[
     ](
         mut self,
         mut expert: SmolVLAExpert[
-            Self.LAYERS, Self.EW, Self.EFF, Self.W, Self.KVW, 2
+            Self.LAYERS, Self.EW, Self.EFF, Self.W, Self.KVW, 2, Self.E_R
         ],
         mut cache: SmolVLAKVCache[
             Self.LAYERS, P, Self.CHUNK, Self.N_KV, Self.HD, Self.B
@@ -191,6 +193,7 @@ struct SmolVLATrainStep[
         mut denoise: SmolVLADenoise[
             P, Self.CHUNK, Self.B, Self.LAYERS, Self.EW, Self.EFF, Self.W,
             Self.HEADS, Self.N_KV, Self.HD, Self.THETA, 2, Self.KVW, True,
+            Self.E_R,
         ],
         mut action_in: Linear[Self.ADIM, Self.EW],
         mut time_mlp_in: Linear[2 * Self.EW, Self.EW],

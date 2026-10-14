@@ -304,15 +304,22 @@ struct CheckpointReader(ParamVisitor, ParamVisitorRT):
         # already acted hits exactly that.
         param.version += 1
         if self.mode == 0 and len(toks) >= 4 and toks[3] == "1":
-            m.ensure(n)
-            v.ensure(n)
-            for i in range(n):
-                m.data[i] = Scalar[DT](atof(self._next()))
-            for i in range(n):
-                v.data[i] = Scalar[DT](atof(self._next()))
-            comptime if target == "gpu":
-                m.upload_resident(ctx.value())
-                v.upload_resident(ctx.value())
+            if grad.n == 0:
+                # A frozen param (`Param.freeze`) keeps no optimizer state:
+                # read past the moments a file saved before the freeze has
+                # for it, rather than allocating them again.
+                for _ in range(2 * n):
+                    _ = self._next()
+            else:
+                m.ensure(n)
+                v.ensure(n)
+                for i in range(n):
+                    m.data[i] = Scalar[DT](atof(self._next()))
+                for i in range(n):
+                    v.data[i] = Scalar[DT](atof(self._next()))
+                comptime if target == "gpu":
+                    m.upload_resident(ctx.value())
+                    v.upload_resident(ctx.value())
         comptime if target == "gpu":
             # ⚠ `upload_resident`, NOT `upload`. `upload` RECREATES the device
             # buffer, and under an adopted `ParamArena` this Param's val/grd/m/v
@@ -454,6 +461,13 @@ struct BinaryCheckpointReader(ParamVisitor, ParamVisitorRT):
         )
         self.cur += n * SB
 
+    def _skip_vals(mut self, n: Int) raises:
+        """Advance past `n` values without storing them."""
+        comptime SB = size_of[Scalar[DT]]()
+        if self.cur + n * SB > len(self.bytes):
+            raise Error(self._eof(String("skipping ") + String(n) + " values"))
+        self.cur += n * SB
+
     def read_scalars(mut self) raises -> CheckpointScalars:
         """Consume the trailing `K` sections. Call after the last tensor walk
         and before `finish`. A file written before `K` existed has none, and
@@ -536,13 +550,18 @@ struct BinaryCheckpointReader(ParamVisitor, ParamVisitorRT):
         # `w_bf`) keep serving the pre-load weight.
         param.version += 1
         if self.mode == 0 and len(toks) >= 4 and toks[3] == "1":
-            m.ensure(n)
-            v.ensure(n)
-            self._take_vals(m, n)
-            self._take_vals(v, n)
-            comptime if target == "gpu":
-                m.upload_resident(ctx.value())
-                v.upload_resident(ctx.value())
+            if grad.n == 0:
+                # A frozen param keeps no optimizer state: skip the moments a
+                # file written before the freeze has for it (see the v2 reader).
+                self._skip_vals(2 * n)
+            else:
+                m.ensure(n)
+                v.ensure(n)
+                self._take_vals(m, n)
+                self._take_vals(v, n)
+                comptime if target == "gpu":
+                    m.upload_resident(ctx.value())
+                    v.upload_resident(ctx.value())
         comptime if target == "gpu":
             # ⚠ `upload_resident`, NOT `upload`. `upload` RECREATES the device
             # buffer, and under an adopted `ParamArena` this Param's val/grd/m/v

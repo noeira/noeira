@@ -32,9 +32,12 @@ from max.gpu.host import DeviceContext
 
 from noeira.nn.constants import DT
 from noeira.nn.core.initializer import Initializer
-from noeira.nn.core.param import ParamVisitor
+from noeira.nn.core.param import ParamVisitor, ParamWalkable
 from noeira.nn.core.walkers import join_name
 from noeira.nn.primitives.rms_norm import RMSNorm
+from noeira.nn.core.torch_names import TorchNameMap
+from noeira.nn.quant.qlinear import Q4_INT4_GEMM
+from noeira.io.safetensors import SafeTensors
 from .layer_weights import DecoderLayerWeights, SmolNorm
 
 
@@ -56,27 +59,39 @@ struct SmolVLMTextLayers[
     W: Int = SMOLLM_DIM,
     FF: Int = SMOLLM_FF,
     KVW: Int = SMOLLM_KV_W,
-](Movable):
+    LORA_R: Int = 0,
+    Q4: Bool = False,
+](ParamWalkable):
     """16 layers plus the final norm, walked under the checkpoint's index.
 
     `KV_IN == W`: every VLM layer projects K/V from its own stream. (The expert
     is the one whose odd layers project the VLM's cached K/V instead.)
+    `LORA_R > 0` puts a LoRA adapter beside each of every layer's seven linears
+    (`layer_weights.mojo`). `Q4` makes the 112 linears int4 `QLinear`s, which
+    `load_q4` fills; the walks then cover the norms (and adapters) only.
     """
 
     comptime Layer = DecoderLayerWeights[
-        Self.W, Self.FF, Self.W, Self.KVW, Self.W
+        Self.W, Self.FF, Self.W, Self.KVW, Self.W, Self.LORA_R, Self.Q4
     ]
+    comptime SCRATCH = Self.FF * Self.W
+    """The largest linear's [OUT, IN]: what the shared dequantize scratch
+    holds (gate / up / down, 2560 x 960)."""
 
     var layers: List[Self.Layer]
     var norm: SmolNorm[Self.W]
+    var _q4_scratch: Bool
+    """The int4 linears share one dequantize scratch (`ensure_q4_scratch`)."""
 
     def __init__(out self):
         self.layers = List[Self.Layer]()
         self.norm = SmolNorm[Self.W]()
+        self._q4_scratch = False
 
     def __init__(out self, *, deinit move: Self):
         self.layers = move.layers^
         self.norm = move.norm^
+        self._q4_scratch = move._q4_scratch
 
     @staticmethod
     def make[
@@ -99,3 +114,99 @@ struct SmolVLMTextLayers[
         self.norm.for_each_param[target](
             vis, ctx, join_name(prefix, String("norm"))
         )
+
+    def for_each_base_param[
+        target: StaticString, V: ParamVisitor
+    ](mut self, mut vis: V, ctx: Optional[DeviceContext],
+      prefix: String = String("")) raises:
+        """`for_each_param` without the LoRA adapters: what the checkpoint's
+        name map describes (`SmolVLAPolicy.load`) and what freezing the
+        backbone freezes. The same walk as `for_each_param` at `LORA_R = 0`."""
+        for i in range(Self.LAYERS):
+            self.layers[i].walk[target, V, False](
+                vis, ctx, join_name(prefix, String("layers." + String(i)))
+            )
+        self.norm.for_each_param[target](
+            vis, ctx, join_name(prefix, String("norm"))
+        )
+
+    def zero_grad[
+        target: StaticString
+    ](mut self, ctx: Optional[DeviceContext]) raises:
+        """⚠ The SAME layers and norm as `for_each_param`. A frozen param has
+        nothing to zero, so on a frozen tower this zeroes the adapters only."""
+        for i in range(Self.LAYERS):
+            self.layers[i].zero_grad[target](ctx)
+        self.norm.zero_grad[target](ctx)
+
+    def for_each_state[
+        target: StaticString, V: ParamVisitor
+    ](mut self, mut vis: V, ctx: Optional[DeviceContext],
+      prefix: String = String("")) raises:
+        """The State walk, in the SAME order as `for_each_param`. No leaf here
+        holds State; `ParamWalkable` (the optimizer arena, the checkpoints)
+        asks for the walk, which LoRA on the tower needs."""
+        for i in range(Self.LAYERS):
+            self.layers[i].walk_state[target](
+                vis, ctx, join_name(prefix, String("layers." + String(i)))
+            )
+        self.norm.for_each_state[target](
+            vis, ctx, join_name(prefix, String("norm"))
+        )
+
+    def set_lora_alpha(mut self, alpha: Float64):
+        """PEFT's `lora_alpha` for every adapter; nothing at `LORA_R = 0`."""
+        for i in range(Self.LAYERS):
+            self.layers[i].set_lora_alpha(alpha)
+
+    # ── int4 ───────────────────────────────────────────────────────────
+    def load_q4[
+        target: StaticString
+    ](
+        mut self,
+        ref st: SafeTensors,
+        ref names: TorchNameMap,
+        ctx: Optional[DeviceContext] = None,
+        blocks_path: String = "",
+    ) raises -> Int:
+        """Quantize the 112 linears of the published weights `st` into the
+        int4 layers (`DecoderLayerWeights.load_q4`), through the text name map;
+        or, with `blocks_path`, read their Q4_0 blocks from that file
+        (`load_q4_blocks`: GPTQ's output, `gptq_calib.mojo`). The norms load
+        through the walk, as before. Returns the map entries claimed (each
+        weight and its zero bias). On a GPU whose forward dequantizes (Metal,
+        or `NN_Q4_PATH=deq`), the layers then share one dequantize scratch."""
+        comptime assert Self.Q4, "load_q4: this tower is not int4 (Q4 = False)"
+        var n = 0
+        if blocks_path:
+            var bf = SafeTensors(blocks_path)
+            for i in range(Self.LAYERS):
+                n += self.layers[i].load_q4_blocks[target](
+                    st, names, String("layers.") + String(i), bf, ctx
+                )
+        else:
+            for i in range(Self.LAYERS):
+                n += self.layers[i].load_q4[target](
+                    st, names, String("layers.") + String(i), ctx
+                )
+        comptime if target == "gpu" and not Q4_INT4_GEMM:
+            self.ensure_q4_scratch(ctx.value())
+        return n
+
+    def ensure_q4_scratch(mut self, ctx: DeviceContext) raises:
+        """One dequantize scratch for all 112 int4 linears (they run one at a
+        time), allocated once. Every dequantizing call needs it: the forward
+        off NVIDIA, the vjp everywhere."""
+        comptime if Self.Q4:
+            if self._q4_scratch:
+                return
+            var buf = ctx.enqueue_create_buffer[DT](Self.SCRATCH)
+            for i in range(Self.LAYERS):
+                self.layers[i].share_q4_scratch(buf, Self.SCRATCH)
+            self._q4_scratch = True
+
+    def keep_only_repacked(mut self) raises:
+        """NVIDIA inference: every int4 linear keeps only MAX's repacked
+        blocks (no host copy, no device copy of the logical blocks)."""
+        for i in range(Self.LAYERS):
+            self.layers[i].keep_only_repacked()

@@ -53,6 +53,7 @@ from .names import (
 )
 from noeira.io.safetensors import SafeTensors
 from noeira.nn.core.torch_names import LoadTorchNamed
+from noeira.nn.peft.freeze import freeze_params, FreezeParams
 
 
 def _claimed_every_entry(
@@ -178,6 +179,9 @@ struct SmolVLAActionSampler[
     # where a layer writes, never what it computes — so a policy built for
     # training can still be asked for an action.
     REC: Bool = False,
+    # The expert's LoRA rank (`layer_weights.mojo`), carried for the same
+    # reason: the expert and its driver are typed by it.
+    E_R: Int = 0,
 ](Movable):
     """The ten-step Euler loop, with `embed_suffix` and `action_out` inside it.
 
@@ -253,7 +257,7 @@ struct SmolVLAActionSampler[
         # definitions.
         mut expert: SmolVLAExpert[
             Self.LAYERS, SMOLVLA_EXPERT_W, EXPERT_FF, SMOLLM_DIM,
-            SMOLLM_KV_W, 2,
+            SMOLLM_KV_W, 2, Self.E_R,
         ],
         mut cache: SmolVLAKVCache[
             Self.LAYERS, P, Self.CHUNK, SMOLLM_KV_HEADS, SMOLLM_HEAD_DIM,
@@ -262,7 +266,7 @@ struct SmolVLAActionSampler[
         mut denoise: SmolVLADenoise[
             P, Self.CHUNK, Self.B, Self.LAYERS, SMOLVLA_EXPERT_W, EXPERT_FF,
             SMOLLM_DIM, SMOLLM_HEADS, SMOLLM_KV_HEADS, SMOLLM_HEAD_DIM,
-            SMOLLM_THETA, 2, SMOLLM_KV_W, Self.REC,
+            SMOLLM_THETA, 2, SMOLLM_KV_W, Self.REC, Self.E_R,
         ],
         mut action_in: Linear[Self.ADIM, Self.EW],
         mut time_mlp_in: Linear[2 * Self.EW, Self.EW],
@@ -632,6 +636,18 @@ struct SmolVLAPolicy[
     # no arithmetic — `test_denoise_tape.mojo` demands the outputs be
     # bit-identical either way.
     RECORD: Bool = False,
+    # LoRA ranks (`nn/peft/lora.mojo`, `layer_weights.mojo`): an adapter
+    # beside every linear of the expert / of the 16 text layers. 0, the
+    # default, builds none and is today's policy exactly. The base weights
+    # load and freeze as before (`load`, `freeze_backbone` walk them without
+    # the adapters); the adapters start at PEFT's initialisation, a no-op.
+    EXPERT_R: Int = 0,
+    TOWER_R: Int = 0,
+    # The VLM's 16 text layers in int4 (`nn/quant`, Q4_0): `load` quantizes
+    # their 112 linears from the published weights by round-to-nearest, and
+    # the prefill runs them through MAX's int4 GEMM on NVIDIA. False, the
+    # default, is today's fp32 tower exactly.
+    VLM_Q4: Bool = False,
 ](Movable):
     """Every component of SmolVLA in one object: pixels and a pose in, joint
     angles out.
@@ -686,10 +702,11 @@ struct SmolVLAPolicy[
     comptime VOCAB: Int = 49280
 
     comptime Tower = SmolVLMTextLayers[
-        Self.L, Self.W, SMOLLM_FF, SMOLLM_KV_W
+        Self.L, Self.W, SMOLLM_FF, SMOLLM_KV_W, Self.TOWER_R, Self.VLM_Q4
     ]
     comptime Expert = SmolVLAExpert[
-        Self.L, SMOLVLA_EXPERT_W, EXPERT_FF, SMOLLM_DIM, SMOLLM_KV_W, 2
+        Self.L, SMOLVLA_EXPERT_W, EXPERT_FF, SMOLLM_DIM, SMOLLM_KV_W, 2,
+        Self.EXPERT_R,
     ]
     comptime Cache = SmolVLAKVCache[
         Self.L, Self.P, Self.CHUNK, SMOLLM_KV_HEADS, SMOLLM_HEAD_DIM, Self.B
@@ -697,16 +714,16 @@ struct SmolVLAPolicy[
     comptime Pre = SmolVLAPrefill[
         Self.P, Self.CHUNK, Self.B, Self.LAYERS, SMOLLM_DIM, SMOLLM_FF,
         SMOLLM_HEADS, SMOLLM_KV_HEADS, SMOLLM_HEAD_DIM, SMOLLM_THETA,
-        Self.RECORD,
+        Self.RECORD, Self.TOWER_R, Self.VLM_Q4,
     ]
     comptime Den = SmolVLADenoise[
         Self.P, Self.CHUNK, Self.B, Self.LAYERS, SMOLVLA_EXPERT_W, EXPERT_FF,
         SMOLLM_DIM, SMOLLM_HEADS, SMOLLM_KV_HEADS, SMOLLM_HEAD_DIM,
-        SMOLLM_THETA, 2, SMOLLM_KV_W, Self.RECORD,
+        SMOLLM_THETA, 2, SMOLLM_KV_W, Self.RECORD, Self.EXPERT_R,
     ]
     comptime Sam = SmolVLAActionSampler[
         Self.CHUNK, SMOLVLA_ACTION_DIM, SMOLVLA_EXPERT_W, Self.STEPS, Self.B,
-        Self.LAYERS, Self.RECORD,
+        Self.LAYERS, Self.RECORD, Self.EXPERT_R,
     ]
     comptime Prefix = SmolVLAPrefixEmbed[
         Self.N_CAM, Self.N_LANG, Self.B, SMOLLM_DIM, Self.IMG_TOK,
@@ -739,6 +756,10 @@ struct SmolVLAPolicy[
     var prefill_out: Tensor
     var state_buf: Tensor
     var chunk_buf: Tensor
+    # `VLM_Q4` only: a Q4_0 blocks file (GPTQ, `gptq_calib.mojo`) that `load`
+    # reads the text tower's linears from. Empty (the default): RTN from the
+    # fp32 weights.
+    var vlm_q4_blocks: String
 
     def __init__(out self):
         comptime assert Self.N_CAM >= 1, "SmolVLAPolicy: need a camera"
@@ -763,6 +784,7 @@ struct SmolVLAPolicy[
         self.prefill_out = Tensor()
         self.state_buf = Tensor()
         self.chunk_buf = Tensor()
+        self.vlm_q4_blocks = String()
 
     def __init__(out self, *, deinit move: Self):
         self.vision = move.vision^
@@ -785,6 +807,7 @@ struct SmolVLAPolicy[
         self.prefill_out = move.prefill_out^
         self.state_buf = move.state_buf^
         self.chunk_buf = move.chunk_buf^
+        self.vlm_q4_blocks = move.vlm_q4_blocks^
 
     @staticmethod
     def make[
@@ -898,18 +921,35 @@ struct SmolVLAPolicy[
             len(vl.map.ours),
         )
 
+        # ⚠ The BASE walks for the two towers: the name maps describe the
+        # checkpoint, which has no LoRA adapters, and `report` raises on a
+        # parameter the map does not name. Identical walks at rank 0.
         var tl = LoadTorchNamed[""](SafeTensors(weights), text_name_map())
         var _ref2 = ParamVisitorRef.of[type_of(tl), target](tl)
-        self.tower.for_each_param[target](_ref2, ctx)
+        self.tower.for_each_base_param[target](_ref2, ctx)
         tl.report(String("text"))
+        # An int4 tower's walk is its norms; its 112 linears are quantized
+        # from the same file, through the same map, and claim their entries
+        # (each weight and its zero bias) here.
+        var q4_claimed = 0
+        comptime if Self.VLM_Q4:
+            q4_claimed = self.tower.load_q4[target](
+                tl.file, tl.map, ctx, self.vlm_q4_blocks
+            )
+        else:
+            if self.vlm_q4_blocks:
+                raise Error(
+                    "SmolVLAPolicy.load: a Q4_0 blocks file ("
+                    + self.vlm_q4_blocks + ") for a policy built without VLM_Q4"
+                )
         _claimed_every_entry(
-            String("text"), len(tl.loaded) + len(tl.zeroed),
+            String("text"), len(tl.loaded) + len(tl.zeroed) + q4_claimed,
             len(tl.map.ours),
         )
 
         var el = LoadTorchNamed[""](SafeTensors(weights), expert_name_map())
         var _ref3 = ParamVisitorRef.of[type_of(el), target](el)
-        self.expert.for_each_param[target](_ref3, ctx)
+        self.expert.for_each_base_param[target](_ref3, ctx)
         el.report(String("expert"))
         _claimed_every_entry(
             String("expert"), len(el.loaded) + len(el.zeroed),
@@ -959,6 +999,61 @@ struct SmolVLAPolicy[
                      + len(ml.loaded))
             + " tensors loaded (lm_head's 1 skipped by design)"
         )
+
+    def freeze_backbone[
+        target: StaticString
+    ](mut self, ctx: Optional[DeviceContext] = None) raises -> Int:
+        """Freeze the vision tower, the connector, the token embedding and
+        the 16 text layers: what `train_expert_only` never trains, minus
+        `state_proj`, whose regime the caller picks. Returns the number of
+        values frozen.
+
+        Their gradient buffers (two copies each on a GPU: host and device)
+        are released, and the text tower's backward, which `train_state_proj`
+        runs, then forms grad_input only (`Linear`, `RMSNorm`). The vision
+        tower, connector and embedding are upstream of nothing trained, so
+        their backward never runs. Values, names and checkpoint maps are
+        unchanged.
+
+        ⚠ Before the optimizer adopts anything; see `noeira/nn/peft/freeze.mojo`.
+
+        With `TOWER_R > 0` the text layers' LoRA adapters are NOT frozen: the
+        tower is frozen by its base walk, which is everything it froze before.
+        """
+        var n = freeze_params[target](self.vision, ctx)
+        n += freeze_params[target](self.connector, ctx)
+        n += freeze_params[target](self.embed, ctx)
+        var f = FreezeParams()
+        self.tower.for_each_base_param[target](f, ctx)
+        return n + f.values
+
+    def freeze_expert_base[
+        target: StaticString
+    ](mut self, ctx: Optional[DeviceContext] = None) raises -> Int:
+        """Freeze the expert's own weights (its 16 layers' linears and norms
+        and the final norm) and leave its LoRA adapters trainable: LoRA on the
+        expert. Returns the number of values frozen. Before any adopt."""
+        comptime assert Self.EXPERT_R > 0, (
+            "freeze_expert_base: without adapters this freezes the whole"
+            " expert, which is freeze_all's job"
+        )
+        var f = FreezeParams()
+        self.expert.for_each_base_param[target](f, ctx)
+        return f.values
+
+    def freeze_all[
+        target: StaticString
+    ](mut self, ctx: Optional[DeviceContext] = None) raises -> Int:
+        """Freeze every parameter: the deploy, where nothing trains. Returns
+        the number of values frozen."""
+        var n = self.freeze_backbone[target](ctx)
+        n += freeze_params[target](self.expert, ctx)
+        n += freeze_params[target](self.state_proj, ctx)
+        n += freeze_params[target](self.action_in, ctx)
+        n += freeze_params[target](self.time_mlp_in, ctx)
+        n += freeze_params[target](self.time_mlp_out, ctx)
+        n += freeze_params[target](self.action_out, ctx)
+        return n
 
     def build_prefix[
         target: StaticString

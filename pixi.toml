@@ -185,6 +185,10 @@ transformers = ">=4.50"
 # as-is by `tools/lewm/`) reshapes with einops. Its encoder is HF's ViTModel,
 # which is why `transformers` above serves LeWM too.
 einops = ">=0.7"
+# PEFT, the reference LoRA implementation, for gating noeira/nn/peft (adapter
+# forward/vjp parity, PEFT-format adapter I/O) and for making adapters MAX serve
+# can load. Same argument as transformers above: gate against what everyone uses.
+peft = ">=0.17"
 
 [feature.cpu.dependencies]
 # CPU-only environment for CI and headless test runs: base deps WITHOUT the
@@ -336,6 +340,7 @@ test-vision = { cmd = "bash scripts/run_tests.sh tests/manifests/vision.txt", de
 test-swm = { cmd = "bash scripts/run_tests.sh tests/manifests/swm.txt", description = "SWM-H sheaf world model gates (experimental, CPU)" }
 test-fb = { cmd = "bash scripts/run_tests.sh tests/manifests/fb.txt", description = "Forward-Backward zero-shot RL gates (CPU; docs/BFM_ZERO_SHOT_RL.md)" }
 test-lewm = { cmd = "bash scripts/run_tests.sh tests/manifests/lewm.txt", description = "LeWorldModel port self-consistency (experimental, CPU, toy dims)" }
+test-peft = { cmd = "bash scripts/run_tests.sh tests/manifests/peft.txt", description = "Frozen parameters (and later LoRA / int4): gates" }
 test-lewm-gpu = { cmd = "bash scripts/run_tests.sh tests/manifests/lewm-gpu.txt", description = "LeWorldModel port GPU paths, toy dims (needs -e apple or -e nvidia)" }
 test-nn-gpu = { cmd = "bash scripts/run_tests.sh tests/manifests/nn-gpu.txt", description = "nn training drivers on the GPU: the GPT / classifier trainers the nn examples run through (needs -e apple or -e nvidia)" }
 test-nn-distributed = { cmd = "bash scripts/run_tests.sh tests/manifests/nn-distributed.txt", description = "nn/distributed gates on the shared-context simulator: DDP, ZeRO-1/2/3, overlap, per-GPU graphs, RankFibers (needs -e apple or -e nvidia)" }

@@ -153,6 +153,8 @@ struct SGD(Movable, ParamVisitor, ParamVisitorRT, Optimizer):
         apply_decay: Bool,
         ctx: Optional[DeviceContext],
     ) raises:
+        if grad.n == 0:  # frozen param: no gradient, nothing to do
+            return
         comptime if target == "cpu":
             for i in range(n):
                 var p = param.data[i]

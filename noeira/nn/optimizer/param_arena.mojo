@@ -96,6 +96,12 @@ struct ParamArena(Movable & ParamVisitor & ParamVisitorRT):
         the running offset and rebind its val/grd buffers to arena slices.
         `param`/`grad` ARE the val/grd Tensors; the mut refs chain back to the
         model's Param, so the rebinds persist."""
+        # A frozen param (empty gradient) gets no slot. ⚠ The sizing and
+        # decay-mask passes skip the same params (`NamedParam.trainable` is
+        # `grad.n > 0`) and so does `_MomentPlacer`: the offsets of all four
+        # walks must agree, or a moment lands on another param's value.
+        if grad.n == 0:
+            return
         comptime if target == "gpu":
             var c = ctx.value()
             self._off = align_param_off(self._off)
@@ -140,12 +146,21 @@ struct ParamArena(Movable & ParamVisitor & ParamVisitorRT):
             var nps = named_params["gpu"](model)
             var total = 0
             for i in range(len(nps)):
+                if not nps[i].trainable:
+                    continue
                 total = align_param_off(total) + nps[i].size
+            if total == 0 and len(nps) > 0:
+                raise Error(
+                    "ParamArena.adopt: every parameter of the model is frozen,"
+                    " there is nothing to optimize"
+                )
             self.total = total
 
             var dm = Tensor.alloc(total)  # host decay mask
             var off = 0
             for i in range(len(nps)):
+                if not nps[i].trainable:
+                    continue
                 var d = Scalar[DT](1.0) if nps[i].decay else Scalar[DT](0.0)
                 off = align_param_off(off)
                 for k in range(nps[i].size):
@@ -181,10 +196,19 @@ struct ParamArena(Movable & ParamVisitor & ParamVisitorRT):
         comptime if target == "gpu":
             var c = ctx.value()
             var total = 0
+            var n_seen = 0
             comptime for i in range(models.__len__()):
                 var nps = named_params["gpu"](models[i])
+                n_seen += len(nps)
                 for j in range(len(nps)):
+                    if not nps[j].trainable:
+                        continue
                     total = align_param_off(total) + nps[j].size
+            if total == 0 and n_seen > 0:
+                raise Error(
+                    "ParamArena.adopt_multi: every parameter of every model is"
+                    " frozen, there is nothing to optimize"
+                )
             self.total = total
 
             var dm = Tensor.alloc(total)
@@ -192,6 +216,8 @@ struct ParamArena(Movable & ParamVisitor & ParamVisitorRT):
             comptime for i in range(models.__len__()):
                 var nps = named_params["gpu"](models[i])
                 for j in range(len(nps)):
+                    if not nps[j].trainable:
+                        continue
                     var d = (
                         Scalar[DT](1.0) if nps[j].decay else Scalar[DT](0.0)
                     )

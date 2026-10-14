@@ -798,6 +798,36 @@ struct Linear[IN_: Int, OUT_: Int, ADT: DType = DT](Module):
         self.cT_pad.release()
         self.gi_pad.release()
 
+    def freeze(mut self):
+        """Make the weight and the bias non-trainable. Their gradient
+        buffers and moments are released (host and device), so `vjp` forms
+        grad_input only, and so is the scratch only the weight gradient used.
+        The values, names and walk order are unchanged: checkpoints and name
+        maps see the same params as before.
+
+        ⚠ Freeze BEFORE an optimizer adopts the model. An adopted param's
+        gradient is a view into the optimizer's arena."""
+        self.weight.freeze()
+        self.bias.freeze()
+        self.cacheT.release()
+        self.cacheT_bf.release()
+        self.dW_tmp.release()
+        self.cT_pad.release()
+        self.dW_pad.release()
+        self.gb_part.release()
+        self.sk_ws.release()
+        self._sk_p = -1
+
+    def unfreeze[
+        target: StaticString
+    ](mut self, ctx: Optional[DeviceContext] = None) raises:
+        """Zeroed gradient buffers again. The scratch comes back lazily."""
+        self.weight.unfreeze[target](ctx)
+        self.bias.unfreeze[target](ctx)
+
+    def is_frozen(self) -> Bool:
+        return self.weight.is_frozen() and self.bias.is_frozen()
+
     def forward[
         target: StaticString, B: Int, o: MutOrigin, POLICY: AMPPolicy = NoAMP
     ](
@@ -1049,6 +1079,16 @@ struct Linear[IN_: Int, OUT_: Int, ADT: DType = DT](Module):
     ) raises:
         ref fin = forward_input[0]
         ref gin = grad_inputs[0]
+        # A param whose gradient buffer is EMPTY is frozen (`freeze`): its
+        # gradient is not formed at all — no dW GEMM, no bias column sum, no
+        # dW scratch — and grad_input is computed exactly as before, since it
+        # does not depend on either. Runtime, not comptime: freezing is a
+        # property of this instance after load, so `DecoderLayerWeights` and
+        # every caller keep one type, and the predicate is the storage itself
+        # (no flag that could disagree with it). A trainable Linear takes the
+        # same branches in the same order as before.
+        var want_dw = self.weight.grd.n > 0
+        var want_db = self.bias.grd.n > 0
         comptime if Self.ACT_DT == DT:
             # ── fp32 path (legacy NoAMP, byte-identical) ──
             # ACT_DT IS DT here — rebind the activation refs (sound; see forward).
@@ -1057,24 +1097,23 @@ struct Linear[IN_: Int, OUT_: Int, ADT: DType = DT](Module):
             ref god = rebind[Tensor](grad_output)
             comptime if target == "cpu":
                 gind.ensure(B * Self.IN_)
-                self.cacheT.ensure(Self.IN_ * B)
-                self.dW_tmp.ensure(Self.W_SIZE)
+                if want_dw:
+                    self.cacheT.ensure(Self.IN_ * B)
+                    self.dW_tmp.ensure(Self.W_SIZE)
                 var x_v = TileTensor(find.data, row_major[B, Self.IN_]())
                 var go_v = TileTensor(god.data, row_major[B, Self.OUT_]())
                 var gi_v = TileTensor(gind.data, row_major[B, Self.IN_]())
                 var w_v = TileTensor(
                     self.weight.val.data, row_major[Self.IN_, Self.OUT_]()
                 )
-                var gw_v = TileTensor(
-                    self.weight.grd.data, row_major[Self.IN_, Self.OUT_]()
-                )
-                var gb_v = TileTensor(
-                    self.bias.grd.data, row_major[Self.OUT_]()
-                )
                 # grad_b += colsum(go)
-                for b in range(B):
-                    for j in range(Self.OUT_):
-                        gb_v[j] += go_v[b, j]
+                if want_db:
+                    var gb_v = TileTensor(
+                        self.bias.grd.data, row_major[Self.OUT_]()
+                    )
+                    for b in range(B):
+                        for j in range(Self.OUT_):
+                            gb_v[j] += go_v[b, j]
                 # grad_w += xᵀ @ go. Apple-fp32: ONE fused cblas_sgemm (TRANSPOSE
                 # A=x, beta=1 → no transpose buffer, no temp, no accumulate loop —
                 # matches legacy Linear). Else: transpose into cacheT + max_matmul
@@ -1082,44 +1121,49 @@ struct Linear[IN_: Int, OUT_: Int, ADT: DType = DT](Module):
                 comptime IS_APPLE_F32 = (
                     CompilationTarget.is_macos() and DT == DType.float32
                 )
-                comptime if IS_APPLE_F32:
-                    var cblas = get_cblas_f32_function()
-                    cblas(
-                        _CBLASOrder.ROW_MAJOR,
-                        _CBLASTranspose.TRANSPOSE,
-                        _CBLASTranspose.NO_TRANSPOSE,
-                        Int32(Self.IN_),
-                        Int32(Self.OUT_),
-                        Int32(B),
-                        Float32(1.0),
-                        rebind[Pointer[Float32, ImmutAnyOrigin]](
-                            find.data.unsafe_ptr()
-                        ),
-                        Int32(Self.IN_),
-                        rebind[Pointer[Float32, ImmutAnyOrigin]](
-                            god.data.unsafe_ptr()
-                        ),
-                        Int32(Self.OUT_),
-                        Float32(1.0),
-                        rebind[Pointer[Float32, MutAnyOrigin]](
-                            self.weight.grd.data.unsafe_ptr()
-                        ),
-                        Int32(Self.OUT_),
-                    )
-                else:
-                    var cT_v = TileTensor(
-                        self.cacheT.data, row_major[Self.IN_, B]()
-                    )
-                    for b in range(B):
+                if want_dw:
+                    comptime if IS_APPLE_F32:
+                        var cblas = get_cblas_f32_function()
+                        cblas(
+                            _CBLASOrder.ROW_MAJOR,
+                            _CBLASTranspose.TRANSPOSE,
+                            _CBLASTranspose.NO_TRANSPOSE,
+                            Int32(Self.IN_),
+                            Int32(Self.OUT_),
+                            Int32(B),
+                            Float32(1.0),
+                            rebind[Pointer[Float32, ImmutAnyOrigin]](
+                                find.data.unsafe_ptr()
+                            ),
+                            Int32(Self.IN_),
+                            rebind[Pointer[Float32, ImmutAnyOrigin]](
+                                god.data.unsafe_ptr()
+                            ),
+                            Int32(Self.OUT_),
+                            Float32(1.0),
+                            rebind[Pointer[Float32, MutAnyOrigin]](
+                                self.weight.grd.data.unsafe_ptr()
+                            ),
+                            Int32(Self.OUT_),
+                        )
+                    else:
+                        var gw_v = TileTensor(
+                            self.weight.grd.data,
+                            row_major[Self.IN_, Self.OUT_](),
+                        )
+                        var cT_v = TileTensor(
+                            self.cacheT.data, row_major[Self.IN_, B]()
+                        )
+                        for b in range(B):
+                            for k in range(Self.IN_):
+                                cT_v[k, b] = x_v[b, k]
+                        var dW_v = TileTensor(
+                            self.dW_tmp.data, row_major[Self.IN_, Self.OUT_]()
+                        )
+                        max_matmul[target="cpu"](dW_v, cT_v, go_v, None)
                         for k in range(Self.IN_):
-                            cT_v[k, b] = x_v[b, k]
-                    var dW_v = TileTensor(
-                        self.dW_tmp.data, row_major[Self.IN_, Self.OUT_]()
-                    )
-                    max_matmul[target="cpu"](dW_v, cT_v, go_v, None)
-                    for k in range(Self.IN_):
-                        for j in range(Self.OUT_):
-                            gw_v[k, j] += dW_v[k, j]
+                            for j in range(Self.OUT_):
+                                gw_v[k, j] += dW_v[k, j]
                 # grad_input = go @ Wᵀ
                 max_matmul[transpose_b=True, target="cpu"](
                     gi_v, go_v, w_v, None
@@ -1135,40 +1179,45 @@ struct Linear[IN_: Int, OUT_: Int, ADT: DType = DT](Module):
                     # per-call workspace MAX's fallback allocates, so the
                     # backward needs none of the K / N padding below.
                     var gol = god.dev.value()
-                    var gbl = self.bias.grd.dev.value()
-                    enqueue_bias_grad[DT](c, gol, gbl, B, Self.OUT_, self.gb_part)
-                    cublas_gemm[True, False, cublas_tf32(B, Self.OUT_, Self.IN_)](
-                        c, self.weight.grd.dev.value(), find.dev.value(),
-                        god.dev.value(),
-                        Self.IN_, Self.OUT_, B, 1.0,
-                    )
+                    if want_db:
+                        var gbl = self.bias.grd.dev.value()
+                        enqueue_bias_grad[DT](c, gol, gbl, B, Self.OUT_, self.gb_part)
+                    if want_dw:
+                        cublas_gemm[True, False, cublas_tf32(B, Self.OUT_, Self.IN_)](
+                            c, self.weight.grd.dev.value(), find.dev.value(),
+                            god.dev.value(),
+                            Self.IN_, Self.OUT_, B, 1.0,
+                        )
                     cublas_gemm[False, True, cublas_tf32(B, Self.OUT_, Self.IN_)](
                         c, gind.dev.value(), god.dev.value(),
                         self.weight.val.dev.value(),
                         B, Self.IN_, Self.OUT_, 0.0,
                     )
                 else:
-                    self.cacheT.ensure_gpu(c, Self.IN_ * B)
-                    self.dW_tmp.ensure_gpu(c, Self.W_SIZE)
+                    if want_dw:
+                        self.cacheT.ensure_gpu(c, Self.IN_ * B)
+                        self.dW_tmp.ensure_gpu(c, Self.W_SIZE)
                     # grad_b += colsum(go)
                     var gol = god.dev.value()
-                    var gbl = self.bias.grd.dev.value()
-                    enqueue_bias_grad[DT](c, gol, gbl, B, Self.OUT_, self.gb_part)
+                    if want_db:
+                        var gbl = self.bias.grd.dev.value()
+                        enqueue_bias_grad[DT](c, gol, gbl, B, Self.OUT_, self.gb_part)
                     # grad_w += cacheᵀ @ go: transpose x → cacheT (B1' tiled, fp32),
                     # then the two GEMMs (grad_w + grad_x), then the grad_w accumulate.
-                    var xl = find.dev.value()
-                    var cTl = self.cacheT.dev.value()
-                    c.enqueue_function[_transpose_tiled_kernel[DT]](
-                        xl,
-                        cTl,
-                        Int64(B),
-                        Int64(Self.IN_),
-                        grid_dim=(
-                            (Self.IN_ + _T_TILE - 1) // _T_TILE,
-                            (B + _T_TILE - 1) // _T_TILE,
-                        ),
-                        block_dim=(_T_TILE, _T_BR),
-                    )
+                    if want_dw:
+                        var xl = find.dev.value()
+                        var cTl = self.cacheT.dev.value()
+                        c.enqueue_function[_transpose_tiled_kernel[DT]](
+                            xl,
+                            cTl,
+                            Int64(B),
+                            Int64(Self.IN_),
+                            grid_dim=(
+                                (Self.IN_ + _T_TILE - 1) // _T_TILE,
+                                (B + _T_TILE - 1) // _T_TILE,
+                            ),
+                            block_dim=(_T_TILE, _T_BR),
+                        )
                     comptime if Self.NEEDS_PAD or Self.NEEDS_N_PAD:
                         # Both backward GEMMs run on the PADDED shapes, reusing the
                         # forward's `w_pad` ([K_PAD, N_PAD]) so no extra weight copy
@@ -1188,70 +1237,71 @@ struct Linear[IN_: Int, OUT_: Int, ADT: DType = DT](Module):
                                 grid_dim=(B * Self.N_PAD + 255) // 256,
                                 block_dim=256,
                             )
-                        var gop_v = TileTensor(
-                            self.go_pad.dev.value() if Self.NEEDS_N_PAD else god.dev.value(),
-                            row_major[B, Self.N_PAD](),
-                        )
-                        # cacheT: [IN_, B] -> [K_PAD, B]  (append zero ROWS)
-                        comptime if Self.NEEDS_PAD:
-                            self.cT_pad.ensure_gpu(c, Self.K_PAD * B)
-                            c.enqueue_function[_pad_2d_kernel](
-                                self.cacheT.dev.value(),
-                                self.cT_pad.dev.value(),
-                                Int64(Self.IN_),
-                                Int64(B),
-                                Int64(Self.K_PAD),
-                                Int64(B),
-                                grid_dim=(Self.K_PAD * B + 255) // 256,
-                                block_dim=256,
+                        if want_dw:
+                            var gop_v = TileTensor(
+                                self.go_pad.dev.value() if Self.NEEDS_N_PAD else god.dev.value(),
+                                row_major[B, Self.N_PAD](),
                             )
-                        var cTp_v = TileTensor(
-                            self.cT_pad.dev.value() if Self.NEEDS_PAD else self.cacheT.dev.value(),
-                            row_major[Self.K_PAD, B](),
-                        )
-                        # grad_w = cacheTᵀ @ go   ->  [K_PAD, N_PAD]
-                        self.dW_pad.ensure_gpu(c, Self.WPAD_SIZE)
-                        var dWp_v = TileTensor(
-                            self.dW_pad.dev.value(),
-                            row_major[Self.K_PAD, Self.N_PAD](),
-                        )
-                        # ── grad_w: split-K on OUR workspace, or plain matmul ──
-                        # This is the GEMM MODULAR_MATMUL_ALLOC_REPORT.md
-                        # Measurement 4 caught allocating per call: K is
-                        # `batch * tokens`, so it is long-K and skinny by
-                        # construction, which is exactly when `select_config`
-                        # partitions K. Routing it through our own workspace
-                        # removes the alloc/free pair AND unblocks CUDA-graph
-                        # capture of the whole step.
-                        #
-                        # Inert unless MAX's own dispatch would have reached
-                        # `multistage_gemm` with a partitioned K (see
-                        # `splitk_path_applies`: not H100, not sm_100 Blackwell,
-                        # not AMD/Apple). Otherwise this is byte-for-byte the
-                        # previous behaviour.
-                        comptime if splitk_path_applies[c.default_device_info]():
-                            if self._sk_p < 0:
-                                self._decide_sk_p(B, c)
-                            if self._sk_p > 1:
-                                dispatch_splitk_gemm(
-                                    dWp_v,
-                                    cTp_v,
-                                    gop_v,
-                                    Self.K_PAD,
-                                    Self.N_PAD,
-                                    B,
-                                    self._sk_p,
-                                    self.sk_ws,
-                                    c,
+                            # cacheT: [IN_, B] -> [K_PAD, B]  (append zero ROWS)
+                            comptime if Self.NEEDS_PAD:
+                                self.cT_pad.ensure_gpu(c, Self.K_PAD * B)
+                                c.enqueue_function[_pad_2d_kernel](
+                                    self.cacheT.dev.value(),
+                                    self.cT_pad.dev.value(),
+                                    Int64(Self.IN_),
+                                    Int64(B),
+                                    Int64(Self.K_PAD),
+                                    Int64(B),
+                                    grid_dim=(Self.K_PAD * B + 255) // 256,
+                                    block_dim=256,
                                 )
+                            var cTp_v = TileTensor(
+                                self.cT_pad.dev.value() if Self.NEEDS_PAD else self.cacheT.dev.value(),
+                                row_major[Self.K_PAD, B](),
+                            )
+                            # grad_w = cacheTᵀ @ go   ->  [K_PAD, N_PAD]
+                            self.dW_pad.ensure_gpu(c, Self.WPAD_SIZE)
+                            var dWp_v = TileTensor(
+                                self.dW_pad.dev.value(),
+                                row_major[Self.K_PAD, Self.N_PAD](),
+                            )
+                            # ── grad_w: split-K on OUR workspace, or plain matmul ──
+                            # This is the GEMM MODULAR_MATMUL_ALLOC_REPORT.md
+                            # Measurement 4 caught allocating per call: K is
+                            # `batch * tokens`, so it is long-K and skinny by
+                            # construction, which is exactly when `select_config`
+                            # partitions K. Routing it through our own workspace
+                            # removes the alloc/free pair AND unblocks CUDA-graph
+                            # capture of the whole step.
+                            #
+                            # Inert unless MAX's own dispatch would have reached
+                            # `multistage_gemm` with a partitioned K (see
+                            # `splitk_path_applies`: not H100, not sm_100 Blackwell,
+                            # not AMD/Apple). Otherwise this is byte-for-byte the
+                            # previous behaviour.
+                            comptime if splitk_path_applies[c.default_device_info]():
+                                if self._sk_p < 0:
+                                    self._decide_sk_p(B, c)
+                                if self._sk_p > 1:
+                                    dispatch_splitk_gemm(
+                                        dWp_v,
+                                        cTp_v,
+                                        gop_v,
+                                        Self.K_PAD,
+                                        Self.N_PAD,
+                                        B,
+                                        self._sk_p,
+                                        self.sk_ws,
+                                        c,
+                                    )
+                                else:
+                                    mm[A0=Self.K_PAD, A1=B, B0=B, B1=Self.N_PAD, O0=Self.K_PAD, O1=Self.N_PAD](
+                                        self.dW_pad.dev.value(), self.cT_pad.dev.value() if Self.NEEDS_PAD else self.cacheT.dev.value(), self.go_pad.dev.value() if Self.NEEDS_N_PAD else god.dev.value(), c
+                                    )
                             else:
                                 mm[A0=Self.K_PAD, A1=B, B0=B, B1=Self.N_PAD, O0=Self.K_PAD, O1=Self.N_PAD](
-                                    self.dW_pad.dev.value(), self.cT_pad.dev.value() if Self.NEEDS_PAD else self.cacheT.dev.value(), self.go_pad.dev.value() if Self.NEEDS_N_PAD else god.dev.value(), c
-                                )
-                        else:
-                            mm[A0=Self.K_PAD, A1=B, B0=B, B1=Self.N_PAD, O0=Self.K_PAD, O1=Self.N_PAD](
-                                    self.dW_pad.dev.value(), self.cT_pad.dev.value() if Self.NEEDS_PAD else self.cacheT.dev.value(), self.go_pad.dev.value() if Self.NEEDS_N_PAD else god.dev.value(), c
-                                )
+                                        self.dW_pad.dev.value(), self.cT_pad.dev.value() if Self.NEEDS_PAD else self.cacheT.dev.value(), self.go_pad.dev.value() if Self.NEEDS_N_PAD else god.dev.value(), c
+                                    )
                         # grad_input = go @ w_padᵀ  ->  [B, K_PAD]
                         # ⚠ The GEMM DESTINATION must be a mutable view, so this
                         # cannot use the `... if NEEDS_PAD else ...` form the
@@ -1279,69 +1329,72 @@ struct Linear[IN_: Int, OUT_: Int, ADT: DType = DT](Module):
                         # ⚠ STRIDED accumulate: dW_pad's row stride is N_PAD, the
                         # master grad's is OUT_. A flat `_accum_kernel` would fold
                         # the padded columns into the next row's gradient.
-                        c.enqueue_function[_accum_2d_kernel](
-                            self.weight.grd.dev.value(),
-                            # PREFIX view: dW_pad is [K_PAD, N_PAD] but only its
-                            # first IN_ rows carry gradient — the rest correspond to
-                            # the zero-padded contraction rows. Row-major makes
-                            # those first IN_ rows contiguous from offset 0.
-                            self.dW_pad.dev.value(),
-                            Int64(Self.IN_),
-                            Int64(Self.OUT_),
-                            Int64(Self.N_PAD),
-                            grid_dim=(Self.W_SIZE + 255) // 256,
-                            block_dim=256,
-                        )
+                        if want_dw:
+                            c.enqueue_function[_accum_2d_kernel](
+                                self.weight.grd.dev.value(),
+                                # PREFIX view: dW_pad is [K_PAD, N_PAD] but only its
+                                # first IN_ rows carry gradient — the rest correspond to
+                                # the zero-padded contraction rows. Row-major makes
+                                # those first IN_ rows contiguous from offset 0.
+                                self.dW_pad.dev.value(),
+                                Int64(Self.IN_),
+                                Int64(Self.OUT_),
+                                Int64(Self.N_PAD),
+                                grid_dim=(Self.W_SIZE + 255) // 256,
+                                block_dim=256,
+                            )
                     else:
-                        var dW_v = TileTensor(
-                            self.dW_tmp.dev.value(),
-                            row_major[Self.IN_, Self.OUT_](),
-                        )
-                        var cT_v = TileTensor(
-                            self.cacheT.dev.value(), row_major[Self.IN_, B]()
-                        )
-                        var go_v = TileTensor(
-                            god.dev.value(), row_major[B, Self.OUT_]()
-                        )
-                        # Same split-K routing as the padded branch above. This is
-                        # the branch an ALIGNED Linear takes (K_PAD == IN_ and
-                        # N_PAD == OUT_), which is most of them — the first version
-                        # of this change patched only the padded site and the gate
-                        # caught it as `split shapes: 0`.
-                        comptime if splitk_path_applies[c.default_device_info]():
-                            if self._sk_p < 0:
-                                self._decide_sk_p(B, c)
-                            if self._sk_p > 1:
-                                dispatch_splitk_gemm(
-                                    dW_v,
-                                    cT_v,
-                                    go_v,
-                                    Self.IN_,
-                                    Self.OUT_,
-                                    B,
-                                    self._sk_p,
-                                    self.sk_ws,
-                                    c,
-                                )
+                        if want_dw:
+                            var dW_v = TileTensor(
+                                self.dW_tmp.dev.value(),
+                                row_major[Self.IN_, Self.OUT_](),
+                            )
+                            var cT_v = TileTensor(
+                                self.cacheT.dev.value(), row_major[Self.IN_, B]()
+                            )
+                            var go_v = TileTensor(
+                                god.dev.value(), row_major[B, Self.OUT_]()
+                            )
+                            # Same split-K routing as the padded branch above. This is
+                            # the branch an ALIGNED Linear takes (K_PAD == IN_ and
+                            # N_PAD == OUT_), which is most of them — the first version
+                            # of this change patched only the padded site and the gate
+                            # caught it as `split shapes: 0`.
+                            comptime if splitk_path_applies[c.default_device_info]():
+                                if self._sk_p < 0:
+                                    self._decide_sk_p(B, c)
+                                if self._sk_p > 1:
+                                    dispatch_splitk_gemm(
+                                        dW_v,
+                                        cT_v,
+                                        go_v,
+                                        Self.IN_,
+                                        Self.OUT_,
+                                        B,
+                                        self._sk_p,
+                                        self.sk_ws,
+                                        c,
+                                    )
+                                else:
+                                    mm[A0=Self.IN_, A1=B, B0=B, B1=Self.OUT_, O0=Self.IN_, O1=Self.OUT_](
+                                        self.dW_tmp.dev.value(), self.cacheT.dev.value(), god.dev.value(), c
+                                    )
                             else:
                                 mm[A0=Self.IN_, A1=B, B0=B, B1=Self.OUT_, O0=Self.IN_, O1=Self.OUT_](
                                     self.dW_tmp.dev.value(), self.cacheT.dev.value(), god.dev.value(), c
                                 )
-                        else:
-                            mm[A0=Self.IN_, A1=B, B0=B, B1=Self.OUT_, O0=Self.IN_, O1=Self.OUT_](
-                                self.dW_tmp.dev.value(), self.cacheT.dev.value(), god.dev.value(), c
-                            )
                         mm[transpose_b=True, A0=B, A1=Self.OUT_, B0=Self.IN_, B1=Self.OUT_, O0=B, O1=Self.IN_](
                             gind.dev.value(), god.dev.value(), self.weight.val.dev.value(), c
                         )
                         # grad_w += dW (accumulate into the fp32 master grad)
-                        c.enqueue_function[_accum_kernel](
-                            self.weight.grd.dev.value(),
-                            self.dW_tmp.dev.value(),
-                            Int64(Self.W_SIZE),
-                            grid_dim=(Self.W_SIZE + 255) // 256,
-                            block_dim=256,
-                        )
+                        if want_dw:
+                            c.enqueue_function[_accum_kernel](
+                                self.weight.grd.dev.value(),
+                                self.dW_tmp.dev.value(),
+                                Int64(Self.W_SIZE),
+                                grid_dim=(Self.W_SIZE + 255) // 256,
+                                block_dim=256,
+                            )
         else:
             # ── bf16-flow path (GPU-only) ──
             comptime assert target == "gpu", "bf16-flow Linear is GPU-only"
@@ -1349,8 +1402,9 @@ struct Linear[IN_: Int, OUT_: Int, ADT: DType = DT](Module):
             gin.ensure_gpu(c, B * Self.IN_)
             # grad_b += colsum(go): bf16 go → fp32 master grad (fp32 accumulator).
             var gol = grad_output.dev.value()
-            var gbl = self.bias.grd.dev.value()
-            enqueue_bias_grad[Self.ADT](c, gol, gbl, B, Self.OUT_, self.gb_part)
+            if want_db:
+                var gbl = self.bias.grd.dev.value()
+                enqueue_bias_grad[Self.ADT](c, gol, gbl, B, Self.OUT_, self.gb_part)
             comptime if Self.CUB_LP:
                 # W: the forward's cast. No `_ensure_w_bf` here: under capture
                 # it recasts unconditionally, and no optimizer step runs
@@ -1359,58 +1413,62 @@ struct Linear[IN_: Int, OUT_: Int, ADT: DType = DT](Module):
                 if self.weight.val.version != self._w_cast_version:
                     self._ensure_w_bf(c)
                 # grad_w[IN, OUT] += xᵀ @ go, bf16 operands -> fp32 master grad.
-                cublas_gemm_lp[True, False, Self.ADT, DT](
-                    c, self.weight.grd.dev.value(), fin.dev.value(), gol,
-                    Self.IN_, Self.OUT_, B, 1.0,
-                )
+                if want_dw:
+                    cublas_gemm_lp[True, False, Self.ADT, DT](
+                        c, self.weight.grd.dev.value(), fin.dev.value(), gol,
+                        Self.IN_, Self.OUT_, B, 1.0,
+                    )
                 # grad_x[B, IN] = go @ Wᵀ (bf16 out — gin flows at bf16).
                 cublas_gemm_lp[False, True, Self.ADT, Self.ADT](
                     c, gin.dev.value(), gol, self.w_bf.dev.value(),
                     B, Self.IN_, Self.OUT_, 0.0,
                 )
                 return
-            self.cacheT_bf.ensure_gpu(c, Self.IN_ * B)
-            self.dW_tmp.ensure_gpu(c, Self.W_SIZE)
+            if want_dw:
+                self.cacheT_bf.ensure_gpu(c, Self.IN_ * B)
+                self.dW_tmp.ensure_gpu(c, Self.W_SIZE)
             # grad_w += cacheᵀ @ go. `fin`/`go` are ALREADY bf16 (no cast).
             # Transpose the bf16 fwd-input directly → bf16 cacheT_bf, then a
             # bf16-in → FP32-out GEMM into the fp32 dW_tmp, then accumulate into
             # the fp32 master grad. W reuses the forward's cached cast.
             self._ensure_w_bf(c)
-            var xl = fin.dev.value()
-            var cTl = self.cacheT_bf.dev.value()
-            c.enqueue_function[_transpose_tiled_kernel[Self.ADT]](
-                xl,
-                cTl,
-                Int64(B),
-                Int64(Self.IN_),
-                grid_dim=(
-                    (Self.IN_ + _T_TILE - 1) // _T_TILE,
-                    (B + _T_TILE - 1) // _T_TILE,
-                ),
-                block_dim=(_T_TILE, _T_BR),
-            )
-            # grad_w = cacheT_bfᵀ-form @ go → fp32 dW (bf16-in, fp32-out).
-            # ⚠ NOT routed through split-K, deliberately. bf16 operands with an
-            # fp32 output would work the same way, but nothing gates it yet —
-            # `tests/nn/test_linear_splitk_dw_gpu.mojo` builds fp32 Linears.
-            # Route it when that gate grows a bf16 arm, not before.
-            mm[A0=Self.IN_, A1=B, B0=B, B1=Self.OUT_, O0=Self.IN_, O1=Self.OUT_](
-                self.dW_tmp.dev.value(), self.cacheT_bf.dev.value(), grad_output.dev.value(), c
-            )
+            if want_dw:
+                var xl = fin.dev.value()
+                var cTl = self.cacheT_bf.dev.value()
+                c.enqueue_function[_transpose_tiled_kernel[Self.ADT]](
+                    xl,
+                    cTl,
+                    Int64(B),
+                    Int64(Self.IN_),
+                    grid_dim=(
+                        (Self.IN_ + _T_TILE - 1) // _T_TILE,
+                        (B + _T_TILE - 1) // _T_TILE,
+                    ),
+                    block_dim=(_T_TILE, _T_BR),
+                )
+                # grad_w = cacheT_bfᵀ-form @ go → fp32 dW (bf16-in, fp32-out).
+                # ⚠ NOT routed through split-K, deliberately. bf16 operands with an
+                # fp32 output would work the same way, but nothing gates it yet —
+                # `tests/nn/test_linear_splitk_dw_gpu.mojo` builds fp32 Linears.
+                # Route it when that gate grows a bf16 arm, not before.
+                mm[A0=Self.IN_, A1=B, B0=B, B1=Self.OUT_, O0=Self.IN_, O1=Self.OUT_](
+                    self.dW_tmp.dev.value(), self.cacheT_bf.dev.value(), grad_output.dev.value(), c
+                )
             # grad_x = go @ Wᵀ → bf16 gin (bf16-in, bf16-out — gin flows at bf16).
             mm[transpose_b=True, A0=B, A1=Self.OUT_, B0=Self.IN_, B1=Self.OUT_, O0=B, O1=Self.IN_](
                 gin.dev.value(), grad_output.dev.value(), self.w_bf.dev.value(), c
             )
             # grad_w += dW (accumulate into the fp32 master grad)
-            var gwl = self.weight.grd.dev.value()
-            var dWl = self.dW_tmp.dev.value()
-            c.enqueue_function[_accum_kernel](
-                gwl,
-                dWl,
-                Int64(Self.W_SIZE),
-                grid_dim=(Self.W_SIZE + 255) // 256,
-                block_dim=256,
-            )
+            if want_dw:
+                var gwl = self.weight.grd.dev.value()
+                var dWl = self.dW_tmp.dev.value()
+                c.enqueue_function[_accum_kernel](
+                    gwl,
+                    dWl,
+                    Int64(Self.W_SIZE),
+                    grid_dim=(Self.W_SIZE + 255) // 256,
+                    block_dim=256,
+                )
 
     # for_each_param / zero_grad inherit the Module reflection defaults
     # (core/walkers.mojo auto-discovers the `weight` + `bias` Params).

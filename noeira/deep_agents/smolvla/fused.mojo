@@ -53,6 +53,9 @@ from .text import (
     SMOLLM_HEAD_DIM, SMOLLM_REP, SMOLLM_LAYERS, SMOLLM_THETA, SMOLLM_KV_W,
 )
 from .kv_cache import SmolVLAKVCache
+from .layer_weights import (
+    LORA_Q, LORA_K, LORA_V, LORA_O, LORA_GATE, LORA_UP, LORA_DOWN,
+)
 from .expert import SmolVLAExpert
 from .block_attention import BlockCrossAttention
 from .grad_ops import (
@@ -100,6 +103,11 @@ struct SmolVLAPrefill[
     THETA: Float64 = SMOLLM_THETA,
     # V2 stage 7. See `SmolVLADenoise`'s RECORD — same parameter, same reason.
     RECORD: Bool = False,
+    # The tower's LoRA rank (`layer_weights.mojo`); 0 = no adapters, and every
+    # adapter hook inside `proj_fwd` / `proj_vjp` compiles to nothing.
+    LORA_R: Int = 0,
+    # The tower's linears are int4 `QLinear`s (`layer_weights.mojo`, Q4).
+    Q4: Bool = False,
 ](Movable):
     """The prefill driver. Owns the stateless leaves and every scratch slab, so
     one instance runs all 16 layers without allocating in the loop."""
@@ -248,7 +256,9 @@ struct SmolVLAPrefill[
         target: StaticString
     ](
         mut self,
-        mut tower: SmolVLMTextLayers[Self.LAYERS, Self.W, Self.FF, Self.KVW],
+        mut tower: SmolVLMTextLayers[
+            Self.LAYERS, Self.W, Self.FF, Self.KVW, Self.LORA_R, Self.Q4
+        ],
         mut cache: SmolVLAKVCache[
             Self.LAYERS, Self.P, Self.SUFFIX, Self.N_KV, Self.HD, Self.B
         ],
@@ -281,13 +291,13 @@ struct SmolVLAPrefill[
             tower.layers[i].input_layernorm.forward[target, TOK](
                 TensorRefs[1](PK[Self.X]), PK[Self.H], ctx
             )
-            tower.layers[i].q.forward[target, TOK](
+            tower.layers[i].proj_fwd[LORA_Q, target, TOK](
                 TensorRefs[1](PK[Self.H]), PK[Self.Q], ctx
             )
-            tower.layers[i].k.forward[target, TOK](
+            tower.layers[i].proj_fwd[LORA_K, target, TOK](
                 TensorRefs[1](PK[Self.H]), PK[Self.K], ctx
             )
-            tower.layers[i].v.forward[target, TOK](
+            tower.layers[i].proj_fwd[LORA_V, target, TOK](
                 TensorRefs[1](PK[Self.H]), PK[Self.V], ctx
             )
             # RoPE on q and k, never on v.
@@ -316,7 +326,7 @@ struct SmolVLAPrefill[
             self.attn.forward[target, Self.B](
                 TensorRefs[1](PK[Self.PACKED]), PK[Self.ATT], ctx
             )
-            tower.layers[i].o.forward[target, TOK](
+            tower.layers[i].proj_fwd[LORA_O, target, TOK](
                 TensorRefs[1](PK[Self.ATT]), PK[Self.AO], ctx
             )
             self.res.forward[target, Self.B](
@@ -328,10 +338,10 @@ struct SmolVLAPrefill[
             tower.layers[i].post_attention_layernorm.forward[target, TOK](
                 TensorRefs[1](PK[Self.X2]), PK[Self.H2], ctx
             )
-            tower.layers[i].mlp.gate.forward[target, TOK](
+            tower.layers[i].proj_fwd[LORA_GATE, target, TOK](
                 TensorRefs[1](PK[Self.H2]), PK[Self.GATE], ctx
             )
-            tower.layers[i].mlp.up.forward[target, TOK](
+            tower.layers[i].proj_fwd[LORA_UP, target, TOK](
                 TensorRefs[1](PK[Self.H2]), PK[Self.UP], ctx
             )
             # ⚠ (up, gate): SwiGLU reads [u ‖ v] -> u * silu(v), and the
@@ -344,7 +354,7 @@ struct SmolVLAPrefill[
             self.glu.forward[target, Self.B](
                 TensorRefs[1](PK[Self.CAT]), PK[Self.GLU], ctx
             )
-            tower.layers[i].mlp.down.forward[target, TOK](
+            tower.layers[i].proj_fwd[LORA_DOWN, target, TOK](
                 TensorRefs[1](PK[Self.GLU]), PK[Self.DOWN], ctx
             )
             self.res.forward[target, Self.B](
@@ -380,7 +390,7 @@ struct SmolVLAPrefill[
     ](
         mut self,
         mut tower: SmolVLMTextLayers[
-            Self.LAYERS, Self.W, Self.FF, Self.KVW
+            Self.LAYERS, Self.W, Self.FF, Self.KVW, Self.LORA_R, Self.Q4
         ],
         mut grad_cache_k: Tensor,
         mut grad_cache_v: Tensor,
@@ -408,12 +418,12 @@ struct SmolVLAPrefill[
         reasonable and is missing most of itself; taking only the cache side
         silently deletes the prefix's internal structure.
 
-        ⚠ **No VLM weight gradient is wanted** — the tower is frozen — but
-        `Linear.vjp` forms one anyway, because it has no flag to skip dW.
-        That is roughly double the backward cost of this pass and it pollutes
-        `.grd` on frozen parameters, which nothing zeroes. Named here rather
-        than discovered later; the fix is a `NO_DW` parameter on `Linear.vjp`
-        and it belongs with the Jetson work.
+        ⚠ **No VLM weight gradient is wanted** — the tower is frozen. Freeze
+        it (`SmolVLAPolicy.freeze_backbone`, or `FreezeParams` over the tower)
+        and `Linear.vjp` / `RMSNorm.vjp` form grad_input only: no dW GEMM, no
+        bias or gamma sums, no gradient buffers. On an unfrozen tower they
+        still form and accumulate every weight gradient, which nothing reads
+        or zeroes (1.30x on a 5090 at one observation, 4.2x on Metal).
         """
         comptime assert Self.RECORD, (
             "SmolVLAPrefill.backward needs RECORD=True — the non-recording"
@@ -427,6 +437,9 @@ struct SmolVLAPrefill[
         comptime CACHE_LAYER = Self.B * Self.P * Self.KVW
 
         zero_into[target, XN](self.g[Self.GXO], ctx)
+        # An int4 tower's grad_input dequantizes: one shared scratch.
+        comptime if Self.Q4 and target == "gpu":
+            tower.ensure_q4_scratch(ctx.value())
 
         for ridx in range(Self.LAYERS):
             var i = Self.LAYERS - 1 - ridx
@@ -439,7 +452,7 @@ struct SmolVLAPrefill[
                 TensorRefs[2](self.g[Self.GX2], self.g[Self.GDOWN]),
                 ctx,
             )
-            tower.layers[i].mlp.down.vjp[target, TOK](
+            tower.layers[i].proj_vjp[LORA_DOWN, target, TOK](
                 TensorRefs[1](PK[Self.GLU]), self.g[Self.GDOWN],
                 TensorRefs[1](self.g[Self.GGLU]), ctx,
             )
@@ -459,11 +472,11 @@ struct SmolVLAPrefill[
                 TensorRefs[2](self.g[Self.GUP], self.g[Self.GGATE]),
                 ctx,
             )
-            tower.layers[i].mlp.up.vjp[target, TOK](
+            tower.layers[i].proj_vjp[LORA_UP, target, TOK](
                 TensorRefs[1](PK[Self.H2]), self.g[Self.GUP],
                 TensorRefs[1](self.g[Self.GHA]), ctx,
             )
-            tower.layers[i].mlp.gate.vjp[target, TOK](
+            tower.layers[i].proj_vjp[LORA_GATE, target, TOK](
                 TensorRefs[1](PK[Self.H2]), self.g[Self.GGATE],
                 TensorRefs[1](self.g[Self.GHB]), ctx,
             )
@@ -481,7 +494,7 @@ struct SmolVLAPrefill[
                 TensorRefs[2](self.g[Self.GHC], self.g[Self.GAO]),
                 ctx,
             )
-            tower.layers[i].o.vjp[target, TOK](
+            tower.layers[i].proj_vjp[LORA_O, target, TOK](
                 TensorRefs[1](PK[Self.ATT]), self.g[Self.GAO],
                 TensorRefs[1](self.g[Self.GATT]), ctx,
             )
@@ -530,15 +543,15 @@ struct SmolVLAPrefill[
                 TensorRefs[1](PK[Self.Q]), self.g[Self.GQR],
                 TensorRefs[1](self.g[Self.GQ]), ctx,
             )
-            tower.layers[i].q.vjp[target, TOK](
+            tower.layers[i].proj_vjp[LORA_Q, target, TOK](
                 TensorRefs[1](PK[Self.H]), self.g[Self.GQ],
                 TensorRefs[1](self.g[Self.GHA]), ctx,
             )
-            tower.layers[i].k.vjp[target, TOK](
+            tower.layers[i].proj_vjp[LORA_K, target, TOK](
                 TensorRefs[1](PK[Self.H]), self.g[Self.GK],
                 TensorRefs[1](self.g[Self.GHB]), ctx,
             )
-            tower.layers[i].v.vjp[target, TOK](
+            tower.layers[i].proj_vjp[LORA_V, target, TOK](
                 TensorRefs[1](PK[Self.H]), self.g[Self.GV],
                 TensorRefs[1](self.g[Self.GXO]), ctx,
             )
@@ -622,6 +635,9 @@ struct SmolVLADenoise[
     # sixteen layers, nothing kept. True keeps a pool PER LAYER, so the
     # activations a backward pass needs survive the forward that made them.
     RECORD: Bool = False,
+    # The expert's LoRA rank (`layer_weights.mojo`); 0 = no adapters, and
+    # every `lora_fwd` / `lora_vjp` below compiles to nothing.
+    LORA_R: Int = 0,
 ](Movable):
     """One denoising step: the 50-token action suffix through the 16 expert
     layers, reading the prefix K/V the prefill left behind.
@@ -888,7 +904,8 @@ struct SmolVLADenoise[
     ](
         mut self,
         mut expert: SmolVLAExpert[
-            Self.LAYERS, Self.EW, Self.EFF, Self.W, Self.KVW, Self.SELF_EVERY
+            Self.LAYERS, Self.EW, Self.EFF, Self.W, Self.KVW, Self.SELF_EVERY,
+            Self.LORA_R,
         ],
         mut cache: SmolVLAKVCache[
             Self.LAYERS, Self.P, Self.S, Self.N_KV, Self.HD, Self.B
@@ -941,10 +958,19 @@ struct SmolVLADenoise[
                 L.q.forward[target, TOK_S](
                     TensorRefs[1](PK[Self.H]), PK[Self.Q], ctx
                 )
+                L.lora_fwd[LORA_Q, target, TOK_S](
+                    TensorRefs[1](PK[Self.H]), PK[Self.Q], ctx
+                )
                 L.k.forward[target, TOK_S](
                     TensorRefs[1](PK[Self.H]), PK[Self.KS], ctx
                 )
+                L.lora_fwd[LORA_K, target, TOK_S](
+                    TensorRefs[1](PK[Self.H]), PK[Self.KS], ctx
+                )
                 L.v.forward[target, TOK_S](
+                    TensorRefs[1](PK[Self.H]), PK[Self.VS], ctx
+                )
+                L.lora_fwd[LORA_V, target, TOK_S](
                     TensorRefs[1](PK[Self.H]), PK[Self.VS], ctx
                 )
                 _prof_tick[target](
@@ -983,6 +1009,9 @@ struct SmolVLADenoise[
                 L.o.forward[target, TOK_S](
                     TensorRefs[1](PK[Self.ATT]), PK[Self.AO], ctx
                 )
+                L.lora_fwd[LORA_O, target, TOK_S](
+                    TensorRefs[1](PK[Self.ATT]), PK[Self.AO], ctx
+                )
                 _prof_tick[target](
                     self.profile_step, self.prof_step, Self.PR_O, t, ctx
                 )
@@ -995,6 +1024,9 @@ struct SmolVLADenoise[
                     self.profile_step, self.prof_step, Self.PR_NORM, t, ctx
                 )
                 L.q.forward[target, TOK_S](
+                    TensorRefs[1](PK[Self.H]), PK[Self.Q], ctx
+                )
+                L.lora_fwd[LORA_Q, target, TOK_S](
                     TensorRefs[1](PK[Self.H]), PK[Self.Q], ctx
                 )
                 _prof_tick[target](
@@ -1017,7 +1049,13 @@ struct SmolVLADenoise[
                 L.k.forward[target, TOK_P](
                     TensorRefs[1](PK[Self.KP]), PK[Self.KS], ctx
                 )
+                L.lora_fwd[LORA_K, target, TOK_P](
+                    TensorRefs[1](PK[Self.KP]), PK[Self.KS], ctx
+                )
                 L.v.forward[target, TOK_P](
+                    TensorRefs[1](PK[Self.VP]), PK[Self.VS], ctx
+                )
+                L.lora_fwd[LORA_V, target, TOK_P](
                     TensorRefs[1](PK[Self.VP]), PK[Self.VS], ctx
                 )
                 _prof_tick[target](
@@ -1040,6 +1078,9 @@ struct SmolVLADenoise[
                     self.profile_step, self.prof_step, Self.PR_ATTN, t, ctx
                 )
                 L.o.forward[target, TOK_S](
+                    TensorRefs[1](PK[Self.ATT]), PK[Self.AO], ctx
+                )
+                L.lora_fwd[LORA_O, target, TOK_S](
                     TensorRefs[1](PK[Self.ATT]), PK[Self.AO], ctx
                 )
                 _prof_tick[target](
@@ -1066,7 +1107,13 @@ struct SmolVLADenoise[
                 L.mlp.gate.forward[target, TOK_S](
                     TensorRefs[1](PK[Self.H2]), PK[Self.GATE], ctx
                 )
+                L.lora_fwd[LORA_GATE, target, TOK_S](
+                    TensorRefs[1](PK[Self.H2]), PK[Self.GATE], ctx
+                )
                 L.mlp.up.forward[target, TOK_S](
+                    TensorRefs[1](PK[Self.H2]), PK[Self.UP], ctx
+                )
+                L.lora_fwd[LORA_UP, target, TOK_S](
                     TensorRefs[1](PK[Self.H2]), PK[Self.UP], ctx
                 )
             else:
@@ -1080,7 +1127,13 @@ struct SmolVLADenoise[
                 L.mlp.gate.forward[target, TOK_S](
                     TensorRefs[1](PK[Self.H2]), PK[Self.GATE], ctx
                 )
+                L.lora_fwd[LORA_GATE, target, TOK_S](
+                    TensorRefs[1](PK[Self.H2]), PK[Self.GATE], ctx
+                )
                 L.mlp.up.forward[target, TOK_S](
+                    TensorRefs[1](PK[Self.H2]), PK[Self.UP], ctx
+                )
+                L.lora_fwd[LORA_UP, target, TOK_S](
                     TensorRefs[1](PK[Self.H2]), PK[Self.UP], ctx
                 )
             _prof_tick[target](
@@ -1101,8 +1154,16 @@ struct SmolVLADenoise[
                     TensorRefs[1](PK[Self.GLU]), PK[Self.DOWN],
                     ctx,
                 )
+                expert.self_layers[li].lora_fwd[LORA_DOWN, target, TOK_S](
+                    TensorRefs[1](PK[Self.GLU]), PK[Self.DOWN],
+                    ctx,
+                )
             else:
                 expert.cross_layers[li].mlp.down.forward[target, TOK_S](
+                    TensorRefs[1](PK[Self.GLU]), PK[Self.DOWN],
+                    ctx,
+                )
+                expert.cross_layers[li].lora_fwd[LORA_DOWN, target, TOK_S](
                     TensorRefs[1](PK[Self.GLU]), PK[Self.DOWN],
                     ctx,
                 )
@@ -1151,7 +1212,8 @@ struct SmolVLADenoise[
     ](
         mut self,
         mut expert: SmolVLAExpert[
-            Self.LAYERS, Self.EW, Self.EFF, Self.W, Self.KVW, Self.SELF_EVERY
+            Self.LAYERS, Self.EW, Self.EFF, Self.W, Self.KVW, Self.SELF_EVERY,
+            Self.LORA_R,
         ],
         mut cache: SmolVLAKVCache[
             Self.LAYERS, Self.P, Self.S, Self.N_KV, Self.HD, Self.B
@@ -1248,8 +1310,16 @@ struct SmolVLADenoise[
                     TensorRefs[1](PK[Self.GLU]), self.g[Self.GDOWN],
                     TensorRefs[1](self.g[Self.GGLU]), ctx,
                 )
+                expert.self_layers[li].lora_vjp[LORA_DOWN, target, TOK_S](
+                    TensorRefs[1](PK[Self.GLU]), self.g[Self.GDOWN],
+                    TensorRefs[1](self.g[Self.GGLU]), ctx,
+                )
             else:
                 expert.cross_layers[li].mlp.down.vjp[target, TOK_S](
+                    TensorRefs[1](PK[Self.GLU]), self.g[Self.GDOWN],
+                    TensorRefs[1](self.g[Self.GGLU]), ctx,
+                )
+                expert.cross_layers[li].lora_vjp[LORA_DOWN, target, TOK_S](
                     TensorRefs[1](PK[Self.GLU]), self.g[Self.GDOWN],
                     TensorRefs[1](self.g[Self.GGLU]), ctx,
                 )
@@ -1282,7 +1352,15 @@ struct SmolVLADenoise[
                     TensorRefs[1](PK[Self.H2]), self.g[Self.GUP],
                     TensorRefs[1](self.g[Self.GHA]), ctx,
                 )
+                L.lora_vjp[LORA_UP, target, TOK_S](
+                    TensorRefs[1](PK[Self.H2]), self.g[Self.GUP],
+                    TensorRefs[1](self.g[Self.GHA]), ctx,
+                )
                 L.mlp.gate.vjp[target, TOK_S](
+                    TensorRefs[1](PK[Self.H2]), self.g[Self.GGATE],
+                    TensorRefs[1](self.g[Self.GHB]), ctx,
+                )
+                L.lora_vjp[LORA_GATE, target, TOK_S](
                     TensorRefs[1](PK[Self.H2]), self.g[Self.GGATE],
                     TensorRefs[1](self.g[Self.GHB]), ctx,
                 )
@@ -1292,7 +1370,15 @@ struct SmolVLADenoise[
                     TensorRefs[1](PK[Self.H2]), self.g[Self.GUP],
                     TensorRefs[1](self.g[Self.GHA]), ctx,
                 )
+                L.lora_vjp[LORA_UP, target, TOK_S](
+                    TensorRefs[1](PK[Self.H2]), self.g[Self.GUP],
+                    TensorRefs[1](self.g[Self.GHA]), ctx,
+                )
                 L.mlp.gate.vjp[target, TOK_S](
+                    TensorRefs[1](PK[Self.H2]), self.g[Self.GGATE],
+                    TensorRefs[1](self.g[Self.GHB]), ctx,
+                )
+                L.lora_vjp[LORA_GATE, target, TOK_S](
                     TensorRefs[1](PK[Self.H2]), self.g[Self.GGATE],
                     TensorRefs[1](self.g[Self.GHB]), ctx,
                 )
@@ -1330,6 +1416,10 @@ struct SmolVLADenoise[
             if is_self:
                 ref L = expert.self_layers[li]
                 L.o.vjp[target, TOK_S](
+                    TensorRefs[1](PK[Self.ATT]), self.g[Self.GAO],
+                    TensorRefs[1](self.g[Self.GATT]), ctx,
+                )
+                L.lora_vjp[LORA_O, target, TOK_S](
                     TensorRefs[1](PK[Self.ATT]), self.g[Self.GAO],
                     TensorRefs[1](self.g[Self.GATT]), ctx,
                 )
@@ -1394,11 +1484,23 @@ struct SmolVLADenoise[
                     TensorRefs[1](PK[Self.H]), self.g[Self.GQ],
                     TensorRefs[1](self.g[Self.GHA]), ctx,
                 )
+                L.lora_vjp[LORA_Q, target, TOK_S](
+                    TensorRefs[1](PK[Self.H]), self.g[Self.GQ],
+                    TensorRefs[1](self.g[Self.GHA]), ctx,
+                )
                 L.k.vjp[target, TOK_S](
                     TensorRefs[1](PK[Self.H]), self.g[Self.GKS],
                     TensorRefs[1](self.g[Self.GHB]), ctx,
                 )
+                L.lora_vjp[LORA_K, target, TOK_S](
+                    TensorRefs[1](PK[Self.H]), self.g[Self.GKS],
+                    TensorRefs[1](self.g[Self.GHB]), ctx,
+                )
                 L.v.vjp[target, TOK_S](
+                    TensorRefs[1](PK[Self.H]), self.g[Self.GVS],
+                    TensorRefs[1](self.g[Self.GXO]), ctx,
+                )
+                L.lora_vjp[LORA_V, target, TOK_S](
                     TensorRefs[1](PK[Self.H]), self.g[Self.GVS],
                     TensorRefs[1](self.g[Self.GXO]), ctx,
                 )
@@ -1415,6 +1517,10 @@ struct SmolVLADenoise[
             else:
                 ref L = expert.cross_layers[li]
                 L.o.vjp[target, TOK_S](
+                    TensorRefs[1](PK[Self.ATT]), self.g[Self.GAO],
+                    TensorRefs[1](self.g[Self.GATT]), ctx,
+                )
+                L.lora_vjp[LORA_O, target, TOK_S](
                     TensorRefs[1](PK[Self.ATT]), self.g[Self.GAO],
                     TensorRefs[1](self.g[Self.GATT]), ctx,
                 )
@@ -1441,7 +1547,15 @@ struct SmolVLADenoise[
                     TensorRefs[1](PK[Self.KP]), self.g[Self.GKSP],
                     TensorRefs[1](self.g[Self.GKP]), ctx,
                 )
+                L.lora_vjp[LORA_K, target, TOK_P](
+                    TensorRefs[1](PK[Self.KP]), self.g[Self.GKSP],
+                    TensorRefs[1](self.g[Self.GKP]), ctx,
+                )
                 L.v.vjp[target, TOK_P](
+                    TensorRefs[1](PK[Self.VP]), self.g[Self.GVSP],
+                    TensorRefs[1](self.g[Self.GVP]), ctx,
+                )
+                L.lora_vjp[LORA_V, target, TOK_P](
                     TensorRefs[1](PK[Self.VP]), self.g[Self.GVSP],
                     TensorRefs[1](self.g[Self.GVP]), ctx,
                 )
@@ -1462,6 +1576,10 @@ struct SmolVLADenoise[
                 # cache, not from this stream. No sum here, and adding one
                 # would double-count nothing — it would add a stale slab.
                 L.q.vjp[target, TOK_S](
+                    TensorRefs[1](PK[Self.H]), self.g[Self.GQ],
+                    TensorRefs[1](self.g[Self.GHA]), ctx,
+                )
+                L.lora_vjp[LORA_Q, target, TOK_S](
                     TensorRefs[1](PK[Self.H]), self.g[Self.GQ],
                     TensorRefs[1](self.g[Self.GHA]), ctx,
                 )
