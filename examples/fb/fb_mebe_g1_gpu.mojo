@@ -16,6 +16,14 @@ and Q_reg (λ ≤ 1 there; recalibrated here) are the add-ons:
     G-MEBE   --explore mebe --beta 2 --reg λ
     G-MEBE0  --explore mebe --beta 0 --reg λ
 
+and the §12.6 levers against the spin MEBE bought on φ ∋ ωz:
+
+    --phi vxvyh            φ = (vx, vy, h): density no longer rewards ωz
+    --wz-max 1.0           a |ωz| box in the validity filter (0 = off)
+    --w-yaw 0.5 --w-angxy 0.05
+                           −w_yaw·ωz² − w_angxy·(ωx² + ωy²) in Q_reg's
+                           simulator half (needs --reg > 0)
+
     pixi run -e nvidia mojo build -I . examples/fb/fb_mebe_g1_gpu.mojo -o fb_mebe_g1
     ./fb_mebe_g1 --explore sphere --reg 0 --tag gfb_s1 --seed 1
     ./fb_mebe_g1 --smoke                  # 3 segments of 40 batched steps + an eval
@@ -87,6 +95,7 @@ from noeira.deep_agents.fb.g1_mebe import (
     g1_fall_kernel,
     g1_reset_noise_kernel,
     g1_reg_env_kernel,
+    g1_angvel_price_kernel,
 )
 from noeira.envs.robots import UnitreeG1Batched
 from noeira.envs.robots.unitree_g1_xml import UNITREE_G1_OBS_DIM
@@ -191,6 +200,10 @@ def main() raises:
     var eval_every = atol(_flag(String("--eval-every"), String(0)))
     var seed_v = atol(_flag(String("--seed"), String(1)))
     var tag = _flag(String("--tag"), String(""))
+    var phi = _flag(String("--phi"), String("vxvywzh"))
+    var wz_max = atof(_flag(String("--wz-max"), String(0.0)))
+    var w_yaw = atof(_flag(String("--w-yaw"), String(0.0)))
+    var w_angxy = atof(_flag(String("--w-angxy"), String(0.0)))
     if smoke:
         total = 3 * 40 * N_ENVS
         seg_steps = 40 * N_ENVS
@@ -199,6 +212,10 @@ def main() raises:
     if explore != "mebe" and explore != "sphere":
         raise Error("--explore must be 'mebe' or 'sphere'")
     var mebe = explore == "mebe"
+    if phi != "vxvywzh" and phi != "vxvyh":
+        raise Error("--phi must be 'vxvywzh' or 'vxvyh'")
+    if (w_yaw > 0.0 or w_angxy > 0.0) and reg <= 0.0:
+        raise Error("--w-yaw / --w-angxy price Q_reg: they need --reg > 0")
     if warmup < BATCH:
         raise Error("--warmup must be >= BATCH")
     var n_batched = total // N_ENVS
@@ -222,10 +239,15 @@ def main() raises:
     var csv_path = run.metrics_path()
 
     # φ = (vx, vy, ωz, h); valid = upright and in the release's speed box
-    var cfg = MebeConfig([G1M_COL_VX, G1M_COL_VY, G1M_COL_WZ, G1M_COL_H])
+    var phi_cols: List[Int] = [G1M_COL_VX, G1M_COL_VY, G1M_COL_WZ, G1M_COL_H]
+    if phi == "vxvyh":
+        phi_cols = [G1M_COL_VX, G1M_COL_VY, G1M_COL_H]
+    var cfg = MebeConfig(phi_cols^)
     cfg.add_filter(G1M_COL_GZ, -1.01, -0.93)
     cfg.add_filter(G1M_COL_VX, -1.8, 1.8)
     cfg.add_filter(G1M_COL_VY, -1.3, 1.3)
+    if wz_max > 0.0:
+        cfg.add_filter(G1M_COL_WZ, -wz_max, wz_max)
     cfg.density = InverseDensityConfig(beta=beta, eps_rel=eps_rel, bw_scale=1.0)
     cfg.n_cand = 8192
     cfg.n_ref = 2048
@@ -247,6 +269,7 @@ def main() raises:
     print("=" * 70)
     print("  nets                =", "F/Q tower H", H, "L", L, "| actor H", H, "L", LA, "| B ϑ(10) ->", HB, "->", D)
     print("  explore             =", explore, " β", beta, " eps_rel", eps_rel, " refresh", refresh, " explore_frac", explore_frac)
+    print("  φ / |ωz| box        =", phi, "/", wz_max, "(0 = off)   ang-vel price yaw", w_yaw, " xy", w_angxy)
     print("  Q_reg λ (raw)       =", reg, " w_acc", w_acc, " w_ar", w_ar, " w_env", w_env,
           " (und", rw.undesired, " fo", rw.feet_orient, " lim", rw.limits, " slide", rw.slide, ")")
     print("  N_ENVS / BATCH / D  =", N_ENVS, "/", BATCH, "/", D)
@@ -282,6 +305,10 @@ def main() raises:
         logger.set_config("reset_noise", String(reset_noise))
         logger.set_config("seed", String(seed_v))
         logger.set_config("tag", tag)
+        logger.set_config("phi", phi)
+        logger.set_config("wz_max", String(wz_max))
+        logger.set_config("w_yaw", String(w_yaw))
+        logger.set_config("w_angxy", String(w_angxy))
         var logger_ptr = Pointer(to=logger).as_unsafe_any_origin()
 
         var agent = Agent.make(
@@ -330,6 +357,7 @@ def main() raises:
                 h_params[k * G1M_CMD_P + j] = Scalar[DT](p[j])
         ctx.enqueue_copy(e_task, h_task)
         ctx.enqueue_copy(e_params, h_params)
+        var h_eobs = ctx.enqueue_create_host_buffer[DT](N_ENVS * OBS)
 
         def _eval(at: Int) capturing raises:
             var t0 = perf_counter_ns()
@@ -366,6 +394,8 @@ def main() raises:
             e_fell.enqueue_fill(Scalar[DT](0.0))
             e_ar.enqueue_fill(Scalar[DT](0.0))
             e_prev_a.enqueue_fill(Scalar[DT](0.0))
+            # §12.6: the spin, read back per step — Σ|ωz|, Σ|vx − vx*|
+            var sp = List[Float64](length=2 * n_task, fill=0.0)
             for t in range(EVAL_LEN):
                 agent.policy_with_z(
                     mptr(eval_env._obs.unsafe_ptr()), mptr(e_z.unsafe_ptr()),
@@ -380,6 +410,12 @@ def main() raises:
                     Scalar[DT](EVAL_FALL_H), Int32(ACT),
                     grid_dim=_blocks(N_ENVS), block_dim=TPB,
                 )
+                ctx.enqueue_copy(h_eobs, eval_env._obs)
+                ctx.synchronize()
+                for l in range(reps * n_task):
+                    var k = l % n_task
+                    sp[2 * k] += abs(Float64(h_eobs[l * OBS + G1M_COL_WZ]))
+                    sp[2 * k + 1] += abs(Float64(h_eobs[l * OBS + G1M_COL_VX]) - suite[k].vx)
             var h_ret = ctx.enqueue_create_host_buffer[DT](N_ENVS)
             var h_fell = ctx.enqueue_create_host_buffer[DT](N_ENVS)
             var h_ar = ctx.enqueue_create_host_buffer[DT](N_ENVS)
@@ -391,6 +427,7 @@ def main() raises:
             var fam_sum = List[Float64](length=3, fill=0.0)
             var fam_n = List[Int](length=3, fill=0)
             var fall_all = 0.0
+            var wz_all = 0.0
             for k in range(n_task):
                 var r = 0.0
                 var f = 0.0
@@ -406,12 +443,16 @@ def main() raises:
                 fall_all += f
                 fam_sum[suite[k].family] += r
                 fam_n[suite[k].family] += 1
-                print("SUITE", at, suite[k].name, suite[k].family, r, f, a)
+                var nn = Float64(reps * EVAL_LEN)
+                wz_all += sp[2 * k] / nn
+                print("SUITE", at, suite[k].name, suite[k].family, r, f, a,
+                      sp[2 * k] / nn, sp[2 * k + 1] / nn)
             print(
                 "  [eval @", at, "] velocity", fam_sum[0] / Float64(fam_n[0]),
                 " posture", fam_sum[1] / Float64(fam_n[1]),
                 " composite", fam_sum[2] / Float64(fam_n[2]),
                 " fall", fall_all / Float64(n_task),
+                " |wz|", wz_all / Float64(n_task),
                 "  (", Float64(perf_counter_ns() - t0) / 1e9, "s )",
             )
             var names = List[String]()
@@ -426,17 +467,20 @@ def main() raises:
             """The plan's early kill checks, on the ring: upright share,
             upright |vx| >= 0.5 share, entropy of the upright (vx, vy)
             histogram (0.25 m/s cells on [-2, 2]²), and the fall-reset rate."""
-            var cols: List[Int] = [G1M_COL_VX, G1M_COL_VY, G1M_COL_GZ, G1M_COL_H]
+            var cols: List[Int] = [G1M_COL_VX, G1M_COL_VY, G1M_COL_GZ, G1M_COL_WZ]
             comptime NS = 8192
             var x = agent.sample_ring_cols(cols, NS, UInt64(at) + 17)
             var up = 0
             var fast = 0
+            var calm = 0
             var hist = List[Int](length=256, fill=0)
             for i in range(NS):
                 var vx = x[i * 4]
                 var vy = x[i * 4 + 1]
                 if x[i * 4 + 2] <= -0.93:
                     up += 1
+                    if abs(x[i * 4 + 3]) < 0.3:
+                        calm += 1
                     if abs(vx) >= 0.5:
                         fast += 1
                     var cx = Int((vx + 2.0) / 0.25)
@@ -461,12 +505,14 @@ def main() raises:
             print(
                 "   [cov] step", at, " upright", Float64(up) / Float64(NS),
                 " upright|vx|>=0.5", Float64(fast) / Float64(NS),
+                " upright|wz|<0.3", Float64(calm) / Float64(NS),
                 " H(vx,vy)", ent, " falls/1k lane-steps", fall_rate,
             )
             var names = List[String]()
             var vals = List[Float64]()
             names.append(String("cov/upright")); vals.append(Float64(up) / Float64(NS))
             names.append(String("cov/upright_fast")); vals.append(Float64(fast) / Float64(NS))
+            names.append(String("cov/upright_calm")); vals.append(Float64(calm) / Float64(NS))
             names.append(String("cov/entropy_vxvy")); vals.append(ent)
             names.append(String("cov/falls_per_1k")); vals.append(fall_rate)
             logger.log_scalars(names, vals, at)
@@ -506,6 +552,12 @@ def main() raises:
                     mptr(r_env.unsafe_ptr()),
                     Scalar[DT](rw.undesired), Scalar[DT](rw.feet_orient),
                     Scalar[DT](rw.limits), Scalar[DT](rw.slide),
+                    grid_dim=_blocks(N_ENVS), block_dim=TPB,
+                )
+            if use_reg and (w_yaw > 0.0 or w_angxy > 0.0):
+                ctx.enqueue_function[g1_angvel_price_kernel[OBS, N_ENVS]](
+                    mptr(env._obs.unsafe_ptr()), mptr(r_env.unsafe_ptr()),
+                    Scalar[DT](w_yaw), Scalar[DT](w_angxy),
                     grid_dim=_blocks(N_ENVS), block_dim=TPB,
                 )
             ctx.enqueue_function[g1_fall_kernel[OBS, N_ENVS]](

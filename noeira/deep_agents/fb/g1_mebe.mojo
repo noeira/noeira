@@ -235,6 +235,29 @@ def g1_reg_env_kernel[
     )
 
 
+def g1_angvel_price_kernel[OBS_W: Int, LANES: Int](
+    obs: Pointer[Scalar[DT], MutAnyOrigin],
+    r_env: Pointer[Scalar[DT], MutAnyOrigin],
+    w_yaw: Scalar[DT],
+    w_xy: Scalar[DT],
+):
+    """One thread per lane, AFTER `g1_reg_env_kernel` (it ADDS to `r_env`):
+    `−w_yaw·ωz² − w_xy·(ωx² + ωy²)` of the post-step pelvis angular velocity
+    (heading frame, obs 434:437). Plan §12.6: MEBE's density on φ ∋ ωz
+    bought yaw coverage with spin, and IsaacLab's set prices ang_vel_xy
+    only, so nothing in Q_reg priced the spin."""
+    var l = Int(global_idx.x)
+    if l >= LANES:
+        return
+    var o = l * OBS_W + G1M_COL_WZ
+    var wx = obs[unsafe_offset=o - 2]
+    var wy = obs[unsafe_offset=o - 1]
+    var wz = obs[unsafe_offset=o]
+    r_env[unsafe_offset=l] = r_env[unsafe_offset=l] - (
+        w_yaw * wz * wz + w_xy * (wx * wx + wy * wy)
+    )
+
+
 # ── the base-command suite (§3) ──────────────────────────────────────────
 
 comptime G1M_SIG_V: Float64 = 0.3
