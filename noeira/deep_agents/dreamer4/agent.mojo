@@ -43,7 +43,7 @@ from noeira.nn.core.call import call_forward, call_vjp
 from noeira.nn.core.walkers import join_name
 from noeira.nn.core.checkpoint import (
     BinaryCheckpointWriter, BinaryCheckpointReader,
-    _write_file_bytes, _read_file_bytes,
+    _read_file_bytes,
 )
 
 from .dynamics import Dreamer4Dynamics
@@ -385,7 +385,7 @@ struct Dreamer4Agent[
         mut self, mut tok: TOK, base: String,
         dctx: Optional[DeviceContext] = None,
     ) raises:
-        var w = BinaryCheckpointWriter(False)
+        var w = BinaryCheckpointWriter.to_file(base + ".ckpt", False)
         comptime if Self.DYN_TARGET == "gpu":
             Self._wsec[TOK, "gpu"](w, tok, dctx)
             Self._wsec[Self.DYN, "gpu"](w, self.dyn, dctx)
@@ -399,7 +399,7 @@ struct Dreamer4Agent[
         Self._wsec[Self.RH, "cpu"](w, self.rh, None)
         Self._wsec[Self.VH, "cpu"](w, self.vh, None)
         Self._wsec[Self.CH, "cpu"](w, self.ch, None)
-        _write_file_bytes(base + ".ckpt", w.content)
+        w.commit()
 
     def load[
         TOK: Module

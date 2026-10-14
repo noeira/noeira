@@ -55,7 +55,7 @@ from noeira.nn.optimizer.scalar_adam import ScalarAdam
 from noeira.nn.core.checkpoint import (
     BinaryCheckpointWriter, BinaryCheckpointReader, CheckpointReader,
     CheckpointScalars, write_model, read_model, _split_lines, _is_v3_header,
-    _read_file_bytes, _write_file_bytes,
+    _read_file_bytes,
 )
 
 from noeira.nn.core.log_bundle import log_bundle
@@ -784,7 +784,7 @@ struct REDQOFETrainer[
         three OFE nets, then as `K` sections α's whole optimizer (`alpha.*`)
         and the train-step counter. Atomic and chunked. Network optimizer
         moments NOT persisted (resume re-warms)."""
-        var w = BinaryCheckpointWriter(save_moments=False)
+        var w = BinaryCheckpointWriter.to_file(path, save_moments=False)
         write_model[Self.train_target](w, self.actor, self.ctx, "actor")
         for i in range(Self.N):
             write_model[Self.train_target](
@@ -797,7 +797,7 @@ struct REDQOFETrainer[
         self.alpha_opt.put_state(sc, "alpha")
         sc.set_int("total_train_steps", self._total_train_steps)
         w.write_scalars(sc)
-        _write_file_bytes(path, w.content)
+        w.commit()
 
     def load_state(mut self, path: String) raises:
         """Restore every net, α and the counter (v3, or the legacy v2 text

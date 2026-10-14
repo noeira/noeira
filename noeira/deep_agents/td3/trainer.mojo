@@ -51,7 +51,7 @@ from noeira.nn.optimizer.adam import Adam
 from noeira.nn.core.checkpoint import (
     BinaryCheckpointWriter, BinaryCheckpointReader, CheckpointReader,
     CheckpointScalars, write_model, read_model, _split_lines, _is_v3_header,
-    _read_file_bytes, _write_file_bytes,
+    _read_file_bytes,
 )
 from noeira.nn.random.box_muller import box_muller_normal, box_muller_normal_gpu
 
@@ -735,14 +735,14 @@ struct TD3Trainer[
         """ONE v3 `storage-ckpt` file: the ONLINE nets, name-prefixed
         `actor.` / `critic1.` / `critic2.`; training scalars as `K` sections.
         Atomic and chunked. Optimizer moments NOT persisted (resume re-warms)."""
-        var w = BinaryCheckpointWriter(save_moments=False)
+        var w = BinaryCheckpointWriter.to_file(path, save_moments=False)
         write_model[Self.train_target](w, self.actor_pair.online, self.ctx, "actor")
         write_model[Self.train_target](w, self.pair1.online, self.ctx, "critic1")
         write_model[Self.train_target](w, self.pair2.online, self.ctx, "critic2")
         var sc = CheckpointScalars()
         sc.set_int("total_train_steps", self._total_train_steps)
         w.write_scalars(sc)
-        _write_file_bytes(path, w.content)
+        w.commit()
 
     def load_state(mut self, path: String) raises:
         """Restore the online nets (v3, or the legacy v2 text this trainer

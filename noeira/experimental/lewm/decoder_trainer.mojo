@@ -24,7 +24,6 @@ from noeira.nn.core.checkpoint import (
     BinaryCheckpointWriter,
     BinaryCheckpointReader,
     CheckpointReader,
-    _write_file_bytes,
     _read_file_bytes,
     _is_v3_header,
     _split_lines,
@@ -303,7 +302,7 @@ struct LeWMDecoderTrainer[
         """Write a v3 binary named checkpoint (params + state; same format
         as LeWMTrainer.save_params). Replaces the legacy positional flat
         text; `load_params` still reads it."""
-        var w = BinaryCheckpointWriter(save_moments)
+        var w = BinaryCheckpointWriter.to_file(path, save_moments)
         w.mode = 0
         self.graph.for_each_param[Self.train_target, BinaryCheckpointWriter](
             w, self.ctx
@@ -312,7 +311,7 @@ struct LeWMDecoderTrainer[
         self.graph.for_each_state[Self.train_target, BinaryCheckpointWriter](
             w, self.ctx
         )
-        _write_file_bytes(path, w.content)
+        w.commit()
 
     def load_params(mut self, path: String) raises:
         """Load a v3 binary / v2 named text / legacy flat-text checkpoint

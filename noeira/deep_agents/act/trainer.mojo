@@ -108,7 +108,6 @@ from noeira.nn.core.checkpoint import (
     CheckpointScalars,
     _is_v3_header,
     _read_file_bytes,
-    _write_file_bytes,
 )
 from noeira.deep_agents.loss.seed_grad_inv_batch import seed_grad_inv_batch
 from ..training.device_mean_accum import DeviceMeanAccum
@@ -1310,7 +1309,7 @@ struct ACTTrainer[
         step-1 bias corrections, and a resumed run's first few hundred
         updates come out ~0.3× the size they should.
         """
-        var w = BinaryCheckpointWriter(save_moments)
+        var w = BinaryCheckpointWriter.to_file(path, save_moments)
         w.mode = 0
         walk_params[Self.target](self.graph, w, self.ctx)
         w.mode = 1
@@ -1320,7 +1319,7 @@ struct ACTTrainer[
             var sc = CheckpointScalars()
             self.opt.put_step_state(sc, "opt")
             w.write_scalars(sc)
-        _write_file_bytes(path, w.content)
+        w.commit()
 
     def load_backbone(
         mut self, dump_dir: String, freeze_norm: Bool = True

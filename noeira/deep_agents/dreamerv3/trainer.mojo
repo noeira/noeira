@@ -33,7 +33,7 @@ from noeira.nn.core.tensor_refs import TensorRefs, child_refs
 from noeira.nn.core.checkpoint import (
     CheckpointReader, _split_lines,
     BinaryCheckpointWriter, BinaryCheckpointReader,
-    _write_file_bytes, _read_file_bytes, _is_v3_header,
+    _read_file_bytes, _is_v3_header,
 )
 from noeira.nn.core.param import ParamVisitor, walk_params, ParamVisitorRef
 from noeira.nn.core.hard_copy import hard_copy
@@ -761,7 +761,7 @@ struct DreamerV3Trainer[
         re-warms), matching the SAC checkpoint convention. v3 binary is REQUIRED
         at size200m: the v2 text format was ~5 GB per save and silently
         truncated at the 2 GiB single-write(2) cap."""
-        var w = BinaryCheckpointWriter(save_moments=False)
+        var w = BinaryCheckpointWriter.to_file(path, save_moments=False)
         w.mode = 0
         walk_params[Self.train_target](self.enc, w, self.ctx, "enc")
         walk_params[Self.train_target](self.core, w, self.ctx, "core")
@@ -788,7 +788,7 @@ struct DreamerV3Trainer[
         self.slowvalue.for_each_state[Self.train_target](_sref7, self.ctx, "slowvalue")
         var _sref8 = ParamVisitorRef.of[type_of(w), Self.train_target](w)
         self.policy.for_each_state[Self.train_target](_sref8, self.ctx, "policy")
-        _write_file_bytes(path, w.content)
+        w.commit()
 
     def load_state(mut self, path: String) raises:
         """Restore the full network set from the single envelope (same walk

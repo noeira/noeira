@@ -79,7 +79,7 @@ from noeira.nn.optimizer.adam import Adam
 from noeira.nn.core.checkpoint import (
     CheckpointReader, _split_lines,
     BinaryCheckpointWriter, BinaryCheckpointReader,
-    _read_file_bytes, _write_file_bytes, _is_v3_header,
+    _read_file_bytes, _is_v3_header,
 )
 from noeira.nn.loss.grad_penalty import GradPenalty
 from noeira.nn.loss.bce_logits import bce_logits_const_t
@@ -846,7 +846,7 @@ struct FBCPRHead[
         """`D` and the `Q_D` twins to `path + ".cpr"`. The FB nets go to
         `path` through the trainer's own `save_state`, so every FB eval reads
         the FB file unchanged."""
-        var w = BinaryCheckpointWriter(save_moments=False)
+        var w = BinaryCheckpointWriter.to_file(path + ".cpr", save_moments=False)
         w.mode = 0
         walk_params[Self.TARGET](self.disc, w, self.ctx, "disc")
         walk_params[Self.TARGET](self.qd1.online, w, self.ctx, "qd1")
@@ -858,7 +858,7 @@ struct FBCPRHead[
         self.qd1.online.for_each_state[Self.TARGET](_sref2, self.ctx, "qd1")
         var _sref3 = ParamVisitorRef.of[type_of(w), Self.TARGET](w)
         self.qd2.online.for_each_state[Self.TARGET](_sref3, self.ctx, "qd2")
-        _write_file_bytes(path + ".cpr", w.content)
+        w.commit()
 
     def load_sidecar(mut self, path: String) raises:
         """CPR nets from `path + ".cpr"`. ⚠ A missing sidecar RAISES: a

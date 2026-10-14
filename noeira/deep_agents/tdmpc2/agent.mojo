@@ -38,7 +38,7 @@ from noeira.nn.primitives.rsample import RSample
 from noeira.nn.core.checkpoint import (
     BinaryCheckpointWriter, BinaryCheckpointReader, CheckpointReader,
     CheckpointScalars, write_model, read_model, _split_lines, _is_v3_header,
-    _read_file_bytes, _write_file_bytes,
+    _read_file_bytes,
 )
 
 from noeira.deep_agents.data.sequence_replay import SequenceReplay
@@ -641,7 +641,7 @@ struct TDMPC2Agent[
         counter. Atomic and chunked. Optimizer moments are NOT persisted
         (resume re-warms)."""
         comptime tg = Self.target
-        var w = BinaryCheckpointWriter(save_moments=False)
+        var w = BinaryCheckpointWriter.to_file(path, save_moments=False)
         write_model[tg](w, self.encoder, self.ctx, "encoder")
         write_model[tg](w, self.dynamics, self.ctx, "dynamics")
         write_model[tg](w, self.reward, self.ctx, "reward")
@@ -661,7 +661,7 @@ struct TDMPC2Agent[
         sc.set("pi_scale", Float64(self.pol_step.scale.value))
         sc.set_int("step_count", self.step_count)
         w.write_scalars(sc)
-        _write_file_bytes(path, w.content)
+        w.commit()
 
     def load_state(mut self, path: String) raises:
         """Inverse of `save_state` (online + target Q both restored). Legacy

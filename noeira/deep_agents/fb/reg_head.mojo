@@ -55,7 +55,7 @@ from noeira.nn.core.initializer import Initializer, Xavier
 from noeira.nn.optimizer.adam import Adam
 from noeira.nn.core.checkpoint import (
     BinaryCheckpointWriter, BinaryCheckpointReader,
-    _read_file_bytes, _write_file_bytes,
+    _read_file_bytes,
 )
 
 from ..core.online_target_pair import OnlineTargetPair
@@ -511,7 +511,7 @@ struct FBRegHead[
 
     def save_sidecar(mut self, path: String) raises:
         """The `Q_reg` twins to `path + ".reg"` (v3 binary)."""
-        var w = BinaryCheckpointWriter(save_moments=False)
+        var w = BinaryCheckpointWriter.to_file(path + ".reg", save_moments=False)
         w.mode = 0
         walk_params[Self.TARGET](self.q1n.online, w, self.ctx, "qr1")
         walk_params[Self.TARGET](self.q2n.online, w, self.ctx, "qr2")
@@ -520,7 +520,7 @@ struct FBRegHead[
         self.q1n.online.for_each_state[Self.TARGET](_s1, self.ctx, "qr1")
         var _s2 = ParamVisitorRef.of[type_of(w), Self.TARGET](w)
         self.q2n.online.for_each_state[Self.TARGET](_s2, self.ctx, "qr2")
-        _write_file_bytes(path + ".reg", w.content)
+        w.commit()
 
     def load_sidecar(mut self, path: String) raises:
         """⚠ A missing sidecar RAISES: a resume that silently restarts `Q_reg`

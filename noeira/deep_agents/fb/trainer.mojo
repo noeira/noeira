@@ -87,7 +87,7 @@ from noeira.nn.optimizer.adam import Adam
 from noeira.nn.core.checkpoint import (
     CheckpointReader, _split_lines,
     BinaryCheckpointWriter, BinaryCheckpointReader,
-    _read_file_bytes, _write_file_bytes, _is_v3_header,
+    _read_file_bytes, _is_v3_header,
 )
 
 from ..core.online_target_pair import OnlineTargetPair
@@ -1175,7 +1175,7 @@ struct FBTrainer[
         the M2 run script trained for 2 M steps and exited without saving
         anything: hours of GPU time producing a log file and no weights.
         """
-        var w = BinaryCheckpointWriter(save_moments=False)
+        var w = BinaryCheckpointWriter.to_file(path, save_moments=False)
         w.mode = 0
         walk_params[Self.TARGET](self.bnet.online, w, self.ctx, "b")
         walk_params[Self.TARGET](self.f1.online, w, self.ctx, "f1")
@@ -1190,7 +1190,7 @@ struct FBTrainer[
         self.f2.online.for_each_state[Self.TARGET](_sref3, self.ctx, "f2")
         var _sref4 = ParamVisitorRef.of[type_of(w), Self.TARGET](w)
         self.actor.online.for_each_state[Self.TARGET](_sref4, self.ctx, "actor")
-        _write_file_bytes(path, w.content)
+        w.commit()
 
     def load_state(mut self, path: String) raises:
         """Restore the online nets and HARD-COPY them onto the targets.

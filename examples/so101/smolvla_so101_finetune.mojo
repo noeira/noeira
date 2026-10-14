@@ -83,7 +83,7 @@ is read from `tools/vla/`.
 | `SMOLVLA_MERGE_OUT` | expert-LoRA builds only: after training, merge the BEST checkpoint's adapters into the expert's weights, check the merged model's held-out loss against the adapted one's, and write a PLAIN checkpoint there (no adapters, no moments) that the deploy loads as any fine-tune's `--ckpt` |
 | `SMOLVLA_CKPT` | checkpoint path prefix (`<prefix>_best.ckpt` / `_last.ckpt`); default the run's own `runs/<id>/checkpoints/best.ckpt` / `last.ckpt` |
 | `SMOLVLA_CKPT=off` | write no checkpoint at all: the held-out curve only |
-| `SMOLVLA_CKPT_MOMENTS` | `0`: checkpoints without Adam's moments (half the size, and half the memory spike of writing one). A resume from them restarts the optimizer cold |
+| `SMOLVLA_CKPT_MOMENTS` | `0`: checkpoints without Adam's moments (a third of the size). A resume from them restarts the optimizer cold |
 | `SMOLVLA_INIT` | a `*_best.ckpt` to start from, applied ON TOP of the base checkpoint |
 | `SMOLVLA_VAL_EPISODES` | episodes held out at the END of the recording; default one fifth. **`0` trains on every episode** — see below |
 | `SMOLVLA_PROFILE` | set to anything: per-phase wall times (host images / prefix / suffix forward / backward) in the log line, at the cost of three extra drains per observation |
@@ -830,9 +830,7 @@ def main() raises:
     var ckpt = getenv("SMOLVLA_CKPT")
     var last_ckpt = run.checkpoint_path(String("last"))
     var best_ckpt = run.checkpoint_path(String("best"))
-    # `SMOLVLA_CKPT=off`: no checkpoint is written (the curve only). Writing
-    # one builds the file in memory, which a 16 GB Orin training the fp32
-    # text tower's adapters cannot spare.
+    # `SMOLVLA_CKPT=off`: no checkpoint is written (the curve only).
     var ckpt_off = ckpt == "off"
     if ckpt.byte_length() > 0:
         last_ckpt = ckpt + "_last.ckpt"

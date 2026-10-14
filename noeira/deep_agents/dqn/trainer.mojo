@@ -43,7 +43,7 @@ from noeira.nn.optimizer.adam import Adam
 from noeira.nn.core.checkpoint import (
     BinaryCheckpointWriter, BinaryCheckpointReader, CheckpointReader,
     CheckpointScalars, write_model, read_model, _split_lines, _is_v3_header,
-    _read_file_bytes, _write_file_bytes,
+    _read_file_bytes,
 )
 
 from noeira.nn.core.log_bundle import log_bundle
@@ -850,7 +850,7 @@ struct DQNTrainer[
         as `K` sections. Atomic and chunked. On GPU device params download to
         host first; the on-disk format is target-agnostic (train-on-GPU →
         eval-on-CPU loads). The target net is hard-copied from online on load."""
-        var w = BinaryCheckpointWriter(save_moments=False)
+        var w = BinaryCheckpointWriter.to_file(path, save_moments=False)
         write_model[Self.train_target](w, self.pair.online, self.ctx, "q_net")
         var sc = CheckpointScalars()
         sc.set("eps.epsilon", Float64(self.epsilon))
@@ -858,7 +858,7 @@ struct DQNTrainer[
         sc.set("eps.epsilon_min", Float64(self.epsilon_min))
         sc.set_int("total_train_steps", self._total_train_steps)
         w.write_scalars(sc)
-        _write_file_bytes(path, w.content)
+        w.commit()
 
     def load_state(mut self, path: String) raises:
         """Inverse of `save_state`: restore online params + state, ε scalars +
