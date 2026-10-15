@@ -38,6 +38,34 @@ def gemm_cpu[
     a[M, K] (row stride `lda`), or a[K, M]ᵀ when `TA`; op(b) is b[K, N], or
     b[N, K]ᵀ when `TB`. As in BLAS, `c` is not read when beta is 0."""
     comptime assert DT == DType.float32, "gemm_cpu is fp32"
+    gemm_cpu_ptr[TA, TB](
+        M, N, K, alpha,
+        rebind[Pointer[Float32, ImmutAnyOrigin]](a.data.unsafe_ptr()), lda,
+        rebind[Pointer[Float32, ImmutAnyOrigin]](b.data.unsafe_ptr()), ldb,
+        beta,
+        rebind[Pointer[Float32, MutAnyOrigin]](c.data.unsafe_ptr()), ldc,
+    )
+
+
+def gemm_cpu_ptr[
+    TA: Bool, TB: Bool
+](
+    M: Int,
+    N: Int,
+    K: Int,
+    alpha: Float32,
+    a: Pointer[Float32, ImmutAnyOrigin],
+    lda: Int,
+    b: Pointer[Float32, ImmutAnyOrigin],
+    ldb: Int,
+    beta: Float32,
+    c: Pointer[Float32, MutAnyOrigin],
+    ldc: Int,
+) raises:
+    """`gemm_cpu` over raw pointers, for callers whose operands are not each
+    a whole `Tensor` — the functional tape (`nn/functional/`) keeps every
+    node's value and gradient in one list, so two of them cannot be borrowed
+    as `Tensor`s at once."""
     comptime if CompilationTarget.is_macos():
         var cblas = get_cblas_f32_function()
         cblas(
@@ -48,12 +76,12 @@ def gemm_cpu[
             Int32(N),
             Int32(K),
             alpha,
-            rebind[Pointer[Float32, ImmutAnyOrigin]](a.data.unsafe_ptr()),
+            a,
             Int32(lda),
-            rebind[Pointer[Float32, ImmutAnyOrigin]](b.data.unsafe_ptr()),
+            b,
             Int32(ldb),
             beta,
-            rebind[Pointer[Float32, MutAnyOrigin]](c.data.unsafe_ptr()),
+            c,
             Int32(ldc),
         )
     else:
@@ -61,10 +89,10 @@ def gemm_cpu[
             for j in range(N):
                 var acc = Float32(0)
                 for k in range(K):
-                    var av = a.data[k * lda + i] if TA else a.data[i * lda + k]
-                    var bv = b.data[j * ldb + k] if TB else b.data[k * ldb + j]
+                    var av = a[unsafe_offset=k * lda + i] if TA else a[unsafe_offset=i * lda + k]
+                    var bv = b[unsafe_offset=j * ldb + k] if TB else b[unsafe_offset=k * ldb + j]
                     acc += av * bv
                 var prev = Float32(0)
                 if beta != 0:
-                    prev = beta * c.data[i * ldc + j]
-                c.data[i * ldc + j] = alpha * acc + prev
+                    prev = beta * c[unsafe_offset=i * ldc + j]
+                c[unsafe_offset=i * ldc + j] = alpha * acc + prev
