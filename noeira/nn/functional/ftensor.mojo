@@ -1,7 +1,7 @@
 """`Tape` and `FTensor` — the functional mode's surface.
 
 ```mojo
-var tape = Tape()
+var tape = Tape()                           # or Tape(DeviceContext()): GPU
 var w = tape.param[Kaiming](4, 16)          # [IN, OUT], like `Linear`
 var b = tape.zeros(1, 16)
 var x = tape.input(batch, 4, xs)           # shapes are runtime values
@@ -17,9 +17,11 @@ and shapes chosen at run time included.
 """
 
 from std.memory import ArcPointer
+from max.gpu.host import DeviceContext, DeviceBuffer
 
 from noeira.nn.constants import DT
 from noeira.nn.core.initializer import Initializer
+from .gpu import gpu_copy
 from .tape import (
     TapeData,
     OP_ADD,
@@ -49,7 +51,19 @@ struct Tape(ImplicitlyCopyable):
     var data: ArcPointer[TapeData]
 
     def __init__(out self):
+        """A CPU tape."""
         self.data = ArcPointer(TapeData())
+
+    def __init__(out self, ctx: DeviceContext):
+        """A GPU tape: every value and gradient lives on `ctx`'s device."""
+        self.data = ArcPointer(TapeData(ctx))
+
+    def on_gpu(self) -> Bool:
+        return self.data[].on_gpu()
+
+    def synchronize(self) raises:
+        if self.data[].ctx:
+            self.data[].dctx().synchronize()
 
     def _wrap(self, id: Int) -> FTensor:
         return FTensor(self.data, id)
@@ -60,6 +74,7 @@ struct Tape(ImplicitlyCopyable):
         initialises a `Linear` weight of fan_in `rows`, fan_out `cols`."""
         var i = self.data[].param(rows, cols)
         INIT.init_weight["cpu"](self.data[].nodes[i].val, rows * cols, rows, cols, None)
+        self.data[].upload_val(i)
         return self._wrap(i)
 
     def param(
@@ -70,6 +85,7 @@ struct Tape(ImplicitlyCopyable):
         var i = self.data[].param(rows, cols)
         for k in range(rows * cols):
             self.data[].nodes[i].val.data[k] = values[k]
+        self.data[].upload_val(i)
         return self._wrap(i)
 
     def zeros(self, rows: Int, cols: Int) raises -> FTensor:
@@ -77,6 +93,7 @@ struct Tape(ImplicitlyCopyable):
         var i = self.data[].param(rows, cols)
         for k in range(rows * cols):
             self.data[].nodes[i].val.data[k] = 0
+        self.data[].upload_val(i)
         return self._wrap(i)
 
     # ── inputs (dropped by `reset`) ──────────────────────────────────────
@@ -90,9 +107,11 @@ struct Tape(ImplicitlyCopyable):
         if len(values) < rows * cols:
             raise Error("Tape.input: values do not fill the shape")
         var i = self.data[].leaf(rows, cols, requires_grad)
+        self.data[]._host_fit(i, False)
         var p = self.data[].val_ptr(i)
         for k in range(rows * cols):
             p[unsafe_offset=k] = values[k]
+        self.data[].upload_val(i)
         return self._wrap(i)
 
     def input_from(
@@ -101,18 +120,38 @@ struct Tape(ImplicitlyCopyable):
         cols: Int,
         src: Pointer[Scalar[DT], ImmutAnyOrigin],
         requires_grad: Bool = False,
-    ) -> FTensor:
-        """`input` from raw memory (an env's observation buffer, a `Tensor`'s
-        `data.unsafe_ptr()`), copied in."""
+    ) raises -> FTensor:
+        """`input` from raw host memory (an env's observation buffer, a
+        `Tensor`'s `data.unsafe_ptr()`), copied in."""
         var i = self.data[].leaf(rows, cols, requires_grad)
+        self.data[]._host_fit(i, False)
         var p = self.data[].val_ptr(i)
         for k in range(rows * cols):
             p[unsafe_offset=k] = src[unsafe_offset=k]
+        self.data[].upload_val(i)
         return self._wrap(i)
 
-    def scalar(self, value: Scalar[DT]) -> FTensor:
+    def input_device(
+        self,
+        rows: Int,
+        cols: Int,
+        src: DeviceBuffer[DT],
+        requires_grad: Bool = False,
+    ) raises -> FTensor:
+        """`input` from memory already on the tape's device (a GPU env's
+        observation batch): one device copy, no host round trip."""
+        if not self.data[].ctx:
+            raise Error("Tape.input_device: a CPU tape")
+        var i = self.data[].leaf(rows, cols, requires_grad)
+        var ctx = self.data[].dctx()
+        gpu_copy(ctx, self.data[].dv(i), src, rows * cols)
+        return self._wrap(i)
+
+    def scalar(self, value: Scalar[DT]) raises -> FTensor:
         var i = self.data[].leaf(1, 1, False)
+        self.data[]._host_fit(i, False)
         self.data[].val_ptr(i)[unsafe_offset=0] = value
+        self.data[].upload_val(i)
         return self._wrap(i)
 
     # ── lifecycle ────────────────────────────────────────────────────────
@@ -121,7 +160,7 @@ struct Tape(ImplicitlyCopyable):
         once per step: the next step then allocates nothing."""
         self.data[].reset()
 
-    def zero_grad(self):
+    def zero_grad(self) raises:
         self.data[].zero_grad()
 
     def params(self) -> List[FTensor]:
@@ -133,14 +172,9 @@ struct Tape(ImplicitlyCopyable):
     def num_nodes(self) -> Int:
         return self.data[].n_live
 
-    def sgd_step(self, lr: Scalar[DT]):
+    def sgd_step(self, lr: Scalar[DT]) raises:
         """`p -= lr · grad` on every parameter."""
-        for i in range(self.data[].n_params):
-            if self.data[].nodes[i].rg:
-                var v = self.data[].val_ptr(i)
-                var g = self.data[].grad_ptr(i)
-                for k in range(self.data[].nodes[i].size()):
-                    v[unsafe_offset=k] -= lr * g[unsafe_offset=k]
+        self.data[].sgd_step(lr)
 
 
 struct FTensor(ImplicitlyCopyable, Writable):
@@ -164,34 +198,61 @@ struct FTensor(ImplicitlyCopyable, Writable):
     def size(self) -> Int:
         return self.rows() * self.cols()
 
-    def __getitem__(self, i: Int, j: Int) -> Scalar[DT]:
-        return self.tape[].val_ptr(self.id)[unsafe_offset=i * self.cols() + j]
+    def values(self) raises -> List[Scalar[DT]]:
+        """Every value, row-major, on the host (a GPU tape synchronises)."""
+        self.tape[].download_val(self.id)
+        var out = List[Scalar[DT]]()
+        var p = self.tape[].val_ptr(self.id)
+        for k in range(self.size()):
+            out.append(p[unsafe_offset=k])
+        return out^
+
+    def grads(self) raises -> List[Scalar[DT]]:
+        """Every gradient element (after `backward`), on the host."""
+        self.tape[].download_grad(self.id)
+        var out = List[Scalar[DT]]()
+        var p = self.tape[].grad_ptr(self.id)
+        for k in range(self.size()):
+            out.append(p[unsafe_offset=k])
+        return out^
+
+    def __getitem__(self, i: Int, j: Int) raises -> Scalar[DT]:
+        return self.value(i * self.cols() + j)
 
     def item(self) raises -> Scalar[DT]:
         if self.size() != 1:
             raise Error("item: not a [1, 1] tensor")
-        return self.tape[].val_ptr(self.id)[unsafe_offset=0]
+        return self.value(0)
 
-    def value(self, k: Int) -> Scalar[DT]:
-        """Flat (row-major) element `k`."""
+    def value(self, k: Int) raises -> Scalar[DT]:
+        """Flat (row-major) element `k`. On a GPU tape this downloads the
+        whole tensor: read many through `values()`."""
+        self.tape[].download_val(self.id)
         return self.tape[].val_ptr(self.id)[unsafe_offset=k]
 
-    def grad(self, k: Int) -> Scalar[DT]:
+    def grad(self, k: Int) raises -> Scalar[DT]:
         """Flat element `k` of the gradient (after `backward`)."""
+        self.tape[].download_grad(self.id)
         return self.tape[].grad_ptr(self.id)[unsafe_offset=k]
 
-    def set_value(self, k: Int, v: Scalar[DT]):
+    def set_value(self, k: Int, v: Scalar[DT]) raises:
+        self.tape[].download_val(self.id)
         self.tape[].val_ptr(self.id)[unsafe_offset=k] = v
+        self.tape[].upload_val(self.id)
 
     def write_to(self, mut writer: Some[Writer]):
         writer.write("FTensor[", self.rows(), ", ", self.cols(), "](")
-        var n = min(self.size(), 8)
-        for k in range(n):
-            if k > 0:
-                writer.write(", ")
-            writer.write(self.value(k))
-        if self.size() > n:
-            writer.write(", …")
+        try:
+            var vals = self.values()
+            var n = min(len(vals), 8)
+            for k in range(n):
+                if k > 0:
+                    writer.write(", ")
+                writer.write(vals[k])
+            if len(vals) > n:
+                writer.write(", …")
+        except:
+            writer.write("<unreadable>")
         writer.write(")")
 
     # ── tensor ⊕ tensor (numpy broadcasting) ─────────────────────────────
@@ -211,28 +272,28 @@ struct FTensor(ImplicitlyCopyable, Writable):
         return self._new(self.tape[].matmul(self.id, other.id))
 
     # ── tensor ⊕ scalar ──────────────────────────────────────────────────
-    def __add__(self, c: Scalar[DT]) -> Self:
+    def __add__(self, c: Scalar[DT]) raises -> Self:
         return self._new(self.tape[].scalar_op[OP_SHIFT](self.id, c))
 
-    def __radd__(self, c: Scalar[DT]) -> Self:
+    def __radd__(self, c: Scalar[DT]) raises -> Self:
         return self + c
 
-    def __sub__(self, c: Scalar[DT]) -> Self:
+    def __sub__(self, c: Scalar[DT]) raises -> Self:
         return self._new(self.tape[].scalar_op[OP_SHIFT](self.id, -c))
 
-    def __rsub__(self, c: Scalar[DT]) -> Self:
+    def __rsub__(self, c: Scalar[DT]) raises -> Self:
         return self._new(self.tape[].scalar_op[OP_RSUBC](self.id, c))
 
-    def __mul__(self, c: Scalar[DT]) -> Self:
+    def __mul__(self, c: Scalar[DT]) raises -> Self:
         return self._new(self.tape[].scalar_op[OP_SCALE](self.id, c))
 
-    def __rmul__(self, c: Scalar[DT]) -> Self:
+    def __rmul__(self, c: Scalar[DT]) raises -> Self:
         return self * c
 
-    def __truediv__(self, c: Scalar[DT]) -> Self:
+    def __truediv__(self, c: Scalar[DT]) raises -> Self:
         return self._new(self.tape[].scalar_op[OP_DIVC](self.id, c))
 
-    def __neg__(self) -> Self:
+    def __neg__(self) raises -> Self:
         return self * -1.0
 
     def __pow__(self, p: Int) raises -> Self:
@@ -245,17 +306,17 @@ struct FTensor(ImplicitlyCopyable, Writable):
         return out
 
     # ── shape ops, reductions ────────────────────────────────────────────
-    def T(self) -> Self:
+    def T(self) raises -> Self:
         """The transpose (`x.T()`: Mojo has no properties)."""
         return self._new(self.tape[].transpose(self.id))
 
-    def sum(self) -> Self:
+    def sum(self) raises -> Self:
         return self._new(self.tape[].reduce[OP_SUM](self.id))
 
-    def mean(self) -> Self:
+    def mean(self) raises -> Self:
         return self._new(self.tape[].reduce[OP_MEAN](self.id))
 
-    def sum_rows(self) -> Self:
+    def sum_rows(self) raises -> Self:
         """`[R, C] -> [1, C]`."""
         return self._new(self.tape[].sum_rows(self.id))
 

@@ -4,6 +4,7 @@ command-line arguments — one binary, any architecture, no recompile.
     pixi run -e apple mojo build -I . examples/functional/fit_sine.mojo -o /tmp/fit_sine
     /tmp/fit_sine            # depth 2, width 32, tanh
     /tmp/fit_sine 4 64 relu  # depth 4, width 64, relu
+    /tmp/fit_sine 4 64 relu gpu   # the same, on the GPU
 
 The network is a Python-style loop over a `List[FTensor]` of parameters.
 """
@@ -11,6 +12,8 @@ The network is a Python-style loop over a `List[FTensor]` of parameters.
 from std.math import sin
 from std.random import seed, random_float64
 from std.sys import argv
+
+from max.gpu.host import DeviceContext
 
 from noeira.nn.constants import DT
 from noeira.nn.core.initializer import Xavier
@@ -32,12 +35,13 @@ def main() raises:
     var depth = Int(args[1]) if len(args) > 1 else 2
     var width = Int(args[2]) if len(args) > 2 else 32
     var act = String(args[3]) if len(args) > 3 else String("tanh")
+    var gpu = len(args) > 4 and String(args[4]) == "gpu"
     comptime BATCH = 64
     comptime STEPS = 3000
     var lr: Scalar[DT] = 0.05
 
     seed(0)
-    var tape = Tape()
+    var tape = Tape(DeviceContext()) if gpu else Tape()
     var weights = List[FTensor]()
     var biases = List[FTensor]()
     var fan_in = 1
@@ -46,7 +50,8 @@ def main() raises:
         weights.append(tape.param[Xavier](fan_in, fan_out))
         biases.append(tape.zeros(1, fan_out))
         fan_in = fan_out
-    print("MLP 1 ->", depth, "x", width, act, "-> 1;", len(tape.params()), "parameter tensors")
+    print("MLP 1 ->", depth, "x", width, act, "-> 1;", len(tape.params()),
+          "parameter tensors, on the", "GPU" if gpu else "CPU")
 
     var xs = List[Scalar[DT]](length=BATCH, fill=0)
     var ys = List[Scalar[DT]](length=BATCH, fill=0)
@@ -71,7 +76,8 @@ def main() raises:
     for k in range(9):
         grid.append(Scalar[DT](-1.0 + 0.25 * Float64(k)))
     var pred = mlp(tape.input(9, 1, grid), weights, biases, act)
+    var p = pred.values()
     print("  x      sin(3x)   mlp")
     for k in range(9):
         var v = Float64(grid[k])
-        print("  ", grid[k], "  ", Scalar[DT](sin(3.0 * v)), "  ", pred.value(k))
+        print("  ", grid[k], "  ", Scalar[DT](sin(3.0 * v)), "  ", p[k])
