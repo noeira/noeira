@@ -83,13 +83,15 @@ struct Tape(ImplicitlyCopyable, ParamWalkable):
         return self.data[].on_gpu()
 
     # ── comptime nn modules ──────────────────────────────────────────────
-    def module[M: Module, //, B: Int](
+    def module[M: Module, //, B: Int, B2: Int = 0, B3: Int = 0](
         self, var m: M, name: String = String("")
     ) raises -> FModule[M]:
         """Hand `m` to the tape (it OWNS it from here) as an op for inputs
-        `[B, M.IN_DIMS[0]]`. Make `m` for the tape's device. `name` (default
-        `m<index>`) prefixes its parameters: `<name>.weight`, …"""
-        var e = make_entry[M, B](m^, self.data[].on_gpu())
+        of `B` rows — or `B2` / `B3` too: `tape.module[64, 1](m)` serves a
+        training batch and single-row acting with one module. Make `m` for
+        the tape's device. `name` (default `m<index>`) prefixes its
+        parameters: `<name>.weight`, …"""
+        var e = make_entry[M, B, B2, B3](m^, self.data[].on_gpu())
         return FModule[M](self.data, self.data[].add_module(e^, name))
 
     # ── gradient mode ────────────────────────────────────────────────────
@@ -608,7 +610,17 @@ struct FModule[M: Module](ImplicitlyCopyable):
         self.id = id
 
     def __call__(self, x: FTensor) raises -> FTensor:
-        return FTensor(self.tape, self.tape[].module_call(self.id, x._vid()))
+        return FTensor(self.tape, self.tape[].module_call(self.id, [x._vid()]))
+
+    def __call__(self, x: FTensor, y: FTensor) raises -> FTensor:
+        """A two-input module (`GRUCell(x, h)`, `Add`, `Concat[A, B]`)."""
+        return FTensor(self.tape, self.tape[].module_call(self.id, [x._vid(), y._vid()]))
+
+    def __call__(self, x: FTensor, y: FTensor, z: FTensor) raises -> FTensor:
+        """A three-input module (`Modulate(x, scale, shift)`, `Gate`)."""
+        return FTensor(
+            self.tape, self.tape[].module_call(self.id, [x._vid(), y._vid(), z._vid()])
+        )
 
     def get(mut self) -> ref[self] Self.M:
         """The module, owned by the tape. The reference's origin is THIS
