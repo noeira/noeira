@@ -30,6 +30,7 @@ from noeira.nn.core.cpu_gemm import gemm_cpu_ptr
 from .opcodes import *
 from .tape import TapeData
 from .gpu import gpu_matmul, gpu_matmul_bwd_a, gpu_matmul_bwd_b, bin_term
+from .extra import extra_vjp
 
 
 comptime P = Pointer[Scalar[DT], MutAnyOrigin]
@@ -866,7 +867,9 @@ def _gather_bwd(mut t: TapeData, o: Int) raises:
 def nd_vjp(mut t: TapeData, o: Int) raises:
     var op = t.nodes[o].op
     var a = t.nodes[o].a
-    if op == OP_RESHAPE:
+    if op >= OP_CLAMP:
+        extra_vjp(t, o)
+    elif op == OP_RESHAPE:
         if t.nodes[a].rg:
             var n = t.nodes[a].size()
             _copy(t, a, True, o, True, D4(1, 1, 1, n), D4(0, 0, 0, 1), 0,

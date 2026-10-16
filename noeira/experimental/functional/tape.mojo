@@ -50,6 +50,7 @@ from noeira.nn.core.walkers import join_name
 from .opcodes import *
 from .module_op import ModEntry
 from .nd import nd_binary, nd_bmm, nd_binary_vjp, nd_vjp
+from .extra import ExpOp, LogOp, SqrtOp
 from std.sys import has_nvidia_gpu_accelerator
 from noeira.cuda.graph import CUDAGraph
 from noeira.nn.primitives.linear import enqueue_bias_grad
@@ -115,6 +116,8 @@ struct Node(Movable):
     var x3: Int
     """A third input (`OP_LINEAR`'s bias); -1 otherwise."""
     var c: Scalar[DT]
+    var c2: Scalar[DT]
+    """A second scalar attribute (clamp's upper bound)."""
     var rg: Bool
     """Requires grad: a parameter, an input asked for it, or anything
     computed from one. `backward` skips every node without it."""
@@ -148,6 +151,7 @@ struct Node(Movable):
         self.b = -1
         self.x3 = -1
         self.c = 0
+        self.c2 = 0
         self.rg = False
         self.name = String("")
         self.gfresh = False
@@ -908,6 +912,12 @@ struct TapeData(Movable):
             self._ew_fwd_one[SwishOp](a, o)
         elif sub == EW_ELU:
             self._ew_fwd_one[ELUOp](a, o)
+        elif sub == EW_EXP:
+            self._ew_fwd_one[ExpOp](a, o)
+        elif sub == EW_LOG:
+            self._ew_fwd_one[LogOp](a, o)
+        elif sub == EW_SQRT:
+            self._ew_fwd_one[SqrtOp](a, o)
         else:
             raise Error(String("unknown elementwise op ", sub))
         return o
@@ -1278,6 +1288,12 @@ struct TapeData(Movable):
             self._ew_bwd_one[SwishOp](o, a)
         elif sub == EW_ELU:
             self._ew_bwd_one[ELUOp](o, a)
+        elif sub == EW_EXP:
+            self._ew_bwd_one[ExpOp](o, a)
+        elif sub == EW_LOG:
+            self._ew_bwd_one[LogOp](o, a)
+        elif sub == EW_SQRT:
+            self._ew_bwd_one[SqrtOp](o, a)
         else:
             raise Error(String("unknown elementwise op ", sub))
 

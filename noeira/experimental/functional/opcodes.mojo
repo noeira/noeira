@@ -29,6 +29,10 @@ comptime OP_REDUCE_AXIS = 19  # sub = RED_*, i0 = padded axis
 comptime OP_NARROW = 20  # i0 = padded axis, i1 = start
 comptime OP_CONCAT = 21  # a, b; i0 = padded axis
 comptime OP_GATHER = 22  # a = table [V, D], b = indices
+comptime OP_CLAMP = 23  # c = lo, c2 = hi (extra.mojo, as every tag from here)
+comptime OP_SOFTMAX = 24  # last axis; sub = 0 softmax, 1 log-softmax
+comptime OP_XENT = 25  # a = logits, b = targets; mean cross-entropy
+comptime OP_DROPOUT = 26  # c = p, i0 = seed
 comptime RED_SUM = 0
 comptime RED_MEAN = 1
 comptime RED_MAX = 2  # a comptime nn Module, `sub` = its entry (module_op.mojo)
@@ -42,6 +46,9 @@ comptime EW_GELU_TANH = 4
 comptime EW_MISH = 5
 comptime EW_SWISH = 6
 comptime EW_ELU = 7
+comptime EW_EXP = 8  # extra.mojo's ElementOps
+comptime EW_LOG = 9
+comptime EW_SQRT = 10
 comptime EW_NONE = -1  # OP_LINEAR without an activation
 
 

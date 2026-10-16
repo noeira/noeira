@@ -32,6 +32,7 @@ from noeira.cuda.graph import CUDAGraph
 from .gpu import gpu_copy
 from .module_op import make_entry
 from .nd import nd_reshape, nd_permute, nd_reduce, nd_narrow, nd_concat, nd_gather
+from .extra import ex_clamp, ex_softmax
 from .tape import (
     TapeData,
     OP_ADD,
@@ -55,6 +56,9 @@ from .tape import (
     EW_MISH,
     EW_SWISH,
     EW_ELU,
+    EW_EXP,
+    EW_LOG,
+    EW_SQRT,
 )
 
 
@@ -565,6 +569,27 @@ struct FTensor(ImplicitlyCopyable, Writable):
 
     def elu(self) raises -> Self:
         return self._new(self.tape[].elementwise(self._vid(), EW_ELU))
+
+    def exp(self) raises -> Self:
+        return self._new(self.tape[].elementwise(self._vid(), EW_EXP))
+
+    def log(self) raises -> Self:
+        return self._new(self.tape[].elementwise(self._vid(), EW_LOG))
+
+    def sqrt(self) raises -> Self:
+        return self._new(self.tape[].elementwise(self._vid(), EW_SQRT))
+
+    def clamp(self, lo: Scalar[DT], hi: Scalar[DT]) raises -> Self:
+        """Gradient passes inside [lo, hi], bounds included (torch's)."""
+        return self._new(ex_clamp(self.tape[], self._vid(), lo, hi))
+
+    def softmax(self) raises -> Self:
+        """Over the LAST axis (`permute` first for another)."""
+        return self._new(ex_softmax(self.tape[], self._vid(), False))
+
+    def log_softmax(self) raises -> Self:
+        """Over the LAST axis."""
+        return self._new(ex_softmax(self.tape[], self._vid(), True))
 
     # ── autodiff ─────────────────────────────────────────────────────────
     def backward(self) raises:
