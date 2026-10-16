@@ -31,6 +31,7 @@ from noeira.nn.core.param import (
 from noeira.cuda.graph import CUDAGraph
 from .gpu import gpu_copy
 from .module_op import make_entry
+from .nd import nd_reshape, nd_permute, nd_reduce, nd_narrow, nd_concat, nd_gather
 from .tape import (
     TapeData,
     OP_ADD,
@@ -43,6 +44,9 @@ from .tape import (
     OP_RSUBC,
     OP_SUM,
     OP_MEAN,
+    RED_SUM,
+    RED_MEAN,
+    RED_MAX,
     EW_RELU,
     EW_TANH,
     EW_SIGMOID,
@@ -254,6 +258,23 @@ struct Tape(ImplicitlyCopyable, ParamWalkable):
         self.data[].upload_val(i)
         return self._wrap(i)
 
+    def input(
+        self,
+        shape: List[Int],
+        values: List[Scalar[DT]],
+        requires_grad: Bool = False,
+    ) raises -> FTensor:
+        """An N-d input (rank 1 to 4), row-major `values`."""
+        var r = len(shape)
+        if r < 1 or r > 4:
+            raise Error("Tape.input: rank 1 to 4")
+        var d = List[Int](length=4, fill=1)
+        for i in range(r):
+            d[4 - r + i] = shape[i]
+        var t = self.input(d[0] * d[1] * d[2], d[3], values, requires_grad)
+        self.data[].nodes[t.id].set_dims(d[0], d[1], d[2], d[3], r)
+        return t
+
     def input_from(
         self,
         rows: Int,
@@ -351,6 +372,49 @@ struct FTensor(ImplicitlyCopyable, Writable):
 
     def size(self) -> Int:
         return self.rows() * self.cols()
+
+    def shape(self) -> List[Int]:
+        return self.tape[].nodes[self.id].shape()
+
+    def rank(self) -> Int:
+        return self.tape[].nodes[self.id].rank
+
+    # ── N-d (nd.mojo) ────────────────────────────────────────────────────
+    def reshape(self, shape: List[Int]) raises -> Self:
+        """Same elements, row-major, another shape (one `-1` inferred). A
+        copy: the tape's nodes own their storage."""
+        return self._new(nd_reshape(self.tape[], self._vid(), shape))
+
+    def permute(self, perm: List[Int]) raises -> Self:
+        """Output axis `i` is input axis `perm[i]` (torch's `permute`)."""
+        return self._new(nd_permute(self.tape[], self._vid(), perm))
+
+    def transpose(self, i: Int, j: Int) raises -> Self:
+        var r = self.rank()
+        var perm = List[Int]()
+        for k in range(r):
+            perm.append(k)
+        var a = i + r if i < 0 else i
+        var b = j + r if j < 0 else j
+        if a < 0 or a >= r or b < 0 or b >= r:
+            raise Error("transpose: axis out of range")
+        perm[a] = b
+        perm[b] = a
+        return self.permute(perm)
+
+    def sum(self, axis: Int, keepdim: Bool = False) raises -> Self:
+        return self._new(nd_reduce(self.tape[], self._vid(), axis, RED_SUM, keepdim))
+
+    def mean(self, axis: Int, keepdim: Bool = False) raises -> Self:
+        return self._new(nd_reduce(self.tape[], self._vid(), axis, RED_MEAN, keepdim))
+
+    def max(self, axis: Int, keepdim: Bool = False) raises -> Self:
+        """Gradient to the FIRST maximum of each slice."""
+        return self._new(nd_reduce(self.tape[], self._vid(), axis, RED_MAX, keepdim))
+
+    def narrow(self, axis: Int, start: Int, length: Int) raises -> Self:
+        """`length` entries of `axis` from `start` (torch's `narrow`)."""
+        return self._new(nd_narrow(self.tape[], self._vid(), axis, start, length))
 
     def values(self) raises -> List[Scalar[DT]]:
         """Every value, row-major, on the host (a GPU tape synchronises)."""
@@ -461,7 +525,10 @@ struct FTensor(ImplicitlyCopyable, Writable):
 
     # ── shape ops, reductions ────────────────────────────────────────────
     def T(self) raises -> Self:
-        """The transpose (`x.T()`: Mojo has no properties)."""
+        """The transpose of the LAST two axes (`x.T()`: Mojo has no
+        properties); the rank-2 kernel for a matrix."""
+        if self.rank() > 2:
+            return self.transpose(-2, -1)
         return self._new(self.tape[].transpose(self._vid()))
 
     def sum(self) raises -> Self:

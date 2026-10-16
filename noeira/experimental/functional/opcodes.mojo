@@ -21,7 +21,17 @@ comptime OP_MEAN = 12  # all elements -> [1, 1]
 comptime OP_TRANSPOSE = 13
 comptime OP_SUM_ROWS = 14  # [R, C] -> [1, C]
 comptime OP_LINEAR = 16  # x @ w + b (+ act): a = x, b = w, x3 = bias, `sub` = EW_* or EW_NONE
-comptime OP_MODULE = 15  # a comptime nn Module, `sub` = its entry (module_op.mojo)
+comptime OP_MODULE = 15
+# N-d ops (nd.mojo); every tag from OP_RESHAPE up is dispatched there.
+comptime OP_RESHAPE = 17
+comptime OP_PERMUTE = 18  # i0..i3 = the padded source axis of each output axis
+comptime OP_REDUCE_AXIS = 19  # sub = RED_*, i0 = padded axis
+comptime OP_NARROW = 20  # i0 = padded axis, i1 = start
+comptime OP_CONCAT = 21  # a, b; i0 = padded axis
+comptime OP_GATHER = 22  # a = table [V, D], b = indices
+comptime RED_SUM = 0
+comptime RED_MEAN = 1
+comptime RED_MAX = 2  # a comptime nn Module, `sub` = its entry (module_op.mojo)
 
 # ── elementwise activations: the comptime nn's `ElementOp`s ─────────────
 comptime EW_RELU = 0

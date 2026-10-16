@@ -7,6 +7,7 @@ the bias row added — the same arithmetic, so the same bits.
 """
 
 from .ftensor import FTensor
+from .nd import nd_concat, nd_gather
 from .opcodes import (
     EW_NONE, EW_RELU, EW_TANH, EW_SIGMOID, EW_GELU, EW_GELU_TANH, EW_MISH,
     EW_SWISH, EW_ELU,
@@ -63,3 +64,16 @@ def sigmoid(x: FTensor) raises -> FTensor:
 
 def gelu(x: FTensor) raises -> FTensor:
     return x.gelu()
+
+
+def concat(a: FTensor, b: FTensor, axis: Int) raises -> FTensor:
+    """`a` then `b` along `axis`; every other dim equal."""
+    return a._new(nd_concat(a.tape[], a._vid(), b._vid(), axis))
+
+
+def gather(table: FTensor, idx: FTensor) raises -> FTensor:
+    """Rows of `table [V, D]` at `idx` (any shape up to rank 3, integer
+    values held as floats) -> `idx.shape + [D]`: an embedding lookup.
+    Repeated indices add their gradients. Out of range: raises on the CPU,
+    NaN on the GPU."""
+    return table._new(nd_gather(table.tape[], table._vid(), idx._vid()))
