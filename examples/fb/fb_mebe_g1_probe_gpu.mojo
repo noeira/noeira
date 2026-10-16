@@ -5,11 +5,13 @@
 The checkpoint holds the nets and the normaliser, not the ring, so a fresh
 ring is collected first: `--collect` batched steps of the agent's own
 exploration (MEBE pool refreshed as in training, NO updates, so the nets
-and the normaliser stay the checkpoint's). Then, for three reward pools:
+and the normaliser stay the checkpoint's). Then, for five reward pools:
 
     ring          32 768 uniform ring rows, centred rewards (= the training eval)
     upright       the upright rows (g_z ≤ −0.93) of 65 536 uniform ring rows
     upright_wide  the same rows, reward r^¼ (every σ × 2) for the z only
+    calm          the upright rows with |ωz| < 0.3 (§13.2)
+    calm_sharp    the same rows, reward r⁴: only the rows that match count
 
 it prints, per task:
 
@@ -17,15 +19,20 @@ it prints, per task:
           the reward-weighted mean of (vx, vy, ωz, h) — what the z is asked for
     EVAL  return / fall / the mean (vx, vy, ωz, h) actually held over the
           250 eval steps, |vx − vx*|, |vy − vy*|, |ωz − ωz*| (velocity tasks),
-          and the return the SAME rollout earns on vx0 (standing still)
+          the return the SAME rollout earns on vx0 (standing still), and the
+          mean vx and |vx − vx*| over the last 125 steps (the held speed,
+          once the start from the reset stand is over)
 
 and, with `--dump`, writes the `ring` eval's qpos of the first lane of every
 task, every step, as text (`t lane q0 … q35`) for an offline render.
+With `--dump-pool`, it writes the 65 536 sampled ring rows' (vx, vy, ωz,
+h, g_z) as text, for offline joint histograms of what the ring holds.
 
     pixi run -e nvidia mojo build -I . examples/fb/fb_mebe_g1_probe_gpu.mojo -o fb_mebe_g1_probe
     ./fb_mebe_g1_probe --ckpt <run>/checkpoints/step_19988480.ckpt --reg 1 --dump qpos.txt
 
-`--reg` must match the run (it loads the `.reg` sidecar); `--explore` too.
+`--reg` must match the run (it loads the `.reg` sidecar); `--explore`,
+`--phi` and `--wz-max` too (they set the MEBE pool the collection refreshes).
 """
 
 from std.math import sqrt
@@ -71,7 +78,8 @@ comptime L: Int = 3
 comptime LA: Int = 2
 comptime HB: Int = 512
 comptime BATCH: Int = 1024
-comptime CAP: Int = 1_000_000
+comptime CAP: Int = 524_288   # ≥ the default --collect's 409 600 rows (still
+                              # OOMs beside two G1 training runs on a 5090)
 comptime ZBUF: Int = 8192
 comptime EnvT = UnitreeG1Batched[N_ENVS]
 comptime FNet = BFMFTower[OBS, ACT, D, H, L, D]
@@ -90,6 +98,7 @@ comptime EVAL_LEN: Int = 250
 comptime EVAL_POOL: Int = 32_768
 comptime EVAL_FALL_H: Float64 = 0.5
 comptime UPRIGHT_GZ: Float64 = -0.93
+comptime CALM_WZ: Float64 = 0.3
 
 
 def _flag(name: String, dflt: String) raises -> String:
@@ -143,13 +152,23 @@ def main() raises:
     var reset_noise = atof(_flag(String("--reset-noise"), String(0.1)))
     var seed_v = atol(_flag(String("--seed"), String(1)))
     var dump = _flag(String("--dump"), String(""))
+    var dump_pool = _flag(String("--dump-pool"), String(""))
+    var phi = _flag(String("--phi"), String("vxvywzh"))
+    var wz_max = atof(_flag(String("--wz-max"), String(0.0)))
     var mebe = explore == "mebe"
     var use_reg = reg > 0.0
+    if phi != "vxvywzh" and phi != "vxvyh":
+        raise Error("--phi must be 'vxvywzh' or 'vxvyh'")
 
-    var cfg = MebeConfig([G1M_COL_VX, G1M_COL_VY, G1M_COL_WZ, G1M_COL_H])
+    var phi_cols: List[Int] = [G1M_COL_VX, G1M_COL_VY, G1M_COL_WZ, G1M_COL_H]
+    if phi == "vxvyh":
+        phi_cols = [G1M_COL_VX, G1M_COL_VY, G1M_COL_H]
+    var cfg = MebeConfig(phi_cols^)
     cfg.add_filter(G1M_COL_GZ, -1.01, -0.93)
     cfg.add_filter(G1M_COL_VX, -1.8, 1.8)
     cfg.add_filter(G1M_COL_VY, -1.3, 1.3)
+    if wz_max > 0.0:
+        cfg.add_filter(G1M_COL_WZ, -wz_max, wz_max)
     cfg.density = InverseDensityConfig(beta=beta, eps_rel=0.1, bw_scale=1.0)
     cfg.n_cand = 8192
     cfg.n_ref = 2048
@@ -172,6 +191,7 @@ def main() raises:
     print("FB-MEBE G1 probe —", ckpt)
     print("  explore", explore, " β", beta, " reg", reg, " collect", n_collect,
           "batched steps (", n_collect * N_ENVS, "rows )  seed", seed_v)
+    print("  φ", phi, " |ωz| box", wz_max, "(0 = off)")
     print("=" * 70)
 
     with DeviceContext() as ctx:
@@ -247,10 +267,26 @@ def main() raises:
         var bs = List[Scalar[DT]]()
         agent.embed_rows(rows, raw, bs)
         var up_idx = List[Int]()
+        var calm_idx = List[Int]()
         for i in range(NROW):
             if Float64(raw[i * OBS + G1M_COL_GZ]) <= UPRIGHT_GZ:
                 up_idx.append(i)
-        print("[pool] upright rows", len(up_idx), "/", NROW)
+                if abs(Float64(raw[i * OBS + G1M_COL_WZ])) < CALM_WZ:
+                    calm_idx.append(i)
+        print("[pool] upright rows", len(up_idx), "/", NROW,
+              "  calm (upright, |ωz| <", CALM_WZ, ")", len(calm_idx))
+        if dump_pool.byte_length() > 0:
+            var txt = String("# vx vy wz h gz\n")
+            for i in range(NROW):
+                var o = i * OBS
+                txt += (String(Float64(raw[o + G1M_COL_VX])) + " "
+                        + String(Float64(raw[o + G1M_COL_VY])) + " "
+                        + String(Float64(raw[o + G1M_COL_WZ])) + " "
+                        + String(Float64(raw[o + G1M_COL_H])) + " "
+                        + String(Float64(raw[o + G1M_COL_GZ])) + "\n")
+            with open(dump_pool, "w") as fh:
+                fh.write(txt)
+            print("[dump] pool rows ->", dump_pool)
 
         # ── eval buffers ───────────────────────────────────────────────────
         var e_task = ctx.enqueue_create_buffer[DType.int32](N_ENVS)
@@ -273,18 +309,26 @@ def main() raises:
         var h_obs = ctx.enqueue_create_host_buffer[DT](N_ENVS * OBS)
         var h_qpos = ctx.enqueue_create_host_buffer[DT](len(eval_env.d.qpos.dev.value()))
 
-        var pool_names: List[String] = ["ring", "upright", "upright_wide"]
-        for v in range(3):
+        var pool_names: List[String] = [
+            "ring", "upright", "upright_wide", "calm", "calm_sharp"
+        ]
+        for v in range(len(pool_names)):
             # the pool's rows (indices into `rows`) and the reward power
             var sel = List[Int]()
             if v == 0:
                 for i in range(EVAL_POOL):
                     sel.append(i)
-            else:
+            elif v <= 2:
                 for i in range(min(EVAL_POOL, len(up_idx))):
                     sel.append(up_idx[i])
+            else:
+                for i in range(min(EVAL_POOL, len(calm_idx))):
+                    sel.append(calm_idx[i])
             var n = len(sel)
-            var pw = 0.25 if v == 2 else 1.0
+            if n == 0:
+                print("# pool", pool_names[v], "is empty: skipped")
+                continue
+            var pw = 0.25 if v == 2 else (4.0 if v == 4 else 1.0)
             var sub_b = List[Scalar[DT]](length=n * D, fill=Scalar[DT](0))
             for i in range(n):
                 for j in range(D):
@@ -341,8 +385,9 @@ def main() raises:
             e_fell.enqueue_fill(Scalar[DT](0.0))
             e_ar.enqueue_fill(Scalar[DT](0.0))
             e_prev_a.enqueue_fill(Scalar[DT](0.0))
-            # per task: Σ vx, vy, wz, h, |e_vx|, |e_vy|, |e_wz|, r_vx0
-            comptime NS = 8
+            # per task: Σ vx, vy, wz, h, |e_vx|, |e_vy|, |e_wz|, r_vx0,
+            # and over the last half: Σ vx, |e_vx|
+            comptime NS = 10
             var acc = List[Float64](length=n_task * NS, fill=0.0)
             var vx0p = suite[k_vx0].params()
             var dump_txt = String()
@@ -385,6 +430,9 @@ def main() raises:
                         Float64(h_obs[o + G1M_COL_GX]),
                         Float64(h_obs[o + G1M_COL_GY]), hh,
                     )
+                    if t >= EVAL_LEN // 2:
+                        acc[b + 8] += vx
+                        acc[b + 9] += abs(vx - suite[k].vx)
                 if v == 0 and dump.byte_length() > 0:
                     for k in range(n_task):
                         dump_txt += String(t) + " " + String(k)
@@ -396,7 +444,7 @@ def main() raises:
             ctx.enqueue_copy(h_ret, e_ret)
             ctx.enqueue_copy(h_fell, e_fell)
             ctx.synchronize()
-            print("EVAL task  ret  fall   vx  vy  wz  h   |e_vx| |e_vy| |e_wz|   ret_on_vx0")
+            print("EVAL task  ret  fall   vx  vy  wz  h   |e_vx| |e_vy| |e_wz|   ret_on_vx0   late_vx late_|e_vx|")
             var fam_sum = List[Float64](length=3, fill=0.0)
             var fam_n = List[Int](length=3, fill=0)
             for k in range(n_task):
@@ -411,12 +459,14 @@ def main() raises:
                 fam_sum[suite[k].family] += r
                 fam_n[suite[k].family] += 1
                 var nn = Float64(reps * EVAL_LEN)
+                var nl = Float64(reps * (EVAL_LEN - EVAL_LEN // 2))
                 var b = k * NS
                 print("EVAL", suite[k].name, _fmt(r), _fmt(f),
                       _fmt(acc[b] / nn), _fmt(acc[b + 1] / nn), _fmt(acc[b + 2] / nn),
                       _fmt(acc[b + 3] / nn), _fmt(acc[b + 4] / nn),
                       _fmt(acc[b + 5] / nn), _fmt(acc[b + 6] / nn),
-                      _fmt(acc[b + 7] / Float64(reps)))
+                      _fmt(acc[b + 7] / Float64(reps)),
+                      _fmt(acc[b + 8] / nl), _fmt(acc[b + 9] / nl))
             print("[eval", pool_names[v], "] velocity", fam_sum[0] / Float64(fam_n[0]),
                   " posture", fam_sum[1] / Float64(fam_n[1]),
                   " composite", fam_sum[2] / Float64(fam_n[2]))
