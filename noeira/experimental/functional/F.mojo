@@ -16,7 +16,7 @@ from .opcodes import (
 def linear(x: FTensor, w: FTensor, b: FTensor) raises -> FTensor:
     """`x[B, IN] @ w[IN, OUT] + b[1, OUT]` — `Linear`'s weight layout. ONE
     fused node (`tape.linear`); `x @ w + b` is the same value as two."""
-    return x._new(x.tape[].linear(x.id, w.id, b.id, EW_NONE))
+    return x._new(x.tape[].linear(x._vid(), w._vid(), b._vid(), EW_NONE))
 
 
 def linear(x: FTensor, w: FTensor, b: FTensor, act: StaticString) raises -> FTensor:
@@ -41,7 +41,7 @@ def linear(x: FTensor, w: FTensor, b: FTensor, act: StaticString) raises -> FTen
         tag = EW_ELU
     else:
         raise Error(String("F.linear: unknown activation ", act))
-    return x._new(x.tape[].linear(x.id, w.id, b.id, tag))
+    return x._new(x.tape[].linear(x._vid(), w._vid(), b._vid(), tag))
 
 
 def mse(pred: FTensor, target: FTensor) raises -> FTensor:

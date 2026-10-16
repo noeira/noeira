@@ -102,6 +102,8 @@ struct Node(Movable):
     var rg: Bool
     """Requires grad: a parameter, an input asked for it, or anything
     computed from one. `backward` skips every node without it."""
+    var name: String
+    """A parameter's name in the walk (checkpoints, `named_params`)."""
     var gfresh: Bool
     """GPU backward: no gradient has reached this node yet, so its grad
     buffer holds garbage — the first contribution WRITES it, later ones add.
@@ -122,6 +124,7 @@ struct Node(Movable):
         self.x3 = -1
         self.c = 0
         self.rg = False
+        self.name = String("")
         self.gfresh = False
 
     def size(self) -> Int:
@@ -144,6 +147,13 @@ struct TapeData(Movable):
     """Comptime nn modules the tape owns (`module_op.mojo`)."""
     var graph: Optional[CUDAGraph]
     """A captured step (`Tape.capture_begin/end`), NVIDIA only."""
+    var gen: Int
+    """The step: bumped by every `reset`. A handle carries the `gen` it was
+    made in, and one from an earlier step — whose slot `reset` handed to
+    another node — raises on use instead of reading that node."""
+    var grad_on: Bool
+    """`False` under `Tape.no_grad()`: new nodes do not require grad, so no
+    gradient buffer, no saved pre-activation, no backward."""
 
     def __init__(out self, ctx: Optional[DeviceContext] = None):
         self.nodes = List[Node]()
@@ -156,6 +166,8 @@ struct TapeData(Movable):
         self.s4 = Tensor()
         self.mods = List[ModEntry]()
         self.graph = None
+        self.gen = 0
+        self.grad_on = True
 
     def __deinit__(deinit self):
         for i in range(len(self.mods)):
@@ -252,6 +264,9 @@ struct TapeData(Movable):
         """The next node: a reused slot left by `reset` when there is one
         (its buffers grow only if this step's shape is larger), else a new
         one. The value buffer is NOT cleared — every op writes all of it."""
+        # Under `no_grad` only a LEAF keeps its flag (a parameter stays a
+        # parameter); everything computed is plain data.
+        var rg_eff = rg if op == OP_LEAF else (rg and self.grad_on)
         var i = self.n_live
         if i == len(self.nodes):
             self.nodes.append(Node())
@@ -268,11 +283,11 @@ struct TapeData(Movable):
         n.b = b
         n.x3 = -1
         n.c = 0
-        n.rg = rg
+        n.rg = rg_eff
         n.gfresh = False
         if gpu:
             n.val.ensure_gpu(c.value(), rows * cols)
-            if rg:
+            if rg_eff:
                 n.grad.ensure_gpu(c.value(), rows * cols)
         else:
             n.val.ensure(rows * cols)
@@ -285,7 +300,30 @@ struct TapeData(Movable):
             self.nodes[i].grad.ensure(rows * cols)
         return i
 
-    def param(mut self, rows: Int, cols: Int) raises -> Int:
+    def check_name(self, name: String) raises:
+        """A tape-level name (a parameter, or a module's prefix): non-empty,
+        no `.` (module parameters are `<module>.<field>`), unique."""
+        if name.byte_length() == 0:
+            raise Error("tape: an empty name")
+        if "." in name:
+            raise Error(String("tape: `", name, "` — a name cannot contain `.`"))
+        for i in range(self.n_params):
+            if self.nodes[i].name == name:
+                raise Error(String("tape: `", name, "` names two parameters"))
+        for j in range(len(self.mods)):
+            if self.mods[j].name == name:
+                raise Error(String("tape: `", name, "` is already a module"))
+
+    def param(mut self, rows: Int, cols: Int, name: String = String("")) raises -> Int:
+        """A parameter named `name` — by default `p<index>`. Names key the
+        checkpoint and the optimizer walk (`_walk_order`)."""
+        var nm = name if name.byte_length() > 0 else String("p", self.n_params)
+        self.check_name(nm)
+        var i = self._new_param(rows, cols)
+        self.nodes[i].name = nm
+        return i
+
+    def _new_param(mut self, rows: Int, cols: Int) raises -> Int:
         """A parameter: a persistent leaf that requires grad. Every
         parameter must exist before the first activation, so they stay the
         contiguous prefix `reset` keeps. Its host `val.data` is sized for
@@ -308,6 +346,7 @@ struct TapeData(Movable):
     def reset(mut self):
         """Drop every activation; parameters, and every buffer, stay."""
         self.n_live = self.n_params
+        self.gen += 1
         for i in range(len(self.mods)):
             self.mods[i].used = False
 
@@ -354,7 +393,11 @@ struct TapeData(Movable):
     def _s4ref(mut self) -> ref[MutAnyOrigin] Tensor:
         return self.s4
 
-    def add_module(mut self, var e: ModEntry) -> Int:
+    def add_module(mut self, var e: ModEntry, name: String = String("")) raises -> Int:
+        """Own module entry `e`, named `name` — by default `m<index>`."""
+        var nm = name if name.byte_length() > 0 else String("m", len(self.mods))
+        self.check_name(nm)
+        e.name = nm
         self.mods.append(e^)
         return len(self.mods) - 1
 
@@ -367,10 +410,12 @@ struct TapeData(Movable):
                        "], called on [", self.nodes[a].rows, ", ",
                        self.nodes[a].cols, "]")
             )
-        if self.mods[mid].used:
+        if self.mods[mid].used and self.grad_on:
             raise Error(
-                String("module ", mid, ": called twice since reset() — its"
-                       " caches hold one call; share weights with native ops")
+                String("module `", self.mods[mid].name, "`: called twice"
+                       " since reset() with gradients on — its caches hold"
+                       " one call for the backward (under no_grad it may be"
+                       " called any number of times)")
             )
         self.mods[mid].used = True
         var o = self.new_node(b, self.mods[mid].out_dim, OP_MODULE, a, -1, True)
@@ -408,33 +453,64 @@ struct TapeData(Movable):
             for k in range(n):
                 ga[unsafe_offset=k] += gs[unsafe_offset=k]
 
+    def _walk_order(self) -> List[Int]:
+        """Every tape-level entry — parameter `i` as `i`, module `j` as
+        `-(j + 1)` — sorted by NAME, so a checkpoint survives reordering the
+        code that creates them (nn's reader matches sections in walk order
+        and checks each name). Insertion sort: tens of entries."""
+        var order = List[Int]()
+        var names = List[String]()
+        for i in range(self.n_params):
+            if self.nodes[i].rg:
+                order.append(i)
+                names.append(self.nodes[i].name)
+        for j in range(len(self.mods)):
+            order.append(-(j + 1))
+            names.append(self.mods[j].name)
+        for a in range(1, len(order)):
+            var k = a
+            while k > 0 and names[k] < names[k - 1]:
+                var tn = names[k]
+                names[k] = names[k - 1]
+                names[k - 1] = tn
+                var to = order[k]
+                order[k] = order[k - 1]
+                order[k - 1] = to
+                k -= 1
+        return order^
+
     def walk_params(
         mut self, mut r: ParamVisitorRef, ctx: Optional[DeviceContext],
         prefix: String,
     ) raises:
         """Every trainable parameter, through the erased visitor nn's
-        optimizers and checkpoints drive: native ones as `p<i>` (weight
-        decay on matrices, not on `[1, n]` rows), then each module's own
-        walk under `m<j>`."""
-        for i in range(self.n_params):
-            if not self.nodes[i].rg:
-                continue
-            ref nd = self.nodes[i]
-            r.call(
-                r.state, join_name(prefix, String("p", i)), nd.val, nd.grad,
-                nd.m, nd.v, nd.size(), nd.rows > 1, ctx,
-            )
-        for j in range(len(self.mods)):
-            var w = self.mods[j].walk
-            w(self.mods[j].state, r, ctx, join_name(prefix, String("m", j)))
+        optimizers and checkpoints drive, in NAME order (`_walk_order`):
+        a parameter as its name (weight decay on matrices, not on `[1, n]`
+        rows), a module's as `<module>.<its own names>`."""
+        var order = self._walk_order()
+        for e in range(len(order)):
+            var i = order[e]
+            if i >= 0:
+                ref nd = self.nodes[i]
+                r.call(
+                    r.state, join_name(prefix, nd.name), nd.val, nd.grad,
+                    nd.m, nd.v, nd.size(), nd.rows > 1, ctx,
+                )
+            else:
+                var j = -i - 1
+                var w = self.mods[j].walk
+                w(self.mods[j].state, r, ctx, join_name(prefix, self.mods[j].name))
 
     def walk_states(
         mut self, mut r: ParamVisitorRef, ctx: Optional[DeviceContext],
         prefix: String,
     ) raises:
-        for j in range(len(self.mods)):
-            var w = self.mods[j].walk_state
-            w(self.mods[j].state, r, ctx, join_name(prefix, String("m", j)))
+        var order = self._walk_order()
+        for e in range(len(order)):
+            if order[e] < 0:
+                var j = -order[e] - 1
+                var w = self.mods[j].walk_state
+                w(self.mods[j].state, r, ctx, join_name(prefix, self.mods[j].name))
 
     # ── forward ops ──────────────────────────────────────────────────────
     def binary[OP: Int](mut self, a: Int, b: Int) raises -> Int:
@@ -556,6 +632,8 @@ struct TapeData(Movable):
         var k = self.nodes[x].cols
         var n = self.nodes[w].cols
         comptime NEEDS_Z = HAS_ACT and not OP.owns_cache
+        # The pre-activation is backward state: not kept under no_grad.
+        var keep_z = NEEDS_Z and self.nodes[o].rg
         if self.ctx:
             var c = self.dctx()
             comptime if has_nvidia_gpu_accelerator() and not HAS_ACT:
@@ -564,8 +642,11 @@ struct TapeData(Movable):
                 )
                 return
             gpu_matmul(c, self.dv(o), self.dv(x), self.dv(w), m, n, k)
+            # Without a kept z the kernel writes z into `o` itself, then
+            # overwrites it with act(z): the same thread, same element, in
+            # that order — a harmless scratch write.
             var z = self.dv(o)
-            comptime if NEEDS_Z:
+            if keep_z:
                 self.nodes[o].aux.ensure_gpu(c, m * n)
                 z = self.nodes[o].aux.dev.value().create_sub_buffer[DT](0, m * n)
             gpu_bias_act[OP, HAS_ACT](c, self.dv(o), self.dv(bias), z, m, n)
@@ -577,7 +658,7 @@ struct TapeData(Movable):
             0.0,
             rebind[Pointer[Float32, MutAnyOrigin]](self.val_ptr(o)), n,
         )
-        comptime if NEEDS_Z:
+        if keep_z:
             self.nodes[o].aux.ensure(m * n)
         var po = self.val_ptr(o)
         var pb = self.val_ptr(bias)
@@ -588,7 +669,8 @@ struct TapeData(Movable):
                 var zz = po[unsafe_offset=t] + pb[unsafe_offset=j]
                 comptime if HAS_ACT:
                     comptime if NEEDS_Z:
-                        pz[unsafe_offset=t] = zz
+                        if keep_z:
+                            pz[unsafe_offset=t] = zz
                     po[unsafe_offset=t] = OP.forward_scalar(zz)
                 else:
                     po[unsafe_offset=t] = zz
@@ -803,7 +885,12 @@ struct TapeData(Movable):
         if self.nodes[loss].size() != 1:
             raise Error("backward: the loss must be a [1, 1] scalar")
         if not self.nodes[loss].rg:
-            raise Error("backward: the loss does not depend on any parameter")
+            if not self.grad_on:
+                raise Error("backward: gradients are off (inside no_grad)")
+            raise Error(
+                "backward: the loss does not depend on any parameter (or it"
+                " was recorded under no_grad)"
+            )
         for i in range(self.n_params, loss + 1):
             if not self.nodes[i].rg:
                 continue

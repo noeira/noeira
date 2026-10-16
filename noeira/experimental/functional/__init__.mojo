@@ -10,4 +10,4 @@ into a CUDA graph. See `README.md`; `ftensor.mojo` for the surface,
 `Tape(ctx)` on the GPU — one binary, any shape. Experimental.
 """
 
-from .ftensor import Tape, FTensor, FModule
+from .ftensor import Tape, FTensor, FModule, NoGrad

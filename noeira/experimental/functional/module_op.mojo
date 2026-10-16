@@ -113,6 +113,8 @@ struct ModEntry(Copyable):
     var out_dim: Int
     var used: Bool
     """Called since the last `reset`: its caches hold that call."""
+    var name: String
+    """The prefix of its parameters' names in the tape's walk."""
 
     def __init__(
         out self,
@@ -138,6 +140,7 @@ struct ModEntry(Copyable):
         self.in_dim = in_dim
         self.out_dim = out_dim
         self.used = False
+        self.name = String("")
 
 
 def make_entry[M: Module, B: Int](var m: M, gpu: Bool) -> ModEntry:
