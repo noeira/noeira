@@ -45,7 +45,10 @@ from noeira.nn.primitives.ops.gelu_tanh_op import GELUTanhOp
 from noeira.nn.primitives.ops.mish_op import MishOp
 from noeira.nn.primitives.ops.swish_op import SwishOp
 from noeira.nn.primitives.ops.elu_op import ELUOp
+from noeira.nn.core.param import ParamVisitorRef
+from noeira.nn.core.walkers import join_name
 from .opcodes import *
+from .module_op import ModEntry
 from .gpu import (
     gpu_binary,
     gpu_binary_bwd,
@@ -74,6 +77,10 @@ comptime DBuf = DeviceBuffer[DT]
 struct Node(Movable):
     var val: Tensor
     var grad: Tensor
+    var m: Tensor
+    var v: Tensor
+    """A parameter's optimizer moments, allocated by the optimizer on its
+    first step (nn's `Adam` via `ParamVisitorRef`); empty otherwise."""
     var rows: Int
     var cols: Int
     var op: Int
@@ -92,6 +99,8 @@ struct Node(Movable):
     def __init__(out self):
         self.val = Tensor()
         self.grad = Tensor()
+        self.m = Tensor()
+        self.v = Tensor()
         self.rows = 0
         self.cols = 0
         self.op = OP_LEAF
@@ -114,8 +123,12 @@ struct TapeData(Movable):
     var s1: Tensor
     var s2: Tensor
     var s3: Tensor
-    """GPU backward scratch (a transposed operand, a product before it
+    var s4: Tensor
+    """Backward scratch (a transposed operand, a product before it
     is accumulated). Grown on demand, reused by every matmul."""
+
+    var mods: List[ModEntry]
+    """Comptime nn modules the tape owns (`module_op.mojo`)."""
 
     def __init__(out self, ctx: Optional[DeviceContext] = None):
         self.nodes = List[Node]()
@@ -125,6 +138,12 @@ struct TapeData(Movable):
         self.s1 = Tensor()
         self.s2 = Tensor()
         self.s3 = Tensor()
+        self.s4 = Tensor()
+        self.mods = List[ModEntry]()
+
+    def __deinit__(deinit self):
+        for i in range(len(self.mods)):
+            self.mods[i].drop(self.mods[i].state)
 
     # ── storage ──────────────────────────────────────────────────────────
     def on_gpu(self) -> Bool:
@@ -272,8 +291,13 @@ struct TapeData(Movable):
     def reset(mut self):
         """Drop every activation; parameters, and every buffer, stay."""
         self.n_live = self.n_params
+        for i in range(len(self.mods)):
+            self.mods[i].used = False
 
     def zero_grad(mut self) raises:
+        var c = self.ctx
+        for j in range(len(self.mods)):
+            self.mods[j].zero(self.mods[j].state, c)
         for i in range(self.n_params):
             if self.nodes[i].rg:
                 if self.ctx:
@@ -299,6 +323,101 @@ struct TapeData(Movable):
                 var g = self.grad_ptr(i)
                 for k in range(n):
                     v[unsafe_offset=k] -= lr * g[unsafe_offset=k]
+
+    # ── comptime modules ─────────────────────────────────────────────────
+    def _vref(mut self, i: Int) -> ref[MutAnyOrigin] Tensor:
+        """Node `i`'s value storage, origin erased — a module call needs two
+        node storages of the one list at once (`TensorPack.__getitem__`'s
+        idiom: the wildcard pins `self`)."""
+        return self.nodes[i].val
+
+    def _gref(mut self, i: Int) -> ref[MutAnyOrigin] Tensor:
+        return self.nodes[i].grad
+
+    def _s4ref(mut self) -> ref[MutAnyOrigin] Tensor:
+        return self.s4
+
+    def add_module(mut self, var e: ModEntry) -> Int:
+        self.mods.append(e^)
+        return len(self.mods) - 1
+
+    def module_call(mut self, mid: Int, a: Int) raises -> Int:
+        var b = self.mods[mid].batch
+        var ind = self.mods[mid].in_dim
+        if self.nodes[a].rows != b or self.nodes[a].cols != ind:
+            raise Error(
+                String("module ", mid, ": built for [", b, ", ", ind,
+                       "], called on [", self.nodes[a].rows, ", ",
+                       self.nodes[a].cols, "]")
+            )
+        if self.mods[mid].used:
+            raise Error(
+                String("module ", mid, ": called twice since reset() — its"
+                       " caches hold one call; share weights with native ops")
+            )
+        self.mods[mid].used = True
+        var o = self.new_node(b, self.mods[mid].out_dim, OP_MODULE, a, -1, True)
+        self.nodes[o].sub = mid
+        var f = self.mods[mid].fwd
+        var st = self.mods[mid].state
+        var c = self.ctx
+        f(st, self._vref(a), self._vref(o), c)
+        return o
+
+    def _module_vjp(mut self, o: Int, a: Int) raises:
+        """The module's `vjp` WRITES its input gradient. Straight into the
+        input's gradient when it is the first to arrive (GPU, still fresh);
+        otherwise into scratch, then added."""
+        var mid = self.nodes[o].sub
+        var f = self.mods[mid].vjp
+        var st = self.mods[mid].state
+        var c = self.ctx
+        var direct = Bool(c) and self.nodes[a].rg and self.nodes[a].gfresh
+        if direct:
+            self.nodes[a].gfresh = False
+            f(st, self._vref(a), self._gref(o), self._gref(a), c)
+            return
+        f(st, self._vref(a), self._gref(o), self._s4ref(), c)
+        if not self.nodes[a].rg:
+            return
+        var n = self.nodes[a].size()
+        if self.ctx:
+            var src = self.s4.dev.value().create_sub_buffer[DT](0, n)
+            gpu_axpy(self.dctx(), self.dg(a), src, n, 1.0)
+            self.nodes[a].gfresh = False
+        else:
+            var ga = self.grad_ptr(a)
+            var gs = self.s4.data.unsafe_ptr()
+            for k in range(n):
+                ga[unsafe_offset=k] += gs[unsafe_offset=k]
+
+    def walk_params(
+        mut self, mut r: ParamVisitorRef, ctx: Optional[DeviceContext],
+        prefix: String,
+    ) raises:
+        """Every trainable parameter, through the erased visitor nn's
+        optimizers and checkpoints drive: native ones as `p<i>` (weight
+        decay on matrices, not on `[1, n]` rows), then each module's own
+        walk under `m<j>`."""
+        for i in range(self.n_params):
+            if not self.nodes[i].rg:
+                continue
+            ref nd = self.nodes[i]
+            r.call(
+                r.state, join_name(prefix, String("p", i)), nd.val, nd.grad,
+                nd.m, nd.v, nd.size(), nd.rows > 1, ctx,
+            )
+        for j in range(len(self.mods)):
+            var w = self.mods[j].walk
+            w(self.mods[j].state, r, ctx, join_name(prefix, String("m", j)))
+
+    def walk_states(
+        mut self, mut r: ParamVisitorRef, ctx: Optional[DeviceContext],
+        prefix: String,
+    ) raises:
+        for j in range(len(self.mods)):
+            var w = self.mods[j].walk_state
+            w(self.mods[j].state, r, ctx, join_name(prefix, String("m", j)))
 
     # ── forward ops ──────────────────────────────────────────────────────
     def binary[OP: Int](mut self, a: Int, b: Int) raises -> Int:
@@ -542,6 +661,8 @@ struct TapeData(Movable):
             self._scalar_vjp[OP_RSUBC](o, a)
         elif op == OP_EW:
             self._ew_vjp(o, a)
+        elif op == OP_MODULE:
+            self._module_vjp(o, a)
         elif op == OP_SUM or op == OP_MEAN:
             if not self.nodes[a].rg:
                 return

@@ -20,6 +20,7 @@ comptime OP_SUM = 11  # all elements -> [1, 1]
 comptime OP_MEAN = 12  # all elements -> [1, 1]
 comptime OP_TRANSPOSE = 13
 comptime OP_SUM_ROWS = 14  # [R, C] -> [1, C]
+comptime OP_MODULE = 15  # a comptime nn Module, `sub` = its entry (module_op.mojo)
 
 # ── elementwise activations: the comptime nn's `ElementOp`s ─────────────
 comptime EW_RELU = 0

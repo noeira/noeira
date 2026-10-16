@@ -21,7 +21,15 @@ from max.gpu.host import DeviceContext, DeviceBuffer
 
 from noeira.nn.constants import DT
 from noeira.nn.core.initializer import Initializer
+from noeira.nn.core.module import Module
+from noeira.nn.core.param import (
+    ParamVisitor,
+    ParamVisitorRef,
+    IsParamVisitorRef,
+    ParamWalkable,
+)
 from .gpu import gpu_copy
+from .module_op import make_entry
 from .tape import (
     TapeData,
     OP_ADD,
@@ -45,8 +53,12 @@ from .tape import (
 )
 
 
-struct Tape(ImplicitlyCopyable):
-    """A handle on one tape. Copies share it."""
+struct Tape(ImplicitlyCopyable, ParamWalkable):
+    """A handle on one tape. Copies share it.
+
+    `ParamWalkable`: nn's optimizers and checkpoint walks take a tape as
+    they take a model — `adam.step["cpu"](tape)` updates the tape's own
+    parameters AND every module handed to it, in one step."""
 
     var data: ArcPointer[TapeData]
 
@@ -60,6 +72,49 @@ struct Tape(ImplicitlyCopyable):
 
     def on_gpu(self) -> Bool:
         return self.data[].on_gpu()
+
+    # ── comptime nn modules ──────────────────────────────────────────────
+    def module[M: Module, //, B: Int](self, var m: M) -> FModule[M]:
+        """Hand `m` to the tape (it OWNS it from here) as an op for inputs
+        `[B, M.IN_DIMS[0]]`. Make `m` for the tape's device."""
+        var e = make_entry[M, B](m^, self.data[].on_gpu())
+        return FModule[M](self.data, self.data[].add_module(e^))
+
+    # ── ParamWalkable ────────────────────────────────────────────────────
+    def for_each_param[target: StaticString, V: ParamVisitor](
+        mut self,
+        mut visitor: V,
+        ctx: Optional[DeviceContext],
+        prefix: String = String(""),
+    ) raises:
+        """Only through a `ParamVisitorRef` (what `walk_params`, `Adam.step`
+        and `SGD.step` drive): the tape's parameters have RUNTIME sizes,
+        which a concrete visitor's `visit[target, N]` cannot take."""
+        comptime if conforms_to(V, IsParamVisitorRef):
+            ref r = Pointer(to=visitor).unsafe_bitcast[ParamVisitorRef]()[]
+            self.data[].walk_params(r, ctx, prefix)
+        else:
+            raise Error(
+                "Tape.for_each_param: drive the walk through a"
+                " ParamVisitorRef (walk_params / Adam.step / SGD.step)"
+            )
+
+    def zero_grad[target: StaticString](
+        mut self, ctx: Optional[DeviceContext]
+    ) raises:
+        self.data[].zero_grad()
+
+    def for_each_state[target: StaticString, V: ParamVisitor](
+        mut self,
+        mut visitor: V,
+        ctx: Optional[DeviceContext],
+        prefix: String = String(""),
+    ) raises:
+        comptime if conforms_to(V, IsParamVisitorRef):
+            ref r = Pointer(to=visitor).unsafe_bitcast[ParamVisitorRef]()[]
+            self.data[].walk_states(r, ctx, prefix)
+        else:
+            raise Error("Tape.for_each_state: drive it through a ParamVisitorRef")
 
     def synchronize(self) raises:
         if self.data[].ctx:
@@ -348,3 +403,28 @@ struct FTensor(ImplicitlyCopyable, Writable):
     # ── autodiff ─────────────────────────────────────────────────────────
     def backward(self) raises:
         self.tape[].backward(self.id)
+
+
+struct FModule[M: Module](ImplicitlyCopyable):
+    """A comptime nn module the tape owns. `m(x)` records it as one op;
+    `m.get()` reaches the module itself (its parameters, a checkpoint)."""
+
+    var tape: ArcPointer[TapeData]
+    var id: Int
+
+    def __init__(out self, tape: ArcPointer[TapeData], id: Int):
+        self.tape = tape
+        self.id = id
+
+    def __call__(self, x: FTensor) raises -> FTensor:
+        return FTensor(self.tape, self.tape[].module_call(self.id, x.id))
+
+    def get(mut self) -> ref[self] Self.M:
+        """The module, owned by the tape. The reference's origin is THIS
+        handle, so the handle — and the tape it keeps alive — outlives every
+        use of it. (An untracked pointer did not: Mojo ends a value at its
+        last use, the handle died right after `get()`, it was the tape's
+        last owner, and the next read was of freed memory.)"""
+        return self.tape[].mods[self.id].state.unsafe_bitcast[
+            Self.M
+        ]().unsafe_origin_cast[origin_of(self)]()[]

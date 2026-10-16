@@ -7,4 +7,4 @@ for the device kernels. `Tape()` runs on the CPU, `Tape(ctx)` on the GPU —
 one binary, any shape. A prototype (branch `proto/functional-nn`).
 """
 
-from .ftensor import Tape, FTensor
+from .ftensor import Tape, FTensor, FModule
