@@ -136,7 +136,7 @@ struct Tape(ImplicitlyCopyable, ParamWalkable):
     #
     #     adam.adopt["gpu"](tape, ctx)    # once, after every param/module
     #     step(tape)                      # eager: allocates
-    #     tape.capture_begin(); step(tape); tape.capture_end()
+    #     tape.capture_begin(); step(tape); tape.capture_end()  # records, then runs it once
     #     for …: refill(src); tape.replay()   # forward, backward, Adam
     #
     # Off NVIDIA `capture_begin/end` run the step eagerly and `captured()`
@@ -148,8 +148,16 @@ struct Tape(ImplicitlyCopyable, ParamWalkable):
         self.data[].graph = CUDAGraph(self.data[].dctx())
         self.data[].graph.value().begin_capture()
 
-    def capture_end(self) raises:
+    def capture_end(self, run: Bool = True) raises:
+        """End the capture and, by default, REPLAY once. Stream capture
+        RECORDS the step without executing it, so the step written between
+        `capture_begin` and `capture_end` has not happened yet: a training
+        step captured and not run silently drops one optimizer update (seen:
+        a captured Adam run trained on batches 0, 2, 3, … and diverged from
+        eager by 13 %). `run=False` only records."""
         self.data[].graph.value().end_capture()
+        if run and self.captured():
+            self.replay()
 
     def captured(self) -> Bool:
         return Bool(self.data[].graph) and self.data[].graph.value().is_captured()
