@@ -32,7 +32,7 @@ h, g_z) as text, for offline joint histograms of what the ring holds.
     ./fb_mebe_g1_probe --ckpt <run>/checkpoints/step_19988480.ckpt --reg 1 --dump qpos.txt
 
 `--reg` must match the run (it loads the `.reg` sidecar); `--explore`,
-`--phi` and `--wz-max` too (they set the MEBE pool the collection refreshes).
+`--phi`, `--wz-max` and `--upright-gz` too (they set the MEBE pool the collection refreshes).
 """
 
 from std.math import sqrt
@@ -155,6 +155,7 @@ def main() raises:
     var dump_pool = _flag(String("--dump-pool"), String(""))
     var phi = _flag(String("--phi"), String("vxvywzh"))
     var wz_max = atof(_flag(String("--wz-max"), String(0.0)))
+    var upright_gz = atof(_flag(String("--upright-gz"), String(-0.93)))
     var mebe = explore == "mebe"
     var use_reg = reg > 0.0
     if phi != "vxvywzh" and phi != "vxvyh":
@@ -164,7 +165,7 @@ def main() raises:
     if phi == "vxvyh":
         phi_cols = [G1M_COL_VX, G1M_COL_VY, G1M_COL_H]
     var cfg = MebeConfig(phi_cols^)
-    cfg.add_filter(G1M_COL_GZ, -1.01, -0.93)
+    cfg.add_filter(G1M_COL_GZ, -1.01, upright_gz)
     cfg.add_filter(G1M_COL_VX, -1.8, 1.8)
     cfg.add_filter(G1M_COL_VY, -1.3, 1.3)
     if wz_max > 0.0:
