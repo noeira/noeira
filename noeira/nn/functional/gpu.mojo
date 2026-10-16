@@ -13,8 +13,10 @@ replaces a zero-fill per node per step and lets a GEMM write its gradient
 in place. Parameter gradients always accumulate.
 
 GEMMs: on NVIDIA, `cublas_gemm` (runtime dims, transposes and beta built
-in; fp32, never TF32, since a runtime shape cannot pick a precision at
-compile time). Elsewhere (Metal), MAX's `matmul` over runtime-extent views —
+in), at the comptime nn's precision for the same shape: `cublas_tf32(m, n,
+k)` — TF32 from 2^24 multiply-adds, fp32 below — evaluated at RUN time over
+both instantiations. (Always-fp32 made a B=4096 MLP step 1.8x the comptime
+one on an RTX 5090, mostly SIMT sgemm vs TF32 tensor-core GEMMs.) Elsewhere (Metal), MAX's `matmul` over runtime-extent views —
 the form `mm.mojo` already uses on Apple — with two exceptions:
 
 * `transpose_b` only at N >= 2: MAX's GPU matmul silently miscomputes
@@ -34,7 +36,7 @@ from linalg.matmul import matmul as max_matmul
 
 from noeira.nn.constants import DT
 from noeira.nn.core.element_op import ElementOp
-from noeira.nn.core.cublas_gemm import cublas_gemm
+from noeira.nn.core.cublas_gemm import cublas_gemm, cublas_tf32
 from .opcodes import *
 
 
@@ -532,6 +534,18 @@ def _max_mm[transpose_b: Bool = False](
         max_matmul[target="gpu"](ov, av, bv, ctx)
 
 
+def _cublas[TA: Bool, TB: Bool](
+    ctx: DeviceContext, o: DeviceBuffer[DT], a: DeviceBuffer[DT],
+    b: DeviceBuffer[DT], m: Int, n: Int, k: Int, beta: Float32,
+) raises:
+    """`cublas_gemm` with the comptime nn's precision rule applied at run
+    time. A layer's three GEMMs share m·n·k, so they share a precision."""
+    if cublas_tf32(m, n, k):
+        cublas_gemm[TA, TB, True](ctx, o, a, b, m, n, k, beta)
+    else:
+        cublas_gemm[TA, TB, False](ctx, o, a, b, m, n, k, beta)
+
+
 @always_inline
 def _degenerate(m: Int, n: Int, k: Int) -> Bool:
     return n == 1 or k == 1 or m == 1
@@ -543,7 +557,7 @@ def gpu_matmul(
 ) raises:
     """`o[m, n] = a[m, k] @ b[k, n]`."""
     comptime if has_nvidia_gpu_accelerator():
-        cublas_gemm[False, False, False](ctx, o, a, b, m, n, k, 0.0)
+        _cublas[False, False](ctx, o, a, b, m, n, k, 0.0)
     else:
         if _degenerate(m, n, k):
             _naive_mm[False, False, False](ctx, o, a, b, m, n, k)
@@ -558,7 +572,7 @@ def gpu_matmul_bwd_a[ACC: Bool](
     """`ga[m, k] (+)= go[m, n] @ b[k, n]ᵀ`. `tmp_o` >= m·k (used only when
     accumulating through MAX's matmul, which cannot)."""
     comptime if has_nvidia_gpu_accelerator():
-        cublas_gemm[False, True, False](
+        _cublas[False, True](
             ctx, ga, go, b, m, k, n, Float32(1.0) if ACC else Float32(0.0)
         )
     else:
@@ -580,7 +594,7 @@ def gpu_matmul_bwd_b[ACC: Bool](
     """`gb[k, n] (+)= a[m, k]ᵀ @ go[m, n]`. `tmp_t` >= m·k (aᵀ: MAX's matmul
     has no transpose_a), `tmp_o` >= k·n."""
     comptime if has_nvidia_gpu_accelerator():
-        cublas_gemm[True, False, False](
+        _cublas[True, False](
             ctx, gb, a, go, k, n, m, Float32(1.0) if ACC else Float32(0.0)
         )
     else:
