@@ -94,7 +94,17 @@ def _visit_thunk[V: ParamVisitorRT, target: StaticString](
     )
 
 
-struct ParamVisitorRef(ParamVisitor):
+trait IsParamVisitorRef:
+    """Marks `ParamVisitorRef` and nothing else, so a walk generic over
+    `V: ParamVisitor` can tell, at compile time, that it holds the erased
+    ref — and then pass it parameters whose size is only known at RUN time
+    (`ref.call(…, n, …)`), which a `visit[target, N]` cannot take. The
+    functional tape's parameters are the reason (`experimental/functional/`)."""
+
+    pass
+
+
+struct ParamVisitorRef(ParamVisitor, IsParamVisitorRef):
     """A type-erased `ParamVisitor`. Build one with `of[V, target](v)`; it
     borrows `v` for as long as the walk runs and must not outlive it."""
 
