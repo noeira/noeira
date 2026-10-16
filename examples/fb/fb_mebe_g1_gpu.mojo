@@ -20,6 +20,10 @@ and the §12.6 levers against the spin MEBE bought on φ ∋ ωz:
 
     --phi vxvyh            φ = (vx, vy, h): density no longer rewards ωz
     --wz-max 1.0           a |ωz| box in the validity filter (0 = off)
+    --phi vxh | vx         φ = (vx, h) or (vx): density no longer pays for
+                           lateral sliding (vy) or, with vx, crouching (h)
+    --vy-max 0.3           the filter's |vy| box (default 1.3)
+    --h-min 0.7            the filter's pelvis-height floor (0 = off)
     --upright-gz -0.995    the filter's g_z bound (default −0.93 ≈ 21° of
                            tilt; −0.995 ≈ 6°, what σ_g 0.1 rewards)
     --w-yaw 0.5 --w-angxy 0.05
@@ -205,6 +209,8 @@ def main() raises:
     var phi = _flag(String("--phi"), String("vxvywzh"))
     var wz_max = atof(_flag(String("--wz-max"), String(0.0)))
     var upright_gz = atof(_flag(String("--upright-gz"), String(-0.93)))
+    var vy_max = atof(_flag(String("--vy-max"), String(1.3)))
+    var h_min = atof(_flag(String("--h-min"), String(0.0)))
     var w_yaw = atof(_flag(String("--w-yaw"), String(0.0)))
     var w_angxy = atof(_flag(String("--w-angxy"), String(0.0)))
     if smoke:
@@ -215,8 +221,8 @@ def main() raises:
     if explore != "mebe" and explore != "sphere":
         raise Error("--explore must be 'mebe' or 'sphere'")
     var mebe = explore == "mebe"
-    if phi != "vxvywzh" and phi != "vxvyh":
-        raise Error("--phi must be 'vxvywzh' or 'vxvyh'")
+    if phi != "vxvywzh" and phi != "vxvyh" and phi != "vxh" and phi != "vx":
+        raise Error("--phi must be 'vxvywzh', 'vxvyh', 'vxh' or 'vx'")
     if (w_yaw > 0.0 or w_angxy > 0.0) and reg <= 0.0:
         raise Error("--w-yaw / --w-angxy price Q_reg: they need --reg > 0")
     if warmup < BATCH:
@@ -245,10 +251,16 @@ def main() raises:
     var phi_cols: List[Int] = [G1M_COL_VX, G1M_COL_VY, G1M_COL_WZ, G1M_COL_H]
     if phi == "vxvyh":
         phi_cols = [G1M_COL_VX, G1M_COL_VY, G1M_COL_H]
+    elif phi == "vxh":
+        phi_cols = [G1M_COL_VX, G1M_COL_H]
+    elif phi == "vx":
+        phi_cols = [G1M_COL_VX]
     var cfg = MebeConfig(phi_cols^)
     cfg.add_filter(G1M_COL_GZ, -1.01, upright_gz)
     cfg.add_filter(G1M_COL_VX, -1.8, 1.8)
-    cfg.add_filter(G1M_COL_VY, -1.3, 1.3)
+    cfg.add_filter(G1M_COL_VY, -vy_max, vy_max)
+    if h_min > 0.0:
+        cfg.add_filter(G1M_COL_H, h_min, 2.0)
     if wz_max > 0.0:
         cfg.add_filter(G1M_COL_WZ, -wz_max, wz_max)
     cfg.density = InverseDensityConfig(beta=beta, eps_rel=eps_rel, bw_scale=1.0)
@@ -272,7 +284,7 @@ def main() raises:
     print("=" * 70)
     print("  nets                =", "F/Q tower H", H, "L", L, "| actor H", H, "L", LA, "| B ϑ(10) ->", HB, "->", D)
     print("  explore             =", explore, " β", beta, " eps_rel", eps_rel, " refresh", refresh, " explore_frac", explore_frac)
-    print("  upright g_z bound    =", upright_gz)
+    print("  upright g_z bound    =", upright_gz, "  |vy| box", vy_max, "  h floor", h_min, "(0 = off)")
     print("  φ / |ωz| box        =", phi, "/", wz_max, "(0 = off)   ang-vel price yaw", w_yaw, " xy", w_angxy)
     print("  Q_reg λ (raw)       =", reg, " w_acc", w_acc, " w_ar", w_ar, " w_env", w_env,
           " (und", rw.undesired, " fo", rw.feet_orient, " lim", rw.limits, " slide", rw.slide, ")")
@@ -312,6 +324,8 @@ def main() raises:
         logger.set_config("phi", phi)
         logger.set_config("wz_max", String(wz_max))
         logger.set_config("upright_gz", String(upright_gz))
+        logger.set_config("vy_max", String(vy_max))
+        logger.set_config("h_min", String(h_min))
         logger.set_config("w_yaw", String(w_yaw))
         logger.set_config("w_angxy", String(w_angxy))
         var logger_ptr = Pointer(to=logger).as_unsafe_any_origin()

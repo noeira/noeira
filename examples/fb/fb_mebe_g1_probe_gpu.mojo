@@ -32,7 +32,7 @@ h, g_z) as text, for offline joint histograms of what the ring holds.
     ./fb_mebe_g1_probe --ckpt <run>/checkpoints/step_19988480.ckpt --reg 1 --dump qpos.txt
 
 `--reg` must match the run (it loads the `.reg` sidecar); `--explore`,
-`--phi`, `--wz-max` and `--upright-gz` too (they set the MEBE pool the collection refreshes).
+`--phi`, `--wz-max`, `--upright-gz`, `--vy-max` and `--h-min` too (they set the MEBE pool the collection refreshes).
 """
 
 from std.math import sqrt
@@ -156,18 +156,26 @@ def main() raises:
     var phi = _flag(String("--phi"), String("vxvywzh"))
     var wz_max = atof(_flag(String("--wz-max"), String(0.0)))
     var upright_gz = atof(_flag(String("--upright-gz"), String(-0.93)))
+    var vy_max = atof(_flag(String("--vy-max"), String(1.3)))
+    var h_min = atof(_flag(String("--h-min"), String(0.0)))
     var mebe = explore == "mebe"
     var use_reg = reg > 0.0
-    if phi != "vxvywzh" and phi != "vxvyh":
-        raise Error("--phi must be 'vxvywzh' or 'vxvyh'")
+    if phi != "vxvywzh" and phi != "vxvyh" and phi != "vxh" and phi != "vx":
+        raise Error("--phi must be 'vxvywzh', 'vxvyh', 'vxh' or 'vx'")
 
     var phi_cols: List[Int] = [G1M_COL_VX, G1M_COL_VY, G1M_COL_WZ, G1M_COL_H]
     if phi == "vxvyh":
         phi_cols = [G1M_COL_VX, G1M_COL_VY, G1M_COL_H]
+    elif phi == "vxh":
+        phi_cols = [G1M_COL_VX, G1M_COL_H]
+    elif phi == "vx":
+        phi_cols = [G1M_COL_VX]
     var cfg = MebeConfig(phi_cols^)
     cfg.add_filter(G1M_COL_GZ, -1.01, upright_gz)
     cfg.add_filter(G1M_COL_VX, -1.8, 1.8)
-    cfg.add_filter(G1M_COL_VY, -1.3, 1.3)
+    cfg.add_filter(G1M_COL_VY, -vy_max, vy_max)
+    if h_min > 0.0:
+        cfg.add_filter(G1M_COL_H, h_min, 2.0)
     if wz_max > 0.0:
         cfg.add_filter(G1M_COL_WZ, -wz_max, wz_max)
     cfg.density = InverseDensityConfig(beta=beta, eps_rel=0.1, bw_scale=1.0)
