@@ -11,13 +11,16 @@ from noeira.experimental.functional import Tape, FTensor, FModule
 import noeira.experimental.functional.F as F
 
 var tape = Tape()                                 # or Tape(ctx): the GPU
-var w = tape.param[Kaiming](4, 16)                # runtime shapes
-var b = tape.zeros(1, 16)
-var ln = tape.module[B](LayerNorm[16].make["cpu", Kaiming]())  # a comptime module as an op
+var w = tape.param[Kaiming](4, 16, name="w")      # runtime shapes; names key checkpoints
+var b = tape.zeros(1, 16, name="b")
+var ln = tape.module[B](LayerNorm[16].make["cpu", Kaiming](), name="ln")  # a comptime module as an op
 var h = ln(F.linear(x, w, b, "relu"))
 var loss = ((h @ v - y) ** 2).mean()
 loss.backward()
 adam.step["cpu"](tape)                            # nn's optimizers take the tape
+save_params["cpu"](tape, path)                    # so do nn's checkpoints
+with tape.no_grad():                              # inference: no grad buffers, no backward
+    var act = F.linear(obs, w, b, "relu")
 ```
 
 ## What it is
@@ -73,10 +76,22 @@ Evidence: `noeira-docs/functional_nn_5090_2026-10-16/`.
   one call), ARITY 1, fp32 activations.
 - The op set is closed (a tag + forward + backward per op): Mojo has no trait
   objects. Activations reuse `ElementOp`.
-- An `FTensor` from a previous step points at a slot `reset` reused.
 - Capture: NVIDIA only; one eager step first; no host reads or host inputs
   inside the step (`input_device`); the optimizer must be ADOPTED;
   `capture_end()` replays the recorded step once (capture does not run it).
+
+## Safety and basics (2026-10-16)
+
+- **Stale handles raise.** `reset` bumps the tape's step; an activation
+  handle from an earlier step raises on any use instead of reading the node
+  that now owns its slot. Parameters stay valid.
+- **Names.** Parameters and modules take `name=` (defaults `p<i>`, `m<j>`;
+  no `.`, no duplicates). The parameter walk runs in NAME order, so
+  `save_params(tape)` / `load_params(tape)` work across a reordering of the
+  code that creates them, and nn's reader refuses a renamed parameter.
+- **`no_grad`.** `with tape.no_grad():` records plain data: no gradient
+  buffer, no saved pre-activation, no backward, and a module may be called
+  any number of times.
 
 ## What was learned
 
@@ -97,4 +112,5 @@ pixi run -e apple   mojo run -I . tests/experimental/functional/test_functional_
 pixi run -e apple   mojo run -I . tests/experimental/functional/test_functional_module.mojo      # module bridge, Adam
 pixi run -e apple   mojo run -I . tests/experimental/functional/test_functional_fused.mojo       # fused linear, capture
 pixi run -e default mojo run -I . tests/experimental/functional/test_functional_capture_adam.mojo  # captured training
+pixi run -e apple   mojo run -I . tests/experimental/functional/test_functional_safety.mojo      # handles, names, checkpoint, no_grad
 ```
