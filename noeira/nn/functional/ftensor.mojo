@@ -125,12 +125,19 @@ struct Tape(ImplicitlyCopyable, ParamWalkable):
     # and cuBLASLt plans are created on the first call; capture forbids
     # allocation). Inside the captured step: no host reads (`item`,
     # `values`) and no host inputs — feed `input_device` from a buffer you
-    # refill between replays. The optimizer stays outside (its bias
-    # correction is a host-side scalar per step).
+    # refill between replays.
     #
+    # The OPTIMIZER can be inside the step once it is ADOPTED:
+    # `adam.adopt["gpu"](tape, ctx)` packs the tape's parameters and its
+    # modules' into nn's arena, whose step is one kernel and whose bias
+    # correction β^t advances ON THE DEVICE, per replay. An un-adopted Adam
+    # bakes the capture step's host `1 - β^t` into the graph and replays it
+    # (`tests/nn/test_functional_capture_adam.mojo`, control arm D).
+    #
+    #     adam.adopt["gpu"](tape, ctx)    # once, after every param/module
     #     step(tape)                      # eager: allocates
     #     tape.capture_begin(); step(tape); tape.capture_end()
-    #     for …: refill(src); tape.replay()
+    #     for …: refill(src); tape.replay()   # forward, backward, Adam
     #
     # Off NVIDIA `capture_begin/end` run the step eagerly and `captured()`
     # stays False: check it and run the step yourself.

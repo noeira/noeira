@@ -32,6 +32,7 @@ from noeira.nn.combinators.sequential import Sequential
 from noeira.nn.loss.mse import mse_backward
 from std.sys import has_nvidia_gpu_accelerator
 from noeira.cuda.graph import CUDAGraph
+from noeira.nn.optimizer.adam import Adam
 from noeira.nn.functional import Tape, FTensor
 import noeira.nn.functional.F as F
 
@@ -40,8 +41,11 @@ comptime ROUNDS = 5
 
 
 def _bench[
-    B: Int, IN: Int, H: Int, OUT: Int, OP: ElementOp, TRAIN: Bool
+    B: Int, IN: Int, H: Int, OUT: Int, OP: ElementOp, TRAIN: Bool,
+    ADAM: Bool = False,
 ](ctx: DeviceContext, name: String, iters: Int) raises:
+    """`ADAM`: the step ends with nn's Adam, ADOPTED (arena mode) in both
+    arms so its bias correction advances on the device under replay."""
     comptime RELU = OP.is_relu
     comptime NET = Sequential[
         Linear[IN, H], Elementwise[H, OP], Linear[H, H], Elementwise[H, OP],
@@ -68,16 +72,23 @@ def _bench[
     var b2 = tape.param(1, H, net.children[2].bias.val.data.copy())
     var w3 = tape.param(H, OUT, net.children[4].weight.val.data.copy())
     var b3 = tape.param(1, OUT, net.children[4].bias.val.data.copy())
+    var opt_c = Adam(lr=1e-5)
+    var opt_f = Adam(lr=1e-5)
+    comptime if ADAM:
+        opt_c.adopt["gpu"](net, ctx)
+        opt_f.adopt["gpu"](tape, ctx)
 
-    def _ct_step(mut net: NET, ctx: DeviceContext) raises {mut x, mut y, mut out, mut go, mut gx}:
+    def _ct_step(mut net: NET, ctx: DeviceContext) raises {mut x, mut y, mut out, mut go, mut gx, mut opt_c}:
         comptime if TRAIN:
             net.zero_grad["gpu"](ctx)
         net.forward["gpu", B](TensorRefs[1](x), out, ctx)
         comptime if TRAIN:
             mse_backward["gpu", B, OUT](out, y, go, ctx)
             net.vjp["gpu", B](TensorRefs[1](x), go, TensorRefs[1](gx), ctx)
+        comptime if ADAM:
+            opt_c.step["gpu"](net, ctx)
 
-    def _fn_step(tape: Tape) raises {mut x, mut y, w1, b1, w2, b2, w3, b3}:
+    def _fn_step(tape: Tape) raises {mut x, mut y, w1, b1, w2, b2, w3, b3, mut opt_f, ctx}:
         tape.reset()
         comptime if TRAIN:
             tape.zero_grad()
@@ -91,6 +102,9 @@ def _bench[
         comptime if TRAIN:
             var loss = F.mse(pred, tape.input_device(B, OUT, y.dev.value()))
             loss.backward()
+        comptime if ADAM:
+            var t = tape
+            opt_f.step["gpu"](t, ctx)
 
     # Warm-up (allocations, cuBLASLt plans), then capture on NVIDIA.
     _ct_step(net, ctx)
@@ -140,3 +154,6 @@ def main() raises:
     _bench[64, 8, 64, 4, TanhOp, True](ctx, "PPO   B=64   8-64-64-4 tanh train   ", 200)
     _bench[256, 23, 256, 1, ReLUOp, True](ctx, "SAC   B=256  23-256-256-1 relu train", 200)
     _bench[4096, 64, 512, 64, ReLUOp, True](ctx, "BIG   B=4096 64-512-512-64 relu train", 50)
+    print("with nn's Adam (adopted) in the step:")
+    _bench[64, 8, 64, 4, TanhOp, True, True](ctx, "PPO   B=64   train + Adam            ", 200)
+    _bench[256, 23, 256, 1, ReLUOp, True, True](ctx, "SAC   B=256  train + Adam            ", 200)
