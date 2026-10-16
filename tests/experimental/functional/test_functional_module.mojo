@@ -12,7 +12,7 @@ on the CPU and on the GPU.
    (2); then 60 Adam steps of training through the tape.
 4. MISUSE raises: a module called twice before `reset`, a wrong batch.
 
-Run: pixi run -e apple mojo run -I . tests/nn/test_functional_module.mojo
+Run: pixi run -e apple mojo run -I . tests/experimental/functional/test_functional_module.mojo
 """
 
 from std.random import seed, random_float64
@@ -28,8 +28,8 @@ from noeira.nn.primitives.activations import Tanh
 from noeira.nn.combinators.sequential import Sequential
 from noeira.nn.loss.mse import mse_forward, mse_backward
 from noeira.nn.optimizer.adam import Adam
-from noeira.nn.functional import Tape, FTensor, FModule
-import noeira.nn.functional.F as F
+from noeira.experimental.functional import Tape, FTensor, FModule
+import noeira.experimental.functional.F as F
 
 
 comptime B = 96

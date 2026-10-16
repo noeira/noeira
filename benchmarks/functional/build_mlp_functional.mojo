@@ -12,8 +12,8 @@ from std.sys import argv
 from noeira.nn.constants import DT
 from noeira.nn.core.initializer import Xavier
 from noeira.nn.optimizer.adam import Adam
-from noeira.nn.functional import Tape, FTensor
-import noeira.nn.functional.F as F
+from noeira.experimental.functional import Tape, FTensor
+import noeira.experimental.functional.F as F
 
 
 def main() raises:

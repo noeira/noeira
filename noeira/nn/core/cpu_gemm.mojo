@@ -63,7 +63,7 @@ def gemm_cpu_ptr[
     ldc: Int,
 ) raises:
     """`gemm_cpu` over raw pointers, for callers whose operands are not each
-    a whole `Tensor` — the functional tape (`nn/functional/`) keeps every
+    a whole `Tensor` — the functional tape (`experimental/functional/`) keeps every
     node's value and gradient in one list, so two of them cannot be borrowed
     as `Tensor`s at once."""
     comptime if CompilationTarget.is_macos():

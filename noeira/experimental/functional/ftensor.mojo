@@ -132,7 +132,7 @@ struct Tape(ImplicitlyCopyable, ParamWalkable):
     # modules' into nn's arena, whose step is one kernel and whose bias
     # correction β^t advances ON THE DEVICE, per replay. An un-adopted Adam
     # bakes the capture step's host `1 - β^t` into the graph and replays it
-    # (`tests/nn/test_functional_capture_adam.mojo`, control arm D).
+    # (`tests/experimental/functional/test_functional_capture_adam.mojo`, control arm D).
     #
     #     adam.adopt["gpu"](tape, ctx)    # once, after every param/module
     #     step(tape)                      # eager: allocates

@@ -1,5 +1,5 @@
 """`F` — the named-function spelling of the functional mode, for code that
-reads better as calls than as operators (`import noeira.nn.functional.F as F`).
+reads better as calls than as operators (`import noeira.experimental.functional.F as F`).
 
 Each is the composition its body shows; none is a new op. `linear` is
 `x @ w + b` because that IS `Linear`'s CPU forward: one cblas sgemm, then

@@ -33,8 +33,8 @@ from noeira.nn.loss.mse import mse_backward
 from std.sys import has_nvidia_gpu_accelerator
 from noeira.cuda.graph import CUDAGraph
 from noeira.nn.optimizer.adam import Adam
-from noeira.nn.functional import Tape, FTensor
-import noeira.nn.functional.F as F
+from noeira.experimental.functional import Tape, FTensor
+import noeira.experimental.functional.F as F
 
 
 comptime ROUNDS = 5

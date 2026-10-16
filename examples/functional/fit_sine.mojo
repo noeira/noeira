@@ -17,8 +17,8 @@ from max.gpu.host import DeviceContext
 
 from noeira.nn.constants import DT
 from noeira.nn.core.initializer import Xavier
-from noeira.nn.functional import Tape, FTensor
-import noeira.nn.functional.F as F
+from noeira.experimental.functional import Tape, FTensor
+import noeira.experimental.functional.F as F
 
 
 def mlp(x: FTensor, weights: List[FTensor], biases: List[FTensor], act: String) raises -> FTensor:

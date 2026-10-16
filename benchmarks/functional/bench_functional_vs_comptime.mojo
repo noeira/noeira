@@ -23,8 +23,8 @@ from noeira.nn.primitives.ops.relu_op import ReLUOp
 from noeira.nn.primitives.ops.tanh_op import TanhOp
 from noeira.nn.combinators.sequential import Sequential
 from noeira.nn.loss.mse import mse_forward, mse_backward
-from noeira.nn.functional import Tape, FTensor
-import noeira.nn.functional.F as F
+from noeira.experimental.functional import Tape, FTensor
+import noeira.experimental.functional.F as F
 
 
 comptime ROUNDS = 7

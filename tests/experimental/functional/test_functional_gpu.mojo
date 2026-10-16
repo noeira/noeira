@@ -16,7 +16,7 @@ the comptime nn and against finite differences, `test_functional_mode`).
 Tolerance: |gpu - cpu| <= 1e-4 · max(1, |cpu|) — GPU sums run in another
 order and Metal's transcendentals are not libm's.
 
-Run: pixi run -e apple mojo run -I . tests/nn/test_functional_gpu.mojo
+Run: pixi run -e apple mojo run -I . tests/experimental/functional/test_functional_gpu.mojo
 """
 
 from std.random import seed, random_float64
@@ -30,8 +30,8 @@ from noeira.nn.primitives.linear import Linear
 from noeira.nn.primitives.activations import Tanh
 from noeira.nn.combinators.sequential import Sequential
 from noeira.nn.loss.mse import mse_forward, mse_backward
-from noeira.nn.functional import Tape, FTensor
-import noeira.nn.functional.F as F
+from noeira.experimental.functional import Tape, FTensor
+import noeira.experimental.functional.F as F
 
 
 comptime TOL: Float64 = 1e-4

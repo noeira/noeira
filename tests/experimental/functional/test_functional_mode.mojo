@@ -1,4 +1,4 @@
-"""Functional mode (`noeira/nn/functional/`) — gates.
+"""Functional mode (`noeira/experimental/functional/`) — gates.
 
 1. PARITY vs the comptime nn: `Sequential[Linear, ReLU|Tanh, Linear]` + MSE,
    forward and backward, against the same network written with operators on
@@ -12,7 +12,7 @@
 3. REPLAY: after `reset`, a second step records the same number of nodes,
    allocates no new node, and reproduces the first step's loss and grads.
 
-Run: pixi run -e apple mojo run -I . tests/nn/test_functional_mode.mojo
+Run: pixi run -e apple mojo run -I . tests/experimental/functional/test_functional_mode.mojo
 """
 
 from std.random import seed, random_float64
@@ -25,8 +25,8 @@ from noeira.nn.primitives.linear import Linear
 from noeira.nn.primitives.activations import ReLU, Tanh
 from noeira.nn.combinators.sequential import Sequential
 from noeira.nn.loss.mse import mse_forward, mse_backward
-from noeira.nn.functional import Tape, FTensor
-import noeira.nn.functional.F as F
+from noeira.experimental.functional import Tape, FTensor
+import noeira.experimental.functional.F as F
 
 
 comptime B = 5

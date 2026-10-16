@@ -12,5 +12,6 @@ If something here graduates — converges on real results, becomes stable, or ge
 
 | Module | Status | Topic |
 |---|---|---|
+| [`functional/`](functional/) | Active | An eager mode for `nn`: a runtime-shaped tape with operators (`x @ w + b`), CPU and GPU from one binary; comptime nn modules as tape ops, nn's Adam over the tape, CUDA-graph capture of a training step. See `functional/README.md`. |
 | [`pcn/`](pcn/) | Active | Predictive Coding Networks (Bogacz canonical). See `pcn/README.md` and `docs/PCN_REDESIGN.md`. |
 | [`swm/`](swm/) | Active (Phase 1/6) | Sheaf World Models: orthogonal transports on a place graph, holonomy read as an observable. See `swm/README.md`, `docs/SHEAF_WORLD_MODELS_V2.md` and `docs/SWM_IMPLEMENTATION_PLAN.md`. |

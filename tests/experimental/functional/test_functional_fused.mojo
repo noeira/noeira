@@ -9,7 +9,7 @@ gates, on the CPU and on the GPU.
    input buffer, against an eager tape run on that input. Off NVIDIA the
    capture is unavailable and the row says so (not a pass).
 
-Run: pixi run -e default mojo run -I . tests/nn/test_functional_fused.mojo
+Run: pixi run -e default mojo run -I . tests/experimental/functional/test_functional_fused.mojo
 """
 
 from std.random import seed, random_float64
@@ -23,8 +23,8 @@ from noeira.nn.primitives.linear import Linear
 from noeira.nn.primitives.linear_act import LinearAct
 from noeira.nn.primitives.ops.relu_op import ReLUOp
 from noeira.nn.primitives.ops.tanh_op import TanhOp
-from noeira.nn.functional import Tape, FTensor, FModule
-import noeira.nn.functional.F as F
+from noeira.experimental.functional import Tape, FTensor, FModule
+import noeira.experimental.functional.F as F
 
 
 comptime B = 96

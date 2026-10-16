@@ -17,7 +17,7 @@ Gates: B ~ A (two Adam implementations), C == B bit for bit, D != B
 (the gate can see a frozen bias correction), and the loss falls. On a GPU
 without capture (Metal) only A vs B runs and the capture rows say so.
 
-Run: pixi run -e default mojo run -I . tests/nn/test_functional_capture_adam.mojo
+Run: pixi run -e default mojo run -I . tests/experimental/functional/test_functional_capture_adam.mojo
 """
 
 from std.random import seed, random_float64
@@ -28,8 +28,8 @@ from noeira.nn.core.tensor import Tensor
 from noeira.nn.core.initializer import Deterministic
 from noeira.nn.primitives.linear import Linear
 from noeira.nn.optimizer.adam import Adam
-from noeira.nn.functional import Tape, FTensor, FModule
-import noeira.nn.functional.F as F
+from noeira.experimental.functional import Tape, FTensor, FModule
+import noeira.experimental.functional.F as F
 
 
 comptime B = 64

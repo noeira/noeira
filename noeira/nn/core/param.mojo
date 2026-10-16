@@ -99,7 +99,7 @@ trait IsParamVisitorRef:
     `V: ParamVisitor` can tell, at compile time, that it holds the erased
     ref — and then pass it parameters whose size is only known at RUN time
     (`ref.call(…, n, …)`), which a `visit[target, N]` cannot take. The
-    functional tape's parameters are the reason (`nn/functional/`)."""
+    functional tape's parameters are the reason (`experimental/functional/`)."""
 
     pass
 
