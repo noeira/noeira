@@ -75,11 +75,27 @@ struct Tape(ImplicitlyCopyable, ParamWalkable):
         return self.data[].on_gpu()
 
     # ── comptime nn modules ──────────────────────────────────────────────
-    def module[M: Module, //, B: Int](self, var m: M) -> FModule[M]:
+    def module[M: Module, //, B: Int](
+        self, var m: M, name: String = String("")
+    ) raises -> FModule[M]:
         """Hand `m` to the tape (it OWNS it from here) as an op for inputs
-        `[B, M.IN_DIMS[0]]`. Make `m` for the tape's device."""
+        `[B, M.IN_DIMS[0]]`. Make `m` for the tape's device. `name` (default
+        `m<index>`) prefixes its parameters: `<name>.weight`, …"""
         var e = make_entry[M, B](m^, self.data[].on_gpu())
-        return FModule[M](self.data, self.data[].add_module(e^))
+        return FModule[M](self.data, self.data[].add_module(e^, name))
+
+    # ── gradient mode ────────────────────────────────────────────────────
+    def no_grad(self) -> NoGrad:
+        """`with tape.no_grad(): …` — inference. Nodes recorded inside do not
+        require grad: no gradient buffers, no saved pre-activations, no
+        backward, and a module may be called any number of times."""
+        return NoGrad(self.data)
+
+    def set_grad_enabled(self, on: Bool):
+        self.data[].grad_on = on
+
+    def grad_enabled(self) -> Bool:
+        return self.data[].grad_on
 
     # ── ParamWalkable ────────────────────────────────────────────────────
     def for_each_param[target: StaticString, V: ParamVisitor](
@@ -180,29 +196,41 @@ struct Tape(ImplicitlyCopyable, ParamWalkable):
     def _wrap(self, id: Int) -> FTensor:
         return FTensor(self.data, id)
 
+    def param_names(self) -> List[String]:
+        var out = List[String]()
+        for i in range(self.data[].n_params):
+            out.append(self.data[].nodes[i].name)
+        return out^
+
     # ── parameters (persist across `reset`) ──────────────────────────────
-    def param[INIT: Initializer](self, rows: Int, cols: Int) raises -> FTensor:
+    def param[INIT: Initializer](
+        self, rows: Int, cols: Int, name: String = String("")
+    ) raises -> FTensor:
         """A `[rows, cols]` parameter initialised as the comptime nn
-        initialises a `Linear` weight of fan_in `rows`, fan_out `cols`."""
-        var i = self.data[].param(rows, cols)
+        initialises a `Linear` weight of fan_in `rows`, fan_out `cols`.
+        `name` keys checkpoints (default `p<index>`): name what you save."""
+        var i = self.data[].param(rows, cols, name)
         INIT.init_weight["cpu"](self.data[].nodes[i].val, rows * cols, rows, cols, None)
         self.data[].upload_val(i)
         return self._wrap(i)
 
     def param(
-        self, rows: Int, cols: Int, values: List[Scalar[DT]]
+        self, rows: Int, cols: Int, values: List[Scalar[DT]],
+        name: String = String(""),
     ) raises -> FTensor:
         if len(values) != rows * cols:
             raise Error("Tape.param: values do not fill the shape")
-        var i = self.data[].param(rows, cols)
+        var i = self.data[].param(rows, cols, name)
         for k in range(rows * cols):
             self.data[].nodes[i].val.data[k] = values[k]
         self.data[].upload_val(i)
         return self._wrap(i)
 
-    def zeros(self, rows: Int, cols: Int) raises -> FTensor:
+    def zeros(
+        self, rows: Int, cols: Int, name: String = String("")
+    ) raises -> FTensor:
         """A zero-initialised parameter (a bias)."""
-        var i = self.data[].param(rows, cols)
+        var i = self.data[].param(rows, cols, name)
         for k in range(rows * cols):
             self.data[].nodes[i].val.data[k] = 0
         self.data[].upload_val(i)
@@ -292,13 +320,27 @@ struct Tape(ImplicitlyCopyable, ParamWalkable):
 struct FTensor(ImplicitlyCopyable, Writable):
     var tape: ArcPointer[TapeData]
     var id: Int
+    var gen: Int
+    """The tape's step when this handle was made (`TapeData.gen`)."""
 
     def __init__(out self, tape: ArcPointer[TapeData], id: Int):
         self.tape = tape
         self.id = id
+        self.gen = tape[].gen
 
     def _new(self, id: Int) -> Self:
         return Self(self.tape, id)
+
+    def _vid(self) raises -> Int:
+        """`id`, checked: a node from before the last `reset` has had its
+        slot handed to another node, so reading it would read THAT node.
+        Parameters persist and are always valid."""
+        if self.id >= self.tape[].n_params and self.gen != self.tape[].gen:
+            raise Error(
+                "FTensor: recorded before the last reset() — its slot now"
+                " holds another node (keep parameters, re-record activations)"
+            )
+        return self.id
 
     # ── shape and values ─────────────────────────────────────────────────
     def rows(self) -> Int:
@@ -312,18 +354,18 @@ struct FTensor(ImplicitlyCopyable, Writable):
 
     def values(self) raises -> List[Scalar[DT]]:
         """Every value, row-major, on the host (a GPU tape synchronises)."""
-        self.tape[].download_val(self.id)
+        self.tape[].download_val(self._vid())
         var out = List[Scalar[DT]]()
-        var p = self.tape[].val_ptr(self.id)
+        var p = self.tape[].val_ptr(self._vid())
         for k in range(self.size()):
             out.append(p[unsafe_offset=k])
         return out^
 
     def grads(self) raises -> List[Scalar[DT]]:
         """Every gradient element (after `backward`), on the host."""
-        self.tape[].download_grad(self.id)
+        self.tape[].download_grad(self._vid())
         var out = List[Scalar[DT]]()
-        var p = self.tape[].grad_ptr(self.id)
+        var p = self.tape[].grad_ptr(self._vid())
         for k in range(self.size()):
             out.append(p[unsafe_offset=k])
         return out^
@@ -339,18 +381,18 @@ struct FTensor(ImplicitlyCopyable, Writable):
     def value(self, k: Int) raises -> Scalar[DT]:
         """Flat (row-major) element `k`. On a GPU tape this downloads the
         whole tensor: read many through `values()`."""
-        self.tape[].download_val(self.id)
-        return self.tape[].val_ptr(self.id)[unsafe_offset=k]
+        self.tape[].download_val(self._vid())
+        return self.tape[].val_ptr(self._vid())[unsafe_offset=k]
 
     def grad(self, k: Int) raises -> Scalar[DT]:
         """Flat element `k` of the gradient (after `backward`)."""
-        self.tape[].download_grad(self.id)
-        return self.tape[].grad_ptr(self.id)[unsafe_offset=k]
+        self.tape[].download_grad(self._vid())
+        return self.tape[].grad_ptr(self._vid())[unsafe_offset=k]
 
     def set_value(self, k: Int, v: Scalar[DT]) raises:
-        self.tape[].download_val(self.id)
-        self.tape[].val_ptr(self.id)[unsafe_offset=k] = v
-        self.tape[].upload_val(self.id)
+        self.tape[].download_val(self._vid())
+        self.tape[].val_ptr(self._vid())[unsafe_offset=k] = v
+        self.tape[].upload_val(self._vid())
 
     def write_to(self, mut writer: Some[Writer]):
         writer.write("FTensor[", self.rows(), ", ", self.cols(), "](")
@@ -369,41 +411,41 @@ struct FTensor(ImplicitlyCopyable, Writable):
 
     # ── tensor ⊕ tensor (numpy broadcasting) ─────────────────────────────
     def __add__(self, other: Self) raises -> Self:
-        return self._new(self.tape[].binary[OP_ADD](self.id, other.id))
+        return self._new(self.tape[].binary[OP_ADD](self._vid(), other._vid()))
 
     def __sub__(self, other: Self) raises -> Self:
-        return self._new(self.tape[].binary[OP_SUB](self.id, other.id))
+        return self._new(self.tape[].binary[OP_SUB](self._vid(), other._vid()))
 
     def __mul__(self, other: Self) raises -> Self:
-        return self._new(self.tape[].binary[OP_MUL](self.id, other.id))
+        return self._new(self.tape[].binary[OP_MUL](self._vid(), other._vid()))
 
     def __truediv__(self, other: Self) raises -> Self:
-        return self._new(self.tape[].binary[OP_DIV](self.id, other.id))
+        return self._new(self.tape[].binary[OP_DIV](self._vid(), other._vid()))
 
     def __matmul__(self, other: Self) raises -> Self:
-        return self._new(self.tape[].matmul(self.id, other.id))
+        return self._new(self.tape[].matmul(self._vid(), other._vid()))
 
     # ── tensor ⊕ scalar ──────────────────────────────────────────────────
     def __add__(self, c: Scalar[DT]) raises -> Self:
-        return self._new(self.tape[].scalar_op[OP_SHIFT](self.id, c))
+        return self._new(self.tape[].scalar_op[OP_SHIFT](self._vid(), c))
 
     def __radd__(self, c: Scalar[DT]) raises -> Self:
         return self + c
 
     def __sub__(self, c: Scalar[DT]) raises -> Self:
-        return self._new(self.tape[].scalar_op[OP_SHIFT](self.id, -c))
+        return self._new(self.tape[].scalar_op[OP_SHIFT](self._vid(), -c))
 
     def __rsub__(self, c: Scalar[DT]) raises -> Self:
-        return self._new(self.tape[].scalar_op[OP_RSUBC](self.id, c))
+        return self._new(self.tape[].scalar_op[OP_RSUBC](self._vid(), c))
 
     def __mul__(self, c: Scalar[DT]) raises -> Self:
-        return self._new(self.tape[].scalar_op[OP_SCALE](self.id, c))
+        return self._new(self.tape[].scalar_op[OP_SCALE](self._vid(), c))
 
     def __rmul__(self, c: Scalar[DT]) raises -> Self:
         return self * c
 
     def __truediv__(self, c: Scalar[DT]) raises -> Self:
-        return self._new(self.tape[].scalar_op[OP_DIVC](self.id, c))
+        return self._new(self.tape[].scalar_op[OP_DIVC](self._vid(), c))
 
     def __neg__(self) raises -> Self:
         return self * -1.0
@@ -420,46 +462,46 @@ struct FTensor(ImplicitlyCopyable, Writable):
     # ── shape ops, reductions ────────────────────────────────────────────
     def T(self) raises -> Self:
         """The transpose (`x.T()`: Mojo has no properties)."""
-        return self._new(self.tape[].transpose(self.id))
+        return self._new(self.tape[].transpose(self._vid()))
 
     def sum(self) raises -> Self:
-        return self._new(self.tape[].reduce[OP_SUM](self.id))
+        return self._new(self.tape[].reduce[OP_SUM](self._vid()))
 
     def mean(self) raises -> Self:
-        return self._new(self.tape[].reduce[OP_MEAN](self.id))
+        return self._new(self.tape[].reduce[OP_MEAN](self._vid()))
 
     def sum_rows(self) raises -> Self:
         """`[R, C] -> [1, C]`."""
-        return self._new(self.tape[].sum_rows(self.id))
+        return self._new(self.tape[].sum_rows(self._vid()))
 
     # ── activations (the comptime nn's `ElementOp`s) ─────────────────────
     def relu(self) raises -> Self:
-        return self._new(self.tape[].elementwise(self.id, EW_RELU))
+        return self._new(self.tape[].elementwise(self._vid(), EW_RELU))
 
     def tanh(self) raises -> Self:
-        return self._new(self.tape[].elementwise(self.id, EW_TANH))
+        return self._new(self.tape[].elementwise(self._vid(), EW_TANH))
 
     def sigmoid(self) raises -> Self:
-        return self._new(self.tape[].elementwise(self.id, EW_SIGMOID))
+        return self._new(self.tape[].elementwise(self._vid(), EW_SIGMOID))
 
     def gelu(self) raises -> Self:
-        return self._new(self.tape[].elementwise(self.id, EW_GELU))
+        return self._new(self.tape[].elementwise(self._vid(), EW_GELU))
 
     def gelu_tanh(self) raises -> Self:
-        return self._new(self.tape[].elementwise(self.id, EW_GELU_TANH))
+        return self._new(self.tape[].elementwise(self._vid(), EW_GELU_TANH))
 
     def mish(self) raises -> Self:
-        return self._new(self.tape[].elementwise(self.id, EW_MISH))
+        return self._new(self.tape[].elementwise(self._vid(), EW_MISH))
 
     def swish(self) raises -> Self:
-        return self._new(self.tape[].elementwise(self.id, EW_SWISH))
+        return self._new(self.tape[].elementwise(self._vid(), EW_SWISH))
 
     def elu(self) raises -> Self:
-        return self._new(self.tape[].elementwise(self.id, EW_ELU))
+        return self._new(self.tape[].elementwise(self._vid(), EW_ELU))
 
     # ── autodiff ─────────────────────────────────────────────────────────
     def backward(self) raises:
-        self.tape[].backward(self.id)
+        self.tape[].backward(self._vid())
 
 
 struct FModule[M: Module](ImplicitlyCopyable):
@@ -474,7 +516,7 @@ struct FModule[M: Module](ImplicitlyCopyable):
         self.id = id
 
     def __call__(self, x: FTensor) raises -> FTensor:
-        return FTensor(self.tape, self.tape[].module_call(self.id, x.id))
+        return FTensor(self.tape, self.tape[].module_call(self.id, x._vid()))
 
     def get(mut self) -> ref[self] Self.M:
         """The module, owned by the tape. The reference's origin is THIS
@@ -485,3 +527,25 @@ struct FModule[M: Module](ImplicitlyCopyable):
         return self.tape[].mods[self.id].state.unsafe_bitcast[
             Self.M
         ]().unsafe_origin_cast[origin_of(self)]()[]
+
+
+struct NoGrad:
+    """The guard `Tape.no_grad()` returns: gradients off inside the `with`,
+    restored to what they were on the way out."""
+
+    var tape: ArcPointer[TapeData]
+    var was_on: Bool
+
+    def __init__(out self, tape: ArcPointer[TapeData]):
+        self.tape = tape
+        self.was_on = tape[].grad_on
+
+    def __enter__(self):
+        self.tape[].grad_on = False
+
+    def __exit__(self):
+        self.tape[].grad_on = self.was_on
+
+    def __exit__(self, err: Error) -> Bool:
+        self.tape[].grad_on = self.was_on
+        return False
