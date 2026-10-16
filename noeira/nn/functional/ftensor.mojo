@@ -28,6 +28,7 @@ from noeira.nn.core.param import (
     IsParamVisitorRef,
     ParamWalkable,
 )
+from noeira.cuda.graph import CUDAGraph
 from .gpu import gpu_copy
 from .module_op import make_entry
 from .tape import (
@@ -115,6 +116,47 @@ struct Tape(ImplicitlyCopyable, ParamWalkable):
             self.data[].walk_states(r, ctx, prefix)
         else:
             raise Error("Tape.for_each_state: drive it through a ParamVisitorRef")
+
+    # ── CUDA graph capture (NVIDIA) ──────────────────────────────────────
+    #
+    # A steady-state step re-records the same nodes into the same slots, so
+    # every buffer address is the same each step: the step can be captured
+    # ONCE and replayed. Run it eagerly at least once first (slots, scratch
+    # and cuBLASLt plans are created on the first call; capture forbids
+    # allocation). Inside the captured step: no host reads (`item`,
+    # `values`) and no host inputs — feed `input_device` from a buffer you
+    # refill between replays. The optimizer stays outside (its bias
+    # correction is a host-side scalar per step).
+    #
+    #     step(tape)                      # eager: allocates
+    #     tape.capture_begin(); step(tape); tape.capture_end()
+    #     for …: refill(src); tape.replay()
+    #
+    # Off NVIDIA `capture_begin/end` run the step eagerly and `captured()`
+    # stays False: check it and run the step yourself.
+
+    def capture_begin(self) raises:
+        if not self.data[].ctx:
+            raise Error("Tape.capture_begin: a CPU tape")
+        self.data[].graph = CUDAGraph(self.data[].dctx())
+        self.data[].graph.value().begin_capture()
+
+    def capture_end(self) raises:
+        self.data[].graph.value().end_capture()
+
+    def captured(self) -> Bool:
+        return Bool(self.data[].graph) and self.data[].graph.value().is_captured()
+
+    def replay(self) raises:
+        """Re-run the captured step on the context's own stream: ordered
+        after whatever was enqueued before (an input refill) and before what
+        comes after (a read, an optimizer step) with no extra sync."""
+        if not self.captured():
+            raise Error(
+                "Tape.replay: nothing captured (capture is NVIDIA-only —"
+                " run the step eagerly when `captured()` is False)"
+            )
+        self.data[].graph.value().replay_on_mojo_stream()
 
     def synchronize(self) raises:
         if self.data[].ctx:

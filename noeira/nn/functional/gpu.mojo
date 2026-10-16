@@ -37,6 +37,7 @@ from linalg.matmul import matmul as max_matmul
 from noeira.nn.constants import DT
 from noeira.nn.core.element_op import ElementOp
 from noeira.nn.core.cublas_gemm import cublas_gemm, cublas_tf32
+from noeira.nn.core.cublaslt_gemm import cublaslt_gemm, EPI_BIAS
 from .opcodes import *
 
 
@@ -325,6 +326,73 @@ def gpu_ew_bwd[OP: ElementOp, ACC: Bool](
     ctx.enqueue_function[_ew_bwd_kernel[OP, ACC]](
         ga, go, x, y, Int64(n), grid_dim=_grid(n), block_dim=TPB
     )
+
+
+# ── fused linear: bias + activation epilogue, activation gate ────────────
+def _bias_act_kernel[OP: ElementOp, HAS_ACT: Bool](
+    o: P, bias: P, z: P, m_: Int64, n_: Int64
+):
+    """`o = act(o + bias)` in place over a GEMM's [m, n] output, saving the
+    pre-activation `z` when the activation's backward needs its INPUT — the
+    arithmetic of `LinearAct`'s `_bias_act_cache_kernel` (fp32 path)."""
+    var n = Int(n_)
+    var t = Int(global_idx.x)
+    if t >= Int(m_) * n:
+        return
+    var zz = o[unsafe_offset=t] + bias[unsafe_offset=t % n]
+    comptime if HAS_ACT:
+        comptime if not OP.owns_cache:
+            z[unsafe_offset=t] = zz
+        o[unsafe_offset=t] = OP.forward_scalar(zz)
+    else:
+        o[unsafe_offset=t] = zz
+
+
+def gpu_bias_act[OP: ElementOp, HAS_ACT: Bool](
+    ctx: DeviceContext, o: DeviceBuffer[DT], bias: DeviceBuffer[DT],
+    z: DeviceBuffer[DT], m: Int, n: Int,
+) raises:
+    ctx.enqueue_function[_bias_act_kernel[OP, HAS_ACT]](
+        o, bias, z, Int64(m), Int64(n), grid_dim=_grid(m * n), block_dim=TPB
+    )
+
+
+def _act_gate_kernel[OP: ElementOp](g: P, y: P, z: P, n: Int64):
+    """`g = act'(·) ⊙ g` in place: the gradient of the PRE-activation, from
+    the output's. `y` for an output-cache op, `z` otherwise."""
+    var k = Int(global_idx.x)
+    if k >= Int(n):
+        return
+    var cache = y[unsafe_offset=k] if OP.owns_cache else z[unsafe_offset=k]
+    g[unsafe_offset=k] = OP.backward_scalar(cache, g[unsafe_offset=k])
+
+
+def gpu_act_gate[OP: ElementOp](
+    ctx: DeviceContext, g: DeviceBuffer[DT], y: DeviceBuffer[DT],
+    z: DeviceBuffer[DT], n: Int,
+) raises:
+    ctx.enqueue_function[_act_gate_kernel[OP]](
+        g, y, z, Int64(n), grid_dim=_grid(n), block_dim=TPB
+    )
+
+
+def gpu_linear_lt_bias(
+    ctx: DeviceContext, o: DeviceBuffer[DT], x: DeviceBuffer[DT],
+    w: DeviceBuffer[DT], bias: DeviceBuffer[DT], m: Int, n: Int, k: Int,
+) raises:
+    """NVIDIA: `o = x @ w + bias` in ONE launch, the bias in cuBLASLt's
+    epilogue — `Linear`'s forward, at its precision rule."""
+    comptime if has_nvidia_gpu_accelerator():
+        if cublas_tf32(m, n, k):
+            cublaslt_gemm[False, False, DT, DT, True](
+                ctx, o, x, w, m, n, k, EPI_BIAS, bias=Int(bias.unsafe_ptr())
+            )
+        else:
+            cublaslt_gemm[False, False, DT, DT, False](
+                ctx, o, x, w, m, n, k, EPI_BIAS, bias=Int(bias.unsafe_ptr())
+            )
+    else:
+        raise Error("gpu_linear_lt_bias: NVIDIA only")
 
 
 # ── reductions ───────────────────────────────────────────────────────────

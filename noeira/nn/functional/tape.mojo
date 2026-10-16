@@ -49,7 +49,13 @@ from noeira.nn.core.param import ParamVisitorRef
 from noeira.nn.core.walkers import join_name
 from .opcodes import *
 from .module_op import ModEntry
+from std.sys import has_nvidia_gpu_accelerator
+from noeira.cuda.graph import CUDAGraph
+from noeira.nn.primitives.linear import enqueue_bias_grad
 from .gpu import (
+    gpu_bias_act,
+    gpu_act_gate,
+    gpu_linear_lt_bias,
     gpu_binary,
     gpu_binary_bwd,
     gpu_scalar,
@@ -77,6 +83,9 @@ comptime DBuf = DeviceBuffer[DT]
 struct Node(Movable):
     var val: Tensor
     var grad: Tensor
+    var aux: Tensor
+    """`OP_LINEAR`'s pre-activation, kept when its activation's backward
+    reads its INPUT (ReLU, GELU, …); empty otherwise."""
     var m: Tensor
     var v: Tensor
     """A parameter's optimizer moments, allocated by the optimizer on its
@@ -87,6 +96,8 @@ struct Node(Movable):
     var sub: Int
     var a: Int
     var b: Int
+    var x3: Int
+    """A third input (`OP_LINEAR`'s bias); -1 otherwise."""
     var c: Scalar[DT]
     var rg: Bool
     """Requires grad: a parameter, an input asked for it, or anything
@@ -99,6 +110,7 @@ struct Node(Movable):
     def __init__(out self):
         self.val = Tensor()
         self.grad = Tensor()
+        self.aux = Tensor()
         self.m = Tensor()
         self.v = Tensor()
         self.rows = 0
@@ -107,6 +119,7 @@ struct Node(Movable):
         self.sub = 0
         self.a = -1
         self.b = -1
+        self.x3 = -1
         self.c = 0
         self.rg = False
         self.gfresh = False
@@ -129,6 +142,8 @@ struct TapeData(Movable):
 
     var mods: List[ModEntry]
     """Comptime nn modules the tape owns (`module_op.mojo`)."""
+    var graph: Optional[CUDAGraph]
+    """A captured step (`Tape.capture_begin/end`), NVIDIA only."""
 
     def __init__(out self, ctx: Optional[DeviceContext] = None):
         self.nodes = List[Node]()
@@ -140,6 +155,7 @@ struct TapeData(Movable):
         self.s3 = Tensor()
         self.s4 = Tensor()
         self.mods = List[ModEntry]()
+        self.graph = None
 
     def __deinit__(deinit self):
         for i in range(len(self.mods)):
@@ -250,6 +266,7 @@ struct TapeData(Movable):
         n.sub = 0
         n.a = a
         n.b = b
+        n.x3 = -1
         n.c = 0
         n.rg = rg
         n.gfresh = False
@@ -488,6 +505,190 @@ struct TapeData(Movable):
         )
         return o
 
+    # ── fused linear ─────────────────────────────────────────────────────
+    def linear(mut self, x: Int, w: Int, bias: Int, act: Int) raises -> Int:
+        """`act(x @ w + bias)` as ONE node — `Linear` / `LinearAct`'s
+        launches: on NVIDIA one cuBLASLt GEMM with the bias in its epilogue
+        (no activation), or a GEMM and one bias+activation kernel; the
+        backward is an activation gate, nn's own `enqueue_bias_grad` and the
+        two GEMMs. Unfused, the same layer is a GEMM, a bias kernel and an
+        activation kernel forward, and one more of each backward."""
+        var m = self.nodes[x].rows
+        var k = self.nodes[x].cols
+        var n = self.nodes[w].cols
+        if self.nodes[w].rows != k or self.nodes[bias].rows != 1 or self.nodes[bias].cols != n:
+            raise Error(
+                String("linear: x [", m, ", ", k, "], w [", self.nodes[w].rows,
+                       ", ", n, "], bias [", self.nodes[bias].rows, ", ",
+                       self.nodes[bias].cols, "]")
+            )
+        var rg = self.nodes[x].rg or self.nodes[w].rg or self.nodes[bias].rg
+        var o = self.new_node(m, n, OP_LINEAR, x, w, rg)
+        self.nodes[o].x3 = bias
+        self.nodes[o].sub = act
+        if act == EW_NONE:
+            self._lin_fwd[ReLUOp, False](o)
+        elif act == EW_RELU:
+            self._lin_fwd[ReLUOp, True](o)
+        elif act == EW_TANH:
+            self._lin_fwd[TanhOp, True](o)
+        elif act == EW_SIGMOID:
+            self._lin_fwd[SigmoidOp, True](o)
+        elif act == EW_GELU:
+            self._lin_fwd[GELUOp, True](o)
+        elif act == EW_GELU_TANH:
+            self._lin_fwd[GELUTanhOp, True](o)
+        elif act == EW_MISH:
+            self._lin_fwd[MishOp, True](o)
+        elif act == EW_SWISH:
+            self._lin_fwd[SwishOp, True](o)
+        elif act == EW_ELU:
+            self._lin_fwd[ELUOp, True](o)
+        else:
+            raise Error(String("linear: unknown activation ", act))
+        return o
+
+    def _lin_fwd[OP: ElementOp, HAS_ACT: Bool](mut self, o: Int) raises:
+        var x = self.nodes[o].a
+        var w = self.nodes[o].b
+        var bias = self.nodes[o].x3
+        var m = self.nodes[x].rows
+        var k = self.nodes[x].cols
+        var n = self.nodes[w].cols
+        comptime NEEDS_Z = HAS_ACT and not OP.owns_cache
+        if self.ctx:
+            var c = self.dctx()
+            comptime if has_nvidia_gpu_accelerator() and not HAS_ACT:
+                gpu_linear_lt_bias(
+                    c, self.dv(o), self.dv(x), self.dv(w), self.dv(bias), m, n, k
+                )
+                return
+            gpu_matmul(c, self.dv(o), self.dv(x), self.dv(w), m, n, k)
+            var z = self.dv(o)
+            comptime if NEEDS_Z:
+                self.nodes[o].aux.ensure_gpu(c, m * n)
+                z = self.nodes[o].aux.dev.value().create_sub_buffer[DT](0, m * n)
+            gpu_bias_act[OP, HAS_ACT](c, self.dv(o), self.dv(bias), z, m, n)
+            return
+        gemm_cpu_ptr[False, False](
+            m, n, k, 1.0,
+            rebind[Pointer[Float32, ImmutAnyOrigin]](self.val_ptr(x)), k,
+            rebind[Pointer[Float32, ImmutAnyOrigin]](self.val_ptr(w)), n,
+            0.0,
+            rebind[Pointer[Float32, MutAnyOrigin]](self.val_ptr(o)), n,
+        )
+        comptime if NEEDS_Z:
+            self.nodes[o].aux.ensure(m * n)
+        var po = self.val_ptr(o)
+        var pb = self.val_ptr(bias)
+        var pz = rebind[Ptr](self.nodes[o].aux.data.unsafe_ptr())
+        for i in range(m):
+            for j in range(n):
+                var t = i * n + j
+                var zz = po[unsafe_offset=t] + pb[unsafe_offset=j]
+                comptime if HAS_ACT:
+                    comptime if NEEDS_Z:
+                        pz[unsafe_offset=t] = zz
+                    po[unsafe_offset=t] = OP.forward_scalar(zz)
+                else:
+                    po[unsafe_offset=t] = zz
+
+    def _linear_vjp(mut self, o: Int) raises:
+        var act = self.nodes[o].sub
+        if act == EW_NONE:
+            self._lin_bwd[ReLUOp, False](o)
+        elif act == EW_RELU:
+            self._lin_bwd[ReLUOp, True](o)
+        elif act == EW_TANH:
+            self._lin_bwd[TanhOp, True](o)
+        elif act == EW_SIGMOID:
+            self._lin_bwd[SigmoidOp, True](o)
+        elif act == EW_GELU:
+            self._lin_bwd[GELUOp, True](o)
+        elif act == EW_GELU_TANH:
+            self._lin_bwd[GELUTanhOp, True](o)
+        elif act == EW_MISH:
+            self._lin_bwd[MishOp, True](o)
+        elif act == EW_SWISH:
+            self._lin_bwd[SwishOp, True](o)
+        elif act == EW_ELU:
+            self._lin_bwd[ELUOp, True](o)
+        else:
+            raise Error(String("linear: unknown activation ", act))
+
+    def _lin_bwd[OP: ElementOp, HAS_ACT: Bool](mut self, o: Int) raises:
+        """The output's gradient is gated IN PLACE to the pre-activation's
+        (nothing reads it after this node), then: bias, weight, input."""
+        var x = self.nodes[o].a
+        var w = self.nodes[o].b
+        var bias = self.nodes[o].x3
+        var m = self.nodes[x].rows
+        var k = self.nodes[x].cols
+        var n = self.nodes[w].cols
+        comptime NEEDS_Z = HAS_ACT and not OP.owns_cache
+        if self.ctx:
+            var c = self.dctx()
+            var go = self.dg(o)
+            comptime if HAS_ACT:
+                var z = self.dv(o)
+                comptime if NEEDS_Z:
+                    z = self.nodes[o].aux.dev.value().create_sub_buffer[DT](0, m * n)
+                gpu_act_gate[OP](c, go, self.dv(o), z, m * n)
+            if self.nodes[bias].rg:
+                var gb = self.dg(bias)
+                if self._take(bias) == False:
+                    fill_dev(gb, n, Scalar[DT](0), c)  # first arrival: from zero
+                enqueue_bias_grad[DT](c, go, gb, m, n, self.s3)
+            if self.nodes[w].rg:
+                var gw = self.dg(w)
+                var xv = self.dv(x)
+                var t1 = self._scratch1(m * k)
+                var t2 = self._scratch2(k * n)
+                if self._take(w):
+                    gpu_matmul_bwd_b[True](c, gw, xv, go, m, n, k, t1, t2)
+                else:
+                    gpu_matmul_bwd_b[False](c, gw, xv, go, m, n, k, t1, t2)
+            if self.nodes[x].rg:
+                var gx = self.dg(x)
+                var wv = self.dv(w)
+                var t2 = self._scratch2(m * k)
+                if self._take(x):
+                    gpu_matmul_bwd_a[True](c, gx, go, wv, m, n, k, t2)
+                else:
+                    gpu_matmul_bwd_a[False](c, gx, go, wv, m, n, k, t2)
+            return
+        var go = self.grad_ptr(o)
+        comptime if HAS_ACT:
+            var py = self.val_ptr(o)
+            var pz = rebind[Ptr](self.nodes[o].aux.data.unsafe_ptr())
+            for t in range(m * n):
+                var cache: Scalar[DT]
+                comptime if NEEDS_Z:
+                    cache = pz[unsafe_offset=t]
+                else:
+                    cache = py[unsafe_offset=t]
+                go[unsafe_offset=t] = OP.backward_scalar(cache, go[unsafe_offset=t])
+        if self.nodes[bias].rg:
+            var gb = self.grad_ptr(bias)
+            for i in range(m):
+                for j in range(n):
+                    gb[unsafe_offset=j] += go[unsafe_offset=i * n + j]
+        var gop = rebind[Pointer[Float32, ImmutAnyOrigin]](go)
+        if self.nodes[w].rg:
+            gemm_cpu_ptr[True, False](
+                k, n, m, 1.0,
+                rebind[Pointer[Float32, ImmutAnyOrigin]](self.val_ptr(x)), k,
+                gop, n, 1.0,
+                rebind[Pointer[Float32, MutAnyOrigin]](self.grad_ptr(w)), n,
+            )
+        if self.nodes[x].rg:
+            gemm_cpu_ptr[False, True](
+                m, k, n, 1.0, gop, n,
+                rebind[Pointer[Float32, ImmutAnyOrigin]](self.val_ptr(w)), n,
+                1.0,
+                rebind[Pointer[Float32, MutAnyOrigin]](self.grad_ptr(x)), k,
+            )
+
     def scalar_op[OP: Int](mut self, a: Int, c: Scalar[DT]) raises -> Int:
         var o = self.new_node(
             self.nodes[a].rows, self.nodes[a].cols, OP, a, -1, self.nodes[a].rg
@@ -663,6 +864,8 @@ struct TapeData(Movable):
             self._ew_vjp(o, a)
         elif op == OP_MODULE:
             self._module_vjp(o, a)
+        elif op == OP_LINEAR:
+            self._linear_vjp(o)
         elif op == OP_SUM or op == OP_MEAN:
             if not self.nodes[a].rg:
                 return
