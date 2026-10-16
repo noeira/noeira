@@ -72,7 +72,7 @@ def _bin_fwd_kernel[OP: Int](
 
 
 @always_inline
-def _bin_term[OP: Int, WHICH: Int](
+def bin_term[OP: Int, WHICH: Int](
     g: Scalar[DT], x: Scalar[DT], y: Scalar[DT]
 ) -> Scalar[DT]:
     """Input `WHICH`'s share of the output gradient `g` at one element, `x`
@@ -116,7 +116,7 @@ def _bin_bwd_sum[OP: Int, WHICH: Int](
         for j in range(j0, j1):
             var ka = (i if ra > 1 else 0) * ca + (j if ca > 1 else 0)
             var kb = (i if rb > 1 else 0) * cb + (j if cb > 1 else 0)
-            acc += _bin_term[OP, WHICH](
+            acc += bin_term[OP, WHICH](
                 go[unsafe_offset=i * c + j], a[unsafe_offset=ka],
                 b[unsafe_offset=kb],
             )

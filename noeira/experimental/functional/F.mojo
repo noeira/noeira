@@ -7,6 +7,9 @@ the bias row added — the same arithmetic, so the same bits.
 """
 
 from .ftensor import FTensor
+from .nd import nd_concat, nd_gather
+from .extra import ex_cross_entropy, ex_dropout
+from noeira.nn.constants import DT
 from .opcodes import (
     EW_NONE, EW_RELU, EW_TANH, EW_SIGMOID, EW_GELU, EW_GELU_TANH, EW_MISH,
     EW_SWISH, EW_ELU,
@@ -63,3 +66,40 @@ def sigmoid(x: FTensor) raises -> FTensor:
 
 def gelu(x: FTensor) raises -> FTensor:
     return x.gelu()
+
+
+def concat(a: FTensor, b: FTensor, axis: Int) raises -> FTensor:
+    """`a` then `b` along `axis`; every other dim equal."""
+    return a._new(nd_concat(a.tape[], a._vid(), b._vid(), axis))
+
+
+def gather(table: FTensor, idx: FTensor) raises -> FTensor:
+    """Rows of `table [V, D]` at `idx` (any shape up to rank 3, integer
+    values held as floats) -> `idx.shape + [D]`: an embedding lookup.
+    Repeated indices add their gradients. Out of range: raises on the CPU,
+    NaN on the GPU."""
+    return table._new(nd_gather(table.tape[], table._vid(), idx._vid()))
+
+
+def cross_entropy(logits: FTensor, targets: FTensor) raises -> FTensor:
+    """Mean over rows of −log softmax(logits)[target], fused: `logits`'
+    rows are every axis but the last (`[B, T, C]` is `B*T` rows), `targets`
+    holds one class index per row (as floats)."""
+    return logits._new(ex_cross_entropy(logits.tape[], logits._vid(), targets._vid()))
+
+
+def dropout(x: FTensor, p: Scalar[DT], seed: Int, training: Bool = True) raises -> FTensor:
+    """Zero each element with probability `p`, scale the rest by 1/(1−p).
+    The mask is a pure function of (`seed`, element index): pass a new seed
+    every step; CPU and GPU draw the same mask. `training=False`: `x`."""
+    if not training or p == 0:
+        return x
+    return x._new(ex_dropout(x.tape[], x._vid(), p, seed))
+
+
+def softmax(x: FTensor) raises -> FTensor:
+    return x.softmax()
+
+
+def log_softmax(x: FTensor) raises -> FTensor:
+    return x.log_softmax()

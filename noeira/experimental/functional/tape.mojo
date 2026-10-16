@@ -48,7 +48,9 @@ from noeira.nn.primitives.ops.elu_op import ELUOp
 from noeira.nn.core.param import ParamVisitorRef
 from noeira.nn.core.walkers import join_name
 from .opcodes import *
-from .module_op import ModEntry
+from .module_op import ModEntry, TP
+from .nd import nd_binary, nd_bmm, nd_binary_vjp, nd_vjp
+from .extra import ExpOp, LogOp, SqrtOp
 from std.sys import has_nvidia_gpu_accelerator
 from noeira.cuda.graph import CUDAGraph
 from noeira.nn.primitives.linear import enqueue_bias_grad
@@ -92,6 +94,21 @@ struct Node(Movable):
     first step (nn's `Adam` via `ParamVisitorRef`); empty otherwise."""
     var rows: Int
     var cols: Int
+    """The 2-D view every op reads: `rows` = the product of every leading
+    dim, `cols` = the last. A rank-3 `[B, T, D]` is `[B*T, D]` here, which is
+    what makes `x @ w`, `F.linear` and a module work on it unchanged."""
+    var rank: Int
+    var d0: Int
+    var d1: Int
+    var d2: Int
+    var d3: Int
+    """The N-d shape (rank <= 4), LEFT-padded with 1s to four dims: a rank-2
+    `[r, c]` is `(1, 1, r, c)`. `nd.mojo` indexes in these."""
+    var i0: Int
+    var i1: Int
+    var i2: Int
+    var i3: Int
+    """Integer attributes of an N-d op (an axis, a start, a permutation)."""
     var op: Int
     var sub: Int
     var a: Int
@@ -99,6 +116,8 @@ struct Node(Movable):
     var x3: Int
     """A third input (`OP_LINEAR`'s bias); -1 otherwise."""
     var c: Scalar[DT]
+    var c2: Scalar[DT]
+    """A second scalar attribute (clamp's upper bound)."""
     var rg: Bool
     """Requires grad: a parameter, an input asked for it, or anything
     computed from one. `backward` skips every node without it."""
@@ -117,18 +136,55 @@ struct Node(Movable):
         self.v = Tensor()
         self.rows = 0
         self.cols = 0
+        self.rank = 2
+        self.d0 = 1
+        self.d1 = 1
+        self.d2 = 0
+        self.d3 = 0
+        self.i0 = 0
+        self.i1 = 0
+        self.i2 = 0
+        self.i3 = 0
         self.op = OP_LEAF
         self.sub = 0
         self.a = -1
         self.b = -1
         self.x3 = -1
         self.c = 0
+        self.c2 = 0
         self.rg = False
         self.name = String("")
         self.gfresh = False
 
     def size(self) -> Int:
         return self.rows * self.cols
+
+    def dim(self, p: Int) -> Int:
+        """Padded dim `p` in 0..3."""
+        if p == 0:
+            return self.d0
+        elif p == 1:
+            return self.d1
+        elif p == 2:
+            return self.d2
+        return self.d3
+
+    def set_dims(mut self, d0: Int, d1: Int, d2: Int, d3: Int, rank: Int):
+        """The N-d shape; the 2-D view (`rows`, `cols`) follows. The buffer
+        must already hold `d0*d1*d2*d3` elements (the caller sized it)."""
+        self.d0 = d0
+        self.d1 = d1
+        self.d2 = d2
+        self.d3 = d3
+        self.rank = rank
+        self.rows = d0 * d1 * d2
+        self.cols = d3
+
+    def shape(self) -> List[Int]:
+        var out = List[Int]()
+        for p in range(4 - self.rank, 4):
+            out.append(self.dim(p))
+        return out^
 
 
 struct TapeData(Movable):
@@ -140,6 +196,8 @@ struct TapeData(Movable):
     var s2: Tensor
     var s3: Tensor
     var s4: Tensor
+    var s5: Tensor
+    var s6: Tensor
     """Backward scratch (a transposed operand, a product before it
     is accumulated). Grown on demand, reused by every matmul."""
 
@@ -164,6 +222,8 @@ struct TapeData(Movable):
         self.s2 = Tensor()
         self.s3 = Tensor()
         self.s4 = Tensor()
+        self.s5 = Tensor()
+        self.s6 = Tensor()
         self.mods = List[ModEntry]()
         self.graph = None
         self.gen = 0
@@ -277,6 +337,15 @@ struct TapeData(Movable):
         ref n = self.nodes[i]
         n.rows = rows
         n.cols = cols
+        n.rank = 2
+        n.d0 = 1
+        n.d1 = 1
+        n.d2 = rows
+        n.d3 = cols
+        n.i0 = 0
+        n.i1 = 0
+        n.i2 = 0
+        n.i3 = 0
         n.op = op
         n.sub = 0
         n.a = a
@@ -380,6 +449,27 @@ struct TapeData(Movable):
                 for k in range(n):
                     v[unsafe_offset=k] -= lr * g[unsafe_offset=k]
 
+    # ── N-d shapes of the 2-D ops ────────────────────────────────────────
+    def like(mut self, o: Int, a: Int):
+        """Node `o` takes `a`'s N-d shape (an elementwise op's output)."""
+        ref s = self.nodes[a]
+        var d0 = s.d0
+        var d1 = s.d1
+        var d2 = s.d2
+        var d3 = s.d3
+        var r = s.rank
+        self.nodes[o].set_dims(d0, d1, d2, d3, r)
+
+    def lead_then(mut self, o: Int, a: Int, last: Int):
+        """Node `o` takes `a`'s leading dims and a new last one: what
+        `x @ w`, `F.linear` and a module make of a rank-3 `x`."""
+        ref s = self.nodes[a]
+        var d0 = s.d0
+        var d1 = s.d1
+        var d2 = s.d2
+        var r = s.rank
+        self.nodes[o].set_dims(d0, d1, d2, last, r)
+
     # ── comptime modules ─────────────────────────────────────────────────
     def _vref(mut self, i: Int) -> ref[MutAnyOrigin] Tensor:
         """Node `i`'s value storage, origin erased — a module call needs two
@@ -401,15 +491,46 @@ struct TapeData(Movable):
         self.mods.append(e^)
         return len(self.mods) - 1
 
-    def module_call(mut self, mid: Int, a: Int) raises -> Int:
-        var b = self.mods[mid].batch
-        var ind = self.mods[mid].in_dim
-        if self.nodes[a].rows != b or self.nodes[a].cols != ind:
+    def _tp(mut self, i: Int, grad: Bool) -> TP:
+        """Node `i`'s value (or gradient) storage as a module-call slot."""
+        if grad:
+            return Pointer(to=self.nodes[i].grad).unsafe_origin_cast[MutUntrackedOrigin]()
+        return Pointer(to=self.nodes[i].val).unsafe_origin_cast[MutUntrackedOrigin]()
+
+    def _scratch_tp(mut self, k: Int) -> TP:
+        if k == 0:
+            return Pointer(to=self.s4).unsafe_origin_cast[MutUntrackedOrigin]()
+        elif k == 1:
+            return Pointer(to=self.s5).unsafe_origin_cast[MutUntrackedOrigin]()
+        return Pointer(to=self.s6).unsafe_origin_cast[MutUntrackedOrigin]()
+
+    def module_call(mut self, mid: Int, inputs: List[Int]) raises -> Int:
+        """One node for module `mid` on `inputs` (its ARITY of them), with
+        the thunks of the batch the inputs' rows name."""
+        var ar = self.mods[mid].arity
+        if len(inputs) != ar:
             raise Error(
-                String("module ", mid, ": built for [", b, ", ", ind,
-                       "], called on [", self.nodes[a].rows, ", ",
-                       self.nodes[a].cols, "]")
+                String("module `", self.mods[mid].name, "`: ", ar,
+                       " inputs, called with ", len(inputs))
             )
+        var rows = self.nodes[inputs[0]].rows
+        var bi = self.mods[mid].batch_index(rows)
+        if bi < 0:
+            var bs = String("")
+            for k in range(len(self.mods[mid].batches)):
+                bs += String(" ", self.mods[mid].batches[k])
+            raise Error(
+                String("module `", self.mods[mid].name, "`: batch ", rows,
+                       " — it serves", bs, " (tape.module[B, B2, B3])")
+            )
+        for k in range(ar):
+            var x = inputs[k]
+            if self.nodes[x].rows != rows or self.nodes[x].cols != self.mods[mid].in_dims[k]:
+                raise Error(
+                    String("module `", self.mods[mid].name, "`: input ", k,
+                           " is [", self.nodes[x].rows, ", ", self.nodes[x].cols,
+                           "], expected [", rows, ", ", self.mods[mid].in_dims[k], "]")
+                )
         if self.mods[mid].used and self.grad_on:
             raise Error(
                 String("module `", self.mods[mid].name, "`: called twice"
@@ -418,40 +539,79 @@ struct TapeData(Movable):
                        " called any number of times)")
             )
         self.mods[mid].used = True
-        var o = self.new_node(b, self.mods[mid].out_dim, OP_MODULE, a, -1, True)
+        var o = self.new_node(
+            rows, self.mods[mid].out_dim, OP_MODULE, inputs[0],
+            inputs[1] if ar > 1 else -1, True,
+        )
+        self.lead_then(o, inputs[0], self.mods[mid].out_dim)
+        self.nodes[o].x3 = inputs[2] if ar > 2 else -1
         self.nodes[o].sub = mid
-        var f = self.mods[mid].fwd
+        self.nodes[o].i0 = bi
+        var f = self.mods[mid].fwds[bi]
         var st = self.mods[mid].state
         var c = self.ctx
-        f(st, self._vref(a), self._vref(o), c)
+        var x0 = self._tp(inputs[0], False)
+        var x1 = self._tp(inputs[1], False) if ar > 1 else x0
+        var x2 = self._tp(inputs[2], False) if ar > 2 else x0
+        f(st, x0, x1, x2, self._tp(o, False), c)
         return o
 
-    def _module_vjp(mut self, o: Int, a: Int) raises:
-        """The module's `vjp` WRITES its input gradient. Straight into the
-        input's gradient when it is the first to arrive (GPU, still fresh);
-        otherwise into scratch, then added."""
+    def _module_vjp(mut self, o: Int) raises:
+        """The module's `vjp` WRITES every input gradient. Straight into an
+        input's gradient when it is the first to arrive (GPU, still fresh)
+        and the node is not passed twice in this call; otherwise into a
+        scratch slot, then added (or, first on the GPU, copied)."""
         var mid = self.nodes[o].sub
-        var f = self.mods[mid].vjp
+        var bi = self.nodes[o].i0
+        var ar = self.mods[mid].arity
+        var ins = List[Int]()
+        ins.append(self.nodes[o].a)
+        if ar > 1:
+            ins.append(self.nodes[o].b)
+        if ar > 2:
+            ins.append(self.nodes[o].x3)
+        var direct = List[Bool]()
+        for k in range(ar):
+            var dup = False
+            for q in range(ar):
+                if q != k and ins[q] == ins[k]:
+                    dup = True
+            var x = ins[k]
+            direct.append(
+                Bool(self.ctx) and self.nodes[x].rg and self.nodes[x].gfresh and not dup
+            )
+        var slots = List[TP]()
+        for k in range(ar):
+            if direct[k]:
+                self.nodes[ins[k]].gfresh = False
+                slots.append(self._tp(ins[k], True))
+            else:
+                slots.append(self._scratch_tp(k))
+        var f = self.mods[mid].vjps[bi]
         var st = self.mods[mid].state
         var c = self.ctx
-        var direct = Bool(c) and self.nodes[a].rg and self.nodes[a].gfresh
-        if direct:
-            self.nodes[a].gfresh = False
-            f(st, self._vref(a), self._gref(o), self._gref(a), c)
-            return
-        f(st, self._vref(a), self._gref(o), self._s4ref(), c)
-        if not self.nodes[a].rg:
-            return
-        var n = self.nodes[a].size()
-        if self.ctx:
-            var src = self.s4.dev.value().create_sub_buffer[DT](0, n)
-            gpu_axpy(self.dctx(), self.dg(a), src, n, 1.0)
-            self.nodes[a].gfresh = False
-        else:
-            var ga = self.grad_ptr(a)
-            var gs = self.s4.data.unsafe_ptr()
-            for k in range(n):
-                ga[unsafe_offset=k] += gs[unsafe_offset=k]
+        var x0 = self._tp(ins[0], False)
+        var x1 = self._tp(ins[1], False) if ar > 1 else x0
+        var x2 = self._tp(ins[2], False) if ar > 2 else x0
+        var g1 = slots[1] if ar > 1 else slots[0]
+        var g2 = slots[2] if ar > 2 else slots[0]
+        f(st, x0, x1, x2, self._tp(o, True), slots[0], g1, g2, c)
+        for k in range(ar):
+            var x = ins[k]
+            if direct[k] or not self.nodes[x].rg:
+                continue
+            var n = self.nodes[x].size()
+            if self.ctx:
+                var src = slots[k][].dev.value().create_sub_buffer[DT](0, n)
+                if self._take(x):
+                    gpu_axpy(self.dctx(), self.dg(x), src, n, 1.0)
+                else:
+                    gpu_copy(self.dctx(), self.dg(x), src, n)
+            else:
+                var gx = self.grad_ptr(x)
+                var gs = slots[k][].data.unsafe_ptr()
+                for e in range(n):
+                    gx[unsafe_offset=e] += gs[unsafe_offset=e]
 
     def _walk_order(self) -> List[Int]:
         """Every tape-level entry — parameter `i` as `i`, module `j` as
@@ -514,6 +674,8 @@ struct TapeData(Movable):
 
     # ── forward ops ──────────────────────────────────────────────────────
     def binary[OP: Int](mut self, a: Int, b: Int) raises -> Int:
+        if self.nodes[a].rank > 2 or self.nodes[b].rank > 2:
+            return nd_binary[OP](self, a, b)
         var ra = self.nodes[a].rows
         var ca = self.nodes[a].cols
         var rb = self.nodes[b].rows
@@ -556,6 +718,8 @@ struct TapeData(Movable):
         return o
 
     def matmul(mut self, a: Int, b: Int) raises -> Int:
+        if self.nodes[b].rank > 2:
+            return nd_bmm(self, a, b)
         var m = self.nodes[a].rows
         var k = self.nodes[a].cols
         var n = self.nodes[b].cols
@@ -567,6 +731,7 @@ struct TapeData(Movable):
         var o = self.new_node(
             m, n, OP_MATMUL, a, b, self.nodes[a].rg or self.nodes[b].rg
         )
+        self.lead_then(o, a, n)
         if self.ctx:
             gpu_matmul(
                 self.dctx(), self.dv(o), self.dv(a), self.dv(b), m, n, k
@@ -600,6 +765,7 @@ struct TapeData(Movable):
             )
         var rg = self.nodes[x].rg or self.nodes[w].rg or self.nodes[bias].rg
         var o = self.new_node(m, n, OP_LINEAR, x, w, rg)
+        self.lead_then(o, x, n)
         self.nodes[o].x3 = bias
         self.nodes[o].sub = act
         if act == EW_NONE:
@@ -775,6 +941,7 @@ struct TapeData(Movable):
         var o = self.new_node(
             self.nodes[a].rows, self.nodes[a].cols, OP, a, -1, self.nodes[a].rg
         )
+        self.like(o, a)
         self.nodes[o].c = c
         if self.ctx:
             gpu_scalar[OP](
@@ -800,6 +967,7 @@ struct TapeData(Movable):
             self.nodes[a].rows, self.nodes[a].cols, OP_EW, a, -1,
             self.nodes[a].rg,
         )
+        self.like(o, a)
         self.nodes[o].sub = sub
         if sub == EW_RELU:
             self._ew_fwd_one[ReLUOp](a, o)
@@ -817,6 +985,12 @@ struct TapeData(Movable):
             self._ew_fwd_one[SwishOp](a, o)
         elif sub == EW_ELU:
             self._ew_fwd_one[ELUOp](a, o)
+        elif sub == EW_EXP:
+            self._ew_fwd_one[ExpOp](a, o)
+        elif sub == EW_LOG:
+            self._ew_fwd_one[LogOp](a, o)
+        elif sub == EW_SQRT:
+            self._ew_fwd_one[SqrtOp](a, o)
         else:
             raise Error(String("unknown elementwise op ", sub))
         return o
@@ -848,6 +1022,8 @@ struct TapeData(Movable):
         return o
 
     def sum_rows(mut self, a: Int) raises -> Int:
+        if self.nodes[a].rank > 2:
+            raise Error("sum_rows: rank 2 only — use sum(axis)")
         var r = self.nodes[a].rows
         var c = self.nodes[a].cols
         var o = self.new_node(1, c, OP_SUM_ROWS, a, -1, self.nodes[a].rg)
@@ -864,6 +1040,8 @@ struct TapeData(Movable):
         return o
 
     def transpose(mut self, a: Int) raises -> Int:
+        if self.nodes[a].rank > 2:
+            raise Error("transpose: rank 2 only — use permute / transpose(i, j)")
         var r = self.nodes[a].rows
         var c = self.nodes[a].cols
         var o = self.new_node(c, r, OP_TRANSPOSE, a, -1, self.nodes[a].rg)
@@ -929,7 +1107,16 @@ struct TapeData(Movable):
         var op = self.nodes[o].op
         var a = self.nodes[o].a
         var b = self.nodes[o].b
-        if op == OP_ADD:
+        var nd = (op >= OP_ADD and op <= OP_MATMUL) and (
+            self.nodes[a].rank > 2 or self.nodes[b].rank > 2
+        )
+        if nd and op == OP_MATMUL and self.nodes[b].rank <= 2:
+            nd = False  # a rank-3 x @ a rank-2 w is the 2-D GEMM
+        if nd:
+            nd_binary_vjp(self, o)
+        elif op >= OP_RESHAPE:
+            nd_vjp(self, o)
+        elif op == OP_ADD:
             self._bin_vjp[OP_ADD](o, a, b)
         elif op == OP_SUB:
             self._bin_vjp[OP_SUB](o, a, b)
@@ -950,7 +1137,7 @@ struct TapeData(Movable):
         elif op == OP_EW:
             self._ew_vjp(o, a)
         elif op == OP_MODULE:
-            self._module_vjp(o, a)
+            self._module_vjp(o)
         elif op == OP_LINEAR:
             self._linear_vjp(o)
         elif op == OP_SUM or op == OP_MEAN:
@@ -1174,6 +1361,12 @@ struct TapeData(Movable):
             self._ew_bwd_one[SwishOp](o, a)
         elif sub == EW_ELU:
             self._ew_bwd_one[ELUOp](o, a)
+        elif sub == EW_EXP:
+            self._ew_bwd_one[ExpOp](o, a)
+        elif sub == EW_LOG:
+            self._ew_bwd_one[LogOp](o, a)
+        elif sub == EW_SQRT:
+            self._ew_bwd_one[SqrtOp](o, a)
         else:
             raise Error(String("unknown elementwise op ", sub))
 
