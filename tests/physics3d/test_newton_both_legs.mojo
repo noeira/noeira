@@ -52,9 +52,7 @@ PRINTED. See that constant for why it is 1e-13 and not something rounder.
 Run: pixi run mojo run -I . tests/physics3d/test_newton_both_legs.mojo
 """
 
-from std.utils import IndexList
-from layout import Layout, RuntimeLayout
-from noeira.core.tiles import RowMajor
+from noeira.core.tiles import RowMajor, DYN1, DYN2, rl1, rl2
 from max.gpu.host import DeviceContext
 
 from noeira.physics3d.fields import (
@@ -116,8 +114,6 @@ comptime BATCH = 2
 # noise floor is a tolerance that admits the bug the test exists to catch.
 comptime AGREE_TOL = 1e-13
 
-comptime DYN1 = Layout.row_major[1]()
-comptime DYN2 = Layout.row_major[2]()
 
 
 struct Tally(Movable):
@@ -331,51 +327,31 @@ def solve_dynamic[
     copy — "one body, two models" would then be true of the source and false
     of the machine code.
     """
-    var rl_qpos = RuntimeLayout[DYN2].row_major(IndexList[2](BATCH, nq))
-    var rl_nv = RuntimeLayout[DYN2].row_major(IndexList[2](BATCH, nv))
-    var rl_b3 = RuntimeLayout[DYN2].row_major(IndexList[2](BATCH, nbody * 3))
-    var rl_b4 = RuntimeLayout[DYN2].row_major(IndexList[2](BATCH, nbody * 4))
-    var rl_con = RuntimeLayout[DYN2].row_major(
-        IndexList[2](BATCH, max_contacts * CONTACT_SIZE)
-    )
-    var rl_smeta = RuntimeLayout[DYN2].row_major(
-        IndexList[2](BATCH, METADATA_SIZE)
-    )
-    var rl_joint = RuntimeLayout[DYN2].row_major(
-        IndexList[2](njoint, MODEL_JOINT_SIZE)
-    )
-    var rl_body = RuntimeLayout[DYN2].row_major(
-        IndexList[2](nbody, MODEL_BODY_SIZE)
-    )
-    var rl_mmeta = RuntimeLayout[DYN1].row_major(IndexList[1](MODEL_META_SIZE))
-    var rl_trees = RuntimeLayout[DYN1].row_major(
-        IndexList[1](nv * MODEL_TREE_SIZE)
-    )
-    var rl_eq = RuntimeLayout[DYN2].row_major(
-        IndexList[2](nequality, MODEL_EQ_SIZE)
-    )
-    var rl_ten = RuntimeLayout[DYN2].row_major(
-        IndexList[2](ntendon, MODEL_TENDON_SIZE)
-    )
-    var rl_site = RuntimeLayout[DYN2].row_major(
-        IndexList[2](nsite, MODEL_SITE_SIZE)
-    )
-    var rl_geom_w = RuntimeLayout[DYN2].row_major(
-        IndexList[2](ngeom, MODEL_GEOM_SIZE)
-    )
-    var rl_bw = RuntimeLayout[DYN2].row_major(IndexList[2](nbody, 2))
-    var rl_dw = RuntimeLayout[DYN1].row_major(IndexList[1](nv))
-    var rl_cdof = RuntimeLayout[DYN2].row_major(IndexList[2](BATCH, nv * 6))
-    var rl_m = RuntimeLayout[DYN2].row_major(IndexList[2](BATCH, nv * nv))
-    var rl_solver = RuntimeLayout[DYN2].row_major(IndexList[2](BATCH, SOLVER_WS))
+    var rl_qpos = rl2(BATCH, nq)
+    var rl_nv = rl2(BATCH, nv)
+    var rl_b3 = rl2(BATCH, nbody * 3)
+    var rl_b4 = rl2(BATCH, nbody * 4)
+    var rl_con = rl2(BATCH, max_contacts * CONTACT_SIZE)
+    var rl_smeta = rl2(BATCH, METADATA_SIZE)
+    var rl_joint = rl2(njoint, MODEL_JOINT_SIZE)
+    var rl_body = rl2(nbody, MODEL_BODY_SIZE)
+    var rl_mmeta = rl1(MODEL_META_SIZE)
+    var rl_trees = rl1(nv * MODEL_TREE_SIZE)
+    var rl_eq = rl2(nequality, MODEL_EQ_SIZE)
+    var rl_ten = rl2(ntendon, MODEL_TENDON_SIZE)
+    var rl_site = rl2(nsite, MODEL_SITE_SIZE)
+    var rl_geom_w = rl2(ngeom, MODEL_GEOM_SIZE)
+    var rl_bw = rl2(nbody, 2)
+    var rl_dw = rl1(nv)
+    var rl_cdof = rl2(BATCH, nv * 6)
+    var rl_m = rl2(BATCH, nv * nv)
+    var rl_solver = rl2(BATCH, SOLVER_WS)
     # ⚠ `d.efc_eq_force` — the connect/weld equality row forces the solver
     # retains for `mj_rnePostConstraint` (AUD-48). Added to
     # `_newton_solve_env` in `254816cc` and NOT added here, which left this
     # file failing to COMPILE at HEAD until 2026-09-13. It is the only
     # caller that spells the argument list out by hand.
-    var rl_eqf = RuntimeLayout[DYN2].row_major(
-        IndexList[2](BATCH, 6 * nequality)
-    )
+    var rl_eqf = rl2(BATCH, 6 * nequality)
 
     var dims = DynDims(
         nq=nq,

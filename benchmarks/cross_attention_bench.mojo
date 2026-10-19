@@ -262,8 +262,8 @@ def _launch_max_fa[
                 _is_cache_length_accurate=True,
                 _use_valid_length=False,
             ](
-                o_tt.to_layout_tensor(),
-                q_tt.to_layout_tensor(),
+                o_tt,
+                q_tt,
                 TileTensorMHAOperand(k_tt),
                 TileTensorMHAOperand(v_tt),
                 NullMask(),

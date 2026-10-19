@@ -32,20 +32,16 @@ is 1e-12 and the actual worst error is PRINTED — if it is ever exactly zero
 that is information, not something to assert.
 """
 
-from std.utils import IndexList
-from layout import Layout, RuntimeLayout
-from noeira.core.tiles import RowMajor
+from noeira.core.tiles import RowMajor, DYN1, DYN2, rl1, rl2
 
 from noeira.nn.core.tensor import TensorImpl
 from noeira.physics3d.fields import Dims, DynDims
-from noeira.physics3d.fields.rt_layout import DYN1
 from noeira.physics3d.fields.dims import DIM_POISON
 from noeira.physics3d.fields.scratch import Scratch
 from noeira.physics3d.dynamics.ldl import _ldl_factor_env, _ldl_solve_env
 from noeira.physics3d.gpu.constants import MODEL_TREE_SIZE
 
 comptime DT = DType.float64
-comptime DYN2 = Layout.row_major[2]()
 comptime BATCH = 2
 
 
@@ -151,8 +147,8 @@ def solve_dynamic(nv: Int) raises -> List[Float64]:
     var x = TensorImpl[DT].alloc(BATCH * nv)
     _fill(M, b, nv)
 
-    var rl_m = RuntimeLayout[DYN2].row_major(IndexList[2](BATCH, nv * nv))
-    var rl_v = RuntimeLayout[DYN2].row_major(IndexList[2](BATCH, nv))
+    var rl_m = rl2(BATCH, nv * nv)
+    var rl_v = rl2(BATCH, nv)
     var M_v = M.tt_dyn["cpu", DYN2](rl_m)
     var L_v = L.tt_dyn["cpu", DYN2](rl_m)
     var D_v = D.tt_dyn["cpu", DYN2](rl_v)
@@ -167,9 +163,7 @@ def solve_dynamic(nv: Int) raises -> List[Float64]:
     var T = TensorImpl[DT].alloc(nv * MODEL_TREE_SIZE)
     for i in range(nv * MODEL_TREE_SIZE):
         T.data[i] = Scalar[DT](0)
-    var rl_t = RuntimeLayout[DYN1].row_major(
-        IndexList[1](nv * MODEL_TREE_SIZE)
-    )
+    var rl_t = rl1(nv * MODEL_TREE_SIZE)
     var T_v = T.tt_dyn["cpu", DYN1](rl_t)
     var dims = DynDims(nv=nv)
     for e in range(BATCH):

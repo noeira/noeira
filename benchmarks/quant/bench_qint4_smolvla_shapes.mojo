@@ -173,8 +173,8 @@ def run_cfg[N: Int, K: Int, CFG: Cfg](
     var a_tt = TileTensor(a_d, row_major(Coord(M, Idx[K])))
     var c_tt = TileTensor(c_d, row_major(Coord(M, Idx[N])))
     multistage_gemm_q[group_size=GS, pack_factor=8, config=CFG](
-        c_tt.to_layout_tensor(), a_tt.as_immut().to_layout_tensor(),
-        bpk_tt.as_immut().to_layout_tensor(), CFG, ctx,
+        c_tt, a_tt.as_imm(),
+        bpk_tt.as_imm(), CFG, ctx,
     )
     ctx.enqueue_copy(c_hb, c_d)
     ctx.synchronize()
@@ -191,15 +191,15 @@ def run_cfg[N: Int, K: Int, CFG: Cfg](
         mag = max(mag, abs(want))
     for _ in range(3):
         multistage_gemm_q[group_size=GS, pack_factor=8, config=CFG](
-            c_tt.to_layout_tensor(), a_tt.as_immut().to_layout_tensor(),
-            bpk_tt.as_immut().to_layout_tensor(), CFG, ctx,
+            c_tt, a_tt.as_imm(),
+            bpk_tt.as_imm(), CFG, ctx,
         )
     ctx.synchronize()
     var t0 = perf_counter_ns()
     for _ in range(ITERS):
         multistage_gemm_q[group_size=GS, pack_factor=8, config=CFG](
-            c_tt.to_layout_tensor(), a_tt.as_immut().to_layout_tensor(),
-            bpk_tt.as_immut().to_layout_tensor(), CFG, ctx,
+            c_tt, a_tt.as_imm(),
+            bpk_tt.as_imm(), CFG, ctx,
         )
     ctx.synchronize()
     var us = Float64(perf_counter_ns() - t0) / 1e3 / ITERS
@@ -250,7 +250,7 @@ def run_shape[N: Int, K: Int](
     var b_tt = TileTensor(b_d, row_major(Coord(Idx[N], Idx[KB])))
     var bpk_tt = TileTensor(bpk_d, row_major(Coord(Idx[N], Idx[KB])))
     comptime if REPACK:
-        gpu_qint4_repack_Q4_0["gpu"](b_tt.as_immut(), bpk_tt, ctx)
+        gpu_qint4_repack_Q4_0["gpu"](b_tt.as_imm(), bpk_tt, ctx)
     else:
         ctx.enqueue_copy(bpk_d, b_d)
     ctx.synchronize()

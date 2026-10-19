@@ -14,7 +14,6 @@ from std.memory import alloc
 from std.random import seed, random_float64
 from std.time import perf_counter_ns
 from noeira.core.tiles import Tile, tile
-from layout.tile_tensor import lt_to_tt
 from linalg.matmul import matmul as max_matmul
 
 from noeira.nn.constants import DT as dtype
@@ -46,18 +45,10 @@ def bench[M: Int, K: Int, N: Int, WARMUP: Int, ITERS: Int]() raises:
     print(label)
     print("─" * 72)
 
-    var a_buf: Pointer[Scalar[dtype], MutAnyOrigin] = alloc[
-        Scalar[dtype]
-    ](M * K)
-    var b_buf: Pointer[Scalar[dtype], MutAnyOrigin] = alloc[
-        Scalar[dtype]
-    ](K * N)
-    var c_naive_buf: Pointer[Scalar[dtype], MutAnyOrigin] = alloc[
-        Scalar[dtype]
-    ](M * N)
-    var c_blas_buf: Pointer[Scalar[dtype], MutAnyOrigin] = alloc[
-        Scalar[dtype]
-    ](M * N)
+    var a_buf = alloc[Scalar[dtype]](M * K)
+    var b_buf = alloc[Scalar[dtype]](K * N)
+    var c_naive_buf = alloc[Scalar[dtype]](M * N)
+    var c_blas_buf = alloc[Scalar[dtype]](M * N)
 
     for i in range(M * K):
         a_buf[i] = Scalar[dtype](random_float64(-1.0, 1.0))
@@ -75,7 +66,7 @@ def bench[M: Int, K: Int, N: Int, WARMUP: Int, ITERS: Int]() raises:
     # ── Warmup ──
     for _ in range(WARMUP):
         max_matmul[target="cpu"](
-            lt_to_tt(c_blas_lt), lt_to_tt(a_lt), lt_to_tt(b_lt), None
+            c_blas_lt, a_lt, b_lt, None
         )
 
     # Run naive once (will be reused for verification; only time-bench at the
@@ -103,7 +94,7 @@ def bench[M: Int, K: Int, N: Int, WARMUP: Int, ITERS: Int]() raises:
     var t2 = perf_counter_ns()
     for _ in range(ITERS):
         max_matmul[target="cpu"](
-            lt_to_tt(c_blas_lt), lt_to_tt(a_lt), lt_to_tt(b_lt), None
+            c_blas_lt, a_lt, b_lt, None
         )
     var t3 = perf_counter_ns()
     var blas_ms = Float64(t3 - t2) / 1e6 / Float64(ITERS)

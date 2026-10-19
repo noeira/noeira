@@ -4,9 +4,9 @@ Owns a CPU `List` AND an optional GPU `DeviceBuffer`; the active one is picked
 by the method's `target`. `dt` defaults to `DT` (fp32), so the surface stays
 `Tensor`; AMP scratch is `Tensor[DType.bfloat16]`. The KEY idea is unchanged:
 leaves/orchestrators pass `ref`/`mut Tensor` (the STORAGE), and each method
-builds its typed view INTERNALLY — `TileTensor(self.data, …)` on CPU, or
-`self.lt["gpu", layout]()` (a device `LayoutTensor`) on GPU. The only erasure on
-the GPU path is the kernel-arg `MutAnyOrigin` (the GPU ABI).
+builds its typed view INTERNALLY — `self.tt[target, dims...]()` (a row-major
+`TileTensor`; `tt_dyn` with runtime extents, `tt_at` at an offset). The only
+erasure on the GPU path is the kernel-arg `MutAnyOrigin` (the GPU ABI).
 """
 
 from std.os import getenv
@@ -17,7 +17,7 @@ from max.gpu.host import (
     DeviceEvent,
     HostBuffer,
 )
-from layout import Layout, LayoutTensor, RuntimeLayout, TileTensor, TensorLayout
+from layout import TileTensor, TensorLayout
 
 from noeira.core.tiles import RowMajor, Tile
 from noeira.nn.constants import DT
@@ -193,7 +193,7 @@ struct TensorImpl[dt: DType = DT](Defaultable & Movable & Deinitable):
         n: Int,
     ) raises -> Self:
         """BORROWING device view — wrap an EXTERNALLY-owned device buffer (e.g.
-        an MCTS planner's search buffer, reached as a `LayoutTensor.ptr`) in a
+        an MCTS planner's search buffer, reached as a `TileTensor.ptr`) in a
         non-owning `Tensor` so it can be fed straight to `forward`/`vjp` with NO
         copy. The caller owns the memory and MUST keep it alive for the view's
         lifetime; `owning=False` means this `Tensor` never frees it (it dies as
@@ -208,7 +208,7 @@ struct TensorImpl[dt: DType = DT](Defaultable & Movable & Deinitable):
 
         GPU-only: the CPU `data` List owns its storage and cannot alias external
         memory, so CPU adapters copy into an owned `Tensor` instead (no analog —
-        like `lt_at`).
+        like `tt_at`).
 
         ⚠️ A single non-owning view is fine as a kernel operand, but TWO
         simultaneous non-owning views as operands of ONE kernel miscompile on
@@ -230,7 +230,7 @@ struct TensorImpl[dt: DType = DT](Defaultable & Movable & Deinitable):
     ) raises:
         """Device→device copy an EXTERNALLY-owned buffer INTO this Tensor's own
         device buffer (lazily allocated to >= n). The external pointer (e.g. an
-        MCTS planner's `LayoutTensor.ptr`) is wrapped in a transient non-owning
+        MCTS planner's `TileTensor.ptr`) is wrapped in a transient non-owning
         `DeviceBuffer` used ONLY as a copy endpoint — never a kernel operand —
         so the net's forward/vjp then runs entirely on owned storage. This is
         the robust adapter-boundary INPUT bridge (see `view_gpu`'s warning)."""
@@ -257,73 +257,11 @@ struct TensorImpl[dt: DType = DT](Defaultable & Movable & Deinitable):
             self.hbuf = ctx.enqueue_create_host_buffer[Self.dt](n)
             self.hcap = n
 
-    def lt[
-        target: StaticString, layout: Layout
-    ](mut self) -> LayoutTensor[Self.dt, layout, MutAnyOrigin]:
-        """Typed device view at `layout`. Origin-linking ctor (no
-        `.unsafe_ptr()`); `MutAnyOrigin` is the GPU kernel-ABI boundary."""
-        comptime if target == "cpu":
-            return LayoutTensor[Self.dt, layout, MutAnyOrigin](self.data)
-        elif target == "gpu":
-            return LayoutTensor[Self.dt, layout, MutAnyOrigin](self.dev.value())
-        else:
-            comptime assert False, "target must be 'cpu' or 'gpu'"
-
-    def lt_dyn[
-        target: StaticString, layout: Layout
-    ](mut self, rl: RuntimeLayout[layout]) -> LayoutTensor[
-        Self.dt, layout, MutAnyOrigin
-    ]:
-        """The same view, shaped at RUN TIME — `layout` carries UNKNOWN
-        extents and `rl` carries the real ones.
-
-        This is `lt`'s counterpart for physics3d's dynamic leg (assessment
-        §12.4): one kernel body serves a comptime `Layout.row_major(BATCH,
-        NV*NV)` from the GPU path and a `Layout.row_major[2]()` + this from
-        the CPU path, because `LM: Layout` accepts both. Same origin-linking
-        ctor as `lt` — no `.unsafe_ptr()`, so the borrow is not severed."""
-        comptime if target == "cpu":
-            return LayoutTensor[Self.dt, layout, MutAnyOrigin](self.data, rl)
-        elif target == "gpu":
-            return LayoutTensor[Self.dt, layout, MutAnyOrigin](
-                self.dev.value(), rl
-            )
-        else:
-            comptime assert False, "target must be 'cpu' or 'gpu'"
-
-    def lt_at[
-        target: StaticString, layout: Layout
-    ](mut self, offset: Int) raises -> LayoutTensor[
-        Self.dt, layout, MutAnyOrigin
-    ]:
-        """Typed GPU view at element `offset` into the device buffer — a
-        stacked-ensemble / per-step sub-view — WITHOUT `.unsafe_ptr()`. The
-        sanctioned replacement for
-        `LayoutTensor[..MutAnyOrigin](buf.dev.value().unsafe_ptr() + offset)`:
-        a memory-sharing `create_sub_buffer` (offset + `layout.size()`, in
-        elements) feeds the same explicit-`MutAnyOrigin` DeviceBuffer ctor `lt`
-        uses, so the returned static `layout` matches the kernel ABI exactly
-        (callers/kernels identical to `lt`, just offset).
-
-        GPU-only: the per-member offset views that needed raw pointers are all on
-        the GPU kernel path; CPU branches index the owning `self.data` List
-        directly (no ABI erasure, so no helper needed). The parent buffer owns
-        the storage — the sub-buffer handle dying after this returns is safe
-        (the `MutAnyOrigin` cast erases its origin; the memory outlives via the
-        parent)."""
-        comptime assert target == "gpu", (
-            "lt_at is GPU-only (offset sub-view); CPU indexes self.data directly"
-        )
-        comptime sz = layout.size()
-        var sub = self.dev.value().create_sub_buffer[Self.dt](offset, sz)
-        return LayoutTensor[Self.dt, layout, MutAnyOrigin](sub)
-
     def tt[
         target: StaticString, *dims: Int
     ](mut self) -> Tile[Self.dt, *dims]:
-        """Row-major TileTensor view at `dims`: `lt`'s replacement.
-        `t.lt["gpu", Layout.row_major(B, N)]()` becomes `t.tt["gpu", B, N]()`,
-        typed for a `Tile[dt, B, N]` kernel argument. Built from the owning
+        """Row-major TileTensor view at `dims`, typed for a `Tile[dt, B, N]`
+        kernel argument: `t.tt["gpu", B, N]()`. Built from the owning
         storage (`self.data` / `self.dev`), so the origin is concrete until the
         return converts it to the kernel ABI's `MutAnyOrigin`."""
         comptime if target == "cpu":
@@ -336,8 +274,7 @@ struct TensorImpl[dt: DType = DT](Defaultable & Movable & Deinitable):
     def tt_dyn[
         target: StaticString, L: TensorLayout
     ](mut self, layout: L) -> TileTensor[Self.dt, L, MutAnyOrigin]:
-        """`tt` with RUNTIME extents: `lt_dyn`'s replacement.
-        `t.lt_dyn["cpu", DYN2](rl2(B, nv))` becomes
+        """`tt` with RUNTIME extents (or any layout VALUE):
         `t.tt_dyn["cpu", DYN2](rl2(B, nv))`. ⚠ The extents are not checked
         against the buffer: a wrong width reads a neighbouring row."""
         comptime if target == "cpu":
@@ -350,15 +287,17 @@ struct TensorImpl[dt: DType = DT](Defaultable & Movable & Deinitable):
     def tt_at[
         target: StaticString, *dims: Int
     ](mut self, offset: Int) raises -> Tile[Self.dt, *dims]:
-        """Row-major TileTensor view at element `offset` of the device buffer:
-        `lt_at`'s replacement (same `create_sub_buffer` route, GPU-only)."""
+        """Row-major TileTensor view at element `offset` of the device buffer
+        (a stacked-ensemble / per-step sub-view), via a memory-sharing
+        `create_sub_buffer`, never `.unsafe_ptr()`. GPU-only: CPU branches
+        index the owning `self.data` directly."""
         comptime assert target == "gpu", (
             "tt_at is GPU-only (offset sub-view); CPU indexes self.data directly"
         )
         comptime sz = RowMajor[*dims]().size()
         var sub = self.dev.value().create_sub_buffer[Self.dt](offset, sz)
         # The sub-buffer handle dies here; the parent buffer owns the memory,
-        # exactly as in `lt_at`. That is the one erasure this view needs.
+        # so the view's origin is erased to the kernel ABI's MutAnyOrigin.
         return TileTensor(sub, RowMajor[*dims]()).as_unsafe_any_origin()
 
     def upload(mut self, ctx: DeviceContext) raises:

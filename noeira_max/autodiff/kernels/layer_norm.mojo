@@ -78,13 +78,13 @@ struct LayerNormFwd:
         var rows = x.shape()[0]
         var d = x.shape()[1]
         comptime if target == "gpu":
-            var y_t = y.to_layout_tensor()
-            var mean_t = mean.to_layout_tensor()
-            var rstd_t = rstd.to_layout_tensor()
-            var x_t = x.to_layout_tensor()
-            var gamma_t = gamma.to_layout_tensor()
-            var beta_t = beta.to_layout_tensor()
-            var eps_t = eps.to_layout_tensor()
+            var y_t = y.to_tile_tensor[.int64]()
+            var mean_t = mean.to_tile_tensor[.int64]()
+            var rstd_t = rstd.to_tile_tensor[.int64]()
+            var x_t = x.to_tile_tensor[.int64]()
+            var gamma_t = gamma.to_tile_tensor[.int64]()
+            var beta_t = beta.to_tile_tensor[.int64]()
+            var eps_t = eps.to_tile_tensor[.int64]()
 
             @__parameter
             def fwd_gpu(
@@ -184,14 +184,14 @@ struct LayerNormBwd:
         var d = x.shape()[1]
         var chunks = dgamma.shape()[0]
         comptime if target == "gpu":
-            var dx_t = dx.to_layout_tensor()
-            var dgamma_t = dgamma.to_layout_tensor()
-            var dbeta_t = dbeta.to_layout_tensor()
-            var dy_t = dy.to_layout_tensor()
-            var x_t = x.to_layout_tensor()
-            var gamma_t = gamma.to_layout_tensor()
-            var mean_t = mean.to_layout_tensor()
-            var rstd_t = rstd.to_layout_tensor()
+            var dx_t = dx.to_tile_tensor[.int64]()
+            var dgamma_t = dgamma.to_tile_tensor[.int64]()
+            var dbeta_t = dbeta.to_tile_tensor[.int64]()
+            var dy_t = dy.to_tile_tensor[.int64]()
+            var x_t = x.to_tile_tensor[.int64]()
+            var gamma_t = gamma.to_tile_tensor[.int64]()
+            var mean_t = mean.to_tile_tensor[.int64]()
+            var rstd_t = rstd.to_tile_tensor[.int64]()
 
             @__parameter
             def dx_gpu(
