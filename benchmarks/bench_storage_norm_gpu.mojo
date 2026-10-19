@@ -28,7 +28,7 @@ from max.gpu.primitives import block
 from max.gpu.host import DeviceContext
 from std.time import perf_counter_ns
 from std.utils.numerics import get_accum_type
-from layout import Layout, LayoutTensor
+from noeira.core.tiles import RowMajor, Tile, tile
 
 comptime DT = DType.float32
 comptime TPB = 128
@@ -40,12 +40,12 @@ comptime LN_EPS: Scalar[DT] = 1e-5
 def _ln_fwd_scalar[
     BATCH: Int, DIM: Int
 ](
-    input: LayoutTensor[DT, Layout.row_major(BATCH, DIM), MutAnyOrigin],
-    output: LayoutTensor[DT, Layout.row_major(BATCH, DIM), MutAnyOrigin],
-    gamma: LayoutTensor[DT, Layout.row_major(DIM), MutAnyOrigin],
-    beta: LayoutTensor[DT, Layout.row_major(DIM), MutAnyOrigin],
-    cache_xhat: LayoutTensor[DT, Layout.row_major(BATCH, DIM), MutAnyOrigin],
-    cache_inv_std: LayoutTensor[DT, Layout.row_major(BATCH), MutAnyOrigin],
+    input: Tile[DT, BATCH, DIM],
+    output: Tile[DT, BATCH, DIM],
+    gamma: Tile[DT, DIM],
+    beta: Tile[DT, DIM],
+    cache_xhat: Tile[DT, BATCH, DIM],
+    cache_inv_std: Tile[DT, BATCH],
 ):
     var b = Int(block_idx.x)
     var t = Int(thread_idx.x)
@@ -87,12 +87,12 @@ def _ln_fwd_scalar[
 def _ln_fwd_single[
     BATCH: Int, DIM: Int
 ](
-    input: LayoutTensor[DT, Layout.row_major(BATCH, DIM), MutAnyOrigin],
-    output: LayoutTensor[DT, Layout.row_major(BATCH, DIM), MutAnyOrigin],
-    gamma: LayoutTensor[DT, Layout.row_major(DIM), MutAnyOrigin],
-    beta: LayoutTensor[DT, Layout.row_major(DIM), MutAnyOrigin],
-    cache_xhat: LayoutTensor[DT, Layout.row_major(BATCH, DIM), MutAnyOrigin],
-    cache_inv_std: LayoutTensor[DT, Layout.row_major(BATCH), MutAnyOrigin],
+    input: Tile[DT, BATCH, DIM],
+    output: Tile[DT, BATCH, DIM],
+    gamma: Tile[DT, DIM],
+    beta: Tile[DT, DIM],
+    cache_xhat: Tile[DT, BATCH, DIM],
+    cache_inv_std: Tile[DT, BATCH],
 ):
     var b = Int(block_idx.x)
     var t = Int(thread_idx.x)
@@ -169,11 +169,11 @@ def _ln_fwd_single[
 def _ln_bwd_scalar[
     BATCH: Int, DIM: Int
 ](
-    grad_output: LayoutTensor[DT, Layout.row_major(BATCH, DIM), MutAnyOrigin],
-    gamma: LayoutTensor[DT, Layout.row_major(DIM), MutAnyOrigin],
-    cache_xhat: LayoutTensor[DT, Layout.row_major(BATCH, DIM), MutAnyOrigin],
-    cache_inv_std: LayoutTensor[DT, Layout.row_major(BATCH), MutAnyOrigin],
-    grad_input: LayoutTensor[DT, Layout.row_major(BATCH, DIM), MutAnyOrigin],
+    grad_output: Tile[DT, BATCH, DIM],
+    gamma: Tile[DT, DIM],
+    cache_xhat: Tile[DT, BATCH, DIM],
+    cache_inv_std: Tile[DT, BATCH],
+    grad_input: Tile[DT, BATCH, DIM],
 ):
     var b = Int(block_idx.x)
     var t = Int(thread_idx.x)
@@ -211,11 +211,11 @@ def _ln_bwd_scalar[
 def _ln_bwd_single[
     BATCH: Int, DIM: Int
 ](
-    grad_output: LayoutTensor[DT, Layout.row_major(BATCH, DIM), MutAnyOrigin],
-    gamma: LayoutTensor[DT, Layout.row_major(DIM), MutAnyOrigin],
-    cache_xhat: LayoutTensor[DT, Layout.row_major(BATCH, DIM), MutAnyOrigin],
-    cache_inv_std: LayoutTensor[DT, Layout.row_major(BATCH), MutAnyOrigin],
-    grad_input: LayoutTensor[DT, Layout.row_major(BATCH, DIM), MutAnyOrigin],
+    grad_output: Tile[DT, BATCH, DIM],
+    gamma: Tile[DT, DIM],
+    cache_xhat: Tile[DT, BATCH, DIM],
+    cache_inv_std: Tile[DT, BATCH],
+    grad_input: Tile[DT, BATCH, DIM],
 ):
     var b = Int(block_idx.x)
     var t = Int(thread_idx.x)
@@ -297,15 +297,15 @@ def _time[
     _ = gam.enqueue_fill(Scalar[DT](1.0))
     _ = bet.enqueue_fill(Scalar[DT](0.0))
 
-    comptime l2d = Layout.row_major(BATCH, DIM)
-    comptime ld = Layout.row_major(DIM)
-    comptime lb = Layout.row_major(BATCH)
-    var it = LayoutTensor[DT, l2d, MutAnyOrigin](inp)
-    var ot = LayoutTensor[DT, l2d, MutAnyOrigin](out)
-    var gt = LayoutTensor[DT, ld, MutAnyOrigin](gam)
-    var btt = LayoutTensor[DT, ld, MutAnyOrigin](bet)
-    var xt = LayoutTensor[DT, l2d, MutAnyOrigin](xh)
-    var ivt = LayoutTensor[DT, lb, MutAnyOrigin](iv)
+    comptime l2d = RowMajor[BATCH, DIM]
+    comptime ld = RowMajor[DIM]
+    comptime lb = RowMajor[BATCH]
+    var it = tile[BATCH, DIM](inp)
+    var ot = tile[BATCH, DIM](out)
+    var gt = tile[DIM](gam)
+    var btt = tile[DIM](bet)
+    var xt = tile[BATCH, DIM](xh)
+    var ivt = tile[BATCH](iv)
 
     comptime kern = _ln_fwd_single[
         BATCH, DIM
@@ -360,14 +360,14 @@ def _time_bwd[
     _ = xh.enqueue_fill(Scalar[DT](0.5))
     _ = iv.enqueue_fill(Scalar[DT](1.0))
 
-    comptime l2d = Layout.row_major(BATCH, DIM)
-    comptime ld = Layout.row_major(DIM)
-    comptime lb = Layout.row_major(BATCH)
-    var got = LayoutTensor[DT, l2d, MutAnyOrigin](go)
-    var gt = LayoutTensor[DT, ld, MutAnyOrigin](gam)
-    var xt = LayoutTensor[DT, l2d, MutAnyOrigin](xh)
-    var ivt = LayoutTensor[DT, lb, MutAnyOrigin](iv)
-    var git = LayoutTensor[DT, l2d, MutAnyOrigin](gi)
+    comptime l2d = RowMajor[BATCH, DIM]
+    comptime ld = RowMajor[DIM]
+    comptime lb = RowMajor[BATCH]
+    var got = tile[BATCH, DIM](go)
+    var gt = tile[DIM](gam)
+    var xt = tile[BATCH, DIM](xh)
+    var ivt = tile[BATCH](iv)
+    var git = tile[BATCH, DIM](gi)
 
     comptime kern = _ln_bwd_single[
         BATCH, DIM
@@ -404,9 +404,9 @@ def _ab_bwd[
 def _mmn_fwd_scalar[
     BATCH: Int, DIM: Int
 ](
-    input: LayoutTensor[DT, Layout.row_major(BATCH, DIM), MutAnyOrigin],
-    output: LayoutTensor[DT, Layout.row_major(BATCH, DIM), MutAnyOrigin],
-    cache: LayoutTensor[DT, Layout.row_major(BATCH, DIM), MutAnyOrigin],
+    input: Tile[DT, BATCH, DIM],
+    output: Tile[DT, BATCH, DIM],
+    cache: Tile[DT, BATCH, DIM],
 ):
     var b = Int(block_idx.x)
     var t = Int(thread_idx.x)
@@ -439,9 +439,9 @@ def _mmn_fwd_scalar[
 def _mmn_fwd_single[
     BATCH: Int, DIM: Int
 ](
-    input: LayoutTensor[DT, Layout.row_major(BATCH, DIM), MutAnyOrigin],
-    output: LayoutTensor[DT, Layout.row_major(BATCH, DIM), MutAnyOrigin],
-    cache: LayoutTensor[DT, Layout.row_major(BATCH, DIM), MutAnyOrigin],
+    input: Tile[DT, BATCH, DIM],
+    output: Tile[DT, BATCH, DIM],
+    cache: Tile[DT, BATCH, DIM],
 ):
     var b = Int(block_idx.x)
     var t = Int(thread_idx.x)
@@ -483,10 +483,10 @@ def _time_mmn[
     var ca = ctx.enqueue_create_buffer[DT](BATCH * DIM)
     _ = inp.enqueue_fill(Scalar[DT](0.013))
 
-    comptime l2d = Layout.row_major(BATCH, DIM)
-    var it = LayoutTensor[DT, l2d, MutAnyOrigin](inp)
-    var ot = LayoutTensor[DT, l2d, MutAnyOrigin](out)
-    var ct = LayoutTensor[DT, l2d, MutAnyOrigin](ca)
+    comptime l2d = RowMajor[BATCH, DIM]
+    var it = tile[BATCH, DIM](inp)
+    var ot = tile[BATCH, DIM](out)
+    var ct = tile[BATCH, DIM](ca)
 
     comptime kern = _mmn_fwd_single[
         BATCH, DIM

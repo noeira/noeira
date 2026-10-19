@@ -49,7 +49,6 @@ from std.python import Python
 from std.testing import assert_true, TestSuite
 from std.collections import Array
 from max.gpu.host import DeviceContext
-from layout import Layout
 
 from noeira.physics3d.fields import Model, Data, Dims, DimsLike
 from noeira.physics3d.parser.full_parser import parse_xml_full

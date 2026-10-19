@@ -16,7 +16,7 @@ Run: pixi run mojo run -I . tests/physics3d/probe_mesh_multicontact.mojo
 from std.math import abs, sqrt
 from std.python import Python, PythonObject
 from max.gpu.host import DeviceContext
-from layout import Layout
+from noeira.core.tiles import RowMajor
 
 from noeira.physics3d.parser import parse_xml, ModelDefFromXML
 from noeira.physics3d.types import ConeType
@@ -148,34 +148,30 @@ def main() raises:
         )
 
     # ---- the live call ----------------------------------------------------
-    comptime L_GEOM = Layout.row_major(NGEOM, MODEL_GEOM_SIZE)
-    comptime L_MESH_META = Layout.row_major(
-        MAX_GPU_MESHES, MODEL_MESH_META_SIZE
-    )
-    comptime L_MESH_VERT = Layout.row_major(NMESHV, 3)
-    comptime L_MESH_POLY = Layout.row_major(
-        mesh_max_poly(NMESHV), MODEL_MESH_POLY_SIZE
-    )
-    comptime L_MESH_PV = Layout.row_major(mesh_max_polyvert(NMESHV))
-    comptime L_MESH_VEADR = Layout.row_major(NMESHV)
-    comptime L_MESH_EDGE = Layout.row_major(mesh_max_edge(NMESHV))
-    comptime L_MESH_VPM = Layout.row_major(NMESHV, 2)
-    comptime L_CONTACTS = Layout.row_major(1, MC * CONTACT_SIZE)
-    comptime L_B3 = Layout.row_major(1, NBODY * 3)
-    comptime L_B4 = Layout.row_major(1, NBODY * 4)
+    comptime L_GEOM = RowMajor[NGEOM, MODEL_GEOM_SIZE]
+    comptime L_MESH_META = RowMajor[MAX_GPU_MESHES, MODEL_MESH_META_SIZE]
+    comptime L_MESH_VERT = RowMajor[NMESHV, 3]
+    comptime L_MESH_POLY = RowMajor[mesh_max_poly(NMESHV), MODEL_MESH_POLY_SIZE]
+    comptime L_MESH_PV = RowMajor[mesh_max_polyvert(NMESHV)]
+    comptime L_MESH_VEADR = RowMajor[NMESHV]
+    comptime L_MESH_EDGE = RowMajor[mesh_max_edge(NMESHV)]
+    comptime L_MESH_VPM = RowMajor[NMESHV, 2]
+    comptime L_CONTACTS = RowMajor[1, MC * CONTACT_SIZE]
+    comptime L_B3 = RowMajor[1, NBODY * 3]
+    comptime L_B4 = RowMajor[1, NBODY * 4]
 
-    var geoms_v = mf.geoms.lt["cpu", L_GEOM]()
-    var mesh_meta_v = mf.mesh_meta.lt["cpu", L_MESH_META]()
-    var mesh_verts_v = mf.mesh_verts.lt["cpu", L_MESH_VERT]()
-    var mesh_veadr_v = mf.mesh_vert_edgeadr.lt["cpu", L_MESH_VEADR]()
-    var mesh_edges_v = mf.mesh_edges.lt["cpu", L_MESH_EDGE]()
-    var mesh_polys_v = mf.mesh_polys.lt["cpu", L_MESH_POLY]()
-    var mesh_pv_v = mf.mesh_polyvert.lt["cpu", L_MESH_PV]()
-    var mesh_pm_v = mf.mesh_polymap.lt["cpu", L_MESH_PV]()
-    var mesh_vpm_v = mf.mesh_vert_polymap.lt["cpu", L_MESH_VPM]()
-    var contacts_v = d.contacts.lt["cpu", L_CONTACTS]()
-    var xpos_v = d.xpos.lt["cpu", L_B3]()
-    var xquat_v = d.xquat.lt["cpu", L_B4]()
+    var geoms_v = mf.geoms.tt["cpu", NGEOM, MODEL_GEOM_SIZE]()
+    var mesh_meta_v = mf.mesh_meta.tt["cpu", MAX_GPU_MESHES, MODEL_MESH_META_SIZE]()
+    var mesh_verts_v = mf.mesh_verts.tt["cpu", NMESHV, 3]()
+    var mesh_veadr_v = mf.mesh_vert_edgeadr.tt["cpu", NMESHV]()
+    var mesh_edges_v = mf.mesh_edges.tt["cpu", mesh_max_edge(NMESHV)]()
+    var mesh_polys_v = mf.mesh_polys.tt["cpu", mesh_max_poly(NMESHV), MODEL_MESH_POLY_SIZE]()
+    var mesh_pv_v = mf.mesh_polyvert.tt["cpu", mesh_max_polyvert(NMESHV)]()
+    var mesh_pm_v = mf.mesh_polymap.tt["cpu", mesh_max_polyvert(NMESHV)]()
+    var mesh_vpm_v = mf.mesh_vert_polymap.tt["cpu", NMESHV, 2]()
+    var contacts_v = d.contacts.tt["cpu", 1, MC * CONTACT_SIZE]()
+    var xpos_v = d.xpos.tt["cpu", 1, NBODY * 3]()
+    var xquat_v = d.xquat.tt["cpu", 1, NBODY * 4]()
 
     # geom world poses straight out of FK (both geoms sit at their body origin)
     var gi = 0
@@ -237,7 +233,7 @@ def main() raises:
         z, z, z, z, z,
         va2, mnv2,
         wf1, wf2, wxx, wf_ok, wfi,
-        ws.lt["cpu", L_CCD_WS1](), 0,
+        ws.tt_dyn["cpu", L_CCD_WS1](L_CCD_WS1()), 0,
     )
     print("  EPA: dist", r[0], " n(gi->gj)", r[4], r[5], r[6], " ok", wf_ok)
     print("   x1", wxx[0], wxx[1], wxx[2], "  x2", wxx[3], wxx[4], wxx[5])
@@ -266,7 +262,7 @@ def main() raises:
         # flip; the narrow phase passes `True` on the leg where it sorted the
         # operands to `type1 <= type2`. See `native_multicontact_contacts`.
         False,
-        contacts_v, ws.lt["cpu", L_CCD_WS1](), 0, nc,
+        contacts_v, ws.tt_dyn["cpu", L_CCD_WS1](L_CCD_WS1()), 0, nc,
     )
     print("  OURS: multicontact wrote", got, "rows")
     for k in range(got):

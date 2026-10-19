@@ -19,7 +19,7 @@ Run:
 from std.memory import alloc, memset
 from std.time import perf_counter_ns
 from max.gpu.host import DeviceContext
-from layout import Layout, LayoutTensor
+from noeira.core.tiles import tile
 
 from noeira.nn.constants import DT as dtype
 from noeira.experimental.pcn.pc_initializer import PCXavier
@@ -80,16 +80,12 @@ def main() raises:
     var params_host_init = ctx.enqueue_create_host_buffer[dtype](NET.PARAM_SIZE)
     for i in range(NET.PARAM_SIZE):
         params_host_init.unsafe_ptr()[i] = Scalar[dtype](0)
-    var params_init_t = LayoutTensor[
-        dtype, Layout.row_major(NET.PARAM_SIZE), MutAnyOrigin
-    ](params_host_init.unsafe_ptr().as_unsafe_any_origin())
+    var params_init_t = tile[NET.PARAM_SIZE](params_host_init.unsafe_ptr().as_unsafe_any_origin())
     NET.pc_init_params[PCXavier, dtype](params_init_t)
 
     var params_dbuf = ctx.enqueue_create_buffer[dtype](NET.PARAM_SIZE)
     ctx.enqueue_copy(params_dbuf, params_host_init)
-    var params_t = LayoutTensor[
-        dtype, Layout.row_major(NET.PARAM_SIZE), MutAnyOrigin
-    ](params_dbuf)
+    var params_t = tile[NET.PARAM_SIZE](params_dbuf)
 
     # ── grads, latents, scratch buffers (GPU only) ────────────────────────────
     var grads_dbuf = ctx.enqueue_create_buffer[dtype](NET.PARAM_SIZE)
@@ -100,27 +96,13 @@ def main() raises:
     var dx_dbuf = ctx.enqueue_create_buffer[dtype](BATCH * NET.LATENT_DIM)
     var eval_out_dbuf = ctx.enqueue_create_buffer[dtype](BATCH * NET.OUT_DIM)
 
-    var grads_t = LayoutTensor[
-        dtype, Layout.row_major(NET.PARAM_SIZE), MutAnyOrigin
-    ](grads_dbuf)
-    var lat_t = LayoutTensor[
-        dtype, Layout.row_major(BATCH, NET.LATENT_DIM), MutAnyOrigin
-    ](lat_dbuf)
-    var mu_eps_t = LayoutTensor[
-        dtype, Layout.row_major(BATCH, NET.SCRATCH_OUT_DIM), MutAnyOrigin
-    ](mu_eps_dbuf)
-    var a_below_t = LayoutTensor[
-        dtype, Layout.row_major(BATCH, NET.SCRATCH_IN_DIM), MutAnyOrigin
-    ](a_below_dbuf)
-    var z_below_t = LayoutTensor[
-        dtype, Layout.row_major(BATCH, NET.SCRATCH_IN_DIM), MutAnyOrigin
-    ](z_below_dbuf)
-    var dx_t = LayoutTensor[
-        dtype, Layout.row_major(BATCH, NET.LATENT_DIM), MutAnyOrigin
-    ](dx_dbuf)
-    var eval_out_t = LayoutTensor[
-        dtype, Layout.row_major(BATCH, NET.OUT_DIM), MutAnyOrigin
-    ](eval_out_dbuf)
+    var grads_t = tile[NET.PARAM_SIZE](grads_dbuf)
+    var lat_t = tile[BATCH, NET.LATENT_DIM](lat_dbuf)
+    var mu_eps_t = tile[BATCH, NET.SCRATCH_OUT_DIM](mu_eps_dbuf)
+    var a_below_t = tile[BATCH, NET.SCRATCH_IN_DIM](a_below_dbuf)
+    var z_below_t = tile[BATCH, NET.SCRATCH_IN_DIM](z_below_dbuf)
+    var dx_t = tile[BATCH, NET.LATENT_DIM](dx_dbuf)
+    var eval_out_t = tile[BATCH, NET.OUT_DIM](eval_out_dbuf)
 
     # ── Adam state on GPU ─────────────────────────────────────────────────────
     var opt_state_dbuf = ctx.enqueue_create_buffer[dtype](
@@ -140,14 +122,8 @@ def main() raises:
     opt_global_init.unsafe_ptr()[1] = Scalar[dtype](1.0)  # lr_scale = 1.0
     ctx.enqueue_copy(opt_global_dbuf, opt_global_init)
 
-    var opt_state_t = LayoutTensor[
-        dtype,
-        Layout.row_major(NET.PARAM_SIZE, OPT.STATE_PER_PARAM),
-        MutAnyOrigin,
-    ](opt_state_dbuf)
-    var opt_global_t = LayoutTensor[
-        dtype, Layout.row_major(OPT.GLOBAL_STATE_SIZE), MutAnyOrigin
-    ](opt_global_dbuf)
+    var opt_state_t = tile[NET.PARAM_SIZE, OPT.STATE_PER_PARAM](opt_state_dbuf)
+    var opt_global_t = tile[OPT.GLOBAL_STATE_SIZE](opt_global_dbuf)
 
     # ── Upload entire MNIST train + test sets once ────────────────────────────
     var train_img_host = ctx.enqueue_create_host_buffer[dtype](
@@ -191,9 +167,7 @@ def main() raises:
 
     var initial_correct: Int = 0
     for tb in range(N_TEST_BATCHES):
-        var x_batch_t = LayoutTensor[
-            dtype, Layout.row_major(BATCH, NET.IN_DIM), MutAnyOrigin
-        ](test_img_dbuf.unsafe_ptr().as_unsafe_any_origin() + tb * BATCH * NET.IN_DIM)
+        var x_batch_t = tile[BATCH, NET.IN_DIM](test_img_dbuf.unsafe_ptr().as_unsafe_any_origin() + tb * BATCH * NET.IN_DIM)
         NET.forward_eval_gpu[BATCH, dtype](
             ctx, x_batch_t, params_t, eval_out_t, mu_eps_t, a_below_t
         )
@@ -224,12 +198,8 @@ def main() raises:
         var epoch_start_ns = perf_counter_ns()
 
         for batch_idx in range(N_TRAIN_BATCHES):
-            var x_batch_t = LayoutTensor[
-                dtype, Layout.row_major(BATCH, NET.IN_DIM), MutAnyOrigin
-            ](train_img_dbuf.unsafe_ptr().as_unsafe_any_origin() + batch_idx * BATCH * NET.IN_DIM)
-            var y_batch_t = LayoutTensor[
-                dtype, Layout.row_major(BATCH, NET.OUT_DIM), MutAnyOrigin
-            ](train_tgt_dbuf.unsafe_ptr().as_unsafe_any_origin() + batch_idx * BATCH * NET.OUT_DIM)
+            var x_batch_t = tile[BATCH, NET.IN_DIM](train_img_dbuf.unsafe_ptr().as_unsafe_any_origin() + batch_idx * BATCH * NET.IN_DIM)
+            var y_batch_t = tile[BATCH, NET.OUT_DIM](train_tgt_dbuf.unsafe_ptr().as_unsafe_any_origin() + batch_idx * BATCH * NET.OUT_DIM)
 
             TRAINER.compute_grads_only_gpu[BATCH](
                 ctx,
@@ -264,9 +234,7 @@ def main() raises:
         # Inline eval at end of epoch
         var ep_correct: Int = 0
         for tb in range(N_TEST_BATCHES):
-            var x_batch_t = LayoutTensor[
-                dtype, Layout.row_major(BATCH, NET.IN_DIM), MutAnyOrigin
-            ](test_img_dbuf.unsafe_ptr().as_unsafe_any_origin() + tb * BATCH * NET.IN_DIM)
+            var x_batch_t = tile[BATCH, NET.IN_DIM](test_img_dbuf.unsafe_ptr().as_unsafe_any_origin() + tb * BATCH * NET.IN_DIM)
             NET.forward_eval_gpu[BATCH, dtype](
                 ctx, x_batch_t, params_t, eval_out_t, mu_eps_t, a_below_t
             )
@@ -295,9 +263,7 @@ def main() raises:
     # Final eval
     var final_correct: Int = 0
     for tb in range(N_TEST_BATCHES):
-        var x_batch_t = LayoutTensor[
-            dtype, Layout.row_major(BATCH, NET.IN_DIM), MutAnyOrigin
-        ](test_img_dbuf.unsafe_ptr().as_unsafe_any_origin() + tb * BATCH * NET.IN_DIM)
+        var x_batch_t = tile[BATCH, NET.IN_DIM](test_img_dbuf.unsafe_ptr().as_unsafe_any_origin() + tb * BATCH * NET.IN_DIM)
         NET.forward_eval_gpu[BATCH, dtype](
             ctx, x_batch_t, params_t, eval_out_t, mu_eps_t, a_below_t
         )

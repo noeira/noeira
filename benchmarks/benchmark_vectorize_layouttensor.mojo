@@ -25,7 +25,7 @@ from std.memory import alloc
 from std.random import seed, random_float64
 from std.sys import simd_width_of
 from std.time import perf_counter_ns
-from layout import Layout, LayoutTensor
+from noeira.core.tiles import Tile, tile
 
 from noeira.nn.constants import DT as dtype
 
@@ -41,8 +41,8 @@ comptime DIM = 256
 
 
 def relu_lt_scalar(
-    inp: LayoutTensor[dtype, Layout.row_major(BATCH, DIM), MutAnyOrigin],
-    mut res: LayoutTensor[dtype, Layout.row_major(BATCH, DIM), MutAnyOrigin],
+    inp: Tile[dtype, BATCH, DIM],
+    res: Tile[dtype, BATCH, DIM],
 ):
     for b in range(BATCH):
         for i in range(DIM):
@@ -51,8 +51,8 @@ def relu_lt_scalar(
 
 
 def mish_lt_scalar(
-    inp: LayoutTensor[dtype, Layout.row_major(BATCH, DIM), MutAnyOrigin],
-    mut res: LayoutTensor[dtype, Layout.row_major(BATCH, DIM), MutAnyOrigin],
+    inp: Tile[dtype, BATCH, DIM],
+    res: Tile[dtype, BATCH, DIM],
 ):
     for b in range(BATCH):
         for i in range(DIM):
@@ -149,12 +149,8 @@ def main() raises:
     for i in range(BATCH * DIM):
         inp_buf[i] = Scalar[dtype](random_float64(-1.0, 1.0))
 
-    var inp_lt = LayoutTensor[
-        dtype, Layout.row_major(BATCH, DIM), MutAnyOrigin
-    ](inp_buf)
-    var res_a_lt = LayoutTensor[
-        dtype, Layout.row_major(BATCH, DIM), MutAnyOrigin
-    ](res_a)
+    var inp_lt = tile[BATCH, DIM](inp_buf)
+    var res_a_lt = tile[BATCH, DIM](res_a)
 
     var iters = 1000
 

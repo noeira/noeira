@@ -370,7 +370,7 @@ def test_a_mesh_past_the_old_placeholder_still_hits() raises:
     var a_pnt = np.zeros(3)
     var a_vec = np.zeros(3)
     var a_nrm = np.zeros(3)
-    var tri_view = b.m.mesh_tris.lt_dyn["cpu", DYN1](rl1(64 * 9))
+    var tri_view = b.m.mesh_tris.tt_dyn["cpu", DYN1](rl1(64 * 9))
 
     var rng = Lcg(0xB16BE11)
     var hits = 0
@@ -453,7 +453,7 @@ def test_ray_mesh_vs_mujoco() raises:
     var a_nrm = np.zeros(3)
 
     # ⚠ Built ONCE: `lt_dyn` needs `mut` and the soup does not move.
-    var tri_view = b.m.mesh_tris.lt_dyn["cpu", DYN1](rl1(64 * 9))
+    var tri_view = b.m.mesh_tris.tt_dyn["cpu", DYN1](rl1(64 * 9))
 
     var rng = Lcg(0x5EED11)
     var hits = 0

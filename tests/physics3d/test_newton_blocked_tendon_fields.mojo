@@ -45,7 +45,7 @@ from std.math import abs
 from std.testing import TestSuite
 from std.sys import default_accelerator
 from max.gpu.host import DeviceContext
-from layout import Layout
+from noeira.core.tiles import RowMajor
 
 from noeira.nn.core.tensor import TensorImpl
 from noeira.physics3d.fields import (
@@ -151,32 +151,32 @@ def _fields_prep[
     compute_cdof[target, DTYPE, BATCH=BATCH](d, mf, scratch, ctx)
     compute_mass_matrix[target, DTYPE, BATCH=BATCH](d, mf, scratch, ctx)
 
-    comptime L_JOINT = Layout.row_major(NJOINT, MODEL_JOINT_SIZE)
-    comptime L_M = Layout.row_major(BATCH, NV * NV)
-    comptime L_NV = Layout.row_major(BATCH, NV)
-    comptime L_QPOS = Layout.row_major(BATCH, NQ)
+    comptime L_JOINT = RowMajor[NJOINT, MODEL_JOINT_SIZE]
+    comptime L_M = RowMajor[BATCH, NV * NV]
+    comptime L_NV = RowMajor[BATCH, NV]
+    comptime L_QPOS = RowMajor[BATCH, NQ]
 
     comptime if target == "cpu":
-        var joints_v = mf.joints.lt["cpu", L_JOINT]()
-        var M_v = scratch.M.lt["cpu", L_M]()
+        var joints_v = mf.joints.tt["cpu", NJOINT, MODEL_JOINT_SIZE]()
+        var M_v = scratch.M.tt["cpu", BATCH, NV * NV]()
         for e in range(BATCH):
             _armature_env[DTYPE](e, AsStatic[MD](), joints_v, M_v)
         ldl_factor[target, DTYPE, BATCH=BATCH](mf, scratch, ctx)
         compute_m_inv[target, DTYPE, BATCH=BATCH](mf, scratch, ctx)
         compute_bias_forces_rne[target, DTYPE, BATCH=BATCH](d, mf, scratch, ctx)
-        var qpos_v = d.qpos.lt["cpu", L_QPOS]()
-        var qvel_v = d.qvel.lt["cpu", L_NV]()
-        var qfrc_v = d.qfrc.lt["cpu", L_NV]()
-        var bias_v = scratch.bias.lt["cpu", L_NV]()
-        var fnet_v = scratch.fnet.lt["cpu", L_NV]()
+        var qpos_v = d.qpos.tt["cpu", BATCH, NQ]()
+        var qvel_v = d.qvel.tt["cpu", BATCH, NV]()
+        var qfrc_v = d.qfrc.tt["cpu", BATCH, NV]()
+        var bias_v = scratch.bias.tt["cpu", BATCH, NV]()
+        var fnet_v = scratch.fnet.tt["cpu", BATCH, NV]()
         for e in range(BATCH):
             _fnet_passive_env[DTYPE](
                 e, AsStatic[MD](), qpos_v, qvel_v, qfrc_v, joints_v, bias_v, fnet_v
             )
         ldl_solve[target, DTYPE, BATCH=BATCH](mf, scratch, ctx)
-        var qacc_ws_v = scratch.qacc_ws.lt["cpu", L_NV]()
-        var qacc_v = d.qacc.lt["cpu", L_NV]()
-        var qacc_c_v = scratch.qacc_constrained.lt["cpu", L_NV]()
+        var qacc_ws_v = scratch.qacc_ws.tt["cpu", BATCH, NV]()
+        var qacc_v = d.qacc.tt["cpu", BATCH, NV]()
+        var qacc_c_v = scratch.qacc_constrained.tt["cpu", BATCH, NV]()
         for e in range(BATCH):
             _qacc_writeback_env[DTYPE](
                 e, AsStatic[MD](), qacc_ws_v, qacc_v, qacc_c_v
@@ -185,8 +185,8 @@ def _fields_prep[
         ctx.value().enqueue_function[
             _armature_kernel[DTYPE, NV, NJOINT, BATCH]
         ](
-            mf.joints.lt["gpu", L_JOINT](),
-            scratch.M.lt["gpu", L_M](),
+            mf.joints.tt["gpu", NJOINT, MODEL_JOINT_SIZE](),
+            scratch.M.tt["gpu", BATCH, NV * NV](),
             grid_dim=(BATCH,),
             block_dim=(1,),
         )
@@ -196,12 +196,12 @@ def _fields_prep[
         ctx.value().enqueue_function[
             _fnet_passive_kernel[DTYPE, NQ, NV, NJOINT, BATCH]
         ](
-            d.qpos.lt["gpu", L_QPOS](),
-            d.qvel.lt["gpu", L_NV](),
-            d.qfrc.lt["gpu", L_NV](),
-            mf.joints.lt["gpu", L_JOINT](),
-            scratch.bias.lt["gpu", L_NV](),
-            scratch.fnet.lt["gpu", L_NV](),
+            d.qpos.tt["gpu", BATCH, NQ](),
+            d.qvel.tt["gpu", BATCH, NV](),
+            d.qfrc.tt["gpu", BATCH, NV](),
+            mf.joints.tt["gpu", NJOINT, MODEL_JOINT_SIZE](),
+            scratch.bias.tt["gpu", BATCH, NV](),
+            scratch.fnet.tt["gpu", BATCH, NV](),
             grid_dim=(BATCH,),
             block_dim=(1,),
         )
@@ -209,9 +209,9 @@ def _fields_prep[
         ctx.value().enqueue_function[
             _qacc_writeback_kernel[DTYPE, NV, BATCH]
         ](
-            scratch.qacc_ws.lt["gpu", L_NV](),
-            d.qacc.lt["gpu", L_NV](),
-            scratch.qacc_constrained.lt["gpu", L_NV](),
+            scratch.qacc_ws.tt["gpu", BATCH, NV](),
+            d.qacc.tt["gpu", BATCH, NV](),
+            scratch.qacc_constrained.tt["gpu", BATCH, NV](),
             grid_dim=(BATCH,),
             block_dim=(1,),
         )

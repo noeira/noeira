@@ -53,7 +53,8 @@ Run: pixi run mojo run -I . tests/physics3d/test_newton_both_legs.mojo
 """
 
 from std.utils import IndexList
-from layout import Layout, LayoutTensor, RuntimeLayout
+from layout import Layout, RuntimeLayout
+from noeira.core.tiles import RowMajor
 from max.gpu.host import DeviceContext
 
 from noeira.physics3d.fields import (
@@ -186,10 +187,10 @@ def prep[
     comptime NQ = MD.NQ
     comptime NV = MD.NV
     comptime NJOINT = MD.NJOINT
-    comptime L_JOINT = Layout.row_major(NJOINT, MODEL_JOINT_SIZE)
-    comptime L_M = Layout.row_major(BATCH, NV * NV)
-    comptime L_NV = Layout.row_major(BATCH, NV)
-    comptime L_QPOS = Layout.row_major(BATCH, NQ)
+    comptime L_JOINT = RowMajor[NJOINT, MODEL_JOINT_SIZE]
+    comptime L_M = RowMajor[BATCH, NV * NV]
+    comptime L_NV = RowMajor[BATCH, NV]
+    comptime L_QPOS = RowMajor[BATCH, NQ]
 
     forward_kinematics["cpu", DT, BATCH=BATCH](d, mf, ctx)
     compute_body_velocities["cpu", DT, BATCH=BATCH](d, mf, ctx)
@@ -197,27 +198,27 @@ def prep[
     compute_cdof["cpu", DT, BATCH=BATCH](d, mf, sc, ctx)
     compute_mass_matrix["cpu", DT, BATCH=BATCH](d, mf, sc, ctx)
 
-    var joints_v = mf.joints.lt["cpu", L_JOINT]()
-    var M_v = sc.M.lt["cpu", L_M]()
+    var joints_v = mf.joints.tt["cpu", NJOINT, MODEL_JOINT_SIZE]()
+    var M_v = sc.M.tt["cpu", BATCH, NV * NV]()
     for e in range(BATCH):
         _armature_env[DT](e, AsStatic[MD](), joints_v, M_v)
     ldl_factor["cpu", DT, BATCH=BATCH](mf, sc, ctx)
     compute_m_inv["cpu", DT, BATCH=BATCH](mf, sc, ctx)
     compute_bias_forces_rne["cpu", DT, BATCH=BATCH](d, mf, sc, ctx)
 
-    var qpos_v = d.qpos.lt["cpu", L_QPOS]()
-    var qvel_v = d.qvel.lt["cpu", L_NV]()
-    var qfrc_v = d.qfrc.lt["cpu", L_NV]()
-    var bias_v = sc.bias.lt["cpu", L_NV]()
-    var fnet_v = sc.fnet.lt["cpu", L_NV]()
+    var qpos_v = d.qpos.tt["cpu", BATCH, NQ]()
+    var qvel_v = d.qvel.tt["cpu", BATCH, NV]()
+    var qfrc_v = d.qfrc.tt["cpu", BATCH, NV]()
+    var bias_v = sc.bias.tt["cpu", BATCH, NV]()
+    var fnet_v = sc.fnet.tt["cpu", BATCH, NV]()
     for e in range(BATCH):
         _fnet_passive_env[DT](
             e, AsStatic[MD](), qpos_v, qvel_v, qfrc_v, joints_v, bias_v, fnet_v
         )
     ldl_solve["cpu", DT, BATCH=BATCH](mf, sc, ctx)
-    var qacc_ws_v = sc.qacc_ws.lt["cpu", L_NV]()
-    var qacc_v = d.qacc.lt["cpu", L_NV]()
-    var qacc_c_v = sc.qacc_constrained.lt["cpu", L_NV]()
+    var qacc_ws_v = sc.qacc_ws.tt["cpu", BATCH, NV]()
+    var qacc_v = d.qacc.tt["cpu", BATCH, NV]()
+    var qacc_c_v = sc.qacc_constrained.tt["cpu", BATCH, NV]()
     for e in range(BATCH):
         _qacc_writeback_env[DT](e, AsStatic[MD](), qacc_ws_v, qacc_v, qacc_c_v)
     detect_contacts["cpu", DT, BATCH=BATCH](d, mf, ctx)
@@ -233,27 +234,27 @@ def solve_static[
 ) raises:
     """The shipped leg: comptime layouts, `Dims`, every `Scratch` on the stack.
     """
-    comptime L_QPOS = Layout.row_major(BATCH, MD.NQ)
-    comptime L_NV = Layout.row_major(BATCH, MD.NV)
-    comptime L_B3 = Layout.row_major(BATCH, MD.NBODY * 3)
-    comptime L_B4 = Layout.row_major(BATCH, MD.NBODY * 4)
-    comptime L_CON = Layout.row_major(BATCH, MD.MAX_CONTACTS * CONTACT_SIZE)
-    comptime L_SMETA = Layout.row_major(BATCH, METADATA_SIZE)
-    comptime L_JOINT = Layout.row_major(MD.NJOINT, MODEL_JOINT_SIZE)
-    comptime L_BODY = Layout.row_major(MD.NBODY, MODEL_BODY_SIZE)
-    comptime L_MMETA = Layout.row_major(MODEL_META_SIZE)
-    comptime L_TREES = Layout.row_major(MD.NV * MODEL_TREE_SIZE)
-    comptime L_EQ = Layout.row_major(MD.NEQUALITY, MODEL_EQ_SIZE)
-    comptime L_TEN = Layout.row_major(MD.NTENDON, MODEL_TENDON_SIZE)
-    comptime L_SITE = Layout.row_major(MD.NSITE, MODEL_SITE_SIZE)
-    comptime L_GEOM_W = Layout.row_major(MD.NGEOM, MODEL_GEOM_SIZE)
-    comptime L_BW = Layout.row_major(MD.NBODY, 2)
-    comptime L_DW = Layout.row_major(MD.NV)
-    comptime L_CDOF = Layout.row_major(BATCH, MD.NV * 6)
-    comptime L_M = Layout.row_major(BATCH, MD.NV * MD.NV)
-    comptime L_SOLVER = Layout.row_major(BATCH, SOLVER_WS)
+    comptime L_QPOS = RowMajor[BATCH, MD.NQ]
+    comptime L_NV = RowMajor[BATCH, MD.NV]
+    comptime L_B3 = RowMajor[BATCH, MD.NBODY * 3]
+    comptime L_B4 = RowMajor[BATCH, MD.NBODY * 4]
+    comptime L_CON = RowMajor[BATCH, MD.MAX_CONTACTS * CONTACT_SIZE]
+    comptime L_SMETA = RowMajor[BATCH, METADATA_SIZE]
+    comptime L_JOINT = RowMajor[MD.NJOINT, MODEL_JOINT_SIZE]
+    comptime L_BODY = RowMajor[MD.NBODY, MODEL_BODY_SIZE]
+    comptime L_MMETA = RowMajor[MODEL_META_SIZE]
+    comptime L_TREES = RowMajor[MD.NV * MODEL_TREE_SIZE]
+    comptime L_EQ = RowMajor[MD.NEQUALITY, MODEL_EQ_SIZE]
+    comptime L_TEN = RowMajor[MD.NTENDON, MODEL_TENDON_SIZE]
+    comptime L_SITE = RowMajor[MD.NSITE, MODEL_SITE_SIZE]
+    comptime L_GEOM_W = RowMajor[MD.NGEOM, MODEL_GEOM_SIZE]
+    comptime L_BW = RowMajor[MD.NBODY, 2]
+    comptime L_DW = RowMajor[MD.NV]
+    comptime L_CDOF = RowMajor[BATCH, MD.NV * 6]
+    comptime L_M = RowMajor[BATCH, MD.NV * MD.NV]
+    comptime L_SOLVER = RowMajor[BATCH, SOLVER_WS]
     # ⚠ See the dynamic leg's twin below: `d.efc_eq_force` (AUD-48).
-    comptime L_EQF = Layout.row_major(BATCH, 6 * MD.NEQUALITY)
+    comptime L_EQF = RowMajor[BATCH, 6 * MD.NEQUALITY]
 
     for e in range(BATCH):
         _newton_solve_env[DT, CONE, BATCH, SOLVER_WS](
@@ -269,33 +270,33 @@ def solve_static[
                 ntendon=MD.NTENDON,
                 nsite=MD.NSITE,
             ](),
-            d.qpos.lt["cpu", L_QPOS](),
-            d.qvel.lt["cpu", L_NV](),
-            d.xpos.lt["cpu", L_B3](),
-            d.xquat.lt["cpu", L_B4](),
-            d.subtree_com.lt["cpu", L_B3](),
-            d.contacts.lt["cpu", L_CON](),
-            d.meta.lt["cpu", L_SMETA](),
-            mf.joints.lt["cpu", L_JOINT](),
-            mf.bodies.lt["cpu", L_BODY](),
-            mf.meta.lt["cpu", L_MMETA](),
-            mf.trees.lt["cpu", L_TREES](),
-            mf.equality.lt["cpu", L_EQ](),
-            mf.tendons.lt["cpu", L_TEN](),
-            mf.sites.lt["cpu", L_SITE](),
-            mf.geoms.lt["cpu", L_GEOM_W](),
-            mf.body_invweight0.lt["cpu", L_BW](),
-            mf.dof_invweight0.lt["cpu", L_DW](),
-            sc.cdof.lt["cpu", L_CDOF](),
-            sc.M.lt["cpu", L_M](),
-            sc.m_inv.lt["cpu", L_M](),
-            sc.L.lt["cpu", L_M](),
-            sc.D.lt["cpu", L_NV](),
-            mf.dof_parentid.lt["cpu", L_DW](),
-            sc.qacc_constrained.lt["cpu", L_NV](),
-            d.qacc_warmstart.lt["cpu", L_NV](),
-            cs.solver.lt["cpu", L_SOLVER](),
-            d.efc_eq_force.lt["cpu", L_EQF](),
+            d.qpos.tt["cpu", BATCH, MD.NQ](),
+            d.qvel.tt["cpu", BATCH, MD.NV](),
+            d.xpos.tt["cpu", BATCH, MD.NBODY * 3](),
+            d.xquat.tt["cpu", BATCH, MD.NBODY * 4](),
+            d.subtree_com.tt["cpu", BATCH, MD.NBODY * 3](),
+            d.contacts.tt["cpu", BATCH, MD.MAX_CONTACTS * CONTACT_SIZE](),
+            d.meta.tt["cpu", BATCH, METADATA_SIZE](),
+            mf.joints.tt["cpu", MD.NJOINT, MODEL_JOINT_SIZE](),
+            mf.bodies.tt["cpu", MD.NBODY, MODEL_BODY_SIZE](),
+            mf.meta.tt["cpu", MODEL_META_SIZE](),
+            mf.trees.tt["cpu", MD.NV * MODEL_TREE_SIZE](),
+            mf.equality.tt["cpu", MD.NEQUALITY, MODEL_EQ_SIZE](),
+            mf.tendons.tt["cpu", MD.NTENDON, MODEL_TENDON_SIZE](),
+            mf.sites.tt["cpu", MD.NSITE, MODEL_SITE_SIZE](),
+            mf.geoms.tt["cpu", MD.NGEOM, MODEL_GEOM_SIZE](),
+            mf.body_invweight0.tt["cpu", MD.NBODY, 2](),
+            mf.dof_invweight0.tt["cpu", MD.NV](),
+            sc.cdof.tt["cpu", BATCH, MD.NV * 6](),
+            sc.M.tt["cpu", BATCH, MD.NV * MD.NV](),
+            sc.m_inv.tt["cpu", BATCH, MD.NV * MD.NV](),
+            sc.L.tt["cpu", BATCH, MD.NV * MD.NV](),
+            sc.D.tt["cpu", BATCH, MD.NV](),
+            mf.dof_parentid.tt["cpu", MD.NV](),
+            sc.qacc_constrained.tt["cpu", BATCH, MD.NV](),
+            d.qacc_warmstart.tt["cpu", BATCH, MD.NV](),
+            cs.solver.tt["cpu", BATCH, SOLVER_WS](),
+            d.efc_eq_force.tt["cpu", BATCH, 6 * MD.NEQUALITY](),
         )
 
 
@@ -391,33 +392,33 @@ def solve_dynamic[
         _newton_solve_env[DT, CONE, BATCH, SOLVER_WS](
             e,
             dims,
-            d.qpos.lt_dyn["cpu", DYN2](rl_qpos),
-            d.qvel.lt_dyn["cpu", DYN2](rl_nv),
-            d.xpos.lt_dyn["cpu", DYN2](rl_b3),
-            d.xquat.lt_dyn["cpu", DYN2](rl_b4),
-            d.subtree_com.lt_dyn["cpu", DYN2](rl_b3),
-            d.contacts.lt_dyn["cpu", DYN2](rl_con),
-            d.meta.lt_dyn["cpu", DYN2](rl_smeta),
-            mf.joints.lt_dyn["cpu", DYN2](rl_joint),
-            mf.bodies.lt_dyn["cpu", DYN2](rl_body),
-            mf.meta.lt_dyn["cpu", DYN1](rl_mmeta),
-            mf.trees.lt_dyn["cpu", DYN1](rl_trees),
-            mf.equality.lt_dyn["cpu", DYN2](rl_eq),
-            mf.tendons.lt_dyn["cpu", DYN2](rl_ten),
-            mf.sites.lt_dyn["cpu", DYN2](rl_site),
-            mf.geoms.lt_dyn["cpu", DYN2](rl_geom_w),
-            mf.body_invweight0.lt_dyn["cpu", DYN2](rl_bw),
-            mf.dof_invweight0.lt_dyn["cpu", DYN1](rl_dw),
-            sc.cdof.lt_dyn["cpu", DYN2](rl_cdof),
-            sc.M.lt_dyn["cpu", DYN2](rl_m),
-            sc.m_inv.lt_dyn["cpu", DYN2](rl_m),
-            sc.L.lt_dyn["cpu", DYN2](rl_m),
-            sc.D.lt_dyn["cpu", DYN2](rl_nv),
-            mf.dof_parentid.lt_dyn["cpu", DYN1](rl_dw),
-            sc.qacc_constrained.lt_dyn["cpu", DYN2](rl_nv),
-            d.qacc_warmstart.lt_dyn["cpu", DYN2](rl_nv),
-            cs.solver.lt_dyn["cpu", DYN2](rl_solver),
-            d.efc_eq_force.lt_dyn["cpu", DYN2](rl_eqf),
+            d.qpos.tt_dyn["cpu", DYN2](rl_qpos),
+            d.qvel.tt_dyn["cpu", DYN2](rl_nv),
+            d.xpos.tt_dyn["cpu", DYN2](rl_b3),
+            d.xquat.tt_dyn["cpu", DYN2](rl_b4),
+            d.subtree_com.tt_dyn["cpu", DYN2](rl_b3),
+            d.contacts.tt_dyn["cpu", DYN2](rl_con),
+            d.meta.tt_dyn["cpu", DYN2](rl_smeta),
+            mf.joints.tt_dyn["cpu", DYN2](rl_joint),
+            mf.bodies.tt_dyn["cpu", DYN2](rl_body),
+            mf.meta.tt_dyn["cpu", DYN1](rl_mmeta),
+            mf.trees.tt_dyn["cpu", DYN1](rl_trees),
+            mf.equality.tt_dyn["cpu", DYN2](rl_eq),
+            mf.tendons.tt_dyn["cpu", DYN2](rl_ten),
+            mf.sites.tt_dyn["cpu", DYN2](rl_site),
+            mf.geoms.tt_dyn["cpu", DYN2](rl_geom_w),
+            mf.body_invweight0.tt_dyn["cpu", DYN2](rl_bw),
+            mf.dof_invweight0.tt_dyn["cpu", DYN1](rl_dw),
+            sc.cdof.tt_dyn["cpu", DYN2](rl_cdof),
+            sc.M.tt_dyn["cpu", DYN2](rl_m),
+            sc.m_inv.tt_dyn["cpu", DYN2](rl_m),
+            sc.L.tt_dyn["cpu", DYN2](rl_m),
+            sc.D.tt_dyn["cpu", DYN2](rl_nv),
+            mf.dof_parentid.tt_dyn["cpu", DYN1](rl_dw),
+            sc.qacc_constrained.tt_dyn["cpu", DYN2](rl_nv),
+            d.qacc_warmstart.tt_dyn["cpu", DYN2](rl_nv),
+            cs.solver.tt_dyn["cpu", DYN2](rl_solver),
+            d.efc_eq_force.tt_dyn["cpu", DYN2](rl_eqf),
         )
 
 

@@ -22,7 +22,7 @@ from max.gpu.sync import barrier
 from max.gpu.memory import AddressSpace
 from max.gpu.host import DeviceContext
 from std.time import perf_counter_ns
-from layout import Layout, LayoutTensor
+from noeira.core.tiles import Tile, tile, shared_tile
 
 comptime DT = DType.float32
 comptime TPB = 128
@@ -34,8 +34,8 @@ comptime BR = 8           # BLOCK_ROWS: 32x8 block, 4 elems/thread (variant C)
 def _t2d_naive[
     BATCH: Int, A: Int, B: Int
 ](
-    src: LayoutTensor[DT, Layout.row_major(BATCH, A * B), MutAnyOrigin],
-    dst: LayoutTensor[DT, Layout.row_major(BATCH, A * B), MutAnyOrigin],
+    src: Tile[DT, BATCH, A * B],
+    dst: Tile[DT, BATCH, A * B],
 ):
     var gid = Int(global_idx.x)
     comptime total = BATCH * A * B
@@ -52,16 +52,11 @@ def _t2d_naive[
 def _t2d_tiled[
     BATCH: Int, A: Int, B: Int
 ](
-    src: LayoutTensor[DT, Layout.row_major(BATCH, A * B), MutAnyOrigin],
-    dst: LayoutTensor[DT, Layout.row_major(BATCH, A * B), MutAnyOrigin],
+    src: Tile[DT, BATCH, A * B],
+    dst: Tile[DT, BATCH, A * B],
 ):
     # Tile in src-space: rows = i (A dim), cols = j (B dim).
-    var tile = LayoutTensor[
-        DT,
-        Layout.row_major(TILE, TILE + 1),   # +1 pad → no bank conflicts
-        MutAnyOrigin,
-        address_space=AddressSpace.SHARED,
-    ].stack_allocation()
+    var tile = shared_tile[DT, TILE, TILE + 1]()
 
     var b = Int(block_idx.z)
     var cy = Int(block_idx.y) * TILE        # tile origin in i (A)
@@ -87,15 +82,10 @@ def _t2d_tiled[
 def _t2d_tiled_br[
     BATCH: Int, A: Int, B: Int
 ](
-    src: LayoutTensor[DT, Layout.row_major(BATCH, A * B), MutAnyOrigin],
-    dst: LayoutTensor[DT, Layout.row_major(BATCH, A * B), MutAnyOrigin],
+    src: Tile[DT, BATCH, A * B],
+    dst: Tile[DT, BATCH, A * B],
 ):
-    var tile = LayoutTensor[
-        DT,
-        Layout.row_major(TILE, TILE + 1),
-        MutAnyOrigin,
-        address_space=AddressSpace.SHARED,
-    ].stack_allocation()
+    var tile = shared_tile[DT, TILE, TILE + 1]()
 
     var b = Int(block_idx.z)
     var cy = Int(block_idx.y) * TILE        # tile origin in i (A)
@@ -125,8 +115,8 @@ def _time[
     var d = ctx.enqueue_create_buffer[DT](BATCH * AB)
     _ = s.enqueue_fill(Scalar[DT](0.01))
     _ = d.enqueue_fill(Scalar[DT](0.0))
-    var sl = LayoutTensor[DT, Layout.row_major(BATCH, AB), MutAnyOrigin](s)
-    var dl = LayoutTensor[DT, Layout.row_major(BATCH, AB), MutAnyOrigin](d)
+    var sl = tile[BATCH, AB](s)
+    var dl = tile[BATCH, AB](d)
     var us = Float64(0)
 
     comptime gx = (B + TILE - 1) // TILE
@@ -200,8 +190,8 @@ def _verify[BATCH: Int, A: Int, B: Int, MODE: Int](ctx: DeviceContext) raises:
             for k in range(AB):
                 hs[b * AB + k] = Scalar[DT](b * 1000 + k)
     _ = d.enqueue_fill(Scalar[DT](-1.0))
-    var sl = LayoutTensor[DT, Layout.row_major(BATCH, AB), MutAnyOrigin](s)
-    var dl = LayoutTensor[DT, Layout.row_major(BATCH, AB), MutAnyOrigin](d)
+    var sl = tile[BATCH, AB](s)
+    var dl = tile[BATCH, AB](d)
     comptime gx = (B + TILE - 1) // TILE
     comptime gy = (A + TILE - 1) // TILE
     comptime if MODE == 1:

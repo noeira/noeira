@@ -20,7 +20,7 @@ from max.gpu import global_idx
 from max.gpu.host import DeviceContext
 from std.time import perf_counter_ns
 from std.testing import assert_true
-from layout import Layout, LayoutTensor
+from noeira.core.tiles import Tile, tile
 
 from noeira.nn.constants import DT, TPB
 from noeira.nn.core.tensor import Tensor
@@ -29,7 +29,7 @@ from noeira.nn.core.tensor import Tensor
 def _add_const_kernel[
     DIM: Int
 ](
-    v: LayoutTensor[DT, Layout.row_major(DIM), MutAnyOrigin],
+    v: Tile[DT, DIM],
     c: Scalar[DT],
 ):
     var i = Int(global_idx.x)
@@ -52,7 +52,7 @@ def main() raises:
         var tg = Tensor.alloc_gpu(ctx, TOTAL)  # zero-filled on device
         comptime nblk = (DIM + TPB - 1) // TPB
         for m in range(N):
-            var v = tg.lt_at["gpu", Layout.row_major(DIM)](m * DIM)
+            var v = tg.tt_at["gpu", DIM](m * DIM)
             ctx.enqueue_function[_add_const_kernel[DIM]](
                 v, Scalar[DT](m + 1), grid_dim=nblk, block_dim=TPB
             )
@@ -77,9 +77,7 @@ def main() raises:
         # OLD: LayoutTensor over unsafe_ptr()+offset
         for _ in range(WARMUP):
             for m in range(BN):
-                var v = LayoutTensor[
-                    DT, Layout.row_major(BDIM), MutAnyOrigin
-                ](tb.dev.value().unsafe_ptr().unsafe_offset(m * BDIM).as_unsafe_any_origin())
+                var v = tile[BDIM](tb.dev.value().unsafe_ptr().unsafe_offset(m * BDIM).as_unsafe_any_origin())
                 ctx.enqueue_function[_add_const_kernel[BDIM]](
                     v, tiny, grid_dim=bnblk, block_dim=TPB
                 )
@@ -87,9 +85,7 @@ def main() raises:
         var t0 = perf_counter_ns()
         for _ in range(ITERS):
             for m in range(BN):
-                var v = LayoutTensor[
-                    DT, Layout.row_major(BDIM), MutAnyOrigin
-                ](tb.dev.value().unsafe_ptr().unsafe_offset(m * BDIM).as_unsafe_any_origin())
+                var v = tile[BDIM](tb.dev.value().unsafe_ptr().unsafe_offset(m * BDIM).as_unsafe_any_origin())
                 ctx.enqueue_function[_add_const_kernel[BDIM]](
                     v, tiny, grid_dim=bnblk, block_dim=TPB
                 )
@@ -99,7 +95,7 @@ def main() raises:
         # NEW: lt_at (create_sub_buffer)
         for _ in range(WARMUP):
             for m in range(BN):
-                var v = tb.lt_at["gpu", Layout.row_major(BDIM)](m * BDIM)
+                var v = tb.tt_at["gpu", BDIM](m * BDIM)
                 ctx.enqueue_function[_add_const_kernel[BDIM]](
                     v, tiny, grid_dim=bnblk, block_dim=TPB
                 )
@@ -107,7 +103,7 @@ def main() raises:
         var t2 = perf_counter_ns()
         for _ in range(ITERS):
             for m in range(BN):
-                var v = tb.lt_at["gpu", Layout.row_major(BDIM)](m * BDIM)
+                var v = tb.tt_at["gpu", BDIM](m * BDIM)
                 ctx.enqueue_function[_add_const_kernel[BDIM]](
                     v, tiny, grid_dim=bnblk, block_dim=TPB
                 )

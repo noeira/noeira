@@ -15,7 +15,7 @@ from max.gpu.host import DeviceContext, DeviceBuffer
 from max.gpu import thread_idx, block_idx, block_dim
 from max.gpu.sync import barrier
 from max.gpu.memory import AddressSpace
-from layout import Layout, LayoutTensor
+from noeira.core.tiles import Tile, tile, shared_tile
 
 from noeira.nn.constants import DT as dtype
 from noeira.core.fmt import fit
@@ -41,9 +41,9 @@ comptime BENCHMARK_ITERS = 100
 def matmul_kernel_tile8[
     M: Int, K: Int, N: Int
 ](
-    A: LayoutTensor[dtype, Layout.row_major(M, K), MutAnyOrigin],
-    B: LayoutTensor[dtype, Layout.row_major(K, N), MutAnyOrigin],
-    C: LayoutTensor[dtype, Layout.row_major(M, N), MutAnyOrigin],
+    A: Tile[dtype, M, K],
+    B: Tile[dtype, K, N],
+    C: Tile[dtype, M, N],
 ):
     """Tiled matmul with TILE=8."""
     comptime TILE = 8
@@ -56,19 +56,9 @@ def matmul_kernel_tile8[
         return
 
     # Shared memory tiles
-    var a_shared = LayoutTensor[
-        dtype,
-        Layout.row_major(TILE, TILE),
-        MutAnyOrigin,
-        address_space=AddressSpace.SHARED,
-    ].stack_allocation()
+    var a_shared = shared_tile[dtype, TILE, TILE]()
 
-    var b_shared = LayoutTensor[
-        dtype,
-        Layout.row_major(TILE, TILE),
-        MutAnyOrigin,
-        address_space=AddressSpace.SHARED,
-    ].stack_allocation()
+    var b_shared = shared_tile[dtype, TILE, TILE]()
 
     var acc: Scalar[dtype] = 0.0
 
@@ -104,9 +94,9 @@ def matmul_kernel_tile8[
 def matmul_kernel_tile16[
     M: Int, K: Int, N: Int
 ](
-    A: LayoutTensor[dtype, Layout.row_major(M, K), MutAnyOrigin],
-    B: LayoutTensor[dtype, Layout.row_major(K, N), MutAnyOrigin],
-    C: LayoutTensor[dtype, Layout.row_major(M, N), MutAnyOrigin],
+    A: Tile[dtype, M, K],
+    B: Tile[dtype, K, N],
+    C: Tile[dtype, M, N],
 ):
     """Tiled matmul with TILE=16."""
     comptime TILE = 16
@@ -118,19 +108,9 @@ def matmul_kernel_tile16[
     if row >= M or col >= N:
         return
 
-    var a_shared = LayoutTensor[
-        dtype,
-        Layout.row_major(TILE, TILE),
-        MutAnyOrigin,
-        address_space=AddressSpace.SHARED,
-    ].stack_allocation()
+    var a_shared = shared_tile[dtype, TILE, TILE]()
 
-    var b_shared = LayoutTensor[
-        dtype,
-        Layout.row_major(TILE, TILE),
-        MutAnyOrigin,
-        address_space=AddressSpace.SHARED,
-    ].stack_allocation()
+    var b_shared = shared_tile[dtype, TILE, TILE]()
 
     var acc: Scalar[dtype] = 0.0
 
@@ -162,9 +142,9 @@ def matmul_kernel_tile16[
 def matmul_kernel_tile32[
     M: Int, K: Int, N: Int
 ](
-    A: LayoutTensor[dtype, Layout.row_major(M, K), MutAnyOrigin],
-    B: LayoutTensor[dtype, Layout.row_major(K, N), MutAnyOrigin],
-    C: LayoutTensor[dtype, Layout.row_major(M, N), MutAnyOrigin],
+    A: Tile[dtype, M, K],
+    B: Tile[dtype, K, N],
+    C: Tile[dtype, M, N],
 ):
     """Tiled matmul with TILE=32."""
     comptime TILE = 32
@@ -176,19 +156,9 @@ def matmul_kernel_tile32[
     if row >= M or col >= N:
         return
 
-    var a_shared = LayoutTensor[
-        dtype,
-        Layout.row_major(TILE, TILE),
-        MutAnyOrigin,
-        address_space=AddressSpace.SHARED,
-    ].stack_allocation()
+    var a_shared = shared_tile[dtype, TILE, TILE]()
 
-    var b_shared = LayoutTensor[
-        dtype,
-        Layout.row_major(TILE, TILE),
-        MutAnyOrigin,
-        address_space=AddressSpace.SHARED,
-    ].stack_allocation()
+    var b_shared = shared_tile[dtype, TILE, TILE]()
 
     var acc: Scalar[dtype] = 0.0
 
@@ -225,8 +195,8 @@ def matmul_kernel_tile32[
 def relu_kernel[
     SIZE: Int, TPB: Int
 ](
-    x: LayoutTensor[dtype, Layout.row_major(SIZE), MutAnyOrigin],
-    y: LayoutTensor[dtype, Layout.row_major(SIZE), MutAnyOrigin],
+    x: Tile[dtype, SIZE],
+    y: Tile[dtype, SIZE],
 ):
     """ReLU kernel with parameterized TPB."""
     var idx = Int(block_idx.x * UInt(TPB) + thread_idx.x)
@@ -239,9 +209,9 @@ def relu_kernel[
 def add_kernel[
     SIZE: Int, TPB: Int
 ](
-    a: LayoutTensor[dtype, Layout.row_major(SIZE), MutAnyOrigin],
-    b: LayoutTensor[dtype, Layout.row_major(SIZE), MutAnyOrigin],
-    c: LayoutTensor[dtype, Layout.row_major(SIZE), MutAnyOrigin],
+    a: Tile[dtype, SIZE],
+    b: Tile[dtype, SIZE],
+    c: Tile[dtype, SIZE],
 ):
     """Add kernel with parameterized TPB."""
     var idx = Int(block_idx.x * UInt(TPB) + thread_idx.x)
@@ -279,15 +249,9 @@ def benchmark_matmul_tile[TILE: Int](ctx: DeviceContext) raises -> Float64:
     ctx.enqueue_copy(b_buf, b_data.unsafe_ptr())
     ctx.synchronize()
 
-    var a = LayoutTensor[dtype, Layout.row_major(M, K), MutAnyOrigin](
-        a_buf.unsafe_ptr()
-    )
-    var b = LayoutTensor[dtype, Layout.row_major(K, N), MutAnyOrigin](
-        b_buf.unsafe_ptr()
-    )
-    var c = LayoutTensor[dtype, Layout.row_major(M, N), MutAnyOrigin](
-        c_buf.unsafe_ptr()
-    )
+    var a = tile[M, K](a_buf.unsafe_ptr())
+    var b = tile[K, N](b_buf.unsafe_ptr())
+    var c = tile[M, N](c_buf.unsafe_ptr())
 
     comptime BLOCKS_X = (N + TILE - 1) // TILE
     comptime BLOCKS_Y = (M + TILE - 1) // TILE
@@ -297,9 +261,9 @@ def benchmark_matmul_tile[TILE: Int](ctx: DeviceContext) raises -> Float64:
 
         @always_inline
         def kernel8(
-            a: LayoutTensor[dtype, Layout.row_major(M, K), MutAnyOrigin],
-            b: LayoutTensor[dtype, Layout.row_major(K, N), MutAnyOrigin],
-            c: LayoutTensor[dtype, Layout.row_major(M, N), MutAnyOrigin],
+            a: Tile[dtype, M, K],
+            b: Tile[dtype, K, N],
+            c: Tile[dtype, M, N],
         ):
             matmul_kernel_tile8[M, K, N](a, b, c)
 
@@ -331,9 +295,9 @@ def benchmark_matmul_tile[TILE: Int](ctx: DeviceContext) raises -> Float64:
 
         @always_inline
         def kernel16(
-            a: LayoutTensor[dtype, Layout.row_major(M, K), MutAnyOrigin],
-            b: LayoutTensor[dtype, Layout.row_major(K, N), MutAnyOrigin],
-            c: LayoutTensor[dtype, Layout.row_major(M, N), MutAnyOrigin],
+            a: Tile[dtype, M, K],
+            b: Tile[dtype, K, N],
+            c: Tile[dtype, M, N],
         ):
             matmul_kernel_tile16[M, K, N](a, b, c)
 
@@ -365,9 +329,9 @@ def benchmark_matmul_tile[TILE: Int](ctx: DeviceContext) raises -> Float64:
 
         @always_inline
         def kernel32(
-            a: LayoutTensor[dtype, Layout.row_major(M, K), MutAnyOrigin],
-            b: LayoutTensor[dtype, Layout.row_major(K, N), MutAnyOrigin],
-            c: LayoutTensor[dtype, Layout.row_major(M, N), MutAnyOrigin],
+            a: Tile[dtype, M, K],
+            b: Tile[dtype, K, N],
+            c: Tile[dtype, M, N],
         ):
             matmul_kernel_tile32[M, K, N](a, b, c)
 
@@ -418,28 +382,22 @@ def benchmark_elementwise_tpb[TPB: Int](ctx: DeviceContext) raises -> Float64:
     ctx.enqueue_copy(b_buf, b_data.unsafe_ptr())
     ctx.synchronize()
 
-    var a = LayoutTensor[dtype, Layout.row_major(SIZE), MutAnyOrigin](
-        a_buf.unsafe_ptr()
-    )
-    var b = LayoutTensor[dtype, Layout.row_major(SIZE), MutAnyOrigin](
-        b_buf.unsafe_ptr()
-    )
-    var c = LayoutTensor[dtype, Layout.row_major(SIZE), MutAnyOrigin](
-        c_buf.unsafe_ptr()
-    )
+    var a = tile[SIZE](a_buf.unsafe_ptr())
+    var b = tile[SIZE](b_buf.unsafe_ptr())
+    var c = tile[SIZE](c_buf.unsafe_ptr())
 
     @always_inline
     def relu_wrapper(
-        x: LayoutTensor[dtype, Layout.row_major(SIZE), MutAnyOrigin],
-        y: LayoutTensor[dtype, Layout.row_major(SIZE), MutAnyOrigin],
+        x: Tile[dtype, SIZE],
+        y: Tile[dtype, SIZE],
     ):
         relu_kernel[SIZE, TPB](x, y)
 
     @always_inline
     def add_wrapper(
-        a: LayoutTensor[dtype, Layout.row_major(SIZE), MutAnyOrigin],
-        b: LayoutTensor[dtype, Layout.row_major(SIZE), MutAnyOrigin],
-        c: LayoutTensor[dtype, Layout.row_major(SIZE), MutAnyOrigin],
+        a: Tile[dtype, SIZE],
+        b: Tile[dtype, SIZE],
+        c: Tile[dtype, SIZE],
     ):
         add_kernel[SIZE, TPB](a, b, c)
 
@@ -511,21 +469,11 @@ def benchmark_combined[
     ctx.enqueue_copy(w_buf, w_data.unsafe_ptr())
     ctx.synchronize()
 
-    var a = LayoutTensor[dtype, Layout.row_major(M, K), MutAnyOrigin](
-        a_buf.unsafe_ptr()
-    )
-    var w = LayoutTensor[dtype, Layout.row_major(K, N), MutAnyOrigin](
-        w_buf.unsafe_ptr()
-    )
-    var out = LayoutTensor[dtype, Layout.row_major(M, N), MutAnyOrigin](
-        out_buf.unsafe_ptr()
-    )
-    var relu_out = LayoutTensor[dtype, Layout.row_major(SIZE), MutAnyOrigin](
-        relu_buf.unsafe_ptr()
-    )
-    var out_flat = LayoutTensor[dtype, Layout.row_major(SIZE), MutAnyOrigin](
-        out_buf.unsafe_ptr()
-    )
+    var a = tile[M, K](a_buf.unsafe_ptr())
+    var w = tile[K, N](w_buf.unsafe_ptr())
+    var out = tile[M, N](out_buf.unsafe_ptr())
+    var relu_out = tile[SIZE](relu_buf.unsafe_ptr())
+    var out_flat = tile[SIZE](out_buf.unsafe_ptr())
 
     comptime MATMUL_BLOCKS_X = (N + TILE - 1) // TILE
     comptime MATMUL_BLOCKS_Y = (M + TILE - 1) // TILE
@@ -533,9 +481,9 @@ def benchmark_combined[
 
     @always_inline
     def matmul_wrapper(
-        a: LayoutTensor[dtype, Layout.row_major(M, K), MutAnyOrigin],
-        b: LayoutTensor[dtype, Layout.row_major(K, N), MutAnyOrigin],
-        c: LayoutTensor[dtype, Layout.row_major(M, N), MutAnyOrigin],
+        a: Tile[dtype, M, K],
+        b: Tile[dtype, K, N],
+        c: Tile[dtype, M, N],
     ):
         comptime if TILE == 8:
             matmul_kernel_tile8[M, K, N](a, b, c)
@@ -546,8 +494,8 @@ def benchmark_combined[
 
     @always_inline
     def relu_wrapper(
-        x: LayoutTensor[dtype, Layout.row_major(SIZE), MutAnyOrigin],
-        y: LayoutTensor[dtype, Layout.row_major(SIZE), MutAnyOrigin],
+        x: Tile[dtype, SIZE],
+        y: Tile[dtype, SIZE],
     ):
         relu_kernel[SIZE, TPB](x, y)
 

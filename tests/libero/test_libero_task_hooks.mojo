@@ -50,7 +50,7 @@ copied and pinned words are printed and required non-zero.
 from std.os import listdir
 from std.os.path import exists
 
-from layout import Layout, LayoutTensor
+from noeira.core.tiles import RowMajor
 from noeira.nn.core.tensor import TensorImpl
 from noeira.physics3d.gpu.constants import (
     METADATA_SIZE, META_IDX_TASK_ACTIVE, META_IDX_TASK_PARAM_0,
@@ -349,12 +349,12 @@ def _family[T: PlacementTable](
     var radii = List[Float64](length=len(f.slots), fill=0.02)
     var tasks = _tasks_of(name)
 
-    comptime L_Q = Layout.row_major(B, NQ)
-    comptime L_V = Layout.row_major(B, NV)
-    comptime L_XP = Layout.row_major(B, NB * 3)
-    comptime L_SP = Layout.row_major(B, NS * 3)
-    comptime L_M = Layout.row_major(B, METADATA_SIZE)
-    comptime L_O = Layout.row_major(B, OD)
+    comptime L_Q = RowMajor[B, NQ]
+    comptime L_V = RowMajor[B, NV]
+    comptime L_XP = RowMajor[B, NB * 3]
+    comptime L_SP = RowMajor[B, NS * 3]
+    comptime L_M = RowMajor[B, METADATA_SIZE]
+    comptime L_O = RowMajor[B, OD]
 
     for ti in range(len(tasks)):
         acc.tasks += 1
@@ -470,12 +470,12 @@ def _family[T: PlacementTable](
             acc.lanes += 1
 
         # ── the device writer ──
-        var qt = qs.lt["cpu", L_Q]()
-        var vt = vs.lt["cpu", L_V]()
-        var xt = xs.lt["cpu", L_XP]()
-        var st = ss.lt["cpu", L_SP]()
-        var mt = ms.lt["cpu", L_M]()
-        var ot = os.lt["cpu", L_O]()
+        var qt = qs.tt["cpu", B, NQ]()
+        var vt = vs.tt["cpu", B, NV]()
+        var xt = xs.tt["cpu", B, NB * 3]()
+        var st = ss.tt["cpu", B, NS * 3]()
+        var mt = ms.tt["cpu", B, METADATA_SIZE]()
+        var ot = os.tt["cpu", B, OD]()
         for lane in range(B):
             write_task_obs[T, DT, B, NQ, NV, NB, NS * 3, OD](
                 qt, vt, xt, st, mt, ot, lane
@@ -1044,21 +1044,21 @@ def _config_hooks[T: PlacementTable, M: ModelDefLike, C: Phyics3dEnvConfig](
         fmd.site_names, fmd.joint_names, jadr,
     )
 
-    comptime L_Q = Layout.row_major(B, NQ)
-    comptime L_V = Layout.row_major(B, NV)
-    comptime L_B3 = Layout.row_major(B, NB * 3)
-    comptime L_B4 = Layout.row_major(B, NB * 4)
-    comptime L_B6 = Layout.row_major(B, NB * 6)
-    comptime L_S3 = Layout.row_major(B, NS * 3)
-    comptime L_M = Layout.row_major(B, METADATA_SIZE)
-    comptime L_O = Layout.row_major(B, OD)
-    comptime L_CON = Layout.row_major(B, MCG * CONTACT_SIZE)
-    comptime L_BR = Layout.row_major(NB, MODEL_BODY_SIZE)
-    comptime L_SR = Layout.row_major(NS, MODEL_SITE_SIZE)
-    comptime L_GR = Layout.row_major(NG, MODEL_GEOM_SIZE)
-    comptime L_CUR = Layout.row_major(1, MODEL_CURRICULUM_SIZE)
-    comptime L_ACT = Layout.row_major(B, 7)
-    comptime L_NA = Layout.row_major(B, NA)
+    comptime L_Q = RowMajor[B, NQ]
+    comptime L_V = RowMajor[B, NV]
+    comptime L_B3 = RowMajor[B, NB * 3]
+    comptime L_B4 = RowMajor[B, NB * 4]
+    comptime L_B6 = RowMajor[B, NB * 6]
+    comptime L_S3 = RowMajor[B, NS * 3]
+    comptime L_M = RowMajor[B, METADATA_SIZE]
+    comptime L_O = RowMajor[B, OD]
+    comptime L_CON = RowMajor[B, MCG * CONTACT_SIZE]
+    comptime L_BR = RowMajor[NB, MODEL_BODY_SIZE]
+    comptime L_SR = RowMajor[NS, MODEL_SITE_SIZE]
+    comptime L_GR = RowMajor[NG, MODEL_GEOM_SIZE]
+    comptime L_CUR = RowMajor[1, MODEL_CURRICULUM_SIZE]
+    comptime L_ACT = RowMajor[B, 7]
+    comptime L_NA = RowMajor[B, NA]
 
     var qs = TensorImpl[DT].alloc(B * NQ)
     var vs = TensorImpl[DT].alloc(B * NV)
@@ -1143,18 +1143,18 @@ def _config_hooks[T: PlacementTable, M: ModelDefLike, C: Phyics3dEnvConfig](
         _ = C.custom_extract_obs_gpu[
             DT, B, NQ, NV, NB, OD, NS * 3, MCG, NS, NG, NA
         ](
-            qs.lt["cpu", L_Q](), vs.lt["cpu", L_V](), xp.lt["cpu", L_B3](),
-            xq.lt["cpu", L_B4](), xv.lt["cpu", L_B3](), br.lt["cpu", L_BR](),
-            sp.lt["cpu", L_S3](), con.lt["cpu", L_CON](), sr.lt["cpu", L_SR](),
-            gr.lt["cpu", L_GR](), ms.lt["cpu", L_M](), o_cfg.lt["cpu", L_O](),
-            xip.lt["cpu", L_B3](), xav.lt["cpu", L_B3](), cv.lt["cpu", L_B6](),
-            ca.lt["cpu", L_B6](), cfi.lt["cpu", L_B6](), stc.lt["cpu", L_B3](),
-            spa.lt["cpu", L_S3](), xqa.lt["cpu", L_B4](), actv.lt["cpu", L_NA](),
+            qs.tt["cpu", B, NQ](), vs.tt["cpu", B, NV](), xp.tt["cpu", B, NB * 3](),
+            xq.tt["cpu", B, NB * 4](), xv.tt["cpu", B, NB * 3](), br.tt["cpu", NB, MODEL_BODY_SIZE](),
+            sp.tt["cpu", B, NS * 3](), con.tt["cpu", B, MCG * CONTACT_SIZE](), sr.tt["cpu", NS, MODEL_SITE_SIZE](),
+            gr.tt["cpu", NG, MODEL_GEOM_SIZE](), ms.tt["cpu", B, METADATA_SIZE](), o_cfg.tt["cpu", B, OD](),
+            xip.tt["cpu", B, NB * 3](), xav.tt["cpu", B, NB * 3](), cv.tt["cpu", B, NB * 6](),
+            ca.tt["cpu", B, NB * 6](), cfi.tt["cpu", B, NB * 6](), stc.tt["cpu", B, NB * 3](),
+            spa.tt["cpu", B, NS * 3](), xqa.tt["cpu", B, NB * 4](), actv.tt["cpu", B, NA](),
             lane,
         )
         write_task_obs[T, DT, B, NQ, NV, NB, NS * 3, OD](
-            qs.lt["cpu", L_Q](), vs.lt["cpu", L_V](), xp.lt["cpu", L_B3](),
-            sp.lt["cpu", L_S3](), ms.lt["cpu", L_M](), o_hlp.lt["cpu", L_O](),
+            qs.tt["cpu", B, NQ](), vs.tt["cpu", B, NV](), xp.tt["cpu", B, NB * 3](),
+            sp.tt["cpu", B, NS * 3](), ms.tt["cpu", B, METADATA_SIZE](), o_hlp.tt["cpu", B, OD](),
             lane,
         )
     var obs_same = True
@@ -1202,10 +1202,10 @@ def _config_hooks[T: PlacementTable, M: ModelDefLike, C: Phyics3dEnvConfig](
         vs2.data[i] = vs.data[i]
     for lane in range(B):
         C.pre_step_full_gpu[DT, B, NQ, NV](
-            qs.lt["cpu", L_Q](), vs.lt["cpu", L_V](), ms.lt["cpu", L_M](), lane
+            qs.tt["cpu", B, NQ](), vs.tt["cpu", B, NV](), ms.tt["cpu", B, METADATA_SIZE](), lane
         )
         repark_inactive_slots[T, DT, B, NQ, NV](
-            qs2.lt["cpu", L_Q](), vs2.lt["cpu", L_V](), ms.lt["cpu", L_M](), lane
+            qs2.tt["cpu", B, NQ](), vs2.tt["cpu", B, NV](), ms.tt["cpu", B, METADATA_SIZE](), lane
         )
     var rp_same = True
     for i in range(B * NQ):
@@ -1235,20 +1235,20 @@ def _config_hooks[T: PlacementTable, M: ModelDefLike, C: Phyics3dEnvConfig](
         var res = C.compute_reward_and_done_gpu[
             DT, B, NQ, NV, NB, 7, NS * 3, MCG, NS, NG, NA
         ](
-            qs.lt["cpu", L_Q](), vs.lt["cpu", L_V](), xp.lt["cpu", L_B3](),
-            xip.lt["cpu", L_B3](), xq.lt["cpu", L_B4](), xv.lt["cpu", L_B3](),
-            br.lt["cpu", L_BR](), sp.lt["cpu", L_S3](), con.lt["cpu", L_CON](),
-            sr.lt["cpu", L_SR](), gr.lt["cpu", L_GR](), cfe.lt["cpu", L_B6](),
-            cv.lt["cpu", L_B6](), ms.lt["cpu", L_M](), cur.lt["cpu", L_CUR](),
-            acts.lt["cpu", L_ACT](), xav.lt["cpu", L_B3](), ca.lt["cpu", L_B6](),
-            cfi.lt["cpu", L_B6](), stc.lt["cpu", L_B3](), spa.lt["cpu", L_S3](),
-            xqa.lt["cpu", L_B4](), actv.lt["cpu", L_NA](), 0, 0, 25,
+            qs.tt["cpu", B, NQ](), vs.tt["cpu", B, NV](), xp.tt["cpu", B, NB * 3](),
+            xip.tt["cpu", B, NB * 3](), xq.tt["cpu", B, NB * 4](), xv.tt["cpu", B, NB * 3](),
+            br.tt["cpu", NB, MODEL_BODY_SIZE](), sp.tt["cpu", B, NS * 3](), con.tt["cpu", B, MCG * CONTACT_SIZE](),
+            sr.tt["cpu", NS, MODEL_SITE_SIZE](), gr.tt["cpu", NG, MODEL_GEOM_SIZE](), cfe.tt["cpu", B, NB * 6](),
+            cv.tt["cpu", B, NB * 6](), ms.tt["cpu", B, METADATA_SIZE](), cur.tt["cpu", 1, MODEL_CURRICULUM_SIZE](),
+            acts.tt["cpu", B, 7](), xav.tt["cpu", B, NB * 3](), ca.tt["cpu", B, NB * 6](),
+            cfi.tt["cpu", B, NB * 6](), stc.tt["cpu", B, NB * 3](), spa.tt["cpu", B, NS * 3](),
+            xqa.tt["cpu", B, NB * 4](), actv.tt["cpu", B, NA](), 0, 0, 25,
             Scalar[DT](0.002),
         )
         var kern = eval_tape_gpu[DT, B, NB, NS * 3, NQ, NS, MCG](
-            ms.lt["cpu", L_M](), cur.lt["cpu", L_CUR](), xp.lt["cpu", L_B3](),
-            xq.lt["cpu", L_B4](), sp.lt["cpu", L_S3](), qs.lt["cpu", L_Q](),
-            sr.lt["cpu", L_SR](), br.lt["cpu", L_BR](), con.lt["cpu", L_CON](), 0,
+            ms.tt["cpu", B, METADATA_SIZE](), cur.tt["cpu", 1, MODEL_CURRICULUM_SIZE](), xp.tt["cpu", B, NB * 3](),
+            xq.tt["cpu", B, NB * 4](), sp.tt["cpu", B, NS * 3](), qs.tt["cpu", B, NQ](),
+            sr.tt["cpu", NS, MODEL_SITE_SIZE](), br.tt["cpu", NB, MODEL_BODY_SIZE](), con.tt["cpu", B, MCG * CONTACT_SIZE](), 0,
         )
         var r = Float64(res[0])
         var gh = Float64(ms.data[META_IDX_GOAL_HELD])

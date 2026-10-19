@@ -53,7 +53,7 @@ Run with:
 from max.gpu import thread_idx
 from std.sys import default_accelerator
 from std.testing import assert_true, TestSuite
-from layout import Layout, LayoutTensor
+from noeira.core.tiles import Tile, tile
 from max.gpu.host import DeviceContext, DeviceBuffer
 
 from noeira.nn.constants import DT
@@ -90,7 +90,7 @@ def test_record_replay_contract() raises:
     # top-level def for the HOST, and a GPU kernel fails there with "target
     # does not support operation: _get_intrinsic_name".
     @always_inline
-    def _bump(buf: LayoutTensor[DT, Layout.row_major(1), MutAnyOrigin]):
+    def _bump(buf: Tile[DT, 1]):
         if Int(thread_idx.x) != 0:
             return
         buf[0] = buf[0] + Scalar[DT](1.0)
@@ -121,7 +121,7 @@ def test_record_replay_contract() raises:
     # work is still correct, the graph is still built, and it records NOTHING.
     # Nothing raises. The counter is what tells you — it lands on CALLS+1.
     def _step(gctx: DeviceContext) capturing raises -> None:
-        var v = LayoutTensor[DT, Layout.row_major(1)](buf)
+        var v = tile[1](buf)
         gctx.enqueue_function[_bump](v, grid_dim=1, block_dim=1)
 
     var slot = GraphSlot()

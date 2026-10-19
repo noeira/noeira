@@ -256,18 +256,18 @@ def test_ray_model_vs_mujoco() raises:
     # kernel where a thread owns one ray and cannot hold a scene.
     var ng = b.dims.get_ngeom()
     var nb = b.dims.get_nbody()
-    var geoms_v = b.m.geoms.lt_dyn["cpu", DYN2](rl2(ng, MODEL_GEOM_SIZE))
-    var bodies_v = b.m.bodies.lt_dyn["cpu", DYN2](rl2(nb, MODEL_BODY_SIZE))
-    var xpos_v = b.d.xpos.lt_dyn["cpu", DYN2](rl2(1, nb * 3))
-    var xquat_v = b.d.xquat.lt_dyn["cpu", DYN2](rl2(1, nb * 4))
-    var mesh_meta_v = b.m.mesh_meta.lt_dyn["cpu", DYN1](
+    var geoms_v = b.m.geoms.tt_dyn["cpu", DYN2](rl2(ng, MODEL_GEOM_SIZE))
+    var bodies_v = b.m.bodies.tt_dyn["cpu", DYN2](rl2(nb, MODEL_BODY_SIZE))
+    var xpos_v = b.d.xpos.tt_dyn["cpu", DYN2](rl2(1, nb * 3))
+    var xquat_v = b.d.xquat.tt_dyn["cpu", DYN2](rl2(1, nb * 4))
+    var mesh_meta_v = b.m.mesh_meta.tt_dyn["cpu", DYN1](
         rl1(MAX_GPU_MESHES * MODEL_MESH_META_SIZE)
     )
-    var mesh_tris_v = b.m.mesh_tris.lt_dyn["cpu", DYN1](rl1(64 * 9))
-    var hf_meta_v = b.m.hfield_meta.lt_dyn["cpu", DYN1](
+    var mesh_tris_v = b.m.mesh_tris.tt_dyn["cpu", DYN1](rl1(64 * 9))
+    var hf_meta_v = b.m.hfield_meta.tt_dyn["cpu", DYN1](
         rl1(MAX_GPU_HFIELDS * MODEL_HFIELD_META_SIZE)
     )
-    var hf_data_v = b.d.hfield_data.lt_dyn["cpu", DYN1](
+    var hf_data_v = b.d.hfield_data.tt_dyn["cpu", DYN1](
         rl1(b.dims.get_nhfield_data())
     )
 

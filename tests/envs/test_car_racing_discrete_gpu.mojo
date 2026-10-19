@@ -7,7 +7,6 @@ produce finite normalized observations, and episodes terminate.
 Run: pixi run -e apple mojo run -I . tests/envs/test_car_racing_discrete_gpu.mojo
 """
 
-from layout import Layout, LayoutTensor
 from max.gpu.host import DeviceContext
 from noeira.physics2d import dtype
 from noeira.envs.car_racing import CarRacingDiscrete

@@ -15,7 +15,6 @@ Run: pixi run -e apple mojo run -I . tests/physics3d/test_fluid_fields_vs_mujoco
 from std.math import abs
 from std.sys import default_accelerator
 from max.gpu.host import DeviceContext
-from layout import Layout
 
 from noeira.nn.core.tensor import TensorImpl
 from noeira.physics3d.fields import (

@@ -80,7 +80,7 @@ from max.gpu import thread_idx, block_idx, block_dim
 from max.gpu.host import DeviceContext, DeviceBuffer
 from std.sys import default_accelerator
 from std.testing import assert_true, TestSuite
-from layout import Layout, LayoutTensor
+from noeira.core.tiles import Tile, tile
 
 from noeira.nn.constants import DT
 from noeira.cuda import CUDAGraph, maybe_capture_replay
@@ -109,7 +109,7 @@ def test_capture_records_nodes() raises:
     # `Phyics3dBatchedEnv` uses for its kernels.
     @always_inline
     def _bump_kernel(
-        buf: LayoutTensor[DT, Layout.row_major(1), MutAnyOrigin],
+        buf: Tile[DT, 1],
     ):
         """`buf[0] += 1`. One thread — the smallest thing a graph can hold."""
         if Int(thread_idx.x) != 0:
@@ -118,7 +118,7 @@ def test_capture_records_nodes() raises:
 
     var ctx = DeviceContext()
     var buf = ctx.enqueue_create_buffer[DT](1)
-    var lt = LayoutTensor[DT, Layout.row_major(1)](buf)
+    var lt = tile[1](buf)
 
     # ⚠ Stream discovery needs a prior launch — see `CUDAGraph.__init__`.
     # Constructing the graph before any kernel has run is itself a way to get
@@ -179,7 +179,7 @@ def test_replay_executes_the_captured_work() raises:
     # `Phyics3dBatchedEnv` uses for its kernels.
     @always_inline
     def _bump_kernel(
-        buf: LayoutTensor[DT, Layout.row_major(1), MutAnyOrigin],
+        buf: Tile[DT, 1],
     ):
         """`buf[0] += 1`. One thread — the smallest thing a graph can hold."""
         if Int(thread_idx.x) != 0:
@@ -189,7 +189,7 @@ def test_replay_executes_the_captured_work() raises:
     var ctx = DeviceContext()
     var buf = ctx.enqueue_create_buffer[DT](1)
     buf.enqueue_fill(Scalar[DT](0))
-    var lt = LayoutTensor[DT, Layout.row_major(1)](buf)
+    var lt = tile[1](buf)
 
     ctx.enqueue_function[_bump_kernel](lt, grid_dim=1, block_dim=1)
     ctx.synchronize()
@@ -275,7 +275,7 @@ def test_maybe_capture_replay_lifecycle() raises:
     # `Phyics3dBatchedEnv` uses for its kernels.
     @always_inline
     def _bump_kernel(
-        buf: LayoutTensor[DT, Layout.row_major(1), MutAnyOrigin],
+        buf: Tile[DT, 1],
     ):
         """`buf[0] += 1`. One thread — the smallest thing a graph can hold."""
         if Int(thread_idx.x) != 0:
@@ -285,7 +285,7 @@ def test_maybe_capture_replay_lifecycle() raises:
     var ctx = DeviceContext()
     var buf = ctx.enqueue_create_buffer[DT](1)
     buf.enqueue_fill(Scalar[DT](0))
-    var lt = LayoutTensor[DT, Layout.row_major(1)](buf)
+    var lt = tile[1](buf)
 
     ctx.enqueue_function[_bump_kernel](lt, grid_dim=1, block_dim=1)
     ctx.synchronize()

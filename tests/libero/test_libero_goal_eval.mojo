@@ -41,7 +41,8 @@ which are asserted.
 from std.os.path import exists
 from std.sys import has_accelerator
 from max.gpu import thread_idx, block_idx, block_dim
-from layout import Layout, LayoutTensor
+from layout import TileTensor
+from noeira.core.tiles import RowMajor
 from max.gpu.host import DeviceContext
 
 from noeira.nn.core.tensor import TensorImpl
@@ -92,25 +93,25 @@ comptime SETTLE_STEPS = 400   # 0.8 s at the family's 2 ms timestep
 comptime DROP = 0.04          # metres above the resting surface
 comptime TABLE_Z = 0.9        # the workspace site's z
 
-comptime L_META = Layout.row_major(1, METADATA_SIZE)
-comptime L_CUR = Layout.row_major(1, MODEL_CURRICULUM_SIZE)
-comptime L_XP = Layout.row_major(1, NB * 3)
-comptime L_XQ = Layout.row_major(1, NB * 4)
-comptime L_SP = Layout.row_major(1, NS * 3)
-comptime L_QP = Layout.row_major(1, NQ)
-comptime L_SITES = Layout.row_major(NS, MODEL_SITE_SIZE)
-comptime L_BODIES = Layout.row_major(NB, MODEL_BODY_SIZE)
-comptime L_CON = Layout.row_major(1, MC * CONTACT_SIZE)
+comptime L_META = RowMajor[1, METADATA_SIZE]
+comptime L_CUR = RowMajor[1, MODEL_CURRICULUM_SIZE]
+comptime L_XP = RowMajor[1, NB * 3]
+comptime L_XQ = RowMajor[1, NB * 4]
+comptime L_SP = RowMajor[1, NS * 3]
+comptime L_QP = RowMajor[1, NQ]
+comptime L_SITES = RowMajor[NS, MODEL_SITE_SIZE]
+comptime L_BODIES = RowMajor[NB, MODEL_BODY_SIZE]
+comptime L_CON = RowMajor[1, MC * CONTACT_SIZE]
 
 # the device leg: ten lanes, one task each
-comptime L_META32 = Layout.row_major(N_TASKS, METADATA_SIZE)
-comptime L_CUR32 = Layout.row_major(1, MODEL_CURRICULUM_SIZE)
-comptime L_XP32 = Layout.row_major(N_TASKS, NB * 3)
-comptime L_XQ32 = Layout.row_major(N_TASKS, NB * 4)
-comptime L_SP32 = Layout.row_major(N_TASKS, NS * 3)
-comptime L_QP32 = Layout.row_major(N_TASKS, NQ)
-comptime L_CON32 = Layout.row_major(N_TASKS, MC * CONTACT_SIZE)
-comptime L_OUT32 = Layout.row_major(N_TASKS, 2)
+comptime L_META32 = RowMajor[N_TASKS, METADATA_SIZE]
+comptime L_CUR32 = RowMajor[1, MODEL_CURRICULUM_SIZE]
+comptime L_XP32 = RowMajor[N_TASKS, NB * 3]
+comptime L_XQ32 = RowMajor[N_TASKS, NB * 4]
+comptime L_SP32 = RowMajor[N_TASKS, NS * 3]
+comptime L_QP32 = RowMajor[N_TASKS, NQ]
+comptime L_CON32 = RowMajor[N_TASKS, MC * CONTACT_SIZE]
+comptime L_OUT32 = RowMajor[N_TASKS, 2]
 
 
 struct Tally(Copyable, ImplicitlyCopyable, Movable):
@@ -149,16 +150,16 @@ def _task_stems() -> List[String]:
 
 
 def _lane_kernel(
-    meta: LayoutTensor[F32, L_META32, MutAnyOrigin],
-    cur: LayoutTensor[F32, L_CUR32, MutAnyOrigin],
-    xpos: LayoutTensor[F32, L_XP32, MutAnyOrigin],
-    xquat: LayoutTensor[F32, L_XQ32, MutAnyOrigin],
-    sxp: LayoutTensor[F32, L_SP32, MutAnyOrigin],
-    qpos: LayoutTensor[F32, L_QP32, MutAnyOrigin],
-    sites: LayoutTensor[F32, L_SITES, MutAnyOrigin],
-    bodies: LayoutTensor[F32, L_BODIES, MutAnyOrigin],
-    contacts: LayoutTensor[F32, L_CON32, MutAnyOrigin],
-    res: LayoutTensor[F32, L_OUT32, MutAnyOrigin],
+    meta: TileTensor[F32, L_META32, MutAnyOrigin],
+    cur: TileTensor[F32, L_CUR32, MutAnyOrigin],
+    xpos: TileTensor[F32, L_XP32, MutAnyOrigin],
+    xquat: TileTensor[F32, L_XQ32, MutAnyOrigin],
+    sxp: TileTensor[F32, L_SP32, MutAnyOrigin],
+    qpos: TileTensor[F32, L_QP32, MutAnyOrigin],
+    sites: TileTensor[F32, L_SITES, MutAnyOrigin],
+    bodies: TileTensor[F32, L_BODIES, MutAnyOrigin],
+    contacts: TileTensor[F32, L_CON32, MutAnyOrigin],
+    res: TileTensor[F32, L_OUT32, MutAnyOrigin],
 ):
     var env = Int(block_dim.x * block_idx.x + thread_idx.x)
     if env >= N_TASKS:
@@ -612,18 +613,18 @@ def main() raises:
             for k in range(TAPE_WORDS):
                 meta.data[META_IDX_TASK_PARAM_0 + k] = Scalar[DT](tapes[ti][k])
             var kl = eval_tape_gpu[DT, 1, NB, NS * 3, NQ, NS, MC](
-                meta.lt["cpu", L_META](), cur.lt["cpu", L_CUR](),
-                t_xp.lt["cpu", L_XP](), t_xq.lt["cpu", L_XQ](),
-                t_sp.lt["cpu", L_SP](), t_qp.lt["cpu", L_QP](),
-                t_sites.lt["cpu", L_SITES](), t_bodies.lt["cpu", L_BODIES](),
-                t_con.lt["cpu", L_CON](), 0,
+                meta.tt["cpu", 1, METADATA_SIZE](), cur.tt["cpu", 1, MODEL_CURRICULUM_SIZE](),
+                t_xp.tt["cpu", 1, NB * 3](), t_xq.tt["cpu", 1, NB * 4](),
+                t_sp.tt["cpu", 1, NS * 3](), t_qp.tt["cpu", 1, NQ](),
+                t_sites.tt["cpu", NS, MODEL_SITE_SIZE](), t_bodies.tt["cpu", NB, MODEL_BODY_SIZE](),
+                t_con.tt["cpu", 1, MC * CONTACT_SIZE](), 0,
             )
             var dd = tape_distance_gpu[DT, 1, NB, NS * 3, NQ, NS, MC](
-                meta.lt["cpu", L_META](), cur.lt["cpu", L_CUR](),
-                t_xp.lt["cpu", L_XP](), t_xq.lt["cpu", L_XQ](),
-                t_sp.lt["cpu", L_SP](), t_qp.lt["cpu", L_QP](),
-                t_sites.lt["cpu", L_SITES](), t_bodies.lt["cpu", L_BODIES](),
-                t_con.lt["cpu", L_CON](), 0,
+                meta.tt["cpu", 1, METADATA_SIZE](), cur.tt["cpu", 1, MODEL_CURRICULUM_SIZE](),
+                t_xp.tt["cpu", 1, NB * 3](), t_xq.tt["cpu", 1, NB * 4](),
+                t_sp.tt["cpu", 1, NS * 3](), t_qp.tt["cpu", 1, NQ](),
+                t_sites.tt["cpu", NS, MODEL_SITE_SIZE](), t_bodies.tt["cpu", NB, MODEL_BODY_SIZE](),
+                t_con.tt["cpu", 1, MC * CONTACT_SIZE](), 0,
             )
             total += 1
             if h == tp and tp == kl:
@@ -730,11 +731,11 @@ def main() raises:
             g_con.upload(ctx)
             g_out.upload(ctx)
             ctx.enqueue_function[_lane_kernel](
-                g_meta.lt["gpu", L_META32](), g_cur.lt["gpu", L_CUR32](),
-                g_xp.lt["gpu", L_XP32](), g_xq.lt["gpu", L_XQ32](),
-                g_sp.lt["gpu", L_SP32](), g_qp.lt["gpu", L_QP32](),
-                g_sites.lt["gpu", L_SITES](), g_bodies.lt["gpu", L_BODIES](),
-                g_con.lt["gpu", L_CON32](), g_out.lt["gpu", L_OUT32](),
+                g_meta.tt["gpu", N_TASKS, METADATA_SIZE](), g_cur.tt["gpu", 1, MODEL_CURRICULUM_SIZE](),
+                g_xp.tt["gpu", N_TASKS, NB * 3](), g_xq.tt["gpu", N_TASKS, NB * 4](),
+                g_sp.tt["gpu", N_TASKS, NS * 3](), g_qp.tt["gpu", N_TASKS, NQ](),
+                g_sites.tt["gpu", NS, MODEL_SITE_SIZE](), g_bodies.tt["gpu", NB, MODEL_BODY_SIZE](),
+                g_con.tt["gpu", N_TASKS, MC * CONTACT_SIZE](), g_out.tt["gpu", N_TASKS, 2](),
                 grid_dim=(1,), block_dim=(N_TASKS,),
             )
             g_out.download(ctx)

@@ -26,7 +26,7 @@ Run:
 
 from std.math import abs as mabs, sqrt
 from std.memory import alloc, memset
-from layout import Layout, LayoutTensor
+from noeira.core.tiles import tile
 
 from noeira.nn.constants import DT as dtype
 from noeira.experimental.pcn.pc_initializer import PCXavier
@@ -62,7 +62,7 @@ def main() raises:
 
     var params_raw = alloc[Scalar[dtype]](NET.PARAM_SIZE).as_unsafe_any_origin()
     memset(params_raw, 0, NET.PARAM_SIZE)
-    var params = LayoutTensor[dtype, Layout.row_major(NET.PARAM_SIZE), MutAnyOrigin](params_raw)
+    var params = tile[NET.PARAM_SIZE](params_raw)
     NET.pc_init_params[PCXavier, dtype](params)
 
     var g_s = alloc[Scalar[dtype]](NET.PARAM_SIZE).as_unsafe_any_origin()
@@ -71,10 +71,10 @@ def main() raises:
     var g_e5 = alloc[Scalar[dtype]](NET.PARAM_SIZE).as_unsafe_any_origin()
     for b in [g_s, g_e, g_s5, g_e5]:
         memset(b, 0, NET.PARAM_SIZE)
-    var grads_s = LayoutTensor[dtype, Layout.row_major(NET.PARAM_SIZE), MutAnyOrigin](g_s)
-    var grads_e = LayoutTensor[dtype, Layout.row_major(NET.PARAM_SIZE), MutAnyOrigin](g_e)
-    var grads_s5 = LayoutTensor[dtype, Layout.row_major(NET.PARAM_SIZE), MutAnyOrigin](g_s5)
-    var grads_e5 = LayoutTensor[dtype, Layout.row_major(NET.PARAM_SIZE), MutAnyOrigin](g_e5)
+    var grads_s = tile[NET.PARAM_SIZE](g_s)
+    var grads_e = tile[NET.PARAM_SIZE](g_e)
+    var grads_s5 = tile[NET.PARAM_SIZE](g_s5)
+    var grads_e5 = tile[NET.PARAM_SIZE](g_e5)
 
     var lat_raw = alloc[Scalar[dtype]](BATCH * NET.LATENT_DIM).as_unsafe_any_origin()
     var ref_raw = alloc[Scalar[dtype]](BATCH * NET.LATENT_DIM).as_unsafe_any_origin()
@@ -91,13 +91,13 @@ def main() raises:
     memset(ab_raw, 0, BATCH * NET.SCRATCH_IN_DIM)
     memset(zb_raw, 0, BATCH * NET.SCRATCH_IN_DIM)
 
-    var latents = LayoutTensor[dtype, Layout.row_major(BATCH, NET.LATENT_DIM), MutAnyOrigin](lat_raw)
-    var ref_lat = LayoutTensor[dtype, Layout.row_major(BATCH, NET.LATENT_DIM), MutAnyOrigin](ref_raw)
-    var errors = LayoutTensor[dtype, Layout.row_major(BATCH, NET.LATENT_DIM), MutAnyOrigin](err_raw)
-    var dx_buf = LayoutTensor[dtype, Layout.row_major(BATCH, NET.LATENT_DIM), MutAnyOrigin](dx_raw)
-    var mu_eps_buf = LayoutTensor[dtype, Layout.row_major(BATCH, NET.SCRATCH_OUT_DIM), MutAnyOrigin](mu_raw)
-    var a_below_buf = LayoutTensor[dtype, Layout.row_major(BATCH, NET.SCRATCH_IN_DIM), MutAnyOrigin](ab_raw)
-    var z_below_buf = LayoutTensor[dtype, Layout.row_major(BATCH, NET.SCRATCH_IN_DIM), MutAnyOrigin](zb_raw)
+    var latents = tile[BATCH, NET.LATENT_DIM](lat_raw)
+    var ref_lat = tile[BATCH, NET.LATENT_DIM](ref_raw)
+    var errors = tile[BATCH, NET.LATENT_DIM](err_raw)
+    var dx_buf = tile[BATCH, NET.LATENT_DIM](dx_raw)
+    var mu_eps_buf = tile[BATCH, NET.SCRATCH_OUT_DIM](mu_raw)
+    var a_below_buf = tile[BATCH, NET.SCRATCH_IN_DIM](ab_raw)
+    var z_below_buf = tile[BATCH, NET.SCRATCH_IN_DIM](zb_raw)
 
     var x_raw = alloc[Scalar[dtype]](BATCH * NET.IN_DIM).as_unsafe_any_origin()
     var y_raw = alloc[Scalar[dtype]](BATCH * NET.OUT_DIM).as_unsafe_any_origin()
@@ -108,8 +108,8 @@ def main() raises:
             )
         for k in range(NET.OUT_DIM):
             y_raw[unsafe_offset=b * NET.OUT_DIM + k] = 1.0 if k == (b % NET.OUT_DIM) else 0.0
-    var x_in = LayoutTensor[dtype, Layout.row_major(BATCH, NET.IN_DIM), MutAnyOrigin](x_raw)
-    var y_target = LayoutTensor[dtype, Layout.row_major(BATCH, NET.OUT_DIM), MutAnyOrigin](y_raw)
+    var x_in = tile[BATCH, NET.IN_DIM](x_raw)
+    var y_target = tile[BATCH, NET.OUT_DIM](y_raw)
 
     # ── 1. eps = 0 reconstructs the forward sweep ────────────────────────────
     print("\n[1] ε=0 reconstruction == init_latents forward sweep")

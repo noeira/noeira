@@ -25,7 +25,7 @@ Run (NVIDIA): pixi run -e nvidia mojo run -I . benchmarks/amp/a6_conv_gemm_pad_b
 
 from std.time import perf_counter_ns
 from max.gpu.host import DeviceContext
-from layout import Layout, LayoutTensor, TileTensor, row_major
+from layout import TileTensor, row_major
 from linalg.matmul import matmul as max_matmul
 
 from noeira.nn.core.tensor import Tensor, TensorImpl

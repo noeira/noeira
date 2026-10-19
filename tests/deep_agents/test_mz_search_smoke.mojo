@@ -21,7 +21,7 @@ Run (Apple Metal):
 
 from max.gpu.host import DeviceContext
 from std.testing import assert_true
-from layout import Layout, LayoutTensor
+from noeira.core.tiles import tile
 
 from noeira.nn.constants import DT
 from noeira.nn.core.initializer import Kaiming
@@ -79,9 +79,7 @@ def main() raises:
     ctx.enqueue_copy(obs, obs_h)
     ctx.synchronize()
 
-    var root_obs = LayoutTensor[
-        DT, Layout.row_major(N_ENVS, OBS), MutAnyOrigin
-    ](obs)
+    var root_obs = tile[N_ENVS, OBS](obs)
 
     # ── Run the full MuZero learned-dynamics MCTS search ──
     mcts.search_gpu[type_of(rep), type_of(dyn), type_of(pred)](

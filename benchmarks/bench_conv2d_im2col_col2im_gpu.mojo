@@ -35,7 +35,7 @@ Run (Apple = parity only):
 from max.gpu import global_idx, thread_idx, block_idx, block_dim
 from max.gpu.host import DeviceContext, DeviceBuffer
 from std.time import perf_counter_ns
-from layout import Layout, LayoutTensor
+from noeira.core.tiles import Tile, tile
 
 from noeira.nn.primitives.conv2d import _im2col_cpu, _col2im_cpu
 
@@ -52,8 +52,8 @@ def _im2col_v0[
     BATCH: Int, IC: Int, K: Int, S: Int, P: Int, H: Int, W: Int,
     OH: Int, OW: Int, IN_FLAT: Int, COL: Int, SO: Int, BS: Int,
 ](
-    input: LayoutTensor[DT, Layout.row_major(BATCH, IN_FLAT), MutAnyOrigin],
-    col: LayoutTensor[DT, Layout.row_major(BS, COL), MutAnyOrigin],
+    input: Tile[DT, BATCH, IN_FLAT],
+    col: Tile[DT, BS, COL],
 ):
     var idx = Int(global_idx.x)
     if idx >= BS * COL:
@@ -85,9 +85,9 @@ def _im2col_v1[
     BATCH: Int, IC: Int, K: Int, S: Int, P: Int, H: Int, W: Int,
     OH: Int, OW: Int, IN_FLAT: Int, COL: Int, SO: Int, BS: Int,
 ](
-    input: LayoutTensor[DT, Layout.row_major(BATCH * IN_FLAT), MutAnyOrigin],
-    gather: LayoutTensor[IT, Layout.row_major(SO * COL), MutAnyOrigin],
-    col: LayoutTensor[DT, Layout.row_major(BS * COL), MutAnyOrigin],
+    input: Tile[DT, BATCH * IN_FLAT],
+    gather: Tile[IT, SO * COL],
+    col: Tile[DT, BS * COL],
 ):
     var idx = Int(global_idx.x)
     if idx >= BS * COL:
@@ -109,8 +109,8 @@ def _im2col_v2[
     BATCH: Int, IC: Int, K: Int, S: Int, P: Int, H: Int, W: Int,
     OH: Int, OW: Int, IN_FLAT: Int, COL: Int, SO: Int, BS: Int,
 ](
-    input: LayoutTensor[DT, Layout.row_major(BATCH, IN_FLAT), MutAnyOrigin],
-    col: LayoutTensor[DT, Layout.row_major(BS, COL), MutAnyOrigin],
+    input: Tile[DT, BATCH, IN_FLAT],
+    col: Tile[DT, BS, COL],
 ):
     var base = Int(global_idx.x) * 4
     if base >= BS * COL:
@@ -169,8 +169,8 @@ def _im2col_v3[
     BATCH: Int, IC: Int, K: Int, S: Int, P: Int, H: Int, W: Int,
     OH: Int, OW: Int, IN_FLAT: Int, COL: Int, SO: Int, BS: Int,
 ](
-    input: LayoutTensor[DT, Layout.row_major(BATCH, IN_FLAT), MutAnyOrigin],
-    col: LayoutTensor[DT, Layout.row_major(BS, COL), MutAnyOrigin],
+    input: Tile[DT, BATCH, IN_FLAT],
+    col: Tile[DT, BS, COL],
 ):
     var idx = Int(global_idx.x)
     if idx >= BS * COL:
@@ -205,8 +205,8 @@ def _col2im_v0[
     BATCH: Int, IC: Int, K: Int, S: Int, P: Int, H: Int, W: Int,
     OH: Int, OW: Int, IN_FLAT: Int, COL: Int, SO: Int, BS: Int,
 ](
-    d_col: LayoutTensor[DT, Layout.row_major(BS, COL), MutAnyOrigin],
-    grad_input: LayoutTensor[DT, Layout.row_major(BATCH, IN_FLAT), MutAnyOrigin],
+    d_col: Tile[DT, BS, COL],
+    grad_input: Tile[DT, BATCH, IN_FLAT],
 ):
     var idx = Int(block_dim.x * block_idx.x + thread_idx.x)
     if idx >= BATCH * IN_FLAT:
@@ -245,8 +245,8 @@ def _col2im_v1[
     BATCH: Int, IC: Int, K: Int, S: Int, P: Int, H: Int, W: Int,
     OH: Int, OW: Int, IN_FLAT: Int, COL: Int, SO: Int, BS: Int,
 ](
-    d_colT: LayoutTensor[DT, Layout.row_major(COL, BS), MutAnyOrigin],
-    grad_input: LayoutTensor[DT, Layout.row_major(BATCH, IN_FLAT), MutAnyOrigin],
+    d_colT: Tile[DT, COL, BS],
+    grad_input: Tile[DT, BATCH, IN_FLAT],
 ):
     var idx = Int(block_dim.x * block_idx.x + thread_idx.x)
     if idx >= BATCH * IN_FLAT:
@@ -302,8 +302,8 @@ def _col2im_v2[
     BATCH: Int, IC: Int, K: Int, S: Int, P: Int, H: Int, W: Int,
     OH: Int, OW: Int, IN_FLAT: Int, COL: Int, SO: Int, BS: Int,
 ](
-    d_colT: LayoutTensor[DT, Layout.row_major(COL, BS), MutAnyOrigin],
-    grad_input: LayoutTensor[DT, Layout.row_major(BATCH, IN_FLAT), MutAnyOrigin],
+    d_colT: Tile[DT, COL, BS],
+    grad_input: Tile[DT, BATCH, IN_FLAT],
 ):
     var hw = H * W
     var base = Int(block_dim.x * block_idx.x + thread_idx.x) * 4
@@ -443,23 +443,23 @@ def _im2col_verify[
     comptime nb = (BS * COL + TPB - 1) // TPB
 
     comptime if VARIANT == 0:
-        var inl = LayoutTensor[DT, Layout.row_major(BATCH, IN_FLAT), MutAnyOrigin](inp)
-        var cl = LayoutTensor[DT, Layout.row_major(BS, COL), MutAnyOrigin](col)
+        var inl = tile[BATCH, IN_FLAT](inp)
+        var cl = tile[BS, COL](col)
         ctx.enqueue_function[
             _im2col_v0[BATCH, IC, K, S, P, H, W, OH, OW, IN_FLAT, COL, SO, BS]
         ](inl, cl, grid_dim=nb, block_dim=TPB)
     elif VARIANT == 1:
         var g = _build_gather[IC, K, S, P, H, W, OH, OW, COL, SO](ctx)
-        var inl = LayoutTensor[DT, Layout.row_major(BATCH * IN_FLAT), MutAnyOrigin](inp)
-        var gl = LayoutTensor[IT, Layout.row_major(SO * COL), MutAnyOrigin](g)
-        var cl = LayoutTensor[DT, Layout.row_major(BS * COL), MutAnyOrigin](col)
+        var inl = tile[BATCH * IN_FLAT](inp)
+        var gl = tile[SO * COL](g)
+        var cl = tile[BS * COL](col)
         ctx.enqueue_function[
             _im2col_v1[BATCH, IC, K, S, P, H, W, OH, OW, IN_FLAT, COL, SO, BS]
         ](inl, gl, cl, grid_dim=nb, block_dim=TPB)
     else:
         comptime nb2 = ((BS * COL + 3) // 4 + TPB - 1) // TPB
-        var inl = LayoutTensor[DT, Layout.row_major(BATCH, IN_FLAT), MutAnyOrigin](inp)
-        var cl = LayoutTensor[DT, Layout.row_major(BS, COL), MutAnyOrigin](col)
+        var inl = tile[BATCH, IN_FLAT](inp)
+        var cl = tile[BS, COL](col)
         ctx.enqueue_function[
             _im2col_v2[BATCH, IC, K, S, P, H, W, OH, OW, IN_FLAT, COL, SO, BS]
         ](inl, cl, grid_dim=nb2, block_dim=TPB)
@@ -491,8 +491,8 @@ def _im2col_time[
     var us = Float64(0)
 
     comptime if VARIANT == 0:
-        var inl = LayoutTensor[DT, Layout.row_major(BATCH, IN_FLAT), MutAnyOrigin](inp)
-        var cl = LayoutTensor[DT, Layout.row_major(BS, COL), MutAnyOrigin](col)
+        var inl = tile[BATCH, IN_FLAT](inp)
+        var cl = tile[BS, COL](col)
         comptime for _ in range(WARMUP):
             ctx.enqueue_function[
                 _im2col_v0[BATCH, IC, K, S, P, H, W, OH, OW, IN_FLAT, COL, SO, BS]
@@ -507,9 +507,9 @@ def _im2col_time[
         us = Float64(perf_counter_ns() - t0) / Float64(ITERS) / 1000.0
     elif VARIANT == 1:
         var g = _build_gather[IC, K, S, P, H, W, OH, OW, COL, SO](ctx)
-        var inl = LayoutTensor[DT, Layout.row_major(BATCH * IN_FLAT), MutAnyOrigin](inp)
-        var gl = LayoutTensor[IT, Layout.row_major(SO * COL), MutAnyOrigin](g)
-        var cl = LayoutTensor[DT, Layout.row_major(BS * COL), MutAnyOrigin](col)
+        var inl = tile[BATCH * IN_FLAT](inp)
+        var gl = tile[SO * COL](g)
+        var cl = tile[BS * COL](col)
         comptime for _ in range(WARMUP):
             ctx.enqueue_function[
                 _im2col_v1[BATCH, IC, K, S, P, H, W, OH, OW, IN_FLAT, COL, SO, BS]
@@ -524,8 +524,8 @@ def _im2col_time[
         us = Float64(perf_counter_ns() - t0) / Float64(ITERS) / 1000.0
     else:
         comptime nb2 = ((BS * COL + 3) // 4 + TPB - 1) // TPB
-        var inl = LayoutTensor[DT, Layout.row_major(BATCH, IN_FLAT), MutAnyOrigin](inp)
-        var cl = LayoutTensor[DT, Layout.row_major(BS, COL), MutAnyOrigin](col)
+        var inl = tile[BATCH, IN_FLAT](inp)
+        var cl = tile[BS, COL](col)
         comptime for _ in range(WARMUP):
             ctx.enqueue_function[
                 _im2col_v2[BATCH, IC, K, S, P, H, W, OH, OW, IN_FLAT, COL, SO, BS]
@@ -562,8 +562,8 @@ def _im2col_nhwc_verify[
             in_host[i] = v
     _ = col.enqueue_fill(Scalar[DT](-123.0))
     comptime nb = (BS * COL + TPB - 1) // TPB
-    var inl = LayoutTensor[DT, Layout.row_major(BATCH, IN_FLAT), MutAnyOrigin](inp)
-    var cl = LayoutTensor[DT, Layout.row_major(BS, COL), MutAnyOrigin](col)
+    var inl = tile[BATCH, IN_FLAT](inp)
+    var cl = tile[BS, COL](col)
     ctx.enqueue_function[
         _im2col_v3[BATCH, IC, K, S, P, H, W, OH, OW, IN_FLAT, COL, SO, BS]
     ](inl, cl, grid_dim=nb, block_dim=TPB)
@@ -600,8 +600,8 @@ def _im2col_nhwc_time[
     _ = inp.enqueue_fill(Scalar[DT](0.01))
     _ = col.enqueue_fill(Scalar[DT](0.0))
     comptime nb = (BS * COL + TPB - 1) // TPB
-    var inl = LayoutTensor[DT, Layout.row_major(BATCH, IN_FLAT), MutAnyOrigin](inp)
-    var cl = LayoutTensor[DT, Layout.row_major(BS, COL), MutAnyOrigin](col)
+    var inl = tile[BATCH, IN_FLAT](inp)
+    var cl = tile[BS, COL](col)
     comptime for _ in range(WARMUP):
         ctx.enqueue_function[
             _im2col_v3[BATCH, IC, K, S, P, H, W, OH, OW, IN_FLAT, COL, SO, BS]
@@ -644,21 +644,21 @@ def _col2im_verify[
     comptime nb = (BATCH * IN_FLAT + TPB - 1) // TPB
 
     comptime if VARIANT == 0:
-        var dl = LayoutTensor[DT, Layout.row_major(BS, COL), MutAnyOrigin](dcol)
-        var gl = LayoutTensor[DT, Layout.row_major(BATCH, IN_FLAT), MutAnyOrigin](gin)
+        var dl = tile[BS, COL](dcol)
+        var gl = tile[BATCH, IN_FLAT](gin)
         ctx.enqueue_function[
             _col2im_v0[BATCH, IC, K, S, P, H, W, OH, OW, IN_FLAT, COL, SO, BS]
         ](dl, gl, grid_dim=nb, block_dim=TPB)
     elif VARIANT == 1:
-        var dl = LayoutTensor[DT, Layout.row_major(COL, BS), MutAnyOrigin](dcol)
-        var gl = LayoutTensor[DT, Layout.row_major(BATCH, IN_FLAT), MutAnyOrigin](gin)
+        var dl = tile[COL, BS](dcol)
+        var gl = tile[BATCH, IN_FLAT](gin)
         ctx.enqueue_function[
             _col2im_v1[BATCH, IC, K, S, P, H, W, OH, OW, IN_FLAT, COL, SO, BS]
         ](dl, gl, grid_dim=nb, block_dim=TPB)
     else:
         comptime nb2 = ((BATCH * IN_FLAT + 3) // 4 + TPB - 1) // TPB
-        var dl = LayoutTensor[DT, Layout.row_major(COL, BS), MutAnyOrigin](dcol)
-        var gl = LayoutTensor[DT, Layout.row_major(BATCH, IN_FLAT), MutAnyOrigin](gin)
+        var dl = tile[COL, BS](dcol)
+        var gl = tile[BATCH, IN_FLAT](gin)
         ctx.enqueue_function[
             _col2im_v2[BATCH, IC, K, S, P, H, W, OH, OW, IN_FLAT, COL, SO, BS]
         ](dl, gl, grid_dim=nb2, block_dim=TPB)
@@ -697,8 +697,8 @@ def _col2im_time[
     var us = Float64(0)
 
     comptime if VARIANT == 0:
-        var dl = LayoutTensor[DT, Layout.row_major(BS, COL), MutAnyOrigin](dcol)
-        var gl = LayoutTensor[DT, Layout.row_major(BATCH, IN_FLAT), MutAnyOrigin](gin)
+        var dl = tile[BS, COL](dcol)
+        var gl = tile[BATCH, IN_FLAT](gin)
         comptime for _ in range(WARMUP):
             ctx.enqueue_function[
                 _col2im_v0[BATCH, IC, K, S, P, H, W, OH, OW, IN_FLAT, COL, SO, BS]
@@ -712,8 +712,8 @@ def _col2im_time[
         ctx.synchronize()
         us = Float64(perf_counter_ns() - t0) / Float64(ITERS) / 1000.0
     elif VARIANT == 1:
-        var dl = LayoutTensor[DT, Layout.row_major(COL, BS), MutAnyOrigin](dcol)
-        var gl = LayoutTensor[DT, Layout.row_major(BATCH, IN_FLAT), MutAnyOrigin](gin)
+        var dl = tile[COL, BS](dcol)
+        var gl = tile[BATCH, IN_FLAT](gin)
         comptime for _ in range(WARMUP):
             ctx.enqueue_function[
                 _col2im_v1[BATCH, IC, K, S, P, H, W, OH, OW, IN_FLAT, COL, SO, BS]
@@ -728,8 +728,8 @@ def _col2im_time[
         us = Float64(perf_counter_ns() - t0) / Float64(ITERS) / 1000.0
     else:
         comptime nb2 = ((BATCH * IN_FLAT + 3) // 4 + TPB - 1) // TPB
-        var dl = LayoutTensor[DT, Layout.row_major(COL, BS), MutAnyOrigin](dcol)
-        var gl = LayoutTensor[DT, Layout.row_major(BATCH, IN_FLAT), MutAnyOrigin](gin)
+        var dl = tile[COL, BS](dcol)
+        var gl = tile[BATCH, IN_FLAT](gin)
         comptime for _ in range(WARMUP):
             ctx.enqueue_function[
                 _col2im_v2[BATCH, IC, K, S, P, H, W, OH, OW, IN_FLAT, COL, SO, BS]

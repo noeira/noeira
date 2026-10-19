@@ -46,7 +46,6 @@ from std.python import Python, PythonObject
 from std.testing import assert_true, TestSuite
 from max.gpu.host import DeviceContext
 from std.collections import Array
-from layout import Layout, LayoutTensor
 
 from noeira.envs.dm_control.ball_in_cup import (
     DMBallInCupCatch,
@@ -307,16 +306,16 @@ def test_ball_in_cup_model_matches_mujoco() raises:
         DTYPE, NV, 1
     ](
         0, 0, AsStatic[MD](),
-        mf.tendons.lt["cpu", Layout.row_major(NTEN, MODEL_TENDON_SIZE)](),
-        mf.sites.lt["cpu", Layout.row_major(NSITE, MODEL_SITE_SIZE)](),
-        mf.geoms.lt["cpu", Layout.row_major(NGEOM, MODEL_GEOM_SIZE)](),
-        mf.bodies.lt["cpu", Layout.row_major(NBODY, MODEL_BODY_SIZE)](),
-        mf.joints.lt["cpu", Layout.row_major(NJOINT, MODEL_JOINT_SIZE)](),
-        mf.meta.lt["cpu", Layout.row_major(MODEL_META_SIZE)](),
-        d.subtree_com.lt["cpu", Layout.row_major(1, NBODY * 3)](),
-        sc.cdof.lt["cpu", Layout.row_major(1, NV * 6)](),
-        d.xpos.lt["cpu", Layout.row_major(1, NBODY * 3)](),
-        d.xquat.lt["cpu", Layout.row_major(1, NBODY * 4)](),
+        mf.tendons.tt["cpu", NTEN, MODEL_TENDON_SIZE](),
+        mf.sites.tt["cpu", NSITE, MODEL_SITE_SIZE](),
+        mf.geoms.tt["cpu", NGEOM, MODEL_GEOM_SIZE](),
+        mf.bodies.tt["cpu", NBODY, MODEL_BODY_SIZE](),
+        mf.joints.tt["cpu", NJOINT, MODEL_JOINT_SIZE](),
+        mf.meta.tt["cpu", MODEL_META_SIZE](),
+        d.subtree_com.tt["cpu", 1, NBODY * 3](),
+        sc.cdof.tt["cpu", 1, NV * 6](),
+        d.xpos.tt["cpu", 1, NBODY * 3](),
+        d.xquat.tt["cpu", 1, NBODY * 4](),
         tJ,
     )
     var dL = abs(Float64(L) - Float64(py=mj_d.ten_length[0]))

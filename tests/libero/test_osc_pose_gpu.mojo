@@ -35,7 +35,8 @@ questions into one number.
 from std.os.path import exists
 from std.sys import has_accelerator
 from max.gpu import thread_idx, block_idx, block_dim
-from layout import Layout, LayoutTensor
+from layout import TileTensor
+from noeira.core.tiles import RowMajor
 from max.gpu.host import DeviceContext
 
 from noeira.nn.core.tensor import TensorImpl
@@ -73,21 +74,21 @@ comptime NV = LIBERO_GOAL_DIMS.NV
 comptime NJ = LIBERO_GOAL_DIMS.NJOINT
 comptime NACT = LIBERO_GOAL_DIMS.NACT
 
-comptime L_STATE = Layout.row_major(BATCH, OSC_STATE_WORDS)
-comptime L_WORK = Layout.row_major(BATCH, OSC_WORK_WORDS)
-comptime L_REFS = Layout.row_major(OSC_REF_WORDS)
-comptime L_CTRL = Layout.row_major(BATCH, NACT)
-comptime L_QPOS = Layout.row_major(BATCH, NQ)
-comptime L_NV = Layout.row_major(BATCH, NV)
-comptime L_B4 = Layout.row_major(BATCH, NB * 4)
-comptime L_SX = Layout.row_major(BATCH, NS * 3)
-comptime L_B3 = Layout.row_major(BATCH, NB * 3)
-comptime L_CDOF = Layout.row_major(BATCH, NV * 6)
-comptime L_M = Layout.row_major(BATCH, NV * NV)
-comptime L_JOINTS = Layout.row_major(NJ, MODEL_JOINT_SIZE)
-comptime L_BODIES = Layout.row_major(NB, MODEL_BODY_SIZE)
-comptime L_SITES = Layout.row_major(NS, MODEL_SITE_SIZE)
-comptime L_MMETA = Layout.row_major(MODEL_META_SIZE)
+comptime L_STATE = RowMajor[BATCH, OSC_STATE_WORDS]
+comptime L_WORK = RowMajor[BATCH, OSC_WORK_WORDS]
+comptime L_REFS = RowMajor[OSC_REF_WORDS]
+comptime L_CTRL = RowMajor[BATCH, NACT]
+comptime L_QPOS = RowMajor[BATCH, NQ]
+comptime L_NV = RowMajor[BATCH, NV]
+comptime L_B4 = RowMajor[BATCH, NB * 4]
+comptime L_SX = RowMajor[BATCH, NS * 3]
+comptime L_B3 = RowMajor[BATCH, NB * 3]
+comptime L_CDOF = RowMajor[BATCH, NV * 6]
+comptime L_M = RowMajor[BATCH, NV * NV]
+comptime L_JOINTS = RowMajor[NJ, MODEL_JOINT_SIZE]
+comptime L_BODIES = RowMajor[NB, MODEL_BODY_SIZE]
+comptime L_SITES = RowMajor[NS, MODEL_SITE_SIZE]
+comptime L_MMETA = RowMajor[MODEL_META_SIZE]
 
 
 struct Tally(Copyable, ImplicitlyCopyable, Movable):
@@ -115,22 +116,22 @@ def _index(names: List[String], want: String) raises -> Int:
 
 
 def _osc_kernel(
-    state: LayoutTensor[F32, L_STATE, MutAnyOrigin],
-    work: LayoutTensor[F32, L_WORK, MutAnyOrigin],
-    refs: LayoutTensor[F32, L_REFS, MutAnyOrigin],
-    ctrl: LayoutTensor[F32, L_CTRL, MutAnyOrigin],
-    qpos: LayoutTensor[F32, L_QPOS, MutAnyOrigin],
-    qvel: LayoutTensor[F32, L_NV, MutAnyOrigin],
-    xquat: LayoutTensor[F32, L_B4, MutAnyOrigin],
-    sxp: LayoutTensor[F32, L_SX, MutAnyOrigin],
-    stcom: LayoutTensor[F32, L_B3, MutAnyOrigin],
-    cdof: LayoutTensor[F32, L_CDOF, MutAnyOrigin],
-    mass: LayoutTensor[F32, L_M, MutAnyOrigin],
-    bias: LayoutTensor[F32, L_NV, MutAnyOrigin],
-    joints: LayoutTensor[F32, L_JOINTS, MutAnyOrigin],
-    bodies: LayoutTensor[F32, L_BODIES, MutAnyOrigin],
-    sites: LayoutTensor[F32, L_SITES, MutAnyOrigin],
-    mmeta: LayoutTensor[F32, L_MMETA, MutAnyOrigin],
+    state: TileTensor[F32, L_STATE, MutAnyOrigin],
+    work: TileTensor[F32, L_WORK, MutAnyOrigin],
+    refs: TileTensor[F32, L_REFS, MutAnyOrigin],
+    ctrl: TileTensor[F32, L_CTRL, MutAnyOrigin],
+    qpos: TileTensor[F32, L_QPOS, MutAnyOrigin],
+    qvel: TileTensor[F32, L_NV, MutAnyOrigin],
+    xquat: TileTensor[F32, L_B4, MutAnyOrigin],
+    sxp: TileTensor[F32, L_SX, MutAnyOrigin],
+    stcom: TileTensor[F32, L_B3, MutAnyOrigin],
+    cdof: TileTensor[F32, L_CDOF, MutAnyOrigin],
+    mass: TileTensor[F32, L_M, MutAnyOrigin],
+    bias: TileTensor[F32, L_NV, MutAnyOrigin],
+    joints: TileTensor[F32, L_JOINTS, MutAnyOrigin],
+    bodies: TileTensor[F32, L_BODIES, MutAnyOrigin],
+    sites: TileTensor[F32, L_SITES, MutAnyOrigin],
+    mmeta: TileTensor[F32, L_MMETA, MutAnyOrigin],
 ):
     var env = Int(block_dim.x * block_idx.x + thread_idx.x)
     if env >= BATCH:
@@ -319,22 +320,22 @@ def main() raises:
     print("--- leg 1: osc_run_gpu over", BATCH, "lanes at float64 ---")
     for e in range(BATCH):
         osc_run_gpu[DT](
-            t_state.lt_dyn["cpu", DYN2](rl2(BATCH, OSC_STATE_WORDS)),
-            t_work.lt_dyn["cpu", DYN2](rl2(BATCH, OSC_WORK_WORDS)),
-            t_refs.lt_dyn["cpu", DYN1](rl1(OSC_REF_WORDS)),
-            t_ctrl.lt_dyn["cpu", DYN2](rl2(BATCH, NACT)),
-            t_qpos.lt_dyn["cpu", DYN2](rl2(BATCH, NQ)),
-            t_qvel.lt_dyn["cpu", DYN2](rl2(BATCH, NV)),
-            t_xq.lt_dyn["cpu", DYN2](rl2(BATCH, NB * 4)),
-            t_sx.lt_dyn["cpu", DYN2](rl2(BATCH, NS * 3)),
-            t_st.lt_dyn["cpu", DYN2](rl2(BATCH, NB * 3)),
-            t_cdof.lt_dyn["cpu", DYN2](rl2(BATCH, NV * 6)),
-            t_m.lt_dyn["cpu", DYN2](rl2(BATCH, NV * NV)),
-            t_bias.lt_dyn["cpu", DYN2](rl2(BATCH, NV)),
-            t_joints.lt_dyn["cpu", DYN2](rl2(NJ, MODEL_JOINT_SIZE)),
-            t_bodies.lt_dyn["cpu", DYN2](rl2(NB, MODEL_BODY_SIZE)),
-            t_sites.lt_dyn["cpu", DYN2](rl2(NS, MODEL_SITE_SIZE)),
-            t_meta.lt_dyn["cpu", DYN1](rl1(MODEL_META_SIZE)),
+            t_state.tt_dyn["cpu", DYN2](rl2(BATCH, OSC_STATE_WORDS)),
+            t_work.tt_dyn["cpu", DYN2](rl2(BATCH, OSC_WORK_WORDS)),
+            t_refs.tt_dyn["cpu", DYN1](rl1(OSC_REF_WORDS)),
+            t_ctrl.tt_dyn["cpu", DYN2](rl2(BATCH, NACT)),
+            t_qpos.tt_dyn["cpu", DYN2](rl2(BATCH, NQ)),
+            t_qvel.tt_dyn["cpu", DYN2](rl2(BATCH, NV)),
+            t_xq.tt_dyn["cpu", DYN2](rl2(BATCH, NB * 4)),
+            t_sx.tt_dyn["cpu", DYN2](rl2(BATCH, NS * 3)),
+            t_st.tt_dyn["cpu", DYN2](rl2(BATCH, NB * 3)),
+            t_cdof.tt_dyn["cpu", DYN2](rl2(BATCH, NV * 6)),
+            t_m.tt_dyn["cpu", DYN2](rl2(BATCH, NV * NV)),
+            t_bias.tt_dyn["cpu", DYN2](rl2(BATCH, NV)),
+            t_joints.tt_dyn["cpu", DYN2](rl2(NJ, MODEL_JOINT_SIZE)),
+            t_bodies.tt_dyn["cpu", DYN2](rl2(NB, MODEL_BODY_SIZE)),
+            t_sites.tt_dyn["cpu", DYN2](rl2(NS, MODEL_SITE_SIZE)),
+            t_meta.tt_dyn["cpu", DYN1](rl1(MODEL_META_SIZE)),
             e,
             NV,
         )
@@ -422,14 +423,14 @@ def main() raises:
         g_sites.upload(ctx)
         g_meta.upload(ctx)
         ctx.enqueue_function[_osc_kernel](
-            g_state.lt["gpu", L_STATE](), g_work.lt["gpu", L_WORK](),
-            g_refs.lt["gpu", L_REFS](), g_ctrl.lt["gpu", L_CTRL](),
-            g_qpos.lt["gpu", L_QPOS](), g_qvel.lt["gpu", L_NV](),
-            g_xq.lt["gpu", L_B4](), g_sx.lt["gpu", L_SX](),
-            g_st.lt["gpu", L_B3](), g_cdof.lt["gpu", L_CDOF](),
-            g_m.lt["gpu", L_M](), g_bias.lt["gpu", L_NV](),
-            g_joints.lt["gpu", L_JOINTS](), g_bodies.lt["gpu", L_BODIES](),
-            g_sites.lt["gpu", L_SITES](), g_meta.lt["gpu", L_MMETA](),
+            g_state.tt["gpu", BATCH, OSC_STATE_WORDS](), g_work.tt["gpu", BATCH, OSC_WORK_WORDS](),
+            g_refs.tt["gpu", OSC_REF_WORDS](), g_ctrl.tt["gpu", BATCH, NACT](),
+            g_qpos.tt["gpu", BATCH, NQ](), g_qvel.tt["gpu", BATCH, NV](),
+            g_xq.tt["gpu", BATCH, NB * 4](), g_sx.tt["gpu", BATCH, NS * 3](),
+            g_st.tt["gpu", BATCH, NB * 3](), g_cdof.tt["gpu", BATCH, NV * 6](),
+            g_m.tt["gpu", BATCH, NV * NV](), g_bias.tt["gpu", BATCH, NV](),
+            g_joints.tt["gpu", NJ, MODEL_JOINT_SIZE](), g_bodies.tt["gpu", NB, MODEL_BODY_SIZE](),
+            g_sites.tt["gpu", NS, MODEL_SITE_SIZE](), g_meta.tt["gpu", MODEL_META_SIZE](),
             grid_dim=(1,), block_dim=(BATCH,),
         )
         g_ctrl.download(ctx)

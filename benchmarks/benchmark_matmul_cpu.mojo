@@ -13,7 +13,7 @@ Run:
 from std.memory import alloc
 from std.random import seed, random_float64
 from std.time import perf_counter_ns
-from layout import Layout, LayoutTensor
+from noeira.core.tiles import Tile, tile
 from layout.tile_tensor import lt_to_tt
 from linalg.matmul import matmul as max_matmul
 
@@ -25,14 +25,14 @@ from noeira.core.fmt import fit
 def naive_matmul[
     M: Int, N: Int, K: Int
 ](
-    a: LayoutTensor[dtype, Layout.row_major(M, K), MutAnyOrigin],
-    b: LayoutTensor[dtype, Layout.row_major(K, N), MutAnyOrigin],
-    mut c: LayoutTensor[dtype, Layout.row_major(M, N), MutAnyOrigin],
+    a: Tile[dtype, M, K],
+    b: Tile[dtype, K, N],
+    c: Tile[dtype, M, N],
 ):
     """Body of MatMul.eval (without input caching). c = a @ b."""
     for i in range(M):
         for j in range(N):
-            var acc: c.element_type = 0
+            var acc: c.ElementType = 0
             for k in range(K):
                 acc += a[i, k] * b[k, j]
             c[i, j] = acc
@@ -67,14 +67,10 @@ def bench[M: Int, K: Int, N: Int, WARMUP: Int, ITERS: Int]() raises:
         c_naive_buf[i] = 0
         c_blas_buf[i] = 0
 
-    var a_lt = LayoutTensor[dtype, Layout.row_major(M, K), MutAnyOrigin](a_buf)
-    var b_lt = LayoutTensor[dtype, Layout.row_major(K, N), MutAnyOrigin](b_buf)
-    var c_naive_lt = LayoutTensor[dtype, Layout.row_major(M, N), MutAnyOrigin](
-        c_naive_buf
-    )
-    var c_blas_lt = LayoutTensor[dtype, Layout.row_major(M, N), MutAnyOrigin](
-        c_blas_buf
-    )
+    var a_lt = tile[M, K](a_buf)
+    var b_lt = tile[K, N](b_buf)
+    var c_naive_lt = tile[M, N](c_naive_buf)
+    var c_blas_lt = tile[M, N](c_blas_buf)
 
     # ── Warmup ──
     for _ in range(WARMUP):

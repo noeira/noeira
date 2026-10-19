@@ -58,7 +58,7 @@ from noeira.tasks.eval import region_rects, region_half_heights
 from noeira.physics3d.gpu.constants import (
     MODEL_CURRICULUM_SIZE, METADATA_SIZE,
 )
-from layout import Layout
+from noeira.core.tiles import RowMajor
 
 
 comptime DT = DType.float64
@@ -253,11 +253,11 @@ def main() raises:
     # beside the one place that already owns it.
     comptime NB = So101TabletopModel.NBODY
     comptime NS = So101TabletopModel.NSITE
-    comptime L_META = Layout.row_major(1, METADATA_SIZE)
-    comptime L_CUR = Layout.row_major(1, MODEL_CURRICULUM_SIZE)
-    comptime L_XP = Layout.row_major(1, NB * 3)
-    comptime L_XQ = Layout.row_major(1, NB * 4)
-    comptime L_SP = Layout.row_major(1, NS * 3)
+    comptime L_META = RowMajor[1, METADATA_SIZE]
+    comptime L_CUR = RowMajor[1, MODEL_CURRICULUM_SIZE]
+    comptime L_XP = RowMajor[1, NB * 3]
+    comptime L_XQ = RowMajor[1, NB * 4]
+    comptime L_SP = RowMajor[1, NS * 3]
     var t_meta = TensorImpl[DT].alloc(METADATA_SIZE)
     var t_cur = TensorImpl[DT].alloc(MODEL_CURRICULUM_SIZE)
     var t_xp = TensorImpl[DT].alloc(NB * 3)
@@ -318,9 +318,9 @@ def main() raises:
             t_sp.data[i] = env.d.site_xpos.data[i]
         var gd = Float64(
             tape_distance_gpu[DT, 1, NB, NS * 3](
-                t_meta.lt["cpu", L_META](), t_cur.lt["cpu", L_CUR](),
-                t_xp.lt["cpu", L_XP](), t_xq.lt["cpu", L_XQ](),
-                t_sp.lt["cpu", L_SP](), 0,
+                t_meta.tt["cpu", 1, METADATA_SIZE](), t_cur.tt["cpu", 1, MODEL_CURRICULUM_SIZE](),
+                t_xp.tt["cpu", 1, NB * 3](), t_xq.tt["cpu", 1, NB * 4](),
+                t_sp.tt["cpu", 1, NS * 3](), 0,
             )
         )
         _ = ox

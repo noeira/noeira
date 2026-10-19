@@ -9,7 +9,7 @@ Usage:
 
 from std.math import sqrt
 from max.gpu.host import DeviceContext, DeviceBuffer
-from layout import Layout, LayoutTensor
+from noeira.core.tiles import Tile, ImmTile, tile
 from std.random import seed as set_seed
 
 from noeira.envs.lunar_lander import LunarLander
@@ -130,10 +130,8 @@ def extract_gpu_observation[
     # Copy observation portion from states buffer
     @always_inline
     def copy_obs_kernel(
-        dst: LayoutTensor[dtype, Layout.row_major(8), MutAnyOrigin],
-        src: LayoutTensor[
-            dtype, Layout.row_major(BATCH, STATE_SIZE), ImmutAnyOrigin
-        ],
+        dst: Tile[dtype, 8],
+        src: ImmTile[dtype, BATCH, STATE_SIZE],
         env_arg: Int64,
     ):
         # Mojo 1.0: `Int`/`UInt` are not `DevicePassable`; the kernel takes
@@ -142,12 +140,8 @@ def extract_gpu_observation[
         for i in range(8):
             dst[i] = src[env, LLConstants.OBS_OFFSET + i]
 
-    var dst_tensor = LayoutTensor[dtype, Layout.row_major(8), MutAnyOrigin](
-        obs_buf.unsafe_ptr()
-    )
-    var src_tensor = LayoutTensor[
-        dtype, Layout.row_major(BATCH, STATE_SIZE), MutAnyOrigin
-    ](states_buf.unsafe_ptr())
+    var dst_tensor = tile[8](obs_buf.unsafe_ptr())
+    var src_tensor = tile[BATCH, STATE_SIZE](states_buf.unsafe_ptr())
 
     ctx.enqueue_function[copy_obs_kernel, copy_obs_kernel](
         dst_tensor, src_tensor, Int64(env_idx), grid_dim=(1,), block_dim=(1,)
@@ -177,10 +171,8 @@ def extract_gpu_body_state[
 
     @always_inline
     def copy_body_kernel(
-        dst: LayoutTensor[dtype, Layout.row_major(6), MutAnyOrigin],
-        src: LayoutTensor[
-            dtype, Layout.row_major(BATCH, STATE_SIZE), ImmutAnyOrigin
-        ],
+        dst: Tile[dtype, 6],
+        src: ImmTile[dtype, BATCH, STATE_SIZE],
         env_arg: Int64,
         body_arg: Int64,
     ):
@@ -196,12 +188,8 @@ def extract_gpu_body_state[
         dst[4] = src[env, body_off + IDX_VY]
         dst[5] = src[env, body_off + IDX_OMEGA]
 
-    var dst_tensor = LayoutTensor[dtype, Layout.row_major(6), MutAnyOrigin](
-        state_buf.unsafe_ptr()
-    )
-    var src_tensor = LayoutTensor[
-        dtype, Layout.row_major(BATCH, STATE_SIZE), MutAnyOrigin
-    ](states_buf.unsafe_ptr())
+    var dst_tensor = tile[6](state_buf.unsafe_ptr())
+    var src_tensor = tile[BATCH, STATE_SIZE](states_buf.unsafe_ptr())
 
     ctx.enqueue_function[copy_body_kernel, copy_body_kernel](
         dst_tensor,
@@ -236,10 +224,8 @@ def extract_gpu_metadata[
 
     @always_inline
     def copy_meta_kernel(
-        dst: LayoutTensor[dtype, Layout.row_major(4), MutAnyOrigin],
-        src: LayoutTensor[
-            dtype, Layout.row_major(BATCH, STATE_SIZE), ImmutAnyOrigin
-        ],
+        dst: Tile[dtype, 4],
+        src: ImmTile[dtype, BATCH, STATE_SIZE],
         env_arg: Int64,
     ):
         # Mojo 1.0: `Int`/`UInt` are not `DevicePassable`; the kernel takes
@@ -248,12 +234,8 @@ def extract_gpu_metadata[
         for i in range(4):
             dst[i] = src[env, LLConstants.METADATA_OFFSET + i]
 
-    var dst_tensor = LayoutTensor[dtype, Layout.row_major(4), MutAnyOrigin](
-        meta_buf.unsafe_ptr()
-    )
-    var src_tensor = LayoutTensor[
-        dtype, Layout.row_major(BATCH, STATE_SIZE), MutAnyOrigin
-    ](states_buf.unsafe_ptr())
+    var dst_tensor = tile[4](meta_buf.unsafe_ptr())
+    var src_tensor = tile[BATCH, STATE_SIZE](states_buf.unsafe_ptr())
 
     ctx.enqueue_function[copy_meta_kernel, copy_meta_kernel](
         dst_tensor, src_tensor, Int64(env_idx), grid_dim=(1,), block_dim=(1,)
@@ -1223,14 +1205,10 @@ def test_deterministic_physics(ctx: DeviceContext) raises -> Bool:
     # We need a kernel to selectively copy
     @always_inline
     def copy_state_kernel(
-        dst: LayoutTensor[
-            dtype, Layout.row_major(N_ENVS, STATE_SIZE), MutAnyOrigin
-        ],
-        src_bodies: LayoutTensor[
-            dtype, Layout.row_major(3, BODY_STATE_SIZE), ImmutAnyOrigin
-        ],
-        src_obs: LayoutTensor[dtype, Layout.row_major(8), ImmutAnyOrigin],
-        src_meta: LayoutTensor[dtype, Layout.row_major(4), ImmutAnyOrigin],
+        dst: Tile[dtype, N_ENVS, STATE_SIZE],
+        src_bodies: ImmTile[dtype, 3, BODY_STATE_SIZE],
+        src_obs: ImmTile[dtype, 8],
+        src_meta: ImmTile[dtype, 4],
         prev_shaping: Scalar[dtype],
     ):
         # Copy bodies
@@ -1277,18 +1255,10 @@ def test_deterministic_physics(ctx: DeviceContext) raises -> Bool:
     ctx.enqueue_copy(obs_buf_small, obs_host_buf)
     ctx.enqueue_copy(meta_buf, meta_host)
 
-    var dst_tensor = LayoutTensor[
-        dtype, Layout.row_major(N_ENVS, STATE_SIZE), MutAnyOrigin
-    ](gpu_states.unsafe_ptr())
-    var src_bodies_tensor = LayoutTensor[
-        dtype, Layout.row_major(3, BODY_STATE_SIZE), MutAnyOrigin
-    ](bodies_buf.unsafe_ptr())
-    var src_obs_tensor = LayoutTensor[dtype, Layout.row_major(8), MutAnyOrigin](
-        obs_buf_small.unsafe_ptr()
-    )
-    var src_meta_tensor = LayoutTensor[
-        dtype, Layout.row_major(4), MutAnyOrigin
-    ](meta_buf.unsafe_ptr())
+    var dst_tensor = tile[N_ENVS, STATE_SIZE](gpu_states.unsafe_ptr())
+    var src_bodies_tensor = tile[3, BODY_STATE_SIZE](bodies_buf.unsafe_ptr())
+    var src_obs_tensor = tile[8](obs_buf_small.unsafe_ptr())
+    var src_meta_tensor = tile[4](meta_buf.unsafe_ptr())
 
     ctx.enqueue_function[copy_state_kernel, copy_state_kernel](
         dst_tensor,
@@ -1566,13 +1536,9 @@ def test_gravity_only(ctx: DeviceContext) raises -> Bool:
 
     @always_inline
     def copy_state_kernel2(
-        dst: LayoutTensor[
-            dtype, Layout.row_major(N_ENVS, STATE_SIZE), MutAnyOrigin
-        ],
-        src_bodies: LayoutTensor[
-            dtype, Layout.row_major(3, BODY_STATE_SIZE), ImmutAnyOrigin
-        ],
-        src_obs: LayoutTensor[dtype, Layout.row_major(8), ImmutAnyOrigin],
+        dst: Tile[dtype, N_ENVS, STATE_SIZE],
+        src_bodies: ImmTile[dtype, 3, BODY_STATE_SIZE],
+        src_obs: ImmTile[dtype, 8],
         prev_shaping: Scalar[dtype],
     ):
         for body in range(3):
@@ -1586,15 +1552,9 @@ def test_gravity_only(ctx: DeviceContext) raises -> Bool:
         dst[0, LLConstants.METADATA_OFFSET + 2] = prev_shaping
         dst[0, LLConstants.METADATA_OFFSET + 3] = Scalar[dtype](0)
 
-    var dst_tensor = LayoutTensor[
-        dtype, Layout.row_major(N_ENVS, STATE_SIZE), MutAnyOrigin
-    ](gpu_states.unsafe_ptr())
-    var src_bodies_tensor = LayoutTensor[
-        dtype, Layout.row_major(3, BODY_STATE_SIZE), MutAnyOrigin
-    ](bodies_buf.unsafe_ptr())
-    var src_obs_tensor = LayoutTensor[dtype, Layout.row_major(8), MutAnyOrigin](
-        obs_buf_small.unsafe_ptr()
-    )
+    var dst_tensor = tile[N_ENVS, STATE_SIZE](gpu_states.unsafe_ptr())
+    var src_bodies_tensor = tile[3, BODY_STATE_SIZE](bodies_buf.unsafe_ptr())
+    var src_obs_tensor = tile[8](obs_buf_small.unsafe_ptr())
 
     ctx.enqueue_function[copy_state_kernel2, copy_state_kernel2](
         dst_tensor,
@@ -1890,13 +1850,9 @@ def test_reward_deep_dive(ctx: DeviceContext) raises -> Bool:
 
     @always_inline
     def copy_full_state_kernel(
-        dst: LayoutTensor[
-            dtype, Layout.row_major(N_ENVS, STATE_SIZE), MutAnyOrigin
-        ],
-        src_bodies: LayoutTensor[
-            dtype, Layout.row_major(3, BODY_STATE_SIZE), ImmutAnyOrigin
-        ],
-        src_obs: LayoutTensor[dtype, Layout.row_major(8), ImmutAnyOrigin],
+        dst: Tile[dtype, N_ENVS, STATE_SIZE],
+        src_bodies: ImmTile[dtype, 3, BODY_STATE_SIZE],
+        src_obs: ImmTile[dtype, 8],
         prev_shaping: Scalar[dtype],
     ):
         for body in range(3):
@@ -1910,15 +1866,9 @@ def test_reward_deep_dive(ctx: DeviceContext) raises -> Bool:
         dst[0, LLConstants.METADATA_OFFSET + 2] = prev_shaping
         dst[0, LLConstants.METADATA_OFFSET + 3] = Scalar[dtype](0)
 
-    var dst_tensor = LayoutTensor[
-        dtype, Layout.row_major(N_ENVS, STATE_SIZE), MutAnyOrigin
-    ](gpu_states.unsafe_ptr())
-    var src_bodies_tensor = LayoutTensor[
-        dtype, Layout.row_major(3, BODY_STATE_SIZE), MutAnyOrigin
-    ](bodies_buf.unsafe_ptr())
-    var src_obs_tensor = LayoutTensor[dtype, Layout.row_major(8), MutAnyOrigin](
-        obs_buf_small.unsafe_ptr()
-    )
+    var dst_tensor = tile[N_ENVS, STATE_SIZE](gpu_states.unsafe_ptr())
+    var src_bodies_tensor = tile[3, BODY_STATE_SIZE](bodies_buf.unsafe_ptr())
+    var src_obs_tensor = tile[8](obs_buf_small.unsafe_ptr())
 
     ctx.enqueue_function[copy_full_state_kernel, copy_full_state_kernel](
         dst_tensor,

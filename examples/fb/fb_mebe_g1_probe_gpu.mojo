@@ -39,7 +39,7 @@ from std.math import sqrt
 from std.random import seed
 from std.sys import argv
 from std.time import perf_counter_ns
-from layout import Layout, LayoutTensor
+from noeira.core.tiles import tile
 from max.gpu.host import DeviceContext
 
 from noeira.nn.constants import DT, TPB
@@ -236,10 +236,10 @@ def main() raises:
         for s in range(n_collect):
             ctx.enqueue_copy(prev_obs, env._obs)
             agent.select_action_batched[N_ENVS](
-                LayoutTensor[DT, Layout.row_major(N_ENVS, OBS), MutAnyOrigin](env._obs),
-                LayoutTensor[DT, Layout.row_major(N_ENVS, ACT), MutAnyOrigin](env._action),
-                LayoutTensor[DT, Layout.row_major(N_ENVS, 2 * ACT), MutAnyOrigin](ao),
-                LayoutTensor[DT, Layout.row_major(N_ENVS, ACT + 1), MutAnyOrigin](alp),
+                tile[N_ENVS, OBS](env._obs),
+                tile[N_ENVS, ACT](env._action),
+                tile[N_ENVS, 2 * ACT](ao),
+                tile[N_ENVS, ACT + 1](alp),
                 s * N_ENVS,
             )
             env.step_batch[N_ENVS](Optional(ctx), UInt64(seed_v) + UInt64(s))

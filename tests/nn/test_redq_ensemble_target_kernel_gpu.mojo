@@ -13,7 +13,7 @@ math is well-understood; the port is mechanical).
 from max.gpu.host import DeviceContext
 from std.testing import assert_true
 
-from layout import Layout, LayoutTensor
+from noeira.core.tiles import tile
 
 from noeira.nn.constants import DT
 from noeira.nn.core.tensor import Tensor
@@ -93,9 +93,7 @@ def test_redq_ensemble_target_gpu_matches_cpu() raises:
         q_buf,
         terms,
         lps,
-        LayoutTensor[DType.uint32, Layout.row_major(N_MIN), MutAnyOrigin](
-            subset_dev.unsafe_ptr().as_unsafe_any_origin()
-        ),
+        tile[N_MIN](subset_dev.unsafe_ptr().as_unsafe_any_origin()),
         gamma, alpha,
     )
     y_gpu.download(ctx)

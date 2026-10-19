@@ -18,7 +18,7 @@ Run:
 
 from std.memory import alloc, memset
 from std.math import sin
-from layout import Layout, LayoutTensor
+from noeira.core.tiles import tile
 
 from noeira.experimental.pcn.pc_initializer import PCXavier
 from noeira.experimental.pcn import (
@@ -61,12 +61,8 @@ def main() raises:
     var grads_buf = alloc[Scalar[dtype]](NET.PARAM_SIZE).as_unsafe_any_origin()
     memset(params_buf, 0, NET.PARAM_SIZE)
     memset(grads_buf, 0, NET.PARAM_SIZE)
-    var params = LayoutTensor[
-        dtype, Layout.row_major(NET.PARAM_SIZE), MutAnyOrigin
-    ](params_buf)
-    var grads = LayoutTensor[
-        dtype, Layout.row_major(NET.PARAM_SIZE), MutAnyOrigin
-    ](grads_buf)
+    var params = tile[NET.PARAM_SIZE](params_buf)
+    var grads = tile[NET.PARAM_SIZE](grads_buf)
     NET.pc_init_params[PCXavier, dtype](params)
 
     # ── Per-batch latents + scratch ──────────────────────────────────────────
@@ -81,21 +77,11 @@ def main() raises:
     memset(z_below_buf_raw, 0, BATCH * NET.SCRATCH_IN_DIM)
     memset(dx_buf_raw, 0, BATCH * NET.LATENT_DIM)
 
-    var latents = LayoutTensor[
-        dtype, Layout.row_major(BATCH, NET.LATENT_DIM), MutAnyOrigin
-    ](lat_buf)
-    var mu_eps_buf = LayoutTensor[
-        dtype, Layout.row_major(BATCH, NET.SCRATCH_OUT_DIM), MutAnyOrigin
-    ](mu_eps_buf_raw)
-    var a_below_buf = LayoutTensor[
-        dtype, Layout.row_major(BATCH, NET.SCRATCH_IN_DIM), MutAnyOrigin
-    ](a_below_buf_raw)
-    var z_below_buf = LayoutTensor[
-        dtype, Layout.row_major(BATCH, NET.SCRATCH_IN_DIM), MutAnyOrigin
-    ](z_below_buf_raw)
-    var dx_buf = LayoutTensor[
-        dtype, Layout.row_major(BATCH, NET.LATENT_DIM), MutAnyOrigin
-    ](dx_buf_raw)
+    var latents = tile[BATCH, NET.LATENT_DIM](lat_buf)
+    var mu_eps_buf = tile[BATCH, NET.SCRATCH_OUT_DIM](mu_eps_buf_raw)
+    var a_below_buf = tile[BATCH, NET.SCRATCH_IN_DIM](a_below_buf_raw)
+    var z_below_buf = tile[BATCH, NET.SCRATCH_IN_DIM](z_below_buf_raw)
+    var dx_buf = tile[BATCH, NET.LATENT_DIM](dx_buf_raw)
 
     # ── Fixed synthetic batch (deterministic) ────────────────────────────────
     var x_buf = alloc[Scalar[dtype]](BATCH * NET.IN_DIM).as_unsafe_any_origin()
@@ -104,12 +90,8 @@ def main() raises:
         x_buf[i] = Scalar[dtype](sin(Float32(i) * 0.5 + 0.1))
     for i in range(BATCH * NET.OUT_DIM):
         y_buf[i] = Scalar[dtype](0.5 * sin(Float32(i) * 0.9 + 0.4))
-    var x_in = LayoutTensor[
-        dtype, Layout.row_major(BATCH, NET.IN_DIM), MutAnyOrigin
-    ](x_buf)
-    var y_target = LayoutTensor[
-        dtype, Layout.row_major(BATCH, NET.OUT_DIM), MutAnyOrigin
-    ](y_buf)
+    var x_in = tile[BATCH, NET.IN_DIM](x_buf)
+    var y_target = tile[BATCH, NET.OUT_DIM](y_buf)
 
     # ── Train ─────────────────────────────────────────────────────────────────
     var first_loss: Float64 = 0.0

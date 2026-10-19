@@ -17,7 +17,7 @@ Run with:
 from max.gpu.host import DeviceContext, DeviceBuffer
 from max.gpu import thread_idx, block_idx, block_dim
 from std.sys import is_nvidia_gpu, default_accelerator
-from layout import Layout, LayoutTensor
+from noeira.core.tiles import Tile, ImmTile, tile
 from std.time import perf_counter_ns
 
 from noeira.nn.constants import DT as dtype
@@ -31,9 +31,9 @@ from noeira.nn.constants import DT as dtype
 def simple_add_kernel[
     dtype: DType, N: Int
 ](
-    output: LayoutTensor[dtype, Layout.row_major(N), MutAnyOrigin],
-    input_a: LayoutTensor[dtype, Layout.row_major(N), ImmutAnyOrigin],
-    input_b: LayoutTensor[dtype, Layout.row_major(N), ImmutAnyOrigin],
+    output: Tile[dtype, N],
+    input_a: ImmTile[dtype, N],
+    input_b: ImmTile[dtype, N],
 ):
     var tid = Int(thread_idx.x) + Int(block_idx.x) * Int(block_dim.x)
     if tid < N:
@@ -43,8 +43,8 @@ def simple_add_kernel[
 def scale_kernel[
     dtype: DType, N: Int
 ](
-    output: LayoutTensor[dtype, Layout.row_major(N), MutAnyOrigin],
-    input: LayoutTensor[dtype, Layout.row_major(N), ImmutAnyOrigin],
+    output: Tile[dtype, N],
+    input: ImmTile[dtype, N],
 ):
     var tid = Int(thread_idx.x) + Int(block_idx.x) * Int(block_dim.x)
     if tid < N:
@@ -54,8 +54,8 @@ def scale_kernel[
 def relu_kernel[
     dtype: DType, N: Int
 ](
-    output: LayoutTensor[dtype, Layout.row_major(N), MutAnyOrigin],
-    input: LayoutTensor[dtype, Layout.row_major(N), ImmutAnyOrigin],
+    output: Tile[dtype, N],
+    input: ImmTile[dtype, N],
 ):
     var tid = Int(thread_idx.x) + Int(block_idx.x) * Int(block_dim.x)
     if tid < N:
@@ -66,8 +66,8 @@ def relu_kernel[
 def bias_add_kernel[
     dtype: DType, N: Int
 ](
-    output: LayoutTensor[dtype, Layout.row_major(N), MutAnyOrigin],
-    input: LayoutTensor[dtype, Layout.row_major(N), ImmutAnyOrigin],
+    output: Tile[dtype, N],
+    input: ImmTile[dtype, N],
 ):
     var tid = Int(thread_idx.x) + Int(block_idx.x) * Int(block_dim.x)
     if tid < N:
@@ -77,8 +77,8 @@ def bias_add_kernel[
 def negate_kernel[
     dtype: DType, N: Int
 ](
-    output: LayoutTensor[dtype, Layout.row_major(N), MutAnyOrigin],
-    input: LayoutTensor[dtype, Layout.row_major(N), ImmutAnyOrigin],
+    output: Tile[dtype, N],
+    input: ImmTile[dtype, N],
 ):
     var tid = Int(thread_idx.x) + Int(block_idx.x) * Int(block_dim.x)
     if tid < N:
@@ -88,8 +88,8 @@ def negate_kernel[
 def fused_scale_relu_bias_kernel[
     dtype: DType, N: Int
 ](
-    output: LayoutTensor[dtype, Layout.row_major(N), MutAnyOrigin],
-    input: LayoutTensor[dtype, Layout.row_major(N), ImmutAnyOrigin],
+    output: Tile[dtype, N],
+    input: ImmTile[dtype, N],
 ):
     var tid = Int(thread_idx.x) + Int(block_idx.x) * Int(block_dim.x)
     if tid < N:
@@ -101,8 +101,8 @@ def fused_scale_relu_bias_kernel[
 def fused_5op_kernel[
     dtype: DType, N: Int
 ](
-    output: LayoutTensor[dtype, Layout.row_major(N), MutAnyOrigin],
-    input: LayoutTensor[dtype, Layout.row_major(N), ImmutAnyOrigin],
+    output: Tile[dtype, N],
+    input: ImmTile[dtype, N],
 ):
     """Fused: scale, relu, bias, negate, scale (5 ops)."""
     var tid = Int(thread_idx.x) + Int(block_idx.x) * Int(block_dim.x)
@@ -145,9 +145,9 @@ def benchmark_cold_vs_warm[N: Int](ctx: DeviceContext) raises:
     out_buf.enqueue_fill(Scalar[dtype](0.0))
     ctx.synchronize()
 
-    var a_t = LayoutTensor[dtype, Layout.row_major(N), ImmutAnyOrigin](a_buf)
-    var b_t = LayoutTensor[dtype, Layout.row_major(N), ImmutAnyOrigin](b_buf)
-    var out_t = LayoutTensor[dtype, Layout.row_major(N), MutAnyOrigin](out_buf)
+    var a_t = tile[N](a_buf)
+    var b_t = tile[N](b_buf)
+    var out_t = tile[N](out_buf)
 
     comptime TPB = 256
     comptime grid = ((N + TPB - 1) // TPB,)
@@ -232,23 +232,13 @@ def benchmark_chain_vs_fused[N: Int](ctx: DeviceContext) raises:
     fused_out_buf.enqueue_fill(Scalar[dtype](0.0))
     ctx.synchronize()
 
-    var in_t = LayoutTensor[dtype, Layout.row_major(N), ImmutAnyOrigin](in_buf)
-    var tmp1_m = LayoutTensor[dtype, Layout.row_major(N), MutAnyOrigin](
-        tmp1_buf
-    )
-    var tmp1_i = LayoutTensor[dtype, Layout.row_major(N), ImmutAnyOrigin](
-        tmp1_buf
-    )
-    var tmp2_m = LayoutTensor[dtype, Layout.row_major(N), MutAnyOrigin](
-        tmp2_buf
-    )
-    var tmp2_i = LayoutTensor[dtype, Layout.row_major(N), ImmutAnyOrigin](
-        tmp2_buf
-    )
-    var out_t = LayoutTensor[dtype, Layout.row_major(N), MutAnyOrigin](out_buf)
-    var fused_t = LayoutTensor[dtype, Layout.row_major(N), MutAnyOrigin](
-        fused_out_buf
-    )
+    var in_t = tile[N](in_buf)
+    var tmp1_m = tile[N](tmp1_buf)
+    var tmp1_i = tile[N](tmp1_buf)
+    var tmp2_m = tile[N](tmp2_buf)
+    var tmp2_i = tile[N](tmp2_buf)
+    var out_t = tile[N](out_buf)
+    var fused_t = tile[N](fused_out_buf)
 
     comptime TPB = 256
     comptime grid = ((N + TPB - 1) // TPB,)
@@ -365,16 +355,16 @@ def benchmark_chain_scaling[N: Int](ctx: DeviceContext) raises:
     out_buf.enqueue_fill(Scalar[dtype](0.0))
     ctx.synchronize()
 
-    var in_t = LayoutTensor[dtype, Layout.row_major(N), ImmutAnyOrigin](in_buf)
-    var t1m = LayoutTensor[dtype, Layout.row_major(N), MutAnyOrigin](tmp1_buf)
-    var t1i = LayoutTensor[dtype, Layout.row_major(N), ImmutAnyOrigin](tmp1_buf)
-    var t2m = LayoutTensor[dtype, Layout.row_major(N), MutAnyOrigin](tmp2_buf)
-    var t2i = LayoutTensor[dtype, Layout.row_major(N), ImmutAnyOrigin](tmp2_buf)
-    var t3m = LayoutTensor[dtype, Layout.row_major(N), MutAnyOrigin](tmp3_buf)
-    var t3i = LayoutTensor[dtype, Layout.row_major(N), ImmutAnyOrigin](tmp3_buf)
-    var t4m = LayoutTensor[dtype, Layout.row_major(N), MutAnyOrigin](tmp4_buf)
-    var t4i = LayoutTensor[dtype, Layout.row_major(N), ImmutAnyOrigin](tmp4_buf)
-    var out_t = LayoutTensor[dtype, Layout.row_major(N), MutAnyOrigin](out_buf)
+    var in_t = tile[N](in_buf)
+    var t1m = tile[N](tmp1_buf)
+    var t1i = tile[N](tmp1_buf)
+    var t2m = tile[N](tmp2_buf)
+    var t2i = tile[N](tmp2_buf)
+    var t3m = tile[N](tmp3_buf)
+    var t3i = tile[N](tmp3_buf)
+    var t4m = tile[N](tmp4_buf)
+    var t4i = tile[N](tmp4_buf)
+    var out_t = tile[N](out_buf)
 
     comptime TPB = 256
     comptime grid = ((N + TPB - 1) // TPB,)
@@ -592,9 +582,9 @@ def benchmark_precompile[N: Int](ctx: DeviceContext) raises:
     out_buf.enqueue_fill(Scalar[dtype](0.0))
     ctx.synchronize()
 
-    var a_t = LayoutTensor[dtype, Layout.row_major(N), ImmutAnyOrigin](a_buf)
-    var b_t = LayoutTensor[dtype, Layout.row_major(N), ImmutAnyOrigin](b_buf)
-    var out_t = LayoutTensor[dtype, Layout.row_major(N), MutAnyOrigin](out_buf)
+    var a_t = tile[N](a_buf)
+    var b_t = tile[N](b_buf)
+    var out_t = tile[N](out_buf)
 
     comptime TPB = 256
     comptime grid = ((N + TPB - 1) // TPB,)
@@ -623,9 +613,9 @@ def benchmark_precompile[N: Int](ctx: DeviceContext) raises:
 
     # Precompiled
     def wrapper(
-        output: LayoutTensor[dtype, Layout.row_major(N), MutAnyOrigin],
-        input_a: LayoutTensor[dtype, Layout.row_major(N), ImmutAnyOrigin],
-        input_b: LayoutTensor[dtype, Layout.row_major(N), ImmutAnyOrigin],
+        output: Tile[dtype, N],
+        input_a: ImmTile[dtype, N],
+        input_b: ImmTile[dtype, N],
     ):
         simple_add_kernel[dtype, N](output, input_a, input_b)
 

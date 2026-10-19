@@ -19,7 +19,7 @@ from std.random import seed, random_float64
 from std.testing import assert_true
 from std.math import abs
 from max.gpu.host import DeviceContext
-from layout import Layout, LayoutTensor
+from noeira.core.tiles import tile
 
 from noeira.nn.constants import DT
 from noeira.nn.optimizer.adam import Adam
@@ -74,12 +74,8 @@ def main() raises:
                 acc += x_s[b * IN + i] * w_true[i * OUT + j]
             y_s[b * OUT + j] = acc
 
-    var x_cpu = LayoutTensor[DT, Layout.row_major(BATCH, IN), MutAnyOrigin](
-        mptr(x_s)
-    )
-    var y_cpu = LayoutTensor[DT, Layout.row_major(BATCH, OUT), MutAnyOrigin](
-        mptr(y_s)
-    )
+    var x_cpu = tile[BATCH, IN](mptr(x_s))
+    var y_cpu = tile[BATCH, OUT](mptr(y_s))
 
     # Nets: CPU init, then GPU starts from the SAME weights.
     var cpu_net = Net.make_pcn[PCXavier]()
@@ -98,12 +94,8 @@ def main() raises:
     ctx.enqueue_copy(x_dev_b, mptr(x_s))
     ctx.enqueue_copy(y_dev_b, mptr(y_s))
     ctx.synchronize()
-    var x_dev = LayoutTensor[DT, Layout.row_major(BATCH, IN), MutAnyOrigin](
-        x_dev_b.unsafe_ptr().as_unsafe_any_origin()
-    )
-    var y_dev = LayoutTensor[DT, Layout.row_major(BATCH, OUT), MutAnyOrigin](
-        y_dev_b.unsafe_ptr().as_unsafe_any_origin()
-    )
+    var x_dev = tile[BATCH, IN](x_dev_b.unsafe_ptr().as_unsafe_any_origin())
+    var y_dev = tile[BATCH, OUT](y_dev_b.unsafe_ptr().as_unsafe_any_origin())
 
     # Persistent GPU workspace — allocated once, reused every step.
     var ws = PCGpuWorkspace[BATCH, PCBlock[IN, H, PCIdentity], PCBlock[

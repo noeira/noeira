@@ -33,7 +33,7 @@ WHAT KEEPS IT FROM BEING VACUOUS:
 
 from std.testing import assert_true, assert_equal, TestSuite
 from std.time import perf_counter_ns
-from layout import LayoutTensor
+from layout import TileTensor
 
 from noeira.math3d import Vec3 as Vec3Generic, Quat as QuatGeneric
 from noeira.physics3d.fields import DYN1, rl1
@@ -161,9 +161,9 @@ def test_trees_and_cut_match_the_linear_sweep() raises:
     assert_true(differ, "the SAH and median trees are identical — the `sah`"
                         " flag does not reach the builder, so item 1 is vacuous")
 
-    var lin_view = LayoutTensor[DT, DYN1, MutAnyOrigin](soup.tri, rl1(len(soup.tri)))
-    var sah_view = LayoutTensor[DT, DYN1, MutAnyOrigin](sah.data, rl1(len(sah.data)))
-    var med_view = LayoutTensor[DT, DYN1, MutAnyOrigin](med.data, rl1(len(med.data)))
+    var lin_view = TileTensor(soup.tri, rl1(len(soup.tri)))
+    var sah_view = TileTensor(sah.data, rl1(len(sah.data)))
+    var med_view = TileTensor(med.data, rl1(len(med.data)))
 
     var rng = Lcg(0x5A4B1D)
     var bad_sah = 0

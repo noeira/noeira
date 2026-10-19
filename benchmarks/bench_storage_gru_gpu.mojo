@@ -10,7 +10,8 @@ from std.math import exp, tanh
 from max.gpu import thread_idx, block_idx, global_idx
 from max.gpu.host import DeviceContext
 from std.time import perf_counter_ns
-from layout import Layout, LayoutTensor, TileTensor, row_major
+from layout import TileTensor, row_major
+from noeira.core.tiles import RowMajor, Tile, tile
 from linalg.matmul import matmul as max_matmul
 
 comptime DT = DType.float32
@@ -28,13 +29,13 @@ def _sig(x: Scalar[DT]) -> Scalar[DT]:
 def _gru_naive[
     BATCH: Int, IN_: Int, H: Int
 ](
-    x: LayoutTensor[DT, Layout.row_major(BATCH, IN_), MutAnyOrigin],
-    W_ih: LayoutTensor[DT, Layout.row_major(IN_, 3 * H), MutAnyOrigin],
-    W_hh: LayoutTensor[DT, Layout.row_major(H, 3 * H), MutAnyOrigin],
-    b_ih: LayoutTensor[DT, Layout.row_major(3 * H), MutAnyOrigin],
-    b_hh: LayoutTensor[DT, Layout.row_major(3 * H), MutAnyOrigin],
-    h_prev: LayoutTensor[DT, Layout.row_major(BATCH, H), MutAnyOrigin],
-    out_buf: LayoutTensor[DT, Layout.row_major(BATCH, H), MutAnyOrigin],
+    x: Tile[DT, BATCH, IN_],
+    W_ih: Tile[DT, IN_, 3 * H],
+    W_hh: Tile[DT, H, 3 * H],
+    b_ih: Tile[DT, 3 * H],
+    b_hh: Tile[DT, 3 * H],
+    h_prev: Tile[DT, BATCH, H],
+    out_buf: Tile[DT, BATCH, H],
 ):
     var bi = Int(block_idx.x)
     if bi >= BATCH:
@@ -69,12 +70,12 @@ def _gru_naive[
 def _gru_gate[
     BATCH: Int, H: Int
 ](
-    ix: LayoutTensor[DT, Layout.row_major(BATCH, 3 * H), MutAnyOrigin],
-    hx: LayoutTensor[DT, Layout.row_major(BATCH, 3 * H), MutAnyOrigin],
-    b_ih: LayoutTensor[DT, Layout.row_major(3 * H), MutAnyOrigin],
-    b_hh: LayoutTensor[DT, Layout.row_major(3 * H), MutAnyOrigin],
-    h_prev: LayoutTensor[DT, Layout.row_major(BATCH, H), MutAnyOrigin],
-    out_buf: LayoutTensor[DT, Layout.row_major(BATCH, H), MutAnyOrigin],
+    ix: Tile[DT, BATCH, 3 * H],
+    hx: Tile[DT, BATCH, 3 * H],
+    b_ih: Tile[DT, 3 * H],
+    b_hh: Tile[DT, 3 * H],
+    h_prev: Tile[DT, BATCH, H],
+    out_buf: Tile[DT, BATCH, H],
 ):
     var gid = Int(global_idx.x)
     if gid >= BATCH * H:
@@ -121,12 +122,12 @@ def _time[
     _ = bhh.enqueue_fill(Scalar[DT](0.0))
     _ = hp.enqueue_fill(Scalar[DT](0.01))
 
-    comptime lbi = Layout.row_major(BATCH, IN_)
-    comptime lwih = Layout.row_major(IN_, TH)
-    comptime lwhh = Layout.row_major(H, TH)
-    comptime l3 = Layout.row_major(TH)
-    comptime lbh = Layout.row_major(BATCH, H)
-    comptime lb3 = Layout.row_major(BATCH, TH)
+    comptime lbi = RowMajor[BATCH, IN_]
+    comptime lwih = RowMajor[IN_, TH]
+    comptime lwhh = RowMajor[H, TH]
+    comptime l3 = RowMajor[TH]
+    comptime lbh = RowMajor[BATCH, H]
+    comptime lb3 = RowMajor[BATCH, TH]
     var us = Float64(0)
 
     comptime if GEMM:
@@ -136,12 +137,12 @@ def _time[
         var hp_v = TileTensor(hp, row_major[BATCH, H]())
         var ix_v = TileTensor(ix, row_major[BATCH, TH]())
         var hx_v = TileTensor(hx, row_major[BATCH, TH]())
-        var ixl = LayoutTensor[DT, lb3, MutAnyOrigin](ix)
-        var hxl = LayoutTensor[DT, lb3, MutAnyOrigin](hx)
-        var bihl = LayoutTensor[DT, l3, MutAnyOrigin](bih)
-        var bhhl = LayoutTensor[DT, l3, MutAnyOrigin](bhh)
-        var hpl = LayoutTensor[DT, lbh, MutAnyOrigin](hp)
-        var obl = LayoutTensor[DT, lbh, MutAnyOrigin](ob)
+        var ixl = tile[BATCH, TH](ix)
+        var hxl = tile[BATCH, TH](hx)
+        var bihl = tile[TH](bih)
+        var bhhl = tile[TH](bhh)
+        var hpl = tile[BATCH, H](hp)
+        var obl = tile[BATCH, H](ob)
         comptime nblk = (BATCH * H + TPB - 1) // TPB
 
         comptime for _ in range(WARMUP):
@@ -161,13 +162,13 @@ def _time[
         ctx.synchronize()
         us = Float64(perf_counter_ns() - t0) / Float64(ITERS) / 1000.0
     else:
-        var xl = LayoutTensor[DT, lbi, MutAnyOrigin](x)
-        var wihl = LayoutTensor[DT, lwih, MutAnyOrigin](wih)
-        var whhl = LayoutTensor[DT, lwhh, MutAnyOrigin](whh)
-        var bihl = LayoutTensor[DT, l3, MutAnyOrigin](bih)
-        var bhhl = LayoutTensor[DT, l3, MutAnyOrigin](bhh)
-        var hpl = LayoutTensor[DT, lbh, MutAnyOrigin](hp)
-        var obl = LayoutTensor[DT, lbh, MutAnyOrigin](ob)
+        var xl = tile[BATCH, IN_](x)
+        var wihl = tile[IN_, TH](wih)
+        var whhl = tile[H, TH](whh)
+        var bihl = tile[TH](bih)
+        var bhhl = tile[TH](bhh)
+        var hpl = tile[BATCH, H](hp)
+        var obl = tile[BATCH, H](ob)
 
         comptime for _ in range(WARMUP):
             ctx.enqueue_function[_gru_naive[BATCH, IN_, H]](

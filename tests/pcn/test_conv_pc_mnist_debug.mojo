@@ -10,7 +10,7 @@ Run (Apple):
 
 from std.memory import alloc, memset
 from std.math import sin
-from layout import Layout, LayoutTensor
+from noeira.core.tiles import tile
 from max.gpu.host import DeviceContext
 
 from noeira.nn.constants import DT as dtype
@@ -50,9 +50,7 @@ def main() raises:
     # ── Shared params + synthetic batch (host) ───────────────────────────────
     var params_buf = alloc[Scalar[dtype]](NET.PARAM_SIZE).as_unsafe_any_origin()
     memset(params_buf, 0, NET.PARAM_SIZE)
-    var params_lt = LayoutTensor[
-        dtype, Layout.row_major(NET.PARAM_SIZE), MutAnyOrigin
-    ](params_buf)
+    var params_lt = tile[NET.PARAM_SIZE](params_buf)
     NET.pc_init_params[PCXavier, dtype](params_lt)
 
     var x_buf = alloc[Scalar[dtype]](BATCH * NET.IN_DIM).as_unsafe_any_origin()
@@ -78,33 +76,15 @@ def main() raises:
     memset(zb_c, 0, BATCH * NET.SCRATCH_IN_DIM)
     memset(dx_c, 0, BATCH * NET.LATENT_DIM)
 
-    var pc = LayoutTensor[dtype, Layout.row_major(NET.PARAM_SIZE), MutAnyOrigin](
-        params_buf
-    )
-    var gc = LayoutTensor[dtype, Layout.row_major(NET.PARAM_SIZE), MutAnyOrigin](
-        grads_cpu
-    )
-    var latc = LayoutTensor[
-        dtype, Layout.row_major(BATCH, NET.LATENT_DIM), MutAnyOrigin
-    ](lat_c)
-    var muc = LayoutTensor[
-        dtype, Layout.row_major(BATCH, NET.SCRATCH_OUT_DIM), MutAnyOrigin
-    ](mu_c)
-    var abc = LayoutTensor[
-        dtype, Layout.row_major(BATCH, NET.SCRATCH_IN_DIM), MutAnyOrigin
-    ](ab_c)
-    var zbc = LayoutTensor[
-        dtype, Layout.row_major(BATCH, NET.SCRATCH_IN_DIM), MutAnyOrigin
-    ](zb_c)
-    var dxc = LayoutTensor[
-        dtype, Layout.row_major(BATCH, NET.LATENT_DIM), MutAnyOrigin
-    ](dx_c)
-    var xc = LayoutTensor[dtype, Layout.row_major(BATCH, NET.IN_DIM), MutAnyOrigin](
-        x_buf
-    )
-    var yc = LayoutTensor[dtype, Layout.row_major(BATCH, NET.OUT_DIM), MutAnyOrigin](
-        y_buf
-    )
+    var pc = tile[NET.PARAM_SIZE](params_buf)
+    var gc = tile[NET.PARAM_SIZE](grads_cpu)
+    var latc = tile[BATCH, NET.LATENT_DIM](lat_c)
+    var muc = tile[BATCH, NET.SCRATCH_OUT_DIM](mu_c)
+    var abc = tile[BATCH, NET.SCRATCH_IN_DIM](ab_c)
+    var zbc = tile[BATCH, NET.SCRATCH_IN_DIM](zb_c)
+    var dxc = tile[BATCH, NET.LATENT_DIM](dx_c)
+    var xc = tile[BATCH, NET.IN_DIM](x_buf)
+    var yc = tile[BATCH, NET.OUT_DIM](y_buf)
 
     var r = TRAINER.compute_grads_only[BATCH](
         pc, gc, latc, muc, abc, zbc, dxc, xc, yc,
@@ -137,33 +117,15 @@ def main() raises:
         yh.unsafe_ptr()[i] = y_buf[i]
     ctx.enqueue_copy(y_d, yh)
 
-    var pd = LayoutTensor[dtype, Layout.row_major(NET.PARAM_SIZE), MutAnyOrigin](
-        params_d
-    )
-    var gd = LayoutTensor[dtype, Layout.row_major(NET.PARAM_SIZE), MutAnyOrigin](
-        grads_d
-    )
-    var latd = LayoutTensor[
-        dtype, Layout.row_major(BATCH, NET.LATENT_DIM), MutAnyOrigin
-    ](lat_d)
-    var mud = LayoutTensor[
-        dtype, Layout.row_major(BATCH, NET.SCRATCH_OUT_DIM), MutAnyOrigin
-    ](mu_d)
-    var abd = LayoutTensor[
-        dtype, Layout.row_major(BATCH, NET.SCRATCH_IN_DIM), MutAnyOrigin
-    ](ab_d)
-    var zbd = LayoutTensor[
-        dtype, Layout.row_major(BATCH, NET.SCRATCH_IN_DIM), MutAnyOrigin
-    ](zb_d)
-    var dxd = LayoutTensor[
-        dtype, Layout.row_major(BATCH, NET.LATENT_DIM), MutAnyOrigin
-    ](dx_d)
-    var xd = LayoutTensor[dtype, Layout.row_major(BATCH, NET.IN_DIM), MutAnyOrigin](
-        x_d
-    )
-    var yd = LayoutTensor[dtype, Layout.row_major(BATCH, NET.OUT_DIM), MutAnyOrigin](
-        y_d
-    )
+    var pd = tile[NET.PARAM_SIZE](params_d)
+    var gd = tile[NET.PARAM_SIZE](grads_d)
+    var latd = tile[BATCH, NET.LATENT_DIM](lat_d)
+    var mud = tile[BATCH, NET.SCRATCH_OUT_DIM](mu_d)
+    var abd = tile[BATCH, NET.SCRATCH_IN_DIM](ab_d)
+    var zbd = tile[BATCH, NET.SCRATCH_IN_DIM](zb_d)
+    var dxd = tile[BATCH, NET.LATENT_DIM](dx_d)
+    var xd = tile[BATCH, NET.IN_DIM](x_d)
+    var yd = tile[BATCH, NET.OUT_DIM](y_d)
 
     TRAINER.compute_grads_only_gpu[BATCH](
         ctx, pd, gd, latd, mud, abd, zbd, dxd, xd, yd,

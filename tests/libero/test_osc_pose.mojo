@@ -125,7 +125,7 @@ def main() raises:
     var wt = TensorImpl[DT].alloc(OSC_WORK_WORDS)
     for i in range(OSC_WORK_WORDS):
         wt.data[i] = Scalar[DT](0)
-    var wv = wt.lt_dyn["cpu", DYN2](rl2(1, OSC_WORK_WORDS))
+    var wv = wt.tt_dyn["cpu", DYN2](rl2(1, OSC_WORK_WORDS))
     var n = 6
     for i in range(n):
         for j in range(n):

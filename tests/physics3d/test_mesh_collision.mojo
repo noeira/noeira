@@ -11,7 +11,7 @@ broadphase_sap).
 """
 
 from std.math import sqrt
-from layout import Layout, LayoutTensor
+from noeira.core.tiles import RowMajor
 from noeira.nn.core.tensor import TensorImpl
 from noeira.physics3d.collision.ccd_workspace import L_CCD_WS1
 from noeira.physics3d.collision.ccd_workspace_host import ccd_ws_alloc
@@ -25,15 +25,15 @@ from noeira.physics3d.constants import GEOM_SPHERE, GEOM_BOX, GEOM_MESH
 from noeira.physics3d.gpu.constants import mesh_max_edge
 
 comptime NMV = 8
-comptime L_MV = Layout.row_major(NMV, 3)
+comptime L_MV = RowMajor[NMV, 3]
 # ⚠ NO EDGE GRAPH HERE, ON PURPOSE. `_support_mesh` hill-climbs the hull
 # adjacency when it exists and falls back to the exhaustive scan when
 # `edgeadr < 0` — which is how `fields/model.mojo` marks an unbuilt graph.
 # These fixtures are 8-vertex cubes, below `_HILLCLIMB_MIN`, so the scan is the
 # path under test either way; the tensors just have to be present and marked
 # absent. `test_gjk_hillclimb_support.mojo` is where the two paths are compared.
-comptime L_VEADR = Layout.row_major(NMV)
-comptime L_EDGES = Layout.row_major(mesh_max_edge(NMV))
+comptime L_VEADR = RowMajor[NMV]
+comptime L_EDGES = RowMajor[mesh_max_edge(NMV)]
 
 
 def _no_graph() raises -> TensorImpl[DType.float64]:
@@ -72,14 +72,14 @@ def test_box_box_separated() raises:
         0.0, 0.0, 0.0, 1.0,  # identity quat
         0.0, 0.0,  # radius, half_length (unused for box)
         0.5, 0.5, 0.5,  # half-extents
-        mv.lt["cpu", L_MV](), _ng.lt["cpu", L_VEADR](), _ne.lt["cpu", L_EDGES](), 0, 0,
+        mv.tt["cpu", NMV, 3](), _ng.tt["cpu", NMV](), _ne.tt["cpu", mesh_max_edge(NMV)](), 0, 0,
         GEOM_BOX,
         0.0, 0.0, 0.0,  # box2 at origin
         0.0, 0.0, 0.0, 1.0,
         0.0, 0.0,
         0.5, 0.5, 0.5,
         0, 0,
-        ws.lt["cpu", L_CCD_WS1](), 0,
+        ws.tt_dyn["cpu", L_CCD_WS1](L_CCD_WS1()), 0,
     )
     print("  dist=", Float64(result[0]), "(expected ~1.0)")
     if result[0] < 0:
@@ -101,14 +101,14 @@ def test_box_box_overlapping() raises:
         0.0, 0.0, 0.0, 1.0,
         0.0, 0.0,
         0.5, 0.5, 0.5,
-        mv.lt["cpu", L_MV](), _ng.lt["cpu", L_VEADR](), _ne.lt["cpu", L_EDGES](), 0, 0,
+        mv.tt["cpu", NMV, 3](), _ng.tt["cpu", NMV](), _ne.tt["cpu", mesh_max_edge(NMV)](), 0, 0,
         GEOM_BOX,
         0.0, 0.0, 0.0,  # box2 at origin
         0.0, 0.0, 0.0, 1.0,
         0.0, 0.0,
         0.5, 0.5, 0.5,
         0, 0,
-        ws.lt["cpu", L_CCD_WS1](), 0,
+        ws.tt_dyn["cpu", L_CCD_WS1](L_CCD_WS1()), 0,
     )
     print("  dist=", Float64(result[0]), "(expected ~-0.7)")
     if result[0] >= 0:
@@ -142,14 +142,14 @@ def test_sphere_mesh_separated() raises:
         0.0, 0.0, 0.0, 1.0,
         0.1, 0.0,  # radius=0.1
         0.0, 0.0, 0.0,
-        mv.lt["cpu", L_MV](), _ng.lt["cpu", L_VEADR](), _ne.lt["cpu", L_EDGES](), 0, 0,
+        mv.tt["cpu", NMV, 3](), _ng.tt["cpu", NMV](), _ne.tt["cpu", mesh_max_edge(NMV)](), 0, 0,
         GEOM_MESH,
         0.0, 0.0, 0.0,  # mesh at origin
         0.0, 0.0, 0.0, 1.0,
         0.0, 0.0,
         0.0, 0.0, 0.0,
         0, 8,
-        ws.lt["cpu", L_CCD_WS1](), 0,
+        ws.tt_dyn["cpu", L_CCD_WS1](L_CCD_WS1()), 0,
     )
     print("  dist=", Float64(result[0]), "(expected ~2.4)")
     if result[0] < 0:
@@ -186,14 +186,14 @@ def test_mesh_box_sawyer_case() raises:
         0.0, 0.0, 0.0, 1.0,  # identity quat
         0.0, 0.0,
         0.0, 0.0, 0.0,
-        mv.lt["cpu", L_MV](), _ng.lt["cpu", L_VEADR](), _ne.lt["cpu", L_EDGES](), 0, 8,
+        mv.tt["cpu", NMV, 3](), _ng.tt["cpu", NMV](), _ne.tt["cpu", mesh_max_edge(NMV)](), 0, 8,
         GEOM_BOX,
         0.0, 0.6, -0.46,  # table box center
         0.0, 0.0, 0.0, 1.0,  # identity quat
         0.0, 0.0,
         0.7, 0.4, 0.46,  # half-extents
         0, 0,
-        ws.lt["cpu", L_CCD_WS1](), 0,
+        ws.tt_dyn["cpu", L_CCD_WS1](L_CCD_WS1()), 0,
     )
     print("  dist=", Float64(result[0]),
           "contact_z=", Float64(result[3]),
@@ -233,14 +233,14 @@ def test_mesh_box_touching() raises:
         0.0, 0.0, 0.0, 1.0,
         0.0, 0.0,
         0.0, 0.0, 0.0,
-        mv.lt["cpu", L_MV](), _ng.lt["cpu", L_VEADR](), _ne.lt["cpu", L_EDGES](), 0, 8,
+        mv.tt["cpu", NMV, 3](), _ng.tt["cpu", NMV](), _ne.tt["cpu", mesh_max_edge(NMV)](), 0, 8,
         GEOM_BOX,
         0.0, 0.0, -0.5,  # box center at z=-0.5, half_z=0.5 → top at z=0.0
         0.0, 0.0, 0.0, 1.0,
         0.0, 0.0,
         1.0, 1.0, 0.5,
         0, 0,
-        ws.lt["cpu", L_CCD_WS1](), 0,
+        ws.tt_dyn["cpu", L_CCD_WS1](L_CCD_WS1()), 0,
     )
     print("  dist=", Float64(result[0]), "(expected ~0.0)")
     if result[0] < -0.01:
@@ -277,14 +277,14 @@ def test_mesh_box_rotated() raises:
         sq2, 0.0, 0.0, sq2,  # 90° rotation around X
         0.0, 0.0,
         0.0, 0.0, 0.0,
-        mv.lt["cpu", L_MV](), _ng.lt["cpu", L_VEADR](), _ne.lt["cpu", L_EDGES](), 0, 8,
+        mv.tt["cpu", NMV, 3](), _ng.tt["cpu", NMV](), _ne.tt["cpu", mesh_max_edge(NMV)](), 0, 8,
         GEOM_BOX,
         0.0, 0.6, -0.46,
         0.0, 0.0, 0.0, 1.0,
         0.0, 0.0,
         0.7, 0.4, 0.46,
         0, 0,
-        ws.lt["cpu", L_CCD_WS1](), 0,
+        ws.tt_dyn["cpu", L_CCD_WS1](L_CCD_WS1()), 0,
     )
     print("  dist=", Float64(result[0]),
           "(expected ~0.2, mesh at z=0.23±0.03, box top at z=0.0)")
@@ -320,14 +320,14 @@ def test_mesh_box_asymmetric() raises:
         0.0, 0.0, 0.0, 1.0,
         0.0, 0.0,
         0.0, 0.0, 0.0,
-        mv.lt["cpu", L_MV](), _ng.lt["cpu", L_VEADR](), _ne.lt["cpu", L_EDGES](), 0, 8,
+        mv.tt["cpu", NMV, 3](), _ng.tt["cpu", NMV](), _ne.tt["cpu", mesh_max_edge(NMV)](), 0, 8,
         GEOM_BOX,
         0.0, 0.6, -0.46,
         0.0, 0.0, 0.0, 1.0,
         0.0, 0.0,
         0.7, 0.4, 0.46,
         0, 0,
-        ws.lt["cpu", L_CCD_WS1](), 0,
+        ws.tt_dyn["cpu", L_CCD_WS1](L_CCD_WS1()), 0,
     )
     print("  dist=", Float64(result[0]),
           "(expected ~0.205)")
@@ -371,14 +371,14 @@ def test_mesh_box_actual_sawyer() raises:
         sq2, 0.0, 0.0, sq2,  # body 23 quat: 90° around X
         0.0, 0.0,
         0.0, 0.0, 0.0,
-        mv.lt["cpu", L_MV](), _ng.lt["cpu", L_VEADR](), _ne.lt["cpu", L_EDGES](), 0, 8,
+        mv.tt["cpu", NMV, 3](), _ng.tt["cpu", NMV](), _ne.tt["cpu", mesh_max_edge(NMV)](), 0, 8,
         GEOM_BOX,
         0.0, 0.6, -0.46,  # table collision box
         0.0, 0.0, 0.0, 1.0,
         0.0, 0.0,
         0.7, 0.4, 0.46,  # table half-extents
         0, 0,
-        ws.lt["cpu", L_CCD_WS1](), 0,
+        ws.tt_dyn["cpu", L_CCD_WS1](L_CCD_WS1()), 0,
     )
     # After 90° X rotation: mesh local z becomes world y, local y becomes world -z
     # Hull z-range [-0.003, 0.051] → world y offset
@@ -500,14 +500,14 @@ def test_exact_sawyer_runtime() raises:
         bqx, bqy, bqz, bqw,
         0.0, 0.0,
         0.0, 0.0, 0.0,
-        mv.lt["cpu", L_MV](), _ng.lt["cpu", L_VEADR](), _ne.lt["cpu", L_EDGES](), 0, 8,
+        mv.tt["cpu", NMV, 3](), _ng.tt["cpu", NMV](), _ne.tt["cpu", mesh_max_edge(NMV)](), 0, 8,
         GEOM_BOX,
         0.0, 0.6, -0.46,  # table collision box
         0.0, 0.0, 0.0, 1.0,
         0.0, 0.0,
         0.7, 0.4, 0.46,  # table half-extents
         0, 0,
-        ws.lt["cpu", L_CCD_WS1](), 0,
+        ws.tt_dyn["cpu", L_CCD_WS1](L_CCD_WS1()), 0,
     )
     print("  dist=", Float64(result[0]),
           "normal=", Float64(result[4]), Float64(result[5]), Float64(result[6]))

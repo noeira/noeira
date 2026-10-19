@@ -19,7 +19,7 @@ Run:
 
 from std.random import seed, random_float64
 from std.testing import assert_true
-from layout import Layout, LayoutTensor
+from noeira.core.tiles import tile
 
 from noeira.nn.constants import DT
 from noeira.nn.optimizer.adam import Adam
@@ -61,12 +61,8 @@ def main() raises:
                 acc += x_s[b * IN + i] * w_true[i * OUT + j]
             y_s[b * OUT + j] = acc
 
-    var x_in = LayoutTensor[DT, Layout.row_major(BATCH, IN), MutAnyOrigin](
-        mptr(x_s)
-    )
-    var y_target = LayoutTensor[DT, Layout.row_major(BATCH, OUT), MutAnyOrigin](
-        mptr(y_s)
-    )
+    var x_in = tile[BATCH, IN](mptr(x_s))
+    var y_target = tile[BATCH, OUT](mptr(y_s))
 
     # ── PCN on nn storage + nn Adam ───────────────────────────────────
     comptime Net = PCModule[

@@ -22,7 +22,7 @@ Run (Apple):  pixi run -e apple  mojo run -I . benchmarks/bench_storage_permute_
 from max.gpu import global_idx
 from max.gpu.host import DeviceContext
 from std.time import perf_counter_ns
-from layout import Layout, LayoutTensor
+from noeira.core.tiles import Tile, tile
 
 comptime DT = DType.float32
 comptime TPB = 128
@@ -33,8 +33,8 @@ comptime VEC = 4
 def _stt_naive[
     BATCH: Int, T: Int, S: Int, D: Int
 ](
-    src: LayoutTensor[DT, Layout.row_major(BATCH, T * S * D), MutAnyOrigin],
-    dst: LayoutTensor[DT, Layout.row_major(BATCH, T * S * D), MutAnyOrigin],
+    src: Tile[DT, BATCH, T * S * D],
+    dst: Tile[DT, BATCH, T * S * D],
 ):
     var gid = Int(global_idx.x)
     comptime total = BATCH * T * S * D
@@ -52,8 +52,8 @@ def _stt_naive[
 def _stt_vec[
     BATCH: Int, T: Int, S: Int, D: Int
 ](
-    src: LayoutTensor[DT, Layout.row_major(BATCH, T * S * D), MutAnyOrigin],
-    dst: LayoutTensor[DT, Layout.row_major(BATCH, T * S * D), MutAnyOrigin],
+    src: Tile[DT, BATCH, T * S * D],
+    dst: Tile[DT, BATCH, T * S * D],
 ):
     # one thread per VEC-chunk of the contiguous d-run (D % VEC == 0)
     var gid = Int(global_idx.x)
@@ -77,8 +77,8 @@ def _stt_vec[
 def _qkv_naive[
     BATCH: Int, SEQ: Int, DIM: Int
 ](
-    src: LayoutTensor[DT, Layout.row_major(BATCH, 3 * SEQ * DIM), MutAnyOrigin],
-    dst: LayoutTensor[DT, Layout.row_major(BATCH, 3 * SEQ * DIM), MutAnyOrigin],
+    src: Tile[DT, BATCH, 3 * SEQ * DIM],
+    dst: Tile[DT, BATCH, 3 * SEQ * DIM],
 ):
     var gid = Int(global_idx.x)
     comptime total = BATCH * 3 * SEQ * DIM
@@ -96,8 +96,8 @@ def _qkv_naive[
 def _qkv_vec[
     BATCH: Int, SEQ: Int, DIM: Int
 ](
-    src: LayoutTensor[DT, Layout.row_major(BATCH, 3 * SEQ * DIM), MutAnyOrigin],
-    dst: LayoutTensor[DT, Layout.row_major(BATCH, 3 * SEQ * DIM), MutAnyOrigin],
+    src: Tile[DT, BATCH, 3 * SEQ * DIM],
+    dst: Tile[DT, BATCH, 3 * SEQ * DIM],
 ):
     var gid = Int(global_idx.x)
     comptime total = BATCH * 3 * SEQ * DIM // VEC
@@ -123,8 +123,8 @@ def _time_stt[
     var s = ctx.enqueue_create_buffer[DT](N)
     var d = ctx.enqueue_create_buffer[DT](N)
     _ = s.enqueue_fill(Scalar[DT](0.01)); _ = d.enqueue_fill(Scalar[DT](0.0))
-    var sl = LayoutTensor[DT, Layout.row_major(BATCH, T * S * D), MutAnyOrigin](s)
-    var dl = LayoutTensor[DT, Layout.row_major(BATCH, T * S * D), MutAnyOrigin](d)
+    var sl = tile[BATCH, T * S * D](s)
+    var dl = tile[BATCH, T * S * D](d)
     var us = Float64(0)
     comptime if V:
         comptime nb = (N // VEC + TPB - 1) // TPB
@@ -158,8 +158,8 @@ def _time_qkv[
     var s = ctx.enqueue_create_buffer[DT](N)
     var d = ctx.enqueue_create_buffer[DT](N)
     _ = s.enqueue_fill(Scalar[DT](0.01)); _ = d.enqueue_fill(Scalar[DT](0.0))
-    var sl = LayoutTensor[DT, Layout.row_major(BATCH, 3 * SEQ * DIM), MutAnyOrigin](s)
-    var dl = LayoutTensor[DT, Layout.row_major(BATCH, 3 * SEQ * DIM), MutAnyOrigin](d)
+    var sl = tile[BATCH, 3 * SEQ * DIM](s)
+    var dl = tile[BATCH, 3 * SEQ * DIM](d)
     var us = Float64(0)
     comptime if V:
         comptime nb = (N // VEC + TPB - 1) // TPB

@@ -48,7 +48,7 @@ full TD-MPC2 planner at 1024 samples but only 1.21x at 256, where the
 
 from std.time import perf_counter_ns
 from max.gpu.host import DeviceContext
-from layout import Layout, LayoutTensor, TileTensor, row_major
+from layout import TileTensor, row_major
 from linalg.matmul import matmul as max_matmul
 
 comptime DT = DType.float32

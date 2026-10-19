@@ -65,7 +65,7 @@ def sumN_origin_erased[
         origin=MutAnyOrigin,
         ...,
     ],
-    mut output: TileTensor[
+    output: TileTensor[
         mut=True, dtype=DT, address_space=AddressSpace.GENERIC,
         element_size=1, origin=MutAnyOrigin, ...,
     ],
@@ -101,7 +101,7 @@ def sumN_pointer_pack[
     DIM: Int,
 ](
     var *input_ptrs: Pointer[Scalar[DT], MutAnyOrigin],
-    mut output: TileTensor[
+    output: TileTensor[
         mut=True, dtype=DT, address_space=AddressSpace.GENERIC,
         element_size=1, origin=MutAnyOrigin, ...,
     ],
@@ -176,7 +176,7 @@ struct MockNaryBinarySub[DIM: Int]:
             dtype=DT, address_space=AddressSpace.GENERIC,
             element_size=1, origin=MutAnyOrigin, ...,
         ],
-        mut output: TileTensor[
+        output: TileTensor[
             mut=True, dtype=DT, address_space=AddressSpace.GENERIC,
             element_size=1, origin=MutAnyOrigin, ...,
         ],
@@ -219,7 +219,7 @@ trait NaryModuleProto(Defaultable & Movable & Deinitable):
             dtype=DT, address_space=AddressSpace.GENERIC,
             element_size=1, origin=MutAnyOrigin, ...,
         ],
-        mut output: TileTensor[
+        output: TileTensor[
             mut=True, dtype=DT, address_space=AddressSpace.GENERIC,
             element_size=1, origin=MutAnyOrigin, ...,
         ],
@@ -246,7 +246,7 @@ struct MockTraitConformingBinarySub[DIM: Int](NaryModuleProto):
             dtype=DT, address_space=AddressSpace.GENERIC,
             element_size=1, origin=MutAnyOrigin, ...,
         ],
-        mut output: TileTensor[
+        output: TileTensor[
             mut=True, dtype=DT, address_space=AddressSpace.GENERIC,
             element_size=1, origin=MutAnyOrigin, ...,
         ],

@@ -36,8 +36,7 @@ from std.sys import default_accelerator
 from std.time import perf_counter_ns
 
 from max.gpu.host import DeviceContext, DeviceBuffer, FuncAttribute
-from layout import Layout, LayoutTensor, TileTensor, RuntimeLayout, UNKNOWN_VALUE
-from layout import row_major, Coord
+from layout import Coord, Idx, TileTensor, row_major
 from std.utils.index import Index
 
 from linalg.matmul import matmul as max_matmul
@@ -92,11 +91,8 @@ def splitk_gemm[
     `num_k_partitions` differs. `MatmulConfig.__eq__` compares only
     `block_tile_shape` and `num_pipeline_stages`, confirming that split.
     """
-    var tensor_c = c.to_layout_tensor()
-    var tensor_a = a.to_layout_tensor()
-    var tensor_b = b.to_layout_tensor()
-    var M = tensor_c.dim[0]()
-    var N = tensor_c.dim[1]()
+    var M = Int(c.dim[0]())
+    var N = Int(c.dim[1]())
 
     if num_partitions * M * N > ws.capacity:
         raise Error("SplitKWorkspace too small for this GEMM")
@@ -135,7 +131,7 @@ def splitk_gemm[
     # SEPARATE `min_k_partition = 1024` test capping P at 2 here for unrelated
     # reasons. Any caller that chooses P itself -- us, or MAX's own
     # `TUNE_NUM_K_PARTITIONS` autotune define -- can reach both.
-    var K_dim = Int(tensor_a.dim[1]())
+    var K_dim = Int(a.dim[1]())
     comptime BK = config.block_tile_shape[2]
     var part = align_up(K_dim // num_partitions, BK) if num_partitions > 0 else 0
     if num_partitions < 1:
@@ -155,34 +151,29 @@ def splitk_gemm[
 
 
     comptime ws_type = config.split_k_reduction_type
-    comptime static_N = tensor_c.layout.shape[1].value()
-    comptime ws_layout = Layout.row_major(UNKNOWN_VALUE, UNKNOWN_VALUE, static_N)
-    var ws_rt_layout = RuntimeLayout[ws_layout].row_major(
-        Index(num_partitions, M, N)
-    )
-    var ws_lt = LayoutTensor[ws_type, ws_layout, MutAnyOrigin](
-        ws.buf, ws_rt_layout
-    )
+    # MAX 26.7: the kernel takes TileTensors, with a LayoutType and a
+    # linear_idx_type parameter per operand (same as nn/core/splitk_gemm.mojo).
+    comptime static_N = c.static_shape[1]
+    var ws_tt = TileTensor(ws.buf, row_major(Coord(num_partitions, M, Idx[static_N])))
 
     comptime kern = multistage_gemm_split_k_kernel[
-        c_type,
-        tensor_c.layout,
-        a_type,
-        tensor_a.layout,
-        b_type,
-        tensor_b.layout,
-        ws_type,
-        ws_lt.layout,
+        c_type, type_of(c).LayoutType,
+        a_type, type_of(a).LayoutType,
+        b_type, type_of(b).LayoutType,
+        ws_type, type_of(ws_tt).LayoutType,
         transpose_b,
+        type_of(c).linear_idx_type,
+        type_of(a).linear_idx_type,
+        type_of(b).linear_idx_type,
+        type_of(ws_tt).linear_idx_type,
         config,
-        None,
     ]
 
     ctx.enqueue_function[kern](
-        tensor_c,
-        tensor_a,
-        tensor_b,
-        ws_lt,
+        c.as_unsafe_any_origin(),
+        a.as_unsafe_any_origin(),
+        b.as_unsafe_any_origin(),
+        ws_tt.as_unsafe_any_origin(),
         Int32(num_partitions),
         grid_dim=(
             ceildiv(N, config.block_tile_shape[1]),
@@ -196,7 +187,6 @@ def splitk_gemm[
         ),
     )
 
-    var ws_tt = TileTensor(ws.buf, row_major(Coord(num_partitions, M, N)))
     split_k_reduce(c, ws_tt, ctx)
 
 

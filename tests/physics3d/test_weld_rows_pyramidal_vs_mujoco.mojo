@@ -101,7 +101,7 @@ from noeira.physics3d.gpu.constants import (
 )
 from noeira.physics3d.types import ConeType
 from noeira.physics3d.solver.je_budget import je_ws_size
-from layout import Layout
+from noeira.core.tiles import RowMajor
 from noeira.physics3d.model.model_dims import ModelDims
 
 comptime DTYPE = DType.float64
@@ -391,14 +391,14 @@ def _prep(
     compute_cdof["cpu"](d, mf, sc, None)
     compute_mass_matrix["cpu"](d, mf, sc, None)
 
-    comptime L_JOINT = Layout.row_major(M.NJOINT, MODEL_JOINT_SIZE)
-    comptime L_M = Layout.row_major(1, M.NV * M.NV)
-    comptime L_NV = Layout.row_major(1, M.NV)
-    comptime L_QPOS = Layout.row_major(1, M.NQ)
+    comptime L_JOINT = RowMajor[M.NJOINT, MODEL_JOINT_SIZE]
+    comptime L_M = RowMajor[1, M.NV * M.NV]
+    comptime L_NV = RowMajor[1, M.NV]
+    comptime L_QPOS = RowMajor[1, M.NQ]
 
-    var joints_v = mf.joints.lt["cpu", L_JOINT]()
+    var joints_v = mf.joints.tt["cpu", M.NJOINT, MODEL_JOINT_SIZE]()
     _armature_env[DTYPE](
-        0, AsStatic[MD](), joints_v, sc.M.lt["cpu", L_M]()
+        0, AsStatic[MD](), joints_v, sc.M.tt["cpu", 1, M.NV * M.NV]()
     )
     ldl_factor["cpu", DTYPE, BATCH=1](mf, sc, None)
     compute_m_inv["cpu", DTYPE, BATCH=1](mf, sc, None)
@@ -406,20 +406,20 @@ def _prep(
     _fnet_passive_env[DTYPE](
         0,
         AsStatic[MD](),
-        d.qpos.lt["cpu", L_QPOS](),
-        d.qvel.lt["cpu", L_NV](),
-        d.qfrc.lt["cpu", L_NV](),
+        d.qpos.tt["cpu", 1, M.NQ](),
+        d.qvel.tt["cpu", 1, M.NV](),
+        d.qfrc.tt["cpu", 1, M.NV](),
         joints_v,
-        sc.bias.lt["cpu", L_NV](),
-        sc.fnet.lt["cpu", L_NV](),
+        sc.bias.tt["cpu", 1, M.NV](),
+        sc.fnet.tt["cpu", 1, M.NV](),
     )
     ldl_solve["cpu", DTYPE, BATCH=1](mf, sc, None)
     _qacc_writeback_env[DTYPE](
         0,
         AsStatic[MD](),
-        sc.qacc_ws.lt["cpu", L_NV](),
-        d.qacc.lt["cpu", L_NV](),
-        sc.qacc_constrained.lt["cpu", L_NV](),
+        sc.qacc_ws.tt["cpu", 1, M.NV](),
+        d.qacc.tt["cpu", 1, M.NV](),
+        sc.qacc_constrained.tt["cpu", 1, M.NV](),
     )
     detect_contacts["cpu"](d, mf, None)
 
@@ -673,35 +673,35 @@ def test_weld_orientation_rows_match_mujoco() raises:
     var w_J = Scratch[Scalar[DTYPE], WJ](6 * MTQ1.MAX_EQUALITY * MTQ1.NV, Scalar[DTYPE](0))
     var w_MinvJ = Scratch[Scalar[DTYPE], WJ](6 * MTQ1.MAX_EQUALITY * MTQ1.NV, Scalar[DTYPE](0))
 
-    comptime L_B3 = Layout.row_major(1, MTQ1.NBODY * 3)
-    comptime L_B4 = Layout.row_major(1, MTQ1.NBODY * 4)
-    comptime L_NV = Layout.row_major(1, MTQ1.NV)
-    comptime L_NQ = Layout.row_major(1, MTQ1.NQ)
-    comptime L_DW = Layout.row_major(MTQ1.NV)
-    comptime L_JT = Layout.row_major(MTQ1.NJOINT, MODEL_JOINT_SIZE)
-    comptime L_BD = Layout.row_major(MTQ1.NBODY, MODEL_BODY_SIZE)
-    comptime L_MT = Layout.row_major(MODEL_META_SIZE)
-    comptime L_EQ = Layout.row_major(MTQ1.MAX_EQUALITY, MODEL_EQ_SIZE)
-    comptime L_IW = Layout.row_major(MTQ1.NBODY, 2)
-    comptime L_CD = Layout.row_major(1, MTQ1.NV * 6)
-    comptime L_MI = Layout.row_major(1, MTQ1.NV * MTQ1.NV)
+    comptime L_B3 = RowMajor[1, MTQ1.NBODY * 3]
+    comptime L_B4 = RowMajor[1, MTQ1.NBODY * 4]
+    comptime L_NV = RowMajor[1, MTQ1.NV]
+    comptime L_NQ = RowMajor[1, MTQ1.NQ]
+    comptime L_DW = RowMajor[MTQ1.NV]
+    comptime L_JT = RowMajor[MTQ1.NJOINT, MODEL_JOINT_SIZE]
+    comptime L_BD = RowMajor[MTQ1.NBODY, MODEL_BODY_SIZE]
+    comptime L_MT = RowMajor[MODEL_META_SIZE]
+    comptime L_EQ = RowMajor[MTQ1.MAX_EQUALITY, MODEL_EQ_SIZE]
+    comptime L_IW = RowMajor[MTQ1.NBODY, 2]
+    comptime L_CD = RowMajor[1, MTQ1.NV * 6]
+    comptime L_MI = RowMajor[1, MTQ1.NV * MTQ1.NV]
 
     var n = build_weld_equality_rows[DTYPE, MTQ1.NV](
         0,
         AsStatic[MD_3](),
-        d.qpos.lt["cpu", L_NQ](),
-        d.qvel.lt["cpu", L_NV](),
-        d.xpos.lt["cpu", L_B3](),
-        d.xquat.lt["cpu", L_B4](),
-        d.subtree_com.lt["cpu", L_B3](),
-        mf.joints.lt["cpu", L_JT](),
-        mf.bodies.lt["cpu", L_BD](),
-        mf.meta.lt["cpu", L_MT](),
-        mf.equality.lt["cpu", L_EQ](),
-        mf.body_invweight0.lt["cpu", L_IW](),
-        mf.dof_invweight0.lt["cpu", L_DW](),
-        sc.cdof.lt["cpu", L_CD](),
-        sc.m_inv.lt["cpu", L_MI](),
+        d.qpos.tt["cpu", 1, MTQ1.NQ](),
+        d.qvel.tt["cpu", 1, MTQ1.NV](),
+        d.xpos.tt["cpu", 1, MTQ1.NBODY * 3](),
+        d.xquat.tt["cpu", 1, MTQ1.NBODY * 4](),
+        d.subtree_com.tt["cpu", 1, MTQ1.NBODY * 3](),
+        mf.joints.tt["cpu", MTQ1.NJOINT, MODEL_JOINT_SIZE](),
+        mf.bodies.tt["cpu", MTQ1.NBODY, MODEL_BODY_SIZE](),
+        mf.meta.tt["cpu", MODEL_META_SIZE](),
+        mf.equality.tt["cpu", MTQ1.MAX_EQUALITY, MODEL_EQ_SIZE](),
+        mf.body_invweight0.tt["cpu", MTQ1.NBODY, 2](),
+        mf.dof_invweight0.tt["cpu", MTQ1.NV](),
+        sc.cdof.tt["cpu", 1, MTQ1.NV * 6](),
+        sc.m_inv.tt["cpu", 1, MTQ1.NV * MTQ1.NV](),
         w_K, w_bias, w_D, w_J, w_MinvJ,
     )
     assert_true(n == 6, "expected 6 weld rows, built " + String(n))
@@ -818,35 +818,35 @@ def test_weld_torquescale_matches_mujoco() raises:
     var w_J = Scratch[Scalar[DTYPE], WJ](6 * MTQ5.MAX_EQUALITY * MTQ5.NV, Scalar[DTYPE](0))
     var w_MinvJ = Scratch[Scalar[DTYPE], WJ](6 * MTQ5.MAX_EQUALITY * MTQ5.NV, Scalar[DTYPE](0))
 
-    comptime L_B3 = Layout.row_major(1, MTQ5.NBODY * 3)
-    comptime L_B4 = Layout.row_major(1, MTQ5.NBODY * 4)
-    comptime L_NV = Layout.row_major(1, MTQ5.NV)
-    comptime L_NQ = Layout.row_major(1, MTQ5.NQ)
-    comptime L_DW = Layout.row_major(MTQ5.NV)
-    comptime L_JT = Layout.row_major(MTQ5.NJOINT, MODEL_JOINT_SIZE)
-    comptime L_BD = Layout.row_major(MTQ5.NBODY, MODEL_BODY_SIZE)
-    comptime L_MT = Layout.row_major(MODEL_META_SIZE)
-    comptime L_EQ = Layout.row_major(MTQ5.MAX_EQUALITY, MODEL_EQ_SIZE)
-    comptime L_IW = Layout.row_major(MTQ5.NBODY, 2)
-    comptime L_CD = Layout.row_major(1, MTQ5.NV * 6)
-    comptime L_MI = Layout.row_major(1, MTQ5.NV * MTQ5.NV)
+    comptime L_B3 = RowMajor[1, MTQ5.NBODY * 3]
+    comptime L_B4 = RowMajor[1, MTQ5.NBODY * 4]
+    comptime L_NV = RowMajor[1, MTQ5.NV]
+    comptime L_NQ = RowMajor[1, MTQ5.NQ]
+    comptime L_DW = RowMajor[MTQ5.NV]
+    comptime L_JT = RowMajor[MTQ5.NJOINT, MODEL_JOINT_SIZE]
+    comptime L_BD = RowMajor[MTQ5.NBODY, MODEL_BODY_SIZE]
+    comptime L_MT = RowMajor[MODEL_META_SIZE]
+    comptime L_EQ = RowMajor[MTQ5.MAX_EQUALITY, MODEL_EQ_SIZE]
+    comptime L_IW = RowMajor[MTQ5.NBODY, 2]
+    comptime L_CD = RowMajor[1, MTQ5.NV * 6]
+    comptime L_MI = RowMajor[1, MTQ5.NV * MTQ5.NV]
 
     var n = build_weld_equality_rows[DTYPE, MTQ5.NV](
         0,
         AsStatic[MD_4](),
-        d.qpos.lt["cpu", L_NQ](),
-        d.qvel.lt["cpu", L_NV](),
-        d.xpos.lt["cpu", L_B3](),
-        d.xquat.lt["cpu", L_B4](),
-        d.subtree_com.lt["cpu", L_B3](),
-        mf.joints.lt["cpu", L_JT](),
-        mf.bodies.lt["cpu", L_BD](),
-        mf.meta.lt["cpu", L_MT](),
-        mf.equality.lt["cpu", L_EQ](),
-        mf.body_invweight0.lt["cpu", L_IW](),
-        mf.dof_invweight0.lt["cpu", L_DW](),
-        sc.cdof.lt["cpu", L_CD](),
-        sc.m_inv.lt["cpu", L_MI](),
+        d.qpos.tt["cpu", 1, MTQ5.NQ](),
+        d.qvel.tt["cpu", 1, MTQ5.NV](),
+        d.xpos.tt["cpu", 1, MTQ5.NBODY * 3](),
+        d.xquat.tt["cpu", 1, MTQ5.NBODY * 4](),
+        d.subtree_com.tt["cpu", 1, MTQ5.NBODY * 3](),
+        mf.joints.tt["cpu", MTQ5.NJOINT, MODEL_JOINT_SIZE](),
+        mf.bodies.tt["cpu", MTQ5.NBODY, MODEL_BODY_SIZE](),
+        mf.meta.tt["cpu", MODEL_META_SIZE](),
+        mf.equality.tt["cpu", MTQ5.MAX_EQUALITY, MODEL_EQ_SIZE](),
+        mf.body_invweight0.tt["cpu", MTQ5.NBODY, 2](),
+        mf.dof_invweight0.tt["cpu", MTQ5.NV](),
+        sc.cdof.tt["cpu", 1, MTQ5.NV * 6](),
+        sc.m_inv.tt["cpu", 1, MTQ5.NV * MTQ5.NV](),
         w_K, w_bias, w_D, w_J, w_MinvJ,
     )
     assert_true(n == 6, "expected 6 weld rows, built " + String(n))

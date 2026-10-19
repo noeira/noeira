@@ -39,7 +39,7 @@ from std.math import abs
 from std.python import Python
 from std.testing import assert_true, TestSuite
 from max.gpu.host import DeviceContext
-from layout import Layout
+from noeira.core.tiles import RowMajor
 
 from noeira.envs.dm_control.fish import DMFishUprightModel
 from noeira.physics3d.fields import Model, Data, Dims, AsStatic
@@ -210,12 +210,12 @@ def test_integrate_pos_matches_mujoco() raises:
     var d = Data[DTYPE, MD, 1]()
     M.reset_data[DTYPE](sf, d)
 
-    comptime L_JNT = Layout.row_major(NJOINT, MODEL_JOINT_SIZE)
-    comptime L_QPOS = Layout.row_major(1, NQ)
-    comptime L_QVEL = Layout.row_major(1, NV)
-    var joints_v = mf.joints.lt["cpu", L_JNT]()
-    var qpos_v = d.qpos.lt["cpu", L_QPOS]()
-    var qvel_v = d.qvel.lt["cpu", L_QVEL]()
+    comptime L_JNT = RowMajor[NJOINT, MODEL_JOINT_SIZE]
+    comptime L_QPOS = RowMajor[1, NQ]
+    comptime L_QVEL = RowMajor[1, NV]
+    var joints_v = mf.joints.tt["cpu", NJOINT, MODEL_JOINT_SIZE]()
+    var qpos_v = d.qpos.tt["cpu", 1, NQ]()
+    var qvel_v = d.qvel.tt["cpu", 1, NV]()
 
     var n_free = 0
     for j in range(NJOINT):

@@ -1,7 +1,7 @@
 """PushT pixel rasterizer smoke test (CPU + GPU)."""
 
 from std.math import pi
-from layout import Layout, LayoutTensor
+from noeira.core.tiles import tile
 from max.gpu.host import DeviceContext, DeviceBuffer
 from noeira.physics2d import dtype, SHAPE_MAX_SIZE
 from noeira.envs.pusht import (
@@ -23,9 +23,7 @@ def cpu_test() raises:
     var data = Array[Scalar[dtype], IMG_H * IMG_W * IMG_C](
         fill=Scalar[dtype](0.0)
     )
-    var out_t = LayoutTensor[
-        dtype, Layout.row_major(IMG_H, IMG_W, IMG_C), MutAnyOrigin
-    ](data.unsafe_ptr().unsafe_bitcast[Scalar[dtype]]().as_unsafe_any_origin())
+    var out_t = tile[IMG_H, IMG_W, IMG_C](data.unsafe_ptr().unsafe_bitcast[Scalar[dtype]]().as_unsafe_any_origin())
     render_pixel_obs_single(
         Scalar[dtype](256.0),
         Scalar[dtype](256.0),

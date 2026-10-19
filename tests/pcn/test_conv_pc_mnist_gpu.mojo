@@ -21,7 +21,7 @@ Run (Apple):
 
 from std.memory import alloc, memset
 from std.time import perf_counter_ns
-from layout import Layout, LayoutTensor
+from noeira.core.tiles import tile
 from max.gpu.host import DeviceContext
 
 from noeira.nn.constants import DT as dtype
@@ -78,9 +78,7 @@ def main() raises:
     # ── Params (host init → device) ──────────────────────────────────────────
     var params_buf = alloc[Scalar[dtype]](NET.PARAM_SIZE).as_unsafe_any_origin()
     memset(params_buf, 0, NET.PARAM_SIZE)
-    var params_host_lt = LayoutTensor[
-        dtype, Layout.row_major(NET.PARAM_SIZE), MutAnyOrigin
-    ](params_buf)
+    var params_host_lt = tile[NET.PARAM_SIZE](params_buf)
     NET.pc_init_params[PCXavier, dtype](params_host_lt)
 
     var params_d = ctx.enqueue_create_buffer[dtype](NET.PARAM_SIZE)
@@ -124,42 +122,18 @@ def main() raises:
     var eval_host = ctx.enqueue_create_host_buffer[dtype](BATCH * NET.OUT_DIM)
 
     # ── Device LayoutTensor views ────────────────────────────────────────────
-    var params_t = LayoutTensor[
-        dtype, Layout.row_major(NET.PARAM_SIZE), MutAnyOrigin
-    ](params_d)
-    var grads_t = LayoutTensor[
-        dtype, Layout.row_major(NET.PARAM_SIZE), MutAnyOrigin
-    ](grads_d)
-    var opt_state_t = LayoutTensor[
-        dtype, Layout.row_major(NET.PARAM_SIZE, OPT.STATE_PER_PARAM), MutAnyOrigin
-    ](opt_state_d)
-    var opt_global_t = LayoutTensor[
-        dtype, Layout.row_major(OPT.GLOBAL_STATE_SIZE), MutAnyOrigin
-    ](opt_global_d)
-    var lat_t = LayoutTensor[
-        dtype, Layout.row_major(BATCH, NET.LATENT_DIM), MutAnyOrigin
-    ](lat_d)
-    var mu_eps_t = LayoutTensor[
-        dtype, Layout.row_major(BATCH, NET.SCRATCH_OUT_DIM), MutAnyOrigin
-    ](mu_eps_d)
-    var a_below_t = LayoutTensor[
-        dtype, Layout.row_major(BATCH, NET.SCRATCH_IN_DIM), MutAnyOrigin
-    ](a_below_d)
-    var z_below_t = LayoutTensor[
-        dtype, Layout.row_major(BATCH, NET.SCRATCH_IN_DIM), MutAnyOrigin
-    ](z_below_d)
-    var dx_t = LayoutTensor[
-        dtype, Layout.row_major(BATCH, NET.LATENT_DIM), MutAnyOrigin
-    ](dx_d)
-    var x_in_t = LayoutTensor[
-        dtype, Layout.row_major(BATCH, NET.IN_DIM), MutAnyOrigin
-    ](x_in_d)
-    var y_target_t = LayoutTensor[
-        dtype, Layout.row_major(BATCH, NET.OUT_DIM), MutAnyOrigin
-    ](y_target_d)
-    var eval_out_t = LayoutTensor[
-        dtype, Layout.row_major(BATCH, NET.OUT_DIM), MutAnyOrigin
-    ](eval_out_d)
+    var params_t = tile[NET.PARAM_SIZE](params_d)
+    var grads_t = tile[NET.PARAM_SIZE](grads_d)
+    var opt_state_t = tile[NET.PARAM_SIZE, OPT.STATE_PER_PARAM](opt_state_d)
+    var opt_global_t = tile[OPT.GLOBAL_STATE_SIZE](opt_global_d)
+    var lat_t = tile[BATCH, NET.LATENT_DIM](lat_d)
+    var mu_eps_t = tile[BATCH, NET.SCRATCH_OUT_DIM](mu_eps_d)
+    var a_below_t = tile[BATCH, NET.SCRATCH_IN_DIM](a_below_d)
+    var z_below_t = tile[BATCH, NET.SCRATCH_IN_DIM](z_below_d)
+    var dx_t = tile[BATCH, NET.LATENT_DIM](dx_d)
+    var x_in_t = tile[BATCH, NET.IN_DIM](x_in_d)
+    var y_target_t = tile[BATCH, NET.OUT_DIM](y_target_d)
+    var eval_out_t = tile[BATCH, NET.OUT_DIM](eval_out_d)
 
     # ── Train ─────────────────────────────────────────────────────────────────
     var step_num: Int = 0

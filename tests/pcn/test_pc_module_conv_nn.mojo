@@ -24,7 +24,7 @@ Run:
 
 from std.random import seed, random_float64
 from std.testing import assert_true
-from layout import Layout, LayoutTensor
+from noeira.core.tiles import tile
 
 from noeira.nn.constants import DT
 from noeira.nn.optimizer.adam import Adam
@@ -67,21 +67,15 @@ def main() raises:
     var x_s = List[Scalar[DT]](capacity=BATCH * IN)
     for _ in range(BATCH * IN):
         x_s.append(Scalar[DT](random_float64() * 2.0 - 1.0))
-    var x_in = LayoutTensor[DT, Layout.row_major(BATCH, IN), MutAnyOrigin](
-        mptr(x_s)
-    )
+    var x_in = tile[BATCH, IN](mptr(x_s))
 
     # Teacher (random init) defines an exactly-representable target.
     var teacher = Net.make_pcn[PCXavier]()
     var y_s = List[Scalar[DT]](capacity=BATCH * OUT)
     for _ in range(BATCH * OUT):
         y_s.append(Scalar[DT](0))
-    var y_target = LayoutTensor[DT, Layout.row_major(BATCH, OUT), MutAnyOrigin](
-        mptr(y_s)
-    )
-    var teacher_params = LayoutTensor[
-        DT, Layout.row_major(Seq.PARAM_SIZE), MutAnyOrigin
-    ](mptr(teacher.weights.val.data))
+    var y_target = tile[BATCH, OUT](mptr(y_s))
+    var teacher_params = tile[Seq.PARAM_SIZE](mptr(teacher.weights.val.data))
     Seq.forward_eval[BATCH](x_in, teacher_params, y_target)
 
     # Student (different draws) trains to match.

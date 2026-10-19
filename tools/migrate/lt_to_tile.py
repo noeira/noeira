@@ -209,7 +209,13 @@ def convert(s):
         bare = name[5:] if name.startswith("Self.") else name
         if not re.fullmatch(r"\w+", bare):
             return None, None, None
-        if bare in ("DYN1", "DYN2"):  # runtime-extent layout TYPES (core.tiles)
+        if bare in ("DYN1", "DYN2") or (
+            bare in PACKAGE_LAYOUTS
+            and not any(b[1] == bare for b in bindings)
+            and not any(g[1] == bare for g in generics)
+        ):
+            # runtime-extent layout types (core.tiles), or a layout TYPE the
+            # file imports from the package (`L_CCD_WS1`)
             return "generic", None, name
         kind = name_kind(bare, pos, bindings, generics)
         if kind == "binding":
@@ -468,8 +474,20 @@ def fix_imports(s):
     return s
 
 
+PACKAGE_LAYOUTS = set()
+"""Module-level `comptime NAME = RowMajor[...]` names in noeira/: layout
+types other files import (filled by `main`)."""
+
+
+def _scan_package_layouts(root):
+    for f in Path(root).rglob("*.mojo"):
+        for m in re.finditer(r"^comptime (\w+) = RowMajor\[", f.read_text(), re.M):
+            PACKAGE_LAYOUTS.add(m.group(1))
+
+
 def main(argv):
     dry = "--dry-run" in argv
+    _scan_package_layouts(Path(__file__).resolve().parents[2] / "noeira")
     paths = [Path(a) for a in argv if a != "--dry-run"]
     files = []
     for p in paths:

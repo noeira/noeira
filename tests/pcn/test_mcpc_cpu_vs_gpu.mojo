@@ -20,7 +20,7 @@ from std.math import abs as mabs
 from std.memory import alloc, memset
 from std.random.philox import Random as PhiloxRandom
 from max.gpu.host import DeviceContext
-from layout import Layout, LayoutTensor
+from noeira.core.tiles import tile
 
 from noeira.nn.constants import DT as dtype
 from noeira.experimental.pcn.pc_initializer import PCXavier
@@ -76,9 +76,7 @@ def main() raises:
     # ── Allocate params on host, init with Xavier (deterministic seed) ────────
     var params_buf = alloc[Scalar[dtype]](NET.PARAM_SIZE).as_unsafe_any_origin()
     memset(params_buf, 0, NET.PARAM_SIZE)
-    var params = LayoutTensor[
-        dtype, Layout.row_major(NET.PARAM_SIZE), MutAnyOrigin
-    ](params_buf)
+    var params = tile[NET.PARAM_SIZE](params_buf)
     NET.pc_init_params[PCXavier, dtype](params)
 
     # ── Input + target (deterministic Philox) ─────────────────────────────────
@@ -93,12 +91,8 @@ def main() raises:
     for b in range(BATCH):
         y_tgt_buf[b * NET.OUT_DIM + (b % NET.OUT_DIM)] = Scalar[dtype](1.0)
 
-    var x_in = LayoutTensor[
-        dtype, Layout.row_major(BATCH, NET.IN_DIM), MutAnyOrigin
-    ](x_in_buf)
-    var y_target = LayoutTensor[
-        dtype, Layout.row_major(BATCH, NET.OUT_DIM), MutAnyOrigin
-    ](y_tgt_buf)
+    var x_in = tile[BATCH, NET.IN_DIM](x_in_buf)
+    var y_target = tile[BATCH, NET.OUT_DIM](y_tgt_buf)
 
     # =================================================================
     # CPU run
@@ -118,27 +112,13 @@ def main() raises:
     memset(dx_cpu_buf, 0, BATCH * NET.LATENT_DIM)
     memset(noise_cpu_buf, 0, BATCH * NET.LATENT_DIM)
 
-    var grads_cpu = LayoutTensor[
-        dtype, Layout.row_major(NET.PARAM_SIZE), MutAnyOrigin
-    ](grads_cpu_buf)
-    var lat_cpu = LayoutTensor[
-        dtype, Layout.row_major(BATCH, NET.LATENT_DIM), MutAnyOrigin
-    ](lat_cpu_buf)
-    var mu_eps_cpu = LayoutTensor[
-        dtype, Layout.row_major(BATCH, NET.SCRATCH_OUT_DIM), MutAnyOrigin
-    ](mu_eps_cpu_buf)
-    var a_below_cpu = LayoutTensor[
-        dtype, Layout.row_major(BATCH, NET.SCRATCH_IN_DIM), MutAnyOrigin
-    ](a_below_cpu_buf)
-    var z_below_cpu = LayoutTensor[
-        dtype, Layout.row_major(BATCH, NET.SCRATCH_IN_DIM), MutAnyOrigin
-    ](z_below_cpu_buf)
-    var dx_cpu = LayoutTensor[
-        dtype, Layout.row_major(BATCH, NET.LATENT_DIM), MutAnyOrigin
-    ](dx_cpu_buf)
-    var noise_cpu = LayoutTensor[
-        dtype, Layout.row_major(BATCH, NET.LATENT_DIM), MutAnyOrigin
-    ](noise_cpu_buf)
+    var grads_cpu = tile[NET.PARAM_SIZE](grads_cpu_buf)
+    var lat_cpu = tile[BATCH, NET.LATENT_DIM](lat_cpu_buf)
+    var mu_eps_cpu = tile[BATCH, NET.SCRATCH_OUT_DIM](mu_eps_cpu_buf)
+    var a_below_cpu = tile[BATCH, NET.SCRATCH_IN_DIM](a_below_cpu_buf)
+    var z_below_cpu = tile[BATCH, NET.SCRATCH_IN_DIM](z_below_cpu_buf)
+    var dx_cpu = tile[BATCH, NET.LATENT_DIM](dx_cpu_buf)
+    var noise_cpu = tile[BATCH, NET.LATENT_DIM](noise_cpu_buf)
 
     var cpu_result = TRAINER.compute_grads_only_mcpc[BATCH](
         params,
@@ -192,36 +172,16 @@ def main() raises:
         y_host.unsafe_ptr()[i] = y_tgt_buf[i]
     ctx.enqueue_copy(y_target_dbuf, y_host)
 
-    var params_t_gpu = LayoutTensor[
-        dtype, Layout.row_major(NET.PARAM_SIZE), MutAnyOrigin
-    ](params_dbuf)
-    var grads_t_gpu = LayoutTensor[
-        dtype, Layout.row_major(NET.PARAM_SIZE), MutAnyOrigin
-    ](grads_dbuf)
-    var lat_t_gpu = LayoutTensor[
-        dtype, Layout.row_major(BATCH, NET.LATENT_DIM), MutAnyOrigin
-    ](lat_dbuf)
-    var mu_eps_t_gpu = LayoutTensor[
-        dtype, Layout.row_major(BATCH, NET.SCRATCH_OUT_DIM), MutAnyOrigin
-    ](mu_eps_dbuf)
-    var a_below_t_gpu = LayoutTensor[
-        dtype, Layout.row_major(BATCH, NET.SCRATCH_IN_DIM), MutAnyOrigin
-    ](a_below_dbuf)
-    var z_below_t_gpu = LayoutTensor[
-        dtype, Layout.row_major(BATCH, NET.SCRATCH_IN_DIM), MutAnyOrigin
-    ](z_below_dbuf)
-    var dx_t_gpu = LayoutTensor[
-        dtype, Layout.row_major(BATCH, NET.LATENT_DIM), MutAnyOrigin
-    ](dx_dbuf)
-    var noise_t_gpu = LayoutTensor[
-        dtype, Layout.row_major(BATCH, NET.LATENT_DIM), MutAnyOrigin
-    ](noise_dbuf)
-    var x_in_t_gpu = LayoutTensor[
-        dtype, Layout.row_major(BATCH, NET.IN_DIM), MutAnyOrigin
-    ](x_in_dbuf)
-    var y_target_t_gpu = LayoutTensor[
-        dtype, Layout.row_major(BATCH, NET.OUT_DIM), MutAnyOrigin
-    ](y_target_dbuf)
+    var params_t_gpu = tile[NET.PARAM_SIZE](params_dbuf)
+    var grads_t_gpu = tile[NET.PARAM_SIZE](grads_dbuf)
+    var lat_t_gpu = tile[BATCH, NET.LATENT_DIM](lat_dbuf)
+    var mu_eps_t_gpu = tile[BATCH, NET.SCRATCH_OUT_DIM](mu_eps_dbuf)
+    var a_below_t_gpu = tile[BATCH, NET.SCRATCH_IN_DIM](a_below_dbuf)
+    var z_below_t_gpu = tile[BATCH, NET.SCRATCH_IN_DIM](z_below_dbuf)
+    var dx_t_gpu = tile[BATCH, NET.LATENT_DIM](dx_dbuf)
+    var noise_t_gpu = tile[BATCH, NET.LATENT_DIM](noise_dbuf)
+    var x_in_t_gpu = tile[BATCH, NET.IN_DIM](x_in_dbuf)
+    var y_target_t_gpu = tile[BATCH, NET.OUT_DIM](y_target_dbuf)
 
     TRAINER.compute_grads_only_mcpc_gpu[BATCH](
         ctx,

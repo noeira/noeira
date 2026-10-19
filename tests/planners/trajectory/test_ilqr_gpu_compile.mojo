@@ -12,7 +12,7 @@ machines should still pass).
 
 from std.sys import has_accelerator
 from max.gpu.host import DeviceContext
-from layout import Layout, LayoutTensor
+from noeira.core.tiles import Tile, tile
 
 from noeira.nn.constants import DT as dtype
 from noeira.planners.trajectory import (
@@ -46,77 +46,35 @@ struct DummyGPUCB(
     def step_gpu[B: Int](
         mut self,
         ctx: DeviceContext,
-        z: LayoutTensor[
-            dtype, Layout.row_major(B, Self.LATENT_DIM), MutAnyOrigin
-        ],
-        u: LayoutTensor[
-            dtype, Layout.row_major(B, Self.ACTION_DIM), MutAnyOrigin
-        ],
-        z_next_out: LayoutTensor[
-            dtype, Layout.row_major(B, Self.LATENT_DIM), MutAnyOrigin
-        ],
-        cost_out: LayoutTensor[dtype, Layout.row_major(B), MutAnyOrigin],
+        z: Tile[dtype, B, Self.LATENT_DIM],
+        u: Tile[dtype, B, Self.ACTION_DIM],
+        z_next_out: Tile[dtype, B, Self.LATENT_DIM],
+        cost_out: Tile[dtype, B],
     ) raises:
         pass
 
     def linearize_gpu[B: Int](
         mut self,
         ctx: DeviceContext,
-        z: LayoutTensor[
-            dtype, Layout.row_major(B, Self.LATENT_DIM), MutAnyOrigin
-        ],
-        u: LayoutTensor[
-            dtype, Layout.row_major(B, Self.ACTION_DIM), MutAnyOrigin
-        ],
-        A_out: LayoutTensor[
-            dtype,
-            Layout.row_major(B, Self.LATENT_DIM, Self.LATENT_DIM),
-            MutAnyOrigin,
-        ],
-        B_out: LayoutTensor[
-            dtype,
-            Layout.row_major(B, Self.LATENT_DIM, Self.ACTION_DIM),
-            MutAnyOrigin,
-        ],
-        l_z_out: LayoutTensor[
-            dtype, Layout.row_major(B, Self.LATENT_DIM), MutAnyOrigin
-        ],
-        l_u_out: LayoutTensor[
-            dtype, Layout.row_major(B, Self.ACTION_DIM), MutAnyOrigin
-        ],
-        l_zz_out: LayoutTensor[
-            dtype,
-            Layout.row_major(B, Self.LATENT_DIM, Self.LATENT_DIM),
-            MutAnyOrigin,
-        ],
-        l_uu_out: LayoutTensor[
-            dtype,
-            Layout.row_major(B, Self.ACTION_DIM, Self.ACTION_DIM),
-            MutAnyOrigin,
-        ],
-        l_zu_out: LayoutTensor[
-            dtype,
-            Layout.row_major(B, Self.LATENT_DIM, Self.ACTION_DIM),
-            MutAnyOrigin,
-        ],
+        z: Tile[dtype, B, Self.LATENT_DIM],
+        u: Tile[dtype, B, Self.ACTION_DIM],
+        A_out: Tile[dtype, B, Self.LATENT_DIM, Self.LATENT_DIM],
+        B_out: Tile[dtype, B, Self.LATENT_DIM, Self.ACTION_DIM],
+        l_z_out: Tile[dtype, B, Self.LATENT_DIM],
+        l_u_out: Tile[dtype, B, Self.ACTION_DIM],
+        l_zz_out: Tile[dtype, B, Self.LATENT_DIM, Self.LATENT_DIM],
+        l_uu_out: Tile[dtype, B, Self.ACTION_DIM, Self.ACTION_DIM],
+        l_zu_out: Tile[dtype, B, Self.LATENT_DIM, Self.ACTION_DIM],
     ) raises:
         pass
 
     def terminal_gpu[B: Int](
         mut self,
         ctx: DeviceContext,
-        z: LayoutTensor[
-            dtype, Layout.row_major(B, Self.LATENT_DIM), MutAnyOrigin
-        ],
-        V_z_out: LayoutTensor[
-            dtype, Layout.row_major(B, Self.LATENT_DIM), MutAnyOrigin
-        ],
-        V_zz_out: LayoutTensor[
-            dtype,
-            Layout.row_major(B, Self.LATENT_DIM, Self.LATENT_DIM),
-            MutAnyOrigin,
-        ],
-        cost_out: LayoutTensor[dtype, Layout.row_major(B), MutAnyOrigin],
+        z: Tile[dtype, B, Self.LATENT_DIM],
+        V_z_out: Tile[dtype, B, Self.LATENT_DIM],
+        V_zz_out: Tile[dtype, B, Self.LATENT_DIM, Self.LATENT_DIM],
+        cost_out: Tile[dtype, B],
     ) raises:
         pass
 
@@ -134,9 +92,7 @@ def main() raises:
 
     var z0_buf = ctx.enqueue_create_buffer[dtype](N_ENVS * LATENT_DIM)
     z0_buf.enqueue_fill(0.0)
-    var z0 = LayoutTensor[
-        dtype, Layout.row_major(N_ENVS, LATENT_DIM), MutAnyOrigin
-    ](z0_buf.unsafe_ptr().as_unsafe_any_origin())
+    var z0 = tile[N_ENVS, LATENT_DIM](z0_buf.unsafe_ptr().as_unsafe_any_origin())
 
     var cb = DummyGPUCB(_placeholder=0)
     planner.plan_gpu(ctx, cb, z0)

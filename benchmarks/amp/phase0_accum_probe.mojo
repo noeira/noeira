@@ -15,7 +15,7 @@ Three cases:
 """
 
 from max.gpu.host import DeviceContext
-from layout import Layout, LayoutTensor, TileTensor, row_major
+from layout import TileTensor, row_major
 from linalg.matmul import matmul as max_matmul
 
 from noeira.nn.core.tensor import Tensor, TensorImpl

@@ -22,7 +22,7 @@ from max.gpu import block_idx, thread_idx
 from max.gpu.host import DeviceContext
 from std.math import abs as math_abs
 from std.testing import assert_true
-from layout import Layout, LayoutTensor
+from noeira.core.tiles import Tile, tile
 
 from noeira.nn.constants import DT as dtype
 from noeira.planners.trajectory import (
@@ -44,12 +44,10 @@ def lq_step_kernel[
     dtype: DType,
     B: Int,
 ](
-    z: LayoutTensor[dtype, Layout.row_major(B, LATENT_DIM), MutAnyOrigin],
-    u: LayoutTensor[dtype, Layout.row_major(B, ACTION_DIM), MutAnyOrigin],
-    z_next_out: LayoutTensor[
-        dtype, Layout.row_major(B, LATENT_DIM), MutAnyOrigin
-    ],
-    cost_out: LayoutTensor[dtype, Layout.row_major(B), MutAnyOrigin],
+    z: Tile[dtype, B, LATENT_DIM],
+    u: Tile[dtype, B, ACTION_DIM],
+    z_next_out: Tile[dtype, B, LATENT_DIM],
+    cost_out: Tile[dtype, B],
     A_c: Scalar[dtype],
     B_c: Scalar[dtype],
     Q_c: Scalar[dtype],
@@ -60,8 +58,8 @@ def lq_step_kernel[
         return
     var z_v = rebind[Scalar[dtype]](z[i, 0])
     var u_v = rebind[Scalar[dtype]](u[i, 0])
-    z_next_out[i, 0] = rebind[z_next_out.element_type](A_c * z_v + B_c * u_v)
-    cost_out[i] = rebind[cost_out.element_type](
+    z_next_out[i, 0] = rebind[z_next_out.ElementType](A_c * z_v + B_c * u_v)
+    cost_out[i] = rebind[cost_out.ElementType](
         Q_c * z_v * z_v + R_c * u_v * u_v
     )
 
@@ -73,39 +71,15 @@ def lq_linearize_kernel[
     dtype: DType,
     B: Int,
 ](
-    z: LayoutTensor[dtype, Layout.row_major(B, LATENT_DIM), MutAnyOrigin],
-    u: LayoutTensor[dtype, Layout.row_major(B, ACTION_DIM), MutAnyOrigin],
-    A_out: LayoutTensor[
-        dtype,
-        Layout.row_major(B, LATENT_DIM, LATENT_DIM),
-        MutAnyOrigin,
-    ],
-    B_out: LayoutTensor[
-        dtype,
-        Layout.row_major(B, LATENT_DIM, ACTION_DIM),
-        MutAnyOrigin,
-    ],
-    l_z_out: LayoutTensor[
-        dtype, Layout.row_major(B, LATENT_DIM), MutAnyOrigin
-    ],
-    l_u_out: LayoutTensor[
-        dtype, Layout.row_major(B, ACTION_DIM), MutAnyOrigin
-    ],
-    l_zz_out: LayoutTensor[
-        dtype,
-        Layout.row_major(B, LATENT_DIM, LATENT_DIM),
-        MutAnyOrigin,
-    ],
-    l_uu_out: LayoutTensor[
-        dtype,
-        Layout.row_major(B, ACTION_DIM, ACTION_DIM),
-        MutAnyOrigin,
-    ],
-    l_zu_out: LayoutTensor[
-        dtype,
-        Layout.row_major(B, LATENT_DIM, ACTION_DIM),
-        MutAnyOrigin,
-    ],
+    z: Tile[dtype, B, LATENT_DIM],
+    u: Tile[dtype, B, ACTION_DIM],
+    A_out: Tile[dtype, B, LATENT_DIM, LATENT_DIM],
+    B_out: Tile[dtype, B, LATENT_DIM, ACTION_DIM],
+    l_z_out: Tile[dtype, B, LATENT_DIM],
+    l_u_out: Tile[dtype, B, ACTION_DIM],
+    l_zz_out: Tile[dtype, B, LATENT_DIM, LATENT_DIM],
+    l_uu_out: Tile[dtype, B, ACTION_DIM, ACTION_DIM],
+    l_zu_out: Tile[dtype, B, LATENT_DIM, ACTION_DIM],
     A_c: Scalar[dtype],
     B_c: Scalar[dtype],
     Q_c: Scalar[dtype],
@@ -116,13 +90,13 @@ def lq_linearize_kernel[
         return
     var z_v = rebind[Scalar[dtype]](z[i, 0])
     var u_v = rebind[Scalar[dtype]](u[i, 0])
-    A_out[i, 0, 0] = rebind[A_out.element_type](A_c)
-    B_out[i, 0, 0] = rebind[B_out.element_type](B_c)
-    l_z_out[i, 0] = rebind[l_z_out.element_type](Scalar[dtype](2.0) * Q_c * z_v)
-    l_u_out[i, 0] = rebind[l_u_out.element_type](Scalar[dtype](2.0) * R_c * u_v)
-    l_zz_out[i, 0, 0] = rebind[l_zz_out.element_type](Scalar[dtype](2.0) * Q_c)
-    l_uu_out[i, 0, 0] = rebind[l_uu_out.element_type](Scalar[dtype](2.0) * R_c)
-    l_zu_out[i, 0, 0] = rebind[l_zu_out.element_type](Scalar[dtype](0.0))
+    A_out[i, 0, 0] = rebind[A_out.ElementType](A_c)
+    B_out[i, 0, 0] = rebind[B_out.ElementType](B_c)
+    l_z_out[i, 0] = rebind[l_z_out.ElementType](Scalar[dtype](2.0) * Q_c * z_v)
+    l_u_out[i, 0] = rebind[l_u_out.ElementType](Scalar[dtype](2.0) * R_c * u_v)
+    l_zz_out[i, 0, 0] = rebind[l_zz_out.ElementType](Scalar[dtype](2.0) * Q_c)
+    l_uu_out[i, 0, 0] = rebind[l_uu_out.ElementType](Scalar[dtype](2.0) * R_c)
+    l_zu_out[i, 0, 0] = rebind[l_zu_out.ElementType](Scalar[dtype](0.0))
 
 
 # ── 1D LQ terminal kernel: cost = Q_T·z², V_z = 2·Q_T·z, V_zz = 2·Q_T ──
@@ -132,29 +106,23 @@ def lq_terminal_kernel[
     dtype: DType,
     B: Int,
 ](
-    z: LayoutTensor[dtype, Layout.row_major(B, LATENT_DIM), MutAnyOrigin],
-    V_z_out: LayoutTensor[
-        dtype, Layout.row_major(B, LATENT_DIM), MutAnyOrigin
-    ],
-    V_zz_out: LayoutTensor[
-        dtype,
-        Layout.row_major(B, LATENT_DIM, LATENT_DIM),
-        MutAnyOrigin,
-    ],
-    cost_out: LayoutTensor[dtype, Layout.row_major(B), MutAnyOrigin],
+    z: Tile[dtype, B, LATENT_DIM],
+    V_z_out: Tile[dtype, B, LATENT_DIM],
+    V_zz_out: Tile[dtype, B, LATENT_DIM, LATENT_DIM],
+    cost_out: Tile[dtype, B],
     Q_T_c: Scalar[dtype],
 ):
     var i = Int(block_idx.x * thread_idx.x + thread_idx.x)
     if i >= B:
         return
     var z_v = rebind[Scalar[dtype]](z[i, 0])
-    V_z_out[i, 0] = rebind[V_z_out.element_type](
+    V_z_out[i, 0] = rebind[V_z_out.ElementType](
         Scalar[dtype](2.0) * Q_T_c * z_v
     )
-    V_zz_out[i, 0, 0] = rebind[V_zz_out.element_type](
+    V_zz_out[i, 0, 0] = rebind[V_zz_out.ElementType](
         Scalar[dtype](2.0) * Q_T_c
     )
-    cost_out[i] = rebind[cost_out.element_type](Q_T_c * z_v * z_v)
+    cost_out[i] = rebind[cost_out.ElementType](Q_T_c * z_v * z_v)
 
 
 # ── Callback ──
@@ -178,16 +146,10 @@ struct LQ1DGPUCallback(
     def step_gpu[B: Int](
         mut self,
         ctx: DeviceContext,
-        z: LayoutTensor[
-            dtype, Layout.row_major(B, Self.LATENT_DIM), MutAnyOrigin
-        ],
-        u: LayoutTensor[
-            dtype, Layout.row_major(B, Self.ACTION_DIM), MutAnyOrigin
-        ],
-        z_next_out: LayoutTensor[
-            dtype, Layout.row_major(B, Self.LATENT_DIM), MutAnyOrigin
-        ],
-        cost_out: LayoutTensor[dtype, Layout.row_major(B), MutAnyOrigin],
+        z: Tile[dtype, B, Self.LATENT_DIM],
+        u: Tile[dtype, B, Self.ACTION_DIM],
+        z_next_out: Tile[dtype, B, Self.LATENT_DIM],
+        cost_out: Tile[dtype, B],
     ) raises:
         ctx.enqueue_function[lq_step_kernel[dtype, B]](
             z,
@@ -205,43 +167,15 @@ struct LQ1DGPUCallback(
     def linearize_gpu[B: Int](
         mut self,
         ctx: DeviceContext,
-        z: LayoutTensor[
-            dtype, Layout.row_major(B, Self.LATENT_DIM), MutAnyOrigin
-        ],
-        u: LayoutTensor[
-            dtype, Layout.row_major(B, Self.ACTION_DIM), MutAnyOrigin
-        ],
-        A_out: LayoutTensor[
-            dtype,
-            Layout.row_major(B, Self.LATENT_DIM, Self.LATENT_DIM),
-            MutAnyOrigin,
-        ],
-        B_out: LayoutTensor[
-            dtype,
-            Layout.row_major(B, Self.LATENT_DIM, Self.ACTION_DIM),
-            MutAnyOrigin,
-        ],
-        l_z_out: LayoutTensor[
-            dtype, Layout.row_major(B, Self.LATENT_DIM), MutAnyOrigin
-        ],
-        l_u_out: LayoutTensor[
-            dtype, Layout.row_major(B, Self.ACTION_DIM), MutAnyOrigin
-        ],
-        l_zz_out: LayoutTensor[
-            dtype,
-            Layout.row_major(B, Self.LATENT_DIM, Self.LATENT_DIM),
-            MutAnyOrigin,
-        ],
-        l_uu_out: LayoutTensor[
-            dtype,
-            Layout.row_major(B, Self.ACTION_DIM, Self.ACTION_DIM),
-            MutAnyOrigin,
-        ],
-        l_zu_out: LayoutTensor[
-            dtype,
-            Layout.row_major(B, Self.LATENT_DIM, Self.ACTION_DIM),
-            MutAnyOrigin,
-        ],
+        z: Tile[dtype, B, Self.LATENT_DIM],
+        u: Tile[dtype, B, Self.ACTION_DIM],
+        A_out: Tile[dtype, B, Self.LATENT_DIM, Self.LATENT_DIM],
+        B_out: Tile[dtype, B, Self.LATENT_DIM, Self.ACTION_DIM],
+        l_z_out: Tile[dtype, B, Self.LATENT_DIM],
+        l_u_out: Tile[dtype, B, Self.ACTION_DIM],
+        l_zz_out: Tile[dtype, B, Self.LATENT_DIM, Self.LATENT_DIM],
+        l_uu_out: Tile[dtype, B, Self.ACTION_DIM, Self.ACTION_DIM],
+        l_zu_out: Tile[dtype, B, Self.LATENT_DIM, Self.ACTION_DIM],
     ) raises:
         ctx.enqueue_function[lq_linearize_kernel[dtype, B]](
             z,
@@ -264,18 +198,10 @@ struct LQ1DGPUCallback(
     def terminal_gpu[B: Int](
         mut self,
         ctx: DeviceContext,
-        z: LayoutTensor[
-            dtype, Layout.row_major(B, Self.LATENT_DIM), MutAnyOrigin
-        ],
-        V_z_out: LayoutTensor[
-            dtype, Layout.row_major(B, Self.LATENT_DIM), MutAnyOrigin
-        ],
-        V_zz_out: LayoutTensor[
-            dtype,
-            Layout.row_major(B, Self.LATENT_DIM, Self.LATENT_DIM),
-            MutAnyOrigin,
-        ],
-        cost_out: LayoutTensor[dtype, Layout.row_major(B), MutAnyOrigin],
+        z: Tile[dtype, B, Self.LATENT_DIM],
+        V_z_out: Tile[dtype, B, Self.LATENT_DIM],
+        V_zz_out: Tile[dtype, B, Self.LATENT_DIM, Self.LATENT_DIM],
+        cost_out: Tile[dtype, B],
     ) raises:
         ctx.enqueue_function[lq_terminal_kernel[dtype, B]](
             z,
@@ -325,9 +251,7 @@ def test_ilqr_gpu_matches_lqr_first_action() raises:
     z0_host[1] = 0.5
     var z0_buf = ctx.enqueue_create_buffer[dtype](N_ENVS * LATENT_DIM)
     ctx.enqueue_copy(z0_buf, z0_host)
-    var z0 = LayoutTensor[
-        dtype, Layout.row_major(N_ENVS, LATENT_DIM), MutAnyOrigin
-    ](z0_buf.unsafe_ptr().as_unsafe_any_origin())
+    var z0 = tile[N_ENVS, LATENT_DIM](z0_buf.unsafe_ptr().as_unsafe_any_origin())
 
     var cb = LQ1DGPUCallback(A=A, B=B, Q=Q, R=R, Q_T=Q_T)
     planner.plan_gpu(ctx, cb, z0)

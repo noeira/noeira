@@ -13,7 +13,8 @@ from std.math import exp, tanh
 from max.gpu import thread_idx, block_idx, global_idx
 from max.gpu.host import DeviceContext
 from std.time import perf_counter_ns
-from layout import Layout, LayoutTensor, TileTensor, row_major
+from layout import TileTensor, row_major
+from noeira.core.tiles import RowMajor, Tile, tile
 from linalg.matmul import matmul as max_matmul
 
 comptime DT = DType.float32
@@ -31,14 +32,14 @@ def _sigmoid(x: Scalar[DT]) -> Scalar[DT]:
 def _lstm_fwd_naive[
     BATCH: Int, IN_: Int, H: Int
 ](
-    x: LayoutTensor[DT, Layout.row_major(BATCH, IN_), MutAnyOrigin],
-    W_ih: LayoutTensor[DT, Layout.row_major(IN_, 4 * H), MutAnyOrigin],
-    W_hh: LayoutTensor[DT, Layout.row_major(H, 4 * H), MutAnyOrigin],
-    b: LayoutTensor[DT, Layout.row_major(4 * H), MutAnyOrigin],
-    h_prev: LayoutTensor[DT, Layout.row_major(BATCH, H), MutAnyOrigin],
-    c_prev: LayoutTensor[DT, Layout.row_major(BATCH, H), MutAnyOrigin],
-    h_t: LayoutTensor[DT, Layout.row_major(BATCH, H), MutAnyOrigin],
-    c_t: LayoutTensor[DT, Layout.row_major(BATCH, H), MutAnyOrigin],
+    x: Tile[DT, BATCH, IN_],
+    W_ih: Tile[DT, IN_, 4 * H],
+    W_hh: Tile[DT, H, 4 * H],
+    b: Tile[DT, 4 * H],
+    h_prev: Tile[DT, BATCH, H],
+    c_prev: Tile[DT, BATCH, H],
+    h_t: Tile[DT, BATCH, H],
+    c_t: Tile[DT, BATCH, H],
 ):
     var bi = Int(block_idx.x)
     if bi >= BATCH:
@@ -74,12 +75,12 @@ def _lstm_fwd_naive[
 def _lstm_gate[
     BATCH: Int, H: Int
 ](
-    ix: LayoutTensor[DT, Layout.row_major(BATCH, 4 * H), MutAnyOrigin],
-    hx: LayoutTensor[DT, Layout.row_major(BATCH, 4 * H), MutAnyOrigin],
-    b: LayoutTensor[DT, Layout.row_major(4 * H), MutAnyOrigin],
-    c_prev: LayoutTensor[DT, Layout.row_major(BATCH, H), MutAnyOrigin],
-    h_t: LayoutTensor[DT, Layout.row_major(BATCH, H), MutAnyOrigin],
-    c_t: LayoutTensor[DT, Layout.row_major(BATCH, H), MutAnyOrigin],
+    ix: Tile[DT, BATCH, 4 * H],
+    hx: Tile[DT, BATCH, 4 * H],
+    b: Tile[DT, 4 * H],
+    c_prev: Tile[DT, BATCH, H],
+    h_t: Tile[DT, BATCH, H],
+    c_t: Tile[DT, BATCH, H],
 ):
     var gid = Int(global_idx.x)
     if gid >= BATCH * H:
@@ -130,12 +131,12 @@ def _time[
     _ = hp.enqueue_fill(Scalar[DT](0.01))
     _ = cp.enqueue_fill(Scalar[DT](0.01))
 
-    comptime lbi = Layout.row_major(BATCH, IN_)
-    comptime lwih = Layout.row_major(IN_, FOURH)
-    comptime lwhh = Layout.row_major(H, FOURH)
-    comptime l4 = Layout.row_major(FOURH)
-    comptime lbh = Layout.row_major(BATCH, H)
-    comptime lb4 = Layout.row_major(BATCH, FOURH)
+    comptime lbi = RowMajor[BATCH, IN_]
+    comptime lwih = RowMajor[IN_, FOURH]
+    comptime lwhh = RowMajor[H, FOURH]
+    comptime l4 = RowMajor[FOURH]
+    comptime lbh = RowMajor[BATCH, H]
+    comptime lb4 = RowMajor[BATCH, FOURH]
     var us = Float64(0)
 
     comptime if GEMM:
@@ -145,12 +146,12 @@ def _time[
         var hp_v = TileTensor(hp, row_major[BATCH, H]())
         var ix_v = TileTensor(ix, row_major[BATCH, FOURH]())
         var hx_v = TileTensor(hx, row_major[BATCH, FOURH]())
-        var bl = LayoutTensor[DT, l4, MutAnyOrigin](bb)
-        var cpl = LayoutTensor[DT, lbh, MutAnyOrigin](cp)
-        var htl = LayoutTensor[DT, lbh, MutAnyOrigin](ht)
-        var ctl = LayoutTensor[DT, lbh, MutAnyOrigin](ct)
-        var ixl = LayoutTensor[DT, lb4, MutAnyOrigin](ix)
-        var hxl = LayoutTensor[DT, lb4, MutAnyOrigin](hx)
+        var bl = tile[FOURH](bb)
+        var cpl = tile[BATCH, H](cp)
+        var htl = tile[BATCH, H](ht)
+        var ctl = tile[BATCH, H](ct)
+        var ixl = tile[BATCH, FOURH](ix)
+        var hxl = tile[BATCH, FOURH](hx)
         comptime nblk = (BATCH * H + TPB - 1) // TPB
 
         comptime for _ in range(WARMUP):
@@ -170,14 +171,14 @@ def _time[
         ctx.synchronize()
         us = Float64(perf_counter_ns() - t0) / Float64(ITERS) / 1000.0
     else:
-        var xl = LayoutTensor[DT, lbi, MutAnyOrigin](x)
-        var wihl = LayoutTensor[DT, lwih, MutAnyOrigin](wih)
-        var whhl = LayoutTensor[DT, lwhh, MutAnyOrigin](whh)
-        var bl = LayoutTensor[DT, l4, MutAnyOrigin](bb)
-        var hpl = LayoutTensor[DT, lbh, MutAnyOrigin](hp)
-        var cpl = LayoutTensor[DT, lbh, MutAnyOrigin](cp)
-        var htl = LayoutTensor[DT, lbh, MutAnyOrigin](ht)
-        var ctl = LayoutTensor[DT, lbh, MutAnyOrigin](ct)
+        var xl = tile[BATCH, IN_](x)
+        var wihl = tile[IN_, FOURH](wih)
+        var whhl = tile[H, FOURH](whh)
+        var bl = tile[FOURH](bb)
+        var hpl = tile[BATCH, H](hp)
+        var cpl = tile[BATCH, H](cp)
+        var htl = tile[BATCH, H](ht)
+        var ctl = tile[BATCH, H](ct)
 
         comptime for _ in range(WARMUP):
             ctx.enqueue_function[_lstm_fwd_naive[BATCH, IN_, H]](

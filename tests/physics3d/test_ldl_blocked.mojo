@@ -38,7 +38,7 @@ and the two results must agree.
 Run: pixi run mojo run -I . tests/physics3d/test_ldl_blocked.mojo
 """
 
-from layout import Layout
+from noeira.core.tiles import RowMajor
 from noeira.nn.core.tensor import TensorImpl
 from noeira.physics3d.fields import Dims
 from noeira.physics3d.dynamics.ldl import (
@@ -52,9 +52,9 @@ comptime DT = DType.float64
 comptime NV = 12
 comptime SPLIT = 5          # trees [0,5) and [5,12) — deliberately uneven
 comptime BATCH = 1
-comptime LM = Layout.row_major(BATCH, NV * NV)
-comptime LNV = Layout.row_major(BATCH, NV)
-comptime LT = Layout.row_major(NV * MODEL_TREE_SIZE)
+comptime LM = RowMajor[BATCH, NV * NV]
+comptime LNV = RowMajor[BATCH, NV]
+comptime LT = RowMajor[NV * MODEL_TREE_SIZE]
 
 
 struct Tally:
@@ -129,14 +129,14 @@ def _run(coupled: Bool, two_trees: Bool) raises -> Tuple[
     for i in range(BATCH * NV * NV):
         MI.data[i] = Scalar[DT](-999.0)
 
-    var Mv = M.lt["cpu", LM]()
-    var Lv = L.lt["cpu", LM]()
-    var Dv = D.lt["cpu", LNV]()
-    var MIv = MI.lt["cpu", LM]()
-    var Tv = T.lt["cpu", LT]()
+    var Mv = M.tt["cpu", BATCH, NV * NV]()
+    var Lv = L.tt["cpu", BATCH, NV * NV]()
+    var Dv = D.tt["cpu", BATCH, NV]()
+    var MIv = MI.tt["cpu", BATCH, NV * NV]()
+    var Tv = T.tt["cpu", NV * MODEL_TREE_SIZE]()
     var dims = Dims[nv=NV]()
-    var bv = bb_.lt["cpu", LNV]()
-    var xv = xx.lt["cpu", LNV]()
+    var bv = bb_.tt["cpu", BATCH, NV]()
+    var xv = xx.tt["cpu", BATCH, NV]()
     _ldl_factor_env(0, dims, Mv, Lv, Dv, Tv)
     _m_inv_env(0, dims, Lv, Dv, MIv, Tv)
     _ldl_solve_env(0, dims, Lv, Dv, bv, xv, Tv)

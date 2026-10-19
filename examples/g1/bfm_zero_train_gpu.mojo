@@ -99,7 +99,7 @@ from std.sys import argv
 from std.time import perf_counter_ns
 from max.gpu import global_idx
 
-from layout import Layout, LayoutTensor
+from noeira.core.tiles import tile
 from max.gpu.host import DeviceContext, DeviceBuffer
 
 from noeira.cuda import CUDAGraph, maybe_capture_replay
@@ -1073,10 +1073,10 @@ def main() raises:
         _pack_obs()
         ctx.enqueue_copy(prev_obs, full_obs)
         agent.select_action_batched[N_ENVS](
-            LayoutTensor[DT, Layout.row_major(N_ENVS, OBS), MutAnyOrigin](full_obs),
-            LayoutTensor[DT, Layout.row_major(N_ENVS, ACT), MutAnyOrigin](env._action),
-            LayoutTensor[DT, Layout.row_major(N_ENVS, 2 * ACT), MutAnyOrigin](ao),
-            LayoutTensor[DT, Layout.row_major(N_ENVS, ACT + 1), MutAnyOrigin](alp),
+            tile[N_ENVS, OBS](full_obs),
+            tile[N_ENVS, ACT](env._action),
+            tile[N_ENVS, 2 * ACT](ao),
+            tile[N_ENVS, ACT + 1](alp),
             env_steps,
         )
         # push(state_t, a_{t-1}) then last_action = a_t, before the env moves

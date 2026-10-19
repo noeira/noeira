@@ -56,7 +56,7 @@ it.
 """
 
 from std.random import seed as seed_rng
-from layout import Layout
+from noeira.core.tiles import RowMajor
 from max.gpu.host import DeviceContext
 
 from noeira.nn.constants import DT
@@ -314,11 +314,11 @@ def main() raises:
         var mismatch = 0
         var shaped_bad = 0
         var shaped_worst = 0.0
-        comptime L_META_H = Layout.row_major(N_ENVS, METADATA_SIZE)
-        comptime L_CUR_H = Layout.row_major(1, MODEL_CURRICULUM_SIZE)
-        comptime L_XP_H = Layout.row_major(N_ENVS, NB * 3)
-        comptime L_XQ_H = Layout.row_major(N_ENVS, NB * 4)
-        comptime L_SP_H = Layout.row_major(N_ENVS, NS * 3)
+        comptime L_META_H = RowMajor[N_ENVS, METADATA_SIZE]
+        comptime L_CUR_H = RowMajor[1, MODEL_CURRICULUM_SIZE]
+        comptime L_XP_H = RowMajor[N_ENVS, NB * 3]
+        comptime L_XQ_H = RowMajor[N_ENVS, NB * 4]
+        comptime L_SP_H = RowMajor[N_ENVS, NS * 3]
         var a_true = 0
         var b_true = 0
         var first_bad = -1
@@ -362,11 +362,11 @@ def main() raises:
             # which is the one quantity every curve in every run is made of.
             var d_h = Float64(
                 tape_distance_gpu[DT, N_ENVS, NB, NS * 3](
-                    env.d.meta.lt["cpu", L_META_H](),
-                    env.mf.curriculum.lt["cpu", L_CUR_H](),
-                    env.d.xpos.lt["cpu", L_XP_H](),
-                    env.d.xquat.lt["cpu", L_XQ_H](),
-                    env.d.site_xpos.lt["cpu", L_SP_H](),
+                    env.d.meta.tt["cpu", N_ENVS, METADATA_SIZE](),
+                    env.mf.curriculum.tt["cpu", 1, MODEL_CURRICULUM_SIZE](),
+                    env.d.xpos.tt["cpu", N_ENVS, NB * 3](),
+                    env.d.xquat.tt["cpu", N_ENVS, NB * 4](),
+                    env.d.site_xpos.tt["cpu", N_ENVS, NS * 3](),
                     e,
                 )
             )

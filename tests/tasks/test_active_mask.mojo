@@ -62,7 +62,7 @@ reason as `test_tape_gpu_parity`.
 Run: pixi run mojo run -I . tests/tasks/test_active_mask.mojo
 """
 
-from layout import Layout
+from noeira.core.tiles import RowMajor
 from noeira.nn.core.tensor import TensorImpl
 from noeira.physics3d.gpu.constants import (
     METADATA_SIZE, META_IDX_TASK_ACTIVE,
@@ -295,19 +295,19 @@ def main() raises:
     # ── 3 & 4. the observation hook, two lanes, different active sets ─────
     print()
     print("--- 3. the observation, lane 0 =", tg.name, "lane 1 =", tr.name, "---")
-    comptime L_QPOS = Layout.row_major(BATCH, NQ)
-    comptime L_QVEL = Layout.row_major(BATCH, NV)
-    comptime L_META = Layout.row_major(BATCH, METADATA_SIZE)
-    comptime L_OBS = Layout.row_major(BATCH, OD)
-    comptime L_B3 = Layout.row_major(BATCH, NB * 3)
-    comptime L_B4 = Layout.row_major(BATCH, NB * 4)
-    comptime L_B6 = Layout.row_major(BATCH, NB * 6)
-    comptime L_SXP = Layout.row_major(BATCH, SD)
-    comptime L_BODY = Layout.row_major(NB, MODEL_BODY_SIZE)
-    comptime L_SITE = Layout.row_major(NS, MODEL_SITE_SIZE)
-    comptime L_GEOM = Layout.row_major(NG, MODEL_GEOM_SIZE)
-    comptime L_CON = Layout.row_major(BATCH, MC * CONTACT_SIZE)
-    comptime L_ACT = Layout.row_major(BATCH, NA)
+    comptime L_QPOS = RowMajor[BATCH, NQ]
+    comptime L_QVEL = RowMajor[BATCH, NV]
+    comptime L_META = RowMajor[BATCH, METADATA_SIZE]
+    comptime L_OBS = RowMajor[BATCH, OD]
+    comptime L_B3 = RowMajor[BATCH, NB * 3]
+    comptime L_B4 = RowMajor[BATCH, NB * 4]
+    comptime L_B6 = RowMajor[BATCH, NB * 6]
+    comptime L_SXP = RowMajor[BATCH, SD]
+    comptime L_BODY = RowMajor[NB, MODEL_BODY_SIZE]
+    comptime L_SITE = RowMajor[NS, MODEL_SITE_SIZE]
+    comptime L_GEOM = RowMajor[NG, MODEL_GEOM_SIZE]
+    comptime L_CON = RowMajor[BATCH, MC * CONTACT_SIZE]
+    comptime L_ACT = RowMajor[BATCH, NA]
 
     var qpos = TensorImpl[DTYPE].alloc(BATCH * NQ)
     var qvel = TensorImpl[DTYPE].alloc(BATCH * NV)
@@ -367,16 +367,16 @@ def main() raises:
         wrote = CFG.custom_extract_obs_gpu[
             DTYPE, BATCH, NQ, NV, NB, OD, SD, MC, NS, NG, NA
         ](
-            qpos.lt["cpu", L_QPOS](), qvel.lt["cpu", L_QVEL](),
-            b3.lt["cpu", L_B3](), b4.lt["cpu", L_B4](), b3.lt["cpu", L_B3](),
-            mbody.lt["cpu", L_BODY](), sxp.lt["cpu", L_SXP](),
-            con.lt["cpu", L_CON](), msite.lt["cpu", L_SITE](),
-            mgeom.lt["cpu", L_GEOM](), meta.lt["cpu", L_META](),
-            obs.lt["cpu", L_OBS](),
-            b3.lt["cpu", L_B3](), b3.lt["cpu", L_B3](), b6.lt["cpu", L_B6](),
-            b6.lt["cpu", L_B6](), b6.lt["cpu", L_B6](), b3.lt["cpu", L_B3](),
-            sxp.lt["cpu", L_SXP](), b4.lt["cpu", L_B4](),
-            act.lt["cpu", L_ACT](),
+            qpos.tt["cpu", BATCH, NQ](), qvel.tt["cpu", BATCH, NV](),
+            b3.tt["cpu", BATCH, NB * 3](), b4.tt["cpu", BATCH, NB * 4](), b3.tt["cpu", BATCH, NB * 3](),
+            mbody.tt["cpu", NB, MODEL_BODY_SIZE](), sxp.tt["cpu", BATCH, SD](),
+            con.tt["cpu", BATCH, MC * CONTACT_SIZE](), msite.tt["cpu", NS, MODEL_SITE_SIZE](),
+            mgeom.tt["cpu", NG, MODEL_GEOM_SIZE](), meta.tt["cpu", BATCH, METADATA_SIZE](),
+            obs.tt["cpu", BATCH, OD](),
+            b3.tt["cpu", BATCH, NB * 3](), b3.tt["cpu", BATCH, NB * 3](), b6.tt["cpu", BATCH, NB * 6](),
+            b6.tt["cpu", BATCH, NB * 6](), b6.tt["cpu", BATCH, NB * 6](), b3.tt["cpu", BATCH, NB * 3](),
+            sxp.tt["cpu", BATCH, SD](), b4.tt["cpu", BATCH, NB * 4](),
+            act.tt["cpu", BATCH, NA](),
             e,
         )
     ta.check(wrote, "the hook claims the observation (returns True)")
@@ -564,8 +564,8 @@ def main() raises:
 
     for e in range(BATCH):
         CFG.pre_step_full_gpu[DTYPE, BATCH, NQ, NV](
-            qpos.lt["cpu", L_QPOS](), qvel.lt["cpu", L_QVEL](),
-            meta.lt["cpu", L_META](), e,
+            qpos.tt["cpu", BATCH, NQ](), qvel.tt["cpu", BATCH, NV](),
+            meta.tt["cpu", BATCH, METADATA_SIZE](), e,
         )
 
     var pinned = 0
@@ -637,8 +637,8 @@ def main() raises:
     # one of the fourteen that would go silently uncalled if the forward
     # broke. Its own gates need a GPU, so this is the cheapest place that can
     # notice.
-    comptime L_HQ = Layout.row_major(BATCH, 4)
-    comptime L_HV = Layout.row_major(BATCH, 3)
+    comptime L_HQ = RowMajor[BATCH, 4]
+    comptime L_HV = RowMajor[BATCH, 3]
     var hq = TensorImpl[DTYPE].alloc(BATCH * 4)
     var hv = TensorImpl[DTYPE].alloc(BATCH * 3)
     var hm = TensorImpl[DTYPE].alloc(BATCH * METADATA_SIZE)
@@ -651,8 +651,8 @@ def main() raises:
             hm.data[e * METADATA_SIZE + i] = Scalar[DTYPE](-1234.0)
     for e in range(BATCH):
         HalfCheetahConfig.pre_step_full_gpu[DTYPE, BATCH, 4, 3](
-            hq.lt["cpu", L_HQ](), hv.lt["cpu", L_HV](),
-            hm.lt["cpu", L_META](), e,
+            hq.tt["cpu", BATCH, 4](), hv.tt["cpu", BATCH, 3](),
+            hm.tt["cpu", BATCH, METADATA_SIZE](), e,
         )
     var fwd_ok = True
     for e in range(BATCH):

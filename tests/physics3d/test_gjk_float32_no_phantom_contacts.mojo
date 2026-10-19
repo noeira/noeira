@@ -43,7 +43,7 @@ the property that actually matters and the one the fix delivers.
 """
 
 from std.math import sqrt, cos, sin, abs
-from layout import Layout, LayoutTensor
+from noeira.core.tiles import tile
 from std.testing import assert_true, TestSuite
 
 from noeira.physics3d.collision.convex_hull import load_mesh_hull
@@ -104,23 +104,17 @@ def _sweep[D: DType]() raises -> List[Float64]:
     # ⚠ HEAP, NOT `Array` — see `test_gjk_hillclimb_support.mojo`. The
     # `_ = buf^` lines below are load-bearing: Mojo destroys at LAST USE.
     var vbuf = List[Scalar[D]](length=NV * 3, fill=Scalar[D](0))
-    var verts = LayoutTensor[D, Layout.row_major(NV, 3), MutAnyOrigin](
-        vbuf.unsafe_ptr().as_unsafe_any_origin().unsafe_mut_cast[True]()
-    )
+    var verts = tile[NV, 3](vbuf.unsafe_ptr().as_unsafe_any_origin().unsafe_mut_cast[True]())
     for i in range(len(mv) // 3):
         verts[i, 0] = mv[i * 3]
         verts[i, 1] = mv[i * 3 + 1]
         verts[i, 2] = mv[i * 3 + 2]
     var abuf = List[Scalar[D]](length=NV, fill=Scalar[D](-1))
-    var eadr = LayoutTensor[D, Layout.row_major(NV), MutAnyOrigin](
-        abuf.unsafe_ptr().as_unsafe_any_origin().unsafe_mut_cast[True]()
-    )
+    var eadr = tile[NV](abuf.unsafe_ptr().as_unsafe_any_origin().unsafe_mut_cast[True]())
     for v in range(len(ea)):
         eadr[v] = Scalar[D](ea[v])
     var ebuf = List[Scalar[D]](length=NE, fill=Scalar[D](-1))
-    var edges = LayoutTensor[D, Layout.row_major(NE), MutAnyOrigin](
-        ebuf.unsafe_ptr().as_unsafe_any_origin().unsafe_mut_cast[True]()
-    )
+    var edges = tile[NE](ebuf.unsafe_ptr().as_unsafe_any_origin().unsafe_mut_cast[True]())
     for k in range(len(el)):
         edges[k] = Scalar[D](el[k])
 
@@ -140,7 +134,7 @@ def _sweep[D: DType]() raises -> List[Float64]:
             GEOM_MESH, gx, Scalar[D](0.01), Scalar[D](-0.02), z, z, qz, qw,
             z, z, z, z, z,
             mva[1], mvn[1],
-            ws.lt["cpu", L_CCD_WS1](), 0,
+            ws.tt_dyn["cpu", L_CCD_WS1](L_CCD_WS1()), 0,
         )
         out.append(Float64(r[0]))
     _ = vbuf^

@@ -19,7 +19,7 @@ produces O(1e-3) absolute error and fails by four orders of magnitude.
 
 from std.math import abs, sqrt
 from max.gpu.host import DeviceContext
-from layout import Layout, LayoutTensor
+from noeira.core.tiles import tile
 
 from noeira.nn.constants import DT
 from noeira.planners.trajectory.mppi_kernels import (
@@ -73,10 +73,10 @@ def main() raises:
         DT, N_ENVS, TOTAL_SAMPLES, HORIZON, ACT, TPB
     ]
     ctx.enqueue_function[k](
-        LayoutTensor[DT, Layout.row_major(NW), MutAnyOrigin](wd),
-        LayoutTensor[DT, Layout.row_major(NA), MutAnyOrigin](ad),
-        LayoutTensor[DT, Layout.row_major(DIMS), MutAnyOrigin](md),
-        LayoutTensor[DT, Layout.row_major(DIMS), MutAnyOrigin](sd),
+        tile[NW](wd),
+        tile[NA](ad),
+        tile[DIMS](md),
+        tile[DIMS](sd),
         grid_dim=(DIMS,),
         block_dim=(TPB,),
     )

@@ -14,7 +14,7 @@ breaks later, we can disambiguate planner-bug-vs-callback-bug.
 from max.gpu.host import DeviceContext
 from std.memory import alloc
 from std.testing import assert_true
-from layout import Layout, LayoutTensor
+from noeira.core.tiles import Tile, tile
 
 from noeira.nn.constants import DT as dtype
 from noeira.planners.trajectory import (
@@ -37,12 +37,8 @@ struct ZeroRolloutCallback(
     def policy_action_gpu[B: Int](
         mut self,
         ctx: DeviceContext,
-        z: LayoutTensor[
-            dtype, Layout.row_major(B, Self.LATENT_DIM), MutAnyOrigin
-        ],
-        action_out: LayoutTensor[
-            dtype, Layout.row_major(B, Self.ACTION_DIM), MutAnyOrigin
-        ],
+        z: Tile[dtype, B, Self.LATENT_DIM],
+        action_out: Tile[dtype, B, Self.ACTION_DIM],
     ) raises:
         # No-op stub: leave action_out as-is (zero initialized).
         pass
@@ -50,26 +46,18 @@ struct ZeroRolloutCallback(
     def rollout_step_gpu[B: Int](
         mut self,
         ctx: DeviceContext,
-        z: LayoutTensor[
-            dtype, Layout.row_major(B, Self.LATENT_DIM), MutAnyOrigin
-        ],
-        a: LayoutTensor[
-            dtype, Layout.row_major(B, Self.ACTION_DIM), MutAnyOrigin
-        ],
-        z_next_out: LayoutTensor[
-            dtype, Layout.row_major(B, Self.LATENT_DIM), MutAnyOrigin
-        ],
-        r_out: LayoutTensor[dtype, Layout.row_major(B), MutAnyOrigin],
+        z: Tile[dtype, B, Self.LATENT_DIM],
+        a: Tile[dtype, B, Self.ACTION_DIM],
+        z_next_out: Tile[dtype, B, Self.LATENT_DIM],
+        r_out: Tile[dtype, B],
     ) raises:
         pass
 
     def terminal_value_gpu[B: Int](
         mut self,
         ctx: DeviceContext,
-        z: LayoutTensor[
-            dtype, Layout.row_major(B, Self.LATENT_DIM), MutAnyOrigin
-        ],
-        v_out: LayoutTensor[dtype, Layout.row_major(B), MutAnyOrigin],
+        z: Tile[dtype, B, Self.LATENT_DIM],
+        v_out: Tile[dtype, B],
         seed: UInt32,
     ) raises:
         pass
@@ -125,12 +113,8 @@ def test_mppi_gpu_plan_runs() raises:
     var out_act_buf = ctx.enqueue_create_buffer[dtype](
         N_ENVS * ACTION_DIM
     )
-    var z0_tensor = LayoutTensor[
-        dtype, Layout.row_major(N_ENVS, LATENT_DIM), MutAnyOrigin
-    ](z0_buf.unsafe_ptr().as_unsafe_any_origin())
-    var out_act_tensor = LayoutTensor[
-        dtype, Layout.row_major(N_ENVS * ACTION_DIM), MutAnyOrigin
-    ](out_act_buf.unsafe_ptr().as_unsafe_any_origin())
+    var z0_tensor = tile[N_ENVS, LATENT_DIM](z0_buf.unsafe_ptr().as_unsafe_any_origin())
+    var out_act_tensor = tile[N_ENVS * ACTION_DIM](out_act_buf.unsafe_ptr().as_unsafe_any_origin())
 
     planner.plan_gpu(
         ctx,

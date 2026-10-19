@@ -45,7 +45,8 @@ Run: pixi run mojo run -I . tests/physics3d/test_gjk_simplex.mojo
 """
 
 from std.math import abs, sqrt
-from layout import Layout, LayoutTensor
+from layout import TileTensor
+from noeira.core.tiles import RowMajor
 from noeira.nn.core.tensor import TensorImpl
 from noeira.physics3d.collision.ccd_workspace import L_CCD_WS1, CCD_WS_SPX
 from noeira.physics3d.collision.ccd_workspace_host import ccd_ws_alloc
@@ -57,15 +58,15 @@ from noeira.physics3d.constants import GEOM_CYLINDER, GEOM_MESH
 
 comptime DT = DType.float64
 comptime NMV = 8
-comptime L_MV = Layout.row_major(NMV, 3)
+comptime L_MV = RowMajor[NMV, 3]
 
 # ⚠ NO EDGE GRAPH. `_support_mesh` hill-climbs the hull adjacency when it is
 # present and falls back to the exhaustive scan when `edgeadr < 0`, which is
 # how `fields/model.mojo` marks an unbuilt graph. These fixtures only need the
 # tensors present and marked absent; the two paths are compared against each
 # other in `test_gjk_hillclimb_support.mojo`.
-comptime L_VEADR_G = Layout.row_major(NMV)
-comptime L_EDGES_G = Layout.row_major(mesh_max_edge(NMV))
+comptime L_VEADR_G = RowMajor[NMV]
+comptime L_EDGES_G = RowMajor[mesh_max_edge(NMV)]
 
 
 def _no_graph_G() raises -> TensorImpl[DT]:
@@ -84,7 +85,7 @@ def _no_edges_G() raises -> TensorImpl[DT]:
 
 
 def _put(
-    wsv: LayoutTensor[DT, L_CCD_WS1, MutAnyOrigin],
+    wsv: TileTensor[DT, L_CCD_WS1, MutAnyOrigin],
     slot: Int,
     x: Float64,
     y: Float64,
@@ -101,7 +102,7 @@ def _put(
 
 
 def _xyz(
-    wsv: LayoutTensor[DT, L_CCD_WS1, MutAnyOrigin], slot: Int
+    wsv: TileTensor[DT, L_CCD_WS1, MutAnyOrigin], slot: Int
 ) -> Tuple[Float64, Float64, Float64]:
     return (
         Float64(sv(wsv, 0, CCD_WS_SPX, slot, 0)),
@@ -111,7 +112,7 @@ def _xyz(
 
 
 def _lincomb(
-    wsv: LayoutTensor[DT, L_CCD_WS1, MutAnyOrigin],
+    wsv: TileTensor[DT, L_CCD_WS1, MutAnyOrigin],
     lam: Array[Scalar[DT], 4],
     n: Int,
 ) -> Tuple[Float64, Float64, Float64]:
@@ -140,7 +141,7 @@ def test_flat_simplex_is_not_an_enclosure() raises:
     """Four COPLANAR points at z = 0.5 cannot enclose the origin."""
     print("=== flat simplex is not an enclosure ===")
     var ws = ccd_ws_alloc[DT]()
-    var wsv = ws.lt["cpu", L_CCD_WS1]()
+    var wsv = ws.tt_dyn["cpu", L_CCD_WS1](L_CCD_WS1())
     _put(wsv, 0, -1.0, -1.0, 0.5, 100.0)
     _put(wsv, 1, 1.0, -1.0, 0.5, 200.0)
     _put(wsv, 2, 1.0, 1.0, 0.5, 300.0)
@@ -167,7 +168,7 @@ def test_true_enclosure_still_detected() raises:
     the flat-simplex fix must not swing the other way."""
     print("=== true enclosure still detected ===")
     var ws = ccd_ws_alloc[DT]()
-    var wsv = ws.lt["cpu", L_CCD_WS1]()
+    var wsv = ws.tt_dyn["cpu", L_CCD_WS1](L_CCD_WS1())
     # Regular-ish tetra straddling the origin.
     _put(wsv, 0, 1.0, 1.0, 1.0, 100.0)
     _put(wsv, 1, 1.0, -1.0, -1.0, 200.0)
@@ -204,7 +205,7 @@ def test_face_adb_reduction_keeps_a_d_b() raises:
     """
     print("=== face-ADB reduction keeps {A, D, B} ===")
     var ws = ccd_ws_alloc[DT]()
-    var wsv = ws.lt["cpu", L_CCD_WS1]()
+    var wsv = ws.tt_dyn["cpu", L_CCD_WS1](L_CCD_WS1())
     _put(wsv, 0, 1.0, 0.0, 0.0, 100.0)  # A
     _put(wsv, 1, 0.0, 0.0, 1.0, 200.0)  # B
     _put(wsv, 2, 1.0, 1.0, 1.0, 300.0)  # C
@@ -290,14 +291,14 @@ def test_flat_face_query_reports_exact_gap() raises:
         0.0, 0.0, 0.0, 1.0,
         0.2, 0.02,  # radius, half-length
         0.0, 0.0, 0.0,
-        mv.lt["cpu", L_MV](), _ng.lt["cpu", L_VEADR_G](), _ne.lt["cpu", L_EDGES_G](), 0, 0,
+        mv.tt["cpu", NMV, 3](), _ng.tt["cpu", NMV](), _ne.tt["cpu", mesh_max_edge(NMV)](), 0, 0,
         GEOM_MESH,
         0.0, 0.0, 0.0,
         0.0, 0.0, 0.0, 1.0,
         0.0, 0.0,
         0.0, 0.0, 0.0,
         0, 4,
-        ws.lt["cpu", L_CCD_WS1](), 0,
+        ws.tt_dyn["cpu", L_CCD_WS1](L_CCD_WS1()), 0,
     )
     var dist = Float64(result[0])
     print("  dist =", dist, "(expected 0.7)")

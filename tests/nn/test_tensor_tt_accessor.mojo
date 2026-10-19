@@ -1,20 +1,21 @@
-"""`Tensor.tt` / `tt_at` (TileTensor) against `Tensor.lt` / `lt_at` (LayoutTensor).
+"""`Tensor.tt` / `tt_at` / `tt_dyn`: the TileTensor views address the owning storage.
 
-The LayoutTensor migration moves every kernel from `t.lt["gpu", L]()` to
-`t.tt["gpu", dims...]()`. This gates that the new views address the SAME
-storage, in the same row-major order, on both legs:
+The LayoutTensor migration moved every kernel from `t.lt["gpu", L]()` to
+`t.tt["gpu", dims...]()`. This gates that the views point at the tensor's own
+storage, in row-major order, on both legs:
 
-  [1] cpu: `tt` and `lt` share a pointer, and `tt[i, j]` reads element i*N+j
-  [2] gpu: `tt` and `lt` share a device pointer; a kernel taking `Tile[DT, B, N]`
-      writes through `tt`, and the download sees row-major values
-  [3] gpu: `tt_at(offset)` and `lt_at(offset)` share a pointer, and a kernel
-      writing through `tt_at` lands at `offset` and nowhere else
+  [1] cpu: `tt` points at `data`, and `tt[i, j]` reads element i*N+j;
+      `tt_dyn` with `rl2(B, N)` reads the same elements
+  [2] gpu: `tt` points at the device buffer; a kernel taking `Tile[DT, B, N]`
+      writes through it, and the download sees row-major values
+  [3] gpu: `tt_at(offset)` points `offset` elements into the device buffer,
+      and a kernel writing through it lands at the offset and nowhere else
 """
 
-from layout import Layout
+from std.sys import size_of
 from max.gpu import thread_idx
 from max.gpu.host import DeviceContext
-from noeira.core.tiles import Tile
+from noeira.core.tiles import Tile, DYN2, rl2
 from noeira.nn.constants import DT
 from noeira.nn.core.tensor import Tensor
 
@@ -41,16 +42,19 @@ def main() raises:
     for k in range(B * N):
         x.data[k] = Scalar[DT](k)
     var xt = x.tt["cpu", B, N]()
-    var xl = x.lt["cpu", Layout.row_major(B, N)]()
-    if Int(xt.ptr) != Int(xl.ptr):
-        print("  FAIL [1] cpu tt / lt pointers differ")
+    var xd = x.tt_dyn["cpu", DYN2](rl2(B, N))
+    if Int(xt.ptr) != Int(x.data.unsafe_ptr()):
+        print("  FAIL [1] cpu tt does not point at data")
         fails += 1
     for i in range(B):
         for j in range(N):
             if xt[i, j] != Scalar[DT](i * N + j):
                 print("  FAIL [1] cpu tt[", i, ",", j, "] =", xt[i, j])
                 fails += 1
-    print("[1] cpu view: tt == lt storage, row-major reads")
+            if xd[i, j] != Scalar[DT](i * N + j):
+                print("  FAIL [1] cpu tt_dyn[", i, ",", j, "] =", xd[i, j])
+                fails += 1
+    print("[1] cpu view: tt / tt_dyn on data, row-major reads")
 
     # [2] gpu
     var ctx = DeviceContext()
@@ -58,9 +62,8 @@ def main() raises:
     y.ensure_gpu(ctx, B * N)
     y.upload(ctx)
     var yt = y.tt["gpu", B, N]()
-    var yl = y.lt["gpu", Layout.row_major(B, N)]()
-    if Int(yt.ptr) != Int(yl.ptr):
-        print("  FAIL [2] gpu tt / lt pointers differ")
+    if Int(yt.ptr) != Int(y.dev.value().unsafe_ptr()):
+        print("  FAIL [2] gpu tt does not point at the device buffer")
         fails += 1
     ctx.enqueue_function[_write_rows](yt, grid_dim=1, block_dim=B)
     y.download(ctx)
@@ -77,9 +80,9 @@ def main() raises:
     z.ensure_gpu(ctx, B * N)
     z.upload(ctx)
     var zt = z.tt_at["gpu", 1, N](OFF)
-    var zl = z.lt_at["gpu", Layout.row_major(1, N)](OFF)
-    if Int(zt.ptr) != Int(zl.ptr):
-        print("  FAIL [3] gpu tt_at / lt_at pointers differ")
+    var want_ptr = Int(z.dev.value().unsafe_ptr()) + OFF * size_of[Scalar[DT]]()
+    if Int(zt.ptr) != want_ptr:
+        print("  FAIL [3] gpu tt_at is not OFF elements into the buffer")
         fails += 1
     ctx.enqueue_function[_write_row](zt, grid_dim=1, block_dim=N)
     z.download(ctx)

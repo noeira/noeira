@@ -30,7 +30,7 @@ FB gates) each have their own.
 from std.math import sqrt, abs, isnan, isinf
 from std.testing import assert_true, TestSuite
 
-from layout import Layout, LayoutTensor
+from noeira.core.tiles import tile
 from max.gpu.host import DeviceContext, DeviceBuffer
 
 from noeira.nn.constants import DT
@@ -146,10 +146,10 @@ def test_agent_instantiates_and_trains_finite() raises:
         prev.upload(ctx)
         obs.upload(ctx)
         agent.select_action_batched[LANES](
-            LayoutTensor[DT, Layout.row_major(LANES, OBS), MutAnyOrigin](prev.dev.value()),
-            LayoutTensor[DT, Layout.row_major(LANES, ACT), MutAnyOrigin](act.dev.value()),
-            LayoutTensor[DT, Layout.row_major(LANES, 2 * ACT), MutAnyOrigin](ao),
-            LayoutTensor[DT, Layout.row_major(LANES, ACT + 1), MutAnyOrigin](alp),
+            tile[LANES, OBS](prev.dev.value()),
+            tile[LANES, ACT](act.dev.value()),
+            tile[LANES, 2 * ACT](ao),
+            tile[LANES, ACT + 1](alp),
             t * LANES,
         )
         agent.record_batch_gpu[LANES](

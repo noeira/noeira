@@ -44,7 +44,7 @@ from std.sys import has_accelerator
 from std.time import perf_counter_ns
 
 from max.gpu.host import DeviceContext
-from layout import Layout, LayoutTensor
+from noeira.core.tiles import RowMajor, Tile
 
 from noeira.nn.constants import DT, TPB
 from noeira.nn.core.initializer import Deterministic
@@ -77,8 +77,8 @@ comptime ROW_BLOCK_SMALL = 32
 def _xk_pack_kt_kernel[
     BATCH: Int, DIM: Int, NH: Int, KL: Int, HD: Int, PK: Int
 ](
-    dst: LayoutTensor[DT, Layout.row_major(PK), MutAnyOrigin],
-    src: LayoutTensor[DT, Layout.row_major(BATCH, KL * DIM), MutAnyOrigin],
+    dst: Tile[DT, PK],
+    src: Tile[DT, BATCH, KL * DIM],
 ):
     """K1: token-major `(B, KL, DIM)` -> `(BH, HD, KL)` in one pass."""
     var idx = Int(global_idx.x)
@@ -98,9 +98,9 @@ def _xk_pack_kt_kernel[
 def _xs_row_softmax_kernel[
     BATCH: Int, NH: Int, QL: Int, KL: Int, HD: Int, MASKED: Bool, SC: Int
 ](
-    scores: LayoutTensor[DT, Layout.row_major(SC), MutAnyOrigin],
-    attn: LayoutTensor[DT, Layout.row_major(SC), MutAnyOrigin],
-    mask: LayoutTensor[DT, Layout.row_major(BATCH, KL), MutAnyOrigin],
+    scores: Tile[DT, SC],
+    attn: Tile[DT, SC],
+    mask: Tile[DT, BATCH, KL],
 ):
     """S1/S2: one thread per (b,h,i). The shipped kernel's three passes and its
     arithmetic, stored between passes, written to the cache only."""
@@ -137,9 +137,9 @@ def _xs_row_softmax_kernel[
 def _xs_row_stats_kernel[
     BATCH: Int, NH: Int, QL: Int, KL: Int, HD: Int, MASKED: Bool, SC: Int, ROWS: Int
 ](
-    scores: LayoutTensor[DT, Layout.row_major(SC), MutAnyOrigin],
-    stats: LayoutTensor[DT, Layout.row_major(ROWS * 2), MutAnyOrigin],
-    mask: LayoutTensor[DT, Layout.row_major(BATCH, KL), MutAnyOrigin],
+    scores: Tile[DT, SC],
+    stats: Tile[DT, ROWS * 2],
+    mask: Tile[DT, BATCH, KL],
 ):
     """S3, pass 1: per row, the max scaled score and 1/denominator. Reads only."""
     var r = Int(global_idx.x)
@@ -171,10 +171,10 @@ def _xs_row_stats_kernel[
 def _xs_element_softmax_kernel[
     BATCH: Int, NH: Int, QL: Int, KL: Int, HD: Int, MASKED: Bool, SC: Int, ROWS: Int
 ](
-    scores: LayoutTensor[DT, Layout.row_major(SC), MutAnyOrigin],
-    stats: LayoutTensor[DT, Layout.row_major(ROWS * 2), MutAnyOrigin],
-    mask: LayoutTensor[DT, Layout.row_major(BATCH, KL), MutAnyOrigin],
-    attn: LayoutTensor[DT, Layout.row_major(SC), MutAnyOrigin],
+    scores: Tile[DT, SC],
+    stats: Tile[DT, ROWS * 2],
+    mask: Tile[DT, BATCH, KL],
+    attn: Tile[DT, SC],
 ):
     """S3, pass 2: one thread per (b,h,i,j)."""
     var idx = Int(global_idx.x)
@@ -260,14 +260,14 @@ def run_shape[
     comptime ATTN_SIZE = H * QL * KL
     comptime XA = CrossAttention[DIM, H, QL, KL, MASKED]
 
-    comptime lay_q = Layout.row_major(B, QL * DIM)
-    comptime lay_kv = Layout.row_major(B, KL * DIM)
-    comptime lay_pq = Layout.row_major(PQ)
-    comptime lay_pk = Layout.row_major(PK)
-    comptime lay_s = Layout.row_major(SC)
-    comptime lay_a = Layout.row_major(B, ATTN_SIZE)
-    comptime lay_m = Layout.row_major(B, KL)
-    comptime lay_st = Layout.row_major(ROWS * 2)
+    comptime lay_q = RowMajor[B, QL * DIM]
+    comptime lay_kv = RowMajor[B, KL * DIM]
+    comptime lay_pq = RowMajor[PQ]
+    comptime lay_pk = RowMajor[PK]
+    comptime lay_s = RowMajor[SC]
+    comptime lay_a = RowMajor[B, ATTN_SIZE]
+    comptime lay_m = RowMajor[B, KL]
+    comptime lay_st = RowMajor[ROWS * 2]
     comptime qblocks = (QN + TPB - 1) // TPB
     comptime kblocks = (KN + TPB - 1) // TPB
 
@@ -326,14 +326,14 @@ def run_shape[
 
     # The shipped pipeline once, to have realistic scores in `raw`.
     ctx.enqueue_function[_xa_pack_kernel[B, DIM, H, QL, HD, PQ]](
-        sq.lt["gpu", lay_pq](), q.lt["gpu", lay_q](), grid_dim=qblocks, block_dim=TPB)
+        sq.tt["gpu", PQ](), q.tt["gpu", B, QL * DIM](), grid_dim=qblocks, block_dim=TPB)
     ctx.enqueue_function[_xa_pack_kernel[B, DIM, H, KL, HD, PK]](
-        sk.lt["gpu", lay_pk](), k.lt["gpu", lay_kv](), grid_dim=kblocks, block_dim=TPB)
+        sk.tt["gpu", PK](), k.tt["gpu", B, KL * DIM](), grid_dim=kblocks, block_dim=TPB)
     ctx.enqueue_function[_xa_transpose_k_kernel[BH, KL, HD, PK]](
-        skt.lt["gpu", lay_pk](), sk.lt["gpu", lay_pk](),
+        skt.tt["gpu", PK](), sk.tt["gpu", PK](),
         grid_dim=(PK + TPB - 1) // TPB, block_dim=TPB)
     ctx.enqueue_function[_xa_pack_kernel[B, DIM, H, KL, HD, PK]](
-        sv.lt["gpu", lay_pk](), v.lt["gpu", lay_kv](), grid_dim=kblocks, block_dim=TPB)
+        sv.tt["gpu", PK](), v.tt["gpu", B, KL * DIM](), grid_dim=kblocks, block_dim=TPB)
     bmm[A0=BH, A1=QL, A2=HD, B0=BH, B1=HD, B2=KL, O0=BH, O1=QL, O2=KL](
         raw.dev.value(), sq.dev.value(), skt.dev.value(), ctx)
     ctx.synchronize()
@@ -395,19 +395,19 @@ def run_shape[
             var t0 = perf_counter_ns()
             if s == 0:
                 ctx.enqueue_function[_xa_pack_kernel[B, DIM, H, QL, HD, PQ]](
-                    sq.lt["gpu", lay_pq](), q.lt["gpu", lay_q](),
+                    sq.tt["gpu", PQ](), q.tt["gpu", B, QL * DIM](),
                     grid_dim=qblocks, block_dim=TPB)
             elif s == 1:
                 ctx.enqueue_function[_xa_pack_kernel[B, DIM, H, KL, HD, PK]](
-                    sk.lt["gpu", lay_pk](), k.lt["gpu", lay_kv](),
+                    sk.tt["gpu", PK](), k.tt["gpu", B, KL * DIM](),
                     grid_dim=kblocks, block_dim=TPB)
             elif s == 2:
                 ctx.enqueue_function[_xa_transpose_k_kernel[BH, KL, HD, PK]](
-                    skt.lt["gpu", lay_pk](), sk.lt["gpu", lay_pk](),
+                    skt.tt["gpu", PK](), sk.tt["gpu", PK](),
                     grid_dim=(PK + TPB - 1) // TPB, block_dim=TPB)
             elif s == 3:
                 ctx.enqueue_function[_xa_pack_kernel[B, DIM, H, KL, HD, PK]](
-                    sv.lt["gpu", lay_pk](), v.lt["gpu", lay_kv](),
+                    sv.tt["gpu", PK](), v.tt["gpu", B, KL * DIM](),
                     grid_dim=kblocks, block_dim=TPB)
             elif s == 4:
                 bmm[A0=BH, A1=QL, A2=HD, B0=BH, B1=HD, B2=KL, O0=BH, O1=QL, O2=KL](
@@ -415,43 +415,43 @@ def run_shape[
             elif s == 5:
                 ctx.enqueue_function[
                     _xa_softmax_kernel[B, H, QL, KL, HD, MASKED, ATTN_SIZE, SC, BH]
-                ](ss.lt["gpu", lay_s](), attn0.lt["gpu", lay_a](),
-                  m.lt["gpu", lay_m](), grid_dim=BH, block_dim=TPB)
+                ](ss.tt["gpu", SC](), attn0.tt["gpu", B, ATTN_SIZE](),
+                  m.tt["gpu", B, KL](), grid_dim=BH, block_dim=TPB)
             elif s == 6:
                 bmm[A0=BH, A1=QL, A2=KL, B0=BH, B1=KL, B2=HD, O0=BH, O1=QL, O2=HD](
                     pout.dev.value(), attn0.dev.value(), sv.dev.value(), ctx)
             elif s == 7:
                 ctx.enqueue_function[_xa_unpack_kernel[B, DIM, H, QL, HD, PQ]](
-                    out.lt["gpu", lay_q](), pout.lt["gpu", lay_pq](),
+                    out.tt["gpu", B, QL * DIM](), pout.tt["gpu", PQ](),
                     grid_dim=qblocks, block_dim=TPB)
             elif s == 8:
                 ctx.enqueue_function[_xk_pack_kt_kernel[B, DIM, H, KL, HD, PK]](
-                    skt1.lt["gpu", lay_pk](), k.lt["gpu", lay_kv](),
+                    skt1.tt["gpu", PK](), k.tt["gpu", B, KL * DIM](),
                     grid_dim=(PK + TPB - 1) // TPB, block_dim=TPB)
             elif s == 9 or s == 10:
                 var blk = ROW_BLOCK_SMALL if s == 9 else TPB
                 comptime kr = _xs_row_softmax_kernel[B, H, QL, KL, HD, MASKED, SC]
                 if s == 9:
                     ctx.enqueue_function[kr](
-                        raw.lt["gpu", lay_s](), attn1.lt["gpu", lay_s](),
-                        m.lt["gpu", lay_m](),
+                        raw.tt["gpu", SC](), attn1.tt["gpu", SC](),
+                        m.tt["gpu", B, KL](),
                         grid_dim=(ROWS + blk - 1) // blk, block_dim=blk)
                 else:
                     ctx.enqueue_function[kr](
-                        raw.lt["gpu", lay_s](), attn2.lt["gpu", lay_s](),
-                        m.lt["gpu", lay_m](),
+                        raw.tt["gpu", SC](), attn2.tt["gpu", SC](),
+                        m.tt["gpu", B, KL](),
                         grid_dim=(ROWS + blk - 1) // blk, block_dim=blk)
             else:
                 ctx.enqueue_function[
                     _xs_row_stats_kernel[B, H, QL, KL, HD, MASKED, SC, ROWS]
-                ](raw.lt["gpu", lay_s](), stats.lt["gpu", lay_st](),
-                  m.lt["gpu", lay_m](),
+                ](raw.tt["gpu", SC](), stats.tt["gpu", ROWS * 2](),
+                  m.tt["gpu", B, KL](),
                   grid_dim=(ROWS + ROW_BLOCK_SMALL - 1) // ROW_BLOCK_SMALL,
                   block_dim=ROW_BLOCK_SMALL)
                 ctx.enqueue_function[
                     _xs_element_softmax_kernel[B, H, QL, KL, HD, MASKED, SC, ROWS]
-                ](raw.lt["gpu", lay_s](), stats.lt["gpu", lay_st](),
-                  m.lt["gpu", lay_m](), attn3.lt["gpu", lay_s](),
+                ](raw.tt["gpu", SC](), stats.tt["gpu", ROWS * 2](),
+                  m.tt["gpu", B, KL](), attn3.tt["gpu", SC](),
                   grid_dim=(SC + TPB - 1) // TPB, block_dim=TPB)
             ctx.synchronize()
             var dt = Float64(perf_counter_ns() - t0) / 1e6

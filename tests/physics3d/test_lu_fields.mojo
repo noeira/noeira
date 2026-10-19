@@ -19,7 +19,6 @@ Run: pixi run -e apple mojo run -I . tests/physics3d/test_lu_fields.mojo
 from std.math import abs
 from max.gpu.host import DeviceContext
 from std.sys import default_accelerator
-from layout import Layout
 
 from noeira.physics3d.fields import DynamicsScratch, Dims, DimsLike
 from noeira.physics3d.dynamics.lu import (

@@ -91,7 +91,7 @@ Run with:
 """
 
 from std.math import abs, sqrt, acos, cos, sin, pi
-from layout import Layout, LayoutTensor
+from noeira.core.tiles import RowMajor
 from std.testing import assert_true, TestSuite
 
 from noeira.nn.core.tensor import TensorImpl
@@ -107,15 +107,15 @@ from noeira.physics3d.constants import GEOM_CYLINDER, GEOM_MESH
 
 comptime DT = DType.float64
 comptime NV_HULL: Int = 130
-comptime L_MV = Layout.row_major(NV_HULL, 3)
+comptime L_MV = RowMajor[NV_HULL, 3]
 
 # ⚠ NO EDGE GRAPH. `_support_mesh` hill-climbs the hull adjacency when it is
 # present and falls back to the exhaustive scan when `edgeadr < 0`, which is
 # how `fields/model.mojo` marks an unbuilt graph. These fixtures only need the
 # tensors present and marked absent; the two paths are compared against each
 # other in `test_gjk_hillclimb_support.mojo`.
-comptime L_VEADR_H = Layout.row_major(NV_HULL)
-comptime L_EDGES_H = Layout.row_major(mesh_max_edge(NV_HULL))
+comptime L_VEADR_H = RowMajor[NV_HULL]
+comptime L_EDGES_H = RowMajor[mesh_max_edge(NV_HULL)]
 
 
 def _no_graph_H() raises -> TensorImpl[DType.float64]:
@@ -614,14 +614,14 @@ def _epa() raises -> Tuple[Float64, Float64, Float64, Float64]:
         Scalar[DT](CYL_QW),
         Scalar[DT](CYL_R), Scalar[DT](CYL_HL),
         Scalar[DT](0), Scalar[DT](0), Scalar[DT](0),
-        mv.lt["cpu", L_MV](), _ng.lt["cpu", L_VEADR_H](), _ne.lt["cpu", L_EDGES_H](), 0, 0,
+        mv.tt["cpu", NV_HULL, 3](), _ng.tt["cpu", NV_HULL](), _ne.tt["cpu", mesh_max_edge(NV_HULL)](), 0, 0,
         GEOM_MESH,
         Scalar[DT](0), Scalar[DT](0), Scalar[DT](0),
         Scalar[DT](0), Scalar[DT](0), Scalar[DT](0), Scalar[DT](1),
         Scalar[DT](0), Scalar[DT](0),
         Scalar[DT](0), Scalar[DT](0), Scalar[DT](0),
         0, NV_HULL,
-        ws.lt["cpu", L_CCD_WS1](), 0,
+        ws.tt_dyn["cpu", L_CCD_WS1](L_CCD_WS1()), 0,
     )
     return (Float64(r[0]), Float64(r[4]), Float64(r[5]), Float64(r[6]))
 

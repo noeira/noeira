@@ -51,7 +51,8 @@ from max.gpu.sync import barrier
 from max.gpu.memory import AddressSpace
 from max.gpu.primitives import warp
 from max.gpu.host import DeviceContext, DeviceBuffer
-from layout import Layout, LayoutTensor
+from layout import TileTensor
+from noeira.core.tiles import RowMajor
 
 # noeira's `nn.constants`, inlined: this file is a copy (see the header).
 comptime DT = DType.float32
@@ -69,10 +70,7 @@ comptime KV_TQ = 32 if _NV else 16
 comptime _NEG = Scalar[DT](-1e30)
 comptime _LOG2E = Scalar[DT](1.4426950408889634)
 
-comptime _Shared[R: Int, C: Int] = LayoutTensor[
-    DT, Layout.row_major(R, C), MutAnyOrigin,
-    address_space=AddressSpace.SHARED, alignment=16,
-]
+comptime _Shared[R: Int, C: Int] = TileTensor[DT, RowMajor[R, C], MutAnyOrigin, address_space=AddressSpace.SHARED, alignment=16]
 
 
 def flash_eligible[HD: Int, P_DROP: Float64]() -> Bool:

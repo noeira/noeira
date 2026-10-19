@@ -21,8 +21,10 @@ and pinned host BUFFERS are handles, so their views are `MutAnyOrigin`, the
 kernel ABI, exactly as LayoutTensor's buffer constructor made them.
 
 ⚠ TileTensor traps (both silent):
-- a SINGLE int index on a multi-dim tile returns `[k, 0, ...]`, not flat
-  element `k`. Flat reads go through `.ptr[k]`.
+- a SINGLE int index on a multi-dim tile splits `k` column-major: on
+  `row_major[3, 4]`, `t[5]` is `t[2, 1]` (flat 9), not flat element 5.
+  LayoutTensor rejected this at compile time; TileTensor accepts it. Flat
+  reads go through `.ptr[k]`.
 - `row_major[...]` assumes contiguous strides; a view over a section of a
   buffer with per-batch gaps reads into the next batch.
 """

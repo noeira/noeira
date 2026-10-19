@@ -31,7 +31,7 @@ from std.memory import alloc
 from std.sys import argv
 from noeira.core.run import resolve_checkpoint
 from max.gpu.host import DeviceContext
-from layout import Layout, LayoutTensor
+from noeira.core.tiles import tile
 
 from noeira.nn.constants import DT
 from noeira.nn.core.initializer import Kaiming
@@ -211,9 +211,7 @@ def main() raises:
                 )
             ctx.enqueue_copy(d_obs, h_obs)
             ctx.enqueue_copy(planner.legal_mask_view(), h_legal)
-            var obs_t = LayoutTensor[
-                DT, Layout.row_major(1, OBS), MutAnyOrigin
-            ](d_obs)
+            var obs_t = tile[1, OBS](d_obs)
             planner.search_gpu[
                 type_of(rep_a), type_of(dyn_a), type_of(pred_a)
             ](

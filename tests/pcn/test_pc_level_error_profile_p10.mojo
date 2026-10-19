@@ -49,7 +49,7 @@ Run:
 
 from std.math import sqrt
 from std.memory import alloc, memset
-from layout import Layout, LayoutTensor
+from noeira.core.tiles import Tile, tile
 
 from noeira.nn.constants import DT as dtype
 from noeira.experimental.pcn.pc_initializer import PCXavier
@@ -124,14 +124,14 @@ def _print_profile(
 def _probe(
     tag: String,
     eps_raw: Pointer[Scalar[dtype], MutAnyOrigin],
-    x_batch: LayoutTensor[dtype, Layout.row_major(BATCH, NET.IN_DIM), MutAnyOrigin],
-    y_batch: LayoutTensor[dtype, Layout.row_major(BATCH, NET.OUT_DIM), MutAnyOrigin],
-    params: LayoutTensor[dtype, Layout.row_major(NET.PARAM_SIZE), MutAnyOrigin],
-    mut latents: LayoutTensor[dtype, Layout.row_major(BATCH, NET.LATENT_DIM), MutAnyOrigin],
-    mut mu_eps_buf: LayoutTensor[dtype, Layout.row_major(BATCH, NET.SCRATCH_OUT_DIM), MutAnyOrigin],
-    mut a_below_buf: LayoutTensor[dtype, Layout.row_major(BATCH, NET.SCRATCH_IN_DIM), MutAnyOrigin],
-    mut z_below_buf: LayoutTensor[dtype, Layout.row_major(BATCH, NET.SCRATCH_IN_DIM), MutAnyOrigin],
-    mut dx_buf: LayoutTensor[dtype, Layout.row_major(BATCH, NET.LATENT_DIM), MutAnyOrigin],
+    x_batch: Tile[dtype, BATCH, NET.IN_DIM],
+    y_batch: Tile[dtype, BATCH, NET.OUT_DIM],
+    params: Tile[dtype, NET.PARAM_SIZE],
+    latents: Tile[dtype, BATCH, NET.LATENT_DIM],
+    mu_eps_buf: Tile[dtype, BATCH, NET.SCRATCH_OUT_DIM],
+    a_below_buf: Tile[dtype, BATCH, NET.SCRATCH_IN_DIM],
+    z_below_buf: Tile[dtype, BATCH, NET.SCRATCH_IN_DIM],
+    dx_buf: Tile[dtype, BATCH, NET.LATENT_DIM],
 ) raises:
     """Walk the relaxation by hand, printing the profile at t=0,1,T/2,T."""
     NET.init_latents[BATCH, dtype](x_batch, params, latents)
@@ -176,16 +176,16 @@ def main() raises:
     var grads_buf = alloc[Scalar[dtype]](NET.PARAM_SIZE).as_unsafe_any_origin()
     memset(params_buf, 0, NET.PARAM_SIZE)
     memset(grads_buf, 0, NET.PARAM_SIZE)
-    var params = LayoutTensor[dtype, Layout.row_major(NET.PARAM_SIZE), MutAnyOrigin](params_buf)
-    var grads = LayoutTensor[dtype, Layout.row_major(NET.PARAM_SIZE), MutAnyOrigin](grads_buf)
+    var params = tile[NET.PARAM_SIZE](params_buf)
+    var grads = tile[NET.PARAM_SIZE](grads_buf)
     NET.pc_init_params[PCXavier, dtype](params)
 
     var opt_state_buf = alloc[Scalar[dtype]](NET.PARAM_SIZE * OPT.STATE_PER_PARAM).as_unsafe_any_origin()
     var opt_global_buf = alloc[Scalar[dtype]](OPT.GLOBAL_STATE_SIZE).as_unsafe_any_origin()
     memset(opt_state_buf, 0, NET.PARAM_SIZE * OPT.STATE_PER_PARAM)
     memset(opt_global_buf, 0, OPT.GLOBAL_STATE_SIZE)
-    var opt_state = LayoutTensor[dtype, Layout.row_major(NET.PARAM_SIZE, OPT.STATE_PER_PARAM), MutAnyOrigin](opt_state_buf)
-    var opt_global = LayoutTensor[dtype, Layout.row_major(OPT.GLOBAL_STATE_SIZE), MutAnyOrigin](opt_global_buf)
+    var opt_state = tile[NET.PARAM_SIZE, OPT.STATE_PER_PARAM](opt_state_buf)
+    var opt_global = tile[OPT.GLOBAL_STATE_SIZE](opt_global_buf)
 
     var lat_buf = alloc[Scalar[dtype]](BATCH * NET.LATENT_DIM).as_unsafe_any_origin()
     var mu_eps_raw = alloc[Scalar[dtype]](BATCH * NET.SCRATCH_OUT_DIM).as_unsafe_any_origin()
@@ -200,13 +200,13 @@ def main() raises:
     memset(z_below_raw, 0, BATCH * NET.SCRATCH_IN_DIM)
     memset(dx_raw, 0, BATCH * NET.LATENT_DIM)
 
-    var latents = LayoutTensor[dtype, Layout.row_major(BATCH, NET.LATENT_DIM), MutAnyOrigin](lat_buf)
-    var mu_eps_buf = LayoutTensor[dtype, Layout.row_major(BATCH, NET.SCRATCH_OUT_DIM), MutAnyOrigin](mu_eps_raw)
-    var a_below_buf = LayoutTensor[dtype, Layout.row_major(BATCH, NET.SCRATCH_IN_DIM), MutAnyOrigin](a_below_raw)
-    var z_below_buf = LayoutTensor[dtype, Layout.row_major(BATCH, NET.SCRATCH_IN_DIM), MutAnyOrigin](z_below_raw)
-    var dx_buf = LayoutTensor[dtype, Layout.row_major(BATCH, NET.LATENT_DIM), MutAnyOrigin](dx_raw)
-    var x_batch = LayoutTensor[dtype, Layout.row_major(BATCH, IN), MutAnyOrigin](x_buf)
-    var y_batch = LayoutTensor[dtype, Layout.row_major(BATCH, NET.OUT_DIM), MutAnyOrigin](y_buf)
+    var latents = tile[BATCH, NET.LATENT_DIM](lat_buf)
+    var mu_eps_buf = tile[BATCH, NET.SCRATCH_OUT_DIM](mu_eps_raw)
+    var a_below_buf = tile[BATCH, NET.SCRATCH_IN_DIM](a_below_raw)
+    var z_below_buf = tile[BATCH, NET.SCRATCH_IN_DIM](z_below_raw)
+    var dx_buf = tile[BATCH, NET.LATENT_DIM](dx_raw)
+    var x_batch = tile[BATCH, IN](x_buf)
+    var y_batch = tile[BATCH, NET.OUT_DIM](y_buf)
 
     print("\n  ── AT INITIALIZATION (Xavier) ──")
     print("           level:        0         1         2         3         4         5")

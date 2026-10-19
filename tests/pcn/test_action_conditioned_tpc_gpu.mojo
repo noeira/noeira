@@ -20,7 +20,7 @@ from max.gpu.host import DeviceContext
 from std.memory import alloc, memset
 from std.random.philox import Random as PhiloxRandom
 from std.time import perf_counter_ns
-from layout import Layout, LayoutTensor
+from noeira.core.tiles import Tile, tile
 
 from noeira.nn.constants import DT as dtype
 from noeira.experimental.pcn.pc_constants import TPB
@@ -67,10 +67,10 @@ def _set_action_target_kernel[
     DATA_DIM: Int,
     KDT: DType,
 ](
-    actions_slice: LayoutTensor[KDT, Layout.row_major(BATCH), MutAnyOrigin],
-    states_slice: LayoutTensor[KDT, Layout.row_major(BATCH), MutAnyOrigin],
-    x_in: LayoutTensor[KDT, Layout.row_major(BATCH, AUG_DIM), MutAnyOrigin],
-    y_tgt: LayoutTensor[KDT, Layout.row_major(BATCH, DATA_DIM), MutAnyOrigin],
+    actions_slice: Tile[KDT, BATCH],
+    states_slice: Tile[KDT, BATCH],
+    x_in: Tile[KDT, BATCH, AUG_DIM],
+    y_tgt: Tile[KDT, BATCH, DATA_DIM],
 ):
     """Write per-step action into x_in[:, HIDDEN] and target state into y_tgt[:, 0].
     """
@@ -88,10 +88,8 @@ def _set_prev_hidden_kernel[
     LATENT_DIM: Int,
     KDT: DType,
 ](
-    latents: LayoutTensor[
-        KDT, Layout.row_major(BATCH, LATENT_DIM), MutAnyOrigin
-    ],
-    x_in: LayoutTensor[KDT, Layout.row_major(BATCH, AUG_DIM), MutAnyOrigin],
+    latents: Tile[KDT, BATCH, LATENT_DIM],
+    x_in: Tile[KDT, BATCH, AUG_DIM],
 ):
     """Copy lat[:, 0:HIDDEN] into x_in[:, 0:HIDDEN] (the recurrent prefix)."""
     var idx = Int(block_dim.x * block_idx.x + thread_idx.x)
@@ -106,7 +104,7 @@ def _zero_x_in_kernel[
     BATCH: Int,
     AUG_DIM: Int,
     KDT: DType,
-](x_in: LayoutTensor[KDT, Layout.row_major(BATCH, AUG_DIM), MutAnyOrigin],):
+](x_in: Tile[KDT, BATCH, AUG_DIM],):
     var idx = Int(block_dim.x * block_idx.x + thread_idx.x)
     if idx >= BATCH * AUG_DIM:
         return
@@ -154,9 +152,7 @@ def main() raises:
     var params_host_init = ctx.enqueue_create_host_buffer[dtype](NET.PARAM_SIZE)
     for i in range(NET.PARAM_SIZE):
         params_host_init.unsafe_ptr()[i] = Scalar[dtype](0)
-    var params_init_t = LayoutTensor[
-        dtype, Layout.row_major(NET.PARAM_SIZE), MutAnyOrigin
-    ](params_host_init.unsafe_ptr().as_unsafe_any_origin())
+    var params_init_t = tile[NET.PARAM_SIZE](params_host_init.unsafe_ptr().as_unsafe_any_origin())
     NET.pc_init_params[PCXavier, dtype](params_init_t)
 
     var params_dbuf = ctx.enqueue_create_buffer[dtype](NET.PARAM_SIZE)
@@ -177,33 +173,15 @@ def main() raises:
     var x_in_dbuf = ctx.enqueue_create_buffer[dtype](BATCH * AUG_DIM)
     var y_tgt_dbuf = ctx.enqueue_create_buffer[dtype](BATCH * DATA_DIM)
 
-    var params_t = LayoutTensor[
-        dtype, Layout.row_major(NET.PARAM_SIZE), MutAnyOrigin
-    ](params_dbuf)
-    var grads_t = LayoutTensor[
-        dtype, Layout.row_major(NET.PARAM_SIZE), MutAnyOrigin
-    ](grads_dbuf)
-    var lat_t = LayoutTensor[
-        dtype, Layout.row_major(BATCH, NET.LATENT_DIM), MutAnyOrigin
-    ](lat_dbuf)
-    var mu_eps_t = LayoutTensor[
-        dtype, Layout.row_major(BATCH, NET.SCRATCH_OUT_DIM), MutAnyOrigin
-    ](mu_eps_dbuf)
-    var a_below_t = LayoutTensor[
-        dtype, Layout.row_major(BATCH, NET.SCRATCH_IN_DIM), MutAnyOrigin
-    ](a_below_dbuf)
-    var z_below_t = LayoutTensor[
-        dtype, Layout.row_major(BATCH, NET.SCRATCH_IN_DIM), MutAnyOrigin
-    ](z_below_dbuf)
-    var dx_t = LayoutTensor[
-        dtype, Layout.row_major(BATCH, NET.LATENT_DIM), MutAnyOrigin
-    ](dx_dbuf)
-    var x_in_t = LayoutTensor[
-        dtype, Layout.row_major(BATCH, AUG_DIM), MutAnyOrigin
-    ](x_in_dbuf)
-    var y_tgt_t = LayoutTensor[
-        dtype, Layout.row_major(BATCH, DATA_DIM), MutAnyOrigin
-    ](y_tgt_dbuf)
+    var params_t = tile[NET.PARAM_SIZE](params_dbuf)
+    var grads_t = tile[NET.PARAM_SIZE](grads_dbuf)
+    var lat_t = tile[BATCH, NET.LATENT_DIM](lat_dbuf)
+    var mu_eps_t = tile[BATCH, NET.SCRATCH_OUT_DIM](mu_eps_dbuf)
+    var a_below_t = tile[BATCH, NET.SCRATCH_IN_DIM](a_below_dbuf)
+    var z_below_t = tile[BATCH, NET.SCRATCH_IN_DIM](z_below_dbuf)
+    var dx_t = tile[BATCH, NET.LATENT_DIM](dx_dbuf)
+    var x_in_t = tile[BATCH, AUG_DIM](x_in_dbuf)
+    var y_tgt_t = tile[BATCH, DATA_DIM](y_tgt_dbuf)
 
     # Adam state on GPU
     var opt_state_dbuf = ctx.enqueue_create_buffer[dtype](
@@ -226,14 +204,8 @@ def main() raises:
     opt_global_init.unsafe_ptr()[1] = Scalar[dtype](1.0)
     ctx.enqueue_copy(opt_global_dbuf, opt_global_init)
 
-    var opt_state_t = LayoutTensor[
-        dtype,
-        Layout.row_major(NET.PARAM_SIZE, OPT.STATE_PER_PARAM),
-        MutAnyOrigin,
-    ](opt_state_dbuf)
-    var opt_global_t = LayoutTensor[
-        dtype, Layout.row_major(OPT.GLOBAL_STATE_SIZE), MutAnyOrigin
-    ](opt_global_dbuf)
+    var opt_state_t = tile[NET.PARAM_SIZE, OPT.STATE_PER_PARAM](opt_state_dbuf)
+    var opt_global_t = tile[OPT.GLOBAL_STATE_SIZE](opt_global_dbuf)
 
     # Per-batch rollout buffers — column-major in time so per-step slice contiguous.
     # actions[t, b] at offset t * BATCH + b; states[t, b] similarly.
@@ -284,12 +256,8 @@ def main() raises:
             )
 
             for t in range(1, SEQ_LEN + 1):
-                var actions_slice = LayoutTensor[
-                    dtype, Layout.row_major(BATCH), MutAnyOrigin
-                ](actions_dbuf.unsafe_ptr().as_unsafe_any_origin() + (t - 1) * BATCH)
-                var states_slice = LayoutTensor[
-                    dtype, Layout.row_major(BATCH), MutAnyOrigin
-                ](states_dbuf.unsafe_ptr().as_unsafe_any_origin() + t * BATCH)
+                var actions_slice = tile[BATCH](actions_dbuf.unsafe_ptr().as_unsafe_any_origin() + (t - 1) * BATCH)
+                var states_slice = tile[BATCH](states_dbuf.unsafe_ptr().as_unsafe_any_origin() + t * BATCH)
 
                 comptime sat_k = _set_action_target_kernel[
                     BATCH, AUG_DIM, HIDDEN, DATA_DIM, dtype
@@ -368,18 +336,10 @@ def main() raises:
     var a_z_pred_dbuf = ctx.enqueue_create_buffer[dtype](BATCH * AUG_DIM)
     var s_pred_dbuf = ctx.enqueue_create_buffer[dtype](BATCH * DATA_DIM)
     var a_s_pred_dbuf = ctx.enqueue_create_buffer[dtype](BATCH * HIDDEN)
-    var z_pred_t = LayoutTensor[
-        dtype, Layout.row_major(BATCH, HIDDEN), MutAnyOrigin
-    ](z_pred_dbuf)
-    var a_z_pred_t = LayoutTensor[
-        dtype, Layout.row_major(BATCH, AUG_DIM), MutAnyOrigin
-    ](a_z_pred_dbuf)
-    var s_pred_t = LayoutTensor[
-        dtype, Layout.row_major(BATCH, DATA_DIM), MutAnyOrigin
-    ](s_pred_dbuf)
-    var a_s_pred_t = LayoutTensor[
-        dtype, Layout.row_major(BATCH, HIDDEN), MutAnyOrigin
-    ](a_s_pred_dbuf)
+    var z_pred_t = tile[BATCH, HIDDEN](z_pred_dbuf)
+    var a_z_pred_t = tile[BATCH, AUG_DIM](a_z_pred_dbuf)
+    var s_pred_t = tile[BATCH, DATA_DIM](s_pred_dbuf)
+    var a_s_pred_t = tile[BATCH, HIDDEN](a_s_pred_dbuf)
 
     var s_pred_host = ctx.enqueue_create_host_buffer[dtype](BATCH * DATA_DIM)
 
@@ -395,12 +355,8 @@ def main() raises:
 
     # Per-block param views (for eval feedforward)
     comptime offset_b1 = NET._param_offset[1]()
-    var params_b0_t = LayoutTensor[
-        dtype, Layout.row_major(NET.block_types[0].PARAM_SIZE), MutAnyOrigin
-    ](params_dbuf.unsafe_ptr().as_unsafe_any_origin())
-    var params_b1_t = LayoutTensor[
-        dtype, Layout.row_major(NET.block_types[1].PARAM_SIZE), MutAnyOrigin
-    ](params_dbuf.unsafe_ptr().as_unsafe_any_origin() + offset_b1)
+    var params_b0_t = tile[NET.block_types[0].PARAM_SIZE](params_dbuf.unsafe_ptr().as_unsafe_any_origin())
+    var params_b1_t = tile[NET.block_types[1].PARAM_SIZE](params_dbuf.unsafe_ptr().as_unsafe_any_origin() + offset_b1)
 
     var total_sq_err: Float64 = 0.0
     var total_baseline_err: Float64 = 0.0
@@ -411,12 +367,8 @@ def main() raises:
 
     for t in range(1, SEQ_LEN + 1):
         # x_in[:, HIDDEN] = action[t-1, :]
-        var actions_slice = LayoutTensor[
-            dtype, Layout.row_major(BATCH), MutAnyOrigin
-        ](actions_dbuf.unsafe_ptr().as_unsafe_any_origin() + (t - 1) * BATCH)
-        var states_slice = LayoutTensor[
-            dtype, Layout.row_major(BATCH), MutAnyOrigin
-        ](states_dbuf.unsafe_ptr().as_unsafe_any_origin() + t * BATCH)
+        var actions_slice = tile[BATCH](actions_dbuf.unsafe_ptr().as_unsafe_any_origin() + (t - 1) * BATCH)
+        var states_slice = tile[BATCH](states_dbuf.unsafe_ptr().as_unsafe_any_origin() + t * BATCH)
 
         comptime sat_k_eval = _set_action_target_kernel[
             BATCH, AUG_DIM, HIDDEN, DATA_DIM, dtype

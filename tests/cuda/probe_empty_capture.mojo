@@ -48,7 +48,7 @@ which is precisely why the interceptor prints the begin/end rc values.
 from max.gpu import thread_idx
 from max.gpu.host import DeviceContext
 from std.sys import default_accelerator
-from layout import Layout, LayoutTensor
+from noeira.core.tiles import Tile, tile
 
 from noeira.nn.constants import DT
 from noeira.cuda import CUDAGraph
@@ -60,14 +60,14 @@ def main() raises:
         return
 
     @always_inline
-    def _bump(buf: LayoutTensor[DT, Layout.row_major(1), MutAnyOrigin]):
+    def _bump(buf: Tile[DT, 1]):
         if Int(thread_idx.x) != 0:
             return
         buf[0] = buf[0] + Scalar[DT](1.0)
 
     var ctx = DeviceContext()
     var buf = ctx.enqueue_create_buffer[DT](1)
-    var lt = LayoutTensor[DT, Layout.row_major(1)](buf)
+    var lt = tile[1](buf)
 
     # Stream discovery still needs one launch — but it happens BEFORE the
     # capture window opens, so it is not part of what we are testing.

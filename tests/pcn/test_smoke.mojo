@@ -19,7 +19,7 @@ Run:
 
 from std.memory import alloc, memset
 from std.random.philox import Random as PhiloxRandom
-from layout import Layout, LayoutTensor
+from noeira.core.tiles import tile
 
 from noeira.nn.constants import DT as dtype
 from noeira.experimental.pcn.pc_initializer import PCXavier
@@ -59,12 +59,8 @@ def main() raises:
     memset(params_buf, 0, NET.PARAM_SIZE)
     memset(grads_buf, 0, NET.PARAM_SIZE)
 
-    var params = LayoutTensor[
-        dtype, Layout.row_major(NET.PARAM_SIZE), MutAnyOrigin
-    ](params_buf)
-    var grads = LayoutTensor[
-        dtype, Layout.row_major(NET.PARAM_SIZE), MutAnyOrigin
-    ](grads_buf)
+    var params = tile[NET.PARAM_SIZE](params_buf)
+    var grads = tile[NET.PARAM_SIZE](grads_buf)
     NET.pc_init_params[PCXavier, dtype](params)
 
     # ── input + target ────────────────────────────────────────────────────────
@@ -81,12 +77,8 @@ def main() raises:
     y_tgt_buf[0 * NET.OUT_DIM + 0] = Scalar[dtype](1.0)
     y_tgt_buf[1 * NET.OUT_DIM + 1] = Scalar[dtype](1.0)
 
-    var x_input = LayoutTensor[
-        dtype, Layout.row_major(BATCH, NET.IN_DIM), MutAnyOrigin
-    ](x_in_buf)
-    var y_target = LayoutTensor[
-        dtype, Layout.row_major(BATCH, NET.OUT_DIM), MutAnyOrigin
-    ](y_tgt_buf)
+    var x_input = tile[BATCH, NET.IN_DIM](x_in_buf)
+    var y_target = tile[BATCH, NET.OUT_DIM](y_tgt_buf)
 
     # ── latents + scratch buffers (allocated once, reused) ────────────────────
     var lat_buf = alloc[Scalar[dtype]](BATCH * NET.LATENT_DIM).as_unsafe_any_origin()
@@ -100,21 +92,11 @@ def main() raises:
     memset(z_below_buf_raw, 0, BATCH * NET.SCRATCH_IN_DIM)
     memset(dx_buf_raw, 0, BATCH * NET.LATENT_DIM)
 
-    var latents = LayoutTensor[
-        dtype, Layout.row_major(BATCH, NET.LATENT_DIM), MutAnyOrigin
-    ](lat_buf)
-    var mu_eps_buf = LayoutTensor[
-        dtype, Layout.row_major(BATCH, NET.SCRATCH_OUT_DIM), MutAnyOrigin
-    ](mu_eps_buf_raw)
-    var a_below_buf = LayoutTensor[
-        dtype, Layout.row_major(BATCH, NET.SCRATCH_IN_DIM), MutAnyOrigin
-    ](a_below_buf_raw)
-    var z_below_buf = LayoutTensor[
-        dtype, Layout.row_major(BATCH, NET.SCRATCH_IN_DIM), MutAnyOrigin
-    ](z_below_buf_raw)
-    var dx_buf = LayoutTensor[
-        dtype, Layout.row_major(BATCH, NET.LATENT_DIM), MutAnyOrigin
-    ](dx_buf_raw)
+    var latents = tile[BATCH, NET.LATENT_DIM](lat_buf)
+    var mu_eps_buf = tile[BATCH, NET.SCRATCH_OUT_DIM](mu_eps_buf_raw)
+    var a_below_buf = tile[BATCH, NET.SCRATCH_IN_DIM](a_below_buf_raw)
+    var z_below_buf = tile[BATCH, NET.SCRATCH_IN_DIM](z_below_buf_raw)
+    var dx_buf = tile[BATCH, NET.LATENT_DIM](dx_buf_raw)
 
     # ── Train ─────────────────────────────────────────────────────────────────
     print("\n  batch | E_init    E_final   sup_loss")

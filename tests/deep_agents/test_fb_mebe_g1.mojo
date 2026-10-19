@@ -22,7 +22,7 @@ from std.math import sqrt, sin
 from std.random import random_float64, seed
 from std.sys import default_accelerator
 from std.testing import assert_true
-from layout import Layout, LayoutTensor
+from noeira.core.tiles import tile
 from max.gpu.host import DeviceContext
 
 from noeira.nn.constants import DT, TPB
@@ -296,11 +296,11 @@ def leg4(ctx: DeviceContext) raises:
     var r_env = ctx.enqueue_create_buffer[DT](NL)
     var w = G1RegWeights.default()
     ctx.enqueue_function[g1_reg_env_kernel[NL, NQ, NB, MC]](
-        env.d.qpos.lt["gpu", type_of(env.d).L_QPOS](),
-        env.d.xquat.lt["gpu", type_of(env.d).L_B4](),
-        env.d.xvel.lt["gpu", type_of(env.d).L_B3](),
-        env.d.contacts.lt["gpu", type_of(env.d).L_CONTACTS](),
-        env.d.meta.lt["gpu", type_of(env.d).L_META](),
+        env.d.qpos.tt_dyn["gpu", type_of(env.d).L_QPOS](type_of(env.d).L_QPOS()),
+        env.d.xquat.tt_dyn["gpu", type_of(env.d).L_B4](type_of(env.d).L_B4()),
+        env.d.xvel.tt_dyn["gpu", type_of(env.d).L_B3](type_of(env.d).L_B3()),
+        env.d.contacts.tt_dyn["gpu", type_of(env.d).L_CONTACTS](type_of(env.d).L_CONTACTS()),
+        env.d.meta.tt_dyn["gpu", type_of(env.d).L_META](type_of(env.d).L_META()),
         mptr(r_env.unsafe_ptr()),
         Scalar[DT](w.undesired), Scalar[DT](w.feet_orient),
         Scalar[DT](w.limits), Scalar[DT](w.slide),
@@ -320,8 +320,8 @@ def leg4(ctx: DeviceContext) raises:
     ctx.enqueue_copy(hm, env.d.meta.dev.value())
     ctx.enqueue_copy(hr, r_env)
     ctx.synchronize()
-    var ct = LayoutTensor[DT, Layout.row_major(NL, NCON), MutAnyOrigin](mptr(hc.unsafe_ptr()))
-    var mt = LayoutTensor[DT, Layout.row_major(NL, METADATA_SIZE), MutAnyOrigin](mptr(hm.unsafe_ptr()))
+    var ct = tile[NL, NCON](mptr(hc.unsafe_ptr()))
+    var mt = tile[NL, METADATA_SIZE](mptr(hm.unsafe_ptr()))
     var worst = 0.0
     var nonzero = 0
     var n_und = 0

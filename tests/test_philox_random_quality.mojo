@@ -25,7 +25,7 @@ Run:
 from std.math import sqrt, cos, sin, pi
 from std.random.philox import Random as PhiloxRandom
 from std.random import random_float64, seed as global_seed
-from layout import Layout, LayoutTensor
+from noeira.core.tiles import Tile, tile
 from max.gpu import thread_idx, block_idx, block_dim
 from max.gpu.host import DeviceContext, DeviceBuffer
 
@@ -559,15 +559,13 @@ def test_gpu_kernel() raises:
 
     var ctx = DeviceContext()
     var samples_dbuf = ctx.enqueue_create_buffer[dtype](GPU_BATCH * 4)
-    var samples_t = LayoutTensor[
-        dtype, Layout.row_major(GPU_BATCH, 4), MutAnyOrigin
-    ](samples_dbuf.unsafe_ptr().as_unsafe_any_origin())
+    var samples_t = tile[GPU_BATCH, 4](samples_dbuf.unsafe_ptr().as_unsafe_any_origin())
 
     comptime BLOCKS = (GPU_BATCH + TPB - 1) // TPB
 
     @always_inline
     def gen_kernel(
-        dst: LayoutTensor[dtype, Layout.row_major(GPU_BATCH, 4), MutAnyOrigin],
+        dst: Tile[dtype, GPU_BATCH, 4],
         seed_v: Scalar[dtype],
     ):
         var env = Int(block_dim.x * block_idx.x + thread_idx.x)

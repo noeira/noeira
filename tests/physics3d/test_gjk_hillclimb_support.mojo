@@ -41,7 +41,7 @@ sweep below is a Fibonacci lattice, which spreads without needing an RNG.
 """
 
 from std.math import sqrt, cos, sin, pi, acos
-from layout import Layout, LayoutTensor
+from noeira.core.tiles import tile
 from std.testing import assert_true, TestSuite
 
 from noeira.physics3d.collision.convex_hull import load_mesh_hull
@@ -107,34 +107,26 @@ def _check(name: String, path: String) raises:
     # ⚠⚠ THE LISTS MUST OUTLIVE THE TENSORS — Mojo destroys at LAST USE, so the
     # `_ = ...` at the end of this function is load-bearing, not tidy-up.
     var vbuf = List[Scalar[D]](length=NV * 3, fill=Scalar[D](0))
-    var verts = LayoutTensor[D, Layout.row_major(NV, 3), MutAnyOrigin](
-        vbuf.unsafe_ptr().as_unsafe_any_origin().unsafe_mut_cast[True]()
-    )
+    var verts = tile[NV, 3](vbuf.unsafe_ptr().as_unsafe_any_origin().unsafe_mut_cast[True]())
     for i in range(nverts):
         verts[i, 0] = mesh_vert[i * 3 + 0]
         verts[i, 1] = mesh_vert[i * 3 + 1]
         verts[i, 2] = mesh_vert[i * 3 + 2]
 
     var abuf = List[Scalar[D]](length=NV, fill=Scalar[D](-1))
-    var eadr = LayoutTensor[D, Layout.row_major(NV), MutAnyOrigin](
-        abuf.unsafe_ptr().as_unsafe_any_origin().unsafe_mut_cast[True]()
-    )
+    var eadr = tile[NV](abuf.unsafe_ptr().as_unsafe_any_origin().unsafe_mut_cast[True]())
     for v in range(len(edge_adr)):
         eadr[v] = Scalar[D](edge_adr[v])
 
     var ebuf = List[Scalar[D]](length=NE, fill=Scalar[D](-1))
-    var edges = LayoutTensor[D, Layout.row_major(NE), MutAnyOrigin](
-        ebuf.unsafe_ptr().as_unsafe_any_origin().unsafe_mut_cast[True]()
-    )
+    var edges = tile[NE](ebuf.unsafe_ptr().as_unsafe_any_origin().unsafe_mut_cast[True]())
     for k in range(len(edge_list)):
         edges[k] = Scalar[D](edge_list[k])
 
     # ⚠ The scan arm: an all -1 `edgeadr` is exactly how an unbuilt graph is
     # marked, so this takes the fallback WITHOUT a test-only branch.
     var nbuf = List[Scalar[D]](length=NV, fill=Scalar[D](-1))
-    var no_graph = LayoutTensor[D, Layout.row_major(NV), MutAnyOrigin](
-        nbuf.unsafe_ptr().as_unsafe_any_origin().unsafe_mut_cast[True]()
-    )
+    var no_graph = tile[NV](nbuf.unsafe_ptr().as_unsafe_any_origin().unsafe_mut_cast[True]())
 
     # ================================================================
     # THE GRAPH IS A CONVEX POLYTOPE'S 1-SKELETON, OR THE WALK BELOW IS
@@ -471,9 +463,7 @@ def test_below_hillclimb_min_uses_the_scan() raises:
     # ⚠⚠ THE LISTS MUST OUTLIVE THE TENSORS — Mojo destroys at LAST USE, so the
     # `_ = ...` at the end of this function is load-bearing, not tidy-up.
     var vbuf = List[Scalar[D]](length=NV * 3, fill=Scalar[D](0))
-    var verts = LayoutTensor[D, Layout.row_major(NV, 3), MutAnyOrigin](
-        vbuf.unsafe_ptr().as_unsafe_any_origin().unsafe_mut_cast[True]()
-    )
+    var verts = tile[NV, 3](vbuf.unsafe_ptr().as_unsafe_any_origin().unsafe_mut_cast[True]())
     var n = 0
     for sx in range(2):
         for sy in range(2):
@@ -483,13 +473,9 @@ def test_below_hillclimb_min_uses_the_scan() raises:
                 verts[n, 2] = Scalar[D](sz) - Scalar[D](0.5)
                 n += 1
     var abuf = List[Scalar[D]](length=NV, fill=Scalar[D](-1))
-    var eadr = LayoutTensor[D, Layout.row_major(NV), MutAnyOrigin](
-        abuf.unsafe_ptr().as_unsafe_any_origin().unsafe_mut_cast[True]()
-    )
+    var eadr = tile[NV](abuf.unsafe_ptr().as_unsafe_any_origin().unsafe_mut_cast[True]())
     var ebuf = List[Scalar[D]](length=NE, fill=Scalar[D](-1))
-    var edges = LayoutTensor[D, Layout.row_major(NE), MutAnyOrigin](
-        ebuf.unsafe_ptr().as_unsafe_any_origin().unsafe_mut_cast[True]()
-    )
+    var edges = tile[NE](ebuf.unsafe_ptr().as_unsafe_any_origin().unsafe_mut_cast[True]())
     var w = -1
     var s = _support_mesh[D](
         Scalar[D](0), Scalar[D](0), Scalar[D](1),

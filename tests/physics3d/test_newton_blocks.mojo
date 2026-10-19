@@ -15,7 +15,7 @@ broken version.
 Run: pixi run mojo run -I . tests/physics3d/test_newton_blocks.mojo
 """
 
-from layout import Layout, LayoutTensor
+from noeira.core.tiles import RowMajor
 from noeira.nn.core.tensor import TensorImpl
 from noeira.physics3d.solver.newton_blocks import build_dof_segments
 from noeira.physics3d.gpu.constants import (
@@ -26,9 +26,9 @@ comptime DT = DType.float64
 comptime NV = 60
 comptime NTREE = 10
 comptime ME = 8
-comptime L_T = Layout.row_major(NV * MODEL_TREE_SIZE)
-comptime L_J = Layout.row_major(ME * NV)
-comptime L_S = Layout.row_major(NV)
+comptime L_T = RowMajor[NV * MODEL_TREE_SIZE]
+comptime L_J = RowMajor[ME * NV]
+comptime L_S = RowMajor[NV]
 
 
 struct Tally:
@@ -81,10 +81,10 @@ struct Case:
     def run(mut self, num_edges: Int) raises -> Int:
         return build_dof_segments[DT](
             NV, self.ntree, num_edges,
-            self.trees.lt["cpu", L_T](),
-            self.je.lt["cpu", L_J](),
-            self.s0.lt["cpu", L_S](),
-            self.s1.lt["cpu", L_S](),
+            self.trees.tt["cpu", NV * MODEL_TREE_SIZE](),
+            self.je.tt["cpu", ME * NV](),
+            self.s0.tt["cpu", NV](),
+            self.s1.tt["cpu", NV](),
         )
 
     def seg(self, i: Int) -> String:

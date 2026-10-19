@@ -14,7 +14,6 @@ Run: pixi run -e apple mojo run -I . tests/nn/dreamerv3/test_imag_bwd_continuous
 from std.math import abs
 from max.gpu.host import DeviceContext
 from std.testing import assert_true
-from layout import Layout
 
 from noeira.nn.constants import DT, TPB
 from noeira.nn.core.tensor import Tensor
@@ -119,20 +118,20 @@ def main() raises:
 
     comptime nb = (NS + TPB - 1) // TPB
     ctx.enqueue_function[_imag_bwd_continuous_k[NS, TI, BINS, ACT]](
-        vlog.lt["gpu", Layout.row_major(NS * TI * BINS)](),
-        svlog.lt["gpu", Layout.row_major(NS * TI * BINS)](),
-        pmean.lt["gpu", Layout.row_major(NS * TI * ACT)](),
-        pstd.lt["gpu", Layout.row_major(NS * TI * ACT)](),
-        acts.lt["gpu", Layout.row_major(NS * TI * ACT)](),
-        con.lt["gpu", Layout.row_major(NS * TI)](),
-        ret_d.lt["gpu", Layout.row_major(NS * TM1)](),
-        bins.lt["gpu", Layout.row_major(BINS)](),
-        gvlog_d.lt["gpu", Layout.row_major(NS * TI * BINS)](),
-        gpmean_d.lt["gpu", Layout.row_major(NS * TI * ACT)](),
-        gpstd_d.lt["gpu", Layout.row_major(NS * TI * ACT)](),
-        pol_d.lt["gpu", Layout.row_major(NS * TM1)](),
-        val_d.lt["gpu", Layout.row_major(NS * TM1)](),
-        rscale_t.lt["gpu", Layout.row_major(1)](),
+        vlog.tt["gpu", NS * TI * BINS](),
+        svlog.tt["gpu", NS * TI * BINS](),
+        pmean.tt["gpu", NS * TI * ACT](),
+        pstd.tt["gpu", NS * TI * ACT](),
+        acts.tt["gpu", NS * TI * ACT](),
+        con.tt["gpu", NS * TI](),
+        ret_d.tt["gpu", NS * TM1](),
+        bins.tt["gpu", BINS](),
+        gvlog_d.tt["gpu", NS * TI * BINS](),
+        gpmean_d.tt["gpu", NS * TI * ACT](),
+        gpstd_d.tt["gpu", NS * TI * ACT](),
+        pol_d.tt["gpu", NS * TM1](),
+        val_d.tt["gpu", NS * TM1](),
+        rscale_t.tt["gpu", 1](),
         ACTENT, SLOWREG, INV_IM, MINSTD, MAXSTD,
         grid_dim=nb, block_dim=TPB,
     )
