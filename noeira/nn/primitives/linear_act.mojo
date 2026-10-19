@@ -41,7 +41,8 @@ from noeira.nn.core.cublas_gemm import cublas_gemm, CUBLAS_BWD, cublas_fwd, cubl
 from noeira.nn.core.cublaslt_gemm import cublaslt_gemm, EPI_RELU_AUX_BIAS, LT_RELU
 from max.gpu import global_idx
 from max.gpu.host import DeviceContext
-from layout import Layout, LayoutTensor, TileTensor, row_major
+from layout import TileTensor, row_major
+from noeira.core.tiles import Tile
 from linalg.matmul import matmul as max_matmul
 from noeira.nn.core.splitk_gemm import (
     splitk_path_applies,
@@ -80,9 +81,9 @@ from .linear import (
 def _bias_act_cache_kernel[
     B: Int, OUT: Int, OP: ElementOp, ADT: DType = DT
 ](
-    o: LayoutTensor[ADT, Layout.row_major(B, OUT), MutAnyOrigin],
-    bias: LayoutTensor[ADT, Layout.row_major(OUT), MutAnyOrigin],
-    cache: LayoutTensor[ADT, Layout.row_major(B, OUT), MutAnyOrigin],
+    o: Tile[ADT, B, OUT],
+    bias: Tile[ADT, OUT],
+    cache: Tile[ADT, B, OUT],
 ):
     """Fused epilogue: o[b,j] = OP.forward(matmul[b,j] + bias[j]).
 
@@ -117,10 +118,10 @@ def _bias_act_cache_kernel[
 def _bias_act_cache_slice_kernel[
     B: Int, OUT: Int, N_PAD: Int, OP: ElementOp, ADT: DType = DT
 ](
-    ypad: LayoutTensor[ADT, Layout.row_major(B * N_PAD), MutAnyOrigin],
-    bias: LayoutTensor[ADT, Layout.row_major(OUT), MutAnyOrigin],
-    o: LayoutTensor[ADT, Layout.row_major(B, OUT), MutAnyOrigin],
-    cache: LayoutTensor[ADT, Layout.row_major(B, OUT), MutAnyOrigin],
+    ypad: Tile[ADT, B * N_PAD],
+    bias: Tile[ADT, OUT],
+    o: Tile[ADT, B, OUT],
+    cache: Tile[ADT, B, OUT],
 ):
     """`_bias_act_cache_kernel` reading a row stride of `N_PAD` instead of OUT.
 
@@ -156,8 +157,8 @@ def _bias_act_cache_slice_kernel[
 def _act_gate_kernel[
     B: Int, OUT: Int, OP: ElementOp, ADT: DType = DT
 ](
-    go: LayoutTensor[ADT, Layout.row_major(B, OUT), MutAnyOrigin],
-    cache: LayoutTensor[ADT, Layout.row_major(B, OUT), MutAnyOrigin],
+    go: Tile[ADT, B, OUT],
+    cache: Tile[ADT, B, OUT],
 ):
     """In-place activation-derivative rewrite: go[b,j] ← OP.backward(cache, go).
 
@@ -536,9 +537,9 @@ struct LinearAct[IN_: Int, OUT_: Int, OP: ElementOp, ADT: DType = DT](Module):
                     c.enqueue_function[
                         _bias_act_cache_kernel[B, Self.OUT_, Self.OP]
                     ](
-                        outd.lt["gpu", Layout.row_major(B, Self.OUT_)](),
-                        self.bias.val.lt["gpu", Layout.row_major(Self.OUT_)](),
-                        cached.lt["gpu", Layout.row_major(B, Self.OUT_)](),
+                        outd.tt["gpu", B, Self.OUT_](),
+                        self.bias.val.tt["gpu", Self.OUT_](),
+                        cached.tt["gpu", B, Self.OUT_](),
                         grid_dim=(B * Self.OUT_ + TPB - 1) // TPB,
                         block_dim=TPB,
                     )
@@ -580,12 +581,10 @@ struct LinearAct[IN_: Int, OUT_: Int, OP: ElementOp, ADT: DType = DT](Module):
                             B, Self.OUT_, Self.N_PAD, Self.OP
                         ]
                     ](
-                        self.y_pad.lt[
-                            "gpu", Layout.row_major(B * Self.N_PAD)
-                        ](),
-                        self.bias.val.lt["gpu", Layout.row_major(Self.OUT_)](),
-                        outd.lt["gpu", Layout.row_major(B, Self.OUT_)](),
-                        cached.lt["gpu", Layout.row_major(B, Self.OUT_)](),
+                        self.y_pad.tt["gpu", B * Self.N_PAD](),
+                        self.bias.val.tt["gpu", Self.OUT_](),
+                        outd.tt["gpu", B, Self.OUT_](),
+                        cached.tt["gpu", B, Self.OUT_](),
                         grid_dim=(B * Self.OUT_ + TPB - 1) // TPB,
                         block_dim=TPB,
                     )
@@ -601,9 +600,9 @@ struct LinearAct[IN_: Int, OUT_: Int, OP: ElementOp, ADT: DType = DT](Module):
                     c.enqueue_function[
                         _bias_act_cache_kernel[B, Self.OUT_, Self.OP]
                     ](
-                        outd.lt["gpu", Layout.row_major(B, Self.OUT_)](),
-                        self.bias.val.lt["gpu", Layout.row_major(Self.OUT_)](),
-                        cached.lt["gpu", Layout.row_major(B, Self.OUT_)](),
+                        outd.tt["gpu", B, Self.OUT_](),
+                        self.bias.val.tt["gpu", Self.OUT_](),
+                        cached.tt["gpu", B, Self.OUT_](),
                         grid_dim=(B * Self.OUT_ + TPB - 1) // TPB,
                         block_dim=TPB,
                     )
@@ -642,9 +641,9 @@ struct LinearAct[IN_: Int, OUT_: Int, OP: ElementOp, ADT: DType = DT](Module):
             c.enqueue_function[
                 _bias_act_cache_kernel[B, Self.OUT_, Self.OP, Self.ADT]
             ](
-                out.lt["gpu", Layout.row_major(B, Self.OUT_)](),
-                self.b_a.lt["gpu", Layout.row_major(Self.OUT_)](),
-                self.cache.lt["gpu", Layout.row_major(B, Self.OUT_)](),
+                out.tt["gpu", B, Self.OUT_](),
+                self.b_a.tt["gpu", Self.OUT_](),
+                self.cache.tt["gpu", B, Self.OUT_](),
                 grid_dim=(B * Self.OUT_ + TPB - 1) // TPB,
                 block_dim=TPB,
             )
@@ -756,8 +755,8 @@ struct LinearAct[IN_: Int, OUT_: Int, OP: ElementOp, ADT: DType = DT](Module):
                     )
                 else:
                     c.enqueue_function[_act_gate_kernel[B, Self.OUT_, Self.OP]](
-                        god.lt["gpu", Layout.row_major(B, Self.OUT_)](),
-                        cached.lt["gpu", Layout.row_major(B, Self.OUT_)](),
+                        god.tt["gpu", B, Self.OUT_](),
+                        cached.tt["gpu", B, Self.OUT_](),
                         grid_dim=(M + TPB - 1) // TPB,
                         block_dim=TPB,
                     )
@@ -964,8 +963,8 @@ struct LinearAct[IN_: Int, OUT_: Int, OP: ElementOp, ADT: DType = DT](Module):
             c.enqueue_function[
                 _act_gate_kernel[B, Self.OUT_, Self.OP, Self.ADT]
             ](
-                grad_output.lt["gpu", Layout.row_major(B, Self.OUT_)](),
-                self.cache.lt["gpu", Layout.row_major(B, Self.OUT_)](),
+                grad_output.tt["gpu", B, Self.OUT_](),
+                self.cache.tt["gpu", B, Self.OUT_](),
                 grid_dim=(M + TPB - 1) // TPB,
                 block_dim=TPB,
             )

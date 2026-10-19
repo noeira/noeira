@@ -26,7 +26,6 @@ feeds Adam with **no negation** — confirmed in `pc_block.mojo` (the "−sign
 expected by Optimizer.step").
 """
 
-from layout import Layout, LayoutTensor
 from max.gpu.host import DeviceContext
 
 from noeira.nn.constants import DT
@@ -40,6 +39,7 @@ from noeira.nn.core.amp import AMPPolicy, NoAMP
 from .predictive_model import PCBlockTrait
 from .pc_sequential import PCSequential
 from .pc_initializer import PCInitializer, PCXavier
+from noeira.core.tiles import tile
 
 
 struct PCModule[*BLOCKS: PCBlockTrait](Module):
@@ -83,9 +83,7 @@ struct PCModule[*BLOCKS: PCBlockTrait](Module):
             "cpu"
         ]()
 
-        var params = LayoutTensor[
-            DT, Layout.row_major(Self.NET.PARAM_SIZE), MutAnyOrigin
-        ](net.weights.val.data)
+        var params = tile[Self.NET.PARAM_SIZE](net.weights.val.data)
         Self.NET.pc_init_params[INIT, DT](params)
         return net^
 
@@ -109,9 +107,7 @@ struct PCModule[*BLOCKS: PCBlockTrait](Module):
         var host = List[Scalar[DT]](
             length=Self.NET.PARAM_SIZE, fill=Scalar[DT](0)
         )
-        var host_view = LayoutTensor[
-            DT, Layout.row_major(Self.NET.PARAM_SIZE), MutAnyOrigin
-        ](host)
+        var host_view = tile[Self.NET.PARAM_SIZE](host)
         Self.NET.pc_init_params[INIT, DT](host_view)
         ctx.enqueue_copy(net.weights.val.dev.value(), host)
         ctx.synchronize()

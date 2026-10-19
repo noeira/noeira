@@ -6,7 +6,7 @@ Observation state for the GPU-enabled Pendulum environment.
 from std.math import cos, sin
 
 from noeira.core import State
-from layout import Layout, LayoutTensor
+from noeira.core.tiles import Tile
 
 
 @fieldwise_init
@@ -79,9 +79,7 @@ struct PendulumV2State[DTYPE: DType](
         BATCH: Int,
         STATE_SIZE: Int,
     ](
-        state: LayoutTensor[
-            DType.float32, Layout.row_major(BATCH, STATE_SIZE), MutAnyOrigin
-        ],
+        state: Tile[DType.float32, BATCH, STATE_SIZE],
         env: Int,
     ) -> PendulumV2State[Self.DTYPE]:
         """Create state from std.gpu buffer by reading theta and computing observation.
@@ -111,9 +109,7 @@ struct PendulumV2State[DTYPE: DType](
         BATCH: Int,
         OBS_DIM: Int,
     ](
-        obs: LayoutTensor[
-            DType.float32, Layout.row_major(BATCH, OBS_DIM), MutAnyOrigin
-        ],
+        obs: Tile[DType.float32, BATCH, OBS_DIM],
         env: Int,
     ) -> PendulumV2State[Self.DTYPE]:
         """Create state directly from observation buffer.

@@ -14,11 +14,11 @@ it (later P2 slices).
 """
 
 from max.gpu.host import DeviceContext
-from layout import Layout
 
 from noeira.nn.core.tensor import TensorImpl
 
 from .dims import DimsLike
+from noeira.core.tiles import RowMajor
 
 
 struct DynamicsScratch[
@@ -40,11 +40,11 @@ struct DynamicsScratch[
     comptime NV = Self.DIMS.NV
     comptime NBODY = Self.DIMS.NBODY
 
-    comptime L_CDOF = Layout.row_major(Self.BATCH, Self.NV * 6)
-    comptime L_CRB = Layout.row_major(Self.BATCH, Self.NBODY * 10)
-    comptime L_M = Layout.row_major(Self.BATCH, Self.NV * Self.NV)
-    comptime L_NV = Layout.row_major(Self.BATCH, Self.NV)
-    comptime L_B6 = Layout.row_major(Self.BATCH, Self.NBODY * 6)
+    comptime L_CDOF = RowMajor[Self.BATCH, Self.NV * 6]
+    comptime L_CRB = RowMajor[Self.BATCH, Self.NBODY * 10]
+    comptime L_M = RowMajor[Self.BATCH, Self.NV * Self.NV]
+    comptime L_NV = RowMajor[Self.BATCH, Self.NV]
+    comptime L_B6 = RowMajor[Self.BATCH, Self.NBODY * 6]
 
     var cdof: TensorImpl[Self.DTYPE]  # [BATCH, NV*6]
     var crb: TensorImpl[Self.DTYPE]  # [BATCH, NBODY*10]

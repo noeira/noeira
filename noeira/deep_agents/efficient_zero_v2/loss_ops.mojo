@@ -33,9 +33,9 @@ with).
 
 from std.math import sqrt
 from max.gpu import global_idx
-from layout import Layout, LayoutTensor
 
 from noeira.nn.constants import DT
+from noeira.core.tiles import Tile
 
 
 comptime _COS_EPS: Scalar[DT] = Scalar[DT](1e-12)
@@ -90,11 +90,11 @@ def consistency_loss_and_grad[
 def consistency_loss_grad_k[
     B_: Int, DIM_: Int, ADT: DType = DT,
 ](
-    p: LayoutTensor[ADT, Layout.row_major(B_ * DIM_), MutAnyOrigin],
-    t: LayoutTensor[ADT, Layout.row_major(B_ * DIM_), MutAnyOrigin],
-    grad_p: LayoutTensor[ADT, Layout.row_major(B_ * DIM_), MutAnyOrigin],
-    loss_buf: LayoutTensor[DT, Layout.row_major(B_), MutAnyOrigin],
-    mask: LayoutTensor[DT, Layout.row_major(B_), MutAnyOrigin],
+    p: Tile[ADT, B_ * DIM_],
+    t: Tile[ADT, B_ * DIM_],
+    grad_p: Tile[ADT, B_ * DIM_],
+    loss_buf: Tile[DT, B_],
+    mask: Tile[DT, B_],
     grad_scale: Scalar[DT],
     loss_coef: Scalar[DT],
 ):

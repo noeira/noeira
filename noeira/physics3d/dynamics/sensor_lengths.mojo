@@ -44,7 +44,7 @@ including the solver's. Until then a GPU-batched `<tendonpos>` reads NaN, and
 `test_tendon_length_batched_vs_mujoco` pins which leg serves it.
 """
 
-from layout import Layout, LayoutTensor
+from layout import TileTensor, TensorLayout
 
 from ..fields import (
     Data, Model, DimsLike, DynamicsScratch,
@@ -94,33 +94,33 @@ def _tendon_lengths_env[
     V_CAP: Int,
     BATCH: Int,
     D: DimsLike,
-    L_TENDONS: Layout,
-    L_SITES: Layout,
-    L_GEOMS: Layout,
-    L_BODIES: Layout,
-    L_JOINTS: Layout,
-    L_MMETA: Layout,
-    L_B3: Layout,
-    L_CDOF: Layout,
-    L_XQUAT: Layout,
-    L_QPOS: Layout,
-    L_TEN: Layout,
+    L_TENDONS: TensorLayout,
+    L_SITES: TensorLayout,
+    L_GEOMS: TensorLayout,
+    L_BODIES: TensorLayout,
+    L_JOINTS: TensorLayout,
+    L_MMETA: TensorLayout,
+    L_B3: TensorLayout,
+    L_CDOF: TensorLayout,
+    L_XQUAT: TensorLayout,
+    L_QPOS: TensorLayout,
+    L_TEN: TensorLayout,
 ](
     env: Int,
     nten: Int,
     dims: D,
-    tendons: LayoutTensor[DTYPE, L_TENDONS, MutAnyOrigin],
-    sites: LayoutTensor[DTYPE, L_SITES, MutAnyOrigin],
-    geoms: LayoutTensor[DTYPE, L_GEOMS, MutAnyOrigin],
-    bodies: LayoutTensor[DTYPE, L_BODIES, MutAnyOrigin],
-    joints: LayoutTensor[DTYPE, L_JOINTS, MutAnyOrigin],
-    mmeta: LayoutTensor[DTYPE, L_MMETA, MutAnyOrigin],
-    subtree_com: LayoutTensor[DTYPE, L_B3, MutAnyOrigin],
-    cdof: LayoutTensor[DTYPE, L_CDOF, MutAnyOrigin],
-    xpos: LayoutTensor[DTYPE, L_B3, MutAnyOrigin],
-    xquat: LayoutTensor[DTYPE, L_XQUAT, MutAnyOrigin],
-    qpos: LayoutTensor[DTYPE, L_QPOS, MutAnyOrigin],
-    ten_length: LayoutTensor[DTYPE, L_TEN, MutAnyOrigin],
+    tendons: TileTensor[DTYPE, L_TENDONS, MutAnyOrigin],
+    sites: TileTensor[DTYPE, L_SITES, MutAnyOrigin],
+    geoms: TileTensor[DTYPE, L_GEOMS, MutAnyOrigin],
+    bodies: TileTensor[DTYPE, L_BODIES, MutAnyOrigin],
+    joints: TileTensor[DTYPE, L_JOINTS, MutAnyOrigin],
+    mmeta: TileTensor[DTYPE, L_MMETA, MutAnyOrigin],
+    subtree_com: TileTensor[DTYPE, L_B3, MutAnyOrigin],
+    cdof: TileTensor[DTYPE, L_CDOF, MutAnyOrigin],
+    xpos: TileTensor[DTYPE, L_B3, MutAnyOrigin],
+    xquat: TileTensor[DTYPE, L_XQUAT, MutAnyOrigin],
+    qpos: TileTensor[DTYPE, L_QPOS, MutAnyOrigin],
+    ten_length: TileTensor[DTYPE, L_TEN, MutAnyOrigin],
 ):
     """`d.ten_length[env, :]` for one env. The whole pass, minus the binding.
 
@@ -199,22 +199,22 @@ def compute_tendon_lengths[
     var rl_B4 = rl2(BATCH, dm.get_nbody() * 4)
     var rl_CDOF = rl2(BATCH, dm.get_nv() * 6)
     var rl_QPOS = rl2(BATCH, dm.get_nq())
-    var tendons_v = m.tendons.lt_dyn["cpu", DYN2](rl_TENM)
-    var sites_v = m.sites.lt_dyn["cpu", DYN2](rl_SITE)
-    var geoms_v = m.geoms.lt_dyn["cpu", DYN2](rl_GEOM)
-    var bodies_v = m.bodies.lt_dyn["cpu", DYN2](rl_BODY)
-    var joints_v = m.joints.lt_dyn["cpu", DYN2](rl_JOINT)
-    var mmeta_v = m.meta.lt_dyn["cpu", DYN1](rl_MMETA)
-    var stcom_v = d.subtree_com.lt_dyn["cpu", DYN2](rl_B3)
-    var xpos_v = d.xpos.lt_dyn["cpu", DYN2](rl_B3)
-    var xquat_v = d.xquat.lt_dyn["cpu", DYN2](rl_B4)
-    var qpos_v = d.qpos.lt_dyn["cpu", DYN2](rl_QPOS)
-    var tenlen_v = d.ten_length.lt_dyn["cpu", DYN2](rl_TEN)
+    var tendons_v = m.tendons.tt_dyn["cpu", DYN2](rl_TENM)
+    var sites_v = m.sites.tt_dyn["cpu", DYN2](rl_SITE)
+    var geoms_v = m.geoms.tt_dyn["cpu", DYN2](rl_GEOM)
+    var bodies_v = m.bodies.tt_dyn["cpu", DYN2](rl_BODY)
+    var joints_v = m.joints.tt_dyn["cpu", DYN2](rl_JOINT)
+    var mmeta_v = m.meta.tt_dyn["cpu", DYN1](rl_MMETA)
+    var stcom_v = d.subtree_com.tt_dyn["cpu", DYN2](rl_B3)
+    var xpos_v = d.xpos.tt_dyn["cpu", DYN2](rl_B3)
+    var xquat_v = d.xquat.tt_dyn["cpu", DYN2](rl_B4)
+    var qpos_v = d.qpos.tt_dyn["cpu", DYN2](rl_QPOS)
+    var tenlen_v = d.ten_length.tt_dyn["cpu", DYN2](rl_TEN)
     # ⚠ STALE AT THIS POINT IN THE STEP, AND NEVER READ. `compute_cdof` runs
     # later; `flg_jac=False` below is what makes that safe. Binding it anyway
     # keeps the call shape identical to every other caller's, so a future
     # reader comparing the two sees one difference, not two.
-    var cdof_v = sc.cdof.lt_dyn["cpu", DYN2](rl_CDOF)
+    var cdof_v = sc.cdof.tt_dyn["cpu", DYN2](rl_CDOF)
 
     for env in range(BATCH):
         _tendon_lengths_env[DTYPE, V_CAP, BATCH](

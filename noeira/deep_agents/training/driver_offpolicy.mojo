@@ -44,7 +44,6 @@ through the `BatchedEnv` trait.
 from std.time import perf_counter_ns
 from std.sys import default_accelerator
 from max.gpu.host import DeviceContext, DeviceBuffer
-from layout import Layout, LayoutTensor
 
 from noeira.core.logger import Logger, NoOpLogger
 from noeira.nn.constants import DT
@@ -69,6 +68,7 @@ from .blocks.episode_readback import (
 from .blocks.cadence import DriverCadence
 from .checkpoint import announce_checkpoint
 from ...io.artifact_sink import ArtifactSink
+from noeira.core.tiles import Tile, tile
 
 
 # ──────────────────────────────────────────────────────────────────────
@@ -102,18 +102,10 @@ trait OffPolicyAgent(Deinitable, Movable):
         N_ENVS: Int
     ](
         mut self,
-        obs: LayoutTensor[
-            DT, Layout.row_major(N_ENVS, Self.AGENT_OBS_DIM), MutAnyOrigin
-        ],
-        action: LayoutTensor[
-            DT, Layout.row_major(N_ENVS, Self.AGENT_ACT_DIM), MutAnyOrigin
-        ],
-        ao_scratch: LayoutTensor[
-            DT, Layout.row_major(N_ENVS, 2 * Self.AGENT_ACT_DIM), MutAnyOrigin
-        ],
-        alp_scratch: LayoutTensor[
-            DT, Layout.row_major(N_ENVS, Self.AGENT_ACT_DIM + 1), MutAnyOrigin
-        ],
+        obs: Tile[DT, N_ENVS, Self.AGENT_OBS_DIM],
+        action: Tile[DT, N_ENVS, Self.AGENT_ACT_DIM],
+        ao_scratch: Tile[DT, N_ENVS, 2 * Self.AGENT_ACT_DIM],
+        alp_scratch: Tile[DT, N_ENVS, Self.AGENT_ACT_DIM + 1],
         step_idx: Int,
     ) raises:
         ...
@@ -135,15 +127,9 @@ trait OffPolicyAgent(Deinitable, Movable):
     ](
         mut self,
         ctx: Optional[DeviceContext],
-        obs: LayoutTensor[
-            DT, Layout.row_major(N_ENVS, Self.AGENT_OBS_DIM), MutAnyOrigin
-        ],
-        action: LayoutTensor[
-            DT, Layout.row_major(N_ENVS, Self.AGENT_ACT_DIM), MutAnyOrigin
-        ],
-        ao_scratch: LayoutTensor[
-            DT, Layout.row_major(N_ENVS, 2 * Self.AGENT_ACT_DIM), MutAnyOrigin
-        ],
+        obs: Tile[DT, N_ENVS, Self.AGENT_OBS_DIM],
+        action: Tile[DT, N_ENVS, Self.AGENT_ACT_DIM],
+        ao_scratch: Tile[DT, N_ENVS, 2 * Self.AGENT_ACT_DIM],
     ) raises:
         """Batched deterministic (greedy) action selection for GPU-parallel
         eval (`run_offpolicy_eval_batched`). View contract is target-side
@@ -565,18 +551,10 @@ def run_offpolicy_train[
         # this driver in cadence-sized blocks). Equivalent to `step` when
         # `base_step=0` (single-call usage).
         trainer.select_action_batched[1](
-            LayoutTensor[DT, Layout.row_major(1, OBS), MutAnyOrigin](
-                obs_scratch.target_ptr[train_target]()
-            ),
-            LayoutTensor[DT, Layout.row_major(1, ACT), MutAnyOrigin](
-                action_scratch.target_ptr[train_target]()
-            ),
-            LayoutTensor[DT, Layout.row_major(1, 2 * ACT), MutAnyOrigin](
-                ao.target_ptr[train_target]()
-            ),
-            LayoutTensor[DT, Layout.row_major(1, ACT + 1), MutAnyOrigin](
-                alp.target_ptr[train_target]()
-            ),
+            tile[1, OBS](obs_scratch.target_ptr[train_target]()),
+            tile[1, ACT](action_scratch.target_ptr[train_target]()),
+            tile[1, 2 * ACT](ao.target_ptr[train_target]()),
+            tile[1, ACT + 1](alp.target_ptr[train_target]()),
             base_step + step,
         )
 
@@ -781,15 +759,9 @@ def run_offpolicy_eval_batched[
         # Greedy action → eval_env.action_ptr() (target-side pointer).
         trainer.select_greedy_action_batched[EVAL_ENVS](
             ctx,
-            LayoutTensor[DT, Layout.row_major(EVAL_ENVS, OBS), MutAnyOrigin](
-                eval_env.obs_ptr()
-            ),
-            LayoutTensor[DT, Layout.row_major(EVAL_ENVS, ACT), MutAnyOrigin](
-                eval_env.action_ptr()
-            ),
-            LayoutTensor[
-                DT, Layout.row_major(EVAL_ENVS, 2 * ACT), MutAnyOrigin
-            ](ao.target_ptr[target]()),
+            tile[EVAL_ENVS, OBS](eval_env.obs_ptr()),
+            tile[EVAL_ENVS, ACT](eval_env.action_ptr()),
+            tile[EVAL_ENVS, 2 * ACT](ao.target_ptr[target]()),
         )
         eval_env.step_batch[EVAL_ENVS](
             ctx=ctx,
@@ -1118,18 +1090,10 @@ def run_offpolicy_train_batched[
         # `base_step + step_idx` is the cumulative env-step counter (see
         # the `base_step` note in `run_offpolicy_train`).
         trainer.select_action_batched[N_ENVS](
-            LayoutTensor[DT, Layout.row_major(N_ENVS, OBS), MutAnyOrigin](
-                env.obs_ptr()
-            ),
-            LayoutTensor[DT, Layout.row_major(N_ENVS, ACT), MutAnyOrigin](
-                env.action_ptr()
-            ),
-            LayoutTensor[DT, Layout.row_major(N_ENVS, 2 * ACT), MutAnyOrigin](
-                ao.target_ptr[train_target]()
-            ),
-            LayoutTensor[DT, Layout.row_major(N_ENVS, ACT + 1), MutAnyOrigin](
-                alp.target_ptr[train_target]()
-            ),
+            tile[N_ENVS, OBS](env.obs_ptr()),
+            tile[N_ENVS, ACT](env.action_ptr()),
+            tile[N_ENVS, 2 * ACT](ao.target_ptr[train_target]()),
+            tile[N_ENVS, ACT + 1](alp.target_ptr[train_target]()),
             base_step + step_idx,
         )
 
@@ -1697,18 +1661,10 @@ def run_offpolicy_train_cpu_env_gpu_agent[
 
         # ── 2. Action selection on device (warmup gated inside trainer).
         trainer.select_action_batched[N_ENVS](
-            LayoutTensor[DT, Layout.row_major(N_ENVS, OBS), MutAnyOrigin](
-                obs_dev.dev_ptr()
-            ),
-            LayoutTensor[DT, Layout.row_major(N_ENVS, ACT), MutAnyOrigin](
-                action_dev.dev_ptr()
-            ),
-            LayoutTensor[DT, Layout.row_major(N_ENVS, 2 * ACT), MutAnyOrigin](
-                ao.dev_ptr()
-            ),
-            LayoutTensor[DT, Layout.row_major(N_ENVS, ACT + 1), MutAnyOrigin](
-                alp.dev_ptr()
-            ),
+            tile[N_ENVS, OBS](obs_dev.dev_ptr()),
+            tile[N_ENVS, ACT](action_dev.dev_ptr()),
+            tile[N_ENVS, 2 * ACT](ao.dev_ptr()),
+            tile[N_ENVS, ACT + 1](alp.dev_ptr()),
             abs_step,
         )
 

@@ -22,7 +22,6 @@ kernels are parametrized by `ADT` (defaulting to DT → NoAMP unchanged).
 
 from max.gpu import global_idx
 from max.gpu.host import DeviceContext
-from layout import Layout, LayoutTensor
 
 from noeira.nn.constants import DT, TPB, CPU_SIMD_W
 from ..core.initializer import Initializer
@@ -34,6 +33,7 @@ from ..core.module import Module
 from ..core.param import ParamVisitor
 from ..core.walkers import join_name
 from ..core.amp import AMPPolicy, NoAMP
+from noeira.core.tiles import Tile
 
 
 # ── grad-input accumulation (dst[i] += src[i]) ──────────────────────────
@@ -43,8 +43,8 @@ from ..core.amp import AMPPolicy, NoAMP
 def _par_accum_kernel[
     N: Int, ADT: DType = DT
 ](
-    dst: LayoutTensor[ADT, Layout.row_major(N), MutAnyOrigin],
-    src: LayoutTensor[ADT, Layout.row_major(N), MutAnyOrigin],
+    dst: Tile[ADT, N],
+    src: Tile[ADT, N],
 ):
     var i = Int(global_idx.x)
     if i < N:
@@ -72,8 +72,8 @@ def _cumulative_offset[index: Int, *BRANCHES: Module]() -> Int:
 def _par_write_kernel[
     B: Int, OI: Int, OD: Int, ADT: DType = DT
 ](
-    slab: LayoutTensor[ADT, Layout.row_major(B, OI), MutAnyOrigin],
-    packed: LayoutTensor[ADT, Layout.row_major(B, OD), MutAnyOrigin],
+    slab: Tile[ADT, B, OI],
+    packed: Tile[ADT, B, OD],
     off_arg: Int64,
 ):
     # Mojo 1.0: `Int`/`UInt` are not `DevicePassable`; the kernel takes
@@ -89,8 +89,8 @@ def _par_write_kernel[
 def _par_read_kernel[
     B: Int, OI: Int, OD: Int, ADT: DType = DT
 ](
-    packed: LayoutTensor[ADT, Layout.row_major(B, OD), MutAnyOrigin],
-    slab: LayoutTensor[ADT, Layout.row_major(B, OI), MutAnyOrigin],
+    packed: Tile[ADT, B, OD],
+    slab: Tile[ADT, B, OI],
     off_arg: Int64,
 ):
     # Mojo 1.0: `Int`/`UInt` are not `DevicePassable`; the kernel takes
@@ -107,9 +107,9 @@ def _par_read_kernel[
 def _par_concat_kernel[
     B: Int, OA: Int, OB: Int, ADT: DType = DT
 ](
-    a: LayoutTensor[ADT, Layout.row_major(B, OA), MutAnyOrigin],
-    bb: LayoutTensor[ADT, Layout.row_major(B, OB), MutAnyOrigin],
-    packed: LayoutTensor[ADT, Layout.row_major(B, OA + OB), MutAnyOrigin],
+    a: Tile[ADT, B, OA],
+    bb: Tile[ADT, B, OB],
+    packed: Tile[ADT, B, OA + OB],
 ):
     var idx = Int(global_idx.x)
     var total = B * (OA + OB)
@@ -125,9 +125,9 @@ def _par_concat_kernel[
 def _par_split_kernel[
     B: Int, OA: Int, OB: Int, ADT: DType = DT
 ](
-    packed: LayoutTensor[ADT, Layout.row_major(B, OA + OB), MutAnyOrigin],
-    a: LayoutTensor[ADT, Layout.row_major(B, OA), MutAnyOrigin],
-    bb: LayoutTensor[ADT, Layout.row_major(B, OB), MutAnyOrigin],
+    packed: Tile[ADT, B, OA + OB],
+    a: Tile[ADT, B, OA],
+    bb: Tile[ADT, B, OB],
 ):
     var idx = Int(global_idx.x)
     var total = B * (OA + OB)
@@ -241,8 +241,8 @@ struct Parallel[*BRANCHES: Module](Module):
                 c.enqueue_function[
                     _par_write_kernel[B, oi, Self.OUT_DIM, Self.ACT_DT]
                 ](
-                    self.slabs[i].lt["gpu", Layout.row_major(B, oi)](),
-                    out.lt["gpu", Layout.row_major(B, Self.OUT_DIM)](),
+                    self.slabs[i].tt["gpu", B, oi](),
+                    out.tt["gpu", B, Self.OUT_DIM](),
                     Int64(off),
                     grid_dim=(B * oi + TPB - 1) // TPB,
                     block_dim=TPB,
@@ -287,8 +287,8 @@ struct Parallel[*BRANCHES: Module](Module):
                 c.enqueue_function[
                     _par_read_kernel[B, oi, Self.OUT_DIM, Self.ACT_DT]
                 ](
-                    grad_output.lt["gpu", Layout.row_major(B, Self.OUT_DIM)](),
-                    self.slabs[i].lt["gpu", Layout.row_major(B, oi)](),
+                    grad_output.tt["gpu", B, Self.OUT_DIM](),
+                    self.slabs[i].tt["gpu", B, oi](),
                     Int64(off),
                     grid_dim=(B * oi + TPB - 1) // TPB,
                     block_dim=TPB,
@@ -315,8 +315,8 @@ struct Parallel[*BRANCHES: Module](Module):
             else:
                 var c = ctx.value()
                 c.enqueue_function[_par_accum_kernel[NIN, Self.ACT_DT]](
-                    gin.lt["gpu", Layout.row_major(NIN)](),
-                    self.gi_temp.lt["gpu", Layout.row_major(NIN)](),
+                    gin.tt["gpu", NIN](),
+                    self.gi_temp.tt["gpu", NIN](),
                     grid_dim=(NIN + TPB - 1) // TPB,
                     block_dim=TPB,
                 )

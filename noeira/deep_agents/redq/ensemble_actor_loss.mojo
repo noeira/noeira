@@ -32,7 +32,6 @@ Returns `EnsembleActorLossResult { loss, log_prob_mean }`. The trainer reads
 from max.gpu import global_idx
 from noeira.nn.core.ptr import untracked
 from max.gpu.host import DeviceContext, DeviceBuffer
-from layout import Layout, LayoutTensor
 
 from noeira.nn.constants import DT, TPB, TPB_REDUCE
 from noeira.nn.core.amp import AMPPolicy, NoAMP
@@ -46,6 +45,7 @@ from noeira.nn.primitives.rsample import RSample
 
 from .ensemble import CriticEnsemble
 from ..sac.actor_loss import reduce_mean_write_kernel, reduce_mean_acc_kernel
+from noeira.core.tiles import Tile
 
 
 # ────────────────────────────────────────────────────────────────────
@@ -55,7 +55,7 @@ from ..sac.actor_loss import reduce_mean_write_kernel, reduce_mean_acc_kernel
 
 def _eal_zero_kernel[
     N: Int
-](dst: LayoutTensor[DT, Layout.row_major(N), MutAnyOrigin]):
+](dst: Tile[DT, N]):
     """`dst[i] = 0`."""
     var idx = Int(global_idx.x)
     if idx < N:
@@ -65,8 +65,8 @@ def _eal_zero_kernel[
 def _eal_add_into_kernel[
     N: Int
 ](
-    dst: LayoutTensor[DT, Layout.row_major(N), MutAnyOrigin],
-    src: LayoutTensor[DT, Layout.row_major(N), MutAnyOrigin],
+    dst: Tile[DT, N],
+    src: Tile[DT, N],
 ):
     """`dst[i] += src[i]`."""
     var idx = Int(global_idx.x)
@@ -76,7 +76,7 @@ def _eal_add_into_kernel[
 
 def _eal_fill_const_kernel[
     N: Int
-](dst: LayoutTensor[DT, Layout.row_major(N), MutAnyOrigin], value: Scalar[DT]):
+](dst: Tile[DT, N], value: Scalar[DT]):
     """`dst[i] = value` — seeds grad_q_i with the −1/(N·B) constant."""
     var idx = Int(global_idx.x)
     if idx < N:
@@ -86,10 +86,10 @@ def _eal_fill_const_kernel[
 def _eal_concat_sa_extract_lp_kernel[
     OBS: Int, ACT: Int, BATCH: Int, SA_DIM: Int, ALP_DIM: Int,
 ](
-    s: LayoutTensor[DT, Layout.row_major(BATCH, OBS), MutAnyOrigin],
-    alp: LayoutTensor[DT, Layout.row_major(BATCH, ALP_DIM), MutAnyOrigin],
-    sa: LayoutTensor[DT, Layout.row_major(BATCH, SA_DIM), MutAnyOrigin],
-    lp: LayoutTensor[DT, Layout.row_major(BATCH), MutAnyOrigin],
+    s: Tile[DT, BATCH, OBS],
+    alp: Tile[DT, BATCH, ALP_DIM],
+    sa: Tile[DT, BATCH, SA_DIM],
+    lp: Tile[DT, BATCH],
 ):
     """sa[b, :OBS] = s[b, :], sa[b, OBS:] = alp[b, :ACT], lp[b] = alp[b, ACT]."""
     var idx = Int(global_idx.x)
@@ -109,8 +109,8 @@ def _eal_concat_sa_extract_lp_kernel[
 def _eal_build_grad_alp_kernel[
     BATCH: Int, OBS: Int, ACT: Int, SA_DIM: Int, ALP_DIM: Int,
 ](
-    grad_sa_sum: LayoutTensor[DT, Layout.row_major(BATCH, SA_DIM), MutAnyOrigin],
-    grad_alp: LayoutTensor[DT, Layout.row_major(BATCH, ALP_DIM), MutAnyOrigin],
+    grad_sa_sum: Tile[DT, BATCH, SA_DIM],
+    grad_alp: Tile[DT, BATCH, ALP_DIM],
     grad_lp_const: Scalar[DT],
 ):
     """grad_alp[b, :ACT] = grad_sa_sum[b, OBS:]; grad_alp[b, ACT] = grad_lp_const
@@ -137,9 +137,9 @@ def _eal_build_grad_alp_kernel[
 def _eal_loss_per_b_dev_kernel[
     BATCH: Int, N: Int
 ](
-    q_sum: LayoutTensor[DT, Layout.row_major(BATCH), MutAnyOrigin],
-    lp: LayoutTensor[DT, Layout.row_major(BATCH), MutAnyOrigin],
-    loss_out: LayoutTensor[DT, Layout.row_major(BATCH), MutAnyOrigin],
+    q_sum: Tile[DT, BATCH],
+    lp: Tile[DT, BATCH],
+    loss_out: Tile[DT, BATCH],
     alpha_ptr: Pointer[Scalar[DT], MutAnyOrigin],
 ):
     """loss_out[b] = α·lp[b] − (1/N)·q_sum[b]. α read on-device. Per-b loss the
@@ -155,8 +155,8 @@ def _eal_loss_per_b_dev_kernel[
 def _eal_build_grad_alp_dev_kernel[
     BATCH: Int, OBS: Int, ACT: Int, SA_DIM: Int, ALP_DIM: Int,
 ](
-    grad_sa_sum: LayoutTensor[DT, Layout.row_major(BATCH, SA_DIM), MutAnyOrigin],
-    grad_alp: LayoutTensor[DT, Layout.row_major(BATCH, ALP_DIM), MutAnyOrigin],
+    grad_sa_sum: Tile[DT, BATCH, SA_DIM],
+    grad_alp: Tile[DT, BATCH, ALP_DIM],
     inv_b: Scalar[DT],
     alpha_ptr: Pointer[Scalar[DT], MutAnyOrigin],
 ):
@@ -390,10 +390,10 @@ struct EnsembleActorLoss[
                 Self.OBS, Self.ACT, BB, Self.SA_DIM, Self.ALP_DIM,
             ]
             c.enqueue_function[kernel](
-                mb_s.lt["gpu", Layout.row_major(BB, Self.OBS)](),
-                self._mb_alp.lt["gpu", Layout.row_major(BB, Self.ALP_DIM)](),
-                self._mb_sa.lt["gpu", Layout.row_major(BB, Self.SA_DIM)](),
-                self._mb_lp.lt["gpu", Layout.row_major(BB)](),
+                mb_s.tt["gpu", BB, Self.OBS](),
+                self._mb_alp.tt["gpu", BB, Self.ALP_DIM](),
+                self._mb_sa.tt["gpu", BB, Self.SA_DIM](),
+                self._mb_lp.tt["gpu", BB](),
                 grid_dim=n_blocks, block_dim=TPB,
             )
 
@@ -405,7 +405,7 @@ struct EnsembleActorLoss[
             var c = ctx.value()
             comptime nbb = (BB + TPB - 1) // TPB
             c.enqueue_function[_eal_zero_kernel[BB]](
-                self._mb_q_sum.lt["gpu", Layout.row_major(BB)](),
+                self._mb_q_sum.tt["gpu", BB](),
                 grid_dim=nbb, block_dim=TPB,
             )
         for i in range(Self.N):
@@ -420,8 +420,8 @@ struct EnsembleActorLoss[
                 var c = ctx.value()
                 comptime nbb = (BB + TPB - 1) // TPB
                 c.enqueue_function[_eal_add_into_kernel[BB]](
-                    self._mb_q_sum.lt["gpu", Layout.row_major(BB)](),
-                    self._mb_q_i.lt["gpu", Layout.row_major(BB)](),
+                    self._mb_q_sum.tt["gpu", BB](),
+                    self._mb_q_i.tt["gpu", BB](),
                     grid_dim=nbb, block_dim=TPB,
                 )
 
@@ -443,20 +443,20 @@ struct EnsembleActorLoss[
                 # Returned host scalars stay 0 sentinels.
                 comptime nbb = (BB + TPB - 1) // TPB
                 c.enqueue_function[_eal_loss_per_b_dev_kernel[BB, Self.N]](
-                    self._mb_q_sum.lt["gpu", Layout.row_major(BB)](),
-                    self._mb_lp.lt["gpu", Layout.row_major(BB)](),
-                    self._mb_loss_out.lt["gpu", Layout.row_major(BB)](),
+                    self._mb_q_sum.tt["gpu", BB](),
+                    self._mb_lp.tt["gpu", BB](),
+                    self._mb_loss_out.tt["gpu", BB](),
                     self._alpha_ptr.value(),
                     grid_dim=nbb, block_dim=TPB,
                 )
                 c.enqueue_function[reduce_mean_write_kernel[BB]](
-                    self._mb_lp.lt["gpu", Layout.row_major(BB, 1)](),
-                    self._lp_mean.lt["gpu", Layout.row_major(1, 1)](),
+                    self._mb_lp.tt["gpu", BB, 1](),
+                    self._lp_mean.tt["gpu", 1, 1](),
                     grid_dim=1, block_dim=TPB_REDUCE,
                 )
                 c.enqueue_function[reduce_mean_acc_kernel[BB]](
-                    self._mb_loss_out.lt["gpu", Layout.row_major(BB, 1)](),
-                    self._loss_acc.lt["gpu", Layout.row_major(1, 2)](),
+                    self._mb_loss_out.tt["gpu", BB, 1](),
+                    self._loss_acc.tt["gpu", 1, 2](),
                     grid_dim=1, block_dim=TPB_REDUCE,
                 )
             else:
@@ -478,7 +478,7 @@ struct EnsembleActorLoss[
             var c = ctx.value()
             comptime nbb = (BB + TPB - 1) // TPB
             c.enqueue_function[_eal_fill_const_kernel[BB]](
-                self._mb_grad_q_i.lt["gpu", Layout.row_major(BB)](),
+                self._mb_grad_q_i.tt["gpu", BB](),
                 grad_q_val,
                 grid_dim=nbb, block_dim=TPB,
             )
@@ -492,7 +492,7 @@ struct EnsembleActorLoss[
             comptime total_gss = BB * Self.SA_DIM
             comptime n_blocks_z = (total_gss + TPB - 1) // TPB
             c.enqueue_function[_eal_zero_kernel[total_gss]](
-                self._mb_grad_sa_sum.lt["gpu", Layout.row_major(total_gss)](),
+                self._mb_grad_sa_sum.tt["gpu", total_gss](),
                 grid_dim=n_blocks_z, block_dim=TPB,
             )
         for i in range(Self.N):
@@ -518,10 +518,8 @@ struct EnsembleActorLoss[
                 comptime total_gss = BB * Self.SA_DIM
                 comptime n_blocks_a = (total_gss + TPB - 1) // TPB
                 c.enqueue_function[_eal_add_into_kernel[total_gss]](
-                    self._mb_grad_sa_sum.lt[
-                        "gpu", Layout.row_major(total_gss)
-                    ](),
-                    self._mb_grad_sa_i.lt["gpu", Layout.row_major(total_gss)](),
+                    self._mb_grad_sa_sum.tt["gpu", total_gss](),
+                    self._mb_grad_sa_i.tt["gpu", total_gss](),
                     grid_dim=n_blocks_a, block_dim=TPB,
                 )
 
@@ -544,12 +542,8 @@ struct EnsembleActorLoss[
                     BB, Self.OBS, Self.ACT, Self.SA_DIM, Self.ALP_DIM,
                 ]
                 c.enqueue_function[build_galp_dev](
-                    self._mb_grad_sa_sum.lt[
-                        "gpu", Layout.row_major(BB, Self.SA_DIM)
-                    ](),
-                    self._mb_grad_alp.lt[
-                        "gpu", Layout.row_major(BB, Self.ALP_DIM)
-                    ](),
+                    self._mb_grad_sa_sum.tt["gpu", BB, Self.SA_DIM](),
+                    self._mb_grad_alp.tt["gpu", BB, Self.ALP_DIM](),
                     inv_b,
                     self._alpha_ptr.value(),
                     grid_dim=n_blocks_g, block_dim=TPB,
@@ -559,12 +553,8 @@ struct EnsembleActorLoss[
                     BB, Self.OBS, Self.ACT, Self.SA_DIM, Self.ALP_DIM,
                 ]
                 c.enqueue_function[build_galp](
-                    self._mb_grad_sa_sum.lt[
-                        "gpu", Layout.row_major(BB, Self.SA_DIM)
-                    ](),
-                    self._mb_grad_alp.lt[
-                        "gpu", Layout.row_major(BB, Self.ALP_DIM)
-                    ](),
+                    self._mb_grad_sa_sum.tt["gpu", BB, Self.SA_DIM](),
+                    self._mb_grad_alp.tt["gpu", BB, Self.ALP_DIM](),
                     grad_lp_val,
                     grid_dim=n_blocks_g, block_dim=TPB,
                 )

@@ -19,7 +19,6 @@ driver calls `plan_gpu` directly with an `[N_ENVS, LATENT]` root and lets it
 write the whole action slab.
 """
 
-from layout import Layout, LayoutTensor
 from max.gpu.host import DeviceContext
 from std.math import tanh
 from max.gpu import global_idx
@@ -35,13 +34,14 @@ from noeira.deep_agents.training.blocks.action_kernels import (
     offpolicy_copy2d_kernel,
     offpolicy_clamp_action_kernel,
 )
+from noeira.core.tiles import Tile
 
 
 def tdmpc2_greedy_action_kernel[
     N_ENVS: Int, ACT: Int, POL: Int
 ](
-    pio: LayoutTensor[DT, Layout.row_major(N_ENVS, POL), MutAnyOrigin],
-    action_out: LayoutTensor[DT, Layout.row_major(N_ENVS, ACT), MutAnyOrigin],
+    pio: Tile[DT, N_ENVS, POL],
+    action_out: Tile[DT, N_ENVS, ACT],
     action_scale: Scalar[DT],
 ):
     """`action = tanh(pio[:, :ACT]) · action_scale` — the deterministic head.
@@ -75,8 +75,8 @@ def tdmpc2_select_action_batched[
     mut z_scr: Tensor,
     mut pio_scr: Tensor,
     mut alp_scr: Tensor,
-    obs: LayoutTensor[DT, Layout.row_major(N_ENVS, OBS), MutAnyOrigin],
-    action: LayoutTensor[DT, Layout.row_major(N_ENVS, ACT), MutAnyOrigin],
+    obs: Tile[DT, N_ENVS, OBS],
+    action: Tile[DT, N_ENVS, ACT],
     action_scale: Scalar[DT],
     explore: Bool,
     ctx: Optional[DeviceContext],
@@ -139,7 +139,7 @@ def tdmpc2_select_action_batched[
         comptime tot_obs = N_ENVS * OBS
         c.enqueue_function[offpolicy_copy2d_kernel[N_ENVS, OBS]](
             obs,
-            ob_scr.lt["gpu", Layout.row_major(N_ENVS, OBS)](),
+            ob_scr.tt["gpu", N_ENVS, OBS](),
             grid_dim=(tot_obs + TPB - 1) // TPB,
             block_dim=TPB,
         )
@@ -158,7 +158,7 @@ def tdmpc2_select_action_batched[
             c.enqueue_function[
                 offpolicy_clamp_action_kernel[N_ENVS, ACT, ACT + 1]
             ](
-                alp_scr.lt["gpu", Layout.row_major(N_ENVS, ACT + 1)](),
+                alp_scr.tt["gpu", N_ENVS, ACT + 1](),
                 action,
                 action_scale,
                 grid_dim=(tot_act + TPB - 1) // TPB,
@@ -168,7 +168,7 @@ def tdmpc2_select_action_batched[
             c.enqueue_function[
                 tdmpc2_greedy_action_kernel[N_ENVS, ACT, POL]
             ](
-                pio_scr.lt["gpu", Layout.row_major(N_ENVS, POL)](),
+                pio_scr.tt["gpu", N_ENVS, POL](),
                 action,
                 action_scale,
                 grid_dim=(tot_act + TPB - 1) // TPB,
@@ -186,7 +186,7 @@ def tdmpc2_encode_batched[
     mut encoder: ENC_M,
     mut ob_scr: Tensor,
     mut z_scr: Tensor,
-    obs: LayoutTensor[DT, Layout.row_major(N_ENVS, OBS), MutAnyOrigin],
+    obs: Tile[DT, N_ENVS, OBS],
     ctx: Optional[DeviceContext],
 ) raises:
     """`z_scr ← encode(obs)` for N envs — the MPPI planner's root latents.
@@ -203,7 +203,7 @@ def tdmpc2_encode_batched[
     comptime tot_obs = N_ENVS * OBS
     c.enqueue_function[offpolicy_copy2d_kernel[N_ENVS, OBS]](
         obs,
-        ob_scr.lt["gpu", Layout.row_major(N_ENVS, OBS)](),
+        ob_scr.tt["gpu", N_ENVS, OBS](),
         grid_dim=(tot_obs + TPB - 1) // TPB,
         block_dim=TPB,
     )

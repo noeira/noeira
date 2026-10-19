@@ -36,7 +36,8 @@ DT). bf16-flow is a follow-up mirroring Conv2D's `ADT` branch.
 
 from max.gpu import global_idx
 from max.gpu.host import DeviceContext
-from layout import Layout, LayoutTensor, TileTensor, row_major
+from layout import TileTensor, row_major
+from noeira.core.tiles import Tile
 from linalg.matmul import matmul as max_matmul
 from noeira.nn.core.splitk_gemm import (
     splitk_path_applies,
@@ -77,8 +78,8 @@ def _scatter_small_kernel[
     BS: Int,
     LAYOUT: Int = LAYOUT_NCHW,
 ](
-    packed: LayoutTensor[DT, Layout.row_major(BS, IC), MutAnyOrigin],
-    out_small: LayoutTensor[DT, Layout.row_major(BATCH, IN_FLAT), MutAnyOrigin],
+    packed: Tile[DT, BS, IC],
+    out_small: Tile[DT, BATCH, IN_FLAT],
 ):
     """Scatter the [BS, IC] GEMM result into the small ("input"-shaped) tensor
     `[BATCH, IC·H·W]`. `packed[b·SI + s, ic] → out_small[b, off(ic,s)]`
@@ -99,8 +100,8 @@ def _addbias_big_kernel[
     OUT_FLAT: Int,
     LAYOUT: Int = LAYOUT_NCHW,
 ](
-    out_big: LayoutTensor[DT, Layout.row_major(BATCH, OUT_FLAT), MutAnyOrigin],
-    bias: LayoutTensor[DT, Layout.row_major(OC), MutAnyOrigin],
+    out_big: Tile[DT, BATCH, OUT_FLAT],
+    bias: Tile[DT, OC],
 ):
     """Add the per-(big)-channel bias to every spatial position of the output."""
     var idx = Int(global_idx.x)
@@ -268,16 +269,16 @@ struct Conv2DTranspose[
                     B, Self.IC_, Self.SI, Self.IN_FLAT, BS, DT, Self.LAYOUT
                 ]
             ](
-                in0.lt["gpu", Layout.row_major(B, Self.IN_FLAT)](),
-                self.xT_t.lt["gpu", Layout.row_major(Self.IC_, BS)](),
+                in0.tt["gpu", B, Self.IN_FLAT](),
+                self.xT_t.tt["gpu", Self.IC_, BS](),
                 grid_dim=nb_xt,
                 block_dim=CONV_TPB,
             )
             # (2) wTT[COLT, IC] = transpose(weight[IC, COLT])
             comptime nb_wt = (Self.IC_ * Self.COLT + CONV_TPB - 1) // CONV_TPB
             c.enqueue_function[_wT_transpose_kernel[Self.IC_, Self.COLT]](
-                self.weight.val.lt["gpu", Layout.row_major(Self.IC_, Self.COLT)](),
-                self.wTT_t.lt["gpu", Layout.row_major(Self.COLT, Self.IC_)](),
+                self.weight.val.tt["gpu", Self.IC_, Self.COLT](),
+                self.wTT_t.tt["gpu", Self.COLT, Self.IC_](),
                 grid_dim=nb_wt,
                 block_dim=CONV_TPB,
             )
@@ -316,8 +317,8 @@ struct Conv2DTranspose[
                     Self.LAYOUT,
                 ]
             ](
-                self.dcolT_t.lt["gpu", Layout.row_major(Self.COLT, BS)](),
-                out.lt["gpu", Layout.row_major(B, Self.OUT_FLAT)](),
+                self.dcolT_t.tt["gpu", Self.COLT, BS](),
+                out.tt["gpu", B, Self.OUT_FLAT](),
                 grid_dim=nb_c2i,
                 block_dim=CONV_DW_TPB,
             )
@@ -328,8 +329,8 @@ struct Conv2DTranspose[
                     B, Self.OC_, Self.SBIG, Self.OUT_FLAT, Self.LAYOUT
                 ]
             ](
-                out.lt["gpu", Layout.row_major(B, Self.OUT_FLAT)](),
-                self.bias.val.lt["gpu", Layout.row_major(Self.OC_)](),
+                out.tt["gpu", B, Self.OUT_FLAT](),
+                self.bias.val.tt["gpu", Self.OC_](),
                 grid_dim=nb_bb,
                 block_dim=CONV_TPB,
             )
@@ -443,8 +444,8 @@ struct Conv2DTranspose[
                     Self.LAYOUT,
                 ]
             ](
-                grad_output.lt["gpu", Layout.row_major(B, Self.OUT_FLAT)](),
-                self.ecol_t.lt["gpu", Layout.row_major(BS, Self.COLT)](),
+                grad_output.tt["gpu", B, Self.OUT_FLAT](),
+                self.ecol_t.tt["gpu", BS, Self.COLT](),
                 grid_dim=nb_ec,
                 block_dim=CONV_TPB,
             )
@@ -465,8 +466,8 @@ struct Conv2DTranspose[
                     B, Self.IC_, Self.SI, Self.IN_FLAT, BS, Self.LAYOUT
                 ]
             ](
-                self.gxp_t.lt["gpu", Layout.row_major(BS, Self.IC_)](),
-                gin.lt["gpu", Layout.row_major(B, Self.IN_FLAT)](),
+                self.gxp_t.tt["gpu", BS, Self.IC_](),
+                gin.tt["gpu", B, Self.IN_FLAT](),
                 grid_dim=nb_sc,
                 block_dim=CONV_TPB,
             )
@@ -477,8 +478,8 @@ struct Conv2DTranspose[
                     B, Self.IC_, Self.SI, Self.IN_FLAT, BS, DT, Self.LAYOUT
                 ]
             ](
-                fin.lt["gpu", Layout.row_major(B, Self.IN_FLAT)](),
-                self.xT_t.lt["gpu", Layout.row_major(Self.IC_, BS)](),
+                fin.tt["gpu", B, Self.IN_FLAT](),
+                self.xT_t.tt["gpu", Self.IC_, BS](),
                 grid_dim=nb_xt,
                 block_dim=CONV_TPB,
             )
@@ -507,8 +508,8 @@ struct Conv2DTranspose[
                 max_matmul[target="gpu"](dW_tmp_tt, xT_tt, ecol2_tt, c)
             comptime nb_acc = (Self.W_SIZE + CONV_TPB - 1) // CONV_TPB
             c.enqueue_function[_accum_kernel[Self.W_SIZE]](
-                self.weight.grd.lt["gpu", Layout.row_major(Self.W_SIZE)](),
-                self.dW_tmp.lt["gpu", Layout.row_major(Self.W_SIZE)](),
+                self.weight.grd.tt["gpu", Self.W_SIZE](),
+                self.dW_tmp.tt["gpu", Self.W_SIZE](),
                 grid_dim=nb_acc,
                 block_dim=CONV_TPB,
             )
@@ -524,8 +525,8 @@ struct Conv2DTranspose[
                     Self.LAYOUT,
                 ]
             ](
-                grad_output.lt["gpu", Layout.row_major(B, Self.OUT_FLAT)](),
-                self.bias.grd.lt["gpu", Layout.row_major(Self.OC_)](),
+                grad_output.tt["gpu", B, Self.OUT_FLAT](),
+                self.bias.grd.tt["gpu", Self.OC_](),
                 grid_dim=Self.OC_,
                 block_dim=CONV_DW_TPB,
             )

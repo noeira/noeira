@@ -44,7 +44,6 @@ function (like `run_muzero_selfplay_2p_cpu`) rather than on the single-player
 from std.math import exp, log
 from std.memory import alloc
 from max.gpu.host import DeviceContext, DeviceBuffer
-from layout import Layout, LayoutTensor
 
 from noeira.nn.constants import DT
 from noeira.nn.core.module import Module
@@ -79,6 +78,7 @@ from ..zero.prioritized_sequence_replay_mcts import (
 from ..zero.symmetries import BoardAugmenter, IdentityAugmenter
 from ..zero.evaluators import GPUEvaluator, RandomOpponent
 from ..zero.temperature import visit_temperature
+from noeira.core.tiles import tile
 
 
 def _a(n: Int) -> Pointer[Scalar[DT], MutAnyOrigin]:
@@ -187,9 +187,7 @@ def _mz_search_argmax[
     ctx.enqueue_copy(planner.legal_mask_view(), legal_dev)
     # `obs_dev` is an immutable param; the planner ABI wants `MutAnyOrigin`.
     # Read-only root observations — cast restores the pre-nightly typing.
-    var obs_t = LayoutTensor[DT, Layout.row_major(N, RA.OBS_DIM), MutAnyOrigin](
-        obs_dev.unsafe_ptr().as_unsafe_any_origin().unsafe_mut_cast[True]()
-    )
+    var obs_t = tile[N, RA.OBS_DIM](obs_dev.unsafe_ptr().as_unsafe_any_origin().unsafe_mut_cast[True]())
     planner.search_gpu[RA, DA, PA](
         ctx, rep_a, dyn_a, pred_a, obs_t,
         apply_legal=True, k_actual=MAX_K, rng_seed=rng_seed,
@@ -917,9 +915,7 @@ def run_muzero_selfplay_arena_gumbel_2p[
         dyn.set_attr["training"](Scalar[DT](0.0))
         pred.set_attr["training"](Scalar[DT](0.0))
         ctx.enqueue_copy(planner.legal_mask_view(), legal_dev)
-        var obs_t = LayoutTensor[DT, Layout.row_major(N_ENVS, OBS), MutAnyOrigin](
-            obs_dev.unsafe_ptr().as_unsafe_any_origin()
-        )
+        var obs_t = tile[N_ENVS, OBS](obs_dev.unsafe_ptr().as_unsafe_any_origin())
         comptime if USE_MCTS_CUDA_GRAPH:
             planner.search_gpu_captured[
                 type_of(rep_a), type_of(dyn_a), type_of(pred_a),
@@ -1292,9 +1288,7 @@ def run_muzero_selfplay_arena_gumbel_2p[
                 )
                 ctx.enqueue_copy(d_reana_legal, h_reana_legal)
                 ctx.enqueue_copy(planner.legal_mask_view(), d_reana_legal)
-                var reana_t = LayoutTensor[
-                    DT, Layout.row_major(N_ENVS, OBS), MutAnyOrigin
-                ](d_reana.unsafe_ptr().as_unsafe_any_origin())
+                var reana_t = tile[N_ENVS, OBS](d_reana.unsafe_ptr().as_unsafe_any_origin())
                 comptime if USE_MCTS_CUDA_GRAPH:
                     planner.search_gpu_captured[
                         type_of(rep_ta), type_of(dyn_ta), type_of(pred_ta),

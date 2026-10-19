@@ -21,7 +21,6 @@ Reference: gymnasium/envs/box2d/car_racing.py.
 
 from std.math import sqrt, sin, cos
 from std.memory import alloc
-from layout import Layout, LayoutTensor
 
 from noeira.render import (
     Renderer2D,
@@ -61,6 +60,7 @@ from .constants import CRConstants
 from .car_racing_pixel import CarRacingPixel
 from .state import CarRacingState
 from .action import CarRacingAction
+from noeira.core.tiles import Tile, tile
 
 
 struct CarRacingMB[DTYPE: DType, PIXEL_OBS: Bool = False, PIX_RES: Int = 84](
@@ -196,27 +196,11 @@ struct CarRacingMB[DTYPE: DType, PIXEL_OBS: Bool = False, PIX_RES: Int = 84](
         self._pixel_idx = move._pixel_idx
 
     # --- internal tensor views -------------------------------------------
-    def _state(self) -> LayoutTensor[
-        dtype, Layout.row_major(1, Self.STATE_SIZE), MutAnyOrigin
-    ]:
-        return LayoutTensor[
-            dtype, Layout.row_major(1, Self.STATE_SIZE), MutAnyOrigin
-        ](
-            rebind[Pointer[Scalar[dtype], MutAnyOrigin]](
-                self.state_buffer.unsafe_ptr()
-            )
-        )
+    def _state(self) -> Tile[dtype, 1, Self.STATE_SIZE]:
+        return tile[1, Self.STATE_SIZE](rebind[Pointer[Scalar[dtype], MutAnyOrigin]]( self.state_buffer.unsafe_ptr() ))
 
-    def _tiles(self) -> LayoutTensor[
-        dtype, Layout.row_major(Self.MAX_TILES, TILE_DATA_SIZE), MutAnyOrigin
-    ]:
-        return LayoutTensor[
-            dtype, Layout.row_major(Self.MAX_TILES, TILE_DATA_SIZE), MutAnyOrigin
-        ](
-            rebind[Pointer[Scalar[dtype], MutAnyOrigin]](
-                self.tiles_buffer.unsafe_ptr()
-            )
-        )
+    def _tiles(self) -> Tile[dtype, Self.MAX_TILES, TILE_DATA_SIZE]:
+        return tile[Self.MAX_TILES, TILE_DATA_SIZE](rebind[Pointer[Scalar[dtype], MutAnyOrigin]]( self.tiles_buffer.unsafe_ptr() ))
 
     # --- API --------------------------------------------------------------
     def obs_dim(self) -> Int:

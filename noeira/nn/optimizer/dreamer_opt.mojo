@@ -51,13 +51,13 @@ from std.math import sqrt
 from max.gpu import global_idx, thread_idx, block_idx
 from max.gpu.primitives import block
 from max.gpu.host import DeviceContext
-from layout import Layout, LayoutTensor
 
 from noeira.nn.constants import DT, TPB
 from ..core.tensor import Tensor
 from ..core.param import ParamVisitor, walk_params, ParamVisitorRT
 from ..core.param import ParamWalkable
 from .optimizer import Optimizer
+from noeira.core.tiles import RowMajor, Tile
 
 
 comptime AGC_TPB: Int = 128   # per-block reduction width
@@ -74,7 +74,7 @@ def _agc_partials_kernel_rt(
     param: Pointer[Scalar[DT], MutAnyOrigin],
     grad: Pointer[Scalar[DT], MutAnyOrigin],
     n_arg: Int64,
-    partials: LayoutTensor[DT, Layout.row_major(2 * AGC_MAXB), MutAnyOrigin],
+    partials: Tile[DT, 2 * AGC_MAXB],
 ):
     """Pass A with the length at RUNTIME (one kernel for every Param; reached
     through `ParamVisitorRef`): AGC_MAXB blocks each strided-sum a chunk of
@@ -100,8 +100,8 @@ def _agc_partials_kernel_rt(
 
 
 def _agc_finalize_kernel(
-    partials: LayoutTensor[DT, Layout.row_major(2 * AGC_MAXB), MutAnyOrigin],
-    scale_buf: LayoutTensor[DT, Layout.row_major(1), MutAnyOrigin],
+    partials: Tile[DT, 2 * AGC_MAXB],
+    scale_buf: Tile[DT, 1],
     agc_clip: Scalar[DT],
     agc_pmin: Scalar[DT],
 ):
@@ -134,12 +134,12 @@ def _dreamer_update_kernel_rt(
     m: Pointer[Scalar[DT], MutAnyOrigin],  # mu (momentum)
     v: Pointer[Scalar[DT], MutAnyOrigin],  # nu (rms)
     n_arg: Int64,
-    scale_buf: LayoutTensor[DT, Layout.row_major(1), MutAnyOrigin],
+    scale_buf: Tile[DT, 1],
     lr: Scalar[DT],
     beta1: Scalar[DT],
     beta2: Scalar[DT],
     eps: Scalar[DT],
-    powbuf: LayoutTensor[DT, Layout.row_major(2), MutAnyOrigin],
+    powbuf: Tile[DT, 2],
 ):
     """rms → momentum → lr with the length at RUNTIME; the AGC scale is read
     from `scale_buf[0]` and `bc1/bc2 = 1 − β^t` from the device `powbuf` so
@@ -163,7 +163,7 @@ def _dreamer_update_kernel_rt(
 
 
 def _dreamer_advance_pow_kernel(
-    powbuf: LayoutTensor[DT, Layout.row_major(2), MutAnyOrigin],
+    powbuf: Tile[DT, 2],
     beta1: Scalar[DT],
     beta2: Scalar[DT],
 ):
@@ -250,7 +250,7 @@ struct DreamerOpt(Movable, ParamVisitor, ParamVisitorRT, Optimizer):
             self._pow_dev = Tensor.alloc_gpu(ctx, 2)
             self._pow_dev.dev.value().enqueue_fill(Scalar[DT](1.0))
         ctx.enqueue_function[_dreamer_advance_pow_kernel](
-            self._pow_dev.lt["gpu", Layout.row_major(2)](),
+            self._pow_dev.tt["gpu", 2](),
             self.beta1, self.beta2, grid_dim=1, block_dim=1,
         )
 
@@ -330,20 +330,20 @@ struct DreamerOpt(Movable, ParamVisitor, ParamVisitorRT, Optimizer):
                 self._scale = Tensor.alloc_gpu(c, 1)
             if not self._agc_partials.dev:
                 self._agc_partials = Tensor.alloc_gpu(c, 2 * AGC_MAXB)
-            comptime players = Layout.row_major(2 * AGC_MAXB)
+            comptime players = RowMajor[2 * AGC_MAXB]
             # Pass A: multi-block partial ‖grad‖²/‖param‖² → _agc_partials.
             c.enqueue_function[_agc_partials_kernel_rt](
                 param.dev.value(),
                 grad.dev.value(),
                 Int64(n),
-                self._agc_partials.lt["gpu", players](),
+                self._agc_partials.tt["gpu", 2 * AGC_MAXB](),
                 grid_dim=AGC_MAXB,
                 block_dim=AGC_TPB,
             )
             # Pass A2: reduce partials → per-leaf AGC scale → _scale[0].
             c.enqueue_function[_agc_finalize_kernel](
-                self._agc_partials.lt["gpu", players](),
-                self._scale.lt["gpu", Layout.row_major(1)](),
+                self._agc_partials.tt["gpu", 2 * AGC_MAXB](),
+                self._scale.tt["gpu", 1](),
                 self.agc_clip,
                 self.agc_pmin,
                 grid_dim=1,
@@ -358,12 +358,12 @@ struct DreamerOpt(Movable, ParamVisitor, ParamVisitorRT, Optimizer):
                 m.dev.value(),
                 v.dev.value(),
                 Int64(n),
-                self._scale.lt["gpu", Layout.row_major(1)](),
+                self._scale.tt["gpu", 1](),
                 self.lr,
                 self.beta1,
                 self.beta2,
                 self.eps,
-                self._pow_dev.lt["gpu", Layout.row_major(2)](),
+                self._pow_dev.tt["gpu", 2](),
                 grid_dim=nblk,
                 block_dim=TPB,
             )

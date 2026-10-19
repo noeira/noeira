@@ -29,7 +29,6 @@ are categorical over `[v_min, v_max]` — keep those in sync with the config.
 
 from noeira.nn.core.ptr import untracked
 from max.gpu.host import DeviceContext
-from layout import Layout, LayoutTensor
 
 from noeira.nn.constants import DT
 from noeira.nn.core.module import Module
@@ -51,6 +50,7 @@ from .selfplay_gpu import run_muzero_selfplay_gpu, mz_sync_gpu_to_cpu
 from .selfplay_gpu_device import run_muzero_gumbel_selfplay_gpu
 from ..zero.mcts_adapters_mz_cpu import MZRepCPU, MZDynCPU, MZPredCPU
 from ..zero.mcts_adapters_mz import MZRepGPU, MZDynGPU, MZPredGPU
+from noeira.core.tiles import tile
 
 
 @fieldwise_init
@@ -293,9 +293,7 @@ struct MuZeroAgent[
                     for j in range(Self.OBS):
                         h_obs[j] = Scalar[DT](eo_f[j])
                     c.enqueue_copy(d_obs, h_obs.unsafe_ptr())  # H2D (sanctioned)
-                    var obs_t = LayoutTensor[
-                        DT, Layout.row_major(1, Self.OBS), MutAnyOrigin
-                    ](d_obs)
+                    var obs_t = tile[1, Self.OBS](d_obs)
                     planner.search_gpu[
                         type_of(rep_a), type_of(dyn_a), type_of(pred_a)
                     ](c, rep_a, dyn_a, pred_a, obs_t,

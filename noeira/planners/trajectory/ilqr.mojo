@@ -41,7 +41,6 @@ increase it on failure. Line search is plain backtracking on
 """
 
 from max.gpu.host import DeviceContext, DeviceBuffer, HostBuffer
-from layout import Layout, LayoutTensor
 
 from noeira.nn.constants import DT as dtype
 
@@ -56,6 +55,7 @@ from .ilqr_kernels import (
     ilqr_backward_pass_kernel,
     ilqr_accept_kernel,
 )
+from noeira.core.tiles import Tile, tile
 
 # =============================================================================
 # Module-level scalar matrix helpers (CPU, List[Float64] interface)
@@ -915,9 +915,7 @@ struct ILQRGPUBatched[
         mut self,
         ctx: DeviceContext,
         mut callback: CB,
-        z0: LayoutTensor[
-            dtype, Layout.row_major(Self._N, Self._L), MutAnyOrigin
-        ],
+        z0: Tile[dtype, Self._N, Self._L],
         warm_start: Bool = False,
     ) raises:
         """Run batched iLQR with global μ / α schedule.
@@ -998,14 +996,9 @@ struct ILQRGPUBatched[
     def _copy_z0(
         mut self,
         ctx: DeviceContext,
-        z0: LayoutTensor[
-            dtype, Layout.row_major(Self._N, Self._L), MutAnyOrigin
-        ],
+        z0: Tile[dtype, Self._N, Self._L],
     ) raises:
-        var z_seq_view = LayoutTensor[
-            dtype,
-            Layout.row_major(Self._N * Self._L),
-        ](self.z_seq_buf)
+        var z_seq_view = tile[Self._N * Self._L](self.z_seq_buf)
         ctx.enqueue_function[ilqr_copy_z0_kernel[dtype, Self._N, Self._L]](
             z0,
             z_seq_view,
@@ -1016,14 +1009,9 @@ struct ILQRGPUBatched[
     def _copy_z0_trial(
         mut self,
         ctx: DeviceContext,
-        z0: LayoutTensor[
-            dtype, Layout.row_major(Self._N, Self._L), MutAnyOrigin
-        ],
+        z0: Tile[dtype, Self._N, Self._L],
     ) raises:
-        var z_trial_view = LayoutTensor[
-            dtype,
-            Layout.row_major(Self._N * Self._L),
-        ](self.z_trial_buf)
+        var z_trial_view = tile[Self._N * Self._L](self.z_trial_buf)
         ctx.enqueue_function[ilqr_copy_z0_kernel[dtype, Self._N, Self._L]](
             z0,
             z_trial_view,
@@ -1039,61 +1027,24 @@ struct ILQRGPUBatched[
         """
         for t in range(Self._T):
             var z_t = rebind[
-                LayoutTensor[
-                    dtype,
-                    Layout.row_major(Self._N, CB.LATENT_DIM),
-                    MutAnyOrigin,
-                ]
+                Tile[dtype, Self._N, CB.LATENT_DIM]
             ](
-                LayoutTensor[
-                    dtype,
-                    Layout.row_major(Self._N, Self._L),
-                ](
-                    self.z_seq_buf.create_sub_buffer[dtype](
-                        t * Self._N * Self._L, Self._N * Self._L
-                    )
-                )
+                tile[Self._N, Self._L](self.z_seq_buf.create_sub_buffer[dtype]( t * Self._N * Self._L, Self._N * Self._L ))
             )
             var u_t = rebind[
-                LayoutTensor[
-                    dtype,
-                    Layout.row_major(Self._N, CB.ACTION_DIM),
-                    MutAnyOrigin,
-                ]
+                Tile[dtype, Self._N, CB.ACTION_DIM]
             ](
-                LayoutTensor[
-                    dtype,
-                    Layout.row_major(Self._N, Self._A),
-                ](
-                    self.U_buf.create_sub_buffer[dtype](
-                        t * Self._N * Self._A, Self._N * Self._A
-                    )
-                )
+                tile[Self._N, Self._A](self.U_buf.create_sub_buffer[dtype]( t * Self._N * Self._A, Self._N * Self._A ))
             )
             var z_next = rebind[
-                LayoutTensor[
-                    dtype,
-                    Layout.row_major(Self._N, CB.LATENT_DIM),
-                    MutAnyOrigin,
-                ]
+                Tile[dtype, Self._N, CB.LATENT_DIM]
             ](
-                LayoutTensor[
-                    dtype,
-                    Layout.row_major(Self._N, Self._L),
-                ](
-                    self.z_seq_buf.create_sub_buffer[dtype](
-                        (t + 1) * Self._N * Self._L, Self._N * Self._L
-                    )
-                )
+                tile[Self._N, Self._L](self.z_seq_buf.create_sub_buffer[dtype]( (t + 1) * Self._N * Self._L, Self._N * Self._L ))
             )
             var c_t = rebind[
-                LayoutTensor[dtype, Layout.row_major(Self._N), MutAnyOrigin]
+                Tile[dtype, Self._N]
             ](
-                LayoutTensor[dtype, Layout.row_major(Self._N)](
-                    self.step_cost_buf.create_sub_buffer[dtype](
-                        t * Self._N, Self._N
-                    )
-                )
+                tile[Self._N](self.step_cost_buf.create_sub_buffer[dtype]( t * Self._N, Self._N ))
             )
             callback.step_gpu[Self._N](ctx, z_t, u_t, z_next, c_t)
 
@@ -1103,100 +1054,48 @@ struct ILQRGPUBatched[
         CB: RolloutJacobianCallbackGPU
     ](mut self, ctx: DeviceContext, mut callback: CB,) raises:
         var z_T = rebind[
-            LayoutTensor[
-                dtype,
-                Layout.row_major(Self._N, CB.LATENT_DIM),
-                MutAnyOrigin,
-            ]
+            Tile[dtype, Self._N, CB.LATENT_DIM]
         ](
-            LayoutTensor[dtype, Layout.row_major(Self._N, Self._L)](
-                self.z_seq_buf.create_sub_buffer[dtype](
-                    Self._T * Self._N * Self._L, Self._N * Self._L
-                )
-            )
+            tile[Self._N, Self._L](self.z_seq_buf.create_sub_buffer[dtype]( Self._T * Self._N * Self._L, Self._N * Self._L ))
         )
         var Vz = rebind[
-            LayoutTensor[
-                dtype,
-                Layout.row_major(Self._N, CB.LATENT_DIM),
-                MutAnyOrigin,
-            ]
+            Tile[dtype, Self._N, CB.LATENT_DIM]
         ](
-            LayoutTensor[dtype, Layout.row_major(Self._N, Self._L)](
-                self.V_z_term_buf
-            )
+            tile[Self._N, Self._L](self.V_z_term_buf)
         )
         var Vzz = rebind[
-            LayoutTensor[
-                dtype,
-                Layout.row_major(Self._N, CB.LATENT_DIM, CB.LATENT_DIM),
-                MutAnyOrigin,
-            ]
+            Tile[dtype, Self._N, CB.LATENT_DIM, CB.LATENT_DIM]
         ](
-            LayoutTensor[
-                dtype,
-                Layout.row_major(Self._N, Self._L, Self._L),
-            ](self.V_zz_term_buf)
+            tile[Self._N, Self._L, Self._L](self.V_zz_term_buf)
         )
-        var term = LayoutTensor[dtype, Layout.row_major(Self._N)](
-            self.term_cost_buf
-        )
+        var term = tile[Self._N](self.term_cost_buf)
         callback.terminal_gpu[Self._N](ctx, z_T, Vz, Vzz, term)
 
     def _terminal_on_z_trial[
         CB: RolloutJacobianCallbackGPU
     ](mut self, ctx: DeviceContext, mut callback: CB,) raises:
         var z_T = rebind[
-            LayoutTensor[
-                dtype,
-                Layout.row_major(Self._N, CB.LATENT_DIM),
-                MutAnyOrigin,
-            ]
+            Tile[dtype, Self._N, CB.LATENT_DIM]
         ](
-            LayoutTensor[dtype, Layout.row_major(Self._N, Self._L)](
-                self.z_trial_buf.create_sub_buffer[dtype](
-                    Self._T * Self._N * Self._L, Self._N * Self._L
-                )
-            )
+            tile[Self._N, Self._L](self.z_trial_buf.create_sub_buffer[dtype]( Self._T * Self._N * Self._L, Self._N * Self._L ))
         )
         var Vz = rebind[
-            LayoutTensor[
-                dtype,
-                Layout.row_major(Self._N, CB.LATENT_DIM),
-                MutAnyOrigin,
-            ]
+            Tile[dtype, Self._N, CB.LATENT_DIM]
         ](
-            LayoutTensor[dtype, Layout.row_major(Self._N, Self._L)](
-                self.V_z_term_buf
-            )
+            tile[Self._N, Self._L](self.V_z_term_buf)
         )
         var Vzz = rebind[
-            LayoutTensor[
-                dtype,
-                Layout.row_major(Self._N, CB.LATENT_DIM, CB.LATENT_DIM),
-                MutAnyOrigin,
-            ]
+            Tile[dtype, Self._N, CB.LATENT_DIM, CB.LATENT_DIM]
         ](
-            LayoutTensor[
-                dtype,
-                Layout.row_major(Self._N, Self._L, Self._L),
-            ](self.V_zz_term_buf)
+            tile[Self._N, Self._L, Self._L](self.V_zz_term_buf)
         )
-        var term = LayoutTensor[dtype, Layout.row_major(Self._N)](
-            self.term_cost_buf
-        )
+        var term = tile[Self._N](self.term_cost_buf)
         callback.terminal_gpu[Self._N](ctx, z_T, Vz, Vzz, term)
 
     def _reduce_total_cost(mut self, ctx: DeviceContext) raises:
-        var step_view = LayoutTensor[
-            dtype, Layout.row_major(Self._T * Self._N)
-        ](self.step_cost_buf)
-        var term_view = LayoutTensor[dtype, Layout.row_major(Self._N)](
-            self.term_cost_buf
-        )
-        var out_view = LayoutTensor[dtype, Layout.row_major(Self._N)](
-            self.total_cost_buf
-        )
+        var step_view = tile[Self._T * Self._N](self.step_cost_buf)
+        var term_view = tile[Self._N](self.term_cost_buf)
+        var out_view = tile[Self._N](self.total_cost_buf)
         ctx.enqueue_function[ilqr_reduce_cost_kernel[dtype, Self._T, Self._N]](
             step_view,
             term_view,
@@ -1206,15 +1105,9 @@ struct ILQRGPUBatched[
         )
 
     def _reduce_trial_cost(mut self, ctx: DeviceContext) raises:
-        var step_view = LayoutTensor[
-            dtype, Layout.row_major(Self._T * Self._N)
-        ](self.step_cost_buf)
-        var term_view = LayoutTensor[dtype, Layout.row_major(Self._N)](
-            self.term_cost_buf
-        )
-        var out_view = LayoutTensor[dtype, Layout.row_major(Self._N)](
-            self.trial_cost_buf
-        )
+        var step_view = tile[Self._T * Self._N](self.step_cost_buf)
+        var term_view = tile[Self._N](self.term_cost_buf)
+        var out_view = tile[Self._N](self.trial_cost_buf)
         ctx.enqueue_function[ilqr_reduce_cost_kernel[dtype, Self._T, Self._N]](
             step_view,
             term_view,
@@ -1228,148 +1121,49 @@ struct ILQRGPUBatched[
     ](mut self, ctx: DeviceContext, mut callback: CB,) raises:
         for t in range(Self._T):
             var z_t = rebind[
-                LayoutTensor[
-                    dtype,
-                    Layout.row_major(Self._N, CB.LATENT_DIM),
-                    MutAnyOrigin,
-                ]
+                Tile[dtype, Self._N, CB.LATENT_DIM]
             ](
-                LayoutTensor[
-                    dtype,
-                    Layout.row_major(Self._N, Self._L),
-                ](
-                    self.z_seq_buf.create_sub_buffer[dtype](
-                        t * Self._N * Self._L, Self._N * Self._L
-                    )
-                )
+                tile[Self._N, Self._L](self.z_seq_buf.create_sub_buffer[dtype]( t * Self._N * Self._L, Self._N * Self._L ))
             )
             var u_t = rebind[
-                LayoutTensor[
-                    dtype,
-                    Layout.row_major(Self._N, CB.ACTION_DIM),
-                    MutAnyOrigin,
-                ]
+                Tile[dtype, Self._N, CB.ACTION_DIM]
             ](
-                LayoutTensor[
-                    dtype,
-                    Layout.row_major(Self._N, Self._A),
-                ](
-                    self.U_buf.create_sub_buffer[dtype](
-                        t * Self._N * Self._A, Self._N * Self._A
-                    )
-                )
+                tile[Self._N, Self._A](self.U_buf.create_sub_buffer[dtype]( t * Self._N * Self._A, Self._N * Self._A ))
             )
             var A_t = rebind[
-                LayoutTensor[
-                    dtype,
-                    Layout.row_major(Self._N, CB.LATENT_DIM, CB.LATENT_DIM),
-                    MutAnyOrigin,
-                ]
+                Tile[dtype, Self._N, CB.LATENT_DIM, CB.LATENT_DIM]
             ](
-                LayoutTensor[
-                    dtype,
-                    Layout.row_major(Self._N, Self._L, Self._L),
-                ](
-                    self.A_seq_buf.create_sub_buffer[dtype](
-                        t * Self._N * Self._LL, Self._N * Self._LL
-                    )
-                )
+                tile[Self._N, Self._L, Self._L](self.A_seq_buf.create_sub_buffer[dtype]( t * Self._N * Self._LL, Self._N * Self._LL ))
             )
             var B_t = rebind[
-                LayoutTensor[
-                    dtype,
-                    Layout.row_major(Self._N, CB.LATENT_DIM, CB.ACTION_DIM),
-                    MutAnyOrigin,
-                ]
+                Tile[dtype, Self._N, CB.LATENT_DIM, CB.ACTION_DIM]
             ](
-                LayoutTensor[
-                    dtype,
-                    Layout.row_major(Self._N, Self._L, Self._A),
-                ](
-                    self.B_seq_buf.create_sub_buffer[dtype](
-                        t * Self._N * Self._LA, Self._N * Self._LA
-                    )
-                )
+                tile[Self._N, Self._L, Self._A](self.B_seq_buf.create_sub_buffer[dtype]( t * Self._N * Self._LA, Self._N * Self._LA ))
             )
             var lz_t = rebind[
-                LayoutTensor[
-                    dtype,
-                    Layout.row_major(Self._N, CB.LATENT_DIM),
-                    MutAnyOrigin,
-                ]
+                Tile[dtype, Self._N, CB.LATENT_DIM]
             ](
-                LayoutTensor[
-                    dtype,
-                    Layout.row_major(Self._N, Self._L),
-                ](
-                    self.l_z_seq_buf.create_sub_buffer[dtype](
-                        t * Self._N * Self._L, Self._N * Self._L
-                    )
-                )
+                tile[Self._N, Self._L](self.l_z_seq_buf.create_sub_buffer[dtype]( t * Self._N * Self._L, Self._N * Self._L ))
             )
             var lu_t = rebind[
-                LayoutTensor[
-                    dtype,
-                    Layout.row_major(Self._N, CB.ACTION_DIM),
-                    MutAnyOrigin,
-                ]
+                Tile[dtype, Self._N, CB.ACTION_DIM]
             ](
-                LayoutTensor[
-                    dtype,
-                    Layout.row_major(Self._N, Self._A),
-                ](
-                    self.l_u_seq_buf.create_sub_buffer[dtype](
-                        t * Self._N * Self._A, Self._N * Self._A
-                    )
-                )
+                tile[Self._N, Self._A](self.l_u_seq_buf.create_sub_buffer[dtype]( t * Self._N * Self._A, Self._N * Self._A ))
             )
             var lzz_t = rebind[
-                LayoutTensor[
-                    dtype,
-                    Layout.row_major(Self._N, CB.LATENT_DIM, CB.LATENT_DIM),
-                    MutAnyOrigin,
-                ]
+                Tile[dtype, Self._N, CB.LATENT_DIM, CB.LATENT_DIM]
             ](
-                LayoutTensor[
-                    dtype,
-                    Layout.row_major(Self._N, Self._L, Self._L),
-                ](
-                    self.l_zz_seq_buf.create_sub_buffer[dtype](
-                        t * Self._N * Self._LL, Self._N * Self._LL
-                    )
-                )
+                tile[Self._N, Self._L, Self._L](self.l_zz_seq_buf.create_sub_buffer[dtype]( t * Self._N * Self._LL, Self._N * Self._LL ))
             )
             var luu_t = rebind[
-                LayoutTensor[
-                    dtype,
-                    Layout.row_major(Self._N, CB.ACTION_DIM, CB.ACTION_DIM),
-                    MutAnyOrigin,
-                ]
+                Tile[dtype, Self._N, CB.ACTION_DIM, CB.ACTION_DIM]
             ](
-                LayoutTensor[
-                    dtype,
-                    Layout.row_major(Self._N, Self._A, Self._A),
-                ](
-                    self.l_uu_seq_buf.create_sub_buffer[dtype](
-                        t * Self._N * Self._AA, Self._N * Self._AA
-                    )
-                )
+                tile[Self._N, Self._A, Self._A](self.l_uu_seq_buf.create_sub_buffer[dtype]( t * Self._N * Self._AA, Self._N * Self._AA ))
             )
             var lzu_t = rebind[
-                LayoutTensor[
-                    dtype,
-                    Layout.row_major(Self._N, CB.LATENT_DIM, CB.ACTION_DIM),
-                    MutAnyOrigin,
-                ]
+                Tile[dtype, Self._N, CB.LATENT_DIM, CB.ACTION_DIM]
             ](
-                LayoutTensor[
-                    dtype,
-                    Layout.row_major(Self._N, Self._L, Self._A),
-                ](
-                    self.l_zu_seq_buf.create_sub_buffer[dtype](
-                        t * Self._N * Self._LA, Self._N * Self._LA
-                    )
-                )
+                tile[Self._N, Self._L, Self._A](self.l_zu_seq_buf.create_sub_buffer[dtype]( t * Self._N * Self._LA, Self._N * Self._LA ))
             )
             callback.linearize_gpu[Self._N](
                 ctx, z_t, u_t, A_t, B_t, lz_t, lu_t, lzz_t, luu_t, lzu_t
@@ -1378,51 +1172,18 @@ struct ILQRGPUBatched[
         self._terminal_on_z_seq(ctx, callback)
 
     def _backward_pass(mut self, ctx: DeviceContext, mu: Float64) raises:
-        var A_view = LayoutTensor[
-            dtype,
-            Layout.row_major(Self._T * Self._N * Self._LL),
-        ](self.A_seq_buf)
-        var B_view = LayoutTensor[
-            dtype,
-            Layout.row_major(Self._T * Self._N * Self._LA),
-        ](self.B_seq_buf)
-        var lz_view = LayoutTensor[
-            dtype,
-            Layout.row_major(Self._T * Self._N * Self._L),
-        ](self.l_z_seq_buf)
-        var lu_view = LayoutTensor[
-            dtype,
-            Layout.row_major(Self._T * Self._N * Self._A),
-        ](self.l_u_seq_buf)
-        var lzz_view = LayoutTensor[
-            dtype,
-            Layout.row_major(Self._T * Self._N * Self._LL),
-        ](self.l_zz_seq_buf)
-        var luu_view = LayoutTensor[
-            dtype,
-            Layout.row_major(Self._T * Self._N * Self._AA),
-        ](self.l_uu_seq_buf)
-        var lzu_view = LayoutTensor[
-            dtype,
-            Layout.row_major(Self._T * Self._N * Self._LA),
-        ](self.l_zu_seq_buf)
-        var Vz_view = LayoutTensor[dtype, Layout.row_major(Self._N * Self._L)](
-            self.V_z_term_buf
-        )
-        var Vzz_view = LayoutTensor[
-            dtype, Layout.row_major(Self._N * Self._LL)
-        ](self.V_zz_term_buf)
-        var K_view = LayoutTensor[
-            dtype,
-            Layout.row_major(Self._T * Self._N * Self._LA),
-        ](self.K_seq_buf)
-        var k_view = LayoutTensor[
-            dtype,
-            Layout.row_major(Self._T * Self._N * Self._A),
-        ](self.k_seq_buf)
-        var bw_view = LayoutTensor[DType.int32, Layout.row_major(Self._N)](
-            self.bw_ok_buf
-        )
+        var A_view = tile[Self._T * Self._N * Self._LL](self.A_seq_buf)
+        var B_view = tile[Self._T * Self._N * Self._LA](self.B_seq_buf)
+        var lz_view = tile[Self._T * Self._N * Self._L](self.l_z_seq_buf)
+        var lu_view = tile[Self._T * Self._N * Self._A](self.l_u_seq_buf)
+        var lzz_view = tile[Self._T * Self._N * Self._LL](self.l_zz_seq_buf)
+        var luu_view = tile[Self._T * Self._N * Self._AA](self.l_uu_seq_buf)
+        var lzu_view = tile[Self._T * Self._N * Self._LA](self.l_zu_seq_buf)
+        var Vz_view = tile[Self._N * Self._L](self.V_z_term_buf)
+        var Vzz_view = tile[Self._N * Self._LL](self.V_zz_term_buf)
+        var K_view = tile[Self._T * Self._N * Self._LA](self.K_seq_buf)
+        var k_view = tile[Self._T * Self._N * Self._A](self.k_seq_buf)
+        var bw_view = tile[Self._N](self.bw_ok_buf)
         ctx.enqueue_function[
             ilqr_backward_pass_kernel[dtype, Self._N, Self._T, Self._L, Self._A]
         ](
@@ -1446,30 +1207,12 @@ struct ILQRGPUBatched[
     def _forward_with_gains[
         CB: RolloutJacobianCallbackGPU
     ](mut self, ctx: DeviceContext, mut callback: CB, alpha: Float64,) raises:
-        var U_view = LayoutTensor[
-            dtype,
-            Layout.row_major(Self._T * Self._N * Self._A),
-        ](self.U_buf)
-        var k_view = LayoutTensor[
-            dtype,
-            Layout.row_major(Self._T * Self._N * Self._A),
-        ](self.k_seq_buf)
-        var K_view = LayoutTensor[
-            dtype,
-            Layout.row_major(Self._T * Self._N * Self._LA),
-        ](self.K_seq_buf)
-        var zseq_view = LayoutTensor[
-            dtype,
-            Layout.row_major((Self._T + 1) * Self._N * Self._L),
-        ](self.z_seq_buf)
-        var ztrial_view = LayoutTensor[
-            dtype,
-            Layout.row_major((Self._T + 1) * Self._N * Self._L),
-        ](self.z_trial_buf)
-        var Utrial_view = LayoutTensor[
-            dtype,
-            Layout.row_major(Self._T * Self._N * Self._A),
-        ](self.U_trial_buf)
+        var U_view = tile[Self._T * Self._N * Self._A](self.U_buf)
+        var k_view = tile[Self._T * Self._N * Self._A](self.k_seq_buf)
+        var K_view = tile[Self._T * Self._N * Self._LA](self.K_seq_buf)
+        var zseq_view = tile[(Self._T + 1) * Self._N * Self._L](self.z_seq_buf)
+        var ztrial_view = tile[(Self._T + 1) * Self._N * Self._L](self.z_trial_buf)
+        var Utrial_view = tile[Self._T * Self._N * Self._A](self.U_trial_buf)
         for t in range(Self._T):
             ctx.enqueue_function[
                 ilqr_apply_control_update_kernel[
@@ -1488,89 +1231,36 @@ struct ILQRGPUBatched[
                 block_dim=Self._A,
             )
             var z_t = rebind[
-                LayoutTensor[
-                    dtype,
-                    Layout.row_major(Self._N, CB.LATENT_DIM),
-                    MutAnyOrigin,
-                ]
+                Tile[dtype, Self._N, CB.LATENT_DIM]
             ](
-                LayoutTensor[
-                    dtype,
-                    Layout.row_major(Self._N, Self._L),
-                ](
-                    self.z_trial_buf.create_sub_buffer[dtype](
-                        t * Self._N * Self._L, Self._N * Self._L
-                    )
-                )
+                tile[Self._N, Self._L](self.z_trial_buf.create_sub_buffer[dtype]( t * Self._N * Self._L, Self._N * Self._L ))
             )
             var u_t = rebind[
-                LayoutTensor[
-                    dtype,
-                    Layout.row_major(Self._N, CB.ACTION_DIM),
-                    MutAnyOrigin,
-                ]
+                Tile[dtype, Self._N, CB.ACTION_DIM]
             ](
-                LayoutTensor[
-                    dtype,
-                    Layout.row_major(Self._N, Self._A),
-                ](
-                    self.U_trial_buf.create_sub_buffer[dtype](
-                        t * Self._N * Self._A, Self._N * Self._A
-                    )
-                )
+                tile[Self._N, Self._A](self.U_trial_buf.create_sub_buffer[dtype]( t * Self._N * Self._A, Self._N * Self._A ))
             )
             var z_next = rebind[
-                LayoutTensor[
-                    dtype,
-                    Layout.row_major(Self._N, CB.LATENT_DIM),
-                    MutAnyOrigin,
-                ]
+                Tile[dtype, Self._N, CB.LATENT_DIM]
             ](
-                LayoutTensor[
-                    dtype,
-                    Layout.row_major(Self._N, Self._L),
-                ](
-                    self.z_trial_buf.create_sub_buffer[dtype](
-                        (t + 1) * Self._N * Self._L, Self._N * Self._L
-                    )
-                )
+                tile[Self._N, Self._L](self.z_trial_buf.create_sub_buffer[dtype]( (t + 1) * Self._N * Self._L, Self._N * Self._L ))
             )
             var c_t = rebind[
-                LayoutTensor[dtype, Layout.row_major(Self._N), MutAnyOrigin]
+                Tile[dtype, Self._N]
             ](
-                LayoutTensor[dtype, Layout.row_major(Self._N)](
-                    self.step_cost_buf.create_sub_buffer[dtype](
-                        t * Self._N, Self._N
-                    )
-                )
+                tile[Self._N](self.step_cost_buf.create_sub_buffer[dtype]( t * Self._N, Self._N ))
             )
             callback.step_gpu[Self._N](ctx, z_t, u_t, z_next, c_t)
 
         self._terminal_on_z_trial(ctx, callback)
 
     def _accept_all(mut self, ctx: DeviceContext) raises:
-        var Utrial_view = LayoutTensor[
-            dtype,
-            Layout.row_major(Self._T * Self._N * Self._A),
-        ](self.U_trial_buf)
-        var ztrial_view = LayoutTensor[
-            dtype,
-            Layout.row_major((Self._T + 1) * Self._N * Self._L),
-        ](self.z_trial_buf)
-        var trial_view = LayoutTensor[dtype, Layout.row_major(Self._N)](
-            self.trial_cost_buf
-        )
-        var U_view = LayoutTensor[
-            dtype,
-            Layout.row_major(Self._T * Self._N * Self._A),
-        ](self.U_buf)
-        var zseq_view = LayoutTensor[
-            dtype,
-            Layout.row_major((Self._T + 1) * Self._N * Self._L),
-        ](self.z_seq_buf)
-        var total_view = LayoutTensor[dtype, Layout.row_major(Self._N)](
-            self.total_cost_buf
-        )
+        var Utrial_view = tile[Self._T * Self._N * Self._A](self.U_trial_buf)
+        var ztrial_view = tile[(Self._T + 1) * Self._N * Self._L](self.z_trial_buf)
+        var trial_view = tile[Self._N](self.trial_cost_buf)
+        var U_view = tile[Self._T * Self._N * Self._A](self.U_buf)
+        var zseq_view = tile[(Self._T + 1) * Self._N * Self._L](self.z_seq_buf)
+        var total_view = tile[Self._N](self.total_cost_buf)
         ctx.enqueue_function[
             ilqr_accept_kernel[dtype, Self._N, Self._T, Self._L, Self._A]
         ](

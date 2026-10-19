@@ -18,7 +18,6 @@ Backward: grad_in_i[b, :] = grad_output[b, off_i : off_i+DIMS[i]].
 
 from max.gpu import global_idx
 from max.gpu.host import DeviceContext
-from layout import Layout, LayoutTensor
 
 from noeira.nn.constants import DT, TPB
 from ..core.tensor import Tensor, TensorImpl
@@ -27,6 +26,7 @@ from ..core.module import Module
 from ..core.param import ParamVisitor
 from ..core.initializer import Initializer
 from ..core.amp import AMPPolicy, NoAMP
+from noeira.core.tiles import Tile
 
 
 # ── comptime variadic helpers (mirror Parallel / legacy concat) ─────────
@@ -55,8 +55,8 @@ def _build_in_dims[*DIMS: Int]() -> Array[Int, DIMS.size]:
 def _concat_copy_in_kernel[
     BATCH: Int, SRC_DIM: Int, OUT_DIM: Int, DST_OFF: Int, ADT: DType = DT
 ](
-    src: LayoutTensor[ADT, Layout.row_major(BATCH, SRC_DIM), MutAnyOrigin],
-    output: LayoutTensor[ADT, Layout.row_major(BATCH, OUT_DIM), MutAnyOrigin],
+    src: Tile[ADT, BATCH, SRC_DIM],
+    output: Tile[ADT, BATCH, OUT_DIM],
 ):
     var idx = Int(global_idx.x)
     var total = BATCH * SRC_DIM
@@ -69,10 +69,8 @@ def _concat_copy_in_kernel[
 def _concat_copy_out_kernel[
     BATCH: Int, DST_DIM: Int, OUT_DIM: Int, SRC_OFF: Int, ADT: DType = DT
 ](
-    grad_output: LayoutTensor[
-        ADT, Layout.row_major(BATCH, OUT_DIM), MutAnyOrigin
-    ],
-    grad_in: LayoutTensor[ADT, Layout.row_major(BATCH, DST_DIM), MutAnyOrigin],
+    grad_output: Tile[ADT, BATCH, OUT_DIM],
+    grad_in: Tile[ADT, BATCH, DST_DIM],
 ):
     var idx = Int(global_idx.x)
     var total = BATCH * DST_DIM
@@ -133,8 +131,8 @@ struct Concat[*DIMS: Int, ADT: DType = DT](Module):
                 c.enqueue_function[
                     _concat_copy_in_kernel[B, D, OUT, OFF, Self.ACT_DT]
                 ](
-                    in_i.lt["gpu", Layout.row_major(B, D)](),
-                    out.lt["gpu", Layout.row_major(B, OUT)](),
+                    in_i.tt["gpu", B, D](),
+                    out.tt["gpu", B, OUT](),
                     grid_dim=nblk,
                     block_dim=TPB,
                 )
@@ -173,8 +171,8 @@ struct Concat[*DIMS: Int, ADT: DType = DT](Module):
                 c.enqueue_function[
                     _concat_copy_out_kernel[B, D, OUT, OFF, Self.ACT_DT]
                 ](
-                    grad_output.lt["gpu", Layout.row_major(B, OUT)](),
-                    gi.lt["gpu", Layout.row_major(B, D)](),
+                    grad_output.tt["gpu", B, OUT](),
+                    gi.tt["gpu", B, D](),
                     grid_dim=nblk,
                     block_dim=TPB,
                 )

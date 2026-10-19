@@ -47,7 +47,8 @@ transpose node on the position path.
 from std.math import cos, exp, log, pi, sin
 from max.gpu import global_idx
 from max.gpu.host import DeviceContext
-from layout import Layout, LayoutTensor, TileTensor, row_major
+from layout import TileTensor, row_major
+from noeira.core.tiles import Tile
 
 from noeira.nn.constants import DT, TPB
 from ..core.tensor import Tensor
@@ -101,8 +102,8 @@ def detr_pos2d_entry(h: Int, w: Int, j: Int, oh: Int, ow: Int, dim: Int) -> Floa
 def _spt_broadcast_kernel[
     BATCH: Int, OUT_DIM: Int
 ](
-    table: LayoutTensor[DT, Layout.row_major(OUT_DIM), MutAnyOrigin],
-    output: LayoutTensor[DT, Layout.row_major(BATCH, OUT_DIM), MutAnyOrigin],
+    table: Tile[DT, OUT_DIM],
+    output: Tile[DT, BATCH, OUT_DIM],
 ):
     var idx = Int(global_idx.x)
     if idx >= BATCH * OUT_DIM:
@@ -114,7 +115,7 @@ def _spt_broadcast_kernel[
 
 def _spt_zero_kernel[
     N: Int
-](grad_input: LayoutTensor[DT, Layout.row_major(N), MutAnyOrigin]):
+](grad_input: Tile[DT, N]):
     var idx = Int(global_idx.x)
     if idx < N:
         grad_input.ptr[unsafe_offset=idx] = Scalar[DT](0.0)
@@ -283,8 +284,8 @@ def _spt_forward[
         var c = ctx.value()
         out.ensure_gpu(c, B * OUT_DIM)
         c.enqueue_function[_spt_broadcast_kernel[B, OUT_DIM]](
-            table.lt["gpu", Layout.row_major(OUT_DIM)](),
-            out.lt["gpu", Layout.row_major(B, OUT_DIM)](),
+            table.tt["gpu", OUT_DIM](),
+            out.tt["gpu", B, OUT_DIM](),
             grid_dim=(B * OUT_DIM + TPB - 1) // TPB,
             block_dim=TPB,
         )
@@ -305,7 +306,7 @@ def _spt_zero[
         var c = ctx.value()
         gin.ensure_gpu(c, N)
         c.enqueue_function[_spt_zero_kernel[N]](
-            gin.lt["gpu", Layout.row_major(N)](),
+            gin.tt["gpu", N](),
             grid_dim=(N + TPB - 1) // TPB,
             block_dim=TPB,
         )

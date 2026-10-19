@@ -8,19 +8,19 @@ scalar monitor; the GPU driver downloads `pred` first).
 
 from max.gpu import global_idx
 from max.gpu.host import DeviceContext
-from layout import Layout, LayoutTensor
 
 from noeira.nn.constants import DT
 from ..core.tensor import Tensor
 from ..core.param import ParamVisitor
+from noeira.core.tiles import RowMajor, Tile
 
 
 def _mse_back_kernel[
     M: Int
 ](
-    pred: LayoutTensor[DT, Layout.row_major(M), MutAnyOrigin],
-    tgt: LayoutTensor[DT, Layout.row_major(M), MutAnyOrigin],
-    grad: LayoutTensor[DT, Layout.row_major(M), MutAnyOrigin],
+    pred: Tile[DT, M],
+    tgt: Tile[DT, M],
+    grad: Tile[DT, M],
     scale: Scalar[DT],
 ):
     var i = Int(global_idx.x)
@@ -57,10 +57,10 @@ def mse_backward[
     else:
         var c = ctx.value()
         grad.ensure_gpu(c, M)
-        comptime layout = Layout.row_major(M)
-        var pl = pred.lt["gpu", layout]()
-        var tl = tgt.lt["gpu", layout]()
-        var gl = grad.lt["gpu", layout]()
+        comptime layout = RowMajor[M]
+        var pl = pred.tt["gpu", M]()
+        var tl = tgt.tt["gpu", M]()
+        var gl = grad.tt["gpu", M]()
         comptime nblk = (M + 255) // 256
         c.enqueue_function[_mse_back_kernel[M]](
             pl, tl, gl, scale, grid_dim=nblk, block_dim=256

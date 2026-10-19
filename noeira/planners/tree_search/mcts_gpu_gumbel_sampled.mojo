@@ -44,8 +44,8 @@ from max.gpu import block_dim, block_idx, thread_idx
 from max.gpu.host import DeviceContext, DeviceBuffer
 from std.random.philox import Random as PhiloxRandom
 from std.math import sqrt, log, exp, tanh, cos, pi
-from layout import Layout, LayoutTensor
 from noeira.nn.constants import DT as dtype
+from noeira.core.tiles import Tile
 comptime TPB = 256  # preserved from legacy nn.constants (nn.TPB == 128)
 
 
@@ -258,12 +258,8 @@ def gs_scatter_root_hidden_kernel[
     N_ENVS: Int, MAX_NODES: Int, LATENT: Int,
     dtype: DType,
 ](
-    root_hidden: LayoutTensor[
-        dtype, Layout.row_major(N_ENVS * LATENT), MutAnyOrigin
-    ],
-    hidden_states: LayoutTensor[
-        dtype, Layout.row_major(N_ENVS * MAX_NODES * LATENT), MutAnyOrigin
-    ],
+    root_hidden: Tile[dtype, N_ENVS * LATENT],
+    hidden_states: Tile[dtype, N_ENVS * MAX_NODES * LATENT],
 ) where dtype.is_floating_point():
     """Scatter contiguous rep-forward output into each env's slot-0 hidden."""
     var e = Int(block_dim.x * block_idx.x + thread_idx.x)
@@ -297,31 +293,16 @@ def gs_init_root_kernel[
     N_POLICY_AT_ROOT: Int,
     dtype: DType,
 ](
-    actions: LayoutTensor[
-        dtype, Layout.row_major(N_ENVS * MAX_NODES * K_PAD * ACT_DIM),
-        MutAnyOrigin,
-    ],
-    log_prior: LayoutTensor[
-        dtype, Layout.row_major(N_ENVS * MAX_NODES * K_PAD), MutAnyOrigin
-    ],
-    node_value: LayoutTensor[
-        dtype, Layout.row_major(N_ENVS * MAX_NODES), MutAnyOrigin
-    ],
-    active_k: LayoutTensor[
-        dtype, Layout.row_major(N_ENVS * MAX_NODES), MutAnyOrigin
-    ],
-    node_count: LayoutTensor[dtype, Layout.row_major(N_ENVS), MutAnyOrigin],
-    min_q: LayoutTensor[dtype, Layout.row_major(N_ENVS), MutAnyOrigin],
-    max_q: LayoutTensor[dtype, Layout.row_major(N_ENVS), MutAnyOrigin],
-    root_gumbels: LayoutTensor[
-        dtype, Layout.row_major(N_ENVS * K_ROOT), MutAnyOrigin
-    ],
-    root_active: LayoutTensor[
-        dtype, Layout.row_major(N_ENVS * K_ROOT), MutAnyOrigin
-    ],
-    pred_output: LayoutTensor[
-        dtype, Layout.row_major(N_ENVS * PRED_OUT), MutAnyOrigin
-    ],
+    actions: Tile[dtype, N_ENVS * MAX_NODES * K_PAD * ACT_DIM],
+    log_prior: Tile[dtype, N_ENVS * MAX_NODES * K_PAD],
+    node_value: Tile[dtype, N_ENVS * MAX_NODES],
+    active_k: Tile[dtype, N_ENVS * MAX_NODES],
+    node_count: Tile[dtype, N_ENVS],
+    min_q: Tile[dtype, N_ENVS],
+    max_q: Tile[dtype, N_ENVS],
+    root_gumbels: Tile[dtype, N_ENVS * K_ROOT],
+    root_active: Tile[dtype, N_ENVS * K_ROOT],
+    pred_output: Tile[dtype, N_ENVS * PRED_OUT],
     v_min: Scalar[dtype],
     v_max: Scalar[dtype],
     max_action: Scalar[dtype],
@@ -554,57 +535,24 @@ def gs_select_kernel[
     DYN_IN: Int,
     dtype: DType,
 ](
-    visit_count: LayoutTensor[
-        dtype, Layout.row_major(N_ENVS * MAX_NODES * K_PAD), MutAnyOrigin
-    ],
-    total_value: LayoutTensor[
-        dtype, Layout.row_major(N_ENVS * MAX_NODES * K_PAD), MutAnyOrigin
-    ],
-    log_prior: LayoutTensor[
-        dtype, Layout.row_major(N_ENVS * MAX_NODES * K_PAD), MutAnyOrigin
-    ],
-    child_idx: LayoutTensor[
-        dtype, Layout.row_major(N_ENVS * MAX_NODES * K_PAD), MutAnyOrigin
-    ],
-    actions: LayoutTensor[
-        dtype, Layout.row_major(N_ENVS * MAX_NODES * K_PAD * ACT_DIM),
-        MutAnyOrigin,
-    ],
-    total_visits: LayoutTensor[
-        dtype, Layout.row_major(N_ENVS * MAX_NODES), MutAnyOrigin
-    ],
-    node_value: LayoutTensor[
-        dtype, Layout.row_major(N_ENVS * MAX_NODES), MutAnyOrigin
-    ],
-    active_k: LayoutTensor[
-        dtype, Layout.row_major(N_ENVS * MAX_NODES), MutAnyOrigin
-    ],
-    min_q: LayoutTensor[dtype, Layout.row_major(N_ENVS), MutAnyOrigin],
-    max_q: LayoutTensor[dtype, Layout.row_major(N_ENVS), MutAnyOrigin],
-    root_active: LayoutTensor[
-        dtype, Layout.row_major(N_ENVS * K_ROOT), MutAnyOrigin
-    ],
-    hidden_states: LayoutTensor[
-        dtype, Layout.row_major(N_ENVS * MAX_NODES * LATENT), MutAnyOrigin
-    ],
-    dyn_input: LayoutTensor[
-        dtype, Layout.row_major(N_ENVS * DYN_IN), MutAnyOrigin
-    ],
-    pending_parent: LayoutTensor[
-        dtype, Layout.row_major(N_ENVS), MutAnyOrigin
-    ],
-    pending_cand: LayoutTensor[
-        dtype, Layout.row_major(N_ENVS), MutAnyOrigin
-    ],
-    search_paths: LayoutTensor[
-        dtype, Layout.row_major(N_ENVS * MAX_DEPTH), MutAnyOrigin
-    ],
-    cand_paths: LayoutTensor[
-        dtype, Layout.row_major(N_ENVS * MAX_DEPTH), MutAnyOrigin
-    ],
-    path_lengths: LayoutTensor[
-        dtype, Layout.row_major(N_ENVS), MutAnyOrigin
-    ],
+    visit_count: Tile[dtype, N_ENVS * MAX_NODES * K_PAD],
+    total_value: Tile[dtype, N_ENVS * MAX_NODES * K_PAD],
+    log_prior: Tile[dtype, N_ENVS * MAX_NODES * K_PAD],
+    child_idx: Tile[dtype, N_ENVS * MAX_NODES * K_PAD],
+    actions: Tile[dtype, N_ENVS * MAX_NODES * K_PAD * ACT_DIM],
+    total_visits: Tile[dtype, N_ENVS * MAX_NODES],
+    node_value: Tile[dtype, N_ENVS * MAX_NODES],
+    active_k: Tile[dtype, N_ENVS * MAX_NODES],
+    min_q: Tile[dtype, N_ENVS],
+    max_q: Tile[dtype, N_ENVS],
+    root_active: Tile[dtype, N_ENVS * K_ROOT],
+    hidden_states: Tile[dtype, N_ENVS * MAX_NODES * LATENT],
+    dyn_input: Tile[dtype, N_ENVS * DYN_IN],
+    pending_parent: Tile[dtype, N_ENVS],
+    pending_cand: Tile[dtype, N_ENVS],
+    search_paths: Tile[dtype, N_ENVS * MAX_DEPTH],
+    cand_paths: Tile[dtype, N_ENVS * MAX_DEPTH],
+    path_lengths: Tile[dtype, N_ENVS],
     current_slot: Scalar[DType.int32],
     c_visit: Scalar[dtype],
     c_scale: Scalar[dtype],
@@ -821,12 +769,8 @@ def gs_copy_pred_input_kernel[
     N_ENVS: Int, LATENT: Int, DYN_OUT: Int,
     dtype: DType,
 ](
-    pred_input: LayoutTensor[
-        dtype, Layout.row_major(N_ENVS * LATENT), MutAnyOrigin
-    ],
-    dyn_output: LayoutTensor[
-        dtype, Layout.row_major(N_ENVS * DYN_OUT), MutAnyOrigin
-    ],
+    pred_input: Tile[dtype, N_ENVS * LATENT],
+    dyn_output: Tile[dtype, N_ENVS * DYN_OUT],
 ) where dtype.is_floating_point():
     """Copy LATENT prefix of dyn_output into pred_input."""
     var e = Int(block_dim.x * block_idx.x + thread_idx.x)
@@ -851,51 +795,22 @@ def gs_expand_kernel[
     DYN_OUT: Int,
     dtype: DType,
 ](
-    visit_count: LayoutTensor[
-        dtype, Layout.row_major(N_ENVS * MAX_NODES * K_PAD), MutAnyOrigin
-    ],
-    total_value: LayoutTensor[
-        dtype, Layout.row_major(N_ENVS * MAX_NODES * K_PAD), MutAnyOrigin
-    ],
-    log_prior: LayoutTensor[
-        dtype, Layout.row_major(N_ENVS * MAX_NODES * K_PAD), MutAnyOrigin
-    ],
-    reward: LayoutTensor[
-        dtype, Layout.row_major(N_ENVS * MAX_NODES * K_PAD), MutAnyOrigin
-    ],
-    child_idx: LayoutTensor[
-        dtype, Layout.row_major(N_ENVS * MAX_NODES * K_PAD), MutAnyOrigin
-    ],
-    actions: LayoutTensor[
-        dtype, Layout.row_major(N_ENVS * MAX_NODES * K_PAD * ACT_DIM),
-        MutAnyOrigin,
-    ],
-    total_visits: LayoutTensor[
-        dtype, Layout.row_major(N_ENVS * MAX_NODES), MutAnyOrigin
-    ],
-    node_value: LayoutTensor[
-        dtype, Layout.row_major(N_ENVS * MAX_NODES), MutAnyOrigin
-    ],
-    active_k: LayoutTensor[
-        dtype, Layout.row_major(N_ENVS * MAX_NODES), MutAnyOrigin
-    ],
-    node_count: LayoutTensor[dtype, Layout.row_major(N_ENVS), MutAnyOrigin],
-    hidden_states: LayoutTensor[
-        dtype, Layout.row_major(N_ENVS * MAX_NODES * LATENT), MutAnyOrigin
-    ],
-    pending_parent: LayoutTensor[
-        dtype, Layout.row_major(N_ENVS), MutAnyOrigin
-    ],
-    pending_cand: LayoutTensor[
-        dtype, Layout.row_major(N_ENVS), MutAnyOrigin
-    ],
-    dyn_output: LayoutTensor[
-        dtype, Layout.row_major(N_ENVS * DYN_OUT), MutAnyOrigin
-    ],
-    pred_output: LayoutTensor[
-        dtype, Layout.row_major(N_ENVS * PRED_OUT), MutAnyOrigin
-    ],
-    leaf_values: LayoutTensor[dtype, Layout.row_major(N_ENVS), MutAnyOrigin],
+    visit_count: Tile[dtype, N_ENVS * MAX_NODES * K_PAD],
+    total_value: Tile[dtype, N_ENVS * MAX_NODES * K_PAD],
+    log_prior: Tile[dtype, N_ENVS * MAX_NODES * K_PAD],
+    reward: Tile[dtype, N_ENVS * MAX_NODES * K_PAD],
+    child_idx: Tile[dtype, N_ENVS * MAX_NODES * K_PAD],
+    actions: Tile[dtype, N_ENVS * MAX_NODES * K_PAD * ACT_DIM],
+    total_visits: Tile[dtype, N_ENVS * MAX_NODES],
+    node_value: Tile[dtype, N_ENVS * MAX_NODES],
+    active_k: Tile[dtype, N_ENVS * MAX_NODES],
+    node_count: Tile[dtype, N_ENVS],
+    hidden_states: Tile[dtype, N_ENVS * MAX_NODES * LATENT],
+    pending_parent: Tile[dtype, N_ENVS],
+    pending_cand: Tile[dtype, N_ENVS],
+    dyn_output: Tile[dtype, N_ENVS * DYN_OUT],
+    pred_output: Tile[dtype, N_ENVS * PRED_OUT],
+    leaf_values: Tile[dtype, N_ENVS],
     v_min: Scalar[dtype],
     v_max: Scalar[dtype],
     reward_min: Scalar[dtype],
@@ -1149,30 +1064,16 @@ def gs_backup_kernel[
     N_ENVS: Int, MAX_NODES: Int, K_PAD: Int,
     dtype: DType,
 ](
-    visit_count: LayoutTensor[
-        dtype, Layout.row_major(N_ENVS * MAX_NODES * K_PAD), MutAnyOrigin
-    ],
-    total_value: LayoutTensor[
-        dtype, Layout.row_major(N_ENVS * MAX_NODES * K_PAD), MutAnyOrigin
-    ],
-    reward: LayoutTensor[
-        dtype, Layout.row_major(N_ENVS * MAX_NODES * K_PAD), MutAnyOrigin
-    ],
-    total_visits: LayoutTensor[
-        dtype, Layout.row_major(N_ENVS * MAX_NODES), MutAnyOrigin
-    ],
-    min_q: LayoutTensor[dtype, Layout.row_major(N_ENVS), MutAnyOrigin],
-    max_q: LayoutTensor[dtype, Layout.row_major(N_ENVS), MutAnyOrigin],
-    search_paths: LayoutTensor[
-        dtype, Layout.row_major(N_ENVS * MAX_DEPTH), MutAnyOrigin
-    ],
-    cand_paths: LayoutTensor[
-        dtype, Layout.row_major(N_ENVS * MAX_DEPTH), MutAnyOrigin
-    ],
-    path_lengths: LayoutTensor[
-        dtype, Layout.row_major(N_ENVS), MutAnyOrigin
-    ],
-    leaf_values: LayoutTensor[dtype, Layout.row_major(N_ENVS), MutAnyOrigin],
+    visit_count: Tile[dtype, N_ENVS * MAX_NODES * K_PAD],
+    total_value: Tile[dtype, N_ENVS * MAX_NODES * K_PAD],
+    reward: Tile[dtype, N_ENVS * MAX_NODES * K_PAD],
+    total_visits: Tile[dtype, N_ENVS * MAX_NODES],
+    min_q: Tile[dtype, N_ENVS],
+    max_q: Tile[dtype, N_ENVS],
+    search_paths: Tile[dtype, N_ENVS * MAX_DEPTH],
+    cand_paths: Tile[dtype, N_ENVS * MAX_DEPTH],
+    path_lengths: Tile[dtype, N_ENVS],
+    leaf_values: Tile[dtype, N_ENVS],
     gamma: Scalar[dtype],
 ) where dtype.is_floating_point():
     """Walk path leaf→root, accumulate discounted return, refresh min/max_Q."""
@@ -1219,29 +1120,15 @@ def gs_halve_active_kernel[
     N_ENVS: Int, MAX_NODES: Int, K_ROOT: Int, K_PAD: Int,
     dtype: DType,
 ](
-    visit_count: LayoutTensor[
-        dtype, Layout.row_major(N_ENVS * MAX_NODES * K_PAD), MutAnyOrigin
-    ],
-    total_value: LayoutTensor[
-        dtype, Layout.row_major(N_ENVS * MAX_NODES * K_PAD), MutAnyOrigin
-    ],
-    log_prior: LayoutTensor[
-        dtype, Layout.row_major(N_ENVS * MAX_NODES * K_PAD), MutAnyOrigin
-    ],
-    total_visits: LayoutTensor[
-        dtype, Layout.row_major(N_ENVS * MAX_NODES), MutAnyOrigin
-    ],
-    node_value: LayoutTensor[
-        dtype, Layout.row_major(N_ENVS * MAX_NODES), MutAnyOrigin
-    ],
-    min_q: LayoutTensor[dtype, Layout.row_major(N_ENVS), MutAnyOrigin],
-    max_q: LayoutTensor[dtype, Layout.row_major(N_ENVS), MutAnyOrigin],
-    root_gumbels: LayoutTensor[
-        dtype, Layout.row_major(N_ENVS * K_ROOT), MutAnyOrigin
-    ],
-    root_active: LayoutTensor[
-        dtype, Layout.row_major(N_ENVS * K_ROOT), MutAnyOrigin
-    ],
+    visit_count: Tile[dtype, N_ENVS * MAX_NODES * K_PAD],
+    total_value: Tile[dtype, N_ENVS * MAX_NODES * K_PAD],
+    log_prior: Tile[dtype, N_ENVS * MAX_NODES * K_PAD],
+    total_visits: Tile[dtype, N_ENVS * MAX_NODES],
+    node_value: Tile[dtype, N_ENVS * MAX_NODES],
+    min_q: Tile[dtype, N_ENVS],
+    max_q: Tile[dtype, N_ENVS],
+    root_gumbels: Tile[dtype, N_ENVS * K_ROOT],
+    root_active: Tile[dtype, N_ENVS * K_ROOT],
     old_size: Scalar[DType.int32],
     keep: Scalar[DType.int32],
     c_visit: Scalar[dtype],
@@ -1373,19 +1260,10 @@ def gs_extract_kernel[
     K_PAD: Int,
     dtype: DType,
 ](
-    visit_count: LayoutTensor[
-        dtype, Layout.row_major(N_ENVS * MAX_NODES * K_PAD), MutAnyOrigin
-    ],
-    actions: LayoutTensor[
-        dtype, Layout.row_major(N_ENVS * MAX_NODES * K_PAD * ACT_DIM),
-        MutAnyOrigin,
-    ],
-    chosen_actions: LayoutTensor[
-        dtype, Layout.row_major(N_ENVS * ACT_DIM), MutAnyOrigin
-    ],
-    root_visits_out: LayoutTensor[
-        dtype, Layout.row_major(N_ENVS * K_ROOT), MutAnyOrigin
-    ],
+    visit_count: Tile[dtype, N_ENVS * MAX_NODES * K_PAD],
+    actions: Tile[dtype, N_ENVS * MAX_NODES * K_PAD * ACT_DIM],
+    chosen_actions: Tile[dtype, N_ENVS * ACT_DIM],
+    root_visits_out: Tile[dtype, N_ENVS * K_ROOT],
     deterministic: Scalar[DType.uint8],
     rng_seed: Scalar[DType.uint32],
 ) where dtype.is_floating_point():

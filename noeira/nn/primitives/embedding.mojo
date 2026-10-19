@@ -22,7 +22,8 @@ GPU-only.
 from noeira.nn.core.mm import mm, bmm
 from max.gpu import global_idx
 from max.gpu.host import DeviceContext
-from layout import Layout, LayoutTensor, TileTensor, row_major
+from layout import TileTensor, row_major
+from noeira.core.tiles import RowMajor, Tile
 from linalg.matmul import matmul as max_matmul
 from noeira.nn.core.splitk_gemm import (
     splitk_path_applies,
@@ -53,8 +54,8 @@ from .linear import (
 def _emb_accum_kernel[
     N: Int
 ](
-    dst: LayoutTensor[DT, Layout.row_major(N), MutAnyOrigin],
-    src: LayoutTensor[DT, Layout.row_major(N), MutAnyOrigin],
+    dst: Tile[DT, N],
+    src: Tile[DT, N],
 ):
     var i = Int(global_idx.x)
     if i < N:
@@ -328,8 +329,8 @@ struct Embedding[VOCAB_: Int, EMBED_DIM_: Int, ADT: DType = DT](Module):
                 var c = ctx.value()
                 gind.ensure_gpu(c, B * Self.VOCAB_)
                 self.gw_tmp.ensure_gpu(c, Self.W_SIZE)
-                comptime lw = Layout.row_major(Self.VOCAB_, Self.EMBED_DIM_)
-                comptime lwf = Layout.row_major(Self.W_SIZE)
+                comptime lw = RowMajor[Self.VOCAB_, Self.EMBED_DIM_]
+                comptime lwf = RowMajor[Self.W_SIZE]
                 # grad_in[B, VOCAB] = grad_out[B, ED] @ weight[VOCAB, ED]ᵀ
                 var go_v = TileTensor(
                     god.dev.value(), row_major[B, Self.EMBED_DIM_]()
@@ -365,8 +366,8 @@ struct Embedding[VOCAB_: Int, EMBED_DIM_: Int, ADT: DType = DT](Module):
                 # weight.grad += gw_tmp  (accumulate, matches legacy semantics)
                 comptime gw_blk = (Self.W_SIZE + TPB - 1) // TPB
                 c.enqueue_function[_emb_accum_kernel[Self.W_SIZE]](
-                    self.weight.grd.lt["gpu", lwf](),
-                    self.gw_tmp.lt["gpu", lwf](),
+                    self.weight.grd.tt["gpu", Self.W_SIZE](),
+                    self.gw_tmp.tt["gpu", Self.W_SIZE](),
                     grid_dim=gw_blk,
                     block_dim=TPB,
                 )
@@ -378,7 +379,7 @@ struct Embedding[VOCAB_: Int, EMBED_DIM_: Int, ADT: DType = DT](Module):
             var c = ctx.value()
             gin.ensure_gpu(c, B * Self.VOCAB_)
             self.gw_tmp.ensure_gpu(c, Self.W_SIZE)
-            comptime lwf = Layout.row_major(Self.W_SIZE)
+            comptime lwf = RowMajor[Self.W_SIZE]
             # grad_output is ALREADY bf16 (no cast). W reuses the forward's cached
             # bf16 cast. grad_in[B, VOCAB] = grad_out[B, ED] @ W[VOCAB, ED]ᵀ →
             # bf16 gin (bf16-in, bf16-out — gin flows at bf16).
@@ -399,8 +400,8 @@ struct Embedding[VOCAB_: Int, EMBED_DIM_: Int, ADT: DType = DT](Module):
             # weight.grad (fp32 master) += gw_tmp (fp32)
             comptime gw_blk = (Self.W_SIZE + TPB - 1) // TPB
             c.enqueue_function[_emb_accum_kernel[Self.W_SIZE]](
-                self.weight.grd.lt["gpu", lwf](),
-                self.gw_tmp.lt["gpu", lwf](),
+                self.weight.grd.tt["gpu", Self.W_SIZE](),
+                self.gw_tmp.tt["gpu", Self.W_SIZE](),
                 grid_dim=gw_blk,
                 block_dim=TPB,
             )

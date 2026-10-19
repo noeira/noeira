@@ -29,7 +29,6 @@ from std.math import exp, log, log1p
 from max.gpu import global_idx, block_idx, thread_idx
 from max.gpu.primitives import block
 from max.gpu.host import DeviceContext, DeviceBuffer
-from layout import Layout, LayoutTensor
 
 from noeira.nn.constants import DT, TPB, TPB_REDUCE
 from noeira.nn.core.tensor import Tensor
@@ -45,6 +44,7 @@ from noeira.nn.loss.two_hot import (
     two_hot_ce_bwd_kernel,
 )
 from .twohot import symexp_twohot_bins, DREAMER_REWARD_GRID_LO
+from noeira.core.tiles import Tile
 
 
 @always_inline
@@ -101,9 +101,9 @@ def _sigmoid(x: Scalar[DT]) -> Scalar[DT]:
 
 
 def _symmse_fwd_kernel[B: Int, OBS: Int, SIGMOID: Bool](
-    pred: LayoutTensor[DT, Layout.row_major(B * OBS), MutAnyOrigin],
-    tgt: LayoutTensor[DT, Layout.row_major(B * OBS), MutAnyOrigin],
-    o: LayoutTensor[DT, Layout.row_major(B), MutAnyOrigin],
+    pred: Tile[DT, B * OBS],
+    tgt: Tile[DT, B * OBS],
+    o: Tile[DT, B],
 ):
     # ONE BLOCK per batch element; threads stride over the OBS pixels and the
     # block reduces. (Was grid=(B/TPB) → only B threads active, each looping all
@@ -132,11 +132,11 @@ def _symmse_fwd_kernel[B: Int, OBS: Int, SIGMOID: Bool](
 
 
 def _symmse_bwd_kernel[B: Int, OBS: Int, SIGMOID: Bool](
-    go: LayoutTensor[DT, Layout.row_major(B), MutAnyOrigin],
-    pred: LayoutTensor[DT, Layout.row_major(B * OBS), MutAnyOrigin],
-    tgt: LayoutTensor[DT, Layout.row_major(B * OBS), MutAnyOrigin],
-    gp: LayoutTensor[DT, Layout.row_major(B * OBS), MutAnyOrigin],
-    gt: LayoutTensor[DT, Layout.row_major(B * OBS), MutAnyOrigin],
+    go: Tile[DT, B],
+    pred: Tile[DT, B * OBS],
+    tgt: Tile[DT, B * OBS],
+    gp: Tile[DT, B * OBS],
+    gt: Tile[DT, B * OBS],
 ):
     # Pure elementwise over ALL B*OBS — one thread per element (grid-strided),
     # not one thread per batch row. (Was grid=(B/TPB) → B threads each looping
@@ -204,9 +204,9 @@ struct SymlogMSELoss[OBS: Int, SIGMOID: Bool = False](Module):
             out.ensure_gpu(c, B)
             # one block per batch element (block-reduce over OBS).
             c.enqueue_function[_symmse_fwd_kernel[B, Self.OBS, Self.SIGMOID]](
-                pred.lt["gpu", Layout.row_major(B * Self.OBS)](),
-                tgt.lt["gpu", Layout.row_major(B * Self.OBS)](),
-                out.lt["gpu", Layout.row_major(B)](),
+                pred.tt["gpu", B * Self.OBS](),
+                tgt.tt["gpu", B * Self.OBS](),
+                out.tt["gpu", B](),
                 grid_dim=B, block_dim=TPB_REDUCE,
             )
 
@@ -248,11 +248,11 @@ struct SymlogMSELoss[OBS: Int, SIGMOID: Bool = False](Module):
             # one thread per (b, pixel) element across all B*OBS.
             comptime nb = (B * Self.OBS + TPB - 1) // TPB
             c.enqueue_function[_symmse_bwd_kernel[B, Self.OBS, Self.SIGMOID]](
-                grad_output.lt["gpu", Layout.row_major(B)](),
-                pred.lt["gpu", Layout.row_major(B * Self.OBS)](),
-                tgt.lt["gpu", Layout.row_major(B * Self.OBS)](),
-                gp.lt["gpu", Layout.row_major(B * Self.OBS)](),
-                gt.lt["gpu", Layout.row_major(B * Self.OBS)](),
+                grad_output.tt["gpu", B](),
+                pred.tt["gpu", B * Self.OBS](),
+                tgt.tt["gpu", B * Self.OBS](),
+                gp.tt["gpu", B * Self.OBS](),
+                gt.tt["gpu", B * Self.OBS](),
                 grid_dim=nb, block_dim=TPB,
             )
 
@@ -327,10 +327,10 @@ struct TwoHotLoss[BINS: Int](Module):
             out.ensure_gpu(c, B)
             comptime nb = (B + TPB - 1) // TPB
             c.enqueue_function[two_hot_ce_fwd_kernel[B, Self.BINS, False]](
-                inputs[0].lt["gpu", Layout.row_major(B * Self.BINS)](),
-                inputs[1].lt["gpu", Layout.row_major(B)](),
-                self.bins.lt["gpu", Layout.row_major(Self.BINS)](),
-                out.lt["gpu", Layout.row_major(B)](),
+                inputs[0].tt["gpu", B * Self.BINS](),
+                inputs[1].tt["gpu", B](),
+                self.bins.tt["gpu", Self.BINS](),
+                out.tt["gpu", B](),
                 grid_dim=nb, block_dim=TPB,
             )
 
@@ -357,11 +357,11 @@ struct TwoHotLoss[BINS: Int](Module):
             g_tgt.dev.value().enqueue_fill(Scalar[DT](0))
             comptime nb = (B + TPB - 1) // TPB
             c.enqueue_function[two_hot_ce_bwd_kernel[B, Self.BINS, False]](
-                grad_output.lt["gpu", Layout.row_major(B)](),
-                forward_input[0].lt["gpu", Layout.row_major(B * Self.BINS)](),
-                forward_input[1].lt["gpu", Layout.row_major(B)](),
-                self.bins.lt["gpu", Layout.row_major(Self.BINS)](),
-                g_lg.lt["gpu", Layout.row_major(B * Self.BINS)](),
+                grad_output.tt["gpu", B](),
+                forward_input[0].tt["gpu", B * Self.BINS](),
+                forward_input[1].tt["gpu", B](),
+                self.bins.tt["gpu", Self.BINS](),
+                g_lg.tt["gpu", B * Self.BINS](),
                 grid_dim=nb, block_dim=TPB,
             )
 
@@ -373,9 +373,9 @@ struct TwoHotLoss[BINS: Int](Module):
 
 
 def _binary_fwd_kernel[B: Int](
-    lo: LayoutTensor[DT, Layout.row_major(B), MutAnyOrigin],
-    tg: LayoutTensor[DT, Layout.row_major(B), MutAnyOrigin],
-    o: LayoutTensor[DT, Layout.row_major(B), MutAnyOrigin],
+    lo: Tile[DT, B],
+    tg: Tile[DT, B],
+    o: Tile[DT, B],
 ):
     var b = Int(global_idx.x)
     if b < B:
@@ -388,11 +388,11 @@ def _binary_fwd_kernel[B: Int](
 
 
 def _binary_bwd_kernel[B: Int](
-    go: LayoutTensor[DT, Layout.row_major(B), MutAnyOrigin],
-    lo: LayoutTensor[DT, Layout.row_major(B), MutAnyOrigin],
-    tg: LayoutTensor[DT, Layout.row_major(B), MutAnyOrigin],
-    gl: LayoutTensor[DT, Layout.row_major(B), MutAnyOrigin],
-    gt: LayoutTensor[DT, Layout.row_major(B), MutAnyOrigin],
+    go: Tile[DT, B],
+    lo: Tile[DT, B],
+    tg: Tile[DT, B],
+    gl: Tile[DT, B],
+    gt: Tile[DT, B],
 ):
     var b = Int(global_idx.x)
     if b < B:
@@ -445,9 +445,9 @@ struct BinaryLoss(Module):
             out.ensure_gpu(c, B)
             comptime nb = (B + TPB - 1) // TPB
             c.enqueue_function[_binary_fwd_kernel[B]](
-                lo.lt["gpu", Layout.row_major(B)](),
-                tgt.lt["gpu", Layout.row_major(B)](),
-                out.lt["gpu", Layout.row_major(B)](),
+                lo.tt["gpu", B](),
+                tgt.tt["gpu", B](),
+                out.tt["gpu", B](),
                 grid_dim=nb, block_dim=TPB,
             )
 
@@ -479,10 +479,10 @@ struct BinaryLoss(Module):
             gt.ensure_gpu(c, B)
             comptime nb = (B + TPB - 1) // TPB
             c.enqueue_function[_binary_bwd_kernel[B]](
-                grad_output.lt["gpu", Layout.row_major(B)](),
-                lo.lt["gpu", Layout.row_major(B)](),
-                tgt.lt["gpu", Layout.row_major(B)](),
-                gl.lt["gpu", Layout.row_major(B)](),
-                gt.lt["gpu", Layout.row_major(B)](),
+                grad_output.tt["gpu", B](),
+                lo.tt["gpu", B](),
+                tgt.tt["gpu", B](),
+                gl.tt["gpu", B](),
+                gt.tt["gpu", B](),
                 grid_dim=nb, block_dim=TPB,
             )

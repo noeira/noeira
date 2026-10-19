@@ -9,7 +9,6 @@ Perfect for LunarLander where we need fast ground contact detection.
 """
 
 from std.math import cos, sin
-from layout import LayoutTensor, Layout
 from max.gpu import thread_idx, block_idx, block_dim
 from max.gpu.host import DeviceContext, DeviceBuffer
 
@@ -37,6 +36,7 @@ from ..constants import (
     CONTACT_TANGENT_IMPULSE,
 )
 from ..traits.collision import CollisionSystem
+from noeira.core.tiles import Tile, ImmTile, tile
 
 
 struct FlatTerrainCollision(CollisionSystem):
@@ -73,22 +73,10 @@ struct FlatTerrainCollision(CollisionSystem):
         MAX_CONTACTS: Int = 16,
     ](
         self,
-        bodies: LayoutTensor[
-            dtype,
-            Layout.row_major(BATCH, NUM_BODIES, BODY_STATE_SIZE),
-            MutAnyOrigin,
-        ],
-        shapes: LayoutTensor[
-            dtype, Layout.row_major(NUM_SHAPES, SHAPE_MAX_SIZE), MutAnyOrigin
-        ],
-        mut contacts: LayoutTensor[
-            dtype,
-            Layout.row_major(BATCH, MAX_CONTACTS, CONTACT_DATA_SIZE),
-            MutAnyOrigin,
-        ],
-        mut contact_counts: LayoutTensor[
-            dtype, Layout.row_major(BATCH), MutAnyOrigin
-        ],
+        bodies: Tile[dtype, BATCH, NUM_BODIES, BODY_STATE_SIZE],
+        shapes: Tile[dtype, NUM_SHAPES, SHAPE_MAX_SIZE],
+        contacts: Tile[dtype, BATCH, MAX_CONTACTS, CONTACT_DATA_SIZE],
+        contact_counts: Tile[dtype, BATCH],
     ):
         """Detect ground contacts for all bodies in all environments."""
         for env in range(BATCH):
@@ -215,22 +203,10 @@ struct FlatTerrainCollision(CollisionSystem):
         NUM_SHAPES: Int,
         MAX_CONTACTS: Int,
     ](
-        bodies: LayoutTensor[
-            dtype,
-            Layout.row_major(BATCH, NUM_BODIES, BODY_STATE_SIZE),
-            MutAnyOrigin,
-        ],
-        shapes: LayoutTensor[
-            dtype, Layout.row_major(NUM_SHAPES, SHAPE_MAX_SIZE), ImmutAnyOrigin
-        ],
-        contacts: LayoutTensor[
-            dtype,
-            Layout.row_major(BATCH, MAX_CONTACTS, CONTACT_DATA_SIZE),
-            MutAnyOrigin,
-        ],
-        contact_counts: LayoutTensor[
-            dtype, Layout.row_major(BATCH), MutAnyOrigin
-        ],
+        bodies: Tile[dtype, BATCH, NUM_BODIES, BODY_STATE_SIZE],
+        shapes: ImmTile[dtype, NUM_SHAPES, SHAPE_MAX_SIZE],
+        contacts: Tile[dtype, BATCH, MAX_CONTACTS, CONTACT_DATA_SIZE],
+        contact_counts: Tile[dtype, BATCH],
         ground_y: Scalar[dtype],
     ):
         """GPU kernel: one thread per environment."""
@@ -339,22 +315,10 @@ struct FlatTerrainCollision(CollisionSystem):
         STATE_SIZE: Int,
         BODIES_OFFSET: Int,
     ](
-        state: LayoutTensor[
-            dtype,
-            Layout.row_major(BATCH, STATE_SIZE),
-            MutAnyOrigin,
-        ],
-        shapes: LayoutTensor[
-            dtype, Layout.row_major(NUM_SHAPES, SHAPE_MAX_SIZE), ImmutAnyOrigin
-        ],
-        contacts: LayoutTensor[
-            dtype,
-            Layout.row_major(BATCH, MAX_CONTACTS, CONTACT_DATA_SIZE),
-            MutAnyOrigin,
-        ],
-        contact_counts: LayoutTensor[
-            dtype, Layout.row_major(BATCH), MutAnyOrigin
-        ],
+        state: Tile[dtype, BATCH, STATE_SIZE],
+        shapes: ImmTile[dtype, NUM_SHAPES, SHAPE_MAX_SIZE],
+        contacts: Tile[dtype, BATCH, MAX_CONTACTS, CONTACT_DATA_SIZE],
+        contact_counts: Tile[dtype, BATCH],
         ground_y: Scalar[dtype],
     ):
         """GPU kernel for flat terrain collision with 2D strided state layout.
@@ -458,23 +422,11 @@ struct FlatTerrainCollision(CollisionSystem):
         BODIES_OFFSET: Int,
     ](
         env: Int,
-        state: LayoutTensor[
-            dtype,
-            Layout.row_major(BATCH, STATE_SIZE),
-            MutAnyOrigin,
-        ],
-        shapes: LayoutTensor[
-            dtype, Layout.row_major(NUM_SHAPES, SHAPE_MAX_SIZE), MutAnyOrigin
-        ],
+        state: Tile[dtype, BATCH, STATE_SIZE],
+        shapes: Tile[dtype, NUM_SHAPES, SHAPE_MAX_SIZE],
         ground_y: Scalar[dtype],
-        contacts: LayoutTensor[
-            dtype,
-            Layout.row_major(BATCH, MAX_CONTACTS, CONTACT_DATA_SIZE),
-            MutAnyOrigin,
-        ],
-        contact_counts: LayoutTensor[
-            dtype, Layout.row_major(BATCH), MutAnyOrigin
-        ],
+        contacts: Tile[dtype, BATCH, MAX_CONTACTS, CONTACT_DATA_SIZE],
+        contact_counts: Tile[dtype, BATCH],
     ):
         """Detect collisions for a single environment against flat terrain.
 
@@ -593,41 +545,19 @@ struct FlatTerrainCollision(CollisionSystem):
         """Launch strided flat terrain collision detection kernel."""
         # state/shapes read-only here (mut=False views -> ImmutAnyOrigin kernel
         # params); contacts/contact_counts written (mut=True).
-        var state = LayoutTensor[
-            dtype, Layout.row_major(BATCH, STATE_SIZE)
-        ](state_buf)
-        var shapes = LayoutTensor[
-            dtype, Layout.row_major(NUM_SHAPES, SHAPE_MAX_SIZE)
-        ](shapes_buf)
-        var contacts = LayoutTensor[
-            dtype, Layout.row_major(BATCH, MAX_CONTACTS, CONTACT_DATA_SIZE)
-        ](contacts_buf)
-        var contact_counts = LayoutTensor[
-            dtype, Layout.row_major(BATCH)
-        ](contact_counts_buf)
+        var state = tile[BATCH, STATE_SIZE](state_buf)
+        var shapes = tile[NUM_SHAPES, SHAPE_MAX_SIZE](shapes_buf)
+        var contacts = tile[BATCH, MAX_CONTACTS, CONTACT_DATA_SIZE](contacts_buf)
+        var contact_counts = tile[BATCH](contact_counts_buf)
 
         comptime BLOCKS = (BATCH + TPB - 1) // TPB
 
         @always_inline
         def kernel_wrapper(
-            state: LayoutTensor[
-                dtype,
-                Layout.row_major(BATCH, STATE_SIZE),
-                MutAnyOrigin,
-            ],
-            shapes: LayoutTensor[
-                dtype,
-                Layout.row_major(NUM_SHAPES, SHAPE_MAX_SIZE),
-                ImmutAnyOrigin,
-            ],
-            contacts: LayoutTensor[
-                dtype,
-                Layout.row_major(BATCH, MAX_CONTACTS, CONTACT_DATA_SIZE),
-                MutAnyOrigin,
-            ],
-            contact_counts: LayoutTensor[
-                dtype, Layout.row_major(BATCH), MutAnyOrigin
-            ],
+            state: Tile[dtype, BATCH, STATE_SIZE],
+            shapes: ImmTile[dtype, NUM_SHAPES, SHAPE_MAX_SIZE],
+            contacts: Tile[dtype, BATCH, MAX_CONTACTS, CONTACT_DATA_SIZE],
+            contact_counts: Tile[dtype, BATCH],
             ground_y: Scalar[dtype],
         ):
             FlatTerrainCollision.detect_kernel[

@@ -19,7 +19,6 @@ Episode never terminates naturally (always runs for max_steps=200).
 """
 
 from std.math import sqrt, cos, sin, pi
-from layout import Layout, LayoutTensor
 from max.gpu import thread_idx, block_idx, block_dim
 from max.gpu.host import DeviceContext, DeviceBuffer
 from std.random.philox import Random as PhiloxRandom
@@ -52,6 +51,7 @@ from .constants import PConstants, PendulumLayout
 # Import global GPU constants
 from noeira.physics2d import dtype, TPB
 from noeira.core.fmt import fit
+from noeira.core.tiles import Tile, ImmTile, tile
 
 
 # =============================================================================
@@ -291,52 +291,28 @@ struct PendulumV2[DTYPE: DType](
         """
         # Create tensor views (concrete-origin, direct-from-buffer; widen into
         # the MutAnyOrigin/ImmutAnyOrigin kernel params below).
-        var states_tensor = LayoutTensor[
-            dtype, Layout.row_major(BATCH_SIZE, STATE_SIZE)
-        ](states)
+        var states_tensor = tile[BATCH_SIZE, STATE_SIZE](states)
 
-        var actions_tensor = LayoutTensor[
-            dtype, Layout.row_major(BATCH_SIZE, ACTION_DIM)
-        ](actions)
+        var actions_tensor = tile[BATCH_SIZE, ACTION_DIM](actions)
 
-        var rewards_tensor = LayoutTensor[
-            dtype, Layout.row_major(BATCH_SIZE)
-        ](rewards)
+        var rewards_tensor = tile[BATCH_SIZE](rewards)
 
-        var dones_tensor = LayoutTensor[
-            dtype, Layout.row_major(BATCH_SIZE)
-        ](dones)
+        var dones_tensor = tile[BATCH_SIZE](dones)
 
-        var terminated_tensor = LayoutTensor[
-            dtype, Layout.row_major(BATCH_SIZE)
-        ](terminated)
+        var terminated_tensor = tile[BATCH_SIZE](terminated)
 
-        var obs_tensor = LayoutTensor[
-            dtype, Layout.row_major(BATCH_SIZE, OBS_DIM)
-        ](obs)
+        var obs_tensor = tile[BATCH_SIZE, OBS_DIM](obs)
 
         comptime BLOCKS = (BATCH_SIZE + TPB - 1) // TPB
 
         @always_inline
         def step_wrapper(
-            states: LayoutTensor[
-                dtype, Layout.row_major(BATCH_SIZE, STATE_SIZE), MutAnyOrigin
-            ],
-            actions: LayoutTensor[
-                dtype, Layout.row_major(BATCH_SIZE, ACTION_DIM), ImmutAnyOrigin
-            ],
-            rewards: LayoutTensor[
-                dtype, Layout.row_major(BATCH_SIZE), MutAnyOrigin
-            ],
-            dones: LayoutTensor[
-                dtype, Layout.row_major(BATCH_SIZE), MutAnyOrigin
-            ],
-            terminated_out: LayoutTensor[
-                dtype, Layout.row_major(BATCH_SIZE), MutAnyOrigin
-            ],
-            obs: LayoutTensor[
-                dtype, Layout.row_major(BATCH_SIZE, OBS_DIM), MutAnyOrigin
-            ],
+            states: Tile[dtype, BATCH_SIZE, STATE_SIZE],
+            actions: ImmTile[dtype, BATCH_SIZE, ACTION_DIM],
+            rewards: Tile[dtype, BATCH_SIZE],
+            dones: Tile[dtype, BATCH_SIZE],
+            terminated_out: Tile[dtype, BATCH_SIZE],
+            obs: Tile[dtype, BATCH_SIZE, OBS_DIM],
         ):
             var env = Int(block_dim.x * block_idx.x + thread_idx.x)
             if env >= BATCH_SIZE:
@@ -379,17 +355,13 @@ struct PendulumV2[DTYPE: DType](
             rng_seed: Random seed for initial state generation. Use different
                      values across calls for varied initial states.
         """
-        var states_tensor = LayoutTensor[
-            dtype, Layout.row_major(BATCH_SIZE, STATE_SIZE)
-        ](states)
+        var states_tensor = tile[BATCH_SIZE, STATE_SIZE](states)
 
         comptime BLOCKS = (BATCH_SIZE + TPB - 1) // TPB
 
         @always_inline
         def reset_wrapper(
-            states: LayoutTensor[
-                dtype, Layout.row_major(BATCH_SIZE, STATE_SIZE), MutAnyOrigin
-            ],
+            states: Tile[dtype, BATCH_SIZE, STATE_SIZE],
             seed: Scalar[dtype],
         ):
             var env = Int(block_dim.x * block_idx.x + thread_idx.x)
@@ -436,34 +408,20 @@ struct PendulumV2[DTYPE: DType](
             rng_counter_ptr: Optional GPU counter pointer. When non-null, reads
                      seed from GPU memory instead of rng_seed parameter.
         """
-        var states_tensor = LayoutTensor[
-            dtype, Layout.row_major(BATCH_SIZE, STATE_SIZE)
-        ](states)
+        var states_tensor = tile[BATCH_SIZE, STATE_SIZE](states)
 
-        var dones_tensor = LayoutTensor[
-            dtype, Layout.row_major(BATCH_SIZE)
-        ](dones)
+        var dones_tensor = tile[BATCH_SIZE](dones)
 
         comptime BLOCKS = (BATCH_SIZE + TPB - 1) // TPB
 
         if Bool(rng_counter_ptr):
-            var counter_t = LayoutTensor[
-                DType.uint64, Layout.row_major(1), MutAnyOrigin
-            ](rng_counter_ptr.value())
+            var counter_t = tile[1](rng_counter_ptr.value())
 
             @always_inline
             def selective_reset_counter_wrapper(
-                states: LayoutTensor[
-                    dtype,
-                    Layout.row_major(BATCH_SIZE, STATE_SIZE),
-                    MutAnyOrigin,
-                ],
-                dones: LayoutTensor[
-                    dtype, Layout.row_major(BATCH_SIZE), MutAnyOrigin
-                ],
-                counter: LayoutTensor[
-                    DType.uint64, Layout.row_major(1), MutAnyOrigin
-                ],
+                states: Tile[dtype, BATCH_SIZE, STATE_SIZE],
+                dones: Tile[dtype, BATCH_SIZE],
+                counter: Tile[DType.uint64, 1],
             ):
                 var env = Int(block_dim.x * block_idx.x + thread_idx.x)
                 if env >= BATCH_SIZE:
@@ -490,14 +448,8 @@ struct PendulumV2[DTYPE: DType](
 
             @always_inline
             def selective_reset_wrapper(
-                states: LayoutTensor[
-                    dtype,
-                    Layout.row_major(BATCH_SIZE, STATE_SIZE),
-                    MutAnyOrigin,
-                ],
-                dones: LayoutTensor[
-                    dtype, Layout.row_major(BATCH_SIZE), MutAnyOrigin
-                ],
+                states: Tile[dtype, BATCH_SIZE, STATE_SIZE],
+                dones: Tile[dtype, BATCH_SIZE],
                 seed: Scalar[dtype],
             ):
                 var env = Int(block_dim.x * block_idx.x + thread_idx.x)
@@ -532,25 +484,15 @@ struct PendulumV2[DTYPE: DType](
     ) raises:
         """Extract observations from state buffer (trivial copy: obs = state[0:OBS_DIM]).
         """
-        var states = LayoutTensor[
-            dtype, Layout.row_major(BATCH_SIZE, STATE_SIZE_VAL)
-        ](states_buf)
-        var obs = LayoutTensor[
-            dtype, Layout.row_major(BATCH_SIZE, OBS_DIM_VAL)
-        ](obs_buf)
+        var states = tile[BATCH_SIZE, STATE_SIZE_VAL](states_buf)
+        var obs = tile[BATCH_SIZE, OBS_DIM_VAL](obs_buf)
 
         comptime BLOCKS = (BATCH_SIZE + TPB - 1) // TPB
 
         @always_inline
         def extract_obs(
-            states: LayoutTensor[
-                dtype,
-                Layout.row_major(BATCH_SIZE, STATE_SIZE_VAL),
-                ImmutAnyOrigin,
-            ],
-            obs: LayoutTensor[
-                dtype, Layout.row_major(BATCH_SIZE, OBS_DIM_VAL), MutAnyOrigin
-            ],
+            states: ImmTile[dtype, BATCH_SIZE, STATE_SIZE_VAL],
+            obs: Tile[dtype, BATCH_SIZE, OBS_DIM_VAL],
         ):
             var i = Int(block_dim.x * block_idx.x + thread_idx.x)
             if i >= BATCH_SIZE:
@@ -593,19 +535,11 @@ struct PendulumV2[DTYPE: DType](
         OBS_DIM: Int,
         ACTION_DIM: Int,
     ](
-        states: LayoutTensor[
-            dtype, Layout.row_major(BATCH_SIZE, STATE_SIZE), MutAnyOrigin
-        ],
-        actions: LayoutTensor[
-            dtype, Layout.row_major(BATCH_SIZE, ACTION_DIM), ImmutAnyOrigin
-        ],
-        rewards: LayoutTensor[
-            dtype, Layout.row_major(BATCH_SIZE), MutAnyOrigin
-        ],
-        dones: LayoutTensor[dtype, Layout.row_major(BATCH_SIZE), MutAnyOrigin],
-        obs: LayoutTensor[
-            dtype, Layout.row_major(BATCH_SIZE, OBS_DIM), MutAnyOrigin
-        ],
+        states: Tile[dtype, BATCH_SIZE, STATE_SIZE],
+        actions: ImmTile[dtype, BATCH_SIZE, ACTION_DIM],
+        rewards: Tile[dtype, BATCH_SIZE],
+        dones: Tile[dtype, BATCH_SIZE],
+        obs: Tile[dtype, BATCH_SIZE, OBS_DIM],
         env: Int,
     ):
         """Step a single environment (GPU-compatible inline function).
@@ -736,9 +670,7 @@ struct PendulumV2[DTYPE: DType](
         BATCH_SIZE: Int,
         STATE_SIZE: Int,
     ](
-        states: LayoutTensor[
-            dtype, Layout.row_major(BATCH_SIZE, STATE_SIZE), MutAnyOrigin
-        ],
+        states: Tile[dtype, BATCH_SIZE, STATE_SIZE],
         env: Int,
         seed: Int,
     ):

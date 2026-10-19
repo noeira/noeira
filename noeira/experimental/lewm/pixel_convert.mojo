@@ -12,14 +12,14 @@ covers both CPU (reference / offline ingest) and GPU (the batched path).
 
 from max.gpu import global_idx
 from max.gpu.host import DeviceContext
-from layout import Layout, LayoutTensor
+from noeira.core.tiles import RowMajor, Tile, tile
 
 from ...nn.constants import DT, TPB
 
 
 def _u8_hwc_to_chw_kernel[C: Int, H: Int, W: Int, BATCH: Int](
-    src: LayoutTensor[DType.uint8, Layout.row_major(BATCH * H * W * C), MutAnyOrigin],
-    dst: LayoutTensor[DT, Layout.row_major(BATCH * C * H * W), MutAnyOrigin],
+    src: Tile[DType.uint8, BATCH * H * W * C],
+    dst: Tile[DT, BATCH * C * H * W],
 ):
     comptime HWC = H * W * C
     var idx = Int(global_idx.x)
@@ -37,8 +37,8 @@ def _u8_hwc_to_chw_kernel[C: Int, H: Int, W: Int, BATCH: Int](
 
 
 def _u8_norm_kernel[N: Int](
-    src: LayoutTensor[DType.uint8, Layout.row_major(N), MutAnyOrigin],
-    dst: LayoutTensor[DT, Layout.row_major(N), MutAnyOrigin],
+    src: Tile[DType.uint8, N],
+    dst: Tile[DT, N],
 ):
     var idx = Int(global_idx.x)
     if idx < N:
@@ -69,10 +69,8 @@ def u8_to_fp32_norm[
         if not ctx:
             raise Error("u8_to_fp32_norm[target='gpu']: ctx required")
         var c = ctx.value()
-        var src_lt = LayoutTensor[
-            DType.uint8, Layout.row_major(N), so
-        ](src)
-        var dst_lt = LayoutTensor[DT, Layout.row_major(N), do](dst)
+        var src_lt = tile[N](src)
+        var dst_lt = tile[N](dst)
         comptime n_blocks = (N + TPB - 1) // TPB
         comptime kernel = _u8_norm_kernel[N]
         c.enqueue_function[kernel](
@@ -108,12 +106,8 @@ def u8_hwc_to_chw_norm[
         if not ctx:
             raise Error("u8_hwc_to_chw_norm[target='gpu']: ctx required")
         var c = ctx.value()
-        var src_lt = LayoutTensor[
-            DType.uint8, Layout.row_major(BATCH * HWC), so
-        ](src)
-        var dst_lt = LayoutTensor[
-            DT, Layout.row_major(BATCH * HWC), do
-        ](dst)
+        var src_lt = tile[BATCH * HWC](src)
+        var dst_lt = tile[BATCH * HWC](dst)
         comptime n = BATCH * HWC
         comptime n_blocks = (n + TPB - 1) // TPB
         comptime kernel = _u8_hwc_to_chw_kernel[C, H, W, BATCH]

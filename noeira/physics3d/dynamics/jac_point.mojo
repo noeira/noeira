@@ -45,7 +45,7 @@ checks magnitudes will not see it.
 """
 
 from std.collections import Array
-from layout import Layout, LayoutTensor
+from layout import TileTensor, TensorLayout
 from ..fields.scratch import Scratch
 
 from ..joint_types import JNT_FREE, JNT_BALL
@@ -68,10 +68,8 @@ from ..gpu.constants import (
 @always_inline
 def _is_self_or_ancestor[
     DTYPE: DType,
-    L_BODIES: Layout](
-    bodies: LayoutTensor[
-        DTYPE, L_BODIES, MutAnyOrigin
-    ],
+    L_BODIES: TensorLayout](
+    bodies: TileTensor[DTYPE, L_BODIES, MutAnyOrigin],
     body: Int,
     candidate: Int,
 ) -> Bool:
@@ -100,26 +98,18 @@ def _is_self_or_ancestor[
 def jac_point[
     DTYPE: DType,
     V_CAP: Int,
-    L_SUBTREE_COM: Layout,
-    L_JOINTS: Layout,
-    L_BODIES: Layout,
-    L_MMETA: Layout,
-    L_CDOF: Layout,
+    L_SUBTREE_COM: TensorLayout,
+    L_JOINTS: TensorLayout,
+    L_BODIES: TensorLayout,
+    L_MMETA: TensorLayout,
+    L_CDOF: TensorLayout,
 ](
     env: Int,
-    subtree_com: LayoutTensor[
-        DTYPE, L_SUBTREE_COM, MutAnyOrigin
-    ],
-    joints: LayoutTensor[
-        DTYPE, L_JOINTS, MutAnyOrigin
-    ],
-    bodies: LayoutTensor[
-        DTYPE, L_BODIES, MutAnyOrigin
-    ],
-    mmeta: LayoutTensor[
-        DTYPE, L_MMETA, MutAnyOrigin
-    ],
-    cdof: LayoutTensor[DTYPE, L_CDOF, MutAnyOrigin],
+    subtree_com: TileTensor[DTYPE, L_SUBTREE_COM, MutAnyOrigin],
+    joints: TileTensor[DTYPE, L_JOINTS, MutAnyOrigin],
+    bodies: TileTensor[DTYPE, L_BODIES, MutAnyOrigin],
+    mmeta: TileTensor[DTYPE, L_MMETA, MutAnyOrigin],
+    cdof: TileTensor[DTYPE, L_CDOF, MutAnyOrigin],
     body: Int,
     point_x: Scalar[DTYPE],
     point_y: Scalar[DTYPE],
@@ -208,34 +198,22 @@ def jac_point[
 def jac_site[
     DTYPE: DType,
     V_CAP: Int,
-    L_SUBTREE_COM: Layout,
-    L_JOINTS: Layout,
-    L_BODIES: Layout,
-    L_MMETA: Layout,
-    L_CDOF: Layout,
-    L_SITES: Layout,
-    L_SITE_XPOS: Layout,
+    L_SUBTREE_COM: TensorLayout,
+    L_JOINTS: TensorLayout,
+    L_BODIES: TensorLayout,
+    L_MMETA: TensorLayout,
+    L_CDOF: TensorLayout,
+    L_SITES: TensorLayout,
+    L_SITE_XPOS: TensorLayout,
 ](
     env: Int,
-    subtree_com: LayoutTensor[
-        DTYPE, L_SUBTREE_COM, MutAnyOrigin
-    ],
-    joints: LayoutTensor[
-        DTYPE, L_JOINTS, MutAnyOrigin
-    ],
-    bodies: LayoutTensor[
-        DTYPE, L_BODIES, MutAnyOrigin
-    ],
-    mmeta: LayoutTensor[
-        DTYPE, L_MMETA, MutAnyOrigin
-    ],
-    cdof: LayoutTensor[DTYPE, L_CDOF, MutAnyOrigin],
-    sites: LayoutTensor[
-        DTYPE, L_SITES, MutAnyOrigin
-    ],
-    site_xpos: LayoutTensor[
-        DTYPE, L_SITE_XPOS, MutAnyOrigin
-    ],
+    subtree_com: TileTensor[DTYPE, L_SUBTREE_COM, MutAnyOrigin],
+    joints: TileTensor[DTYPE, L_JOINTS, MutAnyOrigin],
+    bodies: TileTensor[DTYPE, L_BODIES, MutAnyOrigin],
+    mmeta: TileTensor[DTYPE, L_MMETA, MutAnyOrigin],
+    cdof: TileTensor[DTYPE, L_CDOF, MutAnyOrigin],
+    sites: TileTensor[DTYPE, L_SITES, MutAnyOrigin],
+    site_xpos: TileTensor[DTYPE, L_SITE_XPOS, MutAnyOrigin],
     site: Int,
     mut jacp: Scratch[Scalar[DTYPE], 3 * V_CAP],
     mut jacr: Scratch[Scalar[DTYPE], 3 * V_CAP],

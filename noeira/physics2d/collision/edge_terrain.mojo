@@ -9,7 +9,6 @@ Perfect for LunarLander with varying terrain heights.
 """
 
 from std.math import cos, sin, sqrt
-from layout import LayoutTensor, Layout
 from max.gpu import thread_idx, block_idx, block_dim
 from max.gpu.host import DeviceContext, DeviceBuffer
 from ..traits.collision import CollisionSystem
@@ -37,6 +36,7 @@ from ..constants import (
     CONTACT_NORMAL_IMPULSE,
     CONTACT_TANGENT_IMPULSE,
 )
+from noeira.core.tiles import Tile, ImmTile, tile
 
 # Maximum number of terrain edges per environment
 # Set to 128 to support BipedalWalker's more complex terrain
@@ -178,22 +178,10 @@ struct EdgeTerrainCollision(CollisionSystem):
         MAX_CONTACTS: Int = 16,
     ](
         self,
-        bodies: LayoutTensor[
-            dtype,
-            Layout.row_major(BATCH, NUM_BODIES, BODY_STATE_SIZE),
-            MutAnyOrigin,
-        ],
-        shapes: LayoutTensor[
-            dtype, Layout.row_major(NUM_SHAPES, SHAPE_MAX_SIZE), MutAnyOrigin
-        ],
-        mut contacts: LayoutTensor[
-            dtype,
-            Layout.row_major(BATCH, MAX_CONTACTS, CONTACT_DATA_SIZE),
-            MutAnyOrigin,
-        ],
-        mut contact_counts: LayoutTensor[
-            dtype, Layout.row_major(BATCH), MutAnyOrigin
-        ],
+        bodies: Tile[dtype, BATCH, NUM_BODIES, BODY_STATE_SIZE],
+        shapes: Tile[dtype, NUM_SHAPES, SHAPE_MAX_SIZE],
+        contacts: Tile[dtype, BATCH, MAX_CONTACTS, CONTACT_DATA_SIZE],
+        contact_counts: Tile[dtype, BATCH],
     ):
         """Detect terrain contacts for all bodies in all environments."""
         for env in range(BATCH):
@@ -444,30 +432,10 @@ struct EdgeTerrainCollision(CollisionSystem):
         env: Int,
         body_idx: Int,
         edge_idx: Int,
-        state: LayoutTensor[
-            dtype,
-            Layout.row_major(BATCH, STATE_SIZE),
-            MutAnyOrigin,
-        ],
-        shapes: LayoutTensor[
-            dtype, Layout.row_major(NUM_SHAPES, SHAPE_MAX_SIZE), ImmutAnyOrigin
-        ],
-        contacts: LayoutTensor[
-            dtype,
-            Layout.row_major(
-                BATCH,
-                NUM_BODIES * MAX_EDGES * MAX_CONTACTS_PER_BODY_EDGE,
-                CONTACT_DATA_SIZE,
-            ),
-            MutAnyOrigin,
-        ],
-        contact_flags: LayoutTensor[
-            dtype,
-            Layout.row_major(
-                BATCH, NUM_BODIES * MAX_EDGES * MAX_CONTACTS_PER_BODY_EDGE
-            ),
-            MutAnyOrigin,
-        ],
+        state: Tile[dtype, BATCH, STATE_SIZE],
+        shapes: ImmTile[dtype, NUM_SHAPES, SHAPE_MAX_SIZE],
+        contacts: Tile[dtype, BATCH, NUM_BODIES * MAX_EDGES * MAX_CONTACTS_PER_BODY_EDGE, CONTACT_DATA_SIZE],
+        contact_flags: Tile[dtype, BATCH, NUM_BODIES * MAX_EDGES * MAX_CONTACTS_PER_BODY_EDGE],
     ):
         """Detect collisions for a single (body, edge) pair.
 
@@ -647,25 +615,11 @@ struct EdgeTerrainCollision(CollisionSystem):
     ](
         env: Int,
         body_idx: Int,
-        state: LayoutTensor[
-            dtype,
-            Layout.row_major(BATCH, STATE_SIZE),
-            MutAnyOrigin,
-        ],
-        shapes: LayoutTensor[
-            dtype, Layout.row_major(NUM_SHAPES, SHAPE_MAX_SIZE), ImmutAnyOrigin
-        ],
+        state: Tile[dtype, BATCH, STATE_SIZE],
+        shapes: ImmTile[dtype, NUM_SHAPES, SHAPE_MAX_SIZE],
         n_edges: Int,
-        contacts: LayoutTensor[
-            dtype,
-            Layout.row_major(
-                BATCH, NUM_BODIES * MAX_CONTACTS_PER_BODY, CONTACT_DATA_SIZE
-            ),
-            MutAnyOrigin,
-        ],
-        body_contact_counts: LayoutTensor[
-            dtype, Layout.row_major(BATCH, NUM_BODIES), MutAnyOrigin
-        ],
+        contacts: Tile[dtype, BATCH, NUM_BODIES * MAX_CONTACTS_PER_BODY, CONTACT_DATA_SIZE],
+        body_contact_counts: Tile[dtype, BATCH, NUM_BODIES],
     ):
         """Detect collisions for a single body in a single environment.
 
@@ -870,23 +824,11 @@ struct EdgeTerrainCollision(CollisionSystem):
         EDGES_OFFSET: Int,
     ](
         env: Int,
-        state: LayoutTensor[
-            dtype,
-            Layout.row_major(BATCH, STATE_SIZE),
-            MutAnyOrigin,
-        ],
-        shapes: LayoutTensor[
-            dtype, Layout.row_major(NUM_SHAPES, SHAPE_MAX_SIZE), ImmutAnyOrigin
-        ],
+        state: Tile[dtype, BATCH, STATE_SIZE],
+        shapes: ImmTile[dtype, NUM_SHAPES, SHAPE_MAX_SIZE],
         n_edges: Int,
-        contacts: LayoutTensor[
-            dtype,
-            Layout.row_major(BATCH, MAX_CONTACTS, CONTACT_DATA_SIZE),
-            MutAnyOrigin,
-        ],
-        contact_counts: LayoutTensor[
-            dtype, Layout.row_major(BATCH), MutAnyOrigin
-        ],
+        contacts: Tile[dtype, BATCH, MAX_CONTACTS, CONTACT_DATA_SIZE],
+        contact_counts: Tile[dtype, BATCH],
     ):
         """Detect collisions for a single environment.
 
@@ -1088,23 +1030,11 @@ struct EdgeTerrainCollision(CollisionSystem):
         BODIES_OFFSET: Int,
         EDGES_OFFSET: Int,
     ](
-        state: LayoutTensor[
-            dtype,
-            Layout.row_major(BATCH, STATE_SIZE),
-            MutAnyOrigin,
-        ],
-        shapes: LayoutTensor[
-            dtype, Layout.row_major(NUM_SHAPES, SHAPE_MAX_SIZE), ImmutAnyOrigin
-        ],
-        edge_counts: LayoutTensor[dtype, Layout.row_major(BATCH), ImmutAnyOrigin],
-        contacts: LayoutTensor[
-            dtype,
-            Layout.row_major(BATCH, MAX_CONTACTS, CONTACT_DATA_SIZE),
-            MutAnyOrigin,
-        ],
-        contact_counts: LayoutTensor[
-            dtype, Layout.row_major(BATCH), MutAnyOrigin
-        ],
+        state: Tile[dtype, BATCH, STATE_SIZE],
+        shapes: ImmTile[dtype, NUM_SHAPES, SHAPE_MAX_SIZE],
+        edge_counts: ImmTile[dtype, BATCH],
+        contacts: Tile[dtype, BATCH, MAX_CONTACTS, CONTACT_DATA_SIZE],
+        contact_counts: Tile[dtype, BATCH],
     ):
         """GPU kernel for edge terrain collision with 2D strided layout."""
         var env = Int(block_dim.x * block_idx.x + thread_idx.x)
@@ -1144,45 +1074,21 @@ struct EdgeTerrainCollision(CollisionSystem):
         """Launch strided collision detection kernel on GPU."""
         # state/shapes/edge_counts read-only (mut=False views -> ImmutAnyOrigin
         # kernel params); contacts/contact_counts written (mut=True).
-        var state = LayoutTensor[
-            dtype, Layout.row_major(BATCH, STATE_SIZE)
-        ](state_buf)
-        var shapes = LayoutTensor[
-            dtype, Layout.row_major(NUM_SHAPES, SHAPE_MAX_SIZE)
-        ](shapes_buf)
-        var edge_counts = LayoutTensor[
-            dtype, Layout.row_major(BATCH)
-        ](edge_counts_buf)
-        var contacts = LayoutTensor[
-            dtype, Layout.row_major(BATCH, MAX_CONTACTS, CONTACT_DATA_SIZE)
-        ](contacts_buf)
-        var contact_counts = LayoutTensor[
-            dtype, Layout.row_major(BATCH)
-        ](contact_counts_buf)
+        var state = tile[BATCH, STATE_SIZE](state_buf)
+        var shapes = tile[NUM_SHAPES, SHAPE_MAX_SIZE](shapes_buf)
+        var edge_counts = tile[BATCH](edge_counts_buf)
+        var contacts = tile[BATCH, MAX_CONTACTS, CONTACT_DATA_SIZE](contacts_buf)
+        var contact_counts = tile[BATCH](contact_counts_buf)
 
         comptime BLOCKS = (BATCH + TPB - 1) // TPB
 
         @always_inline
         def kernel_wrapper(
-            state: LayoutTensor[
-                dtype, Layout.row_major(BATCH, STATE_SIZE), MutAnyOrigin
-            ],
-            shapes: LayoutTensor[
-                dtype,
-                Layout.row_major(NUM_SHAPES, SHAPE_MAX_SIZE),
-                ImmutAnyOrigin,
-            ],
-            edge_counts: LayoutTensor[
-                dtype, Layout.row_major(BATCH), ImmutAnyOrigin
-            ],
-            contacts: LayoutTensor[
-                dtype,
-                Layout.row_major(BATCH, MAX_CONTACTS, CONTACT_DATA_SIZE),
-                MutAnyOrigin,
-            ],
-            contact_counts: LayoutTensor[
-                dtype, Layout.row_major(BATCH), MutAnyOrigin
-            ],
+            state: Tile[dtype, BATCH, STATE_SIZE],
+            shapes: ImmTile[dtype, NUM_SHAPES, SHAPE_MAX_SIZE],
+            edge_counts: ImmTile[dtype, BATCH],
+            contacts: Tile[dtype, BATCH, MAX_CONTACTS, CONTACT_DATA_SIZE],
+            contact_counts: Tile[dtype, BATCH],
         ):
             EdgeTerrainCollision.detect_kernel[
                 BATCH,

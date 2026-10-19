@@ -26,7 +26,6 @@ from noeira.nn.core.param import walk_params, ParamVisitorRef
 from std.math import tanh
 from std.random import random_float64
 from std.time import perf_counter_ns
-from layout import Layout, LayoutTensor
 from max.gpu.host import DeviceContext, DeviceBuffer, HostBuffer
 
 from noeira.nn.constants import DT
@@ -64,6 +63,7 @@ from .wm_graph import TDMPC2WMGraph, NQ
 from .wm_step import WMStep
 from .policy_step import PolicyStep
 from .td_target_step import TDTargetStep
+from noeira.core.tiles import tile
 
 
 @always_inline
@@ -477,10 +477,8 @@ struct TDMPC2Agent[
             TensorRefs[1](self.act_ob), self.act_z, Optional(ctx)
         )
 
-        var z0_lt = self.act_z.lt["gpu", Layout.row_major(1, LAT)]()
-        var out_lt = LayoutTensor[DT, Layout.row_major(1 * A), MutAnyOrigin](
-            self.mpc_out.value()
-        )
+        var z0_lt = self.act_z.tt["gpu", 1, LAT]()
+        var out_lt = tile[1 * A](self.mpc_out.value())
         self.planner.value().plan_gpu[Self.MpcCB](
             ctx, self.mpc_cb.value(), z0_lt, out_lt,
             gamma=Float64(self.gamma),
@@ -1284,12 +1282,8 @@ struct TDMPC2Agent[
         var returns = List[Scalar[DT]]()
 
         for s in range(max_steps):
-            var obs_lt = LayoutTensor[
-                DT, Layout.row_major(EVAL_ENVS, OBSD), MutAnyOrigin
-            ](env.obs_ptr())
-            var act_lt = LayoutTensor[
-                DT, Layout.row_major(EVAL_ENVS, ACTD), MutAnyOrigin
-            ](env.action_ptr())
+            var obs_lt = tile[EVAL_ENVS, OBSD](env.obs_ptr())
+            var act_lt = tile[EVAL_ENVS, ACTD](env.action_ptr())
 
             comptime if USE_MPC:
                 tdmpc2_encode_batched[
@@ -1298,10 +1292,8 @@ struct TDMPC2Agent[
                 ev_planner.value().plan_gpu[EvCB](
                     ctx.value(),
                     ev_cb.value(),
-                    z_scr.lt["gpu", Layout.row_major(EVAL_ENVS, LAT)](),
-                    LayoutTensor[
-                        DT, Layout.row_major(EVAL_ENVS * ACTD), MutAnyOrigin
-                    ](env.action_ptr()),
+                    z_scr.tt["gpu", EVAL_ENVS, LAT](),
+                    tile[EVAL_ENVS * ACTD](env.action_ptr()),
                     gamma=Float64(self.gamma),
                     temperature=Float64(self.temperature),
                     action_scale=Float64(self.action_scale),
@@ -1514,12 +1506,8 @@ struct TDMPC2Agent[
             var step = it * N_ENVS          # env-steps done BEFORE this iter
             var gstep = base_step + step    # cumulative, for logging
 
-            var obs_lt = LayoutTensor[
-                DT, Layout.row_major(N_ENVS, OBSD), MutAnyOrigin
-            ](env.obs_ptr())
-            var act_lt = LayoutTensor[
-                DT, Layout.row_major(N_ENVS, ACTD), MutAnyOrigin
-            ](env.action_ptr())
+            var obs_lt = tile[N_ENVS, OBSD](env.obs_ptr())
+            var act_lt = tile[N_ENVS, ACTD](env.action_ptr())
 
             # ── 1. actions → env.action_ptr() ────────────────────────────
             # ⚠ Gate on the REPLAY COUNT, not the per-call step counter:
@@ -1541,10 +1529,8 @@ struct TDMPC2Agent[
                     planner.value().plan_gpu[TrCB](
                         ctx.value(),
                         cb.value(),
-                        z_scr.lt["gpu", Layout.row_major(N_ENVS, LAT)](),
-                        LayoutTensor[
-                            DT, Layout.row_major(N_ENVS * ACTD), MutAnyOrigin
-                        ](env.action_ptr()),
+                        z_scr.tt["gpu", N_ENVS, LAT](),
+                        tile[N_ENVS * ACTD](env.action_ptr()),
                         gamma=Float64(self.gamma),
                         temperature=Float64(self.temperature),
                         action_scale=Float64(self.action_scale),

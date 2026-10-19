@@ -28,7 +28,6 @@ The −sign on weight_grad is baked in (as in PCBlock) so callers can do
 `params -= lr·grads` directly. pull_back writes (does not accumulate) z_below.
 """
 
-from layout import Layout, LayoutTensor
 from max.gpu import thread_idx, block_idx, block_dim
 from max.gpu.host import DeviceContext
 from std.sys import CompilationTarget
@@ -38,6 +37,7 @@ from .pc_initializer import PCInitializer
 from .pc_apple_cblas import apple_sgemm_accum
 
 from .predictive_model import PCActivation, PCReLU, PCBlockTrait
+from noeira.core.tiles import Tile, tile
 
 
 struct ConvPCBlock[
@@ -85,15 +85,11 @@ struct ConvPCBlock[
     def pc_init_params[
         INIT: PCInitializer, dtype: DType = DType.float32
     ](
-        mut params: LayoutTensor[
-            dtype, Layout.row_major(Self.PARAM_SIZE), MutAnyOrigin
-        ],
+        params: Tile[dtype, Self.PARAM_SIZE],
     ) raises:
         """Init: conv W via INIT.fill(conv fan_in/out); zero per-channel b."""
         comptime W_SIZE = Self.out_channels * Self.col_size
-        var W_view = LayoutTensor[
-            dtype, Layout.row_major(W_SIZE), MutAnyOrigin
-        ](params.ptr)
+        var W_view = tile[W_SIZE](params.ptr)
         INIT.fill[
             W_SIZE,
             Self.in_channels * Self.kernel_size * Self.kernel_size,
@@ -112,9 +108,7 @@ struct ConvPCBlock[
     def _im2col_cpu[
         BATCH: Int, dtype: DType
     ](
-        a_below: LayoutTensor[
-            dtype, Layout.row_major(BATCH, Self.IN_DIM), MutAnyOrigin
-        ],
+        a_below: Tile[dtype, BATCH, Self.IN_DIM],
         mut cache: List[Scalar[dtype]],
     ):
         for b in range(BATCH):
@@ -161,18 +155,10 @@ struct ConvPCBlock[
     def predict[
         BATCH: Int, dtype: DType = DType.float32
     ](
-        x_below: LayoutTensor[
-            dtype, Layout.row_major(BATCH, Self.IN_DIM), MutAnyOrigin
-        ],
-        params: LayoutTensor[
-            dtype, Layout.row_major(Self.PARAM_SIZE), MutAnyOrigin
-        ],
-        mut mu: LayoutTensor[
-            dtype, Layout.row_major(BATCH, Self.OUT_DIM), MutAnyOrigin
-        ],
-        mut a_below: LayoutTensor[
-            dtype, Layout.row_major(BATCH, Self.IN_DIM), MutAnyOrigin
-        ],
+        x_below: Tile[dtype, BATCH, Self.IN_DIM],
+        params: Tile[dtype, Self.PARAM_SIZE],
+        mu: Tile[dtype, BATCH, Self.OUT_DIM],
+        a_below: Tile[dtype, BATCH, Self.IN_DIM],
     ):
         # a_below = ACT(x_below) (cached for weight_grad)
         Self.ACT.apply[BATCH, Self.IN_DIM, dtype](x_below, a_below)
@@ -182,15 +168,9 @@ struct ConvPCBlock[
     def _conv_forward[
         BATCH: Int, dtype: DType = DType.float32
     ](
-        a_below: LayoutTensor[
-            dtype, Layout.row_major(BATCH, Self.IN_DIM), MutAnyOrigin
-        ],
-        params: LayoutTensor[
-            dtype, Layout.row_major(Self.PARAM_SIZE), MutAnyOrigin
-        ],
-        mut mu: LayoutTensor[
-            dtype, Layout.row_major(BATCH, Self.OUT_DIM), MutAnyOrigin
-        ],
+        a_below: Tile[dtype, BATCH, Self.IN_DIM],
+        params: Tile[dtype, Self.PARAM_SIZE],
+        mu: Tile[dtype, BATCH, Self.OUT_DIM],
     ):
         """Conv-only forward (no activation): μ = Conv(a_below) + bias. Caller
         supplies the already-activated/normalized conv input. Reused by
@@ -291,15 +271,9 @@ struct ConvPCBlock[
     def eps_compute[
         BATCH: Int, dtype: DType = DType.float32
     ](
-        x_above: LayoutTensor[
-            dtype, Layout.row_major(BATCH, Self.OUT_DIM), MutAnyOrigin
-        ],
-        mu: LayoutTensor[
-            dtype, Layout.row_major(BATCH, Self.OUT_DIM), MutAnyOrigin
-        ],
-        mut eps: LayoutTensor[
-            dtype, Layout.row_major(BATCH, Self.OUT_DIM), MutAnyOrigin
-        ],
+        x_above: Tile[dtype, BATCH, Self.OUT_DIM],
+        mu: Tile[dtype, BATCH, Self.OUT_DIM],
+        eps: Tile[dtype, BATCH, Self.OUT_DIM],
     ):
         # ε = x_above − μ (elementwise; scalar LayoutTensor indexing).
         for sb in range(BATCH):
@@ -314,15 +288,9 @@ struct ConvPCBlock[
     def pull_back[
         BATCH: Int, dtype: DType = DType.float32
     ](
-        eps_above: LayoutTensor[
-            dtype, Layout.row_major(BATCH, Self.OUT_DIM), MutAnyOrigin
-        ],
-        params: LayoutTensor[
-            dtype, Layout.row_major(Self.PARAM_SIZE), MutAnyOrigin
-        ],
-        mut z_below: LayoutTensor[
-            dtype, Layout.row_major(BATCH, Self.IN_DIM), MutAnyOrigin
-        ],
+        eps_above: Tile[dtype, BATCH, Self.OUT_DIM],
+        params: Tile[dtype, Self.PARAM_SIZE],
+        z_below: Tile[dtype, BATCH, Self.IN_DIM],
     ):
         comptime use_apple = CompilationTarget.is_macos() and (
             dtype == DType.float32
@@ -452,15 +420,9 @@ struct ConvPCBlock[
     def act_derivative_mul[
         BATCH: Int, dtype: DType = DType.float32
     ](
-        x_below: LayoutTensor[
-            dtype, Layout.row_major(BATCH, Self.IN_DIM), MutAnyOrigin
-        ],
-        z_in: LayoutTensor[
-            dtype, Layout.row_major(BATCH, Self.IN_DIM), MutAnyOrigin
-        ],
-        mut z_out: LayoutTensor[
-            dtype, Layout.row_major(BATCH, Self.IN_DIM), MutAnyOrigin
-        ],
+        x_below: Tile[dtype, BATCH, Self.IN_DIM],
+        z_in: Tile[dtype, BATCH, Self.IN_DIM],
+        z_out: Tile[dtype, BATCH, Self.IN_DIM],
     ):
         Self.ACT.apply_derivative_mul[BATCH, Self.IN_DIM, dtype](
             x_below, z_in, z_out
@@ -474,15 +436,9 @@ struct ConvPCBlock[
     def weight_grad[
         BATCH: Int, dtype: DType = DType.float32
     ](
-        eps_above: LayoutTensor[
-            dtype, Layout.row_major(BATCH, Self.OUT_DIM), MutAnyOrigin
-        ],
-        a_below: LayoutTensor[
-            dtype, Layout.row_major(BATCH, Self.IN_DIM), MutAnyOrigin
-        ],
-        mut grads: LayoutTensor[
-            dtype, Layout.row_major(Self.PARAM_SIZE), MutAnyOrigin
-        ],
+        eps_above: Tile[dtype, BATCH, Self.OUT_DIM],
+        a_below: Tile[dtype, BATCH, Self.IN_DIM],
+        grads: Tile[dtype, Self.PARAM_SIZE],
     ):
         comptime W_SIZE = Self.out_channels * Self.col_size
         comptime use_apple = CompilationTarget.is_macos() and (
@@ -588,15 +544,9 @@ struct ConvPCBlock[
     def _predict_conv_kernel[
         BATCH: Int, dtype: DType
     ](
-        a_below: LayoutTensor[
-            dtype, Layout.row_major(BATCH, Self.IN_DIM), MutAnyOrigin
-        ],
-        params: LayoutTensor[
-            dtype, Layout.row_major(Self.PARAM_SIZE), MutAnyOrigin
-        ],
-        mu: LayoutTensor[
-            dtype, Layout.row_major(BATCH, Self.OUT_DIM), MutAnyOrigin
-        ],
+        a_below: Tile[dtype, BATCH, Self.IN_DIM],
+        params: Tile[dtype, Self.PARAM_SIZE],
+        mu: Tile[dtype, BATCH, Self.OUT_DIM],
     ):
         var idx = Int(block_dim.x * block_idx.x + thread_idx.x)
         if idx >= BATCH * Self.OUT_DIM:
@@ -638,15 +588,9 @@ struct ConvPCBlock[
     def _eps_kernel[
         BATCH: Int, dtype: DType
     ](
-        x_above: LayoutTensor[
-            dtype, Layout.row_major(BATCH, Self.OUT_DIM), MutAnyOrigin
-        ],
-        mu: LayoutTensor[
-            dtype, Layout.row_major(BATCH, Self.OUT_DIM), MutAnyOrigin
-        ],
-        eps: LayoutTensor[
-            dtype, Layout.row_major(BATCH, Self.OUT_DIM), MutAnyOrigin
-        ],
+        x_above: Tile[dtype, BATCH, Self.OUT_DIM],
+        mu: Tile[dtype, BATCH, Self.OUT_DIM],
+        eps: Tile[dtype, BATCH, Self.OUT_DIM],
     ):
         var idx = Int(block_dim.x * block_idx.x + thread_idx.x)
         if idx >= BATCH * Self.OUT_DIM:
@@ -657,15 +601,9 @@ struct ConvPCBlock[
     def _pull_back_kernel[
         BATCH: Int, dtype: DType
     ](
-        eps_above: LayoutTensor[
-            dtype, Layout.row_major(BATCH, Self.OUT_DIM), MutAnyOrigin
-        ],
-        params: LayoutTensor[
-            dtype, Layout.row_major(Self.PARAM_SIZE), MutAnyOrigin
-        ],
-        z_below: LayoutTensor[
-            dtype, Layout.row_major(BATCH, Self.IN_DIM), MutAnyOrigin
-        ],
+        eps_above: Tile[dtype, BATCH, Self.OUT_DIM],
+        params: Tile[dtype, Self.PARAM_SIZE],
+        z_below: Tile[dtype, BATCH, Self.IN_DIM],
     ):
         # One thread per input element (gather over all outputs whose
         # receptive field covers it): z[b,in_idx] = Σ_{oc,kh,kw} W·ε.
@@ -711,15 +649,9 @@ struct ConvPCBlock[
     def _weight_grad_W_kernel[
         BATCH: Int, dtype: DType
     ](
-        eps_above: LayoutTensor[
-            dtype, Layout.row_major(BATCH, Self.OUT_DIM), MutAnyOrigin
-        ],
-        a_below: LayoutTensor[
-            dtype, Layout.row_major(BATCH, Self.IN_DIM), MutAnyOrigin
-        ],
-        grads: LayoutTensor[
-            dtype, Layout.row_major(Self.PARAM_SIZE), MutAnyOrigin
-        ],
+        eps_above: Tile[dtype, BATCH, Self.OUT_DIM],
+        a_below: Tile[dtype, BATCH, Self.IN_DIM],
+        grads: Tile[dtype, Self.PARAM_SIZE],
     ):
         # One thread per weight (oc, c_k): dW = −Σ_{b,oh,ow} ε·a_below_patch.
         var idx = Int(block_dim.x * block_idx.x + thread_idx.x)
@@ -759,12 +691,8 @@ struct ConvPCBlock[
     def _weight_grad_b_kernel[
         BATCH: Int, dtype: DType
     ](
-        eps_above: LayoutTensor[
-            dtype, Layout.row_major(BATCH, Self.OUT_DIM), MutAnyOrigin
-        ],
-        grads: LayoutTensor[
-            dtype, Layout.row_major(Self.PARAM_SIZE), MutAnyOrigin
-        ],
+        eps_above: Tile[dtype, BATCH, Self.OUT_DIM],
+        grads: Tile[dtype, Self.PARAM_SIZE],
     ):
         # One thread per output channel: db = −Σ_{b,oh,ow} ε.
         var oc = Int(block_dim.x * block_idx.x + thread_idx.x)
@@ -786,18 +714,10 @@ struct ConvPCBlock[
         BATCH: Int, dtype: DType = DType.float32
     ](
         ctx: DeviceContext,
-        x_below: LayoutTensor[
-            dtype, Layout.row_major(BATCH, Self.IN_DIM), MutAnyOrigin
-        ],
-        params: LayoutTensor[
-            dtype, Layout.row_major(Self.PARAM_SIZE), MutAnyOrigin
-        ],
-        mut mu: LayoutTensor[
-            dtype, Layout.row_major(BATCH, Self.OUT_DIM), MutAnyOrigin
-        ],
-        mut a_below: LayoutTensor[
-            dtype, Layout.row_major(BATCH, Self.IN_DIM), MutAnyOrigin
-        ],
+        x_below: Tile[dtype, BATCH, Self.IN_DIM],
+        params: Tile[dtype, Self.PARAM_SIZE],
+        mu: Tile[dtype, BATCH, Self.OUT_DIM],
+        a_below: Tile[dtype, BATCH, Self.IN_DIM],
     ) raises:
         Self.ACT.apply_gpu[BATCH, Self.IN_DIM, dtype](ctx, x_below, a_below)
         comptime k = Self._predict_conv_kernel[BATCH, dtype]
@@ -812,15 +732,9 @@ struct ConvPCBlock[
         BATCH: Int, dtype: DType = DType.float32
     ](
         ctx: DeviceContext,
-        x_above: LayoutTensor[
-            dtype, Layout.row_major(BATCH, Self.OUT_DIM), MutAnyOrigin
-        ],
-        mu: LayoutTensor[
-            dtype, Layout.row_major(BATCH, Self.OUT_DIM), MutAnyOrigin
-        ],
-        mut eps: LayoutTensor[
-            dtype, Layout.row_major(BATCH, Self.OUT_DIM), MutAnyOrigin
-        ],
+        x_above: Tile[dtype, BATCH, Self.OUT_DIM],
+        mu: Tile[dtype, BATCH, Self.OUT_DIM],
+        eps: Tile[dtype, BATCH, Self.OUT_DIM],
     ) raises:
         comptime k = Self._eps_kernel[BATCH, dtype]
         var threads = BATCH * Self.OUT_DIM
@@ -834,15 +748,9 @@ struct ConvPCBlock[
         BATCH: Int, dtype: DType = DType.float32
     ](
         ctx: DeviceContext,
-        eps_above: LayoutTensor[
-            dtype, Layout.row_major(BATCH, Self.OUT_DIM), MutAnyOrigin
-        ],
-        params: LayoutTensor[
-            dtype, Layout.row_major(Self.PARAM_SIZE), MutAnyOrigin
-        ],
-        mut z_below: LayoutTensor[
-            dtype, Layout.row_major(BATCH, Self.IN_DIM), MutAnyOrigin
-        ],
+        eps_above: Tile[dtype, BATCH, Self.OUT_DIM],
+        params: Tile[dtype, Self.PARAM_SIZE],
+        z_below: Tile[dtype, BATCH, Self.IN_DIM],
     ) raises:
         comptime k = Self._pull_back_kernel[BATCH, dtype]
         var threads = BATCH * Self.IN_DIM
@@ -856,15 +764,9 @@ struct ConvPCBlock[
         BATCH: Int, dtype: DType = DType.float32
     ](
         ctx: DeviceContext,
-        x_below: LayoutTensor[
-            dtype, Layout.row_major(BATCH, Self.IN_DIM), MutAnyOrigin
-        ],
-        z_in: LayoutTensor[
-            dtype, Layout.row_major(BATCH, Self.IN_DIM), MutAnyOrigin
-        ],
-        mut z_out: LayoutTensor[
-            dtype, Layout.row_major(BATCH, Self.IN_DIM), MutAnyOrigin
-        ],
+        x_below: Tile[dtype, BATCH, Self.IN_DIM],
+        z_in: Tile[dtype, BATCH, Self.IN_DIM],
+        z_out: Tile[dtype, BATCH, Self.IN_DIM],
     ) raises:
         Self.ACT.apply_derivative_mul_gpu[BATCH, Self.IN_DIM, dtype](
             ctx, x_below, z_in, z_out
@@ -875,15 +777,9 @@ struct ConvPCBlock[
         BATCH: Int, dtype: DType = DType.float32
     ](
         ctx: DeviceContext,
-        eps_above: LayoutTensor[
-            dtype, Layout.row_major(BATCH, Self.OUT_DIM), MutAnyOrigin
-        ],
-        a_below: LayoutTensor[
-            dtype, Layout.row_major(BATCH, Self.IN_DIM), MutAnyOrigin
-        ],
-        mut grads: LayoutTensor[
-            dtype, Layout.row_major(Self.PARAM_SIZE), MutAnyOrigin
-        ],
+        eps_above: Tile[dtype, BATCH, Self.OUT_DIM],
+        a_below: Tile[dtype, BATCH, Self.IN_DIM],
+        grads: Tile[dtype, Self.PARAM_SIZE],
     ) raises:
         comptime kw = Self._weight_grad_W_kernel[BATCH, dtype]
         var w_threads = Self.out_channels * Self.col_size

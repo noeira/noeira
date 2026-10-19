@@ -12,7 +12,8 @@ from max.gpu import thread_idx, block_idx, block_dim
 from max.gpu.sync import barrier
 from max.gpu.memory import AddressSpace
 from max.gpu.host import DeviceContext
-from layout import Layout, LayoutTensor
+from layout import TileTensor, TensorLayout
+from noeira.core.tiles import RowMajor, Tile, shared_tile
 
 from ..kinematics.quat_math import gpu_quat_mul
 from ..joint_types import JNT_FREE, JNT_BALL
@@ -56,21 +57,15 @@ def _mm_setup_env[
     V_CAP: Int,
     B6_CAP: Int,
     MASK_CAP: Int,
-    L_XQUAT: Layout,
-    L_BODIES: Layout,
-    L_JOINTS: Layout,
+    L_XQUAT: TensorLayout,
+    L_BODIES: TensorLayout,
+    L_JOINTS: TensorLayout,
 ](
     env: Int,
     dims: D,
-    xquat: LayoutTensor[
-        DTYPE, L_XQUAT, MutAnyOrigin
-    ],
-    bodies: LayoutTensor[
-        DTYPE, L_BODIES, MutAnyOrigin
-    ],
-    joints: LayoutTensor[
-        DTYPE, L_JOINTS, MutAnyOrigin
-    ],
+    xquat: TileTensor[DTYPE, L_XQUAT, MutAnyOrigin],
+    bodies: TileTensor[DTYPE, L_BODIES, MutAnyOrigin],
+    joints: TileTensor[DTYPE, L_JOINTS, MutAnyOrigin],
     mut dof_body: Scratch[Int, V_CAP],
     mut I_world: Scratch[Scalar[DTYPE], B6_CAP],
     mut subtree_mask: Scratch[Bool, MASK_CAP],
@@ -170,25 +165,19 @@ def _mm_row_env[
     V_CAP: Int,
     B6_CAP: Int,
     MASK_CAP: Int,
-    L_XIPOS: Layout,
-    L_BODIES: Layout,
-    L_CDOF: Layout,
-    L_M: Layout,
+    L_XIPOS: TensorLayout,
+    L_BODIES: TensorLayout,
+    L_CDOF: TensorLayout,
+    L_M: TensorLayout,
 ](
     env: Int,
     i: Int,
     dims: D,
-    xipos: LayoutTensor[
-        DTYPE, L_XIPOS, MutAnyOrigin
-    ],
-    subtree_com: LayoutTensor[
-        DTYPE, L_XIPOS, MutAnyOrigin
-    ],
-    bodies: LayoutTensor[
-        DTYPE, L_BODIES, MutAnyOrigin
-    ],
-    cdof: LayoutTensor[DTYPE, L_CDOF, MutAnyOrigin],
-    M: LayoutTensor[DTYPE, L_M, MutAnyOrigin],
+    xipos: TileTensor[DTYPE, L_XIPOS, MutAnyOrigin],
+    subtree_com: TileTensor[DTYPE, L_XIPOS, MutAnyOrigin],
+    bodies: TileTensor[DTYPE, L_BODIES, MutAnyOrigin],
+    cdof: TileTensor[DTYPE, L_CDOF, MutAnyOrigin],
+    M: TileTensor[DTYPE, L_M, MutAnyOrigin],
     dof_body: Scratch[Int, V_CAP],
     I_world: Scratch[Scalar[DTYPE], B6_CAP],
     subtree_mask: Scratch[Bool, MASK_CAP],
@@ -215,7 +204,7 @@ def _mm_row_env[
             var lj1 = cdof[env, j * 6 + 4]
             var lj2 = cdof[env, j * 6 + 5]
 
-            var mij: M.element_type = 0
+            var mij: M.ElementType = 0
 
             for k in range(nbody):
                 if not subtree_mask[k * nbody + body_i]:
@@ -290,32 +279,22 @@ def _mm_row_env[
 def _mass_matrix_env[
     DTYPE: DType,
     D: DimsLike,
-    L_XQUAT: Layout,
-    L_XIPOS: Layout,
-    L_BODIES: Layout,
-    L_JOINTS: Layout,
-    L_CDOF: Layout,
-    L_M: Layout,
+    L_XQUAT: TensorLayout,
+    L_XIPOS: TensorLayout,
+    L_BODIES: TensorLayout,
+    L_JOINTS: TensorLayout,
+    L_CDOF: TensorLayout,
+    L_M: TensorLayout,
 ](
     env: Int,
     dims: D,
-    xquat: LayoutTensor[
-        DTYPE, L_XQUAT, MutAnyOrigin
-    ],
-    xipos: LayoutTensor[
-        DTYPE, L_XIPOS, MutAnyOrigin
-    ],
-    subtree_com: LayoutTensor[
-        DTYPE, L_XIPOS, MutAnyOrigin
-    ],
-    bodies: LayoutTensor[
-        DTYPE, L_BODIES, MutAnyOrigin
-    ],
-    joints: LayoutTensor[
-        DTYPE, L_JOINTS, MutAnyOrigin
-    ],
-    cdof: LayoutTensor[DTYPE, L_CDOF, MutAnyOrigin],
-    M: LayoutTensor[DTYPE, L_M, MutAnyOrigin],
+    xquat: TileTensor[DTYPE, L_XQUAT, MutAnyOrigin],
+    xipos: TileTensor[DTYPE, L_XIPOS, MutAnyOrigin],
+    subtree_com: TileTensor[DTYPE, L_XIPOS, MutAnyOrigin],
+    bodies: TileTensor[DTYPE, L_BODIES, MutAnyOrigin],
+    joints: TileTensor[DTYPE, L_JOINTS, MutAnyOrigin],
+    cdof: TileTensor[DTYPE, L_CDOF, MutAnyOrigin],
+    M: TileTensor[DTYPE, L_M, MutAnyOrigin],
 ):
     """Full nv x nv mass matrix for one env (arithmetic verbatim from
     compute_mass_matrix_full_gpu; setup/row bodies now live in the shared
@@ -370,23 +349,13 @@ def _mass_matrix_fields_mt_kernel[
     BATCH: Int,
     N_THREADS: Int,
 ](
-    xquat: LayoutTensor[
-        DTYPE, Layout.row_major(BATCH, NBODY * 4), MutAnyOrigin
-    ],
-    xipos: LayoutTensor[
-        DTYPE, Layout.row_major(BATCH, NBODY * 3), MutAnyOrigin
-    ],
-    subtree_com: LayoutTensor[
-        DTYPE, Layout.row_major(BATCH, NBODY * 3), MutAnyOrigin
-    ],
-    bodies: LayoutTensor[
-        DTYPE, Layout.row_major(NBODY, MODEL_BODY_SIZE), MutAnyOrigin
-    ],
-    joints: LayoutTensor[
-        DTYPE, Layout.row_major(NJOINT, MODEL_JOINT_SIZE), MutAnyOrigin
-    ],
-    cdof: LayoutTensor[DTYPE, Layout.row_major(BATCH, NV * 6), MutAnyOrigin],
-    M: LayoutTensor[DTYPE, Layout.row_major(BATCH, NV * NV), MutAnyOrigin],
+    xquat: Tile[DTYPE, BATCH, NBODY * 4],
+    xipos: Tile[DTYPE, BATCH, NBODY * 3],
+    subtree_com: Tile[DTYPE, BATCH, NBODY * 3],
+    bodies: Tile[DTYPE, NBODY, MODEL_BODY_SIZE],
+    joints: Tile[DTYPE, NJOINT, MODEL_JOINT_SIZE],
+    cdof: Tile[DTYPE, BATCH, NV * 6],
+    M: Tile[DTYPE, BATCH, NV * NV],
 ):
     var env = Int(block_idx.x)
     var tid = Int(thread_idx.x)
@@ -453,34 +422,24 @@ def _mm_treewalk_env[
     N_THREADS: Int,
     GPU: Bool,
     D: DimsLike,
-    L_XQUAT: Layout,
-    L_XIPOS: Layout,
-    L_BODIES: Layout,
-    L_JOINTS: Layout,
-    L_CDOF: Layout,
-    L_M: Layout,
+    L_XQUAT: TensorLayout,
+    L_XIPOS: TensorLayout,
+    L_BODIES: TensorLayout,
+    L_JOINTS: TensorLayout,
+    L_CDOF: TensorLayout,
+    L_M: TensorLayout,
     CMP_AS: AddressSpace = AddressSpace.GENERIC,
 ](
     env: Int,
     tid: Int,
     dims: D,
-    xquat: LayoutTensor[
-        DTYPE, L_XQUAT, MutAnyOrigin
-    ],
-    xipos: LayoutTensor[
-        DTYPE, L_XIPOS, MutAnyOrigin
-    ],
-    subtree_com: LayoutTensor[
-        DTYPE, L_XIPOS, MutAnyOrigin
-    ],
-    bodies: LayoutTensor[
-        DTYPE, L_BODIES, MutAnyOrigin
-    ],
-    joints: LayoutTensor[
-        DTYPE, L_JOINTS, MutAnyOrigin
-    ],
-    cdof: LayoutTensor[DTYPE, L_CDOF, MutAnyOrigin],
-    M: LayoutTensor[DTYPE, L_M, MutAnyOrigin],
+    xquat: TileTensor[DTYPE, L_XQUAT, MutAnyOrigin],
+    xipos: TileTensor[DTYPE, L_XIPOS, MutAnyOrigin],
+    subtree_com: TileTensor[DTYPE, L_XIPOS, MutAnyOrigin],
+    bodies: TileTensor[DTYPE, L_BODIES, MutAnyOrigin],
+    joints: TileTensor[DTYPE, L_JOINTS, MutAnyOrigin],
+    cdof: TileTensor[DTYPE, L_CDOF, MutAnyOrigin],
+    M: TileTensor[DTYPE, L_M, MutAnyOrigin],
     # ⚠⚠ THE COMPOSITE INERTIA, OWNED BY THE CALLER AND SHARED ACROSS THE
     # BLOCK ON GPU. It used to be a per-thread `Scratch`, so every one of the
     # `N_THREADS = NV` threads rebuilt the whole `nbody`-body composite —
@@ -716,23 +675,13 @@ def _mass_matrix_treewalk_fields_mt_kernel[
     BATCH: Int,
     N_THREADS: Int,
 ](
-    xquat: LayoutTensor[
-        DTYPE, Layout.row_major(BATCH, NBODY * 4), MutAnyOrigin
-    ],
-    xipos: LayoutTensor[
-        DTYPE, Layout.row_major(BATCH, NBODY * 3), MutAnyOrigin
-    ],
-    subtree_com: LayoutTensor[
-        DTYPE, Layout.row_major(BATCH, NBODY * 3), MutAnyOrigin
-    ],
-    bodies: LayoutTensor[
-        DTYPE, Layout.row_major(NBODY, MODEL_BODY_SIZE), MutAnyOrigin
-    ],
-    joints: LayoutTensor[
-        DTYPE, Layout.row_major(NJOINT, MODEL_JOINT_SIZE), MutAnyOrigin
-    ],
-    cdof: LayoutTensor[DTYPE, Layout.row_major(BATCH, NV * 6), MutAnyOrigin],
-    M: LayoutTensor[DTYPE, Layout.row_major(BATCH, NV * NV), MutAnyOrigin],
+    xquat: Tile[DTYPE, BATCH, NBODY * 4],
+    xipos: Tile[DTYPE, BATCH, NBODY * 3],
+    subtree_com: Tile[DTYPE, BATCH, NBODY * 3],
+    bodies: Tile[DTYPE, NBODY, MODEL_BODY_SIZE],
+    joints: Tile[DTYPE, NJOINT, MODEL_JOINT_SIZE],
+    cdof: Tile[DTYPE, BATCH, NV * 6],
+    M: Tile[DTYPE, BATCH, NV * NV],
 ):
     # ⚠ ONE COMPOSITE INERTIA PER BLOCK, not one per thread. `NBODY*10`
     # scalars — 880 B at k=13 against this kernel's otherwise trivial
@@ -740,14 +689,8 @@ def _mass_matrix_treewalk_fields_mt_kernel[
     # array. Allocated HERE rather than inside `_mm_treewalk_env` because
     # shared memory belongs to the kernel scope; the env function takes a
     # pointer so the CPU leg can hand it a `Scratch` instead.
-    var comp_sh = LayoutTensor[
-        DTYPE, Layout.row_major(NBODY * 10), MutAnyOrigin,
-        address_space=AddressSpace.SHARED,
-    ].stack_allocation()
-    var topo_sh = LayoutTensor[
-        DType.int32, Layout.row_major(2 * NV + 2 * NBODY), MutAnyOrigin,
-        address_space=AddressSpace.SHARED,
-    ].stack_allocation()
+    var comp_sh = shared_tile[DTYPE, NBODY * 10]()
+    var topo_sh = shared_tile[DType.int32, 2 * NV + 2 * NBODY]()
     _mm_treewalk_env[DTYPE, N_THREADS, True, CMP_AS = AddressSpace.SHARED](
         Int(block_idx.x), Int(thread_idx.x),
         Dims[nv=NV, nbody=NBODY, njoint=NJOINT](),
@@ -763,23 +706,13 @@ def _mass_matrix_fields_kernel[
     NJOINT: Int,
     BATCH: Int,
 ](
-    xquat: LayoutTensor[
-        DTYPE, Layout.row_major(BATCH, NBODY * 4), MutAnyOrigin
-    ],
-    xipos: LayoutTensor[
-        DTYPE, Layout.row_major(BATCH, NBODY * 3), MutAnyOrigin
-    ],
-    subtree_com: LayoutTensor[
-        DTYPE, Layout.row_major(BATCH, NBODY * 3), MutAnyOrigin
-    ],
-    bodies: LayoutTensor[
-        DTYPE, Layout.row_major(NBODY, MODEL_BODY_SIZE), MutAnyOrigin
-    ],
-    joints: LayoutTensor[
-        DTYPE, Layout.row_major(NJOINT, MODEL_JOINT_SIZE), MutAnyOrigin
-    ],
-    cdof: LayoutTensor[DTYPE, Layout.row_major(BATCH, NV * 6), MutAnyOrigin],
-    M: LayoutTensor[DTYPE, Layout.row_major(BATCH, NV * NV), MutAnyOrigin],
+    xquat: Tile[DTYPE, BATCH, NBODY * 4],
+    xipos: Tile[DTYPE, BATCH, NBODY * 3],
+    subtree_com: Tile[DTYPE, BATCH, NBODY * 3],
+    bodies: Tile[DTYPE, NBODY, MODEL_BODY_SIZE],
+    joints: Tile[DTYPE, NJOINT, MODEL_JOINT_SIZE],
+    cdof: Tile[DTYPE, BATCH, NV * 6],
+    M: Tile[DTYPE, BATCH, NV * NV],
 ):
     var env = Int(block_dim.x * block_idx.x + thread_idx.x)
     if env >= BATCH:
@@ -822,12 +755,12 @@ def compute_mass_matrix[
     the dense kernel — the viewer, every test and every single-env rollout.
     The requirement was never real: the cooperative kernel's only
     parallelism is two strided loops, and N_THREADS=1 collapses them."""
-    comptime L_B3 = Layout.row_major(BATCH, D.NBODY * 3)
-    comptime L_B4 = Layout.row_major(BATCH, D.NBODY * 4)
-    comptime L_BODY = Layout.row_major(D.NBODY, MODEL_BODY_SIZE)
-    comptime L_JOINT = Layout.row_major(D.NJOINT, MODEL_JOINT_SIZE)
-    comptime L_CDOF = Layout.row_major(BATCH, D.NV * 6)
-    comptime L_M = Layout.row_major(BATCH, D.NV * D.NV)
+    comptime L_B3 = RowMajor[BATCH, D.NBODY * 3]
+    comptime L_B4 = RowMajor[BATCH, D.NBODY * 4]
+    comptime L_BODY = RowMajor[D.NBODY, MODEL_BODY_SIZE]
+    comptime L_JOINT = RowMajor[D.NJOINT, MODEL_JOINT_SIZE]
+    comptime L_CDOF = RowMajor[BATCH, D.NV * 6]
+    comptime L_M = RowMajor[BATCH, D.NV * D.NV]
 
     comptime if target == "cpu":
         var dm = d.dims
@@ -837,13 +770,13 @@ def compute_mass_matrix[
         var rl_JOINT = rl2(dm.get_njoint(), MODEL_JOINT_SIZE)
         var rl_CDOF = rl2(BATCH, dm.get_nv() * 6)
         var rl_M = rl2(BATCH, dm.get_nv() * dm.get_nv())
-        var xquat_v = d.xquat.lt_dyn["cpu", DYN2](rl_B4)
-        var xipos_v = d.xipos.lt_dyn["cpu", DYN2](rl_B3)
-        var stcom_v = d.subtree_com.lt_dyn["cpu", DYN2](rl_B3)
-        var bodies_v = m.bodies.lt_dyn["cpu", DYN2](rl_BODY)
-        var joints_v = m.joints.lt_dyn["cpu", DYN2](rl_JOINT)
-        var cdof_v = scratch.cdof.lt_dyn["cpu", DYN2](rl_CDOF)
-        var M_v = scratch.M.lt_dyn["cpu", DYN2](rl_M)
+        var xquat_v = d.xquat.tt_dyn["cpu", DYN2](rl_B4)
+        var xipos_v = d.xipos.tt_dyn["cpu", DYN2](rl_B3)
+        var stcom_v = d.subtree_com.tt_dyn["cpu", DYN2](rl_B3)
+        var bodies_v = m.bodies.tt_dyn["cpu", DYN2](rl_BODY)
+        var joints_v = m.joints.tt_dyn["cpu", DYN2](rl_JOINT)
+        var cdof_v = scratch.cdof.tt_dyn["cpu", DYN2](rl_CDOF)
+        var M_v = scratch.M.tt_dyn["cpu", DYN2](rl_M)
         comptime if TREEWALK:
             # The CPU twin of the kernel's shared array. `N_THREADS == 1`, so
             # one buffer serves the single "thread"; hoisted out of the env
@@ -876,13 +809,13 @@ def compute_mass_matrix[
                 DTYPE, D.NV, D.NBODY, D.NJOINT, BATCH, MT_T
             ]
         ](
-            d.xquat.lt["gpu", L_B4](),
-            d.xipos.lt["gpu", L_B3](),
-            d.subtree_com.lt["gpu", L_B3](),
-            m.bodies.lt["gpu", L_BODY](),
-            m.joints.lt["gpu", L_JOINT](),
-            scratch.cdof.lt["gpu", L_CDOF](),
-            scratch.M.lt["gpu", L_M](),
+            d.xquat.tt["gpu", BATCH, D.NBODY * 4](),
+            d.xipos.tt["gpu", BATCH, D.NBODY * 3](),
+            d.subtree_com.tt["gpu", BATCH, D.NBODY * 3](),
+            m.bodies.tt["gpu", D.NBODY, MODEL_BODY_SIZE](),
+            m.joints.tt["gpu", D.NJOINT, MODEL_JOINT_SIZE](),
+            scratch.cdof.tt["gpu", BATCH, D.NV * 6](),
+            scratch.M.tt["gpu", BATCH, D.NV * D.NV](),
             grid_dim=(BATCH,),
             block_dim=(MT_T,),
         )
@@ -894,13 +827,13 @@ def compute_mass_matrix[
                 DTYPE, D.NV, D.NBODY, D.NJOINT, BATCH, MT_T
             ]
         ](
-            d.xquat.lt["gpu", L_B4](),
-            d.xipos.lt["gpu", L_B3](),
-            d.subtree_com.lt["gpu", L_B3](),
-            m.bodies.lt["gpu", L_BODY](),
-            m.joints.lt["gpu", L_JOINT](),
-            scratch.cdof.lt["gpu", L_CDOF](),
-            scratch.M.lt["gpu", L_M](),
+            d.xquat.tt["gpu", BATCH, D.NBODY * 4](),
+            d.xipos.tt["gpu", BATCH, D.NBODY * 3](),
+            d.subtree_com.tt["gpu", BATCH, D.NBODY * 3](),
+            m.bodies.tt["gpu", D.NBODY, MODEL_BODY_SIZE](),
+            m.joints.tt["gpu", D.NJOINT, MODEL_JOINT_SIZE](),
+            scratch.cdof.tt["gpu", BATCH, D.NV * 6](),
+            scratch.M.tt["gpu", BATCH, D.NV * D.NV](),
             grid_dim=(BATCH,),
             block_dim=(MT_T,),
         )
@@ -910,13 +843,13 @@ def compute_mass_matrix[
         c.enqueue_function[
             _mass_matrix_fields_kernel[DTYPE, D.NV, D.NBODY, D.NJOINT, BATCH]
         ](
-            d.xquat.lt["gpu", L_B4](),
-            d.xipos.lt["gpu", L_B3](),
-            d.subtree_com.lt["gpu", L_B3](),
-            m.bodies.lt["gpu", L_BODY](),
-            m.joints.lt["gpu", L_JOINT](),
-            scratch.cdof.lt["gpu", L_CDOF](),
-            scratch.M.lt["gpu", L_M](),
+            d.xquat.tt["gpu", BATCH, D.NBODY * 4](),
+            d.xipos.tt["gpu", BATCH, D.NBODY * 3](),
+            d.subtree_com.tt["gpu", BATCH, D.NBODY * 3](),
+            m.bodies.tt["gpu", D.NBODY, MODEL_BODY_SIZE](),
+            m.joints.tt["gpu", D.NJOINT, MODEL_JOINT_SIZE](),
+            scratch.cdof.tt["gpu", BATCH, D.NV * 6](),
+            scratch.M.tt["gpu", BATCH, D.NV * D.NV](),
             grid_dim=(BLOCKS,),
             block_dim=(MM_TPB,),
         )

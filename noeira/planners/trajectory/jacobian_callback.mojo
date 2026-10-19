@@ -45,9 +45,9 @@ implement both.
 """
 
 from max.gpu.host import DeviceContext
-from layout import Layout, LayoutTensor
 
 from noeira.nn.constants import DT as dtype
+from noeira.core.tiles import Tile
 
 
 trait RolloutJacobianCallbackCPU(Deinitable):
@@ -133,16 +133,10 @@ trait RolloutJacobianCallbackGPU(Deinitable):
     ](
         mut self,
         ctx: DeviceContext,
-        z: LayoutTensor[
-            dtype, Layout.row_major(B, Self.LATENT_DIM), MutAnyOrigin
-        ],
-        u: LayoutTensor[
-            dtype, Layout.row_major(B, Self.ACTION_DIM), MutAnyOrigin
-        ],
-        z_next_out: LayoutTensor[
-            dtype, Layout.row_major(B, Self.LATENT_DIM), MutAnyOrigin
-        ],
-        cost_out: LayoutTensor[dtype, Layout.row_major(B), MutAnyOrigin],
+        z: Tile[dtype, B, Self.LATENT_DIM],
+        u: Tile[dtype, B, Self.ACTION_DIM],
+        z_next_out: Tile[dtype, B, Self.LATENT_DIM],
+        cost_out: Tile[dtype, B],
     ) raises:
         """Advance one step for the full batch and write per-row scalar
         costs into ``cost_out``. Convention: lower cost is better.
@@ -154,43 +148,15 @@ trait RolloutJacobianCallbackGPU(Deinitable):
     ](
         mut self,
         ctx: DeviceContext,
-        z: LayoutTensor[
-            dtype, Layout.row_major(B, Self.LATENT_DIM), MutAnyOrigin
-        ],
-        u: LayoutTensor[
-            dtype, Layout.row_major(B, Self.ACTION_DIM), MutAnyOrigin
-        ],
-        A_out: LayoutTensor[
-            dtype,
-            Layout.row_major(B, Self.LATENT_DIM, Self.LATENT_DIM),
-            MutAnyOrigin,
-        ],
-        B_out: LayoutTensor[
-            dtype,
-            Layout.row_major(B, Self.LATENT_DIM, Self.ACTION_DIM),
-            MutAnyOrigin,
-        ],
-        l_z_out: LayoutTensor[
-            dtype, Layout.row_major(B, Self.LATENT_DIM), MutAnyOrigin
-        ],
-        l_u_out: LayoutTensor[
-            dtype, Layout.row_major(B, Self.ACTION_DIM), MutAnyOrigin
-        ],
-        l_zz_out: LayoutTensor[
-            dtype,
-            Layout.row_major(B, Self.LATENT_DIM, Self.LATENT_DIM),
-            MutAnyOrigin,
-        ],
-        l_uu_out: LayoutTensor[
-            dtype,
-            Layout.row_major(B, Self.ACTION_DIM, Self.ACTION_DIM),
-            MutAnyOrigin,
-        ],
-        l_zu_out: LayoutTensor[
-            dtype,
-            Layout.row_major(B, Self.LATENT_DIM, Self.ACTION_DIM),
-            MutAnyOrigin,
-        ],
+        z: Tile[dtype, B, Self.LATENT_DIM],
+        u: Tile[dtype, B, Self.ACTION_DIM],
+        A_out: Tile[dtype, B, Self.LATENT_DIM, Self.LATENT_DIM],
+        B_out: Tile[dtype, B, Self.LATENT_DIM, Self.ACTION_DIM],
+        l_z_out: Tile[dtype, B, Self.LATENT_DIM],
+        l_u_out: Tile[dtype, B, Self.ACTION_DIM],
+        l_zz_out: Tile[dtype, B, Self.LATENT_DIM, Self.LATENT_DIM],
+        l_uu_out: Tile[dtype, B, Self.ACTION_DIM, Self.ACTION_DIM],
+        l_zu_out: Tile[dtype, B, Self.LATENT_DIM, Self.ACTION_DIM],
     ) raises:
         """Write dynamics Jacobians and quadratic cost expansion at every
         operating point in the batch. See module docstring for layout.
@@ -202,18 +168,10 @@ trait RolloutJacobianCallbackGPU(Deinitable):
     ](
         mut self,
         ctx: DeviceContext,
-        z: LayoutTensor[
-            dtype, Layout.row_major(B, Self.LATENT_DIM), MutAnyOrigin
-        ],
-        V_z_out: LayoutTensor[
-            dtype, Layout.row_major(B, Self.LATENT_DIM), MutAnyOrigin
-        ],
-        V_zz_out: LayoutTensor[
-            dtype,
-            Layout.row_major(B, Self.LATENT_DIM, Self.LATENT_DIM),
-            MutAnyOrigin,
-        ],
-        cost_out: LayoutTensor[dtype, Layout.row_major(B), MutAnyOrigin],
+        z: Tile[dtype, B, Self.LATENT_DIM],
+        V_z_out: Tile[dtype, B, Self.LATENT_DIM],
+        V_zz_out: Tile[dtype, B, Self.LATENT_DIM, Self.LATENT_DIM],
+        cost_out: Tile[dtype, B],
     ) raises:
         """Terminal cost expansion for the batch: scalar ``Φ`` per row +
         gradient + Hessian. Seeds the Riccati backward pass.

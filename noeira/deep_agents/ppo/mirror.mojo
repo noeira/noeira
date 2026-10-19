@@ -29,7 +29,6 @@ actor output only (a state-independent log-std is symmetric or not on its
 own; RoboParty's mirror loss is on `act_inference`, the mean, too).
 """
 
-from layout import Layout, LayoutTensor
 from max.gpu import global_idx
 from max.gpu.host import DeviceContext
 
@@ -39,8 +38,9 @@ from noeira.nn.core.tensor import Tensor
 from noeira.nn.core.tensor_refs import TensorRefs
 from noeira.nn.core.call import call_forward, call_vjp
 from ..training.device_mean_accum import DeviceMeanAccum
+from noeira.core.tiles import Tile
 
-comptime _V[n: Int] = LayoutTensor[DT, Layout.row_major(n), MutAnyOrigin]
+comptime _V[n: Int] = Tile[DT, n]
 
 
 def _mirror_rows_k[B: Int, D: Int](
@@ -185,10 +185,10 @@ struct ActorMirror[OBS: Int, ACT: Int, BATCH: Int](Movable):
         comptime if target == "gpu":
             var c = ctx.value()
             c.enqueue_function[_mirror_rows_k[B, D]](
-                mb_s.lt["gpu", Layout.row_major(B * D)](),
-                self.obs_idx.lt["gpu", Layout.row_major(D)](),
-                self.obs_sign.lt["gpu", Layout.row_major(D)](),
-                self.s_m.lt["gpu", Layout.row_major(B * D)](),
+                mb_s.tt["gpu", B * D](),
+                self.obs_idx.tt["gpu", D](),
+                self.obs_sign.tt["gpu", D](),
+                self.s_m.tt["gpu", B * D](),
                 grid_dim=(B * D + TPB - 1) // TPB, block_dim=TPB,
             )
         else:
@@ -202,17 +202,17 @@ struct ActorMirror[OBS: Int, ACT: Int, BATCH: Int](Movable):
         comptime if target == "gpu":
             var c = ctx.value()
             c.enqueue_function[_mirror_grad_k[B, A]](
-                self.ao.lt["gpu", Layout.row_major(B * 2 * A)](),
-                self.ao_m.lt["gpu", Layout.row_major(B * 2 * A)](),
-                self.act_idx.lt["gpu", Layout.row_major(A)](),
-                self.act_sign.lt["gpu", Layout.row_major(A)](),
+                self.ao.tt["gpu", B * 2 * A](),
+                self.ao_m.tt["gpu", B * 2 * A](),
+                self.act_idx.tt["gpu", A](),
+                self.act_sign.tt["gpu", A](),
                 self.coeff,
-                self.grad.lt["gpu", Layout.row_major(B * 2 * A)](),
-                self.loss.lt["gpu", Layout.row_major(B)](),
+                self.grad.tt["gpu", B * 2 * A](),
+                self.loss.tt["gpu", B](),
                 grid_dim=(B + TPB - 1) // TPB, block_dim=TPB,
             )
             self.loss_mean_dev.accumulate_gpu_lt[B](
-                self.loss.lt["gpu", Layout.row_major(B)]()
+                self.loss.tt["gpu", B]()
             )
         else:
             var inv = Scalar[DT](2.0) * self.coeff / Scalar[DT](B * A)

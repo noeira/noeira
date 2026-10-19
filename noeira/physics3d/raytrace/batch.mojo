@@ -40,7 +40,8 @@ function returns a `Vec3` either way.
 from std.math import ceildiv
 from max.gpu import block_dim, block_idx, thread_idx
 from max.gpu.host import DeviceContext, DeviceBuffer
-from layout import Layout, LayoutTensor
+from layout import TileTensor
+from noeira.core.tiles import RowMajor, tile
 
 from noeira.math3d import Vec3 as Vec3Generic
 
@@ -182,25 +183,19 @@ struct BatchedCameraRenderer[
     comptime NMESH_TRI_F: Int = _pos(Self.D.NMESH_TRI)
     comptime NHF_F: Int = _pos(Self.D.NHFIELD_DATA)
 
-    comptime L_GEOMS = Layout.row_major(Self.NGEOM_F, MODEL_GEOM_SIZE)
-    comptime L_RGBA = Layout.row_major(Self.NGEOM_F * MODEL_GEOM_RGBA_SIZE)
-    comptime L_BODIES = Layout.row_major(Self.D.NBODY, MODEL_BODY_SIZE)
-    comptime L_B3 = Layout.row_major(Self.BATCH, Self.D.NBODY * 3)
-    comptime L_B4 = Layout.row_major(Self.BATCH, Self.D.NBODY * 4)
-    comptime L_QPOS = Layout.row_major(Self.BATCH, _pos(Self.D.NQ))
-    comptime L_CAM = Layout.row_major(MAX_GPU_CAMERAS * MODEL_CAM_SIZE)
-    comptime L_MESH_META = Layout.row_major(
-        MAX_GPU_MESHES * MODEL_MESH_META_SIZE
-    )
-    comptime L_TRI = Layout.row_major(
-        Self.NMESH_TRI_F * MESH_ARENA_FLOATS_PER_TRI
-    )
-    comptime L_HF_META = Layout.row_major(
-        MAX_GPU_HFIELDS * MODEL_HFIELD_META_SIZE
-    )
-    comptime L_HF = Layout.row_major(Self.BATCH * Self.NHF_F)
-    comptime L_RGB = Layout.row_major(Self.BATCH, Self.NPIX * RGB_CHANNELS)
-    comptime L_SCALARPIX = Layout.row_major(Self.BATCH, Self.NPIX)
+    comptime L_GEOMS = RowMajor[Self.NGEOM_F, MODEL_GEOM_SIZE]
+    comptime L_RGBA = RowMajor[Self.NGEOM_F * MODEL_GEOM_RGBA_SIZE]
+    comptime L_BODIES = RowMajor[Self.D.NBODY, MODEL_BODY_SIZE]
+    comptime L_B3 = RowMajor[Self.BATCH, Self.D.NBODY * 3]
+    comptime L_B4 = RowMajor[Self.BATCH, Self.D.NBODY * 4]
+    comptime L_QPOS = RowMajor[Self.BATCH, _pos(Self.D.NQ)]
+    comptime L_CAM = RowMajor[MAX_GPU_CAMERAS * MODEL_CAM_SIZE]
+    comptime L_MESH_META = RowMajor[MAX_GPU_MESHES * MODEL_MESH_META_SIZE]
+    comptime L_TRI = RowMajor[Self.NMESH_TRI_F * MESH_ARENA_FLOATS_PER_TRI]
+    comptime L_HF_META = RowMajor[MAX_GPU_HFIELDS * MODEL_HFIELD_META_SIZE]
+    comptime L_HF = RowMajor[Self.BATCH * Self.NHF_F]
+    comptime L_RGB = RowMajor[Self.BATCH, Self.NPIX * RGB_CHANNELS]
+    comptime L_SCALARPIX = RowMajor[Self.BATCH, Self.NPIX]
     # ── the appearance tables ────────────────────────────────────────────
     #
     # ⚠⚠ THESE BIND THROUGH `DYN1`/`DYN2` WHILE EVERY LAYOUT ABOVE IS
@@ -380,33 +375,27 @@ struct BatchedCameraRenderer[
 
         @always_inline
         def cam_kernel(
-            geoms: LayoutTensor[Self.DTYPE, DYN2, MutAnyOrigin],
-            appearance: LayoutTensor[Self.DTYPE, DYN1, MutAnyOrigin],
-            bodies: LayoutTensor[Self.DTYPE, Self.L_BODIES, MutAnyOrigin],
-            xpos: LayoutTensor[Self.DTYPE, Self.L_B3, MutAnyOrigin],
-            xquat: LayoutTensor[Self.DTYPE, Self.L_B4, MutAnyOrigin],
-            subtree_com: LayoutTensor[Self.DTYPE, Self.L_B3, MutAnyOrigin],
-            cameras: LayoutTensor[Self.DTYPE, Self.L_CAM, MutAnyOrigin],
-            mesh_meta: LayoutTensor[Self.DTYPE, DYN1, MutAnyOrigin],
-            mesh_tris: LayoutTensor[Self.DTYPE, DYN1, MutAnyOrigin],
-            mesh_uv: LayoutTensor[Self.DTYPE, DYN1, MutAnyOrigin],
-            hfield_meta: LayoutTensor[
-                Self.DTYPE, Self.L_HF_META, MutAnyOrigin
-            ],
-            hfield_data: LayoutTensor[Self.DTYPE, Self.L_HF, MutAnyOrigin],
-            materials: LayoutTensor[Self.DTYPE, DYN1, MutAnyOrigin],
-            textures: LayoutTensor[Self.DTYPE, DYN1, MutAnyOrigin],
-            texels: LayoutTensor[DType.uint8, DYN1, MutAnyOrigin],
-            lights: LayoutTensor[Self.DTYPE, DYN1, MutAnyOrigin],
-            qpos: LayoutTensor[Self.DTYPE, Self.L_QPOS, MutAnyOrigin],
-            cull_t: LayoutTensor[Self.DTYPE, DYN1, MutAnyOrigin],
-            rgb_out: LayoutTensor[Self.DTYPE, Self.L_RGB, MutAnyOrigin],
-            depth_out: LayoutTensor[
-                Self.DTYPE, Self.L_SCALARPIX, MutAnyOrigin
-            ],
-            seg_out: LayoutTensor[
-                Self.DTYPE, Self.L_SCALARPIX, MutAnyOrigin
-            ],
+            geoms: TileTensor[Self.DTYPE, DYN2, MutAnyOrigin],
+            appearance: TileTensor[Self.DTYPE, DYN1, MutAnyOrigin],
+            bodies: TileTensor[Self.DTYPE, Self.L_BODIES, MutAnyOrigin],
+            xpos: TileTensor[Self.DTYPE, Self.L_B3, MutAnyOrigin],
+            xquat: TileTensor[Self.DTYPE, Self.L_B4, MutAnyOrigin],
+            subtree_com: TileTensor[Self.DTYPE, Self.L_B3, MutAnyOrigin],
+            cameras: TileTensor[Self.DTYPE, Self.L_CAM, MutAnyOrigin],
+            mesh_meta: TileTensor[Self.DTYPE, DYN1, MutAnyOrigin],
+            mesh_tris: TileTensor[Self.DTYPE, DYN1, MutAnyOrigin],
+            mesh_uv: TileTensor[Self.DTYPE, DYN1, MutAnyOrigin],
+            hfield_meta: TileTensor[Self.DTYPE, Self.L_HF_META, MutAnyOrigin],
+            hfield_data: TileTensor[Self.DTYPE, Self.L_HF, MutAnyOrigin],
+            materials: TileTensor[Self.DTYPE, DYN1, MutAnyOrigin],
+            textures: TileTensor[Self.DTYPE, DYN1, MutAnyOrigin],
+            texels: TileTensor[DType.uint8, DYN1, MutAnyOrigin],
+            lights: TileTensor[Self.DTYPE, DYN1, MutAnyOrigin],
+            qpos: TileTensor[Self.DTYPE, Self.L_QPOS, MutAnyOrigin],
+            cull_t: TileTensor[Self.DTYPE, DYN1, MutAnyOrigin],
+            rgb_out: TileTensor[Self.DTYPE, Self.L_RGB, MutAnyOrigin],
+            depth_out: TileTensor[Self.DTYPE, Self.L_SCALARPIX, MutAnyOrigin],
+            seg_out: TileTensor[Self.DTYPE, Self.L_SCALARPIX, MutAnyOrigin],
             # ⚠ `Int32`, NOT `Int`. Neither `Int` nor `UInt` conforms to
             # `DevicePassable` — "use a fixed-width type" — so a plain `Int`
             # kernel operand does not compile.
@@ -496,12 +485,12 @@ struct BatchedCameraRenderer[
 
             @always_inline
             def cull_kernel(
-                geoms: LayoutTensor[Self.DTYPE, DYN2, MutAnyOrigin],
-                xpos: LayoutTensor[Self.DTYPE, Self.L_B3, MutAnyOrigin],
-                xquat: LayoutTensor[Self.DTYPE, Self.L_B4, MutAnyOrigin],
-                subtree_com: LayoutTensor[Self.DTYPE, Self.L_B3, MutAnyOrigin],
-                cameras: LayoutTensor[Self.DTYPE, Self.L_CAM, MutAnyOrigin],
-                cull_out: LayoutTensor[Self.DTYPE, DYN1, MutAnyOrigin],
+                geoms: TileTensor[Self.DTYPE, DYN2, MutAnyOrigin],
+                xpos: TileTensor[Self.DTYPE, Self.L_B3, MutAnyOrigin],
+                xquat: TileTensor[Self.DTYPE, Self.L_B4, MutAnyOrigin],
+                subtree_com: TileTensor[Self.DTYPE, Self.L_B3, MutAnyOrigin],
+                cameras: TileTensor[Self.DTYPE, Self.L_CAM, MutAnyOrigin],
+                cull_out: TileTensor[Self.DTYPE, DYN1, MutAnyOrigin],
                 cam: Int32,
                 ng: Int32,
             ):
@@ -527,16 +516,14 @@ struct BatchedCameraRenderer[
 
             var ncull = Self.BATCH * nvg
             ctx.enqueue_function[cull_kernel](
-                self.vis.geoms.lt_dyn["gpu", DYN2](
+                self.vis.geoms.tt_dyn["gpu", DYN2](
                     rl2(nvg + ncond, MODEL_GEOM_SIZE)
                 ),
-                d.xpos.lt["gpu", Self.L_B3](),
-                d.xquat.lt["gpu", Self.L_B4](),
-                d.subtree_com.lt["gpu", Self.L_B3](),
-                m.cameras.lt["gpu", Self.L_CAM](),
-                LayoutTensor[Self.DTYPE, DYN1, MutAnyOrigin](
-                    self.cull, rl1(self.cull_cap)
-                ),
+                d.xpos.tt["gpu", Self.BATCH, Self.D.NBODY * 3](),
+                d.xquat.tt["gpu", Self.BATCH, Self.D.NBODY * 4](),
+                d.subtree_com.tt["gpu", Self.BATCH, Self.D.NBODY * 3](),
+                m.cameras.tt["gpu", MAX_GPU_CAMERAS * MODEL_CAM_SIZE](),
+                TileTensor(self.cull, rl1(self.cull_cap)),
                 Int32(cam_used),
                 Int32(nvg),
                 grid_dim=(ceildiv(ncull, TPB),),
@@ -545,33 +532,31 @@ struct BatchedCameraRenderer[
 
         var total = Self.BATCH * Self.NPIX
         ctx.enqueue_function[cam_kernel](
-            self.vis.geoms.lt_dyn["gpu", DYN2](
+            self.vis.geoms.tt_dyn["gpu", DYN2](
                 rl2(nvg + ncond, MODEL_GEOM_SIZE)
             ),
-            self.vis.appearance.lt_dyn["gpu", DYN1](
+            self.vis.appearance.tt_dyn["gpu", DYN1](
                 rl1(self.vis.appearance.n)
             ),
-            m.bodies.lt["gpu", Self.L_BODIES](),
-            d.xpos.lt["gpu", Self.L_B3](),
-            d.xquat.lt["gpu", Self.L_B4](),
-            d.subtree_com.lt["gpu", Self.L_B3](),
-            m.cameras.lt["gpu", Self.L_CAM](),
-            self.vis.mesh_meta.lt_dyn["gpu", DYN1](rl1(self.vis.mesh_meta.n)),
-            self.vis.mesh_tris.lt_dyn["gpu", DYN1](rl1(self.vis.mesh_tris.n)),
-            self.vis.mesh_uv.lt_dyn["gpu", DYN1](rl1(self.vis.mesh_uv.n)),
-            m.hfield_meta.lt["gpu", Self.L_HF_META](),
-            d.hfield_data.lt["gpu", Self.L_HF](),
-            self.vis.materials.lt_dyn["gpu", DYN1](rl1(self.vis.materials.n)),
-            self.vis.textures.lt_dyn["gpu", DYN1](rl1(self.vis.textures.n)),
-            self.vis.texels.lt_dyn["gpu", DYN1](rl1(self.vis.texels.n)),
-            self.vis.lights.lt_dyn["gpu", DYN1](rl1(self.vis.lights.n)),
-            d.qpos.lt["gpu", Self.L_QPOS](),
-            LayoutTensor[Self.DTYPE, DYN1, MutAnyOrigin](
-                self.cull, rl1(self.cull_cap)
-            ),
-            LayoutTensor[Self.DTYPE, Self.L_RGB](self.rgb),
-            LayoutTensor[Self.DTYPE, Self.L_SCALARPIX](self.depth),
-            LayoutTensor[Self.DTYPE, Self.L_SCALARPIX](self.seg),
+            m.bodies.tt["gpu", Self.D.NBODY, MODEL_BODY_SIZE](),
+            d.xpos.tt["gpu", Self.BATCH, Self.D.NBODY * 3](),
+            d.xquat.tt["gpu", Self.BATCH, Self.D.NBODY * 4](),
+            d.subtree_com.tt["gpu", Self.BATCH, Self.D.NBODY * 3](),
+            m.cameras.tt["gpu", MAX_GPU_CAMERAS * MODEL_CAM_SIZE](),
+            self.vis.mesh_meta.tt_dyn["gpu", DYN1](rl1(self.vis.mesh_meta.n)),
+            self.vis.mesh_tris.tt_dyn["gpu", DYN1](rl1(self.vis.mesh_tris.n)),
+            self.vis.mesh_uv.tt_dyn["gpu", DYN1](rl1(self.vis.mesh_uv.n)),
+            m.hfield_meta.tt["gpu", MAX_GPU_HFIELDS * MODEL_HFIELD_META_SIZE](),
+            d.hfield_data.tt["gpu", Self.BATCH * Self.NHF_F](),
+            self.vis.materials.tt_dyn["gpu", DYN1](rl1(self.vis.materials.n)),
+            self.vis.textures.tt_dyn["gpu", DYN1](rl1(self.vis.textures.n)),
+            self.vis.texels.tt_dyn["gpu", DYN1](rl1(self.vis.texels.n)),
+            self.vis.lights.tt_dyn["gpu", DYN1](rl1(self.vis.lights.n)),
+            d.qpos.tt["gpu", Self.BATCH, _pos(Self.D.NQ)](),
+            TileTensor(self.cull, rl1(self.cull_cap)),
+            tile[Self.BATCH, Self.NPIX * RGB_CHANNELS](self.rgb),
+            tile[Self.BATCH, Self.NPIX](self.depth),
+            tile[Self.BATCH, Self.NPIX](self.seg),
             Int32(cam_used),
             Int32(nvg + (ncond << 16)),
             Int32(nlight + ((1 if cull_on else 0) << 20)),
@@ -696,39 +681,39 @@ struct BatchedCameraRenderer[
         comptime if Self.DTYPE.is_floating_point():
             var nvg = self.vis.ngeom
             var ncond = self.vis.ncond
-            var geoms_c = self.vis.geoms.lt_dyn["cpu", DYN2](
+            var geoms_c = self.vis.geoms.tt_dyn["cpu", DYN2](
                 rl2(nvg + ncond, MODEL_GEOM_SIZE)
             )
-            var qpos_c = d.qpos.lt["cpu", Self.L_QPOS]()
-            var app_c = self.vis.appearance.lt_dyn["cpu", DYN1](
+            var qpos_c = d.qpos.tt["cpu", Self.BATCH, _pos(Self.D.NQ)]()
+            var app_c = self.vis.appearance.tt_dyn["cpu", DYN1](
                 rl1(self.vis.appearance.n)
             )
-            var bodies_c = m.bodies.lt["cpu", Self.L_BODIES]()
-            var xpos_c = d.xpos.lt["cpu", Self.L_B3]()
-            var xquat_c = d.xquat.lt["cpu", Self.L_B4]()
-            var com_c = d.subtree_com.lt["cpu", Self.L_B3]()
-            var cams_c = m.cameras.lt["cpu", Self.L_CAM]()
-            var mm_c = self.vis.mesh_meta.lt_dyn["cpu", DYN1](
+            var bodies_c = m.bodies.tt["cpu", Self.D.NBODY, MODEL_BODY_SIZE]()
+            var xpos_c = d.xpos.tt["cpu", Self.BATCH, Self.D.NBODY * 3]()
+            var xquat_c = d.xquat.tt["cpu", Self.BATCH, Self.D.NBODY * 4]()
+            var com_c = d.subtree_com.tt["cpu", Self.BATCH, Self.D.NBODY * 3]()
+            var cams_c = m.cameras.tt["cpu", MAX_GPU_CAMERAS * MODEL_CAM_SIZE]()
+            var mm_c = self.vis.mesh_meta.tt_dyn["cpu", DYN1](
                 rl1(self.vis.mesh_meta.n)
             )
-            var mt_c = self.vis.mesh_tris.lt_dyn["cpu", DYN1](
+            var mt_c = self.vis.mesh_tris.tt_dyn["cpu", DYN1](
                 rl1(self.vis.mesh_tris.n)
             )
-            var uv_c = self.vis.mesh_uv.lt_dyn["cpu", DYN1](
+            var uv_c = self.vis.mesh_uv.tt_dyn["cpu", DYN1](
                 rl1(self.vis.mesh_uv.n)
             )
-            var hm_c = m.hfield_meta.lt["cpu", Self.L_HF_META]()
-            var hd_c = d.hfield_data.lt["cpu", Self.L_HF]()
-            var mat_c = self.vis.materials.lt_dyn["cpu", DYN1](
+            var hm_c = m.hfield_meta.tt["cpu", MAX_GPU_HFIELDS * MODEL_HFIELD_META_SIZE]()
+            var hd_c = d.hfield_data.tt["cpu", Self.BATCH * Self.NHF_F]()
+            var mat_c = self.vis.materials.tt_dyn["cpu", DYN1](
                 rl1(self.vis.materials.n)
             )
-            var tex_c = self.vis.textures.lt_dyn["cpu", DYN1](
+            var tex_c = self.vis.textures.tt_dyn["cpu", DYN1](
                 rl1(self.vis.textures.n)
             )
-            var txl_c = self.vis.texels.lt_dyn["cpu", DYN1](
+            var txl_c = self.vis.texels.tt_dyn["cpu", DYN1](
                 rl1(self.vis.texels.n)
             )
-            var lit_c = self.vis.lights.lt_dyn["cpu", DYN1](
+            var lit_c = self.vis.lights.tt_dyn["cpu", DYN1](
                 rl1(self.vis.lights.n)
             )
             var nlight = self.vis.nlight

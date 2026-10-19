@@ -32,7 +32,6 @@ actor + the ensemble, mirroring the SAC storage `TargetYBlock.step`.
 from max.gpu import global_idx
 from noeira.nn.core.ptr import untracked
 from max.gpu.host import DeviceContext
-from layout import Layout, LayoutTensor
 from std.random import random_float64
 from std.random.philox import Random as PhiloxRandom
 
@@ -55,6 +54,7 @@ from .kernels import (
     REDQ_TARGET_MIN,
     REDQ_TARGET_AVE,
 )
+from noeira.core.tiles import Tile
 
 
 # ────────────────────────────────────────────────────────────────────
@@ -69,9 +69,9 @@ from .kernels import (
 def _redq_resample_subset_kernel[
     N: Int, N_MIN: Int
 ](
-    subset: LayoutTensor[DType.uint32, Layout.row_major(N_MIN), MutAnyOrigin],
+    subset: Tile[DType.uint32, N_MIN],
     seed: UInt64,
-    offset_buf: LayoutTensor[DType.uint64, Layout.row_major(1), MutAnyOrigin],
+    offset_buf: Tile[DType.uint64, 1],
 ):
     if Int(global_idx.x) != 0:
         return
@@ -104,10 +104,10 @@ def _redq_resample_subset_kernel[
 def _redq_concat_sa_extract_lp_kernel[
     OBS: Int, ACT: Int, BATCH: Int, SA_DIM: Int, ALP_DIM: Int,
 ](
-    sp: LayoutTensor[DT, Layout.row_major(BATCH, OBS), MutAnyOrigin],
-    alp: LayoutTensor[DT, Layout.row_major(BATCH, ALP_DIM), MutAnyOrigin],
-    sa: LayoutTensor[DT, Layout.row_major(BATCH, SA_DIM), MutAnyOrigin],
-    lp: LayoutTensor[DT, Layout.row_major(BATCH), MutAnyOrigin],
+    sp: Tile[DT, BATCH, OBS],
+    alp: Tile[DT, BATCH, ALP_DIM],
+    sa: Tile[DT, BATCH, SA_DIM],
+    lp: Tile[DT, BATCH],
 ):
     var idx = Int(global_idx.x)
     var total = BATCH * SA_DIM
@@ -126,8 +126,8 @@ def _redq_concat_sa_extract_lp_kernel[
 def _copy_row_kernel[
     NB: Int, BATCH: Int
 ](
-    src: LayoutTensor[DT, Layout.row_major(BATCH), MutAnyOrigin],
-    dst: LayoutTensor[DT, Layout.row_major(NB), MutAnyOrigin],
+    src: Tile[DT, BATCH],
+    dst: Tile[DT, NB],
     base_arg: Int64,
 ):
     """`dst[base + b] = src[b]` — write src into the row `base = i*BATCH` of the
@@ -283,14 +283,14 @@ struct EnsembleTargetYBlock[
         (reads `_subset_offset`, then advances it). GPU + device path only."""
         var c = self.ctx.value()
         c.enqueue_function[_redq_resample_subset_kernel[Self.N, Self.N_MIN]](
-            self._subset_dev.lt["gpu", Layout.row_major(Self.N_MIN)](),
+            self._subset_dev.tt["gpu", Self.N_MIN](),
             self.subset_seed,
-            self._subset_offset.lt["gpu", Layout.row_major(1)](),
+            self._subset_offset.tt["gpu", 1](),
             grid_dim=1,
             block_dim=1,
         )
         c.enqueue_function[advance_rng_offset_kernel[Self.N_MIN]](
-            self._subset_offset.lt["gpu", Layout.row_major(1)](),
+            self._subset_offset.tt["gpu", 1](),
             grid_dim=1,
             block_dim=1,
         )
@@ -371,14 +371,10 @@ struct EnsembleTargetYBlock[
                 Self.OBS, Self.ACT, Self.BATCH, Self.SA_DIM, Self.ALP_DIM,
             ]
             c.enqueue_function[kernel](
-                state.mb_sp.lt["gpu", Layout.row_major(Self.BATCH, Self.OBS)](),
-                self._mb_alp.lt[
-                    "gpu", Layout.row_major(Self.BATCH, Self.ALP_DIM)
-                ](),
-                self._mb_sa.lt[
-                    "gpu", Layout.row_major(Self.BATCH, Self.SA_DIM)
-                ](),
-                self._mb_lp.lt["gpu", Layout.row_major(Self.BATCH)](),
+                state.mb_sp.tt["gpu", Self.BATCH, Self.OBS](),
+                self._mb_alp.tt["gpu", Self.BATCH, Self.ALP_DIM](),
+                self._mb_sa.tt["gpu", Self.BATCH, Self.SA_DIM](),
+                self._mb_lp.tt["gpu", Self.BATCH](),
                 grid_dim=n_blocks, block_dim=TPB,
             )
 
@@ -406,10 +402,8 @@ struct EnsembleTargetYBlock[
                 c.enqueue_function[
                     _copy_row_kernel[Self.N * Self.BATCH, Self.BATCH]
                 ](
-                    self._mb_q_i.lt["gpu", Layout.row_major(Self.BATCH)](),
-                    self._mb_stacked_q.lt[
-                        "gpu", Layout.row_major(Self.N * Self.BATCH)
-                    ](),
+                    self._mb_q_i.tt["gpu", Self.BATCH](),
+                    self._mb_stacked_q.tt["gpu", Self.N * Self.BATCH](),
                     Int64(i * Self.BATCH),
                     grid_dim=nb, block_dim=TPB,
                 )
@@ -443,7 +437,7 @@ struct EnsembleTargetYBlock[
                     self._mb_stacked_q,
                     state.mb_d,
                     self._mb_lp,
-                    self._subset_dev.lt["gpu", Layout.row_major(Self.N_MIN)](),
+                    self._subset_dev.tt["gpu", Self.N_MIN](),
                     self.gamma,
                     self._alpha_ptr.value().as_unsafe_any_origin(),
                 )
@@ -464,7 +458,7 @@ struct EnsembleTargetYBlock[
                     self._mb_stacked_q,
                     state.mb_d,
                     self._mb_lp,
-                    self._subset_dev.lt["gpu", Layout.row_major(Self.N_MIN)](),
+                    self._subset_dev.tt["gpu", Self.N_MIN](),
                     self.gamma,
                     alpha,
                 )

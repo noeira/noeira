@@ -28,7 +28,6 @@ from noeira.nn.core.param import walk_params, ParamVisitorRef
 from std.math import exp as fexp, log as flog, tanh as ftanh
 from std.random import random_float64
 from std.random.philox import Random as PhiloxRandom
-from layout import Layout, LayoutTensor
 
 from max.gpu import global_idx
 from max.gpu.host import DeviceContext, DeviceBuffer
@@ -71,6 +70,7 @@ from .target_y_block import TargetYBlock
 from .actor_loss import SACActorLoss
 from .blocks.alpha_update_step import AlphaUpdateStep
 from .metrics import SACMetrics
+from noeira.core.tiles import RowMajor, Tile
 
 
 # ──────────────────────────────────────────────────────────────────────
@@ -563,25 +563,25 @@ struct SACTrainer[
             self._mean_done_accum += sd * inv_b
             self._mean_abs_action_accum += saa / Scalar[DT](B * A)
         else:
-            comptime lb = Layout.row_major(B)
-            comptime lba = Layout.row_major(B * A)
+            comptime lb = RowMajor[B]
+            comptime lba = RowMajor[B * A]
             self._mean_q_dev.accumulate_gpu_lt[B](
-                self.twin_critic_blk.inner.c1._mb_q.lt["gpu", lb]()
+                self.twin_critic_blk.inner.c1._mb_q.tt["gpu", B]()
             )
             self._mean_target_dev.accumulate_gpu_lt[B](
-                self.state.mb_y.lt["gpu", lb]()
+                self.state.mb_y.tt["gpu", B]()
             )
             self._mean_reward_dev.accumulate_gpu_lt[B](
-                self.state.mb_r.lt["gpu", lb]()
+                self.state.mb_r.tt["gpu", B]()
             )
             self._mean_next_q_dev.accumulate_gpu_lt[B](
-                self.target_y_blk.graph.node_output["min_q"]().lt["gpu", lb]()
+                self.target_y_blk.graph.node_output["min_q"]().tt["gpu", B]()
             )
             self._mean_done_dev.accumulate_gpu_lt[B](
-                self.state.mb_d.lt["gpu", lb]()
+                self.state.mb_d.tt["gpu", B]()
             )
             self._mean_abs_action_dev.accumulate_gpu_abs_lt[B * A](
-                self.state.mb_a.lt["gpu", lba]()
+                self.state.mb_a.tt["gpu", B * A]()
             )
         self._update_count += 1
         self._total_train_steps += 1
@@ -681,25 +681,25 @@ struct SACTrainer[
 
         # Device diagnostics (fold each batch mean into the device accumulators;
         # captured + replayed → advances identically to the non-captured path).
-        comptime lb = Layout.row_major(Self.BATCH)
-        comptime lba = Layout.row_major(Self.BATCH * Self.ACT_DIM)
+        comptime lb = RowMajor[Self.BATCH]
+        comptime lba = RowMajor[Self.BATCH * Self.ACT_DIM]
         self._mean_q_dev.accumulate_gpu_lt[Self.BATCH](
-            self.twin_critic_blk.inner.c1._mb_q.lt["gpu", lb]()
+            self.twin_critic_blk.inner.c1._mb_q.tt["gpu", Self.BATCH]()
         )
         self._mean_target_dev.accumulate_gpu_lt[Self.BATCH](
-            self.state.mb_y.lt["gpu", lb]()
+            self.state.mb_y.tt["gpu", Self.BATCH]()
         )
         self._mean_reward_dev.accumulate_gpu_lt[Self.BATCH](
-            self.state.mb_r.lt["gpu", lb]()
+            self.state.mb_r.tt["gpu", Self.BATCH]()
         )
         self._mean_next_q_dev.accumulate_gpu_lt[Self.BATCH](
-            self.target_y_blk.graph.node_output["min_q"]().lt["gpu", lb]()
+            self.target_y_blk.graph.node_output["min_q"]().tt["gpu", Self.BATCH]()
         )
         self._mean_done_dev.accumulate_gpu_lt[Self.BATCH](
-            self.state.mb_d.lt["gpu", lb]()
+            self.state.mb_d.tt["gpu", Self.BATCH]()
         )
         self._mean_abs_action_dev.accumulate_gpu_abs_lt[Self.BATCH * Self.ACT_DIM](
-            self.state.mb_a.lt["gpu", lba]()
+            self.state.mb_a.tt["gpu", Self.BATCH * Self.ACT_DIM]()
         )
 
     def note_train_update(mut self):
@@ -720,18 +720,10 @@ struct SACTrainer[
         N_ENVS: Int
     ](
         mut self,
-        obs: LayoutTensor[
-            DT, Layout.row_major(N_ENVS, Self.AGENT_OBS_DIM), MutAnyOrigin
-        ],
-        action: LayoutTensor[
-            DT, Layout.row_major(N_ENVS, Self.AGENT_ACT_DIM), MutAnyOrigin
-        ],
-        ao_scratch: LayoutTensor[
-            DT, Layout.row_major(N_ENVS, 2 * Self.AGENT_ACT_DIM), MutAnyOrigin
-        ],
-        alp_scratch: LayoutTensor[
-            DT, Layout.row_major(N_ENVS, Self.AGENT_ACT_DIM + 1), MutAnyOrigin
-        ],
+        obs: Tile[DT, N_ENVS, Self.AGENT_OBS_DIM],
+        action: Tile[DT, N_ENVS, Self.AGENT_ACT_DIM],
+        ao_scratch: Tile[DT, N_ENVS, 2 * Self.AGENT_ACT_DIM],
+        alp_scratch: Tile[DT, N_ENVS, Self.AGENT_ACT_DIM + 1],
         step_idx: Int,
     ) raises:
         comptime assert N_ENVS > 0, "N_ENVS must be > 0"

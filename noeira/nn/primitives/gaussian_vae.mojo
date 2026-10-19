@@ -45,7 +45,8 @@ would collapse slowly enough to look like ordinary underfitting.
 from std.math import exp
 from max.gpu import global_idx
 from max.gpu.host import DeviceContext
-from layout import Layout, LayoutTensor, TileTensor, row_major
+from layout import TileTensor, row_major
+from noeira.core.tiles import Tile
 
 from noeira.nn.constants import DT, TPB
 from noeira.nn.core.ptr import mptr
@@ -70,9 +71,9 @@ from ..core.amp import AMPPolicy, NoAMP
 def _gr_forward_kernel[
     BATCH: Int, L: Int
 ](
-    x: LayoutTensor[DT, Layout.row_major(BATCH, 2 * L), MutAnyOrigin],
-    eps: LayoutTensor[DT, Layout.row_major(BATCH, L), MutAnyOrigin],
-    o: LayoutTensor[DT, Layout.row_major(BATCH, L), MutAnyOrigin],
+    x: Tile[DT, BATCH, 2 * L],
+    eps: Tile[DT, BATCH, L],
+    o: Tile[DT, BATCH, L],
 ):
     var idx = Int(global_idx.x)
     if idx >= BATCH * L:
@@ -88,8 +89,8 @@ def _gr_forward_kernel[
 def _gr_prior_kernel[
     N: Int
 ](
-    eps: LayoutTensor[DT, Layout.row_major(N), MutAnyOrigin],
-    z: LayoutTensor[DT, Layout.row_major(N), MutAnyOrigin],
+    eps: Tile[DT, N],
+    z: Tile[DT, N],
 ):
     """z = eps: the prior draw, `GaussianReparam.prior`."""
     var idx = Int(global_idx.x)
@@ -98,7 +99,7 @@ def _gr_prior_kernel[
 
 def _gr_zero_eps_kernel[
     N: Int
-](eps: LayoutTensor[DT, Layout.row_major(N), MutAnyOrigin]):
+](eps: Tile[DT, N]):
     var i = Int(global_idx.x)
     if i < N:
         eps.ptr[unsafe_offset=i] = Scalar[DT](0.0)
@@ -107,10 +108,10 @@ def _gr_zero_eps_kernel[
 def _gr_backward_kernel[
     BATCH: Int, L: Int
 ](
-    go: LayoutTensor[DT, Layout.row_major(BATCH, L), MutAnyOrigin],
-    x: LayoutTensor[DT, Layout.row_major(BATCH, 2 * L), MutAnyOrigin],
-    eps: LayoutTensor[DT, Layout.row_major(BATCH, L), MutAnyOrigin],
-    gi: LayoutTensor[DT, Layout.row_major(BATCH, 2 * L), MutAnyOrigin],
+    go: Tile[DT, BATCH, L],
+    x: Tile[DT, BATCH, 2 * L],
+    eps: Tile[DT, BATCH, L],
+    gi: Tile[DT, BATCH, 2 * L],
 ):
     var idx = Int(global_idx.x)
     if idx >= BATCH * L:
@@ -209,14 +210,14 @@ struct GaussianReparam[LATENT: Int](Module):
             comptime nbz = (NZ + TPB - 1) // TPB
             if self.deterministic:
                 c.enqueue_function[_gr_zero_eps_kernel[NZ]](
-                    self.eps.lt["gpu", Layout.row_major(NZ)](),
+                    self.eps.tt["gpu", NZ](),
                     grid_dim=nbz, block_dim=TPB,
                 )
             else:
                 c.enqueue_function[_box_muller_kernel_dev[NZ]](
-                    self.eps.lt["gpu", Layout.row_major(NZ)](),
+                    self.eps.tt["gpu", NZ](),
                     self.noise_seed,
-                    self.noise_offset.lt["gpu", Layout.row_major(1)](),
+                    self.noise_offset.tt["gpu", 1](),
                     grid_dim=nbz, block_dim=TPB,
                 )
                 # Advance by the PAIR-rounded count, matching `rsample` — the
@@ -224,20 +225,20 @@ struct GaussianReparam[LATENT: Int](Module):
                 c.enqueue_function[
                     advance_rng_offset_kernel[((NZ + 1) // 2) * 2]
                 ](
-                    self.noise_offset.lt["gpu", Layout.row_major(1)](),
+                    self.noise_offset.tt["gpu", 1](),
                     grid_dim=1, block_dim=1,
                 )
             if self.prior:
                 c.enqueue_function[_gr_prior_kernel[NZ]](
-                    self.eps.lt["gpu", Layout.row_major(NZ)](),
-                    out.lt["gpu", Layout.row_major(NZ)](),
+                    self.eps.tt["gpu", NZ](),
+                    out.tt["gpu", NZ](),
                     grid_dim=nbz, block_dim=TPB,
                 )
                 return
             c.enqueue_function[_gr_forward_kernel[B, L]](
-                x.lt["gpu", Layout.row_major(B, 2 * L)](),
-                self.eps.lt["gpu", Layout.row_major(B, L)](),
-                out.lt["gpu", Layout.row_major(B, L)](),
+                x.tt["gpu", B, 2 * L](),
+                self.eps.tt["gpu", B, L](),
+                out.tt["gpu", B, L](),
                 grid_dim=nbz, block_dim=TPB,
             )
             return
@@ -282,10 +283,10 @@ struct GaussianReparam[LATENT: Int](Module):
             var c = ctx.value()
             gin.ensure_gpu(c, B * 2 * L)
             c.enqueue_function[_gr_backward_kernel[B, L]](
-                grad_output.lt["gpu", Layout.row_major(B, L)](),
-                x.lt["gpu", Layout.row_major(B, 2 * L)](),
-                self.eps.lt["gpu", Layout.row_major(B, L)](),
-                gin.lt["gpu", Layout.row_major(B, 2 * L)](),
+                grad_output.tt["gpu", B, L](),
+                x.tt["gpu", B, 2 * L](),
+                self.eps.tt["gpu", B, L](),
+                gin.tt["gpu", B, 2 * L](),
                 grid_dim=(B * L + TPB - 1) // TPB, block_dim=TPB,
             )
             return
@@ -310,8 +311,8 @@ struct GaussianReparam[LATENT: Int](Module):
 def _kl_forward_kernel[
     BATCH: Int, L: Int
 ](
-    x: LayoutTensor[DT, Layout.row_major(BATCH, 2 * L), MutAnyOrigin],
-    o: LayoutTensor[DT, Layout.row_major(BATCH, 1), MutAnyOrigin],
+    x: Tile[DT, BATCH, 2 * L],
+    o: Tile[DT, BATCH, 1],
 ):
     var r = Int(global_idx.x)
     if r >= BATCH:
@@ -327,9 +328,9 @@ def _kl_forward_kernel[
 def _kl_backward_kernel[
     BATCH: Int, L: Int
 ](
-    go: LayoutTensor[DT, Layout.row_major(BATCH, 1), MutAnyOrigin],
-    x: LayoutTensor[DT, Layout.row_major(BATCH, 2 * L), MutAnyOrigin],
-    gi: LayoutTensor[DT, Layout.row_major(BATCH, 2 * L), MutAnyOrigin],
+    go: Tile[DT, BATCH, 1],
+    x: Tile[DT, BATCH, 2 * L],
+    gi: Tile[DT, BATCH, 2 * L],
 ):
     var idx = Int(global_idx.x)
     if idx >= BATCH * L:
@@ -390,8 +391,8 @@ struct GaussianKLStdNormal[LATENT: Int](Module):
             var c = ctx.value()
             out.ensure_gpu(c, B)
             c.enqueue_function[_kl_forward_kernel[B, L]](
-                x.lt["gpu", Layout.row_major(B, 2 * L)](),
-                out.lt["gpu", Layout.row_major(B, 1)](),
+                x.tt["gpu", B, 2 * L](),
+                out.tt["gpu", B, 1](),
                 grid_dim=(B + TPB - 1) // TPB,
                 block_dim=TPB,
             )
@@ -427,9 +428,9 @@ struct GaussianKLStdNormal[LATENT: Int](Module):
             var c = ctx.value()
             gin.ensure_gpu(c, B * 2 * L)
             c.enqueue_function[_kl_backward_kernel[B, L]](
-                grad_output.lt["gpu", Layout.row_major(B, 1)](),
-                x.lt["gpu", Layout.row_major(B, 2 * L)](),
-                gin.lt["gpu", Layout.row_major(B, 2 * L)](),
+                grad_output.tt["gpu", B, 1](),
+                x.tt["gpu", B, 2 * L](),
+                gin.tt["gpu", B, 2 * L](),
                 grid_dim=(B * L + TPB - 1) // TPB,
                 block_dim=TPB,
             )

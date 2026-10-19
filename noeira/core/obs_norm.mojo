@@ -22,9 +22,9 @@ from std.collections import Array
 from std.math import sqrt
 from max.gpu import thread_idx, block_idx, block_dim
 from max.gpu.host import DeviceContext, DeviceBuffer
-from layout import Layout, LayoutTensor
 
 from noeira.nn.constants import DT as gpu_dtype
+from noeira.core.tiles import Tile, ImmTile, tile
 
 
 # =============================================================================
@@ -36,12 +36,10 @@ def update_obs_norm_kernel[
     BATCH: Int,
     OBS_DIM: Int,
 ](
-    obs: LayoutTensor[
-        gpu_dtype, Layout.row_major(BATCH, OBS_DIM), MutAnyOrigin
-    ],
-    mean: LayoutTensor[gpu_dtype, Layout.row_major(OBS_DIM), MutAnyOrigin],
-    var_: LayoutTensor[gpu_dtype, Layout.row_major(OBS_DIM), MutAnyOrigin],
-    count: LayoutTensor[gpu_dtype, Layout.row_major(1), MutAnyOrigin],
+    obs: Tile[gpu_dtype, BATCH, OBS_DIM],
+    mean: Tile[gpu_dtype, OBS_DIM],
+    var_: Tile[gpu_dtype, OBS_DIM],
+    count: Tile[gpu_dtype, 1],
 ):
     """One thread per obs dim; merges this step's batch into running stats.
 
@@ -94,11 +92,9 @@ def apply_obs_norm_kernel[
     BATCH: Int,
     OBS_DIM: Int,
 ](
-    obs: LayoutTensor[
-        gpu_dtype, Layout.row_major(BATCH, OBS_DIM), MutAnyOrigin
-    ],
-    mean: LayoutTensor[gpu_dtype, Layout.row_major(OBS_DIM), ImmutAnyOrigin],
-    var_: LayoutTensor[gpu_dtype, Layout.row_major(OBS_DIM), ImmutAnyOrigin],
+    obs: Tile[gpu_dtype, BATCH, OBS_DIM],
+    mean: ImmTile[gpu_dtype, OBS_DIM],
+    var_: ImmTile[gpu_dtype, OBS_DIM],
     eps: Scalar[gpu_dtype],
 ):
     """One thread per (env, dim); writes obs ← (o − μ) / √(σ² + ε) in place.
@@ -210,18 +206,10 @@ struct ObsNormStats[OBS_DIM: Int](Movable):
     ](
         mut self, ctx: DeviceContext, mut obs_buf: DeviceBuffer[gpu_dtype]
     ) raises:
-        var obs = LayoutTensor[
-            gpu_dtype, Layout.row_major(BATCH, Self.OBS_DIM)
-        ](obs_buf)
-        var mean_t = LayoutTensor[gpu_dtype, Layout.row_major(Self.OBS_DIM)](
-            self.mean_buf
-        )
-        var var_t = LayoutTensor[gpu_dtype, Layout.row_major(Self.OBS_DIM)](
-            self.var_buf
-        )
-        var count_t = LayoutTensor[gpu_dtype, Layout.row_major(1)](
-            self.count_buf
-        )
+        var obs = tile[BATCH, Self.OBS_DIM](obs_buf)
+        var mean_t = tile[Self.OBS_DIM](self.mean_buf)
+        var var_t = tile[Self.OBS_DIM](self.var_buf)
+        var count_t = tile[1](self.count_buf)
 
         comptime kernel = update_obs_norm_kernel[BATCH, Self.OBS_DIM]
         comptime BLOCKS = (Self.OBS_DIM + _TPB_UPDATE - 1) // _TPB_UPDATE
@@ -241,15 +229,9 @@ struct ObsNormStats[OBS_DIM: Int](Movable):
         # `self` is non-`mut`, so mean/var views are mut=False; the apply
         # kernel reads them (ImmutAnyOrigin params), so this matches without
         # the deprecated immutable->mutable laundering.
-        var obs = LayoutTensor[
-            gpu_dtype, Layout.row_major(BATCH, Self.OBS_DIM)
-        ](obs_buf)
-        var mean_t = LayoutTensor[gpu_dtype, Layout.row_major(Self.OBS_DIM)](
-            self.mean_buf
-        )
-        var var_t = LayoutTensor[gpu_dtype, Layout.row_major(Self.OBS_DIM)](
-            self.var_buf
-        )
+        var obs = tile[BATCH, Self.OBS_DIM](obs_buf)
+        var mean_t = tile[Self.OBS_DIM](self.mean_buf)
+        var var_t = tile[Self.OBS_DIM](self.var_buf)
 
         comptime kernel = apply_obs_norm_kernel[BATCH, Self.OBS_DIM]
         comptime TOTAL = BATCH * Self.OBS_DIM

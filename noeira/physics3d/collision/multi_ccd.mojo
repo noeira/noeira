@@ -91,7 +91,7 @@ flag.
 
 from std.math import sqrt
 
-from layout import Layout, LayoutTensor
+from layout import TileTensor, TensorLayout
 
 from ..constants import (
     GEOM_SPHERE,
@@ -207,25 +207,19 @@ def multi_ccd_pair_supported(
 @always_inline
 def _convex_pair_single[
     DTYPE: DType,
-    L_MESH_VERTS: Layout,
-    L_MESH_VERT_EDGEADR: Layout,
-    L_MESH_EDGES: Layout,
-    L_WS: Layout](
+    L_MESH_VERTS: TensorLayout,
+    L_MESH_VERT_EDGEADR: TensorLayout,
+    L_MESH_EDGES: TensorLayout,
+    L_WS: TensorLayout](
     gi_type: Int,
     pi_x: Scalar[DTYPE], pi_y: Scalar[DTYPE], pi_z: Scalar[DTYPE],
     qi_x: Scalar[DTYPE], qi_y: Scalar[DTYPE], qi_z: Scalar[DTYPE],
     qi_w: Scalar[DTYPE],
     ri: Scalar[DTYPE], hli: Scalar[DTYPE],
     hxi: Scalar[DTYPE], hyi: Scalar[DTYPE], hzi: Scalar[DTYPE],
-    mesh_verts: LayoutTensor[
-        DTYPE, L_MESH_VERTS, MutAnyOrigin
-    ],
-    mesh_vert_edgeadr: LayoutTensor[
-        DTYPE, L_MESH_VERT_EDGEADR, MutAnyOrigin
-    ],
-    mesh_edges: LayoutTensor[
-        DTYPE, L_MESH_EDGES, MutAnyOrigin
-    ],
+    mesh_verts: TileTensor[DTYPE, L_MESH_VERTS, MutAnyOrigin],
+    mesh_vert_edgeadr: TileTensor[DTYPE, L_MESH_VERT_EDGEADR, MutAnyOrigin],
+    mesh_edges: TileTensor[DTYPE, L_MESH_EDGES, MutAnyOrigin],
     va1: Int, mnv1: Int,
     gj_type: Int,
     pj_x: Scalar[DTYPE], pj_y: Scalar[DTYPE], pj_z: Scalar[DTYPE],
@@ -234,7 +228,7 @@ def _convex_pair_single[
     rj: Scalar[DTYPE], hlj: Scalar[DTYPE],
     hxj: Scalar[DTYPE], hyj: Scalar[DTYPE], hzj: Scalar[DTYPE],
     va2: Int, mnv2: Int,
-    ws: LayoutTensor[DTYPE, L_WS, MutAnyOrigin],
+    ws: TileTensor[DTYPE, L_WS, MutAnyOrigin],
     wrow: Int,
     ccd_tol: Scalar[DTYPE] = Scalar[DTYPE](MJ_CCD_TOLERANCE),
     ccd_iter: Int = MJ_CCD_ITERATIONS,
@@ -436,11 +430,11 @@ def _rotate_pose_about[
 def multi_ccd_extra_contacts[
     DTYPE: DType,
     D: DimsLike,
-    L_MESH_VERTS: Layout,
-    L_MESH_VERT_EDGEADR: Layout,
-    L_MESH_EDGES: Layout,
-    L_CONTACTS: Layout,
-    L_WS: Layout](
+    L_MESH_VERTS: TensorLayout,
+    L_MESH_VERT_EDGEADR: TensorLayout,
+    L_MESH_EDGES: TensorLayout,
+    L_CONTACTS: TensorLayout,
+    L_WS: TensorLayout](
     env: Int,
     body_a: Int,
     body_b: Int,
@@ -462,15 +456,9 @@ def multi_ccd_extra_contacts[
     rbound_j: Scalar[DTYPE],
     va2: Int, mnv2: Int,
     dims: D,
-    mesh_verts: LayoutTensor[
-        DTYPE, L_MESH_VERTS, MutAnyOrigin
-    ],
-    mesh_vert_edgeadr: LayoutTensor[
-        DTYPE, L_MESH_VERT_EDGEADR, MutAnyOrigin
-    ],
-    mesh_edges: LayoutTensor[
-        DTYPE, L_MESH_EDGES, MutAnyOrigin
-    ],
+    mesh_verts: TileTensor[DTYPE, L_MESH_VERTS, MutAnyOrigin],
+    mesh_vert_edgeadr: TileTensor[DTYPE, L_MESH_VERT_EDGEADR, MutAnyOrigin],
+    mesh_edges: TileTensor[DTYPE, L_MESH_EDGES, MutAnyOrigin],
     c0x: Scalar[DTYPE], c0y: Scalar[DTYPE], c0z: Scalar[DTYPE],
     n0x: Scalar[DTYPE], n0y: Scalar[DTYPE], n0z: Scalar[DTYPE],
     dist0: Scalar[DTYPE],
@@ -479,12 +467,9 @@ def multi_ccd_extra_contacts[
     contact_friction_spin: Scalar[DTYPE],
     contact_friction_roll: Scalar[DTYPE],
     contact_condim: Int,
-    contacts: LayoutTensor[
-        DTYPE, L_CONTACTS,
-        MutAnyOrigin,
-    ],
+    contacts: TileTensor[DTYPE, L_CONTACTS, MutAnyOrigin],
     mut num_contacts: Int,
-    ws: LayoutTensor[DTYPE, L_WS, MutAnyOrigin],
+    ws: TileTensor[DTYPE, L_WS, MutAnyOrigin],
     wrow: Int,
     ccd_tol: Scalar[DTYPE] = Scalar[DTYPE](MJ_CCD_TOLERANCE),
     ccd_iter: Int = MJ_CCD_ITERATIONS,

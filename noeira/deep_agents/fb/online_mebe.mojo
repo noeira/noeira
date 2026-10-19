@@ -66,7 +66,6 @@ never read.
 """
 
 from std.math import sqrt
-from layout import Layout, LayoutTensor
 from max.gpu import global_idx
 from max.gpu.host import DeviceContext, DeviceBuffer
 
@@ -98,6 +97,7 @@ from .kernels import (
     ensure_t,
     _blocks,
 )
+from noeira.core.tiles import RowMajor, Tile
 
 
 # ══════════════════════════════════════════════════════════════════════
@@ -666,9 +666,9 @@ struct FBMebeOnlineAgent[
         else:
             _ = self.base.t.train_step(want_loss=False)
         self.base._push_zbuf()
-        comptime lba = Layout.row_major(Self.BATCH * Self.ACT)
+        comptime lba = RowMajor[Self.BATCH * Self.ACT]
         self.base._mean_abs_action_dev.accumulate_gpu_abs_lt[Self.BATCH * Self.ACT](
-            self.base.t.ba.lt["gpu", lba]()
+            self.base.t.ba.tt["gpu", Self.BATCH * Self.ACT]()
         )
 
     # ── OffPolicyAgentGpu: rollout surface ───────────────────────────────
@@ -677,18 +677,10 @@ struct FBMebeOnlineAgent[
         N_ENVS: Int
     ](
         mut self,
-        obs: LayoutTensor[
-            DT, Layout.row_major(N_ENVS, Self.AGENT_OBS_DIM), MutAnyOrigin
-        ],
-        action: LayoutTensor[
-            DT, Layout.row_major(N_ENVS, Self.AGENT_ACT_DIM), MutAnyOrigin
-        ],
-        ao_scratch: LayoutTensor[
-            DT, Layout.row_major(N_ENVS, 2 * Self.AGENT_ACT_DIM), MutAnyOrigin
-        ],
-        alp_scratch: LayoutTensor[
-            DT, Layout.row_major(N_ENVS, Self.AGENT_ACT_DIM + 1), MutAnyOrigin
-        ],
+        obs: Tile[DT, N_ENVS, Self.AGENT_OBS_DIM],
+        action: Tile[DT, N_ENVS, Self.AGENT_ACT_DIM],
+        ao_scratch: Tile[DT, N_ENVS, 2 * Self.AGENT_ACT_DIM],
+        alp_scratch: Tile[DT, N_ENVS, Self.AGENT_ACT_DIM + 1],
         step_idx: Int,
     ) raises:
         if (
@@ -707,15 +699,9 @@ struct FBMebeOnlineAgent[
     ](
         mut self,
         ctx: Optional[DeviceContext],
-        obs: LayoutTensor[
-            DT, Layout.row_major(N_ENVS, Self.AGENT_OBS_DIM), MutAnyOrigin
-        ],
-        action: LayoutTensor[
-            DT, Layout.row_major(N_ENVS, Self.AGENT_ACT_DIM), MutAnyOrigin
-        ],
-        ao_scratch: LayoutTensor[
-            DT, Layout.row_major(N_ENVS, 2 * Self.AGENT_ACT_DIM), MutAnyOrigin
-        ],
+        obs: Tile[DT, N_ENVS, Self.AGENT_OBS_DIM],
+        action: Tile[DT, N_ENVS, Self.AGENT_ACT_DIM],
+        ao_scratch: Tile[DT, N_ENVS, 2 * Self.AGENT_ACT_DIM],
     ) raises:
         self.base.select_greedy_action_batched[N_ENVS](ctx, obs, action, ao_scratch)
 

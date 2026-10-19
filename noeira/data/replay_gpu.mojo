@@ -38,7 +38,6 @@ from max.gpu.sync import barrier
 from max.gpu.host import DeviceContext, DeviceBuffer
 from std.math import pow as fpow
 from std.random.philox import Random as PhiloxRandom
-from layout import Layout, LayoutTensor
 
 from noeira.nn.constants import DT, TPB
 from noeira.deep_agents.training.replay_buffer import ReplayBuffer
@@ -46,6 +45,7 @@ from noeira.deep_agents.training.trainer_block import TrainerState
 from .quantize import _obs_dequant, _obs_quant
 from .resident import IDX_DT
 from .sampler import UniformDeviceSampler
+from noeira.core.tiles import Tile, tile
 
 
 
@@ -54,16 +54,16 @@ from .sampler import UniformDeviceSampler
 def _store_one_kernel[
     OBS: Int, ACT: Int, CAP: Int, SDT: DType = DT
 ](
-    stage_s: LayoutTensor[DT, Layout.row_major(OBS), MutAnyOrigin],
-    stage_a: LayoutTensor[DT, Layout.row_major(ACT), MutAnyOrigin],
-    stage_r: LayoutTensor[DT, Layout.row_major(1), MutAnyOrigin],
-    stage_sp: LayoutTensor[DT, Layout.row_major(OBS), MutAnyOrigin],
-    stage_d: LayoutTensor[DT, Layout.row_major(1), MutAnyOrigin],
-    buf_s: LayoutTensor[SDT, Layout.row_major(CAP, OBS), MutAnyOrigin],
-    buf_a: LayoutTensor[DT, Layout.row_major(CAP, ACT), MutAnyOrigin],
-    buf_r: LayoutTensor[DT, Layout.row_major(CAP), MutAnyOrigin],
-    buf_sp: LayoutTensor[SDT, Layout.row_major(CAP, OBS), MutAnyOrigin],
-    buf_d: LayoutTensor[DT, Layout.row_major(CAP), MutAnyOrigin],
+    stage_s: Tile[DT, OBS],
+    stage_a: Tile[DT, ACT],
+    stage_r: Tile[DT, 1],
+    stage_sp: Tile[DT, OBS],
+    stage_d: Tile[DT, 1],
+    buf_s: Tile[SDT, CAP, OBS],
+    buf_a: Tile[DT, CAP, ACT],
+    buf_r: Tile[DT, CAP],
+    buf_sp: Tile[SDT, CAP, OBS],
+    buf_d: Tile[DT, CAP],
     slot: Int32,
 ):
     """One transition, staged host→device, written into `buf[slot]`."""
@@ -82,16 +82,16 @@ def _store_one_kernel[
 def _store_batch_kernel[
     N_ENVS: Int, OBS: Int, ACT: Int, CAP: Int, SDT: DType = DT
 ](
-    src_s: LayoutTensor[DT, Layout.row_major(N_ENVS, OBS), MutAnyOrigin],
-    src_a: LayoutTensor[DT, Layout.row_major(N_ENVS, ACT), MutAnyOrigin],
-    src_r: LayoutTensor[DT, Layout.row_major(N_ENVS), MutAnyOrigin],
-    src_sp: LayoutTensor[DT, Layout.row_major(N_ENVS, OBS), MutAnyOrigin],
-    src_d: LayoutTensor[DT, Layout.row_major(N_ENVS), MutAnyOrigin],
-    buf_s: LayoutTensor[SDT, Layout.row_major(CAP, OBS), MutAnyOrigin],
-    buf_a: LayoutTensor[DT, Layout.row_major(CAP, ACT), MutAnyOrigin],
-    buf_r: LayoutTensor[DT, Layout.row_major(CAP), MutAnyOrigin],
-    buf_sp: LayoutTensor[SDT, Layout.row_major(CAP, OBS), MutAnyOrigin],
-    buf_d: LayoutTensor[DT, Layout.row_major(CAP), MutAnyOrigin],
+    src_s: Tile[DT, N_ENVS, OBS],
+    src_a: Tile[DT, N_ENVS, ACT],
+    src_r: Tile[DT, N_ENVS],
+    src_sp: Tile[DT, N_ENVS, OBS],
+    src_d: Tile[DT, N_ENVS],
+    buf_s: Tile[SDT, CAP, OBS],
+    buf_a: Tile[DT, CAP, ACT],
+    buf_r: Tile[DT, CAP],
+    buf_sp: Tile[SDT, CAP, OBS],
+    buf_d: Tile[DT, CAP],
     start_pos: Int32,
     base: Int32,
 ):
@@ -121,17 +121,17 @@ def _store_batch_kernel[
 def _gather_batch_kernel[
     BATCH: Int, OBS: Int, ACT: Int, CAP: Int, SDT: DType = DT
 ](
-    mb_s: LayoutTensor[DT, Layout.row_major(BATCH, OBS), MutAnyOrigin],
-    mb_a: LayoutTensor[DT, Layout.row_major(BATCH, ACT), MutAnyOrigin],
-    mb_r: LayoutTensor[DT, Layout.row_major(BATCH), MutAnyOrigin],
-    mb_sp: LayoutTensor[DT, Layout.row_major(BATCH, OBS), MutAnyOrigin],
-    mb_d: LayoutTensor[DT, Layout.row_major(BATCH), MutAnyOrigin],
-    buf_s: LayoutTensor[SDT, Layout.row_major(CAP, OBS), MutAnyOrigin],
-    buf_a: LayoutTensor[DT, Layout.row_major(CAP, ACT), MutAnyOrigin],
-    buf_r: LayoutTensor[DT, Layout.row_major(CAP), MutAnyOrigin],
-    buf_sp: LayoutTensor[SDT, Layout.row_major(CAP, OBS), MutAnyOrigin],
-    buf_d: LayoutTensor[DT, Layout.row_major(CAP), MutAnyOrigin],
-    indices: LayoutTensor[IDX_DT, Layout.row_major(BATCH), MutAnyOrigin],
+    mb_s: Tile[DT, BATCH, OBS],
+    mb_a: Tile[DT, BATCH, ACT],
+    mb_r: Tile[DT, BATCH],
+    mb_sp: Tile[DT, BATCH, OBS],
+    mb_d: Tile[DT, BATCH],
+    buf_s: Tile[SDT, CAP, OBS],
+    buf_a: Tile[DT, CAP, ACT],
+    buf_r: Tile[DT, CAP],
+    buf_sp: Tile[SDT, CAP, OBS],
+    buf_d: Tile[DT, CAP],
+    indices: Tile[IDX_DT, BATCH],
 ):
     """One thread per (lane, obs element). Element-parallel rather than
     one-thread-per-lane: a per-lane kernel serialises the row copy and
@@ -165,10 +165,10 @@ def _gather_batch_kernel[
 def _uniform_indices_dev_kernel[
     BATCH: Int
 ](
-    indices: LayoutTensor[IDX_DT, Layout.row_major(BATCH), MutAnyOrigin],
-    size_buf: LayoutTensor[DType.int32, Layout.row_major(1), MutAnyOrigin],
+    indices: Tile[IDX_DT, BATCH],
+    size_buf: Tile[DType.int32, 1],
     seed: UInt64,
-    offset_buf: LayoutTensor[DType.uint64, Layout.row_major(1), MutAnyOrigin],
+    offset_buf: Tile[DType.uint64, 1],
 ):
     """Capture-safe port of `gpu_replay.mojo::_sample_indices_kernel`."""
     var i = Int(block_dim.x * block_idx.x + thread_idx.x)
@@ -189,11 +189,11 @@ def _uniform_indices_dev_kernel[
 def _mixed_indices_dev_kernel[
     BATCH: Int
 ](
-    indices: LayoutTensor[IDX_DT, Layout.row_major(BATCH), MutAnyOrigin],
-    size_buf: LayoutTensor[DType.int32, Layout.row_major(1), MutAnyOrigin],
-    demo_buf: LayoutTensor[DType.int32, Layout.row_major(1), MutAnyOrigin],
+    indices: Tile[IDX_DT, BATCH],
+    size_buf: Tile[DType.int32, 1],
+    demo_buf: Tile[DType.int32, 1],
     seed: UInt64,
-    offset_buf: LayoutTensor[DType.uint64, Layout.row_major(1), MutAnyOrigin],
+    offset_buf: Tile[DType.uint64, 1],
 ):
     """RLPD's symmetric sampling over ONE storage: lanes `[0, BATCH/2)` draw
     uniformly from the pinned demo prefix `[0, demo_n)`, the rest from the
@@ -221,7 +221,7 @@ def _mixed_indices_dev_kernel[
 
 
 def _incr_offset_kernel[BATCH: Int](
-    offset_buf: LayoutTensor[DType.uint64, Layout.row_major(1), MutAnyOrigin],
+    offset_buf: Tile[DType.uint64, 1],
 ):
     """`offset += 2 * BATCH` on device — the capturable form of the host
     counter bump."""
@@ -231,7 +231,7 @@ def _incr_offset_kernel[BATCH: Int](
 
 
 def _set_size_kernel(
-    size_buf: LayoutTensor[DType.int32, Layout.row_major(1), MutAnyOrigin],
+    size_buf: Tile[DType.int32, 1],
     v: Int32,
 ):
     if Int(thread_idx.x) != 0:
@@ -243,12 +243,12 @@ def _set_size_kernel(
 def _ere_indices_kernel[
     BATCH: Int, CAP: Int
 ](
-    indices: LayoutTensor[IDX_DT, Layout.row_major(BATCH), MutAnyOrigin],
+    indices: Tile[IDX_DT, BATCH],
     size: Int32,
     write_pos: Int32,
     c_k: Int32,
     seed: UInt64,
-    offset_buf: LayoutTensor[DType.uint64, Layout.row_major(1), MutAnyOrigin],
+    offset_buf: Tile[DType.uint64, 1],
 ):
     """Emphasizing Recent Experience (Wang & Ross 2019) — sample uniformly
     from the most recent `c_k` rows of the ring rather than all of it.
@@ -287,11 +287,11 @@ def _ere_indices_kernel[
 def _range_indices_kernel[
     BATCH: Int
 ](
-    indices: LayoutTensor[IDX_DT, Layout.row_major(BATCH), MutAnyOrigin],
+    indices: Tile[IDX_DT, BATCH],
     lo: Int32,
     hi: Int32,
     seed: UInt64,
-    offset_buf: LayoutTensor[DType.uint64, Layout.row_major(1), MutAnyOrigin],
+    offset_buf: Tile[DType.uint64, 1],
 ):
     """Uniform index in `[lo, hi)` — MBPO's dynamics train/holdout split.
 
@@ -322,8 +322,8 @@ def _range_indices_kernel[
 def _per_leafset_new_kernel[
     N: Int, CAP: Int
 ](
-    tree: LayoutTensor[DT, Layout.row_major(2 * CAP - 1), MutAnyOrigin],
-    max_p: LayoutTensor[DT, Layout.row_major(1), MutAnyOrigin],
+    tree: Tile[DT, 2 * CAP - 1],
+    max_p: Tile[DT, 1],
     start_pos: Int32,
     alpha: Scalar[DT],
 ):
@@ -339,9 +339,9 @@ def _per_leafset_new_kernel[
 def _per_update_leaves_kernel[
     BATCH: Int, CAP: Int
 ](
-    tree: LayoutTensor[DT, Layout.row_major(2 * CAP - 1), MutAnyOrigin],
-    indices: LayoutTensor[IDX_DT, Layout.row_major(BATCH), MutAnyOrigin],
-    td: LayoutTensor[DT, Layout.row_major(BATCH), MutAnyOrigin],
+    tree: Tile[DT, 2 * CAP - 1],
+    indices: Tile[IDX_DT, BATCH],
+    td: Tile[DT, BATCH],
     alpha: Scalar[DT],
     epsilon: Scalar[DT],
 ):
@@ -368,8 +368,8 @@ def _per_update_leaves_kernel[
 def _per_max_priority_kernel[
     BATCH: Int
 ](
-    max_p: LayoutTensor[DT, Layout.row_major(1), MutAnyOrigin],
-    td: LayoutTensor[DT, Layout.row_major(BATCH), MutAnyOrigin],
+    max_p: Tile[DT, 1],
+    td: Tile[DT, BATCH],
     epsilon: Scalar[DT],
 ):
     """Single-thread max reduction — BATCH is small and the codebase avoids
@@ -388,7 +388,7 @@ def _per_max_priority_kernel[
 
 def _per_tree_propagate_kernel[
     CAP: Int
-](tree: LayoutTensor[DT, Layout.row_major(2 * CAP - 1), MutAnyOrigin],):
+](tree: Tile[DT, 2 * CAP - 1],):
     """Rebuild every internal node bottom-up, level by level, in ONE
     single-block launch with a barrier between levels. Full-level recompute
     sidesteps the concurrent ancestor-path race that per-leaf propagation
@@ -417,13 +417,13 @@ def _per_tree_propagate_kernel[
 def _per_sample_kernel[
     BATCH: Int, CAP: Int
 ](
-    tree: LayoutTensor[DT, Layout.row_major(2 * CAP - 1), MutAnyOrigin],
-    size_buf: LayoutTensor[DType.int32, Layout.row_major(1), MutAnyOrigin],
-    out_idx: LayoutTensor[IDX_DT, Layout.row_major(BATCH), MutAnyOrigin],
-    out_w: LayoutTensor[DT, Layout.row_major(BATCH), MutAnyOrigin],
+    tree: Tile[DT, 2 * CAP - 1],
+    size_buf: Tile[DType.int32, 1],
+    out_idx: Tile[IDX_DT, BATCH],
+    out_w: Tile[DT, BATCH],
     beta: Scalar[DT],
     seed: UInt64,
-    offset_buf: LayoutTensor[DType.uint64, Layout.row_major(1), MutAnyOrigin],
+    offset_buf: Tile[DType.uint64, 1],
 ):
     """Stratified draw + iterative root-to-leaf descent, one thread per lane.
     `<=` on the left child, matching the host descent exactly."""
@@ -464,7 +464,7 @@ def _per_sample_kernel[
 
 def _per_normalize_weights_kernel[
     BATCH: Int
-](w: LayoutTensor[DT, Layout.row_major(BATCH), MutAnyOrigin],):
+](w: Tile[DT, BATCH],):
     """Normalize so max sampled weight == 1, matching the host two-pass."""
     if Int(thread_idx.x) != 0:
         return
@@ -482,8 +482,8 @@ def _per_normalize_weights_kernel[
 def _per_copy_weights_kernel[
     BATCH: Int
 ](
-    dst: LayoutTensor[DT, Layout.row_major(BATCH), MutAnyOrigin],
-    src: LayoutTensor[DT, Layout.row_major(BATCH), MutAnyOrigin],
+    dst: Tile[DT, BATCH],
+    src: Tile[DT, BATCH],
 ):
     var i = Int(block_dim.x * block_idx.x + thread_idx.x)
     if i >= BATCH:
@@ -753,35 +753,31 @@ struct StoreReplayGpu[
         comptime tpb = Self.OBS if Self.OBS > Self.ACT else Self.ACT
         comptime kern = _store_one_kernel[Self.OBS, Self.ACT, Self.CAP, Self.SDT]
         c.enqueue_function[kern](
-            LayoutTensor[DT, Layout.row_major(Self.OBS)](self.stage_obs),
-            LayoutTensor[DT, Layout.row_major(Self.ACT)](self.stage_act),
-            LayoutTensor[DT, Layout.row_major(1)](self.stage_rew),
-            LayoutTensor[DT, Layout.row_major(Self.OBS)](self.stage_nxt),
-            LayoutTensor[DT, Layout.row_major(1)](self.stage_dne),
-            LayoutTensor[Self.SDT, Layout.row_major(Self.CAP, Self.OBS)](self.obs),
-            LayoutTensor[DT, Layout.row_major(Self.CAP, Self.ACT)](self.act),
-            LayoutTensor[DT, Layout.row_major(Self.CAP)](self.rew),
-            LayoutTensor[Self.SDT, Layout.row_major(Self.CAP, Self.OBS)](self.nxt),
-            LayoutTensor[DT, Layout.row_major(Self.CAP)](self.dne),
+            tile[Self.OBS](self.stage_obs),
+            tile[Self.ACT](self.stage_act),
+            tile[1](self.stage_rew),
+            tile[Self.OBS](self.stage_nxt),
+            tile[1](self.stage_dne),
+            tile[Self.CAP, Self.OBS](self.obs),
+            tile[Self.CAP, Self.ACT](self.act),
+            tile[Self.CAP](self.rew),
+            tile[Self.CAP, Self.OBS](self.nxt),
+            tile[Self.CAP](self.dne),
             Int32(self.pos),
             grid_dim=1,
             block_dim=tpb,
         )
         comptime if Self.PRIORITIZED:
             c.enqueue_function[_per_leafset_new_kernel[1, Self.CAP]](
-                LayoutTensor[DT, Layout.row_major(2 * Self.CAP - 1)](
-                    self.tree.value()
-                ),
-                LayoutTensor[DT, Layout.row_major(1)](self.max_p.value()),
+                tile[2 * Self.CAP - 1](self.tree.value()),
+                tile[1](self.max_p.value()),
                 Int32(self.pos),
                 self.alpha,
                 grid_dim=1,
                 block_dim=1,
             )
             c.enqueue_function[_per_tree_propagate_kernel[Self.CAP]](
-                LayoutTensor[DT, Layout.row_major(2 * Self.CAP - 1)](
-                    self.tree.value()
-                ),
+                tile[2 * Self.CAP - 1](self.tree.value()),
                 grid_dim=1,
                 block_dim=TPB,
             )
@@ -834,7 +830,7 @@ struct StoreReplayGpu[
         self.pos = n
         # The device word the sample kernel reads — one launch, no wait.
         ctx.value().enqueue_function[_set_size_kernel](
-            LayoutTensor[DType.int32, Layout.row_major(1)](self.demo_dev),
+            tile[1](self.demo_dev),
             Int32(n),
             grid_dim=1,
             block_dim=1,
@@ -847,7 +843,7 @@ struct StoreReplayGpu[
         """Mirror the host `size` into the device buffer the sample kernels
         read. Device-resident so capture cannot bake a stale fill."""
         ctx.enqueue_function[_set_size_kernel](
-            LayoutTensor[DType.int32, Layout.row_major(1)](self.size_dev),
+            tile[1](self.size_dev),
             Int32(self.size),
             grid_dim=1,
             block_dim=1,
@@ -873,20 +869,20 @@ struct StoreReplayGpu[
         # it this method simply fails to instantiate (and, being generic, it
         # stayed silently uncompiled until the first GPU-batched call site).
         var src_obs_lt = rebind[
-            LayoutTensor[DT, Layout.row_major(N_ENVS, Self.OBS), MutAnyOrigin]
-        ](LayoutTensor[DT, Layout.row_major(N_ENVS, Self.OBS)](src_obs))
+            Tile[DT, N_ENVS, Self.OBS]
+        ](tile[N_ENVS, Self.OBS](src_obs))
         var src_act_lt = rebind[
-            LayoutTensor[DT, Layout.row_major(N_ENVS, Self.ACT), MutAnyOrigin]
-        ](LayoutTensor[DT, Layout.row_major(N_ENVS, Self.ACT)](src_act))
+            Tile[DT, N_ENVS, Self.ACT]
+        ](tile[N_ENVS, Self.ACT](src_act))
         var src_rew_lt = rebind[
-            LayoutTensor[DT, Layout.row_major(N_ENVS), MutAnyOrigin]
-        ](LayoutTensor[DT, Layout.row_major(N_ENVS)](src_rew))
+            Tile[DT, N_ENVS]
+        ](tile[N_ENVS](src_rew))
         var src_nxt_lt = rebind[
-            LayoutTensor[DT, Layout.row_major(N_ENVS, Self.OBS), MutAnyOrigin]
-        ](LayoutTensor[DT, Layout.row_major(N_ENVS, Self.OBS)](src_nxt))
+            Tile[DT, N_ENVS, Self.OBS]
+        ](tile[N_ENVS, Self.OBS](src_nxt))
         var src_dne_lt = rebind[
-            LayoutTensor[DT, Layout.row_major(N_ENVS), MutAnyOrigin]
-        ](LayoutTensor[DT, Layout.row_major(N_ENVS)](src_dne))
+            Tile[DT, N_ENVS]
+        ](tile[N_ENVS](src_dne))
         comptime n_blocks = (N_ENVS * Self.OBS + TPB - 1) // TPB
         comptime kern = _store_batch_kernel[
             N_ENVS, Self.OBS, Self.ACT, Self.CAP, Self.SDT
@@ -897,11 +893,11 @@ struct StoreReplayGpu[
             src_rew_lt,
             src_nxt_lt,
             src_dne_lt,
-            LayoutTensor[Self.SDT, Layout.row_major(Self.CAP, Self.OBS)](self.obs),
-            LayoutTensor[DT, Layout.row_major(Self.CAP, Self.ACT)](self.act),
-            LayoutTensor[DT, Layout.row_major(Self.CAP)](self.rew),
-            LayoutTensor[Self.SDT, Layout.row_major(Self.CAP, Self.OBS)](self.nxt),
-            LayoutTensor[DT, Layout.row_major(Self.CAP)](self.dne),
+            tile[Self.CAP, Self.OBS](self.obs),
+            tile[Self.CAP, Self.ACT](self.act),
+            tile[Self.CAP](self.rew),
+            tile[Self.CAP, Self.OBS](self.nxt),
+            tile[Self.CAP](self.dne),
             Int32(self.pos),
             Int32(self.demo_n),
             grid_dim=n_blocks,
@@ -912,19 +908,15 @@ struct StoreReplayGpu[
             ctx.enqueue_function[
                 _per_leafset_new_kernel[N_ENVS, Self.CAP]
             ](
-                LayoutTensor[DT, Layout.row_major(2 * Self.CAP - 1)](
-                    self.tree.value()
-                ),
-                LayoutTensor[DT, Layout.row_major(1)](self.max_p.value()),
+                tile[2 * Self.CAP - 1](self.tree.value()),
+                tile[1](self.max_p.value()),
                 Int32(self.pos),
                 self.alpha,
                 grid_dim=nb,
                 block_dim=TPB,
             )
             ctx.enqueue_function[_per_tree_propagate_kernel[Self.CAP]](
-                LayoutTensor[DT, Layout.row_major(2 * Self.CAP - 1)](
-                    self.tree.value()
-                ),
+                tile[2 * Self.CAP - 1](self.tree.value()),
                 grid_dim=1,
                 block_dim=TPB,
             )
@@ -946,24 +938,14 @@ struct StoreReplayGpu[
                 + " exceeds batch_capacity=" + String(self.batch_capacity)
             )
         var ctx = state.ctx.value()
-        var idx_lt = LayoutTensor[IDX_DT, Layout.row_major(BATCH)](
-            self.idx_buf
-        )
-        var size_lt = LayoutTensor[DType.int32, Layout.row_major(1)](
-            self.size_dev
-        )
-        var off_lt = LayoutTensor[DType.uint64, Layout.row_major(1)](
-            self.offset_dev
-        )
+        var idx_lt = tile[BATCH](self.idx_buf)
+        var size_lt = tile[1](self.size_dev)
+        var off_lt = tile[1](self.offset_dev)
         comptime n_idx_blocks = (BATCH + TPB - 1) // TPB
 
         comptime if Self.PRIORITIZED:
-            var tree_lt = LayoutTensor[
-                DT, Layout.row_major(2 * Self.CAP - 1)
-            ](self.tree.value())
-            var w_lt = LayoutTensor[DT, Layout.row_major(BATCH)](
-                self.w_buf.value()
-            )
+            var tree_lt = tile[2 * Self.CAP - 1](self.tree.value())
+            var w_lt = tile[BATCH](self.w_buf.value())
             ctx.enqueue_function[_per_sample_kernel[BATCH, Self.CAP]](
                 tree_lt, size_lt, idx_lt, w_lt, self.beta,
                 UInt64(0xC0FFEE_DECADE_0042), off_lt,
@@ -973,9 +955,7 @@ struct StoreReplayGpu[
                 w_lt, grid_dim=1, block_dim=1,
             )
             ctx.enqueue_function[_per_copy_weights_kernel[BATCH]](
-                LayoutTensor[DT, Layout.row_major(BATCH)](
-                    state.mb_w.dev.value()
-                ),
+                tile[BATCH](state.mb_w.dev.value()),
                 w_lt,
                 grid_dim=n_idx_blocks, block_dim=TPB,
             )
@@ -984,9 +964,7 @@ struct StoreReplayGpu[
             if self.demo_n > 0:
                 ctx.enqueue_function[_mixed_indices_dev_kernel[BATCH]](
                     idx_lt, size_lt,
-                    LayoutTensor[DType.int32, Layout.row_major(1)](
-                        self.demo_dev
-                    ),
+                    tile[1](self.demo_dev),
                     UInt64(0xC0FFEE_DECADE_0042), off_lt,
                     grid_dim=n_idx_blocks, block_dim=TPB,
                 )
@@ -1024,23 +1002,17 @@ struct StoreReplayGpu[
             BATCH, Self.OBS, Self.ACT, Self.CAP, Self.SDT
         ]
         ctx.enqueue_function[kern](
-            LayoutTensor[DT, Layout.row_major(BATCH, Self.OBS)](
-                state.mb_s.dev.value()
-            ),
-            LayoutTensor[DT, Layout.row_major(BATCH, Self.ACT)](
-                state.mb_a.dev.value()
-            ),
-            LayoutTensor[DT, Layout.row_major(BATCH)](state.mb_r.dev.value()),
-            LayoutTensor[DT, Layout.row_major(BATCH, Self.OBS)](
-                state.mb_sp.dev.value()
-            ),
-            LayoutTensor[DT, Layout.row_major(BATCH)](state.mb_d.dev.value()),
-            LayoutTensor[Self.SDT, Layout.row_major(Self.CAP, Self.OBS)](self.obs),
-            LayoutTensor[DT, Layout.row_major(Self.CAP, Self.ACT)](self.act),
-            LayoutTensor[DT, Layout.row_major(Self.CAP)](self.rew),
-            LayoutTensor[Self.SDT, Layout.row_major(Self.CAP, Self.OBS)](self.nxt),
-            LayoutTensor[DT, Layout.row_major(Self.CAP)](self.dne),
-            LayoutTensor[IDX_DT, Layout.row_major(BATCH)](self.idx_buf),
+            tile[BATCH, Self.OBS](state.mb_s.dev.value()),
+            tile[BATCH, Self.ACT](state.mb_a.dev.value()),
+            tile[BATCH](state.mb_r.dev.value()),
+            tile[BATCH, Self.OBS](state.mb_sp.dev.value()),
+            tile[BATCH](state.mb_d.dev.value()),
+            tile[Self.CAP, Self.OBS](self.obs),
+            tile[Self.CAP, Self.ACT](self.act),
+            tile[Self.CAP](self.rew),
+            tile[Self.CAP, Self.OBS](self.nxt),
+            tile[Self.CAP](self.dne),
+            tile[BATCH](self.idx_buf),
             grid_dim=n_blocks,
             block_dim=TPB,
         )
@@ -1066,21 +1038,15 @@ struct StoreReplayGpu[
     ) raises:
         comptime if Self.PRIORITIZED:
             var ctx = state.ctx.value()
-            var td = LayoutTensor[DT, Layout.row_major(BATCH)](
-                state.td_residuals.dev.value()
-            )
-            var tree_lt = LayoutTensor[
-                DT, Layout.row_major(2 * Self.CAP - 1)
-            ](self.tree.value())
-            var maxp_lt = LayoutTensor[DT, Layout.row_major(1)](
-                self.max_p.value()
-            )
+            var td = tile[BATCH](state.td_residuals.dev.value())
+            var tree_lt = tile[2 * Self.CAP - 1](self.tree.value())
+            var maxp_lt = tile[1](self.max_p.value())
             comptime n_blocks = (BATCH + TPB - 1) // TPB
             ctx.enqueue_function[
                 _per_update_leaves_kernel[BATCH, Self.CAP]
             ](
                 tree_lt,
-                LayoutTensor[IDX_DT, Layout.row_major(BATCH)](self.idx_buf),
+                tile[BATCH](self.idx_buf),
                 td,
                 self.alpha,
                 self.epsilon,
@@ -1110,13 +1076,9 @@ struct StoreReplayGpu[
         `sample_into` targets a `TrainerState`; MBPO needs the raw form for
         its dynamics-model batches and rollout start states.
         """
-        var idx_lt = LayoutTensor[IDX_DT, Layout.row_major(N)](self.idx_buf)
-        var size_lt = LayoutTensor[DType.int32, Layout.row_major(1)](
-            self.size_dev
-        )
-        var off_lt = LayoutTensor[DType.uint64, Layout.row_major(1)](
-            self.offset_dev
-        )
+        var idx_lt = tile[N](self.idx_buf)
+        var size_lt = tile[1](self.size_dev)
+        var off_lt = tile[1](self.offset_dev)
         comptime nb = (N + TPB - 1) // TPB
         ctx.enqueue_function[_uniform_indices_dev_kernel[N]](
             idx_lt, size_lt, UInt64(0xC0FFEE_DECADE_0042), off_lt,
@@ -1142,10 +1104,8 @@ struct StoreReplayGpu[
     ) raises:
         """Uniform draw restricted to rows `[lo, hi)` — MBPO's dynamics
         train/holdout split."""
-        var idx_lt = LayoutTensor[IDX_DT, Layout.row_major(N)](self.idx_buf)
-        var off_lt = LayoutTensor[DType.uint64, Layout.row_major(1)](
-            self.offset_dev
-        )
+        var idx_lt = tile[N](self.idx_buf)
+        var off_lt = tile[1](self.offset_dev)
         comptime nb = (N + TPB - 1) // TPB
         ctx.enqueue_function[_range_indices_kernel[N]](
             idx_lt, Int32(lo), Int32(hi),
@@ -1172,20 +1132,20 @@ struct StoreReplayGpu[
         # DESTINATIONS and arrive read-only, so without it `sample` /
         # `sample_range` (the MBPO raw-buffer path) fail to instantiate.
         var mb_s_lt = rebind[
-            LayoutTensor[DT, Layout.row_major(N, Self.OBS), MutAnyOrigin]
-        ](LayoutTensor[DT, Layout.row_major(N, Self.OBS)](mb_s))
+            Tile[DT, N, Self.OBS]
+        ](tile[N, Self.OBS](mb_s))
         var mb_a_lt = rebind[
-            LayoutTensor[DT, Layout.row_major(N, Self.ACT), MutAnyOrigin]
-        ](LayoutTensor[DT, Layout.row_major(N, Self.ACT)](mb_a))
+            Tile[DT, N, Self.ACT]
+        ](tile[N, Self.ACT](mb_a))
         var mb_r_lt = rebind[
-            LayoutTensor[DT, Layout.row_major(N), MutAnyOrigin]
-        ](LayoutTensor[DT, Layout.row_major(N)](mb_r))
+            Tile[DT, N]
+        ](tile[N](mb_r))
         var mb_sp_lt = rebind[
-            LayoutTensor[DT, Layout.row_major(N, Self.OBS), MutAnyOrigin]
-        ](LayoutTensor[DT, Layout.row_major(N, Self.OBS)](mb_sp))
+            Tile[DT, N, Self.OBS]
+        ](tile[N, Self.OBS](mb_sp))
         var mb_d_lt = rebind[
-            LayoutTensor[DT, Layout.row_major(N), MutAnyOrigin]
-        ](LayoutTensor[DT, Layout.row_major(N)](mb_d))
+            Tile[DT, N]
+        ](tile[N](mb_d))
         comptime nbg = (N * Self.OBS + TPB - 1) // TPB
         comptime kern = _gather_batch_kernel[
             N, Self.OBS, Self.ACT, Self.CAP, Self.SDT
@@ -1196,12 +1156,12 @@ struct StoreReplayGpu[
             mb_r_lt,
             mb_sp_lt,
             mb_d_lt,
-            LayoutTensor[Self.SDT, Layout.row_major(Self.CAP, Self.OBS)](self.obs),
-            LayoutTensor[DT, Layout.row_major(Self.CAP, Self.ACT)](self.act),
-            LayoutTensor[DT, Layout.row_major(Self.CAP)](self.rew),
-            LayoutTensor[Self.SDT, Layout.row_major(Self.CAP, Self.OBS)](self.nxt),
-            LayoutTensor[DT, Layout.row_major(Self.CAP)](self.dne),
-            LayoutTensor[IDX_DT, Layout.row_major(N)](self.idx_buf),
+            tile[Self.CAP, Self.OBS](self.obs),
+            tile[Self.CAP, Self.ACT](self.act),
+            tile[Self.CAP](self.rew),
+            tile[Self.CAP, Self.OBS](self.nxt),
+            tile[Self.CAP](self.dne),
+            tile[N](self.idx_buf),
             grid_dim=nbg, block_dim=TPB,
         )
 

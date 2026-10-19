@@ -27,7 +27,6 @@ decisive games).
 from noeira.nn.core.ptr import untracked
 from std.memory import Pointer
 from max.gpu.host import DeviceContext, DeviceBuffer
-from layout import Layout, LayoutTensor
 
 from noeira.nn.constants import DT
 from noeira.nn.core.module import Module
@@ -44,6 +43,7 @@ from ..zero.evaluators import RandomOpponent
 from ..zero.mcts_adapters import AZPredGPU, AZEnvGPU
 from ..zero.mcts_adapters_cpu import AZRepCPU, AZDynCPU, AZPredCPU
 from .eval import EvalResult
+from noeira.core.tiles import tile
 
 
 @always_inline
@@ -134,12 +134,8 @@ def arena_match[
             ctx.enqueue_copy(legal_h, legal_dev)
             ctx.synchronize()
             var a_turn = (ply % 2) == a_player
-            var obs_lt = LayoutTensor[
-                DT, Layout.row_major(N_GAMES, OBS), MutAnyOrigin
-            ](obs_dev)
-            var pred_lt = LayoutTensor[
-                DT, Layout.row_major(N_GAMES, W), MutAnyOrigin
-            ](pred_dev)
+            var obs_lt = tile[N_GAMES, OBS](obs_dev)
+            var pred_lt = tile[N_GAMES, W](pred_dev)
             if a_turn:
                 pred_ad_a.predict_gpu[N_GAMES](ctx, obs_lt, pred_lt)
             else:
@@ -265,12 +261,8 @@ def arena_match_mcts[
         elif a_turn:
             var pred = AZPredGPU[OBS, ACT, NETA].make(a)
             var env_ad = AZEnvGPU[ENV, STATE, OBS, ACT]()
-            var root_obs = LayoutTensor[DT, Layout.row_major(N_GAMES, OBS)](
-                obs_dev
-            )
-            var root_legal = LayoutTensor[DT, Layout.row_major(N_GAMES * ACT)](
-                legal_dev
-            )
+            var root_obs = tile[N_GAMES, OBS](obs_dev)
+            var root_legal = tile[N_GAMES * ACT](legal_dev)
             mcts.search_gpu_alphazero[type_of(pred), type_of(env_ad)](
                 ctx,
                 pred,
@@ -284,12 +276,8 @@ def arena_match_mcts[
         else:
             var pred = AZPredGPU[OBS, ACT, NETB].make(b)
             var env_ad = AZEnvGPU[ENV, STATE, OBS, ACT]()
-            var root_obs = LayoutTensor[DT, Layout.row_major(N_GAMES, OBS)](
-                obs_dev
-            )
-            var root_legal = LayoutTensor[DT, Layout.row_major(N_GAMES * ACT)](
-                legal_dev
-            )
+            var root_obs = tile[N_GAMES, OBS](obs_dev)
+            var root_legal = tile[N_GAMES * ACT](legal_dev)
             mcts.search_gpu_alphazero[type_of(pred), type_of(env_ad)](
                 ctx,
                 pred,

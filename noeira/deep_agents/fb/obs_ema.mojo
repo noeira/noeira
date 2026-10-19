@@ -35,7 +35,6 @@ sqrt(var + eps)`, then `n_updates <k>`), which the evals load with
 
 from max.gpu import global_idx
 from std.math import sqrt
-from layout import Layout, LayoutTensor
 from max.gpu.host import DeviceContext
 
 from noeira.nn.constants import DT, TPB

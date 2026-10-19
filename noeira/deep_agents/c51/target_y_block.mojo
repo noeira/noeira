@@ -27,7 +27,6 @@ kernels (argmax / projection, no atomics) are unchanged; views are built via
 from std.math import exp as fexp, log as flog
 from max.gpu import global_idx
 from max.gpu.host import DeviceContext
-from layout import Layout, LayoutTensor
 
 from noeira.nn.constants import DT, TPB
 from noeira.nn.core.amp import AMPPolicy, NoAMP
@@ -35,6 +34,7 @@ from noeira.nn.core.call import call_forward
 from noeira.nn.core.module import Module
 from noeira.nn.core.tensor import Tensor
 from noeira.nn.core.tensor_refs import TensorRefs
+from noeira.core.tiles import RowMajor, Tile
 
 
 # ──────────────────────────────────────────────────────────────────────
@@ -45,11 +45,9 @@ from noeira.nn.core.tensor_refs import TensorRefs
 def _c51_argmax_action_kernel[
     BATCH: Int, NA: Int, N_ATOMS: Int,
 ](
-    logits: LayoutTensor[
-        DT, Layout.row_major(BATCH, NA * N_ATOMS), MutAnyOrigin,
-    ],
-    z: LayoutTensor[DT, Layout.row_major(N_ATOMS), MutAnyOrigin],
-    best_a_out: LayoutTensor[DT, Layout.row_major(BATCH), MutAnyOrigin],
+    logits: Tile[DT, BATCH, NA * N_ATOMS],
+    z: Tile[DT, N_ATOMS],
+    best_a_out: Tile[DT, BATCH],
 ):
     """Per row b: pick `argmax_a Σ_k softmax(logits[b, a, ·])_k · z_k`."""
     var b = Int(global_idx.x)
@@ -84,14 +82,12 @@ def _c51_argmax_action_kernel[
 def _c51_project_kernel[
     BATCH: Int, NA: Int, N_ATOMS: Int,
 ](
-    logits_t: LayoutTensor[
-        DT, Layout.row_major(BATCH, NA * N_ATOMS), MutAnyOrigin,
-    ],
-    best_a: LayoutTensor[DT, Layout.row_major(BATCH), MutAnyOrigin],
-    r: LayoutTensor[DT, Layout.row_major(BATCH), MutAnyOrigin],
-    d: LayoutTensor[DT, Layout.row_major(BATCH), MutAnyOrigin],
-    z: LayoutTensor[DT, Layout.row_major(N_ATOMS), MutAnyOrigin],
-    m_out: LayoutTensor[DT, Layout.row_major(BATCH, N_ATOMS), MutAnyOrigin],
+    logits_t: Tile[DT, BATCH, NA * N_ATOMS],
+    best_a: Tile[DT, BATCH],
+    r: Tile[DT, BATCH],
+    d: Tile[DT, BATCH],
+    z: Tile[DT, N_ATOMS],
+    m_out: Tile[DT, BATCH, N_ATOMS],
     gamma_n: Scalar[DT],
     v_min: Scalar[DT],
     v_max: Scalar[DT],
@@ -272,10 +268,10 @@ struct C51TargetYBlock[
 
         comptime if target == "gpu":
             var c = ctx.value()
-            comptime LZ = Layout.row_major(Self.N_ATOMS)
-            comptime LB = Layout.row_major(Self.BATCH)
-            comptime LROW = Layout.row_major(Self.BATCH, ROW)
-            comptime LM = Layout.row_major(Self.BATCH, Self.N_ATOMS)
+            comptime LZ = RowMajor[Self.N_ATOMS]
+            comptime LB = RowMajor[Self.BATCH]
+            comptime LROW = RowMajor[Self.BATCH, ROW]
+            comptime LM = RowMajor[Self.BATCH, Self.N_ATOMS]
             comptime n_blocks_b = (Self.BATCH + TPB - 1) // TPB
 
             # Argmax: source is _logits_on if DOUBLE else _logits_t.
@@ -284,16 +280,16 @@ struct C51TargetYBlock[
             ]
             comptime if Self.DOUBLE:
                 c.enqueue_function[arg_kernel](
-                    self._logits_on.lt["gpu", LROW](),
-                    self._z.lt["gpu", LZ](),
-                    self._best_a.lt["gpu", LB](),
+                    self._logits_on.tt["gpu", Self.BATCH, ROW](),
+                    self._z.tt["gpu", Self.N_ATOMS](),
+                    self._best_a.tt["gpu", Self.BATCH](),
                     grid_dim=n_blocks_b, block_dim=TPB,
                 )
             else:
                 c.enqueue_function[arg_kernel](
-                    self._logits_t.lt["gpu", LROW](),
-                    self._z.lt["gpu", LZ](),
-                    self._best_a.lt["gpu", LB](),
+                    self._logits_t.tt["gpu", Self.BATCH, ROW](),
+                    self._z.tt["gpu", Self.N_ATOMS](),
+                    self._best_a.tt["gpu", Self.BATCH](),
                     grid_dim=n_blocks_b, block_dim=TPB,
                 )
 
@@ -302,12 +298,12 @@ struct C51TargetYBlock[
                 Self.BATCH, Self.NA, Self.N_ATOMS,
             ]
             c.enqueue_function[proj_kernel](
-                self._logits_t.lt["gpu", LROW](),
-                self._best_a.lt["gpu", LB](),
-                mb_r.lt["gpu", LB](),
-                mb_d.lt["gpu", LB](),
-                self._z.lt["gpu", LZ](),
-                mb_m.lt["gpu", LM](),
+                self._logits_t.tt["gpu", Self.BATCH, ROW](),
+                self._best_a.tt["gpu", Self.BATCH](),
+                mb_r.tt["gpu", Self.BATCH](),
+                mb_d.tt["gpu", Self.BATCH](),
+                self._z.tt["gpu", Self.N_ATOMS](),
+                mb_m.tt["gpu", Self.BATCH, Self.N_ATOMS](),
                 self.gamma_n, self.v_min, self.v_max, self.dz,
                 grid_dim=n_blocks_b, block_dim=TPB,
             )

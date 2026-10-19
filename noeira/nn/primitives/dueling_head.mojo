@@ -20,7 +20,8 @@ verbatim.
 
 from max.gpu import global_idx
 from max.gpu.host import DeviceContext
-from layout import Layout, LayoutTensor, TileTensor, row_major
+from layout import TileTensor, row_major
+from noeira.core.tiles import Tile
 
 from noeira.nn.constants import DT, TPB
 from ..core.tensor import Tensor
@@ -35,10 +36,8 @@ from ..core.amp import AMPPolicy, NoAMP
 def _dueling_combine_kernel[
     BATCH: Int, NA: Int,
 ](
-    raw_in: LayoutTensor[
-        DT, Layout.row_major(BATCH, NA + 1), MutAnyOrigin,
-    ],
-    q_out: LayoutTensor[DT, Layout.row_major(BATCH, NA), MutAnyOrigin],
+    raw_in: Tile[DT, BATCH, NA + 1],
+    q_out: Tile[DT, BATCH, NA],
 ):
     """`q_out[b, a] = raw_in[b, 0] + raw_in[b, 1 + a] − mean_a raw_in[b, 1 + a]`.
     1 thread per BATCH row, scalar inner loop over NA.
@@ -58,12 +57,8 @@ def _dueling_combine_kernel[
 def _dueling_grad_kernel[
     BATCH: Int, NA: Int,
 ](
-    grad_out: LayoutTensor[
-        DT, Layout.row_major(BATCH, NA), MutAnyOrigin,
-    ],
-    grad_in: LayoutTensor[
-        DT, Layout.row_major(BATCH, NA + 1), MutAnyOrigin,
-    ],
+    grad_out: Tile[DT, BATCH, NA],
+    grad_in: Tile[DT, BATCH, NA + 1],
 ):
     """`grad_in[b, 0] = Σ_a grad_out[b, a]`,
     `grad_in[b, 1 + a] = grad_out[b, a] − (1 / NA) · Σ_a grad_out[b, a]`.
@@ -132,8 +127,8 @@ struct DuelingHead[NA: Int](Module):
             comptime n_blocks = (B + TPB - 1) // TPB
             comptime kernel = _dueling_combine_kernel[B, Self.NA]
             c.enqueue_function[kernel](
-                in0.lt["gpu", Layout.row_major(B, Self.NA + 1)](),
-                out.lt["gpu", Layout.row_major(B, Self.NA)](),
+                in0.tt["gpu", B, Self.NA + 1](),
+                out.tt["gpu", B, Self.NA](),
                 grid_dim=n_blocks,
                 block_dim=TPB,
             )
@@ -176,8 +171,8 @@ struct DuelingHead[NA: Int](Module):
             comptime n_blocks = (B + TPB - 1) // TPB
             comptime kernel = _dueling_grad_kernel[B, Self.NA]
             c.enqueue_function[kernel](
-                grad_output.lt["gpu", Layout.row_major(B, Self.NA)](),
-                gin.lt["gpu", Layout.row_major(B, Self.NA + 1)](),
+                grad_output.tt["gpu", B, Self.NA](),
+                gin.tt["gpu", B, Self.NA + 1](),
                 grid_dim=n_blocks,
                 block_dim=TPB,
             )

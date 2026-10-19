@@ -23,7 +23,6 @@ from CarDynamicsMB. See project_car_racing_audit memory.
 """
 
 from std.math import sqrt, sin, cos, pi
-from layout import Layout, LayoutTensor
 from max.gpu import thread_idx, block_idx, block_dim
 from max.gpu.host import DeviceContext, DeviceBuffer
 from std.random.philox import Random as PhiloxRandom
@@ -39,6 +38,7 @@ from noeira.physics2d.car.constants import (
     STEERING_LIMIT, TILE_DATA_SIZE,
 )
 from .constants import CRConstants
+from noeira.core.tiles import Tile, ImmTile, tile
 
 
 struct CarRacingDiscrete[DTYPE: DType](GPUDiscreteEnv, Copyable, Movable):
@@ -129,9 +129,7 @@ struct CarRacingDiscrete[DTYPE: DType](GPUDiscreteEnv, Copyable, Movable):
         BATCH: Int, STATE_SIZE: Int
     ](
         env: Int,
-        states: LayoutTensor[
-            dtype, Layout.row_major(BATCH, STATE_SIZE), MutAnyOrigin
-        ],
+        states: Tile[dtype, BATCH, STATE_SIZE],
     ):
         var ho = Self.BODIES_OFFSET  # hull = body 0
         var a = rebind[Scalar[dtype]](states[env, ho + IDX_ANGLE])
@@ -168,9 +166,7 @@ struct CarRacingDiscrete[DTYPE: DType](GPUDiscreteEnv, Copyable, Movable):
     def _gen_track[
         BATCH: Int, STATE_SIZE: Int
     ](
-        states: LayoutTensor[
-            dtype, Layout.row_major(BATCH, STATE_SIZE), MutAnyOrigin
-        ],
+        states: Tile[dtype, BATCH, STATE_SIZE],
         env: Int,
         mut rng: PhiloxRandom,
     ) -> Int:
@@ -287,9 +283,7 @@ struct CarRacingDiscrete[DTYPE: DType](GPUDiscreteEnv, Copyable, Movable):
     def _reset_env[
         BATCH: Int, STATE_SIZE: Int
     ](
-        states: LayoutTensor[
-            dtype, Layout.row_major(BATCH, STATE_SIZE), MutAnyOrigin
-        ],
+        states: Tile[dtype, BATCH, STATE_SIZE],
         env: Int,
         seed: Int,
     ):
@@ -330,14 +324,10 @@ struct CarRacingDiscrete[DTYPE: DType](GPUDiscreteEnv, Copyable, Movable):
         BATCH: Int, STATE_SIZE: Int, ACTION_DIM: Int
     ](
         env: Int,
-        states: LayoutTensor[
-            dtype, Layout.row_major(BATCH, STATE_SIZE), MutAnyOrigin
-        ],
-        actions: LayoutTensor[
-            dtype, Layout.row_major(BATCH, ACTION_DIM), ImmutAnyOrigin
-        ],
-        rewards: LayoutTensor[dtype, Layout.row_major(BATCH), MutAnyOrigin],
-        dones: LayoutTensor[dtype, Layout.row_major(BATCH), MutAnyOrigin],
+        states: Tile[dtype, BATCH, STATE_SIZE],
+        actions: ImmTile[dtype, BATCH, ACTION_DIM],
+        rewards: Tile[dtype, BATCH],
+        dones: Tile[dtype, BATCH],
     ):
         var mo = Self.METADATA_OFFSET
         var was_done = rebind[Scalar[dtype]](states[env, mo + Self.META_DONE]) > Scalar[dtype](0.5)
@@ -415,12 +405,12 @@ struct CarRacingDiscrete[DTYPE: DType](GPUDiscreteEnv, Copyable, Movable):
     def reset_kernel_gpu[
         BATCH_SIZE: Int, STATE_SIZE: Int
     ](ctx: DeviceContext, mut states: DeviceBuffer[dtype], rng_seed: UInt64 = 0) raises:
-        var st = LayoutTensor[dtype, Layout.row_major(BATCH_SIZE, STATE_SIZE)](states)
+        var st = tile[BATCH_SIZE, STATE_SIZE](states)
         comptime BLOCKS = (BATCH_SIZE + TPB - 1) // TPB
 
         @always_inline
         def reset_wrap(
-            st: LayoutTensor[dtype, Layout.row_major(BATCH_SIZE, STATE_SIZE), MutAnyOrigin],
+            st: Tile[dtype, BATCH_SIZE, STATE_SIZE],
             seed: Scalar[DType.uint64],
         ):
             var env = Int(block_dim.x * block_idx.x + thread_idx.x)
@@ -444,14 +434,14 @@ struct CarRacingDiscrete[DTYPE: DType](GPUDiscreteEnv, Copyable, Movable):
         workspace_ptr: Optional[Pointer[Scalar[dtype], MutAnyOrigin]] = None,
         rng_counter_ptr: Optional[Pointer[Scalar[DType.uint64], MutAnyOrigin]] = None,
     ) raises:
-        var st = LayoutTensor[dtype, Layout.row_major(BATCH_SIZE, STATE_SIZE)](states)
-        var dn = LayoutTensor[dtype, Layout.row_major(BATCH_SIZE)](dones)
+        var st = tile[BATCH_SIZE, STATE_SIZE](states)
+        var dn = tile[BATCH_SIZE](dones)
         comptime BLOCKS = (BATCH_SIZE + TPB - 1) // TPB
 
         @always_inline
         def sel_wrap(
-            st: LayoutTensor[dtype, Layout.row_major(BATCH_SIZE, STATE_SIZE), MutAnyOrigin],
-            dn: LayoutTensor[dtype, Layout.row_major(BATCH_SIZE), MutAnyOrigin],
+            st: Tile[dtype, BATCH_SIZE, STATE_SIZE],
+            dn: Tile[dtype, BATCH_SIZE],
             seed: Scalar[DType.uint64],
         ):
             var env = Int(block_dim.x * block_idx.x + thread_idx.x)
@@ -481,22 +471,22 @@ struct CarRacingDiscrete[DTYPE: DType](GPUDiscreteEnv, Copyable, Movable):
         workspace_ptr: Optional[Pointer[Scalar[dtype], MutAnyOrigin]] = None,
         rng_counter_ptr: Optional[Pointer[Scalar[DType.uint64], MutAnyOrigin]] = None,
     ) raises:
-        var st = LayoutTensor[dtype, Layout.row_major(BATCH_SIZE, STATE_SIZE)](states)
-        var ac = LayoutTensor[dtype, Layout.row_major(BATCH_SIZE, 1)](actions)
-        var rw = LayoutTensor[dtype, Layout.row_major(BATCH_SIZE)](rewards)
-        var dn = LayoutTensor[dtype, Layout.row_major(BATCH_SIZE)](dones)
-        var tm = LayoutTensor[dtype, Layout.row_major(BATCH_SIZE)](terminated)
-        var ob = LayoutTensor[dtype, Layout.row_major(BATCH_SIZE, OBS_DIM)](obs)
+        var st = tile[BATCH_SIZE, STATE_SIZE](states)
+        var ac = tile[BATCH_SIZE, 1](actions)
+        var rw = tile[BATCH_SIZE](rewards)
+        var dn = tile[BATCH_SIZE](dones)
+        var tm = tile[BATCH_SIZE](terminated)
+        var ob = tile[BATCH_SIZE, OBS_DIM](obs)
         comptime BLOCKS = (BATCH_SIZE + TPB - 1) // TPB
 
         @always_inline
         def step_wrap(
-            st: LayoutTensor[dtype, Layout.row_major(BATCH_SIZE, STATE_SIZE), MutAnyOrigin],
-            ac: LayoutTensor[dtype, Layout.row_major(BATCH_SIZE, 1), ImmutAnyOrigin],
-            rw: LayoutTensor[dtype, Layout.row_major(BATCH_SIZE), MutAnyOrigin],
-            dn: LayoutTensor[dtype, Layout.row_major(BATCH_SIZE), MutAnyOrigin],
-            tm: LayoutTensor[dtype, Layout.row_major(BATCH_SIZE), MutAnyOrigin],
-            ob: LayoutTensor[dtype, Layout.row_major(BATCH_SIZE, OBS_DIM), MutAnyOrigin],
+            st: Tile[dtype, BATCH_SIZE, STATE_SIZE],
+            ac: ImmTile[dtype, BATCH_SIZE, 1],
+            rw: Tile[dtype, BATCH_SIZE],
+            dn: Tile[dtype, BATCH_SIZE],
+            tm: Tile[dtype, BATCH_SIZE],
+            ob: Tile[dtype, BATCH_SIZE, OBS_DIM],
         ):
             var env = Int(block_dim.x * block_idx.x + thread_idx.x)
             if env >= BATCH_SIZE:
@@ -529,14 +519,14 @@ struct CarRacingDiscrete[DTYPE: DType](GPUDiscreteEnv, Copyable, Movable):
         `states` view as `MutAnyOrigin` and so fails to bind the immutable
         view built from the non-`mut` `states` buffer (mirrors the legacy env).
         """
-        var st = LayoutTensor[dtype, Layout.row_major(BATCH_SIZE, STATE_SIZE)](states)
-        var ob = LayoutTensor[dtype, Layout.row_major(BATCH_SIZE, OBS_DIM)](obs)
+        var st = tile[BATCH_SIZE, STATE_SIZE](states)
+        var ob = tile[BATCH_SIZE, OBS_DIM](obs)
         comptime BLOCKS = (BATCH_SIZE + TPB - 1) // TPB
 
         @always_inline
         def extract_wrap(
-            st: LayoutTensor[dtype, Layout.row_major(BATCH_SIZE, STATE_SIZE), ImmutAnyOrigin],
-            ob: LayoutTensor[dtype, Layout.row_major(BATCH_SIZE, OBS_DIM), MutAnyOrigin],
+            st: ImmTile[dtype, BATCH_SIZE, STATE_SIZE],
+            ob: Tile[dtype, BATCH_SIZE, OBS_DIM],
         ):
             var env = Int(block_dim.x * block_idx.x + thread_idx.x)
             if env >= BATCH_SIZE:

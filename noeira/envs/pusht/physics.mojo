@@ -13,7 +13,6 @@ A single env step is composed of N_SUBSTEPS iterations of:
 """
 
 from std.math import cos, sin, sqrt, log, exp
-from layout import LayoutTensor, Layout
 
 from noeira.physics2d.constants import (
     dtype,
@@ -50,6 +49,7 @@ from noeira.physics2d.collision.circle_polygon import (
 )
 
 from .constants import PConstants, PushTLayout
+from noeira.core.tiles import Tile
 
 
 # =============================================================================
@@ -63,11 +63,7 @@ from .constants import PConstants, PushTLayout
 def _emit_wall_contact[
     BATCH: Int, MAX_CONTACTS: Int, STATE_SIZE: Int
 ](
-    contacts: LayoutTensor[
-        dtype,
-        Layout.row_major(BATCH, MAX_CONTACTS, CONTACT_DATA_SIZE),
-        MutAnyOrigin,
-    ],
+    contacts: Tile[dtype, BATCH, MAX_CONTACTS, CONTACT_DATA_SIZE],
     env: Int,
     count_in: Int,
     body_a: Int,
@@ -98,17 +94,9 @@ def detect_wall_contacts_single_env[
     MAX_CONTACTS: Int,
     STATE_SIZE: Int,
 ](
-    state: LayoutTensor[
-        dtype, Layout.row_major(BATCH, STATE_SIZE), MutAnyOrigin
-    ],
-    shapes: LayoutTensor[
-        dtype, Layout.row_major(NUM_SHAPES, SHAPE_MAX_SIZE), MutAnyOrigin
-    ],
-    contacts: LayoutTensor[
-        dtype,
-        Layout.row_major(BATCH, MAX_CONTACTS, CONTACT_DATA_SIZE),
-        MutAnyOrigin,
-    ],
+    state: Tile[dtype, BATCH, STATE_SIZE],
+    shapes: Tile[dtype, NUM_SHAPES, SHAPE_MAX_SIZE],
+    contacts: Tile[dtype, BATCH, MAX_CONTACTS, CONTACT_DATA_SIZE],
     env: Int,
     body_a: Int,
     body_off: Int,
@@ -274,9 +262,7 @@ def detect_wall_contacts_single_env[
 def pd_update_agent_single_env[
     BATCH: Int, STATE_SIZE: Int
 ](
-    state: LayoutTensor[
-        dtype, Layout.row_major(BATCH, STATE_SIZE), MutAnyOrigin
-    ],
+    state: Tile[dtype, BATCH, STATE_SIZE],
     env: Int,
     agent_off: Int,
     target_x: Scalar[dtype],
@@ -320,17 +306,9 @@ def pusht_substep_single_env[
     VEL_ITERATIONS: Int,
     POS_ITERATIONS: Int,
 ](
-    state: LayoutTensor[
-        dtype, Layout.row_major(BATCH, STATE_SIZE), MutAnyOrigin
-    ],
-    shapes: LayoutTensor[
-        dtype, Layout.row_major(NUM_SHAPES, SHAPE_MAX_SIZE), MutAnyOrigin
-    ],
-    contacts: LayoutTensor[
-        dtype,
-        Layout.row_major(BATCH, MAX_CONTACTS, CONTACT_DATA_SIZE),
-        MutAnyOrigin,
-    ],
+    state: Tile[dtype, BATCH, STATE_SIZE],
+    shapes: Tile[dtype, NUM_SHAPES, SHAPE_MAX_SIZE],
+    contacts: Tile[dtype, BATCH, MAX_CONTACTS, CONTACT_DATA_SIZE],
     env: Int,
     target_x: Scalar[dtype],
     target_y: Scalar[dtype],

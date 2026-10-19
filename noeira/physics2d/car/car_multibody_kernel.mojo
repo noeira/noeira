@@ -13,12 +13,12 @@ Usage:
     ](ctx, state_buf, friction_limit, dt)
 """
 
-from layout import Layout, LayoutTensor
 from max.gpu import thread_idx, block_idx, block_dim
 from max.gpu.host import DeviceContext, DeviceBuffer
 
 from ..constants import dtype, TPB
 from .car_multibody import CarDynamicsMB
+from noeira.core.tiles import Tile, tile
 
 
 struct CarMBPhysicsKernel:
@@ -38,9 +38,7 @@ struct CarMBPhysicsKernel:
         VEL_ITERS: Int,
         POS_ITERS: Int,
     ](
-        state: LayoutTensor[
-            dtype, Layout.row_major(BATCH, STATE_SIZE), MutAnyOrigin
-        ],
+        state: Tile[dtype, BATCH, STATE_SIZE],
         friction_limit: Scalar[dtype],
         dt: Scalar[dtype],
     ):
@@ -87,17 +85,13 @@ struct CarMBPhysicsKernel:
             friction_limit: Surface friction limit (FRICTION_LIMIT * road/grass).
             dt: Frame time step.
         """
-        var state = LayoutTensor[
-            dtype, Layout.row_major(BATCH, STATE_SIZE)
-        ](state_buf)
+        var state = tile[BATCH, STATE_SIZE](state_buf)
 
         comptime BLOCKS = (BATCH + TPB - 1) // TPB
 
         @always_inline
         def kernel_wrapper(
-            state: LayoutTensor[
-                dtype, Layout.row_major(BATCH, STATE_SIZE), MutAnyOrigin
-            ],
+            state: Tile[dtype, BATCH, STATE_SIZE],
             friction_limit: Scalar[dtype],
             dt: Scalar[dtype],
         ):

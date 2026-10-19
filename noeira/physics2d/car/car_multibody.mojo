@@ -40,7 +40,6 @@ Reference: gymnasium/envs/box2d/car_dynamics.py + physics2d solver infra.
 """
 
 from std.math import sqrt, cos, sin
-from layout import Layout, LayoutTensor
 
 from ..constants import (
     dtype,
@@ -97,6 +96,7 @@ from .constants import (
     CTRL_GAS,
     CTRL_BRAKE,
 )
+from noeira.core.tiles import Tile
 
 
 struct CarDynamicsMB:
@@ -163,9 +163,7 @@ struct CarDynamicsMB:
         ROLLING_OFFSET: Int,
     ](
         env: Int,
-        state: LayoutTensor[
-            dtype, Layout.row_major(BATCH, STATE_SIZE), MutAnyOrigin
-        ],
+        state: Tile[dtype, BATCH, STATE_SIZE],
         x: Scalar[dtype],
         y: Scalar[dtype],
         angle: Scalar[dtype],
@@ -232,9 +230,7 @@ struct CarDynamicsMB:
     def _set_body[
         BATCH: Int, STATE_SIZE: Int
     ](
-        state: LayoutTensor[
-            dtype, Layout.row_major(BATCH, STATE_SIZE), MutAnyOrigin
-        ],
+        state: Tile[dtype, BATCH, STATE_SIZE],
         env: Int,
         o: Int,
         x: Scalar[dtype],
@@ -268,9 +264,7 @@ struct CarDynamicsMB:
         ROLLING_OFFSET: Int,
     ](
         env: Int,
-        state: LayoutTensor[
-            dtype, Layout.row_major(BATCH, STATE_SIZE), MutAnyOrigin
-        ],
+        state: Tile[dtype, BATCH, STATE_SIZE],
         w: Int,
         is_rear: Bool,
         gas: Scalar[dtype],
@@ -358,9 +352,7 @@ struct CarDynamicsMB:
         POS_ITERS: Int,
     ](
         env: Int,
-        state: LayoutTensor[
-            dtype, Layout.row_major(BATCH, STATE_SIZE), MutAnyOrigin
-        ],
+        state: Tile[dtype, BATCH, STATE_SIZE],
         f_fl: Scalar[dtype],
         f_fr: Scalar[dtype],
         f_rl: Scalar[dtype],
@@ -505,9 +497,7 @@ struct CarDynamicsMB:
         POS_ITERS: Int = CarDynamicsMB.DEFAULT_POS_ITERS,
     ](
         env: Int,
-        state: LayoutTensor[
-            dtype, Layout.row_major(BATCH, STATE_SIZE), MutAnyOrigin
-        ],
+        state: Tile[dtype, BATCH, STATE_SIZE],
         friction_limit: Scalar[dtype],
         dt: Scalar[dtype],
     ):
@@ -533,9 +523,7 @@ struct CarDynamicsMB:
         POS_ITERS: Int = CarDynamicsMB.DEFAULT_POS_ITERS,
     ](
         env: Int,
-        state: LayoutTensor[
-            dtype, Layout.row_major(BATCH, STATE_SIZE), MutAnyOrigin
-        ],
+        state: Tile[dtype, BATCH, STATE_SIZE],
         f_fl: Scalar[dtype],
         f_fr: Scalar[dtype],
         f_rl: Scalar[dtype],
@@ -559,9 +547,7 @@ struct CarDynamicsMB:
         BODIES_OFFSET: Int,
     ](
         env: Int,
-        state: LayoutTensor[
-            dtype, Layout.row_major(BATCH, STATE_SIZE), MutAnyOrigin
-        ],
+        state: Tile[dtype, BATCH, STATE_SIZE],
         w: Int,
     ) -> Tuple[Scalar[dtype], Scalar[dtype]]:
         """World position of wheel body w (0=FL,1=FR,2=RL,3=RR) — used by the

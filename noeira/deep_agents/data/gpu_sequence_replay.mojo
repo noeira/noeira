@@ -47,11 +47,11 @@ see `noeira/data/quantize.mojo`).
 from max.gpu import block_dim, block_idx, thread_idx
 from max.gpu.host import DeviceContext, DeviceBuffer
 from std.random.philox import Random as PhiloxRandom
-from layout import Layout, LayoutTensor
 
 from noeira.nn.constants import DT, TPB
 from noeira.data.quantize import _obs_quant, _obs_dequant
 from .sequence_replay_buffer import SequenceReplayBuffer
+from noeira.core.tiles import Tile, tile
 
 
 # ──────────────────────────────────────────────────────────────────────
@@ -62,14 +62,14 @@ from .sequence_replay_buffer import SequenceReplayBuffer
 def _seq_store_one_kernel[
     OBS: Int, ACT: Int, CAP: Int, SDT: DType = DT
 ](
-    stage_s: LayoutTensor[DT, Layout.row_major(OBS), MutAnyOrigin],
-    stage_a: LayoutTensor[DT, Layout.row_major(ACT), MutAnyOrigin],
-    stage_r: LayoutTensor[DT, Layout.row_major(1), MutAnyOrigin],
-    stage_d: LayoutTensor[DT, Layout.row_major(1), MutAnyOrigin],
-    buf_s: LayoutTensor[SDT, Layout.row_major(CAP, OBS), MutAnyOrigin],
-    buf_a: LayoutTensor[DT, Layout.row_major(CAP, ACT), MutAnyOrigin],
-    buf_r: LayoutTensor[DT, Layout.row_major(CAP), MutAnyOrigin],
-    buf_d: LayoutTensor[DT, Layout.row_major(CAP), MutAnyOrigin],
+    stage_s: Tile[DT, OBS],
+    stage_a: Tile[DT, ACT],
+    stage_r: Tile[DT, 1],
+    stage_d: Tile[DT, 1],
+    buf_s: Tile[SDT, CAP, OBS],
+    buf_a: Tile[DT, CAP, ACT],
+    buf_r: Tile[DT, CAP],
+    buf_d: Tile[DT, CAP],
     slot: Int32,
 ):
     """Element-parallel store: thread d writes stage[d] → buf[slot, d] for obs
@@ -94,14 +94,14 @@ def _seq_store_batch_kernel[
     CAP: Int,
     SDT: DType = DT,
 ](
-    src_obs: LayoutTensor[DT, Layout.row_major(N_ENVS, OBS), MutAnyOrigin],
-    src_act: LayoutTensor[DT, Layout.row_major(N_ENVS, ACT), MutAnyOrigin],
-    src_rew: LayoutTensor[DT, Layout.row_major(N_ENVS), MutAnyOrigin],
-    src_dne: LayoutTensor[DT, Layout.row_major(N_ENVS), MutAnyOrigin],
-    buf_s: LayoutTensor[SDT, Layout.row_major(CAP, OBS), MutAnyOrigin],
-    buf_a: LayoutTensor[DT, Layout.row_major(CAP, ACT), MutAnyOrigin],
-    buf_r: LayoutTensor[DT, Layout.row_major(CAP), MutAnyOrigin],
-    buf_d: LayoutTensor[DT, Layout.row_major(CAP), MutAnyOrigin],
+    src_obs: Tile[DT, N_ENVS, OBS],
+    src_act: Tile[DT, N_ENVS, ACT],
+    src_rew: Tile[DT, N_ENVS],
+    src_dne: Tile[DT, N_ENVS],
+    buf_s: Tile[SDT, CAP, OBS],
+    buf_a: Tile[DT, CAP, ACT],
+    buf_r: Tile[DT, CAP],
+    buf_d: Tile[DT, CAP],
     start_pos: Int32,
 ):
     """Element-parallel batched store: one thread per (env × obs element).
@@ -131,7 +131,7 @@ def _seq_store_batch_kernel[
 
 def _increment_rng_offset_kernel[
     B: Int
-](offset: LayoutTensor[DType.uint64, Layout.row_major(1), MutAnyOrigin],):
+](offset: Tile[DType.uint64, 1],):
     """Bump the device RNG offset by `2 * B` (the host stride). Launch
     grid=(1,), block=(1,); enqueued after the sample kernel so the
     offset sequence is bit-identical to the old host `_rng_offset += 2·B`
@@ -143,10 +143,10 @@ def _increment_rng_offset_kernel[
 def _seq_draw_starts_kernel[
     B: Int
 ](
-    starts: LayoutTensor[DType.int32, Layout.row_major(B), MutAnyOrigin],
+    starts: Tile[DType.int32, B],
     n_valid: Int32,
     seed: UInt64,
-    offset_buf: LayoutTensor[DType.uint64, Layout.row_major(1), MutAnyOrigin],
+    offset_buf: Tile[DType.uint64, 1],
 ):
     """Pre-kernel: thread `b` draws window start `s ∈ [0, n_valid)` via
     Philox into `starts[b]`. The same draw math (seed + b, offset) the old
@@ -173,7 +173,7 @@ def _seq_draw_starts_kernel[
 def _seq_set_start_kernel[
     B: Int
 ](
-    starts: LayoutTensor[DType.int32, Layout.row_major(B), MutAnyOrigin],
+    starts: Tile[DType.int32, B],
     row: Int32,
     value: Int32,
 ):
@@ -193,15 +193,15 @@ def _seq_sample_kernel[
     CAP: Int,
     SDT: DType = DT,
 ](
-    buf_s: LayoutTensor[SDT, Layout.row_major(CAP, OBS), MutAnyOrigin],
-    buf_a: LayoutTensor[DT, Layout.row_major(CAP, ACT), MutAnyOrigin],
-    buf_r: LayoutTensor[DT, Layout.row_major(CAP), MutAnyOrigin],
-    buf_d: LayoutTensor[DT, Layout.row_major(CAP), MutAnyOrigin],
-    out_obs: LayoutTensor[DT, Layout.row_major(B, T + 1, OBS), MutAnyOrigin],
-    out_act: LayoutTensor[DT, Layout.row_major(B, T, ACT), MutAnyOrigin],
-    out_rew: LayoutTensor[DT, Layout.row_major(B, T), MutAnyOrigin],
-    out_dne: LayoutTensor[DT, Layout.row_major(B, T), MutAnyOrigin],
-    starts: LayoutTensor[DType.int32, Layout.row_major(B), MutAnyOrigin],
+    buf_s: Tile[SDT, CAP, OBS],
+    buf_a: Tile[DT, CAP, ACT],
+    buf_r: Tile[DT, CAP],
+    buf_d: Tile[DT, CAP],
+    out_obs: Tile[DT, B, T + 1, OBS],
+    out_act: Tile[DT, B, T, ACT],
+    out_rew: Tile[DT, B, T],
+    out_dne: Tile[DT, B, T],
+    starts: Tile[DType.int32, B],
     origin: Int32,
 ):
     """Element-parallel window gather: one thread per
@@ -239,8 +239,8 @@ def _seq_sample_kernel[
 
 
 def _seq_store_fst_kernel[CAP: Int](
-    stage_fst: LayoutTensor[DT, Layout.row_major(1), MutAnyOrigin],
-    buf_fst: LayoutTensor[DT, Layout.row_major(CAP), MutAnyOrigin],
+    stage_fst: Tile[DT, 1],
+    buf_fst: Tile[DT, CAP],
     pos: Int32,
 ):
     """Store the staged `is_first` flag into the ring at `pos` (1 thread)."""
@@ -250,9 +250,9 @@ def _seq_store_fst_kernel[CAP: Int](
 
 
 def _seq_gather_fst_kernel[B: Int, T: Int, CAP: Int](
-    buf_fst: LayoutTensor[DT, Layout.row_major(CAP), MutAnyOrigin],
-    fst_out: LayoutTensor[DT, Layout.row_major(B, T + 1), MutAnyOrigin],
-    starts: LayoutTensor[DType.int32, Layout.row_major(B), MutAnyOrigin],
+    buf_fst: Tile[DT, CAP],
+    fst_out: Tile[DT, B, T + 1],
+    starts: Tile[DType.int32, B],
     origin: Int32,
 ):
     """Per-(window × obs-frame) gather of the `is_first` flag — same window
@@ -475,22 +475,14 @@ struct GPUSequenceReplay[
         self.ctx.enqueue_copy(self.stage_dne, self._h_dne.unsafe_ptr())
         self.ctx.enqueue_copy(self.stage_fst, self._h_fst.unsafe_ptr())
 
-        var stage_s_lt = LayoutTensor[DT, Layout.row_major(Self.OBS)](
-            self.stage_obs
-        )
-        var stage_a_lt = LayoutTensor[DT, Layout.row_major(Self.ACT)](
-            self.stage_act
-        )
-        var stage_r_lt = LayoutTensor[DT, Layout.row_major(1)](self.stage_rew)
-        var stage_d_lt = LayoutTensor[DT, Layout.row_major(1)](self.stage_dne)
-        var buf_s_lt = LayoutTensor[
-            Self.SDT, Layout.row_major(Self.CAP, Self.OBS)
-        ](self.obs)
-        var buf_a_lt = LayoutTensor[DT, Layout.row_major(Self.CAP, Self.ACT)](
-            self.act
-        )
-        var buf_r_lt = LayoutTensor[DT, Layout.row_major(Self.CAP)](self.rew)
-        var buf_d_lt = LayoutTensor[DT, Layout.row_major(Self.CAP)](self.dne)
+        var stage_s_lt = tile[Self.OBS](self.stage_obs)
+        var stage_a_lt = tile[Self.ACT](self.stage_act)
+        var stage_r_lt = tile[1](self.stage_rew)
+        var stage_d_lt = tile[1](self.stage_dne)
+        var buf_s_lt = tile[Self.CAP, Self.OBS](self.obs)
+        var buf_a_lt = tile[Self.CAP, Self.ACT](self.act)
+        var buf_r_lt = tile[Self.CAP](self.rew)
+        var buf_d_lt = tile[Self.CAP](self.dne)
 
         # grid-strided: max(OBS,ACT) may exceed the 1024-thread block cap (pixels)
         comptime MAXD_R = Self.OBS if Self.OBS > Self.ACT else Self.ACT
@@ -513,8 +505,8 @@ struct GPUSequenceReplay[
         )
         # store the `is_first` flag into the ring at `pos`.
         self.ctx.enqueue_function[_seq_store_fst_kernel[Self.CAP]](
-            LayoutTensor[DT, Layout.row_major(1)](self.stage_fst),
-            LayoutTensor[DT, Layout.row_major(Self.CAP)](self.fst),
+            tile[1](self.stage_fst),
+            tile[Self.CAP](self.fst),
             Int32(self.pos),
             grid_dim=1,
             block_dim=1,
@@ -551,21 +543,21 @@ struct GPUSequenceReplay[
         self.ctx.enqueue_function[
             _seq_store_one_kernel[Self.OBS, Self.ACT, Self.CAP, Self.SDT]
         ](
-            LayoutTensor[DT, Layout.row_major(Self.OBS)](self.stage_obs),
-            LayoutTensor[DT, Layout.row_major(Self.ACT)](self.stage_act),
-            LayoutTensor[DT, Layout.row_major(1)](self.stage_rew),
-            LayoutTensor[DT, Layout.row_major(1)](self.stage_dne),
-            LayoutTensor[Self.SDT, Layout.row_major(Self.CAP, Self.OBS)](self.obs),
-            LayoutTensor[DT, Layout.row_major(Self.CAP, Self.ACT)](self.act),
-            LayoutTensor[DT, Layout.row_major(Self.CAP)](self.rew),
-            LayoutTensor[DT, Layout.row_major(Self.CAP)](self.dne),
+            tile[Self.OBS](self.stage_obs),
+            tile[Self.ACT](self.stage_act),
+            tile[1](self.stage_rew),
+            tile[1](self.stage_dne),
+            tile[Self.CAP, Self.OBS](self.obs),
+            tile[Self.CAP, Self.ACT](self.act),
+            tile[Self.CAP](self.rew),
+            tile[Self.CAP](self.dne),
             Int32(self.pos),
             grid_dim=n_blocks_t,
             block_dim=TPB,
         )
         self.ctx.enqueue_function[_seq_store_fst_kernel[Self.CAP]](
-            LayoutTensor[DT, Layout.row_major(1)](self.stage_fst),
-            LayoutTensor[DT, Layout.row_major(Self.CAP)](self.fst),
+            tile[1](self.stage_fst),
+            tile[Self.CAP](self.fst),
             Int32(self.pos),
             grid_dim=1,
             block_dim=1,
@@ -589,25 +581,21 @@ struct GPUSequenceReplay[
         (lockstep multi-env collection); slots `(pos + e) % CAP`."""
         comptime assert N_ENVS > 0, "N_ENVS must be > 0"
         var src_obs_lt = rebind[
-            LayoutTensor[DT, Layout.row_major(N_ENVS, Self.OBS), MutAnyOrigin]
-        ](LayoutTensor[DT, Layout.row_major(N_ENVS, Self.OBS)](src_obs))
+            Tile[DT, N_ENVS, Self.OBS]
+        ](tile[N_ENVS, Self.OBS](src_obs))
         var src_act_lt = rebind[
-            LayoutTensor[DT, Layout.row_major(N_ENVS, Self.ACT), MutAnyOrigin]
-        ](LayoutTensor[DT, Layout.row_major(N_ENVS, Self.ACT)](src_act))
+            Tile[DT, N_ENVS, Self.ACT]
+        ](tile[N_ENVS, Self.ACT](src_act))
         var src_rew_lt = rebind[
-            LayoutTensor[DT, Layout.row_major(N_ENVS), MutAnyOrigin]
-        ](LayoutTensor[DT, Layout.row_major(N_ENVS)](src_rew))
+            Tile[DT, N_ENVS]
+        ](tile[N_ENVS](src_rew))
         var src_dne_lt = rebind[
-            LayoutTensor[DT, Layout.row_major(N_ENVS), MutAnyOrigin]
-        ](LayoutTensor[DT, Layout.row_major(N_ENVS)](src_dne))
-        var buf_s_lt = LayoutTensor[
-            Self.SDT, Layout.row_major(Self.CAP, Self.OBS)
-        ](self.obs)
-        var buf_a_lt = LayoutTensor[DT, Layout.row_major(Self.CAP, Self.ACT)](
-            self.act
-        )
-        var buf_r_lt = LayoutTensor[DT, Layout.row_major(Self.CAP)](self.rew)
-        var buf_d_lt = LayoutTensor[DT, Layout.row_major(Self.CAP)](self.dne)
+            Tile[DT, N_ENVS]
+        ](tile[N_ENVS](src_dne))
+        var buf_s_lt = tile[Self.CAP, Self.OBS](self.obs)
+        var buf_a_lt = tile[Self.CAP, Self.ACT](self.act)
+        var buf_r_lt = tile[Self.CAP](self.rew)
+        var buf_d_lt = tile[Self.CAP](self.dne)
 
         # Element-parallel: one thread per (env × OBS element).
         comptime n_blocks = (N_ENVS * Self.OBS + TPB - 1) // TPB
@@ -668,37 +656,29 @@ struct GPUSequenceReplay[
                 break
             online_rows.append(on)
 
-        var buf_s_lt = LayoutTensor[
-            Self.SDT, Layout.row_major(Self.CAP, Self.OBS)
-        ](self.obs)
-        var buf_a_lt = LayoutTensor[DT, Layout.row_major(Self.CAP, Self.ACT)](
-            self.act
-        )
-        var buf_r_lt = LayoutTensor[DT, Layout.row_major(Self.CAP)](self.rew)
-        var buf_d_lt = LayoutTensor[DT, Layout.row_major(Self.CAP)](self.dne)
+        var buf_s_lt = tile[Self.CAP, Self.OBS](self.obs)
+        var buf_a_lt = tile[Self.CAP, Self.ACT](self.act)
+        var buf_r_lt = tile[Self.CAP](self.rew)
+        var buf_d_lt = tile[Self.CAP](self.dne)
         var out_obs_lt = rebind[
-            LayoutTensor[DT, Layout.row_major(B, T + 1, Self.OBS), MutAnyOrigin]
-        ](LayoutTensor[DT, Layout.row_major(B, T + 1, Self.OBS)](obs_dev))
+            Tile[DT, B, T + 1, Self.OBS]
+        ](tile[B, T + 1, Self.OBS](obs_dev))
         var out_act_lt = rebind[
-            LayoutTensor[DT, Layout.row_major(B, T, Self.ACT), MutAnyOrigin]
-        ](LayoutTensor[DT, Layout.row_major(B, T, Self.ACT)](act_dev))
+            Tile[DT, B, T, Self.ACT]
+        ](tile[B, T, Self.ACT](act_dev))
         var out_rew_lt = rebind[
-            LayoutTensor[DT, Layout.row_major(B, T), MutAnyOrigin]
-        ](LayoutTensor[DT, Layout.row_major(B, T)](rew_dev))
+            Tile[DT, B, T]
+        ](tile[B, T](rew_dev))
         var out_dne_lt = rebind[
-            LayoutTensor[DT, Layout.row_major(B, T), MutAnyOrigin]
-        ](LayoutTensor[DT, Layout.row_major(B, T)](dne_dev))
+            Tile[DT, B, T]
+        ](tile[B, T](dne_dev))
 
-        var off_lt = LayoutTensor[DType.uint64, Layout.row_major(1)](
-            self._rng_offset_dev
-        )
+        var off_lt = tile[1](self._rng_offset_dev)
 
         # 1) Draw one start per window (same Philox math the old fused
         #    kernel used per-thread, so the window distribution is
         #    unchanged) into the pre-sized `starts` scratch.
-        var starts_lt = LayoutTensor[DType.int32, Layout.row_major(B)](
-            self.starts
-        )
+        var starts_lt = tile[B](self.starts)
         comptime n_blocks_draw = (B + TPB - 1) // TPB
         comptime draw_kernel = _seq_draw_starts_kernel[B]
         ctx.enqueue_function[draw_kernel](
@@ -769,13 +749,11 @@ struct GPUSequenceReplay[
         with the obs frames. Device twin of `SequenceReplay.sample_batch_fst`."""
         self.sample_batch_dev[B, T](ctx, obs_dev, act_dev, rew_dev, dne_dev)
         var origin = 0 if self.size < Self.CAP else self.pos
-        var starts_lt = LayoutTensor[DType.int32, Layout.row_major(B)](
-            self.starts
-        )
-        var buf_fst_lt = LayoutTensor[DT, Layout.row_major(Self.CAP)](self.fst)
+        var starts_lt = tile[B](self.starts)
+        var buf_fst_lt = tile[Self.CAP](self.fst)
         var out_fst_lt = rebind[
-            LayoutTensor[DT, Layout.row_major(B, T + 1), MutAnyOrigin]
-        ](LayoutTensor[DT, Layout.row_major(B, T + 1)](fst_dev))
+            Tile[DT, B, T + 1]
+        ](tile[B, T + 1](fst_dev))
         comptime n_blocks_f = (B * (T + 1) + TPB - 1) // TPB
         ctx.enqueue_function[_seq_gather_fst_kernel[B, T, Self.CAP]](
             buf_fst_lt,

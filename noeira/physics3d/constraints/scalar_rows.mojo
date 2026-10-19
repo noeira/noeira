@@ -68,7 +68,7 @@ tail-end of this one.
 """
 
 from std.math import pow
-from layout import Layout, LayoutTensor
+from layout import TileTensor, TensorLayout
 
 from ..joint_types import JNT_HINGE, JNT_SLIDE, JNT_FREE, JNT_BALL
 from ..gpu.constants import (
@@ -237,25 +237,21 @@ def build_scalar_rows[
     DTYPE: DType,
     S_CAP: Int,
     D: DimsLike,
-    L_QPOS: Layout,
-    L_QVEL: Layout,
-    L_JOINTS: Layout,
-    L_MMETA: Layout,
-    L_DOF_INVWEIGHT0: Layout,
-    L_M_INV: Layout,
+    L_QPOS: TensorLayout,
+    L_QVEL: TensorLayout,
+    L_JOINTS: TensorLayout,
+    L_MMETA: TensorLayout,
+    L_DOF_INVWEIGHT0: TensorLayout,
+    L_M_INV: TensorLayout,
 ](
     env: Int,
     dims: D,
-    qpos: LayoutTensor[DTYPE, L_QPOS, MutAnyOrigin],
-    qvel: LayoutTensor[DTYPE, L_QVEL, MutAnyOrigin],
-    joints: LayoutTensor[
-        DTYPE, L_JOINTS, MutAnyOrigin
-    ],
-    mmeta: LayoutTensor[
-        DTYPE, L_MMETA, MutAnyOrigin
-    ],
-    dof_invweight0: LayoutTensor[DTYPE, L_DOF_INVWEIGHT0, MutAnyOrigin],
-    m_inv: LayoutTensor[DTYPE, L_M_INV, MutAnyOrigin],
+    qpos: TileTensor[DTYPE, L_QPOS, MutAnyOrigin],
+    qvel: TileTensor[DTYPE, L_QVEL, MutAnyOrigin],
+    joints: TileTensor[DTYPE, L_JOINTS, MutAnyOrigin],
+    mmeta: TileTensor[DTYPE, L_MMETA, MutAnyOrigin],
+    dof_invweight0: TileTensor[DTYPE, L_DOF_INVWEIGHT0, MutAnyOrigin],
+    m_inv: TileTensor[DTYPE, L_M_INV, MutAnyOrigin],
     mut sr_dof: Scratch[Int, S_CAP],
     mut sr_kind: Scratch[Int, S_CAP],
     mut sr_sign: Scratch[Scalar[DTYPE], S_CAP],

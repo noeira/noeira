@@ -33,7 +33,8 @@ is GPU-only.
 from max.gpu import global_idx, thread_idx, block_idx
 from max.gpu.primitives import block
 from max.gpu.host import DeviceContext
-from layout import Layout, LayoutTensor, TileTensor, row_major
+from layout import TileTensor, row_major
+from noeira.core.tiles import RowMajor, Tile
 
 from noeira.nn.constants import DT, TPB
 from ..core.tensor import Tensor, TensorImpl
@@ -55,9 +56,9 @@ comptime BF16 = DType.bfloat16
 def _bias_add_fwd_kernel[
     BATCH: Int, DIM: Int, ADT: DType = DT
 ](
-    input: LayoutTensor[ADT, Layout.row_major(BATCH, DIM), MutAnyOrigin],
-    bias: LayoutTensor[ADT, Layout.row_major(DIM), MutAnyOrigin],
-    output: LayoutTensor[ADT, Layout.row_major(BATCH, DIM), MutAnyOrigin],
+    input: Tile[ADT, BATCH, DIM],
+    bias: Tile[ADT, DIM],
+    output: Tile[ADT, BATCH, DIM],
 ):
     var gid = Int(global_idx.x)
     comptime total = BATCH * DIM
@@ -75,8 +76,8 @@ def _bias_add_fwd_kernel[
 def _bias_add_copy_kernel[
     N: Int, ADT: DType = DT
 ](
-    src: LayoutTensor[ADT, Layout.row_major(N), MutAnyOrigin],
-    dst: LayoutTensor[ADT, Layout.row_major(N), MutAnyOrigin],
+    src: Tile[ADT, N],
+    dst: Tile[ADT, N],
 ):
     var gid = Int(global_idx.x)
     if gid < N:
@@ -90,8 +91,8 @@ def _bias_add_copy_kernel[
 def _bias_add_dbias_kernel[
     BATCH: Int, DIM: Int, ADT: DType = DT
 ](
-    grad_output: LayoutTensor[ADT, Layout.row_major(BATCH, DIM), MutAnyOrigin],
-    grad_bias: LayoutTensor[DT, Layout.row_major(DIM), MutAnyOrigin],
+    grad_output: Tile[ADT, BATCH, DIM],
+    grad_bias: Tile[DT, DIM],
 ):
     # One block per DIM column; threads reduce over the batch.
     var col = Int(block_idx.x)
@@ -111,8 +112,8 @@ def _bias_add_dbias_kernel[
 def _cast_f2b_kernel[
     N: Int
 ](
-    src: LayoutTensor[DT, Layout.row_major(N), MutAnyOrigin],
-    dst: LayoutTensor[BF16, Layout.row_major(N), MutAnyOrigin],
+    src: Tile[DT, N],
+    dst: Tile[BF16, N],
 ):
     var i = Int(global_idx.x)
     if i < N:
@@ -174,14 +175,14 @@ struct BiasAdd[DIM_: Int, ADT: DType = DT](Module):
             else:
                 var c = ctx.value()
                 outd.ensure_gpu(c, B * Self.DIM_)
-                comptime l2d = Layout.row_major(B, Self.DIM_)
-                comptime ld = Layout.row_major(Self.DIM_)
+                comptime l2d = RowMajor[B, Self.DIM_]
+                comptime ld = RowMajor[Self.DIM_]
                 comptime total = B * Self.DIM_
                 comptime n_blocks = (total + TPB - 1) // TPB
                 c.enqueue_function[_bias_add_fwd_kernel[B, Self.DIM_]](
-                    in0d.lt["gpu", l2d](),
-                    self.bias.val.lt["gpu", ld](),
-                    outd.lt["gpu", l2d](),
+                    in0d.tt["gpu", B, Self.DIM_](),
+                    self.bias.val.tt["gpu", Self.DIM_](),
+                    outd.tt["gpu", B, Self.DIM_](),
                     grid_dim=n_blocks,
                     block_dim=TPB,
                 )
@@ -192,22 +193,22 @@ struct BiasAdd[DIM_: Int, ADT: DType = DT](Module):
             ), "bf16-flow BiasAdd is GPU-only"
             var c = ctx.value()
             out.ensure_gpu(c, B * Self.DIM_)
-            comptime l2d = Layout.row_major(B, Self.DIM_)
-            comptime ld = Layout.row_major(Self.DIM_)
+            comptime l2d = RowMajor[B, Self.DIM_]
+            comptime ld = RowMajor[Self.DIM_]
             comptime total = B * Self.DIM_
             comptime n_blocks = (total + TPB - 1) // TPB
             # bias: cheap per-forward DT→bf16 cast (input ALREADY bf16).
             self.b_a.ensure_gpu(c, Self.DIM_)
             c.enqueue_function[_cast_f2b_kernel[Self.DIM_]](
-                self.bias.val.lt["gpu", ld](),
-                self.b_a.lt["gpu", ld](),
+                self.bias.val.tt["gpu", Self.DIM_](),
+                self.b_a.tt["gpu", Self.DIM_](),
                 grid_dim=(Self.DIM_ + 255) // 256,
                 block_dim=256,
             )
             c.enqueue_function[_bias_add_fwd_kernel[B, Self.DIM_, Self.ADT]](
-                in0.lt["gpu", l2d](),
-                self.b_a.lt["gpu", ld](),
-                out.lt["gpu", l2d](),
+                in0.tt["gpu", B, Self.DIM_](),
+                self.b_a.tt["gpu", Self.DIM_](),
+                out.tt["gpu", B, Self.DIM_](),
                 grid_dim=n_blocks,
                 block_dim=TPB,
             )
@@ -247,23 +248,23 @@ struct BiasAdd[DIM_: Int, ADT: DType = DT](Module):
                         gb_v[i] += go_v[b, i]
             else:
                 var c = ctx.value()
-                comptime l2d = Layout.row_major(B, Self.DIM_)
-                comptime ld = Layout.row_major(Self.DIM_)
+                comptime l2d = RowMajor[B, Self.DIM_]
+                comptime ld = RowMajor[Self.DIM_]
                 comptime total = B * Self.DIM_
-                comptime lflat = Layout.row_major(total)
+                comptime lflat = RowMajor[total]
                 gind.ensure_gpu(c, B * Self.DIM_)
                 # grad_in = grad_out: device→device copy via flat kernel.
                 comptime n_blocks = (total + TPB - 1) // TPB
                 c.enqueue_function[_bias_add_copy_kernel[total]](
-                    god.lt["gpu", lflat](),
-                    gind.lt["gpu", lflat](),
+                    god.tt["gpu", total](),
+                    gind.tt["gpu", total](),
                     grid_dim=n_blocks,
                     block_dim=TPB,
                 )
                 # grad_bias[i] += sum_b grad_out[b, i] (one block per column).
                 c.enqueue_function[_bias_add_dbias_kernel[B, Self.DIM_]](
-                    god.lt["gpu", l2d](),
-                    self.bias.grd.lt["gpu", ld](),
+                    god.tt["gpu", B, Self.DIM_](),
+                    self.bias.grd.tt["gpu", Self.DIM_](),
                     grid_dim=Self.DIM_,
                     block_dim=BA_TPB,
                 )
@@ -273,24 +274,24 @@ struct BiasAdd[DIM_: Int, ADT: DType = DT](Module):
                 target == "gpu"
             ), "bf16-flow BiasAdd is GPU-only"
             var c = ctx.value()
-            comptime l2d = Layout.row_major(B, Self.DIM_)
-            comptime ld = Layout.row_major(Self.DIM_)
+            comptime l2d = RowMajor[B, Self.DIM_]
+            comptime ld = RowMajor[Self.DIM_]
             comptime total = B * Self.DIM_
-            comptime lflat = Layout.row_major(total)
+            comptime lflat = RowMajor[total]
             gin.ensure_gpu(c, B * Self.DIM_)
             # grad_in = grad_out: bf16 identity copy (grad flows at bf16).
             comptime n_blocks = (total + TPB - 1) // TPB
             c.enqueue_function[_bias_add_copy_kernel[total, Self.ADT]](
-                grad_output.lt["gpu", lflat](),
-                gin.lt["gpu", lflat](),
+                grad_output.tt["gpu", total](),
+                gin.tt["gpu", total](),
                 grid_dim=n_blocks,
                 block_dim=TPB,
             )
             # grad_bias[i] += sum_b grad_out[b, i]: bf16 grad → fp32 master grad
             # (each element cast to DT, fp32 accumulator).
             c.enqueue_function[_bias_add_dbias_kernel[B, Self.DIM_, Self.ADT]](
-                grad_output.lt["gpu", l2d](),
-                self.bias.grd.lt["gpu", ld](),
+                grad_output.tt["gpu", B, Self.DIM_](),
+                self.bias.grd.tt["gpu", Self.DIM_](),
                 grid_dim=Self.DIM_,
                 block_dim=BA_TPB,
             )

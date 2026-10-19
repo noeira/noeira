@@ -14,7 +14,8 @@ and the finalize); contacts/equality/tendons follow at P4."""
 from std.math import abs, pow
 from max.gpu import thread_idx, block_idx, block_dim
 from max.gpu.host import DeviceContext
-from layout import Layout, LayoutTensor
+from layout import TileTensor, TensorLayout
+from noeira.core.tiles import RowMajor, Tile
 
 from ..joint_types import JNT_HINGE, JNT_SLIDE
 from ..fields import (
@@ -69,26 +70,22 @@ def _limits_env[
     DTYPE: DType,
     NUM_ITERATIONS: Int,
     D: DimsLike,
-    L_QPOS: Layout,
-    L_QVEL: Layout,
-    L_JOINTS: Layout,
-    L_META: Layout,
-    L_DOF_INVWEIGHT0: Layout,
-    L_M_INV: Layout,
+    L_QPOS: TensorLayout,
+    L_QVEL: TensorLayout,
+    L_JOINTS: TensorLayout,
+    L_META: TensorLayout,
+    L_DOF_INVWEIGHT0: TensorLayout,
+    L_M_INV: TensorLayout,
 ](
     env: Int,
     dims: D,
-    qpos: LayoutTensor[DTYPE, L_QPOS, MutAnyOrigin],
-    qvel: LayoutTensor[DTYPE, L_QVEL, MutAnyOrigin],
-    joints: LayoutTensor[
-        DTYPE, L_JOINTS, MutAnyOrigin
-    ],
-    meta: LayoutTensor[DTYPE, L_META, MutAnyOrigin],
-    dof_invweight0: LayoutTensor[DTYPE, L_DOF_INVWEIGHT0, MutAnyOrigin],
-    m_inv: LayoutTensor[DTYPE, L_M_INV, MutAnyOrigin],
-    qacc_constrained: LayoutTensor[
-        DTYPE, L_QVEL, MutAnyOrigin
-    ],
+    qpos: TileTensor[DTYPE, L_QPOS, MutAnyOrigin],
+    qvel: TileTensor[DTYPE, L_QVEL, MutAnyOrigin],
+    joints: TileTensor[DTYPE, L_JOINTS, MutAnyOrigin],
+    meta: TileTensor[DTYPE, L_META, MutAnyOrigin],
+    dof_invweight0: TileTensor[DTYPE, L_DOF_INVWEIGHT0, MutAnyOrigin],
+    m_inv: TileTensor[DTYPE, L_M_INV, MutAnyOrigin],
+    qacc_constrained: TileTensor[DTYPE, L_QVEL, MutAnyOrigin],
 ):
     """Detect + PGS-solve active joint limits for one env (verbatim from
     detect_and_solve_limits_gpu)."""
@@ -304,17 +301,13 @@ def _limits_fields_kernel[
     BATCH: Int,
     NUM_ITERATIONS: Int,
 ](
-    qpos: LayoutTensor[DTYPE, Layout.row_major(BATCH, NQ), MutAnyOrigin],
-    qvel: LayoutTensor[DTYPE, Layout.row_major(BATCH, NV), MutAnyOrigin],
-    joints: LayoutTensor[
-        DTYPE, Layout.row_major(NJOINT, MODEL_JOINT_SIZE), MutAnyOrigin
-    ],
-    meta: LayoutTensor[DTYPE, Layout.row_major(MODEL_META_SIZE), MutAnyOrigin],
-    dof_invweight0: LayoutTensor[DTYPE, Layout.row_major(NV), MutAnyOrigin],
-    m_inv: LayoutTensor[DTYPE, Layout.row_major(BATCH, NV * NV), MutAnyOrigin],
-    qacc_constrained: LayoutTensor[
-        DTYPE, Layout.row_major(BATCH, NV), MutAnyOrigin
-    ],
+    qpos: Tile[DTYPE, BATCH, NQ],
+    qvel: Tile[DTYPE, BATCH, NV],
+    joints: Tile[DTYPE, NJOINT, MODEL_JOINT_SIZE],
+    meta: Tile[DTYPE, MODEL_META_SIZE],
+    dof_invweight0: Tile[DTYPE, NV],
+    m_inv: Tile[DTYPE, BATCH, NV * NV],
+    qacc_constrained: Tile[DTYPE, BATCH, NV],
 ):
     var env = Int(block_dim.x * block_idx.x + thread_idx.x)
     if env >= BATCH:
@@ -341,12 +334,12 @@ def solve_limits[
     """Detect + solve joint limits into `scratch.qacc_constrained`, both
     targets, one body. NUM_ITERATIONS=50 matches the Newton solver's
     SOLVER_ITER_GPU."""
-    comptime L_QPOS = Layout.row_major(BATCH, D.NQ)
-    comptime L_NV = Layout.row_major(BATCH, D.NV)
-    comptime L_JOINT = Layout.row_major(D.NJOINT, MODEL_JOINT_SIZE)
-    comptime L_META = Layout.row_major(MODEL_META_SIZE)
-    comptime L_DW = Layout.row_major(D.NV)
-    comptime L_M = Layout.row_major(BATCH, D.NV * D.NV)
+    comptime L_QPOS = RowMajor[BATCH, D.NQ]
+    comptime L_NV = RowMajor[BATCH, D.NV]
+    comptime L_JOINT = RowMajor[D.NJOINT, MODEL_JOINT_SIZE]
+    comptime L_META = RowMajor[MODEL_META_SIZE]
+    comptime L_DW = RowMajor[D.NV]
+    comptime L_M = RowMajor[BATCH, D.NV * D.NV]
 
     comptime if target == "cpu":
         var dm = d.dims
@@ -356,13 +349,13 @@ def solve_limits[
         var rl_META = rl1(MODEL_META_SIZE)
         var rl_DW = rl1(dm.get_nv())
         var rl_M = rl2(BATCH, dm.get_nv() * dm.get_nv())
-        var qpos_v = d.qpos.lt_dyn["cpu", DYN2](rl_QPOS)
-        var qvel_v = d.qvel.lt_dyn["cpu", DYN2](rl_NV)
-        var joints_v = m.joints.lt_dyn["cpu", DYN2](rl_JOINT)
-        var meta_v = m.meta.lt_dyn["cpu", DYN1](rl_META)
-        var dw_v = m.dof_invweight0.lt_dyn["cpu", DYN1](rl_DW)
-        var mi_v = scratch.m_inv.lt_dyn["cpu", DYN2](rl_M)
-        var qc_v = scratch.qacc_constrained.lt_dyn["cpu", DYN2](rl_NV)
+        var qpos_v = d.qpos.tt_dyn["cpu", DYN2](rl_QPOS)
+        var qvel_v = d.qvel.tt_dyn["cpu", DYN2](rl_NV)
+        var joints_v = m.joints.tt_dyn["cpu", DYN2](rl_JOINT)
+        var meta_v = m.meta.tt_dyn["cpu", DYN1](rl_META)
+        var dw_v = m.dof_invweight0.tt_dyn["cpu", DYN1](rl_DW)
+        var mi_v = scratch.m_inv.tt_dyn["cpu", DYN2](rl_M)
+        var qc_v = scratch.qacc_constrained.tt_dyn["cpu", DYN2](rl_NV)
         for e in range(BATCH):
             _limits_env[DTYPE, NUM_ITERATIONS](
                 e, dm, qpos_v, qvel_v, joints_v, meta_v, dw_v, mi_v, qc_v
@@ -375,13 +368,13 @@ def solve_limits[
                 DTYPE, D.NQ, D.NV, D.NJOINT, BATCH, NUM_ITERATIONS
             ]
         ](
-            d.qpos.lt["gpu", L_QPOS](),
-            d.qvel.lt["gpu", L_NV](),
-            m.joints.lt["gpu", L_JOINT](),
-            m.meta.lt["gpu", L_META](),
-            m.dof_invweight0.lt["gpu", L_DW](),
-            scratch.m_inv.lt["gpu", L_M](),
-            scratch.qacc_constrained.lt["gpu", L_NV](),
+            d.qpos.tt["gpu", BATCH, D.NQ](),
+            d.qvel.tt["gpu", BATCH, D.NV](),
+            m.joints.tt["gpu", D.NJOINT, MODEL_JOINT_SIZE](),
+            m.meta.tt["gpu", MODEL_META_SIZE](),
+            m.dof_invweight0.tt["gpu", D.NV](),
+            scratch.m_inv.tt["gpu", BATCH, D.NV * D.NV](),
+            scratch.qacc_constrained.tt["gpu", BATCH, D.NV](),
             grid_dim=(BLOCKS,),
             block_dim=(LIM_TPB,),
         )

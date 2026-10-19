@@ -25,7 +25,6 @@ from std.math import sqrt
 from max.gpu import global_idx, thread_idx, block_idx
 from max.gpu.primitives import block
 from max.gpu.host import DeviceContext
-from layout import Layout, LayoutTensor
 
 from noeira.nn.constants import DT, TPB
 from ..core.tensor import Tensor

@@ -56,7 +56,7 @@ its diagonal here, from the joint record `refs` names.
 
 from std.math import sqrt, sin, cos
 
-from layout import Layout, LayoutTensor
+from layout import TileTensor, TensorLayout
 from max.gpu.host import DeviceContext
 
 from ..fields import Data, Model, DynamicsScratch, DimsLike
@@ -156,9 +156,9 @@ comptime OSC_WORK_WORDS: Int = OSC_W_VEC + 16
 
 @always_inline
 def _inv_into[
-    DTYPE: DType, L_WORK: Layout,
+    DTYPE: DType, L_WORK: TensorLayout,
 ](
-    work: LayoutTensor[DTYPE, L_WORK, MutAnyOrigin],
+    work: TileTensor[DTYPE, L_WORK, MutAnyOrigin],
     env: Int, src: Int, dst: Int, n: Int,
 ) -> Bool:
     """`dst = inv(src)`, Gauss-Jordan with partial pivoting, through the
@@ -219,9 +219,9 @@ def _inv_into[
 
 @always_inline
 def _mul_into[
-    DTYPE: DType, L_WORK: Layout,
+    DTYPE: DType, L_WORK: TensorLayout,
 ](
-    work: LayoutTensor[DTYPE, L_WORK, MutAnyOrigin],
+    work: TileTensor[DTYPE, L_WORK, MutAnyOrigin],
     env: Int, a: Int, b: Int, dst: Int, n: Int, k: Int, m: Int,
 ):
     """`dst[n x m] = a[n x k] @ b[k x m]`. `dst` must not alias `a` or `b`."""
@@ -238,9 +238,9 @@ def _mul_into[
 
 @always_inline
 def _mul_t_into[
-    DTYPE: DType, L_WORK: Layout,
+    DTYPE: DType, L_WORK: TensorLayout,
 ](
-    work: LayoutTensor[DTYPE, L_WORK, MutAnyOrigin],
+    work: TileTensor[DTYPE, L_WORK, MutAnyOrigin],
     env: Int, a: Int, b: Int, dst: Int, n: Int, k: Int, m: Int,
 ):
     """`dst[n x m] = a[k x n]^T @ b[k x m]` — the transpose is READ, never
@@ -258,9 +258,9 @@ def _mul_t_into[
 
 @always_inline
 def _mul_bt_into[
-    DTYPE: DType, L_WORK: Layout,
+    DTYPE: DType, L_WORK: TensorLayout,
 ](
-    work: LayoutTensor[DTYPE, L_WORK, MutAnyOrigin],
+    work: TileTensor[DTYPE, L_WORK, MutAnyOrigin],
     env: Int, a: Int, b: Int, dst: Int, n: Int, k: Int, m: Int,
 ):
     """`dst[n x m] = a[n x k] @ b[m x k]^T`."""
@@ -277,9 +277,9 @@ def _mul_bt_into[
 
 @always_inline
 def _is_ancestor[
-    DTYPE: DType, L_BODIES: Layout,
+    DTYPE: DType, L_BODIES: TensorLayout,
 ](
-    bodies: LayoutTensor[DTYPE, L_BODIES, MutAnyOrigin],
+    bodies: TileTensor[DTYPE, L_BODIES, MutAnyOrigin],
     body: Int, maybe: Int,
 ) -> Bool:
     """Is `maybe` `body` or one of its ancestors? Body ids are in tree order,
@@ -297,11 +297,11 @@ def _is_ancestor[
 
 @always_inline
 def _site_mat_into[
-    DTYPE: DType, L_WORK: Layout, L_B4: Layout, L_SITES: Layout,
+    DTYPE: DType, L_WORK: TensorLayout, L_B4: TensorLayout, L_SITES: TensorLayout,
 ](
-    work: LayoutTensor[DTYPE, L_WORK, MutAnyOrigin],
-    xquat: LayoutTensor[DTYPE, L_B4, MutAnyOrigin],
-    sites: LayoutTensor[DTYPE, L_SITES, MutAnyOrigin],
+    work: TileTensor[DTYPE, L_WORK, MutAnyOrigin],
+    xquat: TileTensor[DTYPE, L_B4, MutAnyOrigin],
+    sites: TileTensor[DTYPE, L_SITES, MutAnyOrigin],
     env: Int, site: Int, site_body: Int, dst: Int,
 ):
     """`site_xmat` — `xquat[site body] * site quat`, the product
@@ -331,9 +331,9 @@ def _site_mat_into[
 
 @always_inline
 def axisangle_mat_into[
-    DTYPE: DType, L_WORK: Layout,
+    DTYPE: DType, L_WORK: TensorLayout,
 ](
-    work: LayoutTensor[DTYPE, L_WORK, MutAnyOrigin],
+    work: TileTensor[DTYPE, L_WORK, MutAnyOrigin],
     env: Int, dst: Int,
     vx: Scalar[DTYPE], vy: Scalar[DTYPE], vz: Scalar[DTYPE],
 ):
@@ -379,16 +379,16 @@ def axisangle_mat_into[
 
 @always_inline
 def osc_reset_gpu[
-    DTYPE: DType, L_STATE: Layout, L_WORK: Layout, L_REFS: Layout,
-    L_QPOS: Layout, L_B4: Layout, L_SX: Layout, L_SITES: Layout,
+    DTYPE: DType, L_STATE: TensorLayout, L_WORK: TensorLayout, L_REFS: TensorLayout,
+    L_QPOS: TensorLayout, L_B4: TensorLayout, L_SX: TensorLayout, L_SITES: TensorLayout,
 ](
-    state: LayoutTensor[DTYPE, L_STATE, MutAnyOrigin],
-    work: LayoutTensor[DTYPE, L_WORK, MutAnyOrigin],
-    refs: LayoutTensor[DTYPE, L_REFS, MutAnyOrigin],
-    qpos: LayoutTensor[DTYPE, L_QPOS, MutAnyOrigin],
-    xquat: LayoutTensor[DTYPE, L_B4, MutAnyOrigin],
-    site_xpos: LayoutTensor[DTYPE, L_SX, MutAnyOrigin],
-    sites: LayoutTensor[DTYPE, L_SITES, MutAnyOrigin],
+    state: TileTensor[DTYPE, L_STATE, MutAnyOrigin],
+    work: TileTensor[DTYPE, L_WORK, MutAnyOrigin],
+    refs: TileTensor[DTYPE, L_REFS, MutAnyOrigin],
+    qpos: TileTensor[DTYPE, L_QPOS, MutAnyOrigin],
+    xquat: TileTensor[DTYPE, L_B4, MutAnyOrigin],
+    site_xpos: TileTensor[DTYPE, L_SX, MutAnyOrigin],
+    sites: TileTensor[DTYPE, L_SITES, MutAnyOrigin],
     env: Int,
 ):
     """`Robot.reset` -> `_load_controller`: the nullspace target is the
@@ -415,16 +415,16 @@ def osc_reset_gpu[
 
 @always_inline
 def osc_set_goal_gpu[
-    DTYPE: DType, L_STATE: Layout, L_WORK: Layout, L_REFS: Layout,
-    L_ACT: Layout, L_B4: Layout, L_SX: Layout, L_SITES: Layout,
+    DTYPE: DType, L_STATE: TensorLayout, L_WORK: TensorLayout, L_REFS: TensorLayout,
+    L_ACT: TensorLayout, L_B4: TensorLayout, L_SX: TensorLayout, L_SITES: TensorLayout,
 ](
-    state: LayoutTensor[DTYPE, L_STATE, MutAnyOrigin],
-    work: LayoutTensor[DTYPE, L_WORK, MutAnyOrigin],
-    refs: LayoutTensor[DTYPE, L_REFS, MutAnyOrigin],
-    actions: LayoutTensor[DTYPE, L_ACT, MutAnyOrigin],
-    xquat: LayoutTensor[DTYPE, L_B4, MutAnyOrigin],
-    site_xpos: LayoutTensor[DTYPE, L_SX, MutAnyOrigin],
-    sites: LayoutTensor[DTYPE, L_SITES, MutAnyOrigin],
+    state: TileTensor[DTYPE, L_STATE, MutAnyOrigin],
+    work: TileTensor[DTYPE, L_WORK, MutAnyOrigin],
+    refs: TileTensor[DTYPE, L_REFS, MutAnyOrigin],
+    actions: TileTensor[DTYPE, L_ACT, MutAnyOrigin],
+    xquat: TileTensor[DTYPE, L_B4, MutAnyOrigin],
+    site_xpos: TileTensor[DTYPE, L_SX, MutAnyOrigin],
+    sites: TileTensor[DTYPE, L_SITES, MutAnyOrigin],
     env: Int,
 ):
     """`set_goal(action)` — on a POLICY step, after the state is current.
@@ -486,28 +486,28 @@ def osc_set_goal_gpu[
 
 @always_inline
 def osc_run_gpu[
-    DTYPE: DType, L_STATE: Layout, L_WORK: Layout, L_REFS: Layout,
-    L_CTRL: Layout,
-    L_QPOS: Layout, L_NV: Layout, L_B4: Layout, L_SX: Layout, L_B3: Layout,
-    L_CDOF: Layout, L_M: Layout, L_JOINTS: Layout, L_BODIES: Layout,
-    L_SITES: Layout, L_MMETA: Layout,
+    DTYPE: DType, L_STATE: TensorLayout, L_WORK: TensorLayout, L_REFS: TensorLayout,
+    L_CTRL: TensorLayout,
+    L_QPOS: TensorLayout, L_NV: TensorLayout, L_B4: TensorLayout, L_SX: TensorLayout, L_B3: TensorLayout,
+    L_CDOF: TensorLayout, L_M: TensorLayout, L_JOINTS: TensorLayout, L_BODIES: TensorLayout,
+    L_SITES: TensorLayout, L_MMETA: TensorLayout,
 ](
-    state: LayoutTensor[DTYPE, L_STATE, MutAnyOrigin],
-    work: LayoutTensor[DTYPE, L_WORK, MutAnyOrigin],
-    refs: LayoutTensor[DTYPE, L_REFS, MutAnyOrigin],
-    ctrl: LayoutTensor[DTYPE, L_CTRL, MutAnyOrigin],
-    qpos: LayoutTensor[DTYPE, L_QPOS, MutAnyOrigin],
-    qvel: LayoutTensor[DTYPE, L_NV, MutAnyOrigin],
-    xquat: LayoutTensor[DTYPE, L_B4, MutAnyOrigin],
-    site_xpos: LayoutTensor[DTYPE, L_SX, MutAnyOrigin],
-    subtree_com: LayoutTensor[DTYPE, L_B3, MutAnyOrigin],
-    cdof: LayoutTensor[DTYPE, L_CDOF, MutAnyOrigin],
-    mass: LayoutTensor[DTYPE, L_M, MutAnyOrigin],
-    bias: LayoutTensor[DTYPE, L_NV, MutAnyOrigin],
-    joints: LayoutTensor[DTYPE, L_JOINTS, MutAnyOrigin],
-    bodies: LayoutTensor[DTYPE, L_BODIES, MutAnyOrigin],
-    sites: LayoutTensor[DTYPE, L_SITES, MutAnyOrigin],
-    mmeta: LayoutTensor[DTYPE, L_MMETA, MutAnyOrigin],
+    state: TileTensor[DTYPE, L_STATE, MutAnyOrigin],
+    work: TileTensor[DTYPE, L_WORK, MutAnyOrigin],
+    refs: TileTensor[DTYPE, L_REFS, MutAnyOrigin],
+    ctrl: TileTensor[DTYPE, L_CTRL, MutAnyOrigin],
+    qpos: TileTensor[DTYPE, L_QPOS, MutAnyOrigin],
+    qvel: TileTensor[DTYPE, L_NV, MutAnyOrigin],
+    xquat: TileTensor[DTYPE, L_B4, MutAnyOrigin],
+    site_xpos: TileTensor[DTYPE, L_SX, MutAnyOrigin],
+    subtree_com: TileTensor[DTYPE, L_B3, MutAnyOrigin],
+    cdof: TileTensor[DTYPE, L_CDOF, MutAnyOrigin],
+    mass: TileTensor[DTYPE, L_M, MutAnyOrigin],
+    bias: TileTensor[DTYPE, L_NV, MutAnyOrigin],
+    joints: TileTensor[DTYPE, L_JOINTS, MutAnyOrigin],
+    bodies: TileTensor[DTYPE, L_BODIES, MutAnyOrigin],
+    sites: TileTensor[DTYPE, L_SITES, MutAnyOrigin],
+    mmeta: TileTensor[DTYPE, L_MMETA, MutAnyOrigin],
     env: Int,
     nv: Int,
 ):
@@ -762,13 +762,13 @@ def osc_run_gpu[
 
 @always_inline
 def osc_gripper_gpu[
-    DTYPE: DType, L_STATE: Layout, L_REFS: Layout, L_CTRL: Layout,
-    L_ACT: Layout, ACT_DIM: Int,
+    DTYPE: DType, L_STATE: TensorLayout, L_REFS: TensorLayout, L_CTRL: TensorLayout,
+    L_ACT: TensorLayout, ACT_DIM: Int,
 ](
-    state: LayoutTensor[DTYPE, L_STATE, MutAnyOrigin],
-    refs: LayoutTensor[DTYPE, L_REFS, MutAnyOrigin],
-    ctrl: LayoutTensor[DTYPE, L_CTRL, MutAnyOrigin],
-    actions: LayoutTensor[DTYPE, L_ACT, MutAnyOrigin],
+    state: TileTensor[DTYPE, L_STATE, MutAnyOrigin],
+    refs: TileTensor[DTYPE, L_REFS, MutAnyOrigin],
+    ctrl: TileTensor[DTYPE, L_CTRL, MutAnyOrigin],
+    actions: TileTensor[DTYPE, L_ACT, MutAnyOrigin],
     env: Int,
 ):
     """`PandaGripper.format_action` + `Manipulator.grip_action`, ONE SIM STEP.

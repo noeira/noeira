@@ -95,7 +95,6 @@ kinematics this file refreshes are exactly what `mj_jacSite` needs, so that
 is an addition to the loop below rather than another ordering problem.
 """
 
-from layout import Layout, LayoutTensor
 from max.gpu.host import DeviceContext
 
 from ..fields import (
@@ -312,16 +311,16 @@ def apply_pose_transmission[
     var rl_B3 = rl2(BATCH, dm.get_nbody() * 3)
     var rl_B4 = rl2(BATCH, dm.get_nbody() * 4)
     var rl_CDOF = rl2(BATCH, dm.get_nv() * 6)
-    var tendons_v = m.tendons.lt_dyn["cpu", DYN2](rl_TEN)
-    var sites_v = m.sites.lt_dyn["cpu", DYN2](rl_SITE)
-    var geoms_v = m.geoms.lt_dyn["cpu", DYN2](rl_GEOM)
-    var bodies_v = m.bodies.lt_dyn["cpu", DYN2](rl_BODY)
-    var joints_v = m.joints.lt_dyn["cpu", DYN2](rl_JOINT)
-    var mmeta_v = m.meta.lt_dyn["cpu", DYN1](rl_MMETA)
-    var stcom_v = d.subtree_com.lt_dyn["cpu", DYN2](rl_B3)
-    var xpos_v = d.xpos.lt_dyn["cpu", DYN2](rl_B3)
-    var xquat_v = d.xquat.lt_dyn["cpu", DYN2](rl_B4)
-    var cdof_v = sc.cdof.lt_dyn["cpu", DYN2](rl_CDOF)
+    var tendons_v = m.tendons.tt_dyn["cpu", DYN2](rl_TEN)
+    var sites_v = m.sites.tt_dyn["cpu", DYN2](rl_SITE)
+    var geoms_v = m.geoms.tt_dyn["cpu", DYN2](rl_GEOM)
+    var bodies_v = m.bodies.tt_dyn["cpu", DYN2](rl_BODY)
+    var joints_v = m.joints.tt_dyn["cpu", DYN2](rl_JOINT)
+    var mmeta_v = m.meta.tt_dyn["cpu", DYN1](rl_MMETA)
+    var stcom_v = d.subtree_com.tt_dyn["cpu", DYN2](rl_B3)
+    var xpos_v = d.xpos.tt_dyn["cpu", DYN2](rl_B3)
+    var xquat_v = d.xquat.tt_dyn["cpu", DYN2](rl_B4)
+    var cdof_v = sc.cdof.tt_dyn["cpu", DYN2](rl_CDOF)
 
     var n_ten = mdm.get_ntendon()
     var nten_live = Int(Float64(m.meta.data[MODEL_META_IDX_NTENDON]))

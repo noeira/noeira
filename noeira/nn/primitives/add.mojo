@@ -15,7 +15,8 @@ the whole function, then builds views from that.
 
 from max.gpu import global_idx
 from max.gpu.host import DeviceContext
-from layout import Layout, LayoutTensor, TileTensor, row_major
+from layout import TileTensor, row_major
+from noeira.core.tiles import Tile
 from linalg.matmul import matmul as max_matmul
 
 from noeira.nn.constants import DT
@@ -30,9 +31,9 @@ from ..core.amp import AMPPolicy, NoAMP
 def _add_fwd_kernel[
     M: Int, ADT: DType = DT
 ](
-    a: LayoutTensor[ADT, Layout.row_major(M), MutAnyOrigin],
-    b: LayoutTensor[ADT, Layout.row_major(M), MutAnyOrigin],
-    o: LayoutTensor[ADT, Layout.row_major(M), MutAnyOrigin],
+    a: Tile[ADT, M],
+    b: Tile[ADT, M],
+    o: Tile[ADT, M],
 ):
     var i = Int(global_idx.x)
     if i < M:
@@ -42,8 +43,8 @@ def _add_fwd_kernel[
 def _copy_kernel[
     M: Int, ADT: DType = DT
 ](
-    src: LayoutTensor[ADT, Layout.row_major(M), MutAnyOrigin],
-    dst: LayoutTensor[ADT, Layout.row_major(M), MutAnyOrigin],
+    src: Tile[ADT, M],
+    dst: Tile[ADT, M],
 ):
     var i = Int(global_idx.x)
     if i < M:
@@ -90,9 +91,9 @@ struct Add[DIM_: Int, ADT: DType = DT](Module):
         else:
             var c = ctx.value()
             out.ensure_gpu(c, M)
-            var al = a0.lt["gpu", Layout.row_major(M)]()
-            var bl = a1.lt["gpu", Layout.row_major(M)]()
-            var ol = out.lt["gpu", Layout.row_major(M)]()
+            var al = a0.tt["gpu", M]()
+            var bl = a1.tt["gpu", M]()
+            var ol = out.tt["gpu", M]()
             c.enqueue_function[_add_fwd_kernel[M, Self.ACT_DT]](
                 al, bl, ol, grid_dim=(M + 255) // 256, block_dim=256
             )
@@ -126,9 +127,9 @@ struct Add[DIM_: Int, ADT: DType = DT](Module):
             var c = ctx.value()
             g0.ensure_gpu(c, M)
             g1.ensure_gpu(c, M)
-            var gol = grad_output.lt["gpu", Layout.row_major(M)]()
-            var gi0l = g0.lt["gpu", Layout.row_major(M)]()
-            var gi1l = g1.lt["gpu", Layout.row_major(M)]()
+            var gol = grad_output.tt["gpu", M]()
+            var gi0l = g0.tt["gpu", M]()
+            var gi1l = g1.tt["gpu", M]()
             comptime nblk = (M + 255) // 256
             c.enqueue_function[_copy_kernel[M, Self.ACT_DT]](
                 gol, gi0l, grid_dim=nblk, block_dim=256

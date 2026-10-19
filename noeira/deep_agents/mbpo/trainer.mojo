@@ -27,7 +27,6 @@ from std.time import perf_counter_ns
 from max.gpu import block_dim, block_idx, thread_idx, global_idx
 from max.gpu.host import DeviceContext, DeviceBuffer
 from std.random.philox import Random as PhiloxRandom
-from layout import Layout, LayoutTensor
 
 from noeira.core.logger import Logger, NoOpLogger
 from noeira.nn.constants import DT, TPB
@@ -71,6 +70,7 @@ from ..sac.actor_loss import SACActorLoss
 from ..sac.blocks.alpha_update_step import AlphaUpdateStep
 from .dynamics_ensemble_block import DynamicsEnsembleBlock
 from .metrics import MBPOMetrics
+from noeira.core.tiles import RowMajor, Tile, tile
 
 
 # ──────────────────────────────────────────────────────────────────────
@@ -81,12 +81,12 @@ from .metrics import MBPOMetrics
 def _rollout_posterior_kernel[
     BATCH: Int, OBS: Int, PRED: Int
 ](
-    obs: LayoutTensor[DT, Layout.row_major(BATCH, OBS), MutAnyOrigin],
-    mu: LayoutTensor[DT, Layout.row_major(BATCH, PRED), MutAnyOrigin],
-    lv: LayoutTensor[DT, Layout.row_major(BATCH, PRED), MutAnyOrigin],
-    noise: LayoutTensor[DT, Layout.row_major(BATCH, PRED), MutAnyOrigin],
-    out_nxt: LayoutTensor[DT, Layout.row_major(BATCH, OBS), MutAnyOrigin],
-    out_rew: LayoutTensor[DT, Layout.row_major(BATCH), MutAnyOrigin],
+    obs: Tile[DT, BATCH, OBS],
+    mu: Tile[DT, BATCH, PRED],
+    lv: Tile[DT, BATCH, PRED],
+    noise: Tile[DT, BATCH, PRED],
+    out_nxt: Tile[DT, BATCH, OBS],
+    out_rew: Tile[DT, BATCH],
 ):
     """Posterior sample one rollout step: PRED = 1 + OBS (reward + Δobs).
     Reward clamped to [-100, 100], NaN→0."""
@@ -115,7 +115,7 @@ def _rollout_posterior_kernel[
 def _mbpo_elite_assign_kernel[
     BATCH: Int
 ](
-    slot: LayoutTensor[DT, Layout.row_major(BATCH), MutAnyOrigin],
+    slot: Tile[DT, BATCH],
     n_elites: Int32,
     seed: UInt64,
     offset: UInt64,
@@ -138,15 +138,11 @@ def _mbpo_elite_assign_kernel[
 def _mbpo_elite_gather_kernel[
     BATCH: Int, NELITES: Int, PRED: Int
 ](
-    mu_all: LayoutTensor[
-        DT, Layout.row_major(NELITES * BATCH, PRED), MutAnyOrigin
-    ],
-    lv_all: LayoutTensor[
-        DT, Layout.row_major(NELITES * BATCH, PRED), MutAnyOrigin
-    ],
-    slot: LayoutTensor[DT, Layout.row_major(BATCH), MutAnyOrigin],
-    out_mu: LayoutTensor[DT, Layout.row_major(BATCH, PRED), MutAnyOrigin],
-    out_lv: LayoutTensor[DT, Layout.row_major(BATCH, PRED), MutAnyOrigin],
+    mu_all: Tile[DT, NELITES * BATCH, PRED],
+    lv_all: Tile[DT, NELITES * BATCH, PRED],
+    slot: Tile[DT, BATCH],
+    out_mu: Tile[DT, BATCH, PRED],
+    out_lv: Tile[DT, BATCH, PRED],
 ):
     """Per-transition gather: `out[b,:] = all[slot[b]·BATCH + b, :]`."""
     var b = Int(block_dim.x * block_idx.x + thread_idx.x)
@@ -166,10 +162,10 @@ def _mbpo_elite_gather_kernel[
 def _build_dyn_target_kernel[
     BATCH: Int, OBS: Int, PRED: Int
 ](
-    rew: LayoutTensor[DT, Layout.row_major(BATCH), MutAnyOrigin],
-    s: LayoutTensor[DT, Layout.row_major(BATCH, OBS), MutAnyOrigin],
-    sp: LayoutTensor[DT, Layout.row_major(BATCH, OBS), MutAnyOrigin],
-    out_tgt: LayoutTensor[DT, Layout.row_major(BATCH, PRED), MutAnyOrigin],
+    rew: Tile[DT, BATCH],
+    s: Tile[DT, BATCH, OBS],
+    sp: Tile[DT, BATCH, OBS],
+    out_tgt: Tile[DT, BATCH, PRED],
 ):
     """Dynamics target = [reward, Δobs = s' − s]. PRED = 1 + OBS."""
     var k = Int(block_dim.x * block_idx.x + thread_idx.x)
@@ -185,9 +181,9 @@ def _build_dyn_target_kernel[
 def _normalize_input_kernel[
     BATCH: Int, D: Int
 ](
-    data: LayoutTensor[DT, Layout.row_major(BATCH, D), MutAnyOrigin],
-    mean: LayoutTensor[DT, Layout.row_major(D), MutAnyOrigin],
-    std: LayoutTensor[DT, Layout.row_major(D), MutAnyOrigin],
+    data: Tile[DT, BATCH, D],
+    mean: Tile[DT, D],
+    std: Tile[DT, D],
 ):
     """In-place per-column z-score of the dynamics input."""
     var i = Int(block_dim.x * block_idx.x + thread_idx.x)
@@ -204,10 +200,10 @@ def _normalize_input_kernel[
 def _mbpo_fit_scaler_kernel[
     OBS: Int, ACT: Int, DYN_IN: Int, CAP: Int
 ](
-    obs: LayoutTensor[DT, Layout.row_major(CAP, OBS), MutAnyOrigin],
-    act: LayoutTensor[DT, Layout.row_major(CAP, ACT), MutAnyOrigin],
-    mean_out: LayoutTensor[DT, Layout.row_major(DYN_IN), MutAnyOrigin],
-    std_out: LayoutTensor[DT, Layout.row_major(DYN_IN), MutAnyOrigin],
+    obs: Tile[DT, CAP, OBS],
+    act: Tile[DT, CAP, ACT],
+    mean_out: Tile[DT, DYN_IN],
+    std_out: Tile[DT, DYN_IN],
     n_data: Int32,
 ):
     """Per-column z-score fit of the dynamics input over the first `n_data`
@@ -981,22 +977,22 @@ struct MBPOTrainer[
                 self._done_accum += sum_d * inv_b
                 self._action_abs_accum += sum_a / Scalar[DT](B * A)
             else:
-                comptime lb = Layout.row_major(B)
-                comptime lba = Layout.row_major(B * A)
+                comptime lb = RowMajor[B]
+                comptime lba = RowMajor[B * A]
                 self._q_mean_dev.accumulate_gpu_lt[B](
-                    self.twin_critic_blk.inner.c1._mb_q.lt["gpu", lb]()
+                    self.twin_critic_blk.inner.c1._mb_q.tt["gpu", B]()
                 )
                 self._reward_mean_dev.accumulate_gpu_lt[B](
-                    self.state.mb_r.lt["gpu", lb]()
+                    self.state.mb_r.tt["gpu", B]()
                 )
                 self._td_mean_dev.accumulate_gpu_lt[B](
-                    self.state.mb_y.lt["gpu", lb]()
+                    self.state.mb_y.tt["gpu", B]()
                 )
                 self._done_mean_dev.accumulate_gpu_lt[B](
-                    self.state.mb_d.lt["gpu", lb]()
+                    self.state.mb_d.tt["gpu", B]()
                 )
                 self._action_abs_mean_dev.accumulate_gpu_abs_lt[B * A](
-                    self.state.mb_a.lt["gpu", lba]()
+                    self.state.mb_a.tt["gpu", B * A]()
                 )
 
             self._actor_L_accum += self.state.actor_loss
@@ -1057,22 +1053,22 @@ struct MBPOTrainer[
             )
             self.polyak_blk.step["gpu"](self.state, self.pair1, self.pair2)
 
-            comptime lb = Layout.row_major(B)
-            comptime lba = Layout.row_major(B * A)
+            comptime lb = RowMajor[B]
+            comptime lba = RowMajor[B * A]
             self._q_mean_dev.accumulate_gpu_lt[B](
-                self.twin_critic_blk.inner.c1._mb_q.lt["gpu", lb]()
+                self.twin_critic_blk.inner.c1._mb_q.tt["gpu", B]()
             )
             self._reward_mean_dev.accumulate_gpu_lt[B](
-                self.state.mb_r.lt["gpu", lb]()
+                self.state.mb_r.tt["gpu", B]()
             )
             self._td_mean_dev.accumulate_gpu_lt[B](
-                self.state.mb_y.lt["gpu", lb]()
+                self.state.mb_y.tt["gpu", B]()
             )
             self._done_mean_dev.accumulate_gpu_lt[B](
-                self.state.mb_d.lt["gpu", lb]()
+                self.state.mb_d.tt["gpu", B]()
             )
             self._action_abs_mean_dev.accumulate_gpu_abs_lt[B * A](
-                self.state.mb_a.lt["gpu", lba]()
+                self.state.mb_a.tt["gpu", B * A]()
             )
         else:
             raise Error("train_device_kernels: GPU-only (CUDA-graph capture)")
@@ -1361,18 +1357,10 @@ struct MBPOTrainer[
         N_ENVS: Int,
     ](
         mut self,
-        obs: LayoutTensor[
-            DT, Layout.row_major(N_ENVS, Self.AGENT_OBS_DIM), MutAnyOrigin
-        ],
-        action: LayoutTensor[
-            DT, Layout.row_major(N_ENVS, Self.AGENT_ACT_DIM), MutAnyOrigin
-        ],
-        ao_scratch: LayoutTensor[
-            DT, Layout.row_major(N_ENVS, 2 * Self.AGENT_ACT_DIM), MutAnyOrigin
-        ],
-        alp_scratch: LayoutTensor[
-            DT, Layout.row_major(N_ENVS, Self.AGENT_ACT_DIM + 1), MutAnyOrigin
-        ],
+        obs: Tile[DT, N_ENVS, Self.AGENT_OBS_DIM],
+        action: Tile[DT, N_ENVS, Self.AGENT_ACT_DIM],
+        ao_scratch: Tile[DT, N_ENVS, 2 * Self.AGENT_ACT_DIM],
+        alp_scratch: Tile[DT, N_ENVS, Self.AGENT_ACT_DIM + 1],
         step_idx: Int,
     ) raises:
         comptime assert N_ENVS > 0, "N_ENVS must be > 0"
@@ -1551,18 +1539,10 @@ struct MBPOTrainer[
         ]
         comptime n_blocks = (Self.DYN_IN + TPB - 1) // TPB
         ctx.enqueue_function[fit_kernel](
-            LayoutTensor[
-                DT,
-                Layout.row_major(Self.REPLAY_CAPACITY, Self.OBS_DIM),
-                MutAnyOrigin,
-            ](self.sample_blk.real_gpu.value().obs),
-            LayoutTensor[
-                DT,
-                Layout.row_major(Self.REPLAY_CAPACITY, Self.ACT_DIM),
-                MutAnyOrigin,
-            ](self.sample_blk.real_gpu.value().act),
-            self._in_mean.lt["gpu", Layout.row_major(Self.DYN_IN)](),
-            self._in_std.lt["gpu", Layout.row_major(Self.DYN_IN)](),
+            tile[Self.REPLAY_CAPACITY, Self.OBS_DIM](self.sample_blk.real_gpu.value().obs),
+            tile[Self.REPLAY_CAPACITY, Self.ACT_DIM](self.sample_blk.real_gpu.value().act),
+            self._in_mean.tt["gpu", Self.DYN_IN](),
+            self._in_std.tt["gpu", Self.DYN_IN](),
             Int32(n_data),
             grid_dim=n_blocks,
             block_dim=TPB,
@@ -1589,9 +1569,9 @@ struct MBPOTrainer[
         comptime n_blocks = (total + TPB - 1) // TPB
         comptime norm_kernel = _normalize_input_kernel[Self.BATCH, Self.DYN_IN]
         ctx.enqueue_function[norm_kernel](
-            self._dyn_in.lt["gpu", Layout.row_major(Self.BATCH, Self.DYN_IN)](),
-            self._in_mean.lt["gpu", Layout.row_major(Self.DYN_IN)](),
-            self._in_std.lt["gpu", Layout.row_major(Self.DYN_IN)](),
+            self._dyn_in.tt["gpu", Self.BATCH, Self.DYN_IN](),
+            self._in_mean.tt["gpu", Self.DYN_IN](),
+            self._in_std.tt["gpu", Self.DYN_IN](),
             grid_dim=n_blocks,
             block_dim=TPB,
         )
@@ -1819,16 +1799,16 @@ struct MBPOTrainer[
         )
         concat_sa_gpu[Self.OBS_DIM, Self.ACT_DIM, Self.BATCH](
             ctx,
-            self._ro_obs.lt["gpu", Layout.row_major(Self.BATCH, Self.OBS_DIM)](),
-            self._ro_act.lt["gpu", Layout.row_major(Self.BATCH, Self.ACT_DIM)](),
-            self._dyn_in.lt["gpu", Layout.row_major(Self.BATCH, Self.DYN_IN)](),
+            self._ro_obs.tt["gpu", Self.BATCH, Self.OBS_DIM](),
+            self._ro_act.tt["gpu", Self.BATCH, Self.ACT_DIM](),
+            self._dyn_in.tt["gpu", Self.BATCH, Self.DYN_IN](),
         )
         self._normalize_dyn_in_gpu()
         ctx.enqueue_function[tgt_kernel](
-            self._ro_rew.lt["gpu", Layout.row_major(Self.BATCH)](),
-            self._ro_obs.lt["gpu", Layout.row_major(Self.BATCH, Self.OBS_DIM)](),
-            self._ro_nxt.lt["gpu", Layout.row_major(Self.BATCH, Self.OBS_DIM)](),
-            self._dyn_tgt.lt["gpu", Layout.row_major(Self.BATCH, Self.DYN_PRED)](),
+            self._ro_rew.tt["gpu", Self.BATCH](),
+            self._ro_obs.tt["gpu", Self.BATCH, Self.OBS_DIM](),
+            self._ro_nxt.tt["gpu", Self.BATCH, Self.OBS_DIM](),
+            self._dyn_tgt.tt["gpu", Self.BATCH, Self.DYN_PRED](),
             grid_dim=n_blocks,
             block_dim=TPB,
         )
@@ -1951,12 +1931,8 @@ struct MBPOTrainer[
                     TensorRefs[1](self._ro_ao), self._ro_alp, self.ctx
                 )
                 ctx.enqueue_function[clamp_kernel](
-                    self._ro_alp.lt[
-                        "gpu", Layout.row_major(Self.BATCH, Self.ACT_DIM + 1)
-                    ](),
-                    self._ro_act.lt[
-                        "gpu", Layout.row_major(Self.BATCH, Self.ACT_DIM)
-                    ](),
+                    self._ro_alp.tt["gpu", Self.BATCH, Self.ACT_DIM + 1](),
+                    self._ro_act.tt["gpu", Self.BATCH, Self.ACT_DIM](),
                     self.action_scale,
                     grid_dim=n_lane_blocks,
                     block_dim=TPB,
@@ -1964,15 +1940,9 @@ struct MBPOTrainer[
 
                 concat_sa_gpu[Self.OBS_DIM, Self.ACT_DIM, Self.BATCH](
                     ctx,
-                    self._ro_obs.lt[
-                        "gpu", Layout.row_major(Self.BATCH, Self.OBS_DIM)
-                    ](),
-                    self._ro_act.lt[
-                        "gpu", Layout.row_major(Self.BATCH, Self.ACT_DIM)
-                    ](),
-                    self._dyn_in.lt[
-                        "gpu", Layout.row_major(Self.BATCH, Self.DYN_IN)
-                    ](),
+                    self._ro_obs.tt["gpu", Self.BATCH, Self.OBS_DIM](),
+                    self._ro_act.tt["gpu", Self.BATCH, Self.ACT_DIM](),
+                    self._dyn_in.tt["gpu", Self.BATCH, Self.DYN_IN](),
                 )
                 self._normalize_dyn_in_gpu()
 
@@ -1992,7 +1962,7 @@ struct MBPOTrainer[
 
                 comptime assign_kernel = _mbpo_elite_assign_kernel[Self.BATCH]
                 ctx.enqueue_function[assign_kernel](
-                    self._ro_slot.lt["gpu", Layout.row_major(Self.BATCH)](),
+                    self._ro_slot.tt["gpu", Self.BATCH](),
                     Int32(n_elites),
                     self._roll_rng_seed + UInt64(0x5107),
                     self._elite_rng_offset,
@@ -2005,32 +1975,18 @@ struct MBPOTrainer[
                     Self.BATCH, Self.NUM_ELITES, Self.DYN_PRED
                 ]
                 ctx.enqueue_function[gather_kernel](
-                    self._ro_mu_all.lt[
-                        "gpu",
-                        Layout.row_major(
-                            Self.NUM_ELITES * Self.BATCH, Self.DYN_PRED
-                        ),
-                    ](),
-                    self._ro_lv_all.lt[
-                        "gpu",
-                        Layout.row_major(
-                            Self.NUM_ELITES * Self.BATCH, Self.DYN_PRED
-                        ),
-                    ](),
-                    self._ro_slot.lt["gpu", Layout.row_major(Self.BATCH)](),
-                    self._ro_mu.lt[
-                        "gpu", Layout.row_major(Self.BATCH, Self.DYN_PRED)
-                    ](),
-                    self._ro_lv.lt[
-                        "gpu", Layout.row_major(Self.BATCH, Self.DYN_PRED)
-                    ](),
+                    self._ro_mu_all.tt["gpu", Self.NUM_ELITES * Self.BATCH, Self.DYN_PRED](),
+                    self._ro_lv_all.tt["gpu", Self.NUM_ELITES * Self.BATCH, Self.DYN_PRED](),
+                    self._ro_slot.tt["gpu", Self.BATCH](),
+                    self._ro_mu.tt["gpu", Self.BATCH, Self.DYN_PRED](),
+                    self._ro_lv.tt["gpu", Self.BATCH, Self.DYN_PRED](),
                     grid_dim=n_lane_blocks,
                     block_dim=TPB,
                 )
 
                 comptime nb_noise = (n_noise + TPB - 1) // TPB
                 ctx.enqueue_function[_box_muller_kernel[n_noise]](
-                    self._ro_noise.lt["gpu", Layout.row_major(n_noise)](),
+                    self._ro_noise.tt["gpu", n_noise](),
                     self._roll_rng_seed,
                     self._roll_rng_offset,
                     grid_dim=nb_noise,
@@ -2038,22 +1994,12 @@ struct MBPOTrainer[
                 )
                 self._roll_rng_offset += UInt64(((n_noise + 1) // 2) * 2)
                 ctx.enqueue_function[post_kernel](
-                    self._ro_obs.lt[
-                        "gpu", Layout.row_major(Self.BATCH, Self.OBS_DIM)
-                    ](),
-                    self._ro_mu.lt[
-                        "gpu", Layout.row_major(Self.BATCH, Self.DYN_PRED)
-                    ](),
-                    self._ro_lv.lt[
-                        "gpu", Layout.row_major(Self.BATCH, Self.DYN_PRED)
-                    ](),
-                    self._ro_noise.lt[
-                        "gpu", Layout.row_major(Self.BATCH, Self.DYN_PRED)
-                    ](),
-                    self._ro_nxt.lt[
-                        "gpu", Layout.row_major(Self.BATCH, Self.OBS_DIM)
-                    ](),
-                    self._ro_rew.lt["gpu", Layout.row_major(Self.BATCH)](),
+                    self._ro_obs.tt["gpu", Self.BATCH, Self.OBS_DIM](),
+                    self._ro_mu.tt["gpu", Self.BATCH, Self.DYN_PRED](),
+                    self._ro_lv.tt["gpu", Self.BATCH, Self.DYN_PRED](),
+                    self._ro_noise.tt["gpu", Self.BATCH, Self.DYN_PRED](),
+                    self._ro_nxt.tt["gpu", Self.BATCH, Self.OBS_DIM](),
+                    self._ro_rew.tt["gpu", Self.BATCH](),
                     grid_dim=n_lane_blocks,
                     block_dim=TPB,
                 )

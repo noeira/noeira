@@ -16,7 +16,6 @@ one origin (§B0) for the `TensorRefs[4]` the leaf consumes; grad_inputs land in
 second pool. `forward_backward` returns the mean per-batch loss for logging.
 """
 
-from layout import Layout
 from max.gpu.host import DeviceContext
 
 from noeira.nn.constants import DT
@@ -175,7 +174,7 @@ struct PPOActorLoss[
         comptime if DEVICE_LOSS:
             comptime assert target == "gpu", "DEVICE_LOSS is GPU-only"
             self._loss_mean_dev.accumulate_gpu_lt[BB](
-                self._loss_out.lt["gpu", Layout.row_major(BB)]()
+                self._loss_out.tt["gpu", BB]()
             )
         else:
             comptime if target == "gpu":

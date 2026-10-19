@@ -31,7 +31,6 @@ from noeira.nn.core.param import walk_params, ParamVisitorRef
 from std.math import exp as fexp, log as flog, tanh as ftanh
 from std.random import random_float64
 from std.random.philox import Random as PhiloxRandom
-from layout import Layout, LayoutTensor
 
 from max.gpu import global_idx
 from max.gpu.host import DeviceContext, DeviceBuffer
@@ -75,6 +74,7 @@ from .blocks.ensemble_critic_step import EnsembleCriticStep
 from .blocks.ensemble_actor_step import EnsembleActorStep
 from .blocks.ensemble_polyak_step import EnsemblePolyakStep
 from .metrics import REDQMetrics
+from noeira.core.tiles import RowMajor, Tile
 
 
 # ──────────────────────────────────────────────────────────────────────
@@ -397,22 +397,22 @@ struct REDQTrainer[
             self._done_accum += sd * inv_b
             self._abs_action_accum += saa / Scalar[DT](B * A)
         else:
-            comptime lb = Layout.row_major(B)
-            comptime lba = Layout.row_major(B * A)
+            comptime lb = RowMajor[B]
+            comptime lba = RowMajor[B * A]
             self._q_mean_dev.accumulate_gpu_lt[B](
-                self.critic_blk.member_step._mb_q.lt["gpu", lb]()
+                self.critic_blk.member_step._mb_q.tt["gpu", B]()
             )
             self._target_mean_dev.accumulate_gpu_lt[B](
-                self.state.mb_y.lt["gpu", lb]()
+                self.state.mb_y.tt["gpu", B]()
             )
             self._reward_mean_dev.accumulate_gpu_lt[B](
-                self.state.mb_r.lt["gpu", lb]()
+                self.state.mb_r.tt["gpu", B]()
             )
             self._done_mean_dev.accumulate_gpu_lt[B](
-                self.state.mb_d.lt["gpu", lb]()
+                self.state.mb_d.tt["gpu", B]()
             )
             self._abs_action_mean_dev.accumulate_gpu_abs_lt[B * A](
-                self.state.mb_a.lt["gpu", lba]()
+                self.state.mb_a.tt["gpu", B * A]()
             )
 
         self._critic_L_accum += self.state.critic_loss
@@ -455,22 +455,22 @@ struct REDQTrainer[
         # Per-batch diagnostics — device-resident accumulators (capture-safe).
         comptime B = Self.BATCH
         comptime A = Self.ACT_DIM
-        comptime lb = Layout.row_major(B)
-        comptime lba = Layout.row_major(B * A)
+        comptime lb = RowMajor[B]
+        comptime lba = RowMajor[B * A]
         self._q_mean_dev.accumulate_gpu_lt[B](
-            self.critic_blk.member_step._mb_q.lt["gpu", lb]()
+            self.critic_blk.member_step._mb_q.tt["gpu", B]()
         )
         self._target_mean_dev.accumulate_gpu_lt[B](
-            self.state.mb_y.lt["gpu", lb]()
+            self.state.mb_y.tt["gpu", B]()
         )
         self._reward_mean_dev.accumulate_gpu_lt[B](
-            self.state.mb_r.lt["gpu", lb]()
+            self.state.mb_r.tt["gpu", B]()
         )
         self._done_mean_dev.accumulate_gpu_lt[B](
-            self.state.mb_d.lt["gpu", lb]()
+            self.state.mb_d.tt["gpu", B]()
         )
         self._abs_action_mean_dev.accumulate_gpu_abs_lt[B * A](
-            self.state.mb_a.lt["gpu", lba]()
+            self.state.mb_a.tt["gpu", B * A]()
         )
 
     def _run_inner_loop_graph(mut self) raises -> Bool:
@@ -543,18 +543,10 @@ struct REDQTrainer[
         N_ENVS: Int
     ](
         mut self,
-        obs: LayoutTensor[
-            DT, Layout.row_major(N_ENVS, Self.AGENT_OBS_DIM), MutAnyOrigin
-        ],
-        action: LayoutTensor[
-            DT, Layout.row_major(N_ENVS, Self.AGENT_ACT_DIM), MutAnyOrigin
-        ],
-        ao_scratch: LayoutTensor[
-            DT, Layout.row_major(N_ENVS, 2 * Self.AGENT_ACT_DIM), MutAnyOrigin
-        ],
-        alp_scratch: LayoutTensor[
-            DT, Layout.row_major(N_ENVS, Self.AGENT_ACT_DIM + 1), MutAnyOrigin
-        ],
+        obs: Tile[DT, N_ENVS, Self.AGENT_OBS_DIM],
+        action: Tile[DT, N_ENVS, Self.AGENT_ACT_DIM],
+        ao_scratch: Tile[DT, N_ENVS, 2 * Self.AGENT_ACT_DIM],
+        alp_scratch: Tile[DT, N_ENVS, Self.AGENT_ACT_DIM + 1],
         step_idx: Int,
     ) raises:
         comptime assert N_ENVS > 0, "N_ENVS must be > 0"

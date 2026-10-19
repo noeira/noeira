@@ -24,7 +24,6 @@ upgrades happen after the code stops round-tripping through slabs.
 """
 
 from max.gpu.host import DeviceContext
-from layout import Layout
 
 from std.math import nan
 
@@ -36,6 +35,7 @@ from ..gpu.constants import CONTACT_SIZE, METADATA_SIZE
 from ..collision.ccd_workspace import (
     CCD_WS_SIZE, COLL_CCD_LANES, COLL_STAGE_SLOTS, coll_flat_words,
 )
+from noeira.core.tiles import RowMajor
 
 
 struct Data[
@@ -57,19 +57,17 @@ struct Data[
     comptime NSITE = Self.D.NSITE
 
     # Per-field view layouts ([BATCH, F] row-major).
-    comptime L_QPOS = Layout.row_major(Self.BATCH, Self.NQ)
-    comptime L_NV = Layout.row_major(Self.BATCH, Self.NV)  # qvel/qacc/qfrc/qfrc_actuator
-    comptime L_B3 = Layout.row_major(Self.BATCH, Self.NBODY * 3)
-    comptime L_B4 = Layout.row_major(Self.BATCH, Self.NBODY * 4)
-    comptime L_B6 = Layout.row_major(Self.BATCH, Self.NBODY * 6)
-    comptime L_B10 = Layout.row_major(Self.BATCH, Self.NBODY * 10)
-    comptime L_CONTACTS = Layout.row_major(
-        Self.BATCH, Self.MAX_CONTACTS * CONTACT_SIZE
-    )
-    comptime L_META = Layout.row_major(Self.BATCH, METADATA_SIZE)
-    comptime L_CCD_WS = Layout.row_major(Self.BATCH * COLL_CCD_LANES, CCD_WS_SIZE)
-    comptime L_COLL_STAGE = Layout.row_major(Self.BATCH, COLL_STAGE_SLOTS * CONTACT_SIZE)
-    comptime L_SITE = Layout.row_major(Self.BATCH, Self.NSITE * 3)
+    comptime L_QPOS = RowMajor[Self.BATCH, Self.NQ]
+    comptime L_NV = RowMajor[Self.BATCH, Self.NV]  # qvel/qacc/qfrc/qfrc_actuator
+    comptime L_B3 = RowMajor[Self.BATCH, Self.NBODY * 3]
+    comptime L_B4 = RowMajor[Self.BATCH, Self.NBODY * 4]
+    comptime L_B6 = RowMajor[Self.BATCH, Self.NBODY * 6]
+    comptime L_B10 = RowMajor[Self.BATCH, Self.NBODY * 10]
+    comptime L_CONTACTS = RowMajor[Self.BATCH, Self.MAX_CONTACTS * CONTACT_SIZE]
+    comptime L_META = RowMajor[Self.BATCH, METADATA_SIZE]
+    comptime L_CCD_WS = RowMajor[Self.BATCH * COLL_CCD_LANES, CCD_WS_SIZE]
+    comptime L_COLL_STAGE = RowMajor[Self.BATCH, COLL_STAGE_SLOTS * CONTACT_SIZE]
+    comptime L_SITE = RowMajor[Self.BATCH, Self.NSITE * 3]
 
     # Joint space
     var qpos: TensorImpl[Self.DTYPE]  # [BATCH, NQ]

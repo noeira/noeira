@@ -15,7 +15,8 @@ Backward (c = grad_out·2/DIM):
 
 from max.gpu import global_idx
 from max.gpu.host import DeviceContext
-from layout import Layout, LayoutTensor, TileTensor, row_major
+from layout import TileTensor, row_major
+from noeira.core.tiles import RowMajor, Tile
 
 from noeira.nn.constants import DT, TPB
 from ..core.tensor import Tensor
@@ -27,10 +28,10 @@ from ..core.amp import AMPPolicy, NoAMP
 
 
 def _mps_forward_kernel[BATCH: Int, DIM: Int](
-    a: LayoutTensor[DT, Layout.row_major(BATCH, DIM), MutAnyOrigin],
-    b: LayoutTensor[DT, Layout.row_major(BATCH, DIM), MutAnyOrigin],
-    o: LayoutTensor[DT, Layout.row_major(BATCH, 1), MutAnyOrigin],
-    diff: LayoutTensor[DT, Layout.row_major(BATCH, DIM), MutAnyOrigin],
+    a: Tile[DT, BATCH, DIM],
+    b: Tile[DT, BATCH, DIM],
+    o: Tile[DT, BATCH, 1],
+    diff: Tile[DT, BATCH, DIM],
 ):
     var r = Int(global_idx.x)
     if r >= BATCH:
@@ -44,10 +45,10 @@ def _mps_forward_kernel[BATCH: Int, DIM: Int](
 
 
 def _mps_backward_kernel[BATCH: Int, DIM: Int](
-    go: LayoutTensor[DT, Layout.row_major(BATCH, 1), MutAnyOrigin],
-    diff: LayoutTensor[DT, Layout.row_major(BATCH, DIM), MutAnyOrigin],
-    ga: LayoutTensor[DT, Layout.row_major(BATCH, DIM), MutAnyOrigin],
-    gb: LayoutTensor[DT, Layout.row_major(BATCH, DIM), MutAnyOrigin],
+    go: Tile[DT, BATCH, 1],
+    diff: Tile[DT, BATCH, DIM],
+    ga: Tile[DT, BATCH, DIM],
+    gb: Tile[DT, BATCH, DIM],
 ):
     var idx = Int(global_idx.x)
     if idx >= BATCH * DIM:
@@ -108,14 +109,14 @@ struct MSEPerSample[DIM_: Int](Module):
             var c = ctx.value()
             out.ensure_gpu(c, B)
             self.cache_diff.ensure_gpu(c, B * Self.DIM_)
-            comptime lay2 = Layout.row_major(B, Self.DIM_)
-            comptime lay1 = Layout.row_major(B, 1)
+            comptime lay2 = RowMajor[B, Self.DIM_]
+            comptime lay1 = RowMajor[B, 1]
             comptime n_blocks = (B + TPB - 1) // TPB
             c.enqueue_function[_mps_forward_kernel[B, Self.DIM_]](
-                a.lt["gpu", lay2](),
-                b.lt["gpu", lay2](),
-                out.lt["gpu", lay1](),
-                self.cache_diff.lt["gpu", lay2](),
+                a.tt["gpu", B, Self.DIM_](),
+                b.tt["gpu", B, Self.DIM_](),
+                out.tt["gpu", B, 1](),
+                self.cache_diff.tt["gpu", B, Self.DIM_](),
                 grid_dim=n_blocks,
                 block_dim=TPB,
             )
@@ -154,14 +155,14 @@ struct MSEPerSample[DIM_: Int](Module):
             var c = ctx.value()
             ga.ensure_gpu(c, B * Self.DIM_)
             gb.ensure_gpu(c, B * Self.DIM_)
-            comptime lay2 = Layout.row_major(B, Self.DIM_)
-            comptime lay1 = Layout.row_major(B, 1)
+            comptime lay2 = RowMajor[B, Self.DIM_]
+            comptime lay1 = RowMajor[B, 1]
             comptime n_blocks = (B * Self.DIM_ + TPB - 1) // TPB
             c.enqueue_function[_mps_backward_kernel[B, Self.DIM_]](
-                grad_output.lt["gpu", lay1](),
-                self.cache_diff.lt["gpu", lay2](),
-                ga.lt["gpu", lay2](),
-                gb.lt["gpu", lay2](),
+                grad_output.tt["gpu", B, 1](),
+                self.cache_diff.tt["gpu", B, Self.DIM_](),
+                ga.tt["gpu", B, Self.DIM_](),
+                gb.tt["gpu", B, Self.DIM_](),
                 grid_dim=n_blocks,
                 block_dim=TPB,
             )

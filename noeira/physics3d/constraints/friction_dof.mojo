@@ -54,7 +54,8 @@ standalone path.
 from std.math import abs
 from max.gpu import thread_idx, block_idx, block_dim
 from max.gpu.host import DeviceContext
-from layout import Layout, LayoutTensor
+from layout import TileTensor, TensorLayout
+from noeira.core.tiles import RowMajor, Tile
 
 from ..joint_types import JNT_FREE, JNT_BALL
 from ..fields import (
@@ -105,26 +106,22 @@ def _friction_env[
     DTYPE: DType,
     NUM_ITERATIONS: Int,
     D: DimsLike,
-    L_QVEL: Layout,
-    L_JOINTS: Layout,
-    L_DOF_INVWEIGHT0: Layout,
-    L_M_INV: Layout,
+    L_QVEL: TensorLayout,
+    L_JOINTS: TensorLayout,
+    L_DOF_INVWEIGHT0: TensorLayout,
+    L_M_INV: TensorLayout,
 ](
     env: Int,
     dims: D,
-    qvel: LayoutTensor[DTYPE, L_QVEL, MutAnyOrigin],
-    joints: LayoutTensor[
-        DTYPE, L_JOINTS, MutAnyOrigin
-    ],
+    qvel: TileTensor[DTYPE, L_QVEL, MutAnyOrigin],
+    joints: TileTensor[DTYPE, L_JOINTS, MutAnyOrigin],
     # ⚠ REFSAFE needs the timestep, and `_friction_env` has no `meta`.
     # Passed as a scalar rather than threading the whole meta tensor: the
     # only thing this row type needs from the model options is `2*dt`.
     timestep: Scalar[DTYPE],
-    dof_invweight0: LayoutTensor[DTYPE, L_DOF_INVWEIGHT0, MutAnyOrigin],
-    m_inv: LayoutTensor[DTYPE, L_M_INV, MutAnyOrigin],
-    qacc_constrained: LayoutTensor[
-        DTYPE, L_QVEL, MutAnyOrigin
-    ],
+    dof_invweight0: TileTensor[DTYPE, L_DOF_INVWEIGHT0, MutAnyOrigin],
+    m_inv: TileTensor[DTYPE, L_M_INV, MutAnyOrigin],
+    qacc_constrained: TileTensor[DTYPE, L_QVEL, MutAnyOrigin],
 ):
     """Build + PGS-solve one friction row per frictional dof, for one env."""
     var nv = dims.get_nv()
@@ -254,15 +251,11 @@ def _friction_fields_kernel[
     BATCH: Int,
     NUM_ITERATIONS: Int,
 ](
-    qvel: LayoutTensor[DTYPE, Layout.row_major(BATCH, NV), MutAnyOrigin],
-    joints: LayoutTensor[
-        DTYPE, Layout.row_major(NJOINT, MODEL_JOINT_SIZE), MutAnyOrigin
-    ],
-    dof_invweight0: LayoutTensor[DTYPE, Layout.row_major(NV), MutAnyOrigin],
-    m_inv: LayoutTensor[DTYPE, Layout.row_major(BATCH, NV * NV), MutAnyOrigin],
-    qacc_constrained: LayoutTensor[
-        DTYPE, Layout.row_major(BATCH, NV), MutAnyOrigin
-    ],
+    qvel: Tile[DTYPE, BATCH, NV],
+    joints: Tile[DTYPE, NJOINT, MODEL_JOINT_SIZE],
+    dof_invweight0: Tile[DTYPE, NV],
+    m_inv: Tile[DTYPE, BATCH, NV * NV],
+    qacc_constrained: Tile[DTYPE, BATCH, NV],
     # A SCALAR, not the meta tensor: the friction rows need exactly `2*dt` from
     # the model options, and a scalar kernel argument is the cheap, capture-safe
     # way to carry it.
@@ -293,10 +286,10 @@ def solve_friction[
     """Solve dry-friction dof rows into `scratch.qacc_constrained`, both
     targets. Mirrors `solve_limits`; used on the CONTACTS=False path, where no
     solver runs and would otherwise call `_friction_env` itself."""
-    comptime L_NV = Layout.row_major(BATCH, D.NV)
-    comptime L_JOINT = Layout.row_major(D.NJOINT, MODEL_JOINT_SIZE)
-    comptime L_DW = Layout.row_major(D.NV)
-    comptime L_M = Layout.row_major(BATCH, D.NV * D.NV)
+    comptime L_NV = RowMajor[BATCH, D.NV]
+    comptime L_JOINT = RowMajor[D.NJOINT, MODEL_JOINT_SIZE]
+    comptime L_DW = RowMajor[D.NV]
+    comptime L_M = RowMajor[BATCH, D.NV * D.NV]
 
     # REFSAFE (defect 23): the friction rows use the HARDCODED default
     # timeconst, and MuJoCo clamps that to 2*timestep like any other. Read once
@@ -309,11 +302,11 @@ def solve_friction[
         var rl_JOINT = rl2(dm.get_njoint(), MODEL_JOINT_SIZE)
         var rl_DW = rl1(dm.get_nv())
         var rl_M = rl2(BATCH, dm.get_nv() * dm.get_nv())
-        var qvel_v = d.qvel.lt_dyn["cpu", DYN2](rl_NV)
-        var joints_v = m.joints.lt_dyn["cpu", DYN2](rl_JOINT)
-        var dw_v = m.dof_invweight0.lt_dyn["cpu", DYN1](rl_DW)
-        var mi_v = scratch.m_inv.lt_dyn["cpu", DYN2](rl_M)
-        var qc_v = scratch.qacc_constrained.lt_dyn["cpu", DYN2](rl_NV)
+        var qvel_v = d.qvel.tt_dyn["cpu", DYN2](rl_NV)
+        var joints_v = m.joints.tt_dyn["cpu", DYN2](rl_JOINT)
+        var dw_v = m.dof_invweight0.tt_dyn["cpu", DYN1](rl_DW)
+        var mi_v = scratch.m_inv.tt_dyn["cpu", DYN2](rl_M)
+        var qc_v = scratch.qacc_constrained.tt_dyn["cpu", DYN2](rl_NV)
         for e in range(BATCH):
             _friction_env[DTYPE, NUM_ITERATIONS](
                 e, dm, qvel_v, joints_v, ts_v, dw_v, mi_v, qc_v
@@ -326,11 +319,11 @@ def solve_friction[
                 DTYPE, D.NQ, D.NV, D.NJOINT, BATCH, NUM_ITERATIONS
             ]
         ](
-            d.qvel.lt["gpu", L_NV](),
-            m.joints.lt["gpu", L_JOINT](),
-            m.dof_invweight0.lt["gpu", L_DW](),
-            scratch.m_inv.lt["gpu", L_M](),
-            scratch.qacc_constrained.lt["gpu", L_NV](),
+            d.qvel.tt["gpu", BATCH, D.NV](),
+            m.joints.tt["gpu", D.NJOINT, MODEL_JOINT_SIZE](),
+            m.dof_invweight0.tt["gpu", D.NV](),
+            scratch.m_inv.tt["gpu", BATCH, D.NV * D.NV](),
+            scratch.qacc_constrained.tt["gpu", BATCH, D.NV](),
             ts_v,
             grid_dim=(BLOCKS,),
             block_dim=(FRIC_TPB,),

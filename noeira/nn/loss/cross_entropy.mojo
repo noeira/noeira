@@ -13,18 +13,18 @@ from std.math import exp, log
 from max.gpu import global_idx, thread_idx
 from max.gpu.primitives import block
 from max.gpu.host import DeviceContext
-from layout import Layout, LayoutTensor
 
 from noeira.nn.constants import DT, TPB, TPB_REDUCE
 from ..core.tensor import Tensor
+from noeira.core.tiles import Tile
 
 
 def _ce_fwd_kernel[
     BATCH: Int, NC: Int
 ](
-    logits: LayoutTensor[DT, Layout.row_major(BATCH, NC), MutAnyOrigin],
-    targets: LayoutTensor[DT, Layout.row_major(BATCH, NC), MutAnyOrigin],
-    partial: LayoutTensor[DT, Layout.row_major(BATCH), MutAnyOrigin],
+    logits: Tile[DT, BATCH, NC],
+    targets: Tile[DT, BATCH, NC],
+    partial: Tile[DT, BATCH],
 ):
     var b = Int(global_idx.x)
     if b < BATCH:
@@ -48,8 +48,8 @@ def _ce_fwd_kernel[
 def _ce_reduce_kernel[
     BATCH: Int
 ](
-    partial: LayoutTensor[DT, Layout.row_major(BATCH), MutAnyOrigin],
-    acc: LayoutTensor[DT, Layout.row_major(2), MutAnyOrigin],
+    partial: Tile[DT, BATCH],
+    acc: Tile[DT, 2],
 ):
     var t = Int(thread_idx.x)
     var my_sum: Scalar[DT] = 0.0
@@ -66,9 +66,9 @@ def _ce_reduce_kernel[
 def _ce_bwd_kernel[
     BATCH: Int, NC: Int
 ](
-    logits: LayoutTensor[DT, Layout.row_major(BATCH, NC), MutAnyOrigin],
-    targets: LayoutTensor[DT, Layout.row_major(BATCH, NC), MutAnyOrigin],
-    grad: LayoutTensor[DT, Layout.row_major(BATCH, NC), MutAnyOrigin],
+    logits: Tile[DT, BATCH, NC],
+    targets: Tile[DT, BATCH, NC],
+    grad: Tile[DT, BATCH, NC],
 ):
     # one thread per row: recompute softmax, then grad = (softmax - target)/B
     var b = Int(global_idx.x)
@@ -146,9 +146,9 @@ struct CrossEntropyLoss[NC_: Int](Movable & Deinitable):
             self.partial.ensure_gpu(c, B)
             comptime nblk = (B + TPB_REDUCE - 1) // TPB_REDUCE
             c.enqueue_function[_ce_fwd_kernel[B, Self.NC_]](
-                logits.lt["gpu", Layout.row_major(B, Self.NC_)](),
-                targets.lt["gpu", Layout.row_major(B, Self.NC_)](),
-                self.partial.lt["gpu", Layout.row_major(B)](),
+                logits.tt["gpu", B, Self.NC_](),
+                targets.tt["gpu", B, Self.NC_](),
+                self.partial.tt["gpu", B](),
                 grid_dim=nblk,
                 block_dim=TPB_REDUCE,
             )
@@ -174,15 +174,15 @@ struct CrossEntropyLoss[NC_: Int](Movable & Deinitable):
             self.partial.ensure_gpu(c, B)
             comptime nblk = (B + TPB_REDUCE - 1) // TPB_REDUCE
             c.enqueue_function[_ce_fwd_kernel[B, Self.NC_]](
-                logits.lt["gpu", Layout.row_major(B, Self.NC_)](),
-                targets.lt["gpu", Layout.row_major(B, Self.NC_)](),
-                self.partial.lt["gpu", Layout.row_major(B)](),
+                logits.tt["gpu", B, Self.NC_](),
+                targets.tt["gpu", B, Self.NC_](),
+                self.partial.tt["gpu", B](),
                 grid_dim=nblk,
                 block_dim=TPB_REDUCE,
             )
             c.enqueue_function[_ce_reduce_kernel[B]](
-                self.partial.lt["gpu", Layout.row_major(B)](),
-                self.loss_acc.lt["gpu", Layout.row_major(2)](),
+                self.partial.tt["gpu", B](),
+                self.loss_acc.tt["gpu", 2](),
                 grid_dim=1,
                 block_dim=TPB_REDUCE,
             )
@@ -241,9 +241,9 @@ struct CrossEntropyLoss[NC_: Int](Movable & Deinitable):
             grad.ensure_gpu(c, M)
             comptime nblk = (B + TPB_REDUCE - 1) // TPB_REDUCE
             c.enqueue_function[_ce_bwd_kernel[B, Self.NC_]](
-                logits.lt["gpu", Layout.row_major(B, Self.NC_)](),
-                targets.lt["gpu", Layout.row_major(B, Self.NC_)](),
-                grad.lt["gpu", Layout.row_major(B, Self.NC_)](),
+                logits.tt["gpu", B, Self.NC_](),
+                targets.tt["gpu", B, Self.NC_](),
+                grad.tt["gpu", B, Self.NC_](),
                 grid_dim=nblk,
                 block_dim=TPB_REDUCE,
             )

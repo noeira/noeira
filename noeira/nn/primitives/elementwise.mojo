@@ -32,7 +32,6 @@ default `ADT = DT` reproduces the legacy fp32 kernels byte-for-byte.
 
 from max.gpu import global_idx
 from max.gpu.host import DeviceContext
-from layout import Layout, LayoutTensor
 
 from noeira.nn.constants import DT, CPU_SIMD_W, TPB
 from noeira.nn.core.element_op import ElementOp
@@ -42,6 +41,7 @@ from ..core.module import Module
 from ..core.param import ParamVisitor
 from ..core.initializer import Initializer
 from ..core.amp import AMPPolicy, NoAMP
+from noeira.core.tiles import Tile
 
 
 # ── GPU kernels (OP supplies the math via comptime) ─────────────────────
@@ -52,8 +52,8 @@ from ..core.amp import AMPPolicy, NoAMP
 def _ew_fwd_kernel[
     M: Int, OP: ElementOp, ADT: DType = DT
 ](
-    x: LayoutTensor[ADT, Layout.row_major(M), MutAnyOrigin],
-    o: LayoutTensor[ADT, Layout.row_major(M), MutAnyOrigin],
+    x: Tile[ADT, M],
+    o: Tile[ADT, M],
 ):
     var i = Int(global_idx.x)
     if i < M:
@@ -70,9 +70,9 @@ def _ew_fwd_kernel[
 def _ew_bwd_kernel[
     M: Int, OP: ElementOp, ADT: DType = DT
 ](
-    x: LayoutTensor[ADT, Layout.row_major(M), MutAnyOrigin],
-    go: LayoutTensor[ADT, Layout.row_major(M), MutAnyOrigin],
-    gi: LayoutTensor[ADT, Layout.row_major(M), MutAnyOrigin],
+    x: Tile[ADT, M],
+    go: Tile[ADT, M],
+    gi: Tile[ADT, M],
 ):
     var i = Int(global_idx.x)
     if i < M:
@@ -160,8 +160,8 @@ struct Elementwise[DIM_: Int, OP: ElementOp, ADT: DType = DT](Module):
                 outd.ensure_gpu(c, M)
                 comptime nblk = (M + TPB - 1) // TPB
                 c.enqueue_function[_ew_fwd_kernel[M, Self.OP, Self.ADT]](
-                    in0d.lt["gpu", Layout.row_major(M)](),
-                    outd.lt["gpu", Layout.row_major(M)](),
+                    in0d.tt["gpu", M](),
+                    outd.tt["gpu", M](),
                     grid_dim=nblk,
                     block_dim=TPB,
                 )
@@ -175,8 +175,8 @@ struct Elementwise[DIM_: Int, OP: ElementOp, ADT: DType = DT](Module):
             out.ensure_gpu(c, M)
             comptime nblk = (M + TPB - 1) // TPB
             c.enqueue_function[_ew_fwd_kernel[M, Self.OP, Self.ADT]](
-                in0.lt["gpu", Layout.row_major(M)](),
-                out.lt["gpu", Layout.row_major(M)](),
+                in0.tt["gpu", M](),
+                out.tt["gpu", M](),
                 grid_dim=nblk,
                 block_dim=TPB,
             )
@@ -234,9 +234,9 @@ struct Elementwise[DIM_: Int, OP: ElementOp, ADT: DType = DT](Module):
                 gind.ensure_gpu(c, M)
                 comptime nblk = (M + TPB - 1) // TPB
                 c.enqueue_function[_ew_bwd_kernel[M, Self.OP, Self.ADT]](
-                    find.lt["gpu", Layout.row_major(M)](),
-                    god.lt["gpu", Layout.row_major(M)](),
-                    gind.lt["gpu", Layout.row_major(M)](),
+                    find.tt["gpu", M](),
+                    god.tt["gpu", M](),
+                    gind.tt["gpu", M](),
                     grid_dim=nblk,
                     block_dim=TPB,
                 )
@@ -250,9 +250,9 @@ struct Elementwise[DIM_: Int, OP: ElementOp, ADT: DType = DT](Module):
             gin.ensure_gpu(c, M)
             comptime nblk = (M + TPB - 1) // TPB
             c.enqueue_function[_ew_bwd_kernel[M, Self.OP, Self.ADT]](
-                fin.lt["gpu", Layout.row_major(M)](),
-                grad_output.lt["gpu", Layout.row_major(M)](),
-                gin.lt["gpu", Layout.row_major(M)](),
+                fin.tt["gpu", M](),
+                grad_output.tt["gpu", M](),
+                gin.tt["gpu", M](),
                 grid_dim=nblk,
                 block_dim=TPB,
             )

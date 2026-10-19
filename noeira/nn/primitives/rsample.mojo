@@ -25,7 +25,6 @@ from std.random import random_float64
 from std.math import sqrt as fsqrt, log as flog, cos as fcos, pi
 from max.gpu import global_idx
 from max.gpu.host import DeviceContext
-from layout import Layout, LayoutTensor
 
 from noeira.nn.constants import DT, TPB
 from noeira.nn.random.box_muller import (
@@ -38,6 +37,7 @@ from ..core.module import Module
 from ..core.param import ParamVisitor
 from ..core.initializer import Initializer
 from ..core.amp import AMPPolicy, NoAMP
+from noeira.core.tiles import Tile
 
 
 comptime LOG_STD_MIN: Scalar[DT] = -5.0
@@ -81,11 +81,9 @@ def _draw_normal_cpu(mut buf: List[Scalar[DT]], n: Int):
 def _rsample_fwd_kernel[
     ACT: Int, BATCH: Int, OUT: Int
 ](
-    actor_output: LayoutTensor[
-        DT, Layout.row_major(BATCH, 2 * ACT), MutAnyOrigin
-    ],
-    z: LayoutTensor[DT, Layout.row_major(BATCH, ACT), MutAnyOrigin],
-    output: LayoutTensor[DT, Layout.row_major(BATCH, OUT), MutAnyOrigin],
+    actor_output: Tile[DT, BATCH, 2 * ACT],
+    z: Tile[DT, BATCH, ACT],
+    output: Tile[DT, BATCH, OUT],
     action_scale: Scalar[DT],
 ):
     var b = Int(global_idx.x)
@@ -112,12 +110,10 @@ def _rsample_fwd_kernel[
 def _rsample_bwd_kernel[
     ACT: Int, BATCH: Int, OUT: Int
 ](
-    actor_output: LayoutTensor[
-        DT, Layout.row_major(BATCH, 2 * ACT), MutAnyOrigin
-    ],
-    z: LayoutTensor[DT, Layout.row_major(BATCH, ACT), MutAnyOrigin],
-    grad_out: LayoutTensor[DT, Layout.row_major(BATCH, OUT), MutAnyOrigin],
-    grad_in: LayoutTensor[DT, Layout.row_major(BATCH, 2 * ACT), MutAnyOrigin],
+    actor_output: Tile[DT, BATCH, 2 * ACT],
+    z: Tile[DT, BATCH, ACT],
+    grad_out: Tile[DT, BATCH, OUT],
+    grad_in: Tile[DT, BATCH, 2 * ACT],
     action_scale: Scalar[DT],
 ):
     var idx = Int(global_idx.x)
@@ -231,22 +227,22 @@ struct RSample[ACT_: Int](Module):
             comptime NZ = B * Self.ACT_
             comptime nb_z = (NZ + TPB - 1) // TPB
             c.enqueue_function[_box_muller_kernel_dev[NZ]](
-                self.z.lt["gpu", Layout.row_major(NZ)](),
+                self.z.tt["gpu", NZ](),
                 self.noise_seed,
-                self.noise_offset.lt["gpu", Layout.row_major(1)](),
+                self.noise_offset.tt["gpu", 1](),
                 grid_dim=nb_z,
                 block_dim=TPB,
             )
             c.enqueue_function[advance_rng_offset_kernel[((NZ + 1) // 2) * 2]](
-                self.noise_offset.lt["gpu", Layout.row_major(1)](),
+                self.noise_offset.tt["gpu", 1](),
                 grid_dim=1,
                 block_dim=1,
             )
             comptime nb_b = (B + TPB - 1) // TPB
             c.enqueue_function[_rsample_fwd_kernel[Self.ACT_, B, OUT]](
-                ao.lt["gpu", Layout.row_major(B, AO)](),
-                self.z.lt["gpu", Layout.row_major(B, Self.ACT_)](),
-                out.lt["gpu", Layout.row_major(B, OUT)](),
+                ao.tt["gpu", B, AO](),
+                self.z.tt["gpu", B, Self.ACT_](),
+                out.tt["gpu", B, OUT](),
                 self.action_scale,
                 grid_dim=nb_b,
                 block_dim=TPB,
@@ -305,10 +301,10 @@ struct RSample[ACT_: Int](Module):
             gin.ensure_gpu(c, B * AO)
             comptime nb = (B * Self.ACT_ + TPB - 1) // TPB
             c.enqueue_function[_rsample_bwd_kernel[Self.ACT_, B, OUT]](
-                ao.lt["gpu", Layout.row_major(B, AO)](),
-                self.z.lt["gpu", Layout.row_major(B, Self.ACT_)](),
-                grad_output.lt["gpu", Layout.row_major(B, OUT)](),
-                gin.lt["gpu", Layout.row_major(B, AO)](),
+                ao.tt["gpu", B, AO](),
+                self.z.tt["gpu", B, Self.ACT_](),
+                grad_output.tt["gpu", B, OUT](),
+                gin.tt["gpu", B, AO](),
                 self.action_scale,
                 grid_dim=nb,
                 block_dim=TPB,

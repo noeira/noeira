@@ -35,7 +35,8 @@ from max.gpu import global_idx, thread_idx, block_idx
 from max.gpu.primitives import block
 from max.gpu.host import DeviceContext
 from std.random.philox import Random as PhiloxRandom
-from layout import Layout, LayoutTensor, TileTensor, row_major
+from layout import TileTensor, row_major
+from noeira.core.tiles import RowMajor, Tile
 
 from noeira.nn.constants import DT
 from ..core.tensor import Tensor
@@ -70,10 +71,10 @@ def _kept(
 def _mae_fwd_kernel[
     BATCH: Int, NP: Int, D: Int, SEED: UInt64
 ](
-    input: LayoutTensor[DT, Layout.row_major(BATCH, NP * D), MutAnyOrigin],
-    mask_token: LayoutTensor[DT, Layout.row_major(D), MutAnyOrigin],
-    output: LayoutTensor[DT, Layout.row_major(BATCH, NP * D), MutAnyOrigin],
-    keep: LayoutTensor[DT, Layout.row_major(BATCH * NP), MutAnyOrigin],
+    input: Tile[DT, BATCH, NP * D],
+    mask_token: Tile[DT, D],
+    output: Tile[DT, BATCH, NP * D],
+    keep: Tile[DT, BATCH * NP],
     base: UInt64, pmin: Scalar[DT], span: Scalar[DT],
 ):
     var idx = Int(global_idx.x)
@@ -95,8 +96,8 @@ def _mae_fwd_kernel[
 def _mae_grad_input_kernel[
     BATCH: Int, NP: Int, D: Int, SEED: UInt64
 ](
-    grad_output: LayoutTensor[DT, Layout.row_major(BATCH, NP * D), MutAnyOrigin],
-    grad_input: LayoutTensor[DT, Layout.row_major(BATCH, NP * D), MutAnyOrigin],
+    grad_output: Tile[DT, BATCH, NP * D],
+    grad_input: Tile[DT, BATCH, NP * D],
     base: UInt64, pmin: Scalar[DT], span: Scalar[DT],
 ):
     var idx = Int(global_idx.x)
@@ -114,8 +115,8 @@ def _mae_grad_input_kernel[
 def _mae_grad_token_kernel[
     BATCH: Int, NP: Int, D: Int, SEED: UInt64
 ](
-    grad_output: LayoutTensor[DT, Layout.row_major(BATCH, NP * D), MutAnyOrigin],
-    grad_token: LayoutTensor[DT, Layout.row_major(D), MutAnyOrigin],
+    grad_output: Tile[DT, BATCH, NP * D],
+    grad_token: Tile[DT, D],
     base: UInt64, pmin: Scalar[DT], span: Scalar[DT],
 ):
     # One block per channel d; threads reduce over dropped (bt, i) patches.
@@ -231,16 +232,16 @@ struct MAEReplacer[
             var c = ctx.value()
             out.ensure_gpu(c, B * Self.OUT_DIM)
             self.keep.ensure_gpu(c, B * Self.NP)
-            comptime lbo = Layout.row_major(B, Self.NP * Self.D)
-            comptime ld = Layout.row_major(Self.D)
-            comptime lk = Layout.row_major(B * Self.NP)
+            comptime lbo = RowMajor[B, Self.NP * Self.D]
+            comptime ld = RowMajor[Self.D]
+            comptime lk = RowMajor[B * Self.NP]
             comptime nb = (B * Self.NP * Self.D + 127) // 128
             comptime kern = _mae_fwd_kernel[B, Self.NP, Self.D, Self.SEED]
             c.enqueue_function[kern](
-                in0.lt["gpu", lbo](),
-                self.mask_token.val.lt["gpu", ld](),
-                out.lt["gpu", lbo](),
-                self.keep.lt["gpu", lk](),
+                in0.tt["gpu", B, Self.NP * Self.D](),
+                self.mask_token.val.tt["gpu", Self.D](),
+                out.tt["gpu", B, Self.NP * Self.D](),
+                self.keep.tt["gpu", B * Self.NP](),
                 base, pmin, span,
                 grid_dim=nb, block_dim=128,
             )
@@ -283,23 +284,23 @@ struct MAEReplacer[
         else:
             var c = ctx.value()
             gin.ensure_gpu(c, B * Self.OUT_DIM)
-            comptime lbo = Layout.row_major(B, Self.NP * Self.D)
-            comptime ld = Layout.row_major(Self.D)
+            comptime lbo = RowMajor[B, Self.NP * Self.D]
+            comptime ld = RowMajor[Self.D]
             comptime nb = (B * Self.NP * Self.D + 127) // 128
             comptime gik = _mae_grad_input_kernel[
                 B, Self.NP, Self.D, Self.SEED
             ]
             c.enqueue_function[gik](
-                grad_output.lt["gpu", lbo](),
-                gin.lt["gpu", lbo](),
+                grad_output.tt["gpu", B, Self.NP * Self.D](),
+                gin.tt["gpu", B, Self.NP * Self.D](),
                 base, pmin, span, grid_dim=nb, block_dim=128,
             )
             comptime gtk = _mae_grad_token_kernel[
                 B, Self.NP, Self.D, Self.SEED
             ]
             c.enqueue_function[gtk](
-                grad_output.lt["gpu", lbo](),
-                self.mask_token.grd.lt["gpu", ld](),
+                grad_output.tt["gpu", B, Self.NP * Self.D](),
+                self.mask_token.grd.tt["gpu", Self.D](),
                 base, pmin, span,
                 grid_dim=Self.D, block_dim=MAE_RTPB,
             )

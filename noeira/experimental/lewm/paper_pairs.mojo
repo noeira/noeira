@@ -24,11 +24,11 @@ same way — kept here once, not twice:
 
 from std.math import sqrt, cos, sin, log, pi, abs
 from std.random.philox import Random as PhiloxRandom
-from layout import Layout, LayoutTensor
 
 from noeira.nn.constants import DT
 from noeira.envs.pusht import PushTEnv, PConstants
 from noeira.envs.pusht.render_swm import render_pusht_swm_at, render_pusht_swm_canvas_goal
+from noeira.core.tiles import tile
 
 
 comptime PAIR_IMG = 224
@@ -54,9 +54,7 @@ def render_frame(mut env: PairEnv) raises -> List[Scalar[DT]]:
     var ag = env.agent_pos()
     var bp = env.block_pose()
     var buf = List[Scalar[DT]](length=PAIR_HW * 3, fill=Scalar[DT](0))
-    var pix = LayoutTensor[DT, Layout.row_major(PAIR_IMG, PAIR_IMG, 3), MutAnyOrigin](
-        rebind[Pointer[Scalar[DT], MutAnyOrigin]](buf.unsafe_ptr())
-    )
+    var pix = tile[PAIR_IMG, PAIR_IMG, 3](rebind[Pointer[Scalar[DT], MutAnyOrigin]](buf.unsafe_ptr()))
     render_pusht_swm_at[PAIR_IMG](
         rebind[Scalar[DT]](bp[0]), rebind[Scalar[DT]](bp[1]), rebind[Scalar[DT]](bp[2]),
         rebind[Scalar[DT]](ag[0]), rebind[Scalar[DT]](ag[1]), pix,

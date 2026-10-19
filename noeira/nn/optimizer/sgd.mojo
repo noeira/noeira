@@ -11,7 +11,6 @@ Update: `if decay: g += wd·p ; p -= lr·g`.
 
 from max.gpu import global_idx
 from max.gpu.host import DeviceContext
-from layout import Layout, LayoutTensor
 
 from noeira.nn.constants import DT, TPB
 from ..core.tensor import Tensor

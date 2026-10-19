@@ -13,10 +13,10 @@ extractors as they are ported; this covers the default-obs family
 
 from max.gpu import thread_idx, block_idx, block_dim
 from max.gpu.host import DeviceContext
-from layout import Layout, LayoutTensor
 
 from noeira.nn.core.tensor import TensorImpl
 from noeira.physics3d.fields import Data, Dims, DimsLike
+from noeira.core.tiles import RowMajor, Tile
 
 comptime OBS_TPB: Int = 64
 
@@ -30,13 +30,9 @@ def _obs_qpos_qvel_env[
     BATCH: Int,
 ](
     env: Int,
-    qpos: LayoutTensor[DTYPE, Layout.row_major(BATCH, NQ), MutAnyOrigin],
-    qvel: LayoutTensor[DTYPE, Layout.row_major(BATCH, NV), MutAnyOrigin],
-    obs: LayoutTensor[
-        DTYPE,
-        Layout.row_major(BATCH, NQ - OBS_QPOS_SKIP + NV),
-        MutAnyOrigin,
-    ],
+    qpos: Tile[DTYPE, BATCH, NQ],
+    qvel: Tile[DTYPE, BATCH, NV],
+    obs: Tile[DTYPE, BATCH, NQ - OBS_QPOS_SKIP + NV],
 ):
     comptime NQO = NQ - OBS_QPOS_SKIP
     for i in range(NQO):
@@ -52,13 +48,9 @@ def _obs_qpos_qvel_kernel[
     OBS_QPOS_SKIP: Int,
     BATCH: Int,
 ](
-    qpos: LayoutTensor[DTYPE, Layout.row_major(BATCH, NQ), MutAnyOrigin],
-    qvel: LayoutTensor[DTYPE, Layout.row_major(BATCH, NV), MutAnyOrigin],
-    obs: LayoutTensor[
-        DTYPE,
-        Layout.row_major(BATCH, NQ - OBS_QPOS_SKIP + NV),
-        MutAnyOrigin,
-    ],
+    qpos: Tile[DTYPE, BATCH, NQ],
+    qvel: Tile[DTYPE, BATCH, NV],
+    obs: Tile[DTYPE, BATCH, NQ - OBS_QPOS_SKIP + NV],
 ):
     var env = Int(block_dim.x * block_idx.x + thread_idx.x)
     if env >= BATCH:
@@ -81,14 +73,14 @@ def extract_obs_qpos_qvel[
 ) raises:
     """Default obs (qpos[SKIP:] ‖ qvel) into a caller-owned obs tensor,
     both targets, one body."""
-    comptime L_QPOS = Layout.row_major(BATCH, D.NQ)
-    comptime L_NV = Layout.row_major(BATCH, D.NV)
-    comptime L_OBS = Layout.row_major(BATCH, D.NQ - OBS_QPOS_SKIP + D.NV)
+    comptime L_QPOS = RowMajor[BATCH, D.NQ]
+    comptime L_NV = RowMajor[BATCH, D.NV]
+    comptime L_OBS = RowMajor[BATCH, D.NQ - OBS_QPOS_SKIP + D.NV]
 
     comptime if target == "cpu":
-        var qpos_v = d.qpos.lt["cpu", L_QPOS]()
-        var qvel_v = d.qvel.lt["cpu", L_NV]()
-        var obs_v = obs.lt["cpu", L_OBS]()
+        var qpos_v = d.qpos.tt["cpu", BATCH, D.NQ]()
+        var qvel_v = d.qvel.tt["cpu", BATCH, D.NV]()
+        var obs_v = obs.tt["cpu", BATCH, D.NQ - OBS_QPOS_SKIP + D.NV]()
         for e in range(BATCH):
             _obs_qpos_qvel_env[DTYPE, D.NQ, D.NV, OBS_QPOS_SKIP, BATCH](
                 e, qpos_v, qvel_v, obs_v
@@ -99,9 +91,9 @@ def extract_obs_qpos_qvel[
         c.enqueue_function[
             _obs_qpos_qvel_kernel[DTYPE, D.NQ, D.NV, OBS_QPOS_SKIP, BATCH]
         ](
-            d.qpos.lt["gpu", L_QPOS](),
-            d.qvel.lt["gpu", L_NV](),
-            obs.lt["gpu", L_OBS](),
+            d.qpos.tt["gpu", BATCH, D.NQ](),
+            d.qvel.tt["gpu", BATCH, D.NV](),
+            obs.tt["gpu", BATCH, D.NQ - OBS_QPOS_SKIP + D.NV](),
             grid_dim=(BLOCKS,),
             block_dim=(OBS_TPB,),
         )

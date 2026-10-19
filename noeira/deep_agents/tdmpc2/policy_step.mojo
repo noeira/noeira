@@ -19,7 +19,6 @@ agent's comptime dispatch supplies the random Q pair as DISTINCT fields.
 
 from max.gpu import global_idx
 from max.gpu.host import DeviceContext
-from layout import Layout, LayoutTensor
 
 from noeira.nn.constants import DT, TPB
 from noeira.nn.core.tensor import Tensor
@@ -30,11 +29,12 @@ from noeira.deep_agents.loss.seed_grad_inv_batch import seed_grad_inv_batch
 from .nets import TDMPC2Policy, TDMPC2QNet
 from .policy_graph import TDMPC2PolicyGraph
 from .running_scale import RunningScale
+from noeira.core.tiles import Tile
 
 
 def _scale_copy_k[N: Int](
-    src: LayoutTensor[DT, Layout.row_major(N), MutAnyOrigin],
-    dst: LayoutTensor[DT, Layout.row_major(N), MutAnyOrigin],
+    src: Tile[DT, N],
+    dst: Tile[DT, N],
     f: Scalar[DT],
 ):
     var i = Int(global_idx.x)
@@ -161,8 +161,8 @@ struct PolicyStep[
             # qsum lives in the graph pool; copy·0.5 into the loss-sized device
             # scratch via grad (reused before vjp seeds it).
             c.enqueue_function[_scale_copy_k[BB]](
-                qsum.lt["gpu", Layout.row_major(BB)](),
-                self.grad.lt["gpu", Layout.row_major(BB)](),
+                qsum.tt["gpu", BB](),
+                self.grad.tt["gpu", BB](),
                 Scalar[DT](0.5),
                 grid_dim=nb, block_dim=TPB,
             )
@@ -190,7 +190,7 @@ struct PolicyStep[
         # backward (seed = 1/B) + policy step. Grad flows through the Q heads
         # (param grads discarded) into the policy (stepped).
         seed_grad_inv_batch[target, BB](
-            self.grad.lt[target, Layout.row_major(BB, 1)](), ctx=ctx
+            self.grad.tt[target, BB, 1](), ctx=ctx
         )
         self.graph.vjp[BB, target](self.grad, ctx, policy, q_a, q_b)
         pi_opt.step[target, M=Self.PolicyT](policy, ctx)

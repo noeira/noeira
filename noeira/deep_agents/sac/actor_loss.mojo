@@ -38,7 +38,6 @@ puts λ around `mean|Q| / 2.5` ≈ 40.
 from max.gpu import thread_idx
 from max.gpu.primitives import block
 from max.gpu.host import DeviceContext, DeviceBuffer
-from layout import Layout, LayoutTensor
 
 from noeira.nn.constants import DT, TPB_REDUCE
 from noeira.nn.core.amp import AMPPolicy, NoAMP
@@ -61,6 +60,7 @@ comptime BinaryAdd[DIM: Int] = BinaryElementwise[DIM, BinaryAddOp]
 from noeira.nn.combinators.compute_graph import ComputeGraph
 from noeira.nn.combinators.graph_decl import InputSlot, Node, ExternalNode
 from ..loss.loss_block import LossBlock
+from noeira.core.tiles import Tile
 
 
 # ── Device reductions (single-block; launch grid=1, block=TPB_REDUCE) ──
@@ -71,8 +71,8 @@ from ..loss.loss_block import LossBlock
 def reduce_mean_write_kernel[
     B: Int
 ](
-    src: LayoutTensor[DT, Layout.row_major(B, 1), MutAnyOrigin],
-    dst: LayoutTensor[DT, Layout.row_major(1, 1), MutAnyOrigin],
+    src: Tile[DT, B, 1],
+    dst: Tile[DT, 1, 1],
 ):
     var t = Int(thread_idx.x)
     var my_sum: Scalar[DT] = 0.0
@@ -88,8 +88,8 @@ def reduce_mean_write_kernel[
 def reduce_mean_acc_kernel[
     B: Int
 ](
-    src: LayoutTensor[DT, Layout.row_major(B, 1), MutAnyOrigin],
-    acc: LayoutTensor[DT, Layout.row_major(1, 2), MutAnyOrigin],
+    src: Tile[DT, B, 1],
+    acc: Tile[DT, 1, 2],
 ):
     var t = Int(thread_idx.x)
     var my_sum: Scalar[DT] = 0.0
@@ -342,12 +342,10 @@ struct SACActorLoss[
             var c = ctx.value()
             # Materialize the detached (MutAnyOrigin) device views first, so no
             # `self` field borrow is held across the launch.
-            var logp_v = self.graph.node_output["logp"]().lt[
-                "gpu", Layout.row_major(BB, 1)
-            ]()
-            var lp_mean_v = self._lp_mean.lt["gpu", Layout.row_major(1, 1)]()
-            var loss_v = self._loss_out.lt["gpu", Layout.row_major(BB, 1)]()
-            var loss_acc_v = self._loss_acc.lt["gpu", Layout.row_major(1, 2)]()
+            var logp_v = self.graph.node_output["logp"]().tt["gpu", BB, 1]()
+            var lp_mean_v = self._lp_mean.tt["gpu", 1, 1]()
+            var loss_v = self._loss_out.tt["gpu", BB, 1]()
+            var loss_acc_v = self._loss_acc.tt["gpu", 1, 2]()
             c.enqueue_function[reduce_mean_write_kernel[BB]](
                 logp_v,
                 lp_mean_v,

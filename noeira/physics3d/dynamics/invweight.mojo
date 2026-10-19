@@ -35,7 +35,6 @@ missing fraction. Fixed 2026-07-31 after dm_control's ball_in_cup measured
 CPU-only (build-time); no GPU kernels needed.
 """
 
-from layout import Layout, LayoutTensor
 
 from noeira.physics3d.fields import (
     Data,
@@ -507,16 +506,16 @@ def compute_invweight0[
         var rl_B4_V = rl2(1, dm.get_nbody() * 4)
         var rl_CDOF_V = rl2(1, dm.get_nv() * 6)
 
-        var meta_v = mf.meta.lt_dyn["cpu", DYN1](rl_META)
-        var ten_v = mf.tendons.lt_dyn["cpu", DYN2](rl_TEN)
-        var site_v = mf.sites.lt_dyn["cpu", DYN2](rl_SITE)
-        var geoms_v = mf.geoms.lt_dyn["cpu", DYN2](rl_GEOM_V)
-        var bodies_v = mf.bodies.lt_dyn["cpu", DYN2](rl_BODY_V)
-        var joints_v = mf.joints.lt_dyn["cpu", DYN2](rl_JOINT_V)
-        var stcom_v = d.subtree_com.lt_dyn["cpu", DYN2](rl_B3_V)
-        var xpos_v = d.xpos.lt_dyn["cpu", DYN2](rl_B3_V)
-        var xquat_v = d.xquat.lt_dyn["cpu", DYN2](rl_B4_V)
-        var cdof_v = sc.cdof.lt_dyn["cpu", DYN2](rl_CDOF_V)
+        var meta_v = mf.meta.tt_dyn["cpu", DYN1](rl_META)
+        var ten_v = mf.tendons.tt_dyn["cpu", DYN2](rl_TEN)
+        var site_v = mf.sites.tt_dyn["cpu", DYN2](rl_SITE)
+        var geoms_v = mf.geoms.tt_dyn["cpu", DYN2](rl_GEOM_V)
+        var bodies_v = mf.bodies.tt_dyn["cpu", DYN2](rl_BODY_V)
+        var joints_v = mf.joints.tt_dyn["cpu", DYN2](rl_JOINT_V)
+        var stcom_v = d.subtree_com.tt_dyn["cpu", DYN2](rl_B3_V)
+        var xpos_v = d.xpos.tt_dyn["cpu", DYN2](rl_B3_V)
+        var xquat_v = d.xquat.tt_dyn["cpu", DYN2](rl_B4_V)
+        var cdof_v = sc.cdof.tt_dyn["cpu", DYN2](rl_CDOF_V)
 
         var tJ = Scratch[Scalar[DTYPE], cap[D.NV]()](nv, fill=Scalar[DTYPE](0))
         for t in range(ntendon):

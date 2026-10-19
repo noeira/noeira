@@ -41,10 +41,10 @@ the call as needed. A `use_n_step: Bool` Saveable config flag in
 
 from max.gpu import block_dim, block_idx, thread_idx
 from max.gpu.host import DeviceContext, DeviceBuffer
-from layout import Layout, LayoutTensor
 
 from noeira.nn.constants import DT, TPB
 from ..training.replay_buffer import ReplayBuffer
+from noeira.core.tiles import Tile, tile
 
 
 # ──────────────────────────────────────────────────────────────────────
@@ -218,46 +218,14 @@ def _nstep_decide_kernel[
     N_ENVS: Int,
     N: Int,
 ](
-    in_rew: LayoutTensor[
-        DT,
-        Layout.row_major(N_ENVS),
-        MutAnyOrigin,
-    ],
-    in_done: LayoutTensor[
-        DT,
-        Layout.row_major(N_ENVS),
-        MutAnyOrigin,
-    ],
-    ring_rew: LayoutTensor[
-        DT,
-        Layout.row_major(N_ENVS, N),
-        MutAnyOrigin,
-    ],
-    counts: LayoutTensor[
-        DType.int32,
-        Layout.row_major(N_ENVS),
-        MutAnyOrigin,
-    ],
-    out_rew: LayoutTensor[
-        DT,
-        Layout.row_major(N_ENVS),
-        MutAnyOrigin,
-    ],
-    out_done: LayoutTensor[
-        DT,
-        Layout.row_major(N_ENVS),
-        MutAnyOrigin,
-    ],
-    out_valid: LayoutTensor[
-        DType.int32,
-        Layout.row_major(N_ENVS),
-        MutAnyOrigin,
-    ],
-    proc_slot: LayoutTensor[
-        DType.int32,
-        Layout.row_major(N_ENVS),
-        MutAnyOrigin,
-    ],
+    in_rew: Tile[DT, N_ENVS],
+    in_done: Tile[DT, N_ENVS],
+    ring_rew: Tile[DT, N_ENVS, N],
+    counts: Tile[DType.int32, N_ENVS],
+    out_rew: Tile[DT, N_ENVS],
+    out_done: Tile[DT, N_ENVS],
+    out_valid: Tile[DType.int32, N_ENVS],
+    proc_slot: Tile[DType.int32, N_ENVS],
     gamma: Scalar[DT],
 ):
     """Phase 1 of the n-step process split — one thread per env (cheap
@@ -308,56 +276,16 @@ def _nstep_copy_kernel[
     OBS: Int,
     ACT: Int,
 ](
-    in_obs: LayoutTensor[
-        DT,
-        Layout.row_major(N_ENVS, OBS),
-        MutAnyOrigin,
-    ],
-    in_act: LayoutTensor[
-        DT,
-        Layout.row_major(N_ENVS, ACT),
-        MutAnyOrigin,
-    ],
-    in_nobs: LayoutTensor[
-        DT,
-        Layout.row_major(N_ENVS, OBS),
-        MutAnyOrigin,
-    ],
-    in_done: LayoutTensor[
-        DT,
-        Layout.row_major(N_ENVS),
-        MutAnyOrigin,
-    ],
-    ring_obs: LayoutTensor[
-        DT,
-        Layout.row_major(N_ENVS, N * OBS),
-        MutAnyOrigin,
-    ],
-    ring_act: LayoutTensor[
-        DT,
-        Layout.row_major(N_ENVS, N * ACT),
-        MutAnyOrigin,
-    ],
-    out_obs: LayoutTensor[
-        DT,
-        Layout.row_major(N_ENVS, OBS),
-        MutAnyOrigin,
-    ],
-    out_act: LayoutTensor[
-        DT,
-        Layout.row_major(N_ENVS, ACT),
-        MutAnyOrigin,
-    ],
-    out_nobs: LayoutTensor[
-        DT,
-        Layout.row_major(N_ENVS, OBS),
-        MutAnyOrigin,
-    ],
-    proc_slot: LayoutTensor[
-        DType.int32,
-        Layout.row_major(N_ENVS),
-        MutAnyOrigin,
-    ],
+    in_obs: Tile[DT, N_ENVS, OBS],
+    in_act: Tile[DT, N_ENVS, ACT],
+    in_nobs: Tile[DT, N_ENVS, OBS],
+    in_done: Tile[DT, N_ENVS],
+    ring_obs: Tile[DT, N_ENVS, N * OBS],
+    ring_act: Tile[DT, N_ENVS, N * ACT],
+    out_obs: Tile[DT, N_ENVS, OBS],
+    out_act: Tile[DT, N_ENVS, ACT],
+    out_nobs: Tile[DT, N_ENVS, OBS],
+    proc_slot: Tile[DType.int32, N_ENVS],
 ):
     """Phase 2 of the n-step process split — element-parallel over
     (env × OBS element); one thread per `(e, d)`.
@@ -514,111 +442,43 @@ struct GPUNStepBuffer[N: Int, OBS: Int, ACT: Int, N_ENVS: Int](
         Outputs land in the internal `out_*` device buffers;
         `out_valid[e]` is 1 if env `e` emitted this call."""
         var in_obs_lt = rebind[
-            LayoutTensor[
-                DT,
-                Layout.row_major(Self.N_ENVS, Self.OBS),
-                MutAnyOrigin,
-            ]
+            Tile[DT, Self.N_ENVS, Self.OBS]
         ](
-            LayoutTensor[
-                DT,
-                Layout.row_major(Self.N_ENVS, Self.OBS),
-            ](obs)
+            tile[Self.N_ENVS, Self.OBS](obs)
         )
         var in_act_lt = rebind[
-            LayoutTensor[
-                DT,
-                Layout.row_major(Self.N_ENVS, Self.ACT),
-                MutAnyOrigin,
-            ]
+            Tile[DT, Self.N_ENVS, Self.ACT]
         ](
-            LayoutTensor[
-                DT,
-                Layout.row_major(Self.N_ENVS, Self.ACT),
-            ](act)
+            tile[Self.N_ENVS, Self.ACT](act)
         )
         var in_rew_lt = rebind[
-            LayoutTensor[
-                DT,
-                Layout.row_major(Self.N_ENVS),
-                MutAnyOrigin,
-            ]
+            Tile[DT, Self.N_ENVS]
         ](
-            LayoutTensor[
-                DT,
-                Layout.row_major(Self.N_ENVS),
-            ](rew)
+            tile[Self.N_ENVS](rew)
         )
         var in_nobs_lt = rebind[
-            LayoutTensor[
-                DT,
-                Layout.row_major(Self.N_ENVS, Self.OBS),
-                MutAnyOrigin,
-            ]
+            Tile[DT, Self.N_ENVS, Self.OBS]
         ](
-            LayoutTensor[
-                DT,
-                Layout.row_major(Self.N_ENVS, Self.OBS),
-            ](nobs)
+            tile[Self.N_ENVS, Self.OBS](nobs)
         )
         var in_done_lt = rebind[
-            LayoutTensor[
-                DT,
-                Layout.row_major(Self.N_ENVS),
-                MutAnyOrigin,
-            ]
+            Tile[DT, Self.N_ENVS]
         ](
-            LayoutTensor[
-                DT,
-                Layout.row_major(Self.N_ENVS),
-            ](done)
+            tile[Self.N_ENVS](done)
         )
 
-        var ring_obs_lt = LayoutTensor[
-            DT,
-            Layout.row_major(Self.N_ENVS, Self.N * Self.OBS),
-        ](self.ring_obs)
-        var ring_act_lt = LayoutTensor[
-            DT,
-            Layout.row_major(Self.N_ENVS, Self.N * Self.ACT),
-        ](self.ring_act)
-        var ring_rew_lt = LayoutTensor[
-            DT,
-            Layout.row_major(Self.N_ENVS, Self.N),
-        ](self.ring_rew)
-        var counts_lt = LayoutTensor[
-            DType.int32,
-            Layout.row_major(Self.N_ENVS),
-        ](self.counts)
+        var ring_obs_lt = tile[Self.N_ENVS, Self.N * Self.OBS](self.ring_obs)
+        var ring_act_lt = tile[Self.N_ENVS, Self.N * Self.ACT](self.ring_act)
+        var ring_rew_lt = tile[Self.N_ENVS, Self.N](self.ring_rew)
+        var counts_lt = tile[Self.N_ENVS](self.counts)
 
-        var out_obs_lt = LayoutTensor[
-            DT,
-            Layout.row_major(Self.N_ENVS, Self.OBS),
-        ](self.out_obs)
-        var out_act_lt = LayoutTensor[
-            DT,
-            Layout.row_major(Self.N_ENVS, Self.ACT),
-        ](self.out_act)
-        var out_rew_lt = LayoutTensor[
-            DT,
-            Layout.row_major(Self.N_ENVS),
-        ](self.out_rew)
-        var out_nobs_lt = LayoutTensor[
-            DT,
-            Layout.row_major(Self.N_ENVS, Self.OBS),
-        ](self.out_nobs)
-        var out_done_lt = LayoutTensor[
-            DT,
-            Layout.row_major(Self.N_ENVS),
-        ](self.out_done)
-        var out_valid_lt = LayoutTensor[
-            DType.int32,
-            Layout.row_major(Self.N_ENVS),
-        ](self.out_valid)
-        var proc_slot_lt = LayoutTensor[
-            DType.int32,
-            Layout.row_major(Self.N_ENVS),
-        ](self.proc_slot)
+        var out_obs_lt = tile[Self.N_ENVS, Self.OBS](self.out_obs)
+        var out_act_lt = tile[Self.N_ENVS, Self.ACT](self.out_act)
+        var out_rew_lt = tile[Self.N_ENVS](self.out_rew)
+        var out_nobs_lt = tile[Self.N_ENVS, Self.OBS](self.out_nobs)
+        var out_done_lt = tile[Self.N_ENVS](self.out_done)
+        var out_valid_lt = tile[Self.N_ENVS](self.out_valid)
+        var proc_slot_lt = tile[Self.N_ENVS](self.proc_slot)
 
         # Phase 1 — decide (one thread per env): rew ring + emit decision +
         # counts, publishing the append slot into proc_slot. Must precede

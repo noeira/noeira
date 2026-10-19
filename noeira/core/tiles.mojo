@@ -13,12 +13,12 @@ accepts every tensor built from that layout. Do not reach for `LTToTTLayout`:
 `LTToTTLayout[Layout.row_major(B, N)]` is a DIFFERENT type, and a kernel
 declared with it rejects a natively built tensor (checked on 1.2rc2).
 
-Construction keeps a concrete origin (docs/UNSAFE_ANY_ORIGIN_MIGRATION_PLAN.md):
-`tile[B, N](buf)` (dtype inferred) takes the buffer `mut` and returns a view at
-`origin_of(buf)`. A MUTABLE narrow-origin view converts implicitly to a
-`Tile` kernel argument at `enqueue_function`, so no `as_unsafe_any_origin()`
-is needed at the launch. An immutable buffer gives an immutable view, which a
-`MutAnyOrigin` kernel argument correctly rejects.
+Construction (`tile[B, N](x)`, dtype inferred) follows
+docs/UNSAFE_ANY_ORIGIN_MIGRATION_PLAN.md: host memory (a `List` / `Span`, a
+pointer) keeps its concrete origin and mutability, and a MUTABLE narrow view
+converts implicitly to a `Tile` kernel argument at `enqueue_function`. Device
+and pinned host BUFFERS are handles, so their views are `MutAnyOrigin`, the
+kernel ABI, exactly as LayoutTensor's buffer constructor made them.
 
 ⚠ TileTensor traps (both silent):
 - a SINGLE int index on a multi-dim tile returns `[k, 0, ...]`, not flat
@@ -28,7 +28,8 @@ is needed at the launch. An immutable buffer gives an immutable view, which a
 """
 
 from std.memory import stack_allocation as std_stack_allocation
-from layout import TileTensor, row_major
+from std.sys import align_of
+from layout import Coord, TileTensor, row_major
 from max.gpu.host import DeviceBuffer, HostBuffer
 from max.gpu.memory import AddressSpace
 
@@ -36,6 +37,27 @@ from max.gpu.memory import AddressSpace
 comptime RowMajor[*dims: Int] = type_of(row_major[*dims]())
 """The layout type of `row_major[*dims]()`: fully static extents and strides.
 `RowMajor[B, N]()` is its value."""
+
+comptime DYN1 = type_of(row_major(Coord(Int(0))))
+"""A 1-D layout whose extent is a RUNTIME value; `rl1(n)` is one. Replaces
+`Layout.row_major[1]()` (UNKNOWN extent) + `RuntimeLayout[DYN1]`."""
+
+comptime DYN2 = type_of(row_major(Coord(Int(0), Int(0))))
+"""A 2-D row-major layout with RUNTIME extents; `rl2(rows, cols)` is one."""
+
+
+@always_inline
+def rl1(n: Int) -> DYN1:
+    """A `DYN1` layout of live length `n`."""
+    return row_major(Coord(n))
+
+
+@always_inline
+def rl2(rows: Int, cols: Int) -> DYN2:
+    """A `DYN2` layout, row-major `[rows, cols]`. ⚠ `cols` is the row stride:
+    a wrong width is a legal view over the wrong memory, not an error."""
+    return row_major(Coord(rows, cols))
+
 
 comptime Tile[dt: DType, *dims: Int] = TileTensor[
     dt, RowMajor[*dims], MutAnyOrigin
@@ -58,30 +80,41 @@ address_space=AddressSpace.SHARED]`); allocate with `shared_tile`."""
 @always_inline
 def tile[
     dt: DType, //, *dims: Int
-](mut buf: DeviceBuffer[dt]) -> TileTensor[
-    dt, RowMajor[*dims], origin_of(buf)
-]:
+](buf: DeviceBuffer[dt]) -> Tile[dt, *dims]:
     """Row-major view of a device buffer: `tile[B, N](buf)` (was
-    `LayoutTensor[dt, Layout.row_major(B, N), MutAnyOrigin](buf)`)."""
-    return TileTensor(buf, RowMajor[*dims]())
+    `LayoutTensor[dt, Layout.row_major(B, N), MutAnyOrigin](buf)`).
+
+    The ONE origin erasure in this module, and the same one LayoutTensor's
+    buffer constructor made: a `DeviceBuffer` is a HANDLE to device memory,
+    so a read-only handle (every GPU env trait method takes
+    `states_buf: DeviceBuffer[dtype]`) still names writable memory, and the
+    kernel ABI is `MutAnyOrigin` anyway (see `Tensor.lt`). The buffer must
+    outlive the kernels that use the view."""
+    return Tile[dt, *dims](
+        ptr=rebind[Pointer[Scalar[dt], MutAnyOrigin]](buf.unsafe_ptr()),
+        layout=RowMajor[*dims](),
+    )
 
 
 @always_inline
 def tile[
     dt: DType, //, *dims: Int
-](mut buf: HostBuffer[dt]) -> TileTensor[dt, RowMajor[*dims], origin_of(buf)]:
-    """Row-major view of a pinned host buffer."""
-    return TileTensor(buf, RowMajor[*dims]())
+](buf: HostBuffer[dt]) -> Tile[dt, *dims]:
+    """Row-major view of a pinned host buffer (a handle, like `DeviceBuffer`)."""
+    return Tile[dt, *dims](
+        ptr=rebind[Pointer[Scalar[dt], MutAnyOrigin]](buf.unsafe_ptr()),
+        layout=RowMajor[*dims](),
+    )
 
 
 @always_inline
 def tile[
-    dt: DType, //, *dims: Int
-](mut list: List[Scalar[dt]]) -> TileTensor[
-    dt, RowMajor[*dims], origin_of(list)
-]:
-    """Row-major view of a host `List` (the CPU leg)."""
-    return TileTensor(list, RowMajor[*dims]())
+    dt: DType, mut: Bool, origin: Origin[mut=mut], //, *dims: Int
+](span: Span[Scalar[dt], origin]) -> TileTensor[dt, RowMajor[*dims], origin]:
+    """Row-major view of host memory, e.g. a `List` (the CPU leg). Keeps the
+    list's origin AND mutability: an immutable list gives a read-only view,
+    which a `Tile` argument correctly rejects."""
+    return TileTensor(span, RowMajor[*dims]())
 
 
 @always_inline
@@ -90,17 +123,19 @@ def tile[
 ](ptr: Pointer[Scalar[dt], origin]) -> TileTensor[dt, RowMajor[*dims], origin]:
     """Row-major view at a pointer (was `LayoutTensor[dt, ...,
     MutAnyOrigin](ptr)`). The view keeps the pointer's origin: a
-    `MutAnyOrigin` slab pointer gives a `Tile`, a buffer's `unsafe_ptr()` a
-    view tied to that buffer."""
+    `MutAnyOrigin` slab pointer gives a `Tile`."""
     return TileTensor(ptr=ptr, layout=RowMajor[*dims]())
 
 
 @always_inline
-def shared_tile[dt: DType, *dims: Int]() -> SharedTile[dt, *dims]:
+def shared_tile[
+    dt: DType, *dims: Int, alignment: Int = align_of[Scalar[dt]]()
+]() -> SharedTile[dt, *dims]:
     """Allocate a shared-memory tile (was `LayoutTensor[dt,
     Layout.row_major(*dims), MutAnyOrigin,
     address_space=AddressSpace.SHARED].stack_allocation()`). Call it in a
-    kernel body, like the stack allocation it replaces.
+    kernel body, like the stack allocation it replaces. `alignment` (bytes)
+    is the allocation's, e.g. 16 for SIMD-width shared loads.
 
     Goes through `std.memory.stack_allocation` + a pointer view, not
     `layout.stack_allocation`: that one carries a `where
@@ -108,7 +143,7 @@ def shared_tile[dt: DType, *dims: Int]() -> SharedTile[dt, *dims]:
     `dims` (1.2rc2), though every `RowMajor` is fully static."""
     comptime n = RowMajor[*dims]().size()
     var p = std_stack_allocation[
-        n, Scalar[dt], address_space=AddressSpace.SHARED
+        n, Scalar[dt], alignment=alignment, address_space=AddressSpace.SHARED
     ]()
     # Stack memory lives for the kernel (shared: the block); the legacy tiles
     # were MutAnyOrigin too, so this is the same erasure, made explicit.

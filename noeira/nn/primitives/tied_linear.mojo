@@ -73,7 +73,8 @@ from std.sys import CompilationTarget
 from std.memory import Pointer
 from max.gpu import global_idx
 from max.gpu.host import DeviceContext
-from layout import Layout, LayoutTensor, TileTensor, row_major
+from layout import TileTensor, row_major
+from noeira.core.tiles import Tile
 from linalg.matmul import matmul as max_matmul
 from linalg.matmul.cpu.apple_accelerate import (
     get_cblas_f32_function,
@@ -106,9 +107,9 @@ from .linear import _cast_f2b_kernel
 def _tied_grad_w_kernel[
     BATCH: Int, OUT: Int, IN: Int, ADT: DType = DT
 ](
-    grad_output: LayoutTensor[ADT, Layout.row_major(BATCH, OUT), MutAnyOrigin],
-    cache_in: LayoutTensor[ADT, Layout.row_major(BATCH, IN), MutAnyOrigin],
-    grad_w: LayoutTensor[DT, Layout.row_major(OUT, IN), MutAnyOrigin],
+    grad_output: Tile[ADT, BATCH, OUT],
+    cache_in: Tile[ADT, BATCH, IN],
+    grad_w: Tile[DT, OUT, IN],
 ):
     var gid = Int(global_idx.x)
     comptime total = OUT * IN
@@ -376,13 +377,9 @@ struct TiedLinear[IN_: Int, OUT_: Int, ADT: DType = DT](Module):
                 var c = ctx.value()
                 gind.ensure_gpu(c, B * Self.IN_)
                 # ── (1) grad-weight kernel (accumulate into source grad cell).
-                var go_lt = god.lt[
-                    "gpu", Layout.row_major(B, Self.OUT_)
-                ]()
-                var x_lt = find.lt["gpu", Layout.row_major(B, Self.IN_)]()
-                var gw_lt = gw.lt[
-                    "gpu", Layout.row_major(Self.OUT_, Self.IN_)
-                ]()
+                var go_lt = god.tt["gpu", B, Self.OUT_]()
+                var x_lt = find.tt["gpu", B, Self.IN_]()
+                var gw_lt = gw.tt["gpu", Self.OUT_, Self.IN_]()
                 comptime total = Self.W_SIZE
                 comptime n_blocks = (total + TPB - 1) // TPB
                 c.enqueue_function[
@@ -411,9 +408,9 @@ struct TiedLinear[IN_: Int, OUT_: Int, ADT: DType = DT](Module):
             self._ensure_w_bf(c)
             # ── (1) grad-weight: dWsrc[v,e] += Σ_b dout[b,v]·x[b,e]. bf16
             # go/cache_in → fp32 master grad (fp32 accumulator in the kernel).
-            var go_lt = grad_output.lt["gpu", Layout.row_major(B, Self.OUT_)]()
-            var x_lt = fin.lt["gpu", Layout.row_major(B, Self.IN_)]()
-            var gw_lt = gw.lt["gpu", Layout.row_major(Self.OUT_, Self.IN_)]()
+            var go_lt = grad_output.tt["gpu", B, Self.OUT_]()
+            var x_lt = fin.tt["gpu", B, Self.IN_]()
+            var gw_lt = gw.tt["gpu", Self.OUT_, Self.IN_]()
             comptime total = Self.W_SIZE
             comptime n_blocks = (total + TPB - 1) // TPB
             c.enqueue_function[

@@ -28,7 +28,6 @@ Inputs (t-major, contiguous per step):
 
 from max.gpu import global_idx
 from max.gpu.host import DeviceContext
-from layout import Layout, LayoutTensor
 
 from noeira.nn.constants import DT, TPB
 from noeira.nn.core.tensor import Tensor
@@ -39,6 +38,7 @@ from .nets import (
     TDMPC2Encoder, TDMPC2Dynamics, TDMPC2Reward, TDMPC2QNet, TDMPC2Termination,
 )
 from .wm_graph import TDMPC2WMGraph, NQ, NLOSS, TERM_COL
+from noeira.core.tiles import Tile, tile
 
 
 @fieldwise_init
@@ -57,8 +57,8 @@ struct WMLossOut(Copyable):
 
 # ── GPU kernels (operate over storage Tensor `.lt` views) ───────────────
 def _copy_slice_k[N: Int](
-    src: LayoutTensor[DT, Layout.row_major(N), MutAnyOrigin],
-    dst: LayoutTensor[DT, Layout.row_major(N), MutAnyOrigin],
+    src: Tile[DT, N],
+    dst: Tile[DT, N],
 ):
     """dst[i] = src[i] over a contiguous N-window (sub-buffer views)."""
     var i = Int(global_idx.x)
@@ -67,8 +67,8 @@ def _copy_slice_k[N: Int](
 
 
 def _extract_carry_k[B_: Int, LAT_: Int, OW_: Int](
-    ob: LayoutTensor[DT, Layout.row_major(B_ * OW_), MutAnyOrigin],
-    carry_next: LayoutTensor[DT, Layout.row_major(B_ * LAT_), MutAnyOrigin],
+    ob: Tile[DT, B_ * OW_],
+    carry_next: Tile[DT, B_ * LAT_],
 ):
     """carry_next[b,k] = out[b, NLOSS+k]  (znext passthrough columns)."""
     var i = Int(global_idx.x)
@@ -79,8 +79,8 @@ def _extract_carry_k[B_: Int, LAT_: Int, OW_: Int](
 
 
 def _seed_wm_k[B_: Int, OW_: Int, LAT_: Int, NQ_: Int](
-    seed: LayoutTensor[DT, Layout.row_major(B_ * OW_), MutAnyOrigin],
-    gz: LayoutTensor[DT, Layout.row_major(B_ * LAT_), MutAnyOrigin],
+    seed: Tile[DT, B_ * OW_],
+    gz: Tile[DT, B_ * LAT_],
     sc_cons: Scalar[DT],
     sc_rew: Scalar[DT],
     sc_val: Scalar[DT],
@@ -99,8 +99,8 @@ def _seed_wm_k[B_: Int, OW_: Int, LAT_: Int, NQ_: Int](
 
 
 def _accum_metric_k[B_: Int, OW_: Int, NQ_: Int](
-    ob: LayoutTensor[DT, Layout.row_major(B_ * OW_), MutAnyOrigin],
-    acc: LayoutTensor[DT, Layout.row_major(4), MutAnyOrigin],
+    ob: Tile[DT, B_ * OW_],
+    acc: Tile[DT, 4],
     sc_cons: Scalar[DT],
     sc_rew: Scalar[DT],
     sc_val: Scalar[DT],
@@ -463,10 +463,8 @@ struct WMStep[
                 off, BB * LAT
             )
             c.enqueue_function[_extract_carry_k[BB, LAT, OW]](
-                self.out_t.lt["gpu", Layout.row_major(BB * OW)](),
-                LayoutTensor[DT, Layout.row_major(BB * LAT), MutAnyOrigin](
-                    carry_sub
-                ),
+                self.out_t.tt["gpu", BB * OW](),
+                tile[BB * LAT](carry_sub),
                 grid_dim=nb, block_dim=TPB,
             )
 
@@ -500,8 +498,8 @@ struct WMStep[
         else:
             var c = ctx.value()
             c.enqueue_function[_accum_metric_k[BB, OW, NQ]](
-                self.out_t.lt["gpu", Layout.row_major(BB * OW)](),
-                self.acc.lt["gpu", Layout.row_major(4)](),
+                self.out_t.tt["gpu", BB * OW](),
+                self.acc.tt["gpu", 4](),
                 sc_cons, sc_rew, sc_val, sc_term,
                 grid_dim=1, block_dim=1,
             )
@@ -530,8 +528,8 @@ struct WMStep[
             var c = ctx.value()
             comptime nb = (BB + TPB - 1) // TPB
             c.enqueue_function[_seed_wm_k[BB, OW, LAT, NQ]](
-                self.seed.lt["gpu", Layout.row_major(BB * OW)](),
-                self.gz.lt["gpu", Layout.row_major(BB * LAT)](),
+                self.seed.tt["gpu", BB * OW](),
+                self.gz.tt["gpu", BB * LAT](),
                 sc_cons, sc_rew, sc_val, sc_term,
                 grid_dim=nb, block_dim=TPB,
             )
@@ -549,7 +547,7 @@ struct WMStep[
             var c = ctx.value()
             comptime nb = (BB * LAT + TPB - 1) // TPB
             c.enqueue_function[_copy_slice_k[BB * LAT]](
-                graph.grad_input["z"]().lt["gpu", Layout.row_major(BB * LAT)](),
-                self.gz.lt["gpu", Layout.row_major(BB * LAT)](),
+                graph.grad_input["z"]().tt["gpu", BB * LAT](),
+                self.gz.tt["gpu", BB * LAT](),
                 grid_dim=nb, block_dim=TPB,
             )

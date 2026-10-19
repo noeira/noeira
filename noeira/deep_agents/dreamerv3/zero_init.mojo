@@ -30,7 +30,6 @@ shrink the downstream weight and choke the hidden layers' gradient.
 
 from max.gpu import global_idx
 from max.gpu.host import DeviceContext
-from layout import Layout, LayoutTensor
 
 from noeira.nn.constants import DT, TPB
 from noeira.nn.core.tensor import Tensor

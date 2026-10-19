@@ -29,7 +29,6 @@ scaling), and a conv reward head reads it. The wrapper bridges the graph's
 
 from max.gpu import global_idx
 from max.gpu.host import DeviceContext
-from layout import Layout, LayoutTensor
 
 from noeira.nn.constants import DT, TPB
 from noeira.nn.core.initializer import Initializer, Zero
@@ -55,6 +54,7 @@ from noeira.nn.primitives.slice import Slice
 from noeira.nn.primitives.concat import Concat
 from noeira.nn.primitives.add import Add
 from noeira.nn.primitives.broadcast_tokens import BroadcastTokens
+from noeira.core.tiles import Tile
 
 
 # ── BN-free identity-skip residual conv block (3×3, pad 1 → H×W preserved) ──
@@ -160,8 +160,8 @@ comptime MZDynC4SpatialGraph[
 # GPU LayoutTensor copy for the vjp input-grad copy-back (dst, src both real
 # graph-pool / grad-pool buffers).
 def _mzc4dyn_copy_kernel[N: Int](
-    dst: LayoutTensor[DT, Layout.row_major(N), MutAnyOrigin],
-    src: LayoutTensor[DT, Layout.row_major(N), MutAnyOrigin],
+    dst: Tile[DT, N],
+    src: Tile[DT, N],
 ):
     var idx = Int(global_idx.x)
     if idx < N:
@@ -249,8 +249,8 @@ struct MZDynNetC4Spatial[
             var c = ctx.value()
             comptime nb = (N + TPB - 1) // TPB
             c.enqueue_function[_mzc4dyn_copy_kernel[N]](
-                grad_inputs[0].lt["gpu", Layout.row_major(N)](),
-                self.graph.grad_input["in"]().lt["gpu", Layout.row_major(N)](),
+                grad_inputs[0].tt["gpu", N](),
+                self.graph.grad_input["in"]().tt["gpu", N](),
                 grid_dim=nb, block_dim=TPB,
             )
 

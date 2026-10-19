@@ -17,7 +17,7 @@ from max.gpu.host import (
     DeviceEvent,
     HostBuffer,
 )
-from layout import Layout, LayoutTensor, RuntimeLayout, TileTensor
+from layout import Layout, LayoutTensor, RuntimeLayout, TileTensor, TensorLayout
 
 from noeira.core.tiles import RowMajor, Tile
 from noeira.nn.constants import DT
@@ -330,6 +330,20 @@ struct TensorImpl[dt: DType = DT](Defaultable & Movable & Deinitable):
             return TileTensor(self.data, RowMajor[*dims]())
         elif target == "gpu":
             return TileTensor(self.dev.value(), RowMajor[*dims]())
+        else:
+            comptime assert False, "target must be 'cpu' or 'gpu'"
+
+    def tt_dyn[
+        target: StaticString, L: TensorLayout
+    ](mut self, layout: L) -> TileTensor[Self.dt, L, MutAnyOrigin]:
+        """`tt` with RUNTIME extents: `lt_dyn`'s replacement.
+        `t.lt_dyn["cpu", DYN2](rl2(B, nv))` becomes
+        `t.tt_dyn["cpu", DYN2](rl2(B, nv))`. ⚠ The extents are not checked
+        against the buffer: a wrong width reads a neighbouring row."""
+        comptime if target == "cpu":
+            return TileTensor(self.data, layout)
+        elif target == "gpu":
+            return TileTensor(self.dev.value(), layout)
         else:
             comptime assert False, "target must be 'cpu' or 'gpu'"
 

@@ -37,7 +37,6 @@ Run (GPU env required): see `tests/deep_agents/test_ezv2_atari_batched_smoke.moj
 from std.math import exp, log
 from std.memory import unsafe_memcpy, alloc, dealloc
 from std.time import perf_counter_ns
-from layout import Layout, LayoutTensor
 from max.gpu.host import DeviceContext, DeviceBuffer
 
 from noeira.nn.constants import DT
@@ -57,6 +56,7 @@ from ..zero.mcts_adapters_mz import MZRepGPU, MZDynGPU, MZPredGPU
 from ..zero.prioritized_sequence_replay_mcts import PrioritizedMCTSSequenceReplay
 from ..zero.temperature import visit_temperature
 from ..muzero.selfplay_gpu_batched import _sample_action
+from noeira.core.tiles import tile
 
 
 def _a(n: Int) -> Pointer[Scalar[DT], MutAnyOrigin]:
@@ -266,8 +266,7 @@ def run_ezv2_gumbel_selfplay_gpu_batched[
             # ── 1. H2D the CPU env's live obs, batched Gumbel search ──
             var _t0 = perf_counter_ns()
             ctx.enqueue_copy(d_obs, env.obs_ptr())
-            var obs_t = LayoutTensor[DT, Layout.row_major(N_ENVS, OBS),
-                MutAnyOrigin](d_obs.unsafe_ptr().as_unsafe_any_origin())
+            var obs_t = tile[N_ENVS, OBS](d_obs.unsafe_ptr().as_unsafe_any_origin())
             planner.search_gpu[
                 type_of(rep_a),
                 type_of(dyn_a),
@@ -449,8 +448,7 @@ def run_ezv2_gumbel_selfplay_gpu_batched[
                     )
                     ts_re_host += Float64(perf_counter_ns() - _trh)
                     var _trs = perf_counter_ns()
-                    var reana_t = LayoutTensor[DT, Layout.row_major(REANA_W, OBS),
-                        MutAnyOrigin](d_reana.unsafe_ptr().as_unsafe_any_origin())
+                    var reana_t = tile[REANA_W, OBS](d_reana.unsafe_ptr().as_unsafe_any_origin())
                     reana_planner.search_gpu[
                         type_of(rep_a),
                         type_of(dyn_a),
@@ -643,10 +641,7 @@ def _ez_eval_greedy_cpu_batched[
             break
         ctx.enqueue_copy(d_obs, eval_env[].obs_ptr())
         # `d_obs` is an immutable param; planner ABI wants `MutAnyOrigin`.
-        var obs_t = LayoutTensor[DT, Layout.row_major(N_ENVS, RA.OBS_DIM),
-            MutAnyOrigin](
-            d_obs.unsafe_ptr().as_unsafe_any_origin().unsafe_mut_cast[True]()
-        )
+        var obs_t = tile[N_ENVS, RA.OBS_DIM](d_obs.unsafe_ptr().as_unsafe_any_origin().unsafe_mut_cast[True]())
         planner.search_gpu[RA, DA, PA](ctx, rep_a, dyn_a, pred_a, obs_t,
           apply_legal=False, k_actual=MAX_K, rng_seed=es)
         es += UInt32(1)

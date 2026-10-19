@@ -22,7 +22,6 @@ forward/backward is small (a few hundred params for typical world-model
 sizes) and runs on host without dominating wall time.
 """
 
-from layout import Layout, LayoutTensor
 from std.math import sqrt, tanh
 from std.random.philox import Random as PhiloxRandom
 from std.sys import CompilationTarget
@@ -32,7 +31,7 @@ from linalg.matmul.cpu.apple_accelerate import (
     _CBLASOrder,
     _CBLASTranspose,
 )
-from layout.tile_tensor import lt_to_tt
+from noeira.core.tiles import Tile, tile
 
 
 struct PCEncoder[in_dim: Int, hidden_dim: Int, out_dim: Int]:
@@ -77,9 +76,7 @@ struct PCEncoder[in_dim: Int, hidden_dim: Int, out_dim: Int]:
     def xavier_init[
         dtype: DType = DType.float32
     ](
-        params: LayoutTensor[
-            dtype, Layout.row_major(Self.PARAM_SIZE), MutAnyOrigin
-        ],
+        params: Tile[dtype, Self.PARAM_SIZE],
         seed: UInt64,
     ):
         """Xavier-uniform init for W1, W2; zero biases.
@@ -121,41 +118,23 @@ struct PCEncoder[in_dim: Int, hidden_dim: Int, out_dim: Int]:
     def forward[
         BATCH: Int, dtype: DType = DType.float32
     ](
-        params: LayoutTensor[
-            dtype, Layout.row_major(Self.PARAM_SIZE), MutAnyOrigin
-        ],
-        enc_input: LayoutTensor[
-            dtype, Layout.row_major(BATCH, Self.IN_DIM), MutAnyOrigin
-        ],
-        mut hidden_pre: LayoutTensor[
-            dtype, Layout.row_major(BATCH, Self.HIDDEN_DIM), MutAnyOrigin
-        ],
-        mut hidden_act: LayoutTensor[
-            dtype, Layout.row_major(BATCH, Self.HIDDEN_DIM), MutAnyOrigin
-        ],
-        mut output: LayoutTensor[
-            dtype, Layout.row_major(BATCH, Self.OUT_DIM), MutAnyOrigin
-        ],
+        params: Tile[dtype, Self.PARAM_SIZE],
+        enc_input: Tile[dtype, BATCH, Self.IN_DIM],
+        hidden_pre: Tile[dtype, BATCH, Self.HIDDEN_DIM],
+        hidden_act: Tile[dtype, BATCH, Self.HIDDEN_DIM],
+        output: Tile[dtype, BATCH, Self.OUT_DIM],
     ):
         """Forward pass; caches `hidden_pre`, `hidden_act` for backward."""
         # Param sub-views over the flat slab (no rebind; like the block path).
-        var W1 = LayoutTensor[
-            dtype, Layout.row_major(Self.in_dim, Self.hidden_dim), MutAnyOrigin
-        ](params.ptr.unsafe_offset(Self.W1_OFFSET))
-        var b1 = LayoutTensor[
-            dtype, Layout.row_major(Self.hidden_dim), MutAnyOrigin
-        ](params.ptr.unsafe_offset(Self.B1_OFFSET))
-        var W2 = LayoutTensor[
-            dtype, Layout.row_major(Self.hidden_dim, Self.out_dim), MutAnyOrigin
-        ](params.ptr.unsafe_offset(Self.W2_OFFSET))
-        var b2 = LayoutTensor[
-            dtype, Layout.row_major(Self.out_dim), MutAnyOrigin
-        ](params.ptr.unsafe_offset(Self.B2_OFFSET))
+        var W1 = tile[Self.in_dim, Self.hidden_dim](params.ptr.unsafe_offset(Self.W1_OFFSET))
+        var b1 = tile[Self.hidden_dim](params.ptr.unsafe_offset(Self.B1_OFFSET))
+        var W2 = tile[Self.hidden_dim, Self.out_dim](params.ptr.unsafe_offset(Self.W2_OFFSET))
+        var b2 = tile[Self.out_dim](params.ptr.unsafe_offset(Self.B2_OFFSET))
 
         # h_pre = input @ W1
         try:
             max_matmul[target="cpu"](
-                lt_to_tt(hidden_pre), lt_to_tt(enc_input), lt_to_tt(W1), None
+                hidden_pre, enc_input, W1, None
             )
         except:
             pass
@@ -171,7 +150,7 @@ struct PCEncoder[in_dim: Int, hidden_dim: Int, out_dim: Int]:
         # output = h_act @ W2
         try:
             max_matmul[target="cpu"](
-                lt_to_tt(output), lt_to_tt(hidden_act), lt_to_tt(W2), None
+                output, hidden_act, W2, None
             )
         except:
             pass
@@ -188,42 +167,22 @@ struct PCEncoder[in_dim: Int, hidden_dim: Int, out_dim: Int]:
     def backward[
         BATCH: Int, dtype: DType = DType.float32
     ](
-        params: LayoutTensor[
-            dtype, Layout.row_major(Self.PARAM_SIZE), MutAnyOrigin
-        ],
-        enc_input: LayoutTensor[
-            dtype, Layout.row_major(BATCH, Self.IN_DIM), MutAnyOrigin
-        ],
-        hidden_act: LayoutTensor[
-            dtype, Layout.row_major(BATCH, Self.HIDDEN_DIM), MutAnyOrigin
-        ],
-        dz_out: LayoutTensor[
-            dtype, Layout.row_major(BATCH, Self.OUT_DIM), MutAnyOrigin
-        ],
-        mut grads: LayoutTensor[
-            dtype, Layout.row_major(Self.PARAM_SIZE), MutAnyOrigin
-        ],
+        params: Tile[dtype, Self.PARAM_SIZE],
+        enc_input: Tile[dtype, BATCH, Self.IN_DIM],
+        hidden_act: Tile[dtype, BATCH, Self.HIDDEN_DIM],
+        dz_out: Tile[dtype, BATCH, Self.OUT_DIM],
+        grads: Tile[dtype, Self.PARAM_SIZE],
     ):
         """Writes gradients into `grads` (overwrites; caller need not zero)."""
         for i in range(Self.PARAM_SIZE):
             grads.ptr[unsafe_offset=i] = Scalar[dtype](0.0)
 
         # Grad + param sub-views over the slabs (no rebind; like the block path).
-        var dW1 = LayoutTensor[
-            dtype, Layout.row_major(Self.in_dim, Self.hidden_dim), MutAnyOrigin
-        ](grads.ptr.unsafe_offset(Self.W1_OFFSET))
-        var db1 = LayoutTensor[
-            dtype, Layout.row_major(Self.hidden_dim), MutAnyOrigin
-        ](grads.ptr.unsafe_offset(Self.B1_OFFSET))
-        var dW2 = LayoutTensor[
-            dtype, Layout.row_major(Self.hidden_dim, Self.out_dim), MutAnyOrigin
-        ](grads.ptr.unsafe_offset(Self.W2_OFFSET))
-        var db2 = LayoutTensor[
-            dtype, Layout.row_major(Self.out_dim), MutAnyOrigin
-        ](grads.ptr.unsafe_offset(Self.B2_OFFSET))
-        var W2 = LayoutTensor[
-            dtype, Layout.row_major(Self.hidden_dim, Self.out_dim), MutAnyOrigin
-        ](params.ptr.unsafe_offset(Self.W2_OFFSET))
+        var dW1 = tile[Self.in_dim, Self.hidden_dim](grads.ptr.unsafe_offset(Self.W1_OFFSET))
+        var db1 = tile[Self.hidden_dim](grads.ptr.unsafe_offset(Self.B1_OFFSET))
+        var dW2 = tile[Self.hidden_dim, Self.out_dim](grads.ptr.unsafe_offset(Self.W2_OFFSET))
+        var db2 = tile[Self.out_dim](grads.ptr.unsafe_offset(Self.B2_OFFSET))
+        var W2 = tile[Self.hidden_dim, Self.out_dim](params.ptr.unsafe_offset(Self.W2_OFFSET))
 
         # dW2 = h_act^T @ dz_out
         comptime if CompilationTarget.is_macos() and dtype == DType.float32:
@@ -252,7 +211,7 @@ struct PCEncoder[in_dim: Int, hidden_dim: Int, out_dim: Int]:
             except:
                 pass
         else:
-            # Portable: materialize h_act^T into an owned List, GEMM via lt_to_tt.
+            # Portable: materialize h_act^T into an owned List, GEMM on the TileTensor views.
             var cT = List[Scalar[dtype]](
                 length=Self.hidden_dim * BATCH, fill=Scalar[dtype](0)
             )
@@ -261,12 +220,10 @@ struct PCEncoder[in_dim: Int, hidden_dim: Int, out_dim: Int]:
                     cT[i * BATCH + bi] = rebind[Scalar[dtype]](
                         hidden_act[bi, i]
                     )
-            var cT_view = LayoutTensor[
-                dtype, Layout.row_major(Self.hidden_dim, BATCH), MutAnyOrigin
-            ](cT)
+            var cT_view = tile[Self.hidden_dim, BATCH](cT)
             try:
                 max_matmul[target="cpu"](
-                    lt_to_tt(dW2), lt_to_tt(cT_view), lt_to_tt(dz_out), None
+                    dW2, cT_view, dz_out, None
                 )
             except:
                 pass
@@ -283,12 +240,10 @@ struct PCEncoder[in_dim: Int, hidden_dim: Int, out_dim: Int]:
         var dh_act = List[Scalar[dtype]](
             length=BATCH * Self.hidden_dim, fill=Scalar[dtype](0)
         )
-        var dh_act_view = LayoutTensor[
-            dtype, Layout.row_major(BATCH, Self.hidden_dim), MutAnyOrigin
-        ](dh_act)
+        var dh_act_view = tile[BATCH, Self.hidden_dim](dh_act)
         try:
             max_matmul[transpose_b=True, target="cpu"](
-                lt_to_tt(dh_act_view), lt_to_tt(dz_out), lt_to_tt(W2), None
+                dh_act_view, dz_out, W2, None
             )
         except:
             pass
@@ -297,9 +252,7 @@ struct PCEncoder[in_dim: Int, hidden_dim: Int, out_dim: Int]:
         var dh_pre = List[Scalar[dtype]](
             length=BATCH * Self.hidden_dim, fill=Scalar[dtype](0)
         )
-        var dh_pre_view = LayoutTensor[
-            dtype, Layout.row_major(BATCH, Self.hidden_dim), MutAnyOrigin
-        ](dh_pre)
+        var dh_pre_view = tile[BATCH, Self.hidden_dim](dh_pre)
         for b in range(BATCH):
             for j in range(Self.hidden_dim):
                 var ha = rebind[Scalar[dtype]](hidden_act[b, j])
@@ -335,19 +288,17 @@ struct PCEncoder[in_dim: Int, hidden_dim: Int, out_dim: Int]:
             except:
                 pass
         else:
-            # Portable: materialize input^T into an owned List, GEMM via lt_to_tt.
+            # Portable: materialize input^T into an owned List, GEMM on the TileTensor views.
             var iT = List[Scalar[dtype]](
                 length=Self.in_dim * BATCH, fill=Scalar[dtype](0)
             )
             for bi in range(BATCH):
                 for i in range(Self.in_dim):
                     iT[i * BATCH + bi] = rebind[Scalar[dtype]](enc_input[bi, i])
-            var iT_view = LayoutTensor[
-                dtype, Layout.row_major(Self.in_dim, BATCH), MutAnyOrigin
-            ](iT)
+            var iT_view = tile[Self.in_dim, BATCH](iT)
             try:
                 max_matmul[target="cpu"](
-                    lt_to_tt(dW1), lt_to_tt(iT_view), lt_to_tt(dh_pre_view), None
+                    dW1, iT_view, dh_pre_view, None
                 )
             except:
                 pass

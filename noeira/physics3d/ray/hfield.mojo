@@ -39,7 +39,7 @@ not for float64 exactness. [[feedback_match_the_references_storage_type]]
 
 from std.math import floor, ceil
 
-from layout import Layout, LayoutTensor
+from layout import TileTensor, TensorLayout
 
 from noeira.math3d import Vec3 as Vec3Generic, Quat as QuatGeneric
 
@@ -49,9 +49,9 @@ from .triangle import ray_basis, ray_triangle
 
 @always_inline
 def _elev[
-    DTYPE: DType, L_HF: Layout
+    DTYPE: DType, L_HF: TensorLayout
 ](
-    data: LayoutTensor[DTYPE, L_HF, MutAnyOrigin],
+    data: TileTensor[DTYPE, L_HF, MutAnyOrigin],
     adr: Int,
     ncol: Int,
     r: Int,
@@ -61,7 +61,7 @@ def _elev[
 
 
 def ray_hfield[
-    DTYPE: DType, L_HF: Layout
+    DTYPE: DType, L_HF: TensorLayout
 ](
     xpos: Vec3Generic[DTYPE],
     xquat: QuatGeneric[DTYPE],
@@ -71,7 +71,7 @@ def ray_hfield[
     size_y: Scalar[DTYPE],
     size_z: Scalar[DTYPE],
     size_base: Scalar[DTYPE],
-    data: LayoutTensor[DTYPE, L_HF, MutAnyOrigin],
+    data: TileTensor[DTYPE, L_HF, MutAnyOrigin],
     adr: Int,
     pnt: Vec3Generic[DTYPE],
     vec: Vec3Generic[DTYPE],

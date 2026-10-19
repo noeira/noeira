@@ -90,7 +90,6 @@ is what the policy is judged on). `eval_step` returns both.
 from std.math import sqrt
 
 from max.gpu.host import DeviceContext
-from layout import Layout
 
 from noeira.nn.constants import DT
 from noeira.nn import Adam, Kaiming, Tensor
@@ -133,6 +132,7 @@ from noeira.nn.models.resnet18_torch import (
 )
 
 from .refload import LoadPrefixedParams, RefDump
+from noeira.core.tiles import RowMajor
 
 
 # ── grad-norm clip over a graph ──────────────────────────────────────────
@@ -547,7 +547,7 @@ struct ACTTrainer[
         # The backward seed for a mean-over-batch loss is the constant 1/BATCH;
         # nothing in a step mutates it, so it is written once.
         seed_grad_inv_batch[Self.target, Self.BATCH](
-            t.grad_seed.lt[Self.target, Layout.row_major(Self.BATCH, 1)](),
+            t.grad_seed.tt[Self.target, Self.BATCH, 1](),
             ctx=ctx,
         )
         t.t_qpos = Tensor.alloc(Self.BATCH * Self.QPOS)
@@ -829,7 +829,7 @@ struct ACTTrainer[
 
         GPU: three one-block reductions, no bus traffic, capture-safe. CPU: the
         same means computed on the host, where they already live."""
-        comptime lb = Layout.row_major(Self.BATCH)
+        comptime lb = RowMajor[Self.BATCH]
         ref l1n = self.graph.node_output["l1"]()
         ref kln = self.graph.node_output["kl"]()
         comptime if Self.target == "cpu":
@@ -852,9 +852,9 @@ struct ACTTrainer[
                 self._train_acc._h_kl += ak / d
                 self._train_acc.n += 1
         else:
-            var v1 = l1n.lt["gpu", lb]()
-            var vk = kln.lt["gpu", lb]()
-            var vl = self.loss_out.lt["gpu", lb]()
+            var v1 = l1n.tt["gpu", Self.BATCH]()
+            var vk = kln.tt["gpu", Self.BATCH]()
+            var vl = self.loss_out.tt["gpu", Self.BATCH]()
             comptime if VAL:
                 self._val_acc.loss.accumulate_gpu_lt[Self.BATCH](vl)
                 self._val_acc.l1.accumulate_gpu_lt[Self.BATCH](v1)

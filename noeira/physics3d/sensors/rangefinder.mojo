@@ -52,7 +52,7 @@ non-mutating constructor. Nothing here writes; see `core/env.mojo` on why the
 trait carries the marker anyway.
 """
 
-from layout import Layout, LayoutTensor
+from layout import TileTensor, TensorLayout
 
 from noeira.math3d import Vec3 as Vec3Generic, Quat as QuatGeneric
 
@@ -80,27 +80,27 @@ def _pos(n: Int) -> Int:
 
 def rangefinder_ray[
     DTYPE: DType,
-    L_SITES: Layout,
-    L_S3: Layout,
-    L_B3: Layout,
-    L_B4: Layout,
-    L_GEOMS: Layout,
-    L_BODIES: Layout,
-    L_MESH_META: Layout,
-    L_TRI: Layout,
-    L_HF_META: Layout,
-    L_HF: Layout,
+    L_SITES: TensorLayout,
+    L_S3: TensorLayout,
+    L_B3: TensorLayout,
+    L_B4: TensorLayout,
+    L_GEOMS: TensorLayout,
+    L_BODIES: TensorLayout,
+    L_MESH_META: TensorLayout,
+    L_TRI: TensorLayout,
+    L_HF_META: TensorLayout,
+    L_HF: TensorLayout,
 ](
-    sites: LayoutTensor[DTYPE, L_SITES, MutAnyOrigin],
-    site_xpos: LayoutTensor[DTYPE, L_S3, MutAnyOrigin],
-    xpos: LayoutTensor[DTYPE, L_B3, MutAnyOrigin],
-    xquat: LayoutTensor[DTYPE, L_B4, MutAnyOrigin],
-    geoms: LayoutTensor[DTYPE, L_GEOMS, MutAnyOrigin],
-    bodies: LayoutTensor[DTYPE, L_BODIES, MutAnyOrigin],
-    mesh_meta: LayoutTensor[DTYPE, L_MESH_META, MutAnyOrigin],
-    mesh_tris: LayoutTensor[DTYPE, L_TRI, MutAnyOrigin],
-    hfield_meta: LayoutTensor[DTYPE, L_HF_META, MutAnyOrigin],
-    hfield_data: LayoutTensor[DTYPE, L_HF, MutAnyOrigin],
+    sites: TileTensor[DTYPE, L_SITES, MutAnyOrigin],
+    site_xpos: TileTensor[DTYPE, L_S3, MutAnyOrigin],
+    xpos: TileTensor[DTYPE, L_B3, MutAnyOrigin],
+    xquat: TileTensor[DTYPE, L_B4, MutAnyOrigin],
+    geoms: TileTensor[DTYPE, L_GEOMS, MutAnyOrigin],
+    bodies: TileTensor[DTYPE, L_BODIES, MutAnyOrigin],
+    mesh_meta: TileTensor[DTYPE, L_MESH_META, MutAnyOrigin],
+    mesh_tris: TileTensor[DTYPE, L_TRI, MutAnyOrigin],
+    hfield_meta: TileTensor[DTYPE, L_HF_META, MutAnyOrigin],
+    hfield_data: TileTensor[DTYPE, L_HF, MutAnyOrigin],
     ngeom: Int,
     hf_stride: Int,
     env: Int,
@@ -161,22 +161,22 @@ def rangefinder_site[
     var hfn = _pos(m.dims.get_nhfield_data())
     return Float64(
         rangefinder_ray[DTYPE](
-            m.sites.lt_dyn["cpu", DYN2](rl2(ns, MODEL_SITE_SIZE)),
-            d.site_xpos.lt_dyn["cpu", DYN2](rl2(BATCH, ns * 3)),
-            d.xpos.lt_dyn["cpu", DYN2](rl2(BATCH, nb * 3)),
-            d.xquat.lt_dyn["cpu", DYN2](rl2(BATCH, nb * 4)),
-            m.geoms.lt_dyn["cpu", DYN2](rl2(ng, MODEL_GEOM_SIZE)),
-            m.bodies.lt_dyn["cpu", DYN2](rl2(nb, MODEL_BODY_SIZE)),
-            m.mesh_meta.lt_dyn["cpu", DYN1](
+            m.sites.tt_dyn["cpu", DYN2](rl2(ns, MODEL_SITE_SIZE)),
+            d.site_xpos.tt_dyn["cpu", DYN2](rl2(BATCH, ns * 3)),
+            d.xpos.tt_dyn["cpu", DYN2](rl2(BATCH, nb * 3)),
+            d.xquat.tt_dyn["cpu", DYN2](rl2(BATCH, nb * 4)),
+            m.geoms.tt_dyn["cpu", DYN2](rl2(ng, MODEL_GEOM_SIZE)),
+            m.bodies.tt_dyn["cpu", DYN2](rl2(nb, MODEL_BODY_SIZE)),
+            m.mesh_meta.tt_dyn["cpu", DYN1](
                 rl1(MAX_GPU_MESHES * MODEL_MESH_META_SIZE)
             ),
-            m.mesh_tris.lt_dyn["cpu", DYN1](
+            m.mesh_tris.tt_dyn["cpu", DYN1](
                 rl1(_pos(m.dims.get_nmesh_tri() * MESH_ARENA_FLOATS_PER_TRI))
             ),
-            m.hfield_meta.lt_dyn["cpu", DYN1](
+            m.hfield_meta.tt_dyn["cpu", DYN1](
                 rl1(MAX_GPU_HFIELDS * MODEL_HFIELD_META_SIZE)
             ),
-            d.hfield_data.lt_dyn["cpu", DYN1](rl1(BATCH * hfn)),
+            d.hfield_data.tt_dyn["cpu", DYN1](rl1(BATCH * hfn)),
             ng,
             m.dims.get_nhfield_data(),
             env,

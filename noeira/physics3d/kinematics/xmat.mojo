@@ -19,7 +19,7 @@ NOT MuJoCo's [w, x, y, z]. The accessors below take the components by name to
 keep that from biting at the call site.
 """
 
-from layout import Layout, LayoutTensor
+from layout import TileTensor, TensorLayout
 
 from ..fields import Data, Dims, DimsLike
 
@@ -100,11 +100,9 @@ def xmat_elem[DTYPE: DType, D: DimsLike](
 @always_inline
 def xmat_elem_gpu[
     DTYPE: DType,
-    L_XQUAT: Layout,
+    L_XQUAT: TensorLayout,
 ](
-    xquat: LayoutTensor[
-        DTYPE, L_XQUAT, MutAnyOrigin
-    ],
+    xquat: TileTensor[DTYPE, L_XQUAT, MutAnyOrigin],
     env: Int,
     body: Int,
     idx: Int,

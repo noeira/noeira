@@ -23,7 +23,6 @@ state-prefix obs extraction when OBS_DIM > STATE_SIZE and renders on first step)
 """
 
 from std.math import sin, cos
-from layout import Layout, LayoutTensor
 from max.gpu import thread_idx, block_idx, block_dim
 from max.gpu.host import DeviceContext, DeviceBuffer
 
@@ -33,6 +32,7 @@ from noeira.physics2d.constants import IDX_X, IDX_Y, IDX_ANGLE
 from noeira.physics2d.car import TileCollision
 from noeira.physics2d.car.constants import TILE_DATA_SIZE
 from .car_racing_discrete import CarRacingDiscrete
+from noeira.core.tiles import Tile, ImmTile, tile
 
 
 struct CarRacingPixel[DTYPE: DType, PIX_RES: Int = 84](
@@ -108,9 +108,7 @@ struct CarRacingPixel[DTYPE: DType, PIX_RES: Int = 84](
         BATCH: Int, STATE_SIZE: Int
     ](
         env: Int,
-        states: LayoutTensor[
-            dtype, Layout.row_major(BATCH, STATE_SIZE), MutAnyOrigin
-        ],
+        states: Tile[dtype, BATCH, STATE_SIZE],
         vis_ptr: Pointer[Scalar[dtype], MutAnyOrigin],
         vis_count: Int,
         dx: Int,
@@ -184,15 +182,15 @@ struct CarRacingPixel[DTYPE: DType, PIX_RES: Int = 84](
         workspace_ptr: Optional[Pointer[Scalar[dtype], MutAnyOrigin]] = None,
         rng_counter_ptr: Optional[Pointer[Scalar[DType.uint64], MutAnyOrigin]] = None,
     ) raises:
-        var st = LayoutTensor[dtype, Layout.row_major(BATCH_SIZE, STATE_SIZE)](states)
-        var dn = LayoutTensor[dtype, Layout.row_major(BATCH_SIZE)](dones)
+        var st = tile[BATCH_SIZE, STATE_SIZE](states)
+        var dn = tile[BATCH_SIZE](dones)
         comptime BLOCKS = (BATCH_SIZE + Self.TPB - 1) // Self.TPB
         var ws = workspace_ptr.value()
 
         @always_inline
         def sel_wrap(
-            st: LayoutTensor[dtype, Layout.row_major(BATCH_SIZE, STATE_SIZE), MutAnyOrigin],
-            dn: LayoutTensor[dtype, Layout.row_major(BATCH_SIZE), MutAnyOrigin],
+            st: Tile[dtype, BATCH_SIZE, STATE_SIZE],
+            dn: Tile[dtype, BATCH_SIZE],
             ws_ptr: Pointer[Scalar[dtype], MutAnyOrigin],
             seed: Scalar[DType.uint64],
         ):
@@ -228,11 +226,11 @@ struct CarRacingPixel[DTYPE: DType, PIX_RES: Int = 84](
         workspace_ptr: Optional[Pointer[Scalar[dtype], MutAnyOrigin]] = None,
         rng_counter_ptr: Optional[Pointer[Scalar[DType.uint64], MutAnyOrigin]] = None,
     ) raises:
-        var st = LayoutTensor[dtype, Layout.row_major(BATCH_SIZE, STATE_SIZE)](states)
-        var ac = LayoutTensor[dtype, Layout.row_major(BATCH_SIZE, 1)](actions)
-        var rw = LayoutTensor[dtype, Layout.row_major(BATCH_SIZE)](rewards)
-        var dn = LayoutTensor[dtype, Layout.row_major(BATCH_SIZE)](dones)
-        var tm = LayoutTensor[dtype, Layout.row_major(BATCH_SIZE)](terminated)
+        var st = tile[BATCH_SIZE, STATE_SIZE](states)
+        var ac = tile[BATCH_SIZE, 1](actions)
+        var rw = tile[BATCH_SIZE](rewards)
+        var dn = tile[BATCH_SIZE](dones)
+        var tm = tile[BATCH_SIZE](terminated)
         var ws = workspace_ptr.value()
         var obs_ptr = obs.unsafe_ptr()
 
@@ -241,11 +239,11 @@ struct CarRacingPixel[DTYPE: DType, PIX_RES: Int = 84](
 
         @always_inline
         def phys_wrap(
-            st: LayoutTensor[dtype, Layout.row_major(BATCH_SIZE, STATE_SIZE), MutAnyOrigin],
-            ac: LayoutTensor[dtype, Layout.row_major(BATCH_SIZE, 1), ImmutAnyOrigin],
-            rw: LayoutTensor[dtype, Layout.row_major(BATCH_SIZE), MutAnyOrigin],
-            dn: LayoutTensor[dtype, Layout.row_major(BATCH_SIZE), MutAnyOrigin],
-            tm: LayoutTensor[dtype, Layout.row_major(BATCH_SIZE), MutAnyOrigin],
+            st: Tile[dtype, BATCH_SIZE, STATE_SIZE],
+            ac: ImmTile[dtype, BATCH_SIZE, 1],
+            rw: Tile[dtype, BATCH_SIZE],
+            dn: Tile[dtype, BATCH_SIZE],
+            tm: Tile[dtype, BATCH_SIZE],
         ):
             var env = Int(block_dim.x * block_idx.x + thread_idx.x)
             if env >= BATCH_SIZE:
@@ -268,7 +266,7 @@ struct CarRacingPixel[DTYPE: DType, PIX_RES: Int = 84](
         # of all ~300 (≈10x fewer point-in-quad tests).
         @always_inline
         def cull_wrap(
-            st: LayoutTensor[dtype, Layout.row_major(BATCH_SIZE, STATE_SIZE), MutAnyOrigin],
+            st: Tile[dtype, BATCH_SIZE, STATE_SIZE],
             ws_ptr: Pointer[Scalar[dtype], MutAnyOrigin],
         ):
             var env = Int(block_dim.x * block_idx.x + thread_idx.x)
@@ -316,7 +314,7 @@ struct CarRacingPixel[DTYPE: DType, PIX_RES: Int = 84](
 
         @always_inline
         def render_wrap(
-            st: LayoutTensor[dtype, Layout.row_major(BATCH_SIZE, STATE_SIZE), MutAnyOrigin],
+            st: Tile[dtype, BATCH_SIZE, STATE_SIZE],
             ws_ptr: Pointer[Scalar[dtype], MutAnyOrigin],
             o_ptr: Pointer[Scalar[dtype], MutAnyOrigin],
         ):
@@ -397,12 +395,12 @@ struct CarRacingPixel[DTYPE: DType, PIX_RES: Int = 84](
         """Never used for pixel obs (OBS_DIM > STATE_SIZE → BatchedGpuDiscreteEnv
         skips it and renders on the first step). Provided for trait conformance;
         zero-fills so it is well-defined if ever called."""
-        var ob = LayoutTensor[dtype, Layout.row_major(BATCH_SIZE, OBS_DIM)](obs)
+        var ob = tile[BATCH_SIZE, OBS_DIM](obs)
         comptime TOT = BATCH_SIZE * OBS_DIM
         comptime BLK = (TOT + 256 - 1) // 256
 
         @always_inline
-        def zero_obs(o: LayoutTensor[dtype, Layout.row_major(BATCH_SIZE, OBS_DIM), MutAnyOrigin]):
+        def zero_obs(o: Tile[dtype, BATCH_SIZE, OBS_DIM]):
             var i = Int(block_dim.x * block_idx.x + thread_idx.x)
             if i >= TOT:
                 return

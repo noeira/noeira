@@ -12,17 +12,17 @@ carried as byte-identical private duplicates (docstring-only diffs — audited
     (sac, redq, redq_ofe, mbpo; `ALP` defaults to `ACT + 1`).
 """
 
-from layout import Layout, LayoutTensor
 from max.gpu import global_idx
 from std.random.philox import Random as PhiloxRandom
 
 from noeira.nn.constants import DT
+from noeira.core.tiles import Tile
 
 
 def offpolicy_warmup_uniform_kernel[
     N_ENVS: Int, ACT: Int
 ](
-    action_dest: LayoutTensor[DT, Layout.row_major(N_ENVS, ACT), MutAnyOrigin],
+    action_dest: Tile[DT, N_ENVS, ACT],
     action_scale: Scalar[DT],
     seed: UInt64,
     offset_base: UInt64,
@@ -41,8 +41,8 @@ def offpolicy_warmup_uniform_kernel[
 def offpolicy_copy2d_kernel[
     N_ENVS: Int, D: Int
 ](
-    src: LayoutTensor[DT, Layout.row_major(N_ENVS, D), MutAnyOrigin],
-    dst: LayoutTensor[DT, Layout.row_major(N_ENVS, D), MutAnyOrigin],
+    src: Tile[DT, N_ENVS, D],
+    dst: Tile[DT, N_ENVS, D],
 ):
     """`dst[e,d] = src[e,d]` — bridge the driver's obs view into the trainer's
     owned device scratch the storage actor.forward consumes."""
@@ -55,9 +55,9 @@ def offpolicy_copy2d_kernel[
 def offpolicy_noise_clamp_kernel[
     N_ENVS: Int, ACT: Int
 ](
-    ao: LayoutTensor[DT, Layout.row_major(N_ENVS, ACT), MutAnyOrigin],
-    noise: LayoutTensor[DT, Layout.row_major(N_ENVS, ACT), MutAnyOrigin],
-    action_out: LayoutTensor[DT, Layout.row_major(N_ENVS, ACT), MutAnyOrigin],
+    ao: Tile[DT, N_ENVS, ACT],
+    noise: Tile[DT, N_ENVS, ACT],
+    action_out: Tile[DT, N_ENVS, ACT],
     sigma: Scalar[DT],
     action_scale: Scalar[DT],
 ):
@@ -81,8 +81,8 @@ def offpolicy_noise_clamp_kernel[
 def offpolicy_clamp_action_kernel[
     N_ENVS: Int, ACT: Int, ALP: Int = ACT + 1
 ](
-    alp: LayoutTensor[DT, Layout.row_major(N_ENVS, ALP), MutAnyOrigin],
-    action: LayoutTensor[DT, Layout.row_major(N_ENVS, ACT), MutAnyOrigin],
+    alp: Tile[DT, N_ENVS, ALP],
+    action: Tile[DT, N_ENVS, ACT],
     scale: Scalar[DT],
 ):
     """`action[e,j] = clamp(alp[e,j], ±scale)` — drop the trailing log-prob

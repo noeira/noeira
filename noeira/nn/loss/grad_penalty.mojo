@@ -61,7 +61,6 @@ Do not put a BatchNorm in a discriminator regularised this way.
 
 from max.gpu import global_idx
 from std.math import sqrt
-from layout import Layout, LayoutTensor
 from max.gpu.host import DeviceContext
 
 from noeira.nn.constants import DT, TPB

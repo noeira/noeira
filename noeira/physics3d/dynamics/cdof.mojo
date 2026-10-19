@@ -12,7 +12,8 @@ is the comptime NJOINT (no metadata read)."""
 from max.gpu import thread_idx, block_idx, block_dim
 from max.gpu.sync import barrier
 from max.gpu.host import DeviceContext
-from layout import Layout, LayoutTensor
+from layout import TileTensor, TensorLayout
+from noeira.core.tiles import RowMajor, Tile
 
 from ..kinematics.quat_math import (
     gpu_quat_mul,
@@ -62,31 +63,23 @@ comptime CDOF_TPB: Int = 64
 def _cdof_body[
     DTYPE: DType,
     D: DimsLike,
-    L_QPOS: Layout,
-    L_XPOS: Layout,
-    L_XQUAT: Layout,
-    L_BODIES: Layout,
-    L_JOINTS: Layout,
-    L_CDOF: Layout,
+    L_QPOS: TensorLayout,
+    L_XPOS: TensorLayout,
+    L_XQUAT: TensorLayout,
+    L_BODIES: TensorLayout,
+    L_JOINTS: TensorLayout,
+    L_CDOF: TensorLayout,
 ](
     env: Int,
     body: Int,
     dims: D,
-    qpos: LayoutTensor[DTYPE, L_QPOS, MutAnyOrigin],
-    xpos: LayoutTensor[DTYPE, L_XPOS, MutAnyOrigin],
-    xquat: LayoutTensor[
-        DTYPE, L_XQUAT, MutAnyOrigin
-    ],
-    subtree_com: LayoutTensor[
-        DTYPE, L_XPOS, MutAnyOrigin
-    ],
-    bodies: LayoutTensor[
-        DTYPE, L_BODIES, MutAnyOrigin
-    ],
-    joints: LayoutTensor[
-        DTYPE, L_JOINTS, MutAnyOrigin
-    ],
-    cdof: LayoutTensor[DTYPE, L_CDOF, MutAnyOrigin],
+    qpos: TileTensor[DTYPE, L_QPOS, MutAnyOrigin],
+    xpos: TileTensor[DTYPE, L_XPOS, MutAnyOrigin],
+    xquat: TileTensor[DTYPE, L_XQUAT, MutAnyOrigin],
+    subtree_com: TileTensor[DTYPE, L_XPOS, MutAnyOrigin],
+    bodies: TileTensor[DTYPE, L_BODIES, MutAnyOrigin],
+    joints: TileTensor[DTYPE, L_JOINTS, MutAnyOrigin],
+    cdof: TileTensor[DTYPE, L_CDOF, MutAnyOrigin],
 ):
     """One body's cdof for its DOFs (arithmetic verbatim from
     cdof_body_gpu)."""
@@ -392,30 +385,22 @@ def _cdof_body[
 def _cdof_env[
     DTYPE: DType,
     D: DimsLike,
-    L_QPOS: Layout,
-    L_XPOS: Layout,
-    L_XQUAT: Layout,
-    L_BODIES: Layout,
-    L_JOINTS: Layout,
-    L_CDOF: Layout,
+    L_QPOS: TensorLayout,
+    L_XPOS: TensorLayout,
+    L_XQUAT: TensorLayout,
+    L_BODIES: TensorLayout,
+    L_JOINTS: TensorLayout,
+    L_CDOF: TensorLayout,
 ](
     env: Int,
     dims: D,
-    qpos: LayoutTensor[DTYPE, L_QPOS, MutAnyOrigin],
-    xpos: LayoutTensor[DTYPE, L_XPOS, MutAnyOrigin],
-    xquat: LayoutTensor[
-        DTYPE, L_XQUAT, MutAnyOrigin
-    ],
-    subtree_com: LayoutTensor[
-        DTYPE, L_XPOS, MutAnyOrigin
-    ],
-    bodies: LayoutTensor[
-        DTYPE, L_BODIES, MutAnyOrigin
-    ],
-    joints: LayoutTensor[
-        DTYPE, L_JOINTS, MutAnyOrigin
-    ],
-    cdof: LayoutTensor[DTYPE, L_CDOF, MutAnyOrigin],
+    qpos: TileTensor[DTYPE, L_QPOS, MutAnyOrigin],
+    xpos: TileTensor[DTYPE, L_XPOS, MutAnyOrigin],
+    xquat: TileTensor[DTYPE, L_XQUAT, MutAnyOrigin],
+    subtree_com: TileTensor[DTYPE, L_XPOS, MutAnyOrigin],
+    bodies: TileTensor[DTYPE, L_BODIES, MutAnyOrigin],
+    joints: TileTensor[DTYPE, L_JOINTS, MutAnyOrigin],
+    cdof: TileTensor[DTYPE, L_CDOF, MutAnyOrigin],
 ):
     """Full cdof for one env: zero + per-body walk."""
     var nv = dims.get_nv()
@@ -437,21 +422,13 @@ def _cdof_fields_kernel[
     NJOINT: Int,
     BATCH: Int,
 ](
-    qpos: LayoutTensor[DTYPE, Layout.row_major(BATCH, NQ), MutAnyOrigin],
-    xpos: LayoutTensor[DTYPE, Layout.row_major(BATCH, NBODY * 3), MutAnyOrigin],
-    xquat: LayoutTensor[
-        DTYPE, Layout.row_major(BATCH, NBODY * 4), MutAnyOrigin
-    ],
-    subtree_com: LayoutTensor[
-        DTYPE, Layout.row_major(BATCH, NBODY * 3), MutAnyOrigin
-    ],
-    bodies: LayoutTensor[
-        DTYPE, Layout.row_major(NBODY, MODEL_BODY_SIZE), MutAnyOrigin
-    ],
-    joints: LayoutTensor[
-        DTYPE, Layout.row_major(NJOINT, MODEL_JOINT_SIZE), MutAnyOrigin
-    ],
-    cdof: LayoutTensor[DTYPE, Layout.row_major(BATCH, NV * 6), MutAnyOrigin],
+    qpos: Tile[DTYPE, BATCH, NQ],
+    xpos: Tile[DTYPE, BATCH, NBODY * 3],
+    xquat: Tile[DTYPE, BATCH, NBODY * 4],
+    subtree_com: Tile[DTYPE, BATCH, NBODY * 3],
+    bodies: Tile[DTYPE, NBODY, MODEL_BODY_SIZE],
+    joints: Tile[DTYPE, NJOINT, MODEL_JOINT_SIZE],
+    cdof: Tile[DTYPE, BATCH, NV * 6],
 ):
     var env = Int(block_dim.x * block_idx.x + thread_idx.x)
     if env >= BATCH:
@@ -478,21 +455,13 @@ def _cdof_fields_mt_kernel[
     BATCH: Int,
     N_THREADS: Int,
 ](
-    qpos: LayoutTensor[DTYPE, Layout.row_major(BATCH, NQ), MutAnyOrigin],
-    xpos: LayoutTensor[DTYPE, Layout.row_major(BATCH, NBODY * 3), MutAnyOrigin],
-    xquat: LayoutTensor[
-        DTYPE, Layout.row_major(BATCH, NBODY * 4), MutAnyOrigin
-    ],
-    subtree_com: LayoutTensor[
-        DTYPE, Layout.row_major(BATCH, NBODY * 3), MutAnyOrigin
-    ],
-    bodies: LayoutTensor[
-        DTYPE, Layout.row_major(NBODY, MODEL_BODY_SIZE), MutAnyOrigin
-    ],
-    joints: LayoutTensor[
-        DTYPE, Layout.row_major(NJOINT, MODEL_JOINT_SIZE), MutAnyOrigin
-    ],
-    cdof: LayoutTensor[DTYPE, Layout.row_major(BATCH, NV * 6), MutAnyOrigin],
+    qpos: Tile[DTYPE, BATCH, NQ],
+    xpos: Tile[DTYPE, BATCH, NBODY * 3],
+    xquat: Tile[DTYPE, BATCH, NBODY * 4],
+    subtree_com: Tile[DTYPE, BATCH, NBODY * 3],
+    bodies: Tile[DTYPE, NBODY, MODEL_BODY_SIZE],
+    joints: Tile[DTYPE, NJOINT, MODEL_JOINT_SIZE],
+    cdof: Tile[DTYPE, BATCH, NV * 6],
 ):
     var env = Int(block_idx.x)
     var tid = Int(thread_idx.x)
@@ -526,12 +495,12 @@ def compute_cdof[
     """`cdof` from FK products, both targets, one body. Output goes to the
     owned `scratch.cdof` tensor. PARALLEL=True (GPU only): cooperative
     flat-parallel kernel, bit-exact vs serial. CPU ignores PARALLEL."""
-    comptime L_QPOS = Layout.row_major(BATCH, D.NQ)
-    comptime L_B3 = Layout.row_major(BATCH, D.NBODY * 3)
-    comptime L_B4 = Layout.row_major(BATCH, D.NBODY * 4)
-    comptime L_BODY = Layout.row_major(D.NBODY, MODEL_BODY_SIZE)
-    comptime L_JOINT = Layout.row_major(D.NJOINT, MODEL_JOINT_SIZE)
-    comptime L_CDOF = Layout.row_major(BATCH, D.NV * 6)
+    comptime L_QPOS = RowMajor[BATCH, D.NQ]
+    comptime L_B3 = RowMajor[BATCH, D.NBODY * 3]
+    comptime L_B4 = RowMajor[BATCH, D.NBODY * 4]
+    comptime L_BODY = RowMajor[D.NBODY, MODEL_BODY_SIZE]
+    comptime L_JOINT = RowMajor[D.NJOINT, MODEL_JOINT_SIZE]
+    comptime L_CDOF = RowMajor[BATCH, D.NV * 6]
 
     comptime if target == "cpu":
         var dm = d.dims
@@ -541,13 +510,13 @@ def compute_cdof[
         var rl_BODY = rl2(dm.get_nbody(), MODEL_BODY_SIZE)
         var rl_JOINT = rl2(dm.get_njoint(), MODEL_JOINT_SIZE)
         var rl_CDOF = rl2(BATCH, dm.get_nv() * 6)
-        var qpos_v = d.qpos.lt_dyn["cpu", DYN2](rl_QPOS)
-        var xpos_v = d.xpos.lt_dyn["cpu", DYN2](rl_B3)
-        var xquat_v = d.xquat.lt_dyn["cpu", DYN2](rl_B4)
-        var stcom_v = d.subtree_com.lt_dyn["cpu", DYN2](rl_B3)
-        var bodies_v = m.bodies.lt_dyn["cpu", DYN2](rl_BODY)
-        var joints_v = m.joints.lt_dyn["cpu", DYN2](rl_JOINT)
-        var cdof_v = scratch.cdof.lt_dyn["cpu", DYN2](rl_CDOF)
+        var qpos_v = d.qpos.tt_dyn["cpu", DYN2](rl_QPOS)
+        var xpos_v = d.xpos.tt_dyn["cpu", DYN2](rl_B3)
+        var xquat_v = d.xquat.tt_dyn["cpu", DYN2](rl_B4)
+        var stcom_v = d.subtree_com.tt_dyn["cpu", DYN2](rl_B3)
+        var bodies_v = m.bodies.tt_dyn["cpu", DYN2](rl_BODY)
+        var joints_v = m.joints.tt_dyn["cpu", DYN2](rl_JOINT)
+        var cdof_v = scratch.cdof.tt_dyn["cpu", DYN2](rl_CDOF)
         for e in range(BATCH):
             _cdof_env[DTYPE](
                 e, dm, qpos_v, xpos_v, xquat_v, stcom_v, bodies_v, joints_v, cdof_v
@@ -558,13 +527,13 @@ def compute_cdof[
         c.enqueue_function[
             _cdof_fields_mt_kernel[DTYPE, D.NQ, D.NV, D.NBODY, D.NJOINT, BATCH, MT_T]
         ](
-            d.qpos.lt["gpu", L_QPOS](),
-            d.xpos.lt["gpu", L_B3](),
-            d.xquat.lt["gpu", L_B4](),
-            d.subtree_com.lt["gpu", L_B3](),
-            m.bodies.lt["gpu", L_BODY](),
-            m.joints.lt["gpu", L_JOINT](),
-            scratch.cdof.lt["gpu", L_CDOF](),
+            d.qpos.tt["gpu", BATCH, D.NQ](),
+            d.xpos.tt["gpu", BATCH, D.NBODY * 3](),
+            d.xquat.tt["gpu", BATCH, D.NBODY * 4](),
+            d.subtree_com.tt["gpu", BATCH, D.NBODY * 3](),
+            m.bodies.tt["gpu", D.NBODY, MODEL_BODY_SIZE](),
+            m.joints.tt["gpu", D.NJOINT, MODEL_JOINT_SIZE](),
+            scratch.cdof.tt["gpu", BATCH, D.NV * 6](),
             grid_dim=(BATCH,),
             block_dim=(MT_T,),
         )
@@ -574,13 +543,13 @@ def compute_cdof[
         c.enqueue_function[
             _cdof_fields_kernel[DTYPE, D.NQ, D.NV, D.NBODY, D.NJOINT, BATCH]
         ](
-            d.qpos.lt["gpu", L_QPOS](),
-            d.xpos.lt["gpu", L_B3](),
-            d.xquat.lt["gpu", L_B4](),
-            d.subtree_com.lt["gpu", L_B3](),
-            m.bodies.lt["gpu", L_BODY](),
-            m.joints.lt["gpu", L_JOINT](),
-            scratch.cdof.lt["gpu", L_CDOF](),
+            d.qpos.tt["gpu", BATCH, D.NQ](),
+            d.xpos.tt["gpu", BATCH, D.NBODY * 3](),
+            d.xquat.tt["gpu", BATCH, D.NBODY * 4](),
+            d.subtree_com.tt["gpu", BATCH, D.NBODY * 3](),
+            m.bodies.tt["gpu", D.NBODY, MODEL_BODY_SIZE](),
+            m.joints.tt["gpu", D.NJOINT, MODEL_JOINT_SIZE](),
+            scratch.cdof.tt["gpu", BATCH, D.NV * 6](),
             grid_dim=(BLOCKS,),
             block_dim=(CDOF_TPB,),
         )

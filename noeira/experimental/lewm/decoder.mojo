@@ -29,7 +29,8 @@ paper=16) is independent of the encoder's patch size.
 from max.gpu import global_idx
 from max.gpu.host import DeviceContext
 from max.gpu.memory import AddressSpace
-from layout import Layout, LayoutTensor, TileTensor
+from layout import TileTensor
+from noeira.core.tiles import Tile, tile
 
 from noeira.nn.constants import DT, TPB
 from noeira.nn import (
@@ -107,15 +108,8 @@ comptime LeWMDecoderLossGraph[
 def _patchify_kernel[
     BATCH: Int, C: Int, IMG: Int, PATCH_D: Int
 ](
-    img: LayoutTensor[DT, Layout.row_major(BATCH, C * IMG * IMG), MutAnyOrigin],
-    dst: LayoutTensor[
-        DT,
-        Layout.row_major(
-            BATCH,
-            (IMG // PATCH_D) * (IMG // PATCH_D) * (C * PATCH_D * PATCH_D),
-        ),
-        MutAnyOrigin,
-    ],
+    img: Tile[DT, BATCH, C * IMG * IMG],
+    dst: Tile[DT, BATCH, (IMG // PATCH_D) * (IMG // PATCH_D) * (C * PATCH_D * PATCH_D)],
 ):
     comptime GRID = IMG // PATCH_D
     comptime PATCH_PX = C * PATCH_D * PATCH_D
@@ -146,15 +140,8 @@ def _patchify_kernel[
 def _unpatchify_kernel[
     BATCH: Int, C: Int, IMG: Int, PATCH_D: Int
 ](
-    patches: LayoutTensor[
-        DT,
-        Layout.row_major(
-            BATCH,
-            (IMG // PATCH_D) * (IMG // PATCH_D) * (C * PATCH_D * PATCH_D),
-        ),
-        MutAnyOrigin,
-    ],
-    img: LayoutTensor[DT, Layout.row_major(BATCH, C * IMG * IMG), MutAnyOrigin],
+    patches: Tile[DT, BATCH, (IMG // PATCH_D) * (IMG // PATCH_D) * (C * PATCH_D * PATCH_D)],
+    img: Tile[DT, BATCH, C * IMG * IMG],
 ):
     comptime GRID = IMG // PATCH_D
     comptime PATCH_PX = C * PATCH_D * PATCH_D
@@ -219,12 +206,8 @@ def patchify[
                             dst_buf[unsafe_offset=dst] = img[unsafe_offset=src]
     else:
         var c = ctx.value()
-        var img_lt = LayoutTensor[
-            DT, Layout.row_major(BATCH, IMGN), MutAnyOrigin
-        ](img)
-        var out_lt = LayoutTensor[
-            DT, Layout.row_major(BATCH, OUTN), MutAnyOrigin
-        ](dst_buf)
+        var img_lt = tile[BATCH, IMGN](img)
+        var out_lt = tile[BATCH, OUTN](dst_buf)
         comptime total = BATCH * OUTN
         comptime n_blocks = (total + TPB - 1) // TPB
         c.enqueue_function[_patchify_kernel[BATCH, C, IMG, PATCH_D]](
@@ -265,12 +248,8 @@ def unpatchify[
                         img[unsafe_offset=dst] = patches[unsafe_offset=psrc]
     else:
         var cc = ctx.value()
-        var p_lt = LayoutTensor[
-            DT, Layout.row_major(BATCH, OUTN), MutAnyOrigin
-        ](patches)
-        var img_lt = LayoutTensor[
-            DT, Layout.row_major(BATCH, IMGN), MutAnyOrigin
-        ](img)
+        var p_lt = tile[BATCH, OUTN](patches)
+        var img_lt = tile[BATCH, IMGN](img)
         comptime total = BATCH * IMGN
         comptime n_blocks = (total + TPB - 1) // TPB
         cc.enqueue_function[_unpatchify_kernel[BATCH, C, IMG, PATCH_D]](

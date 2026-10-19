@@ -31,7 +31,8 @@ from max.gpu import global_idx, thread_idx
 from max.gpu.sync import barrier
 from max.gpu.memory import AddressSpace
 from max.gpu.host import DeviceContext, DeviceBuffer
-from layout import Layout, LayoutTensor, TileTensor, row_major
+from layout import TileTensor, row_major
+from noeira.core.tiles import shared_tile
 from linalg.matmul import matmul as max_matmul
 
 from noeira.nn.constants import DT
@@ -401,10 +402,7 @@ def _reduce_kernel[MEAN: Bool](o: P, a: P, n_: Int64):
     memory — the same result every run."""
     var n = Int(n_)
     var tid = Int(thread_idx.x)
-    var sh = LayoutTensor[
-        DT, Layout.row_major(REDUCE_TPB), MutAnyOrigin,
-        address_space=AddressSpace.SHARED,
-    ].stack_allocation()
+    var sh = shared_tile[DT, REDUCE_TPB]()
     var s: Scalar[DT] = 0
     var k = tid
     while k < n:

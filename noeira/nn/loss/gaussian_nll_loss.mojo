@@ -27,18 +27,18 @@ from std.math import exp
 from max.gpu import global_idx, thread_idx
 from max.gpu.primitives import block
 from max.gpu.host import DeviceContext
-from layout import Layout, LayoutTensor
 
 from noeira.nn.constants import DT, TPB, TPB_REDUCE
 from ..core.tensor import Tensor
+from noeira.core.tiles import Tile
 
 
 def _gnll_fwd_kernel[
     BATCH: Int, DIM: Int, LV_MIN: Float64, LV_MAX: Float64
 ](
-    logits: LayoutTensor[DT, Layout.row_major(BATCH, 2 * DIM), MutAnyOrigin],
-    targets: LayoutTensor[DT, Layout.row_major(BATCH, DIM), MutAnyOrigin],
-    partial: LayoutTensor[DT, Layout.row_major(BATCH), MutAnyOrigin],
+    logits: Tile[DT, BATCH, 2 * DIM],
+    targets: Tile[DT, BATCH, DIM],
+    partial: Tile[DT, BATCH],
 ):
     var b = Int(global_idx.x)
     if b < BATCH:
@@ -63,8 +63,8 @@ def _gnll_fwd_kernel[
 def _gnll_reduce_kernel[
     BATCH: Int
 ](
-    partial: LayoutTensor[DT, Layout.row_major(BATCH), MutAnyOrigin],
-    acc: LayoutTensor[DT, Layout.row_major(2), MutAnyOrigin],
+    partial: Tile[DT, BATCH],
+    acc: Tile[DT, 2],
 ):
     var t = Int(thread_idx.x)
     var my_sum: Scalar[DT] = 0.0
@@ -81,9 +81,9 @@ def _gnll_reduce_kernel[
 def _gnll_bwd_kernel[
     BATCH: Int, DIM: Int, LV_MIN: Float64, LV_MAX: Float64
 ](
-    logits: LayoutTensor[DT, Layout.row_major(BATCH, 2 * DIM), MutAnyOrigin],
-    targets: LayoutTensor[DT, Layout.row_major(BATCH, DIM), MutAnyOrigin],
-    grad: LayoutTensor[DT, Layout.row_major(BATCH, 2 * DIM), MutAnyOrigin],
+    logits: Tile[DT, BATCH, 2 * DIM],
+    targets: Tile[DT, BATCH, DIM],
+    grad: Tile[DT, BATCH, 2 * DIM],
 ):
     # one thread per element: recompute diff/inv_var/in_clamp from logits.
     var idx = Int(global_idx.x)
@@ -186,9 +186,9 @@ struct GaussianNLLLoss[
                     B, Self.DIM_, Self.LOGVAR_MIN, Self.LOGVAR_MAX
                 ]
             ](
-                logits.lt["gpu", Layout.row_major(B, 2 * Self.DIM_)](),
-                targets.lt["gpu", Layout.row_major(B, Self.DIM_)](),
-                self.partial.lt["gpu", Layout.row_major(B)](),
+                logits.tt["gpu", B, 2 * Self.DIM_](),
+                targets.tt["gpu", B, Self.DIM_](),
+                self.partial.tt["gpu", B](),
                 grid_dim=nblk,
                 block_dim=TPB_REDUCE,
             )
@@ -218,15 +218,15 @@ struct GaussianNLLLoss[
                     B, Self.DIM_, Self.LOGVAR_MIN, Self.LOGVAR_MAX
                 ]
             ](
-                logits.lt["gpu", Layout.row_major(B, 2 * Self.DIM_)](),
-                targets.lt["gpu", Layout.row_major(B, Self.DIM_)](),
-                self.partial.lt["gpu", Layout.row_major(B)](),
+                logits.tt["gpu", B, 2 * Self.DIM_](),
+                targets.tt["gpu", B, Self.DIM_](),
+                self.partial.tt["gpu", B](),
                 grid_dim=nblk,
                 block_dim=TPB_REDUCE,
             )
             c.enqueue_function[_gnll_reduce_kernel[B]](
-                self.partial.lt["gpu", Layout.row_major(B)](),
-                self.loss_acc.lt["gpu", Layout.row_major(2)](),
+                self.partial.tt["gpu", B](),
+                self.loss_acc.tt["gpu", 2](),
                 grid_dim=1,
                 block_dim=TPB_REDUCE,
             )
@@ -301,9 +301,9 @@ struct GaussianNLLLoss[
                     B, Self.DIM_, Self.LOGVAR_MIN, Self.LOGVAR_MAX
                 ]
             ](
-                logits.lt["gpu", Layout.row_major(B, 2 * Self.DIM_)](),
-                targets.lt["gpu", Layout.row_major(B, Self.DIM_)](),
-                grad.lt["gpu", Layout.row_major(B, 2 * Self.DIM_)](),
+                logits.tt["gpu", B, 2 * Self.DIM_](),
+                targets.tt["gpu", B, Self.DIM_](),
+                grad.tt["gpu", B, 2 * Self.DIM_](),
                 grid_dim=nblk,
                 block_dim=TPB,
             )

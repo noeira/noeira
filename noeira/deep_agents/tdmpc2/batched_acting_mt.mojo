@@ -15,7 +15,6 @@ task, which is what the segment-alternating driver guarantees; gathering N
 identical rows keeps the concat a plain elementwise copy with no broadcast.
 """
 
-from layout import Layout, LayoutTensor
 from max.gpu.host import DeviceContext
 from std.math import tanh
 from max.gpu import global_idx
@@ -30,14 +29,15 @@ from noeira.nn.primitives.rsample import RSample
 from noeira.deep_agents.training.blocks.action_kernels import (
     offpolicy_copy2d_kernel,
 )
+from noeira.core.tiles import Tile
 
 
 def mt_concat2_kernel[
     N: Int, D1: Int, D2: Int
 ](
-    a: LayoutTensor[DT, Layout.row_major(N, D1), MutAnyOrigin],
-    b: LayoutTensor[DT, Layout.row_major(N, D2), MutAnyOrigin],
-    out_t: LayoutTensor[DT, Layout.row_major(N, D1 + D2), MutAnyOrigin],
+    a: Tile[DT, N, D1],
+    b: Tile[DT, N, D2],
+    out_t: Tile[DT, N, D1 + D2],
 ):
     """`out[n] = a[n] ++ b[n]` — the `[obs | tem]` / `[z | tem]` join."""
     var i = Int(global_idx.x)
@@ -55,9 +55,9 @@ def mt_concat2_kernel[
 def mt_mask_clamp_kernel[
     N: Int, ACT: Int, ALP: Int
 ](
-    alp: LayoutTensor[DT, Layout.row_major(N, ALP), MutAnyOrigin],
-    mask: LayoutTensor[DT, Layout.row_major(ACT), MutAnyOrigin],
-    action_out: LayoutTensor[DT, Layout.row_major(N, ACT), MutAnyOrigin],
+    alp: Tile[DT, N, ALP],
+    mask: Tile[DT, ACT],
+    action_out: Tile[DT, N, ACT],
     action_scale: Scalar[DT],
 ):
     """`action[n,j] = clamp(alp[n,j], ±scale) · mask[j]`.
@@ -83,9 +83,9 @@ def mt_mask_clamp_kernel[
 def mt_greedy_mask_kernel[
     N: Int, ACT: Int, POL: Int
 ](
-    pio: LayoutTensor[DT, Layout.row_major(N, POL), MutAnyOrigin],
-    mask: LayoutTensor[DT, Layout.row_major(ACT), MutAnyOrigin],
-    action_out: LayoutTensor[DT, Layout.row_major(N, ACT), MutAnyOrigin],
+    pio: Tile[DT, N, POL],
+    mask: Tile[DT, ACT],
+    action_out: Tile[DT, N, ACT],
     action_scale: Scalar[DT],
 ):
     """`action[n,j] = tanh(pio[n,j])·scale·mask[j]` — the deterministic head,
@@ -124,8 +124,8 @@ def tdmpc2_mt_select_action_batched[
     mut alp_scr: Tensor,     # [N, ACT+1]
     mut tem: Tensor,         # [N, EMB]  — caller-gathered task embedding
     mut mask_scr: Tensor,    # [ACT]     — the current task's action mask
-    obs: LayoutTensor[DT, Layout.row_major(N_ENVS, MAX_OBS), MutAnyOrigin],
-    action: LayoutTensor[DT, Layout.row_major(N_ENVS, ACT), MutAnyOrigin],
+    obs: Tile[DT, N_ENVS, MAX_OBS],
+    action: Tile[DT, N_ENVS, ACT],
     action_scale: Scalar[DT],
     explore: Bool,
     ctx: Optional[DeviceContext],
@@ -196,15 +196,15 @@ def tdmpc2_mt_select_action_batched[
         comptime tot_obs = N_ENVS * MAX_OBS
         c.enqueue_function[offpolicy_copy2d_kernel[N_ENVS, MAX_OBS]](
             obs,
-            ob_scr.lt["gpu", Layout.row_major(N_ENVS, MAX_OBS)](),
+            ob_scr.tt["gpu", N_ENVS, MAX_OBS](),
             grid_dim=(tot_obs + TPB - 1) // TPB,
             block_dim=TPB,
         )
         comptime tot_ein = N_ENVS * AOBS
         c.enqueue_function[mt_concat2_kernel[N_ENVS, MAX_OBS, EMB]](
-            ob_scr.lt["gpu", Layout.row_major(N_ENVS, MAX_OBS)](),
-            tem.lt["gpu", Layout.row_major(N_ENVS, EMB)](),
-            ein_scr.lt["gpu", Layout.row_major(N_ENVS, AOBS)](),
+            ob_scr.tt["gpu", N_ENVS, MAX_OBS](),
+            tem.tt["gpu", N_ENVS, EMB](),
+            ein_scr.tt["gpu", N_ENVS, AOBS](),
             grid_dim=(tot_ein + TPB - 1) // TPB,
             block_dim=TPB,
         )
@@ -213,9 +213,9 @@ def tdmpc2_mt_select_action_batched[
         )
         comptime tot_pin = N_ENVS * PIN
         c.enqueue_function[mt_concat2_kernel[N_ENVS, LATENT, EMB]](
-            z_scr.lt["gpu", Layout.row_major(N_ENVS, LATENT)](),
-            tem.lt["gpu", Layout.row_major(N_ENVS, EMB)](),
-            pin_scr.lt["gpu", Layout.row_major(N_ENVS, PIN)](),
+            z_scr.tt["gpu", N_ENVS, LATENT](),
+            tem.tt["gpu", N_ENVS, EMB](),
+            pin_scr.tt["gpu", N_ENVS, PIN](),
             grid_dim=(tot_pin + TPB - 1) // TPB,
             block_dim=TPB,
         )
@@ -229,8 +229,8 @@ def tdmpc2_mt_select_action_batched[
                 rs, TensorRefs[1](pio_scr), alp_scr, ctx
             )
             c.enqueue_function[mt_mask_clamp_kernel[N_ENVS, ACT, ACT + 1]](
-                alp_scr.lt["gpu", Layout.row_major(N_ENVS, ACT + 1)](),
-                mask_scr.lt["gpu", Layout.row_major(ACT)](),
+                alp_scr.tt["gpu", N_ENVS, ACT + 1](),
+                mask_scr.tt["gpu", ACT](),
                 action,
                 action_scale,
                 grid_dim=(tot_act + TPB - 1) // TPB,
@@ -238,8 +238,8 @@ def tdmpc2_mt_select_action_batched[
             )
         else:
             c.enqueue_function[mt_greedy_mask_kernel[N_ENVS, ACT, POL]](
-                pio_scr.lt["gpu", Layout.row_major(N_ENVS, POL)](),
-                mask_scr.lt["gpu", Layout.row_major(ACT)](),
+                pio_scr.tt["gpu", N_ENVS, POL](),
+                mask_scr.tt["gpu", ACT](),
                 action,
                 action_scale,
                 grid_dim=(tot_act + TPB - 1) // TPB,
@@ -250,8 +250,8 @@ def tdmpc2_mt_select_action_batched[
 def mt_apply_mask_kernel[
     N: Int, ACT: Int
 ](
-    action: LayoutTensor[DT, Layout.row_major(N, ACT), MutAnyOrigin],
-    mask: LayoutTensor[DT, Layout.row_major(ACT), MutAnyOrigin],
+    action: Tile[DT, N, ACT],
+    mask: Tile[DT, ACT],
 ):
     """`action[n,j] *= mask[j]`, in place.
 
@@ -281,7 +281,7 @@ def tdmpc2_mt_encode_batched[
     mut ein_scr: Tensor,
     mut z_scr: Tensor,
     mut tem: Tensor,
-    obs: LayoutTensor[DT, Layout.row_major(N_ENVS, MAX_OBS), MutAnyOrigin],
+    obs: Tile[DT, N_ENVS, MAX_OBS],
     ctx: Optional[DeviceContext],
 ) raises:
     """`z_scr ← encode([obs | tem])` for N envs — the MPPI planner's roots.
@@ -300,15 +300,15 @@ def tdmpc2_mt_encode_batched[
     comptime tot_obs = N_ENVS * MAX_OBS
     c.enqueue_function[offpolicy_copy2d_kernel[N_ENVS, MAX_OBS]](
         obs,
-        ob_scr.lt["gpu", Layout.row_major(N_ENVS, MAX_OBS)](),
+        ob_scr.tt["gpu", N_ENVS, MAX_OBS](),
         grid_dim=(tot_obs + TPB - 1) // TPB,
         block_dim=TPB,
     )
     comptime tot_ein = N_ENVS * AOBS
     c.enqueue_function[mt_concat2_kernel[N_ENVS, MAX_OBS, EMB]](
-        ob_scr.lt["gpu", Layout.row_major(N_ENVS, MAX_OBS)](),
-        tem.lt["gpu", Layout.row_major(N_ENVS, EMB)](),
-        ein_scr.lt["gpu", Layout.row_major(N_ENVS, AOBS)](),
+        ob_scr.tt["gpu", N_ENVS, MAX_OBS](),
+        tem.tt["gpu", N_ENVS, EMB](),
+        ein_scr.tt["gpu", N_ENVS, AOBS](),
         grid_dim=(tot_ein + TPB - 1) // TPB,
         block_dim=TPB,
     )

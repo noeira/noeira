@@ -19,7 +19,6 @@ from noeira.nn.core.param import walk_params, ParamVisitorRef
 from std.math import sqrt
 from max.gpu import global_idx
 from max.gpu.host import DeviceContext
-from layout import Layout, LayoutTensor
 
 from noeira.nn.constants import DT, TPB
 from noeira.nn.core.initializer import Initializer, Deterministic
@@ -54,6 +53,7 @@ from .names import (
 from noeira.io.safetensors import SafeTensors
 from noeira.nn.core.torch_names import LoadTorchNamed
 from noeira.nn.peft.freeze import freeze_params, FreezeParams
+from noeira.core.tiles import Tile
 
 
 def _claimed_every_entry(
@@ -138,8 +138,8 @@ def scaled_copy_into[
         var c = ctx.value()
         comptime nb = (N + TPB - 1) // TPB
         c.enqueue_function[_scaled_copy_kernel[N, M]](
-            dst.lt["gpu", Layout.row_major(M)](),
-            src.lt["gpu", Layout.row_major(N)](),
+            dst.tt["gpu", M](),
+            src.tt["gpu", N](),
             scale,
             # ⚠ `Int32`, not `Int`. `Int`/`UInt`/`Bool` are NOT `DevicePassable`
             # — a kernel taking one fails to instantiate, and the failure shows
@@ -154,8 +154,8 @@ def scaled_copy_into[
 def _scaled_copy_kernel[
     N: Int, M: Int
 ](
-    dst: LayoutTensor[DT, Layout.row_major(M), MutAnyOrigin],
-    src: LayoutTensor[DT, Layout.row_major(N), MutAnyOrigin],
+    dst: Tile[DT, M],
+    src: Tile[DT, N],
     scale: Scalar[DT],
     dst_off: Int32,
 ):

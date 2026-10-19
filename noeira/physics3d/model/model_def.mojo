@@ -23,7 +23,7 @@ from ..gpu.constants import (
 
 # GPU imports
 from max.gpu.host import DeviceContext, DeviceBuffer
-from layout import Layout, LayoutTensor
+from noeira.core.tiles import Tile
 
 
 comptime _RVec3 = _Vec3G[DType.float64]
@@ -230,43 +230,17 @@ trait ModelDefLike:
         NORMALIZED: Bool = False,
     ](
         ctx: DeviceContext,
-        qfrc: LayoutTensor[
-            DTYPE, Layout.row_major(BATCH_SIZE, Self.NV), MutAnyOrigin
-        ],
-        actions: LayoutTensor[
-            DTYPE, Layout.row_major(BATCH_SIZE, ACTION_DIM), MutAnyOrigin
-        ],
-        qpos: LayoutTensor[
-            DTYPE, Layout.row_major(BATCH_SIZE, Self.NQ), MutAnyOrigin
-        ],
-        qvel: LayoutTensor[
-            DTYPE, Layout.row_major(BATCH_SIZE, Self.NV), MutAnyOrigin
-        ],
-        act: LayoutTensor[
-            DTYPE, Layout.row_major(BATCH_SIZE, Self.NA_F), MutAnyOrigin
-        ],
-        acts: LayoutTensor[
-            DTYPE,
-            Layout.row_major(Self.NACT_F * MODEL_ACTUATOR_SIZE),
-            MutAnyOrigin,
-        ],
-        act_tendons: LayoutTensor[
-            DTYPE,
-            Layout.row_major(Self.NTEN_F * MODEL_ACT_TENDON_SIZE),
-            MutAnyOrigin,
-        ],
-        joint_limits: LayoutTensor[
-            DTYPE, Layout.row_major(Self.NJOINT * JLIM_SIZE), MutAnyOrigin
-        ],
-        dof_actdamp: LayoutTensor[
-            DTYPE, Layout.row_major(BATCH_SIZE, Self.NV), MutAnyOrigin
-        ],
-        actdamp_act: LayoutTensor[
-            DTYPE, Layout.row_major(BATCH_SIZE, Self.NACT_F), MutAnyOrigin
-        ],
-        meta: LayoutTensor[
-            DTYPE, Layout.row_major(BATCH_SIZE, METADATA_SIZE), MutAnyOrigin
-        ],
+        qfrc: Tile[DTYPE, BATCH_SIZE, Self.NV],
+        actions: Tile[DTYPE, BATCH_SIZE, ACTION_DIM],
+        qpos: Tile[DTYPE, BATCH_SIZE, Self.NQ],
+        qvel: Tile[DTYPE, BATCH_SIZE, Self.NV],
+        act: Tile[DTYPE, BATCH_SIZE, Self.NA_F],
+        acts: Tile[DTYPE, Self.NACT_F * MODEL_ACTUATOR_SIZE],
+        act_tendons: Tile[DTYPE, Self.NTEN_F * MODEL_ACT_TENDON_SIZE],
+        joint_limits: Tile[DTYPE, Self.NJOINT * JLIM_SIZE],
+        dof_actdamp: Tile[DTYPE, BATCH_SIZE, Self.NV],
+        actdamp_act: Tile[DTYPE, BATCH_SIZE, Self.NACT_F],
+        meta: Tile[DTYPE, BATCH_SIZE, METADATA_SIZE],
     ) raises:
         """⚠ `joint_limits` added for `jnt_actfrcrange` — MuJoCo's SECOND
         actuator force clamp (`engine_forward.c:477`), which is per-JOINT on
@@ -295,24 +269,12 @@ trait ModelDefLike:
         DTYPE: DType,
         BATCH_SIZE: Int,
     ](
-        qpos: LayoutTensor[
-            DTYPE, Layout.row_major(BATCH_SIZE, Self.NQ), MutAnyOrigin
-        ],
-        qvel: LayoutTensor[
-            DTYPE, Layout.row_major(BATCH_SIZE, Self.NV), MutAnyOrigin
-        ],
-        qacc: LayoutTensor[
-            DTYPE, Layout.row_major(BATCH_SIZE, Self.NV), MutAnyOrigin
-        ],
-        qfrc: LayoutTensor[
-            DTYPE, Layout.row_major(BATCH_SIZE, Self.NV), MutAnyOrigin
-        ],
-        qpos0: LayoutTensor[
-            DTYPE, Layout.row_major(Self.NQ_F), MutAnyOrigin
-        ],
-        pose_meta: LayoutTensor[
-            DTYPE, Layout.row_major(POSE_META_SIZE), MutAnyOrigin
-        ],
+        qpos: Tile[DTYPE, BATCH_SIZE, Self.NQ],
+        qvel: Tile[DTYPE, BATCH_SIZE, Self.NV],
+        qacc: Tile[DTYPE, BATCH_SIZE, Self.NV],
+        qfrc: Tile[DTYPE, BATCH_SIZE, Self.NV],
+        qpos0: Tile[DTYPE, Self.NQ_F],
+        pose_meta: Tile[DTYPE, POSE_META_SIZE],
         env: Int,
         noise_scale: Scalar[DTYPE],
         seed: Int,
@@ -326,15 +288,9 @@ trait ModelDefLike:
         BATCH_SIZE: Int,
         OBS_DIM: Int,
     ](
-        qpos: LayoutTensor[
-            DTYPE, Layout.row_major(BATCH_SIZE, Self.NQ), MutAnyOrigin
-        ],
-        qvel: LayoutTensor[
-            DTYPE, Layout.row_major(BATCH_SIZE, Self.NV), MutAnyOrigin
-        ],
-        obs: LayoutTensor[
-            DTYPE, Layout.row_major(BATCH_SIZE, OBS_DIM), MutAnyOrigin
-        ],
+        qpos: Tile[DTYPE, BATCH_SIZE, Self.NQ],
+        qvel: Tile[DTYPE, BATCH_SIZE, Self.NV],
+        obs: Tile[DTYPE, BATCH_SIZE, OBS_DIM],
         env: Int,
     ):
         ...

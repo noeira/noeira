@@ -8,7 +8,6 @@ This order is crucial for energy conservation in constrained systems.
 """
 
 from std.math import cos, sin, pi, sqrt
-from layout import LayoutTensor, Layout
 from max.gpu import thread_idx, block_idx, block_dim
 from max.gpu.host import DeviceContext, DeviceBuffer
 
@@ -31,6 +30,7 @@ from ..constants import (
     B2_MAX_ROTATION,
 )
 from ..traits.integrator import Integrator
+from noeira.core.tiles import Tile, tile
 
 
 struct SemiImplicitEuler(Integrator):
@@ -57,14 +57,8 @@ struct SemiImplicitEuler(Integrator):
         NUM_BODIES: Int,
     ](
         self,
-        mut bodies: LayoutTensor[
-            dtype,
-            Layout.row_major(BATCH, NUM_BODIES, BODY_STATE_SIZE),
-            MutAnyOrigin,
-        ],
-        forces: LayoutTensor[
-            dtype, Layout.row_major(BATCH, NUM_BODIES, 3), MutAnyOrigin
-        ],
+        bodies: Tile[dtype, BATCH, NUM_BODIES, BODY_STATE_SIZE],
+        forces: Tile[dtype, BATCH, NUM_BODIES, 3],
         gravity_x: Scalar[dtype],
         gravity_y: Scalar[dtype],
         dt: Scalar[dtype],
@@ -105,21 +99,13 @@ struct SemiImplicitEuler(Integrator):
         NUM_BODIES: Int,
     ](
         self,
-        mut bodies: LayoutTensor[
-            dtype,
-            Layout.row_major(BATCH, NUM_BODIES, BODY_STATE_SIZE),
-            MutAnyOrigin,
-        ],
+        bodies: Tile[dtype, BATCH, NUM_BODIES, BODY_STATE_SIZE],
         dt: Scalar[dtype],
     ):
         """Integrate positions: x' = x + v' * dt (using NEW velocity). The
         bodies layout is the flat state layout with BODIES_OFFSET = 0, so
         this routes to `integrate_positions_single_env` (ONE rule)."""
-        var state = LayoutTensor[
-            dtype,
-            Layout.row_major(BATCH, NUM_BODIES * BODY_STATE_SIZE),
-            MutAnyOrigin,
-        ](bodies.ptr)
+        var state = tile[BATCH, NUM_BODIES * BODY_STATE_SIZE](bodies.ptr)
         for env in range(BATCH):
             Self.integrate_positions_single_env[
                 BATCH, NUM_BODIES, NUM_BODIES * BODY_STATE_SIZE, 0
@@ -150,11 +136,7 @@ struct SemiImplicitEuler(Integrator):
         FORCES_OFFSET: Int,
     ](
         env: Int,
-        state: LayoutTensor[
-            dtype,
-            Layout.row_major(BATCH, STATE_SIZE),
-            MutAnyOrigin,
-        ],
+        state: Tile[dtype, BATCH, STATE_SIZE],
         gravity_x: Scalar[dtype],
         gravity_y: Scalar[dtype],
         dt: Scalar[dtype],
@@ -201,11 +183,7 @@ struct SemiImplicitEuler(Integrator):
         BODIES_OFFSET: Int,
     ](
         env: Int,
-        state: LayoutTensor[
-            dtype,
-            Layout.row_major(BATCH, STATE_SIZE),
-            MutAnyOrigin,
-        ],
+        state: Tile[dtype, BATCH, STATE_SIZE],
         dt: Scalar[dtype],
     ):
         """Integrate positions for a single environment.
@@ -261,11 +239,7 @@ struct SemiImplicitEuler(Integrator):
         BODIES_OFFSET: Int,
         FORCES_OFFSET: Int,
     ](
-        state: LayoutTensor[
-            dtype,
-            Layout.row_major(BATCH, STATE_SIZE),
-            MutAnyOrigin,
-        ],
+        state: Tile[dtype, BATCH, STATE_SIZE],
         gravity_x: Scalar[dtype],
         gravity_y: Scalar[dtype],
         dt: Scalar[dtype],
@@ -287,11 +261,7 @@ struct SemiImplicitEuler(Integrator):
         STATE_SIZE: Int,
         BODIES_OFFSET: Int,
     ](
-        state: LayoutTensor[
-            dtype,
-            Layout.row_major(BATCH, STATE_SIZE),
-            MutAnyOrigin,
-        ],
+        state: Tile[dtype, BATCH, STATE_SIZE],
         dt: Scalar[dtype],
     ):
         """GPU kernel for position integration with 2D strided layout."""
@@ -326,19 +296,13 @@ struct SemiImplicitEuler(Integrator):
             gravity_y: Gravity Y component.
             dt: Time step.
         """
-        var state = LayoutTensor[
-            dtype, Layout.row_major(BATCH, STATE_SIZE)
-        ](state_buf)  # mut=True view from `mut state_buf` (written in place)
+        var state = tile[BATCH, STATE_SIZE](state_buf)  # mut=True view from `mut state_buf` (written in place)
 
         comptime BLOCKS = (BATCH + TPB - 1) // TPB
 
         @always_inline
         def kernel_wrapper(
-            state: LayoutTensor[
-                dtype,
-                Layout.row_major(BATCH, STATE_SIZE),
-                MutAnyOrigin,
-            ],
+            state: Tile[dtype, BATCH, STATE_SIZE],
             gravity_x: Scalar[dtype],
             gravity_y: Scalar[dtype],
             dt: Scalar[dtype],
@@ -374,19 +338,13 @@ struct SemiImplicitEuler(Integrator):
             state_buf: State buffer [BATCH * STATE_SIZE].
             dt: Time step.
         """
-        var state = LayoutTensor[
-            dtype, Layout.row_major(BATCH, STATE_SIZE)
-        ](state_buf)  # mut=True view from `mut state_buf` (written in place)
+        var state = tile[BATCH, STATE_SIZE](state_buf)  # mut=True view from `mut state_buf` (written in place)
 
         comptime BLOCKS = (BATCH + TPB - 1) // TPB
 
         @always_inline
         def kernel_wrapper(
-            state: LayoutTensor[
-                dtype,
-                Layout.row_major(BATCH, STATE_SIZE),
-                MutAnyOrigin,
-            ],
+            state: Tile[dtype, BATCH, STATE_SIZE],
             dt: Scalar[dtype],
         ):
             SemiImplicitEuler.integrate_positions_kernel[

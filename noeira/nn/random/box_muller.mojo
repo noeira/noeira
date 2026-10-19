@@ -20,9 +20,9 @@ from max.gpu import block_dim, block_idx, thread_idx
 from max.gpu.host import DeviceContext
 from std.random import random_float64
 from std.random.philox import Random as PhiloxRandom
-from layout import Layout, LayoutTensor
 
 from ..constants import DT, TPB
+from noeira.core.tiles import Tile, tile
 
 
 def box_muller_normal[
@@ -46,7 +46,7 @@ def box_muller_normal[
 
 
 def _box_muller_kernel[N: Int](
-    noise: LayoutTensor[DT, Layout.row_major(N), MutAnyOrigin],
+    noise: Tile[DT, N],
     seed: UInt64,
     offset_base: UInt64,
 ):
@@ -90,7 +90,7 @@ def box_muller_normal_gpu[N: Int](
     without reuse. The Philox stream is deterministic for a given
     (seed, offset_base) pair.
     """
-    var noise_lt = LayoutTensor[DT, Layout.row_major(N), MutAnyOrigin](out_ptr)
+    var noise_lt = tile[N](out_ptr)
     comptime n_blocks = (N + TPB - 1) // TPB
     comptime kernel = _box_muller_kernel[N]
     ctx.enqueue_function[kernel](
@@ -112,9 +112,9 @@ def box_muller_normal_gpu[N: Int](
 
 
 def _box_muller_kernel_dev[N: Int](
-    noise: LayoutTensor[DT, Layout.row_major(N), MutAnyOrigin],
+    noise: Tile[DT, N],
     seed: UInt64,
-    offset_buf: LayoutTensor[DType.uint64, Layout.row_major(1), MutAnyOrigin],
+    offset_buf: Tile[DType.uint64, 1],
 ):
     """As `_box_muller_kernel` but reads `offset_base` from `offset_buf[0]`."""
     var idx = Int(block_dim.x * block_idx.x + thread_idx.x)
@@ -139,7 +139,7 @@ def _box_muller_kernel_dev[N: Int](
 
 
 def advance_rng_offset_kernel[AMT: Int](
-    offset: LayoutTensor[DType.uint64, Layout.row_major(1), MutAnyOrigin],
+    offset: Tile[DType.uint64, 1],
 ):
     """Bump a 1-elem device Philox offset by the comptime `AMT`. Launch
     grid=(1,), block=(1,); enqueue AFTER the draw kernel so the offset
@@ -152,12 +152,12 @@ def box_muller_normal_gpu_dev[N: Int](
     ctx: DeviceContext,
     out_ptr: Pointer[Scalar[DT], MutAnyOrigin],
     seed: UInt64,
-    offset_buf: LayoutTensor[DType.uint64, Layout.row_major(1), MutAnyOrigin],
+    offset_buf: Tile[DType.uint64, 1],
 ) raises:
     """Device-offset variant of `box_muller_normal_gpu`. Reads the Philox
     offset from `offset_buf`; the caller advances it with
     `advance_rng_offset_kernel` after the draw."""
-    var noise_lt = LayoutTensor[DT, Layout.row_major(N), MutAnyOrigin](out_ptr)
+    var noise_lt = tile[N](out_ptr)
     comptime n_blocks = (N + TPB - 1) // TPB
     comptime kernel = _box_muller_kernel_dev[N]
     ctx.enqueue_function[kernel](

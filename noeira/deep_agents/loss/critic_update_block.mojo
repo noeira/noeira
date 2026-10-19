@@ -29,7 +29,6 @@ Surface:
 
 from max.gpu import block_dim, block_idx, thread_idx
 from max.gpu.host import DeviceContext
-from layout import Layout, LayoutTensor
 
 from noeira.nn.constants import DT, TPB
 from noeira.nn.core.module import Module
@@ -41,6 +40,7 @@ from noeira.nn.optimizer.adam import Adam
 from noeira.nn.loss.mse_loss import MSELoss
 from .loss_block import LossBlock
 from ..training.off_policy_critic import concat_sa, concat_sa_gpu
+from noeira.core.tiles import Tile
 
 
 # ──────────────────────────────────────────────────────────────────────
@@ -51,8 +51,8 @@ from ..training.off_policy_critic import concat_sa, concat_sa_gpu
 def _scale_grad_by_weights_kernel[
     BATCH: Int
 ](
-    mb_grad_q: LayoutTensor[DT, Layout.row_major(BATCH, 1), MutAnyOrigin],
-    weights: LayoutTensor[DT, Layout.row_major(BATCH), MutAnyOrigin],
+    mb_grad_q: Tile[DT, BATCH, 1],
+    weights: Tile[DT, BATCH],
 ):
     """Per-lane in-place scaling `mb_grad_q[i,0] *= weights[i]` — the PER
     correction `grad_θ ∝ Σ_b w_b·(Q_b−y_b)·∂Q/∂θ` (Schaul et al. §3.4)."""
@@ -65,8 +65,8 @@ def _scale_grad_by_weights_kernel[
 def _capture_td_residuals_kernel[
     BATCH: Int
 ](
-    mb_grad_q: LayoutTensor[DT, Layout.row_major(BATCH, 1), MutAnyOrigin],
-    out_residuals: LayoutTensor[DT, Layout.row_major(BATCH), MutAnyOrigin],
+    mb_grad_q: Tile[DT, BATCH, 1],
+    out_residuals: Tile[DT, BATCH],
 ):
     """Recover the unscaled signed TD residual `Q−y = mb_grad_q·BATCH` (the
     value MSE.vjp wrote) for PER priority refresh. Run BEFORE IS scaling."""
@@ -132,10 +132,10 @@ struct CriticUpdateBlock[
         mut sa: Tensor,
         mut y: Tensor,
         weights: Optional[
-            LayoutTensor[DT, Layout.row_major(Self.BATCH), MutAnyOrigin]
+            Tile[DT, Self.BATCH]
         ] = None,
         td_residuals: Optional[
-            LayoutTensor[DT, Layout.row_major(Self.BATCH), MutAnyOrigin]
+            Tile[DT, Self.BATCH]
         ] = None,
         ctx: Optional[DeviceContext] = None,
     ) raises -> Scalar[DT]:
@@ -171,9 +171,7 @@ struct CriticUpdateBlock[
                 ctx.value().enqueue_function[
                     _capture_td_residuals_kernel[Self.BATCH]
                 ](
-                    self._mb_grad_q.lt[
-                        "gpu", Layout.row_major(Self.BATCH, 1)
-                    ](),
+                    self._mb_grad_q.tt["gpu", Self.BATCH, 1](),
                     td,
                     grid_dim=n_blocks,
                     block_dim=TPB,
@@ -192,9 +190,7 @@ struct CriticUpdateBlock[
                 ctx.value().enqueue_function[
                     _scale_grad_by_weights_kernel[Self.BATCH]
                 ](
-                    self._mb_grad_q.lt[
-                        "gpu", Layout.row_major(Self.BATCH, 1)
-                    ](),
+                    self._mb_grad_q.tt["gpu", Self.BATCH, 1](),
                     w,
                     grid_dim=n_blocks,
                     block_dim=TPB,
@@ -265,10 +261,10 @@ struct TwinCriticUpdateBlock[
         mut mb_a: Tensor,
         mut mb_y: Tensor,
         weights: Optional[
-            LayoutTensor[DT, Layout.row_major(Self.BATCH), MutAnyOrigin]
+            Tile[DT, Self.BATCH]
         ] = None,
         td_residuals: Optional[
-            LayoutTensor[DT, Layout.row_major(Self.BATCH), MutAnyOrigin]
+            Tile[DT, Self.BATCH]
         ] = None,
         ctx: Optional[DeviceContext] = None,
     ) raises -> Scalar[DT]:
@@ -276,16 +272,16 @@ struct TwinCriticUpdateBlock[
         captured from critic1 only (canonical PER proxy)."""
         comptime if target == "cpu":
             concat_sa[Self.OBS, Self.ACT, Self.BATCH](
-                mb_s.lt["cpu", Layout.row_major(Self.BATCH, Self.OBS)](),
-                mb_a.lt["cpu", Layout.row_major(Self.BATCH, Self.ACT)](),
-                self._mb_sa.lt["cpu", Layout.row_major(Self.BATCH, Self.SA_DIM)](),
+                mb_s.tt["cpu", Self.BATCH, Self.OBS](),
+                mb_a.tt["cpu", Self.BATCH, Self.ACT](),
+                self._mb_sa.tt["cpu", Self.BATCH, Self.SA_DIM](),
             )
         else:
             concat_sa_gpu[Self.OBS, Self.ACT, Self.BATCH](
                 ctx.value(),
-                mb_s.lt["gpu", Layout.row_major(Self.BATCH, Self.OBS)](),
-                mb_a.lt["gpu", Layout.row_major(Self.BATCH, Self.ACT)](),
-                self._mb_sa.lt["gpu", Layout.row_major(Self.BATCH, Self.SA_DIM)](),
+                mb_s.tt["gpu", Self.BATCH, Self.OBS](),
+                mb_a.tt["gpu", Self.BATCH, Self.ACT](),
+                self._mb_sa.tt["gpu", Self.BATCH, Self.SA_DIM](),
             )
 
         var loss1 = self.c1.step[target, POLICY, ACCUMULATE](

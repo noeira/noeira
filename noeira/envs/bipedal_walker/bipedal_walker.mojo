@@ -11,7 +11,6 @@ All physics data is packed per-environment for efficient GPU access.
 
 from std.math import sqrt, cos, sin, pi, tanh
 from std.memory import alloc
-from layout import Layout, LayoutTensor
 from max.gpu import thread_idx, block_idx, block_dim
 from max.gpu.host import DeviceContext, DeviceBuffer
 from std.random.philox import Random as PhiloxRandom
@@ -91,6 +90,7 @@ from noeira.physics2d import (
     PhysicsEnvHelpers,
     PhysicsConfig,
 )
+from noeira.core.tiles import Tile, ImmTile, tile
 
 
 # =============================================================================
@@ -1569,17 +1569,13 @@ struct BipedalWalker[
         rng_seed: UInt64 = 0,
     ) raises:
         """GPU reset kernel."""
-        var states = LayoutTensor[
-            dtype, Layout.row_major(BATCH_SIZE, STATE_SIZE)
-        ](states_buf)
+        var states = tile[BATCH_SIZE, STATE_SIZE](states_buf)
 
         comptime BLOCKS = (BATCH_SIZE + TPB - 1) // TPB
 
         @always_inline
         def reset_wrapper(
-            states: LayoutTensor[
-                dtype, Layout.row_major(BATCH_SIZE, STATE_SIZE), MutAnyOrigin
-            ],
+            states: Tile[dtype, BATCH_SIZE, STATE_SIZE],
             seed: Scalar[dtype],
         ):
             var i = Int(block_dim.x * block_idx.x + thread_idx.x)
@@ -1614,33 +1610,19 @@ struct BipedalWalker[
         ] = None,
     ) raises:
         """GPU selective reset kernel - resets only done environments."""
-        var states = LayoutTensor[
-            dtype, Layout.row_major(BATCH_SIZE, STATE_SIZE)
-        ](states_buf)
-        var dones = LayoutTensor[
-            dtype, Layout.row_major(BATCH_SIZE)
-        ](dones_buf)
+        var states = tile[BATCH_SIZE, STATE_SIZE](states_buf)
+        var dones = tile[BATCH_SIZE](dones_buf)
 
         comptime BLOCKS = (BATCH_SIZE + TPB - 1) // TPB
 
         if Bool(rng_counter_ptr):
-            var counter_t = LayoutTensor[
-                DType.uint64, Layout.row_major(1), MutAnyOrigin
-            ](rng_counter_ptr.value())
+            var counter_t = tile[1](rng_counter_ptr.value())
 
             @always_inline
             def selective_reset_counter_wrapper(
-                states: LayoutTensor[
-                    dtype,
-                    Layout.row_major(BATCH_SIZE, STATE_SIZE),
-                    MutAnyOrigin,
-                ],
-                dones: LayoutTensor[
-                    dtype, Layout.row_major(BATCH_SIZE), MutAnyOrigin
-                ],
-                counter: LayoutTensor[
-                    DType.uint64, Layout.row_major(1), MutAnyOrigin
-                ],
+                states: Tile[dtype, BATCH_SIZE, STATE_SIZE],
+                dones: Tile[dtype, BATCH_SIZE],
+                counter: Tile[DType.uint64, 1],
             ):
                 var i = Int(block_dim.x * block_idx.x + thread_idx.x)
                 if i >= BATCH_SIZE:
@@ -1668,14 +1650,8 @@ struct BipedalWalker[
 
             @always_inline
             def selective_reset_wrapper(
-                states: LayoutTensor[
-                    dtype,
-                    Layout.row_major(BATCH_SIZE, STATE_SIZE),
-                    MutAnyOrigin,
-                ],
-                dones: LayoutTensor[
-                    dtype, Layout.row_major(BATCH_SIZE), MutAnyOrigin
-                ],
+                states: Tile[dtype, BATCH_SIZE, STATE_SIZE],
+                dones: Tile[dtype, BATCH_SIZE],
                 seed: Scalar[dtype],
             ):
                 var i = Int(block_dim.x * block_idx.x + thread_idx.x)
@@ -1709,25 +1685,15 @@ struct BipedalWalker[
     ) raises:
         """Extract observations from state buffer (trivial copy: obs = state[0:OBS_DIM]).
         """
-        var states = LayoutTensor[
-            dtype, Layout.row_major(BATCH_SIZE, STATE_SIZE_VAL)
-        ](states_buf)
-        var obs = LayoutTensor[
-            dtype, Layout.row_major(BATCH_SIZE, OBS_DIM_VAL)
-        ](obs_buf)
+        var states = tile[BATCH_SIZE, STATE_SIZE_VAL](states_buf)
+        var obs = tile[BATCH_SIZE, OBS_DIM_VAL](obs_buf)
 
         comptime BLOCKS = (BATCH_SIZE + TPB - 1) // TPB
 
         @always_inline
         def extract_obs(
-            states: LayoutTensor[
-                dtype,
-                Layout.row_major(BATCH_SIZE, STATE_SIZE_VAL),
-                ImmutAnyOrigin,
-            ],
-            obs: LayoutTensor[
-                dtype, Layout.row_major(BATCH_SIZE, OBS_DIM_VAL), MutAnyOrigin
-            ],
+            states: ImmTile[dtype, BATCH_SIZE, STATE_SIZE_VAL],
+            obs: Tile[dtype, BATCH_SIZE, OBS_DIM_VAL],
         ):
             var i = Int(block_dim.x * block_idx.x + thread_idx.x)
             if i >= BATCH_SIZE:
@@ -1776,14 +1742,8 @@ struct BipedalWalker[
         STATE_SIZE: Int,
     ](
         env: Int,
-        states: LayoutTensor[
-            dtype, Layout.row_major(BATCH, STATE_SIZE), MutAnyOrigin
-        ],
-        contacts: LayoutTensor[
-            dtype,
-            Layout.row_major(BATCH, BWConstants.MAX_CONTACTS, CONTACT_DATA_SIZE),
-            MutAnyOrigin,
-        ],
+        states: Tile[dtype, BATCH, STATE_SIZE],
+        contacts: Tile[dtype, BATCH, BWConstants.MAX_CONTACTS, CONTACT_DATA_SIZE],
         n_contacts: Int,
         n_joints: Int,
         gravity_x: Scalar[dtype],
@@ -1841,9 +1801,7 @@ struct BipedalWalker[
         BATCH_SIZE: Int,
         STATE_SIZE: Int,
     ](
-        states: LayoutTensor[
-            dtype, Layout.row_major(BATCH_SIZE, STATE_SIZE), MutAnyOrigin
-        ],
+        states: Tile[dtype, BATCH_SIZE, STATE_SIZE],
         env: Int,
         seed: Int,
     ):
@@ -2089,9 +2047,7 @@ struct BipedalWalker[
         BATCH_SIZE: Int,
         STATE_SIZE: Int,
     ](
-        states: LayoutTensor[
-            dtype, Layout.row_major(BATCH_SIZE, STATE_SIZE), MutAnyOrigin
-        ],
+        states: Tile[dtype, BATCH_SIZE, STATE_SIZE],
         env: Int,
     ):
         """Compute initial observation after reset (GPU version).
@@ -2266,18 +2222,11 @@ struct BipedalWalker[
         mut shapes_buf: DeviceBuffer[dtype],
     ) raises:
         """Initialize shape definitions for GPU."""
-        var shapes = LayoutTensor[
-            dtype,
-            Layout.row_major(BWConstants.NUM_SHAPES * SHAPE_MAX_SIZE),
-        ](shapes_buf)
+        var shapes = tile[BWConstants.NUM_SHAPES * SHAPE_MAX_SIZE](shapes_buf)
 
         @always_inline
         def init_shapes_wrapper(
-            shapes: LayoutTensor[
-                dtype,
-                Layout.row_major(BWConstants.NUM_SHAPES * SHAPE_MAX_SIZE),
-                MutAnyOrigin,
-            ],
+            shapes: Tile[dtype, BWConstants.NUM_SHAPES * SHAPE_MAX_SIZE],
         ):
             var tid = Int(block_dim.x * block_idx.x + thread_idx.x)
             if tid > 0:
@@ -2354,73 +2303,27 @@ struct BipedalWalker[
         comptime BLOCKS = (BATCH_SIZE + TPB - 1) // TPB
         comptime STATE_SIZE = BWConstants.STATE_SIZE_VAL
 
-        var states = LayoutTensor[
-            dtype, Layout.row_major(BATCH_SIZE, STATE_SIZE)
-        ](states_buf)
-        var shapes = LayoutTensor[
-            dtype,
-            Layout.row_major(BWConstants.NUM_SHAPES, SHAPE_MAX_SIZE),
-        ](shapes_buf)
-        var contacts = LayoutTensor[
-            dtype,
-            Layout.row_major(
-                BATCH_SIZE, BWConstants.MAX_CONTACTS, CONTACT_DATA_SIZE
-            ),
-        ](contacts_buf)
-        var contact_counts = LayoutTensor[
-            dtype, Layout.row_major(BATCH_SIZE)
-        ](contact_counts_buf)
-        var actions = LayoutTensor[
-            dtype, Layout.row_major(BATCH_SIZE, ACTION_DIM)
-        ](actions_buf)
-        var rewards = LayoutTensor[
-            dtype, Layout.row_major(BATCH_SIZE)
-        ](rewards_buf)
-        var dones = LayoutTensor[
-            dtype, Layout.row_major(BATCH_SIZE)
-        ](dones_buf)
-        var terminated_out = LayoutTensor[
-            dtype, Layout.row_major(BATCH_SIZE)
-        ](terminated_buf)
-        var obs = LayoutTensor[
-            dtype, Layout.row_major(BATCH_SIZE, OBS_DIM)
-        ](obs_buf)
+        var states = tile[BATCH_SIZE, STATE_SIZE](states_buf)
+        var shapes = tile[BWConstants.NUM_SHAPES, SHAPE_MAX_SIZE](shapes_buf)
+        var contacts = tile[BATCH_SIZE, BWConstants.MAX_CONTACTS, CONTACT_DATA_SIZE](contacts_buf)
+        var contact_counts = tile[BATCH_SIZE](contact_counts_buf)
+        var actions = tile[BATCH_SIZE, ACTION_DIM](actions_buf)
+        var rewards = tile[BATCH_SIZE](rewards_buf)
+        var dones = tile[BATCH_SIZE](dones_buf)
+        var terminated_out = tile[BATCH_SIZE](terminated_buf)
+        var obs = tile[BATCH_SIZE, OBS_DIM](obs_buf)
 
         @always_inline
         def step_wrapper(
-            states: LayoutTensor[
-                dtype, Layout.row_major(BATCH_SIZE, STATE_SIZE), MutAnyOrigin
-            ],
-            shapes: LayoutTensor[
-                dtype,
-                Layout.row_major(BWConstants.NUM_SHAPES, SHAPE_MAX_SIZE),
-                ImmutAnyOrigin,
-            ],
-            contacts: LayoutTensor[
-                dtype,
-                Layout.row_major(
-                    BATCH_SIZE, BWConstants.MAX_CONTACTS, CONTACT_DATA_SIZE
-                ),
-                MutAnyOrigin,
-            ],
-            contact_counts: LayoutTensor[
-                dtype, Layout.row_major(BATCH_SIZE), MutAnyOrigin
-            ],
-            actions: LayoutTensor[
-                dtype, Layout.row_major(BATCH_SIZE, ACTION_DIM), ImmutAnyOrigin
-            ],
-            rewards: LayoutTensor[
-                dtype, Layout.row_major(BATCH_SIZE), MutAnyOrigin
-            ],
-            dones: LayoutTensor[
-                dtype, Layout.row_major(BATCH_SIZE), MutAnyOrigin
-            ],
-            terminated_out: LayoutTensor[
-                dtype, Layout.row_major(BATCH_SIZE), MutAnyOrigin
-            ],
-            obs: LayoutTensor[
-                dtype, Layout.row_major(BATCH_SIZE, OBS_DIM), MutAnyOrigin
-            ],
+            states: Tile[dtype, BATCH_SIZE, STATE_SIZE],
+            shapes: ImmTile[dtype, BWConstants.NUM_SHAPES, SHAPE_MAX_SIZE],
+            contacts: Tile[dtype, BATCH_SIZE, BWConstants.MAX_CONTACTS, CONTACT_DATA_SIZE],
+            contact_counts: Tile[dtype, BATCH_SIZE],
+            actions: ImmTile[dtype, BATCH_SIZE, ACTION_DIM],
+            rewards: Tile[dtype, BATCH_SIZE],
+            dones: Tile[dtype, BATCH_SIZE],
+            terminated_out: Tile[dtype, BATCH_SIZE],
+            obs: Tile[dtype, BATCH_SIZE, OBS_DIM],
         ):
             var env = Int(block_dim.x * block_idx.x + thread_idx.x)
             if env >= BATCH_SIZE:
@@ -2652,12 +2555,8 @@ struct BipedalWalker[
         OBS_DIM: Int,
     ](
         env: Int,
-        states: LayoutTensor[
-            dtype, Layout.row_major(BATCH_SIZE, STATE_SIZE), MutAnyOrigin
-        ],
-        obs: LayoutTensor[
-            dtype, Layout.row_major(BATCH_SIZE, OBS_DIM), MutAnyOrigin
-        ],
+        states: Tile[dtype, BATCH_SIZE, STATE_SIZE],
+        obs: Tile[dtype, BATCH_SIZE, OBS_DIM],
     ):
         """Compute 10 lidar readings from hull position.
 
@@ -2751,12 +2650,8 @@ struct BipedalWalker[
         ACTION_DIM: Int,
     ](
         env: Int,
-        states: LayoutTensor[
-            dtype, Layout.row_major(BATCH_SIZE, STATE_SIZE), MutAnyOrigin
-        ],
-        actions: LayoutTensor[
-            dtype, Layout.row_major(BATCH_SIZE, ACTION_DIM), ImmutAnyOrigin
-        ],
+        states: Tile[dtype, BATCH_SIZE, STATE_SIZE],
+        actions: ImmTile[dtype, BATCH_SIZE, ACTION_DIM],
     ):
         """Apply motor actions to joints."""
         # Hip 1
@@ -2847,12 +2742,8 @@ struct BipedalWalker[
         OBS_DIM: Int,
     ](
         env: Int,
-        states: LayoutTensor[
-            dtype, Layout.row_major(BATCH_SIZE, STATE_SIZE), MutAnyOrigin
-        ],
-        obs: LayoutTensor[
-            dtype, Layout.row_major(BATCH_SIZE, OBS_DIM), MutAnyOrigin
-        ],
+        states: Tile[dtype, BATCH_SIZE, STATE_SIZE],
+        obs: Tile[dtype, BATCH_SIZE, OBS_DIM],
     ):
         """Extract 24D observation from state.
 

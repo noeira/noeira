@@ -34,7 +34,6 @@ from std.os import makedirs
 from std.time import perf_counter_ns
 from max.gpu import global_idx
 from max.gpu.host import DeviceContext, DeviceBuffer, HostBuffer
-from layout import Layout, LayoutTensor
 
 from noeira.nn.constants import DT, TPB
 from noeira.nn.core.tensor import Tensor
@@ -46,6 +45,7 @@ from .ref_model import LeWMLossGraphRef
 from .ref_load import LoadRef
 from noeira.nn.optimizer.grad_clip import _sum_sq_kernel_rt, GC_TPB
 from noeira.io.fileio import write_file_atomic
+from noeira.core.tiles import Tile
 
 
 comptime REF_T = 4
@@ -115,7 +115,7 @@ def _lewm_pixels_kernel(
 def _clip_scale_kernel[
     N: Int
 ](
-    grad: LayoutTensor[DT, Layout.row_major(N), MutAnyOrigin],
+    grad: Tile[DT, N],
     scale: Scalar[DT],
 ):
     """grad *= scale; a scale of 0 writes exact zeros (the NaN guard)."""
@@ -371,7 +371,7 @@ struct _GradScale(ParamVisitor):
                 grad.data[i] = grad.data[i] * self.scale
         else:
             ctx.value().enqueue_function[_clip_scale_kernel[N]](
-                grad.lt["gpu", Layout.row_major(N)](),
+                grad.tt["gpu", N](),
                 self.scale,
                 grid_dim=(N + TPB - 1) // TPB,
                 block_dim=TPB,

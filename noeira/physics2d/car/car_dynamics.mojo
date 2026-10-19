@@ -14,7 +14,6 @@ Reference: gymnasium/envs/box2d/car_dynamics.py
 """
 
 from std.math import cos, sin, sqrt, pi
-from layout import LayoutTensor, Layout
 
 from .constants import (
     # Physics constants
@@ -57,6 +56,7 @@ from .wheel_friction import WheelFriction
 from .tile_collision import TileCollision
 
 from ..constants import dtype
+from noeira.core.tiles import Tile
 
 
 struct CarDynamics:
@@ -86,11 +86,7 @@ struct CarDynamics:
         CONTROLS_OFFSET: Int,
     ](
         env: Int,
-        state: LayoutTensor[
-            dtype,
-            Layout.row_major(BATCH, STATE_SIZE),
-            MutAnyOrigin,
-        ],
+        state: Tile[dtype, BATCH, STATE_SIZE],
         dt: Scalar[dtype],
     ):
         """Update front wheel steering angles.
@@ -191,11 +187,7 @@ struct CarDynamics:
         HULL_OFFSET: Int,
     ](
         env: Int,
-        state: LayoutTensor[
-            dtype,
-            Layout.row_major(BATCH, STATE_SIZE),
-            MutAnyOrigin,
-        ],
+        state: Tile[dtype, BATCH, STATE_SIZE],
         fx: Scalar[dtype],
         fy: Scalar[dtype],
         torque: Scalar[dtype],
@@ -305,16 +297,8 @@ struct CarDynamics:
         MAX_TILES: Int,
     ](
         env: Int,
-        state: LayoutTensor[
-            dtype,
-            Layout.row_major(BATCH, STATE_SIZE),
-            MutAnyOrigin,
-        ],
-        tiles: LayoutTensor[
-            dtype,
-            Layout.row_major(MAX_TILES, TILE_DATA_SIZE),
-            MutAnyOrigin,
-        ],
+        state: Tile[dtype, BATCH, STATE_SIZE],
+        tiles: Tile[dtype, MAX_TILES, TILE_DATA_SIZE],
         num_active_tiles: Int,
         dt: Scalar[dtype],
     ):
@@ -376,11 +360,7 @@ struct CarDynamics:
         WHEELS_OFFSET: Int,
     ](
         env: Int,
-        state: LayoutTensor[
-            dtype,
-            Layout.row_major(BATCH, STATE_SIZE),
-            MutAnyOrigin,
-        ],
+        state: Tile[dtype, BATCH, STATE_SIZE],
     ):
         """Update observation vector from physics state.
 
@@ -445,16 +425,8 @@ struct CarDynamics:
         MAX_TILES: Int,
     ](
         env: Int,
-        state: LayoutTensor[
-            dtype,
-            Layout.row_major(BATCH, STATE_SIZE),
-            MutAnyOrigin,
-        ],
-        tiles: LayoutTensor[
-            dtype,
-            Layout.row_major(MAX_TILES, TILE_DATA_SIZE),
-            MutAnyOrigin,
-        ],
+        state: Tile[dtype, BATCH, STATE_SIZE],
+        tiles: Tile[dtype, MAX_TILES, TILE_DATA_SIZE],
         num_active_tiles: Int,
         dt: Scalar[dtype],
     ):
@@ -498,11 +470,7 @@ struct CarDynamics:
         CONTROLS_OFFSET: Int,
     ](
         env: Int,
-        state: LayoutTensor[
-            dtype,
-            Layout.row_major(BATCH, STATE_SIZE),
-            MutAnyOrigin,
-        ],
+        state: Tile[dtype, BATCH, STATE_SIZE],
         dt: Scalar[dtype],
     ):
         """Perform physics step without track (uses default road friction).
@@ -565,11 +533,7 @@ struct CarDynamics:
         MAX_TILES: Int,
     ](
         env: Int,
-        state: LayoutTensor[
-            dtype,
-            Layout.row_major(BATCH, STATE_SIZE),
-            MutAnyOrigin,
-        ],
+        state: Tile[dtype, BATCH, STATE_SIZE],
         num_active_tiles: Int,
         dt: Scalar[dtype],
     ):
@@ -631,11 +595,7 @@ struct CarDynamics:
         MAX_TILES: Int,
     ](
         env: Int,
-        state: LayoutTensor[
-            dtype,
-            Layout.row_major(BATCH, STATE_SIZE),
-            MutAnyOrigin,
-        ],
+        state: Tile[dtype, BATCH, STATE_SIZE],
         hull_x: Scalar[dtype],
         hull_y: Scalar[dtype],
         hull_angle: Scalar[dtype],
@@ -709,16 +669,8 @@ struct CarDynamics:
         CONTROLS_OFFSET: Int,
         MAX_TILES: Int,
     ](
-        state: LayoutTensor[
-            dtype,
-            Layout.row_major(BATCH, STATE_SIZE),
-            MutAnyOrigin,
-        ],
-        tiles: LayoutTensor[
-            dtype,
-            Layout.row_major(MAX_TILES, TILE_DATA_SIZE),
-            MutAnyOrigin,
-        ],
+        state: Tile[dtype, BATCH, STATE_SIZE],
+        tiles: Tile[dtype, MAX_TILES, TILE_DATA_SIZE],
         num_active_tiles: Int,
         dt: Scalar[dtype],
     ):

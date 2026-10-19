@@ -43,12 +43,12 @@ replay — only the *which-window* draw and the IS weights differ.
 from std.memory import alloc
 from max.gpu import block_dim, block_idx, thread_idx
 from max.gpu.host import DeviceContext, DeviceBuffer
-from layout import Layout, LayoutTensor
 
 from noeira.nn.constants import DT, TPB
 from noeira.core.sum_tree import SumTree
 from .nstep_targets import compute_nstep_value_targets
 from noeira.data.quantize import _obs_quant, _obs_dequant
+from noeira.core.tiles import Tile, tile
 
 
 # Host→device store staging chunk (steps). Bounds the transient host uint8
@@ -73,9 +73,9 @@ def _a(n: Int) -> Pointer[Scalar[DT], MutAnyOrigin]:
 def _ez_obs_gather_kernel[
     M: Int, OBS: Int, CAP: Int, SDT: DType
 ](
-    ring: LayoutTensor[SDT, Layout.row_major(CAP, OBS), MutAnyOrigin],
-    slots: LayoutTensor[DType.int32, Layout.row_major(M), MutAnyOrigin],
-    dst: LayoutTensor[DT, Layout.row_major(M, OBS), MutAnyOrigin],
+    ring: Tile[SDT, CAP, OBS],
+    slots: Tile[DType.int32, M],
+    dst: Tile[DT, M, OBS],
 ):
     var t = Int(block_dim.x * block_idx.x + thread_idx.x)
     if t >= M * OBS:
@@ -174,17 +174,11 @@ struct PrioritizedMCTSSequenceReplay[
 
     def _ring_lt(
         self,
-    ) -> LayoutTensor[
-        Self.SDT, Layout.row_major(Self.CAP, Self.OBS), MutAnyOrigin
-    ]:
+    ) -> Tile[Self.SDT, Self.CAP, Self.OBS]:
         return rebind[
-            LayoutTensor[
-                Self.SDT, Layout.row_major(Self.CAP, Self.OBS), MutAnyOrigin
-            ]
+            Tile[Self.SDT, Self.CAP, Self.OBS]
         ](
-            LayoutTensor[Self.SDT, Layout.row_major(Self.CAP, Self.OBS)](
-                self.obs
-            )
+            tile[Self.CAP, Self.OBS](self.obs)
         )
 
     def store_episode(
@@ -454,11 +448,11 @@ struct PrioritizedMCTSSequenceReplay[
         ctx.enqueue_copy(d_slots, h_slots.unsafe_ptr())  # sanctioned H2D-staging boundary
         var ring_lt = self._ring_lt()
         var slots_lt = rebind[
-            LayoutTensor[DType.int32, Layout.row_major(M), MutAnyOrigin]
-        ](LayoutTensor[DType.int32, Layout.row_major(M)](d_slots))
+            Tile[DType.int32, M]
+        ](tile[M](d_slots))
         var out_lt = rebind[
-            LayoutTensor[DT, Layout.row_major(M, Self.OBS), MutAnyOrigin]
-        ](LayoutTensor[DT, Layout.row_major(M, Self.OBS)](out_obs_dev))
+            Tile[DT, M, Self.OBS]
+        ](tile[M, Self.OBS](out_obs_dev))
         comptime n_blocks = (M * Self.OBS + TPB - 1) // TPB
         comptime kernel = _ez_obs_gather_kernel[M, Self.OBS, Self.CAP, Self.SDT]
         ctx.enqueue_function[kernel](
@@ -498,11 +492,11 @@ struct PrioritizedMCTSSequenceReplay[
         ctx.enqueue_copy(d_slots, h_slots.unsafe_ptr())  # sanctioned H2D-staging boundary
         var ring_lt = self._ring_lt()
         var slots_lt = rebind[
-            LayoutTensor[DType.int32, Layout.row_major(M), MutAnyOrigin]
-        ](LayoutTensor[DType.int32, Layout.row_major(M)](d_slots))
+            Tile[DType.int32, M]
+        ](tile[M](d_slots))
         var out_lt = rebind[
-            LayoutTensor[DT, Layout.row_major(M, Self.OBS), MutAnyOrigin]
-        ](LayoutTensor[DT, Layout.row_major(M, Self.OBS)](out_obs_dev))
+            Tile[DT, M, Self.OBS]
+        ](tile[M, Self.OBS](out_obs_dev))
         comptime n_blocks = (M * Self.OBS + TPB - 1) // TPB
         comptime kernel = _ez_obs_gather_kernel[M, Self.OBS, Self.CAP, Self.SDT]
         ctx.enqueue_function[kernel](

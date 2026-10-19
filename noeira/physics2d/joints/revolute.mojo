@@ -23,7 +23,6 @@ neither does this port.
 """
 
 from std.math import cos, sin, sqrt
-from layout import LayoutTensor, Layout
 
 from ..constants import (
     dtype,
@@ -66,13 +65,14 @@ from ..constants import (
     B2_ANGULAR_SLOP,
     B2_MAX_ANGULAR_CORRECTION,
 )
+from noeira.core.tiles import Tile
 
 
 @always_inline
 def _ld[
     BATCH: Int, STATE_SIZE: Int
 ](
-    state: LayoutTensor[dtype, Layout.row_major(BATCH, STATE_SIZE), MutAnyOrigin],
+    state: Tile[dtype, BATCH, STATE_SIZE],
     env: Int,
     i: Int,
 ) -> Scalar[dtype]:
@@ -104,7 +104,7 @@ struct _JointFrame(Copyable, Movable):
 def _joint_frame[
     BATCH: Int, STATE_SIZE: Int, BODIES_OFFSET: Int
 ](
-    state: LayoutTensor[dtype, Layout.row_major(BATCH, STATE_SIZE), MutAnyOrigin],
+    state: Tile[dtype, BATCH, STATE_SIZE],
     env: Int,
     joint_off: Int,
 ) -> _JointFrame:
@@ -149,9 +149,7 @@ struct RevoluteJointSolver:
     def write_joint[
         BATCH: Int, STATE_SIZE: Int
     ](
-        states: LayoutTensor[
-            dtype, Layout.row_major(BATCH, STATE_SIZE), MutAnyOrigin
-        ],
+        states: Tile[dtype, BATCH, STATE_SIZE],
         env: Int,
         joint_off: Int,
         body_a: Int,
@@ -197,9 +195,7 @@ struct RevoluteJointSolver:
     def clear_warm_start[
         BATCH: Int, STATE_SIZE: Int
     ](
-        states: LayoutTensor[
-            dtype, Layout.row_major(BATCH, STATE_SIZE), MutAnyOrigin
-        ],
+        states: Tile[dtype, BATCH, STATE_SIZE],
         env: Int,
         joint_off: Int,
     ):
@@ -229,9 +225,7 @@ struct RevoluteJointSolver:
         JOINTS_OFFSET: Int,
     ](
         env: Int,
-        state: LayoutTensor[
-            dtype, Layout.row_major(BATCH, STATE_SIZE), MutAnyOrigin
-        ],
+        state: Tile[dtype, BATCH, STATE_SIZE],
         joint_count: Int,
     ):
         """Update each joint's limit state and apply the warm-start impulses
@@ -310,9 +304,7 @@ struct RevoluteJointSolver:
         JOINTS_OFFSET: Int,
     ](
         env: Int,
-        state: LayoutTensor[
-            dtype, Layout.row_major(BATCH, STATE_SIZE), MutAnyOrigin
-        ],
+        state: Tile[dtype, BATCH, STATE_SIZE],
         joint_count: Int,
         dt: Scalar[dtype],
     ):
@@ -470,9 +462,7 @@ struct RevoluteJointSolver:
         JOINTS_OFFSET: Int,
     ](
         env: Int,
-        state: LayoutTensor[
-            dtype, Layout.row_major(BATCH, STATE_SIZE), MutAnyOrigin
-        ],
+        state: Tile[dtype, BATCH, STATE_SIZE],
         joint_count: Int,
     ) -> Bool:
         """One position iteration over all joints

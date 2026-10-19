@@ -26,7 +26,8 @@ symmetry). CPU + GPU.
 from max.gpu import global_idx, thread_idx, block_idx
 from max.gpu.primitives import block
 from max.gpu.host import DeviceContext
-from layout import Layout, LayoutTensor, TileTensor, row_major
+from layout import TileTensor, row_major
+from noeira.core.tiles import RowMajor, Tile
 
 from noeira.nn.constants import DT, TPB
 from noeira.nn.core.initializer import Normal
@@ -46,8 +47,8 @@ comptime LQ_RTPB = 64  # reduction block size for the param-grad batch sum
 def _lq_forward_kernel[
     BATCH: Int, OUT_DIM: Int
 ](
-    param: LayoutTensor[DT, Layout.row_major(OUT_DIM), MutAnyOrigin],
-    output: LayoutTensor[DT, Layout.row_major(BATCH, OUT_DIM), MutAnyOrigin],
+    param: Tile[DT, OUT_DIM],
+    output: Tile[DT, BATCH, OUT_DIM],
 ):
     var idx = Int(global_idx.x)
     if idx >= BATCH * OUT_DIM:
@@ -59,7 +60,7 @@ def _lq_forward_kernel[
 def _lq_grad_input_zero_kernel[
     N: Int
 ](
-    grad_input: LayoutTensor[DT, Layout.row_major(N), MutAnyOrigin],
+    grad_input: Tile[DT, N],
 ):
     var idx = Int(global_idx.x)
     if idx < N:
@@ -69,8 +70,8 @@ def _lq_grad_input_zero_kernel[
 def _lq_grad_param_kernel[
     BATCH: Int, OUT_DIM: Int
 ](
-    grad_output: LayoutTensor[DT, Layout.row_major(BATCH, OUT_DIM), MutAnyOrigin],
-    grad_param: LayoutTensor[DT, Layout.row_major(OUT_DIM), MutAnyOrigin],
+    grad_output: Tile[DT, BATCH, OUT_DIM],
+    grad_param: Tile[DT, OUT_DIM],
 ):
     # One block per param element; threads reduce over the batch.
     var col = Int(block_idx.x)
@@ -150,13 +151,13 @@ struct LearnedQueries[
         else:
             var c = ctx.value()
             out.ensure_gpu(c, B * Self.OUT_DIM)
-            comptime lp = Layout.row_major(Self.OUT_DIM)
-            comptime lbo = Layout.row_major(B, Self.OUT_DIM)
+            comptime lp = RowMajor[Self.OUT_DIM]
+            comptime lbo = RowMajor[B, Self.OUT_DIM]
             comptime n_blocks = (B * Self.OUT_DIM + TPB - 1) // TPB
             comptime kernel = _lq_forward_kernel[B, Self.OUT_DIM]
             c.enqueue_function[kernel](
-                self.queries.val.lt["gpu", lp](),
-                out.lt["gpu", lbo](),
+                self.queries.val.tt["gpu", Self.OUT_DIM](),
+                out.tt["gpu", B, Self.OUT_DIM](),
                 grid_dim=n_blocks,
                 block_dim=TPB,
             )
@@ -191,16 +192,16 @@ struct LearnedQueries[
             gin.ensure_gpu(c, gi_total)
             comptime zblocks = (gi_total + TPB - 1) // TPB
             c.enqueue_function[_lq_grad_input_zero_kernel[gi_total]](
-                gin.lt["gpu", Layout.row_major(gi_total)](),
+                gin.tt["gpu", gi_total](),
                 grid_dim=zblocks,
                 block_dim=TPB,
             )
-            comptime lbo = Layout.row_major(B, Self.OUT_DIM)
-            comptime lp = Layout.row_major(Self.OUT_DIM)
+            comptime lbo = RowMajor[B, Self.OUT_DIM]
+            comptime lp = RowMajor[Self.OUT_DIM]
             comptime gpk = _lq_grad_param_kernel[B, Self.OUT_DIM]
             c.enqueue_function[gpk](
-                grad_output.lt["gpu", lbo](),
-                self.queries.grd.lt["gpu", lp](),
+                grad_output.tt["gpu", B, Self.OUT_DIM](),
+                self.queries.grd.tt["gpu", Self.OUT_DIM](),
                 grid_dim=Self.OUT_DIM,
                 block_dim=LQ_RTPB,
             )

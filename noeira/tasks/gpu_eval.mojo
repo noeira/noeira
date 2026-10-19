@@ -47,7 +47,8 @@ LIBERO driver must call the wide ones. `family_config` does.
 
 from std.math import sqrt
 
-from layout import Layout, LayoutTensor
+from layout import TileTensor, TensorLayout
+from noeira.core.tiles import RowMajor, Tile
 
 from noeira.physics3d.gpu.constants import (
     METADATA_SIZE, META_IDX_TASK_PARAM_0, META_IDX_NUM_CONTACTS,
@@ -184,11 +185,11 @@ def region_table_words(
 
 @always_inline
 def _slots_touching_gpu[
-    DTYPE: DType, BATCH: Int, L_BODIES: Layout, L_CON: Layout,
+    DTYPE: DType, BATCH: Int, L_BODIES: TensorLayout, L_CON: TensorLayout,
 ](
     root_a: Int, root_b: Int, ncon: Int,
-    bodies: LayoutTensor[DTYPE, L_BODIES, MutAnyOrigin],
-    contacts: LayoutTensor[DTYPE, L_CON, MutAnyOrigin],
+    bodies: TileTensor[DTYPE, L_BODIES, MutAnyOrigin],
+    contacts: TileTensor[DTYPE, L_CON, MutAnyOrigin],
     env: Int,
 ) -> Bool:
     """`eval.slots_touching` over the lane's contact records: any contact
@@ -221,27 +222,17 @@ def _slots_touching_gpu[
 def _eval_tape_impl[
     DTYPE: DType, BATCH: Int, NBODY_F: Int, SITE_DIM: Int,
     HAS_L3: Bool,
-    L_Q: Layout, L_SITES: Layout, L_BODIES: Layout, L_CON: Layout,
+    L_Q: TensorLayout, L_SITES: TensorLayout, L_BODIES: TensorLayout, L_CON: TensorLayout,
 ](
-    meta: LayoutTensor[
-        DTYPE, Layout.row_major(BATCH, METADATA_SIZE), MutAnyOrigin
-    ],
-    curriculum: LayoutTensor[
-        DTYPE, Layout.row_major(1, MODEL_CURRICULUM_SIZE), MutAnyOrigin
-    ],
-    xpos: LayoutTensor[
-        DTYPE, Layout.row_major(BATCH, NBODY_F * 3), MutAnyOrigin
-    ],
-    xquat: LayoutTensor[
-        DTYPE, Layout.row_major(BATCH, NBODY_F * 4), MutAnyOrigin
-    ],
-    site_xpos: LayoutTensor[
-        DTYPE, Layout.row_major(BATCH, SITE_DIM), MutAnyOrigin
-    ],
-    qpos: LayoutTensor[DTYPE, L_Q, MutAnyOrigin],
-    sites: LayoutTensor[DTYPE, L_SITES, MutAnyOrigin],
-    bodies: LayoutTensor[DTYPE, L_BODIES, MutAnyOrigin],
-    contacts: LayoutTensor[DTYPE, L_CON, MutAnyOrigin],
+    meta: Tile[DTYPE, BATCH, METADATA_SIZE],
+    curriculum: Tile[DTYPE, 1, MODEL_CURRICULUM_SIZE],
+    xpos: Tile[DTYPE, BATCH, NBODY_F * 3],
+    xquat: Tile[DTYPE, BATCH, NBODY_F * 4],
+    site_xpos: Tile[DTYPE, BATCH, SITE_DIM],
+    qpos: TileTensor[DTYPE, L_Q, MutAnyOrigin],
+    sites: TileTensor[DTYPE, L_SITES, MutAnyOrigin],
+    bodies: TileTensor[DTYPE, L_BODIES, MutAnyOrigin],
+    contacts: TileTensor[DTYPE, L_CON, MutAnyOrigin],
     env: Int,
 ) -> Bool:
     """This lane's goal, from this lane's tape. One `Bool`, no allocation.
@@ -428,26 +419,16 @@ def _eval_tape_impl[
 def eval_tape_gpu[
     DTYPE: DType, BATCH: Int, NBODY_F: Int, SITE_DIM: Int,
 ](
-    meta: LayoutTensor[
-        DTYPE, Layout.row_major(BATCH, METADATA_SIZE), MutAnyOrigin
-    ],
-    curriculum: LayoutTensor[
-        DTYPE, Layout.row_major(1, MODEL_CURRICULUM_SIZE), MutAnyOrigin
-    ],
-    xpos: LayoutTensor[
-        DTYPE, Layout.row_major(BATCH, NBODY_F * 3), MutAnyOrigin
-    ],
-    xquat: LayoutTensor[
-        DTYPE, Layout.row_major(BATCH, NBODY_F * 4), MutAnyOrigin
-    ],
-    site_xpos: LayoutTensor[
-        DTYPE, Layout.row_major(BATCH, SITE_DIM), MutAnyOrigin
-    ],
+    meta: Tile[DTYPE, BATCH, METADATA_SIZE],
+    curriculum: Tile[DTYPE, 1, MODEL_CURRICULUM_SIZE],
+    xpos: Tile[DTYPE, BATCH, NBODY_F * 3],
+    xquat: Tile[DTYPE, BATCH, NBODY_F * 4],
+    site_xpos: Tile[DTYPE, BATCH, SITE_DIM],
     env: Int,
 ) -> Bool:
     """The pre-L3 signature: poses only, L3 branches compiled out. See
     `_eval_tape_impl` for what an L3 op evaluates to here."""
-    comptime L_XP = Layout.row_major(BATCH, NBODY_F * 3)
+    comptime L_XP = RowMajor[BATCH, NBODY_F * 3]
     return _eval_tape_impl[
         DTYPE, BATCH, NBODY_F, SITE_DIM, False, L_XP, L_XP, L_XP, L_XP
     ](meta, curriculum, xpos, xquat, site_xpos, xpos, xpos, xpos, xpos, env)
@@ -458,40 +439,24 @@ def eval_tape_gpu[
     DTYPE: DType, BATCH: Int, NBODY_F: Int, SITE_DIM: Int,
     NQ_F: Int, NSITE_F: Int, MC_F: Int,
 ](
-    meta: LayoutTensor[
-        DTYPE, Layout.row_major(BATCH, METADATA_SIZE), MutAnyOrigin
-    ],
-    curriculum: LayoutTensor[
-        DTYPE, Layout.row_major(1, MODEL_CURRICULUM_SIZE), MutAnyOrigin
-    ],
-    xpos: LayoutTensor[
-        DTYPE, Layout.row_major(BATCH, NBODY_F * 3), MutAnyOrigin
-    ],
-    xquat: LayoutTensor[
-        DTYPE, Layout.row_major(BATCH, NBODY_F * 4), MutAnyOrigin
-    ],
-    site_xpos: LayoutTensor[
-        DTYPE, Layout.row_major(BATCH, SITE_DIM), MutAnyOrigin
-    ],
-    qpos: LayoutTensor[DTYPE, Layout.row_major(BATCH, NQ_F), MutAnyOrigin],
-    sites: LayoutTensor[
-        DTYPE, Layout.row_major(NSITE_F, MODEL_SITE_SIZE), MutAnyOrigin
-    ],
-    bodies: LayoutTensor[
-        DTYPE, Layout.row_major(NBODY_F, MODEL_BODY_SIZE), MutAnyOrigin
-    ],
-    contacts: LayoutTensor[
-        DTYPE, Layout.row_major(BATCH, MC_F * CONTACT_SIZE), MutAnyOrigin
-    ],
+    meta: Tile[DTYPE, BATCH, METADATA_SIZE],
+    curriculum: Tile[DTYPE, 1, MODEL_CURRICULUM_SIZE],
+    xpos: Tile[DTYPE, BATCH, NBODY_F * 3],
+    xquat: Tile[DTYPE, BATCH, NBODY_F * 4],
+    site_xpos: Tile[DTYPE, BATCH, SITE_DIM],
+    qpos: Tile[DTYPE, BATCH, NQ_F],
+    sites: Tile[DTYPE, NSITE_F, MODEL_SITE_SIZE],
+    bodies: Tile[DTYPE, NBODY_F, MODEL_BODY_SIZE],
+    contacts: Tile[DTYPE, BATCH, MC_F * CONTACT_SIZE],
     env: Int,
 ) -> Bool:
     """The whole language (L3): the reward hook's own operands, one for one."""
     return _eval_tape_impl[
         DTYPE, BATCH, NBODY_F, SITE_DIM, True,
-        Layout.row_major(BATCH, NQ_F),
-        Layout.row_major(NSITE_F, MODEL_SITE_SIZE),
-        Layout.row_major(NBODY_F, MODEL_BODY_SIZE),
-        Layout.row_major(BATCH, MC_F * CONTACT_SIZE),
+        RowMajor[BATCH, NQ_F],
+        RowMajor[NSITE_F, MODEL_SITE_SIZE],
+        RowMajor[NBODY_F, MODEL_BODY_SIZE],
+        RowMajor[BATCH, MC_F * CONTACT_SIZE],
     ](meta, curriculum, xpos, xquat, site_xpos, qpos, sites, bodies, contacts, env)
 
 
@@ -548,27 +513,17 @@ comptime DIST_EPS: Float64 = 1e-6
 def _tape_distance_impl[
     DTYPE: DType, BATCH: Int, NBODY_F: Int, SITE_DIM: Int,
     HAS_L3: Bool,
-    L_Q: Layout, L_SITES: Layout, L_BODIES: Layout, L_CON: Layout,
+    L_Q: TensorLayout, L_SITES: TensorLayout, L_BODIES: TensorLayout, L_CON: TensorLayout,
 ](
-    meta: LayoutTensor[
-        DTYPE, Layout.row_major(BATCH, METADATA_SIZE), MutAnyOrigin
-    ],
-    curriculum: LayoutTensor[
-        DTYPE, Layout.row_major(1, MODEL_CURRICULUM_SIZE), MutAnyOrigin
-    ],
-    xpos: LayoutTensor[
-        DTYPE, Layout.row_major(BATCH, NBODY_F * 3), MutAnyOrigin
-    ],
-    xquat: LayoutTensor[
-        DTYPE, Layout.row_major(BATCH, NBODY_F * 4), MutAnyOrigin
-    ],
-    site_xpos: LayoutTensor[
-        DTYPE, Layout.row_major(BATCH, SITE_DIM), MutAnyOrigin
-    ],
-    qpos: LayoutTensor[DTYPE, L_Q, MutAnyOrigin],
-    sites: LayoutTensor[DTYPE, L_SITES, MutAnyOrigin],
-    bodies: LayoutTensor[DTYPE, L_BODIES, MutAnyOrigin],
-    contacts: LayoutTensor[DTYPE, L_CON, MutAnyOrigin],
+    meta: Tile[DTYPE, BATCH, METADATA_SIZE],
+    curriculum: Tile[DTYPE, 1, MODEL_CURRICULUM_SIZE],
+    xpos: Tile[DTYPE, BATCH, NBODY_F * 3],
+    xquat: Tile[DTYPE, BATCH, NBODY_F * 4],
+    site_xpos: Tile[DTYPE, BATCH, SITE_DIM],
+    qpos: TileTensor[DTYPE, L_Q, MutAnyOrigin],
+    sites: TileTensor[DTYPE, L_SITES, MutAnyOrigin],
+    bodies: TileTensor[DTYPE, L_BODIES, MutAnyOrigin],
+    contacts: TileTensor[DTYPE, L_CON, MutAnyOrigin],
     env: Int,
 ) -> Scalar[DTYPE]:
     """HOW FAR this lane is from its goal, in metres. ZERO iff the goal holds.
@@ -875,25 +830,15 @@ def _tape_distance_impl[
 def tape_distance_gpu[
     DTYPE: DType, BATCH: Int, NBODY_F: Int, SITE_DIM: Int,
 ](
-    meta: LayoutTensor[
-        DTYPE, Layout.row_major(BATCH, METADATA_SIZE), MutAnyOrigin
-    ],
-    curriculum: LayoutTensor[
-        DTYPE, Layout.row_major(1, MODEL_CURRICULUM_SIZE), MutAnyOrigin
-    ],
-    xpos: LayoutTensor[
-        DTYPE, Layout.row_major(BATCH, NBODY_F * 3), MutAnyOrigin
-    ],
-    xquat: LayoutTensor[
-        DTYPE, Layout.row_major(BATCH, NBODY_F * 4), MutAnyOrigin
-    ],
-    site_xpos: LayoutTensor[
-        DTYPE, Layout.row_major(BATCH, SITE_DIM), MutAnyOrigin
-    ],
+    meta: Tile[DTYPE, BATCH, METADATA_SIZE],
+    curriculum: Tile[DTYPE, 1, MODEL_CURRICULUM_SIZE],
+    xpos: Tile[DTYPE, BATCH, NBODY_F * 3],
+    xquat: Tile[DTYPE, BATCH, NBODY_F * 4],
+    site_xpos: Tile[DTYPE, BATCH, SITE_DIM],
     env: Int,
 ) -> Scalar[DTYPE]:
     """The pre-L3 signature: poses only, L3 branches compiled out."""
-    comptime L_XP = Layout.row_major(BATCH, NBODY_F * 3)
+    comptime L_XP = RowMajor[BATCH, NBODY_F * 3]
     return _tape_distance_impl[
         DTYPE, BATCH, NBODY_F, SITE_DIM, False, L_XP, L_XP, L_XP, L_XP
     ](meta, curriculum, xpos, xquat, site_xpos, xpos, xpos, xpos, xpos, env)
@@ -904,40 +849,24 @@ def tape_distance_gpu[
     DTYPE: DType, BATCH: Int, NBODY_F: Int, SITE_DIM: Int,
     NQ_F: Int, NSITE_F: Int, MC_F: Int,
 ](
-    meta: LayoutTensor[
-        DTYPE, Layout.row_major(BATCH, METADATA_SIZE), MutAnyOrigin
-    ],
-    curriculum: LayoutTensor[
-        DTYPE, Layout.row_major(1, MODEL_CURRICULUM_SIZE), MutAnyOrigin
-    ],
-    xpos: LayoutTensor[
-        DTYPE, Layout.row_major(BATCH, NBODY_F * 3), MutAnyOrigin
-    ],
-    xquat: LayoutTensor[
-        DTYPE, Layout.row_major(BATCH, NBODY_F * 4), MutAnyOrigin
-    ],
-    site_xpos: LayoutTensor[
-        DTYPE, Layout.row_major(BATCH, SITE_DIM), MutAnyOrigin
-    ],
-    qpos: LayoutTensor[DTYPE, Layout.row_major(BATCH, NQ_F), MutAnyOrigin],
-    sites: LayoutTensor[
-        DTYPE, Layout.row_major(NSITE_F, MODEL_SITE_SIZE), MutAnyOrigin
-    ],
-    bodies: LayoutTensor[
-        DTYPE, Layout.row_major(NBODY_F, MODEL_BODY_SIZE), MutAnyOrigin
-    ],
-    contacts: LayoutTensor[
-        DTYPE, Layout.row_major(BATCH, MC_F * CONTACT_SIZE), MutAnyOrigin
-    ],
+    meta: Tile[DTYPE, BATCH, METADATA_SIZE],
+    curriculum: Tile[DTYPE, 1, MODEL_CURRICULUM_SIZE],
+    xpos: Tile[DTYPE, BATCH, NBODY_F * 3],
+    xquat: Tile[DTYPE, BATCH, NBODY_F * 4],
+    site_xpos: Tile[DTYPE, BATCH, SITE_DIM],
+    qpos: Tile[DTYPE, BATCH, NQ_F],
+    sites: Tile[DTYPE, NSITE_F, MODEL_SITE_SIZE],
+    bodies: Tile[DTYPE, NBODY_F, MODEL_BODY_SIZE],
+    contacts: Tile[DTYPE, BATCH, MC_F * CONTACT_SIZE],
     env: Int,
 ) -> Scalar[DTYPE]:
     """The whole language (L3): the reward hook's own operands, one for one."""
     return _tape_distance_impl[
         DTYPE, BATCH, NBODY_F, SITE_DIM, True,
-        Layout.row_major(BATCH, NQ_F),
-        Layout.row_major(NSITE_F, MODEL_SITE_SIZE),
-        Layout.row_major(NBODY_F, MODEL_BODY_SIZE),
-        Layout.row_major(BATCH, MC_F * CONTACT_SIZE),
+        RowMajor[BATCH, NQ_F],
+        RowMajor[NSITE_F, MODEL_SITE_SIZE],
+        RowMajor[NBODY_F, MODEL_BODY_SIZE],
+        RowMajor[BATCH, MC_F * CONTACT_SIZE],
     ](meta, curriculum, xpos, xquat, site_xpos, qpos, sites, bodies, contacts, env)
 
 

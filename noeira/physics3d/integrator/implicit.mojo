@@ -32,7 +32,8 @@ forces (density/viscosity > 0)."""
 
 from max.gpu import thread_idx, block_idx, block_dim
 from max.gpu.host import DeviceContext
-from layout import Layout, LayoutTensor
+from layout import TileTensor, TensorLayout
+from noeira.core.tiles import RowMajor, Tile
 
 from ..kinematics.quat_math import quat_integrate, quat_normalize, quat_rotate, quat_mul
 from ..kinematics.forward_kinematics import (
@@ -128,25 +129,23 @@ comptime IM_TPB: Int = 64
 def _qderiv_damping_env[
     DTYPE: DType,
     D: DimsLike,
-    L_JOINTS: Layout,
-    L_ACTD: Layout,
-    L_ACTDL: Layout,
-    L_ATRN: Layout,
-    L_AACT: Layout,
-    L_META: Layout,
-    L_QDERIV: Layout](
+    L_JOINTS: TensorLayout,
+    L_ACTD: TensorLayout,
+    L_ACTDL: TensorLayout,
+    L_ATRN: TensorLayout,
+    L_AACT: TensorLayout,
+    L_META: TensorLayout,
+    L_QDERIV: TensorLayout](
     env: Int,
     dims: D,
-    joints: LayoutTensor[
-        DTYPE, L_JOINTS, MutAnyOrigin
-    ],
+    joints: TileTensor[DTYPE, L_JOINTS, MutAnyOrigin],
     njoint: Int,
-    actd: LayoutTensor[DTYPE, L_ACTD, MutAnyOrigin],
-    actd_live: LayoutTensor[DTYPE, L_ACTDL, MutAnyOrigin],
-    atrn: LayoutTensor[DTYPE, L_ATRN, MutAnyOrigin],
-    aact: LayoutTensor[DTYPE, L_AACT, MutAnyOrigin],
-    meta: LayoutTensor[DTYPE, L_META, MutAnyOrigin],
-    qderiv: LayoutTensor[DTYPE, L_QDERIV, MutAnyOrigin],
+    actd: TileTensor[DTYPE, L_ACTD, MutAnyOrigin],
+    actd_live: TileTensor[DTYPE, L_ACTDL, MutAnyOrigin],
+    atrn: TileTensor[DTYPE, L_ATRN, MutAnyOrigin],
+    aact: TileTensor[DTYPE, L_AACT, MutAnyOrigin],
+    meta: TileTensor[DTYPE, L_META, MutAnyOrigin],
+    qderiv: TileTensor[DTYPE, L_QDERIV, MutAnyOrigin],
 ):
     var nv = dims.get_nv()
     for i in range(nv * nv):
@@ -257,12 +256,12 @@ def _qderiv_damping_env[
 def _msub_qderiv_env[
     DTYPE: DType,
     D: DimsLike,
-    L_M: Layout](
+    L_M: TensorLayout](
     env: Int,
     dt: Scalar[DTYPE],
     dims: D,
-    M: LayoutTensor[DTYPE, L_M, MutAnyOrigin],
-    qderiv: LayoutTensor[DTYPE, L_M, MutAnyOrigin],
+    M: TileTensor[DTYPE, L_M, MutAnyOrigin],
+    qderiv: TileTensor[DTYPE, L_M, MutAnyOrigin],
 ):
     var nv = dims.get_nv()
     for i in range(nv * nv):
@@ -315,25 +314,25 @@ def _q2m[
 def _free_body_block_env[
     DTYPE: DType,
     D: DimsLike,
-    L_M: Layout,
-    L_NV: Layout,
-    L_JOINTS: Layout,
-    L_BODIES: Layout,
-    L_X3: Layout,
-    L_X4: Layout,
+    L_M: TensorLayout,
+    L_NV: TensorLayout,
+    L_JOINTS: TensorLayout,
+    L_BODIES: TensorLayout,
+    L_X3: TensorLayout,
+    L_X4: TensorLayout,
 ](
     env: Int,
     dt: Scalar[DTYPE],
     dims: D,
-    joints: LayoutTensor[DTYPE, L_JOINTS, MutAnyOrigin],
-    bodies: LayoutTensor[DTYPE, L_BODIES, MutAnyOrigin],
-    xpos: LayoutTensor[DTYPE, L_X3, MutAnyOrigin],
-    xipos: LayoutTensor[DTYPE, L_X3, MutAnyOrigin],
-    xquat: LayoutTensor[DTYPE, L_X4, MutAnyOrigin],
-    qvel: LayoutTensor[DTYPE, L_NV, MutAnyOrigin],
-    mhat: LayoutTensor[DTYPE, L_M, MutAnyOrigin],
-    fnet: LayoutTensor[DTYPE, L_NV, MutAnyOrigin],
-    qacc_ws: LayoutTensor[DTYPE, L_NV, MutAnyOrigin],
+    joints: TileTensor[DTYPE, L_JOINTS, MutAnyOrigin],
+    bodies: TileTensor[DTYPE, L_BODIES, MutAnyOrigin],
+    xpos: TileTensor[DTYPE, L_X3, MutAnyOrigin],
+    xipos: TileTensor[DTYPE, L_X3, MutAnyOrigin],
+    xquat: TileTensor[DTYPE, L_X4, MutAnyOrigin],
+    qvel: TileTensor[DTYPE, L_NV, MutAnyOrigin],
+    mhat: TileTensor[DTYPE, L_M, MutAnyOrigin],
+    fnet: TileTensor[DTYPE, L_NV, MutAnyOrigin],
+    qacc_ws: TileTensor[DTYPE, L_NV, MutAnyOrigin],
 ):
     """For every standalone free body: `A = M_hat_block + h*B_bias`, then
     `qacc_ws[block] = A^-1 fnet[block]` (`mjd_freeMhat` + `mju_solveLU6`).
@@ -534,15 +533,15 @@ def _free_body_block_kernel[
     DTYPE: DType, NV: Int, NJOINT: Int, NBODY: Int, BATCH: Int
 ](
     dt: Scalar[DTYPE],
-    joints: LayoutTensor[DTYPE, Layout.row_major(NJOINT, MODEL_JOINT_SIZE), MutAnyOrigin],
-    bodies: LayoutTensor[DTYPE, Layout.row_major(NBODY, MODEL_BODY_SIZE), MutAnyOrigin],
-    xpos: LayoutTensor[DTYPE, Layout.row_major(BATCH, NBODY * 3), MutAnyOrigin],
-    xipos: LayoutTensor[DTYPE, Layout.row_major(BATCH, NBODY * 3), MutAnyOrigin],
-    xquat: LayoutTensor[DTYPE, Layout.row_major(BATCH, NBODY * 4), MutAnyOrigin],
-    qvel: LayoutTensor[DTYPE, Layout.row_major(BATCH, NV), MutAnyOrigin],
-    mhat: LayoutTensor[DTYPE, Layout.row_major(BATCH, NV * NV), MutAnyOrigin],
-    fnet: LayoutTensor[DTYPE, Layout.row_major(BATCH, NV), MutAnyOrigin],
-    qacc_ws: LayoutTensor[DTYPE, Layout.row_major(BATCH, NV), MutAnyOrigin],
+    joints: Tile[DTYPE, NJOINT, MODEL_JOINT_SIZE],
+    bodies: Tile[DTYPE, NBODY, MODEL_BODY_SIZE],
+    xpos: Tile[DTYPE, BATCH, NBODY * 3],
+    xipos: Tile[DTYPE, BATCH, NBODY * 3],
+    xquat: Tile[DTYPE, BATCH, NBODY * 4],
+    qvel: Tile[DTYPE, BATCH, NV],
+    mhat: Tile[DTYPE, BATCH, NV * NV],
+    fnet: Tile[DTYPE, BATCH, NV],
+    qacc_ws: Tile[DTYPE, BATCH, NV],
 ):
     var env = Int(block_dim.x * block_idx.x + thread_idx.x)
     if env >= BATCH:
@@ -557,13 +556,13 @@ def _free_body_block_kernel[
 def _mrhs_env[
     DTYPE: DType,
     D: DimsLike,
-    L_M: Layout,
-    L_NV: Layout](
+    L_M: TensorLayout,
+    L_NV: TensorLayout](
     env: Int,
     dims: D,
-    M: LayoutTensor[DTYPE, L_M, MutAnyOrigin],
-    qacc_c: LayoutTensor[DTYPE, L_NV, MutAnyOrigin],
-    fnet: LayoutTensor[DTYPE, L_NV, MutAnyOrigin],
+    M: TileTensor[DTYPE, L_M, MutAnyOrigin],
+    qacc_c: TileTensor[DTYPE, L_NV, MutAnyOrigin],
+    fnet: TileTensor[DTYPE, L_NV, MutAnyOrigin],
 ):
     """`fnet = M * qacc_constrained` — the force MuJoCo re-solves against.
 
@@ -588,11 +587,11 @@ def _mrhs_env[
 def _adopt_qacc_env[
     DTYPE: DType,
     D: DimsLike,
-    L_NV: Layout](
+    L_NV: TensorLayout](
     env: Int,
     dims: D,
-    qacc_ws: LayoutTensor[DTYPE, L_NV, MutAnyOrigin],
-    qacc_c: LayoutTensor[DTYPE, L_NV, MutAnyOrigin],
+    qacc_ws: TileTensor[DTYPE, L_NV, MutAnyOrigin],
+    qacc_c: TileTensor[DTYPE, L_NV, MutAnyOrigin],
 ):
     """`qacc_constrained <- qacc_ws`, the M_hat re-solve's answer."""
     var nv = dims.get_nv()
@@ -605,21 +604,17 @@ def _adopt_qacc_env[
 def _implicit_finalize_env[
     DTYPE: DType,
     D: DimsLike,
-    L_QPOS: Layout,
-    L_QVEL: Layout,
-    L_JOINTS: Layout](
+    L_QPOS: TensorLayout,
+    L_QVEL: TensorLayout,
+    L_JOINTS: TensorLayout](
     env: Int,
     dt: Scalar[DTYPE],
     dims: D,
-    qpos: LayoutTensor[DTYPE, L_QPOS, MutAnyOrigin],
-    qvel: LayoutTensor[DTYPE, L_QVEL, MutAnyOrigin],
-    qacc: LayoutTensor[DTYPE, L_QVEL, MutAnyOrigin],
-    joints: LayoutTensor[
-        DTYPE, L_JOINTS, MutAnyOrigin
-    ],
-    qacc_constrained: LayoutTensor[
-        DTYPE, L_QVEL, MutAnyOrigin
-    ],
+    qpos: TileTensor[DTYPE, L_QPOS, MutAnyOrigin],
+    qvel: TileTensor[DTYPE, L_QVEL, MutAnyOrigin],
+    qacc: TileTensor[DTYPE, L_QVEL, MutAnyOrigin],
+    joints: TileTensor[DTYPE, L_JOINTS, MutAnyOrigin],
+    qacc_constrained: TileTensor[DTYPE, L_QVEL, MutAnyOrigin],
 ):
     var nv = dims.get_nv()
     var njoint = dims.get_njoint()
@@ -707,22 +702,14 @@ def _implicit_finalize_env[
 def _qderiv_damping_kernel[
     DTYPE: DType, NV: Int, NJOINT: Int, NACT: Int, BATCH: Int
 ](
-    joints: LayoutTensor[
-        DTYPE, Layout.row_major(NJOINT, MODEL_JOINT_SIZE), MutAnyOrigin
-    ],
+    joints: Tile[DTYPE, NJOINT, MODEL_JOINT_SIZE],
     njoint_arg: Int64,
-    actd: LayoutTensor[DTYPE, Layout.row_major(NV, 1), MutAnyOrigin],
-    actd_live: LayoutTensor[
-        DTYPE, Layout.row_major(BATCH, NV), MutAnyOrigin
-    ],
-    atrn: LayoutTensor[
-        DTYPE, Layout.row_major(NACT * ACTDAMP_TRN_SIZE, 1), MutAnyOrigin
-    ],
-    aact: LayoutTensor[DTYPE, Layout.row_major(BATCH, NACT), MutAnyOrigin],
-    meta: LayoutTensor[
-        DTYPE, Layout.row_major(BATCH, METADATA_SIZE), MutAnyOrigin
-    ],
-    qderiv: LayoutTensor[DTYPE, Layout.row_major(BATCH, NV * NV), MutAnyOrigin],
+    actd: Tile[DTYPE, NV, 1],
+    actd_live: Tile[DTYPE, BATCH, NV],
+    atrn: Tile[DTYPE, NACT * ACTDAMP_TRN_SIZE, 1],
+    aact: Tile[DTYPE, BATCH, NACT],
+    meta: Tile[DTYPE, BATCH, METADATA_SIZE],
+    qderiv: Tile[DTYPE, BATCH, NV * NV],
 ):
     # Mojo 1.0: `Int`/`UInt` are not `DevicePassable`; the kernel takes
     # a fixed-width `Int64` and re-binds the original name here.
@@ -740,8 +727,8 @@ def _msub_qderiv_kernel[
     DTYPE: DType, NV: Int, BATCH: Int
 ](
     dt: Scalar[DTYPE],
-    M: LayoutTensor[DTYPE, Layout.row_major(BATCH, NV * NV), MutAnyOrigin],
-    qderiv: LayoutTensor[DTYPE, Layout.row_major(BATCH, NV * NV), MutAnyOrigin],
+    M: Tile[DTYPE, BATCH, NV * NV],
+    qderiv: Tile[DTYPE, BATCH, NV * NV],
 ):
     var env = Int(block_dim.x * block_idx.x + thread_idx.x)
     if env >= BATCH:
@@ -752,9 +739,9 @@ def _msub_qderiv_kernel[
 def _mrhs_kernel[
     DTYPE: DType, NV: Int, BATCH: Int
 ](
-    M: LayoutTensor[DTYPE, Layout.row_major(BATCH, NV * NV), MutAnyOrigin],
-    qacc_c: LayoutTensor[DTYPE, Layout.row_major(BATCH, NV), MutAnyOrigin],
-    fnet: LayoutTensor[DTYPE, Layout.row_major(BATCH, NV), MutAnyOrigin],
+    M: Tile[DTYPE, BATCH, NV * NV],
+    qacc_c: Tile[DTYPE, BATCH, NV],
+    fnet: Tile[DTYPE, BATCH, NV],
 ):
     var env = Int(block_dim.x * block_idx.x + thread_idx.x)
     if env >= BATCH:
@@ -765,8 +752,8 @@ def _mrhs_kernel[
 def _adopt_qacc_kernel[
     DTYPE: DType, NV: Int, BATCH: Int
 ](
-    qacc_ws: LayoutTensor[DTYPE, Layout.row_major(BATCH, NV), MutAnyOrigin],
-    qacc_c: LayoutTensor[DTYPE, Layout.row_major(BATCH, NV), MutAnyOrigin],
+    qacc_ws: Tile[DTYPE, BATCH, NV],
+    qacc_c: Tile[DTYPE, BATCH, NV],
 ):
     var env = Int(block_dim.x * block_idx.x + thread_idx.x)
     if env >= BATCH:
@@ -778,15 +765,11 @@ def _implicit_finalize_kernel[
     DTYPE: DType, NQ: Int, NV: Int, NJOINT: Int, BATCH: Int
 ](
     dt: Scalar[DTYPE],
-    qpos: LayoutTensor[DTYPE, Layout.row_major(BATCH, NQ), MutAnyOrigin],
-    qvel: LayoutTensor[DTYPE, Layout.row_major(BATCH, NV), MutAnyOrigin],
-    qacc: LayoutTensor[DTYPE, Layout.row_major(BATCH, NV), MutAnyOrigin],
-    joints: LayoutTensor[
-        DTYPE, Layout.row_major(NJOINT, MODEL_JOINT_SIZE), MutAnyOrigin
-    ],
-    qacc_constrained: LayoutTensor[
-        DTYPE, Layout.row_major(BATCH, NV), MutAnyOrigin
-    ],
+    qpos: Tile[DTYPE, BATCH, NQ],
+    qvel: Tile[DTYPE, BATCH, NV],
+    qacc: Tile[DTYPE, BATCH, NV],
+    joints: Tile[DTYPE, NJOINT, MODEL_JOINT_SIZE],
+    qacc_constrained: Tile[DTYPE, BATCH, NV],
 ):
     var env = Int(block_dim.x * block_idx.x + thread_idx.x)
     if env >= BATCH:
@@ -895,15 +878,15 @@ struct ImplicitIntegrator[
         compute_cdof[target, Self.DTYPE, BATCH=Self.BATCH, PARALLEL = Self.PARALLEL_GPU](d, m, self.scratch, ctx)
         compute_mass_matrix[target, Self.DTYPE, BATCH=Self.BATCH, PARALLEL = Self.PARALLEL_GPU, TREEWALK = Self.CRBA_TREEWALK](d, m, self.scratch, ctx)
 
-        comptime L_JOINT = Layout.row_major(Self.D.NJOINT, MODEL_JOINT_SIZE)
-        comptime L_ACTD = Layout.row_major(Self.D.NV, 1)
+        comptime L_JOINT = RowMajor[Self.D.NJOINT, MODEL_JOINT_SIZE]
+        comptime L_ACTD = RowMajor[Self.D.NV, 1]
         # ⚠ FLOORED AT 1. `CAP_NACT` is 0 on a model with no actuators and a
         # zero-extent layout is a null view — the `site_xpos` trap. The
         # tensor is allocated with the same floor.
         comptime NACT_G = Self.D.CAP_NACT if Self.D.CAP_NACT > 0 else 1
-        comptime L_M = Layout.row_major(Self.BATCH, Self.D.NV * Self.D.NV)
-        comptime L_NV = Layout.row_major(Self.BATCH, Self.D.NV)
-        comptime L_QPOS = Layout.row_major(Self.BATCH, Self.D.NQ)
+        comptime L_M = RowMajor[Self.BATCH, Self.D.NV * Self.D.NV]
+        comptime L_NV = RowMajor[Self.BATCH, Self.D.NV]
+        comptime L_QPOS = RowMajor[Self.BATCH, Self.D.NQ]
         comptime BLOCKS = (Self.BATCH + IM_TPB - 1) // IM_TPB
 
         # ── armature: M diag += armature ─────────────────────────────────
@@ -911,8 +894,8 @@ struct ImplicitIntegrator[
             var dm = d.dims
             var rl_JOINT = rl2(dm.get_njoint(), MODEL_JOINT_SIZE)
             var rl_M = rl2(Self.BATCH, dm.get_nv() * dm.get_nv())
-            var joints_v = m.joints.lt_dyn["cpu", DYN2](rl_JOINT)
-            var M_v = self.scratch.M.lt_dyn["cpu", DYN2](rl_M)
+            var joints_v = m.joints.tt_dyn["cpu", DYN2](rl_JOINT)
+            var M_v = self.scratch.M.tt_dyn["cpu", DYN2](rl_M)
             for e in range(Self.BATCH):
                 _armature_env[
                     Self.DTYPE](e, dm, joints_v, M_v)
@@ -920,8 +903,8 @@ struct ImplicitIntegrator[
             ctx.value().enqueue_function[
                 _armature_kernel[Self.DTYPE, Self.D.NV, Self.D.NJOINT, Self.BATCH]
             ](
-                m.joints.lt["gpu", L_JOINT](),
-                self.scratch.M.lt["gpu", L_M](),
+                m.joints.tt["gpu", Self.D.NJOINT, MODEL_JOINT_SIZE](),
+                self.scratch.M.tt["gpu", Self.BATCH, Self.D.NV * Self.D.NV](),
                 grid_dim=(BLOCKS,),
                 block_dim=(IM_TPB,),
             )
@@ -958,12 +941,12 @@ struct ImplicitIntegrator[
             var rl_QPOS = rl2(Self.BATCH, dm.get_nq())
             var rl_NV = rl2(Self.BATCH, dm.get_nv())
             var rl_JOINT = rl2(dm.get_njoint(), MODEL_JOINT_SIZE)
-            var qpos_v = d.qpos.lt_dyn["cpu", DYN2](rl_QPOS)
-            var qvel_v = d.qvel.lt_dyn["cpu", DYN2](rl_NV)
-            var qfrc_v = d.qfrc.lt_dyn["cpu", DYN2](rl_NV)
-            var joints_v = m.joints.lt_dyn["cpu", DYN2](rl_JOINT)
-            var bias_v = self.scratch.bias.lt_dyn["cpu", DYN2](rl_NV)
-            var fnet_v = self.scratch.fnet.lt_dyn["cpu", DYN2](rl_NV)
+            var qpos_v = d.qpos.tt_dyn["cpu", DYN2](rl_QPOS)
+            var qvel_v = d.qvel.tt_dyn["cpu", DYN2](rl_NV)
+            var qfrc_v = d.qfrc.tt_dyn["cpu", DYN2](rl_NV)
+            var joints_v = m.joints.tt_dyn["cpu", DYN2](rl_JOINT)
+            var bias_v = self.scratch.bias.tt_dyn["cpu", DYN2](rl_NV)
+            var fnet_v = self.scratch.fnet.tt_dyn["cpu", DYN2](rl_NV)
             for e in range(Self.BATCH):
                 _fnet_passive_env[
                     Self.DTYPE](e, dm, qpos_v, qvel_v, qfrc_v, joints_v, bias_v, fnet_v)
@@ -973,12 +956,12 @@ struct ImplicitIntegrator[
                     Self.DTYPE, Self.D.NQ, Self.D.NV, Self.D.NJOINT, Self.BATCH
                 ]
             ](
-                d.qpos.lt["gpu", L_QPOS](),
-                d.qvel.lt["gpu", L_NV](),
-                d.qfrc.lt["gpu", L_NV](),
-                m.joints.lt["gpu", L_JOINT](),
-                self.scratch.bias.lt["gpu", L_NV](),
-                self.scratch.fnet.lt["gpu", L_NV](),
+                d.qpos.tt["gpu", Self.BATCH, Self.D.NQ](),
+                d.qvel.tt["gpu", Self.BATCH, Self.D.NV](),
+                d.qfrc.tt["gpu", Self.BATCH, Self.D.NV](),
+                m.joints.tt["gpu", Self.D.NJOINT, MODEL_JOINT_SIZE](),
+                self.scratch.bias.tt["gpu", Self.BATCH, Self.D.NV](),
+                self.scratch.fnet.tt["gpu", Self.BATCH, Self.D.NV](),
                 grid_dim=(BLOCKS,),
                 block_dim=(IM_TPB,),
             )
@@ -998,9 +981,9 @@ struct ImplicitIntegrator[
         comptime if target == "cpu":
             var dm = d.dims
             var rl_NV = rl2(Self.BATCH, dm.get_nv())
-            var qacc_ws_v = self.scratch.qacc_ws.lt_dyn["cpu", DYN2](rl_NV)
-            var qacc_v = d.qacc.lt_dyn["cpu", DYN2](rl_NV)
-            var qacc_c_v = self.scratch.qacc_constrained.lt_dyn["cpu", DYN2](rl_NV)
+            var qacc_ws_v = self.scratch.qacc_ws.tt_dyn["cpu", DYN2](rl_NV)
+            var qacc_v = d.qacc.tt_dyn["cpu", DYN2](rl_NV)
+            var qacc_c_v = self.scratch.qacc_constrained.tt_dyn["cpu", DYN2](rl_NV)
             for e in range(Self.BATCH):
                 _qacc_writeback_env[Self.DTYPE](
                     e, dm, qacc_ws_v, qacc_v, qacc_c_v
@@ -1009,9 +992,9 @@ struct ImplicitIntegrator[
             ctx.value().enqueue_function[
                 _qacc_writeback_kernel[Self.DTYPE, Self.D.NV, Self.BATCH]
             ](
-                self.scratch.qacc_ws.lt["gpu", L_NV](),
-                d.qacc.lt["gpu", L_NV](),
-                self.scratch.qacc_constrained.lt["gpu", L_NV](),
+                self.scratch.qacc_ws.tt["gpu", Self.BATCH, Self.D.NV](),
+                d.qacc.tt["gpu", Self.BATCH, Self.D.NV](),
+                self.scratch.qacc_constrained.tt["gpu", Self.BATCH, Self.D.NV](),
                 grid_dim=(BLOCKS,),
                 block_dim=(IM_TPB,),
             )
@@ -1103,18 +1086,18 @@ struct ImplicitIntegrator[
             var dm_r = d.dims
             var rl_M_r = rl2(Self.BATCH, dm_r.get_nv() * dm_r.get_nv())
             var rl_NV_r = rl2(Self.BATCH, dm_r.get_nv())
-            var M_r = self.scratch.M.lt_dyn["cpu", DYN2](rl_M_r)
-            var qc_r = self.scratch.qacc_constrained.lt_dyn["cpu", DYN2](rl_NV_r)
-            var fnet_r = self.scratch.fnet.lt_dyn["cpu", DYN2](rl_NV_r)
+            var M_r = self.scratch.M.tt_dyn["cpu", DYN2](rl_M_r)
+            var qc_r = self.scratch.qacc_constrained.tt_dyn["cpu", DYN2](rl_NV_r)
+            var fnet_r = self.scratch.fnet.tt_dyn["cpu", DYN2](rl_NV_r)
             for e in range(Self.BATCH):
                 _mrhs_env[Self.DTYPE](e, dm_r, M_r, qc_r, fnet_r)
         else:
             ctx.value().enqueue_function[
                 _mrhs_kernel[Self.DTYPE, Self.D.NV, Self.BATCH]
             ](
-                self.scratch.M.lt["gpu", L_M](),
-                self.scratch.qacc_constrained.lt["gpu", L_NV](),
-                self.scratch.fnet.lt["gpu", L_NV](),
+                self.scratch.M.tt["gpu", Self.BATCH, Self.D.NV * Self.D.NV](),
+                self.scratch.qacc_constrained.tt["gpu", Self.BATCH, Self.D.NV](),
+                self.scratch.fnet.tt["gpu", Self.BATCH, Self.D.NV](),
                 grid_dim=(BLOCKS,),
                 block_dim=(IM_TPB,),
             )
@@ -1124,12 +1107,12 @@ struct ImplicitIntegrator[
             var dm = d.dims
             var rl_JOINT = rl2(dm.get_njoint(), MODEL_JOINT_SIZE)
             var rl_M = rl2(Self.BATCH, dm.get_nv() * dm.get_nv())
-            var joints_v = m.joints.lt_dyn["cpu", DYN2](rl_JOINT)
-            var qd_v = self.iscratch.qderiv.lt_dyn["cpu", DYN2](rl_M)
+            var joints_v = m.joints.tt_dyn["cpu", DYN2](rl_JOINT)
+            var qd_v = self.iscratch.qderiv.tt_dyn["cpu", DYN2](rl_M)
             var rl_ACTD = rl2(dm.get_nv(), 1)
-            var actd_v = m.dof_actdamp.lt_dyn["cpu", DYN2](rl_ACTD)
+            var actd_v = m.dof_actdamp.tt_dyn["cpu", DYN2](rl_ACTD)
             var rl_ACTDL = rl2(Self.BATCH, dm.get_nv())
-            var actdl_v = d.dof_actdamp.lt_dyn["cpu", DYN2](rl_ACTDL)
+            var actdl_v = d.dof_actdamp.tt_dyn["cpu", DYN2](rl_ACTDL)
             # ⚠ `nact` FROM THE **DATA** PROVIDER, not from a comptime member
             # — on the runtime leg those are `DIM_POISON`. `_at_least_one`
             # because a model with no actuators still binds this tensor.
@@ -1137,11 +1120,11 @@ struct ImplicitIntegrator[
             if _na < 1:
                 _na = 1
             var rl_ATRN = rl2(_na * ACTDAMP_TRN_SIZE, 1)
-            var atrn_v = m.actdamp_trn.lt_dyn["cpu", DYN2](rl_ATRN)
+            var atrn_v = m.actdamp_trn.tt_dyn["cpu", DYN2](rl_ATRN)
             var rl_AACT = rl2(Self.BATCH, _na)
-            var aact_v = d.actdamp_act.lt_dyn["cpu", DYN2](rl_AACT)
+            var aact_v = d.actdamp_act.tt_dyn["cpu", DYN2](rl_AACT)
             var rl_META = rl2(Self.BATCH, METADATA_SIZE)
-            var meta_v = d.meta.lt_dyn["cpu", DYN2](rl_META)
+            var meta_v = d.meta.tt_dyn["cpu", DYN2](rl_META)
             for e in range(Self.BATCH):
                 _qderiv_damping_env[
                     Self.DTYPE](e, dm, joints_v, njoint, actd_v, actdl_v,
@@ -1153,18 +1136,14 @@ struct ImplicitIntegrator[
                     Self.BATCH
                 ]
             ](
-                m.joints.lt["gpu", L_JOINT](),
+                m.joints.tt["gpu", Self.D.NJOINT, MODEL_JOINT_SIZE](),
                 Int64(njoint),
-                m.dof_actdamp.lt["gpu", L_ACTD](),
-                d.dof_actdamp.lt["gpu", Layout.row_major(
-                    Self.BATCH, Self.D.NV)](),
-                m.actdamp_trn.lt["gpu", Layout.row_major(
-                    NACT_G * ACTDAMP_TRN_SIZE, 1)](),
-                d.actdamp_act.lt["gpu", Layout.row_major(
-                    Self.BATCH, NACT_G)](),
-                d.meta.lt["gpu", Layout.row_major(
-                    Self.BATCH, METADATA_SIZE)](),
-                self.iscratch.qderiv.lt["gpu", L_M](),
+                m.dof_actdamp.tt["gpu", Self.D.NV, 1](),
+                d.dof_actdamp.tt["gpu", Self.BATCH, Self.D.NV](),
+                m.actdamp_trn.tt["gpu", NACT_G * ACTDAMP_TRN_SIZE, 1](),
+                d.actdamp_act.tt["gpu", Self.BATCH, NACT_G](),
+                d.meta.tt["gpu", Self.BATCH, METADATA_SIZE](),
+                self.iscratch.qderiv.tt["gpu", Self.BATCH, Self.D.NV * Self.D.NV](),
                 grid_dim=(BLOCKS,),
                 block_dim=(IM_TPB,),
             )
@@ -1188,8 +1167,8 @@ struct ImplicitIntegrator[
         comptime if target == "cpu":
             var dm = d.dims
             var rl_M = rl2(Self.BATCH, dm.get_nv() * dm.get_nv())
-            var M_v = self.scratch.M.lt_dyn["cpu", DYN2](rl_M)
-            var qd_v = self.iscratch.qderiv.lt_dyn["cpu", DYN2](rl_M)
+            var M_v = self.scratch.M.tt_dyn["cpu", DYN2](rl_M)
+            var qd_v = self.iscratch.qderiv.tt_dyn["cpu", DYN2](rl_M)
             for e in range(Self.BATCH):
                 _msub_qderiv_env[Self.DTYPE](
                     e, dt, dm, M_v, qd_v
@@ -1199,8 +1178,8 @@ struct ImplicitIntegrator[
                 _msub_qderiv_kernel[Self.DTYPE, Self.D.NV, Self.BATCH]
             ](
                 dt,
-                self.scratch.M.lt["gpu", L_M](),
-                self.iscratch.qderiv.lt["gpu", L_M](),
+                self.scratch.M.tt["gpu", Self.BATCH, Self.D.NV * Self.D.NV](),
+                self.iscratch.qderiv.tt["gpu", Self.BATCH, Self.D.NV * Self.D.NV](),
                 grid_dim=(BLOCKS,),
                 block_dim=(IM_TPB,),
             )
@@ -1224,15 +1203,15 @@ struct ImplicitIntegrator[
                 var rl_B_f = rl2(nb_f, MODEL_BODY_SIZE)
                 var rl_X3_f = rl2(Self.BATCH, nb_f * 3)
                 var rl_X4_f = rl2(Self.BATCH, nb_f * 4)
-                var joints_f = m.joints.lt_dyn["cpu", DYN2](rl_J_f)
-                var bodies_f = m.bodies.lt_dyn["cpu", DYN2](rl_B_f)
-                var xpos_f = d.xpos.lt_dyn["cpu", DYN2](rl_X3_f)
-                var xipos_f = d.xipos.lt_dyn["cpu", DYN2](rl_X3_f)
-                var xquat_f = d.xquat.lt_dyn["cpu", DYN2](rl_X4_f)
-                var qvel_f = d.qvel.lt_dyn["cpu", DYN2](rl_NV_f)
-                var M_f = self.scratch.M.lt_dyn["cpu", DYN2](rl_M_f)
-                var fnet_f = self.scratch.fnet.lt_dyn["cpu", DYN2](rl_NV_f)
-                var qws_f = self.scratch.qacc_ws.lt_dyn["cpu", DYN2](rl_NV_f)
+                var joints_f = m.joints.tt_dyn["cpu", DYN2](rl_J_f)
+                var bodies_f = m.bodies.tt_dyn["cpu", DYN2](rl_B_f)
+                var xpos_f = d.xpos.tt_dyn["cpu", DYN2](rl_X3_f)
+                var xipos_f = d.xipos.tt_dyn["cpu", DYN2](rl_X3_f)
+                var xquat_f = d.xquat.tt_dyn["cpu", DYN2](rl_X4_f)
+                var qvel_f = d.qvel.tt_dyn["cpu", DYN2](rl_NV_f)
+                var M_f = self.scratch.M.tt_dyn["cpu", DYN2](rl_M_f)
+                var fnet_f = self.scratch.fnet.tt_dyn["cpu", DYN2](rl_NV_f)
+                var qws_f = self.scratch.qacc_ws.tt_dyn["cpu", DYN2](rl_NV_f)
                 for e in range(Self.BATCH):
                     _free_body_block_env[Self.DTYPE](
                         e, dt, dm_f, joints_f, bodies_f, xpos_f, xipos_f,
@@ -1246,15 +1225,15 @@ struct ImplicitIntegrator[
                     ]
                 ](
                     dt,
-                    m.joints.lt["gpu", L_JOINT](),
-                    m.bodies.lt["gpu", Layout.row_major(Self.D.NBODY, MODEL_BODY_SIZE)](),
-                    d.xpos.lt["gpu", Layout.row_major(Self.BATCH, Self.D.NBODY * 3)](),
-                    d.xipos.lt["gpu", Layout.row_major(Self.BATCH, Self.D.NBODY * 3)](),
-                    d.xquat.lt["gpu", Layout.row_major(Self.BATCH, Self.D.NBODY * 4)](),
-                    d.qvel.lt["gpu", L_NV](),
-                    self.scratch.M.lt["gpu", L_M](),
-                    self.scratch.fnet.lt["gpu", L_NV](),
-                    self.scratch.qacc_ws.lt["gpu", L_NV](),
+                    m.joints.tt["gpu", Self.D.NJOINT, MODEL_JOINT_SIZE](),
+                    m.bodies.tt["gpu", Self.D.NBODY, MODEL_BODY_SIZE](),
+                    d.xpos.tt["gpu", Self.BATCH, Self.D.NBODY * 3](),
+                    d.xipos.tt["gpu", Self.BATCH, Self.D.NBODY * 3](),
+                    d.xquat.tt["gpu", Self.BATCH, Self.D.NBODY * 4](),
+                    d.qvel.tt["gpu", Self.BATCH, Self.D.NV](),
+                    self.scratch.M.tt["gpu", Self.BATCH, Self.D.NV * Self.D.NV](),
+                    self.scratch.fnet.tt["gpu", Self.BATCH, Self.D.NV](),
+                    self.scratch.qacc_ws.tt["gpu", Self.BATCH, Self.D.NV](),
                     grid_dim=(BLOCKS,),
                     block_dim=(IM_TPB,),
                 )
@@ -1262,16 +1241,16 @@ struct ImplicitIntegrator[
         comptime if target == "cpu":
             var dm_a = d.dims
             var rl_NV_a = rl2(Self.BATCH, dm_a.get_nv())
-            var qws_a = self.scratch.qacc_ws.lt_dyn["cpu", DYN2](rl_NV_a)
-            var qc_a = self.scratch.qacc_constrained.lt_dyn["cpu", DYN2](rl_NV_a)
+            var qws_a = self.scratch.qacc_ws.tt_dyn["cpu", DYN2](rl_NV_a)
+            var qc_a = self.scratch.qacc_constrained.tt_dyn["cpu", DYN2](rl_NV_a)
             for e in range(Self.BATCH):
                 _adopt_qacc_env[Self.DTYPE](e, dm_a, qws_a, qc_a)
         else:
             ctx.value().enqueue_function[
                 _adopt_qacc_kernel[Self.DTYPE, Self.D.NV, Self.BATCH]
             ](
-                self.scratch.qacc_ws.lt["gpu", L_NV](),
-                self.scratch.qacc_constrained.lt["gpu", L_NV](),
+                self.scratch.qacc_ws.tt["gpu", Self.BATCH, Self.D.NV](),
+                self.scratch.qacc_constrained.tt["gpu", Self.BATCH, Self.D.NV](),
                 grid_dim=(BLOCKS,),
                 block_dim=(IM_TPB,),
             )
@@ -1282,11 +1261,11 @@ struct ImplicitIntegrator[
             var rl_QPOS = rl2(Self.BATCH, dm.get_nq())
             var rl_NV = rl2(Self.BATCH, dm.get_nv())
             var rl_JOINT = rl2(dm.get_njoint(), MODEL_JOINT_SIZE)
-            var qpos_v = d.qpos.lt_dyn["cpu", DYN2](rl_QPOS)
-            var qvel_v = d.qvel.lt_dyn["cpu", DYN2](rl_NV)
-            var qacc_v = d.qacc.lt_dyn["cpu", DYN2](rl_NV)
-            var joints_v = m.joints.lt_dyn["cpu", DYN2](rl_JOINT)
-            var qacc_c_v = self.scratch.qacc_constrained.lt_dyn["cpu", DYN2](rl_NV)
+            var qpos_v = d.qpos.tt_dyn["cpu", DYN2](rl_QPOS)
+            var qvel_v = d.qvel.tt_dyn["cpu", DYN2](rl_NV)
+            var qacc_v = d.qacc.tt_dyn["cpu", DYN2](rl_NV)
+            var joints_v = m.joints.tt_dyn["cpu", DYN2](rl_JOINT)
+            var qacc_c_v = self.scratch.qacc_constrained.tt_dyn["cpu", DYN2](rl_NV)
             for e in range(Self.BATCH):
                 _implicit_finalize_env[
                     Self.DTYPE](e, dt, dm, qpos_v, qvel_v, qacc_v, joints_v, qacc_c_v)
@@ -1297,11 +1276,11 @@ struct ImplicitIntegrator[
                 ]
             ](
                 dt,
-                d.qpos.lt["gpu", L_QPOS](),
-                d.qvel.lt["gpu", L_NV](),
-                d.qacc.lt["gpu", L_NV](),
-                m.joints.lt["gpu", L_JOINT](),
-                self.scratch.qacc_constrained.lt["gpu", L_NV](),
+                d.qpos.tt["gpu", Self.BATCH, Self.D.NQ](),
+                d.qvel.tt["gpu", Self.BATCH, Self.D.NV](),
+                d.qacc.tt["gpu", Self.BATCH, Self.D.NV](),
+                m.joints.tt["gpu", Self.D.NJOINT, MODEL_JOINT_SIZE](),
+                self.scratch.qacc_constrained.tt["gpu", Self.BATCH, Self.D.NV](),
                 grid_dim=(BLOCKS,),
                 block_dim=(IM_TPB,),
             )

@@ -12,7 +12,6 @@ The envs here are one island each (the ground is static), so one clock per
 env stored in the env's own state is Box2D's per-body `m_sleepTime` minimum.
 """
 
-from layout import LayoutTensor, Layout
 
 from .constants import (
     dtype,
@@ -25,6 +24,7 @@ from .constants import (
     B2_LINEAR_SLEEP_TOLERANCE,
     B2_ANGULAR_SLEEP_TOLERANCE,
 )
+from noeira.core.tiles import Tile
 
 
 @always_inline
@@ -35,7 +35,7 @@ def island_sleep_time_single_env[
     BODIES_OFFSET: Int,
 ](
     env: Int,
-    state: LayoutTensor[dtype, Layout.row_major(BATCH, STATE_SIZE), MutAnyOrigin],
+    state: Tile[dtype, BATCH, STATE_SIZE],
     sleep_time: Scalar[dtype],
     dt: Scalar[dtype],
 ) -> Scalar[dtype]:

@@ -30,8 +30,7 @@ the vector; it dominates the first layer's activations whatever the mask bit
 says. The two together are the fix, not either one.
 """
 
-from layout import Layout, LayoutTensor
-
+from noeira.core.tiles import Tile
 
 # ⚠ A FREE JOINT'S WIDTH, NAMED ONCE. `reset.write_free_pose` writes seven
 # `qpos` and `reset.write_free_vel_zero` six `qvel`; this zeroes the same two
@@ -61,7 +60,7 @@ def slot_active[DTYPE: DType](mask: Scalar[DTYPE], slot: Int) -> Bool:
 def write_free_slot_obs[
     DTYPE: DType, BATCH: Int, OBS_DIM: Int,
 ](
-    obs: LayoutTensor[DTYPE, Layout.row_major(BATCH, OBS_DIM), MutAnyOrigin],
+    obs: Tile[DTYPE, BATCH, OBS_DIM],
     env: Int,
     active: Bool,
     qadr: Int,

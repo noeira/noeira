@@ -47,7 +47,6 @@ Checkpoint: the FB file (`fb_eval_walker_online.mojo` reads it unchanged)
 """
 
 from std.math import sqrt
-from layout import Layout, LayoutTensor
 from max.gpu.host import DeviceContext, DeviceBuffer
 
 from noeira.core.logger import Logger
@@ -81,6 +80,7 @@ from .kernels import (
     ensure_t,
     _blocks,
 )
+from noeira.core.tiles import RowMajor, Tile, tile
 
 
 struct FBCPROnlineAgent[
@@ -284,13 +284,9 @@ struct FBCPROnlineAgent[
         """NW window starts → BATCH rows of expert `s` and `s'` in
         `head.es` / `head.esn`. Device-offset draws: capture-safe."""
         var c = self.ctx.value()
-        var n_lt = LayoutTensor[DType.int32, Layout.row_major(1)](
-            self.n_starts_dev.value()
-        )
-        var off_lt = LayoutTensor[DType.uint64, Layout.row_major(1)](
-            self.base.samp_off.value()
-        )
-        var iw_lt = LayoutTensor[IDX_DT, Layout.row_major(Self.NW)](self.idx_w.value())
+        var n_lt = tile[1](self.n_starts_dev.value())
+        var off_lt = tile[1](self.base.samp_off.value())
+        var iw_lt = tile[Self.NW](self.idx_w.value())
         c.enqueue_function[_uniform_indices_dev_kernel[Self.NW]](
             iw_lt, n_lt, self.base._train_seed + 4242, off_lt,
             grid_dim=_blocks(Self.NW), block_dim=TPB,
@@ -345,9 +341,7 @@ struct FBCPROnlineAgent[
             self.base.gauss, self.base._train_seed + 5,
             self.base.rng_dev.value(), self.ctx,
         )
-        var off_lt = LayoutTensor[DType.uint64, Layout.row_major(1), MutAnyOrigin](
-            mptr(self.base.rng_dev.value().unsafe_ptr())
-        )
+        var off_lt = tile[1](mptr(self.base.rng_dev.value().unsafe_ptr()))
         comptime NP = Self.BATCH * 3
         c.enqueue_function[uniform01_dev_kernel[NP]](
             mptr(self.pick3.dev.value().unsafe_ptr()),
@@ -391,9 +385,9 @@ struct FBCPROnlineAgent[
         self._relabel_z3()
         _ = self.head.step(self.base.t, want_loss=False)
         self.base._push_zbuf()
-        comptime lba = Layout.row_major(Self.BATCH * Self.ACT)
+        comptime lba = RowMajor[Self.BATCH * Self.ACT]
         self.base._mean_abs_action_dev.accumulate_gpu_abs_lt[Self.BATCH * Self.ACT](
-            self.base.t.ba.lt["gpu", lba]()
+            self.base.t.ba.tt["gpu", Self.BATCH * Self.ACT]()
         )
 
     # ── OffPolicyAgentGpu: rollout surface, delegated ────────────────────
@@ -402,18 +396,10 @@ struct FBCPROnlineAgent[
         N_ENVS: Int
     ](
         mut self,
-        obs: LayoutTensor[
-            DT, Layout.row_major(N_ENVS, Self.AGENT_OBS_DIM), MutAnyOrigin
-        ],
-        action: LayoutTensor[
-            DT, Layout.row_major(N_ENVS, Self.AGENT_ACT_DIM), MutAnyOrigin
-        ],
-        ao_scratch: LayoutTensor[
-            DT, Layout.row_major(N_ENVS, 2 * Self.AGENT_ACT_DIM), MutAnyOrigin
-        ],
-        alp_scratch: LayoutTensor[
-            DT, Layout.row_major(N_ENVS, Self.AGENT_ACT_DIM + 1), MutAnyOrigin
-        ],
+        obs: Tile[DT, N_ENVS, Self.AGENT_OBS_DIM],
+        action: Tile[DT, N_ENVS, Self.AGENT_ACT_DIM],
+        ao_scratch: Tile[DT, N_ENVS, 2 * Self.AGENT_ACT_DIM],
+        alp_scratch: Tile[DT, N_ENVS, Self.AGENT_ACT_DIM + 1],
         step_idx: Int,
     ) raises:
         self.base.select_action_batched[N_ENVS](
@@ -425,15 +411,9 @@ struct FBCPROnlineAgent[
     ](
         mut self,
         ctx: Optional[DeviceContext],
-        obs: LayoutTensor[
-            DT, Layout.row_major(N_ENVS, Self.AGENT_OBS_DIM), MutAnyOrigin
-        ],
-        action: LayoutTensor[
-            DT, Layout.row_major(N_ENVS, Self.AGENT_ACT_DIM), MutAnyOrigin
-        ],
-        ao_scratch: LayoutTensor[
-            DT, Layout.row_major(N_ENVS, 2 * Self.AGENT_ACT_DIM), MutAnyOrigin
-        ],
+        obs: Tile[DT, N_ENVS, Self.AGENT_OBS_DIM],
+        action: Tile[DT, N_ENVS, Self.AGENT_ACT_DIM],
+        ao_scratch: Tile[DT, N_ENVS, 2 * Self.AGENT_ACT_DIM],
     ) raises:
         self.base.select_greedy_action_batched[N_ENVS](ctx, obs, action, ao_scratch)
 

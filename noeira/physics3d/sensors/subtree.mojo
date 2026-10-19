@@ -55,7 +55,7 @@ Bounding is not a hack here: a parent chain cannot revisit a body, so `nbody`
 is an exact bound.
 """
 
-from layout import Layout, LayoutTensor
+from layout import TileTensor, TensorLayout
 
 from ..gpu.constants import (
     MODEL_BODY_SIZE,
@@ -154,11 +154,9 @@ def subtree_linvel[
 def walk_to_root_gpu[
     DTYPE: DType,
     D: DimsLike,
-    L_BODIES: Layout](
+    L_BODIES: TensorLayout](
     dims: D,
-    bodies: LayoutTensor[
-        DTYPE, L_BODIES, MutAnyOrigin
-    ],
+    bodies: TileTensor[DTYPE, L_BODIES, MutAnyOrigin],
     body: Int,
     root: Int,
 ) -> Bool:
@@ -182,15 +180,11 @@ def walk_to_root_gpu[
 def subtree_linvel_gpu[
     DTYPE: DType,
     D: DimsLike,
-    L_XVEL: Layout,
-    L_BODIES: Layout](
+    L_XVEL: TensorLayout,
+    L_BODIES: TensorLayout](
     dims: D,
-    xvel: LayoutTensor[
-        DTYPE, L_XVEL, MutAnyOrigin
-    ],
-    bodies: LayoutTensor[
-        DTYPE, L_BODIES, MutAnyOrigin
-    ],
+    xvel: TileTensor[DTYPE, L_XVEL, MutAnyOrigin],
+    bodies: TileTensor[DTYPE, L_BODIES, MutAnyOrigin],
     env: Int,
     root: Int,
     mut vx: Scalar[DTYPE],
@@ -235,16 +229,16 @@ def subtree_linvel_gpu[
 def subtree_angmom_gpu[
     DTYPE: DType,
     D: DimsLike,
-    L_B3: Layout,
-    L_XQUAT: Layout,
-    L_BODIES: Layout](
+    L_B3: TensorLayout,
+    L_XQUAT: TensorLayout,
+    L_BODIES: TensorLayout](
     dims: D,
-    xipos: LayoutTensor[DTYPE, L_B3, MutAnyOrigin],
-    xvel: LayoutTensor[DTYPE, L_B3, MutAnyOrigin],
-    xangvel: LayoutTensor[DTYPE, L_B3, MutAnyOrigin],
-    xquat: LayoutTensor[DTYPE, L_XQUAT, MutAnyOrigin],
-    subtree_com: LayoutTensor[DTYPE, L_B3, MutAnyOrigin],
-    bodies: LayoutTensor[DTYPE, L_BODIES, MutAnyOrigin],
+    xipos: TileTensor[DTYPE, L_B3, MutAnyOrigin],
+    xvel: TileTensor[DTYPE, L_B3, MutAnyOrigin],
+    xangvel: TileTensor[DTYPE, L_B3, MutAnyOrigin],
+    xquat: TileTensor[DTYPE, L_XQUAT, MutAnyOrigin],
+    subtree_com: TileTensor[DTYPE, L_B3, MutAnyOrigin],
+    bodies: TileTensor[DTYPE, L_BODIES, MutAnyOrigin],
     env: Int,
     root: Int,
     mut lx: Scalar[DTYPE],

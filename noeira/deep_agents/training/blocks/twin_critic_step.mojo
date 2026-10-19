@@ -9,7 +9,6 @@ PER weight / TD-residual views are built via `state.mb_*.lt[target, layout]`.
 """
 
 from max.gpu.host import DeviceContext
-from layout import Layout, LayoutTensor
 
 from noeira.nn.constants import DT
 from noeira.nn.core.amp import AMPPolicy, NoAMP
@@ -17,6 +16,7 @@ from noeira.nn.core.module import Module
 from noeira.nn.optimizer.adam import Adam
 from ...loss.critic_update_block import TwinCriticUpdateBlock
 from ..trainer_block import TrainerState
+from noeira.core.tiles import Tile
 
 
 struct TwinCriticStep[
@@ -64,16 +64,14 @@ struct TwinCriticStep[
         # update and capture per-sample signed TD residuals. When unset, both
         # stay None and the inner block falls back to the uniform path.
         var weights: Optional[
-            LayoutTensor[DT, Layout.row_major(Self.BATCH), MutAnyOrigin]
+            Tile[DT, Self.BATCH]
         ] = None
         var td_residuals: Optional[
-            LayoutTensor[DT, Layout.row_major(Self.BATCH), MutAnyOrigin]
+            Tile[DT, Self.BATCH]
         ] = None
         if state.has_per:
-            weights = state.mb_w.lt[target, Layout.row_major(Self.BATCH)]()
-            td_residuals = state.td_residuals.lt[
-                target, Layout.row_major(Self.BATCH)
-            ]()
+            weights = state.mb_w.tt[target, Self.BATCH]()
+            td_residuals = state.td_residuals.tt[target, Self.BATCH]()
 
         var loss = self.inner.step[target, POLICY, ACCUMULATE](
             critic1,

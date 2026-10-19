@@ -29,7 +29,6 @@ the arm this serves is data-free.
 """
 
 from std.math import exp, sqrt, sin
-from layout import Layout, LayoutTensor
 from max.gpu import global_idx
 
 from noeira.nn.constants import DT
@@ -52,6 +51,7 @@ from noeira.envs.robots.unitree_g1_walk_rp_config import (
 )
 
 from .bfm_towers import BFMBNet
+from noeira.core.tiles import Tile
 
 
 # ── observation columns (the 527-D G1 row) ───────────────────────────────
@@ -175,11 +175,11 @@ struct G1RegWeights(Copyable, ImplicitlyCopyable, Movable):
 def g1_reg_env_kernel[
     N: Int, NQ: Int, NBODY: Int, MC: Int,
 ](
-    qpos: LayoutTensor[DT, Layout.row_major(N, NQ), MutAnyOrigin],
-    xquat: LayoutTensor[DT, Layout.row_major(N, NBODY * 4), MutAnyOrigin],
-    xvel: LayoutTensor[DT, Layout.row_major(N, NBODY * 3), MutAnyOrigin],
-    contacts: LayoutTensor[DT, Layout.row_major(N, MC * CONTACT_SIZE), MutAnyOrigin],
-    meta: LayoutTensor[DT, Layout.row_major(N, METADATA_SIZE), MutAnyOrigin],
+    qpos: Tile[DT, N, NQ],
+    xquat: Tile[DT, N, NBODY * 4],
+    xvel: Tile[DT, N, NBODY * 3],
+    contacts: Tile[DT, N, MC * CONTACT_SIZE],
+    meta: Tile[DT, N, METADATA_SIZE],
     r_env: Pointer[Scalar[DT], MutAnyOrigin],
     w_und: Scalar[DT],
     w_fo: Scalar[DT],

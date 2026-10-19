@@ -39,7 +39,6 @@ from noeira.nn.core.param import walk_params
 from std.math import tanh as ftanh
 from std.random import random_float64
 from std.random.philox import Random as PhiloxRandom
-from layout import Layout, LayoutTensor
 
 from max.gpu import global_idx
 from max.gpu.host import DeviceContext, DeviceBuffer
@@ -77,6 +76,7 @@ from .target_y_block import DDPGTargetYBlock
 from .blocks.actor_step import DDPGActorStep
 from .blocks.polyak_step import DDPGPolyakStep
 from .metrics import DDPGMetrics
+from noeira.core.tiles import RowMajor, Tile
 
 
 # ──────────────────────────────────────────────────────────────────────
@@ -354,15 +354,15 @@ struct DDPGTrainer[
             self._mean_target_accum += sy * inv_b
             self._mean_reward_accum += sr * inv_b
         else:
-            comptime lb = Layout.row_major(B)
+            comptime lb = RowMajor[B]
             self._mean_q_dev.accumulate_gpu_lt[B](
-                self.critic_blk.inner._mb_q.lt["gpu", lb]()
+                self.critic_blk.inner._mb_q.tt["gpu", B]()
             )
             self._mean_target_dev.accumulate_gpu_lt[B](
-                self.state.mb_y.lt["gpu", lb]()
+                self.state.mb_y.tt["gpu", B]()
             )
             self._mean_reward_dev.accumulate_gpu_lt[B](
-                self.state.mb_r.lt["gpu", lb]()
+                self.state.mb_r.tt["gpu", B]()
             )
         self._update_count += 1
         self._total_train_steps += 1
@@ -376,18 +376,10 @@ struct DDPGTrainer[
         N_ENVS: Int
     ](
         mut self,
-        obs: LayoutTensor[
-            DT, Layout.row_major(N_ENVS, Self.AGENT_OBS_DIM), MutAnyOrigin
-        ],
-        action: LayoutTensor[
-            DT, Layout.row_major(N_ENVS, Self.AGENT_ACT_DIM), MutAnyOrigin
-        ],
-        ao_scratch: LayoutTensor[
-            DT, Layout.row_major(N_ENVS, 2 * Self.AGENT_ACT_DIM), MutAnyOrigin
-        ],
-        alp_scratch: LayoutTensor[
-            DT, Layout.row_major(N_ENVS, Self.AGENT_ACT_DIM + 1), MutAnyOrigin
-        ],
+        obs: Tile[DT, N_ENVS, Self.AGENT_OBS_DIM],
+        action: Tile[DT, N_ENVS, Self.AGENT_ACT_DIM],
+        ao_scratch: Tile[DT, N_ENVS, 2 * Self.AGENT_ACT_DIM],
+        alp_scratch: Tile[DT, N_ENVS, Self.AGENT_ACT_DIM + 1],
         step_idx: Int,
     ) raises:
         comptime assert N_ENVS > 0, "N_ENVS must be > 0"

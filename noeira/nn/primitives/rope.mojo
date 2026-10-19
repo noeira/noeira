@@ -47,7 +47,8 @@ sits after a cached prefix.
 from std.math import cos, sin, exp, log
 from max.gpu import global_idx
 from max.gpu.host import DeviceContext
-from layout import Layout, LayoutTensor, TileTensor, row_major
+from layout import TileTensor, row_major
+from noeira.core.tiles import Tile
 
 from noeira.nn.constants import DT, TPB
 from ..core.tensor import Tensor
@@ -83,10 +84,10 @@ def build_rope_tables[
 def _rope_fwd_kernel[
     BATCH: Int, SEQ: Int, N_HEADS: Int, HEAD_DIM: Int, N: Int
 ](
-    x: LayoutTensor[DT, Layout.row_major(BATCH, N), MutAnyOrigin],
-    cs: LayoutTensor[DT, Layout.row_major(SEQ * (HEAD_DIM // 2)), MutAnyOrigin],
-    sn: LayoutTensor[DT, Layout.row_major(SEQ * (HEAD_DIM // 2)), MutAnyOrigin],
-    dst: LayoutTensor[DT, Layout.row_major(BATCH, N), MutAnyOrigin],
+    x: Tile[DT, BATCH, N],
+    cs: Tile[DT, SEQ * (HEAD_DIM // 2)],
+    sn: Tile[DT, SEQ * (HEAD_DIM // 2)],
+    dst: Tile[DT, BATCH, N],
 ):
     comptime H = HEAD_DIM // 2
     comptime PAIRS = BATCH * SEQ * N_HEADS * H
@@ -113,10 +114,10 @@ def _rope_fwd_kernel[
 def _rope_bwd_kernel[
     BATCH: Int, SEQ: Int, N_HEADS: Int, HEAD_DIM: Int, N: Int
 ](
-    go: LayoutTensor[DT, Layout.row_major(BATCH, N), MutAnyOrigin],
-    cs: LayoutTensor[DT, Layout.row_major(SEQ * (HEAD_DIM // 2)), MutAnyOrigin],
-    sn: LayoutTensor[DT, Layout.row_major(SEQ * (HEAD_DIM // 2)), MutAnyOrigin],
-    gi: LayoutTensor[DT, Layout.row_major(BATCH, N), MutAnyOrigin],
+    go: Tile[DT, BATCH, N],
+    cs: Tile[DT, SEQ * (HEAD_DIM // 2)],
+    sn: Tile[DT, SEQ * (HEAD_DIM // 2)],
+    gi: Tile[DT, BATCH, N],
 ):
     comptime H = HEAD_DIM // 2
     comptime PAIRS = BATCH * SEQ * N_HEADS * H
@@ -226,10 +227,10 @@ struct RoPE[
                     B, Self.SEQ, Self.N_HEADS, Self.HEAD_DIM, Self.N
                 ]
             ](
-                x.lt["gpu", Layout.row_major(B, Self.N)](),
-                self.cs.lt["gpu", Layout.row_major(Self.TABLE)](),
-                self.sn.lt["gpu", Layout.row_major(Self.TABLE)](),
-                out.lt["gpu", Layout.row_major(B, Self.N)](),
+                x.tt["gpu", B, Self.N](),
+                self.cs.tt["gpu", Self.TABLE](),
+                self.sn.tt["gpu", Self.TABLE](),
+                out.tt["gpu", B, Self.N](),
                 grid_dim=n_blocks,
                 block_dim=TPB,
             )
@@ -276,10 +277,10 @@ struct RoPE[
                     B, Self.SEQ, Self.N_HEADS, Self.HEAD_DIM, Self.N
                 ]
             ](
-                grad_output.lt["gpu", Layout.row_major(B, Self.N)](),
-                self.cs.lt["gpu", Layout.row_major(Self.TABLE)](),
-                self.sn.lt["gpu", Layout.row_major(Self.TABLE)](),
-                gin.lt["gpu", Layout.row_major(B, Self.N)](),
+                grad_output.tt["gpu", B, Self.N](),
+                self.cs.tt["gpu", Self.TABLE](),
+                self.sn.tt["gpu", Self.TABLE](),
+                gin.tt["gpu", B, Self.N](),
                 grid_dim=n_blocks,
                 block_dim=TPB,
             )

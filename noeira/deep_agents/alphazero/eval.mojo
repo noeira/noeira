@@ -23,7 +23,6 @@ BatchNorm-bearing torsos (CNN / ResNet) use running stats — a no-op for the ML
 from noeira.nn.core.ptr import untracked
 from std.memory import Pointer
 from max.gpu.host import DeviceContext, DeviceBuffer
-from layout import Layout, LayoutTensor
 
 from noeira.nn.constants import DT
 from noeira.nn.core.module import Module
@@ -42,6 +41,7 @@ from noeira.planners.tree_search import (
 from ..zero.evaluators import GPUEvaluator, CPUEvaluator, RandomOpponent
 from ..zero.mcts_adapters import AZPredGPU, AZEnvGPU
 from ..zero.mcts_adapters_cpu import AZRepCPU, AZDynCPU, AZPredCPU
+from noeira.core.tiles import tile
 
 
 @always_inline
@@ -111,12 +111,8 @@ def eval_policy_vs_random[
 
         var agent_turn = (ply % 2) == agent_player
         if agent_turn:
-            var obs_lt = LayoutTensor[
-                DT, Layout.row_major(N_GAMES, OBS), MutAnyOrigin
-            ](obs_dev)
-            var pred_lt = LayoutTensor[
-                DT, Layout.row_major(N_GAMES, W), MutAnyOrigin
-            ](pred_dev)
+            var obs_lt = tile[N_GAMES, OBS](obs_dev)
+            var pred_lt = tile[N_GAMES, W](pred_dev)
             pred_ad.predict_gpu[N_GAMES](ctx, obs_lt, pred_lt)
             ctx.enqueue_copy(pred_h, pred_dev)
             ctx.synchronize()
@@ -441,12 +437,8 @@ def eval_mcts_vs_opponent[
         elif agent_turn:
             var pred = AZPredGPU[OBS, ACT, NET].make(net)
             var env_ad = AZEnvGPU[ENV, STATE, OBS, ACT]()
-            var root_obs = LayoutTensor[DT, Layout.row_major(N_GAMES, OBS)](
-                obs_dev
-            )
-            var root_legal = LayoutTensor[DT, Layout.row_major(N_GAMES * ACT)](
-                legal_dev
-            )
+            var root_obs = tile[N_GAMES, OBS](obs_dev)
+            var root_legal = tile[N_GAMES * ACT](legal_dev)
             mcts.search_gpu_alphazero[type_of(pred), type_of(env_ad)](
                 ctx,
                 pred,
@@ -586,12 +578,8 @@ def eval_policy_vs_opponent[
             # Greedy net policy: argmax over legal columns (CPU readback).
             ctx.enqueue_copy(legal_h, legal_dev)
             ctx.synchronize()
-            var obs_lt = LayoutTensor[
-                DT, Layout.row_major(N_GAMES, OBS), MutAnyOrigin
-            ](obs_dev)
-            var pred_lt = LayoutTensor[
-                DT, Layout.row_major(N_GAMES, W), MutAnyOrigin
-            ](pred_dev)
+            var obs_lt = tile[N_GAMES, OBS](obs_dev)
+            var pred_lt = tile[N_GAMES, W](pred_dev)
             pred_ad.predict_gpu[N_GAMES](ctx, obs_lt, pred_lt)
             ctx.enqueue_copy(pred_h, pred_dev)
             ctx.synchronize()

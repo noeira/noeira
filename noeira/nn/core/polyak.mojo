@@ -10,17 +10,17 @@ than in any agent's loss module. Both CPU + GPU.
 
 from max.gpu import global_idx
 from max.gpu.host import DeviceContext
-from layout import Layout, LayoutTensor
 
 from noeira.nn.constants import DT, TPB
 from .tensor import Tensor
+from noeira.core.tiles import Tile
 
 
 def _polyak_kernel[
     N: Int
 ](
-    dst: LayoutTensor[DT, Layout.row_major(N), MutAnyOrigin],
-    src: LayoutTensor[DT, Layout.row_major(N), MutAnyOrigin],
+    dst: Tile[DT, N],
+    src: Tile[DT, N],
     tau: Scalar[DT],
 ):
     var i = Int(global_idx.x)
@@ -47,8 +47,8 @@ def polyak_tensor[
         var c = ctx.value()
         comptime nblk = (N + TPB - 1) // TPB
         c.enqueue_function[_polyak_kernel[N]](
-            dst.lt["gpu", Layout.row_major(N)](),
-            src.lt["gpu", Layout.row_major(N)](),
+            dst.tt["gpu", N](),
+            src.tt["gpu", N](),
             tau,
             grid_dim=nblk,
             block_dim=TPB,

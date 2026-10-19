@@ -31,7 +31,8 @@ from max.gpu import global_idx, thread_idx, block_idx
 from max.gpu.sync import barrier
 from max.gpu.memory import AddressSpace
 from max.gpu.host import DeviceContext, DeviceBuffer
-from layout import Layout, LayoutTensor, TileTensor, row_major
+from layout import TileTensor, row_major
+from noeira.core.tiles import RowMajor, tile, shared_tile
 from linalg.matmul import matmul as max_matmul
 from noeira.nn.core.splitk_gemm import (
     splitk_path_applies,
@@ -110,12 +111,7 @@ def _transpose_tiled_kernel[
 ):
     var ROWS = Int(rows_arg)
     var COLS = Int(cols_arg)
-    var tile = LayoutTensor[
-        ADT,
-        Layout.row_major(_T_TILE, _T_TILE + 1),  # +1 pad → no bank conflicts
-        MutAnyOrigin,
-        address_space=AddressSpace.SHARED,
-    ].stack_allocation()
+    var tile = shared_tile[ADT, _T_TILE, _T_TILE + 1]()
 
     var cy = Int(block_idx.y) * _T_TILE  # tile origin in ROWS
     var cx = Int(block_idx.x) * _T_TILE  # tile origin in COLS
@@ -173,10 +169,7 @@ def _lin_gb_partial_kernel[
     var j = Int(block_idx.x) * _GB_COLS + tx
     var r0 = Int(block_idx.y) * _GB_CHUNK
     var r1 = min(r0 + _GB_CHUNK, n_b)
-    var acc = LayoutTensor[
-        DT, Layout.row_major(_GB_ROWS, _GB_COLS), MutAnyOrigin,
-        address_space=AddressSpace.SHARED,
-    ].stack_allocation()
+    var acc = shared_tile[DT, _GB_ROWS, _GB_COLS]()
     var s: Scalar[DT] = 0
     if j < n_out:
         var r = r0 + ty

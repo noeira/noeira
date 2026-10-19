@@ -57,7 +57,8 @@ those rows' `efc_force` is not retained past the solve.
 
 from max.gpu import thread_idx, block_idx, block_dim
 from max.gpu.host import DeviceContext
-from layout import Layout, LayoutTensor
+from layout import TileTensor, TensorLayout
+from noeira.core.tiles import RowMajor, Tile
 
 from ..fields import (
     Data,
@@ -140,49 +141,28 @@ comptime RNE_POST_TPB: Int = 64
 def _cfrc_ext_env[
     DTYPE: DType,
     D: DimsLike,
-    L_CONTACTS: Layout,
-    L_DMETA: Layout,
-    L_SUBTREE_COM: Layout,
-    L_BODIES: Layout,
-    L_CFRC_EXT: Layout,
-    L_XQUAT_E: Layout,
-    L_EQUALITY: Layout,
-    L_EQFORCE: Layout,
-    L_MMETA_E: Layout,
+    L_CONTACTS: TensorLayout,
+    L_DMETA: TensorLayout,
+    L_SUBTREE_COM: TensorLayout,
+    L_BODIES: TensorLayout,
+    L_CFRC_EXT: TensorLayout,
+    L_XQUAT_E: TensorLayout,
+    L_EQUALITY: TensorLayout,
+    L_EQFORCE: TensorLayout,
+    L_MMETA_E: TensorLayout,
 ](
     env: Int,
     dims: D,
-    contacts: LayoutTensor[
-        DTYPE, L_CONTACTS,
-        MutAnyOrigin,
-    ],
-    dmeta: LayoutTensor[
-        DTYPE, L_DMETA, MutAnyOrigin
-    ],
-    subtree_com: LayoutTensor[
-        DTYPE, L_SUBTREE_COM, MutAnyOrigin
-    ],
-    bodies: LayoutTensor[
-        DTYPE, L_BODIES, MutAnyOrigin
-    ],
-    cfrc_ext: LayoutTensor[
-        DTYPE, L_CFRC_EXT, MutAnyOrigin
-    ],
-    xpos: LayoutTensor[
-        DTYPE, L_SUBTREE_COM, MutAnyOrigin
-    ],
-    xquat: LayoutTensor[
-        DTYPE, L_XQUAT_E, MutAnyOrigin
-    ],
-    equality: LayoutTensor[
-        DTYPE, L_EQUALITY, MutAnyOrigin
-    ],
-    eq_force: LayoutTensor[
-        DTYPE, L_EQFORCE, MutAnyOrigin
-    ],
-    mmeta: LayoutTensor[
-        DTYPE, L_MMETA_E, MutAnyOrigin
-    ],
+    contacts: TileTensor[DTYPE, L_CONTACTS, MutAnyOrigin],
+    dmeta: TileTensor[DTYPE, L_DMETA, MutAnyOrigin],
+    subtree_com: TileTensor[DTYPE, L_SUBTREE_COM, MutAnyOrigin],
+    bodies: TileTensor[DTYPE, L_BODIES, MutAnyOrigin],
+    cfrc_ext: TileTensor[DTYPE, L_CFRC_EXT, MutAnyOrigin],
+    xpos: TileTensor[DTYPE, L_SUBTREE_COM, MutAnyOrigin],
+    xquat: TileTensor[DTYPE, L_XQUAT_E, MutAnyOrigin],
+    equality: TileTensor[DTYPE, L_EQUALITY, MutAnyOrigin],
+    eq_force: TileTensor[DTYPE, L_EQFORCE, MutAnyOrigin],
+    mmeta: TileTensor[DTYPE, L_MMETA_E, MutAnyOrigin],
 ):
     """Contact forces accumulated per body at the root's subtree CoM.
 
@@ -480,79 +460,46 @@ def _cfrc_ext_env[
 def _rne_post_env[
     DTYPE: DType,
     D: DimsLike,
-    L_QVEL: Layout,
-    L_XQUAT: Layout,
-    L_XIPOS: Layout,
-    L_CONTACTS: Layout,
-    L_DMETA: Layout,
-    L_BODIES: Layout,
-    L_JOINTS: Layout,
-    L_MMETA: Layout,
-    L_CDOF: Layout,
-    L_CRB: Layout,
-    L_CVEL: Layout,
-    L_EQUALITY: Layout,
-    L_EQFORCE: Layout,
+    L_QVEL: TensorLayout,
+    L_XQUAT: TensorLayout,
+    L_XIPOS: TensorLayout,
+    L_CONTACTS: TensorLayout,
+    L_DMETA: TensorLayout,
+    L_BODIES: TensorLayout,
+    L_JOINTS: TensorLayout,
+    L_MMETA: TensorLayout,
+    L_CDOF: TensorLayout,
+    L_CRB: TensorLayout,
+    L_CVEL: TensorLayout,
+    L_EQUALITY: TensorLayout,
+    L_EQFORCE: TensorLayout,
     # CPU dispatcher only — see `_rne_env`.
     JMAP: Bool = False,
 ](
     env: Int,
     dims: D,
-    qvel: LayoutTensor[DTYPE, L_QVEL, MutAnyOrigin],
-    qacc: LayoutTensor[DTYPE, L_QVEL, MutAnyOrigin],
-    xquat: LayoutTensor[
-        DTYPE, L_XQUAT, MutAnyOrigin
-    ],
-    xipos: LayoutTensor[
-        DTYPE, L_XIPOS, MutAnyOrigin
-    ],
-    subtree_com: LayoutTensor[
-        DTYPE, L_XIPOS, MutAnyOrigin
-    ],
-    contacts: LayoutTensor[
-        DTYPE, L_CONTACTS,
-        MutAnyOrigin,
-    ],
-    dmeta: LayoutTensor[
-        DTYPE, L_DMETA, MutAnyOrigin
-    ],
-    bodies: LayoutTensor[
-        DTYPE, L_BODIES, MutAnyOrigin
-    ],
-    joints: LayoutTensor[
-        DTYPE, L_JOINTS, MutAnyOrigin
-    ],
-    mmeta: LayoutTensor[
-        DTYPE, L_MMETA, MutAnyOrigin
-    ],
-    cdof: LayoutTensor[DTYPE, L_CDOF, MutAnyOrigin],
-    crb: LayoutTensor[
-        DTYPE, L_CRB, MutAnyOrigin
-    ],
-    cvel: LayoutTensor[
-        DTYPE, L_CVEL, MutAnyOrigin
-    ],
-    cacc: LayoutTensor[
-        DTYPE, L_CVEL, MutAnyOrigin
-    ],
-    cfrc_ext: LayoutTensor[
-        DTYPE, L_CVEL, MutAnyOrigin
-    ],
-    cfrc_int: LayoutTensor[
-        DTYPE, L_CVEL, MutAnyOrigin
-    ],
+    qvel: TileTensor[DTYPE, L_QVEL, MutAnyOrigin],
+    qacc: TileTensor[DTYPE, L_QVEL, MutAnyOrigin],
+    xquat: TileTensor[DTYPE, L_XQUAT, MutAnyOrigin],
+    xipos: TileTensor[DTYPE, L_XIPOS, MutAnyOrigin],
+    subtree_com: TileTensor[DTYPE, L_XIPOS, MutAnyOrigin],
+    contacts: TileTensor[DTYPE, L_CONTACTS, MutAnyOrigin],
+    dmeta: TileTensor[DTYPE, L_DMETA, MutAnyOrigin],
+    bodies: TileTensor[DTYPE, L_BODIES, MutAnyOrigin],
+    joints: TileTensor[DTYPE, L_JOINTS, MutAnyOrigin],
+    mmeta: TileTensor[DTYPE, L_MMETA, MutAnyOrigin],
+    cdof: TileTensor[DTYPE, L_CDOF, MutAnyOrigin],
+    crb: TileTensor[DTYPE, L_CRB, MutAnyOrigin],
+    cvel: TileTensor[DTYPE, L_CVEL, MutAnyOrigin],
+    cacc: TileTensor[DTYPE, L_CVEL, MutAnyOrigin],
+    cfrc_ext: TileTensor[DTYPE, L_CVEL, MutAnyOrigin],
+    cfrc_int: TileTensor[DTYPE, L_CVEL, MutAnyOrigin],
     # The three operands the equality walk needs on top of the contact one:
     # the body poses the anchors are expressed against, the equality records,
     # and the row forces the solver retained. See `_cfrc_ext_env`.
-    xpos: LayoutTensor[
-        DTYPE, L_XIPOS, MutAnyOrigin
-    ],
-    equality: LayoutTensor[
-        DTYPE, L_EQUALITY, MutAnyOrigin
-    ],
-    eq_force: LayoutTensor[
-        DTYPE, L_EQFORCE, MutAnyOrigin
-    ],
+    xpos: TileTensor[DTYPE, L_XIPOS, MutAnyOrigin],
+    equality: TileTensor[DTYPE, L_EQUALITY, MutAnyOrigin],
+    eq_force: TileTensor[DTYPE, L_EQFORCE, MutAnyOrigin],
 ):
     """One env's `mj_rnePostConstraint`. See the module docstring."""
     var nbody = dims.get_nbody()
@@ -680,59 +627,25 @@ def _rne_post_kernel[
     NEQUALITY: Int,
     BATCH: Int,
 ](
-    qvel: LayoutTensor[DTYPE, Layout.row_major(BATCH, NV), MutAnyOrigin],
-    qacc: LayoutTensor[DTYPE, Layout.row_major(BATCH, NV), MutAnyOrigin],
-    xquat: LayoutTensor[
-        DTYPE, Layout.row_major(BATCH, NBODY * 4), MutAnyOrigin
-    ],
-    xipos: LayoutTensor[
-        DTYPE, Layout.row_major(BATCH, NBODY * 3), MutAnyOrigin
-    ],
-    subtree_com: LayoutTensor[
-        DTYPE, Layout.row_major(BATCH, NBODY * 3), MutAnyOrigin
-    ],
-    contacts: LayoutTensor[
-        DTYPE, Layout.row_major(BATCH, MAX_CONTACTS * CONTACT_SIZE),
-        MutAnyOrigin,
-    ],
-    dmeta: LayoutTensor[
-        DTYPE, Layout.row_major(BATCH, METADATA_SIZE), MutAnyOrigin
-    ],
-    bodies: LayoutTensor[
-        DTYPE, Layout.row_major(NBODY, MODEL_BODY_SIZE), MutAnyOrigin
-    ],
-    joints: LayoutTensor[
-        DTYPE, Layout.row_major(NJOINT, MODEL_JOINT_SIZE), MutAnyOrigin
-    ],
-    mmeta: LayoutTensor[
-        DTYPE, Layout.row_major(MODEL_META_SIZE), MutAnyOrigin
-    ],
-    cdof: LayoutTensor[DTYPE, Layout.row_major(BATCH, NV * 6), MutAnyOrigin],
-    crb: LayoutTensor[
-        DTYPE, Layout.row_major(BATCH, NBODY * 10), MutAnyOrigin
-    ],
-    cvel: LayoutTensor[
-        DTYPE, Layout.row_major(BATCH, NBODY * 6), MutAnyOrigin
-    ],
-    cacc: LayoutTensor[
-        DTYPE, Layout.row_major(BATCH, NBODY * 6), MutAnyOrigin
-    ],
-    cfrc_ext: LayoutTensor[
-        DTYPE, Layout.row_major(BATCH, NBODY * 6), MutAnyOrigin
-    ],
-    cfrc_int: LayoutTensor[
-        DTYPE, Layout.row_major(BATCH, NBODY * 6), MutAnyOrigin
-    ],
-    xpos: LayoutTensor[
-        DTYPE, Layout.row_major(BATCH, NBODY * 3), MutAnyOrigin
-    ],
-    equality: LayoutTensor[
-        DTYPE, Layout.row_major(_max_one[NEQUALITY](), MODEL_EQ_SIZE),
-        MutAnyOrigin,
-    ],
-    eq_force: LayoutTensor[
-        DTYPE, Layout.row_major(BATCH, _max_one[6 * NEQUALITY]()), MutAnyOrigin
-    ],
+    qvel: Tile[DTYPE, BATCH, NV],
+    qacc: Tile[DTYPE, BATCH, NV],
+    xquat: Tile[DTYPE, BATCH, NBODY * 4],
+    xipos: Tile[DTYPE, BATCH, NBODY * 3],
+    subtree_com: Tile[DTYPE, BATCH, NBODY * 3],
+    contacts: Tile[DTYPE, BATCH, MAX_CONTACTS * CONTACT_SIZE],
+    dmeta: Tile[DTYPE, BATCH, METADATA_SIZE],
+    bodies: Tile[DTYPE, NBODY, MODEL_BODY_SIZE],
+    joints: Tile[DTYPE, NJOINT, MODEL_JOINT_SIZE],
+    mmeta: Tile[DTYPE, MODEL_META_SIZE],
+    cdof: Tile[DTYPE, BATCH, NV * 6],
+    crb: Tile[DTYPE, BATCH, NBODY * 10],
+    cvel: Tile[DTYPE, BATCH, NBODY * 6],
+    cacc: Tile[DTYPE, BATCH, NBODY * 6],
+    cfrc_ext: Tile[DTYPE, BATCH, NBODY * 6],
+    cfrc_int: Tile[DTYPE, BATCH, NBODY * 6],
+    xpos: Tile[DTYPE, BATCH, NBODY * 3],
+    equality: Tile[DTYPE, _max_one[NEQUALITY](), MODEL_EQ_SIZE],
+    eq_force: Tile[DTYPE, BATCH, _max_one[6 * NEQUALITY]()],
 ):
     var env = Int(block_dim.x * block_idx.x + thread_idx.x)
     if env >= BATCH:
@@ -761,19 +674,19 @@ def compute_rne_post[
     CURRENT state. Run between the constraint solve and the integration —
     that is where MuJoCo's `mj_sensorAcc` sits, and the FK products, the
     contact forces and `scratch.qacc_constrained` are all valid there."""
-    comptime L_NV = Layout.row_major(BATCH, D.NV)
-    comptime L_B3 = Layout.row_major(BATCH, D.NBODY * 3)
-    comptime L_B4 = Layout.row_major(BATCH, D.NBODY * 4)
-    comptime L_B6 = Layout.row_major(BATCH, D.NBODY * 6)
-    comptime L_B10 = Layout.row_major(BATCH, D.NBODY * 10)
-    comptime L_CON = Layout.row_major(BATCH, D.MAX_CONTACTS * CONTACT_SIZE)
-    comptime L_EQ_RP = Layout.row_major(_max_one[D.NEQUALITY](), MODEL_EQ_SIZE)
-    comptime L_EQF_RP = Layout.row_major(BATCH, _max_one[6 * D.NEQUALITY]())
-    comptime L_DMETA = Layout.row_major(BATCH, METADATA_SIZE)
-    comptime L_BODY = Layout.row_major(D.NBODY, MODEL_BODY_SIZE)
-    comptime L_JOINT = Layout.row_major(D.NJOINT, MODEL_JOINT_SIZE)
-    comptime L_MMETA = Layout.row_major(MODEL_META_SIZE)
-    comptime L_CDOF = Layout.row_major(BATCH, D.NV * 6)
+    comptime L_NV = RowMajor[BATCH, D.NV]
+    comptime L_B3 = RowMajor[BATCH, D.NBODY * 3]
+    comptime L_B4 = RowMajor[BATCH, D.NBODY * 4]
+    comptime L_B6 = RowMajor[BATCH, D.NBODY * 6]
+    comptime L_B10 = RowMajor[BATCH, D.NBODY * 10]
+    comptime L_CON = RowMajor[BATCH, D.MAX_CONTACTS * CONTACT_SIZE]
+    comptime L_EQ_RP = RowMajor[_max_one[D.NEQUALITY](), MODEL_EQ_SIZE]
+    comptime L_EQF_RP = RowMajor[BATCH, _max_one[6 * D.NEQUALITY]()]
+    comptime L_DMETA = RowMajor[BATCH, METADATA_SIZE]
+    comptime L_BODY = RowMajor[D.NBODY, MODEL_BODY_SIZE]
+    comptime L_JOINT = RowMajor[D.NJOINT, MODEL_JOINT_SIZE]
+    comptime L_MMETA = RowMajor[MODEL_META_SIZE]
+    comptime L_CDOF = RowMajor[BATCH, D.NV * 6]
 
     comptime if target == "cpu":
         var dm = d.dims
@@ -788,27 +701,27 @@ def compute_rne_post[
         var rl_CDOF = rl2(BATCH, dm.get_nv() * 6)
         var rl_B10 = rl2(BATCH, dm.get_nbody() * 10)
         var rl_B6 = rl2(BATCH, dm.get_nbody() * 6)
-        var qvel_v = d.qvel.lt_dyn["cpu", DYN2](rl_NV)
-        var qacc_v = scratch.qacc_constrained.lt_dyn["cpu", DYN2](rl_NV)
-        var xquat_v = d.xquat.lt_dyn["cpu", DYN2](rl_B4)
-        var xipos_v = d.xipos.lt_dyn["cpu", DYN2](rl_B3)
-        var stcom_v = d.subtree_com.lt_dyn["cpu", DYN2](rl_B3)
-        var con_v = d.contacts.lt_dyn["cpu", DYN2](rl_CON)
-        var dmeta_v = d.meta.lt_dyn["cpu", DYN2](rl_DMETA)
-        var bodies_v = m.bodies.lt_dyn["cpu", DYN2](rl_BODY)
-        var joints_v = m.joints.lt_dyn["cpu", DYN2](rl_JOINT)
-        var mmeta_v = m.meta.lt_dyn["cpu", DYN1](rl_MMETA)
-        var cdof_v = scratch.cdof.lt_dyn["cpu", DYN2](rl_CDOF)
-        var crb_v = scratch.crb.lt_dyn["cpu", DYN2](rl_B10)
-        var cvel_v = d.cvel.lt_dyn["cpu", DYN2](rl_B6)
-        var cacc_v = d.cacc.lt_dyn["cpu", DYN2](rl_B6)
-        var cfrc_ext_v = d.cfrc_ext.lt_dyn["cpu", DYN2](rl_B6)
-        var cfrc_int_v = d.cfrc_int.lt_dyn["cpu", DYN2](rl_B6)
-        var xpos_v = d.xpos.lt_dyn["cpu", DYN2](rl_B3)
-        var eq_v = m.equality.lt_dyn["cpu", DYN2](
+        var qvel_v = d.qvel.tt_dyn["cpu", DYN2](rl_NV)
+        var qacc_v = scratch.qacc_constrained.tt_dyn["cpu", DYN2](rl_NV)
+        var xquat_v = d.xquat.tt_dyn["cpu", DYN2](rl_B4)
+        var xipos_v = d.xipos.tt_dyn["cpu", DYN2](rl_B3)
+        var stcom_v = d.subtree_com.tt_dyn["cpu", DYN2](rl_B3)
+        var con_v = d.contacts.tt_dyn["cpu", DYN2](rl_CON)
+        var dmeta_v = d.meta.tt_dyn["cpu", DYN2](rl_DMETA)
+        var bodies_v = m.bodies.tt_dyn["cpu", DYN2](rl_BODY)
+        var joints_v = m.joints.tt_dyn["cpu", DYN2](rl_JOINT)
+        var mmeta_v = m.meta.tt_dyn["cpu", DYN1](rl_MMETA)
+        var cdof_v = scratch.cdof.tt_dyn["cpu", DYN2](rl_CDOF)
+        var crb_v = scratch.crb.tt_dyn["cpu", DYN2](rl_B10)
+        var cvel_v = d.cvel.tt_dyn["cpu", DYN2](rl_B6)
+        var cacc_v = d.cacc.tt_dyn["cpu", DYN2](rl_B6)
+        var cfrc_ext_v = d.cfrc_ext.tt_dyn["cpu", DYN2](rl_B6)
+        var cfrc_int_v = d.cfrc_int.tt_dyn["cpu", DYN2](rl_B6)
+        var xpos_v = d.xpos.tt_dyn["cpu", DYN2](rl_B3)
+        var eq_v = m.equality.tt_dyn["cpu", DYN2](
             rl2(_max_one_rt(dm.get_nequality()), MODEL_EQ_SIZE)
         )
-        var eqf_v = d.efc_eq_force.lt_dyn["cpu", DYN2](
+        var eqf_v = d.efc_eq_force.tt_dyn["cpu", DYN2](
             rl2(BATCH, _max_one_rt(dm.get_nequality() * 6))
         )
         for e in range(BATCH):
@@ -826,25 +739,25 @@ def compute_rne_post[
                 BATCH,
             ]
         ](
-            d.qvel.lt["gpu", L_NV](),
-            scratch.qacc_constrained.lt["gpu", L_NV](),
-            d.xquat.lt["gpu", L_B4](),
-            d.xipos.lt["gpu", L_B3](),
-            d.subtree_com.lt["gpu", L_B3](),
-            d.contacts.lt["gpu", L_CON](),
-            d.meta.lt["gpu", L_DMETA](),
-            m.bodies.lt["gpu", L_BODY](),
-            m.joints.lt["gpu", L_JOINT](),
-            m.meta.lt["gpu", L_MMETA](),
-            scratch.cdof.lt["gpu", L_CDOF](),
-            scratch.crb.lt["gpu", L_B10](),
-            d.cvel.lt["gpu", L_B6](),
-            d.cacc.lt["gpu", L_B6](),
-            d.cfrc_ext.lt["gpu", L_B6](),
-            d.cfrc_int.lt["gpu", L_B6](),
-            d.xpos.lt["gpu", L_B3](),
-            m.equality.lt["gpu", L_EQ_RP](),
-            d.efc_eq_force.lt["gpu", L_EQF_RP](),
+            d.qvel.tt["gpu", BATCH, D.NV](),
+            scratch.qacc_constrained.tt["gpu", BATCH, D.NV](),
+            d.xquat.tt["gpu", BATCH, D.NBODY * 4](),
+            d.xipos.tt["gpu", BATCH, D.NBODY * 3](),
+            d.subtree_com.tt["gpu", BATCH, D.NBODY * 3](),
+            d.contacts.tt["gpu", BATCH, D.MAX_CONTACTS * CONTACT_SIZE](),
+            d.meta.tt["gpu", BATCH, METADATA_SIZE](),
+            m.bodies.tt["gpu", D.NBODY, MODEL_BODY_SIZE](),
+            m.joints.tt["gpu", D.NJOINT, MODEL_JOINT_SIZE](),
+            m.meta.tt["gpu", MODEL_META_SIZE](),
+            scratch.cdof.tt["gpu", BATCH, D.NV * 6](),
+            scratch.crb.tt["gpu", BATCH, D.NBODY * 10](),
+            d.cvel.tt["gpu", BATCH, D.NBODY * 6](),
+            d.cacc.tt["gpu", BATCH, D.NBODY * 6](),
+            d.cfrc_ext.tt["gpu", BATCH, D.NBODY * 6](),
+            d.cfrc_int.tt["gpu", BATCH, D.NBODY * 6](),
+            d.xpos.tt["gpu", BATCH, D.NBODY * 3](),
+            m.equality.tt["gpu", _max_one[D.NEQUALITY](), MODEL_EQ_SIZE](),
+            d.efc_eq_force.tt["gpu", BATCH, _max_one[6 * D.NEQUALITY]()](),
             grid_dim=(BLOCKS,),
             block_dim=(RNE_POST_TPB,),
         )

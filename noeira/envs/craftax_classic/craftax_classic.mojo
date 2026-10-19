@@ -20,7 +20,6 @@ from noeira.core import (
 )
 from noeira.nn.constants import DT as gpu_dtype
 from noeira.render import Renderer2D, SDL_Color
-from layout import LayoutTensor, Layout
 from max.gpu import block_dim, block_idx, thread_idx
 from max.gpu.host import DeviceContext, DeviceBuffer
 
@@ -156,6 +155,7 @@ from .craftax_classic_sprites import (
 )
 from std.random.philox import Random as PhiloxRandom
 from noeira.core.fmt import fit
+from noeira.core.tiles import Tile, ImmTile, tile
 
 
 # Per-env GPU world-gen workspace: 4 noise fields × MAP_SIZE floats.
@@ -382,34 +382,21 @@ struct CraftaxClassicEnv[DTYPE: DType = DType.float32](
         mut states_buf: DeviceBuffer[gpu_dtype],
         rng_seed: UInt64 = 0,
     ) raises:
-        var states = LayoutTensor[
-            gpu_dtype, Layout.row_major(BATCH_SIZE, STATE_SIZE)
-        ](states_buf)
+        var states = tile[BATCH_SIZE, STATE_SIZE](states_buf)
 
         # Per-env scratch (4 noise fields). Lives only for this kernel call.
         var scratch_buf = ctx.enqueue_create_buffer[gpu_dtype](
             BATCH_SIZE * WORLD_GEN_WS_PER_ENV
         )
-        var scratch = LayoutTensor[
-            gpu_dtype,
-            Layout.row_major(BATCH_SIZE * WORLD_GEN_WS_PER_ENV),
-        ](scratch_buf)
+        var scratch = tile[BATCH_SIZE * WORLD_GEN_WS_PER_ENV](scratch_buf)
 
         comptime BLOCKS = (BATCH_SIZE + Self.TPB - 1) // Self.TPB
         var seed_scalar = Scalar[DType.uint64](rng_seed)
 
         @always_inline
         def reset_wrapper(
-            states: LayoutTensor[
-                gpu_dtype,
-                Layout.row_major(BATCH_SIZE, STATE_SIZE),
-                MutAnyOrigin,
-            ],
-            scratch: LayoutTensor[
-                gpu_dtype,
-                Layout.row_major(BATCH_SIZE * WORLD_GEN_WS_PER_ENV),
-                MutAnyOrigin,
-            ],
+            states: Tile[gpu_dtype, BATCH_SIZE, STATE_SIZE],
+            scratch: Tile[gpu_dtype, BATCH_SIZE * WORLD_GEN_WS_PER_ENV],
             seed: Scalar[DType.uint64],
         ):
             var e = Int(block_dim.x * block_idx.x + thread_idx.x)
@@ -478,39 +465,22 @@ struct CraftaxClassicEnv[DTYPE: DType = DType.float32](
             Pointer[Scalar[DType.uint64], MutAnyOrigin]
         ] = None,
     ) raises:
-        var states = LayoutTensor[
-            gpu_dtype, Layout.row_major(BATCH_SIZE, STATE_SIZE)
-        ](states_buf)
-        var dones = LayoutTensor[
-            gpu_dtype, Layout.row_major(BATCH_SIZE)
-        ](dones_buf)
+        var states = tile[BATCH_SIZE, STATE_SIZE](states_buf)
+        var dones = tile[BATCH_SIZE](dones_buf)
 
         var scratch_buf = ctx.enqueue_create_buffer[gpu_dtype](
             BATCH_SIZE * WORLD_GEN_WS_PER_ENV
         )
-        var scratch = LayoutTensor[
-            gpu_dtype,
-            Layout.row_major(BATCH_SIZE * WORLD_GEN_WS_PER_ENV),
-        ](scratch_buf)
+        var scratch = tile[BATCH_SIZE * WORLD_GEN_WS_PER_ENV](scratch_buf)
 
         comptime BLOCKS = (BATCH_SIZE + Self.TPB - 1) // Self.TPB
         var seed_scalar = Scalar[DType.uint64](rng_seed)
 
         @always_inline
         def selective_reset_wrapper(
-            states: LayoutTensor[
-                gpu_dtype,
-                Layout.row_major(BATCH_SIZE, STATE_SIZE),
-                MutAnyOrigin,
-            ],
-            dones: LayoutTensor[
-                gpu_dtype, Layout.row_major(BATCH_SIZE), MutAnyOrigin
-            ],
-            scratch: LayoutTensor[
-                gpu_dtype,
-                Layout.row_major(BATCH_SIZE * WORLD_GEN_WS_PER_ENV),
-                MutAnyOrigin,
-            ],
+            states: Tile[gpu_dtype, BATCH_SIZE, STATE_SIZE],
+            dones: Tile[gpu_dtype, BATCH_SIZE],
+            scratch: Tile[gpu_dtype, BATCH_SIZE * WORLD_GEN_WS_PER_ENV],
             seed: Scalar[DType.uint64],
         ):
             var e = Int(block_dim.x * block_idx.x + thread_idx.x)
@@ -581,51 +551,25 @@ struct CraftaxClassicEnv[DTYPE: DType = DType.float32](
             Pointer[Scalar[DType.uint64], MutAnyOrigin]
         ] = None,
     ) raises:
-        var states = LayoutTensor[
-            gpu_dtype, Layout.row_major(BATCH_SIZE, STATE_SIZE)
-        ](states_buf)
-        var rewards = LayoutTensor[
-            gpu_dtype, Layout.row_major(BATCH_SIZE)
-        ](rewards_buf)
-        var dones = LayoutTensor[
-            gpu_dtype, Layout.row_major(BATCH_SIZE)
-        ](dones_buf)
-        var terminated_out = LayoutTensor[
-            gpu_dtype, Layout.row_major(BATCH_SIZE)
-        ](terminated_buf)
-        var obs = LayoutTensor[
-            gpu_dtype, Layout.row_major(BATCH_SIZE, OBS_DIM)
-        ](obs_buf)
+        var states = tile[BATCH_SIZE, STATE_SIZE](states_buf)
+        var rewards = tile[BATCH_SIZE](rewards_buf)
+        var dones = tile[BATCH_SIZE](dones_buf)
+        var terminated_out = tile[BATCH_SIZE](terminated_buf)
+        var obs = tile[BATCH_SIZE, OBS_DIM](obs_buf)
 
         comptime BLOCKS = (BATCH_SIZE + Self.TPB - 1) // Self.TPB
 
-        var actions = LayoutTensor[
-            gpu_dtype, Layout.row_major(BATCH_SIZE)
-        ](actions_buf)
+        var actions = tile[BATCH_SIZE](actions_buf)
         var seed_scalar = Scalar[DType.uint64](rng_seed)
 
         @always_inline
         def step_wrapper(
-            states: LayoutTensor[
-                gpu_dtype,
-                Layout.row_major(BATCH_SIZE, STATE_SIZE),
-                MutAnyOrigin,
-            ],
-            actions: LayoutTensor[
-                gpu_dtype, Layout.row_major(BATCH_SIZE), ImmutAnyOrigin
-            ],
-            rewards: LayoutTensor[
-                gpu_dtype, Layout.row_major(BATCH_SIZE), MutAnyOrigin
-            ],
-            dones: LayoutTensor[
-                gpu_dtype, Layout.row_major(BATCH_SIZE), MutAnyOrigin
-            ],
-            terminated_out: LayoutTensor[
-                gpu_dtype, Layout.row_major(BATCH_SIZE), MutAnyOrigin
-            ],
-            obs: LayoutTensor[
-                gpu_dtype, Layout.row_major(BATCH_SIZE, OBS_DIM), MutAnyOrigin
-            ],
+            states: Tile[gpu_dtype, BATCH_SIZE, STATE_SIZE],
+            actions: ImmTile[gpu_dtype, BATCH_SIZE],
+            rewards: Tile[gpu_dtype, BATCH_SIZE],
+            dones: Tile[gpu_dtype, BATCH_SIZE],
+            terminated_out: Tile[gpu_dtype, BATCH_SIZE],
+            obs: Tile[gpu_dtype, BATCH_SIZE, OBS_DIM],
             seed: Scalar[DType.uint64],
         ):
             var e = Int(block_dim.x * block_idx.x + thread_idx.x)
@@ -677,25 +621,15 @@ struct CraftaxClassicEnv[DTYPE: DType = DType.float32](
         # Rebind the read-only buffer through a mut local to get a mut=True
         # concrete-origin view (no unsafe_ptr; widens into the MutAnyOrigin param).
         var states_buf_mut = states_buf
-        var states = LayoutTensor[
-            gpu_dtype, Layout.row_major(BATCH_SIZE, STATE_SIZE)
-        ](states_buf_mut)
-        var obs = LayoutTensor[
-            gpu_dtype, Layout.row_major(BATCH_SIZE, OBS_DIM)
-        ](obs_buf)
+        var states = tile[BATCH_SIZE, STATE_SIZE](states_buf_mut)
+        var obs = tile[BATCH_SIZE, OBS_DIM](obs_buf)
 
         comptime BLOCKS = (BATCH_SIZE + Self.TPB - 1) // Self.TPB
 
         @always_inline
         def extract_wrapper(
-            states: LayoutTensor[
-                gpu_dtype,
-                Layout.row_major(BATCH_SIZE, STATE_SIZE),
-                MutAnyOrigin,
-            ],
-            obs: LayoutTensor[
-                gpu_dtype, Layout.row_major(BATCH_SIZE, OBS_DIM), MutAnyOrigin
-            ],
+            states: Tile[gpu_dtype, BATCH_SIZE, STATE_SIZE],
+            obs: Tile[gpu_dtype, BATCH_SIZE, OBS_DIM],
         ):
             var e = Int(block_dim.x * block_idx.x + thread_idx.x)
             if e >= BATCH_SIZE:

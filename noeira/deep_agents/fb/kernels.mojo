@@ -30,7 +30,6 @@ from std.random import random_float64
 from max.gpu import block_dim, block_idx, thread_idx, global_idx
 from max.gpu.primitives import block
 from max.gpu.host import DeviceContext, DeviceBuffer
-from layout import Layout, LayoutTensor
 
 from noeira.nn.constants import DT, TPB, TPB_REDUCE
 from noeira.nn.core.tensor import Tensor
@@ -43,6 +42,7 @@ from noeira.nn.random.box_muller import (
 )
 from std.random.philox import Random as PhiloxRandom
 from noeira.data.resident import IDX_DT
+from noeira.core.tiles import Tile, tile
 
 
 # ══════════════════════════════════════════════════════════════════════
@@ -1168,9 +1168,7 @@ def gaussian_dev_t[target: StaticString, N: Int](
         box_muller_normal(t.data.unsafe_ptr(), N)
     else:
         var d = ctx.value()
-        var off = LayoutTensor[DType.uint64, Layout.row_major(1), MutAnyOrigin](
-            mptr(offset_buf.unsafe_ptr())
-        )
+        var off = tile[1](mptr(offset_buf.unsafe_ptr()))
         box_muller_normal_gpu_dev[N](
             d, mptr(t.dev.value().unsafe_ptr()), seed, off
         )
@@ -1193,7 +1191,7 @@ def gaussian_dev_t[target: StaticString, N: Int](
 def uniform01_dev_kernel[N: Int](
     dst: Pointer[Scalar[DT], MutAnyOrigin],
     seed: UInt64,
-    offset_buf: LayoutTensor[DType.uint64, Layout.row_major(1), MutAnyOrigin],
+    offset_buf: Tile[DType.uint64, 1],
 ):
     """`dst[i] ~ U[0, 1)`, Philox, offset read FROM DEVICE (capture-safe).
     Device-offset twin of `uniform01_kernel` — see its docstring for why the
@@ -1391,9 +1389,7 @@ def uniform01_dev_t[target: StaticString, N: Int](
             t.data[i] = Scalar[DT](random_float64())
     else:
         var d = ctx.value()
-        var off = LayoutTensor[DType.uint64, Layout.row_major(1), MutAnyOrigin](
-            mptr(offset_buf.unsafe_ptr())
-        )
+        var off = tile[1](mptr(offset_buf.unsafe_ptr()))
         d.enqueue_function[uniform01_dev_kernel[N]](
             t.dev.value().unsafe_ptr(), seed, off,
             grid_dim=_blocks(N), block_dim=TPB,

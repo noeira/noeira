@@ -27,13 +27,13 @@ PCIdentity means the readout output is W·x_last + b, directly compared to
 target via output loss (no extra nonlinearity on top).
 """
 
-from layout import Layout, LayoutTensor
 from max.gpu import thread_idx, block_idx, block_dim
 from max.gpu.host import DeviceContext
 from std.math import exp, tanh
 
 from .pc_constants import TPB
 from .pc_initializer import PCInitializer
+from noeira.core.tiles import Tile
 
 
 # =============================================================================
@@ -57,8 +57,8 @@ trait PCActivation(ImplicitlyCopyable):
     def apply[
         BATCH: Int, DIM: Int, dtype: DType = DType.float32
     ](
-        x: LayoutTensor[dtype, Layout.row_major(BATCH, DIM), MutAnyOrigin],
-        mut a: LayoutTensor[dtype, Layout.row_major(BATCH, DIM), MutAnyOrigin],
+        x: Tile[dtype, BATCH, DIM],
+        a: Tile[dtype, BATCH, DIM],
     ):
         ...
 
@@ -66,11 +66,9 @@ trait PCActivation(ImplicitlyCopyable):
     def apply_derivative_mul[
         BATCH: Int, DIM: Int, dtype: DType = DType.float32
     ](
-        x: LayoutTensor[dtype, Layout.row_major(BATCH, DIM), MutAnyOrigin],
-        z_in: LayoutTensor[dtype, Layout.row_major(BATCH, DIM), MutAnyOrigin],
-        mut z_out: LayoutTensor[
-            dtype, Layout.row_major(BATCH, DIM), MutAnyOrigin
-        ],
+        x: Tile[dtype, BATCH, DIM],
+        z_in: Tile[dtype, BATCH, DIM],
+        z_out: Tile[dtype, BATCH, DIM],
     ):
         ...
 
@@ -79,8 +77,8 @@ trait PCActivation(ImplicitlyCopyable):
         BATCH: Int, DIM: Int, dtype: DType = DType.float32
     ](
         ctx: DeviceContext,
-        x: LayoutTensor[dtype, Layout.row_major(BATCH, DIM), MutAnyOrigin],
-        mut a: LayoutTensor[dtype, Layout.row_major(BATCH, DIM), MutAnyOrigin],
+        x: Tile[dtype, BATCH, DIM],
+        a: Tile[dtype, BATCH, DIM],
     ) raises:
         ...
 
@@ -89,11 +87,9 @@ trait PCActivation(ImplicitlyCopyable):
         BATCH: Int, DIM: Int, dtype: DType = DType.float32
     ](
         ctx: DeviceContext,
-        x: LayoutTensor[dtype, Layout.row_major(BATCH, DIM), MutAnyOrigin],
-        z_in: LayoutTensor[dtype, Layout.row_major(BATCH, DIM), MutAnyOrigin],
-        mut z_out: LayoutTensor[
-            dtype, Layout.row_major(BATCH, DIM), MutAnyOrigin
-        ],
+        x: Tile[dtype, BATCH, DIM],
+        z_in: Tile[dtype, BATCH, DIM],
+        z_out: Tile[dtype, BATCH, DIM],
     ) raises:
         ...
 
@@ -114,8 +110,8 @@ struct PCReLU(PCActivation):
     def apply[
         BATCH: Int, DIM: Int, dtype: DType = DType.float32
     ](
-        x: LayoutTensor[dtype, Layout.row_major(BATCH, DIM), MutAnyOrigin],
-        mut a: LayoutTensor[dtype, Layout.row_major(BATCH, DIM), MutAnyOrigin],
+        x: Tile[dtype, BATCH, DIM],
+        a: Tile[dtype, BATCH, DIM],
     ):
         # ReLU elementwise via direct LayoutTensor indexing (no raw pointers).
         for b in range(BATCH):
@@ -127,11 +123,9 @@ struct PCReLU(PCActivation):
     def apply_derivative_mul[
         BATCH: Int, DIM: Int, dtype: DType = DType.float32
     ](
-        x: LayoutTensor[dtype, Layout.row_major(BATCH, DIM), MutAnyOrigin],
-        z_in: LayoutTensor[dtype, Layout.row_major(BATCH, DIM), MutAnyOrigin],
-        mut z_out: LayoutTensor[
-            dtype, Layout.row_major(BATCH, DIM), MutAnyOrigin
-        ],
+        x: Tile[dtype, BATCH, DIM],
+        z_in: Tile[dtype, BATCH, DIM],
+        z_out: Tile[dtype, BATCH, DIM],
     ):
         # ReLU derivative gating via direct LayoutTensor indexing.
         for b in range(BATCH):
@@ -149,8 +143,8 @@ struct PCReLU(PCActivation):
         DIM: Int,
         dtype: DType,
     ](
-        x: LayoutTensor[dtype, Layout.row_major(BATCH, DIM), MutAnyOrigin],
-        a: LayoutTensor[dtype, Layout.row_major(BATCH, DIM), MutAnyOrigin],
+        x: Tile[dtype, BATCH, DIM],
+        a: Tile[dtype, BATCH, DIM],
     ):
         var idx = Int(block_dim.x * block_idx.x + thread_idx.x)
         if idx >= BATCH * DIM:
@@ -166,9 +160,9 @@ struct PCReLU(PCActivation):
         DIM: Int,
         dtype: DType,
     ](
-        x: LayoutTensor[dtype, Layout.row_major(BATCH, DIM), MutAnyOrigin],
-        z_in: LayoutTensor[dtype, Layout.row_major(BATCH, DIM), MutAnyOrigin],
-        z_out: LayoutTensor[dtype, Layout.row_major(BATCH, DIM), MutAnyOrigin],
+        x: Tile[dtype, BATCH, DIM],
+        z_in: Tile[dtype, BATCH, DIM],
+        z_out: Tile[dtype, BATCH, DIM],
     ):
         var idx = Int(block_dim.x * block_idx.x + thread_idx.x)
         if idx >= BATCH * DIM:
@@ -185,8 +179,8 @@ struct PCReLU(PCActivation):
         BATCH: Int, DIM: Int, dtype: DType = DType.float32
     ](
         ctx: DeviceContext,
-        x: LayoutTensor[dtype, Layout.row_major(BATCH, DIM), MutAnyOrigin],
-        mut a: LayoutTensor[dtype, Layout.row_major(BATCH, DIM), MutAnyOrigin],
+        x: Tile[dtype, BATCH, DIM],
+        a: Tile[dtype, BATCH, DIM],
     ) raises:
         comptime k = Self._relu_apply_kernel[BATCH, DIM, dtype]
         var threads = BATCH * DIM
@@ -198,11 +192,9 @@ struct PCReLU(PCActivation):
         BATCH: Int, DIM: Int, dtype: DType = DType.float32
     ](
         ctx: DeviceContext,
-        x: LayoutTensor[dtype, Layout.row_major(BATCH, DIM), MutAnyOrigin],
-        z_in: LayoutTensor[dtype, Layout.row_major(BATCH, DIM), MutAnyOrigin],
-        mut z_out: LayoutTensor[
-            dtype, Layout.row_major(BATCH, DIM), MutAnyOrigin
-        ],
+        x: Tile[dtype, BATCH, DIM],
+        z_in: Tile[dtype, BATCH, DIM],
+        z_out: Tile[dtype, BATCH, DIM],
     ) raises:
         comptime k = Self._relu_deriv_mul_kernel[BATCH, DIM, dtype]
         var threads = BATCH * DIM
@@ -228,8 +220,8 @@ struct PCIdentity(PCActivation):
     def apply[
         BATCH: Int, DIM: Int, dtype: DType = DType.float32
     ](
-        x: LayoutTensor[dtype, Layout.row_major(BATCH, DIM), MutAnyOrigin],
-        mut a: LayoutTensor[dtype, Layout.row_major(BATCH, DIM), MutAnyOrigin],
+        x: Tile[dtype, BATCH, DIM],
+        a: Tile[dtype, BATCH, DIM],
     ):
         # Identity: a = x (elementwise copy via direct LayoutTensor indexing).
         for b in range(BATCH):
@@ -240,11 +232,9 @@ struct PCIdentity(PCActivation):
     def apply_derivative_mul[
         BATCH: Int, DIM: Int, dtype: DType = DType.float32
     ](
-        x: LayoutTensor[dtype, Layout.row_major(BATCH, DIM), MutAnyOrigin],
-        z_in: LayoutTensor[dtype, Layout.row_major(BATCH, DIM), MutAnyOrigin],
-        mut z_out: LayoutTensor[
-            dtype, Layout.row_major(BATCH, DIM), MutAnyOrigin
-        ],
+        x: Tile[dtype, BATCH, DIM],
+        z_in: Tile[dtype, BATCH, DIM],
+        z_out: Tile[dtype, BATCH, DIM],
     ):
         # Identity derivative = 1: z_out = z_in (copy via LayoutTensor indexing).
         for b in range(BATCH):
@@ -259,8 +249,8 @@ struct PCIdentity(PCActivation):
         DIM: Int,
         dtype: DType,
     ](
-        src: LayoutTensor[dtype, Layout.row_major(BATCH, DIM), MutAnyOrigin],
-        dst: LayoutTensor[dtype, Layout.row_major(BATCH, DIM), MutAnyOrigin],
+        src: Tile[dtype, BATCH, DIM],
+        dst: Tile[dtype, BATCH, DIM],
     ):
         var idx = Int(block_dim.x * block_idx.x + thread_idx.x)
         if idx >= BATCH * DIM:
@@ -274,8 +264,8 @@ struct PCIdentity(PCActivation):
         BATCH: Int, DIM: Int, dtype: DType = DType.float32
     ](
         ctx: DeviceContext,
-        x: LayoutTensor[dtype, Layout.row_major(BATCH, DIM), MutAnyOrigin],
-        mut a: LayoutTensor[dtype, Layout.row_major(BATCH, DIM), MutAnyOrigin],
+        x: Tile[dtype, BATCH, DIM],
+        a: Tile[dtype, BATCH, DIM],
     ) raises:
         comptime k = Self._identity_copy_kernel[BATCH, DIM, dtype]
         var threads = BATCH * DIM
@@ -287,11 +277,9 @@ struct PCIdentity(PCActivation):
         BATCH: Int, DIM: Int, dtype: DType = DType.float32
     ](
         ctx: DeviceContext,
-        x: LayoutTensor[dtype, Layout.row_major(BATCH, DIM), MutAnyOrigin],
-        z_in: LayoutTensor[dtype, Layout.row_major(BATCH, DIM), MutAnyOrigin],
-        mut z_out: LayoutTensor[
-            dtype, Layout.row_major(BATCH, DIM), MutAnyOrigin
-        ],
+        x: Tile[dtype, BATCH, DIM],
+        z_in: Tile[dtype, BATCH, DIM],
+        z_out: Tile[dtype, BATCH, DIM],
     ) raises:
         # Identity derivative = 1: z_out = z_in (copy)
         comptime k = Self._identity_copy_kernel[BATCH, DIM, dtype]
@@ -323,8 +311,8 @@ struct PCTanh(PCActivation):
     def apply[
         BATCH: Int, DIM: Int, dtype: DType = DType.float32
     ](
-        x: LayoutTensor[dtype, Layout.row_major(BATCH, DIM), MutAnyOrigin],
-        mut a: LayoutTensor[dtype, Layout.row_major(BATCH, DIM), MutAnyOrigin],
+        x: Tile[dtype, BATCH, DIM],
+        a: Tile[dtype, BATCH, DIM],
     ):
         comptime assert (
             dtype.is_floating_point()
@@ -338,11 +326,9 @@ struct PCTanh(PCActivation):
     def apply_derivative_mul[
         BATCH: Int, DIM: Int, dtype: DType = DType.float32
     ](
-        x: LayoutTensor[dtype, Layout.row_major(BATCH, DIM), MutAnyOrigin],
-        z_in: LayoutTensor[dtype, Layout.row_major(BATCH, DIM), MutAnyOrigin],
-        mut z_out: LayoutTensor[
-            dtype, Layout.row_major(BATCH, DIM), MutAnyOrigin
-        ],
+        x: Tile[dtype, BATCH, DIM],
+        z_in: Tile[dtype, BATCH, DIM],
+        z_out: Tile[dtype, BATCH, DIM],
     ):
         comptime assert (
             dtype.is_floating_point()
@@ -362,8 +348,8 @@ struct PCTanh(PCActivation):
         DIM: Int,
         dtype: DType,
     ](
-        x: LayoutTensor[dtype, Layout.row_major(BATCH, DIM), MutAnyOrigin],
-        a: LayoutTensor[dtype, Layout.row_major(BATCH, DIM), MutAnyOrigin],
+        x: Tile[dtype, BATCH, DIM],
+        a: Tile[dtype, BATCH, DIM],
     ):
         comptime assert (
             dtype.is_floating_point()
@@ -382,9 +368,9 @@ struct PCTanh(PCActivation):
         DIM: Int,
         dtype: DType,
     ](
-        x: LayoutTensor[dtype, Layout.row_major(BATCH, DIM), MutAnyOrigin],
-        z_in: LayoutTensor[dtype, Layout.row_major(BATCH, DIM), MutAnyOrigin],
-        z_out: LayoutTensor[dtype, Layout.row_major(BATCH, DIM), MutAnyOrigin],
+        x: Tile[dtype, BATCH, DIM],
+        z_in: Tile[dtype, BATCH, DIM],
+        z_out: Tile[dtype, BATCH, DIM],
     ):
         comptime assert (
             dtype.is_floating_point()
@@ -404,8 +390,8 @@ struct PCTanh(PCActivation):
         BATCH: Int, DIM: Int, dtype: DType = DType.float32
     ](
         ctx: DeviceContext,
-        x: LayoutTensor[dtype, Layout.row_major(BATCH, DIM), MutAnyOrigin],
-        mut a: LayoutTensor[dtype, Layout.row_major(BATCH, DIM), MutAnyOrigin],
+        x: Tile[dtype, BATCH, DIM],
+        a: Tile[dtype, BATCH, DIM],
     ) raises:
         comptime k = Self._tanh_apply_kernel[BATCH, DIM, dtype]
         var threads = BATCH * DIM
@@ -417,11 +403,9 @@ struct PCTanh(PCActivation):
         BATCH: Int, DIM: Int, dtype: DType = DType.float32
     ](
         ctx: DeviceContext,
-        x: LayoutTensor[dtype, Layout.row_major(BATCH, DIM), MutAnyOrigin],
-        z_in: LayoutTensor[dtype, Layout.row_major(BATCH, DIM), MutAnyOrigin],
-        mut z_out: LayoutTensor[
-            dtype, Layout.row_major(BATCH, DIM), MutAnyOrigin
-        ],
+        x: Tile[dtype, BATCH, DIM],
+        z_in: Tile[dtype, BATCH, DIM],
+        z_out: Tile[dtype, BATCH, DIM],
     ) raises:
         comptime k = Self._tanh_deriv_mul_kernel[BATCH, DIM, dtype]
         var threads = BATCH * DIM
@@ -460,8 +444,8 @@ struct PCSwish(PCActivation):
     def apply[
         BATCH: Int, DIM: Int, dtype: DType = DType.float32
     ](
-        x: LayoutTensor[dtype, Layout.row_major(BATCH, DIM), MutAnyOrigin],
-        mut a: LayoutTensor[dtype, Layout.row_major(BATCH, DIM), MutAnyOrigin],
+        x: Tile[dtype, BATCH, DIM],
+        a: Tile[dtype, BATCH, DIM],
     ):
         comptime assert (
             dtype.is_floating_point()
@@ -476,11 +460,9 @@ struct PCSwish(PCActivation):
     def apply_derivative_mul[
         BATCH: Int, DIM: Int, dtype: DType = DType.float32
     ](
-        x: LayoutTensor[dtype, Layout.row_major(BATCH, DIM), MutAnyOrigin],
-        z_in: LayoutTensor[dtype, Layout.row_major(BATCH, DIM), MutAnyOrigin],
-        mut z_out: LayoutTensor[
-            dtype, Layout.row_major(BATCH, DIM), MutAnyOrigin
-        ],
+        x: Tile[dtype, BATCH, DIM],
+        z_in: Tile[dtype, BATCH, DIM],
+        z_out: Tile[dtype, BATCH, DIM],
     ):
         comptime assert (
             dtype.is_floating_point()
@@ -502,8 +484,8 @@ struct PCSwish(PCActivation):
         DIM: Int,
         dtype: DType,
     ](
-        x: LayoutTensor[dtype, Layout.row_major(BATCH, DIM), MutAnyOrigin],
-        a: LayoutTensor[dtype, Layout.row_major(BATCH, DIM), MutAnyOrigin],
+        x: Tile[dtype, BATCH, DIM],
+        a: Tile[dtype, BATCH, DIM],
     ):
         comptime assert (
             dtype.is_floating_point()
@@ -523,9 +505,9 @@ struct PCSwish(PCActivation):
         DIM: Int,
         dtype: DType,
     ](
-        x: LayoutTensor[dtype, Layout.row_major(BATCH, DIM), MutAnyOrigin],
-        z_in: LayoutTensor[dtype, Layout.row_major(BATCH, DIM), MutAnyOrigin],
-        z_out: LayoutTensor[dtype, Layout.row_major(BATCH, DIM), MutAnyOrigin],
+        x: Tile[dtype, BATCH, DIM],
+        z_in: Tile[dtype, BATCH, DIM],
+        z_out: Tile[dtype, BATCH, DIM],
     ):
         comptime assert (
             dtype.is_floating_point()
@@ -545,8 +527,8 @@ struct PCSwish(PCActivation):
         BATCH: Int, DIM: Int, dtype: DType = DType.float32
     ](
         ctx: DeviceContext,
-        x: LayoutTensor[dtype, Layout.row_major(BATCH, DIM), MutAnyOrigin],
-        mut a: LayoutTensor[dtype, Layout.row_major(BATCH, DIM), MutAnyOrigin],
+        x: Tile[dtype, BATCH, DIM],
+        a: Tile[dtype, BATCH, DIM],
     ) raises:
         comptime k = Self._swish_apply_kernel[BATCH, DIM, dtype]
         var threads = BATCH * DIM
@@ -558,11 +540,9 @@ struct PCSwish(PCActivation):
         BATCH: Int, DIM: Int, dtype: DType = DType.float32
     ](
         ctx: DeviceContext,
-        x: LayoutTensor[dtype, Layout.row_major(BATCH, DIM), MutAnyOrigin],
-        z_in: LayoutTensor[dtype, Layout.row_major(BATCH, DIM), MutAnyOrigin],
-        mut z_out: LayoutTensor[
-            dtype, Layout.row_major(BATCH, DIM), MutAnyOrigin
-        ],
+        x: Tile[dtype, BATCH, DIM],
+        z_in: Tile[dtype, BATCH, DIM],
+        z_out: Tile[dtype, BATCH, DIM],
     ) raises:
         comptime k = Self._swish_deriv_mul_kernel[BATCH, DIM, dtype]
         var threads = BATCH * DIM
@@ -599,9 +579,7 @@ trait PCBlockTrait(ImplicitlyCopyable):
     def pc_init_params[
         INIT: PCInitializer, dtype: DType = DType.float32
     ](
-        mut params: LayoutTensor[
-            dtype, Layout.row_major(Self.PARAM_SIZE), MutAnyOrigin
-        ],
+        params: Tile[dtype, Self.PARAM_SIZE],
     ) raises:
         """Same contract as `initialize_params`
         but driven by the vendored `PCInitializer` (legacy-`nn`-free), so
@@ -617,18 +595,10 @@ trait PCBlockTrait(ImplicitlyCopyable):
     def predict[
         BATCH: Int, dtype: DType = DType.float32
     ](
-        x_below: LayoutTensor[
-            dtype, Layout.row_major(BATCH, Self.IN_DIM), MutAnyOrigin
-        ],
-        params: LayoutTensor[
-            dtype, Layout.row_major(Self.PARAM_SIZE), MutAnyOrigin
-        ],
-        mut mu: LayoutTensor[
-            dtype, Layout.row_major(BATCH, Self.OUT_DIM), MutAnyOrigin
-        ],
-        mut a_below: LayoutTensor[
-            dtype, Layout.row_major(BATCH, Self.IN_DIM), MutAnyOrigin
-        ],
+        x_below: Tile[dtype, BATCH, Self.IN_DIM],
+        params: Tile[dtype, Self.PARAM_SIZE],
+        mu: Tile[dtype, BATCH, Self.OUT_DIM],
+        a_below: Tile[dtype, BATCH, Self.IN_DIM],
     ):
         ...
 
@@ -636,15 +606,9 @@ trait PCBlockTrait(ImplicitlyCopyable):
     def eps_compute[
         BATCH: Int, dtype: DType = DType.float32
     ](
-        x_above: LayoutTensor[
-            dtype, Layout.row_major(BATCH, Self.OUT_DIM), MutAnyOrigin
-        ],
-        mu: LayoutTensor[
-            dtype, Layout.row_major(BATCH, Self.OUT_DIM), MutAnyOrigin
-        ],
-        mut eps: LayoutTensor[
-            dtype, Layout.row_major(BATCH, Self.OUT_DIM), MutAnyOrigin
-        ],
+        x_above: Tile[dtype, BATCH, Self.OUT_DIM],
+        mu: Tile[dtype, BATCH, Self.OUT_DIM],
+        eps: Tile[dtype, BATCH, Self.OUT_DIM],
     ):
         ...
 
@@ -652,15 +616,9 @@ trait PCBlockTrait(ImplicitlyCopyable):
     def pull_back[
         BATCH: Int, dtype: DType = DType.float32
     ](
-        eps_above: LayoutTensor[
-            dtype, Layout.row_major(BATCH, Self.OUT_DIM), MutAnyOrigin
-        ],
-        params: LayoutTensor[
-            dtype, Layout.row_major(Self.PARAM_SIZE), MutAnyOrigin
-        ],
-        mut z_below: LayoutTensor[
-            dtype, Layout.row_major(BATCH, Self.IN_DIM), MutAnyOrigin
-        ],
+        eps_above: Tile[dtype, BATCH, Self.OUT_DIM],
+        params: Tile[dtype, Self.PARAM_SIZE],
+        z_below: Tile[dtype, BATCH, Self.IN_DIM],
     ):
         ...
 
@@ -668,15 +626,9 @@ trait PCBlockTrait(ImplicitlyCopyable):
     def act_derivative_mul[
         BATCH: Int, dtype: DType = DType.float32
     ](
-        x_below: LayoutTensor[
-            dtype, Layout.row_major(BATCH, Self.IN_DIM), MutAnyOrigin
-        ],
-        z_in: LayoutTensor[
-            dtype, Layout.row_major(BATCH, Self.IN_DIM), MutAnyOrigin
-        ],
-        mut z_out: LayoutTensor[
-            dtype, Layout.row_major(BATCH, Self.IN_DIM), MutAnyOrigin
-        ],
+        x_below: Tile[dtype, BATCH, Self.IN_DIM],
+        z_in: Tile[dtype, BATCH, Self.IN_DIM],
+        z_out: Tile[dtype, BATCH, Self.IN_DIM],
     ):
         ...
 
@@ -684,15 +636,9 @@ trait PCBlockTrait(ImplicitlyCopyable):
     def weight_grad[
         BATCH: Int, dtype: DType = DType.float32
     ](
-        eps_above: LayoutTensor[
-            dtype, Layout.row_major(BATCH, Self.OUT_DIM), MutAnyOrigin
-        ],
-        a_below: LayoutTensor[
-            dtype, Layout.row_major(BATCH, Self.IN_DIM), MutAnyOrigin
-        ],
-        mut grads: LayoutTensor[
-            dtype, Layout.row_major(Self.PARAM_SIZE), MutAnyOrigin
-        ],
+        eps_above: Tile[dtype, BATCH, Self.OUT_DIM],
+        a_below: Tile[dtype, BATCH, Self.IN_DIM],
+        grads: Tile[dtype, Self.PARAM_SIZE],
     ):
         ...
 
@@ -703,18 +649,10 @@ trait PCBlockTrait(ImplicitlyCopyable):
         BATCH: Int, dtype: DType = DType.float32
     ](
         ctx: DeviceContext,
-        x_below: LayoutTensor[
-            dtype, Layout.row_major(BATCH, Self.IN_DIM), MutAnyOrigin
-        ],
-        params: LayoutTensor[
-            dtype, Layout.row_major(Self.PARAM_SIZE), MutAnyOrigin
-        ],
-        mut mu: LayoutTensor[
-            dtype, Layout.row_major(BATCH, Self.OUT_DIM), MutAnyOrigin
-        ],
-        mut a_below: LayoutTensor[
-            dtype, Layout.row_major(BATCH, Self.IN_DIM), MutAnyOrigin
-        ],
+        x_below: Tile[dtype, BATCH, Self.IN_DIM],
+        params: Tile[dtype, Self.PARAM_SIZE],
+        mu: Tile[dtype, BATCH, Self.OUT_DIM],
+        a_below: Tile[dtype, BATCH, Self.IN_DIM],
     ) raises:
         ...
 
@@ -723,15 +661,9 @@ trait PCBlockTrait(ImplicitlyCopyable):
         BATCH: Int, dtype: DType = DType.float32
     ](
         ctx: DeviceContext,
-        x_above: LayoutTensor[
-            dtype, Layout.row_major(BATCH, Self.OUT_DIM), MutAnyOrigin
-        ],
-        mu: LayoutTensor[
-            dtype, Layout.row_major(BATCH, Self.OUT_DIM), MutAnyOrigin
-        ],
-        mut eps: LayoutTensor[
-            dtype, Layout.row_major(BATCH, Self.OUT_DIM), MutAnyOrigin
-        ],
+        x_above: Tile[dtype, BATCH, Self.OUT_DIM],
+        mu: Tile[dtype, BATCH, Self.OUT_DIM],
+        eps: Tile[dtype, BATCH, Self.OUT_DIM],
     ) raises:
         ...
 
@@ -740,15 +672,9 @@ trait PCBlockTrait(ImplicitlyCopyable):
         BATCH: Int, dtype: DType = DType.float32
     ](
         ctx: DeviceContext,
-        eps_above: LayoutTensor[
-            dtype, Layout.row_major(BATCH, Self.OUT_DIM), MutAnyOrigin
-        ],
-        params: LayoutTensor[
-            dtype, Layout.row_major(Self.PARAM_SIZE), MutAnyOrigin
-        ],
-        mut z_below: LayoutTensor[
-            dtype, Layout.row_major(BATCH, Self.IN_DIM), MutAnyOrigin
-        ],
+        eps_above: Tile[dtype, BATCH, Self.OUT_DIM],
+        params: Tile[dtype, Self.PARAM_SIZE],
+        z_below: Tile[dtype, BATCH, Self.IN_DIM],
     ) raises:
         ...
 
@@ -757,15 +683,9 @@ trait PCBlockTrait(ImplicitlyCopyable):
         BATCH: Int, dtype: DType = DType.float32
     ](
         ctx: DeviceContext,
-        x_below: LayoutTensor[
-            dtype, Layout.row_major(BATCH, Self.IN_DIM), MutAnyOrigin
-        ],
-        z_in: LayoutTensor[
-            dtype, Layout.row_major(BATCH, Self.IN_DIM), MutAnyOrigin
-        ],
-        mut z_out: LayoutTensor[
-            dtype, Layout.row_major(BATCH, Self.IN_DIM), MutAnyOrigin
-        ],
+        x_below: Tile[dtype, BATCH, Self.IN_DIM],
+        z_in: Tile[dtype, BATCH, Self.IN_DIM],
+        z_out: Tile[dtype, BATCH, Self.IN_DIM],
     ) raises:
         ...
 
@@ -774,14 +694,8 @@ trait PCBlockTrait(ImplicitlyCopyable):
         BATCH: Int, dtype: DType = DType.float32
     ](
         ctx: DeviceContext,
-        eps_above: LayoutTensor[
-            dtype, Layout.row_major(BATCH, Self.OUT_DIM), MutAnyOrigin
-        ],
-        a_below: LayoutTensor[
-            dtype, Layout.row_major(BATCH, Self.IN_DIM), MutAnyOrigin
-        ],
-        mut grads: LayoutTensor[
-            dtype, Layout.row_major(Self.PARAM_SIZE), MutAnyOrigin
-        ],
+        eps_above: Tile[dtype, BATCH, Self.OUT_DIM],
+        a_below: Tile[dtype, BATCH, Self.IN_DIM],
+        grads: Tile[dtype, Self.PARAM_SIZE],
     ) raises:
         ...

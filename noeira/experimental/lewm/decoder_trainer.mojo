@@ -15,7 +15,7 @@ from max.gpu import thread_idx
 from max.gpu.primitives import block
 from max.gpu.host import DeviceContext, DeviceBuffer
 from max.gpu.memory import AddressSpace
-from layout import Layout, TileTensor, row_major
+from layout import TileTensor, row_major
 
 from noeira.nn.constants import DT, TPB_REDUCE
 from noeira.nn import Tensor, ParamVisitor, Kaiming, Adam
@@ -164,9 +164,7 @@ struct LeWMDecoderTrainer[
             t.grad_seed = Tensor.alloc(Self.BATCH)
             t.tgt_dummy = Tensor.alloc(Self.BATCH * Self.RECON)
         seed_grad_inv_batch[Self.train_target, Self.BATCH](
-            t.grad_seed.lt[
-                Self.train_target, Layout.row_major(Self.BATCH, 1)
-            ](),
+            t.grad_seed.tt[Self.train_target, Self.BATCH, 1](),
             ctx=ctx,
         )
         return t^

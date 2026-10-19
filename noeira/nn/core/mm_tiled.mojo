@@ -38,9 +38,9 @@ would be better served by MAX's split-K, which this does not do.
 from max.gpu import barrier, block_idx, thread_idx
 from max.gpu.host import DeviceContext, DeviceBuffer
 from max.gpu.memory import AddressSpace
-from layout import Layout, LayoutTensor
 
 from noeira.nn.constants import DT
+from noeira.core.tiles import RowMajor, Tile, tile, shared_tile
 
 
 comptime MMT_T1: Int = 16
@@ -84,19 +84,13 @@ def bmm_tiled_uses_big_tile[BH: Int, M: Int, N: Int, K: Int]() -> Bool:
 
 
 def _bmm_tile1_kernel[BH: Int, M: Int, N: Int, K: Int](
-    a: LayoutTensor[DT, Layout.row_major(BH * M * K), MutAnyOrigin],
-    b: LayoutTensor[DT, Layout.row_major(BH * K * N), MutAnyOrigin],
-    o: LayoutTensor[DT, Layout.row_major(BH * M * N), MutAnyOrigin],
+    a: Tile[DT, BH * M * K],
+    b: Tile[DT, BH * K * N],
+    o: Tile[DT, BH * M * N],
 ):
     """One output per thread, both operands staged through shared memory."""
-    var sa = LayoutTensor[
-        DT, Layout.row_major(MMT_T1, MMT_T1), MutAnyOrigin,
-        address_space=AddressSpace.SHARED,
-    ].stack_allocation()
-    var sb = LayoutTensor[
-        DT, Layout.row_major(MMT_T1, MMT_T1), MutAnyOrigin,
-        address_space=AddressSpace.SHARED,
-    ].stack_allocation()
+    var sa = shared_tile[DT, MMT_T1, MMT_T1]()
+    var sb = shared_tile[DT, MMT_T1, MMT_T1]()
 
     var bh = Int(block_idx.z)
     var ty = Int(thread_idx.y)
@@ -130,21 +124,15 @@ def _bmm_tile1_kernel[BH: Int, M: Int, N: Int, K: Int](
 
 
 def _bmm_tile4_kernel[BH: Int, M: Int, N: Int, K: Int](
-    a: LayoutTensor[DT, Layout.row_major(BH * M * K), MutAnyOrigin],
-    b: LayoutTensor[DT, Layout.row_major(BH * K * N), MutAnyOrigin],
-    o: LayoutTensor[DT, Layout.row_major(BH * M * N), MutAnyOrigin],
+    a: Tile[DT, BH * M * K],
+    b: Tile[DT, BH * K * N],
+    o: Tile[DT, BH * M * N],
 ):
     """4x4 outputs per thread — each shared-memory element feeds four MACs
     from registers instead of one, which is what lifts a tiled matmul off the
     shared-memory bandwidth bound."""
-    var sa = LayoutTensor[
-        DT, Layout.row_major(MMT_TM, MMT_TK), MutAnyOrigin,
-        address_space=AddressSpace.SHARED,
-    ].stack_allocation()
-    var sb = LayoutTensor[
-        DT, Layout.row_major(MMT_TK, MMT_TN), MutAnyOrigin,
-        address_space=AddressSpace.SHARED,
-    ].stack_allocation()
+    var sa = shared_tile[DT, MMT_TM, MMT_TK]()
+    var sb = shared_tile[DT, MMT_TK, MMT_TN]()
 
     var bh = Int(block_idx.z)
     var ty = Int(thread_idx.y)
@@ -214,17 +202,17 @@ def bmm_tiled[
     variant, deliberately: the caller that needs `Kt` materialises it in one
     pass while packing (`_xa_pack_kt_kernel`), which is cheaper than either a
     separate transpose or a strided read inside the matmul."""
-    comptime lay_a = Layout.row_major(BH * M * K)
-    comptime lay_b = Layout.row_major(BH * K * N)
-    comptime lay_o = Layout.row_major(BH * M * N)
+    comptime lay_a = RowMajor[BH * M * K]
+    comptime lay_b = RowMajor[BH * K * N]
+    comptime lay_o = RowMajor[BH * M * N]
     # The origin-linking ctor takes the buffer BY REFERENCE, so the views are
     # built from locals rather than from the (by-value) arguments.
     var ab = a
     var bb = b
     var ob = o
-    var av = LayoutTensor[DT, lay_a, MutAnyOrigin](ab)
-    var bv = LayoutTensor[DT, lay_b, MutAnyOrigin](bb)
-    var ov = LayoutTensor[DT, lay_o, MutAnyOrigin](ob)
+    var av = tile[BH * M * K](ab)
+    var bv = tile[BH * K * N](bb)
+    var ov = tile[BH * M * N](ob)
     comptime if bmm_tiled_uses_big_tile[BH, M, N, K]():
         c.enqueue_function[_bmm_tile4_kernel[BH, M, N, K]](
             av, bv, ov,

@@ -16,7 +16,8 @@ grad_slice + the original action indices. ARITY 2, no params, no cache.
 
 from max.gpu import global_idx
 from max.gpu.host import DeviceContext
-from layout import Layout, LayoutTensor, TileTensor, row_major
+from layout import TileTensor, row_major
+from noeira.core.tiles import Tile
 
 from noeira.nn.constants import DT, TPB, CPU_SIMD_W
 from ..core.tensor import Tensor
@@ -38,11 +39,9 @@ def _dims2(d0: Int, d1: Int) -> Array[Int, 2]:
 def _gather_action_slice_forward_kernel[
     BATCH: Int, NA: Int, K: Int,
 ](
-    values: LayoutTensor[
-        DT, Layout.row_major(BATCH, NA * K), MutAnyOrigin,
-    ],
-    idx: LayoutTensor[DT, Layout.row_major(BATCH, 1), MutAnyOrigin],
-    output: LayoutTensor[DT, Layout.row_major(BATCH, K), MutAnyOrigin],
+    values: Tile[DT, BATCH, NA * K],
+    idx: Tile[DT, BATCH, 1],
+    output: Tile[DT, BATCH, K],
 ):
     var lin = Int(global_idx.x)
     var total = BATCH * K
@@ -56,9 +55,7 @@ def _gather_action_slice_forward_kernel[
 def _gather_action_slice_zero_values_grad_kernel[
     BATCH: Int, NA: Int, K: Int,
 ](
-    grad_values: LayoutTensor[
-        DT, Layout.row_major(BATCH, NA * K), MutAnyOrigin,
-    ],
+    grad_values: Tile[DT, BATCH, NA * K],
 ):
     var lin = Int(global_idx.x)
     var total = BATCH * NA * K
@@ -71,7 +68,7 @@ def _gather_action_slice_zero_values_grad_kernel[
 def _gather_action_slice_zero_idx_grad_kernel[
     BATCH: Int,
 ](
-    grad_idx: LayoutTensor[DT, Layout.row_major(BATCH, 1), MutAnyOrigin],
+    grad_idx: Tile[DT, BATCH, 1],
 ):
     var b = Int(global_idx.x)
     if b < BATCH:
@@ -123,9 +120,9 @@ struct GatherActionSlice[NA_: Int, K_: Int](Module):
             c.enqueue_function[
                 _gather_action_slice_forward_kernel[B, Self.NA_, Self.K_]
             ](
-                values.lt["gpu", Layout.row_major(B, Self.NA_ * Self.K_)](),
-                idx.lt["gpu", Layout.row_major(B, 1)](),
-                out.lt["gpu", Layout.row_major(B, Self.K_)](),
+                values.tt["gpu", B, Self.NA_ * Self.K_](),
+                idx.tt["gpu", B, 1](),
+                out.tt["gpu", B, Self.K_](),
                 grid_dim=n_blocks,
                 block_dim=TPB,
             )
@@ -165,7 +162,7 @@ struct GatherActionSlice[NA_: Int, K_: Int](Module):
                     B, Self.NA_, Self.K_
                 ]
             ](
-                gv.lt["gpu", Layout.row_major(B, Self.NA_ * Self.K_)](),
+                gv.tt["gpu", B, Self.NA_ * Self.K_](),
                 grid_dim=values_blocks,
                 block_dim=TPB,
             )
@@ -173,7 +170,7 @@ struct GatherActionSlice[NA_: Int, K_: Int](Module):
             c.enqueue_function[
                 _gather_action_slice_zero_idx_grad_kernel[B]
             ](
-                gi.lt["gpu", Layout.row_major(B, 1)](),
+                gi.tt["gpu", B, 1](),
                 grid_dim=idx_blocks,
                 block_dim=TPB,
             )

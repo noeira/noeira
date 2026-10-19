@@ -17,7 +17,8 @@ from std.collections import Array
 
 from max.gpu.host import DeviceContext, DeviceBuffer
 from max.gpu import thread_idx, block_idx, block_dim
-from layout import Layout, LayoutTensor
+from layout import TileTensor, TensorLayout
+from noeira.core.tiles import Tile
 
 from .constants import (
     METADATA_SIZE,
@@ -53,31 +54,19 @@ def compute_cfrc_ext[
     DTYPE: DType,
     BATCH_SIZE: Int,
     D: DimsLike,
-    L_XIPOS: Layout,
-    L_CONTACTS: Layout,
-    L_META: Layout,
-    L_CFRC_EXT: Layout,
-    L_BODIES: Layout,
+    L_XIPOS: TensorLayout,
+    L_CONTACTS: TensorLayout,
+    L_META: TensorLayout,
+    L_CFRC_EXT: TensorLayout,
+    L_BODIES: TensorLayout,
 ](
     ctx: DeviceContext,
     dims: D,
-    xipos: LayoutTensor[
-        DTYPE, L_XIPOS, MutAnyOrigin
-    ],
-    contacts: LayoutTensor[
-        DTYPE,
-        L_CONTACTS,
-        MutAnyOrigin,
-    ],
-    meta: LayoutTensor[
-        DTYPE, L_META, MutAnyOrigin
-    ],
-    cfrc_ext: LayoutTensor[
-        DTYPE, L_CFRC_EXT, MutAnyOrigin
-    ],
-    bodies: LayoutTensor[
-        DTYPE, L_BODIES, MutAnyOrigin
-    ],
+    xipos: TileTensor[DTYPE, L_XIPOS, MutAnyOrigin],
+    contacts: TileTensor[DTYPE, L_CONTACTS, MutAnyOrigin],
+    meta: TileTensor[DTYPE, L_META, MutAnyOrigin],
+    cfrc_ext: TileTensor[DTYPE, L_CFRC_EXT, MutAnyOrigin],
+    bodies: TileTensor[DTYPE, L_BODIES, MutAnyOrigin],
 ) raises:
     """Per-field cfrc_ext (G5 — no state slab): contact forces accumulated
     into per-root-subtree spatial force records, arithmetic verbatim from the
@@ -99,23 +88,11 @@ def compute_cfrc_ext[
     # exactly that as rel = 1.0). Decision 3 keeps this leg
     # comptime, so the caps are the right and only source here.
     def cfrc_ext_fields_kernel(
-        xipos: LayoutTensor[
-            DTYPE, Layout.row_major(BATCH_SIZE, D.CAP_NBODY * 3), MutAnyOrigin
-        ],
-        contacts: LayoutTensor[
-            DTYPE,
-            Layout.row_major(BATCH_SIZE, D.CAP_MAX_CONTACTS * CONTACT_SIZE),
-            MutAnyOrigin,
-        ],
-        meta: LayoutTensor[
-            DTYPE, Layout.row_major(BATCH_SIZE, METADATA_SIZE), MutAnyOrigin
-        ],
-        cfrc_ext: LayoutTensor[
-            DTYPE, Layout.row_major(BATCH_SIZE, D.CAP_NBODY * 6), MutAnyOrigin
-        ],
-        bodies: LayoutTensor[
-            DTYPE, Layout.row_major(D.CAP_NBODY, MODEL_BODY_SIZE), MutAnyOrigin
-        ],
+        xipos: Tile[DTYPE, BATCH_SIZE, D.CAP_NBODY * 3],
+        contacts: Tile[DTYPE, BATCH_SIZE, D.CAP_MAX_CONTACTS * CONTACT_SIZE],
+        meta: Tile[DTYPE, BATCH_SIZE, METADATA_SIZE],
+        cfrc_ext: Tile[DTYPE, BATCH_SIZE, D.CAP_NBODY * 6],
+        bodies: Tile[DTYPE, D.CAP_NBODY, MODEL_BODY_SIZE],
     ):
         var env = Int(block_dim.x * block_idx.x + thread_idx.x)
         if env >= BATCH_SIZE:

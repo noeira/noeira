@@ -27,10 +27,10 @@ Flow per self-play step:
 
 from max.gpu import global_idx
 from max.gpu.host import DeviceContext, DeviceBuffer, HostBuffer
-from layout import Layout, LayoutTensor
 
 from noeira.nn.constants import DT, TPB
 from noeira.nn.core.tensor import Tensor
+from noeira.core.tiles import Tile, tile
 
 
 @always_inline
@@ -48,9 +48,9 @@ def _xs64(s: UInt64) -> UInt64:
 def _store_rows_kernel[
     N_ENVS: Int, W: Int, MAX_TRAJ: Int
 ](
-    src: LayoutTensor[DT, Layout.row_major(N_ENVS, W), MutAnyOrigin],
-    traj: LayoutTensor[DT, Layout.row_major(N_ENVS, MAX_TRAJ, W), MutAnyOrigin],
-    len_dev: LayoutTensor[DType.int32, Layout.row_major(N_ENVS), MutAnyOrigin],
+    src: Tile[DT, N_ENVS, W],
+    traj: Tile[DT, N_ENVS, MAX_TRAJ, W],
+    len_dev: Tile[DType.int32, N_ENVS],
 ):
     """Append `src[e, :]` into env `e`'s trajectory at slot `len_dev[e]`
     (skipped once the trajectory is full). Thread `t` → env `e=t//W`, elem
@@ -68,10 +68,8 @@ def _store_rows_kernel[
 def _flush_obs_kernel[
     N_ENVS: Int, OBS: Int, MAX_TRAJ: Int, CAP: Int
 ](
-    traj_obs: LayoutTensor[
-        DT, Layout.row_major(N_ENVS, MAX_TRAJ, OBS), MutAnyOrigin
-    ],
-    obs_ring: LayoutTensor[DT, Layout.row_major(CAP, OBS), MutAnyOrigin],
+    traj_obs: Tile[DT, N_ENVS, MAX_TRAJ, OBS],
+    obs_ring: Tile[DT, CAP, OBS],
     e: Int32, L: Int32, start: Int32,
 ):
     """Copy env `e`'s `L` trajectory obs rows into the ring at
@@ -88,10 +86,8 @@ def _flush_obs_kernel[
 def _flush_tgt_kernel[
     N_ENVS: Int, ACT: Int, MAX_TRAJ: Int, CAP: Int
 ](
-    traj_pol: LayoutTensor[
-        DT, Layout.row_major(N_ENVS, MAX_TRAJ, ACT), MutAnyOrigin
-    ],
-    tgt_ring: LayoutTensor[DT, Layout.row_major(CAP, ACT + 1), MutAnyOrigin],
+    traj_pol: Tile[DT, N_ENVS, MAX_TRAJ, ACT],
+    tgt_ring: Tile[DT, CAP, ACT + 1],
     e: Int32, L: Int32, start: Int32, win: Scalar[DT],
 ):
     """Write env `e`'s `L` packed targets `[π(ACT) | z]` into the ring. `z` is
@@ -116,9 +112,9 @@ def _flush_tgt_kernel[
 def _gather_rows_kernel[
     B: Int, W: Int, CAP: Int
 ](
-    ring: LayoutTensor[DT, Layout.row_major(CAP, W), MutAnyOrigin],
-    dst: LayoutTensor[DT, Layout.row_major(B, W), MutAnyOrigin],
-    rng: LayoutTensor[DType.uint64, Layout.row_major(1), MutAnyOrigin],
+    ring: Tile[DT, CAP, W],
+    dst: Tile[DT, B, W],
+    rng: Tile[DType.uint64, 1],
     size: Int32,
 ):
     """Gather `B` rows from `ring` into `dst`. The source slot for window `b` is
@@ -136,7 +132,7 @@ def _gather_rows_kernel[
 
 
 def _advance_rng_kernel(
-    rng: LayoutTensor[DType.uint64, Layout.row_major(1), MutAnyOrigin],
+    rng: Tile[DType.uint64, 1],
 ):
     """Advance the device sampling seed (1 thread). Run AFTER the gathers so the
     next `sample_batch_gpu` draws a fresh set."""
@@ -205,17 +201,10 @@ struct GpuMCTSExampleReplay[
         for e in range(Self.N_ENVS):
             self.len_host[e] = Int32(self.traj_len[e])
         self.ctx.enqueue_copy(self.len_dev, self.len_host)
-        var len_lt = LayoutTensor[
-            DType.int32, Layout.row_major(Self.N_ENVS), MutAnyOrigin
-        ](self.len_dev)
+        var len_lt = tile[Self.N_ENVS](self.len_dev)
 
-        var src_obs = LayoutTensor[
-            DT, Layout.row_major(Self.N_ENVS, Self.OBS), MutAnyOrigin
-        ](obs_dev)
-        var traj_obs_lt = LayoutTensor[
-            DT, Layout.row_major(Self.N_ENVS, Self.MAX_TRAJ, Self.OBS),
-            MutAnyOrigin,
-        ](self.traj_obs)
+        var src_obs = tile[Self.N_ENVS, Self.OBS](obs_dev)
+        var traj_obs_lt = tile[Self.N_ENVS, Self.MAX_TRAJ, Self.OBS](self.traj_obs)
         self.ctx.enqueue_function[
             _store_rows_kernel[Self.N_ENVS, Self.OBS, Self.MAX_TRAJ]
         ](
@@ -223,13 +212,8 @@ struct GpuMCTSExampleReplay[
             grid_dim=(Self.N_ENVS * Self.OBS + TPB - 1) // TPB, block_dim=TPB,
         )
 
-        var src_pol = LayoutTensor[
-            DT, Layout.row_major(Self.N_ENVS, Self.ACT), MutAnyOrigin
-        ](pol_dev)
-        var traj_pol_lt = LayoutTensor[
-            DT, Layout.row_major(Self.N_ENVS, Self.MAX_TRAJ, Self.ACT),
-            MutAnyOrigin,
-        ](self.traj_pol)
+        var src_pol = tile[Self.N_ENVS, Self.ACT](pol_dev)
+        var traj_pol_lt = tile[Self.N_ENVS, Self.MAX_TRAJ, Self.ACT](self.traj_pol)
         self.ctx.enqueue_function[
             _store_rows_kernel[Self.N_ENVS, Self.ACT, Self.MAX_TRAJ]
         ](
@@ -252,20 +236,10 @@ struct GpuMCTSExampleReplay[
         self.ctx.enqueue_copy(self.rew_host, rew_dev)
         self.ctx.synchronize()
 
-        var traj_obs_lt = LayoutTensor[
-            DT, Layout.row_major(Self.N_ENVS, Self.MAX_TRAJ, Self.OBS),
-            MutAnyOrigin,
-        ](self.traj_obs)
-        var traj_pol_lt = LayoutTensor[
-            DT, Layout.row_major(Self.N_ENVS, Self.MAX_TRAJ, Self.ACT),
-            MutAnyOrigin,
-        ](self.traj_pol)
-        var obs_ring_lt = LayoutTensor[
-            DT, Layout.row_major(Self.CAP, Self.OBS), MutAnyOrigin
-        ](self.obs_ring)
-        var tgt_ring_lt = LayoutTensor[
-            DT, Layout.row_major(Self.CAP, Self.TGT), MutAnyOrigin
-        ](self.tgt_ring)
+        var traj_obs_lt = tile[Self.N_ENVS, Self.MAX_TRAJ, Self.OBS](self.traj_obs)
+        var traj_pol_lt = tile[Self.N_ENVS, Self.MAX_TRAJ, Self.ACT](self.traj_pol)
+        var obs_ring_lt = tile[Self.CAP, Self.OBS](self.obs_ring)
+        var tgt_ring_lt = tile[Self.CAP, Self.TGT](self.tgt_ring)
 
         for e in range(Self.N_ENVS):
             if self.done_host[e] > Scalar[DT](0.5):
@@ -306,23 +280,17 @@ struct GpuMCTSExampleReplay[
         the train step is a pure device pipeline."""
         obs_out.ensure_gpu(self.ctx, B * Self.OBS)
         tgt_out.ensure_gpu(self.ctx, B * Self.TGT)
-        var rng_lt = LayoutTensor[
-            DType.uint64, Layout.row_major(1), MutAnyOrigin
-        ](self.rng_dev)
+        var rng_lt = tile[1](self.rng_dev)
 
-        var obs_ring_lt = LayoutTensor[
-            DT, Layout.row_major(Self.CAP, Self.OBS), MutAnyOrigin
-        ](self.obs_ring)
-        var obs_out_lt = obs_out.lt["gpu", Layout.row_major(B, Self.OBS)]()
+        var obs_ring_lt = tile[Self.CAP, Self.OBS](self.obs_ring)
+        var obs_out_lt = obs_out.tt["gpu", B, Self.OBS]()
         self.ctx.enqueue_function[_gather_rows_kernel[B, Self.OBS, Self.CAP]](
             obs_ring_lt, obs_out_lt, rng_lt, Int32(self.size),
             grid_dim=(B * Self.OBS + TPB - 1) // TPB, block_dim=TPB,
         )
 
-        var tgt_ring_lt = LayoutTensor[
-            DT, Layout.row_major(Self.CAP, Self.TGT), MutAnyOrigin
-        ](self.tgt_ring)
-        var tgt_out_lt = tgt_out.lt["gpu", Layout.row_major(B, Self.TGT)]()
+        var tgt_ring_lt = tile[Self.CAP, Self.TGT](self.tgt_ring)
+        var tgt_out_lt = tgt_out.tt["gpu", B, Self.TGT]()
         self.ctx.enqueue_function[_gather_rows_kernel[B, Self.TGT, Self.CAP]](
             tgt_ring_lt, tgt_out_lt, rng_lt, Int32(self.size),
             grid_dim=(B * Self.TGT + TPB - 1) // TPB, block_dim=TPB,

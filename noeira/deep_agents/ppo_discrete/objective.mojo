@@ -55,7 +55,8 @@ legacy leaf; only the storage surface (`TensorRefs[4, o]` + owned `Tensor` out +
 from std.math import exp, log as flog
 from max.gpu import global_idx
 from max.gpu.host import DeviceContext
-from layout import Layout, LayoutTensor, TileTensor, row_major
+from layout import TileTensor, row_major
+from noeira.core.tiles import Tile
 
 from noeira.nn.constants import DT, TPB
 from noeira.nn.core.tensor import Tensor
@@ -77,11 +78,11 @@ comptime GRAD_CLIP: Scalar[DT] = 10.0
 
 
 def _ppo_disc_forward_kernel[N: Int, BATCH: Int](
-    ao: LayoutTensor[DT, Layout.row_major(BATCH, N), MutAnyOrigin],
-    act: LayoutTensor[DT, Layout.row_major(BATCH, 1), MutAnyOrigin],
-    olp: LayoutTensor[DT, Layout.row_major(BATCH, 1), MutAnyOrigin],
-    adv: LayoutTensor[DT, Layout.row_major(BATCH, 1), MutAnyOrigin],
-    loss_out: LayoutTensor[DT, Layout.row_major(BATCH, 1), MutAnyOrigin],
+    ao: Tile[DT, BATCH, N],
+    act: Tile[DT, BATCH, 1],
+    olp: Tile[DT, BATCH, 1],
+    adv: Tile[DT, BATCH, 1],
+    loss_out: Tile[DT, BATCH, 1],
     clip_eps: Scalar[DT],
     entropy_coef: Scalar[DT],
 ):
@@ -126,15 +127,15 @@ def _ppo_disc_forward_kernel[N: Int, BATCH: Int](
 
 
 def _ppo_disc_vjp_kernel[N: Int, BATCH: Int](
-    ao: LayoutTensor[DT, Layout.row_major(BATCH, N), MutAnyOrigin],
-    act: LayoutTensor[DT, Layout.row_major(BATCH, 1), MutAnyOrigin],
-    olp: LayoutTensor[DT, Layout.row_major(BATCH, 1), MutAnyOrigin],
-    adv: LayoutTensor[DT, Layout.row_major(BATCH, 1), MutAnyOrigin],
-    go: LayoutTensor[DT, Layout.row_major(BATCH, 1), MutAnyOrigin],
-    gi0: LayoutTensor[DT, Layout.row_major(BATCH, N), MutAnyOrigin],
-    gi1: LayoutTensor[DT, Layout.row_major(BATCH, 1), MutAnyOrigin],
-    gi2: LayoutTensor[DT, Layout.row_major(BATCH, 1), MutAnyOrigin],
-    gi3: LayoutTensor[DT, Layout.row_major(BATCH, 1), MutAnyOrigin],
+    ao: Tile[DT, BATCH, N],
+    act: Tile[DT, BATCH, 1],
+    olp: Tile[DT, BATCH, 1],
+    adv: Tile[DT, BATCH, 1],
+    go: Tile[DT, BATCH, 1],
+    gi0: Tile[DT, BATCH, N],
+    gi1: Tile[DT, BATCH, 1],
+    gi2: Tile[DT, BATCH, 1],
+    gi3: Tile[DT, BATCH, 1],
     clip_eps: Scalar[DT],
     entropy_coef: Scalar[DT],
 ):
@@ -293,11 +294,11 @@ struct PPODiscreteObjective[N_: Int](Module):
             out.ensure_gpu(c, B * 1)
             comptime n_blocks = (B + TPB - 1) // TPB
             c.enqueue_function[_ppo_disc_forward_kernel[N, B]](
-                ao.lt["gpu", Layout.row_major(B, N)](),
-                act.lt["gpu", Layout.row_major(B, 1)](),
-                olp.lt["gpu", Layout.row_major(B, 1)](),
-                adv.lt["gpu", Layout.row_major(B, 1)](),
-                out.lt["gpu", Layout.row_major(B, 1)](),
+                ao.tt["gpu", B, N](),
+                act.tt["gpu", B, 1](),
+                olp.tt["gpu", B, 1](),
+                adv.tt["gpu", B, 1](),
+                out.tt["gpu", B, 1](),
                 self.clip_eps, self.entropy_coef,
                 grid_dim=n_blocks, block_dim=TPB,
             )
@@ -400,15 +401,15 @@ struct PPODiscreteObjective[N_: Int](Module):
             gi3.ensure_gpu(c, B * 1)
             comptime n_blocks = (B + TPB - 1) // TPB
             c.enqueue_function[_ppo_disc_vjp_kernel[N, B]](
-                ao.lt["gpu", Layout.row_major(B, N)](),
-                act.lt["gpu", Layout.row_major(B, 1)](),
-                olp.lt["gpu", Layout.row_major(B, 1)](),
-                adv.lt["gpu", Layout.row_major(B, 1)](),
-                grad_output.lt["gpu", Layout.row_major(B, 1)](),
-                gi0.lt["gpu", Layout.row_major(B, N)](),
-                gi1.lt["gpu", Layout.row_major(B, 1)](),
-                gi2.lt["gpu", Layout.row_major(B, 1)](),
-                gi3.lt["gpu", Layout.row_major(B, 1)](),
+                ao.tt["gpu", B, N](),
+                act.tt["gpu", B, 1](),
+                olp.tt["gpu", B, 1](),
+                adv.tt["gpu", B, 1](),
+                grad_output.tt["gpu", B, 1](),
+                gi0.tt["gpu", B, N](),
+                gi1.tt["gpu", B, 1](),
+                gi2.tt["gpu", B, 1](),
+                gi3.tt["gpu", B, 1](),
                 self.clip_eps, self.entropy_coef,
                 grid_dim=n_blocks, block_dim=TPB,
             )

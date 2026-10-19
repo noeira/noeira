@@ -46,7 +46,7 @@ is zero before that, so a hook that reads it too early gets a silent all-zero
 sensor rather than an error.
 """
 
-from layout import Layout, LayoutTensor
+from layout import TileTensor, TensorLayout
 
 from ..fields import Data, Dims, DimsLike
 from noeira.math3d import Vec3 as Vec3Generic, Quat as QuatGeneric
@@ -225,35 +225,23 @@ comptime TOUCH_UNSUPPORTED_ZONE: Float64 = -1.0
 def touch_sphere_site_gpu[
     DTYPE: DType,
     D: DimsLike,
-    L_CONTACTS: Layout,
-    L_SITE_XPOS: Layout,
-    L_SITES: Layout,
-    L_META: Layout,
-    L_XQUAT: Layout,
+    L_CONTACTS: TensorLayout,
+    L_SITE_XPOS: TensorLayout,
+    L_SITES: TensorLayout,
+    L_META: TensorLayout,
+    L_XQUAT: TensorLayout,
 ](
     dims: D,
-    contacts: LayoutTensor[
-        DTYPE,
-        L_CONTACTS,
-        MutAnyOrigin,
-    ],
-    site_xpos: LayoutTensor[
-        DTYPE, L_SITE_XPOS, MutAnyOrigin
-    ],
-    sites: LayoutTensor[
-        DTYPE, L_SITES, MutAnyOrigin
-    ],
-    meta: LayoutTensor[
-        DTYPE, L_META, MutAnyOrigin
-    ],
+    contacts: TileTensor[DTYPE, L_CONTACTS, MutAnyOrigin],
+    site_xpos: TileTensor[DTYPE, L_SITE_XPOS, MutAnyOrigin],
+    sites: TileTensor[DTYPE, L_SITES, MutAnyOrigin],
+    meta: TileTensor[DTYPE, L_META, MutAnyOrigin],
     # ⚠ ADDED 2026-08-10 FOR THE BOX BRANCH. `site_xmat` is not stored — it is
     # composed as `xquat[body] * site_localquat`, so the box path needs the
     # BODY quaternions. The old signature had no way to get them, which is why
     # a box zone used to bail out; the model table already carried the local
     # quat (`SITE_IDX_QUAT_*`), so this parameter was the only missing piece.
-    xquat: LayoutTensor[
-        DTYPE, L_XQUAT, MutAnyOrigin
-    ],
+    xquat: TileTensor[DTYPE, L_XQUAT, MutAnyOrigin],
     env: Int,
     site: Int,
     scale: Scalar[DTYPE],

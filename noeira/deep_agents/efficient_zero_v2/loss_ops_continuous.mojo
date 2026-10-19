@@ -33,9 +33,9 @@ Gradchecked vs finite differences in
 
 from std.math import log, exp, tanh, sqrt
 from max.gpu import global_idx
-from layout import Layout, LayoutTensor
 
 from noeira.nn.constants import DT
+from noeira.core.tiles import Tile
 
 
 comptime _LOG2PI: Scalar[DT] = Scalar[DT](1.8378770664093453)   # log(2π)
@@ -127,10 +127,10 @@ def continuous_policy_loss_and_grad[
 def continuous_policy_loss_grad_k[
     B_: Int, ACT_DIM_: Int, PRED_OUT_: Int,
 ](
-    pout: LayoutTensor[DT, Layout.row_major(B_ * PRED_OUT_), MutAnyOrigin],
-    target_act: LayoutTensor[DT, Layout.row_major(B_ * ACT_DIM_), MutAnyOrigin],
-    grad_pout: LayoutTensor[DT, Layout.row_major(B_ * PRED_OUT_), MutAnyOrigin],
-    loss_buf: LayoutTensor[DT, Layout.row_major(B_), MutAnyOrigin],
+    pout: Tile[DT, B_ * PRED_OUT_],
+    target_act: Tile[DT, B_ * ACT_DIM_],
+    grad_pout: Tile[DT, B_ * PRED_OUT_],
+    loss_buf: Tile[DT, B_],
     grad_scale: Scalar[DT],
     loss_coef: Scalar[DT],
     max_action: Scalar[DT],

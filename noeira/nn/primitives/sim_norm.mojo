@@ -17,7 +17,8 @@ Backward (per group, standard softmax Jacobian):
 from std.math import exp
 from max.gpu import thread_idx, block_idx, block_dim
 from max.gpu.host import DeviceContext
-from layout import Layout, LayoutTensor, TileTensor, row_major
+from layout import TileTensor, row_major
+from noeira.core.tiles import RowMajor, Tile
 
 from noeira.nn.constants import DT, TPB
 from ..core.tensor import Tensor
@@ -38,9 +39,9 @@ from ..core.amp import AMPPolicy, NoAMP
 def _sim_norm_forward_kernel[
     BATCH: Int, DIM: Int, GROUPS: Int, GROUP_SIZE: Int,
 ](
-    input: LayoutTensor[DT, Layout.row_major(BATCH, DIM), MutAnyOrigin],
-    output: LayoutTensor[DT, Layout.row_major(BATCH, DIM), MutAnyOrigin],
-    cache: LayoutTensor[DT, Layout.row_major(BATCH, DIM), MutAnyOrigin],
+    input: Tile[DT, BATCH, DIM],
+    output: Tile[DT, BATCH, DIM],
+    cache: Tile[DT, BATCH, DIM],
 ):
     var idx = Int(block_dim.x * block_idx.x + thread_idx.x)
     if idx >= BATCH * GROUPS:
@@ -95,9 +96,9 @@ def _sim_norm_forward_kernel[
 def _sim_norm_backward_kernel[
     BATCH: Int, DIM: Int, GROUPS: Int, GROUP_SIZE: Int,
 ](
-    grad_output: LayoutTensor[DT, Layout.row_major(BATCH, DIM), MutAnyOrigin],
-    cache: LayoutTensor[DT, Layout.row_major(BATCH, DIM), MutAnyOrigin],
-    grad_input: LayoutTensor[DT, Layout.row_major(BATCH, DIM), MutAnyOrigin],
+    grad_output: Tile[DT, BATCH, DIM],
+    cache: Tile[DT, BATCH, DIM],
+    grad_input: Tile[DT, BATCH, DIM],
 ):
     var idx = Int(block_dim.x * block_idx.x + thread_idx.x)
     if idx >= BATCH * GROUPS:
@@ -200,7 +201,7 @@ struct SimNorm[DIM_: Int, GROUPS_: Int](Module):
             var c = ctx.value()
             out.ensure_gpu(c, B * Self.DIM_)
             self.cache_y.ensure_gpu(c, B * Self.DIM_)
-            comptime l2d = Layout.row_major(B, Self.DIM_)
+            comptime l2d = RowMajor[B, Self.DIM_]
             comptime total = B * Self.GROUPS_
             comptime n_blocks = (total + TPB - 1) // TPB
             c.enqueue_function[
@@ -208,9 +209,9 @@ struct SimNorm[DIM_: Int, GROUPS_: Int](Module):
                     B, Self.DIM_, Self.GROUPS_, Self.GROUP_SIZE
                 ]
             ](
-                in0.lt["gpu", l2d](),
-                out.lt["gpu", l2d](),
-                self.cache_y.lt["gpu", l2d](),
+                in0.tt["gpu", B, Self.DIM_](),
+                out.tt["gpu", B, Self.DIM_](),
+                self.cache_y.tt["gpu", B, Self.DIM_](),
                 grid_dim=n_blocks,
                 block_dim=TPB,
             )
@@ -248,7 +249,7 @@ struct SimNorm[DIM_: Int, GROUPS_: Int](Module):
         else:
             var c = ctx.value()
             gin.ensure_gpu(c, B * Self.DIM_)
-            comptime l2d = Layout.row_major(B, Self.DIM_)
+            comptime l2d = RowMajor[B, Self.DIM_]
             comptime total = B * Self.GROUPS_
             comptime n_blocks = (total + TPB - 1) // TPB
             c.enqueue_function[
@@ -256,9 +257,9 @@ struct SimNorm[DIM_: Int, GROUPS_: Int](Module):
                     B, Self.DIM_, Self.GROUPS_, Self.GROUP_SIZE
                 ]
             ](
-                grad_output.lt["gpu", l2d](),
-                self.cache_y.lt["gpu", l2d](),
-                gin.lt["gpu", l2d](),
+                grad_output.tt["gpu", B, Self.DIM_](),
+                self.cache_y.tt["gpu", B, Self.DIM_](),
+                gin.tt["gpu", B, Self.DIM_](),
                 grid_dim=n_blocks,
                 block_dim=TPB,
             )

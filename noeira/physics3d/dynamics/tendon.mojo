@@ -48,7 +48,7 @@ kinds are one import apart and so the formula has ONE spelling; it had three
 
 from std.collections import Array
 from std.math import sqrt
-from layout import Layout, LayoutTensor
+from layout import TileTensor, TensorLayout
 from ..fields.scratch import Scratch
 
 from ..gpu.constants import (
@@ -95,20 +95,16 @@ def _site_world[
     DTYPE: DType,
     BATCH: Int,
     D: DimsLike,
-    L_SITES: Layout,
-    L_XPOS: Layout,
-    L_XQUAT: Layout](
+    L_SITES: TensorLayout,
+    L_XPOS: TensorLayout,
+    L_XQUAT: TensorLayout](
     env: Int,
     site_idx: Int,
     s_body: Int,
     dims: D,
-    sites: LayoutTensor[
-        DTYPE, L_SITES, MutAnyOrigin
-    ],
-    xpos: LayoutTensor[DTYPE, L_XPOS, MutAnyOrigin],
-    xquat: LayoutTensor[
-        DTYPE, L_XQUAT, MutAnyOrigin
-    ],
+    sites: TileTensor[DTYPE, L_SITES, MutAnyOrigin],
+    xpos: TileTensor[DTYPE, L_XPOS, MutAnyOrigin],
+    xquat: TileTensor[DTYPE, L_XQUAT, MutAnyOrigin],
 ) -> Tuple[Scalar[DTYPE], Scalar[DTYPE], Scalar[DTYPE]]:
     """A site's world position, recomputed from `xpos`/`xquat`.
 
@@ -172,16 +168,16 @@ def _geom_world_frame[
     DTYPE: DType,
     BATCH: Int,
     D: DimsLike,
-    L_GEOMS: Layout,
-    L_XPOS: Layout,
-    L_XQUAT: Layout,
+    L_GEOMS: TensorLayout,
+    L_XPOS: TensorLayout,
+    L_XQUAT: TensorLayout,
 ](
     env: Int,
     g_id: Int,
     dims: D,
-    geoms: LayoutTensor[DTYPE, L_GEOMS, MutAnyOrigin],
-    xpos: LayoutTensor[DTYPE, L_XPOS, MutAnyOrigin],
-    xquat: LayoutTensor[DTYPE, L_XQUAT, MutAnyOrigin],
+    geoms: TileTensor[DTYPE, L_GEOMS, MutAnyOrigin],
+    xpos: TileTensor[DTYPE, L_XPOS, MutAnyOrigin],
+    xquat: TileTensor[DTYPE, L_XQUAT, MutAnyOrigin],
 ) -> GeomFrame[DTYPE]:
     """A wrap geom's world frame, MuJoCo's `geom_xpos` / `geom_xmat`.
 
@@ -246,16 +242,16 @@ def fixed_tendon_length_jac[
     DTYPE: DType,
     V_CAP: Int,
     D: DimsLike,
-    L_TENDONS: Layout,
-    L_JOINTS: Layout,
-    L_QPOS: Layout,
+    L_TENDONS: TensorLayout,
+    L_JOINTS: TensorLayout,
+    L_QPOS: TensorLayout,
 ](
     env: Int,
     t_i: Int,
     dims: D,
-    tendons: LayoutTensor[DTYPE, L_TENDONS, MutAnyOrigin],
-    joints: LayoutTensor[DTYPE, L_JOINTS, MutAnyOrigin],
-    qpos: LayoutTensor[DTYPE, L_QPOS, MutAnyOrigin],
+    tendons: TileTensor[DTYPE, L_TENDONS, MutAnyOrigin],
+    joints: TileTensor[DTYPE, L_JOINTS, MutAnyOrigin],
+    qpos: TileTensor[DTYPE, L_QPOS, MutAnyOrigin],
     mut J_row: Scratch[Scalar[DTYPE], V_CAP],
 ) -> Scalar[DTYPE]:
     """`length = sum_k coef_k * qpos[joint_k]`, moment arm `coef_k` per dof.
@@ -327,49 +323,35 @@ def spatial_tendon_length_jac[
     # world`, which it calls, needed one. A caller's provider requirement is
     # the TRANSITIVE closure of its callees', not what its own lines mention.
     D: DimsLike,
-    L_TENDONS: Layout,
-    L_SITES: Layout,
-    L_GEOMS: Layout,
-    L_BODIES: Layout,
-    L_JOINTS: Layout,
-    L_MMETA: Layout,
-    L_SUBTREE_COM: Layout,
-    L_CDOF: Layout,
-    L_XQUAT: Layout,
+    L_TENDONS: TensorLayout,
+    L_SITES: TensorLayout,
+    L_GEOMS: TensorLayout,
+    L_BODIES: TensorLayout,
+    L_JOINTS: TensorLayout,
+    L_MMETA: TensorLayout,
+    L_SUBTREE_COM: TensorLayout,
+    L_CDOF: TensorLayout,
+    L_XQUAT: TensorLayout,
 ](
     env: Int,
     t_i: Int,
     dims: D,
-    tendons: LayoutTensor[
-        DTYPE, L_TENDONS, MutAnyOrigin
-    ],
-    sites: LayoutTensor[
-        DTYPE, L_SITES, MutAnyOrigin
-    ],
+    tendons: TileTensor[DTYPE, L_TENDONS, MutAnyOrigin],
+    sites: TileTensor[DTYPE, L_SITES, MutAnyOrigin],
     # ⚠ THREADED IN FOR THE WRAP GEOMS, and it had to be: a wrap object's
     # world frame is its body's pose composed with its OWN local pos/quat, and
     # its radius is `GEOM_IDX_RADIUS`. The alternative — copying those nine
     # numbers into the tendon record beside each wrap entry — would be a
     # second spelling of the geom, and a geom resized in the studio would
     # leave the tendon routing round its old size.
-    geoms: LayoutTensor[
-        DTYPE, L_GEOMS, MutAnyOrigin
-    ],
-    bodies: LayoutTensor[
-        DTYPE, L_BODIES, MutAnyOrigin
-    ],
-    joints: LayoutTensor[
-        DTYPE, L_JOINTS, MutAnyOrigin
-    ],
-    mmeta: LayoutTensor[DTYPE, L_MMETA, MutAnyOrigin],
-    subtree_com: LayoutTensor[
-        DTYPE, L_SUBTREE_COM, MutAnyOrigin
-    ],
-    cdof: LayoutTensor[DTYPE, L_CDOF, MutAnyOrigin],
-    xpos: LayoutTensor[DTYPE, L_SUBTREE_COM, MutAnyOrigin],
-    xquat: LayoutTensor[
-        DTYPE, L_XQUAT, MutAnyOrigin
-    ],
+    geoms: TileTensor[DTYPE, L_GEOMS, MutAnyOrigin],
+    bodies: TileTensor[DTYPE, L_BODIES, MutAnyOrigin],
+    joints: TileTensor[DTYPE, L_JOINTS, MutAnyOrigin],
+    mmeta: TileTensor[DTYPE, L_MMETA, MutAnyOrigin],
+    subtree_com: TileTensor[DTYPE, L_SUBTREE_COM, MutAnyOrigin],
+    cdof: TileTensor[DTYPE, L_CDOF, MutAnyOrigin],
+    xpos: TileTensor[DTYPE, L_SUBTREE_COM, MutAnyOrigin],
+    xquat: TileTensor[DTYPE, L_XQUAT, MutAnyOrigin],
     mut J_row: Scratch[Scalar[DTYPE], V_CAP],
     flg_jac: Bool = True,
 ) -> Scalar[DTYPE]:

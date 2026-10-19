@@ -12,7 +12,6 @@ storage TrainerState minibatch Tensors straight into the migrated
 """
 
 from max.gpu.host import DeviceContext
-from layout import Layout, LayoutTensor
 
 from noeira.nn.constants import DT
 from noeira.nn.core.amp import AMPPolicy, NoAMP
@@ -22,6 +21,7 @@ from noeira.nn.optimizer.adam import Adam
 from ...loss.critic_update_block import CriticUpdateBlock
 from ...training.off_policy_critic import concat_sa, concat_sa_gpu
 from ..trainer_block import TrainerState
+from noeira.core.tiles import Tile
 
 
 struct SingleCriticStep[
@@ -70,29 +70,27 @@ struct SingleCriticStep[
     ) raises:
         comptime if target == "cpu":
             concat_sa[Self.OBS, Self.ACT, Self.BATCH](
-                state.mb_s.lt["cpu", Layout.row_major(Self.BATCH, Self.OBS)](),
-                state.mb_a.lt["cpu", Layout.row_major(Self.BATCH, Self.ACT)](),
-                self._mb_sa.lt["cpu", Layout.row_major(Self.BATCH, Self.SA)](),
+                state.mb_s.tt["cpu", Self.BATCH, Self.OBS](),
+                state.mb_a.tt["cpu", Self.BATCH, Self.ACT](),
+                self._mb_sa.tt["cpu", Self.BATCH, Self.SA](),
             )
         else:
             concat_sa_gpu[Self.OBS, Self.ACT, Self.BATCH](
                 state.ctx.value(),
-                state.mb_s.lt["gpu", Layout.row_major(Self.BATCH, Self.OBS)](),
-                state.mb_a.lt["gpu", Layout.row_major(Self.BATCH, Self.ACT)](),
-                self._mb_sa.lt["gpu", Layout.row_major(Self.BATCH, Self.SA)](),
+                state.mb_s.tt["gpu", Self.BATCH, Self.OBS](),
+                state.mb_a.tt["gpu", Self.BATCH, Self.ACT](),
+                self._mb_sa.tt["gpu", Self.BATCH, Self.SA](),
             )
 
         var weights: Optional[
-            LayoutTensor[DT, Layout.row_major(Self.BATCH), MutAnyOrigin]
+            Tile[DT, Self.BATCH]
         ] = None
         var td_residuals: Optional[
-            LayoutTensor[DT, Layout.row_major(Self.BATCH), MutAnyOrigin]
+            Tile[DT, Self.BATCH]
         ] = None
         if state.has_per:
-            weights = state.mb_w.lt[target, Layout.row_major(Self.BATCH)]()
-            td_residuals = state.td_residuals.lt[
-                target, Layout.row_major(Self.BATCH)
-            ]()
+            weights = state.mb_w.tt[target, Self.BATCH]()
+            td_residuals = state.td_residuals.tt[target, Self.BATCH]()
 
         var loss = self.inner.step[target, POLICY, ACCUMULATE](
             critic,

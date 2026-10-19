@@ -33,7 +33,7 @@ faces) is far larger.
 """
 
 from std.sys import default_accelerator
-from layout import Layout
+from noeira.core.tiles import RowMajor
 
 
 # ---- EPA's polytope caps ---------------------------------------------------
@@ -451,4 +451,4 @@ comptime COLL_REPORT_WORDS: Int = COLL_REPORT_HDR + COLL_NCAND_CAP
 # The single-row spelling, for host callers that collide one pair at a time
 # (every gate and probe in `tests/physics3d`). The engine binds
 # `[BATCH, CCD_WS_SIZE]` instead and passes the env index as `wrow`.
-comptime L_CCD_WS1 = Layout.row_major(1, CCD_WS_SIZE)
+comptime L_CCD_WS1 = RowMajor[1, CCD_WS_SIZE]

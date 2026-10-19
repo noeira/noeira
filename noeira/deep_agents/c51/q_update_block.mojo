@@ -28,7 +28,6 @@ GPU. PER weights/td_residuals are `Optional[LayoutTensor]` (mirror
 from std.math import exp as fexp, log as flog
 from max.gpu import global_idx
 from max.gpu.host import DeviceContext
-from layout import Layout, LayoutTensor
 
 from noeira.nn.constants import DT, TPB
 from noeira.nn.core.module import Module
@@ -41,6 +40,7 @@ from noeira.nn.core.initializer import Zero
 from noeira.nn.optimizer.adam import Adam
 from noeira.nn.loss.cross_entropy import CrossEntropyLoss
 from noeira.nn.primitives.gather_action_slice import GatherActionSlice
+from noeira.core.tiles import Tile
 
 
 # ──────────────────────────────────────────────────────────────────────
@@ -51,9 +51,9 @@ from noeira.nn.primitives.gather_action_slice import GatherActionSlice
 def _c51_per_residual_kernel[
     BATCH: Int, N_ATOMS: Int
 ](
-    logits_a: LayoutTensor[DT, Layout.row_major(BATCH, N_ATOMS), MutAnyOrigin],
-    m: LayoutTensor[DT, Layout.row_major(BATCH, N_ATOMS), MutAnyOrigin],
-    td_out: LayoutTensor[DT, Layout.row_major(BATCH), MutAnyOrigin],
+    logits_a: Tile[DT, BATCH, N_ATOMS],
+    m: Tile[DT, BATCH, N_ATOMS],
+    td_out: Tile[DT, BATCH],
 ):
     """Per-row cross-entropy used as the PER priority signal."""
     var b = Int(global_idx.x)
@@ -79,10 +79,8 @@ def _c51_per_residual_kernel[
 def _c51_per_scale_kernel[
     BATCH: Int, N_ATOMS: Int
 ](
-    grad_logits_a: LayoutTensor[
-        DT, Layout.row_major(BATCH, N_ATOMS), MutAnyOrigin,
-    ],
-    weights: LayoutTensor[DT, Layout.row_major(BATCH), MutAnyOrigin],
+    grad_logits_a: Tile[DT, BATCH, N_ATOMS],
+    weights: Tile[DT, BATCH],
 ):
     """`grad_logits_a[b, i] *= weights[b]`."""
     var idx = Int(global_idx.x)
@@ -98,13 +96,9 @@ def _c51_per_scale_kernel[
 def _c51_scatter_grad_kernel[
     BATCH: Int, NA: Int, N_ATOMS: Int
 ](
-    grad_logits_a: LayoutTensor[
-        DT, Layout.row_major(BATCH, N_ATOMS), MutAnyOrigin,
-    ],
-    mb_a: LayoutTensor[DT, Layout.row_major(BATCH), MutAnyOrigin],
-    grad_logits_all: LayoutTensor[
-        DT, Layout.row_major(BATCH, NA * N_ATOMS), MutAnyOrigin,
-    ],
+    grad_logits_a: Tile[DT, BATCH, N_ATOMS],
+    mb_a: Tile[DT, BATCH],
+    grad_logits_all: Tile[DT, BATCH, NA * N_ATOMS],
 ):
     """`grad_logits_all[b, c] = 0`, then `grad_logits_all[b, a·N + i] =
     grad_logits_a[b, i]` for `i ∈ [0, N_ATOMS)` and `a = int(mb_a[b])`."""
@@ -200,10 +194,10 @@ struct C51QUpdateBlock[
         mut mb_a: Tensor,
         mut mb_m: Tensor,
         weights: Optional[
-            LayoutTensor[DT, Layout.row_major(Self.BATCH), MutAnyOrigin]
+            Tile[DT, Self.BATCH]
         ] = None,
         td_residuals: Optional[
-            LayoutTensor[DT, Layout.row_major(Self.BATCH), MutAnyOrigin]
+            Tile[DT, Self.BATCH]
         ] = None,
         ctx: Optional[DeviceContext] = None,
     ) raises -> Scalar[DT]:
@@ -277,10 +271,8 @@ struct C51QUpdateBlock[
                 ctx.value().enqueue_function[
                     _c51_per_residual_kernel[Self.BATCH, Self.N_ATOMS]
                 ](
-                    self._logits_a.lt[
-                        "gpu", Layout.row_major(Self.BATCH, Self.N_ATOMS)
-                    ](),
-                    mb_m.lt["gpu", Layout.row_major(Self.BATCH, Self.N_ATOMS)](),
+                    self._logits_a.tt["gpu", Self.BATCH, Self.N_ATOMS](),
+                    mb_m.tt["gpu", Self.BATCH, Self.N_ATOMS](),
                     td,
                     grid_dim=n_blocks_pr, block_dim=TPB,
                 )
@@ -301,9 +293,7 @@ struct C51QUpdateBlock[
                 ctx.value().enqueue_function[
                     _c51_per_scale_kernel[Self.BATCH, Self.N_ATOMS]
                 ](
-                    self._grad_logits_a.lt[
-                        "gpu", Layout.row_major(Self.BATCH, Self.N_ATOMS)
-                    ](),
+                    self._grad_logits_a.tt["gpu", Self.BATCH, Self.N_ATOMS](),
                     w,
                     grid_dim=n_blocks_ps, block_dim=TPB,
                 )
@@ -327,13 +317,9 @@ struct C51QUpdateBlock[
             ctx.value().enqueue_function[
                 _c51_scatter_grad_kernel[Self.BATCH, Self.NA, Self.N_ATOMS]
             ](
-                self._grad_logits_a.lt[
-                    "gpu", Layout.row_major(Self.BATCH, Self.N_ATOMS)
-                ](),
-                mb_a.lt["gpu", Layout.row_major(Self.BATCH)](),
-                self._grad_logits_all.lt[
-                    "gpu", Layout.row_major(Self.BATCH, ROW)
-                ](),
+                self._grad_logits_a.tt["gpu", Self.BATCH, Self.N_ATOMS](),
+                mb_a.tt["gpu", Self.BATCH](),
+                self._grad_logits_all.tt["gpu", Self.BATCH, ROW](),
                 grid_dim=n_blocks_sc, block_dim=TPB,
             )
 

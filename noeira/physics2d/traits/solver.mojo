@@ -5,8 +5,8 @@ to prevent interpenetration and enforce friction.
 """
 
 from ..constants import dtype, BODY_STATE_SIZE, CONTACT_DATA_SIZE
-from layout import LayoutTensor, Layout
 from max.gpu.host import DeviceContext, DeviceBuffer
+from noeira.core.tiles import Tile
 
 
 trait ConstraintSolver(ImplicitlyCopyable):
@@ -44,19 +44,9 @@ trait ConstraintSolver(ImplicitlyCopyable):
         MAX_CONTACTS: Int,
     ](
         self,
-        mut bodies: LayoutTensor[
-            dtype,
-            Layout.row_major(BATCH, NUM_BODIES, BODY_STATE_SIZE),
-            MutAnyOrigin,
-        ],
-        mut contacts: LayoutTensor[
-            dtype,
-            Layout.row_major(BATCH, MAX_CONTACTS, CONTACT_DATA_SIZE),
-            MutAnyOrigin,
-        ],
-        contact_counts: LayoutTensor[
-            dtype, Layout.row_major(BATCH), MutAnyOrigin
-        ],
+        bodies: Tile[dtype, BATCH, NUM_BODIES, BODY_STATE_SIZE],
+        contacts: Tile[dtype, BATCH, MAX_CONTACTS, CONTACT_DATA_SIZE],
+        contact_counts: Tile[dtype, BATCH],
     ):
         """Prepare this step's contacts (anchors, restitution bias) and warm
         start. Call once per step, before the velocity iterations."""
@@ -68,19 +58,9 @@ trait ConstraintSolver(ImplicitlyCopyable):
         MAX_CONTACTS: Int,
     ](
         self,
-        mut bodies: LayoutTensor[
-            dtype,
-            Layout.row_major(BATCH, NUM_BODIES, BODY_STATE_SIZE),
-            MutAnyOrigin,
-        ],
-        mut contacts: LayoutTensor[
-            dtype,
-            Layout.row_major(BATCH, MAX_CONTACTS, CONTACT_DATA_SIZE),
-            MutAnyOrigin,
-        ],
-        contact_counts: LayoutTensor[
-            dtype, Layout.row_major(BATCH), MutAnyOrigin
-        ],
+        bodies: Tile[dtype, BATCH, NUM_BODIES, BODY_STATE_SIZE],
+        contacts: Tile[dtype, BATCH, MAX_CONTACTS, CONTACT_DATA_SIZE],
+        contact_counts: Tile[dtype, BATCH],
     ):
         """Solve velocity constraints for one iteration.
 
@@ -100,19 +80,9 @@ trait ConstraintSolver(ImplicitlyCopyable):
         MAX_CONTACTS: Int,
     ](
         self,
-        mut bodies: LayoutTensor[
-            dtype,
-            Layout.row_major(BATCH, NUM_BODIES, BODY_STATE_SIZE),
-            MutAnyOrigin,
-        ],
-        contacts: LayoutTensor[
-            dtype,
-            Layout.row_major(BATCH, MAX_CONTACTS, CONTACT_DATA_SIZE),
-            MutAnyOrigin,
-        ],
-        contact_counts: LayoutTensor[
-            dtype, Layout.row_major(BATCH), MutAnyOrigin
-        ],
+        bodies: Tile[dtype, BATCH, NUM_BODIES, BODY_STATE_SIZE],
+        contacts: Tile[dtype, BATCH, MAX_CONTACTS, CONTACT_DATA_SIZE],
+        contact_counts: Tile[dtype, BATCH],
     ) -> Bool:
         """Solve position constraints for one iteration.
 

@@ -46,7 +46,7 @@ puts friction-dof rows last, so on such a model an entry both kinds touch
 can differ in its last bit. LIBERO and the gate fixture have neither.
 """
 
-from layout import Layout, LayoutTensor
+from layout import TileTensor, TensorLayout
 from max.gpu.memory import AddressSpace
 from max.gpu.sync import barrier
 
@@ -68,13 +68,11 @@ from .elliptic_cone import (
 
 @always_inline
 def _ell_tangent_locals[
-    DTYPE: DType, NT: Int, L_ROW: Layout
+    DTYPE: DType, NT: Int, L_ROW: TensorLayout
 ](
     nt: Int,
     row0: Int,
-    src: LayoutTensor[
-        DTYPE, L_ROW, MutAnyOrigin, address_space=AddressSpace.SHARED
-    ],
+    src: TileTensor[DTYPE, L_ROW, MutAnyOrigin, address_space=AddressSpace.SHARED],
     mut dst: Scratch[Scalar[DTYPE], NT],
 ):
     """This contact's `nt` tangential entries of a per-row shared array
@@ -113,27 +111,15 @@ def _ell_cost_at_jar[
 
 @always_inline
 def _ell_contact_cost[
-    DTYPE: DType, NT: Int, L_ROW: Layout, L_FR: Layout, L_C: Layout
+    DTYPE: DType, NT: Int, L_ROW: TensorLayout, L_FR: TensorLayout, L_C: TensorLayout
 ](
     c: Int,
-    jar_sh: LayoutTensor[
-        DTYPE, L_ROW, MutAnyOrigin, address_space=AddressSpace.SHARED
-    ],
-    De_sh: LayoutTensor[
-        DTYPE, L_ROW, MutAnyOrigin, address_space=AddressSpace.SHARED
-    ],
-    fr_e_sh: LayoutTensor[
-        DTYPE, L_FR, MutAnyOrigin, address_space=AddressSpace.SHARED
-    ],
-    mu_sh: LayoutTensor[
-        DTYPE, L_C, MutAnyOrigin, address_space=AddressSpace.SHARED
-    ],
-    ntc_sh: LayoutTensor[
-        DTYPE, L_C, MutAnyOrigin, address_space=AddressSpace.SHARED
-    ],
-    cs_sh: LayoutTensor[
-        DTYPE, L_C, MutAnyOrigin, address_space=AddressSpace.SHARED
-    ],
+    jar_sh: TileTensor[DTYPE, L_ROW, MutAnyOrigin, address_space=AddressSpace.SHARED],
+    De_sh: TileTensor[DTYPE, L_ROW, MutAnyOrigin, address_space=AddressSpace.SHARED],
+    fr_e_sh: TileTensor[DTYPE, L_FR, MutAnyOrigin, address_space=AddressSpace.SHARED],
+    mu_sh: TileTensor[DTYPE, L_C, MutAnyOrigin, address_space=AddressSpace.SHARED],
+    ntc_sh: TileTensor[DTYPE, L_C, MutAnyOrigin, address_space=AddressSpace.SHARED],
+    cs_sh: TileTensor[DTYPE, L_C, MutAnyOrigin, address_space=AddressSpace.SHARED],
 ) -> Scalar[DTYPE]:
     """The contact's primal cost at the CURRENT `jar` and zone — the total
     cost's term (`_total_cost` in the per-env leg). The caller skips
@@ -162,28 +148,16 @@ def _ell_contact_cost[
 
 @always_inline
 def _ell_contact_line_eval[
-    DTYPE: DType, NT: Int, L_ROW: Layout, L_FR: Layout, L_C: Layout
+    DTYPE: DType, NT: Int, L_ROW: TensorLayout, L_FR: TensorLayout, L_C: TensorLayout
 ](
     c: Int,
     a: Scalar[DTYPE],
-    jar_sh: LayoutTensor[
-        DTYPE, L_ROW, MutAnyOrigin, address_space=AddressSpace.SHARED
-    ],
-    Jv_e_sh: LayoutTensor[
-        DTYPE, L_ROW, MutAnyOrigin, address_space=AddressSpace.SHARED
-    ],
-    De_sh: LayoutTensor[
-        DTYPE, L_ROW, MutAnyOrigin, address_space=AddressSpace.SHARED
-    ],
-    fr_e_sh: LayoutTensor[
-        DTYPE, L_FR, MutAnyOrigin, address_space=AddressSpace.SHARED
-    ],
-    mu_sh: LayoutTensor[
-        DTYPE, L_C, MutAnyOrigin, address_space=AddressSpace.SHARED
-    ],
-    ntc_sh: LayoutTensor[
-        DTYPE, L_C, MutAnyOrigin, address_space=AddressSpace.SHARED
-    ],
+    jar_sh: TileTensor[DTYPE, L_ROW, MutAnyOrigin, address_space=AddressSpace.SHARED],
+    Jv_e_sh: TileTensor[DTYPE, L_ROW, MutAnyOrigin, address_space=AddressSpace.SHARED],
+    De_sh: TileTensor[DTYPE, L_ROW, MutAnyOrigin, address_space=AddressSpace.SHARED],
+    fr_e_sh: TileTensor[DTYPE, L_FR, MutAnyOrigin, address_space=AddressSpace.SHARED],
+    mu_sh: TileTensor[DTYPE, L_C, MutAnyOrigin, address_space=AddressSpace.SHARED],
+    ntc_sh: TileTensor[DTYPE, L_C, MutAnyOrigin, address_space=AddressSpace.SHARED],
     mut cost: Scalar[DTYPE],
     mut d0: Scalar[DTYPE],
     mut d1: Scalar[DTYPE],
@@ -222,31 +196,17 @@ def _ell_contact_line_eval[
 
 @always_inline
 def _ell_contact_hb[
-    DTYPE: DType, NT: Int, HN: Int, L_ROW: Layout, L_FR: Layout, L_C: Layout,
-    L_HB: Layout,
+    DTYPE: DType, NT: Int, HN: Int, L_ROW: TensorLayout, L_FR: TensorLayout, L_C: TensorLayout,
+    L_HB: TensorLayout,
 ](
     c: Int,
-    jar_sh: LayoutTensor[
-        DTYPE, L_ROW, MutAnyOrigin, address_space=AddressSpace.SHARED
-    ],
-    De_sh: LayoutTensor[
-        DTYPE, L_ROW, MutAnyOrigin, address_space=AddressSpace.SHARED
-    ],
-    fr_e_sh: LayoutTensor[
-        DTYPE, L_FR, MutAnyOrigin, address_space=AddressSpace.SHARED
-    ],
-    mu_sh: LayoutTensor[
-        DTYPE, L_C, MutAnyOrigin, address_space=AddressSpace.SHARED
-    ],
-    ntc_sh: LayoutTensor[
-        DTYPE, L_C, MutAnyOrigin, address_space=AddressSpace.SHARED
-    ],
-    cs_sh: LayoutTensor[
-        DTYPE, L_C, MutAnyOrigin, address_space=AddressSpace.SHARED
-    ],
-    hb_sh: LayoutTensor[
-        DTYPE, L_HB, MutAnyOrigin, address_space=AddressSpace.SHARED
-    ],
+    jar_sh: TileTensor[DTYPE, L_ROW, MutAnyOrigin, address_space=AddressSpace.SHARED],
+    De_sh: TileTensor[DTYPE, L_ROW, MutAnyOrigin, address_space=AddressSpace.SHARED],
+    fr_e_sh: TileTensor[DTYPE, L_FR, MutAnyOrigin, address_space=AddressSpace.SHARED],
+    mu_sh: TileTensor[DTYPE, L_C, MutAnyOrigin, address_space=AddressSpace.SHARED],
+    ntc_sh: TileTensor[DTYPE, L_C, MutAnyOrigin, address_space=AddressSpace.SHARED],
+    cs_sh: TileTensor[DTYPE, L_C, MutAnyOrigin, address_space=AddressSpace.SHARED],
+    hb_sh: TileTensor[DTYPE, L_HB, MutAnyOrigin, address_space=AddressSpace.SHARED],
 ):
     """The contact's `(NT+1)^2` Hessian block (`ell_hessian_block`, PSD
     projection included) into `hb_sh[c*HN ..]` — one thread per contact,
@@ -280,20 +240,16 @@ def _ell_contact_hb[
 
 @always_inline
 def _ell_entry_contact_term[
-    DTYPE: DType, NT: Int, HN: Int, L_JE: Layout, L_C: Layout, L_HB: Layout,
+    DTYPE: DType, NT: Int, HN: Int, L_JE: TensorLayout, L_C: TensorLayout, L_HB: TensorLayout,
     JE_AS: AddressSpace,
 ](
     c: Int,
     i: Int,
     j: Int,
     nv: Int,
-    Je_sh: LayoutTensor[DTYPE, L_JE, MutAnyOrigin, address_space=JE_AS],
-    ntc_sh: LayoutTensor[
-        DTYPE, L_C, MutAnyOrigin, address_space=AddressSpace.SHARED
-    ],
-    hb_sh: LayoutTensor[
-        DTYPE, L_HB, MutAnyOrigin, address_space=AddressSpace.SHARED
-    ],
+    Je_sh: TileTensor[DTYPE, L_JE, MutAnyOrigin, address_space=JE_AS],
+    ntc_sh: TileTensor[DTYPE, L_C, MutAnyOrigin, address_space=AddressSpace.SHARED],
+    hb_sh: TileTensor[DTYPE, L_HB, MutAnyOrigin, address_space=AddressSpace.SHARED],
     mut h: Scalar[DTYPE],
 ):
     """Add contact `c`'s `J^T Hb J` to Hessian entry `(i, j)`, in EXACTLY
@@ -325,11 +281,11 @@ def _ell_recompute_coop[
     DTYPE: DType,
     NT: Int,
     D: DimsLike,
-    L_JE: Layout,
-    L_ROW: Layout,
-    L_FR: Layout,
-    L_V: Layout,
-    L_C: Layout,
+    L_JE: TensorLayout,
+    L_ROW: TensorLayout,
+    L_FR: TensorLayout,
+    L_V: TensorLayout,
+    L_C: TensorLayout,
     JE_AS: AddressSpace = AddressSpace.SHARED,
 ](
     tid: Int,
@@ -338,52 +294,22 @@ def _ell_recompute_coop[
     dense0: Int,
     num_edges: Int,
     dims: D,
-    Je_sh: LayoutTensor[DTYPE, L_JE, MutAnyOrigin, address_space=JE_AS],
-    De_sh: LayoutTensor[
-        DTYPE, L_ROW, MutAnyOrigin, address_space=AddressSpace.SHARED
-    ],
-    bias_e_sh: LayoutTensor[
-        DTYPE, L_ROW, MutAnyOrigin, address_space=AddressSpace.SHARED
-    ],
-    kind_e_sh: LayoutTensor[
-        DTYPE, L_ROW, MutAnyOrigin, address_space=AddressSpace.SHARED
-    ],
-    R_e_sh: LayoutTensor[
-        DTYPE, L_ROW, MutAnyOrigin, address_space=AddressSpace.SHARED
-    ],
-    floss_e_sh: LayoutTensor[
-        DTYPE, L_ROW, MutAnyOrigin, address_space=AddressSpace.SHARED
-    ],
-    state_e_sh: LayoutTensor[
-        DTYPE, L_ROW, MutAnyOrigin, address_space=AddressSpace.SHARED
-    ],
-    fr_e_sh: LayoutTensor[
-        DTYPE, L_FR, MutAnyOrigin, address_space=AddressSpace.SHARED
-    ],
-    mu_sh: LayoutTensor[
-        DTYPE, L_C, MutAnyOrigin, address_space=AddressSpace.SHARED
-    ],
-    ntc_sh: LayoutTensor[
-        DTYPE, L_C, MutAnyOrigin, address_space=AddressSpace.SHARED
-    ],
-    cact_sh: LayoutTensor[
-        DTYPE, L_C, MutAnyOrigin, address_space=AddressSpace.SHARED
-    ],
-    cs_sh: LayoutTensor[
-        DTYPE, L_C, MutAnyOrigin, address_space=AddressSpace.SHARED
-    ],
-    qacc_sh: LayoutTensor[
-        DTYPE, L_V, MutAnyOrigin, address_space=AddressSpace.SHARED
-    ],
-    jar_sh: LayoutTensor[
-        DTYPE, L_ROW, MutAnyOrigin, address_space=AddressSpace.SHARED
-    ],
-    force_sh: LayoutTensor[
-        DTYPE, L_ROW, MutAnyOrigin, address_space=AddressSpace.SHARED
-    ],
-    qfrc_sh: LayoutTensor[
-        DTYPE, L_V, MutAnyOrigin, address_space=AddressSpace.SHARED
-    ],
+    Je_sh: TileTensor[DTYPE, L_JE, MutAnyOrigin, address_space=JE_AS],
+    De_sh: TileTensor[DTYPE, L_ROW, MutAnyOrigin, address_space=AddressSpace.SHARED],
+    bias_e_sh: TileTensor[DTYPE, L_ROW, MutAnyOrigin, address_space=AddressSpace.SHARED],
+    kind_e_sh: TileTensor[DTYPE, L_ROW, MutAnyOrigin, address_space=AddressSpace.SHARED],
+    R_e_sh: TileTensor[DTYPE, L_ROW, MutAnyOrigin, address_space=AddressSpace.SHARED],
+    floss_e_sh: TileTensor[DTYPE, L_ROW, MutAnyOrigin, address_space=AddressSpace.SHARED],
+    state_e_sh: TileTensor[DTYPE, L_ROW, MutAnyOrigin, address_space=AddressSpace.SHARED],
+    fr_e_sh: TileTensor[DTYPE, L_FR, MutAnyOrigin, address_space=AddressSpace.SHARED],
+    mu_sh: TileTensor[DTYPE, L_C, MutAnyOrigin, address_space=AddressSpace.SHARED],
+    ntc_sh: TileTensor[DTYPE, L_C, MutAnyOrigin, address_space=AddressSpace.SHARED],
+    cact_sh: TileTensor[DTYPE, L_C, MutAnyOrigin, address_space=AddressSpace.SHARED],
+    cs_sh: TileTensor[DTYPE, L_C, MutAnyOrigin, address_space=AddressSpace.SHARED],
+    qacc_sh: TileTensor[DTYPE, L_V, MutAnyOrigin, address_space=AddressSpace.SHARED],
+    jar_sh: TileTensor[DTYPE, L_ROW, MutAnyOrigin, address_space=AddressSpace.SHARED],
+    force_sh: TileTensor[DTYPE, L_ROW, MutAnyOrigin, address_space=AddressSpace.SHARED],
+    qfrc_sh: TileTensor[DTYPE, L_V, MutAnyOrigin, address_space=AddressSpace.SHARED],
 ):
     """Cooperative `jar` / zone / force / `qfrc` recompute at `qacc_sh` —
     the elliptic twin of `_recompute_jfq_coop`.

@@ -14,7 +14,8 @@ no cache.
 
 from max.gpu import global_idx
 from max.gpu.host import DeviceContext
-from layout import Layout, LayoutTensor, TileTensor, row_major
+from layout import TileTensor, row_major
+from noeira.core.tiles import Tile
 
 from noeira.nn.constants import DT, TPB, CPU_SIMD_W
 from ..core.tensor import Tensor
@@ -36,9 +37,9 @@ def _dims2(d0: Int, d1: Int) -> Array[Int, 2]:
 def _gather_cols_forward_kernel[
     BATCH: Int, NA: Int,
 ](
-    values: LayoutTensor[DT, Layout.row_major(BATCH, NA), MutAnyOrigin],
-    idx: LayoutTensor[DT, Layout.row_major(BATCH, 1), MutAnyOrigin],
-    output: LayoutTensor[DT, Layout.row_major(BATCH, 1), MutAnyOrigin],
+    values: Tile[DT, BATCH, NA],
+    idx: Tile[DT, BATCH, 1],
+    output: Tile[DT, BATCH, 1],
 ):
     var b = Int(global_idx.x)
     if b < BATCH:
@@ -49,7 +50,7 @@ def _gather_cols_forward_kernel[
 def _gather_cols_zero_values_grad_kernel[
     BATCH: Int, NA: Int,
 ](
-    grad_values: LayoutTensor[DT, Layout.row_major(BATCH, NA), MutAnyOrigin],
+    grad_values: Tile[DT, BATCH, NA],
 ):
     var lin = Int(global_idx.x)
     var total = BATCH * NA
@@ -62,7 +63,7 @@ def _gather_cols_zero_values_grad_kernel[
 def _gather_cols_zero_idx_grad_kernel[
     BATCH: Int,
 ](
-    grad_idx: LayoutTensor[DT, Layout.row_major(BATCH, 1), MutAnyOrigin],
+    grad_idx: Tile[DT, BATCH, 1],
 ):
     var b = Int(global_idx.x)
     if b < BATCH:
@@ -108,9 +109,9 @@ struct GatherCols[NA_: Int](Module):
             out.ensure_gpu(c, B)
             comptime n_blocks = (B + TPB - 1) // TPB
             c.enqueue_function[_gather_cols_forward_kernel[B, Self.NA_]](
-                values.lt["gpu", Layout.row_major(B, Self.NA_)](),
-                idx.lt["gpu", Layout.row_major(B, 1)](),
-                out.lt["gpu", Layout.row_major(B, 1)](),
+                values.tt["gpu", B, Self.NA_](),
+                idx.tt["gpu", B, 1](),
+                out.tt["gpu", B, 1](),
                 grid_dim=n_blocks,
                 block_dim=TPB,
             )
@@ -147,13 +148,13 @@ struct GatherCols[NA_: Int](Module):
             c.enqueue_function[
                 _gather_cols_zero_values_grad_kernel[B, Self.NA_]
             ](
-                gv.lt["gpu", Layout.row_major(B, Self.NA_)](),
+                gv.tt["gpu", B, Self.NA_](),
                 grid_dim=values_blocks,
                 block_dim=TPB,
             )
             comptime idx_blocks = (B + TPB - 1) // TPB
             c.enqueue_function[_gather_cols_zero_idx_grad_kernel[B]](
-                gi.lt["gpu", Layout.row_major(B, 1)](),
+                gi.tt["gpu", B, 1](),
                 grid_dim=idx_blocks,
                 block_dim=TPB,
             )

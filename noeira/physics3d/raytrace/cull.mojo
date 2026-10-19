@@ -38,7 +38,7 @@ pictures to the unculled ones byte for byte, and
 device render against the (unculled) host one.
 """
 
-from layout import Layout, LayoutTensor
+from layout import TileTensor, TensorLayout
 
 from noeira.math3d import Vec3 as Vec3Generic
 
@@ -70,11 +70,11 @@ comptime CULL_FULL: Float64 = 1.0e9
 
 
 def geom_screen_rect[
-    DTYPE: DType, L_GEOMS: Layout, L_XPOS: Layout, L_XQUAT: Layout
+    DTYPE: DType, L_GEOMS: TensorLayout, L_XPOS: TensorLayout, L_XQUAT: TensorLayout
 ](
-    geoms: LayoutTensor[DTYPE, L_GEOMS, MutAnyOrigin],
-    xpos: LayoutTensor[DTYPE, L_XPOS, MutAnyOrigin],
-    xquat: LayoutTensor[DTYPE, L_XQUAT, MutAnyOrigin],
+    geoms: TileTensor[DTYPE, L_GEOMS, MutAnyOrigin],
+    xpos: TileTensor[DTYPE, L_XPOS, MutAnyOrigin],
+    xquat: TileTensor[DTYPE, L_XQUAT, MutAnyOrigin],
     env: Int,
     g: Int,
     frame: CameraFrame[DTYPE],

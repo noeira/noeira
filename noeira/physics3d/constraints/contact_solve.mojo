@@ -45,7 +45,8 @@ misread reproduction (see equality_tendon.mojo).
 from std.math import sqrt, pow, abs
 from max.gpu import thread_idx, block_idx, block_dim
 from max.gpu.host import DeviceContext
-from layout import Layout, LayoutTensor
+from layout import TileTensor, TensorLayout
+from noeira.core.tiles import RowMajor, Tile
 
 from ..types import _max_one, ConeType
 from ..joint_types import JNT_FREE, JNT_BALL
@@ -203,22 +204,16 @@ comptime FRICTION_K_MIN: Float64 = 1e-6
 def _angular_jacobian_row[
     DTYPE: DType,
     V_CAP: Int,
-    L_JOINTS: Layout,
-    L_BODIES: Layout,
-    L_MMETA: Layout,
-    L_CDOF: Layout,
+    L_JOINTS: TensorLayout,
+    L_BODIES: TensorLayout,
+    L_MMETA: TensorLayout,
+    L_CDOF: TensorLayout,
 ](
     env: Int,
-    joints: LayoutTensor[
-        DTYPE, L_JOINTS, MutAnyOrigin
-    ],
-    bodies: LayoutTensor[
-        DTYPE, L_BODIES, MutAnyOrigin
-    ],
-    mmeta: LayoutTensor[
-        DTYPE, L_MMETA, MutAnyOrigin
-    ],
-    cdof: LayoutTensor[DTYPE, L_CDOF, MutAnyOrigin],
+    joints: TileTensor[DTYPE, L_JOINTS, MutAnyOrigin],
+    bodies: TileTensor[DTYPE, L_BODIES, MutAnyOrigin],
+    mmeta: TileTensor[DTYPE, L_MMETA, MutAnyOrigin],
+    cdof: TileTensor[DTYPE, L_CDOF, MutAnyOrigin],
     contact_body_a: Int,
     contact_body_b: Int,
     dir_x: Scalar[DTYPE],
@@ -296,14 +291,12 @@ def _angular_jacobian_row[
 def _init_common_normal_ws[
     DTYPE: DType,
     D: DimsLike,
-    L_SOLVER: Layout,
+    L_SOLVER: TensorLayout,
 ](
     env: Int,
     contact_tid: Int,
     dims: D,
-    solver: LayoutTensor[
-        DTYPE, L_SOLVER, MutAnyOrigin
-    ],
+    solver: TileTensor[DTYPE, L_SOLVER, MutAnyOrigin],
 ):
     """Zero-initialize common normal workspace fields for one contact slot
     (verbatim from init_common_normal_workspace_gpu; the `solver_idx` base
@@ -317,14 +310,12 @@ def _init_common_normal_ws[
 def _init_common_normal_scalars[
     DTYPE: DType,
     D: DimsLike,
-    L_SOLVER: Layout,
+    L_SOLVER: TensorLayout,
 ](
     env: Int,
     contact_tid: Int,
     dims: D,
-    solver: LayoutTensor[
-        DTYPE, L_SOLVER, MutAnyOrigin
-    ],
+    solver: TileTensor[DTYPE, L_SOLVER, MutAnyOrigin],
 ):
     """The 15 scalar fields of one contact slot (`k*mc + slot`), the first
     half of `_init_common_normal_ws`."""
@@ -351,14 +342,12 @@ def _init_common_normal_scalars[
 def _init_common_normal_rows[
     DTYPE: DType,
     D: DimsLike,
-    L_SOLVER: Layout,
+    L_SOLVER: TensorLayout,
 ](
     env: Int,
     contact_tid: Int,
     dims: D,
-    solver: LayoutTensor[
-        DTYPE, L_SOLVER, MutAnyOrigin
-    ],
+    solver: TileTensor[DTYPE, L_SOLVER, MutAnyOrigin],
 ):
     """Zero J_n and MinvJn for one contact slot — the second half of
     `_init_common_normal_ws`. Across all `max_contacts` slots these rows tile
@@ -377,16 +366,16 @@ def _precompute_contact_normal[
     DTYPE: DType,
     V_CAP: Int,
     D: DimsLike,
-    L_QVEL: Layout,
-    L_SUBTREE_COM: Layout,
-    L_CONTACTS: Layout,
-    L_JOINTS: Layout,
-    L_BODIES: Layout,
-    L_MMETA: Layout,
-    L_BODY_INVWEIGHT0: Layout,
-    L_CDOF: Layout,
-    L_M_INV: Layout,
-    L_SOLVER: Layout,
+    L_QVEL: TensorLayout,
+    L_SUBTREE_COM: TensorLayout,
+    L_CONTACTS: TensorLayout,
+    L_JOINTS: TensorLayout,
+    L_BODIES: TensorLayout,
+    L_MMETA: TensorLayout,
+    L_BODY_INVWEIGHT0: TensorLayout,
+    L_CDOF: TensorLayout,
+    L_M_INV: TensorLayout,
+    L_SOLVER: TensorLayout,
     # False skips `M^-1 J_n` and the `K_n` it feeds: only the PGS family
     # reads them (the Newton and CG take `R` from `diag_n` as MuJoCo does).
     MINV_J: Bool = True,
@@ -396,37 +385,17 @@ def _precompute_contact_normal[
     contact_tid: Int,
     nc: Int,
     dims: D,
-    qvel: LayoutTensor[DTYPE, L_QVEL, MutAnyOrigin],
-    subtree_com: LayoutTensor[
-        DTYPE, L_SUBTREE_COM, MutAnyOrigin
-    ],
-    contacts: LayoutTensor[
-        DTYPE,
-        L_CONTACTS,
-        MutAnyOrigin,
-    ],
-    joints: LayoutTensor[
-        DTYPE, L_JOINTS, MutAnyOrigin
-    ],
-    bodies: LayoutTensor[
-        DTYPE, L_BODIES, MutAnyOrigin
-    ],
-    mmeta: LayoutTensor[
-        DTYPE, L_MMETA, MutAnyOrigin
-    ],
-    body_invweight0: LayoutTensor[
-        DTYPE, L_BODY_INVWEIGHT0, MutAnyOrigin
-    ],
-    cdof: LayoutTensor[DTYPE, L_CDOF, MutAnyOrigin],
-    m_inv: LayoutTensor[
-        DTYPE, L_M_INV, MutAnyOrigin
-    ],
-    qacc_constrained: LayoutTensor[
-        DTYPE, L_QVEL, MutAnyOrigin
-    ],
-    solver: LayoutTensor[
-        DTYPE, L_SOLVER, MutAnyOrigin
-    ],
+    qvel: TileTensor[DTYPE, L_QVEL, MutAnyOrigin],
+    subtree_com: TileTensor[DTYPE, L_SUBTREE_COM, MutAnyOrigin],
+    contacts: TileTensor[DTYPE, L_CONTACTS, MutAnyOrigin],
+    joints: TileTensor[DTYPE, L_JOINTS, MutAnyOrigin],
+    bodies: TileTensor[DTYPE, L_BODIES, MutAnyOrigin],
+    mmeta: TileTensor[DTYPE, L_MMETA, MutAnyOrigin],
+    body_invweight0: TileTensor[DTYPE, L_BODY_INVWEIGHT0, MutAnyOrigin],
+    cdof: TileTensor[DTYPE, L_CDOF, MutAnyOrigin],
+    m_inv: TileTensor[DTYPE, L_M_INV, MutAnyOrigin],
+    qacc_constrained: TileTensor[DTYPE, L_QVEL, MutAnyOrigin],
+    solver: TileTensor[DTYPE, L_SOLVER, MutAnyOrigin],
     # ⚠ SUPERSEDED, AND DELIBERATELY RENAMED SO THEY CANNOT BE MISREAD AS
     # LIVE. These are the MODEL-LEVEL solref/solimp
     # (`MODEL_META_IDX_SOLREF_CONTACT_*`) every contact used to share. Since
@@ -589,9 +558,9 @@ def _precompute_contact_normal[
             )
 
             # Store J_n, compute MinvJn and K_n
-            var k: solver.element_type = 0
-            var v_n: solver.element_type = 0
-            var a_n: solver.element_type = 0
+            var k: solver.ElementType = 0
+            var v_n: solver.ElementType = 0
+            var a_n: solver.ElementType = 0
 
             for i in range(nv):
                 solver[env, ws_J_n + c * nv + i] = J_row[i]
@@ -599,7 +568,7 @@ def _precompute_contact_normal[
                 # humanoid_CMU, 40 us of a 120 us Newton solve for eleven
                 # contacts — and the Newton never reads its result.
                 comptime if MINV_J:
-                    var mi_j_sum: solver.element_type = 0
+                    var mi_j_sum: solver.ElementType = 0
                     for j_idx in range(nv):
                         mi_j_sum += m_inv[env, i * nv + j_idx] * J_row[j_idx]
                     solver[env, ws_MinvJn + c * nv + i] = mi_j_sum
@@ -681,14 +650,14 @@ def _precompute_contact_friction[
     DTYPE: DType,
     V_CAP: Int,
     D: DimsLike,
-    L_QVEL: Layout,
-    L_SUBTREE_COM: Layout,
-    L_CONTACTS: Layout,
-    L_JOINTS: Layout,
-    L_BODIES: Layout,
-    L_MMETA: Layout,
-    L_CDOF: Layout,
-    L_SOLVER: Layout,
+    L_QVEL: TensorLayout,
+    L_SUBTREE_COM: TensorLayout,
+    L_CONTACTS: TensorLayout,
+    L_JOINTS: TensorLayout,
+    L_BODIES: TensorLayout,
+    L_MMETA: TensorLayout,
+    L_CDOF: TensorLayout,
+    L_SOLVER: TensorLayout,
     CONE_TYPE: Int = ConeType.ELLIPTIC,
     MAX_CONDIM: Int = 3,
     JM_CAP: Int = 1,
@@ -697,28 +666,14 @@ def _precompute_contact_friction[
     contact_tid: Int,
     nc: Int,
     dims: D,
-    qvel: LayoutTensor[DTYPE, L_QVEL, MutAnyOrigin],
-    subtree_com: LayoutTensor[
-        DTYPE, L_SUBTREE_COM, MutAnyOrigin
-    ],
-    contacts: LayoutTensor[
-        DTYPE,
-        L_CONTACTS,
-        MutAnyOrigin,
-    ],
-    joints: LayoutTensor[
-        DTYPE, L_JOINTS, MutAnyOrigin
-    ],
-    bodies: LayoutTensor[
-        DTYPE, L_BODIES, MutAnyOrigin
-    ],
-    mmeta: LayoutTensor[
-        DTYPE, L_MMETA, MutAnyOrigin
-    ],
-    cdof: LayoutTensor[DTYPE, L_CDOF, MutAnyOrigin],
-    solver: LayoutTensor[
-        DTYPE, L_SOLVER, MutAnyOrigin
-    ],
+    qvel: TileTensor[DTYPE, L_QVEL, MutAnyOrigin],
+    subtree_com: TileTensor[DTYPE, L_SUBTREE_COM, MutAnyOrigin],
+    contacts: TileTensor[DTYPE, L_CONTACTS, MutAnyOrigin],
+    joints: TileTensor[DTYPE, L_JOINTS, MutAnyOrigin],
+    bodies: TileTensor[DTYPE, L_BODIES, MutAnyOrigin],
+    mmeta: TileTensor[DTYPE, L_MMETA, MutAnyOrigin],
+    cdof: TileTensor[DTYPE, L_CDOF, MutAnyOrigin],
+    solver: TileTensor[DTYPE, L_SOLVER, MutAnyOrigin],
     B_damp: Scalar[DTYPE],
     impratio: Scalar[DTYPE],
     K_spring: Scalar[DTYPE],
@@ -1253,18 +1208,14 @@ def _precompute_contact_friction[
 def _warmstart_normals[
     DTYPE: DType,
     D: DimsLike,
-    L_QACC_CONSTRAINED: Layout,
-    L_SOLVER: Layout,
+    L_QACC_CONSTRAINED: TensorLayout,
+    L_SOLVER: TensorLayout,
 ](
     env: Int,
     nc: Int,
     dims: D,
-    qacc_constrained: LayoutTensor[
-        DTYPE, L_QACC_CONSTRAINED, MutAnyOrigin
-    ],
-    solver: LayoutTensor[
-        DTYPE, L_SOLVER, MutAnyOrigin
-    ],
+    qacc_constrained: TileTensor[DTYPE, L_QACC_CONSTRAINED, MutAnyOrigin],
+    solver: TileTensor[DTYPE, L_SOLVER, MutAnyOrigin],
 ):
     """Apply warm-start normal impulses to predicted velocity (verbatim from
     warmstart_normals_gpu; sequential section)."""
@@ -1289,24 +1240,16 @@ def _warmstart_normals[
 def _apply_solved_normals[
     DTYPE: DType,
     D: DimsLike,
-    L_CONTACTS: Layout,
-    L_QACC_CONSTRAINED: Layout,
-    L_SOLVER: Layout,
+    L_CONTACTS: TensorLayout,
+    L_QACC_CONSTRAINED: TensorLayout,
+    L_SOLVER: TensorLayout,
 ](
     env: Int,
     nc: Int,
     dims: D,
-    contacts: LayoutTensor[
-        DTYPE,
-        L_CONTACTS,
-        MutAnyOrigin,
-    ],
-    qacc_constrained: LayoutTensor[
-        DTYPE, L_QACC_CONSTRAINED, MutAnyOrigin
-    ],
-    solver: LayoutTensor[
-        DTYPE, L_SOLVER, MutAnyOrigin
-    ],
+    contacts: TileTensor[DTYPE, L_CONTACTS, MutAnyOrigin],
+    qacc_constrained: TileTensor[DTYPE, L_QACC_CONSTRAINED, MutAnyOrigin],
+    solver: TileTensor[DTYPE, L_SOLVER, MutAnyOrigin],
 ):
     """Remove warm-start and apply final solved normal impulses (verbatim
     from apply_solved_normals_gpu — used by the CG/Newton solvers after
@@ -1354,82 +1297,48 @@ def _contact_solve_env[
     CONE_TYPE: Int,
     BATCH: Int,
     D: DimsLike,
-    L_QPOS: Layout,
-    L_QVEL: Layout,
-    L_XPOS: Layout,
-    L_XQUAT: Layout,
-    L_CONTACTS: Layout,
-    L_SMETA: Layout,
-    L_JOINTS: Layout,
-    L_BODIES: Layout,
-    L_MMETA: Layout,
-    L_EQUALITY: Layout,
-    L_TENDONS: Layout,
-    L_SITES: Layout,
-    L_GEOMS_W: Layout,
-    L_BODY_INVWEIGHT0: Layout,
-    L_DOF_INVWEIGHT0: Layout,
-    L_CDOF: Layout,
-    L_M_INV: Layout,
-    L_SOLVER: Layout,
+    L_QPOS: TensorLayout,
+    L_QVEL: TensorLayout,
+    L_XPOS: TensorLayout,
+    L_XQUAT: TensorLayout,
+    L_CONTACTS: TensorLayout,
+    L_SMETA: TensorLayout,
+    L_JOINTS: TensorLayout,
+    L_BODIES: TensorLayout,
+    L_MMETA: TensorLayout,
+    L_EQUALITY: TensorLayout,
+    L_TENDONS: TensorLayout,
+    L_SITES: TensorLayout,
+    L_GEOMS_W: TensorLayout,
+    L_BODY_INVWEIGHT0: TensorLayout,
+    L_DOF_INVWEIGHT0: TensorLayout,
+    L_CDOF: TensorLayout,
+    L_M_INV: TensorLayout,
+    L_SOLVER: TensorLayout,
 ](
     env: Int,
     dims: D,
-    qpos: LayoutTensor[DTYPE, L_QPOS, MutAnyOrigin],
-    qvel: LayoutTensor[DTYPE, L_QVEL, MutAnyOrigin],
-    xpos: LayoutTensor[
-        DTYPE, L_XPOS, MutAnyOrigin
-    ],
-    xquat: LayoutTensor[
-        DTYPE, L_XQUAT, MutAnyOrigin
-    ],
-    subtree_com: LayoutTensor[
-        DTYPE, L_XPOS, MutAnyOrigin
-    ],
-    contacts: LayoutTensor[
-        DTYPE,
-        L_CONTACTS,
-        MutAnyOrigin,
-    ],
-    smeta: LayoutTensor[
-        DTYPE, L_SMETA, MutAnyOrigin
-    ],
-    joints: LayoutTensor[
-        DTYPE, L_JOINTS, MutAnyOrigin
-    ],
-    bodies: LayoutTensor[
-        DTYPE, L_BODIES, MutAnyOrigin
-    ],
-    mmeta: LayoutTensor[
-        DTYPE, L_MMETA, MutAnyOrigin
-    ],
-    equality: LayoutTensor[
-        DTYPE, L_EQUALITY, MutAnyOrigin
-    ],
-    tendons: LayoutTensor[
-        DTYPE, L_TENDONS, MutAnyOrigin
-    ],
-    sites: LayoutTensor[
-        DTYPE, L_SITES, MutAnyOrigin
-    ],
+    qpos: TileTensor[DTYPE, L_QPOS, MutAnyOrigin],
+    qvel: TileTensor[DTYPE, L_QVEL, MutAnyOrigin],
+    xpos: TileTensor[DTYPE, L_XPOS, MutAnyOrigin],
+    xquat: TileTensor[DTYPE, L_XQUAT, MutAnyOrigin],
+    subtree_com: TileTensor[DTYPE, L_XPOS, MutAnyOrigin],
+    contacts: TileTensor[DTYPE, L_CONTACTS, MutAnyOrigin],
+    smeta: TileTensor[DTYPE, L_SMETA, MutAnyOrigin],
+    joints: TileTensor[DTYPE, L_JOINTS, MutAnyOrigin],
+    bodies: TileTensor[DTYPE, L_BODIES, MutAnyOrigin],
+    mmeta: TileTensor[DTYPE, L_MMETA, MutAnyOrigin],
+    equality: TileTensor[DTYPE, L_EQUALITY, MutAnyOrigin],
+    tendons: TileTensor[DTYPE, L_TENDONS, MutAnyOrigin],
+    sites: TileTensor[DTYPE, L_SITES, MutAnyOrigin],
     # ⚠ FOR TENDON WRAP GEOMS ONLY — see `dynamics/tendon._geom_world_frame`.
-    geoms_w: LayoutTensor[
-        DTYPE, L_GEOMS_W, MutAnyOrigin
-    ],
-    body_invweight0: LayoutTensor[
-        DTYPE, L_BODY_INVWEIGHT0, MutAnyOrigin
-    ],
-    dof_invweight0: LayoutTensor[DTYPE, L_DOF_INVWEIGHT0, MutAnyOrigin],
-    cdof: LayoutTensor[DTYPE, L_CDOF, MutAnyOrigin],
-    m_inv: LayoutTensor[
-        DTYPE, L_M_INV, MutAnyOrigin
-    ],
-    qacc_constrained: LayoutTensor[
-        DTYPE, L_QVEL, MutAnyOrigin
-    ],
-    solver: LayoutTensor[
-        DTYPE, L_SOLVER, MutAnyOrigin
-    ],
+    geoms_w: TileTensor[DTYPE, L_GEOMS_W, MutAnyOrigin],
+    body_invweight0: TileTensor[DTYPE, L_BODY_INVWEIGHT0, MutAnyOrigin],
+    dof_invweight0: TileTensor[DTYPE, L_DOF_INVWEIGHT0, MutAnyOrigin],
+    cdof: TileTensor[DTYPE, L_CDOF, MutAnyOrigin],
+    m_inv: TileTensor[DTYPE, L_M_INV, MutAnyOrigin],
+    qacc_constrained: TileTensor[DTYPE, L_QVEL, MutAnyOrigin],
+    solver: TileTensor[DTYPE, L_SOLVER, MutAnyOrigin],
 ):
     """Full PGS contact solve for one env (verbatim from PGSSolver.solve_gpu,
     serialized per env — see module docstring; limits/equality/tendon run at
@@ -1600,11 +1509,11 @@ def _contact_solve_env[
 
     # PGS normal iterations (acceleration-level)
     for _ in range(PGS_ITERATIONS):
-        var max_delta: solver.element_type = 0
+        var max_delta: solver.ElementType = 0
         for c in range(nc):
             if solver[env, ws_c_dist + c] >= Scalar[DTYPE](0):
                 continue
-            var a_n: solver.element_type = 0
+            var a_n: solver.ElementType = 0
             for i in range(nv):
                 a_n += (
                     solver[env, ws_J_n + c * nv + i]
@@ -1813,12 +1722,12 @@ def _contact_solve_env[
                             nv,
                         )
 
-                    var k_d: solver.element_type = 0
+                    var k_d: solver.ElementType = 0
                     for i in range(nv):
                         solver[env, ws_jf + d * max_contacts * nv + c * nv + i] = J_row[
                             i
                         ]
-                        var mi_j_sum: solver.element_type = 0
+                        var mi_j_sum: solver.ElementType = 0
                         for j_idx in range(nv):
                             mi_j_sum += (
                                 m_inv[env, i * nv + j_idx] * J_row[j_idx]
@@ -1863,7 +1772,7 @@ def _contact_solve_env[
 
                 # Compute velocity damping bias for friction rows
                 for d in range(num_fric):
-                    var v_t: solver.element_type = 0
+                    var v_t: solver.ElementType = 0
                     for i in range(nv):
                         v_t += rebind[Scalar[DTYPE]](
                             solver[env, ws_jf + d * max_contacts * nv + c * nv + i]
@@ -1884,7 +1793,7 @@ def _contact_solve_env[
                             solver[env, ws_fc + d * max_contacts + c]
                         )
                         # Cross-term: C_nt[d][c] = Σ_i J_n[c*nv+i] * MinvJ_f[d*MC*nv+c*nv+i]
-                        var c_nt_val: solver.element_type = 0
+                        var c_nt_val: solver.ElementType = 0
                         for i in range(nv):
                             c_nt_val += rebind[Scalar[DTYPE]](
                                 solver[env, ws_J_n + c * nv + i]
@@ -1945,7 +1854,7 @@ def _contact_solve_env[
         for c in range(nc):
             if solver[env, ws_c_dist + c] >= Scalar[DTYPE](0):
                 continue
-            var a_n: solver.element_type = 0
+            var a_n: solver.ElementType = 0
             for i in range(nv):
                 a_n += (
                     solver[env, ws_J_n + c * nv + i]
@@ -2056,8 +1965,8 @@ def _contact_solve_env[
                     if mu_d <= Scalar[DTYPE](1e-12):
                         continue
 
-                    var a_n_val: solver.element_type = 0
-                    var a_f_val: solver.element_type = 0
+                    var a_n_val: solver.ElementType = 0
+                    var a_f_val: solver.ElementType = 0
                     for i in range(nv):
                         var qi = rebind[Scalar[DTYPE]](
                             qacc_constrained[env, i]
@@ -2640,60 +2549,26 @@ def _contact_solve_fields_kernel[
     BATCH: Int,
     SOLVER_WS: Int,
 ](
-    qpos: LayoutTensor[DTYPE, Layout.row_major(BATCH, NQ), MutAnyOrigin],
-    qvel: LayoutTensor[DTYPE, Layout.row_major(BATCH, NV), MutAnyOrigin],
-    xpos: LayoutTensor[
-        DTYPE, Layout.row_major(BATCH, NBODY * 3), MutAnyOrigin
-    ],
-    xquat: LayoutTensor[
-        DTYPE, Layout.row_major(BATCH, NBODY * 4), MutAnyOrigin
-    ],
-    subtree_com: LayoutTensor[
-        DTYPE, Layout.row_major(BATCH, NBODY * 3), MutAnyOrigin
-    ],
-    contacts: LayoutTensor[
-        DTYPE,
-        Layout.row_major(BATCH, MAX_CONTACTS * CONTACT_SIZE),
-        MutAnyOrigin,
-    ],
-    smeta: LayoutTensor[
-        DTYPE, Layout.row_major(BATCH, METADATA_SIZE), MutAnyOrigin
-    ],
-    joints: LayoutTensor[
-        DTYPE, Layout.row_major(NJOINT, MODEL_JOINT_SIZE), MutAnyOrigin
-    ],
-    bodies: LayoutTensor[
-        DTYPE, Layout.row_major(NBODY, MODEL_BODY_SIZE), MutAnyOrigin
-    ],
-    mmeta: LayoutTensor[
-        DTYPE, Layout.row_major(MODEL_META_SIZE), MutAnyOrigin
-    ],
-    equality: LayoutTensor[
-        DTYPE, Layout.row_major(NEQUALITY, MODEL_EQ_SIZE), MutAnyOrigin
-    ],
-    tendons: LayoutTensor[
-        DTYPE, Layout.row_major(NTENDON, MODEL_TENDON_SIZE), MutAnyOrigin
-    ],
-    sites: LayoutTensor[
-        DTYPE, Layout.row_major(NSITE, MODEL_SITE_SIZE), MutAnyOrigin
-    ],
-    geoms_w: LayoutTensor[
-        DTYPE, Layout.row_major(NGEOM, MODEL_GEOM_SIZE), MutAnyOrigin
-    ],
-    body_invweight0: LayoutTensor[
-        DTYPE, Layout.row_major(NBODY, 2), MutAnyOrigin
-    ],
-    dof_invweight0: LayoutTensor[DTYPE, Layout.row_major(NV), MutAnyOrigin],
-    cdof: LayoutTensor[DTYPE, Layout.row_major(BATCH, NV * 6), MutAnyOrigin],
-    m_inv: LayoutTensor[
-        DTYPE, Layout.row_major(BATCH, NV * NV), MutAnyOrigin
-    ],
-    qacc_constrained: LayoutTensor[
-        DTYPE, Layout.row_major(BATCH, NV), MutAnyOrigin
-    ],
-    solver: LayoutTensor[
-        DTYPE, Layout.row_major(BATCH, SOLVER_WS), MutAnyOrigin
-    ],
+    qpos: Tile[DTYPE, BATCH, NQ],
+    qvel: Tile[DTYPE, BATCH, NV],
+    xpos: Tile[DTYPE, BATCH, NBODY * 3],
+    xquat: Tile[DTYPE, BATCH, NBODY * 4],
+    subtree_com: Tile[DTYPE, BATCH, NBODY * 3],
+    contacts: Tile[DTYPE, BATCH, MAX_CONTACTS * CONTACT_SIZE],
+    smeta: Tile[DTYPE, BATCH, METADATA_SIZE],
+    joints: Tile[DTYPE, NJOINT, MODEL_JOINT_SIZE],
+    bodies: Tile[DTYPE, NBODY, MODEL_BODY_SIZE],
+    mmeta: Tile[DTYPE, MODEL_META_SIZE],
+    equality: Tile[DTYPE, NEQUALITY, MODEL_EQ_SIZE],
+    tendons: Tile[DTYPE, NTENDON, MODEL_TENDON_SIZE],
+    sites: Tile[DTYPE, NSITE, MODEL_SITE_SIZE],
+    geoms_w: Tile[DTYPE, NGEOM, MODEL_GEOM_SIZE],
+    body_invweight0: Tile[DTYPE, NBODY, 2],
+    dof_invweight0: Tile[DTYPE, NV],
+    cdof: Tile[DTYPE, BATCH, NV * 6],
+    m_inv: Tile[DTYPE, BATCH, NV * NV],
+    qacc_constrained: Tile[DTYPE, BATCH, NV],
+    solver: Tile[DTYPE, BATCH, SOLVER_WS],
 ):
     var env = Int(block_dim.x * block_idx.x + thread_idx.x)
     if env >= BATCH:
@@ -2730,25 +2605,25 @@ def solve_contacts[
     comptime MC = _max_one[D.MAX_CONTACTS]()
     comptime SOLVER_WS = 81 * MC + 12 * MC * D.NV
 
-    comptime L_NV = Layout.row_major(BATCH, D.NV)
-    comptime L_B3 = Layout.row_major(BATCH, D.NBODY * 3)
-    comptime L_B4 = Layout.row_major(BATCH, D.NBODY * 4)
-    comptime L_CON = Layout.row_major(BATCH, D.MAX_CONTACTS * CONTACT_SIZE)
-    comptime L_SMETA = Layout.row_major(BATCH, METADATA_SIZE)
-    comptime L_JOINT = Layout.row_major(D.NJOINT, MODEL_JOINT_SIZE)
-    comptime L_BODY = Layout.row_major(D.NBODY, MODEL_BODY_SIZE)
-    comptime L_MMETA = Layout.row_major(MODEL_META_SIZE)
-    comptime L_EQ = Layout.row_major(D.NEQUALITY, MODEL_EQ_SIZE)
-    comptime L_TEN = Layout.row_major(D.NTENDON, MODEL_TENDON_SIZE)
-    comptime L_SITE = Layout.row_major(D.NSITE, MODEL_SITE_SIZE)
-    comptime L_GEOM_W = Layout.row_major(D.NGEOM, MODEL_GEOM_SIZE)
-    comptime L_BW = Layout.row_major(D.NBODY, 2)
-    comptime L_CDOF = Layout.row_major(BATCH, D.NV * 6)
-    comptime L_M = Layout.row_major(BATCH, D.NV * D.NV)
-    comptime L_SOLVER = Layout.row_major(BATCH, SOLVER_WS)
+    comptime L_NV = RowMajor[BATCH, D.NV]
+    comptime L_B3 = RowMajor[BATCH, D.NBODY * 3]
+    comptime L_B4 = RowMajor[BATCH, D.NBODY * 4]
+    comptime L_CON = RowMajor[BATCH, D.MAX_CONTACTS * CONTACT_SIZE]
+    comptime L_SMETA = RowMajor[BATCH, METADATA_SIZE]
+    comptime L_JOINT = RowMajor[D.NJOINT, MODEL_JOINT_SIZE]
+    comptime L_BODY = RowMajor[D.NBODY, MODEL_BODY_SIZE]
+    comptime L_MMETA = RowMajor[MODEL_META_SIZE]
+    comptime L_EQ = RowMajor[D.NEQUALITY, MODEL_EQ_SIZE]
+    comptime L_TEN = RowMajor[D.NTENDON, MODEL_TENDON_SIZE]
+    comptime L_SITE = RowMajor[D.NSITE, MODEL_SITE_SIZE]
+    comptime L_GEOM_W = RowMajor[D.NGEOM, MODEL_GEOM_SIZE]
+    comptime L_BW = RowMajor[D.NBODY, 2]
+    comptime L_CDOF = RowMajor[BATCH, D.NV * 6]
+    comptime L_M = RowMajor[BATCH, D.NV * D.NV]
+    comptime L_SOLVER = RowMajor[BATCH, SOLVER_WS]
 
-    comptime L_QPOS = Layout.row_major(BATCH, D.NQ)
-    comptime L_DW = Layout.row_major(D.NV)
+    comptime L_QPOS = RowMajor[BATCH, D.NQ]
+    comptime L_DW = RowMajor[D.NV]
 
     comptime if target == "cpu":
         var dm = d.dims
@@ -2777,26 +2652,26 @@ def solve_contacts[
         var rl_SOLVER = rl2(
             BATCH, ws_budget(_max_one_rt(dm.get_max_contacts()), dm.get_nv())
         )
-        var qpos_v = d.qpos.lt_dyn["cpu", DYN2](rl_QPOS)
-        var qvel_v = d.qvel.lt_dyn["cpu", DYN2](rl_NV)
-        var xpos_v = d.xpos.lt_dyn["cpu", DYN2](rl_B3)
-        var xquat_v = d.xquat.lt_dyn["cpu", DYN2](rl_B4)
-        var stcom_v = d.subtree_com.lt_dyn["cpu", DYN2](rl_B3)
-        var con_v = d.contacts.lt_dyn["cpu", DYN2](rl_CON)
-        var smeta_v = d.meta.lt_dyn["cpu", DYN2](rl_SMETA)
-        var joints_v = m.joints.lt_dyn["cpu", DYN2](rl_JOINT)
-        var bodies_v = m.bodies.lt_dyn["cpu", DYN2](rl_BODY)
-        var mmeta_v = m.meta.lt_dyn["cpu", DYN1](rl_MMETA)
-        var eq_v = m.equality.lt_dyn["cpu", DYN2](rl_EQ)
-        var ten_v = m.tendons.lt_dyn["cpu", DYN2](rl_TEN)
-        var site_v = m.sites.lt_dyn["cpu", DYN2](rl_SITE)
-        var geomw_v = m.geoms.lt_dyn["cpu", DYN2](rl_GEOM_W)
-        var bw_v = m.body_invweight0.lt_dyn["cpu", DYN2](rl_BW)
-        var dw_v = m.dof_invweight0.lt_dyn["cpu", DYN1](rl_DW)
-        var cdof_v = scratch.cdof.lt_dyn["cpu", DYN2](rl_CDOF)
-        var mi_v = scratch.m_inv.lt_dyn["cpu", DYN2](rl_M)
-        var qc_v = scratch.qacc_constrained.lt_dyn["cpu", DYN2](rl_NV)
-        var sol_v = cscratch.solver.lt_dyn["cpu", DYN2](rl_SOLVER)
+        var qpos_v = d.qpos.tt_dyn["cpu", DYN2](rl_QPOS)
+        var qvel_v = d.qvel.tt_dyn["cpu", DYN2](rl_NV)
+        var xpos_v = d.xpos.tt_dyn["cpu", DYN2](rl_B3)
+        var xquat_v = d.xquat.tt_dyn["cpu", DYN2](rl_B4)
+        var stcom_v = d.subtree_com.tt_dyn["cpu", DYN2](rl_B3)
+        var con_v = d.contacts.tt_dyn["cpu", DYN2](rl_CON)
+        var smeta_v = d.meta.tt_dyn["cpu", DYN2](rl_SMETA)
+        var joints_v = m.joints.tt_dyn["cpu", DYN2](rl_JOINT)
+        var bodies_v = m.bodies.tt_dyn["cpu", DYN2](rl_BODY)
+        var mmeta_v = m.meta.tt_dyn["cpu", DYN1](rl_MMETA)
+        var eq_v = m.equality.tt_dyn["cpu", DYN2](rl_EQ)
+        var ten_v = m.tendons.tt_dyn["cpu", DYN2](rl_TEN)
+        var site_v = m.sites.tt_dyn["cpu", DYN2](rl_SITE)
+        var geomw_v = m.geoms.tt_dyn["cpu", DYN2](rl_GEOM_W)
+        var bw_v = m.body_invweight0.tt_dyn["cpu", DYN2](rl_BW)
+        var dw_v = m.dof_invweight0.tt_dyn["cpu", DYN1](rl_DW)
+        var cdof_v = scratch.cdof.tt_dyn["cpu", DYN2](rl_CDOF)
+        var mi_v = scratch.m_inv.tt_dyn["cpu", DYN2](rl_M)
+        var qc_v = scratch.qacc_constrained.tt_dyn["cpu", DYN2](rl_NV)
+        var sol_v = cscratch.solver.tt_dyn["cpu", DYN2](rl_SOLVER)
         for e in range(BATCH):
             _contact_solve_env[
                 DTYPE,
@@ -2826,26 +2701,26 @@ def solve_contacts[
                 SOLVER_WS,
             ]
         ](
-            d.qpos.lt["gpu", L_QPOS](),
-            d.qvel.lt["gpu", L_NV](),
-            d.xpos.lt["gpu", L_B3](),
-            d.xquat.lt["gpu", L_B4](),
-            d.subtree_com.lt["gpu", L_B3](),
-            d.contacts.lt["gpu", L_CON](),
-            d.meta.lt["gpu", L_SMETA](),
-            m.joints.lt["gpu", L_JOINT](),
-            m.bodies.lt["gpu", L_BODY](),
-            m.meta.lt["gpu", L_MMETA](),
-            m.equality.lt["gpu", L_EQ](),
-            m.tendons.lt["gpu", L_TEN](),
-            m.sites.lt["gpu", L_SITE](),
-                m.geoms.lt["gpu", L_GEOM_W](),
-            m.body_invweight0.lt["gpu", L_BW](),
-            m.dof_invweight0.lt["gpu", L_DW](),
-            scratch.cdof.lt["gpu", L_CDOF](),
-            scratch.m_inv.lt["gpu", L_M](),
-            scratch.qacc_constrained.lt["gpu", L_NV](),
-            cscratch.solver.lt["gpu", L_SOLVER](),
+            d.qpos.tt["gpu", BATCH, D.NQ](),
+            d.qvel.tt["gpu", BATCH, D.NV](),
+            d.xpos.tt["gpu", BATCH, D.NBODY * 3](),
+            d.xquat.tt["gpu", BATCH, D.NBODY * 4](),
+            d.subtree_com.tt["gpu", BATCH, D.NBODY * 3](),
+            d.contacts.tt["gpu", BATCH, D.MAX_CONTACTS * CONTACT_SIZE](),
+            d.meta.tt["gpu", BATCH, METADATA_SIZE](),
+            m.joints.tt["gpu", D.NJOINT, MODEL_JOINT_SIZE](),
+            m.bodies.tt["gpu", D.NBODY, MODEL_BODY_SIZE](),
+            m.meta.tt["gpu", MODEL_META_SIZE](),
+            m.equality.tt["gpu", D.NEQUALITY, MODEL_EQ_SIZE](),
+            m.tendons.tt["gpu", D.NTENDON, MODEL_TENDON_SIZE](),
+            m.sites.tt["gpu", D.NSITE, MODEL_SITE_SIZE](),
+                m.geoms.tt["gpu", D.NGEOM, MODEL_GEOM_SIZE](),
+            m.body_invweight0.tt["gpu", D.NBODY, 2](),
+            m.dof_invweight0.tt["gpu", D.NV](),
+            scratch.cdof.tt["gpu", BATCH, D.NV * 6](),
+            scratch.m_inv.tt["gpu", BATCH, D.NV * D.NV](),
+            scratch.qacc_constrained.tt["gpu", BATCH, D.NV](),
+            cscratch.solver.tt["gpu", BATCH, SOLVER_WS](),
             grid_dim=(BLOCKS,),
             block_dim=(CS_TPB,),
         )

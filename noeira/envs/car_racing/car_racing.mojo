@@ -26,7 +26,8 @@ Reference: gymnasium/envs/box2d/car_racing.py
 """
 
 from std.math import sqrt, cos, sin, pi
-from layout import Layout, LayoutTensor
+from layout import Layout
+from noeira.core.tiles import Tile, ImmTile, tile
 from max.gpu import thread_idx, block_idx, block_dim
 from max.gpu.host import DeviceContext, DeviceBuffer
 from std.random.philox import Random as PhiloxRandom
@@ -796,39 +797,15 @@ struct CarRacing[DTYPE: DType](
 
     def _get_state_tensor(
         self,
-    ) -> LayoutTensor[
-        dtype,
-        Layout.row_major(1, Self.STATE_SIZE),
-        MutAnyOrigin,
-    ]:
+    ) -> Tile[dtype, 1, Self.STATE_SIZE]:
         """Get state tensor view (BATCH=1 for CPU mode)."""
-        return LayoutTensor[
-            dtype,
-            Layout.row_major(1, Self.STATE_SIZE),
-            MutAnyOrigin,
-        ](
-            rebind[Pointer[Scalar[dtype], MutAnyOrigin]](
-                self.state_buffer.unsafe_ptr()
-            )
-        )
+        return tile[1, Self.STATE_SIZE](rebind[Pointer[Scalar[dtype], MutAnyOrigin]]( self.state_buffer.unsafe_ptr() ))
 
     def _get_tiles_tensor(
         self,
-    ) -> LayoutTensor[
-        dtype,
-        Layout.row_major(MAX_TRACK_TILES, TILE_DATA_SIZE),
-        MutAnyOrigin,
-    ]:
+    ) -> Tile[dtype, MAX_TRACK_TILES, TILE_DATA_SIZE]:
         """Get tiles tensor view."""
-        return LayoutTensor[
-            dtype,
-            Layout.row_major(MAX_TRACK_TILES, TILE_DATA_SIZE),
-            MutAnyOrigin,
-        ](
-            rebind[Pointer[Scalar[dtype], MutAnyOrigin]](
-                self.tiles_buffer.unsafe_ptr()
-            )
-        )
+        return tile[MAX_TRACK_TILES, TILE_DATA_SIZE](rebind[Pointer[Scalar[dtype], MutAnyOrigin]]( self.tiles_buffer.unsafe_ptr() ))
 
     def _init_state_buffer(
         mut self,
@@ -1105,52 +1082,28 @@ struct CarRacing[DTYPE: DType](
             workspace_ptr: Optional workspace pointer (unused).
             rng_counter_ptr: Optional GPU counter pointer for deterministic RNG sequencing.
         """
-        var states_tensor = LayoutTensor[
-            dtype, Layout.row_major(BATCH_SIZE, STATE_SIZE)
-        ](states)
+        var states_tensor = tile[BATCH_SIZE, STATE_SIZE](states)
 
-        var actions_tensor = LayoutTensor[
-            dtype, Layout.row_major(BATCH_SIZE, ACTION_DIM)
-        ](actions)
+        var actions_tensor = tile[BATCH_SIZE, ACTION_DIM](actions)
 
-        var rewards_tensor = LayoutTensor[
-            dtype, Layout.row_major(BATCH_SIZE)
-        ](rewards)
+        var rewards_tensor = tile[BATCH_SIZE](rewards)
 
-        var dones_tensor = LayoutTensor[
-            dtype, Layout.row_major(BATCH_SIZE)
-        ](dones)
+        var dones_tensor = tile[BATCH_SIZE](dones)
 
-        var terminated_tensor = LayoutTensor[
-            dtype, Layout.row_major(BATCH_SIZE)
-        ](terminated)
+        var terminated_tensor = tile[BATCH_SIZE](terminated)
 
-        var obs_tensor = LayoutTensor[
-            dtype, Layout.row_major(BATCH_SIZE, OBS_DIM)
-        ](obs)
+        var obs_tensor = tile[BATCH_SIZE, OBS_DIM](obs)
 
         comptime BLOCKS = (BATCH_SIZE + TPB - 1) // TPB
 
         @always_inline
         def step_embedded_wrapper(
-            states: LayoutTensor[
-                dtype, Layout.row_major(BATCH_SIZE, STATE_SIZE), MutAnyOrigin
-            ],
-            actions: LayoutTensor[
-                dtype, Layout.row_major(BATCH_SIZE, ACTION_DIM), ImmutAnyOrigin
-            ],
-            rewards: LayoutTensor[
-                dtype, Layout.row_major(BATCH_SIZE), MutAnyOrigin
-            ],
-            dones: LayoutTensor[
-                dtype, Layout.row_major(BATCH_SIZE), MutAnyOrigin
-            ],
-            terminated_out: LayoutTensor[
-                dtype, Layout.row_major(BATCH_SIZE), MutAnyOrigin
-            ],
-            obs: LayoutTensor[
-                dtype, Layout.row_major(BATCH_SIZE, OBS_DIM), MutAnyOrigin
-            ],
+            states: Tile[dtype, BATCH_SIZE, STATE_SIZE],
+            actions: ImmTile[dtype, BATCH_SIZE, ACTION_DIM],
+            rewards: Tile[dtype, BATCH_SIZE],
+            dones: Tile[dtype, BATCH_SIZE],
+            terminated_out: Tile[dtype, BATCH_SIZE],
+            obs: Tile[dtype, BATCH_SIZE, OBS_DIM],
         ):
             var env = Int(block_dim.x * block_idx.x + thread_idx.x)
             if env >= BATCH_SIZE:
@@ -1198,17 +1151,13 @@ struct CarRacing[DTYPE: DType](
             rng_seed: Random seed for initial state generation. Use different
                      values across calls for varied initial states.
         """
-        var states_tensor = LayoutTensor[
-            dtype, Layout.row_major(BATCH_SIZE, STATE_SIZE)
-        ](states)
+        var states_tensor = tile[BATCH_SIZE, STATE_SIZE](states)
 
         comptime BLOCKS = (BATCH_SIZE + TPB - 1) // TPB
 
         @always_inline
         def reset_wrapper(
-            states: LayoutTensor[
-                dtype, Layout.row_major(BATCH_SIZE, STATE_SIZE), MutAnyOrigin
-            ],
+            states: Tile[dtype, BATCH_SIZE, STATE_SIZE],
             seed: Scalar[dtype],
         ):
             var env = Int(block_dim.x * block_idx.x + thread_idx.x)
@@ -1258,34 +1207,20 @@ struct CarRacing[DTYPE: DType](
             rng_counter_ptr: Optional GPU counter pointer. When non-null, reads
                      seed from GPU memory instead of rng_seed parameter.
         """
-        var states_tensor = LayoutTensor[
-            dtype, Layout.row_major(BATCH_SIZE, STATE_SIZE)
-        ](states)
+        var states_tensor = tile[BATCH_SIZE, STATE_SIZE](states)
 
-        var dones_tensor = LayoutTensor[
-            dtype, Layout.row_major(BATCH_SIZE)
-        ](dones)
+        var dones_tensor = tile[BATCH_SIZE](dones)
 
         comptime BLOCKS = (BATCH_SIZE + TPB - 1) // TPB
 
         if Bool(rng_counter_ptr):
-            var counter_t = LayoutTensor[
-                DType.uint64, Layout.row_major(1), MutAnyOrigin
-            ](rng_counter_ptr.value())
+            var counter_t = tile[1](rng_counter_ptr.value())
 
             @always_inline
             def selective_reset_counter_wrapper(
-                states: LayoutTensor[
-                    dtype,
-                    Layout.row_major(BATCH_SIZE, STATE_SIZE),
-                    MutAnyOrigin,
-                ],
-                dones: LayoutTensor[
-                    dtype, Layout.row_major(BATCH_SIZE), MutAnyOrigin
-                ],
-                counter: LayoutTensor[
-                    DType.uint64, Layout.row_major(1), MutAnyOrigin
-                ],
+                states: Tile[dtype, BATCH_SIZE, STATE_SIZE],
+                dones: Tile[dtype, BATCH_SIZE],
+                counter: Tile[DType.uint64, 1],
             ):
                 var env = Int(block_dim.x * block_idx.x + thread_idx.x)
                 if env >= BATCH_SIZE:
@@ -1312,14 +1247,8 @@ struct CarRacing[DTYPE: DType](
 
             @always_inline
             def selective_reset_wrapper(
-                states: LayoutTensor[
-                    dtype,
-                    Layout.row_major(BATCH_SIZE, STATE_SIZE),
-                    MutAnyOrigin,
-                ],
-                dones: LayoutTensor[
-                    dtype, Layout.row_major(BATCH_SIZE), MutAnyOrigin
-                ],
+                states: Tile[dtype, BATCH_SIZE, STATE_SIZE],
+                dones: Tile[dtype, BATCH_SIZE],
                 seed: Scalar[dtype],
             ):
                 var env = Int(block_dim.x * block_idx.x + thread_idx.x)
@@ -1352,25 +1281,15 @@ struct CarRacing[DTYPE: DType](
     ) raises:
         """Extract observations from state buffer (trivial copy: obs = state[0:OBS_DIM]).
         """
-        var states = LayoutTensor[
-            dtype, Layout.row_major(BATCH_SIZE, STATE_SIZE_VAL)
-        ](states_buf)
-        var obs = LayoutTensor[
-            dtype, Layout.row_major(BATCH_SIZE, OBS_DIM_VAL)
-        ](obs_buf)
+        var states = tile[BATCH_SIZE, STATE_SIZE_VAL](states_buf)
+        var obs = tile[BATCH_SIZE, OBS_DIM_VAL](obs_buf)
 
         comptime BLOCKS = (BATCH_SIZE + TPB - 1) // TPB
 
         @always_inline
         def extract_obs(
-            states: LayoutTensor[
-                dtype,
-                Layout.row_major(BATCH_SIZE, STATE_SIZE_VAL),
-                ImmutAnyOrigin,
-            ],
-            obs: LayoutTensor[
-                dtype, Layout.row_major(BATCH_SIZE, OBS_DIM_VAL), MutAnyOrigin
-            ],
+            states: ImmTile[dtype, BATCH_SIZE, STATE_SIZE_VAL],
+            obs: Tile[dtype, BATCH_SIZE, OBS_DIM_VAL],
         ):
             var i = Int(block_dim.x * block_idx.x + thread_idx.x)
             if i >= BATCH_SIZE:
@@ -1411,9 +1330,7 @@ struct CarRacing[DTYPE: DType](
         BATCH_SIZE: Int,
         STATE_SIZE: Int,
     ](
-        states: LayoutTensor[
-            dtype, Layout.row_major(BATCH_SIZE, STATE_SIZE), MutAnyOrigin
-        ],
+        states: Tile[dtype, BATCH_SIZE, STATE_SIZE],
         env: Int,
         seed: Int,
     ):
@@ -1558,9 +1475,7 @@ struct CarRacing[DTYPE: DType](
         BATCH_SIZE: Int,
         STATE_SIZE: Int,
     ](
-        states: LayoutTensor[
-            dtype, Layout.row_major(BATCH_SIZE, STATE_SIZE), MutAnyOrigin
-        ],
+        states: Tile[dtype, BATCH_SIZE, STATE_SIZE],
         env: Int,
         mut rng: PhiloxRandom,
     ) -> Int:
@@ -1748,27 +1663,16 @@ struct CarRacing[DTYPE: DType](
         mut obs: DeviceBuffer[dtype],
     ) raises:
         """Copy observations from state buffer to output obs buffer."""
-        var states_tensor = LayoutTensor[
-            dtype,
-            Layout.row_major(BATCH_SIZE, CRConstants.STATE_SIZE),
-        ](states)
+        var states_tensor = tile[BATCH_SIZE, CRConstants.STATE_SIZE](states)
 
-        var obs_tensor = LayoutTensor[
-            dtype, Layout.row_major(BATCH_SIZE, OBS_DIM)
-        ](obs)
+        var obs_tensor = tile[BATCH_SIZE, OBS_DIM](obs)
 
         comptime BLOCKS = (BATCH_SIZE + TPB - 1) // TPB
 
         @always_inline
         def copy_obs_wrapper(
-            states: LayoutTensor[
-                dtype,
-                Layout.row_major(BATCH_SIZE, CRConstants.STATE_SIZE),
-                ImmutAnyOrigin,
-            ],
-            obs: LayoutTensor[
-                dtype, Layout.row_major(BATCH_SIZE, OBS_DIM), MutAnyOrigin
-            ],
+            states: ImmTile[dtype, BATCH_SIZE, CRConstants.STATE_SIZE],
+            obs: Tile[dtype, BATCH_SIZE, OBS_DIM],
         ):
             var env = Int(block_dim.x * block_idx.x + thread_idx.x)
             if env >= BATCH_SIZE:
@@ -1796,17 +1700,11 @@ struct CarRacing[DTYPE: DType](
         ACTION_DIM: Int,
     ](
         env: Int,
-        states: LayoutTensor[
-            dtype, Layout.row_major(BATCH, STATE_SIZE), MutAnyOrigin
-        ],
-        actions: LayoutTensor[
-            dtype, Layout.row_major(BATCH, ACTION_DIM), ImmutAnyOrigin
-        ],
-        rewards: LayoutTensor[dtype, Layout.row_major(BATCH), MutAnyOrigin],
-        dones: LayoutTensor[dtype, Layout.row_major(BATCH), MutAnyOrigin],
-        obs: LayoutTensor[
-            dtype, Layout.row_major(BATCH, OBS_DIM), MutAnyOrigin
-        ],
+        states: Tile[dtype, BATCH, STATE_SIZE],
+        actions: ImmTile[dtype, BATCH, ACTION_DIM],
+        rewards: Tile[dtype, BATCH],
+        dones: Tile[dtype, BATCH],
+        obs: Tile[dtype, BATCH, OBS_DIM],
     ):
         """Execute one step using embedded track and visited flags.
 
@@ -2004,10 +1902,7 @@ struct CarRacing[DTYPE: DType](
         ctx.synchronize()
 
         # Create tensor view for the host buffer
-        var tiles_tensor = LayoutTensor[
-            dtype,
-            Layout.row_major(MAX_TRACK_TILES, TILE_DATA_SIZE),
-        ](tiles_host)
+        var tiles_tensor = tile[MAX_TRACK_TILES, TILE_DATA_SIZE](tiles_host)
 
         # Copy track data to host buffer
         track.to_buffer[MAX_TRACK_TILES](tiles_tensor)

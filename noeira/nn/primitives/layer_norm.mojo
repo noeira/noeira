@@ -26,7 +26,8 @@ from max.gpu.sync import barrier
 from max.gpu.memory import AddressSpace
 from max.gpu.host import DeviceContext
 from std.utils.numerics import get_accum_type
-from layout import Layout, LayoutTensor, TileTensor, row_major
+from layout import TileTensor, row_major
+from noeira.core.tiles import RowMajor, Tile, shared_tile
 
 from noeira.nn.constants import DT, CPU_SIMD_W
 from ..core.tensor import Tensor, TensorImpl
@@ -66,12 +67,12 @@ def _layer_norm_forward_kernel[
     # struct's `EPS`, so `LayerNorm[DIM, EPS=1e-12]` was 1e-12 on CPU and 1e-5
     # on GPU. Gate: tests/nn/test_layer_norm_eps_gpu.mojo.
 ](
-    input: LayoutTensor[ADT, Layout.row_major(BATCH, DIM), MutAnyOrigin],
-    output: LayoutTensor[ADT, Layout.row_major(BATCH, DIM), MutAnyOrigin],
-    gamma: LayoutTensor[DT, Layout.row_major(DIM), MutAnyOrigin],
-    beta: LayoutTensor[DT, Layout.row_major(DIM), MutAnyOrigin],
-    cache_xhat: LayoutTensor[DT, Layout.row_major(BATCH, DIM), MutAnyOrigin],
-    cache_inv_std: LayoutTensor[DT, Layout.row_major(BATCH), MutAnyOrigin],
+    input: Tile[ADT, BATCH, DIM],
+    output: Tile[ADT, BATCH, DIM],
+    gamma: Tile[DT, DIM],
+    beta: Tile[DT, DIM],
+    cache_xhat: Tile[DT, BATCH, DIM],
+    cache_inv_std: Tile[DT, BATCH],
 ):
     var b = Int(block_idx.x)
     var t = Int(thread_idx.x)
@@ -153,11 +154,11 @@ def _layer_norm_backward_dx_kernel[
     DIM: Int,
     ADT: DType = DT,
 ](
-    grad_output: LayoutTensor[ADT, Layout.row_major(BATCH, DIM), MutAnyOrigin],
-    gamma: LayoutTensor[DT, Layout.row_major(DIM), MutAnyOrigin],
-    cache_xhat: LayoutTensor[DT, Layout.row_major(BATCH, DIM), MutAnyOrigin],
-    cache_inv_std: LayoutTensor[DT, Layout.row_major(BATCH), MutAnyOrigin],
-    grad_input: LayoutTensor[ADT, Layout.row_major(BATCH, DIM), MutAnyOrigin],
+    grad_output: Tile[ADT, BATCH, DIM],
+    gamma: Tile[DT, DIM],
+    cache_xhat: Tile[DT, BATCH, DIM],
+    cache_inv_std: Tile[DT, BATCH],
+    grad_input: Tile[ADT, BATCH, DIM],
 ):
     var b = Int(block_idx.x)
     var t = Int(thread_idx.x)
@@ -238,13 +239,9 @@ comptime _DP_CHUNK = 1024
 def _ln_dparams_partial_kernel[
     BATCH: Int, DIM: Int, ADT: DType = DT
 ](
-    grad_output: LayoutTensor[ADT, Layout.row_major(BATCH, DIM), MutAnyOrigin],
-    cache_xhat: LayoutTensor[DT, Layout.row_major(BATCH, DIM), MutAnyOrigin],
-    part: LayoutTensor[
-        DT,
-        Layout.row_major(2 * ((BATCH + _DP_CHUNK - 1) // _DP_CHUNK) * DIM),
-        MutAnyOrigin,
-    ],
+    grad_output: Tile[ADT, BATCH, DIM],
+    cache_xhat: Tile[DT, BATCH, DIM],
+    part: Tile[DT, 2 * ((BATCH + _DP_CHUNK - 1) // _DP_CHUNK) * DIM],
 ):
     """`part[c, j] = Σ go·x̂` and `part[CHUNKS + c, j] = Σ go` over the rows of
     chunk c (`_DP_CHUNK` rows). Block (`_DP_COLS`, `_DP_ROWS`): lanes along j,
@@ -259,10 +256,7 @@ def _ln_dparams_partial_kernel[
     var ch = Int(block_idx.y)
     var r0 = ch * _DP_CHUNK
     var r1 = min(r0 + _DP_CHUNK, BATCH)
-    var acc = LayoutTensor[
-        DT, Layout.row_major(2 * _DP_ROWS, _DP_COLS), MutAnyOrigin,
-        address_space=AddressSpace.SHARED,
-    ].stack_allocation()
+    var acc = shared_tile[DT, 2 * _DP_ROWS, _DP_COLS]()
     var sg: Scalar[DT] = 0
     var sb: Scalar[DT] = 0
     if j < DIM:
@@ -288,13 +282,9 @@ def _ln_dparams_partial_kernel[
 def _ln_dparams_final_kernel[
     BATCH: Int, DIM: Int
 ](
-    part: LayoutTensor[
-        DT,
-        Layout.row_major(2 * ((BATCH + _DP_CHUNK - 1) // _DP_CHUNK) * DIM),
-        MutAnyOrigin,
-    ],
-    grad_gamma: LayoutTensor[DT, Layout.row_major(DIM), MutAnyOrigin],
-    grad_beta: LayoutTensor[DT, Layout.row_major(DIM), MutAnyOrigin],
+    part: Tile[DT, 2 * ((BATCH + _DP_CHUNK - 1) // _DP_CHUNK) * DIM],
+    grad_gamma: Tile[DT, DIM],
+    grad_beta: Tile[DT, DIM],
 ):
     """`dγ[j] += Σ_c part[c, j]`, `dβ[j] += Σ_c part[CHUNKS + c, j]`, chunks
     in order (deterministic)."""
@@ -431,18 +421,18 @@ struct LayerNorm[DIM_: Int, ADT: DType = DT, EPS: Scalar[DT] = LN_EPS](Module):
                 outd.ensure_gpu(c, B * Self.DIM_)
                 self.cache_xhat.ensure_gpu(c, B * Self.DIM_)
                 self.cache_inv_std.ensure_gpu(c, B)
-                comptime l2d = Layout.row_major(B, Self.DIM_)
-                comptime lb = Layout.row_major(B)
-                comptime ld = Layout.row_major(Self.DIM_)
+                comptime l2d = RowMajor[B, Self.DIM_]
+                comptime lb = RowMajor[B]
+                comptime ld = RowMajor[Self.DIM_]
                 c.enqueue_function[
                     _layer_norm_forward_kernel[B, Self.DIM_, Self.ADT, Self.EPS]
                 ](
-                    in0d.lt["gpu", l2d](),
-                    outd.lt["gpu", l2d](),
-                    self.gamma.val.lt["gpu", ld](),
-                    self.beta.val.lt["gpu", ld](),
-                    self.cache_xhat.lt["gpu", l2d](),
-                    self.cache_inv_std.lt["gpu", lb](),
+                    in0d.tt["gpu", B, Self.DIM_](),
+                    outd.tt["gpu", B, Self.DIM_](),
+                    self.gamma.val.tt["gpu", Self.DIM_](),
+                    self.beta.val.tt["gpu", Self.DIM_](),
+                    self.cache_xhat.tt["gpu", B, Self.DIM_](),
+                    self.cache_inv_std.tt["gpu", B](),
                     grid_dim=B,
                     block_dim=LN_TPB,
                 )
@@ -456,18 +446,18 @@ struct LayerNorm[DIM_: Int, ADT: DType = DT, EPS: Scalar[DT] = LN_EPS](Module):
             out.ensure_gpu(c, B * Self.DIM_)
             self.cache_xhat.ensure_gpu(c, B * Self.DIM_)
             self.cache_inv_std.ensure_gpu(c, B)
-            comptime l2d = Layout.row_major(B, Self.DIM_)
-            comptime lb = Layout.row_major(B)
-            comptime ld = Layout.row_major(Self.DIM_)
+            comptime l2d = RowMajor[B, Self.DIM_]
+            comptime lb = RowMajor[B]
+            comptime ld = RowMajor[Self.DIM_]
             c.enqueue_function[
                 _layer_norm_forward_kernel[B, Self.DIM_, Self.ADT, Self.EPS]
             ](
-                in0.lt["gpu", l2d](),
-                out.lt["gpu", l2d](),
-                self.gamma.val.lt["gpu", ld](),
-                self.beta.val.lt["gpu", ld](),
-                self.cache_xhat.lt["gpu", l2d](),
-                self.cache_inv_std.lt["gpu", lb](),
+                in0.tt["gpu", B, Self.DIM_](),
+                out.tt["gpu", B, Self.DIM_](),
+                self.gamma.val.tt["gpu", Self.DIM_](),
+                self.beta.val.tt["gpu", Self.DIM_](),
+                self.cache_xhat.tt["gpu", B, Self.DIM_](),
+                self.cache_inv_std.tt["gpu", B](),
                 grid_dim=B,
                 block_dim=LN_TPB,
             )
@@ -554,17 +544,17 @@ struct LayerNorm[DIM_: Int, ADT: DType = DT, EPS: Scalar[DT] = LN_EPS](Module):
             else:
                 var c = ctx.value()
                 gind.ensure_gpu(c, B * Self.DIM_)
-                comptime l2d = Layout.row_major(B, Self.DIM_)
-                comptime lb = Layout.row_major(B)
-                comptime ld = Layout.row_major(Self.DIM_)
+                comptime l2d = RowMajor[B, Self.DIM_]
+                comptime lb = RowMajor[B]
+                comptime ld = RowMajor[Self.DIM_]
                 c.enqueue_function[
                     _layer_norm_backward_dx_kernel[B, Self.DIM_, Self.ADT]
                 ](
-                    god.lt["gpu", l2d](),
-                    self.gamma.val.lt["gpu", ld](),
-                    self.cache_xhat.lt["gpu", l2d](),
-                    self.cache_inv_std.lt["gpu", lb](),
-                    gind.lt["gpu", l2d](),
+                    god.tt["gpu", B, Self.DIM_](),
+                    self.gamma.val.tt["gpu", Self.DIM_](),
+                    self.cache_xhat.tt["gpu", B, Self.DIM_](),
+                    self.cache_inv_std.tt["gpu", B](),
+                    gind.tt["gpu", B, Self.DIM_](),
                     grid_dim=B,
                     block_dim=LN_TPB,
                 )
@@ -577,17 +567,17 @@ struct LayerNorm[DIM_: Int, ADT: DType = DT, EPS: Scalar[DT] = LN_EPS](Module):
             ), "bf16-flow LayerNorm is GPU-only"
             var c = ctx.value()
             gin.ensure_gpu(c, B * Self.DIM_)
-            comptime l2d = Layout.row_major(B, Self.DIM_)
-            comptime lb = Layout.row_major(B)
-            comptime ld = Layout.row_major(Self.DIM_)
+            comptime l2d = RowMajor[B, Self.DIM_]
+            comptime lb = RowMajor[B]
+            comptime ld = RowMajor[Self.DIM_]
             c.enqueue_function[
                 _layer_norm_backward_dx_kernel[B, Self.DIM_, Self.ADT]
             ](
-                grad_output.lt["gpu", l2d](),
-                self.gamma.val.lt["gpu", ld](),
-                self.cache_xhat.lt["gpu", l2d](),
-                self.cache_inv_std.lt["gpu", lb](),
-                gin.lt["gpu", l2d](),
+                grad_output.tt["gpu", B, Self.DIM_](),
+                self.gamma.val.tt["gpu", Self.DIM_](),
+                self.cache_xhat.tt["gpu", B, Self.DIM_](),
+                self.cache_inv_std.tt["gpu", B](),
+                gin.tt["gpu", B, Self.DIM_](),
                 grid_dim=B,
                 block_dim=LN_TPB,
             )
@@ -599,23 +589,23 @@ struct LayerNorm[DIM_: Int, ADT: DType = DT, EPS: Scalar[DT] = LN_EPS](Module):
         """dγ += Σ go·x̂, dβ += Σ go over the B rows: chunk partials, then
         the chunks summed in order."""
         comptime CHUNKS = (B + _DP_CHUNK - 1) // _DP_CHUNK
-        comptime l2d = Layout.row_major(B, Self.DIM_)
-        comptime ld = Layout.row_major(Self.DIM_)
-        comptime lp = Layout.row_major(2 * CHUNKS * Self.DIM_)
+        comptime l2d = RowMajor[B, Self.DIM_]
+        comptime ld = RowMajor[Self.DIM_]
+        comptime lp = RowMajor[2 * CHUNKS * Self.DIM_]
         self.dp_part.ensure_gpu(c, 2 * CHUNKS * Self.DIM_)
         c.enqueue_function[
             _ln_dparams_partial_kernel[B, Self.DIM_, Self.ADT]
         ](
-            go.lt["gpu", l2d](),
-            self.cache_xhat.lt["gpu", l2d](),
-            self.dp_part.lt["gpu", lp](),
+            go.tt["gpu", B, Self.DIM_](),
+            self.cache_xhat.tt["gpu", B, Self.DIM_](),
+            self.dp_part.tt["gpu", 2 * CHUNKS * Self.DIM_](),
             grid_dim=((Self.DIM_ + _DP_COLS - 1) // _DP_COLS, CHUNKS),
             block_dim=(_DP_COLS, _DP_ROWS),
         )
         c.enqueue_function[_ln_dparams_final_kernel[B, Self.DIM_]](
-            self.dp_part.lt["gpu", lp](),
-            self.gamma.grd.lt["gpu", ld](),
-            self.beta.grd.lt["gpu", ld](),
+            self.dp_part.tt["gpu", 2 * CHUNKS * Self.DIM_](),
+            self.gamma.grd.tt["gpu", Self.DIM_](),
+            self.beta.grd.tt["gpu", Self.DIM_](),
             grid_dim=(Self.DIM_ + 255) // 256,
             block_dim=256,
         )

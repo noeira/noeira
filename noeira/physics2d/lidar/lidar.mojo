@@ -5,11 +5,11 @@ Casts rays from the hull and detects terrain intersections.
 """
 
 from std.math import sqrt, sin, cos, pi
-from layout import Layout, LayoutTensor
 from max.gpu import thread_idx, block_idx, block_dim
 from max.gpu.host import DeviceContext, DeviceBuffer
 
 from ..constants import dtype, TPB, erase_origin
+from noeira.core.tiles import Tile, tile
 
 
 struct Lidar:
@@ -86,16 +86,8 @@ struct Lidar:
         NUM_LIDAR: Int,
         MAX_EDGES: Int,
     ](
-        state: LayoutTensor[
-            dtype,
-            Layout.row_major(1, STATE_SIZE),
-            MutAnyOrigin,
-        ],
-        obs: LayoutTensor[
-            dtype,
-            Layout.row_major(NUM_LIDAR),
-            MutAnyOrigin,
-        ],
+        state: Tile[dtype, 1, STATE_SIZE],
+        obs: Tile[dtype, NUM_LIDAR],
         hull_x: Scalar[dtype],
         hull_y: Scalar[dtype],
         hull_angle: Scalar[dtype],
@@ -171,16 +163,8 @@ struct Lidar:
         MAX_EDGES: Int,
     ](
         env: Int,
-        state: LayoutTensor[
-            dtype,
-            Layout.row_major(BATCH, STATE_SIZE),
-            MutAnyOrigin,
-        ],
-        obs: LayoutTensor[
-            dtype,
-            Layout.row_major(BATCH, OBS_DIM),
-            MutAnyOrigin,
-        ],
+        state: Tile[dtype, BATCH, STATE_SIZE],
+        obs: Tile[dtype, BATCH, OBS_DIM],
         hull_x: Scalar[dtype],
         hull_y: Scalar[dtype],
         hull_angle: Scalar[dtype],
@@ -256,16 +240,8 @@ struct Lidar:
         NUM_LIDAR: Int,
         MAX_EDGES: Int,
     ](
-        state: LayoutTensor[
-            dtype,
-            Layout.row_major(BATCH, STATE_SIZE),
-            MutAnyOrigin,
-        ],
-        obs: LayoutTensor[
-            dtype,
-            Layout.row_major(BATCH, OBS_DIM),
-            MutAnyOrigin,
-        ],
+        state: Tile[dtype, BATCH, STATE_SIZE],
+        obs: Tile[dtype, BATCH, OBS_DIM],
         lidar_range: Scalar[dtype],
     ):
         """GPU kernel for batched lidar raycast."""
@@ -317,24 +293,16 @@ struct Lidar:
             obs_buf: Output observation buffer [BATCH, OBS_DIM].
             lidar_range: Maximum lidar range.
         """
-        var state = LayoutTensor[
-            dtype, Layout.row_major(BATCH, STATE_SIZE), MutAnyOrigin
-        ](erase_origin(state_buf.unsafe_ptr()))
+        var state = tile[BATCH, STATE_SIZE](erase_origin(state_buf.unsafe_ptr()))
 
-        var obs = LayoutTensor[
-            dtype, Layout.row_major(BATCH, OBS_DIM), MutAnyOrigin
-        ](erase_origin(obs_buf.unsafe_ptr()))
+        var obs = tile[BATCH, OBS_DIM](erase_origin(obs_buf.unsafe_ptr()))
 
         comptime BLOCKS = (BATCH + TPB - 1) // TPB
 
         @always_inline
         def kernel_wrapper(
-            state: LayoutTensor[
-                dtype, Layout.row_major(BATCH, STATE_SIZE), MutAnyOrigin
-            ],
-            obs: LayoutTensor[
-                dtype, Layout.row_major(BATCH, OBS_DIM), MutAnyOrigin
-            ],
+            state: Tile[dtype, BATCH, STATE_SIZE],
+            obs: Tile[dtype, BATCH, OBS_DIM],
             lidar_range: Scalar[dtype],
         ):
             Lidar._raycast_kernel[

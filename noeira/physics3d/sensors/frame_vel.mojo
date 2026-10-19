@@ -41,7 +41,7 @@ Used by dm_control's swimmer, whose `body_velocities()` observation is the
 """
 
 from std.collections import Array
-from layout import Layout, LayoutTensor
+from layout import TileTensor, TensorLayout
 
 from ..kinematics.quat_math import quat_rotate_inverse
 from ..kinematics.site_frame import site_world_quat, site_world_quat_list
@@ -156,29 +156,17 @@ def site_frame_velocity[
 @always_inline
 def site_frame_velocity_gpu[
     DTYPE: DType,
-    L_XVEL: Layout,
-    L_XQUAT: Layout,
-    L_SITE_XPOS: Layout,
-    L_SITES: Layout,
+    L_XVEL: TensorLayout,
+    L_XQUAT: TensorLayout,
+    L_SITE_XPOS: TensorLayout,
+    L_SITES: TensorLayout,
 ](
-    xvel: LayoutTensor[
-        DTYPE, L_XVEL, MutAnyOrigin
-    ],
-    xangvel: LayoutTensor[
-        DTYPE, L_XVEL, MutAnyOrigin
-    ],
-    xipos: LayoutTensor[
-        DTYPE, L_XVEL, MutAnyOrigin
-    ],
-    xquat: LayoutTensor[
-        DTYPE, L_XQUAT, MutAnyOrigin
-    ],
-    site_xpos: LayoutTensor[
-        DTYPE, L_SITE_XPOS, MutAnyOrigin
-    ],
-    sites: LayoutTensor[
-        DTYPE, L_SITES, MutAnyOrigin
-    ],
+    xvel: TileTensor[DTYPE, L_XVEL, MutAnyOrigin],
+    xangvel: TileTensor[DTYPE, L_XVEL, MutAnyOrigin],
+    xipos: TileTensor[DTYPE, L_XVEL, MutAnyOrigin],
+    xquat: TileTensor[DTYPE, L_XQUAT, MutAnyOrigin],
+    site_xpos: TileTensor[DTYPE, L_SITE_XPOS, MutAnyOrigin],
+    sites: TileTensor[DTYPE, L_SITES, MutAnyOrigin],
     env: Int,
     body: Int,
     site: Int,

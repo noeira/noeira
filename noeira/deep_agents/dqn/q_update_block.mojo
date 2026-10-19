@@ -33,7 +33,6 @@ null = uniform replay, bit-identical to pre-PER). Mirrors the storage
 
 from max.gpu import block_dim, block_idx, thread_idx
 from max.gpu.host import DeviceContext
-from layout import Layout, LayoutTensor
 
 from noeira.nn.constants import DT, TPB
 from noeira.nn.core.module import Module
@@ -46,6 +45,7 @@ from noeira.nn.core.initializer import Zero
 from noeira.nn.optimizer.adam import Adam
 from noeira.nn.loss.mse_loss import MSELoss
 from noeira.nn.primitives.gather_cols import GatherCols
+from noeira.core.tiles import Tile
 
 
 # ──────────────────────────────────────────────────────────────────────
@@ -56,8 +56,8 @@ from noeira.nn.primitives.gather_cols import GatherCols
 def _capture_td_residuals_kernel[
     BATCH: Int
 ](
-    mb_grad_q: LayoutTensor[DT, Layout.row_major(BATCH, 1), MutAnyOrigin],
-    out_residuals: LayoutTensor[DT, Layout.row_major(BATCH), MutAnyOrigin],
+    mb_grad_q: Tile[DT, BATCH, 1],
+    out_residuals: Tile[DT, BATCH],
 ):
     """Recover the raw signed TD residual `Q − y = mb_grad_q·BATCH` (the value
     MSE.vjp wrote) for PER priority refresh. Run BEFORE IS-weight scaling."""
@@ -70,8 +70,8 @@ def _capture_td_residuals_kernel[
 def _scale_grad_by_weights_kernel[
     BATCH: Int
 ](
-    mb_grad_q: LayoutTensor[DT, Layout.row_major(BATCH, 1), MutAnyOrigin],
-    weights: LayoutTensor[DT, Layout.row_major(BATCH), MutAnyOrigin],
+    mb_grad_q: Tile[DT, BATCH, 1],
+    weights: Tile[DT, BATCH],
 ):
     """In-place PER IS-weight scaling `mb_grad_q[i,0] *= weights[i]`."""
     var i = Int(block_dim.x * block_idx.x + thread_idx.x)
@@ -83,9 +83,9 @@ def _scale_grad_by_weights_kernel[
 def _scatter_action_grad_kernel[
     BATCH: Int, NA: Int,
 ](
-    grad_q_gath: LayoutTensor[DT, Layout.row_major(BATCH, 1), MutAnyOrigin],
-    mb_a: LayoutTensor[DT, Layout.row_major(BATCH, 1), MutAnyOrigin],
-    grad_q_all: LayoutTensor[DT, Layout.row_major(BATCH, NA), MutAnyOrigin],
+    grad_q_gath: Tile[DT, BATCH, 1],
+    mb_a: Tile[DT, BATCH, 1],
+    grad_q_all: Tile[DT, BATCH, NA],
 ):
     """`grad_q_all[b, k] = grad_q_gath[b, 0]` if `k == Int(mb_a[b, 0])` else `0`.
     One thread per (BATCH * NA) element; per-row write is unique (no atomics)."""
@@ -174,10 +174,10 @@ struct DQNQUpdateBlock[
         mut mb_a: Tensor,
         mut mb_y: Tensor,
         weights: Optional[
-            LayoutTensor[DT, Layout.row_major(Self.BATCH), MutAnyOrigin]
+            Tile[DT, Self.BATCH]
         ] = None,
         td_residuals: Optional[
-            LayoutTensor[DT, Layout.row_major(Self.BATCH), MutAnyOrigin]
+            Tile[DT, Self.BATCH]
         ] = None,
         ctx: Optional[DeviceContext] = None,
     ) raises -> Scalar[DT]:
@@ -237,7 +237,7 @@ struct DQNQUpdateBlock[
                 ctx.value().enqueue_function[
                     _capture_td_residuals_kernel[Self.BATCH]
                 ](
-                    self._mb_grad_q.lt["gpu", Layout.row_major(Self.BATCH, 1)](),
+                    self._mb_grad_q.tt["gpu", Self.BATCH, 1](),
                     td,
                     grid_dim=n_blocks,
                     block_dim=TPB,
@@ -256,7 +256,7 @@ struct DQNQUpdateBlock[
                 ctx.value().enqueue_function[
                     _scale_grad_by_weights_kernel[Self.BATCH]
                 ](
-                    self._mb_grad_q.lt["gpu", Layout.row_major(Self.BATCH, 1)](),
+                    self._mb_grad_q.tt["gpu", Self.BATCH, 1](),
                     w,
                     grid_dim=n_blocks,
                     block_dim=TPB,
@@ -281,11 +281,9 @@ struct DQNQUpdateBlock[
             ctx.value().enqueue_function[
                 _scatter_action_grad_kernel[Self.BATCH, Self.NA]
             ](
-                self._mb_grad_q.lt["gpu", Layout.row_major(Self.BATCH, 1)](),
-                mb_a.lt["gpu", Layout.row_major(Self.BATCH, 1)](),
-                self._mb_grad_q_all.lt[
-                    "gpu", Layout.row_major(Self.BATCH, Self.NA)
-                ](),
+                self._mb_grad_q.tt["gpu", Self.BATCH, 1](),
+                mb_a.tt["gpu", Self.BATCH, 1](),
+                self._mb_grad_q_all.tt["gpu", Self.BATCH, Self.NA](),
                 grid_dim=n_blocks,
                 block_dim=TPB,
             )

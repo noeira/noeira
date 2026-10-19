@@ -26,22 +26,22 @@ from std.math import sqrt
 from std.random import random_float64
 from max.gpu import global_idx
 from max.gpu.host import DeviceContext
-from layout import Layout, LayoutTensor
 
 from noeira.nn.constants import DT, TPB
 from noeira.nn.core.tensor import Tensor
 from noeira.nn.core.checkpoint import (
     BinaryCheckpointReader, BinaryCheckpointWriter, CheckpointScalars,
 )
+from noeira.core.tiles import Tile
 
 
 # ── GPU kernels (operate over storage Tensor `.lt` views) ────────────────
 def _gather_k[
     NTASKS: Int, NROWS: Int, EMB: Int
 ](
-    task_ids: LayoutTensor[DT, Layout.row_major(NROWS), MutAnyOrigin],
-    param: LayoutTensor[DT, Layout.row_major(NTASKS * EMB), MutAnyOrigin],
-    dst: LayoutTensor[DT, Layout.row_major(NROWS * EMB), MutAnyOrigin],
+    task_ids: Tile[DT, NROWS],
+    param: Tile[DT, NTASKS * EMB],
+    dst: Tile[DT, NROWS * EMB],
 ):
     var i = Int(global_idx.x)
     if i < NROWS * EMB:
@@ -54,9 +54,9 @@ def _gather_k[
 def _accum_k[
     NTASKS: Int, EMB: Int, NROWS: Int, ROWW: Int, COFF: Int
 ](
-    task_ids: LayoutTensor[DT, Layout.row_major(NROWS), MutAnyOrigin],
-    grad_wide: LayoutTensor[DT, Layout.row_major(NROWS * ROWW), MutAnyOrigin],
-    grad_tab: LayoutTensor[DT, Layout.row_major(NTASKS * EMB), MutAnyOrigin],
+    task_ids: Tile[DT, NROWS],
+    grad_wide: Tile[DT, NROWS * ROWW],
+    grad_tab: Tile[DT, NTASKS * EMB],
 ):
     """One thread per table element (task,e); loops rows summing matching
     contributions → atomic-free scatter-add. NROWS is small relative to the
@@ -75,10 +75,10 @@ def _accum_k[
 def _adam_k[
     N: Int
 ](
-    param: LayoutTensor[DT, Layout.row_major(N), MutAnyOrigin],
-    grad: LayoutTensor[DT, Layout.row_major(N), MutAnyOrigin],
-    m: LayoutTensor[DT, Layout.row_major(N), MutAnyOrigin],
-    v: LayoutTensor[DT, Layout.row_major(N), MutAnyOrigin],
+    param: Tile[DT, N],
+    grad: Tile[DT, N],
+    m: Tile[DT, N],
+    v: Tile[DT, N],
     lr: Scalar[DT],
     beta1: Scalar[DT],
     beta2: Scalar[DT],
@@ -100,7 +100,7 @@ def _adam_k[
 
 
 def _zero_k[N: Int](
-    ptr: LayoutTensor[DT, Layout.row_major(N), MutAnyOrigin]
+    ptr: Tile[DT, N]
 ):
     var i = Int(global_idx.x)
     if i < N:
@@ -110,7 +110,7 @@ def _zero_k[N: Int](
 def _renorm_k[
     NTASKS: Int, EMB: Int
 ](
-    param: LayoutTensor[DT, Layout.row_major(NTASKS * EMB), MutAnyOrigin],
+    param: Tile[DT, NTASKS * EMB],
     max_norm: Scalar[DT],
 ):
     """Row-wise `max_norm` projection: rows longer than `max_norm` are scaled
@@ -234,7 +234,7 @@ struct TaskEmbedding[NUM_TASKS: Int, TASK_EMB: Int](
             var c = self.ctx.value()
             comptime nb = (N + TPB - 1) // TPB
             c.enqueue_function[_zero_k[N]](
-                self.grad.lt["gpu", Layout.row_major(N)](),
+                self.grad.tt["gpu", N](),
                 grid_dim=nb, block_dim=TPB,
             )
 
@@ -258,9 +258,9 @@ struct TaskEmbedding[NUM_TASKS: Int, TASK_EMB: Int](
             var c = ctx.value()
             comptime nb = (NROWS * EMB + TPB - 1) // TPB
             c.enqueue_function[_gather_k[Self.NUM_TASKS, NROWS, EMB]](
-                task_ids.lt["gpu", Layout.row_major(NROWS)](),
-                self.param.lt["gpu", Layout.row_major(Self.N)](),
-                dst.lt["gpu", Layout.row_major(NROWS * EMB)](),
+                task_ids.tt["gpu", NROWS](),
+                self.param.tt["gpu", Self.N](),
+                dst.tt["gpu", NROWS * EMB](),
                 grid_dim=nb, block_dim=TPB,
             )
 
@@ -290,9 +290,9 @@ struct TaskEmbedding[NUM_TASKS: Int, TASK_EMB: Int](
             c.enqueue_function[
                 _accum_k[Self.NUM_TASKS, EMB, NROWS, ROWW, COFF]
             ](
-                task_ids.lt["gpu", Layout.row_major(NROWS)](),
-                grad_wide.lt["gpu", Layout.row_major(NROWS * ROWW)](),
-                self.grad.lt["gpu", Layout.row_major(Self.N)](),
+                task_ids.tt["gpu", NROWS](),
+                grad_wide.tt["gpu", NROWS * ROWW](),
+                self.grad.tt["gpu", Self.N](),
                 grid_dim=nt, block_dim=TPB,
             )
 
@@ -335,10 +335,10 @@ struct TaskEmbedding[NUM_TASKS: Int, TASK_EMB: Int](
             var c = self.ctx.value()
             comptime nb = (N + TPB - 1) // TPB
             c.enqueue_function[_adam_k[N]](
-                self.param.lt["gpu", Layout.row_major(N)](),
-                self.grad.lt["gpu", Layout.row_major(N)](),
-                self.m.lt["gpu", Layout.row_major(N)](),
-                self.v.lt["gpu", Layout.row_major(N)](),
+                self.param.tt["gpu", N](),
+                self.grad.tt["gpu", N](),
+                self.m.tt["gpu", N](),
+                self.v.tt["gpu", N](),
                 self.lr,
                 self.beta1,
                 self.beta2,
@@ -353,7 +353,7 @@ struct TaskEmbedding[NUM_TASKS: Int, TASK_EMB: Int](
                 c.enqueue_function[
                     _renorm_k[Self.NUM_TASKS, Self.TASK_EMB]
                 ](
-                    self.param.lt["gpu", Layout.row_major(Self.N)](),
+                    self.param.tt["gpu", Self.N](),
                     self.max_norm,
                     grid_dim=nr,
                     block_dim=TPB,

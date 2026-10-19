@@ -77,11 +77,11 @@ from std.math import exp, log, sqrt
 from max.gpu import global_idx
 from std.random import random_float64
 from max.gpu.host import DeviceContext
-from layout import Layout, LayoutTensor
 
 from noeira.nn.constants import DT, TPB
 from noeira.nn.core.tensor import Tensor
 from noeira.nn.random.box_muller import box_muller_normal
+from noeira.core.tiles import Tile
 
 
 comptime FM_ALPHA: Float64 = 1.5
@@ -125,11 +125,11 @@ def sample_noise(mut dst: Tensor, n: Int) raises:
 
 
 def _xt_ut_kernel[B: Int, ROW: Int](
-    noise: LayoutTensor[DT, Layout.row_major(B, ROW), MutAnyOrigin],
-    actions: LayoutTensor[DT, Layout.row_major(B, ROW), MutAnyOrigin],
-    times: LayoutTensor[DT, Layout.row_major(B), MutAnyOrigin],
-    x_t: LayoutTensor[DT, Layout.row_major(B, ROW), MutAnyOrigin],
-    u_t: LayoutTensor[DT, Layout.row_major(B, ROW), MutAnyOrigin],
+    noise: Tile[DT, B, ROW],
+    actions: Tile[DT, B, ROW],
+    times: Tile[DT, B],
+    x_t: Tile[DT, B, ROW],
+    u_t: Tile[DT, B, ROW],
 ):
     var i = Int(global_idx.x)
     if i >= B * ROW:
@@ -166,11 +166,11 @@ def build_xt_ut[
         x_t.ensure_gpu(c, B * ROW)
         u_t.ensure_gpu(c, B * ROW)
         c.enqueue_function[_xt_ut_kernel[B, ROW]](
-            noise.lt["gpu", Layout.row_major(B, ROW)](),
-            actions.lt["gpu", Layout.row_major(B, ROW)](),
-            times.lt["gpu", Layout.row_major(B)](),
-            x_t.lt["gpu", Layout.row_major(B, ROW)](),
-            u_t.lt["gpu", Layout.row_major(B, ROW)](),
+            noise.tt["gpu", B, ROW](),
+            actions.tt["gpu", B, ROW](),
+            times.tt["gpu", B](),
+            x_t.tt["gpu", B, ROW](),
+            u_t.tt["gpu", B, ROW](),
             grid_dim=(B * ROW + TPB - 1) // TPB,
             block_dim=TPB,
         )
@@ -180,11 +180,11 @@ def build_xt_ut[
 
 
 def _mse_kernel[B: Int, CHUNK: Int, ADIM: Int, ADIM_REAL: Int](
-    v_t: LayoutTensor[DT, Layout.row_major(B, CHUNK * ADIM), MutAnyOrigin],
-    u_t: LayoutTensor[DT, Layout.row_major(B, CHUNK * ADIM), MutAnyOrigin],
-    valid: LayoutTensor[DT, Layout.row_major(B, CHUNK), MutAnyOrigin],
-    grad_v: LayoutTensor[DT, Layout.row_major(B, CHUNK * ADIM), MutAnyOrigin],
-    err: LayoutTensor[DT, Layout.row_major(B, CHUNK * ADIM), MutAnyOrigin],
+    v_t: Tile[DT, B, CHUNK * ADIM],
+    u_t: Tile[DT, B, CHUNK * ADIM],
+    valid: Tile[DT, B, CHUNK],
+    grad_v: Tile[DT, B, CHUNK * ADIM],
+    err: Tile[DT, B, CHUNK * ADIM],
     two_over_n: Scalar[DT],
 ):
     var i = Int(global_idx.x)
@@ -257,11 +257,11 @@ def flow_mse[
         c.enqueue_function[
             _mse_kernel[B, CHUNK, ADIM, ADIM_REAL]
         ](
-            v_t.lt["gpu", Layout.row_major(B, CHUNK * ADIM)](),
-            u_t.lt["gpu", Layout.row_major(B, CHUNK * ADIM)](),
-            valid.lt["gpu", Layout.row_major(B, CHUNK)](),
-            grad_v.lt["gpu", Layout.row_major(B, CHUNK * ADIM)](),
-            err.lt["gpu", Layout.row_major(B, CHUNK * ADIM)](),
+            v_t.tt["gpu", B, CHUNK * ADIM](),
+            u_t.tt["gpu", B, CHUNK * ADIM](),
+            valid.tt["gpu", B, CHUNK](),
+            grad_v.tt["gpu", B, CHUNK * ADIM](),
+            err.tt["gpu", B, CHUNK * ADIM](),
             two_over_n,
             grid_dim=(TOT + TPB - 1) // TPB,
             block_dim=TPB,

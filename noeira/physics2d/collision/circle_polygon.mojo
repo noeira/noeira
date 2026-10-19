@@ -28,7 +28,6 @@ Contact convention written into the buffer:
 """
 
 from std.math import cos, sin, sqrt
-from layout import LayoutTensor, Layout
 from max.gpu import thread_idx, block_idx, block_dim
 
 from ..constants import (
@@ -56,6 +55,7 @@ from ..constants import (
     CONTACT_NORMAL_IMPULSE,
     CONTACT_TANGENT_IMPULSE,
 )
+from noeira.core.tiles import Tile
 
 
 # =============================================================================
@@ -209,11 +209,7 @@ def _circle_vs_convex_polygon(
 def _write_contact[
     BATCH: Int, MAX_CONTACTS: Int
 ](
-    contacts: LayoutTensor[
-        dtype,
-        Layout.row_major(BATCH, MAX_CONTACTS, CONTACT_DATA_SIZE),
-        MutAnyOrigin,
-    ],
+    contacts: Tile[dtype, BATCH, MAX_CONTACTS, CONTACT_DATA_SIZE],
     env: Int,
     c: Int,
     body_a: Int,
@@ -247,17 +243,9 @@ def detect_circle_vs_body_pair[
     MAX_CONTACTS: Int,
     STATE_SIZE: Int,
 ](
-    state: LayoutTensor[
-        dtype, Layout.row_major(BATCH, STATE_SIZE), MutAnyOrigin
-    ],
-    shapes: LayoutTensor[
-        dtype, Layout.row_major(NUM_SHAPES, SHAPE_MAX_SIZE), MutAnyOrigin
-    ],
-    contacts: LayoutTensor[
-        dtype,
-        Layout.row_major(BATCH, MAX_CONTACTS, CONTACT_DATA_SIZE),
-        MutAnyOrigin,
-    ],
+    state: Tile[dtype, BATCH, STATE_SIZE],
+    shapes: Tile[dtype, NUM_SHAPES, SHAPE_MAX_SIZE],
+    contacts: Tile[dtype, BATCH, MAX_CONTACTS, CONTACT_DATA_SIZE],
     env: Int,
     circle_body_off: Int,  # absolute offset (within env row) to the circle body's state slot
     poly_body_off: Int,  # absolute offset to the polygon/compound body's state slot
@@ -427,20 +415,10 @@ struct CirclePolygonCollision(ImplicitlyCopyable):
         STATE_SIZE: Int,
     ](
         self,
-        state: LayoutTensor[
-            dtype, Layout.row_major(BATCH, STATE_SIZE), MutAnyOrigin
-        ],
-        shapes: LayoutTensor[
-            dtype, Layout.row_major(NUM_SHAPES, SHAPE_MAX_SIZE), MutAnyOrigin
-        ],
-        contacts: LayoutTensor[
-            dtype,
-            Layout.row_major(BATCH, MAX_CONTACTS, CONTACT_DATA_SIZE),
-            MutAnyOrigin,
-        ],
-        contact_counts: LayoutTensor[
-            dtype, Layout.row_major(BATCH), MutAnyOrigin
-        ],
+        state: Tile[dtype, BATCH, STATE_SIZE],
+        shapes: Tile[dtype, NUM_SHAPES, SHAPE_MAX_SIZE],
+        contacts: Tile[dtype, BATCH, MAX_CONTACTS, CONTACT_DATA_SIZE],
+        contact_counts: Tile[dtype, BATCH],
     ):
         for env in range(BATCH):
             var c = Int(contact_counts[env])
@@ -468,20 +446,10 @@ struct CirclePolygonCollision(ImplicitlyCopyable):
         MAX_CONTACTS: Int,
         STATE_SIZE: Int,
     ](
-        state: LayoutTensor[
-            dtype, Layout.row_major(BATCH, STATE_SIZE), MutAnyOrigin
-        ],
-        shapes: LayoutTensor[
-            dtype, Layout.row_major(NUM_SHAPES, SHAPE_MAX_SIZE), MutAnyOrigin
-        ],
-        contacts: LayoutTensor[
-            dtype,
-            Layout.row_major(BATCH, MAX_CONTACTS, CONTACT_DATA_SIZE),
-            MutAnyOrigin,
-        ],
-        contact_counts: LayoutTensor[
-            dtype, Layout.row_major(BATCH), MutAnyOrigin
-        ],
+        state: Tile[dtype, BATCH, STATE_SIZE],
+        shapes: Tile[dtype, NUM_SHAPES, SHAPE_MAX_SIZE],
+        contacts: Tile[dtype, BATCH, MAX_CONTACTS, CONTACT_DATA_SIZE],
+        contact_counts: Tile[dtype, BATCH],
         circle_body_off: Int,
         poly_body_off: Int,
         circle_body_idx: Int,

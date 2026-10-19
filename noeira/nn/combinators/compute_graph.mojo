@@ -41,7 +41,6 @@ CPU + GPU (the leaves + the pool-seed / grad-accumulate run on device).
 from max.gpu import global_idx
 from max.gpu.host import DeviceContext, DeviceBuffer
 from std.memory import Pointer
-from layout import Layout, LayoutTensor
 
 from noeira.nn.constants import DT, TPB
 from ..core.initializer import Initializer

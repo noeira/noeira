@@ -16,7 +16,6 @@ Where vertices are in CCW order around the quad.
 """
 
 from std.math import sqrt
-from layout import LayoutTensor, Layout
 
 from .constants import (
     TILE_DATA_SIZE,
@@ -46,6 +45,7 @@ from .constants import (
 from .wheel_friction import WheelFriction
 
 from ..constants import dtype
+from noeira.core.tiles import Tile
 
 
 struct TileCollision:
@@ -133,11 +133,7 @@ struct TileCollision:
     ](
         x: Scalar[dtype],
         y: Scalar[dtype],
-        tiles: LayoutTensor[
-            dtype,
-            Layout.row_major(MAX_TILES, TILE_DATA_SIZE),
-            MutAnyOrigin,
-        ],
+        tiles: Tile[dtype, MAX_TILES, TILE_DATA_SIZE],
         num_active_tiles: Int,
     ) -> Scalar[dtype]:
         """Get friction coefficient at position (x, y).
@@ -180,11 +176,7 @@ struct TileCollision:
     ](
         x: Scalar[dtype],
         y: Scalar[dtype],
-        tiles: LayoutTensor[
-            dtype,
-            Layout.row_major(MAX_TILES, TILE_DATA_SIZE),
-            MutAnyOrigin,
-        ],
+        tiles: Tile[dtype, MAX_TILES, TILE_DATA_SIZE],
         num_active_tiles: Int,
     ) -> Scalar[dtype]:
         """Get friction limit at position (x, y).
@@ -217,11 +209,7 @@ struct TileCollision:
         hull_x: Scalar[dtype],
         hull_y: Scalar[dtype],
         hull_angle: Scalar[dtype],
-        tiles: LayoutTensor[
-            dtype,
-            Layout.row_major(MAX_TILES, TILE_DATA_SIZE),
-            MutAnyOrigin,
-        ],
+        tiles: Tile[dtype, MAX_TILES, TILE_DATA_SIZE],
         num_active_tiles: Int,
     ) -> Array[Scalar[dtype], NUM_WHEELS]:
         """Get friction limits for all 4 wheels.
@@ -297,11 +285,7 @@ struct TileCollision:
     ](
         x: Scalar[dtype],
         y: Scalar[dtype],
-        tiles: LayoutTensor[
-            dtype,
-            Layout.row_major(MAX_TILES, TILE_DATA_SIZE),
-            MutAnyOrigin,
-        ],
+        tiles: Tile[dtype, MAX_TILES, TILE_DATA_SIZE],
         num_active_tiles: Int,
     ) -> Int:
         """Check if position is on any tile and return tile index.
@@ -349,11 +333,7 @@ struct TileCollision:
         env: Int,
         x: Scalar[dtype],
         y: Scalar[dtype],
-        states: LayoutTensor[
-            dtype,
-            Layout.row_major(BATCH, STATE_SIZE),
-            MutAnyOrigin,
-        ],
+        states: Tile[dtype, BATCH, STATE_SIZE],
         num_active_tiles: Int,
     ) -> Scalar[dtype]:
         """Get friction coefficient at position using embedded track data.
@@ -402,11 +382,7 @@ struct TileCollision:
         env: Int,
         x: Scalar[dtype],
         y: Scalar[dtype],
-        states: LayoutTensor[
-            dtype,
-            Layout.row_major(BATCH, STATE_SIZE),
-            MutAnyOrigin,
-        ],
+        states: Tile[dtype, BATCH, STATE_SIZE],
         num_active_tiles: Int,
     ) -> Scalar[dtype]:
         """Get friction limit at position using embedded track data.
@@ -437,11 +413,7 @@ struct TileCollision:
         env: Int,
         x: Scalar[dtype],
         y: Scalar[dtype],
-        states: LayoutTensor[
-            dtype,
-            Layout.row_major(BATCH, STATE_SIZE),
-            MutAnyOrigin,
-        ],
+        states: Tile[dtype, BATCH, STATE_SIZE],
         num_active_tiles: Int,
     ) -> Int:
         """Check if position is on any tile using embedded track data.
@@ -486,11 +458,7 @@ struct TileCollision:
         env: Int,
         x: Scalar[dtype],
         y: Scalar[dtype],
-        states: LayoutTensor[
-            dtype,
-            Layout.row_major(BATCH, STATE_SIZE),
-            MutAnyOrigin,
-        ],
+        states: Tile[dtype, BATCH, STATE_SIZE],
         num_active_tiles: Int,
     ) -> Tuple[Int, Bool]:
         """Check tile visit and mark as visited if new.

@@ -13,12 +13,12 @@ n_starts = len(corpus) - SEQ, input = corpus[start + t], target =
 corpus[start + t + 1].
 """
 
-from layout import Layout, LayoutTensor
 from max.gpu import global_idx
 from std.memory import Pointer
 
 from noeira.nn.constants import DT
 from noeira.nn.random.hash_mask import hash_u64
+from noeira.core.tiles import Tile
 
 
 @always_inline
@@ -33,10 +33,10 @@ def window_onehot_kernel[
 ](
     corpus: Pointer[Scalar[DType.int32], MutAnyOrigin],
     n_starts: Int64,
-    rng: LayoutTensor[DType.uint64, Layout.row_major(2), MutAnyOrigin],
-    inp: LayoutTensor[ADT, Layout.row_major(BATCH * SEQ * VOCAB), MutAnyOrigin],
-    tgt: LayoutTensor[DT, Layout.row_major(BATCH * SEQ * VOCAB), MutAnyOrigin],
-    starts: LayoutTensor[DType.int32, Layout.row_major(BATCH), MutAnyOrigin],
+    rng: Tile[DType.uint64, 2],
+    inp: Tile[ADT, BATCH * SEQ * VOCAB],
+    tgt: Tile[DT, BATCH * SEQ * VOCAB],
+    starts: Tile[DType.int32, BATCH],
 ):
     """One thread per one-hot element `[b, t, v]`: writes `inp` (the net's
     activation dtype) and `tgt` (fp32, the loss target); the `[b, 0, 0]`
@@ -62,7 +62,7 @@ def window_onehot_kernel[
 
 
 def advance_step_kernel(
-    rng: LayoutTensor[DType.uint64, Layout.row_major(2), MutAnyOrigin],
+    rng: Tile[DType.uint64, 2],
 ):
     """step += 1 (one thread). Enqueued after `window_onehot_kernel`."""
     if Int(global_idx.x) == 0:

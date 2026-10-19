@@ -187,7 +187,7 @@ from std.math import sqrt
 from std.sys import simd_width_of
 from std.collections import Array
 from max.gpu.memory import AddressSpace
-from layout import Layout, LayoutTensor
+from layout import TileTensor, TensorLayout
 from ..fields.scratch import Scratch
 from ..dynamics.ldl import _dof_ancestors
 
@@ -240,7 +240,7 @@ comptime _COST_REJECT: Float64 = 1e-10
 def _minv_jt[
     DTYPE: DType,
     V_CAP: Int,
-    L_M_INV: Layout,
+    L_M_INV: TensorLayout,
     JE_AS: AddressSpace = AddressSpace.GENERIC,
     SPARSE: Bool = False,
     N_CAP: Int = 1,
@@ -248,7 +248,7 @@ def _minv_jt[
 ](
     env: Int,
     nv: Int,
-    m_inv: LayoutTensor[DTYPE, L_M_INV, MutAnyOrigin],
+    m_inv: TileTensor[DTYPE, L_M_INV, MutAnyOrigin],
     Je: Pointer[Scalar[DTYPE], _, address_space=JE_AS],
     row: Int,
     mut out_v: Scratch[Scalar[DTYPE], V_CAP],
@@ -461,14 +461,14 @@ def _tree_solve_cols[
     DTYPE: DType,
     V_CAP: Int,
     RV_CAP: Int,
-    L_M_INV: Layout,
-    L_D: Layout,
+    L_M_INV: TensorLayout,
+    L_D: TensorLayout,
 ](
     env: Int,
     nv: Int,
     n: Int,
-    ldl_L: LayoutTensor[DTYPE, L_M_INV, MutAnyOrigin],
-    ldl_D: LayoutTensor[DTYPE, L_D, MutAnyOrigin],
+    ldl_L: TileTensor[DTYPE, L_M_INV, MutAnyOrigin],
+    ldl_D: TileTensor[DTYPE, L_D, MutAnyOrigin],
     par: Scratch[Int, V_CAP],
     mut Wk: Scratch[Scalar[DTYPE], RV_CAP],
 ):
@@ -508,15 +508,15 @@ def _minv_apply_rows[
     DTYPE: DType,
     V_CAP: Int,
     RV_CAP: Int,
-    L_M_INV: Layout,
-    L_D: Layout,
+    L_M_INV: TensorLayout,
+    L_D: TensorLayout,
 ](
     env: Int,
     nv: Int,
     n: Int,
-    m_inv: LayoutTensor[DTYPE, L_M_INV, MutAnyOrigin],
-    ldl_L: LayoutTensor[DTYPE, L_M_INV, MutAnyOrigin],
-    ldl_D: LayoutTensor[DTYPE, L_D, MutAnyOrigin],
+    m_inv: TileTensor[DTYPE, L_M_INV, MutAnyOrigin],
+    ldl_L: TileTensor[DTYPE, L_M_INV, MutAnyOrigin],
+    ldl_D: TileTensor[DTYPE, L_D, MutAnyOrigin],
     par: Scratch[Int, V_CAP],
     tree_ok: Bool,
     B: Scratch[Scalar[DTYPE], RV_CAP],
@@ -557,16 +557,16 @@ def _minv_apply_rows[
 def _minv_apply[
     DTYPE: DType,
     V_CAP: Int,
-    L_M_INV: Layout,
-    L_D: Layout,
+    L_M_INV: TensorLayout,
+    L_D: TensorLayout,
     TREE: Bool = False,
     A_CAP: Int = 1,
 ](
     env: Int,
     nv: Int,
-    m_inv: LayoutTensor[DTYPE, L_M_INV, MutAnyOrigin],
-    ldl_L: LayoutTensor[DTYPE, L_M_INV, MutAnyOrigin],
-    ldl_D: LayoutTensor[DTYPE, L_D, MutAnyOrigin],
+    m_inv: TileTensor[DTYPE, L_M_INV, MutAnyOrigin],
+    ldl_L: TileTensor[DTYPE, L_M_INV, MutAnyOrigin],
+    ldl_D: TileTensor[DTYPE, L_D, MutAnyOrigin],
     # The dof ancestor table (`_dof_ancestors`), read only under `TREE`.
     dep: Scratch[Int, V_CAP],
     anc: Scratch[Int, A_CAP],
@@ -639,9 +639,9 @@ def noslip_pyramidal[
     MC_CAP: Int,
     MAX_CONTACTS: Int,
     MAX_CONDIM: Int,
-    L_CONTACTS: Layout,
-    L_M_INV: Layout,
-    L_D: Layout,
+    L_CONTACTS: TensorLayout,
+    L_M_INV: TensorLayout,
+    L_D: TensorLayout,
     # GENERIC/GENERIC is the per-env caller (per-thread `Array`s); the
     # blocked kernel passes SHARED rows and a `Je` that is SHARED or GLOBAL
     # depending on whether it fit. See the note above `_minv_jt`.
@@ -665,15 +665,12 @@ def noslip_pyramidal[
     # two agree everywhere except MAX_CONTACTS == 0, but a LayoutTensor
     # parameter is part of the TYPE — passing the caller's tensor with the
     # wrong one is a compile error, not a coercion.
-    contacts: LayoutTensor[
-        DTYPE, L_CONTACTS,
-        MutAnyOrigin,
-    ],
-    m_inv: LayoutTensor[DTYPE, L_M_INV, MutAnyOrigin],
+    contacts: TileTensor[DTYPE, L_CONTACTS, MutAnyOrigin],
+    m_inv: TileTensor[DTYPE, L_M_INV, MutAnyOrigin],
     # The step's tree LDL of `M` and the dof parents; read only under `TREE`
     # (see `_minv_apply`). The other legs pass placeholders and `False`.
-    ldl_L: LayoutTensor[DTYPE, L_M_INV, MutAnyOrigin],
-    ldl_D: LayoutTensor[DTYPE, L_D, MutAnyOrigin],
+    ldl_L: TileTensor[DTYPE, L_M_INV, MutAnyOrigin],
+    ldl_D: TileTensor[DTYPE, L_D, MutAnyOrigin],
     par: Scratch[Int, V_CAP],
     tree_ok: Bool,
     # ⚠ `Je` is indexed with stride `V_CAP`, and both callers lay it out with
@@ -1158,14 +1155,14 @@ def _minv_dense[
     V_CAP: Int,
     NT: Int,
     D: DimsLike,
-    L_M_INV: Layout,
+    L_M_INV: TensorLayout,
     SPARSE: Bool = False,
     N_CAP: Int = 1,
     IX_CAP: Int = 1,
 ](
     env: Int,
     dims: D,
-    m_inv: LayoutTensor[DTYPE, L_M_INV, MutAnyOrigin],
+    m_inv: TileTensor[DTYPE, L_M_INV, MutAnyOrigin],
     J: Scratch[Scalar[DTYPE], R_CAP * V_CAP],
     row: Int,
     mut out_v: Scratch[Scalar[DTYPE], NT * V_CAP],
@@ -1391,8 +1388,8 @@ def noslip_elliptic[
     S_CAP: Int,
     EQ_CAP: Int,
     D: DimsLike,
-    L_M_INV: Layout,
-    L_D: Layout,
+    L_M_INV: TensorLayout,
+    L_D: TensorLayout,
     # CPU-path knobs, both off on the GPU legs — see `noslip_pyramidal`.
     SPARSE: Bool = False,
     N_CAP: Int = 1,
@@ -1405,11 +1402,11 @@ def noslip_elliptic[
     ns: Int,
     neq_rows: Int,
     dims: D,
-    m_inv: LayoutTensor[DTYPE, L_M_INV, MutAnyOrigin],
+    m_inv: TileTensor[DTYPE, L_M_INV, MutAnyOrigin],
     # The step's tree LDL of `M` and the dof parents; read only under `TREE`
     # (see `_minv_apply`). The other legs pass placeholders and `False`.
-    ldl_L: LayoutTensor[DTYPE, L_M_INV, MutAnyOrigin],
-    ldl_D: LayoutTensor[DTYPE, L_D, MutAnyOrigin],
+    ldl_L: TileTensor[DTYPE, L_M_INV, MutAnyOrigin],
+    ldl_D: TileTensor[DTYPE, L_D, MutAnyOrigin],
     par: Scratch[Int, V_CAP],
     tree_ok: Bool,
     # ── contact rows: one normal + `nt_c[c]` tangential, `nt_c[c] = dim-1` ──

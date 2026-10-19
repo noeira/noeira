@@ -26,7 +26,6 @@ width-agnostic `concat_sa(_gpu)` glue (its "OBS" param is the first-input width
 """
 
 from max.gpu.host import DeviceContext
-from layout import Layout
 
 from noeira.nn.constants import DT
 from noeira.nn.core.amp import AMPPolicy, NoAMP
@@ -113,28 +112,16 @@ struct EnsembleCriticStepOFE[
         # 1. concat(φ(s), mb_a) → _mb_sa_in [BATCH, PHI_S_DIM + ACT].
         comptime if target == "cpu":
             concat_sa[Self.PHI_S_DIM, Self.ACT, Self.BATCH](
-                phi_s.lt[
-                    "cpu", Layout.row_major(Self.BATCH, Self.PHI_S_DIM)
-                ](),
-                state.mb_a.lt[
-                    "cpu", Layout.row_major(Self.BATCH, Self.ACT)
-                ](),
-                self._mb_sa_in.lt[
-                    "cpu", Layout.row_major(Self.BATCH, Self.SA_IN_DIM)
-                ](),
+                phi_s.tt["cpu", Self.BATCH, Self.PHI_S_DIM](),
+                state.mb_a.tt["cpu", Self.BATCH, Self.ACT](),
+                self._mb_sa_in.tt["cpu", Self.BATCH, Self.SA_IN_DIM](),
             )
         else:
             concat_sa_gpu[Self.PHI_S_DIM, Self.ACT, Self.BATCH](
                 ctx.value(),
-                phi_s.lt[
-                    "gpu", Layout.row_major(Self.BATCH, Self.PHI_S_DIM)
-                ](),
-                state.mb_a.lt[
-                    "gpu", Layout.row_major(Self.BATCH, Self.ACT)
-                ](),
-                self._mb_sa_in.lt[
-                    "gpu", Layout.row_major(Self.BATCH, Self.SA_IN_DIM)
-                ](),
+                phi_s.tt["gpu", Self.BATCH, Self.PHI_S_DIM](),
+                state.mb_a.tt["gpu", Self.BATCH, Self.ACT](),
+                self._mb_sa_in.tt["gpu", Self.BATCH, Self.SA_IN_DIM](),
             )
 
         # 2. action_branch.forward(sa_in) → φ(s, a) [BATCH, PHI_SA_DIM].

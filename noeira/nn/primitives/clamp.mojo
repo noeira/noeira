@@ -16,7 +16,8 @@ Used by `DDPGTargetYBlock` (1 instance, action clamp) and `TD3TargetYBlock`
 
 from max.gpu import global_idx
 from max.gpu.host import DeviceContext
-from layout import Layout, LayoutTensor, TileTensor, row_major
+from layout import TileTensor, row_major
+from noeira.core.tiles import Tile
 
 from noeira.nn.constants import DT, TPB, CPU_SIMD_W
 from ..core.tensor import Tensor
@@ -31,8 +32,8 @@ from ..core.amp import AMPPolicy, NoAMP
 def _clamp_forward_kernel[
     N: Int,
 ](
-    input: LayoutTensor[DT, Layout.row_major(N), MutAnyOrigin],
-    output: LayoutTensor[DT, Layout.row_major(N), MutAnyOrigin],
+    input: Tile[DT, N],
+    output: Tile[DT, N],
     min_val: Scalar[DT],
     max_val: Scalar[DT],
 ):
@@ -50,9 +51,9 @@ def _clamp_forward_kernel[
 def _clamp_backward_kernel[
     N: Int,
 ](
-    grad_output: LayoutTensor[DT, Layout.row_major(N), MutAnyOrigin],
-    input: LayoutTensor[DT, Layout.row_major(N), MutAnyOrigin],
-    grad_input: LayoutTensor[DT, Layout.row_major(N), MutAnyOrigin],
+    grad_output: Tile[DT, N],
+    input: Tile[DT, N],
+    grad_input: Tile[DT, N],
     min_val: Scalar[DT],
     max_val: Scalar[DT],
 ):
@@ -137,8 +138,8 @@ struct Clamp[DIM_: Int](Module):
             out.ensure_gpu(c, N)
             comptime n_blocks = (N + TPB - 1) // TPB
             c.enqueue_function[_clamp_forward_kernel[N]](
-                in0.lt["gpu", Layout.row_major(N)](),
-                out.lt["gpu", Layout.row_major(N)](),
+                in0.tt["gpu", N](),
+                out.tt["gpu", N](),
                 self.min_val,
                 self.max_val,
                 grid_dim=n_blocks,
@@ -189,9 +190,9 @@ struct Clamp[DIM_: Int](Module):
             gin.ensure_gpu(c, N)
             comptime n_blocks = (N + TPB - 1) // TPB
             c.enqueue_function[_clamp_backward_kernel[N]](
-                grad_output.lt["gpu", Layout.row_major(N)](),
-                fin.lt["gpu", Layout.row_major(N)](),
-                gin.lt["gpu", Layout.row_major(N)](),
+                grad_output.tt["gpu", N](),
+                fin.tt["gpu", N](),
+                gin.tt["gpu", N](),
                 self.min_val,
                 self.max_val,
                 grid_dim=n_blocks,

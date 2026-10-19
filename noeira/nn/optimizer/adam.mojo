@@ -22,7 +22,6 @@ from std.sys import simd_width_of
 from std.math import sqrt
 from max.gpu import global_idx
 from max.gpu.host import DeviceContext, DeviceBuffer
-from layout import Layout, LayoutTensor
 
 from noeira.nn.constants import DT, TPB
 from ..core.tensor import Tensor
@@ -34,6 +33,7 @@ from .grad_clip import (
     clip_grad_norm, clip_arena_grads, clip_arena_grads_captured,
 )
 from .optimizer import Optimizer
+from noeira.core.tiles import Tile
 
 
 def _adam_update_kernel_rt(
@@ -713,9 +713,7 @@ struct Adam(Movable, ParamVisitor, ParamVisitorRT, Optimizer):
             return True
         return False
 
-    def clip_norm_dev(mut self) raises -> LayoutTensor[
-        DT, Layout.row_major(1), MutAnyOrigin
-    ]:
+    def clip_norm_dev(mut self) raises -> Tile[DT, 1]:
         """Device view of the last pre-clip grad norm — for a caller that logs
         the norm EVERY step and therefore must not download it.
 
@@ -735,7 +733,7 @@ struct Adam(Movable, ParamVisitor, ParamVisitorRT, Optimizer):
                 " allocated by `adopt` on the GPU grouped-arena path; off that"
                 " path `clip_grads_device` computes the norm on the host."
             )
-        return self._clip_norm.lt["gpu", Layout.row_major(1)]()
+        return self._clip_norm.tt["gpu", 1]()
 
     def visit_rt[target: StaticString](
         mut self,

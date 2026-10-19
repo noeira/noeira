@@ -17,10 +17,10 @@ the live α at log cadence.
 from std.math import sqrt as fsqrt, exp as fexp
 from max.gpu import thread_idx
 from max.gpu.host import DeviceContext, DeviceBuffer
-from layout import LayoutTensor, Layout
 
 from noeira.nn.constants import DT
 from noeira.nn.core.checkpoint import CheckpointScalars
+from noeira.core.tiles import Tile, ImmTile, tile
 
 
 # state_dev layout — single [6] device buffer.
@@ -34,8 +34,8 @@ comptime _SA_STATE_N = 6
 
 
 def _scalar_adam_step_kernel(
-    state: LayoutTensor[DT, Layout.row_major(6, 1), MutAnyOrigin],
-    lp_mean: LayoutTensor[DT, Layout.row_major(1, 1), ImmutAnyOrigin],
+    state: Tile[DT, 6, 1],
+    lp_mean: ImmTile[DT, 1, 1],
     target_entropy: Scalar[DT],
     lr: Scalar[DT],
     beta1: Scalar[DT],
@@ -157,10 +157,8 @@ struct ScalarAdam(Movable & Deinitable):
     ) raises:
         """GPU step — 1-thread kernel reading the device `lp_mean` grad. No D2H,
         no host scalar update; `state_dev[ALPHA]` is refreshed in place."""
-        var state_lt = LayoutTensor[DT, Layout.row_major(6, 1), MutAnyOrigin](
-            self.state_dev.value()
-        )
-        var lp_mean_lt = LayoutTensor[DT, Layout.row_major(1, 1)](lp_mean)
+        var state_lt = tile[6, 1](self.state_dev.value())
+        var lp_mean_lt = tile[1, 1](lp_mean)
         ctx.enqueue_function[_scalar_adam_step_kernel](
             state_lt,
             lp_mean_lt,

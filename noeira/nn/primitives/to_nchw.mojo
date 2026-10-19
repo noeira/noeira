@@ -18,7 +18,6 @@ get a pure identity copy.
 
 from max.gpu import global_idx
 from max.gpu.host import DeviceContext
-from layout import Layout, LayoutTensor
 
 from noeira.nn.constants import DT, TPB, LAYOUT_NCHW
 from ..core.tensor import Tensor, TensorImpl
@@ -27,13 +26,14 @@ from ..core.module import Module
 from ..core.initializer import Initializer
 from ..core.amp import AMPPolicy, NoAMP
 from .conv2d import _out_off
+from noeira.core.tiles import Tile
 
 
 def _to_nchw_kernel[
     B: Int, C: Int, HW: Int, DIM: Int, LAYOUT: Int, ADT: DType = DT
 ](
-    src: LayoutTensor[ADT, Layout.row_major(B * DIM), MutAnyOrigin],
-    dst: LayoutTensor[ADT, Layout.row_major(B * DIM), MutAnyOrigin],
+    src: Tile[ADT, B * DIM],
+    dst: Tile[ADT, B * DIM],
 ):
     # dst is NCHW [C,H,W]-flat; src is Self.LAYOUT. One thread per dst element.
     var idx = Int(global_idx.x)
@@ -49,8 +49,8 @@ def _to_nchw_kernel[
 def _from_nchw_kernel[
     B: Int, C: Int, HW: Int, DIM: Int, LAYOUT: Int, ADT: DType = DT
 ](
-    go: LayoutTensor[ADT, Layout.row_major(B * DIM), MutAnyOrigin],
-    gin: LayoutTensor[ADT, Layout.row_major(B * DIM), MutAnyOrigin],
+    go: Tile[ADT, B * DIM],
+    gin: Tile[ADT, B * DIM],
 ):
     # vjp: scatter NCHW grad back into Self.LAYOUT. One thread per NCHW element.
     var idx = Int(global_idx.x)
@@ -116,8 +116,8 @@ struct ToNCHW[
                     B, Self.C_, Self.HW, Self.DIM, Self.LAYOUT, Self.ACT_DT
                 ]
             ](
-                in0.lt["gpu", Layout.row_major(N)](),
-                out.lt["gpu", Layout.row_major(N)](),
+                in0.tt["gpu", N](),
+                out.tt["gpu", N](),
                 grid_dim=nblk,
                 block_dim=TPB,
             )
@@ -159,8 +159,8 @@ struct ToNCHW[
                     B, Self.C_, Self.HW, Self.DIM, Self.LAYOUT, Self.ACT_DT
                 ]
             ](
-                grad_output.lt["gpu", Layout.row_major(N)](),
-                gin.lt["gpu", Layout.row_major(N)](),
+                grad_output.tt["gpu", N](),
+                gin.tt["gpu", N](),
                 grid_dim=nblk,
                 block_dim=TPB,
             )

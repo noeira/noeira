@@ -7,7 +7,8 @@ for both targets; per-body mass accumulator stays a per-thread Array
 
 from max.gpu import thread_idx, block_idx, block_dim
 from max.gpu.host import DeviceContext
-from layout import Layout, LayoutTensor
+from layout import TileTensor, TensorLayout
+from noeira.core.tiles import RowMajor, Tile
 
 from ..fields import (
     Data,
@@ -38,20 +39,14 @@ def _max_one[N: Int]() -> Int:
 def _subtree_com_env[
     DTYPE: DType,
     D: DimsLike,
-    L_BODIES: Layout,
-    L_XIPOS: Layout,
+    L_BODIES: TensorLayout,
+    L_XIPOS: TensorLayout,
 ](
     env: Int,
     dims: D,
-    bodies: LayoutTensor[
-        DTYPE, L_BODIES, MutAnyOrigin
-    ],
-    xipos: LayoutTensor[
-        DTYPE, L_XIPOS, MutAnyOrigin
-    ],
-    subtree_com: LayoutTensor[
-        DTYPE, L_XIPOS, MutAnyOrigin
-    ],
+    bodies: TileTensor[DTYPE, L_BODIES, MutAnyOrigin],
+    xipos: TileTensor[DTYPE, L_XIPOS, MutAnyOrigin],
+    subtree_com: TileTensor[DTYPE, L_XIPOS, MutAnyOrigin],
 ):
     """Bottom-up mass*xipos accumulation, then normalize (verbatim from
     compute_subtree_com_gpu)."""
@@ -112,15 +107,9 @@ def _subtree_com_fields_kernel[
     NBODY: Int,
     BATCH: Int,
 ](
-    bodies: LayoutTensor[
-        DTYPE, Layout.row_major(NBODY, MODEL_BODY_SIZE), MutAnyOrigin
-    ],
-    xipos: LayoutTensor[
-        DTYPE, Layout.row_major(BATCH, NBODY * 3), MutAnyOrigin
-    ],
-    subtree_com: LayoutTensor[
-        DTYPE, Layout.row_major(BATCH, NBODY * 3), MutAnyOrigin
-    ],
+    bodies: Tile[DTYPE, NBODY, MODEL_BODY_SIZE],
+    xipos: Tile[DTYPE, BATCH, NBODY * 3],
+    subtree_com: Tile[DTYPE, BATCH, NBODY * 3],
 ):
     var env = Int(block_dim.x * block_idx.x + thread_idx.x)
     if env >= BATCH:
@@ -143,16 +132,16 @@ def compute_subtree_com[
     ctx: Optional[DeviceContext] = None,
 ) raises:
     """Subtree CoM from xipos + body masses, both targets, one body."""
-    comptime L_B3 = Layout.row_major(BATCH, D.NBODY * 3)
-    comptime L_BODY = Layout.row_major(D.NBODY, MODEL_BODY_SIZE)
+    comptime L_B3 = RowMajor[BATCH, D.NBODY * 3]
+    comptime L_BODY = RowMajor[D.NBODY, MODEL_BODY_SIZE]
 
     comptime if target == "cpu":
         var dm = d.dims
         var rl_BODY = rl2(dm.get_nbody(), MODEL_BODY_SIZE)
         var rl_B3 = rl2(BATCH, dm.get_nbody() * 3)
-        var bodies_v = m.bodies.lt_dyn["cpu", DYN2](rl_BODY)
-        var xipos_v = d.xipos.lt_dyn["cpu", DYN2](rl_B3)
-        var stcom_v = d.subtree_com.lt_dyn["cpu", DYN2](rl_B3)
+        var bodies_v = m.bodies.tt_dyn["cpu", DYN2](rl_BODY)
+        var xipos_v = d.xipos.tt_dyn["cpu", DYN2](rl_B3)
+        var stcom_v = d.subtree_com.tt_dyn["cpu", DYN2](rl_B3)
         for e in range(BATCH):
             _subtree_com_env[DTYPE](
                 e, dm, bodies_v, xipos_v, stcom_v
@@ -161,9 +150,9 @@ def compute_subtree_com[
         var c = ctx.value()
         comptime BLOCKS = (BATCH + STCOM_TPB - 1) // STCOM_TPB
         c.enqueue_function[_subtree_com_fields_kernel[DTYPE, D.NBODY, BATCH]](
-            m.bodies.lt["gpu", L_BODY](),
-            d.xipos.lt["gpu", L_B3](),
-            d.subtree_com.lt["gpu", L_B3](),
+            m.bodies.tt["gpu", D.NBODY, MODEL_BODY_SIZE](),
+            d.xipos.tt["gpu", BATCH, D.NBODY * 3](),
+            d.subtree_com.tt["gpu", BATCH, D.NBODY * 3](),
             grid_dim=(BLOCKS,),
             block_dim=(STCOM_TPB,),
         )

@@ -27,7 +27,8 @@ from std.math import tanh
 from std.random.philox import Random as PhiloxRandom
 from max.gpu import global_idx
 from max.gpu.host import DeviceContext
-from layout import Layout, LayoutTensor
+from layout import TileTensor, TensorLayout
+from noeira.core.tiles import Tile, tile
 
 from noeira.nn.constants import DT, TPB
 from noeira.nn.core.tensor import Tensor
@@ -156,8 +157,8 @@ struct TDMPC2RolloutCallbackCPU[
 
 
 def _copy_in_k[N: Int](
-    src: LayoutTensor[DT, Layout.row_major(N), MutAnyOrigin],
-    dst: LayoutTensor[DT, Layout.row_major(N), MutAnyOrigin],
+    src: Tile[DT, N],
+    dst: Tile[DT, N],
 ):
     var i = Int(global_idx.x)
     if i < N:
@@ -165,8 +166,8 @@ def _copy_in_k[N: Int](
 
 
 def _extract_tanh_mean_k[B_: Int, ACT_: Int, POL_: Int](
-    pio: LayoutTensor[DT, Layout.row_major(B_ * POL_), MutAnyOrigin],
-    action: LayoutTensor[DT, Layout.row_major(B_ * ACT_), MutAnyOrigin],
+    pio: Tile[DT, B_ * POL_],
+    action: Tile[DT, B_ * ACT_],
 ):
     """action[b,j] = tanh(pio[b, j])  (mean = first ACT cols of [mean|log_std])."""
     var i = Int(global_idx.x)
@@ -177,9 +178,9 @@ def _extract_tanh_mean_k[B_: Int, ACT_: Int, POL_: Int](
 
 
 def _build_za_scaled_k[B_: Int, LATENT_: Int, ACT_: Int, ZA_: Int](
-    z: LayoutTensor[DT, Layout.row_major(B_ * LATENT_), MutAnyOrigin],
-    a: LayoutTensor[DT, Layout.row_major(B_ * ACT_), MutAnyOrigin],
-    za: LayoutTensor[DT, Layout.row_major(B_ * ZA_), MutAnyOrigin],
+    z: Tile[DT, B_ * LATENT_],
+    a: Tile[DT, B_ * ACT_],
+    za: Tile[DT, B_ * ZA_],
     scale: Scalar[DT],
 ):
     """za[b] = [z[b] | a[b]·scale]."""
@@ -194,9 +195,9 @@ def _build_za_scaled_k[B_: Int, LATENT_: Int, ACT_: Int, ZA_: Int](
 
 
 def _avg2_k[B_: Int](
-    qa: LayoutTensor[DT, Layout.row_major(B_), MutAnyOrigin],
-    qb: LayoutTensor[DT, Layout.row_major(B_), MutAnyOrigin],
-    out_v: LayoutTensor[DT, Layout.row_major(B_), MutAnyOrigin],
+    qa: Tile[DT, B_],
+    qb: Tile[DT, B_],
+    out_v: Tile[DT, B_],
 ):
     var b = Int(global_idx.x)
     if b < B_:
@@ -206,16 +207,16 @@ def _avg2_k[B_: Int](
 
 
 def _flat[
-    N: Int, src_layout: Layout
+    N: Int, src_layout: TensorLayout
 ](
-    t: LayoutTensor[DT, src_layout, MutAnyOrigin]
-) -> LayoutTensor[DT, Layout.row_major(N), MutAnyOrigin]:
+    t: TileTensor[DT, src_layout, MutAnyOrigin]
+) -> Tile[DT, N]:
     """Flat 1D view over a contiguous LayoutTensor — the kernel-ABI bridge for
     the planner's 2D `(B, DIM)` views into the 1D-indexed callback kernels
     below. Origin is the incoming MutAnyOrigin (explicit, NOT inferred) so GPU
     codegen stays correct — this restores the pre-storage-migration `_ltg`
     flatten that the 1D kernels still require."""
-    return LayoutTensor[DT, Layout.row_major(N), MutAnyOrigin](t.ptr)
+    return tile[N](t.ptr)
 
 
 @fieldwise_init
@@ -306,18 +307,14 @@ struct TDMPC2RolloutCallbackGPU[
     ](
         mut self,
         ctx: DeviceContext,
-        z: LayoutTensor[
-            DT, Layout.row_major(B, Self.LATENT_DIM), MutAnyOrigin
-        ],
-        action_out: LayoutTensor[
-            DT, Layout.row_major(B, Self.ACTION_DIM), MutAnyOrigin
-        ],
+        z: Tile[DT, B, Self.LATENT_DIM],
+        action_out: Tile[DT, B, Self.ACTION_DIM],
     ) raises:
         comptime assert B == Self.BT, "callback B must equal BT"
         comptime nbc = (B * Self.LATENT + TPB - 1) // TPB
         ctx.enqueue_function[_copy_in_k[B * Self.LATENT]](
             _flat[B * Self.LATENT](z),
-            self.zin.lt["gpu", Layout.row_major(B * Self.LATENT)](),
+            self.zin.tt["gpu", B * Self.LATENT](),
             grid_dim=nbc, block_dim=TPB,
         )
         self.pol[].forward["gpu", B](
@@ -326,7 +323,7 @@ struct TDMPC2RolloutCallbackGPU[
         comptime k = _extract_tanh_mean_k[B, Self.ACT, Self.POL]
         comptime nb = (B * Self.ACT + TPB - 1) // TPB
         ctx.enqueue_function[k](
-            self.pio.lt["gpu", Layout.row_major(B * Self.POL)](),
+            self.pio.tt["gpu", B * Self.POL](),
             _flat[B * Self.ACT](action_out),
             grid_dim=nb, block_dim=TPB,
         )
@@ -336,16 +333,10 @@ struct TDMPC2RolloutCallbackGPU[
     ](
         mut self,
         ctx: DeviceContext,
-        z: LayoutTensor[
-            DT, Layout.row_major(B, Self.LATENT_DIM), MutAnyOrigin
-        ],
-        a: LayoutTensor[
-            DT, Layout.row_major(B, Self.ACTION_DIM), MutAnyOrigin
-        ],
-        z_next_out: LayoutTensor[
-            DT, Layout.row_major(B, Self.LATENT_DIM), MutAnyOrigin
-        ],
-        r_out: LayoutTensor[DT, Layout.row_major(B), MutAnyOrigin],
+        z: Tile[DT, B, Self.LATENT_DIM],
+        a: Tile[DT, B, Self.ACTION_DIM],
+        z_next_out: Tile[DT, B, Self.LATENT_DIM],
+        r_out: Tile[DT, B],
     ) raises:
         comptime assert B == Self.BT, "callback B must equal BT"
         # za = [z | a·scale] — read the planner views directly.
@@ -353,7 +344,7 @@ struct TDMPC2RolloutCallbackGPU[
         comptime nbz = (B * Self.ZA + TPB - 1) // TPB
         ctx.enqueue_function[bza](
             _flat[B * Self.LATENT](z), _flat[B * Self.ACT](a),
-            self.za.lt["gpu", Layout.row_major(B * Self.ZA)](),
+            self.za.tt["gpu", B * Self.ZA](),
             self.action_scale, grid_dim=nbz, block_dim=TPB,
         )
         # dynamics → zout, copy into the planner's z_next_out
@@ -362,7 +353,7 @@ struct TDMPC2RolloutCallbackGPU[
         )
         comptime nbl = (B * Self.LATENT + TPB - 1) // TPB
         ctx.enqueue_function[_copy_in_k[B * Self.LATENT]](
-            self.zout.lt["gpu", Layout.row_major(B * Self.LATENT)](),
+            self.zout.tt["gpu", B * Self.LATENT](),
             _flat[B * Self.LATENT](z_next_out), grid_dim=nbl, block_dim=TPB,
         )
         # reward → two-hot decode → r_out (build a Tensor view of r_out target)
@@ -374,7 +365,7 @@ struct TDMPC2RolloutCallbackGPU[
         )
         comptime nbb = (B + TPB - 1) // TPB
         ctx.enqueue_function[_copy_in_k[B]](
-            self.qa.lt["gpu", Layout.row_major(B)](),
+            self.qa.tt["gpu", B](),
             r_out, grid_dim=nbb, block_dim=TPB,
         )
 
@@ -383,10 +374,8 @@ struct TDMPC2RolloutCallbackGPU[
     ](
         mut self,
         ctx: DeviceContext,
-        z: LayoutTensor[
-            DT, Layout.row_major(B, Self.LATENT_DIM), MutAnyOrigin
-        ],
-        v_out: LayoutTensor[DT, Layout.row_major(B), MutAnyOrigin],
+        z: Tile[DT, B, Self.LATENT_DIM],
+        v_out: Tile[DT, B],
         seed: UInt32,
     ) raises:
         comptime assert B == Self.BT, "callback B must equal BT"
@@ -403,7 +392,7 @@ struct TDMPC2RolloutCallbackGPU[
         comptime nbc = (B * Self.LATENT + TPB - 1) // TPB
         ctx.enqueue_function[_copy_in_k[B * Self.LATENT]](
             _flat[B * Self.LATENT](z),
-            self.zin.lt["gpu", Layout.row_major(B * Self.LATENT)](),
+            self.zin.tt["gpu", B * Self.LATENT](),
             grid_dim=nbc, block_dim=TPB,
         )
         self.pol[].forward["gpu", B](
@@ -412,8 +401,8 @@ struct TDMPC2RolloutCallbackGPU[
         comptime ek = _extract_tanh_mean_k[B, Self.ACT, Self.POL]
         comptime nba = (B * Self.ACT + TPB - 1) // TPB
         ctx.enqueue_function[ek](
-            self.pio.lt["gpu", Layout.row_major(B * Self.POL)](),
-            self.action.lt["gpu", Layout.row_major(B * Self.ACT)](),
+            self.pio.tt["gpu", B * Self.POL](),
+            self.action.tt["gpu", B * Self.ACT](),
             grid_dim=nba, block_dim=TPB,
         )
         # za = [z, action·scale]
@@ -421,8 +410,8 @@ struct TDMPC2RolloutCallbackGPU[
         comptime nbz = (B * Self.ZA + TPB - 1) // TPB
         ctx.enqueue_function[bza](
             _flat[B * Self.LATENT](z),
-            self.action.lt["gpu", Layout.row_major(B * Self.ACT)](),
-            self.za.lt["gpu", Layout.row_major(B * Self.ZA)](),
+            self.action.tt["gpu", B * Self.ACT](),
+            self.za.tt["gpu", B * Self.ZA](),
             self.action_scale, grid_dim=nbz, block_dim=TPB,
         )
         # avg of 2 (random) target-Q, two-hot decoded. Comptime-guarded
@@ -433,8 +422,8 @@ struct TDMPC2RolloutCallbackGPU[
         comptime ak = _avg2_k[B]
         comptime nbb = (B + TPB - 1) // TPB
         ctx.enqueue_function[ak](
-            self.qa.lt["gpu", Layout.row_major(B)](),
-            self.qb.lt["gpu", Layout.row_major(B)](),
+            self.qa.tt["gpu", B](),
+            self.qb.tt["gpu", B](),
             v_out, grid_dim=nbb, block_dim=TPB,
         )
 

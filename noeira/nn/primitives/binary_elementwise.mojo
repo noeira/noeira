@@ -13,7 +13,6 @@ Backward: c = OP.cache(x,y) ; gi0 = OP.backward_x(c, go) ; gi1 = OP.backward_y(c
 
 from max.gpu import global_idx
 from max.gpu.host import DeviceContext
-from layout import Layout, LayoutTensor
 
 from noeira.nn.constants import DT, CPU_SIMD_W, TPB
 from noeira.nn.core.binary_element_op import BinaryElementOp
@@ -26,14 +25,15 @@ from ..core.module import Module
 from ..core.param import ParamVisitor
 from ..core.initializer import Initializer
 from ..core.amp import AMPPolicy, NoAMP
+from noeira.core.tiles import Tile
 
 
 def _be_fwd_kernel[
     M: Int, OP: BinaryElementOp
 ](
-    a: LayoutTensor[DT, Layout.row_major(M), MutAnyOrigin],
-    b: LayoutTensor[DT, Layout.row_major(M), MutAnyOrigin],
-    o: LayoutTensor[DT, Layout.row_major(M), MutAnyOrigin],
+    a: Tile[DT, M],
+    b: Tile[DT, M],
+    o: Tile[DT, M],
 ):
     var i = Int(global_idx.x)
     if i < M:
@@ -45,11 +45,11 @@ def _be_fwd_kernel[
 def _be_bwd_kernel[
     M: Int, OP: BinaryElementOp
 ](
-    a: LayoutTensor[DT, Layout.row_major(M), MutAnyOrigin],
-    b: LayoutTensor[DT, Layout.row_major(M), MutAnyOrigin],
-    go: LayoutTensor[DT, Layout.row_major(M), MutAnyOrigin],
-    gi0: LayoutTensor[DT, Layout.row_major(M), MutAnyOrigin],
-    gi1: LayoutTensor[DT, Layout.row_major(M), MutAnyOrigin],
+    a: Tile[DT, M],
+    b: Tile[DT, M],
+    go: Tile[DT, M],
+    gi0: Tile[DT, M],
+    gi1: Tile[DT, M],
 ):
     var i = Int(global_idx.x)
     if i < M:
@@ -113,9 +113,9 @@ struct BinaryElementwise[DIM_: Int, OP: BinaryElementOp](Module):
             out.ensure_gpu(c, M)
             comptime nblk = (M + TPB - 1) // TPB
             c.enqueue_function[_be_fwd_kernel[M, Self.OP]](
-                a.lt["gpu", Layout.row_major(M)](),
-                b.lt["gpu", Layout.row_major(M)](),
-                out.lt["gpu", Layout.row_major(M)](),
+                a.tt["gpu", M](),
+                b.tt["gpu", M](),
+                out.tt["gpu", M](),
                 grid_dim=nblk,
                 block_dim=TPB,
             )
@@ -166,11 +166,11 @@ struct BinaryElementwise[DIM_: Int, OP: BinaryElementOp](Module):
             gi1.ensure_gpu(c, M)
             comptime nblk = (M + TPB - 1) // TPB
             c.enqueue_function[_be_bwd_kernel[M, Self.OP]](
-                a.lt["gpu", Layout.row_major(M)](),
-                b.lt["gpu", Layout.row_major(M)](),
-                grad_output.lt["gpu", Layout.row_major(M)](),
-                gi0.lt["gpu", Layout.row_major(M)](),
-                gi1.lt["gpu", Layout.row_major(M)](),
+                a.tt["gpu", M](),
+                b.tt["gpu", M](),
+                grad_output.tt["gpu", M](),
+                gi0.tt["gpu", M](),
+                gi1.tt["gpu", M](),
                 grid_dim=nblk,
                 block_dim=TPB,
             )

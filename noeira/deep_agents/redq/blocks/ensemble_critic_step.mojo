@@ -16,7 +16,6 @@ already builds (s,a) internally via the storage `mb_*` Tensors) — so the legac
 """
 
 from max.gpu.host import DeviceContext
-from layout import Layout
 
 from noeira.nn.constants import DT
 from noeira.nn.core.amp import AMPPolicy, NoAMP
@@ -86,20 +85,16 @@ struct EnsembleCriticStep[
         # Build the shared concat(s, a) once; pass it to each critic update.
         comptime if target == "cpu":
             concat_sa[Self.OBS, Self.ACT, Self.BATCH](
-                state.mb_s.lt["cpu", Layout.row_major(Self.BATCH, Self.OBS)](),
-                state.mb_a.lt["cpu", Layout.row_major(Self.BATCH, Self.ACT)](),
-                self._mb_sa.lt[
-                    "cpu", Layout.row_major(Self.BATCH, Self.SA_DIM)
-                ](),
+                state.mb_s.tt["cpu", Self.BATCH, Self.OBS](),
+                state.mb_a.tt["cpu", Self.BATCH, Self.ACT](),
+                self._mb_sa.tt["cpu", Self.BATCH, Self.SA_DIM](),
             )
         else:
             concat_sa_gpu[Self.OBS, Self.ACT, Self.BATCH](
                 ctx.value(),
-                state.mb_s.lt["gpu", Layout.row_major(Self.BATCH, Self.OBS)](),
-                state.mb_a.lt["gpu", Layout.row_major(Self.BATCH, Self.ACT)](),
-                self._mb_sa.lt[
-                    "gpu", Layout.row_major(Self.BATCH, Self.SA_DIM)
-                ](),
+                state.mb_s.tt["gpu", Self.BATCH, Self.OBS](),
+                state.mb_a.tt["gpu", Self.BATCH, Self.ACT](),
+                self._mb_sa.tt["gpu", Self.BATCH, Self.SA_DIM](),
             )
 
         var loss_sum: Scalar[DT] = Scalar[DT](0.0)

@@ -46,7 +46,7 @@ which is today's behaviour, bit for bit.
 """
 
 from ..fields.scratch import Scratch
-from layout import Layout, LayoutTensor
+from layout import TensorLayout, TileTensor
 from max.gpu.memory import AddressSpace
 
 from ..gpu.constants import (
@@ -59,9 +59,9 @@ from ..gpu.constants import (
 @always_inline
 def build_dof_segments[
     DTYPE: DType,
-    LT: Layout,
-    LJ: Layout,
-    LS: Layout,
+    LT: TensorLayout,
+    LJ: TensorLayout,
+    LS: TensorLayout,
     # ⚠ THE OPERANDS LIVE IN DIFFERENT ADDRESS SPACES. In the blocked kernel
     # `Je` is SHARED or GLOBAL depending on whether it fit (`JE_AS`), the
     # segment arrays are threadgroup memory, and `trees` is a plain model
@@ -73,10 +73,10 @@ def build_dof_segments[
     nv: Int,
     ntree: Int,
     num_edges: Int,
-    trees: LayoutTensor[DTYPE, LT, MutAnyOrigin, address_space=T_AS],
-    Je: LayoutTensor[DTYPE, LJ, MutAnyOrigin, address_space=J_AS],
-    seg_start: LayoutTensor[DTYPE, LS, MutAnyOrigin, address_space=S_AS],
-    seg_end: LayoutTensor[DTYPE, LS, MutAnyOrigin, address_space=S_AS],
+    trees: TileTensor[DTYPE, LT, MutAnyOrigin, address_space=T_AS],
+    Je: TileTensor[DTYPE, LJ, MutAnyOrigin, address_space=J_AS],
+    seg_start: TileTensor[DTYPE, LS, MutAnyOrigin, address_space=S_AS],
+    seg_end: TileTensor[DTYPE, LS, MutAnyOrigin, address_space=S_AS],
 ) -> Int:
     """Per-dof segment bounds for `H`. Returns the segment count.
 

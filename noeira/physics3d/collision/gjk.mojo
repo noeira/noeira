@@ -12,7 +12,7 @@ from std.time import perf_counter_ns
 from std.ffi import _Global
 from std.os import abort
 from std.math import sqrt, abs
-from layout import Layout, LayoutTensor
+from layout import TileTensor, TensorLayout
 from .ccd_workspace import (
     HW_WS_OFF,
     EPA_ITER_CAP,
@@ -475,9 +475,9 @@ def _sel4i(i: Int, a: Int, b: Int, c: Int, d: Int) -> Int:
 
 @always_inline
 def _gjk_signed_distance[
-    DTYPE: DType, L_WS: Layout
+    DTYPE: DType, L_WS: TensorLayout
 ](
-    ws: LayoutTensor[DTYPE, L_WS, MutAnyOrigin],
+    ws: TileTensor[DTYPE, L_WS, MutAnyOrigin],
     wrow: Int,
     base: Int,
     i1: Int, i2: Int, i3: Int,
@@ -527,22 +527,16 @@ comptime HILL_SEED: Bool = True
 @always_inline
 def hillclimb_support_index[
     DTYPE: DType,
-    L_MESH_VERTS: Layout,
-    L_MESH_VERT_EDGEADR: Layout,
-    L_MESH_EDGES: Layout,
+    L_MESH_VERTS: TensorLayout,
+    L_MESH_VERT_EDGEADR: TensorLayout,
+    L_MESH_EDGES: TensorLayout,
 ](
     ld_x: Scalar[DTYPE],
     ld_y: Scalar[DTYPE],
     ld_z: Scalar[DTYPE],
-    mesh_verts: LayoutTensor[
-        DTYPE, L_MESH_VERTS, MutAnyOrigin
-    ],
-    mesh_vert_edgeadr: LayoutTensor[
-        DTYPE, L_MESH_VERT_EDGEADR, MutAnyOrigin
-    ],
-    mesh_edges: LayoutTensor[
-        DTYPE, L_MESH_EDGES, MutAnyOrigin
-    ],
+    mesh_verts: TileTensor[DTYPE, L_MESH_VERTS, MutAnyOrigin],
+    mesh_vert_edgeadr: TileTensor[DTYPE, L_MESH_VERT_EDGEADR, MutAnyOrigin],
+    mesh_edges: TileTensor[DTYPE, L_MESH_EDGES, MutAnyOrigin],
     vert_adr: Int,
     num_verts: Int,
     warm: Int,
@@ -765,9 +759,9 @@ def hillclimb_support_index[
 @always_inline
 def _support_mesh[
     DTYPE: DType,
-    L_MESH_VERTS: Layout,
-    L_MESH_VERT_EDGEADR: Layout,
-    L_MESH_EDGES: Layout,
+    L_MESH_VERTS: TensorLayout,
+    L_MESH_VERT_EDGEADR: TensorLayout,
+    L_MESH_EDGES: TensorLayout,
 ](
     dir_x: Scalar[DTYPE],
     dir_y: Scalar[DTYPE],
@@ -779,15 +773,9 @@ def _support_mesh[
     qy: Scalar[DTYPE],
     qz: Scalar[DTYPE],
     qw: Scalar[DTYPE],
-    mesh_verts: LayoutTensor[
-        DTYPE, L_MESH_VERTS, MutAnyOrigin
-    ],
-    mesh_vert_edgeadr: LayoutTensor[
-        DTYPE, L_MESH_VERT_EDGEADR, MutAnyOrigin
-    ],
-    mesh_edges: LayoutTensor[
-        DTYPE, L_MESH_EDGES, MutAnyOrigin
-    ],
+    mesh_verts: TileTensor[DTYPE, L_MESH_VERTS, MutAnyOrigin],
+    mesh_vert_edgeadr: TileTensor[DTYPE, L_MESH_VERT_EDGEADR, MutAnyOrigin],
+    mesh_edges: TileTensor[DTYPE, L_MESH_EDGES, MutAnyOrigin],
     vert_adr: Int,
     num_verts: Int,
     mut warm: Int,
@@ -931,9 +919,9 @@ def _support_mesh[
 @always_inline
 def _support[
     DTYPE: DType,
-    L_MESH_VERTS: Layout,
-    L_MESH_VERT_EDGEADR: Layout,
-    L_MESH_EDGES: Layout,
+    L_MESH_VERTS: TensorLayout,
+    L_MESH_VERT_EDGEADR: TensorLayout,
+    L_MESH_EDGES: TensorLayout,
     # ⚠⚠ THE PRISM'S LENGTH IS A PARAMETER SO IT COSTS NOTHING WHEN UNUSED.
     # It was a plain `Array[..., 18]` with a DEFAULT value, and a
     # defaulted aggregate materialises a fresh temporary at EVERY call site
@@ -957,15 +945,9 @@ def _support[
     half_x: Scalar[DTYPE],
     half_y: Scalar[DTYPE],
     half_z: Scalar[DTYPE],
-    mesh_verts: LayoutTensor[
-        DTYPE, L_MESH_VERTS, MutAnyOrigin
-    ],
-    mesh_vert_edgeadr: LayoutTensor[
-        DTYPE, L_MESH_VERT_EDGEADR, MutAnyOrigin
-    ],
-    mesh_edges: LayoutTensor[
-        DTYPE, L_MESH_EDGES, MutAnyOrigin
-    ],
+    mesh_verts: TileTensor[DTYPE, L_MESH_VERTS, MutAnyOrigin],
+    mesh_vert_edgeadr: TileTensor[DTYPE, L_MESH_VERT_EDGEADR, MutAnyOrigin],
+    mesh_edges: TileTensor[DTYPE, L_MESH_EDGES, MutAnyOrigin],
     vert_adr: Int,
     mesh_num_verts: Int,
     dir_x: Scalar[DTYPE],
@@ -1129,9 +1111,9 @@ def _support[
 @always_inline
 def _minkowski_support[
     DTYPE: DType,
-    L_MESH_VERTS: Layout,
-    L_MESH_VERT_EDGEADR: Layout,
-    L_MESH_EDGES: Layout,
+    L_MESH_VERTS: TensorLayout,
+    L_MESH_VERT_EDGEADR: TensorLayout,
+    L_MESH_EDGES: TensorLayout,
     NPRISM: Int = 1,
 ](
     type1: Int,
@@ -1147,15 +1129,9 @@ def _minkowski_support[
     hx1: Scalar[DTYPE],
     hy1: Scalar[DTYPE],
     hz1: Scalar[DTYPE],
-    mesh_verts: LayoutTensor[
-        DTYPE, L_MESH_VERTS, MutAnyOrigin
-    ],
-    mesh_vert_edgeadr: LayoutTensor[
-        DTYPE, L_MESH_VERT_EDGEADR, MutAnyOrigin
-    ],
-    mesh_edges: LayoutTensor[
-        DTYPE, L_MESH_EDGES, MutAnyOrigin
-    ],
+    mesh_verts: TileTensor[DTYPE, L_MESH_VERTS, MutAnyOrigin],
+    mesh_vert_edgeadr: TileTensor[DTYPE, L_MESH_VERT_EDGEADR, MutAnyOrigin],
+    mesh_edges: TileTensor[DTYPE, L_MESH_EDGES, MutAnyOrigin],
     va1: Int,
     mnv1: Int,
     type2: Int,
@@ -1300,13 +1276,13 @@ def _minkowski_support[
 
 def _gjk_intersect[
     DTYPE: DType,
-    L_MESH_VERTS: Layout,
-    L_MESH_VERT_EDGEADR: Layout,
-    L_MESH_EDGES: Layout,
-    L_WS: Layout,
+    L_MESH_VERTS: TensorLayout,
+    L_MESH_VERT_EDGEADR: TensorLayout,
+    L_MESH_EDGES: TensorLayout,
+    L_WS: TensorLayout,
     NPRISM: Int = 1,
 ](
-    ws: LayoutTensor[DTYPE, L_WS, MutAnyOrigin],
+    ws: TileTensor[DTYPE, L_WS, MutAnyOrigin],
     wrow: Int,
     base: Int,
     type1: Int,
@@ -1315,15 +1291,9 @@ def _gjk_intersect[
     q1w: Scalar[DTYPE],
     r1: Scalar[DTYPE], hl1: Scalar[DTYPE],
     hx1: Scalar[DTYPE], hy1: Scalar[DTYPE], hz1: Scalar[DTYPE],
-    mesh_verts: LayoutTensor[
-        DTYPE, L_MESH_VERTS, MutAnyOrigin
-    ],
-    mesh_vert_edgeadr: LayoutTensor[
-        DTYPE, L_MESH_VERT_EDGEADR, MutAnyOrigin
-    ],
-    mesh_edges: LayoutTensor[
-        DTYPE, L_MESH_EDGES, MutAnyOrigin
-    ],
+    mesh_verts: TileTensor[DTYPE, L_MESH_VERTS, MutAnyOrigin],
+    mesh_vert_edgeadr: TileTensor[DTYPE, L_MESH_VERT_EDGEADR, MutAnyOrigin],
+    mesh_edges: TileTensor[DTYPE, L_MESH_EDGES, MutAnyOrigin],
     va1: Int, mnv1: Int,
     type2: Int,
     p2x: Scalar[DTYPE], p2y: Scalar[DTYPE], p2z: Scalar[DTYPE],
@@ -1550,10 +1520,10 @@ def _gjk_intersect[
 
 def gjk_epa_witness[
     DTYPE: DType,
-    L_MESH_VERTS: Layout,
-    L_MESH_VERT_EDGEADR: Layout,
-    L_MESH_EDGES: Layout,
-    L_WS: Layout,
+    L_MESH_VERTS: TensorLayout,
+    L_MESH_VERT_EDGEADR: TensorLayout,
+    L_MESH_EDGES: TensorLayout,
+    L_WS: TensorLayout,
     NPRISM: Int = 1,
 ](
     type1: Int,
@@ -1569,15 +1539,9 @@ def gjk_epa_witness[
     hx1: Scalar[DTYPE],
     hy1: Scalar[DTYPE],
     hz1: Scalar[DTYPE],
-    mesh_verts: LayoutTensor[
-        DTYPE, L_MESH_VERTS, MutAnyOrigin
-    ],
-    mesh_vert_edgeadr: LayoutTensor[
-        DTYPE, L_MESH_VERT_EDGEADR, MutAnyOrigin
-    ],
-    mesh_edges: LayoutTensor[
-        DTYPE, L_MESH_EDGES, MutAnyOrigin
-    ],
+    mesh_verts: TileTensor[DTYPE, L_MESH_VERTS, MutAnyOrigin],
+    mesh_vert_edgeadr: TileTensor[DTYPE, L_MESH_VERT_EDGEADR, MutAnyOrigin],
+    mesh_edges: TileTensor[DTYPE, L_MESH_EDGES, MutAnyOrigin],
     va1: Int,
     mnv1: Int,
     type2: Int,
@@ -1604,7 +1568,7 @@ def gjk_epa_witness[
     # caller's scratch row and is written unconditionally; nothing in it is
     # read across calls, so no caller has to clear it. One row per ENV is what
     # keeps it thread-local in the collision kernels. See `ccd_workspace`.
-    ws: LayoutTensor[DTYPE, L_WS, MutAnyOrigin],
+    ws: TileTensor[DTYPE, L_WS, MutAnyOrigin],
     wrow: Int,
     ccd_tol: Scalar[DTYPE] = Scalar[DTYPE](MJ_CCD_TOLERANCE),
     ccd_iter: Int = MJ_CCD_ITERATIONS,
@@ -1732,10 +1696,10 @@ def gjk_epa_witness[
 
 def _gjk_epa_witness_run[
     DTYPE: DType,
-    L_MESH_VERTS: Layout,
-    L_MESH_VERT_EDGEADR: Layout,
-    L_MESH_EDGES: Layout,
-    L_WS: Layout,
+    L_MESH_VERTS: TensorLayout,
+    L_MESH_VERT_EDGEADR: TensorLayout,
+    L_MESH_EDGES: TensorLayout,
+    L_WS: TensorLayout,
     NPRISM: Int = 1,
 ](
     type1: Int,
@@ -1751,15 +1715,9 @@ def _gjk_epa_witness_run[
     hx1: Scalar[DTYPE],
     hy1: Scalar[DTYPE],
     hz1: Scalar[DTYPE],
-    mesh_verts: LayoutTensor[
-        DTYPE, L_MESH_VERTS, MutAnyOrigin
-    ],
-    mesh_vert_edgeadr: LayoutTensor[
-        DTYPE, L_MESH_VERT_EDGEADR, MutAnyOrigin
-    ],
-    mesh_edges: LayoutTensor[
-        DTYPE, L_MESH_EDGES, MutAnyOrigin
-    ],
+    mesh_verts: TileTensor[DTYPE, L_MESH_VERTS, MutAnyOrigin],
+    mesh_vert_edgeadr: TileTensor[DTYPE, L_MESH_VERT_EDGEADR, MutAnyOrigin],
+    mesh_edges: TileTensor[DTYPE, L_MESH_EDGES, MutAnyOrigin],
     va1: Int,
     mnv1: Int,
     type2: Int,
@@ -1786,7 +1744,7 @@ def _gjk_epa_witness_run[
     # caller's scratch row and is written unconditionally; nothing in it is
     # read across calls, so no caller has to clear it. One row per ENV is what
     # keeps it thread-local in the collision kernels. See `ccd_workspace`.
-    ws: LayoutTensor[DTYPE, L_WS, MutAnyOrigin],
+    ws: TileTensor[DTYPE, L_WS, MutAnyOrigin],
     wrow: Int,
     mut warm1: Int,
     mut warm2: Int,
@@ -3150,10 +3108,10 @@ def _gjk_epa_witness_run[
 @always_inline
 def gjk_epa[
     DTYPE: DType,
-    L_MESH_VERTS: Layout,
-    L_MESH_VERT_EDGEADR: Layout,
-    L_MESH_EDGES: Layout,
-    L_WS: Layout,
+    L_MESH_VERTS: TensorLayout,
+    L_MESH_VERT_EDGEADR: TensorLayout,
+    L_MESH_EDGES: TensorLayout,
+    L_WS: TensorLayout,
     NPRISM: Int = 1,
 ](
     type1: Int,
@@ -3162,15 +3120,9 @@ def gjk_epa[
     q1w: Scalar[DTYPE],
     r1: Scalar[DTYPE], hl1: Scalar[DTYPE],
     hx1: Scalar[DTYPE], hy1: Scalar[DTYPE], hz1: Scalar[DTYPE],
-    mesh_verts: LayoutTensor[
-        DTYPE, L_MESH_VERTS, MutAnyOrigin
-    ],
-    mesh_vert_edgeadr: LayoutTensor[
-        DTYPE, L_MESH_VERT_EDGEADR, MutAnyOrigin
-    ],
-    mesh_edges: LayoutTensor[
-        DTYPE, L_MESH_EDGES, MutAnyOrigin
-    ],
+    mesh_verts: TileTensor[DTYPE, L_MESH_VERTS, MutAnyOrigin],
+    mesh_vert_edgeadr: TileTensor[DTYPE, L_MESH_VERT_EDGEADR, MutAnyOrigin],
+    mesh_edges: TileTensor[DTYPE, L_MESH_EDGES, MutAnyOrigin],
     va1: Int, mnv1: Int,
     type2: Int,
     p2x: Scalar[DTYPE], p2y: Scalar[DTYPE], p2z: Scalar[DTYPE],
@@ -3179,7 +3131,7 @@ def gjk_epa[
     r2: Scalar[DTYPE], hl2: Scalar[DTYPE],
     hx2: Scalar[DTYPE], hy2: Scalar[DTYPE], hz2: Scalar[DTYPE],
     va2: Int, mnv2: Int,
-    ws: LayoutTensor[DTYPE, L_WS, MutAnyOrigin],
+    ws: TileTensor[DTYPE, L_WS, MutAnyOrigin],
     wrow: Int,
     ccd_tol: Scalar[DTYPE] = Scalar[DTYPE](MJ_CCD_TOLERANCE),
     ccd_iter: Int = MJ_CCD_ITERATIONS,

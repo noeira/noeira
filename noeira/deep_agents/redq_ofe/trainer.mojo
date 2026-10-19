@@ -37,7 +37,6 @@ from noeira.nn.core.param import walk_params, ParamVisitorRef
 from std.math import exp as fexp, log as flog, tanh as ftanh
 from std.random import random_float64
 from std.random.philox import Random as PhiloxRandom
-from layout import Layout, LayoutTensor
 
 from max.gpu import global_idx
 from max.gpu.host import DeviceContext, DeviceBuffer
@@ -81,6 +80,7 @@ from .ensemble_target_y_block_ofe import EnsembleTargetYBlockOFE
 from .ensemble_critic_step_ofe import EnsembleCriticStepOFE
 from .ensemble_actor_step_ofe import EnsembleActorStepOFE
 from .metrics import REDQOFEMetrics
+from noeira.core.tiles import Tile
 
 
 # ──────────────────────────────────────────────────────────────────────
@@ -499,18 +499,10 @@ struct REDQOFETrainer[
         N_ENVS: Int
     ](
         mut self,
-        obs: LayoutTensor[
-            DT, Layout.row_major(N_ENVS, Self.AGENT_OBS_DIM), MutAnyOrigin
-        ],
-        action: LayoutTensor[
-            DT, Layout.row_major(N_ENVS, Self.AGENT_ACT_DIM), MutAnyOrigin
-        ],
-        ao_scratch: LayoutTensor[
-            DT, Layout.row_major(N_ENVS, 2 * Self.AGENT_ACT_DIM), MutAnyOrigin
-        ],
-        alp_scratch: LayoutTensor[
-            DT, Layout.row_major(N_ENVS, Self.AGENT_ACT_DIM + 1), MutAnyOrigin
-        ],
+        obs: Tile[DT, N_ENVS, Self.AGENT_OBS_DIM],
+        action: Tile[DT, N_ENVS, Self.AGENT_ACT_DIM],
+        ao_scratch: Tile[DT, N_ENVS, 2 * Self.AGENT_ACT_DIM],
+        alp_scratch: Tile[DT, N_ENVS, Self.AGENT_ACT_DIM + 1],
         step_idx: Int,
     ) raises:
         comptime assert N_ENVS > 0, "N_ENVS must be > 0"

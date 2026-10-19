@@ -37,12 +37,12 @@ host buffer; `read_obs` gathers a single obs row device→host.
 from max.gpu import block_dim, block_idx, thread_idx
 from max.gpu.host import DeviceContext, DeviceBuffer
 from std.memory import alloc, dealloc
-from layout import Layout, LayoutTensor
 
 from noeira.nn.constants import DT, TPB
 from noeira.core.sum_tree import SumTree
 from noeira.data.quantize import _obs_quant, _obs_dequant
 from .nstep_targets import compute_nstep_value_targets
+from noeira.core.tiles import Tile, tile
 
 
 def _a(n: Int) -> Pointer[Scalar[DT], MutAnyOrigin]:
@@ -59,8 +59,8 @@ def _a(n: Int) -> Pointer[Scalar[DT], MutAnyOrigin]:
 def _mz_obs_store_batch_kernel[
     N_ENVS: Int, OBS: Int, CAP: Int, SDT: DType,
 ](
-    src_obs: LayoutTensor[DT, Layout.row_major(N_ENVS, OBS), MutAnyOrigin],
-    buf_s: LayoutTensor[SDT, Layout.row_major(CAP, OBS), MutAnyOrigin],
+    src_obs: Tile[DT, N_ENVS, OBS],
+    buf_s: Tile[SDT, CAP, OBS],
     start_pos: Int32,
 ):
     """Store ``N_ENVS`` obs rows into the device ring at lockstep slots
@@ -79,9 +79,9 @@ def _mz_obs_store_batch_kernel[
 def _mz_obs_gather_kernel[
     B: Int, OBS: Int, CAP: Int, SDT: DType,
 ](
-    slots: LayoutTensor[DType.int32, Layout.row_major(B), MutAnyOrigin],
-    buf_s: LayoutTensor[SDT, Layout.row_major(CAP, OBS), MutAnyOrigin],
-    out_obs: LayoutTensor[DT, Layout.row_major(B, OBS), MutAnyOrigin],
+    slots: Tile[DType.int32, B],
+    buf_s: Tile[SDT, CAP, OBS],
+    out_obs: Tile[DT, B, OBS],
 ):
     """Gather ``B`` obs rows from the ring at the caller-supplied ``slots`` into
     ``out_obs[B, OBS]``, dequantizing ``SDT → DT``. Thread ``t`` → window
@@ -260,12 +260,8 @@ struct GPUMCTSSequenceReplay[
         # allocation is not owned by Mojo's origin system (cf. `enqueue_copy`
         # into immutable `DeviceBuffer` params elsewhere), so the cast is sound
         # — this view is read-only here regardless.
-        var src_t = LayoutTensor[
-            DT, Layout.row_major(Self.N_ENVS, Self.OBS), MutAnyOrigin
-        ](src_obs.unsafe_ptr().as_unsafe_any_origin().unsafe_mut_cast[True]())
-        var buf_t = LayoutTensor[
-            Self.SDT, Layout.row_major(Self.CAP, Self.OBS), MutAnyOrigin
-        ](self.obs_dev.unsafe_ptr().as_unsafe_any_origin())
+        var src_t = tile[Self.N_ENVS, Self.OBS](src_obs.unsafe_ptr().as_unsafe_any_origin().unsafe_mut_cast[True]())
+        var buf_t = tile[Self.CAP, Self.OBS](self.obs_dev.unsafe_ptr().as_unsafe_any_origin())
         comptime nb = (Self.N_ENVS * Self.OBS + TPB - 1) // TPB
         self.ctx.enqueue_function[
             _mz_obs_store_batch_kernel[Self.N_ENVS, Self.OBS, Self.CAP, Self.SDT]
@@ -438,15 +434,9 @@ struct GPUMCTSSequenceReplay[
 
         # ── gather obs0 device→device into the caller's buffer ──
         self.ctx.enqueue_copy(self.d_slots.value(), self.h_slots.unsafe_ptr())
-        var slots_t = LayoutTensor[
-            DType.int32, Layout.row_major(B), MutAnyOrigin
-        ](self.d_slots.value().unsafe_ptr().as_unsafe_any_origin())
-        var buf_t = LayoutTensor[
-            Self.SDT, Layout.row_major(Self.CAP, Self.OBS), MutAnyOrigin
-        ](self.obs_dev.unsafe_ptr().as_unsafe_any_origin())
-        var out_t = LayoutTensor[
-            DT, Layout.row_major(B, Self.OBS), MutAnyOrigin
-        ](d_obs0.unsafe_ptr().as_unsafe_any_origin())
+        var slots_t = tile[B](self.d_slots.value().unsafe_ptr().as_unsafe_any_origin())
+        var buf_t = tile[Self.CAP, Self.OBS](self.obs_dev.unsafe_ptr().as_unsafe_any_origin())
+        var out_t = tile[B, Self.OBS](d_obs0.unsafe_ptr().as_unsafe_any_origin())
         comptime nb = (B * Self.OBS + TPB - 1) // TPB
         self.ctx.enqueue_function[
             _mz_obs_gather_kernel[B, Self.OBS, Self.CAP, Self.SDT]
@@ -585,15 +575,9 @@ struct GPUMCTSSequenceReplay[
 
         # ── gather obs0 device→device into the caller's buffer ──
         self.ctx.enqueue_copy(self.d_slots.value(), self.h_slots.unsafe_ptr())
-        var slots_t = LayoutTensor[
-            DType.int32, Layout.row_major(B), MutAnyOrigin
-        ](self.d_slots.value().unsafe_ptr().as_unsafe_any_origin())
-        var buf_t = LayoutTensor[
-            Self.SDT, Layout.row_major(Self.CAP, Self.OBS), MutAnyOrigin
-        ](self.obs_dev.unsafe_ptr().as_unsafe_any_origin())
-        var out_t = LayoutTensor[
-            DT, Layout.row_major(B, Self.OBS), MutAnyOrigin
-        ](d_obs0.unsafe_ptr().as_unsafe_any_origin())
+        var slots_t = tile[B](self.d_slots.value().unsafe_ptr().as_unsafe_any_origin())
+        var buf_t = tile[Self.CAP, Self.OBS](self.obs_dev.unsafe_ptr().as_unsafe_any_origin())
+        var out_t = tile[B, Self.OBS](d_obs0.unsafe_ptr().as_unsafe_any_origin())
         comptime nb = (B * Self.OBS + TPB - 1) // TPB
         self.ctx.enqueue_function[
             _mz_obs_gather_kernel[B, Self.OBS, Self.CAP, Self.SDT]
@@ -649,15 +633,9 @@ struct GPUMCTSSequenceReplay[
             offs.append(p[1])
             self.h_rslots[r] = Int32(self._slot(self.ep_start[p[0]], p[1]))
         self.ctx.enqueue_copy(self.d_rslots.value(), self.h_rslots.unsafe_ptr())
-        var slots_t = LayoutTensor[
-            DType.int32, Layout.row_major(R), MutAnyOrigin
-        ](self.d_rslots.value().unsafe_ptr().as_unsafe_any_origin())
-        var buf_t = LayoutTensor[
-            Self.SDT, Layout.row_major(Self.CAP, Self.OBS), MutAnyOrigin
-        ](self.obs_dev.unsafe_ptr().as_unsafe_any_origin())
-        var out_t = LayoutTensor[
-            DT, Layout.row_major(R, Self.OBS), MutAnyOrigin
-        ](out_obs.unsafe_ptr().as_unsafe_any_origin())
+        var slots_t = tile[R](self.d_rslots.value().unsafe_ptr().as_unsafe_any_origin())
+        var buf_t = tile[Self.CAP, Self.OBS](self.obs_dev.unsafe_ptr().as_unsafe_any_origin())
+        var out_t = tile[R, Self.OBS](out_obs.unsafe_ptr().as_unsafe_any_origin())
         comptime nb = (R * Self.OBS + TPB - 1) // TPB
         self.ctx.enqueue_function[
             _mz_obs_gather_kernel[R, Self.OBS, Self.CAP, Self.SDT]
@@ -685,15 +663,9 @@ struct GPUMCTSSequenceReplay[
         try:
             hs[unsafe_offset=0] = Int32(slot)
             self.ctx.enqueue_copy(d_one, hs)
-            var slots_t = LayoutTensor[
-                DType.int32, Layout.row_major(1), MutAnyOrigin
-            ](d_one.unsafe_ptr().as_unsafe_any_origin())
-            var buf_t = LayoutTensor[
-                Self.SDT, Layout.row_major(Self.CAP, Self.OBS), MutAnyOrigin
-            ](self.obs_dev.unsafe_ptr().as_unsafe_any_origin())
-            var out_t = LayoutTensor[
-                DT, Layout.row_major(1, Self.OBS), MutAnyOrigin
-            ](d_out.unsafe_ptr().as_unsafe_any_origin())
+            var slots_t = tile[1](d_one.unsafe_ptr().as_unsafe_any_origin())
+            var buf_t = tile[Self.CAP, Self.OBS](self.obs_dev.unsafe_ptr().as_unsafe_any_origin())
+            var out_t = tile[1, Self.OBS](d_out.unsafe_ptr().as_unsafe_any_origin())
             comptime nb = (Self.OBS + TPB - 1) // TPB
             self.ctx.enqueue_function[
                 _mz_obs_gather_kernel[1, Self.OBS, Self.CAP, Self.SDT]

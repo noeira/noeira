@@ -15,7 +15,8 @@ helper rather than re-rolling.
 
 from max.gpu import global_idx
 from max.gpu.host import DeviceContext
-from layout import Layout, LayoutTensor, TileTensor, row_major
+from layout import TileTensor, row_major
+from noeira.core.tiles import Tile
 
 from noeira.nn.constants import DT, TPB
 
@@ -23,7 +24,7 @@ from noeira.nn.constants import DT, TPB
 def seed_inv_batch_kernel[
     N: Int
 ](
-    grad_out: LayoutTensor[DT, Layout.row_major(N, 1), MutAnyOrigin],
+    grad_out: Tile[DT, N, 1],
     value: Scalar[DT],
 ):
     var idx = Int(global_idx.x)
@@ -35,7 +36,7 @@ def seed_grad_inv_batch[
     target: StaticString,
     BATCH: Int,
 ](
-    grad_out: LayoutTensor[DT, Layout.row_major(BATCH, 1), MutAnyOrigin],
+    grad_out: Tile[DT, BATCH, 1],
     ctx: Optional[DeviceContext] = None,
 ) raises:
     """Fill `grad_out_ptr[0:BATCH]` with `1/BATCH`.

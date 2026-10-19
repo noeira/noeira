@@ -23,7 +23,6 @@ module; MuZero's representation/dynamics adapters land in Phase B.
 
 from max.gpu import global_idx
 from max.gpu.host import DeviceContext, DeviceBuffer
-from layout import Layout, LayoutTensor
 
 from noeira.nn.constants import DT, TPB
 from noeira.nn.core.module import Module
@@ -32,11 +31,12 @@ from noeira.nn.core.tensor_refs import TensorRefs
 from noeira.nn.core.call import call_forward
 from noeira.core.env_traits import GPUTwoPlayerDiscreteEnv
 from noeira.planners.tree_search import PredictionGPU, EnvStepGPU
+from noeira.core.tiles import Tile
 
 
 def _copy2d_kernel[B: Int, D: Int](
-    src: LayoutTensor[DT, Layout.row_major(B, D), MutAnyOrigin],
-    dst: LayoutTensor[DT, Layout.row_major(B, D), MutAnyOrigin],
+    src: Tile[DT, B, D],
+    dst: Tile[DT, B, D],
 ):
     """Element copy between two device LayoutTensors (the planner-owned buffer
     and an owned scratch). Both are real allocations, so a 2-operand copy kernel
@@ -88,12 +88,8 @@ struct AZPredGPU[OBS: Int, ACT: Int, NET: Module, o: Origin[mut=True]](
     ](
         mut self,
         ctx: DeviceContext,
-        hidden: LayoutTensor[
-            DT, Layout.row_major(B, Self.LATENT_DIM), MutAnyOrigin
-        ],
-        mut pred_out: LayoutTensor[
-            DT, Layout.row_major(B, Self.PRED_OUT_DIM), MutAnyOrigin
-        ],
+        hidden: Tile[DT, B, Self.LATENT_DIM],
+        pred_out: Tile[DT, B, Self.PRED_OUT_DIM],
     ) raises:
         comptime LD = Self.LATENT_DIM
         comptime PD = Self.PRED_OUT_DIM
@@ -101,7 +97,7 @@ struct AZPredGPU[OBS: Int, ACT: Int, NET: Module, o: Origin[mut=True]](
         self.sc_out.ensure_gpu(ctx, B * PD)
         # Stage the planner's hidden buffer into the owned input scratch
         # (LayoutTensor-space copy — no raw pointer).
-        var sin = self.sc_in.lt["gpu", Layout.row_major(B, LD)]()
+        var sin = self.sc_in.tt["gpu", B, LD]()
         ctx.enqueue_function[_copy2d_kernel[B, LD]](
             hidden, sin, grid_dim=(B * LD + TPB - 1) // TPB, block_dim=TPB
         )
@@ -110,7 +106,7 @@ struct AZPredGPU[OBS: Int, ACT: Int, NET: Module, o: Origin[mut=True]](
             self.net[], TensorRefs[Self.NET.ARITY](self.sc_in), self.sc_out, Optional(ctx)
         )
         # Write the owned output scratch back to the planner's pred_out buffer.
-        var sout = self.sc_out.lt["gpu", Layout.row_major(B, PD)]()
+        var sout = self.sc_out.tt["gpu", B, PD]()
         ctx.enqueue_function[_copy2d_kernel[B, PD]](
             sout, pred_out, grid_dim=(B * PD + TPB - 1) // TPB, block_dim=TPB
         )

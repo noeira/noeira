@@ -23,7 +23,6 @@ Honest `int32` record tensors are a later cleanup.
 """
 
 from max.gpu.host import DeviceContext
-from layout import Layout
 
 from noeira.nn.core.tensor import TensorImpl
 
@@ -70,6 +69,7 @@ from ..gpu.constants import (
     MJ_LS_ITERATIONS,
     MJ_LS_TOLERANCE,
 )
+from noeira.core.tiles import RowMajor
 
 @always_inline
 def _at_least_one(n: Int) -> Int:
@@ -111,49 +111,45 @@ struct Model[
 
 
     # Record view layouts ([N_ENTITY, RECORD_SIZE] row-major; tails 1-D).
-    comptime L_BODY = Layout.row_major(Self.NBODY, MODEL_BODY_SIZE)
-    comptime L_JOINT = Layout.row_major(Self.NJOINT, MODEL_JOINT_SIZE)
-    comptime L_META = Layout.row_major(MODEL_META_SIZE)
-    comptime L_CURRICULUM = Layout.row_major(MODEL_CURRICULUM_SIZE)
-    comptime L_GEOM = Layout.row_major(Self.NGEOM, MODEL_GEOM_SIZE)
-    comptime L_EQ = Layout.row_major(Self.NEQUALITY, MODEL_EQ_SIZE)
-    comptime L_TENDON = Layout.row_major(Self.NTENDON, MODEL_TENDON_SIZE)
-    comptime L_SITE = Layout.row_major(Self.NSITE, MODEL_SITE_SIZE)
-    comptime L_BODY_INVW = Layout.row_major(Self.NBODY, 2)
-    comptime L_DOF_INVW = Layout.row_major(Self.NV)
+    comptime L_BODY = RowMajor[Self.NBODY, MODEL_BODY_SIZE]
+    comptime L_JOINT = RowMajor[Self.NJOINT, MODEL_JOINT_SIZE]
+    comptime L_META = RowMajor[MODEL_META_SIZE]
+    comptime L_CURRICULUM = RowMajor[MODEL_CURRICULUM_SIZE]
+    comptime L_GEOM = RowMajor[Self.NGEOM, MODEL_GEOM_SIZE]
+    comptime L_EQ = RowMajor[Self.NEQUALITY, MODEL_EQ_SIZE]
+    comptime L_TENDON = RowMajor[Self.NTENDON, MODEL_TENDON_SIZE]
+    comptime L_SITE = RowMajor[Self.NSITE, MODEL_SITE_SIZE]
+    comptime L_BODY_INVW = RowMajor[Self.NBODY, 2]
+    comptime L_DOF_INVW = RowMajor[Self.NV]
     # ⚠ `[NV, 3]` IS EXACT, NOT A CAP. A model cannot have more trees than
     # dofs, so this is a comptime bound that needs no `CAP_*` parameter — which
     # matters because `fields/dims.mojo` treats caps as load-bearing (a cap
     # answers "can I stack-allocate", not "does this exist"). The live row
     # count is `meta[MODEL_META_IDX_NTREE]`.
-    comptime L_TREE = Layout.row_major(Self.NV, MODEL_TREE_SIZE)
-    comptime L_EXCLUDE = Layout.row_major(Self.NEXCLUDE, 2)
-    comptime L_PAIR = Layout.row_major(Self.NPAIR, MODEL_PAIR_SIZE)
-    comptime L_MESH_META = Layout.row_major(MAX_GPU_MESHES, MODEL_MESH_META_SIZE)
+    comptime L_TREE = RowMajor[Self.NV, MODEL_TREE_SIZE]
+    comptime L_EXCLUDE = RowMajor[Self.NEXCLUDE, 2]
+    comptime L_PAIR = RowMajor[Self.NPAIR, MODEL_PAIR_SIZE]
+    comptime L_MESH_META = RowMajor[MAX_GPU_MESHES, MODEL_MESH_META_SIZE]
     # ⚠ FLAT, NOT `[N, SIZE]`. Every consumer of these two indexes them as
     # `base + FIELD`, and a 2-D `LayoutTensor` given ONE index returns a ROW,
     # not an element — the mismatch that cost a debugging session on
     # `hfield_data` in `feb1b6c7`. Spelling the layout flat makes the wrong
     # access a compile error instead of a silent row read.
-    comptime L_CAM = Layout.row_major(MAX_GPU_CAMERAS * MODEL_CAM_SIZE)
-    comptime L_GEOM_RGBA = Layout.row_major(
-        Self.NGEOM * MODEL_GEOM_RGBA_SIZE
-    )
-    comptime L_MESH_VERT = Layout.row_major(Self.NMESH_VERTS, 3)
+    comptime L_CAM = RowMajor[MAX_GPU_CAMERAS * MODEL_CAM_SIZE]
+    comptime L_GEOM_RGBA = RowMajor[Self.NGEOM * MODEL_GEOM_RGBA_SIZE]
+    comptime L_MESH_VERT = RowMajor[Self.NMESH_VERTS, 3]
     # Mesh POLYGON topology for the native multi-contact path. The capacities
     # are Euler's formula on NMESH_VERTS, so they need no type parameter of
     # their own — see `mesh_max_poly` / `mesh_max_polyvert`.
     comptime NMESH_POLY = mesh_max_poly(Self.NMESH_VERTS)
     comptime NMESH_POLYVERT = mesh_max_polyvert(Self.NMESH_VERTS)
-    comptime L_MESH_POLY = Layout.row_major(
-        Self.NMESH_POLY, MODEL_MESH_POLY_SIZE
-    )
-    comptime L_MESH_POLYVERT = Layout.row_major(Self.NMESH_POLYVERT)
-    comptime L_MESH_POLYMAP = Layout.row_major(Self.NMESH_POLYVERT)
-    comptime L_MESH_VERT_POLYMAP = Layout.row_major(Self.NMESH_VERTS, 2)
+    comptime L_MESH_POLY = RowMajor[Self.NMESH_POLY, MODEL_MESH_POLY_SIZE]
+    comptime L_MESH_POLYVERT = RowMajor[Self.NMESH_POLYVERT]
+    comptime L_MESH_POLYMAP = RowMajor[Self.NMESH_POLYVERT]
+    comptime L_MESH_VERT_POLYMAP = RowMajor[Self.NMESH_VERTS, 2]
     comptime NMESH_EDGE = mesh_max_edge(Self.NMESH_VERTS)
-    comptime L_MESH_VERT_EDGEADR = Layout.row_major(Self.NMESH_VERTS)
-    comptime L_MESH_EDGE = Layout.row_major(Self.NMESH_EDGE)
+    comptime L_MESH_VERT_EDGEADR = RowMajor[Self.NMESH_VERTS]
+    comptime L_MESH_EDGE = RowMajor[Self.NMESH_EDGE]
 
     var bodies: TensorImpl[Self.DTYPE]  # [NBODY, MODEL_BODY_SIZE]
     var joints: TensorImpl[Self.DTYPE]  # [NJOINT, MODEL_JOINT_SIZE]

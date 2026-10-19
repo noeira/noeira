@@ -24,7 +24,6 @@ path is byte-for-byte the legacy NoAMP path; the bf16 path is GPU-only.
 
 from max.gpu import global_idx
 from max.gpu.host import DeviceContext
-from layout import Layout, LayoutTensor
 
 from noeira.nn.constants import DT, TPB
 from ..core.tensor import Tensor, TensorImpl
@@ -33,6 +32,7 @@ from ..core.module import Module
 from ..core.param import ParamVisitor
 from ..core.initializer import Initializer
 from ..core.amp import AMPPolicy, NoAMP
+from noeira.core.tiles import RowMajor, Tile
 
 
 # ── GPU kernels (verbatim from legacy; args MutAnyOrigin = GPU ABI) ───────
@@ -41,8 +41,8 @@ from ..core.amp import AMPPolicy, NoAMP
 def _qkv_to_major_fwd_kernel[
     BATCH: Int, SEQ: Int, DIM: Int, ADT: DType = DT
 ](
-    src: LayoutTensor[ADT, Layout.row_major(BATCH, 3 * SEQ * DIM), MutAnyOrigin],
-    dst: LayoutTensor[ADT, Layout.row_major(BATCH, 3 * SEQ * DIM), MutAnyOrigin],
+    src: Tile[ADT, BATCH, 3 * SEQ * DIM],
+    dst: Tile[ADT, BATCH, 3 * SEQ * DIM],
 ):
     var gid = Int(global_idx.x)
     comptime total = BATCH * 3 * SEQ * DIM
@@ -60,8 +60,8 @@ def _qkv_to_major_fwd_kernel[
 def _qkv_to_major_bwd_kernel[
     BATCH: Int, SEQ: Int, DIM: Int, ADT: DType = DT
 ](
-    grad_out: LayoutTensor[ADT, Layout.row_major(BATCH, 3 * SEQ * DIM), MutAnyOrigin],
-    grad_in: LayoutTensor[ADT, Layout.row_major(BATCH, 3 * SEQ * DIM), MutAnyOrigin],
+    grad_out: Tile[ADT, BATCH, 3 * SEQ * DIM],
+    grad_in: Tile[ADT, BATCH, 3 * SEQ * DIM],
 ):
     var gid = Int(global_idx.x)
     comptime total = BATCH * 3 * SEQ * DIM
@@ -136,13 +136,13 @@ struct QKVToMajor[SEQ: Int, DIM: Int, ADT: DType = DT](Module):
             else:
                 var c = ctx.value()
                 outd.ensure_gpu(c, N)
-                comptime lay = Layout.row_major(B, 3 * Self.SEQ * Self.DIM)
+                comptime lay = RowMajor[B, 3 * Self.SEQ * Self.DIM]
                 comptime total = B * 3 * Self.SEQ * Self.DIM
                 comptime n_blocks = (total + TPB - 1) // TPB
                 comptime kernel = _qkv_to_major_fwd_kernel[B, Self.SEQ, Self.DIM]
                 c.enqueue_function[kernel](
-                    in0d.lt["gpu", lay](),
-                    outd.lt["gpu", lay](),
+                    in0d.tt["gpu", B, 3 * Self.SEQ * Self.DIM](),
+                    outd.tt["gpu", B, 3 * Self.SEQ * Self.DIM](),
                     grid_dim=n_blocks,
                     block_dim=TPB,
                 )
@@ -153,15 +153,15 @@ struct QKVToMajor[SEQ: Int, DIM: Int, ADT: DType = DT](Module):
             ), "bf16-flow QKVToMajor is GPU-only"
             var c = ctx.value()
             out.ensure_gpu(c, N)
-            comptime lay = Layout.row_major(B, 3 * Self.SEQ * Self.DIM)
+            comptime lay = RowMajor[B, 3 * Self.SEQ * Self.DIM]
             comptime total = B * 3 * Self.SEQ * Self.DIM
             comptime n_blocks = (total + TPB - 1) // TPB
             comptime kernel = _qkv_to_major_fwd_kernel[
                 B, Self.SEQ, Self.DIM, Self.ADT
             ]
             c.enqueue_function[kernel](
-                in0.lt["gpu", lay](),
-                out.lt["gpu", lay](),
+                in0.tt["gpu", B, 3 * Self.SEQ * Self.DIM](),
+                out.tt["gpu", B, 3 * Self.SEQ * Self.DIM](),
                 grid_dim=n_blocks,
                 block_dim=TPB,
             )
@@ -201,13 +201,13 @@ struct QKVToMajor[SEQ: Int, DIM: Int, ADT: DType = DT](Module):
             else:
                 var c = ctx.value()
                 gind.ensure_gpu(c, N)
-                comptime lay = Layout.row_major(B, 3 * Self.SEQ * Self.DIM)
+                comptime lay = RowMajor[B, 3 * Self.SEQ * Self.DIM]
                 comptime total = B * 3 * Self.SEQ * Self.DIM
                 comptime n_blocks = (total + TPB - 1) // TPB
                 comptime kernel = _qkv_to_major_bwd_kernel[B, Self.SEQ, Self.DIM]
                 c.enqueue_function[kernel](
-                    god.lt["gpu", lay](),
-                    gind.lt["gpu", lay](),
+                    god.tt["gpu", B, 3 * Self.SEQ * Self.DIM](),
+                    gind.tt["gpu", B, 3 * Self.SEQ * Self.DIM](),
                     grid_dim=n_blocks,
                     block_dim=TPB,
                 )
@@ -218,15 +218,15 @@ struct QKVToMajor[SEQ: Int, DIM: Int, ADT: DType = DT](Module):
             ), "bf16-flow QKVToMajor is GPU-only"
             var c = ctx.value()
             gin.ensure_gpu(c, N)
-            comptime lay = Layout.row_major(B, 3 * Self.SEQ * Self.DIM)
+            comptime lay = RowMajor[B, 3 * Self.SEQ * Self.DIM]
             comptime total = B * 3 * Self.SEQ * Self.DIM
             comptime n_blocks = (total + TPB - 1) // TPB
             comptime kernel = _qkv_to_major_bwd_kernel[
                 B, Self.SEQ, Self.DIM, Self.ADT
             ]
             c.enqueue_function[kernel](
-                grad_output.lt["gpu", lay](),
-                gin.lt["gpu", lay](),
+                grad_output.tt["gpu", B, 3 * Self.SEQ * Self.DIM](),
+                gin.tt["gpu", B, 3 * Self.SEQ * Self.DIM](),
                 grid_dim=n_blocks,
                 block_dim=TPB,
             )

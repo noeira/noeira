@@ -33,7 +33,8 @@ launches — so it's correct but slow for long SEQ; keep SEQ modest.
 
 from max.gpu import global_idx
 from max.gpu.host import DeviceContext
-from layout import Layout, LayoutTensor, TileTensor, row_major
+from layout import TileTensor, row_major
+from noeira.core.tiles import Tile, tile
 
 from noeira.nn.constants import DT, TPB
 from ..core.tensor import Tensor
@@ -54,8 +55,8 @@ from .lstm_cell import LSTMCell
 def _bsd_to_sbd_kernel[
     BATCH: Int, SEQ: Int, D: Int
 ](
-    src: LayoutTensor[DT, Layout.row_major(BATCH * SEQ * D), MutAnyOrigin],
-    dst: LayoutTensor[DT, Layout.row_major(BATCH * SEQ * D), MutAnyOrigin],
+    src: Tile[DT, BATCH * SEQ * D],
+    dst: Tile[DT, BATCH * SEQ * D],
 ):
     """`dst[t,b,d] = src[b,t,d]`. src `[BATCH, SEQ·D]`, dst `[SEQ, BATCH, D]`."""
     var idx = Int(global_idx.x)
@@ -72,8 +73,8 @@ def _bsd_to_sbd_kernel[
 def _sbd_to_bsd_kernel[
     BATCH: Int, SEQ: Int, D: Int
 ](
-    src: LayoutTensor[DT, Layout.row_major(BATCH * SEQ * D), MutAnyOrigin],
-    dst: LayoutTensor[DT, Layout.row_major(BATCH * SEQ * D), MutAnyOrigin],
+    src: Tile[DT, BATCH * SEQ * D],
+    dst: Tile[DT, BATCH * SEQ * D],
 ):
     """`dst[b,t,d] = src[t,b,d]`. src `[SEQ, BATCH, D]`, dst `[BATCH, SEQ·D]`."""
     var idx = Int(global_idx.x)
@@ -90,9 +91,9 @@ def _sbd_to_bsd_kernel[
 def _add_kernel[
     N: Int
 ](
-    a: LayoutTensor[DT, Layout.row_major(N), MutAnyOrigin],
-    b: LayoutTensor[DT, Layout.row_major(N), MutAnyOrigin],
-    dst: LayoutTensor[DT, Layout.row_major(N), MutAnyOrigin],
+    a: Tile[DT, N],
+    b: Tile[DT, N],
+    dst: Tile[DT, N],
 ):
     """`dst[i] = a[i] + b[i]`."""
     var i = Int(global_idx.x)
@@ -243,8 +244,8 @@ struct LSTMSeq[VOCAB: Int, HIDDEN: Int, SEQ: Int](Module):
             self.c_buf.dev.value().enqueue_fill(0.0)
             comptime nb = (B * Self.SEQ * V + TPB - 1) // TPB
             c.enqueue_function[_bsd_to_sbd_kernel[B, Self.SEQ, V]](
-                in0.lt["gpu", Layout.row_major(B * Self.SEQ * V)](),
-                self.x_seq.lt["gpu", Layout.row_major(B * Self.SEQ * V)](),
+                in0.tt["gpu", B * Self.SEQ * V](),
+                self.x_seq.tt["gpu", B * Self.SEQ * V](),
                 grid_dim=nb, block_dim=TPB,
             )
             for t in range(Self.SEQ):
@@ -265,10 +266,8 @@ struct LSTMSeq[VOCAB: Int, HIDDEN: Int, SEQ: Int](Module):
                 B * H, B * Self.SEQ * H
             )
             c.enqueue_function[_sbd_to_bsd_kernel[B, Self.SEQ, H]](
-                LayoutTensor[
-                    DT, Layout.row_major(B * Self.SEQ * H), MutAnyOrigin
-                ](hb_sub),
-                out.lt["gpu", Layout.row_major(B * Self.SEQ * H)](),
+                tile[B * Self.SEQ * H](hb_sub),
+                out.tt["gpu", B * Self.SEQ * H](),
                 grid_dim=nbo, block_dim=TPB,
             )
 
@@ -349,8 +348,8 @@ struct LSTMSeq[VOCAB: Int, HIDDEN: Int, SEQ: Int](Module):
             gin.ensure_gpu(c, B * Self.SEQ * V)
             comptime nb = (B * Self.SEQ * H + TPB - 1) // TPB
             c.enqueue_function[_bsd_to_sbd_kernel[B, Self.SEQ, H]](
-                grad_output.lt["gpu", Layout.row_major(B * Self.SEQ * H)](),
-                self.dh_seq.lt["gpu", Layout.row_major(B * Self.SEQ * H)](),
+                grad_output.tt["gpu", B * Self.SEQ * H](),
+                self.dh_seq.tt["gpu", B * Self.SEQ * H](),
                 grid_dim=nb, block_dim=TPB,
             )
             self.dh_recur.dev.value().enqueue_fill(0.0)
@@ -364,11 +363,9 @@ struct LSTMSeq[VOCAB: Int, HIDDEN: Int, SEQ: Int](Module):
                     t * B * H, B * H
                 )
                 c.enqueue_function[_add_kernel[B * H]](
-                    LayoutTensor[DT, Layout.row_major(B * H), MutAnyOrigin](
-                        dhs_sub
-                    ),
-                    self.dh_recur.lt["gpu", Layout.row_major(B * H)](),
-                    self.dh_t.lt["gpu", Layout.row_major(B * H)](),
+                    tile[B * H](dhs_sub),
+                    self.dh_recur.tt["gpu", B * H](),
+                    self.dh_t.tt["gpu", B * H](),
                     grid_dim=nadd, block_dim=TPB,
                 )
                 self.cell.step_backward["gpu", B](
@@ -397,8 +394,8 @@ struct LSTMSeq[VOCAB: Int, HIDDEN: Int, SEQ: Int](Module):
             # transpose dx_seq (SBD) → grad_input (BSD)
             comptime nbv = (B * Self.SEQ * V + TPB - 1) // TPB
             c.enqueue_function[_sbd_to_bsd_kernel[B, Self.SEQ, V]](
-                self.dx_seq.lt["gpu", Layout.row_major(B * Self.SEQ * V)](),
-                gin.lt["gpu", Layout.row_major(B * Self.SEQ * V)](),
+                self.dx_seq.tt["gpu", B * Self.SEQ * V](),
+                gin.tt["gpu", B * Self.SEQ * V](),
                 grid_dim=nbv, block_dim=TPB,
             )
 

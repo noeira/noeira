@@ -17,7 +17,8 @@ died with the fields sunset). Arithmetic verbatim from the slab kernel.
 
 from max.gpu.host import DeviceContext
 from max.gpu import thread_idx, block_idx, block_dim
-from layout import Layout, LayoutTensor
+from layout import TileTensor, TensorLayout
+from noeira.core.tiles import Tile
 
 from .constants import TPB
 from ..fields import DimsLike
@@ -27,26 +28,16 @@ def compute_cvel[
     DTYPE: DType,
     BATCH_SIZE: Int,
     D: DimsLike,
-    L_XPOS: Layout,
-    L_CVEL: Layout,
+    L_XPOS: TensorLayout,
+    L_CVEL: TensorLayout,
 ](
     ctx: DeviceContext,
     dims: D,
-    xpos: LayoutTensor[
-        DTYPE, L_XPOS, MutAnyOrigin
-    ],
-    xvel: LayoutTensor[
-        DTYPE, L_XPOS, MutAnyOrigin
-    ],
-    xangvel: LayoutTensor[
-        DTYPE, L_XPOS, MutAnyOrigin
-    ],
-    xipos: LayoutTensor[
-        DTYPE, L_XPOS, MutAnyOrigin
-    ],
-    cvel: LayoutTensor[
-        DTYPE, L_CVEL, MutAnyOrigin
-    ],
+    xpos: TileTensor[DTYPE, L_XPOS, MutAnyOrigin],
+    xvel: TileTensor[DTYPE, L_XPOS, MutAnyOrigin],
+    xangvel: TileTensor[DTYPE, L_XPOS, MutAnyOrigin],
+    xipos: TileTensor[DTYPE, L_XPOS, MutAnyOrigin],
+    cvel: TileTensor[DTYPE, L_CVEL, MutAnyOrigin],
 ) raises:
     """Compute cvel (body CoM spatial velocities) for all environments on GPU.
 
@@ -63,21 +54,11 @@ def compute_cvel[
     # exactly that as rel = 1.0). Decision 3 keeps this leg
     # comptime, so the caps are the right and only source here.
     def cvel_kernel(
-        xpos: LayoutTensor[
-            DTYPE, Layout.row_major(BATCH_SIZE, D.CAP_NBODY * 3), MutAnyOrigin
-        ],
-        xvel: LayoutTensor[
-            DTYPE, Layout.row_major(BATCH_SIZE, D.CAP_NBODY * 3), MutAnyOrigin
-        ],
-        xangvel: LayoutTensor[
-            DTYPE, Layout.row_major(BATCH_SIZE, D.CAP_NBODY * 3), MutAnyOrigin
-        ],
-        xipos: LayoutTensor[
-            DTYPE, Layout.row_major(BATCH_SIZE, D.CAP_NBODY * 3), MutAnyOrigin
-        ],
-        cvel: LayoutTensor[
-            DTYPE, Layout.row_major(BATCH_SIZE, D.CAP_NBODY * 6), MutAnyOrigin
-        ],
+        xpos: Tile[DTYPE, BATCH_SIZE, D.CAP_NBODY * 3],
+        xvel: Tile[DTYPE, BATCH_SIZE, D.CAP_NBODY * 3],
+        xangvel: Tile[DTYPE, BATCH_SIZE, D.CAP_NBODY * 3],
+        xipos: Tile[DTYPE, BATCH_SIZE, D.CAP_NBODY * 3],
+        cvel: Tile[DTYPE, BATCH_SIZE, D.CAP_NBODY * 6],
     ):
         var env = Int(block_dim.x * block_idx.x + thread_idx.x)
         if env >= BATCH_SIZE:

@@ -24,7 +24,6 @@ this only on GPU.
 from max.gpu import thread_idx
 from max.gpu.primitives import block
 from max.gpu.host import DeviceContext, DeviceBuffer
-from layout import Layout, LayoutTensor
 
 from noeira.nn.constants import DT, TPB_REDUCE
 
@@ -35,6 +34,7 @@ from noeira.nn.constants import DT, TPB_REDUCE
 # block_dim=TPB_REDUCE. Mirrors `_mse_reduce_add_kernel`.
 # ──────────────────────────────────────────────────────────────────────────
 from noeira.nn.core.target_storage import require_ctx
+from noeira.core.tiles import Tile, tile
 
 
 def _mean_reduce_add_kernel[N: Int](
@@ -101,8 +101,8 @@ def _mean_abs_diff_reduce_add_kernel[N: Int](
 
 
 def _mean_reduce_add_kernel_lt[N: Int](
-    data: LayoutTensor[DT, Layout.row_major(N), MutAnyOrigin],
-    acc: LayoutTensor[DT, Layout.row_major(2), MutAnyOrigin],
+    data: Tile[DT, N],
+    acc: Tile[DT, 2],
 ):
     var t = Int(thread_idx.x)
     var my_sum: Scalar[DT] = 0.0
@@ -117,8 +117,8 @@ def _mean_reduce_add_kernel_lt[N: Int](
 
 
 def _mean_abs_reduce_add_kernel_lt[N: Int](
-    data: LayoutTensor[DT, Layout.row_major(N), MutAnyOrigin],
-    acc: LayoutTensor[DT, Layout.row_major(2), MutAnyOrigin],
+    data: Tile[DT, N],
+    acc: Tile[DT, 2],
 ):
     """LayoutTensor twin of `_mean_abs_reduce_add_kernel` (mean of |data[k]|)."""
     var t = Int(thread_idx.x)
@@ -135,9 +135,9 @@ def _mean_abs_reduce_add_kernel_lt[N: Int](
 
 
 def _mean_abs_diff_reduce_add_kernel_lt[N: Int](
-    a: LayoutTensor[DT, Layout.row_major(N), MutAnyOrigin],
-    b: LayoutTensor[DT, Layout.row_major(N), MutAnyOrigin],
-    acc: LayoutTensor[DT, Layout.row_major(2), MutAnyOrigin],
+    a: Tile[DT, N],
+    b: Tile[DT, N],
+    acc: Tile[DT, 2],
 ):
     """LayoutTensor twin of `_mean_abs_diff_reduce_add_kernel` (mean of
     |a[k] − b[k]|) — for the DQN `mean_td_error` diag without `unsafe_ptr`."""
@@ -244,29 +244,25 @@ struct DeviceMeanAccum(Copyable, Movable, Deinitable):
 
     def accumulate_gpu_lt[N: Int](
         mut self,
-        data: LayoutTensor[DT, Layout.row_major(N), MutAnyOrigin],
+        data: Tile[DT, N],
     ) raises:
         """Storage-native `accumulate_gpu`: reduce the `[N]` device view on
         device and fold `(mean, +1)` in. The caller builds `data` via the
         storage tensor's `lt["gpu", Layout.row_major(N)]()` — no `unsafe_ptr`.
         """
         var ctx = self.ctx.value()
-        var acc = LayoutTensor[DT, Layout.row_major(2), MutAnyOrigin](
-            self.acc_dev.value()
-        )
+        var acc = tile[2](self.acc_dev.value())
         ctx.enqueue_function[_mean_reduce_add_kernel_lt[N]](
             data, acc, grid_dim=1, block_dim=TPB_REDUCE
         )
 
     def accumulate_gpu_abs_lt[N: Int](
         mut self,
-        data: LayoutTensor[DT, Layout.row_major(N), MutAnyOrigin],
+        data: Tile[DT, N],
     ) raises:
         """Storage-native `accumulate_gpu_abs` (mean of |data[k]|)."""
         var ctx = self.ctx.value()
-        var acc = LayoutTensor[DT, Layout.row_major(2), MutAnyOrigin](
-            self.acc_dev.value()
-        )
+        var acc = tile[2](self.acc_dev.value())
         ctx.enqueue_function[_mean_abs_reduce_add_kernel_lt[N]](
             data, acc, grid_dim=1, block_dim=TPB_REDUCE
         )
@@ -289,15 +285,13 @@ struct DeviceMeanAccum(Copyable, Movable, Deinitable):
 
     def accumulate_gpu_abs_diff_lt[N: Int](
         mut self,
-        a: LayoutTensor[DT, Layout.row_major(N), MutAnyOrigin],
-        b: LayoutTensor[DT, Layout.row_major(N), MutAnyOrigin],
+        a: Tile[DT, N],
+        b: Tile[DT, N],
     ) raises:
         """Storage-native `accumulate_gpu_abs_diff` (mean of |a[k] − b[k]|) —
         the DQN `mean_td_error` fold built from storage `lt` views."""
         var ctx = self.ctx.value()
-        var acc = LayoutTensor[DT, Layout.row_major(2), MutAnyOrigin](
-            self.acc_dev.value()
-        )
+        var acc = tile[2](self.acc_dev.value())
         ctx.enqueue_function[_mean_abs_diff_reduce_add_kernel_lt[N]](
             a, b, acc, grid_dim=1, block_dim=TPB_REDUCE
         )

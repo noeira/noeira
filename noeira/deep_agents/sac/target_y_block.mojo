@@ -23,7 +23,6 @@ Surface:
 from max.gpu.host import DeviceContext
 from noeira.nn.core.ptr import untracked
 from max.gpu import global_idx
-from layout import Layout, LayoutTensor
 from noeira.nn.constants import DT, TPB
 from noeira.nn.core.amp import AMPPolicy, NoAMP
 from noeira.nn.core.module import Module
@@ -37,16 +36,17 @@ from noeira.nn.combinators.compute_graph import ComputeGraph
 from noeira.nn.combinators.graph_decl import InputSlot, Node, ExternalNode
 from ..loss.loss_block import LossBlock
 from ..training.trainer_block import TrainerState
+from noeira.core.tiles import Tile
 
 
 def _target_y_kernel[
     B: Int
 ](
-    r: LayoutTensor[DT, Layout.row_major(B), MutAnyOrigin],
-    done: LayoutTensor[DT, Layout.row_major(B), MutAnyOrigin],
-    min_q: LayoutTensor[DT, Layout.row_major(B), MutAnyOrigin],
-    logp: LayoutTensor[DT, Layout.row_major(B), MutAnyOrigin],
-    y: LayoutTensor[DT, Layout.row_major(B), MutAnyOrigin],
+    r: Tile[DT, B],
+    done: Tile[DT, B],
+    min_q: Tile[DT, B],
+    logp: Tile[DT, B],
+    y: Tile[DT, B],
     gamma: Scalar[DT],
     alpha: Scalar[DT],
 ):
@@ -64,11 +64,11 @@ def _target_y_kernel[
 def _target_y_dev_kernel[
     B: Int
 ](
-    r: LayoutTensor[DT, Layout.row_major(B), MutAnyOrigin],
-    done: LayoutTensor[DT, Layout.row_major(B), MutAnyOrigin],
-    min_q: LayoutTensor[DT, Layout.row_major(B), MutAnyOrigin],
-    logp: LayoutTensor[DT, Layout.row_major(B), MutAnyOrigin],
-    y: LayoutTensor[DT, Layout.row_major(B), MutAnyOrigin],
+    r: Tile[DT, B],
+    done: Tile[DT, B],
+    min_q: Tile[DT, B],
+    logp: Tile[DT, B],
+    y: Tile[DT, B],
     gamma: Scalar[DT],
     alpha_ptr: Pointer[Scalar[DT], MutAnyOrigin],
 ):
@@ -105,11 +105,11 @@ def sac_target_y_dev[
     y.ensure_gpu(c, B)
     comptime nblk = (B + TPB - 1) // TPB
     c.enqueue_function[_target_y_dev_kernel[B]](
-        r.lt["gpu", Layout.row_major(B)](),
-        done.lt["gpu", Layout.row_major(B)](),
-        min_q.lt["gpu", Layout.row_major(B)](),
-        logp.lt["gpu", Layout.row_major(B)](),
-        y.lt["gpu", Layout.row_major(B)](),
+        r.tt["gpu", B](),
+        done.tt["gpu", B](),
+        min_q.tt["gpu", B](),
+        logp.tt["gpu", B](),
+        y.tt["gpu", B](),
         gamma,
         alpha_ptr,
         grid_dim=nblk,
@@ -144,11 +144,11 @@ def sac_target_y[
         y.ensure_gpu(c, B)
         comptime nblk = (B + TPB - 1) // TPB
         c.enqueue_function[_target_y_kernel[B]](
-            r.lt["gpu", Layout.row_major(B)](),
-            done.lt["gpu", Layout.row_major(B)](),
-            min_q.lt["gpu", Layout.row_major(B)](),
-            logp.lt["gpu", Layout.row_major(B)](),
-            y.lt["gpu", Layout.row_major(B)](),
+            r.tt["gpu", B](),
+            done.tt["gpu", B](),
+            min_q.tt["gpu", B](),
+            logp.tt["gpu", B](),
+            y.tt["gpu", B](),
             gamma,
             alpha,
             grid_dim=nblk,

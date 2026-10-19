@@ -52,9 +52,9 @@ inside the trait methods — the planner is allowed to enqueue all
 """
 
 from max.gpu.host import DeviceContext
-from layout import Layout, LayoutTensor
 
 from noeira.nn.constants import DT as dtype
+from noeira.core.tiles import Tile
 
 
 trait RolloutCallbackCPU(Deinitable):
@@ -135,12 +135,8 @@ trait RolloutCallbackGPU(Deinitable):
     ](
         mut self,
         ctx: DeviceContext,
-        z: LayoutTensor[
-            dtype, Layout.row_major(B, Self.LATENT_DIM), MutAnyOrigin
-        ],
-        action_out: LayoutTensor[
-            dtype, Layout.row_major(B, Self.ACTION_DIM), MutAnyOrigin
-        ],
+        z: Tile[dtype, B, Self.LATENT_DIM],
+        action_out: Tile[dtype, B, Self.ACTION_DIM],
     ) raises:
         """Write the policy's deterministic action mean for every row
         of ``z`` into ``action_out``. Shapes ``(B, LATENT_DIM)`` and
@@ -153,16 +149,10 @@ trait RolloutCallbackGPU(Deinitable):
     ](
         mut self,
         ctx: DeviceContext,
-        z: LayoutTensor[
-            dtype, Layout.row_major(B, Self.LATENT_DIM), MutAnyOrigin
-        ],
-        a: LayoutTensor[
-            dtype, Layout.row_major(B, Self.ACTION_DIM), MutAnyOrigin
-        ],
-        z_next_out: LayoutTensor[
-            dtype, Layout.row_major(B, Self.LATENT_DIM), MutAnyOrigin
-        ],
-        r_out: LayoutTensor[dtype, Layout.row_major(B), MutAnyOrigin],
+        z: Tile[dtype, B, Self.LATENT_DIM],
+        a: Tile[dtype, B, Self.ACTION_DIM],
+        z_next_out: Tile[dtype, B, Self.LATENT_DIM],
+        r_out: Tile[dtype, B],
     ) raises:
         """Advance one step for the full batch: write ``z'`` into
         ``z_next_out`` and the scalar step reward into ``r_out``.
@@ -177,10 +167,8 @@ trait RolloutCallbackGPU(Deinitable):
     ](
         mut self,
         ctx: DeviceContext,
-        z: LayoutTensor[
-            dtype, Layout.row_major(B, Self.LATENT_DIM), MutAnyOrigin
-        ],
-        v_out: LayoutTensor[dtype, Layout.row_major(B), MutAnyOrigin],
+        z: Tile[dtype, B, Self.LATENT_DIM],
+        v_out: Tile[dtype, B],
         seed: UInt32,
     ) raises:
         """Bootstrap value at end-of-horizon state ``z``. TDMPC2's impl

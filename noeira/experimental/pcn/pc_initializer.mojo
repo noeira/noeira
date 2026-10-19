@@ -14,9 +14,9 @@ underlying PRNG differs from legacy Philox — seed via `std.random.seed`
 for reproducibility).
 """
 
-from layout import Layout, LayoutTensor
 from std.math import sqrt
 from std.random import random_float64
+from noeira.core.tiles import Tile
 
 
 trait PCInitializer(ImplicitlyCopyable):
@@ -30,7 +30,7 @@ trait PCInitializer(ImplicitlyCopyable):
     @staticmethod
     def fill[
         SIZE: Int, FAN_IN: Int, FAN_OUT: Int, dtype: DType = DType.float32
-    ](mut params: LayoutTensor[dtype, Layout.row_major(SIZE), MutAnyOrigin]):
+    ](params: Tile[dtype, SIZE]):
         ...
 
 
@@ -52,7 +52,7 @@ struct PCXavier(PCInitializer):
     @staticmethod
     def fill[
         SIZE: Int, FAN_IN: Int, FAN_OUT: Int, dtype: DType = DType.float32
-    ](mut params: LayoutTensor[dtype, Layout.row_major(SIZE), MutAnyOrigin]):
+    ](params: Tile[dtype, SIZE]):
         comptime assert (
             dtype.is_floating_point()
         ), "PCXavier requires floating-point dtype"
@@ -79,6 +79,6 @@ struct PCZeros(PCInitializer):
     @staticmethod
     def fill[
         SIZE: Int, FAN_IN: Int, FAN_OUT: Int, dtype: DType = DType.float32
-    ](mut params: LayoutTensor[dtype, Layout.row_major(SIZE), MutAnyOrigin]):
+    ](params: Tile[dtype, SIZE]):
         for i in range(SIZE):
             params[i] = Scalar[dtype](0)
