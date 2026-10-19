@@ -1309,8 +1309,8 @@ def ezv2_unroll_train_step_gpu_vp[
             grid_dim=nbOBS, block_dim=TPB)
     else:
         ctx.enqueue_function[_cast_f2b_kernel](
-            d_obs.tt_at["gpu", B * OBS](0),
-            d_obs_work.tt["gpu", B * OBS](),
+            d_obs.tt_at["gpu", B * OBS](0).ptr,
+            d_obs_work.tt["gpu", B * OBS]().ptr,
             Int64(B * OBS),
             grid_dim=nbOBS,
             block_dim=TPB,
@@ -1340,8 +1340,8 @@ def ezv2_unroll_train_step_gpu_vp[
             rew.reward_step_forward["gpu", B](dzf, hbuf, cbuf, cache, vp, octx)
         else:
             ctx.enqueue_function[_cast_b2f_kernel](
-                dz.tt["gpu", B * LATENT](),
-                dz_f32.tt["gpu", B * LATENT](),
+                dz.tt["gpu", B * LATENT]().ptr,
+                dz_f32.tt["gpu", B * LATENT]().ptr,
                 Int64(B * LATENT),
                 grid_dim=nbLAT,
                 block_dim=TPB,
@@ -1368,8 +1368,8 @@ def ezv2_unroll_train_step_gpu_vp[
                 grid_dim=nbOBS, block_dim=TPB)
         else:
             ctx.enqueue_function[_cast_f2b_kernel](
-                d_obs.tt_at["gpu", B * OBS](k * B * OBS),
-                d_obs_work.tt["gpu", B * OBS](),
+                d_obs.tt_at["gpu", B * OBS](k * B * OBS).ptr,
+                d_obs_work.tt["gpu", B * OBS]().ptr,
                 Int64(B * OBS),
                 grid_dim=nbOBS,
                 block_dim=TPB,
@@ -1430,8 +1430,8 @@ def ezv2_unroll_train_step_gpu_vp[
                 pred, child_refs[N=PRED.ARITY, CADT=ADT](zk_work), gpout,
                 child_refs[N=PRED.ARITY, CADT=ADT](gpin_b), octx)
             ctx.enqueue_function[_cast_b2f_kernel](
-                gpin_b.tt["gpu", B * LATENT](),
-                gpin.tt["gpu", B * LATENT](),
+                gpin_b.tt["gpu", B * LATENT]().ptr,
+                gpin.tt["gpu", B * LATENT]().ptr,
                 Int64(B * LATENT),
                 grid_dim=nbLAT,
                 block_dim=TPB,
@@ -1485,8 +1485,8 @@ def ezv2_unroll_train_step_gpu_vp[
                     dzd, hbuf, cbuf, cache, vp, octx)
             else:
                 ctx.enqueue_function[_cast_b2f_kernel](
-                    dz.tt["gpu", B * LATENT](),
-                    dz_f32.tt["gpu", B * LATENT](),
+                    dz.tt["gpu", B * LATENT]().ptr,
+                    dz_f32.tt["gpu", B * LATENT]().ptr,
                     Int64(B * LATENT),
                     grid_dim=nbLAT,
                     block_dim=TPB,
@@ -1535,8 +1535,8 @@ def ezv2_unroll_train_step_gpu_vp[
                     child_refs[N=DYNZ.ARITY, CADT=ADT](gdin), octx)
             else:
                 ctx.enqueue_function[_cast_f2b_kernel](
-                    gz.tt["gpu", B * LATENT](),
-                    gz_b.tt["gpu", B * LATENT](),
+                    gz.tt["gpu", B * LATENT]().ptr,
+                    gz_b.tt["gpu", B * LATENT]().ptr,
                     Int64(B * LATENT),
                     grid_dim=nbLAT,
                     block_dim=TPB,
@@ -1560,8 +1560,8 @@ def ezv2_unroll_train_step_gpu_vp[
             grid_dim=nbOBS, block_dim=TPB)
     else:
         ctx.enqueue_function[_cast_f2b_kernel](
-            d_obs.tt_at["gpu", B * OBS](0),
-            d_obs_work.tt["gpu", B * OBS](),
+            d_obs.tt_at["gpu", B * OBS](0).ptr,
+            d_obs_work.tt["gpu", B * OBS]().ptr,
             Int64(B * OBS),
             grid_dim=nbOBS,
             block_dim=TPB,
@@ -1575,8 +1575,8 @@ def ezv2_unroll_train_step_gpu_vp[
             child_refs[N=REP.ARITY, CADT=ADT](gobs), octx)
     else:
         ctx.enqueue_function[_cast_f2b_kernel](
-            gz.tt["gpu", B * LATENT](),
-            gz_b.tt["gpu", B * LATENT](),
+            gz.tt["gpu", B * LATENT]().ptr,
+            gz_b.tt["gpu", B * LATENT]().ptr,
             Int64(B * LATENT),
             grid_dim=nbLAT,
             block_dim=TPB,
