@@ -17,8 +17,9 @@ from max.gpu.host import (
     DeviceEvent,
     HostBuffer,
 )
-from layout import Layout, LayoutTensor, RuntimeLayout
+from layout import Layout, LayoutTensor, RuntimeLayout, TileTensor
 
+from noeira.core.tiles import RowMajor, Tile
 from noeira.nn.constants import DT
 from .fill import fill_dev
 
@@ -316,6 +317,35 @@ struct TensorImpl[dt: DType = DT](Defaultable & Movable & Deinitable):
         comptime sz = layout.size()
         var sub = self.dev.value().create_sub_buffer[Self.dt](offset, sz)
         return LayoutTensor[Self.dt, layout, MutAnyOrigin](sub)
+
+    def tt[
+        target: StaticString, *dims: Int
+    ](mut self) -> Tile[Self.dt, *dims]:
+        """Row-major TileTensor view at `dims`: `lt`'s replacement.
+        `t.lt["gpu", Layout.row_major(B, N)]()` becomes `t.tt["gpu", B, N]()`,
+        typed for a `Tile[dt, B, N]` kernel argument. Built from the owning
+        storage (`self.data` / `self.dev`), so the origin is concrete until the
+        return converts it to the kernel ABI's `MutAnyOrigin`."""
+        comptime if target == "cpu":
+            return TileTensor(self.data, RowMajor[*dims]())
+        elif target == "gpu":
+            return TileTensor(self.dev.value(), RowMajor[*dims]())
+        else:
+            comptime assert False, "target must be 'cpu' or 'gpu'"
+
+    def tt_at[
+        target: StaticString, *dims: Int
+    ](mut self, offset: Int) raises -> Tile[Self.dt, *dims]:
+        """Row-major TileTensor view at element `offset` of the device buffer:
+        `lt_at`'s replacement (same `create_sub_buffer` route, GPU-only)."""
+        comptime assert target == "gpu", (
+            "tt_at is GPU-only (offset sub-view); CPU indexes self.data directly"
+        )
+        comptime sz = RowMajor[*dims]().size()
+        var sub = self.dev.value().create_sub_buffer[Self.dt](offset, sz)
+        # The sub-buffer handle dies here; the parent buffer owns the memory,
+        # exactly as in `lt_at`. That is the one erasure this view needs.
+        return TileTensor(sub, RowMajor[*dims]()).as_unsafe_any_origin()
 
     def upload(mut self, ctx: DeviceContext) raises:
         """CPU `data` → device buffer (via the persistent host staging buffer).
