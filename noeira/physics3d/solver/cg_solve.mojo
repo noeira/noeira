@@ -46,7 +46,7 @@ precompute is invoked with it (the shared builder branches internally).
 from std.math import sqrt, abs
 from max.gpu import thread_idx, block_idx, block_dim
 from max.gpu.host import DeviceContext
-from std.sys import has_nvidia_gpu_accelerator
+from std.sys import default_accelerator
 from layout import Layout, LayoutTensor
 
 from ..types import _max_one, ConeType

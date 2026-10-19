@@ -10,13 +10,13 @@ MAX's int4 GEMM with bf16 activations against an fp32 GEMM, and both
 grad_inputs and adapter gradients are TF32 cuBLAS GEMMs: 1e-2.
 """
 
-from std.sys import has_nvidia_gpu_accelerator
+from std.sys import default_accelerator
 from std.testing import assert_true
 from max.gpu.host import DeviceContext
 
 from tests.nn.quant.qlora_common import check_qlora
 
-comptime TOL = 1e-2 if has_nvidia_gpu_accelerator() else 1e-5
+comptime TOL = 1e-2 if default_accelerator().is_nvidia_gpu() else 1e-5
 
 
 def main() raises:

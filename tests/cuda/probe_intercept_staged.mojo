@@ -52,7 +52,7 @@ READ THE OUTPUT LIKE THIS:
 from std.ffi import OwnedDLHandle, c_int
 from max.gpu import thread_idx
 from max.gpu.host import DeviceContext
-from std.sys import has_nvidia_gpu_accelerator
+from std.sys import default_accelerator
 from std.memory import alloc
 from layout import Layout, LayoutTensor
 
@@ -62,7 +62,7 @@ comptime _CUptr = Pointer[NoneType, MutUntrackedOrigin]
 
 
 def main() raises:
-    comptime if not has_nvidia_gpu_accelerator():
+    comptime if not default_accelerator().is_nvidia_gpu():
         print("non-NVIDIA: the interceptor path does not exist here. Skipped.")
         return
 

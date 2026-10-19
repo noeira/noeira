@@ -205,7 +205,7 @@ harness reports that as "unsupported here", not as a failure. Run it on the
 
 from std.math import ceildiv
 from std.os import getenv
-from std.sys import has_nvidia_gpu_accelerator
+from std.sys import default_accelerator
 from std.time import perf_counter_ns
 
 from layout import Layout, LayoutTensor, TileTensor, row_major
@@ -1040,7 +1040,7 @@ def main() raises:
     print("       libcuda_intercept.so anyway — a '[intercept] ...' line below")
     print("       is THAT, not this file. Build and run the binary directly")
     print("       (see the header) to actually demonstrate independence.")
-    comptime if not has_nvidia_gpu_accelerator():
+    comptime if not default_accelerator().is_nvidia_gpu():
         print("")
         print("  ⚠ NOT AN NVIDIA DEVICE. Metal supports neither stream capture")
         print("    nor device graphs, so every arm below is expected to RAISE")
@@ -1079,7 +1079,7 @@ def main() raises:
 
     print("")
     print("=" * 76)
-    comptime if not has_nvidia_gpu_accelerator():
+    comptime if not default_accelerator().is_nvidia_gpu():
         print("  NO VERDICT — not an NVIDIA device.")
         return
     if a != 1:

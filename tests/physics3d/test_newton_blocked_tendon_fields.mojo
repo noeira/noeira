@@ -43,7 +43,7 @@ Run with:
 
 from std.math import abs
 from std.testing import TestSuite
-from std.sys import has_nvidia_gpu_accelerator
+from std.sys import default_accelerator
 from max.gpu.host import DeviceContext
 from layout import Layout
 

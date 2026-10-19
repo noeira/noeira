@@ -20,7 +20,7 @@ Run: pixi run -e apple mojo run -I . tests/physics3d/test_newton_blocked_fields.
 """
 
 from std.math import abs
-from std.sys import has_nvidia_gpu_accelerator
+from std.sys import default_accelerator
 from max.gpu.host import DeviceContext
 from layout import Layout
 
@@ -379,14 +379,14 @@ def run_leg(ctx: DeviceContext) raises:
         print("  HARVEST GOLD_QC   =", fp_qc)
         print("  HARVEST GOLD_CON  =", fp_con)
     else:
-        if ncon_total != GOLD_NCON and not has_nvidia_gpu_accelerator():
+        if ncon_total != GOLD_NCON and not default_accelerator().is_nvidia_gpu():
             raise Error(
                 "blocked contacts " + String(ncon_total) + " != golden "
                 + String(GOLD_NCON)
             )
         var dq = abs(GOLD_QC) if abs(GOLD_QC) > 1e-9 else 1.0
         if abs(fp_qc - GOLD_QC) / dq > GOLD_RTOL and (
-            not has_nvidia_gpu_accelerator()
+            not default_accelerator().is_nvidia_gpu()
         ):
             raise Error(
                 "blocked qacc fingerprint " + String(fp_qc) + " != golden "
@@ -394,7 +394,7 @@ def run_leg(ctx: DeviceContext) raises:
             )
         var dcn = abs(GOLD_CON) if abs(GOLD_CON) > 1e-9 else 1.0
         if abs(fp_con - GOLD_CON) / dcn > GOLD_RTOL and (
-            not has_nvidia_gpu_accelerator()
+            not default_accelerator().is_nvidia_gpu()
         ):
             raise Error(
                 "blocked contact fingerprint " + String(fp_con) + " != golden "

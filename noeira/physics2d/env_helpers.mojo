@@ -500,11 +500,11 @@ struct PhysicsEnvHelpers:
         if joint_idx >= MAX_JOINTS:
             return -1
 
-        var ref = Scalar[dtype](0)
+        var ref_angle = Scalar[dtype](0)
         if reference_angle:
-            ref = Scalar[dtype](reference_angle.value())
+            ref_angle = Scalar[dtype](reference_angle.value())
         else:
-            ref = Self.get_body_angle[BATCH, STATE_SIZE, BODIES_OFFSET](
+            ref_angle = Self.get_body_angle[BATCH, STATE_SIZE, BODIES_OFFSET](
                 states, env, body_b
             ) - Self.get_body_angle[BATCH, STATE_SIZE, BODIES_OFFSET](
                 states, env, body_a
@@ -519,7 +519,7 @@ struct PhysicsEnvHelpers:
             anchor_ay=Scalar[dtype](anchor_ay),
             anchor_bx=Scalar[dtype](anchor_bx),
             anchor_by=Scalar[dtype](anchor_by),
-            reference_angle=ref,
+            reference_angle=ref_angle,
             lower_limit=Scalar[dtype](lower_limit),
             upper_limit=Scalar[dtype](upper_limit),
             enable_limit=enable_limit,

@@ -19,7 +19,7 @@ Run: pixi run -e apple mojo run -I . tests/physics3d/test_ip_fields_env_loop.moj
 """
 
 from std.math import abs
-from std.sys import has_nvidia_gpu_accelerator
+from std.sys import default_accelerator
 from max.gpu.host import DeviceContext
 
 from noeira.nn.core.tensor import TensorImpl
@@ -139,7 +139,7 @@ def main() raises:
         print("  HARVEST GOLD_R0  =", total_reward[0])
         print("  HARVEST GOLD_R1  =", total_reward[1])
         print("  HARVEST GOLD_OBS =", fp_obs)
-    elif not has_nvidia_gpu_accelerator():
+    elif not default_accelerator().is_nvidia_gpu():
         if total_reward[0] != GOLD_R0 or total_reward[1] != GOLD_R1:
             raise Error("episode returns differ from golden")
         var denom = abs(GOLD_OBS) if abs(GOLD_OBS) > 1e-9 else 1.0

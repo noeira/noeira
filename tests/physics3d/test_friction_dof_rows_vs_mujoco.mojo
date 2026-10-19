@@ -51,7 +51,7 @@ from std.random import random_float64
 from std.python import Python, PythonObject
 from std.testing import assert_true, TestSuite
 from std.math import abs, sin
-from std.sys import has_nvidia_gpu_accelerator
+from std.sys import default_accelerator
 from max.gpu.host import DeviceContext
 from layout import Layout
 

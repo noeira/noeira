@@ -12,7 +12,7 @@ from std.math import sqrt
 from max.gpu import thread_idx, block_idx, global_idx
 from max.gpu.primitives import block
 from max.gpu.host import DeviceContext
-from std.sys.info import has_nvidia_gpu_accelerator
+from std.sys.info import default_accelerator
 from layout import Layout, LayoutTensor, TileTensor, row_major
 
 from noeira.nn.constants import CPU_SIMD_W, DT, LAYOUT_NCHW, LAYOUT_NHWC
@@ -44,7 +44,7 @@ comptime BN2D_NHWC_CHUNKS: Int = 256
 # chunks, the tuned sweet spot): NHWC-2D is 1.6-2x faster than the 1-warp and
 # 0.98-1.50x vs the real NCHW BN (rep24/C4 at/under parity). Metal-gated OFF: the
 # 2D launch ICEs the Metal backend in a large module, and Apple keeps the proven
-# 1-warp kernel anyway — so the gate (has_nvidia_gpu_accelerator) means the 2D is
+# 1-warp kernel anyway — so the gate (default_accelerator) means the 2D is
 # never codegen'd for Metal. Requires C | BN2D_NHWC_BLK (else falls back to 1-warp).
 comptime BN2D_NHWC_BLK: Int = 256
 
@@ -856,7 +856,7 @@ struct BatchNorm2D[
     # block (else the 1-warp transposed kernel — the Apple/Metal path — is used).
     comptime USE_2D_NHWC = (
         Self.LAYOUT == LAYOUT_NHWC
-        and has_nvidia_gpu_accelerator()
+        and default_accelerator().is_nvidia_gpu()
         and BN2D_NHWC_BLK % Self.C_ == 0
     )
     # Activation-flow dtype (AMP §3 fp32-INTERNAL): BN accepts/emits ACT_DT but

@@ -13,7 +13,7 @@ Run: pixi run -e apple mojo run -I . tests/physics3d/test_fluid_fields_vs_mujoco
 """
 
 from std.math import abs
-from std.sys import has_nvidia_gpu_accelerator
+from std.sys import default_accelerator
 from max.gpu.host import DeviceContext
 from layout import Layout
 
@@ -127,7 +127,7 @@ def main() raises:
         if e > worst_b:
             worst_b = e
     print("  fields-CPU vs fields-GPU fluid worst rel err:", worst_b)
-    if worst_b > 1e-4 and not has_nvidia_gpu_accelerator():
+    if worst_b > 1e-4 and not default_accelerator().is_nvidia_gpu():
         raise Error("fields-CPU fluid diverges from fields-GPU")
     print("  Part B PASS: fields-CPU fluid == fields-GPU")
     print("test_fluid_fields_vs_mujoco: ALL PASS")

@@ -48,7 +48,7 @@ Run (NVIDIA only):
 """
 
 from std.math import ceildiv, align_up
-from std.sys import has_nvidia_gpu_accelerator
+from std.sys import default_accelerator
 from std.time import perf_counter_ns
 
 from max.gpu.host import DeviceContext, DeviceBuffer, FuncAttribute
@@ -837,7 +837,7 @@ def sweep_pad[
 
 
 def main() raises:
-    comptime if not has_nvidia_gpu_accelerator():
+    comptime if not default_accelerator().is_nvidia_gpu():
         print("NVIDIA only -- build with `pixi run -e nvidia`.")
     else:
         with DeviceContext() as ctx:

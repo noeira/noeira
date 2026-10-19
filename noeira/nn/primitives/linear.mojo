@@ -25,7 +25,7 @@ the whole function, then builds views from that.
 from noeira.nn.core.mm import mm, mm_bias, bmm
 from noeira.nn.core.cublaslt_gemm import cublaslt_gemm, EPI_BIAS, LT_BIAS
 from noeira.nn.core.cublas_gemm import cublas_gemm, cublas_gemm_lp, GEMM_PATH, CUBLAS_BWD, cublas_fwd, cublas_tf32
-from std.sys import has_nvidia_gpu_accelerator
+from std.sys import default_accelerator
 from std.sys import CompilationTarget
 from max.gpu import global_idx, thread_idx, block_idx
 from max.gpu.sync import barrier
@@ -466,7 +466,7 @@ struct Linear[IN_: Int, OUT_: Int, ADT: DType = DT](Module):
     # so only the FORWARD's terms remain: k % 32 == 0 and k >= 128. PAD_TO is
     # 32 there (a 192-wide ViT layer is no longer copied to 256 every
     # forward). Apple keeps 128: its backward still runs on the padded shapes.
-    comptime PAD_TO = 32 if has_nvidia_gpu_accelerator() else 128
+    comptime PAD_TO = 32 if default_accelerator().is_nvidia_gpu() else 128
     comptime K_MIN = 128
     comptime K_PAD = Self._round_up(Self.IN_, Self.PAD_TO) if Self._round_up(
         Self.IN_, Self.PAD_TO
@@ -581,7 +581,7 @@ struct Linear[IN_: Int, OUT_: Int, ADT: DType = DT](Module):
     # no accumulate kernel. MAX's `mm` (the path before) stays for Apple and
     # `NN_GEMM_PATH=max` / `linmax`.
     comptime CUB_LP = (
-        has_nvidia_gpu_accelerator()
+        default_accelerator().is_nvidia_gpu()
         and GEMM_PATH != "max"
         and GEMM_PATH != "linmax"
     )
@@ -977,7 +977,7 @@ struct Linear[IN_: Int, OUT_: Int, ADT: DType = DT](Module):
                             block_dim=256,
                         )
                     else:
-                        comptime if has_nvidia_gpu_accelerator():
+                        comptime if default_accelerator().is_nvidia_gpu():
                             # Bias in the GEMM epilogue (`mm_bias`): one launch.
                             mm_bias[A0=B, A1=Self.K_PAD, B0=Self.K_PAD, B1=Self.N_PAD, O0=B, O1=Self.OUT_](
                                 outd.dev.value(), self.x_pad.dev.value() if Self.NEEDS_PAD else in0d.dev.value(), self.w_pad.dev.value(), bl, c
@@ -995,7 +995,7 @@ struct Linear[IN_: Int, OUT_: Int, ADT: DType = DT](Module):
                                 block_dim=256,
                             )
                 else:
-                    comptime if has_nvidia_gpu_accelerator():
+                    comptime if default_accelerator().is_nvidia_gpu():
                         mm_bias[A0=B, A1=Self.IN_, B0=Self.IN_, B1=Self.OUT_, O0=B, O1=Self.OUT_](
                             outd.dev.value(), in0d.dev.value(),
                             self.weight.val.dev.value(), bl, c,

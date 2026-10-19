@@ -43,14 +43,14 @@ arc look like they died earlier than they did.
 
 from max.gpu import thread_idx
 from max.gpu.host import DeviceContext
-from std.sys import has_nvidia_gpu_accelerator
+from std.sys import default_accelerator
 from layout import Layout, LayoutTensor
 
 from noeira.nn.constants import DT
 
 
 def main() raises:
-    comptime if not has_nvidia_gpu_accelerator():
+    comptime if not default_accelerator().is_nvidia_gpu():
         print("non-NVIDIA: no interceptor, nothing to observe. Skipped.")
         return
 

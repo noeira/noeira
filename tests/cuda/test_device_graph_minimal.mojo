@@ -51,7 +51,7 @@ Run with:
 """
 
 from max.gpu import thread_idx
-from std.sys import has_nvidia_gpu_accelerator
+from std.sys import default_accelerator
 from std.testing import assert_true, TestSuite
 from layout import Layout, LayoutTensor
 from max.gpu.host import DeviceContext, DeviceBuffer
@@ -146,7 +146,7 @@ def test_record_replay_contract() raises:
     )
 
     # Which path ran. Without this the count above is vacuous.
-    comptime if has_nvidia_gpu_accelerator():
+    comptime if default_accelerator().is_nvidia_gpu():
         assert_true(
             slot.is_recorded() and not slot.is_disabled(),
             "NVIDIA must RECORD. A latched-disabled slot here means"

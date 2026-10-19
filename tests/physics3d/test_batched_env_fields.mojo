@@ -19,7 +19,7 @@ Run: pixi run -e apple mojo run -I . tests/physics3d/test_batched_env_fields.moj
 
 from std.math import abs
 from max.gpu.host import DeviceContext
-from std.sys import has_nvidia_gpu_accelerator
+from std.sys import default_accelerator
 
 from noeira.nn.constants import DT
 from noeira.envs.phyics3d_batched_env import Phyics3dBatchedEnv
@@ -63,7 +63,7 @@ def _action_val(t: Int, e: Int, j: Int) -> Scalar[DT]:
 
 def _chk(name: String, got: Float64, gold: Float64) raises:
     var denom = abs(gold) if abs(gold) > 1e-9 else 1.0
-    if abs(got - gold) / denom > GOLD_RTOL and not has_nvidia_gpu_accelerator():
+    if abs(got - gold) / denom > GOLD_RTOL and not default_accelerator().is_nvidia_gpu():
         raise Error(name + " " + String(got) + " != golden " + String(gold))
 
 
@@ -134,7 +134,7 @@ def main() raises:
         print("  HARVEST GOLD_QPOS    =", fp_qpos)
         print("  HARVEST GOLD_RST_OBS =", fp_rst_obs)
     else:
-        if total_ncon != GOLD_NCON and not has_nvidia_gpu_accelerator():
+        if total_ncon != GOLD_NCON and not default_accelerator().is_nvidia_gpu():
             raise Error(
                 "total contacts " + String(total_ncon) + " != golden "
                 + String(GOLD_NCON)

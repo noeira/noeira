@@ -14,7 +14,7 @@
       dequantize scratch use that buffer and still compute the same outputs
 """
 
-from std.sys import has_nvidia_gpu_accelerator
+from std.sys import default_accelerator
 from std.testing import assert_true
 from max.gpu.host import DeviceContext
 
@@ -25,8 +25,8 @@ from noeira.nn.core.initializer import Deterministic
 from noeira.nn.quant.qlinear import QLinear, Q4_PATH
 from tests.nn.quant.qlinear_common import check_shape, gaussian, put, to_host, rel
 
-comptime INT4 = has_nvidia_gpu_accelerator() and Q4_PATH != "deq"
-comptime TOL = 1e-2 if has_nvidia_gpu_accelerator() else 1e-5
+comptime INT4 = default_accelerator().is_nvidia_gpu() and Q4_PATH != "deq"
+comptime TOL = 1e-2 if default_accelerator().is_nvidia_gpu() else 1e-5
 
 
 def addr(ref t: Tensor) -> Int:

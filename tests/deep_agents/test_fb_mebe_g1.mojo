@@ -20,7 +20,7 @@ Run: pixi run -e nvidia mojo run -I . tests/deep_agents/test_fb_mebe_g1.mojo
 
 from std.math import sqrt, sin
 from std.random import random_float64, seed
-from std.sys import has_nvidia_gpu_accelerator
+from std.sys import default_accelerator
 from std.testing import assert_true
 from layout import Layout, LayoutTensor
 from max.gpu.host import DeviceContext
@@ -378,7 +378,7 @@ def main() raises:
     leg2()
     with DeviceContext() as ctx:
         leg3(ctx)
-        comptime if has_nvidia_gpu_accelerator():
+        comptime if default_accelerator().is_nvidia_gpu():
             leg4(ctx)
         else:
             print("[4] skipped (the G1 batched env is NVIDIA-only)")

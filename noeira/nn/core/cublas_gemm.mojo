@@ -29,7 +29,7 @@ NVIDIA only. Deterministic (cuBLAS's default, atomics-free GEMMs), so an
 eager step and its CUDA-graph replay stay bit-identical.
 """
 
-from std.sys import has_nvidia_gpu_accelerator
+from std.sys import default_accelerator
 from std.sys.defines import get_defined_string, is_defined
 from std.ffi import _get_global_or_null, external_call
 from std.memory.alloc import Layout as AllocLayout
@@ -83,7 +83,7 @@ def cublas_tf32(m: Int, n: Int, k: Int) -> Bool:
         return False
     return m * n * k >= (1 << 24)
 
-comptime CUBLAS_BWD = has_nvidia_gpu_accelerator() and GEMM_PATH != "max" and GEMM_PATH != "bwdmax" and GEMM_PATH != "linmax"
+comptime CUBLAS_BWD = default_accelerator().is_nvidia_gpu() and GEMM_PATH != "max" and GEMM_PATH != "bwdmax" and GEMM_PATH != "linmax"
 """The NVIDIA fp32 backward of `Linear` / `LinearAct` runs on `cublas_gemm`."""
 
 
@@ -107,7 +107,7 @@ def cublas_fwd(m: Int, n: Int, k: Int, padded: Bool) -> Bool:
         streaming (DreamerV3's [16, 3072] @ [3072, 13824]: 109 vs 144 us).
 
     With this rule every measured shape is within 4% of the faster path."""
-    if not has_nvidia_gpu_accelerator() or GEMM_PATH == "max" or GEMM_PATH == "fwdmax" or GEMM_PATH == "linmax":
+    if not default_accelerator().is_nvidia_gpu() or GEMM_PATH == "max" or GEMM_PATH == "fwdmax" or GEMM_PATH == "linmax":
         return False
     if GEMM_PATH == "cublas":
         return True
@@ -209,7 +209,7 @@ def _gemm_ex[
 ) raises:
     """The one `cublasGemmEx` call behind `cublas_gemm` / `cublas_gemm_lp`
     (row-major mapping in `cublas_gemm`'s docstring)."""
-    comptime assert has_nvidia_gpu_accelerator(), "cuBLAS is NVIDIA-only"
+    comptime assert default_accelerator().is_nvidia_gpu(), "cuBLAS is NVIDIA-only"
     var ws = _shared_workspace(c)
     var handle = _get_global_handle[DT, Backend.CUBLAS](c)._get_cublas()
     check_cublas_error(

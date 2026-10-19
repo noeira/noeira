@@ -38,7 +38,7 @@ creation cannot run inside a CUDA-graph capture):
 NVIDIA only.
 """
 
-from std.sys import has_nvidia_gpu_accelerator
+from std.sys import default_accelerator
 from std.sys.defines import get_defined_string
 from std.ffi import _get_global_or_null, external_call
 from std.memory.alloc import Layout as AllocLayout
@@ -319,7 +319,7 @@ def cublaslt_gemm[
     read by `EPI_DGELU` — or the `EPI_RELU_AUX_BIAS` bitmask. beta = 0.
     `TF32`: fp32 operands computed in TF32 (`cublas_tf32`'s rule), else full
     fp32 / bf16 accumulation in fp32."""
-    comptime assert has_nvidia_gpu_accelerator(), "cuBLASLt is NVIDIA-only"
+    comptime assert default_accelerator().is_nvidia_gpu(), "cuBLASLt is NVIDIA-only"
     # The bias is OUT_DT: cuBLASLt rejects an fp32 bias with a bf16 output
     # (INVALID_VALUE from the heuristic on cuBLAS 12.9).
     var plan = _plan[TA, TB, IN_DT, OUT_DT, OUT_DT, TF32](c, M, N, K, epi, aux_ld)

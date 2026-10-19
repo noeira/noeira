@@ -34,7 +34,7 @@ Run: pixi run -e apple mojo run -I . tests/physics3d/test_equality_tendon_fields
 """
 
 from std.math import abs
-from std.sys import has_nvidia_gpu_accelerator
+from std.sys import default_accelerator
 from max.gpu.host import DeviceContext
 
 from noeira.nn.core.tensor import TensorImpl
@@ -497,14 +497,14 @@ def _part_a_tendon(ctx: DeviceContext) raises:
         print("  HARVEST GOLD_NCON_A =", ncon_total)
         print("  HARVEST GOLD_A      =", fp)
     else:
-        if ncon_total != GOLD_NCON_A and not has_nvidia_gpu_accelerator():
+        if ncon_total != GOLD_NCON_A and not default_accelerator().is_nvidia_gpu():
             raise Error(
                 "part A contacts " + String(ncon_total) + " != golden "
                 + String(GOLD_NCON_A)
             )
         var denom = abs(GOLD_A) if abs(GOLD_A) > 1e-9 else 1.0
         if abs(fp - GOLD_A) / denom > GOLD_RTOL and (
-            not has_nvidia_gpu_accelerator()
+            not default_accelerator().is_nvidia_gpu()
         ):
             raise Error(
                 "part A fingerprint " + String(fp) + " != golden "
@@ -712,14 +712,14 @@ def _part_b_equality(ctx: DeviceContext) raises:
         print("  HARVEST GOLD_NCON_B =", ncon_total)
         print("  HARVEST GOLD_B      =", fp)
     else:
-        if ncon_total != GOLD_NCON_B and not has_nvidia_gpu_accelerator():
+        if ncon_total != GOLD_NCON_B and not default_accelerator().is_nvidia_gpu():
             raise Error(
                 "part B contacts " + String(ncon_total) + " != golden "
                 + String(GOLD_NCON_B)
             )
         var denom = abs(GOLD_B) if abs(GOLD_B) > 1e-9 else 1.0
         if abs(fp - GOLD_B) / denom > GOLD_RTOL and (
-            not has_nvidia_gpu_accelerator()
+            not default_accelerator().is_nvidia_gpu()
         ):
             raise Error(
                 "part B fingerprint " + String(fp) + " != golden "

@@ -19,7 +19,7 @@ Run: pixi run -e apple mojo run -I . tests/physics3d/test_euler_fields.mojo
 
 from std.math import abs
 from max.gpu.host import DeviceContext
-from std.sys import has_nvidia_gpu_accelerator
+from std.sys import default_accelerator
 
 from noeira.nn.core.tensor import TensorImpl
 from noeira.physics3d.fields import Data, Model, Dims
@@ -61,7 +61,7 @@ comptime GOLD_XANG = -46.879036627709866
 def _check(name: String, got: Float64, gold: Float64) raises:
     var denom = abs(gold) if abs(gold) > 1e-9 else 1.0
     var rel = abs(got - gold) / denom
-    if rel > GOLD_RTOL and not has_nvidia_gpu_accelerator():
+    if rel > GOLD_RTOL and not default_accelerator().is_nvidia_gpu():
         raise Error(
             name + " fingerprint " + String(got) + " != golden "
             + String(gold) + " (rel " + String(rel) + ")"

@@ -179,7 +179,7 @@ from noeira.physics3d.collision.broadphase_sap import detect_contacts_sap
 from noeira.physics3d.solver.newton_solve import (
     solve_newton_blocked, solve_newton, NEWTON_FORCE_PER_ENV,
 )
-from std.sys import has_nvidia_gpu_accelerator
+from std.sys import default_accelerator
 from noeira.physics3d.gpu.constants import (
     META_IDX_NUM_CONTACTS, META_IDX_NEWTON_ITER, META_IDX_LS_EVAL,
     METADATA_SIZE, MODEL_JOINT_SIZE, CONTACT_SIZE, CONTACT_IDX_CONDIM,
@@ -442,7 +442,7 @@ def _solve64_gpu(
     `NEWTON_FORCE_PER_ENV` is a comptime False there, so `if not
     NEWTON_FORCE_PER_ENV` is always True and everything below it is dead —
     which is the intent. They disappear in the CUDA build that sets the flag."""
-    if not has_nvidia_gpu_accelerator():
+    if not default_accelerator().is_nvidia_gpu():
         raise Error(
             "solve_at_pose: the float64 GPU sweep is CUDA-only — Metal has no"
             " float64. Leave F64_GPU_SWEEP at False on this machine."

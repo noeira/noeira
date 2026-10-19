@@ -16,7 +16,7 @@ Run with:
 
 from max.gpu.host import DeviceContext, DeviceBuffer
 from max.gpu import thread_idx, block_idx, block_dim
-from std.sys import is_nvidia_gpu, has_nvidia_gpu_accelerator
+from std.sys import is_nvidia_gpu, default_accelerator
 from layout import Layout, LayoutTensor
 from std.time import perf_counter_ns
 
@@ -573,7 +573,7 @@ def benchmark_chain_scaling[N: Int](ctx: DeviceContext) raises:
 
 
 def benchmark_precompile[N: Int](ctx: DeviceContext) raises:
-    comptime if not has_nvidia_gpu_accelerator():
+    comptime if not default_accelerator().is_nvidia_gpu():
         print("\n" + "=" * 70)
         print("TEST 4: Precompilation — SKIPPED (Metal: unimplemented)")
         print("=" * 70)

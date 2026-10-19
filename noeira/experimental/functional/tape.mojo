@@ -51,7 +51,7 @@ from .opcodes import *
 from .module_op import ModEntry, TP
 from .nd import nd_binary, nd_bmm, nd_binary_vjp, nd_vjp
 from .extra import ExpOp, LogOp, SqrtOp
-from std.sys import has_nvidia_gpu_accelerator
+from std.sys import default_accelerator
 from noeira.cuda.graph import CUDAGraph
 from noeira.nn.primitives.linear import enqueue_bias_grad
 from .gpu import (
@@ -802,7 +802,7 @@ struct TapeData(Movable):
         var keep_z = NEEDS_Z and self.nodes[o].rg
         if self.ctx:
             var c = self.dctx()
-            comptime if has_nvidia_gpu_accelerator() and not HAS_ACT:
+            comptime if default_accelerator().is_nvidia_gpu() and not HAS_ACT:
                 gpu_linear_lt_bias(
                     c, self.dv(o), self.dv(x), self.dv(w), self.dv(bias), m, n, k
                 )

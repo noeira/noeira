@@ -23,7 +23,7 @@ backward is deterministic). Non-vacuity: the compiled path is the fused one
 from std.math import sqrt, abs
 from std.random import seed, random_float64
 from std.testing import assert_true
-from std.sys import has_nvidia_gpu_accelerator
+from std.sys import default_accelerator
 from max.gpu.host import DeviceContext
 
 from noeira.nn.constants import DT
@@ -34,7 +34,7 @@ from noeira.nn.primitives.attention import ScaledDotProductAttention
 from noeira.nn.primitives.flash_attention import ATTN_PATH
 
 
-comptime TF32 = has_nvidia_gpu_accelerator() and ATTN_PATH == "auto"
+comptime TF32 = default_accelerator().is_nvidia_gpu() and ATTN_PATH == "auto"
 comptime TOL = 1e-2 if TF32 else 1e-4
 """Both sides float32 in different orders: 1e-4. On NVIDIA the default path
 is TF32 on the tensor cores (`flash_attention_tf32.mojo`): 1e-2, the band

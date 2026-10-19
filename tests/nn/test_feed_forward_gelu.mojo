@@ -25,7 +25,7 @@ runs its three children. Gates, per shape:
 
 from std.math import sqrt, abs, tanh, erf
 from std.random import seed, random_float64
-from std.sys import has_nvidia_gpu_accelerator
+from std.sys import default_accelerator
 from std.testing import assert_true
 from max.gpu.host import DeviceContext
 
@@ -36,7 +36,7 @@ from noeira.nn.core.initializer import Kaiming
 from noeira.nn.primitives.feed_forward_gelu import FeedForwardGELU
 
 
-comptime TOL = 1e-2 if has_nvidia_gpu_accelerator() else 1e-4
+comptime TOL = 1e-2 if default_accelerator().is_nvidia_gpu() else 1e-4
 comptime TOL_BF16 = 5e-2
 comptime BF16 = DType.bfloat16
 
@@ -249,7 +249,7 @@ def main() raises:
     ok = check[256, 384, 1536, 2](ctx) and ok   # GPT block
     ok = check[64, 192, 768, 4](ctx) and ok     # CIFAR ViT block
     ok = check[10, 64, 128, 3](ctx) and ok      # small / odd rows
-    comptime if has_nvidia_gpu_accelerator():
+    comptime if default_accelerator().is_nvidia_gpu():
         print("bf16-flow block vs the fp32 CPU block (std units, tol", TOL_BF16, ")")
         ok = check_bf16[256, 384, 1536, 2](ctx) and ok   # GPT block
         ok = check_bf16[64, 192, 768, 4](ctx) and ok     # CIFAR ViT block

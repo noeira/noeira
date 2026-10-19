@@ -23,7 +23,7 @@ two layers of attention and norms: 3e-2.
 
 from std.math import abs
 from std.random import random_float64, seed
-from std.sys import has_nvidia_gpu_accelerator
+from std.sys import default_accelerator
 from std.testing import assert_true
 from max.gpu.host import DeviceContext
 

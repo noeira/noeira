@@ -29,7 +29,7 @@ Batched driver (Tier-3) deferred until a consumer needs it.
 """
 
 from std.time import perf_counter_ns
-from std.sys import has_nvidia_gpu_accelerator
+from std.sys import default_accelerator
 from max.gpu.host import DeviceContext, DeviceBuffer
 
 from noeira.core.logger import Logger, NoOpLogger
@@ -887,7 +887,7 @@ def run_offpolicy_discrete_train_gpu_batched[
         # MEASURED to freeze the env on Apple/Metal rather than no-op
         # (see driver_offpolicy.mojo, 2026-08-07); this train-side branch
         # was not independently measured, and is gated for consistency.
-        comptime if USE_TRAIN_CUDA_GRAPH and has_nvidia_gpu_accelerator():
+        comptime if USE_TRAIN_CUDA_GRAPH and default_accelerator().is_nvidia_gpu():
             # Capture path: once the buffer is warm, the per-update device
             # kernel sequence (`train_device_kernels`) is captured into
             # `train_graph` on first call and replayed thereafter — host

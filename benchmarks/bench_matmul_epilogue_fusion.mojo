@@ -22,7 +22,7 @@ buffer reached ONLY from inside the epilogue closure reads as ZERO. Read
 that function before adopting this anywhere.
 """
 
-from std.sys import has_nvidia_gpu_accelerator
+from std.sys import default_accelerator
 from std.time import perf_counter_ns
 
 from max.gpu.host import DeviceContext

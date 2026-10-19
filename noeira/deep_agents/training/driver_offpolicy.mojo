@@ -42,7 +42,7 @@ through the `BatchedEnv` trait.
 """
 
 from std.time import perf_counter_ns
-from std.sys import has_nvidia_gpu_accelerator
+from std.sys import default_accelerator
 from max.gpu.host import DeviceContext, DeviceBuffer
 from layout import Layout, LayoutTensor
 
@@ -1134,7 +1134,7 @@ def run_offpolicy_train_batched[
         )
 
         # ── 3. Env step (writes env-internal obs/reward/done).
-        # ⚠ `and has_nvidia_gpu_accelerator()` added 2026-08-07. The
+        # ⚠ `and default_accelerator().is_nvidia_gpu()` added 2026-08-07. The
         # comptime asserts above have always CLAIMED this path is a
         # "no-op on non-NVIDIA" — it was not. On Apple/Metal the capture
         # branch ran and silently FROZE the env: measured ep_count 0 vs 6
@@ -1145,7 +1145,7 @@ def run_offpolicy_train_batched[
         comptime if (
             USE_ENV_CUDA_GRAPH
             and env_target == "gpu"
-            and has_nvidia_gpu_accelerator()
+            and default_accelerator().is_nvidia_gpu()
         ):
             # Capture the (deterministic) physics `step_batch` into a CUDA graph
             # and replay it once per iteration — collapses the env's dozens of
@@ -1315,7 +1315,7 @@ def run_offpolicy_train_batched[
         # advances reset randomness on every replay — no baked host seed. The
         # `rng_seed` arg is retained for trait/CPU compatibility but the GPU
         # reset ignores it (the device counter is authoritative).
-        # ⚠ `and has_nvidia_gpu_accelerator()` added 2026-08-07. The
+        # ⚠ `and default_accelerator().is_nvidia_gpu()` added 2026-08-07. The
         # comptime asserts above have always CLAIMED this path is a
         # "no-op on non-NVIDIA" — it was not. On Apple/Metal the capture
         # branch ran and silently FROZE the env: measured ep_count 0 vs 6
@@ -1326,7 +1326,7 @@ def run_offpolicy_train_batched[
         comptime if (
             USE_ENV_CUDA_GRAPH
             and env_target == "gpu"
-            and has_nvidia_gpu_accelerator()
+            and default_accelerator().is_nvidia_gpu()
         ):
             # TEMP DIAGNOSTIC: inline, legacy-style explicit CUDAGraph capture
             # (mirrors the env-step block above). Reset randomness is driven by
@@ -1392,7 +1392,7 @@ def run_offpolicy_train_batched[
         # env path this one was NOT independently measured to misbehave on
         # Metal — it is gated to honour the contract, not to fix a
         # diagnosed defect.
-        comptime if USE_TRAIN_CUDA_GRAPH and has_nvidia_gpu_accelerator():
+        comptime if USE_TRAIN_CUDA_GRAPH and default_accelerator().is_nvidia_gpu():
             # Capture path: once the buffer is warm, the per-update device
             # kernel sequence (`train_device_kernels`) is captured into
             # `train_graph` on first call and replayed thereafter — host

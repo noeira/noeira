@@ -18,7 +18,7 @@ Run: pixi run -e apple mojo run -I . tests/physics3d/test_contact_detection_fiel
 
 from std.math import abs
 from max.gpu.host import DeviceContext
-from std.sys import has_nvidia_gpu_accelerator
+from std.sys import default_accelerator
 
 from noeira.nn.core.tensor import TensorImpl
 from noeira.physics3d.fields import Data, Model, Dims, DimsLike
@@ -125,14 +125,14 @@ def main() raises:
         print("  HARVEST GOLD_NCON =", ncon_total)
         print("  HARVEST GOLD_CON  =", fp_con)
     else:
-        if ncon_total != GOLD_NCON and not has_nvidia_gpu_accelerator():
+        if ncon_total != GOLD_NCON and not default_accelerator().is_nvidia_gpu():
             raise Error(
                 "total contacts " + String(ncon_total) + " != golden "
                 + String(GOLD_NCON)
             )
         var denom = abs(GOLD_CON) if abs(GOLD_CON) > 1e-9 else 1.0
         if abs(fp_con - GOLD_CON) / denom > GOLD_RTOL and (
-            not has_nvidia_gpu_accelerator()
+            not default_accelerator().is_nvidia_gpu()
         ):
             raise Error(
                 "contact-record fingerprint " + String(fp_con) + " != golden "

@@ -36,7 +36,7 @@ Use via one-line aliases (see linear_tanh.mojo / linear_mish.mojo / …):
     comptime LinearSwish[IN, OUT]   = LinearAct[IN, OUT, SwishOp]
 """
 
-from std.sys import CompilationTarget, has_nvidia_gpu_accelerator
+from std.sys import CompilationTarget, default_accelerator
 from noeira.nn.core.cublas_gemm import cublas_gemm, CUBLAS_BWD, cublas_fwd, cublas_tf32, cublas_gemm_lp, GEMM_PATH
 from noeira.nn.core.cublaslt_gemm import cublaslt_gemm, EPI_RELU_AUX_BIAS, LT_RELU
 from max.gpu import global_idx
@@ -284,7 +284,7 @@ struct LinearAct[IN_: Int, OUT_: Int, OP: ElementOp, ADT: DType = DT](Module):
     # temporary, no accumulate kernel). MAX's GEMMs stay for Apple and
     # `NN_GEMM_PATH=max` / `linmax`.
     comptime CUB_LP = (
-        has_nvidia_gpu_accelerator()
+        default_accelerator().is_nvidia_gpu()
         and GEMM_PATH != "max"
         and GEMM_PATH != "linmax"
     )

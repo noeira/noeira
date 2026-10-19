@@ -78,7 +78,7 @@ Run with:
 
 from max.gpu import thread_idx, block_idx, block_dim
 from max.gpu.host import DeviceContext, DeviceBuffer
-from std.sys import has_nvidia_gpu_accelerator
+from std.sys import default_accelerator
 from std.testing import assert_true, TestSuite
 from layout import Layout, LayoutTensor
 
@@ -144,7 +144,7 @@ def test_capture_records_nodes() raises:
 
     print("  captured nodes =", g.num_nodes())
 
-    comptime if has_nvidia_gpu_accelerator():
+    comptime if default_accelerator().is_nvidia_gpu():
         assert_true(
             g.num_nodes() > 0,
             "CUDA graph captured ZERO nodes. begin/end capture both"
@@ -206,7 +206,7 @@ def test_replay_executes_the_captured_work() raises:
     ctx.synchronize()
     var after_capture = _read(ctx, buf)
 
-    comptime if has_nvidia_gpu_accelerator():
+    comptime if default_accelerator().is_nvidia_gpu():
         assert_true(
             after_capture == after_warm,
             "the counter moved during CAPTURE (" + String(after_warm)

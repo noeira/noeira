@@ -43,7 +43,7 @@ and model types mangle to a symbol longer than the new macOS linker accepts.
 from std.random import seed
 from std.math import log
 from std.time import perf_counter_ns
-from std.sys import get_defined_int, has_nvidia_gpu_accelerator
+from std.sys import get_defined_int, default_accelerator
 from max.gpu.host import DeviceContext
 
 from noeira.nn.datasets import CharTokenizer, load_text, train_val_split
@@ -74,7 +74,7 @@ comptime NGPUS = get_defined_int["NGPUS", 2]()
 comptime ZERO = get_defined_int["ZERO", 0]()
 
 # ── nanoGPT char-Shakespeare on NVIDIA; a small config elsewhere ──
-comptime FULL = has_nvidia_gpu_accelerator()
+comptime FULL = default_accelerator().is_nvidia_gpu()
 comptime VOCAB = 65
 comptime SEQ = 256 if FULL else 64
 comptime EMBED = 384 if FULL else 64

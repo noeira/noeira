@@ -56,7 +56,7 @@ scripts = ["scripts/build_cuda_intercept.sh"]
 # "feature 'jetson' references platform 'linux-aarch64' which is not declared
 # in the workspace" and every environment fails to resolve — apple and cpu
 # included, not just this one. The workspace entry is what scopes the solve.
-# Everything else (mojo 1.1.0, max 26.6.0, and every conda-forge dep in
+# Everything else (mojo 1.2.0rc2, max 26.7.0rc2, and every conda-forge dep in
 # [dependencies]) is published for linux-aarch64 — checked 2026-09-16 — so the
 # default feature is inherited as-is.
 [feature.jetson]
@@ -198,8 +198,8 @@ peft = ">=0.17"
 python = ">=3.13.14,<3.14"
 
 [dependencies]
-mojo = "==1.1.0"
-max = "==26.6.0"
+mojo = "==1.2.0rc2"
+max = "==26.7.0rc2"
 gymnasium = ">=1.3.0,<2"
 # ⚠ DECLARED, NOT TRANSITIVE. `noeira/physics3d/collision/native/nra_qhull.c`
 # links libqhull_r to reproduce `mjCMesh::MakeGraph`'s facet ORDER, which is

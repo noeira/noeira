@@ -21,7 +21,7 @@ Run: pixi run -e apple mojo run -I . tests/physics3d/test_plane_mesh_fields.mojo
 
 from std.math import abs
 from max.gpu.host import DeviceContext
-from std.sys import has_nvidia_gpu_accelerator
+from std.sys import default_accelerator
 
 from noeira.physics3d.constants import GEOM_MESH, GEOM_CYLINDER
 from noeira.physics3d.fields import Data, Model, Dims, DimsLike
@@ -200,14 +200,14 @@ def _fp_check(
         print("  HARVEST", label, "GEOM =", fp_geom)
         print("  HARVEST", label, "SOL  =", fp_sol)
     else:
-        if ncon_total != gold_ncon and not has_nvidia_gpu_accelerator():
+        if ncon_total != gold_ncon and not default_accelerator().is_nvidia_gpu():
             raise Error(
                 label + ": contacts " + String(ncon_total) + " != golden "
                 + String(gold_ncon)
             )
         var denom = abs(gold_con) if abs(gold_con) > 1e-9 else 1.0
         if abs(fp_geom - gold_con) / denom > GOLD_RTOL and (
-            not has_nvidia_gpu_accelerator()
+            not default_accelerator().is_nvidia_gpu()
         ):
             raise Error(
                 label + ": GEOMETRY fingerprint " + String(fp_geom)
@@ -215,7 +215,7 @@ def _fp_check(
             )
         var sdenom = abs(gold_sol) if abs(gold_sol) > 1e-9 else 1.0
         if abs(fp_sol - gold_sol) / sdenom > GOLD_RTOL and (
-            not has_nvidia_gpu_accelerator()
+            not default_accelerator().is_nvidia_gpu()
         ):
             raise Error(
                 label + ": SOLPARAM fingerprint " + String(fp_sol)

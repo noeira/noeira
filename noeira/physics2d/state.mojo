@@ -445,11 +445,11 @@ struct PhysicsState[
         if joint_idx >= Self.MAX_JOINTS:
             return -1
 
-        var ref = Scalar[dtype](0)
+        var ref_angle = Scalar[dtype](0)
         if reference_angle:
-            ref = Scalar[dtype](reference_angle.value())
+            ref_angle = Scalar[dtype](reference_angle.value())
         else:
-            ref = self.get_body_angle[BATCH](states, body_b) - self.get_body_angle[
+            ref_angle = self.get_body_angle[BATCH](states, body_b) - self.get_body_angle[
                 BATCH
             ](states, body_a)
         RevoluteJointSolver.write_joint[BATCH, Self.STATE_SIZE](
@@ -462,7 +462,7 @@ struct PhysicsState[
             anchor_ay=Scalar[dtype](anchor_ay),
             anchor_bx=Scalar[dtype](anchor_bx),
             anchor_by=Scalar[dtype](anchor_by),
-            reference_angle=ref,
+            reference_angle=ref_angle,
             lower_limit=Scalar[dtype](lower_limit),
             upper_limit=Scalar[dtype](upper_limit),
             enable_limit=enable_limit,

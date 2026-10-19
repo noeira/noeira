@@ -19,7 +19,7 @@ Run: pixi run -e apple mojo run -I . tests/physics3d/test_cg_fields.mojo
 """
 
 from std.math import abs
-from std.sys import has_nvidia_gpu_accelerator
+from std.sys import default_accelerator
 from max.gpu.host import DeviceContext
 from layout import Layout
 
@@ -250,7 +250,7 @@ def part_a(ctx: DeviceContext) raises:
         if err > worst:
             worst = err
     print("  CG vs Newton qacc_constrained worst rel err:", worst)
-    if worst > 2e-2 and not has_nvidia_gpu_accelerator():
+    if worst > 2e-2 and not default_accelerator().is_nvidia_gpu():
         raise Error("Part A: CG diverges from Newton on the same problem")
     print("  Part A PASS: CG ≈ Newton")
 
@@ -287,7 +287,7 @@ def part_b(ctx: DeviceContext) raises:
         if err > worst:
             worst = err
     print("  fields-CPU vs fields-GPU CG worst rel err:", worst)
-    if worst > 1e-2 and not has_nvidia_gpu_accelerator():
+    if worst > 1e-2 and not default_accelerator().is_nvidia_gpu():
         raise Error("Part B: fields-CPU CG diverged from fields-GPU CG")
     print("  Part B PASS: fields-CPU CG ≈ fields-GPU CG")
 

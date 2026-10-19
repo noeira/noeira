@@ -77,7 +77,7 @@ from max.gpu.memory import AddressSpace
 from .je_budget import je_spills, je_ws_size, newton_block_threads
 from std.sys.info import size_of
 from max.gpu.host import DeviceContext
-from std.sys import has_nvidia_gpu_accelerator
+from std.sys import default_accelerator
 from layout import Layout, LayoutTensor
 
 from ..types import _max_one, ConeType
@@ -1022,7 +1022,7 @@ def _newton_solve_env[
     # the default rather than take a per-thread index list they cannot afford.
     TREE_AWARE: Bool = False,
     # ⚠ APPLE GPU ONLY (the per-env GPU kernel passes
-    # `not has_nvidia_gpu_accelerator()`; both CPU legs keep the default).
+    # `not default_accelerator().is_nvidia_gpu()`; both CPU legs keep the default).
     # The ELLIPTIC path caches every contact's tangent Jacobian rows in
     # `Jt_c`, `T_CAP*V_CAP` floats — 33.8 KB for LIBERO's
     # `libero_kitchen_scene3` (128 contacts, nv 22, condim 4) out of a ~91 KB
@@ -4257,7 +4257,7 @@ def _newton_solve_fields_kernel[
         # kernel at condim 4 ("exceeds available stack space") because the
         # all-contact tangent cache is 33.8 KB of a ~91 KB frame. CUDA keeps
         # the cache, so its numbers and its timings do not move.
-        JT_PC = not has_nvidia_gpu_accelerator(),
+        JT_PC = not default_accelerator().is_nvidia_gpu(),
     ](
         env, Dims[nq=NQ, nv=NV, nbody=NBODY, njoint=NJOINT, max_contacts=MAX_CONTACTS, ngeom=NGEOM, nequality=NEQUALITY, ntendon=NTENDON, nsite=NSITE](), qpos, qvel, xpos, xquat, subtree_com, contacts, smeta, joints,
         bodies, mmeta, trees, equality, tendons, sites, geoms_w, body_invweight0,
@@ -4415,7 +4415,7 @@ def solve_newton[
                 NEWTON_FORCE_BLOCKED and D.NV <= NEWTON_FORCE_BLOCKED_MAX_NV
             )
             if (
-                has_nvidia_gpu_accelerator() or FORCE_BLOCKED_HERE
+                default_accelerator().is_nvidia_gpu() or FORCE_BLOCKED_HERE
             ) and not NEWTON_FORCE_PER_ENV:
                 solve_newton_blocked["gpu", DTYPE, CONE_TYPE=CONE_TYPE, BATCH=BATCH, MAX_CONDIM=MAX_CONDIM, NOSLIP_ITER=NOSLIP_ITER, JE_WS=JE_WS](d, m, scratch, cscratch, ctx)
                 used_blocked = True

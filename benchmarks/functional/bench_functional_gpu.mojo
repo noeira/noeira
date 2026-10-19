@@ -30,7 +30,7 @@ from noeira.nn.primitives.ops.tanh_op import TanhOp
 from noeira.nn.primitives.linear import Linear
 from noeira.nn.combinators.sequential import Sequential
 from noeira.nn.loss.mse import mse_backward
-from std.sys import has_nvidia_gpu_accelerator
+from std.sys import default_accelerator
 from noeira.cuda.graph import CUDAGraph
 from noeira.nn.optimizer.adam import Adam
 from noeira.experimental.functional import Tape, FTensor
@@ -110,7 +110,7 @@ def _bench[
     _ct_step(net, ctx)
     _fn_step(tape)
     ctx.synchronize()
-    comptime GRAPHS = has_nvidia_gpu_accelerator()
+    comptime GRAPHS = default_accelerator().is_nvidia_gpu()
     var g_ct = CUDAGraph(ctx)
     comptime if GRAPHS:
         g_ct.begin_capture()

@@ -31,7 +31,7 @@ from noeira.nn.core.cudnn_conv import (
     cudnn_conv_backward_data,
     cudnn_conv_backward_filter,
 )
-from std.sys import CompilationTarget, has_nvidia_gpu_accelerator
+from std.sys import CompilationTarget, default_accelerator
 from max.gpu import thread_idx, block_idx, block_dim, global_idx
 from max.gpu.primitives import block
 from max.gpu.host import DeviceContext, DeviceBuffer
@@ -914,7 +914,7 @@ struct Conv2D[
     channel conv with a 25-64 long contraction and <= 16 outputs (MNIST conv1:
     58 us vs 99 cuDNN, 116 im2col). A property of the layer, not of the
     batch, because it decides the padding below."""
-    comptime CUB = has_nvidia_gpu_accelerator() and GEMM_PATH != "max" and GEMM_PATH != "convmax" and not Self.KEEP_MAX
+    comptime CUB = default_accelerator().is_nvidia_gpu() and GEMM_PATH != "max" and GEMM_PATH != "convmax" and not Self.KEEP_MAX
     """NVIDIA fp32: the three GEMMs (forward, dW, d_col) run on `cublas_gemm`,
     UNPADDED: cuBLAS takes any shape without the per-call workspace that MAX's
     fallback allocates, so `CPAD == COL` and `OCPAD == OC_` below and none of
@@ -925,7 +925,7 @@ struct Conv2D[
         """NVIDIA fp32: run this layer's forward and backward through cuDNN
         (`cudnn_conv`) instead of im2col + GEMM. `NN_CONV_PATH` selects;
         `auto` is the per-shape rule below."""
-        comptime if not has_nvidia_gpu_accelerator() or Self.ADT != DT or GEMM_PATH == "max" or GEMM_PATH == "convmax":
+        comptime if not default_accelerator().is_nvidia_gpu() or Self.ADT != DT or GEMM_PATH == "max" or GEMM_PATH == "convmax":
             return False
         comptime if CONV_PATH == "cudnn":
             return True

@@ -15,7 +15,7 @@ N*BATCH; TPB_REDUCE (64) is used by per-batch reduction kernels (one block
 per batch element) such as MSE/CE forward. These values were chosen during
 the nn bit-identity baselines (SAC -169.04118, MBPO -143.13, PPO -230.15)
 and changing them invalidates those baselines. If hardware-adaptive tuning
-is ever needed, gate via `has_nvidia_gpu_accelerator()` at the call site.
+is ever needed, gate via `default_accelerator().is_nvidia_gpu()` at the call site.
 Shape-derived block sizes (e.g. `TPB = max(OBS, ACT)` in gpu_replay) stay
 local to their kernel.
 """

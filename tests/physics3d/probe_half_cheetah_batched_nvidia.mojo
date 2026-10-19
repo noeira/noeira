@@ -25,7 +25,7 @@ What WAS running: env stepping, replay insertion, and the RemoteLogger
 production dispatch in `newton_solve.mojo` is
 
     comptime if CONE_TYPE == ConeType.PYRAMIDAL:
-        if has_nvidia_gpu_accelerator():
+        if default_accelerator().is_nvidia_gpu():
             solve_newton_blocked[...]
 
 so on this laptop that `if` is always False and the one-thread-per-env kernel

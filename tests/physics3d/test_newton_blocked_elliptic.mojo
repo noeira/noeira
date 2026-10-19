@@ -46,7 +46,7 @@ Run:
 """
 
 from std.math import abs
-from std.sys import has_nvidia_gpu_accelerator
+from std.sys import default_accelerator
 from std.testing import assert_true, TestSuite
 from max.gpu.host import DeviceContext
 from layout import Layout
@@ -443,7 +443,7 @@ def test_blocked_elliptic_matches_per_env() raises:
     var gap_f = _worst_rel(blk.forces, pe.forces)
     print("  blocked-GPU vs per-env-GPU  qacc worst rel:", gap_q,
           " forces:", gap_f)
-    if has_nvidia_gpu_accelerator():
+    if default_accelerator().is_nvidia_gpu():
         print("  (NVIDIA: `solve_newton` routes ELLIPTIC to the blocked"
               " kernel too — the same-device leg is an identity here)")
     assert_true(

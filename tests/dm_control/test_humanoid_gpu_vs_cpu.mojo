@@ -39,7 +39,7 @@ Run with:
 """
 
 from max.gpu.host import DeviceContext
-from std.sys import has_nvidia_gpu_accelerator
+from std.sys import default_accelerator
 from std.math import abs, sin
 from std.testing import assert_true, TestSuite
 
@@ -228,7 +228,7 @@ def test_humanoid_gpu_matches_cpu() raises:
         # humanoid_CMU's integrator kernel at all. Skipping keeps the gate
         # honest on Apple instead of turning a hardware limit into a red test
         # that nobody can fix here.
-        if has_nvidia_gpu_accelerator():
+        if default_accelerator().is_nvidia_gpu():
             _run[DMHumanoidCMUModel, DMHumanoidCMUConfig[WALK_SPEED],
                  "humanoidCMU-walk "](ctx, worst)
         else:
@@ -238,7 +238,7 @@ def test_humanoid_gpu_matches_cpu() raises:
                 " UNGATED until run on NVIDIA."
             )
         print(
-            "humanoid GPU vs CPU: ", 4 if has_nvidia_gpu_accelerator() else 3,
+            "humanoid GPU vs CPU: ", 4 if default_accelerator().is_nvidia_gpu() else 3,
             " configs x ", N_STEPS, " steps x ",
             N_ENVS, " lanes — worst abs diff = ", worst,
             " (bound ", ATOL, " + ", RTOL, "*|cpu|)",

@@ -22,7 +22,7 @@ type-checked every comptime branch the controller adds — the layouts
 `osc_control_step` binds, the `DynamicsScratch` in its `List`, the
 `apply_actions_kernel_gpu` call fed from `ctrl` instead of `actions`, and the
 `ACTION_DIM == 7` assert. `tests/libero/test_libero_osc_env.mojo` keeps the
-NVIDIA leg behind `comptime if has_nvidia_gpu_accelerator()` so the suite still
+NVIDIA leg behind `comptime if default_accelerator().is_nvidia_gpu()` so the suite still
 runs on Apple; this one does not, deliberately.
 
 ## WHAT IT PRINTS, AND WHAT THAT DOES AND DOES NOT SHOW

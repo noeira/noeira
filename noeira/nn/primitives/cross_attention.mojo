@@ -60,10 +60,10 @@ from max.gpu.host import DeviceContext
 from max.gpu.memory import AddressSpace
 from layout import Layout, LayoutTensor, TileTensor, row_major, Idx
 from linalg.bmm import batched_matmul
-from std.sys.info import has_nvidia_gpu_accelerator
+from std.sys.info import default_accelerator
 from nn.attention.gpu.mha import flash_attention_dispatch
 from nn.attention.mha_mask import NullMask
-from nn.attention.mha_operand import LayoutTensorMHAOperand
+from nn.attention.mha_operand import TileTensorMHAOperand
 
 from noeira.nn.constants import DT, TPB
 from ..core.tensor import Tensor, TensorImpl
@@ -530,7 +530,7 @@ def xa_fused_routes_to_max[MASKED: Bool, HD: Int]() -> Bool:
     comptime if not XA_FUSED_VIA_MAX:
         return False
     else:
-        return has_nvidia_gpu_accelerator() and (not MASKED) and HD == 64
+        return default_accelerator().is_nvidia_gpu() and (not MASKED) and HD == 64
 
 
 def _xa_fused_split[HD: Int]() -> Int:
@@ -1236,10 +1236,10 @@ struct CrossAttention[
                 _is_cache_length_accurate=True,
                 _use_valid_length=False,
             ](
-                o_tt.to_layout_tensor(),
-                q_tt.to_layout_tensor(),
-                LayoutTensorMHAOperand(k_tt),
-                LayoutTensorMHAOperand(v_tt),
+                o_tt,
+                q_tt,
+                TileTensorMHAOperand(k_tt),
+                TileTensorMHAOperand(v_tt),
                 NullMask(),
                 QL,
                 KL,

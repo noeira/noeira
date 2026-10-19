@@ -26,7 +26,7 @@ the form `mm.mojo` already uses on Apple — with two exceptions:
   `_naive_mm_kernel`, which also covers the cases MAX never sees here.
 """
 
-from std.sys import has_nvidia_gpu_accelerator
+from std.sys import default_accelerator
 from max.gpu import global_idx, thread_idx
 from max.gpu.sync import barrier
 from max.gpu.memory import AddressSpace
@@ -382,7 +382,7 @@ def gpu_linear_lt_bias(
 ) raises:
     """NVIDIA: `o = x @ w + bias` in ONE launch, the bias in cuBLASLt's
     epilogue — `Linear`'s forward, at its precision rule."""
-    comptime if has_nvidia_gpu_accelerator():
+    comptime if default_accelerator().is_nvidia_gpu():
         if cublas_tf32(m, n, k):
             cublaslt_gemm[False, False, DT, DT, True](
                 ctx, o, x, w, m, n, k, EPI_BIAS, bias=Int(bias.unsafe_ptr())
@@ -624,7 +624,7 @@ def gpu_matmul(
     b: DeviceBuffer[DT], m: Int, n: Int, k: Int,
 ) raises:
     """`o[m, n] = a[m, k] @ b[k, n]`."""
-    comptime if has_nvidia_gpu_accelerator():
+    comptime if default_accelerator().is_nvidia_gpu():
         _cublas[False, False](ctx, o, a, b, m, n, k, 0.0)
     else:
         if _degenerate(m, n, k):
@@ -639,7 +639,7 @@ def gpu_matmul_bwd_a[ACC: Bool](
 ) raises:
     """`ga[m, k] (+)= go[m, n] @ b[k, n]ᵀ`. `tmp_o` >= m·k (used only when
     accumulating through MAX's matmul, which cannot)."""
-    comptime if has_nvidia_gpu_accelerator():
+    comptime if default_accelerator().is_nvidia_gpu():
         _cublas[False, True](
             ctx, ga, go, b, m, k, n, Float32(1.0) if ACC else Float32(0.0)
         )
@@ -661,7 +661,7 @@ def gpu_matmul_bwd_b[ACC: Bool](
 ) raises:
     """`gb[k, n] (+)= a[m, k]ᵀ @ go[m, n]`. `tmp_t` >= m·k (aᵀ: MAX's matmul
     has no transpose_a), `tmp_o` >= k·n."""
-    comptime if has_nvidia_gpu_accelerator():
+    comptime if default_accelerator().is_nvidia_gpu():
         _cublas[True, False](
             ctx, gb, a, go, k, n, m, Float32(1.0) if ACC else Float32(0.0)
         )

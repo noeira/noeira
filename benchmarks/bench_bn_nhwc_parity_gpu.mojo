@@ -27,7 +27,7 @@ from std.math import sqrt
 from max.gpu import global_idx, thread_idx, block_idx
 from max.gpu.primitives import block
 from max.gpu.host import DeviceContext, DeviceBuffer
-from std.sys.info import has_nvidia_gpu_accelerator
+from std.sys.info import default_accelerator
 from std.time import perf_counter_ns
 from layout import Layout, LayoutTensor
 
@@ -468,7 +468,7 @@ def run_bn[
 
     # ---- verify NHWC-2D stats vs NCHW ref (NVIDIA-only; Metal ICEs it here) ----
     var stat_bad2 = 0
-    comptime if has_nvidia_gpu_accelerator():
+    comptime if default_accelerator().is_nvidia_gpu():
         ctx.enqueue_function[_bn_stats_nhwc_2d[C, R, NCHUNK]](
             xhr, psl2, pql2, grid_dim=NCHUNK, block_dim=BN2D_BLK)
         ctx.enqueue_function[_bn_finalize_nhwc_parallel[C, R, P2]](
@@ -521,7 +521,7 @@ def run_bn[
 
     # ---- time NHWC-2D (NVIDIA) ----
     var us_nhwc2 = us_nhwc   # default on Apple (2D skipped)
-    comptime if has_nvidia_gpu_accelerator():
+    comptime if default_accelerator().is_nvidia_gpu():
         comptime for _ in range(WARMUP):
             ctx.enqueue_function[_bn_stats_nhwc_2d[C, R, NCHUNK]](
                 xhr, psl2, pql2, grid_dim=NCHUNK, block_dim=BN2D_BLK)

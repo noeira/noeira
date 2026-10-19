@@ -18,7 +18,7 @@ relative — a band written on Metal's float32 would fail them for no defect
 
 from std.math import sqrt, abs
 from std.random import seed, random_float64
-from std.sys import has_nvidia_gpu_accelerator
+from std.sys import default_accelerator
 from std.testing import assert_true
 from max.gpu.host import DeviceContext
 
@@ -29,7 +29,7 @@ from noeira.nn.core.initializer import Kaiming
 from noeira.nn.primitives.linear import Linear
 
 
-comptime TOL = 1e-2 if has_nvidia_gpu_accelerator() else 1e-4
+comptime TOL = 1e-2 if default_accelerator().is_nvidia_gpu() else 1e-4
 
 
 def _err(ref_: List[Scalar[DT]], got: List[Scalar[DT]], n: Int) -> Float64:

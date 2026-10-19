@@ -92,13 +92,13 @@ attempted.
 
 from std.math import ceildiv, align_up
 from std.os import getenv
-from std.sys import has_nvidia_gpu_accelerator
+from std.sys import default_accelerator
 from std.sys.info import _has_blackwell_tcgen05
 
 from max.gpu.host import DeviceContext, FuncAttribute
 from max.gpu.host.info import H100, GPUInfo
 from layout import Layout, LayoutTensor, TileTensor, RuntimeLayout, UNKNOWN_VALUE
-from layout import row_major, Coord
+from layout import row_major, Coord, Idx
 from std.utils.index import Index
 
 from linalg.matmul import matmul as max_matmul
@@ -117,9 +117,9 @@ def splitk_path_applies[info: GPUInfo]() -> Bool:
     datacenter Blackwell (`matmul_dispatch_sm100` returns unconditionally).
     See the module docstring.
     """
-    comptime not_h100 = info != H100
+    comptime not_h100 = info != H100.gpu_info
     return (
-        has_nvidia_gpu_accelerator()
+        default_accelerator().is_nvidia_gpu()
         and not _has_blackwell_tcgen05()
         and not_h100
     )
@@ -307,24 +307,28 @@ def splitk_gemm[
         )
 
     comptime static_N = tensor_c.layout.shape[1].value()
-    comptime ws_layout = Layout.row_major(UNKNOWN_VALUE, UNKNOWN_VALUE, static_N)
-    var ws_rt_layout = RuntimeLayout[ws_layout].row_major(
-        Index(num_partitions, M, N)
-    )
-    var ws_lt = LayoutTensor[ws_type, ws_layout, MutAnyOrigin](
-        ws.dev.value(), ws_rt_layout
+    var ws_tt = TileTensor(
+        ws.dev.value(), row_major(Coord(num_partitions, Int(M), Idx[static_N]))
     )
 
     comptime kern = multistage_gemm_split_k_kernel[
-        c_type, tensor_c.layout,
-        a_type, tensor_a.layout,
-        b_type, tensor_b.layout,
-        ws_type, ws_lt.layout,
-        transpose_b, config, None,
+        c_type, type_of(c).LayoutType,
+        a_type, type_of(a).LayoutType,
+        b_type, type_of(b).LayoutType,
+        ws_type, type_of(ws_tt).LayoutType,
+        transpose_b,
+        type_of(c).linear_idx_type,
+        type_of(a).linear_idx_type,
+        type_of(b).linear_idx_type,
+        type_of(ws_tt).linear_idx_type,
+        config,
     ]
 
     ctx.enqueue_function[kern](
-        tensor_c, tensor_a, tensor_b, ws_lt, Int32(num_partitions),
+        c.as_unsafe_any_origin(),
+        a.as_unsafe_any_origin(),
+        b.as_unsafe_any_origin(),
+        ws_tt, Int32(num_partitions),
         grid_dim=(
             ceildiv(N, config.block_tile_shape[1]),
             ceildiv(M, config.block_tile_shape[0]),
@@ -337,9 +341,6 @@ def splitk_gemm[
         ),
     )
 
-    var ws_tt = TileTensor(
-        ws.dev.value(), row_major(Coord(num_partitions, M, N))
-    )
     split_k_reduce(c, ws_tt, ctx)
 
 

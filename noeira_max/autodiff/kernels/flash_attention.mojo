@@ -45,7 +45,7 @@ backward 32x32) and Apple's 32 KB at half the size.
 
 from std.math import exp2, log2, sqrt
 from std.sys import size_of
-from std.sys import has_nvidia_gpu_accelerator
+from std.sys import default_accelerator
 from max.gpu import thread_idx, block_idx, global_idx, WARP_SIZE
 from max.gpu.sync import barrier
 from max.gpu.memory import AddressSpace
@@ -58,7 +58,7 @@ comptime DT = DType.float32
 comptime TPB = 128
 
 
-comptime _NV = has_nvidia_gpu_accelerator()
+comptime _NV = default_accelerator().is_nvidia_gpu()
 comptime FWD_TQ = 64 if _NV else 32
 comptime FWD_TK = 32 if _NV else 16
 comptime DQ_TQ = 32 if _NV else 16

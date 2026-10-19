@@ -733,7 +733,7 @@ struct ChatClient(Movable):
         var msgs = List[ChatMessage]()
         msgs.append(ChatMessage.user(prompt^))
         var r = self.chat(msgs, system)
-        return r.text^
+        return r.text.copy()
 
 
 # ═══════════════════════════════════════════════════════════════════════════

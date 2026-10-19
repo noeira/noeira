@@ -32,7 +32,7 @@ NVIDIA (the interceptor needs the pixi activation's LD_PRELOAD):
 """
 
 from std.random import seed
-from std.sys import is_defined, has_nvidia_gpu_accelerator, has_accelerator
+from std.sys import is_defined, default_accelerator, has_accelerator
 from std.testing import assert_true
 from std.ffi import OwnedDLHandle
 from max.gpu.host import DeviceContext
@@ -267,7 +267,7 @@ def _stream_probe(ctx: DeviceContext) raises:
     `CUDAGraph(stream_of_context=True)`. A mismatch means MAX's kernels run on
     a stream `ctx.stream()` does not name, and per-context capture records
     nothing."""
-    comptime if has_nvidia_gpu_accelerator():
+    comptime if default_accelerator().is_nvidia_gpu():
         var t = Tensor.alloc_gpu(ctx, 4)
         var u = Tensor.alloc_gpu(ctx, 4)
         # A KERNEL: the interceptor records the stream at `cuLaunchKernelEx`,

@@ -69,7 +69,7 @@ deploy on the Orin holds the repacked blocks and nothing else
 """
 
 from std.memory import unsafe_memcpy
-from std.sys import has_nvidia_gpu_accelerator
+from std.sys import default_accelerator
 from std.sys.defines import get_defined_string
 from std.utils.index import Index
 from max.gpu import global_idx
@@ -103,7 +103,7 @@ comptime Q4_PATH = get_defined_string["NN_Q4_PATH", "auto"]()
 fp32 GEMM on every backend (A/B runs, and the int4 path's reference)."""
 comptime Q4_CFG = get_defined_string["NN_Q4_CFG", "small2"]()
 """The int4 GEMM's tile config (module docstring)."""
-comptime Q4_INT4_GEMM = has_nvidia_gpu_accelerator() and Q4_PATH != "deq"
+comptime Q4_INT4_GEMM = default_accelerator().is_nvidia_gpu() and Q4_PATH != "deq"
 """The GPU forward runs MAX's int4 GEMM (else it dequantizes)."""
 
 comptime _QCfg = MatmulConfig[
@@ -395,9 +395,9 @@ struct QLinear[IN_: Int, OUT_: Int](Module):
             row_major(Coord(Idx[Self.N_PAD], Idx[Self.PAD_ROW_BYTES])),
         )
         multistage_gemm_q[group_size=Q4_GROUP, pack_factor=8, config=CFG](
-            c_tt.to_layout_tensor(),
-            a_tt.as_immut().to_layout_tensor(),
-            b_tt.as_immut().to_layout_tensor(),
+            c_tt,
+            a_tt.as_imm(),
+            b_tt.as_imm(),
             CFG,
             c,
         )
@@ -464,7 +464,7 @@ struct QLinear[IN_: Int, OUT_: Int](Module):
             else:
                 self._need_blocks("forward")
                 self._dequantize_dev(c)
-                comptime if has_nvidia_gpu_accelerator():
+                comptime if default_accelerator().is_nvidia_gpu():
                     cublas_gemm[False, True, cublas_tf32(B, Self.OUT_, Self.IN_)](
                         c, out.dev.value(), x.dev.value(), self.deq.dev.value(),
                         B, Self.OUT_, Self.IN_, 0.0,
@@ -506,7 +506,7 @@ struct QLinear[IN_: Int, OUT_: Int](Module):
             var c = ctx.value()
             gx.ensure_gpu(c, B * Self.IN_)
             self._dequantize_dev(c)
-            comptime if has_nvidia_gpu_accelerator():
+            comptime if default_accelerator().is_nvidia_gpu():
                 cublas_gemm[False, False, cublas_tf32(B, Self.OUT_, Self.IN_)](
                     c, gx.dev.value(), grad_output.dev.value(),
                     self.deq.dev.value(), B, Self.IN_, Self.OUT_, 0.0,

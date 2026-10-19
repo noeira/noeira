@@ -24,7 +24,7 @@ Run on Apple : pixi run -e apple  mojo run -I . tests/physics3d/test_newton_free
 """
 
 from std.math import abs
-from std.sys import has_nvidia_gpu_accelerator
+from std.sys import default_accelerator
 from max.gpu.host import DeviceContext
 from layout import Layout
 
@@ -222,7 +222,7 @@ def _prep[target: StaticString, D: DimsLike](
 def _validate[
     MODEL: ModelDefLike,
     # ⚠⚠ FORCE THE BLOCKED KERNEL, WHICH `solve_newton` WOULD NOT LAUNCH HERE.
-    # Its routing is `if has_nvidia_gpu_accelerator()` — a RUNTIME test, so the
+    # Its routing is `if default_accelerator().is_nvidia_gpu()` — a RUNTIME test, so the
     # blocked kernel is COMPILED on Metal and simply never reached. That left a
     # hole exactly where the block work lives: the only multi-tree model in the
     # tree reached the blocked kernel on NVIDIA and nowhere else, so a change to
@@ -342,7 +342,7 @@ def _validate[
         ncon += Int(d_g.meta.data[e * METADATA_SIZE + META_IDX_NUM_CONTACTS])
     print("    contacts:", ncon, "(",
           "FORCED blocked" if FORCE_BLOCKED else
-          ("NVIDIA=blocked" if has_nvidia_gpu_accelerator()
+          ("NVIDIA=blocked" if default_accelerator().is_nvidia_gpu()
            else "Apple=per-env"), ")")
     if ncon == 0:
         print("    WARNING: 0 contacts (vacuous). Lower this model's torso_z\n"

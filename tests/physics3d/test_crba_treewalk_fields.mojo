@@ -26,7 +26,7 @@ Run: pixi run -e apple mojo run -I . tests/physics3d/test_crba_treewalk_fields.m
 
 from std.math import abs
 from max.gpu.host import DeviceContext
-from std.sys import has_nvidia_gpu_accelerator
+from std.sys import default_accelerator
 
 from noeira.nn.core.tensor import TensorImpl
 from noeira.physics3d.fields import Data, Model, DynamicsScratch, Dims, DimsLike
@@ -231,7 +231,7 @@ def _m_golden[
     else:
         var denom = abs(gold) if abs(gold) > 1e-9 else 1.0
         if abs(fp - gold) / denom > GOLD_RTOL and (
-            not has_nvidia_gpu_accelerator()
+            not default_accelerator().is_nvidia_gpu()
         ):
             raise Error(
                 name + " treewalk M fingerprint " + String(fp) + " != golden "

@@ -23,7 +23,7 @@ Mac with `mojo build --target-accelerator sm_120 --emit asm`.
 """
 
 from max.gpu.host import DeviceContext
-from std.sys import has_nvidia_gpu_accelerator
+from std.sys import default_accelerator
 from std.math import abs, sin
 from std.time import perf_counter_ns
 from std.testing import assert_true, TestSuite
@@ -273,7 +273,7 @@ def _part_b(ctx: DeviceContext) raises:
 
 
 def test_unitree_g1_walk_gpu() raises:
-    if not has_nvidia_gpu_accelerator():
+    if not default_accelerator().is_nvidia_gpu():
         print("  unitree_g1_walk GPU: SKIPPED on Apple (nv 35, Metal's"
               " per-thread stack). UNGATED until run on NVIDIA.")
         return

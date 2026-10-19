@@ -13,7 +13,7 @@ Run: pixi run -e default mojo run -I . tests/experimental/functional/test_functi
 """
 
 from std.random import seed, random_float64
-from std.sys import has_nvidia_gpu_accelerator
+from std.sys import default_accelerator
 from max.gpu.host import DeviceContext
 
 from noeira.nn.constants import DT

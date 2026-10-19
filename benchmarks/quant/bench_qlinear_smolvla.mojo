@@ -21,7 +21,7 @@ Weight bytes per layer, for the memory side: fp32 4 B per weight (a host and
 a device copy in noeira), Q4_0 0.5625 B, padded for MAX's repack.
 """
 
-from std.sys import has_nvidia_gpu_accelerator
+from std.sys import default_accelerator
 from std.time import perf_counter_ns
 from max.gpu.host import DeviceContext
 
@@ -36,7 +36,7 @@ from noeira.nn.quant.qlinear import (
 
 comptime CALLS = 10
 comptime SAMPLES = 7
-comptime INT4 = has_nvidia_gpu_accelerator() and Q4_PATH != "deq"
+comptime INT4 = default_accelerator().is_nvidia_gpu() and Q4_PATH != "deq"
 
 
 def _median(mut ts: List[Float64]) -> Float64:

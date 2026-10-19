@@ -47,7 +47,7 @@ which is precisely why the interceptor prints the begin/end rc values.
 
 from max.gpu import thread_idx
 from max.gpu.host import DeviceContext
-from std.sys import has_nvidia_gpu_accelerator
+from std.sys import default_accelerator
 from layout import Layout, LayoutTensor
 
 from noeira.nn.constants import DT
@@ -55,7 +55,7 @@ from noeira.cuda import CUDAGraph
 
 
 def main() raises:
-    comptime if not has_nvidia_gpu_accelerator():
+    comptime if not default_accelerator().is_nvidia_gpu():
         print("non-NVIDIA: capture is a comptime no-op here. Skipped.")
         return
 

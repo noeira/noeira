@@ -71,10 +71,10 @@ from std.time import perf_counter_ns
 
 from max.gpu.host import DeviceContext
 from layout import Layout, LayoutTensor, TileTensor, row_major, Idx
-from std.sys.info import has_nvidia_gpu_accelerator
+from std.sys.info import default_accelerator
 from nn.attention.gpu.mha import flash_attention, flash_attention_dispatch
 from nn.attention.mha_mask import NullMask
-from nn.attention.mha_operand import LayoutTensorMHAOperand
+from nn.attention.mha_operand import TileTensorMHAOperand
 
 from noeira.nn.constants import DT, TPB
 from noeira.nn.core.initializer import Deterministic
@@ -237,7 +237,7 @@ def _launch_max_fa[
     choice (naive two-BMM on any part its depth table does not name);
     FORCE=True is `flash_attention_dispatch` with the admission test
     overridden: the FA2 kernel, TF32 tensor-core matmuls, online softmax."""
-    comptime if not has_nvidia_gpu_accelerator():
+    comptime if not default_accelerator().is_nvidia_gpu():
         raise Error("MAX's flash attention rows run on NVIDIA only")
     else:
         # ⚠ `.unsafe_ptr()` severs the borrow; the Tensors are the caller's
@@ -263,8 +263,8 @@ def _launch_max_fa[
             ](
                 o_tt.to_layout_tensor(),
                 q_tt.to_layout_tensor(),
-                LayoutTensorMHAOperand(k_tt),
-                LayoutTensorMHAOperand(v_tt),
+                TileTensorMHAOperand(k_tt),
+                TileTensorMHAOperand(v_tt),
                 NullMask(),
                 QL,
                 KL,
@@ -406,7 +406,7 @@ def run_shape[
         String("Q  MAX FA2 kernel forced (TF32 mma)"),
     ]
     # MAX's rows: NVIDIA, unmasked, head dim 64 (see the header).
-    comptime MAX_ROWS = has_nvidia_gpu_accelerator() and not MASKED and HD == 64
+    comptime MAX_ROWS = default_accelerator().is_nvidia_gpu() and not MASKED and HD == 64
     comptime N_VARIANTS = 16 if MAX_ROWS else 14
     var ok = True
     var best_a = 0.0
