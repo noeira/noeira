@@ -22,16 +22,26 @@ from std.random import seed, random_float64
 from std.testing import assert_true
 from max.gpu.host import DeviceContext
 
+from std.sys import default_accelerator
 from noeira.nn.constants import DT
 from noeira.nn.core.tensor import Tensor
 from noeira.nn.core.tensor_refs import TensorRefs
 from noeira.nn.core.initializer import Kaiming
+from noeira.nn.primitives.flash_attention import ATTN_PATH
 from noeira.nn.primitives.attention import (
     ScaledDotProductAttention, ScaledDotProductAttentionQKV,
 )
 
 
-comptime TOL = 1e-4
+comptime TF32 = default_accelerator().is_nvidia_gpu() and ATTN_PATH == "auto"
+comptime TOL = 1e-2 if TF32 else 1e-4
+"""Both sides float32 in different orders: 1e-4. On NVIDIA the fused shapes
+run TF32 on the tensor cores (`flash_attention_tf32.mojo`, b65b87737, which
+landed after this test): 1e-2, the band `test_flash_attention` and every TF32
+GEMM gate use. Measured on an RTX 5090: 2.2e-3 .. 8.6e-3 (out and grad_in),
+the head-dim-8 fallback 3e-7; `-D NN_ATTN_PATH=no_tf32` restores strict fp32
+and 1e-4. The races are ruled out by the second, bit-identical run of each
+shape, and a layout error is O(1): the non-vacuity leg below reads 6.3."""
 
 
 def _err(ref_: List[Scalar[DT]], got: List[Scalar[DT]]) -> Float64:

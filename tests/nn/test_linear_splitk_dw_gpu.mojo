@@ -20,8 +20,16 @@ and "0 mismatches" means "nothing was tested". So the test PRINTS the partition
 count it chose and FAILS if no shape in the sweep actually split. A green run
 with `split shapes: 0` is a red run.
 
-    pixi run -e nvidia mojo run -I . tests/nn/test_linear_splitk_dw_gpu.mojo
-    NOEIRA_SPLITK=0 pixi run -e nvidia mojo run -I . tests/nn/...   # both arms plain
+⚠ ON NVIDIA THE DEFAULT GEMM PATH DOES NOT REACH THIS BRANCH. Since
+`c6355224a` Linear's fp32 backward runs on `cublas_gemm` (`CUBLAS_BWD`), which
+takes any shape without a per-call workspace, so the split-K dW route is only
+taken on MAX's GEMM path. The test therefore runs it there and says so
+otherwise:
+
+    pixi run -e nvidia mojo run -D NN_GEMM_PATH=linmax -I . tests/nn/test_linear_splitk_dw_gpu.mojo
+    NOEIRA_SPLITK=0 pixi run -e nvidia mojo run -D NN_GEMM_PATH=linmax -I . tests/nn/...   # both arms plain
+
+(`linmax` = MAX's GEMMs for Linear / LinearAct only; `max` / `bwdmax` reach it too.)
 """
 
 from std.math import abs
@@ -32,6 +40,7 @@ from noeira.nn.core.tensor import Tensor
 from noeira.nn.core.tensor_refs import TensorRefs
 from noeira.nn.core.initializer import Kaiming
 from noeira.nn.core.splitk_gemm import splitk_path_applies
+from noeira.nn.core.cublas_gemm import CUBLAS_BWD, GEMM_PATH
 from noeira.nn.primitives.linear import Linear
 
 
@@ -136,6 +145,15 @@ def main() raises:
         print(
             "split-K path does not apply on this device (Apple / AMD / H100 /"
             " sm_100 Blackwell) — Linear is unchanged here, nothing to test."
+        )
+        return
+    comptime if CUBLAS_BWD:
+        print(
+            "Linear's backward runs on cuBLAS on this path (NN_GEMM_PATH=",
+            GEMM_PATH,
+            "), so its split-K dW route is unreachable and nothing here is"
+            " tested. Run with -D NN_GEMM_PATH=linmax to exercise it.",
+            sep="",
         )
         return
 

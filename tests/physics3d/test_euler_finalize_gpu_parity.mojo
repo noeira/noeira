@@ -12,6 +12,16 @@ same values and the same worst digit, which is what says the split is the
 old kernel's arithmetic. The bound below is 1e-5 absolute: two decades
 above that rounding, five decades below what a halved damping does (0.32).
 
+⚠ OPEN (2026-10-19): ON AN RTX 5090 UNDER MOJO 1.2rc2 THIS READS 2.24e-05 and
+fails, the same on `dev` with and without the TileTensor migration, while Apple
+Metal still reads exactly 1.49e-06 (2^-20). The band is deliberately NOT
+widened: the cause is unknown. Ruled out: a change in how the GPU math lowers.
+The sm_120 PTX of this file under 1.1 and under 1.2rc2 has the same op mix
+(sqrt.approx 180 / 181, sin/cos/ex2/lg2.approx 6/6/8/8, fma.rn.f32 7329 /
+7298). Still open, and each needs an NVIDIA run: physics changes since the
+09-07 measurement, the 31 fewer FMA contractions, and the CPU leg itself (the
+box's x86 and the Mac's arm64 contract FMAs differently).
+
 WHY THIS FILE EXISTS. The finalize's implicit damping (`M_hat = M +
 dt*diag(damping)`, `mj_Euler`'s eulerdamp) runs only when a dof has damping,
 and the two gates that were green while a mutant halved that damping did not
