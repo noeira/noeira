@@ -181,7 +181,7 @@ def main() raises:
     a.train_device_kernels()
     ctx.synchronize()
     var idx = _download_idx(ctx, a.base.idx_s.value(), BATCH)
-    var rz = _download(ctx, a.base.r_z, CAP * D)
+    var rz = a.base.ring_z_host()
     var zneg = _download(ctx, a.head.z_neg, BATCH * D)
     var bz = _download(ctx, a.base.t.bz, BATCH * D)
     var worst = Float64(0)

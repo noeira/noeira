@@ -50,8 +50,8 @@ from noeira.core.tiles import Tile, tile
 # ══════════════════════════════════════════════════════════════════════
 
 
-def gather_rows_kernel[ROW_DIM: Int, BATCH: Int](
-    src: Pointer[Scalar[DT], MutAnyOrigin],
+def gather_rows_kernel[ROW_DIM: Int, BATCH: Int, SDT: DType = DT](
+    src: Pointer[Scalar[SDT], MutAnyOrigin],
     idx: Pointer[Scalar[IDX_DT], MutAnyOrigin],
     dst: Pointer[Scalar[DT], MutAnyOrigin],
 ):
@@ -60,17 +60,24 @@ def gather_rows_kernel[ROW_DIM: Int, BATCH: Int](
     Element-parallel, not lane-parallel: a per-lane kernel serialises the row
     copy inside each thread and launches only BATCH threads, which measured at
     ~73% of GPU time on wide rows elsewhere in this repo.
+
+    `SDT` is the SOURCE's storage type (a replay ring may hold fp16); the
+    batch is always `DT`. At `SDT == DT` the cast is the identity.
     """
     var t = Int(global_idx.x)
     if t >= BATCH * ROW_DIM:
         return
     var i = t // ROW_DIM
     var d = t % ROW_DIM
-    dst[unsafe_offset=t] = src[unsafe_offset=Int(idx[unsafe_offset=i]) * ROW_DIM + d]
+    dst[unsafe_offset=t] = src[
+        unsafe_offset=Int(idx[unsafe_offset=i]) * ROW_DIM + d
+    ].cast[DT]()
 
 
-def gather_rows_into_kernel[SRC_DIM: Int, DST_STRIDE: Int, BATCH: Int](
-    src: Pointer[Scalar[DT], MutAnyOrigin],
+def gather_rows_into_kernel[
+    SRC_DIM: Int, DST_STRIDE: Int, BATCH: Int, SDT: DType = DT
+](
+    src: Pointer[Scalar[SDT], MutAnyOrigin],
     idx: Pointer[Scalar[IDX_DT], MutAnyOrigin],
     dst: Pointer[Scalar[DT], MutAnyOrigin],
 ):
@@ -91,14 +98,14 @@ def gather_rows_into_kernel[SRC_DIM: Int, DST_STRIDE: Int, BATCH: Int](
     var d = t % SRC_DIM
     dst[unsafe_offset=i * DST_STRIDE + d] = src[
         unsafe_offset=Int(idx[unsafe_offset=i]) * SRC_DIM + d
-    ]
+    ].cast[DT]()
 
 
 def derive_tail_kernel[
     ROWS: Int, CAP: Int, LANES: Int, STORE_OBS: Int, ACT: Int, TAIL: Int,
-    OBS: Int,
+    OBS: Int, SDT: DType = DT,
 ](
-    r_obs: Pointer[Scalar[DT], MutAnyOrigin],    # CAP x STORE_OBS
+    r_obs: Pointer[Scalar[SDT], MutAnyOrigin],   # CAP x STORE_OBS, ring type
     r_act: Pointer[Scalar[DT], MutAnyOrigin],    # CAP x ACT
     r_age: Pointer[Scalar[DT], MutAnyOrigin],    # CAP, steps since this lane's reset
     idx: Pointer[Scalar[IDX_DT], MutAnyOrigin],  # ROWS, the drawn rows
@@ -149,7 +156,9 @@ def derive_tail_kernel[
         r += CAP
     var src_off = Int(spec[unsafe_offset=k * 4 + 2])
     if Int(spec[unsafe_offset=k * 4]) == 0:
-        dst[unsafe_offset=o] = r_obs[unsafe_offset=r * STORE_OBS + src_off]
+        dst[unsafe_offset=o] = r_obs[
+            unsafe_offset=r * STORE_OBS + src_off
+        ].cast[DT]()
     else:
         var a = r_act[unsafe_offset=r * ACT + src_off] * act_scale
         if a > act_clip:

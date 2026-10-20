@@ -105,8 +105,8 @@ from noeira.core.tiles import RowMajor, Tile
 # ══════════════════════════════════════════════════════════════════════
 
 
-def gather_cols_kernel[SRC_W: Int](
-    src: Pointer[Scalar[DT], MutAnyOrigin],
+def gather_cols_kernel[SRC_W: Int, SDT: DType = DT](
+    src: Pointer[Scalar[SDT], MutAnyOrigin],
     idx: Pointer[Scalar[IDX_DT], MutAnyOrigin],
     cols: Pointer[Scalar[DType.int32], MutAnyOrigin],
     dst: Pointer[Scalar[DT], MutAnyOrigin],
@@ -124,7 +124,7 @@ def gather_cols_kernel[SRC_W: Int](
     dst[unsafe_offset=t] = src[
         unsafe_offset=Int(idx[unsafe_offset=i]) * SRC_W
         + Int(cols[unsafe_offset=k])
-    ]
+    ].cast[DT]()
 
 
 def reg_reward_kernel[OBS_W: Int, ACT: Int, LANES: Int, CAP: Int](
@@ -242,6 +242,7 @@ struct FBMebeOnlineAgent[
     LANES: Int,
     ZBUF: Int = 10_000,
     DERIVED_TAIL: Int = 0,
+    RING_DT: DType = DT,
 ](OffPolicyAgentGpu):
     comptime AGENT_TRAIN_TARGET: StaticString = "gpu"
     comptime AGENT_OBS_DIM: Int = Self.OBS
@@ -250,6 +251,7 @@ struct FBMebeOnlineAgent[
     comptime Base = FBOnlineAgent[
         Self.FNET, Self.BNET, Self.ANET, Self.OBS, Self.ACT, Self.D,
         Self.BATCH, Self.CAP, Self.LANES, Self.ZBUF, 0, Self.DERIVED_TAIL,
+        Self.RING_DT,
     ]
     comptime Head = FBRegHead[
         Self.FNET, Self.BNET, Self.ANET, Self.QNET,
@@ -470,8 +472,8 @@ struct FBMebeOnlineAgent[
             hidx[i] = Scalar[IDX_DT](rows[i])
         c.enqueue_copy(self._idx_cr.value(), hidx)
         # 2. gather φ + filter columns, D2H
-        c.enqueue_function[gather_cols_kernel[Self.STORE_OBS]](
-            mptr(self.base.r_obs.dev.value().unsafe_ptr()),
+        c.enqueue_function[gather_cols_kernel[Self.STORE_OBS, Self.RING_DT]](
+            self.base.ring_obs_ptr(),
             mptr(self._idx_cr.value().unsafe_ptr()),
             mptr(self._cols_dev.value().unsafe_ptr()),
             mptr(self._phi_dev.dev.value().unsafe_ptr()),
@@ -519,9 +521,11 @@ struct FBMebeOnlineAgent[
         c.enqueue_copy(self._idx_pick.value(), hp)
         # 5. those rows → (normalise) → B → sphere → zsrc
         c.enqueue_function[
-            gather_rows_into_kernel[Self.STORE_OBS, Self.OBS, Self.BATCH]
+            gather_rows_into_kernel[
+                Self.STORE_OBS, Self.OBS, Self.BATCH, Self.RING_DT
+            ]
         ](
-            mptr(self.base.r_obs.dev.value().unsafe_ptr()),
+            self.base.ring_obs_ptr(),
             mptr(self._idx_pick.value().unsafe_ptr()),
             mptr(self._pool_obs.dev.value().unsafe_ptr()),
             grid_dim=_blocks(Self.BATCH * Self.STORE_OBS), block_dim=TPB,
@@ -576,9 +580,11 @@ struct FBMebeOnlineAgent[
                 hidx[i] = Scalar[IDX_DT](rows[done + (i if i < take else 0)])
             c.enqueue_copy(self._e_idx.value(), hidx)
             c.enqueue_function[
-                gather_rows_into_kernel[Self.STORE_OBS, Self.OBS, Self.BATCH]
+                gather_rows_into_kernel[
+                    Self.STORE_OBS, Self.OBS, Self.BATCH, Self.RING_DT
+                ]
             ](
-                mptr(self.base.r_obs.dev.value().unsafe_ptr()),
+                self.base.ring_obs_ptr(),
                 mptr(self._e_idx.value().unsafe_ptr()),
                 mptr(self._e_obs.dev.value().unsafe_ptr()),
                 grid_dim=_blocks(Self.BATCH * Self.STORE_OBS), block_dim=TPB,
@@ -625,8 +631,8 @@ struct FBMebeOnlineAgent[
         var dcols = c.enqueue_create_buffer[DType.int32](nc)
         c.enqueue_copy(dcols, hcols)
         var dout = c.enqueue_create_buffer[DT](n * nc)
-        c.enqueue_function[gather_cols_kernel[Self.STORE_OBS]](
-            mptr(self.base.r_obs.dev.value().unsafe_ptr()),
+        c.enqueue_function[gather_cols_kernel[Self.STORE_OBS, Self.RING_DT]](
+            self.base.ring_obs_ptr(),
             mptr(didx.unsafe_ptr()), mptr(dcols.unsafe_ptr()),
             mptr(dout.unsafe_ptr()), Int32(n), Int32(nc),
             grid_dim=(n * nc + TPB - 1) // TPB, block_dim=TPB,

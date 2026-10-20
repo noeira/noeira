@@ -98,6 +98,7 @@ struct FBCPROnlineAgent[
     SEQ: Int,
     ZBUF: Int = 10_000,
     DERIVED_TAIL: Int = 0,
+    RING_DT: DType = DT,
 ](OffPolicyAgentGpu):
     comptime AGENT_TRAIN_TARGET: StaticString = "gpu"
     comptime AGENT_OBS_DIM: Int = Self.OBS
@@ -107,7 +108,7 @@ struct FBCPROnlineAgent[
     comptime Base = FBOnlineAgent[
         Self.FNET, Self.BNET, Self.ANET, Self.OBS, Self.ACT, Self.D,
         Self.BATCH, Self.CAP, Self.LANES, Self.ZBUF, 0,
-        Self.DERIVED_TAIL,
+        Self.DERIVED_TAIL, Self.RING_DT,
     ]
     comptime Head = FBCPRHead[
         Self.FNET, Self.BNET, Self.ANET, Self.DNET, Self.QNET,

@@ -96,6 +96,7 @@ by the G3.4 eval, never one alone.
 from std.math import sqrt
 from std.random import seed, random_float64
 from std.sys import argv
+from std.sys.defines import get_defined_int, get_defined_string
 from std.time import perf_counter_ns
 from max.gpu import global_idx
 
@@ -207,7 +208,21 @@ comptime BATCH: Int = 1024
 # the buffer). A LOSS is not, and needs 1024/3 + CAP 1 M as the control before
 # anything is concluded. That control is also the CAP probe §12.23 has been
 # asking for since the ring rewrite and which has never been run.
-comptime CAP: Int = 1_000_000
+#
+# `-D G1_RING_DT=fp16` stores the ring's `obs` and `z` columns as fp16
+# (docs §16): 3256 -> 1690 B per transition, so `-D G1_CAP=2000000` costs
+# what CAP 1 M costs in fp32. fp16, not bf16: the ring holds RAW observations
+# and fp16 rounds them 9x finer (worst 0.005 std against 0.047). The
+# defaults stay fp32 / 1 M — the run at 36.9 M -> 100 M was launched on them,
+# and a buffer change goes through a short A/B first.
+comptime CAP: Int = get_defined_int["G1_CAP", 1_000_000]()
+comptime RING_DT: DType = (
+    DType.float16 if get_defined_string["G1_RING_DT", "fp32"]() == "fp16"
+    else (
+        DType.bfloat16 if get_defined_string["G1_RING_DT", "fp32"]() == "bf16"
+        else DType.float32
+    )
+)
 comptime SEQ: Int = 8
 comptime ZBUF: Int = 8192
 comptime T_EPISODE: Int = 500
@@ -230,6 +245,7 @@ comptime QNet = BFMFTower[OBS, ACT, D, H, L, 1]
 comptime Agent = FBCPROnlineAgent[
     FNet, BNet, ANet, DNet, QNet, OBS, ACT, D, BATCH, CAP, N_ENVS, SEQ, ZBUF,
     G1_ACTOR_EXTRA,   # DERIVED_TAIL — the 401 the ring does NOT store (§12.36)
+    RING_DT,
 ]
 comptime NQ = UnitreeG1Model.NQ
 comptime NV = UnitreeG1Model.NV
@@ -666,6 +682,8 @@ def main() raises:
     logger.set_config("env", "unitree_g1")
     logger.set_config("target", "gpu")
     logger.set_config("lanes", String(N_ENVS))
+    logger.set_config("cap", String(CAP))
+    logger.set_config("ring_dt", String(RING_DT))
     logger.set_config("obs", String(OBS))
     logger.set_config("act", String(ACT))
     logger.set_config("d", String(D))

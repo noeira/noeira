@@ -187,7 +187,7 @@ def test_pool(ctx: DeviceContext) raises:
     assert_true(on == BATCH, "a pooled z is off the sphere")
     assert_true(moved == BATCH, "a pooled z still holds its init value")
     var n = a.base.size
-    var ring = _dl(ctx, a.base.r_obs, CAP * OBS)
+    var ring = a.base.ring_obs_host()
     var pool = _dl(ctx, a._pool_obs, BATCH * OBS)
     var rows2 = List[Int]()
     var miss = _pool_rows_in_ring(pool, ring, n, rows2)
@@ -203,7 +203,7 @@ def test_pool(ctx: DeviceContext) raises:
     _fill(ctx, b, 1600)
     b.refresh_pool()
     ctx.synchronize()
-    var ring0 = _dl(ctx, b.base.r_obs, CAP * OBS)
+    var ring0 = b.base.ring_obs_host()
     var pool0 = _dl(ctx, b._pool_obs, BATCH * OBS)
     var rows0 = List[Int]()
     _ = _pool_rows_in_ring(pool0, ring0, b.base.size, rows0)
@@ -236,7 +236,7 @@ def test_reward_column(ctx: DeviceContext) raises:
     var a = _make(ctx, 2.0, False)
     _fill(ctx, a, 1200)          # < CAP: no wrap, rows 0..size-1 in order
     var n = a.base.size
-    var ring = _dl(ctx, a.base.r_obs, CAP * OBS)
+    var ring = a.base.ring_obs_host()
     var act = _dl(ctx, a.base.r_act, CAP * ACT)
     var bnd = _dl(ctx, a.base.r_bnd, CAP)
     var rr = _dl(ctx, a.r_rew, CAP)

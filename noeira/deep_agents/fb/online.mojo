@@ -124,19 +124,36 @@ from noeira.core.tiles import RowMajor, Tile, tile
 # ══════════════════════════════════════════════════════════════════════
 
 
+@always_inline
+def to_ring[RDT: DType](x: Scalar[DT]) -> Scalar[RDT]:
+    """`x` in the ring's storage type. fp16 SATURATES at ±65504 rather than
+    storing ±inf: one exploding rollout would otherwise poison every batch
+    that draws the row (a NaN stays a NaN either way)."""
+    comptime if RDT == DType.float16:
+        comptime HMAX = Scalar[DT](65504.0)
+        var y = x
+        if y > HMAX:
+            y = HMAX
+        if y < -HMAX:
+            y = -HMAX
+        return y.cast[RDT]()
+    else:
+        return x.cast[RDT]()
+
+
 def ring_store_kernel[
-    OBS: Int, ACT: Int, D: Int, CAP: Int, LANES: Int
+    OBS: Int, ACT: Int, D: Int, CAP: Int, LANES: Int, RDT: DType = DT
 ](
     obs_src: Pointer[Scalar[DT], MutAnyOrigin],
     act_src: Pointer[Scalar[DT], MutAnyOrigin],
     term_src: Pointer[Scalar[DT], MutAnyOrigin],
     z_src: Pointer[Scalar[DT], MutAnyOrigin],
-    r_obs: Pointer[Scalar[DT], MutAnyOrigin],
+    r_obs: Pointer[Scalar[RDT], MutAnyOrigin],
     r_act: Pointer[Scalar[DT], MutAnyOrigin],
     r_term: Pointer[Scalar[DT], MutAnyOrigin],
     r_bnd: Pointer[Scalar[DT], MutAnyOrigin],
     r_age: Pointer[Scalar[DT], MutAnyOrigin],
-    r_z: Pointer[Scalar[DT], MutAnyOrigin],
+    r_z: Pointer[Scalar[RDT], MutAnyOrigin],
     pos: Int32,
     bnd: Int32,
     age: Int32,
@@ -162,6 +179,9 @@ def ring_store_kernel[
     Element-parallel over the concatenated row width so a wide `z` (128) does
     not serialise inside a per-lane thread. `pos` is a host scalar because
     `record_batch_gpu` is eager — the driver never captures it.
+
+    `RDT` is the storage type of the two WIDE columns, `obs` and `z` (the
+    agent's `RING_DT`); `act` and the three per-row scalars stay `DT`.
     """
     comptime W = OBS + ACT + D + 3
     var t = Int(global_idx.x)
@@ -171,13 +191,17 @@ def ring_store_kernel[
     var k = t % W
     var row = (Int(pos) + lane) % CAP
     if k < OBS:
-        r_obs[unsafe_offset=row * OBS + k] = obs_src[unsafe_offset=lane * OBS + k]
+        r_obs[unsafe_offset=row * OBS + k] = to_ring[RDT](
+            obs_src[unsafe_offset=lane * OBS + k]
+        )
     elif k < OBS + ACT:
         var j = k - OBS
         r_act[unsafe_offset=row * ACT + j] = act_src[unsafe_offset=lane * ACT + j]
     elif k < OBS + ACT + D:
         var j = k - OBS - ACT
-        r_z[unsafe_offset=row * D + j] = z_src[unsafe_offset=lane * D + j]
+        r_z[unsafe_offset=row * D + j] = to_ring[RDT](
+            z_src[unsafe_offset=lane * D + j]
+        )
     elif k == OBS + ACT + D:
         r_term[unsafe_offset=row] = term_src[unsafe_offset=lane]
     elif k == OBS + ACT + D + 1:
@@ -447,6 +471,18 @@ def z_pin_kernel[D: Int, LANES: Int](
         z_lane[unsafe_offset=i] = z_pin[unsafe_offset=i]
 
 
+def _ring_to_host[
+    RDT: DType
+](ctx: DeviceContext, ref src: DeviceBuffer[RDT], n: Int) raises -> Tensor:
+    var h = ctx.enqueue_create_host_buffer[RDT](n)
+    ctx.enqueue_copy(h, src)
+    ctx.synchronize()
+    var t = Tensor.alloc(n)
+    for i in range(n):
+        t.data[i] = h[i].cast[DT]()
+    return t^
+
+
 struct FBOnlineAgent[
     FNET: Module,
     BNET: Module,
@@ -460,6 +496,7 @@ struct FBOnlineAgent[
     ZBUF: Int = 10_000,
     EXPERT_ROWS: Int = 0,
     DERIVED_TAIL: Int = 0,
+    RING_DT: DType = DT,
 ](OffPolicyAgentGpu):
     """`OffPolicyAgentGpu` conformer around `FBTrainer[..., "gpu"]`.
 
@@ -473,6 +510,15 @@ struct FBOnlineAgent[
     expert rows ONLY (`FBTrainer.fill_bc_mask`); their `z` is always drawn
     fresh (no stored z to keep). Without an attached store the agent samples
     the ring alone, whatever `EXPERT_ROWS` says — one binary, both arms.
+
+    `RING_DT` is the storage type of the ring's `obs` and `z` columns — 3/4
+    of its bytes (docs BFM_ZERO_G1_REPRODUCTION §16). The ring holds RAW
+    observations (the normaliser runs on the gathered batch), so fp16 is the
+    half-width type to use, not bf16: on the G1's 527 stored columns fp16's
+    worst rounding is 0.005 of a feature's std against bf16's 0.047, and the
+    largest |obs| is 29 against fp16's 65504 (saturated on write regardless,
+    `to_ring`). Every gather casts back to `DT`, so nothing downstream of the
+    batch sees the storage type.
     """
 
     comptime AGENT_TRAIN_TARGET: StaticString = "gpu"
@@ -496,9 +542,9 @@ struct FBOnlineAgent[
     var tracker: EpisodeTracker
 
     # ── replay ring (device only — no host mirror of CAP x D floats) ────
-    var r_obs: Tensor
+    var r_obs: Optional[DeviceBuffer[Self.RING_DT]]   # CAP x STORE_OBS
     var r_act: Tensor
-    var r_z: Tensor
+    var r_z: Optional[DeviceBuffer[Self.RING_DT]]     # CAP x D
     var r_term: Tensor
     var r_bnd: Tensor          # CAP, 1 = this row's successor is post-reset
     var r_age: Tensor          # CAP, steps since this lane's reset (capped)
@@ -597,9 +643,9 @@ struct FBOnlineAgent[
             window=List[Scalar[DT]](), window_size=0, idx=0,
             current_return=Scalar[DT](0.0), ep_count=0,
         )
-        self.r_obs = Tensor()
+        self.r_obs = None
         self.r_act = Tensor()
-        self.r_z = Tensor()
+        self.r_z = None
         self.r_term = Tensor()
         self.r_bnd = Tensor()
         self.r_age = Tensor()
@@ -755,9 +801,13 @@ struct FBOnlineAgent[
         # Ring: device only. A host mirror of CAP x (OBS + ACT + D + 2)
         # floats at CAP = 1 M would be ~350 MB of host RAM nothing reads.
         # `next_obs` is derived, not stored — see `ring_store_kernel`.
-        a.r_obs.ensure_gpu(ctx, Self.CAP * Self.STORE_OBS)
+        var r_o = ctx.enqueue_create_buffer[Self.RING_DT](Self.CAP * Self.STORE_OBS)
+        r_o.enqueue_fill(Scalar[Self.RING_DT](0.0))
+        a.r_obs = r_o^
         a.r_act.ensure_gpu(ctx, Self.CAP * Self.ACT)
-        a.r_z.ensure_gpu(ctx, Self.CAP * Self.D)
+        var r_zb = ctx.enqueue_create_buffer[Self.RING_DT](Self.CAP * Self.D)
+        r_zb.enqueue_fill(Scalar[Self.RING_DT](0.0))
+        a.r_z = r_zb^
         a.r_term.ensure_gpu(ctx, Self.CAP)
         a.r_bnd.ensure_gpu(ctx, Self.CAP)
         # Every row starts flagged. This is NOT what keeps the warmup safe —
@@ -810,6 +860,25 @@ struct FBOnlineAgent[
         return a^
 
     # ── expert store (A3.5) ──────────────────────────────────────────────
+
+    def ring_obs_ptr(self) -> Pointer[Scalar[Self.RING_DT], MutAnyOrigin]:
+        """The ring's `obs` column (`CAP x STORE_OBS`, `RING_DT`). Readers
+        cast to `DT` (`gather_rows_into_kernel[..., SDT=RING_DT]`)."""
+        return mptr(self.r_obs.value().unsafe_ptr())
+
+    def ring_z_ptr(self) -> Pointer[Scalar[Self.RING_DT], MutAnyOrigin]:
+        """The ring's `z` column (`CAP x D`, `RING_DT`)."""
+        return mptr(self.r_z.value().unsafe_ptr())
+
+    def ring_obs_host(self) raises -> Tensor:
+        """Host copy of the whole `obs` column, widened to `DT` (tests)."""
+        return _ring_to_host(
+            self.ctx.value(), self.r_obs.value(), Self.CAP * Self.STORE_OBS
+        )
+
+    def ring_z_host(self) raises -> Tensor:
+        """Host copy of the whole `z` column, widened to `DT` (tests)."""
+        return _ring_to_host(self.ctx.value(), self.r_z.value(), Self.CAP * Self.D)
 
     def attach_expert(
         mut self,
@@ -892,9 +961,9 @@ struct FBOnlineAgent[
         )
         # the STORED head; the derived tail follows below
         c.enqueue_function[
-            gather_rows_into_kernel[Self.STORE_OBS, Self.OBS, ROWS]
+            gather_rows_into_kernel[Self.STORE_OBS, Self.OBS, ROWS, Self.RING_DT]
         ](
-            mptr(self.r_obs.dev.value().unsafe_ptr()), ip_s,
+            self.ring_obs_ptr(), ip_s,
             mptr(self.t.bs.dev.value().unsafe_ptr()).unsafe_offset(row0 * Self.OBS),
             grid_dim=_blocks(ROWS * Self.STORE_OBS), block_dim=TPB,
         )
@@ -904,21 +973,21 @@ struct FBOnlineAgent[
             grid_dim=_blocks(ROWS * Self.ACT), block_dim=TPB,
         )
         c.enqueue_function[
-            gather_rows_into_kernel[Self.STORE_OBS, Self.OBS, ROWS]
+            gather_rows_into_kernel[Self.STORE_OBS, Self.OBS, ROWS, Self.RING_DT]
         ](
-            mptr(self.r_obs.dev.value().unsafe_ptr()), ip_sn,
+            self.ring_obs_ptr(), ip_sn,
             mptr(self.t.bsn.dev.value().unsafe_ptr()).unsafe_offset(row0 * Self.OBS),
             grid_dim=_blocks(ROWS * Self.STORE_OBS), block_dim=TPB,
         )
-        c.enqueue_function[gather_rows_kernel[Self.D, ROWS]](
-            mptr(self.r_z.dev.value().unsafe_ptr()), ip_s,
+        c.enqueue_function[gather_rows_kernel[Self.D, ROWS, Self.RING_DT]](
+            self.ring_z_ptr(), ip_s,
             mptr(self.t.bz.dev.value().unsafe_ptr()).unsafe_offset(row0 * Self.D),
             grid_dim=_blocks(ROWS * Self.D), block_dim=TPB,
         )
         c.enqueue_function[
-            gather_rows_into_kernel[Self.STORE_OBS, Self.OBS, ROWS]
+            gather_rows_into_kernel[Self.STORE_OBS, Self.OBS, ROWS, Self.RING_DT]
         ](
-            mptr(self.r_obs.dev.value().unsafe_ptr()), ip_sp,
+            self.ring_obs_ptr(), ip_sp,
             mptr(self.t.bsp.dev.value().unsafe_ptr()).unsafe_offset(row0 * Self.OBS),
             grid_dim=_blocks(ROWS * Self.STORE_OBS), block_dim=TPB,
         )
@@ -931,12 +1000,12 @@ struct FBOnlineAgent[
         # someone widens a filter.
         comptime if Self.DERIVED_TAIL > 0:
             var sp = self.tail_spec.value().unsafe_ptr()
-            var ro = mptr(self.r_obs.dev.value().unsafe_ptr())
+            var ro = self.ring_obs_ptr()
             var ra = mptr(self.r_act.dev.value().unsafe_ptr())
             var rg = mptr(self.r_age.dev.value().unsafe_ptr())
             comptime TK = derive_tail_kernel[
                 ROWS, Self.CAP, Self.LANES, Self.STORE_OBS, Self.ACT,
-                Self.DERIVED_TAIL, Self.OBS,
+                Self.DERIVED_TAIL, Self.OBS, Self.RING_DT,
             ]
             comptime nbt = _blocks(ROWS * Self.DERIVED_TAIL)
             c.enqueue_function[TK](
@@ -1309,19 +1378,20 @@ struct FBOnlineAgent[
         comptime W = Self.STORE_OBS + Self.ACT + Self.D + 3
         ctx.enqueue_function[
             ring_store_kernel[
-                Self.STORE_OBS, Self.ACT, Self.D, Self.CAP, Self.LANES
+                Self.STORE_OBS, Self.ACT, Self.D, Self.CAP, Self.LANES,
+                Self.RING_DT,
             ]
         ](
             mptr(prev_obs_dev.unsafe_ptr()),
             mptr(action_dev.unsafe_ptr()),
             mptr(done_dev.unsafe_ptr()),
             mptr(self.z_lane.dev.value().unsafe_ptr()),
-            mptr(self.r_obs.dev.value().unsafe_ptr()),
+            self.ring_obs_ptr(),
             mptr(self.r_act.dev.value().unsafe_ptr()),
             mptr(self.r_term.dev.value().unsafe_ptr()),
             mptr(self.r_bnd.dev.value().unsafe_ptr()),
             mptr(self.r_age.dev.value().unsafe_ptr()),
-            mptr(self.r_z.dev.value().unsafe_ptr()),
+            self.ring_z_ptr(),
             Int32(self.pos),
             Int32(1) if self.bnd_next else Int32(0),
             Int32(self.age_next),

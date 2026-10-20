@@ -22,6 +22,12 @@ a property the loss curve could not show:
       the setting the walker runs use and the one the first online run
       reported `episodes 0` under (§18.7). Pendulum truncates at 200, so
       4096 steps over 4 lanes must complete ~20 episodes.
+  [8] the expert slice (A3.5): store rows first, ring rows after.
+  [9] an fp16 ring (`RING_DT = float16`) stores EXACTLY the fp32 ring's
+      values rounded to fp16, saturates 1e6 to 65504 instead of +inf, and
+      its gathered `s` / `z` batch is the fp32 agent's batch rounded the same
+      way, element for element — with some element actually rounded, so the
+      comparison is not fp32 against itself.
 
 Run (Apple Metal or NVIDIA):
     pixi run -e apple mojo run -I . tests/deep_agents/test_fb_online_smoke.mojo
@@ -76,6 +82,9 @@ comptime EnvT = BatchedGpuEnv[PendulumV2[DT], LANES, OBS, ACT]
 comptime EXPERT = 32
 comptime AgentX = FBOnlineAgent[
     FNet, BNet, ANet, OBS, ACT, D, BATCH, CAP, LANES, ZBUF, EXPERT
+]
+comptime Agent16 = FBOnlineAgent[
+    FNet, BNet, ANet, OBS, ACT, D, BATCH, CAP, LANES, ZBUF, 0, 0, DType.float16
 ]
 
 
@@ -228,7 +237,7 @@ def test_driver_ring_and_capture(ctx: DeviceContext) raises:
     print("      [2] ring: size", a.size, " pos", a.pos, " (CAP", CAP, ")")
     assert_true(a.size == CAP, "ring did not fill to CAP after 3*CAP steps")
     assert_true(a.pos == 0, "write head did not wrap back to 0")
-    var rz = _download_rows(ctx, a.r_z, CAP * D)
+    var rz = a.ring_z_host()
     var on = _rows_on_sphere(rz, CAP, 1e-3)
     print("      [2] stored z on sphere:", on, "/", CAP)
     assert_true(on == CAP, "a stored z row is off the sphere")
@@ -451,6 +460,97 @@ def test_expert_slice(ctx: DeviceContext) raises:
     print("      OK")
 
 
+def _f16(x: Scalar[DT]) -> Float64:
+    """What the fp16 ring must hold for `x`: round-to-nearest fp16, with
+    |x| above the fp16 max SATURATED (the host cast would give inf)."""
+    if Float64(x) > 65504.0:
+        return 65504.0
+    if Float64(x) < -65504.0:
+        return -65504.0
+    return Float64(x.cast[DType.float16]().cast[DT]())
+
+
+def _count_off(ref got: Tensor, ref ref32: Tensor, n: Int) -> Tuple[Int, Int]:
+    """(elements of `got` != fp16(`ref32`), elements where fp16 changed the
+    fp32 value at all) over the first `n`."""
+    var bad = 0
+    var rounded = 0
+    for i in range(n):
+        var want = _f16(ref32.data[i])
+        if Float64(got.data[i]) != want:
+            bad += 1
+        if want != Float64(ref32.data[i]):
+            rounded += 1
+    return (bad, rounded)
+
+
+def test_ring_fp16(ctx: DeviceContext) raises:
+    """[9] the fp16 ring against the fp32 ring, same seed, same records."""
+    print("[9] fp16 ring: stores fp16(x), saturates, gathers the same batch ...")
+    seed(SEED)
+    var a = _make(ctx)
+    seed(SEED)
+    var h = Agent16.make(
+        ctx, lr=1e-3, learning_starts=LEARNING_STARTS, action_scale=2.0,
+        z_hold=Z_HOLD, window_size=8, seed=UInt64(SEED),
+    )
+    var ob = ctx.enqueue_create_buffer[DT](LANES * OBS)
+    var hob = ctx.enqueue_create_host_buffer[DT](LANES * OBS)
+    var ac = ctx.enqueue_create_buffer[DT](LANES * ACT)
+    ac.enqueue_fill(Scalar[DT](0.11))
+    var rw = ctx.enqueue_create_buffer[DT](LANES)
+    rw.enqueue_fill(Scalar[DT](0.0))
+    var dn = ctx.enqueue_create_buffer[DT](LANES)
+    dn.enqueue_fill(Scalar[DT](0.0))
+    comptime NREC = 6
+    for r in range(NREC):
+        for i in range(LANES * OBS):
+            # not fp16-representable (0.1-ish steps), one row out of range
+            hob[i] = Scalar[DT](0.1 + 0.0123 * Float64(i) - 0.37 * Float64(r))
+        if r == 2:
+            hob[0] = Scalar[DT](1.0e6)
+            hob[1] = Scalar[DT](-1.0e6)
+        ctx.enqueue_copy(ob, hob)
+        a.record_batch_gpu[LANES](ctx, ob, ac, rw, ob, dn)
+        h.record_batch_gpu[LANES](ctx, ob, ac, rw, ob, dn)
+    ctx.synchronize()
+    comptime NW = NREC * LANES
+    var o32 = a.ring_obs_host()
+    var o16 = h.ring_obs_host()
+    var z32 = a.ring_z_host()
+    var z16 = h.ring_z_host()
+    var so = _count_off(o16, o32, NW * OBS)
+    var sz = _count_off(z16, z32, NW * D)
+    var sat = Float64(o16.data[2 * LANES * OBS])
+    var satn = Float64(o16.data[2 * LANES * OBS + 1])
+    print("      [9] ring obs: off", so[0], "of", NW * OBS, "(rounded", so[1],
+          ")  z: off", sz[0], "of", NW * D, "(rounded", sz[1], ")  1e6 ->", sat,
+          " -1e6 ->", satn)
+    assert_true(so[0] == 0, "the fp16 ring's obs is not fp16(the fp32 ring's)")
+    assert_true(sz[0] == 0, "the fp16 ring's z is not fp16(the fp32 ring's)")
+    assert_true(so[1] > 0 and sz[1] > 0, "nothing was rounded: [9] compared fp32 to fp32")
+    assert_true(sat == 65504.0 and satn == -65504.0, "1e6 did not saturate to ±65504")
+
+    a._gather_batch()
+    h._gather_batch()
+    ctx.synchronize()
+    var bs32 = _download_rows(ctx, a.t.bs, BATCH * OBS)
+    var bs16 = _download_rows(ctx, h.t.bs, BATCH * OBS)
+    var bz32 = _download_rows(ctx, a.t.bz, BATCH * D)
+    var bz16 = _download_rows(ctx, h.t.bz, BATCH * D)
+    var bsn32 = _download_rows(ctx, a.t.bsn, BATCH * OBS)
+    var bsn16 = _download_rows(ctx, h.t.bsn, BATCH * OBS)
+    var gs = _count_off(bs16, bs32, BATCH * OBS)
+    var gz = _count_off(bz16, bz32, BATCH * D)
+    var gn = _count_off(bsn16, bsn32, BATCH * OBS)
+    print("      [9] batch s: off", gs[0], "(rounded", gs[1], ")  s':", gn[0],
+          "(rounded", gn[1], ")  z: off", gz[0], "(rounded", gz[1], ")")
+    assert_true(gs[0] == 0 and gn[0] == 0, "the fp16 agent's gathered s / s' differ from fp16(fp32's)")
+    assert_true(gz[0] == 0, "the fp16 agent's gathered z differs from fp16(fp32's)")
+    assert_true(gs[1] > 0 and gz[1] > 0, "the gathered batch was never rounded")
+    print("      OK")
+
+
 def main() raises:
     print("=" * 70)
     print("FB online agent smoke — Pendulum, 4 lanes")
@@ -461,4 +561,5 @@ def main() raises:
     test_driver_ring_and_capture(ctx)
     test_episode_readback_at_sync_32(ctx)
     test_expert_slice(ctx)
+    test_ring_fp16(ctx)
     print("\n[PASS] FB online smoke")
