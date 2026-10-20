@@ -23,6 +23,7 @@ from std.math import sqrt, sqrt as fsqrt
 from noeira.nn.constants import DT, TPB
 from noeira.nn.core.tensor import Tensor
 from noeira.core.tiles import Tile
+from noeira.io.fileio import write_text_atomic
 
 
 comptime _V[n: Int] = Tile[DT, n]
@@ -116,8 +117,7 @@ struct RunningMeanStd(Movable):
         for k in range(len(self.var_)):
             s += " " + String(self.var_[k])
         s += "\n"
-        with open(path, "w") as f:
-            f.write(s)
+        write_text_atomic(path, s)
 
 
 

@@ -476,10 +476,10 @@ def main() raises:
             )
             var names = List[String]()
             var vals = List[Float64]()
-            names.append(String("suite/velocity")); vals.append(fam_sum[0] / Float64(fam_n[0]))
-            names.append(String("suite/posture")); vals.append(fam_sum[1] / Float64(fam_n[1]))
-            names.append(String("suite/composite")); vals.append(fam_sum[2] / Float64(fam_n[2]))
-            names.append(String("suite/fall")); vals.append(fall_all / Float64(n_task))
+            names.append(String("eval_velocity")); vals.append(fam_sum[0] / Float64(fam_n[0]))
+            names.append(String("eval_posture")); vals.append(fam_sum[1] / Float64(fam_n[1]))
+            names.append(String("eval_composite")); vals.append(fam_sum[2] / Float64(fam_n[2]))
+            names.append(String("eval_fall")); vals.append(fall_all / Float64(n_task))
             logger.log_scalars(names, vals, at)
 
         def _coverage(at: Int, window_lane_steps: Int) capturing raises:
@@ -529,11 +529,11 @@ def main() raises:
             )
             var names = List[String]()
             var vals = List[Float64]()
-            names.append(String("cov/upright")); vals.append(Float64(up) / Float64(NS))
-            names.append(String("cov/upright_fast")); vals.append(Float64(fast) / Float64(NS))
-            names.append(String("cov/upright_calm")); vals.append(Float64(calm) / Float64(NS))
-            names.append(String("cov/entropy_vxvy")); vals.append(ent)
-            names.append(String("cov/falls_per_1k")); vals.append(fall_rate)
+            names.append(String("coverage_upright")); vals.append(Float64(up) / Float64(NS))
+            names.append(String("coverage_upright_fast")); vals.append(Float64(fast) / Float64(NS))
+            names.append(String("coverage_upright_calm")); vals.append(Float64(calm) / Float64(NS))
+            names.append(String("coverage_entropy_vxvy")); vals.append(ent)
+            names.append(String("coverage_falls_per_1k")); vals.append(fall_rate)
             logger.log_scalars(names, vals, at)
 
         def _captured_updates() capturing raises -> None:

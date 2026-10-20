@@ -435,13 +435,16 @@ tests/io/test_artifact_sink.mojo
 # drivers must each be followed by `announce_checkpoint(...)`, and no driver
 # may inline the offer. A site that saves and forgets shows NOTHING — the run
 # trains, the file is on disk, and only the box dying reveals the loss. Prints
-# sites-scanned beside violations, and pins the count at 18.
+# sites-scanned beside violations, and pins the count at 19.
 tests/deep_agents/test_checkpoints_announce.mojo
 
 # A SOURCE gate: nothing in `noeira/` writes a v2 checkpoint, and nothing under
 # `deep_agents/` writes a file in place (non-atomic, cut at 2 GiB). Globbed on
 # purpose — it checks an ABSENCE, so a new file must be scanned unasked.
 tests/deep_agents/test_no_v2_checkpoint_writes.mojo
+# RunningMeanStd.save / load: the obs-norm file a resumed PPO run reads back
+# round-trips (within one ulp), written through write_text_atomic.
+tests/deep_agents/test_obs_norm_save_load.mojo
 
 # A SOURCE gate: a run's settings go through `set_config` (metrics.config.kv +
 # /runs), never as `cfg/*` scalars that the dashboard draws as one-point charts.
