@@ -13,7 +13,10 @@ from noeira.envs.car_racing import CarRacingDiscrete
 
 
 comptime B = 16
-comptime K = 520  # > MAX_STEPS (500) so truncation must fire at least once
+comptime K = CarRacingDiscrete[DType.float32].MAX_STEPS + 20
+"""Past MAX_STEPS so truncation must fire at least once. Derived, not written:
+a literal 520 went stale when MAX_STEPS moved 500 -> 1000 (0b985874e) and the
+gate then failed with "no episodes terminated"."""
 
 
 def main() raises:

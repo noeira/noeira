@@ -30,7 +30,7 @@ from max.gpu.host import DeviceContext
 from std.sys import default_accelerator
 from std.math import abs, sin
 from std.time import perf_counter_ns
-from std.testing import assert_true, TestSuite
+from std.testing import assert_true
 
 from noeira.nn.constants import DT
 from noeira.core.cont_action import ContAction
@@ -277,14 +277,20 @@ def _part_b(ctx: DeviceContext) raises:
 
 
 def test_unitree_g1_walk_rp_gpu() raises:
-    if not default_accelerator().is_nvidia_gpu():
+    # `comptime`, not a runtime `if`: the kernels are float64 (and nv 35),
+    # and Metal rejects them at COMPILE time even on a branch never taken.
+    comptime if default_accelerator().is_nvidia_gpu():
+        with DeviceContext() as ctx:
+            _part_a(ctx)
+            _part_b(ctx)
+    else:
         print("  unitree_g1_walk_rp GPU: SKIPPED on Apple (nv 35, Metal's"
-              " per-thread stack). UNGATED until run on NVIDIA.")
-        return
-    with DeviceContext() as ctx:
-        _part_a(ctx)
-        _part_b(ctx)
+              " per-thread stack, float64 kernels). UNGATED until run on"
+              " NVIDIA.")
 
 
 def main() raises:
-    TestSuite.discover_tests[__functions_in_module()]().run()
+    # A direct call, not `TestSuite.discover_tests[__functions_in_module()]`:
+    # the reflection elaborates EVERY function here, `_part_a` / `_part_b`
+    # included, so their float64 kernels reached Metal past the comptime skip.
+    test_unitree_g1_walk_rp_gpu()

@@ -103,7 +103,9 @@ def g1_fall_kernel[OBS_W: Int, LANES: Int](
     var gz = obs[unsafe_offset=l * OBS_W + G1M_COL_GZ]
     var down = h < h_min or gz > g_max or h != h or gz != gz
     var c = fall_cnt[unsafe_offset=l] + Scalar[DT](1.0) if down else Scalar[DT](0.0)
-    var fell = c >= Scalar[DT](Float64(Int(delay)))
+    # Int32 -> float32 directly: the same rounding of the same integer as the
+    # old trip through Float64, and no f64 op for Metal to reject.
+    var fell = c >= Scalar[DT](delay)
     var d = env_done[unsafe_offset=l] > Scalar[DT](0.5) or fell
     if fell:
         n_falls[unsafe_offset=l] = n_falls[unsafe_offset=l] + Scalar[DT](1.0)
