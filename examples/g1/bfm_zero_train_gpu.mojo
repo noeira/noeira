@@ -588,6 +588,11 @@ def main() raises:
     var seed_v = atol(_flag(String("--seed"), String(20260909)))
     var lie_prob = atof(_flag(String("--lie-prob"), String(G1_LIE_DOWN_PROB)))
     var track_on = not _has("--no-track")
+    # The actor step backpropagates through F1, F2, Q_D1 and Q_D2 for dQ/da
+    # only; by default their gradient buffers are moved out for that pass so
+    # no dW GEMM runs (`noeira/nn/core/grad_stash.mojo`, same bits).
+    # `--no-grad-stash` forms and discards them as before, for an A/B.
+    var grad_stash = not _has("--no-grad-stash")
     # 0 turns the in-loop tracking eval off. 1 is one segment per clip (40
     # segments, ~35 s) — ~3 % of a 20-minute checkpoint interval, and the only
     # number in the file that measures the thing the run is FOR.
@@ -674,6 +679,7 @@ def main() raises:
     logger.set_config("t_episode", String(T_EPISODE))
     logger.set_config("track_len", String(TRACK_LEN))
     logger.set_config("lie_prob", String(lie_prob))
+    logger.set_config("grad_stash", String(grad_stash))
     # ⚠ AFTER the config and before step 0 — `register_run` seeds the
     # dashboard from the run (id, project, commit, seed, host) and POSTs
     # `/runs`. A run that dies before step 0 otherwise never appears at all.
@@ -804,6 +810,7 @@ def main() raises:
     g1_build_tail_spec(tail_spec)
     agent.attach_tail_spec(tail_spec)
     agent.set_action_norm(G1_NORMALIZE_TO, G1_ACTION_CLIP)
+    agent.base.t.stash_critic_grads = grad_stash
     agent.attach_expert_windows(eobs^, starts8_dev^, len(starts8))
     if track_on:
         agent.base.enable_z_pin()
