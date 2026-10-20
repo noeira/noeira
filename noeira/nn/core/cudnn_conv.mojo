@@ -93,7 +93,7 @@ def _create(name: StaticString, out_addr: Int) raises -> Int32:
 
 def _new(name: StaticString) raises -> Int:
     var h = 0
-    _check(_create(name, Int(UnsafePointer(to=h))), name)
+    _check(_create(name, Int(Pointer(to=h))), name)
     return h
 
 
@@ -140,7 +140,7 @@ def _find(
     """`cudnnFindConvolution{Forward,BackwardData,BackwardFilter}Algorithm`:
     `(handle, desc, desc, conv, desc, requested, *returned, perf*)`."""
     var returned: Int32 = 0
-    var ret_addr = Int(UnsafePointer(to=returned))
+    var ret_addr = Int(Pointer(to=returned))
     var st: Int32
     comptime if CUDNN_ALGO == "heur":
         if name == "fwd":
@@ -185,7 +185,7 @@ def _workspace_size(
     name: StaticString, handle: Int, a: Int, b: Int, conv: Int, d: Int, algo: Int32,
 ) raises -> Int:
     var size = 0
-    var size_addr = Int(UnsafePointer(to=size))
+    var size_addr = Int(Pointer(to=size))
     var st: Int32
     if name == "fwd":
         st = _get_dylib_function[
@@ -271,7 +271,7 @@ def _handle(c: DeviceContext) raises -> Int:
         var p = alloc(AllocLayout[_Handle].single()).unsafe_leak()
         p.unsafe_write(_Handle(h))
         external_call["KGEN_CompilerRT_InsertGlobal", NoneType](
-            StringSlice(name), p.bitcast[NoneType]()
+            StringSlice(name), p.unsafe_bitcast[NoneType]()
         )
     _check(
         _get_dylib_function["cudnnSetStream", def(Int, type_of(CUDA(c.stream()))) thin abi("C") -> Int32]()(
@@ -303,7 +303,7 @@ def _workspace(c: DeviceContext, need: Int) raises -> Int:
     var p = alloc(AllocLayout[_Workspace].single()).unsafe_leak()
     p.unsafe_write(_Workspace(c.enqueue_create_buffer[DType.uint8](n), n))
     external_call["KGEN_CompilerRT_InsertGlobal", NoneType](
-        StringSlice(name), p.bitcast[NoneType]()
+        StringSlice(name), p.unsafe_bitcast[NoneType]()
     )
     return Int(p[].buf.unsafe_ptr())
 
@@ -318,14 +318,14 @@ def _allowed(what: StaticString, algo: Int32) -> Bool:
     return algo == 1
 
 
-def _pick(perf: UnsafePointer[UInt8, _], n: Int, what: StaticString) raises -> Int32:
+def _pick(perf: Pointer[UInt8, _], n: Int, what: StaticString) raises -> Int32:
     """The first allowed, deterministic, successful algorithm in cuDNN's
     order (heuristic rank, or time with `find`)."""
     for i in range(n):
-        var base = perf + i * _PERF_BYTES
-        var algo = base.bitcast[Int32]()[0]
-        var status = base.bitcast[Int32]()[1]
-        var determinism = (base + 24).bitcast[Int32]()[0]
+        var base = perf.unsafe_offset(i * _PERF_BYTES)
+        var algo = base.unsafe_bitcast[Int32]()[]
+        var status = base.unsafe_bitcast[Int32]()[unsafe_offset=1]
+        var determinism = base.unsafe_offset(24).unsafe_bitcast[Int32]()[]
         if status == 0 and determinism == _DETERMINISTIC and _allowed(what, algo):
             return algo
     raise Error("cuDNN: no deterministic ", what, " algorithm")
@@ -363,7 +363,7 @@ def _plan[
     # cudnnFind* runs the candidates on real buffers it allocates itself.
     c.synchronize()
     var perf_alloc = alloc[UInt8]({count = _N_ALGO * _PERF_BYTES}).into_managed()
-    var perf = UnsafePointer(perf_alloc.unsafe_ptr())
+    var perf = Pointer(perf_alloc.unsafe_ptr())
     var pp = perf
     var nf = _find("fwd", handle, x, w, cf, y, Int(perf))
     var af = _pick(pp, nf, "forward")
@@ -385,7 +385,7 @@ def _plan[
     var p = alloc(AllocLayout[_Plan].single()).unsafe_leak()
     p.unsafe_write(plan)
     external_call["KGEN_CompilerRT_InsertGlobal", NoneType](
-        StringSlice(name), p.bitcast[NoneType]()
+        StringSlice(name), p.unsafe_bitcast[NoneType]()
     )
     return plan
 
@@ -408,9 +408,9 @@ def cudnn_conv_forward[
     var alpha = Float32(1.0)
     var beta = Float32(0.0)
     _run(
-        "fwd", h, Int(UnsafePointer(to=alpha)), p.x, Int(x.unsafe_ptr()),
+        "fwd", h, Int(Pointer(to=alpha)), p.x, Int(x.unsafe_ptr()),
         p.w, Int(w.unsafe_ptr()), p.conv_fwd, p.algo_fwd, ws, p.ws,
-        Int(UnsafePointer(to=beta)), p.y, Int(y.unsafe_ptr()),
+        Int(Pointer(to=beta)), p.y, Int(y.unsafe_ptr()),
     )
     _ = alpha
     _ = beta
@@ -432,9 +432,9 @@ def cudnn_conv_backward_data[
     var alpha = Float32(1.0)
     var beta = Float32(0.0)
     _run(
-        "bwd_data", h, Int(UnsafePointer(to=alpha)), p.w, Int(w.unsafe_ptr()),
+        "bwd_data", h, Int(Pointer(to=alpha)), p.w, Int(w.unsafe_ptr()),
         p.y, Int(dy.unsafe_ptr()), p.conv_bd, p.algo_bd, ws, p.ws,
-        Int(UnsafePointer(to=beta)), p.x, Int(dx.unsafe_ptr()),
+        Int(Pointer(to=beta)), p.x, Int(dx.unsafe_ptr()),
     )
     _ = alpha
     _ = beta
@@ -456,9 +456,9 @@ def cudnn_conv_backward_filter[
     var alpha = Float32(1.0)
     var beta = Float32(1.0)
     _run(
-        "bwd_filter", h, Int(UnsafePointer(to=alpha)), p.x, Int(x.unsafe_ptr()),
+        "bwd_filter", h, Int(Pointer(to=alpha)), p.x, Int(x.unsafe_ptr()),
         p.y, Int(dy.unsafe_ptr()), p.conv_bf, p.algo_bf, ws, p.ws,
-        Int(UnsafePointer(to=beta)), p.w, Int(dw.unsafe_ptr()),
+        Int(Pointer(to=beta)), p.w, Int(dw.unsafe_ptr()),
     )
     _ = alpha
     _ = beta

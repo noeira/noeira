@@ -421,9 +421,9 @@ struct _AdamWAll(ParamVisitor):
 
 def _write_f32(path: String, t: Tensor, n: Int) raises:
     var bytes = List[UInt8](capacity=n * 4)
-    var p = t.data.unsafe_ptr().bitcast[UInt8]()
+    var p = t.data.unsafe_ptr().unsafe_bitcast[UInt8]()
     for i in range(n * 4):
-        bytes.append(p[i])
+        bytes.append(p[unsafe_offset=i])
     write_file_atomic(path, bytes)
 
 
@@ -494,9 +494,9 @@ struct _DumpWriter(ParamVisitor):
             ctx.value().synchronize()
             param.download(ctx.value())
         var bytes = List[UInt8](capacity=N * 4)
-        var p = param.data.unsafe_ptr().bitcast[UInt8]()
+        var p = param.data.unsafe_ptr().unsafe_bitcast[UInt8]()
         for i in range(N * 4):
-            bytes.append(p[i])
+            bytes.append(p[unsafe_offset=i])
         write_file_atomic(self.dir + "/ours." + name + ".bin", bytes)
         self.manifest += "ours." + name + "\t" + String(N) + "\n"
 

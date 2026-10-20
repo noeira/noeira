@@ -857,9 +857,9 @@ struct FamilyDeviceRollout[N_: Int, E_OBS_: Int](Movable):
         for s in range(self._pending):
             var p = self._ring_bufs[s].unsafe_ptr()
             for e in range(Self.N):
-                if p[e * 3 + _EP_DONE] > Scalar[DT](0.5):
-                    hist_succ.append(p[e * 3 + _EP_SUCC] > Scalar[DT](0.5))
-                    hist_ret.append(Float64(p[e * 3 + _EP_RET]))
+                if p[unsafe_offset=e * 3 + _EP_DONE] > Scalar[DT](0.5):
+                    hist_succ.append(p[unsafe_offset=e * 3 + _EP_SUCC] > Scalar[DT](0.5))
+                    hist_ret.append(Float64(p[unsafe_offset=e * 3 + _EP_RET]))
                     n_episodes += 1
         self._pending = 0
 

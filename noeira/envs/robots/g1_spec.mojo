@@ -211,16 +211,16 @@ struct G1Pool(Movable):
         var off = nl + 1
         var b = List[Float64](length=n * d, fill=0.0)
         var qv = List[Float64](length=n * nv, fill=0.0)
-        var ptr = raw.unsafe_ptr().bitcast[Float32]()
+        var ptr = raw.unsafe_ptr().unsafe_bitcast[Float32]()
         var base = off // 4
         # ⚠ the header is padded to a 4-byte boundary by the writer, so this
         # bitcast is aligned — `g1_pool_save` pads and this checks it.
         if off % 4 != 0:
             raise Error("g1 pool: payload not 4-byte aligned in " + path)
         for i in range(n * d):
-            b[i] = Float64(ptr[base + i])
+            b[i] = Float64(ptr[unsafe_offset=base + i])
         for i in range(n * nv):
-            qv[i] = Float64(ptr[base + n * d + i])
+            qv[i] = Float64(ptr[unsafe_offset=base + n * d + i])
         return G1Pool(n, b^, qv^)
 
 
@@ -244,12 +244,12 @@ def g1_pool_save(
         out.append(hdr.as_bytes()[i])
     for i in range(n * G1_SPEC_D):
         var v = Float32(b[i])
-        var by = UnsafePointer(to=v).bitcast[UInt8]()
+        var by = Pointer(to=v).unsafe_bitcast[UInt8]()
         for k in range(4):
             out.append(by[unsafe_offset=k])
     for i in range(n * G1_NVOC):
         var v = Float32(qv[i])
-        var by = UnsafePointer(to=v).bitcast[UInt8]()
+        var by = Pointer(to=v).unsafe_bitcast[UInt8]()
         for k in range(4):
             out.append(by[unsafe_offset=k])
     write_file_atomic(path, out)

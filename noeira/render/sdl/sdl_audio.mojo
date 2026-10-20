@@ -131,7 +131,7 @@ from . import (
     c_char,
     c_float,
     c_int,
-    is_little_endian,
+    Endian,
     lib,
     Ptr,
 )
@@ -192,9 +192,9 @@ struct AudioFormat(Indexer, Intable, TrivialRegisterPassable):
     # SDL_DEFINE_AUDIO_FORMAT(1, 1, 1, 32),
 
     # These represent the current system's byteorder.
-    comptime AUDIO_S16 = Self.AUDIO_S16LE if is_little_endian() else Self.AUDIO_S16BE
-    comptime AUDIO_S32 = Self.AUDIO_S32LE if is_little_endian() else Self.AUDIO_S32BE
-    comptime AUDIO_F32 = Self.AUDIO_F32LE if is_little_endian() else Self.AUDIO_F32BE
+    comptime AUDIO_S16 = Self.AUDIO_S16LE if (Endian.native() == .little) else Self.AUDIO_S16BE
+    comptime AUDIO_S32 = Self.AUDIO_S32LE if (Endian.native() == .little) else Self.AUDIO_S32BE
+    comptime AUDIO_F32 = Self.AUDIO_F32LE if (Endian.native() == .little) else Self.AUDIO_F32BE
 
 
 struct AudioDeviceID(Intable, TrivialRegisterPassable):

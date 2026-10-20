@@ -191,7 +191,7 @@ def _relu_mask_gate_kernel[B: Int, OUT: Int, LD: Int](
     var idx = Int(global_idx.x)
     if idx < B * OUT:
         var bit = (idx // OUT) * LD + idx % OUT
-        var byte = mask.bitcast[UInt8]()[unsafe_offset=bit >> 3]
+        var byte = mask.unsafe_bitcast[UInt8]()[unsafe_offset=bit >> 3]
         if (byte >> UInt8(bit & 7)) & 1 == 0:
             go[unsafe_offset=idx] = 0
 

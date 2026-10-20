@@ -3526,7 +3526,7 @@ struct LunarLander[
         # Use shape factory for lander body, scale from pixels to world units
         var lander_verts_raw = make_lander_body()
         var lander_verts = scale_vertices(
-            lander_verts_raw^, 1.0 / Float64(LLConstants.SCALE)
+            lander_verts_raw, 1.0 / Float64(LLConstants.SCALE)
         )
 
         # Create transform for lander position and rotation

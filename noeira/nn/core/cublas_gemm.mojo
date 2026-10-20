@@ -143,7 +143,7 @@ def _shared_workspace(c: DeviceContext) raises -> DeviceBuffer[DType.uint8]:
     var p = alloc(AllocLayout[DeviceBuffer[DType.uint8]].single()).unsafe_leak()
     p.unsafe_write(c.enqueue_create_buffer[DType.uint8](CUBLAS_WS_BYTES))
     external_call["KGEN_CompilerRT_InsertGlobal", NoneType](
-        StringSlice(name), p.bitcast[NoneType]()
+        StringSlice(name), p.unsafe_bitcast[NoneType]()
     )
     return p[]
 
@@ -233,8 +233,8 @@ def _gemm_ex[
             Int32(N),
             Int32(M),
             Int32(K),
-            UnsafePointer(to=alpha_v)
-            .bitcast[NoneType]()
+            Pointer(to=alpha_v)
+            .unsafe_bitcast[NoneType]()
             .as_imm()
             .as_unsafe_any_origin(),
             _ffi_void_ptr(b.unsafe_ptr()),
@@ -243,8 +243,8 @@ def _gemm_ex[
             _ffi_void_ptr(a.unsafe_ptr()),
             _convert_to_cublas_datatype[IN_DT](),
             Int32(lda),
-            UnsafePointer(to=beta_v)
-            .bitcast[NoneType]()
+            Pointer(to=beta_v)
+            .unsafe_bitcast[NoneType]()
             .as_imm()
             .as_unsafe_any_origin(),
             _ffi_void_ptr(dst.unsafe_ptr()),

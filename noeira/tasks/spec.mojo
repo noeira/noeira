@@ -921,7 +921,7 @@ def parse_slot(spec: String) raises -> SlotSpec:
                 " where it is composed is where it stays. Write"
                 " 'slot=" + name + ":static:" + asset + ":x,y,z'."
             )
-        return SlotSpec(name^, kind, asset^)
+        return SlotSpec(name, kind, asset)
 
     if kind == SLOT_FREE:
         raise Error(
@@ -940,7 +940,7 @@ def parse_slot(spec: String) raises -> SlotSpec:
     if len(n) == 4:
         yaw = Float64(String(String(n[3]).strip()))
     return SlotSpec(
-        name^, kind, asset^,
+        name, kind, asset,
         Float64(String(String(n[0]).strip())),
         Float64(String(String(n[1]).strip())),
         Float64(String(String(n[2]).strip())),
@@ -988,7 +988,7 @@ def parse_region(spec: String) raises -> RegionSpec:
             " region carries a contact slot: '" + spec + "'"
         )
     if len(parts) == 3:
-        return RegionSpec(name^, site^)
+        return RegionSpec(name, site)
 
     var nums = split_on(String(String(parts[3]).strip()), String(","))
     if len(nums) != 4:
@@ -1009,7 +1009,7 @@ def parse_region(spec: String) raises -> RegionSpec:
             " (xmin,ymin must be < xmax,ymax): '" + spec + "'"
         )
     if len(parts) == 4:
-        return RegionSpec(name^, site^, x0, y0, x1, y1)
+        return RegionSpec(name, site, x0, y0, x1, y1)
 
     # ⚠ A FIFTH FIELD WITHOUT A RECTANGLE IS UNREACHABLE — `len(parts) == 5`
     # implies parts[3] was the rect, which the block above already parsed. A
@@ -1028,7 +1028,7 @@ def parse_region(spec: String) raises -> RegionSpec:
             " False for every state and the task would read as unlearnable"
             " rather than as malformed."
         )
-    var out = RegionSpec(name^, site^, x0, y0, x1, y1, hh)
+    var out = RegionSpec(name, site, x0, y0, x1, y1, hh)
     out.is_box = is_box
     if len(parts) == 6:
         out.contact = String(String(parts[5]).strip())
@@ -1105,7 +1105,7 @@ def parse_init(spec: String) raises -> InitSpec:
             "tasks: init '" + spec + "' — the suffixes go ':in' / ':on'"
             " first, then ':yaw'; a region name has no colon"
         )
-    return InitSpec(slot^, rest^, inside, yaw, sep_mm)
+    return InitSpec(slot, rest, inside, yaw, sep_mm)
 
 
 def parse_joint_init(spec: String) raises -> JointInitSpec:
@@ -1132,7 +1132,7 @@ def parse_joint_init(spec: String) raises -> JointInitSpec:
             "tasks: jinit '" + spec + "' has hi < lo — a range that samples"
             " outside itself"
         )
-    return JointInitSpec(joint^, lo, hi)
+    return JointInitSpec(joint, lo, hi)
 
 
 def _parse_flag(val: String, what: String) raises -> Bool:

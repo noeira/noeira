@@ -1123,7 +1123,7 @@ def run_sac[M: ModelDefLike, C: Phyics3dEnvConfig](
         # ⚠ THE CONFIG GOES TO BOTH HALVES: `/runs` for the dashboard and
         # `metrics.config.kv` beside the CSV, so a CSV read later still says
         # what produced it. Hence the composite is built BEFORE `set_config`.
-        var logger = CompositeLogger(CsvLogger(csv_path), remote^)
+        var logger = CompositeLogger(CsvLogger(csv_path), remote)
         logger.set_config("algorithm", "SAC")
         logger.set_config("family", f.name)
         logger.set_config("task", task_name)

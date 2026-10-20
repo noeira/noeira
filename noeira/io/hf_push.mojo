@@ -108,7 +108,7 @@ def hf_whoami(var token: String = String("")) raises -> String:
     if token == "":
         token = hf_token()
     var c = HttpClient(0, 30000)
-    c.bearer(token^)
+    c.bearer(token)
     var r = c.get(String(HF_ENDPOINT) + "/api/whoami-v2")
     if not r.ok():
         raise Error(
@@ -329,7 +329,7 @@ struct HubPush(Movable & Deinitable):
         var r = self.client.request(
             String("DELETE"),
             self.endpoint + "/api/repos/delete",
-            body^,
+            body,
             String("application/json"),
         )
         if r.status == 404:
@@ -453,7 +453,7 @@ struct HubPush(Movable & Deinitable):
             String("POST"),
             self.endpoint + "/" + self.kind + "/" + self.repo
             + ".git/info/lfs/objects/batch",
-            body^,
+            body,
             String(LFS_JSON),
         )
         self.client.header(String("Accept"), String("*/*"))
@@ -605,7 +605,7 @@ struct HubPush(Movable & Deinitable):
         var r = self.client.request(
             String("POST"),
             self._api("/commit/" + self.revision),
-            body^,
+            body,
             String("application/x-ndjson"),
         )
         if not r.ok():

@@ -791,7 +791,7 @@ def translate_task(
                 is_free = True
         if not is_free:
             continue
-        t.inits.append(InitSpec(slot, fam_name^, a.pred == "In"))
+        t.inits.append(InitSpec(slot, fam_name, a.pred == "In"))
     # ── `(Open X)` / `(Turnon X)` in `:init` -> `jinit=` ──────────────────
     #
     # ⚠⚠ THIS IS A DRAW, NOT A JUMP TO THE THRESHOLD.

@@ -410,7 +410,7 @@ struct BinaryCheckpointWriter(ParamVisitor, ParamVisitorRT):
         self._file = None
         rename_over(self._path + ".tmp", self._path)
 
-    def _put_bytes(mut self, p: UnsafePointer[UInt8, _], n: Int) raises:
+    def _put_bytes(mut self, p: Pointer[UInt8, _], n: Int) raises:
         if self._file:
             var off = 0
             while off < n:
@@ -423,7 +423,7 @@ struct BinaryCheckpointWriter(ParamVisitor, ParamVisitorRT):
         else:
             self._append_mem(p, n)
 
-    def _append_mem(mut self, p: UnsafePointer[UInt8, _], n: Int):
+    def _append_mem(mut self, p: Pointer[UInt8, _], n: Int):
         var old = len(self.content)
         self.content.resize(old + n, 0)
         unsafe_memcpy(

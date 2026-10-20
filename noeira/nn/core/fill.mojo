@@ -40,7 +40,7 @@ def _fill_kernel[dt: DType](
     var i = Int(global_idx.x)
     var n = Int(n_arg)
     if i < n:
-        dst[i] = value
+        dst[unsafe_offset=i] = value
 
 
 @always_inline

@@ -3415,7 +3415,7 @@ struct Renderer3D(Movable):
             var mesh_data = generate_capsule(f_radius, f_half)
             var handle = self._upload_mesh(mesh_data)
             self.capsule_cache.append(
-                CapsuleCacheEntry(f_radius, f_half, handle^)
+                CapsuleCacheEntry(f_radius, f_half, handle)
             )
             cache_idx = len(self.capsule_cache) - 1
 
@@ -3537,7 +3537,7 @@ struct Renderer3D(Movable):
             var mesh_data = generate_cylinder(f_radius, f_half)
             var handle = self._upload_mesh(mesh_data)
             self.cylinder_cache.append(
-                CapsuleCacheEntry(f_radius, f_half, handle^)
+                CapsuleCacheEntry(f_radius, f_half, handle)
             )
             cache_idx = len(self.cylinder_cache) - 1
 
@@ -3634,7 +3634,7 @@ struct Renderer3D(Movable):
             try:
                 var mesh_data = load_stl(file_path)
                 var handle = self._upload_mesh(mesh_data)
-                self.mesh_cache.append(MeshCacheEntry(name, handle^))
+                self.mesh_cache.append(MeshCacheEntry(name, handle))
                 cache_idx = len(self.mesh_cache) - 1
             except e:
                 # ⚠ ONCE, NOT PER FRAME, and never silently. See `mesh_failed`.
@@ -3819,7 +3819,7 @@ struct Renderer3D(Movable):
 
             var vb_bytes = seed.vertex_byte_size()
             var handle = self._upload_mesh(seed)
-            self.mesh_cache.append(MeshCacheEntry(name, handle^))
+            self.mesh_cache.append(MeshCacheEntry(name, handle))
             var mesh_idx = len(self.mesh_cache) - 1
 
             var tb_info = GPUTransferBufferCreateInfo(
@@ -4135,7 +4135,7 @@ struct Renderer3D(Movable):
 
         var vb_bytes = seed.vertex_byte_size()
         var handle = self._upload_mesh(seed)
-        self.mesh_cache.append(MeshCacheEntry(name, handle^))
+        self.mesh_cache.append(MeshCacheEntry(name, handle))
         var mesh_idx = len(self.mesh_cache) - 1
 
         var tb_info = GPUTransferBufferCreateInfo(

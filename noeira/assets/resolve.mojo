@@ -102,7 +102,7 @@ def resolve_url(ref pack: Pack) raises -> Resolved:
             )
 
     if pack.provider == PROVIDER_HTTPS:
-        return Resolved(String(pack.url), override^)
+        return Resolved(String(pack.url), override)
 
     if pack.provider == PROVIDER_HF:
         var tok = override
@@ -111,7 +111,7 @@ def resolve_url(ref pack: Pack) raises -> Resolved:
             # (§9: an asset pack is third-party data that must work for anyone
             # who clones), so it becomes a 401 only on a private repo.
             tok = _env_or_dotenv(String("HF_TOKEN"))
-        return Resolved(String(pack.url), tok^)
+        return Resolved(String(pack.url), tok)
 
     if pack.provider == PROVIDER_NOEIRA:
         # ⚠⚠ THE ONLY SHAPE THAT NEVER SENDS A SECRET TO THE STORAGE HOST. The
@@ -129,7 +129,7 @@ def resolve_url(ref pack: Pack) raises -> Resolved:
                 + meta.sha256 + " but assets.kv declares " + pack.sha256
                 + ". The pack was re-cut without updating the declaration."
             )
-        return Resolved(meta.download_url^, String(""))
+        return Resolved(meta.download_url, String(""))
 
     raise Error(
         "asset pack '" + pack.ref() + "': unknown provider '" + pack.provider

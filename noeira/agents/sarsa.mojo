@@ -155,7 +155,7 @@ struct SARSAAgent(Copyable, ImplicitlyCopyable, Movable, TabularAgent):
 
             for _ in range(max_steps_per_episode):
                 var action = env.action_from_index(action_idx)
-                var result = env.step(action^)
+                var result = env.step(action)
                 var next_state = result[0]
                 var reward = result[1]
                 var done = result[2]

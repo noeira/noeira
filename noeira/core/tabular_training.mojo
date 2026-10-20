@@ -72,7 +72,7 @@ def train_tabular[
             var action_idx = agent.select_action(state_idx)
             var action = env.action_from_index(action_idx)
 
-            var result = env.step(action^)
+            var result = env.step(action)
             var next_state = result[0]
             var reward = result[1]
             var done = result[2]
@@ -137,7 +137,7 @@ def evaluate_tabular[
             var action_idx = agent.get_best_action(state_idx)
             var action = env.action_from_index(action_idx)
 
-            var result = env.step(action^)
+            var result = env.step(action)
             var next_state = result[0]
             var reward = result[1]
             var done = result[2]

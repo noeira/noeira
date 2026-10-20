@@ -54,7 +54,7 @@ def untracked[
 
 
 from std.os import abort, getenv
-from std.sys import CompilationTarget, is_little_endian, is_big_endian
+from std.sys import CompilationTarget, Endian
 from std.ffi import (
     _Global,
     OwnedDLHandle,

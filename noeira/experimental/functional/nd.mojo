@@ -397,10 +397,10 @@ def nd_bmm(mut t: TapeData, a: Int, b: Int) raises -> Int:
         else:
             gemm_cpu_ptr[False, False](
                 m, n, k, 1.0,
-                rebind[Pointer[Float32, ImmutAnyOrigin]](t.val_ptr(a) + bi * m * k), k,
-                rebind[Pointer[Float32, ImmutAnyOrigin]](t.val_ptr(b) + bi * k * n), n,
+                rebind[Pointer[Float32, ImmutAnyOrigin]](t.val_ptr(a).unsafe_offset(bi * m * k)), k,
+                rebind[Pointer[Float32, ImmutAnyOrigin]](t.val_ptr(b).unsafe_offset(bi * k * n)), n,
                 0.0,
-                rebind[Pointer[Float32, MutAnyOrigin]](t.val_ptr(o) + bi * m * n), n,
+                rebind[Pointer[Float32, MutAnyOrigin]](t.val_ptr(o).unsafe_offset(bi * m * n)), n,
             )
     return o
 
@@ -440,20 +440,20 @@ def _bmm_bwd(mut t: TapeData, o: Int) raises:
                     gpu_matmul_bwd_b[False](c, gb, av, go, m, n, k, t1, t2)
         return
     for bi in range(nb):
-        var go = rebind[Pointer[Float32, ImmutAnyOrigin]](t.grad_ptr(o) + bi * m * n)
+        var go = rebind[Pointer[Float32, ImmutAnyOrigin]](t.grad_ptr(o).unsafe_offset(bi * m * n))
         if t.nodes[a].rg:
             gemm_cpu_ptr[False, True](
                 m, k, n, 1.0, go, n,
-                rebind[Pointer[Float32, ImmutAnyOrigin]](t.val_ptr(b) + bi * k * n), n,
+                rebind[Pointer[Float32, ImmutAnyOrigin]](t.val_ptr(b).unsafe_offset(bi * k * n)), n,
                 1.0,
-                rebind[Pointer[Float32, MutAnyOrigin]](t.grad_ptr(a) + bi * m * k), k,
+                rebind[Pointer[Float32, MutAnyOrigin]](t.grad_ptr(a).unsafe_offset(bi * m * k)), k,
             )
         if t.nodes[b].rg:
             gemm_cpu_ptr[True, False](
                 k, n, m, 1.0,
-                rebind[Pointer[Float32, ImmutAnyOrigin]](t.val_ptr(a) + bi * m * k), k,
+                rebind[Pointer[Float32, ImmutAnyOrigin]](t.val_ptr(a).unsafe_offset(bi * m * k)), k,
                 go, n, 1.0,
-                rebind[Pointer[Float32, MutAnyOrigin]](t.grad_ptr(b) + bi * k * n), n,
+                rebind[Pointer[Float32, MutAnyOrigin]](t.grad_ptr(b).unsafe_offset(bi * k * n)), n,
             )
 
 

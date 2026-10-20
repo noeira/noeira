@@ -23,6 +23,7 @@ Limits, by construction:
 """
 
 from std.memory import alloc
+from std.memory.alloc import Layout as AllocLayout
 from max.gpu.host import DeviceContext
 
 from noeira.nn.constants import DT
@@ -181,7 +182,7 @@ def make_entry[M: Module, B: Int, B2: Int, B3: Int](var m: M, gpu: Bool) -> ModE
     comptime for i in range(M.ARITY):
         comptime d = M.IN_DIMS[i]
         in_dims.append(d)
-    var p = alloc[M](1)
+    var p = alloc(AllocLayout[M](count=1)).unsafe_leak()
     p.unsafe_write(m^)
     var st = p.unsafe_bitcast[NoneType]().unsafe_origin_cast[
         MutUntrackedOrigin

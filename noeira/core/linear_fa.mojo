@@ -417,7 +417,7 @@ struct PolynomialFeatures[dtype: DType](FeatureExtractor):
         var state_list = List[Scalar[Self.DTYPE]]()
         state_list.append(state[0])
         state_list.append(state[1])
-        return self.get_features(state_list^)
+        return self.get_features(state_list)
 
     def get_features_simd4(
         self, state: SIMD[Self.DTYPE, 4]
@@ -428,7 +428,7 @@ struct PolynomialFeatures[dtype: DType](FeatureExtractor):
         state_list.append(state[1])
         state_list.append(state[2])
         state_list.append(state[3])
-        return self.get_features(state_list^)
+        return self.get_features(state_list)
 
     def get_num_features(self) -> Int:
         """Return the number of features."""
@@ -515,7 +515,7 @@ struct RBFFeatures[dtype: DType](FeatureExtractor):
         var state_list = List[Scalar[Self.DTYPE]]()
         state_list.append(state[0])
         state_list.append(state[1])
-        return self.get_features(state_list^)
+        return self.get_features(state_list)
 
     def get_features_simd4(
         self, state: SIMD[Self.DTYPE, 4]
@@ -526,7 +526,7 @@ struct RBFFeatures[dtype: DType](FeatureExtractor):
         state_list.append(state[1])
         state_list.append(state[2])
         state_list.append(state[3])
-        return self.get_features(state_list^)
+        return self.get_features(state_list)
 
     def get_num_features(self) -> Int:
         """Return number of RBF features."""

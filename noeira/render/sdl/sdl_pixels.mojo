@@ -84,7 +84,7 @@ from . import (
     c_char,
     c_float,
     c_int,
-    is_big_endian,
+    Endian,
     lib,
     Ptr,
 )
@@ -462,14 +462,14 @@ struct PixelFormat(Indexer, Intable, TrivialRegisterPassable):
     # SDL_DEFINE_PIXELFOURCC('M', 'J', 'P', 'G')
 
     # Aliases for RGBA byte arrays of color data, for the current platform
-    comptime PIXELFORMAT_RGBA32 = Self.PIXELFORMAT_RGBA8888 if is_big_endian() else Self.PIXELFORMAT_ABGR8888
-    comptime PIXELFORMAT_ARGB32 = Self.PIXELFORMAT_ARGB8888 if is_big_endian() else Self.PIXELFORMAT_BGRA8888
-    comptime PIXELFORMAT_BGRA32 = Self.PIXELFORMAT_BGRA8888 if is_big_endian() else Self.PIXELFORMAT_ARGB8888
-    comptime PIXELFORMAT_ABGR32 = Self.PIXELFORMAT_ABGR8888 if is_big_endian() else Self.PIXELFORMAT_RGBA8888
-    comptime PIXELFORMAT_RGBX32 = Self.PIXELFORMAT_RGBX8888 if is_big_endian() else Self.PIXELFORMAT_XBGR8888
-    comptime PIXELFORMAT_XRGB32 = Self.PIXELFORMAT_XRGB8888 if is_big_endian() else Self.PIXELFORMAT_BGRX8888
-    comptime PIXELFORMAT_BGRX32 = Self.PIXELFORMAT_BGRX8888 if is_big_endian() else Self.PIXELFORMAT_XRGB8888
-    comptime PIXELFORMAT_XBGR32 = Self.PIXELFORMAT_XBGR8888 if is_big_endian() else Self.PIXELFORMAT_RGBX8888
+    comptime PIXELFORMAT_RGBA32 = Self.PIXELFORMAT_RGBA8888 if (Endian.native() == .big) else Self.PIXELFORMAT_ABGR8888
+    comptime PIXELFORMAT_ARGB32 = Self.PIXELFORMAT_ARGB8888 if (Endian.native() == .big) else Self.PIXELFORMAT_BGRA8888
+    comptime PIXELFORMAT_BGRA32 = Self.PIXELFORMAT_BGRA8888 if (Endian.native() == .big) else Self.PIXELFORMAT_ARGB8888
+    comptime PIXELFORMAT_ABGR32 = Self.PIXELFORMAT_ABGR8888 if (Endian.native() == .big) else Self.PIXELFORMAT_RGBA8888
+    comptime PIXELFORMAT_RGBX32 = Self.PIXELFORMAT_RGBX8888 if (Endian.native() == .big) else Self.PIXELFORMAT_XBGR8888
+    comptime PIXELFORMAT_XRGB32 = Self.PIXELFORMAT_XRGB8888 if (Endian.native() == .big) else Self.PIXELFORMAT_BGRX8888
+    comptime PIXELFORMAT_BGRX32 = Self.PIXELFORMAT_BGRX8888 if (Endian.native() == .big) else Self.PIXELFORMAT_XRGB8888
+    comptime PIXELFORMAT_XBGR32 = Self.PIXELFORMAT_XBGR8888 if (Endian.native() == .big) else Self.PIXELFORMAT_RGBX8888
 
 
 struct ColorType(Indexer, Intable, TrivialRegisterPassable):

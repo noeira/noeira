@@ -245,7 +245,7 @@ struct VisionCache(Movable):
             dst.resize(dst_off + self.seg, 0.0)
         self._seek(VC_HEADER_BYTES + i * self.seg * 4)
         var n = external_call["fread", Int](
-            mptr(dst) + dst_off, Int(1), self.seg * 4, self._fp
+            mptr(dst).unsafe_offset(dst_off), Int(1), self.seg * 4, self._fp
         )
         if n != self.seg * 4:
             raise Error(

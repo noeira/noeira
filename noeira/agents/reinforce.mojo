@@ -186,7 +186,7 @@ struct REINFORCEAgent(Copyable, ImplicitlyCopyable, Movable):
             Probability distribution over actions.
         """
         var prefs = self._get_action_preferences(tiles)
-        return softmax(prefs^)
+        return softmax(prefs)
 
     def select_action(self, tiles: List[Int]) -> Int:
         """Sample action from policy π(a|s).
@@ -245,7 +245,7 @@ struct REINFORCEAgent(Copyable, ImplicitlyCopyable, Movable):
                 var tile_idx = self.episode_tiles[episode_idx][i]
                 pref += self.theta[a][tile_idx]
             preferences.append(pref)
-        return softmax(preferences^)
+        return softmax(preferences)
 
     def store_transition(
         mut self,
@@ -613,7 +613,7 @@ struct REINFORCEWithEntropyAgent(Copyable, ImplicitlyCopyable, Movable):
     def get_action_probs(self, tiles: List[Int]) -> List[Float64]:
         """Get action probabilities."""
         var prefs = self._get_action_preferences(tiles)
-        return softmax(prefs^)
+        return softmax(prefs)
 
     def select_action(self, tiles: List[Int]) -> Int:
         """Sample action from policy."""
@@ -651,7 +651,7 @@ struct REINFORCEWithEntropyAgent(Copyable, ImplicitlyCopyable, Movable):
                 var tile_idx = self.episode_tiles[episode_idx][i]
                 pref += self.theta[a][tile_idx]
             preferences.append(pref)
-        return softmax(preferences^)
+        return softmax(preferences)
 
     def store_transition(
         mut self,

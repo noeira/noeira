@@ -1315,7 +1315,7 @@ def _dump_obs_png(
                 for y in range(W):
                     for x in range(W):
                         for c in range(3):
-                            var v = Float64(hp[
+                            var v = Float64(hp[unsafe_offset=
                                 lane * ROW + (3 * cam + c) * PLANE
                                 + (y // S) * OBS_PX + x // S
                             ]) + 0.5

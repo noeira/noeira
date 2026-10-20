@@ -312,7 +312,7 @@ struct QLinear[IN_: Int, OUT_: Int](Module):
                     self.qpk.dev.value(),
                     row_major(Coord(Idx[Self.N_PAD], Idx[Self.PAD_ROW_BYTES])),
                 )
-                gpu_qint4_repack_Q4_0["gpu"](src_tt.as_immut(), dst_tt, c)
+                gpu_qint4_repack_Q4_0["gpu"](src_tt.as_imm(), dst_tt, c)
                 c.synchronize()
         comptime if not REPACKED_ONLY:
             self.q.data = blocks^

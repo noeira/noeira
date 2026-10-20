@@ -114,7 +114,7 @@ def parse_ref(value: String, what: String) raises -> Ref:
         commit = String(path[byte = at + 1 : path.byte_length()])
         var head = String(path[byte=0:at])
         path = head^
-    return Ref(a[0], b[0], path^, commit^)
+    return Ref(a[0], b[0], path, commit)
 
 
 struct ProjectSpec(Movable):

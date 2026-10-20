@@ -564,7 +564,7 @@ struct HttpClient(Movable & Deinitable):
         return self.request(
             String("POST"),
             url,
-            b^,
+            b,
             String("application/json"),
             expect,
         )
