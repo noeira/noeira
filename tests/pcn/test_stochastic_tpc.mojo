@@ -21,7 +21,7 @@ Run:
 """
 
 from std.math import sqrt, log, cos, pi
-from std.memory import alloc, memset
+from std.memory import alloc, unsafe_memset
 from std.random.philox import Random as PhiloxRandom
 from std.time import perf_counter_ns
 from noeira.core.tiles import tile
@@ -93,7 +93,7 @@ def main() raises:
 
     # ── Build a fixed clean sequence (one image per digit class 0..SEQ_LEN-1) ──
     var seq_buf = alloc[Scalar[dtype]](SEQ_LEN * DATA_DIM).as_unsafe_any_origin()
-    memset(seq_buf, 0, SEQ_LEN * DATA_DIM)
+    unsafe_memset(seq_buf, 0, SEQ_LEN * DATA_DIM)
     for digit in range(SEQ_LEN):
         var found_idx = -1
         for i in range(MNIST.N_TRAIN):
@@ -176,16 +176,16 @@ def main() raises:
         print("=" * 60)
 
         # Reset params + Adam + scratch.
-        memset(params_buf, 0, NET.PARAM_SIZE)
-        memset(grads_buf, 0, NET.PARAM_SIZE)
-        memset(opt_state_buf, 0, NET.PARAM_SIZE * OPT.STATE_PER_PARAM)
-        memset(opt_global_buf, 0, OPT.GLOBAL_STATE_SIZE)
-        memset(lat_buf, 0, BATCH * NET.LATENT_DIM)
-        memset(mu_eps_buf_raw, 0, BATCH * NET.SCRATCH_OUT_DIM)
-        memset(a_below_buf_raw, 0, BATCH * NET.SCRATCH_IN_DIM)
-        memset(z_below_buf_raw, 0, BATCH * NET.SCRATCH_IN_DIM)
-        memset(dx_buf_raw, 0, BATCH * NET.LATENT_DIM)
-        memset(noise_buf_raw, 0, BATCH * NET.LATENT_DIM)
+        unsafe_memset(params_buf, 0, NET.PARAM_SIZE)
+        unsafe_memset(grads_buf, 0, NET.PARAM_SIZE)
+        unsafe_memset(opt_state_buf, 0, NET.PARAM_SIZE * OPT.STATE_PER_PARAM)
+        unsafe_memset(opt_global_buf, 0, OPT.GLOBAL_STATE_SIZE)
+        unsafe_memset(lat_buf, 0, BATCH * NET.LATENT_DIM)
+        unsafe_memset(mu_eps_buf_raw, 0, BATCH * NET.SCRATCH_OUT_DIM)
+        unsafe_memset(a_below_buf_raw, 0, BATCH * NET.SCRATCH_IN_DIM)
+        unsafe_memset(z_below_buf_raw, 0, BATCH * NET.SCRATCH_IN_DIM)
+        unsafe_memset(dx_buf_raw, 0, BATCH * NET.LATENT_DIM)
+        unsafe_memset(noise_buf_raw, 0, BATCH * NET.LATENT_DIM)
         NET.pc_init_params[PCXavier, dtype](params)
 
         # Per-phase RNGs: one for obs corruption, one for SGLD substream offset.
@@ -264,7 +264,7 @@ def main() raises:
         for j in range(HIDDEN):
             x_in_buf[j] = lat_buf[j]
 
-        memset(recalls_buf, 0, SEQ_LEN * DATA_DIM)
+        unsafe_memset(recalls_buf, 0, SEQ_LEN * DATA_DIM)
         for j in range(DATA_DIM):
             recalls_buf[0 * DATA_DIM + j] = seq_buf[0 * DATA_DIM + j]
 

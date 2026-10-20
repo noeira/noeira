@@ -48,7 +48,7 @@ Run:
 """
 
 from std.math import sqrt, log, cos, sin, tanh, pi
-from std.memory import alloc, memset
+from std.memory import alloc, unsafe_memset
 from std.random.philox import Random as PhiloxRandom
 from std.time import perf_counter_ns
 from noeira.core.tiles import tile
@@ -263,10 +263,10 @@ def main() raises:
         NET.PARAM_SIZE * OPT_PC.STATE_PER_PARAM
     ).as_unsafe_any_origin()
     var pc_opt_global_buf = alloc[Scalar[dtype]](OPT_PC.GLOBAL_STATE_SIZE).as_unsafe_any_origin()
-    memset(pc_params_buf, 0, NET.PARAM_SIZE)
-    memset(pc_grads_buf, 0, NET.PARAM_SIZE)
-    memset(pc_opt_state_buf, 0, NET.PARAM_SIZE * OPT_PC.STATE_PER_PARAM)
-    memset(pc_opt_global_buf, 0, OPT_PC.GLOBAL_STATE_SIZE)
+    unsafe_memset(pc_params_buf, 0, NET.PARAM_SIZE)
+    unsafe_memset(pc_grads_buf, 0, NET.PARAM_SIZE)
+    unsafe_memset(pc_opt_state_buf, 0, NET.PARAM_SIZE * OPT_PC.STATE_PER_PARAM)
+    unsafe_memset(pc_opt_global_buf, 0, OPT_PC.GLOBAL_STATE_SIZE)
     var pc_params = tile[NET.PARAM_SIZE](pc_params_buf)
     var pc_grads = tile[NET.PARAM_SIZE](pc_grads_buf)
     var pc_opt_state = tile[NET.PARAM_SIZE, OPT_PC.STATE_PER_PARAM](pc_opt_state_buf)
@@ -286,10 +286,10 @@ def main() raises:
         ENC_PARAM_SIZE * OPT_ENC.STATE_PER_PARAM
     ).as_unsafe_any_origin()
     var enc_opt_global_buf = alloc[Scalar[dtype]](OPT_ENC.GLOBAL_STATE_SIZE).as_unsafe_any_origin()
-    memset(enc_params_buf, 0, ENC_PARAM_SIZE)
-    memset(enc_grads_buf, 0, ENC_PARAM_SIZE)
-    memset(enc_opt_state_buf, 0, ENC_PARAM_SIZE * OPT_ENC.STATE_PER_PARAM)
-    memset(enc_opt_global_buf, 0, OPT_ENC.GLOBAL_STATE_SIZE)
+    unsafe_memset(enc_params_buf, 0, ENC_PARAM_SIZE)
+    unsafe_memset(enc_grads_buf, 0, ENC_PARAM_SIZE)
+    unsafe_memset(enc_opt_state_buf, 0, ENC_PARAM_SIZE * OPT_ENC.STATE_PER_PARAM)
+    unsafe_memset(enc_opt_global_buf, 0, OPT_ENC.GLOBAL_STATE_SIZE)
     var enc_params = tile[ENC_PARAM_SIZE](enc_params_buf)
     var enc_grads = tile[ENC_PARAM_SIZE](enc_grads_buf)
     var enc_opt_state = tile[ENC_PARAM_SIZE, OPT_ENC.STATE_PER_PARAM](enc_opt_state_buf)
@@ -303,10 +303,10 @@ def main() raises:
         V_PARAM_SIZE * OPT_VAL.STATE_PER_PARAM
     ).as_unsafe_any_origin()
     var v_opt_global_buf = alloc[Scalar[dtype]](OPT_VAL.GLOBAL_STATE_SIZE).as_unsafe_any_origin()
-    memset(v_params_buf, 0, V_PARAM_SIZE)
-    memset(v_grads_buf, 0, V_PARAM_SIZE)
-    memset(v_opt_state_buf, 0, V_PARAM_SIZE * OPT_VAL.STATE_PER_PARAM)
-    memset(v_opt_global_buf, 0, OPT_VAL.GLOBAL_STATE_SIZE)
+    unsafe_memset(v_params_buf, 0, V_PARAM_SIZE)
+    unsafe_memset(v_grads_buf, 0, V_PARAM_SIZE)
+    unsafe_memset(v_opt_state_buf, 0, V_PARAM_SIZE * OPT_VAL.STATE_PER_PARAM)
+    unsafe_memset(v_opt_global_buf, 0, OPT_VAL.GLOBAL_STATE_SIZE)
     # Xavier-uniform init on W_val: bound = sqrt(6 / (HIDDEN + 1)).
     var v_rng = PhiloxRandom(seed=UInt64(31), offset=UInt64(0))
     var v_bound = sqrt(Float64(6.0) / Float64(HIDDEN + 1))
@@ -416,7 +416,7 @@ def main() raises:
                         break
                 t_term_buf[b] = Scalar[dtype](Float64(t_term))
 
-            memset(prev_z_buf, 0, BATCH * HIDDEN)
+            unsafe_memset(prev_z_buf, 0, BATCH * HIDDEN)
 
             for t in range(0, SEQ_LEN + 1):
                 for b in range(BATCH):
@@ -503,7 +503,7 @@ def main() raises:
                 # Value head gradient — direct SGD, separate from dynamics grads.
                 # dL/dW_val[j] = Σ_b dV[b] · μ_z[b, j]
                 # dL/db_val    = Σ_b dV[b]
-                memset(v_grads_buf, 0, V_PARAM_SIZE)
+                unsafe_memset(v_grads_buf, 0, V_PARAM_SIZE)
                 for b in range(BATCH):
                     var v_pred: Float64 = Float64(v_params_buf[V_B_OFFSET])
                     for j in range(HIDDEN):
@@ -525,7 +525,7 @@ def main() raises:
                         Float64(v_grads_buf[V_B_OFFSET]) + dv
                     )
 
-                memset(pc_grads_buf, 0, NET.PARAM_SIZE)
+                unsafe_memset(pc_grads_buf, 0, NET.PARAM_SIZE)
                 BLOCK0.weight_grad[BATCH, dtype](eps_z, a_aug, grads_b0)
                 # Value contribution to block_0 dynamics grads.
                 BLOCK0.weight_grad[BATCH, dtype](eps_val, a_aug, grads_b0_val)
@@ -652,7 +652,7 @@ def main() raises:
         var theta = (u2 * 2.0 - 1.0) * CP_RESET_RANGE
         var theta_dot = (u3 * 2.0 - 1.0) * CP_RESET_RANGE
 
-        memset(agent_z_buf, 0, HIDDEN)
+        unsafe_memset(agent_z_buf, 0, HIDDEN)
         for h in range(PLAN_HORIZON):
             cem_mu[h] = 0.0
             cem_sigma[h] = INITIAL_SIGMA

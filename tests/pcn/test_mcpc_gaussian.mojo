@@ -27,7 +27,7 @@ Run:
 """
 
 from std.math import sqrt, log, cos, pi
-from std.memory import alloc, memset
+from std.memory import alloc, unsafe_memset
 from std.random.philox import Random as PhiloxRandom
 from noeira.core.tiles import tile
 
@@ -86,10 +86,10 @@ def main() raises:
     var grads_buf = alloc[Scalar[dtype]](NET.PARAM_SIZE).as_unsafe_any_origin()
     var opt_state_buf = alloc[Scalar[dtype]](NET.PARAM_SIZE * OPT.STATE_PER_PARAM).as_unsafe_any_origin()
     var opt_global_buf = alloc[Scalar[dtype]](OPT.GLOBAL_STATE_SIZE).as_unsafe_any_origin()
-    memset(params_buf, 0, NET.PARAM_SIZE)
-    memset(grads_buf, 0, NET.PARAM_SIZE)
-    memset(opt_state_buf, 0, NET.PARAM_SIZE * OPT.STATE_PER_PARAM)
-    memset(opt_global_buf, 0, OPT.GLOBAL_STATE_SIZE)
+    unsafe_memset(params_buf, 0, NET.PARAM_SIZE)
+    unsafe_memset(grads_buf, 0, NET.PARAM_SIZE)
+    unsafe_memset(opt_state_buf, 0, NET.PARAM_SIZE * OPT.STATE_PER_PARAM)
+    unsafe_memset(opt_global_buf, 0, OPT.GLOBAL_STATE_SIZE)
 
     var params = tile[NET.PARAM_SIZE](params_buf)
     var grads = tile[NET.PARAM_SIZE](grads_buf)
@@ -104,12 +104,12 @@ def main() raises:
     var z_below_buf_raw = alloc[Scalar[dtype]](BATCH * NET.SCRATCH_IN_DIM).as_unsafe_any_origin()
     var dx_buf_raw = alloc[Scalar[dtype]](BATCH * NET.LATENT_DIM).as_unsafe_any_origin()
     var noise_buf_raw = alloc[Scalar[dtype]](BATCH * NET.LATENT_DIM).as_unsafe_any_origin()
-    memset(lat_buf, 0, BATCH * NET.LATENT_DIM)
-    memset(mu_eps_buf_raw, 0, BATCH * NET.SCRATCH_OUT_DIM)
-    memset(a_below_buf_raw, 0, BATCH * NET.SCRATCH_IN_DIM)
-    memset(z_below_buf_raw, 0, BATCH * NET.SCRATCH_IN_DIM)
-    memset(dx_buf_raw, 0, BATCH * NET.LATENT_DIM)
-    memset(noise_buf_raw, 0, BATCH * NET.LATENT_DIM)
+    unsafe_memset(lat_buf, 0, BATCH * NET.LATENT_DIM)
+    unsafe_memset(mu_eps_buf_raw, 0, BATCH * NET.SCRATCH_OUT_DIM)
+    unsafe_memset(a_below_buf_raw, 0, BATCH * NET.SCRATCH_IN_DIM)
+    unsafe_memset(z_below_buf_raw, 0, BATCH * NET.SCRATCH_IN_DIM)
+    unsafe_memset(dx_buf_raw, 0, BATCH * NET.LATENT_DIM)
+    unsafe_memset(noise_buf_raw, 0, BATCH * NET.LATENT_DIM)
 
     var latents = tile[BATCH, NET.LATENT_DIM](lat_buf)
     var mu_eps_buf = tile[BATCH, NET.SCRATCH_OUT_DIM](mu_eps_buf_raw)
@@ -195,14 +195,14 @@ def main() raises:
     var gen_sample_buf = alloc[Scalar[dtype]](GEN_BATCH * NET.OUT_DIM).as_unsafe_any_origin()
     var gen_x_in_buf = alloc[Scalar[dtype]](GEN_BATCH * NET.IN_DIM).as_unsafe_any_origin()
     var gen_y_dummy_buf = alloc[Scalar[dtype]](GEN_BATCH * NET.OUT_DIM).as_unsafe_any_origin()
-    memset(gen_lat_buf, 0, GEN_BATCH * NET.LATENT_DIM)
-    memset(gen_mu_eps_buf_raw, 0, GEN_BATCH * NET.SCRATCH_OUT_DIM)
-    memset(gen_a_below_buf_raw, 0, GEN_BATCH * NET.SCRATCH_IN_DIM)
-    memset(gen_z_below_buf_raw, 0, GEN_BATCH * NET.SCRATCH_IN_DIM)
-    memset(gen_dx_buf_raw, 0, GEN_BATCH * NET.LATENT_DIM)
-    memset(gen_noise_buf_raw, 0, GEN_BATCH * NET.LATENT_DIM)
-    memset(gen_sample_buf, 0, GEN_BATCH * NET.OUT_DIM)
-    memset(gen_y_dummy_buf, 0, GEN_BATCH * NET.OUT_DIM)
+    unsafe_memset(gen_lat_buf, 0, GEN_BATCH * NET.LATENT_DIM)
+    unsafe_memset(gen_mu_eps_buf_raw, 0, GEN_BATCH * NET.SCRATCH_OUT_DIM)
+    unsafe_memset(gen_a_below_buf_raw, 0, GEN_BATCH * NET.SCRATCH_IN_DIM)
+    unsafe_memset(gen_z_below_buf_raw, 0, GEN_BATCH * NET.SCRATCH_IN_DIM)
+    unsafe_memset(gen_dx_buf_raw, 0, GEN_BATCH * NET.LATENT_DIM)
+    unsafe_memset(gen_noise_buf_raw, 0, GEN_BATCH * NET.LATENT_DIM)
+    unsafe_memset(gen_sample_buf, 0, GEN_BATCH * NET.OUT_DIM)
+    unsafe_memset(gen_y_dummy_buf, 0, GEN_BATCH * NET.OUT_DIM)
     for i in range(GEN_BATCH * NET.IN_DIM):
         gen_x_in_buf[i] = Scalar[dtype](1.0)
 

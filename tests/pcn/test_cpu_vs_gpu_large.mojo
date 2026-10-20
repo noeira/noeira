@@ -22,7 +22,7 @@ Run:
 """
 
 from std.math import abs as mabs
-from std.memory import alloc, memset
+from std.memory import alloc, unsafe_memset
 from std.random.philox import Random as PhiloxRandom
 from max.gpu.host import DeviceContext
 from noeira.core.tiles import tile
@@ -76,7 +76,7 @@ def main() raises:
 
     # ── Allocate params on host, init with Xavier (deterministic seed) ────────
     var params_buf = alloc[Scalar[dtype]](NET.PARAM_SIZE).as_unsafe_any_origin()
-    memset(params_buf, 0, NET.PARAM_SIZE)
+    unsafe_memset(params_buf, 0, NET.PARAM_SIZE)
     var params = tile[NET.PARAM_SIZE](params_buf)
     NET.pc_init_params[PCXavier, dtype](params)
 
@@ -104,12 +104,12 @@ def main() raises:
     var a_below_cpu_buf = alloc[Scalar[dtype]](BATCH * NET.SCRATCH_IN_DIM).as_unsafe_any_origin()
     var z_below_cpu_buf = alloc[Scalar[dtype]](BATCH * NET.SCRATCH_IN_DIM).as_unsafe_any_origin()
     var dx_cpu_buf = alloc[Scalar[dtype]](BATCH * NET.LATENT_DIM).as_unsafe_any_origin()
-    memset(grads_cpu_buf, 0, NET.PARAM_SIZE)
-    memset(lat_cpu_buf, 0, BATCH * NET.LATENT_DIM)
-    memset(mu_eps_cpu_buf, 0, BATCH * NET.SCRATCH_OUT_DIM)
-    memset(a_below_cpu_buf, 0, BATCH * NET.SCRATCH_IN_DIM)
-    memset(z_below_cpu_buf, 0, BATCH * NET.SCRATCH_IN_DIM)
-    memset(dx_cpu_buf, 0, BATCH * NET.LATENT_DIM)
+    unsafe_memset(grads_cpu_buf, 0, NET.PARAM_SIZE)
+    unsafe_memset(lat_cpu_buf, 0, BATCH * NET.LATENT_DIM)
+    unsafe_memset(mu_eps_cpu_buf, 0, BATCH * NET.SCRATCH_OUT_DIM)
+    unsafe_memset(a_below_cpu_buf, 0, BATCH * NET.SCRATCH_IN_DIM)
+    unsafe_memset(z_below_cpu_buf, 0, BATCH * NET.SCRATCH_IN_DIM)
+    unsafe_memset(dx_cpu_buf, 0, BATCH * NET.LATENT_DIM)
 
     var grads_cpu = tile[NET.PARAM_SIZE](grads_cpu_buf)
     var lat_cpu = tile[BATCH, NET.LATENT_DIM](lat_cpu_buf)

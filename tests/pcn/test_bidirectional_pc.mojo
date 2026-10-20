@@ -20,7 +20,7 @@ Run:
     pixi run mojo run -I . tests/pcn/test_bidirectional_pc.mojo
 """
 
-from std.memory import alloc, memset
+from std.memory import alloc, unsafe_memset
 from std.time import perf_counter_ns
 from std.math import exp
 from noeira.core.tiles import tile
@@ -88,10 +88,10 @@ def main() raises:
     var up_grads_buf = alloc[Scalar[dtype]](UP_PARAM_SIZE).as_unsafe_any_origin()
     var up_opt_state_buf = alloc[Scalar[dtype]](UP_PARAM_SIZE * OPT.STATE_PER_PARAM).as_unsafe_any_origin()
     var up_opt_global_buf = alloc[Scalar[dtype]](OPT.GLOBAL_STATE_SIZE).as_unsafe_any_origin()
-    memset(up_params_buf, 0, UP_PARAM_SIZE)
-    memset(up_grads_buf, 0, UP_PARAM_SIZE)
-    memset(up_opt_state_buf, 0, UP_PARAM_SIZE * OPT.STATE_PER_PARAM)
-    memset(up_opt_global_buf, 0, OPT.GLOBAL_STATE_SIZE)
+    unsafe_memset(up_params_buf, 0, UP_PARAM_SIZE)
+    unsafe_memset(up_grads_buf, 0, UP_PARAM_SIZE)
+    unsafe_memset(up_opt_state_buf, 0, UP_PARAM_SIZE * OPT.STATE_PER_PARAM)
+    unsafe_memset(up_opt_global_buf, 0, OPT.GLOBAL_STATE_SIZE)
     var up_params = tile[UP_PARAM_SIZE](up_params_buf)
     var up_grads = tile[UP_PARAM_SIZE](up_grads_buf)
     var up_opt_state = tile[UP_PARAM_SIZE, OPT.STATE_PER_PARAM](up_opt_state_buf)
@@ -103,10 +103,10 @@ def main() raises:
     var dn_grads_buf = alloc[Scalar[dtype]](DOWN_PARAM_SIZE).as_unsafe_any_origin()
     var dn_opt_state_buf = alloc[Scalar[dtype]](DOWN_PARAM_SIZE * OPT.STATE_PER_PARAM).as_unsafe_any_origin()
     var dn_opt_global_buf = alloc[Scalar[dtype]](OPT.GLOBAL_STATE_SIZE).as_unsafe_any_origin()
-    memset(dn_params_buf, 0, DOWN_PARAM_SIZE)
-    memset(dn_grads_buf, 0, DOWN_PARAM_SIZE)
-    memset(dn_opt_state_buf, 0, DOWN_PARAM_SIZE * OPT.STATE_PER_PARAM)
-    memset(dn_opt_global_buf, 0, OPT.GLOBAL_STATE_SIZE)
+    unsafe_memset(dn_params_buf, 0, DOWN_PARAM_SIZE)
+    unsafe_memset(dn_grads_buf, 0, DOWN_PARAM_SIZE)
+    unsafe_memset(dn_opt_state_buf, 0, DOWN_PARAM_SIZE * OPT.STATE_PER_PARAM)
+    unsafe_memset(dn_opt_global_buf, 0, OPT.GLOBAL_STATE_SIZE)
     var dn_params = tile[DOWN_PARAM_SIZE](dn_params_buf)
     var dn_grads = tile[DOWN_PARAM_SIZE](dn_grads_buf)
     var dn_opt_state = tile[DOWN_PARAM_SIZE, OPT.STATE_PER_PARAM](dn_opt_state_buf)
@@ -116,8 +116,8 @@ def main() raises:
     # ── Shared latents x0, x1 (both HIDDEN-dim) ────────────────────────────
     var x0_buf = alloc[Scalar[dtype]](BATCH * HIDDEN).as_unsafe_any_origin()
     var x1_buf = alloc[Scalar[dtype]](BATCH * HIDDEN).as_unsafe_any_origin()
-    memset(x0_buf, 0, BATCH * HIDDEN)
-    memset(x1_buf, 0, BATCH * HIDDEN)
+    unsafe_memset(x0_buf, 0, BATCH * HIDDEN)
+    unsafe_memset(x1_buf, 0, BATCH * HIDDEN)
     var x0 = tile[BATCH, HIDDEN](x0_buf)
     var x1 = tile[BATCH, HIDDEN](x1_buf)
 
@@ -154,8 +154,8 @@ def main() raises:
     # ── Per-batch input buffers ─────────────────────────────────────────────
     var image_buf = alloc[Scalar[dtype]](BATCH * 784).as_unsafe_any_origin()
     var label_oh_buf = alloc[Scalar[dtype]](BATCH * 10).as_unsafe_any_origin()
-    memset(image_buf, 0, BATCH * 784)
-    memset(label_oh_buf, 0, BATCH * 10)
+    unsafe_memset(image_buf, 0, BATCH * 784)
+    unsafe_memset(label_oh_buf, 0, BATCH * 10)
 
     # ── Param block views ───────────────────────────────────────────────────
     var up_p0 = tile[UB0.PARAM_SIZE](up_params_buf)
@@ -305,7 +305,7 @@ def main() raises:
         # End-of-epoch: quick accuracy check
         var correct: Int = 0
         var pred_buf = alloc[Scalar[dtype]](BATCH * 10).as_unsafe_any_origin()
-        memset(pred_buf, 0, BATCH * 10)
+        unsafe_memset(pred_buf, 0, BATCH * 10)
         var pred_t = tile[BATCH, 10](pred_buf)
         for tb in range(N_TEST_BATCHES):
             for i in range(BATCH):
@@ -338,8 +338,8 @@ def main() raises:
     # ── Generation: pass each one-hot label through DOWN forward_eval ───────
     var gen_label_buf = alloc[Scalar[dtype]](BATCH * 10).as_unsafe_any_origin()
     var gen_image_buf = alloc[Scalar[dtype]](BATCH * 784).as_unsafe_any_origin()
-    memset(gen_label_buf, 0, BATCH * 10)
-    memset(gen_image_buf, 0, BATCH * 784)
+    unsafe_memset(gen_label_buf, 0, BATCH * 10)
+    unsafe_memset(gen_image_buf, 0, BATCH * 784)
     for c in range(10):
         gen_label_buf[c * 10 + c] = Scalar[dtype](1.0)
     var gen_label_t = tile[BATCH, 10](gen_label_buf)
@@ -365,7 +365,7 @@ def main() raises:
     # Find one real test sample per class for comparison
     var real_digits_buf = alloc[Scalar[dtype]](10 * 784).as_unsafe_any_origin()
     var found = alloc[UInt8](10).as_unsafe_any_origin()
-    memset(found, 0, 10)
+    unsafe_memset(found, 0, 10)
     var found_count: Int = 0
     for i in range(MNIST.N_TEST):
         var c = Int(ds.test_labels[i])
@@ -412,7 +412,7 @@ def main() raises:
     # ── Verdict ─────────────────────────────────────────────────────────────
     # Re-run final accuracy (already computed above but recompute clean)
     var final_pred_buf = alloc[Scalar[dtype]](BATCH * 10).as_unsafe_any_origin()
-    memset(final_pred_buf, 0, BATCH * 10)
+    unsafe_memset(final_pred_buf, 0, BATCH * 10)
     var final_pred_t = tile[BATCH, 10](final_pred_buf)
     var final_correct: Int = 0
     for tb in range(N_TEST_BATCHES):

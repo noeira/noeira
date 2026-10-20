@@ -32,7 +32,7 @@ Run:
     pixi run mojo run -I . tests/pcn/test_conv_pc_cifar10_spike_deep_cpu.mojo
 """
 
-from std.memory import alloc, memset
+from std.memory import alloc, unsafe_memset
 from std.time import perf_counter_ns
 from noeira.core.tiles import tile
 
@@ -99,9 +99,9 @@ def main() raises:
     var params_buf = alloc[Scalar[dtype]](NET.PARAM_SIZE).as_unsafe_any_origin()
     var snap_buf = alloc[Scalar[dtype]](NET.PARAM_SIZE).as_unsafe_any_origin()
     var grads_buf = alloc[Scalar[dtype]](NET.PARAM_SIZE).as_unsafe_any_origin()
-    memset(params_buf, 0, NET.PARAM_SIZE)
-    memset(snap_buf, 0, NET.PARAM_SIZE)
-    memset(grads_buf, 0, NET.PARAM_SIZE)
+    unsafe_memset(params_buf, 0, NET.PARAM_SIZE)
+    unsafe_memset(snap_buf, 0, NET.PARAM_SIZE)
+    unsafe_memset(grads_buf, 0, NET.PARAM_SIZE)
     var params = tile[NET.PARAM_SIZE](params_buf)
     var grads = tile[NET.PARAM_SIZE](grads_buf)
 
@@ -156,15 +156,15 @@ def main() raises:
 
         for i in range(NET.PARAM_SIZE):
             params_buf[i] = snap_buf[i]
-        memset(grads_buf, 0, NET.PARAM_SIZE)
-        memset(opt_state_buf, 0, NET.PARAM_SIZE * OPT.STATE_PER_PARAM)
-        memset(opt_global_buf, 0, OPT.GLOBAL_STATE_SIZE)
-        memset(lat_buf, 0, BATCH * NET.LATENT_DIM)
-        memset(mu_eps_buf_raw, 0, BATCH * NET.SCRATCH_OUT_DIM)
-        memset(a_below_buf_raw, 0, BATCH * NET.SCRATCH_IN_DIM)
-        memset(z_below_buf_raw, 0, BATCH * NET.SCRATCH_IN_DIM)
-        memset(dx_buf_raw, 0, BATCH * NET.LATENT_DIM)
-        memset(lat0_buf, 0, BATCH * NET.LATENT_DIM)
+        unsafe_memset(grads_buf, 0, NET.PARAM_SIZE)
+        unsafe_memset(opt_state_buf, 0, NET.PARAM_SIZE * OPT.STATE_PER_PARAM)
+        unsafe_memset(opt_global_buf, 0, OPT.GLOBAL_STATE_SIZE)
+        unsafe_memset(lat_buf, 0, BATCH * NET.LATENT_DIM)
+        unsafe_memset(mu_eps_buf_raw, 0, BATCH * NET.SCRATCH_OUT_DIM)
+        unsafe_memset(a_below_buf_raw, 0, BATCH * NET.SCRATCH_IN_DIM)
+        unsafe_memset(z_below_buf_raw, 0, BATCH * NET.SCRATCH_IN_DIM)
+        unsafe_memset(dx_buf_raw, 0, BATCH * NET.LATENT_DIM)
+        unsafe_memset(lat0_buf, 0, BATCH * NET.LATENT_DIM)
 
         var step_num: Int = 0
         var best_acc: Float64 = 0.0

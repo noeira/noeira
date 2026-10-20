@@ -23,7 +23,7 @@ Run:
 """
 
 from std.math import sqrt, log, cos, sin, tanh, pi
-from std.memory import alloc, memset
+from std.memory import alloc, unsafe_memset
 from std.random.philox import Random as PhiloxRandom
 from std.time import perf_counter_ns
 from noeira.core.tiles import tile
@@ -220,10 +220,10 @@ def main() raises:
         NET.PARAM_SIZE * OPT_PC.STATE_PER_PARAM
     ).as_unsafe_any_origin()
     var pc_opt_global_buf = alloc[Scalar[dtype]](OPT_PC.GLOBAL_STATE_SIZE).as_unsafe_any_origin()
-    memset(pc_params_buf, 0, NET.PARAM_SIZE)
-    memset(pc_grads_buf, 0, NET.PARAM_SIZE)
-    memset(pc_opt_state_buf, 0, NET.PARAM_SIZE * OPT_PC.STATE_PER_PARAM)
-    memset(pc_opt_global_buf, 0, OPT_PC.GLOBAL_STATE_SIZE)
+    unsafe_memset(pc_params_buf, 0, NET.PARAM_SIZE)
+    unsafe_memset(pc_grads_buf, 0, NET.PARAM_SIZE)
+    unsafe_memset(pc_opt_state_buf, 0, NET.PARAM_SIZE * OPT_PC.STATE_PER_PARAM)
+    unsafe_memset(pc_opt_global_buf, 0, OPT_PC.GLOBAL_STATE_SIZE)
     var pc_params = tile[NET.PARAM_SIZE](pc_params_buf)
     var pc_grads = tile[NET.PARAM_SIZE](pc_grads_buf)
     var pc_opt_state = tile[NET.PARAM_SIZE, OPT_PC.STATE_PER_PARAM](pc_opt_state_buf)
@@ -243,10 +243,10 @@ def main() raises:
         ENC_PARAM_SIZE * OPT_ENC.STATE_PER_PARAM
     ).as_unsafe_any_origin()
     var enc_opt_global_buf = alloc[Scalar[dtype]](OPT_ENC.GLOBAL_STATE_SIZE).as_unsafe_any_origin()
-    memset(enc_params_buf, 0, ENC_PARAM_SIZE)
-    memset(enc_grads_buf, 0, ENC_PARAM_SIZE)
-    memset(enc_opt_state_buf, 0, ENC_PARAM_SIZE * OPT_ENC.STATE_PER_PARAM)
-    memset(enc_opt_global_buf, 0, OPT_ENC.GLOBAL_STATE_SIZE)
+    unsafe_memset(enc_params_buf, 0, ENC_PARAM_SIZE)
+    unsafe_memset(enc_grads_buf, 0, ENC_PARAM_SIZE)
+    unsafe_memset(enc_opt_state_buf, 0, ENC_PARAM_SIZE * OPT_ENC.STATE_PER_PARAM)
+    unsafe_memset(enc_opt_global_buf, 0, OPT_ENC.GLOBAL_STATE_SIZE)
     var enc_params = tile[ENC_PARAM_SIZE](enc_params_buf)
     var enc_grads = tile[ENC_PARAM_SIZE](enc_grads_buf)
     var enc_opt_state = tile[ENC_PARAM_SIZE, OPT_ENC.STATE_PER_PARAM](enc_opt_state_buf)
@@ -318,7 +318,7 @@ def main() raises:
                     b * SEQ_LEN,
                     b * (SEQ_LEN + 1) * OBS_DIM,
                 )
-            memset(prev_z_buf, 0, BATCH * HIDDEN)
+            unsafe_memset(prev_z_buf, 0, BATCH * HIDDEN)
 
             for t in range(0, SEQ_LEN + 1):
                 for b in range(BATCH):
@@ -366,7 +366,7 @@ def main() raises:
                         sum_sq += e * e
                 last_loss = 0.5 * sum_sq / Float64(BATCH)
 
-                memset(pc_grads_buf, 0, NET.PARAM_SIZE)
+                unsafe_memset(pc_grads_buf, 0, NET.PARAM_SIZE)
                 BLOCK0.weight_grad[BATCH, dtype](eps_z, a_aug, grads_b0)
                 BLOCK1.weight_grad[BATCH, dtype](eps_obs, a_z, grads_b1)
 
@@ -473,7 +473,7 @@ def main() raises:
         var theta = (u2 * 2.0 - 1.0) * CP_RESET_RANGE
         var theta_dot = (u3 * 2.0 - 1.0) * CP_RESET_RANGE
 
-        memset(agent_z_buf, 0, HIDDEN)
+        unsafe_memset(agent_z_buf, 0, HIDDEN)
         for h in range(PLAN_HORIZON):
             cem_mu[h] = 0.0
             cem_sigma[h] = INITIAL_SIGMA

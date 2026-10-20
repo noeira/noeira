@@ -18,7 +18,7 @@ Run:
     pixi run mojo run -I . tests/pcn/test_bidirectional_conv_pc.mojo
 """
 
-from std.memory import alloc, memset
+from std.memory import alloc, unsafe_memset
 from std.time import perf_counter_ns
 from std.math import exp
 from noeira.core.tiles import tile
@@ -95,10 +95,10 @@ def main() raises:
     var up_grads_buf = alloc[Scalar[dtype]](UP_PARAM_SIZE).as_unsafe_any_origin()
     var up_os_buf = alloc[Scalar[dtype]](UP_PARAM_SIZE * OPT.STATE_PER_PARAM).as_unsafe_any_origin()
     var up_og_buf = alloc[Scalar[dtype]](OPT.GLOBAL_STATE_SIZE).as_unsafe_any_origin()
-    memset(up_params_buf, 0, UP_PARAM_SIZE)
-    memset(up_grads_buf, 0, UP_PARAM_SIZE)
-    memset(up_os_buf, 0, UP_PARAM_SIZE * OPT.STATE_PER_PARAM)
-    memset(up_og_buf, 0, OPT.GLOBAL_STATE_SIZE)
+    unsafe_memset(up_params_buf, 0, UP_PARAM_SIZE)
+    unsafe_memset(up_grads_buf, 0, UP_PARAM_SIZE)
+    unsafe_memset(up_os_buf, 0, UP_PARAM_SIZE * OPT.STATE_PER_PARAM)
+    unsafe_memset(up_og_buf, 0, OPT.GLOBAL_STATE_SIZE)
     var up_params = tile[UP_PARAM_SIZE](up_params_buf)
     var up_grads = tile[UP_PARAM_SIZE](up_grads_buf)
     var up_os = tile[UP_PARAM_SIZE, OPT.STATE_PER_PARAM](up_os_buf)
@@ -110,10 +110,10 @@ def main() raises:
     var dn_grads_buf = alloc[Scalar[dtype]](DOWN_PARAM_SIZE).as_unsafe_any_origin()
     var dn_os_buf = alloc[Scalar[dtype]](DOWN_PARAM_SIZE * OPT.STATE_PER_PARAM).as_unsafe_any_origin()
     var dn_og_buf = alloc[Scalar[dtype]](OPT.GLOBAL_STATE_SIZE).as_unsafe_any_origin()
-    memset(dn_params_buf, 0, DOWN_PARAM_SIZE)
-    memset(dn_grads_buf, 0, DOWN_PARAM_SIZE)
-    memset(dn_os_buf, 0, DOWN_PARAM_SIZE * OPT.STATE_PER_PARAM)
-    memset(dn_og_buf, 0, OPT.GLOBAL_STATE_SIZE)
+    unsafe_memset(dn_params_buf, 0, DOWN_PARAM_SIZE)
+    unsafe_memset(dn_grads_buf, 0, DOWN_PARAM_SIZE)
+    unsafe_memset(dn_os_buf, 0, DOWN_PARAM_SIZE * OPT.STATE_PER_PARAM)
+    unsafe_memset(dn_og_buf, 0, OPT.GLOBAL_STATE_SIZE)
     var dn_params = tile[DOWN_PARAM_SIZE](dn_params_buf)
     var dn_grads = tile[DOWN_PARAM_SIZE](dn_grads_buf)
     var dn_os = tile[DOWN_PARAM_SIZE, OPT.STATE_PER_PARAM](dn_os_buf)
@@ -128,8 +128,8 @@ def main() raises:
     # ── Shared latents ──────────────────────────────────────────────────────
     var x0_buf = alloc[Scalar[dtype]](BATCH * X0_DIM).as_unsafe_any_origin()
     var x1_buf = alloc[Scalar[dtype]](BATCH * X1_DIM).as_unsafe_any_origin()
-    memset(x0_buf, 0, BATCH * X0_DIM)
-    memset(x1_buf, 0, BATCH * X1_DIM)
+    unsafe_memset(x0_buf, 0, BATCH * X0_DIM)
+    unsafe_memset(x1_buf, 0, BATCH * X1_DIM)
     var x0 = tile[BATCH, X0_DIM](x0_buf)
     var x1 = tile[BATCH, X1_DIM](x1_buf)
 
@@ -164,8 +164,8 @@ def main() raises:
 
     var image_buf = alloc[Scalar[dtype]](BATCH * IMG).as_unsafe_any_origin()
     var label_buf = alloc[Scalar[dtype]](BATCH * 10).as_unsafe_any_origin()
-    memset(image_buf, 0, BATCH * IMG)
-    memset(label_buf, 0, BATCH * 10)
+    unsafe_memset(image_buf, 0, BATCH * IMG)
+    unsafe_memset(label_buf, 0, BATCH * 10)
 
     # ── UP param block views ────────────────────────────────────────────────
     var up_p0 = tile[UB0.PARAM_SIZE](up_params_buf)
@@ -330,7 +330,7 @@ def main() raises:
         # accuracy (UP forward_eval — ConvPCBlock + PCBlock all conform)
         var correct: Int = 0
         var pred_buf = alloc[Scalar[dtype]](BATCH * 10).as_unsafe_any_origin()
-        memset(pred_buf, 0, BATCH * 10)
+        unsafe_memset(pred_buf, 0, BATCH * 10)
         var pred_t = tile[BATCH, UP_NET.OUT_DIM](pred_buf)
         for tb in range(N_TEST_BATCHES):
             for i in range(BATCH):
@@ -414,7 +414,7 @@ def main() raises:
 
     var real_digits = alloc[Scalar[dtype]](10 * IMG).as_unsafe_any_origin()
     var found = alloc[UInt8](10).as_unsafe_any_origin()
-    memset(found, 0, 10)
+    unsafe_memset(found, 0, 10)
     var fc: Int = 0
     for i in range(MNIST.N_TEST):
         var c = Int(ds.test_labels[i])
@@ -488,7 +488,7 @@ def main() raises:
     # ── Verdict ─────────────────────────────────────────────────────────────
     var final_correct: Int = 0
     var fp_buf = alloc[Scalar[dtype]](BATCH * 10).as_unsafe_any_origin()
-    memset(fp_buf, 0, BATCH * 10)
+    unsafe_memset(fp_buf, 0, BATCH * 10)
     var fp_t = tile[BATCH, UP_NET.OUT_DIM](fp_buf)
     for tb in range(N_TEST_BATCHES):
         for i in range(BATCH):

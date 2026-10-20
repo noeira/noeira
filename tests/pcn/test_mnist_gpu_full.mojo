@@ -13,7 +13,7 @@ Run:
     pixi run -e nvidia mojo run -I . tests/pcn/test_mnist_gpu_full.mojo
 """
 
-from std.memory import alloc, memset
+from std.memory import alloc, unsafe_memset
 from std.time import perf_counter_ns
 from max.gpu.host import DeviceContext
 from noeira.core.tiles import tile

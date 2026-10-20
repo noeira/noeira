@@ -35,7 +35,7 @@ Run:
 """
 
 from std.math import sqrt, log, cos, pi
-from std.memory import alloc, memset
+from std.memory import alloc, unsafe_memset
 from std.random.philox import Random as PhiloxRandom
 from std.time import perf_counter_ns
 from noeira.core.tiles import tile
@@ -89,7 +89,7 @@ def main() raises:
 
     # ── Build sequence: one image of each of the first SEQ_LEN digits ────────
     var seq_buf = alloc[Scalar[dtype]](SEQ_LEN * DATA_DIM).as_unsafe_any_origin()
-    memset(seq_buf, 0, SEQ_LEN * DATA_DIM)
+    unsafe_memset(seq_buf, 0, SEQ_LEN * DATA_DIM)
     for digit in range(SEQ_LEN):
         # Find the first image of this digit class in train set
         var found_idx = -1
@@ -110,10 +110,10 @@ def main() raises:
     var grads_buf = alloc[Scalar[dtype]](NET.PARAM_SIZE).as_unsafe_any_origin()
     var opt_state_buf = alloc[Scalar[dtype]](NET.PARAM_SIZE * OPT.STATE_PER_PARAM).as_unsafe_any_origin()
     var opt_global_buf = alloc[Scalar[dtype]](OPT.GLOBAL_STATE_SIZE).as_unsafe_any_origin()
-    memset(params_buf, 0, NET.PARAM_SIZE)
-    memset(grads_buf, 0, NET.PARAM_SIZE)
-    memset(opt_state_buf, 0, NET.PARAM_SIZE * OPT.STATE_PER_PARAM)
-    memset(opt_global_buf, 0, OPT.GLOBAL_STATE_SIZE)
+    unsafe_memset(params_buf, 0, NET.PARAM_SIZE)
+    unsafe_memset(grads_buf, 0, NET.PARAM_SIZE)
+    unsafe_memset(opt_state_buf, 0, NET.PARAM_SIZE * OPT.STATE_PER_PARAM)
+    unsafe_memset(opt_global_buf, 0, OPT.GLOBAL_STATE_SIZE)
 
     var params = tile[NET.PARAM_SIZE](params_buf)
     var grads = tile[NET.PARAM_SIZE](grads_buf)
@@ -127,11 +127,11 @@ def main() raises:
     var a_below_buf_raw = alloc[Scalar[dtype]](BATCH * NET.SCRATCH_IN_DIM).as_unsafe_any_origin()
     var z_below_buf_raw = alloc[Scalar[dtype]](BATCH * NET.SCRATCH_IN_DIM).as_unsafe_any_origin()
     var dx_buf_raw = alloc[Scalar[dtype]](BATCH * NET.LATENT_DIM).as_unsafe_any_origin()
-    memset(lat_buf, 0, BATCH * NET.LATENT_DIM)
-    memset(mu_eps_buf_raw, 0, BATCH * NET.SCRATCH_OUT_DIM)
-    memset(a_below_buf_raw, 0, BATCH * NET.SCRATCH_IN_DIM)
-    memset(z_below_buf_raw, 0, BATCH * NET.SCRATCH_IN_DIM)
-    memset(dx_buf_raw, 0, BATCH * NET.LATENT_DIM)
+    unsafe_memset(lat_buf, 0, BATCH * NET.LATENT_DIM)
+    unsafe_memset(mu_eps_buf_raw, 0, BATCH * NET.SCRATCH_OUT_DIM)
+    unsafe_memset(a_below_buf_raw, 0, BATCH * NET.SCRATCH_IN_DIM)
+    unsafe_memset(z_below_buf_raw, 0, BATCH * NET.SCRATCH_IN_DIM)
+    unsafe_memset(dx_buf_raw, 0, BATCH * NET.LATENT_DIM)
 
     var latents = tile[BATCH, NET.LATENT_DIM](lat_buf)
     var mu_eps_buf = tile[BATCH, NET.SCRATCH_OUT_DIM](mu_eps_buf_raw)
@@ -142,8 +142,8 @@ def main() raises:
     # ── Per-step input + target buffers ──────────────────────────────────────
     var x_in_buf = alloc[Scalar[dtype]](BATCH * HIDDEN).as_unsafe_any_origin()
     var y_tgt_buf = alloc[Scalar[dtype]](BATCH * DATA_DIM).as_unsafe_any_origin()
-    memset(x_in_buf, 0, BATCH * HIDDEN)
-    memset(y_tgt_buf, 0, BATCH * DATA_DIM)
+    unsafe_memset(x_in_buf, 0, BATCH * HIDDEN)
+    unsafe_memset(y_tgt_buf, 0, BATCH * DATA_DIM)
     var x_in = tile[BATCH, HIDDEN](x_in_buf)
     var y_target = tile[BATCH, DATA_DIM](y_tgt_buf)
 
@@ -225,7 +225,7 @@ def main() raises:
 
     # Steps 1..SEQ_LEN-1: feedforward only — predict next image from prev_hidden.
     var recalls_buf = alloc[Scalar[dtype]](SEQ_LEN * DATA_DIM).as_unsafe_any_origin()
-    memset(recalls_buf, 0, SEQ_LEN * DATA_DIM)
+    unsafe_memset(recalls_buf, 0, SEQ_LEN * DATA_DIM)
     # First image is just the input (recall starts at t=1).
     for j in range(DATA_DIM):
         recalls_buf[0 * DATA_DIM + j] = seq_buf[0 * DATA_DIM + j]

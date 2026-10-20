@@ -26,7 +26,7 @@ Run:
 """
 
 from std.math import sqrt, log, cos, sin, tanh, pi
-from std.memory import alloc, memset
+from std.memory import alloc, unsafe_memset
 from std.random.philox import Random as PhiloxRandom
 from std.time import perf_counter_ns
 from noeira.core.tiles import tile
@@ -270,10 +270,10 @@ def main() raises:
         T_PARAM_SIZE * OPT.STATE_PER_PARAM
     ).as_unsafe_any_origin()
     var T_opt_global_buf = alloc[Scalar[dtype]](OPT.GLOBAL_STATE_SIZE).as_unsafe_any_origin()
-    memset(T_params_buf, 0, T_PARAM_SIZE)
-    memset(T_grads_buf, 0, T_PARAM_SIZE)
-    memset(T_opt_state_buf, 0, T_PARAM_SIZE * OPT.STATE_PER_PARAM)
-    memset(T_opt_global_buf, 0, OPT.GLOBAL_STATE_SIZE)
+    unsafe_memset(T_params_buf, 0, T_PARAM_SIZE)
+    unsafe_memset(T_grads_buf, 0, T_PARAM_SIZE)
+    unsafe_memset(T_opt_state_buf, 0, T_PARAM_SIZE * OPT.STATE_PER_PARAM)
+    unsafe_memset(T_opt_global_buf, 0, OPT.GLOBAL_STATE_SIZE)
     _xavier_init_layer(T_params_buf, AUG_DIM, HIDDEN, UInt64(7))
     var T_params = tile[T_PARAM_SIZE](T_params_buf)
     var T_grads = tile[T_PARAM_SIZE](T_grads_buf)
@@ -286,10 +286,10 @@ def main() raises:
         D_PARAM_SIZE * OPT.STATE_PER_PARAM
     ).as_unsafe_any_origin()
     var D_opt_global_buf = alloc[Scalar[dtype]](OPT.GLOBAL_STATE_SIZE).as_unsafe_any_origin()
-    memset(D_params_buf, 0, D_PARAM_SIZE)
-    memset(D_grads_buf, 0, D_PARAM_SIZE)
-    memset(D_opt_state_buf, 0, D_PARAM_SIZE * OPT.STATE_PER_PARAM)
-    memset(D_opt_global_buf, 0, OPT.GLOBAL_STATE_SIZE)
+    unsafe_memset(D_params_buf, 0, D_PARAM_SIZE)
+    unsafe_memset(D_grads_buf, 0, D_PARAM_SIZE)
+    unsafe_memset(D_opt_state_buf, 0, D_PARAM_SIZE * OPT.STATE_PER_PARAM)
+    unsafe_memset(D_opt_global_buf, 0, OPT.GLOBAL_STATE_SIZE)
     _xavier_init_layer(D_params_buf, HIDDEN, OBS_DIM, UInt64(8))
     var D_params = tile[D_PARAM_SIZE](D_params_buf)
     var D_grads = tile[D_PARAM_SIZE](D_grads_buf)
@@ -302,10 +302,10 @@ def main() raises:
         ENC_PARAM_SIZE * OPT.STATE_PER_PARAM
     ).as_unsafe_any_origin()
     var enc_opt_global_buf = alloc[Scalar[dtype]](OPT.GLOBAL_STATE_SIZE).as_unsafe_any_origin()
-    memset(enc_params_buf, 0, ENC_PARAM_SIZE)
-    memset(enc_grads_buf, 0, ENC_PARAM_SIZE)
-    memset(enc_opt_state_buf, 0, ENC_PARAM_SIZE * OPT.STATE_PER_PARAM)
-    memset(enc_opt_global_buf, 0, OPT.GLOBAL_STATE_SIZE)
+    unsafe_memset(enc_params_buf, 0, ENC_PARAM_SIZE)
+    unsafe_memset(enc_grads_buf, 0, ENC_PARAM_SIZE)
+    unsafe_memset(enc_opt_state_buf, 0, ENC_PARAM_SIZE * OPT.STATE_PER_PARAM)
+    unsafe_memset(enc_opt_global_buf, 0, OPT.GLOBAL_STATE_SIZE)
     var enc_params = tile[ENC_PARAM_SIZE](enc_params_buf)
     var enc_grads = tile[ENC_PARAM_SIZE](enc_grads_buf)
     var enc_opt_state = tile[ENC_PARAM_SIZE, OPT.STATE_PER_PARAM](enc_opt_state_buf)
@@ -432,10 +432,10 @@ def main() raises:
             last_loss = 0.5 * sum_sq / Float64(BATCH * K_BPTT)
 
             # ── Zero accumulating param gradients before backward sweep ─────
-            memset(T_grads_buf, 0, T_PARAM_SIZE)
-            memset(D_grads_buf, 0, D_PARAM_SIZE)
+            unsafe_memset(T_grads_buf, 0, T_PARAM_SIZE)
+            unsafe_memset(D_grads_buf, 0, D_PARAM_SIZE)
             # d_z_from_next starts at 0 for the last step (k=K-1).
-            memset(d_z_from_next_buf, 0, BATCH * HIDDEN)
+            unsafe_memset(d_z_from_next_buf, 0, BATCH * HIDDEN)
 
             # ── Backward sweep: k = K-1 down to 0 ───────────────────────────
             for k_rev in range(K_BPTT):
@@ -600,7 +600,7 @@ def main() raises:
         var reached_goal = False
         var step_at_goal: Int = -1
 
-        memset(agent_z_buf, 0, HIDDEN)
+        unsafe_memset(agent_z_buf, 0, HIDDEN)
         for h in range(PLAN_HORIZON):
             cem_mu[h] = 0.0
             cem_sigma[h] = INITIAL_SIGMA

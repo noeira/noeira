@@ -17,12 +17,13 @@ Run:
 
 from max.gpu import thread_idx, block_idx, block_dim
 from max.gpu.host import DeviceContext
-from std.memory import alloc, memset
+from std.memory import alloc, unsafe_memset
 from std.random.philox import Random as PhiloxRandom
 from std.time import perf_counter_ns
 from noeira.core.tiles import Tile, tile
 
 from noeira.nn.constants import DT as dtype
+from noeira.core.fmt import fit
 from noeira.experimental.pcn.pc_constants import TPB
 from noeira.experimental.pcn.pc_initializer import PCXavier
 from noeira.experimental.pcn.pc_optimizer import PCAdam
@@ -389,7 +390,6 @@ def main() raises:
         )
         NET.block_types[1].predict_gpu[BATCH, dtype](
             ctx, z_pred_t, params_b1_t, s_pred_t, a_s_pred_t
-from noeira.core.fmt import fit
         )
 
         # Download s_pred to host for MSE

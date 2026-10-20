@@ -22,7 +22,7 @@ Run:
 """
 
 from std.math import sqrt, log, cos, sin, tanh, pi
-from std.memory import alloc, memset
+from std.memory import alloc, unsafe_memset
 from std.random.philox import Random as PhiloxRandom
 from std.time import perf_counter_ns
 from noeira.core.tiles import tile
@@ -220,10 +220,10 @@ def main() raises:
         NET.PARAM_SIZE * OPT_PC.STATE_PER_PARAM
     ).as_unsafe_any_origin()
     var pc_opt_global_buf = alloc[Scalar[dtype]](OPT_PC.GLOBAL_STATE_SIZE).as_unsafe_any_origin()
-    memset(pc_params_buf, 0, NET.PARAM_SIZE)
-    memset(pc_grads_buf, 0, NET.PARAM_SIZE)
-    memset(pc_opt_state_buf, 0, NET.PARAM_SIZE * OPT_PC.STATE_PER_PARAM)
-    memset(pc_opt_global_buf, 0, OPT_PC.GLOBAL_STATE_SIZE)
+    unsafe_memset(pc_params_buf, 0, NET.PARAM_SIZE)
+    unsafe_memset(pc_grads_buf, 0, NET.PARAM_SIZE)
+    unsafe_memset(pc_opt_state_buf, 0, NET.PARAM_SIZE * OPT_PC.STATE_PER_PARAM)
+    unsafe_memset(pc_opt_global_buf, 0, OPT_PC.GLOBAL_STATE_SIZE)
     var pc_params = tile[NET.PARAM_SIZE](pc_params_buf)
     var pc_grads = tile[NET.PARAM_SIZE](pc_grads_buf)
     var pc_opt_state = tile[NET.PARAM_SIZE, OPT_PC.STATE_PER_PARAM](pc_opt_state_buf)
@@ -242,10 +242,10 @@ def main() raises:
         ENC_PARAM_SIZE * OPT_ENC.STATE_PER_PARAM
     ).as_unsafe_any_origin()
     var enc_opt_global_buf = alloc[Scalar[dtype]](OPT_ENC.GLOBAL_STATE_SIZE).as_unsafe_any_origin()
-    memset(enc_params_buf, 0, ENC_PARAM_SIZE)
-    memset(enc_grads_buf, 0, ENC_PARAM_SIZE)
-    memset(enc_opt_state_buf, 0, ENC_PARAM_SIZE * OPT_ENC.STATE_PER_PARAM)
-    memset(enc_opt_global_buf, 0, OPT_ENC.GLOBAL_STATE_SIZE)
+    unsafe_memset(enc_params_buf, 0, ENC_PARAM_SIZE)
+    unsafe_memset(enc_grads_buf, 0, ENC_PARAM_SIZE)
+    unsafe_memset(enc_opt_state_buf, 0, ENC_PARAM_SIZE * OPT_ENC.STATE_PER_PARAM)
+    unsafe_memset(enc_opt_global_buf, 0, OPT_ENC.GLOBAL_STATE_SIZE)
 
     var enc_params = tile[ENC_PARAM_SIZE](enc_params_buf)
     var enc_grads = tile[ENC_PARAM_SIZE](enc_grads_buf)
@@ -259,7 +259,7 @@ def main() raises:
     var a_below_buf_raw = alloc[Scalar[dtype]](BATCH * NET.SCRATCH_IN_DIM).as_unsafe_any_origin()
     var z_below_buf_raw = alloc[Scalar[dtype]](BATCH * NET.SCRATCH_IN_DIM).as_unsafe_any_origin()
     var dx_buf_raw = alloc[Scalar[dtype]](BATCH * NET.LATENT_DIM).as_unsafe_any_origin()
-    memset(lat_buf, 0, BATCH * NET.LATENT_DIM)
+    unsafe_memset(lat_buf, 0, BATCH * NET.LATENT_DIM)
 
     var latents = tile[BATCH, NET.LATENT_DIM](lat_buf)
     var mu_eps_buf = tile[BATCH, NET.SCRATCH_OUT_DIM](mu_eps_buf_raw)
@@ -269,8 +269,8 @@ def main() raises:
 
     var x_in_buf = alloc[Scalar[dtype]](BATCH * AUG_DIM).as_unsafe_any_origin()
     var y_tgt_buf = alloc[Scalar[dtype]](BATCH * OBS_DIM).as_unsafe_any_origin()
-    memset(x_in_buf, 0, BATCH * AUG_DIM)
-    memset(y_tgt_buf, 0, BATCH * OBS_DIM)
+    unsafe_memset(x_in_buf, 0, BATCH * AUG_DIM)
+    unsafe_memset(y_tgt_buf, 0, BATCH * OBS_DIM)
     var x_in = tile[BATCH, AUG_DIM](x_in_buf)
     var y_target = tile[BATCH, OBS_DIM](y_tgt_buf)
 
@@ -319,7 +319,7 @@ def main() raises:
                 )
 
             # prev_z = 0 at the start of each rollout.
-            memset(prev_z_buf, 0, BATCH * HIDDEN)
+            unsafe_memset(prev_z_buf, 0, BATCH * HIDDEN)
 
             # Per time step t = 0..SEQ_LEN: encode → refine → update W's.
             # At t=0 there's no prior action; use action=0 in the encoder input.
@@ -468,7 +468,7 @@ def main() raises:
         " persist[per-dim]"
     )
 
-    memset(prev_z_buf, 0, BATCH * HIDDEN)
+    unsafe_memset(prev_z_buf, 0, BATCH * HIDDEN)
 
     # Initial filter: encode + refine at t=0 (bootstrap).
     for b in range(N_EVAL_TRAJ):
@@ -660,7 +660,7 @@ def main() raises:
     print("  step | mse_total (open-loop) | mse_persist | ratio")
     print("  -----+-----------------------+-------------+------")
 
-    memset(prev_z_buf, 0, BATCH * HIDDEN)
+    unsafe_memset(prev_z_buf, 0, BATCH * HIDDEN)
 
     # Initial filter at t=0
     for b in range(N_EVAL_TRAJ):

@@ -13,7 +13,7 @@ Run:
     pixi run -e nvidia mojo run -I . benchmarks/benchmark_pcn_gpu.mojo
 """
 
-from std.memory import alloc, memset
+from std.memory import alloc, unsafe_memset
 from std.random.philox import Random as PhiloxRandom
 from max.gpu.host import DeviceContext
 from std.time import perf_counter_ns
@@ -66,7 +66,7 @@ def main() raises:
 
     # ── Init params + input/target (Xavier, deterministic Philox) ─────────────
     var params_buf = alloc[Scalar[dtype]](NET.PARAM_SIZE)
-    memset(params_buf, 0, NET.PARAM_SIZE)
+    unsafe_memset(params_buf, 0, NET.PARAM_SIZE)
     var params = tile[NET.PARAM_SIZE](params_buf)
     NET.pc_init_params[PCXavier, dtype](params)
 
@@ -103,7 +103,7 @@ def main() raises:
 
     print("\n  CPU warmup ...")
     for _ in range(WARMUP_ITERS):
-        memset(grads_cpu_buf, 0, NET.PARAM_SIZE)
+        unsafe_memset(grads_cpu_buf, 0, NET.PARAM_SIZE)
         _ = TRAINER.compute_grads_only[BATCH](
             params, grads_cpu, lat_cpu, mu_eps_cpu, a_below_cpu,
             z_below_cpu, dx_cpu, x_in, y_target,
@@ -111,9 +111,9 @@ def main() raises:
         )
 
     print("  CPU benchmarking ...")
-    var cpu_total_ns: UInt = 0
+    var cpu_total_ns = 0
     for _ in range(BENCH_ITERS):
-        memset(grads_cpu_buf, 0, NET.PARAM_SIZE)
+        unsafe_memset(grads_cpu_buf, 0, NET.PARAM_SIZE)
         var t0 = perf_counter_ns()
         _ = TRAINER.compute_grads_only[BATCH](
             params, grads_cpu, lat_cpu, mu_eps_cpu, a_below_cpu,
@@ -171,7 +171,7 @@ def main() raises:
     ctx.synchronize()
 
     print("  GPU benchmarking ...")
-    var gpu_total_ns: UInt = 0
+    var gpu_total_ns = 0
     for _ in range(BENCH_ITERS):
         var t0 = perf_counter_ns()
         TRAINER.compute_grads_only_gpu[BATCH](

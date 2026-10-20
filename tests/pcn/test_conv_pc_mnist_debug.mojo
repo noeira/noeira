@@ -8,7 +8,7 @@ Run (Apple):
     pixi run -e apple mojo run -I . tests/pcn/test_conv_pc_mnist_debug.mojo
 """
 
-from std.memory import alloc, memset
+from std.memory import alloc, unsafe_memset
 from std.math import sin
 from noeira.core.tiles import tile
 from max.gpu.host import DeviceContext
@@ -49,7 +49,7 @@ def main() raises:
 
     # ── Shared params + synthetic batch (host) ───────────────────────────────
     var params_buf = alloc[Scalar[dtype]](NET.PARAM_SIZE).as_unsafe_any_origin()
-    memset(params_buf, 0, NET.PARAM_SIZE)
+    unsafe_memset(params_buf, 0, NET.PARAM_SIZE)
     var params_lt = tile[NET.PARAM_SIZE](params_buf)
     NET.pc_init_params[PCXavier, dtype](params_lt)
 
@@ -64,17 +64,17 @@ def main() raises:
 
     # ── CPU grads ─────────────────────────────────────────────────────────────
     var grads_cpu = alloc[Scalar[dtype]](NET.PARAM_SIZE).as_unsafe_any_origin()
-    memset(grads_cpu, 0, NET.PARAM_SIZE)
+    unsafe_memset(grads_cpu, 0, NET.PARAM_SIZE)
     var lat_c = alloc[Scalar[dtype]](BATCH * NET.LATENT_DIM).as_unsafe_any_origin()
     var mu_c = alloc[Scalar[dtype]](BATCH * NET.SCRATCH_OUT_DIM).as_unsafe_any_origin()
     var ab_c = alloc[Scalar[dtype]](BATCH * NET.SCRATCH_IN_DIM).as_unsafe_any_origin()
     var zb_c = alloc[Scalar[dtype]](BATCH * NET.SCRATCH_IN_DIM).as_unsafe_any_origin()
     var dx_c = alloc[Scalar[dtype]](BATCH * NET.LATENT_DIM).as_unsafe_any_origin()
-    memset(lat_c, 0, BATCH * NET.LATENT_DIM)
-    memset(mu_c, 0, BATCH * NET.SCRATCH_OUT_DIM)
-    memset(ab_c, 0, BATCH * NET.SCRATCH_IN_DIM)
-    memset(zb_c, 0, BATCH * NET.SCRATCH_IN_DIM)
-    memset(dx_c, 0, BATCH * NET.LATENT_DIM)
+    unsafe_memset(lat_c, 0, BATCH * NET.LATENT_DIM)
+    unsafe_memset(mu_c, 0, BATCH * NET.SCRATCH_OUT_DIM)
+    unsafe_memset(ab_c, 0, BATCH * NET.SCRATCH_IN_DIM)
+    unsafe_memset(zb_c, 0, BATCH * NET.SCRATCH_IN_DIM)
+    unsafe_memset(dx_c, 0, BATCH * NET.LATENT_DIM)
 
     var pc = tile[NET.PARAM_SIZE](params_buf)
     var gc = tile[NET.PARAM_SIZE](grads_cpu)

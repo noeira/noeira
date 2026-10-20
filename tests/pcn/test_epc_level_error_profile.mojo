@@ -48,7 +48,7 @@ Run:
 """
 
 from std.math import sqrt
-from std.memory import alloc, memset
+from std.memory import alloc, unsafe_memset
 from noeira.core.tiles import Tile, tile
 
 from noeira.nn.constants import DT as dtype
@@ -229,16 +229,16 @@ def main() raises:
 
     var params_buf = alloc[Scalar[dtype]](NET.PARAM_SIZE).as_unsafe_any_origin()
     var grads_buf = alloc[Scalar[dtype]](NET.PARAM_SIZE).as_unsafe_any_origin()
-    memset(params_buf, 0, NET.PARAM_SIZE)
-    memset(grads_buf, 0, NET.PARAM_SIZE)
+    unsafe_memset(params_buf, 0, NET.PARAM_SIZE)
+    unsafe_memset(grads_buf, 0, NET.PARAM_SIZE)
     var params = tile[NET.PARAM_SIZE](params_buf)
     var grads = tile[NET.PARAM_SIZE](grads_buf)
     NET.pc_init_params[PCXavier, dtype](params)
 
     var opt_state_buf = alloc[Scalar[dtype]](NET.PARAM_SIZE * OPT.STATE_PER_PARAM).as_unsafe_any_origin()
     var opt_global_buf = alloc[Scalar[dtype]](OPT.GLOBAL_STATE_SIZE).as_unsafe_any_origin()
-    memset(opt_state_buf, 0, NET.PARAM_SIZE * OPT.STATE_PER_PARAM)
-    memset(opt_global_buf, 0, OPT.GLOBAL_STATE_SIZE)
+    unsafe_memset(opt_state_buf, 0, NET.PARAM_SIZE * OPT.STATE_PER_PARAM)
+    unsafe_memset(opt_global_buf, 0, OPT.GLOBAL_STATE_SIZE)
     var opt_state = tile[NET.PARAM_SIZE, OPT.STATE_PER_PARAM](opt_state_buf)
     var opt_global = tile[OPT.GLOBAL_STATE_SIZE](opt_global_buf)
 
@@ -250,11 +250,11 @@ def main() raises:
     var err_raw2 = alloc[Scalar[dtype]](BATCH * NET.LATENT_DIM).as_unsafe_any_origin()
     var x_buf = alloc[Scalar[dtype]](BATCH * IN).as_unsafe_any_origin()
     var y_buf = alloc[Scalar[dtype]](BATCH * NET.OUT_DIM).as_unsafe_any_origin()
-    memset(lat_buf, 0, BATCH * NET.LATENT_DIM)
-    memset(mu_eps_raw, 0, BATCH * NET.SCRATCH_OUT_DIM)
-    memset(a_below_raw, 0, BATCH * NET.SCRATCH_IN_DIM)
-    memset(z_below_raw, 0, BATCH * NET.SCRATCH_IN_DIM)
-    memset(dx_raw, 0, BATCH * NET.LATENT_DIM)
+    unsafe_memset(lat_buf, 0, BATCH * NET.LATENT_DIM)
+    unsafe_memset(mu_eps_raw, 0, BATCH * NET.SCRATCH_OUT_DIM)
+    unsafe_memset(a_below_raw, 0, BATCH * NET.SCRATCH_IN_DIM)
+    unsafe_memset(z_below_raw, 0, BATCH * NET.SCRATCH_IN_DIM)
+    unsafe_memset(dx_raw, 0, BATCH * NET.LATENT_DIM)
 
     var latents = tile[BATCH, NET.LATENT_DIM](lat_buf)
     var mu_eps_buf = tile[BATCH, NET.SCRATCH_OUT_DIM](mu_eps_raw)

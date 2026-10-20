@@ -19,7 +19,7 @@ Run (Apple):
     pixi run -e apple mojo run -I . tests/pcn/test_conv_pc_mnist_gpu.mojo
 """
 
-from std.memory import alloc, memset
+from std.memory import alloc, unsafe_memset
 from std.time import perf_counter_ns
 from noeira.core.tiles import tile
 from max.gpu.host import DeviceContext
@@ -77,7 +77,7 @@ def main() raises:
 
     # ── Params (host init → device) ──────────────────────────────────────────
     var params_buf = alloc[Scalar[dtype]](NET.PARAM_SIZE).as_unsafe_any_origin()
-    memset(params_buf, 0, NET.PARAM_SIZE)
+    unsafe_memset(params_buf, 0, NET.PARAM_SIZE)
     var params_host_lt = tile[NET.PARAM_SIZE](params_buf)
     NET.pc_init_params[PCXavier, dtype](params_host_lt)
 

@@ -22,7 +22,7 @@ Run:
 """
 
 from std.math import abs as mabs
-from std.memory import alloc, memset
+from std.memory import alloc, unsafe_memset
 from noeira.core.tiles import tile
 
 from noeira.nn.constants import DT as dtype
@@ -123,7 +123,7 @@ def main() raises:
 
     # ── Shared setup for the driver checks ───────────────────────────────────
     var params_buf = alloc[Scalar[dtype]](NET.PARAM_SIZE).as_unsafe_any_origin()
-    memset(params_buf, 0, NET.PARAM_SIZE)
+    unsafe_memset(params_buf, 0, NET.PARAM_SIZE)
     var params = tile[NET.PARAM_SIZE](params_buf)
     NET.pc_init_params[PCXavier, dtype](params)
 
@@ -132,11 +132,11 @@ def main() raises:
     var a_below_raw = alloc[Scalar[dtype]](BATCH * NET.SCRATCH_IN_DIM).as_unsafe_any_origin()
     var z_below_raw = alloc[Scalar[dtype]](BATCH * NET.SCRATCH_IN_DIM).as_unsafe_any_origin()
     var dx_raw = alloc[Scalar[dtype]](BATCH * NET.LATENT_DIM).as_unsafe_any_origin()
-    memset(lat_buf, 0, BATCH * NET.LATENT_DIM)
-    memset(mu_eps_raw, 0, BATCH * NET.SCRATCH_OUT_DIM)
-    memset(a_below_raw, 0, BATCH * NET.SCRATCH_IN_DIM)
-    memset(z_below_raw, 0, BATCH * NET.SCRATCH_IN_DIM)
-    memset(dx_raw, 0, BATCH * NET.LATENT_DIM)
+    unsafe_memset(lat_buf, 0, BATCH * NET.LATENT_DIM)
+    unsafe_memset(mu_eps_raw, 0, BATCH * NET.SCRATCH_OUT_DIM)
+    unsafe_memset(a_below_raw, 0, BATCH * NET.SCRATCH_IN_DIM)
+    unsafe_memset(z_below_raw, 0, BATCH * NET.SCRATCH_IN_DIM)
+    unsafe_memset(dx_raw, 0, BATCH * NET.LATENT_DIM)
 
     var latents = tile[BATCH, NET.LATENT_DIM](lat_buf)
     var mu_eps_buf = tile[BATCH, NET.SCRATCH_OUT_DIM](mu_eps_raw)
@@ -161,9 +161,9 @@ def main() raises:
     var g_base = alloc[Scalar[dtype]](NET.PARAM_SIZE).as_unsafe_any_origin()
     var g_off = alloc[Scalar[dtype]](NET.PARAM_SIZE).as_unsafe_any_origin()
     var g_on = alloc[Scalar[dtype]](NET.PARAM_SIZE).as_unsafe_any_origin()
-    memset(g_base, 0, NET.PARAM_SIZE)
-    memset(g_off, 0, NET.PARAM_SIZE)
-    memset(g_on, 0, NET.PARAM_SIZE)
+    unsafe_memset(g_base, 0, NET.PARAM_SIZE)
+    unsafe_memset(g_off, 0, NET.PARAM_SIZE)
+    unsafe_memset(g_on, 0, NET.PARAM_SIZE)
     var grads_base = tile[NET.PARAM_SIZE](g_base)
     var grads_off = tile[NET.PARAM_SIZE](g_off)
     var grads_on = tile[NET.PARAM_SIZE](g_on)
@@ -232,11 +232,11 @@ def main() raises:
     print("\n[5] forward updates move interior grads, not the readout block")
 
     var lat0_raw = alloc[Scalar[dtype]](BATCH * NET.LATENT_DIM).as_unsafe_any_origin()
-    memset(lat0_raw, 0, BATCH * NET.LATENT_DIM)
+    unsafe_memset(lat0_raw, 0, BATCH * NET.LATENT_DIM)
     var latents_0 = tile[BATCH, NET.LATENT_DIM](lat0_raw)
 
     var g_fwd = alloc[Scalar[dtype]](NET.PARAM_SIZE).as_unsafe_any_origin()
-    memset(g_fwd, 0, NET.PARAM_SIZE)
+    unsafe_memset(g_fwd, 0, NET.PARAM_SIZE)
     var grads_fwd = tile[NET.PARAM_SIZE](g_fwd)
 
     var r_fwd = TRAINER.compute_grads_only_fwd[BATCH](

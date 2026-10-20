@@ -25,7 +25,7 @@ Run:
 """
 
 from std.math import sqrt, log, cos, sin, pi
-from std.memory import alloc, memset
+from std.memory import alloc, unsafe_memset
 from std.random.philox import Random as PhiloxRandom
 from std.time import perf_counter_ns
 from noeira.core.tiles import Tile, tile
@@ -219,10 +219,10 @@ def main() raises:
         NET.PARAM_SIZE * OPT.STATE_PER_PARAM
     ).as_unsafe_any_origin()
     var opt_global_buf = alloc[Scalar[dtype]](OPT.GLOBAL_STATE_SIZE).as_unsafe_any_origin()
-    memset(params_buf, 0, NET.PARAM_SIZE)
-    memset(grads_buf, 0, NET.PARAM_SIZE)
-    memset(opt_state_buf, 0, NET.PARAM_SIZE * OPT.STATE_PER_PARAM)
-    memset(opt_global_buf, 0, OPT.GLOBAL_STATE_SIZE)
+    unsafe_memset(params_buf, 0, NET.PARAM_SIZE)
+    unsafe_memset(grads_buf, 0, NET.PARAM_SIZE)
+    unsafe_memset(opt_state_buf, 0, NET.PARAM_SIZE * OPT.STATE_PER_PARAM)
+    unsafe_memset(opt_global_buf, 0, OPT.GLOBAL_STATE_SIZE)
 
     var params = tile[NET.PARAM_SIZE](params_buf)
     var grads = tile[NET.PARAM_SIZE](grads_buf)
@@ -236,7 +236,7 @@ def main() raises:
     var a_below_buf_raw = alloc[Scalar[dtype]](BATCH * NET.SCRATCH_IN_DIM).as_unsafe_any_origin()
     var z_below_buf_raw = alloc[Scalar[dtype]](BATCH * NET.SCRATCH_IN_DIM).as_unsafe_any_origin()
     var dx_buf_raw = alloc[Scalar[dtype]](BATCH * NET.LATENT_DIM).as_unsafe_any_origin()
-    memset(lat_buf, 0, BATCH * NET.LATENT_DIM)
+    unsafe_memset(lat_buf, 0, BATCH * NET.LATENT_DIM)
 
     var latents = tile[BATCH, NET.LATENT_DIM](lat_buf)
     var mu_eps_buf = tile[BATCH, NET.SCRATCH_OUT_DIM](mu_eps_buf_raw)
@@ -246,8 +246,8 @@ def main() raises:
 
     var x_in_buf = alloc[Scalar[dtype]](BATCH * AUG_DIM).as_unsafe_any_origin()
     var y_tgt_buf = alloc[Scalar[dtype]](BATCH * OBS_DIM).as_unsafe_any_origin()
-    memset(x_in_buf, 0, BATCH * AUG_DIM)
-    memset(y_tgt_buf, 0, BATCH * OBS_DIM)
+    unsafe_memset(x_in_buf, 0, BATCH * AUG_DIM)
+    unsafe_memset(y_tgt_buf, 0, BATCH * OBS_DIM)
     var x_in = tile[BATCH, AUG_DIM](x_in_buf)
     var y_target = tile[BATCH, OBS_DIM](y_tgt_buf)
 
@@ -276,7 +276,7 @@ def main() raises:
                 )
 
             # Filter z_0 against s_0 (no action input — use zeros).
-            memset(x_in_buf, 0, BATCH * AUG_DIM)
+            unsafe_memset(x_in_buf, 0, BATCH * AUG_DIM)
             for b in range(BATCH):
                 for d in range(OBS_DIM):
                     y_tgt_buf[b * OBS_DIM + d] = obs_buf[
@@ -387,7 +387,7 @@ def main() raises:
     print("  -----+-----------+-------------+---------------+----------------")
 
     # Filter z_0 against s_0 (no action).
-    memset(x_in_buf, 0, BATCH * AUG_DIM)
+    unsafe_memset(x_in_buf, 0, BATCH * AUG_DIM)
     for b in range(N_EVAL_TRAJ):
         for d in range(OBS_DIM):
             y_tgt_buf[b * OBS_DIM + d] = obs_buf[
@@ -548,7 +548,7 @@ def main() raises:
     print("  step | mse_total (open-loop) | mse_persist | ratio")
     print("  -----+-----------------------+-------------+------")
 
-    memset(x_in_buf, 0, BATCH * AUG_DIM)
+    unsafe_memset(x_in_buf, 0, BATCH * AUG_DIM)
     for b in range(N_EVAL_TRAJ):
         for d in range(OBS_DIM):
             y_tgt_buf[b * OBS_DIM + d] = obs_buf[

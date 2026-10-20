@@ -25,7 +25,7 @@ Run:
 """
 
 from std.math import abs as mabs, sqrt
-from std.memory import alloc, memset
+from std.memory import alloc, unsafe_memset
 from noeira.core.tiles import tile
 
 from noeira.nn.constants import DT as dtype
@@ -61,7 +61,7 @@ def main() raises:
     var failures = 0
 
     var params_raw = alloc[Scalar[dtype]](NET.PARAM_SIZE).as_unsafe_any_origin()
-    memset(params_raw, 0, NET.PARAM_SIZE)
+    unsafe_memset(params_raw, 0, NET.PARAM_SIZE)
     var params = tile[NET.PARAM_SIZE](params_raw)
     NET.pc_init_params[PCXavier, dtype](params)
 
@@ -70,7 +70,7 @@ def main() raises:
     var g_s5 = alloc[Scalar[dtype]](NET.PARAM_SIZE).as_unsafe_any_origin()
     var g_e5 = alloc[Scalar[dtype]](NET.PARAM_SIZE).as_unsafe_any_origin()
     for b in [g_s, g_e, g_s5, g_e5]:
-        memset(b, 0, NET.PARAM_SIZE)
+        unsafe_memset(b, 0, NET.PARAM_SIZE)
     var grads_s = tile[NET.PARAM_SIZE](g_s)
     var grads_e = tile[NET.PARAM_SIZE](g_e)
     var grads_s5 = tile[NET.PARAM_SIZE](g_s5)
@@ -83,13 +83,13 @@ def main() raises:
     var mu_raw = alloc[Scalar[dtype]](BATCH * NET.SCRATCH_OUT_DIM).as_unsafe_any_origin()
     var ab_raw = alloc[Scalar[dtype]](BATCH * NET.SCRATCH_IN_DIM).as_unsafe_any_origin()
     var zb_raw = alloc[Scalar[dtype]](BATCH * NET.SCRATCH_IN_DIM).as_unsafe_any_origin()
-    memset(lat_raw, 0, BATCH * NET.LATENT_DIM)
-    memset(ref_raw, 0, BATCH * NET.LATENT_DIM)
-    memset(err_raw, 0, BATCH * NET.LATENT_DIM)
-    memset(dx_raw, 0, BATCH * NET.LATENT_DIM)
-    memset(mu_raw, 0, BATCH * NET.SCRATCH_OUT_DIM)
-    memset(ab_raw, 0, BATCH * NET.SCRATCH_IN_DIM)
-    memset(zb_raw, 0, BATCH * NET.SCRATCH_IN_DIM)
+    unsafe_memset(lat_raw, 0, BATCH * NET.LATENT_DIM)
+    unsafe_memset(ref_raw, 0, BATCH * NET.LATENT_DIM)
+    unsafe_memset(err_raw, 0, BATCH * NET.LATENT_DIM)
+    unsafe_memset(dx_raw, 0, BATCH * NET.LATENT_DIM)
+    unsafe_memset(mu_raw, 0, BATCH * NET.SCRATCH_OUT_DIM)
+    unsafe_memset(ab_raw, 0, BATCH * NET.SCRATCH_IN_DIM)
+    unsafe_memset(zb_raw, 0, BATCH * NET.SCRATCH_IN_DIM)
 
     var latents = tile[BATCH, NET.LATENT_DIM](lat_raw)
     var ref_lat = tile[BATCH, NET.LATENT_DIM](ref_raw)
