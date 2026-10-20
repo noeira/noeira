@@ -74,6 +74,7 @@ from noeira.nn.core.module import Module
 from noeira.nn.core.tensor import Tensor
 from noeira.nn.core.tensor_refs import TensorRefs
 from noeira.nn.core.call import call_forward, call_vjp
+from noeira.nn.core.grad_stash import suspend_grads, resume_grads
 from noeira.nn.core.initializer import Initializer, Xavier
 from noeira.nn.optimizer.adam import Adam
 from noeira.nn.core.checkpoint import (
@@ -743,20 +744,39 @@ struct FBCPRHead[
             var cq = Scalar[DT](-self.reg_coeff / Float64(Self.BATCH))
             # Through Q_D WITHOUT keeping its parameter grads (already
             # stepped above) — zeroed right after, as F1 is in the inner step.
+            # The inner trainer's `stash_critic_grads` covers these two vjps
+            # too: no dW GEMM when it is on, same grad_input bits.
+            var stash = t.stash_critic_grads
             scale_t[T, Self.BATCH](self.cot_pi, self.w_q1, cq, c)
-            call_vjp[T, Self.BATCH](
-                self.qd1.online, TensorRefs[1, MutAnyOrigin](self.qin_pi), self.cot_pi,
-                TensorRefs[1, MutAnyOrigin](self.g_qin), c,
-            )
+            if stash:
+                var held = suspend_grads[T](self.qd1.online, c)
+                call_vjp[T, Self.BATCH](
+                    self.qd1.online, TensorRefs[1, MutAnyOrigin](self.qin_pi), self.cot_pi,
+                    TensorRefs[1, MutAnyOrigin](self.g_qin), c,
+                )
+                resume_grads[T](self.qd1.online, held^, c)
+            else:
+                call_vjp[T, Self.BATCH](
+                    self.qd1.online, TensorRefs[1, MutAnyOrigin](self.qin_pi), self.cot_pi,
+                    TensorRefs[1, MutAnyOrigin](self.g_qin), c,
+                )
             self.qd1.online.zero_grad[T](c)
             slice_cols_t[T, Self.Q_IN, Self.OBS, Self.ACT, Self.BATCH](
                 t.g_pi_extra, self.g_qin, c
             )
             scale_t[T, Self.BATCH](self.cot_pi, self.w_q2, cq, c)
-            call_vjp[T, Self.BATCH](
-                self.qd2.online, TensorRefs[1, MutAnyOrigin](self.qin_pi), self.cot_pi,
-                TensorRefs[1, MutAnyOrigin](self.g_qin), c,
-            )
+            if stash:
+                var held = suspend_grads[T](self.qd2.online, c)
+                call_vjp[T, Self.BATCH](
+                    self.qd2.online, TensorRefs[1, MutAnyOrigin](self.qin_pi), self.cot_pi,
+                    TensorRefs[1, MutAnyOrigin](self.g_qin), c,
+                )
+                resume_grads[T](self.qd2.online, held^, c)
+            else:
+                call_vjp[T, Self.BATCH](
+                    self.qd2.online, TensorRefs[1, MutAnyOrigin](self.qin_pi), self.cot_pi,
+                    TensorRefs[1, MutAnyOrigin](self.g_qin), c,
+                )
             self.qd2.online.zero_grad[T](c)
             slice_cols_t[T, Self.Q_IN, Self.OBS, Self.ACT, Self.BATCH](
                 self.gx2, self.g_qin, c

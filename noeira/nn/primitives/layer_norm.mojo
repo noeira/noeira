@@ -476,6 +476,14 @@ struct LayerNorm[DIM_: Int, ADT: DType = DT, EPS: Scalar[DT] = LN_EPS](Module):
         ctx: Optional[DeviceContext] = None,
     ) raises:
         ref gin = grad_inputs[0]
+        # A frozen γ/β (EMPTY gradient buffers, `Param.freeze`) gets no
+        # gradient: grad_input does not read dγ or dβ, so it is the same bits
+        # either way. Same rule, same predicate as `Linear.vjp`. γ and β
+        # freeze together; one frozen without the other is refused, since the
+        # GPU writes both in one kernel.
+        var want_dp = self.gamma.grd.n > 0
+        if want_dp != (self.beta.grd.n > 0):
+            raise Error("LayerNorm: gamma and beta must be frozen together")
         comptime if Self.ACT_DT == DT:
             # ── fp32 path (legacy NoAMP, byte-identical) ──
             # ACT_DT IS DT here — rebind the activation refs (sound; see forward).
@@ -527,6 +535,8 @@ struct LayerNorm[DIM_: Int, ADT: DType = DT, EPS: Scalar[DT] = LN_EPS](Module):
                         gi_p[unsafe_offset=row + d] = inv_std * (g - mean_g - xh * mean_g_xhat)
                         d += 1
                     # dγ += go·x̂ ; dβ += go  (accumulated across the batch)
+                    if not want_dp:
+                        continue
                     d = 0
                     while d + W <= Self.DIM_:
                         var go = go_p.unsafe_load[width=W](row + d)
@@ -558,7 +568,8 @@ struct LayerNorm[DIM_: Int, ADT: DType = DT, EPS: Scalar[DT] = LN_EPS](Module):
                     grid_dim=B,
                     block_dim=LN_TPB,
                 )
-                self._dparams_gpu[B](grad_output, c)
+                if want_dp:
+                    self._dparams_gpu[B](grad_output, c)
         else:
             # ── bf16-flow path (GPU-only). I/O activations cast at the boundary;
             #    grad math + γ/β masters + cache stay fp32 (fp32-internal). ──
@@ -581,7 +592,8 @@ struct LayerNorm[DIM_: Int, ADT: DType = DT, EPS: Scalar[DT] = LN_EPS](Module):
                 grid_dim=B,
                 block_dim=LN_TPB,
             )
-            self._dparams_gpu[B](grad_output, c)
+            if want_dp:
+                self._dparams_gpu[B](grad_output, c)
 
     def _dparams_gpu[B: Int](
         mut self, mut go: TensorImpl[Self.ACT_DT], c: DeviceContext

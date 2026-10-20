@@ -82,6 +82,7 @@ from noeira.nn.core.tensor import Tensor
 from noeira.nn.core.tensor_refs import TensorRefs
 from noeira.nn.core.tensor_pack import TensorPack
 from noeira.nn.core.call import call_forward, call_vjp
+from noeira.nn.core.grad_stash import suspend_grads, resume_grads
 from noeira.nn.core.initializer import Initializer, Xavier
 from noeira.nn.optimizer.adam import Adam
 from noeira.nn.core.checkpoint import (
@@ -305,6 +306,12 @@ struct FBTrainer[
     var ortho_weight: Float64
     var fb_pessimism: Float64
     var actor_pessimism: Float64
+    # The actor step backpropagates THROUGH F1 and F2 for dF/da only. True
+    # moves their gradient buffers out for that pass (`grad_stash`), so no dW
+    # GEMM runs: about a third of each twin's backward, and grad_input is the
+    # same bits. False forms the gradients and discards them, as before; it is
+    # kept for the bit-identity gate (`test_fb_cpr_smoke` [7]).
+    var stash_critic_grads: Bool
     var policy_noise: Float64
     var noise_clip: Float64
     # ⚠ Global grad-norm clip, 0 = OFF. NOT cosmetic on FB: the measure loss is
@@ -446,6 +453,7 @@ struct FBTrainer[
         self.ortho_weight = 1.0
         self.fb_pessimism = 0.0
         self.actor_pessimism = 0.5
+        self.stash_critic_grads = True
         self.policy_noise = 0.2
         self.noise_clip = 0.3
         self.max_grad_norm = 0.0
@@ -529,6 +537,7 @@ struct FBTrainer[
         self.ortho_weight = move.ortho_weight
         self.fb_pessimism = move.fb_pessimism
         self.actor_pessimism = move.actor_pessimism
+        self.stash_critic_grads = move.stash_critic_grads
         self.policy_noise = move.policy_noise
         self.noise_clip = move.noise_clip
         self.max_grad_norm = move.max_grad_norm
@@ -1087,22 +1096,39 @@ struct FBTrainer[
             # ⚠ Through F WITHOUT keeping its parameter grads: the optimizer
             # has already stepped them above, and folding a second,
             # differently-scaled critic gradient into the next step would be
-            # silent. The vjp accumulates into params, so they are zeroed
-            # right after.
+            # silent. With `stash_critic_grads` the gradient buffers are out
+            # of F for the pass, so none is formed; the zeroing after is kept
+            # so F's state leaves this step exactly as it did before.
             if _twin == 0:
-                call_vjp[T, Self.BATCH](
-                    self.f1.online, TensorRefs[1, MutAnyOrigin](self.fin_a),
-                    self.g_fa, TensorRefs[1, MutAnyOrigin](self.g_fin_a), c,
-                )
+                if self.stash_critic_grads:
+                    var held = suspend_grads[T](self.f1.online, c)
+                    call_vjp[T, Self.BATCH](
+                        self.f1.online, TensorRefs[1, MutAnyOrigin](self.fin_a),
+                        self.g_fa, TensorRefs[1, MutAnyOrigin](self.g_fin_a), c,
+                    )
+                    resume_grads[T](self.f1.online, held^, c)
+                else:
+                    call_vjp[T, Self.BATCH](
+                        self.f1.online, TensorRefs[1, MutAnyOrigin](self.fin_a),
+                        self.g_fa, TensorRefs[1, MutAnyOrigin](self.g_fin_a), c,
+                    )
                 self.f1.online.zero_grad[T](c)
                 slice_cols_t[T, Self.F_IN, Self._A_OFF, Self.ACT, Self.BATCH](
                     self.g_pi, self.g_fin_a, c
                 )
             else:
-                call_vjp[T, Self.BATCH](
-                    self.f2.online, TensorRefs[1, MutAnyOrigin](self.fin_a),
-                    self.g_fa, TensorRefs[1, MutAnyOrigin](self.g_fin_a), c,
-                )
+                if self.stash_critic_grads:
+                    var held = suspend_grads[T](self.f2.online, c)
+                    call_vjp[T, Self.BATCH](
+                        self.f2.online, TensorRefs[1, MutAnyOrigin](self.fin_a),
+                        self.g_fa, TensorRefs[1, MutAnyOrigin](self.g_fin_a), c,
+                    )
+                    resume_grads[T](self.f2.online, held^, c)
+                else:
+                    call_vjp[T, Self.BATCH](
+                        self.f2.online, TensorRefs[1, MutAnyOrigin](self.fin_a),
+                        self.g_fa, TensorRefs[1, MutAnyOrigin](self.g_fin_a), c,
+                    )
                 self.f2.online.zero_grad[T](c)
                 slice_cols_t[T, Self.F_IN, Self._A_OFF, Self.ACT, Self.BATCH](
                     self.g_pi2, self.g_fin_a, c
