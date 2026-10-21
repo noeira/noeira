@@ -158,7 +158,7 @@ def gemm_acc[
     ldc: Int,
     lower: Bool = False,
 ):
-    """c[M, N] += alpha · a[M, K] @ b[K, N], row-major with row strides
+    """`c[M, N] += alpha · a[M, K] @ b[K, N]`, row-major with row strides
     `lda`, `ldb`, `ldc`. With `lower`, the 64 × 256 tiles of c lying wholly
     above its diagonal (every col > every row) are skipped; the others are
     computed whole, so c's upper triangle near the diagonal is written too."""

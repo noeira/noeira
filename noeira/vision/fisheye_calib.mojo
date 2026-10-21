@@ -320,9 +320,9 @@ struct SpreadParts(Copyable, ImplicitlyCopyable, Movable, Writable):
     var total_px: Float64
     """`undistort_spread`: rms map movement over the pinhole field."""
     var shift_deg: Float64
-    """rms of the per-resample mean shift, as a camera rotation."""
+    """RMS of the per-resample mean shift, as a camera rotation."""
     var scale_pct: Float64
-    """rms focal-length change, percent — a field-of-view change."""
+    """RMS focal-length change, percent — a field-of-view change."""
     var shape_px: Float64
     """What is left after removing each resample's shift and scale."""
 

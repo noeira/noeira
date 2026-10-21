@@ -277,8 +277,8 @@ struct EZv2ContinuousAgent[
 
     def load(mut self, path: String) raises:
         var c = Optional(self.ctx)
-        load_params["gpu", Self.REP](self.rep, path + ".rep", c)
-        load_params["gpu", Self.DYN](self.dyn, path + ".dyn", c)
-        load_params["gpu", Self.PRED](self.pred, path + ".pred", c)
-        load_params["gpu", Self.PROJM](self.proj, path + ".proj", c)
-        load_params["gpu", Self.PREDH](self.predh, path + ".predh", c)
+        _ = load_params["gpu", Self.REP](self.rep, path + ".rep", c)
+        _ = load_params["gpu", Self.DYN](self.dyn, path + ".dyn", c)
+        _ = load_params["gpu", Self.PRED](self.pred, path + ".pred", c)
+        _ = load_params["gpu", Self.PROJM](self.proj, path + ".proj", c)
+        _ = load_params["gpu", Self.PREDH](self.predh, path + ".predh", c)

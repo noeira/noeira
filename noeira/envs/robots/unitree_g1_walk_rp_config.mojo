@@ -143,7 +143,7 @@ comptime G1R_ACTION_CLIP: Float64 = 4.0
 """Theirs is 100 (none). +-4 = +-1 rad off default; the PD's effort limits
 bind long before."""
 comptime G1R_GAIN_DR: Float64 = 0.1
-"""kp and kd each x U(1 - 0.1, 1 + 0.1), per joint, per episode."""
+"""`kp` and `kd` each x U(1 - 0.1, 1 + 0.1), per joint, per episode."""
 
 # ── commands, pushes, episode ─────────────────────────────────────────────
 

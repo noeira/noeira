@@ -155,7 +155,7 @@ comptime APPROACH_WAYPOINTS = 3
 """IK solutions along the approach line; the joints interpolate between them,
 so the tips stay near the line instead of cutting a chord."""
 comptime ROLL_SEED_HUMAN: Float64 = 1.34
-"""wrist_roll's seed on the tangential pinch (rad, 77 deg): the operator's
+"""`wrist_roll`'s seed on the tangential pinch (rad, 77 deg): the operator's
 median grasp roll through the follower zero. The pinch axis is folded mod
 180 deg, so without it the IK picks either sign."""
 comptime Z_PRE = 0.08

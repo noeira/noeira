@@ -135,7 +135,7 @@ struct LeWMProprioTrainer[
     def train_step(
         mut self, pix: List[Scalar[DT]], act: List[Scalar[DT]], pro: List[Scalar[DT]]
     ) raises -> RefStepStats:
-        """pix (B, T, IN_CH, IMG, IMG) normalised; act (B, T, ACT_IN) and
+        """`pix` (B, T, IN_CH, IMG, IMG) normalised; act (B, T, ACT_IN) and
         pro (B, T, PROP) z-scored."""
         self.graph.zero_grad[Self.target](self.ctx)
         self._inputs(pix, act, pro)

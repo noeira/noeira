@@ -729,7 +729,7 @@ def run_pixel_dagger(args: List[String], driver: String) raises:
         # ── the student ──────────────────────────────────────────────────
         var student = StudentNet.make["gpu", Kaiming](Optional(ctx))
         if init_student.byte_length() > 0:
-            load_params["gpu"](student, init_student, Optional(ctx))
+            _ = load_params["gpu"](student, init_student, Optional(ctx))
             print("  init: student from", init_student)
         var opt = Adam(lr=Scalar[DT](lr))
 

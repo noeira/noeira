@@ -238,7 +238,7 @@ struct SmolVLAQueryWorker[
         var sp_frozen = Linear[SMOLVLA_STATE_DIM, SMOLLM_DIM].make[
             Self.target, Deterministic
         ](self.ctx)
-        load_trainables[
+        _ = load_trainables[
             Self.target, SMOLLM_LAYERS, SMOLVLA_EXPERT_W, EXPERT_FF,
             SMOLLM_DIM, SMOLLM_KV_W, SMOLVLA_ACTION_DIM,
         ](

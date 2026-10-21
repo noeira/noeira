@@ -121,7 +121,7 @@ struct PPOVecConfig(Copyable, Movable):
     """RoboParty's `action_smoothness_l2`: `w |a_t - 2 a_{t-1} + a_{t-2}|^2`,
     charged like the action rate (0 until a lane has two previous actions)."""
     var adaptive_kl: Bool
-    """rsl_rl's adaptive schedule, applied once per UPDATE (theirs: per
+    """`rsl_rl`'s adaptive schedule, applied once per UPDATE (theirs: per
     minibatch) so the update stays one graph: the update's mean approx-KL
     above 2 x `desired_kl` divides the lr by 1.5, below half of it
     multiplies it by 1.5, clamped to [`lr_min`, `lr_max`]. Excludes `anneal`."""

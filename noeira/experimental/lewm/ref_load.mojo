@@ -114,7 +114,7 @@ def ref_input[target: StaticString](
 def std_err[target: StaticString](
     dump_dir: String, name: String, mut got: Tensor, ctx: Optional[DeviceContext]
 ) raises -> Float64:
-    """max |got - ref| / std(ref) over the reference's elements."""
+    """`max |got - ref| / std(ref)` over the reference's elements."""
     comptime if target == "gpu":
         ctx.value().synchronize()
         got.download(ctx.value())

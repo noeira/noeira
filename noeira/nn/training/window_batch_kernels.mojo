@@ -64,6 +64,6 @@ def window_onehot_kernel[
 def advance_step_kernel(
     rng: Tile[DType.uint64, 2],
 ):
-    """step += 1 (one thread). Enqueued after `window_onehot_kernel`."""
+    """`step += 1` (one thread). Enqueued after `window_onehot_kernel`."""
     if Int(global_idx.x) == 0:
         rng.ptr[unsafe_offset=1] = rng.ptr[unsafe_offset=1] + 1

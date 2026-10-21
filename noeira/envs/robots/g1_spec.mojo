@@ -507,12 +507,6 @@ def g1_spec_admit(
             String("already in the bank as `") + bank.name_at(kbest)
             + String("` — same goal terms (") + key + String(")"),
         )
-    if False:
-        return G1SpecVerdict(
-            False, ess, best, bi, si, margin,
-            String("already in the bank as `") + bank.name_at(bi)
-            + String("` (margin ") + _round2(margin) + String(" deg)"),
-        )
     var stand = bank.find(String("stand"))
     if stand >= 0:
         var a_stand = g1_spec_angle(z, 0, zb, stand * G1_SPEC_D)
@@ -976,7 +970,7 @@ def g1_spec_record(
     gauche` returning a different quantity on two consecutive calls).
     """
     var key = g1_spec_goal_key(pool, terms, n_scaffold)
-    var prev = String("")
+    var prev: String
     try:
         prev = string_from_bytes(read_file_bytes(path))
     except:

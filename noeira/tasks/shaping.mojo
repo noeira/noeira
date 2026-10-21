@@ -96,7 +96,9 @@ def shaping_words(
 
 comptime REWARD_MODE_WORDS: Int = 2
 """How many `meta` words `reward_mode_words` returns, starting at
-`META_IDX_REWARD_MODE`: the mode and the success bonus. (The block's other
+`META_IDX_REWARD_MODE`: the mode and the success bonus.
+
+(The block's other
 two words, `META_IDX_PHI_PREV` / `META_IDX_EPISODE_FLAGS`, are episode state the
 hook and the reset own — a driver never writes them.)"""
 

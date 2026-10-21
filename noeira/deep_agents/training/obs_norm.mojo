@@ -97,7 +97,7 @@ struct RunningMeanStd(Movable):
                 dst[unsafe_offset = i * dim + k] = Scalar[DT](v)
 
     def load(mut self, path: String) raises:
-        var txt = String()
+        var txt: String
         with open(path, "r") as f:
             txt = f.read()
         var lines = txt.split("\n")

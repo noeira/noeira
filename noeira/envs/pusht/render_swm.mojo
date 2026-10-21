@@ -209,7 +209,7 @@ def render_pusht_swm_at[OUT: Int](
     agent_x: Scalar[dtype], agent_y: Scalar[dtype],
     pix: Tile[dtype, OUT, OUT, 3],
 ):
-    """swm 0.0.6's frame at OUT x OUT, HWC in [0, 255] — the same contract as
+    """`swm` 0.0.6's frame at OUT x OUT, HWC in [0, 255] — the same contract as
     `render.render_pusht_rgb_at`. The resize is `cv2.resize`'s INTER_LINEAR."""
     var canvas = render_pusht_swm_canvas(
         Float64(block_x), Float64(block_y), Float64(block_angle),

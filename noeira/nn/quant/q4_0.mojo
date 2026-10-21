@@ -114,7 +114,7 @@ def q4_0_group_scale(g: Pointer[Float32, MutAnyOrigin]) -> Float32:
 
 @always_inline
 def q4_0_code(w: Float32, d: Float32) -> UInt8:
-    """clip(round(w / d) + 8, 0, 15), ties to even: the code of `w` at
+    """`clip(round(w / d) + 8, 0, 15)`, ties to even: the code of `w` at
     scale `d`. Its value is (code - 8) · d."""
     var v = round_half_even(w / d) + 8.0
     v = min(max(v, Float32(0.0)), Float32(15.0))

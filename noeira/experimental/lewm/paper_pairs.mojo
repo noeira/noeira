@@ -63,7 +63,7 @@ def render_frame(mut env: PairEnv) raises -> List[Scalar[DT]]:
 
 
 def gauss(seed: UInt64, n: Int, offset: UInt64) -> List[Scalar[DT]]:
-    """n standard normals (Box-Muller over Philox)."""
+    """`n` standard normals (Box-Muller over Philox)."""
     var out = List[Scalar[DT]](capacity=n)
     var i = 0
     var ctr = offset
@@ -82,12 +82,12 @@ def gauss(seed: UInt64, n: Int, offset: UInt64) -> List[Scalar[DT]]:
 
 
 def pair_success(mut env: PairEnv, goal: List[Scalar[DT]], g: Int) -> Bool:
-    """swm `eval_state`: ‖goal[:4] - cur[:4]‖ < 20 and wrapped |Δ angle| < π/9."""
+    """`swm` `eval_state`: ‖goal[:4] - cur[:4]‖ < 20 and wrapped |Δ angle| < π/9."""
     return pair_margin(env, goal, g) < 1.0
 
 
 def pair_margin(mut env: PairEnv, goal: List[Scalar[DT]], g: Int) -> Float64:
-    """max(‖goal[:4] - cur[:4]‖ / 20, wrapped |Δ angle| / (π/9)): how far
+    """`max(‖goal[:4] - cur[:4]‖ / 20, wrapped |Δ angle| / (π/9))`: how far
     from `pair_success` (< 1 = success) — a continuous outcome, far less
     noisy per pair than the success bit."""
     var ag = env.agent_pos()

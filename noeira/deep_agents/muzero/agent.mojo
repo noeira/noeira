@@ -337,6 +337,6 @@ struct MuZeroAgent[
     def load(mut self, path: String) raises:
         """Inverse of `save` — restores rep / dyn / pred weights from the three
         per-net checkpoints. Optimizer state is not checkpointed (see `save`)."""
-        load_params[Self.TARGET, Self.REP](self.rep, path + ".rep", self.ctx)
-        load_params[Self.TARGET, Self.DYN](self.dyn, path + ".dyn", self.ctx)
-        load_params[Self.TARGET, Self.PRED](self.pred, path + ".pred", self.ctx)
+        _ = load_params[Self.TARGET, Self.REP](self.rep, path + ".rep", self.ctx)
+        _ = load_params[Self.TARGET, Self.DYN](self.dyn, path + ".dyn", self.ctx)
+        _ = load_params[Self.TARGET, Self.PRED](self.pred, path + ".pred", self.ctx)

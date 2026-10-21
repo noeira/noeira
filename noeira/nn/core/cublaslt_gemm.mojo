@@ -68,7 +68,7 @@ comptime EPI_BIAS = 1
 comptime EPI_GELU_AUX_BIAS = 2
 comptime EPI_DGELU = 3
 comptime EPI_RELU_AUX_BIAS = 4
-"""y = relu(acc + bias) and a BITMASK of (acc + bias > 0) in `aux`: one bit
+"""`y = relu(acc + bias)` and a BITMASK of (acc + bias > 0) in `aux`: one bit
 per element, bit (row r, column j) at bit index r * aux_ld + j of the byte
 array, aux_ld a multiple of 128 (cuBLASLt's rule)."""
 

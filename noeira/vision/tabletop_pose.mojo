@@ -93,9 +93,9 @@ struct RigCamera(Copyable, Movable):
     var pin: Pinhole
     var pos: Vec3d
     var rot_cv: Mat3d
-    """world <- camera, OpenCV camera axes."""
+    """`world <- camera`, OpenCV camera axes."""
     var rot_cv_t: Mat3d
-    """camera <- world."""
+    """`camera <- world`."""
     var width: Int
     var height: Int
 

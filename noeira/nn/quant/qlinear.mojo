@@ -231,7 +231,7 @@ struct QLinear[IN_: Int, OUT_: Int](Module):
     """NVIDIA: the blocks padded to [N_PAD, K_PAD] and repacked by MAX for its
     int4 GEMM. Device only."""
     var deq: Tensor
-    """deq(W) [OUT, IN] fp32, written before each GEMM that reads it: the
+    """`deq(W)` [OUT, IN] fp32, written before each GEMM that reads it: the
     caller's shared scratch (`share_scratch`) or this layer's own."""
     var xb: TensorImpl[DType.bfloat16]
     """NVIDIA forward: x cast to bf16 and zero-padded, [T, K_PAD]."""
@@ -324,7 +324,7 @@ struct QLinear[IN_: Int, OUT_: Int](Module):
         return self.q.data.copy()
 
     def dequantized(self) raises -> List[Float32]:
-        """deq(W) [OUT, IN] fp32 on the host, from the blocks (for gates)."""
+        """`deq(W)` [OUT, IN] fp32 on the host, from the blocks (for gates)."""
         return dequantize_q4_0(self.q.data, Self.OUT_, Self.IN_)
 
     def share_scratch(mut self, buf: DeviceBuffer[DT], n: Int) raises:
@@ -489,7 +489,7 @@ struct QLinear[IN_: Int, OUT_: Int](Module):
         grad_inputs: TensorRefs[1, ogi],
         ctx: Optional[DeviceContext] = None,
     ) raises:
-        """grad_input = grad_output @ deq(W), overwriting it as `Linear.vjp`
+        """`grad_input = grad_output @ deq(W)`, overwriting it as `Linear.vjp`
         does. Nothing else: the weight is frozen and there is no bias."""
         ref gx = grad_inputs[0]
         self._need_blocks("vjp")

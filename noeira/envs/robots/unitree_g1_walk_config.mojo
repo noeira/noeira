@@ -110,7 +110,7 @@ comptime G1_WALK_NOISE_QD: Float64 = 1.5
 # ── action ────────────────────────────────────────────────────────────────
 
 comptime G1_WALK_ACTION_SCALE: Float64 = 0.25
-"""rad per unit action — RoboParty's `action_scale` (Playground: 0.5)."""
+"""Radians per unit action — RoboParty's `action_scale` (Playground: 0.5)."""
 comptime G1_WALK_ACTION_CLIP: Float64 = 2.0
 """A Gaussian policy is unbounded; +-2 caps a target at +-0.5 rad off
 default — Playground's range (tanh x 0.5). ⚠ Run s2 had +-4 (+-1 rad) and

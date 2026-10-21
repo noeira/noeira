@@ -311,7 +311,7 @@ def _s16(lo: Int, hi: Int) -> Int16:
 
 
 struct Pcm16Decoder(Movable):
-    """s16le bytes -> samples, across chunks that may end MID-SAMPLE.
+    """`s16le` bytes -> samples, across chunks that may end MID-SAMPLE.
 
     A pipe read returns whatever is there, so a chunk can end on the low
     byte of a sample; that byte is held and paired with the next chunk's
@@ -390,7 +390,7 @@ struct MicCapture(Movable):
 
     var sample_rate: Int
     var pid: Int
-    """ffmpeg's pid: the shell prints `$$` and then `exec`s ffmpeg, which
+    """`ffmpeg`'s pid: the shell prints `$$` and then `exec`s ffmpeg, which
     keeps it. `stop` needs it — closing the pipe alone would leave `pclose`
     waiting on a child that only notices at its next write, and a stalled
     device never writes."""
@@ -402,7 +402,7 @@ struct MicCapture(Movable):
     var _pcm: Pcm16Decoder
     var _any_nonzero: Bool
     var log_path: String
-    """ffmpeg's stderr for this capture; its tail goes into `read`'s error."""
+    """`ffmpeg`'s stderr for this capture; its tail goes into `read`'s error."""
 
     def __init__(
         out self,

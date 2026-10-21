@@ -199,7 +199,7 @@ struct ConditionalTransformerBlockRef[
     EMB: Int, HEADS: Int, H: Int, FF: Int, HEAD_DIM: Int
 ](Module):
     """`module.ConditionalBlock`: AdaLN-zero, with the reference's affine
-    LayerNorm INSIDE `Attention` and inside `FeedForward`:
+    LayerNorm INSIDE `Attention` and inside `FeedForward`.
 
         sh1,sc1,g1,sh2,sc2,g2 = Linear(SiLU(c)).chunk(6)     (6 ZeroLinears)
         x = x + g1 * Attn( LN_a( LN1(x)*(1+sc1)+sh1 ) )      LN1: no affine, 1e-6

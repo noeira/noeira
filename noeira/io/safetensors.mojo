@@ -576,7 +576,7 @@ def _check_unique(ref names: List[String], path: String) raises:
 
 
 def f32_to_bf16_bits(v: Float32) -> UInt16:
-    """bfloat16 bits of `v`, rounded to nearest with ties to even, the
+    """The bfloat16 bits of `v`, rounded to nearest with ties to even, the
     rounding torch's `.to(torch.bfloat16)` does (c10's
     `round_to_nearest_even`): add 0x7FFF plus the lowest kept bit, keep the
     top 16. A NaN becomes torch's quiet NaN, 0x7FC0, which the add could

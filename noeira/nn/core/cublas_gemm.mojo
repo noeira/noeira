@@ -1,5 +1,5 @@
 """`cublas_gemm` — row-major fp32 GEMMs through cuBLAS, for `Linear`'s
-backward on NVIDIA:
+backward on NVIDIA.
 
     dw[K, N] += x[B, K]ᵀ @ go[B, N]     cublas_gemm[TA=True,  TB=False], β = 1
     gx[B, K]  = go[B, N] @ w[K, N]ᵀ     cublas_gemm[TA=False, TB=True],  β = 0
@@ -51,7 +51,7 @@ from noeira.nn.constants import DT
 
 
 comptime GEMM_PATH = get_defined_string["NN_GEMM_PATH", "auto"]()
-"""Which GEMM `Linear` / `LinearAct` use on NVIDIA (fp32), for A/B runs:
+"""Which GEMM `Linear` / `LinearAct` use on NVIDIA (fp32), for A/B runs.
 
   - `auto` (default): the backward through `cublas_gemm`; the forward through
     it where `cublas_fwd` says so, MAX's `mm` / `mm_bias` elsewhere;

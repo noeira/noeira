@@ -487,8 +487,9 @@ comptime XA_FUSED_BQ: Int = 128
 comptime XA_FUSED_BK: Int = 32
 """Keys per shared-memory tile of the fused forward."""
 comptime XA_FUSED_R: Int = 1
-"""Query rows per THREAD (shipped default). `benchmarks/cross_attention_bench.mojo`
-ranks the (R, SPLIT, KU, DOT_FMA, EXP2) grid on the Orin; the defaults are
+"""Query rows per THREAD (shipped default).
+
+`benchmarks/cross_attention_bench.mojo` ranks the (R, SPLIT, KU, DOT_FMA, EXP2) grid on the Orin; the defaults are
 its row N, the best at SigLIP's shape on 20 Sep 2026:
 
     two-pass path (A)                      8.45 ms

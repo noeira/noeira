@@ -25,8 +25,9 @@ comptime SO101_TASKS = get_defined_string[
     "SMOLVLA_TASKS_TSV", "tools/vla/smolvla_tasks_so101-tower_cube-in-bowl.tsv"
 ]()
 comptime SO101_N_LANG: Int = get_defined_int["SMOLVLA_N_LANG", 11]()
-"""⚠ Another recording is a BUILD of both ends with the same two defines, e.g.
-the printed-props one (15 tokens):
+"""⚠ Another recording is a BUILD of both ends with the same two defines.
+
+The printed-props one (15 tokens) is built with
 
     -D SMOLVLA_N_LANG=15 \\
     -D SMOLVLA_TASKS_TSV=tools/vla/smolvla_tasks_so101-tower_cube-in-bowl-printed.tsv

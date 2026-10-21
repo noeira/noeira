@@ -88,8 +88,9 @@ struct Tape(ImplicitlyCopyable, ParamWalkable):
     ) raises -> FModule[M]:
         """Hand `m` to the tape (it OWNS it from here) as an op for inputs
         of `B` rows — or `B2` / `B3` too: `tape.module[64, 1](m)` serves a
-        training batch and single-row acting with one module. Make `m` for
-        the tape's device. `name` (default `m<index>`) prefixes its
+        training batch and single-row acting with one module.
+
+        Make `m` for the tape's device. `name` (default `m<index>`) prefixes its
         parameters: `<name>.weight`, …"""
         var e = make_entry[M, B, B2, B3](m^, self.data[].on_gpu())
         return FModule[M](self.data, self.data[].add_module(e^, name))
@@ -625,7 +626,9 @@ struct FModule[M: Module](ImplicitlyCopyable):
     def get(mut self) -> ref[self] Self.M:
         """The module, owned by the tape. The reference's origin is THIS
         handle, so the handle — and the tape it keeps alive — outlives every
-        use of it. (An untracked pointer did not: Mojo ends a value at its
+        use of it.
+
+        (An untracked pointer did not: Mojo ends a value at its
         last use, the handle died right after `get()`, it was the tape's
         last owner, and the next read was of freed memory.)"""
         return self.tape[].mods[self.id].state.unsafe_bitcast[

@@ -432,4 +432,4 @@ struct AlphaZeroAgent[
     def load(mut self, path: String) raises:
         """Inverse of `save` — restores the net weights. See `save` for why
         optimizer state is not part of the checkpoint."""
-        load_params[Self.TARGET, Self.NET](self.net, path, self.ctx)
+        _ = load_params[Self.TARGET, Self.NET](self.net, path, self.ctx)

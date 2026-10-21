@@ -519,7 +519,7 @@ trait WMWindowLoss:
 def copy_last_loss[
     target: StaticString, B: Int, HD: Int
 ](mut ctx_x: Tensor, mut tgt: Tensor, ctx: Optional[DeviceContext]) raises -> Float64:
-    """mean((ctx_x − tgt)²) over (B, H·D): frame t's latent as frame t + 1's."""
+    """`mean((ctx_x − tgt)²)` over (B, H·D): frame t's latent as frame t + 1's."""
     comptime if target == "gpu":
         ctx.value().synchronize()
         ctx_x.download(ctx.value())
@@ -663,7 +663,7 @@ struct LeWMRefTrainer[
     def train_step(
         mut self, pix: List[Scalar[DT]], act: List[Scalar[DT]]
     ) raises -> RefStepStats:
-        """pix: (B, T, 3, 224, 224) ImageNet-normalised; act: (B, T, 10)
+        """`pix`: (B, T, 3, 224, 224) ImageNet-normalised; act: (B, T, 10)
         z-scored, NaN already zeroed (train.py's `nan_to_num`)."""
         var t = Int(perf_counter_ns())
         for i in range(Self.B * Self.PIX):
@@ -892,6 +892,7 @@ struct LeWMRefTrainer[
         normalised on the device by `_lewm_pixels_kernel` (bit-equal to
         torch's float32 `ToImage`); the clip runs on the device. The host is
         free to fill the other slot; `finish()` waits and reads the step.
+
         (With `profile` on, every stage synchronises.)"""
         comptime assert Self.target == "gpu", "submit_staged: GPU only"
         var t = Int(perf_counter_ns())

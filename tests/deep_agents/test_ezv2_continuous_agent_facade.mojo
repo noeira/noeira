@@ -71,16 +71,20 @@ def main() raises:
     agent2.save(path2)
 
     # storage agent checkpoint = 5 per-net sidecars (.rep/.dyn/.pred/.proj/.predh).
-    var c1: String
-    var c2: String
+    # The sidecars are BINARY (checkpoint format), so compare bytes: reading
+    # them with `f.read()` decodes UTF-8 and raises on the first non-text byte.
     for suf in [
         String(".rep"), String(".dyn"), String(".pred"),
         String(".proj"), String(".predh"),
     ]:
+        var c1: List[UInt8]
+        var c2: List[UInt8]
         with open(path1 + suf, "r") as f:
-            c1 = f.read()
+            c1 = f.read_bytes()
         with open(path2 + suf, "r") as f:
-            c2 = f.read()
+            c2 = f.read_bytes()
+        # An empty sidecar would compare equal to another empty one.
+        assert_true(len(c1) > 0, "empty checkpoint sidecar " + suf)
         assert_true(
             c1 == c2,
             "GPU checkpoint round-trip did not reproduce " + suf,

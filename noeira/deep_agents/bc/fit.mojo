@@ -158,7 +158,7 @@ def fit_bc[OBS: Int, ACT: Int, BATCH: Int](
 
     for ep in range(epochs):
         var tr_loss = 0.0
-        for b in range(n_batches):
+        for _ in range(n_batches):
             # BC rows are i.i.d. only across demos, so the batch is sampled
             # row-wise with replacement
             for r in range(BATCH):
@@ -231,7 +231,7 @@ def fit_bc[OBS: Int, ACT: Int, BATCH: Int](
 
     # ── the checkpoint, reloaded on the CPU and re-scored ─────────────────
     var check = BcNet[OBS, ACT].make["cpu", Kaiming](None)
-    load_params["cpu"](check, out_path, None)
+    _ = load_params["cpu"](check, out_path, None)
     var cx = Tensor.alloc(BATCH * OBS)
     var cy = Tensor.alloc(BATCH * ACT)
     var cy_pred = Tensor.alloc(BATCH * ACT)

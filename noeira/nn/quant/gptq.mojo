@@ -158,7 +158,7 @@ def q4_0_objective(
     k: Int,
     ref h: List[Float64],
 ) -> Float64:
-    """tr((W − Ŵ) H (W − Ŵ)ᵀ) in fp64, Ŵ = (q − 8) d: the layer's summed
+    """`tr((W − Ŵ) H (W − Ŵ)ᵀ)` in fp64, `Ŵ = (q − 8) d`: the layer's summed
     squared output error over the calibration rows H was built from (H
     undamped). GPTQ minimizes it; RTN ignores it."""
     var groups = k // Q4_GROUP

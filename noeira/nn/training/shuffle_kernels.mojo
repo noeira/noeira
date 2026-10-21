@@ -117,7 +117,7 @@ def gather_rows_at_counter_kernel[
 def advance_counter_kernel(
     counter: Tile[DType.int32, 1],
 ):
-    """counter += 1 (one thread)."""
+    """`counter += 1` (one thread)."""
     if Int(thread_idx.x) == 0 and Int(block_idx.x) == 0:
         counter.ptr[unsafe_offset=0] = counter.ptr[unsafe_offset=0] + 1
 
@@ -126,6 +126,6 @@ def advance_counter_kernel(
 def reset_counter_kernel(
     counter: Tile[DType.int32, 1],
 ):
-    """counter = 0 (one thread)."""
+    """`counter = 0` (one thread)."""
     if Int(thread_idx.x) == 0 and Int(block_idx.x) == 0:
         counter.ptr[unsafe_offset=0] = 0

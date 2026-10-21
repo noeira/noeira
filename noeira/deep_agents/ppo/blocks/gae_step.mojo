@@ -59,7 +59,7 @@ struct PPOGAEStep[
     ) raises:
         """V of every row's next observation (one critic forward over the
         rollout's `next_obs_buf`, BATCH = ROLLOUT_LEN * N_ENVS), then GAE
-        backward per env over the T-major host-side buffers:
+        backward per env over the T-major host-side buffers.
 
             nv_t  = (1 - term_t) * V(next_obs_t)   if the episode ended at t
                                                    or t is the rollout's last

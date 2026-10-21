@@ -1057,7 +1057,7 @@ struct TapeData(Movable):
 
     # ── backward ─────────────────────────────────────────────────────────
     def backward(mut self, loss: Int) raises:
-        """d loss / d every node that requires grad. Parameter gradients
+        """`d loss / d node` for every node that requires grad. Parameter gradients
         ACCUMULATE (call `zero_grad` between steps); every other node's
         gradient is cleared first."""
         if self.nodes[loss].size() != 1:
