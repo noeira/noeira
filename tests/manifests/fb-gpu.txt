@@ -44,7 +44,9 @@ tests/deep_agents/test_fb_online_smoke.mojo
 # FB-MEBE online (FB_MEBE_G1_PLAN.md §2): the pool refresh writes B(s) of
 # real ring rows, inverse-density, filter honoured; boundaries on the
 # truncation schedule; the r_reg column equals its host recomputation row by
-# row; the driver runs with the step captured.
+# row; the driver runs with the step captured; prior rows (`attach_prior`)
+# fill batch rows [0, PRIOR_ROWS) with their own regularity reward and reach
+# the pool and the mixed eval embedding.
 tests/deep_agents/test_fb_mebe_online_smoke.mojo
 
 # The batched GPU walker raises `done` at MAX_STEPS on every lane — the env

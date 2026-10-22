@@ -77,3 +77,9 @@ tests/deep_agents/test_fb_reg_head.mojo
 # B on a gathered projection (`WalkerBNetProj`): forward and vjp equal the
 # bare MLP on the hand-gathered columns, and no gradient on unread columns.
 tests/deep_agents/test_fb_proj_b.mojo
+
+# Prior rows (FB_MEBE_G1_PLAN §13.5): a teacher's store laid out for the
+# expert path (transitions first, terminal rows after, nxt inside episodes),
+# the regularity reward recomputed by hand with every term live, a store
+# round trip, and a store of another width refused.
+tests/deep_agents/test_fb_prior.mojo
