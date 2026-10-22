@@ -25,6 +25,8 @@ from .ref_trainer import (
     REF_T,
     RefStepStats,
     WMWindowLoss,
+    WindowLatents,
+    node_host,
     copy_last_loss,
     _AdamWAll,
     _MaskPredQKVBias,
@@ -194,6 +196,16 @@ struct LeWMProprioTrainer[
             self.graph.node_output["ctx_x"](), self.graph.node_output["tgt"](), self.ctx
         )
         return (st.pred_loss, c)
+
+    def window_latents(
+        mut self, pix: List[Scalar[DT]], act: List[Scalar[DT]], pro: List[Scalar[DT]]
+    ) raises -> WindowLatents:
+        """`WMWindowLoss`: `z` = image latent + proprio embedding."""
+        _ = self.loss_of(pix, act, pro)
+        var img = node_host[Self.target](self.graph.node_output["emb"](), Self.B * REF_T * 192, self.ctx)
+        var z = node_host[Self.target](self.graph.node_output["z"](), Self.B * REF_T * 192, self.ctx)
+        var pred = node_host[Self.target](self.graph.node_output["pred"](), Self.B * (REF_T - 1) * 192, self.ctx)
+        return WindowLatents(img^, z^, pred^)
 
     def _stats(mut self) raises -> RefStepStats:
         var stats = RefStepStats(0.0, 0.0, 0.0, 0.0)

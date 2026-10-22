@@ -515,6 +515,43 @@ trait WMWindowLoss:
     ) raises -> Tuple[Float64, Float64]:
         ...
 
+    def window_latents(
+        mut self, pix: List[Scalar[DT]], act: List[Scalar[DT]], pro: List[Scalar[DT]]
+    ) raises -> WindowLatents:
+        """The eval-mode forward's latents (`WindowLatents`), for the
+        slow-feature diagnostics (`lewm_so101_slow_features`)."""
+        ...
+
+
+struct WindowLatents(Movable):
+    """A batch's latents, host-side, (B, ·, 192) row-major per sample."""
+
+    var img: List[Float32]
+    """(B, T, EMB) the image encoder's latent (`emb`)."""
+    var z: List[Float32]
+    """(B, T, EMB) the predictor's state: `img`, plus the proprio embedding
+    for a v2 model."""
+    var pred: List[Float32]
+    """(B, T − 1, EMB) the one-step predictions of frames 1 .. T − 1."""
+
+    def __init__(out self, var img: List[Float32], var z: List[Float32], var pred: List[Float32]):
+        self.img = img^
+        self.z = z^
+        self.pred = pred^
+
+
+def node_host[target: StaticString](
+    mut t: Tensor, n: Int, ctx: Optional[DeviceContext]
+) raises -> List[Float32]:
+    """A node output's first `n` values on the host (downloaded on gpu)."""
+    comptime if target == "gpu":
+        ctx.value().synchronize()
+        t.download(ctx.value())
+    var out = List[Float32](capacity=n)
+    for i in range(n):
+        out.append(Float32(t.data[i]))
+    return out^
+
 
 def copy_last_loss[
     target: StaticString, B: Int, HD: Int
@@ -781,6 +818,16 @@ struct LeWMRefTrainer[
             self.graph.node_output["ctx_x"](), self.graph.node_output["tgt"](), self.ctx
         )
         return (st.pred_loss, c)
+
+    def window_latents(
+        mut self, pix: List[Scalar[DT]], act: List[Scalar[DT]], pro: List[Scalar[DT]]
+    ) raises -> WindowLatents:
+        """`WMWindowLoss`: no proprio, so `z` is the image latent."""
+        _ = self.loss_of(pix, act)
+        var img = node_host[Self.target](self.graph.node_output["emb"](), Self.B * REF_T * 192, self.ctx)
+        var pred = node_host[Self.target](self.graph.node_output["pred"](), Self.B * (REF_T - 1) * 192, self.ctx)
+        var z = img.copy()
+        return WindowLatents(img^, z^, pred^)
 
     def set_eval(mut self):
         """Lightning's `model.eval()`: BatchNorm on its running statistics,

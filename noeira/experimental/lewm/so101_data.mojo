@@ -121,6 +121,9 @@ struct So101WMData[R: Int](Movable):
     var p_std: List[Float64]
     var train_starts: List[Int]
     var val_starts: List[Int]
+    var ep_off: List[Int]
+    """Each episode's first global row."""
+    var ep_len: List[Int]
     var n_rows: Int
     var n_episodes: Int
 
@@ -132,6 +135,8 @@ struct So101WMData[R: Int](Movable):
         self.prop = List[Float32]()
         self.train_starts = List[Int]()
         self.val_starts = List[Int]()
+        self.ep_off = List[Int]()
+        self.ep_len = List[Int]()
         self.n_rows = 0
         self.n_episodes = 0
         var nqv = So101TowerModel.NQ + So101TowerModel.NV
@@ -186,6 +191,8 @@ struct So101WMData[R: Int](Movable):
             for e in range(st.n_episodes()):
                 var off = Int(st.episodes.ep_offset[e])
                 var ln = Int(st.episodes.ep_len[e])
+                self.ep_off.append(base + off)
+                self.ep_len.append(ln)
                 for r in range(off, off + ln):
                     for j in range(JOINTS):
                         var prev = q0[r * JOINTS + j] if r == off else tgt[(r - 1) * JOINTS + j]
