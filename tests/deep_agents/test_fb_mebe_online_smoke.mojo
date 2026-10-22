@@ -19,6 +19,13 @@ obs `[cos θ, sin θ, θ̇]`), four lanes, tiny nets: WIRING, not learning.
       r = 0 on the boundary rows themselves.
   [5] the driver runs end to end with the training step captured: train
       steps happen, refreshes happen, the reg critic's terms are finite.
+  [6] prior rows (`attach_prior`, plan §13.5): rows marked by θ̇ >= 100,
+      which the ring never reaches, and by their reward. After a training
+      step, batch rows [0, PRIOR_ROWS) are prior rows and the rest ring
+      rows, and `br` is each row's OWN reward on both sides (the prior's
+      from its table, the ring's from `r_rew[idx_s]`); a pool refresh
+      draws some prior rows and nothing that is in neither table; the
+      mixed eval embedding returns a prior row's raw obs.
 
 Run (Apple Metal or NVIDIA):
     pixi run -e apple mojo run -I . tests/deep_agents/test_fb_mebe_online_smoke.mojo
@@ -27,10 +34,11 @@ Run (Apple Metal or NVIDIA):
 from std.math import abs, sqrt
 from std.random import seed
 from std.testing import assert_true
-from max.gpu.host import DeviceContext
+from max.gpu.host import DeviceContext, DeviceBuffer
 
 from noeira.nn.constants import DT
 from noeira.nn.core.tensor import Tensor
+from noeira.data.resident import IDX_DT
 from noeira.nn.combinators.sequential import Sequential
 from noeira.nn.primitives.linear import Linear
 from noeira.nn.primitives.activations import ReLU, Tanh
@@ -41,8 +49,10 @@ from noeira.deep_agents.fb.online_mebe import (
     RegRewardConfig,
 )
 from noeira.deep_agents.fb.density import InverseDensityConfig
+from noeira.deep_agents.fb.prior import PriorPrice, prior_rows
 from noeira.deep_agents.training.batched_env import BatchedGpuEnv
 from noeira.deep_agents.training.driver_offpolicy import (
+    OffPolicyAgentGpu,
     run_offpolicy_train_batched,
 )
 from noeira.envs.pendulum.pendulum_v2 import PendulumV2
@@ -76,6 +86,13 @@ comptime Agent = FBMebeOnlineAgent[
     FNet, BNet, ANet, QNet, OBS, ACT, D, BATCH, CAP, LANES, ZBUF
 ]
 comptime EnvT = BatchedGpuEnv[PendulumV2[DT], LANES, OBS, ACT]
+comptime PRIOR = 16
+comptime AgentP = FBMebeOnlineAgent[
+    FNet, BNet, ANet, QNet, OBS, ACT, D, BATCH, CAP, LANES, ZBUF, 0, DT, PRIOR
+]
+comptime P_EPS = 6       # prior episodes ...
+comptime P_LEN = 11      # ... of 11 rows: 10 transitions + the terminal row
+comptime TH_MARK = 100.0
 
 
 def _dl(ctx: DeviceContext, ref src: Tensor, n: Int) raises -> Tensor:
@@ -109,10 +126,10 @@ def _make(ctx: DeviceContext, beta: Float64, filter_neg: Bool) raises -> Agent:
     )
 
 
-def _fill(ctx: DeviceContext, mut a: Agent, steps: Int) raises:
+def _fill[AT: OffPolicyAgentGpu](ctx: DeviceContext, mut a: AT, steps: Int) raises:
     var env = EnvT(ctx)
     _ = run_offpolicy_train_batched[
-        Agent, EnvT, N_ENVS=LANES,
+        AT, EnvT, N_ENVS=LANES,
         USE_TRAIN_CUDA_GRAPH=False, USE_ENV_CUDA_GRAPH=False,
     ](
         Optional(ctx), a, env, steps,
@@ -307,10 +324,143 @@ def test_driver(ctx: DeviceContext) raises:
         assert_true(x == x and abs(x) < 1e9, "non-finite reg term")
 
 
+def _dl_idx(ctx: DeviceContext, ref src: DeviceBuffer[IDX_DT], n: Int) raises -> List[Int]:
+    var h = ctx.enqueue_create_host_buffer[IDX_DT](n)
+    ctx.enqueue_copy(h, src)
+    ctx.synchronize()
+    var out = List[Int](length=n, fill=0)
+    for i in range(n):
+        out[i] = Int(h[i])
+    return out^
+
+
+def test_prior(ctx: DeviceContext) raises:
+    print("[6] prior rows: batch split, own rewards, pool and eval draw them ...")
+    seed(SEED)
+    var a = AgentP.make(
+        ctx, _cfg(2.0, False),
+        RegRewardConfig(qd_off=2, qd_n=1, dt=DT_CTRL, w_acc=W_ACC, w_ar=W_AR, w_env=0.0),
+        mebe=True, use_reg=True, reg_coeff=20.0, lr=1e-3, lr_q=1e-3,
+        learning_starts=LEARNING_STARTS, action_scale=2.0, z_hold=20,
+        window_size=8, seed=UInt64(SEED), episode_len=EP_LEN,
+    )
+    # the store: P_EPS episodes, θ̇ = TH_MARK + store row (a unique marker)
+    var n = P_EPS * P_LEN
+    var obs = List[Float32](length=n * OBS, fill=0)
+    var act = List[Float32](length=n * ACT, fill=0)
+    var r_env = List[Float32](length=n, fill=0)
+    var off = List[Int]()
+    var ln = List[Int]()
+    for e in range(P_EPS):
+        off.append(e * P_LEN)
+        ln.append(P_LEN)
+    for r in range(n):
+        obs[r * OBS] = Float32(0.6)
+        obs[r * OBS + 1] = Float32(0.8)
+        obs[r * OBS + 2] = Float32(TH_MARK + Float64(r))
+        act[r] = Float32(0.01 * Float64(r % 7))
+    var pr = prior_rows(
+        obs, act, r_env, off, ln, OBS, ACT,
+        RegRewardConfig(qd_off=2, qd_n=1, dt=DT_CTRL, w_acc=W_ACC, w_ar=W_AR, w_env=0.0),
+        PriorPrice.none(),
+    )
+    var p_obs = List[Scalar[DT]](length=(pr.n_valid + pr.n_term) * OBS, fill=0)
+    for i in range(len(p_obs)):
+        p_obs[i] = pr.obs.data[i]
+    var p_rew = List[Scalar[DT]](length=pr.n_valid, fill=0)
+    for i in range(pr.n_valid):
+        p_rew[i] = pr.rew.data[i]
+    var nxt = pr.upload(ctx)
+    var nv = pr.n_valid
+    a.attach_prior(pr.take_obs(), pr.take_act(), nxt^, pr.take_rew(), nv)
+    _fill(ctx, a, 1600)
+    _ = a.train_step(1_000_000)
+    ctx.synchronize()
+    var bs = _dl(ctx, a.base.t.bs, BATCH * OBS)
+    var br = _dl(ctx, a.head.br, BATCH)
+    var rr = _dl(ctx, a.r_rew, CAP)
+    var ie = _dl_idx(ctx, a.base.idx_e.value(), PRIOR)
+    var isr = _dl_idx(ctx, a.base.idx_s.value(), BATCH)
+    var wrong_side = 0
+    var wrong_rew = 0
+    for i in range(BATCH):
+        var th = Float64(bs.data[i * OBS + 2])
+        if i < PRIOR:
+            if th < TH_MARK:
+                wrong_side += 1
+            # the row's own table row, found by its marker
+            var row = ie[i]
+            if Float64(p_obs[row * OBS + 2]) != th or br.data[i] != p_rew[row]:
+                wrong_rew += 1
+        else:
+            if th >= TH_MARK:
+                wrong_side += 1
+            if br.data[i] != rr.data[isr[i - PRIOR]]:
+                wrong_rew += 1
+    var live = 0
+    for i in range(PRIOR):
+        if abs(Float64(br.data[i])) > 1e-6:
+            live += 1
+    print("      batch rows on the wrong side", wrong_side, "  rows whose br is not their own",
+          wrong_rew, "  prior rows with r != 0", live, "/", PRIOR)
+    assert_true(wrong_side == 0, "prior rows are not exactly batch rows [0, PRIOR_ROWS)")
+    assert_true(wrong_rew == 0, "a batch row carries another row's regularity reward")
+    assert_true(live > PRIOR // 2, "the prior rows' rewards are all zero — the check is vacuous")
+
+    a.refresh_pool()
+    ctx.synchronize()
+    var pool = _dl(ctx, a._pool_obs, BATCH * OBS)
+    var ring = a.base.ring_obs_host()
+    var from_p = 0
+    var nowhere = 0
+    for i in range(BATCH):
+        var th = Float64(pool.data[i * OBS + 2])
+        if th >= TH_MARK:
+            var r = Int(th - TH_MARK + 0.5)
+            # a transition row of the table holds this marker
+            var hit = False
+            for j in range(nv):
+                if p_obs[j * OBS + 2] == pool.data[i * OBS + 2]:
+                    hit = True
+            if hit and r < n:
+                from_p += 1
+            else:
+                nowhere += 1
+        else:
+            var hit = False
+            for r in range(a.base.size):
+                if ring.data[r * OBS + 2] == pool.data[i * OBS + 2]:
+                    hit = True
+                    break
+            if not hit:
+                nowhere += 1
+    print("      pooled rows from the prior", from_p, "/", BATCH, " (share reported",
+          a.last_pool_prior, ")  in neither table", nowhere)
+    assert_true(from_p > 0, "the pool never draws a prior row")
+    assert_true(nowhere == 0, "a pooled row is in neither table")
+    assert_true(abs(a.last_pool_prior - Float64(from_p) / Float64(BATCH)) < 1e-9,
+                "the reported pool share is not the pool's")
+
+    var rows: List[Int] = [3, 0, 5]
+    var fp: List[Bool] = [True, False, True]
+    var raw = List[Scalar[DT]]()
+    var bb = List[Scalar[DT]]()
+    a.embed_rows_mixed(rows, fp, raw, bb)
+    var bad = 0
+    for k in range(OBS):
+        if raw[k] != p_obs[3 * OBS + k] or raw[2 * OBS + k] != p_obs[5 * OBS + k]:
+            bad += 1
+        if raw[OBS + k] != ring.data[k]:
+            bad += 1
+    print("      mixed eval embedding: entries off", bad)
+    assert_true(bad == 0, "embed_rows_mixed did not read the row's own table")
+
+
 def main() raises:
     var ctx = DeviceContext()
     test_pool(ctx)
     test_filter(ctx)
     test_reward_column(ctx)
     test_driver(ctx)
+    test_prior(ctx)
     print("ALL PASS — fb mebe online smoke")

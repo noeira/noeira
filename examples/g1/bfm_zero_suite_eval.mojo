@@ -28,6 +28,15 @@ Per task and prompt it prints the return, the fall rate, the mean (vx, vy,
 ωz, h) held, |vx − vx*|, and vx over the last 125 steps; per task it also
 prints how many pool rows the reward sees (r > 0.5, r > 0.1), which says
 whether LAFAN even contains the commanded state.
+
+`--dump-z FILE` also writes each task's z per prompt, one
+`z <task> <prompt> v_1 .. v_D` line each — what
+`bfm_zero_prior_collect.mojo` rolls the teacher out under on the box, which
+has no LAFAN. `--reps 0` writes them without any rollout:
+
+    pixi run mojo run -I . examples/g1/bfm_zero_suite_eval.mojo \
+        --ckpt projects/g1/policies/bfm_room.ckpt --reps 0 --prompts centred \
+        --dump-z g1_teacher_z_s36000.txt
 """
 
 from std.math import abs
@@ -180,6 +189,8 @@ def main() raises:
     var reps = atol(_flag(String("--reps"), String(3)))
     var only = _flag(String("--tasks"), String(""))     # comma list, "" = all
     var prompts = _flag(String("--prompts"), String("raw,centred,wide"))
+    var dump_z = _flag(String("--dump-z"), String(""))
+    var z_lines = String("")
     seed(atol(_flag(String("--seed"), String(1))))
 
     print("=" * 76)
@@ -276,6 +287,13 @@ def main() raises:
                 else:
                     raise Error("unknown prompt '" + pn + "' (raw, centred, wide)")
             var z = z_from_reward[D](b_list, rv, POOL)
+            if dump_z.byte_length() > 0:
+                z_lines += "z " + c.name + " " + pn
+                for j in range(D):
+                    z_lines += " " + String(z[j])
+                z_lines += "\n"
+            if reps == 0:
+                continue
             var acc = List[Float64](length=8, fill=0.0)
             for _ in range(reps):
                 _roll[FNet, BNet, ANet](
@@ -288,6 +306,10 @@ def main() raises:
             print("EVAL", pn, c.name, _fmt(acc[0] / nr), _fmt(acc[1] / nr),
                   _fmt(acc[2] / ns), _fmt(acc[3] / ns), _fmt(acc[4] / ns),
                   _fmt(acc[5] / ns), _fmt(acc[6] / ns), _fmt(acc[7] / nl))
+    if dump_z.byte_length() > 0:
+        with open(dump_z, "w") as fh:
+            fh.write(z_lines)
+        print("  wrote the prompts' z ->", dump_z)
     print("-" * 76)
     var fam_names: List[String] = ["velocity", "posture", "composite"]
     for v in range(len(pnames)):

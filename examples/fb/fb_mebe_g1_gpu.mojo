@@ -34,6 +34,18 @@ and the §12.6 levers against the spin MEBE bought on φ ∋ ωz:
     ./fb_mebe_g1 --explore sphere --reg 0 --tag gfb_s1 --seed 1
     ./fb_mebe_g1 --smoke                  # 3 segments of 40 batched steps + an eval
 
+and §13.5 option 1, a SEEDED arm (needs a teacher store,
+`examples/g1/bfm_zero_prior_collect.mojo`):
+
+    --prior g1_prior_s36000.h5
+                           PRIOR_ROWS (build define, default 256 = 25 % of the
+                           batch) rows of every batch are the teacher's
+                           transitions, with their own regularity reward
+                           (`fb/prior.mojo`, same weights and angular price as
+                           the ring); the MEBE pool and the eval's reward pool
+                           draw the same share from them. No BC term. Without
+                           `--prior` the binary is the data-free arm.
+
 ## What differs from the BFM-Zero G1 driver (`examples/g1/bfm_zero_train_gpu.mojo`)
 
   * The agent row is the env's 527-D observation; there is NO history tail
@@ -67,6 +79,7 @@ not run on Metal at 1024 lanes in useful time.
 from std.math import sqrt, log
 from std.random import seed
 from std.sys import argv
+from std.sys.defines import get_defined_int
 from std.time import perf_counter_ns
 from noeira.core.tiles import tile
 from max.gpu.host import DeviceContext, DeviceBuffer
@@ -103,6 +116,7 @@ from noeira.deep_agents.fb.g1_mebe import (
     g1_reg_env_kernel,
     g1_angvel_price_kernel,
 )
+from noeira.deep_agents.fb.prior import PriorPrice, load_prior_rows
 from noeira.envs.robots import UnitreeG1Batched
 from noeira.envs.robots.unitree_g1_xml import UNITREE_G1_OBS_DIM
 
@@ -118,13 +132,15 @@ comptime HB: Int = 512
 comptime BATCH: Int = 1024
 comptime CAP: Int = 1_000_000
 comptime ZBUF: Int = 8192
+comptime PRIOR_ROWS: Int = get_defined_int["PRIOR_ROWS", 256]()
 comptime EnvT = UnitreeG1Batched[N_ENVS]
 comptime FNet = BFMFTower[OBS, ACT, D, H, L, D]
 comptime BNet = G1BNetProj[OBS, D, HB]
 comptime ANet = BFMActorTower[OBS, D, H, LA, ACT]
 comptime QNet = BFMFTower[OBS, ACT, D, H, L, 1]
 comptime Agent = FBMebeOnlineAgent[
-    FNet, BNet, ANet, QNet, OBS, ACT, D, BATCH, CAP, N_ENVS, ZBUF
+    FNet, BNet, ANet, QNet, OBS, ACT, D, BATCH, CAP, N_ENVS, ZBUF, 0, DT,
+    PRIOR_ROWS,
 ]
 
 comptime CTRL_DT: Float64 = 0.02
@@ -213,6 +229,7 @@ def main() raises:
     var h_min = atof(_flag(String("--h-min"), String(0.0)))
     var w_yaw = atof(_flag(String("--w-yaw"), String(0.0)))
     var w_angxy = atof(_flag(String("--w-angxy"), String(0.0)))
+    var prior_path = _flag(String("--prior"), String(""))
     if smoke:
         total = 3 * 40 * N_ENVS
         seg_steps = 40 * N_ENVS
@@ -295,6 +312,8 @@ def main() raises:
     print("  fall reset          = h <", FALL_H, "or g_z >", FALL_GZ, "for", FALL_DELAY, "steps (boundary)")
     print("  eval                =", n_task, "tasks x", reps, "lanes x", EVAL_LEN, "steps, last", eval_rungs, "segments",
           " every", eval_every)
+    print("  prior               =", prior_path if prior_path.byte_length() > 0 else String("none (data-free)"),
+          "  rows/batch", PRIOR_ROWS if prior_path.byte_length() > 0 else 0, "/", BATCH)
     print("  seed / tag          =", seed_v, "/ '", tag, "'   run:", run.dir)
     print("=" * 70)
 
@@ -328,6 +347,8 @@ def main() raises:
         logger.set_config("h_min", String(h_min))
         logger.set_config("w_yaw", String(w_yaw))
         logger.set_config("w_angxy", String(w_angxy))
+        logger.set_config("prior", prior_path)
+        logger.set_config("prior_rows", String(PRIOR_ROWS if prior_path.byte_length() > 0 else 0))
         var logger_ptr = Pointer(to=logger).as_unsafe_any_origin()
 
         var agent = Agent.make(
@@ -340,6 +361,22 @@ def main() raises:
             window_size=100, seed=UInt64(seed_v), normalize_obs=True,
             episode_len=0,
         )
+        if prior_path.byte_length() > 0:
+            # the ring's price is on only with Q_reg and a weight (below)
+            var price = PriorPrice.none()
+            if use_reg and (w_yaw > 0.0 or w_angxy > 0.0):
+                price = PriorPrice(G1M_COL_WZ - 2, w_yaw, w_angxy)
+            var t_p = perf_counter_ns()
+            var pr = load_prior_rows(prior_path, OBS, ACT, regc, price)
+            var r_mean = 0.0
+            for i in range(pr.n_valid):
+                r_mean += Float64(pr.rew.data[i])
+            r_mean /= Float64(pr.n_valid)
+            var nxt = pr.upload(ctx)
+            var nv = pr.n_valid
+            agent.attach_prior(pr.take_obs(), pr.take_act(), nxt^, pr.take_rew(), nv)
+            print("  [prior]", nv, "transitions,", pr.n_term, "episodes; mean r_reg",
+                  r_mean, "  (", Float64(perf_counter_ns() - t_p) / 1e9, "s )")
         var env = EnvT(ctx)
         var eval_env = EnvT(ctx)
         register_run(run, logger)
@@ -381,13 +418,25 @@ def main() raises:
         def _eval(at: Int) capturing raises:
             var t0 = perf_counter_ns()
             # 1. z per task, relabelled over the ring
+            # a seeded arm's pool is its data: ring + prior rows at the
+            # batch's share (Agent.PRIOR_FRAC)
             var rng = SplitMix64(UInt64(seed_v) * 7919 + UInt64(at))
             var rows = List[Int]()
+            var from_p = List[Bool]()
+            var n_prior = agent.prior_rows()
             for _ in range(EVAL_POOL):
-                rows.append(rng.below(agent.replay_size()))
+                if n_prior > 0 and rng.uniform() < Agent.PRIOR_FRAC:
+                    rows.append(rng.below(n_prior))
+                    from_p.append(True)
+                else:
+                    rows.append(rng.below(agent.replay_size()))
+                    from_p.append(False)
             var raw = List[Scalar[DT]]()
             var bs = List[Scalar[DT]]()
-            agent.embed_rows(rows, raw, bs)
+            if n_prior > 0:
+                agent.embed_rows_mixed(rows, from_p, raw, bs)
+            else:
+                agent.embed_rows(rows, raw, bs)
             var h_z = ctx.enqueue_create_host_buffer[DT](N_ENVS * D)
             for i in range(N_ENVS * D):
                 h_z[i] = Scalar[DT](0.0)

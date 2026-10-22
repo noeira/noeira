@@ -127,6 +127,54 @@ def gather_cols_kernel[SRC_W: Int, SDT: DType = DT](
     ].cast[DT]()
 
 
+def gather_cols_2src_kernel[SRC_W: Int, ADT: DType = DT](
+    a: Pointer[Scalar[ADT], MutAnyOrigin],
+    b: Pointer[Scalar[DT], MutAnyOrigin],
+    idx: Pointer[Scalar[IDX_DT], MutAnyOrigin],
+    from_b: Pointer[Scalar[DType.int32], MutAnyOrigin],
+    cols: Pointer[Scalar[DType.int32], MutAnyOrigin],
+    dst: Pointer[Scalar[DT], MutAnyOrigin],
+    n_rows: Int32,
+    n_cols: Int32,
+):
+    """`gather_cols_kernel` over two tables of the same width: row `i` comes
+    from `b` (the prior rows) where `from_b[i] != 0`, else from `a` (the
+    ring)."""
+    var t = Int(global_idx.x)
+    var nc = Int(n_cols)
+    if t >= Int(n_rows) * nc:
+        return
+    var i = t // nc
+    var o = Int(idx[unsafe_offset=i]) * SRC_W + Int(cols[unsafe_offset=t % nc])
+    if from_b[unsafe_offset=i] != 0:
+        dst[unsafe_offset=t] = b[unsafe_offset=o]
+    else:
+        dst[unsafe_offset=t] = a[unsafe_offset=o].cast[DT]()
+
+
+def gather_rows_2src_into_kernel[
+    SRC_DIM: Int, DST_STRIDE: Int, ROWS: Int, ADT: DType = DT
+](
+    a: Pointer[Scalar[ADT], MutAnyOrigin],
+    b: Pointer[Scalar[DT], MutAnyOrigin],
+    idx: Pointer[Scalar[IDX_DT], MutAnyOrigin],
+    from_b: Pointer[Scalar[DType.int32], MutAnyOrigin],
+    dst: Pointer[Scalar[DT], MutAnyOrigin],
+):
+    """`gather_rows_into_kernel` over two tables of the same width, row by
+    row as `gather_cols_2src_kernel` picks."""
+    var t = Int(global_idx.x)
+    if t >= ROWS * SRC_DIM:
+        return
+    var i = t // SRC_DIM
+    var d = t % SRC_DIM
+    var o = Int(idx[unsafe_offset=i]) * SRC_DIM + d
+    if from_b[unsafe_offset=i] != 0:
+        dst[unsafe_offset=i * DST_STRIDE + d] = b[unsafe_offset=o]
+    else:
+        dst[unsafe_offset=i * DST_STRIDE + d] = a[unsafe_offset=o].cast[DT]()
+
+
 def reg_reward_kernel[OBS_W: Int, ACT: Int, LANES: Int, CAP: Int](
     prev_obs: Pointer[Scalar[DT], MutAnyOrigin],
     next_obs: Pointer[Scalar[DT], MutAnyOrigin],
@@ -243,16 +291,25 @@ struct FBMebeOnlineAgent[
     ZBUF: Int = 10_000,
     DERIVED_TAIL: Int = 0,
     RING_DT: DType = DT,
+    PRIOR_ROWS: Int = 0,
 ](OffPolicyAgentGpu):
+    """`PRIOR_ROWS` (plan §13.5 option 1): when > 0 and `attach_prior` was
+    called, that many rows of every training batch come from a teacher's
+    rollouts (the base's EXPERT_ROWS path, BC off), each carrying its own
+    regularity reward; the MEBE pool and `embed_rows_mixed` draw the same
+    share of their rows from them. Not attached: the ring alone, as before
+    — one binary, both arms."""
+
     comptime AGENT_TRAIN_TARGET: StaticString = "gpu"
     comptime AGENT_OBS_DIM: Int = Self.OBS
     comptime AGENT_ACT_DIM: Int = Self.ACT
     comptime STORE_OBS: Int = Self.OBS - Self.DERIVED_TAIL
     comptime Base = FBOnlineAgent[
         Self.FNET, Self.BNET, Self.ANET, Self.OBS, Self.ACT, Self.D,
-        Self.BATCH, Self.CAP, Self.LANES, Self.ZBUF, 0, Self.DERIVED_TAIL,
-        Self.RING_DT,
+        Self.BATCH, Self.CAP, Self.LANES, Self.ZBUF, Self.PRIOR_ROWS,
+        Self.DERIVED_TAIL, Self.RING_DT,
     ]
+    comptime PRIOR_FRAC: Float64 = Float64(Self.PRIOR_ROWS) / Float64(Self.BATCH)
     comptime Head = FBRegHead[
         Self.FNET, Self.BNET, Self.ANET, Self.QNET,
         Self.OBS, Self.ACT, Self.D, Self.BATCH, "gpu",
@@ -285,6 +342,14 @@ struct FBMebeOnlineAgent[
     var _e_idx: Optional[DeviceBuffer[IDX_DT]]
     var _e_obs: Tensor     # BATCH * OBS
     var _e_b: Tensor       # BATCH * D
+    # ── prior rows (`attach_prior`); the obs / act / nxt live in the base's
+    # expert store, the regularity reward per row here
+    var _p_rew: Tensor                               # n_valid
+    var _p_n: Int                                    # 0 = no prior attached
+    var _src_cr: Optional[DeviceBuffer[DType.int32]]   # NC + NR, 1 = prior row
+    var _src_pick: Optional[DeviceBuffer[DType.int32]] # BATCH
+    var _e_src: Optional[DeviceBuffer[DType.int32]]    # BATCH
+    var last_pool_prior: Float64   # share of the last pool drawn from prior rows
 
     def __init__(out self):
         self.base = Self.Base()
@@ -310,6 +375,12 @@ struct FBMebeOnlineAgent[
         self._e_idx = None
         self._e_obs = Tensor()
         self._e_b = Tensor()
+        self._p_rew = Tensor()
+        self._p_n = 0
+        self._src_cr = None
+        self._src_pick = None
+        self._e_src = None
+        self.last_pool_prior = 0.0
 
     def __init__(out self, *, deinit move: Self):
         self.base = move.base^
@@ -335,6 +406,12 @@ struct FBMebeOnlineAgent[
         self._e_idx = move._e_idx^
         self._e_obs = move._e_obs^
         self._e_b = move._e_b^
+        self._p_rew = move._p_rew^
+        self._p_n = move._p_n
+        self._src_cr = move._src_cr^
+        self._src_pick = move._src_pick^
+        self._e_src = move._e_src^
+        self.last_pool_prior = move.last_pool_prior
 
     @staticmethod
     def make[
@@ -449,6 +526,45 @@ struct FBMebeOnlineAgent[
         ctx.synchronize()
         return a^
 
+    # ── prior rows (plan §13.5 option 1) ─────────────────────────────────
+
+    def attach_prior(
+        mut self,
+        var obs: Tensor,
+        var act: Tensor,
+        var nxt: DeviceBuffer[IDX_DT],
+        var rew: Tensor,
+        n_valid: Int,
+    ) raises:
+        """A teacher's rollouts, in `fb/prior.mojo`'s layout and uploaded:
+        `obs` `[n_valid + n_term, STORE_OBS]`, `act` and `rew` `n_valid`
+        rows, `nxt` the successor table. ⚠ Call BEFORE the driver: the
+        training step branches on it, and that branch is captured."""
+        comptime assert Self.PRIOR_ROWS > 0, (
+            "FBMebeOnlineAgent.attach_prior: PRIOR_ROWS is 0 on this agent"
+        )
+        comptime assert Self.DERIVED_TAIL == 0, (
+            "FBMebeOnlineAgent.attach_prior: prior rows carry no derived tail"
+        )
+        if not rew.dev:
+            raise Error("attach_prior: rew must be uploaded to device")
+        var c = self.ctx.value()
+        self.base.attach_expert(obs^, act^, nxt^, n_valid)
+        self._p_rew = rew^
+        self._p_n = n_valid
+        self._src_cr = c.enqueue_create_buffer[DType.int32](
+            self.cfg.n_cand + self.cfg.n_ref
+        )
+        self._src_pick = c.enqueue_create_buffer[DType.int32](Self.BATCH)
+        self._e_src = c.enqueue_create_buffer[DType.int32](Self.BATCH)
+        c.synchronize()
+
+    def prior_rows(self) -> Int:
+        return self._p_n
+
+    def _prior_obs_ptr(self) -> Pointer[Scalar[DT], MutAnyOrigin]:
+        return mptr(self.base.exp_obs.dev.value().unsafe_ptr())
+
     # ── the MEBE pool ────────────────────────────────────────────────────
 
     def refresh_pool(mut self) raises:
@@ -464,22 +580,47 @@ struct FBMebeOnlineAgent[
         var nf = len(self.cfg.filt_cols)
         var ncol = nphi + nf
         var nrows = nc + nr
-        # 1. candidate + reference rows, uniform over the fill (host draw)
+        # 1. candidate + reference rows, uniform over the fill (host draw);
+        # with prior rows attached, each is a prior row w.p. PRIOR_FRAC — the
+        # share the training batch gives them
+        var prior = self._p_n > 0
         var hidx = c.enqueue_create_host_buffer[IDX_DT](nrows)
         var rows = List[Int](length=nrows, fill=0)
+        var src = List[Int32](length=nrows, fill=0)
         for i in range(nrows):
-            rows[i] = self._rng.below(size)
+            if prior and self._rng.uniform() < Self.PRIOR_FRAC:
+                src[i] = 1
+                rows[i] = self._rng.below(self._p_n)
+            else:
+                rows[i] = self._rng.below(size)
             hidx[i] = Scalar[IDX_DT](rows[i])
         c.enqueue_copy(self._idx_cr.value(), hidx)
         # 2. gather φ + filter columns, D2H
-        c.enqueue_function[gather_cols_kernel[Self.STORE_OBS, Self.RING_DT]](
-            self.base.ring_obs_ptr(),
-            mptr(self._idx_cr.value().unsafe_ptr()),
-            mptr(self._cols_dev.value().unsafe_ptr()),
-            mptr(self._phi_dev.dev.value().unsafe_ptr()),
-            Int32(nrows), Int32(ncol),
-            grid_dim=(nrows * ncol + TPB - 1) // TPB, block_dim=TPB,
-        )
+        if prior:
+            var hs = c.enqueue_create_host_buffer[DType.int32](nrows)
+            for i in range(nrows):
+                hs[i] = src[i]
+            c.enqueue_copy(self._src_cr.value(), hs)
+            c.enqueue_function[
+                gather_cols_2src_kernel[Self.STORE_OBS, Self.RING_DT]
+            ](
+                self.base.ring_obs_ptr(), self._prior_obs_ptr(),
+                mptr(self._idx_cr.value().unsafe_ptr()),
+                mptr(self._src_cr.value().unsafe_ptr()),
+                mptr(self._cols_dev.value().unsafe_ptr()),
+                mptr(self._phi_dev.dev.value().unsafe_ptr()),
+                Int32(nrows), Int32(ncol),
+                grid_dim=(nrows * ncol + TPB - 1) // TPB, block_dim=TPB,
+            )
+        else:
+            c.enqueue_function[gather_cols_kernel[Self.STORE_OBS, Self.RING_DT]](
+                self.base.ring_obs_ptr(),
+                mptr(self._idx_cr.value().unsafe_ptr()),
+                mptr(self._cols_dev.value().unsafe_ptr()),
+                mptr(self._phi_dev.dev.value().unsafe_ptr()),
+                Int32(nrows), Int32(ncol),
+                grid_dim=(nrows * ncol + TPB - 1) // TPB, block_dim=TPB,
+            )
         var hphi = c.enqueue_create_host_buffer[DT](nrows * ncol)
         c.enqueue_copy(hphi, self._phi_dev.dev.value())
         c.synchronize()
@@ -520,16 +661,36 @@ struct FBMebeOnlineAgent[
             hp[t] = Scalar[IDX_DT](rows[picks[t]])
         c.enqueue_copy(self._idx_pick.value(), hp)
         # 5. those rows → (normalise) → B → sphere → zsrc
-        c.enqueue_function[
-            gather_rows_into_kernel[
-                Self.STORE_OBS, Self.OBS, Self.BATCH, Self.RING_DT
-            ]
-        ](
-            self.base.ring_obs_ptr(),
-            mptr(self._idx_pick.value().unsafe_ptr()),
-            mptr(self._pool_obs.dev.value().unsafe_ptr()),
-            grid_dim=_blocks(Self.BATCH * Self.STORE_OBS), block_dim=TPB,
-        )
+        if prior:
+            var hs = c.enqueue_create_host_buffer[DType.int32](Self.BATCH)
+            var n_p = 0
+            for t in range(Self.BATCH):
+                hs[t] = src[picks[t]]
+                n_p += Int(src[picks[t]])
+            self.last_pool_prior = Float64(n_p) / Float64(Self.BATCH)
+            c.enqueue_copy(self._src_pick.value(), hs)
+            c.enqueue_function[
+                gather_rows_2src_into_kernel[
+                    Self.STORE_OBS, Self.OBS, Self.BATCH, Self.RING_DT
+                ]
+            ](
+                self.base.ring_obs_ptr(), self._prior_obs_ptr(),
+                mptr(self._idx_pick.value().unsafe_ptr()),
+                mptr(self._src_pick.value().unsafe_ptr()),
+                mptr(self._pool_obs.dev.value().unsafe_ptr()),
+                grid_dim=_blocks(Self.BATCH * Self.STORE_OBS), block_dim=TPB,
+            )
+        else:
+            c.enqueue_function[
+                gather_rows_into_kernel[
+                    Self.STORE_OBS, Self.OBS, Self.BATCH, Self.RING_DT
+                ]
+            ](
+                self.base.ring_obs_ptr(),
+                mptr(self._idx_pick.value().unsafe_ptr()),
+                mptr(self._pool_obs.dev.value().unsafe_ptr()),
+                grid_dim=_blocks(Self.BATCH * Self.STORE_OBS), block_dim=TPB,
+            )
         if self.base.obs_ema.enabled:
             self.base.obs_ema.apply[Self.BATCH](self._pool_obs)
         call_forward["gpu", Self.BATCH](
@@ -556,6 +717,24 @@ struct FBMebeOnlineAgent[
         `STORE_OBS` columns — what a reward reads — and `b` its `D`-wide
         embedding, unprojected (what `z_from_reward` averages). The ring
         is the reward pool of a data-free arm (plan §2 B4)."""
+        self.embed_rows_mixed(rows, List[Bool](), raw, b)
+
+    def embed_rows_mixed(
+        mut self,
+        ref rows: List[Int],
+        ref from_prior: List[Bool],
+        mut raw: List[Scalar[DT]],
+        mut b: List[Scalar[DT]],
+    ) raises:
+        """`embed_rows` where `from_prior[i]` makes row `i` an index into
+        the prior rows (`[0, prior_rows())`) instead of the ring. An empty
+        `from_prior` is the ring alone. A seeded arm's reward pool is its
+        data: the ring and the prior rows at the batch's share."""
+        var mixed = len(from_prior) > 0
+        if mixed and self._p_n == 0:
+            raise Error("embed_rows_mixed: no prior rows attached")
+        if mixed and len(from_prior) != len(rows):
+            raise Error("embed_rows_mixed: rows and from_prior differ in length")
         var c = self.ctx.value()
         if not self._e_idx:
             self._e_idx = c.enqueue_create_buffer[IDX_DT](Self.BATCH)
@@ -566,8 +745,9 @@ struct FBMebeOnlineAgent[
             ensure_t["gpu"](self._e_b, Self.BATCH * Self.D, self.ctx)
         var n = len(rows)
         for i in range(n):
-            if rows[i] < 0 or rows[i] >= self.base.size:
-                raise Error("embed_rows: row outside the ring's fill")
+            var hi = self._p_n if (mixed and from_prior[i]) else self.base.size
+            if rows[i] < 0 or rows[i] >= hi:
+                raise Error("embed_rows: row outside its table")
         raw = List[Scalar[DT]](length=n * Self.STORE_OBS, fill=Scalar[DT](0))
         b = List[Scalar[DT]](length=n * Self.D, fill=Scalar[DT](0))
         var hidx = c.enqueue_create_host_buffer[IDX_DT](Self.BATCH)
@@ -579,16 +759,33 @@ struct FBMebeOnlineAgent[
             for i in range(Self.BATCH):
                 hidx[i] = Scalar[IDX_DT](rows[done + (i if i < take else 0)])
             c.enqueue_copy(self._e_idx.value(), hidx)
-            c.enqueue_function[
-                gather_rows_into_kernel[
-                    Self.STORE_OBS, Self.OBS, Self.BATCH, Self.RING_DT
-                ]
-            ](
-                self.base.ring_obs_ptr(),
-                mptr(self._e_idx.value().unsafe_ptr()),
-                mptr(self._e_obs.dev.value().unsafe_ptr()),
-                grid_dim=_blocks(Self.BATCH * Self.STORE_OBS), block_dim=TPB,
-            )
+            if mixed:
+                var hs = c.enqueue_create_host_buffer[DType.int32](Self.BATCH)
+                for i in range(Self.BATCH):
+                    hs[i] = Int32(1) if from_prior[done + (i if i < take else 0)] else Int32(0)
+                c.enqueue_copy(self._e_src.value(), hs)
+                c.enqueue_function[
+                    gather_rows_2src_into_kernel[
+                        Self.STORE_OBS, Self.OBS, Self.BATCH, Self.RING_DT
+                    ]
+                ](
+                    self.base.ring_obs_ptr(), self._prior_obs_ptr(),
+                    mptr(self._e_idx.value().unsafe_ptr()),
+                    mptr(self._e_src.value().unsafe_ptr()),
+                    mptr(self._e_obs.dev.value().unsafe_ptr()),
+                    grid_dim=_blocks(Self.BATCH * Self.STORE_OBS), block_dim=TPB,
+                )
+            else:
+                c.enqueue_function[
+                    gather_rows_into_kernel[
+                        Self.STORE_OBS, Self.OBS, Self.BATCH, Self.RING_DT
+                    ]
+                ](
+                    self.base.ring_obs_ptr(),
+                    mptr(self._e_idx.value().unsafe_ptr()),
+                    mptr(self._e_obs.dev.value().unsafe_ptr()),
+                    grid_dim=_blocks(Self.BATCH * Self.STORE_OBS), block_dim=TPB,
+                )
             c.enqueue_copy(hraw, self._e_obs.dev.value())
             if self.base.obs_ema.enabled:
                 self.base.obs_ema.apply[Self.BATCH](self._e_obs)
@@ -660,21 +857,54 @@ struct FBMebeOnlineAgent[
         var c = self.ctx.value()
         self.base._sample_batch()
         if self.use_reg:
-            c.enqueue_function[gather_rows_kernel[1, Self.BATCH]](
-                mptr(self.r_rew.dev.value().unsafe_ptr()),
-                mptr(self.base.idx_s.value().unsafe_ptr()),
-                mptr(self.head.br.dev.value().unsafe_ptr()),
-                grid_dim=_blocks(Self.BATCH), block_dim=TPB,
-            )
+            self._gather_reward()
         self.base._relabel_z()
         if self.use_reg:
             _ = self.head.step(self.base.t, want_loss=False)
         else:
             _ = self.base.t.train_step(want_loss=False)
         self.base._push_zbuf()
-        comptime lba = RowMajor[Self.BATCH * Self.ACT]
+        # replay mean|a| of the ONLINE rows only, as the base reports it
+        comptime if Self.PRIOR_ROWS > 0:
+            if self._p_n > 0:
+                comptime RR = Self.BATCH - Self.PRIOR_ROWS
+                self.base._mean_abs_action_dev.accumulate_gpu_abs_lt[RR * Self.ACT](
+                    self.base.t.ba.tt_at["gpu", RR * Self.ACT](Self.PRIOR_ROWS * Self.ACT)
+                )
+                return
         self.base._mean_abs_action_dev.accumulate_gpu_abs_lt[Self.BATCH * Self.ACT](
             self.base.t.ba.tt["gpu", Self.BATCH * Self.ACT]()
+        )
+
+    def _gather_reward(mut self) raises:
+        """`br` row for row with the batch: with prior rows attached, rows
+        `[0, PRIOR_ROWS)` are the base's expert gather (`idx_e`) and the
+        ring's `idx_s` fills rows `[PRIOR_ROWS, BATCH)` from its own first
+        entries — gathering `r_rew[idx_s]` over the whole batch would pair
+        every ring row's reward with the row PRIOR_ROWS above it."""
+        var c = self.ctx.value()
+        comptime if Self.PRIOR_ROWS > 0:
+            if self._p_n > 0:
+                comptime E = Self.PRIOR_ROWS
+                comptime RR = Self.BATCH - E
+                c.enqueue_function[gather_rows_kernel[1, E]](
+                    mptr(self._p_rew.dev.value().unsafe_ptr()),
+                    mptr(self.base.idx_e.value().unsafe_ptr()),
+                    mptr(self.head.br.dev.value().unsafe_ptr()),
+                    grid_dim=_blocks(E), block_dim=TPB,
+                )
+                c.enqueue_function[gather_rows_kernel[1, RR]](
+                    mptr(self.r_rew.dev.value().unsafe_ptr()),
+                    mptr(self.base.idx_s.value().unsafe_ptr()),
+                    mptr(self.head.br.dev.value().unsafe_ptr()).unsafe_offset(E),
+                    grid_dim=_blocks(RR), block_dim=TPB,
+                )
+                return
+        c.enqueue_function[gather_rows_kernel[1, Self.BATCH]](
+            mptr(self.r_rew.dev.value().unsafe_ptr()),
+            mptr(self.base.idx_s.value().unsafe_ptr()),
+            mptr(self.head.br.dev.value().unsafe_ptr()),
+            grid_dim=_blocks(Self.BATCH), block_dim=TPB,
         )
 
     # ── OffPolicyAgentGpu: rollout surface ───────────────────────────────
@@ -880,10 +1110,13 @@ struct FBMebeOnlineAgent[
             names.append(String("mebe_valid_frac"))
             vals.append(Float64(rp.n_valid_cand) / Float64(max(self.cfg.n_cand, 1)))
             names.append(String("mebe_refreshes")); vals.append(Float64(self._n_refresh))
+            if self._p_n > 0:
+                names.append(String("mebe_pool_prior")); vals.append(self.last_pool_prior)
             print(
                 "   [mebe] step", step, " H(φ)", rp.entropy, " ess", rp.ess_frac,
                 " max w", rp.max_w_share, " valid", rp.n_valid_cand, "/",
                 self.cfg.n_cand, " refreshes", self._n_refresh,
+                " pool prior", self.last_pool_prior,
             )
         if Bool(logger) and len(names) > 0:
             logger.value()[].log_scalars(names, vals, step)
