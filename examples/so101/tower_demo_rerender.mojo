@@ -100,7 +100,15 @@ cameras' pose/fovy and the background are re-drawn from `(--dr-seed, launch
 index)` and the four tables re-uploaded in place; both cameras of a launch
 share the draw. A launch is at most `LANES` rows of ONE episode, so an
 episode's look changes every `LANES` rows — for ACT (one frame per sample)
-that is only more variety. With DR on the store gains a `dr_draw` (int32)
+that is only more variety.
+
+⚠ A WORLD MODEL READS WINDOWS OF CONSECUTIVE FRAMES, and a redraw inside
+one is a jump no action explains (S0's stores: ~47 % of LeWM windows held
+one, and those frame pairs carried about two thirds of v1's copy-error mass,
+noeira-docs/SO101_LEWM_PLAN.md §3c step 1). `--dr-per episode` draws ONCE PER
+EPISODE instead: draw index = the episode's index in the store (0, 1, ...),
+applied at its first launch and kept for the rest. `--dr-per launch` (the
+default) is the behaviour above, unchanged. With DR on the store gains a `dr_draw` (int32)
 column naming the draw each row was rendered under, so any row can be
 re-rendered; with `--dr off` (the default) every column and every frame is
 byte for byte what this tool wrote before DR existed (checked on 521 rows);
@@ -110,7 +118,8 @@ The host check runs UNDER THE SAME DRAW: the runtime-built pair gets its own
 randomizer with the same config and applies launch 0's draw, so the check
 covers the randomized tables too. `--dr-preview K` also writes the overhead
 and wrist frames of the first row of the first K launches as PNGs — look at
-them before rendering hours of data.
+them before rendering hours of data (with `--dr-per episode`: the first
+row of the first K episodes).
 """
 
 from std.math import pi, log10
@@ -204,7 +213,7 @@ def _usage() -> String:
         " [--task NAME] [--episodes N] [--per-file a,b] [--all-episodes]"
         " [--deflate 0-9]"
         " [--no-host-check] [--dr off|light|full] [--dr-seed N]"
-        " [--dr-preview K] [--joint-zero none|follower|follower-v1]"
+        " [--dr-per launch|episode] [--dr-preview K] [--joint-zero none|follower|follower-v1]"
         " [--look calibrated|legacy] [--resize R]"
     )
 
@@ -227,6 +236,7 @@ def main() raises:
     var dr_name = String("off")
     var dr_seed = 0
     var dr_preview = 0
+    var dr_per = String("launch")
     var joint_zero = String(RIG_JOINT_ZERO_NONE)
     var look = String(RIG_LOOK_CALIBRATED)
     var resize = 0
@@ -259,6 +269,8 @@ def main() raises:
                 dr_seed = Int(v)
             elif a == "--dr-preview":
                 dr_preview = Int(v)
+            elif a == "--dr-per":
+                dr_per = v
             elif a == "--joint-zero":
                 joint_zero = v
             elif a == "--look":
@@ -273,6 +285,9 @@ def main() raises:
         i += 1
     if demos_arg.byte_length() == 0:
         raise Error("--demos is required\n" + _usage())
+    if dr_per != "launch" and dr_per != "episode":
+        raise Error("--dr-per takes launch or episode, not '" + dr_per + "'\n" + _usage())
+    var dr_per_episode = dr_per == "episode"
     var demo_paths = List[String]()
     for p in demos_arg.split(","):
         var s = String(String(p).strip())
@@ -327,6 +342,7 @@ def main() raises:
     print("  dr     :", String(dr_cfg))
     if dr_on:
         print("  dr cams:", tower_camera_dr_describe())
+        print("  dr per :", dr_per)
 
     # the actuators' ctrlrange: the action map and the gripper's LeRobot unit
     var units = So101TowerUnits(joint_zero)
@@ -374,7 +390,7 @@ def main() raises:
                + " (so101_frames.AreaResize)" if resize > 0 else "")
             + "; dr "
             + String(dr_cfg)
-            + (" (one draw per launch, see dr_draw; " + tower_camera_dr_describe()
+            + (" (one draw per " + dr_per + ", see dr_draw; " + tower_camera_dr_describe()
                + ")" if dr_on else ""),
         deflate=deflate,
     )
@@ -395,6 +411,7 @@ def main() raises:
     ).as_unsafe_any_origin()
     var resizer = AreaResize(3, CAM_H, CAM_W, resize if resize > 0 else 1)
     var launch = 0
+    var draw = 0
     var first_frames = List[UInt8]()   # row 0, both cameras, for the host check
     var first_state = List[Float64]()
     var worst = 99.0
@@ -437,11 +454,15 @@ def main() raises:
                 d.xquat.upload_resident(ctx)
                 t_fk += perf_counter_ns() - tf
                 # ── the launch's appearance draw ─────────────────────────
+                # (per episode: drawn at the episode's first launch, kept)
+                var new_draw = not dr_per_episode or done == 0
                 if dr_on:
-                    r.background = dr.apply(launch, r.vis, m)
-                    dr.upload(ctx, r.vis, m)
+                    if new_draw:
+                        draw = total_eps if dr_per_episode else launch
+                        r.background = dr.apply(draw, r.vis, m)
+                        dr.upload(ctx, r.vis, m)
                     for l in range(n):
-                        drb[unsafe_offset=l] = Int32(launch)
+                        drb[unsafe_offset=l] = Int32(draw)
                 # ── device: both cameras ─────────────────────────────────
                 var tr = perf_counter_ns()
                 for slot in range(N_CAMS):
@@ -453,7 +474,7 @@ def main() raises:
                         var dst = l * N_CAMS * CAM_ELEMS + slot * CAM_ELEMS
                         if pack_camera_u8(mptr(p), l, im, dst):
                             constant_pictures += 1
-                    if dr_on and launch < dr_preview:
+                    if dr_on and new_draw and draw < dr_preview:
                         var hwc = List[UInt8](length=CAM_ELEMS, fill=UInt8(0))
                         for q in range(NPIX):
                             for c in range(3):
@@ -461,7 +482,7 @@ def main() raises:
                                     Float64(p[unsafe_offset = q * 3 + c])
                                 )
                         save_png(
-                            out_path + ".dr" + String(launch) + "."
+                            out_path + ".dr" + String(draw) + "."
                             + ("overhead" if slot == 0 else "wrist") + ".png",
                             hwc, CAM_W, CAM_H, 3,
                         )
