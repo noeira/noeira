@@ -1,0 +1,472 @@
+"""Spike gate: the functional tape compiled by MAX's graph compiler, from Mojo
+with no Python. One eager forward is recorded, `emit_train_step` turns it
+into an MO graph (forward + backward + Adam in place), MAX's C API compiles
+it, and K steps run on host buffers. The reference is the eager tape with
+nn's Adam from the same weights on the same batches.
+
+1. MLP (F.linear relu, tanh, linear) + F.mse: losses and final parameters.
+2. A graph of every other supported op (+ - * / with broadcasting, scalar
+   ops, matmul, transpose, sigmoid/exp/log/sqrt, sum, sum_rows, mean).
+3. A mutant (tanh's backward wrong) must FAIL gate 1.
+4. Time per step: eager tape vs the compiled step; compile time.
+
+Build and run: `noeira_max/tape_to_mo/run.sh` (CPU; `TAPE_MO_ENV=apple`).
+"""
+
+from std.math import sqrt as fsqrt
+from std.random import seed, random_float64
+from std.sys import argv
+from std.time import perf_counter_ns
+
+from maxrt import HostBuffer, Runtime, TensorMap, Model, Tensor
+from max.gpu.host import DeviceContext
+from noeira.nn.constants import DT
+from noeira.nn.core.initializer import Xavier
+from noeira.nn.optimizer.adam import Adam
+from noeira.experimental.functional import Tape, FTensor
+import noeira.experimental.functional.F as F
+
+from tape_to_mo.emit import emit_train_step, Step
+
+
+comptime LR: Float32 = 3e-3
+
+
+struct Net(Copyable):
+    var b: Int
+    var din: Int
+    var h: Int
+    var dout: Int
+    var kind: Int
+    """0 = MLP + MSE; 1 = the every-op graph."""
+
+    def __init__(out self, b: Int, din: Int, h: Int, dout: Int, kind: Int):
+        self.b = b
+        self.din = din
+        self.h = h
+        self.dout = dout
+        self.kind = kind
+
+    def params(self, tape: Tape) raises -> List[FTensor]:
+        seed(7)
+        var p = List[FTensor]()
+        p.append(tape.param[Xavier](self.din, self.h, name="w1"))
+        p.append(tape.zeros(1, self.h, name="b1"))
+        p.append(tape.param[Xavier](self.h, self.h, name="w2"))
+        p.append(tape.zeros(1, self.h, name="b2"))
+        p.append(tape.param[Xavier](self.h, self.dout, name="w3"))
+        p.append(tape.zeros(1, self.dout, name="b3"))
+        return p^
+
+    def loss(self, p: List[FTensor], x: FTensor, y: FTensor) raises -> FTensor:
+        if self.kind == 0:
+            var h = F.linear(x, p[0], p[1], "relu")
+            h = F.linear(h, p[2], p[3], "tanh")
+            return F.mse(F.linear(h, p[4], p[5]), y)
+        # every other op, rank 2
+        var z = x @ p[0] + p[1]                                  # matmul, add (broadcast)
+        var a = z.sigmoid() * Scalar[DT](2.0) + Scalar[DT](0.5)  # scale, shift
+        var c = (a.exp() + Scalar[DT](1.0)).log()                # exp, log
+        var d = (c * c + Scalar[DT](1.0)).sqrt() / (a + Scalar[DT](1.0))  # mul, sqrt, div
+        var e = (d @ p[2] - p[3]).tanh()                         # sub (broadcast)
+        var f = (Scalar[DT](1.0) - e) / Scalar[DT](4.0)          # rsubc, divc
+        var pred = (f @ p[4]) * p[5]                             # mul (broadcast)
+        var r = (pred - y).relu()
+        var t = ((x.T() @ x) / Scalar[DT](100.0)).sum_rows()      # transpose, sum_rows
+        return r.mean() + (t * t).sum() * Scalar[DT](1e-4) + (pred * pred).mean()
+
+
+def batch(net: Net, step: Int) -> Tuple[List[Scalar[DT]], List[Scalar[DT]]]:
+    seed(1000 + step)
+    var x = List[Scalar[DT]]()
+    var y = List[Scalar[DT]]()
+    for _ in range(net.b * net.din):
+        x.append(Scalar[DT](random_float64() * 2.0 - 1.0))
+    for _ in range(net.b * net.dout):
+        y.append(Scalar[DT](random_float64() * 2.0 - 1.0))
+    return (x^, y^)
+
+
+def flat(ps: List[FTensor]) raises -> List[Scalar[DT]]:
+    var out = List[Scalar[DT]]()
+    for i in range(len(ps)):
+        out.extend(ps[i].values())
+    return out^
+
+
+struct Best(Movable):
+    """Mean time of 40-step chunks, keeping the fastest chunk: another
+    process's burst then costs a chunk, not the measurement."""
+    var acc: Float64
+    var n: Int
+    var best: Float64
+
+    def __init__(out self):
+        self.acc = 0
+        self.n = 0
+        self.best = 1e30
+
+    def add(mut self, us: Float64):
+        self.acc += us
+        self.n += 1
+        if self.n == 40:
+            self.best = min(self.best, self.acc / 40.0)
+            self.acc = 0
+            self.n = 0
+
+
+struct Run(Movable):
+    var losses: List[Float64]
+    var params: List[Scalar[DT]]
+    var step_us: Float64
+    var compile_ms: Float64
+
+    def __init__(out self):
+        self.losses = List[Float64]()
+        self.params = List[Scalar[DT]]()
+        self.step_us = 0
+        self.compile_ms = 0
+
+
+def eager(net: Net, steps: Int, timed: Int, fixed: Bool = False) raises -> Run:
+    """CPU tape; `fixed`: batch 0 at every step (what the GPU runs use)."""
+    var r = Run()
+    var tape = Tape()
+    var p = net.params(tape)
+    var opt = Adam(lr=Scalar[DT](LR))
+    var best = Best()
+    for s in range(steps + timed):
+        var bt = batch(net, 0 if fixed else s % steps)
+        var t0 = perf_counter_ns()
+        tape.reset()
+        tape.zero_grad()
+        var loss = net.loss(p, tape.input(net.b, net.din, bt[0].copy()),
+                            tape.input(net.b, net.dout, bt[1].copy()))
+        loss.backward()
+        var t = tape
+        opt.step["cpu"](t, None)
+        var l = Float64(loss.item())
+        if s < steps:
+            r.losses.append(l)
+            if s == steps - 1:
+                r.params = flat(p)
+        else:
+            best.add(Float64(perf_counter_ns() - t0) / 1e3)
+    r.step_us = best.best
+    return r^
+
+
+def eager_gpu(ctx: DeviceContext, net: Net, timed: Int) raises -> Float64:
+    """Mean step time of the eager tape on the GPU: batch 0 on the device
+    (`input_device`), adopted Adam, the loss read back every step."""
+    var tape = Tape(ctx)
+    var p = net.params(tape)
+    var opt = Adam(lr=Scalar[DT](LR))
+    opt.adopt["gpu"](tape, ctx)
+    var bt = batch(net, 0)
+    var xd = ctx.enqueue_create_buffer[DT](len(bt[0]))
+    var yd = ctx.enqueue_create_buffer[DT](len(bt[1]))
+    with xd.map_to_host() as hx, yd.map_to_host() as hy:
+        for i in range(len(bt[0])):
+            hx[i] = bt[0][i]
+        for i in range(len(bt[1])):
+            hy[i] = bt[1][i]
+    var best = Best()
+    for s in range(20 + timed):
+        var t0 = perf_counter_ns()
+        tape.reset()
+        tape.zero_grad()
+        var loss = net.loss(p, tape.input_device(net.b, net.din, xd), tape.input_device(net.b, net.dout, yd))
+        loss.backward()
+        var t = tape
+        opt.step["gpu"](t, ctx)
+        _ = loss.item()
+        if s >= 20:
+            best.add(Float64(perf_counter_ns() - t0) / 1e3)
+    _ = xd^
+    _ = yd^
+    return best.best
+
+
+def compiled_gpu(rt: Runtime, net: Net, steps: Int, timed: Int, path: String) raises -> Run:
+    """The compiled step on the accelerator: every argument copied to the
+    device and lent by address; batch 0 at every step."""
+    var r = Run()
+    var tape = Tape()
+    var p = net.params(tape)
+    var bt0 = batch(net, 0)
+    var xb = tape.input(net.b, net.din, bt0[0].copy())
+    var yb = tape.input(net.b, net.dout, bt0[1].copy())
+    var step = emit_train_step(tape, net.loss(p, xb, yb), LR, device="gpu:0")
+    with open(path, "w") as f:
+        f.write(step.text)
+    var t0 = perf_counter_ns()
+    var model = rt.load(path)
+    r.compile_ms = Float64(perf_counter_ns() - t0) / 1e6
+
+    var staging = rt.tensor_map()
+    var inputs = rt.tensor_map()
+    var on_dev = List[Tensor]()
+
+    def lend(name: String, var buf: HostBuffer, shape: List[Int]) raises {mut staging, mut inputs, mut on_dev, rt}:
+        staging.borrow(name, buf^, DType.float32, shape.copy())
+        var dev = staging.tensor(name).to_device(rt.device())
+        inputs.borrow_address(name, dev.address(), DType.float32, shape.copy(), on_device=True)
+        on_dev.append(dev^)
+
+    for k in range(len(step.params)):
+        var vals = p[k].values()
+        var shp = step.shapes[step.params[k]].copy()
+        var nb = 4 * len(vals)
+        lend(String("p", k), HostBuffer(copy_from=Int(vals.unsafe_ptr()), nbytes=nb), shp)
+        lend(String("m", k), HostBuffer(nb), shp)
+        lend(String("v", k), HostBuffer(nb), shp)
+        _ = vals^
+    var one: List[Scalar[DT]] = [1.0]
+    lend("pow1", HostBuffer(copy_from=Int(one.unsafe_ptr()), nbytes=4), [1, 1])
+    lend("pow2", HostBuffer(copy_from=Int(one.unsafe_ptr()), nbytes=4), [1, 1])
+    _ = one^
+    # `bt0[k]` is a temporary copy: its pointer dangles once the expression
+    # ends, so bind the lists first and keep them alive past the copies.
+    var x0 = bt0[0].copy()
+    var y0 = bt0[1].copy()
+    lend(String("x", xb.id), HostBuffer(copy_from=Int(x0.unsafe_ptr()), nbytes=4 * len(x0)), [net.b, net.din])
+    lend(String("x", yb.id), HostBuffer(copy_from=Int(y0.unsafe_ptr()), nbytes=4 * len(y0)), [net.b, net.dout])
+    _ = x0^
+    _ = y0^
+    var best = Best()
+    for s in range(steps + timed):
+        var t1 = perf_counter_ns()
+        var l = Float64(model.execute(inputs).tensor("loss").to_host().item[DType.float32]())
+        if s < steps:
+            r.losses.append(l)
+            if s == steps - 1:
+                for k in range(len(step.params)):
+                    # read through the map MAX executes on: the Tensor
+                    # handle `to_device` returned shows its INITIAL bytes on
+                    # Metal (MAX 26.7) once the model has stored into them
+                    var h = inputs.tensor(String("p", k)).to_host()
+                    var pk = h.data[Float32]()
+                    for i in range(h.num_elements()):
+                        r.params.append(pk[unsafe_offset=i])
+        else:
+            best.add(Float64(perf_counter_ns() - t1) / 1e3)
+    r.step_us = best.best
+    _ = staging^
+    return r^
+
+
+def debug_gpu(rt: Runtime, net: Net, path: String, update: Bool) raises:
+    """Which MLP node drifts on the GPU: each layer's value from ONE compiled
+    execution vs the CPU tape's forward on the same weights and batch."""
+    var tape = Tape()
+    var p = net.params(tape)
+    var bt = batch(net, 0)
+    var x = tape.input(net.b, net.din, bt[0].copy())
+    var y = tape.input(net.b, net.dout, bt[1].copy())
+    var h1 = F.linear(x, p[0], p[1], "relu")
+    var h2 = F.linear(h1, p[2], p[3], "tanh")
+    var pred = F.linear(h2, p[4], p[5])
+    var dd = pred - y
+    var loss = (dd * dd).mean()
+    var ids: List[Int] = [h1.id, h2.id, pred.id, y.id, dd.id]
+    var step = emit_train_step(tape, loss, LR, device="gpu:0", extra=ids.copy(), update=update)
+    with open(path, "w") as f:
+        f.write(step.text)
+    var model = rt.load(path)
+    var staging = rt.tensor_map()
+    var inputs = rt.tensor_map()
+    var on_dev = List[Tensor]()
+    def lend(name: String, var buf: HostBuffer, shape: List[Int]) raises {mut staging, mut inputs, mut on_dev, rt}:
+        staging.borrow(name, buf^, DType.float32, shape.copy())
+        var dev = staging.tensor(name).to_device(rt.device())
+        inputs.borrow_address(name, dev.address(), DType.float32, shape.copy(), on_device=True)
+        on_dev.append(dev^)
+    for k in range(len(step.params)):
+        var vals = p[k].values()
+        var shp = step.shapes[step.params[k]].copy()
+        lend(String("p", k), HostBuffer(copy_from=Int(vals.unsafe_ptr()), nbytes=4 * len(vals)), shp)
+        lend(String("m", k), HostBuffer(4 * len(vals)), shp)
+        lend(String("v", k), HostBuffer(4 * len(vals)), shp)
+        _ = vals^
+    var one: List[Scalar[DT]] = [1.0]
+    lend("pow1", HostBuffer(copy_from=Int(one.unsafe_ptr()), nbytes=4), [1, 1])
+    lend("pow2", HostBuffer(copy_from=Int(one.unsafe_ptr()), nbytes=4), [1, 1])
+    var x0 = bt[0].copy()
+    var y0 = bt[1].copy()
+    lend(String("x", x.id), HostBuffer(copy_from=Int(x0.unsafe_ptr()), nbytes=4 * len(x0)), [net.b, net.din])
+    lend(String("x", y.id), HostBuffer(copy_from=Int(y0.unsafe_ptr()), nbytes=4 * len(y0)), [net.b, net.dout])
+    _ = x0^
+    _ = y0^
+    var out = model.execute(inputs)
+    var names: List[String] = ["h1 = relu(x w1 + b1)", "h2 = tanh(h1 w2 + b2)", "pred = h2 w3 + b3", "y (input)", "pred - y"]
+    var nodes: List[FTensor] = [h1, h2, pred, y, dd]
+    for j in range(5):
+        var want = nodes[j].values()
+        var t = out.tensor(String("n", ids[j])).to_host()
+        var d = t.data[Float32]()
+        var worst: Float64 = 0
+        var at = 0
+        for i in range(len(want)):
+            var e = abs(Float64(d[unsafe_offset=i]) - Float64(want[i]))
+            if e > worst:
+                worst = e
+                at = i
+        print("    ", names[j], ": worst abs ", worst, " at ", at, " (MAX ", d[unsafe_offset=at],
+              ", eager ", want[at], ")", sep="")
+    print("    loss: MAX", out.tensor("loss").to_host().item[DType.float32](), " eager", loss.item())
+    _ = staging^
+    _ = one^
+
+
+def compiled(rt: Runtime, net: Net, steps: Int, timed: Int, path: String, mutant: Bool) raises -> Run:
+    var r = Run()
+    var tape = Tape()
+    var p = net.params(tape)
+    var bt0 = batch(net, 0)
+    var xb = tape.input(net.b, net.din, bt0[0].copy())
+    var yb = tape.input(net.b, net.dout, bt0[1].copy())
+    var step = emit_train_step(tape, net.loss(p, xb, yb), LR, mutant=mutant)
+    with open(path, "w") as f:
+        f.write(step.text)
+    var t0 = perf_counter_ns()
+    var model = rt.load(path)
+    r.compile_ms = Float64(perf_counter_ns() - t0) / 1e6
+
+    var inputs = rt.tensor_map()
+    for k in range(len(step.params)):
+        var vals = p[k].values()
+        var shp = step.shapes[step.params[k]].copy()
+        var nb = 4 * len(vals)
+        inputs.borrow(String("p", k), HostBuffer(copy_from=Int(vals.unsafe_ptr()), nbytes=nb),
+                      DType.float32, shp.copy())
+        inputs.borrow(String("m", k), HostBuffer(nb), DType.float32, shp.copy())
+        inputs.borrow(String("v", k), HostBuffer(nb), DType.float32, shp.copy())
+        _ = vals^
+    var one: List[Scalar[DT]] = [1.0]
+    inputs.borrow("pow1", HostBuffer(copy_from=Int(one.unsafe_ptr()), nbytes=4), DType.float32, [1, 1])
+    inputs.borrow("pow2", HostBuffer(copy_from=Int(one.unsafe_ptr()), nbytes=4), DType.float32, [1, 1])
+    _ = one^
+    var xname = String("x", xb.id)
+    var yname = String("x", yb.id)
+    inputs.borrow(xname, HostBuffer(4 * net.b * net.din), DType.float32, [net.b, net.din])
+    inputs.borrow(yname, HostBuffer(4 * net.b * net.dout), DType.float32, [net.b, net.dout])
+
+    var best = Best()
+    for s in range(steps + timed):
+        var bt = batch(net, s % steps)
+        var t1 = perf_counter_ns()
+        var px = inputs.owned_data[Float32](xname)
+        var py = inputs.owned_data[Float32](yname)
+        for i in range(len(bt[0])):
+            px[unsafe_offset=i] = bt[0][i]
+        for i in range(len(bt[1])):
+            py[unsafe_offset=i] = bt[1][i]
+        var l = Float64(model.execute(inputs).tensor("loss").item[DType.float32]())
+        if s < steps:
+            r.losses.append(l)
+            if s == steps - 1:
+                for k in range(len(step.params)):
+                    var pk = inputs.owned_data[Float32](String("p", k))
+                    var n = step.shapes[step.params[k]][0] * step.shapes[step.params[k]][1]
+                    for i in range(n):
+                        r.params.append(pk[unsafe_offset=i])
+        else:
+            best.add(Float64(perf_counter_ns() - t1) / 1e3)
+    r.step_us = best.best
+    return r^
+
+
+def compare(name: String, got: Run, want: Run, ltol: Float64, ptol: Float64) -> Bool:
+    var lw: Float64 = 0
+    for i in range(len(want.losses)):
+        lw = max(lw, abs(got.losses[i] - want.losses[i]) / max(1e-6, abs(want.losses[i])))
+    var pw: Float64 = 0
+    var pmoved = 0
+    for i in range(len(want.params)):
+        var d = abs(Float64(got.params[i]) - Float64(want.params[i]))
+        pw = max(pw, d)
+        if d > 1e-5:
+            pmoved += 1
+    var head = String("      first losses eager/MAX:")
+    for i in range(min(4, len(want.losses))):
+        head += String(" ", want.losses[i], "/", got.losses[i])
+    print(head)
+    var ok = len(got.losses) == len(want.losses) and len(got.params) == len(want.params) \
+        and lw <= ltol and pw <= ptol
+    print("    ", name, ": loss ", want.losses[0], " -> ", want.losses[len(want.losses) - 1],
+          " (eager) vs ", got.losses[len(got.losses) - 1], " (MAX); worst loss rel ", lw,
+          ", worst param abs ", pw, " (", pmoved, " of ", len(want.params), " > 1e-5)  ",
+          "OK" if ok else "FAIL", sep="")
+    return ok
+
+
+def main() raises:
+    var dir = String(argv()[1]) if len(argv()) > 1 else String("/tmp")
+    var rt = Runtime()
+    var ok = True
+    comptime STEPS = 20
+    if len(argv()) > 2 and String(argv()[2]) == "--gpu-debug":
+        var drt = Runtime(accelerator=True)
+        var dnet = Net(64, 17, 64, 6, 0)
+        print("  with the in-place stores:")
+        debug_gpu(drt, dnet, dir + "/mlp_gpu_debug.mlir", True)
+        print("  WITHOUT the stores (the step updates nothing):")
+        debug_gpu(drt, dnet, dir + "/mlp_gpu_debug_nostore.mlir", False)
+        return
+
+    print("1. MLP 17 -> 64 relu -> 64 tanh -> 6, MSE, Adam, batch 64,", STEPS, "steps")
+    var mlp = Net(64, 17, 64, 6, 0)
+    var e1 = eager(mlp, STEPS, 0)
+    var c1 = compiled(rt, mlp, STEPS, 0, dir + "/mlp.mlir", False)
+    print("    compile (first load in this process):", c1.compile_ms, "ms")
+    ok = compare("MAX vs eager", c1, e1, 1e-4, 2.5e-3) and ok
+
+    print("2. every other rank-2 op")
+    var wide = Net(32, 9, 16, 5, 1)
+    var e2 = eager(wide, STEPS, 0)
+    var c2 = compiled(rt, wide, STEPS, 0, dir + "/wide.mlir", False)
+    print("    compile:", c2.compile_ms, "ms")
+    ok = compare("MAX vs eager", c2, e2, 1e-4, 2.5e-3) and ok
+
+    print("3. mutant (tanh backward 1 + y^2) must fail gate 1")
+    var cm = compiled(rt, mlp, STEPS, 0, dir + "/mlp_mutant.mlir", True)
+    var caught = not compare("mutant vs eager", cm, e1, 1e-4, 2.5e-3)
+    print("    mutant caught:", caught)
+    ok = caught and ok
+
+    print("4. time per train step (CPU, host buffers; fastest 40-step chunk of 200)")
+    var shapes: List[List[Int]] = [[1, 17, 256, 6], [64, 17, 256, 6], [256, 64, 256, 8], [1024, 128, 512, 16]]
+    for i in range(len(shapes)):
+        var nt = Net(shapes[i][0], shapes[i][1], shapes[i][2], shapes[i][3], 0)
+        var et = eager(nt, STEPS, 200)
+        var ct = compiled(rt, nt, STEPS, 200, String(dir, "/time_", i, ".mlir"), False)
+        print("    B ", nt.b, ", ", nt.din, " -> ", nt.h, " -> ", nt.h, " -> ", nt.dout, ": eager ",
+              et.step_us, " us, MAX ", ct.step_us, " us (x", et.step_us / ct.step_us,
+              "), compile ", ct.compile_ms, " ms", sep="")
+    if len(argv()) > 2 and String(argv()[2]) == "--gpu-debug":
+        var drt = Runtime(accelerator=True)
+        print("  with the in-place stores:")
+        debug_gpu(drt, mlp, dir + "/mlp_gpu_debug.mlir", True)
+        print("  WITHOUT the stores (the step updates nothing):")
+        debug_gpu(drt, mlp, dir + "/mlp_gpu_debug_nostore.mlir", False)
+        return
+    var want_gpu = len(argv()) > 2 and String(argv()[2]) == "--gpu"
+    if want_gpu:
+        var grt = Runtime(accelerator=True)
+        var ctx = DeviceContext()
+        print("5. GPU (", ctx.name(), "): the compiled step on the device, batch 0 every step", sep="")
+        var e5 = eager(mlp, STEPS, 0, fixed=True)
+        var c5 = compiled_gpu(grt, mlp, STEPS, 0, dir + "/mlp_gpu.mlir")
+        print("    compile:", c5.compile_ms, "ms")
+        ok = compare("MAX on the GPU vs eager CPU", c5, e5, 1e-4, 2.5e-3) and ok
+        for i in range(len(shapes)):
+            var nt = Net(shapes[i][0], shapes[i][1], shapes[i][2], shapes[i][3], 0)
+            var eg = eager_gpu(ctx, nt, 200)
+            var cg = compiled_gpu(grt, nt, STEPS, 200, String(dir, "/gtime_", i, ".mlir"))
+            print("    B ", nt.b, ", ", nt.din, " -> ", nt.h, " -> ", nt.h, " -> ", nt.dout,
+                  ": eager tape on the GPU ", eg, " us, MAX ", cg.step_us, " us (x", eg / cg.step_us,
+                  "), compile ", cg.compile_ms, " ms", sep="")
+    print("ALL OK" if ok else "SOME FAILED")
+    if not ok:
+        raise Error("tape_to_mo gate failed")
