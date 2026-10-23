@@ -107,6 +107,7 @@ from .kernels import (
     axpy_t,
     hinge_axpy_t,
     masked_rows_axpy_t,
+    masked_rows_axpy_by_mag_t,
     scale_t,
     sum3_scaled_t,
     pessimism_blend_t,
@@ -342,6 +343,14 @@ struct FBTrainer[
     # below follows TD3+BC: the value term is normalised by its own magnitude
     # so `bc_weight` is a ratio rather than an absolute.
     var bc_weight: Float64
+    # ⚠ WHICH side carries the ratio (default False = TD3+BC, above). True is
+    # BFM-Zero's `scale_reg` form: the value term stays RAW and the BC term is
+    # multiplied by the detached `mean |F·z|` (`acc_mag`) instead, so
+    # `bc_weight` is still a ratio. Needed when the actor has OTHER raw terms
+    # (the regularity head's `g_pi_extra`, the action hinge): dividing only
+    # the value term by |F·z| (~200 on the G1) would hand them the actor.
+    # FB-MEBE's prior-row BC (`FBMebeOnlineAgent.attach_prior_bc`).
+    var bc_scaled_by_mag: Bool
     # ⚠⚠ Action-MAGNITUDE penalty on the actor (0 = OFF): `w · mean(pi^2)`.
     # The ONLINE counterpart of `bc_weight`. Measured 2026-09-07 on the first
     # online walker run (`fb_online_walker_gpu.mojo`, bc 0, no penalty):
@@ -458,6 +467,7 @@ struct FBTrainer[
         self.noise_clip = 0.3
         self.max_grad_norm = 0.0
         self.bc_weight = 0.0
+        self.bc_scaled_by_mag = False
         self.act_l2_weight = 0.0
         self.act_l2_margin = 0.0
         self.steps = 0
@@ -542,6 +552,7 @@ struct FBTrainer[
         self.noise_clip = move.noise_clip
         self.max_grad_norm = move.max_grad_norm
         self.bc_weight = move.bc_weight
+        self.bc_scaled_by_mag = move.bc_scaled_by_mag
         self.act_l2_weight = move.act_l2_weight
         self.act_l2_margin = move.act_l2_margin
         self.steps = move.steps
@@ -1083,7 +1094,7 @@ struct FBTrainer[
                 scale_rows_t[T, Self.BATCH, Self.D](self.zw, self.bz, self.w_f1, c)
             else:
                 scale_rows_t[T, Self.BATCH, Self.D](self.zw, self.bz, self.w_f2, c)
-            if self.bc_weight > 0.0:
+            if self.bc_weight > 0.0 and not self.bc_scaled_by_mag:
                 scale_by_inv_mag_t[T, Self._ND](
                     self.g_fa, self.zw, self.acc_mag,
                     Scalar[DT](-1.0 / Float64(Self.BATCH)), Scalar[DT](1e-6), c,
@@ -1142,12 +1153,20 @@ struct FBTrainer[
                 self.bc_weight * 2.0
                 / (Float64(Self.BATCH) * Float64(Self.ACT))
             )
-            masked_rows_axpy_t[T, Self.BATCH, Self.ACT](
-                self.g_pi, self.pi, self.bc_mask, w, c
-            )
-            masked_rows_axpy_t[T, Self.BATCH, Self.ACT](
-                self.g_pi, self.ba, self.bc_mask, -w, c
-            )
+            if self.bc_scaled_by_mag:
+                masked_rows_axpy_by_mag_t[T, Self.BATCH, Self.ACT](
+                    self.g_pi, self.pi, self.bc_mask, self.acc_mag, w, c
+                )
+                masked_rows_axpy_by_mag_t[T, Self.BATCH, Self.ACT](
+                    self.g_pi, self.ba, self.bc_mask, self.acc_mag, -w, c
+                )
+            else:
+                masked_rows_axpy_t[T, Self.BATCH, Self.ACT](
+                    self.g_pi, self.pi, self.bc_mask, w, c
+                )
+                masked_rows_axpy_t[T, Self.BATCH, Self.ACT](
+                    self.g_pi, self.ba, self.bc_mask, -w, c
+                )
         # + action magnitude: d/dpi of `act_l2_weight · mean(pi^2)` — the BC
         # term with the data action at 0. Same scale form, so the two knobs
         # read on the same axis.
@@ -1165,7 +1184,7 @@ struct FBTrainer[
         # + the external term (FB-CPR's `−reg·∂Q_D/∂π`), see `g_pi_extra`.
         # `acc_mag` holds THIS step's `mean |F·z|`, so the scale is not lagged.
         if self.has_pi_extra:
-            if self.bc_weight > 0.0 or self.pi_extra_raw:
+            if (self.bc_weight > 0.0 and not self.bc_scaled_by_mag) or self.pi_extra_raw:
                 axpy_t[T, Self._NA](self.g_pi, self.g_pi_extra, Scalar[DT](1.0), c)
             else:
                 axpy_by_mag_t[T, Self._NA](

@@ -36,6 +36,12 @@ with `a_prev = 0` on an episode's first row, `q̇` read at
 `env = r_env − w_yaw·ωz'² − w_angxy·(ωx'² + ωy'²)` — the ring's
 `g1_angvel_price_kernel`, on the SUCCESSOR's angular velocity at
 `[ang_off, ang_off + 3)` (`ang_off < 0`: no price).
+
+`PriorRows.windows(seq)` is what the prior-row BC encodes its `z` from
+(FB-CPR's `encode_expert`, `fb/cpr.mojo`): for transition row `p`, the table
+rows of its next `seq` successors `s'_p, s'_{p+1}, …`, following `nxt` and
+repeating the episode's terminal row once it is reached, so a window never
+leaves its episode.
 """
 
 from max.gpu.host import DeviceContext, DeviceBuffer
@@ -110,6 +116,34 @@ struct PriorRows(Movable):
         var t = self.rew^
         self.rew = Tensor()
         return t^
+
+    def windows(self, seq: Int) raises -> List[Int]:
+        """`[n_valid, seq]` table rows, row-major (module header)."""
+        if seq < 1:
+            raise Error("PriorRows.windows: seq must be >= 1")
+        var out = List[Int](length=self.n_valid * seq, fill=0)
+        for p in range(self.n_valid):
+            var q = p
+            for j in range(seq):
+                var s = self.nxt[q]
+                out[p * seq + j] = s
+                if s >= self.n_valid:   # the episode's terminal row: hold it
+                    for k in range(j + 1, seq):
+                        out[p * seq + k] = s
+                    break
+                q = s
+        return out^
+
+    def upload_windows(self, ctx: DeviceContext, seq: Int) raises -> DeviceBuffer[IDX_DT]:
+        var w = self.windows(seq)
+        var n = len(w)
+        var h = ctx.enqueue_create_host_buffer[IDX_DT](n)
+        for i in range(n):
+            h[i] = Scalar[IDX_DT](w[i])
+        var d = ctx.enqueue_create_buffer[IDX_DT](n)
+        ctx.enqueue_copy(d, h)
+        ctx.synchronize()
+        return d^
 
     def upload(mut self, ctx: DeviceContext) raises -> DeviceBuffer[IDX_DT]:
         self.obs.upload(ctx)

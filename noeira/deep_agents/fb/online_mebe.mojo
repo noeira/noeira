@@ -175,6 +175,49 @@ def gather_rows_2src_into_kernel[
         dst[unsafe_offset=i * DST_STRIDE + d] = a[unsafe_offset=o].cast[DT]()
 
 
+def prior_window_idx_kernel[SEQ: Int, ROWS: Int](
+    win: Pointer[Scalar[IDX_DT], MutAnyOrigin],
+    idx_e: Pointer[Scalar[IDX_DT], MutAnyOrigin],
+    dst: Pointer[Scalar[IDX_DT], MutAnyOrigin],
+    i0: Int32,
+):
+    """`dst[r] = win[idx_e[i0 + r / SEQ], r % SEQ]`: the window rows of
+    batch rows `[i0, i0 + ROWS / SEQ)`, flattened window by window."""
+    var r = Int(global_idx.x)
+    if r >= ROWS:
+        return
+    var i = Int(i0) + r // SEQ
+    dst[unsafe_offset=r] = win[
+        unsafe_offset=Int(idx_e[unsafe_offset=i]) * SEQ + r % SEQ
+    ]
+
+
+def window_mean_kernel[D: Int, SEQ: Int, NW: Int](
+    b: Pointer[Scalar[DT], MutAnyOrigin],
+    dst: Pointer[Scalar[DT], MutAnyOrigin],
+):
+    """`dst[w, :] = mean_j b[w·SEQ + j, :]` over `NW` windows."""
+    var t = Int(global_idx.x)
+    if t >= NW * D:
+        return
+    var w = t // D
+    var d = t % D
+    var acc = Scalar[DT](0)
+    for j in range(SEQ):
+        acc += b[unsafe_offset=(w * SEQ + j) * D + d]
+    dst[unsafe_offset=t] = acc / Scalar[DT](SEQ)
+
+
+def copy_kernel[N: Int](
+    src: Pointer[Scalar[DT], MutAnyOrigin],
+    dst: Pointer[Scalar[DT], MutAnyOrigin],
+):
+    var t = Int(global_idx.x)
+    if t >= N:
+        return
+    dst[unsafe_offset=t] = src[unsafe_offset=t]
+
+
 def reg_reward_kernel[OBS_W: Int, ACT: Int, LANES: Int, CAP: Int](
     prev_obs: Pointer[Scalar[DT], MutAnyOrigin],
     next_obs: Pointer[Scalar[DT], MutAnyOrigin],
@@ -298,7 +341,16 @@ struct FBMebeOnlineAgent[
     rollouts (the base's EXPERT_ROWS path, BC off), each carrying its own
     regularity reward; the MEBE pool and `embed_rows_mixed` draw the same
     share of their rows from them. Not attached: the ring alone, as before
-    — one binary, both arms."""
+    — one binary, both arms.
+
+    `attach_prior_bc` (plan §13.10) adds BC on those rows, under the z
+    their own trajectory encodes: FB-CPR's `encode_expert`,
+    `z = project(mean_j B(s'_{t+j}))` over the next `PRIOR_SEQ`
+    successors (`PriorRows.windows`), with the CURRENT normaliser and B,
+    every step. The BC term is scaled by `mean |F·z|`
+    (`FBTrainer.bc_scaled_by_mag`), so the value term and the regularity
+    head stay raw. Without it, the prior rows train under a random z and BC
+    stays off."""
 
     comptime AGENT_TRAIN_TARGET: StaticString = "gpu"
     comptime AGENT_OBS_DIM: Int = Self.OBS
@@ -310,6 +362,9 @@ struct FBMebeOnlineAgent[
         Self.DERIVED_TAIL, Self.RING_DT,
     ]
     comptime PRIOR_FRAC: Float64 = Float64(Self.PRIOR_ROWS) / Float64(Self.BATCH)
+    # BFM-Zero's `seq_length`; one B pass encodes BATCH / PRIOR_SEQ windows
+    comptime PRIOR_SEQ: Int = 8
+    comptime _W_CHUNKS: Int = (Self.PRIOR_ROWS * Self.PRIOR_SEQ) // Self.BATCH
     comptime Head = FBRegHead[
         Self.FNET, Self.BNET, Self.ANET, Self.QNET,
         Self.OBS, Self.ACT, Self.D, Self.BATCH, "gpu",
@@ -346,10 +401,18 @@ struct FBMebeOnlineAgent[
     # expert store, the regularity reward per row here
     var _p_rew: Tensor                               # n_valid
     var _p_n: Int                                    # 0 = no prior attached
+    var _p_table: Int                                # n_valid + n_term table rows
     var _src_cr: Optional[DeviceBuffer[DType.int32]]   # NC + NR, 1 = prior row
     var _src_pick: Optional[DeviceBuffer[DType.int32]] # BATCH
     var _e_src: Optional[DeviceBuffer[DType.int32]]    # BATCH
     var last_pool_prior: Float64   # share of the last pool drawn from prior rows
+    # ── prior-row BC (`attach_prior_bc`)
+    var _p_bc: Bool
+    var _p_win: Optional[DeviceBuffer[IDX_DT]]   # n_valid * PRIOR_SEQ table rows
+    var _w_idx: Optional[DeviceBuffer[IDX_DT]]   # BATCH
+    var _w_obs: Tensor                            # BATCH * OBS
+    var _w_b: Tensor                              # BATCH * D
+    var _p_z: Tensor                              # PRIOR_ROWS * D, unprojected
 
     def __init__(out self):
         self.base = Self.Base()
@@ -377,10 +440,17 @@ struct FBMebeOnlineAgent[
         self._e_b = Tensor()
         self._p_rew = Tensor()
         self._p_n = 0
+        self._p_table = 0
         self._src_cr = None
         self._src_pick = None
         self._e_src = None
         self.last_pool_prior = 0.0
+        self._p_bc = False
+        self._p_win = None
+        self._w_idx = None
+        self._w_obs = Tensor()
+        self._w_b = Tensor()
+        self._p_z = Tensor()
 
     def __init__(out self, *, deinit move: Self):
         self.base = move.base^
@@ -408,10 +478,17 @@ struct FBMebeOnlineAgent[
         self._e_b = move._e_b^
         self._p_rew = move._p_rew^
         self._p_n = move._p_n
+        self._p_table = move._p_table
         self._src_cr = move._src_cr^
         self._src_pick = move._src_pick^
         self._e_src = move._e_src^
         self.last_pool_prior = move.last_pool_prior
+        self._p_bc = move._p_bc
+        self._p_win = move._p_win^
+        self._w_idx = move._w_idx^
+        self._w_obs = move._w_obs^
+        self._w_b = move._w_b^
+        self._p_z = move._p_z^
 
     @staticmethod
     def make[
@@ -549,6 +626,7 @@ struct FBMebeOnlineAgent[
         if not rew.dev:
             raise Error("attach_prior: rew must be uploaded to device")
         var c = self.ctx.value()
+        self._p_table = obs.n // Self.STORE_OBS
         self.base.attach_expert(obs^, act^, nxt^, n_valid)
         self._p_rew = rew^
         self._p_n = n_valid
@@ -558,6 +636,108 @@ struct FBMebeOnlineAgent[
         self._src_pick = c.enqueue_create_buffer[DType.int32](Self.BATCH)
         self._e_src = c.enqueue_create_buffer[DType.int32](Self.BATCH)
         c.synchronize()
+
+    def attach_prior_bc(
+        mut self, var win: DeviceBuffer[IDX_DT], bc_weight: Float64
+    ) raises:
+        """BC on the prior rows under their window-encoded z (struct doc).
+        `win` is `PriorRows.upload_windows(ctx, PRIOR_SEQ)`. ⚠ After
+        `attach_prior`, BEFORE capture: the step branches on it."""
+        comptime assert Self.PRIOR_ROWS > 0, (
+            "FBMebeOnlineAgent.attach_prior_bc: PRIOR_ROWS is 0 on this agent"
+        )
+        comptime assert Self.BATCH % Self.PRIOR_SEQ == 0, (
+            "attach_prior_bc: BATCH must hold whole windows"
+        )
+        comptime assert (Self.PRIOR_ROWS * Self.PRIOR_SEQ) % Self.BATCH == 0, (
+            "attach_prior_bc: PRIOR_ROWS * PRIOR_SEQ must be a multiple of BATCH"
+        )
+        if self._p_n == 0:
+            raise Error("attach_prior_bc: call attach_prior first")
+        if bc_weight <= 0.0:
+            raise Error("attach_prior_bc: bc_weight must be > 0")
+        var c = self.ctx.value()
+        self._p_win = win^
+        self._w_idx = c.enqueue_create_buffer[IDX_DT](Self.BATCH)
+        ensure_t["gpu"](self._w_obs, Self.BATCH * Self.OBS, self.ctx)
+        # the derived tail of a gathered row is never written (B reads the
+        # stored prefix); zero it once
+        self._w_obs.dev.value().enqueue_fill(Scalar[DT](0.0))
+        ensure_t["gpu"](self._w_b, Self.BATCH * Self.D, self.ctx)
+        ensure_t["gpu"](self._p_z, Self.PRIOR_ROWS * Self.D, self.ctx)
+        self.base.t.bc_weight = bc_weight
+        self.base.t.bc_scaled_by_mag = True
+        self._p_bc = True
+        c.synchronize()
+
+    def prior_bc_on(self) -> Bool:
+        return self._p_bc
+
+    def _encode_prior_z(mut self) raises:
+        """`_p_z[i] = mean_j B(norm(s'_{idx_e[i] + j}))` for the batch's prior
+        rows. Runs BEFORE `_relabel_z`: that call's `embed_sp` is the B
+        forward the step's B update reads, so nothing may run B after it."""
+        comptime NW = Self.BATCH // Self.PRIOR_SEQ
+        var c = self.ctx.value()
+        for k in range(Self._W_CHUNKS):
+            var i0 = k * NW
+            c.enqueue_function[prior_window_idx_kernel[Self.PRIOR_SEQ, Self.BATCH]](
+                mptr(self._p_win.value().unsafe_ptr()),
+                mptr(self.base.idx_e.value().unsafe_ptr()),
+                mptr(self._w_idx.value().unsafe_ptr()),
+                Int32(i0),
+                grid_dim=_blocks(Self.BATCH), block_dim=TPB,
+            )
+            c.enqueue_function[
+                gather_rows_into_kernel[Self.STORE_OBS, Self.OBS, Self.BATCH]
+            ](
+                self._prior_obs_ptr(),
+                mptr(self._w_idx.value().unsafe_ptr()),
+                mptr(self._w_obs.dev.value().unsafe_ptr()),
+                grid_dim=_blocks(Self.BATCH * Self.STORE_OBS), block_dim=TPB,
+            )
+            if self.base.obs_ema.enabled:
+                self.base.obs_ema.apply[Self.BATCH](self._w_obs)
+            call_forward["gpu", Self.BATCH](
+                self.base.t.bnet.online, TensorRefs[1, MutAnyOrigin](self._w_obs),
+                self._w_b, self.ctx,
+            )
+            c.enqueue_function[window_mean_kernel[Self.D, Self.PRIOR_SEQ, NW]](
+                mptr(self._w_b.dev.value().unsafe_ptr()),
+                mptr(self._p_z.dev.value().unsafe_ptr()).unsafe_offset(i0 * Self.D),
+                grid_dim=_blocks(NW * Self.D), block_dim=TPB,
+            )
+
+    def _write_prior_z(mut self) raises:
+        """`bz[0:PRIOR_ROWS] = project(_p_z)`, AFTER `_relabel_z` (which
+        always redraws the expert rows)."""
+        comptime N = Self.PRIOR_ROWS * Self.D
+        var c = self.ctx.value()
+        c.enqueue_function[copy_kernel[N]](
+            mptr(self._p_z.dev.value().unsafe_ptr()),
+            mptr(self.base.t.bz.dev.value().unsafe_ptr()),
+            grid_dim=_blocks(N), block_dim=TPB,
+        )
+        c.enqueue_function[project_sphere_kernel[Self.D, Self.PRIOR_ROWS]](
+            mptr(self.base.t.bz.dev.value().unsafe_ptr()),
+            Scalar[DT](sqrt(Float64(Self.D))),
+            grid_dim=_blocks(Self.PRIOR_ROWS), block_dim=TPB,
+        )
+
+    def prior_bc_mse(mut self) raises -> Float64:
+        """`mean (π(s, z) − a_teacher)²` over the LAST step's prior rows, the
+        policy output the step trained on (eager, a diagnostic: syncs)."""
+        if not self._p_bc:
+            return 0.0
+        comptime N = Self.PRIOR_ROWS * Self.ACT
+        var c = self.ctx.value()
+        self.base.t.pi.download(c)
+        self.base.t.ba.download(c)
+        var acc = 0.0
+        for i in range(N):
+            var d = Float64(self.base.t.pi.data[i]) - Float64(self.base.t.ba.data[i])
+            acc += d * d
+        return acc / Float64(N)
 
     def prior_rows(self) -> Int:
         return self._p_n
@@ -727,7 +907,8 @@ struct FBMebeOnlineAgent[
         mut b: List[Scalar[DT]],
     ) raises:
         """`embed_rows` where `from_prior[i]` makes row `i` an index into
-        the prior rows (`[0, prior_rows())`) instead of the ring. An empty
+        the prior table (`[0, prior_rows())` the transitions, the terminal
+        rows after them) instead of the ring. An empty
         `from_prior` is the ring alone. A seeded arm's reward pool is its
         data: the ring and the prior rows at the batch's share."""
         var mixed = len(from_prior) > 0
@@ -745,7 +926,7 @@ struct FBMebeOnlineAgent[
             ensure_t["gpu"](self._e_b, Self.BATCH * Self.D, self.ctx)
         var n = len(rows)
         for i in range(n):
-            var hi = self._p_n if (mixed and from_prior[i]) else self.base.size
+            var hi = self._p_table if (mixed and from_prior[i]) else self.base.size
             if rows[i] < 0 or rows[i] >= hi:
                 raise Error("embed_rows: row outside its table")
         raw = List[Scalar[DT]](length=n * Self.STORE_OBS, fill=Scalar[DT](0))
@@ -858,7 +1039,11 @@ struct FBMebeOnlineAgent[
         self.base._sample_batch()
         if self.use_reg:
             self._gather_reward()
+        if self._p_bc:
+            self._encode_prior_z()
         self.base._relabel_z()
+        if self._p_bc:
+            self._write_prior_z()
         if self.use_reg:
             _ = self.head.step(self.base.t, want_loss=False)
         else:
@@ -1118,6 +1303,10 @@ struct FBMebeOnlineAgent[
                 self.cfg.n_cand, " refreshes", self._n_refresh,
                 " pool prior", self.last_pool_prior,
             )
+        if self._p_bc:
+            var mse = self.prior_bc_mse()
+            names.append(String("prior_bc_mse")); vals.append(mse)
+            print("   [bc] step", step, " mse(π, a_teacher) on prior rows", mse)
         if Bool(logger) and len(names) > 0:
             logger.value()[].log_scalars(names, vals, step)
 

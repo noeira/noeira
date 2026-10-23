@@ -1353,6 +1353,28 @@ def axpy_by_mag_kernel[N: Int](
     y[unsafe_offset=t] = y[unsafe_offset=t] + base * m * x[unsafe_offset=t]
 
 
+def masked_rows_axpy_by_mag_kernel[BATCH: Int, W: Int](
+    y: Pointer[Scalar[DT], MutAnyOrigin],
+    x: Pointer[Scalar[DT], MutAnyOrigin],
+    mask: Pointer[Scalar[DT], MutAnyOrigin],
+    mag: Pointer[Scalar[DT], MutAnyOrigin],
+    base: Scalar[DT],
+):
+    """`y[i, :] += base·|mag[0]|·mask[i]·x[i, :]` — `masked_rows_axpy_kernel`
+    with `axpy_by_mag_kernel`'s scale: a per-row BC term made a RATIO to the
+    FB value term by multiplying IT, so the value term stays raw."""
+    var t = Int(global_idx.x)
+    if t >= BATCH * W:
+        return
+    var m = mag[unsafe_offset=0]
+    if m < Scalar[DT](0):
+        m = -m
+    var i = t // W
+    y[unsafe_offset=t] = (
+        y[unsafe_offset=t] + base * m * mask[unsafe_offset=i] * x[unsafe_offset=t]
+    )
+
+
 def diff_scale_kernel[N: Int](
     dst: Pointer[Scalar[DT], MutAnyOrigin],
     a: Pointer[Scalar[DT], MutAnyOrigin],
@@ -1515,6 +1537,26 @@ def axpy_by_mag_t[target: StaticString, N: Int](
             y.dev.value().unsafe_ptr(), x.dev.value().unsafe_ptr(),
             mag.dev.value().unsafe_ptr(), base,
             grid_dim=_blocks(N), block_dim=TPB,
+        )
+
+
+def masked_rows_axpy_by_mag_t[target: StaticString, BATCH: Int, W: Int](
+    mut y: Tensor, mut x: Tensor, mut mask: Tensor, mut mag: Tensor,
+    base: Scalar[DT], ctx: Optional[DeviceContext] = None,
+) raises:
+    """`y[i, :] += base·|mag[0]|·mask[i]·x[i, :]`, `mag` staying on device."""
+    comptime if target == "cpu":
+        var m = abs(Float64(mag.data[0]))
+        for i in range(BATCH):
+            var a = Scalar[DT](Float64(base) * m) * mask.data[i]
+            for k in range(W):
+                y.data[i * W + k] = y.data[i * W + k] + a * x.data[i * W + k]
+    else:
+        var d = ctx.value()
+        d.enqueue_function[masked_rows_axpy_by_mag_kernel[BATCH, W]](
+            y.dev.value().unsafe_ptr(), x.dev.value().unsafe_ptr(),
+            mask.dev.value().unsafe_ptr(), mag.dev.value().unsafe_ptr(), base,
+            grid_dim=_blocks(BATCH * W), block_dim=TPB,
         )
 
 

@@ -15,6 +15,9 @@
   [3] a store round trip: `load_prior_rows` over a written store gives the
       same table, actions and rewards as `prior_rows` over the arrays.
   [4] a store of another width is refused.
+  [5] `windows(4)`, the rows the prior-row BC encodes its z from: each
+      transition's next 4 successors along `nxt`, holding the episode's own
+      terminal row once reached; never a row of another episode.
 
 Run:
     pixi run mojo run -I . tests/deep_agents/test_fb_prior.mojo
@@ -238,9 +241,43 @@ def test_width_refused() raises:
     assert_true(refused, "a store of the wrong width was accepted")
 
 
+def test_windows() raises:
+    print("[5] windows: successors along nxt, held at the episode's terminal row ...")
+    var obs = List[Float32]()
+    var act = List[Float32]()
+    var r_env = List[Float32]()
+    var off = List[Int]()
+    var ln = List[Int]()
+    _arrays(obs, act, r_env, off, ln)
+    var p = prior_rows(obs, act, r_env, off, ln, W, ACT, _reg(), _price())
+    var w = p.windows(4)
+    # transitions 0..2 (episode 0, terminal 5), 3..4 (episode 2, terminal 6)
+    var want: List[Int] = [
+        1, 2, 5, 5,
+        2, 5, 5, 5,
+        5, 5, 5, 5,
+        4, 6, 6, 6,
+        6, 6, 6, 6,
+    ]
+    var bad = 0
+    for i in range(len(want)):
+        if w[i] != want[i]:
+            bad += 1
+    print("      window rows:", w[0], w[1], w[2], w[3], "|", w[12], w[13], w[14], w[15],
+          "  mismatches", bad)
+    assert_true(len(w) == len(want) and bad == 0, "windows do not follow nxt inside the episode")
+    var w1 = p.windows(1)
+    var bad1 = 0
+    for r in range(p.n_valid):
+        if w1[r] != p.nxt[r]:
+            bad1 += 1
+    assert_true(bad1 == 0, "windows(1) is not nxt")
+
+
 def main() raises:
     test_layout()
     test_reward()
     test_round_trip()
     test_width_refused()
+    test_windows()
     print("ALL PASS — fb prior rows")

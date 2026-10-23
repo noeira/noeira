@@ -45,6 +45,11 @@ and §13.5 option 1, a SEEDED arm (needs a teacher store,
                            the ring); the MEBE pool and the eval's reward pool
                            draw the same share from them. No BC term. Without
                            `--prior` the binary is the data-free arm.
+    --prior-bc 1.0         plan §13.10: BC on those rows, π(s, z) toward the
+                           teacher's action, under the z the row's own next 8
+                           states encode (FB-CPR's `encode_expert`, current B);
+                           the weight is a RATIO to mean |F·z| (the value term
+                           and Q_reg stay raw). 0 = off (§13.9's gseed arm).
 
 ## What differs from the BFM-Zero G1 driver (`examples/g1/bfm_zero_train_gpu.mojo`)
 
@@ -230,6 +235,9 @@ def main() raises:
     var w_yaw = atof(_flag(String("--w-yaw"), String(0.0)))
     var w_angxy = atof(_flag(String("--w-angxy"), String(0.0)))
     var prior_path = _flag(String("--prior"), String(""))
+    var prior_bc = atof(_flag(String("--prior-bc"), String(0.0)))
+    if prior_bc > 0.0 and prior_path.byte_length() == 0:
+        raise Error("--prior-bc needs --prior")
     if smoke:
         total = 3 * 40 * N_ENVS
         seg_steps = 40 * N_ENVS
@@ -313,7 +321,8 @@ def main() raises:
     print("  eval                =", n_task, "tasks x", reps, "lanes x", EVAL_LEN, "steps, last", eval_rungs, "segments",
           " every", eval_every)
     print("  prior               =", prior_path if prior_path.byte_length() > 0 else String("none (data-free)"),
-          "  rows/batch", PRIOR_ROWS if prior_path.byte_length() > 0 else 0, "/", BATCH)
+          "  rows/batch", PRIOR_ROWS if prior_path.byte_length() > 0 else 0, "/", BATCH,
+          "  BC", prior_bc, "(0 = off)")
     print("  seed / tag          =", seed_v, "/ '", tag, "'   run:", run.dir)
     print("=" * 70)
 
@@ -349,6 +358,7 @@ def main() raises:
         logger.set_config("w_angxy", String(w_angxy))
         logger.set_config("prior", prior_path)
         logger.set_config("prior_rows", String(PRIOR_ROWS if prior_path.byte_length() > 0 else 0))
+        logger.set_config("prior_bc", String(prior_bc))
         var logger_ptr = Pointer(to=logger).as_unsafe_any_origin()
 
         var agent = Agent.make(
@@ -375,6 +385,8 @@ def main() raises:
             var nxt = pr.upload(ctx)
             var nv = pr.n_valid
             agent.attach_prior(pr.take_obs(), pr.take_act(), nxt^, pr.take_rew(), nv)
+            if prior_bc > 0.0:
+                agent.attach_prior_bc(pr.upload_windows(ctx, Agent.PRIOR_SEQ), prior_bc)
             print("  [prior]", nv, "transitions,", pr.n_term, "episodes; mean r_reg",
                   r_mean, "  (", Float64(perf_counter_ns() - t_p) / 1e9, "s )")
         var env = EnvT(ctx)

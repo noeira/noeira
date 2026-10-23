@@ -299,6 +299,61 @@ def test_bc_mask_selects_rows() raises:
     )
 
 
+def test_bc_scaled_by_mag_leaves_value_raw() raises:
+    """[4c] `bc_scaled_by_mag` (FB-MEBE's prior-row BC): the value term stays
+    RAW and only the BC term is scaled. Two trainers from one seed on one
+    batch, BC off and BC on: their actor gradients `g_pi` must differ by
+    EXACTLY `2·w·|mean F·z|/(BATCH·ACT) · mask_i · (π − a)` and nothing
+    else. TD3+BC's form (the default) would ALSO divide the value term by
+    |F·z| and fail this on every row, masked or not."""
+    print("[4c] bc_scaled_by_mag: g_pi(BC on) - g_pi(BC off) == the masked, |F·z|-scaled BC term ...")
+    comptime W_BC = 0.7
+    comptime N_ON = BATCH // 2
+    seed(SEED + 3)
+    var s_ = _rand_tensor(BATCH * OBS, 1.0)
+    var ac = _rand_tensor(BATCH * ACT, 0.8)
+    var sn = _rand_tensor(BATCH * OBS, 1.0)
+    var sp = _rand_tensor(BATCH * OBS, 1.0)
+    var z = _z_tensor(BATCH)
+    var g = List[List[Float64]]()
+    var pi = List[Float64]()
+    var mag = 0.0
+    for variant in range(2):
+        seed(SEED)
+        var t = Trainer.make(lr=1e-3, bc_weight=0.0 if variant == 0 else W_BC)
+        t.bc_scaled_by_mag = True
+        t.fill_bc_mask(N_ON)
+        t.load_batch(s_, ac, sn, sp, z)
+        seed(SEED + 77)
+        _ = t.train_step(want_loss=False)
+        var gv = List[Float64](length=BATCH * ACT, fill=0.0)
+        for i in range(BATCH * ACT):
+            gv[i] = Float64(t.g_pi.data[i])
+        g.append(gv^)
+        if variant == 1:
+            for i in range(BATCH * ACT):
+                pi.append(Float64(t.pi.data[i]))
+            mag = abs(Float64(t.acc_mag.data[0]))
+    var worst = 0.0
+    var scale = 0.0
+    var off_rows = 0.0
+    for i in range(BATCH):
+        for k in range(ACT):
+            var j = i * ACT + k
+            var m = 1.0 if i < N_ON else 0.0
+            var want = 2.0 * W_BC * mag / Float64(BATCH * ACT) * m * (pi[j] - Float64(ac.data[j]))
+            var got = g[1][j] - g[0][j]
+            worst = max(worst, abs(got - want))
+            scale = max(scale, abs(want))
+            if i >= N_ON:
+                off_rows = max(off_rows, abs(got))
+    print("      |F·z|", mag, "  largest BC term", scale, "  worst |Δg - BC|", worst,
+          "  largest Δg on unmasked rows", off_rows)
+    assert_true(scale > 1e-4, "the BC term is ~0 in the fixture — the check is vacuous")
+    assert_true(worst < 1e-5 * max(1.0, scale), "g_pi moved by more than the BC term: the value term was rescaled")
+    assert_true(off_rows < 1e-7, "BC reached rows outside its mask")
+
+
 def test_actor_update_independent_of_want_loss() raises:
     """[5] The actor update must be IDENTICAL with and without `want_loss`.
 
@@ -479,6 +534,7 @@ def main() raises:
     test_ortho_weight_changes_the_update()
     test_bc_weight_curbs_action_saturation()
     test_bc_mask_selects_rows()
+    test_bc_scaled_by_mag_leaves_value_raw()
     test_actor_update_independent_of_want_loss()
     test_act_l2_curbs_action_saturation()
     test_act_l2_margin_leaves_the_band_alone()

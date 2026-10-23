@@ -26,6 +26,14 @@ obs `[cos θ, sin θ, θ̇]`), four lanes, tiny nets: WIRING, not learning.
       from its table, the ring's from `r_rew[idx_s]`); a pool refresh
       draws some prior rows and nothing that is in neither table; the
       mixed eval embedding returns a prior row's raw obs.
+  [7] prior-row BC (`attach_prior_bc`, plan §13.10): after a step's
+      encode / relabel / write, batch rows [0, PRIOR_ROWS) carry
+      `project(mean_j B(s'_{t+j}))` over their own window, recomputed here
+      through `embed_rows_mixed` (the eval path: its own gather, the same
+      normaliser and B); the window mean is not the first row's B alone;
+      the ring rows' z are the relabel's, untouched. After training with
+      BC, π on the prior rows sits closer to the teacher's actions than
+      after the same training without it, and `prior_bc_mse` is that mse.
 
 Run (Apple Metal or NVIDIA):
     pixi run -e apple mojo run -I . tests/deep_agents/test_fb_mebe_online_smoke.mojo
@@ -49,7 +57,7 @@ from noeira.deep_agents.fb.online_mebe import (
     RegRewardConfig,
 )
 from noeira.deep_agents.fb.density import InverseDensityConfig
-from noeira.deep_agents.fb.prior import PriorPrice, prior_rows
+from noeira.deep_agents.fb.prior import PriorPrice, PriorRows, prior_rows
 from noeira.deep_agents.training.batched_env import BatchedGpuEnv
 from noeira.deep_agents.training.driver_offpolicy import (
     OffPolicyAgentGpu,
@@ -334,17 +342,8 @@ def _dl_idx(ctx: DeviceContext, ref src: DeviceBuffer[IDX_DT], n: Int) raises ->
     return out^
 
 
-def test_prior(ctx: DeviceContext) raises:
-    print("[6] prior rows: batch split, own rewards, pool and eval draw them ...")
-    seed(SEED)
-    var a = AgentP.make(
-        ctx, _cfg(2.0, False),
-        RegRewardConfig(qd_off=2, qd_n=1, dt=DT_CTRL, w_acc=W_ACC, w_ar=W_AR, w_env=0.0),
-        mebe=True, use_reg=True, reg_coeff=20.0, lr=1e-3, lr_q=1e-3,
-        learning_starts=LEARNING_STARTS, action_scale=2.0, z_hold=20,
-        window_size=8, seed=UInt64(SEED), episode_len=EP_LEN,
-    )
-    # the store: P_EPS episodes, θ̇ = TH_MARK + store row (a unique marker)
+def _prior_store() raises -> PriorRows:
+    """P_EPS episodes, θ̇ = TH_MARK + store row (a unique marker)."""
     var n = P_EPS * P_LEN
     var obs = List[Float32](length=n * OBS, fill=0)
     var act = List[Float32](length=n * ACT, fill=0)
@@ -359,11 +358,29 @@ def test_prior(ctx: DeviceContext) raises:
         obs[r * OBS + 1] = Float32(0.8)
         obs[r * OBS + 2] = Float32(TH_MARK + Float64(r))
         act[r] = Float32(0.01 * Float64(r % 7))
-    var pr = prior_rows(
+    return prior_rows(
         obs, act, r_env, off, ln, OBS, ACT,
         RegRewardConfig(qd_off=2, qd_n=1, dt=DT_CTRL, w_acc=W_ACC, w_ar=W_AR, w_env=0.0),
         PriorPrice.none(),
     )
+
+
+def _make_p(ctx: DeviceContext) raises -> AgentP:
+    return AgentP.make(
+        ctx, _cfg(2.0, False),
+        RegRewardConfig(qd_off=2, qd_n=1, dt=DT_CTRL, w_acc=W_ACC, w_ar=W_AR, w_env=0.0),
+        mebe=True, use_reg=True, reg_coeff=20.0, lr=1e-3, lr_q=1e-3,
+        learning_starts=LEARNING_STARTS, action_scale=2.0, z_hold=20,
+        window_size=8, seed=UInt64(SEED), episode_len=EP_LEN,
+    )
+
+
+def test_prior(ctx: DeviceContext) raises:
+    print("[6] prior rows: batch split, own rewards, pool and eval draw them ...")
+    seed(SEED)
+    var a = _make_p(ctx)
+    var n = P_EPS * P_LEN
+    var pr = _prior_store()
     var p_obs = List[Scalar[DT]](length=(pr.n_valid + pr.n_term) * OBS, fill=0)
     for i in range(len(p_obs)):
         p_obs[i] = pr.obs.data[i]
@@ -456,6 +473,91 @@ def test_prior(ctx: DeviceContext) raises:
     assert_true(bad == 0, "embed_rows_mixed did not read the row's own table")
 
 
+def _prior_pi_mse(ctx: DeviceContext, mut a: AgentP) raises -> Float64:
+    var pi = _dl(ctx, a.base.t.pi, BATCH * ACT)
+    var ba = _dl(ctx, a.base.t.ba, BATCH * ACT)
+    var acc = 0.0
+    for i in range(PRIOR * ACT):
+        acc += (Float64(pi.data[i]) - Float64(ba.data[i])) ** 2
+    return acc / Float64(PRIOR * ACT)
+
+
+def test_prior_bc(ctx: DeviceContext) raises:
+    print("[7] prior-row BC: window-encoded z on the prior rows, π pulled to the teacher ...")
+    comptime SEQ = AgentP.PRIOR_SEQ
+    var mse = List[Float64]()
+    for variant in range(2):
+        seed(SEED)
+        var a = _make_p(ctx)
+        var pr = _prior_store()
+        var win = pr.windows(SEQ)
+        var win_dev = pr.upload_windows(ctx, SEQ)
+        var nxt = pr.upload(ctx)
+        var nv = pr.n_valid
+        a.attach_prior(pr.take_obs(), pr.take_act(), nxt^, pr.take_rew(), nv)
+        if variant == 1:
+            a.attach_prior_bc(win_dev^, 5.0)
+        _fill(ctx, a, 1600)
+        _ = a.train_step(1_000_000)
+        ctx.synchronize()
+        mse.append(_prior_pi_mse(ctx, a))
+        if variant == 0:
+            continue
+        var rep = a.prior_bc_mse()
+        assert_true(abs(rep - mse[1]) < 1e-9, "prior_bc_mse is not the prior rows' mse")
+
+        # one step's z path by hand: sample, encode, relabel, write
+        a.base._sample_batch()
+        a._encode_prior_z()
+        a.base._relabel_z()
+        var z_relabel = _dl(ctx, a.base.t.bz, BATCH * D)
+        a._write_prior_z()
+        ctx.synchronize()
+        var bz = _dl(ctx, a.base.t.bz, BATCH * D)
+        var ie = _dl_idx(ctx, a.base.idx_e.value(), PRIOR)
+        var rows = List[Int]()
+        var fp = List[Bool]()
+        for i in range(PRIOR):
+            for j in range(SEQ):
+                rows.append(win[ie[i] * SEQ + j])
+                fp.append(True)
+        var raw = List[Scalar[DT]]()
+        var bb = List[Scalar[DT]]()
+        a.embed_rows_mixed(rows, fp, raw, bb)
+        var worst = 0.0
+        var vs_first = 0.0
+        for i in range(PRIOR):
+            var m = List[Float64](length=D, fill=0.0)
+            var f = List[Float64](length=D, fill=0.0)
+            for j in range(SEQ):
+                for k in range(D):
+                    m[k] += Float64(bb[(i * SEQ + j) * D + k]) / Float64(SEQ)
+                    if j == 0:
+                        f[k] = Float64(bb[(i * SEQ) * D + k])
+            var nm = 0.0
+            var nf = 0.0
+            for k in range(D):
+                nm += m[k] * m[k]
+                nf += f[k] * f[k]
+            nm = sqrt(nm)
+            nf = sqrt(nf)
+            for k in range(D):
+                var want = m[k] / nm * SQRT_D
+                worst = max(worst, abs(Float64(bz.data[i * D + k]) - want))
+                vs_first = max(vs_first, abs(want - f[k] / nf * SQRT_D))
+        var ring_moved = 0
+        for i in range(PRIOR * D, BATCH * D):
+            if bz.data[i] != z_relabel.data[i]:
+                ring_moved += 1
+        print("      worst |z - project(mean_j B(window))|", worst,
+              "  (vs the first row's B alone:", vs_first, ")  ring z changed", ring_moved)
+        assert_true(worst < 1e-4, "a prior row's z is not its window encoding")
+        assert_true(vs_first > 1e-3, "the window mean equals its first row — the check is vacuous")
+        assert_true(ring_moved == 0, "writing the prior z touched the ring rows")
+    print("      mse(π, a_teacher) on the prior rows: BC off", mse[0], "  BC on", mse[1])
+    assert_true(mse[1] < 0.5 * mse[0], "BC did not pull π toward the teacher's actions")
+
+
 def main() raises:
     var ctx = DeviceContext()
     test_pool(ctx)
@@ -463,4 +565,5 @@ def main() raises:
     test_reward_column(ctx)
     test_driver(ctx)
     test_prior(ctx)
+    test_prior_bc(ctx)
     print("ALL PASS — fb mebe online smoke")
