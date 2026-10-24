@@ -4,8 +4,8 @@ GPU routes.
 At B·DIM >= `BN_TWO_PASS_MIN_ELEMS` the column sums Σ dy·x̂ and Σ dy go
 through the two-pass `enqueue_dot_bias_grad` and dx is a separate
 element-wise pass; below it the fused one-block-per-feature kernel stays.
-2,700 x 100 takes the two-pass route and exercises its edges (three chunks,
-the last partial; 100 features, not a multiple of the 32-wide column block);
+2,700 x 200 takes the two-pass route and exercises its edges (three chunks,
+the last partial; 200 features, not a multiple of the 32-wide column block);
 16 x 100 takes the fused one. Two vjps without a zero_grad between them: the
 γ / β gradients must ACCUMULATE, as the CPU path does. Compared in std units
 of the CPU value; dx (which reads the sums) is checked too.
@@ -113,8 +113,8 @@ def main() raises:
     print("BatchNorm1D train-mode backward, GPU vs CPU")
     seed(29)
     var c = DeviceContext()
-    comptime assert 2700 * 100 >= BN_TWO_PASS_MIN_ELEMS, "must take the two-pass route"
+    comptime assert 2700 * 200 >= BN_TWO_PASS_MIN_ELEMS, "must take the two-pass route"
     comptime assert 16 * 100 < BN_TWO_PASS_MIN_ELEMS, "must take the fused route"
-    run[2700, 100](c)
+    run[2700, 200](c)
     run[16, 100](c)
     print("PASS")

@@ -33,6 +33,7 @@ from noeira.nn.core.cudnn_conv import (
 )
 from std.sys import CompilationTarget, default_accelerator
 from max.gpu import thread_idx, block_idx, block_dim, global_idx
+from max.gpu.primitives import block
 from max.gpu.host import DeviceContext, DeviceBuffer
 from layout import TileTensor, row_major
 from noeira.core.tiles import Tile
@@ -63,6 +64,8 @@ from .linear import (
     BF16,
     enqueue_bias_grad,
     enqueue_channel_grad,
+    TWO_PASS_MIN_ELEMS,
+    CHANNEL_TWO_PASS_MIN_ROWS,
 )
 
 
@@ -715,6 +718,53 @@ def _dx_col2im_kernel[
                 var col_idx = _col_off[LAYOUT, IC, K](ic, kh, kw)
                 acc += rebind[Scalar[ADT]](d_col[col_idx, row]).cast[DT]()
     grad_input[b, in_pos] = acc.cast[ADT]()
+
+
+def _backward_db_kernel[
+    BATCH: Int,
+    OC: Int,
+    OH: Int,
+    OW: Int,
+    OUT_FLAT: Int,
+    ADT: DType = DT,
+    LAYOUT: Int = LAYOUT_NCHW,
+](
+    grad_output: Tile[ADT, BATCH, OUT_FLAT],
+    grad_bias: Tile[DT, OC],
+):
+    # grad_output is the ACTIVATION dtype (`ADT`); grad_bias is the FP32 master
+    # grad. Each element casts to DT before the block-sum (fp32 accumulator).
+    var oc = Int(block_idx.x)
+    var t = Int(thread_idx.x)
+    if oc >= OC:
+        return
+    var so = OH * OW
+    var n_eff = BATCH * so
+    var my_acc: Scalar[DT] = 0
+    var idx = t
+    while idx < n_eff:
+        var b = idx // so
+        var s_pos = idx % so
+        my_acc += rebind[Scalar[ADT]](
+            grad_output[b, _out_off[LAYOUT, OC, OH * OW](oc, s_pos)]
+        ).cast[DT]()
+        idx += CONV_DW_TPB
+    var total = block.sum[block_size=CONV_DW_TPB, broadcast=False](val=my_acc)
+    if t == 0:
+        grad_bias[oc] = rebind[Scalar[DT]](grad_bias[oc]) + total[0]
+
+
+@always_inline
+def _db_two_pass[LAYOUT: Int, B: Int, OC: Int, SO: Int]() -> Bool:
+    """Whether a conv bias gradient leaves `_backward_db_kernel` (one block
+    per channel) for the two-pass reductions: NCHW by rows per channel
+    (`CHANNEL_TWO_PASS_MIN_ROWS`), NHWC by elements (`TWO_PASS_MIN_ELEMS`),
+    both target-dependent. Conv2DTranspose and Conv2D's bf16 path ask it;
+    Conv2D's fp32 path takes the two passes unconditionally (f07082beb)."""
+    comptime if LAYOUT == LAYOUT_NHWC:
+        return B * SO * OC >= TWO_PASS_MIN_ELEMS
+    else:
+        return B * SO >= CHANNEL_TWO_PASS_MIN_ROWS
 
 
 def _bias_add_out_kernel[
@@ -1982,9 +2032,29 @@ struct Conv2D[
                 grid_dim=nb_acc,
                 block_dim=TPB,
             )
-            # (4) d_bias — bf16 go → FP32 master grad (fp32 accumulator),
-            # two-pass (`_enqueue_db`).
-            self._enqueue_db[B](c, grad_output.dev.value())
+            # (4) d_bias — bf16 go → FP32 master grad (fp32 accumulator):
+            # two-pass (`_enqueue_db`) past `_db_two_pass`, else one block per
+            # channel (on a 5090 the two passes lose at EfficientZero v2's
+            # 256 x 6x6 maps: 0.37x NCHW, 0.77x NHWC at OC 16).
+            comptime if _db_two_pass[Self.LAYOUT, B, Self.OC_, Self.SO]():
+                self._enqueue_db[B](c, grad_output.dev.value())
+            else:
+                c.enqueue_function[
+                    _backward_db_kernel[
+                        B,
+                        Self.OC_,
+                        Self.OH,
+                        Self.OW,
+                        Self.OUT_FLAT,
+                        Self.ADT,
+                        Self.LAYOUT,
+                    ]
+                ](
+                    grad_output.tt["gpu", B, Self.OUT_FLAT](),
+                    self.bias.grd.tt["gpu", Self.OC_](),
+                    grid_dim=Self.OC_,
+                    block_dim=CONV_DW_TPB,
+                )
             # (5) d_input (O2): d_colᵀ[COL,BS] = Wᵀ_bf[COL,OC] @ goᵀ[OC,BS]
             # reusing goᵀ from (2) — NO `_go_pack` kernel. All bf16 (grad_input
             # flows bf16); Wᵀ_bf transposes the forward's cached bf16 weight.

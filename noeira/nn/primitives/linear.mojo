@@ -239,13 +239,27 @@ def enqueue_bias_grad[ADT: DType](
     )
 
 
-comptime TWO_PASS_MIN_ELEMS = 1 << 17
+comptime TWO_PASS_MIN_ELEMS = (
+    1 << 19 if default_accelerator().is_nvidia_gpu() else 1 << 17
+)
 """Smallest [R, C] reduction a primitive sends down the two-pass helpers
 below when its old kernel was ONE launch of a block per column. Two launches
-cost ~50 us on Metal however small the tensor (the launch floor), so under
-this the single launch wins: on an M-series GPU, R·C = 2^16 ran 0.6-0.7x of
-the old kernel, 2^17 1.1x, 2^18 1.7x (`bench_param_grad_reductions.mojo`).
-Keeps DreamerV3's 16-row world-model norms on their old kernel."""
+cost a fixed floor however small the tensor, so under this the single launch
+wins (`bench_param_grad_reductions.mojo`):
+  M1 Pro (Metal, ~25 us a launch): R·C = 2^16 ran 0.6-0.7x of the old
+  kernel, 2^17 1.0-1.1x, 2^18 1.7x;
+  RTX 5090 (~3 us a launch, and a 96 MB L2 that soaks up the old kernel's
+  row-strided reads): 2^18 0.81-0.85x, 2^19 1.2-1.3x, 2^20 2.0-2.2x.
+Keeps DreamerV3's 16-row world-model norms on their old kernel on both."""
+
+comptime CHANNEL_TWO_PASS_MIN_ROWS = (
+    1 << 15 if default_accelerator().is_nvidia_gpu() else 0
+)
+"""Smallest rows-per-channel (B·HW) an NCHW per-channel reduction sends
+down `enqueue_channel_grad` / `enqueue_channel_dot_grad` instead of one block
+per channel. Metal: always (1.1x at 2,304 rows, 1.9x at 9,216). RTX 5090:
+9,216 rows 0.65-0.8x, 18,432 0.9-1.1x, 36,864 1.3-2.0x, an RGB decoder head
+(147k rows, 4 channels) 17x."""
 
 
 # gw += Σ_rows go·x (and gb += Σ_rows go): the weighted form of

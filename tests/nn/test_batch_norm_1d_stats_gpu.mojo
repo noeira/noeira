@@ -5,8 +5,8 @@ cancel.
 At B·DIM >= `BN_TWO_PASS_MIN_ELEMS` (2^18) the batch mean / variance come from
 `enqueue_col_mean_var` (a centred two-pass inside each 1024-row chunk, the
 chunks merged in order) and a separate normalize pass; below it the fused
-one-block-per-feature kernel stays. 2,700 x 100 takes the two-pass route and
-exercises its edges (three chunks, the last partial; 100 features, not a
+one-block-per-feature kernel stays. 2,700 x 200 takes the two-pass route and
+exercises its edges (three chunks, the last partial; 200 features, not a
 multiple of the 32-wide column block); 16 x 100 takes the fused one. Checked:
 the output, the running mean / variance after one forward, and a vjp after
 it (dx and dγ / dβ read the cached x̂ and inv_std), in std units of the CPU
@@ -170,10 +170,10 @@ def main() raises:
     print("BatchNorm1D train-mode forward statistics, GPU vs CPU")
     seed(31)
     var c = DeviceContext()
-    comptime assert 2700 * 100 >= BN_TWO_PASS_MIN_ELEMS, "must take the two-pass route"
+    comptime assert 2700 * 200 >= BN_TWO_PASS_MIN_ELEMS, "must take the two-pass route"
     comptime assert 16 * 100 < BN_TWO_PASS_MIN_ELEMS, "must take the fused route"
-    run[2700, 100](c, 0.0)
+    run[2700, 200](c, 0.0)
     run[16, 100](c, 0.0)
-    run[2700, 100](c, 1000.0)
+    run[2700, 200](c, 1000.0)
     run[16, 100](c, 1000.0)
     print("PASS")

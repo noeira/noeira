@@ -3,8 +3,8 @@ both of its GPU routes.
 
 At B·DIM >= `TWO_PASS_MIN_ELEMS` the column sum goes through the two-pass
 `enqueue_bias_grad`; below it the one-launch block-per-column kernel stays.
-2,500 x 100 takes the two-pass route and exercises its edges (three chunks,
-the last partial; 100 columns, not a multiple of 32); 16 x 100 takes the old
+2,700 x 200 takes the two-pass route and exercises its edges (three chunks,
+the last partial; 200 columns, not a multiple of 32); 16 x 100 takes the old
 one. The bf16 cases feed the CPU the same bf16-rounded grad_output, so the
 sums differ by order only. Two vjps without a zero_grad between them: the
 gradient must ACCUMULATE. Compared in std units of the CPU value; dx (a copy)
@@ -104,10 +104,10 @@ def main() raises:
     print("BiasAdd bias gradient, GPU vs CPU")
     seed(23)
     var c = DeviceContext()
-    comptime assert 2500 * 100 >= TWO_PASS_MIN_ELEMS, "must take the two-pass route"
+    comptime assert 2700 * 200 >= TWO_PASS_MIN_ELEMS, "must take the two-pass route"
     comptime assert 16 * 100 < TWO_PASS_MIN_ELEMS, "must take the one-launch route"
-    run[2500, 100, DT](c)
+    run[2700, 200, DT](c)
     run[16, 100, DT](c)
-    run[2500, 100, BF16](c)
+    run[2700, 200, BF16](c)
     run[16, 100, BF16](c)
     print("PASS")

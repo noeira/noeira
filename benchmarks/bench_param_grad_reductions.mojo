@@ -773,3 +773,23 @@ def main() raises:
     case_bn1d_fwd[256, 1024](c, "#8 bn1d fwd")
     case_bn1d_fwd[256, 512](c, "#8 bn1d fwd")
     case_bn1d_fwd[128, 512](c, "#8 bn1d fwd")
+    # Crossover sweeps (the 5090's crossovers sit far above Metal's).
+    # Channel route vs rows per channel (B·HW), C = 96 and 192:
+    case_conv_db[16, 96, 1152, DT, LAYOUT_NCHW](c, "sweep chan")
+    case_conv_db[16, 96, 2304, DT, LAYOUT_NCHW](c, "sweep chan")
+    case_conv_db[16, 192, 2304, DT, LAYOUT_NCHW](c, "sweep chan")
+    case_conv_db[64, 96, 576, DT, LAYOUT_NCHW](c, "sweep chan")
+    case_crms[16, 96, 1152](c, "sweep chan dot")
+    case_crms[16, 96, 2304](c, "sweep chan dot")
+    case_crms[16, 192, 2304](c, "sweep chan dot")
+    case_crms[16, 384, 576](c, "sweep chan dot")
+    # Row-major dot around 2^18-2^20 elements:
+    case_rms[512, 512](c, "sweep dot (again)")
+    case_rms[1024, 256](c, "sweep dot")
+    case_rms[512, 1024](c, "sweep dot")
+    case_rms[4096, 128](c, "sweep dot")
+    # BN1D at 2^19:
+    case_bn1d[512, 1024](c, "#8 bn1d bwd")
+    case_bn1d[1024, 512](c, "#8 bn1d bwd")
+    case_bn1d_fwd[512, 1024](c, "#8 bn1d fwd")
+    case_bn1d_fwd[1024, 512](c, "#8 bn1d fwd")

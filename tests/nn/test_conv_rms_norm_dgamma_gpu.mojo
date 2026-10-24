@@ -1,7 +1,9 @@
 """ConvRMSNorm's GPU γ gradient (two-pass) against the CPU path.
 
-dγ[c] = Σ_{b, p} go·n: per-(sample, channel) sums over the contiguous HW
-plane, then a column sum of the [B, C] row sums over chunks of 1024 rows.
+dγ[c] = Σ_{b, p} go·n. Past `CHANNEL_TWO_PASS_MIN_ROWS` rows per channel
+(target-dependent): per-(sample, channel) sums over the contiguous HW plane,
+then a column sum of the [B, C] row sums over chunks of 1024 rows; below it
+one block per channel (the 16 x 16 case, on a 5090).
 Gated at 2,500 samples (three chunks, the last partial), a tiny C = 3 and a
 C = 100 (not a multiple of the 32-wide column block), and HW = 144 (> the 128
 threads of a row sum). Two vjps without a zero_grad between them: the
@@ -21,6 +23,7 @@ from noeira.nn.core.tensor import Tensor
 from noeira.nn.core.tensor_refs import TensorRefs
 from noeira.nn.core.initializer import Deterministic
 from noeira.nn.primitives.conv_rms_norm import ConvRMSNorm
+from noeira.nn.primitives.linear import CHANNEL_TWO_PASS_MIN_ROWS
 
 comptime TOL = 1e-4
 
@@ -41,7 +44,10 @@ def _err(ref_: List[Scalar[DT]], got: List[Scalar[DT]], n: Int) -> Float64:
 
 def run[B: Int, C: Int, HW: Int](c: DeviceContext) raises:
     comptime N = B * C * HW
-    print("  B", B, "C", C, "HW", HW)
+    print(
+        "  B", B, "C", C, "HW", HW,
+        "(two-pass)" if B * HW >= CHANNEL_TWO_PASS_MIN_ROWS else "(one block per channel)",
+    )
     var cpu = ConvRMSNorm[C, HW].make["cpu", Deterministic](None)
     var gpu = ConvRMSNorm[C, HW].make["gpu", Deterministic](Optional(c))
     for k in range(C):
@@ -97,4 +103,5 @@ def main() raises:
     var c = DeviceContext()
     run[2500, 3, 144](c)
     run[2500, 100, 16](c)
+    run[16, 3, 16](c)
     print("PASS")

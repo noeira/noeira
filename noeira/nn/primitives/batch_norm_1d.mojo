@@ -21,6 +21,7 @@ Backward (training cache):
 """
 
 from std.math import sqrt
+from std.sys import default_accelerator
 from max.gpu import thread_idx, block_idx, global_idx
 from max.gpu.primitives import block
 from max.gpu.host import DeviceContext
@@ -48,14 +49,18 @@ from ..core.amp import AMPPolicy, NoAMP
 comptime BN_DEFAULT_EPS: Float64 = 1e-5
 comptime BN_DEFAULT_MOM: Float64 = 0.1
 comptime BN_TPB: Int = 128
-comptime BN_TWO_PASS_MIN_ELEMS = 1 << 18
+comptime BN_TWO_PASS_MIN_ELEMS = (
+    1 << 19 if default_accelerator().is_nvidia_gpu() else 1 << 18
+)
 """Smallest B·DIM whose train-mode forward and backward leave the fused
 one-block-per-feature kernels for coalesced chunked reductions plus an
 element-wise pass (forward: `enqueue_col_mean_var` + normalize, three
 launches; backward: a fill, `enqueue_dot_bias_grad` and dx, four). Against
-the fused kernel's one launch, on an M1 Pro: forward 512 x 2048 4.0x, 256 x
-1024 (2^18) 2.1x, 256 x 512 1.2x (19 us), 128 x 512 0.74x; backward 4.1x,
-1.4x, 0.88x, — (`bench_param_grad_reductions.mojo`)."""
+the fused kernel's one launch (`bench_param_grad_reductions.mojo`):
+  M1 Pro: forward 512 x 2048 4.0x, 256 x 1024 (2^18) 2.1x, 256 x 512 1.2x
+  (19 us), 128 x 512 0.74x; backward 4.1x, 1.4x, 0.88x.
+  RTX 5090: forward 2^20 3.3x, 2^19 1.3-2.2x, 2^18 1.35x (4 us); backward
+  3.0x, 1.4-1.5x, 0.81x."""
 
 
 # ── GPU kernels (verbatim from legacy; args MutAnyOrigin = GPU ABI) ─────

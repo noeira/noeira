@@ -1,14 +1,16 @@
 """Conv2D's bf16-flow GPU bias gradient (two-pass) against the fp32 CPU path.
 
 The bf16 path reads a bf16 grad_output and accumulates into the fp32 master
-bias grad through `_enqueue_db` (NCHW: per-(sample, channel) plane sums, then
-a chunked [B, OC] column sum; NHWC: a chunked [B·OH·OW, OC] column sum). The
+bias grad: past `_db_two_pass` (target-dependent) through `_enqueue_db` (NCHW:
+per-(sample, channel) plane sums, then a chunked [B, OC] column sum; NHWC: a
+chunked [B·OH·OW, OC] column sum), below it one block per channel. The
 CPU reference runs the fp32 module on the SAME bf16-rounded grad_output, so
 the two sums see identical inputs and differ by summation order only.
 
 Gated at 2,500 samples (three chunks, the last partial), a tiny OC = 3 and an
 OC = 100 (not a multiple of 32), and a 12x12 plane (144 > the 128 threads of a
-row sum). Two vjps without a zero_grad: the gradient must ACCUMULATE.
+row sum); the OC = 100 2x2 case is one-block on a 5090, the 16-sample NHWC one
+on both. Two vjps without a zero_grad: the gradient must ACCUMULATE.
 Compared in std units of the CPU value. Only the bias gradient is gated (the
 bf16 dx and dW carry bf16 rounding of their own).
 
@@ -24,7 +26,7 @@ from noeira.nn.constants import DT, LAYOUT_NCHW, LAYOUT_NHWC
 from noeira.nn.core.tensor import Tensor, TensorImpl
 from noeira.nn.core.tensor_refs import TensorRefs
 from noeira.nn.core.initializer import Deterministic
-from noeira.nn.primitives.conv2d import Conv2D
+from noeira.nn.primitives.conv2d import Conv2D, _db_two_pass
 
 comptime BF16 = DType.bfloat16
 comptime TOL = 1e-4
@@ -55,6 +57,7 @@ def run[
     print(
         "  B", B, "OC", OC, "plane", H, "x", H,
         "NHWC" if LAYOUT == LAYOUT_NHWC else "NCHW",
+        "(two-pass)" if _db_two_pass[LAYOUT, B, OC, H * H]() else "(one block per channel)",
     )
     var cpu = C32.make["cpu", Deterministic](None)
     var gpu = C16.make["gpu", Deterministic](Optional(c))
@@ -109,5 +112,6 @@ def main() raises:
     var c = DeviceContext()
     run[2500, 2, 3, 3, 12, LAYOUT_NCHW](c)
     run[2500, 2, 100, 1, 2, LAYOUT_NCHW](c)
-    run[2500, 2, 3, 3, 6, LAYOUT_NHWC](c)
+    run[2500, 2, 3, 3, 12, LAYOUT_NHWC](c)
+    run[16, 2, 3, 3, 4, LAYOUT_NHWC](c)
     print("PASS")

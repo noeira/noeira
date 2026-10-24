@@ -34,7 +34,7 @@ from ..core.module import Module
 from ..core.param import Param, ParamVisitor
 from ..core.initializer import Initializer
 from ..core.amp import AMPPolicy, NoAMP
-from .linear import enqueue_channel_dot_grad
+from .linear import enqueue_channel_dot_grad, CHANNEL_TWO_PASS_MIN_ROWS
 
 
 comptime CRN_EPS: Scalar[DT] = 1e-4
@@ -116,6 +116,31 @@ def _conv_rms_backward_dx_kernel[
             inv_rms * (go * gm - n * R * inv_c)
         ).cast[DT]()
         c += CRN_TPB
+
+
+def _conv_rms_backward_dgamma_kernel[
+    B: Int, C: Int, HW: Int
+](
+    grad_output: Tile[DT, B, C * HW],
+    cache_norm: Tile[DT, B, C * HW],
+    grad_gamma: Tile[DT, C],
+):
+    var c = Int(block_idx.x)  # one channel per block
+    var t = Int(thread_idx.x)
+    if c >= C:
+        return
+    var my_dg: Scalar[DT] = 0.0
+    var i = t
+    while i < B * HW:
+        var b = i // HW
+        var p = i % HW
+        var go = rebind[Scalar[DT]](grad_output[b, c * HW + p])
+        var n = rebind[Scalar[DT]](cache_norm[b, c * HW + p])
+        my_dg += go * n
+        i += CRN_TPB
+    var total_dg = block.sum[block_size=CRN_TPB, broadcast=False](val=my_dg)
+    if t == 0:
+        grad_gamma[c] = rebind[Scalar[DT]](grad_gamma[c]) + total_dg[0]
 
 
 struct ConvRMSNorm[C_: Int, HW_: Int](Module):
@@ -276,13 +301,26 @@ struct ConvRMSNorm[C_: Int, HW_: Int](Module):
                 grid_dim=B * Self.HW_,
                 block_dim=CRN_TPB,
             )
-            # dγ += Σ_{b, p} go·n per channel, two-pass: per-(b, c) sums over
-            # the contiguous HW plane, then the [B, C] column sum. Replaces
-            # one block per channel walking B·HW values.
-            enqueue_channel_dot_grad(
-                cc, grad_output.dev.value(), self.cache_norm.dev.value(),
-                self.gamma.grd.dev.value(), B, Self.C_, Self.HW_,
-                self.dg_rows, self.dg_part,
-            )
+            # dγ += Σ_{b, p} go·n per channel. Past
+            # `CHANNEL_TWO_PASS_MIN_ROWS` two passes (per-(b, c) sums over the
+            # contiguous HW plane, then the [B, C] column sum); below it one
+            # block per channel walking B·HW values, which a 5090 runs in
+            # ~4-8 us at DreamerV3's 12x12 / 6x6 maps (the two passes: ~10).
+            comptime if B * Self.HW_ >= CHANNEL_TWO_PASS_MIN_ROWS:
+                enqueue_channel_dot_grad(
+                    cc, grad_output.dev.value(), self.cache_norm.dev.value(),
+                    self.gamma.grd.dev.value(), B, Self.C_, Self.HW_,
+                    self.dg_rows, self.dg_part,
+                )
+            else:
+                cc.enqueue_function[
+                    _conv_rms_backward_dgamma_kernel[B, Self.C_, Self.HW_]
+                ](
+                    grad_output.tt["gpu", B, DIM](),
+                    self.cache_norm.tt["gpu", B, DIM](),
+                    self.gamma.grd.tt["gpu", Self.C_](),
+                    grid_dim=Self.C_,
+                    block_dim=CRN_TPB,
+                )
 
     # for_each_param / zero_grad inherit the Module reflection defaults.

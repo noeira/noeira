@@ -2,8 +2,8 @@
 
 At B·DIM >= `TWO_PASS_MIN_ELEMS` dγ = Σ go·n goes through the two-pass
 `enqueue_dot_grad` (chunks of 1024 rows, lanes along the features); below it
-the one-launch block-per-column kernel stays. 2,500 x 100 takes the two-pass
-route and exercises its edges (three chunks, the last partial; 100 features,
+the one-launch block-per-column kernel stays. 2,700 x 200 takes the two-pass
+route and exercises its edges (three chunks, the last partial; 200 features,
 not a multiple of the 32-wide column block); 16 x 100 takes the old one. Two
 vjps without a zero_grad between them: the gradient must ACCUMULATE, as the
 CPU path does. Compared in std units of the CPU value; dx is checked too.
@@ -98,8 +98,8 @@ def main() raises:
     print("RMSNorm γ gradient, GPU vs CPU")
     seed(19)
     var c = DeviceContext()
-    comptime assert 2500 * 100 >= TWO_PASS_MIN_ELEMS, "must take the two-pass route"
+    comptime assert 2700 * 200 >= TWO_PASS_MIN_ELEMS, "must take the two-pass route"
     comptime assert 16 * 100 < TWO_PASS_MIN_ELEMS, "must take the one-launch route"
-    run[2500, 100](c)
+    run[2700, 200](c)
     run[16, 100](c)
     print("PASS")

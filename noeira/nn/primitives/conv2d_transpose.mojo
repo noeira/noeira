@@ -9,9 +9,10 @@ A transposed conv is the ADJOINT of a forward conv. Concretely:
 
 so the GPU path REUSES the LAYOUT-parametrized free kernels in `conv2d.mojo`
 (`_im2col_kernel`, `_dx_col2im_kernel`, `_go_transpose_kernel`,
-`_wT_transpose_kernel`, `_accum_kernel`) with a channel/spatial substitution
-(IC↔OC, H↔OH_t), plus two tiny scatter/bias kernels; the bias gradient goes
-through `linear.mojo`'s shared reductions. The CPU path is direct nested loops (the obvious-correctness ground
+`_wT_transpose_kernel`, `_accum_kernel`, `_backward_db_kernel`) with a
+channel/spatial substitution (IC↔OC, H↔OH_t), plus two tiny scatter/bias
+kernels; past `_db_two_pass` the bias gradient goes through `linear.mojo`'s
+shared reductions. The CPU path is direct nested loops (the obvious-correctness ground
 truth the GPU is gated against).
 
 Spatial (PyTorch ConvTranspose2d convention, output_padding OP):
@@ -64,6 +65,8 @@ from .conv2d import (
     _go_transpose_kernel,
     _wT_transpose_kernel,
     _accum_kernel,
+    _backward_db_kernel,
+    _db_two_pass,
     CONV_TPB,
     CONV_DW_TPB,
 )
@@ -519,10 +522,28 @@ struct Conv2DTranspose[
                 grid_dim=nb_acc,
                 block_dim=CONV_TPB,
             )
-            # (5) d_bias[OC] += Σ grad_output over big spatial, two-pass. The
-            # old one-block-per-channel kernel gave an RGB decoder head 3
-            # blocks walking B·OH·OW values each (`Conv2D._enqueue_db`).
-            comptime if Self.LAYOUT == LAYOUT_NHWC:
+            # (5) d_bias[OC] += Σ grad_output over big spatial. One block per
+            # channel gave DreamerV3's RGB decoder head 4 blocks walking
+            # B·OH·OW values each: 766 -> 80 us two-pass on an M1 Pro, 178 ->
+            # 11 on a 5090. Small maps keep it (`_db_two_pass`).
+            comptime if not _db_two_pass[Self.LAYOUT, B, Self.OC_, Self.SBIG]():
+                c.enqueue_function[
+                    _backward_db_kernel[
+                        B,
+                        Self.OC_,
+                        Self.OHt,
+                        Self.OWt,
+                        Self.OUT_FLAT,
+                        DT,
+                        Self.LAYOUT,
+                    ]
+                ](
+                    grad_output.tt["gpu", B, Self.OUT_FLAT](),
+                    self.bias.grd.tt["gpu", Self.OC_](),
+                    grid_dim=Self.OC_,
+                    block_dim=CONV_DW_TPB,
+                )
+            elif Self.LAYOUT == LAYOUT_NHWC:
                 enqueue_bias_grad[DT](
                     c, grad_output.dev.value(), self.bias.grd.dev.value(),
                     B * Self.SBIG, Self.OC_, self.db_part,
