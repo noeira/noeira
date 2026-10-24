@@ -21,7 +21,7 @@ Backward (training cache):
 """
 
 from std.math import sqrt
-from max.gpu import thread_idx, block_idx
+from max.gpu import thread_idx, block_idx, global_idx
 from max.gpu.primitives import block
 from max.gpu.host import DeviceContext
 from layout import TileTensor, row_major
@@ -30,7 +30,8 @@ from noeira.core.tiles import RowMajor, Tile
 from noeira.nn.constants import DT
 from ..core.polyak import polyak_tensor
 from ..core.tensor import Tensor, TensorImpl
-from .linear import _cast_f2b_kernel, _cast_b2f_kernel
+from .linear import _cast_f2b_kernel, _cast_b2f_kernel, enqueue_dot_bias_grad
+from ..core.fill import fill_dev
 from ..core.tensor_refs import TensorRefs
 from ..core.module import Module
 from ..core.param import Param, ParamVisitor
@@ -42,6 +43,12 @@ from ..core.amp import AMPPolicy, NoAMP
 comptime BN_DEFAULT_EPS: Float64 = 1e-5
 comptime BN_DEFAULT_MOM: Float64 = 0.1
 comptime BN_TPB: Int = 128
+comptime BN_TWO_PASS_MIN_ELEMS = 1 << 18
+"""Smallest B·DIM whose train-mode backward takes the two-pass column sums
+(a fill, `enqueue_dot_bias_grad`'s two passes and a coalesced dx pass: four
+launches against the fused kernel's one). On an M1 Pro: 512 x 2048 4.1x
+faster, 256 x 1024 (2^18) 1.4x, 256 x 512 0.83x
+(`bench_param_grad_reductions.mojo`)."""
 
 
 # ── GPU kernels (verbatim from legacy; args MutAnyOrigin = GPU ABI) ─────
@@ -248,6 +255,44 @@ def _bn1d_backward_kernel[
         b += BN_TPB
 
 
+def _bn1d_backward_dx_kernel[
+    BATCH: Int,
+    DIM: Int,
+](
+    grad_output: Tile[DT, BATCH, DIM],
+    gamma: Tile[DT, DIM],
+    cache_xhat: Tile[DT, BATCH, DIM],
+    cache_inv_std: Tile[DT, DIM],
+    sums: Tile[DT, 2 * DIM],
+    grad_input: Tile[DT, BATCH, DIM],
+    grad_gamma: Tile[DT, DIM],
+    grad_beta: Tile[DT, DIM],
+):
+    """`_bn1d_backward_kernel`'s dx, one thread per element (coalesced), from
+    the column sums `sums[f] = Σ dy·x̂` and `sums[DIM + f] = Σ dy` the
+    two-pass helper wrote. Row 0 adds them to the γ / β grads. Σ dxhat and
+    Σ dxhat·x̂ are γ times those sums."""
+    var i = Int(global_idx.x)
+    if i >= BATCH * DIM:
+        return
+    var b = i // DIM
+    var f = i % DIM
+    var inv_n: Scalar[DT] = 1.0 / Scalar[DT](Float32(BATCH))
+    var g = rebind[Scalar[DT]](gamma[f])
+    var s_gx = rebind[Scalar[DT]](sums[f])
+    var s_g = rebind[Scalar[DT]](sums[DIM + f])
+    var m1 = g * s_g * inv_n
+    var m2 = g * s_gx * inv_n
+    var dy = rebind[Scalar[DT]](grad_output[b, f])
+    var xh = rebind[Scalar[DT]](cache_xhat[b, f])
+    grad_input[b, f] = rebind[Scalar[DT]](cache_inv_std[f]) * (
+        dy * g - m1 - xh * m2
+    )
+    if b == 0:
+        grad_gamma[f] = rebind[Scalar[DT]](grad_gamma[f]) + s_gx
+        grad_beta[f] = rebind[Scalar[DT]](grad_beta[f]) + s_g
+
+
 struct BatchNorm1D[
     DIM_: Int,
     MOMENTUM: Float64 = BN_DEFAULT_MOM,
@@ -281,6 +326,10 @@ struct BatchNorm1D[
     var cache_var: Tensor  # [DIM] (GPU: batch var, fed to the running-stat EMA)
     var cache_is_training: Bool
     var training: Bool
+    var bwd_sums: Tensor
+    """[2·DIM] Σ dy·x̂ then Σ dy: the two-pass backward's column sums."""
+    var bwd_part: Tensor
+    """Chunk partials of those sums (`enqueue_dot_bias_grad`)."""
 
     @staticmethod
     def _var_corr[B: Int]() -> Float64:
@@ -300,6 +349,8 @@ struct BatchNorm1D[
         self.cache_var = Tensor()
         self.cache_is_training = False
         self.training = True
+        self.bwd_sums = Tensor()
+        self.bwd_part = Tensor()
 
     @staticmethod
     def make[
@@ -647,17 +698,42 @@ struct BatchNorm1D[
             gin.ensure_gpu(c, B * Self.DIM_)
             comptime l2d = RowMajor[B, Self.DIM_]
             comptime ld = RowMajor[Self.DIM_]
-            c.enqueue_function[_bn1d_backward_kernel[B, Self.DIM_]](
-                grad_output.tt["gpu", B, Self.DIM_](),
-                self.gamma.val.tt["gpu", Self.DIM_](),
-                self.cache_xhat.tt["gpu", B, Self.DIM_](),
-                self.cache_inv_std.tt["gpu", Self.DIM_](),
-                gin.tt["gpu", B, Self.DIM_](),
-                self.gamma.grd.tt["gpu", Self.DIM_](),
-                self.beta.grd.tt["gpu", Self.DIM_](),
-                grid_dim=Self.DIM_,
-                block_dim=BN_TPB,
-            )
+            comptime if B * Self.DIM_ >= BN_TWO_PASS_MIN_ELEMS:
+                # One block per feature walks the rows twice, 32 different
+                # rows per warp load: 574 us at LeWM's projector (512 x
+                # 2048) on an M1 Pro, 141 us as column sums + a dx pass.
+                comptime D = Self.DIM_
+                self.bwd_sums.ensure_gpu(c, 2 * D)
+                fill_dev(self.bwd_sums.dev.value(), 2 * D, Scalar[DT](0), c)
+                var s_dy = self.bwd_sums.dev.value().create_sub_buffer[DT](D, D)
+                enqueue_dot_bias_grad[DT](
+                    c, grad_output.dev.value(), self.cache_xhat.dev.value(),
+                    self.bwd_sums.dev.value(), s_dy, B, D, self.bwd_part,
+                )
+                c.enqueue_function[_bn1d_backward_dx_kernel[B, D]](
+                    grad_output.tt["gpu", B, D](),
+                    self.gamma.val.tt["gpu", D](),
+                    self.cache_xhat.tt["gpu", B, D](),
+                    self.cache_inv_std.tt["gpu", D](),
+                    self.bwd_sums.tt["gpu", 2 * D](),
+                    gin.tt["gpu", B, D](),
+                    self.gamma.grd.tt["gpu", D](),
+                    self.beta.grd.tt["gpu", D](),
+                    grid_dim=(B * D + 255) // 256,
+                    block_dim=256,
+                )
+            else:
+                c.enqueue_function[_bn1d_backward_kernel[B, Self.DIM_]](
+                    grad_output.tt["gpu", B, Self.DIM_](),
+                    self.gamma.val.tt["gpu", Self.DIM_](),
+                    self.cache_xhat.tt["gpu", B, Self.DIM_](),
+                    self.cache_inv_std.tt["gpu", Self.DIM_](),
+                    gin.tt["gpu", B, Self.DIM_](),
+                    self.gamma.grd.tt["gpu", Self.DIM_](),
+                    self.beta.grd.tt["gpu", Self.DIM_](),
+                    grid_dim=Self.DIM_,
+                    block_dim=BN_TPB,
+                )
 
     def _vjp_eval[target: StaticString, B: Int](
         mut self,
