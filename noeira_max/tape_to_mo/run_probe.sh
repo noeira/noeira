@@ -12,4 +12,4 @@ pixi run --manifest-path "$MAIN/pixi.toml" -e "$ENV" \
     mojo build -I . -I noeira_max -I noeira_max/capi_mojo \
     noeira_max/tape_to_mo/probe_kernels.mojo -o "$OUT/probe_kernels" \
     -Xlinker -L"$LIB" -Xlinker -lmax -Xlinker -rpath -Xlinker "$LIB"
-pixi run --manifest-path "$MAIN/pixi.toml" -e "$ENV" env -u LD_PRELOAD "$OUT/probe_kernels" "$OUT"
+pixi run --manifest-path "$MAIN/pixi.toml" -e "$ENV" env -u LD_PRELOAD "$OUT/probe_kernels" "$OUT" ${PROBE_ARGS:-}

@@ -195,7 +195,7 @@ def eager_gpu(ctx: DeviceContext, net: Net, timed: Int, stage: Int = 2) raises -
 
 
 def compiled_gpu(rt: Runtime, net: Net, steps: Int, timed: Int, path: String, stage: Int = 2,
-                 chain_per_buffer: Bool = False) raises -> Run:
+                 chain_per_buffer: Bool = False, packed: Bool = False) raises -> Run:
     """The compiled step on the accelerator: every argument copied to the
     device and lent by address; batch 0 at every step. `stage` as in
     `eager_gpu` (1 outputs the gradients instead of storing an update)."""
@@ -207,7 +207,7 @@ def compiled_gpu(rt: Runtime, net: Net, steps: Int, timed: Int, path: String, st
     var yb = tape.input(net.b, net.dout, bt0[1].copy())
     var step = emit_train_step(tape, net.loss(p, xb, yb), LR, device="gpu:0",
                                update=stage == 2, grads_out=stage == 1, adam_out=stage == 3,
-                               chain_per_buffer=chain_per_buffer)
+                               chain_per_buffer=chain_per_buffer, packed=packed)
     with open(path, "w") as f:
         f.write(step.text)
     var t0 = perf_counter_ns()
@@ -224,7 +224,17 @@ def compiled_gpu(rt: Runtime, net: Net, steps: Int, timed: Int, path: String, st
         inputs.borrow_address(name, dev.address(), DType.float32, shape.copy(), on_device=True)
         on_dev.append(dev^)
 
-    for k in range(len(step.params)):
+    var total = 0
+    if packed:   # [every p, every m, every v, pow1, pow2], flat
+        var st = flat(p)
+        total = len(st)
+        for _ in range(2 * total):
+            st.append(0.0)
+        st.append(1.0)
+        st.append(1.0)
+        lend("state", HostBuffer(copy_from=Int(st.unsafe_ptr()), nbytes=4 * len(st)), [len(st)])
+        _ = st^
+    for k in range(len(step.params) if not packed else 0):
         var vals = p[k].values()
         var shp = step.shapes[step.params[k]].copy()
         var nb = 4 * len(vals)
@@ -233,8 +243,9 @@ def compiled_gpu(rt: Runtime, net: Net, steps: Int, timed: Int, path: String, st
         lend(String("v", k), HostBuffer(nb), shp)
         _ = vals^
     var one: List[Scalar[DT]] = [1.0]
-    lend("pow1", HostBuffer(copy_from=Int(one.unsafe_ptr()), nbytes=4), [1, 1])
-    lend("pow2", HostBuffer(copy_from=Int(one.unsafe_ptr()), nbytes=4), [1, 1])
+    if not packed:
+        lend("pow1", HostBuffer(copy_from=Int(one.unsafe_ptr()), nbytes=4), [1, 1])
+        lend("pow2", HostBuffer(copy_from=Int(one.unsafe_ptr()), nbytes=4), [1, 1])
     _ = one^
     # `bt0[k]` is a temporary copy: its pointer dangles once the expression
     # ends, so bind the lists first and keep them alive past the copies.
@@ -250,7 +261,12 @@ def compiled_gpu(rt: Runtime, net: Net, steps: Int, timed: Int, path: String, st
         var l = Float64(model.execute(inputs).tensor("loss").to_host().item[DType.float32]())
         if s < steps:
             r.losses.append(l)
-            if s == steps - 1:
+            if s == steps - 1 and packed:
+                var h = inputs.tensor("state").to_host()
+                var pk = h.data[Float32]()
+                for i in range(total):
+                    r.params.append(pk[unsafe_offset=i])
+            elif s == steps - 1:
                 for k in range(len(step.params)):
                     # read through the map MAX executes on: the Tensor
                     # handle `to_device` returned shows its INITIAL bytes on
@@ -402,6 +418,85 @@ def levers(dir: String) raises:
         raise Error("lever gate failed")
 
 
+def compiled_gpu_double(rt: Runtime, net: Net, steps: Int, timed: Int, path: String) raises -> Run:
+    """The compiled step with DOUBLE-BUFFERED state (`double_buffer`): two
+    device copies of every parameter, moment and power, lent to ONE map as
+    set 0 and set 1. Two compiled directions alternate (0 -> 1, then
+    1 -> 0), so a step does no host work beyond the execute."""
+    var r = Run()
+    var tape = Tape()
+    var p = net.params(tape)
+    var bt0 = batch(net, 0)
+    var xb = tape.input(net.b, net.din, bt0[0].copy())
+    var yb = tape.input(net.b, net.dout, bt0[1].copy())
+    var loss = net.loss(p, xb, yb)
+    var fwd = emit_train_step(tape, loss, LR, device="gpu:0", double_buffer=True)
+    var bwd = emit_train_step(tape, loss, LR, device="gpu:0", double_buffer=True, flip=True)
+    with open(path + ".a.mlir", "w") as f:
+        f.write(fwd.text)
+    with open(path + ".b.mlir", "w") as f:
+        f.write(bwd.text)
+    var t0 = perf_counter_ns()
+    var model_a = rt.load(path + ".a.mlir")
+    var model_b = rt.load(path + ".b.mlir")
+    r.compile_ms = Float64(perf_counter_ns() - t0) / 1e6
+
+    var staging = rt.tensor_map()
+    var inputs = rt.tensor_map()
+    var on_dev = List[Tensor]()
+
+    def lend(name: String, var buf: HostBuffer, shape: List[Int]) raises {mut staging, mut inputs, mut on_dev, rt}:
+        staging.borrow(name, buf^, DType.float32, shape.copy())
+        var dev = staging.tensor(name).to_device(rt.device())
+        inputs.borrow_address(name, dev.address(), DType.float32, shape.copy(), on_device=True)
+        on_dev.append(dev^)
+
+    for k in range(len(fwd.params)):
+        var vals = p[k].values()
+        var shp = fwd.shapes[fwd.params[k]].copy()
+        var nb = 4 * len(vals)
+        for sfx in ["_0", "_1"]:
+            lend(String("p", k, sfx), HostBuffer(copy_from=Int(vals.unsafe_ptr()), nbytes=nb), shp)
+            lend(String("m", k, sfx), HostBuffer(nb), shp)
+            lend(String("v", k, sfx), HostBuffer(nb), shp)
+        _ = vals^
+    var one: List[Scalar[DT]] = [1.0]
+    for sfx in ["_0", "_1"]:
+        lend("pow1" + sfx, HostBuffer(copy_from=Int(one.unsafe_ptr()), nbytes=4), [1, 1])
+        lend("pow2" + sfx, HostBuffer(copy_from=Int(one.unsafe_ptr()), nbytes=4), [1, 1])
+    _ = one^
+    var x0 = bt0[0].copy()
+    var y0 = bt0[1].copy()
+    lend(String("x", xb.id), HostBuffer(copy_from=Int(x0.unsafe_ptr()), nbytes=4 * len(x0)), [net.b, net.din])
+    lend(String("x", yb.id), HostBuffer(copy_from=Int(y0.unsafe_ptr()), nbytes=4 * len(y0)), [net.b, net.dout])
+    _ = x0^
+    _ = y0^
+    var best = Best()
+    for s in range(steps + timed):
+        var t1 = perf_counter_ns()
+        var l: Float64
+        if s % 2 == 0:
+            l = Float64(model_a.execute(inputs).tensor("loss").to_host().item[DType.float32]())
+        else:
+            l = Float64(model_b.execute(inputs).tensor("loss").to_host().item[DType.float32]())
+        if s < steps:
+            r.losses.append(l)
+            if s == steps - 1:
+                # step s stored into set 1 if s is even, set 0 if odd
+                var sfx = "_1" if s % 2 == 0 else "_0"
+                for k in range(len(fwd.params)):
+                    var h = inputs.tensor(String("p", k, sfx)).to_host()
+                    var pk = h.data[Float32]()
+                    for i in range(h.num_elements()):
+                        r.params.append(pk[unsafe_offset=i])
+        else:
+            best.add(Float64(perf_counter_ns() - t1) / 1e3)
+    r.step_us = best.best
+    _ = staging^
+    _ = on_dev^
+    return r^
+
+
 def pingpong_probe(dir: String) raises:
     """Why ping-pong is not faster, and what slows MAX round after round:
     the same B64 graph run back to back, alternating ping-pong (outputs fed
@@ -418,6 +513,36 @@ def pingpong_probe(dir: String) raises:
         print("  round ", rd, ": eager ", Int(eg), " | stores ", Int(cs.step_us), " | outputs+buffers ",
               Int(c3.step_us), " | state io, same inputs ", Int(cf.step_us), " | ping-pong ",
               Int(cp.step_us), " (re-lend ", Int(cp.relend_us), ")", sep="")
+
+
+def packed_probe(dir: String) raises:
+    """One store instead of 20: every parameter and moment in ONE flat
+    buffer (`packed`). Gated against the eager CPU tape, then timed
+    against eager, the 20 stores and the outputs-only graph, interleaved."""
+    var grt = Runtime(accelerator=True)
+    var ctx = DeviceContext()
+    var mlp = Net(64, 17, 64, 6, 0)
+    var e = eager(mlp, 20, 0, fixed=True)
+    var cg = compiled_gpu(grt, mlp, 20, 0, dir + "/packed_gate.mlir", packed=True)
+    var ok = compare("one packed store vs eager CPU", cg, e, 1e-4, 2.5e-3)
+    var cd = compiled_gpu_double(grt, mlp, 20, 0, dir + "/double_gate")
+    ok = compare("double-buffered stores vs eager CPU", cd, e, 1e-4, 2.5e-3) and ok
+    var shapes: List[List[Int]] = [[64, 17, 256, 6], [1024, 128, 512, 16]]
+    for i in range(len(shapes)):
+        var nt = Net(shapes[i][0], shapes[i][1], shapes[i][2], shapes[i][3], 0)
+        print("B ", nt.b, ", ", nt.din, " -> ", nt.h, " -> ", nt.h, " -> ", nt.dout, " (us per step)", sep="")
+        for rd in range(3):
+            var eg = eager_gpu(ctx, nt, 200)
+            var cs = compiled_gpu(grt, nt, 0, 200, String(dir, "/lever_", i, "_stores.mlir"))
+            var cp = compiled_gpu(grt, nt, 0, 200, String(dir, "/packed_", i, ".mlir"), packed=True)
+            var c3 = compiled_gpu(grt, nt, 0, 200, String(dir, "/stage_", i, "_3.mlir"), 3)
+            var cd = compiled_gpu_double(grt, nt, 0, 200, String(dir, "/double_", i))
+            print("  round ", rd, ": eager ", Int(eg), " | 20 stores ", Int(cs.step_us), " | 1 packed store ",
+                  Int(cp.step_us), " | outputs, no store ", Int(c3.step_us), " | double-buffered ",
+                  Int(cd.step_us), sep="")
+    print("PACKED/DOUBLE GATES OK" if ok else "PACKED/DOUBLE GATES FAILED")
+    if not ok:
+        raise Error("packed gate failed")
 
 
 def debug_gpu(rt: Runtime, net: Net, path: String, update: Bool) raises:
@@ -593,6 +718,9 @@ def main() raises:
     comptime STEPS = 20
     if len(argv()) > 2 and String(argv()[2]) == "--stages":
         stages(dir)
+        return
+    if len(argv()) > 2 and String(argv()[2]) == "--packed":
+        packed_probe(dir)
         return
     if len(argv()) > 2 and String(argv()[2]) == "--pingpong-probe":
         pingpong_probe(dir)

@@ -156,6 +156,38 @@ struct MoGraph(Movable):
         else:
             self.chain = c
 
+    def slice0(mut self, a: String, ta: String, start: Int, stop: Int, tout: String) -> String:
+        """`a[start:stop]` along axis 0."""
+        var v = self._v()
+        self._line(String(v, " = rmo.slice(", a, ") [starts = #mosh<ape[", start,
+                          "]> : !mosh.ape, stops = #mosh<ape[", stop, "]> : !mosh.ape, steps = #mosh<ape[1]> : !mosh.ape] : (",
+                          ta, ") -> ", tout))
+        return v
+
+    def reshape(mut self, a: String, ta: String, shape: List[Int]) -> String:
+        var dims = String("")
+        for i in range(len(shape)):
+            if i > 0:
+                dims += ", "
+            dims += String(shape[i])
+        var v = self._v()
+        self._line(String(v, " = rmo.reshape(", a, ") [newShape = #mosh<ape[", dims,
+                          "]> : !mosh.ape] : (", ta, ") -> ", shape_ty(shape)))
+        return v
+
+    def concat0(mut self, ids: List[String], types: List[String], tout: String) -> String:
+        var v = self._v()
+        var args = String("")
+        var tys = String("")
+        for i in range(len(ids)):
+            if i > 0:
+                args += ", "
+                tys += ", "
+            args += ids[i]
+            tys += types[i]
+        self._line(String(v, " = rmo.concat(", args, ") [axis = 0 : index] : (", tys, ") -> ", tout))
+        return v
+
     def load(mut self, buf: String, shape: List[Int]) -> String:
         var prev = self._chain_of(buf)
         var t = self._v()

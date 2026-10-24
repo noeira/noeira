@@ -368,10 +368,225 @@ def probe_inplace(rt: Runtime, dir: String) raises:
         _ = vals^
 
 
+def probe_fusion(rt: Runtime, dir: String) raises:
+    """Does a `mutable.store` stop MAX fusing the elementwise chain that
+    feeds it? A chain of K ops (`v = v * 0.999 + 0.001`, 2 ops per link)
+    on a [256, 256] tensor: OUTPUT it (from a tensor argument), or STORE it
+    back into the buffer it was loaded from. If the store blocks fusion,
+    its time grows with K by about one launch per op; the output's does not.
+    Min of 30 synced executes; interleaved over 3 rounds."""
+    print("\n[fusion under a store: K elementwise ops on [256, 256], us]")
+    print("  K | output | store | store - output")
+    var R = 256
+    var C = 256
+    var vals = rand(R * C)
+    var one: List[Scalar[DT]] = [1.0]
+    var staging = rt.tensor_map()
+    var dev = List[Tensor]()
+    var names: List[String] = ["x", "buf", "s"]
+    var shapes: List[List[Int]] = [[R, C], [R, C], [1, 1]]
+    for i in range(3):
+        if i < 2:
+            staging.borrow(names[i], HostBuffer(copy_from=Int(vals.unsafe_ptr()), nbytes=4 * R * C),
+                           DType.float32, shapes[i].copy())
+        else:
+            staging.borrow(names[i], HostBuffer(copy_from=Int(one.unsafe_ptr()), nbytes=4),
+                           DType.float32, shapes[i].copy())
+        dev.append(staging.tensor(names[i]).to_device(rt.device()))
+    var t = ty(R, C)
+    var t11 = ty(1, 1)
+    comptime ST = "!mo.tensor<[], f32, gpu:0>"
+    var ks: List[Int] = [1, 4, 16, 32]
+    for rd in range(3):
+        for K in ks:
+            var chain = String("  %ka = mo.constant <#M.dense_array<0.999> : tensor<f32>> : ", ST, "\n",
+                               "  %kb = mo.constant <#M.dense_array<0.001> : tensor<f32>> : ", ST, "\n")
+            for j in range(K):
+                chain += String("  %m", j, " = rmo.mul(%v", j, ", %ka) : (", t, ", ", ST, ") -> ", t, "\n")
+                chain += String("  %v", j + 1, " = rmo.add(%m", j, ", %kb) : (", t, ", ", ST, ") -> ", t, "\n")
+            var st_g = graph("fuse_store", ["buf", "s"], [bty(R, C), t11],
+                             String("  %v0, %c1 = rmo.mo.mutable.load(%arg0, %chain0) : (", bty(R, C),
+                                    ", !mo.chain) -> (", t, ", !mo.chain)\n", chain,
+                                    "  %c2 = rmo.mo.mutable.store(%arg0, %v", K, ", %c1) : (", bty(R, C), ", ", t,
+                                    ", !mo.chain) -> !mo.chain\n",
+                                    "  %o = rmo.add(%arg1, %kb) : (", t11, ", ", ST, ") -> ", t11, "\n"), t11)
+            # the output graph: the same chain on a tensor argument
+            var out2 = graph("fuse_out", ["x"], [t],
+                             String("  %v0 = rmo.add(%arg0, %arg0) : (", t, ", ", t, ") -> ", t, "\n", chain,
+                                    "  %o = rmo.add(%v", K, ", %kb) : (", t, ", ", ST, ") -> ", t, "\n"), t)
+            var a = run_max(rt, String(dir, "/fuse_out_", K, ".mlir"), out2, ["x"], names, shapes, dev)
+            var b = run_max(rt, String(dir, "/fuse_store_", K, ".mlir"), st_g, ["buf", "s"], names, shapes, dev)
+            print(String("  ", K, " | ", Int(a.us), " | ", Int(b.us), " | ", Int(b.us - a.us)))
+    _ = staging^
+    _ = dev^
+    _ = vals^
+    _ = one^
+
+
+def probe_side_store(rt: Runtime, dir: String) raises:
+    """Does ONE unrelated store slow EVERY kernel of a graph? A chain of K
+    matmuls on [64, 64] (K kernels MAX cannot fuse), output alone, or with a
+    side store `s = s + 1` into an unrelated [1, 1] buffer. If a store makes
+    MAX run the graph's kernels one at a time, the store arm grows by a
+    fixed cost per kernel (the ~20 us Metal command-buffer retirement).
+    Min of 30 synced executes, 3 interleaved rounds."""
+    print("\n[one side store vs none: K chained [64, 64] matmuls, us]")
+    print("  K | no store | + side store | difference | per kernel")
+    var N = 64
+    var vals = rand(N * N)
+    for i in range(N * N):
+        vals[i] = vals[i] * Scalar[DT](0.125)   # keeps the chain bounded
+    var one: List[Scalar[DT]] = [1.0]
+    var staging = rt.tensor_map()
+    var dev = List[Tensor]()
+    var names: List[String] = ["x", "w", "s"]
+    var shapes: List[List[Int]] = [[N, N], [N, N], [1, 1]]
+    for i in range(3):
+        if i < 2:
+            staging.borrow(names[i], HostBuffer(copy_from=Int(vals.unsafe_ptr()), nbytes=4 * N * N),
+                           DType.float32, shapes[i].copy())
+        else:
+            staging.borrow(names[i], HostBuffer(copy_from=Int(one.unsafe_ptr()), nbytes=4),
+                           DType.float32, shapes[i].copy())
+        dev.append(staging.tensor(names[i]).to_device(rt.device()))
+    var t = ty(N, N)
+    var t11 = ty(1, 1)
+    comptime ST = "!mo.tensor<[], f32, gpu:0>"
+    var ks: List[Int] = [4, 16, 32]
+    for rd in range(3):
+        for K in ks:
+            var chain = String("  %v0 = rmo.matmul(%arg0, %arg1) : (", t, ", ", t, ") -> ", t, "\n")
+            for j in range(1, K):
+                chain += String("  %v", j, " = rmo.matmul(%v", j - 1, ", %arg1) : (", t, ", ", t, ") -> ", t, "\n")
+            chain += String("  %o = rmo.mo.tanh(%v", K - 1, ") : (", t, ") -> ", t, "\n")
+            var plain = graph("mm_chain", ["x", "w"], [t, t], chain, t)
+            var side = graph("mm_chain_store", ["x", "w", "s"], [t, t, bty(1, 1)],
+                             String(chain,
+                                    "  %ks = mo.constant <#M.dense_array<1.0> : tensor<f32>> : ", ST, "\n",
+                                    "  %sl, %c1 = rmo.mo.mutable.load(%arg2, %chain0) : (", bty(1, 1),
+                                    ", !mo.chain) -> (", t11, ", !mo.chain)\n",
+                                    "  %sn = rmo.add(%sl, %ks) : (", t11, ", ", ST, ") -> ", t11, "\n",
+                                    "  %c2 = rmo.mo.mutable.store(%arg2, %sn, %c1) : (", bty(1, 1), ", ", t11,
+                                    ", !mo.chain) -> !mo.chain\n"), t)
+            var a = run_max(rt, String(dir, "/mmc_", K, ".mlir"), plain, ["x", "w"], names, shapes, dev)
+            var b = run_max(rt, String(dir, "/mmc_store_", K, ".mlir"), side, ["x", "w", "s"], names, shapes, dev)
+            var d = b.us - a.us
+            print(String("  ", K, " | ", Int(a.us), " | ", Int(b.us), " | ", Int(d), " | ", Int(d / Float64(K))))
+    _ = staging^
+    _ = dev^
+    _ = vals^
+    _ = one^
+
+
+def probe_shared_store(rt: Runtime, dir: String) raises:
+    """Adam's shape: a value that is BOTH stored and read by something else
+    (m_t is stored and feeds the parameter update). NB = 20 buffers
+    [64, 64]: v_i = l_i * 0.999 + 0.001, and the output sums every v_i.
+    Arms: (out) tensor arguments, every v_i also an output; (store) v_i
+    stored back AND summed; (store-only) v_i stored, the output a trivial
+    add. If a store whose value has a second consumer is not fused (a
+    materialise + copy kernel), (store) costs ~NB kernels more than (out)."""
+    print("\n[stored values with a second consumer: 20 buffers [64, 64], us]")
+    print("  out | store + sum | store only | (store + sum) - out")
+    comptime NB = 20
+    var N = 64
+    var vals = rand(N * N)
+    var one: List[Scalar[DT]] = [1.0]
+    var staging = rt.tensor_map()
+    var dev = List[Tensor]()
+    var names = List[String]()
+    var shapes = List[List[Int]]()
+    for i in range(NB):
+        names.append(String("b", i))
+        shapes.append([N, N])
+        staging.borrow(names[i], HostBuffer(copy_from=Int(vals.unsafe_ptr()), nbytes=4 * N * N),
+                       DType.float32, [N, N])
+        dev.append(staging.tensor(names[i]).to_device(rt.device()))
+    names.append("s")
+    shapes.append([1, 1])
+    staging.borrow("s", HostBuffer(copy_from=Int(one.unsafe_ptr()), nbytes=4), DType.float32, [1, 1])
+    dev.append(staging.tensor("s").to_device(rt.device()))
+    var t = ty(N, N)
+    var t1 = ty(1, N)
+    var t11 = ty(1, 1)
+    comptime ST = "!mo.tensor<[], f32, gpu:0>"
+    var consts = String("  %ka = mo.constant <#M.dense_array<0.999> : tensor<f32>> : ", ST, "\n",
+                        "  %kb = mo.constant <#M.dense_array<0.001> : tensor<f32>> : ", ST, "\n")
+    def body(store: Bool, sum: Bool, t: String, t1: String, t11: String, consts: String) -> String:
+        var b = consts
+        var chain = String("%chain0")
+        if store:   # every load first, then the math, then every store (the step's order)
+            for i in range(NB):
+                b += String("  %l", i, ", %cl", i, " = rmo.mo.mutable.load(%arg", i, ", ", chain, ") : (",
+                            bty(64, 64), ", !mo.chain) -> (", t, ", !mo.chain)\n")
+                chain = String("%cl", i)
+        for i in range(NB):
+            var src = String("%l", i) if store else String("%arg", i)
+            b += String("  %m", i, " = rmo.mul(", src, ", %ka) : (", t, ", ", ST, ") -> ", t, "\n")
+            b += String("  %v", i, " = rmo.add(%m", i, ", %kb) : (", t, ", ", ST, ") -> ", t, "\n")
+        if store:
+            for i in range(NB):
+                b += String("  %cs", i, " = rmo.mo.mutable.store(%arg", i, ", %v", i, ", ", chain, ") : (",
+                            bty(64, 64), ", ", t, ", !mo.chain) -> !mo.chain\n")
+                chain = String("%cs", i)
+        if sum:
+            b += String("  %a0 = rmo.add(%v0, %v1) : (", t, ", ", t, ") -> ", t, "\n")
+            for i in range(2, NB):
+                b += String("  %a", i - 1, " = rmo.add(%a", i - 2, ", %v", i, ") : (", t, ", ", t, ") -> ", t, "\n")
+            b += String("  %o = rmo.mo.reduce.add(%a", NB - 2, ") [axis = 0] : (", t, ") -> ", t1, "\n")
+        else:
+            b += String("  %o = rmo.add(%arg", NB, ", %kb) : (", t11, ", ", ST, ") -> ", t11, "\n")
+        return b
+    var argn = List[String]()
+    var tys_t = List[String]()
+    var tys_b = List[String]()
+    for i in range(NB):
+        argn.append(names[i])
+        tys_t.append(t)
+        tys_b.append(bty(N, N))
+    # (out): every v_i is an output too, so each is materialised once
+    var outb = body(False, True, t, t1, t11, consts)
+    var res = String("\"o\"")
+    var oids = String("%o")
+    var otys = t1
+    for i in range(NB):
+        res += String(", \"v", i, "\"")
+        oids += String(", %v", i)
+        otys += String(", ", t)
+    var out_g = graph("shared_out", argn, tys_t, outb, t1)
+    out_g = out_g.replace("result_names = [\"o\"]", String("result_names = [", res, "]"))
+    out_g = out_g.replace(String("mo.output %o : ", t1), String("mo.output ", oids, " : ", otys))
+    out_g = out_g.replace(String(") -> ", t1, " attributes"), String(") -> (", otys, ") attributes"))
+    var st_g = graph("shared_store", argn, tys_b, body(True, True, t, t1, t11, consts), t1)
+    var argn2 = argn.copy()
+    argn2.append("s")
+    var tys_b2 = tys_b.copy()
+    tys_b2.append(t11)
+    var so_g = graph("store_only", argn2, tys_b2, body(True, False, t, t1, t11, consts), t11)
+    for _ in range(3):
+        var a = run_max(rt, dir + "/shared_out.mlir", out_g, argn, names, shapes, dev)
+        var b = run_max(rt, dir + "/shared_store.mlir", st_g, argn, names, shapes, dev)
+        var c = run_max(rt, dir + "/store_only.mlir", so_g, argn2, names, shapes, dev)
+        print(String("  ", Int(a.us), " | ", Int(b.us), " | ", Int(c.us), " | ", Int(b.us - a.us)))
+    _ = staging^
+    _ = dev^
+    _ = vals^
+    _ = one^
+
+
 def main() raises:
     var dir = String(argv()[1])
     var rt = Runtime(accelerator=True)
     var ctx = DeviceContext()
+    if len(argv()) > 2 and String(argv()[2]) == "--shared-store":
+        probe_shared_store(rt, dir)
+        return
+    if len(argv()) > 2 and String(argv()[2]) == "--side-store":
+        probe_side_store(rt, dir)
+        return
+    if len(argv()) > 2 and String(argv()[2]) == "--fusion":
+        probe_fusion(rt, dir)
+        return
     probe(rt, ctx, 1024, 512, dir)
     probe(rt, ctx, 256, 256, dir)
     probe_inplace(rt, dir)

@@ -135,12 +135,25 @@ def emit_train_step(
     adam_out: Bool = False,
     chain_per_buffer: Bool = False,
     state_io: Bool = False,
+    packed: Bool = False,
+    double_buffer: Bool = False,
+    flip: Bool = False,
 ) raises -> Step:
     """`grads_out` (timing stages): also outputs each parameter's gradient
     as "g<k>". `chain_per_buffer`: one chain per buffer instead of one
     for all. `state_io`: no buffers at all — p/m/v/pow1/pow2 are TENSOR
     arguments and the updated ones are outputs "P<k>", "M<k>", "V<k>",
     "pow1n", "pow2n", which the caller passes as the next step's inputs.
+    `packed`: ONE buffer argument "state", flat, holding every parameter,
+    then every m, then every v (each row-major, in parameter order), then
+    pow1 and pow2: one load, sliced, and one store of the concatenated
+    update.
+    `double_buffer`: two sets of state buffers, p<k>_0 … pow2_0 and
+    p<k>_1 … pow2_1. The state is read from set 0 and the update stored
+    into set 1 (`flip`: the reverse), so no buffer is both read and
+    written. The caller compiles both directions and alternates them on
+    ONE input map (on Metal a map holds its own copy of what is lent to it,
+    so two maps lent the same address do not see each other's stores).
     `device`: "" = the host; "gpu:0" puts every tensor and buffer (and the
     scalar constants) on the GPU, as the Python API prints it — transpose's
     si64 permutation constant stays on the host."""
@@ -165,15 +178,46 @@ def emit_train_step(
     var mbuf = List[String]()
     var vbuf = List[String]()
     var one1: List[Int] = [1, 1]
+    var sizes = List[Int]()
+    var total = 0
     for i in range(td.n_params):
+        sizes.append(shapes[i][0] * shapes[i][1])
+        total += sizes[i]
+    var nstate = 3 * total + 2
+    var sflat: List[Int] = [nstate]
+    var state = String("")
+    if packed:
+        for i in range(td.n_params):
+            params.append(i)
+        state = g.arg("state", buffer_ty(sflat))
+    var sin = String("_1" if flip else "_0") if double_buffer else String("")
+    var sout = String("_0" if flip else "_1")
+    for i in range(td.n_params if not packed else 0):
         params.append(i)
-        pbuf.append(g.arg(String("p", i), (shape_ty(shapes[i]) if state_io else buffer_ty(shapes[i]))))
-    for i in range(td.n_params):
-        mbuf.append(g.arg(String("m", i), (shape_ty(shapes[i]) if state_io else buffer_ty(shapes[i]))))
-    for i in range(td.n_params):
-        vbuf.append(g.arg(String("v", i), (shape_ty(shapes[i]) if state_io else buffer_ty(shapes[i]))))
-    var pow1 = g.arg("pow1", (shape_ty(one1) if state_io else buffer_ty(one1)))
-    var pow2 = g.arg("pow2", (shape_ty(one1) if state_io else buffer_ty(one1)))
+        pbuf.append(g.arg(String("p", i, sin), (shape_ty(shapes[i]) if state_io else buffer_ty(shapes[i]))))
+    for i in range(td.n_params if not packed else 0):
+        mbuf.append(g.arg(String("m", i, sin), (shape_ty(shapes[i]) if state_io else buffer_ty(shapes[i]))))
+    for i in range(td.n_params if not packed else 0):
+        vbuf.append(g.arg(String("v", i, sin), (shape_ty(shapes[i]) if state_io else buffer_ty(shapes[i]))))
+    var pow1 = String("")
+    var pow2 = String("")
+    if not packed:
+        pow1 = g.arg("pow1" + sin, (shape_ty(one1) if state_io else buffer_ty(one1)))
+        pow2 = g.arg("pow2" + sin, (shape_ty(one1) if state_io else buffer_ty(one1)))
+    var pout = List[String]()
+    var mout = List[String]()
+    var vout = List[String]()
+    var pow1o = String("")
+    var pow2o = String("")
+    if double_buffer:
+        for i in range(td.n_params):
+            pout.append(g.arg(String("p", i, sout), buffer_ty(shapes[i])))
+        for i in range(td.n_params):
+            mout.append(g.arg(String("m", i, sout), buffer_ty(shapes[i])))
+        for i in range(td.n_params):
+            vout.append(g.arg(String("v", i, sout), buffer_ty(shapes[i])))
+        pow1o = g.arg("pow1" + sout, buffer_ty(one1))
+        pow2o = g.arg("pow2" + sout, buffer_ty(one1))
     for i in range(td.n_params, n):
         if td.nodes[i].op == OP_LEAF:
             inputs.append(i)
@@ -184,7 +228,27 @@ def emit_train_step(
     var vval = List[String]()
     var p1 = pow1
     var p2 = pow2
-    if state_io:
+    if packed:
+        var st = g.load(state, sflat)
+        var sty = shape_ty(sflat)
+        def piece(mut g: MoGraph, st: String, sty: String, off: Int, s: List[Int]) -> String:
+            var n = s[0] * s[1]
+            var flat: List[Int] = [n]
+            var sl = g.slice0(st, sty, off, off + n, shape_ty(flat))
+            return g.reshape(sl, shape_ty(flat), s)
+        var off = 0
+        for k in range(len(params)):
+            vals[params[k]] = piece(g, st, sty, off, shapes[params[k]])
+            off += sizes[k]
+        for k in range(len(params)):
+            mval.append(piece(g, st, sty, off, shapes[params[k]]))
+            off += sizes[k]
+        for k in range(len(params)):
+            vval.append(piece(g, st, sty, off, shapes[params[k]]))
+            off += sizes[k]
+        p1 = piece(g, st, sty, off, one1)
+        p2 = piece(g, st, sty, off + 1, one1)
+    elif state_io:
         for k in range(len(params)):
             vals[params[k]] = pbuf[k]
             mval.append(mbuf[k])
@@ -336,7 +400,31 @@ def emit_train_step(
         updates.append(bin(g, "sub", vals[pi], s, upd, s, s))
         m_new.append(mt)
         v_new.append(vt)
-    if update and not state_io:   # `update=False`: debugging only, the step stores nothing
+    if packed:
+        var ids = List[String]()
+        var tys = List[String]()
+        def flat_of(mut g: MoGraph, v: String, s: List[Int], mut ids: List[String], mut tys: List[String]):
+            var f: List[Int] = [s[0] * s[1]]
+            ids.append(g.reshape(v, shape_ty(s), f))
+            tys.append(shape_ty(f))
+        for k in range(len(params)):
+            flat_of(g, updates[k], shapes[params[k]], ids, tys)
+        for k in range(len(params)):
+            flat_of(g, m_new[k], shapes[params[k]], ids, tys)
+        for k in range(len(params)):
+            flat_of(g, v_new[k], shapes[params[k]], ids, tys)
+        flat_of(g, p1n, one1, ids, tys)
+        flat_of(g, p2n, one1, ids, tys)
+        g.store(state, g.concat0(ids, tys, shape_ty(sflat)), sflat)
+    elif double_buffer:
+        for k in range(len(params)):
+            var s = shapes[params[k]].copy()
+            g.store(pout[k], updates[k], s)
+            g.store(mout[k], m_new[k], s)
+            g.store(vout[k], v_new[k], s)
+        g.store(pow1o, p1n, one1)
+        g.store(pow2o, p2n, one1)
+    elif update and not state_io:   # `update=False`: debugging only, the step stores nothing
         for k in range(len(params)):
             var s = shapes[params[k]].copy()
             g.store(pbuf[k], updates[k], s)
