@@ -156,9 +156,10 @@ def eager(net: Net, steps: Int, timed: Int, fixed: Bool = False) raises -> Run:
     return r^
 
 
-def eager_gpu(ctx: DeviceContext, net: Net, timed: Int) raises -> Float64:
+def eager_gpu(ctx: DeviceContext, net: Net, timed: Int, stage: Int = 2) raises -> Float64:
     """Mean step time of the eager tape on the GPU: batch 0 on the device
-    (`input_device`), adopted Adam, the loss read back every step."""
+    (`input_device`), adopted Adam, the loss read back every step.
+    `stage`: 0 = forward only, 1 = + backward, 2 = + Adam."""
     var tape = Tape(ctx)
     var p = net.params(tape)
     var opt = Adam(lr=Scalar[DT](LR))
@@ -175,11 +176,14 @@ def eager_gpu(ctx: DeviceContext, net: Net, timed: Int) raises -> Float64:
     for s in range(20 + timed):
         var t0 = perf_counter_ns()
         tape.reset()
-        tape.zero_grad()
+        if stage >= 1:
+            tape.zero_grad()
         var loss = net.loss(p, tape.input_device(net.b, net.din, xd), tape.input_device(net.b, net.dout, yd))
-        loss.backward()
-        var t = tape
-        opt.step["gpu"](t, ctx)
+        if stage >= 1:
+            loss.backward()
+        if stage >= 2:
+            var t = tape
+            opt.step["gpu"](t, ctx)
         _ = loss.item()
         if s >= 20:
             best.add(Float64(perf_counter_ns() - t0) / 1e3)
@@ -188,16 +192,18 @@ def eager_gpu(ctx: DeviceContext, net: Net, timed: Int) raises -> Float64:
     return best.best
 
 
-def compiled_gpu(rt: Runtime, net: Net, steps: Int, timed: Int, path: String) raises -> Run:
+def compiled_gpu(rt: Runtime, net: Net, steps: Int, timed: Int, path: String, stage: Int = 2) raises -> Run:
     """The compiled step on the accelerator: every argument copied to the
-    device and lent by address; batch 0 at every step."""
+    device and lent by address; batch 0 at every step. `stage` as in
+    `eager_gpu` (1 outputs the gradients instead of storing an update)."""
     var r = Run()
     var tape = Tape()
     var p = net.params(tape)
     var bt0 = batch(net, 0)
     var xb = tape.input(net.b, net.din, bt0[0].copy())
     var yb = tape.input(net.b, net.dout, bt0[1].copy())
-    var step = emit_train_step(tape, net.loss(p, xb, yb), LR, device="gpu:0")
+    var step = emit_train_step(tape, net.loss(p, xb, yb), LR, device="gpu:0",
+                               update=stage == 2, grads_out=stage == 1, adam_out=stage == 3)
     with open(path, "w") as f:
         f.write(step.text)
     var t0 = perf_counter_ns()
@@ -401,11 +407,35 @@ def compare(name: String, got: Run, want: Run, ltol: Float64, ptol: Float64) -> 
     return ok
 
 
+def stages(dir: String) raises:
+    """The GPU step in stages (forward / + backward / + Adam), eager tape
+    vs MAX, interleaved over 3 rounds (synced timings on Metal drift with
+    the GPU clock). Fastest 40-step chunk of 200 per cell."""
+    var grt = Runtime(accelerator=True)
+    var ctx = DeviceContext()
+    var names: List[String] = ["forward", "+ backward", "+ Adam", "+ Adam, outputs not stores"]
+    var shapes: List[List[Int]] = [[64, 17, 256, 6], [1024, 128, 512, 16]]
+    for i in range(len(shapes)):
+        var nt = Net(shapes[i][0], shapes[i][1], shapes[i][2], shapes[i][3], 0)
+        print("B ", nt.b, ", ", nt.din, " -> ", nt.h, " -> ", nt.h, " -> ", nt.dout,
+              " (us; eager / MAX per round)", sep="")
+        for st in range(4):
+            var line = String("  ", names[st], ":")
+            for _ in range(3):
+                var eg = eager_gpu(ctx, nt, 200, min(st, 2))
+                var cg = compiled_gpu(grt, nt, 0, 200, String(dir, "/stage_", i, "_", st, ".mlir"), st)
+                line += String("  ", Int(eg), " / ", Int(cg.step_us))
+            print(line)
+
+
 def main() raises:
     var dir = String(argv()[1]) if len(argv()) > 1 else String("/tmp")
     var rt = Runtime()
     var ok = True
     comptime STEPS = 20
+    if len(argv()) > 2 and String(argv()[2]) == "--stages":
+        stages(dir)
+        return
     if len(argv()) > 2 and String(argv()[2]) == "--gpu-debug":
         var drt = Runtime(accelerator=True)
         var dnet = Net(64, 17, 64, 6, 0)

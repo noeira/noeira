@@ -131,8 +131,11 @@ def emit_train_step(
     device: String = "",
     extra: List[Int] = [],
     update: Bool = True,
+    grads_out: Bool = False,
+    adam_out: Bool = False,
 ) raises -> Step:
-    """`device`: "" = the host; "gpu:0" puts every tensor and buffer (and the
+    """`grads_out` (timing stages): also outputs each parameter's gradient
+    as "g<k>". `device`: "" = the host; "gpu:0" puts every tensor and buffer (and the
     scalar constants) on the GPU, as the Python API prints it — transpose's
     si64 permutation constant stays on the host."""
     ref td = tape.data[]
@@ -328,6 +331,17 @@ def emit_train_step(
         g.store(pow1, p1n, one1)
         g.store(pow2, p2n, one1)
     g.output(vals[L], shape_ty(shapes[L]), "loss")
+    if adam_out:   # timing: Adam computed, the new values OUTPUT instead of stored
+        for k in range(len(params)):
+            var s = shapes[params[k]].copy()
+            g.output(updates[k], shape_ty(s), String("P", k))
+            g.output(m_new[k], shape_ty(s), String("M", k))
+            g.output(v_new[k], shape_ty(s), String("V", k))
+        g.output(p1n, shape_ty(one1), "pow1n")
+        g.output(p2n, shape_ty(one1), "pow2n")
+    if grads_out:
+        for k in range(len(params)):
+            g.output(grads[params[k]], shape_ty(shapes[params[k]]), String("g", k))
     for i in range(len(extra)):   # debugging: node values, before the update
         g.output(vals[extra[i]], shape_ty(shapes[extra[i]]), String("n", extra[i]))
     var text = g.text()
