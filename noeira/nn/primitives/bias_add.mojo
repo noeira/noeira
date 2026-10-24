@@ -44,6 +44,7 @@ from ..core.param import Param, ParamVisitor
 from ..core.initializer import Initializer
 from ..core.amp import AMPPolicy, NoAMP
 from ..core.polyak import polyak_tensor
+from .linear import enqueue_bias_grad, TWO_PASS_MIN_ELEMS
 
 
 comptime BA_TPB: Int = 128
@@ -133,10 +134,13 @@ struct BiasAdd[DIM_: Int, ADT: DType = DT](Module):
     # master `bias` Param stays fp32; `b_a` is recast from `bias.val` each forward
     # (the bias is small — a per-forward cast is fine, no version-gating needed).
     var b_a: TensorImpl[Self.ADT]
+    var db_part: Tensor
+    """Chunk partials of the two-pass bias grad (`enqueue_bias_grad`)."""
 
     def __init__(out self):
         self.bias = Param["bias", False, Self.DIM_]()
         self.b_a = TensorImpl[Self.ADT]()
+        self.db_part = Tensor()
 
     @staticmethod
     def make[
@@ -261,13 +265,8 @@ struct BiasAdd[DIM_: Int, ADT: DType = DT](Module):
                     grid_dim=n_blocks,
                     block_dim=TPB,
                 )
-                # grad_bias[i] += sum_b grad_out[b, i] (one block per column).
-                c.enqueue_function[_bias_add_dbias_kernel[B, Self.DIM_]](
-                    god.tt["gpu", B, Self.DIM_](),
-                    self.bias.grd.tt["gpu", Self.DIM_](),
-                    grid_dim=Self.DIM_,
-                    block_dim=BA_TPB,
-                )
+                # grad_bias[i] += sum_b grad_out[b, i].
+                self._enqueue_db[B](c, god)
         else:
             # ── bf16-flow path (GPU-only) ──
             comptime assert (
@@ -289,8 +288,24 @@ struct BiasAdd[DIM_: Int, ADT: DType = DT](Module):
             )
             # grad_bias[i] += sum_b grad_out[b, i]: bf16 grad → fp32 master grad
             # (each element cast to DT, fp32 accumulator).
-            c.enqueue_function[_bias_add_dbias_kernel[B, Self.DIM_, Self.ADT]](
-                grad_output.tt["gpu", B, Self.DIM_](),
+            self._enqueue_db[B](c, grad_output)
+
+    def _enqueue_db[
+        GDT: DType, //, B: Int
+    ](mut self, c: DeviceContext, mut go: TensorImpl[GDT]) raises:
+        """`grad_bias += colsum(go)` for a [B, DIM] fp32 or bf16 `go`. One
+        block per column reads 32 different rows per warp load: on LeWM's
+        position embedding (512 frames x 257·192) it took 5.8 ms a call on an
+        M-series GPU, 0.66 ms through `enqueue_bias_grad`. Small tensors keep
+        the one-launch kernel (`TWO_PASS_MIN_ELEMS`)."""
+        comptime if B * Self.DIM_ >= TWO_PASS_MIN_ELEMS:
+            enqueue_bias_grad[GDT](
+                c, go.dev.value(), self.bias.grd.dev.value(), B, Self.DIM_,
+                self.db_part,
+            )
+        else:
+            c.enqueue_function[_bias_add_dbias_kernel[B, Self.DIM_, GDT]](
+                go.tt["gpu", B, Self.DIM_](),
                 self.bias.grd.tt["gpu", Self.DIM_](),
                 grid_dim=Self.DIM_,
                 block_dim=BA_TPB,
