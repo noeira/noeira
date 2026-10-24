@@ -133,14 +133,20 @@ def emit_train_step(
     update: Bool = True,
     grads_out: Bool = False,
     adam_out: Bool = False,
+    chain_per_buffer: Bool = False,
+    state_io: Bool = False,
 ) raises -> Step:
     """`grads_out` (timing stages): also outputs each parameter's gradient
-    as "g<k>". `device`: "" = the host; "gpu:0" puts every tensor and buffer (and the
+    as "g<k>". `chain_per_buffer`: one chain per buffer instead of one
+    for all. `state_io`: no buffers at all — p/m/v/pow1/pow2 are TENSOR
+    arguments and the updated ones are outputs "P<k>", "M<k>", "V<k>",
+    "pow1n", "pow2n", which the caller passes as the next step's inputs.
+    `device`: "" = the host; "gpu:0" puts every tensor and buffer (and the
     scalar constants) on the GPU, as the Python API prints it — transpose's
     si64 permutation constant stays on the host."""
     ref td = tape.data[]
     var n = td.n_live
-    var g = MoGraph("tape_step")
+    var g = MoGraph("tape_step", chain_per_buffer)
     var vals = List[String](length=n, fill=String(""))
     var pre = List[String](length=n, fill=String(""))
     var grads = List[String](length=n, fill=String(""))
@@ -158,16 +164,16 @@ def emit_train_step(
     var pbuf = List[String]()
     var mbuf = List[String]()
     var vbuf = List[String]()
+    var one1: List[Int] = [1, 1]
     for i in range(td.n_params):
         params.append(i)
-        pbuf.append(g.arg(String("p", i), buffer_ty(shapes[i])))
+        pbuf.append(g.arg(String("p", i), (shape_ty(shapes[i]) if state_io else buffer_ty(shapes[i]))))
     for i in range(td.n_params):
-        mbuf.append(g.arg(String("m", i), buffer_ty(shapes[i])))
+        mbuf.append(g.arg(String("m", i), (shape_ty(shapes[i]) if state_io else buffer_ty(shapes[i]))))
     for i in range(td.n_params):
-        vbuf.append(g.arg(String("v", i), buffer_ty(shapes[i])))
-    var one1: List[Int] = [1, 1]
-    var pow1 = g.arg("pow1", buffer_ty(one1))
-    var pow2 = g.arg("pow2", buffer_ty(one1))
+        vbuf.append(g.arg(String("v", i), (shape_ty(shapes[i]) if state_io else buffer_ty(shapes[i]))))
+    var pow1 = g.arg("pow1", (shape_ty(one1) if state_io else buffer_ty(one1)))
+    var pow2 = g.arg("pow2", (shape_ty(one1) if state_io else buffer_ty(one1)))
     for i in range(td.n_params, n):
         if td.nodes[i].op == OP_LEAF:
             inputs.append(i)
@@ -176,12 +182,20 @@ def emit_train_step(
     # every buffer is loaded before anything is stored (one chain, in order)
     var mval = List[String]()
     var vval = List[String]()
-    for k in range(len(params)):
-        vals[params[k]] = g.load(pbuf[k], shapes[params[k]])
-        mval.append(g.load(mbuf[k], shapes[params[k]]))
-        vval.append(g.load(vbuf[k], shapes[params[k]]))
-    var p1 = g.load(pow1, one1)
-    var p2 = g.load(pow2, one1)
+    var p1 = pow1
+    var p2 = pow2
+    if state_io:
+        for k in range(len(params)):
+            vals[params[k]] = pbuf[k]
+            mval.append(mbuf[k])
+            vval.append(vbuf[k])
+    else:
+        for k in range(len(params)):
+            vals[params[k]] = g.load(pbuf[k], shapes[params[k]])
+            mval.append(g.load(mbuf[k], shapes[params[k]]))
+            vval.append(g.load(vbuf[k], shapes[params[k]]))
+        p1 = g.load(pow1, one1)
+        p2 = g.load(pow2, one1)
 
     # ── forward ─────────────────────────────────────────────────────────
     for i in range(td.n_params, n):
@@ -322,7 +336,7 @@ def emit_train_step(
         updates.append(bin(g, "sub", vals[pi], s, upd, s, s))
         m_new.append(mt)
         v_new.append(vt)
-    if update:   # `update=False`: debugging only, the step stores nothing
+    if update and not state_io:   # `update=False`: debugging only, the step stores nothing
         for k in range(len(params)):
             var s = shapes[params[k]].copy()
             g.store(pbuf[k], updates[k], s)
@@ -331,7 +345,7 @@ def emit_train_step(
         g.store(pow1, p1n, one1)
         g.store(pow2, p2n, one1)
     g.output(vals[L], shape_ty(shapes[L]), "loss")
-    if adam_out:   # timing: Adam computed, the new values OUTPUT instead of stored
+    if adam_out or state_io:   # timing: Adam computed, the new values OUTPUT instead of stored
         for k in range(len(params)):
             var s = shapes[params[k]].copy()
             g.output(updates[k], shape_ty(s), String("P", k))

@@ -46,7 +46,7 @@ def fmt_f32(c: Float32) -> String:
 
 struct MoGraph(Movable):
     """SSA values are `%vN`; arguments `%argN`; one chain threaded through
-    every buffer load and store, in emission order."""
+    every buffer load and store, in emission order (or one per buffer)."""
 
     var name: String
     var arg_types: List[String]
@@ -57,8 +57,12 @@ struct MoGraph(Movable):
     var body: String
     var n: Int
     var chain: String
+    var per_buffer: Bool
+    """Each buffer gets its own chain (`mo.chain.create()` at its first
+    load), so its load and store are ordered only against each other."""
+    var buf_chains: Dict[String, String]
 
-    def __init__(out self, name: String):
+    def __init__(out self, name: String, per_buffer: Bool = False):
         self.name = name
         self.arg_types = List[String]()
         self.arg_names = List[String]()
@@ -68,6 +72,8 @@ struct MoGraph(Movable):
         self.body = String("")
         self.n = 0
         self.chain = String("%chain0")
+        self.per_buffer = per_buffer
+        self.buf_chains = Dict[String, String]()
 
     def _v(mut self) -> String:
         var s = String("%v", self.n)
@@ -133,21 +139,40 @@ struct MoGraph(Movable):
                           ty, ") -> ", tout))
         return v
 
+    def _chain_of(mut self, buf: String) -> String:
+        if not self.per_buffer:
+            return self.chain
+        var c = self.buf_chains.get(buf)
+        if c:
+            return c.value()
+        var fresh = String("%bchain", self.n)
+        self.n += 1
+        self._line(String(fresh, " = mo.chain.create()"))
+        return fresh
+
+    def _set_chain(mut self, buf: String, c: String):
+        if self.per_buffer:
+            self.buf_chains[buf] = c
+        else:
+            self.chain = c
+
     def load(mut self, buf: String, shape: List[Int]) -> String:
+        var prev = self._chain_of(buf)
         var t = self._v()
         var c = String("%chain", self.n)
         self.n += 1
-        self._line(String(t, ", ", c, " = rmo.mo.mutable.load(", buf, ", ", self.chain, ") : (",
+        self._line(String(t, ", ", c, " = rmo.mo.mutable.load(", buf, ", ", prev, ") : (",
                           buffer_ty(shape), ", !mo.chain) -> (", shape_ty(shape), ", !mo.chain)"))
-        self.chain = c
+        self._set_chain(buf, c)
         return t
 
     def store(mut self, buf: String, value: String, shape: List[Int]):
+        var prev = self._chain_of(buf)
         var c = String("%chain", self.n)
         self.n += 1
-        self._line(String(c, " = rmo.mo.mutable.store(", buf, ", ", value, ", ", self.chain, ") : (",
+        self._line(String(c, " = rmo.mo.mutable.store(", buf, ", ", value, ", ", prev, ") : (",
                           buffer_ty(shape), ", ", shape_ty(shape), ", !mo.chain) -> !mo.chain"))
-        self.chain = c
+        self._set_chain(buf, c)
 
     def output(mut self, id: String, ty: String, name: String):
         self.out_ids.append(id)
