@@ -39,7 +39,9 @@ from noeira.nn.primitives.linear import (
     enqueue_dot_bias_grad,
     enqueue_channel_grad,
     enqueue_channel_dot_grad,
+    enqueue_col_mean_var,
 )
+from std.math import sqrt
 
 comptime BF16 = DType.bfloat16
 comptime OLD_TPB = 128
@@ -282,6 +284,81 @@ def _new_bn1d_dx[
     if b == 0:
         grad_gamma[f] = rebind[Scalar[DT]](grad_gamma[f]) + sg
         grad_beta[f] = rebind[Scalar[DT]](grad_beta[f]) + sb
+
+
+def _old_bn1d_fwd[
+    BATCH: Int, DIM: Int
+](
+    input: Tile[DT, BATCH, DIM],
+    output: Tile[DT, BATCH, DIM],
+    gamma: Tile[DT, DIM],
+    beta: Tile[DT, DIM],
+    cache_mean: Tile[DT, DIM],
+    cache_var: Tile[DT, DIM],
+    cache_xhat: Tile[DT, BATCH, DIM],
+    cache_inv_std: Tile[DT, DIM],
+):
+    """batch_norm_1d `_bn1d_forward_train_kernel`: grid = DIM blocks, three
+    uncoalesced passes (Σx, Σ(x - mean)², normalize)."""
+    var f = Int(block_idx.x)
+    var t = Int(thread_idx.x)
+    if f >= DIM:
+        return
+    var inv_n: Scalar[DT] = 1.0 / Scalar[DT](Float32(BATCH))
+    var eps = Scalar[DT](1e-5)
+    var my_sum: Scalar[DT] = 0.0
+    var b = t
+    while b < BATCH:
+        my_sum += rebind[Scalar[DT]](input[b, f])
+        b += OLD_TPB
+    var mean = block.sum[block_size=OLD_TPB, broadcast=True](val=my_sum) * inv_n
+    var my_var: Scalar[DT] = 0.0
+    b = t
+    while b < BATCH:
+        var d = rebind[Scalar[DT]](input[b, f]) - mean
+        my_var += d * d
+        b += OLD_TPB
+    var var_ = block.sum[block_size=OLD_TPB, broadcast=True](val=my_var) * inv_n
+    var inv_std = 1.0 / sqrt(var_ + eps)
+    if t == 0:
+        cache_mean[f] = mean
+        cache_var[f] = var_
+        cache_inv_std[f] = inv_std
+    var g = rebind[Scalar[DT]](gamma[f])
+    var bt = rebind[Scalar[DT]](beta[f])
+    b = t
+    while b < BATCH:
+        var xh = (rebind[Scalar[DT]](input[b, f]) - mean) * inv_std
+        cache_xhat[b, f] = xh
+        output[b, f] = g * xh + bt
+        b += OLD_TPB
+
+
+def _new_bn1d_norm[
+    BATCH: Int, DIM: Int
+](
+    input: Tile[DT, BATCH, DIM],
+    output: Tile[DT, BATCH, DIM],
+    gamma: Tile[DT, DIM],
+    beta: Tile[DT, DIM],
+    cache_mean: Tile[DT, DIM],
+    cache_var: Tile[DT, DIM],
+    cache_xhat: Tile[DT, BATCH, DIM],
+    cache_inv_std: Tile[DT, DIM],
+):
+    """Candidate BN1D normalize: one thread per element (coalesced) from the
+    statistics `enqueue_col_mean_var` wrote; row 0 stores inv_std."""
+    var i = Int(global_idx.x)
+    if i >= BATCH * DIM:
+        return
+    var b = i // DIM
+    var f = i % DIM
+    var inv_std = 1.0 / sqrt(rebind[Scalar[DT]](cache_var[f]) + Scalar[DT](1e-5))
+    if b == 0:
+        cache_inv_std[f] = inv_std
+    var xh = (rebind[Scalar[DT]](input[b, f]) - rebind[Scalar[DT]](cache_mean[f])) * inv_std
+    cache_xhat[b, f] = xh
+    output[b, f] = rebind[Scalar[DT]](gamma[f]) * xh + rebind[Scalar[DT]](beta[f])
 
 
 # ── harness ─────────────────────────────────────────────────────────────────
@@ -590,6 +667,56 @@ def case_bn1d[B: Int, D: Int](c: DeviceContext, name: String) raises:
     )
 
 
+# #8 BatchNorm1D forward train statistics: old fused kernel vs
+# enqueue_col_mean_var (2 launches) + a coalesced normalize (3 launches).
+def case_bn1d_fwd[B: Int, D: Int](c: DeviceContext, name: String) raises:
+    var b = Bufs(c, B * D, D)
+    var out = Tensor.alloc_gpu(c, B * D)
+    var xhat = Tensor.alloc_gpu(c, B * D)
+    var mean = Tensor.alloc_gpu(c, D)
+    var var_ = Tensor.alloc_gpu(c, D)
+    var istd = Tensor.alloc_gpu(c, D)
+    var t_old = 1e30
+    var t_new = 1e30
+    for r in range(ROUNDS + 1):
+        c.synchronize()
+        var t0 = perf_counter_ns()
+        for _ in range(N_CALLS):
+            c.enqueue_function[_old_bn1d_fwd[B, D]](
+                b.x.tt["gpu", B, D](), out.tt["gpu", B, D](),
+                b.gamma.tt["gpu", D](), b.beta.tt["gpu", D](),
+                mean.tt["gpu", D](), var_.tt["gpu", D](),
+                xhat.tt["gpu", B, D](), istd.tt["gpu", D](),
+                grid_dim=D, block_dim=OLD_TPB,
+            )
+        c.synchronize()
+        var t1 = perf_counter_ns()
+        for _ in range(N_CALLS):
+            enqueue_col_mean_var(
+                c, b.x.dev.value(), mean.dev.value(), var_.dev.value(), B, D, b.part
+            )
+            c.enqueue_function[_new_bn1d_norm[B, D]](
+                b.x.tt["gpu", B, D](), out.tt["gpu", B, D](),
+                b.gamma.tt["gpu", D](), b.beta.tt["gpu", D](),
+                mean.tt["gpu", D](), var_.tt["gpu", D](),
+                xhat.tt["gpu", B, D](), istd.tt["gpu", D](),
+                grid_dim=(B * D + 255) // 256, block_dim=256,
+            )
+        c.synchronize()
+        var t2 = perf_counter_ns()
+        if r > 0:  # round 0 is the warm-up
+            t_old = min(t_old, Float64(t1 - t0) / 1e3 / Float64(N_CALLS))
+            t_new = min(t_new, Float64(t2 - t1) / 1e3 / Float64(N_CALLS))
+    var ratio = t_old / t_new
+    var saved = t_old - t_new
+    var verdict = "FIX" if ratio >= 1.3 and saved >= 20.0 else "not worth it"
+    print(
+        "|", name, "|", String("R=", B, " C=", D, " (stats + normalize)"), "|",
+        round(t_old, 1), "|", round(t_new, 1), "|", round(ratio, 2), "x |",
+        round(saved, 1), "|", verdict, "| err n/a |",
+    )
+
+
 def main() raises:
     seed(7)
     var c = DeviceContext()
@@ -642,3 +769,7 @@ def main() raises:
     case_bn1d[512, 2048](c, "#8 bn1d bwd")
     case_bn1d[256, 1024](c, "#8 bn1d bwd")
     case_bn1d[256, 512](c, "#8 bn1d bwd")
+    case_bn1d_fwd[512, 2048](c, "#8 bn1d fwd")
+    case_bn1d_fwd[256, 1024](c, "#8 bn1d fwd")
+    case_bn1d_fwd[256, 512](c, "#8 bn1d fwd")
+    case_bn1d_fwd[128, 512](c, "#8 bn1d fwd")

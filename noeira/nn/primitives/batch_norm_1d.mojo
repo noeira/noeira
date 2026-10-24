@@ -30,7 +30,12 @@ from noeira.core.tiles import RowMajor, Tile
 from noeira.nn.constants import DT
 from ..core.polyak import polyak_tensor
 from ..core.tensor import Tensor, TensorImpl
-from .linear import _cast_f2b_kernel, _cast_b2f_kernel, enqueue_dot_bias_grad
+from .linear import (
+    _cast_f2b_kernel,
+    _cast_b2f_kernel,
+    enqueue_dot_bias_grad,
+    enqueue_col_mean_var,
+)
 from ..core.fill import fill_dev
 from ..core.tensor_refs import TensorRefs
 from ..core.module import Module
@@ -44,11 +49,13 @@ comptime BN_DEFAULT_EPS: Float64 = 1e-5
 comptime BN_DEFAULT_MOM: Float64 = 0.1
 comptime BN_TPB: Int = 128
 comptime BN_TWO_PASS_MIN_ELEMS = 1 << 18
-"""Smallest B·DIM whose train-mode backward takes the two-pass column sums
-(a fill, `enqueue_dot_bias_grad`'s two passes and a coalesced dx pass: four
-launches against the fused kernel's one). On an M1 Pro: 512 x 2048 4.1x
-faster, 256 x 1024 (2^18) 1.4x, 256 x 512 0.83x
-(`bench_param_grad_reductions.mojo`)."""
+"""Smallest B·DIM whose train-mode forward and backward leave the fused
+one-block-per-feature kernels for coalesced chunked reductions plus an
+element-wise pass (forward: `enqueue_col_mean_var` + normalize, three
+launches; backward: a fill, `enqueue_dot_bias_grad` and dx, four). Against
+the fused kernel's one launch, on an M1 Pro: forward 512 x 2048 4.0x, 256 x
+1024 (2^18) 2.1x, 256 x 512 1.2x (19 us), 128 x 512 0.74x; backward 4.1x,
+1.4x, 0.88x, — (`bench_param_grad_reductions.mojo`)."""
 
 
 # ── GPU kernels (verbatim from legacy; args MutAnyOrigin = GPU ABI) ─────
@@ -102,6 +109,42 @@ def _bn1d_forward_train_kernel[
         cache_xhat[b, f] = xh
         output[b, f] = g * xh + bt
         b += BN_TPB
+
+
+def _bn1d_normalize_train_kernel[
+    BATCH: Int,
+    DIM: Int,
+    EPSILON: Float64,
+](
+    input: Tile[DT, BATCH, DIM],
+    output: Tile[DT, BATCH, DIM],
+    gamma: Tile[DT, DIM],
+    beta: Tile[DT, DIM],
+    cache_mean: Tile[DT, DIM],
+    cache_var: Tile[DT, DIM],
+    cache_xhat: Tile[DT, BATCH, DIM],
+    cache_inv_std: Tile[DT, DIM],
+):
+    """`_bn1d_forward_train_kernel`'s normalize, one thread per element
+    (coalesced), from the batch statistics `enqueue_col_mean_var` wrote into
+    `cache_mean` / `cache_var`. Row 0 stores `cache_inv_std`."""
+    var i = Int(global_idx.x)
+    if i >= BATCH * DIM:
+        return
+    var b = i // DIM
+    var f = i % DIM
+    var inv_std: Scalar[DT] = 1.0 / sqrt(
+        rebind[Scalar[DT]](cache_var[f]) + Scalar[DT](EPSILON)
+    )
+    if b == 0:
+        cache_inv_std[f] = inv_std
+    var xh = (
+        rebind[Scalar[DT]](input[b, f]) - rebind[Scalar[DT]](cache_mean[f])
+    ) * inv_std
+    cache_xhat[b, f] = xh
+    output[b, f] = rebind[Scalar[DT]](gamma[f]) * xh + rebind[Scalar[DT]](
+        beta[f]
+    )
 
 
 def _bn1d_update_running_kernel[
@@ -330,6 +373,8 @@ struct BatchNorm1D[
     """[2·DIM] Σ dy·x̂ then Σ dy: the two-pass backward's column sums."""
     var bwd_part: Tensor
     """Chunk partials of those sums (`enqueue_dot_bias_grad`)."""
+    var fwd_part: Tensor
+    """Chunk statistics of the train forward (`enqueue_col_mean_var`)."""
 
     @staticmethod
     def _var_corr[B: Int]() -> Float64:
@@ -351,6 +396,7 @@ struct BatchNorm1D[
         self.training = True
         self.bwd_sums = Tensor()
         self.bwd_part = Tensor()
+        self.fwd_part = Tensor()
 
     @staticmethod
     def make[
@@ -524,24 +570,54 @@ struct BatchNorm1D[
                 self.cache_inv_std.ensure_gpu(c, Self.DIM_)
                 self.cache_mean.ensure_gpu(c, Self.DIM_)
                 self.cache_var.ensure_gpu(c, Self.DIM_)
-                c.enqueue_function[
-                    _bn1d_forward_train_kernel[
-                        B,
-                        Self.DIM_,
-                        Self.EPSILON,
-                    ]
-                ](
-                    in0.tt["gpu", B, Self.DIM_](),
-                    out.tt["gpu", B, Self.DIM_](),
-                    self.gamma.val.tt["gpu", Self.DIM_](),
-                    self.beta.val.tt["gpu", Self.DIM_](),
-                    self.cache_mean.tt["gpu", Self.DIM_](),
-                    self.cache_var.tt["gpu", Self.DIM_](),
-                    self.cache_xhat.tt["gpu", B, Self.DIM_](),
-                    self.cache_inv_std.tt["gpu", Self.DIM_](),
-                    grid_dim=Self.DIM_,
-                    block_dim=BN_TPB,
-                )
+                comptime if B * Self.DIM_ >= BN_TWO_PASS_MIN_ELEMS:
+                    # One block per feature walks the rows three times (Σx,
+                    # Σ(x - mean)², normalize), 32 different rows per warp
+                    # load: 578 us at LeWM's projector (512 x 2048) on an M1
+                    # Pro, 148 us as coalesced chunk statistics + a normalize
+                    # pass. The statistics stay a centred two-pass (shifted,
+                    # per chunk, chunks merged exactly): variance as accurate
+                    # as the old kernel's, the mean more (6x at offset 1000).
+                    enqueue_col_mean_var(
+                        c, in0.dev.value(), self.cache_mean.dev.value(),
+                        self.cache_var.dev.value(), B, Self.DIM_,
+                        self.fwd_part,
+                    )
+                    c.enqueue_function[
+                        _bn1d_normalize_train_kernel[
+                            B, Self.DIM_, Self.EPSILON
+                        ]
+                    ](
+                        in0.tt["gpu", B, Self.DIM_](),
+                        out.tt["gpu", B, Self.DIM_](),
+                        self.gamma.val.tt["gpu", Self.DIM_](),
+                        self.beta.val.tt["gpu", Self.DIM_](),
+                        self.cache_mean.tt["gpu", Self.DIM_](),
+                        self.cache_var.tt["gpu", Self.DIM_](),
+                        self.cache_xhat.tt["gpu", B, Self.DIM_](),
+                        self.cache_inv_std.tt["gpu", Self.DIM_](),
+                        grid_dim=(B * Self.DIM_ + 255) // 256,
+                        block_dim=256,
+                    )
+                else:
+                    c.enqueue_function[
+                        _bn1d_forward_train_kernel[
+                            B,
+                            Self.DIM_,
+                            Self.EPSILON,
+                        ]
+                    ](
+                        in0.tt["gpu", B, Self.DIM_](),
+                        out.tt["gpu", B, Self.DIM_](),
+                        self.gamma.val.tt["gpu", Self.DIM_](),
+                        self.beta.val.tt["gpu", Self.DIM_](),
+                        self.cache_mean.tt["gpu", Self.DIM_](),
+                        self.cache_var.tt["gpu", Self.DIM_](),
+                        self.cache_xhat.tt["gpu", B, Self.DIM_](),
+                        self.cache_inv_std.tt["gpu", Self.DIM_](),
+                        grid_dim=Self.DIM_,
+                        block_dim=BN_TPB,
+                    )
                 # Running-stat EMA in a dedicated kernel (see kernel docstring).
                 c.enqueue_function[
                     _bn1d_update_running_kernel[

@@ -389,6 +389,129 @@ def enqueue_dot_bias_grad[ADT: DType](
     _enqueue_dot[ADT, True](c, go, x, gw, gb, B, OUT, part)
 
 
+# mean / biased variance of every column of [B, OUT] (a batch norm's train
+# statistics): an exact two-pass inside each chunk of rows, the chunks merged
+# in order (Chan et al.), all on data shifted by the column's first row. Same
+# chunking and block shape as the sums above.
+def _lin_mv_partial_kernel(
+    x: Pointer[Scalar[DT], MutAnyOrigin],
+    part: Pointer[Scalar[DT], MutAnyOrigin],
+    b_arg: Int64,
+    out_arg: Int64,
+):
+    """With K = x[0, j]: `part[c, j] = Σ (x - K)` over the rows of chunk c and
+    `part[CHUNKS + c, j] = Σ (x - K - m_c)²`, m_c that chunk's mean of x - K:
+    a second sweep of the same ≤ 1024 rows, so the squares are centred and
+    never cancel. The shift keeps the chunk sums at the data's spread, not
+    its offset; unshifted, the 1e6-sized sums of a column at 1000 leaked
+    their rounding into the merge (1e-5 relative variance error, 2e-7 now)."""
+    var n_out = Int(out_arg)
+    var n_b = Int(b_arg)
+    var chunks = (n_b + _GB_CHUNK - 1) // _GB_CHUNK
+    var tx = Int(thread_idx.x)
+    var ty = Int(thread_idx.y)
+    var j = Int(block_idx.x) * _GB_COLS + tx
+    var ch = Int(block_idx.y)
+    var r0 = ch * _GB_CHUNK
+    var r1 = min(r0 + _GB_CHUNK, n_b)
+    var acc = shared_tile[DT, _GB_ROWS, _GB_COLS]()
+    var k0: Scalar[DT] = 0
+    var s: Scalar[DT] = 0
+    if j < n_out:
+        k0 = x[unsafe_offset=j]
+        var r = r0 + ty
+        while r < r1:
+            s += x[unsafe_offset=r * n_out + j] - k0
+            r += _GB_ROWS
+    acc[ty, tx] = s
+    barrier()
+    var tot: Scalar[DT] = 0
+    comptime for k in range(_GB_ROWS):
+        tot += rebind[Scalar[DT]](acc[k, tx])
+    var m = tot / Scalar[DT](r1 - r0)
+    barrier()  # every lane has read `acc` before it is reused
+    var q: Scalar[DT] = 0
+    if j < n_out:
+        var r = r0 + ty
+        while r < r1:
+            var d = x[unsafe_offset=r * n_out + j] - k0 - m
+            q += d * d
+            r += _GB_ROWS
+    acc[ty, tx] = q
+    barrier()
+    if ty == 0 and j < n_out:
+        var tq: Scalar[DT] = 0
+        comptime for k in range(_GB_ROWS):
+            tq += rebind[Scalar[DT]](acc[k, tx])
+        part[unsafe_offset=ch * n_out + j] = tot
+        part[unsafe_offset=(chunks + ch) * n_out + j] = tq
+
+
+def _lin_mv_final_kernel(
+    x: Pointer[Scalar[DT], MutAnyOrigin],
+    part: Pointer[Scalar[DT], MutAnyOrigin],
+    mean: Pointer[Scalar[DT], MutAnyOrigin],
+    var_: Pointer[Scalar[DT], MutAnyOrigin],
+    b_arg: Int64,
+    out_arg: Int64,
+):
+    """With K = x[0, j] and S_c the shifted chunk sums: `mean[j] = K + μ`,
+    μ = Σ_c S_c / B, and `var_[j] = Σ_c (M2_c + n_c·(S_c/n_c - μ)²) / B`,
+    chunks in order. Overwrites (statistics, not gradients)."""
+    var n_out = Int(out_arg)
+    var n_b = Int(b_arg)
+    var chunks = (n_b + _GB_CHUNK - 1) // _GB_CHUNK
+    var j = Int(global_idx.x)
+    if j < n_out:
+        var s: Scalar[DT] = 0
+        for c in range(chunks):
+            s += part[unsafe_offset=c * n_out + j]
+        var mu = s / Scalar[DT](n_b)
+        var m2: Scalar[DT] = 0
+        for c in range(chunks):
+            var n_c = Scalar[DT](min(_GB_CHUNK, n_b - c * _GB_CHUNK))
+            var d = part[unsafe_offset=c * n_out + j] / n_c - mu
+            m2 += part[unsafe_offset=(chunks + c) * n_out + j] + n_c * d * d
+        mean[unsafe_offset=j] = x[unsafe_offset=j] + mu
+        var_[unsafe_offset=j] = m2 / Scalar[DT](n_b)
+
+
+def enqueue_col_mean_var(
+    c: DeviceContext,
+    x: DeviceBuffer[DT],
+    mean: DeviceBuffer[DT],
+    var_: DeviceBuffer[DT],
+    B: Int,
+    OUT: Int,
+    mut part: Tensor,
+) raises:
+    """`mean`, `var_` (biased, ÷B) of each column of a [B, OUT] `x`, as stable
+    as a two-pass over all rows: data shifted by its first row, centred
+    squares per chunk, chunk statistics merged with Chan's formula. Coalesced
+    (lanes along the columns), deterministic; `part` holds `2 · chunks ·
+    OUT`, sized lazily."""
+    var chunks = (B + _GB_CHUNK - 1) // _GB_CHUNK
+    part.ensure_gpu(c, 2 * chunks * OUT)
+    c.enqueue_function[_lin_mv_partial_kernel](
+        x,
+        part.dev.value(),
+        Int64(B),
+        Int64(OUT),
+        grid_dim=((OUT + _GB_COLS - 1) // _GB_COLS, chunks),
+        block_dim=(_GB_COLS, _GB_ROWS),
+    )
+    c.enqueue_function[_lin_mv_final_kernel](
+        x,
+        part.dev.value(),
+        mean,
+        var_,
+        Int64(B),
+        Int64(OUT),
+        grid_dim=(OUT + 255) // 256,
+        block_dim=256,
+    )
+
+
 # Per-channel sums over an NCHW map [B, C, HW] (conv bias, channel-norm γ):
 # a row sum over each contiguous (b, c) plane, then `enqueue_bias_grad` over
 # the [B, C] row sums.
