@@ -23,6 +23,7 @@ tests/nn/test_layer_norm_dparams_gpu.mojo
 tests/nn/test_conv2d_transpose_db_gpu.mojo
 tests/nn/test_conv2d_bf16_db_gpu.mojo
 tests/nn/test_conv_rms_norm_dgamma_gpu.mojo
+tests/nn/test_rms_norm_dgamma_gpu.mojo
 tests/nn/test_layer_norm_storage.mojo
 tests/nn/test_linear_dw_gpu.mojo
 tests/nn/test_linear_act_gpu.mojo
