@@ -17,6 +17,7 @@ GPU gate :  pixi run -e apple mojo run -I . tests/nn/test_conv2d_transpose.mojo
 """
 
 from std.math import abs
+from std.sys import has_accelerator, default_accelerator
 from max.gpu.host import DeviceContext
 from std.testing import assert_true
 
@@ -35,6 +36,14 @@ comptime P = 1
 comptime H = 4
 comptime W = 4
 comptime B = 2
+
+comptime TOL = 1e-4
+"""CPU↔GPU max |Δ| for the bias gradient (a reduction, fp32 on every GPU)."""
+comptime TOL_GEMM = 5e-3 if default_accelerator().is_nvidia_gpu() else 1e-4
+"""CPU↔GPU max |Δ| for out, grad_x and grad_w, which come out of GEMMs. On
+NVIDIA those run in TF32 (operands rounded to a 10-bit mantissa): an RTX 5090
+measured out 1.4e-4, grad_x 4.3e-4, grad_w 9.0e-4 at these shapes. A wrong
+index or a missing term shows up at 1e-1 and above."""
 
 
 def _fill_x(mut x: Tensor, n: Int):
@@ -184,9 +193,8 @@ def _run_gpu_parity[LAYOUT: Int](name: String, ctx: DeviceContext) raises:
         "  [", name, "] CPU↔GPU max|Δ|: out", d_y, " grad_x", d_gx,
         " grad_w", d_gw, " grad_b", d_gb,
     )
-    var tol = 1e-4
     assert_true(
-        d_y < tol and d_gx < tol and d_gw < tol and d_gb < tol,
+        d_y < TOL_GEMM and d_gx < TOL_GEMM and d_gw < TOL_GEMM and d_gb < TOL,
         "Conv2DTranspose CPU↔GPU parity",
     )
 
@@ -200,12 +208,16 @@ def main() raises:
     print("CPU GATES PASSED")
 
     # GPU parity — requires a device (run with `-e apple` / `-e nvidia`).
-    try:
+    # ⚠ This used to wrap the parity checks in a try/except that printed
+    # "SKIPPED (no device context)" for ANY error: on an RTX 5090 the checks
+    # failed (TF32 GEMMs against a 1e-4 tolerance) and the test still exited
+    # 0. Only a missing accelerator skips now; a failed check fails the test.
+    comptime if has_accelerator():
         var ctx = DeviceContext()
         _run_gpu_parity[LAYOUT_NCHW]("NCHW", ctx)
         _run_gpu_parity[LAYOUT_NHWC]("NHWC", ctx)
         print("GPU PARITY GATES PASSED")
-    except e:
-        print("GPU parity SKIPPED (no device context):", e)
+    else:
+        print("GPU parity SKIPPED (no accelerator)")
 
     print("CONV2DTRANSPOSE GATES PASSED")

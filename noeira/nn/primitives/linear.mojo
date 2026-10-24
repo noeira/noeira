@@ -29,6 +29,7 @@ from std.sys import default_accelerator
 from std.sys import CompilationTarget
 from max.gpu import global_idx, thread_idx, block_idx
 from max.gpu.sync import barrier
+from max.gpu.primitives import block
 from max.gpu.memory import AddressSpace
 from max.gpu.host import DeviceContext, DeviceBuffer
 from layout import TileTensor, row_major
@@ -236,6 +237,382 @@ def enqueue_bias_grad[ADT: DType](
         grid_dim=(OUT + 255) // 256,
         block_dim=256,
     )
+
+
+comptime TWO_PASS_MIN_ELEMS = (
+    1 << 19 if default_accelerator().is_nvidia_gpu() else 1 << 17
+)
+"""Smallest [R, C] reduction a primitive sends down the two-pass helpers
+below when its old kernel was ONE launch of a block per column. Two launches
+cost a fixed floor however small the tensor, so under this the single launch
+wins (`bench_param_grad_reductions.mojo`):
+  M1 Pro (Metal, ~25 us a launch): R·C = 2^16 ran 0.6-0.7x of the old
+  kernel, 2^17 1.0-1.1x, 2^18 1.7x;
+  RTX 5090 (~3 us a launch, and a 96 MB L2 that soaks up the old kernel's
+  row-strided reads): 2^18 0.81-0.85x, 2^19 1.2-1.3x, 2^20 2.0-2.2x.
+Keeps DreamerV3's 16-row world-model norms on their old kernel on both."""
+
+comptime CHANNEL_TWO_PASS_MIN_ROWS = (
+    1 << 15 if default_accelerator().is_nvidia_gpu() else 0
+)
+"""Smallest rows-per-channel (B·HW) an NCHW per-channel reduction sends
+down `enqueue_channel_grad` / `enqueue_channel_dot_grad` instead of one block
+per channel. Metal: always (1.1x at 2,304 rows, 1.9x at 9,216). RTX 5090:
+9,216 rows 0.65-0.8x, 18,432 0.9-1.1x, 36,864 1.3-2.0x, an RGB decoder head
+(147k rows, 4 channels) 17x."""
+
+
+# gw += Σ_rows go·x (and gb += Σ_rows go): the weighted form of
+# `enqueue_bias_grad`, for a norm's γ (and β) gradient. Same two passes, same
+# chunking, same fixed order.
+def _lin_dot_partial_kernel[
+    ADT: DType = DT, WITH_SUM: Bool = False
+](
+    go: Pointer[Scalar[ADT], MutAnyOrigin],
+    x: Pointer[Scalar[DT], MutAnyOrigin],
+    part: Pointer[Scalar[DT], MutAnyOrigin],
+    b_arg: Int64,
+    out_arg: Int64,
+):
+    """`part[c, j] = Σ go·x` over the rows of chunk c and, with `WITH_SUM`,
+    `part[CHUNKS + c, j] = Σ go`. Block (`_GB_COLS`, `_GB_ROWS`) as in
+    `_lin_gb_partial_kernel`."""
+    var n_out = Int(out_arg)
+    var n_b = Int(b_arg)
+    var chunks = (n_b + _GB_CHUNK - 1) // _GB_CHUNK
+    var tx = Int(thread_idx.x)
+    var ty = Int(thread_idx.y)
+    var j = Int(block_idx.x) * _GB_COLS + tx
+    var ch = Int(block_idx.y)
+    var r0 = ch * _GB_CHUNK
+    var r1 = min(r0 + _GB_CHUNK, n_b)
+    var acc = shared_tile[DT, 2 * _GB_ROWS, _GB_COLS]()
+    var sw: Scalar[DT] = 0
+    var sb: Scalar[DT] = 0
+    if j < n_out:
+        var r = r0 + ty
+        while r < r1:
+            var g = go[unsafe_offset=r * n_out + j].cast[DT]()
+            sw += g * x[unsafe_offset=r * n_out + j]
+            comptime if WITH_SUM:
+                sb += g
+            r += _GB_ROWS
+    acc[ty, tx] = sw
+    comptime if WITH_SUM:
+        acc[_GB_ROWS + ty, tx] = sb
+    barrier()
+    if ty == 0 and j < n_out:
+        var tw: Scalar[DT] = 0
+        var tb: Scalar[DT] = 0
+        comptime for k in range(_GB_ROWS):
+            tw += rebind[Scalar[DT]](acc[k, tx])
+            comptime if WITH_SUM:
+                tb += rebind[Scalar[DT]](acc[_GB_ROWS + k, tx])
+        part[unsafe_offset=ch * n_out + j] = tw
+        comptime if WITH_SUM:
+            part[unsafe_offset=(chunks + ch) * n_out + j] = tb
+
+
+def _lin_dot_final_kernel[
+    WITH_SUM: Bool = False
+](
+    part: Pointer[Scalar[DT], MutAnyOrigin],
+    gw: Pointer[Scalar[DT], MutAnyOrigin],
+    gb: Pointer[Scalar[DT], MutAnyOrigin],
+    chunks_arg: Int64,
+    out_arg: Int64,
+):
+    """`gw[j] += Σ_c part[c, j]` and, with `WITH_SUM`, `gb[j] += Σ_c
+    part[CHUNKS + c, j]`, chunks in order. Without `WITH_SUM`, `gb` is never
+    touched."""
+    var n_out = Int(out_arg)
+    var chunks = Int(chunks_arg)
+    var j = Int(global_idx.x)
+    if j < n_out:
+        var tw: Scalar[DT] = 0
+        var tb: Scalar[DT] = 0
+        for c in range(chunks):
+            tw += part[unsafe_offset=c * n_out + j]
+            comptime if WITH_SUM:
+                tb += part[unsafe_offset=(chunks + c) * n_out + j]
+        gw[unsafe_offset=j] += tw
+        comptime if WITH_SUM:
+            gb[unsafe_offset=j] += tb
+
+
+def _enqueue_dot[ADT: DType, WITH_SUM: Bool](
+    c: DeviceContext,
+    go: DeviceBuffer[ADT],
+    x: DeviceBuffer[DT],
+    gw: DeviceBuffer[DT],
+    gb: DeviceBuffer[DT],
+    B: Int,
+    OUT: Int,
+    mut part: Tensor,
+) raises:
+    var chunks = (B + _GB_CHUNK - 1) // _GB_CHUNK
+    comptime NSUMS = 2 if WITH_SUM else 1
+    part.ensure_gpu(c, NSUMS * chunks * OUT)
+    c.enqueue_function[_lin_dot_partial_kernel[ADT, WITH_SUM]](
+        go,
+        x,
+        part.dev.value(),
+        Int64(B),
+        Int64(OUT),
+        grid_dim=((OUT + _GB_COLS - 1) // _GB_COLS, chunks),
+        block_dim=(_GB_COLS, _GB_ROWS),
+    )
+    c.enqueue_function[_lin_dot_final_kernel[WITH_SUM]](
+        part.dev.value(),
+        gw,
+        gb,
+        Int64(chunks),
+        Int64(OUT),
+        grid_dim=(OUT + 255) // 256,
+        block_dim=256,
+    )
+
+
+def enqueue_dot_grad[ADT: DType](
+    c: DeviceContext,
+    go: DeviceBuffer[ADT],
+    x: DeviceBuffer[DT],
+    gw: DeviceBuffer[DT],
+    B: Int,
+    OUT: Int,
+    mut part: Tensor,
+) raises:
+    """`gw += Σ_rows go·x` for [B, OUT] `go` (ADT) and `x` (fp32): an RMSNorm
+    γ gradient. `enqueue_bias_grad`'s two passes with a product; fp32
+    accumulator, deterministic, `part` sized lazily (capture-safe)."""
+    _enqueue_dot[ADT, False](c, go, x, gw, gw, B, OUT, part)
+
+
+def enqueue_dot_bias_grad[ADT: DType](
+    c: DeviceContext,
+    go: DeviceBuffer[ADT],
+    x: DeviceBuffer[DT],
+    gw: DeviceBuffer[DT],
+    gb: DeviceBuffer[DT],
+    B: Int,
+    OUT: Int,
+    mut part: Tensor,
+) raises:
+    """`gw += Σ_rows go·x` and `gb += Σ_rows go` in one read of `go`: a
+    LayerNorm γ / β gradient. `part` holds `2 · chunks · OUT`."""
+    _enqueue_dot[ADT, True](c, go, x, gw, gb, B, OUT, part)
+
+
+# mean / biased variance of every column of [B, OUT] (a batch norm's train
+# statistics): an exact two-pass inside each chunk of rows, the chunks merged
+# in order (Chan et al.), all on data shifted by the column's first row. Same
+# chunking and block shape as the sums above.
+def _lin_mv_partial_kernel(
+    x: Pointer[Scalar[DT], MutAnyOrigin],
+    part: Pointer[Scalar[DT], MutAnyOrigin],
+    b_arg: Int64,
+    out_arg: Int64,
+):
+    """With K = x[0, j]: `part[c, j] = Σ (x - K)` over the rows of chunk c and
+    `part[CHUNKS + c, j] = Σ (x - K - m_c)²`, m_c that chunk's mean of x - K:
+    a second sweep of the same ≤ 1024 rows, so the squares are centred and
+    never cancel. The shift keeps the chunk sums at the data's spread, not
+    its offset; unshifted, the 1e6-sized sums of a column at 1000 leaked
+    their rounding into the merge (1e-5 relative variance error, 2e-7 now)."""
+    var n_out = Int(out_arg)
+    var n_b = Int(b_arg)
+    var chunks = (n_b + _GB_CHUNK - 1) // _GB_CHUNK
+    var tx = Int(thread_idx.x)
+    var ty = Int(thread_idx.y)
+    var j = Int(block_idx.x) * _GB_COLS + tx
+    var ch = Int(block_idx.y)
+    var r0 = ch * _GB_CHUNK
+    var r1 = min(r0 + _GB_CHUNK, n_b)
+    var acc = shared_tile[DT, _GB_ROWS, _GB_COLS]()
+    var k0: Scalar[DT] = 0
+    var s: Scalar[DT] = 0
+    if j < n_out:
+        k0 = x[unsafe_offset=j]
+        var r = r0 + ty
+        while r < r1:
+            s += x[unsafe_offset=r * n_out + j] - k0
+            r += _GB_ROWS
+    acc[ty, tx] = s
+    barrier()
+    var tot: Scalar[DT] = 0
+    comptime for k in range(_GB_ROWS):
+        tot += rebind[Scalar[DT]](acc[k, tx])
+    var m = tot / Scalar[DT](r1 - r0)
+    barrier()  # every lane has read `acc` before it is reused
+    var q: Scalar[DT] = 0
+    if j < n_out:
+        var r = r0 + ty
+        while r < r1:
+            var d = x[unsafe_offset=r * n_out + j] - k0 - m
+            q += d * d
+            r += _GB_ROWS
+    acc[ty, tx] = q
+    barrier()
+    if ty == 0 and j < n_out:
+        var tq: Scalar[DT] = 0
+        comptime for k in range(_GB_ROWS):
+            tq += rebind[Scalar[DT]](acc[k, tx])
+        part[unsafe_offset=ch * n_out + j] = tot
+        part[unsafe_offset=(chunks + ch) * n_out + j] = tq
+
+
+def _lin_mv_final_kernel(
+    x: Pointer[Scalar[DT], MutAnyOrigin],
+    part: Pointer[Scalar[DT], MutAnyOrigin],
+    mean: Pointer[Scalar[DT], MutAnyOrigin],
+    var_: Pointer[Scalar[DT], MutAnyOrigin],
+    b_arg: Int64,
+    out_arg: Int64,
+):
+    """With K = x[0, j] and S_c the shifted chunk sums: `mean[j] = K + μ`,
+    μ = Σ_c S_c / B, and `var_[j] = Σ_c (M2_c + n_c·(S_c/n_c - μ)²) / B`,
+    chunks in order. Overwrites (statistics, not gradients)."""
+    var n_out = Int(out_arg)
+    var n_b = Int(b_arg)
+    var chunks = (n_b + _GB_CHUNK - 1) // _GB_CHUNK
+    var j = Int(global_idx.x)
+    if j < n_out:
+        var s: Scalar[DT] = 0
+        for c in range(chunks):
+            s += part[unsafe_offset=c * n_out + j]
+        var mu = s / Scalar[DT](n_b)
+        var m2: Scalar[DT] = 0
+        for c in range(chunks):
+            var n_c = Scalar[DT](min(_GB_CHUNK, n_b - c * _GB_CHUNK))
+            var d = part[unsafe_offset=c * n_out + j] / n_c - mu
+            m2 += part[unsafe_offset=(chunks + c) * n_out + j] + n_c * d * d
+        mean[unsafe_offset=j] = x[unsafe_offset=j] + mu
+        var_[unsafe_offset=j] = m2 / Scalar[DT](n_b)
+
+
+def enqueue_col_mean_var(
+    c: DeviceContext,
+    x: DeviceBuffer[DT],
+    mean: DeviceBuffer[DT],
+    var_: DeviceBuffer[DT],
+    B: Int,
+    OUT: Int,
+    mut part: Tensor,
+) raises:
+    """`mean`, `var_` (biased, ÷B) of each column of a [B, OUT] `x`, as stable
+    as a two-pass over all rows: data shifted by its first row, centred
+    squares per chunk, chunk statistics merged with Chan's formula. Coalesced
+    (lanes along the columns), deterministic; `part` holds `2 · chunks ·
+    OUT`, sized lazily."""
+    var chunks = (B + _GB_CHUNK - 1) // _GB_CHUNK
+    part.ensure_gpu(c, 2 * chunks * OUT)
+    c.enqueue_function[_lin_mv_partial_kernel](
+        x,
+        part.dev.value(),
+        Int64(B),
+        Int64(OUT),
+        grid_dim=((OUT + _GB_COLS - 1) // _GB_COLS, chunks),
+        block_dim=(_GB_COLS, _GB_ROWS),
+    )
+    c.enqueue_function[_lin_mv_final_kernel](
+        x,
+        part.dev.value(),
+        mean,
+        var_,
+        Int64(B),
+        Int64(OUT),
+        grid_dim=(OUT + 255) // 256,
+        block_dim=256,
+    )
+
+
+# Per-channel sums over an NCHW map [B, C, HW] (conv bias, channel-norm γ):
+# a row sum over each contiguous (b, c) plane, then `enqueue_bias_grad` over
+# the [B, C] row sums.
+comptime _RS_TPB = 128
+
+
+def _rowsum_kernel[
+    ADT: DType = DT, WEIGHTED: Bool = False
+](
+    src: Pointer[Scalar[ADT], MutAnyOrigin],
+    w: Pointer[Scalar[DT], MutAnyOrigin],
+    dst: Pointer[Scalar[DT], MutAnyOrigin],
+    cols_arg: Int64,
+):
+    """`dst[r] = Σ_c src[r, c]` (`· w[r, c]` when `WEIGHTED`; otherwise `w`
+    is never read), one block per row, coalesced along c, fp32 accumulator."""
+    var cols = Int(cols_arg)
+    var r = Int(block_idx.x)
+    var t = Int(thread_idx.x)
+    var acc: Scalar[DT] = 0
+    var k = t
+    while k < cols:
+        var v = src[unsafe_offset=r * cols + k].cast[DT]()
+        comptime if WEIGHTED:
+            v *= w[unsafe_offset=r * cols + k]
+        acc += v
+        k += _RS_TPB
+    var total = block.sum[block_size=_RS_TPB, broadcast=False](val=acc)
+    if t == 0:
+        dst[unsafe_offset=r] = total[0]
+
+
+def _enqueue_channel[ADT: DType, WEIGHTED: Bool](
+    c: DeviceContext,
+    go: DeviceBuffer[ADT],
+    w: DeviceBuffer[DT],
+    gc: DeviceBuffer[DT],
+    B: Int,
+    C: Int,
+    HW: Int,
+    mut rows: Tensor,
+    mut part: Tensor,
+) raises:
+    rows.ensure_gpu(c, B * C)
+    c.enqueue_function[_rowsum_kernel[ADT, WEIGHTED]](
+        go,
+        w,
+        rows.dev.value(),
+        Int64(HW),
+        grid_dim=B * C,
+        block_dim=_RS_TPB,
+    )
+    enqueue_bias_grad[DT](c, rows.dev.value(), gc, B, C, part)
+
+
+def enqueue_channel_grad[ADT: DType](
+    c: DeviceContext,
+    go: DeviceBuffer[ADT],
+    gc: DeviceBuffer[DT],
+    B: Int,
+    C: Int,
+    HW: Int,
+    mut rows: Tensor,
+    mut part: Tensor,
+) raises:
+    """`gc[ch] += Σ_{b, s} go[b, ch, s]` for an NCHW `go` (ADT): a conv bias
+    gradient. Replaces one block per channel walking B·HW values (3 blocks for
+    an RGB decoder head). `rows` [B·C] and `part` are the caller's scratch,
+    sized lazily (capture-safe)."""
+    # `gc` stands in for the unread weight operand.
+    _enqueue_channel[ADT, False](c, go, gc, gc, B, C, HW, rows, part)
+
+
+def enqueue_channel_dot_grad(
+    c: DeviceContext,
+    go: DeviceBuffer[DT],
+    x: DeviceBuffer[DT],
+    gc: DeviceBuffer[DT],
+    B: Int,
+    C: Int,
+    HW: Int,
+    mut rows: Tensor,
+    mut part: Tensor,
+) raises:
+    """`gc[ch] += Σ_{b, s} go[b, ch, s]·x[b, ch, s]` for an NCHW map: a
+    channel-wise RMSNorm γ gradient."""
+    _enqueue_channel[DT, True](c, go, x, gc, B, C, HW, rows, part)
 
 
 comptime BF16 = DType.bfloat16

@@ -3,7 +3,8 @@
 Transformed from legacy `nn.primitives.RMSNorm` (surface-only change). No mean
 subtraction, no β — one `Param` (γ, decay=False, init 1). The x·inv_rms + inv_rms
 cache is leaf-owned. CPU SIMD feature-axis loops + 3 GPU kernels (forward /
-backward-dx 1-block-per-row / backward-dgamma 1-block-per-col) carried verbatim.
+backward-dx 1-block-per-row / backward-dgamma 1-block-per-col) carried verbatim;
+past `TWO_PASS_MIN_ELEMS` the dgamma goes through `linear.enqueue_dot_grad`.
 
 Backward (cache):  R = Σ_d go·γ·n ; dx = inv_rms·(go·γ - n·R/DIM) ; dγ += Σ_b go·n
 """
@@ -24,6 +25,7 @@ from ..core.module import Module
 from ..core.param import Param, ParamVisitor
 from ..core.initializer import Initializer
 from ..core.amp import AMPPolicy, NoAMP
+from .linear import enqueue_dot_grad, TWO_PASS_MIN_ELEMS
 
 
 comptime RMS_EPS: Scalar[DT] = 1e-4
@@ -211,11 +213,14 @@ struct RMSNorm[DIM_: Int, EPS: Scalar[DT] = RMS_EPS](Module):
     var gamma: Param["gamma", False, Self.DIM_]
     var cache_norm: Tensor  # [BATCH, DIM]
     var cache_inv_rms: Tensor  # [BATCH]
+    var dg_part: Tensor
+    """Chunk partials of the two-pass dγ (`enqueue_dot_grad`)."""
 
     def __init__(out self):
         self.gamma = Param["gamma", False, Self.DIM_]()
         self.cache_norm = Tensor()
         self.cache_inv_rms = Tensor()
+        self.dg_part = Tensor()
 
     @staticmethod
     def make[
@@ -399,13 +404,25 @@ struct RMSNorm[DIM_: Int, EPS: Scalar[DT] = RMS_EPS](Module):
                 block_dim=RMS_TPB,
             )
             if want_dg:
-                c.enqueue_function[_rms_norm_backward_dgamma_kernel[B, Self.DIM_]](
-                    grad_output.tt["gpu", B, Self.DIM_](),
-                    self.cache_norm.tt["gpu", B, Self.DIM_](),
-                    self.gamma.grd.tt["gpu", Self.DIM_](),
-                    grid_dim=Self.DIM_,
-                    block_dim=RMS_TPB,
-                )
+                # dγ += Σ_b go·n. One block per column reads 32 different rows
+                # per warp load and gives the grid only DIM blocks; past
+                # `TWO_PASS_MIN_ELEMS` the coalesced two-pass helper wins
+                # (2.4x at DreamerV3's 1024 x 512 actor-critic heads, Metal).
+                comptime if B * Self.DIM_ >= TWO_PASS_MIN_ELEMS:
+                    enqueue_dot_grad[DT](
+                        c, grad_output.dev.value(), self.cache_norm.dev.value(),
+                        self.gamma.grd.dev.value(), B, Self.DIM_, self.dg_part,
+                    )
+                else:
+                    c.enqueue_function[
+                        _rms_norm_backward_dgamma_kernel[B, Self.DIM_]
+                    ](
+                        grad_output.tt["gpu", B, Self.DIM_](),
+                        self.cache_norm.tt["gpu", B, Self.DIM_](),
+                        self.gamma.grd.tt["gpu", Self.DIM_](),
+                        grid_dim=Self.DIM_,
+                        block_dim=RMS_TPB,
+                    )
 
     # for_each_param / zero_grad inherit the Module reflection defaults
     # (core/walkers.mojo auto-discovers the Param fields).
