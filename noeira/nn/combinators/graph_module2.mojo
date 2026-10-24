@@ -140,6 +140,29 @@ trait TwoInputGraph(Defaultable & Movable & Deinitable):
         ...
 
 
+trait NamedNodeGraph(TwoInputGraph):
+    """`TwoInputGraph` plus the by-NAME node surface a trainer drives: a node's
+    attribute, a node's output, and whether a node exists. For a trainer that
+    is generic over several graphs of one family (the SO-101 world models,
+    `experimental/lewm/so101_trainer.mojo`); `ComputeGraph` conforms."""
+
+    @staticmethod
+    def has_node[name: StaticString]() -> Bool:
+        """True when a decl is named `name` (comptime-folded): guards a
+        `node_output` / `set_input` the graph may not have."""
+        ...
+
+    def set_node_attr[
+        NAME: StaticString, ATTR: StaticString
+    ](mut self, value: Scalar[DT]):
+        ...
+
+    def node_output[
+        name: StaticString
+    ](mut self) raises -> ref [MutAnyOrigin] TensorImpl[Self.ACT_DT]:
+        ...
+
+
 struct GraphModule2[
     IN0: Int, IN1: Int, OUT: Int, GRAPH: TwoInputGraph
 ](Module):
