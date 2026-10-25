@@ -34,6 +34,7 @@ with tape.no_grad():                              # inference: no grad buffers, 
 | `F` | `F.mojo` | `F.linear(x, w, b[, act])` — one fused node with `Linear` / `LinearAct`'s launches — and `F.mse` |
 | GPU kernels | `gpu.mojo` | every size a runtime argument; cuBLAS / cuBLASLt on NVIDIA at the comptime nn's TF32 rule, MAX's matmul over runtime views on Metal |
 | backend | `backend.mojo` | `Dev`: launch through MAX's context or noeira's `metal_rt` launcher (`Tape.metal_rt()`) |
+| simdgroup GEMM | `sg_gemm.mojo` | Apple's 8 x 8 simdgroup matrix units through the AIR functions; the tape's own GEMM on Metal |
 | `TapeAdam` | `optim.mojo` | nn's per-parameter Adam, launched through the tape's `Dev` (runs on a metal_rt tape) |
 | module bridge | `module_op.mojo` | a comptime `Module` (1 to 3 inputs, up to 3 batch sizes) owned by the tape, called through thin function pointers to per-type thunks |
 
@@ -164,10 +165,12 @@ tape:
   are bound as their own bytes.
 - **Copies.** Host -> device goes through a staging ring plus a copy kernel,
   ordered like a launch. Device -> host syncs, then reads shared memory.
-- **Matmul.** It is the tape's own GEMM (`ctx.own`): a new
-  `_tiled_mm_kernel` (64 x 64 tiles, 4 x 4 per thread, k in order), with
-  `_naive_mm_kernel` below 8 tiles or with a dimension of 1. MAX's matmul
-  launches through MAX and cannot run here.
+- **Matmul.** It is the tape's own GEMM (`ctx.own`): Apple's simdgroup
+  matrix hardware, through `sg_gemm.mojo` (see "A GEMM on the simdgroup
+  matrix hardware" below), for outputs of at least 64 x 64 and k > 1;
+  otherwise `_naive_mm_kernel`. MAX's matmul launches through MAX and cannot
+  run here. (The first version used a scalar `_tiled_mm_kernel`, which is
+  kept.)
 - **Bias gradient.** It is nn's `enqueue_bias_grad`, re-issued through `Dev`:
   the same two kernels and grids.
 - **Optimizer.** It is `TapeAdam` (`optim.mojo`): nn's per-parameter Adam,
@@ -234,14 +237,17 @@ Nothing GPU-side touches MAX.
 | SAC B=256 train + Adam | read/1 | 1943 | 1703 | 966 | 1.8x |
 | B=4096 64-512-512-64 train | read/20 | 8981 | 9857 | 16386 | 0.6x |
 
+This table is the FIRST version, with the scalar tiled GEMM. The simdgroup
+GEMM below takes B=4096 from 16.4 ms to 6.9 ms (1.44x faster than the tape
+on MAX), SAC from 782 to 622 us, and PPO from 245 to 234 us.
+
 - **Small steps.** The metal_rt tape runs PPO-sized steps 4–4.5x faster than
   the tape on MAX, and 6.6x faster than the comptime nn on MAX.
-- **B=4096 is GEMM-bound and slower** (0.6x). The tape's GEMM runs at
+- **B=4096 was GEMM-bound and slower** (0.6x). The scalar GEMM ran at
   0.73 TFLOP/s on [4096, 512] @ [512, 512], against 2.5 for MAX's matmul.
-  The own-kernel MAX arm, 17.8 ms, shows it is the kernel and not the
+  The own-kernel MAX arm, 17.8 ms, showed it was the kernel and not the
   launcher. 8 x 8 outputs per thread and 32-deep k-slabs were both slower.
-  MAX's speed most likely needs Apple's simdgroup matrix instructions, which
-  were not attempted here.
+  The simdgroup GEMM (next section) closed it.
 - **Noise.** The read-every-step rows spread ±20–40% between rounds; see the
   brackets in the bench output.
 
@@ -254,6 +260,129 @@ Nothing GPU-side touches MAX.
   at step 2; fixed by committing first.
 - **A second `DeviceContext` is a second queue.** nn's Adam on another
   context than the tape's raced the tape in the first version of gate (b).
+
+## A GEMM on the simdgroup matrix hardware (2026-10-25)
+
+`sg_gemm.mojo` is a from-scratch GEMM on Apple's 8 x 8 simdgroup matrix
+units. The tape uses it for every Metal product with an output of at least
+64 x 64 and k > 1, on a metal_rt tape and on `own_kernels=True`.
+
+**The route to the hardware.** MSL's `simdgroup_load`,
+`simdgroup_multiply_accumulate`, `simdgroup_store` and
+`make_filled_simdgroup_matrix` compile to four AIR functions. I compiled a
+15-line MSL kernel of my own with `xcrun metal -S -emit-llvm` and read their
+names and signatures off the IR:
+
+```
+<64 x float> air.simdgroup_matrix_8x8_load.v64f32.p{1,3}f32(ptr, <2 x i64> (8, 8), <2 x i64> strides, <2 x i64> origin)
+<64 x float> air.simdgroup_matrix_8x8_multiply_accumulate.v64f32.v64f32.v64f32.v64f32(a, b, c)   // a·b + c
+void         air.simdgroup_matrix_8x8_store.v64f32.p{1,3}f32(m, ptr, …)
+<64 x float> air.simdgroup_matrix_8x8_init_filled.v64f32.f32(float)
+```
+
+- **Strides.** They are `(1, ld)` for a row-major load and `(ld, 1)` for the
+  transposed one.
+- **Calling them.** `llvm_intrinsic` rejects these names ("could not find
+  LLVM intrinsic") because they are external functions that the Metal
+  backend lowers, not LLVM intrinsics. `external_call` reaches them.
+- **Proof.** `metal_rt/probe_simdgroup.mojo` runs an 8x8x8 product, plain
+  and with B loaded transposed: exact against a CPU reference.
+
+**The kernels**, f32 in and out, 128 threads (4 simdgroups in 2 x 2) per
+threadgroup:
+
+- **Direct kernels** run when M and N are multiples of the tile and K a
+  multiple of 8. Fragments load straight from device memory; the tape's
+  transposes are the hardware's transposed load. There is no staging and no
+  barrier. Each simdgroup holds RA x CB accumulators, one variant per form:
+  - 4 x 8 (64 x 128 tile) for plain products from 32 tiles up;
+  - 2 x 8 (32 x 128) for aᵀ·b;
+  - 4 x 4 (64 x 64) for a·bᵀ and small outputs.
+- **The staged kernel** handles everything else (edge tiles, any K). Its
+  64 x 64 tile is staged 16-deep through threadgroup memory: in canonical
+  form, zero-filled past M, N and K, with the transposes absorbed by the
+  staging loads. Interior tiles store their fragments directly. Edge tiles
+  go through threadgroup memory and a bounds-checked copy. With ACC,
+  interior accumulators start from `o`.
+- **Determinism.** Every output sums k in hardware order, so results are the
+  same run to run and launcher to launcher.
+
+**Gates:**
+
+- **(a) `tests/experimental/functional/test_sg_gemm.mojo` vs a float64 CPU
+  reference.** 16 shapes × 8 (TA, TB, ACC) forms × 2 paths: the tape's
+  dispatcher and the staged kernel forced. That is 256 cases. Shapes cover
+  tile multiples, non-multiples of 64 and of 8 in M, N and K, dimensions of 1
+  everywhere, and the MLP shapes.
+  - Bound per element: (K + 2) u (Σ|a b| + |o0|), where u = 2⁻²⁴, the fp32
+    summation bound.
+  - **All 256 pass.** The worst error is 0.50 of the bound, at K = 1, where
+    the bound is a single rounding. At K ≥ 64 the worst is 0.06 of the
+    bound.
+  - The worst relative error on outputs with |ref| > 1e-3 is 3.9e-3, and
+    that is cancellation.
+- **(b) `test_functional_metal_rt.mojo`: 23 of 23,** three runs.
+  Bit-identity against `Tape(ctx, own_kernels=True)` still holds, since both
+  run the same kernels.
+- **(c) Tolerance vs the normal MAX path,** unchanged and well inside its
+  bounds: forward 0, gradients ≤ 4e-8, losses ≤ 8e-8, parameters ≤ 6e-5 of
+  the run's lr. `test_functional_gpu` and `_fused` still pass.
+
+**TFLOP/s** (`benchmarks/functional/bench_tape_gemm.mojo`, best of 5, 20
+launches per sync). MAX's dW runs as a transpose plus matmul, which is how
+the tape runs it on MAX, because MAX's matmul has no transpose_a.
+
+| product | M x N x K | naive | old tiled | simdgroup (tape) | MAX matmul | vs MAX |
+|---|---|---|---|---|---|---|
+| L1 fwd x@w | 4096 x 512 x 64 | 0.08 | 0.67 | 2.46 | 1.75 | 1.40 |
+| L2 fwd x@w | 4096 x 512 x 512 | 0.10 | 0.74 | 3.03 | 2.54 | 1.19 |
+| L3 fwd x@w | 4096 x 64 x 512 | 0.09 | 0.59 | 2.10 | 1.23 | 1.70 |
+| L3 dX = dO@wᵀ | 4096 x 512 x 64 | 0.02 | 0.67 | 1.86 | 1.38 | 1.34 |
+| L2 dX = dO@wᵀ | 4096 x 512 x 512 | 0.02 | 0.73 | 2.18 | 2.26 | 0.96 |
+| L3 dW = xᵀ@dO | 512 x 64 x 4096 | 0.07 | 0.18 | 0.56 | 0.27 | 2.07 |
+| L2 dW = xᵀ@dO | 512 x 512 x 4096 | 0.08 | 0.60 | 2.46 | 1.01 | 2.42 |
+| L1 dW = xᵀ@dO | 64 x 512 x 4096 | 0.07 | 0.18 | 0.61 | 0.67 | 0.91 |
+| SAC fwd | 256 x 256 x 256 | 0.09 | 0.33 | 0.81 | 0.66 | 1.22 |
+| SAC L1 fwd (K = 23: staged) | 256 x 256 x 23 | 0.05 | 0.13 | 0.12 | 0.05 | 2.47 |
+| PPO fwd | 64 x 64 x 64 | 0.02 | 0.02 | 0.03 | 0.02 | 2.15 |
+
+**The tape** (`bench_functional_metal_rt.mojo`, each arm in its own process,
+median of 7, us/step; metal_rt = best of the three policies):
+
+| workload | loop | comptime nn (MAX) | tape MAX | tape metal_rt, scalar GEMM | tape metal_rt, simdgroup GEMM | vs tape MAX |
+|---|---|---|---|---|---|---|
+| B=4096 64-512-512-64 train | end | 9006 | 9844 | 16622 | 6860 | 1.44x |
+| B=4096 train | read/20 | 9028 | 9920 | 16386 | 6896 | 1.44x |
+| B=4096 train | read/1 | 9812 | 10295 | 16850 | 7230 | 1.42x |
+| SAC B=256 train | read/20 | 1305 | 1110 | 782 | 622 | 1.79x |
+| SAC B=256 train + Adam | read/20 | 1642 | 1096 | 830 | 636 | 1.72x |
+| PPO B=64 train | read/20 | 1685 | 1122 | 245 | 234 | 4.79x |
+| PPO B=64 train + Adam | read/20 | 1860 | 1160 | 267 | 255 | 4.55x |
+| ACT B=1 fwd | end | 225 | 240 | 162 | 162 | 1.48x |
+
+- **ACT never reaches the GEMM.** Its products have M = 1 and stay naive.
+  Its read-every-step row (442 now, 324 in the first table) is noise: the
+  pre-simdgroup binary measures 407–467 on the same run.
+- **Thresholds.** Simdgroup kernels run from a 64 x 64 output up (k > 1);
+  below that the naive kernel runs. At 64 x 64 x 64 the simdgroup kernel
+  already beats naive (0.03 vs 0.02 TFLOP/s), and the PPO step went from
+  243 to 227 us when the threshold dropped from 8 tiles to 1. Plain products
+  take the 64 x 128 tile only from 32 tiles up: on SAC's 256 x 256 output
+  it leaves 8 threadgroups and lost to 4 x 4 (0.57 vs 0.81).
+
+**What did not help:**
+
+- **Accumulators in an `Array[SIMD[f32, 64], 16]`:** 0.04 TFLOP/s, 20x
+  slower than scalar. In memory each `<64 x float>` is materialised whole
+  per thread. They must be named SSA locals, and the kernels are written out
+  that way.
+- **Staging every tile through threadgroup memory:** 0.7 TFLOP/s, no faster
+  than the scalar kernel. Staging and barriers dominated. Loading straight
+  from device memory gave 2.0, and a lean kernel with no staging code at all
+  gave 2.7–3.0.
+- **A 2x unroll of the k loop:** +2%, not kept.
+- **An 8 x 4 tile (128 x 64):** slower than 4 x 8 on every shape.
+- **half / bf16 inputs:** not tried; f32 only.
 
 ## Gates
 
@@ -269,4 +398,5 @@ pixi run -e apple   mojo run -I . tests/experimental/functional/test_functional_
 pixi run -e apple   mojo run -I . tests/experimental/functional/test_functional_module_arity.mojo  # multi-input modules, batches
 pixi run -e apple   mojo run -I . tests/experimental/functional/test_functional_transformer.mojo   # integration
 pixi run -e apple   mojo run -I . tests/experimental/functional/test_functional_metal_rt.mojo      # the tape on metal_rt
+pixi run -e apple   mojo run -I . tests/experimental/functional/test_sg_gemm.mojo                  # simdgroup GEMM vs float64
 ```

@@ -29,6 +29,7 @@ most of the step.
 | `mlp_kernels.mojo` | Naive kernels for one 2-layer MLP training step (14 launches). |
 | `bench_mlp.mojo` | The MLP step through MAX and through both launchers under each policy, plus the bit-identity gate. Exits 1 on failure. |
 | `probe_own_launch.mojo` | The seed probe this started from. |
+| `probe_simdgroup.mojo` | An 8x8x8 product on the simdgroup matrix hardware through the AIR functions (`external_call`). |
 | `../functional/backend.mojo` | The functional tape's `Dev`: launches through MAX or `MetalRT` (`Tape.metal_rt()`). |
 
 ## Run
@@ -339,8 +340,28 @@ MAX's runtime. Design, gates and full results are in
   shapes.
 - **Small training steps are 3.8–4.5x faster** than the tape on MAX (PPO
   B=64), and 1.3–1.8x faster for SAC B=256. Each arm ran in its own process.
-- **B=4096 is 0.6x.** Its own GEMM runs at 0.73 TFLOP/s, against MAX's
-  matmul at 2.5.
+- **B=4096 was 0.6x** with a scalar GEMM (0.73 TFLOP/s, against MAX's 2.5).
+  A from-scratch GEMM on the simdgroup matrix hardware (below) fixed that.
+  B=4096 now runs at 6.9 ms, against 9.9 ms for the tape on MAX (1.44x
+  faster). SAC B=256 runs at 622 us, 1.8x faster than the tape on MAX.
+
+**Reaching the simdgroup matrix hardware from Mojo.**
+
+- MSL's `simdgroup_load` / `simdgroup_multiply_accumulate` /
+  `simdgroup_store` / `make_filled_simdgroup_matrix` compile to AIR
+  functions, `air.simdgroup_matrix_8x8_{load,multiply_accumulate,store,init_filled}…`.
+  Their names come from `xcrun metal -S -emit-llvm` on a small MSL kernel of
+  my own.
+- `llvm_intrinsic` cannot call them ("could not find LLVM intrinsic").
+  `external_call["air.simdgroup_matrix_8x8_load.v64f32.p1f32", SIMD[f32, 64]](…)`
+  can.
+- `probe_simdgroup.mojo` runs an 8x8x8 product through them.
+- The GEMM, its gates (256 cases against float64) and its TFLOP/s table are
+  in `functional/sg_gemm.mojo` and the functional README. It reaches 3.0
+  TFLOP/s on [4096, 512] @ [512, 512], against 2.54 for MAX's matmul.
+- **Pitfall:** keep the `<64 x float>` matrices as named locals. In an
+  `Array` they are materialised per thread, and the kernel ran 20x slower
+  than scalar code.
 
 Three more pitfalls, found here:
 
