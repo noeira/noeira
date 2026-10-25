@@ -34,7 +34,6 @@ from max.gpu.host import DeviceContext, DeviceBuffer
 
 from noeira.nn.constants import DT, CPU_SIMD_W
 from noeira.nn.core.tensor import Tensor
-from noeira.nn.core.fill import fill_dev
 from noeira.nn.core.cpu_gemm import gemm_cpu_ptr
 from noeira.nn.core.element_op import ElementOp
 from noeira.nn.primitives.ops.relu_op import ReLUOp
@@ -53,7 +52,9 @@ from .nd import nd_binary, nd_bmm, nd_binary_vjp, nd_vjp
 from .extra import ExpOp, LogOp, SqrtOp
 from std.sys import default_accelerator
 from noeira.cuda.graph import CUDAGraph
-from noeira.nn.primitives.linear import enqueue_bias_grad
+from .backend import Dev, ensure_gpu, fill_dev, enqueue_bias_grad
+from noeira.experimental.metal_rt.runtime import MetalRT
+from std.memory import OwnedPointer
 from .gpu import (
     gpu_bias_act,
     gpu_act_gate,
@@ -212,8 +213,19 @@ struct TapeData(Movable):
     var grad_on: Bool
     """`False` under `Tape.no_grad()`: new nodes do not require grad, so no
     gradient buffer, no saved pre-activation, no backward."""
+    var rt: Optional[OwnedPointer[MetalRT]]
+    """A metal_rt tape: every launch, buffer and copy goes through this
+    launcher instead of MAX (`backend.mojo`). On the heap, so the `Dev`
+    handles that carry its address stay valid when the tape moves."""
+    var own: Bool
+    """Use the tape's own GEMM (and nothing of MAX's but its launch path)."""
 
-    def __init__(out self, ctx: Optional[DeviceContext] = None):
+    def __init__(
+        out self,
+        ctx: Optional[DeviceContext] = None,
+        var rt: Optional[OwnedPointer[MetalRT]] = None,
+        own: Bool = False,
+    ):
         self.nodes = List[Node]()
         self.n_live = 0
         self.n_params = 0
@@ -228,6 +240,8 @@ struct TapeData(Movable):
         self.graph = None
         self.gen = 0
         self.grad_on = True
+        self.rt = rt^
+        self.own = own
 
     def __deinit__(deinit self):
         for i in range(len(self.mods)):
@@ -237,11 +251,27 @@ struct TapeData(Movable):
     def on_gpu(self) -> Bool:
         return Bool(self.ctx)
 
-    def dctx(self) -> DeviceContext:
-        """The device context, by value: an argument next to `self.dv(…)`
-        in one call, where a borrow of `self.ctx` would alias the `mut
-        self` that `dv` takes."""
-        return self.ctx.value()
+    def on_rt(self) -> Bool:
+        return Bool(self.rt)
+
+    def dctx(self) -> Dev:
+        """What the GPU ops launch through (`backend.mojo`): MAX's context or
+        this tape's MetalRT. By value: an argument next to `self.dv(…)` in
+        one call, where a borrow of `self.ctx` would alias the `mut self`
+        that `dv` takes."""
+        var r = 0
+        if self.rt:
+            r = Int(Pointer(to=self.rt.value()[]))
+        return Dev(self.ctx.value(), r, self.own)
+
+    def _no_rt(self, what: String) raises:
+        """Refuse what launches through MAX on tape buffers (see
+        `backend.mojo`, THE RULE)."""
+        if self.rt:
+            raise Error(
+                what + ": not on a metal_rt tape — it launches through MAX,"
+                " which cannot reach metal_rt buffers"
+            )
 
     def val_ptr(mut self, i: Int) -> Ptr:
         return rebind[Ptr](self.nodes[i].val.data.unsafe_ptr())
@@ -263,17 +293,17 @@ struct TapeData(Movable):
 
     def _scratch1(mut self, n: Int) raises -> DBuf:
         var c = self.dctx()
-        self.s1.ensure_gpu(c, n)
+        ensure_gpu(self.s1, c, n)
         return self.s1.dev.value().create_sub_buffer[DT](0, n)
 
     def _scratch2(mut self, n: Int) raises -> DBuf:
         var c = self.dctx()
-        self.s2.ensure_gpu(c, n)
+        ensure_gpu(self.s2, c, n)
         return self.s2.dev.value().create_sub_buffer[DT](0, n)
 
     def _scratch3(mut self, n: Int) raises -> DBuf:
         var c = self.dctx()
-        self.s3.ensure_gpu(c, n)
+        ensure_gpu(self.s3, c, n)
         return self.s3.dev.value().create_sub_buffer[DT](0, n)
 
     def _take(mut self, i: Int) -> Bool:
@@ -331,7 +361,7 @@ struct TapeData(Movable):
         if i == len(self.nodes):
             self.nodes.append(Node())
         var gpu = self.on_gpu()
-        var c: Optional[DeviceContext] = None
+        var c: Optional[Dev] = None
         if gpu:
             c = self.dctx()
         ref n = self.nodes[i]
@@ -355,9 +385,9 @@ struct TapeData(Movable):
         n.rg = rg_eff
         n.gfresh = False
         if gpu:
-            n.val.ensure_gpu(c.value(), rows * cols)
+            ensure_gpu(n.val, c.value(), rows * cols)
             if rg_eff:
-                n.grad.ensure_gpu(c.value(), rows * cols)
+                ensure_gpu(n.grad, c.value(), rows * cols)
         else:
             n.val.ensure(rows * cols)
         self.n_live = i + 1
@@ -485,6 +515,7 @@ struct TapeData(Movable):
 
     def add_module(mut self, var e: ModEntry, name: String = String("")) raises -> Int:
         """Own module entry `e`, named `name` — by default `m<index>`."""
+        self._no_rt("a module as an op")
         var nm = name if name.byte_length() > 0 else String("m", len(self.mods))
         self.check_name(nm)
         e.name = nm
@@ -647,6 +678,7 @@ struct TapeData(Movable):
         optimizers and checkpoints drive, in NAME order (`_walk_order`):
         a parameter as its name (weight decay on matrices, not on `[1, n]`
         rows), a module's as `<module>.<its own names>`."""
+        self._no_rt("nn's optimizers and checkpoints (use TapeAdam)")
         var order = self._walk_order()
         for e in range(len(order)):
             var i = order[e]
@@ -813,7 +845,7 @@ struct TapeData(Movable):
             # that order — a harmless scratch write.
             var z = self.dv(o)
             if keep_z:
-                self.nodes[o].aux.ensure_gpu(c, m * n)
+                ensure_gpu(self.nodes[o].aux, c, m * n)
                 z = self.nodes[o].aux.dev.value().create_sub_buffer[DT](0, m * n)
             gpu_bias_act[OP, HAS_ACT](c, self.dv(o), self.dv(bias), z, m, n)
             return

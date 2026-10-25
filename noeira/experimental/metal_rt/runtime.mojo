@@ -93,6 +93,7 @@ Metal must know every buffer a command buffer touches through a GPU address.
 from std.memory import Pointer
 from std.sys import size_of
 from std.time import perf_counter_ns
+from max.gpu import global_idx
 from max.gpu.host.compile import _compile_code
 
 from noeira.experimental.metal_rt.objc import ObjC
@@ -158,6 +159,32 @@ def load_pipeline(o: ObjC, device: Int, lib_bytes: String, fname: String) raises
     o.release(data)
     o.pool_pop(pool)
     return pso
+
+
+comptime _STAGE_BYTES = 4 << 20
+
+
+def _copy_words(
+    dst: Pointer[UInt32, MutAnyOrigin], src: Pointer[UInt32, MutAnyOrigin], n: Int64
+):
+    var i = Int(global_idx.x)
+    if i < Int(n):
+        dst[unsafe_offset=i] = src[unsafe_offset=i]
+
+
+def _memcpy(dst: Int, src: Int, nbytes: Int):
+    var d = Pointer[UInt8, MutAnyOrigin](unsafe_from_address=dst)
+    var s = Pointer[UInt8, MutAnyOrigin](unsafe_from_address=src)
+    var i = 0
+    if (dst | src | nbytes) & 7 == 0:
+        var d8 = Pointer[UInt64, MutAnyOrigin](unsafe_from_address=dst)
+        var s8 = Pointer[UInt64, MutAnyOrigin](unsafe_from_address=src)
+        for k in range(nbytes // 8):
+            d8[unsafe_offset=k] = s8[unsafe_offset=k]
+        return
+    while i < nbytes:
+        d[unsafe_offset=i] = s[unsafe_offset=i]
+        i += 1
 
 
 trait Launcher(Movable & Deinitable):
@@ -276,6 +303,11 @@ struct MetalRT(Launcher):
     var cur_pso: Int
     var rset_dirty: Bool
     var live: List[Int]  # every live MTLBuffer (for the per-cb modes)
+    var live_gpu: List[Int]
+    var live_host: List[Int]
+    var live_bytes: List[Int]
+    var stage: Buffer  # upload staging ring (allocated on first upload)
+    var stage_off: Int
     var _k_keys: List[Int]
     var _k_pso: List[Int]
     var _dims: List[Int]  # grid xyz, block xyz (MTLSize by reference)
@@ -327,6 +359,11 @@ struct MetalRT(Launcher):
         self.cur_pso = 0
         self.rset_dirty = False
         self.live = List[Int]()
+        self.live_gpu = List[Int]()
+        self.live_host = List[Int]()
+        self.live_bytes = List[Int]()
+        self.stage = Buffer(0, 0, 0, 0)
+        self.stage_off = 0
         self._k_keys = List[Int]()
         self._k_pso = List[Int]()
         self._dims = List[Int](length=6, fill=1)
@@ -352,6 +389,23 @@ struct MetalRT(Launcher):
             self.o.check_error(err[0], "newResidencySetWithDescriptor")
             self.o.release(desc)
             _ = self.o.send1(self.queue, self.o.sel("addResidencySet:"), self.rset)
+
+    def __deinit__(deinit self):
+        """Wait for the GPU, then release every Metal object we own."""
+        self._commit()
+        if self.committed > 0:
+            while not self.gpu_idle():
+                pass
+        for i in range(len(self.live)):
+            self.o.release(self.live[i])
+        for i in range(len(self._k_pso)):
+            self.o.release(self._k_pso[i])
+        if self.last_cb != 0:
+            self.o.release(self.last_cb)
+        self.o.release(self.rset)
+        self.o.release(self.fence)
+        self.o.release(self.event)
+        self.o.release(self.queue)
 
     def commits(self) -> Int:
         return self.n_commits
@@ -381,7 +435,16 @@ struct MetalRT(Launcher):
             nbytes,
         )
         self.live.append(obj)
+        self.live_gpu.append(b.gpu)
+        self.live_host.append(b.host)
+        self.live_bytes.append(nbytes)
         if self.rset != 0:
+            # A buffer allocated while a command buffer is OPEN would be used
+            # by that command buffer before the residency set's commit took
+            # effect: not resident, reads garbage, intermittently (seen on
+            # the functional tape, whose Adam moments and scratch appear
+            # mid-step). Commit the open command buffer first.
+            self._commit()
             _ = self.o.send1(self.rset, self.s.add_allocation, obj)
             self.rset_dirty = True
         return b
@@ -392,6 +455,9 @@ struct MetalRT(Launcher):
         for i in range(len(self.live)):
             if self.live[i] == b.obj:
                 _ = self.live.pop(i)
+                _ = self.live_gpu.pop(i)
+                _ = self.live_host.pop(i)
+                _ = self.live_bytes.pop(i)
                 break
         if self.rset != 0:
             _ = self.o.send1(self.rset, self.o.sel("removeAllocation:"), b.obj)
@@ -424,6 +490,18 @@ struct MetalRT(Launcher):
     ](mut self, *args: *Ts, grid: Int, block: Int) raises:
         """Encode one dispatch of `grid` threadgroups of `block` threads.
         Argument i is bound at buffer index i by value (see module doc)."""
+        self.begin_dispatch[func]()
+        comptime for i in range(args.__len__()):
+            self.set_arg(i, Int(Pointer(to=args[i])), size_of[Ts[i]]())
+        self.dispatch(grid, block)
+
+    # The same launch in three calls, for a caller that converts its own
+    # argument types (`functional/backend.mojo` turns a `DeviceBuffer` into
+    # its address): begin, one `set_arg` per argument, dispatch.
+
+    def begin_dispatch[
+        func_type: TrivialRegisterPassable, //, func: func_type
+    ](mut self) raises:
         var pso = self._pipeline[func]()
         if self.enc == 0:
             self._begin()
@@ -432,23 +510,68 @@ struct MetalRT(Launcher):
         if pso != self.cur_pso:
             _ = self.o.send1(self.enc, self.s.set_pso, pso)
             self.cur_pso = pso
-        comptime for i in range(args.__len__()):
-            _ = self.o.send3(
-                self.enc,
-                self.s.set_bytes,
-                Int(Pointer(to=args[i])),
-                size_of[Ts[i]](),
-                i,
-            )
+
+    @always_inline
+    def set_arg(mut self, index: Int, addr: Int, nbytes: Int):
+        """Kernel argument `index` = the `nbytes` bytes at host `addr`
+        (copied by Metal now)."""
+        _ = self.o.send3(self.enc, self.s.set_bytes, addr, nbytes, index)
+
+    def dispatch(
+        mut self, grid_x: Int, block_x: Int, grid_y: Int = 1, block_y: Int = 1
+    ):
         if self.residency == RESIDENCY_PER_LAUNCH:
             self._use_all()
-        self._dims[0] = grid
-        self._dims[3] = block
+        self._dims[0] = grid_x
+        self._dims[1] = grid_y
+        self._dims[3] = block_x
+        self._dims[4] = block_y
         var d = Int(self._dims.unsafe_ptr())
         _ = self.o.send2(self.enc, self.s.dispatch, d, d + 24)
         self.pending += 1
         self.n_launches += 1
         self._maybe_commit()
+
+    # ---------------------------------------------------------------- copies
+
+    def host_of(self, gpu_addr: Int) raises -> Int:
+        """The host address of a GPU address inside one of our buffers."""
+        for i in range(len(self.live)):
+            var g = self.live_gpu[i]
+            if gpu_addr >= g and gpu_addr < g + self.live_bytes[i]:
+                return self.live_host[i] + (gpu_addr - g)
+        raise Error("MetalRT.host_of: not an address of a MetalRT buffer")
+
+    def upload(mut self, dst_gpu: Int, src_host: Int, nbytes: Int) raises:
+        """Host -> device, ORDERED like a launch: the bytes go into a staging
+        ring now and a copy kernel moves them when the GPU gets there, so
+        nothing the GPU has yet to read is overwritten under it. A wrap of
+        the ring syncs first. `nbytes` is a multiple of 4."""
+        if nbytes <= 0:
+            return
+        if nbytes > _STAGE_BYTES:
+            self.sync()
+            var dh = self.host_of(dst_gpu)
+            _memcpy(dh, src_host, nbytes)
+            return
+        if self.stage.obj == 0:
+            self.stage = self.alloc[DType.uint8](_STAGE_BYTES)
+        if self.stage_off + nbytes > _STAGE_BYTES:
+            self.sync()
+            self.stage_off = 0
+        _memcpy(self.stage.host + self.stage_off, src_host, nbytes)
+        var nw = Int64(nbytes // 4)
+        var src = Pointer[UInt32, MutAnyOrigin](
+            unsafe_from_address=self.stage.gpu + self.stage_off
+        )
+        var dst = Pointer[UInt32, MutAnyOrigin](unsafe_from_address=dst_gpu)
+        self.launch[_copy_words](dst, src, nw, grid=(Int(nw) + 255) // 256, block=256)
+        self.stage_off += (nbytes + 15) & ~15
+
+    def download(mut self, dst_host: Int, src_gpu: Int, nbytes: Int) raises:
+        """Device -> host: sync, then copy out of shared memory."""
+        self.sync()
+        _memcpy(dst_host, self.host_of(src_gpu), nbytes)
 
     def gpu_idle(self) -> Bool:
         """True when every committed command buffer has completed.
