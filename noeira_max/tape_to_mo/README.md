@@ -50,7 +50,25 @@ the run, so the CPU column is loose.
 | Cold, Metal | 52–72 s per graph |
 | From MAX's MEF cache | 7–18 ms |
 
-Not measured: NVIDIA, where the baseline to beat is the captured tape.
+## RTX 5090: MAX loses to the captured tape at every size
+
+`run.sh` does not cover the box: build with `-e default`, run under `pixi run`
+WITH the intercept preloaded, and symlink `noeira/cuda/libcuda_intercept.so`
+into the worktree (the tape's capture dlopens it relatively). Then
+`<binary> <dir> --nvidia [--captured-only]`.
+
+| µs per step | B1 | B1024 |
+|---|---|---|
+| captured tape | 43-46 | 98-99 |
+| MAX executed | 448-469 | 474-584 |
+| MAX captured (`capture=True`) | 106-110 | 312-315 |
+| loss read every 20 steps: captured tape / MAX captured | 33 / 84-85 | 92 / 214-226 |
+
+- MAX's CUDA matmul is TF32: the strict fp32 gate fails at 1.4e-4 (loss) /
+  5.9e-3 (param), already 4.8e-5 at step 0. Captured MAX equals executed MAX
+  bit for bit.
+- `capture` records without executing (replay once after it), and `replay`
+  returns before the GPU is done (only a read waits).
 
 ## Traps (all were harness bugs, not MAX's)
 
