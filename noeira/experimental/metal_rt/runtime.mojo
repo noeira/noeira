@@ -13,7 +13,7 @@ MTLResidencySet.h) plus the Mojo stdlib. The kernel is compiled to a metallib
 by `_compile_code` (the same compiler MAX uses), so a kernel launched here and
 one launched through `DeviceContext.enqueue_function` run the same code.
 
-## Kernel ABI (measured, see `test_metal_rt_abi.mojo`)
+## Kernel ABI (measured, see `test_abi.mojo`)
 
 Every kernel argument is its own Metal buffer-binding index, in declaration
 order, and is passed by value with `setBytes:length:atIndex:`: a device
@@ -27,13 +27,39 @@ All launches between two commits go into ONE serial compute encoder. Apple:
 "MTLDispatchTypeSerial: command encoder dispatches are executed in dispatched
 order", and `memoryBarrierWithScope:` "on a serial encoder is allowed, but
 ignored" -- i.e. a serial encoder already orders memory between dispatches.
-Buffers are created hazard-UNTRACKED (we never bind them, only pass their GPU
-address), so Metal knows nothing about dependencies between command buffers:
-each command buffer waits on the shared event for its predecessor's value
-(`encodeWaitForEvent:value:`) before its encoder starts, and signals its own
-sequence number when it ends. The same event gives the host the number of
-command buffers in flight (`committed - signaledValue`) without completion
-handlers.
+
+Between command buffers nothing is ordered for us. Buffers are created
+hazard-UNTRACKED (we never bind them, only pass their GPU address), and
+consecutive command buffers on one queue DO overlap on the GPU: with no
+ordering, 2000 dependent increments lose up to 30% of their updates
+(`bench_launch.mojo`, "no ordering"). `order=` picks the fix:
+
+  ORDER_FENCE    (default) one MTLFence; every encoder but the first waits on
+                 it at its start and updates it at its end. Free: same cost as
+                 the probe's tracked path.
+  ORDER_EVENT    shared-event chain (`encodeWaitForEvent:value:` on the
+                 predecessor's value). Correct but ~5x slower per command
+                 buffer (110 vs 22 us).
+  ORDER_TRACKED  hazard-tracked buffers declared per command buffer
+                 (`useResources`); Metal orders. Cost grows with live buffers.
+  ORDER_NONE     nothing. Loses updates. Measurement only.
+
+## Completion
+
+  DONE_STATUS    (default) retain the last committed command buffer and read
+                 its `status`; with ordered command buffers, "last completed"
+                 means "all completed". `sync()` spins on it
+                 (`spin_sync=False`: `waitUntilCompleted`).
+  DONE_EVENT     every command buffer signals a shared event with its
+                 sequence number. Costs ~20 us per command buffer on the GPU
+                 side (42 vs 22 us at one launch per command buffer).
+
+`sync_event=True` (default, either mode): the command buffer `sync()`
+commits signals the event and `sync()` spins on `signaledValue`. One signal
+per sync, not per command buffer, and the host sees completion ~80 us sooner
+than through `status` (one-launch round trip 108 vs 190 us).
+
+No completion handlers (ObjC blocks) are needed in any mode.
 
 ## Commit policies
 
@@ -41,6 +67,11 @@ handlers.
   COMMIT_EVERY_N   commit when `batch_n` launches are pending.
   COMMIT_ADAPTIVE  commit at once if the GPU has nothing in flight
                    (GPU idle => latency matters), else batch until `batch_n`.
+                   With `idle_age_us=T > 0`, "at once" becomes "once the
+                   oldest pending launch is T us old": a command buffer costs
+                   the GPU ~20 us, encoding a launch costs the host ~0.15 us,
+                   so committing a lone launch to an idle GPU only pays when
+                   the host is slow to send the next one.
 
 Every policy flushes on `sync()` and `flush()`. ADAPTIVE cannot see the future:
 launches batched while the GPU was busy stay on the host until the next launch,
@@ -61,6 +92,7 @@ Metal must know every buffer a command buffer touches through a GPU address.
 
 from std.memory import Pointer
 from std.sys import size_of
+from std.time import perf_counter_ns
 from max.gpu.host.compile import _compile_code
 
 from noeira.experimental.metal_rt.objc import ObjC
@@ -73,9 +105,20 @@ comptime RESIDENCY_SET = 0
 comptime RESIDENCY_PER_CB = 1
 comptime RESIDENCY_PER_LAUNCH = 2
 
-# MTLResourceStorageModeShared (0) | MTLResourceHazardTrackingModeUntracked
-comptime _BUF_OPTIONS = 0 | (1 << 8)
+# How consecutive command buffers are ordered on the GPU.
+comptime ORDER_FENCE = 0  # one MTLFence: wait at encoder start, update at end
+comptime ORDER_EVENT = 1  # shared event: wait for predecessor's value
+comptime ORDER_NONE = 2  # nothing (UNSAFE with untracked buffers; measurement)
+comptime ORDER_TRACKED = 3  # hazard-tracked buffers + useResources per cb
+
+# How the host learns that command buffers completed.
+comptime DONE_STATUS = 0  # retain the last command buffer, read its `status`
+comptime DONE_EVENT = 1  # every command buffer signals a shared event
+
+comptime _SHARED_UNTRACKED = 0 | (1 << 8)  # StorageModeShared | Untracked
+comptime _SHARED_TRACKED = 0 | (2 << 8)  # StorageModeShared | Tracked
 comptime _USAGE_RW = 1 | 2  # MTLResourceUsageRead | MTLResourceUsageWrite
+comptime _STATUS_COMPLETED = 4  # MTLCommandBufferStatusCompleted
 
 
 def policy_name(p: Int) -> String:
@@ -106,7 +149,8 @@ struct Buffer(ImplicitlyCopyable, Movable):
 
 
 struct _Sel(Movable):
-    var command_buffer: Int
+    """Every selector a launch touches, registered once."""
+
     var command_buffer_unretained: Int
     var compute_encoder: Int
     var set_pso: Int
@@ -117,12 +161,16 @@ struct _Sel(Movable):
     var wait_event: Int
     var signal_event: Int
     var signaled_value: Int
+    var wait_fence: Int
+    var update_fence: Int
     var use_resources: Int
     var add_allocation: Int
-    var rs_commit: Int
+    var status: Int
+    var retain: Int
+    var release: Int
+    var wait_until_completed: Int
 
     def __init__(out self, o: ObjC):
-        self.command_buffer = o.sel("commandBuffer")
         self.command_buffer_unretained = o.sel(
             "commandBufferWithUnretainedReferences"
         )
@@ -135,9 +183,14 @@ struct _Sel(Movable):
         self.wait_event = o.sel("encodeWaitForEvent:value:")
         self.signal_event = o.sel("encodeSignalEvent:value:")
         self.signaled_value = o.sel("signaledValue")
+        self.wait_fence = o.sel("waitForFence:")
+        self.update_fence = o.sel("updateFence:")
         self.use_resources = o.sel("useResources:count:usage:")
         self.add_allocation = o.sel("addAllocation:")
-        self.rs_commit = o.sel("commit")
+        self.status = o.sel("status")
+        self.retain = o.sel("retain")
+        self.release = o.sel("release")
+        self.wait_until_completed = o.sel("waitUntilCompleted")
 
 
 struct MetalRT(Movable):
@@ -146,16 +199,24 @@ struct MetalRT(Movable):
     var device: Int
     var queue: Int
     var event: Int
+    var fence: Int
     var rset: Int
     var policy: Int
     var batch_n: Int
     var residency: Int
-    var wait_chain: Bool
+    var order: Int
+    var done: Int
+    var spin_sync: Bool
+    var sync_event: Bool
+    var last_signaled: Int  # highest event value any command buffer signals
+    var idle_age_ns: Int
+    var first_pending_ns: Int  # when the open command buffer got its first launch
     var cb: Int
     var enc: Int
     var pool: Int
+    var last_cb: Int  # retained: the most recently committed command buffer
     var pending: Int  # launches encoded into the open command buffer
-    var committed: Int  # command buffers committed == value the last signals
+    var committed: Int  # command buffers committed
     var cur_pso: Int
     var rset_dirty: Bool
     var live: List[Int]  # every live MTLBuffer (for the per-cb modes)
@@ -172,7 +233,11 @@ struct MetalRT(Movable):
         policy: Int = COMMIT_ADAPTIVE,
         batch_n: Int = 16,
         residency: Int = RESIDENCY_SET,
-        wait_chain: Bool = True,
+        order: Int = ORDER_FENCE,
+        done: Int = DONE_STATUS,
+        spin_sync: Bool = True,
+        idle_age_us: Int = 0,
+        sync_event: Bool = True,
     ) raises:
         self.o = ObjC()
         self.s = _Sel(self.o)
@@ -183,13 +248,24 @@ struct MetalRT(Movable):
             raise Error("no Metal device")
         self.queue = self.o.send0(self.device, self.o.sel("newCommandQueue"))
         self.event = self.o.send0(self.device, self.o.sel("newSharedEvent"))
+        self.fence = self.o.send0(self.device, self.o.sel("newFence"))
         self.policy = policy
         self.batch_n = batch_n
         self.residency = residency
-        self.wait_chain = wait_chain
+        if order == ORDER_TRACKED and residency == RESIDENCY_SET:
+            # Tracking needs every resource declared to the encoder.
+            self.residency = RESIDENCY_PER_CB
+        self.order = order
+        self.done = done
+        self.spin_sync = spin_sync
+        self.sync_event = sync_event
+        self.last_signaled = 0
+        self.idle_age_ns = idle_age_us * 1000
+        self.first_pending_ns = 0
         self.cb = 0
         self.enc = 0
         self.pool = 0
+        self.last_cb = 0
         self.pending = 0
         self.committed = 0
         self.cur_pso = 0
@@ -202,7 +278,7 @@ struct MetalRT(Movable):
         self.n_commits = 0
         self.n_idle_commits = 0
         self.rset = 0
-        if residency == RESIDENCY_SET:
+        if self.residency == RESIDENCY_SET:
             var desc = self.o.send0(
                 self.o.send0(
                     self.o.cls("MTLResidencySetDescriptor"), self.o.sel("alloc")
@@ -232,7 +308,7 @@ struct MetalRT(Movable):
             self.device,
             self.o.sel("newBufferWithLength:options:"),
             nbytes,
-            _BUF_OPTIONS,
+            _SHARED_TRACKED if self.order == ORDER_TRACKED else _SHARED_UNTRACKED,
         )
         if obj == 0:
             raise Error("newBufferWithLength failed")
@@ -315,6 +391,8 @@ struct MetalRT(Movable):
         var pso = self._pipeline[func]()
         if self.enc == 0:
             self._begin()
+            if self.idle_age_ns > 0:
+                self.first_pending_ns = Int(perf_counter_ns())
         if pso != self.cur_pso:
             _ = self.o.send1(self.enc, self.s.set_pso, pso)
             self.cur_pso = pso
@@ -336,9 +414,20 @@ struct MetalRT(Movable):
         self.n_launches += 1
         self._maybe_commit()
 
-    def in_flight(self) -> Int:
-        """Command buffers committed but not yet completed."""
-        return self.committed - self.o.send0(self.event, self.s.signaled_value)
+    def gpu_idle(self) -> Bool:
+        """True when every committed command buffer has completed.
+
+        Reads the shared event when the last command buffer signalled it, else
+        the last command buffer's `status`. `status` turns Completed ~80 us
+        after the event does: reading it right after a `sync()` that waited on
+        the event says "busy" about a GPU that is idle."""
+        if self.done == DONE_EVENT or self.last_signaled == self.committed:
+            return (
+                self.o.send0(self.event, self.s.signaled_value) >= self.committed
+            )
+        if self.last_cb == 0:
+            return True
+        return self.o.send0(self.last_cb, self.s.status) >= _STATUS_COMPLETED
 
     def _maybe_commit(mut self):
         if self.policy == COMMIT_EACH:
@@ -349,7 +438,11 @@ struct MetalRT(Movable):
         else:
             if self.pending >= self.batch_n:
                 self._commit()
-            elif self.in_flight() == 0:
+            elif (
+                self.idle_age_ns == 0
+                or Int(perf_counter_ns()) - self.first_pending_ns
+                >= self.idle_age_ns
+            ) and self.gpu_idle():
                 self.n_idle_commits += 1
                 self._commit()
 
@@ -364,25 +457,36 @@ struct MetalRT(Movable):
 
     def _begin(mut self):
         if self.rset_dirty:
-            _ = self.o.send0(self.rset, self.s.rs_commit)
+            _ = self.o.send0(self.rset, self.s.commit)  # MTLResidencySet commit
             self.rset_dirty = False
         # One autorelease pool per command buffer: the command buffer and its
-        # encoder are autoreleased; after `commit` the queue owns the buffer.
+        # encoder are autoreleased; after `commit` the queue owns the buffer
+        # (and we retain the last one for `status`).
         self.pool = self.o.pool_push()
         self.cb = self.o.send0(self.queue, self.s.command_buffer_unretained)
-        if self.wait_chain and self.committed > 0:
+        if self.order == ORDER_EVENT and self.committed > 0:
             _ = self.o.send2(self.cb, self.s.wait_event, self.event, self.committed)
         self.enc = self.o.send0(self.cb, self.s.compute_encoder)
+        if self.order == ORDER_FENCE and self.committed > 0:
+            _ = self.o.send1(self.enc, self.s.wait_fence, self.fence)
         self.cur_pso = 0
         if self.residency == RESIDENCY_PER_CB:
             self._use_all()
 
-    def _commit(mut self):
+    def _commit(mut self, signal: Bool = False):
         if self.cb == 0:
             return
+        if self.order == ORDER_FENCE:
+            _ = self.o.send1(self.enc, self.s.update_fence, self.fence)
         _ = self.o.send0(self.enc, self.s.end_encoding)
         self.committed += 1
-        _ = self.o.send2(self.cb, self.s.signal_event, self.event, self.committed)
+        if signal or self.done == DONE_EVENT or self.order == ORDER_EVENT:
+            _ = self.o.send2(self.cb, self.s.signal_event, self.event, self.committed)
+            self.last_signaled = self.committed
+        if self.done == DONE_STATUS:
+            if self.last_cb != 0:
+                _ = self.o.send0(self.last_cb, self.s.release)
+            self.last_cb = self.o.send0(self.cb, self.s.retain)
         _ = self.o.send0(self.cb, self.s.commit)
         self.o.pool_pop(self.pool)
         self.cb = 0
@@ -392,11 +496,27 @@ struct MetalRT(Movable):
         self.n_commits += 1
 
     def flush(mut self):
-        """Commit whatever is encoded; do not wait."""
-        self._commit()
+        """Commit whatever is encoded; do not wait. The command buffer signals
+        the event (~20 us of GPU time) so that a later `sync()` with nothing
+        left to commit can still wait on the event rather than on `status`."""
+        self._commit(signal=self.sync_event)
 
     def sync(mut self):
-        """Commit, then spin until the GPU has finished everything."""
-        self._commit()
-        while self.o.send0(self.event, self.s.signaled_value) < self.committed:
-            pass
+        """Commit, then wait until the GPU has finished everything.
+
+        With `sync_event` (default) the command buffer committed here signals
+        the shared event and the host spins on `signaledValue`: the host sees
+        that ~80 us sooner than the command buffer's `status` turning
+        Completed (bench_launch.mojo, 3b). If nothing was open, the last
+        command buffer may not have signalled; fall back to its `status`."""
+        self._commit(signal=self.sync_event)
+        if self.last_signaled == self.committed:
+            while (
+                self.o.send0(self.event, self.s.signaled_value) < self.committed
+            ):
+                pass
+        elif self.spin_sync:
+            while not self.gpu_idle():
+                pass
+        elif self.last_cb != 0:
+            _ = self.o.send0(self.last_cb, self.s.wait_until_completed)

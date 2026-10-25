@@ -3,8 +3,9 @@ failure).
 
 1. Mixed arguments (pointer, Int, Float32, pointer) bound by index with
    `setBytes`, a multi-threadgroup grid, `block_idx`/`block_dim`/`thread_idx`.
-2. 2000 dependent 1-thread launches under every commit policy and residency
-   mode: the counter must read exactly 2000.
+2. 2000 dependent 1-thread launches under every commit policy, residency
+   mode and ordering mode (except ORDER_NONE, which is known to lose updates):
+   the counter must read exactly 2000.
 """
 
 from max.gpu import block_dim, block_idx, thread_idx, global_idx
@@ -18,6 +19,11 @@ from noeira.experimental.metal_rt.runtime import (
     RESIDENCY_SET,
     RESIDENCY_PER_CB,
     RESIDENCY_PER_LAUNCH,
+    ORDER_FENCE,
+    ORDER_EVENT,
+    ORDER_TRACKED,
+    DONE_STATUS,
+    DONE_EVENT,
     policy_name,
 )
 
@@ -65,16 +71,30 @@ def main() raises:
     if bad != 0:
         fails += 1
 
-    for res in [RESIDENCY_SET, RESIDENCY_PER_CB, RESIDENCY_PER_LAUNCH]:
-        for pol in [COMMIT_EACH, COMMIT_EVERY_N, COMMIT_ADAPTIVE]:
-            var r2 = MetalRT(policy=pol, batch_n=16, residency=res)
+    for cfg in range(6):
+      var res = RESIDENCY_SET
+      var order = ORDER_FENCE
+      var done = DONE_STATUS
+      if cfg == 1:
+          res = RESIDENCY_PER_CB
+      elif cfg == 2:
+          res = RESIDENCY_PER_LAUNCH
+      elif cfg == 3:
+          order = ORDER_EVENT
+          done = DONE_EVENT
+      elif cfg == 4:
+          order = ORDER_TRACKED
+      elif cfg == 5:
+          done = DONE_EVENT
+      for pol in [COMMIT_EACH, COMMIT_EVERY_N, COMMIT_ADAPTIVE]:
+            var r2 = MetalRT(policy=pol, batch_n=16, residency=res, order=order, done=done)
             var c = r2.alloc[DType.float32](1)
             c.host_ptr[DType.float32]()[unsafe_offset=0] = 0.0
             for _ in range(2000):
                 r2.launch[bump](c.dev[DType.float32](), grid=1, block=1)
             r2.sync()
             var v = c.host_ptr[DType.float32]()[unsafe_offset=0]
-            print("order: residency", res, "policy", policy_name(pol), "count", v,
+            print("order: residency", res, "order", order, "done", done, "policy", policy_name(pol), "count", v,
                   "commits", r2.n_commits, "OK" if v == 2000.0 else "FAIL")
             if v != 2000.0:
                 fails += 1
