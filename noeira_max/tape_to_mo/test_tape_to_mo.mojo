@@ -194,7 +194,8 @@ def eager_gpu(ctx: DeviceContext, net: Net, timed: Int, stage: Int = 2) raises -
     return best.best
 
 
-def tape_gpu(ctx: DeviceContext, net: Net, steps: Int, timed: Int, capture: Bool) raises -> Run:
+def tape_gpu(ctx: DeviceContext, net: Net, steps: Int, timed: Int, capture: Bool,
+             read: Bool = True) raises -> Run:
     """The eager tape on the GPU as `eager_gpu` runs it, gated like
     `compiled_gpu`. `capture`: step 0 runs eagerly (allocations, cuBLASLt
     plans), step 1 is captured into a CUDA graph and every later step
@@ -242,7 +243,11 @@ def tape_gpu(ctx: DeviceContext, net: Net, steps: Int, timed: Int, capture: Bool
             tape.replay()
         else:
             loss = one(opt)
-        var l = Float64(loss.item())
+        var l: Float64 = 0
+        if read:
+            l = Float64(loss.item())
+        else:   # timing only: a device sync, no loss read
+            ctx.synchronize()
         if s < steps:
             r.losses.append(l)
         elif s >= n:
@@ -256,13 +261,14 @@ def tape_gpu(ctx: DeviceContext, net: Net, steps: Int, timed: Int, capture: Bool
 
 
 def compiled_gpu(rt: Runtime, net: Net, steps: Int, timed: Int, path: String, stage: Int = 2,
-                 chain_per_buffer: Bool = False, packed: Bool = False, capture: Bool = False) raises -> Run:
+                 chain_per_buffer: Bool = False, packed: Bool = False, capture: Bool = False,
+                 read: Bool = True) raises -> Run:
     """The compiled step on the accelerator: every argument copied to the
     device and lent by address; batch 0 at every step. `stage` as in
     `eager_gpu` (1 outputs the gradients instead of storing an update).
     `capture`: step 0 executes, step 1 is recorded as MAX's device graph
-    (`M_captureModelSync`, CUDA / HIP only) and every later step replays it
-    on the same buffers."""
+    (`M_captureModelSync`, CUDA / HIP only) and replayed, and every later
+    step replays it on the same buffers."""
     var r = Run()
     var tape = Tape()
     var p = net.params(tape)
@@ -346,10 +352,13 @@ def compiled_gpu(rt: Runtime, net: Net, steps: Int, timed: Int, path: String, st
         var l: Float64
         if capture and s >= 1:
             if s == 1:
+                # capture RECORDS without executing (measured on a 5090,
+                # MAX 26.7: this step's loss read 0.0 and every later one
+                # lagged a step): replay once so step 1 happens
                 outs = model.capture(1, args)
-            else:
-                model.replay(1, args)
-            l = Float64(outs[0].to_host().item[DType.float32]())
+            model.replay(1, args)
+            # timing only (`read=False`): the replay is synchronous, no loss read
+            l = Float64(outs[0].to_host().item[DType.float32]()) if read else 0.0
         else:
             l = Float64(model.execute(inputs).tensor("loss").to_host().item[DType.float32]())
         if s < steps:
@@ -667,7 +676,7 @@ def nvidia(dir: String) raises:
     ok = compare("MAX captured vs MAX executed (same TF32 math)", ccap, cs, 1e-6, 1e-6) and ok
     print("NVIDIA GATES OK" if ok else "NVIDIA GATES FAILED")
     if len(argv()) > 3 and String(argv()[3]) == "--captured-only":
-        var shapes1: List[List[Int]] = [[1, 17, 256, 6], [64, 17, 256, 6], [256, 64, 256, 8], [1024, 128, 512, 16]]
+        var shapes1: List[List[Int]] = [[1, 17, 256, 6], [1024, 128, 512, 16]]
         for i in range(len(shapes1)):
             var nt = Net(shapes1[i][0], shapes1[i][1], shapes1[i][2], shapes1[i][3], 0)
             print("B ", nt.b, ", ", nt.din, " -> ", nt.h, " -> ", nt.h, " -> ", nt.dout, " (us per step)", sep="")
@@ -675,8 +684,12 @@ def nvidia(dir: String) raises:
                 var ec = tape_gpu(ctx, nt, 0, 200, True)
                 var ms = compiled_gpu(grt, nt, 0, 200, String(dir, "/nv_", i, "_stores.mlir"))
                 var mc = compiled_gpu(grt, nt, 0, 200, String(dir, "/nv_", i, "_stores.mlir"), capture=True)
+                var en = tape_gpu(ctx, nt, 0, 200, True, read=False)
+                var mn = compiled_gpu(grt, nt, 0, 200, String(dir, "/nv_", i, "_stores.mlir"), capture=True,
+                                      read=False)
                 print("  round ", rd, ": captured tape ", Int(ec.step_us), " | MAX executed ", Int(ms.step_us),
-                      " | MAX captured ", Int(mc.step_us), "  [load ms: ", Int(mc.compile_ms), "]", sep="")
+                      " | MAX captured ", Int(mc.step_us), " || no loss read: captured tape ", Int(en.step_us),
+                      " | MAX captured ", Int(mn.step_us), "  [load ms: ", Int(mc.compile_ms), "]", sep="")
         if not ok:
             raise Error("nvidia gate failed")
         return
