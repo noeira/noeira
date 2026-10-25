@@ -22,6 +22,7 @@ The training step is split between the two:
 | `probe_io.mojo` | Which input/output shapes work (several I/O, odd sizes, both tensor forms) |
 | `probe_ops.mojo` | Which ops compile, and the accuracy of exp/log/sqrt/sigmoid/tanh/reciprocal |
 | `probe_mil.mojo` | Bisects a refused program (`ANECCompile() FAILED` names nothing) |
+| `probe_zero_copy.mojo` | GPU (metal_rt) and ANE sharing the surfaces with no copy |
 | `bench_ane_step.mojo` | Step 3: CPU tape vs ANE vs the metal_rt tape |
 | `tests/experimental/ane/test_ane_step.mojo` | The gates |
 
@@ -110,3 +111,73 @@ fp16 writes / eval / gradient reads / Adam.
   loops: 12 ms of WIDE's 30 ms.
 
 Not measured: power. It needs `sudo powermetrics` during a run.
+
+## Zero copy between the GPU (metal_rt) and the ANE (`probe_zero_copy.mojo`)
+
+Can a GPU kernel write the ANE's input surfaces and read its output surface
+in place, with no CPU copy? **Yes.**
+
+**The route: a buffer, not a texture.** `MetalRT.wrap_external(addr, nbytes)`
+wraps a surface's memory with `newBufferWithBytesNoCopy:length:options:
+deallocator:`:
+- shared storage and a nil deallocator, on the surface's page-aligned base
+  and `IOSurfaceGetAllocSize` (whole 16 KB pages since f23f04c99);
+- `contents` comes back equal to the IOSurface's base address, so no copy;
+- the buffer gets a `gpuAddress` and joins the residency set like any other
+  metal_rt buffer;
+- `free` releases the MTLBuffer object only; the IOSurface keeps owning the
+  memory.
+
+The texture route (`newTextureWithDescriptor:iosurface:plane:`) was not
+needed and was not tried.
+
+**Checks** (linear program `y = x @ w + b`, B×I @ I×O; all pass):
+
+| Check | Result |
+|---|---|
+| a. GPU -> ANE: GPU kernels write x, w, b (fp16, padded row stride); CPU reads y vs float64 | 0 bad elements, 20 iterations per shape (3 at B=4096) |
+| b. ANE -> GPU: GPU kernel reads y (padded) into an fp32 buffer | 0 bad elements |
+| d. shapes | B17 I5 O6 (every row padded to 32 elements), B256 I64 O64, B64 I32 O48 (mixed), B4096 I512 O512 |
+| c. coherency: 200 iterations of y = a + b, values changed every iteration, every element checked exactly, at [64,40], [17,6] and [512,512] | 0 bad **without any IOSurfaceLock**; 0 bad with lock/unlock around each handoff too |
+| f. mutant: inputs written at the DENSE row stride | B17 I5 O6: 306 / 306 elements wrong, caught. At B256 I64 O64 the rows are not padded, so there is nothing to catch. |
+
+The tolerance in (a) and (b) is 2⁻⁹ · max(|ref|, 1), about 2 fp16 ulps. A
+stale or misplaced element is off by 0.1 or more.
+
+**Locks: not needed.** metal_rt's `sync()` (command buffer completed) before
+the ANE evaluation, and the synchronous `evaluateWithQoS` before the GPU
+reads, are enough on the M1 Pro.
+
+**Timing**, median µs per iteration, two runs (the ANE evaluation itself
+varies 640–1970 µs at B=4096 between runs):
+
+| Shape | Zero-copy, 2 GPU syncs (write+sync / ANE / read+sync) | Zero-copy, 1 GPU sync per iteration | CPU path (generate / write / ANE / read) |
+|---|---|---|---|
+| B17 I5 O6 | 590 (183 / 243 / 162) | 429 | 248 (0 / 5 / 239 / 2) |
+| B256 I64 O64 | 575–605 (181 / 245 / 160) | 430–451 | 286–300 (24 / 15 / 246 / 9) |
+| B4096 I512 O512 | 1255–1628 (~360 / 640–930 / ~270) | 1451–1924 | 4845–5833 (2290 / 840 / 990–1970 / 710) |
+
+- **Large tensors: zero copy wins.** At B=4096 it is 3–3.5× faster than the
+  CPU path. Even without the host's generator loop, the CPU path's fp16
+  writes and reads alone (≈ 1.55 ms) cost more than the GPU's whole
+  write-and-read, sync included.
+- **Small tensors: zero copy loses.** One GPU round trip (commit, run, sync)
+  costs ~160–180 µs. The CPU writes a few hundred fp16 values in 5 µs.
+- **The training step needs one sync.** The planned step (ANE eval -> one
+  GPU kernel that reads the gradients, runs Adam on fp32 masters and writes
+  fp16 weights -> ANE eval) needs ONE GPU sync per step, the "1 GPU sync"
+  column. The GPU round trip is then the fixed cost to beat.
+
+**Surprises:**
+
+- **64-bit index math was slow.** The first write kernel used `Int` (64-bit)
+  indices and divided a 1-D thread index into (row, col). It took 2–5 ms at
+  B=4096, on an ordinary metal_rt buffer as much as on a surface: the GPU
+  emulates 64-bit division. With 32-bit math and a 2-D grid (columns in x,
+  rows in y) the same writes take ~0.36 ms with the sync. The surface
+  memory itself is as fast as a normal buffer: a trivial fill of 4 MB runs
+  in ~250 µs, sync included, on both.
+- **The ANE evaluation is noisy.** At B=4096 it ran in 640–930 µs after the
+  GPU path and 990–1970 µs after the CPU path. These are single runs, not a
+  controlled comparison.
+- **No locks needed** (see above).
