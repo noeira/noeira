@@ -31,7 +31,7 @@ the bit-identity gate compares that against the metal_rt tape.
 """
 
 from std.builtin.device_passable import DevicePassable
-from std.sys import size_of
+from std.sys import size_of, default_accelerator
 from max.gpu.host import DeviceContext, DeviceBuffer
 
 from noeira.nn.constants import DT
@@ -60,6 +60,14 @@ struct Dev(ImplicitlyCopyable):
         self.rt = rt
         self.own = own or rt != 0
 
+    @implicit
+    def __init__(out self, ctx: DeviceContext):
+        """MAX's launch path: lets callers outside the tape keep passing a
+        `DeviceContext` to the tape's GPU functions."""
+        self.ctx = ctx
+        self.rt = 0
+        self.own = False
+
     @always_inline
     def is_rt(self) -> Bool:
         return self.rt != 0
@@ -83,6 +91,13 @@ struct Dev(ImplicitlyCopyable):
         func: def(*args: *decl) thin -> None,
         *Ts: DevicePassable,
     ](self, *args: *Ts, grid_dim: Int, block_dim: Int) raises:
+        # metal_rt is Apple-only: on CUDA, do not instantiate its pipeline
+        # path (it would compile every tape kernel a second time).
+        comptime if default_accelerator().is_nvidia_gpu():
+            self.ctx.enqueue_function[func](
+                *args, grid_dim=grid_dim, block_dim=block_dim
+            )
+            return
         if self.rt == 0:
             self.ctx.enqueue_function[func](
                 *args, grid_dim=grid_dim, block_dim=block_dim
@@ -100,6 +115,11 @@ struct Dev(ImplicitlyCopyable):
     ](
         self, *args: *Ts, grid_dim: Tuple[Int, Int], block_dim: Tuple[Int, Int]
     ) raises:
+        comptime if default_accelerator().is_nvidia_gpu():
+            self.ctx.enqueue_function[func](
+                *args, grid_dim=grid_dim, block_dim=block_dim
+            )
+            return
         if self.rt == 0:
             self.ctx.enqueue_function[func](
                 *args, grid_dim=grid_dim, block_dim=block_dim
