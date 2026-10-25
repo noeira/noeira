@@ -129,6 +129,62 @@ def policy_name(p: Int) -> String:
     return "adaptive"
 
 
+def load_pipeline(o: ObjC, device: Int, lib_bytes: String, fname: String) raises -> Int:
+    """metallib bytes -> MTLLibrary -> MTLFunction -> MTLComputePipelineState."""
+    var pool = o.pool_push()
+    var data = o.system.get_function[Int]("dispatch_data_create")(
+        Int(lib_bytes.unsafe_ptr()), lib_bytes.byte_length(), 0, 0
+    )
+    var err = List[Int](length=1, fill=0)
+    var errp = Int(err.unsafe_ptr())
+    var mlib = o.send2(
+        device, o.sel("newLibraryWithData:error:"), data, errp
+    )
+    o.check_error(err[0], "newLibraryWithData")
+    var mfn = o.send1(
+        mlib, o.sel("newFunctionWithName:"), o.nsstring(fname)
+    )
+    if mfn == 0:
+        raise Error("function not in metallib: " + fname)
+    var pso = o.send2(
+        device,
+        o.sel("newComputePipelineStateWithFunction:error:"),
+        mfn,
+        errp,
+    )
+    o.check_error(err[0], "newComputePipelineStateWithFunction")
+    o.release(mfn)
+    o.release(mlib)
+    o.release(data)
+    o.pool_pop(pool)
+    return pso
+
+
+trait Launcher(Movable & Deinitable):
+    """What `MetalRT` and `Metal4RT` both offer, so a workload can be written
+    once and run on either."""
+
+    def launch[
+        func_type: TrivialRegisterPassable, //, func: func_type, *Ts: AnyType
+    ](mut self, *args: *Ts, grid: Int, block: Int) raises:
+        ...
+
+    def alloc[dt: DType](mut self, count: Int) raises -> Buffer:
+        ...
+
+    def flush(mut self):
+        ...
+
+    def sync(mut self):
+        ...
+
+    def commits(self) -> Int:
+        ...
+
+    def idle_commits(self) -> Int:
+        ...
+
+
 @fieldwise_init
 struct Buffer(ImplicitlyCopyable, Movable):
     """A shared-storage MTLBuffer. `host` is the CPU address (`contents`),
@@ -193,7 +249,7 @@ struct _Sel(Movable):
         self.wait_until_completed = o.sel("waitUntilCompleted")
 
 
-struct MetalRT(Movable):
+struct MetalRT(Launcher):
     var o: ObjC
     var s: _Sel
     var device: Int
@@ -297,6 +353,12 @@ struct MetalRT(Movable):
             self.o.release(desc)
             _ = self.o.send1(self.queue, self.o.sel("addResidencySet:"), self.rset)
 
+    def commits(self) -> Int:
+        return self.n_commits
+
+    def idle_commits(self) -> Int:
+        return self.n_idle_commits
+
     def name(self) -> String:
         return self.o.utf8(self.o.send0(self.device, self.o.sel("name")))
 
@@ -353,33 +415,7 @@ struct MetalRT(Movable):
         return pso
 
     def _load(mut self, lib_bytes: String, fname: String) raises -> Int:
-        var pool = self.o.pool_push()
-        var data = self.o.system.get_function[Int]("dispatch_data_create")(
-            Int(lib_bytes.unsafe_ptr()), lib_bytes.byte_length(), 0, 0
-        )
-        var err = List[Int](length=1, fill=0)
-        var errp = Int(err.unsafe_ptr())
-        var mlib = self.o.send2(
-            self.device, self.o.sel("newLibraryWithData:error:"), data, errp
-        )
-        self.o.check_error(err[0], "newLibraryWithData")
-        var mfn = self.o.send1(
-            mlib, self.o.sel("newFunctionWithName:"), self.o.nsstring(fname)
-        )
-        if mfn == 0:
-            raise Error("function not in metallib: " + fname)
-        var pso = self.o.send2(
-            self.device,
-            self.o.sel("newComputePipelineStateWithFunction:error:"),
-            mfn,
-            errp,
-        )
-        self.o.check_error(err[0], "newComputePipelineStateWithFunction")
-        self.o.release(mfn)
-        self.o.release(mlib)
-        self.o.release(data)
-        self.o.pool_pop(pool)
-        return pso
+        return load_pipeline(self.o, self.device, lib_bytes, fname)
 
     # ---------------------------------------------------------------- launch
 

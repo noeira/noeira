@@ -11,6 +11,7 @@ failure).
 from max.gpu import block_dim, block_idx, thread_idx, global_idx
 from std.sys import exit
 
+from noeira.experimental.metal_rt.metal4 import Metal4RT
 from noeira.experimental.metal_rt.runtime import (
     MetalRT,
     COMMIT_EACH,
@@ -98,6 +99,41 @@ def main() raises:
                   "commits", r2.n_commits, "OK" if v == 2000.0 else "FAIL")
             if v != 2000.0:
                 fails += 1
+    # ---- Metal 4 path ---------------------------------------------------
+    var m4 = Metal4RT(policy=COMMIT_EVERY_N, batch_n=16)
+    var a4 = m4.alloc[DType.float32](N)
+    var b4 = m4.alloc[DType.float32](N)
+    for i in range(N):
+        a4.host_ptr[DType.float32]()[unsafe_offset=i] = Float32(i)
+        b4.host_ptr[DType.float32]()[unsafe_offset=i] = -1.0
+    m4.launch[abi_kernel](
+        b4.dev[DType.float32](), N - 3, Float32(0.5), a4.dev[DType.float32](),
+        grid=(N + 63) // 64, block=64,
+    )
+    m4.sync()
+    var bad4 = 0
+    for i in range(N):
+        var want: Float32 = Float32(i) * 0.5 + Float32(i // 64) * 1000.0
+        if i >= N - 3:
+            want = -1.0
+        if b4.host_ptr[DType.float32]()[unsafe_offset=i] != want:
+            bad4 += 1
+    print("metal4 abi:", "OK" if bad4 == 0 else "FAIL")
+    if bad4 != 0:
+        fails += 1
+    for pol in [COMMIT_EACH, COMMIT_EVERY_N, COMMIT_ADAPTIVE]:
+        var r4 = Metal4RT(policy=pol, batch_n=16)
+        var c4 = r4.alloc[DType.float32](1)
+        c4.host_ptr[DType.float32]()[unsafe_offset=0] = 0.0
+        for _ in range(2000):
+            r4.launch[bump](c4.dev[DType.float32](), grid=1, block=1)
+        r4.sync()
+        var v4 = c4.host_ptr[DType.float32]()[unsafe_offset=0]
+        print("metal4 order: policy", policy_name(pol), "count", v4, "commits", r4.n_commits,
+              "OK" if v4 == 2000.0 else "FAIL")
+        if v4 != 2000.0:
+            fails += 1
+
     if fails != 0:
         print("FAILED:", fails)
         exit(1)

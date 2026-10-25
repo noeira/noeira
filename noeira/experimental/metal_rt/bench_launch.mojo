@@ -14,6 +14,7 @@ from max.gpu import global_idx
 from max.gpu.host import DeviceContext, DeviceBuffer
 
 from noeira.experimental.metal_rt.objc import ObjC
+from noeira.experimental.metal_rt.metal4 import Metal4RT
 from noeira.experimental.metal_rt.runtime import (
     MetalRT,
     Buffer,
@@ -65,6 +66,39 @@ def roundtrip_ours(mut rt: MetalRT, c: Buffer, spin_on_value: Bool) raises -> Fl
         if hp[unsafe_offset=0] != v:
             raise Error("round trip read a stale value")
     rt.sync()
+    sort(ts)
+    return Float64(ts[len(ts) // 2]) / 1e3
+
+
+def m4_dependent(mut rt: Metal4RT, c: Buffer) raises -> Float64:
+    var best = Float64(1e30)
+    for r in range(4):
+        c.host_ptr[DType.float32]()[unsafe_offset=0] = 0.0
+        var t0 = perf_counter_ns()
+        for _ in range(K):
+            rt.launch[bump](c.dev[DType.float32](), grid=1, block=1)
+        rt.sync()
+        var t = us(t0, perf_counter_ns(), K)
+        if r > 0 and t < best:
+            best = t
+    var got = c.host_ptr[DType.float32]()[unsafe_offset=0]
+    if got != Float32(K):
+        print("  !! METAL4 LOST UPDATES: counter", got, "of", K, "(batch", rt.batch_n, "barriers", rt.barriers, ")")
+        return -1.0
+    return best
+
+
+def m4_roundtrip(mut rt: Metal4RT, c: Buffer) raises -> Float64:
+    var ts = List[Int]()
+    var hp = c.host_ptr[DType.float32]()
+    for i in range(400):
+        var v = Float32(i + 1)
+        var t0 = Int(perf_counter_ns())
+        rt.launch[stamp](c.dev[DType.float32](), v, grid=1, block=1)
+        rt.sync()
+        ts.append(Int(perf_counter_ns()) - t0)
+        if hp[unsafe_offset=0] != v:
+            raise Error("metal4 round trip read a stale value")
     sort(ts)
     return Float64(ts[len(ts) // 2]) / 1e3
 
@@ -206,6 +240,28 @@ def main() raises:
         var cc = r.alloc[DType.float32](1)
         rr += " | " + String(roundtrip_ours(r, cc, cfg == 3))
     print(rr + " |")
+
+    # ---- 3c. Metal 4 ----------------------------------------------------
+    print("\n## 3c. Metal 4 path,", K, "dependent 1-thread launches, us/launch (-1 = LOST UPDATES)")
+    print("| launches / cb | Metal 4 (barriers) | Metal 4, no barriers (unsafe) |")
+    print("|---|---|---|")
+    for n in [1, 4, 16, 64, K]:
+        var ra = Metal4RT(policy=COMMIT_EVERY_N, batch_n=n)
+        var ca = ra.alloc[DType.float32](1)
+        var rb = Metal4RT(policy=COMMIT_EVERY_N, batch_n=n, barriers=False)
+        var cb = rb.alloc[DType.float32](1)
+        print("|", n, "|", m4_dependent(ra, ca), "|", m4_dependent(rb, cb), "|")
+    var r4 = Metal4RT(policy=COMMIT_EVERY_N, batch_n=1 << 30)
+    var c4 = r4.alloc[DType.float32](1)
+    var e0 = perf_counter_ns()
+    for _ in range(K):
+        r4.launch[bump](c4.dev[DType.float32](), grid=1, block=1)
+    var e1 = perf_counter_ns()
+    r4.sync()
+    print("Metal 4 host encode cost, us/launch:", us(e0, e1, K))
+    var r4b = Metal4RT(policy=COMMIT_EVERY_N, batch_n=1 << 30)
+    var c4b = r4b.alloc[DType.float32](1)
+    print("Metal 4 one launch + sync (event spin), median us:", m4_roundtrip(r4b, c4b))
 
     # ---- 4. live buffers -----------------------------------------------
     print("\n## 4. live buffers,", K, "dependent launches, us/launch")

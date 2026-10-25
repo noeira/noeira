@@ -24,8 +24,10 @@ from std.sys import argv, exit
 from std.time import perf_counter_ns
 from max.gpu.host import DeviceContext, DeviceBuffer, HostBuffer
 
+from noeira.experimental.metal_rt.metal4 import Metal4RT
 from noeira.experimental.metal_rt.runtime import (
     MetalRT,
+    Launcher,
     Buffer,
     COMMIT_EACH,
     COMMIT_EVERY_N,
@@ -250,7 +252,7 @@ def d(b: List[Buffer], k: Int) -> Pointer[Float32, MutAnyOrigin]:
     return b[k].dev[DType.float32]()
 
 
-def ours_step(mut rt: MetalRT, b: List[Buffer], c: Cfg, t: Int) raises:
+def ours_step[L: Launcher](mut rt: L, b: List[Buffer], c: Cfg, t: Int) raises:
     var B = Int64(c.B)
     var I = Int64(c.I)
     var H = Int64(c.H)
@@ -278,10 +280,18 @@ def run_ours(
     batch_n: Int,
     idle_age_us: Int = 0,
     order: Int = ORDER_FENCE,
+    metal4: Bool = False,
 ) raises -> Result:
-    var rt = MetalRT(
-        policy=policy, batch_n=batch_n, idle_age_us=idle_age_us, order=order
+    if metal4:
+        return drive(Metal4RT(policy=policy, batch_n=batch_n, idle_age_us=idle_age_us), c, init)
+    return drive(
+        MetalRT(policy=policy, batch_n=batch_n, idle_age_us=idle_age_us, order=order),
+        c,
+        init,
     )
+
+
+def drive[L: Launcher](var rt: L, c: Cfg, init: List[List[Float32]]) raises -> Result:
     var b = List[Buffer]()
     for k in range(NBUF):
         var buf = rt.alloc[DType.float32](c.nelem(k))
@@ -298,8 +308,8 @@ def run_ours(
         if t == c.warmup:
             rt.sync()
             t0 = Int(perf_counter_ns())
-            c0 = rt.n_commits
-            i0 = rt.n_idle_commits
+            c0 = rt.commits()
+            i0 = rt.idle_commits()
         ours_step(rt, b, c, t)
         if c.flush_each_step:
             rt.flush()
@@ -310,8 +320,8 @@ def run_ours(
     rt.sync()
     var r = Result()
     r.us_step = Float64(Int(perf_counter_ns()) - t0) / 1e3 / Float64(c.steps)
-    r.commits = rt.n_commits - c0
-    r.idle_commits = rt.n_idle_commits - i0
+    r.commits = rt.commits() - c0
+    r.idle_commits = rt.idle_commits() - i0
     for k in [W1, B1, W2, B2]:
         var hp = b[k].host_ptr[DType.float32]()
         for i in range(c.nelem(k)):
@@ -368,6 +378,7 @@ struct Pol(ImplicitlyCopyable, Movable):
     var batch_n: Int
     var idle_age_us: Int
     var flush_each_step: Bool
+    var metal4: Bool
 
 
 def main() raises:
@@ -377,17 +388,18 @@ def main() raises:
             quick = True
     var steps = 100 if quick else 500
     var warmup = 20 if quick else 50
-    var reps = 1 if quick else 3
+    var reps = 1 if quick else 5
     var ctx = DeviceContext()
     var fails = 0
     var gates = 0
 
     var pols = List[Pol]()
-    pols.append(Pol("each", COMMIT_EACH, 1, 0, False))
-    pols.append(Pol("every-16", COMMIT_EVERY_N, 16, 0, False))
-    pols.append(Pol("every-64", COMMIT_EVERY_N, 64, 0, False))
-    pols.append(Pol("adaptive-16", COMMIT_ADAPTIVE, 16, 0, False))
-    pols.append(Pol("adaptive-16, age 20us", COMMIT_ADAPTIVE, 16, 20, False))
+    pols.append(Pol("each", COMMIT_EACH, 1, 0, False, False))
+    pols.append(Pol("every-16", COMMIT_EVERY_N, 16, 0, False, False))
+    pols.append(Pol("every-64", COMMIT_EVERY_N, 64, 0, False, False))
+    pols.append(Pol("adaptive-16", COMMIT_ADAPTIVE, 16, 0, False, False))
+    pols.append(Pol("adaptive-16, age 20us", COMMIT_ADAPTIVE, 16, 20, False, False))
+    pols.append(Pol("Metal 4 every-16", COMMIT_EVERY_N, 16, 0, False, True))
 
     print("MLP step: I=16, O=4,", STEP_LAUNCHES, "launches/step,", steps,
           "timed steps after", warmup, "warm-up; us/step, median of", reps, "repeats")
@@ -419,7 +431,7 @@ def main() raises:
                         fails += 1
                     tm.append(rm.us_step)
                     for p in range(len(pols)):
-                        var r = run_ours(c, init, pols[p].policy, pols[p].batch_n, pols[p].idle_age_us)
+                        var r = run_ours(c, init, pols[p].policy, pols[p].batch_n, pols[p].idle_age_us, metal4=pols[p].metal4)
                         gates += 1
                         if not check(ref_, r, String("H=", h, " B=", bb, " read_every=", re, " ", pols[p].name)):
                             fails += 1
@@ -443,11 +455,11 @@ def main() raises:
     # ---- the tail problem: host CPU work after each step's launches -------
     print("\n### host CPU work between a step's launches and its loss read-back, H=64 B=64, loss every step; us/step, median of", reps, "\n")
     var tpols = List[Pol]()
-    tpols.append(Pol("each", COMMIT_EACH, 1, 0, False))
-    tpols.append(Pol("every-16", COMMIT_EVERY_N, 16, 0, False))
-    tpols.append(Pol("adaptive-16", COMMIT_ADAPTIVE, 16, 0, False))
-    tpols.append(Pol("adaptive-16, age 20us", COMMIT_ADAPTIVE, 16, 20, False))
-    tpols.append(Pol("every-16 + flush()/step", COMMIT_EVERY_N, 16, 0, True))
+    tpols.append(Pol("each", COMMIT_EACH, 1, 0, False, False))
+    tpols.append(Pol("every-16", COMMIT_EVERY_N, 16, 0, False, False))
+    tpols.append(Pol("adaptive-16", COMMIT_ADAPTIVE, 16, 0, False, False))
+    tpols.append(Pol("adaptive-16, age 20us", COMMIT_ADAPTIVE, 16, 20, False, False))
+    tpols.append(Pol("every-16 + flush()/step", COMMIT_EVERY_N, 16, 0, True, False))
     var hdr = String("| cpu us/step | MAX")
     var sep = String("|---|---")
     for p in range(len(tpols)):
