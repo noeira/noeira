@@ -70,6 +70,25 @@ into the worktree (the tape's capture dlopens it relatively). Then
 - `capture` records without executing (replay once after it), and `replay`
   returns before the GPU is done (only a read waits).
 
+**Where MAX's GPU time goes** (`--profile tape|max 1|1024` under
+`nsys profile --cuda-graph-trace=node`). Kernel counts are equal (MAX 37-46
+per step, the tape 36-40) and gaps inside both graphs are < 0.5 µs. MAX
+loses on three things, all inside MAX 26.7:
+
+- Each vendor cuBLAS call creates and zeroes a fresh 32 MiB workspace
+  (`linalg/matmul/vendor/blas.mojo`): 3 memsets of ~9.8 µs per step,
+  replayed by the device graph too.
+- On sm_120, fp32 GEMMs take the Ampere-tuned `multistage_gemm` configs:
+  4-32 CTAs and no split-K. The K = 1024 weight gradients at B1024 take
+  58 µs each, where cuBLASLt takes 8 µs plus a 1.7 µs split-K reduce. In
+  all, MAX's matmuls take 200 µs per step against the tape's 66. At B1, one
+  matmul runs on a single 16-thread block of `matmul_kernel_naive`: 10 µs.
+- Adam is ~18 per-parameter kernels (nn's grouped Adam: 2), and each store
+  is a small device-to-device copy (~15 per step).
+
+The tape is TF32 too at B1024 (cuBLASLt `s1688gemm`). Only the gate's B64
+shapes are fp32 on the tape.
+
 ## Traps (all were harness bugs, not MAX's)
 
 - **Indexing a `Tuple` returns a temporary copy.** `HostBuffer(copy_from=Int(bt[1].unsafe_ptr()))`
