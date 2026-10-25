@@ -360,7 +360,8 @@ Three more pitfalls, found here:
   read zeros and the step-2 loss diverged. It happened in about 1 run in 3
   of the gate, and could not be reproduced on demand (0 of 80 stress runs,
   with or without the fix). `alloc` now commits the open command buffer
-  first, and 9 of 9 full gate runs passed since.
+  first, and every full gate run since has passed (12 of 12, plus 40
+  stress runs).
 - **Two `DeviceContext`s are two queues.** In the first version of the
   tolerance gate, nn's Adam was given a fresh `DeviceContext()` while the
   tape used another one. It raced the tape's own work. This is a MAX-side
