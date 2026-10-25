@@ -59,7 +59,14 @@ from ..core.param import Param, ParamVisitor
 from ..core.initializer import Initializer
 from ..core.amp import AMPPolicy, NoAMP
 from ..core.polyak import polyak_tensor
-from .linear import _cast_f2b_kernel, BF16, enqueue_bias_grad
+from .linear import (
+    _cast_f2b_kernel,
+    BF16,
+    enqueue_bias_grad,
+    enqueue_channel_grad,
+    TWO_PASS_MIN_ELEMS,
+    CHANNEL_TWO_PASS_MIN_ROWS,
+)
 
 
 comptime CONV_DW_TPB: Int = 128
@@ -747,23 +754,17 @@ def _backward_db_kernel[
         grad_bias[oc] = rebind[Scalar[DT]](grad_bias[oc]) + total[0]
 
 
-def _rowsum_kernel[ROWS: Int, COLS: Int](
-    src: Tile[DT, ROWS, COLS],
-    dst: Tile[DT, ROWS],
-):
-    """`dst[r] = Σ_c src[r, c]`, one block per row (coalesced along c).
-    Stage 1 of the NCHW bias gradient: rows are (sample, channel), columns
-    the contiguous OH·OW positions."""
-    var r = Int(block_idx.x)
-    var t = Int(thread_idx.x)
-    var acc: Scalar[DT] = 0
-    var c = t
-    while c < COLS:
-        acc += rebind[Scalar[DT]](src[r, c])
-        c += CONV_DW_TPB
-    var total = block.sum[block_size=CONV_DW_TPB, broadcast=False](val=acc)
-    if t == 0:
-        dst[r] = total[0]
+@always_inline
+def _db_two_pass[LAYOUT: Int, B: Int, OC: Int, SO: Int]() -> Bool:
+    """Whether a conv bias gradient leaves `_backward_db_kernel` (one block
+    per channel) for the two-pass reductions: NCHW by rows per channel
+    (`CHANNEL_TWO_PASS_MIN_ROWS`), NHWC by elements (`TWO_PASS_MIN_ELEMS`),
+    both target-dependent. Conv2DTranspose and Conv2D's bf16 path ask it;
+    Conv2D's fp32 path takes the two passes unconditionally (f07082beb)."""
+    comptime if LAYOUT == LAYOUT_NHWC:
+        return B * SO * OC >= TWO_PASS_MIN_ELEMS
+    else:
+        return B * SO >= CHANNEL_TWO_PASS_MIN_ROWS
 
 
 def _bias_add_out_kernel[
@@ -1555,27 +1556,24 @@ struct Conv2D[
         if self._sk_p > 1:
             self.sk_ws.ensure_gpu(ctx, self._sk_p * Self.OC_ * Self.CPAD)
 
-    def _enqueue_db[B: Int](mut self, c: DeviceContext, mut god: Tensor) raises:
+    def _enqueue_db[
+        GDT: DType, //, B: Int
+    ](mut self, c: DeviceContext, go: DeviceBuffer[GDT]) raises:
         """`grad_bias += Σ_{b, s} grad_output[b, oc, s]`, deterministic, in two
-        passes. The old `_backward_db_kernel` gave each channel ONE block
-        walking B·OH·OW values: 16 blocks on a 170-SM card for a ResNet stem,
-        ~118 us at batch 100 x 32x32 — longer than cuDNN's whole dgrad.
-        NCHW: per-(b, oc) row sums over the contiguous OH·OW, then the
-        [B, OC] column sum. NHWC: grad_output already is [B·OH·OW, OC]."""
+        passes, for an fp32 or bf16 (`GDT`) grad_output. The old one-block-per-
+        channel kernel gave each channel ONE block walking B·OH·OW
+        values: 16 blocks on a 170-SM card for a ResNet stem, ~118 us at batch
+        100 x 32x32 — longer than cuDNN's whole dgrad. NCHW: per-(b, oc) row
+        sums over the contiguous OH·OW, then the [B, OC] column sum. NHWC:
+        grad_output already is [B·OH·OW, OC]."""
         comptime if Self.LAYOUT == LAYOUT_NHWC:
-            enqueue_bias_grad[DT](
-                c, god.dev.value(), self.bias.grd.dev.value(), B * Self.SO, Self.OC_, self.db_part
+            enqueue_bias_grad[GDT](
+                c, go, self.bias.grd.dev.value(), B * Self.SO, Self.OC_, self.db_part
             )
         else:
-            self.db_rows.ensure_gpu(c, B * Self.OC_)
-            c.enqueue_function[_rowsum_kernel[B * Self.OC_, Self.SO]](
-                god.tt["gpu", B * Self.OC_, Self.SO](),
-                self.db_rows.tt["gpu", B * Self.OC_](),
-                grid_dim=B * Self.OC_,
-                block_dim=CONV_DW_TPB,
-            )
-            enqueue_bias_grad[DT](
-                c, self.db_rows.dev.value(), self.bias.grd.dev.value(), B, Self.OC_, self.db_part
+            enqueue_channel_grad[GDT](
+                c, go, self.bias.grd.dev.value(), B, Self.OC_, Self.SO,
+                self.db_rows, self.db_part,
             )
 
     def vjp[
@@ -1777,7 +1775,7 @@ struct Conv2D[
                     B, Self.IC_, Self.OC_, Self.K_, Self.S_, Self.P_,
                     Self.H_, Self.W_, NHWC, TF,
                 ](c, self.weight.grd.dev.value(), find.dev.value(), god.dev.value())
-                self._enqueue_db[B](c, god)
+                self._enqueue_db[B](c, god.dev.value())
                 cudnn_conv_backward_data[
                     B, Self.IC_, Self.OC_, Self.K_, Self.S_, Self.P_,
                     Self.H_, Self.W_, NHWC, TF,
@@ -1903,7 +1901,7 @@ struct Conv2D[
                         block_dim=TPB,
                     )
             # (4) d_bias — two-pass, deterministic (`_enqueue_db`)
-            self._enqueue_db[B](c, god)
+            self._enqueue_db[B](c, god.dev.value())
             # (5) d_input (O2): d_colᵀ[COL,BS] = Wᵀ[COL,OC] @ goᵀ[OC,BS] reusing
             # the goᵀ from (2) — NO `_go_pack` kernel — then the coalesced col2im
             # reading the transposed d_colᵀ. col_t (free after the dW GEMM) is
@@ -2034,23 +2032,29 @@ struct Conv2D[
                 grid_dim=nb_acc,
                 block_dim=TPB,
             )
-            # (4) d_bias — bf16 go → FP32 master grad (fp32 accumulator).
-            c.enqueue_function[
-                _backward_db_kernel[
-                    B,
-                    Self.OC_,
-                    Self.OH,
-                    Self.OW,
-                    Self.OUT_FLAT,
-                    Self.ADT,
-                    Self.LAYOUT,
-                ]
-            ](
-                grad_output.tt["gpu", B, Self.OUT_FLAT](),
-                self.bias.grd.tt["gpu", Self.OC_](),
-                grid_dim=Self.OC_,
-                block_dim=CONV_DW_TPB,
-            )
+            # (4) d_bias — bf16 go → FP32 master grad (fp32 accumulator):
+            # two-pass (`_enqueue_db`) past `_db_two_pass`, else one block per
+            # channel (on a 5090 the two passes lose at EfficientZero v2's
+            # 256 x 6x6 maps: 0.37x NCHW, 0.77x NHWC at OC 16).
+            comptime if _db_two_pass[Self.LAYOUT, B, Self.OC_, Self.SO]():
+                self._enqueue_db[B](c, grad_output.dev.value())
+            else:
+                c.enqueue_function[
+                    _backward_db_kernel[
+                        B,
+                        Self.OC_,
+                        Self.OH,
+                        Self.OW,
+                        Self.OUT_FLAT,
+                        Self.ADT,
+                        Self.LAYOUT,
+                    ]
+                ](
+                    grad_output.tt["gpu", B, Self.OUT_FLAT](),
+                    self.bias.grd.tt["gpu", Self.OC_](),
+                    grid_dim=Self.OC_,
+                    block_dim=CONV_DW_TPB,
+                )
             # (5) d_input (O2): d_colᵀ[COL,BS] = Wᵀ_bf[COL,OC] @ goᵀ[OC,BS]
             # reusing goᵀ from (2) — NO `_go_pack` kernel. All bf16 (grad_input
             # flows bf16); Wᵀ_bf transposes the forward's cached bf16 weight.

@@ -20,14 +20,12 @@ is GPU-only. The reductions stay in LN_ACC (fp32) so accuracy is unchanged.
 """
 
 from std.math import sqrt
-from max.gpu import thread_idx, block_idx, global_idx
+from max.gpu import thread_idx, block_idx
 from max.gpu.primitives import block
-from max.gpu.sync import barrier
-from max.gpu.memory import AddressSpace
 from max.gpu.host import DeviceContext
 from std.utils.numerics import get_accum_type
 from layout import TileTensor, row_major
-from noeira.core.tiles import RowMajor, Tile, shared_tile
+from noeira.core.tiles import RowMajor, Tile
 
 from noeira.nn.constants import DT, CPU_SIMD_W
 from ..core.tensor import Tensor, TensorImpl
@@ -37,6 +35,7 @@ from ..core.module import Module
 from ..core.param import Param, ParamVisitor
 from ..core.initializer import Initializer
 from ..core.amp import AMPPolicy, NoAMP
+from .linear import enqueue_dot_bias_grad
 
 
 comptime LN_EPS: Scalar[DT] = 1e-5
@@ -228,76 +227,6 @@ def _layer_norm_backward_dx_kernel[
                 inv_std * (g - mean_g - xh * mean_g_xhat)
             ).cast[ADT]()
             idx += LN_TPB
-
-
-comptime _DP_COLS = 32
-comptime _DP_ROWS = 8
-comptime _DP_CHUNK = 1024
-"""Rows per partial sum of the γ / β gradients."""
-
-
-def _ln_dparams_partial_kernel[
-    BATCH: Int, DIM: Int, ADT: DType = DT
-](
-    grad_output: Tile[ADT, BATCH, DIM],
-    cache_xhat: Tile[DT, BATCH, DIM],
-    part: Tile[DT, 2 * ((BATCH + _DP_CHUNK - 1) // _DP_CHUNK) * DIM],
-):
-    """`part[c, j] = Σ go·x̂` and `part[CHUNKS + c, j] = Σ go` over the rows of
-    chunk c (`_DP_CHUNK` rows). Block (`_DP_COLS`, `_DP_ROWS`): lanes along j,
-    so a warp reads 32 consecutive columns of a row (coalesced); the
-    `_DP_ROWS` row-strided sums are reduced in a fixed order in shared memory.
-    Replaces one block per COLUMN with threads walking the rows, which read 32
-    different rows per warp load (`enqueue_bias_grad`'s fix, two sums)."""
-    comptime CHUNKS = (BATCH + _DP_CHUNK - 1) // _DP_CHUNK
-    var tx = Int(thread_idx.x)
-    var ty = Int(thread_idx.y)
-    var j = Int(block_idx.x) * _DP_COLS + tx
-    var ch = Int(block_idx.y)
-    var r0 = ch * _DP_CHUNK
-    var r1 = min(r0 + _DP_CHUNK, BATCH)
-    var acc = shared_tile[DT, 2 * _DP_ROWS, _DP_COLS]()
-    var sg: Scalar[DT] = 0
-    var sb: Scalar[DT] = 0
-    if j < DIM:
-        var r = r0 + ty
-        while r < r1:
-            var go = rebind[Scalar[ADT]](grad_output[r, j]).cast[DT]()
-            sg += go * rebind[Scalar[DT]](cache_xhat[r, j])
-            sb += go
-            r += _DP_ROWS
-    acc[ty, tx] = sg
-    acc[_DP_ROWS + ty, tx] = sb
-    barrier()
-    if ty == 0 and j < DIM:
-        var tg: Scalar[DT] = 0
-        var tb: Scalar[DT] = 0
-        comptime for k in range(_DP_ROWS):
-            tg += rebind[Scalar[DT]](acc[k, tx])
-            tb += rebind[Scalar[DT]](acc[_DP_ROWS + k, tx])
-        part[ch * DIM + j] = tg
-        part[(CHUNKS + ch) * DIM + j] = tb
-
-
-def _ln_dparams_final_kernel[
-    BATCH: Int, DIM: Int
-](
-    part: Tile[DT, 2 * ((BATCH + _DP_CHUNK - 1) // _DP_CHUNK) * DIM],
-    grad_gamma: Tile[DT, DIM],
-    grad_beta: Tile[DT, DIM],
-):
-    """`dγ[j] += Σ_c part[c, j]`, `dβ[j] += Σ_c part[CHUNKS + c, j]`, chunks
-    in order (deterministic)."""
-    comptime CHUNKS = (BATCH + _DP_CHUNK - 1) // _DP_CHUNK
-    var j = Int(global_idx.x)
-    if j < DIM:
-        var tg: Scalar[DT] = 0
-        var tb: Scalar[DT] = 0
-        for c in range(CHUNKS):
-            tg += rebind[Scalar[DT]](part[c * DIM + j])
-            tb += rebind[Scalar[DT]](part[(CHUNKS + c) * DIM + j])
-        grad_gamma[j] = rebind[Scalar[DT]](grad_gamma[j]) + tg
-        grad_beta[j] = rebind[Scalar[DT]](grad_beta[j]) + tb
 
 
 struct LayerNorm[DIM_: Int, ADT: DType = DT, EPS: Scalar[DT] = LN_EPS](Module):
@@ -598,28 +527,14 @@ struct LayerNorm[DIM_: Int, ADT: DType = DT, EPS: Scalar[DT] = LN_EPS](Module):
     def _dparams_gpu[B: Int](
         mut self, mut go: TensorImpl[Self.ACT_DT], c: DeviceContext
     ) raises:
-        """dγ += Σ go·x̂, dβ += Σ go over the B rows: chunk partials, then
-        the chunks summed in order."""
-        comptime CHUNKS = (B + _DP_CHUNK - 1) // _DP_CHUNK
-        comptime l2d = RowMajor[B, Self.DIM_]
-        comptime ld = RowMajor[Self.DIM_]
-        comptime lp = RowMajor[2 * CHUNKS * Self.DIM_]
-        self.dp_part.ensure_gpu(c, 2 * CHUNKS * Self.DIM_)
-        c.enqueue_function[
-            _ln_dparams_partial_kernel[B, Self.DIM_, Self.ADT]
-        ](
-            go.tt["gpu", B, Self.DIM_](),
-            self.cache_xhat.tt["gpu", B, Self.DIM_](),
-            self.dp_part.tt["gpu", 2 * CHUNKS * Self.DIM_](),
-            grid_dim=((Self.DIM_ + _DP_COLS - 1) // _DP_COLS, CHUNKS),
-            block_dim=(_DP_COLS, _DP_ROWS),
-        )
-        c.enqueue_function[_ln_dparams_final_kernel[B, Self.DIM_]](
-            self.dp_part.tt["gpu", 2 * CHUNKS * Self.DIM_](),
-            self.gamma.grd.tt["gpu", Self.DIM_](),
-            self.beta.grd.tt["gpu", Self.DIM_](),
-            grid_dim=(Self.DIM_ + 255) // 256,
-            block_dim=256,
+        """dγ += Σ go·x̂, dβ += Σ go over the B rows (`enqueue_dot_bias_grad`:
+        chunk partials with lanes along the features, then the chunks summed
+        in order). It replaced one block per COLUMN with threads walking the
+        rows, which read 32 different rows per warp load."""
+        enqueue_dot_bias_grad[Self.ADT](
+            c, go.dev.value(), self.cache_xhat.dev.value(),
+            self.gamma.grd.dev.value(), self.beta.grd.dev.value(),
+            B, Self.DIM_, self.dp_part,
         )
 
     # for_each_param / zero_grad inherit the Module reflection defaults

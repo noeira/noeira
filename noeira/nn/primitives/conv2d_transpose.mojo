@@ -11,7 +11,8 @@ so the GPU path REUSES the LAYOUT-parametrized free kernels in `conv2d.mojo`
 (`_im2col_kernel`, `_dx_col2im_kernel`, `_go_transpose_kernel`,
 `_wT_transpose_kernel`, `_accum_kernel`, `_backward_db_kernel`) with a
 channel/spatial substitution (IC↔OC, H↔OH_t), plus two tiny scatter/bias
-kernels. The CPU path is direct nested loops (the obvious-correctness ground
+kernels; past `_db_two_pass` the bias gradient goes through `linear.mojo`'s
+shared reductions. The CPU path is direct nested loops (the obvious-correctness ground
 truth the GPU is gated against).
 
 Spatial (PyTorch ConvTranspose2d convention, output_padding OP):
@@ -53,6 +54,7 @@ from ..core.param import Param, ParamVisitor
 from ..core.initializer import Initializer
 from ..core.amp import AMPPolicy, NoAMP
 from ..core.polyak import polyak_tensor
+from .linear import enqueue_bias_grad, enqueue_channel_grad
 from .conv2d import (
     _in_off,
     _col_off,
@@ -64,6 +66,7 @@ from .conv2d import (
     _wT_transpose_kernel,
     _accum_kernel,
     _backward_db_kernel,
+    _db_two_pass,
     CONV_TPB,
     CONV_DW_TPB,
 )
@@ -170,6 +173,10 @@ struct Conv2DTranspose[
     # needs its own measurement.
     var sk_ws: Tensor
     var _sk_p: Int
+    var db_rows: Tensor
+    """[B·OC] per-(sample, channel) sums: stage 1 of the NCHW bias grad."""
+    var db_part: Tensor
+    """Chunk partials of `enqueue_bias_grad` (stage 2)."""
 
     def __init__(out self):
         self.weight = Param["weight", True, Self.W_SIZE]()
@@ -182,6 +189,8 @@ struct Conv2DTranspose[
         self.dW_tmp = Tensor()
         self.sk_ws = Tensor()
         self._sk_p = -1
+        self.db_rows = Tensor()
+        self.db_part = Tensor()
 
     @staticmethod
     def make[
@@ -513,23 +522,37 @@ struct Conv2DTranspose[
                 grid_dim=nb_acc,
                 block_dim=CONV_TPB,
             )
-            # (5) d_bias[OC] += Σ grad_output over big spatial
-            c.enqueue_function[
-                _backward_db_kernel[
-                    B,
-                    Self.OC_,
-                    Self.OHt,
-                    Self.OWt,
-                    Self.OUT_FLAT,
-                    DT,
-                    Self.LAYOUT,
-                ]
-            ](
-                grad_output.tt["gpu", B, Self.OUT_FLAT](),
-                self.bias.grd.tt["gpu", Self.OC_](),
-                grid_dim=Self.OC_,
-                block_dim=CONV_DW_TPB,
-            )
+            # (5) d_bias[OC] += Σ grad_output over big spatial. One block per
+            # channel gave DreamerV3's RGB decoder head 4 blocks walking
+            # B·OH·OW values each: 766 -> 80 us two-pass on an M1 Pro, 178 ->
+            # 11 on a 5090. Small maps keep it (`_db_two_pass`).
+            comptime if not _db_two_pass[Self.LAYOUT, B, Self.OC_, Self.SBIG]():
+                c.enqueue_function[
+                    _backward_db_kernel[
+                        B,
+                        Self.OC_,
+                        Self.OHt,
+                        Self.OWt,
+                        Self.OUT_FLAT,
+                        DT,
+                        Self.LAYOUT,
+                    ]
+                ](
+                    grad_output.tt["gpu", B, Self.OUT_FLAT](),
+                    self.bias.grd.tt["gpu", Self.OC_](),
+                    grid_dim=Self.OC_,
+                    block_dim=CONV_DW_TPB,
+                )
+            elif Self.LAYOUT == LAYOUT_NHWC:
+                enqueue_bias_grad[DT](
+                    c, grad_output.dev.value(), self.bias.grd.dev.value(),
+                    B * Self.SBIG, Self.OC_, self.db_part,
+                )
+            else:
+                enqueue_channel_grad[DT](
+                    c, grad_output.dev.value(), self.bias.grd.dev.value(),
+                    B, Self.OC_, Self.SBIG, self.db_rows, self.db_part,
+                )
 
     def polyak_from[
         target: StaticString

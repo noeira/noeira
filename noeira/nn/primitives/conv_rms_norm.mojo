@@ -34,6 +34,7 @@ from ..core.module import Module
 from ..core.param import Param, ParamVisitor
 from ..core.initializer import Initializer
 from ..core.amp import AMPPolicy, NoAMP
+from .linear import enqueue_channel_dot_grad, CHANNEL_TWO_PASS_MIN_ROWS
 
 
 comptime CRN_EPS: Scalar[DT] = 1e-4
@@ -152,11 +153,17 @@ struct ConvRMSNorm[C_: Int, HW_: Int](Module):
     var gamma: Param["gamma", False, Self.C_]
     var cache_norm: Tensor  # [B, C*HW]
     var cache_inv_rms: Tensor  # [B*HW]
+    var dg_rows: Tensor
+    """[B·C] per-(sample, channel) Σ go·n: stage 1 of the γ gradient."""
+    var dg_part: Tensor
+    """Chunk partials of stage 2 (`enqueue_bias_grad` over the rows)."""
 
     def __init__(out self):
         self.gamma = Param["gamma", False, Self.C_]()
         self.cache_norm = Tensor()
         self.cache_inv_rms = Tensor()
+        self.dg_rows = Tensor()
+        self.dg_part = Tensor()
 
     @staticmethod
     def make[
@@ -294,14 +301,26 @@ struct ConvRMSNorm[C_: Int, HW_: Int](Module):
                 grid_dim=B * Self.HW_,
                 block_dim=CRN_TPB,
             )
-            cc.enqueue_function[
-                _conv_rms_backward_dgamma_kernel[B, Self.C_, Self.HW_]
-            ](
-                grad_output.tt["gpu", B, DIM](),
-                self.cache_norm.tt["gpu", B, DIM](),
-                self.gamma.grd.tt["gpu", Self.C_](),
-                grid_dim=Self.C_,
-                block_dim=CRN_TPB,
-            )
+            # dγ += Σ_{b, p} go·n per channel. Past
+            # `CHANNEL_TWO_PASS_MIN_ROWS` two passes (per-(b, c) sums over the
+            # contiguous HW plane, then the [B, C] column sum); below it one
+            # block per channel walking B·HW values, which a 5090 runs in
+            # ~4-8 us at DreamerV3's 12x12 / 6x6 maps (the two passes: ~10).
+            comptime if B * Self.HW_ >= CHANNEL_TWO_PASS_MIN_ROWS:
+                enqueue_channel_dot_grad(
+                    cc, grad_output.dev.value(), self.cache_norm.dev.value(),
+                    self.gamma.grd.dev.value(), B, Self.C_, Self.HW_,
+                    self.dg_rows, self.dg_part,
+                )
+            else:
+                cc.enqueue_function[
+                    _conv_rms_backward_dgamma_kernel[B, Self.C_, Self.HW_]
+                ](
+                    grad_output.tt["gpu", B, DIM](),
+                    self.cache_norm.tt["gpu", B, DIM](),
+                    self.gamma.grd.tt["gpu", Self.C_](),
+                    grid_dim=Self.C_,
+                    block_dim=CRN_TPB,
+                )
 
     # for_each_param / zero_grad inherit the Module reflection defaults.
