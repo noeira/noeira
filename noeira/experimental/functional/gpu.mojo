@@ -24,10 +24,16 @@ the form `mm.mojo` already uses on Apple — with two exceptions:
   so dB's `aᵀ` is materialised by `_transpose_kernel`.
 * a dimension of 1 (a `[B, 1]` critic head, a `[B, 1]` input) runs on
   `_naive_mm_kernel`, which also covers the cases MAX never sees here.
+
+`ctx` is a `Dev` (`backend.mojo`): MAX's context, or the metal_rt launcher.
+With `ctx.own` (always on a metal_rt tape) the Metal GEMMs are the tape's
+own: the simdgroup-matrix kernels of `sg_gemm.mojo` from a 64 x 64 output,
+`_naive_mm_kernel` below — never MAX's matmul. (`_tiled_mm_kernel`, the
+scalar first version, is kept for comparison: bench_tape_gemm.mojo.)
 """
 
 from std.sys import default_accelerator
-from max.gpu import global_idx, thread_idx
+from max.gpu import global_idx, thread_idx, block_idx
 from max.gpu.sync import barrier
 from max.gpu.memory import AddressSpace
 from max.gpu.host import DeviceContext, DeviceBuffer
@@ -40,6 +46,9 @@ from noeira.nn.core.element_op import ElementOp
 from noeira.nn.core.cublas_gemm import cublas_gemm, cublas_tf32
 from noeira.nn.core.cublaslt_gemm import cublaslt_gemm, EPI_BIAS
 from .opcodes import *
+from .backend import Dev
+from .sg_gemm import sg_mm
+from std.memory import stack_allocation
 
 
 comptime P = Pointer[Scalar[DT], MutAnyOrigin]
@@ -196,7 +205,7 @@ def _chunk_final_kernel[ACC: Bool](gx: P, part: P, nch_: Int64, nx_: Int64):
 
 
 def gpu_binary[OP: Int](
-    ctx: DeviceContext, o: DeviceBuffer[DT], a: DeviceBuffer[DT],
+    ctx: Dev, o: DeviceBuffer[DT], a: DeviceBuffer[DT],
     b: DeviceBuffer[DT], r: Int, c: Int, ra: Int, ca: Int, rb: Int, cb: Int,
 ) raises:
     ctx.enqueue_function[_bin_fwd_kernel[OP]](
@@ -206,7 +215,7 @@ def gpu_binary[OP: Int](
 
 
 def gpu_binary_bwd[OP: Int, WHICH: Int, ACC: Bool](
-    ctx: DeviceContext, gx: DeviceBuffer[DT], go: DeviceBuffer[DT],
+    ctx: Dev, gx: DeviceBuffer[DT], go: DeviceBuffer[DT],
     a: DeviceBuffer[DT], b: DeviceBuffer[DT],
     r: Int, c: Int, ra: Int, ca: Int, rb: Int, cb: Int,
     part: DeviceBuffer[DT],
@@ -274,7 +283,7 @@ def _scalar_bwd_kernel[OP: Int, ACC: Bool](
 
 
 def gpu_scalar[OP: Int](
-    ctx: DeviceContext, o: DeviceBuffer[DT], a: DeviceBuffer[DT], n: Int,
+    ctx: Dev, o: DeviceBuffer[DT], a: DeviceBuffer[DT], n: Int,
     c: Scalar[DT],
 ) raises:
     ctx.enqueue_function[_scalar_fwd_kernel[OP]](
@@ -283,7 +292,7 @@ def gpu_scalar[OP: Int](
 
 
 def gpu_scalar_bwd[OP: Int, ACC: Bool](
-    ctx: DeviceContext, ga: DeviceBuffer[DT], go: DeviceBuffer[DT], n: Int,
+    ctx: Dev, ga: DeviceBuffer[DT], go: DeviceBuffer[DT], n: Int,
     c: Scalar[DT],
 ) raises:
     ctx.enqueue_function[_scalar_bwd_kernel[OP, ACC]](
@@ -313,7 +322,7 @@ def _ew_bwd_kernel[OP: ElementOp, ACC: Bool](
 
 
 def gpu_ew[OP: ElementOp](
-    ctx: DeviceContext, y: DeviceBuffer[DT], x: DeviceBuffer[DT], n: Int
+    ctx: Dev, y: DeviceBuffer[DT], x: DeviceBuffer[DT], n: Int
 ) raises:
     ctx.enqueue_function[_ew_fwd_kernel[OP]](
         y, x, Int64(n), grid_dim=_grid(n), block_dim=TPB
@@ -321,7 +330,7 @@ def gpu_ew[OP: ElementOp](
 
 
 def gpu_ew_bwd[OP: ElementOp, ACC: Bool](
-    ctx: DeviceContext, ga: DeviceBuffer[DT], go: DeviceBuffer[DT],
+    ctx: Dev, ga: DeviceBuffer[DT], go: DeviceBuffer[DT],
     x: DeviceBuffer[DT], y: DeviceBuffer[DT], n: Int,
 ) raises:
     ctx.enqueue_function[_ew_bwd_kernel[OP, ACC]](
@@ -350,7 +359,7 @@ def _bias_act_kernel[OP: ElementOp, HAS_ACT: Bool](
 
 
 def gpu_bias_act[OP: ElementOp, HAS_ACT: Bool](
-    ctx: DeviceContext, o: DeviceBuffer[DT], bias: DeviceBuffer[DT],
+    ctx: Dev, o: DeviceBuffer[DT], bias: DeviceBuffer[DT],
     z: DeviceBuffer[DT], m: Int, n: Int,
 ) raises:
     ctx.enqueue_function[_bias_act_kernel[OP, HAS_ACT]](
@@ -369,7 +378,7 @@ def _act_gate_kernel[OP: ElementOp](g: P, y: P, z: P, n: Int64):
 
 
 def gpu_act_gate[OP: ElementOp](
-    ctx: DeviceContext, g: DeviceBuffer[DT], y: DeviceBuffer[DT],
+    ctx: Dev, g: DeviceBuffer[DT], y: DeviceBuffer[DT],
     z: DeviceBuffer[DT], n: Int,
 ) raises:
     ctx.enqueue_function[_act_gate_kernel[OP]](
@@ -378,7 +387,7 @@ def gpu_act_gate[OP: ElementOp](
 
 
 def gpu_linear_lt_bias(
-    ctx: DeviceContext, o: DeviceBuffer[DT], x: DeviceBuffer[DT],
+    ctx: Dev, o: DeviceBuffer[DT], x: DeviceBuffer[DT],
     w: DeviceBuffer[DT], bias: DeviceBuffer[DT], m: Int, n: Int, k: Int,
 ) raises:
     """NVIDIA: `o = x @ w + bias` in ONE launch, the bias in cuBLASLt's
@@ -386,11 +395,11 @@ def gpu_linear_lt_bias(
     comptime if default_accelerator().is_nvidia_gpu():
         if cublas_tf32(m, n, k):
             cublaslt_gemm[False, False, DT, DT, True](
-                ctx, o, x, w, m, n, k, EPI_BIAS, bias=Int(bias.unsafe_ptr())
+                ctx.ctx, o, x, w, m, n, k, EPI_BIAS, bias=Int(bias.unsafe_ptr())
             )
         else:
             cublaslt_gemm[False, False, DT, DT, False](
-                ctx, o, x, w, m, n, k, EPI_BIAS, bias=Int(bias.unsafe_ptr())
+                ctx.ctx, o, x, w, m, n, k, EPI_BIAS, bias=Int(bias.unsafe_ptr())
             )
     else:
         raise Error("gpu_linear_lt_bias: NVIDIA only")
@@ -437,7 +446,7 @@ def _reduce_bwd_kernel[ACC: Bool](ga: P, go: P, n: Int64, div: Int64):
 
 
 def gpu_reduce[MEAN: Bool](
-    ctx: DeviceContext, o: DeviceBuffer[DT], a: DeviceBuffer[DT], n: Int
+    ctx: Dev, o: DeviceBuffer[DT], a: DeviceBuffer[DT], n: Int
 ) raises:
     ctx.enqueue_function[_reduce_kernel[MEAN]](
         o, a, Int64(n), grid_dim=1, block_dim=REDUCE_TPB
@@ -445,7 +454,7 @@ def gpu_reduce[MEAN: Bool](
 
 
 def gpu_reduce_bwd[ACC: Bool](
-    ctx: DeviceContext, ga: DeviceBuffer[DT], go: DeviceBuffer[DT], n: Int,
+    ctx: Dev, ga: DeviceBuffer[DT], go: DeviceBuffer[DT], n: Int,
     div: Int,
 ) raises:
     ctx.enqueue_function[_reduce_bwd_kernel[ACC]](
@@ -476,7 +485,7 @@ def _sum_rows_bwd_kernel[ACC: Bool](ga: P, go: P, r_: Int64, c_: Int64):
 
 
 def gpu_sum_rows(
-    ctx: DeviceContext, o: DeviceBuffer[DT], a: DeviceBuffer[DT], r: Int, c: Int
+    ctx: Dev, o: DeviceBuffer[DT], a: DeviceBuffer[DT], r: Int, c: Int
 ) raises:
     ctx.enqueue_function[_sum_rows_kernel](
         o, a, Int64(r), Int64(c), grid_dim=_grid(c), block_dim=TPB
@@ -484,7 +493,7 @@ def gpu_sum_rows(
 
 
 def gpu_sum_rows_bwd[ACC: Bool](
-    ctx: DeviceContext, ga: DeviceBuffer[DT], go: DeviceBuffer[DT], r: Int,
+    ctx: Dev, ga: DeviceBuffer[DT], go: DeviceBuffer[DT], r: Int,
     c: Int,
 ) raises:
     ctx.enqueue_function[_sum_rows_bwd_kernel[ACC]](
@@ -509,7 +518,7 @@ def _transpose_kernel[ACC: Bool](o: P, a: P, r_: Int64, c_: Int64):
 
 
 def gpu_transpose[ACC: Bool = False](
-    ctx: DeviceContext, o: DeviceBuffer[DT], a: DeviceBuffer[DT], r: Int, c: Int
+    ctx: Dev, o: DeviceBuffer[DT], a: DeviceBuffer[DT], r: Int, c: Int
 ) raises:
     ctx.enqueue_function[_transpose_kernel[ACC]](
         o, a, Int64(r), Int64(c), grid_dim=_grid(r * c), block_dim=TPB
@@ -524,7 +533,7 @@ def _axpy_kernel(dst: P, src: P, n: Int64, alpha: Scalar[DT]):
 
 
 def gpu_axpy(
-    ctx: DeviceContext, dst: DeviceBuffer[DT], src: DeviceBuffer[DT], n: Int,
+    ctx: Dev, dst: DeviceBuffer[DT], src: DeviceBuffer[DT], n: Int,
     alpha: Scalar[DT],
 ) raises:
     ctx.enqueue_function[_axpy_kernel](
@@ -539,7 +548,7 @@ def _copy_kernel(dst: P, src: P, n: Int64):
 
 
 def gpu_copy(
-    ctx: DeviceContext, dst: DeviceBuffer[DT], src: DeviceBuffer[DT], n: Int
+    ctx: Dev, dst: DeviceBuffer[DT], src: DeviceBuffer[DT], n: Int
 ) raises:
     ctx.enqueue_function[_copy_kernel](
         dst, src, Int64(n), grid_dim=_grid(n), block_dim=TPB
@@ -572,7 +581,7 @@ def _naive_mm_kernel[TA: Bool, TB: Bool, ACC: Bool](
 
 
 def _naive_mm[TA: Bool, TB: Bool, ACC: Bool](
-    ctx: DeviceContext, o: DeviceBuffer[DT], a: DeviceBuffer[DT],
+    ctx: Dev, o: DeviceBuffer[DT], a: DeviceBuffer[DT],
     b: DeviceBuffer[DT], m: Int, n: Int, k: Int,
 ) raises:
     ctx.enqueue_function[_naive_mm_kernel[TA, TB, ACC]](
@@ -581,8 +590,133 @@ def _naive_mm[TA: Bool, TB: Bool, ACC: Bool](
     )
 
 
+comptime MM_T = 64  # output tile edge
+comptime MM_K = 16  # k-slab per shared-memory stage
+comptime MM_SUB = 16  # threads per tile edge (each owns 4 x 4 outputs)
+
+
+def _tiled_mm_kernel[TA: Bool, TB: Bool, ACC: Bool](
+    o: P, a: P, b: P, m_: Int64, n_: Int64, k_: Int64
+):
+    """`_naive_mm_kernel`'s product, 64 x 64 output tiles per threadgroup of
+    16 x 16 threads, each thread 4 x 4 outputs (rows ty + 16 r, columns
+    tx + 16 c), A and B staged through shared memory 16 k at a time. Each
+    output still sums k = 0, 1, … in order: deterministic. Written for the
+    metal_rt tape, which cannot call MAX's matmul."""
+    var m = Int(m_)
+    var n = Int(n_)
+    var kk = Int(k_)
+    var tx = Int(thread_idx.x)
+    var ty = Int(thread_idx.y)
+    var tid = ty * MM_SUB + tx
+    var row0 = Int(block_idx.y) * MM_T
+    var col0 = Int(block_idx.x) * MM_T
+    var As = stack_allocation[
+        MM_K * MM_T, Scalar[DT], address_space=AddressSpace.SHARED
+    ]()
+    var Bs = stack_allocation[
+        MM_K * MM_T, Scalar[DT], address_space=AddressSpace.SHARED
+    ]()
+    var acc0 = SIMD[DT, 4](0)
+    var acc1 = SIMD[DT, 4](0)
+    var acc2 = SIMD[DT, 4](0)
+    var acc3 = SIMD[DT, 4](0)
+    var k0 = 0
+    while k0 < kk:
+        comptime for q in range(MM_K * MM_T // (MM_SUB * MM_SUB)):
+            var e = tid + q * MM_SUB * MM_SUB
+            # A tile: [MM_T rows] x [MM_K k], stored k-major
+            var ia: Int
+            var ka: Int
+            comptime if TA:
+                ka = e // MM_T
+                ia = e % MM_T
+            else:
+                ia = e // MM_K
+                ka = e % MM_K
+            var gi = row0 + ia
+            var gk = k0 + ka
+            var av: Scalar[DT] = 0
+            if gi < m and gk < kk:
+                comptime if TA:
+                    av = a[unsafe_offset=gk * m + gi]
+                else:
+                    av = a[unsafe_offset=gi * kk + gk]
+            As[unsafe_offset=ka * MM_T + ia] = av
+            # B tile: [MM_K k] x [MM_T cols]
+            var jb: Int
+            var kb: Int
+            comptime if TB:
+                jb = e // MM_K
+                kb = e % MM_K
+            else:
+                kb = e // MM_T
+                jb = e % MM_T
+            var gj = col0 + jb
+            var gk2 = k0 + kb
+            var bv: Scalar[DT] = 0
+            if gj < n and gk2 < kk:
+                comptime if TB:
+                    bv = b[unsafe_offset=gj * kk + gk2]
+                else:
+                    bv = b[unsafe_offset=gk2 * n + gj]
+            Bs[unsafe_offset=kb * MM_T + jb] = bv
+        barrier()
+        var kend = min(MM_K, kk - k0)
+        for t in range(kend):
+            var bvec = SIMD[DT, 4](
+                Bs[unsafe_offset=t * MM_T + tx],
+                Bs[unsafe_offset=t * MM_T + tx + 16],
+                Bs[unsafe_offset=t * MM_T + tx + 32],
+                Bs[unsafe_offset=t * MM_T + tx + 48],
+            )
+            acc0 += As[unsafe_offset=t * MM_T + ty] * bvec
+            acc1 += As[unsafe_offset=t * MM_T + ty + 16] * bvec
+            acc2 += As[unsafe_offset=t * MM_T + ty + 32] * bvec
+            acc3 += As[unsafe_offset=t * MM_T + ty + 48] * bvec
+        barrier()
+        k0 += MM_K
+    comptime for r in range(4):
+        var i = row0 + ty + 16 * r
+        if i < m:
+            var accr = acc0
+            comptime if r == 1:
+                accr = acc1
+            elif r == 2:
+                accr = acc2
+            elif r == 3:
+                accr = acc3
+            comptime for c in range(4):
+                var j = col0 + tx + 16 * c
+                if j < n:
+                    comptime if ACC:
+                        o[unsafe_offset=i * n + j] += accr[c]
+                    else:
+                        o[unsafe_offset=i * n + j] = accr[c]
+
+
+comptime MM_TILED_MIN = MM_T * MM_T * 8
+"""(`_tiled_mm_kernel`'s threshold, kept for it.)"""
+comptime SG_MIN_EDGE = 64
+"""The simdgroup kernels from a 64 x 64 output up (one full tile; measured
+faster than the naive kernel down to [64, 64] @ [64, 64],
+bench_tape_gemm.mojo); the naive kernel below and for k = 1."""
+
+
+def _own_mm[TA: Bool, TB: Bool, ACC: Bool](
+    ctx: Dev, o: DeviceBuffer[DT], a: DeviceBuffer[DT],
+    b: DeviceBuffer[DT], m: Int, n: Int, k: Int,
+) raises:
+    """The tape's own GEMM (no MAX): Apple's simdgroup matrix kernels
+    (`sg_gemm.mojo`) for large outputs, the naive kernel else."""
+    if m >= SG_MIN_EDGE and n >= SG_MIN_EDGE and k > 1:
+        sg_mm[TA, TB, ACC](ctx, o, a, b, m, n, k)
+    else:
+        _naive_mm[TA, TB, ACC](ctx, o, a, b, m, n, k)
+
+
 def _max_mm[transpose_b: Bool = False](
-    ctx: DeviceContext, o: DeviceBuffer[DT], a: DeviceBuffer[DT],
+    ctx: Dev, o: DeviceBuffer[DT], a: DeviceBuffer[DT],
     b: DeviceBuffer[DT], m: Int, n: Int, k: Int,
 ) raises:
     """`o[m, n] = a[m, k] @ b[k, n]` (`b[n, k]ᵀ` when `transpose_b`) on MAX's
@@ -594,22 +728,22 @@ def _max_mm[transpose_b: Bool = False](
     var av = TileTensor(a, row_major(m, k))
     comptime if transpose_b:
         var bv = TileTensor(b, row_major(n, k))
-        max_matmul[transpose_b=True, target="gpu"](ov, av, bv, ctx)
+        max_matmul[transpose_b=True, target="gpu"](ov, av, bv, ctx.ctx)
     else:
         var bv = TileTensor(b, row_major(k, n))
-        max_matmul[target="gpu"](ov, av, bv, ctx)
+        max_matmul[target="gpu"](ov, av, bv, ctx.ctx)
 
 
 def _cublas[TA: Bool, TB: Bool](
-    ctx: DeviceContext, o: DeviceBuffer[DT], a: DeviceBuffer[DT],
+    ctx: Dev, o: DeviceBuffer[DT], a: DeviceBuffer[DT],
     b: DeviceBuffer[DT], m: Int, n: Int, k: Int, beta: Float32,
 ) raises:
     """`cublas_gemm` with the comptime nn's precision rule applied at run
     time. A layer's three GEMMs share m·n·k, so they share a precision."""
     if cublas_tf32(m, n, k):
-        cublas_gemm[TA, TB, True](ctx, o, a, b, m, n, k, beta)
+        cublas_gemm[TA, TB, True](ctx.ctx, o, a, b, m, n, k, beta)
     else:
-        cublas_gemm[TA, TB, False](ctx, o, a, b, m, n, k, beta)
+        cublas_gemm[TA, TB, False](ctx.ctx, o, a, b, m, n, k, beta)
 
 
 @always_inline
@@ -618,21 +752,23 @@ def _degenerate(m: Int, n: Int, k: Int) -> Bool:
 
 
 def gpu_matmul(
-    ctx: DeviceContext, o: DeviceBuffer[DT], a: DeviceBuffer[DT],
+    ctx: Dev, o: DeviceBuffer[DT], a: DeviceBuffer[DT],
     b: DeviceBuffer[DT], m: Int, n: Int, k: Int,
 ) raises:
     """`o[m, n] = a[m, k] @ b[k, n]`."""
     comptime if default_accelerator().is_nvidia_gpu():
         _cublas[False, False](ctx, o, a, b, m, n, k, 0.0)
     else:
-        if _degenerate(m, n, k):
+        if ctx.own:
+            _own_mm[False, False, False](ctx, o, a, b, m, n, k)
+        elif _degenerate(m, n, k):
             _naive_mm[False, False, False](ctx, o, a, b, m, n, k)
         else:
             _max_mm(ctx, o, a, b, m, n, k)
 
 
 def gpu_matmul_bwd_a[ACC: Bool](
-    ctx: DeviceContext, ga: DeviceBuffer[DT], go: DeviceBuffer[DT],
+    ctx: Dev, ga: DeviceBuffer[DT], go: DeviceBuffer[DT],
     b: DeviceBuffer[DT], m: Int, n: Int, k: Int, tmp_o: DeviceBuffer[DT],
 ) raises:
     """`ga[m, k] (+)= go[m, n] @ b[k, n]ᵀ`. `tmp_o` >= m·k (used only when
@@ -642,7 +778,9 @@ def gpu_matmul_bwd_a[ACC: Bool](
             ctx, ga, go, b, m, k, n, Float32(1.0) if ACC else Float32(0.0)
         )
     else:
-        if _degenerate(m, k, n):
+        if ctx.own:
+            _own_mm[False, True, ACC](ctx, ga, go, b, m, k, n)
+        elif _degenerate(m, k, n):
             _naive_mm[False, True, ACC](ctx, ga, go, b, m, k, n)
         else:
             comptime if ACC:
@@ -653,7 +791,7 @@ def gpu_matmul_bwd_a[ACC: Bool](
 
 
 def gpu_matmul_bwd_b[ACC: Bool](
-    ctx: DeviceContext, gb: DeviceBuffer[DT], a: DeviceBuffer[DT],
+    ctx: Dev, gb: DeviceBuffer[DT], a: DeviceBuffer[DT],
     go: DeviceBuffer[DT], m: Int, n: Int, k: Int,
     tmp_t: DeviceBuffer[DT], tmp_o: DeviceBuffer[DT],
 ) raises:
@@ -664,7 +802,9 @@ def gpu_matmul_bwd_b[ACC: Bool](
             ctx, gb, a, go, k, n, m, Float32(1.0) if ACC else Float32(0.0)
         )
     else:
-        if _degenerate(k, n, m):
+        if ctx.own:
+            _own_mm[True, False, ACC](ctx, gb, a, go, k, n, m)
+        elif _degenerate(k, n, m):
             _naive_mm[True, False, ACC](ctx, gb, a, go, k, n, m)
         else:
             gpu_transpose(ctx, tmp_t, a, m, k)  # aᵀ: [k, m]

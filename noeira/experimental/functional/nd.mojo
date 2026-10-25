@@ -25,7 +25,7 @@ from max.gpu import global_idx
 from max.gpu.host import DeviceContext, DeviceBuffer
 
 from noeira.nn.constants import DT
-from noeira.nn.core.fill import fill_dev
+from .backend import Dev, fill_dev
 from noeira.nn.core.cpu_gemm import gemm_cpu_ptr
 from .opcodes import *
 from .tape import TapeData

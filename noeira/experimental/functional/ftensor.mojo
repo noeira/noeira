@@ -16,7 +16,8 @@ operator appends a node, so the network is whatever code ran — loops, `if`s
 and shapes chosen at run time included.
 """
 
-from std.memory import ArcPointer
+from std.memory import ArcPointer, OwnedPointer
+from noeira.experimental.metal_rt.runtime import MetalRT, COMMIT_EVERY_N
 from max.gpu.host import DeviceContext, DeviceBuffer
 
 from noeira.nn.constants import DT
@@ -78,6 +79,53 @@ struct Tape(ImplicitlyCopyable, ParamWalkable):
     def __init__(out self, ctx: DeviceContext):
         """A GPU tape: every value and gradient lives on `ctx`'s device."""
         self.data = ArcPointer(TapeData(ctx))
+
+    def __init__(out self, ctx: DeviceContext, *, own_kernels: Bool):
+        """A GPU tape on MAX's launch path; `own_kernels=True` runs the
+        tape's own GEMM instead of MAX's matmul — exactly the kernels a
+        metal_rt tape runs (the bit-identity gate's MAX arm)."""
+        self.data = ArcPointer(TapeData(ctx, None, own_kernels))
+
+    @staticmethod
+    def metal_rt(
+        policy: Int = COMMIT_EVERY_N, batch_n: Int = 16, idle_age_us: Int = 0
+    ) raises -> Tape:
+        """A GPU tape on noeira's own Metal launcher (`experimental/metal_rt`):
+        every kernel, buffer and copy goes through it, none through MAX (the
+        `DeviceContext` it keeps only types the buffers). Not supported here:
+        modules as ops, nn's optimizers and checkpoints (use `TapeAdam`),
+        capture. Read a value (`item`, `values`) to sync; `flush()` before
+        host work that does not need the GPU."""
+        var rt = OwnedPointer(
+            MetalRT(policy=policy, batch_n=batch_n, idle_age_us=idle_age_us)
+        )
+        var t = Tape()
+        t.data = ArcPointer(TapeData(DeviceContext(), Optional(rt^), True))
+        return t
+
+    def on_metal_rt(self) -> Bool:
+        return self.data[].on_rt()
+
+    def flush(self) raises:
+        """metal_rt: commit the pending launches now, without waiting."""
+        if self.data[].ctx:
+            self.data[].dctx().flush()
+
+    def device_buffer(self, n: Int) raises -> DeviceBuffer[DT]:
+        """`n` floats on the tape's device (MAX's, or a metal_rt buffer): a
+        source for `input_device`."""
+        return self.data[].dctx().create_buffer(n)
+
+    def upload(self, dst: DeviceBuffer[DT], src: List[Scalar[DT]]) raises:
+        """Host -> `dst` (ordered after the launches already enqueued)."""
+        self.data[].dctx().enqueue_copy(dst, src.unsafe_ptr())
+
+    def launcher_stats(self) -> Tuple[Int, Int, Int]:
+        """metal_rt: (launches, command buffers, idle commits); zeros on MAX."""
+        if not self.data[].rt:
+            return (0, 0, 0)
+        ref r = self.data[].rt.value()[]
+        return (r.n_launches, r.n_commits, r.n_idle_commits)
 
     def on_gpu(self) -> Bool:
         return self.data[].on_gpu()
@@ -172,7 +220,7 @@ struct Tape(ImplicitlyCopyable, ParamWalkable):
     def capture_begin(self) raises:
         if not self.data[].ctx:
             raise Error("Tape.capture_begin: a CPU tape")
-        self.data[].graph = CUDAGraph(self.data[].dctx())
+        self.data[].graph = CUDAGraph(self.data[].ctx.value())
         self.data[].graph.value().begin_capture()
 
     def capture_end(self, run: Bool = True) raises:

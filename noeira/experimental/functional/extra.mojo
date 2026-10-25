@@ -21,7 +21,7 @@ from max.gpu.host import DeviceContext, DeviceBuffer
 
 from noeira.nn.constants import DT
 from noeira.nn.core.element_op import ElementOp
-from noeira.nn.core.fill import fill_dev
+from .backend import Dev, fill_dev, ensure_gpu
 from .opcodes import *
 from .tape import TapeData
 from .gpu import gpu_reduce
@@ -281,7 +281,7 @@ def ex_cross_entropy(mut t: TapeData, z: Int, tgt: Int) raises -> Int:
     var o = t.new_node(1, 1, OP_XENT, z, tgt, t.nodes[z].rg)
     if t.ctx:
         var c = t.dctx()
-        t.nodes[o].aux.ensure_gpu(c, R)
+        ensure_gpu(t.nodes[o].aux, c, R)
         var rows_loss = t.nodes[o].aux.dev.value().create_sub_buffer[DT](0, R)
         c.enqueue_function[_xent_rows_kernel](
             rows_loss, t.dv(z), t.dv(tgt), Int64(R), Int64(C),

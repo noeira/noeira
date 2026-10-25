@@ -11,3 +11,4 @@ into a CUDA graph. See `README.md`; `ftensor.mojo` for the surface,
 """
 
 from .ftensor import Tape, FTensor, FModule, NoGrad
+from .optim import TapeAdam
