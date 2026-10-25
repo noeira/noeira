@@ -22,13 +22,17 @@ step: the RL loop). A "read" is `loss.item()` (ACT: the output's
 On metal_rt a read is the only sync; nothing else flushes.
 
 Rounds interleave the arms; each cell is the MEDIAN us/step over ROUNDS
-rounds, with the min-max spread in brackets.
+rounds, with the min-max spread in brackets. `--arm K` (0-5) builds and
+times ONE arm: MAX's per-launch cost grows with every live MAX buffer, so in
+the interleaved run the MAX arms also pay for the other arms' tapes (run
+each arm in its own process for the fair numbers).
 
     pixi run -e apple mojo build -I . benchmarks/functional/bench_functional_metal_rt.mojo -o /tmp/bench_fn_rt
     /tmp/bench_fn_rt
 """
 
 from std.time import perf_counter_ns
+from std.sys import argv
 from std.random import seed, random_float64
 from max.gpu.host import DeviceContext, DeviceBuffer
 
@@ -71,37 +75,46 @@ def _fmt(x: Float64) -> String:
 def _bench[
     B: Int, IN: Int, H: Int, OUT: Int, OP: ElementOp, TRAIN: Bool,
     ADAM: Bool = False,
-](ctx: DeviceContext, name: String, iters: Int) raises:
+](ctx: DeviceContext, name: String, iters: Int, only: Int) raises:
+    """`only` >= 0: build and time that ONE arm (MAX's per-launch cost grows
+    with every live MAX buffer, so other arms' tapes would slow it down)."""
     comptime RELU = OP.is_relu
     comptime NET = Sequential[
         Linear[IN, H], Elementwise[H, OP], Linear[H, H], Elementwise[H, OP],
         Linear[H, OUT],
     ]
     seed(1)
-    var net = NET.make["gpu", Deterministic](ctx)
+    var ct_on = only < 0 or only == 0
+    var wnet = NET.make["cpu", Deterministic]()  # the weights every arm starts from
+    var net = NET.make["gpu", Deterministic](ctx) if ct_on else NET.make["cpu", Deterministic]()
     var x = Tensor.alloc(B * IN)
     var y = Tensor.alloc(B * OUT)
     for k in range(B * IN):
         x.data[k] = Scalar[DT](random_float64() * 2.0 - 1.0)
     for k in range(B * OUT):
         y.data[k] = Scalar[DT](random_float64() * 2.0 - 1.0)
-    x.upload(ctx)
-    y.upload(ctx)
-    var out = Tensor.alloc_gpu(ctx, B * OUT)
-    var go = Tensor.alloc_gpu(ctx, B * OUT)
-    var gx = Tensor.alloc_gpu(ctx, B * IN)
+    var out = Tensor.alloc(B * OUT)
+    var go = Tensor.alloc(B * OUT)
+    var gx = Tensor.alloc(B * IN)
     var host1 = List[Scalar[DT]](length=1, fill=0)
     var opt_c = Adam(lr=1e-5)
-    comptime if ADAM:
-        opt_c.adopt["gpu"](net, ctx)
+    if ct_on:
+        x.upload(ctx)
+        y.upload(ctx)
+        out = Tensor.alloc_gpu(ctx, B * OUT)
+        go = Tensor.alloc_gpu(ctx, B * OUT)
+        gx = Tensor.alloc_gpu(ctx, B * IN)
+        comptime if ADAM:
+            opt_c.adopt["gpu"](net, ctx)
 
     # tape arms: 1 MAX, 2 MAX own kernels, 3-5 metal_rt
+    # (an arm not built is a CPU tape: no device memory, never stepped)
     var tapes = List[Tape]()
-    tapes.append(Tape(ctx))
-    tapes.append(Tape(ctx, own_kernels=True))
-    tapes.append(Tape.metal_rt(policy=COMMIT_EVERY_N, batch_n=16))
-    tapes.append(Tape.metal_rt(policy=COMMIT_EVERY_N, batch_n=64))
-    tapes.append(Tape.metal_rt(policy=COMMIT_ADAPTIVE, batch_n=16, idle_age_us=20))
+    tapes.append(Tape(ctx) if only < 0 or only == 1 else Tape())
+    tapes.append(Tape(ctx, own_kernels=True) if only < 0 or only == 2 else Tape())
+    tapes.append(Tape.metal_rt(policy=COMMIT_EVERY_N, batch_n=16) if only < 0 or only == 3 else Tape())
+    tapes.append(Tape.metal_rt(policy=COMMIT_EVERY_N, batch_n=64) if only < 0 or only == 4 else Tape())
+    tapes.append(Tape.metal_rt(policy=COMMIT_ADAPTIVE, batch_n=16, idle_age_us=20) if only < 0 or only == 5 else Tape())
     var ps = List[List[FTensor]]()
     var xb = List[DeviceBuffer[DT]]()
     var yb = List[DeviceBuffer[DT]]()
@@ -110,23 +123,28 @@ def _bench[
     for a in range(len(tapes)):
         var t = tapes[a]
         var p = List[FTensor]()
-        p.append(t.param(IN, H, net.children[0].weight.val.data.copy()))
-        p.append(t.param(1, H, net.children[0].bias.val.data.copy()))
-        p.append(t.param(H, H, net.children[2].weight.val.data.copy()))
-        p.append(t.param(1, H, net.children[2].bias.val.data.copy()))
-        p.append(t.param(H, OUT, net.children[4].weight.val.data.copy()))
-        p.append(t.param(1, OUT, net.children[4].bias.val.data.copy()))
+        p.append(t.param(IN, H, wnet.children[0].weight.val.data.copy()))
+        p.append(t.param(1, H, wnet.children[0].bias.val.data.copy()))
+        p.append(t.param(H, H, wnet.children[2].weight.val.data.copy()))
+        p.append(t.param(1, H, wnet.children[2].bias.val.data.copy()))
+        p.append(t.param(H, OUT, wnet.children[4].weight.val.data.copy()))
+        p.append(t.param(1, OUT, wnet.children[4].bias.val.data.copy()))
         ps.append(p^)
-        var bx = t.device_buffer(B * IN)
-        var by = t.device_buffer(B * OUT)
-        t.upload(bx, x.data)
-        t.upload(by, y.data)
-        xb.append(bx)
-        yb.append(by)
+        if t.on_gpu():
+            var bx = t.device_buffer(B * IN)
+            var by = t.device_buffer(B * OUT)
+            t.upload(bx, x.data)
+            t.upload(by, y.data)
+            xb.append(bx)
+            yb.append(by)
+        else:
+            xb.append(ctx.enqueue_create_buffer[DT](1))  # placeholder
+            yb.append(ctx.enqueue_create_buffer[DT](1))
         topts.append(TapeAdam(lr=1e-5))
     comptime if ADAM:
-        var t0 = tapes[0]
-        nopt.adopt["gpu"](t0, ctx)
+        if tapes[0].on_gpu():
+            var t0 = tapes[0]
+            nopt.adopt["gpu"](t0, ctx)
 
     def _ct_step(do_read: Bool) raises {mut net, mut x, mut y, mut out, mut go, mut gx, mut opt_c, mut host1, ctx}:
         comptime if TRAIN:
@@ -177,9 +195,11 @@ def _bench[
 
     # warm-up: allocations, pipelines
     for _ in range(3):
-        _ct_step(False)
+        if ct_on:
+            _ct_step(False)
         for a in range(len(tapes)):
-            _fn_step(a, False)
+            if tapes[a].on_gpu():
+                _fn_step(a, False)
     ctx.synchronize()
     for a in range(len(tapes)):
         tapes[a].synchronize()
@@ -196,6 +216,8 @@ def _bench[
             times.append(List[Float64]())
         for round in range(ROUNDS + 1):  # round 0 = warm-up
             for arm in range(NARMS):
+                if only >= 0 and arm != only:
+                    continue
                 _sync(arm)
                 var t0 = perf_counter_ns()
                 for i in range(iters):
@@ -211,6 +233,9 @@ def _bench[
         var shape_name = String("end") if every == 0 else String("read/", every)
         var row = String("| ") + name + " | " + shape_name
         for arm in range(NARMS):
+            if only >= 0 and arm != only:
+                row += " | -"
+                continue
             var lo = Float64(1e30)
             var hi = Float64(0)
             for v in times[arm]:
@@ -219,19 +244,26 @@ def _bench[
             row += " | " + _fmt(_median(times[arm].copy())) + " [" + _fmt(lo) + "-" + _fmt(hi) + "]"
         print(row + " |")
     for a in range(2, len(tapes)):
+        if not tapes[a].on_gpu():
+            continue
         var st = tapes[a].launcher_stats()
         print("    metal_rt arm", a + 1, ": launches", st[0], " command buffers", st[1],
               " (", _fmt(Float64(st[0]) / Float64(max(st[1], 1))), "launches / cb )")
 
 
 def main() raises:
+    var only = -1
+    var args = argv()
+    for i in range(len(args)):
+        if args[i] == "--arm" and i + 1 < len(args):
+            only = Int(args[i + 1])
     var ctx = DeviceContext()
     print("GPU:", ctx.name(), "— us/step, median of", ROUNDS, "interleaved rounds [min-max]")
     print("| workload | loop | comptime (MAX) | tape MAX | tape MAX own kernels | rt every-16 | rt every-64 | rt adaptive-16 age 20 |")
     print("|---|---|---|---|---|---|---|---|")
-    _bench[1, 23, 256, 1, ReLUOp, False](ctx, "ACT B=1 23-256-256-1 fwd", 500)
-    _bench[64, 8, 64, 4, TanhOp, True](ctx, "PPO B=64 8-64-64-4 train", 200)
-    _bench[256, 23, 256, 1, ReLUOp, True](ctx, "SAC B=256 23-256-256-1 train", 200)
-    _bench[4096, 64, 512, 64, ReLUOp, True](ctx, "BIG B=4096 64-512-512-64 train", 40)
-    _bench[64, 8, 64, 4, TanhOp, True, True](ctx, "PPO B=64 train + Adam", 200)
-    _bench[256, 23, 256, 1, ReLUOp, True, True](ctx, "SAC B=256 train + Adam", 200)
+    _bench[1, 23, 256, 1, ReLUOp, False](ctx, "ACT B=1 23-256-256-1 fwd", 500, only)
+    _bench[64, 8, 64, 4, TanhOp, True](ctx, "PPO B=64 8-64-64-4 train", 200, only)
+    _bench[256, 23, 256, 1, ReLUOp, True](ctx, "SAC B=256 23-256-256-1 train", 200, only)
+    _bench[4096, 64, 512, 64, ReLUOp, True](ctx, "BIG B=4096 64-512-512-64 train", 40, only)
+    _bench[64, 8, 64, 4, TanhOp, True, True](ctx, "PPO B=64 train + Adam", 200, only)
+    _bench[256, 23, 256, 1, ReLUOp, True, True](ctx, "SAC B=256 train + Adam", 200, only)

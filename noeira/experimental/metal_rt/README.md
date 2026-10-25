@@ -29,6 +29,7 @@ most of the step.
 | `mlp_kernels.mojo` | Naive kernels for one 2-layer MLP training step (14 launches). |
 | `bench_mlp.mojo` | The MLP step through MAX and through both launchers under each policy, plus the bit-identity gate. Exits 1 on failure. |
 | `probe_own_launch.mojo` | The seed probe this started from. |
+| `../functional/backend.mojo` | The functional tape's `Dev`: launches through MAX or `MetalRT` (`Tape.metal_rt()`). |
 
 ## Run
 
@@ -315,6 +316,55 @@ compare a run that is doing nothing. Negative control: the same MLP with
       A ring of 16 allocators is recycled by the event value.
 15. **"Context leak detected, CoreAnalytics returned false"** is sometimes
     printed during the MLP benchmark. It is harmless.
+
+## The functional tape on metal_rt (2026-10-25)
+
+`Tape.metal_rt()` (`experimental/functional`) runs noeira's functional tape
+with every kernel, buffer and copy going through `MetalRT`, and none through
+MAX's runtime. Design, gates and full results are in
+`experimental/functional/README.md`. In short:
+
+- **Launches.** The tape's GPU functions launch through a `Dev` handle,
+  which forwards to MAX or to `MetalRT`.
+- **Arguments.** `MetalRT` gained a three-call launch for this: begin,
+  `set_arg`, dispatch, with 2-D grids. That lets `Dev` bind a `DeviceBuffer`
+  argument as its address.
+- **Storage.** Tape storage is `MetalRT` buffers, wrapped as non-owning
+  `DeviceBuffer`s.
+- **Copies.** `upload()` copies host -> device through a staging ring plus a
+  copy kernel, ordered like a launch. `download()` syncs, then reads shared
+  memory.
+- **Gates.** Bit-identical to the tape on MAX's launch path with the same
+  kernels: 18 of 18 runs, three networks × three commit policies × two loop
+  shapes.
+- **Small training steps are 3.8–4.5x faster** than the tape on MAX (PPO
+  B=64), and 1.3–1.8x faster for SAC B=256. Each arm ran in its own process.
+- **B=4096 is 0.6x.** Its own GEMM runs at 0.73 TFLOP/s, against MAX's
+  matmul at 2.5.
+
+Three more pitfalls, found here:
+
+- **No autorelease pool may span an open command buffer.** The first version
+  pushed a pool when a command buffer opened and popped it at commit. With
+  two launchers interleaved (the benchmark keeps three metal_rt tapes
+  alive), popping one pool pops every pool pushed after it. That released
+  the other launcher's open encoder: `failed assertion 'Command encoder
+  released without endEncoding'`. The command buffer and encoder are now
+  `retain`ed and released at commit, with a pool around each creating call
+  only. MAX's own host calls between our launches, such as
+  `create_sub_buffer`, are now outside any pool of ours too.
+- **A buffer allocated while a command buffer is open.** It joins the
+  residency set, which is committed lazily, so the open command buffer may
+  run without it resident. The symptom matched exactly: the tape's Adam
+  moments, allocated mid-step, lost their step-0 writes, so step-1's update
+  read zeros and the step-2 loss diverged. It happened in about 1 run in 3
+  of the gate, and could not be reproduced on demand (0 of 80 stress runs,
+  with or without the fix). `alloc` now commits the open command buffer
+  first, and 9 of 9 full gate runs passed since.
+- **Two `DeviceContext`s are two queues.** In the first version of the
+  tolerance gate, nn's Adam was given a fresh `DeviceContext()` while the
+  tape used another one. It raced the tape's own work. This is a MAX-side
+  test bug, but it looked exactly like a launcher bug.
 
 ## Limits
 
