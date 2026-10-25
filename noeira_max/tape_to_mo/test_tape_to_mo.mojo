@@ -256,10 +256,13 @@ def tape_gpu(ctx: DeviceContext, net: Net, steps: Int, timed: Int, capture: Bool
 
 
 def compiled_gpu(rt: Runtime, net: Net, steps: Int, timed: Int, path: String, stage: Int = 2,
-                 chain_per_buffer: Bool = False, packed: Bool = False) raises -> Run:
+                 chain_per_buffer: Bool = False, packed: Bool = False, capture: Bool = False) raises -> Run:
     """The compiled step on the accelerator: every argument copied to the
     device and lent by address; batch 0 at every step. `stage` as in
-    `eager_gpu` (1 outputs the gradients instead of storing an update)."""
+    `eager_gpu` (1 outputs the gradients instead of storing an update).
+    `capture`: step 0 executes, step 1 is recorded as MAX's device graph
+    (`M_captureModelSync`, CUDA / HIP only) and every later step replays it
+    on the same buffers."""
     var r = Run()
     var tape = Tape()
     var p = net.params(tape)
@@ -316,10 +319,39 @@ def compiled_gpu(rt: Runtime, net: Net, steps: Int, timed: Int, path: String, st
     lend(String("x", yb.id), HostBuffer(copy_from=Int(y0.unsafe_ptr()), nbytes=4 * len(y0)), [net.b, net.dout])
     _ = x0^
     _ = y0^
+    # capture takes the arguments positionally: the header's order
+    var order = List[String]()
+    for pre in ["p", "m", "v"]:
+        for k in range(len(step.params) if not packed else 0):
+            order.append(String(pre, k))
+    if packed:
+        order.append("state")
+    else:
+        order.append("pow1")
+        order.append("pow2")
+    order.append(String("x", xb.id))
+    order.append(String("x", yb.id))
+    var want = String("argument_names = [")
+    for i in range(len(order)):
+        want += String("\"", order[i], "\"", ", " if i + 1 < len(order) else "]")
+    if capture and step.text.find(want) < 0:
+        raise Error("compiled_gpu: argument order is not " + want)
+    var args = List[Tensor]()
+    for i in range(len(order) if capture else 0):
+        args.append(inputs.tensor(order[i]))
+    var outs = List[Tensor]()
     var best = Best()
     for s in range(steps + timed):
         var t1 = perf_counter_ns()
-        var l = Float64(model.execute(inputs).tensor("loss").to_host().item[DType.float32]())
+        var l: Float64
+        if capture and s >= 1:
+            if s == 1:
+                outs = model.capture(1, args)
+            else:
+                model.replay(1, args)
+            l = Float64(outs[0].to_host().item[DType.float32]())
+        else:
+            l = Float64(model.execute(inputs).tensor("loss").to_host().item[DType.float32]())
         if s < steps:
             r.losses.append(l)
             if s == steps - 1 and packed:
@@ -630,7 +662,24 @@ def nvidia(dir: String) raises:
     ok = compare("MAX ping-pong vs eager CPU", cp, e, 1e-4, 2.5e-3) and ok
     var cpk = compiled_gpu(grt, mlp, 20, 0, dir + "/nv_gate_packed.mlir", packed=True)
     ok = compare("MAX packed vs eager CPU", cpk, e, 1e-4, 2.5e-3) and ok
+    var ccap = compiled_gpu(grt, mlp, 20, 0, dir + "/nv_gate_stores.mlir", capture=True)
+    ok = compare("MAX captured vs eager CPU", ccap, e, 1e-4, 2.5e-3) and ok
+    ok = compare("MAX captured vs MAX executed (same TF32 math)", ccap, cs, 1e-6, 1e-6) and ok
     print("NVIDIA GATES OK" if ok else "NVIDIA GATES FAILED")
+    if len(argv()) > 3 and String(argv()[3]) == "--captured-only":
+        var shapes1: List[List[Int]] = [[1, 17, 256, 6], [64, 17, 256, 6], [256, 64, 256, 8], [1024, 128, 512, 16]]
+        for i in range(len(shapes1)):
+            var nt = Net(shapes1[i][0], shapes1[i][1], shapes1[i][2], shapes1[i][3], 0)
+            print("B ", nt.b, ", ", nt.din, " -> ", nt.h, " -> ", nt.h, " -> ", nt.dout, " (us per step)", sep="")
+            for rd in range(3):
+                var ec = tape_gpu(ctx, nt, 0, 200, True)
+                var ms = compiled_gpu(grt, nt, 0, 200, String(dir, "/nv_", i, "_stores.mlir"))
+                var mc = compiled_gpu(grt, nt, 0, 200, String(dir, "/nv_", i, "_stores.mlir"), capture=True)
+                print("  round ", rd, ": captured tape ", Int(ec.step_us), " | MAX executed ", Int(ms.step_us),
+                      " | MAX captured ", Int(mc.step_us), "  [load ms: ", Int(mc.compile_ms), "]", sep="")
+        if not ok:
+            raise Error("nvidia gate failed")
+        return
     var shapes: List[List[Int]] = [[1, 17, 256, 6], [64, 17, 256, 6], [256, 64, 256, 8], [1024, 128, 512, 16]]
     for i in range(len(shapes)):
         var nt = Net(shapes[i][0], shapes[i][1], shapes[i][2], shapes[i][3], 0)
