@@ -618,16 +618,25 @@ struct MetalRT(Launcher):
         if self.rset_dirty:
             _ = self.o.send0(self.rset, self.s.commit)  # MTLResidencySet commit
             self.rset_dirty = False
-        # One autorelease pool per command buffer: the command buffer and its
-        # encoder are autoreleased; after `commit` the queue owns the buffer
-        # (and we retain the last one for `status`).
-        self.pool = self.o.pool_push()
-        self.cb = self.o.send0(self.queue, self.s.command_buffer_unretained)
+        # The command buffer and its encoder come back autoreleased. They are
+        # RETAINED here and released at commit, with a pool around each of
+        # the two calls only: a pool spanning an open command buffer breaks
+        # as soon as two launchers interleave (popping one pool pops every
+        # pool pushed after it, releasing the other launcher's open encoder:
+        # "Command encoder released without endEncoding").
+        var pool = self.o.pool_push()
+        self.cb = self.o.send0(
+            self.o.send0(self.queue, self.s.command_buffer_unretained),
+            self.s.retain,
+        )
         if self.order == ORDER_EVENT and self.committed > 0:
             _ = self.o.send2(self.cb, self.s.wait_event, self.event, self.committed)
-        self.enc = self.o.send0(self.cb, self.s.compute_encoder)
+        self.enc = self.o.send0(
+            self.o.send0(self.cb, self.s.compute_encoder), self.s.retain
+        )
         if self.order == ORDER_FENCE and self.committed > 0:
             _ = self.o.send1(self.enc, self.s.wait_fence, self.fence)
+        self.o.pool_pop(pool)
         self.cur_pso = 0
         if self.residency == RESIDENCY_PER_CB:
             self._use_all()
@@ -635,6 +644,7 @@ struct MetalRT(Launcher):
     def _commit(mut self, signal: Bool = False):
         if self.cb == 0:
             return
+        var pool = self.o.pool_push()
         if self.order == ORDER_FENCE:
             _ = self.o.send1(self.enc, self.s.update_fence, self.fence)
         _ = self.o.send0(self.enc, self.s.end_encoding)
@@ -642,12 +652,16 @@ struct MetalRT(Launcher):
         if signal or self.done == DONE_EVENT or self.order == ORDER_EVENT:
             _ = self.o.send2(self.cb, self.s.signal_event, self.event, self.committed)
             self.last_signaled = self.committed
+        _ = self.o.send0(self.cb, self.s.commit)
+        _ = self.o.send0(self.enc, self.s.release)
         if self.done == DONE_STATUS:
+            # our retain moves to `last_cb`, kept for its `status`
             if self.last_cb != 0:
                 _ = self.o.send0(self.last_cb, self.s.release)
-            self.last_cb = self.o.send0(self.cb, self.s.retain)
-        _ = self.o.send0(self.cb, self.s.commit)
-        self.o.pool_pop(self.pool)
+            self.last_cb = self.cb
+        else:
+            _ = self.o.send0(self.cb, self.s.release)
+        self.o.pool_pop(pool)
         self.cb = 0
         self.enc = 0
         self.pool = 0

@@ -300,10 +300,13 @@ struct Metal4RT(Launcher):
             while self.signaled() < need:
                 pass
         _ = self.o.send0(self.allocs[slot], self.s_reset)
-        self.pool = self.o.pool_push()
+        # Retain the (autoreleased) encoder; no pool may span an open
+        # command buffer (see runtime.mojo `_begin`).
+        var pool = self.o.pool_push()
         self.cb = self.cbs[slot]
         _ = self.o.send1(self.cb, self.s_begin, self.allocs[slot])
-        self.enc = self.o.send0(self.cb, self.s_enc)
+        self.enc = self.o.send0(self.o.send0(self.cb, self.s_enc), self.o.sel("retain"))
+        self.o.pool_pop(pool)
         if self.committed > 0 and self.barriers:
             _ = self.o.send3(
                 self.enc, self.s_barrier_queue, _STAGE_DISPATCH, _STAGE_DISPATCH, _VIS_DEVICE
@@ -316,13 +319,15 @@ struct Metal4RT(Launcher):
     def _commit(mut self):
         if self.cb == 0:
             return
+        var pool = self.o.pool_push()
         _ = self.o.send0(self.enc, self.s_end_enc)
+        self.o.release(self.enc)
         _ = self.o.send0(self.cb, self.s_end_cb)
         self._cbp[0] = self.cb
         _ = self.o.send2(self.queue, self.s_commit, Int(self._cbp.unsafe_ptr()), 1)
         self.committed += 1
         _ = self.o.send2(self.queue, self.s_signal, self.event, self.committed)
-        self.o.pool_pop(self.pool)
+        self.o.pool_pop(pool)
         self.cb = 0
         self.enc = 0
         self.pool = 0
