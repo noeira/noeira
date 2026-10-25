@@ -194,6 +194,67 @@ def eager_gpu(ctx: DeviceContext, net: Net, timed: Int, stage: Int = 2) raises -
     return best.best
 
 
+def tape_gpu(ctx: DeviceContext, net: Net, steps: Int, timed: Int, capture: Bool) raises -> Run:
+    """The eager tape on the GPU as `eager_gpu` runs it, gated like
+    `compiled_gpu`. `capture`: step 0 runs eagerly (allocations, cuBLASLt
+    plans), step 1 is captured into a CUDA graph and every later step
+    replays it (NVIDIA only: raises where nothing is captured)."""
+    var r = Run()
+    var tape = Tape(ctx)
+    var p = net.params(tape)
+    var opt = Adam(lr=Scalar[DT](LR))
+    opt.adopt["gpu"](tape, ctx)
+    var bt = batch(net, 0)
+    var xd = ctx.enqueue_create_buffer[DT](len(bt[0]))
+    var yd = ctx.enqueue_create_buffer[DT](len(bt[1]))
+    with xd.map_to_host() as hx, yd.map_to_host() as hy:
+        for i in range(len(bt[0])):
+            hx[i] = bt[0][i]
+        for i in range(len(bt[1])):
+            hy[i] = bt[1][i]
+
+    def one(mut opt: Adam) raises {mut tape, p, net, xd, yd, ctx} -> FTensor:
+        tape.reset()
+        tape.zero_grad()
+        var loss = net.loss(p, tape.input_device(net.b, net.din, xd), tape.input_device(net.b, net.dout, yd))
+        loss.backward()
+        opt.step["gpu"](tape, ctx)
+        return loss
+
+    var loss = one(opt)
+    if steps > 0:
+        r.losses.append(Float64(loss.item()))
+    if capture:
+        tape.capture_begin()
+        loss = one(opt)
+        tape.capture_end()
+        if not tape.captured():
+            raise Error("tape_gpu: nothing captured (capture is NVIDIA-only)")
+    else:
+        loss = one(opt)
+    if steps > 1:
+        r.losses.append(Float64(loss.item()))
+    var n = max(steps, 2)
+    var best = Best()
+    for s in range(2, n + timed):
+        var t0 = perf_counter_ns()
+        if capture:
+            tape.replay()
+        else:
+            loss = one(opt)
+        var l = Float64(loss.item())
+        if s < steps:
+            r.losses.append(l)
+        elif s >= n:
+            best.add(Float64(perf_counter_ns() - t0) / 1e3)
+    if timed == 0:
+        r.params = flat(p)
+    r.step_us = best.best
+    _ = xd^
+    _ = yd^
+    return r^
+
+
 def compiled_gpu(rt: Runtime, net: Net, steps: Int, timed: Int, path: String, stage: Int = 2,
                  chain_per_buffer: Bool = False, packed: Bool = False) raises -> Run:
     """The compiled step on the accelerator: every argument copied to the
@@ -545,6 +606,51 @@ def packed_probe(dir: String) raises:
         raise Error("packed gate failed")
 
 
+def nvidia(dir: String) raises:
+    """On NVIDIA the baseline to beat is the CAPTURED tape. Gates against
+    the eager CPU tape: the eager and captured tape on the GPU, MAX with
+    in-place stores, ping-pong and one packed store. Then the step time at
+    four sizes, interleaved over 3 rounds: eager tape | captured tape |
+    MAX 20 stores | MAX 1 packed store | MAX ping-pong | MAX outputs, no
+    store (a lower bound, not a training step)."""
+    var grt = Runtime(accelerator=True)
+    var ctx = DeviceContext()
+    print("GPU:", ctx.name())
+    var mlp = Net(64, 17, 64, 6, 0)
+    var e = eager(mlp, 20, 0, fixed=True)
+    var ok = True
+    var tg = tape_gpu(ctx, mlp, 20, 0, False)
+    ok = compare("eager tape on the GPU vs eager CPU", tg, e, 1e-4, 2.5e-3) and ok
+    var tc = tape_gpu(ctx, mlp, 20, 0, True)
+    ok = compare("captured tape vs eager CPU", tc, e, 1e-4, 2.5e-3) and ok
+    var cs = compiled_gpu(grt, mlp, 20, 0, dir + "/nv_gate_stores.mlir")
+    print("    compile:", cs.compile_ms, "ms")
+    ok = compare("MAX stores vs eager CPU", cs, e, 1e-4, 2.5e-3) and ok
+    var cp = compiled_gpu_pingpong(grt, mlp, 20, 0, dir + "/nv_gate_pingpong.mlir")
+    ok = compare("MAX ping-pong vs eager CPU", cp, e, 1e-4, 2.5e-3) and ok
+    var cpk = compiled_gpu(grt, mlp, 20, 0, dir + "/nv_gate_packed.mlir", packed=True)
+    ok = compare("MAX packed vs eager CPU", cpk, e, 1e-4, 2.5e-3) and ok
+    print("NVIDIA GATES OK" if ok else "NVIDIA GATES FAILED")
+    var shapes: List[List[Int]] = [[1, 17, 256, 6], [64, 17, 256, 6], [256, 64, 256, 8], [1024, 128, 512, 16]]
+    for i in range(len(shapes)):
+        var nt = Net(shapes[i][0], shapes[i][1], shapes[i][2], shapes[i][3], 0)
+        print("B ", nt.b, ", ", nt.din, " -> ", nt.h, " -> ", nt.h, " -> ", nt.dout, " (us per step)", sep="")
+        for rd in range(3):
+            var eg = tape_gpu(ctx, nt, 0, 200, False)
+            var ec = tape_gpu(ctx, nt, 0, 200, True)
+            var ms = compiled_gpu(grt, nt, 0, 200, String(dir, "/nv_", i, "_stores.mlir"))
+            var mk = compiled_gpu(grt, nt, 0, 200, String(dir, "/nv_", i, "_packed.mlir"), packed=True)
+            var mp = compiled_gpu_pingpong(grt, nt, 0, 200, String(dir, "/nv_", i, "_pingpong.mlir"))
+            var mo = compiled_gpu(grt, nt, 0, 200, String(dir, "/nv_", i, "_outputs.mlir"), 3)
+            print("  round ", rd, ": eager ", Int(eg.step_us), " | captured ", Int(ec.step_us),
+                  " | MAX 20 stores ", Int(ms.step_us), " | 1 packed ", Int(mk.step_us),
+                  " | ping-pong ", Int(mp.step_us), " (relend ", Int(mp.relend_us), ")",
+                  " | outputs, no store ", Int(mo.step_us),
+                  "  [compile ms: ", Int(ms.compile_ms), "]", sep="")
+    if not ok:
+        raise Error("nvidia gate failed")
+
+
 def debug_gpu(rt: Runtime, net: Net, path: String, update: Bool) raises:
     """Which MLP node drifts on the GPU: each layer's value from ONE compiled
     execution vs the CPU tape's forward on the same weights and batch."""
@@ -718,6 +824,9 @@ def main() raises:
     comptime STEPS = 20
     if len(argv()) > 2 and String(argv()[2]) == "--stages":
         stages(dir)
+        return
+    if len(argv()) > 2 and String(argv()[2]) == "--nvidia":
+        nvidia(dir)
         return
     if len(argv()) > 2 and String(argv()[2]) == "--packed":
         packed_probe(dir)
