@@ -9,17 +9,20 @@ the host.
    a. MLP 17 -> 64 relu -> 64 tanh -> 6, MSE, batch 64
    b. every other rank-2 op the emitter takes
    c. MUTANT (tanh's backward 1 + y²) must FAIL (a)'s bound.
+   d. (a) at B=1024, 64-256-256-64: the mean's 1/65536 is past fp16's
+      range (left to the host, see below).
 2. Training: fit sin(x) on [-pi, pi], 1 -> 64 tanh -> 64 tanh -> 1, batch
    256, Adam 3e-3, the same init and batches, CPU tape vs the ANE step
-   (dynamic loss scale from 32768: halve and skip on a non-finite gradient,
-   double after 500 good steps). The ANE run must reach the CPU run's loss
+   (dynamic loss scale from an effective 32768: halve and skip on a
+   non-finite gradient, double after 500 good steps). The ANE run must reach the CPU run's loss
    (within a factor) and its curve is printed.
 
 Every gradient is scaled by the seed (an input): fp16's smallest normal is
 6.1e-5, and at a 1024 scale the every-op graph's first-layer gradients
 lost 10% to underflow (1.1% at 32768); section 0 shows the fp32 gradients
 themselves move by < 7e-4 under fp16-sized input noise there, so the error
-is range, not conditioning.
+is range, not conditioning. A mean loss's 1/count is applied on the host,
+so (d) can run at an effective scale past 65504.
 
     pixi run -e apple mojo run -I . tests/experimental/ane/test_ane_step.mojo
 """
@@ -33,7 +36,7 @@ from noeira.nn.optimizer.adam import Adam
 from noeira.experimental.functional import Tape, FTensor
 import noeira.experimental.functional.F as F
 from noeira.experimental.ane.runtime import ANE, Program
-from noeira.experimental.ane.emit import emit_grad_step, GradStep
+from noeira.experimental.ane.step import AneGrad
 
 
 comptime GRAD_TOL = 3e-2
@@ -108,71 +111,21 @@ def batch(net: Net, step: Int) -> Tuple[List[Scalar[DT]], List[Scalar[DT]]]:
     return (x^, y^)
 
 
-struct AneStep(Movable):
-    """The compiled step and where its data goes."""
-
-    var step: GradStep
-    var prog: Program
-    var x_arg: Int
-    var y_arg: Int
-    var grad: List[Scalar[DT]]
-
-    def __init__(out self, a: ANE, net: Net, mut tape: Tape, p: List[FTensor],
-                 mutant: Bool = False) raises:
-        var bt = batch(net, 0)
-        var xb = tape.input(net.b, net.din, bt[0].copy())
-        var yb = tape.input(net.b, net.dout, bt[1].copy())
-        self.step = emit_grad_step(tape, net.loss(p, xb, yb), mutant=mutant)
-        self.prog = Program(a, self.step.text)
-        self.x_arg = -1
-        self.y_arg = -1
-        for k in range(len(self.step.args)):
-            if self.step.args[k] == xb.id:
-                self.x_arg = k
-            elif self.step.args[k] == yb.id:
-                self.y_arg = k
-        if self.x_arg < 0 or self.y_arg < 0:
-            raise Error("the batch inputs are not program arguments")
-        if len(self.prog.in_layout) != len(self.step.args) + 1:
-            raise Error("program inputs != tape arguments + seed")
-        self.grad = List[Scalar[DT]]()
-        tape.reset()
-
-    def run(mut self, a: ANE, mut tape: Tape, x: List[Scalar[DT]], y: List[Scalar[DT]],
-            seed_v: Float32) raises -> Float64:
-        """Loss; the gradients (divided by the seed) land in the tape's
-        parameter grads. Returns NaN if any gradient is not finite."""
-        ref td = tape.data[]
-        for k in range(len(self.step.args)):
-            var id = self.step.args[k]
-            if k == self.x_arg:
-                self.prog.write(a, k, Pointer(to=x[0]))
-            elif k == self.y_arg:
-                self.prog.write(a, k, Pointer(to=y[0]))
-            else:
-                self.prog.write(a, k, Pointer[Float32, MutAnyOrigin](unsafe_from_address=Int(td.val_ptr(id))))
-        var s: List[Float32] = [seed_v]
-        self.prog.write(a, len(self.step.args), Pointer(to=s[0]))
-        self.prog.run(a)
-        var l: List[Float32] = [0.0]
-        self.prog.read(a, 0, Pointer[Float32, MutAnyOrigin](unsafe_from_address=Int(l.unsafe_ptr())))
-        var finite = True
-        for k in range(len(self.step.grads)):
-            var id = self.step.grads[k]
-            var gp = Pointer[Float32, MutAnyOrigin](unsafe_from_address=Int(td.grad_ptr(id)))
-            self.prog.read(a, k + 1, gp, 1.0 / seed_v)
-            var n = self.step.shapes[id][0] * self.step.shapes[id][1]
-            for i in range(n):
-                var v = gp[unsafe_offset=i]
-                if v != v or abs(v) > 1e30:
-                    finite = False
-        _ = s^
-        return Float64(l[0]) if finite else _nan()
+def ane_step(a: ANE, net: Net, mut tape: Tape, p: List[FTensor], mutant: Bool = False) raises -> AneGrad:
+    """Record one forward on batch 0, compile it for the ANE."""
+    var bt = batch(net, 0)
+    var xb = tape.input(net.b, net.din, bt[0].copy())
+    var yb = tape.input(net.b, net.dout, bt[1].copy())
+    var g = AneGrad(a, tape, net.loss(p, xb, yb), [xb, yb], mutant)
+    tape.reset()
+    return g^
 
 
-def _nan() -> Float64:
-    var z = Float64(0)
-    return z / z
+def ane_run(a: ANE, mut st: AneGrad, mut tape: Tape, bt: Tuple[List[Scalar[DT]], List[Scalar[DT]]],
+            scale: Float32) raises -> Float64:
+    st.set_data(a, 0, Pointer(to=bt[0][0]))
+    st.set_data(a, 1, Pointer(to=bt[1][0]))
+    return st.run(a, tape, scale)
 
 
 def cpu_grads(net: Net, mut tape: Tape, p: List[FTensor], step: Int) raises -> Tuple[Float64, List[List[Scalar[DT]]]]:
@@ -240,19 +193,19 @@ def gate_grads(a: ANE, name: String, net: Net, mutant: Bool) raises -> Float64:
     down) whose gradients stay finite, as a dynamic scaler settles."""
     var tape = Tape()
     var p = net.params(tape)
-    var st = AneStep(a, net, tape, p, mutant)
+    var st = ane_step(a, net, tape, p, mutant)
     print("  ", name, ": compile+load", st.prog.compile_ms, "ms,", len(st.step.grads), "gradients")
     var worst = Float64(0)
     for s in range(3):
         var ref_ = cpu_grads(net, tape, p, s)
         var bt = batch(net, s)
-        var seed_v = Float32(32768.0)
-        var l = st.run(a, tape, bt[0], bt[1], seed_v)
-        while l != l and seed_v > 1.0:
+        var seed_v = Float32(32768.0)  # an effective scale up to 32768 * count
+        var l = ane_run(a, st, tape, bt, seed_v)
+        while l != l and seed_v > Float32(6.1e-5):
             seed_v *= 0.5
-            l = st.run(a, tape, bt[0], bt[1], seed_v)
+            l = ane_run(a, st, tape, bt, seed_v)
         var lerr = abs(l - ref_[0]) / max(abs(ref_[0]), 1e-30)
-        var line = String("     batch ", s, " (scale ", Int(seed_v), "): loss ", l, " vs ", ref_[0],
+        var line = String("     batch ", s, " (scale ", Float64(seed_v) * st.step.grad_div, "): loss ", l, " vs ", ref_[0],
                           " (rel ", lerr, ") | grad err")
         for k in range(len(st.step.grads)):
             var id = st.step.grads[k]
@@ -268,7 +221,7 @@ def gate_grads(a: ANE, name: String, net: Net, mutant: Bool) raises -> Float64:
             line += String(" ", tape.data[].nodes[id].name, "=", rel)
         worst = max(worst, lerr)
         print(line)
-    st.prog.free(a)
+    st.free(a)
     return worst
 
 
@@ -277,10 +230,12 @@ def train(a: ANE, net: Net, steps: Int, on_ane: Bool, mut curve: List[Float64]) 
     var tape = Tape()
     var p = net.params(tape)
     var opt = Adam(lr=Scalar[DT](3e-3))
-    var st = Optional[AneStep]()
+    var st = Optional[AneGrad]()
     if on_ane:
-        st = AneStep(a, net, tape, p)
+        st = ane_step(a, net, tape, p)
     var scale = Float32(32768.0)
+    if on_ane:
+        scale = st.value().start_scale()
     var good = 0
     var skipped = 0
     var t_sum = Float64(0)
@@ -289,14 +244,14 @@ def train(a: ANE, net: Net, steps: Int, on_ane: Bool, mut curve: List[Float64]) 
         var t0 = perf_counter_ns()
         var l: Float64
         if on_ane:
-            l = st.value().run(a, tape, bt[0], bt[1], scale)
+            l = ane_run(a, st.value(), tape, bt, scale)
             if l != l:  # an overflowed gradient: skip the step, halve the scale
                 scale *= 0.5
                 skipped += 1
                 good = 0
                 continue
             good += 1
-            if good == 500 and scale < 32768.0:
+            if good == 500 and scale < 32768.0:  # the SEED's cap (fp16)
                 scale *= 2.0
                 good = 0
         else:
@@ -313,7 +268,7 @@ def train(a: ANE, net: Net, steps: Int, on_ane: Bool, mut curve: List[Float64]) 
         curve.append(l)
     if on_ane:
         print("     loss scale at the end", scale, ", skipped steps", skipped)
-        st.value().prog.free(a)
+        st.value().free(a)
     return t_sum / Float64(steps - 20)
 
 
@@ -330,11 +285,15 @@ def main() raises:
     print("0. conditioning (fp32 tape only)")
     _ = sensitivity("a. MLP", Net(64, 17, 64, 6, 0))
     _ = sensitivity("b. every-op", Net(64, 17, 64, 6, 1))
+    _ = sensitivity("d. MLP B=1024", Net(1024, 64, 256, 64, 0))
     print("1. gradients, ANE (fp16) vs CPU tape (fp32), bound", GRAD_TOL)
     var e = gate_grads(a, "a. MLP 17-64relu-64tanh-6", Net(64, 17, 64, 6, 0), False)
     ok = ok and e < GRAD_TOL
     print("     worst", e, "OK" if e < GRAD_TOL else "FAIL")
     e = gate_grads(a, "b. every-op graph", Net(64, 17, 64, 6, 1), False)
+    ok = ok and e < GRAD_TOL
+    print("     worst", e, "OK" if e < GRAD_TOL else "FAIL")
+    e = gate_grads(a, "d. MLP B=1024 64-256relu-256tanh-64", Net(1024, 64, 256, 64, 0), False)
     ok = ok and e < GRAD_TOL
     print("     worst", e, "OK" if e < GRAD_TOL else "FAIL")
     e = gate_grads(a, "c. MUTANT tanh bwd", Net(64, 17, 64, 6, 0), True)

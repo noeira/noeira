@@ -13,7 +13,9 @@ gradient. The optimizer stays on the host (fp32 master weights).
 Every tensor is fp16 (the M1's ANE refuses fp32 I/O), rank 4 in matrix form:
 the tape's `[R, K]` is `[1, 1, R, K]`. The seed is an input so the loss scale
 can change without recompiling: fp16's smallest normal is 6.1e-5, below most
-gradients of a mean loss.
+gradients of a mean loss. When the loss IS a mean, its 1/count stays on the
+host (`grad_div`): the effective scale, seed * count, can then exceed
+fp16's 65504, which a batch of 1024 x 64 outputs needs.
 
 Rank-2 tapes only, the ops an MLP and its loss record: add/sub/mul/div with
 broadcasting, matmul, scalar ops, relu/tanh/sigmoid/exp/log/sqrt, sum/mean,
@@ -36,13 +38,17 @@ struct GradStep(Movable):
     """Parameter node id of each output after the loss."""
     var shapes: List[List[Int]]
     """Every node's [rows, cols]."""
+    var grad_div: Float64
+    """Divide the gradient outputs by seed * grad_div: when the loss is a
+    mean, its 1/count is left to the host (count, else 1)."""
 
     def __init__(out self, var text: String, var args: List[Int], var grads: List[Int],
-                 var shapes: List[List[Int]]):
+                 var shapes: List[List[Int]], grad_div: Float64):
         self.text = text^
         self.args = args^
         self.grads = grads^
         self.shapes = shapes^
+        self.grad_div = grad_div
 
 
 def _ty(s: List[Int]) -> String:
@@ -116,7 +122,9 @@ struct Mil(Movable):
                 b += self.lines[i]
         return b^
 
-    def scalar(mut self, c: Float32) -> String:
+    def scalar(mut self, c: Float32) raises -> String:
+        if abs(c) > 65504.0:
+            raise Error(String("tape_to_mil: constant ", c, " does not fit in fp16"))
         var v = self.fresh()
         self.emit(v, String("        fp16 ", v, " = const()[name = string(\"", v, "\"), val = fp16(", c, ")];\n"))
         return v
@@ -145,12 +153,12 @@ struct Mil(Movable):
     def un(mut self, name: String, a: String, so: List[Int]) -> String:
         return self.op(_ty(so), String(name, "(x = ", a, ")"))
 
-    def scal(mut self, name: String, a: String, c: Float32, so: List[Int]) -> String:
+    def scal(mut self, name: String, a: String, c: Float32, so: List[Int]) raises -> String:
         """`a <name> c`."""
         var k = self.scalar(c)
         return self.op(_ty(so), String(name, "(x = ", a, ", y = ", k, ")"))
 
-    def rscal(mut self, name: String, c: Float32, a: String, so: List[Int]) -> String:
+    def rscal(mut self, name: String, c: Float32, a: String, so: List[Int]) raises -> String:
         """`c <name> a`."""
         var k = self.scalar(c)
         return self.op(_ty(so), String(name, "(x = ", k, ", y = ", a, ")"))
@@ -244,6 +252,17 @@ def _acc(mut g: Mil, mut grads: List[String], rg: List[Bool], shapes: List[List[
         grads[i] = g.bin("add", grads[i], val, shapes[i])
 
 
+def _div_count(mut g: Mil, a: String, n: Int, so: List[Int]) raises -> String:
+    """`a / n` for an element count `n` that may exceed fp16's 65504: exact
+    divisions by 256 first, then the rest."""
+    var v = a
+    var c = Float64(n)
+    while c > 32768.0:
+        v = g.scal("mul", v, 1.0 / 256.0, so)
+        c /= 256.0
+    return g.scal("real_div", v, Float32(c), so)
+
+
 def _unb(mut g: Mil, val: String, gs: List[Int], target: List[Int]) -> String:
     """Sum `val` over every axis `target` broadcast (size 1 there)."""
     var axes = List[Int]()
@@ -331,6 +350,7 @@ def emit_grad_step(tape: Tape, loss: FTensor, mutant: Bool = False) raises -> Gr
         rg.append(td.nodes[i].rg)
 
     grads[L] = seed
+    var grad_div = Float64(1)
     for i in range(L, -1, -1):
         ref nd = td.nodes[i]
         if grads[i] == "" or nd.op == OP_LEAF:
@@ -366,8 +386,10 @@ def emit_grad_step(tape: Tape, loss: FTensor, mutant: Bool = False) raises -> Gr
             _acc(g, grads, rg, shapes, nd.a, _act_bwd(g, mutant, nd.sub, gv, vals[nd.a], vals[i], so))
         elif op == OP_SUM or op == OP_MEAN:
             var gg = gv
-            if op == OP_MEAN:
-                gg = g.scal("real_div", gv, Float32(shapes[nd.a][0] * shapes[nd.a][1]), so)
+            if op == OP_MEAN and i == L:
+                grad_div = Float64(shapes[nd.a][0] * shapes[nd.a][1])
+            elif op == OP_MEAN:
+                gg = _div_count(g, gv, shapes[nd.a][0] * shapes[nd.a][1], so)
             _acc(g, grads, rg, shapes, nd.a, g.tile(gg, so, shapes[nd.a]))
         elif op == OP_TRANSPOSE:
             _acc(g, grads, rg, shapes, nd.a, g.transpose(gv, shapes[nd.a]))
@@ -401,7 +423,7 @@ def emit_grad_step(tape: Tape, loss: FTensor, mutant: Bool = False) raises -> Gr
     for k in range(len(outs)):
         ret += outs[k] if k == 0 else String(", ", outs[k])
     text += String("    } -> (", ret, ");\n}\n")
-    return GradStep(text^, args^, pgrads^, shapes^)
+    return GradStep(text^, args^, pgrads^, shapes^, grad_div)
 
 
 def _pad3(k: Int) -> String:
