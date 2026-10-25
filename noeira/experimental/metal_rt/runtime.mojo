@@ -3,7 +3,7 @@
     var rt = MetalRT(policy=COMMIT_ADAPTIVE, batch_n=16)
     var x = rt.alloc[DType.float32](1024)         # shared storage
     x.host_ptr[DType.float32]()[unsafe_offset=0] = 1.0
-    rt.launch[my_kernel](x.dev[DType.float32](), 1024, grid=4, block=256)
+    rt.launch[my_kernel](x.dev[DType.float32](), Int64(1024), grid=4, block=256)
     rt.sync()                                      # commit + wait
     print(x.host_ptr[DType.float32]()[unsafe_offset=0])
 
