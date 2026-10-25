@@ -495,6 +495,18 @@ struct MetalRT(Launcher):
             self.set_arg(i, Int(Pointer(to=args[i])), size_of[Ts[i]]())
         self.dispatch(grid, block)
 
+    def launch2d[
+        func_type: TrivialRegisterPassable, //, func: func_type, *Ts: AnyType
+    ](
+        mut self, *args: *Ts, grid_x: Int, grid_y: Int, block_x: Int,
+        block_y: Int = 1,
+    ) raises:
+        """`launch` over a 2-D grid of threadgroups."""
+        self.begin_dispatch[func]()
+        comptime for i in range(args.__len__()):
+            self.set_arg(i, Int(Pointer(to=args[i])), size_of[Ts[i]]())
+        self.dispatch(grid_x, block_x, grid_y, block_y)
+
     # The same launch in three calls, for a caller that converts its own
     # argument types (`functional/backend.mojo` turns a `DeviceBuffer` into
     # its address): begin, one `set_arg` per argument, dispatch.

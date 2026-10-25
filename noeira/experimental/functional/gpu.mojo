@@ -27,7 +27,9 @@ the form `mm.mojo` already uses on Apple — with two exceptions:
 
 `ctx` is a `Dev` (`backend.mojo`): MAX's context, or the metal_rt launcher.
 With `ctx.own` (always on a metal_rt tape) the Metal GEMMs are the tape's
-own `_tiled_mm_kernel` / `_naive_mm_kernel`, never MAX's matmul.
+own: the simdgroup-matrix kernels of `sg_gemm.mojo` from a 64 x 64 output,
+`_naive_mm_kernel` below — never MAX's matmul. (`_tiled_mm_kernel`, the
+scalar first version, is kept for comparison: bench_tape_gemm.mojo.)
 """
 
 from std.sys import default_accelerator
@@ -45,6 +47,7 @@ from noeira.nn.core.cublas_gemm import cublas_gemm, cublas_tf32
 from noeira.nn.core.cublaslt_gemm import cublaslt_gemm, EPI_BIAS
 from .opcodes import *
 from .backend import Dev
+from .sg_gemm import sg_mm
 from std.memory import stack_allocation
 
 
@@ -693,21 +696,21 @@ def _tiled_mm_kernel[TA: Bool, TB: Bool, ACC: Bool](
 
 
 comptime MM_TILED_MIN = MM_T * MM_T * 8
-"""Below 8 output tiles the tiled kernel leaves most of the GPU idle (one
-threadgroup per tile); the naive one-thread-per-output kernel runs instead."""
+"""(`_tiled_mm_kernel`'s threshold, kept for it.)"""
+comptime SG_MIN_EDGE = 64
+"""The simdgroup kernels from a 64 x 64 output up (one full tile; measured
+faster than the naive kernel down to [64, 64] @ [64, 64],
+bench_tape_gemm.mojo); the naive kernel below and for k = 1."""
 
 
 def _own_mm[TA: Bool, TB: Bool, ACC: Bool](
     ctx: Dev, o: DeviceBuffer[DT], a: DeviceBuffer[DT],
     b: DeviceBuffer[DT], m: Int, n: Int, k: Int,
 ) raises:
-    """The tape's own GEMM (no MAX): tiled for large outputs, naive else."""
-    if m * n >= MM_TILED_MIN and k > 1:
-        ctx.enqueue_function[_tiled_mm_kernel[TA, TB, ACC]](
-            o, a, b, Int64(m), Int64(n), Int64(k),
-            grid_dim=((n + MM_T - 1) // MM_T, (m + MM_T - 1) // MM_T),
-            block_dim=(MM_SUB, MM_SUB),
-        )
+    """The tape's own GEMM (no MAX): Apple's simdgroup matrix kernels
+    (`sg_gemm.mojo`) for large outputs, the naive kernel else."""
+    if m >= SG_MIN_EDGE and n >= SG_MIN_EDGE and k > 1:
+        sg_mm[TA, TB, ACC](ctx, o, a, b, m, n, k)
     else:
         _naive_mm[TA, TB, ACC](ctx, o, a, b, m, n, k)
 
