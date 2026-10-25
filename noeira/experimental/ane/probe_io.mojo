@@ -46,6 +46,12 @@ def run_case(a: ANE, c: Case, want: def(List[List[Float32]], Int, Int) thin -> F
                 x[i] = val(i, k)
             p.write(a, k, Pointer(to=x[0]))
             xs.append(x^)
+        for k in range(len(p.ins)):
+            if a.base_addr(p.ins[k]) % 16384 != 0:
+                raise Error("input surface not page-aligned")
+        for k in range(len(p.outs)):
+            if a.base_addr(p.outs[k]) % 16384 != 0:
+                raise Error("output surface not page-aligned")
         p.run(a)
         var bad = 0
         var first = -1

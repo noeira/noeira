@@ -26,6 +26,7 @@ comptime CFn0 = def() thin abi("C") -> Int
 comptime CFn3 = def(Int, Int, Int) thin abi("C") -> Int
 
 comptime QOS = 21  # the QoS value maderix/ANE passes everywhere
+comptime PAGE = 16384  # the page size on Apple silicon
 
 
 def mil_header() -> String:
@@ -95,7 +96,11 @@ struct ANE(Movable):
         _ = items
         return r
 
-    def surface(self, nbytes: Int) raises -> Int:
+    def surface(self, nbytes_: Int) raises -> Int:
+        """An IOSurface of at least `nbytes_`, rounded up to whole 16 KB pages
+        (so Metal can wrap its memory without a copy:
+        `newBufferWithBytesNoCopy` needs page-aligned memory and length)."""
+        var nbytes = (nbytes_ + PAGE - 1) // PAGE * PAGE
         var d = self.o.send0(self.o.cls("NSMutableDictionary"), self.o.sel("dictionary"))
         var put = self.o.sel("setObject:forKey:")
         _ = self.o.send2(d, put, self.num(nbytes), self.k_width)
@@ -114,6 +119,9 @@ struct ANE(Movable):
 
     def unlock(self, s: Int, read_only: Bool):
         _ = self._surf_unlock(s, 1 if read_only else 0, 0)
+
+    def base_addr(self, s: Int) -> Int:
+        return self._surf_base(s)
 
     def base(self, s: Int) -> Pointer[Float16, MutAnyOrigin]:
         return Pointer[Float16, MutAnyOrigin](unsafe_from_address=self._surf_base(s))
