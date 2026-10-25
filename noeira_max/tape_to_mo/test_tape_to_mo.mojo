@@ -893,6 +893,21 @@ def main() raises:
     if len(argv()) > 2 and String(argv()[2]) == "--nvidia":
         nvidia(dir)
         return
+    if len(argv()) > 4 and String(argv()[2]) == "--profile":
+        # one captured arm in steady state, for nsys: `--profile tape|max 1|1024`
+        # (2 warm-up steps, then 400 replays, the loss read every 20)
+        var big = String(argv()[4]) == "1024"
+        var nt = Net(1024, 128, 512, 16, 0) if big else Net(1, 17, 256, 6, 0)
+        var pctx = DeviceContext()
+        var us: Float64
+        if String(argv()[3]) == "tape":
+            us = tape_gpu(pctx, nt, 0, 400, True, read_every=20).step_us
+        else:
+            var prt = Runtime(accelerator=True)
+            us = compiled_gpu(prt, nt, 0, 400, String(dir, "/prof_", nt.b, ".mlir"), capture=True,
+                              read_every=20).step_us
+        print("PROFILE", String(argv()[3]), "B", nt.b, ":", us, "us per step")
+        return
     if len(argv()) > 2 and String(argv()[2]) == "--packed":
         packed_probe(dir)
         return
