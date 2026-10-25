@@ -195,7 +195,7 @@ def eager_gpu(ctx: DeviceContext, net: Net, timed: Int, stage: Int = 2) raises -
 
 
 def tape_gpu(ctx: DeviceContext, net: Net, steps: Int, timed: Int, capture: Bool,
-             read: Bool = True) raises -> Run:
+             read_loss: Bool = True) raises -> Run:
     """The eager tape on the GPU as `eager_gpu` runs it, gated like
     `compiled_gpu`. `capture`: step 0 runs eagerly (allocations, cuBLASLt
     plans), step 1 is captured into a CUDA graph and every later step
@@ -244,7 +244,7 @@ def tape_gpu(ctx: DeviceContext, net: Net, steps: Int, timed: Int, capture: Bool
         else:
             loss = one(opt)
         var l: Float64 = 0
-        if read:
+        if read_loss:
             l = Float64(loss.item())
         else:   # timing only: a device sync, no loss read
             ctx.synchronize()
@@ -262,7 +262,7 @@ def tape_gpu(ctx: DeviceContext, net: Net, steps: Int, timed: Int, capture: Bool
 
 def compiled_gpu(rt: Runtime, net: Net, steps: Int, timed: Int, path: String, stage: Int = 2,
                  chain_per_buffer: Bool = False, packed: Bool = False, capture: Bool = False,
-                 read: Bool = True) raises -> Run:
+                 read_loss: Bool = True) raises -> Run:
     """The compiled step on the accelerator: every argument copied to the
     device and lent by address; batch 0 at every step. `stage` as in
     `eager_gpu` (1 outputs the gradients instead of storing an update).
@@ -357,8 +357,8 @@ def compiled_gpu(rt: Runtime, net: Net, steps: Int, timed: Int, path: String, st
                 # lagged a step): replay once so step 1 happens
                 outs = model.capture(1, args)
             model.replay(1, args)
-            # timing only (`read=False`): the replay is synchronous, no loss read
-            l = Float64(outs[0].to_host().item[DType.float32]()) if read else 0.0
+            # timing only (`read_loss=False`): the replay is synchronous, no loss read
+            l = Float64(outs[0].to_host().item[DType.float32]()) if read_loss else 0.0
         else:
             l = Float64(model.execute(inputs).tensor("loss").to_host().item[DType.float32]())
         if s < steps:
@@ -684,9 +684,9 @@ def nvidia(dir: String) raises:
                 var ec = tape_gpu(ctx, nt, 0, 200, True)
                 var ms = compiled_gpu(grt, nt, 0, 200, String(dir, "/nv_", i, "_stores.mlir"))
                 var mc = compiled_gpu(grt, nt, 0, 200, String(dir, "/nv_", i, "_stores.mlir"), capture=True)
-                var en = tape_gpu(ctx, nt, 0, 200, True, read=False)
+                var en = tape_gpu(ctx, nt, 0, 200, True, read_loss=False)
                 var mn = compiled_gpu(grt, nt, 0, 200, String(dir, "/nv_", i, "_stores.mlir"), capture=True,
-                                      read=False)
+                                      read_loss=False)
                 print("  round ", rd, ": captured tape ", Int(ec.step_us), " | MAX executed ", Int(ms.step_us),
                       " | MAX captured ", Int(mc.step_us), " || no loss read: captured tape ", Int(en.step_us),
                       " | MAX captured ", Int(mn.step_us), "  [load ms: ", Int(mc.compile_ms), "]", sep="")
