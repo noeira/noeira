@@ -131,7 +131,7 @@ def policy_name(p: Int) -> String:
 
 
 def load_pipeline(o: ObjC, device: Int, lib_bytes: String, fname: String) raises -> Int:
-    """metallib bytes -> MTLLibrary -> MTLFunction -> MTLComputePipelineState."""
+    """`metallib` bytes -> MTLLibrary -> MTLFunction -> MTLComputePipelineState."""
     var pool = o.pool_push()
     var data = o.system.get_function[Int]("dispatch_data_create")(
         Int(lib_bytes.unsafe_ptr()), lib_bytes.byte_length(), 0, 0

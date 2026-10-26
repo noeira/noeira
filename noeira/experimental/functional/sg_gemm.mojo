@@ -73,7 +73,7 @@ comptime SG_WIDE_MIN = 64 * 128 * 32
 
 @always_inline
 def _ld_g(p: P, off: Int, stride: Int) -> M64:
-    var g = (p + off).unsafe_address_space_cast[AddressSpace.GLOBAL]()
+    var g = p.unsafe_offset(off).unsafe_address_space_cast[AddressSpace.GLOBAL]()
     return external_call["air.simdgroup_matrix_8x8_load.v64f32.p1f32", M64](
         g, I2(8, 8), I2(1, Int64(stride)), I2(0, 0)
     )
@@ -82,7 +82,7 @@ def _ld_g(p: P, off: Int, stride: Int) -> M64:
 @always_inline
 def _ld_gt(p: P, off: Int, stride: Int) -> M64:
     """The transposed load: element (r, c) from p[off + c * stride + r]."""
-    var g = (p + off).unsafe_address_space_cast[AddressSpace.GLOBAL]()
+    var g = p.unsafe_offset(off).unsafe_address_space_cast[AddressSpace.GLOBAL]()
     return external_call["air.simdgroup_matrix_8x8_load.v64f32.p1f32", M64](
         g, I2(8, 8), I2(Int64(stride), 1), I2(0, 0)
     )
@@ -90,7 +90,7 @@ def _ld_gt(p: P, off: Int, stride: Int) -> M64:
 
 @always_inline
 def _st_g(m: M64, p: P, off: Int, stride: Int):
-    var g = (p + off).unsafe_address_space_cast[AddressSpace.GLOBAL]()
+    var g = p.unsafe_offset(off).unsafe_address_space_cast[AddressSpace.GLOBAL]()
     external_call["air.simdgroup_matrix_8x8_store.v64f32.p1f32", NoneType](
         m, g, I2(8, 8), I2(1, Int64(stride)), I2(0, 0)
     )
@@ -103,7 +103,7 @@ def _ld_s[o: Origin](
     stride: Int,
 ) -> M64:
     return external_call["air.simdgroup_matrix_8x8_load.v64f32.p3f32", M64](
-        p + off, I2(8, 8), I2(1, Int64(stride)), I2(0, 0)
+        p.unsafe_offset(off), I2(8, 8), I2(1, Int64(stride)), I2(0, 0)
     )
 
 
@@ -115,7 +115,7 @@ def _st_s[o: Origin](
     stride: Int,
 ):
     external_call["air.simdgroup_matrix_8x8_store.v64f32.p3f32", NoneType](
-        m, p + off, I2(8, 8), I2(1, Int64(stride)), I2(0, 0)
+        m, p.unsafe_offset(off), I2(8, 8), I2(1, Int64(stride)), I2(0, 0)
     )
 
 

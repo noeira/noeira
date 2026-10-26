@@ -22,7 +22,7 @@ comptime STEP_LAUNCHES = 14
 
 
 def fc_fwd(out_: P, x: P, w: P, b: P, rows_: Int64, k_: Int64, n_: Int64):
-    """out[r, j] = sum_k x[r, k] w[k, j] + b[j]."""
+    """`out[r, j] = sum_k x[r, k] w[k, j] + b[j]`."""
     var rows = Int(rows_)
     var k = Int(k_)
     var n = Int(n_)
@@ -45,7 +45,7 @@ def relu_fwd(a: P, z: P, n_: Int64):
 
 
 def mse_grad(dz: P, z: P, y: P, n_: Int64, scale: Float32):
-    """dz = scale * (z - y), scale = 2 / n."""
+    """`dz = scale * (z - y)`, `scale = 2 / n`."""
     var n = Int(n_)
     var t = global_idx.x
     if t < n:
@@ -53,7 +53,7 @@ def mse_grad(dz: P, z: P, y: P, n_: Int64, scale: Float32):
 
 
 def mse_loss(losses: P, z: P, y: P, n_: Int64, step_: Int64):
-    """losses[step] = mean((z - y)^2); ONE threadgroup of TPB threads, strided
+    """`losses[step] = mean((z - y)^2)`; ONE threadgroup of TPB threads, strided
     partial sums then a fixed-shape tree: deterministic."""
     var n = Int(n_)
     var step = Int(step_)
@@ -82,7 +82,7 @@ def mse_loss(losses: P, z: P, y: P, n_: Int64, step_: Int64):
 
 
 def grad_w(dw: P, a: P, dz: P, rows_: Int64, k_: Int64, n_: Int64):
-    """dw[kk, j] = sum_r a[r, kk] dz[r, j]   (dW = A^T dZ)."""
+    """`dw[kk, j] = sum_r a[r, kk] dz[r, j]`   (dW = A^T dZ)."""
     var rows = Int(rows_)
     var k = Int(k_)
     var n = Int(n_)
@@ -97,7 +97,7 @@ def grad_w(dw: P, a: P, dz: P, rows_: Int64, k_: Int64, n_: Int64):
 
 
 def grad_b(db: P, dz: P, rows_: Int64, n_: Int64):
-    """db[j] = sum_r dz[r, j]."""
+    """`db[j] = sum_r dz[r, j]`."""
     var rows = Int(rows_)
     var n = Int(n_)
     var j = global_idx.x
@@ -109,7 +109,7 @@ def grad_b(db: P, dz: P, rows_: Int64, n_: Int64):
 
 
 def grad_in_relu(dz1: P, dz2: P, w2: P, z1: P, rows_: Int64, h_: Int64, o_: Int64):
-    """dz1[r, j] = (sum_q dz2[r, q] w2[j, q]) * (z1[r, j] > 0)."""
+    """`dz1[r, j] = (sum_q dz2[r, q] w2[j, q]) * (z1[r, j] > 0)`."""
     var rows = Int(rows_)
     var h = Int(h_)
     var o = Int(o_)

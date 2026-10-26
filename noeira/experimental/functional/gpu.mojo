@@ -696,7 +696,7 @@ def _tiled_mm_kernel[TA: Bool, TB: Bool, ACC: Bool](
 
 
 comptime MM_TILED_MIN = MM_T * MM_T * 8
-"""(`_tiled_mm_kernel`'s threshold, kept for it.)"""
+"""`_tiled_mm_kernel`'s threshold, kept for it."""
 comptime SG_MIN_EDGE = 64
 """The simdgroup kernels from a 64 x 64 output up (one full tile; measured
 faster than the naive kernel down to [64, 64] @ [64, 64],

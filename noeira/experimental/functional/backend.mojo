@@ -164,7 +164,7 @@ struct Dev(ImplicitlyCopyable):
             self._r()[].sync()
 
     def flush(self):
-        """metal_rt: commit what is encoded without waiting (call before
+        """`metal_rt`: commit what is encoded without waiting (call before
         host work that does not need the GPU's result). No-op on MAX."""
         if self.rt != 0:
             self._r()[].flush()

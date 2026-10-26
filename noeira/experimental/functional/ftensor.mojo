@@ -107,7 +107,7 @@ struct Tape(ImplicitlyCopyable, ParamWalkable):
         return self.data[].on_rt()
 
     def flush(self) raises:
-        """metal_rt: commit the pending launches now, without waiting."""
+        """`metal_rt`: commit the pending launches now, without waiting."""
         if self.data[].ctx:
             self.data[].dctx().flush()
 
@@ -121,7 +121,7 @@ struct Tape(ImplicitlyCopyable, ParamWalkable):
         self.data[].dctx().enqueue_copy(dst, src.unsafe_ptr())
 
     def launcher_stats(self) -> Tuple[Int, Int, Int]:
-        """metal_rt: (launches, command buffers, idle commits); zeros on MAX."""
+        """`metal_rt`: (launches, command buffers, idle commits); zeros on MAX."""
         if not self.data[].rt:
             return (0, 0, 0)
         ref r = self.data[].rt.value()[]

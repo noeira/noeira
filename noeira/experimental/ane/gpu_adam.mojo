@@ -49,7 +49,7 @@ comptime PU32 = Pointer[UInt32, MutAnyOrigin]
 
 
 def check_kernel(flag: PU32, g: P16, rows_: Int64, cols_: Int64, gstride_: Int64, bx_: Int64):
-    """flag[0] = 1 if any element of the [rows, cols] fp16 gradient (row
+    """`flag[0] = 1` if any element of the [rows, cols] fp16 gradient (row
     stride `gstride`) is Inf or NaN: its exponent bits are all ones."""
     var c = Int32(block_idx.x) * Int32(bx_) + Int32(thread_idx.x)
     var r = Int32(block_idx.y)
@@ -66,7 +66,7 @@ def adam_kernel(
     gscale: Float32, lr: Float32, beta1: Float32, beta2: Float32, eps: Float32,
     bc1: Float32, bc2: Float32, wd: Float32, decay: Int64,
 ):
-    """nn Adam's CPU per-parameter update on one element, then fp16(w) into
+    """`nn` Adam's CPU per-parameter update on one element, then fp16(w) into
     the ANE input surface at row stride `wstride`."""
     if flag[unsafe_offset=0] != 0:
         return
@@ -91,7 +91,7 @@ def adam_kernel(
 
 
 def cast_kernel(out16: P16, w: P32, rows_: Int64, cols_: Int64, wstride_: Int64, bx_: Int64):
-    """fp16(w) into the surface at row stride `wstride`."""
+    """`fp16(w)` into the surface at row stride `wstride`."""
     var c = Int32(block_idx.x) * Int32(bx_) + Int32(thread_idx.x)
     var r = Int32(block_idx.y)
     var cols = Int32(cols_)
