@@ -428,6 +428,34 @@ struct MetalRT(Launcher):
         )
         if obj == 0:
             raise Error("newBufferWithLength failed")
+        return self._adopt(obj, nbytes)
+
+    def wrap_external(mut self, host_addr: Int, nbytes: Int) raises -> Buffer:
+        """A Buffer over memory we do NOT own (an IOSurface's, say), with no
+        copy: `newBufferWithBytesNoCopy:length:options:deallocator:` with a
+        nil deallocator, shared storage. `host_addr` and `nbytes` must be
+        page-aligned (16 KB on Apple silicon). It gets a GPU address and joins
+        the residency set like any other buffer; `free` / the destructor
+        release the MTLBuffer object only — the memory stays its owner's, who
+        must keep it alive while the buffer is in use."""
+        if host_addr % 16384 != 0 or nbytes % 16384 != 0 or nbytes == 0:
+            raise Error("wrap_external: pointer and length must be 16 KB page multiples")
+        var obj = self.o.send4(
+            self.device,
+            self.o.sel("newBufferWithBytesNoCopy:length:options:deallocator:"),
+            host_addr,
+            nbytes,
+            _SHARED_TRACKED if self.order == ORDER_TRACKED else _SHARED_UNTRACKED,
+            0,
+        )
+        if obj == 0:
+            raise Error("newBufferWithBytesNoCopy returned nil")
+        var b = self._adopt(obj, nbytes)
+        if b.host != host_addr:
+            raise Error("wrap_external: contents != the wrapped pointer (Metal copied?)")
+        return b
+
+    def _adopt(mut self, obj: Int, nbytes: Int) raises -> Buffer:
         var b = Buffer(
             obj,
             self.o.send0(obj, self.o.sel("contents")),
