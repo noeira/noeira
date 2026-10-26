@@ -1,8 +1,10 @@
 name: ci
 
 # Cost/duration model (public repo → standard runners are free):
-#   * per-push/PR: the `smoke` job only — a curated ~11-file CPU manifest
-#     (tests/manifests/smoke.txt), hard-capped by timeout-minutes.
+#   * per-push/PR: `model-dims` and `examples-compile`.
+#   * per-PR only: `smoke` — a curated CPU manifest (tests/manifests/smoke.txt)
+#     that takes ~50 min, too long for every push to dev. Run it on a branch
+#     with `workflow_dispatch` (tier: smoke).
 #   * weekly cron: the full non-GPU discovery sweep (hours) — catches rot in
 #     the long tail without taxing every push.
 #   * GPU tests never run here (no free GPU runners) — `pixi run -e apple|
@@ -53,7 +55,7 @@ env:
 
 jobs:
   smoke:
-    if: github.event_name != 'schedule' && (github.event_name != 'workflow_dispatch' || inputs.tier == 'smoke')
+    if: github.event_name == 'pull_request' || (github.event_name == 'workflow_dispatch' && inputs.tier == 'smoke')
     runs-on: ubuntu-latest
     # ⚠ The manifest budgets ~15 min; its first full run on a runner
     # (2026-10-26, 101 files) took 58.5 — inside 60 only by luck.
@@ -64,7 +66,7 @@ jobs:
         with:
           environments: cpu
           cache: true
-          cache-write: ${{ github.event_name == 'push' && github.ref == 'refs/heads/dev' }}
+          cache-write: false
       # The http and serial shims are dlopen'd by a dozen smoke tests and are
       # not in git (`scripts/build_http.sh`, `scripts/build_serial.sh`).
       - name: build the native shims
@@ -90,7 +92,9 @@ jobs:
         with:
           environments: cpu
           cache: true
-          cache-write: false
+          # The one job that writes the pixi cache: it runs on every push to
+          # dev, and a cache a PR writes is visible to that PR only.
+          cache-write: ${{ github.event_name == 'push' && github.ref == 'refs/heads/dev' }}
       # assets-pull downloads through the http shim (not in git).
       - name: pull the LIBERO asset pack
         run: pixi run -e cpu build-http && pixi run -e cpu assets-pull libero
