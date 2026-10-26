@@ -23,6 +23,8 @@ The training step is split between the two:
 | `probe_ops.mojo` | Which ops compile, and the accuracy of exp/log/sqrt/sigmoid/tanh/reciprocal |
 | `probe_mil.mojo` | Bisects a refused program (`ANECCompile() FAILED` names nothing) |
 | `probe_zero_copy.mojo` | GPU (metal_rt) and ANE sharing the surfaces with no copy |
+| `gpu_adam.mojo` | `AneAdamGpu`: the step with fp32 masters and Adam on the GPU, zero-copy to and from the surfaces |
+| `tests/experimental/ane/test_ane_gpu_adam.mojo` | Its gates |
 | `bench_ane_step.mojo` | Step 3: CPU tape vs ANE vs the metal_rt tape |
 | `tests/experimental/ane/test_ane_step.mojo` | The gates |
 
@@ -157,10 +159,13 @@ varies 640–1970 µs at B=4096 between runs):
 | B256 I64 O64 | 575–605 (181 / 245 / 160) | 430–451 | 286–300 (24 / 15 / 246 / 9) |
 | B4096 I512 O512 | 1255–1628 (~360 / 640–930 / ~270) | 1451–1924 | 4845–5833 (2290 / 840 / 990–1970 / 710) |
 
-- **Large tensors: zero copy wins.** At B=4096 it is 3–3.5× faster than the
-  CPU path. Even without the host's generator loop, the CPU path's fp16
-  writes and reads alone (≈ 1.55 ms) cost more than the GPU's whole
-  write-and-read, sync included.
+- **Large tensors: zero copy wins, about 2×.** (Corrected: an earlier
+  version said 3–3.5×, but that counted the CPU path's host value-generator
+  loop, ~2.3 ms, which is test scaffolding, not I/O.) At B=4096:
+  - the I/O alone is about 2.5× faster: the CPU's fp16 write + read
+    (≈ 1.55 ms) against the GPU's write + read with both syncs (≈ 0.63 ms);
+  - a whole iteration without the generator is about 2× faster: ≈ 2.5 ms on
+    the CPU path against 1.25–1.6 ms zero-copy.
 - **Small tensors: zero copy loses.** One GPU round trip (commit, run, sync)
   costs ~160–180 µs. The CPU writes a few hundred fp16 values in 5 µs.
 - **The training step needs one sync.** The planned step (ANE eval -> one
@@ -181,3 +186,84 @@ varies 640–1970 µs at B=4096 between runs):
   GPU path and 990–1970 µs after the CPU path. These are single runs, not a
   controlled comparison.
 - **No locks needed** (see above).
+
+## The training step with Adam on the GPU (`gpu_adam.mojo`)
+
+`AneAdamGpu` keeps the fp32 master weights and Adam's m and v in ordinary
+metal_rt buffers. A step:
+
+1. the CPU writes the seed if the scale changed;
+2. the ANE evaluates;
+3. ONE command buffer runs on the GPU:
+   - per gradient, a check kernel reads the fp16 gradient straight from its
+     output surface (wrapped, padded rows) and raises a flag on Inf/NaN;
+   - per parameter, an Adam kernel returns at once if the flag is up.
+     Otherwise it applies nn Adam's CPU expression: the gradient
+     × 1/(scale · grad_div), then `p - lr * (m / bc1) / (sqrt(v / bc2) + eps)`
+     with bc = 1 − βᵗ from fp32 running products. It updates w, m and v and
+     writes fp16(w) straight into the input surface;
+4. one sync;
+5. the CPU reads the flag and the loss.
+
+A non-finite step changes nothing: not the masters, not m or v, not the step
+count. The data inputs are still written by the CPU (`set_data`).
+
+**Gates** (`tests/experimental/ane/test_ane_gpu_adam.mojo`, all pass). The
+network is the sine fit 1-64tanh-64tanh-1 at B=256; its w3 [64, 1] has
+padded rows.
+
+| Gate | Result |
+|---|---|
+| 1. five steps vs `AneGrad.run` + nn's Adam on the host | Losses identical every step. fp32 masters within 0 / 2 / 5 / 6.5 / 6.75 ulps (of max(\|p\|, lr)) after steps 1–5; bound 8. fp16 weights in the surfaces bit-equal to fp16(downloaded masters): 0 mismatches. |
+| 2. skip (seed 65504: the gradients overflow) | Both arms return NaN. Masters, m, v bit-identical (13059 / 13059). Step count 5 → 5. The next good step matches the host arm (6.75 ulps, identical loss). |
+| 3. sine-fit training, 2000 steps, dynamic scaler | Ensembles of 12 per arm (inits 0..11 fp32 ulps apart). Median of the last-100-step medians: host 5.2e-5, GPU 6.9e-5, ratio 1.32; bound: within a factor 2. The CPU tape's mean is 1.7e-4. |
+| 4a. mutant: weights written at the dense row stride | 63 surface elements wrong per step, masters off by ~2.6e7 ulps: FAILS gate 1 (caught) |
+| 4b. mutant: no bias correction | masters off by ~2.8e7 ulps: FAILS gate 1 (caught) |
+
+Why the masters differ at all:
+- the two arms see the same fp16 weights, so the same gradients, bit for
+  bit; only Adam's fp32 arithmetic differs. The GPU's division and sqrt are
+  not correctly rounded, the GPU flushes fp32 denormals (measured: 1e-20²
+  gives 0 on the GPU), and fma contraction may differ;
+- each update (size ≲ lr) differs by a few ulps, and m and v carry the
+  difference into later steps.
+
+Why ensembles in gate 3:
+- the final loss is chaotic in the init's last bit. From inits 1..11 ulps
+  apart, host Adam alone ends anywhere from 2.1e-5 to 2.5e-4;
+- with 5 runs per arm, the two medians differed 3.4× by chance; with 12,
+  1.3×.
+
+**Bench** (`bench_ane_step.mojo`, median µs/step [min-max], loss read every
+step):
+
+| Workload | CPU tape | ANE + host Adam | **ANE + GPU Adam** | metal_rt tape | host-Adam arm: write / eval / read / Adam | GPU-Adam arm: eval / GPU cb incl. sync |
+|---|---|---|---|---|---|---|
+| PPO B=64 8-64-64-4 tanh | 71 | 400 | 688 | 624 | 15 / 509 / 27 / 10 | 380 / 308 |
+| SAC B=256 23-256-256-1 relu | 740 | 794 | 1274 | 1010 | 56 / 547 / 130 / 63 | 797 / 468 |
+| BIG B=4096 64-512-512-64 relu | 19417 | 5554 | 5617 | 7598 | 244 / 4871 / 543 / 275 | 5326 / 993 |
+| WIDE B=2048 512-2048-2048-512 relu | — | 34884 | **19669** | 38744 | 3310 / 18293 / 10488 / 9465 | 17797 / 2410 |
+
+- **PPO and SAC: it loses** (1.7× and 1.6× slower than host Adam). The GPU
+  command buffer costs 300–470 µs: the round trip, plus about 12 serial
+  dispatches. The host did the whole I/O and Adam in under 0.25 ms.
+- **BIG: a tie** (5617 vs 5554). The GPU part costs 0.5–1.3 ms, depending
+  on the GPU's power state. Back to back it is 473 µs; after 5 ms idle
+  (the ANE's evaluation) it is ~650 µs. The host's write + read + Adam
+  cost 1.06 ms.
+  - Per launch on [512, 512], the Adam kernel takes ~106 µs and the check
+    ~16 µs. The 12 dispatches total ~250 µs plus the sync.
+- **WIDE: 1.77× faster.** The step drops from 34.9 to 19.7 ms: the GPU part
+  takes 2.4 ms in place of the host's 23 ms of fp16 conversion and scalar
+  Adam. It is now 2× faster than the metal_rt tape.
+- **Not done.** Fusing the per-parameter checks (or all the kernels) into
+  one dispatch would cut the serial dispatches; Metal's 31-buffer argument
+  table allows it at these sizes.
+
+**Surprises:**
+
+- **A NaN in the DATA does not produce a non-finite gradient.** The ANE's
+  tanh returns a finite value for a NaN input, so the skip gate forces an
+  overflow with the largest fp16 seed (65504) instead.
+- **The GPU flushes fp32 denormals.** fp16 denormals survive both casts on
+  the GPU.

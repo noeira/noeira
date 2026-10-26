@@ -5,6 +5,12 @@ the host, and the tape on noeira's Metal launcher (`Tape.metal_rt`) with
 evaluation is synchronous anyway). One fixed batch, already in place
 (device buffers on metal_rt, the input surfaces on the ANE).
 
+A fourth arm, "ANE + GPU Adam" (`AneAdamGpu`), keeps fp32 masters on the GPU:
+per step the ANE evaluates, then ONE metal_rt command buffer reads the fp16
+gradients from the output surfaces, runs Adam and writes fp16 weights into
+the input surfaces; one sync. Its breakdown: ANE eval / GPU command buffer
+including the sync.
+
 Workloads: `bench_functional_metal_rt.mojo`'s three training networks, and
 a wider one that suits the ANE's matmul better. Each cell is the median
 us/step over ROUNDS rounds of `iters` steps [min-max]. The ANE column's
@@ -28,6 +34,7 @@ from noeira.experimental.metal_rt.runtime import COMMIT_EVERY_N
 import noeira.experimental.functional.F as F
 from noeira.experimental.ane.runtime import ANE
 from noeira.experimental.ane.step import AneGrad
+from noeira.experimental.ane.gpu_adam import AneAdamGpu
 
 
 comptime ROUNDS = 5
@@ -125,6 +132,16 @@ def bench(a: ANE, w: W, dump: String = "") raises:
     t_ane.reset()
     g.set_data(a, 0, Pointer(to=x[0]))
     g.set_data(a, 1, Pointer(to=y[0]))
+    # ANE + GPU Adam (its own tape and program)
+    var t_ag = Tape()
+    var p_ag = params(w, t_ag, init)
+    var xg = t_ag.input(w.b, w.din, x.copy())
+    var yg = t_ag.input(w.b, w.dout, y.copy())
+    var gg = AneGrad(a, t_ag, F.mse(forward(w, p_ag, xg), yg), [xg, yg])
+    t_ag.reset()
+    var ag = AneAdamGpu(a, gg^, t_ag, lr=1e-5)
+    ag.set_data(a, 0, Pointer(to=x[0]))
+    ag.set_data(a, 1, Pointer(to=y[0]))
     # metal_rt tape
     var t_rt = Tape.metal_rt(policy=COMMIT_EVERY_N, batch_n=16)
     var p_rt = params(w, t_rt, init)
@@ -139,7 +156,8 @@ def bench(a: ANE, w: W, dump: String = "") raises:
     var nonfinite = 0
 
     def step(arm: Int) raises {mut t_cpu, p_cpu, mut o_cpu, mut t_ane, mut o_ane, mut g, a,
-                                mut t_rt, p_rt, mut o_rt, bx, by, x, y, w, mut t_adam, scale, mut nonfinite}:
+                                mut t_rt, p_rt, mut o_rt, bx, by, x, y, w, mut t_adam, scale, mut nonfinite,
+                                mut ag}:
         if arm == 0:
             t_cpu.reset()
             t_cpu.zero_grad()
@@ -157,6 +175,10 @@ def bench(a: ANE, w: W, dump: String = "") raises:
             var t = t_ane
             o_ane.step["cpu"](t, None)
             t_adam += Int(perf_counter_ns() - t0)
+        elif arm == 3:
+            var l = ag.step(a, scale)
+            if l != l:
+                nonfinite += 1
         else:
             t_rt.reset()
             t_rt.zero_grad()
@@ -166,7 +188,7 @@ def bench(a: ANE, w: W, dump: String = "") raises:
             o_rt.step(t_rt)
             _ = loss.item()
 
-    for arm in range(3):  # warm-up
+    for arm in range(4):  # warm-up
         if arm == 0 and not w.cpu:
             continue
         for _ in range(5):
@@ -175,11 +197,14 @@ def bench(a: ANE, w: W, dump: String = "") raises:
     g.t_eval = 0
     g.t_read = 0
     t_adam = 0
+    ag.t_eval = 0
+    ag.t_gpu = 0
+    ag.steps = 0
     var res = List[List[Float64]]()
-    for _ in range(3):
+    for _ in range(4):
         res.append(List[Float64]())
     for _ in range(ROUNDS):
-        for arm in range(3):
+        for arm in range(4):
             if arm == 0 and not w.cpu:
                 continue
             var t0 = perf_counter_ns()
@@ -189,23 +214,27 @@ def bench(a: ANE, w: W, dump: String = "") raises:
     var n = Float64(ROUNDS * w.iters) * 1e3
     var flop = 6.0 * Float64(w.b) * Float64(w.din * w.h + w.h * w.h + w.h * w.dout)
     var ane_med = _median(res[1].copy())
+    var ns = Float64(ag.steps) * 1e3
     print(
-        "|", w.name, "|", _cell(res[0]) if w.cpu else String("—"), "|", _cell(res[1]), "|", _cell(res[2]),
+        "|", w.name, "|", _cell(res[0]) if w.cpu else String("—"), "|", _cell(res[1]), "|", _cell(res[3]),
+        "|", _cell(res[2]),
         "|", _r(Float64(g.t_write) / n), "/", _r(Float64(g.t_eval) / n), "/", _r(Float64(g.t_read) / n),
         "/", _r(Float64(t_adam) / n),
+        "|", _r(Float64(ag.t_eval) / ns), "/", _r(Float64(ag.t_gpu) / ns),
         "|", flop / (Float64(g.t_eval) / n * 1e-6) / 1e12, "|",
     )
     _ = ane_med
     if nonfinite > 0:
         print("    (", w.name, ":", nonfinite, "ANE steps had a non-finite gradient)")
     g.free(a)
+    ag.free(a)
 
 
 def main() raises:
     var a = ANE()
     print("us/step (forward + backward + Adam, loss read every step), median of", ROUNDS, "rounds [min-max]")
-    print("| workload | CPU tape | ANE + host Adam | metal_rt tape | ANE: write / eval / read / Adam | ANE eval TFLOP/s |")
-    print("|---|---|---|---|---|---|")
+    print("| workload | CPU tape | ANE + host Adam | ANE + GPU Adam | metal_rt tape | host-Adam arm: write / eval / read / Adam | GPU-Adam arm: eval / GPU cb incl. sync | ANE eval TFLOP/s |")
+    print("|---|---|---|---|---|---|---|---|")
     var args = argv()
     if len(args) > 2 and args[1] == "--dump":  # write the BIG program's MIL, nothing else
         bench(a, W("BIG B=4096 64-512-512-64 relu", 4096, 64, 512, 64, True, 20), String(args[2]))
