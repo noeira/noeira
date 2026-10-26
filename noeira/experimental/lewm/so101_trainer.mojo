@@ -28,7 +28,11 @@ from noeira.nn.constants import DT
 from noeira.nn.core.tensor import Tensor, TensorImpl
 from noeira.nn.core.initializer import Kaiming
 from noeira.nn.combinators.graph_module2 import NamedNodeGraph
-from .ref_model import LeWMLossGraphProprio, LeWMLossGraphIDM, LeWMLossGraphProprioIDM
+from .ref_model import (
+    LeWMLossGraphProprio,
+    LeWMLossGraphIDM,
+    LeWMLossGraphProprioIDM,
+)
 from .ref_load import LoadRef
 from noeira.deep_agents.act.refload import RefDump
 from .ref_trainer import (
@@ -55,42 +59,108 @@ MLP scale; H-JEPA does not give theirs)."""
 comptime LeWMProprioTrainer[
     target: StaticString, B: Int, IN_CH: Int, IMG: Int, ACT_IN: Int, PROP: Int
 ] = LeWMSo101Trainer[
-    target, B, IN_CH, IMG, ACT_IN, PROP,
+    target,
+    B,
+    IN_CH,
+    IMG,
+    ACT_IN,
+    PROP,
     LeWMLossGraphProprio[
-        IN_CH, IMG, 14, 192, 3, 12, 192, 2048,
-        REF_T, ACT_IN, PROP, 3, 1,
-        16, 64, 2048, 6,
-        1024, 17,
+        IN_CH,
+        IMG,
+        14,
+        192,
+        3,
+        12,
+        192,
+        2048,
+        REF_T,
+        ACT_IN,
+        PROP,
+        3,
+        1,
+        16,
+        64,
+        2048,
+        6,
+        1024,
+        17,
     ],
 ]
 
 comptime LeWMIDMTrainer[
     target: StaticString, B: Int, IN_CH: Int, IMG: Int, ACT_IN: Int
 ] = LeWMSo101Trainer[
-    target, B, IN_CH, IMG, ACT_IN, 0,
+    target,
+    B,
+    IN_CH,
+    IMG,
+    ACT_IN,
+    0,
     LeWMLossGraphIDM[
-        IN_CH, IMG, 14, 192, 3, 12, 192, 2048,
-        REF_T, ACT_IN, 3, 1,
-        16, 64, 2048, 6,
-        1024, 17, IDM_HIDDEN,
+        IN_CH,
+        IMG,
+        14,
+        192,
+        3,
+        12,
+        192,
+        2048,
+        REF_T,
+        ACT_IN,
+        3,
+        1,
+        16,
+        64,
+        2048,
+        6,
+        1024,
+        17,
+        IDM_HIDDEN,
     ],
 ]
 
 comptime LeWMProprioIDMTrainer[
     target: StaticString, B: Int, IN_CH: Int, IMG: Int, ACT_IN: Int, PROP: Int
 ] = LeWMSo101Trainer[
-    target, B, IN_CH, IMG, ACT_IN, PROP,
+    target,
+    B,
+    IN_CH,
+    IMG,
+    ACT_IN,
+    PROP,
     LeWMLossGraphProprioIDM[
-        IN_CH, IMG, 14, 192, 3, 12, 192, 2048,
-        REF_T, ACT_IN, PROP, 3, 1,
-        16, 64, 2048, 6,
-        1024, 17, IDM_HIDDEN,
+        IN_CH,
+        IMG,
+        14,
+        192,
+        3,
+        12,
+        192,
+        2048,
+        REF_T,
+        ACT_IN,
+        PROP,
+        3,
+        1,
+        16,
+        64,
+        2048,
+        6,
+        1024,
+        17,
+        IDM_HIDDEN,
     ],
 ]
 
 
 struct LeWMSo101Trainer[
-    target: StaticString, B: Int, IN_CH: Int, IMG: Int, ACT_IN: Int, PROP: Int,
+    target: StaticString,
+    B: Int,
+    IN_CH: Int,
+    IMG: Int,
+    ACT_IN: Int,
+    PROP: Int,
     G: NamedNodeGraph,
 ](Movable, WMWindowLoss):
     comptime PIX = REF_T * Self.IN_CH * Self.IMG * Self.IMG
@@ -129,17 +199,30 @@ struct LeWMSo101Trainer[
     ) raises:
         """`idm` is γ, the inverse-dynamics weight (IDM graphs only)."""
         comptime assert Self.target == "cpu" or Self.target == "gpu"
-        comptime assert Self.G.ACT_DT == DT, "LeWMSo101Trainer: fp32-flow graphs only"
+        comptime assert (
+            Self.G.ACT_DT == DT
+        ), "LeWMSo101Trainer: fp32-flow graphs only"
         comptime assert (Self.PROP > 0) == Self.G.has_node["proprio"](), (
-            "LeWMSo101Trainer: PROP > 0 exactly when the graph has a proprio slot"
+            "LeWMSo101Trainer: PROP > 0 exactly when the graph has a proprio"
+            " slot"
         )
         if idm != 0.0 and not Self.IDM:
-            raise Error("LeWMSo101Trainer: idm weight " + String(idm) + " on a graph without IDM")
+            raise Error(
+                "LeWMSo101Trainer: idm weight "
+                + String(idm)
+                + " on a graph without IDM"
+            )
         self.graph = Self.G.make[Self.target, Kaiming](ctx)
-        self.graph.set_node_attr["emb", "checkpoint"](Scalar[DT](1 if checkpoint else 0))
+        self.graph.set_node_attr["emb", "checkpoint"](
+            Scalar[DT](1 if checkpoint else 0)
+        )
         self.dropout_on = dropout
-        self.graph.set_node_attr["pred_raw", "dropout"](Scalar[DT](1 if dropout else 0))
-        self.graph.set_node_attr["sig_s", "multiplier"](Scalar[DT](sigreg_lambda))
+        self.graph.set_node_attr["pred_raw", "dropout"](
+            Scalar[DT](1 if dropout else 0)
+        )
+        self.graph.set_node_attr["sig_s", "multiplier"](
+            Scalar[DT](sigreg_lambda)
+        )
         self.graph.set_node_attr["sig", "resample"](Scalar[DT](1))
         self.graph.set_node_attr["il_s", "multiplier"](Scalar[DT](idm))
         self.opt = _AdamWAll(Scalar[DT](lr), Scalar[DT](wd), True)
@@ -181,10 +264,15 @@ struct LeWMSo101Trainer[
 
     def set_train(mut self):
         self.graph.set_attr["training"](Scalar[DT](1))
-        self.graph.set_node_attr["pred_raw", "dropout"](Scalar[DT](1 if self.dropout_on else 0))
+        self.graph.set_node_attr["pred_raw", "dropout"](
+            Scalar[DT](1 if self.dropout_on else 0)
+        )
 
     def _inputs(
-        mut self, pix: List[Scalar[DT]], act: List[Scalar[DT]], pro: List[Scalar[DT]]
+        mut self,
+        pix: List[Scalar[DT]],
+        act: List[Scalar[DT]],
+        pro: List[Scalar[DT]],
     ) raises:
         for i in range(Self.B * Self.PIX):
             self.pix.data[i] = pix[i]
@@ -198,24 +286,41 @@ struct LeWMSo101Trainer[
             self.act.upload(self.ctx.value())
             comptime if Self.PROP > 0:
                 self.pro.upload(self.ctx.value())
-        self.graph.set_input["pixels", Self.B](rebind[Self.GT](self.pix), self.ctx)
-        self.graph.set_input["actions", Self.B](rebind[Self.GT](self.act), self.ctx)
+        self.graph.set_input["pixels", Self.B](
+            rebind[Self.GT](self.pix), self.ctx
+        )
+        self.graph.set_input["actions", Self.B](
+            rebind[Self.GT](self.act), self.ctx
+        )
         comptime if Self.PROP > 0:
-            self.graph.set_input["proprio", Self.B](rebind[Self.GT](self.pro), self.ctx)
+            self.graph.set_input["proprio", Self.B](
+                rebind[Self.GT](self.pro), self.ctx
+            )
 
     def train_step(
-        mut self, pix: List[Scalar[DT]], act: List[Scalar[DT]], pro: List[Scalar[DT]]
+        mut self,
+        pix: List[Scalar[DT]],
+        act: List[Scalar[DT]],
+        pro: List[Scalar[DT]],
     ) raises -> RefStepStats:
         """`pix` (B, T, IN_CH, IMG, IMG) normalised; act (B, T, ACT_IN) and
         pro (B, T, PROP) z-scored."""
         self.graph.zero_grad[Self.target](self.ctx)
         self._inputs(pix, act, pro)
-        self.graph.forward[Self.B, Self.target](rebind[Self.GT](self.loss), self.ctx)
-        self.graph.vjp[Self.B, Self.target](rebind[Self.GT](self.seed), self.ctx)
+        self.graph.forward[Self.B, Self.target](
+            rebind[Self.GT](self.loss), self.ctx
+        )
+        self.graph.vjp[Self.B, Self.target](
+            rebind[Self.GT](self.seed), self.ctx
+        )
         var mask = _MaskPredQKVBias()
         self.graph.for_each_param[Self.target](mask, self.ctx)
         if mask.n_masked != 6:
-            raise Error("LeWMSo101Trainer: masked " + String(mask.n_masked) + " predictor qkv biases, expected 6")
+            raise Error(
+                "LeWMSo101Trainer: masked "
+                + String(mask.n_masked)
+                + " predictor qkv biases, expected 6"
+            )
         comptime if Self.target == "gpu":
             var c = self.ctx.value()
             self.norm_parts.ensure_gpu(c, 512)
@@ -225,8 +330,12 @@ struct LeWMSo101Trainer[
             if ss.k > 512:
                 raise Error("LeWMSo101Trainer: more than 512 parameter tensors")
             c.enqueue_function[_clip_coef_kernel](
-                self.norm_parts.dev.value(), Int64(ss.k), Scalar[DT](self.max_norm),
-                self.norm_dev.dev.value(), grid_dim=1, block_dim=1,
+                self.norm_parts.dev.value(),
+                Int64(ss.k),
+                Scalar[DT](self.max_norm),
+                self.norm_dev.dev.value(),
+                grid_dim=1,
+                block_dim=1,
             )
             var sc = _GradScaleDev(self.norm_dev.dev.value())
             self.graph.for_each_param[Self.target](sc, self.ctx)
@@ -249,15 +358,23 @@ struct LeWMSo101Trainer[
         return stats^
 
     def loss_of(
-        mut self, pix: List[Scalar[DT]], act: List[Scalar[DT]], pro: List[Scalar[DT]]
+        mut self,
+        pix: List[Scalar[DT]],
+        act: List[Scalar[DT]],
+        pro: List[Scalar[DT]],
     ) raises -> RefStepStats:
         """Forward only, in the current mode (no update)."""
         self._inputs(pix, act, pro)
-        self.graph.forward[Self.B, Self.target](rebind[Self.GT](self.loss), self.ctx)
+        self.graph.forward[Self.B, Self.target](
+            rebind[Self.GT](self.loss), self.ctx
+        )
         return self._stats()
 
     def window_losses(
-        mut self, pix: List[Scalar[DT]], act: List[Scalar[DT]], pro: List[Scalar[DT]]
+        mut self,
+        pix: List[Scalar[DT]],
+        act: List[Scalar[DT]],
+        pro: List[Scalar[DT]],
     ) raises -> Tuple[Float64, Float64]:
         """`WMWindowLoss`: (pred loss, copy-last loss)."""
         var st = self.loss_of(pix, act, pro)
@@ -267,18 +384,27 @@ struct LeWMSo101Trainer[
         return (st.pred_loss, c)
 
     def window_latents(
-        mut self, pix: List[Scalar[DT]], act: List[Scalar[DT]], pro: List[Scalar[DT]]
+        mut self,
+        pix: List[Scalar[DT]],
+        act: List[Scalar[DT]],
+        pro: List[Scalar[DT]],
     ) raises -> WindowLatents:
         """`WMWindowLoss`: `z` = image latent + proprio embedding (v2), the
         image latent itself otherwise."""
         _ = self.loss_of(pix, act, pro)
-        var img = node_host[Self.target](self._out["emb"](), Self.B * REF_T * 192, self.ctx)
+        var img = node_host[Self.target](
+            self._out["emb"](), Self.B * REF_T * 192, self.ctx
+        )
         var z: List[Float32]
         comptime if Self.G.has_node["z"]():
-            z = node_host[Self.target](self._out["z"](), Self.B * REF_T * 192, self.ctx)
+            z = node_host[Self.target](
+                self._out["z"](), Self.B * REF_T * 192, self.ctx
+            )
         else:
             z = img.copy()
-        var pred = node_host[Self.target](self._out["pred"](), Self.B * (REF_T - 1) * 192, self.ctx)
+        var pred = node_host[Self.target](
+            self._out["pred"](), Self.B * (REF_T - 1) * 192, self.ctx
+        )
         return WindowLatents(img^, z^, pred^)
 
     def _stats(mut self) raises -> RefStepStats:
