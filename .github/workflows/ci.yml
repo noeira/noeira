@@ -40,6 +40,17 @@ concurrency:
   group: ci-${{ github.workflow }}-${{ github.ref }}
   cancel-in-progress: true
 
+# The workspace declares linux-64 only as `{ platform = "linux-64", cuda = "12" }`
+# (lock name `linux-64-cuda-12`), so the lock was solved with `__cuda=12` and the
+# cpu env's linux-64 packages carry it (onnxruntime's cuda129 build pulls
+# cuda-cudart / cuda-nvrtc). A GitHub runner has no GPU, so pixi finds no
+# platform it can run and `pixi install -e cpu --locked` stops at
+# `unsupported-platform: missing virtual packages: __cuda >= 12`. Mocking the
+# virtual package installs the locked env as-is; nothing in the CPU tiers
+# opens a CUDA device.
+env:
+  CONDA_OVERRIDE_CUDA: "12.0"
+
 jobs:
   smoke:
     if: github.event_name != 'schedule' && (github.event_name != 'workflow_dispatch' || inputs.tier == 'smoke')
