@@ -6,7 +6,7 @@ runs it, and compares every output element with the CPU. Several inputs and
 outputs, odd sizes, `[1, C, 1, S]` and `[1, 1, R, K]` tensors, and a linear
 layer with a broadcast bias.
 
-    pixi run -e apple mojo run -I . noeira/experimental/ane/probe_io.mojo
+    pixi run -e apple mojo run -I . benchmarks/ane/probe_io.mojo
 """
 
 from noeira.experimental.ane.runtime import ANE, Program, mil_header

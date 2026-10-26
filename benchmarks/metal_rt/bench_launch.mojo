@@ -1,6 +1,6 @@
 """Launch-overhead micro-benchmarks for `MetalRT` vs MAX's `enqueue_function`.
 
-    pixi run -e apple mojo run -I . noeira/experimental/metal_rt/bench_launch.mojo
+    pixi run -e apple mojo run -I . benchmarks/metal_rt/bench_launch.mojo
 
 1. objc_msgSend through `get_function` (dlsym per call) vs a cached pointer.
 2. Host-side encode cost per launch (one huge command buffer, no waiting).

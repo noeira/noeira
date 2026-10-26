@@ -5,7 +5,7 @@ compiles every PREFIX of the function body, each returning the value of its
 last fp16 op, and prints the first prefix that fails, i.e. the op that
 breaks the compile (or the whole program's result if every prefix passes).
 
-    pixi run -e apple mojo run -I . noeira/experimental/ane/probe_mil.mojo <file.mil>
+    pixi run -e apple mojo run -I . benchmarks/ane/probe_mil.mojo <file.mil>
     ... probe_mil.mojo a.mil b.mil ...   # several: only whether each compiles
 """
 

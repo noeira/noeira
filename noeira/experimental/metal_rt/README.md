@@ -24,12 +24,12 @@ most of the step.
 | `objc.mojo` | ObjC bridge. `objc_msgSend` is looked up once and called through typed thin function pointers, one per arity. |
 | `runtime.mojo` | `MetalRT`: device, shared buffers, a pipeline cache per kernel, `launch[kernel](args..., grid=, block=)`, commit policies, ordering, residency, `flush()` / `sync()`. Also the `Launcher` trait. |
 | `metal4.mojo` | `Metal4RT`: the same API on Metal 4 (`MTL4CommandQueue`, `MTL4CommandAllocator`, `MTL4ArgumentTable`). |
-| `test_abi.mojo` | Checks the argument ABI, and launch ordering under every policy, residency mode, ordering mode and both APIs. Exits 1 on failure. |
-| `bench_launch.mojo` | Micro-benchmarks: msgSend caching, encode cost, batching and ordering, the synced round trip, Metal 4, live buffers. |
+| `tests/experimental/metal_rt/test_abi.mojo` | Checks the argument ABI, and launch ordering under every policy, residency mode, ordering mode and both APIs. Exits 1 on failure. |
+| `benchmarks/metal_rt/bench_launch.mojo` | Micro-benchmarks: msgSend caching, encode cost, batching and ordering, the synced round trip, Metal 4, live buffers. |
 | `mlp_kernels.mojo` | Naive kernels for one 2-layer MLP training step (14 launches). |
-| `bench_mlp.mojo` | The MLP step through MAX and through both launchers under each policy, plus the bit-identity gate. Exits 1 on failure. |
-| `probe_own_launch.mojo` | The seed probe this started from. |
-| `probe_simdgroup.mojo` | An 8x8x8 product on the simdgroup matrix hardware through the AIR functions (`external_call`). |
+| `benchmarks/metal_rt/bench_mlp.mojo` | The MLP step through MAX and through both launchers under each policy, plus the bit-identity gate. Exits 1 on failure. |
+| `benchmarks/metal_rt/probe_own_launch.mojo` | The seed probe this started from. |
+| `benchmarks/metal_rt/probe_simdgroup.mojo` | An 8x8x8 product on the simdgroup matrix hardware through the AIR functions (`external_call`). |
 | `../functional/backend.mojo` | The functional tape's `Dev`: launches through MAX or `MetalRT` (`Tape.metal_rt()`). |
 
 ## Run
@@ -37,10 +37,10 @@ most of the step.
 From the repo root (one Mojo compile at a time):
 
 ```bash
-pixi run -e apple mojo run -I . noeira/experimental/metal_rt/test_abi.mojo
-pixi run -e apple mojo run -I . noeira/experimental/metal_rt/bench_launch.mojo
-pixi run -e apple mojo run -I . noeira/experimental/metal_rt/bench_mlp.mojo          # ~5 min
-pixi run -e apple mojo run -I . noeira/experimental/metal_rt/bench_mlp.mojo --quick  # ~1 min
+pixi run -e apple mojo run -I . tests/experimental/metal_rt/test_abi.mojo
+pixi run -e apple mojo run -I . benchmarks/metal_rt/bench_launch.mojo
+pixi run -e apple mojo run -I . benchmarks/metal_rt/bench_mlp.mojo          # ~5 min
+pixi run -e apple mojo run -I . benchmarks/metal_rt/bench_mlp.mojo --quick  # ~1 min
 ```
 
 ```mojo

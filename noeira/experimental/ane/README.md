@@ -18,19 +18,19 @@ The training step is split between the two:
 | `runtime.mojo` | `ANE` (frameworks, IOSurfaces), `Program` (compile, load, run; reads each I/O layout from the loaded model), `Layout` |
 | `emit.mojo` | `emit_grad_step(tape, loss)`: the rank-2 ops of an MLP and its loss, with tape_to_mo's VJPs written as MIL; dead-code elimination |
 | `step.mojo` | `AneGrad`: emit + compile, and per step: write the parameters, evaluate, write the gradients into the tape |
-| `probe_ane.mojo` | Step 0: a matmul with its weights in the input, timed |
-| `probe_io.mojo` | Which input/output shapes work (several I/O, odd sizes, both tensor forms) |
-| `probe_ops.mojo` | Which ops compile, and the accuracy of exp/log/sqrt/sigmoid/tanh/reciprocal |
-| `probe_mil.mojo` | Bisects a refused program (`ANECCompile() FAILED` names nothing) |
-| `probe_zero_copy.mojo` | GPU (metal_rt) and ANE sharing the surfaces with no copy |
+| `benchmarks/ane/probe_ane.mojo` | Step 0: a matmul with its weights in the input, timed |
+| `benchmarks/ane/probe_io.mojo` | Which input/output shapes work (several I/O, odd sizes, both tensor forms) |
+| `benchmarks/ane/probe_ops.mojo` | Which ops compile, and the accuracy of exp/log/sqrt/sigmoid/tanh/reciprocal |
+| `benchmarks/ane/probe_mil.mojo` | Bisects a refused program (`ANECCompile() FAILED` names nothing) |
+| `benchmarks/ane/probe_zero_copy.mojo` | GPU (metal_rt) and ANE sharing the surfaces with no copy |
 | `gpu_adam.mojo` | `AneAdamGpu`: the step with fp32 masters and Adam on the GPU, zero-copy to and from the surfaces |
 | `tests/experimental/ane/test_ane_gpu_adam.mojo` | Its gates |
-| `bench_ane_step.mojo` | Step 3: CPU tape vs ANE vs the metal_rt tape |
+| `benchmarks/ane/bench_ane_step.mojo` | Step 3: CPU tape vs ANE vs the metal_rt tape |
 | `tests/experimental/ane/test_ane_step.mojo` | The gates |
 
 ```bash
 pixi run -e apple mojo run -I . tests/experimental/ane/test_ane_step.mojo
-pixi run -e apple mojo build -I . noeira/experimental/ane/bench_ane_step.mojo -o /tmp/bench_ane && /tmp/bench_ane
+pixi run -e apple mojo build -I . benchmarks/ane/bench_ane_step.mojo -o /tmp/bench_ane && /tmp/bench_ane
 ```
 
 ## What the M1 Pro's ANE (h13g, 16 cores) takes

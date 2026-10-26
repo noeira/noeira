@@ -4,7 +4,7 @@ copy? The ANE's fp16 IOSurfaces are wrapped as Metal buffers
 memory, nil deallocator); a GPU kernel writes the ANE's inputs in place and
 another reads its output in place. Exits 1 on failure.
 
-    pixi run -e apple mojo run -I . noeira/experimental/ane/probe_zero_copy.mojo
+    pixi run -e apple mojo run -I . benchmarks/ane/probe_zero_copy.mojo
 
 a. GPU -> ANE: GPU kernels write x, w, b of `y = x @ w + b` (fp16, at the
    padded row stride the model reports); the CPU reads y (Program.read) and

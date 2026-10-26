@@ -1,7 +1,7 @@
 """2-layer MLP training step: MAX's launch path vs `MetalRT`, with a
 bit-identity gate.
 
-    pixi run -e apple mojo run -I . noeira/experimental/metal_rt/bench_mlp.mojo [--quick]
+    pixi run -e apple mojo run -I . benchmarks/metal_rt/bench_mlp.mojo [--quick]
 
 The SAME kernel functions (`mlp_kernels.mojo`, 14 launches per step) run
 through `DeviceContext.enqueue_function` and through `MetalRT` under each

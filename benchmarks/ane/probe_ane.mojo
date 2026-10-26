@@ -15,7 +15,7 @@ training/test_dynamic_matmul.m):
 All fp16: the M1's ANE (h13) refuses a program with fp32 inputs or outputs
 (`ANECCompile() FAILED`, see `--bisect`); maderix's M4 casts fp32 in and out.
 
-    pixi run -e apple mojo run -I . noeira/experimental/ane/probe_ane.mojo
+    pixi run -e apple mojo run -I . benchmarks/ane/probe_ane.mojo
     ... probe_ane.mojo --bisect   # which small programs compile (fp16 vs fp32 I/O, opsets)
 """
 

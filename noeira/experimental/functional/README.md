@@ -285,7 +285,7 @@ void         air.simdgroup_matrix_8x8_store.v64f32.p{1,3}f32(m, ptr, …)
 - **Calling them.** `llvm_intrinsic` rejects these names ("could not find
   LLVM intrinsic") because they are external functions that the Metal
   backend lowers, not LLVM intrinsics. `external_call` reaches them.
-- **Proof.** `metal_rt/probe_simdgroup.mojo` runs an 8x8x8 product, plain
+- **Proof.** `benchmarks/metal_rt/probe_simdgroup.mojo` runs an 8x8x8 product, plain
   and with B loaded transposed: exact against a CPU reference.
 
 **The kernels**, f32 in and out, 128 threads (4 simdgroups in 2 x 2) per

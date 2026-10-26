@@ -17,7 +17,7 @@ us/step over ROUNDS rounds of `iters` steps [min-max]. The ANE column's
 breakdown is the mean over every timed step: fp32 -> fp16 parameter writes,
 the evaluation, gradient reads (fp16 -> fp32, / scale), and Adam.
 
-    pixi run -e apple mojo build -I . noeira/experimental/ane/bench_ane_step.mojo -o /tmp/bench_ane
+    pixi run -e apple mojo build -I . benchmarks/ane/bench_ane_step.mojo -o /tmp/bench_ane
     /tmp/bench_ane
 """
 

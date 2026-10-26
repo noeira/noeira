@@ -2,7 +2,7 @@
 with the emitter's own `Mil` writer (`emit.mojo`), on `[1, 1, 8, 32]` fp16
 tensors. `ANECCompile() FAILED` names no op, so this is how to find one.
 
-    pixi run -e apple mojo run -I . noeira/experimental/ane/probe_ops.mojo
+    pixi run -e apple mojo run -I . benchmarks/ane/probe_ops.mojo
 """
 
 from std.math import exp, log, sqrt, tanh
