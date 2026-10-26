@@ -91,8 +91,9 @@ jobs:
           environments: cpu
           cache: true
           cache-write: false
+      # assets-pull downloads through the http shim (not in git).
       - name: pull the LIBERO asset pack
-        run: pixi run -e cpu assets-pull libero
+        run: pixi run -e cpu build-http && pixi run -e cpu assets-pull libero
       - name: generated dims are up to date
         run: pixi run -e cpu gen-dims-check
 
