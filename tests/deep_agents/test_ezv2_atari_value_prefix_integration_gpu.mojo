@@ -18,7 +18,7 @@ Run:
 """
 
 from std.math import isnan, isinf
-from layout import Layout, LayoutTensor
+from noeira.core.tiles import tile
 from max.gpu.host import DeviceContext
 from std.testing import assert_true
 
@@ -94,8 +94,7 @@ def main() raises:
         xs = xs ^ (xs << 13); xs = xs ^ (xs >> 7); xs = xs ^ (xs << 17)
         h_obs[i] = Scalar[DT](Int(xs % 256)) / Scalar[DT](255.0)
     ctx.enqueue_copy(d_obs, h_obs.unsafe_ptr())
-    var obs_t = LayoutTensor[DT, Layout.row_major(N_ENVS, OBS), MutAnyOrigin](
-        d_obs.unsafe_ptr().as_unsafe_any_origin())
+    var obs_t = tile[N_ENVS, OBS](d_obs.unsafe_ptr().as_unsafe_any_origin())
     planner.search_gpu[type_of(rep_a), type_of(dyn_a), type_of(pred_a)](
         ctx, rep_a, dyn_a, pred_a, obs_t,
         apply_legal=False, k_actual=MAX_K, rng_seed=UInt32(1))

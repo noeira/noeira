@@ -34,7 +34,6 @@ raise, never reached with `USE_TRAIN_CUDA_GRAPH=False`.
 from noeira.nn.core.param import walk_params
 from std.random import random_float64
 from std.random.philox import Random as PhiloxRandom
-from layout import Layout, LayoutTensor
 
 from max.gpu import global_idx
 from max.gpu.host import DeviceContext, DeviceBuffer
@@ -51,7 +50,7 @@ from noeira.nn.optimizer.adam import Adam
 from noeira.nn.core.checkpoint import (
     BinaryCheckpointWriter, BinaryCheckpointReader, CheckpointReader,
     CheckpointScalars, write_model, read_model, _split_lines, _is_v3_header,
-    _read_file_bytes, _write_file_bytes,
+    _read_file_bytes,
 )
 from noeira.nn.random.box_muller import box_muller_normal, box_muller_normal_gpu
 
@@ -72,6 +71,7 @@ from ..training.blocks.action_select import (
 from .target_y_block import TD3TargetYBlock
 from .blocks.delayed_actor_polyak_step import TD3DelayedActorPolyakStep
 from .metrics import TD3Metrics
+from noeira.core.tiles import RowMajor, Tile
 
 
 # ──────────────────────────────────────────────────────────────────────
@@ -366,18 +366,18 @@ struct TD3Trainer[
             self._reward_accum += sr * inv_b
             self._done_accum += sd * inv_b
         else:
-            comptime lb = Layout.row_major(B)
+            comptime lb = RowMajor[B]
             self._q_mean_dev.accumulate_gpu_lt[B](
-                self.twin_critic_blk.inner.c1._mb_q.lt["gpu", lb]()
+                self.twin_critic_blk.inner.c1._mb_q.tt["gpu", B]()
             )
             self._target_mean_dev.accumulate_gpu_lt[B](
-                self.state.mb_y.lt["gpu", lb]()
+                self.state.mb_y.tt["gpu", B]()
             )
             self._reward_mean_dev.accumulate_gpu_lt[B](
-                self.state.mb_r.lt["gpu", lb]()
+                self.state.mb_r.tt["gpu", B]()
             )
             self._done_mean_dev.accumulate_gpu_lt[B](
-                self.state.mb_d.lt["gpu", lb]()
+                self.state.mb_d.tt["gpu", B]()
             )
 
         # TD3 actor + 3-pair polyak (gated by internal counter). Block reads
@@ -409,18 +409,10 @@ struct TD3Trainer[
         N_ENVS: Int
     ](
         mut self,
-        obs: LayoutTensor[
-            DT, Layout.row_major(N_ENVS, Self.AGENT_OBS_DIM), MutAnyOrigin
-        ],
-        action: LayoutTensor[
-            DT, Layout.row_major(N_ENVS, Self.AGENT_ACT_DIM), MutAnyOrigin
-        ],
-        ao_scratch: LayoutTensor[
-            DT, Layout.row_major(N_ENVS, 2 * Self.AGENT_ACT_DIM), MutAnyOrigin
-        ],
-        alp_scratch: LayoutTensor[
-            DT, Layout.row_major(N_ENVS, Self.AGENT_ACT_DIM + 1), MutAnyOrigin
-        ],
+        obs: Tile[DT, N_ENVS, Self.AGENT_OBS_DIM],
+        action: Tile[DT, N_ENVS, Self.AGENT_ACT_DIM],
+        ao_scratch: Tile[DT, N_ENVS, 2 * Self.AGENT_ACT_DIM],
+        alp_scratch: Tile[DT, N_ENVS, Self.AGENT_ACT_DIM + 1],
         step_idx: Int,
     ) raises:
         comptime assert N_ENVS > 0, "N_ENVS must be > 0"
@@ -735,14 +727,14 @@ struct TD3Trainer[
         """ONE v3 `storage-ckpt` file: the ONLINE nets, name-prefixed
         `actor.` / `critic1.` / `critic2.`; training scalars as `K` sections.
         Atomic and chunked. Optimizer moments NOT persisted (resume re-warms)."""
-        var w = BinaryCheckpointWriter(save_moments=False)
+        var w = BinaryCheckpointWriter.to_file(path, save_moments=False)
         write_model[Self.train_target](w, self.actor_pair.online, self.ctx, "actor")
         write_model[Self.train_target](w, self.pair1.online, self.ctx, "critic1")
         write_model[Self.train_target](w, self.pair2.online, self.ctx, "critic2")
         var sc = CheckpointScalars()
         sc.set_int("total_train_steps", self._total_train_steps)
         w.write_scalars(sc)
-        _write_file_bytes(path, w.content)
+        w.commit()
 
     def load_state(mut self, path: String) raises:
         """Restore the online nets (v3, or the legacy v2 text this trainer

@@ -17,10 +17,10 @@ Run:
 """
 
 from std.math import sqrt, log, cos, sin, tanh, pi
-from std.memory import alloc, memset
+from std.memory import alloc, unsafe_memset
 from std.random.philox import Random as PhiloxRandom
 from std.time import perf_counter_ns
-from layout import Layout, LayoutTensor
+from noeira.core.tiles import tile
 
 from noeira.nn.constants import DT as dtype
 from noeira.experimental.pcn.pc_initializer import PCXavier
@@ -303,24 +303,14 @@ def main() raises:
         NET.PARAM_SIZE * OPT_PC.STATE_PER_PARAM
     ).as_unsafe_any_origin()
     var pc_opt_global_buf = alloc[Scalar[dtype]](OPT_PC.GLOBAL_STATE_SIZE).as_unsafe_any_origin()
-    memset(pc_params_buf, 0, NET.PARAM_SIZE)
-    memset(pc_grads_buf, 0, NET.PARAM_SIZE)
-    memset(pc_opt_state_buf, 0, NET.PARAM_SIZE * OPT_PC.STATE_PER_PARAM)
-    memset(pc_opt_global_buf, 0, OPT_PC.GLOBAL_STATE_SIZE)
-    var pc_params = LayoutTensor[
-        dtype, Layout.row_major(NET.PARAM_SIZE), MutAnyOrigin
-    ](pc_params_buf)
-    var pc_grads = LayoutTensor[
-        dtype, Layout.row_major(NET.PARAM_SIZE), MutAnyOrigin
-    ](pc_grads_buf)
-    var pc_opt_state = LayoutTensor[
-        dtype,
-        Layout.row_major(NET.PARAM_SIZE, OPT_PC.STATE_PER_PARAM),
-        MutAnyOrigin,
-    ](pc_opt_state_buf)
-    var pc_opt_global = LayoutTensor[
-        dtype, Layout.row_major(OPT_PC.GLOBAL_STATE_SIZE), MutAnyOrigin
-    ](pc_opt_global_buf)
+    unsafe_memset(pc_params_buf, 0, NET.PARAM_SIZE)
+    unsafe_memset(pc_grads_buf, 0, NET.PARAM_SIZE)
+    unsafe_memset(pc_opt_state_buf, 0, NET.PARAM_SIZE * OPT_PC.STATE_PER_PARAM)
+    unsafe_memset(pc_opt_global_buf, 0, OPT_PC.GLOBAL_STATE_SIZE)
+    var pc_params = tile[NET.PARAM_SIZE](pc_params_buf)
+    var pc_grads = tile[NET.PARAM_SIZE](pc_grads_buf)
+    var pc_opt_state = tile[NET.PARAM_SIZE, OPT_PC.STATE_PER_PARAM](pc_opt_state_buf)
+    var pc_opt_global = tile[OPT_PC.GLOBAL_STATE_SIZE](pc_opt_global_buf)
     NET.pc_init_params[PCXavier, dtype](pc_params)
 
     var enc_params_buf = alloc[Scalar[dtype]](ENC_PARAM_SIZE).as_unsafe_any_origin()
@@ -329,24 +319,14 @@ def main() raises:
         ENC_PARAM_SIZE * OPT_ENC.STATE_PER_PARAM
     ).as_unsafe_any_origin()
     var enc_opt_global_buf = alloc[Scalar[dtype]](OPT_ENC.GLOBAL_STATE_SIZE).as_unsafe_any_origin()
-    memset(enc_params_buf, 0, ENC_PARAM_SIZE)
-    memset(enc_grads_buf, 0, ENC_PARAM_SIZE)
-    memset(enc_opt_state_buf, 0, ENC_PARAM_SIZE * OPT_ENC.STATE_PER_PARAM)
-    memset(enc_opt_global_buf, 0, OPT_ENC.GLOBAL_STATE_SIZE)
-    var enc_params = LayoutTensor[
-        dtype, Layout.row_major(ENC_PARAM_SIZE), MutAnyOrigin
-    ](enc_params_buf)
-    var enc_grads = LayoutTensor[
-        dtype, Layout.row_major(ENC_PARAM_SIZE), MutAnyOrigin
-    ](enc_grads_buf)
-    var enc_opt_state = LayoutTensor[
-        dtype,
-        Layout.row_major(ENC_PARAM_SIZE, OPT_ENC.STATE_PER_PARAM),
-        MutAnyOrigin,
-    ](enc_opt_state_buf)
-    var enc_opt_global = LayoutTensor[
-        dtype, Layout.row_major(OPT_ENC.GLOBAL_STATE_SIZE), MutAnyOrigin
-    ](enc_opt_global_buf)
+    unsafe_memset(enc_params_buf, 0, ENC_PARAM_SIZE)
+    unsafe_memset(enc_grads_buf, 0, ENC_PARAM_SIZE)
+    unsafe_memset(enc_opt_state_buf, 0, ENC_PARAM_SIZE * OPT_ENC.STATE_PER_PARAM)
+    unsafe_memset(enc_opt_global_buf, 0, OPT_ENC.GLOBAL_STATE_SIZE)
+    var enc_params = tile[ENC_PARAM_SIZE](enc_params_buf)
+    var enc_grads = tile[ENC_PARAM_SIZE](enc_grads_buf)
+    var enc_opt_state = tile[ENC_PARAM_SIZE, OPT_ENC.STATE_PER_PARAM](enc_opt_state_buf)
+    var enc_opt_global = tile[OPT_ENC.GLOBAL_STATE_SIZE](enc_opt_global_buf)
     ENC.xavier_init[dtype](enc_params, UInt64(123))
 
     # ── Phase-2 BPTT params ──────────────────────────────────────────────────
@@ -356,20 +336,10 @@ def main() raises:
         T_PARAM_SIZE * OPT_BPTT.STATE_PER_PARAM
     ).as_unsafe_any_origin()
     var T_opt_global_buf = alloc[Scalar[dtype]](OPT_BPTT.GLOBAL_STATE_SIZE).as_unsafe_any_origin()
-    var T_params = LayoutTensor[
-        dtype, Layout.row_major(T_PARAM_SIZE), MutAnyOrigin
-    ](T_params_buf)
-    var T_grads = LayoutTensor[
-        dtype, Layout.row_major(T_PARAM_SIZE), MutAnyOrigin
-    ](T_grads_buf)
-    var T_opt_state = LayoutTensor[
-        dtype,
-        Layout.row_major(T_PARAM_SIZE, OPT_BPTT.STATE_PER_PARAM),
-        MutAnyOrigin,
-    ](T_opt_state_buf)
-    var T_opt_global = LayoutTensor[
-        dtype, Layout.row_major(OPT_BPTT.GLOBAL_STATE_SIZE), MutAnyOrigin
-    ](T_opt_global_buf)
+    var T_params = tile[T_PARAM_SIZE](T_params_buf)
+    var T_grads = tile[T_PARAM_SIZE](T_grads_buf)
+    var T_opt_state = tile[T_PARAM_SIZE, OPT_BPTT.STATE_PER_PARAM](T_opt_state_buf)
+    var T_opt_global = tile[OPT_BPTT.GLOBAL_STATE_SIZE](T_opt_global_buf)
 
     var D_params_buf = alloc[Scalar[dtype]](D_PARAM_SIZE).as_unsafe_any_origin()
     var D_grads_buf = alloc[Scalar[dtype]](D_PARAM_SIZE).as_unsafe_any_origin()
@@ -377,20 +347,10 @@ def main() raises:
         D_PARAM_SIZE * OPT_BPTT.STATE_PER_PARAM
     ).as_unsafe_any_origin()
     var D_opt_global_buf = alloc[Scalar[dtype]](OPT_BPTT.GLOBAL_STATE_SIZE).as_unsafe_any_origin()
-    var D_params = LayoutTensor[
-        dtype, Layout.row_major(D_PARAM_SIZE), MutAnyOrigin
-    ](D_params_buf)
-    var D_grads = LayoutTensor[
-        dtype, Layout.row_major(D_PARAM_SIZE), MutAnyOrigin
-    ](D_grads_buf)
-    var D_opt_state = LayoutTensor[
-        dtype,
-        Layout.row_major(D_PARAM_SIZE, OPT_BPTT.STATE_PER_PARAM),
-        MutAnyOrigin,
-    ](D_opt_state_buf)
-    var D_opt_global = LayoutTensor[
-        dtype, Layout.row_major(OPT_BPTT.GLOBAL_STATE_SIZE), MutAnyOrigin
-    ](D_opt_global_buf)
+    var D_params = tile[D_PARAM_SIZE](D_params_buf)
+    var D_grads = tile[D_PARAM_SIZE](D_grads_buf)
+    var D_opt_state = tile[D_PARAM_SIZE, OPT_BPTT.STATE_PER_PARAM](D_opt_state_buf)
+    var D_opt_global = tile[OPT_BPTT.GLOBAL_STATE_SIZE](D_opt_global_buf)
 
     # ── Shared scratch ───────────────────────────────────────────────────────
     var lat_buf = alloc[Scalar[dtype]](BATCH * NET.LATENT_DIM).as_unsafe_any_origin()
@@ -398,67 +358,35 @@ def main() raises:
     var a_below_buf_raw = alloc[Scalar[dtype]](BATCH * NET.SCRATCH_IN_DIM).as_unsafe_any_origin()
     var z_below_buf_raw = alloc[Scalar[dtype]](BATCH * NET.SCRATCH_IN_DIM).as_unsafe_any_origin()
     var dx_buf_raw = alloc[Scalar[dtype]](BATCH * NET.LATENT_DIM).as_unsafe_any_origin()
-    memset(lat_buf, 0, BATCH * NET.LATENT_DIM)
-    var latents = LayoutTensor[
-        dtype, Layout.row_major(BATCH, NET.LATENT_DIM), MutAnyOrigin
-    ](lat_buf)
-    var mu_eps_buf = LayoutTensor[
-        dtype, Layout.row_major(BATCH, NET.SCRATCH_OUT_DIM), MutAnyOrigin
-    ](mu_eps_buf_raw)
-    var a_below_buf = LayoutTensor[
-        dtype, Layout.row_major(BATCH, NET.SCRATCH_IN_DIM), MutAnyOrigin
-    ](a_below_buf_raw)
-    var z_below_buf = LayoutTensor[
-        dtype, Layout.row_major(BATCH, NET.SCRATCH_IN_DIM), MutAnyOrigin
-    ](z_below_buf_raw)
-    var dx_buf = LayoutTensor[
-        dtype, Layout.row_major(BATCH, NET.LATENT_DIM), MutAnyOrigin
-    ](dx_buf_raw)
+    unsafe_memset(lat_buf, 0, BATCH * NET.LATENT_DIM)
+    var latents = tile[BATCH, NET.LATENT_DIM](lat_buf)
+    var mu_eps_buf = tile[BATCH, NET.SCRATCH_OUT_DIM](mu_eps_buf_raw)
+    var a_below_buf = tile[BATCH, NET.SCRATCH_IN_DIM](a_below_buf_raw)
+    var z_below_buf = tile[BATCH, NET.SCRATCH_IN_DIM](z_below_buf_raw)
+    var dx_buf = tile[BATCH, NET.LATENT_DIM](dx_buf_raw)
 
     var x_in_buf = alloc[Scalar[dtype]](BATCH * AUG_DIM).as_unsafe_any_origin()
     var y_tgt_buf = alloc[Scalar[dtype]](BATCH * OBS_DIM).as_unsafe_any_origin()
-    memset(x_in_buf, 0, BATCH * AUG_DIM)
-    memset(y_tgt_buf, 0, BATCH * OBS_DIM)
-    var x_in = LayoutTensor[
-        dtype, Layout.row_major(BATCH, AUG_DIM), MutAnyOrigin
-    ](x_in_buf)
-    var y_target = LayoutTensor[
-        dtype, Layout.row_major(BATCH, OBS_DIM), MutAnyOrigin
-    ](y_tgt_buf)
+    unsafe_memset(x_in_buf, 0, BATCH * AUG_DIM)
+    unsafe_memset(y_tgt_buf, 0, BATCH * OBS_DIM)
+    var x_in = tile[BATCH, AUG_DIM](x_in_buf)
+    var y_target = tile[BATCH, OBS_DIM](y_tgt_buf)
 
     var enc_input_buf = alloc[Scalar[dtype]](BATCH * ENC_INPUT_DIM).as_unsafe_any_origin()
     var enc_hpre_buf = alloc[Scalar[dtype]](BATCH * ENC_HIDDEN_DIM).as_unsafe_any_origin()
     var enc_hact_buf = alloc[Scalar[dtype]](BATCH * ENC_HIDDEN_DIM).as_unsafe_any_origin()
     var enc_output_buf = alloc[Scalar[dtype]](BATCH * ENC_OUTPUT_DIM).as_unsafe_any_origin()
     var enc_dz_buf = alloc[Scalar[dtype]](BATCH * ENC_OUTPUT_DIM).as_unsafe_any_origin()
-    var enc_input = LayoutTensor[
-        dtype, Layout.row_major(BATCH, ENC_INPUT_DIM), MutAnyOrigin
-    ](enc_input_buf)
-    var enc_hpre = LayoutTensor[
-        dtype, Layout.row_major(BATCH, ENC_HIDDEN_DIM), MutAnyOrigin
-    ](enc_hpre_buf)
-    var enc_hact = LayoutTensor[
-        dtype, Layout.row_major(BATCH, ENC_HIDDEN_DIM), MutAnyOrigin
-    ](enc_hact_buf)
-    var enc_output = LayoutTensor[
-        dtype, Layout.row_major(BATCH, ENC_OUTPUT_DIM), MutAnyOrigin
-    ](enc_output_buf)
-    var enc_dz = LayoutTensor[
-        dtype, Layout.row_major(BATCH, ENC_OUTPUT_DIM), MutAnyOrigin
-    ](enc_dz_buf)
+    var enc_input = tile[BATCH, ENC_INPUT_DIM](enc_input_buf)
+    var enc_hpre = tile[BATCH, ENC_HIDDEN_DIM](enc_hpre_buf)
+    var enc_hact = tile[BATCH, ENC_HIDDEN_DIM](enc_hact_buf)
+    var enc_output = tile[BATCH, ENC_OUTPUT_DIM](enc_output_buf)
+    var enc_dz = tile[BATCH, ENC_OUTPUT_DIM](enc_dz_buf)
 
-    var enc_input_1 = LayoutTensor[
-        dtype, Layout.row_major(1, ENC_INPUT_DIM), MutAnyOrigin
-    ](enc_input_buf)
-    var enc_hpre_1 = LayoutTensor[
-        dtype, Layout.row_major(1, ENC_HIDDEN_DIM), MutAnyOrigin
-    ](enc_hpre_buf)
-    var enc_hact_1 = LayoutTensor[
-        dtype, Layout.row_major(1, ENC_HIDDEN_DIM), MutAnyOrigin
-    ](enc_hact_buf)
-    var enc_output_1 = LayoutTensor[
-        dtype, Layout.row_major(1, ENC_OUTPUT_DIM), MutAnyOrigin
-    ](enc_output_buf)
+    var enc_input_1 = tile[1, ENC_INPUT_DIM](enc_input_buf)
+    var enc_hpre_1 = tile[1, ENC_HIDDEN_DIM](enc_hpre_buf)
+    var enc_hact_1 = tile[1, ENC_HIDDEN_DIM](enc_hact_buf)
+    var enc_output_1 = tile[1, ENC_OUTPUT_DIM](enc_output_buf)
 
     # ── BPTT cache ───────────────────────────────────────────────────────────
     var cache_x_aug_buf = alloc[Scalar[dtype]](K_BPTT * BATCH * AUG_DIM).as_unsafe_any_origin()
@@ -498,7 +426,7 @@ def main() raises:
                     b * SEQ_LEN,
                     b * (SEQ_LEN + 1) * OBS_DIM,
                 )
-            memset(prev_z_buf, 0, BATCH * HIDDEN)
+            unsafe_memset(prev_z_buf, 0, BATCH * HIDDEN)
             for t in range(0, SEQ_LEN + 1):
                 for b in range(BATCH):
                     for j in range(HIDDEN):
@@ -605,15 +533,15 @@ def main() raises:
     print("  epoch | mean_loss | wall_t (s)")
     print("  ------+-----------+------------")
 
-    memset(T_params_buf, 0, T_PARAM_SIZE)
-    memset(T_grads_buf, 0, T_PARAM_SIZE)
-    memset(T_opt_state_buf, 0, T_PARAM_SIZE * OPT_BPTT.STATE_PER_PARAM)
-    memset(T_opt_global_buf, 0, OPT_BPTT.GLOBAL_STATE_SIZE)
+    unsafe_memset(T_params_buf, 0, T_PARAM_SIZE)
+    unsafe_memset(T_grads_buf, 0, T_PARAM_SIZE)
+    unsafe_memset(T_opt_state_buf, 0, T_PARAM_SIZE * OPT_BPTT.STATE_PER_PARAM)
+    unsafe_memset(T_opt_global_buf, 0, OPT_BPTT.GLOBAL_STATE_SIZE)
     _xavier_init_layer(T_params_buf, AUG_DIM, HIDDEN, UInt64(7))
-    memset(D_params_buf, 0, D_PARAM_SIZE)
-    memset(D_grads_buf, 0, D_PARAM_SIZE)
-    memset(D_opt_state_buf, 0, D_PARAM_SIZE * OPT_BPTT.STATE_PER_PARAM)
-    memset(D_opt_global_buf, 0, OPT_BPTT.GLOBAL_STATE_SIZE)
+    unsafe_memset(D_params_buf, 0, D_PARAM_SIZE)
+    unsafe_memset(D_grads_buf, 0, D_PARAM_SIZE)
+    unsafe_memset(D_opt_state_buf, 0, D_PARAM_SIZE * OPT_BPTT.STATE_PER_PARAM)
+    unsafe_memset(D_opt_global_buf, 0, OPT_BPTT.GLOBAL_STATE_SIZE)
     _xavier_init_layer(D_params_buf, HIDDEN, OBS_DIM, UInt64(8))
 
     var bptt_step_num: Int = 0
@@ -692,9 +620,9 @@ def main() raises:
                         sum_sq += diff * diff
             last_loss = 0.5 * sum_sq / Float64(BATCH * K_BPTT)
 
-            memset(T_grads_buf, 0, T_PARAM_SIZE)
-            memset(D_grads_buf, 0, D_PARAM_SIZE)
-            memset(d_z_from_next_buf, 0, BATCH * HIDDEN)
+            unsafe_memset(T_grads_buf, 0, T_PARAM_SIZE)
+            unsafe_memset(D_grads_buf, 0, D_PARAM_SIZE)
+            unsafe_memset(d_z_from_next_buf, 0, BATCH * HIDDEN)
 
             for k_rev in range(K_BPTT):
                 var k = K_BPTT - 1 - k_rev
@@ -820,7 +748,7 @@ def main() raises:
         var theta = (u2 * 2.0 - 1.0) * CP_RESET_RANGE
         var theta_dot = (u3 * 2.0 - 1.0) * CP_RESET_RANGE
 
-        memset(agent_z_buf, 0, HIDDEN)
+        unsafe_memset(agent_z_buf, 0, HIDDEN)
         for h in range(PLAN_HORIZON):
             cem_mu[h] = 0.0
             cem_sigma[h] = INITIAL_SIGMA

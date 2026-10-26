@@ -70,7 +70,7 @@ from std.pathlib import Path
 from std.random import seed as seed_rng
 from std.sys import argv
 
-from layout import Layout
+from noeira.core.tiles import RowMajor
 
 from noeira.math3d import Vec3 as Vec3G, Quat as QuatG
 from noeira.nn.constants import DT as NN_DT
@@ -160,11 +160,11 @@ the policy, it commands a different pose."""
 
 comptime NB = So101TabletopModel.NBODY
 comptime NS = So101TabletopModel.NSITE
-comptime L_META = Layout.row_major(1, METADATA_SIZE)
-comptime L_CUR = Layout.row_major(1, MODEL_CURRICULUM_SIZE)
-comptime L_XP = Layout.row_major(1, NB * 3)
-comptime L_XQ = Layout.row_major(1, NB * 4)
-comptime L_SP = Layout.row_major(1, NS * 3)
+comptime L_META = RowMajor[1, METADATA_SIZE]
+comptime L_CUR = RowMajor[1, MODEL_CURRICULUM_SIZE]
+comptime L_XP = RowMajor[1, NB * 3]
+comptime L_XQ = RowMajor[1, NB * 4]
+comptime L_SP = RowMajor[1, NS * 3]
 
 comptime SIDEBAR_W: Float32 = 320.0
 
@@ -388,9 +388,9 @@ def measure(
         t_meta.data[i] = env.d.meta.data[i]
     var goal_d = Float64(
         tape_distance_gpu[DT, 1, NB, NS * 3](
-            t_meta.lt["cpu", L_META](), t_cur.lt["cpu", L_CUR](),
-            t_xp.lt["cpu", L_XP](), t_xq.lt["cpu", L_XQ](),
-            t_sp.lt["cpu", L_SP](), 0,
+            t_meta.tt["cpu", 1, METADATA_SIZE](), t_cur.tt["cpu", 1, MODEL_CURRICULUM_SIZE](),
+            t_xp.tt["cpu", 1, NB * 3](), t_xq.tt["cpu", 1, NB * 4](),
+            t_sp.tt["cpu", 1, NS * 3](), 0,
         )
     )
     var ids = goal_frame_ids(

@@ -20,7 +20,8 @@ damping diagonal, exactly like the legacy integrator).
 
 from max.gpu import thread_idx, block_idx, block_dim
 from max.gpu.host import DeviceContext
-from layout import Layout, LayoutTensor
+from layout import TileTensor, TensorLayout
+from noeira.core.tiles import RowMajor, Tile
 
 from ..kinematics.quat_math import quat_mul
 from ..joint_types import JNT_HINGE, JNT_SLIDE, JNT_BALL, JNT_FREE
@@ -243,52 +244,36 @@ def _matmul_6x6_x_6x6[
 def _rne_vel_derivative_env[
     DTYPE: DType,
     D: DimsLike,
-    L_BODIES: Layout,
-    L_JOINTS: Layout,
-    L_XIPOS: Layout,
-    L_XQUAT: Layout,
-    L_QVEL: Layout,
-    L_CDOF: Layout,
-    L_CINERT: Layout,
-    L_CVEL_SC: Layout,
-    L_DCVEL: Layout,
-    L_DCDOFDOT: Layout,
-    L_QDERIV: Layout,
+    L_BODIES: TensorLayout,
+    L_JOINTS: TensorLayout,
+    L_XIPOS: TensorLayout,
+    L_XQUAT: TensorLayout,
+    L_QVEL: TensorLayout,
+    L_CDOF: TensorLayout,
+    L_CINERT: TensorLayout,
+    L_CVEL_SC: TensorLayout,
+    L_DCVEL: TensorLayout,
+    L_DCDOFDOT: TensorLayout,
+    L_QDERIV: TensorLayout,
 ](
     env: Int,
     njoint: Int,
     dims: D,
-    bodies: LayoutTensor[
-        DTYPE, L_BODIES, MutAnyOrigin
-    ],
-    joints: LayoutTensor[
-        DTYPE, L_JOINTS, MutAnyOrigin
-    ],
-    xipos: LayoutTensor[DTYPE, L_XIPOS, MutAnyOrigin],
-    xquat: LayoutTensor[DTYPE, L_XQUAT, MutAnyOrigin],
-    qvel: LayoutTensor[DTYPE, L_QVEL, MutAnyOrigin],
-    cdof: LayoutTensor[DTYPE, L_CDOF, MutAnyOrigin],
-    cinert: LayoutTensor[
-        DTYPE, L_CINERT, MutAnyOrigin
-    ],
-    cdof_sc: LayoutTensor[DTYPE, L_CDOF, MutAnyOrigin],
-    cvel_sc: LayoutTensor[
-        DTYPE, L_CVEL_SC, MutAnyOrigin
-    ],
-    cdof_dot: LayoutTensor[DTYPE, L_CDOF, MutAnyOrigin],
-    dcvel: LayoutTensor[
-        DTYPE, L_DCVEL, MutAnyOrigin
-    ],
-    dcdofdot: LayoutTensor[
-        DTYPE, L_DCDOFDOT, MutAnyOrigin
-    ],
-    dcacc: LayoutTensor[
-        DTYPE, L_DCVEL, MutAnyOrigin
-    ],
-    dcfrcbody: LayoutTensor[
-        DTYPE, L_DCVEL, MutAnyOrigin
-    ],
-    qderiv: LayoutTensor[DTYPE, L_QDERIV, MutAnyOrigin],
+    bodies: TileTensor[DTYPE, L_BODIES, MutAnyOrigin],
+    joints: TileTensor[DTYPE, L_JOINTS, MutAnyOrigin],
+    xipos: TileTensor[DTYPE, L_XIPOS, MutAnyOrigin],
+    xquat: TileTensor[DTYPE, L_XQUAT, MutAnyOrigin],
+    qvel: TileTensor[DTYPE, L_QVEL, MutAnyOrigin],
+    cdof: TileTensor[DTYPE, L_CDOF, MutAnyOrigin],
+    cinert: TileTensor[DTYPE, L_CINERT, MutAnyOrigin],
+    cdof_sc: TileTensor[DTYPE, L_CDOF, MutAnyOrigin],
+    cvel_sc: TileTensor[DTYPE, L_CVEL_SC, MutAnyOrigin],
+    cdof_dot: TileTensor[DTYPE, L_CDOF, MutAnyOrigin],
+    dcvel: TileTensor[DTYPE, L_DCVEL, MutAnyOrigin],
+    dcdofdot: TileTensor[DTYPE, L_DCDOFDOT, MutAnyOrigin],
+    dcacc: TileTensor[DTYPE, L_DCVEL, MutAnyOrigin],
+    dcfrcbody: TileTensor[DTYPE, L_DCVEL, MutAnyOrigin],
+    qderiv: TileTensor[DTYPE, L_QDERIV, MutAnyOrigin],
 ):
     """d(qfrc_bias)/d(qvel) SUBTRACTED into qderiv for one env. Persistent
     intermediates are zeroed here (scratch is reused across envs/steps)."""
@@ -781,37 +766,21 @@ def _rne_vel_derivative_fields_kernel[
     BATCH: Int,
 ](
     njoint_arg: Int64,
-    bodies: LayoutTensor[
-        DTYPE, Layout.row_major(NBODY, MODEL_BODY_SIZE), MutAnyOrigin
-    ],
-    joints: LayoutTensor[
-        DTYPE, Layout.row_major(NJOINT, MODEL_JOINT_SIZE), MutAnyOrigin
-    ],
-    xipos: LayoutTensor[DTYPE, Layout.row_major(BATCH, NBODY * 3), MutAnyOrigin],
-    xquat: LayoutTensor[DTYPE, Layout.row_major(BATCH, NBODY * 4), MutAnyOrigin],
-    qvel: LayoutTensor[DTYPE, Layout.row_major(BATCH, NV), MutAnyOrigin],
-    cdof: LayoutTensor[DTYPE, Layout.row_major(BATCH, NV * 6), MutAnyOrigin],
-    cinert: LayoutTensor[
-        DTYPE, Layout.row_major(BATCH, NBODY * 10), MutAnyOrigin
-    ],
-    cdof_sc: LayoutTensor[DTYPE, Layout.row_major(BATCH, NV * 6), MutAnyOrigin],
-    cvel_sc: LayoutTensor[
-        DTYPE, Layout.row_major(BATCH, NBODY * 6), MutAnyOrigin
-    ],
-    cdof_dot: LayoutTensor[DTYPE, Layout.row_major(BATCH, NV * 6), MutAnyOrigin],
-    dcvel: LayoutTensor[
-        DTYPE, Layout.row_major(BATCH, NBODY * 6 * NV), MutAnyOrigin
-    ],
-    dcdofdot: LayoutTensor[
-        DTYPE, Layout.row_major(BATCH, NV * 6 * NV), MutAnyOrigin
-    ],
-    dcacc: LayoutTensor[
-        DTYPE, Layout.row_major(BATCH, NBODY * 6 * NV), MutAnyOrigin
-    ],
-    dcfrcbody: LayoutTensor[
-        DTYPE, Layout.row_major(BATCH, NBODY * 6 * NV), MutAnyOrigin
-    ],
-    qderiv: LayoutTensor[DTYPE, Layout.row_major(BATCH, NV * NV), MutAnyOrigin],
+    bodies: Tile[DTYPE, NBODY, MODEL_BODY_SIZE],
+    joints: Tile[DTYPE, NJOINT, MODEL_JOINT_SIZE],
+    xipos: Tile[DTYPE, BATCH, NBODY * 3],
+    xquat: Tile[DTYPE, BATCH, NBODY * 4],
+    qvel: Tile[DTYPE, BATCH, NV],
+    cdof: Tile[DTYPE, BATCH, NV * 6],
+    cinert: Tile[DTYPE, BATCH, NBODY * 10],
+    cdof_sc: Tile[DTYPE, BATCH, NV * 6],
+    cvel_sc: Tile[DTYPE, BATCH, NBODY * 6],
+    cdof_dot: Tile[DTYPE, BATCH, NV * 6],
+    dcvel: Tile[DTYPE, BATCH, NBODY * 6 * NV],
+    dcdofdot: Tile[DTYPE, BATCH, NV * 6 * NV],
+    dcacc: Tile[DTYPE, BATCH, NBODY * 6 * NV],
+    dcfrcbody: Tile[DTYPE, BATCH, NBODY * 6 * NV],
+    qderiv: Tile[DTYPE, BATCH, NV * NV],
 ):
     # Mojo 1.0: `Int`/`UInt` are not `DevicePassable`; the kernel takes
     # a fixed-width `Int64` and re-binds the original name here.
@@ -851,17 +820,17 @@ def compute_rne_vel_derivative[
     scratch.cdof; both targets. NJOINT>0 required (njoint read from meta)."""
     var njoint = Int(m.meta.data[MODEL_META_IDX_NJOINT])
 
-    comptime L_BODY = Layout.row_major(D.NBODY, MODEL_BODY_SIZE)
-    comptime L_JOINT = Layout.row_major(D.NJOINT, MODEL_JOINT_SIZE)
-    comptime L_B3 = Layout.row_major(BATCH, D.NBODY * 3)
-    comptime L_B4 = Layout.row_major(BATCH, D.NBODY * 4)
-    comptime L_NV = Layout.row_major(BATCH, D.NV)
-    comptime L_NV6 = Layout.row_major(BATCH, D.NV * 6)
-    comptime L_B10 = Layout.row_major(BATCH, D.NBODY * 10)
-    comptime L_B6 = Layout.row_major(BATCH, D.NBODY * 6)
-    comptime L_DCVEL = Layout.row_major(BATCH, D.NBODY * 6 * D.NV)
-    comptime L_DCDOF = Layout.row_major(BATCH, D.NV * 6 * D.NV)
-    comptime L_QD = Layout.row_major(BATCH, D.NV * D.NV)
+    comptime L_BODY = RowMajor[D.NBODY, MODEL_BODY_SIZE]
+    comptime L_JOINT = RowMajor[D.NJOINT, MODEL_JOINT_SIZE]
+    comptime L_B3 = RowMajor[BATCH, D.NBODY * 3]
+    comptime L_B4 = RowMajor[BATCH, D.NBODY * 4]
+    comptime L_NV = RowMajor[BATCH, D.NV]
+    comptime L_NV6 = RowMajor[BATCH, D.NV * 6]
+    comptime L_B10 = RowMajor[BATCH, D.NBODY * 10]
+    comptime L_B6 = RowMajor[BATCH, D.NBODY * 6]
+    comptime L_DCVEL = RowMajor[BATCH, D.NBODY * 6 * D.NV]
+    comptime L_DCDOF = RowMajor[BATCH, D.NV * 6 * D.NV]
+    comptime L_QD = RowMajor[BATCH, D.NV * D.NV]
 
     comptime if target == "cpu":
         var dm = d.dims
@@ -876,21 +845,21 @@ def compute_rne_vel_derivative[
         var rl_DCVEL = rl2(BATCH, dm.get_nbody() * 6 * dm.get_nv())
         var rl_DCDOF = rl2(BATCH, dm.get_nv() * 6 * dm.get_nv())
         var rl_QD = rl2(BATCH, dm.get_nv() * dm.get_nv())
-        var bodies_v = m.bodies.lt_dyn["cpu", DYN2](rl_BODY)
-        var joints_v = m.joints.lt_dyn["cpu", DYN2](rl_JOINT)
-        var xipos_v = d.xipos.lt_dyn["cpu", DYN2](rl_B3)
-        var xquat_v = d.xquat.lt_dyn["cpu", DYN2](rl_B4)
-        var qvel_v = d.qvel.lt_dyn["cpu", DYN2](rl_NV)
-        var cdof_v = scratch.cdof.lt_dyn["cpu", DYN2](rl_NV6)
-        var cinert_v = iscratch.cinert.lt_dyn["cpu", DYN2](rl_B10)
-        var cdof_sc_v = iscratch.cdof_sc.lt_dyn["cpu", DYN2](rl_NV6)
-        var cvel_sc_v = iscratch.cvel_sc.lt_dyn["cpu", DYN2](rl_B6)
-        var cdof_dot_v = iscratch.cdof_dot.lt_dyn["cpu", DYN2](rl_NV6)
-        var dcvel_v = iscratch.dcvel.lt_dyn["cpu", DYN2](rl_DCVEL)
-        var dcdofdot_v = iscratch.dcdofdot.lt_dyn["cpu", DYN2](rl_DCDOF)
-        var dcacc_v = iscratch.dcacc.lt_dyn["cpu", DYN2](rl_DCVEL)
-        var dcfrcbody_v = iscratch.dcfrcbody.lt_dyn["cpu", DYN2](rl_DCVEL)
-        var qderiv_v = iscratch.qderiv.lt_dyn["cpu", DYN2](rl_QD)
+        var bodies_v = m.bodies.tt_dyn["cpu", DYN2](rl_BODY)
+        var joints_v = m.joints.tt_dyn["cpu", DYN2](rl_JOINT)
+        var xipos_v = d.xipos.tt_dyn["cpu", DYN2](rl_B3)
+        var xquat_v = d.xquat.tt_dyn["cpu", DYN2](rl_B4)
+        var qvel_v = d.qvel.tt_dyn["cpu", DYN2](rl_NV)
+        var cdof_v = scratch.cdof.tt_dyn["cpu", DYN2](rl_NV6)
+        var cinert_v = iscratch.cinert.tt_dyn["cpu", DYN2](rl_B10)
+        var cdof_sc_v = iscratch.cdof_sc.tt_dyn["cpu", DYN2](rl_NV6)
+        var cvel_sc_v = iscratch.cvel_sc.tt_dyn["cpu", DYN2](rl_B6)
+        var cdof_dot_v = iscratch.cdof_dot.tt_dyn["cpu", DYN2](rl_NV6)
+        var dcvel_v = iscratch.dcvel.tt_dyn["cpu", DYN2](rl_DCVEL)
+        var dcdofdot_v = iscratch.dcdofdot.tt_dyn["cpu", DYN2](rl_DCDOF)
+        var dcacc_v = iscratch.dcacc.tt_dyn["cpu", DYN2](rl_DCVEL)
+        var dcfrcbody_v = iscratch.dcfrcbody.tt_dyn["cpu", DYN2](rl_DCVEL)
+        var qderiv_v = iscratch.qderiv.tt_dyn["cpu", DYN2](rl_QD)
         for e in range(BATCH):
             _rne_vel_derivative_env[DTYPE](
                 e, njoint, dm, bodies_v, joints_v, xipos_v, xquat_v, qvel_v,
@@ -906,21 +875,21 @@ def compute_rne_vel_derivative[
             ]
         ](
             Int64(njoint),
-            m.bodies.lt["gpu", L_BODY](),
-            m.joints.lt["gpu", L_JOINT](),
-            d.xipos.lt["gpu", L_B3](),
-            d.xquat.lt["gpu", L_B4](),
-            d.qvel.lt["gpu", L_NV](),
-            scratch.cdof.lt["gpu", L_NV6](),
-            iscratch.cinert.lt["gpu", L_B10](),
-            iscratch.cdof_sc.lt["gpu", L_NV6](),
-            iscratch.cvel_sc.lt["gpu", L_B6](),
-            iscratch.cdof_dot.lt["gpu", L_NV6](),
-            iscratch.dcvel.lt["gpu", L_DCVEL](),
-            iscratch.dcdofdot.lt["gpu", L_DCDOF](),
-            iscratch.dcacc.lt["gpu", L_DCVEL](),
-            iscratch.dcfrcbody.lt["gpu", L_DCVEL](),
-            iscratch.qderiv.lt["gpu", L_QD](),
+            m.bodies.tt["gpu", D.NBODY, MODEL_BODY_SIZE](),
+            m.joints.tt["gpu", D.NJOINT, MODEL_JOINT_SIZE](),
+            d.xipos.tt["gpu", BATCH, D.NBODY * 3](),
+            d.xquat.tt["gpu", BATCH, D.NBODY * 4](),
+            d.qvel.tt["gpu", BATCH, D.NV](),
+            scratch.cdof.tt["gpu", BATCH, D.NV * 6](),
+            iscratch.cinert.tt["gpu", BATCH, D.NBODY * 10](),
+            iscratch.cdof_sc.tt["gpu", BATCH, D.NV * 6](),
+            iscratch.cvel_sc.tt["gpu", BATCH, D.NBODY * 6](),
+            iscratch.cdof_dot.tt["gpu", BATCH, D.NV * 6](),
+            iscratch.dcvel.tt["gpu", BATCH, D.NBODY * 6 * D.NV](),
+            iscratch.dcdofdot.tt["gpu", BATCH, D.NV * 6 * D.NV](),
+            iscratch.dcacc.tt["gpu", BATCH, D.NBODY * 6 * D.NV](),
+            iscratch.dcfrcbody.tt["gpu", BATCH, D.NBODY * 6 * D.NV](),
+            iscratch.qderiv.tt["gpu", BATCH, D.NV * D.NV](),
             grid_dim=(BLOCKS,),
             block_dim=(QD_TPB,),
         )

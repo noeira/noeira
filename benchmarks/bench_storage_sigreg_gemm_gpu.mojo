@@ -27,7 +27,8 @@ Run (Apple):  pixi run -e apple  mojo run -I . benchmarks/bench_storage_sigreg_g
 from max.gpu import global_idx
 from max.gpu.host import DeviceContext
 from std.time import perf_counter_ns
-from layout import Layout, LayoutTensor, TileTensor, row_major
+from layout import TileTensor, row_major
+from noeira.core.tiles import Tile, tile
 from linalg.matmul import matmul as max_matmul
 
 comptime DT = DType.float32
@@ -38,9 +39,9 @@ comptime TPB = 128
 def _sr_project[
     BATCH: Int, T: Int, D: Int, P: Int
 ](
-    input_t: LayoutTensor[DT, Layout.row_major(BATCH, T * D), MutAnyOrigin],
-    a_t: LayoutTensor[DT, Layout.row_major(D, P), MutAnyOrigin],
-    cache_t: LayoutTensor[DT, Layout.row_major(BATCH, T * P), MutAnyOrigin],
+    input_t: Tile[DT, BATCH, T * D],
+    a_t: Tile[DT, D, P],
+    cache_t: Tile[DT, BATCH, T * P],
 ):
     var idx = Int(global_idx.x)
     if idx >= BATCH * T * P:
@@ -59,9 +60,9 @@ def _sr_project[
 def _sr_matmul_a[
     BATCH: Int, T: Int, D: Int, P: Int
 ](
-    dLdz_t: LayoutTensor[DT, Layout.row_major(BATCH, T * P), MutAnyOrigin],
-    a_t: LayoutTensor[DT, Layout.row_major(D, P), MutAnyOrigin],
-    grad_input_t: LayoutTensor[DT, Layout.row_major(BATCH, T * D), MutAnyOrigin],
+    dLdz_t: Tile[DT, BATCH, T * P],
+    a_t: Tile[DT, D, P],
+    grad_input_t: Tile[DT, BATCH, T * D],
 ):
     var idx = Int(global_idx.x)
     if idx >= BATCH * T * D:
@@ -101,9 +102,9 @@ def _time_fwd[
         ctx.synchronize()
         us = Float64(perf_counter_ns() - t0) / Float64(ITERS) / 1000.0
     else:
-        var xl = LayoutTensor[DT, Layout.row_major(B, T * D), MutAnyOrigin](x)
-        var al = LayoutTensor[DT, Layout.row_major(D, P), MutAnyOrigin](a)
-        var zl = LayoutTensor[DT, Layout.row_major(B, T * P), MutAnyOrigin](z)
+        var xl = tile[B, T * D](x)
+        var al = tile[D, P](a)
+        var zl = tile[B, T * P](z)
         comptime nb = (B * T * P + TPB - 1) // TPB
         comptime for _ in range(WARMUP):
             ctx.enqueue_function[_sr_project[B, T, D, P]](
@@ -144,9 +145,9 @@ def _time_bwd[
         ctx.synchronize()
         us = Float64(perf_counter_ns() - t0) / Float64(ITERS) / 1000.0
     else:
-        var dll = LayoutTensor[DT, Layout.row_major(B, T * P), MutAnyOrigin](dl)
-        var al = LayoutTensor[DT, Layout.row_major(D, P), MutAnyOrigin](a)
-        var gil = LayoutTensor[DT, Layout.row_major(B, T * D), MutAnyOrigin](gi)
+        var dll = tile[B, T * P](dl)
+        var al = tile[D, P](a)
+        var gil = tile[B, T * D](gi)
         comptime nb = (B * T * D + TPB - 1) // TPB
         comptime for _ in range(WARMUP):
             ctx.enqueue_function[_sr_matmul_a[B, T, D, P]](

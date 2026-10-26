@@ -32,7 +32,6 @@ Run with:
 from std.math import abs, min, max
 from std.testing import assert_true, TestSuite
 
-from layout import Layout, LayoutTensor
 
 from noeira.math3d import Vec3 as Vec3Generic
 from noeira.envs.dm_control.quadruped import DMQuadrupedEscape
@@ -125,20 +124,20 @@ def test_the_drawn_nodes_are_where_the_rays_land() raises:
             var pz = hfield_node_z(grid, adr, ncol, r, c, sz)
 
             var hit = ray_model[DT](
-                env.mf.geoms.lt_dyn["cpu", DYN2](rl2(ng, MODEL_GEOM_SIZE)),
+                env.mf.geoms.tt_dyn["cpu", DYN2](rl2(ng, MODEL_GEOM_SIZE)),
                 ng,
-                env.mf.bodies.lt_dyn["cpu", DYN2](rl2(nb, MODEL_BODY_SIZE)),
-                env.d.xpos.lt_dyn["cpu", DYN2](rl2(1, nb * 3)),
-                env.d.xquat.lt_dyn["cpu", DYN2](rl2(1, nb * 4)),
+                env.mf.bodies.tt_dyn["cpu", DYN2](rl2(nb, MODEL_BODY_SIZE)),
+                env.d.xpos.tt_dyn["cpu", DYN2](rl2(1, nb * 3)),
+                env.d.xquat.tt_dyn["cpu", DYN2](rl2(1, nb * 4)),
                 0,
-                env.mf.mesh_meta.lt_dyn["cpu", DYN1](
+                env.mf.mesh_meta.tt_dyn["cpu", DYN1](
                     rl1(MAX_GPU_MESHES * MODEL_MESH_META_SIZE)
                 ),
-                env.mf.mesh_tris.lt_dyn["cpu", DYN1](rl1(nmt)),
-                env.mf.hfield_meta.lt_dyn["cpu", DYN1](
+                env.mf.mesh_tris.tt_dyn["cpu", DYN1](rl1(nmt)),
+                env.mf.hfield_meta.tt_dyn["cpu", DYN1](
                     rl1(MAX_GPU_HFIELDS * MODEL_HFIELD_META_SIZE)
                 ),
-                env.d.hfield_data.lt_dyn["cpu", DYN1](rl1(hfn)),
+                env.d.hfield_data.tt_dyn["cpu", DYN1](rl1(hfn)),
                 hfn,
                 Vec3Generic[DT](px, py, DROP_FROM),
                 Vec3Generic[DT](0.0, 0.0, -1.0),

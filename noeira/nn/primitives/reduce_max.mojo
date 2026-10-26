@@ -17,7 +17,8 @@ Backward: `grad_input[b, a] = 0` for all (b, a)
 
 from max.gpu import global_idx
 from max.gpu.host import DeviceContext
-from layout import Layout, LayoutTensor, TileTensor, row_major
+from layout import TileTensor, row_major
+from noeira.core.tiles import Tile
 
 from noeira.nn.constants import DT, TPB
 from ..core.tensor import Tensor
@@ -32,8 +33,8 @@ from ..core.amp import AMPPolicy, NoAMP
 def _reduce_max_forward_kernel[
     BATCH: Int, NA: Int,
 ](
-    input: LayoutTensor[DT, Layout.row_major(BATCH, NA), MutAnyOrigin],
-    output: LayoutTensor[DT, Layout.row_major(BATCH, 1), MutAnyOrigin],
+    input: Tile[DT, BATCH, NA],
+    output: Tile[DT, BATCH, 1],
 ):
     var b = Int(global_idx.x)
     if b < BATCH:
@@ -48,7 +49,7 @@ def _reduce_max_forward_kernel[
 def _reduce_max_zero_grad_kernel[
     BATCH: Int, NA: Int,
 ](
-    grad_input: LayoutTensor[DT, Layout.row_major(BATCH, NA), MutAnyOrigin],
+    grad_input: Tile[DT, BATCH, NA],
 ):
     var idx = Int(global_idx.x)
     var total = BATCH * NA
@@ -100,8 +101,8 @@ struct ReduceMax[NA_: Int](Module):
             out.ensure_gpu(c, B)
             comptime n_blocks = (B + TPB - 1) // TPB
             c.enqueue_function[_reduce_max_forward_kernel[B, Self.NA_]](
-                in0.lt["gpu", Layout.row_major(B, Self.NA_)](),
-                out.lt["gpu", Layout.row_major(B, 1)](),
+                in0.tt["gpu", B, Self.NA_](),
+                out.tt["gpu", B, 1](),
                 grid_dim=n_blocks,
                 block_dim=TPB,
             )
@@ -133,7 +134,7 @@ struct ReduceMax[NA_: Int](Module):
             comptime total = B * Self.NA_
             comptime n_blocks = (total + TPB - 1) // TPB
             c.enqueue_function[_reduce_max_zero_grad_kernel[B, Self.NA_]](
-                gin.lt["gpu", Layout.row_major(B, Self.NA_)](),
+                gin.tt["gpu", B, Self.NA_](),
                 grid_dim=n_blocks,
                 block_dim=TPB,
             )

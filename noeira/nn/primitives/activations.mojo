@@ -31,6 +31,7 @@ comptime GELUTanh[DIM: Int, ADT: DType = DT] = Elementwise[DIM, GELUTanhOp, ADT]
 """GELU, the TANH approximation = `jax.nn.gelu` (default), torch's
 `GELU(approximate="tanh")`, HF's `"gelu_pytorch_tanh"` / `"gelu_new"`
 (DreamerV3, SigLIP, GPT-2). Up to 4.4e-4 from `GELU`: pick by the reference.
+
 (Renamed 2026-10-02: `GELU` was this tanh form before, and the LeWM port took
 it for torch's.)"""
 comptime Mish[DIM: Int, ADT: DType = DT] = Elementwise[DIM, MishOp, ADT]

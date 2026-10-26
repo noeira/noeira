@@ -29,7 +29,7 @@ Run:
 
 from std.memory import alloc
 from std.math import sin
-from layout import Layout, LayoutTensor
+from noeira.core.tiles import tile
 
 from noeira.experimental.pcn.pc_initializer import PCXavier
 from noeira.experimental.pcn.pc_conv_block import ConvPCBlock
@@ -160,21 +160,13 @@ def run_parity[
     var gi_buf = alloc[Scalar[dtype]](BATCH * IN).as_unsafe_any_origin()
     var gp_buf = alloc[Scalar[dtype]](PSZ).as_unsafe_any_origin()
 
-    var x = LayoutTensor[dtype, Layout.row_major(BATCH, IN), MutAnyOrigin](x_buf)
-    var a = LayoutTensor[dtype, Layout.row_major(BATCH, IN), MutAnyOrigin](a_buf)
-    var mu = LayoutTensor[dtype, Layout.row_major(BATCH, OUT), MutAnyOrigin](
-        mu_buf
-    )
-    var eps = LayoutTensor[dtype, Layout.row_major(BATCH, OUT), MutAnyOrigin](
-        eps_buf
-    )
-    var params = LayoutTensor[dtype, Layout.row_major(PSZ), MutAnyOrigin](
-        params_buf
-    )
-    var z = LayoutTensor[dtype, Layout.row_major(BATCH, IN), MutAnyOrigin](z_buf)
-    var grads = LayoutTensor[dtype, Layout.row_major(PSZ), MutAnyOrigin](
-        grads_buf
-    )
+    var x = tile[BATCH, IN](x_buf)
+    var a = tile[BATCH, IN](a_buf)
+    var mu = tile[BATCH, OUT](mu_buf)
+    var eps = tile[BATCH, OUT](eps_buf)
+    var params = tile[PSZ](params_buf)
+    var z = tile[BATCH, IN](z_buf)
+    var grads = tile[PSZ](grads_buf)
 
     # ── Deterministic inputs (varied sign so ReLU is exercised) ───────────────
     for i in range(BATCH * IN):

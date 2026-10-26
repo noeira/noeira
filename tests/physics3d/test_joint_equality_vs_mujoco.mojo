@@ -34,7 +34,7 @@ from std.math import abs
 from std.python import Python
 from std.testing import assert_true, TestSuite
 from max.gpu.host import DeviceContext
-from layout import Layout
+from noeira.core.tiles import RowMajor
 
 from noeira.physics3d.parser import parse_xml, ModelDefFromXML
 from noeira.physics3d.parser.xml_parser import merge_mjcf
@@ -292,35 +292,35 @@ def _check_rows[M: ModelDefFromXML](
     var w_J = Scratch[Scalar[DTYPE], WJ](6 * M.MAX_EQUALITY * M.NV, Scalar[DTYPE](0))
     var w_MinvJ = Scratch[Scalar[DTYPE], WJ](6 * M.MAX_EQUALITY * M.NV, Scalar[DTYPE](0))
 
-    comptime L_B3 = Layout.row_major(1, M.NBODY * 3)
-    comptime L_B4 = Layout.row_major(1, M.NBODY * 4)
-    comptime L_NV = Layout.row_major(1, M.NV)
-    comptime L_NQ = Layout.row_major(1, M.NQ)
-    comptime L_DW = Layout.row_major(M.NV)
-    comptime L_JT = Layout.row_major(M.NJOINT, MODEL_JOINT_SIZE)
-    comptime L_BD = Layout.row_major(M.NBODY, MODEL_BODY_SIZE)
-    comptime L_MT = Layout.row_major(MODEL_META_SIZE)
-    comptime L_EQ = Layout.row_major(M.MAX_EQUALITY, MODEL_EQ_SIZE)
-    comptime L_IW = Layout.row_major(M.NBODY, 2)
-    comptime L_CD = Layout.row_major(1, M.NV * 6)
-    comptime L_MI = Layout.row_major(1, M.NV * M.NV)
+    comptime L_B3 = RowMajor[1, M.NBODY * 3]
+    comptime L_B4 = RowMajor[1, M.NBODY * 4]
+    comptime L_NV = RowMajor[1, M.NV]
+    comptime L_NQ = RowMajor[1, M.NQ]
+    comptime L_DW = RowMajor[M.NV]
+    comptime L_JT = RowMajor[M.NJOINT, MODEL_JOINT_SIZE]
+    comptime L_BD = RowMajor[M.NBODY, MODEL_BODY_SIZE]
+    comptime L_MT = RowMajor[MODEL_META_SIZE]
+    comptime L_EQ = RowMajor[M.MAX_EQUALITY, MODEL_EQ_SIZE]
+    comptime L_IW = RowMajor[M.NBODY, 2]
+    comptime L_CD = RowMajor[1, M.NV * 6]
+    comptime L_MI = RowMajor[1, M.NV * M.NV]
 
     var n = build_weld_equality_rows[DTYPE, M.NV](
         0,
         AsStatic[MD](),
-        d.qpos.lt["cpu", L_NQ](),
-        d.qvel.lt["cpu", L_NV](),
-        d.xpos.lt["cpu", L_B3](),
-        d.xquat.lt["cpu", L_B4](),
-        d.subtree_com.lt["cpu", L_B3](),
-        mf.joints.lt["cpu", L_JT](),
-        mf.bodies.lt["cpu", L_BD](),
-        mf.meta.lt["cpu", L_MT](),
-        mf.equality.lt["cpu", L_EQ](),
-        mf.body_invweight0.lt["cpu", L_IW](),
-        mf.dof_invweight0.lt["cpu", L_DW](),
-        sc.cdof.lt["cpu", L_CD](),
-        sc.m_inv.lt["cpu", L_MI](),
+        d.qpos.tt["cpu", 1, M.NQ](),
+        d.qvel.tt["cpu", 1, M.NV](),
+        d.xpos.tt["cpu", 1, M.NBODY * 3](),
+        d.xquat.tt["cpu", 1, M.NBODY * 4](),
+        d.subtree_com.tt["cpu", 1, M.NBODY * 3](),
+        mf.joints.tt["cpu", M.NJOINT, MODEL_JOINT_SIZE](),
+        mf.bodies.tt["cpu", M.NBODY, MODEL_BODY_SIZE](),
+        mf.meta.tt["cpu", MODEL_META_SIZE](),
+        mf.equality.tt["cpu", M.MAX_EQUALITY, MODEL_EQ_SIZE](),
+        mf.body_invweight0.tt["cpu", M.NBODY, 2](),
+        mf.dof_invweight0.tt["cpu", M.NV](),
+        sc.cdof.tt["cpu", 1, M.NV * 6](),
+        sc.m_inv.tt["cpu", 1, M.NV * M.NV](),
         w_K, w_bias, w_D, w_J, w_MinvJ,
     )
     assert_true(n == 1, label + ": expected 1 joint row, built " + String(n))

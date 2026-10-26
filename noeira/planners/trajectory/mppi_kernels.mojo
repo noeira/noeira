@@ -41,12 +41,12 @@ Kernels:
     writes it directly to an on-device output buffer.
 """
 
-from layout import LayoutTensor, Layout
 from max.gpu import thread_idx, block_idx, block_dim
 from max.gpu.sync import barrier
 from max.gpu.memory import AddressSpace
 from std.math import exp, log, sqrt, cos, isnan, isinf
 from std.random.philox import Random as PhiloxRandom
+from noeira.core.tiles import Tile, shared_tile
 
 
 # =============================================================================
@@ -62,11 +62,9 @@ def mppi_broadcast_z0_zero_returns_batched_kernel[
     TOTAL_SAMPLES: Int,
     LATENT_DIM: Int,
 ](
-    z0: LayoutTensor[dtype, Layout.row_major(N_ENVS, LATENT_DIM), MutAnyOrigin],
-    z_all: LayoutTensor[
-        dtype, Layout.row_major(BATCH_TOTAL, LATENT_DIM), MutAnyOrigin
-    ],
-    returns: LayoutTensor[dtype, Layout.row_major(BATCH_TOTAL), MutAnyOrigin],
+    z0: Tile[dtype, N_ENVS, LATENT_DIM],
+    z_all: Tile[dtype, BATCH_TOTAL, LATENT_DIM],
+    returns: Tile[dtype, BATCH_TOTAL],
 ) where dtype.is_floating_point():
     """Fused: broadcast per-env ``z0`` to every candidate row + zero
     the returns accumulator. One kernel launch replaces the legacy
@@ -107,23 +105,11 @@ def mppi_sample_actions_batched_kernel[
     HORIZON: Int,
     POL_OUT: Int = ACTION_DIM * 2,
 ](
-    pi_out: LayoutTensor[
-        dtype, Layout.row_major(BATCH_TOTAL, POL_OUT), MutAnyOrigin
-    ],
-    mean: LayoutTensor[
-        dtype, Layout.row_major(N_ENVS * HORIZON * ACTION_DIM), MutAnyOrigin
-    ],
-    std: LayoutTensor[
-        dtype, Layout.row_major(N_ENVS * HORIZON * ACTION_DIM), MutAnyOrigin
-    ],
-    act_step: LayoutTensor[
-        dtype, Layout.row_major(BATCH_TOTAL, ACTION_DIM), MutAnyOrigin
-    ],
-    all_actions: LayoutTensor[
-        dtype,
-        Layout.row_major(BATCH_TOTAL * HORIZON * ACTION_DIM),
-        MutAnyOrigin,
-    ],
+    pi_out: Tile[dtype, BATCH_TOTAL, POL_OUT],
+    mean: Tile[dtype, N_ENVS * HORIZON * ACTION_DIM],
+    std: Tile[dtype, N_ENVS * HORIZON * ACTION_DIM],
+    act_step: Tile[dtype, BATCH_TOTAL, ACTION_DIM],
+    all_actions: Tile[dtype, BATCH_TOTAL * HORIZON * ACTION_DIM],
     # ⚠ Int32, NOT Int: `Int`/`UInt` do not conform to `DevicePassable` since
     # Mojo 1.0.0rc2, so an `Int` here fails to compile AT THE LAUNCH SITE with
     # a constraint error inside `SIMD`. The call site must pass `Int32(t)` too
@@ -192,12 +178,8 @@ def mppi_accum_reward_scalar_kernel[
     dtype: DType,
     TOTAL_SAMPLES: Int,
 ](
-    reward_step: LayoutTensor[
-        dtype, Layout.row_major(TOTAL_SAMPLES), MutAnyOrigin
-    ],
-    returns: LayoutTensor[
-        dtype, Layout.row_major(TOTAL_SAMPLES), MutAnyOrigin
-    ],
+    reward_step: Tile[dtype, TOTAL_SAMPLES],
+    returns: Tile[dtype, TOTAL_SAMPLES],
     discount: Scalar[dtype],
 ) where dtype.is_floating_point():
     """Accumulate pre-decoded per-step rewards into discounted returns.
@@ -219,12 +201,8 @@ def mppi_copy_z_kernel[
     TOTAL_SAMPLES: Int,
     LATENT_DIM: Int,
 ](
-    dst: LayoutTensor[
-        dtype, Layout.row_major(TOTAL_SAMPLES, LATENT_DIM), MutAnyOrigin
-    ],
-    src: LayoutTensor[
-        dtype, Layout.row_major(TOTAL_SAMPLES, LATENT_DIM), MutAnyOrigin
-    ],
+    dst: Tile[dtype, TOTAL_SAMPLES, LATENT_DIM],
+    src: Tile[dtype, TOTAL_SAMPLES, LATENT_DIM],
 ) where dtype.is_floating_point():
     """Copy latent states: ``dst[i] = src[i]``.
 
@@ -260,8 +238,8 @@ def mppi_add_terminal_value_kernel[
     dtype: DType,
     TOTAL_SAMPLES: Int,
 ](
-    q_min: LayoutTensor[dtype, Layout.row_major(TOTAL_SAMPLES), MutAnyOrigin],
-    returns: LayoutTensor[dtype, Layout.row_major(TOTAL_SAMPLES), MutAnyOrigin],
+    q_min: Tile[dtype, TOTAL_SAMPLES],
+    returns: Tile[dtype, TOTAL_SAMPLES],
     discount: Scalar[dtype],
 ) where dtype.is_floating_point():
     """Add discounted terminal bootstrap value to returns, with NaN/
@@ -296,12 +274,8 @@ def mppi_softmax_weights_kernel[
     NUM_ELITES: Int,
     BLOCK_SIZE: Int,
 ](
-    returns: LayoutTensor[
-        dtype, Layout.row_major(N_ENVS * TOTAL_SAMPLES), MutAnyOrigin
-    ],
-    weights: LayoutTensor[
-        dtype, Layout.row_major(N_ENVS * TOTAL_SAMPLES), MutAnyOrigin
-    ],
+    returns: Tile[dtype, N_ENVS * TOTAL_SAMPLES],
+    weights: Tile[dtype, N_ENVS * TOTAL_SAMPLES],
     temperature: Scalar[dtype],
 ) where dtype.is_floating_point():
     """Per-env top-K elite softmax over returns → normalized weights.
@@ -330,12 +304,7 @@ def mppi_softmax_weights_kernel[
     var tid = Int(thread_idx.x)
     var base = env_idx * TOTAL_SAMPLES
 
-    var smem = LayoutTensor[
-        dtype,
-        Layout.row_major(BLOCK_SIZE),
-        MutAnyOrigin,
-        address_space=AddressSpace.SHARED,
-    ].stack_allocation()
+    var smem = shared_tile[dtype, BLOCK_SIZE]()
 
     # Pass 1: find max return.
     var local_max = Scalar[dtype](-1e30)
@@ -363,7 +332,7 @@ def mppi_softmax_weights_kernel[
     barrier()
 
     # Pass 2: per-sample rank + masked exp weight + local sum.
-    var local_sum: smem.element_type = 0.0
+    var local_sum: smem.ElementType = 0.0
     s = tid
     while s < TOTAL_SAMPLES:
         var v_s = Scalar[dtype](returns[base + s][0])
@@ -416,20 +385,10 @@ def mppi_weighted_mean_std_kernel[
     ACTION_DIM: Int,
     BLOCK_SIZE: Int,
 ](
-    weights: LayoutTensor[
-        dtype, Layout.row_major(N_ENVS * TOTAL_SAMPLES), MutAnyOrigin
-    ],
-    all_actions: LayoutTensor[
-        dtype,
-        Layout.row_major(N_ENVS * TOTAL_SAMPLES * HORIZON * ACTION_DIM),
-        MutAnyOrigin,
-    ],
-    mean_out: LayoutTensor[
-        dtype, Layout.row_major(N_ENVS * HORIZON * ACTION_DIM), MutAnyOrigin
-    ],
-    std_out: LayoutTensor[
-        dtype, Layout.row_major(N_ENVS * HORIZON * ACTION_DIM), MutAnyOrigin
-    ],
+    weights: Tile[dtype, N_ENVS * TOTAL_SAMPLES],
+    all_actions: Tile[dtype, N_ENVS * TOTAL_SAMPLES * HORIZON * ACTION_DIM],
+    mean_out: Tile[dtype, N_ENVS * HORIZON * ACTION_DIM],
+    std_out: Tile[dtype, N_ENVS * HORIZON * ACTION_DIM],
 ) where dtype.is_floating_point():
     """Refit ``(mean, std)`` per env using elite-weighted actions.
 
@@ -476,12 +435,7 @@ def mppi_weighted_mean_std_kernel[
     )
     comptime ASTRIDE = HORIZON * ACTION_DIM
 
-    var smem = LayoutTensor[
-        dtype,
-        Layout.row_major(BLOCK_SIZE),
-        MutAnyOrigin,
-        address_space=AddressSpace.SHARED,
-    ].stack_allocation()
+    var smem = shared_tile[dtype, BLOCK_SIZE]()
 
     # ── pass 1: weighted mean ────────────────────────────────────────
     var acc = Scalar[dtype](0.0)
@@ -548,20 +502,10 @@ def mppi_select_action_kernel[
     HORIZON: Int,
     BLOCK_SIZE: Int,
 ](
-    weights: LayoutTensor[
-        dtype, Layout.row_major(N_ENVS * TOTAL_SAMPLES), MutAnyOrigin
-    ],
-    all_actions: LayoutTensor[
-        dtype,
-        Layout.row_major(N_ENVS * TOTAL_SAMPLES * HORIZON * ACTION_DIM),
-        MutAnyOrigin,
-    ],
-    std: LayoutTensor[
-        dtype, Layout.row_major(N_ENVS * HORIZON * ACTION_DIM), MutAnyOrigin
-    ],
-    out_action: LayoutTensor[
-        dtype, Layout.row_major(N_ENVS * ACTION_DIM), MutAnyOrigin
-    ],
+    weights: Tile[dtype, N_ENVS * TOTAL_SAMPLES],
+    all_actions: Tile[dtype, N_ENVS * TOTAL_SAMPLES * HORIZON * ACTION_DIM],
+    std: Tile[dtype, N_ENVS * HORIZON * ACTION_DIM],
+    out_action: Tile[dtype, N_ENVS * ACTION_DIM],
     rng_seed: Scalar[DType.uint32],
     action_scale: Scalar[dtype],
     deterministic: UInt32,
@@ -585,18 +529,8 @@ def mppi_select_action_kernel[
     var w_off = env_idx * TOTAL_SAMPLES
     var act_off = env_idx * TOTAL_SAMPLES * HORIZON * ACTION_DIM
 
-    var smem_val = LayoutTensor[
-        dtype,
-        Layout.row_major(BLOCK_SIZE),
-        MutAnyOrigin,
-        address_space=AddressSpace.SHARED,
-    ].stack_allocation()
-    var smem_idx = LayoutTensor[
-        DType.uint32,
-        Layout.row_major(BLOCK_SIZE),
-        MutAnyOrigin,
-        address_space=AddressSpace.SHARED,
-    ].stack_allocation()
+    var smem_val = shared_tile[dtype, BLOCK_SIZE]()
+    var smem_idx = shared_tile[DType.uint32, BLOCK_SIZE]()
 
     # Phase 1: per-thread local argmax of (log(w) + gumbel).
     var local_max = Scalar[dtype](-1e30)

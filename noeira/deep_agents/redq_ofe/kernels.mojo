@@ -17,10 +17,10 @@ Math:
 
 from max.gpu import global_idx
 from max.gpu.host import DeviceContext
-from layout import Layout, LayoutTensor
 
 from noeira.nn.constants import DT, TPB
 from noeira.nn.core.tensor import Tensor
+from noeira.core.tiles import RowMajor, Tile
 
 
 def aux_mse_grad_cpu[
@@ -64,9 +64,9 @@ def aux_mse_loss_cpu[
 def _aux_mse_grad_kernel[
     BATCH: Int, OBS: Int,
 ](
-    pred: LayoutTensor[DT, Layout.row_major(BATCH, OBS), MutAnyOrigin],
-    target: LayoutTensor[DT, Layout.row_major(BATCH, OBS), MutAnyOrigin],
-    grad_pred: LayoutTensor[DT, Layout.row_major(BATCH, OBS), MutAnyOrigin],
+    pred: Tile[DT, BATCH, OBS],
+    target: Tile[DT, BATCH, OBS],
+    grad_pred: Tile[DT, BATCH, OBS],
     scale: Scalar[DT],
 ):
     var idx = Int(global_idx.x)
@@ -91,14 +91,14 @@ def aux_mse_grad_gpu[
     """Device variant of `aux_mse_grad_cpu`. Writes
     `grad_pred[b,d] = 2·(pred[b,d] - target[b,d]) / (BATCH·OBS)`."""
     var scale = Scalar[DT](2.0) / Scalar[DT](BATCH * OBS)
-    comptime lyt = Layout.row_major(BATCH, OBS)
+    comptime lyt = RowMajor[BATCH, OBS]
     comptime total = BATCH * OBS
     comptime n_blocks = (total + TPB - 1) // TPB
     comptime kernel = _aux_mse_grad_kernel[BATCH, OBS]
     ctx.enqueue_function[kernel](
-        pred.lt["gpu", lyt](),
-        target.lt["gpu", lyt](),
-        grad_pred.lt["gpu", lyt](),
+        pred.tt["gpu", BATCH, OBS](),
+        target.tt["gpu", BATCH, OBS](),
+        grad_pred.tt["gpu", BATCH, OBS](),
         scale,
         grid_dim=n_blocks, block_dim=TPB,
     )

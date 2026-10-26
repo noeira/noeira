@@ -32,8 +32,8 @@ by, and MuJoCo's own allocation (`5 + iterations` verts, `6*iterations`
 faces) is far larger.
 """
 
-from std.sys import has_nvidia_gpu_accelerator
-from layout import Layout
+from std.sys import default_accelerator
+from noeira.core.tiles import RowMajor
 
 
 # ---- EPA's polytope caps ---------------------------------------------------
@@ -370,7 +370,7 @@ comptime COLL_CAND_REPORT: Bool = False
 # 28 = 28, 4 = 4). So flipping this True on Metal is now a measurement, not a
 # risk — it has simply not been measured there. The arm script's `nopre` arm
 # sets it False to A/B the old production.
-comptime COLL_PREFILTER: Bool = has_nvidia_gpu_accelerator()
+comptime COLL_PREFILTER: Bool = default_accelerator().is_nvidia_gpu()
 
 # ── The FLAT narrow phase (`broadphase_sap.detect_contacts_sap`), 2026-09-26 ─
 #
@@ -414,7 +414,7 @@ comptime COLL_PREFILTER: Bool = has_nvidia_gpu_accelerator()
 #
 # ⚠ The costs are timed with `perf_counter_ns` (the global timer) on NVIDIA
 # only; elsewhere nothing is ever hot and the path degrades to cold warps.
-comptime COLL_FLAT_NARROW: Bool = has_nvidia_gpu_accelerator()
+comptime COLL_FLAT_NARROW: Bool = default_accelerator().is_nvidia_gpu()
 comptime COLL_FLAT_HOT_NS: Int = 16384
 # hot cost buckets: [1, 2), [2, 4), [4, 8), [8, inf) x COLL_FLAT_HOT_NS
 comptime COLL_FLAT_NB: Int = 4
@@ -451,4 +451,4 @@ comptime COLL_REPORT_WORDS: Int = COLL_REPORT_HDR + COLL_NCAND_CAP
 # The single-row spelling, for host callers that collide one pair at a time
 # (every gate and probe in `tests/physics3d`). The engine binds
 # `[BATCH, CCD_WS_SIZE]` instead and passes the env index as `wrow`.
-comptime L_CCD_WS1 = Layout.row_major(1, CCD_WS_SIZE)
+comptime L_CCD_WS1 = RowMajor[1, CCD_WS_SIZE]

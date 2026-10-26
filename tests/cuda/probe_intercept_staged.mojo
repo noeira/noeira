@@ -52,9 +52,9 @@ READ THE OUTPUT LIKE THIS:
 from std.ffi import OwnedDLHandle, c_int
 from max.gpu import thread_idx
 from max.gpu.host import DeviceContext
-from std.sys import has_nvidia_gpu_accelerator
+from std.sys import default_accelerator
 from std.memory import alloc
-from layout import Layout, LayoutTensor
+from noeira.core.tiles import Tile, tile
 
 from noeira.nn.constants import DT
 
@@ -62,20 +62,20 @@ comptime _CUptr = Pointer[NoneType, MutUntrackedOrigin]
 
 
 def main() raises:
-    comptime if not has_nvidia_gpu_accelerator():
+    comptime if not default_accelerator().is_nvidia_gpu():
         print("non-NVIDIA: the interceptor path does not exist here. Skipped.")
         return
 
     var ctx = DeviceContext()
 
     @always_inline
-    def _bump(buf: LayoutTensor[DT, Layout.row_major(1), MutAnyOrigin]):
+    def _bump(buf: Tile[DT, 1]):
         if Int(thread_idx.x) != 0:
             return
         buf[0] = buf[0] + Scalar[DT](1.0)
 
     var buf = ctx.enqueue_create_buffer[DT](1)
-    var lt = LayoutTensor[DT, Layout.row_major(1)](buf)
+    var lt = tile[1](buf)
 
     # Stream discovery needs a prior launch (see CUDAGraph.__init__).
     print("[probe] warmup launch ...")

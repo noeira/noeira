@@ -32,7 +32,8 @@ from std.math import exp, sqrt
 from max.gpu import thread_idx, block_idx, block_dim, global_idx, WARP_SIZE
 from max.gpu.primitives import warp
 from max.gpu.host import DeviceContext
-from layout import Layout, LayoutTensor, TileTensor, row_major
+from layout import TileTensor, row_major
+from noeira.core.tiles import RowMajor, Tile
 from linalg.bmm import batched_matmul
 
 from noeira.nn.constants import DT, TPB
@@ -63,9 +64,9 @@ def _attn_fwd_kernel[
     CAUSAL: Bool, IN_DIM: Int, OUT_DIM: Int, CACHE_SIZE: Int,
     K_OFF: Int, V_OFF: Int, ATTN_OFF: Int, ADT: DType = DT,
 ](
-    output: LayoutTensor[ADT, Layout.row_major(BATCH, OUT_DIM), MutAnyOrigin],
-    input: LayoutTensor[ADT, Layout.row_major(BATCH, IN_DIM), MutAnyOrigin],
-    cache: LayoutTensor[DT, Layout.row_major(BATCH, CACHE_SIZE), MutAnyOrigin],
+    output: Tile[ADT, BATCH, OUT_DIM],
+    input: Tile[ADT, BATCH, IN_DIM],
+    cache: Tile[DT, BATCH, CACHE_SIZE],
 ):
     var blk = Int(block_idx.x)
     var b = blk // N_HEADS
@@ -147,7 +148,7 @@ def _attn_fwd_kernel[
 def _attn_zero_grad_kernel[
     BATCH: Int, IN_DIM: Int, ADT: DType = DT
 ](
-    grad_input: LayoutTensor[ADT, Layout.row_major(BATCH, IN_DIM), MutAnyOrigin],
+    grad_input: Tile[ADT, BATCH, IN_DIM],
 ):
     var idx = Int(global_idx.x)
     if idx < BATCH * IN_DIM:
@@ -159,11 +160,9 @@ def _attn_dV_kernel[
     CAUSAL: Bool, IN_DIM: Int, OUT_DIM: Int, CACHE_SIZE: Int,
     V_OFF: Int, ATTN_OFF: Int, ADT: DType = DT,
 ](
-    grad_input: LayoutTensor[ADT, Layout.row_major(BATCH, IN_DIM), MutAnyOrigin],
-    grad_output: LayoutTensor[
-        ADT, Layout.row_major(BATCH, OUT_DIM), MutAnyOrigin
-    ],
-    cache: LayoutTensor[DT, Layout.row_major(BATCH, CACHE_SIZE), MutAnyOrigin],
+    grad_input: Tile[ADT, BATCH, IN_DIM],
+    grad_output: Tile[ADT, BATCH, OUT_DIM],
+    cache: Tile[DT, BATCH, CACHE_SIZE],
 ):
     # dV[j, h_off+d] = Σ_i attn[i,j] * grad_out[i, h_off+d]. Causal: i ≥ j.
     var blk = Int(block_idx.x)
@@ -201,11 +200,9 @@ def _attn_dscore_dQ_kernel[
     CAUSAL: Bool, IN_DIM: Int, OUT_DIM: Int, CACHE_SIZE: Int,
     K_OFF: Int, V_OFF: Int, ATTN_OFF: Int, ADT: DType = DT,
 ](
-    grad_input: LayoutTensor[ADT, Layout.row_major(BATCH, IN_DIM), MutAnyOrigin],
-    grad_output: LayoutTensor[
-        ADT, Layout.row_major(BATCH, OUT_DIM), MutAnyOrigin
-    ],
-    cache: LayoutTensor[DT, Layout.row_major(BATCH, CACHE_SIZE), MutAnyOrigin],
+    grad_input: Tile[ADT, BATCH, IN_DIM],
+    grad_output: Tile[ADT, BATCH, OUT_DIM],
+    cache: Tile[DT, BATCH, CACHE_SIZE],
 ):
     # Per row i: dot_sum, then d_score (overwrites cache.attn), then dQ.
     var blk = Int(block_idx.x)
@@ -275,8 +272,8 @@ def _attn_dK_kernel[
     CAUSAL: Bool, IN_DIM: Int, CACHE_SIZE: Int, K_OFF: Int, ATTN_OFF: Int,
     ADT: DType = DT,
 ](
-    grad_input: LayoutTensor[ADT, Layout.row_major(BATCH, IN_DIM), MutAnyOrigin],
-    cache: LayoutTensor[DT, Layout.row_major(BATCH, CACHE_SIZE), MutAnyOrigin],
+    grad_input: Tile[ADT, BATCH, IN_DIM],
+    cache: Tile[DT, BATCH, CACHE_SIZE],
 ):
     # dK[j, h_off+d] = Σ_i d_score[i,j] * Q[i, h_off+d]. Reads d_score from
     # cache.attn (dscore_dQ kernel overwrote it). Causal: i ≥ j.
@@ -323,11 +320,11 @@ def _attn_pack_qkv_fwd_kernel[
     BATCH: Int, DIM: Int, N_HEADS: Int, SEQ: Int, HEAD_DIM: Int,
     IN_DIM: Int, CACHE_SIZE: Int, PACKED: Int, ADT: DType = DT,
 ](
-    packed_q: LayoutTensor[DT, Layout.row_major(PACKED), MutAnyOrigin],
-    packed_k: LayoutTensor[DT, Layout.row_major(PACKED), MutAnyOrigin],
-    packed_v: LayoutTensor[DT, Layout.row_major(PACKED), MutAnyOrigin],
-    cache: LayoutTensor[DT, Layout.row_major(BATCH, CACHE_SIZE), MutAnyOrigin],
-    input: LayoutTensor[ADT, Layout.row_major(BATCH, IN_DIM), MutAnyOrigin],
+    packed_q: Tile[DT, PACKED],
+    packed_k: Tile[DT, PACKED],
+    packed_v: Tile[DT, PACKED],
+    cache: Tile[DT, BATCH, CACHE_SIZE],
+    input: Tile[ADT, BATCH, IN_DIM],
 ):
     var idx = Int(block_dim.x * block_idx.x + thread_idx.x)
     comptime pack_elems = BATCH * SEQ * DIM
@@ -371,8 +368,8 @@ def _attn_softmax_warp_kernel[
     BATCH: Int, N_HEADS: Int, SEQ: Int, HEAD_DIM: Int, CAUSAL: Bool,
     CACHE_SIZE: Int, SCORES: Int, BH: Int,
 ](
-    scores: LayoutTensor[DT, Layout.row_major(SCORES), MutAnyOrigin],
-    cache: LayoutTensor[DT, Layout.row_major(BATCH, CACHE_SIZE), MutAnyOrigin],
+    scores: Tile[DT, SCORES],
+    cache: Tile[DT, BATCH, CACHE_SIZE],
 ):
     """The stable softmax of the per-(b,h)-block kernel it replaced (scale, max, causal zeros,
     weights mirrored into cache.attn) with one WARP per (b, h, i) row, lanes
@@ -423,9 +420,9 @@ def _attn_softmax_jvp_warp_kernel[
     BATCH: Int, N_HEADS: Int, SEQ: Int, HEAD_DIM: Int,
     CACHE_SIZE: Int, SCORES: Int, BH: Int,
 ](
-    dscore: LayoutTensor[DT, Layout.row_major(SCORES), MutAnyOrigin],
-    dattn: LayoutTensor[DT, Layout.row_major(SCORES), MutAnyOrigin],
-    cache: LayoutTensor[DT, Layout.row_major(BATCH, CACHE_SIZE), MutAnyOrigin],
+    dscore: Tile[DT, SCORES],
+    dattn: Tile[DT, SCORES],
+    cache: Tile[DT, BATCH, CACHE_SIZE],
 ):
     """`_attn_softmax_jvp_kernel` (dscore = scale·a·(dattn − Σ a·dattn)), one
     WARP per row; the dot is a warp reduction. Same launch as the softmax."""
@@ -459,7 +456,7 @@ def _attn_softmax_jvp_warp_kernel[
 
 
 def _attn_drop_kernel[SEQ: Int, SCORES: Int, TRANSPOSED: Bool](
-    buf: LayoutTensor[DT, Layout.row_major(SCORES), MutAnyOrigin],
+    buf: Tile[DT, SCORES],
     seed: UInt64,
     ctr: UInt64,
     p: Float32,
@@ -485,8 +482,8 @@ def _attn_drop_kernel[SEQ: Int, SCORES: Int, TRANSPOSED: Bool](
 
 
 def _attn_packed_t_kernel[BH: Int, SEQ: Int, HEAD_DIM: Int, PACKED: Int](
-    dst: LayoutTensor[DT, Layout.row_major(PACKED), MutAnyOrigin],
-    src: LayoutTensor[DT, Layout.row_major(PACKED), MutAnyOrigin],
+    dst: Tile[DT, PACKED],
+    src: Tile[DT, PACKED],
 ):
     """`dst[bh, d, t] = src[bh, t, d]`: a packed head (BH, SEQ, HEAD_DIM) to
     the (BH, HEAD_DIM, SEQ) operand `bmm_tiled` takes for a ·ᵀ product. One
@@ -507,8 +504,8 @@ def _attn_unpack_out_kernel[
     BATCH: Int, DIM: Int, N_HEADS: Int, SEQ: Int, HEAD_DIM: Int,
     OUT_DIM: Int, PACKED: Int, ADT: DType = DT,
 ](
-    output: LayoutTensor[ADT, Layout.row_major(BATCH, OUT_DIM), MutAnyOrigin],
-    packed_out: LayoutTensor[DT, Layout.row_major(PACKED), MutAnyOrigin],
+    output: Tile[ADT, BATCH, OUT_DIM],
+    packed_out: Tile[DT, PACKED],
 ):
     var idx = Int(block_dim.x * block_idx.x + thread_idx.x)
     comptime n = BATCH * SEQ * DIM
@@ -531,12 +528,12 @@ def _attn_pack_in_bwd_kernel[
     BATCH: Int, DIM: Int, N_HEADS: Int, SEQ: Int, HEAD_DIM: Int,
     IN_DIM: Int, OUT_DIM: Int, CACHE_SIZE: Int, PACKED: Int, ADT: DType = DT,
 ](
-    packed_dout: LayoutTensor[DT, Layout.row_major(PACKED), MutAnyOrigin],
-    packed_q: LayoutTensor[DT, Layout.row_major(PACKED), MutAnyOrigin],
-    packed_k: LayoutTensor[DT, Layout.row_major(PACKED), MutAnyOrigin],
-    packed_v: LayoutTensor[DT, Layout.row_major(PACKED), MutAnyOrigin],
-    grad_output: LayoutTensor[ADT, Layout.row_major(BATCH, OUT_DIM), MutAnyOrigin],
-    cache: LayoutTensor[DT, Layout.row_major(BATCH, CACHE_SIZE), MutAnyOrigin],
+    packed_dout: Tile[DT, PACKED],
+    packed_q: Tile[DT, PACKED],
+    packed_k: Tile[DT, PACKED],
+    packed_v: Tile[DT, PACKED],
+    grad_output: Tile[ADT, BATCH, OUT_DIM],
+    cache: Tile[DT, BATCH, CACHE_SIZE],
 ):
     var idx = Int(block_dim.x * block_idx.x + thread_idx.x)
     comptime n = BATCH * SEQ * DIM
@@ -569,9 +566,9 @@ def _attn_softmax_jvp_kernel[
     BATCH: Int, N_HEADS: Int, SEQ: Int, HEAD_DIM: Int,
     CACHE_SIZE: Int, SCORES: Int, BH: Int,
 ](
-    dscore: LayoutTensor[DT, Layout.row_major(SCORES), MutAnyOrigin],
-    dattn: LayoutTensor[DT, Layout.row_major(SCORES), MutAnyOrigin],
-    cache: LayoutTensor[DT, Layout.row_major(BATCH, CACHE_SIZE), MutAnyOrigin],
+    dscore: Tile[DT, SCORES],
+    dattn: Tile[DT, SCORES],
+    cache: Tile[DT, BATCH, CACHE_SIZE],
 ):
     # dscore = scale * a * (dattn - sum_k a_k*dattn_k). Causal masking is
     # implicit: cache.attn[i,j>i]=0 → dscore[i,j>i]=0.
@@ -606,8 +603,8 @@ def _attn_transpose_from_cache_kernel[
     BATCH: Int, N_HEADS: Int, SEQ: Int, HEAD_DIM: Int,
     CACHE_SIZE: Int, SCORES: Int, BH: Int,
 ](
-    attn_T: LayoutTensor[DT, Layout.row_major(SCORES), MutAnyOrigin],
-    cache: LayoutTensor[DT, Layout.row_major(BATCH, CACHE_SIZE), MutAnyOrigin],
+    attn_T: Tile[DT, SCORES],
+    cache: Tile[DT, BATCH, CACHE_SIZE],
 ):
     var idx = Int(block_dim.x * block_idx.x + thread_idx.x)
     comptime n = BH * SEQ * SEQ
@@ -629,8 +626,8 @@ def _attn_transpose_from_cache_kernel[
 def _attn_transpose_scores_kernel[
     SEQ: Int, SCORES: Int, BH: Int,
 ](
-    dst: LayoutTensor[DT, Layout.row_major(SCORES), MutAnyOrigin],
-    src: LayoutTensor[DT, Layout.row_major(SCORES), MutAnyOrigin],
+    dst: Tile[DT, SCORES],
+    src: Tile[DT, SCORES],
 ):
     var idx = Int(block_dim.x * block_idx.x + thread_idx.x)
     comptime n = BH * SEQ * SEQ
@@ -649,10 +646,10 @@ def _attn_unpack_grad_kernel[
     BATCH: Int, DIM: Int, N_HEADS: Int, SEQ: Int, HEAD_DIM: Int,
     IN_DIM: Int, PACKED: Int, ADT: DType = DT,
 ](
-    grad_input: LayoutTensor[ADT, Layout.row_major(BATCH, IN_DIM), MutAnyOrigin],
-    dQ: LayoutTensor[DT, Layout.row_major(PACKED), MutAnyOrigin],
-    dK: LayoutTensor[DT, Layout.row_major(PACKED), MutAnyOrigin],
-    dV: LayoutTensor[DT, Layout.row_major(PACKED), MutAnyOrigin],
+    grad_input: Tile[ADT, BATCH, IN_DIM],
+    dQ: Tile[DT, PACKED],
+    dK: Tile[DT, PACKED],
+    dV: Tile[DT, PACKED],
 ):
     var idx = Int(block_dim.x * block_idx.x + thread_idx.x)
     comptime n = BATCH * SEQ * DIM
@@ -796,7 +793,7 @@ struct ScaledDotProductAttention[
     ) raises:
         comptime SCORES = BATCH * Self.N_HEADS * Self.SEQ_LEN * Self.SEQ_LEN
         c.enqueue_function[_attn_drop_kernel[Self.SEQ_LEN, SCORES, TRANSPOSED]](
-            buf.lt["gpu", Layout.row_major(SCORES)](),
+            buf.tt["gpu", SCORES](),
             seed, ctr, Float32(Self.P_DROP),
             Scalar[DT](1.0 / (1.0 - Self.P_DROP)),
             grid_dim=(SCORES + TPB - 1) // TPB, block_dim=TPB,
@@ -931,18 +928,18 @@ struct ScaledDotProductAttention[
         mut out: TensorImpl[Self.ACT_DT],
         c: DeviceContext,
     ) raises:
-        comptime lay_in = Layout.row_major(B, Self.IN_DIM0)
-        comptime lay_out = Layout.row_major(B, Self.OUT_DIM)
-        comptime lay_c = Layout.row_major(B, Self.CACHE_SIZE)
+        comptime lay_in = RowMajor[B, Self.IN_DIM0]
+        comptime lay_out = RowMajor[B, Self.OUT_DIM]
+        comptime lay_c = RowMajor[B, Self.CACHE_SIZE]
         comptime kernel = _attn_fwd_kernel[
             B, Self.DIM, Self.N_HEADS, Self.SEQ_LEN, Self.HEAD_DIM,
             Self.CAUSAL, Self.IN_DIM0, Self.OUT_DIM, Self.CACHE_SIZE,
             Self.K_OFF, Self.V_OFF, Self.ATTN_OFF, Self.ADT,
         ]
         c.enqueue_function[kernel](
-            out.lt["gpu", lay_out](),
-            in0.lt["gpu", lay_in](),
-            self.cache.lt["gpu", lay_c](),
+            out.tt["gpu", B, Self.OUT_DIM](),
+            in0.tt["gpu", B, Self.IN_DIM0](),
+            self.cache.tt["gpu", B, Self.CACHE_SIZE](),
             grid_dim=B * Self.N_HEADS, block_dim=TPB,
         )
 
@@ -960,11 +957,11 @@ struct ScaledDotProductAttention[
         self._ensure_scratch_gpu[B](c)
 
         # Forward uses pq=sp0, pk=sp1, pv=sp2, pout=sp3, scores=ss0.
-        comptime lay_in = Layout.row_major(B, Self.IN_DIM0)
-        comptime lay_out = Layout.row_major(B, Self.OUT_DIM)
-        comptime lay_c = Layout.row_major(B, Self.CACHE_SIZE)
-        comptime lay_p = Layout.row_major(PACKED)
-        comptime lay_s = Layout.row_major(SCORES)
+        comptime lay_in = RowMajor[B, Self.IN_DIM0]
+        comptime lay_out = RowMajor[B, Self.OUT_DIM]
+        comptime lay_c = RowMajor[B, Self.CACHE_SIZE]
+        comptime lay_p = RowMajor[PACKED]
+        comptime lay_s = RowMajor[SCORES]
 
         # 1. pack QKV → (BH, SEQ, HEAD_DIM) + write cache.
         comptime pelems = B * Self.SEQ_LEN * Self.DIM
@@ -974,11 +971,11 @@ struct ScaledDotProductAttention[
             Self.IN_DIM0, Self.CACHE_SIZE, PACKED, Self.ADT,
         ]
         c.enqueue_function[pack_k](
-            self.sp0.lt["gpu", lay_p](),
-            self.sp1.lt["gpu", lay_p](),
-            self.sp2.lt["gpu", lay_p](),
-            self.cache.lt["gpu", lay_c](),
-            in0.lt["gpu", lay_in](),
+            self.sp0.tt["gpu", PACKED](),
+            self.sp1.tt["gpu", PACKED](),
+            self.sp2.tt["gpu", PACKED](),
+            self.cache.tt["gpu", B, Self.CACHE_SIZE](),
+            in0.tt["gpu", B, Self.IN_DIM0](),
             grid_dim=pblocks, block_dim=TPB,
         )
 
@@ -987,7 +984,7 @@ struct ScaledDotProductAttention[
         # kernel at HEAD_DIM 64 (no multistage GEMM below k = 128).
         comptime pt_k = _attn_packed_t_kernel[BH, Self.SEQ_LEN, Self.HEAD_DIM, PACKED]
         c.enqueue_function[pt_k](
-            self.sp3.lt["gpu", lay_p](), self.sp1.lt["gpu", lay_p](),
+            self.sp3.tt["gpu", PACKED](), self.sp1.tt["gpu", PACKED](),
             grid_dim=pblocks, block_dim=TPB,
         )
         bmm_tiled[BH=BH, M=Self.SEQ_LEN, N=Self.SEQ_LEN, K=Self.HEAD_DIM](
@@ -1000,8 +997,8 @@ struct ScaledDotProductAttention[
             Self.CACHE_SIZE, SCORES, BH,
         ]
         c.enqueue_function[sm_k](
-            self.ss0.lt["gpu", lay_s](),
-            self.cache.lt["gpu", lay_c](),
+            self.ss0.tt["gpu", SCORES](),
+            self.cache.tt["gpu", B, Self.CACHE_SIZE](),
             grid_dim=attn_warp_rows_grid(BH * Self.SEQ_LEN), block_dim=TPB,
         )
 
@@ -1022,8 +1019,8 @@ struct ScaledDotProductAttention[
             Self.OUT_DIM, PACKED, Self.ADT,
         ]
         c.enqueue_function[up_k](
-            out.lt["gpu", lay_out](),
-            self.sp3.lt["gpu", lay_p](),
+            out.tt["gpu", B, Self.OUT_DIM](),
+            self.sp3.tt["gpu", PACKED](),
             grid_dim=up_blocks, block_dim=TPB,
         )
 
@@ -1222,15 +1219,15 @@ struct ScaledDotProductAttention[
         mut gin: TensorImpl[Self.ACT_DT],
         c: DeviceContext,
     ) raises:
-        comptime lay_in = Layout.row_major(B, Self.IN_DIM0)
-        comptime lay_out = Layout.row_major(B, Self.OUT_DIM)
-        comptime lay_c = Layout.row_major(B, Self.CACHE_SIZE)
+        comptime lay_in = RowMajor[B, Self.IN_DIM0]
+        comptime lay_out = RowMajor[B, Self.OUT_DIM]
+        comptime lay_c = RowMajor[B, Self.CACHE_SIZE]
         comptime grid_bh = B * Self.N_HEADS
         # 1) zero grad_input.
         comptime zk = _attn_zero_grad_kernel[B, Self.IN_DIM0, Self.ADT]
         comptime zn = (B * Self.IN_DIM0 + TPB - 1) // TPB
         c.enqueue_function[zk](
-            gin.lt["gpu", lay_in](), grid_dim=zn, block_dim=TPB
+            gin.tt["gpu", B, Self.IN_DIM0](), grid_dim=zn, block_dim=TPB
         )
         # 2) dV (reads attn weights — must precede dscore_dQ overwrite).
         comptime dvk = _attn_dV_kernel[
@@ -1239,9 +1236,9 @@ struct ScaledDotProductAttention[
             Self.V_OFF, Self.ATTN_OFF, Self.ADT,
         ]
         c.enqueue_function[dvk](
-            gin.lt["gpu", lay_in](),
-            grad_output.lt["gpu", lay_out](),
-            self.cache.lt["gpu", lay_c](),
+            gin.tt["gpu", B, Self.IN_DIM0](),
+            grad_output.tt["gpu", B, Self.OUT_DIM](),
+            self.cache.tt["gpu", B, Self.CACHE_SIZE](),
             grid_dim=grid_bh, block_dim=TPB,
         )
         # 3) dscore + dQ (overwrites cache.attn with d_score).
@@ -1251,9 +1248,9 @@ struct ScaledDotProductAttention[
             Self.K_OFF, Self.V_OFF, Self.ATTN_OFF, Self.ADT,
         ]
         c.enqueue_function[dqk](
-            gin.lt["gpu", lay_in](),
-            grad_output.lt["gpu", lay_out](),
-            self.cache.lt["gpu", lay_c](),
+            gin.tt["gpu", B, Self.IN_DIM0](),
+            grad_output.tt["gpu", B, Self.OUT_DIM](),
+            self.cache.tt["gpu", B, Self.CACHE_SIZE](),
             grid_dim=grid_bh, block_dim=TPB,
         )
         # 4) dK (reads d_score from cache.attn).
@@ -1263,8 +1260,8 @@ struct ScaledDotProductAttention[
             Self.K_OFF, Self.ATTN_OFF, Self.ADT,
         ]
         c.enqueue_function[dkk](
-            gin.lt["gpu", lay_in](),
-            self.cache.lt["gpu", lay_c](),
+            gin.tt["gpu", B, Self.IN_DIM0](),
+            self.cache.tt["gpu", B, Self.CACHE_SIZE](),
             grid_dim=grid_bh, block_dim=TPB,
         )
 
@@ -1289,11 +1286,11 @@ struct ScaledDotProductAttention[
         #   sp2: pk                        sp3: pv     → (step5) dV
         #   ss0: dattn  → (step4) attn_T → (step6) dscore_T
         #   ss1: dscore
-        comptime lay_in = Layout.row_major(B, Self.IN_DIM0)
-        comptime lay_out = Layout.row_major(B, Self.OUT_DIM)
-        comptime lay_c = Layout.row_major(B, Self.CACHE_SIZE)
-        comptime lay_p = Layout.row_major(PACKED)
-        comptime lay_s = Layout.row_major(SCORES)
+        comptime lay_in = RowMajor[B, Self.IN_DIM0]
+        comptime lay_out = RowMajor[B, Self.OUT_DIM]
+        comptime lay_c = RowMajor[B, Self.CACHE_SIZE]
+        comptime lay_p = RowMajor[PACKED]
+        comptime lay_s = RowMajor[SCORES]
 
         comptime pelems = B * SL * Self.DIM
         comptime pblocks = (pelems + TPB - 1) // TPB
@@ -1305,19 +1302,19 @@ struct ScaledDotProductAttention[
             Self.IN_DIM0, Self.OUT_DIM, Self.CACHE_SIZE, PACKED, Self.ADT,
         ]
         c.enqueue_function[pin_k](
-            self.sp0.lt["gpu", lay_p](),
-            self.sp1.lt["gpu", lay_p](),
-            self.sp2.lt["gpu", lay_p](),
-            self.sp3.lt["gpu", lay_p](),
-            grad_output.lt["gpu", lay_out](),
-            self.cache.lt["gpu", lay_c](),
+            self.sp0.tt["gpu", PACKED](),
+            self.sp1.tt["gpu", PACKED](),
+            self.sp2.tt["gpu", PACKED](),
+            self.sp3.tt["gpu", PACKED](),
+            grad_output.tt["gpu", B, Self.OUT_DIM](),
+            self.cache.tt["gpu", B, Self.CACHE_SIZE](),
             grid_dim=pblocks, block_dim=TPB,
         )
 
         # 2. dattn(ss0) = dout @ Vᵀ: Vᵀ(sp4), then the tiled product.
         comptime pt_k = _attn_packed_t_kernel[BH, SL, HD, PACKED]
         c.enqueue_function[pt_k](
-            self.sp4.lt["gpu", lay_p](), self.sp3.lt["gpu", lay_p](),
+            self.sp4.tt["gpu", PACKED](), self.sp3.tt["gpu", PACKED](),
             grid_dim=pblocks, block_dim=TPB,
         )
         bmm_tiled[BH=BH, M=SL, N=SL, K=HD](
@@ -1334,9 +1331,9 @@ struct ScaledDotProductAttention[
             B, Self.N_HEADS, SL, HD, Self.CACHE_SIZE, SCORES, BH,
         ]
         c.enqueue_function[jvp_k](
-            self.ss1.lt["gpu", lay_s](),
-            self.ss0.lt["gpu", lay_s](),
-            self.cache.lt["gpu", lay_c](),
+            self.ss1.tt["gpu", SCORES](),
+            self.ss0.tt["gpu", SCORES](),
+            self.cache.tt["gpu", B, Self.CACHE_SIZE](),
             grid_dim=attn_warp_rows_grid(BH * SL), block_dim=TPB,
         )
 
@@ -1345,8 +1342,8 @@ struct ScaledDotProductAttention[
             B, Self.N_HEADS, SL, HD, Self.CACHE_SIZE, SCORES, BH,
         ]
         c.enqueue_function[tac_k](
-            self.ss0.lt["gpu", lay_s](),
-            self.cache.lt["gpu", lay_c](),
+            self.ss0.tt["gpu", SCORES](),
+            self.cache.tt["gpu", B, Self.CACHE_SIZE](),
             grid_dim=sblocks, block_dim=TPB,
         )
 
@@ -1363,8 +1360,8 @@ struct ScaledDotProductAttention[
         # 6. dscore_T(ss0) = transpose(dscore(ss1)) (ss0 free — attn_T read s5).
         comptime ts_k = _attn_transpose_scores_kernel[SL, SCORES, BH]
         c.enqueue_function[ts_k](
-            self.ss0.lt["gpu", lay_s](),
-            self.ss1.lt["gpu", lay_s](),
+            self.ss0.tt["gpu", SCORES](),
+            self.ss1.tt["gpu", SCORES](),
             grid_dim=sblocks, block_dim=TPB,
         )
 
@@ -1383,10 +1380,10 @@ struct ScaledDotProductAttention[
             B, Self.DIM, Self.N_HEADS, SL, HD, Self.IN_DIM0, PACKED, Self.ADT,
         ]
         c.enqueue_function[ug_k](
-            gin.lt["gpu", lay_in](),
-            self.sp1.lt["gpu", lay_p](),
-            self.sp0.lt["gpu", lay_p](),
-            self.sp3.lt["gpu", lay_p](),
+            gin.tt["gpu", B, Self.IN_DIM0](),
+            self.sp1.tt["gpu", PACKED](),
+            self.sp0.tt["gpu", PACKED](),
+            self.sp3.tt["gpu", PACKED](),
             grid_dim=pblocks, block_dim=TPB,
         )
 

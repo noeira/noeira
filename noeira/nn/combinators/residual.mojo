@@ -11,7 +11,6 @@ surface (`ref`/`mut Tensor`, `TensorRefs`) handles both targets uniformly.
 
 from max.gpu import global_idx
 from max.gpu.host import DeviceContext
-from layout import Layout, LayoutTensor
 
 from noeira.nn.constants import DT, TPB, CPU_SIMD_W
 from ..core.initializer import Initializer
@@ -21,14 +20,15 @@ from ..core.module import Module
 from ..core.param import ParamVisitor
 from ..core.walkers import join_name
 from ..core.amp import AMPPolicy, NoAMP
+from noeira.core.tiles import Tile
 
 
 def _resid_add_kernel[
     N: Int, ADT: DType = DT
 ](
-    a: LayoutTensor[ADT, Layout.row_major(N), MutAnyOrigin],
-    b: LayoutTensor[ADT, Layout.row_major(N), MutAnyOrigin],
-    dst: LayoutTensor[ADT, Layout.row_major(N), MutAnyOrigin],
+    a: Tile[ADT, N],
+    b: Tile[ADT, N],
+    dst: Tile[ADT, N],
 ):
     # The skip ADD runs on the combinator's ACT_DT activation buffers; `ADT`
     # defaults to DT so NoAMP-callers (passing the default) are unchanged.
@@ -114,9 +114,9 @@ struct Residual[Inner: Module](Module):
             var c = ctx.value()
             out.ensure_gpu(c, N)
             c.enqueue_function[_resid_add_kernel[N, Self.ACT_DT]](
-                self.mid.lt["gpu", Layout.row_major(N)](),
-                in0.lt["gpu", Layout.row_major(N)](),
-                out.lt["gpu", Layout.row_major(N)](),
+                self.mid.tt["gpu", N](),
+                in0.tt["gpu", N](),
+                out.tt["gpu", N](),
                 grid_dim=(N + TPB - 1) // TPB,
                 block_dim=TPB,
             )
@@ -160,9 +160,9 @@ struct Residual[Inner: Module](Module):
             var c = ctx.value()
             gin.ensure_gpu(c, N)
             c.enqueue_function[_resid_add_kernel[N, Self.ACT_DT]](
-                self.mid.lt["gpu", Layout.row_major(N)](),
-                grad_output.lt["gpu", Layout.row_major(N)](),
-                gin.lt["gpu", Layout.row_major(N)](),
+                self.mid.tt["gpu", N](),
+                grad_output.tt["gpu", N](),
+                gin.tt["gpu", N](),
                 grid_dim=(N + TPB - 1) // TPB,
                 block_dim=TPB,
             )

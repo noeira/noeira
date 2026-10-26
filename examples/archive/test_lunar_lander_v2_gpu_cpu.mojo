@@ -10,7 +10,7 @@ Usage:
 from std.time import perf_counter_ns
 from std.random import seed
 
-from layout import Layout, LayoutTensor
+from noeira.core.tiles import tile
 
 from noeira.envs.lunar_lander import LunarLander
 from noeira.physics2d import dtype
@@ -54,21 +54,13 @@ def main() raises:
         dones_data.append(Scalar[dtype](0))
 
     # Create LayoutTensors
-    var states = LayoutTensor[
-        dtype, Layout.row_major(BATCH_SIZE, STATE_SIZE), MutAnyOrigin
-    ](states_data.unsafe_ptr())
+    var states = tile[BATCH_SIZE, STATE_SIZE](states_data.unsafe_ptr())
 
-    var actions = LayoutTensor[
-        dtype, Layout.row_major(BATCH_SIZE), MutAnyOrigin
-    ](actions_data.unsafe_ptr())
+    var actions = tile[BATCH_SIZE](actions_data.unsafe_ptr())
 
-    var rewards = LayoutTensor[
-        dtype, Layout.row_major(BATCH_SIZE), MutAnyOrigin
-    ](rewards_data.unsafe_ptr())
+    var rewards = tile[BATCH_SIZE](rewards_data.unsafe_ptr())
 
-    var dones = LayoutTensor[dtype, Layout.row_major(BATCH_SIZE), MutAnyOrigin](
-        dones_data.unsafe_ptr()
-    )
+    var dones = tile[BATCH_SIZE](dones_data.unsafe_ptr())
 
     # Reset all environments
     print("1. Resetting all environments...")
@@ -105,9 +97,7 @@ def main() raises:
         # Step all environments
         LunarLander.step_kernel[BATCH_SIZE, STATE_SIZE](
             states,
-            LayoutTensor[dtype, Layout.row_major(BATCH_SIZE), ImmutAnyOrigin](
-                actions_data.unsafe_ptr()
-            ),
+            tile[BATCH_SIZE](actions_data.unsafe_ptr()),
             rewards,
             dones,
             Scalar[DType.uint64](rng),

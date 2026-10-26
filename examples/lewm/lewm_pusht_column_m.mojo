@@ -38,7 +38,6 @@ from std.math import sqrt, cos, sin, log, pi, abs
 from std.random.philox import Random as PhiloxRandom
 from std.time import perf_counter_ns
 from max.gpu.host import DeviceContext
-from layout import Layout, LayoutTensor
 
 from noeira.nn.constants import DT
 from noeira.nn.core.initializer import Kaiming

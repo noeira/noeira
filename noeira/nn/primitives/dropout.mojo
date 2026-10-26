@@ -56,7 +56,8 @@ bf16 path is GPU-only.
 from max.gpu import thread_idx, block_idx, block_dim
 from max.gpu.host import DeviceContext
 from std.random.philox import Random as PhiloxRandom
-from layout import Layout, LayoutTensor, TileTensor, row_major
+from layout import TileTensor, row_major
+from noeira.core.tiles import RowMajor, Tile
 
 from noeira.nn.constants import DT, TPB, CPU_SIMD_W
 from noeira.nn.random.box_muller import advance_rng_offset_kernel
@@ -85,10 +86,10 @@ from ..core.amp import AMPPolicy, NoAMP
 def _dropout_train_forward_kernel[
     N: Int, SEED: UInt64, ADT: DType = DT
 ](
-    input: LayoutTensor[ADT, Layout.row_major(N), MutAnyOrigin],
-    output: LayoutTensor[ADT, Layout.row_major(N), MutAnyOrigin],
-    cache: LayoutTensor[ADT, Layout.row_major(N), MutAnyOrigin],
-    offset_buf: LayoutTensor[DType.uint64, Layout.row_major(1), MutAnyOrigin],
+    input: Tile[ADT, N],
+    output: Tile[ADT, N],
+    cache: Tile[ADT, N],
+    offset_buf: Tile[DType.uint64, 1],
     threshold: Scalar[DT],
     scale: Scalar[DT],
     stream_base: UInt64,
@@ -110,8 +111,8 @@ def _dropout_train_forward_kernel[
 
 
 def _dropout_eval_kernel[N: Int, ADT: DType = DT](
-    src: LayoutTensor[ADT, Layout.row_major(N), MutAnyOrigin],
-    dst: LayoutTensor[ADT, Layout.row_major(N), MutAnyOrigin],
+    src: Tile[ADT, N],
+    dst: Tile[ADT, N],
 ):
     var idx = Int(block_dim.x * block_idx.x + thread_idx.x)
     if idx >= N:
@@ -120,9 +121,9 @@ def _dropout_eval_kernel[N: Int, ADT: DType = DT](
 
 
 def _dropout_train_backward_kernel[N: Int, ADT: DType = DT](
-    grad_output: LayoutTensor[ADT, Layout.row_major(N), MutAnyOrigin],
-    cache: LayoutTensor[ADT, Layout.row_major(N), MutAnyOrigin],
-    grad_input: LayoutTensor[ADT, Layout.row_major(N), MutAnyOrigin],
+    grad_output: Tile[ADT, N],
+    cache: Tile[ADT, N],
+    grad_input: Tile[ADT, N],
 ):
     var idx = Int(block_dim.x * block_idx.x + thread_idx.x)
     if idx >= N:
@@ -290,13 +291,13 @@ struct Dropout[
                 var c = ctx.value()
                 outd.ensure_gpu(c, N)
                 comptime n_blocks = (N + TPB - 1) // TPB
-                comptime lN = Layout.row_major(N)
-                comptime loff = Layout.row_major(1)
+                comptime lN = RowMajor[N]
+                comptime loff = RowMajor[1]
                 if Self.IS_IDENTITY or not self.training:
                     comptime eval_kernel = _dropout_eval_kernel[N]
                     c.enqueue_function[eval_kernel](
-                        in0d.lt["gpu", lN](),
-                        outd.lt["gpu", lN](),
+                        in0d.tt["gpu", N](),
+                        outd.tt["gpu", N](),
                         grid_dim=n_blocks,
                         block_dim=TPB,
                     )
@@ -308,10 +309,10 @@ struct Dropout[
                     N, Self.SEED
                 ]
                 c.enqueue_function[train_kernel](
-                    in0d.lt["gpu", lN](),
-                    outd.lt["gpu", lN](),
-                    maskd.lt["gpu", lN](),
-                    self.noise_offset.lt["gpu", loff](),
+                    in0d.tt["gpu", N](),
+                    outd.tt["gpu", N](),
+                    maskd.tt["gpu", N](),
+                    self.noise_offset.tt["gpu", 1](),
                     threshold,
                     scale,
                     self.stream_base,
@@ -320,7 +321,7 @@ struct Dropout[
                     block_dim=TPB,
                 )
                 c.enqueue_function[advance_rng_offset_kernel[N]](
-                    self.noise_offset.lt["gpu", loff](),
+                    self.noise_offset.tt["gpu", 1](),
                     grid_dim=1,
                     block_dim=1,
                 )
@@ -332,13 +333,13 @@ struct Dropout[
             var c = ctx.value()
             out.ensure_gpu(c, N)
             comptime n_blocks = (N + TPB - 1) // TPB
-            comptime lN = Layout.row_major(N)
-            comptime loff = Layout.row_major(1)
+            comptime lN = RowMajor[N]
+            comptime loff = RowMajor[1]
             if Self.IS_IDENTITY or not self.training:
                 comptime eval_kernel = _dropout_eval_kernel[N, Self.ADT]
                 c.enqueue_function[eval_kernel](
-                    in0.lt["gpu", lN](),
-                    out.lt["gpu", lN](),
+                    in0.tt["gpu", N](),
+                    out.tt["gpu", N](),
                     grid_dim=n_blocks,
                     block_dim=TPB,
                 )
@@ -350,10 +351,10 @@ struct Dropout[
                 N, Self.SEED, Self.ADT
             ]
             c.enqueue_function[train_kernel](
-                in0.lt["gpu", lN](),
-                out.lt["gpu", lN](),
-                self.cache_mask.lt["gpu", lN](),
-                self.noise_offset.lt["gpu", loff](),
+                in0.tt["gpu", N](),
+                out.tt["gpu", N](),
+                self.cache_mask.tt["gpu", N](),
+                self.noise_offset.tt["gpu", 1](),
                 threshold,
                 scale,
                 self.stream_base,
@@ -362,7 +363,7 @@ struct Dropout[
                 block_dim=TPB,
             )
             c.enqueue_function[advance_rng_offset_kernel[N]](
-                self.noise_offset.lt["gpu", loff](),
+                self.noise_offset.tt["gpu", 1](),
                 grid_dim=1,
                 block_dim=1,
             )
@@ -399,21 +400,21 @@ struct Dropout[
                 var c = ctx.value()
                 gind.ensure_gpu(c, N)
                 comptime n_blocks = (N + TPB - 1) // TPB
-                comptime lN = Layout.row_major(N)
+                comptime lN = RowMajor[N]
                 if Self.IS_IDENTITY or not self.training:
                     comptime eval_kernel = _dropout_eval_kernel[N]
                     c.enqueue_function[eval_kernel](
-                        god.lt["gpu", lN](),
-                        gind.lt["gpu", lN](),
+                        god.tt["gpu", N](),
+                        gind.tt["gpu", N](),
                         grid_dim=n_blocks,
                         block_dim=TPB,
                     )
                     return
                 comptime back_kernel = _dropout_train_backward_kernel[N]
                 c.enqueue_function[back_kernel](
-                    god.lt["gpu", lN](),
-                    maskd.lt["gpu", lN](),
-                    gind.lt["gpu", lN](),
+                    god.tt["gpu", N](),
+                    maskd.tt["gpu", N](),
+                    gind.tt["gpu", N](),
                     grid_dim=n_blocks,
                     block_dim=TPB,
                 )
@@ -425,21 +426,21 @@ struct Dropout[
             var c = ctx.value()
             gin.ensure_gpu(c, N)
             comptime n_blocks = (N + TPB - 1) // TPB
-            comptime lN = Layout.row_major(N)
+            comptime lN = RowMajor[N]
             if Self.IS_IDENTITY or not self.training:
                 comptime eval_kernel = _dropout_eval_kernel[N, Self.ADT]
                 c.enqueue_function[eval_kernel](
-                    grad_output.lt["gpu", lN](),
-                    gin.lt["gpu", lN](),
+                    grad_output.tt["gpu", N](),
+                    gin.tt["gpu", N](),
                     grid_dim=n_blocks,
                     block_dim=TPB,
                 )
                 return
             comptime back_kernel = _dropout_train_backward_kernel[N, Self.ADT]
             c.enqueue_function[back_kernel](
-                grad_output.lt["gpu", lN](),
-                self.cache_mask.lt["gpu", lN](),
-                gin.lt["gpu", lN](),
+                grad_output.tt["gpu", N](),
+                self.cache_mask.tt["gpu", N](),
+                gin.tt["gpu", N](),
                 grid_dim=n_blocks,
                 block_dim=TPB,
             )

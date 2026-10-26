@@ -29,7 +29,7 @@ here has never run against MuJoCo, and neither has the qpos layout it assumes
 known to be right. Anything relying on it must gate it first.
 """
 
-from layout import Layout, LayoutTensor
+from layout import TileTensor, TensorLayout
 
 from .quat_math import quat_integrate
 from ..fields import DimsLike
@@ -46,17 +46,15 @@ from ..gpu.constants import (
 def integrate_pos[
     DTYPE: DType,
     D: DimsLike,
-    L_QPOS: Layout,
-    L_DQ: Layout,
-    L_JOINTS: Layout,
+    L_QPOS: TensorLayout,
+    L_DQ: TensorLayout,
+    L_JOINTS: TensorLayout,
 ](
     env: Int,
     dims: D,
-    qpos: LayoutTensor[DTYPE, L_QPOS, MutAnyOrigin],
-    dq: LayoutTensor[DTYPE, L_DQ, MutAnyOrigin],
-    joints: LayoutTensor[
-        DTYPE, L_JOINTS, MutAnyOrigin
-    ],
+    qpos: TileTensor[DTYPE, L_QPOS, MutAnyOrigin],
+    dq: TileTensor[DTYPE, L_DQ, MutAnyOrigin],
+    joints: TileTensor[DTYPE, L_JOINTS, MutAnyOrigin],
     dt: Scalar[DTYPE],
 ):
     """`qpos <- qpos (+) dt * dq`, quaternion-aware. Mutates `qpos` in place.

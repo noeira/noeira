@@ -16,7 +16,8 @@ storage scaffolding (views, Param access, no cached pointer) differs.
 
 from max.gpu import global_idx
 from max.gpu.host import DeviceContext
-from layout import Layout, LayoutTensor, TileTensor, row_major
+from layout import TileTensor, row_major
+from noeira.core.tiles import Tile
 
 from noeira.nn.constants import DT, TPB
 from noeira.nn.core.polyak import polyak_tensor
@@ -39,11 +40,11 @@ comptime LOG_STD_MAX: Scalar[DT] = 2.0
 
 
 def _gauss_head_forward_kernel[BATCH: Int, IN: Int, ACT: Int](
-    input: LayoutTensor[DT, Layout.row_major(BATCH, IN), MutAnyOrigin],
-    weight: LayoutTensor[DT, Layout.row_major(IN, ACT), MutAnyOrigin],
-    bias: LayoutTensor[DT, Layout.row_major(ACT), MutAnyOrigin],
-    log_std: LayoutTensor[DT, Layout.row_major(ACT), MutAnyOrigin],
-    output: LayoutTensor[DT, Layout.row_major(BATCH, 2 * ACT), MutAnyOrigin],
+    input: Tile[DT, BATCH, IN],
+    weight: Tile[DT, IN, ACT],
+    bias: Tile[DT, ACT],
+    log_std: Tile[DT, ACT],
+    output: Tile[DT, BATCH, 2 * ACT],
 ):
     var idx = Int(global_idx.x)
     var total = BATCH * 2 * ACT
@@ -68,9 +69,9 @@ def _gauss_head_forward_kernel[BATCH: Int, IN: Int, ACT: Int](
 
 
 def _gauss_head_grad_input_kernel[BATCH: Int, IN: Int, ACT: Int](
-    grad_output: LayoutTensor[DT, Layout.row_major(BATCH, 2 * ACT), MutAnyOrigin],
-    weight: LayoutTensor[DT, Layout.row_major(IN, ACT), MutAnyOrigin],
-    grad_input: LayoutTensor[DT, Layout.row_major(BATCH, IN), MutAnyOrigin],
+    grad_output: Tile[DT, BATCH, 2 * ACT],
+    weight: Tile[DT, IN, ACT],
+    grad_input: Tile[DT, BATCH, IN],
 ):
     var idx = Int(global_idx.x)
     var total = BATCH * IN
@@ -86,9 +87,9 @@ def _gauss_head_grad_input_kernel[BATCH: Int, IN: Int, ACT: Int](
 
 
 def _gauss_head_grad_w_kernel[BATCH: Int, IN: Int, ACT: Int](
-    cache: LayoutTensor[DT, Layout.row_major(BATCH, IN), MutAnyOrigin],
-    grad_output: LayoutTensor[DT, Layout.row_major(BATCH, 2 * ACT), MutAnyOrigin],
-    grad_w: LayoutTensor[DT, Layout.row_major(IN, ACT), MutAnyOrigin],
+    cache: Tile[DT, BATCH, IN],
+    grad_output: Tile[DT, BATCH, 2 * ACT],
+    grad_w: Tile[DT, IN, ACT],
 ):
     var idx = Int(global_idx.x)
     var total = IN * ACT
@@ -104,8 +105,8 @@ def _gauss_head_grad_w_kernel[BATCH: Int, IN: Int, ACT: Int](
 
 
 def _gauss_head_grad_b_kernel[BATCH: Int, ACT: Int](
-    grad_output: LayoutTensor[DT, Layout.row_major(BATCH, 2 * ACT), MutAnyOrigin],
-    grad_b: LayoutTensor[DT, Layout.row_major(ACT), MutAnyOrigin],
+    grad_output: Tile[DT, BATCH, 2 * ACT],
+    grad_b: Tile[DT, ACT],
 ):
     var j = Int(global_idx.x)
     if j < ACT:
@@ -116,8 +117,8 @@ def _gauss_head_grad_b_kernel[BATCH: Int, ACT: Int](
 
 
 def _gauss_head_grad_ls_kernel[BATCH: Int, ACT: Int](
-    grad_output: LayoutTensor[DT, Layout.row_major(BATCH, 2 * ACT), MutAnyOrigin],
-    grad_ls: LayoutTensor[DT, Layout.row_major(ACT), MutAnyOrigin],
+    grad_output: Tile[DT, BATCH, 2 * ACT],
+    grad_ls: Tile[DT, ACT],
 ):
     var j = Int(global_idx.x)
     if j < ACT:
@@ -250,11 +251,11 @@ struct GaussianHead[IN: Int, ACT: Int](Module):
             comptime n_blocks = (B * 2 * Self.ACT + TPB - 1) // TPB
             comptime fwd_kernel = _gauss_head_forward_kernel[B, Self.IN, Self.ACT]
             c.enqueue_function[fwd_kernel](
-                in0.lt["gpu", Layout.row_major(B, Self.IN)](),
-                self.weight.val.lt["gpu", Layout.row_major(Self.IN, Self.ACT)](),
-                self.bias.val.lt["gpu", Layout.row_major(Self.ACT)](),
-                self.log_std.val.lt["gpu", Layout.row_major(Self.ACT)](),
-                out.lt["gpu", Layout.row_major(B, 2 * Self.ACT)](),
+                in0.tt["gpu", B, Self.IN](),
+                self.weight.val.tt["gpu", Self.IN, Self.ACT](),
+                self.bias.val.tt["gpu", Self.ACT](),
+                self.log_std.val.tt["gpu", Self.ACT](),
+                out.tt["gpu", B, 2 * Self.ACT](),
                 grid_dim=n_blocks, block_dim=TPB,
             )
 
@@ -310,32 +311,32 @@ struct GaussianHead[IN: Int, ACT: Int](Module):
         else:
             var c = ctx.value()
             gin.ensure_gpu(c, B * Self.IN)
-            var go_lt = grad_output.lt["gpu", Layout.row_major(B, 2 * Self.ACT)]()
+            var go_lt = grad_output.tt["gpu", B, 2 * Self.ACT]()
             # (1) grad_b, grad_log_std
             comptime n_blocks_gb = (Self.ACT + TPB - 1) // TPB
             c.enqueue_function[_gauss_head_grad_b_kernel[B, Self.ACT]](
                 go_lt,
-                self.bias.grd.lt["gpu", Layout.row_major(Self.ACT)](),
+                self.bias.grd.tt["gpu", Self.ACT](),
                 grid_dim=n_blocks_gb, block_dim=TPB,
             )
             c.enqueue_function[_gauss_head_grad_ls_kernel[B, Self.ACT]](
                 go_lt,
-                self.log_std.grd.lt["gpu", Layout.row_major(Self.ACT)](),
+                self.log_std.grd.tt["gpu", Self.ACT](),
                 grid_dim=n_blocks_gb, block_dim=TPB,
             )
             # (2) grad_w (reads forward_input as the cache)
             comptime n_blocks_gw = (Self.W_SIZE + TPB - 1) // TPB
             c.enqueue_function[_gauss_head_grad_w_kernel[B, Self.IN, Self.ACT]](
-                fin.lt["gpu", Layout.row_major(B, Self.IN)](),
+                fin.tt["gpu", B, Self.IN](),
                 go_lt,
-                self.weight.grd.lt["gpu", Layout.row_major(Self.IN, Self.ACT)](),
+                self.weight.grd.tt["gpu", Self.IN, Self.ACT](),
                 grid_dim=n_blocks_gw, block_dim=TPB,
             )
             # (3) grad_input
             comptime n_blocks_gi = (B * Self.IN + TPB - 1) // TPB
             c.enqueue_function[_gauss_head_grad_input_kernel[B, Self.IN, Self.ACT]](
                 go_lt,
-                self.weight.val.lt["gpu", Layout.row_major(Self.IN, Self.ACT)](),
-                gin.lt["gpu", Layout.row_major(B, Self.IN)](),
+                self.weight.val.tt["gpu", Self.IN, Self.ACT](),
+                gin.tt["gpu", B, Self.IN](),
                 grid_dim=n_blocks_gi, block_dim=TPB,
             )

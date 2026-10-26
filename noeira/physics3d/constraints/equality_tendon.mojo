@@ -52,7 +52,7 @@ hypothesis about the code. GREP THE CALL SITES."""
 from ..fields.scratch import Scratch
 from ..dynamics.jac_contact_row import _body_chain, _affects, CHAIN_CAP
 from std.math import abs, pow, sqrt
-from layout import Layout, LayoutTensor
+from layout import TileTensor, TensorLayout
 
 from ..types import _max_one, EQ_CONNECT, EQ_WELD, EQ_JOINT
 from ..joint_types import JNT_FREE, JNT_BALL
@@ -130,26 +130,18 @@ from ..fields import Dims, DimsLike, Scratch, cap, may_exist
 def _weld_jacobian_row[
     DTYPE: DType,
     V_SIZE: Int,
-    L_SUBTREE_COM: Layout,
-    L_JOINTS: Layout,
-    L_BODIES: Layout,
-    L_MMETA: Layout,
-    L_CDOF: Layout,
+    L_SUBTREE_COM: TensorLayout,
+    L_JOINTS: TensorLayout,
+    L_BODIES: TensorLayout,
+    L_MMETA: TensorLayout,
+    L_CDOF: TensorLayout,
 ](
     env: Int,
-    subtree_com: LayoutTensor[
-        DTYPE, L_SUBTREE_COM, MutAnyOrigin
-    ],
-    joints: LayoutTensor[
-        DTYPE, L_JOINTS, MutAnyOrigin
-    ],
-    bodies: LayoutTensor[
-        DTYPE, L_BODIES, MutAnyOrigin
-    ],
-    mmeta: LayoutTensor[
-        DTYPE, L_MMETA, MutAnyOrigin
-    ],
-    cdof: LayoutTensor[DTYPE, L_CDOF, MutAnyOrigin],
+    subtree_com: TileTensor[DTYPE, L_SUBTREE_COM, MutAnyOrigin],
+    joints: TileTensor[DTYPE, L_JOINTS, MutAnyOrigin],
+    bodies: TileTensor[DTYPE, L_BODIES, MutAnyOrigin],
+    mmeta: TileTensor[DTYPE, L_MMETA, MutAnyOrigin],
+    cdof: TileTensor[DTYPE, L_CDOF, MutAnyOrigin],
     body_a: Int,
     body_b: Int,
     pos_a_x: Scalar[DTYPE],
@@ -290,22 +282,16 @@ def _weld_jacobian_row[
 def _angular_jacobian_row_eq[
     DTYPE: DType,
     V_SIZE: Int,
-    L_JOINTS: Layout,
-    L_BODIES: Layout,
-    L_MMETA: Layout,
-    L_CDOF: Layout,
+    L_JOINTS: TensorLayout,
+    L_BODIES: TensorLayout,
+    L_MMETA: TensorLayout,
+    L_CDOF: TensorLayout,
 ](
     env: Int,
-    joints: LayoutTensor[
-        DTYPE, L_JOINTS, MutAnyOrigin
-    ],
-    bodies: LayoutTensor[
-        DTYPE, L_BODIES, MutAnyOrigin
-    ],
-    mmeta: LayoutTensor[
-        DTYPE, L_MMETA, MutAnyOrigin
-    ],
-    cdof: LayoutTensor[DTYPE, L_CDOF, MutAnyOrigin],
+    joints: TileTensor[DTYPE, L_JOINTS, MutAnyOrigin],
+    bodies: TileTensor[DTYPE, L_BODIES, MutAnyOrigin],
+    mmeta: TileTensor[DTYPE, L_MMETA, MutAnyOrigin],
+    cdof: TileTensor[DTYPE, L_CDOF, MutAnyOrigin],
     contact_body_a: Int,
     contact_body_b: Int,
     dir_x: Scalar[DTYPE],
@@ -400,20 +386,20 @@ def _comvel_and_cdof_dot[
     DTYPE: DType,
     CV_CAP: Int,
     CDD_CAP: Int,
-    L_JOINTS: Layout,
-    L_BODIES: Layout,
-    L_MMETA: Layout,
-    L_CDOF: Layout,
-    L_QVEL: Layout,
+    L_JOINTS: TensorLayout,
+    L_BODIES: TensorLayout,
+    L_MMETA: TensorLayout,
+    L_CDOF: TensorLayout,
+    L_QVEL: TensorLayout,
 ](
     env: Int,
     nbody: Int,
     nv: Int,
-    joints: LayoutTensor[DTYPE, L_JOINTS, MutAnyOrigin],
-    bodies: LayoutTensor[DTYPE, L_BODIES, MutAnyOrigin],
-    mmeta: LayoutTensor[DTYPE, L_MMETA, MutAnyOrigin],
-    cdof: LayoutTensor[DTYPE, L_CDOF, MutAnyOrigin],
-    qvel: LayoutTensor[DTYPE, L_QVEL, MutAnyOrigin],
+    joints: TileTensor[DTYPE, L_JOINTS, MutAnyOrigin],
+    bodies: TileTensor[DTYPE, L_BODIES, MutAnyOrigin],
+    mmeta: TileTensor[DTYPE, L_MMETA, MutAnyOrigin],
+    cdof: TileTensor[DTYPE, L_CDOF, MutAnyOrigin],
+    qvel: TileTensor[DTYPE, L_QVEL, MutAnyOrigin],
     mut cv_b: Scratch[Scalar[DTYPE], CV_CAP],
     mut cdd: Scratch[Scalar[DTYPE], CDD_CAP],
 ):
@@ -503,20 +489,20 @@ def _jdotv_point[
     DTYPE: DType,
     CV_CAP: Int,
     CDD_CAP: Int,
-    L_SUBTREE_COM: Layout,
-    L_JOINTS: Layout,
-    L_BODIES: Layout,
-    L_MMETA: Layout,
-    L_CDOF: Layout,
-    L_QVEL: Layout,
+    L_SUBTREE_COM: TensorLayout,
+    L_JOINTS: TensorLayout,
+    L_BODIES: TensorLayout,
+    L_MMETA: TensorLayout,
+    L_CDOF: TensorLayout,
+    L_QVEL: TensorLayout,
 ](
     env: Int,
-    subtree_com: LayoutTensor[DTYPE, L_SUBTREE_COM, MutAnyOrigin],
-    joints: LayoutTensor[DTYPE, L_JOINTS, MutAnyOrigin],
-    bodies: LayoutTensor[DTYPE, L_BODIES, MutAnyOrigin],
-    mmeta: LayoutTensor[DTYPE, L_MMETA, MutAnyOrigin],
-    cdof: LayoutTensor[DTYPE, L_CDOF, MutAnyOrigin],
-    qvel: LayoutTensor[DTYPE, L_QVEL, MutAnyOrigin],
+    subtree_com: TileTensor[DTYPE, L_SUBTREE_COM, MutAnyOrigin],
+    joints: TileTensor[DTYPE, L_JOINTS, MutAnyOrigin],
+    bodies: TileTensor[DTYPE, L_BODIES, MutAnyOrigin],
+    mmeta: TileTensor[DTYPE, L_MMETA, MutAnyOrigin],
+    cdof: TileTensor[DTYPE, L_CDOF, MutAnyOrigin],
+    qvel: TileTensor[DTYPE, L_QVEL, MutAnyOrigin],
     cv_b: Scratch[Scalar[DTYPE], CV_CAP],
     cdd: Scratch[Scalar[DTYPE], CDD_CAP],
     body: Int,
@@ -670,54 +656,34 @@ def build_weld_equality_rows[
     EQ_CAP: Int,
     EQJ_CAP: Int,
     D: DimsLike,
-    L_QPOS: Layout,
-    L_QVEL: Layout,
-    L_XPOS: Layout,
-    L_XQUAT: Layout,
-    L_JOINTS: Layout,
-    L_BODIES: Layout,
-    L_MMETA: Layout,
-    L_EQUALITY: Layout,
-    L_BODY_INVWEIGHT0: Layout,
-    L_DOF_INVWEIGHT0: Layout,
-    L_CDOF: Layout,
-    L_M_INV: Layout,
+    L_QPOS: TensorLayout,
+    L_QVEL: TensorLayout,
+    L_XPOS: TensorLayout,
+    L_XQUAT: TensorLayout,
+    L_JOINTS: TensorLayout,
+    L_BODIES: TensorLayout,
+    L_MMETA: TensorLayout,
+    L_EQUALITY: TensorLayout,
+    L_BODY_INVWEIGHT0: TensorLayout,
+    L_DOF_INVWEIGHT0: TensorLayout,
+    L_CDOF: TensorLayout,
+    L_M_INV: TensorLayout,
 ](
     env: Int,
     dims: D,
-    qpos: LayoutTensor[DTYPE, L_QPOS, MutAnyOrigin],
-    qvel: LayoutTensor[DTYPE, L_QVEL, MutAnyOrigin],
-    xpos: LayoutTensor[
-        DTYPE, L_XPOS, MutAnyOrigin
-    ],
-    xquat: LayoutTensor[
-        DTYPE, L_XQUAT, MutAnyOrigin
-    ],
-    subtree_com: LayoutTensor[
-        DTYPE, L_XPOS, MutAnyOrigin
-    ],
-    joints: LayoutTensor[
-        DTYPE, L_JOINTS, MutAnyOrigin
-    ],
-    bodies: LayoutTensor[
-        DTYPE, L_BODIES, MutAnyOrigin
-    ],
-    mmeta: LayoutTensor[
-        DTYPE, L_MMETA, MutAnyOrigin
-    ],
-    equality: LayoutTensor[
-        DTYPE, L_EQUALITY, MutAnyOrigin
-    ],
-    body_invweight0: LayoutTensor[
-        DTYPE, L_BODY_INVWEIGHT0, MutAnyOrigin
-    ],
-    dof_invweight0: LayoutTensor[
-        DTYPE, L_DOF_INVWEIGHT0, MutAnyOrigin
-    ],
-    cdof: LayoutTensor[DTYPE, L_CDOF, MutAnyOrigin],
-    m_inv: LayoutTensor[
-        DTYPE, L_M_INV, MutAnyOrigin
-    ],
+    qpos: TileTensor[DTYPE, L_QPOS, MutAnyOrigin],
+    qvel: TileTensor[DTYPE, L_QVEL, MutAnyOrigin],
+    xpos: TileTensor[DTYPE, L_XPOS, MutAnyOrigin],
+    xquat: TileTensor[DTYPE, L_XQUAT, MutAnyOrigin],
+    subtree_com: TileTensor[DTYPE, L_XPOS, MutAnyOrigin],
+    joints: TileTensor[DTYPE, L_JOINTS, MutAnyOrigin],
+    bodies: TileTensor[DTYPE, L_BODIES, MutAnyOrigin],
+    mmeta: TileTensor[DTYPE, L_MMETA, MutAnyOrigin],
+    equality: TileTensor[DTYPE, L_EQUALITY, MutAnyOrigin],
+    body_invweight0: TileTensor[DTYPE, L_BODY_INVWEIGHT0, MutAnyOrigin],
+    dof_invweight0: TileTensor[DTYPE, L_DOF_INVWEIGHT0, MutAnyOrigin],
+    cdof: TileTensor[DTYPE, L_CDOF, MutAnyOrigin],
+    m_inv: TileTensor[DTYPE, L_M_INV, MutAnyOrigin],
     mut eq_K: Scratch[Scalar[DTYPE], EQ_CAP],
     mut eq_bias: Scratch[Scalar[DTYPE], EQ_CAP],
     mut eq_inv_K_imp: Scratch[Scalar[DTYPE], EQ_CAP],
@@ -1586,57 +1552,35 @@ def _equality_env[
     V_SIZE: Int,
     NUM_ITERATIONS: Int,
     D: DimsLike,
-    L_QPOS: Layout,
-    L_QVEL: Layout,
-    L_XPOS: Layout,
-    L_XQUAT: Layout,
-    L_JOINTS: Layout,
-    L_BODIES: Layout,
-    L_MMETA: Layout,
-    L_EQUALITY: Layout,
-    L_BODY_INVWEIGHT0: Layout,
-    L_DOF_INVWEIGHT0: Layout,
-    L_CDOF: Layout,
-    L_M_INV: Layout,
+    L_QPOS: TensorLayout,
+    L_QVEL: TensorLayout,
+    L_XPOS: TensorLayout,
+    L_XQUAT: TensorLayout,
+    L_JOINTS: TensorLayout,
+    L_BODIES: TensorLayout,
+    L_MMETA: TensorLayout,
+    L_EQUALITY: TensorLayout,
+    L_BODY_INVWEIGHT0: TensorLayout,
+    L_DOF_INVWEIGHT0: TensorLayout,
+    L_CDOF: TensorLayout,
+    L_M_INV: TensorLayout,
 ](
     env: Int,
     dims: D,
-    qpos: LayoutTensor[DTYPE, L_QPOS, MutAnyOrigin],
-    qvel: LayoutTensor[DTYPE, L_QVEL, MutAnyOrigin],
-    xpos: LayoutTensor[
-        DTYPE, L_XPOS, MutAnyOrigin
-    ],
-    xquat: LayoutTensor[
-        DTYPE, L_XQUAT, MutAnyOrigin
-    ],
-    subtree_com: LayoutTensor[
-        DTYPE, L_XPOS, MutAnyOrigin
-    ],
-    joints: LayoutTensor[
-        DTYPE, L_JOINTS, MutAnyOrigin
-    ],
-    bodies: LayoutTensor[
-        DTYPE, L_BODIES, MutAnyOrigin
-    ],
-    mmeta: LayoutTensor[
-        DTYPE, L_MMETA, MutAnyOrigin
-    ],
-    equality: LayoutTensor[
-        DTYPE, L_EQUALITY, MutAnyOrigin
-    ],
-    body_invweight0: LayoutTensor[
-        DTYPE, L_BODY_INVWEIGHT0, MutAnyOrigin
-    ],
-    dof_invweight0: LayoutTensor[
-        DTYPE, L_DOF_INVWEIGHT0, MutAnyOrigin
-    ],
-    cdof: LayoutTensor[DTYPE, L_CDOF, MutAnyOrigin],
-    m_inv: LayoutTensor[
-        DTYPE, L_M_INV, MutAnyOrigin
-    ],
-    qacc_constrained: LayoutTensor[
-        DTYPE, L_QVEL, MutAnyOrigin
-    ],
+    qpos: TileTensor[DTYPE, L_QPOS, MutAnyOrigin],
+    qvel: TileTensor[DTYPE, L_QVEL, MutAnyOrigin],
+    xpos: TileTensor[DTYPE, L_XPOS, MutAnyOrigin],
+    xquat: TileTensor[DTYPE, L_XQUAT, MutAnyOrigin],
+    subtree_com: TileTensor[DTYPE, L_XPOS, MutAnyOrigin],
+    joints: TileTensor[DTYPE, L_JOINTS, MutAnyOrigin],
+    bodies: TileTensor[DTYPE, L_BODIES, MutAnyOrigin],
+    mmeta: TileTensor[DTYPE, L_MMETA, MutAnyOrigin],
+    equality: TileTensor[DTYPE, L_EQUALITY, MutAnyOrigin],
+    body_invweight0: TileTensor[DTYPE, L_BODY_INVWEIGHT0, MutAnyOrigin],
+    dof_invweight0: TileTensor[DTYPE, L_DOF_INVWEIGHT0, MutAnyOrigin],
+    cdof: TileTensor[DTYPE, L_CDOF, MutAnyOrigin],
+    m_inv: TileTensor[DTYPE, L_M_INV, MutAnyOrigin],
+    qacc_constrained: TileTensor[DTYPE, L_QVEL, MutAnyOrigin],
 ):
     """Build and solve equality constraints (connect + weld) for one env.
 
@@ -1721,55 +1665,35 @@ def _tendon_env[
     BATCH: Int,
     NUM_ITERATIONS: Int,
     D: DimsLike,
-    L_QPOS: Layout,
-    L_QVEL: Layout,
-    L_JOINTS: Layout,
-    L_MMETA: Layout,
-    L_TENDONS: Layout,
-    L_SITES: Layout,
-    L_GEOMS: Layout,
-    L_BODIES: Layout,
-    L_SUBTREE_COM: Layout,
-    L_CDOF: Layout,
-    L_XQUAT: Layout,
-    L_M_INV: Layout,
+    L_QPOS: TensorLayout,
+    L_QVEL: TensorLayout,
+    L_JOINTS: TensorLayout,
+    L_MMETA: TensorLayout,
+    L_TENDONS: TensorLayout,
+    L_SITES: TensorLayout,
+    L_GEOMS: TensorLayout,
+    L_BODIES: TensorLayout,
+    L_SUBTREE_COM: TensorLayout,
+    L_CDOF: TensorLayout,
+    L_XQUAT: TensorLayout,
+    L_M_INV: TensorLayout,
 ](
     env: Int,
     dims: D,
-    qpos: LayoutTensor[DTYPE, L_QPOS, MutAnyOrigin],
-    qvel: LayoutTensor[DTYPE, L_QVEL, MutAnyOrigin],
-    joints: LayoutTensor[
-        DTYPE, L_JOINTS, MutAnyOrigin
-    ],
-    mmeta: LayoutTensor[
-        DTYPE, L_MMETA, MutAnyOrigin
-    ],
-    tendons: LayoutTensor[
-        DTYPE, L_TENDONS, MutAnyOrigin
-    ],
-    sites: LayoutTensor[
-        DTYPE, L_SITES, MutAnyOrigin
-    ],
-    geoms: LayoutTensor[
-        DTYPE, L_GEOMS, MutAnyOrigin
-    ],
-    bodies: LayoutTensor[
-        DTYPE, L_BODIES, MutAnyOrigin
-    ],
-    subtree_com: LayoutTensor[
-        DTYPE, L_SUBTREE_COM, MutAnyOrigin
-    ],
-    cdof: LayoutTensor[DTYPE, L_CDOF, MutAnyOrigin],
-    xpos: LayoutTensor[DTYPE, L_SUBTREE_COM, MutAnyOrigin],
-    xquat: LayoutTensor[
-        DTYPE, L_XQUAT, MutAnyOrigin
-    ],
-    m_inv: LayoutTensor[
-        DTYPE, L_M_INV, MutAnyOrigin
-    ],
-    qacc_constrained: LayoutTensor[
-        DTYPE, L_QVEL, MutAnyOrigin
-    ],
+    qpos: TileTensor[DTYPE, L_QPOS, MutAnyOrigin],
+    qvel: TileTensor[DTYPE, L_QVEL, MutAnyOrigin],
+    joints: TileTensor[DTYPE, L_JOINTS, MutAnyOrigin],
+    mmeta: TileTensor[DTYPE, L_MMETA, MutAnyOrigin],
+    tendons: TileTensor[DTYPE, L_TENDONS, MutAnyOrigin],
+    sites: TileTensor[DTYPE, L_SITES, MutAnyOrigin],
+    geoms: TileTensor[DTYPE, L_GEOMS, MutAnyOrigin],
+    bodies: TileTensor[DTYPE, L_BODIES, MutAnyOrigin],
+    subtree_com: TileTensor[DTYPE, L_SUBTREE_COM, MutAnyOrigin],
+    cdof: TileTensor[DTYPE, L_CDOF, MutAnyOrigin],
+    xpos: TileTensor[DTYPE, L_SUBTREE_COM, MutAnyOrigin],
+    xquat: TileTensor[DTYPE, L_XQUAT, MutAnyOrigin],
+    m_inv: TileTensor[DTYPE, L_M_INV, MutAnyOrigin],
+    qacc_constrained: TileTensor[DTYPE, L_QVEL, MutAnyOrigin],
 ):
     """Build and solve `<equality><tendon>` rows for one env, as a POST-PASS.
 

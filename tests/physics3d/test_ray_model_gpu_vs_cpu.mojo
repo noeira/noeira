@@ -37,7 +37,8 @@ from std.sys import has_accelerator
 from max.gpu import block_dim, block_idx, thread_idx
 from max.gpu.host import DeviceContext
 from std.testing import assert_true, TestSuite
-from layout import Layout, LayoutTensor
+from layout import TileTensor
+from noeira.core.tiles import RowMajor
 
 from noeira.math3d import Vec3 as Vec3Generic, Quat as QuatGeneric
 from noeira.physics3d.fields import Data, Model, Dims, init_hfield_data
@@ -82,16 +83,16 @@ comptime GD = Dims[
     nhfield_data=NHF,
 ]
 
-comptime L_GEOMS = Layout.row_major(NGEOM, MODEL_GEOM_SIZE)
-comptime L_BODIES = Layout.row_major(NBODY, MODEL_BODY_SIZE)
-comptime L_XPOS = Layout.row_major(1, NBODY * 3)
-comptime L_XQUAT = Layout.row_major(1, NBODY * 4)
-comptime L_MESH_META = Layout.row_major(MAX_GPU_MESHES * MODEL_MESH_META_SIZE)
-comptime L_TRI = Layout.row_major(NTRI * 9)
-comptime L_HF_META = Layout.row_major(MAX_GPU_HFIELDS * MODEL_HFIELD_META_SIZE)
-comptime L_HF = Layout.row_major(NHF)
-comptime L_RAYS = Layout.row_major(NRAY, 6)
-comptime L_OUT = Layout.row_major(NRAY, 5)
+comptime L_GEOMS = RowMajor[NGEOM, MODEL_GEOM_SIZE]
+comptime L_BODIES = RowMajor[NBODY, MODEL_BODY_SIZE]
+comptime L_XPOS = RowMajor[1, NBODY * 3]
+comptime L_XQUAT = RowMajor[1, NBODY * 4]
+comptime L_MESH_META = RowMajor[MAX_GPU_MESHES * MODEL_MESH_META_SIZE]
+comptime L_TRI = RowMajor[NTRI * 9]
+comptime L_HF_META = RowMajor[MAX_GPU_HFIELDS * MODEL_HFIELD_META_SIZE]
+comptime L_HF = RowMajor[NHF]
+comptime L_RAYS = RowMajor[NRAY, 6]
+comptime L_OUT = RowMajor[NRAY, 5]
 
 comptime SCENE = String(
     """
@@ -139,16 +140,16 @@ struct Lcg(Copyable, Movable):
 def _ray_kernel[
     T: DType
 ](
-    geoms: LayoutTensor[T, L_GEOMS, MutAnyOrigin],
-    bodies: LayoutTensor[T, L_BODIES, MutAnyOrigin],
-    xpos: LayoutTensor[T, L_XPOS, MutAnyOrigin],
-    xquat: LayoutTensor[T, L_XQUAT, MutAnyOrigin],
-    mesh_meta: LayoutTensor[T, L_MESH_META, MutAnyOrigin],
-    mesh_tris: LayoutTensor[T, L_TRI, MutAnyOrigin],
-    hf_meta: LayoutTensor[T, L_HF_META, MutAnyOrigin],
-    hf_data: LayoutTensor[T, L_HF, MutAnyOrigin],
-    rays: LayoutTensor[T, L_RAYS, MutAnyOrigin],
-    out_t: LayoutTensor[T, L_OUT, MutAnyOrigin],
+    geoms: TileTensor[T, L_GEOMS, MutAnyOrigin],
+    bodies: TileTensor[T, L_BODIES, MutAnyOrigin],
+    xpos: TileTensor[T, L_XPOS, MutAnyOrigin],
+    xquat: TileTensor[T, L_XQUAT, MutAnyOrigin],
+    mesh_meta: TileTensor[T, L_MESH_META, MutAnyOrigin],
+    mesh_tris: TileTensor[T, L_TRI, MutAnyOrigin],
+    hf_meta: TileTensor[T, L_HF_META, MutAnyOrigin],
+    hf_data: TileTensor[T, L_HF, MutAnyOrigin],
+    rays: TileTensor[T, L_RAYS, MutAnyOrigin],
+    out_t: TileTensor[T, L_OUT, MutAnyOrigin],
 ) where T.is_floating_point():
     """One thread per ray.
 
@@ -239,14 +240,14 @@ def test_ray_model_gpu_matches_cpu() raises:
     var cpu_t = List[Float64]()
     var cpu_g = List[Int]()
     var cpu_n = List[Float64]()
-    var geoms_c = m.geoms.lt["cpu", L_GEOMS]()
-    var bodies_c = m.bodies.lt["cpu", L_BODIES]()
-    var xpos_c = d.xpos.lt["cpu", L_XPOS]()
-    var xquat_c = d.xquat.lt["cpu", L_XQUAT]()
-    var mm_c = m.mesh_meta.lt["cpu", L_MESH_META]()
-    var mt_c = m.mesh_tris.lt["cpu", L_TRI]()
-    var hm_c = m.hfield_meta.lt["cpu", L_HF_META]()
-    var hd_c = d.hfield_data.lt["cpu", L_HF]()
+    var geoms_c = m.geoms.tt["cpu", NGEOM, MODEL_GEOM_SIZE]()
+    var bodies_c = m.bodies.tt["cpu", NBODY, MODEL_BODY_SIZE]()
+    var xpos_c = d.xpos.tt["cpu", 1, NBODY * 3]()
+    var xquat_c = d.xquat.tt["cpu", 1, NBODY * 4]()
+    var mm_c = m.mesh_meta.tt["cpu", MAX_GPU_MESHES * MODEL_MESH_META_SIZE]()
+    var mt_c = m.mesh_tris.tt["cpu", NTRI * 9]()
+    var hm_c = m.hfield_meta.tt["cpu", MAX_GPU_HFIELDS * MODEL_HFIELD_META_SIZE]()
+    var hd_c = d.hfield_data.tt["cpu", NHF]()
     for i in range(NRAY):
         var eye = Vec3Generic[GT](
             rays.data[i * 6 + 0], rays.data[i * 6 + 1], rays.data[i * 6 + 2]
@@ -272,16 +273,16 @@ def test_ray_model_gpu_matches_cpu() raises:
     out.upload(ctx)
     comptime BLOCKS = (NRAY + TPB - 1) // TPB
     ctx.enqueue_function[_ray_kernel[GT]](
-        m.geoms.lt["gpu", L_GEOMS](),
-        m.bodies.lt["gpu", L_BODIES](),
-        d.xpos.lt["gpu", L_XPOS](),
-        d.xquat.lt["gpu", L_XQUAT](),
-        m.mesh_meta.lt["gpu", L_MESH_META](),
-        m.mesh_tris.lt["gpu", L_TRI](),
-        m.hfield_meta.lt["gpu", L_HF_META](),
-        d.hfield_data.lt["gpu", L_HF](),
-        rays.lt["gpu", L_RAYS](),
-        out.lt["gpu", L_OUT](),
+        m.geoms.tt["gpu", NGEOM, MODEL_GEOM_SIZE](),
+        m.bodies.tt["gpu", NBODY, MODEL_BODY_SIZE](),
+        d.xpos.tt["gpu", 1, NBODY * 3](),
+        d.xquat.tt["gpu", 1, NBODY * 4](),
+        m.mesh_meta.tt["gpu", MAX_GPU_MESHES * MODEL_MESH_META_SIZE](),
+        m.mesh_tris.tt["gpu", NTRI * 9](),
+        m.hfield_meta.tt["gpu", MAX_GPU_HFIELDS * MODEL_HFIELD_META_SIZE](),
+        d.hfield_data.tt["gpu", NHF](),
+        rays.tt["gpu", NRAY, 6](),
+        out.tt["gpu", NRAY, 5](),
         grid_dim=(BLOCKS,),
         block_dim=(TPB,),
     )

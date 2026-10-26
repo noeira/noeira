@@ -12,6 +12,7 @@ Functions:
 """
 
 from std.math import sqrt, sin, cos, acos, atan2, abs
+from std.sys import is_nvidia_gpu
 
 # MuJoCo's `mjMINVAL` (`mjmodel.h`). `mju_normalize4` skips the division when
 # `mju_abs(norm - 1) <= mjMINVAL`; the compiler's `mjuu_normvec` uses `mjEPS`
@@ -248,8 +249,9 @@ def axis_angle_to_quat[
         DTYPE.is_floating_point()
     ), "DTYPE must be a floating point type"
     var half = angle.cast[DTYPE]() * 0.5
-    var s = Scalar[DTYPE](sin(half))
-    var c = Scalar[DTYPE](cos(half))
+    var sc = sin_cos_device(half)
+    var s = sc[0]
+    var c = sc[1]
 
     return (ax * s, ay * s, az * s, c)
 
@@ -357,8 +359,9 @@ def quat_integrate[
 
     var angle = dt * wn
     var half = Scalar[DTYPE](0.5) * angle
-    var s = Scalar[DTYPE](sin(half)) / wn  # fold the axis normalization in
-    var c = Scalar[DTYPE](cos(half))
+    var sc = sin_cos_device(half)
+    var s = sc[0] / wn  # fold the axis normalization in
+    var c = sc[1]
 
     var rx = wx * s
     var ry = wy * s
@@ -366,6 +369,82 @@ def quat_integrate[
 
     # q * qrot — right multiplication (local frame).
     return quat_mul(q[0], q[1], q[2], q[3], rx, ry, rz, c)
+
+
+@always_inline
+def sin_cos_device[
+    DTYPE: DType
+](x: Scalar[DTYPE]) -> Tuple[Scalar[DTYPE], Scalar[DTYPE]]:
+    """`(sin(x), cos(x))`, accurate to ~1 ulp on NVIDIA as well.
+
+    ⚠ CUDA LOWERS float32 `std.math.sin` / `cos` TO `sin.approx.f32` /
+    `cos.approx.f32` (the MUFU unit): measured on an RTX 5090, 3.3e-7 absolute
+    error on [-1.6, 1.6] (Metal 1.2e-7, host 6e-8) and 1e-5 RELATIVE at
+    small angles: sin(0.025) = 0.024997149 for 0.024997396. Every hinge
+    quaternion in FK carried that, and it alone moved
+    `test_euler_finalize_gpu_parity` from 1.5e-6 to 2.24e-5; with this
+    function the 5090 reads 1.52e-6 again.
+
+    On NVIDIA float32: cephes `sinf` / `cosf`. j = the octant of |x| rounded
+    to even, a three-part Cody-Waite reduction of |x| by j * pi/4 into
+    [-pi/4, pi/4], then the minimax polynomials, chosen and signed by the
+    quadrant. Accurate to ~1 ulp up to |x| ~ 8192 (the reduction's limit).
+    Everywhere else (the CPU, Metal, float64) it is `std.math` unchanged, so
+    those results do not move. Gated in `tests/physics3d/test_sin_cos_device.mojo`.
+
+    ⚠ IT COSTS ~8x THE MUFU PAIR IN ISOLATION, ~1% OF A STEP. 5090,
+    `benchmarks/bench_sin_cos_device.mojo`: 0.078 vs 0.63 ms for 268M pairs.
+    `bench_half_cheetah_batch`, A/B interleaved twice: +0.4 to +1.3% per env
+    step (1 to 4096 envs, eager and graph). This is the price CUDA's own
+    non-fast-math `sinf` charges; an if-chain or selects for the quadrant
+    measured the same.
+    """
+    comptime assert (
+        DTYPE.is_floating_point()
+    ), "DTYPE must be a floating point type"
+    comptime if is_nvidia_gpu() and DTYPE == DType.float32:
+        comptime FOUR_OVER_PI = Scalar[DTYPE](1.2732395447351628)
+        comptime DP1 = Scalar[DTYPE](0.78515625)
+        comptime DP2 = Scalar[DTYPE](2.4187564849853515625e-4)
+        comptime DP3 = Scalar[DTYPE](3.77489497744594108e-8)
+        var ax = abs(x)
+        var j = Int(ax * FOUR_OVER_PI)
+        if (j & 1) == 1:
+            j += 1
+        var y = Scalar[DTYPE](j)
+        var q = j & 7
+        var z = ((ax - y * DP1) - y * DP2) - y * DP3
+        var zz = z * z
+        var ps = z + z * zz * (
+            (Scalar[DTYPE](-1.9515295891e-4) * zz + Scalar[DTYPE](8.3321608736e-3))
+            * zz
+            - Scalar[DTYPE](1.6666654611e-1)
+        )
+        var pc = (
+            Scalar[DTYPE](1.0)
+            - Scalar[DTYPE](0.5) * zz
+            + zz
+            * zz
+            * (
+                (Scalar[DTYPE](2.443315711809948e-5) * zz - Scalar[DTYPE](1.388731625493765e-3))
+                * zz
+                + Scalar[DTYPE](4.166664568298827e-2)
+            )
+        )
+        # q in {0, 2, 4, 6}: the quarter turn |x| was reduced by.
+        #   q   sin   cos
+        #   0   +ps   +pc
+        #   2   +pc   -ps
+        #   4   -ps   -pc
+        #   6   -pc   +ps
+        var swap = (q & 2) != 0
+        var s = pc if swap else ps
+        var c = ps if swap else pc
+        var s_neg = ((q & 4) != 0) != (x < Scalar[DTYPE](0))
+        var c_neg = ((q + 2) & 4) != 0
+        return (-s if s_neg else s, -c if c_neg else c)
+    else:
+        return (sin(x), cos(x))
 
 
 @always_inline
@@ -553,8 +632,9 @@ def gpu_axis_angle_to_quat[
         DTYPE.is_floating_point()
     ), "DTYPE must be a floating point type"
     var half = angle.cast[DTYPE]() * 0.5
-    var s = Scalar[DTYPE](sin(half))
-    var c = Scalar[DTYPE](cos(half))
+    var sc = sin_cos_device(half)
+    var s = sc[0]
+    var c = sc[1]
 
     # ⚠ THE ZERO-AXIS GUARD IS A BRANCH, NOT AN EPSILON UNDER THE SQRT. This
     # was `1.0 / sqrt(len_sq + 1e-10)`, which for the unit axis every caller

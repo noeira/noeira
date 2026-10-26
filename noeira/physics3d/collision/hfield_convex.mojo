@@ -44,7 +44,7 @@ translation.
 
 from std.math import sqrt, floor, ceil
 
-from layout import Layout, LayoutTensor
+from layout import TileTensor, TensorLayout
 
 from ..constants import GEOM_HFIELD
 from ..kinematics.quat_math import quat_rotate, quat_rotate_inverse, quat_mul
@@ -101,7 +101,7 @@ comptime HF_DEBUG: Bool = False
 @always_inline
 def _hf_push[
     DTYPE: DType,
-    L_HF_DATA: Layout,
+    L_HF_DATA: TensorLayout,
 ](
     mut prism: Array[Scalar[DTYPE], 18],
     r: Int,
@@ -113,7 +113,7 @@ def _hf_push[
     sy: Scalar[DTYPE],
     sz: Scalar[DTYPE],
     margin: Scalar[DTYPE],
-    hfield_data: LayoutTensor[DTYPE, L_HF_DATA, MutAnyOrigin],
+    hfield_data: TileTensor[DTYPE, L_HF_DATA, MutAnyOrigin],
     adr: Int,
     ncol: Int,
 ):
@@ -136,13 +136,13 @@ def _hf_push[
 
 def hfield_convex_contacts[
     DTYPE: DType,
-    L_HF_META: Layout,
-    L_HF_DATA: Layout,
-    L_MESH_VERTS: Layout,
-    L_MESH_VERT_EDGEADR: Layout,
-    L_MESH_EDGES: Layout,
-    L_CONTACTS: Layout,
-    L_WS: Layout,
+    L_HF_META: TensorLayout,
+    L_HF_DATA: TensorLayout,
+    L_MESH_VERTS: TensorLayout,
+    L_MESH_VERT_EDGEADR: TensorLayout,
+    L_MESH_EDGES: TensorLayout,
+    L_CONTACTS: TensorLayout,
+    L_WS: TensorLayout,
 ](
     hfield_id: Int,
     p1x: Scalar[DTYPE], p1y: Scalar[DTYPE], p1z: Scalar[DTYPE],
@@ -164,8 +164,8 @@ def hfield_convex_contacts[
     contact_friction_spin: Scalar[DTYPE],
     contact_friction_roll: Scalar[DTYPE],
     contact_condim: Int,
-    hfield_meta: LayoutTensor[DTYPE, L_HF_META, MutAnyOrigin],
-    hfield_data: LayoutTensor[DTYPE, L_HF_DATA, MutAnyOrigin],
+    hfield_meta: TileTensor[DTYPE, L_HF_META, MutAnyOrigin],
+    hfield_data: TileTensor[DTYPE, L_HF_DATA, MutAnyOrigin],
     # ⚠ THE PER-ENVIRONMENT STRIDE OF `hfield_data`, i.e. `NHFIELD_DATA`.
     # The grid moved from `Model` to `Data` when `quadruped escape` needed a
     # terrain per episode, so the tensor is now `[BATCH * NHFIELD_DATA]` and
@@ -173,13 +173,11 @@ def hfield_convex_contacts[
     # would read environment 0's terrain — which on a batch that resets at
     # different times looks like correlated policy behaviour, not a bug.
     hf_stride: Int,
-    mesh_verts: LayoutTensor[DTYPE, L_MESH_VERTS, MutAnyOrigin],
-    mesh_vert_edgeadr: LayoutTensor[
-        DTYPE, L_MESH_VERT_EDGEADR, MutAnyOrigin
-    ],
-    mesh_edges: LayoutTensor[DTYPE, L_MESH_EDGES, MutAnyOrigin],
-    contacts: LayoutTensor[DTYPE, L_CONTACTS, MutAnyOrigin],
-    ws: LayoutTensor[DTYPE, L_WS, MutAnyOrigin],
+    mesh_verts: TileTensor[DTYPE, L_MESH_VERTS, MutAnyOrigin],
+    mesh_vert_edgeadr: TileTensor[DTYPE, L_MESH_VERT_EDGEADR, MutAnyOrigin],
+    mesh_edges: TileTensor[DTYPE, L_MESH_EDGES, MutAnyOrigin],
+    contacts: TileTensor[DTYPE, L_CONTACTS, MutAnyOrigin],
+    ws: TileTensor[DTYPE, L_WS, MutAnyOrigin],
     mut num_contacts: Int,
     max_contacts: Int,
     env: Int,

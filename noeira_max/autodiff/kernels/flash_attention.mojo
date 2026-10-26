@@ -45,20 +45,22 @@ backward 32x32) and Apple's 32 KB at half the size.
 
 from std.math import exp2, log2, sqrt
 from std.sys import size_of
-from std.sys import has_nvidia_gpu_accelerator
+from std.sys import default_accelerator
 from max.gpu import thread_idx, block_idx, global_idx, WARP_SIZE
 from max.gpu.sync import barrier
 from max.gpu.memory import AddressSpace
 from max.gpu.primitives import warp
 from max.gpu.host import DeviceContext, DeviceBuffer
-from layout import Layout, LayoutTensor
+from std.memory import stack_allocation
+from std.sys import align_of
+from layout import Coord, TileTensor, row_major
 
 # noeira's `nn.constants`, inlined: this file is a copy (see the header).
 comptime DT = DType.float32
 comptime TPB = 128
 
 
-comptime _NV = has_nvidia_gpu_accelerator()
+comptime _NV = default_accelerator().is_nvidia_gpu()
 comptime FWD_TQ = 64 if _NV else 32
 comptime FWD_TK = 32 if _NV else 16
 comptime DQ_TQ = 32 if _NV else 16
@@ -69,10 +71,20 @@ comptime KV_TQ = 32 if _NV else 16
 comptime _NEG = Scalar[DT](-1e30)
 comptime _LOG2E = Scalar[DT](1.4426950408889634)
 
-comptime _Shared[R: Int, C: Int] = LayoutTensor[
-    DT, Layout.row_major(R, C), MutAnyOrigin,
-    address_space=AddressSpace.SHARED, alignment=16,
+# noeira's `core.tiles.RowMajor`, inlined like `DT`: this package builds alone.
+comptime RowMajor[*dims: Int] = type_of(row_major[*dims]())
+comptime _Shared[R: Int, C: Int] = TileTensor[
+    DT, RowMajor[R, C], MutAnyOrigin, address_space=AddressSpace.SHARED
 ]
+
+
+@always_inline
+def _shared[R: Int, C: Int]() -> _Shared[R, C]:
+    """A 16-byte-aligned shared tile (noeira's `shared_tile[..., alignment=16]`)."""
+    var p = stack_allocation[
+        R * C, Scalar[DT], alignment=16, address_space=AddressSpace.SHARED
+    ]()
+    return _Shared[R, C](ptr=p.as_unsafe_any_origin(), layout=RowMajor[R, C]())
 
 
 def flash_eligible[HD: Int, P_DROP: Float64]() -> Bool:
@@ -157,9 +169,7 @@ def _stash[
     comptime for ch in range(CH):
         var idx = t + ch * NT
         var rr = idx // C4
-        tile.aligned_store[4](
-            rr, (idx - rr * C4) * 4, _get4[4 * (R * HD // 4 // NT), 4 * ch](regs)
-        )
+        tile.store[width=4, alignment=align_of[SIMD[DT, 4]]()](Coord(rr, (idx - rr * C4) * 4), _get4[4 * (R * HD // 4 // NT), 4 * ch](regs))
 
 
 @always_inline
@@ -176,8 +186,8 @@ def _qk[
         var av = SIMD[DT, 16]()
         var bv = SIMD[DT, 16]()
         comptime for i in range(4):
-            _put4[16, 4 * i](av, a.aligned_load[4](r0 + i, d4 * 4))
-            _put4[16, 4 * i](bv, b.aligned_load[4](tx + CG * i, d4 * 4))
+            _put4[16, 4 * i](av, a.load[width=4, alignment=align_of[SIMD[DT, 4]]()](Coord(r0 + i, d4 * 4)))
+            _put4[16, 4 * i](bv, b.load[width=4, alignment=align_of[SIMD[DT, 4]]()](Coord(tx + CG * i, d4 * 4)))
         comptime for i in range(4):
             comptime for j in range(4):
                 comptime for e in range(4):
@@ -202,10 +212,10 @@ def _pv[
     for c4 in range(TK // 4):
         var pv = SIMD[DT, 16]()
         comptime for i in range(4):
-            _put4[16, 4 * i](pv, p.aligned_load[4](r0 + i, c4 * 4))
+            _put4[16, 4 * i](pv, p.load[width=4, alignment=align_of[SIMD[DT, 4]]()](Coord(r0 + i, c4 * 4)))
         comptime for cc in range(4):
             comptime for q in range(NC):
-                var vv = v.aligned_load[4](c4 * 4 + cc, (tx + CG * q) * 4)
+                var vv = v.load[width=4, alignment=align_of[SIMD[DT, 4]]()](Coord(c4 * 4 + cc, (tx + CG * q) * 4))
                 comptime for i in range(4):
                     comptime for e in range(4):
                         o[i * DPT + q * 4 + e] += pv[i * 4 + cc] * vv[e]
@@ -243,10 +253,10 @@ def _flash_fwd_kernel[
     var r0 = ty * 4
     var scale2 = Scalar[DT](Float32(1.0) / sqrt(Float32(HD))) * _LOG2E
 
-    var Qs = _Shared[TQ, HD + 4].stack_allocation()
-    var Ks = _Shared[TK, HD + 4].stack_allocation()
-    var Vs = _Shared[TK, HD + 4].stack_allocation()
-    var Ps = _Shared[TQ, TK + 4].stack_allocation()
+    var Qs = _shared[TQ, HD + 4]()
+    var Ks = _shared[TK, HD + 4]()
+    var Vs = _shared[TK, HD + 4]()
+    var Ps = _shared[TQ, TK + 4]()
 
     var base = b * IN_DIM + h * HD
     _stash[TQ, HD, NT](
@@ -378,11 +388,11 @@ def _flash_bwd_dq_kernel[
     var scale = Scalar[DT](Float32(1.0) / sqrt(Float32(HD)))
     var scale2 = scale * _LOG2E
 
-    var Qs = _Shared[TQ, HD + 4].stack_allocation()
-    var dOs = _Shared[TQ, HD + 4].stack_allocation()
-    var Ks = _Shared[TK, HD + 4].stack_allocation()
-    var Vs = _Shared[TK, HD + 4].stack_allocation()
-    var dSs = _Shared[TQ, TK + 4].stack_allocation()
+    var Qs = _shared[TQ, HD + 4]()
+    var dOs = _shared[TQ, HD + 4]()
+    var Ks = _shared[TK, HD + 4]()
+    var Vs = _shared[TK, HD + 4]()
+    var dSs = _shared[TQ, TK + 4]()
 
     var base = b * IN_DIM + h * HD
     var obase = b * OUT_DIM + h * HD
@@ -487,12 +497,12 @@ def _flash_bwd_dkdv_kernel[
     var scale = Scalar[DT](Float32(1.0) / sqrt(Float32(HD)))
     var scale2 = scale * _LOG2E
 
-    var Ks = _Shared[TK, HD + 4].stack_allocation()
-    var Vs = _Shared[TK, HD + 4].stack_allocation()
-    var Qs = _Shared[TQ, HD + 4].stack_allocation()
-    var dOs = _Shared[TQ, HD + 4].stack_allocation()
-    var Pt = _Shared[TK, TQ + 4].stack_allocation()
-    var dSt = _Shared[TK, TQ + 4].stack_allocation()
+    var Ks = _shared[TK, HD + 4]()
+    var Vs = _shared[TK, HD + 4]()
+    var Qs = _shared[TQ, HD + 4]()
+    var dOs = _shared[TQ, HD + 4]()
+    var Pt = _shared[TK, TQ + 4]()
+    var dSt = _shared[TK, TQ + 4]()
 
     var base = b * IN_DIM + h * HD
     var obase = b * OUT_DIM + h * HD
@@ -547,12 +557,12 @@ def _flash_bwd_dkdv_kernel[
             var pv = SIMD[DT, 16]()
             var sv = SIMD[DT, 16]()
             comptime for i in range(4):
-                _put4[16, 4 * i](pv, Pt.aligned_load[4](k0 + i, r4 * 4))
-                _put4[16, 4 * i](sv, dSt.aligned_load[4](k0 + i, r4 * 4))
+                _put4[16, 4 * i](pv, Pt.load[width=4, alignment=align_of[SIMD[DT, 4]]()](Coord(k0 + i, r4 * 4)))
+                _put4[16, 4 * i](sv, dSt.load[width=4, alignment=align_of[SIMD[DT, 4]]()](Coord(k0 + i, r4 * 4)))
             comptime for rr in range(4):
                 comptime for q in range(NCK):
-                    var dov = dOs.aligned_load[4](r4 * 4 + rr, (dg + DG * q) * 4)
-                    var qv = Qs.aligned_load[4](r4 * 4 + rr, (dg + DG * q) * 4)
+                    var dov = dOs.load[width=4, alignment=align_of[SIMD[DT, 4]]()](Coord(r4 * 4 + rr, (dg + DG * q) * 4))
+                    var qv = Qs.load[width=4, alignment=align_of[SIMD[DT, 4]]()](Coord(r4 * 4 + rr, (dg + DG * q) * 4))
                     comptime for i in range(4):
                         comptime for e in range(4):
                             dv[i * DPK + q * 4 + e] += pv[i * 4 + rr] * dov[e]

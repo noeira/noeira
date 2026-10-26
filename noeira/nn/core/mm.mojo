@@ -19,9 +19,9 @@ So: static views on NVIDIA and at a single row, runtime views otherwise.
 `MM_FORCE_STATIC` lets a gate compile the static branch on a box that
 would take the runtime one, so both branches are built here.
 """
-from std.sys import has_nvidia_gpu_accelerator
+from std.sys import default_accelerator
 from max.gpu.host import DeviceContext, DeviceBuffer
-from layout import TileTensor, row_major
+from layout import Coord, TileTensor, row_major
 from linalg.matmul import matmul as max_matmul
 from linalg.utils import elementwise_epilogue_type
 from std.utils.index import IndexList
@@ -34,7 +34,7 @@ comptime MM_FORCE_STATIC: Bool = False
 
 @always_inline
 def mm_static_views[rows: Int]() -> Bool:
-    return has_nvidia_gpu_accelerator() or MM_FORCE_STATIC or rows == 1
+    return default_accelerator().is_nvidia_gpu() or MM_FORCE_STATIC or rows == 1
 
 
 @always_inline
@@ -82,7 +82,7 @@ def mm_bias[
     (`benchmarks/bench_matmul_epilogue_fusion.mojo`, `residency_repro`).
     The stored value is the GEMM's fp32 result plus the bias, the same
     operation the separate pass did."""
-    comptime assert has_nvidia_gpu_accelerator(), (
+    comptime assert default_accelerator().is_nvidia_gpu(), (
         "mm_bias: the epilogue's captured bias is not resident on Metal"
     )
     var av = TileTensor(a, row_major[A0, A1]())
@@ -95,11 +95,13 @@ def mm_bias[
     @__copy_capture(ov, biasv)
     def _add_bias[
         dtype: DType, width: SIMDLength, *, alignment: Int = 1
-    ](coords: IndexList[2], val: SIMD[dtype, width]) capturing -> None:
+    ](coords: Coord, val: SIMD[dtype, width]) capturing -> None:
         var out = val.cast[dt]()
         comptime for i in range(width):
-            out[i] += rebind[Scalar[dt]](biasv[coords[1] + i])
-        ov.store_linear[alignment=alignment](coords, out)
+            out[i] += rebind[Scalar[dt]](biasv[Int(coords[1].value()) + i])
+        ov.store_linear[alignment=alignment](
+            IndexList[2](Int(coords[0].value()), Int(coords[1].value())), out
+        )
 
     max_matmul[
         target="gpu",

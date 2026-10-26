@@ -17,9 +17,9 @@ from std.math import max, log10
 from max.gpu import global_idx
 from max.gpu.host import DeviceContext
 from max.gpu.memory import AddressSpace
-from layout import Layout, LayoutTensor
 
 from noeira.nn.constants import DT, TPB
+from noeira.core.tiles import Tile, tile
 
 
 def masked_recon_loss[
@@ -81,10 +81,10 @@ def full_recon_psnr[
 def _masked_grad_kernel[
     N: Int, DP: Int
 ](
-    pred: LayoutTensor[DT, Layout.row_major(N), MutAnyOrigin],
-    target: LayoutTensor[DT, Layout.row_major(N), MutAnyOrigin],
-    keep: LayoutTensor[DT, Layout.row_major(N // DP), MutAnyOrigin],
-    grad_pred: LayoutTensor[DT, Layout.row_major(N), MutAnyOrigin],
+    pred: Tile[DT, N],
+    target: Tile[DT, N],
+    keep: Tile[DT, N // DP],
+    grad_pred: Tile[DT, N],
     denom: Scalar[DT],
 ):
     var idx = Int(global_idx.x)
@@ -112,10 +112,10 @@ def masked_recon_grad_gpu[
 ) raises:
     comptime N = BATCH * NP * DP
     var denom = Scalar[DT](Float64(N))
-    var p_lt = LayoutTensor[DT, Layout.row_major(N), MutAnyOrigin](pred)
-    var t_lt = LayoutTensor[DT, Layout.row_major(N), MutAnyOrigin](target)
-    var k_lt = LayoutTensor[DT, Layout.row_major(N // DP), MutAnyOrigin](keep)
-    var g_lt = LayoutTensor[DT, Layout.row_major(N), MutAnyOrigin](grad_pred)
+    var p_lt = tile[N](pred)
+    var t_lt = tile[N](target)
+    var k_lt = tile[N // DP](keep)
+    var g_lt = tile[N](grad_pred)
     comptime nb = (N + TPB - 1) // TPB
     ctx.enqueue_function[_masked_grad_kernel[N, DP]](
         p_lt, t_lt, k_lt, g_lt, denom, grid_dim=nb, block_dim=TPB

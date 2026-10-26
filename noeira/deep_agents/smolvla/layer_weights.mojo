@@ -25,6 +25,48 @@ to write into the prefix cache. A composed `Sequential`/`Repeat` tower hands bac
 only its final activation, so there is nowhere to reach in. These structs own the
 parameters and expose them by name; the loop that drives them lives in
 `fused.mojo`.
+
+## LoRA
+
+`LORA_R > 0` gives each of the seven linears a `LoRAAdapter` of that rank
+(`<name>_lora`, beside the linear it adapts), walked right after it as
+`<name>.lora_A` / `<name>.lora_B`. `fused.mojo` calls `lora_fwd` / `lora_vjp`
+after every linear's `forward` / `vjp`; at `LORA_R = 0`, the default, the
+adapters are never built or walked and both calls compile to nothing, so the
+type, its walk and every checkpoint are what they were.
+
+`walk[..., WITH_LORA=False]` walks the base parameters only: what the
+checkpoint name maps describe (`SmolVLAPolicy.load`) and what freezing the
+base for LoRA training freezes. The default walk, the optimizers' and the
+checkpoints', includes the adapters.
+
+## Int4 (Q4_0)
+
+`Q4 = True` replaces the seven `Linear`s with `QLinear`s (`nn/quant`): frozen
+Q4_0 weights, MAX's int4 GEMM on NVIDIA, a dequantized fp32 GEMM elsewhere.
+The `Linear` fields are then never built and never walked, so the layer's
+walk is its two norms (and adapters, at `LORA_R > 0`); the int4 weights load
+through `load_q4`, from an fp32 file quantized on the fly, or from Q4_0
+blocks. At `Q4 = False`, the default, the `QLinear` fields are 32 x 32
+placeholders that are never built, and the layer is what it was.
+
+`fused.mojo` drives a projection with `proj_fwd` / `proj_vjp`: the base
+linear (`Linear` or `QLinear`), then its adapter's hook, in that order, which
+is what the loop called before these two existed.
+
+`load_q4` quantizes the fp32 weights by round-to-nearest; `load_q4_blocks`
+reads Q4_0 blocks made beforehand (GPTQ, `gptq_calib.mojo`) from a file that
+keys each linear by the checkpoint's own name plus `.q4_0`
+(`q4_blocks_key`).
+
+## Calibration taps (GPTQ)
+
+`hessian_start` gives the layer four `HessianAccumulator`s, and from then on
+`proj_fwd` adds each projection's input to the one its linear reads: q / k / v
+share the attention input (a self-attention layer: `KV_IN == W`), gate / up
+the MLP input, o and down their own. `hessian_take` hands them back and
+turns the taps off. With no accumulators, the default, `proj_fwd` checks one
+list length and does what it did.
 """
 
 from max.gpu.host import DeviceContext
@@ -32,9 +74,18 @@ from max.gpu.host import DeviceContext
 from noeira.nn.constants import DT
 from noeira.nn.core.initializer import Initializer
 from noeira.nn.core.param import ParamVisitor
+from noeira.nn.core.tensor import Tensor
+from noeira.nn.core.tensor_refs import TensorRefs
 from noeira.nn.core.walkers import join_name
 from noeira.nn.primitives.linear import Linear
 from noeira.nn.primitives.rms_norm import RMSNorm
+from noeira.nn.peft.lora import LoRAAdapter
+from noeira.nn.quant.q4_0 import Q4_GROUP, Q4_BLOCK
+from noeira.nn.quant.hessian import HessianAccumulator
+from noeira.nn.quant.qlinear import QLinear
+from noeira.nn.core.torch_names import TorchNameMap, TN_ZEROS
+from noeira.io.safetensors import SafeTensors
+from max.gpu.host import DeviceBuffer
 
 comptime SMOLLM_RMS_EPS: Scalar[DT] = 1e-5
 """⚠ SmolLM2's `rms_norm_eps`. `nn`'s `RMSNorm` defaults to **1e-4**, ten times
@@ -43,40 +94,137 @@ Every norm in both towers is pinned to this."""
 
 comptime SmolNorm[D: Int] = RMSNorm[D, SMOLLM_RMS_EPS]
 
+# The seven projections, for `proj_fwd` / `proj_vjp` and the adapters'
+# `lora_fwd` / `lora_vjp` (named for the adapters, which came first).
+comptime LORA_Q = 0
+comptime LORA_K = 1
+comptime LORA_V = 2
+comptime LORA_O = 3
+comptime LORA_GATE = 4
+comptime LORA_UP = 5
+comptime LORA_DOWN = 6
 
-struct DecoderMLP[W: Int, FF: Int](Movable):
-    """`down(silu(gate(x)) * up(x))` — three separate `Linear`s, as shipped."""
+# The four calibration Hessians of a layer (`hessian_start`): the inputs of
+# q / k / v, of o, of gate / up, and of down.
+comptime HESS_ATTN = 0
+comptime HESS_O = 1
+comptime HESS_MLP = 2
+comptime HESS_DOWN = 3
+
+
+def q4_proj_name(which: Int) -> String:
+    """Projection `which` (LORA_Q .. LORA_DOWN) as our name inside a layer:
+    `self_attn.q` .. `mlp.down`."""
+    var names: List[String] = [
+        "self_attn.q", "self_attn.k", "self_attn.v", "self_attn.o",
+        "mlp.gate", "mlp.up", "mlp.down",
+    ]
+    return names[which]
+
+
+def q4_hess_slot(which: Int) -> Int:
+    """The calibration Hessian projection `which` reads (HESS_*)."""
+    if which <= LORA_V:
+        return HESS_ATTN
+    if which == LORA_O:
+        return HESS_O
+    if which <= LORA_UP:
+        return HESS_MLP
+    return HESS_DOWN
+
+
+def q4_blocks_key(ref names: TorchNameMap, ours: String) raises -> String:
+    """The key of a linear's Q4_0 blocks in a blocks file: the checkpoint's
+    name for `<ours>.weight`, plus `.q4_0`."""
+    var wi = names.index_of_ours(ours + ".weight")
+    if wi < 0:
+        raise Error("q4_blocks_key: the name map has no '" + ours + ".weight'")
+    return names.theirs[wi] + ".q4_0"
+
+
+struct DecoderMLP[W: Int, FF: Int, LORA_R: Int = 0, Q4: Bool = False](Movable):
+    """`down(silu(gate(x)) * up(x))` — three separate `Linear`s, as shipped,
+    and with `LORA_R > 0` an adapter beside each (module docstring). `Q4`
+    makes the three linears `QLinear`s."""
+
+    comptime AR = Self.LORA_R if Self.LORA_R > 0 else 1
+    """The adapters' rank type parameter; never built at `LORA_R = 0`."""
+    comptime QW_ = Self.W if Self.Q4 else Q4_GROUP
+    comptime QFF = Self.FF if Self.Q4 else Q4_GROUP
+    """The int4 linears' dims: placeholders, never built, at `Q4 = False`."""
 
     var gate: Linear[Self.W, Self.FF]
     var up: Linear[Self.W, Self.FF]
     var down: Linear[Self.FF, Self.W]
+    var gate_lora: LoRAAdapter[Self.W, Self.FF, Self.AR]
+    var up_lora: LoRAAdapter[Self.W, Self.FF, Self.AR]
+    var down_lora: LoRAAdapter[Self.FF, Self.W, Self.AR]
+    var gate_q4: QLinear[Self.QW_, Self.QFF]
+    var up_q4: QLinear[Self.QW_, Self.QFF]
+    var down_q4: QLinear[Self.QFF, Self.QW_]
 
     def __init__(out self):
         self.gate = Linear[Self.W, Self.FF]()
         self.up = Linear[Self.W, Self.FF]()
         self.down = Linear[Self.FF, Self.W]()
+        self.gate_lora = LoRAAdapter[Self.W, Self.FF, Self.AR]()
+        self.up_lora = LoRAAdapter[Self.W, Self.FF, Self.AR]()
+        self.down_lora = LoRAAdapter[Self.FF, Self.W, Self.AR]()
+        self.gate_q4 = QLinear[Self.QW_, Self.QFF]()
+        self.up_q4 = QLinear[Self.QW_, Self.QFF]()
+        self.down_q4 = QLinear[Self.QFF, Self.QW_]()
 
     def __init__(out self, *, deinit move: Self):
         self.gate = move.gate^
         self.up = move.up^
         self.down = move.down^
+        self.gate_lora = move.gate_lora^
+        self.up_lora = move.up_lora^
+        self.down_lora = move.down_lora^
+        self.gate_q4 = move.gate_q4^
+        self.up_q4 = move.up_q4^
+        self.down_q4 = move.down_q4^
 
     @staticmethod
     def make[
         target: StaticString, INIT: Initializer
     ](ctx: Optional[DeviceContext] = None) raises -> Self:
         var m = Self()
-        m.gate = Linear[Self.W, Self.FF].make[target, INIT](ctx)
-        m.up = Linear[Self.W, Self.FF].make[target, INIT](ctx)
-        m.down = Linear[Self.FF, Self.W].make[target, INIT](ctx)
+        comptime if not Self.Q4:
+            m.gate = Linear[Self.W, Self.FF].make[target, INIT](ctx)
+            m.up = Linear[Self.W, Self.FF].make[target, INIT](ctx)
+            m.down = Linear[Self.FF, Self.W].make[target, INIT](ctx)
+        comptime if Self.LORA_R > 0:
+            m.gate_lora = LoRAAdapter[Self.W, Self.FF, Self.AR].make[target](ctx)
+            m.up_lora = LoRAAdapter[Self.W, Self.FF, Self.AR].make[target](ctx)
+            m.down_lora = LoRAAdapter[Self.FF, Self.W, Self.AR].make[target](ctx)
         return m^
 
     def walk[
-        target: StaticString, V: ParamVisitor
+        target: StaticString, V: ParamVisitor, WITH_LORA: Bool = True
     ](mut self, mut v: V, ctx: Optional[DeviceContext], prefix: String) raises:
-        self.gate.for_each_param[target](v, ctx, join_name(prefix, String("gate")))
-        self.up.for_each_param[target](v, ctx, join_name(prefix, String("up")))
-        self.down.for_each_param[target](v, ctx, join_name(prefix, String("down")))
+        comptime LORA = Self.LORA_R > 0 and WITH_LORA
+        var g = join_name(prefix, String("gate"))
+        var u = join_name(prefix, String("up"))
+        var d = join_name(prefix, String("down"))
+        comptime if not Self.Q4:
+            self.gate.for_each_param[target](v, ctx, g)
+        comptime if LORA:
+            self.gate_lora.walk[target](v, ctx, g)
+        comptime if not Self.Q4:
+            self.up.for_each_param[target](v, ctx, u)
+        comptime if LORA:
+            self.up_lora.walk[target](v, ctx, u)
+        comptime if not Self.Q4:
+            self.down.for_each_param[target](v, ctx, d)
+        comptime if LORA:
+            self.down_lora.walk[target](v, ctx, d)
+
+    def set_lora_alpha(mut self, alpha: Float64):
+        """PEFT's `lora_alpha` for the three adapters; nothing at R = 0."""
+        self.gate_lora.alpha = alpha
+        self.up_lora.alpha = alpha
+        self.down_lora.alpha = alpha
 
     def zero_grad[
         target: StaticString
@@ -84,9 +232,14 @@ struct DecoderMLP[W: Int, FF: Int](Movable):
         """⚠ The SAME three children as `walk`, in the same order. A component
         that is walked but not zeroed accumulates across steps forever; one
         that is zeroed but not walked never trains. Neither raises."""
-        self.gate.zero_grad[target](ctx)
-        self.up.zero_grad[target](ctx)
-        self.down.zero_grad[target](ctx)
+        comptime if not Self.Q4:
+            self.gate.zero_grad[target](ctx)
+            self.up.zero_grad[target](ctx)
+            self.down.zero_grad[target](ctx)
+        comptime if Self.LORA_R > 0:
+            self.gate_lora.zero_grad[target](ctx)
+            self.up_lora.zero_grad[target](ctx)
+            self.down_lora.zero_grad[target](ctx)
 
     def walk_state[
         target: StaticString, V: ParamVisitor
@@ -101,23 +254,36 @@ struct DecoderMLP[W: Int, FF: Int](Movable):
         statistic reloads to a model that behaves differently and says
         nothing.
         """
-        self.gate.for_each_state[target](
-            v, ctx, join_name(prefix, String("gate"))
-        )
-        self.up.for_each_state[target](
-            v, ctx, join_name(prefix, String("up"))
-        )
-        self.down.for_each_state[target](
-            v, ctx, join_name(prefix, String("down"))
-        )
+        comptime if not Self.Q4:
+            self.gate.for_each_state[target](
+                v, ctx, join_name(prefix, String("gate"))
+            )
+            self.up.for_each_state[target](
+                v, ctx, join_name(prefix, String("up"))
+            )
+            self.down.for_each_state[target](
+                v, ctx, join_name(prefix, String("down"))
+            )
 
 
 struct DecoderLayerWeights[
-    W: Int, FF: Int, QW: Int, KVW: Int, KV_IN: Int
+    W: Int, FF: Int, QW: Int, KVW: Int, KV_IN: Int, LORA_R: Int = 0,
+    Q4: Bool = False,
 ](Movable):
     """One expert layer. `KV_IN` is the only difference between the two kinds:
     `W` (720) for a self-attention layer, `KVW` (320) for a cross-attention one,
-    which reads the VLM's cached K/V instead of its own stream."""
+    which reads the VLM's cached K/V instead of its own stream. `LORA_R > 0`
+    adds an adapter beside each of the seven linears, `Q4` makes the seven
+    linears int4 `QLinear`s (module docstring)."""
+
+    comptime AR = Self.LORA_R if Self.LORA_R > 0 else 1
+    # The int4 linears' dims: 32 x 32 placeholders, never built, at Q4 = False.
+    comptime QI_W = Self.W if Self.Q4 else Q4_GROUP
+    comptime QI_KV = Self.KV_IN if Self.Q4 else Q4_GROUP
+    comptime QI_QW = Self.QW if Self.Q4 else Q4_GROUP
+    comptime QO_QW = Self.QW if Self.Q4 else Q4_GROUP
+    comptime QO_KVW = Self.KVW if Self.Q4 else Q4_GROUP
+    comptime QO_W = Self.W if Self.Q4 else Q4_GROUP
 
     var input_layernorm: SmolNorm[Self.W]
     var q: Linear[Self.W, Self.QW]
@@ -125,7 +291,17 @@ struct DecoderLayerWeights[
     var v: Linear[Self.KV_IN, Self.KVW]
     var o: Linear[Self.QW, Self.W]
     var post_attention_layernorm: SmolNorm[Self.W]
-    var mlp: DecoderMLP[Self.W, Self.FF]
+    var mlp: DecoderMLP[Self.W, Self.FF, Self.LORA_R, Self.Q4]
+    var q_lora: LoRAAdapter[Self.W, Self.QW, Self.AR]
+    var k_lora: LoRAAdapter[Self.KV_IN, Self.KVW, Self.AR]
+    var v_lora: LoRAAdapter[Self.KV_IN, Self.KVW, Self.AR]
+    var o_lora: LoRAAdapter[Self.QW, Self.W, Self.AR]
+    var q_q4: QLinear[Self.QI_W, Self.QO_QW]
+    var k_q4: QLinear[Self.QI_KV, Self.QO_KVW]
+    var v_q4: QLinear[Self.QI_KV, Self.QO_KVW]
+    var o_q4: QLinear[Self.QI_QW, Self.QO_W]
+    # Calibration taps: empty unless `hessian_start` (module docstring).
+    var hess: List[HessianAccumulator]
 
     def __init__(out self):
         self.input_layernorm = SmolNorm[Self.W]()
@@ -134,7 +310,16 @@ struct DecoderLayerWeights[
         self.v = Linear[Self.KV_IN, Self.KVW]()
         self.o = Linear[Self.QW, Self.W]()
         self.post_attention_layernorm = SmolNorm[Self.W]()
-        self.mlp = DecoderMLP[Self.W, Self.FF]()
+        self.mlp = DecoderMLP[Self.W, Self.FF, Self.LORA_R, Self.Q4]()
+        self.q_lora = LoRAAdapter[Self.W, Self.QW, Self.AR]()
+        self.k_lora = LoRAAdapter[Self.KV_IN, Self.KVW, Self.AR]()
+        self.v_lora = LoRAAdapter[Self.KV_IN, Self.KVW, Self.AR]()
+        self.o_lora = LoRAAdapter[Self.QW, Self.W, Self.AR]()
+        self.q_q4 = QLinear[Self.QI_W, Self.QO_QW]()
+        self.k_q4 = QLinear[Self.QI_KV, Self.QO_KVW]()
+        self.v_q4 = QLinear[Self.QI_KV, Self.QO_KVW]()
+        self.o_q4 = QLinear[Self.QI_QW, Self.QO_W]()
+        self.hess = List[HessianAccumulator]()
 
     def __init__(out self, *, deinit move: Self):
         self.input_layernorm = move.input_layernorm^
@@ -144,6 +329,15 @@ struct DecoderLayerWeights[
         self.o = move.o^
         self.post_attention_layernorm = move.post_attention_layernorm^
         self.mlp = move.mlp^
+        self.q_lora = move.q_lora^
+        self.k_lora = move.k_lora^
+        self.v_lora = move.v_lora^
+        self.o_lora = move.o_lora^
+        self.q_q4 = move.q_q4^
+        self.k_q4 = move.k_q4^
+        self.v_q4 = move.v_q4^
+        self.o_q4 = move.o_q4^
+        self.hess = move.hess^
 
     @staticmethod
     def make[
@@ -151,42 +345,428 @@ struct DecoderLayerWeights[
     ](ctx: Optional[DeviceContext] = None) raises -> Self:
         var l = Self()
         l.input_layernorm = SmolNorm[Self.W].make[target, INIT](ctx)
-        l.q = Linear[Self.W, Self.QW].make[target, INIT](ctx)
-        l.k = Linear[Self.KV_IN, Self.KVW].make[target, INIT](ctx)
-        l.v = Linear[Self.KV_IN, Self.KVW].make[target, INIT](ctx)
-        l.o = Linear[Self.QW, Self.W].make[target, INIT](ctx)
+        comptime if not Self.Q4:
+            l.q = Linear[Self.W, Self.QW].make[target, INIT](ctx)
+            l.k = Linear[Self.KV_IN, Self.KVW].make[target, INIT](ctx)
+            l.v = Linear[Self.KV_IN, Self.KVW].make[target, INIT](ctx)
+            l.o = Linear[Self.QW, Self.W].make[target, INIT](ctx)
         l.post_attention_layernorm = SmolNorm[Self.W].make[target, INIT](ctx)
-        l.mlp = DecoderMLP[Self.W, Self.FF].make[target, INIT](ctx)
+        l.mlp = DecoderMLP[Self.W, Self.FF, Self.LORA_R, Self.Q4].make[
+            target, INIT
+        ](ctx)
+        comptime if Self.LORA_R > 0:
+            l.q_lora = LoRAAdapter[Self.W, Self.QW, Self.AR].make[target](ctx)
+            l.k_lora = LoRAAdapter[Self.KV_IN, Self.KVW, Self.AR].make[target](ctx)
+            l.v_lora = LoRAAdapter[Self.KV_IN, Self.KVW, Self.AR].make[target](ctx)
+            l.o_lora = LoRAAdapter[Self.QW, Self.W, Self.AR].make[target](ctx)
         return l^
 
     def walk[
-        target: StaticString, V: ParamVisitor
+        target: StaticString, V: ParamVisitor, WITH_LORA: Bool = True
     ](mut self, mut vis: V, ctx: Optional[DeviceContext],
       prefix: String) raises:
+        comptime LORA = Self.LORA_R > 0 and WITH_LORA
         self.input_layernorm.for_each_param[target](
             vis, ctx, join_name(prefix, String("input_layernorm"))
         )
         var sa = join_name(prefix, String("self_attn"))
-        self.q.for_each_param[target](vis, ctx, join_name(sa, String("q")))
-        self.k.for_each_param[target](vis, ctx, join_name(sa, String("k")))
-        self.v.for_each_param[target](vis, ctx, join_name(sa, String("v")))
-        self.o.for_each_param[target](vis, ctx, join_name(sa, String("o")))
+        var nq = join_name(sa, String("q"))
+        var nk = join_name(sa, String("k"))
+        var nv = join_name(sa, String("v"))
+        var no = join_name(sa, String("o"))
+        comptime if not Self.Q4:
+            self.q.for_each_param[target](vis, ctx, nq)
+        comptime if LORA:
+            self.q_lora.walk[target](vis, ctx, nq)
+        comptime if not Self.Q4:
+            self.k.for_each_param[target](vis, ctx, nk)
+        comptime if LORA:
+            self.k_lora.walk[target](vis, ctx, nk)
+        comptime if not Self.Q4:
+            self.v.for_each_param[target](vis, ctx, nv)
+        comptime if LORA:
+            self.v_lora.walk[target](vis, ctx, nv)
+        comptime if not Self.Q4:
+            self.o.for_each_param[target](vis, ctx, no)
+        comptime if LORA:
+            self.o_lora.walk[target](vis, ctx, no)
         self.post_attention_layernorm.for_each_param[target](
             vis, ctx, join_name(prefix, String("post_attention_layernorm"))
         )
-        self.mlp.walk[target](vis, ctx, join_name(prefix, String("mlp")))
+        self.mlp.walk[target, V, WITH_LORA](
+            vis, ctx, join_name(prefix, String("mlp"))
+        )
+
+    def set_lora_alpha(mut self, alpha: Float64):
+        """PEFT's `lora_alpha` for the seven adapters; nothing at R = 0."""
+        self.q_lora.alpha = alpha
+        self.k_lora.alpha = alpha
+        self.v_lora.alpha = alpha
+        self.o_lora.alpha = alpha
+        self.mlp.set_lora_alpha(alpha)
+
+    def merge_lora[
+        target: StaticString
+    ](mut self, ctx: Optional[DeviceContext] = None) raises:
+        """Fold each of the seven adapters into its linear's weight
+        (`LoRAAdapter.merge_into`, which bumps the weight's version) and
+        freeze it: the layer then computes the same function with its base
+        GEMMs alone, and a merged adapter takes no gradient. Nothing at
+        R = 0."""
+        comptime assert not Self.Q4, (
+            "merge_lora: an int4 layer's weights are Q4_0 blocks; merging into"
+            " them would re-quantize. Keep the adapters unmerged (QLoRA)."
+        )
+        comptime if Self.LORA_R > 0:
+            self.q_lora.merge_into[target](self.q.weight.val, ctx)
+            self.k_lora.merge_into[target](self.k.weight.val, ctx)
+            self.v_lora.merge_into[target](self.v.weight.val, ctx)
+            self.o_lora.merge_into[target](self.o.weight.val, ctx)
+            self.mlp.gate_lora.merge_into[target](self.mlp.gate.weight.val, ctx)
+            self.mlp.up_lora.merge_into[target](self.mlp.up.weight.val, ctx)
+            self.mlp.down_lora.merge_into[target](self.mlp.down.weight.val, ctx)
+            self.q_lora.freeze()
+            self.k_lora.freeze()
+            self.v_lora.freeze()
+            self.o_lora.freeze()
+            self.mlp.gate_lora.freeze()
+            self.mlp.up_lora.freeze()
+            self.mlp.down_lora.freeze()
 
     def zero_grad[
         target: StaticString
     ](mut self, ctx: Optional[DeviceContext]) raises:
         """⚠ The SAME seven children as `walk`. See `DecoderMLP.zero_grad`."""
         self.input_layernorm.zero_grad[target](ctx)
-        self.q.zero_grad[target](ctx)
-        self.k.zero_grad[target](ctx)
-        self.v.zero_grad[target](ctx)
-        self.o.zero_grad[target](ctx)
+        comptime if not Self.Q4:
+            self.q.zero_grad[target](ctx)
+            self.k.zero_grad[target](ctx)
+            self.v.zero_grad[target](ctx)
+            self.o.zero_grad[target](ctx)
         self.post_attention_layernorm.zero_grad[target](ctx)
         self.mlp.zero_grad[target](ctx)
+        comptime if Self.LORA_R > 0:
+            self.q_lora.zero_grad[target](ctx)
+            self.k_lora.zero_grad[target](ctx)
+            self.v_lora.zero_grad[target](ctx)
+            self.o_lora.zero_grad[target](ctx)
+
+    # ── the projections, called by `fused.mojo` ────────────────────────
+    def proj_fwd[
+        WHICH: Int, target: StaticString, T: Int, o: MutOrigin
+    ](
+        mut self,
+        inputs: TensorRefs[1, o],
+        mut out: Tensor,
+        ctx: Optional[DeviceContext] = None,
+    ) raises:
+        """Projection WHICH (`LORA_Q` .. `LORA_DOWN`): its linear's forward
+        (`Linear`, or `QLinear` at `Q4`), then its adapter's share
+        (`lora_fwd`, nothing at `LORA_R = 0`). With calibration taps on
+        (`hessian_start`), the input first goes into its Hessian."""
+        if len(self.hess) > 0:
+            comptime if WHICH == LORA_Q:
+                self.hess[HESS_ATTN].add[target](inputs[0], T, ctx)
+            elif WHICH == LORA_O:
+                self.hess[HESS_O].add[target](inputs[0], T, ctx)
+            elif WHICH == LORA_GATE:
+                self.hess[HESS_MLP].add[target](inputs[0], T, ctx)
+            elif WHICH == LORA_DOWN:
+                self.hess[HESS_DOWN].add[target](inputs[0], T, ctx)
+        comptime if Self.Q4:
+            comptime if WHICH == LORA_Q:
+                self.q_q4.forward[target, T](inputs, out, ctx)
+            elif WHICH == LORA_K:
+                self.k_q4.forward[target, T](inputs, out, ctx)
+            elif WHICH == LORA_V:
+                self.v_q4.forward[target, T](inputs, out, ctx)
+            elif WHICH == LORA_O:
+                self.o_q4.forward[target, T](inputs, out, ctx)
+            elif WHICH == LORA_GATE:
+                self.mlp.gate_q4.forward[target, T](inputs, out, ctx)
+            elif WHICH == LORA_UP:
+                self.mlp.up_q4.forward[target, T](inputs, out, ctx)
+            else:
+                comptime assert WHICH == LORA_DOWN, "proj_fwd: WHICH is 0..6"
+                self.mlp.down_q4.forward[target, T](inputs, out, ctx)
+        else:
+            comptime if WHICH == LORA_Q:
+                self.q.forward[target, T](inputs, out, ctx)
+            elif WHICH == LORA_K:
+                self.k.forward[target, T](inputs, out, ctx)
+            elif WHICH == LORA_V:
+                self.v.forward[target, T](inputs, out, ctx)
+            elif WHICH == LORA_O:
+                self.o.forward[target, T](inputs, out, ctx)
+            elif WHICH == LORA_GATE:
+                self.mlp.gate.forward[target, T](inputs, out, ctx)
+            elif WHICH == LORA_UP:
+                self.mlp.up.forward[target, T](inputs, out, ctx)
+            else:
+                comptime assert WHICH == LORA_DOWN, "proj_fwd: WHICH is 0..6"
+                self.mlp.down.forward[target, T](inputs, out, ctx)
+        self.lora_fwd[WHICH, target, T](inputs, out, ctx)
+
+    def proj_vjp[
+        WHICH: Int, target: StaticString, T: Int, ofi: MutOrigin,
+        ogi: MutOrigin,
+    ](
+        mut self,
+        forward_input: TensorRefs[1, ofi],
+        mut grad_output: Tensor,
+        grad_inputs: TensorRefs[1, ogi],
+        ctx: Optional[DeviceContext] = None,
+    ) raises:
+        """Projection WHICH: its linear's `vjp`, then its adapter's
+        (`lora_vjp`), which adds onto the grad_input the linear wrote."""
+        comptime if Self.Q4:
+            comptime if WHICH == LORA_Q:
+                self.q_q4.vjp[target, T](forward_input, grad_output, grad_inputs, ctx)
+            elif WHICH == LORA_K:
+                self.k_q4.vjp[target, T](forward_input, grad_output, grad_inputs, ctx)
+            elif WHICH == LORA_V:
+                self.v_q4.vjp[target, T](forward_input, grad_output, grad_inputs, ctx)
+            elif WHICH == LORA_O:
+                self.o_q4.vjp[target, T](forward_input, grad_output, grad_inputs, ctx)
+            elif WHICH == LORA_GATE:
+                self.mlp.gate_q4.vjp[target, T](forward_input, grad_output, grad_inputs, ctx)
+            elif WHICH == LORA_UP:
+                self.mlp.up_q4.vjp[target, T](forward_input, grad_output, grad_inputs, ctx)
+            else:
+                comptime assert WHICH == LORA_DOWN, "proj_vjp: WHICH is 0..6"
+                self.mlp.down_q4.vjp[target, T](forward_input, grad_output, grad_inputs, ctx)
+        else:
+            comptime if WHICH == LORA_Q:
+                self.q.vjp[target, T](forward_input, grad_output, grad_inputs, ctx)
+            elif WHICH == LORA_K:
+                self.k.vjp[target, T](forward_input, grad_output, grad_inputs, ctx)
+            elif WHICH == LORA_V:
+                self.v.vjp[target, T](forward_input, grad_output, grad_inputs, ctx)
+            elif WHICH == LORA_O:
+                self.o.vjp[target, T](forward_input, grad_output, grad_inputs, ctx)
+            elif WHICH == LORA_GATE:
+                self.mlp.gate.vjp[target, T](forward_input, grad_output, grad_inputs, ctx)
+            elif WHICH == LORA_UP:
+                self.mlp.up.vjp[target, T](forward_input, grad_output, grad_inputs, ctx)
+            else:
+                comptime assert WHICH == LORA_DOWN, "proj_vjp: WHICH is 0..6"
+                self.mlp.down.vjp[target, T](forward_input, grad_output, grad_inputs, ctx)
+        self.lora_vjp[WHICH, target, T](forward_input, grad_output, grad_inputs, ctx)
+
+    # ── int4 ───────────────────────────────────────────────────────────
+    def load_q4[
+        target: StaticString
+    ](
+        mut self,
+        ref st: SafeTensors,
+        ref names: TorchNameMap,
+        prefix: String,
+        ctx: Optional[DeviceContext] = None,
+    ) raises -> Int:
+        """Fill the seven `QLinear`s from the fp32 (or bf16) torch weights of
+        `st`, found through `names` (the checkpoint's name map, our name
+        `<prefix>.self_attn.q.weight` and so on), quantized by round-to-
+        nearest on the Q4_0 grid. Returns the map entries claimed: each
+        weight and its zero bias (the published layers have none)."""
+        return self._load_q4[target](st, names, prefix, st, False, ctx)
+
+    def load_q4_blocks[
+        target: StaticString
+    ](
+        mut self,
+        ref st: SafeTensors,
+        ref names: TorchNameMap,
+        prefix: String,
+        ref blocks: SafeTensors,
+        ctx: Optional[DeviceContext] = None,
+    ) raises -> Int:
+        """`load_q4` with the seven linears' Q4_0 blocks read from `blocks`
+        (keys `q4_blocks_key`, U8 [OUT, IN / 32 · 18]) instead of quantized
+        from `st`, whose shapes and zero biases are still checked."""
+        return self._load_q4[target](st, names, prefix, blocks, True, ctx)
+
+    def _load_q4[
+        target: StaticString
+    ](
+        mut self,
+        st: SafeTensors,
+        names: TorchNameMap,
+        prefix: String,
+        blocks: SafeTensors,
+        from_blocks: Bool,
+        ctx: Optional[DeviceContext],
+    ) raises -> Int:
+        comptime assert Self.Q4, "load_q4: this layer is not int4 (Q4 = False)"
+        var n = 0
+        n += _load_one_q4[target](self.q_q4, st, names, join_name(prefix, q4_proj_name(LORA_Q)), blocks, from_blocks, ctx)
+        n += _load_one_q4[target](self.k_q4, st, names, join_name(prefix, q4_proj_name(LORA_K)), blocks, from_blocks, ctx)
+        n += _load_one_q4[target](self.v_q4, st, names, join_name(prefix, q4_proj_name(LORA_V)), blocks, from_blocks, ctx)
+        n += _load_one_q4[target](self.o_q4, st, names, join_name(prefix, q4_proj_name(LORA_O)), blocks, from_blocks, ctx)
+        n += _load_one_q4[target](self.mlp.gate_q4, st, names, join_name(prefix, q4_proj_name(LORA_GATE)), blocks, from_blocks, ctx)
+        n += _load_one_q4[target](self.mlp.up_q4, st, names, join_name(prefix, q4_proj_name(LORA_UP)), blocks, from_blocks, ctx)
+        n += _load_one_q4[target](self.mlp.down_q4, st, names, join_name(prefix, q4_proj_name(LORA_DOWN)), blocks, from_blocks, ctx)
+        return n
+
+    # ── calibration (GPTQ) ─────────────────────────────────────────────
+    def hessian_start(mut self):
+        """Turn the calibration taps on with four zeroed Hessians (module
+        docstring). Self-attention layers only: q, k and v must read the
+        same input."""
+        comptime assert Self.KV_IN == Self.W, (
+            "hessian_start: a cross-attention layer's k / v read the cache,"
+            " not the attention input"
+        )
+        self.hess = [
+            HessianAccumulator(Self.W),
+            HessianAccumulator(Self.QW),
+            HessianAccumulator(Self.W),
+            HessianAccumulator(Self.FF),
+        ]
+
+    def hessian_take(mut self) -> List[HessianAccumulator]:
+        """The four Hessians (HESS_*), and the taps off."""
+        var out = self.hess^
+        self.hess = List[HessianAccumulator]()
+        return out^
+
+    def base_weight(self, which: Int) raises -> List[Float32]:
+        """Projection `which`'s fp32 weight as [OUT, IN] (torch's
+        orientation, the one Q4_0 and GPTQ use), from the host copy."""
+        comptime assert not Self.Q4, "base_weight: an int4 layer has no fp32 weight"
+        if which == LORA_Q:
+            return _lin_out_in(self.q)
+        if which == LORA_K:
+            return _lin_out_in(self.k)
+        if which == LORA_V:
+            return _lin_out_in(self.v)
+        if which == LORA_O:
+            return _lin_out_in(self.o)
+        if which == LORA_GATE:
+            return _lin_out_in(self.mlp.gate)
+        if which == LORA_UP:
+            return _lin_out_in(self.mlp.up)
+        return _lin_out_in(self.mlp.down)
+
+    def set_base_weight[
+        target: StaticString
+    ](
+        mut self,
+        which: Int,
+        ref w: List[Float32],
+        ctx: Optional[DeviceContext] = None,
+    ) raises:
+        """Overwrite projection `which`'s fp32 weight with `w` [OUT, IN] (a
+        dequantized one, for sequential calibration), on the host and the
+        device, and bump its version so the weight caches refresh."""
+        comptime assert not Self.Q4, "set_base_weight: an int4 layer has no fp32 weight"
+        if which == LORA_Q:
+            _lin_set[target](self.q, w, ctx)
+        elif which == LORA_K:
+            _lin_set[target](self.k, w, ctx)
+        elif which == LORA_V:
+            _lin_set[target](self.v, w, ctx)
+        elif which == LORA_O:
+            _lin_set[target](self.o, w, ctx)
+        elif which == LORA_GATE:
+            _lin_set[target](self.mlp.gate, w, ctx)
+        elif which == LORA_UP:
+            _lin_set[target](self.mlp.up, w, ctx)
+        else:
+            _lin_set[target](self.mlp.down, w, ctx)
+
+    def proj_dims(self, which: Int) -> Tuple[Int, Int]:
+        """(IN, OUT) of projection `which`."""
+        if which == LORA_Q:
+            return (Self.W, Self.QW)
+        if which <= LORA_V:
+            return (Self.KV_IN, Self.KVW)
+        if which == LORA_O:
+            return (Self.QW, Self.W)
+        if which <= LORA_UP:
+            return (Self.W, Self.FF)
+        return (Self.FF, Self.W)
+
+    def share_q4_scratch(mut self, buf: DeviceBuffer[DT], n: Int) raises:
+        """Point the seven `QLinear`s' dequantize scratch at `buf`."""
+        comptime if Self.Q4:
+            self.q_q4.share_scratch(buf, n)
+            self.k_q4.share_scratch(buf, n)
+            self.v_q4.share_scratch(buf, n)
+            self.o_q4.share_scratch(buf, n)
+            self.mlp.gate_q4.share_scratch(buf, n)
+            self.mlp.up_q4.share_scratch(buf, n)
+            self.mlp.down_q4.share_scratch(buf, n)
+
+    def keep_only_repacked(mut self) raises:
+        """NVIDIA inference: each `QLinear` keeps only what MAX's int4 GEMM
+        reads (`QLinear.keep_only_repacked`)."""
+        comptime if Self.Q4:
+            self.q_q4.keep_only_repacked()
+            self.k_q4.keep_only_repacked()
+            self.v_q4.keep_only_repacked()
+            self.o_q4.keep_only_repacked()
+            self.mlp.gate_q4.keep_only_repacked()
+            self.mlp.up_q4.keep_only_repacked()
+            self.mlp.down_q4.keep_only_repacked()
+
+    # ── LoRA hooks, called by `proj_fwd` / `proj_vjp` after each linear ──
+    def lora_fwd[
+        WHICH: Int, target: StaticString, T: Int, o: MutOrigin
+    ](
+        mut self,
+        inputs: TensorRefs[1, o],
+        mut out: Tensor,
+        ctx: Optional[DeviceContext] = None,
+    ) raises:
+        """Projection WHICH's adapter (`LORA_Q` .. `LORA_DOWN`) adds its
+        share onto `out`, with the linear's own arguments. Nothing at
+        `LORA_R = 0`."""
+        comptime if Self.LORA_R > 0:
+            comptime if WHICH == LORA_Q:
+                self.q_lora.forward_add[target, T](inputs, out, ctx)
+            elif WHICH == LORA_K:
+                self.k_lora.forward_add[target, T](inputs, out, ctx)
+            elif WHICH == LORA_V:
+                self.v_lora.forward_add[target, T](inputs, out, ctx)
+            elif WHICH == LORA_O:
+                self.o_lora.forward_add[target, T](inputs, out, ctx)
+            elif WHICH == LORA_GATE:
+                self.mlp.gate_lora.forward_add[target, T](inputs, out, ctx)
+            elif WHICH == LORA_UP:
+                self.mlp.up_lora.forward_add[target, T](inputs, out, ctx)
+            else:
+                comptime assert WHICH == LORA_DOWN, "lora_fwd: WHICH is 0..6"
+                self.mlp.down_lora.forward_add[target, T](inputs, out, ctx)
+
+    def lora_vjp[
+        WHICH: Int, target: StaticString, T: Int, ofi: MutOrigin,
+        ogi: MutOrigin,
+    ](
+        mut self,
+        forward_input: TensorRefs[1, ofi],
+        mut grad_output: Tensor,
+        grad_inputs: TensorRefs[1, ogi],
+        ctx: Optional[DeviceContext] = None,
+    ) raises:
+        """Projection WHICH's adapter: dA, dB, and its share added onto the
+        linear's grad_input, with the linear's own arguments right after its
+        `vjp`. Nothing at `LORA_R = 0`."""
+        comptime if Self.LORA_R > 0:
+            comptime if WHICH == LORA_Q:
+                self.q_lora.vjp_add[target, T](forward_input, grad_output, grad_inputs, ctx)
+            elif WHICH == LORA_K:
+                self.k_lora.vjp_add[target, T](forward_input, grad_output, grad_inputs, ctx)
+            elif WHICH == LORA_V:
+                self.v_lora.vjp_add[target, T](forward_input, grad_output, grad_inputs, ctx)
+            elif WHICH == LORA_O:
+                self.o_lora.vjp_add[target, T](forward_input, grad_output, grad_inputs, ctx)
+            elif WHICH == LORA_GATE:
+                self.mlp.gate_lora.vjp_add[target, T](forward_input, grad_output, grad_inputs, ctx)
+            elif WHICH == LORA_UP:
+                self.mlp.up_lora.vjp_add[target, T](forward_input, grad_output, grad_inputs, ctx)
+            else:
+                comptime assert WHICH == LORA_DOWN, "lora_vjp: WHICH is 0..6"
+                self.mlp.down_lora.vjp_add[target, T](forward_input, grad_output, grad_inputs, ctx)
 
     def walk_state[
         target: StaticString, V: ParamVisitor
@@ -197,11 +777,90 @@ struct DecoderLayerWeights[
             vis, ctx, join_name(prefix, String("input_layernorm"))
         )
         var sa = join_name(prefix, String("self_attn"))
-        self.q.for_each_state[target](vis, ctx, join_name(sa, String("q")))
-        self.k.for_each_state[target](vis, ctx, join_name(sa, String("k")))
-        self.v.for_each_state[target](vis, ctx, join_name(sa, String("v")))
-        self.o.for_each_state[target](vis, ctx, join_name(sa, String("o")))
+        comptime if not Self.Q4:
+            self.q.for_each_state[target](vis, ctx, join_name(sa, String("q")))
+            self.k.for_each_state[target](vis, ctx, join_name(sa, String("k")))
+            self.v.for_each_state[target](vis, ctx, join_name(sa, String("v")))
+            self.o.for_each_state[target](vis, ctx, join_name(sa, String("o")))
         self.post_attention_layernorm.for_each_state[target](
             vis, ctx, join_name(prefix, String("post_attention_layernorm"))
         )
         self.mlp.walk_state[target](vis, ctx, join_name(prefix, String("mlp")))
+
+
+def _lin_out_in[IN: Int, OUT: Int](ref lin: Linear[IN, OUT]) -> List[Float32]:
+    """A `Linear`'s [IN, OUT] weight as [OUT, IN], from its host copy."""
+    var w = List[Float32](length=OUT * IN, fill=0)
+    for i in range(IN):
+        for o in range(OUT):
+            w[o * IN + i] = Float32(lin.weight.val.data[i * OUT + o])
+    return w^
+
+
+def _lin_set[
+    target: StaticString, IN: Int, OUT: Int
+](
+    mut lin: Linear[IN, OUT],
+    ref w: List[Float32],
+    ctx: Optional[DeviceContext],
+) raises:
+    """`w` [OUT, IN] into a `Linear`'s [IN, OUT] weight, host and device,
+    with the version bump that refreshes its caches."""
+    if len(w) != OUT * IN:
+        raise Error("set_base_weight: " + String(len(w)) + " values for ["
+                    + String(OUT) + ", " + String(IN) + "]")
+    for i in range(IN):
+        for o in range(OUT):
+            lin.weight.val.data[i * OUT + o] = Scalar[DT](w[o * IN + i])
+    comptime if target != "cpu":
+        lin.weight.val.upload_resident(ctx.value())
+    lin.weight.val.version += 1
+
+
+def _load_one_q4[
+    target: StaticString, IN: Int, OUT: Int
+](
+    mut ql: QLinear[IN, OUT],
+    st: SafeTensors,
+    names: TorchNameMap,
+    ours: String,
+    blocks: SafeTensors,
+    from_blocks: Bool,
+    ctx: Optional[DeviceContext],
+) raises -> Int:
+    """One projection: our `<ours>.weight` -> the file's name through the
+    map, checked against [OUT, IN] (the torch orientation `QLinear` keeps),
+    then read as fp32 and RTN-quantized, or (`from_blocks`) its Q4_0 blocks
+    read from `blocks` at `q4_blocks_key`. Returns 2: the weight and the
+    bias the map fills with zeros (a `QLinear` has none, which is that
+    zero)."""
+    var wi = names.index_of_ours(ours + ".weight")
+    if wi < 0:
+        raise Error("load_q4: the name map has no '" + ours + ".weight'")
+    var bi = names.index_of_ours(ours + ".bias")
+    if bi < 0 or names.kind[bi] != TN_ZEROS:
+        raise Error(
+            "load_q4: '" + ours + ".bias' is not a zero-filled map entry;"
+            " a QLinear has no bias to put a published one in"
+        )
+    var theirs = names.theirs[wi]
+    var shape = st.shape(theirs)
+    if len(shape) != 2 or shape[0] != OUT or shape[1] != IN:
+        raise Error(
+            "load_q4: '" + theirs + "' is " + st.shape_str(theirs)
+            + ", expected [" + String(OUT) + ", " + String(IN) + "]"
+        )
+    if from_blocks:
+        var key = theirs + ".q4_0"
+        var bshape = blocks.shape(key)
+        var row = (IN // Q4_GROUP) * Q4_BLOCK
+        if len(bshape) != 2 or bshape[0] != OUT or bshape[1] != row:
+            raise Error(
+                "load_q4_blocks: '" + key + "' is " + blocks.shape_str(key)
+                + ", expected [" + String(OUT) + ", " + String(row) + "]"
+            )
+        ql.set_blocks[target](blocks.read_raw(key), ctx)
+        return 2
+    var w = st.read_f32(theirs)
+    ql.set_weight[target](w, ctx)
+    return 2

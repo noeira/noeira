@@ -24,7 +24,7 @@ The allreduce here is a SUM. The 1/N of a mean is left to the caller, which
 folds it into the copy back into the gradient arena (`DataParallel`).
 """
 
-from std.sys import size_of, has_nvidia_gpu_accelerator
+from std.sys import size_of, default_accelerator
 from std.collections import Array
 
 from max.gpu import global_idx
@@ -220,7 +220,7 @@ struct ProcessGroup[N: Int](Movable):
         """`devices(max_elems)` when this process sees N NVIDIA GPUs, else
         `shared(ctx)`: the same program trains on a multi-GPU box and runs
         its ranks on one device (a Mac, a single GPU) everywhere else."""
-        comptime if has_nvidia_gpu_accelerator() and Self.N >= 2 and (
+        comptime if default_accelerator().is_nvidia_gpu() and Self.N >= 2 and (
             Self.N <= MAX_GPUS
         ):
             if DeviceContext.number_of_devices() >= Self.N:
@@ -252,7 +252,7 @@ struct ProcessGroup[N: Int](Movable):
         else:
             for r in range(Self.N):
                 self.comm_ctxs.append(DeviceContext(device_id=r))
-        comptime if has_nvidia_gpu_accelerator():
+        comptime if default_accelerator().is_nvidia_gpu():
             var a = CUDA(self.ctxs[0].stream())
             var b = CUDA(self.comm_ctxs[0].stream())
             var pa = Int(a.value()) if a else 0
@@ -401,7 +401,7 @@ struct ProcessGroup[N: Int](Movable):
         n: Int,
     ) raises:
         """MAX `comm` allreduce on the main contexts, or on the comm ones."""
-        comptime if has_nvidia_gpu_accelerator() and Self.N >= 2:
+        comptime if default_accelerator().is_nvidia_gpu() and Self.N >= 2:
             comptime InT = TileTensor[
                 DT, type_of(row_major(0)), ImmutAnyOrigin
             ]
@@ -467,7 +467,7 @@ struct ProcessGroup[N: Int](Movable):
             raise Error(
                 "reduce_scatter_sum: MAX's reduce-scatter requires P2P access"
             )
-        comptime if has_nvidia_gpu_accelerator() and Self.N >= 2:
+        comptime if default_accelerator().is_nvidia_gpu() and Self.N >= 2:
             comptime InT = TileTensor[
                 DT, type_of(row_major(0, 0)), ImmutAnyOrigin
             ]
@@ -527,7 +527,7 @@ struct ProcessGroup[N: Int](Movable):
                             bufs[r].create_sub_buffer[DT](off, n), src
                         )
             return
-        comptime if has_nvidia_gpu_accelerator() and Self.N >= 2:
+        comptime if default_accelerator().is_nvidia_gpu() and Self.N >= 2:
             comptime T1 = TileTensor[DT, type_of(row_major(0)), MutAnyOrigin]
             comptime InT = TileTensor[
                 DT, type_of(row_major(0)), ImmutAnyOrigin
@@ -598,7 +598,7 @@ struct ProcessGroup[N: Int](Movable):
                 for r in range(Self.N):
                     c.enqueue_copy(dsts[r].create_sub_buffer[DT](off, n), src)
             return
-        comptime if has_nvidia_gpu_accelerator() and Self.N >= 2:
+        comptime if default_accelerator().is_nvidia_gpu() and Self.N >= 2:
             comptime T1 = TileTensor[DT, type_of(row_major(0)), MutAnyOrigin]
             comptime InT = TileTensor[
                 DT, type_of(row_major(0)), ImmutAnyOrigin
@@ -644,8 +644,8 @@ struct ProcessGroup[N: Int](Movable):
 
     def _rank_sigs(
         mut self,
-    ) -> Array[MutPointer[Signal, MutAnyOrigin], MAX_GPUS]:
-        var sigs = Array[MutPointer[Signal, MutAnyOrigin], MAX_GPUS](
+    ) -> Array[MutPointer[Signal, MutAnyOrigin], Self.N]:
+        var sigs = Array[MutPointer[Signal, MutAnyOrigin], Self.N](
             uninitialized=True
         )
         for k in range(len(self._sig_bufs)):

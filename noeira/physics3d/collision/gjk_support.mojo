@@ -8,7 +8,7 @@ Reference: MuJoCo engine_collision_convex.c lines 162-398
 
 from std.math import sqrt, abs
 
-from layout import Layout, LayoutTensor
+from layout import TileTensor, TensorLayout
 from ..constants import (
     GEOM_SPHERE,
     GEOM_CAPSULE,
@@ -680,9 +680,9 @@ def _det3[
 
 
 def _subdistance[
-    DTYPE: DType, L_WS: Layout
+    DTYPE: DType, L_WS: TensorLayout
 ](
-    ws: LayoutTensor[DTYPE, L_WS, MutAnyOrigin],
+    ws: TileTensor[DTYPE, L_WS, MutAnyOrigin],
     wrow: Int,
     base: Int,
     n: Int,

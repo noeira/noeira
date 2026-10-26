@@ -19,7 +19,7 @@ constants, which is why it moved cleanly.
 the way would widen this step past what its gate covers.
 """
 
-from layout import Layout, LayoutTensor
+from layout import TileTensor, TensorLayout
 from ..fields.scratch import Scratch
 
 from ..joint_types import JNT_FREE, JNT_BALL
@@ -57,9 +57,9 @@ comptime CHAIN_CAP: Int = 32
 @always_inline
 def _body_chain[
     DTYPE: DType,
-    L_BODIES: Layout,
+    L_BODIES: TensorLayout,
 ](
-    bodies: LayoutTensor[DTYPE, L_BODIES, MutAnyOrigin],
+    bodies: TileTensor[DTYPE, L_BODIES, MutAnyOrigin],
     body: Int,
     mut chain: Scratch[Int, CHAIN_CAP],
 ) -> Int:
@@ -79,9 +79,9 @@ def _body_chain[
 @always_inline
 def _affects[
     DTYPE: DType,
-    L_BODIES: Layout,
+    L_BODIES: TensorLayout,
 ](
-    bodies: LayoutTensor[DTYPE, L_BODIES, MutAnyOrigin],
+    bodies: TileTensor[DTYPE, L_BODIES, MutAnyOrigin],
     chain: Scratch[Int, CHAIN_CAP],
     n: Int,
     body: Int,
@@ -111,19 +111,19 @@ def _affects[
 def _joint_row_add[
     DTYPE: DType,
     V_CAP: Int,
-    L_SUBTREE_COM: Layout,
-    L_JOINTS: Layout,
-    L_BODIES: Layout,
-    L_CDOF: Layout,
+    L_SUBTREE_COM: TensorLayout,
+    L_JOINTS: TensorLayout,
+    L_BODIES: TensorLayout,
+    L_CDOF: TensorLayout,
 ](
     env: Int,
     j_idx: Int,
     affects_a: Bool,
     affects_b: Bool,
-    subtree_com: LayoutTensor[DTYPE, L_SUBTREE_COM, MutAnyOrigin],
-    joints: LayoutTensor[DTYPE, L_JOINTS, MutAnyOrigin],
-    bodies: LayoutTensor[DTYPE, L_BODIES, MutAnyOrigin],
-    cdof: LayoutTensor[DTYPE, L_CDOF, MutAnyOrigin],
+    subtree_com: TileTensor[DTYPE, L_SUBTREE_COM, MutAnyOrigin],
+    joints: TileTensor[DTYPE, L_JOINTS, MutAnyOrigin],
+    bodies: TileTensor[DTYPE, L_BODIES, MutAnyOrigin],
+    cdof: TileTensor[DTYPE, L_CDOF, MutAnyOrigin],
     contact_pos_x: Scalar[DTYPE],
     contact_pos_y: Scalar[DTYPE],
     contact_pos_z: Scalar[DTYPE],
@@ -197,27 +197,19 @@ def _joint_row_add[
 def _contact_jacobian_row[
     DTYPE: DType,
     V_CAP: Int,
-    L_SUBTREE_COM: Layout,
-    L_JOINTS: Layout,
-    L_BODIES: Layout,
-    L_MMETA: Layout,
-    L_CDOF: Layout,
+    L_SUBTREE_COM: TensorLayout,
+    L_JOINTS: TensorLayout,
+    L_BODIES: TensorLayout,
+    L_MMETA: TensorLayout,
+    L_CDOF: TensorLayout,
     JM_CAP: Int = 1,
 ](
     env: Int,
-    subtree_com: LayoutTensor[
-        DTYPE, L_SUBTREE_COM, MutAnyOrigin
-    ],
-    joints: LayoutTensor[
-        DTYPE, L_JOINTS, MutAnyOrigin
-    ],
-    bodies: LayoutTensor[
-        DTYPE, L_BODIES, MutAnyOrigin
-    ],
-    mmeta: LayoutTensor[
-        DTYPE, L_MMETA, MutAnyOrigin
-    ],
-    cdof: LayoutTensor[DTYPE, L_CDOF, MutAnyOrigin],
+    subtree_com: TileTensor[DTYPE, L_SUBTREE_COM, MutAnyOrigin],
+    joints: TileTensor[DTYPE, L_JOINTS, MutAnyOrigin],
+    bodies: TileTensor[DTYPE, L_BODIES, MutAnyOrigin],
+    mmeta: TileTensor[DTYPE, L_MMETA, MutAnyOrigin],
+    cdof: TileTensor[DTYPE, L_CDOF, MutAnyOrigin],
     contact_body_a: Int,
     contact_body_b: Int,
     contact_pos_x: Scalar[DTYPE],

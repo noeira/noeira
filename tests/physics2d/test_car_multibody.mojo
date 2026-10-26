@@ -14,7 +14,7 @@ regression guard that the multi-body port stays faithful + stable.
 """
 
 from std.math import sqrt
-from layout import Layout, LayoutTensor
+from noeira.core.tiles import tile
 from noeira.physics2d import dtype
 from noeira.physics2d.constants import IDX_X, IDX_Y, IDX_ANGLE, IDX_VX, IDX_VY, IDX_OMEGA
 from noeira.physics2d.car import CarDynamicsMB
@@ -47,9 +47,7 @@ def run_scenario(
     var sbuf = List[Scalar[dtype]](capacity=SSZ)
     for _ in range(SSZ):
         sbuf.append(Scalar[dtype](0.0))
-    var state = LayoutTensor[dtype, Layout.row_major(1, SSZ), MutAnyOrigin](
-        mptr(sbuf)
-    )
+    var state = tile[1, SSZ](mptr(sbuf))
 
     CarDynamicsMB.init_env[1, SSZ, BOFF, FOFF, JOFF, ROFF](
         0, state, Scalar[dtype](0.0), Scalar[dtype](0.0), Scalar[dtype](0.0)
@@ -84,9 +82,7 @@ def run_spin_check(nsteps: Int) raises -> Tuple[Float64, Float64]:
     var sbuf = List[Scalar[dtype]](capacity=SSZ)
     for _ in range(SSZ):
         sbuf.append(Scalar[dtype](0.0))
-    var state = LayoutTensor[dtype, Layout.row_major(1, SSZ), MutAnyOrigin](
-        mptr(sbuf)
-    )
+    var state = tile[1, SSZ](mptr(sbuf))
     CarDynamicsMB.init_env[1, SSZ, BOFF, FOFF, JOFF, ROFF](
         0, state, Scalar[dtype](0.0), Scalar[dtype](0.0), Scalar[dtype](0.0)
     )

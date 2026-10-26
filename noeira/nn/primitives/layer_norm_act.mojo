@@ -58,7 +58,6 @@ from max.gpu import thread_idx, block_idx
 from max.gpu.primitives import block
 from max.gpu.host import DeviceContext
 from std.utils.numerics import get_accum_type
-from layout import Layout, LayoutTensor
 
 from noeira.nn.constants import DT, CPU_SIMD_W
 from noeira.nn.core.element_op import ElementOp
@@ -70,6 +69,7 @@ from ..core.param import Param, ParamVisitor
 from ..core.initializer import Initializer
 from ..core.amp import AMPPolicy, NoAMP
 from .layer_norm import LN_EPS, LN_TPB, LN_ACC, LN_REG_CAP
+from noeira.core.tiles import RowMajor, Tile
 
 
 @always_inline
@@ -89,12 +89,12 @@ def _act_cache_of[OP: ElementOp](z: Scalar[DT]) -> Scalar[DT]:
 def _ln_act_forward_kernel[
     BATCH: Int, DIM: Int, OP: ElementOp, ADT: DType = DT
 ](
-    input: LayoutTensor[ADT, Layout.row_major(BATCH, DIM), MutAnyOrigin],
-    output: LayoutTensor[ADT, Layout.row_major(BATCH, DIM), MutAnyOrigin],
-    gamma: LayoutTensor[DT, Layout.row_major(DIM), MutAnyOrigin],
-    beta: LayoutTensor[DT, Layout.row_major(DIM), MutAnyOrigin],
-    cache_xhat: LayoutTensor[DT, Layout.row_major(BATCH, DIM), MutAnyOrigin],
-    cache_inv_std: LayoutTensor[DT, Layout.row_major(BATCH), MutAnyOrigin],
+    input: Tile[ADT, BATCH, DIM],
+    output: Tile[ADT, BATCH, DIM],
+    gamma: Tile[DT, DIM],
+    beta: Tile[DT, DIM],
+    cache_xhat: Tile[DT, BATCH, DIM],
+    cache_inv_std: Tile[DT, BATCH],
 ):
     """Mirror of `_layer_norm_forward_kernel` with `OP.forward` on the store."""
     var b = Int(block_idx.x)
@@ -173,12 +173,12 @@ def _ln_act_forward_kernel[
 def _ln_act_backward_dx_kernel[
     BATCH: Int, DIM: Int, OP: ElementOp, ADT: DType = DT
 ](
-    grad_output: LayoutTensor[ADT, Layout.row_major(BATCH, DIM), MutAnyOrigin],
-    gamma: LayoutTensor[DT, Layout.row_major(DIM), MutAnyOrigin],
-    beta: LayoutTensor[DT, Layout.row_major(DIM), MutAnyOrigin],
-    cache_xhat: LayoutTensor[DT, Layout.row_major(BATCH, DIM), MutAnyOrigin],
-    cache_inv_std: LayoutTensor[DT, Layout.row_major(BATCH), MutAnyOrigin],
-    grad_input: LayoutTensor[ADT, Layout.row_major(BATCH, DIM), MutAnyOrigin],
+    grad_output: Tile[ADT, BATCH, DIM],
+    gamma: Tile[DT, DIM],
+    beta: Tile[DT, DIM],
+    cache_xhat: Tile[DT, BATCH, DIM],
+    cache_inv_std: Tile[DT, BATCH],
+    grad_input: Tile[ADT, BATCH, DIM],
 ):
     """`_layer_norm_backward_dx_kernel` with the activation gate folded in.
 
@@ -266,12 +266,12 @@ def _ln_act_backward_dx_kernel[
 def _ln_act_backward_dparams_kernel[
     BATCH: Int, DIM: Int, OP: ElementOp, ADT: DType = DT
 ](
-    grad_output: LayoutTensor[ADT, Layout.row_major(BATCH, DIM), MutAnyOrigin],
-    gamma: LayoutTensor[DT, Layout.row_major(DIM), MutAnyOrigin],
-    beta: LayoutTensor[DT, Layout.row_major(DIM), MutAnyOrigin],
-    cache_xhat: LayoutTensor[DT, Layout.row_major(BATCH, DIM), MutAnyOrigin],
-    grad_gamma: LayoutTensor[DT, Layout.row_major(DIM), MutAnyOrigin],
-    grad_beta: LayoutTensor[DT, Layout.row_major(DIM), MutAnyOrigin],
+    grad_output: Tile[ADT, BATCH, DIM],
+    gamma: Tile[DT, DIM],
+    beta: Tile[DT, DIM],
+    cache_xhat: Tile[DT, BATCH, DIM],
+    grad_gamma: Tile[DT, DIM],
+    grad_beta: Tile[DT, DIM],
 ):
     """`_layer_norm_backward_dparams_kernel` with the same recomputed gate.
 
@@ -420,18 +420,18 @@ struct LayerNormAct[DIM_: Int, OP: ElementOp, ADT: DType = DT](Module):
             out.ensure_gpu(c, B * Self.DIM_)
             self.cache_xhat.ensure_gpu(c, B * Self.DIM_)
             self.cache_inv_std.ensure_gpu(c, B)
-            comptime l2d = Layout.row_major(B, Self.DIM_)
-            comptime lb = Layout.row_major(B)
-            comptime ld = Layout.row_major(Self.DIM_)
+            comptime l2d = RowMajor[B, Self.DIM_]
+            comptime lb = RowMajor[B]
+            comptime ld = RowMajor[Self.DIM_]
             c.enqueue_function[
                 _ln_act_forward_kernel[B, Self.DIM_, Self.OP, Self.ADT]
             ](
-                in0.lt["gpu", l2d](),
-                out.lt["gpu", l2d](),
-                self.gamma.val.lt["gpu", ld](),
-                self.beta.val.lt["gpu", ld](),
-                self.cache_xhat.lt["gpu", l2d](),
-                self.cache_inv_std.lt["gpu", lb](),
+                in0.tt["gpu", B, Self.DIM_](),
+                out.tt["gpu", B, Self.DIM_](),
+                self.gamma.val.tt["gpu", Self.DIM_](),
+                self.beta.val.tt["gpu", Self.DIM_](),
+                self.cache_xhat.tt["gpu", B, Self.DIM_](),
+                self.cache_inv_std.tt["gpu", B](),
                 grid_dim=B,
                 block_dim=LN_TPB,
             )
@@ -486,30 +486,30 @@ struct LayerNormAct[DIM_: Int, OP: ElementOp, ADT: DType = DT](Module):
         else:
             var c = ctx.value()
             gin.ensure_gpu(c, B * Self.DIM_)
-            comptime l2d = Layout.row_major(B, Self.DIM_)
-            comptime lb = Layout.row_major(B)
-            comptime ld = Layout.row_major(Self.DIM_)
+            comptime l2d = RowMajor[B, Self.DIM_]
+            comptime lb = RowMajor[B]
+            comptime ld = RowMajor[Self.DIM_]
             c.enqueue_function[
                 _ln_act_backward_dx_kernel[B, Self.DIM_, Self.OP, Self.ADT]
             ](
-                grad_output.lt["gpu", l2d](),
-                self.gamma.val.lt["gpu", ld](),
-                self.beta.val.lt["gpu", ld](),
-                self.cache_xhat.lt["gpu", l2d](),
-                self.cache_inv_std.lt["gpu", lb](),
-                gin.lt["gpu", l2d](),
+                grad_output.tt["gpu", B, Self.DIM_](),
+                self.gamma.val.tt["gpu", Self.DIM_](),
+                self.beta.val.tt["gpu", Self.DIM_](),
+                self.cache_xhat.tt["gpu", B, Self.DIM_](),
+                self.cache_inv_std.tt["gpu", B](),
+                gin.tt["gpu", B, Self.DIM_](),
                 grid_dim=B,
                 block_dim=LN_TPB,
             )
             c.enqueue_function[
                 _ln_act_backward_dparams_kernel[B, Self.DIM_, Self.OP, Self.ADT]
             ](
-                grad_output.lt["gpu", l2d](),
-                self.gamma.val.lt["gpu", ld](),
-                self.beta.val.lt["gpu", ld](),
-                self.cache_xhat.lt["gpu", l2d](),
-                self.gamma.grd.lt["gpu", ld](),
-                self.beta.grd.lt["gpu", ld](),
+                grad_output.tt["gpu", B, Self.DIM_](),
+                self.gamma.val.tt["gpu", Self.DIM_](),
+                self.beta.val.tt["gpu", Self.DIM_](),
+                self.cache_xhat.tt["gpu", B, Self.DIM_](),
+                self.gamma.grd.tt["gpu", Self.DIM_](),
+                self.beta.grd.tt["gpu", Self.DIM_](),
                 grid_dim=Self.DIM_,
                 block_dim=LN_TPB,
             )

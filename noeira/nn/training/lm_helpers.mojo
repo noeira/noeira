@@ -59,7 +59,7 @@ def sample_next_token[
 ](
     ref logits: TensorImpl[ADT], base: Int, temperature: Float64, top_k: Int
 ) -> Int:
-    """nanoGPT's rule on `logits.data[base : base + VOCAB]`: the argmax when
+    """NanoGPT's rule on `logits.data[base : base + VOCAB]`: the argmax when
     `temperature <= 0`, else a draw from the softmax of logits / temperature,
     restricted to the `top_k` largest when `0 < top_k < VOCAB`."""
     if temperature <= 0.0:

@@ -172,7 +172,7 @@ from .combinators.skip_concat import SkipConcat
 from .combinators.branch_concat import BranchConcat
 from .combinators.stop_grad_params import StopGradParams
 from .combinators.compute_graph import ComputeGraph
-from .combinators.graph_module2 import GraphModule2, TwoInputGraph
+from .combinators.graph_module2 import GraphModule2, TwoInputGraph, NamedNodeGraph
 from .combinators.graph_decl import (
     GraphDecl,
     InputSlot,

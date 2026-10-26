@@ -24,9 +24,9 @@ Run on Apple : pixi run -e apple  mojo run -I . tests/physics3d/test_newton_free
 """
 
 from std.math import abs
-from std.sys import has_nvidia_gpu_accelerator
+from std.sys import default_accelerator
 from max.gpu.host import DeviceContext
-from layout import Layout
+from noeira.core.tiles import RowMajor
 
 from noeira.physics3d.fields import (
     AsStatic,
@@ -155,40 +155,40 @@ def _prep[target: StaticString, D: DimsLike](
     compute_cdof[target, DTYPE, BATCH=BATCH](d, mf, scratch, ctx)
     compute_mass_matrix[target, DTYPE, BATCH=BATCH](d, mf, scratch, ctx)
 
-    comptime L_JOINT = Layout.row_major(D.NJOINT, MODEL_JOINT_SIZE)
-    comptime L_M = Layout.row_major(BATCH, D.NV * D.NV)
-    comptime L_NV = Layout.row_major(BATCH, D.NV)
-    comptime L_QPOS = Layout.row_major(BATCH, D.NQ)
+    comptime L_JOINT = RowMajor[D.NJOINT, MODEL_JOINT_SIZE]
+    comptime L_M = RowMajor[BATCH, D.NV * D.NV]
+    comptime L_NV = RowMajor[BATCH, D.NV]
+    comptime L_QPOS = RowMajor[BATCH, D.NQ]
 
     comptime if target == "cpu":
-        var joints_v = mf.joints.lt["cpu", L_JOINT]()
-        var M_v = scratch.M.lt["cpu", L_M]()
+        var joints_v = mf.joints.tt["cpu", D.NJOINT, MODEL_JOINT_SIZE]()
+        var M_v = scratch.M.tt["cpu", BATCH, D.NV * D.NV]()
         for e in range(BATCH):
             _armature_env[DTYPE](e, AsStatic[D](), joints_v, M_v)
         ldl_factor["cpu", DTYPE, BATCH=BATCH](mf, scratch, ctx)
         compute_m_inv["cpu", DTYPE, BATCH=BATCH](mf, scratch, ctx)
         compute_bias_forces_rne["cpu", DTYPE, BATCH=BATCH](d, mf, scratch, ctx)
-        var qpos_v = d.qpos.lt["cpu", L_QPOS]()
-        var qvel_v = d.qvel.lt["cpu", L_NV]()
-        var qfrc_v = d.qfrc.lt["cpu", L_NV]()
-        var bias_v = scratch.bias.lt["cpu", L_NV]()
-        var fnet_v = scratch.fnet.lt["cpu", L_NV]()
+        var qpos_v = d.qpos.tt["cpu", BATCH, D.NQ]()
+        var qvel_v = d.qvel.tt["cpu", BATCH, D.NV]()
+        var qfrc_v = d.qfrc.tt["cpu", BATCH, D.NV]()
+        var bias_v = scratch.bias.tt["cpu", BATCH, D.NV]()
+        var fnet_v = scratch.fnet.tt["cpu", BATCH, D.NV]()
         for e in range(BATCH):
             _fnet_passive_env[DTYPE](
                 e, AsStatic[D](), qpos_v, qvel_v, qfrc_v, joints_v, bias_v, fnet_v
             )
         ldl_solve["cpu", DTYPE, BATCH=BATCH](mf, scratch, ctx)
-        var qacc_ws_v = scratch.qacc_ws.lt["cpu", L_NV]()
-        var qacc_v = d.qacc.lt["cpu", L_NV]()
-        var qacc_c_v = scratch.qacc_constrained.lt["cpu", L_NV]()
+        var qacc_ws_v = scratch.qacc_ws.tt["cpu", BATCH, D.NV]()
+        var qacc_v = d.qacc.tt["cpu", BATCH, D.NV]()
+        var qacc_c_v = scratch.qacc_constrained.tt["cpu", BATCH, D.NV]()
         for e in range(BATCH):
             _qacc_writeback_env[DTYPE](
                 e, AsStatic[D](), qacc_ws_v, qacc_v, qacc_c_v
             )
     else:
         ctx.value().enqueue_function[_armature_kernel[DTYPE, D.NV, D.NJOINT, BATCH]](
-            mf.joints.lt["gpu", L_JOINT](),
-            scratch.M.lt["gpu", L_M](),
+            mf.joints.tt["gpu", D.NJOINT, MODEL_JOINT_SIZE](),
+            scratch.M.tt["gpu", BATCH, D.NV * D.NV](),
             grid_dim=(BATCH,),
             block_dim=(1,),
         )
@@ -198,20 +198,20 @@ def _prep[target: StaticString, D: DimsLike](
         ctx.value().enqueue_function[
             _fnet_passive_kernel[DTYPE, D.NQ, D.NV, D.NJOINT, BATCH]
         ](
-            d.qpos.lt["gpu", L_QPOS](),
-            d.qvel.lt["gpu", L_NV](),
-            d.qfrc.lt["gpu", L_NV](),
-            mf.joints.lt["gpu", L_JOINT](),
-            scratch.bias.lt["gpu", L_NV](),
-            scratch.fnet.lt["gpu", L_NV](),
+            d.qpos.tt["gpu", BATCH, D.NQ](),
+            d.qvel.tt["gpu", BATCH, D.NV](),
+            d.qfrc.tt["gpu", BATCH, D.NV](),
+            mf.joints.tt["gpu", D.NJOINT, MODEL_JOINT_SIZE](),
+            scratch.bias.tt["gpu", BATCH, D.NV](),
+            scratch.fnet.tt["gpu", BATCH, D.NV](),
             grid_dim=(BATCH,),
             block_dim=(1,),
         )
         ldl_solve["gpu", DTYPE, BATCH=BATCH](mf, scratch, ctx)
         ctx.value().enqueue_function[_qacc_writeback_kernel[DTYPE, D.NV, BATCH]](
-            scratch.qacc_ws.lt["gpu", L_NV](),
-            d.qacc.lt["gpu", L_NV](),
-            scratch.qacc_constrained.lt["gpu", L_NV](),
+            scratch.qacc_ws.tt["gpu", BATCH, D.NV](),
+            d.qacc.tt["gpu", BATCH, D.NV](),
+            scratch.qacc_constrained.tt["gpu", BATCH, D.NV](),
             grid_dim=(BATCH,),
             block_dim=(1,),
         )
@@ -222,7 +222,7 @@ def _prep[target: StaticString, D: DimsLike](
 def _validate[
     MODEL: ModelDefLike,
     # ⚠⚠ FORCE THE BLOCKED KERNEL, WHICH `solve_newton` WOULD NOT LAUNCH HERE.
-    # Its routing is `if has_nvidia_gpu_accelerator()` — a RUNTIME test, so the
+    # Its routing is `if default_accelerator().is_nvidia_gpu()` — a RUNTIME test, so the
     # blocked kernel is COMPILED on Metal and simply never reached. That left a
     # hole exactly where the block work lives: the only multi-tree model in the
     # tree reached the blocked kernel on NVIDIA and nowhere else, so a change to
@@ -342,7 +342,7 @@ def _validate[
         ncon += Int(d_g.meta.data[e * METADATA_SIZE + META_IDX_NUM_CONTACTS])
     print("    contacts:", ncon, "(",
           "FORCED blocked" if FORCE_BLOCKED else
-          ("NVIDIA=blocked" if has_nvidia_gpu_accelerator()
+          ("NVIDIA=blocked" if default_accelerator().is_nvidia_gpu()
            else "Apple=per-env"), ")")
     if ncon == 0:
         print("    WARNING: 0 contacts (vacuous). Lower this model's torso_z\n"

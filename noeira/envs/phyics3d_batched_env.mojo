@@ -35,7 +35,8 @@ fluid-force models (Swimmer) run via the integrators' passive seam
 
 from max.gpu import thread_idx, block_idx, block_dim
 from max.gpu.host import DeviceContext, DeviceBuffer
-from layout import Layout, LayoutTensor
+from layout import TileTensor
+from noeira.core.tiles import RowMajor, Tile, tile
 
 from noeira.nn.constants import DT
 from noeira.nn.core.ptr import mptr
@@ -103,7 +104,7 @@ from noeira.physics3d.model.model_dims import ModelDims
 
 
 def _rng_counter_bump_kernel(
-    counter: LayoutTensor[DType.uint64, Layout.row_major(1), MutAnyOrigin],
+    counter: Tile[DType.uint64, 1],
 ):
     """Bump the device-resident env-reset RNG counter by 1 (capture-safe
     reset randomness; mirrors the legacy `increment_env_rng_kernel`)."""
@@ -191,19 +192,15 @@ struct Phyics3dBatchedEnv[
     comptime SITE_DIM: Int = (
         Self.NSITE if Self.NSITE > 0 else 1
     ) * 3
-    comptime L_SITE_HOOK = Layout.row_major(Self.N_ENVS, Self.SITE_DIM)
+    comptime L_SITE_HOOK = RowMajor[Self.N_ENVS, Self.SITE_DIM]
     # `Model.sites` is ALREADY floored at the allocation
     # (`_at_least_one` in fields/model.mojo), so only the LAYOUT needs
     # flooring — no dummy buffer, unlike site_xpos above.
     comptime NSITE_F: Int = Self.NSITE if Self.NSITE > 0 else 1
-    comptime L_SITES_HOOK = Layout.row_major(
-        Self.NSITE_F, MODEL_SITE_SIZE
-    )
+    comptime L_SITES_HOOK = RowMajor[Self.NSITE_F, MODEL_SITE_SIZE]
     # `Model.geoms` is `_at_least_one`'d too, so again only the layout.
     comptime NGEOM_F: Int = Self.NGEOM if Self.NGEOM > 0 else 1
-    comptime L_GEOMS_HOOK = Layout.row_major(
-        Self.NGEOM_F, MODEL_GEOM_SIZE
-    )
+    comptime L_GEOMS_HOOK = RowMajor[Self.NGEOM_F, MODEL_GEOM_SIZE]
     # `Model.mesh_tris` is `_at_least_one`'d too — layout only. ⚠ ZERO UNLESS
     # THE CONFIG SETS `NMESH_TRI`, and zero means a MESH geom is invisible to
     # `ray_model` here — a ray goes straight through it. `ModelDims` did not
@@ -213,19 +210,13 @@ struct Phyics3dBatchedEnv[
     comptime NMESH_TRI_F: Int = (
         Self.MD.NMESH_TRI if Self.MD.NMESH_TRI > 0 else 1
     )
-    comptime L_MESH_META_HOOK = Layout.row_major(
-        MAX_GPU_MESHES * MODEL_MESH_META_SIZE
-    )
-    comptime L_MESH_TRIS_HOOK = Layout.row_major(
-        Self.NMESH_TRI_F * MESH_ARENA_FLOATS_PER_TRI
-    )
+    comptime L_MESH_META_HOOK = RowMajor[MAX_GPU_MESHES * MODEL_MESH_META_SIZE]
+    comptime L_MESH_TRIS_HOOK = RowMajor[Self.NMESH_TRI_F * MESH_ARENA_FLOATS_PER_TRI]
     # `Model.tendons` is `_at_least_one`'d too — layout only.
     comptime NTENDON_F: Int = (
         Self.MODEL_DEF.MAX_TENDON if Self.MODEL_DEF.MAX_TENDON > 0 else 1
     )
-    comptime L_TENDONS_HOOK = Layout.row_major(
-        Self.NTENDON_F, MODEL_TENDON_SIZE
-    )
+    comptime L_TENDONS_HOOK = RowMajor[Self.NTENDON_F, MODEL_TENDON_SIZE]
 
     # Fields path (the actual physics state)
     var d: Data[DT, Self.MD, Self.N_ENVS]
@@ -288,12 +279,8 @@ struct Phyics3dBatchedEnv[
     # force is computed from the wrong quantity entirely. quadruped and
     # dog are the models that have one. Floored at 1 like the CPU side.
     comptime NA_F: Int = Self.MODEL_DEF.NA_F
-    comptime L_HF_META_HOOK = Layout.row_major(
-        MAX_GPU_HFIELDS * MODEL_HFIELD_META_SIZE
-    )
-    comptime L_HF_DATA_HOOK = Layout.row_major(
-        Self.N_ENVS * Self.NHFIELD_DATA_F
-    )
+    comptime L_HF_META_HOOK = RowMajor[MAX_GPU_HFIELDS * MODEL_HFIELD_META_SIZE]
+    comptime L_HF_DATA_HOOK = RowMajor[Self.N_ENVS * Self.NHFIELD_DATA_F]
     """⚠ FLAT, NOT `[N_ENVS, NHFIELD_DATA]`. `ray_model` takes the grid as a
     1-D tensor plus an `env * hf_stride` base offset, and the CPU path builds
     exactly that view. One layout then serves BOTH hooks — the terrain writer
@@ -305,7 +292,7 @@ struct Phyics3dBatchedEnv[
     """⚠ `_at_least_one`. Every kernel binds `hfield_data` whether the model
     has a heightfield or not, and a zero-extent layout is not a buffer."""
 
-    comptime L_ACT_HOOK = Layout.row_major(Self.N_ENVS, Self.NA_F)
+    comptime L_ACT_HOOK = RowMajor[Self.N_ENVS, Self.NA_F]
     var _act: DeviceBuffer[DT]
 
     # ── OSC_POSE, when CONFIG.HAS_OSC_CONTROLLER ──────────────────────────
@@ -489,7 +476,7 @@ struct Phyics3dBatchedEnv[
     @always_inline
     def _site_xpos_operand(
         mut self,
-    ) -> LayoutTensor[DT, Self.L_SITE_HOOK, MutAnyOrigin]:
+    ) -> TileTensor[DT, Self.L_SITE_HOOK, MutAnyOrigin]:
         """The `site_xpos` kernel operand, floored to one site.
 
         For NSITE > 0 this IS `d.site_xpos`. For NSITE == 0 it is the dummy —
@@ -498,22 +485,22 @@ struct Phyics3dBatchedEnv[
         be a zero-extent operand at best and a null device pointer at worst.
         See the SITE_DIM note above."""
         comptime if Self.NSITE > 0:
-            return rebind[LayoutTensor[DT, Self.L_SITE_HOOK, MutAnyOrigin]](
-                self.d.site_xpos.lt["gpu", type_of(self.d).L_SITE]()
+            return rebind[TileTensor[DT, Self.L_SITE_HOOK, MutAnyOrigin]](
+                self.d.site_xpos.tt_dyn["gpu", type_of(self.d).L_SITE](type_of(self.d).L_SITE())
             )
         else:
             # rebind: the buffer-constructed view carries
             # `origin_of(self._site_dummy)`, the kernel ABI wants
             # MutAnyOrigin. Constructed FROM THE BUFFER, never from
             # `unsafe_ptr()` — that spelling silently miscompiles on GPU.
-            return rebind[LayoutTensor[DT, Self.L_SITE_HOOK, MutAnyOrigin]](
-                LayoutTensor[DT, Self.L_SITE_HOOK](self._site_dummy)
+            return rebind[TileTensor[DT, Self.L_SITE_HOOK, MutAnyOrigin]](
+                tile[Self.N_ENVS, Self.SITE_DIM](self._site_dummy)
             )
 
     @always_inline
     def _site_xpos_acc_operand(
         mut self,
-    ) -> LayoutTensor[DT, Self.L_SITE_HOOK, MutAnyOrigin]:
+    ) -> TileTensor[DT, Self.L_SITE_HOOK, MutAnyOrigin]:
         """`site_xpos` AS IT STOOD WHEN `cacc`/`cfrc_int` WERE WRITTEN.
 
         Sized and floored exactly like `_site_xpos_operand` — `Data` allocates
@@ -529,25 +516,25 @@ struct Phyics3dBatchedEnv[
         4.5e-10. See fields/data.mojo.
         """
         comptime if Self.NSITE > 0:
-            return rebind[LayoutTensor[DT, Self.L_SITE_HOOK, MutAnyOrigin]](
-                self.d.site_xpos_acc.lt["gpu", type_of(self.d).L_SITE]()
+            return rebind[TileTensor[DT, Self.L_SITE_HOOK, MutAnyOrigin]](
+                self.d.site_xpos_acc.tt_dyn["gpu", type_of(self.d).L_SITE](type_of(self.d).L_SITE())
             )
         else:
-            return rebind[LayoutTensor[DT, Self.L_SITE_HOOK, MutAnyOrigin]](
-                LayoutTensor[DT, Self.L_SITE_HOOK](self._site_dummy)
+            return rebind[TileTensor[DT, Self.L_SITE_HOOK, MutAnyOrigin]](
+                tile[Self.N_ENVS, Self.SITE_DIM](self._site_dummy)
             )
 
     @always_inline
     def _act_operand(
         mut self,
-    ) -> LayoutTensor[DT, Self.L_ACT_HOOK, MutAnyOrigin]:
+    ) -> TileTensor[DT, Self.L_ACT_HOOK, MutAnyOrigin]:
         """The per-env actuator activation, as a hook operand.
 
         `_act` is already floored at `NA_F >= 1` (see the field), so unlike
         `site_xpos` there is no dummy to pick between — this is only here to
         keep the `rebind` off the two call sites."""
-        return rebind[LayoutTensor[DT, Self.L_ACT_HOOK, MutAnyOrigin]](
-            LayoutTensor[DT, Self.L_ACT_HOOK](self._act)
+        return rebind[TileTensor[DT, Self.L_ACT_HOOK, MutAnyOrigin]](
+            tile[Self.N_ENVS, Self.NA_F](self._act)
         )
 
     def _find_non_contacting_height_batch(
@@ -599,12 +586,8 @@ struct Phyics3dBatchedEnv[
 
         @always_inline
         def seed_kernel(
-            mask: LayoutTensor[
-                DT, Layout.row_major(Self.N_ENVS), MutAnyOrigin
-            ],
-            done_t: LayoutTensor[
-                DT, Layout.row_major(Self.N_ENVS), MutAnyOrigin
-            ],
+            mask: Tile[DT, Self.N_ENVS],
+            done_t: Tile[DT, Self.N_ENVS],
         ):
             # A lane the reset did NOT touch starts already "done", so the
             # search never moves a mid-episode robot's root.
@@ -617,12 +600,8 @@ struct Phyics3dBatchedEnv[
 
         @always_inline
         def raise_kernel(
-            qpos: LayoutTensor[
-                DT, Layout.row_major(Self.N_ENVS, Self.NQ), MutAnyOrigin
-            ],
-            done_t: LayoutTensor[
-                DT, Layout.row_major(Self.N_ENVS), MutAnyOrigin
-            ],
+            qpos: Tile[DT, Self.N_ENVS, Self.NQ],
+            done_t: Tile[DT, Self.N_ENVS],
             z_adr_arg: Int64,
             # ⚠ The HEIGHT, not the attempt index. Computing
             # `0.01 * Float64(attempt)` inside the kernel emits an
@@ -643,14 +622,8 @@ struct Phyics3dBatchedEnv[
 
         @always_inline
         def settle_kernel(
-            meta: LayoutTensor[
-                DT,
-                Layout.row_major(Self.N_ENVS, METADATA_SIZE),
-                MutAnyOrigin,
-            ],
-            done_t: LayoutTensor[
-                DT, Layout.row_major(Self.N_ENVS), MutAnyOrigin
-            ],
+            meta: Tile[DT, Self.N_ENVS, METADATA_SIZE],
+            done_t: Tile[DT, Self.N_ENVS],
         ):
             var env = Int(block_dim.x * block_idx.x + thread_idx.x)
             if env >= Self.N_ENVS:
@@ -658,10 +631,8 @@ struct Phyics3dBatchedEnv[
             if meta[env, META_IDX_NUM_CONTACTS] == Scalar[DT](0):
                 done_t[env] = Scalar[DT](1)
 
-        var done_t = LayoutTensor[DT, Layout.row_major(Self.N_ENVS)](done)
-        var mask_t = LayoutTensor[DT, Layout.row_major(Self.N_ENVS)](
-            self._reset_mask
-        )
+        var done_t = tile[Self.N_ENVS](done)
+        var mask_t = tile[Self.N_ENVS](self._reset_mask)
         c.enqueue_function[seed_kernel](
             mask_t, done_t, grid_dim=(Self.BLOCKS,), block_dim=(TPB,)
         )
@@ -674,7 +645,7 @@ struct Phyics3dBatchedEnv[
         # would not explain either.
         for attempt in range(10000):
             c.enqueue_function[raise_kernel](
-                self.d.qpos.lt["gpu", type_of(self.d).L_QPOS](),
+                self.d.qpos.tt_dyn["gpu", type_of(self.d).L_QPOS](type_of(self.d).L_QPOS()),
                 done_t,
                 Int64(zadr),
                 Scalar[DT](0.01 * Float64(attempt)),
@@ -684,7 +655,7 @@ struct Phyics3dBatchedEnv[
             self._run_fields_fk(c)
             detect_contacts_auto["gpu", DT, BATCH=Self.N_ENVS](self.d, self.mf, c)
             c.enqueue_function[settle_kernel](
-                self.d.meta.lt["gpu", type_of(self.d).L_META](),
+                self.d.meta.tt_dyn["gpu", type_of(self.d).L_META](type_of(self.d).L_META()),
                 done_t,
                 grid_dim=(Self.BLOCKS,),
                 block_dim=(TPB,),
@@ -791,50 +762,26 @@ struct Phyics3dBatchedEnv[
             DT, Self.N_ENVS, Self.OSC_NACT, NORMALIZED=False
         ](
             c,
-            self.d.qfrc.lt["gpu", type_of(self.d).L_NV](),
-            self._osc_ctrl.lt[
-                "gpu", Layout.row_major(Self.N_ENVS, Self.OSC_NACT)
-            ](),
-            self.d.qpos.lt["gpu", type_of(self.d).L_QPOS](),
-            self.d.qvel.lt["gpu", type_of(self.d).L_NV](),
+            self.d.qfrc.tt_dyn["gpu", type_of(self.d).L_NV](type_of(self.d).L_NV()),
+            self._osc_ctrl.tt["gpu", Self.N_ENVS, Self.OSC_NACT](),
+            self.d.qpos.tt_dyn["gpu", type_of(self.d).L_QPOS](type_of(self.d).L_QPOS()),
+            self.d.qvel.tt_dyn["gpu", type_of(self.d).L_NV](type_of(self.d).L_NV()),
             rebind[
-                LayoutTensor[
-                    DT,
-                    Layout.row_major(Self.N_ENVS, Self.MODEL_DEF.NA_F),
-                    MutAnyOrigin,
-                ]
+                Tile[DT, Self.N_ENVS, Self.MODEL_DEF.NA_F]
             ](
-                LayoutTensor[
-                    DT, Layout.row_major(Self.N_ENVS, Self.MODEL_DEF.NA_F)
-                ](self._act)
+                tile[Self.N_ENVS, Self.MODEL_DEF.NA_F](self._act)
             ),
-            self.sf.actuators.lt[
-                "gpu",
-                Layout.row_major(
-                    Self.MODEL_DEF.NACT_F * MODEL_ACTUATOR_SIZE
-                ),
-            ](),
+            self.sf.actuators.tt["gpu", Self.MODEL_DEF.NACT_F * MODEL_ACTUATOR_SIZE](),
             # ⚠ `MODEL_DEF.NTEN_F`, NOT `Self.NTENDON_F`. The two are the same
             # number and NOT the same comptime expression, and
             # `apply_actions_kernel_gpu` declares its parameter with the former
             # — the layouts then fail to unify ("unfolded expression at parser
             # time"). The model-default call site above spells it the same way.
-            self.sf.act_tendons.lt[
-                "gpu",
-                Layout.row_major(
-                    Self.MODEL_DEF.NTEN_F * MODEL_ACT_TENDON_SIZE
-                ),
-            ](),
-            self.sf.joint_limits.lt[
-                "gpu",
-                Layout.row_major(Self.MODEL_DEF.NJOINT * JLIM_SIZE),
-            ](),
-            self.d.dof_actdamp.lt["gpu", type_of(self.d).L_NV](),
-            self.d.actdamp_act.lt[
-                "gpu",
-                Layout.row_major(Self.N_ENVS, Self.MODEL_DEF.NACT_F),
-            ](),
-            self.d.meta.lt["gpu", type_of(self.d).L_META](),
+            self.sf.act_tendons.tt["gpu", Self.MODEL_DEF.NTEN_F * MODEL_ACT_TENDON_SIZE](),
+            self.sf.joint_limits.tt["gpu", Self.MODEL_DEF.NJOINT * JLIM_SIZE](),
+            self.d.dof_actdamp.tt_dyn["gpu", type_of(self.d).L_NV](type_of(self.d).L_NV()),
+            self.d.actdamp_act.tt["gpu", Self.N_ENVS, Self.MODEL_DEF.NACT_F](),
+            self.d.meta.tt_dyn["gpu", type_of(self.d).L_META](type_of(self.d).L_META()),
         )
 
     def _apply_actions_custom(mut self, c: DeviceContext) raises:
@@ -850,42 +797,16 @@ struct Phyics3dBatchedEnv[
 
         @always_inline
         def act_kernel(
-            qfrc: LayoutTensor[
-                DT, Layout.row_major(Self.N_ENVS, Self.NV), MutAnyOrigin
-            ],
-            actions: LayoutTensor[
-                DT, Layout.row_major(Self.N_ENVS, Self.ACT_DIM), MutAnyOrigin
-            ],
-            qpos: LayoutTensor[
-                DT, Layout.row_major(Self.N_ENVS, Self.NQ), MutAnyOrigin
-            ],
-            qvel: LayoutTensor[
-                DT, Layout.row_major(Self.N_ENVS, Self.NV), MutAnyOrigin
-            ],
-            act: LayoutTensor[DT, Self.L_ACT_HOOK, MutAnyOrigin],
-            meta: LayoutTensor[
-                DT,
-                Layout.row_major(Self.N_ENVS, METADATA_SIZE),
-                MutAnyOrigin,
-            ],
-            joints: LayoutTensor[
-                DT,
-                Layout.row_major(Self.NJOINT, MODEL_JOINT_SIZE),
-                MutAnyOrigin,
-            ],
-            tendons: LayoutTensor[DT, Self.L_TENDONS_HOOK, MutAnyOrigin],
-            acts: LayoutTensor[
-                DT,
-                Layout.row_major(
-                    Self.MODEL_DEF.NACT_F * MODEL_ACTUATOR_SIZE
-                ),
-                MutAnyOrigin,
-            ],
-            act_tendons: LayoutTensor[
-                DT,
-                Layout.row_major(Self.NTENDON_F * MODEL_ACT_TENDON_SIZE),
-                MutAnyOrigin,
-            ],
+            qfrc: Tile[DT, Self.N_ENVS, Self.NV],
+            actions: Tile[DT, Self.N_ENVS, Self.ACT_DIM],
+            qpos: Tile[DT, Self.N_ENVS, Self.NQ],
+            qvel: Tile[DT, Self.N_ENVS, Self.NV],
+            act: TileTensor[DT, Self.L_ACT_HOOK, MutAnyOrigin],
+            meta: Tile[DT, Self.N_ENVS, METADATA_SIZE],
+            joints: Tile[DT, Self.NJOINT, MODEL_JOINT_SIZE],
+            tendons: TileTensor[DT, Self.L_TENDONS_HOOK, MutAnyOrigin],
+            acts: Tile[DT, Self.MODEL_DEF.NACT_F * MODEL_ACTUATOR_SIZE],
+            act_tendons: Tile[DT, Self.NTENDON_F * MODEL_ACT_TENDON_SIZE],
         ):
             var env = Int(block_dim.x * block_idx.x + thread_idx.x)
             if env >= Self.N_ENVS:
@@ -905,32 +826,20 @@ struct Phyics3dBatchedEnv[
         # passed mutably to 'self' and to 'actions_t'"). The model-default
         # path does not hit this because it is a static method on MODEL_DEF.
         c.enqueue_function[act_kernel](
-            self.d.qfrc.lt["gpu", type_of(self.d).L_NV](),
+            self.d.qfrc.tt_dyn["gpu", type_of(self.d).L_NV](type_of(self.d).L_NV()),
             rebind[
-                LayoutTensor[
-                    DT,
-                    Layout.row_major(Self.N_ENVS, Self.ACT_DIM),
-                    MutAnyOrigin,
-                ]
+                Tile[DT, Self.N_ENVS, Self.ACT_DIM]
             ](
-                LayoutTensor[
-                    DT, Layout.row_major(Self.N_ENVS, Self.ACT_DIM)
-                ](self._action)
+                tile[Self.N_ENVS, Self.ACT_DIM](self._action)
             ),
-            self.d.qpos.lt["gpu", type_of(self.d).L_QPOS](),
-            self.d.qvel.lt["gpu", type_of(self.d).L_NV](),
+            self.d.qpos.tt_dyn["gpu", type_of(self.d).L_QPOS](type_of(self.d).L_QPOS()),
+            self.d.qvel.tt_dyn["gpu", type_of(self.d).L_NV](type_of(self.d).L_NV()),
             self._act_operand(),
-            self.d.meta.lt["gpu", type_of(self.d).L_META](),
-            self.mf.joints.lt["gpu", type_of(self.mf).L_JOINT](),
-            self.mf.tendons.lt["gpu", Self.L_TENDONS_HOOK](),
-            self.sf.actuators.lt[
-                "gpu",
-                Layout.row_major(Self.MODEL_DEF.NACT_F * MODEL_ACTUATOR_SIZE),
-            ](),
-            self.sf.act_tendons.lt[
-                "gpu",
-                Layout.row_major(Self.NTENDON_F * MODEL_ACT_TENDON_SIZE),
-            ](),
+            self.d.meta.tt_dyn["gpu", type_of(self.d).L_META](type_of(self.d).L_META()),
+            self.mf.joints.tt_dyn["gpu", type_of(self.mf).L_JOINT](type_of(self.mf).L_JOINT()),
+            self.mf.tendons.tt["gpu", Self.NTENDON_F, MODEL_TENDON_SIZE](),
+            self.sf.actuators.tt["gpu", Self.MODEL_DEF.NACT_F * MODEL_ACTUATOR_SIZE](),
+            self.sf.act_tendons.tt["gpu", Self.NTENDON_F * MODEL_ACT_TENDON_SIZE](),
             grid_dim=(Self.BLOCKS,),
             block_dim=(TPB,),
         )
@@ -955,26 +864,12 @@ struct Phyics3dBatchedEnv[
 
         @always_inline
         def mocap_kernel(
-            bodies: LayoutTensor[
-                DT,
-                Layout.row_major(Self.NBODY, MODEL_BODY_SIZE),
-                MutAnyOrigin,
-            ],
-            mocap_pos: LayoutTensor[
-                DT, Layout.row_major(Self.N_ENVS, Self.NBODY * 3), MutAnyOrigin
-            ],
-            mocap_quat: LayoutTensor[
-                DT, Layout.row_major(Self.N_ENVS, Self.NBODY * 4), MutAnyOrigin
-            ],
-            xpos: LayoutTensor[
-                DT, Layout.row_major(Self.N_ENVS, Self.NBODY * 3), MutAnyOrigin
-            ],
-            xipos: LayoutTensor[
-                DT, Layout.row_major(Self.N_ENVS, Self.NBODY * 3), MutAnyOrigin
-            ],
-            xquat: LayoutTensor[
-                DT, Layout.row_major(Self.N_ENVS, Self.NBODY * 4), MutAnyOrigin
-            ],
+            bodies: Tile[DT, Self.NBODY, MODEL_BODY_SIZE],
+            mocap_pos: Tile[DT, Self.N_ENVS, Self.NBODY * 3],
+            mocap_quat: Tile[DT, Self.N_ENVS, Self.NBODY * 4],
+            xpos: Tile[DT, Self.N_ENVS, Self.NBODY * 3],
+            xipos: Tile[DT, Self.N_ENVS, Self.NBODY * 3],
+            xquat: Tile[DT, Self.N_ENVS, Self.NBODY * 4],
         ):
             var env = Int(block_dim.x * block_idx.x + thread_idx.x)
             if env >= Self.N_ENVS:
@@ -992,12 +887,12 @@ struct Phyics3dBatchedEnv[
                     xquat[env, b * 4 + k] = mocap_quat[env, b * 4 + k]
 
         c.enqueue_function[mocap_kernel](
-            self.mf.bodies.lt["gpu", type_of(self.mf).L_BODY](),
-            self.d.mocap_pos.lt["gpu", type_of(self.d).L_B3](),
-            self.d.mocap_quat.lt["gpu", type_of(self.d).L_B4](),
-            self.d.xpos.lt["gpu", type_of(self.d).L_B3](),
-            self.d.xipos.lt["gpu", type_of(self.d).L_B3](),
-            self.d.xquat.lt["gpu", type_of(self.d).L_B4](),
+            self.mf.bodies.tt_dyn["gpu", type_of(self.mf).L_BODY](type_of(self.mf).L_BODY()),
+            self.d.mocap_pos.tt_dyn["gpu", type_of(self.d).L_B3](type_of(self.d).L_B3()),
+            self.d.mocap_quat.tt_dyn["gpu", type_of(self.d).L_B4](type_of(self.d).L_B4()),
+            self.d.xpos.tt_dyn["gpu", type_of(self.d).L_B3](type_of(self.d).L_B3()),
+            self.d.xipos.tt_dyn["gpu", type_of(self.d).L_B3](type_of(self.d).L_B3()),
+            self.d.xquat.tt_dyn["gpu", type_of(self.d).L_B4](type_of(self.d).L_B4()),
             grid_dim=(Self.BLOCKS,),
             block_dim=(TPB,),
         )
@@ -1023,97 +918,31 @@ struct Phyics3dBatchedEnv[
 
         @always_inline
         def obs_kernel(
-            qpos: LayoutTensor[
-                DT, Layout.row_major(Self.N_ENVS, Self.NQ), MutAnyOrigin
-            ],
-            qvel: LayoutTensor[
-                DT, Layout.row_major(Self.N_ENVS, Self.NV), MutAnyOrigin
-            ],
-            xpos: LayoutTensor[
-                DT,
-                Layout.row_major(Self.N_ENVS, Self.NBODY * 3),
-                MutAnyOrigin,
-            ],
-            xquat: LayoutTensor[
-                DT,
-                Layout.row_major(Self.N_ENVS, Self.NBODY * 4),
-                MutAnyOrigin,
-            ],
-            xvel: LayoutTensor[
-                DT,
-                Layout.row_major(Self.N_ENVS, Self.NBODY * 3),
-                MutAnyOrigin,
-            ],
-            bodies: LayoutTensor[
-                DT,
-                Layout.row_major(Self.NBODY, MODEL_BODY_SIZE),
-                MutAnyOrigin,
-            ],
-            site_xpos: LayoutTensor[
-                DT, Self.L_SITE_HOOK, MutAnyOrigin
-            ],
-            contacts: LayoutTensor[
-                DT, Data[DT, Self.MD, Self.N_ENVS].L_CONTACTS, MutAnyOrigin
-            ],
-            sites: LayoutTensor[DT, Self.L_SITES_HOOK, MutAnyOrigin],
-            geoms: LayoutTensor[DT, Self.L_GEOMS_HOOK, MutAnyOrigin],
-            meta: LayoutTensor[
-                DT,
-                Layout.row_major(Self.N_ENVS, METADATA_SIZE),
-                MutAnyOrigin,
-            ],
-            obs: LayoutTensor[
-                DT,
-                Layout.row_major(Self.N_ENVS, Self.OBS_DIM),
-                MutAnyOrigin,
-            ],
-            xipos: LayoutTensor[
-                DT,
-                Layout.row_major(Self.N_ENVS, Self.NBODY * 3),
-                MutAnyOrigin,
-            ],
-            xangvel: LayoutTensor[
-                DT,
-                Layout.row_major(Self.N_ENVS, Self.NBODY * 3),
-                MutAnyOrigin,
-            ],
-            cvel: LayoutTensor[
-                DT,
-                Layout.row_major(Self.N_ENVS, Self.NBODY * 6),
-                MutAnyOrigin,
-            ],
-            cacc: LayoutTensor[
-                DT,
-                Layout.row_major(Self.N_ENVS, Self.NBODY * 6),
-                MutAnyOrigin,
-            ],
-            cfrc_int: LayoutTensor[
-                DT,
-                Layout.row_major(Self.N_ENVS, Self.NBODY * 6),
-                MutAnyOrigin,
-            ],
-            subtree_com: LayoutTensor[
-                DT,
-                Layout.row_major(Self.N_ENVS, Self.NBODY * 3),
-                MutAnyOrigin,
-            ],
-            site_xpos_acc: LayoutTensor[
-                DT, Self.L_SITE_HOOK, MutAnyOrigin
-            ],
-            xquat_acc: LayoutTensor[
-                DT,
-                Layout.row_major(Self.N_ENVS, Self.NBODY * 4),
-                MutAnyOrigin,
-            ],
-            act: LayoutTensor[DT, Self.L_ACT_HOOK, MutAnyOrigin],
-            mesh_meta: LayoutTensor[
-                DT, Self.L_MESH_META_HOOK, MutAnyOrigin
-            ],
-            mesh_tris: LayoutTensor[
-                DT, Self.L_MESH_TRIS_HOOK, MutAnyOrigin
-            ],
-            hfield_meta: LayoutTensor[DT, Self.L_HF_META_HOOK, MutAnyOrigin],
-            hfield_data: LayoutTensor[DT, Self.L_HF_DATA_HOOK, MutAnyOrigin],
+            qpos: Tile[DT, Self.N_ENVS, Self.NQ],
+            qvel: Tile[DT, Self.N_ENVS, Self.NV],
+            xpos: Tile[DT, Self.N_ENVS, Self.NBODY * 3],
+            xquat: Tile[DT, Self.N_ENVS, Self.NBODY * 4],
+            xvel: Tile[DT, Self.N_ENVS, Self.NBODY * 3],
+            bodies: Tile[DT, Self.NBODY, MODEL_BODY_SIZE],
+            site_xpos: TileTensor[DT, Self.L_SITE_HOOK, MutAnyOrigin],
+            contacts: TileTensor[DT, Data[DT, Self.MD, Self.N_ENVS].L_CONTACTS, MutAnyOrigin],
+            sites: TileTensor[DT, Self.L_SITES_HOOK, MutAnyOrigin],
+            geoms: TileTensor[DT, Self.L_GEOMS_HOOK, MutAnyOrigin],
+            meta: Tile[DT, Self.N_ENVS, METADATA_SIZE],
+            obs: Tile[DT, Self.N_ENVS, Self.OBS_DIM],
+            xipos: Tile[DT, Self.N_ENVS, Self.NBODY * 3],
+            xangvel: Tile[DT, Self.N_ENVS, Self.NBODY * 3],
+            cvel: Tile[DT, Self.N_ENVS, Self.NBODY * 6],
+            cacc: Tile[DT, Self.N_ENVS, Self.NBODY * 6],
+            cfrc_int: Tile[DT, Self.N_ENVS, Self.NBODY * 6],
+            subtree_com: Tile[DT, Self.N_ENVS, Self.NBODY * 3],
+            site_xpos_acc: TileTensor[DT, Self.L_SITE_HOOK, MutAnyOrigin],
+            xquat_acc: Tile[DT, Self.N_ENVS, Self.NBODY * 4],
+            act: TileTensor[DT, Self.L_ACT_HOOK, MutAnyOrigin],
+            mesh_meta: TileTensor[DT, Self.L_MESH_META_HOOK, MutAnyOrigin],
+            mesh_tris: TileTensor[DT, Self.L_MESH_TRIS_HOOK, MutAnyOrigin],
+            hfield_meta: TileTensor[DT, Self.L_HF_META_HOOK, MutAnyOrigin],
+            hfield_data: TileTensor[DT, Self.L_HF_DATA_HOOK, MutAnyOrigin],
         ):
             var env = Int(block_dim.x * block_idx.x + thread_idx.x)
             if env >= Self.N_ENVS:
@@ -1139,35 +968,33 @@ struct Phyics3dBatchedEnv[
                     DT, Self.N_ENVS, Self.OBS_DIM
                 ](qpos, qvel, obs, env)
 
-        var obs_t = LayoutTensor[
-            DT, Layout.row_major(Self.N_ENVS, Self.OBS_DIM)
-        ](self._obs)
+        var obs_t = tile[Self.N_ENVS, Self.OBS_DIM](self._obs)
         c.enqueue_function[obs_kernel](
-            self.d.qpos.lt["gpu", type_of(self.d).L_QPOS](),
-            self.d.qvel.lt["gpu", type_of(self.d).L_NV](),
-            self.d.xpos.lt["gpu", type_of(self.d).L_B3](),
-            self.d.xquat.lt["gpu", type_of(self.d).L_B4](),
-            self.d.xvel.lt["gpu", type_of(self.d).L_B3](),
-            self.mf.bodies.lt["gpu", type_of(self.mf).L_BODY](),
+            self.d.qpos.tt_dyn["gpu", type_of(self.d).L_QPOS](type_of(self.d).L_QPOS()),
+            self.d.qvel.tt_dyn["gpu", type_of(self.d).L_NV](type_of(self.d).L_NV()),
+            self.d.xpos.tt_dyn["gpu", type_of(self.d).L_B3](type_of(self.d).L_B3()),
+            self.d.xquat.tt_dyn["gpu", type_of(self.d).L_B4](type_of(self.d).L_B4()),
+            self.d.xvel.tt_dyn["gpu", type_of(self.d).L_B3](type_of(self.d).L_B3()),
+            self.mf.bodies.tt_dyn["gpu", type_of(self.mf).L_BODY](type_of(self.mf).L_BODY()),
             self._site_xpos_operand(),
-            self.d.contacts.lt["gpu", type_of(self.d).L_CONTACTS](),
-            self.mf.sites.lt["gpu", Self.L_SITES_HOOK](),
-            self.mf.geoms.lt["gpu", Self.L_GEOMS_HOOK](),
-            self.d.meta.lt["gpu", type_of(self.d).L_META](),
+            self.d.contacts.tt_dyn["gpu", type_of(self.d).L_CONTACTS](type_of(self.d).L_CONTACTS()),
+            self.mf.sites.tt["gpu", Self.NSITE_F, MODEL_SITE_SIZE](),
+            self.mf.geoms.tt["gpu", Self.NGEOM_F, MODEL_GEOM_SIZE](),
+            self.d.meta.tt_dyn["gpu", type_of(self.d).L_META](type_of(self.d).L_META()),
             obs_t,
-            self.d.xipos.lt["gpu", type_of(self.d).L_B3](),
-            self.d.xangvel.lt["gpu", type_of(self.d).L_B3](),
-            self.d.cvel.lt["gpu", type_of(self.d).L_B6](),
-            self.d.cacc.lt["gpu", type_of(self.d).L_B6](),
-            self.d.cfrc_int.lt["gpu", type_of(self.d).L_B6](),
-            self.d.subtree_com.lt["gpu", type_of(self.d).L_B3](),
+            self.d.xipos.tt_dyn["gpu", type_of(self.d).L_B3](type_of(self.d).L_B3()),
+            self.d.xangvel.tt_dyn["gpu", type_of(self.d).L_B3](type_of(self.d).L_B3()),
+            self.d.cvel.tt_dyn["gpu", type_of(self.d).L_B6](type_of(self.d).L_B6()),
+            self.d.cacc.tt_dyn["gpu", type_of(self.d).L_B6](type_of(self.d).L_B6()),
+            self.d.cfrc_int.tt_dyn["gpu", type_of(self.d).L_B6](type_of(self.d).L_B6()),
+            self.d.subtree_com.tt_dyn["gpu", type_of(self.d).L_B3](type_of(self.d).L_B3()),
             self._site_xpos_acc_operand(),
-            self.d.xquat_acc.lt["gpu", type_of(self.d).L_B4](),
+            self.d.xquat_acc.tt_dyn["gpu", type_of(self.d).L_B4](type_of(self.d).L_B4()),
             self._act_operand(),
-            self.mf.mesh_meta.lt["gpu", Self.L_MESH_META_HOOK](),
-            self.mf.mesh_tris.lt["gpu", Self.L_MESH_TRIS_HOOK](),
-            self.mf.hfield_meta.lt["gpu", Self.L_HF_META_HOOK](),
-            self.d.hfield_data.lt["gpu", Self.L_HF_DATA_HOOK](),
+            self.mf.mesh_meta.tt["gpu", MAX_GPU_MESHES * MODEL_MESH_META_SIZE](),
+            self.mf.mesh_tris.tt["gpu", Self.NMESH_TRI_F * MESH_ARENA_FLOATS_PER_TRI](),
+            self.mf.hfield_meta.tt["gpu", MAX_GPU_HFIELDS * MODEL_HFIELD_META_SIZE](),
+            self.d.hfield_data.tt["gpu", Self.N_ENVS * Self.NHFIELD_DATA_F](),
             grid_dim=(Self.BLOCKS,),
             block_dim=(TPB,),
         )
@@ -1178,125 +1005,43 @@ struct Phyics3dBatchedEnv[
 
         @always_inline
         def extract_kernel(
-            qpos: LayoutTensor[
-                DT, Layout.row_major(Self.N_ENVS, Self.NQ), MutAnyOrigin
-            ],
-            qvel: LayoutTensor[
-                DT, Layout.row_major(Self.N_ENVS, Self.NV), MutAnyOrigin
-            ],
-            xpos: LayoutTensor[
-                DT,
-                Layout.row_major(Self.N_ENVS, Self.NBODY * 3),
-                MutAnyOrigin,
-            ],
-            xipos: LayoutTensor[
-                DT,
-                Layout.row_major(Self.N_ENVS, Self.NBODY * 3),
-                MutAnyOrigin,
-            ],
-            xquat: LayoutTensor[
-                DT,
-                Layout.row_major(Self.N_ENVS, Self.NBODY * 4),
-                MutAnyOrigin,
-            ],
-            xvel: LayoutTensor[
-                DT,
-                Layout.row_major(Self.N_ENVS, Self.NBODY * 3),
-                MutAnyOrigin,
-            ],
-            bodies: LayoutTensor[
-                DT,
-                Layout.row_major(Self.NBODY, MODEL_BODY_SIZE),
-                MutAnyOrigin,
-            ],
-            site_xpos: LayoutTensor[
-                DT, Self.L_SITE_HOOK, MutAnyOrigin
-            ],
-            contacts: LayoutTensor[
-                DT, Data[DT, Self.MD, Self.N_ENVS].L_CONTACTS, MutAnyOrigin
-            ],
-            sites: LayoutTensor[DT, Self.L_SITES_HOOK, MutAnyOrigin],
-            geoms: LayoutTensor[DT, Self.L_GEOMS_HOOK, MutAnyOrigin],
-            cfrc_ext: LayoutTensor[
-                DT,
-                Layout.row_major(Self.N_ENVS, Self.NBODY * 6),
-                MutAnyOrigin,
-            ],
-            cvel: LayoutTensor[
-                DT,
-                Layout.row_major(Self.N_ENVS, Self.NBODY * 6),
-                MutAnyOrigin,
-            ],
-            meta: LayoutTensor[
-                DT,
-                Layout.row_major(Self.N_ENVS, METADATA_SIZE),
-                MutAnyOrigin,
-            ],
-            curriculum: LayoutTensor[
-                DT, Layout.row_major(1, MODEL_CURRICULUM_SIZE), MutAnyOrigin
-            ],
-            actions: LayoutTensor[
-                DT,
-                Layout.row_major(Self.N_ENVS, Self.ACT_DIM),
-                MutAnyOrigin,
-            ],
-            rewards: LayoutTensor[
-                DT, Layout.row_major(Self.N_ENVS), MutAnyOrigin
-            ],
-            dones: LayoutTensor[
-                DT, Layout.row_major(Self.N_ENVS), MutAnyOrigin
-            ],
-            terminated_out: LayoutTensor[
-                DT, Layout.row_major(Self.N_ENVS), MutAnyOrigin
-            ],
-            obs: LayoutTensor[
-                DT,
-                Layout.row_major(Self.N_ENVS, Self.OBS_DIM),
-                MutAnyOrigin,
-            ],
+            qpos: Tile[DT, Self.N_ENVS, Self.NQ],
+            qvel: Tile[DT, Self.N_ENVS, Self.NV],
+            xpos: Tile[DT, Self.N_ENVS, Self.NBODY * 3],
+            xipos: Tile[DT, Self.N_ENVS, Self.NBODY * 3],
+            xquat: Tile[DT, Self.N_ENVS, Self.NBODY * 4],
+            xvel: Tile[DT, Self.N_ENVS, Self.NBODY * 3],
+            bodies: Tile[DT, Self.NBODY, MODEL_BODY_SIZE],
+            site_xpos: TileTensor[DT, Self.L_SITE_HOOK, MutAnyOrigin],
+            contacts: TileTensor[DT, Data[DT, Self.MD, Self.N_ENVS].L_CONTACTS, MutAnyOrigin],
+            sites: TileTensor[DT, Self.L_SITES_HOOK, MutAnyOrigin],
+            geoms: TileTensor[DT, Self.L_GEOMS_HOOK, MutAnyOrigin],
+            cfrc_ext: Tile[DT, Self.N_ENVS, Self.NBODY * 6],
+            cvel: Tile[DT, Self.N_ENVS, Self.NBODY * 6],
+            meta: Tile[DT, Self.N_ENVS, METADATA_SIZE],
+            curriculum: Tile[DT, 1, MODEL_CURRICULUM_SIZE],
+            actions: Tile[DT, Self.N_ENVS, Self.ACT_DIM],
+            rewards: Tile[DT, Self.N_ENVS],
+            dones: Tile[DT, Self.N_ENVS],
+            terminated_out: Tile[DT, Self.N_ENVS],
+            obs: Tile[DT, Self.N_ENVS, Self.OBS_DIM],
             # ── E2: the acceleration-stage set ────────────────────────────
             # ⚠ OPERAND BUDGET. This kernel now binds 27 operands against a
             # MEASURED Metal cliff of 28 (29 = JIT abort, not a slowdown).
             # Anything further has to displace something, not append — the
             # obvious lever is that `cfrc_ext` is read by three Gym configs
             # and nothing in the suite.
-            xangvel: LayoutTensor[
-                DT,
-                Layout.row_major(Self.N_ENVS, Self.NBODY * 3),
-                MutAnyOrigin,
-            ],
-            cacc: LayoutTensor[
-                DT,
-                Layout.row_major(Self.N_ENVS, Self.NBODY * 6),
-                MutAnyOrigin,
-            ],
-            cfrc_int: LayoutTensor[
-                DT,
-                Layout.row_major(Self.N_ENVS, Self.NBODY * 6),
-                MutAnyOrigin,
-            ],
-            subtree_com: LayoutTensor[
-                DT,
-                Layout.row_major(Self.N_ENVS, Self.NBODY * 3),
-                MutAnyOrigin,
-            ],
-            site_xpos_acc: LayoutTensor[
-                DT, Self.L_SITE_HOOK, MutAnyOrigin
-            ],
-            xquat_acc: LayoutTensor[
-                DT,
-                Layout.row_major(Self.N_ENVS, Self.NBODY * 4),
-                MutAnyOrigin,
-            ],
-            act: LayoutTensor[DT, Self.L_ACT_HOOK, MutAnyOrigin],
-            mesh_meta: LayoutTensor[
-                DT, Self.L_MESH_META_HOOK, MutAnyOrigin
-            ],
-            mesh_tris: LayoutTensor[
-                DT, Self.L_MESH_TRIS_HOOK, MutAnyOrigin
-            ],
-            hfield_meta: LayoutTensor[DT, Self.L_HF_META_HOOK, MutAnyOrigin],
-            hfield_data: LayoutTensor[DT, Self.L_HF_DATA_HOOK, MutAnyOrigin],
+            xangvel: Tile[DT, Self.N_ENVS, Self.NBODY * 3],
+            cacc: Tile[DT, Self.N_ENVS, Self.NBODY * 6],
+            cfrc_int: Tile[DT, Self.N_ENVS, Self.NBODY * 6],
+            subtree_com: Tile[DT, Self.N_ENVS, Self.NBODY * 3],
+            site_xpos_acc: TileTensor[DT, Self.L_SITE_HOOK, MutAnyOrigin],
+            xquat_acc: Tile[DT, Self.N_ENVS, Self.NBODY * 4],
+            act: TileTensor[DT, Self.L_ACT_HOOK, MutAnyOrigin],
+            mesh_meta: TileTensor[DT, Self.L_MESH_META_HOOK, MutAnyOrigin],
+            mesh_tris: TileTensor[DT, Self.L_MESH_TRIS_HOOK, MutAnyOrigin],
+            hfield_meta: TileTensor[DT, Self.L_HF_META_HOOK, MutAnyOrigin],
+            hfield_data: TileTensor[DT, Self.L_HF_DATA_HOOK, MutAnyOrigin],
         ):
             var env = Int(block_dim.x * block_idx.x + thread_idx.x)
             if env >= Self.N_ENVS:
@@ -1380,55 +1125,43 @@ struct Phyics3dBatchedEnv[
                 1.0
             ) if is_terminated else Scalar[DT](0.0)
 
-        var rewards_t = LayoutTensor[DT, Layout.row_major(Self.N_ENVS)](
-            self._reward
-        )
-        var dones_t = LayoutTensor[DT, Layout.row_major(Self.N_ENVS)](
-            self._done
-        )
-        var term_t = LayoutTensor[DT, Layout.row_major(Self.N_ENVS)](
-            self._terminated
-        )
-        var obs_t = LayoutTensor[
-            DT, Layout.row_major(Self.N_ENVS, Self.OBS_DIM)
-        ](self._obs)
-        var actions_t = LayoutTensor[
-            DT, Layout.row_major(Self.N_ENVS, Self.ACT_DIM)
-        ](self._action)
+        var rewards_t = tile[Self.N_ENVS](self._reward)
+        var dones_t = tile[Self.N_ENVS](self._done)
+        var term_t = tile[Self.N_ENVS](self._terminated)
+        var obs_t = tile[Self.N_ENVS, Self.OBS_DIM](self._obs)
+        var actions_t = tile[Self.N_ENVS, Self.ACT_DIM](self._action)
         c.enqueue_function[extract_kernel](
-            self.d.qpos.lt["gpu", type_of(self.d).L_QPOS](),
-            self.d.qvel.lt["gpu", type_of(self.d).L_NV](),
-            self.d.xpos.lt["gpu", type_of(self.d).L_B3](),
-            self.d.xipos.lt["gpu", type_of(self.d).L_B3](),
-            self.d.xquat.lt["gpu", type_of(self.d).L_B4](),
-            self.d.xvel.lt["gpu", type_of(self.d).L_B3](),
-            self.mf.bodies.lt["gpu", type_of(self.mf).L_BODY](),
+            self.d.qpos.tt_dyn["gpu", type_of(self.d).L_QPOS](type_of(self.d).L_QPOS()),
+            self.d.qvel.tt_dyn["gpu", type_of(self.d).L_NV](type_of(self.d).L_NV()),
+            self.d.xpos.tt_dyn["gpu", type_of(self.d).L_B3](type_of(self.d).L_B3()),
+            self.d.xipos.tt_dyn["gpu", type_of(self.d).L_B3](type_of(self.d).L_B3()),
+            self.d.xquat.tt_dyn["gpu", type_of(self.d).L_B4](type_of(self.d).L_B4()),
+            self.d.xvel.tt_dyn["gpu", type_of(self.d).L_B3](type_of(self.d).L_B3()),
+            self.mf.bodies.tt_dyn["gpu", type_of(self.mf).L_BODY](type_of(self.mf).L_BODY()),
             self._site_xpos_operand(),
-            self.d.contacts.lt["gpu", type_of(self.d).L_CONTACTS](),
-            self.mf.sites.lt["gpu", Self.L_SITES_HOOK](),
-            self.mf.geoms.lt["gpu", Self.L_GEOMS_HOOK](),
-            self.d.cfrc_ext.lt["gpu", type_of(self.d).L_B6](),
-            self.d.cvel.lt["gpu", type_of(self.d).L_B6](),
-            self.d.meta.lt["gpu", type_of(self.d).L_META](),
-            self.mf.curriculum.lt[
-                "gpu", Layout.row_major(1, MODEL_CURRICULUM_SIZE)
-            ](),
+            self.d.contacts.tt_dyn["gpu", type_of(self.d).L_CONTACTS](type_of(self.d).L_CONTACTS()),
+            self.mf.sites.tt["gpu", Self.NSITE_F, MODEL_SITE_SIZE](),
+            self.mf.geoms.tt["gpu", Self.NGEOM_F, MODEL_GEOM_SIZE](),
+            self.d.cfrc_ext.tt_dyn["gpu", type_of(self.d).L_B6](type_of(self.d).L_B6()),
+            self.d.cvel.tt_dyn["gpu", type_of(self.d).L_B6](type_of(self.d).L_B6()),
+            self.d.meta.tt_dyn["gpu", type_of(self.d).L_META](type_of(self.d).L_META()),
+            self.mf.curriculum.tt["gpu", 1, MODEL_CURRICULUM_SIZE](),
             actions_t,
             rewards_t,
             dones_t,
             term_t,
             obs_t,
-            self.d.xangvel.lt["gpu", type_of(self.d).L_B3](),
-            self.d.cacc.lt["gpu", type_of(self.d).L_B6](),
-            self.d.cfrc_int.lt["gpu", type_of(self.d).L_B6](),
-            self.d.subtree_com.lt["gpu", type_of(self.d).L_B3](),
+            self.d.xangvel.tt_dyn["gpu", type_of(self.d).L_B3](type_of(self.d).L_B3()),
+            self.d.cacc.tt_dyn["gpu", type_of(self.d).L_B6](type_of(self.d).L_B6()),
+            self.d.cfrc_int.tt_dyn["gpu", type_of(self.d).L_B6](type_of(self.d).L_B6()),
+            self.d.subtree_com.tt_dyn["gpu", type_of(self.d).L_B3](type_of(self.d).L_B3()),
             self._site_xpos_acc_operand(),
-            self.d.xquat_acc.lt["gpu", type_of(self.d).L_B4](),
+            self.d.xquat_acc.tt_dyn["gpu", type_of(self.d).L_B4](type_of(self.d).L_B4()),
             self._act_operand(),
-            self.mf.mesh_meta.lt["gpu", Self.L_MESH_META_HOOK](),
-            self.mf.mesh_tris.lt["gpu", Self.L_MESH_TRIS_HOOK](),
-            self.mf.hfield_meta.lt["gpu", Self.L_HF_META_HOOK](),
-            self.d.hfield_data.lt["gpu", Self.L_HF_DATA_HOOK](),
+            self.mf.mesh_meta.tt["gpu", MAX_GPU_MESHES * MODEL_MESH_META_SIZE](),
+            self.mf.mesh_tris.tt["gpu", Self.NMESH_TRI_F * MESH_ARENA_FLOATS_PER_TRI](),
+            self.mf.hfield_meta.tt["gpu", MAX_GPU_HFIELDS * MODEL_HFIELD_META_SIZE](),
+            self.d.hfield_data.tt["gpu", Self.N_ENVS * Self.NHFIELD_DATA_F](),
             grid_dim=(Self.BLOCKS,),
             block_dim=(TPB,),
         )
@@ -1448,65 +1181,29 @@ struct Phyics3dBatchedEnv[
         # hook metadata), then FK for the reset observation.
         @always_inline
         def reset_kernel(
-            qpos: LayoutTensor[
-                DT, Layout.row_major(Self.N_ENVS, Self.NQ), MutAnyOrigin
-            ],
-            qvel: LayoutTensor[
-                DT, Layout.row_major(Self.N_ENVS, Self.NV), MutAnyOrigin
-            ],
-            qacc: LayoutTensor[
-                DT, Layout.row_major(Self.N_ENVS, Self.NV), MutAnyOrigin
-            ],
-            qfrc: LayoutTensor[
-                DT, Layout.row_major(Self.N_ENVS, Self.NV), MutAnyOrigin
-            ],
+            qpos: Tile[DT, Self.N_ENVS, Self.NQ],
+            qvel: Tile[DT, Self.N_ENVS, Self.NV],
+            qacc: Tile[DT, Self.N_ENVS, Self.NV],
+            qfrc: Tile[DT, Self.N_ENVS, Self.NV],
             # ⚠ `mj_resetData` ZEROES `qacc_warmstart`, so a lane that starts a
             # new episode must too — otherwise its first primal solve prices
             # the PREVIOUS episode's acceleration. The cost comparison would
             # usually discard it, but "usually" is not the reference's
             # algorithm.
-            qacc_ws: LayoutTensor[
-                DT, Layout.row_major(Self.N_ENVS, Self.NV), MutAnyOrigin
-            ],
-            meta: LayoutTensor[
-                DT,
-                Layout.row_major(Self.N_ENVS, METADATA_SIZE),
-                MutAnyOrigin,
-            ],
-            joints: LayoutTensor[
-                DT,
-                Layout.row_major(Self.NJOINT, MODEL_JOINT_SIZE),
-                MutAnyOrigin,
-            ],
-            mocap_pos: LayoutTensor[
-                DT,
-                Layout.row_major(Self.N_ENVS, Self.NBODY * 3),
-                MutAnyOrigin,
-            ],
-            mocap_quat: LayoutTensor[
-                DT,
-                Layout.row_major(Self.N_ENVS, Self.NBODY * 4),
-                MutAnyOrigin,
-            ],
-            reset_mask: LayoutTensor[
-                DT, Layout.row_major(Self.N_ENVS), MutAnyOrigin
-            ],
-            bodies: LayoutTensor[
-                DT,
-                Layout.row_major(Self.NBODY, MODEL_BODY_SIZE),
-                MutAnyOrigin,
-            ],
-            geoms: LayoutTensor[DT, Self.L_GEOMS_HOOK, MutAnyOrigin],
-            act: LayoutTensor[DT, Self.L_ACT_HOOK, MutAnyOrigin],
-            hfield_meta: LayoutTensor[DT, Self.L_HF_META_HOOK, MutAnyOrigin],
-            hfield_data: LayoutTensor[DT, Self.L_HF_DATA_HOOK, MutAnyOrigin],
+            qacc_ws: Tile[DT, Self.N_ENVS, Self.NV],
+            meta: Tile[DT, Self.N_ENVS, METADATA_SIZE],
+            joints: Tile[DT, Self.NJOINT, MODEL_JOINT_SIZE],
+            mocap_pos: Tile[DT, Self.N_ENVS, Self.NBODY * 3],
+            mocap_quat: Tile[DT, Self.N_ENVS, Self.NBODY * 4],
+            reset_mask: Tile[DT, Self.N_ENVS],
+            bodies: Tile[DT, Self.NBODY, MODEL_BODY_SIZE],
+            geoms: TileTensor[DT, Self.L_GEOMS_HOOK, MutAnyOrigin],
+            act: TileTensor[DT, Self.L_ACT_HOOK, MutAnyOrigin],
+            hfield_meta: TileTensor[DT, Self.L_HF_META_HOOK, MutAnyOrigin],
+            hfield_data: TileTensor[DT, Self.L_HF_DATA_HOOK, MutAnyOrigin],
             seed_arg: Int64,
-            qpos0: LayoutTensor[
-                DT, Layout.row_major(Self.MODEL_DEF.NQ_F), MutAnyOrigin
-            ],
-            pose_meta: LayoutTensor[
-                DT, Layout.row_major(POSE_META_SIZE), MutAnyOrigin
-            ],
+            qpos0: Tile[DT, Self.MODEL_DEF.NQ_F],
+            pose_meta: Tile[DT, POSE_META_SIZE],
         ):
             # Mojo 1.0: `Int`/`UInt` are not `DevicePassable`; the kernel takes
             # a fixed-width `Int64` and re-binds the original name here.
@@ -1522,28 +1219,24 @@ struct Phyics3dBatchedEnv[
             reset_mask[i] = Scalar[DT](1)
 
         c.enqueue_function[reset_kernel](
-            self.d.qpos.lt["gpu", type_of(self.d).L_QPOS](),
-            self.d.qvel.lt["gpu", type_of(self.d).L_NV](),
-            self.d.qacc.lt["gpu", type_of(self.d).L_NV](),
-            self.d.qfrc.lt["gpu", type_of(self.d).L_NV](),
-            self.d.qacc_warmstart.lt["gpu", type_of(self.d).L_NV](),
-            self.d.meta.lt["gpu", type_of(self.d).L_META](),
-            self.mf.joints.lt["gpu", type_of(self.mf).L_JOINT](),
-            self.d.mocap_pos.lt["gpu", type_of(self.d).L_B3](),
-            self.d.mocap_quat.lt["gpu", type_of(self.d).L_B4](),
-            LayoutTensor[DT, Layout.row_major(Self.N_ENVS)](self._reset_mask),
-            self.mf.bodies.lt["gpu", type_of(self.mf).L_BODY](),
-            self.mf.geoms.lt["gpu", Self.L_GEOMS_HOOK](),
+            self.d.qpos.tt_dyn["gpu", type_of(self.d).L_QPOS](type_of(self.d).L_QPOS()),
+            self.d.qvel.tt_dyn["gpu", type_of(self.d).L_NV](type_of(self.d).L_NV()),
+            self.d.qacc.tt_dyn["gpu", type_of(self.d).L_NV](type_of(self.d).L_NV()),
+            self.d.qfrc.tt_dyn["gpu", type_of(self.d).L_NV](type_of(self.d).L_NV()),
+            self.d.qacc_warmstart.tt_dyn["gpu", type_of(self.d).L_NV](type_of(self.d).L_NV()),
+            self.d.meta.tt_dyn["gpu", type_of(self.d).L_META](type_of(self.d).L_META()),
+            self.mf.joints.tt_dyn["gpu", type_of(self.mf).L_JOINT](type_of(self.mf).L_JOINT()),
+            self.d.mocap_pos.tt_dyn["gpu", type_of(self.d).L_B3](type_of(self.d).L_B3()),
+            self.d.mocap_quat.tt_dyn["gpu", type_of(self.d).L_B4](type_of(self.d).L_B4()),
+            tile[Self.N_ENVS](self._reset_mask),
+            self.mf.bodies.tt_dyn["gpu", type_of(self.mf).L_BODY](type_of(self.mf).L_BODY()),
+            self.mf.geoms.tt["gpu", Self.NGEOM_F, MODEL_GEOM_SIZE](),
             self._act_operand(),
-            self.mf.hfield_meta.lt["gpu", Self.L_HF_META_HOOK](),
-            self.d.hfield_data.lt["gpu", Self.L_HF_DATA_HOOK](),
+            self.mf.hfield_meta.tt["gpu", MAX_GPU_HFIELDS * MODEL_HFIELD_META_SIZE](),
+            self.d.hfield_data.tt["gpu", Self.N_ENVS * Self.NHFIELD_DATA_F](),
             Int64(rng_seed),
-            self.sf.qpos0.lt[
-                "gpu", Layout.row_major(Self.MODEL_DEF.NQ_F)
-            ](),
-            self.sf.pose_meta.lt[
-                "gpu", Layout.row_major(POSE_META_SIZE)
-            ](),
+            self.sf.qpos0.tt["gpu", Self.MODEL_DEF.NQ_F](),
+            self.sf.pose_meta.tt["gpu", POSE_META_SIZE](),
             grid_dim=(Self.BLOCKS,),
             block_dim=(TPB,),
         )
@@ -1582,17 +1275,9 @@ struct Phyics3dBatchedEnv[
         # 1) CONFIG pre-step hook (save prev_x etc. into d.meta).
         @always_inline
         def pre_step_kernel(
-            qpos: LayoutTensor[
-                DT, Layout.row_major(Self.N_ENVS, Self.NQ), MutAnyOrigin
-            ],
-            qvel: LayoutTensor[
-                DT, Layout.row_major(Self.N_ENVS, Self.NV), MutAnyOrigin
-            ],
-            meta: LayoutTensor[
-                DT,
-                Layout.row_major(Self.N_ENVS, METADATA_SIZE),
-                MutAnyOrigin,
-            ],
+            qpos: Tile[DT, Self.N_ENVS, Self.NQ],
+            qvel: Tile[DT, Self.N_ENVS, Self.NV],
+            meta: Tile[DT, Self.N_ENVS, METADATA_SIZE],
         ):
             var env = Int(block_dim.x * block_idx.x + thread_idx.x)
             if env >= Self.N_ENVS:
@@ -1607,9 +1292,9 @@ struct Phyics3dBatchedEnv[
             )
 
         c.enqueue_function[pre_step_kernel](
-            self.d.qpos.lt["gpu", type_of(self.d).L_QPOS](),
-            self.d.qvel.lt["gpu", type_of(self.d).L_NV](),
-            self.d.meta.lt["gpu", type_of(self.d).L_META](),
+            self.d.qpos.tt_dyn["gpu", type_of(self.d).L_QPOS](type_of(self.d).L_QPOS()),
+            self.d.qvel.tt_dyn["gpu", type_of(self.d).L_NV](type_of(self.d).L_NV()),
+            self.d.meta.tt_dyn["gpu", type_of(self.d).L_META](type_of(self.d).L_META()),
             grid_dim=(Self.BLOCKS,),
             block_dim=(TPB,),
         )
@@ -1617,9 +1302,7 @@ struct Phyics3dBatchedEnv[
             c.synchronize()
             print("[step_batch] 1 pre_step ok")
 
-        var actions_t = LayoutTensor[
-            DT, Layout.row_major(Self.N_ENVS, Self.ACT_DIM)
-        ](self._action)
+        var actions_t = tile[Self.N_ENVS, Self.ACT_DIM](self._action)
 
         # 2a') Record the action for configs that put the PREVIOUS one in
         # their observation. ⚠ HERE, not in the reward hook: this path runs
@@ -1630,16 +1313,8 @@ struct Phyics3dBatchedEnv[
 
             @always_inline
             def record_action_kernel(
-                actions: LayoutTensor[
-                    DT,
-                    Layout.row_major(Self.N_ENVS, Self.ACT_DIM),
-                    MutAnyOrigin,
-                ],
-                meta: LayoutTensor[
-                    DT,
-                    Layout.row_major(Self.N_ENVS, METADATA_SIZE),
-                    MutAnyOrigin,
-                ],
+                actions: Tile[DT, Self.N_ENVS, Self.ACT_DIM],
+                meta: Tile[DT, Self.N_ENVS, METADATA_SIZE],
             ):
                 var env = Int(block_dim.x * block_idx.x + thread_idx.x)
                 if env >= Self.N_ENVS:
@@ -1652,7 +1327,7 @@ struct Phyics3dBatchedEnv[
 
             c.enqueue_function[record_action_kernel](
                 actions_t,
-                self.d.meta.lt["gpu", type_of(self.d).L_META](),
+                self.d.meta.tt_dyn["gpu", type_of(self.d).L_META](type_of(self.d).L_META()),
                 grid_dim=(Self.BLOCKS,),
                 block_dim=(TPB,),
             )
@@ -1718,64 +1393,31 @@ struct Phyics3dBatchedEnv[
                     NORMALIZED = Self.CONFIG.NORMALIZED_ACTIONS,
                 ](
                     c,
-                    self.d.qfrc.lt["gpu", type_of(self.d).L_NV](),
+                    self.d.qfrc.tt_dyn["gpu", type_of(self.d).L_NV](type_of(self.d).L_NV()),
                     rebind[
-                        LayoutTensor[
-                            DT,
-                            Layout.row_major(Self.N_ENVS, Self.ACT_DIM),
-                            MutAnyOrigin,
-                        ]
+                        Tile[DT, Self.N_ENVS, Self.ACT_DIM]
                     ](actions_t),
-                    self.d.qpos.lt["gpu", type_of(self.d).L_QPOS](),
-                    self.d.qvel.lt["gpu", type_of(self.d).L_NV](),
+                    self.d.qpos.tt_dyn["gpu", type_of(self.d).L_QPOS](type_of(self.d).L_QPOS()),
+                    self.d.qvel.tt_dyn["gpu", type_of(self.d).L_NV](type_of(self.d).L_NV()),
                     rebind[
-                        LayoutTensor[
-                            DT,
-                            Layout.row_major(
-                                Self.N_ENVS, Self.MODEL_DEF.NA_F
-                            ),
-                            MutAnyOrigin,
-                        ]
+                        Tile[DT, Self.N_ENVS, Self.MODEL_DEF.NA_F]
                     ](
-                        LayoutTensor[
-                            DT,
-                            Layout.row_major(
-                                Self.N_ENVS, Self.MODEL_DEF.NA_F
-                            ),
-                        ](self._act)
+                        tile[Self.N_ENVS, Self.MODEL_DEF.NA_F](self._act)
                     ),
-                    self.sf.actuators.lt[
-                        "gpu",
-                        Layout.row_major(
-                            Self.MODEL_DEF.NACT_F * MODEL_ACTUATOR_SIZE
-                        ),
-                    ](),
-                    self.sf.act_tendons.lt[
-                        "gpu",
-                        Layout.row_major(
-                            Self.MODEL_DEF.NTEN_F * MODEL_ACT_TENDON_SIZE
-                        ),
-                    ](),
+                    self.sf.actuators.tt["gpu", Self.MODEL_DEF.NACT_F * MODEL_ACTUATOR_SIZE](),
+                    self.sf.act_tendons.tt["gpu", Self.MODEL_DEF.NTEN_F * MODEL_ACT_TENDON_SIZE](),
                     # `jnt_actfrcrange` — the per-JOINT force clamp
                     # `mj_fwdActuation` applies after every actuator has
                     # contributed. Passed so this target and the CPU one
                     # cannot compute different forces from the same action.
-                    self.sf.joint_limits.lt[
-                        "gpu",
-                        Layout.row_major(Self.MODEL_DEF.NJOINT * JLIM_SIZE),
-                    ](),
+                    self.sf.joint_limits.tt["gpu", Self.MODEL_DEF.NJOINT * JLIM_SIZE](),
                     # This step's actuator damping diagonal + the flag. The
                     # batched env builds Euler/RK4, neither of which reads
                     # them; they are filled anyway so a future implicit
                     # caller cannot silently get the model-time value.
-                    self.d.dof_actdamp.lt["gpu", type_of(self.d).L_NV](),
-                    self.d.actdamp_act.lt[
-                        "gpu",
-                        Layout.row_major(
-                            Self.N_ENVS, Self.MODEL_DEF.NACT_F
-                        ),
-                    ](),
-                    self.d.meta.lt["gpu", type_of(self.d).L_META](),
+                    self.d.dof_actdamp.tt_dyn["gpu", type_of(self.d).L_NV](type_of(self.d).L_NV()),
+                    self.d.actdamp_act.tt["gpu", Self.N_ENVS, Self.MODEL_DEF.NACT_F](),
+                    self.d.meta.tt_dyn["gpu", type_of(self.d).L_META](type_of(self.d).L_META()),
                 )
             comptime if Self.CONFIG.INTEGRATOR == "euler":
                 self.integ_euler.step["gpu"](self.d, self.mf, ctx)
@@ -1817,11 +1459,11 @@ struct Phyics3dBatchedEnv[
         compute_cfrc_ext[DT, Self.N_ENVS](
             c,
             AsStatic[Self.MD](),
-            self.d.xipos.lt["gpu", type_of(self.d).L_B3](),
-            self.d.contacts.lt["gpu", type_of(self.d).L_CONTACTS](),
-            self.d.meta.lt["gpu", type_of(self.d).L_META](),
-            self.d.cfrc_ext.lt["gpu", type_of(self.d).L_B6](),
-            self.mf.bodies.lt["gpu", type_of(self.mf).L_BODY](),
+            self.d.xipos.tt_dyn["gpu", type_of(self.d).L_B3](type_of(self.d).L_B3()),
+            self.d.contacts.tt_dyn["gpu", type_of(self.d).L_CONTACTS](type_of(self.d).L_CONTACTS()),
+            self.d.meta.tt_dyn["gpu", type_of(self.d).L_META](type_of(self.d).L_META()),
+            self.d.cfrc_ext.tt_dyn["gpu", type_of(self.d).L_B6](type_of(self.d).L_B6()),
+            self.mf.bodies.tt_dyn["gpu", type_of(self.mf).L_BODY](type_of(self.mf).L_BODY()),
         )
         comptime if DEBUG:
             c.synchronize()
@@ -1857,11 +1499,11 @@ struct Phyics3dBatchedEnv[
             compute_cvel[DT, Self.N_ENVS](
                 c,
                 AsStatic[Self.MD](),
-                self.d.xpos.lt["gpu", type_of(self.d).L_B3](),
-                self.d.xvel.lt["gpu", type_of(self.d).L_B3](),
-                self.d.xangvel.lt["gpu", type_of(self.d).L_B3](),
-                self.d.xipos.lt["gpu", type_of(self.d).L_B3](),
-                self.d.cvel.lt["gpu", type_of(self.d).L_B6](),
+                self.d.xpos.tt_dyn["gpu", type_of(self.d).L_B3](type_of(self.d).L_B3()),
+                self.d.xvel.tt_dyn["gpu", type_of(self.d).L_B3](type_of(self.d).L_B3()),
+                self.d.xangvel.tt_dyn["gpu", type_of(self.d).L_B3](type_of(self.d).L_B3()),
+                self.d.xipos.tt_dyn["gpu", type_of(self.d).L_B3](type_of(self.d).L_B3()),
+                self.d.cvel.tt_dyn["gpu", type_of(self.d).L_B6](type_of(self.d).L_B6()),
             )
         comptime if DEBUG:
             c.synchronize()
@@ -1884,79 +1526,37 @@ struct Phyics3dBatchedEnv[
         var c = require_ctx[
             "Phyics3dBatchedEnv.selective_reset_batch"
         ](ctx)
-        var cnt_t = LayoutTensor[DType.uint64, Layout.row_major(1)](
-            self._env_rng_counter
-        )
+        var cnt_t = tile[1](self._env_rng_counter)
         c.enqueue_function[_rng_counter_bump_kernel](
             cnt_t, grid_dim=(1,), block_dim=(1,)
         )
 
         @always_inline
         def selective_reset_kernel(
-            qpos: LayoutTensor[
-                DT, Layout.row_major(Self.N_ENVS, Self.NQ), MutAnyOrigin
-            ],
-            qvel: LayoutTensor[
-                DT, Layout.row_major(Self.N_ENVS, Self.NV), MutAnyOrigin
-            ],
-            qacc: LayoutTensor[
-                DT, Layout.row_major(Self.N_ENVS, Self.NV), MutAnyOrigin
-            ],
-            qfrc: LayoutTensor[
-                DT, Layout.row_major(Self.N_ENVS, Self.NV), MutAnyOrigin
-            ],
+            qpos: Tile[DT, Self.N_ENVS, Self.NQ],
+            qvel: Tile[DT, Self.N_ENVS, Self.NV],
+            qacc: Tile[DT, Self.N_ENVS, Self.NV],
+            qfrc: Tile[DT, Self.N_ENVS, Self.NV],
             # ⚠ `mj_resetData` ZEROES `qacc_warmstart`, so a lane that starts a
             # new episode must too — otherwise its first primal solve prices
             # the PREVIOUS episode's acceleration. The cost comparison would
             # usually discard it, but "usually" is not the reference's
             # algorithm.
-            qacc_ws: LayoutTensor[
-                DT, Layout.row_major(Self.N_ENVS, Self.NV), MutAnyOrigin
-            ],
-            meta: LayoutTensor[
-                DT,
-                Layout.row_major(Self.N_ENVS, METADATA_SIZE),
-                MutAnyOrigin,
-            ],
-            dones: LayoutTensor[
-                DT, Layout.row_major(Self.N_ENVS), MutAnyOrigin
-            ],
-            joints: LayoutTensor[
-                DT,
-                Layout.row_major(Self.NJOINT, MODEL_JOINT_SIZE),
-                MutAnyOrigin,
-            ],
-            mocap_pos: LayoutTensor[
-                DT,
-                Layout.row_major(Self.N_ENVS, Self.NBODY * 3),
-                MutAnyOrigin,
-            ],
-            mocap_quat: LayoutTensor[
-                DT,
-                Layout.row_major(Self.N_ENVS, Self.NBODY * 4),
-                MutAnyOrigin,
-            ],
-            counter: LayoutTensor[
-                DType.uint64, Layout.row_major(1), MutAnyOrigin
-            ],
-            reset_mask: LayoutTensor[
-                DT, Layout.row_major(Self.N_ENVS), MutAnyOrigin
-            ],
-            bodies: LayoutTensor[
-                DT,
-                Layout.row_major(Self.NBODY, MODEL_BODY_SIZE),
-                MutAnyOrigin,
-            ],
-            geoms: LayoutTensor[DT, Self.L_GEOMS_HOOK, MutAnyOrigin],
-            act: LayoutTensor[DT, Self.L_ACT_HOOK, MutAnyOrigin],
-            hfield_meta: LayoutTensor[DT, Self.L_HF_META_HOOK, MutAnyOrigin],
-            hfield_data: LayoutTensor[DT, Self.L_HF_DATA_HOOK, MutAnyOrigin],
-            qpos0: LayoutTensor[
-                DT, Layout.row_major(Self.MODEL_DEF.NQ_F), MutAnyOrigin
-            ],
-            pose_meta: LayoutTensor[
-                DT, Layout.row_major(POSE_META_SIZE), MutAnyOrigin
-            ],
+            qacc_ws: Tile[DT, Self.N_ENVS, Self.NV],
+            meta: Tile[DT, Self.N_ENVS, METADATA_SIZE],
+            dones: Tile[DT, Self.N_ENVS],
+            joints: Tile[DT, Self.NJOINT, MODEL_JOINT_SIZE],
+            mocap_pos: Tile[DT, Self.N_ENVS, Self.NBODY * 3],
+            mocap_quat: Tile[DT, Self.N_ENVS, Self.NBODY * 4],
+            counter: Tile[DType.uint64, 1],
+            reset_mask: Tile[DT, Self.N_ENVS],
+            bodies: Tile[DT, Self.NBODY, MODEL_BODY_SIZE],
+            geoms: TileTensor[DT, Self.L_GEOMS_HOOK, MutAnyOrigin],
+            act: TileTensor[DT, Self.L_ACT_HOOK, MutAnyOrigin],
+            hfield_meta: TileTensor[DT, Self.L_HF_META_HOOK, MutAnyOrigin],
+            hfield_data: TileTensor[DT, Self.L_HF_DATA_HOOK, MutAnyOrigin],
+            qpos0: Tile[DT, Self.MODEL_DEF.NQ_F],
+            pose_meta: Tile[DT, POSE_META_SIZE],
         ):
             var i = Int(block_dim.x * block_idx.x + thread_idx.x)
             if i >= Self.N_ENVS:
@@ -1986,33 +1586,27 @@ struct Phyics3dBatchedEnv[
                 dones[i] = Scalar[DT](0.0)
                 reset_mask[i] = Scalar[DT](1)
 
-        var dones_t = LayoutTensor[DT, Layout.row_major(Self.N_ENVS)](
-            self._done
-        )
+        var dones_t = tile[Self.N_ENVS](self._done)
         c.enqueue_function[selective_reset_kernel](
-            self.d.qpos.lt["gpu", type_of(self.d).L_QPOS](),
-            self.d.qvel.lt["gpu", type_of(self.d).L_NV](),
-            self.d.qacc.lt["gpu", type_of(self.d).L_NV](),
-            self.d.qfrc.lt["gpu", type_of(self.d).L_NV](),
-            self.d.qacc_warmstart.lt["gpu", type_of(self.d).L_NV](),
-            self.d.meta.lt["gpu", type_of(self.d).L_META](),
+            self.d.qpos.tt_dyn["gpu", type_of(self.d).L_QPOS](type_of(self.d).L_QPOS()),
+            self.d.qvel.tt_dyn["gpu", type_of(self.d).L_NV](type_of(self.d).L_NV()),
+            self.d.qacc.tt_dyn["gpu", type_of(self.d).L_NV](type_of(self.d).L_NV()),
+            self.d.qfrc.tt_dyn["gpu", type_of(self.d).L_NV](type_of(self.d).L_NV()),
+            self.d.qacc_warmstart.tt_dyn["gpu", type_of(self.d).L_NV](type_of(self.d).L_NV()),
+            self.d.meta.tt_dyn["gpu", type_of(self.d).L_META](type_of(self.d).L_META()),
             dones_t,
-            self.mf.joints.lt["gpu", type_of(self.mf).L_JOINT](),
-            self.d.mocap_pos.lt["gpu", type_of(self.d).L_B3](),
-            self.d.mocap_quat.lt["gpu", type_of(self.d).L_B4](),
+            self.mf.joints.tt_dyn["gpu", type_of(self.mf).L_JOINT](type_of(self.mf).L_JOINT()),
+            self.d.mocap_pos.tt_dyn["gpu", type_of(self.d).L_B3](type_of(self.d).L_B3()),
+            self.d.mocap_quat.tt_dyn["gpu", type_of(self.d).L_B4](type_of(self.d).L_B4()),
             cnt_t,
-            LayoutTensor[DT, Layout.row_major(Self.N_ENVS)](self._reset_mask),
-            self.mf.bodies.lt["gpu", type_of(self.mf).L_BODY](),
-            self.mf.geoms.lt["gpu", Self.L_GEOMS_HOOK](),
+            tile[Self.N_ENVS](self._reset_mask),
+            self.mf.bodies.tt_dyn["gpu", type_of(self.mf).L_BODY](type_of(self.mf).L_BODY()),
+            self.mf.geoms.tt["gpu", Self.NGEOM_F, MODEL_GEOM_SIZE](),
             self._act_operand(),
-            self.mf.hfield_meta.lt["gpu", Self.L_HF_META_HOOK](),
-            self.d.hfield_data.lt["gpu", Self.L_HF_DATA_HOOK](),
-            self.sf.qpos0.lt[
-                "gpu", Layout.row_major(Self.MODEL_DEF.NQ_F)
-            ](),
-            self.sf.pose_meta.lt[
-                "gpu", Layout.row_major(POSE_META_SIZE)
-            ](),
+            self.mf.hfield_meta.tt["gpu", MAX_GPU_HFIELDS * MODEL_HFIELD_META_SIZE](),
+            self.d.hfield_data.tt["gpu", Self.N_ENVS * Self.NHFIELD_DATA_F](),
+            self.sf.qpos0.tt["gpu", Self.MODEL_DEF.NQ_F](),
+            self.sf.pose_meta.tt["gpu", POSE_META_SIZE](),
             grid_dim=(Self.BLOCKS,),
             block_dim=(TPB,),
         )
@@ -2031,46 +1625,22 @@ struct Phyics3dBatchedEnv[
     @always_inline
     @staticmethod
     def _reset_env_lane(
-        qpos: LayoutTensor[
-            DT, Layout.row_major(Self.N_ENVS, Self.NQ), MutAnyOrigin
-        ],
-        qvel: LayoutTensor[
-            DT, Layout.row_major(Self.N_ENVS, Self.NV), MutAnyOrigin
-        ],
-        qacc: LayoutTensor[
-            DT, Layout.row_major(Self.N_ENVS, Self.NV), MutAnyOrigin
-        ],
-        qfrc: LayoutTensor[
-            DT, Layout.row_major(Self.N_ENVS, Self.NV), MutAnyOrigin
-        ],
-        qacc_ws: LayoutTensor[
-            DT, Layout.row_major(Self.N_ENVS, Self.NV), MutAnyOrigin
-        ],
-        meta: LayoutTensor[
-            DT, Layout.row_major(Self.N_ENVS, METADATA_SIZE), MutAnyOrigin
-        ],
-        joints: LayoutTensor[
-            DT, Layout.row_major(Self.NJOINT, MODEL_JOINT_SIZE), MutAnyOrigin
-        ],
-        mocap_pos: LayoutTensor[
-            DT, Layout.row_major(Self.N_ENVS, Self.NBODY * 3), MutAnyOrigin
-        ],
-        mocap_quat: LayoutTensor[
-            DT, Layout.row_major(Self.N_ENVS, Self.NBODY * 4), MutAnyOrigin
-        ],
-        bodies: LayoutTensor[
-            DT, Layout.row_major(Self.NBODY, MODEL_BODY_SIZE), MutAnyOrigin
-        ],
-        geoms: LayoutTensor[DT, Self.L_GEOMS_HOOK, MutAnyOrigin],
-        act: LayoutTensor[DT, Self.L_ACT_HOOK, MutAnyOrigin],
-        hfield_meta: LayoutTensor[DT, Self.L_HF_META_HOOK, MutAnyOrigin],
-        hfield_data: LayoutTensor[DT, Self.L_HF_DATA_HOOK, MutAnyOrigin],
-        qpos0: LayoutTensor[
-            DT, Layout.row_major(Self.MODEL_DEF.NQ_F), MutAnyOrigin
-        ],
-        pose_meta: LayoutTensor[
-            DT, Layout.row_major(POSE_META_SIZE), MutAnyOrigin
-        ],
+        qpos: Tile[DT, Self.N_ENVS, Self.NQ],
+        qvel: Tile[DT, Self.N_ENVS, Self.NV],
+        qacc: Tile[DT, Self.N_ENVS, Self.NV],
+        qfrc: Tile[DT, Self.N_ENVS, Self.NV],
+        qacc_ws: Tile[DT, Self.N_ENVS, Self.NV],
+        meta: Tile[DT, Self.N_ENVS, METADATA_SIZE],
+        joints: Tile[DT, Self.NJOINT, MODEL_JOINT_SIZE],
+        mocap_pos: Tile[DT, Self.N_ENVS, Self.NBODY * 3],
+        mocap_quat: Tile[DT, Self.N_ENVS, Self.NBODY * 4],
+        bodies: Tile[DT, Self.NBODY, MODEL_BODY_SIZE],
+        geoms: TileTensor[DT, Self.L_GEOMS_HOOK, MutAnyOrigin],
+        act: TileTensor[DT, Self.L_ACT_HOOK, MutAnyOrigin],
+        hfield_meta: TileTensor[DT, Self.L_HF_META_HOOK, MutAnyOrigin],
+        hfield_data: TileTensor[DT, Self.L_HF_DATA_HOOK, MutAnyOrigin],
+        qpos0: Tile[DT, Self.MODEL_DEF.NQ_F],
+        pose_meta: Tile[DT, POSE_META_SIZE],
         env: Int,
         seed: Int,
     ):

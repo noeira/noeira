@@ -41,7 +41,7 @@ from std.python import Python, PythonObject
 from std.testing import assert_true, TestSuite
 from max.gpu.host import DeviceContext
 from std.collections import Array
-from layout import Layout
+from noeira.core.tiles import RowMajor
 
 from noeira.envs.dm_control.dog import (
     DMDogStandWalkModel,
@@ -123,16 +123,16 @@ def test_dog_contact_jacobian_matches_mujoco() raises:
     var integ = EulerIntegrator[DTYPE, MD, M.CONE_TYPE, 1, SOLVER="newton", MAX_CONDIM=M.MAX_CONDIM, NOSLIP_ITER=M.NOSLIP_ITER]()
     integ.step["cpu"](d, mf)
 
-    comptime L_NB3 = Layout.row_major(1, M.NBODY * 3)
-    comptime L_JNT = Layout.row_major(M.NJOINT, MODEL_JOINT_SIZE)
-    comptime L_BOD = Layout.row_major(M.NBODY, MODEL_BODY_SIZE)
-    comptime L_MET = Layout.row_major(MODEL_META_SIZE)
-    comptime L_CDOF = Layout.row_major(1, NV * 6)
-    var subtree_v = d.subtree_com.lt["cpu", L_NB3]()
-    var joints_v = mf.joints.lt["cpu", L_JNT]()
-    var bodies_v = mf.bodies.lt["cpu", L_BOD]()
-    var mmeta_v = mf.meta.lt["cpu", L_MET]()
-    var cdof_v = integ.scratch.cdof.lt["cpu", L_CDOF]()
+    comptime L_NB3 = RowMajor[1, M.NBODY * 3]
+    comptime L_JNT = RowMajor[M.NJOINT, MODEL_JOINT_SIZE]
+    comptime L_BOD = RowMajor[M.NBODY, MODEL_BODY_SIZE]
+    comptime L_MET = RowMajor[MODEL_META_SIZE]
+    comptime L_CDOF = RowMajor[1, NV * 6]
+    var subtree_v = d.subtree_com.tt["cpu", 1, M.NBODY * 3]()
+    var joints_v = mf.joints.tt["cpu", M.NJOINT, MODEL_JOINT_SIZE]()
+    var bodies_v = mf.bodies.tt["cpu", M.NBODY, MODEL_BODY_SIZE]()
+    var mmeta_v = mf.meta.tt["cpu", MODEL_META_SIZE]()
+    var cdof_v = integ.scratch.cdof.tt["cpu", 1, NV * 6]()
 
     var nc = Int(Float64(d.meta.data[META_IDX_NUM_CONTACTS]))
     var mj_ncon = Int(py=dat.ncon)

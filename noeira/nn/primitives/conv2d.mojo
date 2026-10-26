@@ -31,11 +31,12 @@ from noeira.nn.core.cudnn_conv import (
     cudnn_conv_backward_data,
     cudnn_conv_backward_filter,
 )
-from std.sys import CompilationTarget, has_nvidia_gpu_accelerator
+from std.sys import CompilationTarget, default_accelerator
 from max.gpu import thread_idx, block_idx, block_dim, global_idx
 from max.gpu.primitives import block
 from max.gpu.host import DeviceContext, DeviceBuffer
-from layout import Layout, LayoutTensor, TileTensor, row_major
+from layout import TileTensor, row_major
+from noeira.core.tiles import Tile
 from linalg.matmul import matmul as max_matmul
 from max.algorithm import parallelize
 from std.os import getenv
@@ -58,7 +59,14 @@ from ..core.param import Param, ParamVisitor
 from ..core.initializer import Initializer
 from ..core.amp import AMPPolicy, NoAMP
 from ..core.polyak import polyak_tensor
-from .linear import _cast_f2b_kernel, BF16, enqueue_bias_grad
+from .linear import (
+    _cast_f2b_kernel,
+    BF16,
+    enqueue_bias_grad,
+    enqueue_channel_grad,
+    TWO_PASS_MIN_ELEMS,
+    CHANNEL_TWO_PASS_MIN_ROWS,
+)
 
 
 comptime CONV_DW_TPB: Int = 128
@@ -444,8 +452,8 @@ def _im2col_kernel[
     ADT: DType = DT,
     LAYOUT: Int = LAYOUT_NCHW,
 ](
-    input: LayoutTensor[ADT, Layout.row_major(BATCH, IN_FLAT), MutAnyOrigin],
-    col: LayoutTensor[ADT, Layout.row_major(BS, DCOL), MutAnyOrigin],
+    input: Tile[ADT, BATCH, IN_FLAT],
+    col: Tile[ADT, BS, DCOL],
 ):
     """im2col into a row stride of `DCOL >= COL`, zero-filling `[COL, DCOL)`.
 
@@ -480,8 +488,8 @@ def _im2col_kernel[
 def _pad_w_cols_kernel[
     OC: Int, COL: Int, DCOL: Int, OCP: Int = OC
 ](
-    src: LayoutTensor[DT, Layout.row_major(OC * COL), MutAnyOrigin],
-    dst: LayoutTensor[DT, Layout.row_major(OCP * DCOL), MutAnyOrigin],
+    src: Tile[DT, OC * COL],
+    dst: Tile[DT, OCP * DCOL],
 ):
     """`W[OC, COL]` -> `W_pad[OCP, DCOL]`, zeros outside the source rectangle.
 
@@ -504,8 +512,8 @@ def _pad_w_cols_kernel[
 def _accum_w_2d_kernel[
     OC: Int, COL: Int, DCOL: Int
 ](
-    dst: LayoutTensor[DT, Layout.row_major(OC * COL), MutAnyOrigin],
-    src: LayoutTensor[DT, Layout.row_major(OC * DCOL), MutAnyOrigin],
+    dst: Tile[DT, OC * COL],
+    src: Tile[DT, OC * DCOL],
 ):
     """`grad_w[oc, c] += dW_pad[oc, c]` where `src` has the WIDER row stride.
 
@@ -533,9 +541,9 @@ def _scatter_bias_kernel[
     LAYOUT: Int = LAYOUT_NCHW,
     OCP: Int = OC,
 ](
-    out_packed: LayoutTensor[ADT, Layout.row_major(BS, OCP), MutAnyOrigin],
-    bias: LayoutTensor[ADT, Layout.row_major(OC), MutAnyOrigin],
-    output: LayoutTensor[ADT, Layout.row_major(BATCH, OUT_FLAT), MutAnyOrigin],
+    out_packed: Tile[ADT, BS, OCP],
+    bias: Tile[ADT, OC],
+    output: Tile[ADT, BATCH, OUT_FLAT],
 ):
     """Scatter + bias, reading `out_packed` at a row stride of `OCP >= OC`.
 
@@ -563,10 +571,10 @@ def _fwd_oc1_matvec_kernel[
     BS: Int,
     ADT: DType = DT,
 ](
-    col: LayoutTensor[ADT, Layout.row_major(BS, DCOL), MutAnyOrigin],
-    weight: LayoutTensor[ADT, Layout.row_major(COL), MutAnyOrigin],
-    bias: LayoutTensor[ADT, Layout.row_major(1), MutAnyOrigin],
-    output: LayoutTensor[ADT, Layout.row_major(BATCH, SO), MutAnyOrigin],
+    col: Tile[ADT, BS, DCOL],
+    weight: Tile[ADT, COL],
+    bias: Tile[ADT, 1],
+    output: Tile[ADT, BATCH, SO],
 ):
     """OC==1 forward: `max_matmul[transpose_b=True]` on GPU SILENTLY
     MISCOMPUTES N=1 GEMMs (out[BS,1] = col @ Wᵀ; verified wrong on Metal,
@@ -596,10 +604,8 @@ def _go_transpose_kernel[
     ADT: DType = DT,
     LAYOUT: Int = LAYOUT_NCHW,
 ](
-    grad_output: LayoutTensor[
-        ADT, Layout.row_major(BATCH, OUT_FLAT), MutAnyOrigin
-    ],
-    go_T: LayoutTensor[ADT, Layout.row_major(OC, BS), MutAnyOrigin],
+    grad_output: Tile[ADT, BATCH, OUT_FLAT],
+    go_T: Tile[ADT, OC, BS],
 ):
     var idx = Int(global_idx.x)
     if idx >= OC * BS:
@@ -616,8 +622,8 @@ def _go_transpose_kernel[
 def _accum_kernel[
     N: Int
 ](
-    dst: LayoutTensor[DT, Layout.row_major(N), MutAnyOrigin],
-    src: LayoutTensor[DT, Layout.row_major(N), MutAnyOrigin],
+    dst: Tile[DT, N],
+    src: Tile[DT, N],
 ):
     var idx = Int(global_idx.x)
     if idx < N:
@@ -627,8 +633,8 @@ def _accum_kernel[
 def _wT_transpose_kernel[
     OC: Int, COL: Int, ADT: DType = DT
 ](
-    w: LayoutTensor[ADT, Layout.row_major(OC, COL), MutAnyOrigin],
-    wT: LayoutTensor[ADT, Layout.row_major(COL, OC), MutAnyOrigin],
+    w: Tile[ADT, OC, COL],
+    wT: Tile[ADT, COL, OC],
 ):
     """O2: transpose weight `W[OC, COL]` → `Wᵀ[COL, OC]` so the input-grad GEMM
     can compute `d_colᵀ[COL, BS] = Wᵀ[COL, OC] @ goᵀ[OC, BS]` (reusing the `goᵀ`
@@ -660,10 +666,8 @@ def _dx_col2im_kernel[
     ADT: DType = DT,
     LAYOUT: Int = LAYOUT_NCHW,
 ](
-    d_col: LayoutTensor[ADT, Layout.row_major(COL, BS), MutAnyOrigin],
-    grad_input: LayoutTensor[
-        ADT, Layout.row_major(BATCH, IN_FLAT), MutAnyOrigin
-    ],
+    d_col: Tile[ADT, COL, BS],
+    grad_input: Tile[ADT, BATCH, IN_FLAT],
 ):
     # O2: `d_col` is the TRANSPOSED layout `[COL, BS]` (vs the natural `[BS,COL]`
     # GEMM output). Adjacent threads differ in `iw` → `row` (col2im is a gather:
@@ -725,10 +729,8 @@ def _backward_db_kernel[
     ADT: DType = DT,
     LAYOUT: Int = LAYOUT_NCHW,
 ](
-    grad_output: LayoutTensor[
-        ADT, Layout.row_major(BATCH, OUT_FLAT), MutAnyOrigin
-    ],
-    grad_bias: LayoutTensor[DT, Layout.row_major(OC), MutAnyOrigin],
+    grad_output: Tile[ADT, BATCH, OUT_FLAT],
+    grad_bias: Tile[DT, OC],
 ):
     # grad_output is the ACTIVATION dtype (`ADT`); grad_bias is the FP32 master
     # grad. Each element casts to DT before the block-sum (fp32 accumulator).
@@ -752,30 +754,24 @@ def _backward_db_kernel[
         grad_bias[oc] = rebind[Scalar[DT]](grad_bias[oc]) + total[0]
 
 
-def _rowsum_kernel[ROWS: Int, COLS: Int](
-    src: LayoutTensor[DT, Layout.row_major(ROWS, COLS), MutAnyOrigin],
-    dst: LayoutTensor[DT, Layout.row_major(ROWS), MutAnyOrigin],
-):
-    """`dst[r] = Σ_c src[r, c]`, one block per row (coalesced along c).
-    Stage 1 of the NCHW bias gradient: rows are (sample, channel), columns
-    the contiguous OH·OW positions."""
-    var r = Int(block_idx.x)
-    var t = Int(thread_idx.x)
-    var acc: Scalar[DT] = 0
-    var c = t
-    while c < COLS:
-        acc += rebind[Scalar[DT]](src[r, c])
-        c += CONV_DW_TPB
-    var total = block.sum[block_size=CONV_DW_TPB, broadcast=False](val=acc)
-    if t == 0:
-        dst[r] = total[0]
+@always_inline
+def _db_two_pass[LAYOUT: Int, B: Int, OC: Int, SO: Int]() -> Bool:
+    """Whether a conv bias gradient leaves `_backward_db_kernel` (one block
+    per channel) for the two-pass reductions: NCHW by rows per channel
+    (`CHANNEL_TWO_PASS_MIN_ROWS`), NHWC by elements (`TWO_PASS_MIN_ELEMS`),
+    both target-dependent. Conv2DTranspose and Conv2D's bf16 path ask it;
+    Conv2D's fp32 path takes the two passes unconditionally (f07082beb)."""
+    comptime if LAYOUT == LAYOUT_NHWC:
+        return B * SO * OC >= TWO_PASS_MIN_ELEMS
+    else:
+        return B * SO >= CHANNEL_TWO_PASS_MIN_ROWS
 
 
 def _bias_add_out_kernel[
     BATCH: Int, OC: Int, SO: Int, OUT_FLAT: Int, LAYOUT: Int = LAYOUT_NCHW
 ](
-    dst: LayoutTensor[DT, Layout.row_major(BATCH, OUT_FLAT), MutAnyOrigin],
-    bias: LayoutTensor[DT, Layout.row_major(OC), MutAnyOrigin],
+    dst: Tile[DT, BATCH, OUT_FLAT],
+    bias: Tile[DT, OC],
 ):
     """`dst[b, oc, s] += bias[oc]` in place, in either layout — the bias of
     the cuDNN forward, which writes the convolution alone."""
@@ -914,7 +910,7 @@ struct Conv2D[
     channel conv with a 25-64 long contraction and <= 16 outputs (MNIST conv1:
     58 us vs 99 cuDNN, 116 im2col). A property of the layer, not of the
     batch, because it decides the padding below."""
-    comptime CUB = has_nvidia_gpu_accelerator() and GEMM_PATH != "max" and GEMM_PATH != "convmax" and not Self.KEEP_MAX
+    comptime CUB = default_accelerator().is_nvidia_gpu() and GEMM_PATH != "max" and GEMM_PATH != "convmax" and not Self.KEEP_MAX
     """NVIDIA fp32: the three GEMMs (forward, dW, d_col) run on `cublas_gemm`,
     UNPADDED: cuBLAS takes any shape without the per-call workspace that MAX's
     fallback allocates, so `CPAD == COL` and `OCPAD == OC_` below and none of
@@ -925,7 +921,7 @@ struct Conv2D[
         """NVIDIA fp32: run this layer's forward and backward through cuDNN
         (`cudnn_conv`) instead of im2col + GEMM. `NN_CONV_PATH` selects;
         `auto` is the per-shape rule below."""
-        comptime if not has_nvidia_gpu_accelerator() or Self.ADT != DT or GEMM_PATH == "max" or GEMM_PATH == "convmax":
+        comptime if not default_accelerator().is_nvidia_gpu() or Self.ADT != DT or GEMM_PATH == "max" or GEMM_PATH == "convmax":
             return False
         comptime if CONV_PATH == "cudnn":
             return True
@@ -1139,8 +1135,8 @@ struct Conv2D[
                     Self.OC_, Self.COL, Self.CPAD, Self.OCPAD
                 ]
             ](
-                self.weight.val.lt["gpu", Layout.row_major(Self.W_SIZE)](),
-                self.w_pad.lt["gpu", Layout.row_major(Self.WPAD_SIZE)](),
+                self.weight.val.tt["gpu", Self.W_SIZE](),
+                self.w_pad.tt["gpu", Self.WPAD_SIZE](),
                 grid_dim=(Self.WPAD_SIZE + CONV_TPB - 1) // CONV_TPB,
                 block_dim=CONV_TPB,
             )
@@ -1308,8 +1304,8 @@ struct Conv2D[
                     c.enqueue_function[
                         _bias_add_out_kernel[B, Self.OC_, Self.SO, Self.OUT_FLAT, Self.LAYOUT]
                     ](
-                        outd.lt["gpu", Layout.row_major(B, Self.OUT_FLAT)](),
-                        self.bias.val.lt["gpu", Layout.row_major(Self.OC_)](),
+                        outd.tt["gpu", B, Self.OUT_FLAT](),
+                        self.bias.val.tt["gpu", Self.OC_](),
                         grid_dim=nb_b,
                         block_dim=CONV_TPB,
                     )
@@ -1339,8 +1335,8 @@ struct Conv2D[
                         Self.LAYOUT,
                     ]
                 ](
-                    in0d.lt["gpu", Layout.row_major(B, Self.IN_FLAT)](),
-                    self.col_t.lt["gpu", Layout.row_major(BS, Self.CPAD)](),
+                    in0d.tt["gpu", B, Self.IN_FLAT](),
+                    self.col_t.tt["gpu", BS, Self.CPAD](),
                     grid_dim=nb_col,
                     block_dim=CONV_TPB,
                 )
@@ -1356,10 +1352,10 @@ struct Conv2D[
                             B, Self.SO, Self.COL, Self.CPAD, BS, DT
                         ]
                     ](
-                        self.col_t.lt["gpu", Layout.row_major(BS, Self.CPAD)](),
-                        self.weight.val.lt["gpu", Layout.row_major(Self.COL)](),
-                        self.bias.val.lt["gpu", Layout.row_major(1)](),
-                        outd.lt["gpu", Layout.row_major(B, Self.SO)](),
+                        self.col_t.tt["gpu", BS, Self.CPAD](),
+                        self.weight.val.tt["gpu", Self.COL](),
+                        self.bias.val.tt["gpu", 1](),
+                        outd.tt["gpu", B, Self.SO](),
                         grid_dim=nb_mv,
                         block_dim=CONV_TPB,
                     )
@@ -1423,9 +1419,9 @@ struct Conv2D[
                             Self.OCPAD,
                         ]
                     ](
-                        self.outp_t.lt["gpu", Layout.row_major(BS, Self.OCPAD)](),
-                        self.bias.val.lt["gpu", Layout.row_major(Self.OC_)](),
-                        outd.lt["gpu", Layout.row_major(B, Self.OUT_FLAT)](),
+                        self.outp_t.tt["gpu", BS, Self.OCPAD](),
+                        self.bias.val.tt["gpu", Self.OC_](),
+                        outd.tt["gpu", B, Self.OUT_FLAT](),
                         grid_dim=nb_sc,
                         block_dim=CONV_TPB,
                     )
@@ -1470,8 +1466,8 @@ struct Conv2D[
                     Self.LAYOUT,
                 ]
             ](
-                in0.lt["gpu", Layout.row_major(B, Self.IN_FLAT)](),
-                self.col_t_bf.lt["gpu", Layout.row_major(BS, Self.COL)](),
+                in0.tt["gpu", B, Self.IN_FLAT](),
+                self.col_t_bf.tt["gpu", BS, Self.COL](),
                 grid_dim=nb_col,
                 block_dim=CONV_TPB,
             )
@@ -1486,10 +1482,10 @@ struct Conv2D[
                         B, Self.SO, Self.COL, Self.COL, BS, Self.ADT
                     ]
                 ](
-                    self.col_t_bf.lt["gpu", Layout.row_major(BS, Self.COL)](),
-                    self.w_bf.lt["gpu", Layout.row_major(Self.COL)](),
-                    self.b_a.lt["gpu", Layout.row_major(1)](),
-                    out.lt["gpu", Layout.row_major(B, Self.SO)](),
+                    self.col_t_bf.tt["gpu", BS, Self.COL](),
+                    self.w_bf.tt["gpu", Self.COL](),
+                    self.b_a.tt["gpu", 1](),
+                    out.tt["gpu", B, Self.SO](),
                     grid_dim=nb_mv,
                     block_dim=CONV_TPB,
                 )
@@ -1512,9 +1508,9 @@ struct Conv2D[
                         Self.LAYOUT,
                     ]
                 ](
-                    self.outp_t_bf.lt["gpu", Layout.row_major(BS, Self.OC_)](),
-                    self.b_a.lt["gpu", Layout.row_major(Self.OC_)](),
-                    out.lt["gpu", Layout.row_major(B, Self.OUT_FLAT)](),
+                    self.outp_t_bf.tt["gpu", BS, Self.OC_](),
+                    self.b_a.tt["gpu", Self.OC_](),
+                    out.tt["gpu", B, Self.OUT_FLAT](),
                     grid_dim=nb_sc,
                     block_dim=CONV_TPB,
                 )
@@ -1560,27 +1556,24 @@ struct Conv2D[
         if self._sk_p > 1:
             self.sk_ws.ensure_gpu(ctx, self._sk_p * Self.OC_ * Self.CPAD)
 
-    def _enqueue_db[B: Int](mut self, c: DeviceContext, mut god: Tensor) raises:
+    def _enqueue_db[
+        GDT: DType, //, B: Int
+    ](mut self, c: DeviceContext, go: DeviceBuffer[GDT]) raises:
         """`grad_bias += Σ_{b, s} grad_output[b, oc, s]`, deterministic, in two
-        passes. The old `_backward_db_kernel` gave each channel ONE block
-        walking B·OH·OW values: 16 blocks on a 170-SM card for a ResNet stem,
-        ~118 us at batch 100 x 32x32 — longer than cuDNN's whole dgrad.
-        NCHW: per-(b, oc) row sums over the contiguous OH·OW, then the
-        [B, OC] column sum. NHWC: grad_output already is [B·OH·OW, OC]."""
+        passes, for an fp32 or bf16 (`GDT`) grad_output. The old one-block-per-
+        channel kernel gave each channel ONE block walking B·OH·OW
+        values: 16 blocks on a 170-SM card for a ResNet stem, ~118 us at batch
+        100 x 32x32 — longer than cuDNN's whole dgrad. NCHW: per-(b, oc) row
+        sums over the contiguous OH·OW, then the [B, OC] column sum. NHWC:
+        grad_output already is [B·OH·OW, OC]."""
         comptime if Self.LAYOUT == LAYOUT_NHWC:
-            enqueue_bias_grad[DT](
-                c, god.dev.value(), self.bias.grd.dev.value(), B * Self.SO, Self.OC_, self.db_part
+            enqueue_bias_grad[GDT](
+                c, go, self.bias.grd.dev.value(), B * Self.SO, Self.OC_, self.db_part
             )
         else:
-            self.db_rows.ensure_gpu(c, B * Self.OC_)
-            c.enqueue_function[_rowsum_kernel[B * Self.OC_, Self.SO]](
-                god.lt["gpu", Layout.row_major(B * Self.OC_, Self.SO)](),
-                self.db_rows.lt["gpu", Layout.row_major(B * Self.OC_)](),
-                grid_dim=B * Self.OC_,
-                block_dim=CONV_DW_TPB,
-            )
-            enqueue_bias_grad[DT](
-                c, self.db_rows.dev.value(), self.bias.grd.dev.value(), B, Self.OC_, self.db_part
+            enqueue_channel_grad[GDT](
+                c, go, self.bias.grd.dev.value(), B, Self.OC_, Self.SO,
+                self.db_rows, self.db_part,
             )
 
     def vjp[
@@ -1782,7 +1775,7 @@ struct Conv2D[
                     B, Self.IC_, Self.OC_, Self.K_, Self.S_, Self.P_,
                     Self.H_, Self.W_, NHWC, TF,
                 ](c, self.weight.grd.dev.value(), find.dev.value(), god.dev.value())
-                self._enqueue_db[B](c, god)
+                self._enqueue_db[B](c, god.dev.value())
                 cudnn_conv_backward_data[
                     B, Self.IC_, Self.OC_, Self.K_, Self.S_, Self.P_,
                     Self.H_, Self.W_, NHWC, TF,
@@ -1821,8 +1814,8 @@ struct Conv2D[
                         Self.LAYOUT,
                     ]
                 ](
-                    find.lt["gpu", Layout.row_major(B, Self.IN_FLAT)](),
-                    self.col_t.lt["gpu", Layout.row_major(BS, Self.CPAD)](),
+                    find.tt["gpu", B, Self.IN_FLAT](),
+                    self.col_t.tt["gpu", BS, Self.CPAD](),
                     grid_dim=nb_col,
                     block_dim=TPB,
                 )
@@ -1839,8 +1832,8 @@ struct Conv2D[
                     Self.LAYOUT,
                 ]
             ](
-                god.lt["gpu", Layout.row_major(B, Self.OUT_FLAT)](),
-                self.goT_t.lt["gpu", Layout.row_major(Self.OC_, BS)](),
+                god.tt["gpu", B, Self.OUT_FLAT](),
+                self.goT_t.tt["gpu", Self.OC_, BS](),
                 grid_dim=nb_got,
                 block_dim=TPB,
             )
@@ -1895,20 +1888,20 @@ struct Conv2D[
                     c.enqueue_function[
                         _accum_w_2d_kernel[Self.OC_, Self.COL, Self.CPAD]
                     ](
-                        self.weight.grd.lt["gpu", Layout.row_major(Self.W_SIZE)](),
-                        self.dW_tmp.lt["gpu", Layout.row_major(Self.DWPAD_SIZE)](),
+                        self.weight.grd.tt["gpu", Self.W_SIZE](),
+                        self.dW_tmp.tt["gpu", Self.DWPAD_SIZE](),
                         grid_dim=nb_acc,
                         block_dim=TPB,
                     )
                 else:
                     c.enqueue_function[_accum_kernel[Self.W_SIZE]](
-                        self.weight.grd.lt["gpu", Layout.row_major(Self.W_SIZE)](),
-                        self.dW_tmp.lt["gpu", Layout.row_major(Self.W_SIZE)](),
+                        self.weight.grd.tt["gpu", Self.W_SIZE](),
+                        self.dW_tmp.tt["gpu", Self.W_SIZE](),
                         grid_dim=nb_acc,
                         block_dim=TPB,
                     )
             # (4) d_bias — two-pass, deterministic (`_enqueue_db`)
-            self._enqueue_db[B](c, god)
+            self._enqueue_db[B](c, god.dev.value())
             # (5) d_input (O2): d_colᵀ[COL,BS] = Wᵀ[COL,OC] @ goᵀ[OC,BS] reusing
             # the goᵀ from (2) — NO `_go_pack` kernel — then the coalesced col2im
             # reading the transposed d_colᵀ. col_t (free after the dW GEMM) is
@@ -1925,8 +1918,8 @@ struct Conv2D[
                 self.wT_t.ensure_gpu(c, Self.COL * Self.OC_)
                 comptime nb_wt = (Self.OC_ * Self.COL + TPB - 1) // TPB
                 c.enqueue_function[_wT_transpose_kernel[Self.OC_, Self.COL]](
-                    self.weight.val.lt["gpu", Layout.row_major(Self.OC_, Self.COL)](),
-                    self.wT_t.lt["gpu", Layout.row_major(Self.COL, Self.OC_)](),
+                    self.weight.val.tt["gpu", Self.OC_, Self.COL](),
+                    self.wT_t.tt["gpu", Self.COL, Self.OC_](),
                     grid_dim=nb_wt,
                     block_dim=TPB,
                 )
@@ -1953,8 +1946,8 @@ struct Conv2D[
                     Self.LAYOUT,
                 ]
             ](
-                self.col_t.lt["gpu", Layout.row_major(Self.COL, BS)](),
-                gind.lt["gpu", Layout.row_major(B, Self.IN_FLAT)](),
+                self.col_t.tt["gpu", Self.COL, BS](),
+                gind.tt["gpu", B, Self.IN_FLAT](),
                 grid_dim=nb_dx,
                 block_dim=CONV_DW_TPB,
             )
@@ -1999,8 +1992,8 @@ struct Conv2D[
                         Self.LAYOUT,
                     ]
                 ](
-                    fin.lt["gpu", Layout.row_major(B, Self.IN_FLAT)](),
-                    self.col_t_bf.lt["gpu", Layout.row_major(BS, Self.COL)](),
+                    fin.tt["gpu", B, Self.IN_FLAT](),
+                    self.col_t_bf.tt["gpu", BS, Self.COL](),
                     grid_dim=nb_col,
                     block_dim=TPB,
                 )
@@ -2017,8 +2010,8 @@ struct Conv2D[
                     Self.LAYOUT,
                 ]
             ](
-                grad_output.lt["gpu", Layout.row_major(B, Self.OUT_FLAT)](),
-                self.goT_t_bf.lt["gpu", Layout.row_major(Self.OC_, BS)](),
+                grad_output.tt["gpu", B, Self.OUT_FLAT](),
+                self.goT_t_bf.tt["gpu", Self.OC_, BS](),
                 grid_dim=nb_got,
                 block_dim=TPB,
             )
@@ -2034,28 +2027,34 @@ struct Conv2D[
             )
             comptime nb_acc = (Self.W_SIZE + TPB - 1) // TPB
             c.enqueue_function[_accum_kernel[Self.W_SIZE]](
-                self.weight.grd.lt["gpu", Layout.row_major(Self.W_SIZE)](),
-                self.dW_tmp.lt["gpu", Layout.row_major(Self.W_SIZE)](),
+                self.weight.grd.tt["gpu", Self.W_SIZE](),
+                self.dW_tmp.tt["gpu", Self.W_SIZE](),
                 grid_dim=nb_acc,
                 block_dim=TPB,
             )
-            # (4) d_bias — bf16 go → FP32 master grad (fp32 accumulator).
-            c.enqueue_function[
-                _backward_db_kernel[
-                    B,
-                    Self.OC_,
-                    Self.OH,
-                    Self.OW,
-                    Self.OUT_FLAT,
-                    Self.ADT,
-                    Self.LAYOUT,
-                ]
-            ](
-                grad_output.lt["gpu", Layout.row_major(B, Self.OUT_FLAT)](),
-                self.bias.grd.lt["gpu", Layout.row_major(Self.OC_)](),
-                grid_dim=Self.OC_,
-                block_dim=CONV_DW_TPB,
-            )
+            # (4) d_bias — bf16 go → FP32 master grad (fp32 accumulator):
+            # two-pass (`_enqueue_db`) past `_db_two_pass`, else one block per
+            # channel (on a 5090 the two passes lose at EfficientZero v2's
+            # 256 x 6x6 maps: 0.37x NCHW, 0.77x NHWC at OC 16).
+            comptime if _db_two_pass[Self.LAYOUT, B, Self.OC_, Self.SO]():
+                self._enqueue_db[B](c, grad_output.dev.value())
+            else:
+                c.enqueue_function[
+                    _backward_db_kernel[
+                        B,
+                        Self.OC_,
+                        Self.OH,
+                        Self.OW,
+                        Self.OUT_FLAT,
+                        Self.ADT,
+                        Self.LAYOUT,
+                    ]
+                ](
+                    grad_output.tt["gpu", B, Self.OUT_FLAT](),
+                    self.bias.grd.tt["gpu", Self.OC_](),
+                    grid_dim=Self.OC_,
+                    block_dim=CONV_DW_TPB,
+                )
             # (5) d_input (O2): d_colᵀ[COL,BS] = Wᵀ_bf[COL,OC] @ goᵀ[OC,BS]
             # reusing goᵀ from (2) — NO `_go_pack` kernel. All bf16 (grad_input
             # flows bf16); Wᵀ_bf transposes the forward's cached bf16 weight.
@@ -2065,8 +2064,8 @@ struct Conv2D[
             c.enqueue_function[
                 _wT_transpose_kernel[Self.OC_, Self.COL, Self.ADT]
             ](
-                self.w_bf.lt["gpu", Layout.row_major(Self.OC_, Self.COL)](),
-                self.wT_bf.lt["gpu", Layout.row_major(Self.COL, Self.OC_)](),
+                self.w_bf.tt["gpu", Self.OC_, Self.COL](),
+                self.wT_bf.tt["gpu", Self.COL, Self.OC_](),
                 grid_dim=nb_wt,
                 block_dim=TPB,
             )
@@ -2093,8 +2092,8 @@ struct Conv2D[
                     Self.LAYOUT,
                 ]
             ](
-                self.col_t_bf.lt["gpu", Layout.row_major(Self.COL, BS)](),
-                gin.lt["gpu", Layout.row_major(B, Self.IN_FLAT)](),
+                self.col_t_bf.tt["gpu", Self.COL, BS](),
+                gin.tt["gpu", B, Self.IN_FLAT](),
                 grid_dim=nb_dx,
                 block_dim=CONV_DW_TPB,
             )

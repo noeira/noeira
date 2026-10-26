@@ -25,7 +25,9 @@ struct CtrlRange(Movable):
 
     def normalize(self, i: Int, q: Float64) -> Float64:
         """Actuator `i`'s target `q` -> [-1, 1], clamped. A zero-width range
-        maps to 0. (Arithmetic kept exactly as the recorders wrote it, so a
+        maps to 0.
+
+        (Arithmetic kept exactly as the recorders wrote it, so a
         re-recorded `.demo` is byte-identical.)"""
         var span = self.hi[i] - self.lo[i]
         var a = 2.0 * (q - self.lo[i]) / span - 1.0 if span != 0.0 else 0.0

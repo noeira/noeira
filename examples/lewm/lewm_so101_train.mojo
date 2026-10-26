@@ -16,12 +16,20 @@ v1 has no proprioception (the arm is only in the pictures); S3 found its
 predictor barely reads its actions. v2 (`-D SO101_WM_PROPRIO=1`) adds each
 frame's q, qd and target lead to the latent (`ref_model.LeWMLossGraphProprio`).
 
+`-D SO101_WM_IDM=1` adds H-JEPA's inverse-dynamics term to either (`--idm`
+γ, default 100): a head regresses each action block from the two IMAGE
+latents it joins. Per-episode looks (S0 re-render, 23 Oct) let both models
+collapse onto the look and drop the arm — the slow-feature collapse that term
+rules out (`ref_model`'s inverse-dynamics section). The dumps load into the
+plain v1 / v2 graphs, so the offline checks run on them unchanged.
+
     pixi run -e nvidia mojo run -I . examples/lewm/lewm_so101_train.mojo \\
         --stores a.rendered.h5,b.rendered.h5 --epochs 10 --out runs/so101_wm
 
 Writes `<out>/epoch_<k>/` (the converted-dump format `load_ref` reads),
 `<out>/action_stats.txt` (per-joint mean and std of the target change, the
-normaliser the critic must reuse) and `<out>/log.csv`.
+normaliser the critic must reuse) and `<out>/log.csv` (`idm` / `val_idm`:
+the unweighted inverse-dynamics loss, 0 / -1 without the term).
 """
 
 from std.sys import argv
@@ -33,7 +41,13 @@ from max.gpu.host import DeviceContext
 
 from noeira.nn.constants import DT
 from noeira.experimental.lewm.ref_trainer import LeWMRefTrainer, RefStepStats, recipe_lr
-from noeira.experimental.lewm.so101_trainer import LeWMProprioTrainer
+from noeira.experimental.lewm.so101_trainer import (
+    LeWMSo101Trainer,
+    LeWMProprioTrainer,
+    LeWMIDMTrainer,
+    LeWMProprioIDMTrainer,
+)
+from noeira.nn.combinators.graph_module2 import NamedNodeGraph
 from noeira.experimental.lewm.so101_data import So101WMData, T, ACT_IN, CAMS, JOINTS, PROP
 
 
@@ -43,8 +57,12 @@ comptime B = get_defined_int["SO101_WM_B", 128]()
 comptime PROPRIO = get_defined_int["SO101_WM_PROPRIO", 0]() == 1
 """v2 (`-D SO101_WM_PROPRIO=1`): proprioception in the latent
 (`LeWMProprioTrainer`; writes `prop_stats.txt` too)."""
+comptime IDM = get_defined_int["SO101_WM_IDM", 0]() == 1
+"""H-JEPA's inverse-dynamics term on v1 or v2 (`--idm` sets its weight)."""
 comptime TR = LeWMRefTrainer["gpu", B, CAMS * 3, R, ACT_IN]
 comptime TRP = LeWMProprioTrainer["gpu", B, CAMS * 3, R, ACT_IN, PROP]
+comptime TRI = LeWMIDMTrainer["gpu", B, CAMS * 3, R, ACT_IN]
+comptime TRPI = LeWMProprioIDMTrainer["gpu", B, CAMS * 3, R, ACT_IN, PROP]
 comptime VAL_BATCHES = 20
 
 
@@ -67,6 +85,10 @@ def main() raises:
     var lr = Float64(_arg(args, "--lr", "5e-5"))
     var max_steps = Int(_arg(args, "--max-steps", "0"))
     var log_every = Int(_arg(args, "--log-every", "50"))
+    var sigreg = Float64(_arg(args, "--sigreg", "0.09"))
+    var idm = Float64(_arg(args, "--idm", "100" if IDM else "0"))
+    if idm != 0.0 and not IDM:
+        raise Error("--idm needs a -D SO101_WM_IDM=1 build")
     seed(Int(_arg(args, "--seed", "3072")))
 
     var paths = List[String]()
@@ -92,14 +114,18 @@ def main() raises:
     if max_steps > 0:
         total = min(total, max_steps)
     print("training:", total, "steps of", B, "|", per_epoch, "per epoch | lr", lr,
-          "| proprio", PROPRIO)
+          "| proprio", PROPRIO, "| sigreg", sigreg, "| idm", idm)
     var c = DeviceContext()
     var ctx = Optional(c)
     var log = _Log(out, per_epoch, log_every)
-    comptime if PROPRIO:
-        _train_v2(data, log, total, lr, ctx)
+    comptime if IDM and PROPRIO:
+        _train_so101[PROP, TRPI.G](data, log, total, lr, sigreg, idm, ctx)
+    elif IDM:
+        _train_so101[0, TRI.G](data, log, total, lr, sigreg, idm, ctx)
+    elif PROPRIO:
+        _train_so101[PROP, TRP.G](data, log, total, lr, sigreg, idm, ctx)
     else:
-        _train_v1(data, log, total, lr, ctx)
+        _train_v1(data, log, total, lr, sigreg, ctx)
     print("done:", total, "steps |", out)
 
 
@@ -113,15 +139,17 @@ struct _Log(Movable):
     var text: String
     var t_start: Int
     var acc_pred: Float64
+    var acc_idm: Float64
     var acc_n: Int
 
     def __init__(out self, out_dir: String, per_epoch: Int, log_every: Int):
         self.out = out_dir
         self.per_epoch = per_epoch
         self.log_every = log_every
-        self.text = String("step,epoch,lr,loss,pred,sigreg,grad_norm,val_pred,secs\n")
+        self.text = String("step,epoch,lr,loss,pred,sigreg,grad_norm,val_pred,secs,idm,val_idm\n")
         self.t_start = perf_counter_ns()
         self.acc_pred = 0.0
+        self.acc_idm = 0.0
         self.acc_n = 0
 
     def end_epoch(self, step: Int, total: Int) -> Bool:
@@ -131,32 +159,37 @@ struct _Log(Movable):
         return self.out + "/epoch_" + String((step + 1 + self.per_epoch - 1) // self.per_epoch - 1)
 
     def after(
-        mut self, step: Int, total: Int, lr_s: Float64, st: RefStepStats, val_pred: Float64
+        mut self, step: Int, total: Int, lr_s: Float64, st: RefStepStats, val_pred: Float64,
+        idm: Float64 = 0.0, val_idm: Float64 = -1.0,
     ) raises:
         self.acc_pred += st.pred_loss
+        self.acc_idm += idm
         self.acc_n += 1
         if (step + 1) % self.log_every != 0 and not self.end_epoch(step, total):
             return
         var secs = Float64(perf_counter_ns() - self.t_start) / 1e9
         var mean = self.acc_pred / Float64(self.acc_n)
+        var mean_idm = self.acc_idm / Float64(self.acc_n)
         var line = String(step + 1) + "," + String(Float64(step + 1) / Float64(self.per_epoch)) + ","
         line += String(lr_s) + "," + String(st.loss) + "," + String(mean) + ","
         line += String(st.sigreg_loss) + "," + String(st.grad_norm) + "," + String(val_pred) + ","
-        line += String(secs) + "\n"
+        line += String(secs) + "," + String(mean_idm) + "," + String(val_idm) + "\n"
         self.text += line
         with open(self.out + "/log.csv", "w") as f:
             f.write(self.text)
-        print("step", step + 1, "| pred", mean, "| sigreg", st.sigreg_loss,
-              "| norm", st.grad_norm, "| val pred", val_pred, "|",
+        print("step", step + 1, "| pred", mean, "| sigreg", st.sigreg_loss, "| idm", mean_idm,
+              "| norm", st.grad_norm, "| val pred", val_pred, "| val idm", val_idm, "|",
               secs / Float64(step + 1), "s/step")
         self.acc_pred = 0.0
+        self.acc_idm = 0.0
         self.acc_n = 0
 
 
 def _train_v1(
-    data: So101WMData[R], mut log: _Log, total: Int, lr: Float64, ctx: Optional[DeviceContext]
+    data: So101WMData[R], mut log: _Log, total: Int, lr: Float64, sigreg: Float64,
+    ctx: Optional[DeviceContext],
 ) raises:
-    var tr = TR(ctx, lr=lr, wd=1e-3, max_norm=1.0, sigreg_lambda=0.09, dropout=True)
+    var tr = TR(ctx, lr=lr, wd=1e-3, max_norm=1.0, sigreg_lambda=sigreg, dropout=True)
     tr.set_train()
     var pix = List[Scalar[DT]](length=B * TR.PIX, fill=Scalar[DT](0))
     var act = List[Scalar[DT]](length=B * TR.ACT, fill=Scalar[DT](0))
@@ -179,32 +212,46 @@ def _train_v1(
         log.after(step, total, lr_s, st, val_pred)
 
 
-def _train_v2(
-    data: So101WMData[R], mut log: _Log, total: Int, lr: Float64, ctx: Optional[DeviceContext]
+def _train_so101[P: Int, G: NamedNodeGraph](
+    data: So101WMData[R], mut log: _Log, total: Int, lr: Float64, sigreg: Float64,
+    idm: Float64, ctx: Optional[DeviceContext],
 ) raises:
-    var tr = TRP(ctx, lr=lr, wd=1e-3, max_norm=1.0, sigreg_lambda=0.09, dropout=True)
+    """v2, and v1 / v2 with inverse dynamics (`P` = 0: no proprio input)."""
+    var tr = LeWMSo101Trainer["gpu", B, CAMS * 3, R, ACT_IN, P, G](
+        ctx, lr=lr, wd=1e-3, max_norm=1.0, sigreg_lambda=sigreg, dropout=True, idm=idm
+    )
     tr.set_train()
-    var pix = List[Scalar[DT]](length=B * TRP.PIX, fill=Scalar[DT](0))
-    var act = List[Scalar[DT]](length=B * TRP.ACT, fill=Scalar[DT](0))
-    var pro = List[Scalar[DT]](length=B * TRP.PRO, fill=Scalar[DT](0))
+    comptime TRN = type_of(tr)
+    var pix = List[Scalar[DT]](length=B * TRN.PIX, fill=Scalar[DT](0))
+    var act = List[Scalar[DT]](length=B * TRN.ACT, fill=Scalar[DT](0))
+    var pro = List[Scalar[DT]](length=B * TRN.PRO, fill=Scalar[DT](0))
     for step in range(total):
         var lr_s = recipe_lr(step, total, lr)
         tr.set_lr(lr_s)
         var starts = data.sample(False, B)
         data.fill(starts, pix, act)
-        data.fill_prop(starts, pro)
+        comptime if P > 0:
+            data.fill_prop(starts, pro)
         var st = tr.train_step(pix, act, pro)
+        var idm_s = tr.idm_loss
         var val_pred = -1.0
+        var val_idm = -1.0
         if log.end_epoch(step, total):
             if len(data.val_starts) > 0:
                 tr.set_eval()
                 val_pred = 0.0
+                val_idm = 0.0
                 for _ in range(VAL_BATCHES):
                     var vs = data.sample(True, B)
                     data.fill(vs, pix, act)
-                    data.fill_prop(vs, pro)
+                    comptime if P > 0:
+                        data.fill_prop(vs, pro)
                     val_pred += tr.loss_of(pix, act, pro).pred_loss
+                    val_idm += tr.idm_loss
                 val_pred /= Float64(VAL_BATCHES)
+                val_idm /= Float64(VAL_BATCHES)
+                if not TRN.IDM:
+                    val_idm = -1.0
                 tr.set_train()
             _ = tr.save_dump(log.dump_dir(step))
-        log.after(step, total, lr_s, st, val_pred)
+        log.after(step, total, lr_s, st, val_pred, idm_s, val_idm)

@@ -17,7 +17,6 @@ capturable). This is the GPU analogue of moving the working buffers onto the
 holder as persistent storage.
 """
 
-from layout import Layout, LayoutTensor
 from max.gpu.host import DeviceContext, DeviceBuffer
 
 from noeira.nn.constants import DT
@@ -27,6 +26,7 @@ from .predictive_model import PCBlockTrait
 from .pc_sequential import PCSequential
 from .pc_trainer import PCTrainer
 from .pc_module import PCModule
+from noeira.core.tiles import Tile, tile
 
 
 @fieldwise_init
@@ -70,39 +70,21 @@ def pc_module_train_one_batch_gpu[
     mut net: PCModule[*BLOCKS],
     mut opt: OPT,
     mut ws: PCGpuWorkspace[BATCH, *BLOCKS],
-    x_in: LayoutTensor[
-        DT, Layout.row_major(BATCH, PCSequential[*BLOCKS].IN_DIM), MutAnyOrigin
-    ],
-    y_target: LayoutTensor[
-        DT, Layout.row_major(BATCH, PCSequential[*BLOCKS].OUT_DIM), MutAnyOrigin
-    ],
+    x_in: Tile[DT, BATCH, PCSequential[*BLOCKS].IN_DIM],
+    y_target: Tile[DT, BATCH, PCSequential[*BLOCKS].OUT_DIM],
     T_infer: Int,
     lr_x: Scalar[DT],
 ) raises:
     comptime NET = PCSequential[*BLOCKS]
 
-    var params = LayoutTensor[
-        DT, Layout.row_major(NET.PARAM_SIZE), MutAnyOrigin
-    ](net.weights.val.dev.value())
-    var grads = LayoutTensor[
-        DT, Layout.row_major(NET.PARAM_SIZE), MutAnyOrigin
-    ](net.weights.grd.dev.value())
+    var params = tile[NET.PARAM_SIZE](net.weights.val.dev.value())
+    var grads = tile[NET.PARAM_SIZE](net.weights.grd.dev.value())
 
-    var latents = LayoutTensor[
-        DT, Layout.row_major(BATCH, NET.LATENT_DIM), MutAnyOrigin
-    ](ws.latents_b)
-    var mu_eps = LayoutTensor[
-        DT, Layout.row_major(BATCH, NET.SCRATCH_OUT_DIM), MutAnyOrigin
-    ](ws.mu_eps_b)
-    var a_below = LayoutTensor[
-        DT, Layout.row_major(BATCH, NET.SCRATCH_IN_DIM), MutAnyOrigin
-    ](ws.a_below_b)
-    var z_below = LayoutTensor[
-        DT, Layout.row_major(BATCH, NET.SCRATCH_IN_DIM), MutAnyOrigin
-    ](ws.z_below_b)
-    var dx = LayoutTensor[
-        DT, Layout.row_major(BATCH, NET.LATENT_DIM), MutAnyOrigin
-    ](ws.dx_b)
+    var latents = tile[BATCH, NET.LATENT_DIM](ws.latents_b)
+    var mu_eps = tile[BATCH, NET.SCRATCH_OUT_DIM](ws.mu_eps_b)
+    var a_below = tile[BATCH, NET.SCRATCH_IN_DIM](ws.a_below_b)
+    var z_below = tile[BATCH, NET.SCRATCH_IN_DIM](ws.z_below_b)
+    var dx = tile[BATCH, NET.LATENT_DIM](ws.dx_b)
 
     # 1. GPU settling fills `grads` (= net.weights.grd) with +∂E/∂W.
     PCTrainer[*BLOCKS].compute_grads_only_gpu[BATCH](
@@ -130,12 +112,8 @@ def pc_module_train_one_batch_gpu[
     ctx: DeviceContext,
     mut net: PCModule[*BLOCKS],
     mut opt: OPT,
-    x_in: LayoutTensor[
-        DT, Layout.row_major(BATCH, PCSequential[*BLOCKS].IN_DIM), MutAnyOrigin
-    ],
-    y_target: LayoutTensor[
-        DT, Layout.row_major(BATCH, PCSequential[*BLOCKS].OUT_DIM), MutAnyOrigin
-    ],
+    x_in: Tile[DT, BATCH, PCSequential[*BLOCKS].IN_DIM],
+    y_target: Tile[DT, BATCH, PCSequential[*BLOCKS].OUT_DIM],
     T_infer: Int,
     lr_x: Scalar[DT],
 ) raises:

@@ -45,7 +45,7 @@ from std.sys import has_accelerator
 from std.time import perf_counter_ns
 
 from max.gpu.host import DeviceContext
-from layout import Layout, LayoutTensor
+from noeira.core.tiles import Tile
 
 from noeira.nn.constants import DT, TPB
 from noeira.nn.core.tensor import Tensor
@@ -98,11 +98,11 @@ comptime GATE_STD_UNITS = 1.0e-3
 def _c_kernel[
     BATCH: Int, D: Int, NH: Int, Q: Int, KL: Int, H: Int
 ](
-    q: LayoutTensor[DT, Layout.row_major(BATCH, Q * D), MutAnyOrigin],
-    k: LayoutTensor[DT, Layout.row_major(BATCH, KL * D), MutAnyOrigin],
-    v: LayoutTensor[DT, Layout.row_major(BATCH, KL * D), MutAnyOrigin],
-    mask: LayoutTensor[DT, Layout.row_major(Q * KL), MutAnyOrigin],
-    dst: LayoutTensor[DT, Layout.row_major(BATCH, Q * D), MutAnyOrigin],
+    q: Tile[DT, BATCH, Q * D],
+    k: Tile[DT, BATCH, KL * D],
+    v: Tile[DT, BATCH, KL * D],
+    mask: Tile[DT, Q * KL],
+    dst: Tile[DT, BATCH, Q * D],
 ):
     var idx = Int(global_idx.x)
     if idx >= BATCH * NH * Q:
@@ -167,11 +167,11 @@ def _c_kernel[
 def _d_kernel[
     BATCH: Int, D: Int, NH: Int, Q: Int, KL: Int, H: Int
 ](
-    q: LayoutTensor[DT, Layout.row_major(BATCH, Q * D), MutAnyOrigin],
-    k: LayoutTensor[DT, Layout.row_major(BATCH, KL * D), MutAnyOrigin],
-    v: LayoutTensor[DT, Layout.row_major(BATCH, KL * D), MutAnyOrigin],
-    mask: LayoutTensor[DT, Layout.row_major(Q * KL), MutAnyOrigin],
-    dst: LayoutTensor[DT, Layout.row_major(BATCH, Q * D), MutAnyOrigin],
+    q: Tile[DT, BATCH, Q * D],
+    k: Tile[DT, BATCH, KL * D],
+    v: Tile[DT, BATCH, KL * D],
+    mask: Tile[DT, Q * KL],
+    dst: Tile[DT, BATCH, Q * D],
 ):
     var idx = Int(global_idx.x)
     if idx >= BATCH * NH * Q:
@@ -236,11 +236,11 @@ def _d_kernel[
 def _ba_kernel[
     BATCH: Int, DIM: Int, N_HEADS: Int, QL: Int, KL: Int, HD: Int
 ](
-    q: LayoutTensor[DT, Layout.row_major(BATCH, QL * DIM), MutAnyOrigin],
-    k: LayoutTensor[DT, Layout.row_major(BATCH, KL * DIM), MutAnyOrigin],
-    v: LayoutTensor[DT, Layout.row_major(BATCH, KL * DIM), MutAnyOrigin],
-    mask: LayoutTensor[DT, Layout.row_major(QL * KL), MutAnyOrigin],
-    dst: LayoutTensor[DT, Layout.row_major(BATCH, QL * DIM), MutAnyOrigin],
+    q: Tile[DT, BATCH, QL * DIM],
+    k: Tile[DT, BATCH, KL * DIM],
+    v: Tile[DT, BATCH, KL * DIM],
+    mask: Tile[DT, QL * KL],
+    dst: Tile[DT, BATCH, QL * DIM],
 ):
     """One thread per (batch, head, query). Q_LEN is 50 and N_HEADS 15 here, so
     the row-per-thread map is a few hundred threads — small, but the work per
@@ -519,59 +519,59 @@ def run_shape(
                 var tpb = TPB if variant == 0 else WARP
                 if kl == KL_SELF:
                     ctx.enqueue_function[_ba_kernel_self](
-                        q.lt["gpu", Layout.row_major(B, QN)](),
-                        k.lt["gpu", Layout.row_major(B, KL_SELF * DIM)](),
-                        v.lt["gpu", Layout.row_major(B, KL_SELF * DIM)](),
-                        mask_t.lt["gpu", Layout.row_major(QL * KL_SELF)](),
-                        out.lt["gpu", Layout.row_major(B, QN)](),
+                        q.tt["gpu", B, QN](),
+                        k.tt["gpu", B, KL_SELF * DIM](),
+                        v.tt["gpu", B, KL_SELF * DIM](),
+                        mask_t.tt["gpu", QL * KL_SELF](),
+                        out.tt["gpu", B, QN](),
                         grid_dim=(ROWS + tpb - 1) // tpb, block_dim=tpb,
                     )
                 else:
                     ctx.enqueue_function[_ba_kernel_cross](
-                        q.lt["gpu", Layout.row_major(B, QN)](),
-                        k.lt["gpu", Layout.row_major(B, KL_CROSS * DIM)](),
-                        v.lt["gpu", Layout.row_major(B, KL_CROSS * DIM)](),
-                        mask_t.lt["gpu", Layout.row_major(QL * KL_CROSS)](),
-                        out.lt["gpu", Layout.row_major(B, QN)](),
+                        q.tt["gpu", B, QN](),
+                        k.tt["gpu", B, KL_CROSS * DIM](),
+                        v.tt["gpu", B, KL_CROSS * DIM](),
+                        mask_t.tt["gpu", QL * KL_CROSS](),
+                        out.tt["gpu", B, QN](),
                         grid_dim=(ROWS + tpb - 1) // tpb, block_dim=tpb,
                     )
             elif variant == 2 or variant == 3:
                 if kl == KL_SELF:
                     if variant == 2:
                         ctx.enqueue_function[_c_self](
-                            q.lt["gpu", Layout.row_major(B, QN)](),
-                            k.lt["gpu", Layout.row_major(B, KL_SELF * DIM)](),
-                            v.lt["gpu", Layout.row_major(B, KL_SELF * DIM)](),
-                            mask_t.lt["gpu", Layout.row_major(QL * KL_SELF)](),
-                            out.lt["gpu", Layout.row_major(B, QN)](),
+                            q.tt["gpu", B, QN](),
+                            k.tt["gpu", B, KL_SELF * DIM](),
+                            v.tt["gpu", B, KL_SELF * DIM](),
+                            mask_t.tt["gpu", QL * KL_SELF](),
+                            out.tt["gpu", B, QN](),
                             grid_dim=(ROWS + WARP - 1) // WARP, block_dim=WARP,
                         )
                     else:
                         ctx.enqueue_function[_d_self](
-                            q.lt["gpu", Layout.row_major(B, QN)](),
-                            k.lt["gpu", Layout.row_major(B, KL_SELF * DIM)](),
-                            v.lt["gpu", Layout.row_major(B, KL_SELF * DIM)](),
-                            mask_t.lt["gpu", Layout.row_major(QL * KL_SELF)](),
-                            out.lt["gpu", Layout.row_major(B, QN)](),
+                            q.tt["gpu", B, QN](),
+                            k.tt["gpu", B, KL_SELF * DIM](),
+                            v.tt["gpu", B, KL_SELF * DIM](),
+                            mask_t.tt["gpu", QL * KL_SELF](),
+                            out.tt["gpu", B, QN](),
                             grid_dim=(ROWS + WARP - 1) // WARP, block_dim=WARP,
                         )
                 else:
                     if variant == 2:
                         ctx.enqueue_function[_c_cross](
-                            q.lt["gpu", Layout.row_major(B, QN)](),
-                            k.lt["gpu", Layout.row_major(B, KL_CROSS * DIM)](),
-                            v.lt["gpu", Layout.row_major(B, KL_CROSS * DIM)](),
-                            mask_t.lt["gpu", Layout.row_major(QL * KL_CROSS)](),
-                            out.lt["gpu", Layout.row_major(B, QN)](),
+                            q.tt["gpu", B, QN](),
+                            k.tt["gpu", B, KL_CROSS * DIM](),
+                            v.tt["gpu", B, KL_CROSS * DIM](),
+                            mask_t.tt["gpu", QL * KL_CROSS](),
+                            out.tt["gpu", B, QN](),
                             grid_dim=(ROWS + WARP - 1) // WARP, block_dim=WARP,
                         )
                     else:
                         ctx.enqueue_function[_d_cross](
-                            q.lt["gpu", Layout.row_major(B, QN)](),
-                            k.lt["gpu", Layout.row_major(B, KL_CROSS * DIM)](),
-                            v.lt["gpu", Layout.row_major(B, KL_CROSS * DIM)](),
-                            mask_t.lt["gpu", Layout.row_major(QL * KL_CROSS)](),
-                            out.lt["gpu", Layout.row_major(B, QN)](),
+                            q.tt["gpu", B, QN](),
+                            k.tt["gpu", B, KL_CROSS * DIM](),
+                            v.tt["gpu", B, KL_CROSS * DIM](),
+                            mask_t.tt["gpu", QL * KL_CROSS](),
+                            out.tt["gpu", B, QN](),
                             grid_dim=(ROWS + WARP - 1) // WARP, block_dim=WARP,
                         )
             else:
@@ -579,48 +579,48 @@ def run_shape(
                 var n_cx = B * HEADS * QL * HD
                 if kl == KL_SELF:
                     ctx.enqueue_function[_e_pack_self](
-                        k.lt["gpu", Layout.row_major(B, KL_SELF * DIM)](),
-                        kt.lt["gpu", Layout.row_major(B * KL_SELF * DIM)](),
+                        k.tt["gpu", B, KL_SELF * DIM](),
+                        kt.tt["gpu", B * KL_SELF * DIM](),
                         grid_dim=(B * KL_SELF * DIM + TPB - 1) // TPB, block_dim=TPB,
                     )
                     ctx.enqueue_function[_e_scores_self](
-                        q.lt["gpu", Layout.row_major(B, QN)](),
-                        kt.lt["gpu", Layout.row_major(B * KL_SELF * DIM)](),
-                        mask_t.lt["gpu", Layout.row_major(QL * KL_SELF)](),
-                        probs.lt["gpu", Layout.row_major(B * HEADS * QL * KL_SELF)](),
+                        q.tt["gpu", B, QN](),
+                        kt.tt["gpu", B * KL_SELF * DIM](),
+                        mask_t.tt["gpu", QL * KL_SELF](),
+                        probs.tt["gpu", B * HEADS * QL * KL_SELF](),
                         grid_dim=(n_sc + TPB - 1) // TPB, block_dim=TPB,
                     )
                     ctx.enqueue_function[_e_softmax_self](
-                        probs.lt["gpu", Layout.row_major(B * HEADS * QL * KL_SELF)](),
+                        probs.tt["gpu", B * HEADS * QL * KL_SELF](),
                         grid_dim=ba_warp_rows_grid(ROWS), block_dim=TPB,
                     )
                     ctx.enqueue_function[_e_context_self](
-                        probs.lt["gpu", Layout.row_major(B * HEADS * QL * KL_SELF)](),
-                        v.lt["gpu", Layout.row_major(B, KL_SELF * DIM)](),
-                        out.lt["gpu", Layout.row_major(B, QN)](),
+                        probs.tt["gpu", B * HEADS * QL * KL_SELF](),
+                        v.tt["gpu", B, KL_SELF * DIM](),
+                        out.tt["gpu", B, QN](),
                         grid_dim=(n_cx + TPB - 1) // TPB, block_dim=TPB,
                     )
                 else:
                     ctx.enqueue_function[_e_pack_cross](
-                        k.lt["gpu", Layout.row_major(B, KL_CROSS * DIM)](),
-                        kt.lt["gpu", Layout.row_major(B * KL_CROSS * DIM)](),
+                        k.tt["gpu", B, KL_CROSS * DIM](),
+                        kt.tt["gpu", B * KL_CROSS * DIM](),
                         grid_dim=(B * KL_CROSS * DIM + TPB - 1) // TPB, block_dim=TPB,
                     )
                     ctx.enqueue_function[_e_scores_cross](
-                        q.lt["gpu", Layout.row_major(B, QN)](),
-                        kt.lt["gpu", Layout.row_major(B * KL_CROSS * DIM)](),
-                        mask_t.lt["gpu", Layout.row_major(QL * KL_CROSS)](),
-                        probs.lt["gpu", Layout.row_major(B * HEADS * QL * KL_CROSS)](),
+                        q.tt["gpu", B, QN](),
+                        kt.tt["gpu", B * KL_CROSS * DIM](),
+                        mask_t.tt["gpu", QL * KL_CROSS](),
+                        probs.tt["gpu", B * HEADS * QL * KL_CROSS](),
                         grid_dim=(n_sc + TPB - 1) // TPB, block_dim=TPB,
                     )
                     ctx.enqueue_function[_e_softmax_cross](
-                        probs.lt["gpu", Layout.row_major(B * HEADS * QL * KL_CROSS)](),
+                        probs.tt["gpu", B * HEADS * QL * KL_CROSS](),
                         grid_dim=ba_warp_rows_grid(ROWS), block_dim=TPB,
                     )
                     ctx.enqueue_function[_e_context_cross](
-                        probs.lt["gpu", Layout.row_major(B * HEADS * QL * KL_CROSS)](),
-                        v.lt["gpu", Layout.row_major(B, KL_CROSS * DIM)](),
-                        out.lt["gpu", Layout.row_major(B, QN)](),
+                        probs.tt["gpu", B * HEADS * QL * KL_CROSS](),
+                        v.tt["gpu", B, KL_CROSS * DIM](),
+                        out.tt["gpu", B, QN](),
                         grid_dim=(n_cx + TPB - 1) // TPB, block_dim=TPB,
                     )
             # ⚠ SYNCHRONISE BEFORE STOPPING THE CLOCK: the enqueue returns

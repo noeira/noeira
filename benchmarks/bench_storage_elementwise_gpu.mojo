@@ -20,7 +20,7 @@ from std.math import tanh
 from max.gpu import global_idx
 from max.gpu.host import DeviceContext
 from std.time import perf_counter_ns
-from layout import Layout, LayoutTensor
+from noeira.core.tiles import Tile, tile
 
 comptime DT = DType.float32
 comptime TPB = 256
@@ -29,8 +29,8 @@ comptime VEC = 4
 
 # ── ReLU (cheap) ──────────────────────────────────────────────────────────
 def _relu_scalar[M: Int](
-    x: LayoutTensor[DT, Layout.row_major(M), MutAnyOrigin],
-    o: LayoutTensor[DT, Layout.row_major(M), MutAnyOrigin],
+    x: Tile[DT, M],
+    o: Tile[DT, M],
 ):
     var i = Int(global_idx.x)
     if i < M:
@@ -39,8 +39,8 @@ def _relu_scalar[M: Int](
 
 
 def _relu_vec[M: Int](
-    x: LayoutTensor[DT, Layout.row_major(M), MutAnyOrigin],
-    o: LayoutTensor[DT, Layout.row_major(M), MutAnyOrigin],
+    x: Tile[DT, M],
+    o: Tile[DT, M],
 ):
     var i = Int(global_idx.x) * VEC
     if i < M:
@@ -50,8 +50,8 @@ def _relu_vec[M: Int](
 
 # ── Tanh (transcendental) ─────────────────────────────────────────────────
 def _tanh_scalar[M: Int](
-    x: LayoutTensor[DT, Layout.row_major(M), MutAnyOrigin],
-    o: LayoutTensor[DT, Layout.row_major(M), MutAnyOrigin],
+    x: Tile[DT, M],
+    o: Tile[DT, M],
 ):
     var i = Int(global_idx.x)
     if i < M:
@@ -59,8 +59,8 @@ def _tanh_scalar[M: Int](
 
 
 def _tanh_vec[M: Int](
-    x: LayoutTensor[DT, Layout.row_major(M), MutAnyOrigin],
-    o: LayoutTensor[DT, Layout.row_major(M), MutAnyOrigin],
+    x: Tile[DT, M],
+    o: Tile[DT, M],
 ):
     var i = Int(global_idx.x) * VEC
     if i < M:
@@ -74,8 +74,8 @@ def _time[
     var x = ctx.enqueue_create_buffer[DT](M)
     var o = ctx.enqueue_create_buffer[DT](M)
     _ = x.enqueue_fill(Scalar[DT](0.5)); _ = o.enqueue_fill(Scalar[DT](0))
-    var xl = LayoutTensor[DT, Layout.row_major(M), MutAnyOrigin](x)
-    var ol = LayoutTensor[DT, Layout.row_major(M), MutAnyOrigin](o)
+    var xl = tile[M](x)
+    var ol = tile[M](o)
     comptime nb_s = (M + TPB - 1) // TPB
     comptime nb_v = (M // VEC + TPB - 1) // TPB
     var us = Float64(0)

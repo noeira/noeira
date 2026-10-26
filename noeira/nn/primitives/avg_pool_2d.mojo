@@ -18,7 +18,8 @@ input-indexed (1 thread per input cell, looping over overlapping output windows)
 
 from max.gpu import thread_idx, block_idx, block_dim
 from max.gpu.host import DeviceContext
-from layout import Layout, LayoutTensor, TileTensor, row_major
+from layout import TileTensor, row_major
+from noeira.core.tiles import Tile
 
 from noeira.nn.constants import DT, TPB, LAYOUT_NCHW, LAYOUT_NHWC
 from ..core.tensor import Tensor, TensorImpl
@@ -36,8 +37,8 @@ def _avg_pool_2d_forward_kernel[
     OH: Int, OW: Int, IN_FLAT: Int, OUT_FLAT: Int, ADT: DType = DT,
     LAYOUT: Int = LAYOUT_NCHW,
 ](
-    input: LayoutTensor[ADT, Layout.row_major(BATCH, IN_FLAT), MutAnyOrigin],
-    output: LayoutTensor[ADT, Layout.row_major(BATCH, OUT_FLAT), MutAnyOrigin],
+    input: Tile[ADT, BATCH, IN_FLAT],
+    output: Tile[ADT, BATCH, OUT_FLAT],
     inv_kk: Scalar[DT],
 ):
     # AMP §3 fp32-INTERNAL: I/O is the activation dtype (`ADT`) but the pooling
@@ -72,12 +73,8 @@ def _avg_pool_2d_backward_kernel[
     OH: Int, OW: Int, IN_FLAT: Int, OUT_FLAT: Int, ADT: DType = DT,
     LAYOUT: Int = LAYOUT_NCHW,
 ](
-    grad_output: LayoutTensor[
-        ADT, Layout.row_major(BATCH, OUT_FLAT), MutAnyOrigin,
-    ],
-    grad_input: LayoutTensor[
-        ADT, Layout.row_major(BATCH, IN_FLAT), MutAnyOrigin,
-    ],
+    grad_output: Tile[ADT, BATCH, OUT_FLAT],
+    grad_input: Tile[ADT, BATCH, IN_FLAT],
     inv_kk: Scalar[DT],
 ):
     # AMP §3 fp32-INTERNAL: I/O `ADT`, gradient distribution accumulated in fp32.
@@ -210,8 +207,8 @@ struct AvgPool2D[
                     Self.IN_FLAT, Self.OUT_FLAT, Self.ACT_DT, Self.LAYOUT,
                 ]
             ](
-                in0.lt["gpu", Layout.row_major(B, Self.IN_FLAT)](),
-                out.lt["gpu", Layout.row_major(B, Self.OUT_FLAT)](),
+                in0.tt["gpu", B, Self.IN_FLAT](),
+                out.tt["gpu", B, Self.OUT_FLAT](),
                 inv_kk,
                 grid_dim=n_blocks, block_dim=TPB,
             )
@@ -279,8 +276,8 @@ struct AvgPool2D[
                     Self.IN_FLAT, Self.OUT_FLAT, Self.ACT_DT, Self.LAYOUT,
                 ]
             ](
-                grad_output.lt["gpu", Layout.row_major(B, Self.OUT_FLAT)](),
-                gin.lt["gpu", Layout.row_major(B, Self.IN_FLAT)](),
+                grad_output.tt["gpu", B, Self.OUT_FLAT](),
+                gin.tt["gpu", B, Self.IN_FLAT](),
                 inv_kk,
                 grid_dim=n_blocks, block_dim=TPB,
             )

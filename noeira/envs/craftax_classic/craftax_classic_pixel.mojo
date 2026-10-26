@@ -31,7 +31,6 @@ from noeira.core import (
     RenderableEnv,
 )
 from noeira.nn.constants import DT as gpu_dtype
-from layout import LayoutTensor, Layout
 from max.gpu import block_dim, block_idx, thread_idx
 from max.gpu.host import DeviceContext, DeviceBuffer
 from std.random.philox import Random as PhiloxRandom

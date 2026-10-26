@@ -14,10 +14,10 @@ window to the GPU world model.
 """
 
 from std.memory import alloc, dealloc
-from layout import Layout, LayoutTensor
 
 from ...nn.constants import DT
 from noeira.envs.pusht.render_swm import render_pusht_swm_at
+from noeira.core.tiles import tile
 
 
 def sim_frame_chw_norm[
@@ -36,9 +36,7 @@ def sim_frame_chw_norm[
     comptime HW = OUT * OUT
     var tmp_a = alloc[Scalar[DT]]({count = HW * 3})
     var tmp = tmp_a.unsafe_ptr().unsafe_origin_cast[MutUntrackedOrigin]()   # HWC [0,255]
-    var pix = LayoutTensor[DT, Layout.row_major(OUT, OUT, 3), MutAnyOrigin](
-        tmp.as_unsafe_any_origin()
-    )
+    var pix = tile[OUT, OUT, 3](tmp.as_unsafe_any_origin())
     # stable-worldmodel 0.0.6's drawing (render_swm.mojo): the frames the
     # LeWM dataset — and so every LeWM encoder — was trained on. The env's
     # own `render_pusht_rgb_at` (flat fills, no outline, no resize) put the

@@ -17,6 +17,7 @@ Run: pixi run -e apple mojo run -I . tests/nn/test_checkpoint_scalars.mojo
 """
 
 from std.testing import assert_true, assert_equal
+from std.sys import has_accelerator
 from max.gpu.host import DeviceContext
 
 from noeira.nn.constants import DT
@@ -226,6 +227,12 @@ def main() raises:
     test_bad_name_raises()
     test_extra_tensor_is_drift()
     test_adam_resume_cpu()
-    test_adam_resume_gpu()
+    comptime if has_accelerator():
+        test_adam_resume_gpu()
+    else:
+        print(
+            "test_adam_resume_gpu: SKIPPED (no accelerator;"
+            " run with -e apple / -e nvidia)"
+        )
     test_scalar_adam_state()
     print("CHECKPOINT SCALARS OK")

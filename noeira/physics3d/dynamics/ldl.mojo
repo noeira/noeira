@@ -25,7 +25,8 @@ from max.gpu import thread_idx, block_idx, block_dim
 from std.collections import Array
 from max.gpu.sync import barrier
 from max.gpu.host import DeviceContext
-from layout import Layout, LayoutTensor
+from layout import TileTensor, TensorLayout
+from noeira.core.tiles import RowMajor, Tile
 
 from ..fields import (
     DynamicsScratch,
@@ -50,8 +51,8 @@ from ..gpu.constants import (
 
 @always_inline
 def _dof_block[
-    DTYPE: DType, LT: Layout
-](trees: LayoutTensor[DTYPE, LT, MutAnyOrigin], nv: Int, j: Int) -> Tuple[Int, Int]:
+    DTYPE: DType, LT: TensorLayout
+](trees: TileTensor[DTYPE, LT, MutAnyOrigin], nv: Int, j: Int) -> Tuple[Int, Int]:
     """The half-open dof range of the kinematic tree containing dof `j`.
 
     ⚠⚠ THE ONE SPELLING OF THE RULE, and it is called at BLOCK BOUNDARIES
@@ -82,16 +83,16 @@ comptime LDL_TPB: Int = 64
 def _ldl_factor_env[
     DTYPE: DType,
     DIMS: DimsLike,
-    LM: Layout,
-    LNV: Layout,
-    LTREE: Layout,
+    LM: TensorLayout,
+    LNV: TensorLayout,
+    LTREE: TensorLayout,
 ](
     env: Int,
     dims: DIMS,
-    M: LayoutTensor[DTYPE, LM, MutAnyOrigin],
-    L: LayoutTensor[DTYPE, LM, MutAnyOrigin],
-    D: LayoutTensor[DTYPE, LNV, MutAnyOrigin],
-    trees: LayoutTensor[DTYPE, LTREE, MutAnyOrigin],
+    M: TileTensor[DTYPE, LM, MutAnyOrigin],
+    L: TileTensor[DTYPE, LM, MutAnyOrigin],
+    D: TileTensor[DTYPE, LNV, MutAnyOrigin],
+    trees: TileTensor[DTYPE, LTREE, MutAnyOrigin],
 ):
     """LDL factorization for one env (verbatim from ldl_factor_gpu).
 
@@ -146,17 +147,17 @@ def _ldl_factor_env[
 def _ldl_solve_env[
     DTYPE: DType,
     DIMS: DimsLike,
-    LM: Layout,
-    LNV: Layout,
-    LTREE: Layout,
+    LM: TensorLayout,
+    LNV: TensorLayout,
+    LTREE: TensorLayout,
 ](
     env: Int,
     dims: DIMS,
-    L: LayoutTensor[DTYPE, LM, MutAnyOrigin],
-    D: LayoutTensor[DTYPE, LNV, MutAnyOrigin],
-    b: LayoutTensor[DTYPE, LNV, MutAnyOrigin],
-    x: LayoutTensor[DTYPE, LNV, MutAnyOrigin],
-    trees: LayoutTensor[DTYPE, LTREE, MutAnyOrigin],
+    L: TileTensor[DTYPE, LM, MutAnyOrigin],
+    D: TileTensor[DTYPE, LNV, MutAnyOrigin],
+    b: TileTensor[DTYPE, LNV, MutAnyOrigin],
+    x: TileTensor[DTYPE, LNV, MutAnyOrigin],
+    trees: TileTensor[DTYPE, LTREE, MutAnyOrigin],
 ):
     """LDL solve x = M^-1 b for one env (verbatim from
     ldl_solve_workspace_gpu).
@@ -178,7 +179,7 @@ def _ldl_solve_env[
     # ⚠ THE TEST IS `i < b0 or i >= b1`, NOT `i >= b1`, because the third loop
     # below runs DESCENDING. One spelling that works in both directions beats
     # two that each work in one.
-    var y = Scratch[L.element_type, V_CAP](nv, uninitialized=0)
+    var y = Scratch[L.ElementType, V_CAP](nv, uninitialized=0)
     var b0 = 1
     var b1 = 0
     for i in range(nv):
@@ -191,7 +192,7 @@ def _ldl_solve_env[
             s = s - L[env, i * nv + j] * y[j]
         y[i] = s
 
-    var z = Scratch[L.element_type, V_CAP](nv, uninitialized=0)
+    var z = Scratch[L.ElementType, V_CAP](nv, uninitialized=0)
     for i in range(nv):
         var d_i = D[env, i]
         if d_i > 1e-14 or d_i < -1e-14:
@@ -282,16 +283,16 @@ def _dof_ancestors[
 def _ldl_factor_tree_env[
     DTYPE: DType,
     DIMS: DimsLike,
-    LM: Layout,
-    LNV: Layout,
-    LP: Layout,
+    LM: TensorLayout,
+    LNV: TensorLayout,
+    LP: TensorLayout,
 ](
     env: Int,
     dims: DIMS,
-    M: LayoutTensor[DTYPE, LM, MutAnyOrigin],
-    L: LayoutTensor[DTYPE, LM, MutAnyOrigin],
-    D: LayoutTensor[DTYPE, LNV, MutAnyOrigin],
-    dofp: LayoutTensor[DTYPE, LP, MutAnyOrigin],
+    M: TileTensor[DTYPE, LM, MutAnyOrigin],
+    L: TileTensor[DTYPE, LM, MutAnyOrigin],
+    D: TileTensor[DTYPE, LNV, MutAnyOrigin],
+    dofp: TileTensor[DTYPE, LP, MutAnyOrigin],
 ):
     """`M = Lᵀ D L`, `mj_factorI` on dense storage. `L[env, k*nv + j]` for
     `j` an ancestor of `k`; unit diagonal stored; everything else zero.
@@ -382,17 +383,17 @@ def _ldl_factor_tree_env[
 def _ldl_solve_tree_env[
     DTYPE: DType,
     DIMS: DimsLike,
-    LM: Layout,
-    LNV: Layout,
-    LP: Layout,
+    LM: TensorLayout,
+    LNV: TensorLayout,
+    LP: TensorLayout,
 ](
     env: Int,
     dims: DIMS,
-    L: LayoutTensor[DTYPE, LM, MutAnyOrigin],
-    D: LayoutTensor[DTYPE, LNV, MutAnyOrigin],
-    b: LayoutTensor[DTYPE, LNV, MutAnyOrigin],
-    x: LayoutTensor[DTYPE, LNV, MutAnyOrigin],
-    dofp: LayoutTensor[DTYPE, LP, MutAnyOrigin],
+    L: TileTensor[DTYPE, LM, MutAnyOrigin],
+    D: TileTensor[DTYPE, LNV, MutAnyOrigin],
+    b: TileTensor[DTYPE, LNV, MutAnyOrigin],
+    x: TileTensor[DTYPE, LNV, MutAnyOrigin],
+    dofp: TileTensor[DTYPE, LP, MutAnyOrigin],
 ):
     """`x = (Lᵀ D L)⁻¹ b`, `mj_solveLD`: scatter up the tree, divide, gather."""
     var nv = dims.get_nv()
@@ -409,7 +410,7 @@ def _ldl_solve_tree_env[
     var dep = Scratch[Int, V_CAP](nv, uninitialized=0)
     var anc = Scratch[Int, A_CAP](nv * nv, uninitialized=0)
     _dof_ancestors[V_CAP, A_CAP](nv, par, dep, anc)
-    var y = Scratch[L.element_type, V_CAP](nv, uninitialized=0)
+    var y = Scratch[L.ElementType, V_CAP](nv, uninitialized=0)
     var yp = y.unsafe_ptr()
     var Lp = L.ptr.unsafe_offset(env * nv * nv)
     for i in range(nv):
@@ -443,16 +444,16 @@ def _ldl_solve_tree_env[
 def _m_inv_tree_env[
     DTYPE: DType,
     DIMS: DimsLike,
-    LM: Layout,
-    LNV: Layout,
-    LP: Layout,
+    LM: TensorLayout,
+    LNV: TensorLayout,
+    LP: TensorLayout,
 ](
     env: Int,
     dims: DIMS,
-    L: LayoutTensor[DTYPE, LM, MutAnyOrigin],
-    D: LayoutTensor[DTYPE, LNV, MutAnyOrigin],
-    m_inv: LayoutTensor[DTYPE, LM, MutAnyOrigin],
-    dofp: LayoutTensor[DTYPE, LP, MutAnyOrigin],
+    L: TileTensor[DTYPE, LM, MutAnyOrigin],
+    D: TileTensor[DTYPE, LNV, MutAnyOrigin],
+    m_inv: TileTensor[DTYPE, LM, MutAnyOrigin],
+    dofp: TileTensor[DTYPE, LP, MutAnyOrigin],
 ):
     """Dense `M⁻¹`, one tree solve per column: O(nv² · depth) in all."""
     var nv = dims.get_nv()
@@ -460,7 +461,7 @@ def _m_inv_tree_env[
     var par = Scratch[Int, V_CAP](nv, uninitialized=0)
     for i in range(nv):
         par[i] = Int(dofp[i])
-    var y = Scratch[L.element_type, V_CAP](nv, uninitialized=0)
+    var y = Scratch[L.ElementType, V_CAP](nv, uninitialized=0)
     for c in range(nv):
         for i in range(nv):
             y[i] = 0
@@ -496,12 +497,10 @@ def _ldl_factor_fields_kernel[
     NV: Int,
     BATCH: Int,
 ](
-    M: LayoutTensor[DTYPE, Layout.row_major(BATCH, NV * NV), MutAnyOrigin],
-    L: LayoutTensor[DTYPE, Layout.row_major(BATCH, NV * NV), MutAnyOrigin],
-    D: LayoutTensor[DTYPE, Layout.row_major(BATCH, NV), MutAnyOrigin],
-    trees: LayoutTensor[
-        DTYPE, Layout.row_major(NV * MODEL_TREE_SIZE), MutAnyOrigin
-    ],
+    M: Tile[DTYPE, BATCH, NV * NV],
+    L: Tile[DTYPE, BATCH, NV * NV],
+    D: Tile[DTYPE, BATCH, NV],
+    trees: Tile[DTYPE, NV * MODEL_TREE_SIZE],
 ):
     var env = Int(block_dim.x * block_idx.x + thread_idx.x)
     if env >= BATCH:
@@ -523,12 +522,10 @@ def _ldl_factor_fields_mt_kernel[
     BATCH: Int,
     N_THREADS: Int,
 ](
-    M: LayoutTensor[DTYPE, Layout.row_major(BATCH, NV * NV), MutAnyOrigin],
-    L: LayoutTensor[DTYPE, Layout.row_major(BATCH, NV * NV), MutAnyOrigin],
-    D: LayoutTensor[DTYPE, Layout.row_major(BATCH, NV), MutAnyOrigin],
-    trees: LayoutTensor[
-        DTYPE, Layout.row_major(NV * MODEL_TREE_SIZE), MutAnyOrigin
-    ],
+    M: Tile[DTYPE, BATCH, NV * NV],
+    L: Tile[DTYPE, BATCH, NV * NV],
+    D: Tile[DTYPE, BATCH, NV],
+    trees: Tile[DTYPE, NV * MODEL_TREE_SIZE],
 ):
     var env = Int(block_idx.x)
     var tid = Int(thread_idx.x)
@@ -577,13 +574,11 @@ def _ldl_solve_fields_kernel[
     NV: Int,
     BATCH: Int,
 ](
-    L: LayoutTensor[DTYPE, Layout.row_major(BATCH, NV * NV), MutAnyOrigin],
-    D: LayoutTensor[DTYPE, Layout.row_major(BATCH, NV), MutAnyOrigin],
-    b: LayoutTensor[DTYPE, Layout.row_major(BATCH, NV), MutAnyOrigin],
-    x: LayoutTensor[DTYPE, Layout.row_major(BATCH, NV), MutAnyOrigin],
-    trees: LayoutTensor[
-        DTYPE, Layout.row_major(NV * MODEL_TREE_SIZE), MutAnyOrigin
-    ],
+    L: Tile[DTYPE, BATCH, NV * NV],
+    D: Tile[DTYPE, BATCH, NV],
+    b: Tile[DTYPE, BATCH, NV],
+    x: Tile[DTYPE, BATCH, NV],
+    trees: Tile[DTYPE, NV * MODEL_TREE_SIZE],
 ):
     var env = Int(block_dim.x * block_idx.x + thread_idx.x)
     if env >= BATCH:
@@ -603,13 +598,11 @@ def _ldl_solve_fields_mt_kernel[
     BATCH: Int,
     N_THREADS: Int,
 ](
-    L: LayoutTensor[DTYPE, Layout.row_major(BATCH, NV * NV), MutAnyOrigin],
-    D: LayoutTensor[DTYPE, Layout.row_major(BATCH, NV), MutAnyOrigin],
-    b: LayoutTensor[DTYPE, Layout.row_major(BATCH, NV), MutAnyOrigin],
-    x: LayoutTensor[DTYPE, Layout.row_major(BATCH, NV), MutAnyOrigin],
-    trees: LayoutTensor[
-        DTYPE, Layout.row_major(NV * MODEL_TREE_SIZE), MutAnyOrigin
-    ],
+    L: Tile[DTYPE, BATCH, NV * NV],
+    D: Tile[DTYPE, BATCH, NV],
+    b: Tile[DTYPE, BATCH, NV],
+    x: Tile[DTYPE, BATCH, NV],
+    trees: Tile[DTYPE, NV * MODEL_TREE_SIZE],
 ):
     """`x = M^-1 b`, one BLOCK PER ENV and one THREAD PER KINEMATIC TREE
     (2026-09-08, block ledger F1's launch shape).
@@ -637,8 +630,8 @@ def _ldl_solve_fields_mt_kernel[
     var tid = Int(thread_idx.x)
     if env >= BATCH:
         return
-    var y = Array[L.element_type, NV](uninitialized=True)
-    var z = Array[L.element_type, NV](uninitialized=True)
+    var y = Array[L.ElementType, NV](uninitialized=True)
+    var z = Array[L.ElementType, NV](uninitialized=True)
     # ⚠ THE TREE TABLE BY INDEX, NOT BY `_dof_block`. The first version
     # walked `_dof_block(trees, NV, sp)` at every boundary — that helper scans
     # the table from the top, so a thread paid `ntree^2` global loads before
@@ -696,26 +689,26 @@ def ldl_factor[
     """M -> L, D (owned scratch), both targets, one body. PARALLEL=True
     (GPU only): cooperative per-column kernel, bit-exact vs serial. CPU
     ignores PARALLEL."""
-    comptime L_M = Layout.row_major(BATCH, D.NV * D.NV)
-    comptime L_NV = Layout.row_major(BATCH, D.NV)
+    comptime L_M = RowMajor[BATCH, D.NV * D.NV]
+    comptime L_NV = RowMajor[BATCH, D.NV]
     # ⚠ FLAT — `[t*MODEL_TREE_SIZE + col]`, the single spelling shared with
     # `newton_blocks` and `newton_solve`. A 2-D `LayoutTensor` given ONE index
     # returns a ROW, so the two forms are not interchangeable.
-    comptime L_TREE = Layout.row_major(D.NV * MODEL_TREE_SIZE)
+    comptime L_TREE = RowMajor[D.NV * MODEL_TREE_SIZE]
 
     comptime if target == "cpu":
         var dm = scratch.dims
         var rl_M = rl2(BATCH, dm.get_nv() * dm.get_nv())
         var rl_NV = rl2(BATCH, dm.get_nv())
         var rl_TREE = rl1(dm.get_nv() * MODEL_TREE_SIZE)
-        var M_v = scratch.M.lt_dyn["cpu", DYN2](rl_M)
-        var L_v = scratch.L.lt_dyn["cpu", DYN2](rl_M)
-        var D_v = scratch.D.lt_dyn["cpu", DYN2](rl_NV)
-        var T_v = m.trees.lt_dyn["cpu", DYN1](rl_TREE)
+        var M_v = scratch.M.tt_dyn["cpu", DYN2](rl_M)
+        var L_v = scratch.L.tt_dyn["cpu", DYN2](rl_M)
+        var D_v = scratch.D.tt_dyn["cpu", DYN2](rl_NV)
+        var T_v = m.trees.tt_dyn["cpu", DYN1](rl_TREE)
         # Tree-ordered when the parser built the table, dense otherwise —
         # see the note above `_ldl_factor_tree_env`.
         var use_tree = Int(m.meta.data[MODEL_META_IDX_NTREE]) > 0
-        var P_v = m.dof_parentid.lt_dyn["cpu", DYN1](
+        var P_v = m.dof_parentid.tt_dyn["cpu", DYN1](
             rl1(dm.get_nv() if dm.get_nv() > 0 else 1)
         )
         for e in range(BATCH):
@@ -729,10 +722,10 @@ def ldl_factor[
         c.enqueue_function[
             _ldl_factor_fields_mt_kernel[DTYPE, D.NV, BATCH, MT_T]
         ](
-            scratch.M.lt["gpu", L_M](),
-            scratch.L.lt["gpu", L_M](),
-            scratch.D.lt["gpu", L_NV](),
-            m.trees.lt["gpu", L_TREE](),
+            scratch.M.tt["gpu", BATCH, D.NV * D.NV](),
+            scratch.L.tt["gpu", BATCH, D.NV * D.NV](),
+            scratch.D.tt["gpu", BATCH, D.NV](),
+            m.trees.tt["gpu", D.NV * MODEL_TREE_SIZE](),
             grid_dim=(BATCH,),
             block_dim=(MT_T,),
         )
@@ -740,10 +733,10 @@ def ldl_factor[
         var c = ctx.value()
         comptime BLOCKS = (BATCH + LDL_TPB - 1) // LDL_TPB
         c.enqueue_function[_ldl_factor_fields_kernel[DTYPE, D.NV, BATCH]](
-            scratch.M.lt["gpu", L_M](),
-            scratch.L.lt["gpu", L_M](),
-            scratch.D.lt["gpu", L_NV](),
-            m.trees.lt["gpu", L_TREE](),
+            scratch.M.tt["gpu", BATCH, D.NV * D.NV](),
+            scratch.L.tt["gpu", BATCH, D.NV * D.NV](),
+            scratch.D.tt["gpu", BATCH, D.NV](),
+            m.trees.tt["gpu", D.NV * MODEL_TREE_SIZE](),
             grid_dim=(BLOCKS,),
             block_dim=(LDL_TPB,),
         )
@@ -764,22 +757,22 @@ def ldl_solve[
     PARALLEL=True (GPU only): a block per env, a thread per kinematic tree
     (`_ldl_solve_fields_mt_kernel`), bit-exact vs the serial kernel. CPU
     ignores PARALLEL."""
-    comptime L_M = Layout.row_major(BATCH, D.NV * D.NV)
-    comptime L_NV = Layout.row_major(BATCH, D.NV)
-    comptime L_TREE = Layout.row_major(D.NV * MODEL_TREE_SIZE)
+    comptime L_M = RowMajor[BATCH, D.NV * D.NV]
+    comptime L_NV = RowMajor[BATCH, D.NV]
+    comptime L_TREE = RowMajor[D.NV * MODEL_TREE_SIZE]
 
     comptime if target == "cpu":
         var dm = scratch.dims
         var rl_M = rl2(BATCH, dm.get_nv() * dm.get_nv())
         var rl_NV = rl2(BATCH, dm.get_nv())
         var rl_TREE = rl1(dm.get_nv() * MODEL_TREE_SIZE)
-        var L_v = scratch.L.lt_dyn["cpu", DYN2](rl_M)
-        var D_v = scratch.D.lt_dyn["cpu", DYN2](rl_NV)
-        var b_v = scratch.fnet.lt_dyn["cpu", DYN2](rl_NV)
-        var x_v = scratch.qacc_ws.lt_dyn["cpu", DYN2](rl_NV)
-        var T_v = m.trees.lt_dyn["cpu", DYN1](rl_TREE)
+        var L_v = scratch.L.tt_dyn["cpu", DYN2](rl_M)
+        var D_v = scratch.D.tt_dyn["cpu", DYN2](rl_NV)
+        var b_v = scratch.fnet.tt_dyn["cpu", DYN2](rl_NV)
+        var x_v = scratch.qacc_ws.tt_dyn["cpu", DYN2](rl_NV)
+        var T_v = m.trees.tt_dyn["cpu", DYN1](rl_TREE)
         var use_tree = Int(m.meta.data[MODEL_META_IDX_NTREE]) > 0
-        var P_v = m.dof_parentid.lt_dyn["cpu", DYN1](
+        var P_v = m.dof_parentid.tt_dyn["cpu", DYN1](
             rl1(dm.get_nv() if dm.get_nv() > 0 else 1)
         )
         for e in range(BATCH):
@@ -792,11 +785,11 @@ def ldl_solve[
         c.enqueue_function[
             _ldl_solve_fields_mt_kernel[DTYPE, D.NV, BATCH, LDL_SOLVE_MT_T]
         ](
-            scratch.L.lt["gpu", L_M](),
-            scratch.D.lt["gpu", L_NV](),
-            scratch.fnet.lt["gpu", L_NV](),
-            scratch.qacc_ws.lt["gpu", L_NV](),
-            m.trees.lt["gpu", L_TREE](),
+            scratch.L.tt["gpu", BATCH, D.NV * D.NV](),
+            scratch.D.tt["gpu", BATCH, D.NV](),
+            scratch.fnet.tt["gpu", BATCH, D.NV](),
+            scratch.qacc_ws.tt["gpu", BATCH, D.NV](),
+            m.trees.tt["gpu", D.NV * MODEL_TREE_SIZE](),
             grid_dim=(BATCH,),
             block_dim=(LDL_SOLVE_MT_T,),
         )
@@ -804,11 +797,11 @@ def ldl_solve[
         var c = ctx.value()
         comptime BLOCKS = (BATCH + LDL_TPB - 1) // LDL_TPB
         c.enqueue_function[_ldl_solve_fields_kernel[DTYPE, D.NV, BATCH]](
-            scratch.L.lt["gpu", L_M](),
-            scratch.D.lt["gpu", L_NV](),
-            scratch.fnet.lt["gpu", L_NV](),
-            scratch.qacc_ws.lt["gpu", L_NV](),
-            m.trees.lt["gpu", L_TREE](),
+            scratch.L.tt["gpu", BATCH, D.NV * D.NV](),
+            scratch.D.tt["gpu", BATCH, D.NV](),
+            scratch.fnet.tt["gpu", BATCH, D.NV](),
+            scratch.qacc_ws.tt["gpu", BATCH, D.NV](),
+            m.trees.tt["gpu", D.NV * MODEL_TREE_SIZE](),
             grid_dim=(BLOCKS,),
             block_dim=(LDL_TPB,),
         )
@@ -819,25 +812,25 @@ def ldl_solve[
 def _m_inv_col_env[
     DTYPE: DType,
     DIMS: DimsLike,
-    LM: Layout,
-    LNV: Layout,
-    LTREE: Layout,
+    LM: TensorLayout,
+    LNV: TensorLayout,
+    LTREE: TensorLayout,
 ](
     env: Int,
     j: Int,
     dims: DIMS,
-    L: LayoutTensor[DTYPE, LM, MutAnyOrigin],
-    D: LayoutTensor[DTYPE, LNV, MutAnyOrigin],
-    m_inv: LayoutTensor[DTYPE, LM, MutAnyOrigin],
-    trees: LayoutTensor[DTYPE, LTREE, MutAnyOrigin],
+    L: TileTensor[DTYPE, LM, MutAnyOrigin],
+    D: TileTensor[DTYPE, LNV, MutAnyOrigin],
+    m_inv: TileTensor[DTYPE, LM, MutAnyOrigin],
+    trees: TileTensor[DTYPE, LTREE, MutAnyOrigin],
 ):
     """One column j of M^-1 (triangular solve on e_j). Extracted verbatim
     from the `_m_inv_env` column loop so serial and _mt schedules
     share identical arithmetic."""
     var nv = dims.get_nv()
     comptime V_CAP = cap[DIMS.NV]()
-    var e = Scratch[L.element_type, V_CAP](nv, uninitialized=0)
-    var col = Scratch[L.element_type, V_CAP](nv, uninitialized=0)
+    var e = Scratch[L.ElementType, V_CAP](nv, uninitialized=0)
+    var col = Scratch[L.ElementType, V_CAP](nv, uninitialized=0)
 
     # ⚠⚠ COLUMN j OF `M^-1` IS ZERO OUTSIDE j's TREE, AND TODAY'S CODE ALREADY
     # COMPUTES IT AS EXACTLY ZERO. Forward substitution gives `y[i] = 0` for
@@ -862,14 +855,14 @@ def _m_inv_col_env[
         col[i] = 0
     e[j] = 1
 
-    var y = Scratch[L.element_type, V_CAP](nv, uninitialized=0)
+    var y = Scratch[L.ElementType, V_CAP](nv, uninitialized=0)
     for i in range(b0, b1):
         var s = e[i]
         for k in range(b0, i):
             s = s - L[env, i * nv + k] * y[k]
         y[i] = s
 
-    var z = Scratch[L.element_type, V_CAP](nv, uninitialized=0)
+    var z = Scratch[L.ElementType, V_CAP](nv, uninitialized=0)
     for i in range(b0, b1):
         var d_i = D[env, i]
         if d_i > 1e-14 or d_i < -1e-14:
@@ -892,16 +885,16 @@ def _m_inv_col_env[
 def _m_inv_env[
     DTYPE: DType,
     DIMS: DimsLike,
-    LM: Layout,
-    LNV: Layout,
-    LTREE: Layout,
+    LM: TensorLayout,
+    LNV: TensorLayout,
+    LTREE: TensorLayout,
 ](
     env: Int,
     dims: DIMS,
-    L: LayoutTensor[DTYPE, LM, MutAnyOrigin],
-    D: LayoutTensor[DTYPE, LNV, MutAnyOrigin],
-    m_inv: LayoutTensor[DTYPE, LM, MutAnyOrigin],
-    trees: LayoutTensor[DTYPE, LTREE, MutAnyOrigin],
+    L: TileTensor[DTYPE, LM, MutAnyOrigin],
+    D: TileTensor[DTYPE, LNV, MutAnyOrigin],
+    m_inv: TileTensor[DTYPE, LM, MutAnyOrigin],
+    trees: TileTensor[DTYPE, LTREE, MutAnyOrigin],
 ):
     """Full dense M^-1 via per-column LDL solves (arithmetic verbatim;
     column body now lives in the shared `_m_inv_col_env` helper —
@@ -915,12 +908,10 @@ def _m_inv_fields_kernel[
     NV: Int,
     BATCH: Int,
 ](
-    L: LayoutTensor[DTYPE, Layout.row_major(BATCH, NV * NV), MutAnyOrigin],
-    D: LayoutTensor[DTYPE, Layout.row_major(BATCH, NV), MutAnyOrigin],
-    m_inv: LayoutTensor[DTYPE, Layout.row_major(BATCH, NV * NV), MutAnyOrigin],
-    trees: LayoutTensor[
-        DTYPE, Layout.row_major(NV * MODEL_TREE_SIZE), MutAnyOrigin
-    ],
+    L: Tile[DTYPE, BATCH, NV * NV],
+    D: Tile[DTYPE, BATCH, NV],
+    m_inv: Tile[DTYPE, BATCH, NV * NV],
+    trees: Tile[DTYPE, NV * MODEL_TREE_SIZE],
 ):
     var env = Int(block_dim.x * block_idx.x + thread_idx.x)
     if env >= BATCH:
@@ -940,12 +931,10 @@ def _m_inv_fields_mt_kernel[
     BATCH: Int,
     N_THREADS: Int,
 ](
-    L: LayoutTensor[DTYPE, Layout.row_major(BATCH, NV * NV), MutAnyOrigin],
-    D: LayoutTensor[DTYPE, Layout.row_major(BATCH, NV), MutAnyOrigin],
-    m_inv: LayoutTensor[DTYPE, Layout.row_major(BATCH, NV * NV), MutAnyOrigin],
-    trees: LayoutTensor[
-        DTYPE, Layout.row_major(NV * MODEL_TREE_SIZE), MutAnyOrigin
-    ],
+    L: Tile[DTYPE, BATCH, NV * NV],
+    D: Tile[DTYPE, BATCH, NV],
+    m_inv: Tile[DTYPE, BATCH, NV * NV],
+    trees: Tile[DTYPE, NV * MODEL_TREE_SIZE],
 ):
     var env = Int(block_idx.x)
     var tid = Int(thread_idx.x)
@@ -971,24 +960,24 @@ def compute_m_inv[
     """L, D -> m_inv (owned scratch), both targets, one body. PARALLEL=True
     (GPU only): cooperative column-striped kernel, bit-exact vs serial. CPU
     ignores PARALLEL."""
-    comptime L_M = Layout.row_major(BATCH, D.NV * D.NV)
-    comptime L_NV = Layout.row_major(BATCH, D.NV)
+    comptime L_M = RowMajor[BATCH, D.NV * D.NV]
+    comptime L_NV = RowMajor[BATCH, D.NV]
     # ⚠ FLAT — `[t*MODEL_TREE_SIZE + col]`, the single spelling shared with
     # `newton_blocks` and `newton_solve`. A 2-D `LayoutTensor` given ONE index
     # returns a ROW, so the two forms are not interchangeable.
-    comptime L_TREE = Layout.row_major(D.NV * MODEL_TREE_SIZE)
+    comptime L_TREE = RowMajor[D.NV * MODEL_TREE_SIZE]
 
     comptime if target == "cpu":
         var dm = scratch.dims
         var rl_M = rl2(BATCH, dm.get_nv() * dm.get_nv())
         var rl_NV = rl2(BATCH, dm.get_nv())
         var rl_TREE = rl1(dm.get_nv() * MODEL_TREE_SIZE)
-        var L_v = scratch.L.lt_dyn["cpu", DYN2](rl_M)
-        var D_v = scratch.D.lt_dyn["cpu", DYN2](rl_NV)
-        var mi_v = scratch.m_inv.lt_dyn["cpu", DYN2](rl_M)
-        var T_v = m.trees.lt_dyn["cpu", DYN1](rl_TREE)
+        var L_v = scratch.L.tt_dyn["cpu", DYN2](rl_M)
+        var D_v = scratch.D.tt_dyn["cpu", DYN2](rl_NV)
+        var mi_v = scratch.m_inv.tt_dyn["cpu", DYN2](rl_M)
+        var T_v = m.trees.tt_dyn["cpu", DYN1](rl_TREE)
         var use_tree = Int(m.meta.data[MODEL_META_IDX_NTREE]) > 0
-        var P_v = m.dof_parentid.lt_dyn["cpu", DYN1](
+        var P_v = m.dof_parentid.tt_dyn["cpu", DYN1](
             rl1(dm.get_nv() if dm.get_nv() > 0 else 1)
         )
         for e in range(BATCH):
@@ -1000,10 +989,10 @@ def compute_m_inv[
         var c = ctx.value()
         comptime MT_T = D.NV
         c.enqueue_function[_m_inv_fields_mt_kernel[DTYPE, D.NV, BATCH, MT_T]](
-            scratch.L.lt["gpu", L_M](),
-            scratch.D.lt["gpu", L_NV](),
-            scratch.m_inv.lt["gpu", L_M](),
-            m.trees.lt["gpu", L_TREE](),
+            scratch.L.tt["gpu", BATCH, D.NV * D.NV](),
+            scratch.D.tt["gpu", BATCH, D.NV](),
+            scratch.m_inv.tt["gpu", BATCH, D.NV * D.NV](),
+            m.trees.tt["gpu", D.NV * MODEL_TREE_SIZE](),
             grid_dim=(BATCH,),
             block_dim=(MT_T,),
         )
@@ -1011,10 +1000,10 @@ def compute_m_inv[
         var c = ctx.value()
         comptime BLOCKS = (BATCH + LDL_TPB - 1) // LDL_TPB
         c.enqueue_function[_m_inv_fields_kernel[DTYPE, D.NV, BATCH]](
-            scratch.L.lt["gpu", L_M](),
-            scratch.D.lt["gpu", L_NV](),
-            scratch.m_inv.lt["gpu", L_M](),
-            m.trees.lt["gpu", L_TREE](),
+            scratch.L.tt["gpu", BATCH, D.NV * D.NV](),
+            scratch.D.tt["gpu", BATCH, D.NV](),
+            scratch.m_inv.tt["gpu", BATCH, D.NV * D.NV](),
+            m.trees.tt["gpu", D.NV * MODEL_TREE_SIZE](),
             grid_dim=(BLOCKS,),
             block_dim=(LDL_TPB,),
         )

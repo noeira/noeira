@@ -20,7 +20,8 @@ from max.gpu import thread_idx, block_idx
 from max.gpu.primitives import block
 from max.gpu.host import DeviceContext
 from std.utils.numerics import get_accum_type
-from layout import Layout, LayoutTensor, TileTensor, row_major
+from layout import TileTensor, row_major
+from noeira.core.tiles import RowMajor, Tile
 
 from noeira.nn.constants import DT
 from ..core.tensor import Tensor
@@ -44,10 +45,10 @@ comptime LNNA_REG_CAP = 8
 def _lnna_forward_kernel[
     BATCH: Int, DIM: Int,
 ](
-    input: LayoutTensor[DT, Layout.row_major(BATCH, DIM), MutAnyOrigin],
-    output: LayoutTensor[DT, Layout.row_major(BATCH, DIM), MutAnyOrigin],
-    cache_xhat: LayoutTensor[DT, Layout.row_major(BATCH, DIM), MutAnyOrigin],
-    cache_inv_std: LayoutTensor[DT, Layout.row_major(BATCH), MutAnyOrigin],
+    input: Tile[DT, BATCH, DIM],
+    output: Tile[DT, BATCH, DIM],
+    cache_xhat: Tile[DT, BATCH, DIM],
+    cache_inv_std: Tile[DT, BATCH],
 ):
     var b = Int(block_idx.x)
     var t = Int(thread_idx.x)
@@ -127,10 +128,10 @@ def _lnna_forward_kernel[
 def _lnna_backward_kernel[
     BATCH: Int, DIM: Int,
 ](
-    grad_output: LayoutTensor[DT, Layout.row_major(BATCH, DIM), MutAnyOrigin],
-    cache_xhat: LayoutTensor[DT, Layout.row_major(BATCH, DIM), MutAnyOrigin],
-    cache_inv_std: LayoutTensor[DT, Layout.row_major(BATCH), MutAnyOrigin],
-    grad_input: LayoutTensor[DT, Layout.row_major(BATCH, DIM), MutAnyOrigin],
+    grad_output: Tile[DT, BATCH, DIM],
+    cache_xhat: Tile[DT, BATCH, DIM],
+    cache_inv_std: Tile[DT, BATCH],
+    grad_input: Tile[DT, BATCH, DIM],
 ):
     var b = Int(block_idx.x)
     var t = Int(thread_idx.x)
@@ -258,13 +259,13 @@ struct LayerNormNoAffine[DIM_: Int](Module):
             out.ensure_gpu(c, B * Self.DIM_)
             self.cache_xhat.ensure_gpu(c, B * Self.DIM_)
             self.cache_inv_std.ensure_gpu(c, B)
-            comptime l2d = Layout.row_major(B, Self.DIM_)
-            comptime lb = Layout.row_major(B)
+            comptime l2d = RowMajor[B, Self.DIM_]
+            comptime lb = RowMajor[B]
             c.enqueue_function[_lnna_forward_kernel[B, Self.DIM_]](
-                in0.lt["gpu", l2d](),
-                out.lt["gpu", l2d](),
-                self.cache_xhat.lt["gpu", l2d](),
-                self.cache_inv_std.lt["gpu", lb](),
+                in0.tt["gpu", B, Self.DIM_](),
+                out.tt["gpu", B, Self.DIM_](),
+                self.cache_xhat.tt["gpu", B, Self.DIM_](),
+                self.cache_inv_std.tt["gpu", B](),
                 grid_dim=B,
                 block_dim=LNNA_TPB,
             )
@@ -309,13 +310,13 @@ struct LayerNormNoAffine[DIM_: Int](Module):
         else:
             var c = ctx.value()
             gin.ensure_gpu(c, B * Self.DIM_)
-            comptime l2d = Layout.row_major(B, Self.DIM_)
-            comptime lb = Layout.row_major(B)
+            comptime l2d = RowMajor[B, Self.DIM_]
+            comptime lb = RowMajor[B]
             c.enqueue_function[_lnna_backward_kernel[B, Self.DIM_]](
-                grad_output.lt["gpu", l2d](),
-                self.cache_xhat.lt["gpu", l2d](),
-                self.cache_inv_std.lt["gpu", lb](),
-                gin.lt["gpu", l2d](),
+                grad_output.tt["gpu", B, Self.DIM_](),
+                self.cache_xhat.tt["gpu", B, Self.DIM_](),
+                self.cache_inv_std.tt["gpu", B](),
+                gin.tt["gpu", B, Self.DIM_](),
                 grid_dim=B,
                 block_dim=LNNA_TPB,
             )

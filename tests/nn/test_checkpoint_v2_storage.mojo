@@ -13,6 +13,7 @@ Run: pixi run -e apple mojo run -I . tests/nn/test_checkpoint_v2_storage.mojo
 """
 
 from std.testing import assert_true
+from std.sys import has_accelerator
 from max.gpu.host import DeviceContext
 
 from noeira.nn.constants import DT
@@ -110,9 +111,16 @@ def main() raises:
     print("Checkpoint v3 binary (+ legacy v2 text compat)")
     var oc = _check["cpu"](None, String("/tmp/ckpt_v2_cpu.txt"))
     print("  CPU round-trip+moments:", "OK" if oc else "FAIL")
-    var c = DeviceContext()
-    var og = _check["gpu"](Optional(c), String("/tmp/ckpt_v2_gpu.txt"))
-    print("  GPU round-trip+moments:", "OK" if og else "FAIL")
+    var og = True
+    comptime if has_accelerator():
+        var c = DeviceContext()
+        og = _check["gpu"](Optional(c), String("/tmp/ckpt_v2_gpu.txt"))
+        print("  GPU round-trip+moments:", "OK" if og else "FAIL")
+    else:
+        print(
+            "  GPU round-trip+moments: SKIPPED (no accelerator;"
+            " run with -e apple / -e nvidia)"
+        )
 
     # Topology drift: load the CPU checkpoint into a wrong-sized model → raises.
     var drift_caught = False

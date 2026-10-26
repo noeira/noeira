@@ -33,7 +33,6 @@ handles a remainder round; the GPU one does not) — asserted at compile time.
 
 from std.math import exp, log
 from std.memory import alloc
-from layout import Layout, LayoutTensor
 from max.gpu.host import DeviceContext, DeviceBuffer
 
 from noeira.nn.constants import DT
@@ -58,6 +57,7 @@ from .blocks import mz_unroll_train_step_gpu, MZScratch
 from ..zero.mcts_adapters_mz import MZRepGPU, MZDynGPU, MZPredGPU
 from ..zero.sequence_replay_mcts import MCTSSequenceReplay
 from ..zero.temperature import visit_temperature
+from noeira.core.tiles import tile
 
 
 def _a(n: Int) -> Pointer[Scalar[DT], MutAnyOrigin]:
@@ -248,8 +248,7 @@ def run_muzero_selfplay_gpu_device[
         for j in range(OBS):
             h_obs[j] = Scalar[DT](cur_f[j])
         ctx.enqueue_copy(d_obs, h_obs.unsafe_ptr())
-        var obs_t = LayoutTensor[DT, Layout.row_major(N_ENVS, OBS),
-            MutAnyOrigin](d_obs.unsafe_ptr().as_unsafe_any_origin())
+        var obs_t = tile[N_ENVS, OBS](d_obs.unsafe_ptr().as_unsafe_any_origin())
         planner.search_gpu[
             type_of(rep_a),
             type_of(dyn_a),
@@ -374,8 +373,7 @@ def run_muzero_selfplay_gpu_device[
             var rpos = rb.sample_position()
             rb.read_obs(rpos[0], rpos[1], h_obs)
             ctx.enqueue_copy(d_obs, h_obs.unsafe_ptr())
-            var robs_t = LayoutTensor[DT, Layout.row_major(N_ENVS, OBS),
-                MutAnyOrigin](d_obs.unsafe_ptr().as_unsafe_any_origin())
+            var robs_t = tile[N_ENVS, OBS](d_obs.unsafe_ptr().as_unsafe_any_origin())
             planner.search_gpu[
                 type_of(rep_a),
                 type_of(dyn_a),
@@ -400,9 +398,7 @@ def run_muzero_selfplay_gpu_device[
                     for j in range(OBS):
                         h_obs[j] = Scalar[DT](eo_f[j])
                     ctx.enqueue_copy(d_obs, h_obs.unsafe_ptr())
-                    var eobs_t = LayoutTensor[DT,
-                        Layout.row_major(N_ENVS, OBS), MutAnyOrigin](
-                            d_obs.unsafe_ptr().as_unsafe_any_origin())
+                    var eobs_t = tile[N_ENVS, OBS](d_obs.unsafe_ptr().as_unsafe_any_origin())
                     eval_planner.search_gpu[
                         type_of(rep_a),
                         type_of(dyn_a),
@@ -595,8 +591,7 @@ def run_muzero_gumbel_selfplay_gpu[
         for j in range(OBS):
             h_obs[j] = Scalar[DT](cur_f[j])
         ctx.enqueue_copy(d_obs, h_obs.unsafe_ptr())
-        var obs_t = LayoutTensor[DT, Layout.row_major(N_ENVS, OBS),
-            MutAnyOrigin](d_obs.unsafe_ptr().as_unsafe_any_origin())
+        var obs_t = tile[N_ENVS, OBS](d_obs.unsafe_ptr().as_unsafe_any_origin())
         planner.search_gpu[
             type_of(rep_a), type_of(dyn_a), type_of(pred_a),
         ](ctx, rep_a, dyn_a, pred_a, obs_t,
@@ -714,8 +709,7 @@ def run_muzero_gumbel_selfplay_gpu[
             var rpos = rb.sample_position()
             rb.read_obs(rpos[0], rpos[1], h_obs)
             ctx.enqueue_copy(d_obs, h_obs.unsafe_ptr())
-            var robs_t = LayoutTensor[DT, Layout.row_major(N_ENVS, OBS),
-                MutAnyOrigin](d_obs.unsafe_ptr().as_unsafe_any_origin())
+            var robs_t = tile[N_ENVS, OBS](d_obs.unsafe_ptr().as_unsafe_any_origin())
             planner.search_gpu[
                 type_of(rep_a),
                 type_of(dyn_a),
@@ -741,9 +735,7 @@ def run_muzero_gumbel_selfplay_gpu[
                     for j in range(OBS):
                         h_obs[j] = Scalar[DT](eo_f[j])
                     ctx.enqueue_copy(d_obs, h_obs.unsafe_ptr())
-                    var eobs_t = LayoutTensor[DT,
-                        Layout.row_major(N_ENVS, OBS), MutAnyOrigin](
-                            d_obs.unsafe_ptr().as_unsafe_any_origin())
+                    var eobs_t = tile[N_ENVS, OBS](d_obs.unsafe_ptr().as_unsafe_any_origin())
                     planner.search_gpu[
                         type_of(rep_a),
                         type_of(dyn_a),

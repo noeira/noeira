@@ -47,7 +47,6 @@ the room writes `cmd` and `G1W_CMD_TIMER = -1` and the hook never redraws.
 
 from std.math import exp, sqrt
 from std.random.philox import Random as PhiloxRandom
-from layout import Layout, LayoutTensor
 from noeira.nn.core.tensor import TensorImpl
 from noeira.physics3d.fields import Data, DimsLike
 from noeira.physics3d.gpu.constants import (
@@ -88,6 +87,7 @@ from .unitree_g1_pd import (
     g1_pos_lower,
     g1_pos_upper,
 )
+from noeira.core.tiles import Tile
 
 
 # ── observation ───────────────────────────────────────────────────────────
@@ -110,7 +110,7 @@ comptime G1_WALK_NOISE_QD: Float64 = 1.5
 # ── action ────────────────────────────────────────────────────────────────
 
 comptime G1_WALK_ACTION_SCALE: Float64 = 0.25
-"""rad per unit action — RoboParty's `action_scale` (Playground: 0.5)."""
+"""Radians per unit action — RoboParty's `action_scale` (Playground: 0.5)."""
 comptime G1_WALK_ACTION_CLIP: Float64 = 2.0
 """A Gaussian policy is unbounded; +-2 caps a target at +-0.5 rad off
 default — Playground's range (tanh x 0.5). ⚠ Run s2 had +-4 (+-1 rad) and
@@ -382,12 +382,8 @@ def _lower_leg_side(b: Int) -> Int:
 def g1_walk_contacts[
     DTYPE: DType, BATCH_SIZE: Int, MC_F: Int
 ](
-    contacts: LayoutTensor[
-        DTYPE, Layout.row_major(BATCH_SIZE, MC_F * CONTACT_SIZE), MutAnyOrigin
-    ],
-    meta: LayoutTensor[
-        DTYPE, Layout.row_major(BATCH_SIZE, METADATA_SIZE), MutAnyOrigin
-    ],
+    contacts: Tile[DTYPE, BATCH_SIZE, MC_F * CONTACT_SIZE],
+    meta: Tile[DTYPE, BATCH_SIZE, METADATA_SIZE],
     env: Int,
 ) -> Tuple[Bool, Bool, Bool]:
     """(left foot on the floor, right foot on the floor, a fall contact).
@@ -441,20 +437,12 @@ def g1_walk_terms[
     ACTION_DIM: Int,
     MC_F: Int,
 ](
-    qpos: LayoutTensor[DTYPE, Layout.row_major(BATCH_SIZE, NQ), MutAnyOrigin],
-    qvel: LayoutTensor[DTYPE, Layout.row_major(BATCH_SIZE, NV), MutAnyOrigin],
-    xangvel: LayoutTensor[
-        DTYPE, Layout.row_major(BATCH_SIZE, NBODY * 3), MutAnyOrigin
-    ],
-    contacts: LayoutTensor[
-        DTYPE, Layout.row_major(BATCH_SIZE, MC_F * CONTACT_SIZE), MutAnyOrigin
-    ],
-    meta: LayoutTensor[
-        DTYPE, Layout.row_major(BATCH_SIZE, METADATA_SIZE), MutAnyOrigin
-    ],
-    actions: LayoutTensor[
-        DTYPE, Layout.row_major(BATCH_SIZE, ACTION_DIM), MutAnyOrigin
-    ],
+    qpos: Tile[DTYPE, BATCH_SIZE, NQ],
+    qvel: Tile[DTYPE, BATCH_SIZE, NV],
+    xangvel: Tile[DTYPE, BATCH_SIZE, NBODY * 3],
+    contacts: Tile[DTYPE, BATCH_SIZE, MC_F * CONTACT_SIZE],
+    meta: Tile[DTYPE, BATCH_SIZE, METADATA_SIZE],
+    actions: Tile[DTYPE, BATCH_SIZE, ACTION_DIM],
     env: Int,
     mut terms: Array[Float64, G1_WALK_N_TERMS],
 ) -> Bool:
@@ -598,11 +586,9 @@ def g1_walk_reward(terms: Array[Float64, G1_WALK_N_TERMS]) -> Float64:
 def g1_walk_pre_step[
     DTYPE: DType, BATCH_SIZE: Int, NQ: Int, NV: Int, PUSHES: Bool
 ](
-    qpos: LayoutTensor[DTYPE, Layout.row_major(BATCH_SIZE, NQ), MutAnyOrigin],
-    qvel: LayoutTensor[DTYPE, Layout.row_major(BATCH_SIZE, NV), MutAnyOrigin],
-    meta: LayoutTensor[
-        DTYPE, Layout.row_major(BATCH_SIZE, METADATA_SIZE), MutAnyOrigin
-    ],
+    qpos: Tile[DTYPE, BATCH_SIZE, NQ],
+    qvel: Tile[DTYPE, BATCH_SIZE, NV],
+    meta: Tile[DTYPE, BATCH_SIZE, METADATA_SIZE],
     env: Int,
 ):
     """Before physics: count down, redraw the command, kick the root.
@@ -646,11 +632,9 @@ def g1_walk_pre_step[
 def g1_walk_init[
     DTYPE: DType, BATCH_SIZE: Int, NQ: Int, NV: Int, RANDOM: Bool
 ](
-    qpos: LayoutTensor[DTYPE, Layout.row_major(BATCH_SIZE, NQ), MutAnyOrigin],
-    qvel: LayoutTensor[DTYPE, Layout.row_major(BATCH_SIZE, NV), MutAnyOrigin],
-    meta: LayoutTensor[
-        DTYPE, Layout.row_major(BATCH_SIZE, METADATA_SIZE), MutAnyOrigin
-    ],
+    qpos: Tile[DTYPE, BATCH_SIZE, NQ],
+    qvel: Tile[DTYPE, BATCH_SIZE, NV],
+    meta: Tile[DTYPE, BATCH_SIZE, METADATA_SIZE],
     env: Int,
     seed: Int,
 ):
@@ -727,14 +711,10 @@ def g1_walk_init[
 def g1_walk_obs[
     DTYPE: DType, BATCH_SIZE: Int, NQ: Int, NV: Int, OBS_DIM: Int, NOISE: Bool
 ](
-    qpos: LayoutTensor[DTYPE, Layout.row_major(BATCH_SIZE, NQ), MutAnyOrigin],
-    qvel: LayoutTensor[DTYPE, Layout.row_major(BATCH_SIZE, NV), MutAnyOrigin],
-    meta: LayoutTensor[
-        DTYPE, Layout.row_major(BATCH_SIZE, METADATA_SIZE), MutAnyOrigin
-    ],
-    obs: LayoutTensor[
-        DTYPE, Layout.row_major(BATCH_SIZE, OBS_DIM), MutAnyOrigin
-    ],
+    qpos: Tile[DTYPE, BATCH_SIZE, NQ],
+    qvel: Tile[DTYPE, BATCH_SIZE, NV],
+    meta: Tile[DTYPE, BATCH_SIZE, METADATA_SIZE],
+    obs: Tile[DTYPE, BATCH_SIZE, OBS_DIM],
     env: Int,
 ):
     """The 70-D observation (module docstring), with Playground's uniform
@@ -878,10 +858,10 @@ struct UnitreeG1WalkConfig[TRAIN: Bool = True](Phyics3dEnvConfig):
         var m = _host_copy(d.meta, METADATA_SIZE)
         var o = TensorImpl[DTYPE].alloc(G1_WALK_OBS_DIM)
         g1_walk_obs[DTYPE, 1, D.NQ, D.NV, G1_WALK_OBS_DIM, False](
-            q.lt["cpu", Layout.row_major(1, D.NQ)](),
-            v.lt["cpu", Layout.row_major(1, D.NV)](),
-            m.lt["cpu", Layout.row_major(1, METADATA_SIZE)](),
-            o.lt["cpu", Layout.row_major(1, G1_WALK_OBS_DIM)](),
+            q.tt["cpu", 1, D.NQ](),
+            v.tt["cpu", 1, D.NV](),
+            m.tt["cpu", 1, METADATA_SIZE](),
+            o.tt["cpu", 1, G1_WALK_OBS_DIM](),
             0,
         )
         for i in range(G1_WALK_OBS_DIM):
@@ -900,9 +880,9 @@ struct UnitreeG1WalkConfig[TRAIN: Bool = True](Phyics3dEnvConfig):
         a CPU env's random reset is one fixed draw — the eval resets with
         `g1_walk_host_init` and its own seed instead."""
         g1_walk_init[DTYPE, 1, D.NQ, D.NV, Self.TRAIN](
-            d.qpos.lt["cpu", Layout.row_major(1, D.NQ)](),
-            d.qvel.lt["cpu", Layout.row_major(1, D.NV)](),
-            d.meta.lt["cpu", Layout.row_major(1, METADATA_SIZE)](),
+            d.qpos.tt["cpu", 1, D.NQ](),
+            d.qvel.tt["cpu", 1, D.NV](),
+            d.meta.tt["cpu", 1, METADATA_SIZE](),
             0, 0,
         )
 
@@ -930,8 +910,8 @@ struct UnitreeG1WalkConfig[TRAIN: Bool = True](Phyics3dEnvConfig):
         var c = _host_copy(d.contacts, D.MAX_CONTACTS * CONTACT_SIZE)
         var m = _host_copy(d.meta, METADATA_SIZE)
         var fc = g1_walk_contacts[DTYPE, 1, D.MAX_CONTACTS](
-            c.lt["cpu", Layout.row_major(1, D.MAX_CONTACTS * CONTACT_SIZE)](),
-            m.lt["cpu", Layout.row_major(1, METADATA_SIZE)](),
+            c.tt["cpu", 1, D.MAX_CONTACTS * CONTACT_SIZE](),
+            m.tt["cpu", 1, METADATA_SIZE](),
             0,
         )
         var fallen = (
@@ -963,38 +943,16 @@ struct UnitreeG1WalkConfig[TRAIN: Bool = True](Phyics3dEnvConfig):
         NA_F: Int,
         NACT_F: Int,
     ](
-        qfrc: LayoutTensor[
-            DTYPE, Layout.row_major(BATCH_SIZE, NV), MutAnyOrigin
-        ],
-        actions: LayoutTensor[
-            DTYPE, Layout.row_major(BATCH_SIZE, ACTION_DIM), MutAnyOrigin
-        ],
-        qpos: LayoutTensor[
-            DTYPE, Layout.row_major(BATCH_SIZE, NQ), MutAnyOrigin
-        ],
-        qvel: LayoutTensor[
-            DTYPE, Layout.row_major(BATCH_SIZE, NV), MutAnyOrigin
-        ],
-        act: LayoutTensor[
-            DTYPE, Layout.row_major(BATCH_SIZE, NA_F), MutAnyOrigin
-        ],
-        meta: LayoutTensor[
-            DTYPE, Layout.row_major(BATCH_SIZE, METADATA_SIZE), MutAnyOrigin
-        ],
-        joints: LayoutTensor[
-            DTYPE, Layout.row_major(NJOINT, MODEL_JOINT_SIZE), MutAnyOrigin
-        ],
-        tendons: LayoutTensor[
-            DTYPE, Layout.row_major(NTENDON_F, MODEL_TENDON_SIZE), MutAnyOrigin
-        ],
-        acts: LayoutTensor[
-            DTYPE, Layout.row_major(NACT_F * MODEL_ACTUATOR_SIZE), MutAnyOrigin
-        ],
-        act_tendons: LayoutTensor[
-            DTYPE,
-            Layout.row_major(NTENDON_F * MODEL_ACT_TENDON_SIZE),
-            MutAnyOrigin,
-        ],
+        qfrc: Tile[DTYPE, BATCH_SIZE, NV],
+        actions: Tile[DTYPE, BATCH_SIZE, ACTION_DIM],
+        qpos: Tile[DTYPE, BATCH_SIZE, NQ],
+        qvel: Tile[DTYPE, BATCH_SIZE, NV],
+        act: Tile[DTYPE, BATCH_SIZE, NA_F],
+        meta: Tile[DTYPE, BATCH_SIZE, METADATA_SIZE],
+        joints: Tile[DTYPE, NJOINT, MODEL_JOINT_SIZE],
+        tendons: Tile[DTYPE, NTENDON_F, MODEL_TENDON_SIZE],
+        acts: Tile[DTYPE, NACT_F * MODEL_ACTUATOR_SIZE],
+        act_tendons: Tile[DTYPE, NTENDON_F * MODEL_ACT_TENDON_SIZE],
         env: Int,
     ):
         """The CPU hook's twin, one lane, every substep."""
@@ -1021,15 +979,9 @@ struct UnitreeG1WalkConfig[TRAIN: Bool = True](Phyics3dEnvConfig):
         NQ: Int,
         NV: Int,
     ](
-        qpos: LayoutTensor[
-            DTYPE, Layout.row_major(BATCH_SIZE, NQ), MutAnyOrigin
-        ],
-        qvel: LayoutTensor[
-            DTYPE, Layout.row_major(BATCH_SIZE, NV), MutAnyOrigin
-        ],
-        meta: LayoutTensor[
-            DTYPE, Layout.row_major(BATCH_SIZE, METADATA_SIZE), MutAnyOrigin
-        ],
+        qpos: Tile[DTYPE, BATCH_SIZE, NQ],
+        qvel: Tile[DTYPE, BATCH_SIZE, NV],
+        meta: Tile[DTYPE, BATCH_SIZE, METADATA_SIZE],
         env: Int,
     ):
         g1_walk_pre_step[DTYPE, BATCH_SIZE, NQ, NV, Self.TRAIN](
@@ -1051,71 +1003,27 @@ struct UnitreeG1WalkConfig[TRAIN: Bool = True](Phyics3dEnvConfig):
         NGEOM_F: Int,
         NA_F: Int,
     ](
-        qpos: LayoutTensor[
-            DTYPE, Layout.row_major(BATCH_SIZE, NQ), MutAnyOrigin
-        ],
-        qvel: LayoutTensor[
-            DTYPE, Layout.row_major(BATCH_SIZE, NV), MutAnyOrigin
-        ],
-        xpos: LayoutTensor[
-            DTYPE, Layout.row_major(BATCH_SIZE, NBODY * 3), MutAnyOrigin
-        ],
-        xquat: LayoutTensor[
-            DTYPE, Layout.row_major(BATCH_SIZE, NBODY * 4), MutAnyOrigin
-        ],
-        xvel: LayoutTensor[
-            DTYPE, Layout.row_major(BATCH_SIZE, NBODY * 3), MutAnyOrigin
-        ],
-        bodies: LayoutTensor[
-            DTYPE, Layout.row_major(NBODY, MODEL_BODY_SIZE), MutAnyOrigin
-        ],
-        site_xpos: LayoutTensor[
-            DTYPE, Layout.row_major(BATCH_SIZE, SITE_DIM), MutAnyOrigin
-        ],
-        contacts: LayoutTensor[
-            DTYPE,
-            Layout.row_major(BATCH_SIZE, MC_F * CONTACT_SIZE),
-            MutAnyOrigin,
-        ],
-        sites: LayoutTensor[
-            DTYPE, Layout.row_major(NSITE_F, MODEL_SITE_SIZE), MutAnyOrigin
-        ],
-        geoms: LayoutTensor[
-            DTYPE, Layout.row_major(NGEOM_F, MODEL_GEOM_SIZE), MutAnyOrigin
-        ],
-        meta: LayoutTensor[
-            DTYPE, Layout.row_major(BATCH_SIZE, METADATA_SIZE), MutAnyOrigin
-        ],
-        obs: LayoutTensor[
-            DTYPE, Layout.row_major(BATCH_SIZE, OBS_DIM), MutAnyOrigin
-        ],
-        xipos: LayoutTensor[
-            DTYPE, Layout.row_major(BATCH_SIZE, NBODY * 3), MutAnyOrigin
-        ],
-        xangvel: LayoutTensor[
-            DTYPE, Layout.row_major(BATCH_SIZE, NBODY * 3), MutAnyOrigin
-        ],
-        cvel: LayoutTensor[
-            DTYPE, Layout.row_major(BATCH_SIZE, NBODY * 6), MutAnyOrigin
-        ],
-        cacc: LayoutTensor[
-            DTYPE, Layout.row_major(BATCH_SIZE, NBODY * 6), MutAnyOrigin
-        ],
-        cfrc_int: LayoutTensor[
-            DTYPE, Layout.row_major(BATCH_SIZE, NBODY * 6), MutAnyOrigin
-        ],
-        subtree_com: LayoutTensor[
-            DTYPE, Layout.row_major(BATCH_SIZE, NBODY * 3), MutAnyOrigin
-        ],
-        site_xpos_acc: LayoutTensor[
-            DTYPE, Layout.row_major(BATCH_SIZE, SITE_DIM), MutAnyOrigin
-        ],
-        xquat_acc: LayoutTensor[
-            DTYPE, Layout.row_major(BATCH_SIZE, NBODY * 4), MutAnyOrigin
-        ],
-        act: LayoutTensor[
-            DTYPE, Layout.row_major(BATCH_SIZE, NA_F), MutAnyOrigin
-        ],
+        qpos: Tile[DTYPE, BATCH_SIZE, NQ],
+        qvel: Tile[DTYPE, BATCH_SIZE, NV],
+        xpos: Tile[DTYPE, BATCH_SIZE, NBODY * 3],
+        xquat: Tile[DTYPE, BATCH_SIZE, NBODY * 4],
+        xvel: Tile[DTYPE, BATCH_SIZE, NBODY * 3],
+        bodies: Tile[DTYPE, NBODY, MODEL_BODY_SIZE],
+        site_xpos: Tile[DTYPE, BATCH_SIZE, SITE_DIM],
+        contacts: Tile[DTYPE, BATCH_SIZE, MC_F * CONTACT_SIZE],
+        sites: Tile[DTYPE, NSITE_F, MODEL_SITE_SIZE],
+        geoms: Tile[DTYPE, NGEOM_F, MODEL_GEOM_SIZE],
+        meta: Tile[DTYPE, BATCH_SIZE, METADATA_SIZE],
+        obs: Tile[DTYPE, BATCH_SIZE, OBS_DIM],
+        xipos: Tile[DTYPE, BATCH_SIZE, NBODY * 3],
+        xangvel: Tile[DTYPE, BATCH_SIZE, NBODY * 3],
+        cvel: Tile[DTYPE, BATCH_SIZE, NBODY * 6],
+        cacc: Tile[DTYPE, BATCH_SIZE, NBODY * 6],
+        cfrc_int: Tile[DTYPE, BATCH_SIZE, NBODY * 6],
+        subtree_com: Tile[DTYPE, BATCH_SIZE, NBODY * 3],
+        site_xpos_acc: Tile[DTYPE, BATCH_SIZE, SITE_DIM],
+        xquat_acc: Tile[DTYPE, BATCH_SIZE, NBODY * 4],
+        act: Tile[DTYPE, BATCH_SIZE, NA_F],
         env: Int,
     ) -> Bool:
         g1_walk_obs[DTYPE, BATCH_SIZE, NQ, NV, OBS_DIM, Self.TRAIN](
@@ -1138,77 +1046,29 @@ struct UnitreeG1WalkConfig[TRAIN: Bool = True](Phyics3dEnvConfig):
         NGEOM_F: Int,
         NA_F: Int,
     ](
-        qpos: LayoutTensor[
-            DTYPE, Layout.row_major(BATCH_SIZE, NQ), MutAnyOrigin
-        ],
-        qvel: LayoutTensor[
-            DTYPE, Layout.row_major(BATCH_SIZE, NV), MutAnyOrigin
-        ],
-        xpos: LayoutTensor[
-            DTYPE, Layout.row_major(BATCH_SIZE, NBODY * 3), MutAnyOrigin
-        ],
-        xipos: LayoutTensor[
-            DTYPE, Layout.row_major(BATCH_SIZE, NBODY * 3), MutAnyOrigin
-        ],
-        xquat: LayoutTensor[
-            DTYPE, Layout.row_major(BATCH_SIZE, NBODY * 4), MutAnyOrigin
-        ],
-        xvel: LayoutTensor[
-            DTYPE, Layout.row_major(BATCH_SIZE, NBODY * 3), MutAnyOrigin
-        ],
-        bodies: LayoutTensor[
-            DTYPE, Layout.row_major(NBODY, MODEL_BODY_SIZE), MutAnyOrigin
-        ],
-        site_xpos: LayoutTensor[
-            DTYPE, Layout.row_major(BATCH_SIZE, SITE_DIM), MutAnyOrigin
-        ],
-        contacts: LayoutTensor[
-            DTYPE,
-            Layout.row_major(BATCH_SIZE, MC_F * CONTACT_SIZE),
-            MutAnyOrigin,
-        ],
-        sites: LayoutTensor[
-            DTYPE, Layout.row_major(NSITE_F, MODEL_SITE_SIZE), MutAnyOrigin
-        ],
-        geoms: LayoutTensor[
-            DTYPE, Layout.row_major(NGEOM_F, MODEL_GEOM_SIZE), MutAnyOrigin
-        ],
-        cfrc_ext: LayoutTensor[
-            DTYPE, Layout.row_major(BATCH_SIZE, NBODY * 6), MutAnyOrigin
-        ],
-        cvel: LayoutTensor[
-            DTYPE, Layout.row_major(BATCH_SIZE, NBODY * 6), MutAnyOrigin
-        ],
-        meta: LayoutTensor[
-            DTYPE, Layout.row_major(BATCH_SIZE, METADATA_SIZE), MutAnyOrigin
-        ],
-        curriculum: LayoutTensor[
-            DTYPE, Layout.row_major(1, MODEL_CURRICULUM_SIZE), MutAnyOrigin
-        ],
-        actions: LayoutTensor[
-            DTYPE, Layout.row_major(BATCH_SIZE, ACTION_DIM), MutAnyOrigin
-        ],
-        xangvel: LayoutTensor[
-            DTYPE, Layout.row_major(BATCH_SIZE, NBODY * 3), MutAnyOrigin
-        ],
-        cacc: LayoutTensor[
-            DTYPE, Layout.row_major(BATCH_SIZE, NBODY * 6), MutAnyOrigin
-        ],
-        cfrc_int: LayoutTensor[
-            DTYPE, Layout.row_major(BATCH_SIZE, NBODY * 6), MutAnyOrigin
-        ],
-        subtree_com: LayoutTensor[
-            DTYPE, Layout.row_major(BATCH_SIZE, NBODY * 3), MutAnyOrigin
-        ],
-        site_xpos_acc: LayoutTensor[
-            DTYPE, Layout.row_major(BATCH_SIZE, SITE_DIM), MutAnyOrigin
-        ],
-        xquat_acc: LayoutTensor[
-            DTYPE, Layout.row_major(BATCH_SIZE, NBODY * 4), MutAnyOrigin
-        ],
-        act: LayoutTensor[
-            DTYPE, Layout.row_major(BATCH_SIZE, NA_F), MutAnyOrigin
-        ],
+        qpos: Tile[DTYPE, BATCH_SIZE, NQ],
+        qvel: Tile[DTYPE, BATCH_SIZE, NV],
+        xpos: Tile[DTYPE, BATCH_SIZE, NBODY * 3],
+        xipos: Tile[DTYPE, BATCH_SIZE, NBODY * 3],
+        xquat: Tile[DTYPE, BATCH_SIZE, NBODY * 4],
+        xvel: Tile[DTYPE, BATCH_SIZE, NBODY * 3],
+        bodies: Tile[DTYPE, NBODY, MODEL_BODY_SIZE],
+        site_xpos: Tile[DTYPE, BATCH_SIZE, SITE_DIM],
+        contacts: Tile[DTYPE, BATCH_SIZE, MC_F * CONTACT_SIZE],
+        sites: Tile[DTYPE, NSITE_F, MODEL_SITE_SIZE],
+        geoms: Tile[DTYPE, NGEOM_F, MODEL_GEOM_SIZE],
+        cfrc_ext: Tile[DTYPE, BATCH_SIZE, NBODY * 6],
+        cvel: Tile[DTYPE, BATCH_SIZE, NBODY * 6],
+        meta: Tile[DTYPE, BATCH_SIZE, METADATA_SIZE],
+        curriculum: Tile[DTYPE, 1, MODEL_CURRICULUM_SIZE],
+        actions: Tile[DTYPE, BATCH_SIZE, ACTION_DIM],
+        xangvel: Tile[DTYPE, BATCH_SIZE, NBODY * 3],
+        cacc: Tile[DTYPE, BATCH_SIZE, NBODY * 6],
+        cfrc_int: Tile[DTYPE, BATCH_SIZE, NBODY * 6],
+        subtree_com: Tile[DTYPE, BATCH_SIZE, NBODY * 3],
+        site_xpos_acc: Tile[DTYPE, BATCH_SIZE, SITE_DIM],
+        xquat_acc: Tile[DTYPE, BATCH_SIZE, NBODY * 4],
+        act: Tile[DTYPE, BATCH_SIZE, NA_F],
         env: Int,
         step_count: Int,
         frame_skip: Int,
@@ -1231,30 +1091,14 @@ struct UnitreeG1WalkConfig[TRAIN: Bool = True](Phyics3dEnvConfig):
         NBODY: Int,
         NGEOM_F: Int,
     ](
-        qpos: LayoutTensor[
-            DTYPE, Layout.row_major(BATCH_SIZE, NQ), MutAnyOrigin
-        ],
-        qvel: LayoutTensor[
-            DTYPE, Layout.row_major(BATCH_SIZE, NV), MutAnyOrigin
-        ],
-        joints: LayoutTensor[
-            DTYPE, Layout.row_major(NJOINT, MODEL_JOINT_SIZE), MutAnyOrigin
-        ],
-        mocap_pos: LayoutTensor[
-            DTYPE, Layout.row_major(BATCH_SIZE, NBODY * 3), MutAnyOrigin
-        ],
-        mocap_quat: LayoutTensor[
-            DTYPE, Layout.row_major(BATCH_SIZE, NBODY * 4), MutAnyOrigin
-        ],
-        bodies: LayoutTensor[
-            DTYPE, Layout.row_major(NBODY, MODEL_BODY_SIZE), MutAnyOrigin
-        ],
-        geoms: LayoutTensor[
-            DTYPE, Layout.row_major(NGEOM_F, MODEL_GEOM_SIZE), MutAnyOrigin
-        ],
-        meta: LayoutTensor[
-            DTYPE, Layout.row_major(BATCH_SIZE, METADATA_SIZE), MutAnyOrigin
-        ],
+        qpos: Tile[DTYPE, BATCH_SIZE, NQ],
+        qvel: Tile[DTYPE, BATCH_SIZE, NV],
+        joints: Tile[DTYPE, NJOINT, MODEL_JOINT_SIZE],
+        mocap_pos: Tile[DTYPE, BATCH_SIZE, NBODY * 3],
+        mocap_quat: Tile[DTYPE, BATCH_SIZE, NBODY * 4],
+        bodies: Tile[DTYPE, NBODY, MODEL_BODY_SIZE],
+        geoms: Tile[DTYPE, NGEOM_F, MODEL_GEOM_SIZE],
+        meta: Tile[DTYPE, BATCH_SIZE, METADATA_SIZE],
         env: Int,
         seed: Int,
     ):

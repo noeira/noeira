@@ -16,7 +16,7 @@ Reference: gymnasium/envs/box2d/car_dynamics.py, lines 171-266
 """
 
 from std.math import sqrt, cos, sin
-from layout import LayoutTensor, Layout
+from noeira.core.tiles import RowMajor, Tile
 
 from .constants import (
     # Physics constants
@@ -340,11 +340,7 @@ struct WheelFriction:
         CONTROLS_OFFSET: Int,
     ](
         env: Int,
-        state: LayoutTensor[
-            dtype,
-            Layout.row_major(BATCH, STATE_SIZE),
-            MutAnyOrigin,
-        ],
+        state: Tile[dtype, BATCH, STATE_SIZE],
         friction_limits: Array[Scalar[dtype], NUM_WHEELS],
         dt: Scalar[dtype],
     ) -> Tuple[Scalar[dtype], Scalar[dtype], Scalar[dtype]]:
@@ -453,21 +449,9 @@ struct WheelFriction:
         WHEELS_OFFSET: Int,
         CONTROLS_OFFSET: Int,
     ](
-        state: LayoutTensor[
-            dtype,
-            Layout.row_major(BATCH, STATE_SIZE),
-            MutAnyOrigin,
-        ],
-        friction_limits: LayoutTensor[
-            dtype,
-            Layout.row_major(BATCH, NUM_WHEELS),
-            MutAnyOrigin,
-        ],
-        mut forces: LayoutTensor[
-            dtype,
-            Layout.row_major(BATCH, 3),  # [fx, fy, torque]
-            MutAnyOrigin,
-        ],
+        state: Tile[dtype, BATCH, STATE_SIZE],
+        friction_limits: Tile[dtype, BATCH, NUM_WHEELS],
+        forces: Tile[dtype, BATCH, 3],
         dt: Scalar[dtype],
     ):
         """Compute wheel forces for all environments (CPU).

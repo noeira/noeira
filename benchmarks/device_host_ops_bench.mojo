@@ -23,7 +23,7 @@ from std.time import perf_counter_ns
 
 from max.gpu import global_idx
 from max.gpu.host import DeviceContext, DeviceBuffer, HostBuffer
-from layout import Layout, LayoutTensor
+from noeira.core.tiles import RowMajor, Tile, tile
 
 from noeira.nn.constants import DT
 from noeira.nn.core.tensor import Tensor
@@ -38,7 +38,7 @@ comptime REPS = 5
 
 
 def _touch_kernel(
-    x: LayoutTensor[DT, Layout.row_major(N), MutAnyOrigin],
+    x: Tile[DT, N],
 ):
     var i = Int(global_idx.x)
     if i < N:
@@ -97,7 +97,7 @@ def main() raises:
     var small_host = ctx.enqueue_create_host_buffer[DT](4)
     var small_dev = ctx.enqueue_create_buffer[DT](4)
     ctx.synchronize()
-    comptime lay = Layout.row_major(N)
+    comptime lay = RowMajor[N]
 
     # 0. kernel launch — the floor
     var best = 1.0e30
@@ -106,7 +106,7 @@ def main() raises:
         var t0 = perf_counter_ns()
         for _ in range(N_CALLS):
             ctx.enqueue_function[_touch_kernel](
-                a.lt["gpu", lay](), grid_dim=(N + 255) // 256, block_dim=256
+                a.tt["gpu", N](), grid_dim=(N + 255) // 256, block_dim=256
             )
         var t_enq = Float64(perf_counter_ns() - t0) / 1e3 / N_CALLS
         ctx.synchronize()
@@ -161,7 +161,7 @@ def main() raises:
         var t0 = perf_counter_ns()
         for _ in range(N_CALLS):
             var tmp = ctx.enqueue_create_buffer[DT](N)
-            var tv = LayoutTensor[DT, lay, MutAnyOrigin](tmp)
+            var tv = tile[N](tmp)
             ctx.enqueue_function[_touch_kernel](
                 tv, grid_dim=(N + 255) // 256, block_dim=256
             )
@@ -313,7 +313,7 @@ def main() raises:
         var t0 = perf_counter_ns()
         for _ in range(N_CALLS // 10):
             ctx.enqueue_function[_touch_kernel](
-                a.lt["gpu", lay](), grid_dim=(N + 255) // 256, block_dim=256
+                a.tt["gpu", N](), grid_dim=(N + 255) // 256, block_dim=256
             )
             var ev = ctx.create_event()
             ev.synchronize()

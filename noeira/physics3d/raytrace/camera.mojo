@@ -26,7 +26,7 @@ other side.
 """
 
 from std.math import sqrt
-from layout import Layout, LayoutTensor
+from layout import TileTensor, TensorLayout
 
 from noeira.math3d import Vec3 as Vec3Generic, Quat as QuatGeneric
 
@@ -112,15 +112,15 @@ def _axes_of[
 
 def camera_world_frame[
     DTYPE: DType,
-    L_CAM: Layout,
-    L_XPOS: Layout,
-    L_XQUAT: Layout,
-    L_COM: Layout,
+    L_CAM: TensorLayout,
+    L_XPOS: TensorLayout,
+    L_XQUAT: TensorLayout,
+    L_COM: TensorLayout,
 ](
-    cameras: LayoutTensor[DTYPE, L_CAM, MutAnyOrigin],
-    xpos: LayoutTensor[DTYPE, L_XPOS, MutAnyOrigin],
-    xquat: LayoutTensor[DTYPE, L_XQUAT, MutAnyOrigin],
-    subtree_com: LayoutTensor[DTYPE, L_COM, MutAnyOrigin],
+    cameras: TileTensor[DTYPE, L_CAM, MutAnyOrigin],
+    xpos: TileTensor[DTYPE, L_XPOS, MutAnyOrigin],
+    xquat: TileTensor[DTYPE, L_XQUAT, MutAnyOrigin],
+    subtree_com: TileTensor[DTYPE, L_COM, MutAnyOrigin],
     env: Int,
     cam: Int,
 ) -> CameraFrame[DTYPE] where DTYPE.is_floating_point():

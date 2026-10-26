@@ -205,10 +205,11 @@ harness reports that as "unsupported here", not as a failure. Run it on the
 
 from std.math import ceildiv
 from std.os import getenv
-from std.sys import has_nvidia_gpu_accelerator
+from std.sys import default_accelerator
 from std.time import perf_counter_ns
 
-from layout import Layout, LayoutTensor, TileTensor, row_major
+from layout import TileTensor, row_major
+from noeira.core.tiles import Tile, tile
 from max.gpu.host import (
     DeviceBuffer,
     DeviceContext,
@@ -277,7 +278,7 @@ def _fill_ptr(
 
 
 def _fill_lt(
-    buf: LayoutTensor[DT, Layout.row_major(N), MutAnyOrigin], val: Int32
+    buf: Tile[DT, N], val: Int32
 ):
     var tid = Int(global_idx.x)
     if tid >= N:
@@ -286,7 +287,7 @@ def _fill_lt(
 
 
 def _bump_lt(
-    buf: LayoutTensor[DT, Layout.row_major(N), MutAnyOrigin], delta: Int32
+    buf: Tile[DT, N], delta: Int32
 ):
     var tid = Int(global_idx.x)
     if tid >= N:
@@ -443,7 +444,7 @@ def arm_b(ctx: DeviceContext) raises -> Bool:
     var buf = ctx.enqueue_create_buffer[DT](N)
     buf.enqueue_fill(Scalar[DT](0))
     ctx.synchronize()
-    var lt = LayoutTensor[DT, Layout.row_major(N)](buf)
+    var lt = tile[N](buf)
 
     var fill = ctx.compile_function[_fill_lt]()
     var bump = ctx.compile_function[_bump_lt]()
@@ -921,7 +922,7 @@ def arm_e(ctx: DeviceContext) raises:
     var buf = ctx.enqueue_create_buffer[DT](N)
     buf.enqueue_fill(Scalar[DT](0))
     ctx.synchronize()
-    var lt = LayoutTensor[DT, Layout.row_major(N)](buf)
+    var lt = tile[N](buf)
     var bump = ctx.compile_function[_bump_lt]()
 
     def build(mut builder: DeviceGraphBuilder) raises {imm}:
@@ -1040,7 +1041,7 @@ def main() raises:
     print("       libcuda_intercept.so anyway — a '[intercept] ...' line below")
     print("       is THAT, not this file. Build and run the binary directly")
     print("       (see the header) to actually demonstrate independence.")
-    comptime if not has_nvidia_gpu_accelerator():
+    comptime if not default_accelerator().is_nvidia_gpu():
         print("")
         print("  ⚠ NOT AN NVIDIA DEVICE. Metal supports neither stream capture")
         print("    nor device graphs, so every arm below is expected to RAISE")
@@ -1079,7 +1080,7 @@ def main() raises:
 
     print("")
     print("=" * 76)
-    comptime if not has_nvidia_gpu_accelerator():
+    comptime if not default_accelerator().is_nvidia_gpu():
         print("  NO VERDICT — not an NVIDIA device.")
         return
     if a != 1:

@@ -28,13 +28,13 @@ PCBlockTrait conformance — callers invoke the static methods directly (the
 bidirectional generative path does not go through PCSequential).
 """
 
-from layout import Layout, LayoutTensor
 from std.sys import CompilationTarget
 
 from .pc_initializer import PCInitializer
 from .pc_apple_cblas import apple_sgemm_accum
 
 from .predictive_model import PCActivation, PCReLU
+from noeira.core.tiles import Tile, tile
 
 
 struct ConvTransposePCBlock[
@@ -82,14 +82,10 @@ struct ConvTransposePCBlock[
     def pc_init_params[
         INIT: PCInitializer, dtype: DType = DType.float32
     ](
-        mut params: LayoutTensor[
-            dtype, Layout.row_major(Self.PARAM_SIZE), MutAnyOrigin
-        ],
+        params: Tile[dtype, Self.PARAM_SIZE],
     ) raises:
         """Init: conv-transpose W via INIT.fill(fan_in/out); zero bias."""
-        var W_view = LayoutTensor[
-            dtype, Layout.row_major(Self.W_SIZE), MutAnyOrigin
-        ](params.ptr)
+        var W_view = tile[Self.W_SIZE](params.ptr)
         INIT.fill[
             Self.W_SIZE,
             Self.in_channels * Self.kernel_size * Self.kernel_size,
@@ -108,9 +104,7 @@ struct ConvTransposePCBlock[
     def _im2col_big[
         BATCH: Int, dtype: DType
     ](
-        big: LayoutTensor[
-            dtype, Layout.row_major(BATCH, Self.OUT_DIM), MutAnyOrigin
-        ],
+        big: Tile[dtype, BATCH, Self.OUT_DIM],
         mut ecol: List[Scalar[dtype]],
     ):
         for b in range(BATCH):
@@ -157,18 +151,10 @@ struct ConvTransposePCBlock[
     def predict[
         BATCH: Int, dtype: DType = DType.float32
     ](
-        x_below: LayoutTensor[
-            dtype, Layout.row_major(BATCH, Self.IN_DIM), MutAnyOrigin
-        ],
-        params: LayoutTensor[
-            dtype, Layout.row_major(Self.PARAM_SIZE), MutAnyOrigin
-        ],
-        mut mu: LayoutTensor[
-            dtype, Layout.row_major(BATCH, Self.OUT_DIM), MutAnyOrigin
-        ],
-        mut a_below: LayoutTensor[
-            dtype, Layout.row_major(BATCH, Self.IN_DIM), MutAnyOrigin
-        ],
+        x_below: Tile[dtype, BATCH, Self.IN_DIM],
+        params: Tile[dtype, Self.PARAM_SIZE],
+        mu: Tile[dtype, BATCH, Self.OUT_DIM],
+        a_below: Tile[dtype, BATCH, Self.IN_DIM],
     ):
         Self.ACT.apply[BATCH, Self.IN_DIM, dtype](x_below, a_below)
         comptime use_apple = CompilationTarget.is_macos() and (
@@ -176,9 +162,7 @@ struct ConvTransposePCBlock[
         )
         # Full param-slab view (no rebind): weight head W[0:W_SIZE] + bias tail
         # W[W_SIZE + oc]. Matches the original whole-slab pointer `wp`.
-        var W = LayoutTensor[
-            dtype, Layout.row_major(Self.PARAM_SIZE), MutAnyOrigin
-        ](params.ptr)
+        var W = tile[Self.PARAM_SIZE](params.ptr)
 
         for b in range(BATCH):
             for i in range(Self.OUT_DIM):
@@ -314,15 +298,9 @@ struct ConvTransposePCBlock[
     def eps_compute[
         BATCH: Int, dtype: DType = DType.float32
     ](
-        x_above: LayoutTensor[
-            dtype, Layout.row_major(BATCH, Self.OUT_DIM), MutAnyOrigin
-        ],
-        mu: LayoutTensor[
-            dtype, Layout.row_major(BATCH, Self.OUT_DIM), MutAnyOrigin
-        ],
-        mut eps: LayoutTensor[
-            dtype, Layout.row_major(BATCH, Self.OUT_DIM), MutAnyOrigin
-        ],
+        x_above: Tile[dtype, BATCH, Self.OUT_DIM],
+        mu: Tile[dtype, BATCH, Self.OUT_DIM],
+        eps: Tile[dtype, BATCH, Self.OUT_DIM],
     ):
         for b in range(BATCH):
             for j in range(Self.OUT_DIM):
@@ -336,23 +314,15 @@ struct ConvTransposePCBlock[
     def pull_back[
         BATCH: Int, dtype: DType = DType.float32
     ](
-        eps_above: LayoutTensor[
-            dtype, Layout.row_major(BATCH, Self.OUT_DIM), MutAnyOrigin
-        ],
-        params: LayoutTensor[
-            dtype, Layout.row_major(Self.PARAM_SIZE), MutAnyOrigin
-        ],
-        mut z_below: LayoutTensor[
-            dtype, Layout.row_major(BATCH, Self.IN_DIM), MutAnyOrigin
-        ],
+        eps_above: Tile[dtype, BATCH, Self.OUT_DIM],
+        params: Tile[dtype, Self.PARAM_SIZE],
+        z_below: Tile[dtype, BATCH, Self.IN_DIM],
     ):
         comptime use_apple = CompilationTarget.is_macos() and (
             dtype == DType.float32
         )
         # W sub-view over the param slab (no rebind).
-        var W = LayoutTensor[
-            dtype, Layout.row_major(Self.W_SIZE), MutAnyOrigin
-        ](params.ptr)
+        var W = tile[Self.W_SIZE](params.ptr)
 
         comptime if use_apple:
             # im2col(ε_big) → ecol, then z_small[ic,p] = Σ_ocol W[ic,ocol]·ecol[p,ocol]
@@ -441,15 +411,9 @@ struct ConvTransposePCBlock[
     def act_derivative_mul[
         BATCH: Int, dtype: DType = DType.float32
     ](
-        x_below: LayoutTensor[
-            dtype, Layout.row_major(BATCH, Self.IN_DIM), MutAnyOrigin
-        ],
-        z_in: LayoutTensor[
-            dtype, Layout.row_major(BATCH, Self.IN_DIM), MutAnyOrigin
-        ],
-        mut z_out: LayoutTensor[
-            dtype, Layout.row_major(BATCH, Self.IN_DIM), MutAnyOrigin
-        ],
+        x_below: Tile[dtype, BATCH, Self.IN_DIM],
+        z_in: Tile[dtype, BATCH, Self.IN_DIM],
+        z_out: Tile[dtype, BATCH, Self.IN_DIM],
     ):
         Self.ACT.apply_derivative_mul[BATCH, Self.IN_DIM, dtype](
             x_below, z_in, z_out
@@ -463,26 +427,16 @@ struct ConvTransposePCBlock[
     def weight_grad[
         BATCH: Int, dtype: DType = DType.float32
     ](
-        eps_above: LayoutTensor[
-            dtype, Layout.row_major(BATCH, Self.OUT_DIM), MutAnyOrigin
-        ],
-        a_below: LayoutTensor[
-            dtype, Layout.row_major(BATCH, Self.IN_DIM), MutAnyOrigin
-        ],
-        mut grads: LayoutTensor[
-            dtype, Layout.row_major(Self.PARAM_SIZE), MutAnyOrigin
-        ],
+        eps_above: Tile[dtype, BATCH, Self.OUT_DIM],
+        a_below: Tile[dtype, BATCH, Self.IN_DIM],
+        grads: Tile[dtype, Self.PARAM_SIZE],
     ):
         comptime use_apple = CompilationTarget.is_macos() and (
             dtype == DType.float32
         )
         # Grad slab as a flat view + W head sub-view (no rebind).
-        var grads_flat = LayoutTensor[
-            dtype, Layout.row_major(Self.PARAM_SIZE), MutAnyOrigin
-        ](grads.ptr)
-        var W_grad = LayoutTensor[
-            dtype, Layout.row_major(Self.W_SIZE), MutAnyOrigin
-        ](grads.ptr)
+        var grads_flat = tile[Self.PARAM_SIZE](grads.ptr)
+        var W_grad = tile[Self.W_SIZE](grads.ptr)
         for i in range(Self.PARAM_SIZE):
             grads_flat[i] = Scalar[dtype](0)
 

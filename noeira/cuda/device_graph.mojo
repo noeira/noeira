@@ -54,7 +54,7 @@ method on it.** Every crash in this area came from skipping it.
 
 ## Fallback is a RUNTIME latch, not a comptime no-op — and that difference bites
 
-`CUDAGraph` was `comptime if has_nvidia_gpu_accelerator()`, so off NVIDIA it
+`CUDAGraph` was `comptime if default_accelerator().is_nvidia_gpu()`, so off NVIDIA it
 compiled away and `maybe_capture_replay` ran `STEP` every call. `DeviceGraph`
 does not compile away: it links everywhere and RAISES at runtime.
 

@@ -70,11 +70,12 @@ from std.sys import has_accelerator
 from std.time import perf_counter_ns
 
 from max.gpu.host import DeviceContext
-from layout import Layout, LayoutTensor, TileTensor, row_major, Idx
-from std.sys.info import has_nvidia_gpu_accelerator
+from layout import TileTensor, row_major, Idx
+from noeira.core.tiles import RowMajor, Tile
+from std.sys.info import default_accelerator
 from nn.attention.gpu.mha import flash_attention, flash_attention_dispatch
 from nn.attention.mha_mask import NullMask
-from nn.attention.mha_operand import LayoutTensorMHAOperand
+from nn.attention.mha_operand import TileTensorMHAOperand
 
 from noeira.nn.constants import DT, TPB
 from noeira.nn.core.initializer import Deterministic
@@ -118,10 +119,10 @@ comptime POISON = 12345.0
 def _xe_scores_kernel[
     BATCH: Int, D: Int, NH: Int, Q: Int, KL: Int, H: Int, MASKED: Bool
 ](
-    q: LayoutTensor[DT, Layout.row_major(BATCH, Q * D), MutAnyOrigin],
-    k: LayoutTensor[DT, Layout.row_major(BATCH, KL * D), MutAnyOrigin],
-    mask: LayoutTensor[DT, Layout.row_major(BATCH, KL), MutAnyOrigin],
-    attn: LayoutTensor[DT, Layout.row_major(BATCH * NH * Q * KL), MutAnyOrigin],
+    q: Tile[DT, BATCH, Q * D],
+    k: Tile[DT, BATCH, KL * D],
+    mask: Tile[DT, BATCH, KL],
+    attn: Tile[DT, BATCH * NH * Q * KL],
 ):
     """One thread per (b, h, i, j), written straight into the cache layout.
 
@@ -210,17 +211,17 @@ def _launch_fused[
 ) raises:
     """One fused-kernel configuration, exactly as `_forward_gpu_fused`
     launches the shipped one."""
-    comptime lay_q = Layout.row_major(B, QL * DIM)
-    comptime lay_kv = Layout.row_major(B, KL * DIM)
-    comptime lay_m = Layout.row_major(B, KL)
+    comptime lay_q = RowMajor[B, QL * DIM]
+    comptime lay_kv = RowMajor[B, KL * DIM]
+    comptime lay_m = RowMajor[B, KL]
     comptime qtiles = (QL + XA_FUSED_BQ - 1) // XA_FUSED_BQ
     ctx.enqueue_function[
         _xa_fused_kernel[
             B, DIM, H, QL, KL, HD, MASKED, R, S, KU, DOT_FMA, EXP2
         ]
     ](
-        q.lt["gpu", lay_q](), k.lt["gpu", lay_kv](), v.lt["gpu", lay_kv](),
-        m.lt["gpu", lay_m](), out.lt["gpu", lay_q](),
+        q.tt["gpu", B, QL * DIM](), k.tt["gpu", B, KL * DIM](), v.tt["gpu", B, KL * DIM](),
+        m.tt["gpu", B, KL](), out.tt["gpu", B, QL * DIM](),
         grid_dim=(qtiles, H, B), block_dim=xa_fused_block[R, S](),
     )
 
@@ -237,7 +238,7 @@ def _launch_max_fa[
     choice (naive two-BMM on any part its depth table does not name);
     FORCE=True is `flash_attention_dispatch` with the admission test
     overridden: the FA2 kernel, TF32 tensor-core matmuls, online softmax."""
-    comptime if not has_nvidia_gpu_accelerator():
+    comptime if not default_accelerator().is_nvidia_gpu():
         raise Error("MAX's flash attention rows run on NVIDIA only")
     else:
         # ⚠ `.unsafe_ptr()` severs the borrow; the Tensors are the caller's
@@ -261,10 +262,10 @@ def _launch_max_fa[
                 _is_cache_length_accurate=True,
                 _use_valid_length=False,
             ](
-                o_tt.to_layout_tensor(),
-                q_tt.to_layout_tensor(),
-                LayoutTensorMHAOperand(k_tt),
-                LayoutTensorMHAOperand(v_tt),
+                o_tt,
+                q_tt,
+                TileTensorMHAOperand(k_tt),
+                TileTensorMHAOperand(v_tt),
                 NullMask(),
                 QL,
                 KL,
@@ -364,13 +365,13 @@ def run_shape[
     ss.ensure_gpu(ctx, SC)
     pout.ensure_gpu(ctx, PQ)
 
-    comptime lay_q = Layout.row_major(B, QL * DIM)
-    comptime lay_kv = Layout.row_major(B, KL * DIM)
-    comptime lay_pq = Layout.row_major(PQ)
-    comptime lay_pk = Layout.row_major(PK)
-    comptime lay_s = Layout.row_major(SC)
-    comptime lay_a = Layout.row_major(B, ATTN_SIZE)
-    comptime lay_m = Layout.row_major(B, KL)
+    comptime lay_q = RowMajor[B, QL * DIM]
+    comptime lay_kv = RowMajor[B, KL * DIM]
+    comptime lay_pq = RowMajor[PQ]
+    comptime lay_pk = RowMajor[PK]
+    comptime lay_s = RowMajor[SC]
+    comptime lay_a = RowMajor[B, ATTN_SIZE]
+    comptime lay_m = RowMajor[B, KL]
     comptime qblocks = (QN + TPB - 1) // TPB
     comptime kblocks = (KN + TPB - 1) // TPB
 
@@ -406,7 +407,7 @@ def run_shape[
         String("Q  MAX FA2 kernel forced (TF32 mma)"),
     ]
     # MAX's rows: NVIDIA, unmasked, head dim 64 (see the header).
-    comptime MAX_ROWS = has_nvidia_gpu_accelerator() and not MASKED and HD == 64
+    comptime MAX_ROWS = default_accelerator().is_nvidia_gpu() and not MASKED and HD == 64
     comptime N_VARIANTS = 16 if MAX_ROWS else 14
     var ok = True
     var best_a = 0.0
@@ -514,35 +515,35 @@ def run_shape[
                     # V head-major, for the A.V matmul.
                     ctx.enqueue_function[
                         _xa_pack_kernel[B, DIM, H, KL, HD, PK]
-                    ](sv.lt["gpu", lay_pk](), v.lt["gpu", lay_kv](),
+                    ](sv.tt["gpu", PK](), v.tt["gpu", B, KL * DIM](),
                       grid_dim=kblocks, block_dim=TPB)
                 if variant == 1:
                     ctx.enqueue_function[
                         _xa_pack_kernel[B, DIM, H, QL, HD, PQ]
-                    ](sq.lt["gpu", lay_pq](), q.lt["gpu", lay_q](),
+                    ](sq.tt["gpu", PQ](), q.tt["gpu", B, QL * DIM](),
                       grid_dim=qblocks, block_dim=TPB)
                     ctx.enqueue_function[
                         _xa_pack_kernel[B, DIM, H, KL, HD, PK]
-                    ](sk.lt["gpu", lay_pk](), k.lt["gpu", lay_kv](),
+                    ](sk.tt["gpu", PK](), k.tt["gpu", B, KL * DIM](),
                       grid_dim=kblocks, block_dim=TPB)
                     bmm[transpose_b=True, A0=BH, A1=QL, A2=HD, B0=BH, B1=KL, B2=HD, O0=BH, O1=QL, O2=KL](
                         ss.dev.value(), sq.dev.value(), sk.dev.value(), ctx
                     )
                     ctx.enqueue_function[
                         _xa_softmax_kernel[B, H, QL, KL, HD, MASKED, ATTN_SIZE, SC, BH]
-                    ](ss.lt["gpu", lay_s](), attn.lt["gpu", lay_a](),
-                      m.lt["gpu", lay_m](), grid_dim=BH, block_dim=TPB)
+                    ](ss.tt["gpu", SC](), attn.tt["gpu", B, ATTN_SIZE](),
+                      m.tt["gpu", B, KL](), grid_dim=BH, block_dim=TPB)
                     bmm[A0=BH, A1=QL, A2=KL, B0=BH, B1=KL, B2=HD, O0=BH, O1=QL, O2=HD](
                         pout.dev.value(), ss.dev.value(), sv.dev.value(), ctx
                     )
                 else:
                     ctx.enqueue_function[
                         _xe_scores_kernel[B, DIM, H, QL, KL, HD, MASKED]
-                    ](q.lt["gpu", lay_q](), k.lt["gpu", lay_kv](),
-                      m.lt["gpu", lay_m](), attn.lt["gpu", lay_s](),
+                    ](q.tt["gpu", B, QL * DIM](), k.tt["gpu", B, KL * DIM](),
+                      m.tt["gpu", B, KL](), attn.tt["gpu", SC](),
                       grid_dim=(SC + TPB - 1) // TPB, block_dim=TPB)
                     ctx.enqueue_function[_ba_softmax_kernel[B, H, QL, KL]](
-                        attn.lt["gpu", lay_s](),
+                        attn.tt["gpu", SC](),
                         grid_dim=ba_warp_rows_grid(BH * QL),
                         block_dim=TPB,
                     )
@@ -552,14 +553,14 @@ def run_shape[
                         )
                     else:
                         ctx.enqueue_function[_ba_context_kernel[B, DIM, H, QL, KL, HD]](
-                            attn.lt["gpu", lay_s](), v.lt["gpu", lay_kv](),
-                            out.lt["gpu", lay_q](),
+                            attn.tt["gpu", SC](), v.tt["gpu", B, KL * DIM](),
+                            out.tt["gpu", B, QL * DIM](),
                             grid_dim=(PQ + TPB - 1) // TPB, block_dim=TPB,
                         )
                 if variant == 1 or variant == 2:
                     ctx.enqueue_function[
                         _xa_unpack_kernel[B, DIM, H, QL, HD, PQ]
-                    ](out.lt["gpu", lay_q](), pout.lt["gpu", lay_pq](),
+                    ](out.tt["gpu", B, QL * DIM](), pout.tt["gpu", PQ](),
                       grid_dim=qblocks, block_dim=TPB)
             # ⚠ SYNCHRONISE BEFORE STOPPING THE CLOCK.
             ctx.synchronize()

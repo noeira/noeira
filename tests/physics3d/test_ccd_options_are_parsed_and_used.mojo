@@ -31,7 +31,7 @@ Run with:
 """
 
 from std.math import abs, sqrt
-from layout import Layout, LayoutTensor
+from noeira.core.tiles import RowMajor
 from max.gpu.host import DeviceContext
 from std.testing import assert_true, TestSuite
 
@@ -61,12 +61,12 @@ comptime NMV: Int = 4096
 # Scratch mesh operand for the direct EPA call — unused (both geoms are
 # primitives) but `gjk_epa` binds it unconditionally.
 comptime NMV_EPA: Int = 8
-comptime L_MV_EPA = Layout.row_major(NMV_EPA, 3)
+comptime L_MV_EPA = RowMajor[NMV_EPA, 3]
 # ⚠ Both geoms here are PRIMITIVES, so the mesh operand is never read; these
 # just have to bind. All -1 is how `fields/model.mojo` marks "no hull graph",
 # which is also the state `_support_mesh` falls back to its scan on.
-comptime L_VEADR_EPA = Layout.row_major(NMV_EPA)
-comptime L_EDGES_EPA = Layout.row_major(mesh_max_edge(NMV_EPA))
+comptime L_VEADR_EPA = RowMajor[NMV_EPA]
+comptime L_EDGES_EPA = RowMajor[mesh_max_edge(NMV_EPA)]
 
 
 def _no_graph_epa() raises -> TensorImpl[DTYPE]:
@@ -338,7 +338,7 @@ def test_epa_actually_consumes_the_tolerance() raises:
             Scalar[DTYPE](QW),
             Scalar[DTYPE](0.03), Scalar[DTYPE](0.02),
             Scalar[DTYPE](0), Scalar[DTYPE](0), Scalar[DTYPE](0),
-            mv.lt["cpu", L_MV_EPA](), _ng.lt["cpu", L_VEADR_EPA](), _ne.lt["cpu", L_EDGES_EPA](), 0, 0,
+            mv.tt["cpu", NMV_EPA, 3](), _ng.tt["cpu", NMV_EPA](), _ne.tt["cpu", mesh_max_edge(NMV_EPA)](), 0, 0,
             GEOM_BOX,
             Scalar[DTYPE](0), Scalar[DTYPE](0), Scalar[DTYPE](0),
             Scalar[DTYPE](0), Scalar[DTYPE](0), Scalar[DTYPE](0),
@@ -346,7 +346,7 @@ def test_epa_actually_consumes_the_tolerance() raises:
             Scalar[DTYPE](0), Scalar[DTYPE](0),
             Scalar[DTYPE](0.05), Scalar[DTYPE](0.04), Scalar[DTYPE](0.03),
             0, 0,
-            ws.lt["cpu", L_CCD_WS1](), 0,
+            ws.tt_dyn["cpu", L_CCD_WS1](L_CCD_WS1()), 0,
             Scalar[DTYPE](tol), MJ_CCD_ITERATIONS,
         )
         out[i * 4 + 0] = Float64(r[0])

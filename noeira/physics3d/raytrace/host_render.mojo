@@ -21,7 +21,6 @@ batched observation over a runtime-dimensioned model needs the kernel, and
 that needs the layouts above to reach it.
 """
 
-from layout import Layout, LayoutTensor
 
 from noeira.math3d import Vec3 as Vec3Generic
 
@@ -77,31 +76,31 @@ def render_lane_cpu[
         var nb = m.dims.get_nbody()
         var nvg = vis.ngeom
         # ⚠ `ngeom + ncond` ROWS: the conditional sites follow the geoms.
-        var geoms_c = vis.geoms.lt_dyn["cpu", DYN2](
+        var geoms_c = vis.geoms.tt_dyn["cpu", DYN2](
             rl2(nvg + vis.ncond, MODEL_GEOM_SIZE)
         )
-        var qpos_c = d.qpos.lt_dyn["cpu", DYN2](rl2(BATCH, m.dims.get_nq()))
-        var app_c = vis.appearance.lt_dyn["cpu", DYN1](rl1(vis.appearance.n))
-        var bodies_c = m.bodies.lt_dyn["cpu", DYN2](rl2(nb, MODEL_BODY_SIZE))
-        var xpos_c = d.xpos.lt_dyn["cpu", DYN2](rl2(BATCH, nb * 3))
-        var xquat_c = d.xquat.lt_dyn["cpu", DYN2](rl2(BATCH, nb * 4))
-        var com_c = d.subtree_com.lt_dyn["cpu", DYN2](rl2(BATCH, nb * 3))
-        var cams_c = m.cameras.lt_dyn["cpu", DYN1](
+        var qpos_c = d.qpos.tt_dyn["cpu", DYN2](rl2(BATCH, m.dims.get_nq()))
+        var app_c = vis.appearance.tt_dyn["cpu", DYN1](rl1(vis.appearance.n))
+        var bodies_c = m.bodies.tt_dyn["cpu", DYN2](rl2(nb, MODEL_BODY_SIZE))
+        var xpos_c = d.xpos.tt_dyn["cpu", DYN2](rl2(BATCH, nb * 3))
+        var xquat_c = d.xquat.tt_dyn["cpu", DYN2](rl2(BATCH, nb * 4))
+        var com_c = d.subtree_com.tt_dyn["cpu", DYN2](rl2(BATCH, nb * 3))
+        var cams_c = m.cameras.tt_dyn["cpu", DYN1](
             rl1(MAX_GPU_CAMERAS * MODEL_CAM_SIZE)
         )
-        var mm_c = vis.mesh_meta.lt_dyn["cpu", DYN1](rl1(vis.mesh_meta.n))
-        var mt_c = vis.mesh_tris.lt_dyn["cpu", DYN1](rl1(vis.mesh_tris.n))
-        var uv_c = vis.mesh_uv.lt_dyn["cpu", DYN1](rl1(vis.mesh_uv.n))
-        var hm_c = m.hfield_meta.lt_dyn["cpu", DYN1](
+        var mm_c = vis.mesh_meta.tt_dyn["cpu", DYN1](rl1(vis.mesh_meta.n))
+        var mt_c = vis.mesh_tris.tt_dyn["cpu", DYN1](rl1(vis.mesh_tris.n))
+        var uv_c = vis.mesh_uv.tt_dyn["cpu", DYN1](rl1(vis.mesh_uv.n))
+        var hm_c = m.hfield_meta.tt_dyn["cpu", DYN1](
             rl1(MAX_GPU_HFIELDS * MODEL_HFIELD_META_SIZE)
         )
-        var hd_c = d.hfield_data.lt_dyn["cpu", DYN1](
+        var hd_c = d.hfield_data.tt_dyn["cpu", DYN1](
             rl1(len(d.hfield_data.data))
         )
-        var mat_c = vis.materials.lt_dyn["cpu", DYN1](rl1(vis.materials.n))
-        var tex_c = vis.textures.lt_dyn["cpu", DYN1](rl1(vis.textures.n))
-        var txl_c = vis.texels.lt_dyn["cpu", DYN1](rl1(vis.texels.n))
-        var lit_c = vis.lights.lt_dyn["cpu", DYN1](rl1(vis.lights.n))
+        var mat_c = vis.materials.tt_dyn["cpu", DYN1](rl1(vis.materials.n))
+        var tex_c = vis.textures.tt_dyn["cpu", DYN1](rl1(vis.textures.n))
+        var txl_c = vis.texels.tt_dyn["cpu", DYN1](rl1(vis.texels.n))
+        var lit_c = vis.lights.tt_dyn["cpu", DYN1](rl1(vis.lights.n))
         var hf_stride = len(d.hfield_data.data) // BATCH
 
         var frame = camera_world_frame[DTYPE](

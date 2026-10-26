@@ -20,7 +20,6 @@ CPU + GPU.
 from std.math import min
 from max.gpu import global_idx
 from max.gpu.host import DeviceContext
-from layout import Layout, LayoutTensor
 
 from noeira.nn.constants import DT, TPB
 from noeira.nn.core.tensor import Tensor
@@ -30,12 +29,13 @@ from noeira.nn.primitives.rsample import RSample
 
 from .nets import TDMPC2Encoder, TDMPC2Policy, TDMPC2QNet
 from .losses import TwoHotDecode
+from noeira.core.tiles import Tile, tile
 
 
 def _build_za_k[B_: Int, LAT_: Int, A_: Int, ALP_: Int](
-    nz: LayoutTensor[DT, Layout.row_major(B_ * LAT_), MutAnyOrigin],
-    alp: LayoutTensor[DT, Layout.row_major(B_ * ALP_), MutAnyOrigin],
-    za: LayoutTensor[DT, Layout.row_major(B_ * (LAT_ + A_)), MutAnyOrigin],
+    nz: Tile[DT, B_ * LAT_],
+    alp: Tile[DT, B_ * ALP_],
+    za: Tile[DT, B_ * (LAT_ + A_)],
 ):
     """za[b] = [nz[b] | action[b]] where action = alp[b, :A_]."""
     var i = Int(global_idx.x)
@@ -50,11 +50,11 @@ def _build_za_k[B_: Int, LAT_: Int, A_: Int, ALP_: Int](
 
 
 def _td_combine_k[B_: Int](
-    rew: LayoutTensor[DT, Layout.row_major(B_), MutAnyOrigin],
-    done: LayoutTensor[DT, Layout.row_major(B_), MutAnyOrigin],
-    qa: LayoutTensor[DT, Layout.row_major(B_), MutAnyOrigin],
-    qb: LayoutTensor[DT, Layout.row_major(B_), MutAnyOrigin],
-    td_out: LayoutTensor[DT, Layout.row_major(B_), MutAnyOrigin],
+    rew: Tile[DT, B_],
+    done: Tile[DT, B_],
+    qa: Tile[DT, B_],
+    qb: Tile[DT, B_],
+    td_out: Tile[DT, B_],
     gamma: Scalar[DT],
 ):
     """td[b] = rew[b] + gamma·(1−done[b])·min(qa,qb)."""
@@ -215,9 +215,9 @@ struct TDTargetStep[
             var c = ctx.value()
             comptime nb = (BB * ZA + TPB - 1) // TPB
             c.enqueue_function[_build_za_k[BB, LAT, A, A + 1]](
-                self.nz.lt["gpu", Layout.row_major(BB * LAT)](),
-                self.alp.lt["gpu", Layout.row_major(BB * (A + 1))](),
-                self.za.lt["gpu", Layout.row_major(BB * ZA)](),
+                self.nz.tt["gpu", BB * LAT](),
+                self.alp.tt["gpu", BB * (A + 1)](),
+                self.za.tt["gpu", BB * ZA](),
                 grid_dim=nb, block_dim=TPB,
             )
 
@@ -245,10 +245,10 @@ struct TDTargetStep[
             var done_sub = done.dev.value().create_sub_buffer[DT](t * BB, BB)
             var td_sub = td_out.dev.value().create_sub_buffer[DT](t * BB, BB)
             c.enqueue_function[_td_combine_k[BB]](
-                LayoutTensor[DT, Layout.row_major(BB), MutAnyOrigin](rew_sub),
-                LayoutTensor[DT, Layout.row_major(BB), MutAnyOrigin](done_sub),
-                self.qa.lt["gpu", Layout.row_major(BB)](),
-                self.qb.lt["gpu", Layout.row_major(BB)](),
-                LayoutTensor[DT, Layout.row_major(BB), MutAnyOrigin](td_sub),
+                tile[BB](rew_sub),
+                tile[BB](done_sub),
+                self.qa.tt["gpu", BB](),
+                self.qb.tt["gpu", BB](),
+                tile[BB](td_sub),
                 gamma, grid_dim=nb, block_dim=TPB,
             )

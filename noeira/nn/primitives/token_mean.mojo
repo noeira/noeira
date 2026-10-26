@@ -20,7 +20,8 @@ classification head.
 
 from max.gpu import global_idx
 from max.gpu.host import DeviceContext
-from layout import Layout, LayoutTensor, TileTensor, row_major
+from layout import TileTensor, row_major
+from noeira.core.tiles import RowMajor, Tile
 
 from noeira.nn.constants import DT, TPB
 from ..core.tensor import Tensor
@@ -35,8 +36,8 @@ from ..core.amp import AMPPolicy, NoAMP
 def _token_mean_fwd_kernel[
     BATCH: Int, SEQ: Int, DIM: Int
 ](
-    src: LayoutTensor[DT, Layout.row_major(BATCH, SEQ * DIM), MutAnyOrigin],
-    dst: LayoutTensor[DT, Layout.row_major(BATCH, DIM), MutAnyOrigin],
+    src: Tile[DT, BATCH, SEQ * DIM],
+    dst: Tile[DT, BATCH, DIM],
 ):
     var gid = Int(global_idx.x)
     comptime total = BATCH * DIM
@@ -53,8 +54,8 @@ def _token_mean_fwd_kernel[
 def _token_mean_bwd_kernel[
     BATCH: Int, SEQ: Int, DIM: Int
 ](
-    go: LayoutTensor[DT, Layout.row_major(BATCH, DIM), MutAnyOrigin],
-    gi: LayoutTensor[DT, Layout.row_major(BATCH, SEQ * DIM), MutAnyOrigin],
+    go: Tile[DT, BATCH, DIM],
+    gi: Tile[DT, BATCH, SEQ * DIM],
 ):
     var gid = Int(global_idx.x)
     comptime total = BATCH * SEQ * DIM
@@ -109,15 +110,15 @@ struct TokenMean[SEQ_LEN_: Int, DIM_: Int](Module):
         else:
             var c = ctx.value()
             out.ensure_gpu(c, B * Self.DIM_)
-            comptime l_in = Layout.row_major(B, SD)
-            comptime l_out = Layout.row_major(B, Self.DIM_)
+            comptime l_in = RowMajor[B, SD]
+            comptime l_out = RowMajor[B, Self.DIM_]
             comptime total = B * Self.DIM_
             comptime n_blocks = (total + TPB - 1) // TPB
             c.enqueue_function[
                 _token_mean_fwd_kernel[B, Self.SEQ_LEN_, Self.DIM_]
             ](
-                in0.lt["gpu", l_in](),
-                out.lt["gpu", l_out](),
+                in0.tt["gpu", B, SD](),
+                out.tt["gpu", B, Self.DIM_](),
                 grid_dim=n_blocks,
                 block_dim=TPB,
             )
@@ -149,15 +150,15 @@ struct TokenMean[SEQ_LEN_: Int, DIM_: Int](Module):
         else:
             var c = ctx.value()
             gin.ensure_gpu(c, B * SD)
-            comptime l_out = Layout.row_major(B, Self.DIM_)
-            comptime l_in = Layout.row_major(B, SD)
+            comptime l_out = RowMajor[B, Self.DIM_]
+            comptime l_in = RowMajor[B, SD]
             comptime total = B * SD
             comptime n_blocks = (total + TPB - 1) // TPB
             c.enqueue_function[
                 _token_mean_bwd_kernel[B, Self.SEQ_LEN_, Self.DIM_]
             ](
-                grad_output.lt["gpu", l_out](),
-                gin.lt["gpu", l_in](),
+                grad_output.tt["gpu", B, Self.DIM_](),
+                gin.tt["gpu", B, SD](),
                 grid_dim=n_blocks,
                 block_dim=TPB,
             )

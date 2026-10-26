@@ -16,9 +16,9 @@ augmentation is requested. Ported verbatim from the legacy
 from max.gpu import thread_idx, block_idx
 from max.gpu.host import DeviceContext
 from std.random.philox import Random as PhiloxRandom
-from layout import Layout, LayoutTensor
 
 from noeira.nn.constants import TPB, LAYOUT_NCHW, LAYOUT_NHWC
+from noeira.core.tiles import Tile, tile
 
 
 trait Augmenter(ImplicitlyCopyable):
@@ -29,8 +29,8 @@ trait Augmenter(ImplicitlyCopyable):
     @staticmethod
     def augment[N: Int, IN_DIM: Int, dtype: DType](
         ctx: DeviceContext,
-        aug: LayoutTensor[dtype, Layout.row_major(N, IN_DIM), MutAnyOrigin],
-        raw: LayoutTensor[dtype, Layout.row_major(N, IN_DIM), MutAnyOrigin],
+        aug: Tile[dtype, N, IN_DIM],
+        raw: Tile[dtype, N, IN_DIM],
         epoch: Int,
         seed: UInt64,
     ) raises:
@@ -59,8 +59,8 @@ struct IdentityAugmenter(Augmenter):
     @staticmethod
     def augment[N: Int, IN_DIM: Int, dtype: DType](
         ctx: DeviceContext,
-        aug: LayoutTensor[dtype, Layout.row_major(N, IN_DIM), MutAnyOrigin],
-        raw: LayoutTensor[dtype, Layout.row_major(N, IN_DIM), MutAnyOrigin],
+        aug: Tile[dtype, N, IN_DIM],
+        raw: Tile[dtype, N, IN_DIM],
         epoch: Int,
         seed: UInt64,
     ) raises:
@@ -70,8 +70,8 @@ struct IdentityAugmenter(Augmenter):
 def _cifar_augment_kernel[
     N: Int, dtype: DType, LAYOUT: Int = LAYOUT_NCHW,
 ](
-    aug: LayoutTensor[dtype, Layout.row_major(N, 3 * 32 * 32), MutAnyOrigin],
-    raw: LayoutTensor[dtype, Layout.row_major(N, 3 * 32 * 32), MutAnyOrigin],
+    aug: Tile[dtype, N, 3 * 32 * 32],
+    raw: Tile[dtype, N, 3 * 32 * 32],
     epoch_seed: Scalar[DType.uint64],
 ):
     """One block per sample; threads parallelize the 3072 output pixels. All
@@ -136,20 +136,16 @@ struct CIFAR10CropFlipAugmenter(Augmenter):
     @staticmethod
     def augment[N: Int, IN_DIM: Int, dtype: DType](
         ctx: DeviceContext,
-        aug: LayoutTensor[dtype, Layout.row_major(N, IN_DIM), MutAnyOrigin],
-        raw: LayoutTensor[dtype, Layout.row_major(N, IN_DIM), MutAnyOrigin],
+        aug: Tile[dtype, N, IN_DIM],
+        raw: Tile[dtype, N, IN_DIM],
         epoch: Int,
         seed: UInt64,
     ) raises:
         comptime assert (
             IN_DIM == 3 * 32 * 32
         ), "CIFAR10CropFlipAugmenter requires IN_DIM == 3*32*32"
-        var aug_fixed = LayoutTensor[
-            dtype, Layout.row_major(N, 3 * 32 * 32), MutAnyOrigin
-        ](aug.ptr)
-        var raw_fixed = LayoutTensor[
-            dtype, Layout.row_major(N, 3 * 32 * 32), MutAnyOrigin
-        ](raw.ptr)
+        var aug_fixed = tile[N, 3 * 32 * 32](aug.ptr)
+        var raw_fixed = tile[N, 3 * 32 * 32](raw.ptr)
         comptime aug_k = _cifar_augment_kernel[N, dtype]
         ctx.enqueue_function[aug_k](
             aug_fixed,
@@ -181,20 +177,16 @@ struct CIFAR10CropFlipAugmenterNHWC(Augmenter):
     @staticmethod
     def augment[N: Int, IN_DIM: Int, dtype: DType](
         ctx: DeviceContext,
-        aug: LayoutTensor[dtype, Layout.row_major(N, IN_DIM), MutAnyOrigin],
-        raw: LayoutTensor[dtype, Layout.row_major(N, IN_DIM), MutAnyOrigin],
+        aug: Tile[dtype, N, IN_DIM],
+        raw: Tile[dtype, N, IN_DIM],
         epoch: Int,
         seed: UInt64,
     ) raises:
         comptime assert (
             IN_DIM == 3 * 32 * 32
         ), "CIFAR10CropFlipAugmenterNHWC requires IN_DIM == 3*32*32"
-        var aug_fixed = LayoutTensor[
-            dtype, Layout.row_major(N, 3 * 32 * 32), MutAnyOrigin
-        ](aug.ptr)
-        var raw_fixed = LayoutTensor[
-            dtype, Layout.row_major(N, 3 * 32 * 32), MutAnyOrigin
-        ](raw.ptr)
+        var aug_fixed = tile[N, 3 * 32 * 32](aug.ptr)
+        var raw_fixed = tile[N, 3 * 32 * 32](raw.ptr)
         comptime aug_k = _cifar_augment_kernel[N, dtype, LAYOUT_NHWC]
         ctx.enqueue_function[aug_k](
             aug_fixed,

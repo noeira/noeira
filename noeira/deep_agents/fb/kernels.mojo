@@ -30,7 +30,6 @@ from std.random import random_float64
 from max.gpu import block_dim, block_idx, thread_idx, global_idx
 from max.gpu.primitives import block
 from max.gpu.host import DeviceContext, DeviceBuffer
-from layout import Layout, LayoutTensor
 
 from noeira.nn.constants import DT, TPB, TPB_REDUCE
 from noeira.nn.core.tensor import Tensor
@@ -43,6 +42,7 @@ from noeira.nn.random.box_muller import (
 )
 from std.random.philox import Random as PhiloxRandom
 from noeira.data.resident import IDX_DT
+from noeira.core.tiles import Tile, tile
 
 
 # ══════════════════════════════════════════════════════════════════════
@@ -50,8 +50,8 @@ from noeira.data.resident import IDX_DT
 # ══════════════════════════════════════════════════════════════════════
 
 
-def gather_rows_kernel[ROW_DIM: Int, BATCH: Int](
-    src: Pointer[Scalar[DT], MutAnyOrigin],
+def gather_rows_kernel[ROW_DIM: Int, BATCH: Int, SDT: DType = DT](
+    src: Pointer[Scalar[SDT], MutAnyOrigin],
     idx: Pointer[Scalar[IDX_DT], MutAnyOrigin],
     dst: Pointer[Scalar[DT], MutAnyOrigin],
 ):
@@ -60,17 +60,24 @@ def gather_rows_kernel[ROW_DIM: Int, BATCH: Int](
     Element-parallel, not lane-parallel: a per-lane kernel serialises the row
     copy inside each thread and launches only BATCH threads, which measured at
     ~73% of GPU time on wide rows elsewhere in this repo.
+
+    `SDT` is the SOURCE's storage type (a replay ring may hold fp16); the
+    batch is always `DT`. At `SDT == DT` the cast is the identity.
     """
     var t = Int(global_idx.x)
     if t >= BATCH * ROW_DIM:
         return
     var i = t // ROW_DIM
     var d = t % ROW_DIM
-    dst[unsafe_offset=t] = src[unsafe_offset=Int(idx[unsafe_offset=i]) * ROW_DIM + d]
+    dst[unsafe_offset=t] = src[
+        unsafe_offset=Int(idx[unsafe_offset=i]) * ROW_DIM + d
+    ].cast[DT]()
 
 
-def gather_rows_into_kernel[SRC_DIM: Int, DST_STRIDE: Int, BATCH: Int](
-    src: Pointer[Scalar[DT], MutAnyOrigin],
+def gather_rows_into_kernel[
+    SRC_DIM: Int, DST_STRIDE: Int, BATCH: Int, SDT: DType = DT
+](
+    src: Pointer[Scalar[SDT], MutAnyOrigin],
     idx: Pointer[Scalar[IDX_DT], MutAnyOrigin],
     dst: Pointer[Scalar[DT], MutAnyOrigin],
 ):
@@ -91,14 +98,14 @@ def gather_rows_into_kernel[SRC_DIM: Int, DST_STRIDE: Int, BATCH: Int](
     var d = t % SRC_DIM
     dst[unsafe_offset=i * DST_STRIDE + d] = src[
         unsafe_offset=Int(idx[unsafe_offset=i]) * SRC_DIM + d
-    ]
+    ].cast[DT]()
 
 
 def derive_tail_kernel[
     ROWS: Int, CAP: Int, LANES: Int, STORE_OBS: Int, ACT: Int, TAIL: Int,
-    OBS: Int,
+    OBS: Int, SDT: DType = DT,
 ](
-    r_obs: Pointer[Scalar[DT], MutAnyOrigin],    # CAP x STORE_OBS
+    r_obs: Pointer[Scalar[SDT], MutAnyOrigin],   # CAP x STORE_OBS, ring type
     r_act: Pointer[Scalar[DT], MutAnyOrigin],    # CAP x ACT
     r_age: Pointer[Scalar[DT], MutAnyOrigin],    # CAP, steps since this lane's reset
     idx: Pointer[Scalar[IDX_DT], MutAnyOrigin],  # ROWS, the drawn rows
@@ -149,7 +156,9 @@ def derive_tail_kernel[
         r += CAP
     var src_off = Int(spec[unsafe_offset=k * 4 + 2])
     if Int(spec[unsafe_offset=k * 4]) == 0:
-        dst[unsafe_offset=o] = r_obs[unsafe_offset=r * STORE_OBS + src_off]
+        dst[unsafe_offset=o] = r_obs[
+            unsafe_offset=r * STORE_OBS + src_off
+        ].cast[DT]()
     else:
         var a = r_act[unsafe_offset=r * ACT + src_off] * act_scale
         if a > act_clip:
@@ -1168,9 +1177,7 @@ def gaussian_dev_t[target: StaticString, N: Int](
         box_muller_normal(t.data.unsafe_ptr(), N)
     else:
         var d = ctx.value()
-        var off = LayoutTensor[DType.uint64, Layout.row_major(1), MutAnyOrigin](
-            mptr(offset_buf.unsafe_ptr())
-        )
+        var off = tile[1](mptr(offset_buf.unsafe_ptr()))
         box_muller_normal_gpu_dev[N](
             d, mptr(t.dev.value().unsafe_ptr()), seed, off
         )
@@ -1193,7 +1200,7 @@ def gaussian_dev_t[target: StaticString, N: Int](
 def uniform01_dev_kernel[N: Int](
     dst: Pointer[Scalar[DT], MutAnyOrigin],
     seed: UInt64,
-    offset_buf: LayoutTensor[DType.uint64, Layout.row_major(1), MutAnyOrigin],
+    offset_buf: Tile[DType.uint64, 1],
 ):
     """`dst[i] ~ U[0, 1)`, Philox, offset read FROM DEVICE (capture-safe).
     Device-offset twin of `uniform01_kernel` — see its docstring for why the
@@ -1346,6 +1353,28 @@ def axpy_by_mag_kernel[N: Int](
     y[unsafe_offset=t] = y[unsafe_offset=t] + base * m * x[unsafe_offset=t]
 
 
+def masked_rows_axpy_by_mag_kernel[BATCH: Int, W: Int](
+    y: Pointer[Scalar[DT], MutAnyOrigin],
+    x: Pointer[Scalar[DT], MutAnyOrigin],
+    mask: Pointer[Scalar[DT], MutAnyOrigin],
+    mag: Pointer[Scalar[DT], MutAnyOrigin],
+    base: Scalar[DT],
+):
+    """`y[i, :] += base·|mag[0]|·mask[i]·x[i, :]` — `masked_rows_axpy_kernel`
+    with `axpy_by_mag_kernel`'s scale: a per-row BC term made a RATIO to the
+    FB value term by multiplying IT, so the value term stays raw."""
+    var t = Int(global_idx.x)
+    if t >= BATCH * W:
+        return
+    var m = mag[unsafe_offset=0]
+    if m < Scalar[DT](0):
+        m = -m
+    var i = t // W
+    y[unsafe_offset=t] = (
+        y[unsafe_offset=t] + base * m * mask[unsafe_offset=i] * x[unsafe_offset=t]
+    )
+
+
 def diff_scale_kernel[N: Int](
     dst: Pointer[Scalar[DT], MutAnyOrigin],
     a: Pointer[Scalar[DT], MutAnyOrigin],
@@ -1391,9 +1420,7 @@ def uniform01_dev_t[target: StaticString, N: Int](
             t.data[i] = Scalar[DT](random_float64())
     else:
         var d = ctx.value()
-        var off = LayoutTensor[DType.uint64, Layout.row_major(1), MutAnyOrigin](
-            mptr(offset_buf.unsafe_ptr())
-        )
+        var off = tile[1](mptr(offset_buf.unsafe_ptr()))
         d.enqueue_function[uniform01_dev_kernel[N]](
             t.dev.value().unsafe_ptr(), seed, off,
             grid_dim=_blocks(N), block_dim=TPB,
@@ -1510,6 +1537,26 @@ def axpy_by_mag_t[target: StaticString, N: Int](
             y.dev.value().unsafe_ptr(), x.dev.value().unsafe_ptr(),
             mag.dev.value().unsafe_ptr(), base,
             grid_dim=_blocks(N), block_dim=TPB,
+        )
+
+
+def masked_rows_axpy_by_mag_t[target: StaticString, BATCH: Int, W: Int](
+    mut y: Tensor, mut x: Tensor, mut mask: Tensor, mut mag: Tensor,
+    base: Scalar[DT], ctx: Optional[DeviceContext] = None,
+) raises:
+    """`y[i, :] += base·|mag[0]|·mask[i]·x[i, :]`, `mag` staying on device."""
+    comptime if target == "cpu":
+        var m = abs(Float64(mag.data[0]))
+        for i in range(BATCH):
+            var a = Scalar[DT](Float64(base) * m) * mask.data[i]
+            for k in range(W):
+                y.data[i * W + k] = y.data[i * W + k] + a * x.data[i * W + k]
+    else:
+        var d = ctx.value()
+        d.enqueue_function[masked_rows_axpy_by_mag_kernel[BATCH, W]](
+            y.dev.value().unsafe_ptr(), x.dev.value().unsafe_ptr(),
+            mask.dev.value().unsafe_ptr(), mag.dev.value().unsafe_ptr(), base,
+            grid_dim=_blocks(BATCH * W), block_dim=TPB,
         )
 
 

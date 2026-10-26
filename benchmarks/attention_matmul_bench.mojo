@@ -43,7 +43,7 @@ from std.time import perf_counter_ns
 from max.gpu import barrier, block_dim, block_idx, thread_idx
 from max.gpu.host import DeviceContext
 from max.gpu.memory import AddressSpace
-from layout import Layout, LayoutTensor
+from noeira.core.tiles import RowMajor, Tile, shared_tile
 
 from noeira.nn.constants import DT
 from noeira.nn.core.mm import bmm
@@ -72,19 +72,13 @@ comptime T2_TN = 4
 
 
 def _mm_tiled_kernel[BH: Int, M: Int, N: Int, K: Int](
-    a: LayoutTensor[DT, Layout.row_major(BH * M * K), MutAnyOrigin],
-    b: LayoutTensor[DT, Layout.row_major(BH * K * N), MutAnyOrigin],
-    o: LayoutTensor[DT, Layout.row_major(BH * M * N), MutAnyOrigin],
+    a: Tile[DT, BH * M * K],
+    b: Tile[DT, BH * K * N],
+    o: Tile[DT, BH * M * N],
 ):
     """M1: one output per thread, both operands staged through shared memory."""
-    var sa = LayoutTensor[
-        DT, Layout.row_major(T1, T1), MutAnyOrigin,
-        address_space=AddressSpace.SHARED,
-    ].stack_allocation()
-    var sb = LayoutTensor[
-        DT, Layout.row_major(T1, T1), MutAnyOrigin,
-        address_space=AddressSpace.SHARED,
-    ].stack_allocation()
+    var sa = shared_tile[DT, T1, T1]()
+    var sb = shared_tile[DT, T1, T1]()
 
     var bh = Int(block_idx.z)
     var ty = Int(thread_idx.y)
@@ -118,21 +112,15 @@ def _mm_tiled_kernel[BH: Int, M: Int, N: Int, K: Int](
 
 
 def _mm_tiled4_kernel[BH: Int, M: Int, N: Int, K: Int](
-    a: LayoutTensor[DT, Layout.row_major(BH * M * K), MutAnyOrigin],
-    b: LayoutTensor[DT, Layout.row_major(BH * K * N), MutAnyOrigin],
-    o: LayoutTensor[DT, Layout.row_major(BH * M * N), MutAnyOrigin],
+    a: Tile[DT, BH * M * K],
+    b: Tile[DT, BH * K * N],
+    o: Tile[DT, BH * M * N],
 ):
     """M2: 4x4 outputs per thread — each shared-memory element is reused four
     times from registers instead of once, which is what lifts a tiled matmul
     off the shared-memory bandwidth bound."""
-    var sa = LayoutTensor[
-        DT, Layout.row_major(T2_M, T2_K), MutAnyOrigin,
-        address_space=AddressSpace.SHARED,
-    ].stack_allocation()
-    var sb = LayoutTensor[
-        DT, Layout.row_major(T2_K, T2_N), MutAnyOrigin,
-        address_space=AddressSpace.SHARED,
-    ].stack_allocation()
+    var sa = shared_tile[DT, T2_M, T2_K]()
+    var sb = shared_tile[DT, T2_K, T2_N]()
 
     var bh = Int(block_idx.z)
     var ty = Int(thread_idx.y)
@@ -236,9 +224,9 @@ def run_gemm[
     comptime ON = BH * M * N
     comptime FLOP = 2.0 * Float64(BH) * Float64(M) * Float64(N) * Float64(K)
 
-    comptime lay_a = Layout.row_major(AN)
-    comptime lay_b = Layout.row_major(BN)
-    comptime lay_o = Layout.row_major(ON)
+    comptime lay_a = RowMajor[AN]
+    comptime lay_b = RowMajor[BN]
+    comptime lay_o = RowMajor[ON]
 
     var rng = Lcg(BH * 7919 + M * 131 + N * 17 + K)
     var a = Tensor.alloc(AN)
@@ -299,15 +287,15 @@ def run_gemm[
                 ](o.dev.value(), a.dev.value(), b.dev.value(), ctx)
             elif variant == 1:
                 ctx.enqueue_function[_mm_tiled_kernel[BH, M, N, K]](
-                    a.lt["gpu", lay_a](), b.lt["gpu", lay_b](),
-                    o.lt["gpu", lay_o](),
+                    a.tt["gpu", AN](), b.tt["gpu", BN](),
+                    o.tt["gpu", ON](),
                     grid_dim=((N + T1 - 1) // T1, (M + T1 - 1) // T1, BH),
                     block_dim=(T1, T1),
                 )
             else:
                 ctx.enqueue_function[_mm_tiled4_kernel[BH, M, N, K]](
-                    a.lt["gpu", lay_a](), b.lt["gpu", lay_b](),
-                    o.lt["gpu", lay_o](),
+                    a.tt["gpu", AN](), b.tt["gpu", BN](),
+                    o.tt["gpu", ON](),
                     grid_dim=(
                         (N + T2_N - 1) // T2_N, (M + T2_M - 1) // T2_M, BH
                     ),

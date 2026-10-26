@@ -32,7 +32,8 @@ than the one the next warm start prices against.
 
 from max.gpu import thread_idx, block_idx, block_dim
 from max.gpu.host import DeviceContext
-from layout import Layout, LayoutTensor
+from layout import TileTensor, TensorLayout
+from noeira.core.tiles import RowMajor, Tile
 
 from ..fields import Data, DynamicsScratch, DimsLike, DYN2, rl2
 
@@ -43,12 +44,12 @@ comptime WS_TPB: Int = 64
 def _save_warmstart_env[
     DTYPE: DType,
     D: DimsLike,
-    L_NV: Layout,
+    L_NV: TensorLayout,
 ](
     env: Int,
     dims: D,
-    qacc_constrained: LayoutTensor[DTYPE, L_NV, MutAnyOrigin],
-    qacc_warmstart: LayoutTensor[DTYPE, L_NV, MutAnyOrigin],
+    qacc_constrained: TileTensor[DTYPE, L_NV, MutAnyOrigin],
+    qacc_warmstart: TileTensor[DTYPE, L_NV, MutAnyOrigin],
 ):
     var nv = dims.get_nv()
     for i in range(nv):
@@ -60,12 +61,8 @@ def _save_warmstart_env[
 def _save_warmstart_kernel[
     DTYPE: DType, NV: Int, BATCH: Int
 ](
-    qacc_constrained: LayoutTensor[
-        DTYPE, Layout.row_major(BATCH, NV), MutAnyOrigin
-    ],
-    qacc_warmstart: LayoutTensor[
-        DTYPE, Layout.row_major(BATCH, NV), MutAnyOrigin
-    ],
+    qacc_constrained: Tile[DTYPE, BATCH, NV],
+    qacc_warmstart: Tile[DTYPE, BATCH, NV],
 ):
     var env = Int(block_dim.x * block_idx.x + thread_idx.x)
     if env >= BATCH:
@@ -87,12 +84,12 @@ def save_qacc_warmstart[
     ctx: Optional[DeviceContext] = None,
 ) raises:
     """`d.qacc_warmstart <- scratch.qacc_constrained`, every lane."""
-    comptime L_NV = Layout.row_major(BATCH, D.NV)
+    comptime L_NV = RowMajor[BATCH, D.NV]
     comptime if target == "cpu":
         var dm = d.dims
         var rl_NV = rl2(BATCH, dm.get_nv())
-        var qc_v = scratch.qacc_constrained.lt_dyn["cpu", DYN2](rl_NV)
-        var qw_v = d.qacc_warmstart.lt_dyn["cpu", DYN2](rl_NV)
+        var qc_v = scratch.qacc_constrained.tt_dyn["cpu", DYN2](rl_NV)
+        var qw_v = d.qacc_warmstart.tt_dyn["cpu", DYN2](rl_NV)
         for e in range(BATCH):
             _save_warmstart_env[DTYPE](e, dm, qc_v, qw_v)
     else:
@@ -100,8 +97,8 @@ def save_qacc_warmstart[
         ctx.value().enqueue_function[
             _save_warmstart_kernel[DTYPE, D.NV, BATCH]
         ](
-            scratch.qacc_constrained.lt["gpu", L_NV](),
-            d.qacc_warmstart.lt["gpu", L_NV](),
+            scratch.qacc_constrained.tt["gpu", BATCH, D.NV](),
+            d.qacc_warmstart.tt["gpu", BATCH, D.NV](),
             grid_dim=(BLOCKS,),
             block_dim=(WS_TPB,),
         )

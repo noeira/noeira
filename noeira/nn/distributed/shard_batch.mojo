@@ -7,11 +7,11 @@ B rows draws. The global batch is the same at every N by construction, which is
 what the N-vs-1 equivalence gate needs, and the ranks' rows are disjoint.
 """
 
-from layout import Layout, LayoutTensor
 from max.gpu import global_idx
 
 from noeira.nn.constants import DT
 from noeira.nn.training.window_batch_kernels import window_start
+from noeira.core.tiles import Tile
 
 
 def window_onehot_shard_kernel[
@@ -20,9 +20,9 @@ def window_onehot_shard_kernel[
     corpus: Pointer[Scalar[DType.int32], MutAnyOrigin],
     n_starts: Int64,
     row_off: Int64,
-    rng: LayoutTensor[DType.uint64, Layout.row_major(2), MutAnyOrigin],
-    inp: LayoutTensor[ADT, Layout.row_major(BL * SEQ * VOCAB), MutAnyOrigin],
-    tgt: LayoutTensor[DT, Layout.row_major(BL * SEQ * VOCAB), MutAnyOrigin],
+    rng: Tile[DType.uint64, 2],
+    inp: Tile[ADT, BL * SEQ * VOCAB],
+    tgt: Tile[DT, BL * SEQ * VOCAB],
 ):
     """One thread per one-hot element `[b, t, v]` of this rank's BL rows;
     local row b is global row `row_off + b`. `rng` = [seed, step]."""

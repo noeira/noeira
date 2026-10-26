@@ -17,9 +17,11 @@ from noeira.deep_agents.efficient_zero_v2.agent import EZv2DiscreteAgent
 from noeira.envs.cartpole import CartPoleEnv
 
 
-def _read(path: String) raises -> String:
+def _read(path: String) raises -> List[UInt8]:
+    # The sidecars are BINARY (checkpoint format): `f.read()` decodes UTF-8
+    # and raises on the first non-text byte.
     with open(path, "r") as f:
-        return f.read()
+        return f.read_bytes()
 
 
 def main() raises:
@@ -62,8 +64,11 @@ def main() raises:
         String(".rep"), String(".dyn"), String(".pred"),
         String(".proj"), String(".predh"),
     ]:
+        var c1 = _read(path + suf)
+        # An empty sidecar would compare equal to another empty one.
+        assert_true(len(c1) > 0, "empty checkpoint sidecar " + suf)
         assert_true(
-            _read(path + suf) == _read(path2 + suf),
+            c1 == _read(path2 + suf),
             "checkpoint round-trip not byte-identical for " + suf,
         )
     print("EZv2DiscreteAgent facade: OK")

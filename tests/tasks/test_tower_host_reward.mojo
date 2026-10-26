@@ -29,6 +29,7 @@ read against the training log's `mean_reward`.
 
 from std.math import sqrt
 from std.testing import assert_almost_equal, assert_equal, assert_true
+from std.sys import has_accelerator
 from max.gpu.host import DeviceContext
 
 from noeira.core.cont_action import ContAction
@@ -91,7 +92,7 @@ def _reach(ref obs: List[Float64]) -> Float64:
     return sqrt(rx * rx + ry * ry + rz * rz)
 
 
-def main() raises:
+def _run() raises:
     print("=" * 66)
     print("host reward == the family's GPU hook, on", TASK)
     print("=" * 66)
@@ -203,3 +204,15 @@ def main() raises:
     assert_almost_equal(goal_only, CFG.SHAPE_W_GOAL, atol=TOL,
                         msg="goal term saturates when the goal holds")
     print("TOWER HOST REWARD OK")
+
+
+def main() raises:
+    # The env is built on a DeviceContext, so there is nothing to run on a
+    # host with no accelerator (the CI runner).
+    comptime if has_accelerator():
+        _run()
+    else:
+        print(
+            "test_tower_host_reward: SKIPPED (no accelerator;"
+            " run with -e apple / -e nvidia)"
+        )

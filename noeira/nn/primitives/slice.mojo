@@ -14,7 +14,8 @@ No params, no cache. Conforms to `Module`.
 
 from max.gpu import global_idx
 from max.gpu.host import DeviceContext
-from layout import Layout, LayoutTensor, TileTensor, row_major
+from layout import TileTensor, row_major
+from noeira.core.tiles import Tile
 
 from noeira.nn.constants import DT, TPB, CPU_SIMD_W
 from ..core.tensor import Tensor, TensorImpl
@@ -29,8 +30,8 @@ from ..core.amp import AMPPolicy, NoAMP
 def _slice_forward_kernel[
     BATCH: Int, IN: Int, START: Int, OUT: Int, ADT: DType = DT,
 ](
-    input: LayoutTensor[ADT, Layout.row_major(BATCH, IN), MutAnyOrigin],
-    output: LayoutTensor[ADT, Layout.row_major(BATCH, OUT), MutAnyOrigin],
+    input: Tile[ADT, BATCH, IN],
+    output: Tile[ADT, BATCH, OUT],
 ):
     var idx = Int(global_idx.x)
     var total = BATCH * OUT
@@ -43,8 +44,8 @@ def _slice_forward_kernel[
 def _slice_backward_kernel[
     BATCH: Int, IN: Int, START: Int, OUT: Int, ADT: DType = DT,
 ](
-    grad_output: LayoutTensor[ADT, Layout.row_major(BATCH, OUT), MutAnyOrigin],
-    grad_input: LayoutTensor[ADT, Layout.row_major(BATCH, IN), MutAnyOrigin],
+    grad_output: Tile[ADT, BATCH, OUT],
+    grad_input: Tile[ADT, BATCH, IN],
 ):
     # Zero the whole grad_input and scatter the slice in. One thread
     # per [b, k] over the FULL input shape — k in [START, START+OUT)
@@ -113,8 +114,8 @@ struct Slice[IN_: Int, START_: Int, END_: Int, ADT: DType = DT](Module):
                     B, Self.IN_, Self.START_, Self.OUT_DIM, Self.ACT_DT
                 ]
             ](
-                in0.lt["gpu", Layout.row_major(B, Self.IN_)](),
-                out.lt["gpu", Layout.row_major(B, Self.OUT_DIM)](),
+                in0.tt["gpu", B, Self.IN_](),
+                out.tt["gpu", B, Self.OUT_DIM](),
                 grid_dim=n_blocks,
                 block_dim=TPB,
             )
@@ -156,8 +157,8 @@ struct Slice[IN_: Int, START_: Int, END_: Int, ADT: DType = DT](Module):
                     B, Self.IN_, Self.START_, Self.OUT_DIM, Self.ACT_DT
                 ]
             ](
-                grad_output.lt["gpu", Layout.row_major(B, Self.OUT_DIM)](),
-                gin.lt["gpu", Layout.row_major(B, Self.IN_)](),
+                grad_output.tt["gpu", B, Self.OUT_DIM](),
+                gin.tt["gpu", B, Self.IN_](),
                 grid_dim=n_blocks,
                 block_dim=TPB,
             )

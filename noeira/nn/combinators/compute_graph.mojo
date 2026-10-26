@@ -41,7 +41,6 @@ CPU + GPU (the leaves + the pool-seed / grad-accumulate run on device).
 from max.gpu import global_idx
 from max.gpu.host import DeviceContext, DeviceBuffer
 from std.memory import Pointer
-from layout import Layout, LayoutTensor
 
 from noeira.nn.constants import DT, TPB
 from ..core.initializer import Initializer
@@ -54,7 +53,7 @@ from ..core.param import ParamVisitor, ParamWalkable
 from ..core.graph_visitor import GraphVisitor
 from ..core.walkers import join_name
 from ..core.amp import AMPPolicy, NoAMP
-from .graph_module2 import TwoInputGraph
+from .graph_module2 import TwoInputGraph, NamedNodeGraph
 from .graph_decl import GraphDecl
 
 
@@ -72,7 +71,7 @@ def _cg_accum_kernel_rt[
         dst[unsafe_offset=i] = dst[unsafe_offset=i] + src[unsafe_offset=i]
 
 
-struct ComputeGraph[*DECLS: GraphDecl](TwoInputGraph & ParamWalkable):
+struct ComputeGraph[*DECLS: GraphDecl](NamedNodeGraph & ParamWalkable):
     # `TwoInputGraph` already implies `Defaultable & Movable & Deinitable`. It
     # is the bound `GraphModule2` needs to drive a graph generically — see
     # `combinators/graph_module2.mojo` for why `Module` cannot serve.
@@ -166,6 +165,11 @@ struct ComputeGraph[*DECLS: GraphDecl](TwoInputGraph & ParamWalkable):
             comptime if Self.DECLS[j].NAME == nm:
                 s = j
         return s
+
+    @staticmethod
+    def has_node[name: StaticString]() -> Bool:
+        """`NamedNodeGraph`: a decl is named `name`."""
+        return Self._slot_of[name]() >= 0
 
     def describe[
         V: GraphVisitor

@@ -21,7 +21,6 @@ Run:
 
 from std.testing import assert_true
 from max.gpu.host import DeviceContext
-from layout import Layout
 
 from noeira.nn.constants import DT
 from noeira.nn.core.tensor import Tensor

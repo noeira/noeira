@@ -30,7 +30,6 @@ Known deviations from Box2D (noted where they apply):
   - shapes have no skin radius (Box2D polygons carry 2 * linear slop).
 """
 
-from layout import LayoutTensor, Layout
 from std.math import cos, sin
 
 from ..constants import (
@@ -69,13 +68,14 @@ from ..constants import (
     B2_VELOCITY_THRESHOLD,
 )
 from ..traits.solver import ConstraintSolver
+from noeira.core.tiles import Tile, tile
 
 
 @always_inline
 def _ld[
     BATCH: Int, SIZE: Int
 ](
-    t: LayoutTensor[dtype, Layout.row_major(BATCH, SIZE), MutAnyOrigin],
+    t: Tile[dtype, BATCH, SIZE],
     env: Int,
     i: Int,
 ) -> Scalar[dtype]:
@@ -118,25 +118,11 @@ struct ImpulseSolver(ConstraintSolver):
         MAX_CONTACTS: Int,
     ](
         self,
-        mut bodies: LayoutTensor[
-            dtype,
-            Layout.row_major(BATCH, NUM_BODIES, BODY_STATE_SIZE),
-            MutAnyOrigin,
-        ],
-        mut contacts: LayoutTensor[
-            dtype,
-            Layout.row_major(BATCH, MAX_CONTACTS, CONTACT_DATA_SIZE),
-            MutAnyOrigin,
-        ],
-        contact_counts: LayoutTensor[
-            dtype, Layout.row_major(BATCH), MutAnyOrigin
-        ],
+        bodies: Tile[dtype, BATCH, NUM_BODIES, BODY_STATE_SIZE],
+        contacts: Tile[dtype, BATCH, MAX_CONTACTS, CONTACT_DATA_SIZE],
+        contact_counts: Tile[dtype, BATCH],
     ):
-        var state = LayoutTensor[
-            dtype,
-            Layout.row_major(BATCH, NUM_BODIES * BODY_STATE_SIZE),
-            MutAnyOrigin,
-        ](bodies.ptr)
+        var state = tile[BATCH, NUM_BODIES * BODY_STATE_SIZE](bodies.ptr)
         for env in range(BATCH):
             Self.init_velocity_single_env[
                 BATCH, NUM_BODIES, MAX_CONTACTS, NUM_BODIES * BODY_STATE_SIZE, 0
@@ -148,25 +134,11 @@ struct ImpulseSolver(ConstraintSolver):
         MAX_CONTACTS: Int,
     ](
         self,
-        mut bodies: LayoutTensor[
-            dtype,
-            Layout.row_major(BATCH, NUM_BODIES, BODY_STATE_SIZE),
-            MutAnyOrigin,
-        ],
-        mut contacts: LayoutTensor[
-            dtype,
-            Layout.row_major(BATCH, MAX_CONTACTS, CONTACT_DATA_SIZE),
-            MutAnyOrigin,
-        ],
-        contact_counts: LayoutTensor[
-            dtype, Layout.row_major(BATCH), MutAnyOrigin
-        ],
+        bodies: Tile[dtype, BATCH, NUM_BODIES, BODY_STATE_SIZE],
+        contacts: Tile[dtype, BATCH, MAX_CONTACTS, CONTACT_DATA_SIZE],
+        contact_counts: Tile[dtype, BATCH],
     ):
-        var state = LayoutTensor[
-            dtype,
-            Layout.row_major(BATCH, NUM_BODIES * BODY_STATE_SIZE),
-            MutAnyOrigin,
-        ](bodies.ptr)
+        var state = tile[BATCH, NUM_BODIES * BODY_STATE_SIZE](bodies.ptr)
         for env in range(BATCH):
             Self.solve_velocity_single_env[
                 BATCH, NUM_BODIES, MAX_CONTACTS, NUM_BODIES * BODY_STATE_SIZE, 0
@@ -178,25 +150,11 @@ struct ImpulseSolver(ConstraintSolver):
         MAX_CONTACTS: Int,
     ](
         self,
-        mut bodies: LayoutTensor[
-            dtype,
-            Layout.row_major(BATCH, NUM_BODIES, BODY_STATE_SIZE),
-            MutAnyOrigin,
-        ],
-        contacts: LayoutTensor[
-            dtype,
-            Layout.row_major(BATCH, MAX_CONTACTS, CONTACT_DATA_SIZE),
-            MutAnyOrigin,
-        ],
-        contact_counts: LayoutTensor[
-            dtype, Layout.row_major(BATCH), MutAnyOrigin
-        ],
+        bodies: Tile[dtype, BATCH, NUM_BODIES, BODY_STATE_SIZE],
+        contacts: Tile[dtype, BATCH, MAX_CONTACTS, CONTACT_DATA_SIZE],
+        contact_counts: Tile[dtype, BATCH],
     ) -> Bool:
-        var state = LayoutTensor[
-            dtype,
-            Layout.row_major(BATCH, NUM_BODIES * BODY_STATE_SIZE),
-            MutAnyOrigin,
-        ](bodies.ptr)
+        var state = tile[BATCH, NUM_BODIES * BODY_STATE_SIZE](bodies.ptr)
         var all_ok = True
         for env in range(BATCH):
             if not Self.solve_position_single_env[
@@ -219,14 +177,8 @@ struct ImpulseSolver(ConstraintSolver):
         BODIES_OFFSET: Int,
     ](
         env: Int,
-        state: LayoutTensor[
-            dtype, Layout.row_major(BATCH, STATE_SIZE), MutAnyOrigin
-        ],
-        contacts: LayoutTensor[
-            dtype,
-            Layout.row_major(BATCH, MAX_CONTACTS, CONTACT_DATA_SIZE),
-            MutAnyOrigin,
-        ],
+        state: Tile[dtype, BATCH, STATE_SIZE],
+        contacts: Tile[dtype, BATCH, MAX_CONTACTS, CONTACT_DATA_SIZE],
         contact_count: Int,
         restitution: Scalar[dtype],
     ):
@@ -313,14 +265,8 @@ struct ImpulseSolver(ConstraintSolver):
         BODIES_OFFSET: Int,
     ](
         env: Int,
-        state: LayoutTensor[
-            dtype, Layout.row_major(BATCH, STATE_SIZE), MutAnyOrigin
-        ],
-        contacts: LayoutTensor[
-            dtype,
-            Layout.row_major(BATCH, MAX_CONTACTS, CONTACT_DATA_SIZE),
-            MutAnyOrigin,
-        ],
+        state: Tile[dtype, BATCH, STATE_SIZE],
+        contacts: Tile[dtype, BATCH, MAX_CONTACTS, CONTACT_DATA_SIZE],
         contact_count: Int,
         friction: Scalar[dtype],
     ):
@@ -415,14 +361,8 @@ struct ImpulseSolver(ConstraintSolver):
         BODIES_OFFSET: Int,
     ](
         env: Int,
-        state: LayoutTensor[
-            dtype, Layout.row_major(BATCH, STATE_SIZE), MutAnyOrigin
-        ],
-        contacts: LayoutTensor[
-            dtype,
-            Layout.row_major(BATCH, MAX_CONTACTS, CONTACT_DATA_SIZE),
-            MutAnyOrigin,
-        ],
+        state: Tile[dtype, BATCH, STATE_SIZE],
+        contacts: Tile[dtype, BATCH, MAX_CONTACTS, CONTACT_DATA_SIZE],
         contact_count: Int,
         linear_slop: Scalar[dtype] = Scalar[dtype](B2_LINEAR_SLOP),
         baumgarte: Scalar[dtype] = Scalar[dtype](B2_BAUMGARTE),
@@ -516,9 +456,7 @@ struct ImpulseSolver(ConstraintSolver):
         BATCH: Int, STATE_SIZE: Int, BODIES_OFFSET: Int
     ](
         env: Int,
-        state: LayoutTensor[
-            dtype, Layout.row_major(BATCH, STATE_SIZE), MutAnyOrigin
-        ],
+        state: Tile[dtype, BATCH, STATE_SIZE],
         a: Int,
         b: Int,
         rax: Scalar[dtype],
@@ -546,9 +484,7 @@ struct ImpulseSolver(ConstraintSolver):
         BATCH: Int, STATE_SIZE: Int, BODIES_OFFSET: Int
     ](
         env: Int,
-        state: LayoutTensor[
-            dtype, Layout.row_major(BATCH, STATE_SIZE), MutAnyOrigin
-        ],
+        state: Tile[dtype, BATCH, STATE_SIZE],
         a: Int,
         b: Int,
         jx: Scalar[dtype],

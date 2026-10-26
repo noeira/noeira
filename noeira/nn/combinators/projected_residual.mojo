@@ -13,7 +13,6 @@ grad_output and sums their grad-inputs. (Branch vjps must not mutate grad_output
 """
 
 from max.gpu.host import DeviceContext
-from layout import Layout
 
 from noeira.nn.constants import DT, TPB, CPU_SIMD_W
 from ..core.initializer import Initializer
@@ -132,9 +131,9 @@ struct ProjectedResidual[Inner: Module, Skip: Module](Module):
             var c = ctx.value()
             out.ensure_gpu(c, N)
             c.enqueue_function[_resid_add_kernel[N, Self.ACT_DT]](
-                self.inner_out.lt["gpu", Layout.row_major(N)](),
-                self.skip_out.lt["gpu", Layout.row_major(N)](),
-                out.lt["gpu", Layout.row_major(N)](),
+                self.inner_out.tt["gpu", N](),
+                self.skip_out.tt["gpu", N](),
+                out.tt["gpu", N](),
                 grid_dim=(N + TPB - 1) // TPB,
                 block_dim=TPB,
             )
@@ -185,9 +184,9 @@ struct ProjectedResidual[Inner: Module, Skip: Module](Module):
             var c = ctx.value()
             gin.ensure_gpu(c, NIN)
             c.enqueue_function[_resid_add_kernel[NIN, Self.ACT_DT]](
-                self.gi_inner.lt["gpu", Layout.row_major(NIN)](),
-                self.gi_skip.lt["gpu", Layout.row_major(NIN)](),
-                gin.lt["gpu", Layout.row_major(NIN)](),
+                self.gi_inner.tt["gpu", NIN](),
+                self.gi_skip.tt["gpu", NIN](),
+                gin.tt["gpu", NIN](),
                 grid_dim=(NIN + TPB - 1) // TPB,
                 block_dim=TPB,
             )

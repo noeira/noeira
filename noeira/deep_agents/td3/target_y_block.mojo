@@ -44,7 +44,6 @@ Surface:
 
 from max.gpu import global_idx
 from max.gpu.host import DeviceContext
-from layout import Layout, LayoutTensor
 
 from noeira.nn.constants import DT, TPB
 from noeira.nn.core.amp import AMPPolicy, NoAMP
@@ -63,10 +62,11 @@ from noeira.nn.random.box_muller import box_muller_normal, box_muller_normal_gpu
 from ..loss.loss_block import LossBlock
 from ..training.terminal_mask import apply_terminal_mask
 from ..training.trainer_block import TrainerState
+from noeira.core.tiles import Tile
 
 
 def _scale_inplace_kernel[N: Int](
-    buf: LayoutTensor[DT, Layout.row_major(N), MutAnyOrigin],
+    buf: Tile[DT, N],
     s: Scalar[DT],
 ):
     """`buf[idx] *= s` — σ-scale the device standard-normal noise buffer
@@ -194,14 +194,14 @@ struct TD3TargetYBlock[
                 self.noise.data[k] = self.noise.data[k] * sigma
         else:
             var c = ctx.value()
-            var noise_flat = self.noise.lt["gpu", Layout.row_major(N)]()
+            var noise_flat = self.noise.tt["gpu", N]()
             box_muller_normal_gpu[N](
                 c, noise_flat.ptr, self._noise_rng_seed, self._noise_rng_offset,
             )
             self._noise_rng_offset += UInt64(((N + 1) // 2) * 2)
             comptime n_blocks = (N + TPB - 1) // TPB
             c.enqueue_function[_scale_inplace_kernel[N]](
-                self.noise.lt["gpu", Layout.row_major(N)](),
+                self.noise.tt["gpu", N](),
                 sigma,
                 grid_dim=n_blocks,
                 block_dim=TPB,
@@ -217,7 +217,7 @@ struct TD3TargetYBlock[
         # mb_y now holds the bootstrap γ·min; fold in reward + terminal mask.
         apply_terminal_mask[target, Self.BATCH](
             ctx,
-            state.mb_r.lt[target, Layout.row_major(Self.BATCH)](),
-            state.mb_d.lt[target, Layout.row_major(Self.BATCH)](),
-            state.mb_y.lt[target, Layout.row_major(Self.BATCH, 1)](),
+            state.mb_r.tt[target, Self.BATCH](),
+            state.mb_d.tt[target, Self.BATCH](),
+            state.mb_y.tt[target, Self.BATCH, 1](),
         )

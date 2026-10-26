@@ -30,7 +30,7 @@ from a table: a caller that forgets it gets an obviously empty answer at the
 call site rather than a silently invisible mesh.
 """
 
-from layout import Layout, LayoutTensor
+from layout import TileTensor, TensorLayout
 
 from noeira.math3d import Vec3 as Vec3Generic, Quat as QuatGeneric
 
@@ -51,9 +51,9 @@ from .triangle import ray_basis, ray_triangle
 
 @always_inline
 def _v3[
-    DTYPE: DType, L_TRI: Layout
+    DTYPE: DType, L_TRI: TensorLayout
 ](
-    tri: LayoutTensor[DTYPE, L_TRI, MutAnyOrigin], o: Int
+    tri: TileTensor[DTYPE, L_TRI, MutAnyOrigin], o: Int
 ) -> Vec3Generic[DTYPE]:
     """Three consecutive floats as a vertex."""
     return Vec3Generic[DTYPE](
@@ -85,12 +85,12 @@ struct MeshHit[DTYPE: DType](Copyable, ImplicitlyCopyable, Movable):
 
 
 def ray_mesh[
-    DTYPE: DType, L_TRI: Layout
+    DTYPE: DType, L_TRI: TensorLayout
 ](
     pos: Vec3Generic[DTYPE],
     quat: QuatGeneric[DTYPE],
     half_extents: Vec3Generic[DTYPE],
-    tri: LayoutTensor[DTYPE, L_TRI, MutAnyOrigin],
+    tri: TileTensor[DTYPE, L_TRI, MutAnyOrigin],
     triadr: Int,
     ntri: Int,
     pnt: Vec3Generic[DTYPE],
@@ -192,12 +192,12 @@ def _inv_safe[
 
 
 def ray_mesh_bvh[
-    DTYPE: DType, L_TRI: Layout
+    DTYPE: DType, L_TRI: TensorLayout
 ](
     pos: Vec3Generic[DTYPE],
     quat: QuatGeneric[DTYPE],
     half_extents: Vec3Generic[DTYPE],
-    tri: LayoutTensor[DTYPE, L_TRI, MutAnyOrigin],
+    tri: TileTensor[DTYPE, L_TRI, MutAnyOrigin],
     triadr: Int,
     ntri: Int,
     bvhadr: Int,

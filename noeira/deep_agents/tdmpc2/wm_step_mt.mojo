@@ -23,7 +23,6 @@ See `wm_step.mojo` for the forward/reverse scan documentation.
 
 from max.gpu import global_idx
 from max.gpu.host import DeviceContext
-from layout import Layout, LayoutTensor
 
 from noeira.nn.constants import DT, TPB
 from noeira.nn.core.tensor import Tensor
@@ -40,12 +39,13 @@ from .wm_step import (
     WMLossOut, _extract_carry_k, _seed_wm_k, _accum_metric_k, _copy_slice_k,
 )
 from .task_embedding import TaskEmbedding
+from noeira.core.tiles import Tile, tile
 
 
 def _build_oaug_k[H1B: Int, MAXOBS: Int, EMB: Int, B: Int](
-    obs: LayoutTensor[DT, Layout.row_major(H1B * MAXOBS), MutAnyOrigin],
-    tem: LayoutTensor[DT, Layout.row_major(B * EMB), MutAnyOrigin],
-    oaug: LayoutTensor[DT, Layout.row_major(H1B * (MAXOBS + EMB)), MutAnyOrigin],
+    obs: Tile[DT, H1B * MAXOBS],
+    tem: Tile[DT, B * EMB],
+    oaug: Tile[DT, H1B * (MAXOBS + EMB)],
 ):
     """oaug[row] = [obs[row] | tem[row % B]] — broadcast the per-window task
     embedding across the (H+1) frames (row = t*B + b)."""
@@ -242,9 +242,9 @@ struct WMStepMT[
             var c = ctx.value()
             comptime nb = (H1B * AOBS + TPB - 1) // TPB
             c.enqueue_function[_build_oaug_k[H1B, MO, EMB, BB]](
-                obs.lt["gpu", Layout.row_major(H1B * MO)](),
-                self.tem.lt["gpu", Layout.row_major(BB * EMB)](),
-                self.oaug.lt["gpu", Layout.row_major(H1B * AOBS)](),
+                obs.tt["gpu", H1B * MO](),
+                self.tem.tt["gpu", BB * EMB](),
+                self.oaug.tt["gpu", H1B * AOBS](),
                 grid_dim=nb, block_dim=TPB,
             )
 
@@ -456,10 +456,8 @@ struct WMStepMT[
                 off, BB * LAT
             )
             c.enqueue_function[_extract_carry_k[BB, LAT, OW]](
-                self.out_t.lt["gpu", Layout.row_major(BB * OW)](),
-                LayoutTensor[DT, Layout.row_major(BB * LAT), MutAnyOrigin](
-                    carry_sub
-                ),
+                self.out_t.tt["gpu", BB * OW](),
+                tile[BB * LAT](carry_sub),
                 grid_dim=nb, block_dim=TPB,
             )
 
@@ -493,8 +491,8 @@ struct WMStepMT[
         else:
             var c = ctx.value()
             c.enqueue_function[_accum_metric_k[BB, OW, NQ]](
-                self.out_t.lt["gpu", Layout.row_major(BB * OW)](),
-                self.acc.lt["gpu", Layout.row_major(4)](),
+                self.out_t.tt["gpu", BB * OW](),
+                self.acc.tt["gpu", 4](),
                 sc_cons, sc_rew, sc_val, sc_term,
                 grid_dim=1, block_dim=1,
             )
@@ -523,8 +521,8 @@ struct WMStepMT[
             var c = ctx.value()
             comptime nb = (BB + TPB - 1) // TPB
             c.enqueue_function[_seed_wm_k[BB, OW, LAT, NQ]](
-                self.seed.lt["gpu", Layout.row_major(BB * OW)](),
-                self.gz.lt["gpu", Layout.row_major(BB * LAT)](),
+                self.seed.tt["gpu", BB * OW](),
+                self.gz.tt["gpu", BB * LAT](),
                 sc_cons, sc_rew, sc_val, sc_term,
                 grid_dim=nb, block_dim=TPB,
             )
@@ -542,7 +540,7 @@ struct WMStepMT[
             var c = ctx.value()
             comptime nb = (BB * LAT + TPB - 1) // TPB
             c.enqueue_function[_copy_slice_k[BB * LAT]](
-                graph.grad_input["z"]().lt["gpu", Layout.row_major(BB * LAT)](),
-                self.gz.lt["gpu", Layout.row_major(BB * LAT)](),
+                graph.grad_input["z"]().tt["gpu", BB * LAT](),
+                self.gz.tt["gpu", BB * LAT](),
                 grid_dim=nb, block_dim=TPB,
             )

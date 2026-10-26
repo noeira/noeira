@@ -19,7 +19,6 @@ loop temporaries stay as InlineArrays inside the kernel (GPU-safe).
 """
 
 from max.gpu.host import DeviceContext
-from layout import Layout
 
 from noeira.nn.core.tensor import TensorImpl
 

@@ -17,7 +17,7 @@ from max.gpu.host import DeviceContext
 from std.math import sqrt, log, cos, pi
 from std.random.philox import Random as PhiloxRandom
 from std.time import perf_counter_ns
-from layout import Layout, LayoutTensor
+from noeira.core.tiles import Tile, tile
 
 from noeira.nn.constants import DT as dtype
 from noeira.experimental.pcn.pc_constants import TPB
@@ -75,10 +75,8 @@ def _copy_lat_to_x_in_kernel[
     LATENT_DIM: Int,
     KDT: DType,
 ](
-    latents: LayoutTensor[
-        KDT, Layout.row_major(BATCH, LATENT_DIM), MutAnyOrigin
-    ],
-    x_in: LayoutTensor[KDT, Layout.row_major(BATCH, HIDDEN), MutAnyOrigin],
+    latents: Tile[KDT, BATCH, LATENT_DIM],
+    x_in: Tile[KDT, BATCH, HIDDEN],
 ):
     """Copy lat[:, 0:HIDDEN] → x_in[:, 0:HIDDEN]. Here IN_DIM == HIDDEN."""
     var idx = Int(block_dim.x * block_idx.x + thread_idx.x)
@@ -159,44 +157,18 @@ def main() raises:
         OPT.GLOBAL_STATE_SIZE
     )
 
-    var params_t = LayoutTensor[
-        dtype, Layout.row_major(NET.PARAM_SIZE), MutAnyOrigin
-    ](params_dbuf)
-    var grads_t = LayoutTensor[
-        dtype, Layout.row_major(NET.PARAM_SIZE), MutAnyOrigin
-    ](grads_dbuf)
-    var lat_t = LayoutTensor[
-        dtype, Layout.row_major(BATCH, NET.LATENT_DIM), MutAnyOrigin
-    ](lat_dbuf)
-    var mu_eps_t = LayoutTensor[
-        dtype, Layout.row_major(BATCH, NET.SCRATCH_OUT_DIM), MutAnyOrigin
-    ](mu_eps_dbuf)
-    var a_below_t = LayoutTensor[
-        dtype, Layout.row_major(BATCH, NET.SCRATCH_IN_DIM), MutAnyOrigin
-    ](a_below_dbuf)
-    var z_below_t = LayoutTensor[
-        dtype, Layout.row_major(BATCH, NET.SCRATCH_IN_DIM), MutAnyOrigin
-    ](z_below_dbuf)
-    var dx_t = LayoutTensor[
-        dtype, Layout.row_major(BATCH, NET.LATENT_DIM), MutAnyOrigin
-    ](dx_dbuf)
-    var noise_t = LayoutTensor[
-        dtype, Layout.row_major(BATCH, NET.LATENT_DIM), MutAnyOrigin
-    ](noise_dbuf)
-    var x_in_t = LayoutTensor[
-        dtype, Layout.row_major(BATCH, HIDDEN), MutAnyOrigin
-    ](x_in_dbuf)
-    var y_tgt_t = LayoutTensor[
-        dtype, Layout.row_major(BATCH, DATA_DIM), MutAnyOrigin
-    ](y_tgt_dbuf)
-    var opt_state_t = LayoutTensor[
-        dtype,
-        Layout.row_major(NET.PARAM_SIZE, OPT.STATE_PER_PARAM),
-        MutAnyOrigin,
-    ](opt_state_dbuf)
-    var opt_global_t = LayoutTensor[
-        dtype, Layout.row_major(OPT.GLOBAL_STATE_SIZE), MutAnyOrigin
-    ](opt_global_dbuf)
+    var params_t = tile[NET.PARAM_SIZE](params_dbuf)
+    var grads_t = tile[NET.PARAM_SIZE](grads_dbuf)
+    var lat_t = tile[BATCH, NET.LATENT_DIM](lat_dbuf)
+    var mu_eps_t = tile[BATCH, NET.SCRATCH_OUT_DIM](mu_eps_dbuf)
+    var a_below_t = tile[BATCH, NET.SCRATCH_IN_DIM](a_below_dbuf)
+    var z_below_t = tile[BATCH, NET.SCRATCH_IN_DIM](z_below_dbuf)
+    var dx_t = tile[BATCH, NET.LATENT_DIM](dx_dbuf)
+    var noise_t = tile[BATCH, NET.LATENT_DIM](noise_dbuf)
+    var x_in_t = tile[BATCH, HIDDEN](x_in_dbuf)
+    var y_tgt_t = tile[BATCH, DATA_DIM](y_tgt_dbuf)
+    var opt_state_t = tile[NET.PARAM_SIZE, OPT.STATE_PER_PARAM](opt_state_dbuf)
+    var opt_global_t = tile[OPT.GLOBAL_STATE_SIZE](opt_global_dbuf)
 
     # Host staging buffers
     var params_init_host = ctx.enqueue_create_host_buffer[dtype](NET.PARAM_SIZE)
@@ -221,30 +193,18 @@ def main() raises:
 
     # ── Per-block param views for eval feedforward ────────────────────────────
     comptime offset_b1 = NET._param_offset[1]()
-    var params_b0_t = LayoutTensor[
-        dtype, Layout.row_major(NET.block_types[0].PARAM_SIZE), MutAnyOrigin
-    ](params_dbuf.unsafe_ptr().as_unsafe_any_origin())
-    var params_b1_t = LayoutTensor[
-        dtype, Layout.row_major(NET.block_types[1].PARAM_SIZE), MutAnyOrigin
-    ](params_dbuf.unsafe_ptr().as_unsafe_any_origin() + offset_b1)
+    var params_b0_t = tile[NET.block_types[0].PARAM_SIZE](params_dbuf.unsafe_ptr().as_unsafe_any_origin())
+    var params_b1_t = tile[NET.block_types[1].PARAM_SIZE](params_dbuf.unsafe_ptr().as_unsafe_any_origin() + offset_b1)
 
     # Eval feedforward scratch
     var z_pred_dbuf = ctx.enqueue_create_buffer[dtype](BATCH * HIDDEN)
     var a_z_pred_dbuf = ctx.enqueue_create_buffer[dtype](BATCH * HIDDEN)
     var x_pred_dbuf = ctx.enqueue_create_buffer[dtype](BATCH * DATA_DIM)
     var a_x_pred_dbuf = ctx.enqueue_create_buffer[dtype](BATCH * HIDDEN)
-    var z_pred_t = LayoutTensor[
-        dtype, Layout.row_major(BATCH, HIDDEN), MutAnyOrigin
-    ](z_pred_dbuf)
-    var a_z_pred_t = LayoutTensor[
-        dtype, Layout.row_major(BATCH, HIDDEN), MutAnyOrigin
-    ](a_z_pred_dbuf)
-    var x_pred_t = LayoutTensor[
-        dtype, Layout.row_major(BATCH, DATA_DIM), MutAnyOrigin
-    ](x_pred_dbuf)
-    var a_x_pred_t = LayoutTensor[
-        dtype, Layout.row_major(BATCH, HIDDEN), MutAnyOrigin
-    ](a_x_pred_dbuf)
+    var z_pred_t = tile[BATCH, HIDDEN](z_pred_dbuf)
+    var a_z_pred_t = tile[BATCH, HIDDEN](a_z_pred_dbuf)
+    var x_pred_t = tile[BATCH, DATA_DIM](x_pred_dbuf)
+    var a_x_pred_t = tile[BATCH, HIDDEN](a_x_pred_dbuf)
 
     var ratio_a: Float64 = 0.0
     var ratio_b: Float64 = 0.0
@@ -264,9 +224,7 @@ def main() raises:
         # Reinit params + Adam state on host, upload.
         for i in range(NET.PARAM_SIZE):
             params_init_host.unsafe_ptr()[i] = Scalar[dtype](0)
-        var params_init_t = LayoutTensor[
-            dtype, Layout.row_major(NET.PARAM_SIZE), MutAnyOrigin
-        ](params_init_host.unsafe_ptr().as_unsafe_any_origin())
+        var params_init_t = tile[NET.PARAM_SIZE](params_init_host.unsafe_ptr().as_unsafe_any_origin())
         NET.pc_init_params[PCXavier, dtype](params_init_t)
         ctx.enqueue_copy(params_dbuf, params_init_host)
 

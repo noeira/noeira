@@ -44,15 +44,23 @@ download on save / upload on load.
 
 from noeira.core.bytes import string_from_bytes
 
-from max.gpu.host import DeviceContext
+from max.gpu.host import DeviceContext, HostBuffer
 from std.memory import bitcast, unsafe_memcpy
 from std.sys.info import size_of
 
-from noeira.io.fileio import read_file_bytes, write_file_atomic
+from noeira.io.fileio import read_file_bytes, write_file_atomic, rename_over
 from noeira.nn.constants import DT
 from .tensor import Tensor
 from .param import ParamVisitor, ParamVisitorRT, walk_params, ParamVisitorRef
 from .param import ParamWalkable
+
+comptime _WRITE_CHUNK = 1 << 30
+"""The streaming writer's largest single `write(2)`: the same 1 GiB bound as
+`noeira/io/fileio.mojo`'s chunked writes."""
+
+comptime _STAGE_ELEMS = 1 << 24
+"""Values per device-to-host copy in the streaming writer (64 MB of fp32)."""
+
 
 def _write_file_bytes(var path: String, content: List[UInt8]) raises:
     """Chunked, ATOMIC file write — see `noeira/io/fileio.mojo` for both
@@ -69,32 +77,6 @@ def _write_file_bytes(var path: String, content: List[UInt8]) raises:
 def _read_file_bytes(path: String) raises -> List[UInt8]:
     """Chunked file read — `read(2)` has the same single-call cap as write."""
     return read_file_bytes(path)
-
-
-def _bytes_append_str(mut buf: List[UInt8], s: String):
-    var sb = s.as_bytes()
-    var old = len(buf)
-    buf.resize(old + len(sb), 0)
-    unsafe_memcpy(dest=buf.unsafe_ptr().unsafe_offset(old), src=sb.unsafe_ptr(), count=len(sb))
-
-
-def _bytes_append_vals(mut buf: List[UInt8], t: Tensor, n: Int):
-    comptime SB = size_of[Scalar[DT]]()
-    var old = len(buf)
-    buf.resize(old + n * SB, 0)
-    unsafe_memcpy(
-        dest=buf.unsafe_ptr().unsafe_offset(old),
-        src=t.data.unsafe_ptr().unsafe_bitcast[UInt8](),
-        count=n * SB,
-    )
-
-
-def _bytes_append_f64(mut buf: List[UInt8], x: Float64):
-    var old = len(buf)
-    buf.resize(old + 8, 0)
-    var bits = bitcast[DType.uint64](x)
-    for i in range(8):
-        buf[old + i] = UInt8((bits >> UInt64(8 * i)) & 0xFF)
 
 
 struct CheckpointScalars(Copyable, Defaultable, Movable, Sized):
@@ -304,15 +286,22 @@ struct CheckpointReader(ParamVisitor, ParamVisitorRT):
         # already acted hits exactly that.
         param.version += 1
         if self.mode == 0 and len(toks) >= 4 and toks[3] == "1":
-            m.ensure(n)
-            v.ensure(n)
-            for i in range(n):
-                m.data[i] = Scalar[DT](atof(self._next()))
-            for i in range(n):
-                v.data[i] = Scalar[DT](atof(self._next()))
-            comptime if target == "gpu":
-                m.upload_resident(ctx.value())
-                v.upload_resident(ctx.value())
+            if grad.n == 0:
+                # A frozen param (`Param.freeze`) keeps no optimizer state:
+                # read past the moments a file saved before the freeze has
+                # for it, rather than allocating them again.
+                for _ in range(2 * n):
+                    _ = self._next()
+            else:
+                m.ensure(n)
+                v.ensure(n)
+                for i in range(n):
+                    m.data[i] = Scalar[DT](atof(self._next()))
+                for i in range(n):
+                    v.data[i] = Scalar[DT](atof(self._next()))
+                comptime if target == "gpu":
+                    m.upload_resident(ctx.value())
+                    v.upload_resident(ctx.value())
         comptime if target == "gpu":
             # ⚠ `upload_resident`, NOT `upload`. `upload` RECREATES the device
             # buffer, and under an adopted `ParamArena` this Param's val/grd/m/v
@@ -336,51 +325,190 @@ struct CheckpointReader(ParamVisitor, ParamVisitorRT):
         self.visit_rt[target](name, param, grad, m, v, N, apply_decay, ctx)
 struct BinaryCheckpointWriter(ParamVisitor, ParamVisitorRT):
     """V3 twin of `LegacyV2CheckpointWriter`: text section headers, raw-byte payloads.
-    `mode`: 0 = Param (P, with optional moments), 1 = State (S)."""
+    `mode`: 0 = Param (P, with optional moments), 1 = State (S).
+
+    Two sinks. `BinaryCheckpointWriter(save_moments)` builds the whole file in
+    `content`, for the caller to hand to `_write_file_bytes`. `to_file(path,
+    save_moments)` STREAMS each section to `path + ".tmp"` as the walk reaches
+    it, and `commit()` renames it over `path` (atomic, like
+    `write_file_atomic`); `content` stays empty.
+
+    ⚠ The in-memory sink costs a second copy of every value saved, at once. A
+    SmolVLA text-LoRA fine-tune on the 16 GB Jetson Orin (1.05 GB of values,
+    the frozen fp32 text tower among them) trained, then died at its first
+    save with 144 MB of memory left. Streaming holds one header line at a
+    time; the payloads go to the file straight from each tensor's host buffer.
+    `save_params` and `save_params_multi` stream.
+
+    ⚠ On a GPU the streaming sink does NOT `download` a tensor. `download`
+    keeps two host copies of it for good (a pinned staging buffer and the
+    `data` list), and for Adam's m and v those copies did not exist before the
+    save: on the same Orin run, a checkpoint with moments still died at 429 MB
+    after the file stopped being built in memory. The streaming sink copies
+    each device tensor through one reusable staging buffer of `stage_elems`
+    values instead, so a save holds 64 MB of staging, whatever the model. A
+    side effect `download` had is gone with it: saving no longer refreshes
+    the tensors' host `data`. The in-memory sink still downloads."""
     var content: List[UInt8]
     var mode: Int
     var save_moments: Bool
+    var _file: Optional[FileHandle]
+    """Open while streaming (`to_file`), None in the in-memory sink and after
+    `commit`."""
+    var _path: String
+    var bytes_written: Int
+    """Bytes emitted so far, by either sink."""
+    var chunk: Int
+    """The largest single write to the file (`_WRITE_CHUNK`); a test lowers it
+    to drive the chunk loop."""
+    var _stage: Optional[HostBuffer[DT]]
+    """The streaming sink's one device-to-host staging buffer, made on the
+    first GPU tensor and reused for every copy."""
+    var stage_elems: Int
+    """Values per staged copy (`_STAGE_ELEMS`); a test lowers it."""
 
     def __init__(out self, save_moments: Bool = True):
         self.content = List[UInt8]()
-        _bytes_append_str(self.content, String("storage-ckpt v3\n"))
         self.mode = 0
         self.save_moments = save_moments
+        self._file = None
+        self._path = String("")
+        self.bytes_written = 0
+        self.chunk = _WRITE_CHUNK
+        self._stage = None
+        self.stage_elems = _STAGE_ELEMS
+        var hb = String("storage-ckpt v3\n").as_bytes()
+        self._append_mem(hb.unsafe_ptr(), len(hb))
 
-    def write_scalars(mut self, scalars: CheckpointScalars):
+    @staticmethod
+    def to_file(path: String, save_moments: Bool = True) raises -> Self:
+        """A writer that streams to `path + ".tmp"`; `commit()` publishes it."""
+        var w = Self(save_moments, path)
+        return w^
+
+    def __init__(out self, save_moments: Bool, path: String) raises:
+        self.content = List[UInt8]()
+        self.mode = 0
+        self.save_moments = save_moments
+        self._file = open(path + ".tmp", "w")
+        self._path = path
+        self.bytes_written = 0
+        self.chunk = _WRITE_CHUNK
+        self._stage = None
+        self.stage_elems = _STAGE_ELEMS
+        self._put_str(String("storage-ckpt v3\n"))
+
+    def commit(mut self) raises:
+        """Close the streamed file and rename it over the target path. Until
+        this runs, a previous checkpoint at that path is untouched."""
+        if not self._file:
+            raise Error(
+                "BinaryCheckpointWriter.commit: not a streaming writer"
+                " (or already committed)"
+            )
+        self._file.value().close()
+        self._file = None
+        rename_over(self._path + ".tmp", self._path)
+
+    def _put_bytes(mut self, p: Pointer[UInt8, _], n: Int) raises:
+        if self._file:
+            var off = 0
+            while off < n:
+                var take = min(n - off, self.chunk)
+                self._file.value().write_bytes(
+                    Span(unsafe_ptr=p.unsafe_offset(off), length=take)
+                )
+                off += take
+            self.bytes_written += n
+        else:
+            self._append_mem(p, n)
+
+    def _append_mem(mut self, p: Pointer[UInt8, _], n: Int):
+        var old = len(self.content)
+        self.content.resize(old + n, 0)
+        unsafe_memcpy(
+            dest=self.content.unsafe_ptr().unsafe_offset(old), src=p, count=n
+        )
+        self.bytes_written += n
+
+    def _put_str(mut self, s: String) raises:
+        var sb = s.as_bytes()
+        self._put_bytes(sb.unsafe_ptr(), len(sb))
+
+    def _put_vals(mut self, t: Tensor, n: Int) raises:
+        comptime SB = size_of[Scalar[DT]]()
+        self._put_bytes(t.data.unsafe_ptr().unsafe_bitcast[UInt8](), n * SB)
+
+    def _put_device_vals(
+        mut self, t: Tensor, n: Int, ctx: DeviceContext
+    ) raises:
+        """The first `n` values of `t`'s DEVICE buffer, `stage_elems` at a
+        time through the one staging buffer (see the struct docstring)."""
+        comptime SB = size_of[Scalar[DT]]()
+        if not self._stage:
+            self._stage = ctx.enqueue_create_host_buffer[DT](self.stage_elems)
+        var off = 0
+        while off < n:
+            var take = min(n - off, self.stage_elems)
+            var src = t.dev.value().create_sub_buffer[DT](off, take)
+            var dst = self._stage.value().create_sub_buffer[DT](0, take)
+            ctx.enqueue_copy(dst, src)
+            ctx.synchronize()
+            self._put_bytes(
+                self._stage.value().unsafe_ptr().unsafe_bitcast[UInt8](),
+                take * SB,
+            )
+            off += take
+
+    def _put_tensor[target: StaticString](
+        mut self, t: Tensor, n: Int, ctx: Optional[DeviceContext]
+    ) raises:
+        """A GPU tensor streams from its device buffer; any other from `data`
+        (which the in-memory sink downloaded first)."""
+        comptime if target == "gpu":
+            if self._file:
+                self._put_device_vals(t, n, ctx.value())
+                return
+        self._put_vals(t, n)
+
+    def _put_f64(mut self, x: Float64) raises:
+        var b = List[UInt8](length=8, fill=0)
+        var bits = bitcast[DType.uint64](x)
+        for i in range(8):
+            b[i] = UInt8((bits >> UInt64(8 * i)) & 0xFF)
+        self._put_bytes(b.unsafe_ptr(), 8)
+
+    def write_scalars(mut self, scalars: CheckpointScalars) raises:
         """Append one `K` section per scalar. Call AFTER the last P/S section:
         the reader walks the tensors first and only then reads the scalars."""
         for i in range(len(scalars.names)):
-            _bytes_append_str(self.content, "K " + scalars.names[i] + "\n")
-            _bytes_append_f64(self.content, scalars.values[i])
+            self._put_str("K " + scalars.names[i] + "\n")
+            self._put_f64(scalars.values[i])
 
     def visit_rt[target: StaticString](
         mut self, name: String, mut param: Tensor, mut grad: Tensor,
         mut m: Tensor, mut v: Tensor, n: Int, apply_decay: Bool,
         ctx: Optional[DeviceContext],
     ) raises:
-        comptime if target == "gpu":
-            param.download(ctx.value())
-        if self.mode == 1:  # State
-            _bytes_append_str(
-                self.content, "S " + name + " " + String(n) + "\n"
-            )
-            _bytes_append_vals(self.content, param, n)
-            return
         var has_m = self.save_moments and m.n >= n and v.n >= n
         comptime if target == "gpu":
-            if has_m:
-                m.download(ctx.value())
-                v.download(ctx.value())
-        _bytes_append_str(
-            self.content,
+            if not self._file:  # the in-memory sink reads `data`
+                param.download(ctx.value())
+                if self.mode == 0 and has_m:
+                    m.download(ctx.value())
+                    v.download(ctx.value())
+        if self.mode == 1:  # State
+            self._put_str("S " + name + " " + String(n) + "\n")
+            self._put_tensor[target](param, n, ctx)
+            return
+        self._put_str(
             "P " + name + " " + String(n) + " "
-            + ("1" if has_m else "0") + "\n",
+            + ("1" if has_m else "0") + "\n"
         )
-        _bytes_append_vals(self.content, param, n)
+        self._put_tensor[target](param, n, ctx)
         if has_m:
-            _bytes_append_vals(self.content, m, n)
-            _bytes_append_vals(self.content, v, n)
+            self._put_tensor[target](m, n, ctx)
+            self._put_tensor[target](v, n, ctx)
 
     def visit[target: StaticString, N: Int](
         mut self,
@@ -452,6 +580,13 @@ struct BinaryCheckpointReader(ParamVisitor, ParamVisitorRT):
             src=self.bytes.unsafe_ptr().unsafe_offset(self.cur),
             count=n * SB,
         )
+        self.cur += n * SB
+
+    def _skip_vals(mut self, n: Int) raises:
+        """Advance past `n` values without storing them."""
+        comptime SB = size_of[Scalar[DT]]()
+        if self.cur + n * SB > len(self.bytes):
+            raise Error(self._eof(String("skipping ") + String(n) + " values"))
         self.cur += n * SB
 
     def read_scalars(mut self) raises -> CheckpointScalars:
@@ -536,13 +671,18 @@ struct BinaryCheckpointReader(ParamVisitor, ParamVisitorRT):
         # `w_bf`) keep serving the pre-load weight.
         param.version += 1
         if self.mode == 0 and len(toks) >= 4 and toks[3] == "1":
-            m.ensure(n)
-            v.ensure(n)
-            self._take_vals(m, n)
-            self._take_vals(v, n)
-            comptime if target == "gpu":
-                m.upload_resident(ctx.value())
-                v.upload_resident(ctx.value())
+            if grad.n == 0:
+                # A frozen param keeps no optimizer state: skip the moments a
+                # file written before the freeze has for it (see the v2 reader).
+                self._skip_vals(2 * n)
+            else:
+                m.ensure(n)
+                v.ensure(n)
+                self._take_vals(m, n)
+                self._take_vals(v, n)
+                comptime if target == "gpu":
+                    m.upload_resident(ctx.value())
+                    v.upload_resident(ctx.value())
         comptime if target == "gpu":
             # ⚠ `upload_resident`, NOT `upload`. `upload` RECREATES the device
             # buffer, and under an adopted `ParamArena` this Param's val/grd/m/v
@@ -574,7 +714,8 @@ def write_model[
 ) raises:
     """One model's Param then State sections, names under `prefix`. A trainer
     with several nets calls this once per net, then `write_scalars`, then
-    `_write_file_bytes` — and loads with `read_model` in the SAME order."""
+    `commit()` (a `to_file` writer) — and loads with `read_model` in the SAME
+    order."""
     w.mode = 0
     walk_params[target](model, w, ctx, prefix)
     w.mode = 1
@@ -610,14 +751,14 @@ def save_params[
 ) raises:
     """Write a v3 named checkpoint: Params (+ moments if populated), then
     States, then one `K` section per entry of `scalars`."""
-    var w = BinaryCheckpointWriter(save_moments)
+    var w = BinaryCheckpointWriter.to_file(path, save_moments)
     w.mode = 0
     walk_params[target](model, w, ctx)
     w.mode = 1
     var _sref1 = ParamVisitorRef.of[type_of(w), target](w)
     model.for_each_state[target](_sref1, ctx)
     w.write_scalars(scalars)
-    _write_file_bytes(path, w.content)
+    w.commit()
 
 
 def load_params[
@@ -674,7 +815,7 @@ def save_params_multi[
     same models in the same order, so each section's dotted name is validated
     against its own model — duplicate names across models never collide. Replaces
     the per-model sidecar layout (plain `save_params` is whole-file-per-model)."""
-    var w = BinaryCheckpointWriter(save_moments)
+    var w = BinaryCheckpointWriter.to_file(path, save_moments)
 
     comptime for i in range(models.__len__()):
         w.mode = 0
@@ -683,7 +824,7 @@ def save_params_multi[
         var _sref4 = ParamVisitorRef.of[type_of(w), target](w)
         models[i].for_each_state[target](_sref4, ctx)
     w.write_scalars(scalars)
-    _write_file_bytes(path, w.content)
+    w.commit()
 
 
 def load_params_multi[

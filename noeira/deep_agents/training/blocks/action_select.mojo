@@ -17,7 +17,6 @@ the driver's LayoutTensor obs into the owned scratch Tensor the storage
 The warmup-uniform branch stays in each trainer (it precedes this call).
 """
 
-from layout import Layout, LayoutTensor
 from max.gpu.host import DeviceContext
 from std.random import random_float64
 
@@ -38,12 +37,13 @@ from .action_kernels import (
     offpolicy_noise_clamp_kernel,
     offpolicy_clamp_action_kernel,
 )
+from noeira.core.tiles import Tile
 
 
 def warmup_uniform_batched[
     target: StaticString, N_ENVS: Int, ACT: Int
 ](
-    action: LayoutTensor[DT, Layout.row_major(N_ENVS, ACT), MutAnyOrigin],
+    action: Tile[DT, N_ENVS, ACT],
     action_scale: Scalar[DT],
     ctx: Optional[DeviceContext],
     mut warmup_rng_seed: UInt64,
@@ -82,8 +82,8 @@ def select_deterministic_batched[
     mut ob_scr: Tensor,
     mut ao_scr: Tensor,
     mut noise_scr: Tensor,
-    obs: LayoutTensor[DT, Layout.row_major(N_ENVS, OBS), MutAnyOrigin],
-    action: LayoutTensor[DT, Layout.row_major(N_ENVS, ACT), MutAnyOrigin],
+    obs: Tile[DT, N_ENVS, OBS],
+    action: Tile[DT, N_ENVS, ACT],
     sigma: Scalar[DT],
     action_scale: Scalar[DT],
     ctx: Optional[DeviceContext],
@@ -126,7 +126,7 @@ def select_deterministic_batched[
         comptime tot_obs = N_ENVS * OBS
         c.enqueue_function[offpolicy_copy2d_kernel[N_ENVS, OBS]](
             obs,
-            ob_scr.lt["gpu", Layout.row_major(N_ENVS, OBS)](),
+            ob_scr.tt["gpu", N_ENVS, OBS](),
             grid_dim=(tot_obs + TPB - 1) // TPB,
             block_dim=TPB,
         )
@@ -137,14 +137,14 @@ def select_deterministic_batched[
         # box-muller fills the noise scratch (ACT-packed, flat); take a 1-D
         # device view and pass its concrete-origin `.ptr`
         # (box_muller_normal_gpu rebuilds the view).
-        var noise_flat = noise_scr.lt["gpu", Layout.row_major(tot_act)]()
+        var noise_flat = noise_scr.tt["gpu", tot_act]()
         box_muller_normal_gpu[tot_act](
             c, noise_flat.ptr, noise_rng_seed, noise_rng_offset
         )
         noise_rng_offset += UInt64(((tot_act + 1) // 2) * 2)
         c.enqueue_function[offpolicy_noise_clamp_kernel[N_ENVS, ACT]](
-            ao_scr.lt["gpu", Layout.row_major(N_ENVS, ACT)](),
-            noise_scr.lt["gpu", Layout.row_major(N_ENVS, ACT)](),
+            ao_scr.tt["gpu", N_ENVS, ACT](),
+            noise_scr.tt["gpu", N_ENVS, ACT](),
             action,
             sigma,
             action_scale,
@@ -165,8 +165,8 @@ def select_squashed_batched[
     mut ob_scr: Tensor,
     mut ao_scr: Tensor,
     mut alp_scr: Tensor,
-    obs: LayoutTensor[DT, Layout.row_major(N_ENVS, OBS), MutAnyOrigin],
-    action: LayoutTensor[DT, Layout.row_major(N_ENVS, ACT), MutAnyOrigin],
+    obs: Tile[DT, N_ENVS, OBS],
+    action: Tile[DT, N_ENVS, ACT],
     action_scale: Scalar[DT],
     ctx: Optional[DeviceContext],
 ) raises:
@@ -203,7 +203,7 @@ def select_squashed_batched[
         comptime tot_obs = N_ENVS * OBS
         c.enqueue_function[offpolicy_copy2d_kernel[N_ENVS, OBS]](
             obs,
-            ob_scr.lt["gpu", Layout.row_major(N_ENVS, OBS)](),
+            ob_scr.tt["gpu", N_ENVS, OBS](),
             grid_dim=(tot_obs + TPB - 1) // TPB,
             block_dim=TPB,
         )
@@ -215,7 +215,7 @@ def select_squashed_batched[
         c.enqueue_function[
             offpolicy_clamp_action_kernel[N_ENVS, ACT, ACT + 1]
         ](
-            alp_scr.lt["gpu", Layout.row_major(N_ENVS, ACT + 1)](),
+            alp_scr.tt["gpu", N_ENVS, ACT + 1](),
             action,
             action_scale,
             grid_dim=(tot_act + TPB - 1) // TPB,

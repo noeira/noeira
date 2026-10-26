@@ -25,7 +25,6 @@ from std.math import sqrt
 from max.gpu import global_idx, thread_idx, block_idx
 from max.gpu.primitives import block
 from max.gpu.host import DeviceContext
-from layout import Layout, LayoutTensor
 
 from noeira.nn.constants import DT, TPB
 from ..core.tensor import Tensor
@@ -79,6 +78,8 @@ struct _SumSqCPU(ParamVisitor, ParamVisitorRT):
         mut m: Tensor, mut v: Tensor, n: Int, apply_decay: Bool,
         ctx: Optional[DeviceContext],
     ) raises:
+        if grad.n == 0:  # frozen param: no gradient, nothing to do
+            return
         for i in range(n):
             var g = grad.data[i]
             self.sum_sq += g * g
@@ -105,6 +106,8 @@ struct _ScaleCPU(ParamVisitor, ParamVisitorRT):
         mut m: Tensor, mut v: Tensor, n: Int, apply_decay: Bool,
         ctx: Optional[DeviceContext],
     ) raises:
+        if grad.n == 0:  # frozen param: no gradient, nothing to do
+            return
         if self.scale == Scalar[DT](0.0):
             for i in range(n):
                 grad.data[i] = Scalar[DT](0.0)
@@ -136,6 +139,8 @@ struct _SumSqGPU(ParamVisitor, ParamVisitorRT):
         mut m: Tensor, mut v: Tensor, n: Int, apply_decay: Bool,
         ctx: Optional[DeviceContext],
     ) raises:
+        if grad.n == 0:  # frozen param: no gradient, nothing to do
+            return
         var c = ctx.value()
         self.psum.ensure_gpu(c, 1)
         c.enqueue_function[_sum_sq_kernel_rt](
@@ -172,6 +177,8 @@ struct _ScaleGPU(ParamVisitor, ParamVisitorRT):
         mut m: Tensor, mut v: Tensor, n: Int, apply_decay: Bool,
         ctx: Optional[DeviceContext],
     ) raises:
+        if grad.n == 0:  # frozen param: no gradient, nothing to do
+            return
         var c = ctx.value()
         var nblk = (n + TPB - 1) // TPB
         c.enqueue_function[_scale_kernel_rt](

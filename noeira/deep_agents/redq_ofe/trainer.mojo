@@ -37,7 +37,6 @@ from noeira.nn.core.param import walk_params, ParamVisitorRef
 from std.math import exp as fexp, log as flog, tanh as ftanh
 from std.random import random_float64
 from std.random.philox import Random as PhiloxRandom
-from layout import Layout, LayoutTensor
 
 from max.gpu import global_idx
 from max.gpu.host import DeviceContext, DeviceBuffer
@@ -55,7 +54,7 @@ from noeira.nn.optimizer.scalar_adam import ScalarAdam
 from noeira.nn.core.checkpoint import (
     BinaryCheckpointWriter, BinaryCheckpointReader, CheckpointReader,
     CheckpointScalars, write_model, read_model, _split_lines, _is_v3_header,
-    _read_file_bytes, _write_file_bytes,
+    _read_file_bytes,
 )
 
 from noeira.nn.core.log_bundle import log_bundle
@@ -81,6 +80,7 @@ from .ensemble_target_y_block_ofe import EnsembleTargetYBlockOFE
 from .ensemble_critic_step_ofe import EnsembleCriticStepOFE
 from .ensemble_actor_step_ofe import EnsembleActorStepOFE
 from .metrics import REDQOFEMetrics
+from noeira.core.tiles import Tile
 
 
 # ──────────────────────────────────────────────────────────────────────
@@ -499,18 +499,10 @@ struct REDQOFETrainer[
         N_ENVS: Int
     ](
         mut self,
-        obs: LayoutTensor[
-            DT, Layout.row_major(N_ENVS, Self.AGENT_OBS_DIM), MutAnyOrigin
-        ],
-        action: LayoutTensor[
-            DT, Layout.row_major(N_ENVS, Self.AGENT_ACT_DIM), MutAnyOrigin
-        ],
-        ao_scratch: LayoutTensor[
-            DT, Layout.row_major(N_ENVS, 2 * Self.AGENT_ACT_DIM), MutAnyOrigin
-        ],
-        alp_scratch: LayoutTensor[
-            DT, Layout.row_major(N_ENVS, Self.AGENT_ACT_DIM + 1), MutAnyOrigin
-        ],
+        obs: Tile[DT, N_ENVS, Self.AGENT_OBS_DIM],
+        action: Tile[DT, N_ENVS, Self.AGENT_ACT_DIM],
+        ao_scratch: Tile[DT, N_ENVS, 2 * Self.AGENT_ACT_DIM],
+        alp_scratch: Tile[DT, N_ENVS, Self.AGENT_ACT_DIM + 1],
         step_idx: Int,
     ) raises:
         comptime assert N_ENVS > 0, "N_ENVS must be > 0"
@@ -784,7 +776,7 @@ struct REDQOFETrainer[
         three OFE nets, then as `K` sections α's whole optimizer (`alpha.*`)
         and the train-step counter. Atomic and chunked. Network optimizer
         moments NOT persisted (resume re-warms)."""
-        var w = BinaryCheckpointWriter(save_moments=False)
+        var w = BinaryCheckpointWriter.to_file(path, save_moments=False)
         write_model[Self.train_target](w, self.actor, self.ctx, "actor")
         for i in range(Self.N):
             write_model[Self.train_target](
@@ -797,7 +789,7 @@ struct REDQOFETrainer[
         self.alpha_opt.put_state(sc, "alpha")
         sc.set_int("total_train_steps", self._total_train_steps)
         w.write_scalars(sc)
-        _write_file_bytes(path, w.content)
+        w.commit()
 
     def load_state(mut self, path: String) raises:
         """Restore every net, α and the counter (v3, or the legacy v2 text

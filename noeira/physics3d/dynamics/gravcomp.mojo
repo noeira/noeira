@@ -78,7 +78,8 @@ Operands (8): xipos, subtree_com (data) + bodies, joints, meta (model)
 
 from max.gpu import thread_idx, block_idx, block_dim
 from max.gpu.host import DeviceContext
-from layout import Layout, LayoutTensor
+from layout import TileTensor, TensorLayout
+from noeira.core.tiles import RowMajor, Tile
 
 from ..joint_types import JNT_FREE, JNT_BALL
 from ..fields import (
@@ -115,22 +116,22 @@ comptime GRAVCOMP_TPB: Int = 64
 def _gravcomp_forces_env[
     DTYPE: DType,
     D: DimsLike,
-    L_B3: Layout,
-    L_BODIES: Layout,
-    L_JOINTS: Layout,
-    L_MMETA: Layout,
-    L_CDOF: Layout,
-    L_FNET: Layout,
+    L_B3: TensorLayout,
+    L_BODIES: TensorLayout,
+    L_JOINTS: TensorLayout,
+    L_MMETA: TensorLayout,
+    L_CDOF: TensorLayout,
+    L_FNET: TensorLayout,
 ](
     env: Int,
     dims: D,
-    xipos: LayoutTensor[DTYPE, L_B3, MutAnyOrigin],
-    subtree_com: LayoutTensor[DTYPE, L_B3, MutAnyOrigin],
-    bodies: LayoutTensor[DTYPE, L_BODIES, MutAnyOrigin],
-    joints: LayoutTensor[DTYPE, L_JOINTS, MutAnyOrigin],
-    mmeta: LayoutTensor[DTYPE, L_MMETA, MutAnyOrigin],
-    cdof: LayoutTensor[DTYPE, L_CDOF, MutAnyOrigin],
-    fnet: LayoutTensor[DTYPE, L_FNET, MutAnyOrigin],
+    xipos: TileTensor[DTYPE, L_B3, MutAnyOrigin],
+    subtree_com: TileTensor[DTYPE, L_B3, MutAnyOrigin],
+    bodies: TileTensor[DTYPE, L_BODIES, MutAnyOrigin],
+    joints: TileTensor[DTYPE, L_JOINTS, MutAnyOrigin],
+    mmeta: TileTensor[DTYPE, L_MMETA, MutAnyOrigin],
+    cdof: TileTensor[DTYPE, L_CDOF, MutAnyOrigin],
+    fnet: TileTensor[DTYPE, L_FNET, MutAnyOrigin],
 ):
     """`mj_gravcomp` for one env, accumulated into `fnet`."""
     # ── the two early-outs, in MuJoCo's order ────────────────────────────
@@ -235,23 +236,13 @@ def _gravcomp_forces_kernel[
     NJOINT: Int,
     BATCH: Int,
 ](
-    xipos: LayoutTensor[
-        DTYPE, Layout.row_major(BATCH, NBODY * 3), MutAnyOrigin
-    ],
-    subtree_com: LayoutTensor[
-        DTYPE, Layout.row_major(BATCH, NBODY * 3), MutAnyOrigin
-    ],
-    bodies: LayoutTensor[
-        DTYPE, Layout.row_major(NBODY, MODEL_BODY_SIZE), MutAnyOrigin
-    ],
-    joints: LayoutTensor[
-        DTYPE, Layout.row_major(NJOINT, MODEL_JOINT_SIZE), MutAnyOrigin
-    ],
-    mmeta: LayoutTensor[
-        DTYPE, Layout.row_major(MODEL_META_SIZE), MutAnyOrigin
-    ],
-    cdof: LayoutTensor[DTYPE, Layout.row_major(BATCH, NV * 6), MutAnyOrigin],
-    fnet: LayoutTensor[DTYPE, Layout.row_major(BATCH, NV), MutAnyOrigin],
+    xipos: Tile[DTYPE, BATCH, NBODY * 3],
+    subtree_com: Tile[DTYPE, BATCH, NBODY * 3],
+    bodies: Tile[DTYPE, NBODY, MODEL_BODY_SIZE],
+    joints: Tile[DTYPE, NJOINT, MODEL_JOINT_SIZE],
+    mmeta: Tile[DTYPE, MODEL_META_SIZE],
+    cdof: Tile[DTYPE, BATCH, NV * 6],
+    fnet: Tile[DTYPE, BATCH, NV],
 ):
     var env = Int(block_dim.x * block_idx.x + thread_idx.x)
     if env >= BATCH:
@@ -287,12 +278,12 @@ def compute_gravcomp_forces[
     nothing else). Call in the passive seam AFTER `compute_fluid_forces` —
     `mj_passive` adds fluid before gravcomp.
     """
-    comptime L_NV = Layout.row_major(BATCH, D.NV)
-    comptime L_B3 = Layout.row_major(BATCH, D.NBODY * 3)
-    comptime L_BODY = Layout.row_major(D.NBODY, MODEL_BODY_SIZE)
-    comptime L_JOINT = Layout.row_major(D.NJOINT, MODEL_JOINT_SIZE)
-    comptime L_META = Layout.row_major(MODEL_META_SIZE)
-    comptime L_CDOF = Layout.row_major(BATCH, D.NV * 6)
+    comptime L_NV = RowMajor[BATCH, D.NV]
+    comptime L_B3 = RowMajor[BATCH, D.NBODY * 3]
+    comptime L_BODY = RowMajor[D.NBODY, MODEL_BODY_SIZE]
+    comptime L_JOINT = RowMajor[D.NJOINT, MODEL_JOINT_SIZE]
+    comptime L_META = RowMajor[MODEL_META_SIZE]
+    comptime L_CDOF = RowMajor[BATCH, D.NV * 6]
 
     comptime if target == "cpu":
         var dm = d.dims
@@ -302,13 +293,13 @@ def compute_gravcomp_forces[
         var rl_META = rl1(MODEL_META_SIZE)
         var rl_CDOF = rl2(BATCH, dm.get_nv() * 6)
         var rl_NV = rl2(BATCH, dm.get_nv())
-        var xipos_v = d.xipos.lt_dyn["cpu", DYN2](rl_B3)
-        var stcom_v = d.subtree_com.lt_dyn["cpu", DYN2](rl_B3)
-        var bodies_v = m.bodies.lt_dyn["cpu", DYN2](rl_BODY)
-        var joints_v = m.joints.lt_dyn["cpu", DYN2](rl_JOINT)
-        var meta_v = m.meta.lt_dyn["cpu", DYN1](rl_META)
-        var cdof_v = scratch.cdof.lt_dyn["cpu", DYN2](rl_CDOF)
-        var fnet_v = scratch.fnet.lt_dyn["cpu", DYN2](rl_NV)
+        var xipos_v = d.xipos.tt_dyn["cpu", DYN2](rl_B3)
+        var stcom_v = d.subtree_com.tt_dyn["cpu", DYN2](rl_B3)
+        var bodies_v = m.bodies.tt_dyn["cpu", DYN2](rl_BODY)
+        var joints_v = m.joints.tt_dyn["cpu", DYN2](rl_JOINT)
+        var meta_v = m.meta.tt_dyn["cpu", DYN1](rl_META)
+        var cdof_v = scratch.cdof.tt_dyn["cpu", DYN2](rl_CDOF)
+        var fnet_v = scratch.fnet.tt_dyn["cpu", DYN2](rl_NV)
         for e in range(BATCH):
             _gravcomp_forces_env[DTYPE](
                 e, dm, xipos_v, stcom_v, bodies_v, joints_v, meta_v, cdof_v,
@@ -322,13 +313,13 @@ def compute_gravcomp_forces[
                 DTYPE, D.NV, D.NBODY, D.NJOINT, BATCH
             ]
         ](
-            d.xipos.lt["gpu", L_B3](),
-            d.subtree_com.lt["gpu", L_B3](),
-            m.bodies.lt["gpu", L_BODY](),
-            m.joints.lt["gpu", L_JOINT](),
-            m.meta.lt["gpu", L_META](),
-            scratch.cdof.lt["gpu", L_CDOF](),
-            scratch.fnet.lt["gpu", L_NV](),
+            d.xipos.tt["gpu", BATCH, D.NBODY * 3](),
+            d.subtree_com.tt["gpu", BATCH, D.NBODY * 3](),
+            m.bodies.tt["gpu", D.NBODY, MODEL_BODY_SIZE](),
+            m.joints.tt["gpu", D.NJOINT, MODEL_JOINT_SIZE](),
+            m.meta.tt["gpu", MODEL_META_SIZE](),
+            scratch.cdof.tt["gpu", BATCH, D.NV * 6](),
+            scratch.fnet.tt["gpu", BATCH, D.NV](),
             grid_dim=(BLOCKS,),
             block_dim=(GRAVCOMP_TPB,),
         )

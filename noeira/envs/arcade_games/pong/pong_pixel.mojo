@@ -32,7 +32,6 @@ from noeira.core import (
     RenderableEnv,
 )
 from noeira.render import Renderer2D, SDL_Color
-from layout import LayoutTensor, Layout
 from max.gpu import block_dim, block_idx, thread_idx
 from max.gpu.host import DeviceContext, DeviceBuffer
 
@@ -79,6 +78,7 @@ from .pong import (
     RIGHT_PADDLE_X,
     MAX_BALL_VY,
 )
+from noeira.core.tiles import Tile, ImmTile, tile
 
 
 # ============================================================================
@@ -490,21 +490,11 @@ struct PongPixelEnv[
             Pointer[Scalar[DType.uint64], MutAnyOrigin]
         ] = None,
     ) raises:
-        var states = LayoutTensor[
-            gpu_dtype, Layout.row_major(BATCH_SIZE, STATE_SIZE)
-        ](states_buf)
-        var actions = LayoutTensor[gpu_dtype, Layout.row_major(BATCH_SIZE)](
-            actions_buf
-        )
-        var rewards = LayoutTensor[gpu_dtype, Layout.row_major(BATCH_SIZE)](
-            rewards_buf
-        )
-        var dones = LayoutTensor[gpu_dtype, Layout.row_major(BATCH_SIZE)](
-            dones_buf
-        )
-        var terminated_out = LayoutTensor[
-            gpu_dtype, Layout.row_major(BATCH_SIZE)
-        ](terminated_buf)
+        var states = tile[BATCH_SIZE, STATE_SIZE](states_buf)
+        var actions = tile[BATCH_SIZE](actions_buf)
+        var rewards = tile[BATCH_SIZE](rewards_buf)
+        var dones = tile[BATCH_SIZE](dones_buf)
+        var terminated_out = tile[BATCH_SIZE](terminated_buf)
 
         comptime BLOCKS = (BATCH_SIZE + Self.TPB - 1) // Self.TPB
         var seed = Scalar[DType.uint64](rng_seed)
@@ -516,23 +506,11 @@ struct PongPixelEnv[
         # instead of serially inside one thread per env.
         @always_inline
         def physics_wrapper(
-            states: LayoutTensor[
-                gpu_dtype,
-                Layout.row_major(BATCH_SIZE, STATE_SIZE),
-                MutAnyOrigin,
-            ],
-            actions: LayoutTensor[
-                gpu_dtype, Layout.row_major(BATCH_SIZE), ImmutAnyOrigin
-            ],
-            rewards: LayoutTensor[
-                gpu_dtype, Layout.row_major(BATCH_SIZE), MutAnyOrigin
-            ],
-            dones: LayoutTensor[
-                gpu_dtype, Layout.row_major(BATCH_SIZE), MutAnyOrigin
-            ],
-            terminated_out: LayoutTensor[
-                gpu_dtype, Layout.row_major(BATCH_SIZE), MutAnyOrigin
-            ],
+            states: Tile[gpu_dtype, BATCH_SIZE, STATE_SIZE],
+            actions: ImmTile[gpu_dtype, BATCH_SIZE],
+            rewards: Tile[gpu_dtype, BATCH_SIZE],
+            dones: Tile[gpu_dtype, BATCH_SIZE],
+            terminated_out: Tile[gpu_dtype, BATCH_SIZE],
             rng_seed: Scalar[DType.uint64],
         ):
             # First physics step (action applied normally)
@@ -607,11 +585,7 @@ struct PongPixelEnv[
         # follow both physics (reads new positions) and clear (writes buffer).
         @always_inline
         def draw_wrapper(
-            states: LayoutTensor[
-                gpu_dtype,
-                Layout.row_major(BATCH_SIZE, STATE_SIZE),
-                MutAnyOrigin,
-            ],
+            states: Tile[gpu_dtype, BATCH_SIZE, STATE_SIZE],
             ws_ptr: Pointer[Scalar[gpu_dtype], MutAnyOrigin],
         ):
             var idx = Int(block_dim.x * block_idx.x + thread_idx.x)
@@ -744,19 +718,13 @@ struct PongPixelEnv[
     ) raises:
         """Reset all environments. Frame stack is initialized in init_step_workspace_gpu.
         """
-        var states = LayoutTensor[
-            gpu_dtype, Layout.row_major(BATCH_SIZE, STATE_SIZE)
-        ](states_buf)
+        var states = tile[BATCH_SIZE, STATE_SIZE](states_buf)
 
         comptime BLOCKS = (BATCH_SIZE + Self.TPB - 1) // Self.TPB
 
         @always_inline
         def reset_wrapper(
-            states: LayoutTensor[
-                gpu_dtype,
-                Layout.row_major(BATCH_SIZE, STATE_SIZE),
-                MutAnyOrigin,
-            ],
+            states: Tile[gpu_dtype, BATCH_SIZE, STATE_SIZE],
         ):
             PongEnv[DType.float32].reset_kernel[BATCH_SIZE, STATE_SIZE](states)
 
@@ -783,34 +751,20 @@ struct PongPixelEnv[
         ] = None,
     ) raises:
         """Reset done environments and clear their frame stacks."""
-        var states = LayoutTensor[
-            gpu_dtype, Layout.row_major(BATCH_SIZE, STATE_SIZE)
-        ](states_buf)
-        var dones = LayoutTensor[gpu_dtype, Layout.row_major(BATCH_SIZE)](
-            dones_buf
-        )
+        var states = tile[BATCH_SIZE, STATE_SIZE](states_buf)
+        var dones = tile[BATCH_SIZE](dones_buf)
 
         comptime BLOCKS = (BATCH_SIZE + Self.TPB - 1) // Self.TPB
 
         if Bool(rng_counter_ptr):
-            var counter_t = LayoutTensor[
-                DType.uint64, Layout.row_major(1), MutAnyOrigin
-            ](rng_counter_ptr.value())
+            var counter_t = tile[1](rng_counter_ptr.value())
 
             @always_inline
             def selective_reset_counter_wrapper(
-                states: LayoutTensor[
-                    gpu_dtype,
-                    Layout.row_major(BATCH_SIZE, STATE_SIZE),
-                    MutAnyOrigin,
-                ],
-                dones: LayoutTensor[
-                    gpu_dtype, Layout.row_major(BATCH_SIZE), MutAnyOrigin
-                ],
+                states: Tile[gpu_dtype, BATCH_SIZE, STATE_SIZE],
+                dones: Tile[gpu_dtype, BATCH_SIZE],
                 ws_ptr: Pointer[Scalar[gpu_dtype], MutAnyOrigin],
-                counter: LayoutTensor[
-                    DType.uint64, Layout.row_major(1), MutAnyOrigin
-                ],
+                counter: Tile[DType.uint64, 1],
             ):
                 var idx = Int(block_dim.x * block_idx.x + thread_idx.x)
                 if idx >= BATCH_SIZE:
@@ -850,14 +804,8 @@ struct PongPixelEnv[
 
             @always_inline
             def selective_reset_wrapper(
-                states: LayoutTensor[
-                    gpu_dtype,
-                    Layout.row_major(BATCH_SIZE, STATE_SIZE),
-                    MutAnyOrigin,
-                ],
-                dones: LayoutTensor[
-                    gpu_dtype, Layout.row_major(BATCH_SIZE), MutAnyOrigin
-                ],
+                states: Tile[gpu_dtype, BATCH_SIZE, STATE_SIZE],
+                dones: Tile[gpu_dtype, BATCH_SIZE],
                 ws_ptr: Pointer[Scalar[gpu_dtype], MutAnyOrigin],
                 rng_seed: Scalar[DType.uint64],
             ):

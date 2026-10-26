@@ -12,7 +12,6 @@ Run: pixi run -e apple mojo run -I . tests/nn/dreamerv3/test_gaussian_sample_ker
 from std.math import tanh, exp, abs
 from max.gpu.host import DeviceContext
 from std.testing import assert_true
-from layout import Layout
 
 from noeira.nn.constants import DT, TPB
 from noeira.nn.core.tensor import Tensor
@@ -54,12 +53,12 @@ def main() raises:
     comptime nb = (NS + TPB - 1) // TPB
     for t in range(TI):
         ctx.enqueue_function[_gaussian_sample_hist_k[ACT, TI, NS]](
-            pb.lt["gpu", Layout.row_major(NS * 2 * ACT)](),
-            noise.lt["gpu", Layout.row_major(TI * NS * ACT)](),
-            at.lt["gpu", Layout.row_major(NS * ACT)](),
-            pmean.lt["gpu", Layout.row_major(NS * TI * ACT)](),
-            pstd.lt["gpu", Layout.row_major(NS * TI * ACT)](),
-            acts.lt["gpu", Layout.row_major(NS * TI * ACT)](),
+            pb.tt["gpu", NS * 2 * ACT](),
+            noise.tt["gpu", TI * NS * ACT](),
+            at.tt["gpu", NS * ACT](),
+            pmean.tt["gpu", NS * TI * ACT](),
+            pstd.tt["gpu", NS * TI * ACT](),
+            acts.tt["gpu", NS * TI * ACT](),
             MINSTD,
             MAXSTD,
             Int64(t),

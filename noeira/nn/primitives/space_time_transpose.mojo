@@ -17,7 +17,6 @@ permutation (the same map with T↔S swapped). Conforms to `Module`.
 
 from max.gpu import global_idx
 from max.gpu.host import DeviceContext
-from layout import Layout, LayoutTensor
 
 from noeira.nn.constants import DT, TPB
 from ..core.tensor import Tensor
@@ -28,14 +27,15 @@ from ..core.module import Module
 from ..core.param import ParamVisitor
 from ..core.initializer import Initializer
 from ..core.amp import AMPPolicy, NoAMP
+from noeira.core.tiles import RowMajor, Tile
 
 
 # ── GPU kernel (verbatim from legacy; args MutAnyOrigin = GPU ABI) ────────
 def _stt_kernel[
     BATCH: Int, T: Int, S: Int, D: Int, INVERSE: Bool
 ](
-    src: LayoutTensor[DT, Layout.row_major(BATCH, T * S * D), MutAnyOrigin],
-    dst: LayoutTensor[DT, Layout.row_major(BATCH, T * S * D), MutAnyOrigin],
+    src: Tile[DT, BATCH, T * S * D],
+    dst: Tile[DT, BATCH, T * S * D],
 ):
     var gid = Int(global_idx.x)
     comptime total = BATCH * T * S * D
@@ -69,8 +69,8 @@ def _stt_kernel[
 def _stt_vec_kernel[
     BATCH: Int, T: Int, S: Int, D: Int, INVERSE: Bool
 ](
-    src: LayoutTensor[DT, Layout.row_major(BATCH, T * S * D), MutAnyOrigin],
-    dst: LayoutTensor[DT, Layout.row_major(BATCH, T * S * D), MutAnyOrigin],
+    src: Tile[DT, BATCH, T * S * D],
+    dst: Tile[DT, BATCH, T * S * D],
 ):
     var gid = Int(global_idx.x)
     comptime TSD = T * S * D
@@ -183,7 +183,7 @@ struct SpaceTimeTranspose[T: Int, S: Int, D: Int](Module):
     def _run_gpu[
         B: Int, INVERSE: Bool
     ](mut self, mut src: Tensor, mut dst: Tensor, c: DeviceContext) raises:
-        comptime lay = Layout.row_major(B, Self.T * Self.S * Self.D)
+        comptime lay = RowMajor[B, Self.T * Self.S * Self.D]
         comptime total = B * Self.T * Self.S * Self.D
         comptime if Self.D % STT_VEC == 0:
             # vectorized run-copy: STT_VEC elements per thread (B2)
@@ -192,8 +192,8 @@ struct SpaceTimeTranspose[T: Int, S: Int, D: Int](Module):
                 B, Self.T, Self.S, Self.D, INVERSE
             ]
             c.enqueue_function[kernel](
-                src.lt["gpu", lay](),
-                dst.lt["gpu", lay](),
+                src.tt["gpu", B, Self.T * Self.S * Self.D](),
+                dst.tt["gpu", B, Self.T * Self.S * Self.D](),
                 grid_dim=n_blocks,
                 block_dim=TPB,
             )
@@ -201,8 +201,8 @@ struct SpaceTimeTranspose[T: Int, S: Int, D: Int](Module):
             comptime n_blocks = (total + TPB - 1) // TPB
             comptime kernel = _stt_kernel[B, Self.T, Self.S, Self.D, INVERSE]
             c.enqueue_function[kernel](
-                src.lt["gpu", lay](),
-                dst.lt["gpu", lay](),
+                src.tt["gpu", B, Self.T * Self.S * Self.D](),
+                dst.tt["gpu", B, Self.T * Self.S * Self.D](),
                 grid_dim=n_blocks,
                 block_dim=TPB,
             )

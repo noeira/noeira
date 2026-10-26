@@ -35,7 +35,6 @@ from std.math import exp as fexp, log as flog, sqrt as fsqrt
 from max.gpu import global_idx, thread_idx
 from max.gpu.primitives import block
 from max.gpu.host import DeviceContext
-from layout import Layout, LayoutTensor
 
 from noeira.nn.constants import DT, TPB, TPB_REDUCE
 from noeira.nn.core.module import Module
@@ -46,14 +45,15 @@ from noeira.nn.core.initializer import Initializer
 from noeira.nn.core.call import call_forward, call_vjp
 from noeira.nn.loss.gaussian_nll_loss import GaussianNLLLoss
 from noeira.nn.optimizer.adam import Adam
+from noeira.core.tiles import Tile
 
 
 def _split_clamp_logvar_kernel[
     BATCH: Int, OUT_DIM: Int, PRED_DIM: Int
 ](
-    pred: LayoutTensor[DT, Layout.row_major(BATCH, OUT_DIM), MutAnyOrigin],
-    out_mu: LayoutTensor[DT, Layout.row_major(BATCH, PRED_DIM), MutAnyOrigin],
-    out_lv: LayoutTensor[DT, Layout.row_major(BATCH, PRED_DIM), MutAnyOrigin],
+    pred: Tile[DT, BATCH, OUT_DIM],
+    out_mu: Tile[DT, BATCH, PRED_DIM],
+    out_lv: Tile[DT, BATCH, PRED_DIM],
     lv_min: Scalar[DT],
     lv_max: Scalar[DT],
 ):
@@ -113,16 +113,14 @@ def _soft_clamp_lv(
 def _dyn_learnable_nll_grad_kernel[
     BATCH: Int, PRED_DIM: Int
 ](
-    pred: LayoutTensor[DT, Layout.row_major(BATCH, 2 * PRED_DIM), MutAnyOrigin],
-    target: LayoutTensor[DT, Layout.row_major(BATCH, PRED_DIM), MutAnyOrigin],
-    max_lv: LayoutTensor[DT, Layout.row_major(PRED_DIM), MutAnyOrigin],
-    min_lv: LayoutTensor[DT, Layout.row_major(PRED_DIM), MutAnyOrigin],
-    grad_out: LayoutTensor[
-        DT, Layout.row_major(BATCH, 2 * PRED_DIM), MutAnyOrigin
-    ],
-    gmax: LayoutTensor[DT, Layout.row_major(BATCH, PRED_DIM), MutAnyOrigin],
-    gmin: LayoutTensor[DT, Layout.row_major(BATCH, PRED_DIM), MutAnyOrigin],
-    ploss: LayoutTensor[DT, Layout.row_major(BATCH), MutAnyOrigin],
+    pred: Tile[DT, BATCH, 2 * PRED_DIM],
+    target: Tile[DT, BATCH, PRED_DIM],
+    max_lv: Tile[DT, PRED_DIM],
+    min_lv: Tile[DT, PRED_DIM],
+    grad_out: Tile[DT, BATCH, 2 * PRED_DIM],
+    gmax: Tile[DT, BATCH, PRED_DIM],
+    gmin: Tile[DT, BATCH, PRED_DIM],
+    ploss: Tile[DT, BATCH],
 ):
     """Combined Gaussian-NLL forward + grad with soft logvar bounds. One
     thread per batch row. Grads use legacy normalisation `2/(BATCH·PRED)`."""
@@ -158,14 +156,14 @@ def _dyn_learnable_nll_grad_kernel[
 def _dyn_bounds_adam_kernel[
     PRED_DIM: Int, BATCH: Int
 ](
-    max_lv: LayoutTensor[DT, Layout.row_major(PRED_DIM), MutAnyOrigin],
-    min_lv: LayoutTensor[DT, Layout.row_major(PRED_DIM), MutAnyOrigin],
-    max_m: LayoutTensor[DT, Layout.row_major(PRED_DIM), MutAnyOrigin],
-    max_v: LayoutTensor[DT, Layout.row_major(PRED_DIM), MutAnyOrigin],
-    min_m: LayoutTensor[DT, Layout.row_major(PRED_DIM), MutAnyOrigin],
-    min_v: LayoutTensor[DT, Layout.row_major(PRED_DIM), MutAnyOrigin],
-    gmax: LayoutTensor[DT, Layout.row_major(BATCH, PRED_DIM), MutAnyOrigin],
-    gmin: LayoutTensor[DT, Layout.row_major(BATCH, PRED_DIM), MutAnyOrigin],
+    max_lv: Tile[DT, PRED_DIM],
+    min_lv: Tile[DT, PRED_DIM],
+    max_m: Tile[DT, PRED_DIM],
+    max_v: Tile[DT, PRED_DIM],
+    min_m: Tile[DT, PRED_DIM],
+    min_v: Tile[DT, PRED_DIM],
+    gmax: Tile[DT, BATCH, PRED_DIM],
+    gmin: Tile[DT, BATCH, PRED_DIM],
     l2_coef: Scalar[DT],
     lr: Scalar[DT],
     beta1: Scalar[DT],
@@ -206,11 +204,11 @@ def _dyn_bounds_adam_kernel[
 def _soft_clamp_split_kernel[
     BATCH: Int, OUT_DIM: Int, PRED_DIM: Int
 ](
-    pred: LayoutTensor[DT, Layout.row_major(BATCH, OUT_DIM), MutAnyOrigin],
-    max_lv: LayoutTensor[DT, Layout.row_major(PRED_DIM), MutAnyOrigin],
-    min_lv: LayoutTensor[DT, Layout.row_major(PRED_DIM), MutAnyOrigin],
-    out_mu: LayoutTensor[DT, Layout.row_major(BATCH, PRED_DIM), MutAnyOrigin],
-    out_lv: LayoutTensor[DT, Layout.row_major(BATCH, PRED_DIM), MutAnyOrigin],
+    pred: Tile[DT, BATCH, OUT_DIM],
+    max_lv: Tile[DT, PRED_DIM],
+    min_lv: Tile[DT, PRED_DIM],
+    out_mu: Tile[DT, BATCH, PRED_DIM],
+    out_lv: Tile[DT, BATCH, PRED_DIM],
 ):
     """Soft-clamp variant of `_split_clamp_logvar_kernel` using the member's
     learnable per-dim bounds. Used by `predict_member` (→ rollout/eval)."""
@@ -230,9 +228,9 @@ def _soft_clamp_split_kernel[
 def _dyn_mse_only_kernel[
     BATCH: Int, OUT_DIM: Int, PRED_DIM: Int
 ](
-    pred: LayoutTensor[DT, Layout.row_major(BATCH, OUT_DIM), MutAnyOrigin],
-    target: LayoutTensor[DT, Layout.row_major(BATCH, PRED_DIM), MutAnyOrigin],
-    ploss: LayoutTensor[DT, Layout.row_major(BATCH), MutAnyOrigin],
+    pred: Tile[DT, BATCH, OUT_DIM],
+    target: Tile[DT, BATCH, PRED_DIM],
+    ploss: Tile[DT, BATCH],
 ):
     """Per-row mean-over-dims MSE of the MEAN head only — the reference
     holdout/elite metric (`inc_var_loss=False`, bnn.py:193). Variance head is
@@ -252,8 +250,8 @@ def _dyn_mse_only_kernel[
 def _dyn_ploss_reduce_kernel[
     BATCH: Int
 ](
-    ploss: LayoutTensor[DT, Layout.row_major(BATCH), MutAnyOrigin],
-    acc: LayoutTensor[DT, Layout.row_major(2), MutAnyOrigin],
+    ploss: Tile[DT, BATCH],
+    acc: Tile[DT, 2],
 ):
     """Block-reduce the per-row learnable-NLL losses and fold the batch MEAN
     into a device accumulator `acc = [sum_of_means, count]`. Mirrors
@@ -514,23 +512,13 @@ struct DynamicsEnsembleBlock[
             var ctx = self.ctx.value()
             comptime total = Self.BATCH * Self.PRED_DIM
             comptime n_blocks = (total + TPB - 1) // TPB
-            var pred_lt = self._mb_pred.lt[
-                "gpu", Layout.row_major(Self.BATCH, Self.OUT_DIM)
-            ]()
-            var mu_lt = out_mu_t.lt_at[
-                "gpu", Layout.row_major(Self.BATCH, Self.PRED_DIM)
-            ](out_off)
-            var lv_lt = out_lv_t.lt_at[
-                "gpu", Layout.row_major(Self.BATCH, Self.PRED_DIM)
-            ](out_off)
+            var pred_lt = self._mb_pred.tt["gpu", Self.BATCH, Self.OUT_DIM]()
+            var mu_lt = out_mu_t.tt_at["gpu", Self.BATCH, Self.PRED_DIM](out_off)
+            var lv_lt = out_lv_t.tt_at["gpu", Self.BATCH, Self.PRED_DIM](out_off)
             if self.learnable_bounds:
                 var bo = member_idx * Self.PRED_DIM
-                var max_lt = self._max_lv.lt_at[
-                    "gpu", Layout.row_major(Self.PRED_DIM)
-                ](bo)
-                var min_lt = self._min_lv.lt_at[
-                    "gpu", Layout.row_major(Self.PRED_DIM)
-                ](bo)
+                var max_lt = self._max_lv.tt_at["gpu", Self.PRED_DIM](bo)
+                var min_lt = self._min_lv.tt_at["gpu", Self.PRED_DIM](bo)
                 comptime soft_kernel = _soft_clamp_split_kernel[
                     Self.BATCH, Self.OUT_DIM, Self.PRED_DIM
                 ]
@@ -602,30 +590,14 @@ struct DynamicsEnsembleBlock[
             return total / Scalar[DT](Self.BATCH)
         else:
             var ctx = self.ctx.value()
-            var pred_lt = self._mb_pred.lt[
-                "gpu", Layout.row_major(Self.BATCH, Self.OUT_DIM)
-            ]()
-            var tgt_lt = mb_target_t.lt[
-                "gpu", Layout.row_major(Self.BATCH, Self.PRED_DIM)
-            ]()
-            var max_lt = self._max_lv.lt_at[
-                "gpu", Layout.row_major(Self.PRED_DIM)
-            ](bo)
-            var min_lt = self._min_lv.lt_at[
-                "gpu", Layout.row_major(Self.PRED_DIM)
-            ](bo)
-            var grad_lt = self._mb_grad.lt[
-                "gpu", Layout.row_major(Self.BATCH, Self.OUT_DIM)
-            ]()
-            var gmax_lt = self._bnd_gmax.lt[
-                "gpu", Layout.row_major(Self.BATCH, Self.PRED_DIM)
-            ]()
-            var gmin_lt = self._bnd_gmin.lt[
-                "gpu", Layout.row_major(Self.BATCH, Self.PRED_DIM)
-            ]()
-            var ploss_lt = self._bnd_ploss.lt[
-                "gpu", Layout.row_major(Self.BATCH)
-            ]()
+            var pred_lt = self._mb_pred.tt["gpu", Self.BATCH, Self.OUT_DIM]()
+            var tgt_lt = mb_target_t.tt["gpu", Self.BATCH, Self.PRED_DIM]()
+            var max_lt = self._max_lv.tt_at["gpu", Self.PRED_DIM](bo)
+            var min_lt = self._min_lv.tt_at["gpu", Self.PRED_DIM](bo)
+            var grad_lt = self._mb_grad.tt["gpu", Self.BATCH, Self.OUT_DIM]()
+            var gmax_lt = self._bnd_gmax.tt["gpu", Self.BATCH, Self.PRED_DIM]()
+            var gmin_lt = self._bnd_gmin.tt["gpu", Self.BATCH, Self.PRED_DIM]()
+            var ploss_lt = self._bnd_ploss.tt["gpu", Self.BATCH]()
             comptime n_rows = (Self.BATCH + TPB - 1) // TPB
             comptime grad_kernel = _dyn_learnable_nll_grad_kernel[
                 Self.BATCH, Self.PRED_DIM
@@ -639,7 +611,7 @@ struct DynamicsEnsembleBlock[
                 # Device reduce → accumulator; read once at flush (no sync).
                 ctx.enqueue_function[_dyn_ploss_reduce_kernel[Self.BATCH]](
                     ploss_lt,
-                    self._dyn_loss_acc.lt["gpu", Layout.row_major(2)](),
+                    self._dyn_loss_acc.tt["gpu", 2](),
                     grid_dim=1, block_dim=TPB_REDUCE,
                 )
                 return Scalar[DT](0.0)
@@ -694,30 +666,14 @@ struct DynamicsEnsembleBlock[
                 ) / (fsqrt(v2 / bc2) + eps)
         else:
             var ctx = self.ctx.value()
-            var max_lt = self._max_lv.lt_at[
-                "gpu", Layout.row_major(Self.PRED_DIM)
-            ](bo)
-            var min_lt = self._min_lv.lt_at[
-                "gpu", Layout.row_major(Self.PRED_DIM)
-            ](bo)
-            var mm_lt = self._max_lv_m.lt_at[
-                "gpu", Layout.row_major(Self.PRED_DIM)
-            ](bo)
-            var mv_lt = self._max_lv_v.lt_at[
-                "gpu", Layout.row_major(Self.PRED_DIM)
-            ](bo)
-            var nm_lt = self._min_lv_m.lt_at[
-                "gpu", Layout.row_major(Self.PRED_DIM)
-            ](bo)
-            var nv_lt = self._min_lv_v.lt_at[
-                "gpu", Layout.row_major(Self.PRED_DIM)
-            ](bo)
-            var gmax_lt = self._bnd_gmax.lt[
-                "gpu", Layout.row_major(Self.BATCH, Self.PRED_DIM)
-            ]()
-            var gmin_lt = self._bnd_gmin.lt[
-                "gpu", Layout.row_major(Self.BATCH, Self.PRED_DIM)
-            ]()
+            var max_lt = self._max_lv.tt_at["gpu", Self.PRED_DIM](bo)
+            var min_lt = self._min_lv.tt_at["gpu", Self.PRED_DIM](bo)
+            var mm_lt = self._max_lv_m.tt_at["gpu", Self.PRED_DIM](bo)
+            var mv_lt = self._max_lv_v.tt_at["gpu", Self.PRED_DIM](bo)
+            var nm_lt = self._min_lv_m.tt_at["gpu", Self.PRED_DIM](bo)
+            var nv_lt = self._min_lv_v.tt_at["gpu", Self.PRED_DIM](bo)
+            var gmax_lt = self._bnd_gmax.tt["gpu", Self.BATCH, Self.PRED_DIM]()
+            var gmin_lt = self._bnd_gmin.tt["gpu", Self.BATCH, Self.PRED_DIM]()
             comptime n_dim_blocks = (Self.PRED_DIM + TPB - 1) // TPB
             comptime bnd_kernel = _dyn_bounds_adam_kernel[
                 Self.PRED_DIM, Self.BATCH
@@ -870,15 +826,9 @@ struct DynamicsEnsembleBlock[
             return total / Scalar[DT](Self.BATCH)
         else:
             var ctx = self.ctx.value()
-            var pred_lt = self._mb_pred.lt[
-                "gpu", Layout.row_major(Self.BATCH, Self.OUT_DIM)
-            ]()
-            var tgt_lt = mb_target_t.lt[
-                "gpu", Layout.row_major(Self.BATCH, Self.PRED_DIM)
-            ]()
-            var ploss_lt = self._bnd_ploss.lt[
-                "gpu", Layout.row_major(Self.BATCH)
-            ]()
+            var pred_lt = self._mb_pred.tt["gpu", Self.BATCH, Self.OUT_DIM]()
+            var tgt_lt = mb_target_t.tt["gpu", Self.BATCH, Self.PRED_DIM]()
+            var ploss_lt = self._bnd_ploss.tt["gpu", Self.BATCH]()
             comptime n_rows = (Self.BATCH + TPB - 1) // TPB
             comptime mse_kernel = _dyn_mse_only_kernel[
                 Self.BATCH, Self.OUT_DIM, Self.PRED_DIM

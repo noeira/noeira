@@ -18,7 +18,8 @@ not the end-to-end win (that verdict is NVIDIA-only).
 from std.time import perf_counter_ns
 from max.gpu import global_idx
 from max.gpu.host import DeviceContext
-from layout import Layout, LayoutTensor, TileTensor, row_major
+from layout import TileTensor, row_major
+from noeira.core.tiles import Tile
 from linalg.matmul import matmul as max_matmul
 
 from noeira.nn.core.tensor import Tensor, TensorImpl
@@ -32,8 +33,8 @@ comptime WARM = 20
 
 
 def _f2b[N: Int](
-    src: LayoutTensor[DType.float32, Layout.row_major(N), MutAnyOrigin],
-    dst: LayoutTensor[BF16, Layout.row_major(N), MutAnyOrigin],
+    src: Tile[DType.float32, N],
+    dst: Tile[BF16, N],
 ):
     var i = Int(global_idx.x)
     if i < N:
@@ -41,8 +42,8 @@ def _f2b[N: Int](
 
 
 def _b2f[N: Int](
-    src: LayoutTensor[BF16, Layout.row_major(N), MutAnyOrigin],
-    dst: LayoutTensor[DType.float32, Layout.row_major(N), MutAnyOrigin],
+    src: Tile[BF16, N],
+    dst: Tile[DType.float32, N],
 ):
     var i = Int(global_idx.x)
     if i < N:
@@ -99,63 +100,63 @@ def main() raises:
     # ---- B: bf16, recast W every iter (legacy) ----
     for _ in range(WARM):
         ctx.enqueue_function[_f2b[B * IN]](
-            x.lt["gpu", Layout.row_major(B * IN)](),
-            x_bf.lt["gpu", Layout.row_major(B * IN)](),
+            x.tt["gpu", B * IN](),
+            x_bf.tt["gpu", B * IN](),
             grid_dim=GX, block_dim=256)
         ctx.enqueue_function[_f2b[IN * OUT]](
-            w.lt["gpu", Layout.row_major(IN * OUT)](),
-            w_bf.lt["gpu", Layout.row_major(IN * OUT)](),
+            w.tt["gpu", IN * OUT](),
+            w_bf.tt["gpu", IN * OUT](),
             grid_dim=GW, block_dim=256)
         max_matmul[target="gpu"](ovb, xvb, wvb, ctx)
         ctx.enqueue_function[_b2f[B * OUT]](
-            o_bf.lt["gpu", Layout.row_major(B * OUT)](),
-            out.lt["gpu", Layout.row_major(B * OUT)](),
+            o_bf.tt["gpu", B * OUT](),
+            out.tt["gpu", B * OUT](),
             grid_dim=GO, block_dim=256)
     ctx.synchronize()
     var b0 = perf_counter_ns()
     for _ in range(R):
         ctx.enqueue_function[_f2b[B * IN]](
-            x.lt["gpu", Layout.row_major(B * IN)](),
-            x_bf.lt["gpu", Layout.row_major(B * IN)](),
+            x.tt["gpu", B * IN](),
+            x_bf.tt["gpu", B * IN](),
             grid_dim=GX, block_dim=256)
         ctx.enqueue_function[_f2b[IN * OUT]](
-            w.lt["gpu", Layout.row_major(IN * OUT)](),
-            w_bf.lt["gpu", Layout.row_major(IN * OUT)](),
+            w.tt["gpu", IN * OUT](),
+            w_bf.tt["gpu", IN * OUT](),
             grid_dim=GW, block_dim=256)
         max_matmul[target="gpu"](ovb, xvb, wvb, ctx)
         ctx.enqueue_function[_b2f[B * OUT]](
-            o_bf.lt["gpu", Layout.row_major(B * OUT)](),
-            out.lt["gpu", Layout.row_major(B * OUT)](),
+            o_bf.tt["gpu", B * OUT](),
+            out.tt["gpu", B * OUT](),
             grid_dim=GO, block_dim=256)
     ctx.synchronize()
     var b_us = Float64(perf_counter_ns() - b0) / Float64(R) / 1000.0
 
     # ---- C: bf16, cache W cast ONCE (the fix) ----
     ctx.enqueue_function[_f2b[IN * OUT]](
-        w.lt["gpu", Layout.row_major(IN * OUT)](),
-        w_bf.lt["gpu", Layout.row_major(IN * OUT)](),
+        w.tt["gpu", IN * OUT](),
+        w_bf.tt["gpu", IN * OUT](),
         grid_dim=GW, block_dim=256)
     for _ in range(WARM):
         ctx.enqueue_function[_f2b[B * IN]](
-            x.lt["gpu", Layout.row_major(B * IN)](),
-            x_bf.lt["gpu", Layout.row_major(B * IN)](),
+            x.tt["gpu", B * IN](),
+            x_bf.tt["gpu", B * IN](),
             grid_dim=GX, block_dim=256)
         max_matmul[target="gpu"](ovb, xvb, wvb, ctx)
         ctx.enqueue_function[_b2f[B * OUT]](
-            o_bf.lt["gpu", Layout.row_major(B * OUT)](),
-            out.lt["gpu", Layout.row_major(B * OUT)](),
+            o_bf.tt["gpu", B * OUT](),
+            out.tt["gpu", B * OUT](),
             grid_dim=GO, block_dim=256)
     ctx.synchronize()
     var c0 = perf_counter_ns()
     for _ in range(R):
         ctx.enqueue_function[_f2b[B * IN]](
-            x.lt["gpu", Layout.row_major(B * IN)](),
-            x_bf.lt["gpu", Layout.row_major(B * IN)](),
+            x.tt["gpu", B * IN](),
+            x_bf.tt["gpu", B * IN](),
             grid_dim=GX, block_dim=256)
         max_matmul[target="gpu"](ovb, xvb, wvb, ctx)
         ctx.enqueue_function[_b2f[B * OUT]](
-            o_bf.lt["gpu", Layout.row_major(B * OUT)](),
-            out.lt["gpu", Layout.row_major(B * OUT)](),
+            o_bf.tt["gpu", B * OUT](),
+            out.tt["gpu", B * OUT](),
             grid_dim=GO, block_dim=256)
     ctx.synchronize()
     var c_us = Float64(perf_counter_ns() - c0) / Float64(R) / 1000.0
@@ -163,15 +164,15 @@ def main() raises:
     # ---- isolated W-cast cost (the per-forward tax in B) ----
     for _ in range(WARM):
         ctx.enqueue_function[_f2b[IN * OUT]](
-            w.lt["gpu", Layout.row_major(IN * OUT)](),
-            w_bf.lt["gpu", Layout.row_major(IN * OUT)](),
+            w.tt["gpu", IN * OUT](),
+            w_bf.tt["gpu", IN * OUT](),
             grid_dim=GW, block_dim=256)
     ctx.synchronize()
     var wc0 = perf_counter_ns()
     for _ in range(R):
         ctx.enqueue_function[_f2b[IN * OUT]](
-            w.lt["gpu", Layout.row_major(IN * OUT)](),
-            w_bf.lt["gpu", Layout.row_major(IN * OUT)](),
+            w.tt["gpu", IN * OUT](),
+            w_bf.tt["gpu", IN * OUT](),
             grid_dim=GW, block_dim=256)
     ctx.synchronize()
     var wc_us = Float64(perf_counter_ns() - wc0) / Float64(R) / 1000.0

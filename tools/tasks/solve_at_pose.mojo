@@ -156,7 +156,7 @@ Both legs run at the SAME cap, which is what the comparison needs.
 from std.math import abs
 from std.sys import argv
 from max.gpu.host import DeviceContext
-from layout import Layout
+from noeira.core.tiles import RowMajor
 
 from noeira.physics3d.fields import (
     AsStatic, Data, Model, DynamicsScratch, ContactScratch, Dims,
@@ -179,7 +179,7 @@ from noeira.physics3d.collision.broadphase_sap import detect_contacts_sap
 from noeira.physics3d.solver.newton_solve import (
     solve_newton_blocked, solve_newton, NEWTON_FORCE_PER_ENV,
 )
-from std.sys import has_nvidia_gpu_accelerator
+from std.sys import default_accelerator
 from noeira.physics3d.gpu.constants import (
     META_IDX_NUM_CONTACTS, META_IDX_NEWTON_ITER, META_IDX_LS_EVAL,
     METADATA_SIZE, MODEL_JOINT_SIZE, CONTACT_SIZE, CONTACT_IDX_CONDIM,
@@ -281,32 +281,32 @@ def _prep(
     """Smooth dynamics + detection up to the constraint seam — `test_newton_
     blocked_elliptic._prep`'s GPU branch, so both files feed the solve the
     same way. ⚠ SAP, not the O(N^2) loop: it is what the batched env runs."""
-    comptime L_JOINT = Layout.row_major(NJOINT, MODEL_JOINT_SIZE)
-    comptime L_M = Layout.row_major(BATCH, NV * NV)
-    comptime L_NV = Layout.row_major(BATCH, NV)
-    comptime L_QPOS = Layout.row_major(BATCH, NQ)
+    comptime L_JOINT = RowMajor[NJOINT, MODEL_JOINT_SIZE]
+    comptime L_M = RowMajor[BATCH, NV * NV]
+    comptime L_NV = RowMajor[BATCH, NV]
+    comptime L_QPOS = RowMajor[BATCH, NQ]
     forward_kinematics["gpu", DTYPE, BATCH=BATCH](d, mf, ctx)
     compute_body_velocities["gpu", DTYPE, BATCH=BATCH](d, mf, ctx)
     compute_subtree_com["gpu", DTYPE, BATCH=BATCH](d, mf, ctx)
     compute_cdof["gpu", DTYPE, BATCH=BATCH](d, mf, scratch, ctx)
     compute_mass_matrix["gpu", DTYPE, BATCH=BATCH](d, mf, scratch, ctx)
     ctx.enqueue_function[_armature_kernel[DTYPE, NV, NJOINT, BATCH]](
-        mf.joints.lt["gpu", L_JOINT](), scratch.M.lt["gpu", L_M](),
+        mf.joints.tt["gpu", NJOINT, MODEL_JOINT_SIZE](), scratch.M.tt["gpu", BATCH, NV * NV](),
         grid_dim=(BATCH,), block_dim=(1,),
     )
     ldl_factor["gpu", DTYPE, BATCH=BATCH](mf, scratch, ctx)
     compute_m_inv["gpu", DTYPE, BATCH=BATCH](mf, scratch, ctx)
     compute_bias_forces_rne["gpu", DTYPE, BATCH=BATCH](d, mf, scratch, ctx)
     ctx.enqueue_function[_fnet_passive_kernel[DTYPE, NQ, NV, NJOINT, BATCH]](
-        d.qpos.lt["gpu", L_QPOS](), d.qvel.lt["gpu", L_NV](),
-        d.qfrc.lt["gpu", L_NV](), mf.joints.lt["gpu", L_JOINT](),
-        scratch.bias.lt["gpu", L_NV](), scratch.fnet.lt["gpu", L_NV](),
+        d.qpos.tt["gpu", BATCH, NQ](), d.qvel.tt["gpu", BATCH, NV](),
+        d.qfrc.tt["gpu", BATCH, NV](), mf.joints.tt["gpu", NJOINT, MODEL_JOINT_SIZE](),
+        scratch.bias.tt["gpu", BATCH, NV](), scratch.fnet.tt["gpu", BATCH, NV](),
         grid_dim=(BATCH,), block_dim=(1,),
     )
     ldl_solve["gpu", DTYPE, BATCH=BATCH](mf, scratch, ctx)
     ctx.enqueue_function[_qacc_writeback_kernel[DTYPE, NV, BATCH]](
-        scratch.qacc_ws.lt["gpu", L_NV](), d.qacc.lt["gpu", L_NV](),
-        scratch.qacc_constrained.lt["gpu", L_NV](),
+        scratch.qacc_ws.tt["gpu", BATCH, NV](), d.qacc.tt["gpu", BATCH, NV](),
+        scratch.qacc_constrained.tt["gpu", BATCH, NV](),
         grid_dim=(BATCH,), block_dim=(1,),
     )
     detect_contacts_sap["gpu", DTYPE, BATCH=BATCH](d, mf, ctx)
@@ -319,37 +319,37 @@ def _prep64(
 ) raises:
     """`_prep`'s CPU float64 twin — `test_newton_blocked_elliptic._prep`'s
     `"cpu"` branch, which is where this shape comes from."""
-    comptime L_JOINT = Layout.row_major(NJOINT, MODEL_JOINT_SIZE)
-    comptime L_M = Layout.row_major(BATCH, NV * NV)
-    comptime L_NV = Layout.row_major(BATCH, NV)
-    comptime L_QPOS = Layout.row_major(BATCH, NQ)
+    comptime L_JOINT = RowMajor[NJOINT, MODEL_JOINT_SIZE]
+    comptime L_M = RowMajor[BATCH, NV * NV]
+    comptime L_NV = RowMajor[BATCH, NV]
+    comptime L_QPOS = RowMajor[BATCH, NQ]
     var none = Optional[DeviceContext](None)
     forward_kinematics["cpu", DTYPE64, BATCH=BATCH](d, mf, none)
     compute_body_velocities["cpu", DTYPE64, BATCH=BATCH](d, mf, none)
     compute_subtree_com["cpu", DTYPE64, BATCH=BATCH](d, mf, none)
     compute_cdof["cpu", DTYPE64, BATCH=BATCH](d, mf, scratch, none)
     compute_mass_matrix["cpu", DTYPE64, BATCH=BATCH](d, mf, scratch, none)
-    var joints_v = mf.joints.lt["cpu", L_JOINT]()
-    var M_v = scratch.M.lt["cpu", L_M]()
+    var joints_v = mf.joints.tt["cpu", NJOINT, MODEL_JOINT_SIZE]()
+    var M_v = scratch.M.tt["cpu", BATCH, NV * NV]()
     for e in range(BATCH):
         _armature_env[DTYPE64](e, AsStatic[MDIMS](), joints_v, M_v)
     ldl_factor["cpu", DTYPE64, BATCH=BATCH](mf, scratch, none)
     compute_m_inv["cpu", DTYPE64, BATCH=BATCH](mf, scratch, none)
     compute_bias_forces_rne["cpu", DTYPE64, BATCH=BATCH](d, mf, scratch, none)
-    var qpos_v = d.qpos.lt["cpu", L_QPOS]()
-    var qvel_v = d.qvel.lt["cpu", L_NV]()
-    var qfrc_v = d.qfrc.lt["cpu", L_NV]()
-    var bias_v = scratch.bias.lt["cpu", L_NV]()
-    var fnet_v = scratch.fnet.lt["cpu", L_NV]()
+    var qpos_v = d.qpos.tt["cpu", BATCH, NQ]()
+    var qvel_v = d.qvel.tt["cpu", BATCH, NV]()
+    var qfrc_v = d.qfrc.tt["cpu", BATCH, NV]()
+    var bias_v = scratch.bias.tt["cpu", BATCH, NV]()
+    var fnet_v = scratch.fnet.tt["cpu", BATCH, NV]()
     for e in range(BATCH):
         _fnet_passive_env[DTYPE64](
             e, AsStatic[MDIMS](), qpos_v, qvel_v, qfrc_v, joints_v, bias_v,
             fnet_v,
         )
     ldl_solve["cpu", DTYPE64, BATCH=BATCH](mf, scratch, none)
-    var qacc_ws_v = scratch.qacc_ws.lt["cpu", L_NV]()
-    var qacc_v = d.qacc.lt["cpu", L_NV]()
-    var qacc_c_v = scratch.qacc_constrained.lt["cpu", L_NV]()
+    var qacc_ws_v = scratch.qacc_ws.tt["cpu", BATCH, NV]()
+    var qacc_v = d.qacc.tt["cpu", BATCH, NV]()
+    var qacc_c_v = scratch.qacc_constrained.tt["cpu", BATCH, NV]()
     for e in range(BATCH):
         _qacc_writeback_env[DTYPE64](
             e, AsStatic[MDIMS](), qacc_ws_v, qacc_v, qacc_c_v
@@ -442,7 +442,7 @@ def _solve64_gpu(
     `NEWTON_FORCE_PER_ENV` is a comptime False there, so `if not
     NEWTON_FORCE_PER_ENV` is always True and everything below it is dead —
     which is the intent. They disappear in the CUDA build that sets the flag."""
-    if not has_nvidia_gpu_accelerator():
+    if not default_accelerator().is_nvidia_gpu():
         raise Error(
             "solve_at_pose: the float64 GPU sweep is CUDA-only — Metal has no"
             " float64. Leave F64_GPU_SWEEP at False on this machine."

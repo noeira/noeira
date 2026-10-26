@@ -18,7 +18,6 @@ Run:
 
 from std.testing import assert_true
 from max.gpu.host import DeviceContext
-from layout import Layout
 
 from noeira.nn.constants import DT, TPB
 from noeira.nn.core.tensor import Tensor
@@ -162,34 +161,34 @@ def test_cpu_gpu_parity() raises:
     comptime nb = (B + TPB - 1) // TPB
     var ce_g = Tensor.alloc_gpu(c, B)
     c.enqueue_function[two_hot_ce_fwd_kernel[B, BINS, True]](
-        inp[0].lt["gpu", Layout.row_major(B * BINS)](),
-        inp[1].lt["gpu", Layout.row_major(B)](),
-        bins.lt["gpu", Layout.row_major(BINS)](),
-        ce_g.lt["gpu", Layout.row_major(B)](),
+        inp[0].tt["gpu", B * BINS](),
+        inp[1].tt["gpu", B](),
+        bins.tt["gpu", BINS](),
+        ce_g.tt["gpu", B](),
         grid_dim=nb, block_dim=TPB,
     )
     var gce_g = Tensor.alloc_gpu(c, B * BINS)
     c.enqueue_function[two_hot_ce_bwd_kernel[B, BINS, True]](
-        go.lt["gpu", Layout.row_major(B)](),
-        inp[0].lt["gpu", Layout.row_major(B * BINS)](),
-        inp[1].lt["gpu", Layout.row_major(B)](),
-        bins.lt["gpu", Layout.row_major(BINS)](),
-        gce_g.lt["gpu", Layout.row_major(B * BINS)](),
+        go.tt["gpu", B](),
+        inp[0].tt["gpu", B * BINS](),
+        inp[1].tt["gpu", B](),
+        bins.tt["gpu", BINS](),
+        gce_g.tt["gpu", B * BINS](),
         grid_dim=nb, block_dim=TPB,
     )
     var dec_g = Tensor.alloc_gpu(c, B)
     c.enqueue_function[decode_value_fwd_kernel[B, BINS]](
-        inp[0].lt["gpu", Layout.row_major(B * BINS)](),
-        bins.lt["gpu", Layout.row_major(BINS)](),
-        dec_g.lt["gpu", Layout.row_major(B)](),
+        inp[0].tt["gpu", B * BINS](),
+        bins.tt["gpu", BINS](),
+        dec_g.tt["gpu", B](),
         grid_dim=nb, block_dim=TPB,
     )
     var gdec_g = Tensor.alloc_gpu(c, B * BINS)
     c.enqueue_function[decode_value_bwd_kernel[B, BINS]](
-        go.lt["gpu", Layout.row_major(B)](),
-        inp[0].lt["gpu", Layout.row_major(B * BINS)](),
-        bins.lt["gpu", Layout.row_major(BINS)](),
-        gdec_g.lt["gpu", Layout.row_major(B * BINS)](),
+        go.tt["gpu", B](),
+        inp[0].tt["gpu", B * BINS](),
+        bins.tt["gpu", BINS](),
+        gdec_g.tt["gpu", B * BINS](),
         grid_dim=nb, block_dim=TPB,
     )
     ce_g.download(c); gce_g.download(c); dec_g.download(c); gdec_g.download(c)

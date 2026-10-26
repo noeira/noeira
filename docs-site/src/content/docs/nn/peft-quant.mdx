@@ -1,0 +1,226 @@
+---
+title: Frozen weights, LoRA and int4
+description: Freeze parameters without paying for their gradients, train LoRA adapters that read and write PEFT's files, store frozen linears in 4-bit Q4_0 with GPTQ, and train adapters over them (QLoRA). Measured on SmolVLA.
+---
+
+import Maturity from '~/components/Maturity.astro';
+import Paper from '~/components/Paper.astro';
+import Papers from '~/components/Papers.astro';
+
+<Maturity level="experimental" note="Gated on CPU, Metal, an RTX 5090 and a Jetson Orin. Used on SmolVLA; no other model wires the int4 layers yet." />
+
+Four pieces, each usable on its own:
+
+| Piece | What it gives you | Where |
+|---|---|---|
+| Frozen parameters | a weight with no gradient, no optimizer state and no gradient memory, still checkpointed | `noeira.nn.core.param`, `noeira.nn.peft.freeze` |
+| LoRA | a low-rank adapter beside a frozen `Linear`, exact against PEFT, and PEFT's adapter files both ways | `noeira.nn.peft` |
+| int4 linears | a frozen linear stored in Q4_0 (4.5 bits a weight), run by MAX's int4 GEMM on NVIDIA | `noeira.nn.quant.qlinear` |
+| GPTQ and QLoRA | quantization that minimizes each layer's output error, and adapters trained over int4 weights | `noeira.nn.quant` |
+
+<Papers label="References">
+	<Paper title="LoRA: Low-Rank Adaptation of Large Language Models" authors="Hu, Shen, Wallis, Allen-Zhu, Li, Wang, Wang, Chen" year="2021" arxiv="2106.09685" />
+	<Paper title="A Rank Stabilization Scaling Factor for Fine-Tuning with LoRA" authors="Kalajdzievski" year="2023" arxiv="2312.03732" />
+	<Paper title="GPTQ: Accurate Post-Training Quantization for Generative Pre-trained Transformers" authors="Frantar, Ashkboos, Hoefler, Alistarh" year="2022" arxiv="2210.17323" />
+	<Paper title="QLoRA: Efficient Finetuning of Quantized LLMs" authors="Dettmers, Pagnoni, Holtzman, Zettlemoyer" year="2023" arxiv="2305.14314" />
+</Papers>
+
+## Frozen parameters
+
+A `Param` whose gradient buffer is empty is frozen. There is no flag: the
+storage is the switch.
+
+```mojo
+from noeira.nn.peft.freeze import freeze_params, unfreeze_params
+
+var n = freeze_params["gpu"](model, ctx)   # every Param of the model; returns the values frozen
+layer.freeze()                             # one Linear: weight and bias
+layer.weight.freeze()                      # one Param
+```
+
+Freezing releases the gradient and the Adam moments, on the host and the
+device. The backward still computes the input gradient exactly as before; a
+`Linear` skips its weight-gradient GEMM when the buffer is gone. Every
+optimizer-side walk (Adam, SGD, the grad-clip visitors, the parameter arena,
+ZeRO) skips a frozen parameter, and checkpoints keep its section in place, so a
+frozen model saves and loads like any other. `unfreeze` reallocates the
+gradient as `make` does.
+
+Built with `-D NN_INFERENCE_ONLY`, a program allocates no gradient at all. That
+is the deploy build: on a Jetson, memory freed after load is not handed back to
+the board, so freezing after `make` saves less than never allocating.
+
+| Measured | Trainable | Frozen |
+|---|---|---|
+| SmolVLA prefill backward, 16 text layers frozen, M1 (Metal) | 802 ms | **191 ms** (4.2×) |
+| The same, RTX 5090 | 8.25 ms | **6.36 ms** (1.30×) |
+| Free memory on a 16 GB Jetson Orin, SmolVLA deploy | 2.1 GB | **5.0 GB** (`-D NN_INFERENCE_ONLY`) |
+
+The input gradients and every trained parameter's gradient are bit-identical
+in both columns.
+
+## LoRA
+
+`LoRAAdapter[IN, OUT, R]` computes `s · (x A) B` and adds it to its layer's
+output, with `s = α / R` (or `α / √R` with `RSLORA=True`). `LoRALinear` pairs it
+with a frozen `Linear`:
+
+```mojo
+from noeira.nn.peft.lora import LoRALinear
+from noeira.nn.core.initializer import Kaiming
+
+var q = LoRALinear[960, 960, 16].make["gpu", Kaiming](ctx)   # base frozen, B = 0
+q.set_attr["lora_alpha"](32)
+# ... load the base weights into q.base as into any Linear, then train:
+# only q.adapter.lora_A and lora_B have gradients.
+q.merge["gpu"](ctx)        # fold s · A B into the base weight for deployment
+```
+
+At initialization the adapter adds an exact zero (B = 0), as PEFT's does. The
+rank is padded to a multiple of 16 inside the parameters, and the padding stays
+exactly zero under training.
+
+**PEFT's files, both ways.** `PeftAdapterWriter` writes an adapter directory
+(`adapter_config.json` and `adapter_model.safetensors`, fp32 or bf16) that PEFT
+loads; `load_peft_lora` reads one PEFT wrote:
+
+```mojo
+from noeira.nn.peft.peft_io import PeftAdapterWriter, read_peft_config, load_peft_lora
+from noeira.io.safetensors import SafeTensors
+
+var w = PeftAdapterWriter(r=16, lora_alpha=32.0)
+w.add["gpu"]("model.layers.0.self_attn.q_proj", q.adapter, ctx)
+w.save("my_adapter")
+
+var cfg = read_peft_config("their_adapter")
+var st = SafeTensors("their_adapter/adapter_model.safetensors")
+load_peft_lora["gpu"](st, cfg, "model.layers.0.self_attn.q_proj", q.adapter, ctx)
+```
+
+Against PEFT on the same weights, the forward and every gradient agree to
+1.6e-7, and the files noeira writes are byte-identical to PEFT's own.
+
+## int4 linears
+
+`QLinear[IN, OUT]` is a frozen linear stored as Q4_0, llama.cpp's format: groups
+of 32 weights, one fp16 scale each, 18 bytes a group. It has no `Param` and no
+bias, and its activations are fp32 at its boundary.
+
+```mojo
+from noeira.nn.quant.qlinear import QLinear
+from noeira.nn.core.initializer import Deterministic
+
+var l = QLinear[960, 2560].make["gpu", Deterministic](ctx)
+l.set_weight["gpu"](w, ctx)        # an fp32 [OUT, IN] weight, rounded to nearest
+# or l.set_blocks["gpu"](blocks, ctx) with Q4_0 bytes, e.g. from GPTQ
+```
+
+On NVIDIA the forward is MAX's int4 tensor-core GEMM. MAX's repack requires
+`OUT % 128 == 0` and `IN % 1024 == 0`, which no SmolVLA shape meets, so the
+blocks are zero-padded once at load (+14.7 % of bytes per SmolVLA text layer)
+and the activations cast to bf16 and back inside the layer. Everywhere else,
+and for every input gradient, the layer dequantizes into a scratch buffer that
+all layers can share and runs an fp32 GEMM: on CPU and Metal it is then
+bit-identical to a `Linear` holding the dequantized weight.
+
+## GPTQ
+
+Round-to-nearest rounds every weight on its own. GPTQ quantizes the input
+columns one at a time and pushes each column's rounding error onto the columns
+not yet quantized, weighted by the inverse Hessian of the inputs the layer saw.
+It minimizes the layer's output error rather than its weight error.
+
+```mojo
+from noeira.nn.quant.hessian import HessianAccumulator
+from noeira.nn.quant.gptq import gptq_q4_0
+
+var h = HessianAccumulator(IN)
+h.add["gpu"](x, rows, ctx)                            # per calibration batch: H += Xᵀ X
+var codes = List[UInt8]()
+var scales = List[Float32]()
+var stats = gptq_q4_0(w, OUT, IN, h.h.copy(), codes, scales)  # w: fp32 [OUT, IN]
+```
+
+The codes and scales are on the same grid as round-to-nearest; `pack_q4_0`
+turns them into blocks. The factorization is noeira's own blocked fp64
+Cholesky and triangular inverse, so no LAPACK or cuSOLVER is needed: a
+12288-wide Hessian factors in 7.6 s on an M1 (Accelerate's LAPACK: 17.6 s). On
+two test matrices with dead inputs, a partial block and outlier channels, the
+codes and scales are identical to a reference GPTQ pipeline's, all 47,104 of
+them.
+
+## QLoRA
+
+`QLoRALinear[IN, OUT, R]` is `LoRALinear` with the `Linear` replaced by a
+`QLinear`. The adapter never reads the base weight, so its gradients are
+exactly those it would get over the dequantized weight; only the base's
+forward and input gradient carry the int4 error. The adapter stays unmerged:
+folding it into Q4_0 blocks would quantize it away.
+
+## On SmolVLA
+
+The fine-tune and the latency probe take these as build options:
+
+| Option | Effect |
+|---|---|
+| `-D SMOLVLA_EXPERT_R=16` | LoRA beside every linear of the action expert |
+| `-D SMOLVLA_TOWER_R=16` | LoRA beside every linear of the 16 VLM text layers |
+| `SMOLVLA_LORA_ALPHA` | the adapters' α (default 32) |
+| `SMOLVLA_MERGE_OUT=<file>` | expert LoRA: merge the best checkpoint into a plain deploy checkpoint |
+| `-D SMOLVLA_VLM_Q4=1` | the 16 text layers in int4 (round-to-nearest from the published weights) |
+| `SMOLVLA_GPTQ_OUT=<file>` | fp32 build: GPTQ-calibrate the text layers on training observations, layer by layer, and write the blocks |
+| `SMOLVLA_VLM_Q4_BLOCKS=<file>` | int4 build: use those blocks |
+| `-D SMOLVLA_TOWER_R=16 -D SMOLVLA_VLM_Q4=1` | QLoRA: text adapters trained over the int4 layers |
+
+Measured on the 50-episode SO-101 recording, held-out flow-matching loss on the
+10 episodes of a cube position never trained on, 2,000 steps of 8
+observations, three seeds, the mean of each run's last three validations:
+
+| Fine-tune (RTX 5090) | Held-out loss | Trained values | Step |
+|---|---|---|---|
+| Expert and projections, all weights (the default recipe) | 0.2124 ± 0.0019 | 100 M | 52 ms |
+| **LoRA R 16 on the expert**, projections trained | **0.1793 ± 0.0004** | 5.0 M | 45 ms |
+| The recipe plus LoRA R 16 on the text layers | 0.2236 ± 0.0002 | 104 M | 100 ms |
+| The same over the GPTQ int4 text layers (QLoRA) | 0.2277 ± 0.0036 | 104 M | 80–88 ms |
+
+LoRA on the expert beats fine-tuning it by 15 %. At eight times the budget the
+full fine-tune is best early and 62 % worse by the end, while expert LoRA stays
+flat. Adapting the text layers does not help on this recording, in fp32 or in
+int4; QLoRA ends 1.8 % above the fp32 adapters.
+
+| The merged expert-LoRA checkpoint, deployed | fp32 VLM | int4, round-to-nearest | int4, GPTQ |
+|---|---|---|---|
+| Held-out loss against fp32, three held-out sets | — | +4.5 to +6.4 % | **−0.4 to +0.3 %** (none significant above fp32) |
+| Query, Jetson Orin (inference build) | 301 ms | 295 ms | 295 ms |
+| Free memory on the 16 GB board | 4.9 GB | 7.4 GB | 7.4 GB |
+
+The int4 text layers buy memory, not speed: their linears are a twentieth of
+the query, which the vision towers and the denoising steps dominate. With
+QLoRA's adapters unmerged beside them the query is 300 ms.
+
+## Gates
+
+`pixi run test-peft` runs every gate: frozen-parameter round trips and
+optimizer skips, LoRA against PEFT's fixtures, the Q4_0 grid against a
+reference, `QLinear` and the int4 SmolVLA tower against fp32 over the
+dequantized weight, Cholesky and GPTQ against references, and QLoRA against
+LoRA over the dequantized weight. The GPU variants run on Metal and on NVIDIA,
+where MAX's int4 GEMM differs from fp32 by its bf16 activations (3e-3 to 4e-3
+on a layer's output).
+
+## Limits
+
+- int4 runs MAX's GEMM on NVIDIA only; elsewhere it dequantizes, which saves
+  memory but not time.
+- Activations stay fp32. A tower kept in bf16 would drop the two cast kernels
+  around each int4 GEMM; it is not built.
+- A QLoRA checkpoint loads only into the int4 model, because the int4 layers
+  have no parameters for the checkpoint to name.
+- SmolVLA's action expert stays fp32: its input width, 720, is not a multiple
+  of 32.
+
+## Next
+
+- [Modules and Params](/nn/modules/) — the `Param` a frozen weight is
+- [Checkpoints](/concepts/checkpoints/) — how frozen parameters and adapters are saved
+- [SmolVLA](/algorithms/imitation/smolvla/) — the model these were measured on

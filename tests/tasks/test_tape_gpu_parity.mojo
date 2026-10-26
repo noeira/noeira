@@ -24,7 +24,7 @@ lanes.
 Run: pixi run mojo run -I . tests/tasks/test_tape_gpu_parity.mojo
 """
 
-from layout import Layout
+from noeira.core.tiles import RowMajor
 from noeira.nn.core.tensor import TensorImpl
 from noeira.physics3d.gpu.constants import (
     METADATA_SIZE, META_IDX_TASK_PARAM_0, MODEL_CURRICULUM_SIZE,
@@ -121,8 +121,8 @@ def main() raises:
         r_y1.append(rects[i][3])
 
     # ── the tensors a kernel would be handed ──────────────────────────────
-    comptime L_META = Layout.row_major(BATCH, METADATA_SIZE)
-    comptime L_CUR = Layout.row_major(1, MODEL_CURRICULUM_SIZE)
+    comptime L_META = RowMajor[BATCH, METADATA_SIZE]
+    comptime L_CUR = RowMajor[1, MODEL_CURRICULUM_SIZE]
     var meta = TensorImpl[DTYPE].alloc(BATCH * METADATA_SIZE)
     var cur = TensorImpl[DTYPE].alloc(MODEL_CURRICULUM_SIZE)
     for i in range(BATCH * METADATA_SIZE):
@@ -198,11 +198,11 @@ def main() raises:
                 for i in range(ns * 3):
                     sxp.data[e * ns * 3 + i] = Scalar[DTYPE](hsp[i])
 
-            var mv = meta.lt["cpu", L_META]()
-            var cv = cur.lt["cpu", L_CUR]()
-            var xv = xpos.lt["cpu", Layout.row_major(BATCH, NB * 3)]()
-            var qv = xquat.lt["cpu", Layout.row_major(BATCH, NB * 4)]()
-            var sv = sxp.lt["cpu", Layout.row_major(BATCH, NS * 3)]()
+            var mv = meta.tt["cpu", BATCH, METADATA_SIZE]()
+            var cv = cur.tt["cpu", 1, MODEL_CURRICULUM_SIZE]()
+            var xv = xpos.tt["cpu", BATCH, NB * 3]()
+            var qv = xquat.tt["cpu", BATCH, NB * 4]()
+            var sv = sxp.tt["cpu", BATCH, NS * 3]()
 
             var h0 = eval_tape(
                 tp0, 0, hxp, hxq, hsp, r_site, r_x0, r_y0, r_x1, r_y1, r_h

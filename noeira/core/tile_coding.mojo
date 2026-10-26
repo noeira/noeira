@@ -167,7 +167,7 @@ struct TileCoding[DTYPE: DType]:
         state_list.append(state[1])
         state_list.append(state[2])
         state_list.append(state[3])
-        return self.get_tiles(state_list^)
+        return self.get_tiles(state_list)
 
     def get_tiles_simd2(self, state: SIMD[Self.DTYPE, 2]) -> List[Int]:
         """Get active tile indices for a 2D SIMD state (optimized for MountainCar).
@@ -181,7 +181,7 @@ struct TileCoding[DTYPE: DType]:
         var state_list = List[Scalar[Self.DTYPE]]()
         state_list.append(state[0])
         state_list.append(state[1])
-        return self.get_tiles(state_list^)
+        return self.get_tiles(state_list)
 
     def get_num_tiles(self) -> Int:
         """Return total number of tiles across all tilings."""

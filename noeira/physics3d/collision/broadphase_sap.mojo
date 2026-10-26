@@ -29,7 +29,8 @@ from std.sys.info import is_nvidia_gpu
 from std.atomic import Atomic
 from max.gpu import thread_idx, block_idx, block_dim
 from max.gpu.host import DeviceContext
-from layout import Layout, LayoutTensor
+from layout import TileTensor, TensorLayout
+from noeira.core.tiles import RowMajor, Tile, SharedTile, shared_tile
 
 from ..kinematics.quat_math import gpu_quat_rotate
 from ..constants import (
@@ -511,11 +512,11 @@ def _sap_plane_gate[
     BATCH: Int,
     D: DimsLike,
     EX_CAP: Int,
-    L_GEOMS: Layout,
-    L_BODIES: Layout,
-    L_MMETA: Layout,
-    L_EXCLUDES: Layout,
-    L_PAIRS: Layout,
+    L_GEOMS: TensorLayout,
+    L_BODIES: TensorLayout,
+    L_MMETA: TensorLayout,
+    L_EXCLUDES: TensorLayout,
+    L_PAIRS: TensorLayout,
 ](
     gi: Int,
     gj: Int,
@@ -540,21 +541,11 @@ def _sap_plane_gate[
     nbody: Int,
     ex_sig: Scratch[Int, EX_CAP],
     n_sig: Int,
-    geoms: LayoutTensor[
-        DTYPE, L_GEOMS, MutAnyOrigin
-    ],
-    bodies: LayoutTensor[
-        DTYPE, L_BODIES, MutAnyOrigin
-    ],
-    mmeta: LayoutTensor[
-        DTYPE, L_MMETA, MutAnyOrigin
-    ],
-    excludes: LayoutTensor[
-        DTYPE, L_EXCLUDES, MutAnyOrigin
-    ],
-    pairs: LayoutTensor[
-        DTYPE, L_PAIRS, MutAnyOrigin
-    ],
+    geoms: TileTensor[DTYPE, L_GEOMS, MutAnyOrigin],
+    bodies: TileTensor[DTYPE, L_BODIES, MutAnyOrigin],
+    mmeta: TileTensor[DTYPE, L_MMETA, MutAnyOrigin],
+    excludes: TileTensor[DTYPE, L_EXCLUDES, MutAnyOrigin],
+    pairs: TileTensor[DTYPE, L_PAIRS, MutAnyOrigin],
 ) -> _PlaneGate[DTYPE]:
     """Everything of the plane phase that can REJECT a (plane, geom)
     candidate before any contact is computed, in the order the serial loop
@@ -711,17 +702,17 @@ def _sap_plane_narrow[
     BATCH: Int,
     D: DimsLike,
     EX_CAP: Int,
-    L_GEOMS: Layout,
-    L_BODIES: Layout,
-    L_MMETA: Layout,
-    L_EXCLUDES: Layout,
-    L_PAIRS: Layout,
-    L_MESH_META: Layout,
-    L_MESH_VERTS: Layout,
-    L_MESH_VERT_EDGEADR: Layout,
-    L_MESH_EDGES: Layout,
-    L_CONTACTS: Layout,
-    L_WS: Layout,
+    L_GEOMS: TensorLayout,
+    L_BODIES: TensorLayout,
+    L_MMETA: TensorLayout,
+    L_EXCLUDES: TensorLayout,
+    L_PAIRS: TensorLayout,
+    L_MESH_META: TensorLayout,
+    L_MESH_VERTS: TensorLayout,
+    L_MESH_VERT_EDGEADR: TensorLayout,
+    L_MESH_EDGES: TensorLayout,
+    L_CONTACTS: TensorLayout,
+    L_WS: TensorLayout,
     HFIELD_ENABLED: Bool,
 ](
     env: Int,
@@ -763,40 +754,17 @@ def _sap_plane_narrow[
     gj_qy: Scalar[DTYPE],
     gj_qz: Scalar[DTYPE],
     gj_qw: Scalar[DTYPE],
-    geoms: LayoutTensor[
-        DTYPE, L_GEOMS, MutAnyOrigin
-    ],
-    bodies: LayoutTensor[
-        DTYPE, L_BODIES, MutAnyOrigin
-    ],
-    mmeta: LayoutTensor[
-        DTYPE, L_MMETA, MutAnyOrigin
-    ],
-    excludes: LayoutTensor[
-        DTYPE, L_EXCLUDES, MutAnyOrigin
-    ],
-    pairs: LayoutTensor[
-        DTYPE, L_PAIRS, MutAnyOrigin
-    ],
-    mesh_meta: LayoutTensor[
-        DTYPE,
-        L_MESH_META,
-        MutAnyOrigin,
-    ],
-    mesh_verts: LayoutTensor[
-        DTYPE, L_MESH_VERTS, MutAnyOrigin
-    ],
-    mesh_vert_edgeadr: LayoutTensor[
-        DTYPE, L_MESH_VERT_EDGEADR, MutAnyOrigin
-    ],
-    mesh_edges: LayoutTensor[
-        DTYPE, L_MESH_EDGES, MutAnyOrigin
-    ],
-    contacts: LayoutTensor[
-        DTYPE, L_CONTACTS,
-        MutAnyOrigin,
-    ],
-    ws: LayoutTensor[DTYPE, L_WS, MutAnyOrigin],
+    geoms: TileTensor[DTYPE, L_GEOMS, MutAnyOrigin],
+    bodies: TileTensor[DTYPE, L_BODIES, MutAnyOrigin],
+    mmeta: TileTensor[DTYPE, L_MMETA, MutAnyOrigin],
+    excludes: TileTensor[DTYPE, L_EXCLUDES, MutAnyOrigin],
+    pairs: TileTensor[DTYPE, L_PAIRS, MutAnyOrigin],
+    mesh_meta: TileTensor[DTYPE, L_MESH_META, MutAnyOrigin],
+    mesh_verts: TileTensor[DTYPE, L_MESH_VERTS, MutAnyOrigin],
+    mesh_vert_edgeadr: TileTensor[DTYPE, L_MESH_VERT_EDGEADR, MutAnyOrigin],
+    mesh_edges: TileTensor[DTYPE, L_MESH_EDGES, MutAnyOrigin],
+    contacts: TileTensor[DTYPE, L_CONTACTS, MutAnyOrigin],
+    ws: TileTensor[DTYPE, L_WS, MutAnyOrigin],
     # The warm-slot row (`gjk_epa_witness`); -1 = `wrow`.
     hw_row: Int = -1,
 ):
@@ -1327,9 +1295,9 @@ def _obb_separated[
 def _sap_pair_filter_rejects[
     DTYPE: DType,
     EX_CAP: Int,
-    L_BODIES: Layout,
-    L_MMETA: Layout,
-    L_EXCLUDES: Layout,
+    L_BODIES: TensorLayout,
+    L_MMETA: TensorLayout,
+    L_EXCLUDES: TensorLayout,
 ](
     gi_body: Int,
     gj_body: Int,
@@ -1337,9 +1305,9 @@ def _sap_pair_filter_rejects[
     gi_conaffinity: Int,
     gj_contype: Int,
     gj_conaffinity: Int,
-    bodies: LayoutTensor[DTYPE, L_BODIES, MutAnyOrigin],
-    mmeta: LayoutTensor[DTYPE, L_MMETA, MutAnyOrigin],
-    excludes: LayoutTensor[DTYPE, L_EXCLUDES, MutAnyOrigin],
+    bodies: TileTensor[DTYPE, L_BODIES, MutAnyOrigin],
+    mmeta: TileTensor[DTYPE, L_MMETA, MutAnyOrigin],
+    excludes: TileTensor[DTYPE, L_EXCLUDES, MutAnyOrigin],
     ex_sig: Scratch[Int, EX_CAP],
     n_sig: Int,
     nbody: Int,
@@ -1365,22 +1333,22 @@ def _sap_pair_narrow[
     BATCH: Int,
     D: DimsLike,
     EX_CAP: Int,
-    L_GEOMS: Layout,
-    L_BODIES: Layout,
-    L_MMETA: Layout,
-    L_EXCLUDES: Layout,
-    L_PAIRS: Layout,
-    L_MESH_META: Layout,
-    L_MESH_VERTS: Layout,
-    L_MESH_POLYS: Layout,
-    L_MESH_POLYVERT: Layout,
-    L_MESH_VERT_POLYMAP: Layout,
-    L_MESH_VERT_EDGEADR: Layout,
-    L_MESH_EDGES: Layout,
-    L_HF_META: Layout,
-    L_HF_DATA: Layout,
-    L_CONTACTS: Layout,
-    L_WS: Layout,
+    L_GEOMS: TensorLayout,
+    L_BODIES: TensorLayout,
+    L_MMETA: TensorLayout,
+    L_EXCLUDES: TensorLayout,
+    L_PAIRS: TensorLayout,
+    L_MESH_META: TensorLayout,
+    L_MESH_VERTS: TensorLayout,
+    L_MESH_POLYS: TensorLayout,
+    L_MESH_POLYVERT: TensorLayout,
+    L_MESH_VERT_POLYMAP: TensorLayout,
+    L_MESH_VERT_EDGEADR: TensorLayout,
+    L_MESH_EDGES: TensorLayout,
+    L_HF_META: TensorLayout,
+    L_HF_DATA: TensorLayout,
+    L_CONTACTS: TensorLayout,
+    L_WS: TensorLayout,
     HFIELD_ENABLED: Bool,
 ](
     env: Int,
@@ -1420,62 +1388,23 @@ def _sap_pair_narrow[
     ccd_tol: Scalar[DTYPE],
     ccd_iter: Int,
     multiccd_off: Bool,
-    geoms: LayoutTensor[
-        DTYPE, L_GEOMS, MutAnyOrigin
-    ],
-    bodies: LayoutTensor[
-        DTYPE, L_BODIES, MutAnyOrigin
-    ],
-    mmeta: LayoutTensor[
-        DTYPE, L_MMETA, MutAnyOrigin
-    ],
-    excludes: LayoutTensor[
-        DTYPE, L_EXCLUDES, MutAnyOrigin
-    ],
-    pairs: LayoutTensor[
-        DTYPE, L_PAIRS, MutAnyOrigin
-    ],
-    mesh_meta: LayoutTensor[
-        DTYPE,
-        L_MESH_META,
-        MutAnyOrigin,
-    ],
-    mesh_verts: LayoutTensor[
-        DTYPE, L_MESH_VERTS, MutAnyOrigin
-    ],
-    mesh_polys: LayoutTensor[
-        DTYPE,
-        L_MESH_POLYS,
-        MutAnyOrigin,
-    ],
-    mesh_polyvert: LayoutTensor[
-        DTYPE, L_MESH_POLYVERT, MutAnyOrigin
-    ],
-    mesh_polymap: LayoutTensor[
-        DTYPE, L_MESH_POLYVERT, MutAnyOrigin
-    ],
-    mesh_vert_polymap: LayoutTensor[
-        DTYPE, L_MESH_VERT_POLYMAP, MutAnyOrigin
-    ],
-    mesh_vert_edgeadr: LayoutTensor[
-        DTYPE, L_MESH_VERT_EDGEADR, MutAnyOrigin
-    ],
-    mesh_edges: LayoutTensor[
-        DTYPE, L_MESH_EDGES, MutAnyOrigin
-    ],
-    hfield_meta: LayoutTensor[
-        DTYPE, L_HF_META, MutAnyOrigin
-    ],
-    hfield_data: LayoutTensor[
-        DTYPE, L_HF_DATA, MutAnyOrigin
-    ],
-    contacts: LayoutTensor[
-        DTYPE, L_CONTACTS,
-        MutAnyOrigin,
-    ],
-    ws: LayoutTensor[
-        DTYPE, L_WS, MutAnyOrigin
-    ],
+    geoms: TileTensor[DTYPE, L_GEOMS, MutAnyOrigin],
+    bodies: TileTensor[DTYPE, L_BODIES, MutAnyOrigin],
+    mmeta: TileTensor[DTYPE, L_MMETA, MutAnyOrigin],
+    excludes: TileTensor[DTYPE, L_EXCLUDES, MutAnyOrigin],
+    pairs: TileTensor[DTYPE, L_PAIRS, MutAnyOrigin],
+    mesh_meta: TileTensor[DTYPE, L_MESH_META, MutAnyOrigin],
+    mesh_verts: TileTensor[DTYPE, L_MESH_VERTS, MutAnyOrigin],
+    mesh_polys: TileTensor[DTYPE, L_MESH_POLYS, MutAnyOrigin],
+    mesh_polyvert: TileTensor[DTYPE, L_MESH_POLYVERT, MutAnyOrigin],
+    mesh_polymap: TileTensor[DTYPE, L_MESH_POLYVERT, MutAnyOrigin],
+    mesh_vert_polymap: TileTensor[DTYPE, L_MESH_VERT_POLYMAP, MutAnyOrigin],
+    mesh_vert_edgeadr: TileTensor[DTYPE, L_MESH_VERT_EDGEADR, MutAnyOrigin],
+    mesh_edges: TileTensor[DTYPE, L_MESH_EDGES, MutAnyOrigin],
+    hfield_meta: TileTensor[DTYPE, L_HF_META, MutAnyOrigin],
+    hfield_data: TileTensor[DTYPE, L_HF_DATA, MutAnyOrigin],
+    contacts: TileTensor[DTYPE, L_CONTACTS, MutAnyOrigin],
+    ws: TileTensor[DTYPE, L_WS, MutAnyOrigin],
     # The warm-slot row (`gjk_epa_witness`); -1 = `wrow`.
     hw_row: Int = -1,
 ):
@@ -2578,25 +2507,25 @@ def _detect_contacts_sap_env[
     DTYPE: DType,
     BATCH: Int,
     D: DimsLike,
-    L_XPOS: Layout,
-    L_XQUAT: Layout,
-    L_GEOMS: Layout,
-    L_BODIES: Layout,
-    L_MMETA: Layout,
-    L_EXCLUDES: Layout,
-    L_PAIRS: Layout,
-    L_MESH_META: Layout,
-    L_MESH_VERTS: Layout,
-    L_MESH_POLYS: Layout,
-    L_MESH_POLYVERT: Layout,
-    L_MESH_VERT_POLYMAP: Layout,
-    L_MESH_VERT_EDGEADR: Layout,
-    L_MESH_EDGES: Layout,
-    L_HF_META: Layout,
-    L_HF_DATA: Layout,
-    L_CONTACTS: Layout,
-    L_SMETA: Layout,
-    L_WS: Layout,
+    L_XPOS: TensorLayout,
+    L_XQUAT: TensorLayout,
+    L_GEOMS: TensorLayout,
+    L_BODIES: TensorLayout,
+    L_MMETA: TensorLayout,
+    L_EXCLUDES: TensorLayout,
+    L_PAIRS: TensorLayout,
+    L_MESH_META: TensorLayout,
+    L_MESH_VERTS: TensorLayout,
+    L_MESH_POLYS: TensorLayout,
+    L_MESH_POLYVERT: TensorLayout,
+    L_MESH_VERT_POLYMAP: TensorLayout,
+    L_MESH_VERT_EDGEADR: TensorLayout,
+    L_MESH_EDGES: TensorLayout,
+    L_HF_META: TensorLayout,
+    L_HF_DATA: TensorLayout,
+    L_CONTACTS: TensorLayout,
+    L_SMETA: TensorLayout,
+    L_WS: TensorLayout,
     # Compiled on both targets — see the twin note in `contact_detection`.
     # EPA's polytope lives in `d.ccd_ws`, not on the per-thread stack, which
     # is what let the second GJK/EPA instantiation into the Metal kernel.
@@ -2604,73 +2533,28 @@ def _detect_contacts_sap_env[
 ](
     env: Int,
     dims: D,
-    xpos: LayoutTensor[
-        DTYPE, L_XPOS, MutAnyOrigin
-    ],
-    xquat: LayoutTensor[
-        DTYPE, L_XQUAT, MutAnyOrigin
-    ],
-    geoms: LayoutTensor[
-        DTYPE, L_GEOMS, MutAnyOrigin
-    ],
-    bodies: LayoutTensor[
-        DTYPE, L_BODIES, MutAnyOrigin
-    ],
-    mmeta: LayoutTensor[
-        DTYPE, L_MMETA, MutAnyOrigin
-    ],
-    excludes: LayoutTensor[
-        DTYPE, L_EXCLUDES, MutAnyOrigin
-    ],
-    pairs: LayoutTensor[
-        DTYPE, L_PAIRS, MutAnyOrigin
-    ],
-    mesh_meta: LayoutTensor[
-        DTYPE,
-        L_MESH_META,
-        MutAnyOrigin,
-    ],
-    mesh_verts: LayoutTensor[
-        DTYPE, L_MESH_VERTS, MutAnyOrigin
-    ],
-    mesh_polys: LayoutTensor[
-        DTYPE,
-        L_MESH_POLYS,
-        MutAnyOrigin,
-    ],
-    mesh_polyvert: LayoutTensor[
-        DTYPE, L_MESH_POLYVERT, MutAnyOrigin
-    ],
-    mesh_polymap: LayoutTensor[
-        DTYPE, L_MESH_POLYVERT, MutAnyOrigin
-    ],
-    mesh_vert_polymap: LayoutTensor[
-        DTYPE, L_MESH_VERT_POLYMAP, MutAnyOrigin
-    ],
-    mesh_vert_edgeadr: LayoutTensor[
-        DTYPE, L_MESH_VERT_EDGEADR, MutAnyOrigin
-    ],
-    mesh_edges: LayoutTensor[
-        DTYPE, L_MESH_EDGES, MutAnyOrigin
-    ],
-    hfield_meta: LayoutTensor[
-        DTYPE, L_HF_META, MutAnyOrigin
-    ],
-    hfield_data: LayoutTensor[
-        DTYPE, L_HF_DATA, MutAnyOrigin
-    ],
-    contacts: LayoutTensor[
-        DTYPE, L_CONTACTS,
-        MutAnyOrigin,
-    ],
-    smeta: LayoutTensor[
-        DTYPE, L_SMETA, MutAnyOrigin
-    ],
+    xpos: TileTensor[DTYPE, L_XPOS, MutAnyOrigin],
+    xquat: TileTensor[DTYPE, L_XQUAT, MutAnyOrigin],
+    geoms: TileTensor[DTYPE, L_GEOMS, MutAnyOrigin],
+    bodies: TileTensor[DTYPE, L_BODIES, MutAnyOrigin],
+    mmeta: TileTensor[DTYPE, L_MMETA, MutAnyOrigin],
+    excludes: TileTensor[DTYPE, L_EXCLUDES, MutAnyOrigin],
+    pairs: TileTensor[DTYPE, L_PAIRS, MutAnyOrigin],
+    mesh_meta: TileTensor[DTYPE, L_MESH_META, MutAnyOrigin],
+    mesh_verts: TileTensor[DTYPE, L_MESH_VERTS, MutAnyOrigin],
+    mesh_polys: TileTensor[DTYPE, L_MESH_POLYS, MutAnyOrigin],
+    mesh_polyvert: TileTensor[DTYPE, L_MESH_POLYVERT, MutAnyOrigin],
+    mesh_polymap: TileTensor[DTYPE, L_MESH_POLYVERT, MutAnyOrigin],
+    mesh_vert_polymap: TileTensor[DTYPE, L_MESH_VERT_POLYMAP, MutAnyOrigin],
+    mesh_vert_edgeadr: TileTensor[DTYPE, L_MESH_VERT_EDGEADR, MutAnyOrigin],
+    mesh_edges: TileTensor[DTYPE, L_MESH_EDGES, MutAnyOrigin],
+    hfield_meta: TileTensor[DTYPE, L_HF_META, MutAnyOrigin],
+    hfield_data: TileTensor[DTYPE, L_HF_DATA, MutAnyOrigin],
+    contacts: TileTensor[DTYPE, L_CONTACTS, MutAnyOrigin],
+    smeta: TileTensor[DTYPE, L_SMETA, MutAnyOrigin],
     # EPA's polytope, one row per env — MuJoCo's `config->buffer`. See
     # `ccd_workspace`.
-    ws: LayoutTensor[
-        DTYPE, L_WS, MutAnyOrigin
-    ],
+    ws: TileTensor[DTYPE, L_WS, MutAnyOrigin],
     # CCD workspace row; -1 = `env` (every serial caller).
     wrow_in: Int = -1,
 ):
@@ -3091,73 +2975,26 @@ def _detect_contacts_sap_fields_kernel[
     # with `ncon = -1`, leave every other env's contacts untouched.
     ONLY_FLAGGED: Bool = False,
 ](
-    xpos: LayoutTensor[
-        DTYPE, Layout.row_major(BATCH, NBODY * 3), MutAnyOrigin
-    ],
-    xquat: LayoutTensor[
-        DTYPE, Layout.row_major(BATCH, NBODY * 4), MutAnyOrigin
-    ],
-    geoms: LayoutTensor[
-        DTYPE, Layout.row_major(NGEOM, MODEL_GEOM_SIZE), MutAnyOrigin
-    ],
-    bodies: LayoutTensor[
-        DTYPE, Layout.row_major(NBODY, MODEL_BODY_SIZE), MutAnyOrigin
-    ],
-    mmeta: LayoutTensor[
-        DTYPE, Layout.row_major(MODEL_META_SIZE), MutAnyOrigin
-    ],
-    excludes: LayoutTensor[
-        DTYPE, Layout.row_major(NEXCLUDE, 2), MutAnyOrigin
-    ],
-    pairs: LayoutTensor[
-        DTYPE, Layout.row_major(NPAIR, MODEL_PAIR_SIZE), MutAnyOrigin
-    ],
-    mesh_meta: LayoutTensor[
-        DTYPE,
-        Layout.row_major(MAX_GPU_MESHES, MODEL_MESH_META_SIZE),
-        MutAnyOrigin,
-    ],
-    mesh_verts: LayoutTensor[
-        DTYPE, Layout.row_major(NMESH_VERTS, 3), MutAnyOrigin
-    ],
-    mesh_polys: LayoutTensor[
-        DTYPE,
-        Layout.row_major(mesh_max_poly(NMESH_VERTS), MODEL_MESH_POLY_SIZE),
-        MutAnyOrigin,
-    ],
-    mesh_polyvert: LayoutTensor[
-        DTYPE, Layout.row_major(mesh_max_polyvert(NMESH_VERTS)), MutAnyOrigin
-    ],
-    mesh_polymap: LayoutTensor[
-        DTYPE, Layout.row_major(mesh_max_polyvert(NMESH_VERTS)), MutAnyOrigin
-    ],
-    mesh_vert_polymap: LayoutTensor[
-        DTYPE, Layout.row_major(NMESH_VERTS, 2), MutAnyOrigin
-    ],
-    mesh_vert_edgeadr: LayoutTensor[
-        DTYPE, Layout.row_major(NMESH_VERTS), MutAnyOrigin
-    ],
-    mesh_edges: LayoutTensor[
-        DTYPE, Layout.row_major(mesh_max_edge(NMESH_VERTS)), MutAnyOrigin
-    ],
-    hfield_meta: LayoutTensor[
-        DTYPE,
-        Layout.row_major(MAX_GPU_HFIELDS * MODEL_HFIELD_META_SIZE),
-        MutAnyOrigin,
-    ],
-    hfield_data: LayoutTensor[
-        DTYPE, Layout.row_major(BATCH * NHFIELD_DATA), MutAnyOrigin
-    ],
-    contacts: LayoutTensor[
-        DTYPE, Layout.row_major(BATCH, MAX_CONTACTS * CONTACT_SIZE),
-        MutAnyOrigin,
-    ],
-    smeta: LayoutTensor[
-        DTYPE, Layout.row_major(BATCH, METADATA_SIZE), MutAnyOrigin
-    ],
-    ccd_ws: LayoutTensor[
-        DTYPE, Layout.row_major(BATCH * COLL_CCD_LANES, CCD_WS_SIZE), MutAnyOrigin
-    ],
+    xpos: Tile[DTYPE, BATCH, NBODY * 3],
+    xquat: Tile[DTYPE, BATCH, NBODY * 4],
+    geoms: Tile[DTYPE, NGEOM, MODEL_GEOM_SIZE],
+    bodies: Tile[DTYPE, NBODY, MODEL_BODY_SIZE],
+    mmeta: Tile[DTYPE, MODEL_META_SIZE],
+    excludes: Tile[DTYPE, NEXCLUDE, 2],
+    pairs: Tile[DTYPE, NPAIR, MODEL_PAIR_SIZE],
+    mesh_meta: Tile[DTYPE, MAX_GPU_MESHES, MODEL_MESH_META_SIZE],
+    mesh_verts: Tile[DTYPE, NMESH_VERTS, 3],
+    mesh_polys: Tile[DTYPE, mesh_max_poly(NMESH_VERTS), MODEL_MESH_POLY_SIZE],
+    mesh_polyvert: Tile[DTYPE, mesh_max_polyvert(NMESH_VERTS)],
+    mesh_polymap: Tile[DTYPE, mesh_max_polyvert(NMESH_VERTS)],
+    mesh_vert_polymap: Tile[DTYPE, NMESH_VERTS, 2],
+    mesh_vert_edgeadr: Tile[DTYPE, NMESH_VERTS],
+    mesh_edges: Tile[DTYPE, mesh_max_edge(NMESH_VERTS)],
+    hfield_meta: Tile[DTYPE, MAX_GPU_HFIELDS * MODEL_HFIELD_META_SIZE],
+    hfield_data: Tile[DTYPE, BATCH * NHFIELD_DATA],
+    contacts: Tile[DTYPE, BATCH, MAX_CONTACTS * CONTACT_SIZE],
+    smeta: Tile[DTYPE, BATCH, METADATA_SIZE],
+    ccd_ws: Tile[DTYPE, BATCH * COLL_CCD_LANES, CCD_WS_SIZE],
 ):
     var env = Int(block_dim.x * block_idx.x + thread_idx.x)
     if env >= BATCH:
@@ -3230,10 +3067,10 @@ def _sap_pair_listable[
     DTYPE: DType,
     D: DimsLike,
     EX_CAP: Int,
-    L_PAIRS: Layout,
-    L_MMETA: Layout,
-    L_BODIES: Layout,
-    L_EXCLUDES: Layout,
+    L_PAIRS: TensorLayout,
+    L_MMETA: TensorLayout,
+    L_BODIES: TensorLayout,
+    L_EXCLUDES: TensorLayout,
 ](
     si: Int,
     sj: Int,
@@ -3246,10 +3083,10 @@ def _sap_pair_listable[
     sj_contype: Int,
     sj_conaffinity: Int,
     dims: D,
-    pairs: LayoutTensor[DTYPE, L_PAIRS, MutAnyOrigin],
-    mmeta: LayoutTensor[DTYPE, L_MMETA, MutAnyOrigin],
-    bodies: LayoutTensor[DTYPE, L_BODIES, MutAnyOrigin],
-    excludes: LayoutTensor[DTYPE, L_EXCLUDES, MutAnyOrigin],
+    pairs: TileTensor[DTYPE, L_PAIRS, MutAnyOrigin],
+    mmeta: TileTensor[DTYPE, L_MMETA, MutAnyOrigin],
+    bodies: TileTensor[DTYPE, L_BODIES, MutAnyOrigin],
+    excludes: TileTensor[DTYPE, L_EXCLUDES, MutAnyOrigin],
     ex_sig: Scratch[Int, EX_CAP],
     n_sig: Int,
     nbody: Int,
@@ -3293,22 +3130,22 @@ def _sap_block_candidate[
     BATCH: Int,
     D: DimsLike,
     EX_CAP: Int,
-    L_GEOMS: Layout,
-    L_BODIES: Layout,
-    L_MMETA: Layout,
-    L_EXCLUDES: Layout,
-    L_PAIRS: Layout,
-    L_MESH_META: Layout,
-    L_MESH_VERTS: Layout,
-    L_MESH_POLYS: Layout,
-    L_MESH_POLYVERT: Layout,
-    L_MESH_VERT_POLYMAP: Layout,
-    L_MESH_VERT_EDGEADR: Layout,
-    L_MESH_EDGES: Layout,
-    L_HF_META: Layout,
-    L_HF_DATA: Layout,
-    L_STAGE: Layout,
-    L_WS: Layout,
+    L_GEOMS: TensorLayout,
+    L_BODIES: TensorLayout,
+    L_MMETA: TensorLayout,
+    L_EXCLUDES: TensorLayout,
+    L_PAIRS: TensorLayout,
+    L_MESH_META: TensorLayout,
+    L_MESH_VERTS: TensorLayout,
+    L_MESH_POLYS: TensorLayout,
+    L_MESH_POLYVERT: TensorLayout,
+    L_MESH_VERT_POLYMAP: TensorLayout,
+    L_MESH_VERT_EDGEADR: TensorLayout,
+    L_MESH_EDGES: TensorLayout,
+    L_HF_META: TensorLayout,
+    L_HF_DATA: TensorLayout,
+    L_STAGE: TensorLayout,
+    L_WS: TensorLayout,
 ](
     env: Int,
     wrow: Int,
@@ -3335,23 +3172,23 @@ def _sap_block_candidate[
     ccd_tol: Scalar[DTYPE],
     ccd_iter: Int,
     multiccd_off: Bool,
-    geoms: LayoutTensor[DTYPE, L_GEOMS, MutAnyOrigin],
-    bodies: LayoutTensor[DTYPE, L_BODIES, MutAnyOrigin],
-    mmeta: LayoutTensor[DTYPE, L_MMETA, MutAnyOrigin],
-    excludes: LayoutTensor[DTYPE, L_EXCLUDES, MutAnyOrigin],
-    pairs: LayoutTensor[DTYPE, L_PAIRS, MutAnyOrigin],
-    mesh_meta: LayoutTensor[DTYPE, L_MESH_META, MutAnyOrigin],
-    mesh_verts: LayoutTensor[DTYPE, L_MESH_VERTS, MutAnyOrigin],
-    mesh_polys: LayoutTensor[DTYPE, L_MESH_POLYS, MutAnyOrigin],
-    mesh_polyvert: LayoutTensor[DTYPE, L_MESH_POLYVERT, MutAnyOrigin],
-    mesh_polymap: LayoutTensor[DTYPE, L_MESH_POLYVERT, MutAnyOrigin],
-    mesh_vert_polymap: LayoutTensor[DTYPE, L_MESH_VERT_POLYMAP, MutAnyOrigin],
-    mesh_vert_edgeadr: LayoutTensor[DTYPE, L_MESH_VERT_EDGEADR, MutAnyOrigin],
-    mesh_edges: LayoutTensor[DTYPE, L_MESH_EDGES, MutAnyOrigin],
-    hfield_meta: LayoutTensor[DTYPE, L_HF_META, MutAnyOrigin],
-    hfield_data: LayoutTensor[DTYPE, L_HF_DATA, MutAnyOrigin],
-    stage: LayoutTensor[DTYPE, L_STAGE, MutAnyOrigin],
-    ccd_ws: LayoutTensor[DTYPE, L_WS, MutAnyOrigin],
+    geoms: TileTensor[DTYPE, L_GEOMS, MutAnyOrigin],
+    bodies: TileTensor[DTYPE, L_BODIES, MutAnyOrigin],
+    mmeta: TileTensor[DTYPE, L_MMETA, MutAnyOrigin],
+    excludes: TileTensor[DTYPE, L_EXCLUDES, MutAnyOrigin],
+    pairs: TileTensor[DTYPE, L_PAIRS, MutAnyOrigin],
+    mesh_meta: TileTensor[DTYPE, L_MESH_META, MutAnyOrigin],
+    mesh_verts: TileTensor[DTYPE, L_MESH_VERTS, MutAnyOrigin],
+    mesh_polys: TileTensor[DTYPE, L_MESH_POLYS, MutAnyOrigin],
+    mesh_polyvert: TileTensor[DTYPE, L_MESH_POLYVERT, MutAnyOrigin],
+    mesh_polymap: TileTensor[DTYPE, L_MESH_POLYVERT, MutAnyOrigin],
+    mesh_vert_polymap: TileTensor[DTYPE, L_MESH_VERT_POLYMAP, MutAnyOrigin],
+    mesh_vert_edgeadr: TileTensor[DTYPE, L_MESH_VERT_EDGEADR, MutAnyOrigin],
+    mesh_edges: TileTensor[DTYPE, L_MESH_EDGES, MutAnyOrigin],
+    hfield_meta: TileTensor[DTYPE, L_HF_META, MutAnyOrigin],
+    hfield_data: TileTensor[DTYPE, L_HF_DATA, MutAnyOrigin],
+    stage: TileTensor[DTYPE, L_STAGE, MutAnyOrigin],
+    ccd_ws: TileTensor[DTYPE, L_WS, MutAnyOrigin],
 ) -> Int:
     """One listed candidate's narrow phase into its staging window
     `stage[env, start ..]`; returns the records it wrote.
@@ -3396,30 +3233,21 @@ def _sap_block_candidate[
 def _sap_block_output[
     DTYPE: DType,
     NC: Int,
-    L_STAGE: Layout,
-    L_CONTACTS: Layout,
-    L_SMETA: Layout,
+    L_STAGE: TensorLayout,
+    L_CONTACTS: TensorLayout,
+    L_SMETA: TensorLayout,
 ](
     env: Int,
     tid: Int,
     ncand: Int,
     max_contacts: Int,
     nbody: Int,
-    cand_sh: LayoutTensor[
-        DTYPE, Layout.row_major(6 * NC), MutAnyOrigin,
-        address_space=AddressSpace.SHARED,
-    ],
-    sk_sh: LayoutTensor[
-        DTYPE, Layout.row_major(NC), MutAnyOrigin,
-        address_space=AddressSpace.SHARED,
-    ],
-    ctrl_sh: LayoutTensor[
-        DTYPE, Layout.row_major(8), MutAnyOrigin,
-        address_space=AddressSpace.SHARED,
-    ],
-    stage: LayoutTensor[DTYPE, L_STAGE, MutAnyOrigin],
-    contacts: LayoutTensor[DTYPE, L_CONTACTS, MutAnyOrigin],
-    smeta: LayoutTensor[DTYPE, L_SMETA, MutAnyOrigin],
+    cand_sh: SharedTile[DTYPE, 6 * NC],
+    sk_sh: SharedTile[DTYPE, NC],
+    ctrl_sh: SharedTile[DTYPE, 8],
+    stage: TileTensor[DTYPE, L_STAGE, MutAnyOrigin],
+    contacts: TileTensor[DTYPE, L_CONTACTS, MutAnyOrigin],
+    smeta: TileTensor[DTYPE, L_SMETA, MutAnyOrigin],
 ):
     """The block kernel's phase 3 — offsets (thread 0), the MuJoCo-order sort
     as ranks, the copy, `ncon` — on EVERY thread of the block (it barriers).
@@ -3532,81 +3360,29 @@ def _detect_contacts_sap_block_kernel[
     # List the candidates into `coll_flat` and return (`COLL_FLAT_NARROW`).
     FLAT_LIST: Bool = False,
 ](
-    xpos: LayoutTensor[
-        DTYPE, Layout.row_major(BATCH, NBODY * 3), MutAnyOrigin
-    ],
-    xquat: LayoutTensor[
-        DTYPE, Layout.row_major(BATCH, NBODY * 4), MutAnyOrigin
-    ],
-    geoms: LayoutTensor[
-        DTYPE, Layout.row_major(NGEOM, MODEL_GEOM_SIZE), MutAnyOrigin
-    ],
-    bodies: LayoutTensor[
-        DTYPE, Layout.row_major(NBODY, MODEL_BODY_SIZE), MutAnyOrigin
-    ],
-    mmeta: LayoutTensor[
-        DTYPE, Layout.row_major(MODEL_META_SIZE), MutAnyOrigin
-    ],
-    excludes: LayoutTensor[
-        DTYPE, Layout.row_major(NEXCLUDE, 2), MutAnyOrigin
-    ],
-    pairs: LayoutTensor[
-        DTYPE, Layout.row_major(NPAIR, MODEL_PAIR_SIZE), MutAnyOrigin
-    ],
-    mesh_meta: LayoutTensor[
-        DTYPE,
-        Layout.row_major(MAX_GPU_MESHES, MODEL_MESH_META_SIZE),
-        MutAnyOrigin,
-    ],
-    mesh_verts: LayoutTensor[
-        DTYPE, Layout.row_major(NMESH_VERTS, 3), MutAnyOrigin
-    ],
-    mesh_polys: LayoutTensor[
-        DTYPE,
-        Layout.row_major(mesh_max_poly(NMESH_VERTS), MODEL_MESH_POLY_SIZE),
-        MutAnyOrigin,
-    ],
-    mesh_polyvert: LayoutTensor[
-        DTYPE, Layout.row_major(mesh_max_polyvert(NMESH_VERTS)), MutAnyOrigin
-    ],
-    mesh_polymap: LayoutTensor[
-        DTYPE, Layout.row_major(mesh_max_polyvert(NMESH_VERTS)), MutAnyOrigin
-    ],
-    mesh_vert_polymap: LayoutTensor[
-        DTYPE, Layout.row_major(NMESH_VERTS, 2), MutAnyOrigin
-    ],
-    mesh_vert_edgeadr: LayoutTensor[
-        DTYPE, Layout.row_major(NMESH_VERTS), MutAnyOrigin
-    ],
-    mesh_edges: LayoutTensor[
-        DTYPE, Layout.row_major(mesh_max_edge(NMESH_VERTS)), MutAnyOrigin
-    ],
-    hfield_meta: LayoutTensor[
-        DTYPE,
-        Layout.row_major(MAX_GPU_HFIELDS * MODEL_HFIELD_META_SIZE),
-        MutAnyOrigin,
-    ],
-    hfield_data: LayoutTensor[
-        DTYPE, Layout.row_major(BATCH * NHFIELD_DATA), MutAnyOrigin
-    ],
-    contacts: LayoutTensor[
-        DTYPE, Layout.row_major(BATCH, MAX_CONTACTS * CONTACT_SIZE),
-        MutAnyOrigin,
-    ],
-    smeta: LayoutTensor[
-        DTYPE, Layout.row_major(BATCH, METADATA_SIZE), MutAnyOrigin
-    ],
-    ccd_ws: LayoutTensor[
-        DTYPE, Layout.row_major(BATCH * COLL_CCD_LANES, CCD_WS_SIZE), MutAnyOrigin
-    ],
-    stage: LayoutTensor[
-        DTYPE, Layout.row_major(BATCH, COLL_STAGE_SLOTS * CONTACT_SIZE),
-        MutAnyOrigin,
-    ],
+    xpos: Tile[DTYPE, BATCH, NBODY * 3],
+    xquat: Tile[DTYPE, BATCH, NBODY * 4],
+    geoms: Tile[DTYPE, NGEOM, MODEL_GEOM_SIZE],
+    bodies: Tile[DTYPE, NBODY, MODEL_BODY_SIZE],
+    mmeta: Tile[DTYPE, MODEL_META_SIZE],
+    excludes: Tile[DTYPE, NEXCLUDE, 2],
+    pairs: Tile[DTYPE, NPAIR, MODEL_PAIR_SIZE],
+    mesh_meta: Tile[DTYPE, MAX_GPU_MESHES, MODEL_MESH_META_SIZE],
+    mesh_verts: Tile[DTYPE, NMESH_VERTS, 3],
+    mesh_polys: Tile[DTYPE, mesh_max_poly(NMESH_VERTS), MODEL_MESH_POLY_SIZE],
+    mesh_polyvert: Tile[DTYPE, mesh_max_polyvert(NMESH_VERTS)],
+    mesh_polymap: Tile[DTYPE, mesh_max_polyvert(NMESH_VERTS)],
+    mesh_vert_polymap: Tile[DTYPE, NMESH_VERTS, 2],
+    mesh_vert_edgeadr: Tile[DTYPE, NMESH_VERTS],
+    mesh_edges: Tile[DTYPE, mesh_max_edge(NMESH_VERTS)],
+    hfield_meta: Tile[DTYPE, MAX_GPU_HFIELDS * MODEL_HFIELD_META_SIZE],
+    hfield_data: Tile[DTYPE, BATCH * NHFIELD_DATA],
+    contacts: Tile[DTYPE, BATCH, MAX_CONTACTS * CONTACT_SIZE],
+    smeta: Tile[DTYPE, BATCH, METADATA_SIZE],
+    ccd_ws: Tile[DTYPE, BATCH * COLL_CCD_LANES, CCD_WS_SIZE],
+    stage: Tile[DTYPE, BATCH, COLL_STAGE_SLOTS * CONTACT_SIZE],
     # `Data.coll_flat` — read and written only with `FLAT_LIST`
-    coll_flat: LayoutTensor[
-        DTYPE, Layout.row_major(coll_flat_words(BATCH)), MutAnyOrigin
-    ],
+    coll_flat: Tile[DTYPE, coll_flat_words(BATCH)],
 ):
     """ONE BLOCK PER ENV, `COLL_TPB` threads over the candidate pairs.
 
@@ -3666,76 +3442,37 @@ def _detect_contacts_sap_block_kernel[
     var npair = NPAIR
 
     # ── threadgroup memory ───────────────────────────────────────────────
-    var wp_sh = LayoutTensor[
-        DTYPE, Layout.row_major(7 * NG), MutAnyOrigin,
-        address_space=AddressSpace.SHARED,
-    ].stack_allocation()
-    var ab_sh = LayoutTensor[
-        DTYPE, Layout.row_major(6 * NG), MutAnyOrigin,
-        address_space=AddressSpace.SHARED,
-    ].stack_allocation()
-    var idx_sh = LayoutTensor[
-        DTYPE, Layout.row_major(2 * NG), MutAnyOrigin,
-        address_space=AddressSpace.SHARED,
-    ].stack_allocation()
+    var wp_sh = shared_tile[DTYPE, 7 * NG]()
+    var ab_sh = shared_tile[DTYPE, 6 * NG]()
+    var idx_sh = shared_tile[DTYPE, 2 * NG]()
     # geom type / body / contype / conaffinity, so thread 0's candidate
     # generation reads its per-pair fields from threadgroup memory instead
     # of one dependent global load per field per pair.
-    var gf_sh = LayoutTensor[
-        DTYPE, Layout.row_major(4 * NG), MutAnyOrigin,
-        address_space=AddressSpace.SHARED,
-    ].stack_allocation()
+    var gf_sh = shared_tile[DTYPE, 4 * NG]()
     # candidate list: a, b, si_type (-1 = plane candidate), staging offset,
     # kind key (phase 3 reuses the slot for the destination offset),
     # emitted count
-    var cand_sh = LayoutTensor[
-        DTYPE, Layout.row_major(6 * NC), MutAnyOrigin,
-        address_space=AddressSpace.SHARED,
-    ].stack_allocation()
+    var cand_sh = shared_tile[DTYPE, 6 * NC]()
     # the candidates in kind order (indices into the list above)
-    var ord_sh = LayoutTensor[
-        DTYPE, Layout.row_major(NC), MutAnyOrigin,
-        address_space=AddressSpace.SHARED,
-    ].stack_allocation()
-    var kcnt_sh = LayoutTensor[
-        DTYPE, Layout.row_major(_KIND_MAX), MutAnyOrigin,
-        address_space=AddressSpace.SHARED,
-    ].stack_allocation()
+    var ord_sh = shared_tile[DTYPE, NC]()
+    var kcnt_sh = shared_tile[DTYPE, _KIND_MAX]()
     # the plane gate's verdict per geom, for the plane being listed; then
     # the sweep's per-row survivor count and first candidate slot
-    var pf_sh = LayoutTensor[
-        DTYPE, Layout.row_major(NG), MutAnyOrigin,
-        address_space=AddressSpace.SHARED,
-    ].stack_allocation()
+    var pf_sh = shared_tile[DTYPE, NG]()
     # [0] ncand [1] overflow [2] n_sig [3] n_out; the sweep's hand-over:
     # [4] sap_n [5] candidates listed before it [6] their overflow
     # [7] candidates it lists, uncapped
-    var ctrl_sh = LayoutTensor[
-        DTYPE, Layout.row_major(8), MutAnyOrigin,
-        address_space=AddressSpace.SHARED,
-    ].stack_allocation()
+    var ctrl_sh = shared_tile[DTYPE, 8]()
     # the sweep's survivors, one bit per sorted (i, j), row-major
     comptime MW = (NG + 31) // 32
-    var mask_sh = LayoutTensor[
-        DType.uint32, Layout.row_major(NG * MW), MutAnyOrigin,
-        address_space=AddressSpace.SHARED,
-    ].stack_allocation()
+    var mask_sh = shared_tile[DType.uint32, NG * MW]()
     # phase 3's sort key per candidate: its body pair
-    var sk_sh = LayoutTensor[
-        DTYPE, Layout.row_major(NC), MutAnyOrigin,
-        address_space=AddressSpace.SHARED,
-    ].stack_allocation()
+    var sk_sh = shared_tile[DTYPE, NC]()
     # `COLL_CAND_REPORT`'s per-thread sweep counters, summed by thread 0
-    var rep_sh = LayoutTensor[
-        DTYPE, Layout.row_major(4 * COLL_TPB), MutAnyOrigin,
-        address_space=AddressSpace.SHARED,
-    ].stack_allocation()
+    var rep_sh = shared_tile[DTYPE, 4 * COLL_TPB]()
     # `<exclude>` signatures, sorted once per block by thread 0 (they are a
     # per-model table; every thread used to sort its own copy).
-    var ex_sh = LayoutTensor[
-        DTYPE, Layout.row_major(EX_CAP), MutAnyOrigin,
-        address_space=AddressSpace.SHARED,
-    ].stack_allocation()
+    var ex_sh = shared_tile[DTYPE, EX_CAP]()
 
     # ── phase 0: world pose and AABB, one geom per thread ────────────────
     for g in range(tid, ngeom, COLL_TPB):
@@ -4317,17 +4054,9 @@ def _sap_flat_list_env[
     tid: Int,
     ncand: Int,
     overflow: Int,
-    cand_sh: LayoutTensor[
-        DTYPE, Layout.row_major(6 * NC), MutAnyOrigin,
-        address_space=AddressSpace.SHARED,
-    ],
-    ord_sh: LayoutTensor[
-        DTYPE, Layout.row_major(NC), MutAnyOrigin,
-        address_space=AddressSpace.SHARED,
-    ],
-    coll_flat: LayoutTensor[
-        DTYPE, Layout.row_major(coll_flat_words(BATCH)), MutAnyOrigin
-    ],
+    cand_sh: SharedTile[DTYPE, 6 * NC],
+    ord_sh: SharedTile[DTYPE, NC],
+    coll_flat: Tile[DTYPE, coll_flat_words(BATCH)],
 ):
     """`FLAT_LIST`'s ending (EVERY thread — it barriers): the env's listed
     candidates into its `coll_flat` row (`a, b, t`, the counts), each one
@@ -4435,81 +4164,29 @@ def _sap_narrow_flat_kernel[
     NPAIR: Int,
     NHFIELD_DATA: Int,
 ](
-    xpos: LayoutTensor[
-        DTYPE, Layout.row_major(BATCH, NBODY * 3), MutAnyOrigin
-    ],
-    xquat: LayoutTensor[
-        DTYPE, Layout.row_major(BATCH, NBODY * 4), MutAnyOrigin
-    ],
-    geoms: LayoutTensor[
-        DTYPE, Layout.row_major(NGEOM, MODEL_GEOM_SIZE), MutAnyOrigin
-    ],
-    bodies: LayoutTensor[
-        DTYPE, Layout.row_major(NBODY, MODEL_BODY_SIZE), MutAnyOrigin
-    ],
-    mmeta: LayoutTensor[
-        DTYPE, Layout.row_major(MODEL_META_SIZE), MutAnyOrigin
-    ],
-    excludes: LayoutTensor[
-        DTYPE, Layout.row_major(NEXCLUDE, 2), MutAnyOrigin
-    ],
-    pairs: LayoutTensor[
-        DTYPE, Layout.row_major(NPAIR, MODEL_PAIR_SIZE), MutAnyOrigin
-    ],
-    mesh_meta: LayoutTensor[
-        DTYPE,
-        Layout.row_major(MAX_GPU_MESHES, MODEL_MESH_META_SIZE),
-        MutAnyOrigin,
-    ],
-    mesh_verts: LayoutTensor[
-        DTYPE, Layout.row_major(NMESH_VERTS, 3), MutAnyOrigin
-    ],
-    mesh_polys: LayoutTensor[
-        DTYPE,
-        Layout.row_major(mesh_max_poly(NMESH_VERTS), MODEL_MESH_POLY_SIZE),
-        MutAnyOrigin,
-    ],
-    mesh_polyvert: LayoutTensor[
-        DTYPE, Layout.row_major(mesh_max_polyvert(NMESH_VERTS)), MutAnyOrigin
-    ],
-    mesh_polymap: LayoutTensor[
-        DTYPE, Layout.row_major(mesh_max_polyvert(NMESH_VERTS)), MutAnyOrigin
-    ],
-    mesh_vert_polymap: LayoutTensor[
-        DTYPE, Layout.row_major(NMESH_VERTS, 2), MutAnyOrigin
-    ],
-    mesh_vert_edgeadr: LayoutTensor[
-        DTYPE, Layout.row_major(NMESH_VERTS), MutAnyOrigin
-    ],
-    mesh_edges: LayoutTensor[
-        DTYPE, Layout.row_major(mesh_max_edge(NMESH_VERTS)), MutAnyOrigin
-    ],
-    hfield_meta: LayoutTensor[
-        DTYPE,
-        Layout.row_major(MAX_GPU_HFIELDS * MODEL_HFIELD_META_SIZE),
-        MutAnyOrigin,
-    ],
-    hfield_data: LayoutTensor[
-        DTYPE, Layout.row_major(BATCH * NHFIELD_DATA), MutAnyOrigin
-    ],
-    contacts: LayoutTensor[
-        DTYPE, Layout.row_major(BATCH, MAX_CONTACTS * CONTACT_SIZE),
-        MutAnyOrigin,
-    ],
-    smeta: LayoutTensor[
-        DTYPE, Layout.row_major(BATCH, METADATA_SIZE), MutAnyOrigin
-    ],
-    ccd_ws: LayoutTensor[
-        DTYPE, Layout.row_major(BATCH * COLL_CCD_LANES, CCD_WS_SIZE), MutAnyOrigin
-    ],
-    stage: LayoutTensor[
-        DTYPE, Layout.row_major(BATCH, COLL_STAGE_SLOTS * CONTACT_SIZE),
-        MutAnyOrigin,
-    ],
+    xpos: Tile[DTYPE, BATCH, NBODY * 3],
+    xquat: Tile[DTYPE, BATCH, NBODY * 4],
+    geoms: Tile[DTYPE, NGEOM, MODEL_GEOM_SIZE],
+    bodies: Tile[DTYPE, NBODY, MODEL_BODY_SIZE],
+    mmeta: Tile[DTYPE, MODEL_META_SIZE],
+    excludes: Tile[DTYPE, NEXCLUDE, 2],
+    pairs: Tile[DTYPE, NPAIR, MODEL_PAIR_SIZE],
+    mesh_meta: Tile[DTYPE, MAX_GPU_MESHES, MODEL_MESH_META_SIZE],
+    mesh_verts: Tile[DTYPE, NMESH_VERTS, 3],
+    mesh_polys: Tile[DTYPE, mesh_max_poly(NMESH_VERTS), MODEL_MESH_POLY_SIZE],
+    mesh_polyvert: Tile[DTYPE, mesh_max_polyvert(NMESH_VERTS)],
+    mesh_polymap: Tile[DTYPE, mesh_max_polyvert(NMESH_VERTS)],
+    mesh_vert_polymap: Tile[DTYPE, NMESH_VERTS, 2],
+    mesh_vert_edgeadr: Tile[DTYPE, NMESH_VERTS],
+    mesh_edges: Tile[DTYPE, mesh_max_edge(NMESH_VERTS)],
+    hfield_meta: Tile[DTYPE, MAX_GPU_HFIELDS * MODEL_HFIELD_META_SIZE],
+    hfield_data: Tile[DTYPE, BATCH * NHFIELD_DATA],
+    contacts: Tile[DTYPE, BATCH, MAX_CONTACTS * CONTACT_SIZE],
+    smeta: Tile[DTYPE, BATCH, METADATA_SIZE],
+    ccd_ws: Tile[DTYPE, BATCH * COLL_CCD_LANES, CCD_WS_SIZE],
+    stage: Tile[DTYPE, BATCH, COLL_STAGE_SLOTS * CONTACT_SIZE],
     # `Data.coll_flat` — the queues, lists and costs
-    coll_flat: LayoutTensor[
-        DTYPE, Layout.row_major(coll_flat_words(BATCH)), MutAnyOrigin
-    ],
+    coll_flat: Tile[DTYPE, coll_flat_words(BATCH)],
 ):
     """The flat narrow phase: one WARP (block) per env slot, over the queues
     the listing appended to. Warp `w` runs hot tasks `w, w + W, ...` on its
@@ -4535,14 +4212,8 @@ def _sap_narrow_flat_kernel[
     comptime EX_CAP = cap[NEXCLUDE]() if may_exist[NEXCLUDE]() else 1
     var dims = Dims[nq=NQ, nv=NV, nbody=NBODY, njoint=NJOINT, max_contacts=MAX_CONTACTS, ngeom=NGEOM, nexclude=NEXCLUDE, nmesh_verts=NMESH_VERTS, npair=NPAIR]()
     var nbody = NBODY
-    var ex_sh = LayoutTensor[
-        DTYPE, Layout.row_major(EX_CAP), MutAnyOrigin,
-        address_space=AddressSpace.SHARED,
-    ].stack_allocation()
-    var nsig_sh = LayoutTensor[
-        DTYPE, Layout.row_major(1), MutAnyOrigin,
-        address_space=AddressSpace.SHARED,
-    ].stack_allocation()
+    var ex_sh = shared_tile[DTYPE, EX_CAP]()
+    var nsig_sh = shared_tile[DTYPE, 1]()
     # The model's `<exclude>` signatures, as the block kernel's phase 1a.
     if lane == 0:
         var ex0 = Scratch[Int, EX_CAP](
@@ -4693,20 +4364,10 @@ def _sap_flat_output_kernel[
     NBODY: Int,
     BATCH: Int,
 ](
-    contacts: LayoutTensor[
-        DTYPE, Layout.row_major(BATCH, MAX_CONTACTS * CONTACT_SIZE),
-        MutAnyOrigin,
-    ],
-    smeta: LayoutTensor[
-        DTYPE, Layout.row_major(BATCH, METADATA_SIZE), MutAnyOrigin
-    ],
-    stage: LayoutTensor[
-        DTYPE, Layout.row_major(BATCH, COLL_STAGE_SLOTS * CONTACT_SIZE),
-        MutAnyOrigin,
-    ],
-    coll_flat: LayoutTensor[
-        DTYPE, Layout.row_major(coll_flat_words(BATCH)), MutAnyOrigin
-    ],
+    contacts: Tile[DTYPE, BATCH, MAX_CONTACTS * CONTACT_SIZE],
+    smeta: Tile[DTYPE, BATCH, METADATA_SIZE],
+    stage: Tile[DTYPE, BATCH, COLL_STAGE_SLOTS * CONTACT_SIZE],
+    coll_flat: Tile[DTYPE, coll_flat_words(BATCH)],
 ):
     """One block per env: the flat narrow phase's staging windows through
     the block kernel's phase 3 (`_sap_block_output`). A list past the cap or
@@ -4716,18 +4377,9 @@ def _sap_flat_output_kernel[
     var tid = Int(thread_idx.x)
     if env >= BATCH:
         return
-    var cand_sh = LayoutTensor[
-        DTYPE, Layout.row_major(6 * NC), MutAnyOrigin,
-        address_space=AddressSpace.SHARED,
-    ].stack_allocation()
-    var sk_sh = LayoutTensor[
-        DTYPE, Layout.row_major(NC), MutAnyOrigin,
-        address_space=AddressSpace.SHARED,
-    ].stack_allocation()
-    var ctrl_sh = LayoutTensor[
-        DTYPE, Layout.row_major(8), MutAnyOrigin,
-        address_space=AddressSpace.SHARED,
-    ].stack_allocation()
+    var cand_sh = shared_tile[DTYPE, 6 * NC]()
+    var sk_sh = shared_tile[DTYPE, NC]()
+    var ctrl_sh = shared_tile[DTYPE, 8]()
     var base = env * CF_ROW
     if env == 0 and tid == 0:
         # The queues are consumed (the narrow kernel has run): zero their
@@ -4775,33 +4427,27 @@ def detect_contacts_sap[
     """AABB/SAP broadphase geom contact detection from FK products, both
     targets, one body. Reads `d.xpos`/`d.xquat` + geom/body/meta/exclude/mesh
     records; writes `d.contacts` + the ncon slot of `d.meta`."""
-    comptime L_B3 = Layout.row_major(BATCH, D.NBODY * 3)
-    comptime L_B4 = Layout.row_major(BATCH, D.NBODY * 4)
-    comptime L_GEOM = Layout.row_major(D.NGEOM, MODEL_GEOM_SIZE)
-    comptime L_BODY = Layout.row_major(D.NBODY, MODEL_BODY_SIZE)
-    comptime L_MMETA = Layout.row_major(MODEL_META_SIZE)
-    comptime L_EXCLUDE = Layout.row_major(D.NEXCLUDE, 2)
-    comptime L_PAIR = Layout.row_major(D.NPAIR, MODEL_PAIR_SIZE)
-    comptime L_MESH_META = Layout.row_major(
-        MAX_GPU_MESHES, MODEL_MESH_META_SIZE
-    )
-    comptime L_MESH_VERT = Layout.row_major(D.NMESH_VERTS, 3)
-    comptime L_MESH_POLY = Layout.row_major(
-        mesh_max_poly(D.NMESH_VERTS), MODEL_MESH_POLY_SIZE
-    )
-    comptime L_MESH_POLYVERT = Layout.row_major(mesh_max_polyvert(D.NMESH_VERTS))
-    comptime L_MESH_VPMAP = Layout.row_major(D.NMESH_VERTS, 2)
-    comptime L_MESH_VEADR = Layout.row_major(D.NMESH_VERTS)
-    comptime L_MESH_EDGE = Layout.row_major(mesh_max_edge(D.NMESH_VERTS))
-    comptime L_HF_META = Layout.row_major(
-        MAX_GPU_HFIELDS * MODEL_HFIELD_META_SIZE
-    )
-    comptime L_HF_DATA = Layout.row_major(BATCH * _hf_len(D.NHFIELD_DATA))
-    comptime L_CONTACTS = Layout.row_major(BATCH, D.MAX_CONTACTS * CONTACT_SIZE)
-    comptime L_SMETA = Layout.row_major(BATCH, METADATA_SIZE)
-    comptime L_CCD_WS = Layout.row_major(BATCH * COLL_CCD_LANES, CCD_WS_SIZE)
-    comptime L_COLL_STAGE = Layout.row_major(BATCH, COLL_STAGE_SLOTS * CONTACT_SIZE)
-    comptime L_COLL_FLAT = Layout.row_major(coll_flat_words(BATCH))
+    comptime L_B3 = RowMajor[BATCH, D.NBODY * 3]
+    comptime L_B4 = RowMajor[BATCH, D.NBODY * 4]
+    comptime L_GEOM = RowMajor[D.NGEOM, MODEL_GEOM_SIZE]
+    comptime L_BODY = RowMajor[D.NBODY, MODEL_BODY_SIZE]
+    comptime L_MMETA = RowMajor[MODEL_META_SIZE]
+    comptime L_EXCLUDE = RowMajor[D.NEXCLUDE, 2]
+    comptime L_PAIR = RowMajor[D.NPAIR, MODEL_PAIR_SIZE]
+    comptime L_MESH_META = RowMajor[MAX_GPU_MESHES, MODEL_MESH_META_SIZE]
+    comptime L_MESH_VERT = RowMajor[D.NMESH_VERTS, 3]
+    comptime L_MESH_POLY = RowMajor[mesh_max_poly(D.NMESH_VERTS), MODEL_MESH_POLY_SIZE]
+    comptime L_MESH_POLYVERT = RowMajor[mesh_max_polyvert(D.NMESH_VERTS)]
+    comptime L_MESH_VPMAP = RowMajor[D.NMESH_VERTS, 2]
+    comptime L_MESH_VEADR = RowMajor[D.NMESH_VERTS]
+    comptime L_MESH_EDGE = RowMajor[mesh_max_edge(D.NMESH_VERTS)]
+    comptime L_HF_META = RowMajor[MAX_GPU_HFIELDS * MODEL_HFIELD_META_SIZE]
+    comptime L_HF_DATA = RowMajor[BATCH * _hf_len(D.NHFIELD_DATA)]
+    comptime L_CONTACTS = RowMajor[BATCH, D.MAX_CONTACTS * CONTACT_SIZE]
+    comptime L_SMETA = RowMajor[BATCH, METADATA_SIZE]
+    comptime L_CCD_WS = RowMajor[BATCH * COLL_CCD_LANES, CCD_WS_SIZE]
+    comptime L_COLL_STAGE = RowMajor[BATCH, COLL_STAGE_SLOTS * CONTACT_SIZE]
+    comptime L_COLL_FLAT = RowMajor[coll_flat_words(BATCH)]
 
     comptime if target == "cpu":
         var dm = d.dims
@@ -4824,28 +4470,28 @@ def detect_contacts_sap[
         var rl_CONTACTS = rl2(BATCH, dm.get_max_contacts() * CONTACT_SIZE)
         var rl_SMETA = rl2(BATCH, METADATA_SIZE)
         var rl_CCD_WS = rl2(BATCH * COLL_CCD_LANES, CCD_WS_SIZE)
-        var xpos_v = d.xpos.lt_dyn["cpu", DYN2](rl_B3)
-        var xquat_v = d.xquat.lt_dyn["cpu", DYN2](rl_B4)
-        var geoms_v = m.geoms.lt_dyn["cpu", DYN2](rl_GEOM)
-        var bodies_v = m.bodies.lt_dyn["cpu", DYN2](rl_BODY)
-        var mmeta_v = m.meta.lt_dyn["cpu", DYN1](rl_MMETA)
-        var excludes_v = m.excludes.lt_dyn["cpu", DYN2](rl_EXCLUDE)
-        var pairs_v = m.pairs.lt_dyn["cpu", DYN2](rl_PAIR)
-        var mesh_meta_v = m.mesh_meta.lt_dyn["cpu", DYN2](rl_MESH_META)
-        var mesh_verts_v = m.mesh_verts.lt_dyn["cpu", DYN2](rl_MESH_VERT)
-        var mesh_polys_v = m.mesh_polys.lt_dyn["cpu", DYN2](rl_MESH_POLY)
-        var mesh_polyvert_v = m.mesh_polyvert.lt_dyn["cpu", DYN1](rl_MESH_POLYVERT)
-        var mesh_polymap_v = m.mesh_polymap.lt_dyn["cpu", DYN1](rl_MESH_POLYVERT)
-        var mesh_vert_polymap_v = m.mesh_vert_polymap.lt_dyn["cpu", DYN2](rl_MESH_VPMAP)
-        var mesh_vert_edgeadr_v = m.mesh_vert_edgeadr.lt_dyn[
+        var xpos_v = d.xpos.tt_dyn["cpu", DYN2](rl_B3)
+        var xquat_v = d.xquat.tt_dyn["cpu", DYN2](rl_B4)
+        var geoms_v = m.geoms.tt_dyn["cpu", DYN2](rl_GEOM)
+        var bodies_v = m.bodies.tt_dyn["cpu", DYN2](rl_BODY)
+        var mmeta_v = m.meta.tt_dyn["cpu", DYN1](rl_MMETA)
+        var excludes_v = m.excludes.tt_dyn["cpu", DYN2](rl_EXCLUDE)
+        var pairs_v = m.pairs.tt_dyn["cpu", DYN2](rl_PAIR)
+        var mesh_meta_v = m.mesh_meta.tt_dyn["cpu", DYN2](rl_MESH_META)
+        var mesh_verts_v = m.mesh_verts.tt_dyn["cpu", DYN2](rl_MESH_VERT)
+        var mesh_polys_v = m.mesh_polys.tt_dyn["cpu", DYN2](rl_MESH_POLY)
+        var mesh_polyvert_v = m.mesh_polyvert.tt_dyn["cpu", DYN1](rl_MESH_POLYVERT)
+        var mesh_polymap_v = m.mesh_polymap.tt_dyn["cpu", DYN1](rl_MESH_POLYVERT)
+        var mesh_vert_polymap_v = m.mesh_vert_polymap.tt_dyn["cpu", DYN2](rl_MESH_VPMAP)
+        var mesh_vert_edgeadr_v = m.mesh_vert_edgeadr.tt_dyn[
             "cpu", DYN1
         ](rl_MESH_VEADR)
-        var mesh_edges_v = m.mesh_edges.lt_dyn["cpu", DYN1](rl_MESH_EDGE)
-        var hfield_meta_v = m.hfield_meta.lt_dyn["cpu", DYN1](rl_HF_META)
-        var hfield_data_v = d.hfield_data.lt_dyn["cpu", DYN1](rl_HF_DATA)
-        var contacts_v = d.contacts.lt_dyn["cpu", DYN2](rl_CONTACTS)
-        var smeta_v = d.meta.lt_dyn["cpu", DYN2](rl_SMETA)
-        var ccd_ws_v = d.ccd_ws.lt_dyn["cpu", DYN2](rl_CCD_WS)
+        var mesh_edges_v = m.mesh_edges.tt_dyn["cpu", DYN1](rl_MESH_EDGE)
+        var hfield_meta_v = m.hfield_meta.tt_dyn["cpu", DYN1](rl_HF_META)
+        var hfield_data_v = d.hfield_data.tt_dyn["cpu", DYN1](rl_HF_DATA)
+        var contacts_v = d.contacts.tt_dyn["cpu", DYN2](rl_CONTACTS)
+        var smeta_v = d.meta.tt_dyn["cpu", DYN2](rl_SMETA)
+        var ccd_ws_v = d.ccd_ws.tt_dyn["cpu", DYN2](rl_CCD_WS)
         for e in range(BATCH):
             _detect_contacts_sap_env[DTYPE, BATCH](
                 e, dm, xpos_v, xquat_v, geoms_v, bodies_v, mmeta_v,
@@ -4870,28 +4516,28 @@ def detect_contacts_sap[
                     FLAT_LIST=True,
                 ]
             ](
-                d.xpos.lt["gpu", L_B3](),
-                d.xquat.lt["gpu", L_B4](),
-                m.geoms.lt["gpu", L_GEOM](),
-                m.bodies.lt["gpu", L_BODY](),
-                m.meta.lt["gpu", L_MMETA](),
-                m.excludes.lt["gpu", L_EXCLUDE](),
-                m.pairs.lt["gpu", L_PAIR](),
-                m.mesh_meta.lt["gpu", L_MESH_META](),
-                m.mesh_verts.lt["gpu", L_MESH_VERT](),
-                m.mesh_polys.lt["gpu", L_MESH_POLY](),
-                m.mesh_polyvert.lt["gpu", L_MESH_POLYVERT](),
-                m.mesh_polymap.lt["gpu", L_MESH_POLYVERT](),
-                m.mesh_vert_polymap.lt["gpu", L_MESH_VPMAP](),
-                m.mesh_vert_edgeadr.lt["gpu", L_MESH_VEADR](),
-                m.mesh_edges.lt["gpu", L_MESH_EDGE](),
-                m.hfield_meta.lt["gpu", L_HF_META](),
-                d.hfield_data.lt["gpu", L_HF_DATA](),
-                d.contacts.lt["gpu", L_CONTACTS](),
-                d.meta.lt["gpu", L_SMETA](),
-                d.ccd_ws.lt["gpu", L_CCD_WS](),
-                d.coll_stage.lt["gpu", L_COLL_STAGE](),
-                d.coll_flat.lt["gpu", L_COLL_FLAT](),
+                d.xpos.tt["gpu", BATCH, D.NBODY * 3](),
+                d.xquat.tt["gpu", BATCH, D.NBODY * 4](),
+                m.geoms.tt["gpu", D.NGEOM, MODEL_GEOM_SIZE](),
+                m.bodies.tt["gpu", D.NBODY, MODEL_BODY_SIZE](),
+                m.meta.tt["gpu", MODEL_META_SIZE](),
+                m.excludes.tt["gpu", D.NEXCLUDE, 2](),
+                m.pairs.tt["gpu", D.NPAIR, MODEL_PAIR_SIZE](),
+                m.mesh_meta.tt["gpu", MAX_GPU_MESHES, MODEL_MESH_META_SIZE](),
+                m.mesh_verts.tt["gpu", D.NMESH_VERTS, 3](),
+                m.mesh_polys.tt["gpu", mesh_max_poly(D.NMESH_VERTS), MODEL_MESH_POLY_SIZE](),
+                m.mesh_polyvert.tt["gpu", mesh_max_polyvert(D.NMESH_VERTS)](),
+                m.mesh_polymap.tt["gpu", mesh_max_polyvert(D.NMESH_VERTS)](),
+                m.mesh_vert_polymap.tt["gpu", D.NMESH_VERTS, 2](),
+                m.mesh_vert_edgeadr.tt["gpu", D.NMESH_VERTS](),
+                m.mesh_edges.tt["gpu", mesh_max_edge(D.NMESH_VERTS)](),
+                m.hfield_meta.tt["gpu", MAX_GPU_HFIELDS * MODEL_HFIELD_META_SIZE](),
+                d.hfield_data.tt["gpu", BATCH * _hf_len(D.NHFIELD_DATA)](),
+                d.contacts.tt["gpu", BATCH, D.MAX_CONTACTS * CONTACT_SIZE](),
+                d.meta.tt["gpu", BATCH, METADATA_SIZE](),
+                d.ccd_ws.tt["gpu", BATCH * COLL_CCD_LANES, CCD_WS_SIZE](),
+                d.coll_stage.tt["gpu", BATCH, COLL_STAGE_SLOTS * CONTACT_SIZE](),
+                d.coll_flat.tt["gpu", coll_flat_words(BATCH)](),
                 grid_dim=(BATCH,),
                 block_dim=(COLL_TPB,),
             )
@@ -4902,28 +4548,28 @@ def detect_contacts_sap[
                     _hf_len(D.NHFIELD_DATA),
                 ]
             ](
-                d.xpos.lt["gpu", L_B3](),
-                d.xquat.lt["gpu", L_B4](),
-                m.geoms.lt["gpu", L_GEOM](),
-                m.bodies.lt["gpu", L_BODY](),
-                m.meta.lt["gpu", L_MMETA](),
-                m.excludes.lt["gpu", L_EXCLUDE](),
-                m.pairs.lt["gpu", L_PAIR](),
-                m.mesh_meta.lt["gpu", L_MESH_META](),
-                m.mesh_verts.lt["gpu", L_MESH_VERT](),
-                m.mesh_polys.lt["gpu", L_MESH_POLY](),
-                m.mesh_polyvert.lt["gpu", L_MESH_POLYVERT](),
-                m.mesh_polymap.lt["gpu", L_MESH_POLYVERT](),
-                m.mesh_vert_polymap.lt["gpu", L_MESH_VPMAP](),
-                m.mesh_vert_edgeadr.lt["gpu", L_MESH_VEADR](),
-                m.mesh_edges.lt["gpu", L_MESH_EDGE](),
-                m.hfield_meta.lt["gpu", L_HF_META](),
-                d.hfield_data.lt["gpu", L_HF_DATA](),
-                d.contacts.lt["gpu", L_CONTACTS](),
-                d.meta.lt["gpu", L_SMETA](),
-                d.ccd_ws.lt["gpu", L_CCD_WS](),
-                d.coll_stage.lt["gpu", L_COLL_STAGE](),
-                d.coll_flat.lt["gpu", L_COLL_FLAT](),
+                d.xpos.tt["gpu", BATCH, D.NBODY * 3](),
+                d.xquat.tt["gpu", BATCH, D.NBODY * 4](),
+                m.geoms.tt["gpu", D.NGEOM, MODEL_GEOM_SIZE](),
+                m.bodies.tt["gpu", D.NBODY, MODEL_BODY_SIZE](),
+                m.meta.tt["gpu", MODEL_META_SIZE](),
+                m.excludes.tt["gpu", D.NEXCLUDE, 2](),
+                m.pairs.tt["gpu", D.NPAIR, MODEL_PAIR_SIZE](),
+                m.mesh_meta.tt["gpu", MAX_GPU_MESHES, MODEL_MESH_META_SIZE](),
+                m.mesh_verts.tt["gpu", D.NMESH_VERTS, 3](),
+                m.mesh_polys.tt["gpu", mesh_max_poly(D.NMESH_VERTS), MODEL_MESH_POLY_SIZE](),
+                m.mesh_polyvert.tt["gpu", mesh_max_polyvert(D.NMESH_VERTS)](),
+                m.mesh_polymap.tt["gpu", mesh_max_polyvert(D.NMESH_VERTS)](),
+                m.mesh_vert_polymap.tt["gpu", D.NMESH_VERTS, 2](),
+                m.mesh_vert_edgeadr.tt["gpu", D.NMESH_VERTS](),
+                m.mesh_edges.tt["gpu", mesh_max_edge(D.NMESH_VERTS)](),
+                m.hfield_meta.tt["gpu", MAX_GPU_HFIELDS * MODEL_HFIELD_META_SIZE](),
+                d.hfield_data.tt["gpu", BATCH * _hf_len(D.NHFIELD_DATA)](),
+                d.contacts.tt["gpu", BATCH, D.MAX_CONTACTS * CONTACT_SIZE](),
+                d.meta.tt["gpu", BATCH, METADATA_SIZE](),
+                d.ccd_ws.tt["gpu", BATCH * COLL_CCD_LANES, CCD_WS_SIZE](),
+                d.coll_stage.tt["gpu", BATCH, COLL_STAGE_SLOTS * CONTACT_SIZE](),
+                d.coll_flat.tt["gpu", coll_flat_words(BATCH)](),
                 grid_dim=(BATCH,),
                 block_dim=(COLL_TPB,),
             )
@@ -4932,10 +4578,10 @@ def detect_contacts_sap[
                     DTYPE, D.MAX_CONTACTS, D.NBODY, BATCH
                 ]
             ](
-                d.contacts.lt["gpu", L_CONTACTS](),
-                d.meta.lt["gpu", L_SMETA](),
-                d.coll_stage.lt["gpu", L_COLL_STAGE](),
-                d.coll_flat.lt["gpu", L_COLL_FLAT](),
+                d.contacts.tt["gpu", BATCH, D.MAX_CONTACTS * CONTACT_SIZE](),
+                d.meta.tt["gpu", BATCH, METADATA_SIZE](),
+                d.coll_stage.tt["gpu", BATCH, COLL_STAGE_SLOTS * CONTACT_SIZE](),
+                d.coll_flat.tt["gpu", coll_flat_words(BATCH)](),
                 grid_dim=(BATCH,),
                 block_dim=(COLL_TPB,),
             )
@@ -4947,28 +4593,28 @@ def detect_contacts_sap[
                     _hf_len(D.NHFIELD_DATA),
                 ]
             ](
-                d.xpos.lt["gpu", L_B3](),
-                d.xquat.lt["gpu", L_B4](),
-                m.geoms.lt["gpu", L_GEOM](),
-                m.bodies.lt["gpu", L_BODY](),
-                m.meta.lt["gpu", L_MMETA](),
-                m.excludes.lt["gpu", L_EXCLUDE](),
-                m.pairs.lt["gpu", L_PAIR](),
-                m.mesh_meta.lt["gpu", L_MESH_META](),
-                m.mesh_verts.lt["gpu", L_MESH_VERT](),
-                m.mesh_polys.lt["gpu", L_MESH_POLY](),
-                m.mesh_polyvert.lt["gpu", L_MESH_POLYVERT](),
-                m.mesh_polymap.lt["gpu", L_MESH_POLYVERT](),
-                m.mesh_vert_polymap.lt["gpu", L_MESH_VPMAP](),
-                m.mesh_vert_edgeadr.lt["gpu", L_MESH_VEADR](),
-                m.mesh_edges.lt["gpu", L_MESH_EDGE](),
-                m.hfield_meta.lt["gpu", L_HF_META](),
-                d.hfield_data.lt["gpu", L_HF_DATA](),
-                d.contacts.lt["gpu", L_CONTACTS](),
-                d.meta.lt["gpu", L_SMETA](),
-                d.ccd_ws.lt["gpu", L_CCD_WS](),
-                d.coll_stage.lt["gpu", L_COLL_STAGE](),
-                d.coll_flat.lt["gpu", L_COLL_FLAT](),
+                d.xpos.tt["gpu", BATCH, D.NBODY * 3](),
+                d.xquat.tt["gpu", BATCH, D.NBODY * 4](),
+                m.geoms.tt["gpu", D.NGEOM, MODEL_GEOM_SIZE](),
+                m.bodies.tt["gpu", D.NBODY, MODEL_BODY_SIZE](),
+                m.meta.tt["gpu", MODEL_META_SIZE](),
+                m.excludes.tt["gpu", D.NEXCLUDE, 2](),
+                m.pairs.tt["gpu", D.NPAIR, MODEL_PAIR_SIZE](),
+                m.mesh_meta.tt["gpu", MAX_GPU_MESHES, MODEL_MESH_META_SIZE](),
+                m.mesh_verts.tt["gpu", D.NMESH_VERTS, 3](),
+                m.mesh_polys.tt["gpu", mesh_max_poly(D.NMESH_VERTS), MODEL_MESH_POLY_SIZE](),
+                m.mesh_polyvert.tt["gpu", mesh_max_polyvert(D.NMESH_VERTS)](),
+                m.mesh_polymap.tt["gpu", mesh_max_polyvert(D.NMESH_VERTS)](),
+                m.mesh_vert_polymap.tt["gpu", D.NMESH_VERTS, 2](),
+                m.mesh_vert_edgeadr.tt["gpu", D.NMESH_VERTS](),
+                m.mesh_edges.tt["gpu", mesh_max_edge(D.NMESH_VERTS)](),
+                m.hfield_meta.tt["gpu", MAX_GPU_HFIELDS * MODEL_HFIELD_META_SIZE](),
+                d.hfield_data.tt["gpu", BATCH * _hf_len(D.NHFIELD_DATA)](),
+                d.contacts.tt["gpu", BATCH, D.MAX_CONTACTS * CONTACT_SIZE](),
+                d.meta.tt["gpu", BATCH, METADATA_SIZE](),
+                d.ccd_ws.tt["gpu", BATCH * COLL_CCD_LANES, CCD_WS_SIZE](),
+                d.coll_stage.tt["gpu", BATCH, COLL_STAGE_SLOTS * CONTACT_SIZE](),
+                d.coll_flat.tt["gpu", coll_flat_words(BATCH)](),
                 grid_dim=(BATCH,),
                 block_dim=(COLL_TPB,),
             )
@@ -4983,26 +4629,26 @@ def detect_contacts_sap[
                 _hf_len(D.NHFIELD_DATA), ONLY_FLAGGED=USE_BLOCK,
             ]
         ](
-            d.xpos.lt["gpu", L_B3](),
-            d.xquat.lt["gpu", L_B4](),
-            m.geoms.lt["gpu", L_GEOM](),
-            m.bodies.lt["gpu", L_BODY](),
-            m.meta.lt["gpu", L_MMETA](),
-            m.excludes.lt["gpu", L_EXCLUDE](),
-            m.pairs.lt["gpu", L_PAIR](),
-            m.mesh_meta.lt["gpu", L_MESH_META](),
-            m.mesh_verts.lt["gpu", L_MESH_VERT](),
-            m.mesh_polys.lt["gpu", L_MESH_POLY](),
-            m.mesh_polyvert.lt["gpu", L_MESH_POLYVERT](),
-            m.mesh_polymap.lt["gpu", L_MESH_POLYVERT](),
-            m.mesh_vert_polymap.lt["gpu", L_MESH_VPMAP](),
-            m.mesh_vert_edgeadr.lt["gpu", L_MESH_VEADR](),
-            m.mesh_edges.lt["gpu", L_MESH_EDGE](),
-            m.hfield_meta.lt["gpu", L_HF_META](),
-            d.hfield_data.lt["gpu", L_HF_DATA](),
-            d.contacts.lt["gpu", L_CONTACTS](),
-            d.meta.lt["gpu", L_SMETA](),
-            d.ccd_ws.lt["gpu", L_CCD_WS](),
+            d.xpos.tt["gpu", BATCH, D.NBODY * 3](),
+            d.xquat.tt["gpu", BATCH, D.NBODY * 4](),
+            m.geoms.tt["gpu", D.NGEOM, MODEL_GEOM_SIZE](),
+            m.bodies.tt["gpu", D.NBODY, MODEL_BODY_SIZE](),
+            m.meta.tt["gpu", MODEL_META_SIZE](),
+            m.excludes.tt["gpu", D.NEXCLUDE, 2](),
+            m.pairs.tt["gpu", D.NPAIR, MODEL_PAIR_SIZE](),
+            m.mesh_meta.tt["gpu", MAX_GPU_MESHES, MODEL_MESH_META_SIZE](),
+            m.mesh_verts.tt["gpu", D.NMESH_VERTS, 3](),
+            m.mesh_polys.tt["gpu", mesh_max_poly(D.NMESH_VERTS), MODEL_MESH_POLY_SIZE](),
+            m.mesh_polyvert.tt["gpu", mesh_max_polyvert(D.NMESH_VERTS)](),
+            m.mesh_polymap.tt["gpu", mesh_max_polyvert(D.NMESH_VERTS)](),
+            m.mesh_vert_polymap.tt["gpu", D.NMESH_VERTS, 2](),
+            m.mesh_vert_edgeadr.tt["gpu", D.NMESH_VERTS](),
+            m.mesh_edges.tt["gpu", mesh_max_edge(D.NMESH_VERTS)](),
+            m.hfield_meta.tt["gpu", MAX_GPU_HFIELDS * MODEL_HFIELD_META_SIZE](),
+            d.hfield_data.tt["gpu", BATCH * _hf_len(D.NHFIELD_DATA)](),
+            d.contacts.tt["gpu", BATCH, D.MAX_CONTACTS * CONTACT_SIZE](),
+            d.meta.tt["gpu", BATCH, METADATA_SIZE](),
+            d.ccd_ws.tt["gpu", BATCH * COLL_CCD_LANES, CCD_WS_SIZE](),
             grid_dim=(BLOCKS,),
             block_dim=(SAP_TPB,),
         )

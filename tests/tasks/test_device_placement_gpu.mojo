@@ -23,7 +23,8 @@ from std.math import cos, sin
 from std.sys import exit, has_accelerator
 from max.gpu import block_idx
 from max.gpu.host import DeviceContext
-from layout import Layout, LayoutTensor
+from layout import TileTensor
+from noeira.core.tiles import RowMajor
 
 from noeira.nn.core.tensor import TensorImpl
 from noeira.physics3d.gpu.constants import (
@@ -50,15 +51,15 @@ comptime SEED = 7
 comptime TOL: Float64 = 2.0e-5
 """Float32 on the device against float64 on the host: a few ULP of a unit
 quantity, and 1e-5 of a pose that spans 0.4 m."""
-comptime L_Q = Layout.row_major(BATCH, NQ)
-comptime L_V = Layout.row_major(BATCH, NV)
-comptime L_M = Layout.row_major(BATCH, METADATA_SIZE)
+comptime L_Q = RowMajor[BATCH, NQ]
+comptime L_V = RowMajor[BATCH, NV]
+comptime L_M = RowMajor[BATCH, METADATA_SIZE]
 
 
 def _reset_kernel(
-    qpos: LayoutTensor[F32, L_Q, MutAnyOrigin],
-    qvel: LayoutTensor[F32, L_V, MutAnyOrigin],
-    meta: LayoutTensor[F32, L_M, MutAnyOrigin],
+    qpos: TileTensor[F32, L_Q, MutAnyOrigin],
+    qvel: TileTensor[F32, L_V, MutAnyOrigin],
+    meta: TileTensor[F32, L_M, MutAnyOrigin],
     seed: Int64,
 ):
     var env = Int(block_idx.x)
@@ -109,7 +110,7 @@ def main() raises:
         vs.upload(ctx)
         ms.upload(ctx)
         ctx.enqueue_function[_reset_kernel](
-            qs.lt["gpu", L_Q](), vs.lt["gpu", L_V](), ms.lt["gpu", L_M](),
+            qs.tt["gpu", BATCH, NQ](), vs.tt["gpu", BATCH, NV](), ms.tt["gpu", BATCH, METADATA_SIZE](),
             Int64(SEED), grid_dim=(BATCH,), block_dim=(1,),
         )
         ctx.synchronize()

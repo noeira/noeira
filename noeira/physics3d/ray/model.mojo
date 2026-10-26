@@ -36,7 +36,7 @@ filter for the sensor this was built for — which is why 2 is not optional and
 why it is precomputed rather than skipped.
 """
 
-from layout import Layout, LayoutTensor
+from layout import TileTensor, TensorLayout
 
 from noeira.math3d import Vec3 as Vec3Generic, Quat as QuatGeneric
 
@@ -119,25 +119,25 @@ struct RayHit[DTYPE: DType](Copyable, ImplicitlyCopyable, Movable):
 
 def ray_model[
     DTYPE: DType,
-    L_GEOMS: Layout,
-    L_BODIES: Layout,
-    L_XPOS: Layout,
-    L_XQUAT: Layout,
-    L_MESH_META: Layout,
-    L_TRI: Layout,
-    L_HF_META: Layout,
-    L_HF: Layout,
+    L_GEOMS: TensorLayout,
+    L_BODIES: TensorLayout,
+    L_XPOS: TensorLayout,
+    L_XQUAT: TensorLayout,
+    L_MESH_META: TensorLayout,
+    L_TRI: TensorLayout,
+    L_HF_META: TensorLayout,
+    L_HF: TensorLayout,
 ](
-    geoms: LayoutTensor[DTYPE, L_GEOMS, MutAnyOrigin],
+    geoms: TileTensor[DTYPE, L_GEOMS, MutAnyOrigin],
     ngeom: Int,
-    bodies: LayoutTensor[DTYPE, L_BODIES, MutAnyOrigin],
-    xpos: LayoutTensor[DTYPE, L_XPOS, MutAnyOrigin],
-    xquat: LayoutTensor[DTYPE, L_XQUAT, MutAnyOrigin],
+    bodies: TileTensor[DTYPE, L_BODIES, MutAnyOrigin],
+    xpos: TileTensor[DTYPE, L_XPOS, MutAnyOrigin],
+    xquat: TileTensor[DTYPE, L_XQUAT, MutAnyOrigin],
     env: Int,
-    mesh_meta: LayoutTensor[DTYPE, L_MESH_META, MutAnyOrigin],
-    mesh_tris: LayoutTensor[DTYPE, L_TRI, MutAnyOrigin],
-    hfield_meta: LayoutTensor[DTYPE, L_HF_META, MutAnyOrigin],
-    hfield_data: LayoutTensor[DTYPE, L_HF, MutAnyOrigin],
+    mesh_meta: TileTensor[DTYPE, L_MESH_META, MutAnyOrigin],
+    mesh_tris: TileTensor[DTYPE, L_TRI, MutAnyOrigin],
+    hfield_meta: TileTensor[DTYPE, L_HF_META, MutAnyOrigin],
+    hfield_data: TileTensor[DTYPE, L_HF, MutAnyOrigin],
     hf_stride: Int,
     pnt: Vec3Generic[DTYPE],
     vec: Vec3Generic[DTYPE],

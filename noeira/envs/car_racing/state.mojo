@@ -4,7 +4,7 @@ This module defines the state representation for the GPU-enabled CarRacing envir
 """
 
 from std.math import sqrt, pi
-from layout import Layout, LayoutTensor
+from noeira.core.tiles import Tile
 from noeira.core import State
 
 
@@ -134,13 +134,10 @@ struct CarRacingState[DTYPE: DType](
         OBS_OFFSET: Int,
         OBS_DIM: Int,
     ](
-        state: LayoutTensor[
-            DType.float32, Layout.row_major(BATCH, STATE_SIZE), MutAnyOrigin
-        ],
+        state: Tile[DType.float32, BATCH, STATE_SIZE],
         env: Int,
     ) -> CarRacingState[Self.DTYPE]:
         """Create state from std.gpu buffer."""
-        from layout import Layout, LayoutTensor
 
         var result = CarRacingState[Self.DTYPE]()
         result.x = rebind[Scalar[Self.DTYPE]](state[env, OBS_OFFSET + 0])

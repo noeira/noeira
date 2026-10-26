@@ -18,11 +18,11 @@ step. Region inventory mirrors the legacy layout exactly:
 """
 
 from max.gpu.host import DeviceContext
-from layout import Layout
 
 from noeira.nn.core.tensor import TensorImpl
 
 from .dims import DimsLike
+from noeira.core.tiles import RowMajor
 
 
 struct Rk4Scratch[
@@ -52,8 +52,8 @@ struct Rk4Scratch[
     comptime NQ = Self.D.NQ
     comptime NV = Self.D.NV
 
-    comptime L_Q0 = Layout.row_major(Self.BATCH, Self.NQ)
-    comptime L_NV = Layout.row_major(Self.BATCH, Self.NV)
+    comptime L_Q0 = RowMajor[Self.BATCH, Self.NQ]
+    comptime L_NV = RowMajor[Self.BATCH, Self.NV]
 
     var q0: TensorImpl[Self.DTYPE]  # [BATCH, NQ]
     var v0: TensorImpl[Self.DTYPE]  # [BATCH, NV]

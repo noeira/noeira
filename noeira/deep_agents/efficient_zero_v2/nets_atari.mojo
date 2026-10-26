@@ -34,7 +34,6 @@ output-count param (storage infers OUT_DIM from the last node) and the
 
 from max.gpu import global_idx
 from max.gpu.host import DeviceContext
-from layout import Layout, LayoutTensor
 
 from noeira.nn.constants import DT, TPB, LAYOUT_NCHW
 from noeira.nn.core.initializer import Initializer
@@ -66,6 +65,7 @@ from noeira.nn.models.resnet import ResBlockConv2DBN
 from noeira.deep_agents.dreamerv3.zero_init import (
     scale_output_module, scale_output_graph,
 )
+from noeira.core.tiles import Tile
 
 
 # ──────────────────────────────────────────────────────────────────────
@@ -232,8 +232,8 @@ comptime EZDynAtariGraph[ACT: Int, BINS: Int] = ComputeGraph[
 # GPU LayoutTensor copy for the vjp input-grad copy-back (dst, src both real
 # graph-pool / grad-pool buffers).
 def _ezdyn_copy_kernel[N: Int, ADT: DType = DT](
-    dst: LayoutTensor[ADT, Layout.row_major(N), MutAnyOrigin],
-    src: LayoutTensor[ADT, Layout.row_major(N), MutAnyOrigin],
+    dst: Tile[ADT, N],
+    src: Tile[ADT, N],
 ):
     var idx = Int(global_idx.x)
     if idx < N:
@@ -313,8 +313,8 @@ struct EZDynNetAtari[ACT: Int, BINS: Int](Module):
             var c = ctx.value()
             comptime nb = (N + TPB - 1) // TPB
             c.enqueue_function[_ezdyn_copy_kernel[N]](
-                grad_inputs[0].lt["gpu", Layout.row_major(N)](),
-                self.graph.grad_input["in"]().lt["gpu", Layout.row_major(N)](),
+                grad_inputs[0].tt["gpu", N](),
+                self.graph.grad_input["in"]().tt["gpu", N](),
                 grid_dim=nb, block_dim=TPB,
             )
 
@@ -541,8 +541,8 @@ struct EZDynZNetAtari[ACT: Int, ADT: DType = DT](Module):
             var c = ctx.value()
             comptime nb = (N + TPB - 1) // TPB
             c.enqueue_function[_ezdyn_copy_kernel[N, Self.ACT_DT]](
-                grad_inputs[0].lt["gpu", Layout.row_major(N)](),
-                self.graph.grad_input["in"]().lt["gpu", Layout.row_major(N)](),
+                grad_inputs[0].tt["gpu", N](),
+                self.graph.grad_input["in"]().tt["gpu", N](),
                 grid_dim=nb, block_dim=TPB,
             )
 
@@ -767,8 +767,8 @@ struct EZRewardLSTMAtari[BINS: Int](Module):
             var dctx = ctx.value()
             comptime nb = (B * H + TPB - 1) // TPB
             dctx.enqueue_function[_ez_add_inplace_kernel[B * H]](
-                self.dhin.lt["gpu", Layout.row_major(B * H)](),
-                dh_carry.lt["gpu", Layout.row_major(B * H)](),
+                self.dhin.tt["gpu", B * H](),
+                dh_carry.tt["gpu", B * H](),
                 grid_dim=nb, block_dim=TPB,
             )
         # cell BPTT: dh=dhin(=dh_total), dc=dc_carry → dx(dstem), dh_prev, dc_prev
@@ -801,8 +801,8 @@ def ez_atari_init_zero_reward[
 
 # GPU elementwise a += b (reward-head carry combine).
 def _ez_add_inplace_kernel[N: Int](
-    a: LayoutTensor[DT, Layout.row_major(N), MutAnyOrigin],
-    b: LayoutTensor[DT, Layout.row_major(N), MutAnyOrigin],
+    a: Tile[DT, N],
+    b: Tile[DT, N],
 ):
     var idx = Int(global_idx.x)
     if idx < N:
@@ -811,9 +811,9 @@ def _ez_add_inplace_kernel[N: Int](
 
 # GPU pack [z'(LATENT) | vp(BINS)] per batch row → out[B·(LATENT+BINS)].
 def _ez_pack_zvp_kernel[B: Int, LATENT: Int, BINS: Int](
-    dst: LayoutTensor[DT, Layout.row_major(B * (LATENT + BINS)), MutAnyOrigin],
-    zp: LayoutTensor[DT, Layout.row_major(B * LATENT), MutAnyOrigin],
-    vp: LayoutTensor[DT, Layout.row_major(B * BINS), MutAnyOrigin],
+    dst: Tile[DT, B * (LATENT + BINS)],
+    zp: Tile[DT, B * LATENT],
+    vp: Tile[DT, B * BINS],
 ):
     comptime OUT = LATENT + BINS
     var gid = Int(global_idx.x)
@@ -913,9 +913,9 @@ struct EZDynVPNetAtari[ACT: Int, BINS: Int](Module):
             var c = ctx.value()
             comptime nb = (B * Self.OUT_DIM + TPB - 1) // TPB
             c.enqueue_function[_ez_pack_zvp_kernel[B, LAT, Self.BINS]](
-                out.lt["gpu", Layout.row_major(B * Self.OUT_DIM)](),
-                self._zp.lt["gpu", Layout.row_major(B * LAT)](),
-                self._vp.lt["gpu", Layout.row_major(B * Self.BINS)](),
+                out.tt["gpu", B * Self.OUT_DIM](),
+                self._zp.tt["gpu", B * LAT](),
+                self._vp.tt["gpu", B * Self.BINS](),
                 grid_dim=nb, block_dim=TPB,
             )
 

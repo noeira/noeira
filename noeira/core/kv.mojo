@@ -135,7 +135,7 @@ def kv_lines(text: String, what: String) raises -> List[KvLine]:
                 what + ": line " + String(i + 1) + " has an empty key: '"
                 + line + "'"
             )
-        out.append(KvLine(key^, String(kv[1].strip()), i + 1))
+        out.append(KvLine(key, String(kv[1].strip()), i + 1))
     return out^
 
 

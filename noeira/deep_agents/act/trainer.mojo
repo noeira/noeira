@@ -90,7 +90,6 @@ is what the policy is judged on). `eval_step` returns both.
 from std.math import sqrt
 
 from max.gpu.host import DeviceContext
-from layout import Layout
 
 from noeira.nn.constants import DT
 from noeira.nn import Adam, Kaiming, Tensor
@@ -108,7 +107,6 @@ from noeira.nn.core.checkpoint import (
     CheckpointScalars,
     _is_v3_header,
     _read_file_bytes,
-    _write_file_bytes,
 )
 from noeira.deep_agents.loss.seed_grad_inv_batch import seed_grad_inv_batch
 from ..training.device_mean_accum import DeviceMeanAccum
@@ -134,6 +132,7 @@ from noeira.nn.models.resnet18_torch import (
 )
 
 from .refload import LoadPrefixedParams, RefDump
+from noeira.core.tiles import RowMajor
 
 
 # ── grad-norm clip over a graph ──────────────────────────────────────────
@@ -175,6 +174,8 @@ struct _SumSq(ParamVisitor, ParamVisitorRT):
         apply_decay: Bool,
         ctx: Optional[DeviceContext],
     ) raises:
+        if grad.n == 0:  # frozen param: no gradient, nothing to do
+            return
         comptime if target != "cpu":
             grad.download(ctx.value())
         for i in range(n):
@@ -215,6 +216,8 @@ struct _ScaleGrads(ParamVisitor, ParamVisitorRT):
         apply_decay: Bool,
         ctx: Optional[DeviceContext],
     ) raises:
+        if grad.n == 0:  # frozen param: no gradient, nothing to do
+            return
         comptime if target != "cpu":
             # ⚠ Unreachable: the GPU clip is the optimizer's arena path. Kept
             # only so the visitor stays target-generic — and `upload` here
@@ -544,7 +547,7 @@ struct ACTTrainer[
         # The backward seed for a mean-over-batch loss is the constant 1/BATCH;
         # nothing in a step mutates it, so it is written once.
         seed_grad_inv_batch[Self.target, Self.BATCH](
-            t.grad_seed.lt[Self.target, Layout.row_major(Self.BATCH, 1)](),
+            t.grad_seed.tt[Self.target, Self.BATCH, 1](),
             ctx=ctx,
         )
         t.t_qpos = Tensor.alloc(Self.BATCH * Self.QPOS)
@@ -826,7 +829,7 @@ struct ACTTrainer[
 
         GPU: three one-block reductions, no bus traffic, capture-safe. CPU: the
         same means computed on the host, where they already live."""
-        comptime lb = Layout.row_major(Self.BATCH)
+        comptime lb = RowMajor[Self.BATCH]
         ref l1n = self.graph.node_output["l1"]()
         ref kln = self.graph.node_output["kl"]()
         comptime if Self.target == "cpu":
@@ -849,9 +852,9 @@ struct ACTTrainer[
                 self._train_acc._h_kl += ak / d
                 self._train_acc.n += 1
         else:
-            var v1 = l1n.lt["gpu", lb]()
-            var vk = kln.lt["gpu", lb]()
-            var vl = self.loss_out.lt["gpu", lb]()
+            var v1 = l1n.tt["gpu", Self.BATCH]()
+            var vk = kln.tt["gpu", Self.BATCH]()
+            var vl = self.loss_out.tt["gpu", Self.BATCH]()
             comptime if VAL:
                 self._val_acc.loss.accumulate_gpu_lt[Self.BATCH](vl)
                 self._val_acc.l1.accumulate_gpu_lt[Self.BATCH](v1)
@@ -1306,7 +1309,7 @@ struct ACTTrainer[
         step-1 bias corrections, and a resumed run's first few hundred
         updates come out ~0.3× the size they should.
         """
-        var w = BinaryCheckpointWriter(save_moments)
+        var w = BinaryCheckpointWriter.to_file(path, save_moments)
         w.mode = 0
         walk_params[Self.target](self.graph, w, self.ctx)
         w.mode = 1
@@ -1316,7 +1319,7 @@ struct ACTTrainer[
             var sc = CheckpointScalars()
             self.opt.put_step_state(sc, "opt")
             w.write_scalars(sc)
-        _write_file_bytes(path, w.content)
+        w.commit()
 
     def load_backbone(
         mut self, dump_dir: String, freeze_norm: Bool = True

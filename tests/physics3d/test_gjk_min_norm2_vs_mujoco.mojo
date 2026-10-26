@@ -98,7 +98,8 @@ reference's `subdistance`. The measurement that filed it predates both.
 them poses a convex pair separated by less than 10 microns.
 """
 from std.math import abs
-from layout import Layout, LayoutTensor
+from layout import TileTensor
+from noeira.core.tiles import RowMajor, tile
 
 from noeira.physics3d.collision.ccd_workspace import L_CCD_WS1
 from noeira.physics3d.collision.ccd_workspace_host import ccd_ws_alloc
@@ -106,8 +107,8 @@ from noeira.physics3d.collision.gjk import gjk_epa
 from noeira.physics3d.constants import GEOM_BOX, GEOM_CYLINDER
 
 comptime DT = DType.float64
-comptime LV = Layout.row_major(1, 3)
-comptime LA = Layout.row_major(1)
+comptime LV = RowMajor[1, 3]
+comptime LA = RowMajor[1]
 
 # `duplo2x4.xml`, class `stud`: cylinder, size ".0047 .0023", margin 1e-4. The
 # radius is 0.004647 and NOT the 0.0047 in the file: dm_control's `Duplo`
@@ -130,10 +131,10 @@ comptime CCD_ITER = 35
 def probe(
     gap: Float64,
     ccd_tol: Float64,
-    mv: LayoutTensor[DT, LV, MutAnyOrigin],
-    ma: LayoutTensor[DT, LA, MutAnyOrigin],
-    me: LayoutTensor[DT, LA, MutAnyOrigin],
-    ws: LayoutTensor[DT, L_CCD_WS1, MutAnyOrigin],
+    mv: TileTensor[DT, LV, MutAnyOrigin],
+    ma: TileTensor[DT, LA, MutAnyOrigin],
+    me: TileTensor[DT, LA, MutAnyOrigin],
+    ws: TileTensor[DT, L_CCD_WS1, MutAnyOrigin],
 ) -> Float64:
     """Signed distance our narrow phase reports for a stud/flange pair whose
     true face-to-surface gap is `gap`."""
@@ -159,17 +160,11 @@ def probe(
 
 def main() raises:
     var mbuf = List[Scalar[DT]](length=3, fill=Scalar[DT](0))
-    var mv = LayoutTensor[DT, LV, MutAnyOrigin](
-        mbuf.unsafe_ptr().as_unsafe_any_origin().unsafe_mut_cast[True]()
-    )
+    var mv = tile[1, 3](mbuf.unsafe_ptr().as_unsafe_any_origin().unsafe_mut_cast[True]())
     var abuf = List[Scalar[DT]](length=1, fill=Scalar[DT](-1))
-    var ma = LayoutTensor[DT, LA, MutAnyOrigin](
-        abuf.unsafe_ptr().as_unsafe_any_origin().unsafe_mut_cast[True]()
-    )
+    var ma = tile[1](abuf.unsafe_ptr().as_unsafe_any_origin().unsafe_mut_cast[True]())
     var ebuf = List[Scalar[DT]](length=1, fill=Scalar[DT](-1))
-    var me = LayoutTensor[DT, LA, MutAnyOrigin](
-        ebuf.unsafe_ptr().as_unsafe_any_origin().unsafe_mut_cast[True]()
-    )
+    var me = tile[1](ebuf.unsafe_ptr().as_unsafe_any_origin().unsafe_mut_cast[True]())
 
     # (true gap, MuJoCo 3.10.0's `contact.dist` for the same pair). Every gap
     # here is UNDER the old 1e-5 floor except the last two.
@@ -198,7 +193,7 @@ def main() raises:
     print("  true gap          ours              MuJoCo 3.10.0     |ours-mj|")
     for i in range(len(gaps)):
         var g = gaps[i]
-        var got = probe(g, CCD_TOL, mv, ma, me, wst.lt["cpu", L_CCD_WS1]())
+        var got = probe(g, CCD_TOL, mv, ma, me, wst.tt_dyn["cpu", L_CCD_WS1](L_CCD_WS1()))
         var dref = abs(got - mjref[i])
         # A gap is a gap: anything <= 0 here is the defect this file exists for.
         var ok = got > 0.0 and dref <= CCD_TOL
@@ -222,7 +217,7 @@ def main() raises:
     print("  control: ccd_tolerance 1e-14, error against the ANALYTIC gap")
     for i in range(len(gaps)):
         var g = gaps[i]
-        var tight = probe(g, 1e-14, mv, ma, me, wst.lt["cpu", L_CCD_WS1]())
+        var tight = probe(g, 1e-14, mv, ma, me, wst.tt_dyn["cpu", L_CCD_WS1](L_CCD_WS1()))
         var err = abs(tight - g)
         var ok = err <= 1e-12
         print("  ", g, " ", tight, " ", err, " ", "ok" if ok else "FAIL")

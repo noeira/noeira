@@ -27,9 +27,9 @@ from std.math import sqrt
 from max.gpu import global_idx, thread_idx, block_idx
 from max.gpu.primitives import block
 from max.gpu.host import DeviceContext, DeviceBuffer
-from std.sys.info import has_nvidia_gpu_accelerator
+from std.sys.info import default_accelerator
 from std.time import perf_counter_ns
-from layout import Layout, LayoutTensor
+from noeira.core.tiles import RowMajor, Tile, tile
 
 comptime DT = DType.float32
 comptime TPB = 128        # block-per-channel reduction width (NCHW) / flat launches
@@ -48,9 +48,9 @@ comptime EPS = 1e-5
 def _bn_stats_nchw[
     N: Int, C: Int, SP: Int, FLAT: Int,
 ](
-    input: LayoutTensor[DT, Layout.row_major(N, FLAT), MutAnyOrigin],
-    mean_out: LayoutTensor[DT, Layout.row_major(C), MutAnyOrigin],
-    inv_std_out: LayoutTensor[DT, Layout.row_major(C), MutAnyOrigin],
+    input: Tile[DT, N, FLAT],
+    mean_out: Tile[DT, C],
+    inv_std_out: Tile[DT, C],
 ):
     var c = Int(block_idx.x)
     if c >= C:
@@ -83,9 +83,9 @@ def _bn_stats_nchw[
 def _bn_stats_nchw_grouped[
     N: Int, C: Int, SP: Int, FLAT: Int, G: Int,
 ](
-    input: LayoutTensor[DT, Layout.row_major(N, FLAT), MutAnyOrigin],
-    partial_sum: LayoutTensor[DT, Layout.row_major(C * G), MutAnyOrigin],
-    partial_sumsq: LayoutTensor[DT, Layout.row_major(C * G), MutAnyOrigin],
+    input: Tile[DT, N, FLAT],
+    partial_sum: Tile[DT, C * G],
+    partial_sumsq: Tile[DT, C * G],
 ):
     var blk = Int(block_idx.x)
     var c = blk // G
@@ -118,10 +118,10 @@ def _bn_stats_nchw_grouped[
 def _bn_finalize_nchw_grouped[
     C: Int, G: Int, RTOT: Int,
 ](
-    partial_sum: LayoutTensor[DT, Layout.row_major(C * G), MutAnyOrigin],
-    partial_sumsq: LayoutTensor[DT, Layout.row_major(C * G), MutAnyOrigin],
-    mean_out: LayoutTensor[DT, Layout.row_major(C), MutAnyOrigin],
-    inv_std_out: LayoutTensor[DT, Layout.row_major(C), MutAnyOrigin],
+    partial_sum: Tile[DT, C * G],
+    partial_sumsq: Tile[DT, C * G],
+    mean_out: Tile[DT, C],
+    inv_std_out: Tile[DT, C],
 ):
     var c = Int(global_idx.x)
     if c >= C:
@@ -144,12 +144,12 @@ def _bn_finalize_nchw_grouped[
 def _bn_norm_nchw[
     N: Int, C: Int, SP: Int, FLAT: Int,
 ](
-    input: LayoutTensor[DT, Layout.row_major(N, FLAT), MutAnyOrigin],
-    output: LayoutTensor[DT, Layout.row_major(N, FLAT), MutAnyOrigin],
-    gamma: LayoutTensor[DT, Layout.row_major(C), MutAnyOrigin],
-    beta: LayoutTensor[DT, Layout.row_major(C), MutAnyOrigin],
-    mean_in: LayoutTensor[DT, Layout.row_major(C), MutAnyOrigin],
-    inv_std_in: LayoutTensor[DT, Layout.row_major(C), MutAnyOrigin],
+    input: Tile[DT, N, FLAT],
+    output: Tile[DT, N, FLAT],
+    gamma: Tile[DT, C],
+    beta: Tile[DT, C],
+    mean_in: Tile[DT, C],
+    inv_std_in: Tile[DT, C],
 ):
     var c = Int(block_idx.x)
     if c >= C:
@@ -172,12 +172,12 @@ def _bn_norm_nchw[
 def _bn_norm_nchw_grouped[
     N: Int, C: Int, SP: Int, FLAT: Int, G: Int,
 ](
-    input: LayoutTensor[DT, Layout.row_major(N, FLAT), MutAnyOrigin],
-    output: LayoutTensor[DT, Layout.row_major(N, FLAT), MutAnyOrigin],
-    gamma: LayoutTensor[DT, Layout.row_major(C), MutAnyOrigin],
-    beta: LayoutTensor[DT, Layout.row_major(C), MutAnyOrigin],
-    mean_in: LayoutTensor[DT, Layout.row_major(C), MutAnyOrigin],
-    inv_std_in: LayoutTensor[DT, Layout.row_major(C), MutAnyOrigin],
+    input: Tile[DT, N, FLAT],
+    output: Tile[DT, N, FLAT],
+    gamma: Tile[DT, C],
+    beta: Tile[DT, C],
+    mean_in: Tile[DT, C],
+    inv_std_in: Tile[DT, C],
 ):
     var blk = Int(block_idx.x)
     var c = blk // G
@@ -212,9 +212,9 @@ def _bn_norm_nchw_grouped[
 def _bn_stats_nhwc_partial[
     C: Int, R: Int,
 ](
-    input: LayoutTensor[DT, Layout.row_major(R * C), MutAnyOrigin],
-    partial_sum: LayoutTensor[DT, Layout.row_major(NCHUNK * C), MutAnyOrigin],
-    partial_sumsq: LayoutTensor[DT, Layout.row_major(NCHUNK * C), MutAnyOrigin],
+    input: Tile[DT, R * C],
+    partial_sum: Tile[DT, NCHUNK * C],
+    partial_sumsq: Tile[DT, NCHUNK * C],
 ):
     var chunk = Int(block_idx.x)
     var c = Int(thread_idx.x)
@@ -246,13 +246,9 @@ def _bn_stats_nhwc_partial[
 def _bn_stats_nhwc_2d[
     C: Int, R: Int, CHUNKS: Int,
 ](
-    input: LayoutTensor[DT, Layout.row_major(R * C), MutAnyOrigin],
-    partial_sum: LayoutTensor[
-        DT, Layout.row_major(CHUNKS * BN2D_BLK), MutAnyOrigin
-    ],
-    partial_sumsq: LayoutTensor[
-        DT, Layout.row_major(CHUNKS * BN2D_BLK), MutAnyOrigin
-    ],
+    input: Tile[DT, R * C],
+    partial_sum: Tile[DT, CHUNKS * BN2D_BLK],
+    partial_sumsq: Tile[DT, CHUNKS * BN2D_BLK],
 ):
     comptime ROWS = BN2D_BLK // C
     var chunk = Int(block_idx.x)
@@ -281,10 +277,10 @@ def _bn_stats_nhwc_2d[
 def _bn_finalize_nhwc_parallel[
     C: Int, RTOT: Int, P: Int,
 ](
-    partial_sum: LayoutTensor[DT, Layout.row_major(P * C), MutAnyOrigin],
-    partial_sumsq: LayoutTensor[DT, Layout.row_major(P * C), MutAnyOrigin],
-    mean_out: LayoutTensor[DT, Layout.row_major(C), MutAnyOrigin],
-    inv_std_out: LayoutTensor[DT, Layout.row_major(C), MutAnyOrigin],
+    partial_sum: Tile[DT, P * C],
+    partial_sumsq: Tile[DT, P * C],
+    mean_out: Tile[DT, C],
+    inv_std_out: Tile[DT, C],
 ):
     var c = Int(block_idx.x)
     if c >= C:
@@ -313,10 +309,10 @@ def _bn_finalize_nhwc_parallel[
 def _bn_finalize_nhwc[
     C: Int, RTOT: Int,
 ](
-    partial_sum: LayoutTensor[DT, Layout.row_major(NCHUNK * C), MutAnyOrigin],
-    partial_sumsq: LayoutTensor[DT, Layout.row_major(NCHUNK * C), MutAnyOrigin],
-    mean_out: LayoutTensor[DT, Layout.row_major(C), MutAnyOrigin],
-    inv_std_out: LayoutTensor[DT, Layout.row_major(C), MutAnyOrigin],
+    partial_sum: Tile[DT, NCHUNK * C],
+    partial_sumsq: Tile[DT, NCHUNK * C],
+    mean_out: Tile[DT, C],
+    inv_std_out: Tile[DT, C],
 ):
     var c = Int(global_idx.x)
     if c >= C:
@@ -339,12 +335,12 @@ def _bn_finalize_nhwc[
 def _bn_norm_nhwc[
     C: Int, RC: Int,
 ](
-    input: LayoutTensor[DT, Layout.row_major(RC), MutAnyOrigin],
-    output: LayoutTensor[DT, Layout.row_major(RC), MutAnyOrigin],
-    gamma: LayoutTensor[DT, Layout.row_major(C), MutAnyOrigin],
-    beta: LayoutTensor[DT, Layout.row_major(C), MutAnyOrigin],
-    mean_in: LayoutTensor[DT, Layout.row_major(C), MutAnyOrigin],
-    inv_std_in: LayoutTensor[DT, Layout.row_major(C), MutAnyOrigin],
+    input: Tile[DT, RC],
+    output: Tile[DT, RC],
+    gamma: Tile[DT, C],
+    beta: Tile[DT, C],
+    mean_in: Tile[DT, C],
+    inv_std_in: Tile[DT, C],
 ):
     var idx = Int(global_idx.x)
     if idx >= RC:
@@ -407,33 +403,29 @@ def run_bn[
     var ps = ctx.enqueue_create_buffer[DT](NCHUNK * BN2D_BLK)
     var psq = ctx.enqueue_create_buffer[DT](NCHUNK * BN2D_BLK)
 
-    var gl = LayoutTensor[DT, Layout.row_major(C), MutAnyOrigin](gamma)
-    var bl = LayoutTensor[DT, Layout.row_major(C), MutAnyOrigin](beta)
+    var gl = tile[C](gamma)
+    var bl = tile[C](beta)
 
-    var xn = LayoutTensor[DT, Layout.row_major(N, FLAT), MutAnyOrigin](x_nchw)
-    var on = LayoutTensor[DT, Layout.row_major(N, FLAT), MutAnyOrigin](out_nchw)
-    var ma = LayoutTensor[DT, Layout.row_major(C), MutAnyOrigin](mean_a)
-    var ia = LayoutTensor[DT, Layout.row_major(C), MutAnyOrigin](istd_a)
+    var xn = tile[N, FLAT](x_nchw)
+    var on = tile[N, FLAT](out_nchw)
+    var ma = tile[C](mean_a)
+    var ia = tile[C](istd_a)
     ctx.enqueue_function[_bn_stats_nchw[N, C, SP, FLAT]](
         xn, ma, ia, grid_dim=C, block_dim=TPB)
     ctx.enqueue_function[_bn_norm_nchw[N, C, SP, FLAT]](
         xn, on, gl, bl, ma, ia, grid_dim=C, block_dim=TPB)
 
-    var xh = LayoutTensor[DT, Layout.row_major(RC), MutAnyOrigin](x_nhwc)
-    var oh = LayoutTensor[DT, Layout.row_major(RC), MutAnyOrigin](out_nhwc)
-    var mb = LayoutTensor[DT, Layout.row_major(C), MutAnyOrigin](mean_b)
-    var ib = LayoutTensor[DT, Layout.row_major(C), MutAnyOrigin](istd_b)
-    var psl = LayoutTensor[DT, Layout.row_major(NCHUNK * C), MutAnyOrigin](ps)
-    var pql = LayoutTensor[DT, Layout.row_major(NCHUNK * C), MutAnyOrigin](psq)
+    var xh = tile[RC](x_nhwc)
+    var oh = tile[RC](out_nhwc)
+    var mb = tile[C](mean_b)
+    var ib = tile[C](istd_b)
+    var psl = tile[NCHUNK * C](ps)
+    var pql = tile[NCHUNK * C](psq)
     comptime ROWS = BN2D_BLK // C
     comptime P2 = NCHUNK * ROWS
-    var psl2 = LayoutTensor[
-        DT, Layout.row_major(NCHUNK * BN2D_BLK), MutAnyOrigin
-    ](ps)
-    var pql2 = LayoutTensor[
-        DT, Layout.row_major(NCHUNK * BN2D_BLK), MutAnyOrigin
-    ](psq)
-    var xhr = LayoutTensor[DT, Layout.row_major(R * C), MutAnyOrigin](x_nhwc)
+    var psl2 = tile[NCHUNK * BN2D_BLK](ps)
+    var pql2 = tile[NCHUNK * BN2D_BLK](psq)
+    var xhr = tile[R * C](x_nhwc)
     comptime nb_norm = (RC + TPB - 1) // TPB
     ctx.enqueue_function[_bn_stats_nhwc_partial[C, R]](
         xhr, psl, pql, grid_dim=NCHUNK, block_dim=C)
@@ -468,7 +460,7 @@ def run_bn[
 
     # ---- verify NHWC-2D stats vs NCHW ref (NVIDIA-only; Metal ICEs it here) ----
     var stat_bad2 = 0
-    comptime if has_nvidia_gpu_accelerator():
+    comptime if default_accelerator().is_nvidia_gpu():
         ctx.enqueue_function[_bn_stats_nhwc_2d[C, R, NCHUNK]](
             xhr, psl2, pql2, grid_dim=NCHUNK, block_dim=BN2D_BLK)
         ctx.enqueue_function[_bn_finalize_nhwc_parallel[C, R, P2]](
@@ -521,7 +513,7 @@ def run_bn[
 
     # ---- time NHWC-2D (NVIDIA) ----
     var us_nhwc2 = us_nhwc   # default on Apple (2D skipped)
-    comptime if has_nvidia_gpu_accelerator():
+    comptime if default_accelerator().is_nvidia_gpu():
         comptime for _ in range(WARMUP):
             ctx.enqueue_function[_bn_stats_nhwc_2d[C, R, NCHUNK]](
                 xhr, psl2, pql2, grid_dim=NCHUNK, block_dim=BN2D_BLK)
@@ -543,9 +535,9 @@ def run_bn[
 
     # ---- time NCHW-grouped (the REAL BatchNorm2D design) ----
     comptime G = N if N < 64 else 64
-    comptime lcg = Layout.row_major(C * G)
-    var psg = LayoutTensor[DT, lcg, MutAnyOrigin](ps)
-    var pqg = LayoutTensor[DT, lcg, MutAnyOrigin](psq)
+    comptime lcg = RowMajor[C * G]
+    var psg = tile[C * G](ps)
+    var pqg = tile[C * G](psq)
     comptime nb_fin = (C + TPB - 1) // TPB
     comptime for _ in range(WARMUP):
         ctx.enqueue_function[_bn_stats_nchw_grouped[N, C, SP, FLAT, G]](

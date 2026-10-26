@@ -128,7 +128,7 @@ from max.gpu.host import DeviceContext, DeviceBuffer
 from layout import TileTensor, row_major
 from linalg.matmul import matmul as max_matmul
 
-from std.sys import has_nvidia_gpu_accelerator
+from std.sys import default_accelerator
 
 from noeira.cuda import CUDAGraph, maybe_capture_replay
 
@@ -287,7 +287,7 @@ def main() raises:
     print("=" * 74)
     print("Does a split-K GEMM abort CUDA-graph capture? —", ctx.name())
     print("=" * 74)
-    comptime if not has_nvidia_gpu_accelerator():
+    comptime if not default_accelerator().is_nvidia_gpu():
         print("  ⚠ NOT NVIDIA. `maybe_capture_replay` is a compile-time no-op")
         print("    here, so nothing is captured and NO VERDICT IS POSSIBLE.")
         print("    The arms below only check that the harness computes the")
@@ -305,7 +305,7 @@ def main() raises:
     )
 
     print("=" * 74)
-    comptime if not has_nvidia_gpu_accelerator():
+    comptime if not default_accelerator().is_nvidia_gpu():
         print("  NO VERDICT — not an NVIDIA device (see above).")
         if a_ok and b_ok and c_ok:
             print("  The harness itself computes the expected values.")

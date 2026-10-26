@@ -54,7 +54,6 @@ region the kernel cannot follow) is refused before a word is written, by
 drawer region stands in the drawer the draw just opened.
 """
 
-from layout import Layout, LayoutTensor
 from std.math import cos, sin, pi
 from std.random.philox import Random as PhiloxRandom
 
@@ -64,6 +63,7 @@ from noeira.physics3d.gpu.constants import (
 )
 from noeira.tasks.obs import FREE_JOINT_NV
 from noeira.tasks.spec import TABLE_Z_OFFSET, STACK_Z_OFFSET
+from noeira.core.tiles import Tile
 
 
 comptime MAX_PLACE_ATTEMPTS: Int = 64
@@ -365,11 +365,9 @@ def place_free_slots[
     NQ_F: Int,
     NV_F: Int,
 ](
-    qpos: LayoutTensor[DTYPE, Layout.row_major(BATCH_SIZE, NQ_F), MutAnyOrigin],
-    qvel: LayoutTensor[DTYPE, Layout.row_major(BATCH_SIZE, NV_F), MutAnyOrigin],
-    meta: LayoutTensor[
-        DTYPE, Layout.row_major(BATCH_SIZE, METADATA_SIZE), MutAnyOrigin
-    ],
+    qpos: Tile[DTYPE, BATCH_SIZE, NQ_F],
+    qvel: Tile[DTYPE, BATCH_SIZE, NV_F],
+    meta: Tile[DTYPE, BATCH_SIZE, METADATA_SIZE],
     env: Int,
     seed: Int,
 ):
@@ -605,11 +603,9 @@ def draw_joint_inits[
     NQ_F: Int,
     NV_F: Int,
 ](
-    qpos: LayoutTensor[DTYPE, Layout.row_major(BATCH_SIZE, NQ_F), MutAnyOrigin],
-    qvel: LayoutTensor[DTYPE, Layout.row_major(BATCH_SIZE, NV_F), MutAnyOrigin],
-    meta: LayoutTensor[
-        DTYPE, Layout.row_major(BATCH_SIZE, METADATA_SIZE), MutAnyOrigin
-    ],
+    qpos: Tile[DTYPE, BATCH_SIZE, NQ_F],
+    qvel: Tile[DTYPE, BATCH_SIZE, NV_F],
+    meta: Tile[DTYPE, BATCH_SIZE, METADATA_SIZE],
     env: Int,
     seed: Int,
 ):
@@ -645,11 +641,9 @@ def reset_task_slots[
     NQ_F: Int,
     NV_F: Int,
 ](
-    qpos: LayoutTensor[DTYPE, Layout.row_major(BATCH_SIZE, NQ_F), MutAnyOrigin],
-    qvel: LayoutTensor[DTYPE, Layout.row_major(BATCH_SIZE, NV_F), MutAnyOrigin],
-    meta: LayoutTensor[
-        DTYPE, Layout.row_major(BATCH_SIZE, METADATA_SIZE), MutAnyOrigin
-    ],
+    qpos: Tile[DTYPE, BATCH_SIZE, NQ_F],
+    qvel: Tile[DTYPE, BATCH_SIZE, NV_F],
+    meta: Tile[DTYPE, BATCH_SIZE, METADATA_SIZE],
     env: Int,
     seed: Int,
 ):
@@ -694,8 +688,8 @@ def reset_task_slots[
 
 @always_inline
 def _write_pose[DTYPE: DType, BATCH_SIZE: Int, NQ_F: Int, NV_F: Int](
-    qpos: LayoutTensor[DTYPE, Layout.row_major(BATCH_SIZE, NQ_F), MutAnyOrigin],
-    qvel: LayoutTensor[DTYPE, Layout.row_major(BATCH_SIZE, NV_F), MutAnyOrigin],
+    qpos: Tile[DTYPE, BATCH_SIZE, NQ_F],
+    qvel: Tile[DTYPE, BATCH_SIZE, NV_F],
     env: Int,
     qa: Int,
     da: Int,

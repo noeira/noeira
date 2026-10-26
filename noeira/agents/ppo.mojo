@@ -224,7 +224,7 @@ struct PPOAgent(Copyable, ImplicitlyCopyable, Movable):
             Probability distribution over actions.
         """
         var prefs = self._get_action_preferences(tiles)
-        return softmax(prefs^)
+        return softmax(prefs)
 
     def get_value(self, tiles: List[Int]) -> Float64:
         """Get state value estimate V(s).
@@ -325,7 +325,7 @@ struct PPOAgent(Copyable, ImplicitlyCopyable, Movable):
                 var tile_idx = self.buffer_tiles[buffer_idx][i]
                 pref += self.theta[a][tile_idx]
             preferences.append(pref)
-        return softmax(preferences^)
+        return softmax(preferences)
 
     def _get_log_prob_idx(self, buffer_idx: Int, action: Int) -> Float64:
         """Get current log probability for buffer step."""
@@ -799,7 +799,7 @@ struct PPOAgentWithMinibatch(Copyable, ImplicitlyCopyable, Movable):
     def get_action_probs(self, tiles: List[Int]) -> List[Float64]:
         """Get action probabilities."""
         var prefs = self._get_action_preferences(tiles)
-        return softmax(prefs^)
+        return softmax(prefs)
 
     def get_value(self, tiles: List[Int]) -> Float64:
         """Get state value estimate."""
@@ -863,7 +863,7 @@ struct PPOAgentWithMinibatch(Copyable, ImplicitlyCopyable, Movable):
                 var tile_idx = self.buffer_tiles[buffer_idx][i]
                 pref += self.theta[a][tile_idx]
             preferences.append(pref)
-        return softmax(preferences^)
+        return softmax(preferences)
 
     def _get_log_prob_idx(self, buffer_idx: Int, action: Int) -> Float64:
         """Get current log probability for buffer step."""

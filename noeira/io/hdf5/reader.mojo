@@ -18,8 +18,9 @@ Read flow:
 """
 
 from std.memory import alloc, Pointer
+from std.os import getenv
 
-from . import c_int, HDF5_PLUGIN_PATH
+from . import c_int, HDF5_PLUGIN_PATH, HDF5_PLUGIN_SUBDIR
 from .h5_types import (
     H5F_ACC_RDONLY,
     H5P_DEFAULT,
@@ -73,6 +74,9 @@ struct H5File(Movable):
         # H5PLprepend is idempotent enough — duplicate paths are harmless.
         try:
             _ = h5pl_prepend(String(HDF5_PLUGIN_PATH))
+            var prefix = getenv("CONDA_PREFIX")
+            if prefix.byte_length() > 0:
+                _ = h5pl_prepend(prefix + HDF5_PLUGIN_SUBDIR)
         except:
             pass
 

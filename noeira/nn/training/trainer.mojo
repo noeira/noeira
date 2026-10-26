@@ -22,7 +22,6 @@ from max.gpu.host import DeviceContext
 from max.gpu import global_idx
 from std.memory import unsafe_memcpy
 from std.time import perf_counter_ns
-from layout import Layout, LayoutTensor
 
 from noeira.nn.constants import DT, TPB
 from ..core.tensor import Tensor, TensorImpl
@@ -45,6 +44,7 @@ from .shuffle_kernels import (
 from .augmenter import Augmenter, IdentityAugmenter
 from ..optimizer.lr_scheduler import Scheduler, ConstantSchedule
 from noeira.cuda import CUDAGraph, maybe_capture_replay
+from noeira.core.tiles import RowMajor, Tile
 
 
 # ── AMP boundary cast kernels (fp32 ↔ MADT) ─────────────────────────────
@@ -54,8 +54,8 @@ from noeira.cuda import CUDAGraph, maybe_capture_replay
 def _cast_kernel[
     SRC: DType, DST: DType, N: Int
 ](
-    src: LayoutTensor[SRC, Layout.row_major(N), MutAnyOrigin],
-    dst: LayoutTensor[DST, Layout.row_major(N), MutAnyOrigin],
+    src: Tile[SRC, N],
+    dst: Tile[DST, N],
 ):
     var i = Int(global_idx.x)
     if i < N:
@@ -297,8 +297,8 @@ struct Trainer[
             c.enqueue_function[
                 _cast_kernel[Self.MADT, DT, LOGN]
             ](
-                logits.lt["gpu", Layout.row_major(LOGN)](),
-                logits_f32.lt["gpu", Layout.row_major(LOGN)](),
+                logits.tt["gpu", LOGN](),
+                logits_f32.tt["gpu", LOGN](),
                 grid_dim=(LOGN + TPB - 1) // TPB,
                 block_dim=TPB,
             )
@@ -309,8 +309,8 @@ struct Trainer[
             c.enqueue_function[
                 _cast_kernel[DT, Self.MADT, LOGN]
             ](
-                grad_f32.lt["gpu", Layout.row_major(LOGN)](),
-                grad.lt["gpu", Layout.row_major(LOGN)](),
+                grad_f32.tt["gpu", LOGN](),
+                grad.tt["gpu", LOGN](),
                 grid_dim=(LOGN + TPB - 1) // TPB,
                 block_dim=TPB,
             )
@@ -334,8 +334,8 @@ struct Trainer[
         comptime NX = Self.BATCH * Self.IN
         model_in.ensure_gpu(ctx, NX)
         ctx.enqueue_function[_cast_kernel[DT, Self.MADT, NX]](
-            batch_xf.lt["gpu", Layout.row_major(NX)](),
-            model_in.lt["gpu", Layout.row_major(NX)](),
+            batch_xf.tt["gpu", NX](),
+            model_in.tt["gpu", NX](),
             grid_dim=(NX + TPB - 1) // TPB,
             block_dim=TPB,
         )
@@ -381,9 +381,9 @@ struct Trainer[
         comptime n_batches = N_TRAIN // Self.BATCH
         comptime blocks_gx = (Self.BATCH * Self.IN + TPB - 1) // TPB
         comptime blocks_gy = (Self.BATCH * Self.NC + TPB - 1) // TPB
-        comptime LX = Layout.row_major(N_TRAIN, Self.IN)
+        comptime LX = RowMajor[N_TRAIN, Self.IN]
         c.enqueue_function[reset_counter_kernel](
-            bctr.lt["gpu", Layout.row_major(1)](), grid_dim=1, block_dim=1
+            bctr.tt["gpu", 1](), grid_dim=1, block_dim=1
         )
         for _ in range(n_batches):
             # Move the slot into a disjoint local (`take` leaves it None) so the
@@ -393,20 +393,18 @@ struct Trainer[
                 g = Optional[CUDAGraph](self._train_graph.take())
 
             def _cap() capturing raises -> None:
-                var src = self.ds_x.lt["gpu", LX]()
+                var src = self.ds_x.tt["gpu", N_TRAIN, Self.IN]()
                 comptime if USE_AUG:
-                    src = aug.lt["gpu", LX]()
+                    src = aug.tt["gpu", N_TRAIN, Self.IN]()
                 c.enqueue_function[
                     gather_rows_at_counter_kernel[
                         N_TRAIN, Self.BATCH, Self.IN, DT
                     ]
                 ](
-                    rebind[Tensor](self.batch_x).lt[
-                        "gpu", Layout.row_major(Self.BATCH, Self.IN)
-                    ](),
+                    rebind[Tensor](self.batch_x).tt["gpu", Self.BATCH, Self.IN](),
                     src,
-                    indices.lt["gpu", Layout.row_major(N_TRAIN)](),
-                    bctr.lt["gpu", Layout.row_major(1)](),
+                    indices.tt["gpu", N_TRAIN](),
+                    bctr.tt["gpu", 1](),
                     grid_dim=blocks_gx,
                     block_dim=TPB,
                 )
@@ -415,17 +413,15 @@ struct Trainer[
                         N_TRAIN, Self.BATCH, Self.NC, DT
                     ]
                 ](
-                    self.batch_y.lt[
-                        "gpu", Layout.row_major(Self.BATCH, Self.NC)
-                    ](),
-                    self.ds_y.lt["gpu", Layout.row_major(N_TRAIN, Self.NC)](),
-                    indices.lt["gpu", Layout.row_major(N_TRAIN)](),
-                    bctr.lt["gpu", Layout.row_major(1)](),
+                    self.batch_y.tt["gpu", Self.BATCH, Self.NC](),
+                    self.ds_y.tt["gpu", N_TRAIN, Self.NC](),
+                    indices.tt["gpu", N_TRAIN](),
+                    bctr.tt["gpu", 1](),
                     grid_dim=blocks_gy,
                     block_dim=TPB,
                 )
                 c.enqueue_function[advance_counter_kernel](
-                    bctr.lt["gpu", Layout.row_major(1)](),
+                    bctr.tt["gpu", 1](),
                     grid_dim=1,
                     block_dim=1,
                 )
@@ -575,8 +571,8 @@ struct Trainer[
                 var c = ctx.value()
                 self.logits_f32.ensure_gpu(c, LOGN)
                 c.enqueue_function[_cast_kernel[Self.MADT, DT, LOGN]](
-                    self.logits.lt["gpu", Layout.row_major(LOGN)](),
-                    self.logits_f32.lt["gpu", Layout.row_major(LOGN)](),
+                    self.logits.tt["gpu", LOGN](),
+                    self.logits_f32.tt["gpu", LOGN](),
                     grid_dim=(LOGN + TPB - 1) // TPB,
                     block_dim=TPB,
                 )
@@ -681,14 +677,14 @@ struct Trainer[
             if not shuffle:
                 indices = TensorImpl[DType.int32].alloc_gpu(c, N_TRAIN)
                 c.enqueue_function[init_identity_indices_kernel[N_TRAIN]](
-                    indices.lt["gpu", Layout.row_major(N_TRAIN)](),
+                    indices.tt["gpu", N_TRAIN](),
                     grid_dim=blocks_init,
                     block_dim=TPB,
                 )
         if shuffle:
             indices = TensorImpl[DType.int32].alloc_gpu(c, N_TRAIN)
             c.enqueue_function[init_identity_indices_kernel[N_TRAIN]](
-                indices.lt["gpu", Layout.row_major(N_TRAIN)](),
+                indices.tt["gpu", N_TRAIN](),
                 grid_dim=blocks_init,
                 block_dim=TPB,
             )
@@ -732,20 +728,20 @@ struct Trainer[
             comptime if USE_AUG:
                 AUGMENTER.augment[N_TRAIN, Self.IN, DT](
                     c,
-                    aug.lt["gpu", Layout.row_major(N_TRAIN, Self.IN)](),
-                    self.ds_x.lt["gpu", Layout.row_major(N_TRAIN, Self.IN)](),
+                    aug.tt["gpu", N_TRAIN, Self.IN](),
+                    self.ds_x.tt["gpu", N_TRAIN, Self.IN](),
                     epoch,
                     aug_seed,
                 )
             if shuffle:
                 c.enqueue_function[fisher_yates_shuffle_kernel[N_TRAIN]](
-                    indices.lt["gpu", Layout.row_major(N_TRAIN)](),
-                    seed.lt["gpu", Layout.row_major(1)](),
+                    indices.tt["gpu", N_TRAIN](),
+                    seed.tt["gpu", 1](),
                     grid_dim=1,
                     block_dim=1,
                 )
                 c.enqueue_function[increment_seed_kernel](
-                    seed.lt["gpu", Layout.row_major(1)](),
+                    seed.tt["gpu", 1](),
                     grid_dim=1,
                     block_dim=1,
                 )
@@ -762,15 +758,9 @@ struct Trainer[
                                     N_TRAIN, Self.BATCH, Self.IN, DT
                                 ]
                             ](
-                                gx.lt[
-                                    "gpu", Layout.row_major(Self.BATCH, Self.IN)
-                                ](),
-                                aug.lt[
-                                    "gpu", Layout.row_major(N_TRAIN, Self.IN)
-                                ](),
-                                indices.lt[
-                                    "gpu", Layout.row_major(N_TRAIN)
-                                ](),
+                                gx.tt["gpu", Self.BATCH, Self.IN](),
+                                aug.tt["gpu", N_TRAIN, Self.IN](),
+                                indices.tt["gpu", N_TRAIN](),
                                 Int32(off),
                                 grid_dim=blocks_gx,
                                 block_dim=TPB,
@@ -781,15 +771,9 @@ struct Trainer[
                                     N_TRAIN, Self.BATCH, Self.IN, DT
                                 ]
                             ](
-                                gx.lt[
-                                    "gpu", Layout.row_major(Self.BATCH, Self.IN)
-                                ](),
-                                self.ds_x.lt[
-                                    "gpu", Layout.row_major(N_TRAIN, Self.IN)
-                                ](),
-                                indices.lt[
-                                    "gpu", Layout.row_major(N_TRAIN)
-                                ](),
+                                gx.tt["gpu", Self.BATCH, Self.IN](),
+                                self.ds_x.tt["gpu", N_TRAIN, Self.IN](),
+                                indices.tt["gpu", N_TRAIN](),
                                 Int32(off),
                                 grid_dim=blocks_gx,
                                 block_dim=TPB,
@@ -797,13 +781,9 @@ struct Trainer[
                         c.enqueue_function[
                             gather_rows_kernel[N_TRAIN, Self.BATCH, Self.NC, DT]
                         ](
-                            gy.lt[
-                                "gpu", Layout.row_major(Self.BATCH, Self.NC)
-                            ](),
-                            self.ds_y.lt[
-                                "gpu", Layout.row_major(N_TRAIN, Self.NC)
-                            ](),
-                            indices.lt["gpu", Layout.row_major(N_TRAIN)](),
+                            gy.tt["gpu", Self.BATCH, Self.NC](),
+                            self.ds_y.tt["gpu", N_TRAIN, Self.NC](),
+                            indices.tt["gpu", N_TRAIN](),
                             Int32(off),
                             grid_dim=blocks_gy,
                             block_dim=TPB,
@@ -824,14 +804,8 @@ struct Trainer[
                                     DT, Self.MADT, Self.BATCH * Self.IN
                                 ]
                             ](
-                                gx.lt[
-                                    "gpu",
-                                    Layout.row_major(Self.BATCH * Self.IN),
-                                ](),
-                                gxm.lt[
-                                    "gpu",
-                                    Layout.row_major(Self.BATCH * Self.IN),
-                                ](),
+                                gx.tt["gpu", Self.BATCH * Self.IN](),
+                                gxm.tt["gpu", Self.BATCH * Self.IN](),
                                 grid_dim=blocks_gx,
                                 block_dim=TPB,
                             )

@@ -190,7 +190,7 @@ struct RemoteCatalog(Movable & Deinitable):
             for i in range(body.byte_length()):
                 payload.append(body.as_bytes()[i])
             ctype = String("application/json")
-        var r = self._http.request(method, url, payload^, ctype, expect)
+        var r = self._http.request(method, url, payload, ctype, expect)
         # ⚠ Move the body out UNCONDITIONALLY. Moving it on only one branch
         # leaves the response partially destroyed on the other, which Mojo
         # rejects as "destroyed out of the middle of a value".
@@ -215,7 +215,7 @@ struct RemoteCatalog(Movable & Deinitable):
             for i in range(body.byte_length()):
                 payload.append(body.as_bytes()[i])
             ctype = String("application/json")
-        var r = self._http.request(method, url, payload^, ctype, -1)
+        var r = self._http.request(method, url, payload, ctype, -1)
         var status = r.status
         var raw = r^.take_body()
         var text = string_from_bytes(raw)

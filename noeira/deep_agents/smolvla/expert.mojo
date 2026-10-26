@@ -80,16 +80,19 @@ struct SmolVLAExpert[
     QW: Int = VLM_W,
     KVW: Int = VLM_KV_W,
     SELF_EVERY: Int = EXPERT_SELF_EVERY,
+    LORA_R: Int = 0,
 ](ParamWalkable):
-    """All 16 layers plus the final norm, walked under the CHECKPOINT's index."""
+    """All 16 layers plus the final norm, walked under the CHECKPOINT's index.
+    `LORA_R > 0` puts a LoRA adapter beside each of every layer's seven
+    linears (`layer_weights.mojo`)."""
 
     comptime N_SELF: Int = (Self.LAYERS + Self.SELF_EVERY - 1) // Self.SELF_EVERY
     comptime N_CROSS: Int = Self.LAYERS - Self.N_SELF
     comptime SelfLayer = DecoderLayerWeights[
-        Self.W, Self.FF, Self.QW, Self.KVW, Self.W
+        Self.W, Self.FF, Self.QW, Self.KVW, Self.W, Self.LORA_R
     ]
     comptime CrossLayer = DecoderLayerWeights[
-        Self.W, Self.FF, Self.QW, Self.KVW, Self.KVW
+        Self.W, Self.FF, Self.QW, Self.KVW, Self.KVW, Self.LORA_R
     ]
 
     var self_layers: List[Self.SelfLayer]
@@ -142,6 +145,44 @@ struct SmolVLAExpert[
         self.norm.for_each_param[target](
             vis, ctx, join_name(prefix, String("norm"))
         )
+
+    def for_each_base_param[
+        target: StaticString, V: ParamVisitor
+    ](mut self, mut vis: V, ctx: Optional[DeviceContext],
+      prefix: String = String("")) raises:
+        """`for_each_param` without the LoRA adapters: what the checkpoint's
+        name map describes (`SmolVLAPolicy.load`) and what freezing the base
+        for LoRA training freezes. The same walk at `LORA_R = 0`."""
+        for i in range(Self.LAYERS):
+            var name = join_name(prefix, String("layers." + String(i)))
+            if Self.is_self_layer(i):
+                self.self_layers[i // Self.SELF_EVERY].walk[target, V, False](
+                    vis, ctx, name
+                )
+            else:
+                self.cross_layers[i // Self.SELF_EVERY].walk[target, V, False](
+                    vis, ctx, name
+                )
+        self.norm.for_each_param[target](
+            vis, ctx, join_name(prefix, String("norm"))
+        )
+
+    def set_lora_alpha(mut self, alpha: Float64):
+        """PEFT's `lora_alpha` for every adapter; nothing at `LORA_R = 0`."""
+        for i in range(Self.N_SELF):
+            self.self_layers[i].set_lora_alpha(alpha)
+        for i in range(Self.N_CROSS):
+            self.cross_layers[i].set_lora_alpha(alpha)
+
+    def merge_lora[
+        target: StaticString
+    ](mut self, ctx: Optional[DeviceContext] = None) raises:
+        """Every layer's `merge_lora`: the expert's base weights then hold
+        W + s · A B and its base walk is a plain expert's."""
+        for i in range(Self.N_SELF):
+            self.self_layers[i].merge_lora[target](ctx)
+        for i in range(Self.N_CROSS):
+            self.cross_layers[i].merge_lora[target](ctx)
 
     def zero_grad[
         target: StaticString

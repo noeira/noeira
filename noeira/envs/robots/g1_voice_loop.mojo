@@ -571,7 +571,7 @@ struct G1VoiceLoop(Movable):
         if not self.tts_busy:
             return
         var el = Float64(perf_counter_ns() - self.tts_t0) / 1e9
-        var ready = False
+        var ready: Bool
         if el > self.cfg.tts_dl:
             self._tts_cancel()
             self.note = String("[tts] GAVE UP after ") + _vl_f2(el) + String(" s — OS voice")
@@ -764,11 +764,7 @@ struct G1VoiceLoop(Movable):
             self.above += 1
         else:
             self.above = 0
-        var can_open = False
-        try:
-            can_open = self.mic.seconds_read() > 1.2
-        except:
-            can_open = False
+        var can_open = self.mic.seconds_read() > 1.2
         if (self.mic_on and self.mic_dead == "" and self.state == VL_ST_IDLE
             and self.cfg.vad and not echoing
             and self.above >= VL_OPEN_FRAMES and can_open):
@@ -838,7 +834,7 @@ struct G1VoiceLoop(Movable):
                     pass
                 self.state = VL_ST_IDLE
             else:
-                var ready = False
+                var ready: Bool
                 try:
                     ready = self.stt.poll()
                 except:
@@ -900,7 +896,7 @@ struct G1VoiceLoop(Movable):
                     pass
                 self.state = VL_ST_IDLE
             else:
-                var ready = False
+                var ready: Bool
                 try:
                     ready = self.jev.poll()
                 except:
@@ -920,7 +916,7 @@ struct G1VoiceLoop(Movable):
                     pass
                 self.state = VL_ST_IDLE
             else:
-                var ready = False
+                var ready: Bool
                 try:
                     ready = self.jev.poll()
                 except:
@@ -940,7 +936,7 @@ struct G1VoiceLoop(Movable):
                     pass
                 self.state = VL_ST_IDLE
             else:
-                var ready = False
+                var ready: Bool
                 try:
                     ready = self.jev.poll()
                 except:
@@ -964,11 +960,7 @@ struct G1VoiceLoop(Movable):
                     _ = self.llm.poll()
                 except:
                     pass
-                var done = False
-                try:
-                    done = self.llm.done()
-                except:
-                    done = True
+                var done = self.llm.done()
                 if done:
                     var rtxt = String("")
                     try:
@@ -1077,7 +1069,6 @@ struct G1VoiceLoop(Movable):
                     self.note = (String("[talk] ") + _vl_f2(self.pick.conf)
                                  + self._jev_ms(ans.latency_ms))
                     self.state = VL_ST_CHAT
-                    got = True
                 except e:
                     self.note = String("[talk] could not start: ") + String(e)
             else:

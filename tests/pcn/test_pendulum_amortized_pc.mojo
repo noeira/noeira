@@ -22,10 +22,10 @@ Run:
 """
 
 from std.math import sqrt, log, cos, sin, tanh, pi
-from std.memory import alloc, memset
+from std.memory import alloc, unsafe_memset
 from std.random.philox import Random as PhiloxRandom
 from std.time import perf_counter_ns
-from layout import Layout, LayoutTensor
+from noeira.core.tiles import tile
 
 from noeira.nn.constants import DT as dtype
 from noeira.experimental.pcn.pc_initializer import PCXavier
@@ -220,34 +220,20 @@ def main() raises:
         NET.PARAM_SIZE * OPT_PC.STATE_PER_PARAM
     ).as_unsafe_any_origin()
     var pc_opt_global_buf = alloc[Scalar[dtype]](OPT_PC.GLOBAL_STATE_SIZE).as_unsafe_any_origin()
-    memset(pc_params_buf, 0, NET.PARAM_SIZE)
-    memset(pc_grads_buf, 0, NET.PARAM_SIZE)
-    memset(pc_opt_state_buf, 0, NET.PARAM_SIZE * OPT_PC.STATE_PER_PARAM)
-    memset(pc_opt_global_buf, 0, OPT_PC.GLOBAL_STATE_SIZE)
-    var pc_params = LayoutTensor[
-        dtype, Layout.row_major(NET.PARAM_SIZE), MutAnyOrigin
-    ](pc_params_buf)
-    var pc_grads = LayoutTensor[
-        dtype, Layout.row_major(NET.PARAM_SIZE), MutAnyOrigin
-    ](pc_grads_buf)
-    var pc_opt_state = LayoutTensor[
-        dtype,
-        Layout.row_major(NET.PARAM_SIZE, OPT_PC.STATE_PER_PARAM),
-        MutAnyOrigin,
-    ](pc_opt_state_buf)
-    var pc_opt_global = LayoutTensor[
-        dtype, Layout.row_major(OPT_PC.GLOBAL_STATE_SIZE), MutAnyOrigin
-    ](pc_opt_global_buf)
+    unsafe_memset(pc_params_buf, 0, NET.PARAM_SIZE)
+    unsafe_memset(pc_grads_buf, 0, NET.PARAM_SIZE)
+    unsafe_memset(pc_opt_state_buf, 0, NET.PARAM_SIZE * OPT_PC.STATE_PER_PARAM)
+    unsafe_memset(pc_opt_global_buf, 0, OPT_PC.GLOBAL_STATE_SIZE)
+    var pc_params = tile[NET.PARAM_SIZE](pc_params_buf)
+    var pc_grads = tile[NET.PARAM_SIZE](pc_grads_buf)
+    var pc_opt_state = tile[NET.PARAM_SIZE, OPT_PC.STATE_PER_PARAM](pc_opt_state_buf)
+    var pc_opt_global = tile[OPT_PC.GLOBAL_STATE_SIZE](pc_opt_global_buf)
     NET.pc_init_params[PCXavier, dtype](pc_params)
 
     # Per-block PC param views — used during eval (open-loop rollout).
     comptime offset_b1 = NET._param_offset[1]()
-    var params_b0 = LayoutTensor[
-        dtype, Layout.row_major(NET.block_types[0].PARAM_SIZE), MutAnyOrigin
-    ](pc_params_buf)
-    var params_b1 = LayoutTensor[
-        dtype, Layout.row_major(NET.block_types[1].PARAM_SIZE), MutAnyOrigin
-    ](pc_params_buf + offset_b1)
+    var params_b0 = tile[NET.block_types[0].PARAM_SIZE](pc_params_buf)
+    var params_b1 = tile[NET.block_types[1].PARAM_SIZE](pc_params_buf + offset_b1)
 
     # ── Encoder params + Adam state ───────────────────────────────────────────
     var enc_params_buf = alloc[Scalar[dtype]](ENC_PARAM_SIZE).as_unsafe_any_origin()
@@ -256,25 +242,15 @@ def main() raises:
         ENC_PARAM_SIZE * OPT_ENC.STATE_PER_PARAM
     ).as_unsafe_any_origin()
     var enc_opt_global_buf = alloc[Scalar[dtype]](OPT_ENC.GLOBAL_STATE_SIZE).as_unsafe_any_origin()
-    memset(enc_params_buf, 0, ENC_PARAM_SIZE)
-    memset(enc_grads_buf, 0, ENC_PARAM_SIZE)
-    memset(enc_opt_state_buf, 0, ENC_PARAM_SIZE * OPT_ENC.STATE_PER_PARAM)
-    memset(enc_opt_global_buf, 0, OPT_ENC.GLOBAL_STATE_SIZE)
+    unsafe_memset(enc_params_buf, 0, ENC_PARAM_SIZE)
+    unsafe_memset(enc_grads_buf, 0, ENC_PARAM_SIZE)
+    unsafe_memset(enc_opt_state_buf, 0, ENC_PARAM_SIZE * OPT_ENC.STATE_PER_PARAM)
+    unsafe_memset(enc_opt_global_buf, 0, OPT_ENC.GLOBAL_STATE_SIZE)
 
-    var enc_params = LayoutTensor[
-        dtype, Layout.row_major(ENC_PARAM_SIZE), MutAnyOrigin
-    ](enc_params_buf)
-    var enc_grads = LayoutTensor[
-        dtype, Layout.row_major(ENC_PARAM_SIZE), MutAnyOrigin
-    ](enc_grads_buf)
-    var enc_opt_state = LayoutTensor[
-        dtype,
-        Layout.row_major(ENC_PARAM_SIZE, OPT_ENC.STATE_PER_PARAM),
-        MutAnyOrigin,
-    ](enc_opt_state_buf)
-    var enc_opt_global = LayoutTensor[
-        dtype, Layout.row_major(OPT_ENC.GLOBAL_STATE_SIZE), MutAnyOrigin
-    ](enc_opt_global_buf)
+    var enc_params = tile[ENC_PARAM_SIZE](enc_params_buf)
+    var enc_grads = tile[ENC_PARAM_SIZE](enc_grads_buf)
+    var enc_opt_state = tile[ENC_PARAM_SIZE, OPT_ENC.STATE_PER_PARAM](enc_opt_state_buf)
+    var enc_opt_global = tile[OPT_ENC.GLOBAL_STATE_SIZE](enc_opt_global_buf)
     ENC.xavier_init[dtype](enc_params, UInt64(123))
 
     # ── PC scratch ────────────────────────────────────────────────────────────
@@ -283,34 +259,20 @@ def main() raises:
     var a_below_buf_raw = alloc[Scalar[dtype]](BATCH * NET.SCRATCH_IN_DIM).as_unsafe_any_origin()
     var z_below_buf_raw = alloc[Scalar[dtype]](BATCH * NET.SCRATCH_IN_DIM).as_unsafe_any_origin()
     var dx_buf_raw = alloc[Scalar[dtype]](BATCH * NET.LATENT_DIM).as_unsafe_any_origin()
-    memset(lat_buf, 0, BATCH * NET.LATENT_DIM)
+    unsafe_memset(lat_buf, 0, BATCH * NET.LATENT_DIM)
 
-    var latents = LayoutTensor[
-        dtype, Layout.row_major(BATCH, NET.LATENT_DIM), MutAnyOrigin
-    ](lat_buf)
-    var mu_eps_buf = LayoutTensor[
-        dtype, Layout.row_major(BATCH, NET.SCRATCH_OUT_DIM), MutAnyOrigin
-    ](mu_eps_buf_raw)
-    var a_below_buf = LayoutTensor[
-        dtype, Layout.row_major(BATCH, NET.SCRATCH_IN_DIM), MutAnyOrigin
-    ](a_below_buf_raw)
-    var z_below_buf = LayoutTensor[
-        dtype, Layout.row_major(BATCH, NET.SCRATCH_IN_DIM), MutAnyOrigin
-    ](z_below_buf_raw)
-    var dx_buf = LayoutTensor[
-        dtype, Layout.row_major(BATCH, NET.LATENT_DIM), MutAnyOrigin
-    ](dx_buf_raw)
+    var latents = tile[BATCH, NET.LATENT_DIM](lat_buf)
+    var mu_eps_buf = tile[BATCH, NET.SCRATCH_OUT_DIM](mu_eps_buf_raw)
+    var a_below_buf = tile[BATCH, NET.SCRATCH_IN_DIM](a_below_buf_raw)
+    var z_below_buf = tile[BATCH, NET.SCRATCH_IN_DIM](z_below_buf_raw)
+    var dx_buf = tile[BATCH, NET.LATENT_DIM](dx_buf_raw)
 
     var x_in_buf = alloc[Scalar[dtype]](BATCH * AUG_DIM).as_unsafe_any_origin()
     var y_tgt_buf = alloc[Scalar[dtype]](BATCH * OBS_DIM).as_unsafe_any_origin()
-    memset(x_in_buf, 0, BATCH * AUG_DIM)
-    memset(y_tgt_buf, 0, BATCH * OBS_DIM)
-    var x_in = LayoutTensor[
-        dtype, Layout.row_major(BATCH, AUG_DIM), MutAnyOrigin
-    ](x_in_buf)
-    var y_target = LayoutTensor[
-        dtype, Layout.row_major(BATCH, OBS_DIM), MutAnyOrigin
-    ](y_tgt_buf)
+    unsafe_memset(x_in_buf, 0, BATCH * AUG_DIM)
+    unsafe_memset(y_tgt_buf, 0, BATCH * OBS_DIM)
+    var x_in = tile[BATCH, AUG_DIM](x_in_buf)
+    var y_target = tile[BATCH, OBS_DIM](y_tgt_buf)
 
     # ── Encoder scratch ──────────────────────────────────────────────────────
     var enc_input_buf = alloc[Scalar[dtype]](BATCH * ENC_INPUT_DIM).as_unsafe_any_origin()
@@ -318,21 +280,11 @@ def main() raises:
     var enc_hact_buf = alloc[Scalar[dtype]](BATCH * ENC_HIDDEN_DIM).as_unsafe_any_origin()
     var enc_output_buf = alloc[Scalar[dtype]](BATCH * ENC_OUTPUT_DIM).as_unsafe_any_origin()
     var enc_dz_buf = alloc[Scalar[dtype]](BATCH * ENC_OUTPUT_DIM).as_unsafe_any_origin()
-    var enc_input = LayoutTensor[
-        dtype, Layout.row_major(BATCH, ENC_INPUT_DIM), MutAnyOrigin
-    ](enc_input_buf)
-    var enc_hpre = LayoutTensor[
-        dtype, Layout.row_major(BATCH, ENC_HIDDEN_DIM), MutAnyOrigin
-    ](enc_hpre_buf)
-    var enc_hact = LayoutTensor[
-        dtype, Layout.row_major(BATCH, ENC_HIDDEN_DIM), MutAnyOrigin
-    ](enc_hact_buf)
-    var enc_output = LayoutTensor[
-        dtype, Layout.row_major(BATCH, ENC_OUTPUT_DIM), MutAnyOrigin
-    ](enc_output_buf)
-    var enc_dz = LayoutTensor[
-        dtype, Layout.row_major(BATCH, ENC_OUTPUT_DIM), MutAnyOrigin
-    ](enc_dz_buf)
+    var enc_input = tile[BATCH, ENC_INPUT_DIM](enc_input_buf)
+    var enc_hpre = tile[BATCH, ENC_HIDDEN_DIM](enc_hpre_buf)
+    var enc_hact = tile[BATCH, ENC_HIDDEN_DIM](enc_hact_buf)
+    var enc_output = tile[BATCH, ENC_OUTPUT_DIM](enc_output_buf)
+    var enc_dz = tile[BATCH, ENC_OUTPUT_DIM](enc_dz_buf)
 
     # ── Per-rollout actions/states scratch ───────────────────────────────────
     var actions_buf = alloc[Scalar[dtype]](BATCH * SEQ_LEN).as_unsafe_any_origin()
@@ -367,7 +319,7 @@ def main() raises:
                 )
 
             # prev_z = 0 at the start of each rollout.
-            memset(prev_z_buf, 0, BATCH * HIDDEN)
+            unsafe_memset(prev_z_buf, 0, BATCH * HIDDEN)
 
             # Per time step t = 0..SEQ_LEN: encode → refine → update W's.
             # At t=0 there's no prior action; use action=0 in the encoder input.
@@ -491,18 +443,10 @@ def main() raises:
     var a_z_pred_buf = alloc[Scalar[dtype]](BATCH * AUG_DIM).as_unsafe_any_origin()
     var s_pred_buf = alloc[Scalar[dtype]](BATCH * OBS_DIM).as_unsafe_any_origin()
     var a_s_pred_buf = alloc[Scalar[dtype]](BATCH * HIDDEN).as_unsafe_any_origin()
-    var z_pred = LayoutTensor[
-        dtype, Layout.row_major(BATCH, HIDDEN), MutAnyOrigin
-    ](z_pred_buf)
-    var a_z_pred = LayoutTensor[
-        dtype, Layout.row_major(BATCH, AUG_DIM), MutAnyOrigin
-    ](a_z_pred_buf)
-    var s_pred = LayoutTensor[
-        dtype, Layout.row_major(BATCH, OBS_DIM), MutAnyOrigin
-    ](s_pred_buf)
-    var a_s_pred = LayoutTensor[
-        dtype, Layout.row_major(BATCH, HIDDEN), MutAnyOrigin
-    ](a_s_pred_buf)
+    var z_pred = tile[BATCH, HIDDEN](z_pred_buf)
+    var a_z_pred = tile[BATCH, AUG_DIM](a_z_pred_buf)
+    var s_pred = tile[BATCH, OBS_DIM](s_pred_buf)
+    var a_s_pred = tile[BATCH, HIDDEN](a_s_pred_buf)
 
     # ── Generate held-out trajectories ───────────────────────────────────────
     var eval_rng = PhiloxRandom(seed=UInt64(2026), offset=UInt64(0))
@@ -524,7 +468,7 @@ def main() raises:
         " persist[per-dim]"
     )
 
-    memset(prev_z_buf, 0, BATCH * HIDDEN)
+    unsafe_memset(prev_z_buf, 0, BATCH * HIDDEN)
 
     # Initial filter: encode + refine at t=0 (bootstrap).
     for b in range(N_EVAL_TRAJ):
@@ -716,7 +660,7 @@ def main() raises:
     print("  step | mse_total (open-loop) | mse_persist | ratio")
     print("  -----+-----------------------+-------------+------")
 
-    memset(prev_z_buf, 0, BATCH * HIDDEN)
+    unsafe_memset(prev_z_buf, 0, BATCH * HIDDEN)
 
     # Initial filter at t=0
     for b in range(N_EVAL_TRAJ):

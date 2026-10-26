@@ -36,6 +36,10 @@ tests/physics3d/test_cfrc_ext_batched_vs_cpu.mojo
 # The Euler finalize's four launches (rhs kernel, the step's LDL factor and
 # solve, integrate) against the CPU step, bit-exact, on a damped model.
 tests/physics3d/test_euler_finalize_gpu_parity.mojo
+# sin_cos_device in a kernel vs a correctly rounded reference: CUDA's float32
+# sin/cos is sin.approx (1e-5 relative at small angles), which alone failed
+# the Euler gate above on NVIDIA. On Apple it is std.math and gates nothing new.
+tests/physics3d/test_sin_cos_device.mojo
 
 # Render-time domain randomization (DR plan Phase 2) on the so101_tower rig:
 # `off` restores the build's tables and frame bit for bit, a draw is a

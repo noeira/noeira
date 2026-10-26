@@ -31,15 +31,15 @@ other must, and at B == 1 neither would notice.
 
 from max.gpu import global_idx
 from max.gpu.host import DeviceContext
-from layout import Layout, LayoutTensor
 
 from noeira.nn.constants import DT, TPB
 from noeira.nn.core.tensor import Tensor
+from noeira.core.tiles import Tile
 
 
 def _accum_kernel[N: Int](
-    dst: LayoutTensor[DT, Layout.row_major(N), MutAnyOrigin],
-    src: LayoutTensor[DT, Layout.row_major(N), MutAnyOrigin],
+    dst: Tile[DT, N],
+    src: Tile[DT, N],
 ):
     var i = Int(global_idx.x)
     if i < N:
@@ -49,8 +49,8 @@ def _accum_kernel[N: Int](
 
 
 def _copy_kernel[N: Int](
-    dst: LayoutTensor[DT, Layout.row_major(N), MutAnyOrigin],
-    src: LayoutTensor[DT, Layout.row_major(N), MutAnyOrigin],
+    dst: Tile[DT, N],
+    src: Tile[DT, N],
 ):
     var i = Int(global_idx.x)
     if i < N:
@@ -60,8 +60,8 @@ def _copy_kernel[N: Int](
 
 
 def _suffix_kernel[B: Int, FULL_B: Int, PRE_B: Int, SUF_B: Int](
-    src: LayoutTensor[DT, Layout.row_major(B, FULL_B), MutAnyOrigin],
-    dst: LayoutTensor[DT, Layout.row_major(B, SUF_B), MutAnyOrigin],
+    src: Tile[DT, B, FULL_B],
+    dst: Tile[DT, B, SUF_B],
 ):
     var i = Int(global_idx.x)
     if i >= B * SUF_B:
@@ -84,8 +84,8 @@ def accum_into[
     else:
         var c = ctx.value()
         c.enqueue_function[_accum_kernel[N]](
-            dst.lt["gpu", Layout.row_major(N)](),
-            src.lt["gpu", Layout.row_major(N)](),
+            dst.tt["gpu", N](),
+            src.tt["gpu", N](),
             grid_dim=(N + TPB - 1) // TPB,
             block_dim=TPB,
         )
@@ -104,8 +104,8 @@ def copy_into[
         var c = ctx.value()
         dst.ensure_gpu(c, N)
         c.enqueue_function[_copy_kernel[N]](
-            dst.lt["gpu", Layout.row_major(N)](),
-            src.lt["gpu", Layout.row_major(N)](),
+            dst.tt["gpu", N](),
+            src.tt["gpu", N](),
             grid_dim=(N + TPB - 1) // TPB,
             block_dim=TPB,
         )
@@ -125,16 +125,16 @@ def suffix_tail[
         var c = ctx.value()
         dst.ensure_gpu(c, B * SUF_B)
         c.enqueue_function[_suffix_kernel[B, FULL_B, PRE_B, SUF_B]](
-            src.lt["gpu", Layout.row_major(B, FULL_B)](),
-            dst.lt["gpu", Layout.row_major(B, SUF_B)](),
+            src.tt["gpu", B, FULL_B](),
+            dst.tt["gpu", B, SUF_B](),
             grid_dim=(B * SUF_B + TPB - 1) // TPB,
             block_dim=TPB,
         )
 
 
 def _prefix_kernel[B: Int, FULL_B: Int, PRE_B: Int](
-    src: LayoutTensor[DT, Layout.row_major(B, FULL_B), MutAnyOrigin],
-    dst: LayoutTensor[DT, Layout.row_major(B, PRE_B), MutAnyOrigin],
+    src: Tile[DT, B, FULL_B],
+    dst: Tile[DT, B, PRE_B],
 ):
     var i = Int(global_idx.x)
     if i >= B * PRE_B:
@@ -166,15 +166,15 @@ def prefix_head[
         var c = ctx.value()
         dst.ensure_gpu(c, B * PRE_B)
         c.enqueue_function[_prefix_kernel[B, FULL_B, PRE_B]](
-            src.lt["gpu", Layout.row_major(B, FULL_B)](),
-            dst.lt["gpu", Layout.row_major(B, PRE_B)](),
+            src.tt["gpu", B, FULL_B](),
+            dst.tt["gpu", B, PRE_B](),
             grid_dim=(B * PRE_B + TPB - 1) // TPB,
             block_dim=TPB,
         )
 
 
 def _zero_kernel[N: Int](
-    dst: LayoutTensor[DT, Layout.row_major(N), MutAnyOrigin],
+    dst: Tile[DT, N],
 ):
     var i = Int(global_idx.x)
     if i < N:
@@ -197,7 +197,7 @@ def zero_into[
         var c = ctx.value()
         dst.ensure_gpu(c, N)
         c.enqueue_function[_zero_kernel[N]](
-            dst.lt["gpu", Layout.row_major(N)](),
+            dst.tt["gpu", N](),
             grid_dim=(N + TPB - 1) // TPB,
             block_dim=TPB,
         )

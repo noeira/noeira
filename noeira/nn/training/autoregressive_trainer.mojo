@@ -35,7 +35,6 @@ GPU-only for now (eval + generation use device buffers). A recurrent model
 from std.math import exp, cos
 from std.random import random_float64, random_ui64
 from max.gpu.host import DeviceContext
-from layout import Layout
 
 from noeira.nn.constants import DT, TPB
 from ..core.module import Module
@@ -239,15 +238,15 @@ struct AutoregressiveTrainer[
         ](
             mptr(self.corpus_dev.dev.value().unsafe_ptr()),
             Int64(self.corpus_dev.n - Self.SEQ),
-            self.rng_dev.lt["gpu", Layout.row_major(2)](),
-            self.in_t.lt["gpu", Layout.row_major(TOTAL)](),
-            self.tgt_t.lt["gpu", Layout.row_major(TOTAL)](),
-            self.starts_dev.lt["gpu", Layout.row_major(Self.BATCH)](),
+            self.rng_dev.tt["gpu", 2](),
+            self.in_t.tt["gpu", TOTAL](),
+            self.tgt_t.tt["gpu", TOTAL](),
+            self.starts_dev.tt["gpu", Self.BATCH](),
             grid_dim=(TOTAL + TPB - 1) // TPB,
             block_dim=TPB,
         )
         self.ctx.enqueue_function[advance_step_kernel](
-            self.rng_dev.lt["gpu", Layout.row_major(2)](),
+            self.rng_dev.tt["gpu", 2](),
             grid_dim=1,
             block_dim=1,
         )
@@ -399,8 +398,8 @@ struct AutoregressiveTrainer[
         comptime LOGN = B * Self.OUT_DIM
         logits_f32.ensure_gpu(ctx, LOGN)
         ctx.enqueue_function[_cast_kernel[Self.MADT, DT, LOGN]](
-            logits.lt["gpu", Layout.row_major(LOGN)](),
-            logits_f32.lt["gpu", Layout.row_major(LOGN)](),
+            logits.tt["gpu", LOGN](),
+            logits_f32.tt["gpu", LOGN](),
             grid_dim=(LOGN + TPB - 1) // TPB,
             block_dim=TPB,
         )
@@ -417,8 +416,8 @@ struct AutoregressiveTrainer[
         comptime LOGN = B * Self.OUT_DIM
         grad.ensure_gpu(ctx, LOGN)
         ctx.enqueue_function[_cast_kernel[DT, Self.MADT, LOGN]](
-            grad_f32.lt["gpu", Layout.row_major(LOGN)](),
-            grad.lt["gpu", Layout.row_major(LOGN)](),
+            grad_f32.tt["gpu", LOGN](),
+            grad.tt["gpu", LOGN](),
             grid_dim=(LOGN + TPB - 1) // TPB,
             block_dim=TPB,
         )

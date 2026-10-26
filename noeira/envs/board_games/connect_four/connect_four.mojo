@@ -20,7 +20,7 @@ Actions: 0-6 = column index. Full column = illegal (-1.0 reward).
 
 from std.random import random_float64
 from std.memory import alloc
-from layout import LayoutTensor, Layout
+from noeira.core.tiles import RowMajor, Tile, ImmTile, tile
 from max.gpu import block_dim, block_idx, thread_idx
 from max.gpu.host import DeviceContext, DeviceBuffer
 from noeira.core import (
@@ -515,11 +515,7 @@ struct ConnectFourEnv[DTYPE: DType = DType.float64](
         BATCH_SIZE: Int,
         STATE_SIZE: Int,
     ](
-        states: LayoutTensor[
-            board_dtype,
-            Layout.row_major(BATCH_SIZE, STATE_SIZE),
-            MutAnyOrigin,
-        ],
+        states: Tile[board_dtype, BATCH_SIZE, STATE_SIZE],
         i: Int,
         col: Int,
         row: Int,
@@ -545,20 +541,10 @@ struct ConnectFourEnv[DTYPE: DType = DType.float64](
         BATCH_SIZE: Int,
         STATE_SIZE: Int,
     ](
-        states: LayoutTensor[
-            board_dtype,
-            Layout.row_major(BATCH_SIZE, STATE_SIZE),
-            MutAnyOrigin,
-        ],
-        actions: LayoutTensor[
-            board_dtype, Layout.row_major(BATCH_SIZE), ImmutAnyOrigin
-        ],
-        rewards: LayoutTensor[
-            board_dtype, Layout.row_major(BATCH_SIZE), MutAnyOrigin
-        ],
-        dones: LayoutTensor[
-            board_dtype, Layout.row_major(BATCH_SIZE), MutAnyOrigin
-        ],
+        states: Tile[board_dtype, BATCH_SIZE, STATE_SIZE],
+        actions: ImmTile[board_dtype, BATCH_SIZE],
+        rewards: Tile[board_dtype, BATCH_SIZE],
+        dones: Tile[board_dtype, BATCH_SIZE],
     ):
         """Per-thread ConnectFour step kernel."""
         var i = Int(block_dim.x * block_idx.x + thread_idx.x)
@@ -646,11 +632,7 @@ struct ConnectFourEnv[DTYPE: DType = DType.float64](
         BATCH_SIZE: Int,
         STATE_SIZE: Int,
     ](
-        states: LayoutTensor[
-            board_dtype,
-            Layout.row_major(BATCH_SIZE, STATE_SIZE),
-            MutAnyOrigin,
-        ],
+        states: Tile[board_dtype, BATCH_SIZE, STATE_SIZE],
     ):
         var i = Int(block_dim.x * block_idx.x + thread_idx.x)
         if i >= BATCH_SIZE:
@@ -664,14 +646,8 @@ struct ConnectFourEnv[DTYPE: DType = DType.float64](
         BATCH_SIZE: Int,
         STATE_SIZE: Int,
     ](
-        states: LayoutTensor[
-            board_dtype,
-            Layout.row_major(BATCH_SIZE, STATE_SIZE),
-            MutAnyOrigin,
-        ],
-        dones: LayoutTensor[
-            board_dtype, Layout.row_major(BATCH_SIZE), MutAnyOrigin
-        ],
+        states: Tile[board_dtype, BATCH_SIZE, STATE_SIZE],
+        dones: Tile[board_dtype, BATCH_SIZE],
     ):
         var i = Int(block_dim.x * block_idx.x + thread_idx.x)
         if i >= BATCH_SIZE:
@@ -689,21 +665,9 @@ struct ConnectFourEnv[DTYPE: DType = DType.float64](
         OBS_DIM: Int,
         NUM_ACTIONS: Int,
     ](
-        states: LayoutTensor[
-            board_dtype,
-            Layout.row_major(BATCH_SIZE, STATE_SIZE),
-            ImmutAnyOrigin,
-        ],
-        obs: LayoutTensor[
-            board_dtype,
-            Layout.row_major(BATCH_SIZE, OBS_DIM),
-            MutAnyOrigin,
-        ],
-        legal_masks: LayoutTensor[
-            board_dtype,
-            Layout.row_major(BATCH_SIZE, NUM_ACTIONS),
-            MutAnyOrigin,
-        ],
+        states: ImmTile[board_dtype, BATCH_SIZE, STATE_SIZE],
+        obs: Tile[board_dtype, BATCH_SIZE, OBS_DIM],
+        legal_masks: Tile[board_dtype, BATCH_SIZE, NUM_ACTIONS],
     ):
         var i = Int(block_dim.x * block_idx.x + thread_idx.x)
         if i >= BATCH_SIZE:
@@ -767,59 +731,25 @@ struct ConnectFourEnv[DTYPE: DType = DType.float64](
         rng_seed: UInt64 = 0,
         rng_counter_ptr: Optional[Pointer[Scalar[DType.uint64], MutAnyOrigin]] = None,
     ) raises:
-        var states = LayoutTensor[
-            board_dtype, Layout.row_major(BATCH_SIZE, STATE_SIZE)
-        ](states_buf)
-        var actions = LayoutTensor[
-            board_dtype, Layout.row_major(BATCH_SIZE)
-        ](actions_buf)
-        var rewards = LayoutTensor[
-            board_dtype, Layout.row_major(BATCH_SIZE)
-        ](rewards_buf)
-        var dones = LayoutTensor[
-            board_dtype, Layout.row_major(BATCH_SIZE)
-        ](dones_buf)
-        var terminated_out = LayoutTensor[
-            board_dtype, Layout.row_major(BATCH_SIZE)
-        ](terminated_buf)
-        var obs = LayoutTensor[
-            board_dtype, Layout.row_major(BATCH_SIZE, OBS_DIM)
-        ](obs_buf)
-        var legal_masks = LayoutTensor[
-            board_dtype, Layout.row_major(BATCH_SIZE, 7)
-        ](legal_masks_buf)
+        var states = tile[BATCH_SIZE, STATE_SIZE](states_buf)
+        var actions = tile[BATCH_SIZE](actions_buf)
+        var rewards = tile[BATCH_SIZE](rewards_buf)
+        var dones = tile[BATCH_SIZE](dones_buf)
+        var terminated_out = tile[BATCH_SIZE](terminated_buf)
+        var obs = tile[BATCH_SIZE, OBS_DIM](obs_buf)
+        var legal_masks = tile[BATCH_SIZE, 7](legal_masks_buf)
 
         comptime BLOCKS = (BATCH_SIZE + Self.TPB - 1) // Self.TPB
 
         @always_inline
         def step_wrapper(
-            states: LayoutTensor[
-                board_dtype,
-                Layout.row_major(BATCH_SIZE, STATE_SIZE),
-                MutAnyOrigin,
-            ],
-            actions: LayoutTensor[
-                board_dtype, Layout.row_major(BATCH_SIZE), ImmutAnyOrigin
-            ],
-            rewards: LayoutTensor[
-                board_dtype, Layout.row_major(BATCH_SIZE), MutAnyOrigin
-            ],
-            dones: LayoutTensor[
-                board_dtype, Layout.row_major(BATCH_SIZE), MutAnyOrigin
-            ],
-            terminated_out: LayoutTensor[
-                board_dtype, Layout.row_major(BATCH_SIZE), MutAnyOrigin
-            ],
-            obs: LayoutTensor[
-                board_dtype,
-                Layout.row_major(BATCH_SIZE, OBS_DIM),
-                MutAnyOrigin,
-            ],
-            legal_masks: LayoutTensor[
-                board_dtype,
-                Layout.row_major(BATCH_SIZE, 7),
-                MutAnyOrigin,
-            ],
+            states: Tile[board_dtype, BATCH_SIZE, STATE_SIZE],
+            actions: ImmTile[board_dtype, BATCH_SIZE],
+            rewards: Tile[board_dtype, BATCH_SIZE],
+            dones: Tile[board_dtype, BATCH_SIZE],
+            terminated_out: Tile[board_dtype, BATCH_SIZE],
+            obs: Tile[board_dtype, BATCH_SIZE, OBS_DIM],
+            legal_masks: Tile[board_dtype, BATCH_SIZE, 7],
         ):
             ConnectFourEnv.step_kernel[BATCH_SIZE, STATE_SIZE](
                 states, actions, rewards, dones
@@ -828,15 +758,7 @@ struct ConnectFourEnv[DTYPE: DType = DType.float64](
             if idx < BATCH_SIZE:
                 terminated_out[idx] = dones[idx]
 
-            var states_read = LayoutTensor[
-                board_dtype,
-                Layout.row_major(BATCH_SIZE, STATE_SIZE),
-                ImmutAnyOrigin,
-            ](
-                rebind[Pointer[Scalar[board_dtype], ImmutAnyOrigin]](
-                    states.ptr
-                )
-            )
+            var states_read = tile[BATCH_SIZE, STATE_SIZE](rebind[Pointer[Scalar[board_dtype], ImmutAnyOrigin]]( states.ptr ))
             ConnectFourEnv.extract_obs_and_masks[
                 BATCH_SIZE, STATE_SIZE, OBS_DIM, 7
             ](states_read, obs, legal_masks)
@@ -862,18 +784,12 @@ struct ConnectFourEnv[DTYPE: DType = DType.float64](
         mut states_buf: DeviceBuffer[board_dtype],
         rng_seed: UInt64 = 0,
     ) raises:
-        var states = LayoutTensor[
-            board_dtype, Layout.row_major(BATCH_SIZE, STATE_SIZE)
-        ](states_buf)
+        var states = tile[BATCH_SIZE, STATE_SIZE](states_buf)
         comptime BLOCKS = (BATCH_SIZE + Self.TPB - 1) // Self.TPB
 
         @always_inline
         def reset_wrapper(
-            states: LayoutTensor[
-                board_dtype,
-                Layout.row_major(BATCH_SIZE, STATE_SIZE),
-                MutAnyOrigin,
-            ],
+            states: Tile[board_dtype, BATCH_SIZE, STATE_SIZE],
         ):
             ConnectFourEnv.reset_kernel[BATCH_SIZE, STATE_SIZE](states)
 
@@ -894,24 +810,14 @@ struct ConnectFourEnv[DTYPE: DType = DType.float64](
         rng_seed: UInt64,
         rng_counter_ptr: Optional[Pointer[Scalar[DType.uint64], MutAnyOrigin]] = None,
     ) raises:
-        var states = LayoutTensor[
-            board_dtype, Layout.row_major(BATCH_SIZE, STATE_SIZE)
-        ](states_buf)
-        var dones = LayoutTensor[
-            board_dtype, Layout.row_major(BATCH_SIZE)
-        ](dones_buf)
+        var states = tile[BATCH_SIZE, STATE_SIZE](states_buf)
+        var dones = tile[BATCH_SIZE](dones_buf)
         comptime BLOCKS = (BATCH_SIZE + Self.TPB - 1) // Self.TPB
 
         @always_inline
         def sel_reset_wrapper(
-            states: LayoutTensor[
-                board_dtype,
-                Layout.row_major(BATCH_SIZE, STATE_SIZE),
-                MutAnyOrigin,
-            ],
-            dones: LayoutTensor[
-                board_dtype, Layout.row_major(BATCH_SIZE), MutAnyOrigin
-            ],
+            states: Tile[board_dtype, BATCH_SIZE, STATE_SIZE],
+            dones: Tile[board_dtype, BATCH_SIZE],
         ):
             ConnectFourEnv.selective_reset_kernel[BATCH_SIZE, STATE_SIZE](
                 states, dones
@@ -935,35 +841,16 @@ struct ConnectFourEnv[DTYPE: DType = DType.float64](
         mut obs_buf: DeviceBuffer[board_dtype],
         mut legal_masks_buf: DeviceBuffer[board_dtype],
     ) raises:
-        var states = LayoutTensor[
-            board_dtype,
-            Layout.row_major(BATCH_SIZE, STATE_SIZE),
-        ](states_buf)
-        var obs = LayoutTensor[
-            board_dtype, Layout.row_major(BATCH_SIZE, OBS_DIM)
-        ](obs_buf)
-        var legal_masks = LayoutTensor[
-            board_dtype, Layout.row_major(BATCH_SIZE, 7)
-        ](legal_masks_buf)
+        var states = tile[BATCH_SIZE, STATE_SIZE](states_buf)
+        var obs = tile[BATCH_SIZE, OBS_DIM](obs_buf)
+        var legal_masks = tile[BATCH_SIZE, 7](legal_masks_buf)
         comptime BLOCKS = (BATCH_SIZE + Self.TPB - 1) // Self.TPB
 
         @always_inline
         def extract_wrapper(
-            states: LayoutTensor[
-                board_dtype,
-                Layout.row_major(BATCH_SIZE, STATE_SIZE),
-                ImmutAnyOrigin,
-            ],
-            obs: LayoutTensor[
-                board_dtype,
-                Layout.row_major(BATCH_SIZE, OBS_DIM),
-                MutAnyOrigin,
-            ],
-            legal_masks: LayoutTensor[
-                board_dtype,
-                Layout.row_major(BATCH_SIZE, 7),
-                MutAnyOrigin,
-            ],
+            states: ImmTile[board_dtype, BATCH_SIZE, STATE_SIZE],
+            obs: Tile[board_dtype, BATCH_SIZE, OBS_DIM],
+            legal_masks: Tile[board_dtype, BATCH_SIZE, 7],
         ):
             ConnectFourEnv.extract_obs_and_masks[
                 BATCH_SIZE, STATE_SIZE, OBS_DIM, 7

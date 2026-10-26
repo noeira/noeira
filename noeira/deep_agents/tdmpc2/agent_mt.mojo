@@ -32,7 +32,6 @@ from noeira.nn.core.param import walk_params, ParamVisitorRef
 from std.math import tanh
 from std.random import random_float64
 from std.time import perf_counter_ns
-from layout import Layout, LayoutTensor
 from max.gpu.host import DeviceContext, DeviceBuffer
 
 from noeira.nn.constants import DT, TPB
@@ -44,7 +43,7 @@ from noeira.nn.primitives.rsample import RSample
 from noeira.nn.core.checkpoint import (
     BinaryCheckpointWriter, BinaryCheckpointReader, CheckpointReader,
     CheckpointScalars, write_model, read_model, _split_lines, _is_v3_header,
-    _read_file_bytes, _write_file_bytes,
+    _read_file_bytes,
 )
 
 from noeira.deep_agents.data.sequence_replay import SequenceReplay
@@ -74,6 +73,7 @@ from .wm_step_mt import WMStepMT
 from .policy_step_mt import PolicyStepMT
 from .td_target_step_mt import TDTargetStepMT
 from .task_embedding import TaskEmbedding
+from noeira.core.tiles import tile
 
 
 @fieldwise_init
@@ -578,12 +578,10 @@ struct TDMPC2MultiTaskAgent[
             TensorRefs[1](self.mpc_ob), self.mpc_z0, Optional(ctx)
         )
 
-        var out_lt = LayoutTensor[DT, Layout.row_major(1 * A), MutAnyOrigin](
-            self.mpc_out.value()
-        )
+        var out_lt = tile[1 * A](self.mpc_out.value())
         self.planner.value().plan_gpu[Self.MpcCB](
             ctx, self.mpc_cb.value(),
-            self.mpc_z0.lt["gpu", Layout.row_major(1, LAT)](),
+            self.mpc_z0.tt["gpu", 1, LAT](),
             out_lt,
             gamma=Float64(self.gamma),
             temperature=Float64(self.temperature),
@@ -737,7 +735,7 @@ struct TDMPC2MultiTaskAgent[
         bias-correction powers, the running Q scale (`pi_scale`) and the step
         counter. Atomic and chunked. Network optimizer moments NOT persisted."""
         comptime tg = Self.target
-        var w = BinaryCheckpointWriter(save_moments=False)
+        var w = BinaryCheckpointWriter.to_file(path, save_moments=False)
         write_model[tg](w, self.encoder, self.ctx, "encoder")
         write_model[tg](w, self.dynamics, self.ctx, "dynamics")
         write_model[tg](w, self.reward, self.ctx, "reward")
@@ -758,7 +756,7 @@ struct TDMPC2MultiTaskAgent[
         sc.set("pi_scale", Float64(self.pol_step.scale.value))
         sc.set_int("step_count", self.step_count)
         w.write_scalars(sc)
-        _write_file_bytes(path, w.content)
+        w.commit()
 
     def load_state(mut self, path: String) raises:
         """Inverse of `save_state`. Legacy v2 text files (the task table as a
@@ -1207,17 +1205,13 @@ struct TDMPC2MultiTaskAgent[
                 ](
                     self.encoder, self.act_ob, self.act_ein, self.act_z,
                     self.act_tem,
-                    LayoutTensor[
-                        DT, Layout.row_major(EVAL_ENVS, MO), MutAnyOrigin
-                    ](env.obs_ptr()),
+                    tile[EVAL_ENVS, MO](env.obs_ptr()),
                     ctx,
                 )
                 ev_planner.value().plan_gpu[EvCB](
                     ctx.value(), ev_cb.value(),
-                    self.act_z.lt["gpu", Layout.row_major(EVAL_ENVS, LAT)](),
-                    LayoutTensor[
-                        DT, Layout.row_major(EVAL_ENVS * A), MutAnyOrigin
-                    ](env.action_ptr()),
+                    self.act_z.tt["gpu", EVAL_ENVS, LAT](),
+                    tile[EVAL_ENVS * A](env.action_ptr()),
                     gamma=Float64(self.gamma),
                     temperature=Float64(self.temperature),
                     action_scale=Float64(self.action_scale),
@@ -1227,10 +1221,8 @@ struct TDMPC2MultiTaskAgent[
                 ctx.value().enqueue_function[
                     mt_apply_mask_kernel[EVAL_ENVS, A]
                 ](
-                    LayoutTensor[
-                        DT, Layout.row_major(EVAL_ENVS, A), MutAnyOrigin
-                    ](env.action_ptr()),
-                    self.act_mask.lt["gpu", Layout.row_major(A)](),
+                    tile[EVAL_ENVS, A](env.action_ptr()),
+                    self.act_mask.tt["gpu", A](),
                     grid_dim=(EVAL_ENVS * A + TPB - 1) // TPB,
                     block_dim=TPB,
                 )
@@ -1242,12 +1234,8 @@ struct TDMPC2MultiTaskAgent[
                     self.encoder, self.policy, self.act_rsample,
                     self.act_ob, self.act_ein, self.act_z, self.act_pin,
                     self.act_pio, self.act_alp, self.act_tem, self.act_mask,
-                    LayoutTensor[
-                        DT, Layout.row_major(EVAL_ENVS, MO), MutAnyOrigin
-                    ](env.obs_ptr()),
-                    LayoutTensor[
-                        DT, Layout.row_major(EVAL_ENVS, A), MutAnyOrigin
-                    ](env.action_ptr()),
+                    tile[EVAL_ENVS, MO](env.obs_ptr()),
+                    tile[EVAL_ENVS, A](env.action_ptr()),
                     self.action_scale, False, ctx,
                 )
             env.step_batch[EVAL_ENVS](
@@ -1416,9 +1404,7 @@ struct TDMPC2MultiTaskAgent[
             var step = it * N_ENVS
             var gstep = base_step + step
 
-            var act_lt = LayoutTensor[
-                DT, Layout.row_major(N_ENVS, A), MutAnyOrigin
-            ](env.action_ptr())
+            var act_lt = tile[N_ENVS, A](env.action_ptr())
 
             # ── 1. actions ───────────────────────────────────────────────
             # ⚠ Gate on the REPLAY COUNT, not the per-call step counter:
@@ -1447,17 +1433,13 @@ struct TDMPC2MultiTaskAgent[
                     ](
                         self.encoder, self.act_ob, self.act_ein, self.act_z,
                         self.act_tem,
-                        LayoutTensor[
-                            DT, Layout.row_major(N_ENVS, MO), MutAnyOrigin
-                        ](env.obs_ptr()),
+                        tile[N_ENVS, MO](env.obs_ptr()),
                         ctx,
                     )
                     tr_planner.value().plan_gpu[TrCB](
                         ctx.value(), tr_cb.value(),
-                        self.act_z.lt["gpu", Layout.row_major(N_ENVS, LAT)](),
-                        LayoutTensor[
-                            DT, Layout.row_major(N_ENVS * A), MutAnyOrigin
-                        ](env.action_ptr()),
+                        self.act_z.tt["gpu", N_ENVS, LAT](),
+                        tile[N_ENVS * A](env.action_ptr()),
                         gamma=Float64(self.gamma),
                         temperature=Float64(self.temperature),
                         action_scale=Float64(self.action_scale),
@@ -1468,7 +1450,7 @@ struct TDMPC2MultiTaskAgent[
                         mt_apply_mask_kernel[N_ENVS, A]
                     ](
                         act_lt,
-                        self.act_mask.lt["gpu", Layout.row_major(A)](),
+                        self.act_mask.tt["gpu", A](),
                         grid_dim=(N_ENVS * A + TPB - 1) // TPB,
                         block_dim=TPB,
                     )
@@ -1481,9 +1463,7 @@ struct TDMPC2MultiTaskAgent[
                         self.act_ob, self.act_ein, self.act_z, self.act_pin,
                         self.act_pio, self.act_alp, self.act_tem,
                         self.act_mask,
-                        LayoutTensor[
-                            DT, Layout.row_major(N_ENVS, MO), MutAnyOrigin
-                        ](env.obs_ptr()),
+                        tile[N_ENVS, MO](env.obs_ptr()),
                         act_lt,
                         self.action_scale, True, ctx,
                     )

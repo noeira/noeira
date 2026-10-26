@@ -539,6 +539,11 @@ def main() raises:
         # Inference only from here: the towers' attention fused (see
         # `SmolVLAPolicy.set_fused_vision_attention`) unless asked not to.
         pol.set_fused_vision_attention(fused_vision)
+        # Nothing trains here: every gradient buffer goes back (half of the
+        # "3.2 GB host+device" above). The host copies return to the OS; the
+        # device ones to MAX's pool, for this process to reuse.
+        var n_frozen = pol.freeze_all[TARGET](dev_ctx)
+        print("             " + String(n_frozen) + " values frozen")
         pol_opt = pol^
 
     # ── the safety boxes, from the SAME stats file ────────────────────────

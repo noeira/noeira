@@ -21,10 +21,14 @@
 # prop_stats.txt,log.csv} for the laptop's offline gates
 # (`lewm_so101_real_check -D SO101_WM_PROPRIO=1`).
 # STAGES picks stages (default "build record render train"); EPOCHS (8).
+# DR_PER (launch): `episode` renders each episode under ONE look instead of a
+# redraw every 32 rows (plan §3c step 1: the in-episode redraws were most of
+# v1's copy error); `launch` is how S0 was rendered.
 set -u
 D=${D:-/workspace/so101_v2}
 STAGES=${STAGES:-build record render train}
 EPOCHS=${EPOCHS:-8}
+DR_PER=${DR_PER:-launch}
 cd "$(dirname "$0")/../.."
 REPO=$(pwd)
 mkdir -p "$D" build
@@ -76,12 +80,12 @@ if want record; then
 fi
 
 if want render; then
-  say "render"
+  say "render, dr per $DR_PER"
   for n in n10 n20 n00; do
     s=$([ $n = n10 ] && echo 11 || ([ $n = n20 ] && echo 22 || echo 33))
     build/rerender --demos "$D/teacher_$n.demo" --all-episodes --episodes 100000 \
-      --out "$D/teacher_$n.rendered.h5" --dr room --dr-seed $s --joint-zero follower \
-      --resize 112 > "$D/render_$n.log" 2>&1 &
+      --out "$D/teacher_$n.rendered.h5" --dr room --dr-seed $s --dr-per "$DR_PER" \
+      --joint-zero follower --resize 112 > "$D/render_$n.log" 2>&1 &
   done
   wait
   for n in n10 n20 n00; do

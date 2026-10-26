@@ -19,7 +19,8 @@ without breaking CUDA-graph capture. CPU always uses the host `multiplier`.
 
 from max.gpu import global_idx
 from max.gpu.host import DeviceContext, DeviceBuffer
-from layout import Layout, LayoutTensor, TileTensor, row_major
+from layout import TileTensor, row_major
+from noeira.core.tiles import RowMajor, Tile, ImmTile, tile
 
 from noeira.nn.constants import DT, TPB, CPU_SIMD_W
 from ..core.tensor import Tensor
@@ -34,8 +35,8 @@ from ..core.amp import AMPPolicy, NoAMP
 def _scale_kernel[
     N: Int,
 ](
-    input: LayoutTensor[DT, Layout.row_major(N), MutAnyOrigin],
-    output: LayoutTensor[DT, Layout.row_major(N), MutAnyOrigin],
+    input: Tile[DT, N],
+    output: Tile[DT, N],
     multiplier: Scalar[DT],
 ):
     var idx = Int(global_idx.x)
@@ -46,9 +47,9 @@ def _scale_kernel[
 def _scale_dev_kernel[
     N: Int,
 ](
-    input: LayoutTensor[DT, Layout.row_major(N), MutAnyOrigin],
-    output: LayoutTensor[DT, Layout.row_major(N), MutAnyOrigin],
-    multiplier: LayoutTensor[DT, Layout.row_major(1), ImmutAnyOrigin],
+    input: Tile[DT, N],
+    output: Tile[DT, N],
+    multiplier: ImmTile[DT, 1],
 ):
     # Device-resident multiplier variant — reads the scale factor from
     # `mptr[0]` instead of a baked scalar arg, so the value can be updated by
@@ -130,20 +131,18 @@ struct Scale[DIM_: Int](Module):
             out.ensure_gpu(c, N)
             comptime n_blocks = (N + TPB - 1) // TPB
             if self.multiplier_buf:
-                var mptr = LayoutTensor[
-                    DT, Layout.row_major(1), ImmutAnyOrigin
-                ](self.multiplier_buf.value())
+                var mptr = tile[1](self.multiplier_buf.value())
                 c.enqueue_function[_scale_dev_kernel[N]](
-                    in0.lt["gpu", Layout.row_major(N)](),
-                    out.lt["gpu", Layout.row_major(N)](),
+                    in0.tt["gpu", N](),
+                    out.tt["gpu", N](),
                     mptr,
                     grid_dim=n_blocks,
                     block_dim=TPB,
                 )
             else:
                 c.enqueue_function[_scale_kernel[N]](
-                    in0.lt["gpu", Layout.row_major(N)](),
-                    out.lt["gpu", Layout.row_major(N)](),
+                    in0.tt["gpu", N](),
+                    out.tt["gpu", N](),
                     self.multiplier,
                     grid_dim=n_blocks,
                     block_dim=TPB,
@@ -181,20 +180,18 @@ struct Scale[DIM_: Int](Module):
             gin.ensure_gpu(c, N)
             comptime n_blocks = (N + TPB - 1) // TPB
             if self.multiplier_buf:
-                var mptr = LayoutTensor[
-                    DT, Layout.row_major(1), ImmutAnyOrigin
-                ](self.multiplier_buf.value())
+                var mptr = tile[1](self.multiplier_buf.value())
                 c.enqueue_function[_scale_dev_kernel[N]](
-                    grad_output.lt["gpu", Layout.row_major(N)](),
-                    gin.lt["gpu", Layout.row_major(N)](),
+                    grad_output.tt["gpu", N](),
+                    gin.tt["gpu", N](),
                     mptr,
                     grid_dim=n_blocks,
                     block_dim=TPB,
                 )
             else:
                 c.enqueue_function[_scale_kernel[N]](
-                    grad_output.lt["gpu", Layout.row_major(N)](),
-                    gin.lt["gpu", Layout.row_major(N)](),
+                    grad_output.tt["gpu", N](),
+                    gin.tt["gpu", N](),
                     self.multiplier,
                     grid_dim=n_blocks,
                     block_dim=TPB,

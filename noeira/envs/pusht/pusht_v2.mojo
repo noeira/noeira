@@ -20,7 +20,6 @@ to populate it from CPU shape definitions.
 """
 
 from std.math import cos, sin, sqrt, pi
-from layout import Layout, LayoutTensor
 from max.gpu import thread_idx, block_idx, block_dim
 from max.gpu.host import DeviceContext, DeviceBuffer
 from std.random.philox import Random as PhiloxRandom
@@ -59,6 +58,7 @@ from .geometry import (
     t_origin_from_body,
 )
 from .physics import pusht_substep_single_env
+from noeira.core.tiles import Tile, ImmTile, tile
 
 
 # =============================================================================
@@ -97,9 +97,7 @@ def _compute_t_inertia_g() -> Scalar[dtype]:
 def _seed_env_state_gpu[
     BATCH_SIZE: Int, STATE_SIZE: Int
 ](
-    state: LayoutTensor[
-        dtype, Layout.row_major(BATCH_SIZE, STATE_SIZE), MutAnyOrigin
-    ],
+    state: Tile[dtype, BATCH_SIZE, STATE_SIZE],
     env: Int,
     agent_x: Scalar[dtype],
     agent_y: Scalar[dtype],
@@ -135,9 +133,7 @@ def _seed_env_state_gpu[
 def _write_obs_to_state_only[
     BATCH_SIZE: Int, STATE_SIZE: Int
 ](
-    state: LayoutTensor[
-        dtype, Layout.row_major(BATCH_SIZE, STATE_SIZE), MutAnyOrigin
-    ],
+    state: Tile[dtype, BATCH_SIZE, STATE_SIZE],
     env: Int,
 ):
     """Compute keypoints + agent_pos and store in state's OBS slot only.
@@ -169,12 +165,8 @@ def _write_obs_to_state_only[
 def _write_obs_single_env[
     BATCH_SIZE: Int, STATE_SIZE: Int, OBS_DIM: Int
 ](
-    state: LayoutTensor[
-        dtype, Layout.row_major(BATCH_SIZE, STATE_SIZE), MutAnyOrigin
-    ],
-    obs: LayoutTensor[
-        dtype, Layout.row_major(BATCH_SIZE, OBS_DIM), MutAnyOrigin
-    ],
+    state: Tile[dtype, BATCH_SIZE, STATE_SIZE],
+    obs: Tile[dtype, BATCH_SIZE, OBS_DIM],
     env: Int,
 ):
     """Compute keypoints + agent_pos and write to both the state's obs slot
@@ -300,42 +292,20 @@ struct PushTV2[DTYPE: DType](
     @always_inline
     def _state_view(
         mut self,
-    ) -> LayoutTensor[
-        dtype, Layout.row_major(1, PushTLayout.STATE_SIZE), MutAnyOrigin
-    ]:
-        return LayoutTensor[
-            dtype,
-            Layout.row_major(1, PushTLayout.STATE_SIZE),
-        ](Span(self.state_data))
+    ) -> Tile[dtype, 1, PushTLayout.STATE_SIZE]:
+        return tile[1, PushTLayout.STATE_SIZE](Span(self.state_data))
 
     @always_inline
     def _shapes_view(
         mut self,
-    ) -> LayoutTensor[
-        dtype,
-        Layout.row_major(PushTShapeBuf.NUM_SHAPES, SHAPE_MAX_SIZE),
-        MutAnyOrigin,
-    ]:
-        return LayoutTensor[
-            dtype,
-            Layout.row_major(PushTShapeBuf.NUM_SHAPES, SHAPE_MAX_SIZE),
-            MutAnyOrigin,
-        ](self.shapes_data.unsafe_ptr().unsafe_bitcast[Scalar[dtype]]().as_unsafe_any_origin())
+    ) -> Tile[dtype, PushTShapeBuf.NUM_SHAPES, SHAPE_MAX_SIZE]:
+        return tile[PushTShapeBuf.NUM_SHAPES, SHAPE_MAX_SIZE](self.shapes_data.unsafe_ptr().unsafe_bitcast[Scalar[dtype]]().as_unsafe_any_origin())
 
     @always_inline
     def _contacts_view(
         mut self,
-    ) -> LayoutTensor[
-        dtype,
-        Layout.row_major(1, PushTLayout.MAX_CONTACTS, CONTACT_DATA_SIZE),
-        MutAnyOrigin,
-    ]:
-        return LayoutTensor[
-            dtype,
-            Layout.row_major(
-                1, PushTLayout.MAX_CONTACTS, CONTACT_DATA_SIZE
-            ),
-        ](Span(self.contacts_data))
+    ) -> Tile[dtype, 1, PushTLayout.MAX_CONTACTS, CONTACT_DATA_SIZE]:
+        return tile[1, PushTLayout.MAX_CONTACTS, CONTACT_DATA_SIZE](Span(self.contacts_data))
 
     def _cpu_reset(mut self):
         var rng = PhiloxRandom(seed=self.rng_seed, offset=self.rng_counter)
@@ -353,9 +323,7 @@ struct PushTV2[DTYPE: DType](
         var ba = (Scalar[dtype](r[0]) * Scalar[dtype](2.0) - Scalar[dtype](1.0)) * pi_s
         var s = self._state_view()
         _seed_env_state_gpu[1, PushTLayout.STATE_SIZE](s, 0, ax, ay, bx, by, ba)
-        var obs_view = LayoutTensor[
-            dtype, Layout.row_major(1, PConstants.OBS_DIM)
-        ](Span(self.state_data))  # OBS at offset 0
+        var obs_view = tile[1, PConstants.OBS_DIM](Span(self.state_data))  # OBS at offset 0
         _write_obs_single_env[1, PushTLayout.STATE_SIZE, PConstants.OBS_DIM](
             s, obs_view, 0
         )
@@ -451,9 +419,7 @@ struct PushTV2[DTYPE: DType](
             ](1.0)
 
         # Refresh obs slot (so get_state sees up-to-date keypoints)
-        var obs_view = LayoutTensor[
-            dtype, Layout.row_major(1, PConstants.OBS_DIM)
-        ](Span(self.state_data))
+        var obs_view = tile[1, PConstants.OBS_DIM](Span(self.state_data))
         _write_obs_single_env[1, PushTLayout.STATE_SIZE, PConstants.OBS_DIM](
             s, obs_view, 0
         )
@@ -566,16 +532,12 @@ struct PushTV2[DTYPE: DType](
         mut states: DeviceBuffer[dtype],
         rng_seed: UInt64 = 0,
     ) raises:
-        var states_tensor = LayoutTensor[
-            dtype, Layout.row_major(BATCH_SIZE, STATE_SIZE)
-        ](states)
+        var states_tensor = tile[BATCH_SIZE, STATE_SIZE](states)
         comptime BLOCKS = (BATCH_SIZE + TPB - 1) // TPB
 
         @always_inline
         def reset_wrapper(
-            st: LayoutTensor[
-                dtype, Layout.row_major(BATCH_SIZE, STATE_SIZE), MutAnyOrigin
-            ],
+            st: Tile[dtype, BATCH_SIZE, STATE_SIZE],
             seed: Scalar[DType.uint64],
         ):
             var env = Int(block_dim.x * block_idx.x + thread_idx.x)
@@ -607,22 +569,14 @@ struct PushTV2[DTYPE: DType](
             Pointer[Scalar[DType.uint64], MutAnyOrigin]
         ] = None,
     ) raises:
-        var states_tensor = LayoutTensor[
-            dtype, Layout.row_major(BATCH_SIZE, STATE_SIZE)
-        ](states)
-        var dones_tensor = LayoutTensor[
-            dtype, Layout.row_major(BATCH_SIZE)
-        ](dones)
+        var states_tensor = tile[BATCH_SIZE, STATE_SIZE](states)
+        var dones_tensor = tile[BATCH_SIZE](dones)
         comptime BLOCKS = (BATCH_SIZE + TPB - 1) // TPB
 
         @always_inline
         def selreset_wrapper(
-            st: LayoutTensor[
-                dtype, Layout.row_major(BATCH_SIZE, STATE_SIZE), MutAnyOrigin
-            ],
-            dn: LayoutTensor[
-                dtype, Layout.row_major(BATCH_SIZE), MutAnyOrigin
-            ],
+            st: Tile[dtype, BATCH_SIZE, STATE_SIZE],
+            dn: Tile[dtype, BATCH_SIZE],
             seed: Scalar[DType.uint64],
         ):
             var env = Int(block_dim.x * block_idx.x + thread_idx.x)
@@ -650,22 +604,14 @@ struct PushTV2[DTYPE: DType](
         states: DeviceBuffer[dtype],
         mut obs: DeviceBuffer[dtype],
     ) raises:
-        var st_t = LayoutTensor[
-            dtype, Layout.row_major(BATCH_SIZE, STATE_SIZE)
-        ](states)
-        var ob_t = LayoutTensor[
-            dtype, Layout.row_major(BATCH_SIZE, OBS_DIM)
-        ](obs)
+        var st_t = tile[BATCH_SIZE, STATE_SIZE](states)
+        var ob_t = tile[BATCH_SIZE, OBS_DIM](obs)
         comptime BLOCKS = (BATCH_SIZE + TPB - 1) // TPB
 
         @always_inline
         def extract(
-            st: LayoutTensor[
-                dtype, Layout.row_major(BATCH_SIZE, STATE_SIZE), ImmutAnyOrigin
-            ],
-            ob: LayoutTensor[
-                dtype, Layout.row_major(BATCH_SIZE, OBS_DIM), MutAnyOrigin
-            ],
+            st: ImmTile[dtype, BATCH_SIZE, STATE_SIZE],
+            ob: Tile[dtype, BATCH_SIZE, OBS_DIM],
         ):
             var env = Int(block_dim.x * block_idx.x + thread_idx.x)
             if env >= BATCH_SIZE:
@@ -737,63 +683,25 @@ struct PushTV2[DTYPE: DType](
                 "PushTV2.step_kernel_gpu requires workspace_ptr (shape buffer)"
             )
 
-        var states_tensor = LayoutTensor[
-            dtype, Layout.row_major(BATCH_SIZE, STATE_SIZE)
-        ](states)
-        var actions_tensor = LayoutTensor[
-            dtype, Layout.row_major(BATCH_SIZE, ACTION_DIM)
-        ](actions)
-        var rewards_tensor = LayoutTensor[
-            dtype, Layout.row_major(BATCH_SIZE)
-        ](rewards)
-        var dones_tensor = LayoutTensor[
-            dtype, Layout.row_major(BATCH_SIZE)
-        ](dones)
-        var terminated_tensor = LayoutTensor[
-            dtype, Layout.row_major(BATCH_SIZE)
-        ](terminated)
-        var obs_tensor = LayoutTensor[
-            dtype, Layout.row_major(BATCH_SIZE, OBS_DIM)
-        ](obs)
-        var shapes_tensor = LayoutTensor[
-            dtype,
-            Layout.row_major(PushTShapeBuf.NUM_SHAPES, SHAPE_MAX_SIZE),
-            MutAnyOrigin,
-        ](workspace_ptr.value())
+        var states_tensor = tile[BATCH_SIZE, STATE_SIZE](states)
+        var actions_tensor = tile[BATCH_SIZE, ACTION_DIM](actions)
+        var rewards_tensor = tile[BATCH_SIZE](rewards)
+        var dones_tensor = tile[BATCH_SIZE](dones)
+        var terminated_tensor = tile[BATCH_SIZE](terminated)
+        var obs_tensor = tile[BATCH_SIZE, OBS_DIM](obs)
+        var shapes_tensor = tile[PushTShapeBuf.NUM_SHAPES, SHAPE_MAX_SIZE](workspace_ptr.value())
 
         comptime BLOCKS = (BATCH_SIZE + TPB - 1) // TPB
 
         @always_inline
         def step_wrapper(
-            st: LayoutTensor[
-                dtype,
-                Layout.row_major(BATCH_SIZE, STATE_SIZE),
-                MutAnyOrigin,
-            ],
-            ac: LayoutTensor[
-                dtype,
-                Layout.row_major(BATCH_SIZE, ACTION_DIM),
-                ImmutAnyOrigin,
-            ],
-            rw: LayoutTensor[
-                dtype, Layout.row_major(BATCH_SIZE), MutAnyOrigin
-            ],
-            dn: LayoutTensor[
-                dtype, Layout.row_major(BATCH_SIZE), MutAnyOrigin
-            ],
-            tm: LayoutTensor[
-                dtype, Layout.row_major(BATCH_SIZE), MutAnyOrigin
-            ],
-            ob: LayoutTensor[
-                dtype, Layout.row_major(BATCH_SIZE, OBS_DIM), MutAnyOrigin
-            ],
-            sh: LayoutTensor[
-                dtype,
-                Layout.row_major(
-                    PushTShapeBuf.NUM_SHAPES, SHAPE_MAX_SIZE
-                ),
-                MutAnyOrigin,
-            ],
+            st: Tile[dtype, BATCH_SIZE, STATE_SIZE],
+            ac: ImmTile[dtype, BATCH_SIZE, ACTION_DIM],
+            rw: Tile[dtype, BATCH_SIZE],
+            dn: Tile[dtype, BATCH_SIZE],
+            tm: Tile[dtype, BATCH_SIZE],
+            ob: Tile[dtype, BATCH_SIZE, OBS_DIM],
+            sh: Tile[dtype, PushTShapeBuf.NUM_SHAPES, SHAPE_MAX_SIZE],
         ):
             var env = Int(block_dim.x * block_idx.x + thread_idx.x)
             if env >= BATCH_SIZE:
@@ -823,9 +731,7 @@ struct PushTV2[DTYPE: DType](
     def _reset_env_gpu[
         BATCH_SIZE: Int, STATE_SIZE: Int,
     ](
-        state: LayoutTensor[
-            dtype, Layout.row_major(BATCH_SIZE, STATE_SIZE), MutAnyOrigin
-        ],
+        state: Tile[dtype, BATCH_SIZE, STATE_SIZE],
         env: Int,
         seed: UInt64,
     ):
@@ -854,29 +760,13 @@ struct PushTV2[DTYPE: DType](
     def _step_env_gpu[
         BATCH_SIZE: Int, STATE_SIZE: Int, OBS_DIM: Int, ACTION_DIM: Int,
     ](
-        state: LayoutTensor[
-            dtype, Layout.row_major(BATCH_SIZE, STATE_SIZE), MutAnyOrigin
-        ],
-        actions: LayoutTensor[
-            dtype, Layout.row_major(BATCH_SIZE, ACTION_DIM), ImmutAnyOrigin
-        ],
-        rewards: LayoutTensor[
-            dtype, Layout.row_major(BATCH_SIZE), MutAnyOrigin
-        ],
-        dones: LayoutTensor[
-            dtype, Layout.row_major(BATCH_SIZE), MutAnyOrigin
-        ],
-        terminated: LayoutTensor[
-            dtype, Layout.row_major(BATCH_SIZE), MutAnyOrigin
-        ],
-        obs: LayoutTensor[
-            dtype, Layout.row_major(BATCH_SIZE, OBS_DIM), MutAnyOrigin
-        ],
-        shapes: LayoutTensor[
-            dtype,
-            Layout.row_major(PushTShapeBuf.NUM_SHAPES, SHAPE_MAX_SIZE),
-            MutAnyOrigin,
-        ],
+        state: Tile[dtype, BATCH_SIZE, STATE_SIZE],
+        actions: ImmTile[dtype, BATCH_SIZE, ACTION_DIM],
+        rewards: Tile[dtype, BATCH_SIZE],
+        dones: Tile[dtype, BATCH_SIZE],
+        terminated: Tile[dtype, BATCH_SIZE],
+        obs: Tile[dtype, BATCH_SIZE, OBS_DIM],
+        shapes: Tile[dtype, PushTShapeBuf.NUM_SHAPES, SHAPE_MAX_SIZE],
         env: Int,
     ):
         # Action: clamp to [0, 512]
@@ -910,11 +800,7 @@ struct PushTV2[DTYPE: DType](
         var contacts_local = Array[
             Scalar[dtype], PushTLayout.MAX_CONTACTS * CONTACT_DATA_SIZE
         ](fill=Scalar[dtype](0.0))
-        var contacts_view = LayoutTensor[
-            dtype,
-            Layout.row_major(1, PushTLayout.MAX_CONTACTS, CONTACT_DATA_SIZE),
-            MutAnyOrigin,
-        ](contacts_local.unsafe_ptr().as_unsafe_any_origin())
+        var contacts_view = tile[1, PushTLayout.MAX_CONTACTS, CONTACT_DATA_SIZE](contacts_local.unsafe_ptr().as_unsafe_any_origin())
         # Local 1-element state view aliased at this env's slot is NOT trivial
         # — the substep helper expects BATCH (here BATCH_SIZE) and indexes
         # with `env`, which is fine. So we can just pass the full state tensor
@@ -933,9 +819,7 @@ struct PushTV2[DTYPE: DType](
         # and contacts with 1-batch, but the helper expects a single BATCH.
         # Workaround: rebuild the per-env physics inline here using a fresh
         # 1-batch state view aliased at this env's row.
-        var state_one = LayoutTensor[
-            dtype, Layout.row_major(1, STATE_SIZE), MutAnyOrigin
-        ](state.ptr.unsafe_offset(env * STATE_SIZE))
+        var state_one = tile[1, STATE_SIZE](state.ptr.unsafe_offset(env * STATE_SIZE))
 
         for _ in range(PConstants.N_SUBSTEPS):
             pusht_substep_single_env[

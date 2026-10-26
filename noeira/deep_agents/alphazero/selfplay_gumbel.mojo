@@ -21,7 +21,6 @@ driver does on the host by design).
 
 from noeira.nn.core.param import walk_params
 from max.gpu.host import DeviceContext, DeviceBuffer
-from layout import Layout, LayoutTensor
 
 from noeira.nn.constants import DT
 from noeira.nn.core.module import Module
@@ -38,6 +37,7 @@ from noeira.planners.tree_search import GumbelGPUMCTS, SelfPlay
 from .loss_ops import AZLossOp
 from ..zero.mcts_adapters import AZPredGPU, AZEnvGPU
 from ..zero.gpu_example_replay import GpuMCTSExampleReplay
+from noeira.core.tiles import tile
 
 
 def run_alphazero_gumbel_selfplay[
@@ -127,7 +127,7 @@ def run_alphazero_gumbel_selfplay[
         net.set_attr["training"](Scalar[DT](0.0))
         var pred = AZPredGPU[OBS, ACT, NET].make(net)
         var env_ad = AZEnvGPU[ENV, STATE, OBS, ACT]()
-        var root_obs = LayoutTensor[DT, Layout.row_major(N_ENVS, OBS)](obs_dev)
+        var root_obs = tile[N_ENVS, OBS](obs_dev)
         mcts.search_gpu_alphazero[type_of(pred), type_of(env_ad)](
             ctx,
             pred,

@@ -21,7 +21,8 @@ from std.random import random_float64
 from max.gpu import global_idx, thread_idx, block_idx
 from max.gpu.host import DeviceContext
 from max.gpu.primitives import block
-from layout import Layout, LayoutTensor, TileTensor, row_major
+from layout import TileTensor, row_major
+from noeira.core.tiles import RowMajor, Tile
 from linalg.matmul import matmul as max_matmul
 from noeira.nn.core.splitk_gemm import (
     splitk_path_applies,
@@ -80,7 +81,7 @@ def _sample_factorized_noise(mut buf: List[Scalar[DT]], n: Int):
 # ── GPU kernels (verbatim from legacy; args MutAnyOrigin = GPU ABI) ─────
 def _apply_f_noise_kernel[
     N: Int
-](noise: LayoutTensor[DT, Layout.row_major(N), MutAnyOrigin]):
+](noise: Tile[DT, N]):
     var idx = Int(global_idx.x)
     if idx < N:
         var x = rebind[Scalar[DT]](noise[idx])
@@ -92,7 +93,7 @@ def _apply_f_noise_kernel[
 
 def _scale_inplace_kernel[
     N: Int
-](buf: LayoutTensor[DT, Layout.row_major(N), MutAnyOrigin], s: Scalar[DT]):
+](buf: Tile[DT, N], s: Scalar[DT]):
     var idx = Int(global_idx.x)
     if idx < N:
         buf[idx] = rebind[Scalar[DT]](buf[idx]) * s
@@ -101,11 +102,11 @@ def _scale_inplace_kernel[
 def _materialize_w_eff_kernel[
     IN: Int, OUT: Int
 ](
-    mu_w: LayoutTensor[DT, Layout.row_major(IN, OUT), MutAnyOrigin],
-    sigma_w: LayoutTensor[DT, Layout.row_major(IN, OUT), MutAnyOrigin],
-    n_in: LayoutTensor[DT, Layout.row_major(IN), MutAnyOrigin],
-    n_out: LayoutTensor[DT, Layout.row_major(OUT), MutAnyOrigin],
-    w_eff: LayoutTensor[DT, Layout.row_major(IN, OUT), MutAnyOrigin],
+    mu_w: Tile[DT, IN, OUT],
+    sigma_w: Tile[DT, IN, OUT],
+    n_in: Tile[DT, IN],
+    n_out: Tile[DT, OUT],
+    w_eff: Tile[DT, IN, OUT],
 ):
     var idx = Int(global_idx.x)
     if idx < IN * OUT:
@@ -119,10 +120,10 @@ def _materialize_w_eff_kernel[
 def _materialize_b_eff_kernel[
     OUT: Int
 ](
-    mu_b: LayoutTensor[DT, Layout.row_major(OUT), MutAnyOrigin],
-    sigma_b: LayoutTensor[DT, Layout.row_major(OUT), MutAnyOrigin],
-    n_out: LayoutTensor[DT, Layout.row_major(OUT), MutAnyOrigin],
-    b_eff: LayoutTensor[DT, Layout.row_major(OUT), MutAnyOrigin],
+    mu_b: Tile[DT, OUT],
+    sigma_b: Tile[DT, OUT],
+    n_out: Tile[DT, OUT],
+    b_eff: Tile[DT, OUT],
 ):
     var j = Int(global_idx.x)
     if j < OUT:
@@ -134,8 +135,8 @@ def _materialize_b_eff_kernel[
 def _noisy_bias_add_kernel[
     BATCH: Int, OUT: Int
 ](
-    output: LayoutTensor[DT, Layout.row_major(BATCH, OUT), MutAnyOrigin],
-    b_eff: LayoutTensor[DT, Layout.row_major(OUT), MutAnyOrigin],
+    output: Tile[DT, BATCH, OUT],
+    b_eff: Tile[DT, OUT],
 ):
     var idx = Int(global_idx.x)
     if idx < BATCH * OUT:
@@ -149,10 +150,10 @@ def _noisy_bias_add_kernel[
 def _grad_b_pair_reduce_kernel[
     BATCH: Int, OUT: Int
 ](
-    grad_output: LayoutTensor[DT, Layout.row_major(BATCH, OUT), MutAnyOrigin],
-    n_out: LayoutTensor[DT, Layout.row_major(OUT), MutAnyOrigin],
-    grad_mu_b: LayoutTensor[DT, Layout.row_major(OUT), MutAnyOrigin],
-    grad_sigma_b: LayoutTensor[DT, Layout.row_major(OUT), MutAnyOrigin],
+    grad_output: Tile[DT, BATCH, OUT],
+    n_out: Tile[DT, OUT],
+    grad_mu_b: Tile[DT, OUT],
+    grad_sigma_b: Tile[DT, OUT],
 ):
     var col = Int(block_idx.x)
     var t = Int(thread_idx.x)
@@ -175,10 +176,10 @@ def _grad_b_pair_reduce_kernel[
 def _scaled_accum_factorized_kernel[
     IN: Int, OUT: Int
 ](
-    dst: LayoutTensor[DT, Layout.row_major(IN, OUT), MutAnyOrigin],
-    src: LayoutTensor[DT, Layout.row_major(IN, OUT), MutAnyOrigin],
-    n_in: LayoutTensor[DT, Layout.row_major(IN), MutAnyOrigin],
-    n_out: LayoutTensor[DT, Layout.row_major(OUT), MutAnyOrigin],
+    dst: Tile[DT, IN, OUT],
+    src: Tile[DT, IN, OUT],
+    n_in: Tile[DT, IN],
+    n_out: Tile[DT, OUT],
 ):
     var idx = Int(global_idx.x)
     if idx < IN * OUT:
@@ -343,42 +344,42 @@ struct NoisyLinear[IN_: Int, OUT_: Int](Module):
         else:
             var c = ctx.value()
             out.ensure_gpu(c, B * Self.OUT_)
-            comptime lin = Layout.row_major(Self.IN_)
-            comptime lout = Layout.row_major(Self.OUT_)
-            comptime lw = Layout.row_major(Self.IN_, Self.OUT_)
-            comptime loff = Layout.row_major(1)
+            comptime lin = RowMajor[Self.IN_]
+            comptime lout = RowMajor[Self.OUT_]
+            comptime lw = RowMajor[Self.IN_, Self.OUT_]
+            comptime loff = RowMajor[1]
             # 1. Philox box-muller into ε_in / ε_out via the shared LT kernel
             #    (no raw ptr — lt_gpu views + the uint64 offset Tensor's lt_gpu).
             comptime nb_in = (Self.IN_ + TPB - 1) // TPB
             comptime nb_out = (Self.OUT_ + TPB - 1) // TPB
             c.enqueue_function[_box_muller_kernel_dev[Self.IN_]](
-                self.noise_in.lt["gpu", lin](),
+                self.noise_in.tt["gpu", Self.IN_](),
                 self.noise_seed,
-                self.noise_offset.lt["gpu", loff](),
+                self.noise_offset.tt["gpu", 1](),
                 grid_dim=nb_in,
                 block_dim=TPB,
             )
             c.enqueue_function[
                 advance_rng_offset_kernel[((Self.IN_ + 1) // 2) * 2]
-            ](self.noise_offset.lt["gpu", loff](), grid_dim=1, block_dim=1)
+            ](self.noise_offset.tt["gpu", 1](), grid_dim=1, block_dim=1)
             c.enqueue_function[_box_muller_kernel_dev[Self.OUT_]](
-                self.noise_out.lt["gpu", lout](),
+                self.noise_out.tt["gpu", Self.OUT_](),
                 self.noise_seed,
-                self.noise_offset.lt["gpu", loff](),
+                self.noise_offset.tt["gpu", 1](),
                 grid_dim=nb_out,
                 block_dim=TPB,
             )
             c.enqueue_function[
                 advance_rng_offset_kernel[((Self.OUT_ + 1) // 2) * 2]
-            ](self.noise_offset.lt["gpu", loff](), grid_dim=1, block_dim=1)
+            ](self.noise_offset.tt["gpu", 1](), grid_dim=1, block_dim=1)
             c.enqueue_function[_apply_f_noise_kernel[Self.IN_]](
-                self.noise_in.lt["gpu", lin](), grid_dim=nb_in, block_dim=TPB
+                self.noise_in.tt["gpu", Self.IN_](), grid_dim=nb_in, block_dim=TPB
             )
             c.enqueue_function[_apply_f_noise_kernel[Self.OUT_]](
-                self.noise_out.lt["gpu", lout](), grid_dim=nb_out, block_dim=TPB
+                self.noise_out.tt["gpu", Self.OUT_](), grid_dim=nb_out, block_dim=TPB
             )
             c.enqueue_function[_scale_inplace_kernel[Self.OUT_]](
-                self.noise_out.lt["gpu", lout](),
+                self.noise_out.tt["gpu", Self.OUT_](),
                 self.noise_scale,
                 grid_dim=nb_out,
                 block_dim=TPB,
@@ -386,19 +387,19 @@ struct NoisyLinear[IN_: Int, OUT_: Int](Module):
             # 2. materialize W_eff, b_eff.
             comptime nb_w = (Self.W_SIZE + TPB - 1) // TPB
             c.enqueue_function[_materialize_w_eff_kernel[Self.IN_, Self.OUT_]](
-                self.mu_w.val.lt["gpu", lw](),
-                self.sigma_w.val.lt["gpu", lw](),
-                self.noise_in.lt["gpu", lin](),
-                self.noise_out.lt["gpu", lout](),
-                self.w_eff.lt["gpu", lw](),
+                self.mu_w.val.tt["gpu", Self.IN_, Self.OUT_](),
+                self.sigma_w.val.tt["gpu", Self.IN_, Self.OUT_](),
+                self.noise_in.tt["gpu", Self.IN_](),
+                self.noise_out.tt["gpu", Self.OUT_](),
+                self.w_eff.tt["gpu", Self.IN_, Self.OUT_](),
                 grid_dim=nb_w,
                 block_dim=TPB,
             )
             c.enqueue_function[_materialize_b_eff_kernel[Self.OUT_]](
-                self.mu_b.val.lt["gpu", lout](),
-                self.sigma_b.val.lt["gpu", lout](),
-                self.noise_out.lt["gpu", lout](),
-                self.b_eff.lt["gpu", lout](),
+                self.mu_b.val.tt["gpu", Self.OUT_](),
+                self.sigma_b.val.tt["gpu", Self.OUT_](),
+                self.noise_out.tt["gpu", Self.OUT_](),
+                self.b_eff.tt["gpu", Self.OUT_](),
                 grid_dim=nb_out,
                 block_dim=TPB,
             )
@@ -408,8 +409,8 @@ struct NoisyLinear[IN_: Int, OUT_: Int](Module):
             )
             comptime nb_ba = (B * Self.OUT_ + TPB - 1) // TPB
             c.enqueue_function[_noisy_bias_add_kernel[B, Self.OUT_]](
-                out.lt["gpu", Layout.row_major(B, Self.OUT_)](),
-                self.b_eff.lt["gpu", lout](),
+                out.tt["gpu", B, Self.OUT_](),
+                self.b_eff.tt["gpu", Self.OUT_](),
                 grid_dim=nb_ba,
                 block_dim=TPB,
             )
@@ -479,16 +480,16 @@ struct NoisyLinear[IN_: Int, OUT_: Int](Module):
             var c = ctx.value()
             gin.ensure_gpu(c, B * Self.IN_)
             self.cacheT.ensure_gpu(c, B * Self.IN_)
-            comptime lin = Layout.row_major(Self.IN_)
-            comptime lout = Layout.row_major(Self.OUT_)
-            comptime lw = Layout.row_major(Self.W_SIZE)
-            comptime lw2 = Layout.row_major(Self.IN_, Self.OUT_)
+            comptime lin = RowMajor[Self.IN_]
+            comptime lout = RowMajor[Self.OUT_]
+            comptime lw = RowMajor[Self.W_SIZE]
+            comptime lw2 = RowMajor[Self.IN_, Self.OUT_]
             # grad_b pair.
             c.enqueue_function[_grad_b_pair_reduce_kernel[B, Self.OUT_]](
-                grad_output.lt["gpu", Layout.row_major(B, Self.OUT_)](),
-                self.noise_out.lt["gpu", lout](),
-                self.mu_b.grd.lt["gpu", lout](),
-                self.sigma_b.grd.lt["gpu", lout](),
+                grad_output.tt["gpu", B, Self.OUT_](),
+                self.noise_out.tt["gpu", Self.OUT_](),
+                self.mu_b.grd.tt["gpu", Self.OUT_](),
+                self.sigma_b.grd.tt["gpu", Self.OUT_](),
                 grid_dim=Self.OUT_,
                 block_dim=TPB,
             )
@@ -541,10 +542,10 @@ struct NoisyLinear[IN_: Int, OUT_: Int](Module):
             c.enqueue_function[
                 _scaled_accum_factorized_kernel[Self.IN_, Self.OUT_]
             ](
-                self.sigma_w.grd.lt["gpu", lw2](),
-                self.dW_tmp.lt["gpu", lw2](),
-                self.noise_in.lt["gpu", lin](),
-                self.noise_out.lt["gpu", lout](),
+                self.sigma_w.grd.tt["gpu", Self.IN_, Self.OUT_](),
+                self.dW_tmp.tt["gpu", Self.IN_, Self.OUT_](),
+                self.noise_in.tt["gpu", Self.IN_](),
+                self.noise_out.tt["gpu", Self.OUT_](),
                 grid_dim=nb_w,
                 block_dim=TPB,
             )

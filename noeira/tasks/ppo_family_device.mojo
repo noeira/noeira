@@ -35,7 +35,6 @@ sync per `sync_every` steps); the diverged / smoothing / dive counters are
 per-lane device sums read at log cadence (`read_window_stats`).
 """
 
-from layout import Layout, LayoutTensor
 from max.gpu import global_idx
 from max.gpu.host import DeviceBuffer, DeviceContext, HostBuffer
 from std.math import exp as fexp, log as flog, sqrt as fsqrt, cos as fcos
@@ -55,10 +54,11 @@ from noeira.physics3d.gpu.constants import METADATA_SIZE, META_IDX_GOAL_HELD
 from noeira.tasks.delta_action import (
     DELTA_ACT, LAG_MAX_DELAY, ServoLag, ACT_HIST, TARGET_OBS,
 )
+from noeira.core.tiles import Tile, tile
 
 
 comptime ACT = DELTA_ACT
-comptime _V[n: Int] = LayoutTensor[DT, Layout.row_major(n), MutAnyOrigin]
+comptime _V[n: Int] = Tile[DT, n]
 comptime _Ptr = Pointer[Scalar[DT], MutAnyOrigin]
 
 # ServoLag's configuration, packed for the device (`_lag_cfg`).
@@ -857,9 +857,9 @@ struct FamilyDeviceRollout[N_: Int, E_OBS_: Int](Movable):
         for s in range(self._pending):
             var p = self._ring_bufs[s].unsafe_ptr()
             for e in range(Self.N):
-                if p[e * 3 + _EP_DONE] > Scalar[DT](0.5):
-                    hist_succ.append(p[e * 3 + _EP_SUCC] > Scalar[DT](0.5))
-                    hist_ret.append(Float64(p[e * 3 + _EP_RET]))
+                if p[unsafe_offset=e * 3 + _EP_DONE] > Scalar[DT](0.5):
+                    hist_succ.append(p[unsafe_offset=e * 3 + _EP_SUCC] > Scalar[DT](0.5))
+                    hist_ret.append(Float64(p[unsafe_offset=e * 3 + _EP_RET]))
                     n_episodes += 1
         self._pending = 0
 
@@ -873,11 +873,11 @@ struct FamilyDeviceRollout[N_: Int, E_OBS_: Int](Movable):
         self.ctx.enqueue_function[
             augment_k[N, Self.E_OBS, Self.W, Self.T, ACT]
         ](
-            _V[N * Self.E_OBS](raw_ptr),
-            self.hist.lt["gpu", Layout.row_major(N * Self.W + 1)](),
-            self.tprev.lt["gpu", Layout.row_major(N * ACT)](),
-            self.qa.lt["gpu", Layout.row_major(ACT)](),
-            self.aug.lt["gpu", Layout.row_major(N * Self.OBS)](),
+            tile[N * Self.E_OBS](raw_ptr),
+            self.hist.tt["gpu", N * Self.W + 1](),
+            self.tprev.tt["gpu", N * ACT](),
+            self.qa.tt["gpu", ACT](),
+            self.aug.tt["gpu", N * Self.OBS](),
             grid_dim=Self._g(N), block_dim=TPB,
         )
 
@@ -886,24 +886,24 @@ struct FamilyDeviceRollout[N_: Int, E_OBS_: Int](Movable):
     ) raises:
         comptime N = Self.N
         self.ctx.enqueue_function[_reset_k[N, Self.E_OBS, Self.W]](
-            _V[N * Self.E_OBS](raw_ptr),
-            self.qa.lt["gpu", Layout.row_major(ACT)](),
-            _V[N](done_ptr),
+            tile[N * Self.E_OBS](raw_ptr),
+            self.qa.tt["gpu", ACT](),
+            tile[N](done_ptr),
             Int32(1) if all_lanes else Int32(0),
-            self.arm_q.lt["gpu", Layout.row_major(N * ACT)](),
-            self.tprev.lt["gpu", Layout.row_major(N * ACT)](),
-            self.hist.lt["gpu", Layout.row_major(N * Self.W + 1)](),
-            self.has_prev.lt["gpu", Layout.row_major(N)](),
-            self.dmac.lt["gpu", Layout.row_major(N)](),
-            self.diverged.lt["gpu", Layout.row_major(N)](),
-            self.rsum.lt["gpu", Layout.row_major(N)](),
-            self.lag_cfg.lt["gpu", Layout.row_major(_L_SIZE)](),
-            self.alpha.lt["gpu", Layout.row_major(N * ACT)](),
-            self.delay.lt["gpu", Layout.row_major(N * ACT)](),
-            self.y.lt["gpu", Layout.row_major(N * ACT)](),
-            self.ring.lt["gpu", Layout.row_major(N * LAG_MAX_DELAY * ACT)](),
-            self.vcap.lt["gpu", Layout.row_major(N * ACT)](),
-            self.off.lt["gpu", Layout.row_major(N * ACT)](),
+            self.arm_q.tt["gpu", N * ACT](),
+            self.tprev.tt["gpu", N * ACT](),
+            self.hist.tt["gpu", N * Self.W + 1](),
+            self.has_prev.tt["gpu", N](),
+            self.dmac.tt["gpu", N](),
+            self.diverged.tt["gpu", N](),
+            self.rsum.tt["gpu", N](),
+            self.lag_cfg.tt["gpu", _L_SIZE](),
+            self.alpha.tt["gpu", N * ACT](),
+            self.delay.tt["gpu", N * ACT](),
+            self.y.tt["gpu", N * ACT](),
+            self.ring.tt["gpu", N * LAG_MAX_DELAY * ACT](),
+            self.vcap.tt["gpu", N * ACT](),
+            self.off.tt["gpu", N * ACT](),
             self.seed ^ UInt64(0x5E2F0),
             UInt64(self.it),
             grid_dim=Self._g(N), block_dim=TPB,
@@ -948,7 +948,7 @@ struct FamilyDeviceRollout[N_: Int, E_OBS_: Int](Movable):
         )
         if cfg.exec_noise > 0.0:
             c.enqueue_function[_exec_noise_k[N]](
-                self.act.lt["gpu", Layout.row_major(N * ACT)](),
+                self.act.tt["gpu", N * ACT](),
                 Scalar[DT](cfg.exec_noise),
                 self.seed ^ UInt64(0xE7EC),
                 UInt64(self.it),
@@ -956,22 +956,22 @@ struct FamilyDeviceRollout[N_: Int, E_OBS_: Int](Movable):
             )
         if cfg.smooth_w > 0.0:
             c.enqueue_function[_smooth_k[N]](
-                self.act.lt["gpu", Layout.row_major(N * ACT)](),
-                self.a_prev.lt["gpu", Layout.row_major(N * ACT)](),
-                self.has_prev.lt["gpu", Layout.row_major(N)](),
-                self.spen.lt["gpu", Layout.row_major(N)](),
-                self.stats.lt["gpu", Layout.row_major(N * _S_SIZE)](),
+                self.act.tt["gpu", N * ACT](),
+                self.a_prev.tt["gpu", N * ACT](),
+                self.has_prev.tt["gpu", N](),
+                self.spen.tt["gpu", N](),
+                self.stats.tt["gpu", N * _S_SIZE](),
                 Scalar[DT](cfg.smooth_w),
                 grid_dim=Self._g(N), block_dim=TPB,
             )
         if stepped:
             c.enqueue_function[_targets_k[N]](
-                self.act.lt["gpu", Layout.row_major(N * ACT)](),
-                self.arm_q.lt["gpu", Layout.row_major(N * ACT)](),
-                self.tg.lt["gpu", Layout.row_major(N * ACT)](),
-                self.tprev.lt["gpu", Layout.row_major(N * ACT)](),
-                self.a_lo.lt["gpu", Layout.row_major(ACT)](),
-                self.a_hi.lt["gpu", Layout.row_major(ACT)](),
+                self.act.tt["gpu", N * ACT](),
+                self.arm_q.tt["gpu", N * ACT](),
+                self.tg.tt["gpu", N * ACT](),
+                self.tprev.tt["gpu", N * ACT](),
+                self.a_lo.tt["gpu", ACT](),
+                self.a_hi.tt["gpu", ACT](),
                 Int32(cfg.mode),
                 Scalar[DT](cfg.d_arm),
                 Scalar[DT](cfg.d_grip),
@@ -980,27 +980,27 @@ struct FamilyDeviceRollout[N_: Int, E_OBS_: Int](Movable):
             )
         comptime if Self.W > 0:
             c.enqueue_function[_hist_push_k[N, Self.W]](
-                self.hist.lt["gpu", Layout.row_major(N * Self.W)](),
-                self.act.lt["gpu", Layout.row_major(N * ACT)](),
+                self.hist.tt["gpu", N * Self.W](),
+                self.act.tt["gpu", N * ACT](),
                 grid_dim=Self._g(N), block_dim=TPB,
             )
         # 2. the ticks under the held targets
         for t in range(cfg.repeat):
             c.enqueue_function[_to_env_k[N]](
-                self.tg.lt["gpu", Layout.row_major(N * ACT)](),
-                self.act.lt["gpu", Layout.row_major(N * ACT)](),
-                _V[N * ACT](env.action_ptr()),
-                self.a_lo.lt["gpu", Layout.row_major(ACT)](),
-                self.a_hi.lt["gpu", Layout.row_major(ACT)](),
+                self.tg.tt["gpu", N * ACT](),
+                self.act.tt["gpu", N * ACT](),
+                tile[N * ACT](env.action_ptr()),
+                self.a_lo.tt["gpu", ACT](),
+                self.a_hi.tt["gpu", ACT](),
                 Int32(1) if stepped else Int32(0),
                 Int32(self.tick),
-                self.lag_cfg.lt["gpu", Layout.row_major(_L_SIZE)](),
-                self.alpha.lt["gpu", Layout.row_major(N * ACT)](),
-                self.delay.lt["gpu", Layout.row_major(N * ACT)](),
-                self.y.lt["gpu", Layout.row_major(N * ACT)](),
-                self.ring.lt["gpu", Layout.row_major(N * LAG_MAX_DELAY * ACT)](),
-                self.vcap.lt["gpu", Layout.row_major(N * ACT)](),
-                self.off.lt["gpu", Layout.row_major(N * ACT)](),
+                self.lag_cfg.tt["gpu", _L_SIZE](),
+                self.alpha.tt["gpu", N * ACT](),
+                self.delay.tt["gpu", N * ACT](),
+                self.y.tt["gpu", N * ACT](),
+                self.ring.tt["gpu", N * LAG_MAX_DELAY * ACT](),
+                self.vcap.tt["gpu", N * ACT](),
+                self.off.tt["gpu", N * ACT](),
                 grid_dim=Self._g(N * ACT), block_dim=TPB,
             )
             if stepped:
@@ -1017,17 +1017,17 @@ struct FamilyDeviceRollout[N_: Int, E_OBS_: Int](Movable):
             else:
                 _env_step()
             c.enqueue_function[_tick_k[N, EO]](
-                _V[N * EO](env.obs_ptr()),
-                _V[N](env.reward_ptr()),
-                _V[N](env.done_ptr()),
-                _V[N * METADATA_SIZE](meta_ptr),
-                self.qa.lt["gpu", Layout.row_major(ACT)](),
-                self.dmac.lt["gpu", Layout.row_major(N)](),
-                self.diverged.lt["gpu", Layout.row_major(N)](),
-                self.rsum.lt["gpu", Layout.row_major(N)](),
-                self.succ.lt["gpu", Layout.row_major(N)](),
-                self.term.lt["gpu", Layout.row_major(N * EO)](),
-                self.stats.lt["gpu", Layout.row_major(N * _S_SIZE)](),
+                tile[N * EO](env.obs_ptr()),
+                tile[N](env.reward_ptr()),
+                tile[N](env.done_ptr()),
+                tile[N * METADATA_SIZE](meta_ptr),
+                self.qa.tt["gpu", ACT](),
+                self.dmac.tt["gpu", N](),
+                self.diverged.tt["gpu", N](),
+                self.rsum.tt["gpu", N](),
+                self.succ.tt["gpu", N](),
+                self.term.tt["gpu", N * EO](),
+                self.stats.tt["gpu", N * _S_SIZE](),
                 Scalar[DT](cfg.dive_w),
                 Scalar[DT](cfg.obs_bound),
                 Scalar[DT](cfg.rew_bound),
@@ -1035,15 +1035,15 @@ struct FamilyDeviceRollout[N_: Int, E_OBS_: Int](Movable):
             )
         # 3. the transition, the next observation's statistics
         c.enqueue_function[_post_k[N, EO]](
-            _V[N * EO](env.obs_ptr()),
-            self.term.lt["gpu", Layout.row_major(N * EO)](),
-            self.raw_post.lt["gpu", Layout.row_major(N * EO)](),
-            self.rsum.lt["gpu", Layout.row_major(N)](),
-            self.spen.lt["gpu", Layout.row_major(N)](),
-            self.dmac.lt["gpu", Layout.row_major(N)](),
-            self.rew_raw.lt["gpu", Layout.row_major(N)](),
-            self.done_out.lt["gpu", Layout.row_major(N)](),
-            _V[N](env.done_ptr()),
+            tile[N * EO](env.obs_ptr()),
+            self.term.tt["gpu", N * EO](),
+            self.raw_post.tt["gpu", N * EO](),
+            self.rsum.tt["gpu", N](),
+            self.spen.tt["gpu", N](),
+            self.dmac.tt["gpu", N](),
+            self.rew_raw.tt["gpu", N](),
+            self.done_out.tt["gpu", N](),
+            tile[N](env.done_ptr()),
             Scalar[DT](cfg.smooth_w),
             Int32(cfg.repeat),
             grid_dim=Self._g(N), block_dim=TPB,
@@ -1059,10 +1059,10 @@ struct FamilyDeviceRollout[N_: Int, E_OBS_: Int](Movable):
         )
         # 4. reward normalisation and the episode records
         c.enqueue_function[_ret_k[N]](
-            self.rew_raw.lt["gpu", Layout.row_major(N)](),
-            self.ret_acc.lt["gpu", Layout.row_major(N)](),
-            self.raw_ret.lt["gpu", Layout.row_major(N)](),
-            self.rets.lt["gpu", Layout.row_major(N)](),
+            self.rew_raw.tt["gpu", N](),
+            self.ret_acc.tt["gpu", N](),
+            self.raw_ret.tt["gpu", N](),
+            self.rets.tt["gpu", N](),
             Scalar[DT](cfg.gamma),
             grid_dim=Self._g(N), block_dim=TPB,
         )
@@ -1071,14 +1071,14 @@ struct FamilyDeviceRollout[N_: Int, E_OBS_: Int](Movable):
             self.ret_count, False,
         )
         c.enqueue_function[_rew_k[N]](
-            self.rew_raw.lt["gpu", Layout.row_major(N)](),
-            self.done_out.lt["gpu", Layout.row_major(N)](),
-            self.ret_var.lt["gpu", Layout.row_major(1)](),
-            self.rew_n.lt["gpu", Layout.row_major(N)](),
-            self.succ.lt["gpu", Layout.row_major(N)](),
-            self.raw_ret.lt["gpu", Layout.row_major(N)](),
-            self.ret_acc.lt["gpu", Layout.row_major(N)](),
-            self.ep.lt["gpu", Layout.row_major(N * 3)](),
+            self.rew_raw.tt["gpu", N](),
+            self.done_out.tt["gpu", N](),
+            self.ret_var.tt["gpu", 1](),
+            self.rew_n.tt["gpu", N](),
+            self.succ.tt["gpu", N](),
+            self.raw_ret.tt["gpu", N](),
+            self.ret_acc.tt["gpu", N](),
+            self.ep.tt["gpu", N * 3](),
             Scalar[DT](cfg.rew_clip),
             grid_dim=Self._g(N), block_dim=TPB,
         )

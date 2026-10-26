@@ -20,7 +20,8 @@ are carried over verbatim.
 
 from max.gpu import global_idx
 from max.gpu.host import DeviceContext
-from layout import Layout, LayoutTensor, TileTensor, row_major
+from layout import TileTensor, row_major
+from noeira.core.tiles import RowMajor, Tile
 
 from noeira.nn.constants import DT, TPB
 from ..core.tensor import Tensor
@@ -34,12 +35,12 @@ from ..core.amp import AMPPolicy, NoAMP
 def _modulate_forward_kernel[
     BATCH: Int, DIM: Int,
 ](
-    x: LayoutTensor[DT, Layout.row_major(BATCH, DIM), MutAnyOrigin],
-    scale: LayoutTensor[DT, Layout.row_major(BATCH, DIM), MutAnyOrigin],
-    shift: LayoutTensor[DT, Layout.row_major(BATCH, DIM), MutAnyOrigin],
-    output: LayoutTensor[DT, Layout.row_major(BATCH, DIM), MutAnyOrigin],
-    cache_x: LayoutTensor[DT, Layout.row_major(BATCH, DIM), MutAnyOrigin],
-    cache_scale: LayoutTensor[DT, Layout.row_major(BATCH, DIM), MutAnyOrigin],
+    x: Tile[DT, BATCH, DIM],
+    scale: Tile[DT, BATCH, DIM],
+    shift: Tile[DT, BATCH, DIM],
+    output: Tile[DT, BATCH, DIM],
+    cache_x: Tile[DT, BATCH, DIM],
+    cache_scale: Tile[DT, BATCH, DIM],
 ):
     var idx = Int(global_idx.x)
     if idx >= BATCH * DIM:
@@ -57,12 +58,12 @@ def _modulate_forward_kernel[
 def _modulate_backward_kernel[
     BATCH: Int, DIM: Int,
 ](
-    grad_output: LayoutTensor[DT, Layout.row_major(BATCH, DIM), MutAnyOrigin],
-    cache_x: LayoutTensor[DT, Layout.row_major(BATCH, DIM), MutAnyOrigin],
-    cache_scale: LayoutTensor[DT, Layout.row_major(BATCH, DIM), MutAnyOrigin],
-    grad_x: LayoutTensor[DT, Layout.row_major(BATCH, DIM), MutAnyOrigin],
-    grad_scale: LayoutTensor[DT, Layout.row_major(BATCH, DIM), MutAnyOrigin],
-    grad_shift: LayoutTensor[DT, Layout.row_major(BATCH, DIM), MutAnyOrigin],
+    grad_output: Tile[DT, BATCH, DIM],
+    cache_x: Tile[DT, BATCH, DIM],
+    cache_scale: Tile[DT, BATCH, DIM],
+    grad_x: Tile[DT, BATCH, DIM],
+    grad_scale: Tile[DT, BATCH, DIM],
+    grad_shift: Tile[DT, BATCH, DIM],
 ):
     var idx = Int(global_idx.x)
     if idx >= BATCH * DIM:
@@ -130,15 +131,15 @@ struct Modulate[DIM_: Int](Module):
             out.ensure_gpu(c, B * Self.DIM_)
             self.cache_x.ensure_gpu(c, B * Self.DIM_)
             self.cache_scale.ensure_gpu(c, B * Self.DIM_)
-            comptime lay = Layout.row_major(B, Self.DIM_)
+            comptime lay = RowMajor[B, Self.DIM_]
             comptime n_blocks = (B * Self.DIM_ + TPB - 1) // TPB
             c.enqueue_function[_modulate_forward_kernel[B, Self.DIM_]](
-                x.lt["gpu", lay](),
-                scale.lt["gpu", lay](),
-                shift.lt["gpu", lay](),
-                out.lt["gpu", lay](),
-                self.cache_x.lt["gpu", lay](),
-                self.cache_scale.lt["gpu", lay](),
+                x.tt["gpu", B, Self.DIM_](),
+                scale.tt["gpu", B, Self.DIM_](),
+                shift.tt["gpu", B, Self.DIM_](),
+                out.tt["gpu", B, Self.DIM_](),
+                self.cache_x.tt["gpu", B, Self.DIM_](),
+                self.cache_scale.tt["gpu", B, Self.DIM_](),
                 grid_dim=n_blocks,
                 block_dim=TPB,
             )
@@ -180,15 +181,15 @@ struct Modulate[DIM_: Int](Module):
             gx.ensure_gpu(c, B * Self.DIM_)
             gs.ensure_gpu(c, B * Self.DIM_)
             gsh.ensure_gpu(c, B * Self.DIM_)
-            comptime lay = Layout.row_major(B, Self.DIM_)
+            comptime lay = RowMajor[B, Self.DIM_]
             comptime n_blocks = (B * Self.DIM_ + TPB - 1) // TPB
             c.enqueue_function[_modulate_backward_kernel[B, Self.DIM_]](
-                grad_output.lt["gpu", lay](),
-                self.cache_x.lt["gpu", lay](),
-                self.cache_scale.lt["gpu", lay](),
-                gx.lt["gpu", lay](),
-                gs.lt["gpu", lay](),
-                gsh.lt["gpu", lay](),
+                grad_output.tt["gpu", B, Self.DIM_](),
+                self.cache_x.tt["gpu", B, Self.DIM_](),
+                self.cache_scale.tt["gpu", B, Self.DIM_](),
+                gx.tt["gpu", B, Self.DIM_](),
+                gs.tt["gpu", B, Self.DIM_](),
+                gsh.tt["gpu", B, Self.DIM_](),
                 grid_dim=n_blocks,
                 block_dim=TPB,
             )

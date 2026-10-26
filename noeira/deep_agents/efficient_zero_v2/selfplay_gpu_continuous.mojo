@@ -22,7 +22,6 @@ round-trip trivial. Returns the last loss.
 """
 
 from std.memory import alloc
-from layout import Layout, LayoutTensor
 from noeira.nn.core.tensor import Tensor
 from noeira.nn.core.tensor_refs import TensorRefs
 from noeira.nn.core.call import call_forward, call_vjp
@@ -42,6 +41,7 @@ from .unroll_scratch import EZV2UnrollContScratch
 from ..zero.mcts_adapters_mz import MZRepGPU, MZDynGPU, MZContPredGPU
 from ..zero.sequence_replay_mcts_continuous import MCTSContSequenceReplay
 from ..zero.mz_diagnostics import append_value_diagnostics
+from noeira.core.tiles import tile
 
 
 def _a(n: Int) -> Pointer[Scalar[DT], MutAnyOrigin]:
@@ -207,8 +207,7 @@ def run_ezv2_sampled_selfplay_gpu[
         for j in range(OBS):
             h_obs[j] = Scalar[DT](cur_f[j])
         ctx.enqueue_copy(d_obs, h_obs.unsafe_ptr())
-        var obs_t = LayoutTensor[DT, Layout.row_major(N_ENVS, OBS),
-            MutAnyOrigin](d_obs.unsafe_ptr().as_unsafe_any_origin())
+        var obs_t = tile[N_ENVS, OBS](d_obs.unsafe_ptr().as_unsafe_any_origin())
         planner.search_gpu[
             type_of(rep_a),
             type_of(dyn_a),
@@ -307,9 +306,7 @@ def run_ezv2_sampled_selfplay_gpu[
                         var pos = rb.sample_position()
                         rb.read_obs(pos[0], pos[1], h_ra_obs)
                         ctx.enqueue_copy(d_obs, h_ra_obs.unsafe_ptr())
-                        var ra_obs_t = LayoutTensor[
-                            DT, Layout.row_major(N_ENVS, OBS), MutAnyOrigin
-                        ](d_obs.unsafe_ptr().as_unsafe_any_origin())
+                        var ra_obs_t = tile[N_ENVS, OBS](d_obs.unsafe_ptr().as_unsafe_any_origin())
                         planner.search_gpu[
                             type_of(rep_ta),
                             type_of(dyn_ta),
@@ -374,9 +371,7 @@ def run_ezv2_sampled_selfplay_gpu[
                     for j in range(OBS):
                         h_obs[j] = Scalar[DT](eo_f[j])
                     ctx.enqueue_copy(d_obs, h_obs.unsafe_ptr())
-                    var eobs_t = LayoutTensor[DT,
-                        Layout.row_major(N_ENVS, OBS), MutAnyOrigin](
-                            d_obs.unsafe_ptr().as_unsafe_any_origin())
+                    var eobs_t = tile[N_ENVS, OBS](d_obs.unsafe_ptr().as_unsafe_any_origin())
                     planner.search_gpu[
                         type_of(rep_a),
                         type_of(dyn_a),

@@ -47,7 +47,7 @@ Run with:
 from std.math import abs
 from std.python import Python, PythonObject
 from std.testing import assert_true, TestSuite
-from layout import Layout, LayoutTensor
+from noeira.core.tiles import RowMajor
 from max.gpu.host import DeviceContext
 
 from noeira.nn.core.tensor import TensorImpl
@@ -273,11 +273,11 @@ def test_apply_actions_gpu_matches_cpu() raises:
         act_c.append(Scalar[GT](0))
     M.apply_actions[GT](sf, d32, actions_c, act_c)
 
-    comptime L_QF = Layout.row_major(B, M.NV)
-    comptime L_AC = Layout.row_major(B, AD)
-    comptime L_QP = Layout.row_major(B, M.NQ)
-    comptime L_QV = Layout.row_major(B, M.NV)
-    comptime L_AT = Layout.row_major(B, M.NA_F)
+    comptime L_QF = RowMajor[B, M.NV]
+    comptime L_AC = RowMajor[B, AD]
+    comptime L_QP = RowMajor[B, M.NQ]
+    comptime L_QV = RowMajor[B, M.NV]
+    comptime L_AT = RowMajor[B, M.NA_F]
 
     var t_qfrc = TensorImpl[GT].alloc_gpu(ctx, B * M.NV)
     var t_act = TensorImpl[GT].alloc_gpu(ctx, B * AD)
@@ -312,32 +312,26 @@ def test_apply_actions_gpu_matches_cpu() raises:
     t_meta.upload(ctx)
     M.apply_actions_kernel_gpu[GT, B, AD](
         ctx,
-        t_qfrc.lt["gpu", L_QF](),
-        t_act.lt["gpu", L_AC](),
-        t_qpos.lt["gpu", L_QP](),
-        t_qvel.lt["gpu", L_QV](),
-        t_a.lt["gpu", L_AT](),
-        sfg.actuators.lt[
-            "gpu", Layout.row_major(M.NACT_F * MODEL_ACTUATOR_SIZE)
-        ](),
-        sfg.act_tendons.lt[
-            "gpu", Layout.row_major(M.NTEN_F * MODEL_ACT_TENDON_SIZE)
-        ](),
+        t_qfrc.tt["gpu", B, M.NV](),
+        t_act.tt["gpu", B, AD](),
+        t_qpos.tt["gpu", B, M.NQ](),
+        t_qvel.tt["gpu", B, M.NV](),
+        t_a.tt["gpu", B, M.NA_F](),
+        sfg.actuators.tt["gpu", M.NACT_F * MODEL_ACTUATOR_SIZE](),
+        sfg.act_tendons.tt["gpu", M.NTEN_F * MODEL_ACT_TENDON_SIZE](),
         # `jnt_actfrcrange` — MuJoCo's per-JOINT clamp on the accumulated
         # `qfrc_actuator`. This fixture declares none, so it is inert here;
         # it is passed because the kernel now requires it, and the model
         # that DOES exercise it is g1 in
         # `test_jnt_actfrcrange_vs_mujoco`.
-        sfg.joint_limits.lt[
-            "gpu", Layout.row_major(M.NJOINT * JLIM_SIZE)
-        ](),
+        sfg.joint_limits.tt["gpu", M.NJOINT * JLIM_SIZE](),
         # `dof_actdamp` + `actdamp_act` + `meta` — this step's actuator
         # damping, diagonal and per-actuator gate. Inert for this fixture (no
         # forcerange saturation); passed because the kernel requires them and
         # the CPU/GPU pair must not diverge.
-        t_actd.lt["gpu", Layout.row_major(B, M.NV)](),
-        t_aact.lt["gpu", Layout.row_major(B, M.NACT_F)](),
-        t_meta.lt["gpu", Layout.row_major(B, METADATA_SIZE)](),
+        t_actd.tt["gpu", B, M.NV](),
+        t_aact.tt["gpu", B, M.NACT_F](),
+        t_meta.tt["gpu", B, METADATA_SIZE](),
     )
     ctx.synchronize()
     t_qfrc.download(ctx)

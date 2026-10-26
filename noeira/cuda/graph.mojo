@@ -33,7 +33,7 @@ moment `CUDAGraph` is constructed — the library was only dlopened, its
 `g_mojo_stream` is NULL because it never saw a launch, and capture disables.
 """
 
-from std.sys import has_nvidia_gpu_accelerator
+from std.sys import default_accelerator
 from std.ffi import OwnedDLHandle, c_int
 from std.memory import alloc, dealloc
 from std.os import getenv
@@ -197,7 +197,7 @@ struct CUDAGraph(Movable):
         self._mojo_stream = _uninit[_CUptr]()
         self._replay_stream = _uninit[_CUptr]()
 
-        comptime if has_nvidia_gpu_accelerator():
+        comptime if default_accelerator().is_nvidia_gpu():
             ctx.synchronize()
             self._lib = OwnedDLHandle("./noeira/cuda/libcuda_intercept.so")
 
@@ -281,7 +281,7 @@ struct CUDAGraph(Movable):
 
     def begin_capture(mut self) raises:
         """Begin capturing GPU kernel launches. No-op on non-NVIDIA."""
-        comptime if not has_nvidia_gpu_accelerator():
+        comptime if not default_accelerator().is_nvidia_gpu():
             return
 
         # ⚠ CHECK STATE FIRST. On the DISABLED path `_mojo_stream` was never
@@ -327,7 +327,7 @@ struct CUDAGraph(Movable):
 
     def end_capture(mut self) raises:
         """End capture and instantiate the graph. No-op on non-NVIDIA."""
-        comptime if not has_nvidia_gpu_accelerator():
+        comptime if not default_accelerator().is_nvidia_gpu():
             return
 
         if self._state != 1:
@@ -397,7 +397,7 @@ struct CUDAGraph(Movable):
 
     def replay(self) raises:
         """Replay the captured graph (launch + sync). No-op on non-NVIDIA."""
-        comptime if not has_nvidia_gpu_accelerator():
+        comptime if not default_accelerator().is_nvidia_gpu():
             return
 
         if self._state != 2:
@@ -412,7 +412,7 @@ struct CUDAGraph(Movable):
     def replay_async(self) raises:
         """Replay without sync on replay stream. Call sync() later. No-op on non-NVIDIA.
         """
-        comptime if not has_nvidia_gpu_accelerator():
+        comptime if not default_accelerator().is_nvidia_gpu():
             return
 
         if self._state != 2:
@@ -433,7 +433,7 @@ struct CUDAGraph(Movable):
         No explicit sync needed between pre-graph and post-graph operations.
         No-op on non-NVIDIA.
         """
-        comptime if not has_nvidia_gpu_accelerator():
+        comptime if not default_accelerator().is_nvidia_gpu():
             return
 
         if self._state != 2:
@@ -444,7 +444,7 @@ struct CUDAGraph(Movable):
 
     def sync(self) raises:
         """Synchronize the replay stream. No-op on non-NVIDIA."""
-        comptime if not has_nvidia_gpu_accelerator():
+        comptime if not default_accelerator().is_nvidia_gpu():
             return
 
         var stream_sync = self._lib.get_function[c_int]("intercept_stream_synchronize")
@@ -457,13 +457,13 @@ struct CUDAGraph(Movable):
         must check this INSTEAD OF assuming capture is available; see the note
         in `__init__` for why this is the normal state under MAX 26.5.0rc2.
         """
-        comptime if not has_nvidia_gpu_accelerator():
+        comptime if not default_accelerator().is_nvidia_gpu():
             return False
         return self._state == 3
 
     def is_captured(self) -> Bool:
         """Whether a graph is ready for replay."""
-        comptime if not has_nvidia_gpu_accelerator():
+        comptime if not default_accelerator().is_nvidia_gpu():
             return False
         return self._state == 2
 
@@ -508,7 +508,7 @@ def maybe_capture_replay[
 
     `VERBOSE=False` skips the node-count line — for a caller that re-captures
     by design (a schedule baked into kernel arguments) and printed it once."""
-    comptime if has_nvidia_gpu_accelerator():
+    comptime if default_accelerator().is_nvidia_gpu():
         if not graph:
             STEP()
             ctx.synchronize()

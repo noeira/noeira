@@ -18,7 +18,8 @@ even with overlapping pools.
 
 from max.gpu import thread_idx, block_idx, block_dim
 from max.gpu.host import DeviceContext
-from layout import Layout, LayoutTensor, TileTensor, row_major
+from layout import TileTensor, row_major
+from noeira.core.tiles import Tile
 
 from max.algorithm import parallelize
 from noeira.nn.constants import DT, TPB, LAYOUT_NCHW, LAYOUT_NHWC
@@ -41,8 +42,8 @@ def _max_pool_2d_forward_kernel[
     OH: Int, OW: Int, IN_FLAT: Int, OUT_FLAT: Int,
     LAYOUT: Int = LAYOUT_NCHW,
 ](
-    input: LayoutTensor[DT, Layout.row_major(BATCH, IN_FLAT), MutAnyOrigin],
-    output: LayoutTensor[DT, Layout.row_major(BATCH, OUT_FLAT), MutAnyOrigin],
+    input: Tile[DT, BATCH, IN_FLAT],
+    output: Tile[DT, BATCH, OUT_FLAT],
 ):
     var idx = Int(block_dim.x * block_idx.x + thread_idx.x)
     var total = BATCH * OUT_FLAT
@@ -76,13 +77,9 @@ def _max_pool_2d_backward_kernel[
     OH: Int, OW: Int, IN_FLAT: Int, OUT_FLAT: Int,
     LAYOUT: Int = LAYOUT_NCHW,
 ](
-    grad_output: LayoutTensor[
-        DT, Layout.row_major(BATCH, OUT_FLAT), MutAnyOrigin,
-    ],
-    input: LayoutTensor[DT, Layout.row_major(BATCH, IN_FLAT), MutAnyOrigin],
-    grad_input: LayoutTensor[
-        DT, Layout.row_major(BATCH, IN_FLAT), MutAnyOrigin,
-    ],
+    grad_output: Tile[DT, BATCH, OUT_FLAT],
+    input: Tile[DT, BATCH, IN_FLAT],
+    grad_input: Tile[DT, BATCH, IN_FLAT],
 ):
     var idx = Int(block_dim.x * block_idx.x + thread_idx.x)
     var total = BATCH * IN_FLAT
@@ -261,8 +258,8 @@ struct MaxPool2D[
                     Self.IN_FLAT, Self.OUT_FLAT, Self.LAYOUT,
                 ]
             ](
-                in0.lt["gpu", Layout.row_major(B, Self.IN_FLAT)](),
-                out.lt["gpu", Layout.row_major(B, Self.OUT_FLAT)](),
+                in0.tt["gpu", B, Self.IN_FLAT](),
+                out.tt["gpu", B, Self.OUT_FLAT](),
                 grid_dim=n_blocks, block_dim=TPB,
             )
 
@@ -328,9 +325,9 @@ struct MaxPool2D[
                     Self.IN_FLAT, Self.OUT_FLAT, Self.LAYOUT,
                 ]
             ](
-                grad_output.lt["gpu", Layout.row_major(B, Self.OUT_FLAT)](),
-                fin.lt["gpu", Layout.row_major(B, Self.IN_FLAT)](),
-                gin.lt["gpu", Layout.row_major(B, Self.IN_FLAT)](),
+                grad_output.tt["gpu", B, Self.OUT_FLAT](),
+                fin.tt["gpu", B, Self.IN_FLAT](),
+                gin.tt["gpu", B, Self.IN_FLAT](),
                 grid_dim=n_blocks, block_dim=TPB,
             )
 

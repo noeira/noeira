@@ -63,7 +63,7 @@ comptime _LOG2E = Scalar[F32](1.4426950408889634)
 
 
 def mma_eligible[ADT: DType, HD: Int, H: Int]() -> Bool:
-    """bf16 activations, a head dim the 16-wide k steps and 8-wide n tiles
+    """`bf16` activations, a head dim the 16-wide k steps and 8-wide n tiles
     cover, and 16-byte aligned rows (8-element vector loads)."""
     return ADT == BF and HD % 16 == 0 and HD <= 128 and (H * HD) % 8 == 0
 

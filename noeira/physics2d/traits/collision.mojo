@@ -10,8 +10,8 @@ from ..constants import (
     SHAPE_MAX_SIZE,
     CONTACT_DATA_SIZE,
 )
-from layout import LayoutTensor, Layout
 from max.gpu.host import DeviceContext, DeviceBuffer
+from noeira.core.tiles import Tile
 
 
 trait CollisionSystem(ImplicitlyCopyable):
@@ -44,22 +44,10 @@ trait CollisionSystem(ImplicitlyCopyable):
         MAX_CONTACTS: Int = 16,
     ](
         self,
-        bodies: LayoutTensor[
-            dtype,
-            Layout.row_major(BATCH, NUM_BODIES, BODY_STATE_SIZE),
-            MutAnyOrigin,
-        ],
-        shapes: LayoutTensor[
-            dtype, Layout.row_major(NUM_SHAPES, SHAPE_MAX_SIZE), MutAnyOrigin
-        ],
-        mut contacts: LayoutTensor[
-            dtype,
-            Layout.row_major(BATCH, MAX_CONTACTS, CONTACT_DATA_SIZE),
-            MutAnyOrigin,
-        ],
-        mut contact_counts: LayoutTensor[
-            dtype, Layout.row_major(BATCH), MutAnyOrigin
-        ],
+        bodies: Tile[dtype, BATCH, NUM_BODIES, BODY_STATE_SIZE],
+        shapes: Tile[dtype, NUM_SHAPES, SHAPE_MAX_SIZE],
+        contacts: Tile[dtype, BATCH, MAX_CONTACTS, CONTACT_DATA_SIZE],
+        contact_counts: Tile[dtype, BATCH],
     ):
         """Detect collisions and generate contact manifolds.
 

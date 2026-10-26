@@ -16,7 +16,7 @@ from max.gpu import global_idx, thread_idx, block_idx
 from max.gpu.primitives import block
 from max.gpu.host import DeviceContext
 from std.time import perf_counter_ns
-from layout import Layout, LayoutTensor
+from noeira.core.tiles import Tile, tile
 
 comptime DT = DType.float32
 comptime TPB = 128
@@ -40,9 +40,9 @@ comptime P = NCHUNK * ROWS     # partials per channel
 # 2D partial: block_dim = BN2D_BLK = ROWS×C. Thread (rg,c) accumulates channel c
 # over its strided row subset and writes its OWN partial — no shared mem.
 def _bn_stats_nhwc_2d(
-    input: LayoutTensor[DT, Layout.row_major(R * C), MutAnyOrigin],
-    partial_sum: LayoutTensor[DT, Layout.row_major(NCHUNK * BN2D_BLK), MutAnyOrigin],
-    partial_sumsq: LayoutTensor[DT, Layout.row_major(NCHUNK * BN2D_BLK), MutAnyOrigin],
+    input: Tile[DT, R * C],
+    partial_sum: Tile[DT, NCHUNK * BN2D_BLK],
+    partial_sumsq: Tile[DT, NCHUNK * BN2D_BLK],
 ):
     var chunk = Int(block_idx.x)
     var lane = Int(thread_idx.x)
@@ -68,10 +68,10 @@ def _bn_stats_nhwc_2d(
 
 # parallel finalize: grid=C, block reduces its P partials via block.sum.
 def _bn_finalize_nhwc_parallel(
-    partial_sum: LayoutTensor[DT, Layout.row_major(P * C), MutAnyOrigin],
-    partial_sumsq: LayoutTensor[DT, Layout.row_major(P * C), MutAnyOrigin],
-    mean_out: LayoutTensor[DT, Layout.row_major(C), MutAnyOrigin],
-    inv_std_out: LayoutTensor[DT, Layout.row_major(C), MutAnyOrigin],
+    partial_sum: Tile[DT, P * C],
+    partial_sumsq: Tile[DT, P * C],
+    mean_out: Tile[DT, C],
+    inv_std_out: Tile[DT, C],
 ):
     var c = Int(block_idx.x)
     if c >= C:
@@ -98,10 +98,10 @@ def _bn_finalize_nhwc_parallel(
 
 # flat normalize (coalesced both layouts): c = idx % C.
 def _bn_norm_nhwc(
-    input: LayoutTensor[DT, Layout.row_major(RC), MutAnyOrigin],
-    output: LayoutTensor[DT, Layout.row_major(RC), MutAnyOrigin],
-    mean_in: LayoutTensor[DT, Layout.row_major(C), MutAnyOrigin],
-    inv_std_in: LayoutTensor[DT, Layout.row_major(C), MutAnyOrigin],
+    input: Tile[DT, RC],
+    output: Tile[DT, RC],
+    mean_in: Tile[DT, C],
+    inv_std_in: Tile[DT, C],
 ):
     var idx = Int(global_idx.x)
     if idx >= RC:
@@ -132,13 +132,13 @@ def main() raises:
                     Float64(((r * C + c) % 1009) + 1) * 0.03 - 15.0
                 )
 
-    var xt = LayoutTensor[DT, Layout.row_major(RC), MutAnyOrigin](x_buf)
-    var xr = LayoutTensor[DT, Layout.row_major(R * C), MutAnyOrigin](x_buf)
-    var ot = LayoutTensor[DT, Layout.row_major(RC), MutAnyOrigin](out_buf)
-    var psl = LayoutTensor[DT, Layout.row_major(NCHUNK * BN2D_BLK), MutAnyOrigin](ps)
-    var pql = LayoutTensor[DT, Layout.row_major(NCHUNK * BN2D_BLK), MutAnyOrigin](psq)
-    var mt = LayoutTensor[DT, Layout.row_major(C), MutAnyOrigin](mean_buf)
-    var it = LayoutTensor[DT, Layout.row_major(C), MutAnyOrigin](istd_buf)
+    var xt = tile[RC](x_buf)
+    var xr = tile[R * C](x_buf)
+    var ot = tile[RC](out_buf)
+    var psl = tile[NCHUNK * BN2D_BLK](ps)
+    var pql = tile[NCHUNK * BN2D_BLK](psq)
+    var mt = tile[C](mean_buf)
+    var it = tile[C](istd_buf)
 
     comptime nb_norm = (RC + TPB - 1) // TPB
     ctx.enqueue_function[_bn_stats_nhwc_2d](

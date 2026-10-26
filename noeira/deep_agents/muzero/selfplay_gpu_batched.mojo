@@ -34,7 +34,6 @@ Run (GPU env required):
 
 from std.math import exp, log
 from std.memory import alloc
-from layout import Layout, LayoutTensor
 from max.gpu.host import DeviceContext, DeviceBuffer
 
 from noeira.nn.constants import DT
@@ -58,6 +57,7 @@ from ..zero.mz_diagnostics import append_mz_train_diagnostics
 from ..zero.sequence_replay_mcts import MCTSSequenceReplay
 from ..zero.gpu_sequence_replay_mcts import GPUMCTSSequenceReplay
 from ..zero.temperature import visit_temperature
+from noeira.core.tiles import tile
 
 
 def _a(n: Int) -> Pointer[Scalar[DT], MutAnyOrigin]:
@@ -336,9 +336,7 @@ def run_muzero_gumbel_selfplay_gpu_batched[
 
     for it in range(iterations):
         # ── 1. batched Gumbel search over the LIVE env obs (no H2D in) ──
-        var obs_t = LayoutTensor[
-            DT, Layout.row_major(N_ENVS, OBS), MutAnyOrigin
-        ](env.obs_ptr())
+        var obs_t = tile[N_ENVS, OBS](env.obs_ptr())
         planner.search_gpu[
             type_of(rep_a),
             type_of(dyn_a),
@@ -500,9 +498,7 @@ def run_muzero_gumbel_selfplay_gpu_batched[
                     for j in range(OBS):
                         h_reana[unsafe_offset=e * OBS + j] = tmp[j]
                 ctx.enqueue_copy(d_reana, h_reana)
-                var reana_t = LayoutTensor[
-                    DT, Layout.row_major(N_ENVS, OBS), MutAnyOrigin
-                ](d_reana.unsafe_ptr().as_unsafe_any_origin())
+                var reana_t = tile[N_ENVS, OBS](d_reana.unsafe_ptr().as_unsafe_any_origin())
                 planner.search_gpu[
                     type_of(rep_ta),
                     type_of(dyn_ta),
@@ -783,9 +779,7 @@ def run_muzero_gumbel_selfplay_gpu_batched_devreplay[
 
     for it in range(iterations):
         # ── 1. batched Gumbel search over the LIVE env obs (no H2D in) ──
-        var obs_t = LayoutTensor[
-            DT, Layout.row_major(N_ENVS, OBS), MutAnyOrigin
-        ](env.obs_ptr())
+        var obs_t = tile[N_ENVS, OBS](env.obs_ptr())
         planner.search_gpu[
             type_of(rep_a),
             type_of(dyn_a),
@@ -951,9 +945,7 @@ def run_muzero_gumbel_selfplay_gpu_batched_devreplay[
                 var rpos = rb.sample_reanalyze_chunk[N_ENVS](d_reana)
                 var rpos_e = rpos[0].copy()
                 var rpos_o = rpos[1].copy()
-                var reana_t = LayoutTensor[
-                    DT, Layout.row_major(N_ENVS, OBS), MutAnyOrigin
-                ](d_reana.unsafe_ptr().as_unsafe_any_origin())
+                var reana_t = tile[N_ENVS, OBS](d_reana.unsafe_ptr().as_unsafe_any_origin())
                 planner.search_gpu[
                     type_of(rep_ta),
                     type_of(dyn_ta),
@@ -1079,9 +1071,7 @@ def _eval_greedy_batched[
     var step_i = 0
     while done_cnt < target_episodes and step_i < max_steps:
         step_i += 1
-        var obs_t = LayoutTensor[
-            DT, Layout.row_major(N_ENVS, RA.OBS_DIM), MutAnyOrigin
-        ](eval_env[].obs_ptr())
+        var obs_t = tile[N_ENVS, RA.OBS_DIM](eval_env[].obs_ptr())
         planner.search_gpu[RA, DA, PA](
             ctx, rep_a, dyn_a, pred_a, obs_t,
             apply_legal=False, k_actual=MAX_K, rng_seed=seed_i,

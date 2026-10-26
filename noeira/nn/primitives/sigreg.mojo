@@ -42,7 +42,8 @@ from max.gpu.primitives import block
 from max.gpu.host import DeviceContext, DeviceBuffer
 from std.math import sin, cos, sqrt, log, exp, pi
 from std.random.philox import Random as PhiloxRandom
-from layout import Layout, LayoutTensor, TileTensor, row_major
+from layout import TileTensor, row_major
+from noeira.core.tiles import RowMajor, Tile
 from linalg.matmul import matmul as max_matmul
 
 from noeira.nn.constants import DT, TPB
@@ -138,7 +139,7 @@ struct SIGReg[DIM: Int, SEQ_LEN: Int, NUM_PROJ: Int, KNOTS: Int](Module):
         """A for the GPU path, into `ws_a`: the injected matrix, else the PRNG."""
         comptime D = Self.DIM
         comptime P = Self.NUM_PROJ
-        comptime lay_a = Layout.row_major(D, P)
+        comptime lay_a = RowMajor[D, P]
         if self.fixed_a:
             c.enqueue_copy(
                 self.ws_a.dev.value().create_sub_buffer[DT](0, D * P),
@@ -146,13 +147,13 @@ struct SIGReg[DIM: Int, SEQ_LEN: Int, NUM_PROJ: Int, KNOTS: Int](Module):
             )
             return
         c.enqueue_function[_sr_gen_a_unnorm[D, P]](
-            self.ws_a.lt["gpu", lay_a](),
+            self.ws_a.tt["gpu", D, P](),
             seed,
             grid_dim=((D * P + TPB - 1) // TPB,),
             block_dim=(TPB,),
         )
         c.enqueue_function[_sr_norm_a[D, P]](
-            self.ws_a.lt["gpu", lay_a](),
+            self.ws_a.tt["gpu", D, P](),
             grid_dim=((P + TPB - 1) // TPB,),
             block_dim=(TPB,),
         )
@@ -319,13 +320,13 @@ struct SIGReg[DIM: Int, SEQ_LEN: Int, NUM_PROJ: Int, KNOTS: Int](Module):
             out.ensure_gpu(c, B * 1)
             self._ensure_gpu(c, B)
             comptime N_PARTIALS = Self._n_partials()
-            comptime lay_a = Layout.row_major(D, P)
-            comptime lay_cmsm = Layout.row_major(T, P * K)
-            comptime lay_in = Layout.row_major(B, T * D)
-            comptime lay_cache = Layout.row_major(B, T * P)
-            comptime lay_out = Layout.row_major(B, 1)
-            comptime lay_part = Layout.row_major(N_PARTIALS)
-            comptime lay_one = Layout.row_major(1)
+            comptime lay_a = RowMajor[D, P]
+            comptime lay_cmsm = RowMajor[T, P * K]
+            comptime lay_in = RowMajor[B, T * D]
+            comptime lay_cache = RowMajor[B, T * P]
+            comptime lay_out = RowMajor[B, 1]
+            comptime lay_part = RowMajor[N_PARTIALS]
+            comptime lay_one = RowMajor[1]
             var seed = self._forward_seed(
                 UInt64(Int(self.cache_z.dev.value().unsafe_ptr()))
             )
@@ -335,29 +336,29 @@ struct SIGReg[DIM: Int, SEQ_LEN: Int, NUM_PROJ: Int, KNOTS: Int](Module):
             # real LeWM regime; see _sr_project note + bench). max_matmul only
             # wins forward at M≥~1.5k, which no LeWM config hits.
             c.enqueue_function[_sr_project[B, T, D, P]](
-                in0.lt["gpu", lay_in](),
-                self.ws_a.lt["gpu", lay_a](),
-                self.cache_z.lt["gpu", lay_cache](),
+                in0.tt["gpu", B, T * D](),
+                self.ws_a.tt["gpu", D, P](),
+                self.cache_z.tt["gpu", B, T * P](),
                 grid_dim=((B * T * P + TPB - 1) // TPB,),
                 block_dim=(TPB,),
             )
             c.enqueue_function[_sr_cm_sm[B, T, P, K, N_PARTIALS, True]](
-                self.cache_z.lt["gpu", lay_cache](),
-                self.ws_cm.lt["gpu", lay_cmsm](),
-                self.ws_sm.lt["gpu", lay_cmsm](),
-                self.ws_partials.lt["gpu", lay_part](),
+                self.cache_z.tt["gpu", B, T * P](),
+                self.ws_cm.tt["gpu", T, P * K](),
+                self.ws_sm.tt["gpu", T, P * K](),
+                self.ws_partials.tt["gpu", N_PARTIALS](),
                 grid_dim=(N_PARTIALS,),
                 block_dim=(TPB,),
             )
             c.enqueue_function[_sr_final_reduce[N_PARTIALS]](
-                self.ws_partials.lt["gpu", lay_part](),
-                self.ws_scalar.lt["gpu", lay_one](),
+                self.ws_partials.tt["gpu", N_PARTIALS](),
+                self.ws_scalar.tt["gpu", 1](),
                 grid_dim=(1,),
                 block_dim=(TPB,),
             )
             c.enqueue_function[_sr_broadcast_stat[B, T, P]](
-                self.ws_scalar.lt["gpu", lay_one](),
-                out.lt["gpu", lay_out](),
+                self.ws_scalar.tt["gpu", 1](),
+                out.tt["gpu", B, 1](),
                 grid_dim=((B + TPB - 1) // TPB,),
                 block_dim=(TPB,),
             )
@@ -448,37 +449,37 @@ struct SIGReg[DIM: Int, SEQ_LEN: Int, NUM_PROJ: Int, KNOTS: Int](Module):
             gin.ensure_gpu(c, B * T * D)
             self._ensure_gpu(c, B)
             comptime N_PARTIALS = Self._n_partials()
-            comptime lay_a = Layout.row_major(D, P)
-            comptime lay_cmsm = Layout.row_major(T, P * K)
-            comptime lay_cache = Layout.row_major(B, T * P)
-            comptime lay_go = Layout.row_major(B, 1)
-            comptime lay_dLdz = Layout.row_major(B, T * P)
-            comptime lay_one = Layout.row_major(1)
+            comptime lay_a = RowMajor[D, P]
+            comptime lay_cmsm = RowMajor[T, P * K]
+            comptime lay_cache = RowMajor[B, T * P]
+            comptime lay_go = RowMajor[B, 1]
+            comptime lay_dLdz = RowMajor[B, T * P]
+            comptime lay_one = RowMajor[1]
             var seed = self._backward_seed(
                 UInt64(Int(self.cache_z.dev.value().unsafe_ptr()))
             )
 
             self._fill_a_gpu(c, seed)
             c.enqueue_function[_sr_cm_sm[B, T, P, K, N_PARTIALS, False]](
-                self.cache_z.lt["gpu", lay_cache](),
-                self.ws_cm.lt["gpu", lay_cmsm](),
-                self.ws_sm.lt["gpu", lay_cmsm](),
-                self.ws_partials.lt["gpu", Layout.row_major(N_PARTIALS)](),
+                self.cache_z.tt["gpu", B, T * P](),
+                self.ws_cm.tt["gpu", T, P * K](),
+                self.ws_sm.tt["gpu", T, P * K](),
+                self.ws_partials.tt["gpu", N_PARTIALS](),
                 grid_dim=(N_PARTIALS,),
                 block_dim=(TPB,),
             )
             c.enqueue_function[_sr_reduce_g[B]](
-                grad_output.lt["gpu", lay_go](),
-                self.ws_scalar.lt["gpu", lay_one](),
+                grad_output.tt["gpu", B, 1](),
+                self.ws_scalar.tt["gpu", 1](),
                 grid_dim=(1,),
                 block_dim=(TPB,),
             )
             c.enqueue_function[_sr_dLdz[B, T, P, K]](
-                self.cache_z.lt["gpu", lay_cache](),
-                self.ws_cm.lt["gpu", lay_cmsm](),
-                self.ws_sm.lt["gpu", lay_cmsm](),
-                self.ws_dLdz.lt["gpu", lay_dLdz](),
-                self.ws_scalar.lt["gpu", lay_one](),
+                self.cache_z.tt["gpu", B, T * P](),
+                self.ws_cm.tt["gpu", T, P * K](),
+                self.ws_sm.tt["gpu", T, P * K](),
+                self.ws_dLdz.tt["gpu", B, T * P](),
+                self.ws_scalar.tt["gpu", 1](),
                 grid_dim=((B * T * P + TPB - 1) // TPB,),
                 block_dim=(TPB,),
             )
@@ -507,7 +508,7 @@ struct SIGReg[DIM: Int, SEQ_LEN: Int, NUM_PROJ: Int, KNOTS: Int](Module):
 
 
 def _sr_gen_a_unnorm[D: Int, P: Int](
-    a_t: LayoutTensor[DT, Layout.row_major(D, P), MutAnyOrigin],
+    a_t: Tile[DT, D, P],
     seed: UInt64,
 ):
     var idx = Int(global_idx.x)
@@ -525,7 +526,7 @@ def _sr_gen_a_unnorm[D: Int, P: Int](
 
 
 def _sr_norm_a[D: Int, P: Int](
-    a_t: LayoutTensor[DT, Layout.row_major(D, P), MutAnyOrigin],
+    a_t: Tile[DT, D, P],
 ):
     var p_idx = Int(global_idx.x)
     if p_idx >= P:
@@ -549,9 +550,9 @@ def _sr_norm_a[D: Int, P: Int](
 # 4.4× win at P=1024, wash at P=256, never worse). See vjp() + the A/B microbench
 # benchmarks/bench_storage_sigreg_gemm_gpu.mojo.
 def _sr_project[BATCH: Int, T: Int, D: Int, P: Int](
-    input_t: LayoutTensor[DT, Layout.row_major(BATCH, T * D), MutAnyOrigin],
-    a_t: LayoutTensor[DT, Layout.row_major(D, P), MutAnyOrigin],
-    cache_t: LayoutTensor[DT, Layout.row_major(BATCH, T * P), MutAnyOrigin],
+    input_t: Tile[DT, BATCH, T * D],
+    a_t: Tile[DT, D, P],
+    cache_t: Tile[DT, BATCH, T * P],
 ):
     var idx = Int(global_idx.x)
     if idx >= BATCH * T * P:
@@ -570,10 +571,10 @@ def _sr_project[BATCH: Int, T: Int, D: Int, P: Int](
 def _sr_cm_sm[
     BATCH: Int, T: Int, P: Int, K: Int, N_PARTIALS: Int, INCLUDE_STAT: Bool
 ](
-    cache_t: LayoutTensor[DT, Layout.row_major(BATCH, T * P), MutAnyOrigin],
-    cm_t: LayoutTensor[DT, Layout.row_major(T, P * K), MutAnyOrigin],
-    sm_t: LayoutTensor[DT, Layout.row_major(T, P * K), MutAnyOrigin],
-    partials_t: LayoutTensor[DT, Layout.row_major(N_PARTIALS), MutAnyOrigin],
+    cache_t: Tile[DT, BATCH, T * P],
+    cm_t: Tile[DT, T, P * K],
+    sm_t: Tile[DT, T, P * K],
+    partials_t: Tile[DT, N_PARTIALS],
 ):
     var idx = Int(global_idx.x)
     var dt = Scalar[DT](3.0 / Float64(K - 1))
@@ -613,10 +614,8 @@ def _sr_cm_sm[
 
 
 def _sr_final_reduce[N_PARTIALS: Int](
-    partials_t: LayoutTensor[
-        DT, Layout.row_major(N_PARTIALS), MutAnyOrigin
-    ],
-    out_t: LayoutTensor[DT, Layout.row_major(1), MutAnyOrigin],
+    partials_t: Tile[DT, N_PARTIALS],
+    out_t: Tile[DT, 1],
 ):
     var tid = Int(thread_idx.x)
     var v = Scalar[DT](0)
@@ -630,8 +629,8 @@ def _sr_final_reduce[N_PARTIALS: Int](
 
 
 def _sr_broadcast_stat[BATCH: Int, T: Int, P: Int](
-    stat_t: LayoutTensor[DT, Layout.row_major(1), MutAnyOrigin],
-    output_t: LayoutTensor[DT, Layout.row_major(BATCH, 1), MutAnyOrigin],
+    stat_t: Tile[DT, 1],
+    output_t: Tile[DT, BATCH, 1],
 ):
     var b = Int(global_idx.x)
     if b >= BATCH:
@@ -641,8 +640,8 @@ def _sr_broadcast_stat[BATCH: Int, T: Int, P: Int](
 
 
 def _sr_reduce_g[BATCH: Int](
-    grad_output: LayoutTensor[DT, Layout.row_major(BATCH, 1), MutAnyOrigin],
-    g_t: LayoutTensor[DT, Layout.row_major(1), MutAnyOrigin],
+    grad_output: Tile[DT, BATCH, 1],
+    g_t: Tile[DT, 1],
 ):
     var b = Int(thread_idx.x)
     var v = Scalar[DT](0)
@@ -654,11 +653,11 @@ def _sr_reduce_g[BATCH: Int](
 
 
 def _sr_dLdz[BATCH: Int, T: Int, P: Int, K: Int](
-    cache_t: LayoutTensor[DT, Layout.row_major(BATCH, T * P), MutAnyOrigin],
-    cm_t: LayoutTensor[DT, Layout.row_major(T, P * K), MutAnyOrigin],
-    sm_t: LayoutTensor[DT, Layout.row_major(T, P * K), MutAnyOrigin],
-    dLdz_t: LayoutTensor[DT, Layout.row_major(BATCH, T * P), MutAnyOrigin],
-    g_t: LayoutTensor[DT, Layout.row_major(1), MutAnyOrigin],
+    cache_t: Tile[DT, BATCH, T * P],
+    cm_t: Tile[DT, T, P * K],
+    sm_t: Tile[DT, T, P * K],
+    dLdz_t: Tile[DT, BATCH, T * P],
+    g_t: Tile[DT, 1],
 ):
     var idx = Int(global_idx.x)
     if idx >= BATCH * T * P:

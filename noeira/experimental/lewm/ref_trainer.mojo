@@ -34,7 +34,6 @@ from std.os import makedirs
 from std.time import perf_counter_ns
 from max.gpu import global_idx
 from max.gpu.host import DeviceContext, DeviceBuffer, HostBuffer
-from layout import Layout, LayoutTensor
 
 from noeira.nn.constants import DT, TPB
 from noeira.nn.core.tensor import Tensor
@@ -46,6 +45,7 @@ from .ref_model import LeWMLossGraphRef
 from .ref_load import LoadRef
 from noeira.nn.optimizer.grad_clip import _sum_sq_kernel_rt, GC_TPB
 from noeira.io.fileio import write_file_atomic
+from noeira.core.tiles import Tile
 
 
 comptime REF_T = 4
@@ -115,7 +115,7 @@ def _lewm_pixels_kernel(
 def _clip_scale_kernel[
     N: Int
 ](
-    grad: LayoutTensor[DT, Layout.row_major(N), MutAnyOrigin],
+    grad: Tile[DT, N],
     scale: Scalar[DT],
 ):
     """grad *= scale; a scale of 0 writes exact zeros (the NaN guard)."""
@@ -189,6 +189,8 @@ struct _MaskKeep(ParamVisitor):
         mut m: Tensor, mut v: Tensor, apply_decay: Bool,
         ctx: Optional[DeviceContext],
     ) raises:
+        if grad.n == 0:  # frozen param: no gradient, nothing to do
+            return
         if _kept(name, self.keep):
             return
         comptime if target == "cpu":
@@ -300,6 +302,8 @@ struct _MaskPredQKVBias(ParamVisitor):
         mut m: Tensor, mut v: Tensor, apply_decay: Bool,
         ctx: Optional[DeviceContext],
     ) raises:
+        if grad.n == 0:  # frozen param: no gradient, nothing to do
+            return
         if not _is_pred_qkv_bias(name):
             return
         self.n_masked += 1
@@ -330,6 +334,8 @@ struct _GradSumSq(ParamVisitor):
         mut m: Tensor, mut v: Tensor, apply_decay: Bool,
         ctx: Optional[DeviceContext],
     ) raises:
+        if grad.n == 0:  # frozen param: no gradient, nothing to do
+            return
         comptime if target == "gpu":
             ctx.value().enqueue_function[_sum_sq_kernel_rt](
                 grad.dev.value(),
@@ -358,12 +364,14 @@ struct _GradScale(ParamVisitor):
         mut m: Tensor, mut v: Tensor, apply_decay: Bool,
         ctx: Optional[DeviceContext],
     ) raises:
+        if grad.n == 0:  # frozen param: no gradient, nothing to do
+            return
         comptime if target == "cpu":
             for i in range(N):
                 grad.data[i] = grad.data[i] * self.scale
         else:
             ctx.value().enqueue_function[_clip_scale_kernel[N]](
-                grad.lt["gpu", Layout.row_major(N)](),
+                grad.tt["gpu", N](),
                 self.scale,
                 grid_dim=(N + TPB - 1) // TPB,
                 block_dim=TPB,
@@ -381,6 +389,8 @@ struct _GradScaleDev(ParamVisitor):
         mut m: Tensor, mut v: Tensor, apply_decay: Bool,
         ctx: Optional[DeviceContext],
     ) raises:
+        if grad.n == 0:  # frozen param: no gradient, nothing to do
+            return
         ctx.value().enqueue_function[_scale_by_dev_kernel](
             grad.dev.value(), Int64(N), self.coef,
             grid_dim=(N + TPB - 1) // TPB, block_dim=TPB,
@@ -411,9 +421,9 @@ struct _AdamWAll(ParamVisitor):
 
 def _write_f32(path: String, t: Tensor, n: Int) raises:
     var bytes = List[UInt8](capacity=n * 4)
-    var p = t.data.unsafe_ptr().bitcast[UInt8]()
+    var p = t.data.unsafe_ptr().unsafe_bitcast[UInt8]()
     for i in range(n * 4):
-        bytes.append(p[i])
+        bytes.append(p[unsafe_offset=i])
     write_file_atomic(path, bytes)
 
 
@@ -484,9 +494,9 @@ struct _DumpWriter(ParamVisitor):
             ctx.value().synchronize()
             param.download(ctx.value())
         var bytes = List[UInt8](capacity=N * 4)
-        var p = param.data.unsafe_ptr().bitcast[UInt8]()
+        var p = param.data.unsafe_ptr().unsafe_bitcast[UInt8]()
         for i in range(N * 4):
-            bytes.append(p[i])
+            bytes.append(p[unsafe_offset=i])
         write_file_atomic(self.dir + "/ours." + name + ".bin", bytes)
         self.manifest += "ours." + name + "\t" + String(N) + "\n"
 
@@ -505,11 +515,48 @@ trait WMWindowLoss:
     ) raises -> Tuple[Float64, Float64]:
         ...
 
+    def window_latents(
+        mut self, pix: List[Scalar[DT]], act: List[Scalar[DT]], pro: List[Scalar[DT]]
+    ) raises -> WindowLatents:
+        """The eval-mode forward's latents (`WindowLatents`), for the
+        slow-feature diagnostics (`lewm_so101_slow_features`)."""
+        ...
+
+
+struct WindowLatents(Movable):
+    """A batch's latents, host-side, (B, ·, 192) row-major per sample."""
+
+    var img: List[Float32]
+    """(B, T, EMB) the image encoder's latent (`emb`)."""
+    var z: List[Float32]
+    """(B, T, EMB) the predictor's state: `img`, plus the proprio embedding
+    for a v2 model."""
+    var pred: List[Float32]
+    """(B, T − 1, EMB) the one-step predictions of frames 1 .. T − 1."""
+
+    def __init__(out self, var img: List[Float32], var z: List[Float32], var pred: List[Float32]):
+        self.img = img^
+        self.z = z^
+        self.pred = pred^
+
+
+def node_host[target: StaticString](
+    mut t: Tensor, n: Int, ctx: Optional[DeviceContext]
+) raises -> List[Float32]:
+    """A node output's first `n` values on the host (downloaded on gpu)."""
+    comptime if target == "gpu":
+        ctx.value().synchronize()
+        t.download(ctx.value())
+    var out = List[Float32](capacity=n)
+    for i in range(n):
+        out.append(Float32(t.data[i]))
+    return out^
+
 
 def copy_last_loss[
     target: StaticString, B: Int, HD: Int
 ](mut ctx_x: Tensor, mut tgt: Tensor, ctx: Optional[DeviceContext]) raises -> Float64:
-    """mean((ctx_x − tgt)²) over (B, H·D): frame t's latent as frame t + 1's."""
+    """`mean((ctx_x − tgt)²)` over (B, H·D): frame t's latent as frame t + 1's."""
     comptime if target == "gpu":
         ctx.value().synchronize()
         ctx_x.download(ctx.value())
@@ -653,7 +700,7 @@ struct LeWMRefTrainer[
     def train_step(
         mut self, pix: List[Scalar[DT]], act: List[Scalar[DT]]
     ) raises -> RefStepStats:
-        """pix: (B, T, 3, 224, 224) ImageNet-normalised; act: (B, T, 10)
+        """`pix`: (B, T, 3, 224, 224) ImageNet-normalised; act: (B, T, 10)
         z-scored, NaN already zeroed (train.py's `nan_to_num`)."""
         var t = Int(perf_counter_ns())
         for i in range(Self.B * Self.PIX):
@@ -772,6 +819,16 @@ struct LeWMRefTrainer[
         )
         return (st.pred_loss, c)
 
+    def window_latents(
+        mut self, pix: List[Scalar[DT]], act: List[Scalar[DT]], pro: List[Scalar[DT]]
+    ) raises -> WindowLatents:
+        """`WMWindowLoss`: no proprio, so `z` is the image latent."""
+        _ = self.loss_of(pix, act)
+        var img = node_host[Self.target](self.graph.node_output["emb"](), Self.B * REF_T * 192, self.ctx)
+        var pred = node_host[Self.target](self.graph.node_output["pred"](), Self.B * (REF_T - 1) * 192, self.ctx)
+        var z = img.copy()
+        return WindowLatents(img^, z^, pred^)
+
     def set_eval(mut self):
         """Lightning's `model.eval()`: BatchNorm on its running statistics,
         no dropout."""
@@ -882,6 +939,7 @@ struct LeWMRefTrainer[
         normalised on the device by `_lewm_pixels_kernel` (bit-equal to
         torch's float32 `ToImage`); the clip runs on the device. The host is
         free to fill the other slot; `finish()` waits and reads the step.
+
         (With `profile` on, every stage synchronises.)"""
         comptime assert Self.target == "gpu", "submit_staged: GPU only"
         var t = Int(perf_counter_ns())

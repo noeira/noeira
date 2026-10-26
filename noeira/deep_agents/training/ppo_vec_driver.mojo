@@ -53,7 +53,6 @@ so `ENV_GRAPH` / `TRAIN_GRAPH` on or off give the same checkpoint
 (`tests/deep_agents/test_ppo_vec_driver.mojo`).
 """
 
-from layout import Layout, LayoutTensor
 from max.gpu import global_idx
 from max.gpu.host import DeviceContext, HostBuffer
 from std.time import perf_counter_ns
@@ -73,9 +72,10 @@ from noeira.nn.core.fill import fill_dev
 from noeira.nn.core.module import Module
 from noeira.nn.core.ptr import mptr
 from noeira.nn.core.tensor import Tensor
+from noeira.core.tiles import Tile, tile
 
 
-comptime _V[n: Int] = LayoutTensor[DT, Layout.row_major(n), MutAnyOrigin]
+comptime _V[n: Int] = Tile[DT, n]
 comptime _Ptr = Pointer[Scalar[DT], MutAnyOrigin]
 
 # the episode record per lane per step
@@ -121,7 +121,7 @@ struct PPOVecConfig(Copyable, Movable):
     """RoboParty's `action_smoothness_l2`: `w |a_t - 2 a_{t-1} + a_{t-2}|^2`,
     charged like the action rate (0 until a lane has two previous actions)."""
     var adaptive_kl: Bool
-    """rsl_rl's adaptive schedule, applied once per UPDATE (theirs: per
+    """`rsl_rl`'s adaptive schedule, applied once per UPDATE (theirs: per
     minibatch) so the update stays one graph: the update's mean approx-KL
     above 2 x `desired_kl` divides the lr by 1.5, below half of it
     multiplies it by 1.5, clamped to [`lr_min`, `lr_max`]. Excludes `anneal`."""
@@ -596,21 +596,21 @@ struct PPOVecRollout[
             self.ctx.enqueue_function[
                 _stack_k[N, Self.E_OBS, Self.EA, Self.W, Self.FRAMES_, MODE]
             ](
-                _V[N * Self.E_OBS](raw_ptr),
-                self.hist.lt["gpu", Layout.row_major(N * Self.W + 1)](),
-                self.done_out.lt["gpu", Layout.row_major(N)](),
-                self.aug.lt["gpu", Layout.row_major(N * Self.OBS)](),
+                tile[N * Self.E_OBS](raw_ptr),
+                self.hist.tt["gpu", N * Self.W + 1](),
+                self.done_out.tt["gpu", N](),
+                self.aug.tt["gpu", N * Self.OBS](),
                 grid_dim=Self._g(N), block_dim=TPB,
             )
         else:
             self.ctx.enqueue_function[
                 augment_k[N, Self.E_OBS, Self.W, 0, Self.ACT]
             ](
-                _V[N * Self.E_OBS](raw_ptr),
-                self.hist.lt["gpu", Layout.row_major(N * Self.W + 1)](),
-                self.tprev.lt["gpu", Layout.row_major(N * Self.ACT)](),
-                self.qa.lt["gpu", Layout.row_major(Self.ACT)](),
-                self.aug.lt["gpu", Layout.row_major(N * Self.OBS)](),
+                tile[N * Self.E_OBS](raw_ptr),
+                self.hist.tt["gpu", N * Self.W + 1](),
+                self.tprev.tt["gpu", N * Self.ACT](),
+                self.qa.tt["gpu", Self.ACT](),
+                self.aug.tt["gpu", N * Self.OBS](),
                 grid_dim=Self._g(N), block_dim=TPB,
             )
 
@@ -652,13 +652,13 @@ struct PPOVecRollout[
             mptr(self.cur_n.dev.value().unsafe_ptr()), env.action_ptr()
         )
         c.enqueue_function[_pre_k[N, Self.ACT, Self.W]](
-            _V[N * Self.ACT](env.action_ptr()),
-            self.a_prev.lt["gpu", Layout.row_major(N * Self.ACT)](),
-            self.a_prev2.lt["gpu", Layout.row_major(N * Self.ACT)](),
-            self.has_prev.lt["gpu", Layout.row_major(N)](),
-            self.pen.lt["gpu", Layout.row_major(N)](),
-            self.hist.lt["gpu", Layout.row_major(N * Self.W + 1)](),
-            self.stats.lt["gpu", Layout.row_major(N * _S_SIZE)](),
+            tile[N * Self.ACT](env.action_ptr()),
+            self.a_prev.tt["gpu", N * Self.ACT](),
+            self.a_prev2.tt["gpu", N * Self.ACT](),
+            self.has_prev.tt["gpu", N](),
+            self.pen.tt["gpu", N](),
+            self.hist.tt["gpu", N * Self.W + 1](),
+            self.stats.tt["gpu", N * _S_SIZE](),
             Scalar[DT](cfg.act_rate_w),
             Scalar[DT](cfg.act_smooth_w),
             grid_dim=Self._g(N), block_dim=TPB,
@@ -674,18 +674,18 @@ struct PPOVecRollout[
             _env_step()
         # 3. the transition, the next observation and its statistics
         c.enqueue_function[_post_k[N, EO]](
-            _V[N * EO](env.obs_ptr()),
-            _V[N](env.reward_ptr()),
-            _V[N](env.done_ptr()),
-            _V[N](env.terminated_ptr()),
-            self.pen.lt["gpu", Layout.row_major(N)](),
-            self.diverged.lt["gpu", Layout.row_major(N)](),
-            self.rew_raw.lt["gpu", Layout.row_major(N)](),
-            self.done_out.lt["gpu", Layout.row_major(N)](),
-            self.term_out.lt["gpu", Layout.row_major(N)](),
-            self.raw_ret.lt["gpu", Layout.row_major(N)](),
-            self.ep_len.lt["gpu", Layout.row_major(N)](),
-            self.stats.lt["gpu", Layout.row_major(N * _S_SIZE)](),
+            tile[N * EO](env.obs_ptr()),
+            tile[N](env.reward_ptr()),
+            tile[N](env.done_ptr()),
+            tile[N](env.terminated_ptr()),
+            self.pen.tt["gpu", N](),
+            self.diverged.tt["gpu", N](),
+            self.rew_raw.tt["gpu", N](),
+            self.done_out.tt["gpu", N](),
+            self.term_out.tt["gpu", N](),
+            self.raw_ret.tt["gpu", N](),
+            self.ep_len.tt["gpu", N](),
+            self.stats.tt["gpu", N * _S_SIZE](),
             Scalar[DT](cfg.obs_bound),
             Scalar[DT](cfg.rew_bound),
             grid_dim=Self._g(N), block_dim=TPB,
@@ -702,9 +702,9 @@ struct PPOVecRollout[
         )
         # 4. reward normalisation and the episode records
         c.enqueue_function[_ret_k[N]](
-            self.rew_raw.lt["gpu", Layout.row_major(N)](),
-            self.ret_acc.lt["gpu", Layout.row_major(N)](),
-            self.rets.lt["gpu", Layout.row_major(N)](),
+            self.rew_raw.tt["gpu", N](),
+            self.ret_acc.tt["gpu", N](),
+            self.rets.tt["gpu", N](),
             gamma,
             grid_dim=Self._g(N), block_dim=TPB,
         )
@@ -714,14 +714,14 @@ struct PPOVecRollout[
                 self.ret_count, False,
             )
         c.enqueue_function[_rew_k[N]](
-            self.rew_raw.lt["gpu", Layout.row_major(N)](),
-            self.done_out.lt["gpu", Layout.row_major(N)](),
-            self.ret_var.lt["gpu", Layout.row_major(1)](),
-            self.rew_n.lt["gpu", Layout.row_major(N)](),
-            self.raw_ret.lt["gpu", Layout.row_major(N)](),
-            self.ret_acc.lt["gpu", Layout.row_major(N)](),
-            self.ep_len.lt["gpu", Layout.row_major(N)](),
-            self.ep.lt["gpu", Layout.row_major(N * _EP_W)](),
+            self.rew_raw.tt["gpu", N](),
+            self.done_out.tt["gpu", N](),
+            self.ret_var.tt["gpu", 1](),
+            self.rew_n.tt["gpu", N](),
+            self.raw_ret.tt["gpu", N](),
+            self.ret_acc.tt["gpu", N](),
+            self.ep_len.tt["gpu", N](),
+            self.ep.tt["gpu", N * _EP_W](),
             Scalar[DT](cfg.rew_clip if cfg.norm_reward else _NO_CLIP),
             grid_dim=Self._g(N), block_dim=TPB,
         )
@@ -751,9 +751,9 @@ struct PPOVecRollout[
         else:
             _env_reset()
         c.enqueue_function[_reset_k[N, Self.W]](
-            self.done_out.lt["gpu", Layout.row_major(N)](),
-            self.hist.lt["gpu", Layout.row_major(N * Self.W + 1)](),
-            self.has_prev.lt["gpu", Layout.row_major(N)](),
+            self.done_out.tt["gpu", N](),
+            self.hist.tt["gpu", N * Self.W + 1](),
+            self.has_prev.tt["gpu", N](),
             grid_dim=Self._g(N), block_dim=TPB,
         )
         self._augment[2](env.obs_ptr())

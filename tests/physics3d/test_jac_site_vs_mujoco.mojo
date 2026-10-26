@@ -55,7 +55,7 @@ from std.python import Python, PythonObject
 from std.testing import assert_true, TestSuite
 from std.collections import Array
 from max.gpu.host import DeviceContext
-from layout import Layout
+from noeira.core.tiles import RowMajor
 
 from noeira.envs.dm_control.ball_in_cup import (
     DMBallInCupModel,
@@ -124,18 +124,18 @@ def _sweep[D: DimsLike](
     assert_true(Int(py=mm.nv) == D.NV, label + ": nv mismatch")
     assert_true(Int(py=mm.nsite) == D.NSITE, label + ": nsite mismatch")
 
-    comptime L_NB3 = Layout.row_major(1, D.NBODY * 3)
-    comptime L_JNT = Layout.row_major(D.NJOINT, MODEL_JOINT_SIZE)
-    comptime L_BOD = Layout.row_major(D.NBODY, MODEL_BODY_SIZE)
-    comptime L_MET = Layout.row_major(MODEL_META_SIZE)
-    comptime L_CDOF = Layout.row_major(1, D.NV * 6)
-    comptime L_SITE = Layout.row_major(D.NSITE, MODEL_SITE_SIZE)
-    comptime L_SX = Layout.row_major(1, D.NSITE * 3)
+    comptime L_NB3 = RowMajor[1, D.NBODY * 3]
+    comptime L_JNT = RowMajor[D.NJOINT, MODEL_JOINT_SIZE]
+    comptime L_BOD = RowMajor[D.NBODY, MODEL_BODY_SIZE]
+    comptime L_MET = RowMajor[MODEL_META_SIZE]
+    comptime L_CDOF = RowMajor[1, D.NV * 6]
+    comptime L_SITE = RowMajor[D.NSITE, MODEL_SITE_SIZE]
+    comptime L_SX = RowMajor[1, D.NSITE * 3]
 
-    var bodies_v = mf.bodies.lt["cpu", L_BOD]()
-    var joints_v = mf.joints.lt["cpu", L_JNT]()
-    var sites_v = mf.sites.lt["cpu", L_SITE]()
-    var mmeta_v = mf.meta.lt["cpu", L_MET]()
+    var bodies_v = mf.bodies.tt["cpu", D.NBODY, MODEL_BODY_SIZE]()
+    var joints_v = mf.joints.tt["cpu", D.NJOINT, MODEL_JOINT_SIZE]()
+    var sites_v = mf.sites.tt["cpu", D.NSITE, MODEL_SITE_SIZE]()
+    var mmeta_v = mf.meta.tt["cpu", MODEL_META_SIZE]()
 
     # ── preconditions: this model really does carry what it is here for ──
     var n_free = 0
@@ -205,9 +205,9 @@ def _sweep[D: DimsLike](
         compute_subtree_com["cpu"](d, mf)
         compute_cdof["cpu"](d, mf, scratch)
 
-        var subtree_v = d.subtree_com.lt["cpu", L_NB3]()
-        var cdof_v = scratch.cdof.lt["cpu", L_CDOF]()
-        var sxpos_v = d.site_xpos.lt["cpu", L_SX]()
+        var subtree_v = d.subtree_com.tt["cpu", 1, D.NBODY * 3]()
+        var cdof_v = scratch.cdof.tt["cpu", 1, D.NV * 6]()
+        var sxpos_v = d.site_xpos.tt["cpu", 1, D.NSITE * 3]()
 
         for s in range(D.NSITE):
             var dp = 0.0

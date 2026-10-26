@@ -70,7 +70,7 @@ def bench_shape[N: Int, K: Int](ctx: DeviceContext, count: Int, mut total: List[
     ctx.enqueue_copy(b_d, b_h)
     var b_tt = TileTensor(b_d, row_major(Coord(Idx[N], Idx[KB])))
     var bpk_tt = TileTensor(bpk_d, row_major(Coord(Idx[N], Idx[KB])))
-    gpu_qint4_repack_Q4_0["gpu"](b_tt.as_immut(), bpk_tt, ctx)
+    gpu_qint4_repack_Q4_0["gpu"](b_tt.as_imm(), bpk_tt, ctx)
     ctx.synchronize()
 
     print(t"N={N} K={K} (x{count})")
@@ -88,10 +88,10 @@ def bench_shape[N: Int, K: Int](ctx: DeviceContext, count: Int, mut total: List[
 
         comptime if N == 4096 and K == 4096:  # tuned configs do not compile (header)
             multistage_gemm_q[group_size=GS, pack_factor=8, config=DEFAULT_Q](
-                c_tt.to_layout_tensor(), a_tt.as_immut().to_layout_tensor(), bpk_tt.as_immut().to_layout_tensor(), DEFAULT_Q, ctx
+                c_tt, a_tt.as_imm(), bpk_tt.as_imm(), DEFAULT_Q, ctx
             )
         else:
-            matmul_gpu_qint4[GS, "gpu"](c_tt, a_tt.as_immut(), bpk_tt.as_immut(), ctx)
+            matmul_gpu_qint4[GS, "gpu"](c_tt, a_tt.as_imm(), bpk_tt.as_imm(), ctx)
         ctx.enqueue_copy(c_h, c_d)
         ctx.synchronize()
         # 8 columns against the host dequantize-and-multiply
@@ -111,19 +111,19 @@ def bench_shape[N: Int, K: Int](ctx: DeviceContext, count: Int, mut total: List[
         for _ in range(3):
             comptime if N == 4096 and K == 4096:  # tuned configs do not compile (header)
                 multistage_gemm_q[group_size=GS, pack_factor=8, config=DEFAULT_Q](
-                    c_tt.to_layout_tensor(), a_tt.as_immut().to_layout_tensor(), bpk_tt.as_immut().to_layout_tensor(), DEFAULT_Q, ctx
+                    c_tt, a_tt.as_imm(), bpk_tt.as_imm(), DEFAULT_Q, ctx
                 )
             else:
-                matmul_gpu_qint4[GS, "gpu"](c_tt, a_tt.as_immut(), bpk_tt.as_immut(), ctx)
+                matmul_gpu_qint4[GS, "gpu"](c_tt, a_tt.as_imm(), bpk_tt.as_imm(), ctx)
         ctx.synchronize()
         var t0 = perf_counter_ns()
         for _ in range(ITERS):
             comptime if N == 4096 and K == 4096:  # tuned configs do not compile (header)
                 multistage_gemm_q[group_size=GS, pack_factor=8, config=DEFAULT_Q](
-                    c_tt.to_layout_tensor(), a_tt.as_immut().to_layout_tensor(), bpk_tt.as_immut().to_layout_tensor(), DEFAULT_Q, ctx
+                    c_tt, a_tt.as_imm(), bpk_tt.as_imm(), DEFAULT_Q, ctx
                 )
             else:
-                matmul_gpu_qint4[GS, "gpu"](c_tt, a_tt.as_immut(), bpk_tt.as_immut(), ctx)
+                matmul_gpu_qint4[GS, "gpu"](c_tt, a_tt.as_imm(), bpk_tt.as_imm(), ctx)
         ctx.synchronize()
         var us = Float64(perf_counter_ns() - t0) / 1e3 / ITERS
         total[i] += Float64(count) * us

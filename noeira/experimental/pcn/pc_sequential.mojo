@@ -26,12 +26,12 @@ Layouts (per sample, for one inference step):
 For Phase 1 (CPU), no alignment padding between blocks. Add for GPU later.
 """
 
-from layout import Layout, LayoutTensor
 from max.gpu.host import DeviceContext
 
 
 from .predictive_model import PCBlockTrait
 from .pc_initializer import PCInitializer
+from noeira.core.tiles import Tile, tile
 
 
 @fieldwise_init
@@ -139,9 +139,7 @@ struct PCSequential[*BLOCKS: PCBlockTrait]:
     def pc_init_params[
         INIT: PCInitializer, dtype: DType = DType.float32
     ](
-        mut params: LayoutTensor[
-            dtype, Layout.row_major(Self.PARAM_SIZE), MutAnyOrigin
-        ],
+        params: Tile[dtype, Self.PARAM_SIZE],
     ) raises:
         """Init: per-block `pc_init_params` (vendored
         `PCInitializer`, legacy-`nn`-free). Mirror of `initialize_params`."""
@@ -149,11 +147,7 @@ struct PCSequential[*BLOCKS: PCBlockTrait]:
             params.ptr[unsafe_offset=i] = Scalar[dtype](0)
 
         comptime for i in range(Self.N):
-            var li_p = LayoutTensor[
-                dtype,
-                Layout.row_major(Self.block_types[i].PARAM_SIZE),
-                MutAnyOrigin,
-            ](params.ptr.unsafe_offset(Self._param_offset[i]()))
+            var li_p = tile[Self.block_types[i].PARAM_SIZE](params.ptr.unsafe_offset(Self._param_offset[i]()))
             Self.block_types[i].pc_init_params[INIT, dtype](li_p)
 
     # =========================================================================
@@ -166,15 +160,9 @@ struct PCSequential[*BLOCKS: PCBlockTrait]:
     def forward_eval[
         BATCH: Int, dtype: DType = DType.float32
     ](
-        x_in: LayoutTensor[
-            dtype, Layout.row_major(BATCH, Self.IN_DIM), MutAnyOrigin
-        ],
-        params: LayoutTensor[
-            dtype, Layout.row_major(Self.PARAM_SIZE), MutAnyOrigin
-        ],
-        mut output: LayoutTensor[
-            dtype, Layout.row_major(BATCH, Self.OUT_DIM), MutAnyOrigin
-        ],
+        x_in: Tile[dtype, BATCH, Self.IN_DIM],
+        params: Tile[dtype, Self.PARAM_SIZE],
+        output: Tile[dtype, BATCH, Self.OUT_DIM],
     ):
         """Feedforward: x_in → block_0.predict → ... → block_{N-1}.predict → output.
 
@@ -200,80 +188,40 @@ struct PCSequential[*BLOCKS: PCBlockTrait]:
         for _ in range(BATCH * Self.SCRATCH_OUT_DIM):
             mu_storage.append(0)
 
-        var a_full = LayoutTensor[
-            dtype, Layout.row_major(BATCH * Self.SCRATCH_IN_DIM), MutAnyOrigin
-        ](a_storage)
+        var a_full = tile[BATCH * Self.SCRATCH_IN_DIM](a_storage)
         var a_ptr = a_full.ptr
-        var mu_full = LayoutTensor[
-            dtype, Layout.row_major(BATCH * Self.SCRATCH_OUT_DIM), MutAnyOrigin
-        ](mu_storage)
+        var mu_full = tile[BATCH * Self.SCRATCH_OUT_DIM](mu_storage)
         var mu_ptr = mu_full.ptr
 
         comptime for i in range(Self.N):
-            var li_p = LayoutTensor[
-                dtype,
-                Layout.row_major(Self.block_types[i].PARAM_SIZE),
-                MutAnyOrigin,
-            ](params.ptr.unsafe_offset(Self._param_offset[i]()))
-            var li_a = LayoutTensor[
-                dtype,
-                Layout.row_major(BATCH, Self.block_types[i].IN_DIM),
-                MutAnyOrigin,
-            ](a_ptr.unsafe_offset(BATCH * Self._in_offset[i]()))
+            var li_p = tile[Self.block_types[i].PARAM_SIZE](params.ptr.unsafe_offset(Self._param_offset[i]()))
+            var li_a = tile[BATCH, Self.block_types[i].IN_DIM](a_ptr.unsafe_offset(BATCH * Self._in_offset[i]()))
 
             comptime if i == 0:
                 # Input: external x_in
-                var li_x = LayoutTensor[
-                    dtype,
-                    Layout.row_major(BATCH, Self.block_types[i].IN_DIM),
-                    MutAnyOrigin,
-                ](x_in.ptr)
+                var li_x = tile[BATCH, Self.block_types[i].IN_DIM](x_in.ptr)
                 comptime if Self.N == 1:
                     # Single-block net: write μ directly to external output
-                    var li_mu_out = LayoutTensor[
-                        dtype,
-                        Layout.row_major(BATCH, Self.block_types[i].OUT_DIM),
-                        MutAnyOrigin,
-                    ](output.ptr)
+                    var li_mu_out = tile[BATCH, Self.block_types[i].OUT_DIM](output.ptr)
                     Self.block_types[i].predict[BATCH, dtype](
                         li_x, li_p, li_mu_out, li_a
                     )
                 else:
-                    var li_mu = LayoutTensor[
-                        dtype,
-                        Layout.row_major(BATCH, Self.block_types[i].OUT_DIM),
-                        MutAnyOrigin,
-                    ](mu_ptr.unsafe_offset(BATCH * Self._out_offset[i]()))
+                    var li_mu = tile[BATCH, Self.block_types[i].OUT_DIM](mu_ptr.unsafe_offset(BATCH * Self._out_offset[i]()))
                     Self.block_types[i].predict[BATCH, dtype](
                         li_x, li_p, li_mu, li_a
                     )
             elif i == Self.N - 1:
                 # Last block: input is previous block's μ; write to external output
-                var li_x_below = LayoutTensor[
-                    dtype,
-                    Layout.row_major(BATCH, Self.block_types[i].IN_DIM),
-                    MutAnyOrigin,
-                ](mu_ptr.unsafe_offset(BATCH * Self._out_offset[i - 1]()))
-                var li_mu_out = LayoutTensor[
-                    dtype,
-                    Layout.row_major(BATCH, Self.block_types[i].OUT_DIM),
-                    MutAnyOrigin,
-                ](output.ptr)
+                var li_x_below = tile[BATCH, Self.block_types[i].IN_DIM](mu_ptr.unsafe_offset(BATCH * Self._out_offset[i - 1]()))
+                var li_mu_out = tile[BATCH, Self.block_types[i].OUT_DIM](output.ptr)
                 Self.block_types[i].predict[BATCH, dtype](
                     li_x_below, li_p, li_mu_out, li_a
                 )
             else:
                 # Middle: input is previous block's μ; output to next slot
-                var li_x_below = LayoutTensor[
-                    dtype,
-                    Layout.row_major(BATCH, Self.block_types[i].IN_DIM),
-                    MutAnyOrigin,
-                ](mu_ptr.unsafe_offset(BATCH * Self._out_offset[i - 1]()))
-                var li_mu = LayoutTensor[
-                    dtype,
-                    Layout.row_major(BATCH, Self.block_types[i].OUT_DIM),
-                    MutAnyOrigin,
-                ](mu_ptr.unsafe_offset(BATCH * Self._out_offset[i]()))
+                var li_x_below = tile[BATCH, Self.block_types[i].IN_DIM](mu_ptr.unsafe_offset(BATCH * Self._out_offset[i - 1]()))
+                var li_mu = tile[BATCH, Self.block_types[i].OUT_DIM](mu_ptr.unsafe_offset(BATCH * Self._out_offset[i]()))
                 Self.block_types[i].predict[BATCH, dtype](
                     li_x_below, li_p, li_mu, li_a
                 )
@@ -286,15 +234,9 @@ struct PCSequential[*BLOCKS: PCBlockTrait]:
     def init_latents[
         BATCH: Int, dtype: DType = DType.float32
     ](
-        x_in: LayoutTensor[
-            dtype, Layout.row_major(BATCH, Self.IN_DIM), MutAnyOrigin
-        ],
-        params: LayoutTensor[
-            dtype, Layout.row_major(Self.PARAM_SIZE), MutAnyOrigin
-        ],
-        mut latents: LayoutTensor[
-            dtype, Layout.row_major(BATCH, Self.LATENT_DIM), MutAnyOrigin
-        ],
+        x_in: Tile[dtype, BATCH, Self.IN_DIM],
+        params: Tile[dtype, Self.PARAM_SIZE],
+        latents: Tile[dtype, BATCH, Self.LATENT_DIM],
     ):
         """Forward sweep: x_l ← μ_l for l = 1..N-1 (interior latents).
 
@@ -320,46 +262,24 @@ struct PCSequential[*BLOCKS: PCBlockTrait]:
         )
         for _ in range(BATCH * Self.SCRATCH_IN_DIM):
             a_storage.append(0)
-        var a_full = LayoutTensor[
-            dtype, Layout.row_major(BATCH * Self.SCRATCH_IN_DIM), MutAnyOrigin
-        ](a_storage)
+        var a_full = tile[BATCH * Self.SCRATCH_IN_DIM](a_storage)
         var a_ptr = a_full.ptr
 
         comptime for i in range(Self.N - 1):  # only fill interior latents
-            var li_p = LayoutTensor[
-                dtype,
-                Layout.row_major(Self.block_types[i].PARAM_SIZE),
-                MutAnyOrigin,
-            ](params.ptr.unsafe_offset(Self._param_offset[i]()))
-            var li_a = LayoutTensor[
-                dtype,
-                Layout.row_major(BATCH, Self.block_types[i].IN_DIM),
-                MutAnyOrigin,
-            ](a_ptr.unsafe_offset(BATCH * Self._in_offset[i]()))
+            var li_p = tile[Self.block_types[i].PARAM_SIZE](params.ptr.unsafe_offset(Self._param_offset[i]()))
+            var li_a = tile[BATCH, Self.block_types[i].IN_DIM](a_ptr.unsafe_offset(BATCH * Self._in_offset[i]()))
 
             # Output: latents[..., latent_offset[i]..+OUT_DIM]  (= x_{i+1})
-            var li_mu = LayoutTensor[
-                dtype,
-                Layout.row_major(BATCH, Self.block_types[i].OUT_DIM),
-                MutAnyOrigin,
-            ](latents.ptr.unsafe_offset(BATCH * Self._latent_offset[i]()))
+            var li_mu = tile[BATCH, Self.block_types[i].OUT_DIM](latents.ptr.unsafe_offset(BATCH * Self._latent_offset[i]()))
 
             comptime if i == 0:
-                var li_x = LayoutTensor[
-                    dtype,
-                    Layout.row_major(BATCH, Self.block_types[i].IN_DIM),
-                    MutAnyOrigin,
-                ](x_in.ptr)
+                var li_x = tile[BATCH, Self.block_types[i].IN_DIM](x_in.ptr)
                 Self.block_types[i].predict[BATCH, dtype](
                     li_x, li_p, li_mu, li_a
                 )
             else:
                 # x_below = previous latent: latents[..., latent_offset[i-1]...]
-                var li_x_below = LayoutTensor[
-                    dtype,
-                    Layout.row_major(BATCH, Self.block_types[i].IN_DIM),
-                    MutAnyOrigin,
-                ](latents.ptr.unsafe_offset(BATCH * Self._latent_offset[i - 1]()))
+                var li_x_below = tile[BATCH, Self.block_types[i].IN_DIM](latents.ptr.unsafe_offset(BATCH * Self._latent_offset[i - 1]()))
                 Self.block_types[i].predict[BATCH, dtype](
                     li_x_below, li_p, li_mu, li_a
                 )
@@ -373,84 +293,38 @@ struct PCSequential[*BLOCKS: PCBlockTrait]:
         BATCH: Int, dtype: DType = DType.float32
     ](
         ctx: DeviceContext,
-        x_in: LayoutTensor[
-            dtype, Layout.row_major(BATCH, Self.IN_DIM), MutAnyOrigin
-        ],
-        params: LayoutTensor[
-            dtype, Layout.row_major(Self.PARAM_SIZE), MutAnyOrigin
-        ],
-        mut output: LayoutTensor[
-            dtype, Layout.row_major(BATCH, Self.OUT_DIM), MutAnyOrigin
-        ],
-        mut mu_buf: LayoutTensor[
-            dtype, Layout.row_major(BATCH, Self.SCRATCH_OUT_DIM), MutAnyOrigin
-        ],
-        mut a_buf: LayoutTensor[
-            dtype, Layout.row_major(BATCH, Self.SCRATCH_IN_DIM), MutAnyOrigin
-        ],
+        x_in: Tile[dtype, BATCH, Self.IN_DIM],
+        params: Tile[dtype, Self.PARAM_SIZE],
+        output: Tile[dtype, BATCH, Self.OUT_DIM],
+        mu_buf: Tile[dtype, BATCH, Self.SCRATCH_OUT_DIM],
+        a_buf: Tile[dtype, BATCH, Self.SCRATCH_IN_DIM],
     ) raises:
         """GPU feedforward through all blocks. Caller-owned scratch buffers."""
         comptime for i in range(Self.N):
-            var li_p = LayoutTensor[
-                dtype,
-                Layout.row_major(Self.block_types[i].PARAM_SIZE),
-                MutAnyOrigin,
-            ](params.ptr.unsafe_offset(Self._param_offset[i]()))
-            var li_a = LayoutTensor[
-                dtype,
-                Layout.row_major(BATCH, Self.block_types[i].IN_DIM),
-                MutAnyOrigin,
-            ](a_buf.ptr.unsafe_offset(BATCH * Self._in_offset[i]()))
+            var li_p = tile[Self.block_types[i].PARAM_SIZE](params.ptr.unsafe_offset(Self._param_offset[i]()))
+            var li_a = tile[BATCH, Self.block_types[i].IN_DIM](a_buf.ptr.unsafe_offset(BATCH * Self._in_offset[i]()))
 
             comptime if i == 0:
-                var li_x = LayoutTensor[
-                    dtype,
-                    Layout.row_major(BATCH, Self.block_types[i].IN_DIM),
-                    MutAnyOrigin,
-                ](x_in.ptr)
+                var li_x = tile[BATCH, Self.block_types[i].IN_DIM](x_in.ptr)
                 comptime if Self.N == 1:
-                    var li_mu_out = LayoutTensor[
-                        dtype,
-                        Layout.row_major(BATCH, Self.block_types[i].OUT_DIM),
-                        MutAnyOrigin,
-                    ](output.ptr)
+                    var li_mu_out = tile[BATCH, Self.block_types[i].OUT_DIM](output.ptr)
                     Self.block_types[i].predict_gpu[BATCH, dtype](
                         ctx, li_x, li_p, li_mu_out, li_a
                     )
                 else:
-                    var li_mu = LayoutTensor[
-                        dtype,
-                        Layout.row_major(BATCH, Self.block_types[i].OUT_DIM),
-                        MutAnyOrigin,
-                    ](mu_buf.ptr.unsafe_offset(BATCH * Self._out_offset[i]()))
+                    var li_mu = tile[BATCH, Self.block_types[i].OUT_DIM](mu_buf.ptr.unsafe_offset(BATCH * Self._out_offset[i]()))
                     Self.block_types[i].predict_gpu[BATCH, dtype](
                         ctx, li_x, li_p, li_mu, li_a
                     )
             elif i == Self.N - 1:
-                var li_x_below = LayoutTensor[
-                    dtype,
-                    Layout.row_major(BATCH, Self.block_types[i].IN_DIM),
-                    MutAnyOrigin,
-                ](mu_buf.ptr.unsafe_offset(BATCH * Self._out_offset[i - 1]()))
-                var li_mu_out = LayoutTensor[
-                    dtype,
-                    Layout.row_major(BATCH, Self.block_types[i].OUT_DIM),
-                    MutAnyOrigin,
-                ](output.ptr)
+                var li_x_below = tile[BATCH, Self.block_types[i].IN_DIM](mu_buf.ptr.unsafe_offset(BATCH * Self._out_offset[i - 1]()))
+                var li_mu_out = tile[BATCH, Self.block_types[i].OUT_DIM](output.ptr)
                 Self.block_types[i].predict_gpu[BATCH, dtype](
                     ctx, li_x_below, li_p, li_mu_out, li_a
                 )
             else:
-                var li_x_below = LayoutTensor[
-                    dtype,
-                    Layout.row_major(BATCH, Self.block_types[i].IN_DIM),
-                    MutAnyOrigin,
-                ](mu_buf.ptr.unsafe_offset(BATCH * Self._out_offset[i - 1]()))
-                var li_mu = LayoutTensor[
-                    dtype,
-                    Layout.row_major(BATCH, Self.block_types[i].OUT_DIM),
-                    MutAnyOrigin,
-                ](mu_buf.ptr.unsafe_offset(BATCH * Self._out_offset[i]()))
+                var li_x_below = tile[BATCH, Self.block_types[i].IN_DIM](mu_buf.ptr.unsafe_offset(BATCH * Self._out_offset[i - 1]()))
+                var li_mu = tile[BATCH, Self.block_types[i].OUT_DIM](mu_buf.ptr.unsafe_offset(BATCH * Self._out_offset[i]()))
                 Self.block_types[i].predict_gpu[BATCH, dtype](
                     ctx, li_x_below, li_p, li_mu, li_a
                 )
@@ -460,52 +334,24 @@ struct PCSequential[*BLOCKS: PCBlockTrait]:
         BATCH: Int, dtype: DType = DType.float32
     ](
         ctx: DeviceContext,
-        x_in: LayoutTensor[
-            dtype, Layout.row_major(BATCH, Self.IN_DIM), MutAnyOrigin
-        ],
-        params: LayoutTensor[
-            dtype, Layout.row_major(Self.PARAM_SIZE), MutAnyOrigin
-        ],
-        mut latents: LayoutTensor[
-            dtype, Layout.row_major(BATCH, Self.LATENT_DIM), MutAnyOrigin
-        ],
-        mut a_buf: LayoutTensor[
-            dtype, Layout.row_major(BATCH, Self.SCRATCH_IN_DIM), MutAnyOrigin
-        ],
+        x_in: Tile[dtype, BATCH, Self.IN_DIM],
+        params: Tile[dtype, Self.PARAM_SIZE],
+        latents: Tile[dtype, BATCH, Self.LATENT_DIM],
+        a_buf: Tile[dtype, BATCH, Self.SCRATCH_IN_DIM],
     ) raises:
         """Forward sweep on GPU: x_l ← μ_l for l = 1..N-1."""
         comptime for i in range(Self.N - 1):
-            var li_p = LayoutTensor[
-                dtype,
-                Layout.row_major(Self.block_types[i].PARAM_SIZE),
-                MutAnyOrigin,
-            ](params.ptr.unsafe_offset(Self._param_offset[i]()))
-            var li_a = LayoutTensor[
-                dtype,
-                Layout.row_major(BATCH, Self.block_types[i].IN_DIM),
-                MutAnyOrigin,
-            ](a_buf.ptr.unsafe_offset(BATCH * Self._in_offset[i]()))
-            var li_mu = LayoutTensor[
-                dtype,
-                Layout.row_major(BATCH, Self.block_types[i].OUT_DIM),
-                MutAnyOrigin,
-            ](latents.ptr.unsafe_offset(BATCH * Self._latent_offset[i]()))
+            var li_p = tile[Self.block_types[i].PARAM_SIZE](params.ptr.unsafe_offset(Self._param_offset[i]()))
+            var li_a = tile[BATCH, Self.block_types[i].IN_DIM](a_buf.ptr.unsafe_offset(BATCH * Self._in_offset[i]()))
+            var li_mu = tile[BATCH, Self.block_types[i].OUT_DIM](latents.ptr.unsafe_offset(BATCH * Self._latent_offset[i]()))
 
             comptime if i == 0:
-                var li_x = LayoutTensor[
-                    dtype,
-                    Layout.row_major(BATCH, Self.block_types[i].IN_DIM),
-                    MutAnyOrigin,
-                ](x_in.ptr)
+                var li_x = tile[BATCH, Self.block_types[i].IN_DIM](x_in.ptr)
                 Self.block_types[i].predict_gpu[BATCH, dtype](
                     ctx, li_x, li_p, li_mu, li_a
                 )
             else:
-                var li_x_below = LayoutTensor[
-                    dtype,
-                    Layout.row_major(BATCH, Self.block_types[i].IN_DIM),
-                    MutAnyOrigin,
-                ](latents.ptr.unsafe_offset(BATCH * Self._latent_offset[i - 1]()))
+                var li_x_below = tile[BATCH, Self.block_types[i].IN_DIM](latents.ptr.unsafe_offset(BATCH * Self._latent_offset[i - 1]()))
                 Self.block_types[i].predict_gpu[BATCH, dtype](
                     ctx, li_x_below, li_p, li_mu, li_a
                 )

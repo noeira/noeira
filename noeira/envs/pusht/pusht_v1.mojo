@@ -20,7 +20,6 @@ from std.math import cos, sin, sqrt, pi
 from std.random import random_float64
 from std.random.philox import Random as PhiloxRandom
 from std.memory import alloc
-from layout import LayoutTensor, Layout
 
 from noeira.core import (
     BoxContinuousActionEnv,
@@ -77,6 +76,7 @@ from .physics import (
     detect_wall_contacts_single_env,
     pusht_substep_single_env,
 )
+from noeira.core.tiles import Tile, tile
 
 
 # Inertia for one rectangle's vertices about the body origin (parallel-axis
@@ -232,45 +232,23 @@ struct PushTEnv[DTYPE: DType](
     @always_inline
     def _state_view(
         mut self,
-    ) -> LayoutTensor[
-        dtype, Layout.row_major(1, PushTLayout.STATE_SIZE), MutAnyOrigin
-    ]:
-        return LayoutTensor[
-            dtype,
-            Layout.row_major(1, PushTLayout.STATE_SIZE),
-        ](Span(self.state_data))
+    ) -> Tile[dtype, 1, PushTLayout.STATE_SIZE]:
+        return tile[1, PushTLayout.STATE_SIZE](Span(self.state_data))
 
     @always_inline
     def _shapes_view(
         mut self,
-    ) -> LayoutTensor[
-        dtype,
-        Layout.row_major(PushTShapeBuf.NUM_SHAPES, SHAPE_MAX_SIZE),
-        MutAnyOrigin,
-    ]:
+    ) -> Tile[dtype, PushTShapeBuf.NUM_SHAPES, SHAPE_MAX_SIZE]:
         # Array of InlineArrays is contiguous in Mojo, so we can treat
         # the outer storage's pointer as a flat NUM_SHAPES * SHAPE_MAX_SIZE
         # buffer.
-        return LayoutTensor[
-            dtype,
-            Layout.row_major(PushTShapeBuf.NUM_SHAPES, SHAPE_MAX_SIZE),
-            MutAnyOrigin,
-        ](self.shapes_data.unsafe_ptr().unsafe_bitcast[Scalar[dtype]]().as_unsafe_any_origin())
+        return tile[PushTShapeBuf.NUM_SHAPES, SHAPE_MAX_SIZE](self.shapes_data.unsafe_ptr().unsafe_bitcast[Scalar[dtype]]().as_unsafe_any_origin())
 
     @always_inline
     def _contacts_view(
         mut self,
-    ) -> LayoutTensor[
-        dtype,
-        Layout.row_major(1, PushTLayout.MAX_CONTACTS, CONTACT_DATA_SIZE),
-        MutAnyOrigin,
-    ]:
-        return LayoutTensor[
-            dtype,
-            Layout.row_major(
-                1, PushTLayout.MAX_CONTACTS, CONTACT_DATA_SIZE
-            ),
-        ](Span(self.contacts_data))
+    ) -> Tile[dtype, 1, PushTLayout.MAX_CONTACTS, CONTACT_DATA_SIZE]:
+        return tile[1, PushTLayout.MAX_CONTACTS, CONTACT_DATA_SIZE](Span(self.contacts_data))
 
     # =========================================================================
     # Initialization helpers

@@ -27,9 +27,9 @@ Run:
 """
 
 from std.math import sqrt, log, cos, pi
-from std.memory import alloc, memset
+from std.memory import alloc, unsafe_memset
 from std.random.philox import Random as PhiloxRandom
-from layout import Layout, LayoutTensor
+from noeira.core.tiles import tile
 
 from noeira.nn.constants import DT as dtype
 from noeira.experimental.pcn.pc_initializer import PCXavier
@@ -86,23 +86,15 @@ def main() raises:
     var grads_buf = alloc[Scalar[dtype]](NET.PARAM_SIZE).as_unsafe_any_origin()
     var opt_state_buf = alloc[Scalar[dtype]](NET.PARAM_SIZE * OPT.STATE_PER_PARAM).as_unsafe_any_origin()
     var opt_global_buf = alloc[Scalar[dtype]](OPT.GLOBAL_STATE_SIZE).as_unsafe_any_origin()
-    memset(params_buf, 0, NET.PARAM_SIZE)
-    memset(grads_buf, 0, NET.PARAM_SIZE)
-    memset(opt_state_buf, 0, NET.PARAM_SIZE * OPT.STATE_PER_PARAM)
-    memset(opt_global_buf, 0, OPT.GLOBAL_STATE_SIZE)
+    unsafe_memset(params_buf, 0, NET.PARAM_SIZE)
+    unsafe_memset(grads_buf, 0, NET.PARAM_SIZE)
+    unsafe_memset(opt_state_buf, 0, NET.PARAM_SIZE * OPT.STATE_PER_PARAM)
+    unsafe_memset(opt_global_buf, 0, OPT.GLOBAL_STATE_SIZE)
 
-    var params = LayoutTensor[
-        dtype, Layout.row_major(NET.PARAM_SIZE), MutAnyOrigin
-    ](params_buf)
-    var grads = LayoutTensor[
-        dtype, Layout.row_major(NET.PARAM_SIZE), MutAnyOrigin
-    ](grads_buf)
-    var opt_state = LayoutTensor[
-        dtype, Layout.row_major(NET.PARAM_SIZE, OPT.STATE_PER_PARAM), MutAnyOrigin
-    ](opt_state_buf)
-    var opt_global = LayoutTensor[
-        dtype, Layout.row_major(OPT.GLOBAL_STATE_SIZE), MutAnyOrigin
-    ](opt_global_buf)
+    var params = tile[NET.PARAM_SIZE](params_buf)
+    var grads = tile[NET.PARAM_SIZE](grads_buf)
+    var opt_state = tile[NET.PARAM_SIZE, OPT.STATE_PER_PARAM](opt_state_buf)
+    var opt_global = tile[OPT.GLOBAL_STATE_SIZE](opt_global_buf)
     NET.pc_init_params[PCXavier, dtype](params)
 
     # ── scratch buffers ──────────────────────────────────────────────────────
@@ -112,44 +104,28 @@ def main() raises:
     var z_below_buf_raw = alloc[Scalar[dtype]](BATCH * NET.SCRATCH_IN_DIM).as_unsafe_any_origin()
     var dx_buf_raw = alloc[Scalar[dtype]](BATCH * NET.LATENT_DIM).as_unsafe_any_origin()
     var noise_buf_raw = alloc[Scalar[dtype]](BATCH * NET.LATENT_DIM).as_unsafe_any_origin()
-    memset(lat_buf, 0, BATCH * NET.LATENT_DIM)
-    memset(mu_eps_buf_raw, 0, BATCH * NET.SCRATCH_OUT_DIM)
-    memset(a_below_buf_raw, 0, BATCH * NET.SCRATCH_IN_DIM)
-    memset(z_below_buf_raw, 0, BATCH * NET.SCRATCH_IN_DIM)
-    memset(dx_buf_raw, 0, BATCH * NET.LATENT_DIM)
-    memset(noise_buf_raw, 0, BATCH * NET.LATENT_DIM)
+    unsafe_memset(lat_buf, 0, BATCH * NET.LATENT_DIM)
+    unsafe_memset(mu_eps_buf_raw, 0, BATCH * NET.SCRATCH_OUT_DIM)
+    unsafe_memset(a_below_buf_raw, 0, BATCH * NET.SCRATCH_IN_DIM)
+    unsafe_memset(z_below_buf_raw, 0, BATCH * NET.SCRATCH_IN_DIM)
+    unsafe_memset(dx_buf_raw, 0, BATCH * NET.LATENT_DIM)
+    unsafe_memset(noise_buf_raw, 0, BATCH * NET.LATENT_DIM)
 
-    var latents = LayoutTensor[
-        dtype, Layout.row_major(BATCH, NET.LATENT_DIM), MutAnyOrigin
-    ](lat_buf)
-    var mu_eps_buf = LayoutTensor[
-        dtype, Layout.row_major(BATCH, NET.SCRATCH_OUT_DIM), MutAnyOrigin
-    ](mu_eps_buf_raw)
-    var a_below_buf = LayoutTensor[
-        dtype, Layout.row_major(BATCH, NET.SCRATCH_IN_DIM), MutAnyOrigin
-    ](a_below_buf_raw)
-    var z_below_buf = LayoutTensor[
-        dtype, Layout.row_major(BATCH, NET.SCRATCH_IN_DIM), MutAnyOrigin
-    ](z_below_buf_raw)
-    var dx_buf = LayoutTensor[
-        dtype, Layout.row_major(BATCH, NET.LATENT_DIM), MutAnyOrigin
-    ](dx_buf_raw)
-    var noise_buf = LayoutTensor[
-        dtype, Layout.row_major(BATCH, NET.LATENT_DIM), MutAnyOrigin
-    ](noise_buf_raw)
+    var latents = tile[BATCH, NET.LATENT_DIM](lat_buf)
+    var mu_eps_buf = tile[BATCH, NET.SCRATCH_OUT_DIM](mu_eps_buf_raw)
+    var a_below_buf = tile[BATCH, NET.SCRATCH_IN_DIM](a_below_buf_raw)
+    var z_below_buf = tile[BATCH, NET.SCRATCH_IN_DIM](z_below_buf_raw)
+    var dx_buf = tile[BATCH, NET.LATENT_DIM](dx_buf_raw)
+    var noise_buf = tile[BATCH, NET.LATENT_DIM](noise_buf_raw)
 
     # ── x_in is always 1.0 (pseudo-input — drives the bias-only block_0) ─────
     var x_in_buf = alloc[Scalar[dtype]](BATCH * NET.IN_DIM).as_unsafe_any_origin()
     for i in range(BATCH * NET.IN_DIM):
         x_in_buf[i] = Scalar[dtype](1.0)
-    var x_in = LayoutTensor[
-        dtype, Layout.row_major(BATCH, NET.IN_DIM), MutAnyOrigin
-    ](x_in_buf)
+    var x_in = tile[BATCH, NET.IN_DIM](x_in_buf)
 
     var y_data_buf = alloc[Scalar[dtype]](BATCH * NET.OUT_DIM).as_unsafe_any_origin()
-    var y_data = LayoutTensor[
-        dtype, Layout.row_major(BATCH, NET.OUT_DIM), MutAnyOrigin
-    ](y_data_buf)
+    var y_data = tile[BATCH, NET.OUT_DIM](y_data_buf)
 
     # ── Train ────────────────────────────────────────────────────────────────
     print("\n  epoch | last_loss")
@@ -219,44 +195,26 @@ def main() raises:
     var gen_sample_buf = alloc[Scalar[dtype]](GEN_BATCH * NET.OUT_DIM).as_unsafe_any_origin()
     var gen_x_in_buf = alloc[Scalar[dtype]](GEN_BATCH * NET.IN_DIM).as_unsafe_any_origin()
     var gen_y_dummy_buf = alloc[Scalar[dtype]](GEN_BATCH * NET.OUT_DIM).as_unsafe_any_origin()
-    memset(gen_lat_buf, 0, GEN_BATCH * NET.LATENT_DIM)
-    memset(gen_mu_eps_buf_raw, 0, GEN_BATCH * NET.SCRATCH_OUT_DIM)
-    memset(gen_a_below_buf_raw, 0, GEN_BATCH * NET.SCRATCH_IN_DIM)
-    memset(gen_z_below_buf_raw, 0, GEN_BATCH * NET.SCRATCH_IN_DIM)
-    memset(gen_dx_buf_raw, 0, GEN_BATCH * NET.LATENT_DIM)
-    memset(gen_noise_buf_raw, 0, GEN_BATCH * NET.LATENT_DIM)
-    memset(gen_sample_buf, 0, GEN_BATCH * NET.OUT_DIM)
-    memset(gen_y_dummy_buf, 0, GEN_BATCH * NET.OUT_DIM)
+    unsafe_memset(gen_lat_buf, 0, GEN_BATCH * NET.LATENT_DIM)
+    unsafe_memset(gen_mu_eps_buf_raw, 0, GEN_BATCH * NET.SCRATCH_OUT_DIM)
+    unsafe_memset(gen_a_below_buf_raw, 0, GEN_BATCH * NET.SCRATCH_IN_DIM)
+    unsafe_memset(gen_z_below_buf_raw, 0, GEN_BATCH * NET.SCRATCH_IN_DIM)
+    unsafe_memset(gen_dx_buf_raw, 0, GEN_BATCH * NET.LATENT_DIM)
+    unsafe_memset(gen_noise_buf_raw, 0, GEN_BATCH * NET.LATENT_DIM)
+    unsafe_memset(gen_sample_buf, 0, GEN_BATCH * NET.OUT_DIM)
+    unsafe_memset(gen_y_dummy_buf, 0, GEN_BATCH * NET.OUT_DIM)
     for i in range(GEN_BATCH * NET.IN_DIM):
         gen_x_in_buf[i] = Scalar[dtype](1.0)
 
-    var gen_lat = LayoutTensor[
-        dtype, Layout.row_major(GEN_BATCH, NET.LATENT_DIM), MutAnyOrigin
-    ](gen_lat_buf)
-    var gen_mu_eps = LayoutTensor[
-        dtype, Layout.row_major(GEN_BATCH, NET.SCRATCH_OUT_DIM), MutAnyOrigin
-    ](gen_mu_eps_buf_raw)
-    var gen_a_below = LayoutTensor[
-        dtype, Layout.row_major(GEN_BATCH, NET.SCRATCH_IN_DIM), MutAnyOrigin
-    ](gen_a_below_buf_raw)
-    var gen_z_below = LayoutTensor[
-        dtype, Layout.row_major(GEN_BATCH, NET.SCRATCH_IN_DIM), MutAnyOrigin
-    ](gen_z_below_buf_raw)
-    var gen_dx = LayoutTensor[
-        dtype, Layout.row_major(GEN_BATCH, NET.LATENT_DIM), MutAnyOrigin
-    ](gen_dx_buf_raw)
-    var gen_noise = LayoutTensor[
-        dtype, Layout.row_major(GEN_BATCH, NET.LATENT_DIM), MutAnyOrigin
-    ](gen_noise_buf_raw)
-    var gen_x_in = LayoutTensor[
-        dtype, Layout.row_major(GEN_BATCH, NET.IN_DIM), MutAnyOrigin
-    ](gen_x_in_buf)
-    var gen_y_dummy = LayoutTensor[
-        dtype, Layout.row_major(GEN_BATCH, NET.OUT_DIM), MutAnyOrigin
-    ](gen_y_dummy_buf)
-    var gen_sample = LayoutTensor[
-        dtype, Layout.row_major(GEN_BATCH, NET.OUT_DIM), MutAnyOrigin
-    ](gen_sample_buf)
+    var gen_lat = tile[GEN_BATCH, NET.LATENT_DIM](gen_lat_buf)
+    var gen_mu_eps = tile[GEN_BATCH, NET.SCRATCH_OUT_DIM](gen_mu_eps_buf_raw)
+    var gen_a_below = tile[GEN_BATCH, NET.SCRATCH_IN_DIM](gen_a_below_buf_raw)
+    var gen_z_below = tile[GEN_BATCH, NET.SCRATCH_IN_DIM](gen_z_below_buf_raw)
+    var gen_dx = tile[GEN_BATCH, NET.LATENT_DIM](gen_dx_buf_raw)
+    var gen_noise = tile[GEN_BATCH, NET.LATENT_DIM](gen_noise_buf_raw)
+    var gen_x_in = tile[GEN_BATCH, NET.IN_DIM](gen_x_in_buf)
+    var gen_y_dummy = tile[GEN_BATCH, NET.OUT_DIM](gen_y_dummy_buf)
+    var gen_sample = tile[GEN_BATCH, NET.OUT_DIM](gen_sample_buf)
 
     # ── Sanity-check Box-Muller noise: should be ~N(0, 1) ───────────────────
     var rng_test = PhiloxRandom(seed=UInt64(7), offset=UInt64(2_000_000))

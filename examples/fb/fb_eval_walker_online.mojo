@@ -32,7 +32,7 @@ other one. Written separately so the sweep's binary is untouched.
 
 from std.math import abs, sqrt
 from std.random import random_float64, seed
-from std.sys import argv
+from std.sys import argv, get_defined_int
 
 from noeira.nn.constants import DT
 from noeira.nn.core.tensor import Tensor
@@ -49,8 +49,10 @@ from noeira.envs.phyics3d_env import Phyics3dEnv
 from noeira.envs.phyics3d_env_config import Phyics3dEnvConfig
 from noeira.envs.dm_control.walker import DMWalkerModel, DMWalkerConfig
 
+from noeira.nn.core.module import Module
 from noeira.deep_agents.fb.trainer import FBTrainer
 from noeira.deep_agents.fb import z_from_reward
+from noeira.deep_agents.fb.walker_nets import WalkerBNetProj
 
 
 comptime NQ: Int = 9
@@ -77,7 +79,12 @@ comptime BNet = Sequential[
 comptime ANet = Sequential[
     Linear[A_IN, HID], ReLU[HID], Linear[HID, NACT], Tanh[NACT]
 ]
-comptime Trainer = FBTrainer[FNet, BNet, ANet, OBS, NACT, D, BATCH, "cpu"]
+# `-D B_PROJ=1` (mojo BUILD, not run — a stale define-less compile is reused
+# by `mojo run`): B reads the walker projection ϑ_w instead of the whole
+# observation — the FB-MEBE rung-W arms (`fb_mebe_walker_gpu.mojo`). Every
+# other net is the same family, so one eval scores both.
+comptime B_PROJ: Int = get_defined_int["B_PROJ", 0]()
+comptime TrainerOf[BN: Module] = FBTrainer[FNet, BN, ANet, OBS, NACT, D, BATCH, "cpu"]
 comptime ScorerEnv = Phyics3dEnv[
     DMWalkerModel, DMWalkerConfig[0.0], DType.float64, False
 ]
@@ -154,9 +161,9 @@ def _z_for_task[
 
 
 def _rollout[
-    CONFIG: Phyics3dEnvConfig
+    CONFIG: Phyics3dEnvConfig, BN: Module
 ](
-    mut t: Trainer, ref z: Tensor, use_policy: Bool, ep_seed: Int,
+    mut t: TrainerOf[BN], ref z: Tensor, use_policy: Bool, ep_seed: Int,
     mut act_mean_abs: Float64, mut act_sat_frac: Float64,
 ) raises -> Float64:
     comptime Env = Phyics3dEnv[DMWalkerModel, CONFIG, DType.float64, False]
@@ -199,8 +206,8 @@ def _rollout[
 
 
 def _eval_task[
-    CONFIG: Phyics3dEnvConfig
-](mut t: Trainer, ref z: Tensor, name: String, episodes: Int) raises:
+    CONFIG: Phyics3dEnvConfig, BN: Module
+](mut t: TrainerOf[BN], ref z: Tensor, name: String, episodes: Int) raises:
     var diffs = List[Float64]()
     var rp = Float64(0)
     var rr = Float64(0)
@@ -209,10 +216,10 @@ def _eval_task[
     for ep in range(episodes):
         var ama = Float64(0)
         var asf = Float64(0)
-        var a = _rollout[CONFIG](t, z, True, SEED + 1000 + ep, ama, asf)
+        var a = _rollout[CONFIG, BN](t, z, True, SEED + 1000 + ep, ama, asf)
         var da = Float64(0)
         var db = Float64(0)
-        var b = _rollout[CONFIG](t, z, False, SEED + 1000 + ep, da, db)
+        var b = _rollout[CONFIG, BN](t, z, False, SEED + 1000 + ep, da, db)
         mean_abs += ama
         sat_frac += asf
         rp += a
@@ -247,6 +254,14 @@ def _eval_task[
 
 
 def main() raises:
+    comptime if B_PROJ == 1:
+        print("[B_PROJ=1] B reads the walker projection ϑ_w")
+        _main[WalkerBNetProj]()
+    else:
+        _main[BNet]()
+
+
+def _main[BN: Module]() raises:
     var av = argv()
     if len(av) < 2 or String(av[1]).startswith("--"):
         raise Error("usage: fb_eval_walker_online.mojo <ckpt> [--episodes N] [--rows N]")
@@ -254,7 +269,7 @@ def main() raises:
     var episodes = atol(_flag(String("--episodes"), String(EVAL_EPISODES_DEFAULT)))
     var n_relabel = atol(_flag(String("--rows"), String(RELABEL_ROWS_DEFAULT)))
     print("[1] loading checkpoint", ck, "(online arm, OBS =", OBS, ") ...")
-    var t = Trainer.make(lr=3e-4, ctx=None)
+    var t = TrainerOf[BN].make(lr=3e-4, ctx=None)
     t.load_state(ck)
 
     print("[2] loading", STORE, "for relabelling ...")
@@ -328,9 +343,9 @@ def main() raises:
               " responding to its reward; the numbers below are one experiment")
 
     print("[4] rolling out", episodes, "x", EVAL_LEN, "steps per task, paired ...")
-    _eval_task[DMWalkerConfig[0.0]](t, z_stand, String("stand"), episodes)
-    _eval_task[DMWalkerConfig[1.0]](t, z_walk, String("walk "), episodes)
-    _eval_task[DMWalkerConfig[8.0]](t, z_run, String("run  "), episodes)
+    _eval_task[DMWalkerConfig[0.0], BN](t, z_stand, String("stand"), episodes)
+    _eval_task[DMWalkerConfig[1.0], BN](t, z_walk, String("walk "), episodes)
+    _eval_task[DMWalkerConfig[8.0], BN](t, z_run, String("run  "), episodes)
     print("")
     print("Offline bar (A2 winner, two seeds, §18.6.2): stand 1.51  walk 1.82  run 1.44")
     print("SAC expert returns in the store:             ~983      ~965      ~720")

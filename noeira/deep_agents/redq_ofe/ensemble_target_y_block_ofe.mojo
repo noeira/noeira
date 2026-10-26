@@ -26,7 +26,6 @@ just the first-input width — passing PHI_S_DIM there is correct).
 
 from max.gpu import global_idx
 from max.gpu.host import DeviceContext
-from layout import Layout, LayoutTensor
 from std.random import random_float64
 
 from noeira.nn.constants import DT, TPB
@@ -244,16 +243,10 @@ struct EnsembleTargetYBlockOFE[
                 Self.SA_IN_DIM, Self.ALP_DIM,
             ]
             c.enqueue_function[kernel](
-                phi_sp.lt[
-                    "gpu", Layout.row_major(Self.BATCH, Self.PHI_S_DIM)
-                ](),
-                self._mb_alp.lt[
-                    "gpu", Layout.row_major(Self.BATCH, Self.ALP_DIM)
-                ](),
-                self._mb_sa_in.lt[
-                    "gpu", Layout.row_major(Self.BATCH, Self.SA_IN_DIM)
-                ](),
-                self._mb_lp.lt["gpu", Layout.row_major(Self.BATCH)](),
+                phi_sp.tt["gpu", Self.BATCH, Self.PHI_S_DIM](),
+                self._mb_alp.tt["gpu", Self.BATCH, Self.ALP_DIM](),
+                self._mb_sa_in.tt["gpu", Self.BATCH, Self.SA_IN_DIM](),
+                self._mb_lp.tt["gpu", Self.BATCH](),
                 grid_dim=n_blocks, block_dim=TPB,
             )
 
@@ -281,10 +274,8 @@ struct EnsembleTargetYBlockOFE[
                 c.enqueue_function[
                     _copy_row_kernel[Self.N * Self.BATCH, Self.BATCH]
                 ](
-                    self._mb_q_i.lt["gpu", Layout.row_major(Self.BATCH)](),
-                    self._mb_stacked_q.lt[
-                        "gpu", Layout.row_major(Self.N * Self.BATCH)
-                    ](),
+                    self._mb_q_i.tt["gpu", Self.BATCH](),
+                    self._mb_stacked_q.tt["gpu", Self.N * Self.BATCH](),
                     Int64(i * Self.BATCH),
                     grid_dim=nb, block_dim=TPB,
                 )
@@ -320,7 +311,7 @@ struct EnsembleTargetYBlockOFE[
                 self._mb_stacked_q,
                 state.mb_d,
                 self._mb_lp,
-                self._subset_dev.lt["gpu", Layout.row_major(Self.N_MIN)](),
+                self._subset_dev.tt["gpu", Self.N_MIN](),
                 self.gamma,
                 alpha,
             )

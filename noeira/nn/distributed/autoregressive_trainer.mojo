@@ -51,7 +51,6 @@ GPU only, fp32, eager: no CUDA-graph capture (ZeRO-2/3 enqueue from fibers;
 from std.random import random_ui64
 from std.memory import Pointer
 from max.gpu.host import DeviceContext
-from layout import Layout
 
 from noeira.nn.constants import DT, TPB
 from noeira.nn.core.module import Module
@@ -120,9 +119,9 @@ def _window_batch[
         mptr(corpus.dev.value().unsafe_ptr()),
         Int64(corpus.n - SEQ),
         Int64(row_off),
-        sampler.lt["gpu", Layout.row_major(2)](),
-        inp.lt["gpu", Layout.row_major(TOTAL)](),
-        tgt.lt["gpu", Layout.row_major(TOTAL)](),
+        sampler.tt["gpu", 2](),
+        inp.tt["gpu", TOTAL](),
+        tgt.tt["gpu", TOTAL](),
         grid_dim=(TOTAL + TPB - 1) // TPB,
         block_dim=TPB,
     )
@@ -205,7 +204,7 @@ struct _RankLM[NET: Module, VOCAB: Int, SEQ: Int, BL: Int](Movable, RankStep):
                     self.in_t, self.tgt_t,
                 )
                 self.ctx.enqueue_function[advance_step_kernel](
-                    self.sampler.lt["gpu", Layout.row_major(2)](),
+                    self.sampler.tt["gpu", 2](),
                     grid_dim=1,
                     block_dim=1,
                 )

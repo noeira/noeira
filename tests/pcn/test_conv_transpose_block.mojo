@@ -14,7 +14,7 @@ Run:
 
 from std.memory import alloc
 from std.math import sin
-from layout import Layout, LayoutTensor
+from noeira.core.tiles import Tile, tile
 
 from noeira.experimental.pcn.pc_initializer import PCXavier
 from noeira.experimental.pcn.pc_conv_transpose_block import (
@@ -33,11 +33,11 @@ comptime PSZ = CB.PARAM_SIZE
 
 
 def _energy(
-    x_small: LayoutTensor[dtype, Layout.row_major(BATCH, IN), MutAnyOrigin],
+    x_small: Tile[dtype, BATCH, IN],
     x_above: Pointer[Scalar[dtype], MutAnyOrigin],
-    params: LayoutTensor[dtype, Layout.row_major(PSZ), MutAnyOrigin],
-    mut mu: LayoutTensor[dtype, Layout.row_major(BATCH, OUT), MutAnyOrigin],
-    mut a: LayoutTensor[dtype, Layout.row_major(BATCH, IN), MutAnyOrigin],
+    params: Tile[dtype, PSZ],
+    mu: Tile[dtype, BATCH, OUT],
+    a: Tile[dtype, BATCH, IN],
 ) -> Float64:
     CB.predict[BATCH, dtype](x_small, params, mu, a)
     var e: Float64 = 0.0
@@ -64,18 +64,12 @@ def main() raises:
     for i in range(BATCH * OUT):
         y_buf[i] = Scalar[dtype](sin(Float32(i) * 1.3 + 0.9))
 
-    var x = LayoutTensor[dtype, Layout.row_major(BATCH, IN), MutAnyOrigin](x_buf)
-    var y = LayoutTensor[dtype, Layout.row_major(BATCH, OUT), MutAnyOrigin](
-        y_buf
-    )
-    var params = LayoutTensor[dtype, Layout.row_major(PSZ), MutAnyOrigin](
-        params_buf
-    )
-    var mu = LayoutTensor[dtype, Layout.row_major(BATCH, OUT), MutAnyOrigin](
-        mu_buf
-    )
-    var a = LayoutTensor[dtype, Layout.row_major(BATCH, IN), MutAnyOrigin](a_buf)
-    var z = LayoutTensor[dtype, Layout.row_major(BATCH, IN), MutAnyOrigin](z_buf)
+    var x = tile[BATCH, IN](x_buf)
+    var y = tile[BATCH, OUT](y_buf)
+    var params = tile[PSZ](params_buf)
+    var mu = tile[BATCH, OUT](mu_buf)
+    var a = tile[BATCH, IN](a_buf)
+    var z = tile[BATCH, IN](z_buf)
     CB.pc_init_params[PCXavier, dtype](params)  # bias starts at 0
 
     # ── 1. Adjoint identity ───────────────────────────────────────────────────
@@ -98,13 +92,9 @@ def main() raises:
     var eps_buf = alloc[Scalar[dtype]](BATCH * OUT).as_unsafe_any_origin()
     for i in range(BATCH * OUT):
         eps_buf[i] = y_buf[i] - mu_buf[i]
-    var eps = LayoutTensor[dtype, Layout.row_major(BATCH, OUT), MutAnyOrigin](
-        eps_buf
-    )
+    var eps = tile[BATCH, OUT](eps_buf)
     var grads_buf = alloc[Scalar[dtype]](PSZ).as_unsafe_any_origin()
-    var grads = LayoutTensor[dtype, Layout.row_major(PSZ), MutAnyOrigin](
-        grads_buf
-    )
+    var grads = tile[PSZ](grads_buf)
     CB.weight_grad[BATCH, dtype](eps, a, grads)
 
     var h: Float64 = 1e-2

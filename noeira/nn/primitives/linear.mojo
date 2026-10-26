@@ -25,13 +25,15 @@ the whole function, then builds views from that.
 from noeira.nn.core.mm import mm, mm_bias, bmm
 from noeira.nn.core.cublaslt_gemm import cublaslt_gemm, EPI_BIAS, LT_BIAS
 from noeira.nn.core.cublas_gemm import cublas_gemm, cublas_gemm_lp, GEMM_PATH, CUBLAS_BWD, cublas_fwd, cublas_tf32
-from std.sys import has_nvidia_gpu_accelerator
+from std.sys import default_accelerator
 from std.sys import CompilationTarget
 from max.gpu import global_idx, thread_idx, block_idx
 from max.gpu.sync import barrier
+from max.gpu.primitives import block
 from max.gpu.memory import AddressSpace
 from max.gpu.host import DeviceContext, DeviceBuffer
-from layout import Layout, LayoutTensor, TileTensor, row_major
+from layout import TileTensor, row_major
+from noeira.core.tiles import RowMajor, tile, shared_tile
 from linalg.matmul import matmul as max_matmul
 from noeira.nn.core.splitk_gemm import (
     splitk_path_applies,
@@ -110,12 +112,7 @@ def _transpose_tiled_kernel[
 ):
     var ROWS = Int(rows_arg)
     var COLS = Int(cols_arg)
-    var tile = LayoutTensor[
-        ADT,
-        Layout.row_major(_T_TILE, _T_TILE + 1),  # +1 pad → no bank conflicts
-        MutAnyOrigin,
-        address_space=AddressSpace.SHARED,
-    ].stack_allocation()
+    var tile = shared_tile[ADT, _T_TILE, _T_TILE + 1]()
 
     var cy = Int(block_idx.y) * _T_TILE  # tile origin in ROWS
     var cx = Int(block_idx.x) * _T_TILE  # tile origin in COLS
@@ -173,10 +170,7 @@ def _lin_gb_partial_kernel[
     var j = Int(block_idx.x) * _GB_COLS + tx
     var r0 = Int(block_idx.y) * _GB_CHUNK
     var r1 = min(r0 + _GB_CHUNK, n_b)
-    var acc = LayoutTensor[
-        DT, Layout.row_major(_GB_ROWS, _GB_COLS), MutAnyOrigin,
-        address_space=AddressSpace.SHARED,
-    ].stack_allocation()
+    var acc = shared_tile[DT, _GB_ROWS, _GB_COLS]()
     var s: Scalar[DT] = 0
     if j < n_out:
         var r = r0 + ty
@@ -243,6 +237,382 @@ def enqueue_bias_grad[ADT: DType](
         grid_dim=(OUT + 255) // 256,
         block_dim=256,
     )
+
+
+comptime TWO_PASS_MIN_ELEMS = (
+    1 << 19 if default_accelerator().is_nvidia_gpu() else 1 << 17
+)
+"""Smallest [R, C] reduction a primitive sends down the two-pass helpers
+below when its old kernel was ONE launch of a block per column. Two launches
+cost a fixed floor however small the tensor, so under this the single launch
+wins (`bench_param_grad_reductions.mojo`):
+  M1 Pro (Metal, ~25 us a launch): R·C = 2^16 ran 0.6-0.7x of the old
+  kernel, 2^17 1.0-1.1x, 2^18 1.7x;
+  RTX 5090 (~3 us a launch, and a 96 MB L2 that soaks up the old kernel's
+  row-strided reads): 2^18 0.81-0.85x, 2^19 1.2-1.3x, 2^20 2.0-2.2x.
+Keeps DreamerV3's 16-row world-model norms on their old kernel on both."""
+
+comptime CHANNEL_TWO_PASS_MIN_ROWS = (
+    1 << 15 if default_accelerator().is_nvidia_gpu() else 0
+)
+"""Smallest rows-per-channel (B·HW) an NCHW per-channel reduction sends
+down `enqueue_channel_grad` / `enqueue_channel_dot_grad` instead of one block
+per channel. Metal: always (1.1x at 2,304 rows, 1.9x at 9,216). RTX 5090:
+9,216 rows 0.65-0.8x, 18,432 0.9-1.1x, 36,864 1.3-2.0x, an RGB decoder head
+(147k rows, 4 channels) 17x."""
+
+
+# gw += Σ_rows go·x (and gb += Σ_rows go): the weighted form of
+# `enqueue_bias_grad`, for a norm's γ (and β) gradient. Same two passes, same
+# chunking, same fixed order.
+def _lin_dot_partial_kernel[
+    ADT: DType = DT, WITH_SUM: Bool = False
+](
+    go: Pointer[Scalar[ADT], MutAnyOrigin],
+    x: Pointer[Scalar[DT], MutAnyOrigin],
+    part: Pointer[Scalar[DT], MutAnyOrigin],
+    b_arg: Int64,
+    out_arg: Int64,
+):
+    """`part[c, j] = Σ go·x` over the rows of chunk c and, with `WITH_SUM`,
+    `part[CHUNKS + c, j] = Σ go`. Block (`_GB_COLS`, `_GB_ROWS`) as in
+    `_lin_gb_partial_kernel`."""
+    var n_out = Int(out_arg)
+    var n_b = Int(b_arg)
+    var chunks = (n_b + _GB_CHUNK - 1) // _GB_CHUNK
+    var tx = Int(thread_idx.x)
+    var ty = Int(thread_idx.y)
+    var j = Int(block_idx.x) * _GB_COLS + tx
+    var ch = Int(block_idx.y)
+    var r0 = ch * _GB_CHUNK
+    var r1 = min(r0 + _GB_CHUNK, n_b)
+    var acc = shared_tile[DT, 2 * _GB_ROWS, _GB_COLS]()
+    var sw: Scalar[DT] = 0
+    var sb: Scalar[DT] = 0
+    if j < n_out:
+        var r = r0 + ty
+        while r < r1:
+            var g = go[unsafe_offset=r * n_out + j].cast[DT]()
+            sw += g * x[unsafe_offset=r * n_out + j]
+            comptime if WITH_SUM:
+                sb += g
+            r += _GB_ROWS
+    acc[ty, tx] = sw
+    comptime if WITH_SUM:
+        acc[_GB_ROWS + ty, tx] = sb
+    barrier()
+    if ty == 0 and j < n_out:
+        var tw: Scalar[DT] = 0
+        var tb: Scalar[DT] = 0
+        comptime for k in range(_GB_ROWS):
+            tw += rebind[Scalar[DT]](acc[k, tx])
+            comptime if WITH_SUM:
+                tb += rebind[Scalar[DT]](acc[_GB_ROWS + k, tx])
+        part[unsafe_offset=ch * n_out + j] = tw
+        comptime if WITH_SUM:
+            part[unsafe_offset=(chunks + ch) * n_out + j] = tb
+
+
+def _lin_dot_final_kernel[
+    WITH_SUM: Bool = False
+](
+    part: Pointer[Scalar[DT], MutAnyOrigin],
+    gw: Pointer[Scalar[DT], MutAnyOrigin],
+    gb: Pointer[Scalar[DT], MutAnyOrigin],
+    chunks_arg: Int64,
+    out_arg: Int64,
+):
+    """`gw[j] += Σ_c part[c, j]` and, with `WITH_SUM`, `gb[j] += Σ_c
+    part[CHUNKS + c, j]`, chunks in order. Without `WITH_SUM`, `gb` is never
+    touched."""
+    var n_out = Int(out_arg)
+    var chunks = Int(chunks_arg)
+    var j = Int(global_idx.x)
+    if j < n_out:
+        var tw: Scalar[DT] = 0
+        var tb: Scalar[DT] = 0
+        for c in range(chunks):
+            tw += part[unsafe_offset=c * n_out + j]
+            comptime if WITH_SUM:
+                tb += part[unsafe_offset=(chunks + c) * n_out + j]
+        gw[unsafe_offset=j] += tw
+        comptime if WITH_SUM:
+            gb[unsafe_offset=j] += tb
+
+
+def _enqueue_dot[ADT: DType, WITH_SUM: Bool](
+    c: DeviceContext,
+    go: DeviceBuffer[ADT],
+    x: DeviceBuffer[DT],
+    gw: DeviceBuffer[DT],
+    gb: DeviceBuffer[DT],
+    B: Int,
+    OUT: Int,
+    mut part: Tensor,
+) raises:
+    var chunks = (B + _GB_CHUNK - 1) // _GB_CHUNK
+    comptime NSUMS = 2 if WITH_SUM else 1
+    part.ensure_gpu(c, NSUMS * chunks * OUT)
+    c.enqueue_function[_lin_dot_partial_kernel[ADT, WITH_SUM]](
+        go,
+        x,
+        part.dev.value(),
+        Int64(B),
+        Int64(OUT),
+        grid_dim=((OUT + _GB_COLS - 1) // _GB_COLS, chunks),
+        block_dim=(_GB_COLS, _GB_ROWS),
+    )
+    c.enqueue_function[_lin_dot_final_kernel[WITH_SUM]](
+        part.dev.value(),
+        gw,
+        gb,
+        Int64(chunks),
+        Int64(OUT),
+        grid_dim=(OUT + 255) // 256,
+        block_dim=256,
+    )
+
+
+def enqueue_dot_grad[ADT: DType](
+    c: DeviceContext,
+    go: DeviceBuffer[ADT],
+    x: DeviceBuffer[DT],
+    gw: DeviceBuffer[DT],
+    B: Int,
+    OUT: Int,
+    mut part: Tensor,
+) raises:
+    """`gw += Σ_rows go·x` for [B, OUT] `go` (ADT) and `x` (fp32): an RMSNorm
+    γ gradient. `enqueue_bias_grad`'s two passes with a product; fp32
+    accumulator, deterministic, `part` sized lazily (capture-safe)."""
+    _enqueue_dot[ADT, False](c, go, x, gw, gw, B, OUT, part)
+
+
+def enqueue_dot_bias_grad[ADT: DType](
+    c: DeviceContext,
+    go: DeviceBuffer[ADT],
+    x: DeviceBuffer[DT],
+    gw: DeviceBuffer[DT],
+    gb: DeviceBuffer[DT],
+    B: Int,
+    OUT: Int,
+    mut part: Tensor,
+) raises:
+    """`gw += Σ_rows go·x` and `gb += Σ_rows go` in one read of `go`: a
+    LayerNorm γ / β gradient. `part` holds `2 · chunks · OUT`."""
+    _enqueue_dot[ADT, True](c, go, x, gw, gb, B, OUT, part)
+
+
+# mean / biased variance of every column of [B, OUT] (a batch norm's train
+# statistics): an exact two-pass inside each chunk of rows, the chunks merged
+# in order (Chan et al.), all on data shifted by the column's first row. Same
+# chunking and block shape as the sums above.
+def _lin_mv_partial_kernel(
+    x: Pointer[Scalar[DT], MutAnyOrigin],
+    part: Pointer[Scalar[DT], MutAnyOrigin],
+    b_arg: Int64,
+    out_arg: Int64,
+):
+    """With K = x[0, j]: `part[c, j] = Σ (x - K)` over the rows of chunk c and
+    `part[CHUNKS + c, j] = Σ (x - K - m_c)²`, m_c that chunk's mean of x - K:
+    a second sweep of the same ≤ 1024 rows, so the squares are centred and
+    never cancel. The shift keeps the chunk sums at the data's spread, not
+    its offset; unshifted, the 1e6-sized sums of a column at 1000 leaked
+    their rounding into the merge (1e-5 relative variance error, 2e-7 now)."""
+    var n_out = Int(out_arg)
+    var n_b = Int(b_arg)
+    var chunks = (n_b + _GB_CHUNK - 1) // _GB_CHUNK
+    var tx = Int(thread_idx.x)
+    var ty = Int(thread_idx.y)
+    var j = Int(block_idx.x) * _GB_COLS + tx
+    var ch = Int(block_idx.y)
+    var r0 = ch * _GB_CHUNK
+    var r1 = min(r0 + _GB_CHUNK, n_b)
+    var acc = shared_tile[DT, _GB_ROWS, _GB_COLS]()
+    var k0: Scalar[DT] = 0
+    var s: Scalar[DT] = 0
+    if j < n_out:
+        k0 = x[unsafe_offset=j]
+        var r = r0 + ty
+        while r < r1:
+            s += x[unsafe_offset=r * n_out + j] - k0
+            r += _GB_ROWS
+    acc[ty, tx] = s
+    barrier()
+    var tot: Scalar[DT] = 0
+    comptime for k in range(_GB_ROWS):
+        tot += rebind[Scalar[DT]](acc[k, tx])
+    var m = tot / Scalar[DT](r1 - r0)
+    barrier()  # every lane has read `acc` before it is reused
+    var q: Scalar[DT] = 0
+    if j < n_out:
+        var r = r0 + ty
+        while r < r1:
+            var d = x[unsafe_offset=r * n_out + j] - k0 - m
+            q += d * d
+            r += _GB_ROWS
+    acc[ty, tx] = q
+    barrier()
+    if ty == 0 and j < n_out:
+        var tq: Scalar[DT] = 0
+        comptime for k in range(_GB_ROWS):
+            tq += rebind[Scalar[DT]](acc[k, tx])
+        part[unsafe_offset=ch * n_out + j] = tot
+        part[unsafe_offset=(chunks + ch) * n_out + j] = tq
+
+
+def _lin_mv_final_kernel(
+    x: Pointer[Scalar[DT], MutAnyOrigin],
+    part: Pointer[Scalar[DT], MutAnyOrigin],
+    mean: Pointer[Scalar[DT], MutAnyOrigin],
+    var_: Pointer[Scalar[DT], MutAnyOrigin],
+    b_arg: Int64,
+    out_arg: Int64,
+):
+    """With K = x[0, j] and S_c the shifted chunk sums: `mean[j] = K + μ`,
+    μ = Σ_c S_c / B, and `var_[j] = Σ_c (M2_c + n_c·(S_c/n_c - μ)²) / B`,
+    chunks in order. Overwrites (statistics, not gradients)."""
+    var n_out = Int(out_arg)
+    var n_b = Int(b_arg)
+    var chunks = (n_b + _GB_CHUNK - 1) // _GB_CHUNK
+    var j = Int(global_idx.x)
+    if j < n_out:
+        var s: Scalar[DT] = 0
+        for c in range(chunks):
+            s += part[unsafe_offset=c * n_out + j]
+        var mu = s / Scalar[DT](n_b)
+        var m2: Scalar[DT] = 0
+        for c in range(chunks):
+            var n_c = Scalar[DT](min(_GB_CHUNK, n_b - c * _GB_CHUNK))
+            var d = part[unsafe_offset=c * n_out + j] / n_c - mu
+            m2 += part[unsafe_offset=(chunks + c) * n_out + j] + n_c * d * d
+        mean[unsafe_offset=j] = x[unsafe_offset=j] + mu
+        var_[unsafe_offset=j] = m2 / Scalar[DT](n_b)
+
+
+def enqueue_col_mean_var(
+    c: DeviceContext,
+    x: DeviceBuffer[DT],
+    mean: DeviceBuffer[DT],
+    var_: DeviceBuffer[DT],
+    B: Int,
+    OUT: Int,
+    mut part: Tensor,
+) raises:
+    """`mean`, `var_` (biased, ÷B) of each column of a [B, OUT] `x`, as stable
+    as a two-pass over all rows: data shifted by its first row, centred
+    squares per chunk, chunk statistics merged with Chan's formula. Coalesced
+    (lanes along the columns), deterministic; `part` holds `2 · chunks ·
+    OUT`, sized lazily."""
+    var chunks = (B + _GB_CHUNK - 1) // _GB_CHUNK
+    part.ensure_gpu(c, 2 * chunks * OUT)
+    c.enqueue_function[_lin_mv_partial_kernel](
+        x,
+        part.dev.value(),
+        Int64(B),
+        Int64(OUT),
+        grid_dim=((OUT + _GB_COLS - 1) // _GB_COLS, chunks),
+        block_dim=(_GB_COLS, _GB_ROWS),
+    )
+    c.enqueue_function[_lin_mv_final_kernel](
+        x,
+        part.dev.value(),
+        mean,
+        var_,
+        Int64(B),
+        Int64(OUT),
+        grid_dim=(OUT + 255) // 256,
+        block_dim=256,
+    )
+
+
+# Per-channel sums over an NCHW map [B, C, HW] (conv bias, channel-norm γ):
+# a row sum over each contiguous (b, c) plane, then `enqueue_bias_grad` over
+# the [B, C] row sums.
+comptime _RS_TPB = 128
+
+
+def _rowsum_kernel[
+    ADT: DType = DT, WEIGHTED: Bool = False
+](
+    src: Pointer[Scalar[ADT], MutAnyOrigin],
+    w: Pointer[Scalar[DT], MutAnyOrigin],
+    dst: Pointer[Scalar[DT], MutAnyOrigin],
+    cols_arg: Int64,
+):
+    """`dst[r] = Σ_c src[r, c]` (`· w[r, c]` when `WEIGHTED`; otherwise `w`
+    is never read), one block per row, coalesced along c, fp32 accumulator."""
+    var cols = Int(cols_arg)
+    var r = Int(block_idx.x)
+    var t = Int(thread_idx.x)
+    var acc: Scalar[DT] = 0
+    var k = t
+    while k < cols:
+        var v = src[unsafe_offset=r * cols + k].cast[DT]()
+        comptime if WEIGHTED:
+            v *= w[unsafe_offset=r * cols + k]
+        acc += v
+        k += _RS_TPB
+    var total = block.sum[block_size=_RS_TPB, broadcast=False](val=acc)
+    if t == 0:
+        dst[unsafe_offset=r] = total[0]
+
+
+def _enqueue_channel[ADT: DType, WEIGHTED: Bool](
+    c: DeviceContext,
+    go: DeviceBuffer[ADT],
+    w: DeviceBuffer[DT],
+    gc: DeviceBuffer[DT],
+    B: Int,
+    C: Int,
+    HW: Int,
+    mut rows: Tensor,
+    mut part: Tensor,
+) raises:
+    rows.ensure_gpu(c, B * C)
+    c.enqueue_function[_rowsum_kernel[ADT, WEIGHTED]](
+        go,
+        w,
+        rows.dev.value(),
+        Int64(HW),
+        grid_dim=B * C,
+        block_dim=_RS_TPB,
+    )
+    enqueue_bias_grad[DT](c, rows.dev.value(), gc, B, C, part)
+
+
+def enqueue_channel_grad[ADT: DType](
+    c: DeviceContext,
+    go: DeviceBuffer[ADT],
+    gc: DeviceBuffer[DT],
+    B: Int,
+    C: Int,
+    HW: Int,
+    mut rows: Tensor,
+    mut part: Tensor,
+) raises:
+    """`gc[ch] += Σ_{b, s} go[b, ch, s]` for an NCHW `go` (ADT): a conv bias
+    gradient. Replaces one block per channel walking B·HW values (3 blocks for
+    an RGB decoder head). `rows` [B·C] and `part` are the caller's scratch,
+    sized lazily (capture-safe)."""
+    # `gc` stands in for the unread weight operand.
+    _enqueue_channel[ADT, False](c, go, gc, gc, B, C, HW, rows, part)
+
+
+def enqueue_channel_dot_grad(
+    c: DeviceContext,
+    go: DeviceBuffer[DT],
+    x: DeviceBuffer[DT],
+    gc: DeviceBuffer[DT],
+    B: Int,
+    C: Int,
+    HW: Int,
+    mut rows: Tensor,
+    mut part: Tensor,
+) raises:
+    """`gc[ch] += Σ_{b, s} go[b, ch, s]·x[b, ch, s]` for an NCHW map: a
+    channel-wise RMSNorm γ gradient."""
+    _enqueue_channel[DT, True](c, go, x, gc, B, C, HW, rows, part)
 
 
 comptime BF16 = DType.bfloat16
@@ -466,7 +836,7 @@ struct Linear[IN_: Int, OUT_: Int, ADT: DType = DT](Module):
     # so only the FORWARD's terms remain: k % 32 == 0 and k >= 128. PAD_TO is
     # 32 there (a 192-wide ViT layer is no longer copied to 256 every
     # forward). Apple keeps 128: its backward still runs on the padded shapes.
-    comptime PAD_TO = 32 if has_nvidia_gpu_accelerator() else 128
+    comptime PAD_TO = 32 if default_accelerator().is_nvidia_gpu() else 128
     comptime K_MIN = 128
     comptime K_PAD = Self._round_up(Self.IN_, Self.PAD_TO) if Self._round_up(
         Self.IN_, Self.PAD_TO
@@ -581,7 +951,7 @@ struct Linear[IN_: Int, OUT_: Int, ADT: DType = DT](Module):
     # no accumulate kernel. MAX's `mm` (the path before) stays for Apple and
     # `NN_GEMM_PATH=max` / `linmax`.
     comptime CUB_LP = (
-        has_nvidia_gpu_accelerator()
+        default_accelerator().is_nvidia_gpu()
         and GEMM_PATH != "max"
         and GEMM_PATH != "linmax"
     )
@@ -798,6 +1168,36 @@ struct Linear[IN_: Int, OUT_: Int, ADT: DType = DT](Module):
         self.cT_pad.release()
         self.gi_pad.release()
 
+    def freeze(mut self):
+        """Make the weight and the bias non-trainable. Their gradient
+        buffers and moments are released (host and device), so `vjp` forms
+        grad_input only, and so is the scratch only the weight gradient used.
+        The values, names and walk order are unchanged: checkpoints and name
+        maps see the same params as before.
+
+        ⚠ Freeze BEFORE an optimizer adopts the model. An adopted param's
+        gradient is a view into the optimizer's arena."""
+        self.weight.freeze()
+        self.bias.freeze()
+        self.cacheT.release()
+        self.cacheT_bf.release()
+        self.dW_tmp.release()
+        self.cT_pad.release()
+        self.dW_pad.release()
+        self.gb_part.release()
+        self.sk_ws.release()
+        self._sk_p = -1
+
+    def unfreeze[
+        target: StaticString
+    ](mut self, ctx: Optional[DeviceContext] = None) raises:
+        """Zeroed gradient buffers again. The scratch comes back lazily."""
+        self.weight.unfreeze[target](ctx)
+        self.bias.unfreeze[target](ctx)
+
+    def is_frozen(self) -> Bool:
+        return self.weight.is_frozen() and self.bias.is_frozen()
+
     def forward[
         target: StaticString, B: Int, o: MutOrigin, POLICY: AMPPolicy = NoAMP
     ](
@@ -947,7 +1347,7 @@ struct Linear[IN_: Int, OUT_: Int, ADT: DType = DT](Module):
                             block_dim=256,
                         )
                     else:
-                        comptime if has_nvidia_gpu_accelerator():
+                        comptime if default_accelerator().is_nvidia_gpu():
                             # Bias in the GEMM epilogue (`mm_bias`): one launch.
                             mm_bias[A0=B, A1=Self.K_PAD, B0=Self.K_PAD, B1=Self.N_PAD, O0=B, O1=Self.OUT_](
                                 outd.dev.value(), self.x_pad.dev.value() if Self.NEEDS_PAD else in0d.dev.value(), self.w_pad.dev.value(), bl, c
@@ -965,7 +1365,7 @@ struct Linear[IN_: Int, OUT_: Int, ADT: DType = DT](Module):
                                 block_dim=256,
                             )
                 else:
-                    comptime if has_nvidia_gpu_accelerator():
+                    comptime if default_accelerator().is_nvidia_gpu():
                         mm_bias[A0=B, A1=Self.IN_, B0=Self.IN_, B1=Self.OUT_, O0=B, O1=Self.OUT_](
                             outd.dev.value(), in0d.dev.value(),
                             self.weight.val.dev.value(), bl, c,
@@ -1049,6 +1449,16 @@ struct Linear[IN_: Int, OUT_: Int, ADT: DType = DT](Module):
     ) raises:
         ref fin = forward_input[0]
         ref gin = grad_inputs[0]
+        # A param whose gradient buffer is EMPTY is frozen (`freeze`): its
+        # gradient is not formed at all — no dW GEMM, no bias column sum, no
+        # dW scratch — and grad_input is computed exactly as before, since it
+        # does not depend on either. Runtime, not comptime: freezing is a
+        # property of this instance after load, so `DecoderLayerWeights` and
+        # every caller keep one type, and the predicate is the storage itself
+        # (no flag that could disagree with it). A trainable Linear takes the
+        # same branches in the same order as before.
+        var want_dw = self.weight.grd.n > 0
+        var want_db = self.bias.grd.n > 0
         comptime if Self.ACT_DT == DT:
             # ── fp32 path (legacy NoAMP, byte-identical) ──
             # ACT_DT IS DT here — rebind the activation refs (sound; see forward).
@@ -1057,24 +1467,23 @@ struct Linear[IN_: Int, OUT_: Int, ADT: DType = DT](Module):
             ref god = rebind[Tensor](grad_output)
             comptime if target == "cpu":
                 gind.ensure(B * Self.IN_)
-                self.cacheT.ensure(Self.IN_ * B)
-                self.dW_tmp.ensure(Self.W_SIZE)
+                if want_dw:
+                    self.cacheT.ensure(Self.IN_ * B)
+                    self.dW_tmp.ensure(Self.W_SIZE)
                 var x_v = TileTensor(find.data, row_major[B, Self.IN_]())
                 var go_v = TileTensor(god.data, row_major[B, Self.OUT_]())
                 var gi_v = TileTensor(gind.data, row_major[B, Self.IN_]())
                 var w_v = TileTensor(
                     self.weight.val.data, row_major[Self.IN_, Self.OUT_]()
                 )
-                var gw_v = TileTensor(
-                    self.weight.grd.data, row_major[Self.IN_, Self.OUT_]()
-                )
-                var gb_v = TileTensor(
-                    self.bias.grd.data, row_major[Self.OUT_]()
-                )
                 # grad_b += colsum(go)
-                for b in range(B):
-                    for j in range(Self.OUT_):
-                        gb_v[j] += go_v[b, j]
+                if want_db:
+                    var gb_v = TileTensor(
+                        self.bias.grd.data, row_major[Self.OUT_]()
+                    )
+                    for b in range(B):
+                        for j in range(Self.OUT_):
+                            gb_v[j] += go_v[b, j]
                 # grad_w += xᵀ @ go. Apple-fp32: ONE fused cblas_sgemm (TRANSPOSE
                 # A=x, beta=1 → no transpose buffer, no temp, no accumulate loop —
                 # matches legacy Linear). Else: transpose into cacheT + max_matmul
@@ -1082,44 +1491,49 @@ struct Linear[IN_: Int, OUT_: Int, ADT: DType = DT](Module):
                 comptime IS_APPLE_F32 = (
                     CompilationTarget.is_macos() and DT == DType.float32
                 )
-                comptime if IS_APPLE_F32:
-                    var cblas = get_cblas_f32_function()
-                    cblas(
-                        _CBLASOrder.ROW_MAJOR,
-                        _CBLASTranspose.TRANSPOSE,
-                        _CBLASTranspose.NO_TRANSPOSE,
-                        Int32(Self.IN_),
-                        Int32(Self.OUT_),
-                        Int32(B),
-                        Float32(1.0),
-                        rebind[Pointer[Float32, ImmutAnyOrigin]](
-                            find.data.unsafe_ptr()
-                        ),
-                        Int32(Self.IN_),
-                        rebind[Pointer[Float32, ImmutAnyOrigin]](
-                            god.data.unsafe_ptr()
-                        ),
-                        Int32(Self.OUT_),
-                        Float32(1.0),
-                        rebind[Pointer[Float32, MutAnyOrigin]](
-                            self.weight.grd.data.unsafe_ptr()
-                        ),
-                        Int32(Self.OUT_),
-                    )
-                else:
-                    var cT_v = TileTensor(
-                        self.cacheT.data, row_major[Self.IN_, B]()
-                    )
-                    for b in range(B):
+                if want_dw:
+                    comptime if IS_APPLE_F32:
+                        var cblas = get_cblas_f32_function()
+                        cblas(
+                            _CBLASOrder.ROW_MAJOR,
+                            _CBLASTranspose.TRANSPOSE,
+                            _CBLASTranspose.NO_TRANSPOSE,
+                            Int32(Self.IN_),
+                            Int32(Self.OUT_),
+                            Int32(B),
+                            Float32(1.0),
+                            rebind[Pointer[Float32, ImmutAnyOrigin]](
+                                find.data.unsafe_ptr()
+                            ),
+                            Int32(Self.IN_),
+                            rebind[Pointer[Float32, ImmutAnyOrigin]](
+                                god.data.unsafe_ptr()
+                            ),
+                            Int32(Self.OUT_),
+                            Float32(1.0),
+                            rebind[Pointer[Float32, MutAnyOrigin]](
+                                self.weight.grd.data.unsafe_ptr()
+                            ),
+                            Int32(Self.OUT_),
+                        )
+                    else:
+                        var gw_v = TileTensor(
+                            self.weight.grd.data,
+                            row_major[Self.IN_, Self.OUT_](),
+                        )
+                        var cT_v = TileTensor(
+                            self.cacheT.data, row_major[Self.IN_, B]()
+                        )
+                        for b in range(B):
+                            for k in range(Self.IN_):
+                                cT_v[k, b] = x_v[b, k]
+                        var dW_v = TileTensor(
+                            self.dW_tmp.data, row_major[Self.IN_, Self.OUT_]()
+                        )
+                        max_matmul[target="cpu"](dW_v, cT_v, go_v, None)
                         for k in range(Self.IN_):
-                            cT_v[k, b] = x_v[b, k]
-                    var dW_v = TileTensor(
-                        self.dW_tmp.data, row_major[Self.IN_, Self.OUT_]()
-                    )
-                    max_matmul[target="cpu"](dW_v, cT_v, go_v, None)
-                    for k in range(Self.IN_):
-                        for j in range(Self.OUT_):
-                            gw_v[k, j] += dW_v[k, j]
+                            for j in range(Self.OUT_):
+                                gw_v[k, j] += dW_v[k, j]
                 # grad_input = go @ Wᵀ
                 max_matmul[transpose_b=True, target="cpu"](
                     gi_v, go_v, w_v, None
@@ -1135,40 +1549,45 @@ struct Linear[IN_: Int, OUT_: Int, ADT: DType = DT](Module):
                     # per-call workspace MAX's fallback allocates, so the
                     # backward needs none of the K / N padding below.
                     var gol = god.dev.value()
-                    var gbl = self.bias.grd.dev.value()
-                    enqueue_bias_grad[DT](c, gol, gbl, B, Self.OUT_, self.gb_part)
-                    cublas_gemm[True, False, cublas_tf32(B, Self.OUT_, Self.IN_)](
-                        c, self.weight.grd.dev.value(), find.dev.value(),
-                        god.dev.value(),
-                        Self.IN_, Self.OUT_, B, 1.0,
-                    )
+                    if want_db:
+                        var gbl = self.bias.grd.dev.value()
+                        enqueue_bias_grad[DT](c, gol, gbl, B, Self.OUT_, self.gb_part)
+                    if want_dw:
+                        cublas_gemm[True, False, cublas_tf32(B, Self.OUT_, Self.IN_)](
+                            c, self.weight.grd.dev.value(), find.dev.value(),
+                            god.dev.value(),
+                            Self.IN_, Self.OUT_, B, 1.0,
+                        )
                     cublas_gemm[False, True, cublas_tf32(B, Self.OUT_, Self.IN_)](
                         c, gind.dev.value(), god.dev.value(),
                         self.weight.val.dev.value(),
                         B, Self.IN_, Self.OUT_, 0.0,
                     )
                 else:
-                    self.cacheT.ensure_gpu(c, Self.IN_ * B)
-                    self.dW_tmp.ensure_gpu(c, Self.W_SIZE)
+                    if want_dw:
+                        self.cacheT.ensure_gpu(c, Self.IN_ * B)
+                        self.dW_tmp.ensure_gpu(c, Self.W_SIZE)
                     # grad_b += colsum(go)
                     var gol = god.dev.value()
-                    var gbl = self.bias.grd.dev.value()
-                    enqueue_bias_grad[DT](c, gol, gbl, B, Self.OUT_, self.gb_part)
+                    if want_db:
+                        var gbl = self.bias.grd.dev.value()
+                        enqueue_bias_grad[DT](c, gol, gbl, B, Self.OUT_, self.gb_part)
                     # grad_w += cacheᵀ @ go: transpose x → cacheT (B1' tiled, fp32),
                     # then the two GEMMs (grad_w + grad_x), then the grad_w accumulate.
-                    var xl = find.dev.value()
-                    var cTl = self.cacheT.dev.value()
-                    c.enqueue_function[_transpose_tiled_kernel[DT]](
-                        xl,
-                        cTl,
-                        Int64(B),
-                        Int64(Self.IN_),
-                        grid_dim=(
-                            (Self.IN_ + _T_TILE - 1) // _T_TILE,
-                            (B + _T_TILE - 1) // _T_TILE,
-                        ),
-                        block_dim=(_T_TILE, _T_BR),
-                    )
+                    if want_dw:
+                        var xl = find.dev.value()
+                        var cTl = self.cacheT.dev.value()
+                        c.enqueue_function[_transpose_tiled_kernel[DT]](
+                            xl,
+                            cTl,
+                            Int64(B),
+                            Int64(Self.IN_),
+                            grid_dim=(
+                                (Self.IN_ + _T_TILE - 1) // _T_TILE,
+                                (B + _T_TILE - 1) // _T_TILE,
+                            ),
+                            block_dim=(_T_TILE, _T_BR),
+                        )
                     comptime if Self.NEEDS_PAD or Self.NEEDS_N_PAD:
                         # Both backward GEMMs run on the PADDED shapes, reusing the
                         # forward's `w_pad` ([K_PAD, N_PAD]) so no extra weight copy
@@ -1188,70 +1607,71 @@ struct Linear[IN_: Int, OUT_: Int, ADT: DType = DT](Module):
                                 grid_dim=(B * Self.N_PAD + 255) // 256,
                                 block_dim=256,
                             )
-                        var gop_v = TileTensor(
-                            self.go_pad.dev.value() if Self.NEEDS_N_PAD else god.dev.value(),
-                            row_major[B, Self.N_PAD](),
-                        )
-                        # cacheT: [IN_, B] -> [K_PAD, B]  (append zero ROWS)
-                        comptime if Self.NEEDS_PAD:
-                            self.cT_pad.ensure_gpu(c, Self.K_PAD * B)
-                            c.enqueue_function[_pad_2d_kernel](
-                                self.cacheT.dev.value(),
-                                self.cT_pad.dev.value(),
-                                Int64(Self.IN_),
-                                Int64(B),
-                                Int64(Self.K_PAD),
-                                Int64(B),
-                                grid_dim=(Self.K_PAD * B + 255) // 256,
-                                block_dim=256,
+                        if want_dw:
+                            var gop_v = TileTensor(
+                                self.go_pad.dev.value() if Self.NEEDS_N_PAD else god.dev.value(),
+                                row_major[B, Self.N_PAD](),
                             )
-                        var cTp_v = TileTensor(
-                            self.cT_pad.dev.value() if Self.NEEDS_PAD else self.cacheT.dev.value(),
-                            row_major[Self.K_PAD, B](),
-                        )
-                        # grad_w = cacheTᵀ @ go   ->  [K_PAD, N_PAD]
-                        self.dW_pad.ensure_gpu(c, Self.WPAD_SIZE)
-                        var dWp_v = TileTensor(
-                            self.dW_pad.dev.value(),
-                            row_major[Self.K_PAD, Self.N_PAD](),
-                        )
-                        # ── grad_w: split-K on OUR workspace, or plain matmul ──
-                        # This is the GEMM MODULAR_MATMUL_ALLOC_REPORT.md
-                        # Measurement 4 caught allocating per call: K is
-                        # `batch * tokens`, so it is long-K and skinny by
-                        # construction, which is exactly when `select_config`
-                        # partitions K. Routing it through our own workspace
-                        # removes the alloc/free pair AND unblocks CUDA-graph
-                        # capture of the whole step.
-                        #
-                        # Inert unless MAX's own dispatch would have reached
-                        # `multistage_gemm` with a partitioned K (see
-                        # `splitk_path_applies`: not H100, not sm_100 Blackwell,
-                        # not AMD/Apple). Otherwise this is byte-for-byte the
-                        # previous behaviour.
-                        comptime if splitk_path_applies[c.default_device_info]():
-                            if self._sk_p < 0:
-                                self._decide_sk_p(B, c)
-                            if self._sk_p > 1:
-                                dispatch_splitk_gemm(
-                                    dWp_v,
-                                    cTp_v,
-                                    gop_v,
-                                    Self.K_PAD,
-                                    Self.N_PAD,
-                                    B,
-                                    self._sk_p,
-                                    self.sk_ws,
-                                    c,
+                            # cacheT: [IN_, B] -> [K_PAD, B]  (append zero ROWS)
+                            comptime if Self.NEEDS_PAD:
+                                self.cT_pad.ensure_gpu(c, Self.K_PAD * B)
+                                c.enqueue_function[_pad_2d_kernel](
+                                    self.cacheT.dev.value(),
+                                    self.cT_pad.dev.value(),
+                                    Int64(Self.IN_),
+                                    Int64(B),
+                                    Int64(Self.K_PAD),
+                                    Int64(B),
+                                    grid_dim=(Self.K_PAD * B + 255) // 256,
+                                    block_dim=256,
                                 )
+                            var cTp_v = TileTensor(
+                                self.cT_pad.dev.value() if Self.NEEDS_PAD else self.cacheT.dev.value(),
+                                row_major[Self.K_PAD, B](),
+                            )
+                            # grad_w = cacheTᵀ @ go   ->  [K_PAD, N_PAD]
+                            self.dW_pad.ensure_gpu(c, Self.WPAD_SIZE)
+                            var dWp_v = TileTensor(
+                                self.dW_pad.dev.value(),
+                                row_major[Self.K_PAD, Self.N_PAD](),
+                            )
+                            # ── grad_w: split-K on OUR workspace, or plain matmul ──
+                            # This is the GEMM MODULAR_MATMUL_ALLOC_REPORT.md
+                            # Measurement 4 caught allocating per call: K is
+                            # `batch * tokens`, so it is long-K and skinny by
+                            # construction, which is exactly when `select_config`
+                            # partitions K. Routing it through our own workspace
+                            # removes the alloc/free pair AND unblocks CUDA-graph
+                            # capture of the whole step.
+                            #
+                            # Inert unless MAX's own dispatch would have reached
+                            # `multistage_gemm` with a partitioned K (see
+                            # `splitk_path_applies`: not H100, not sm_100 Blackwell,
+                            # not AMD/Apple). Otherwise this is byte-for-byte the
+                            # previous behaviour.
+                            comptime if splitk_path_applies[c.default_device_info]():
+                                if self._sk_p < 0:
+                                    self._decide_sk_p(B, c)
+                                if self._sk_p > 1:
+                                    dispatch_splitk_gemm(
+                                        dWp_v,
+                                        cTp_v,
+                                        gop_v,
+                                        Self.K_PAD,
+                                        Self.N_PAD,
+                                        B,
+                                        self._sk_p,
+                                        self.sk_ws,
+                                        c,
+                                    )
+                                else:
+                                    mm[A0=Self.K_PAD, A1=B, B0=B, B1=Self.N_PAD, O0=Self.K_PAD, O1=Self.N_PAD](
+                                        self.dW_pad.dev.value(), self.cT_pad.dev.value() if Self.NEEDS_PAD else self.cacheT.dev.value(), self.go_pad.dev.value() if Self.NEEDS_N_PAD else god.dev.value(), c
+                                    )
                             else:
                                 mm[A0=Self.K_PAD, A1=B, B0=B, B1=Self.N_PAD, O0=Self.K_PAD, O1=Self.N_PAD](
-                                    self.dW_pad.dev.value(), self.cT_pad.dev.value() if Self.NEEDS_PAD else self.cacheT.dev.value(), self.go_pad.dev.value() if Self.NEEDS_N_PAD else god.dev.value(), c
-                                )
-                        else:
-                            mm[A0=Self.K_PAD, A1=B, B0=B, B1=Self.N_PAD, O0=Self.K_PAD, O1=Self.N_PAD](
-                                    self.dW_pad.dev.value(), self.cT_pad.dev.value() if Self.NEEDS_PAD else self.cacheT.dev.value(), self.go_pad.dev.value() if Self.NEEDS_N_PAD else god.dev.value(), c
-                                )
+                                        self.dW_pad.dev.value(), self.cT_pad.dev.value() if Self.NEEDS_PAD else self.cacheT.dev.value(), self.go_pad.dev.value() if Self.NEEDS_N_PAD else god.dev.value(), c
+                                    )
                         # grad_input = go @ w_padᵀ  ->  [B, K_PAD]
                         # ⚠ The GEMM DESTINATION must be a mutable view, so this
                         # cannot use the `... if NEEDS_PAD else ...` form the
@@ -1279,69 +1699,72 @@ struct Linear[IN_: Int, OUT_: Int, ADT: DType = DT](Module):
                         # ⚠ STRIDED accumulate: dW_pad's row stride is N_PAD, the
                         # master grad's is OUT_. A flat `_accum_kernel` would fold
                         # the padded columns into the next row's gradient.
-                        c.enqueue_function[_accum_2d_kernel](
-                            self.weight.grd.dev.value(),
-                            # PREFIX view: dW_pad is [K_PAD, N_PAD] but only its
-                            # first IN_ rows carry gradient — the rest correspond to
-                            # the zero-padded contraction rows. Row-major makes
-                            # those first IN_ rows contiguous from offset 0.
-                            self.dW_pad.dev.value(),
-                            Int64(Self.IN_),
-                            Int64(Self.OUT_),
-                            Int64(Self.N_PAD),
-                            grid_dim=(Self.W_SIZE + 255) // 256,
-                            block_dim=256,
-                        )
+                        if want_dw:
+                            c.enqueue_function[_accum_2d_kernel](
+                                self.weight.grd.dev.value(),
+                                # PREFIX view: dW_pad is [K_PAD, N_PAD] but only its
+                                # first IN_ rows carry gradient — the rest correspond to
+                                # the zero-padded contraction rows. Row-major makes
+                                # those first IN_ rows contiguous from offset 0.
+                                self.dW_pad.dev.value(),
+                                Int64(Self.IN_),
+                                Int64(Self.OUT_),
+                                Int64(Self.N_PAD),
+                                grid_dim=(Self.W_SIZE + 255) // 256,
+                                block_dim=256,
+                            )
                     else:
-                        var dW_v = TileTensor(
-                            self.dW_tmp.dev.value(),
-                            row_major[Self.IN_, Self.OUT_](),
-                        )
-                        var cT_v = TileTensor(
-                            self.cacheT.dev.value(), row_major[Self.IN_, B]()
-                        )
-                        var go_v = TileTensor(
-                            god.dev.value(), row_major[B, Self.OUT_]()
-                        )
-                        # Same split-K routing as the padded branch above. This is
-                        # the branch an ALIGNED Linear takes (K_PAD == IN_ and
-                        # N_PAD == OUT_), which is most of them — the first version
-                        # of this change patched only the padded site and the gate
-                        # caught it as `split shapes: 0`.
-                        comptime if splitk_path_applies[c.default_device_info]():
-                            if self._sk_p < 0:
-                                self._decide_sk_p(B, c)
-                            if self._sk_p > 1:
-                                dispatch_splitk_gemm(
-                                    dW_v,
-                                    cT_v,
-                                    go_v,
-                                    Self.IN_,
-                                    Self.OUT_,
-                                    B,
-                                    self._sk_p,
-                                    self.sk_ws,
-                                    c,
-                                )
+                        if want_dw:
+                            var dW_v = TileTensor(
+                                self.dW_tmp.dev.value(),
+                                row_major[Self.IN_, Self.OUT_](),
+                            )
+                            var cT_v = TileTensor(
+                                self.cacheT.dev.value(), row_major[Self.IN_, B]()
+                            )
+                            var go_v = TileTensor(
+                                god.dev.value(), row_major[B, Self.OUT_]()
+                            )
+                            # Same split-K routing as the padded branch above. This is
+                            # the branch an ALIGNED Linear takes (K_PAD == IN_ and
+                            # N_PAD == OUT_), which is most of them — the first version
+                            # of this change patched only the padded site and the gate
+                            # caught it as `split shapes: 0`.
+                            comptime if splitk_path_applies[c.default_device_info]():
+                                if self._sk_p < 0:
+                                    self._decide_sk_p(B, c)
+                                if self._sk_p > 1:
+                                    dispatch_splitk_gemm(
+                                        dW_v,
+                                        cT_v,
+                                        go_v,
+                                        Self.IN_,
+                                        Self.OUT_,
+                                        B,
+                                        self._sk_p,
+                                        self.sk_ws,
+                                        c,
+                                    )
+                                else:
+                                    mm[A0=Self.IN_, A1=B, B0=B, B1=Self.OUT_, O0=Self.IN_, O1=Self.OUT_](
+                                        self.dW_tmp.dev.value(), self.cacheT.dev.value(), god.dev.value(), c
+                                    )
                             else:
                                 mm[A0=Self.IN_, A1=B, B0=B, B1=Self.OUT_, O0=Self.IN_, O1=Self.OUT_](
                                     self.dW_tmp.dev.value(), self.cacheT.dev.value(), god.dev.value(), c
                                 )
-                        else:
-                            mm[A0=Self.IN_, A1=B, B0=B, B1=Self.OUT_, O0=Self.IN_, O1=Self.OUT_](
-                                self.dW_tmp.dev.value(), self.cacheT.dev.value(), god.dev.value(), c
-                            )
                         mm[transpose_b=True, A0=B, A1=Self.OUT_, B0=Self.IN_, B1=Self.OUT_, O0=B, O1=Self.IN_](
                             gind.dev.value(), god.dev.value(), self.weight.val.dev.value(), c
                         )
                         # grad_w += dW (accumulate into the fp32 master grad)
-                        c.enqueue_function[_accum_kernel](
-                            self.weight.grd.dev.value(),
-                            self.dW_tmp.dev.value(),
-                            Int64(Self.W_SIZE),
-                            grid_dim=(Self.W_SIZE + 255) // 256,
-                            block_dim=256,
-                        )
+                        if want_dw:
+                            c.enqueue_function[_accum_kernel](
+                                self.weight.grd.dev.value(),
+                                self.dW_tmp.dev.value(),
+                                Int64(Self.W_SIZE),
+                                grid_dim=(Self.W_SIZE + 255) // 256,
+                                block_dim=256,
+                            )
         else:
             # ── bf16-flow path (GPU-only) ──
             comptime assert target == "gpu", "bf16-flow Linear is GPU-only"
@@ -1349,8 +1772,9 @@ struct Linear[IN_: Int, OUT_: Int, ADT: DType = DT](Module):
             gin.ensure_gpu(c, B * Self.IN_)
             # grad_b += colsum(go): bf16 go → fp32 master grad (fp32 accumulator).
             var gol = grad_output.dev.value()
-            var gbl = self.bias.grd.dev.value()
-            enqueue_bias_grad[Self.ADT](c, gol, gbl, B, Self.OUT_, self.gb_part)
+            if want_db:
+                var gbl = self.bias.grd.dev.value()
+                enqueue_bias_grad[Self.ADT](c, gol, gbl, B, Self.OUT_, self.gb_part)
             comptime if Self.CUB_LP:
                 # W: the forward's cast. No `_ensure_w_bf` here: under capture
                 # it recasts unconditionally, and no optimizer step runs
@@ -1359,58 +1783,62 @@ struct Linear[IN_: Int, OUT_: Int, ADT: DType = DT](Module):
                 if self.weight.val.version != self._w_cast_version:
                     self._ensure_w_bf(c)
                 # grad_w[IN, OUT] += xᵀ @ go, bf16 operands -> fp32 master grad.
-                cublas_gemm_lp[True, False, Self.ADT, DT](
-                    c, self.weight.grd.dev.value(), fin.dev.value(), gol,
-                    Self.IN_, Self.OUT_, B, 1.0,
-                )
+                if want_dw:
+                    cublas_gemm_lp[True, False, Self.ADT, DT](
+                        c, self.weight.grd.dev.value(), fin.dev.value(), gol,
+                        Self.IN_, Self.OUT_, B, 1.0,
+                    )
                 # grad_x[B, IN] = go @ Wᵀ (bf16 out — gin flows at bf16).
                 cublas_gemm_lp[False, True, Self.ADT, Self.ADT](
                     c, gin.dev.value(), gol, self.w_bf.dev.value(),
                     B, Self.IN_, Self.OUT_, 0.0,
                 )
                 return
-            self.cacheT_bf.ensure_gpu(c, Self.IN_ * B)
-            self.dW_tmp.ensure_gpu(c, Self.W_SIZE)
+            if want_dw:
+                self.cacheT_bf.ensure_gpu(c, Self.IN_ * B)
+                self.dW_tmp.ensure_gpu(c, Self.W_SIZE)
             # grad_w += cacheᵀ @ go. `fin`/`go` are ALREADY bf16 (no cast).
             # Transpose the bf16 fwd-input directly → bf16 cacheT_bf, then a
             # bf16-in → FP32-out GEMM into the fp32 dW_tmp, then accumulate into
             # the fp32 master grad. W reuses the forward's cached cast.
             self._ensure_w_bf(c)
-            var xl = fin.dev.value()
-            var cTl = self.cacheT_bf.dev.value()
-            c.enqueue_function[_transpose_tiled_kernel[Self.ADT]](
-                xl,
-                cTl,
-                Int64(B),
-                Int64(Self.IN_),
-                grid_dim=(
-                    (Self.IN_ + _T_TILE - 1) // _T_TILE,
-                    (B + _T_TILE - 1) // _T_TILE,
-                ),
-                block_dim=(_T_TILE, _T_BR),
-            )
-            # grad_w = cacheT_bfᵀ-form @ go → fp32 dW (bf16-in, fp32-out).
-            # ⚠ NOT routed through split-K, deliberately. bf16 operands with an
-            # fp32 output would work the same way, but nothing gates it yet —
-            # `tests/nn/test_linear_splitk_dw_gpu.mojo` builds fp32 Linears.
-            # Route it when that gate grows a bf16 arm, not before.
-            mm[A0=Self.IN_, A1=B, B0=B, B1=Self.OUT_, O0=Self.IN_, O1=Self.OUT_](
-                self.dW_tmp.dev.value(), self.cacheT_bf.dev.value(), grad_output.dev.value(), c
-            )
+            if want_dw:
+                var xl = fin.dev.value()
+                var cTl = self.cacheT_bf.dev.value()
+                c.enqueue_function[_transpose_tiled_kernel[Self.ADT]](
+                    xl,
+                    cTl,
+                    Int64(B),
+                    Int64(Self.IN_),
+                    grid_dim=(
+                        (Self.IN_ + _T_TILE - 1) // _T_TILE,
+                        (B + _T_TILE - 1) // _T_TILE,
+                    ),
+                    block_dim=(_T_TILE, _T_BR),
+                )
+                # grad_w = cacheT_bfᵀ-form @ go → fp32 dW (bf16-in, fp32-out).
+                # ⚠ NOT routed through split-K, deliberately. bf16 operands with an
+                # fp32 output would work the same way, but nothing gates it yet —
+                # `tests/nn/test_linear_splitk_dw_gpu.mojo` builds fp32 Linears.
+                # Route it when that gate grows a bf16 arm, not before.
+                mm[A0=Self.IN_, A1=B, B0=B, B1=Self.OUT_, O0=Self.IN_, O1=Self.OUT_](
+                    self.dW_tmp.dev.value(), self.cacheT_bf.dev.value(), grad_output.dev.value(), c
+                )
             # grad_x = go @ Wᵀ → bf16 gin (bf16-in, bf16-out — gin flows at bf16).
             mm[transpose_b=True, A0=B, A1=Self.OUT_, B0=Self.IN_, B1=Self.OUT_, O0=B, O1=Self.IN_](
                 gin.dev.value(), grad_output.dev.value(), self.w_bf.dev.value(), c
             )
             # grad_w += dW (accumulate into the fp32 master grad)
-            var gwl = self.weight.grd.dev.value()
-            var dWl = self.dW_tmp.dev.value()
-            c.enqueue_function[_accum_kernel](
-                gwl,
-                dWl,
-                Int64(Self.W_SIZE),
-                grid_dim=(Self.W_SIZE + 255) // 256,
-                block_dim=256,
-            )
+            if want_dw:
+                var gwl = self.weight.grd.dev.value()
+                var dWl = self.dW_tmp.dev.value()
+                c.enqueue_function[_accum_kernel](
+                    gwl,
+                    dWl,
+                    Int64(Self.W_SIZE),
+                    grid_dim=(Self.W_SIZE + 255) // 256,
+                    block_dim=256,
+                )
 
     # for_each_param / zero_grad inherit the Module reflection defaults
     # (core/walkers.mojo auto-discovers the `weight` + `bias` Params).

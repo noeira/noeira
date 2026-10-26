@@ -18,7 +18,6 @@ run at that dtype (`ADT` defaults to DT → NoAMP unchanged).
 """
 
 from max.gpu.host import DeviceContext
-from layout import Layout
 
 from noeira.nn.constants import DT, TPB, CPU_SIMD_W
 from ..core.initializer import Initializer
@@ -113,9 +112,9 @@ struct SkipConcat[Inner: Module](Module):
             c.enqueue_function[
                 _par_concat_kernel[B, Self.IN, Self.OINNER, Self.ACT_DT]
             ](
-                in0.lt["gpu", Layout.row_major(B, Self.IN)](),
-                self.inner_out.lt["gpu", Layout.row_major(B, Self.OINNER)](),
-                out.lt["gpu", Layout.row_major(B, Self.OUT_DIM)](),
+                in0.tt["gpu", B, Self.IN](),
+                self.inner_out.tt["gpu", B, Self.OINNER](),
+                out.tt["gpu", B, Self.OUT_DIM](),
                 grid_dim=(B * Self.OUT_DIM + TPB - 1) // TPB,
                 block_dim=TPB,
             )
@@ -155,9 +154,9 @@ struct SkipConcat[Inner: Module](Module):
             c.enqueue_function[
                 _par_split_kernel[B, Self.IN, Self.OINNER, Self.ACT_DT]
             ](
-                grad_output.lt["gpu", Layout.row_major(B, Self.OUT_DIM)](),
-                self.go_pass.lt["gpu", Layout.row_major(B, Self.IN)](),
-                self.go_inner.lt["gpu", Layout.row_major(B, Self.OINNER)](),
+                grad_output.tt["gpu", B, Self.OUT_DIM](),
+                self.go_pass.tt["gpu", B, Self.IN](),
+                self.go_inner.tt["gpu", B, Self.OINNER](),
                 grid_dim=(B * Self.OUT_DIM + TPB - 1) // TPB,
                 block_dim=TPB,
             )
@@ -188,9 +187,9 @@ struct SkipConcat[Inner: Module](Module):
             var c = ctx.value()
             gin.ensure_gpu(c, NIN)
             c.enqueue_function[_resid_add_kernel[NIN, Self.ACT_DT]](
-                self.go_pass.lt["gpu", Layout.row_major(NIN)](),
-                self.gi_inner.lt["gpu", Layout.row_major(NIN)](),
-                gin.lt["gpu", Layout.row_major(NIN)](),
+                self.go_pass.tt["gpu", NIN](),
+                self.gi_inner.tt["gpu", NIN](),
+                gin.tt["gpu", NIN](),
                 grid_dim=(NIN + TPB - 1) // TPB,
                 block_dim=TPB,
             )

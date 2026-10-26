@@ -197,7 +197,7 @@ struct LeWMRefRollout[target: StaticString, S: Int, HORIZON: Int, ACT: Int = REF
     def rollout(
         mut self, start_emb: List[Scalar[DT]], actions: List[Scalar[DT]]
     ) raises -> List[Scalar[DT]]:
-        """start_emb (D), actions (S, HORIZON, ACT) z-scored ->
+        """`start_emb` (D), actions (S, HORIZON, ACT) z-scored ->
         predicted embeddings (S, HORIZON + 1, D); entry 0 is the start."""
         return self.rollout_ctx(start_emb, 1, actions)
 
@@ -338,7 +338,7 @@ def cem_step[
     step_w: List[Float64] = List[Float64](),
 ) raises -> CEMStep:
     """`CEMSolver.solve`'s loop body (stable_worldmodel 0.1.1 solver/cem.py),
-    one env:
+    one env.
 
         candidates = noise * var + mean;  candidates[0] = mean
         costs = get_cost(candidates)

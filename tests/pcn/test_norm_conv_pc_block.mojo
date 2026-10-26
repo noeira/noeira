@@ -13,7 +13,7 @@ Run:
 
 from std.memory import alloc
 from std.math import sin
-from layout import Layout, LayoutTensor
+from noeira.core.tiles import Tile, tile
 
 from noeira.experimental.pcn.pc_initializer import PCXavier
 from noeira.experimental.pcn.pc_norm_conv_block import NormConvPCBlock
@@ -28,10 +28,10 @@ comptime PSZ = CB.PARAM_SIZE
 
 
 def _predict(
-    x: LayoutTensor[dtype, Layout.row_major(BATCH, IN), MutAnyOrigin],
-    params: LayoutTensor[dtype, Layout.row_major(PSZ), MutAnyOrigin],
-    mut mu: LayoutTensor[dtype, Layout.row_major(BATCH, OUT), MutAnyOrigin],
-    mut a: LayoutTensor[dtype, Layout.row_major(BATCH, IN), MutAnyOrigin],
+    x: Tile[dtype, BATCH, IN],
+    params: Tile[dtype, PSZ],
+    mu: Tile[dtype, BATCH, OUT],
+    a: Tile[dtype, BATCH, IN],
 ):
     CB.predict[BATCH, dtype](x, params, mu, a)
 
@@ -55,15 +55,15 @@ def main() raises:
     for i in range(BATCH * OUT):
         y_buf[i] = Scalar[dtype](sin(Float32(i) * 1.1 + 0.6))
 
-    var x = LayoutTensor[dtype, Layout.row_major(BATCH, IN), MutAnyOrigin](x_buf)
-    var y = LayoutTensor[dtype, Layout.row_major(BATCH, OUT), MutAnyOrigin](y_buf)
-    var params = LayoutTensor[dtype, Layout.row_major(PSZ), MutAnyOrigin](params_buf)
-    var mu = LayoutTensor[dtype, Layout.row_major(BATCH, OUT), MutAnyOrigin](mu_buf)
-    var a = LayoutTensor[dtype, Layout.row_major(BATCH, IN), MutAnyOrigin](a_buf)
-    var eps = LayoutTensor[dtype, Layout.row_major(BATCH, OUT), MutAnyOrigin](eps_buf)
-    var z = LayoutTensor[dtype, Layout.row_major(BATCH, IN), MutAnyOrigin](z_buf)
-    var zeff = LayoutTensor[dtype, Layout.row_major(BATCH, IN), MutAnyOrigin](zeff_buf)
-    var grads = LayoutTensor[dtype, Layout.row_major(PSZ), MutAnyOrigin](grads_buf)
+    var x = tile[BATCH, IN](x_buf)
+    var y = tile[BATCH, OUT](y_buf)
+    var params = tile[PSZ](params_buf)
+    var mu = tile[BATCH, OUT](mu_buf)
+    var a = tile[BATCH, IN](a_buf)
+    var eps = tile[BATCH, OUT](eps_buf)
+    var z = tile[BATCH, IN](z_buf)
+    var zeff = tile[BATCH, IN](zeff_buf)
+    var grads = tile[PSZ](grads_buf)
     CB.pc_init_params[PCXavier, dtype](params)
 
     _predict(x, params, mu, a)
@@ -75,9 +75,9 @@ def main() raises:
     var mu_p = alloc[Scalar[dtype]](BATCH * OUT).as_unsafe_any_origin()
     var mu_m = alloc[Scalar[dtype]](BATCH * OUT).as_unsafe_any_origin()
     var a_tmp = alloc[Scalar[dtype]](BATCH * IN).as_unsafe_any_origin()
-    var mu_p_t = LayoutTensor[dtype, Layout.row_major(BATCH, OUT), MutAnyOrigin](mu_p)
-    var mu_m_t = LayoutTensor[dtype, Layout.row_major(BATCH, OUT), MutAnyOrigin](mu_m)
-    var a_tmp_t = LayoutTensor[dtype, Layout.row_major(BATCH, IN), MutAnyOrigin](a_tmp)
+    var mu_p_t = tile[BATCH, OUT](mu_p)
+    var mu_m_t = tile[BATCH, OUT](mu_m)
+    var a_tmp_t = tile[BATCH, IN](a_tmp)
 
     var max_jvp_rel: Float64 = 0.0
     for b in range(BATCH):

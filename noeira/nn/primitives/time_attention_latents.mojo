@@ -30,7 +30,8 @@ device `Cache` — no `mptr`, no `Cache`.
 
 from max.gpu import global_idx
 from max.gpu.host import DeviceContext
-from layout import Layout, LayoutTensor, TileTensor, row_major
+from layout import TileTensor, row_major
+from noeira.core.tiles import RowMajor, Tile
 
 from noeira.nn.constants import DT, TPB
 from ..core.initializer import Initializer
@@ -48,8 +49,8 @@ from ..models.transformer import MultiHeadAttention
 def _tal_gather_kernel[
     B: Int, T: Int, S: Int, L: Int, D: Int
 ](
-    src: LayoutTensor[DT, Layout.row_major(B * T * S * D), MutAnyOrigin],
-    dst: LayoutTensor[DT, Layout.row_major(B * L * T * D), MutAnyOrigin],
+    src: Tile[DT, B * T * S * D],
+    dst: Tile[DT, B * L * T * D],
 ):
     var idx = Int(global_idx.x)
     if idx >= B * L * T * D:
@@ -69,8 +70,8 @@ def _tal_gather_kernel[
 def _tal_scatter_kernel[
     B: Int, T: Int, S: Int, L: Int, D: Int
 ](
-    packed: LayoutTensor[DT, Layout.row_major(B * L * T * D), MutAnyOrigin],
-    dst: LayoutTensor[DT, Layout.row_major(B * T * S * D), MutAnyOrigin],
+    packed: Tile[DT, B * L * T * D],
+    dst: Tile[DT, B * T * S * D],
 ):
     var idx = Int(global_idx.x)
     if idx >= B * T * S * D:
@@ -184,14 +185,14 @@ struct TimeAttentionLatents[
             self.packed_in.ensure_gpu(c, PACKED)
             self.packed_out.ensure_gpu(c, PACKED)
             out.ensure_gpu(c, FULL)
-            comptime lay_full = Layout.row_major(FULL)
-            comptime lay_pack = Layout.row_major(PACKED)
+            comptime lay_full = RowMajor[FULL]
+            comptime lay_pack = RowMajor[PACKED]
             comptime gk = _tal_gather_kernel[
                 Bn, Self.T, Self.S, Self.N_LATENTS, Self.D
             ]
             c.enqueue_function[gk](
-                in0.lt["gpu", lay_full](),
-                self.packed_in.lt["gpu", lay_pack](),
+                in0.tt["gpu", FULL](),
+                self.packed_in.tt["gpu", PACKED](),
                 grid_dim=(PACKED + TPB - 1) // TPB, block_dim=TPB,
             )
             self.mha.forward[target, BL, POLICY=POLICY](
@@ -201,8 +202,8 @@ struct TimeAttentionLatents[
                 Bn, Self.T, Self.S, Self.N_LATENTS, Self.D
             ]
             c.enqueue_function[sk](
-                self.packed_out.lt["gpu", lay_pack](),
-                out.lt["gpu", lay_full](),
+                self.packed_out.tt["gpu", PACKED](),
+                out.tt["gpu", FULL](),
                 grid_dim=(FULL + TPB - 1) // TPB, block_dim=TPB,
             )
 
@@ -266,14 +267,14 @@ struct TimeAttentionLatents[
             self.grad_pout.ensure_gpu(c, PACKED)
             self.grad_pin.ensure_gpu(c, PACKED)
             gin.ensure_gpu(c, FULL)
-            comptime lay_full = Layout.row_major(FULL)
-            comptime lay_pack = Layout.row_major(PACKED)
+            comptime lay_full = RowMajor[FULL]
+            comptime lay_pack = RowMajor[PACKED]
             comptime gk = _tal_gather_kernel[
                 Bn, Self.T, Self.S, Self.N_LATENTS, Self.D
             ]
             c.enqueue_function[gk](
-                grad_output.lt["gpu", lay_full](),
-                self.grad_pout.lt["gpu", lay_pack](),
+                grad_output.tt["gpu", FULL](),
+                self.grad_pout.tt["gpu", PACKED](),
                 grid_dim=(PACKED + TPB - 1) // TPB, block_dim=TPB,
             )
             self.mha.vjp[target, BL, POLICY=POLICY](
@@ -286,8 +287,8 @@ struct TimeAttentionLatents[
                 Bn, Self.T, Self.S, Self.N_LATENTS, Self.D
             ]
             c.enqueue_function[sk](
-                self.grad_pin.lt["gpu", lay_pack](),
-                gin.lt["gpu", lay_full](),
+                self.grad_pin.tt["gpu", PACKED](),
+                gin.tt["gpu", FULL](),
                 grid_dim=(FULL + TPB - 1) // TPB, block_dim=TPB,
             )
 

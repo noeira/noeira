@@ -20,7 +20,7 @@ from max.gpu import thread_idx, block_idx, block_dim
 from max.gpu.sync import barrier
 from max.gpu.host import DeviceContext
 from max.gpu.memory import AddressSpace
-from layout import Layout, LayoutTensor
+from noeira.core.tiles import Tile, ImmTile, tile
 from noeira.core.fmt import fit
 
 
@@ -123,20 +123,12 @@ def forward_kernel_simple[
     out_dim: Int,
     TPB: Int,
 ](
-    output: LayoutTensor[
-        dtype, Layout.row_major(batch_size, out_dim), MutAnyOrigin
-    ],
-    obs: LayoutTensor[
-        dtype, Layout.row_major(batch_size, obs_dim), ImmutAnyOrigin
-    ],
-    W1: LayoutTensor[
-        dtype, Layout.row_major(obs_dim, hidden_dim), ImmutAnyOrigin
-    ],
-    b1: LayoutTensor[dtype, Layout.row_major(hidden_dim), ImmutAnyOrigin],
-    W2: LayoutTensor[
-        dtype, Layout.row_major(hidden_dim, out_dim), ImmutAnyOrigin
-    ],
-    b2: LayoutTensor[dtype, Layout.row_major(out_dim), ImmutAnyOrigin],
+    output: Tile[dtype, batch_size, out_dim],
+    obs: ImmTile[dtype, batch_size, obs_dim],
+    W1: ImmTile[dtype, obs_dim, hidden_dim],
+    b1: ImmTile[dtype, hidden_dim],
+    W2: ImmTile[dtype, hidden_dim, out_dim],
+    b2: ImmTile[dtype, out_dim],
 ):
     """Simple GPU forward pass - one thread per output element."""
     var global_idx = Int(block_dim.x * block_idx.x + thread_idx.x)
@@ -256,24 +248,12 @@ def benchmark_gpu_batch[
     ctx.synchronize()
 
     # Create layout tensors
-    var obs_t = LayoutTensor[
-        dtype, Layout.row_major(batch_size, obs_dim), ImmutAnyOrigin
-    ](obs_gpu)
-    var W1_t = LayoutTensor[
-        dtype, Layout.row_major(obs_dim, hidden_dim), ImmutAnyOrigin
-    ](W1_gpu)
-    var b1_t = LayoutTensor[
-        dtype, Layout.row_major(hidden_dim), ImmutAnyOrigin
-    ](b1_gpu)
-    var W2_t = LayoutTensor[
-        dtype, Layout.row_major(hidden_dim, out_dim), ImmutAnyOrigin
-    ](W2_gpu)
-    var b2_t = LayoutTensor[dtype, Layout.row_major(out_dim), ImmutAnyOrigin](
-        b2_gpu
-    )
-    var output_t = LayoutTensor[
-        dtype, Layout.row_major(batch_size, out_dim), MutAnyOrigin
-    ](output_gpu)
+    var obs_t = tile[batch_size, obs_dim](obs_gpu)
+    var W1_t = tile[obs_dim, hidden_dim](W1_gpu)
+    var b1_t = tile[hidden_dim](b1_gpu)
+    var W2_t = tile[hidden_dim, out_dim](W2_gpu)
+    var b2_t = tile[out_dim](b2_gpu)
+    var output_t = tile[batch_size, out_dim](output_gpu)
 
     comptime total_outputs = batch_size * out_dim
     comptime num_blocks = (total_outputs + TPB - 1) // TPB
@@ -326,11 +306,11 @@ def benchmark_kernel_launch_overhead(
     buf.enqueue_fill(0)
     ctx.synchronize()
 
-    var buf_t = LayoutTensor[dtype, Layout.row_major(size), MutAnyOrigin](buf)
+    var buf_t = tile[size](buf)
 
     # Simple kernel that does almost nothing
     def trivial_kernel(
-        buf: LayoutTensor[dtype, Layout.row_major(size), MutAnyOrigin]
+        buf: Tile[dtype, size]
     ):
         var i = Int(thread_idx.x)
         if i < size:

@@ -26,7 +26,6 @@ reuse + `ComputeGraph`'s fan-out accumulation kernel.
 
 from max.gpu import global_idx
 from max.gpu.host import DeviceContext
-from layout import Layout, LayoutTensor
 
 from noeira.nn.constants import DT, TPB
 from ..core.initializer import Initializer
@@ -38,13 +37,14 @@ from ..core.module import Module
 from ..core.param import ParamVisitor
 from ..core.walkers import join_name
 from ..core.amp import AMPPolicy, NoAMP
+from noeira.core.tiles import Tile
 
 
 def _rc_accum_kernel[
     ADT: DType, N: Int
 ](
-    dst: LayoutTensor[ADT, Layout.row_major(N), MutAnyOrigin],
-    src: LayoutTensor[ADT, Layout.row_major(N), MutAnyOrigin],
+    dst: Tile[ADT, N],
+    src: Tile[ADT, N],
 ):
     """dst[i] += src[i] — grad_c fan-out accumulation on device (at the
     activation dtype `ADT`)."""
@@ -135,8 +135,8 @@ struct RepeatConditional[N: Int, Inner: Module](Module):
                 dst.data[q] += src.data[q]
         else:
             ctx.value().enqueue_function[_rc_accum_kernel[Self.ACT_DT, NN]](
-                dst.lt["gpu", Layout.row_major(NN)](),
-                src.lt["gpu", Layout.row_major(NN)](),
+                dst.tt["gpu", NN](),
+                src.tt["gpu", NN](),
                 grid_dim=(NN + TPB - 1) // TPB,
                 block_dim=TPB,
             )

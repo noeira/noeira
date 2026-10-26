@@ -65,7 +65,7 @@ A TF32 path would show up as every step wide, not two
 """
 
 from max.gpu.host import DeviceContext
-from std.sys import has_nvidia_gpu_accelerator
+from std.sys import default_accelerator
 from std.math import abs, sin
 from std.testing import assert_true, TestSuite
 
@@ -259,7 +259,7 @@ def _run(ctx: DeviceContext) raises:
 
 
 def test_unitree_g1_gpu_matches_cpu() raises:
-    if not has_nvidia_gpu_accelerator():
+    if not default_accelerator().is_nvidia_gpu():
         print(
             "  unitree_g1 GPU vs CPU: SKIPPED on Apple — nv 35 exceeds Metal's"
             " per-thread stack in the Newton solver (SO-101 broke it at nv"

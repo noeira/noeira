@@ -51,9 +51,9 @@ struct NoeiraQ4_0Matmul:
         b: InputTensor[dtype=.uint8, rank=2, ...],
         ctx: DeviceContext,
     ) raises:
-        var cl = c.to_tile_tensor[.int64]().to_layout_tensor()
-        var al = a.to_tile_tensor[.int64]().to_layout_tensor()
-        var bl = b.to_tile_tensor[.int64]().to_layout_tensor()
+        var cl = c.to_tile_tensor[.int64]()
+        var al = a.to_tile_tensor[.int64]()
+        var bl = b.to_tile_tensor[.int64]()
         if a.dim_size(0) <= 64:
             multistage_gemm_q[group_size=32, pack_factor=8, config=SMALL_M](cl, al, bl, SMALL_M, ctx)
         else:

@@ -32,19 +32,16 @@ is 1e-12 and the actual worst error is PRINTED — if it is ever exactly zero
 that is information, not something to assert.
 """
 
-from std.utils import IndexList
-from layout import Layout, LayoutTensor, RuntimeLayout
+from noeira.core.tiles import RowMajor, DYN1, DYN2, rl1, rl2
 
 from noeira.nn.core.tensor import TensorImpl
 from noeira.physics3d.fields import Dims, DynDims
-from noeira.physics3d.fields.rt_layout import DYN1
 from noeira.physics3d.fields.dims import DIM_POISON
 from noeira.physics3d.fields.scratch import Scratch
 from noeira.physics3d.dynamics.ldl import _ldl_factor_env, _ldl_solve_env
 from noeira.physics3d.gpu.constants import MODEL_TREE_SIZE
 
 comptime DT = DType.float64
-comptime DYN2 = Layout.row_major[2]()
 comptime BATCH = 2
 
 
@@ -97,9 +94,9 @@ def _fill(mut M: TensorImpl[DT], mut b: TensorImpl[DT], nv: Int):
 
 def solve_static[NV: Int]() raises -> List[Float64]:
     """The arm that ships today: comptime dims, comptime layout."""
-    comptime LM = Layout.row_major(BATCH, NV * NV)
-    comptime LNV = Layout.row_major(BATCH, NV)
-    comptime LTREE = Layout.row_major(NV * MODEL_TREE_SIZE)
+    comptime LM = RowMajor[BATCH, NV * NV]
+    comptime LNV = RowMajor[BATCH, NV]
+    comptime LTREE = RowMajor[NV * MODEL_TREE_SIZE]
     var M = TensorImpl[DT].alloc(BATCH * NV * NV)
     var L = TensorImpl[DT].alloc(BATCH * NV * NV)
     var D = TensorImpl[DT].alloc(BATCH * NV)
@@ -107,11 +104,11 @@ def solve_static[NV: Int]() raises -> List[Float64]:
     var x = TensorImpl[DT].alloc(BATCH * NV)
     _fill(M, b, NV)
 
-    var M_v = M.lt["cpu", LM]()
-    var L_v = L.lt["cpu", LM]()
-    var D_v = D.lt["cpu", LNV]()
-    var b_v = b.lt["cpu", LNV]()
-    var x_v = x.lt["cpu", LNV]()
+    var M_v = M.tt["cpu", BATCH, NV * NV]()
+    var L_v = L.tt["cpu", BATCH, NV * NV]()
+    var D_v = D.tt["cpu", BATCH, NV]()
+    var b_v = b.tt["cpu", BATCH, NV]()
+    var x_v = x.tt["cpu", BATCH, NV]()
     # ⚠ THE ZEROED BLOCK TABLE, DELIBERATELY. This file hand-builds its
     # tensors and has no `Model`, so it exercises the fallback a parser-free
     # model takes: rows past `ntree` are `(0, 0, 0)`, `dof_num == 0` ends the
@@ -121,7 +118,7 @@ def solve_static[NV: Int]() raises -> List[Float64]:
     var T = TensorImpl[DT].alloc(NV * MODEL_TREE_SIZE)
     for i in range(NV * MODEL_TREE_SIZE):
         T.data[i] = Scalar[DT](0)
-    var T_v = T.lt["cpu", LTREE]()
+    var T_v = T.tt["cpu", NV * MODEL_TREE_SIZE]()
     var dims = Dims[nv=NV]()
     for e in range(BATCH):
         _ldl_factor_env(e, dims, M_v, L_v, D_v, T_v)
@@ -150,13 +147,13 @@ def solve_dynamic(nv: Int) raises -> List[Float64]:
     var x = TensorImpl[DT].alloc(BATCH * nv)
     _fill(M, b, nv)
 
-    var rl_m = RuntimeLayout[DYN2].row_major(IndexList[2](BATCH, nv * nv))
-    var rl_v = RuntimeLayout[DYN2].row_major(IndexList[2](BATCH, nv))
-    var M_v = M.lt_dyn["cpu", DYN2](rl_m)
-    var L_v = L.lt_dyn["cpu", DYN2](rl_m)
-    var D_v = D.lt_dyn["cpu", DYN2](rl_v)
-    var b_v = b.lt_dyn["cpu", DYN2](rl_v)
-    var x_v = x.lt_dyn["cpu", DYN2](rl_v)
+    var rl_m = rl2(BATCH, nv * nv)
+    var rl_v = rl2(BATCH, nv)
+    var M_v = M.tt_dyn["cpu", DYN2](rl_m)
+    var L_v = L.tt_dyn["cpu", DYN2](rl_m)
+    var D_v = D.tt_dyn["cpu", DYN2](rl_v)
+    var b_v = b.tt_dyn["cpu", DYN2](rl_v)
+    var x_v = x.tt_dyn["cpu", DYN2](rl_v)
     # ⚠ THE ZEROED BLOCK TABLE, DELIBERATELY. This file hand-builds its
     # tensors and has no `Model`, so it exercises the fallback a parser-free
     # model takes: rows past `ntree` are `(0, 0, 0)`, `dof_num == 0` ends the
@@ -166,10 +163,8 @@ def solve_dynamic(nv: Int) raises -> List[Float64]:
     var T = TensorImpl[DT].alloc(nv * MODEL_TREE_SIZE)
     for i in range(nv * MODEL_TREE_SIZE):
         T.data[i] = Scalar[DT](0)
-    var rl_t = RuntimeLayout[DYN1].row_major(
-        IndexList[1](nv * MODEL_TREE_SIZE)
-    )
-    var T_v = T.lt_dyn["cpu", DYN1](rl_t)
+    var rl_t = rl1(nv * MODEL_TREE_SIZE)
+    var T_v = T.tt_dyn["cpu", DYN1](rl_t)
     var dims = DynDims(nv=nv)
     for e in range(BATCH):
         _ldl_factor_env(e, dims, M_v, L_v, D_v, T_v)

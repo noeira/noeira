@@ -25,10 +25,10 @@ Run:
 """
 
 from std.math import sqrt, log, cos, sin, pi
-from std.memory import alloc, memset
+from std.memory import alloc, unsafe_memset
 from std.random.philox import Random as PhiloxRandom
 from std.time import perf_counter_ns
-from layout import Layout, LayoutTensor
+from noeira.core.tiles import Tile, tile
 
 from noeira.nn.constants import DT as dtype
 from noeira.experimental.pcn.pc_initializer import PCXavier
@@ -109,9 +109,7 @@ def _step_pendulum(
 
 
 def _clip_grad_norm(
-    mut grads: LayoutTensor[
-        dtype, Layout.row_major(NET.PARAM_SIZE), MutAnyOrigin
-    ],
+    grads: Tile[dtype, NET.PARAM_SIZE],
     max_norm: Float64,
 ) -> Float64:
     """Global L2-norm gradient clipping.
@@ -221,25 +219,15 @@ def main() raises:
         NET.PARAM_SIZE * OPT.STATE_PER_PARAM
     ).as_unsafe_any_origin()
     var opt_global_buf = alloc[Scalar[dtype]](OPT.GLOBAL_STATE_SIZE).as_unsafe_any_origin()
-    memset(params_buf, 0, NET.PARAM_SIZE)
-    memset(grads_buf, 0, NET.PARAM_SIZE)
-    memset(opt_state_buf, 0, NET.PARAM_SIZE * OPT.STATE_PER_PARAM)
-    memset(opt_global_buf, 0, OPT.GLOBAL_STATE_SIZE)
+    unsafe_memset(params_buf, 0, NET.PARAM_SIZE)
+    unsafe_memset(grads_buf, 0, NET.PARAM_SIZE)
+    unsafe_memset(opt_state_buf, 0, NET.PARAM_SIZE * OPT.STATE_PER_PARAM)
+    unsafe_memset(opt_global_buf, 0, OPT.GLOBAL_STATE_SIZE)
 
-    var params = LayoutTensor[
-        dtype, Layout.row_major(NET.PARAM_SIZE), MutAnyOrigin
-    ](params_buf)
-    var grads = LayoutTensor[
-        dtype, Layout.row_major(NET.PARAM_SIZE), MutAnyOrigin
-    ](grads_buf)
-    var opt_state = LayoutTensor[
-        dtype,
-        Layout.row_major(NET.PARAM_SIZE, OPT.STATE_PER_PARAM),
-        MutAnyOrigin,
-    ](opt_state_buf)
-    var opt_global = LayoutTensor[
-        dtype, Layout.row_major(OPT.GLOBAL_STATE_SIZE), MutAnyOrigin
-    ](opt_global_buf)
+    var params = tile[NET.PARAM_SIZE](params_buf)
+    var grads = tile[NET.PARAM_SIZE](grads_buf)
+    var opt_state = tile[NET.PARAM_SIZE, OPT.STATE_PER_PARAM](opt_state_buf)
+    var opt_global = tile[OPT.GLOBAL_STATE_SIZE](opt_global_buf)
     NET.pc_init_params[PCXavier, dtype](params)
 
     # Scratch buffers
@@ -248,34 +236,20 @@ def main() raises:
     var a_below_buf_raw = alloc[Scalar[dtype]](BATCH * NET.SCRATCH_IN_DIM).as_unsafe_any_origin()
     var z_below_buf_raw = alloc[Scalar[dtype]](BATCH * NET.SCRATCH_IN_DIM).as_unsafe_any_origin()
     var dx_buf_raw = alloc[Scalar[dtype]](BATCH * NET.LATENT_DIM).as_unsafe_any_origin()
-    memset(lat_buf, 0, BATCH * NET.LATENT_DIM)
+    unsafe_memset(lat_buf, 0, BATCH * NET.LATENT_DIM)
 
-    var latents = LayoutTensor[
-        dtype, Layout.row_major(BATCH, NET.LATENT_DIM), MutAnyOrigin
-    ](lat_buf)
-    var mu_eps_buf = LayoutTensor[
-        dtype, Layout.row_major(BATCH, NET.SCRATCH_OUT_DIM), MutAnyOrigin
-    ](mu_eps_buf_raw)
-    var a_below_buf = LayoutTensor[
-        dtype, Layout.row_major(BATCH, NET.SCRATCH_IN_DIM), MutAnyOrigin
-    ](a_below_buf_raw)
-    var z_below_buf = LayoutTensor[
-        dtype, Layout.row_major(BATCH, NET.SCRATCH_IN_DIM), MutAnyOrigin
-    ](z_below_buf_raw)
-    var dx_buf = LayoutTensor[
-        dtype, Layout.row_major(BATCH, NET.LATENT_DIM), MutAnyOrigin
-    ](dx_buf_raw)
+    var latents = tile[BATCH, NET.LATENT_DIM](lat_buf)
+    var mu_eps_buf = tile[BATCH, NET.SCRATCH_OUT_DIM](mu_eps_buf_raw)
+    var a_below_buf = tile[BATCH, NET.SCRATCH_IN_DIM](a_below_buf_raw)
+    var z_below_buf = tile[BATCH, NET.SCRATCH_IN_DIM](z_below_buf_raw)
+    var dx_buf = tile[BATCH, NET.LATENT_DIM](dx_buf_raw)
 
     var x_in_buf = alloc[Scalar[dtype]](BATCH * AUG_DIM).as_unsafe_any_origin()
     var y_tgt_buf = alloc[Scalar[dtype]](BATCH * OBS_DIM).as_unsafe_any_origin()
-    memset(x_in_buf, 0, BATCH * AUG_DIM)
-    memset(y_tgt_buf, 0, BATCH * OBS_DIM)
-    var x_in = LayoutTensor[
-        dtype, Layout.row_major(BATCH, AUG_DIM), MutAnyOrigin
-    ](x_in_buf)
-    var y_target = LayoutTensor[
-        dtype, Layout.row_major(BATCH, OBS_DIM), MutAnyOrigin
-    ](y_tgt_buf)
+    unsafe_memset(x_in_buf, 0, BATCH * AUG_DIM)
+    unsafe_memset(y_tgt_buf, 0, BATCH * OBS_DIM)
+    var x_in = tile[BATCH, AUG_DIM](x_in_buf)
+    var y_target = tile[BATCH, OBS_DIM](y_tgt_buf)
 
     # Per-rollout actions/states scratch.
     var actions_buf = alloc[Scalar[dtype]](BATCH * SEQ_LEN).as_unsafe_any_origin()
@@ -302,7 +276,7 @@ def main() raises:
                 )
 
             # Filter z_0 against s_0 (no action input — use zeros).
-            memset(x_in_buf, 0, BATCH * AUG_DIM)
+            unsafe_memset(x_in_buf, 0, BATCH * AUG_DIM)
             for b in range(BATCH):
                 for d in range(OBS_DIM):
                     y_tgt_buf[b * OBS_DIM + d] = obs_buf[
@@ -381,30 +355,18 @@ def main() raises:
 
     # Per-block param views for eval feedforward
     comptime offset_b1 = NET._param_offset[1]()
-    var params_b0 = LayoutTensor[
-        dtype, Layout.row_major(NET.block_types[0].PARAM_SIZE), MutAnyOrigin
-    ](params_buf)
-    var params_b1 = LayoutTensor[
-        dtype, Layout.row_major(NET.block_types[1].PARAM_SIZE), MutAnyOrigin
-    ](params_buf + offset_b1)
+    var params_b0 = tile[NET.block_types[0].PARAM_SIZE](params_buf)
+    var params_b1 = tile[NET.block_types[1].PARAM_SIZE](params_buf + offset_b1)
 
     # Eval feedforward scratch
     var z_pred_buf = alloc[Scalar[dtype]](BATCH * HIDDEN).as_unsafe_any_origin()
     var a_z_pred_buf = alloc[Scalar[dtype]](BATCH * AUG_DIM).as_unsafe_any_origin()
     var s_pred_buf = alloc[Scalar[dtype]](BATCH * OBS_DIM).as_unsafe_any_origin()
     var a_s_pred_buf = alloc[Scalar[dtype]](BATCH * HIDDEN).as_unsafe_any_origin()
-    var z_pred = LayoutTensor[
-        dtype, Layout.row_major(BATCH, HIDDEN), MutAnyOrigin
-    ](z_pred_buf)
-    var a_z_pred = LayoutTensor[
-        dtype, Layout.row_major(BATCH, AUG_DIM), MutAnyOrigin
-    ](a_z_pred_buf)
-    var s_pred = LayoutTensor[
-        dtype, Layout.row_major(BATCH, OBS_DIM), MutAnyOrigin
-    ](s_pred_buf)
-    var a_s_pred = LayoutTensor[
-        dtype, Layout.row_major(BATCH, HIDDEN), MutAnyOrigin
-    ](a_s_pred_buf)
+    var z_pred = tile[BATCH, HIDDEN](z_pred_buf)
+    var a_z_pred = tile[BATCH, AUG_DIM](a_z_pred_buf)
+    var s_pred = tile[BATCH, OBS_DIM](s_pred_buf)
+    var a_s_pred = tile[BATCH, HIDDEN](a_s_pred_buf)
 
     # ── Generate held-out trajectories ───────────────────────────────────────
     var eval_rng = PhiloxRandom(seed=UInt64(2026), offset=UInt64(0))
@@ -425,7 +387,7 @@ def main() raises:
     print("  -----+-----------+-------------+---------------+----------------")
 
     # Filter z_0 against s_0 (no action).
-    memset(x_in_buf, 0, BATCH * AUG_DIM)
+    unsafe_memset(x_in_buf, 0, BATCH * AUG_DIM)
     for b in range(N_EVAL_TRAJ):
         for d in range(OBS_DIM):
             y_tgt_buf[b * OBS_DIM + d] = obs_buf[
@@ -586,7 +548,7 @@ def main() raises:
     print("  step | mse_total (open-loop) | mse_persist | ratio")
     print("  -----+-----------------------+-------------+------")
 
-    memset(x_in_buf, 0, BATCH * AUG_DIM)
+    unsafe_memset(x_in_buf, 0, BATCH * AUG_DIM)
     for b in range(N_EVAL_TRAJ):
         for d in range(OBS_DIM):
             y_tgt_buf[b * OBS_DIM + d] = obs_buf[

@@ -42,7 +42,6 @@ Output buffers exposed:
 
 from max.gpu import block_dim, block_idx, thread_idx
 from max.gpu.host import DeviceContext, DeviceBuffer
-from layout import Layout, LayoutTensor
 
 from noeira.nn.constants import DT as dtype
 
@@ -66,6 +65,7 @@ from .mcts_gpu_gumbel_sampled import (
     gs_extract_kernel,
 )
 from .mcts_gpu_gumbel_orchestrator import gz_extract_root_value_kernel
+from noeira.core.tiles import Tile, tile
 
 
 # ═════════════════════════════════════════════════════════════════════════
@@ -273,9 +273,7 @@ struct SampledGumbelGPUMCTS[
         mut rep: REP,
         mut dyn: DYN,
         mut pred: PRED,
-        obs: LayoutTensor[
-            dtype, Layout.row_major(Self.N_ENVS, REP.OBS_DIM), MutAnyOrigin
-        ],
+        obs: Tile[dtype, Self.N_ENVS, REP.OBS_DIM],
         deterministic: Bool = False,
         rng_seed: UInt32 = UInt32(0),
     ) raises:
@@ -306,29 +304,17 @@ struct SampledGumbelGPUMCTS[
         self.state.zero_tree(ctx)
 
         # ── 1. Rep forward ───────────────────────────────────────────────
-        var root_hidden_t = LayoutTensor[
-            dtype, Layout.row_major(Self.N_ENVS, REP.LATENT_DIM), MutAnyOrigin
-        ](self.state.root_hidden)
+        var root_hidden_t = tile[Self.N_ENVS, REP.LATENT_DIM](self.state.root_hidden)
         rep.encode_gpu[Self.N_ENVS](ctx, obs, root_hidden_t)
 
         # ── 2. Pred forward at root ──────────────────────────────────────
-        var pred_root_in = LayoutTensor[
-            dtype, Layout.row_major(Self.N_ENVS, PRED.LATENT_DIM)
-        ](self.state.root_hidden)
-        var pred_root_out = LayoutTensor[
-            dtype,
-            Layout.row_major(Self.N_ENVS, PRED.PRED_OUT_DIM),
-            MutAnyOrigin,
-        ](self.state.pred_output)
+        var pred_root_in = tile[Self.N_ENVS, PRED.LATENT_DIM](self.state.root_hidden)
+        var pred_root_out = tile[Self.N_ENVS, PRED.PRED_OUT_DIM](self.state.pred_output)
         pred.predict_gpu[Self.N_ENVS](ctx, pred_root_in, pred_root_out)
 
         # ── 3. Scatter root hidden into per-env slot-0 ───────────────────
-        var rh_flat = LayoutTensor[
-            dtype, Layout.row_major(Self.N_ENVS * Self.LATENT)
-        ](self.state.root_hidden)
-        var hs_flat = LayoutTensor[
-            dtype, Layout.row_major(Self.N_ENVS * Self.MAX_NODES * Self.LATENT)
-        ](self.state.hidden_states)
+        var rh_flat = tile[Self.N_ENVS * Self.LATENT](self.state.root_hidden)
+        var hs_flat = tile[Self.N_ENVS * Self.MAX_NODES * Self.LATENT](self.state.hidden_states)
         comptime run_scatter = gs_scatter_root_hidden_kernel[
             Self.N_ENVS,
             Self.MAX_NODES,
@@ -343,39 +329,16 @@ struct SampledGumbelGPUMCTS[
         )
 
         # ── 4. Init root ─────────────────────────────────────────────────
-        var act_t = LayoutTensor[
-            dtype,
-            Layout.row_major(
-                Self.N_ENVS * Self.MAX_NODES * Self.K_PAD * Self.ACT_DIM
-            ),
-        ](self.state.actions)
-        var lp_t = LayoutTensor[
-            dtype, Layout.row_major(Self.N_ENVS * Self.MAX_NODES * Self.K_PAD)
-        ](self.state.log_prior)
-        var nv_t = LayoutTensor[
-            dtype, Layout.row_major(Self.N_ENVS * Self.MAX_NODES)
-        ](self.state.node_value)
-        var ak_t = LayoutTensor[
-            dtype, Layout.row_major(Self.N_ENVS * Self.MAX_NODES)
-        ](self.state.active_k)
-        var nc_t = LayoutTensor[dtype, Layout.row_major(Self.N_ENVS)](
-            self.state.node_count
-        )
-        var miq_t = LayoutTensor[dtype, Layout.row_major(Self.N_ENVS)](
-            self.state.min_q
-        )
-        var mxq_t = LayoutTensor[dtype, Layout.row_major(Self.N_ENVS)](
-            self.state.max_q
-        )
-        var rg_t = LayoutTensor[
-            dtype, Layout.row_major(Self.N_ENVS * Self.K_ROOT)
-        ](self.state.root_gumbels)
-        var ra_t = LayoutTensor[
-            dtype, Layout.row_major(Self.N_ENVS * Self.K_ROOT)
-        ](self.state.root_active)
-        var po_full_t = LayoutTensor[
-            dtype, Layout.row_major(Self.N_ENVS * Self.PRED_OUT)
-        ](self.state.pred_output)
+        var act_t = tile[Self.N_ENVS * Self.MAX_NODES * Self.K_PAD * Self.ACT_DIM](self.state.actions)
+        var lp_t = tile[Self.N_ENVS * Self.MAX_NODES * Self.K_PAD](self.state.log_prior)
+        var nv_t = tile[Self.N_ENVS * Self.MAX_NODES](self.state.node_value)
+        var ak_t = tile[Self.N_ENVS * Self.MAX_NODES](self.state.active_k)
+        var nc_t = tile[Self.N_ENVS](self.state.node_count)
+        var miq_t = tile[Self.N_ENVS](self.state.min_q)
+        var mxq_t = tile[Self.N_ENVS](self.state.max_q)
+        var rg_t = tile[Self.N_ENVS * Self.K_ROOT](self.state.root_gumbels)
+        var ra_t = tile[Self.N_ENVS * Self.K_ROOT](self.state.root_active)
+        var po_full_t = tile[Self.N_ENVS * Self.PRED_OUT](self.state.pred_output)
 
         comptime run_init = gs_init_root_kernel[
             Self.N_ENVS,
@@ -449,17 +412,9 @@ struct SampledGumbelGPUMCTS[
                     Self.K_PAD,
                     dtype,
                 ]
-                var vc_t = LayoutTensor[
-                    dtype,
-                    Layout.row_major(Self.N_ENVS * Self.MAX_NODES * Self.K_PAD),
-                ](self.state.visit_count)
-                var tv_t = LayoutTensor[
-                    dtype,
-                    Layout.row_major(Self.N_ENVS * Self.MAX_NODES * Self.K_PAD),
-                ](self.state.total_value)
-                var tvis_t = LayoutTensor[
-                    dtype, Layout.row_major(Self.N_ENVS * Self.MAX_NODES)
-                ](self.state.total_visits)
+                var vc_t = tile[Self.N_ENVS * Self.MAX_NODES * Self.K_PAD](self.state.visit_count)
+                var tv_t = tile[Self.N_ENVS * Self.MAX_NODES * Self.K_PAD](self.state.total_value)
+                var tvis_t = tile[Self.N_ENVS * Self.MAX_NODES](self.state.total_visits)
                 ctx.enqueue_function[run_halve](
                     vc_t,
                     tv_t,
@@ -487,15 +442,9 @@ struct SampledGumbelGPUMCTS[
             sims_used += 1
 
         # ── 6. Extract chosen action + root visit diagnostics ────────────
-        var ca_t = LayoutTensor[
-            dtype, Layout.row_major(Self.N_ENVS * Self.ACT_DIM)
-        ](self.state.chosen_actions)
-        var rv_t = LayoutTensor[
-            dtype, Layout.row_major(Self.N_ENVS * Self.K_ROOT)
-        ](self.state.root_visits)
-        var vc_extract_t = LayoutTensor[
-            dtype, Layout.row_major(Self.N_ENVS * Self.MAX_NODES * Self.K_PAD)
-        ](self.state.visit_count)
+        var ca_t = tile[Self.N_ENVS * Self.ACT_DIM](self.state.chosen_actions)
+        var rv_t = tile[Self.N_ENVS * Self.K_ROOT](self.state.root_visits)
+        var vc_extract_t = tile[Self.N_ENVS * Self.MAX_NODES * Self.K_PAD](self.state.visit_count)
         comptime run_extract = gs_extract_kernel[
             Self.N_ENVS,
             Self.MAX_NODES,
@@ -516,15 +465,9 @@ struct SampledGumbelGPUMCTS[
         )
 
         # ── 7. Extract root scalar value ─────────────────────────────────
-        var root_value_t = LayoutTensor[dtype, Layout.row_major(Self.N_ENVS)](
-            self.root_value_out
-        )
-        var vc_root_t = LayoutTensor[
-            dtype, Layout.row_major(Self.N_ENVS * Self.MAX_NODES * Self.K_PAD)
-        ](self.state.visit_count)
-        var tv_root_t = LayoutTensor[
-            dtype, Layout.row_major(Self.N_ENVS * Self.MAX_NODES * Self.K_PAD)
-        ](self.state.total_value)
+        var root_value_t = tile[Self.N_ENVS](self.root_value_out)
+        var vc_root_t = tile[Self.N_ENVS * Self.MAX_NODES * Self.K_PAD](self.state.visit_count)
+        var tv_root_t = tile[Self.N_ENVS * Self.MAX_NODES * Self.K_PAD](self.state.total_value)
         comptime run_root_value = gz_extract_root_value_kernel[
             Self.N_ENVS,
             Self.MAX_NODES,
@@ -559,69 +502,26 @@ struct SampledGumbelGPUMCTS[
     ) raises:
         """One sim across all envs: select → dyn → pred → expand → backup."""
 
-        var vc_t = LayoutTensor[
-            dtype, Layout.row_major(Self.N_ENVS * Self.MAX_NODES * Self.K_PAD)
-        ](self.state.visit_count)
-        var tv_t = LayoutTensor[
-            dtype, Layout.row_major(Self.N_ENVS * Self.MAX_NODES * Self.K_PAD)
-        ](self.state.total_value)
-        var lp_t = LayoutTensor[
-            dtype, Layout.row_major(Self.N_ENVS * Self.MAX_NODES * Self.K_PAD)
-        ](self.state.log_prior)
-        var rw_t = LayoutTensor[
-            dtype, Layout.row_major(Self.N_ENVS * Self.MAX_NODES * Self.K_PAD)
-        ](self.state.reward)
-        var ci_t = LayoutTensor[
-            dtype, Layout.row_major(Self.N_ENVS * Self.MAX_NODES * Self.K_PAD)
-        ](self.state.child_idx)
-        var act_t = LayoutTensor[
-            dtype,
-            Layout.row_major(
-                Self.N_ENVS * Self.MAX_NODES * Self.K_PAD * Self.ACT_DIM
-            ),
-        ](self.state.actions)
-        var tvis_t = LayoutTensor[
-            dtype, Layout.row_major(Self.N_ENVS * Self.MAX_NODES)
-        ](self.state.total_visits)
-        var nv_t = LayoutTensor[
-            dtype, Layout.row_major(Self.N_ENVS * Self.MAX_NODES)
-        ](self.state.node_value)
-        var ak_t = LayoutTensor[
-            dtype, Layout.row_major(Self.N_ENVS * Self.MAX_NODES)
-        ](self.state.active_k)
-        var nc_t = LayoutTensor[dtype, Layout.row_major(Self.N_ENVS)](
-            self.state.node_count
-        )
-        var miq_t = LayoutTensor[dtype, Layout.row_major(Self.N_ENVS)](
-            self.state.min_q
-        )
-        var mxq_t = LayoutTensor[dtype, Layout.row_major(Self.N_ENVS)](
-            self.state.max_q
-        )
-        var ra_t = LayoutTensor[
-            dtype, Layout.row_major(Self.N_ENVS * Self.K_ROOT)
-        ](self.state.root_active)
-        var hs_t = LayoutTensor[
-            dtype, Layout.row_major(Self.N_ENVS * Self.MAX_NODES * Self.LATENT)
-        ](self.state.hidden_states)
-        var di_t = LayoutTensor[
-            dtype, Layout.row_major(Self.N_ENVS * Self.DYN_IN)
-        ](self.state.dyn_input)
-        var pp_t = LayoutTensor[dtype, Layout.row_major(Self.N_ENVS)](
-            self.state.pending_parent
-        )
-        var pc_t = LayoutTensor[dtype, Layout.row_major(Self.N_ENVS)](
-            self.state.pending_cand
-        )
-        var sp_t = LayoutTensor[
-            dtype, Layout.row_major(Self.N_ENVS * MAX_DEPTH)
-        ](self.state.search_paths)
-        var cp_t = LayoutTensor[
-            dtype, Layout.row_major(Self.N_ENVS * MAX_DEPTH)
-        ](self.state.cand_paths)
-        var pl_t = LayoutTensor[dtype, Layout.row_major(Self.N_ENVS)](
-            self.state.path_lengths
-        )
+        var vc_t = tile[Self.N_ENVS * Self.MAX_NODES * Self.K_PAD](self.state.visit_count)
+        var tv_t = tile[Self.N_ENVS * Self.MAX_NODES * Self.K_PAD](self.state.total_value)
+        var lp_t = tile[Self.N_ENVS * Self.MAX_NODES * Self.K_PAD](self.state.log_prior)
+        var rw_t = tile[Self.N_ENVS * Self.MAX_NODES * Self.K_PAD](self.state.reward)
+        var ci_t = tile[Self.N_ENVS * Self.MAX_NODES * Self.K_PAD](self.state.child_idx)
+        var act_t = tile[Self.N_ENVS * Self.MAX_NODES * Self.K_PAD * Self.ACT_DIM](self.state.actions)
+        var tvis_t = tile[Self.N_ENVS * Self.MAX_NODES](self.state.total_visits)
+        var nv_t = tile[Self.N_ENVS * Self.MAX_NODES](self.state.node_value)
+        var ak_t = tile[Self.N_ENVS * Self.MAX_NODES](self.state.active_k)
+        var nc_t = tile[Self.N_ENVS](self.state.node_count)
+        var miq_t = tile[Self.N_ENVS](self.state.min_q)
+        var mxq_t = tile[Self.N_ENVS](self.state.max_q)
+        var ra_t = tile[Self.N_ENVS * Self.K_ROOT](self.state.root_active)
+        var hs_t = tile[Self.N_ENVS * Self.MAX_NODES * Self.LATENT](self.state.hidden_states)
+        var di_t = tile[Self.N_ENVS * Self.DYN_IN](self.state.dyn_input)
+        var pp_t = tile[Self.N_ENVS](self.state.pending_parent)
+        var pc_t = tile[Self.N_ENVS](self.state.pending_cand)
+        var sp_t = tile[Self.N_ENVS * MAX_DEPTH](self.state.search_paths)
+        var cp_t = tile[Self.N_ENVS * MAX_DEPTH](self.state.cand_paths)
+        var pl_t = tile[Self.N_ENVS](self.state.path_lengths)
 
         # Selection.
         comptime run_select = gs_select_kernel[
@@ -661,12 +561,8 @@ struct SampledGumbelGPUMCTS[
         )
 
         # Dynamics forward (via trait adapter).
-        var dyn_in_b = LayoutTensor[
-            dtype, Layout.row_major(Self.N_ENVS, DYN.DYN_IN_DIM)
-        ](self.state.dyn_input)
-        var dyn_out_b = LayoutTensor[
-            dtype, Layout.row_major(Self.N_ENVS, DYN.DYN_OUT_DIM), MutAnyOrigin
-        ](self.state.dyn_output)
+        var dyn_in_b = tile[Self.N_ENVS, DYN.DYN_IN_DIM](self.state.dyn_input)
+        var dyn_out_b = tile[Self.N_ENVS, DYN.DYN_OUT_DIM](self.state.dyn_output)
         dyn.step_gpu[Self.N_ENVS](ctx, dyn_in_b, dyn_out_b)
 
         # Copy LATENT prefix of dyn_output into pred_input.
@@ -676,12 +572,8 @@ struct SampledGumbelGPUMCTS[
             Self.DYN_OUT,
             dtype,
         ]
-        var pred_in_flat = LayoutTensor[
-            dtype, Layout.row_major(Self.N_ENVS * Self.LATENT)
-        ](self.state.pred_input)
-        var dyn_out_flat = LayoutTensor[
-            dtype, Layout.row_major(Self.N_ENVS * Self.DYN_OUT)
-        ](self.state.dyn_output)
+        var pred_in_flat = tile[Self.N_ENVS * Self.LATENT](self.state.pred_input)
+        var dyn_out_flat = tile[Self.N_ENVS * Self.DYN_OUT](self.state.dyn_output)
         ctx.enqueue_function[run_copy](
             pred_in_flat,
             dyn_out_flat,
@@ -690,23 +582,13 @@ struct SampledGumbelGPUMCTS[
         )
 
         # Prediction forward.
-        var pred_in_b = LayoutTensor[
-            dtype, Layout.row_major(Self.N_ENVS, PRED.LATENT_DIM)
-        ](self.state.pred_input)
-        var pred_out_b = LayoutTensor[
-            dtype,
-            Layout.row_major(Self.N_ENVS, PRED.PRED_OUT_DIM),
-            MutAnyOrigin,
-        ](self.state.pred_output)
+        var pred_in_b = tile[Self.N_ENVS, PRED.LATENT_DIM](self.state.pred_input)
+        var pred_out_b = tile[Self.N_ENVS, PRED.PRED_OUT_DIM](self.state.pred_output)
         pred.predict_gpu[Self.N_ENVS](ctx, pred_in_b, pred_out_b)
 
         # Expand.
-        var lv_t = LayoutTensor[dtype, Layout.row_major(Self.N_ENVS)](
-            self.state.leaf_values
-        )
-        var po_full_t = LayoutTensor[
-            dtype, Layout.row_major(Self.N_ENVS * Self.PRED_OUT)
-        ](self.state.pred_output)
+        var lv_t = tile[Self.N_ENVS](self.state.leaf_values)
+        var po_full_t = tile[Self.N_ENVS * Self.PRED_OUT](self.state.pred_output)
         comptime run_expand = gs_expand_kernel[
             Self.N_ENVS,
             Self.MAX_NODES,

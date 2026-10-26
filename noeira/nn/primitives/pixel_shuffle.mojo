@@ -31,7 +31,6 @@ identity `<f(x), y> == <x, vjp(y)>` holds exactly and is the gate.
 
 from max.gpu import global_idx
 from max.gpu.host import DeviceContext
-from layout import Layout, LayoutTensor
 
 from noeira.nn.constants import DT, TPB
 from ..core.tensor import Tensor
@@ -40,13 +39,14 @@ from ..core.module import Module
 from ..core.param import ParamVisitor
 from ..core.initializer import Initializer
 from ..core.amp import AMPPolicy, NoAMP
+from noeira.core.tiles import Tile
 
 
 def _ps_fwd_kernel[
     BATCH: Int, GRID: Int, EMBED: Int, SCALE: Int, N: Int
 ](
-    src: LayoutTensor[DT, Layout.row_major(BATCH, N), MutAnyOrigin],
-    dst: LayoutTensor[DT, Layout.row_major(BATCH, N), MutAnyOrigin],
+    src: Tile[DT, BATCH, N],
+    dst: Tile[DT, BATCH, N],
 ):
     comptime OG = GRID // SCALE
     comptime OC = EMBED * SCALE * SCALE
@@ -73,8 +73,8 @@ def _ps_fwd_kernel[
 def _ps_bwd_kernel[
     BATCH: Int, GRID: Int, EMBED: Int, SCALE: Int, N: Int
 ](
-    go: LayoutTensor[DT, Layout.row_major(BATCH, N), MutAnyOrigin],
-    gi: LayoutTensor[DT, Layout.row_major(BATCH, N), MutAnyOrigin],
+    go: Tile[DT, BATCH, N],
+    gi: Tile[DT, BATCH, N],
 ):
     comptime OG = GRID // SCALE
     comptime OC = EMBED * SCALE * SCALE
@@ -149,8 +149,8 @@ struct PixelShuffle[GRID: Int, EMBED: Int, SCALE: Int](Module):
                     B, Self.GRID, Self.EMBED, Self.SCALE, Self.N
                 ]
             ](
-                x.lt["gpu", Layout.row_major(B, Self.N)](),
-                out.lt["gpu", Layout.row_major(B, Self.N)](),
+                x.tt["gpu", B, Self.N](),
+                out.tt["gpu", B, Self.N](),
                 grid_dim=n_blocks,
                 block_dim=TPB,
             )
@@ -192,8 +192,8 @@ struct PixelShuffle[GRID: Int, EMBED: Int, SCALE: Int](Module):
                     B, Self.GRID, Self.EMBED, Self.SCALE, Self.N
                 ]
             ](
-                grad_output.lt["gpu", Layout.row_major(B, Self.N)](),
-                gin.lt["gpu", Layout.row_major(B, Self.N)](),
+                grad_output.tt["gpu", B, Self.N](),
+                gin.tt["gpu", B, Self.N](),
                 grid_dim=n_blocks,
                 block_dim=TPB,
             )

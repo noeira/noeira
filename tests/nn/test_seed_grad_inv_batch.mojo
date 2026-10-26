@@ -17,7 +17,7 @@ from std.memory import alloc
 from std.testing import assert_true
 from max.gpu.host import DeviceContext
 
-from layout import Layout, LayoutTensor
+from noeira.core.tiles import tile
 
 from noeira.nn.constants import DT
 from noeira.deep_agents.loss.seed_grad_inv_batch import seed_grad_inv_batch
@@ -32,7 +32,7 @@ def test_cpu_basic() raises:
         buf[i] = Scalar[DT](999.0)
 
     seed_grad_inv_batch["cpu", BATCH](
-        LayoutTensor[DT, Layout.row_major(BATCH, 1), MutAnyOrigin](buf)
+        tile[BATCH, 1](buf)
     )
 
     var expected = Scalar[DT](1.0) / Scalar[DT](BATCH)
@@ -51,14 +51,14 @@ def test_cpu_batch_sizes() raises:
     # BATCH=1 → 1.0, BATCH=2 → 0.5, BATCH=256 → ~0.0039.
     var b1 = alloc[Scalar[DT]](1).as_unsafe_any_origin()
     seed_grad_inv_batch["cpu", 1](
-        LayoutTensor[DT, Layout.row_major(1, 1), MutAnyOrigin](b1)
+        tile[1, 1](b1)
     )
     assert_true(b1[0] == Scalar[DT](1.0), "BATCH=1 should give 1.0")
     b1.free()
 
     var b2 = alloc[Scalar[DT]](2).as_unsafe_any_origin()
     seed_grad_inv_batch["cpu", 2](
-        LayoutTensor[DT, Layout.row_major(2, 1), MutAnyOrigin](b2)
+        tile[2, 1](b2)
     )
     assert_true(b2[0] == Scalar[DT](0.5), "BATCH=2 [0] should give 0.5")
     assert_true(b2[1] == Scalar[DT](0.5), "BATCH=2 [1] should give 0.5")
@@ -66,7 +66,7 @@ def test_cpu_batch_sizes() raises:
 
     var b256 = alloc[Scalar[DT]](256).as_unsafe_any_origin()
     seed_grad_inv_batch["cpu", 256](
-        LayoutTensor[DT, Layout.row_major(256, 1), MutAnyOrigin](b256)
+        tile[256, 1](b256)
     )
     var expected_256 = Scalar[DT](1.0) / Scalar[DT](256)
     for i in range(256):
@@ -88,9 +88,7 @@ def test_gpu_basic() raises:
         host_buf[i] = Scalar[DT](999.0)
     ctx.enqueue_copy(dev_buf, host_buf)
 
-    var dev_p = LayoutTensor[DT, Layout.row_major(BATCH, 1), MutAnyOrigin](
-        dev_buf.unsafe_ptr().as_unsafe_any_origin()
-    )
+    var dev_p = tile[BATCH, 1](dev_buf.unsafe_ptr().as_unsafe_any_origin())
     seed_grad_inv_batch["gpu", BATCH](
         dev_p, Optional[DeviceContext](ctx)
     )

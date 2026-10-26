@@ -41,7 +41,7 @@ drawn from "the graph test hangs" is about the machine instead.
 
 from max.gpu import thread_idx
 from std.os import getenv
-from layout import Layout, LayoutTensor
+from noeira.core.tiles import Tile, tile
 from max.gpu.host import DeviceContext, DeviceBuffer
 
 from noeira.nn.constants import DT
@@ -62,7 +62,7 @@ def main() raises:
     print("[probe] [2] ok", flush=True)
 
     @always_inline
-    def _bump(b: LayoutTensor[DT, Layout.row_major(1), MutAnyOrigin]):
+    def _bump(b: Tile[DT, 1]):
         if Int(thread_idx.x) != 0:
             return
         b[0] = b[0] + Scalar[DT](1.0)
@@ -71,7 +71,7 @@ def main() raises:
     # toolchain is the problem and `device_graph.mojo` is exonerated. This is
     # also the first JIT of `_bump`, so on NVIDIA it pays ptxas.
     print("[probe] [3] bare enqueue_function + synchronize (NO graph) ...", flush=True)
-    var v0 = LayoutTensor[DT, Layout.row_major(1)](buf)
+    var v0 = tile[1](buf)
     ctx.enqueue_function[_bump](v0, grid_dim=1, block_dim=1)
     ctx.synchronize()
     print("[probe] [3] ok", flush=True)
@@ -94,7 +94,7 @@ def main() raises:
     # closure passed as a comptime parameter is destroyed at its construction
     # line. See `device_graph.mojo`'s header.
     def _step(gctx: DeviceContext) capturing raises -> None:
-        var v = LayoutTensor[DT, Layout.row_major(1)](buf)
+        var v = tile[1](buf)
         gctx.enqueue_function[_bump](v, grid_dim=1, block_dim=1)
 
     print("[probe] [6] maybe_record_replay #1 (warm-up + record) ...", flush=True)

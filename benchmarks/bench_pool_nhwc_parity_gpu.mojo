@@ -16,7 +16,7 @@ Run (Apple = parity only):
 from max.gpu import global_idx
 from max.gpu.host import DeviceContext, DeviceBuffer
 from std.time import perf_counter_ns
-from layout import Layout, LayoutTensor
+from noeira.core.tiles import Tile, tile
 
 comptime DT = DType.float32
 comptime TPB = 128
@@ -27,8 +27,8 @@ def _maxpool_nchw[
     N: Int, C: Int, K: Int, S: Int, P: Int, H: Int, W: Int,
     OH: Int, OW: Int, IN_FLAT: Int, OUT_FLAT: Int,
 ](
-    input: LayoutTensor[DT, Layout.row_major(N, IN_FLAT), MutAnyOrigin],
-    output: LayoutTensor[DT, Layout.row_major(N, OUT_FLAT), MutAnyOrigin],
+    input: Tile[DT, N, IN_FLAT],
+    output: Tile[DT, N, OUT_FLAT],
 ):
     var idx = Int(global_idx.x)
     if idx >= N * OUT_FLAT:
@@ -61,8 +61,8 @@ def _maxpool_nhwc[
     N: Int, C: Int, K: Int, S: Int, P: Int, H: Int, W: Int,
     OH: Int, OW: Int, IN_FLAT: Int, OUT_FLAT: Int,
 ](
-    input: LayoutTensor[DT, Layout.row_major(N, IN_FLAT), MutAnyOrigin],
-    output: LayoutTensor[DT, Layout.row_major(N, OUT_FLAT), MutAnyOrigin],
+    input: Tile[DT, N, IN_FLAT],
+    output: Tile[DT, N, OUT_FLAT],
 ):
     var idx = Int(global_idx.x)
     if idx >= N * OUT_FLAT:
@@ -128,10 +128,10 @@ def run_pool[
     var o_nchw = ctx.enqueue_create_buffer[DT](N * OUT_FLAT)
     var o_nhwc = ctx.enqueue_create_buffer[DT](N * OUT_FLAT)
 
-    var xn = LayoutTensor[DT, Layout.row_major(N, IN_FLAT), MutAnyOrigin](x_nchw)
-    var onn = LayoutTensor[DT, Layout.row_major(N, OUT_FLAT), MutAnyOrigin](o_nchw)
-    var xh = LayoutTensor[DT, Layout.row_major(N, IN_FLAT), MutAnyOrigin](x_nhwc)
-    var ohh = LayoutTensor[DT, Layout.row_major(N, OUT_FLAT), MutAnyOrigin](o_nhwc)
+    var xn = tile[N, IN_FLAT](x_nchw)
+    var onn = tile[N, OUT_FLAT](o_nchw)
+    var xh = tile[N, IN_FLAT](x_nhwc)
+    var ohh = tile[N, OUT_FLAT](o_nhwc)
     comptime nb = (TOT + TPB - 1) // TPB
 
     ctx.enqueue_function[

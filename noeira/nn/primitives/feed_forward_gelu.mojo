@@ -32,7 +32,7 @@ Everywhere else (CPU, Apple, bf16 activations) it runs its three children —
 Parameters walk as `0.*` (fc1) and `1.*` (fc2).
 """
 
-from std.sys import has_nvidia_gpu_accelerator
+from std.sys import default_accelerator
 from max.gpu.host import DeviceContext
 
 from noeira.nn.constants import DT, TPB
@@ -49,7 +49,7 @@ from .linear import Linear, enqueue_bias_grad, _cast_f2b_kernel
 from .activations import GELUTanh
 from .ops.gelu_tanh_op import GELUTanhOp
 from max.gpu.host import DeviceBuffer
-from layout import TileTensor, row_major
+from layout import Coord, TileTensor, row_major
 from linalg.matmul import matmul as max_matmul
 from linalg.utils import elementwise_epilogue_type
 from std.utils.index import IndexList
@@ -79,14 +79,18 @@ def _mm_bias_gelu[
     @__copy_capture(hv, zv, bv)
     def _bias_gelu[
         dtype: DType, width: SIMDLength, *, alignment: Int = 1
-    ](coords: IndexList[2], val: SIMD[dtype, width]) capturing -> None:
+    ](coords: Coord, val: SIMD[dtype, width]) capturing -> None:
         var zz = val.cast[DT]()
         var hh = zz
         comptime for i in range(width):
-            zz[i] += rebind[Scalar[DT]](bv[coords[1] + i])
+            zz[i] += rebind[Scalar[DT]](bv[Int(coords[1].value()) + i])
             hh[i] = GELUTanhOp.forward_scalar(zz[i])
-        zv.store_linear[alignment=alignment](coords, zz)
-        hv.store_linear[alignment=alignment](coords, hh)
+        zv.store_linear[alignment=alignment](
+            IndexList[2](Int(coords[0].value()), Int(coords[1].value())), zz
+        )
+        hv.store_linear[alignment=alignment](
+            IndexList[2](Int(coords[0].value()), Int(coords[1].value())), hh
+        )
 
     max_matmul[
         target="gpu",
@@ -100,7 +104,7 @@ struct FeedForwardGELU[S: Int, D: Int, FF: Int, ADT: DType = DT](Module):
     comptime IN_DIMS = Array[Int, 1](fill=Self.S * Self.D)
     comptime OUT_DIM = Self.S * Self.D
     # The fused path: NVIDIA, fp32 activations.
-    comptime FUSED = has_nvidia_gpu_accelerator() and Self.ADT == DT
+    comptime FUSED = default_accelerator().is_nvidia_gpu() and Self.ADT == DT
     # The bf16 fused path: NVIDIA bf16 activations, where cuBLASLt's GELU
     # epilogues run inside the GEMM (`cublaslt_gemm.mojo`): fc1 + bias + GELU
     # in one GEMM that also stores z, and dz = (go·W2ᵀ) ⊙ GELU'(z) in one.

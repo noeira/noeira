@@ -36,12 +36,12 @@ from noeira.core import (
 )
 from noeira.render import Renderer2D, SDL_Color, Vec2, Camera, black, white
 from std.random.philox import Random as PhiloxRandom
-from layout import LayoutTensor, Layout
 from max.gpu import block_dim, block_idx, thread_idx
 from max.gpu.host import DeviceContext, DeviceBuffer
 
 from ..core.gpu_env import ArcadeGameState, ArcadeGameAction, gpu_dtype
 from ..core.colors import SCREEN_W, SCREEN_H
+from noeira.core.tiles import Tile, ImmTile, tile
 
 # ============================================================================
 # Constants
@@ -572,20 +572,10 @@ struct SpaceInvadersEnv[DTYPE: DType](
         BATCH_SIZE: Int,
         STATE_SIZE: Int,
     ](
-        states: LayoutTensor[
-            gpu_dtype,
-            Layout.row_major(BATCH_SIZE, STATE_SIZE),
-            MutAnyOrigin,
-        ],
-        actions: LayoutTensor[
-            gpu_dtype, Layout.row_major(BATCH_SIZE), ImmutAnyOrigin
-        ],
-        rewards: LayoutTensor[
-            gpu_dtype, Layout.row_major(BATCH_SIZE), MutAnyOrigin
-        ],
-        dones: LayoutTensor[
-            gpu_dtype, Layout.row_major(BATCH_SIZE), MutAnyOrigin
-        ],
+        states: Tile[gpu_dtype, BATCH_SIZE, STATE_SIZE],
+        actions: ImmTile[gpu_dtype, BATCH_SIZE],
+        rewards: Tile[gpu_dtype, BATCH_SIZE],
+        dones: Tile[gpu_dtype, BATCH_SIZE],
         rng_seed: Scalar[DType.uint64],
     ):
         var i = Int(block_dim.x * block_idx.x + thread_idx.x)
@@ -791,11 +781,7 @@ struct SpaceInvadersEnv[DTYPE: DType](
         BATCH_SIZE: Int,
         STATE_SIZE: Int,
     ](
-        state: LayoutTensor[
-            gpu_dtype,
-            Layout.row_major(BATCH_SIZE, STATE_SIZE),
-            MutAnyOrigin,
-        ],
+        state: Tile[gpu_dtype, BATCH_SIZE, STATE_SIZE],
     ):
         var i = Int(block_dim.x * block_idx.x + thread_idx.x)
         if i >= BATCH_SIZE:
@@ -823,16 +809,8 @@ struct SpaceInvadersEnv[DTYPE: DType](
         BATCH_SIZE: Int,
         STATE_SIZE: Int,
     ](
-        state: LayoutTensor[
-            gpu_dtype,
-            Layout.row_major(BATCH_SIZE, STATE_SIZE),
-            MutAnyOrigin,
-        ],
-        dones: LayoutTensor[
-            gpu_dtype,
-            Layout.row_major(BATCH_SIZE),
-            MutAnyOrigin,
-        ],
+        state: Tile[gpu_dtype, BATCH_SIZE, STATE_SIZE],
+        dones: Tile[gpu_dtype, BATCH_SIZE],
         rng_seed: Scalar[DType.uint32],
     ):
         var i = Int(block_dim.x * block_idx.x + thread_idx.x)
@@ -885,50 +863,24 @@ struct SpaceInvadersEnv[DTYPE: DType](
             Pointer[Scalar[DType.uint64], MutAnyOrigin]
         ] = None,
     ) raises:
-        var states = LayoutTensor[
-            gpu_dtype, Layout.row_major(BATCH_SIZE, STATE_SIZE)
-        ](states_buf)
-        var actions = LayoutTensor[
-            gpu_dtype, Layout.row_major(BATCH_SIZE)
-        ](actions_buf)
-        var rewards = LayoutTensor[
-            gpu_dtype, Layout.row_major(BATCH_SIZE)
-        ](rewards_buf)
-        var dones = LayoutTensor[
-            gpu_dtype, Layout.row_major(BATCH_SIZE)
-        ](dones_buf)
-        var terminated_out = LayoutTensor[
-            gpu_dtype, Layout.row_major(BATCH_SIZE)
-        ](terminated_buf)
-        var obs = LayoutTensor[
-            gpu_dtype, Layout.row_major(BATCH_SIZE, OBS_DIM)
-        ](obs_buf)
+        var states = tile[BATCH_SIZE, STATE_SIZE](states_buf)
+        var actions = tile[BATCH_SIZE](actions_buf)
+        var rewards = tile[BATCH_SIZE](rewards_buf)
+        var dones = tile[BATCH_SIZE](dones_buf)
+        var terminated_out = tile[BATCH_SIZE](terminated_buf)
+        var obs = tile[BATCH_SIZE, OBS_DIM](obs_buf)
 
         comptime BLOCKS = (BATCH_SIZE + Self.TPB - 1) // Self.TPB
         var seed = Scalar[DType.uint64](rng_seed)
 
         @always_inline
         def step_wrapper(
-            states: LayoutTensor[
-                gpu_dtype,
-                Layout.row_major(BATCH_SIZE, STATE_SIZE),
-                MutAnyOrigin,
-            ],
-            actions: LayoutTensor[
-                gpu_dtype, Layout.row_major(BATCH_SIZE), ImmutAnyOrigin
-            ],
-            rewards: LayoutTensor[
-                gpu_dtype, Layout.row_major(BATCH_SIZE), MutAnyOrigin
-            ],
-            dones: LayoutTensor[
-                gpu_dtype, Layout.row_major(BATCH_SIZE), MutAnyOrigin
-            ],
-            terminated_out: LayoutTensor[
-                gpu_dtype, Layout.row_major(BATCH_SIZE), MutAnyOrigin
-            ],
-            obs: LayoutTensor[
-                gpu_dtype, Layout.row_major(BATCH_SIZE, OBS_DIM), MutAnyOrigin
-            ],
+            states: Tile[gpu_dtype, BATCH_SIZE, STATE_SIZE],
+            actions: ImmTile[gpu_dtype, BATCH_SIZE],
+            rewards: Tile[gpu_dtype, BATCH_SIZE],
+            dones: Tile[gpu_dtype, BATCH_SIZE],
+            terminated_out: Tile[gpu_dtype, BATCH_SIZE],
+            obs: Tile[gpu_dtype, BATCH_SIZE, OBS_DIM],
             rng_seed: Scalar[DType.uint64],
         ):
             Self.step_kernel[BATCH_SIZE, STATE_SIZE](
@@ -986,24 +938,14 @@ struct SpaceInvadersEnv[DTYPE: DType](
         replay (prev_obs raw vs next_obs normalized → uniform collapse). Keep
         in lock-step with the obs block in `step_kernel_gpu`."""
         # `states_buf` read-only here → mut=False view widens into ImmutAnyOrigin.
-        var states = LayoutTensor[
-            gpu_dtype, Layout.row_major(BATCH_SIZE, STATE_SIZE)
-        ](states_buf)
-        var obs = LayoutTensor[
-            gpu_dtype, Layout.row_major(BATCH_SIZE, OBS_DIM)
-        ](obs_buf)
+        var states = tile[BATCH_SIZE, STATE_SIZE](states_buf)
+        var obs = tile[BATCH_SIZE, OBS_DIM](obs_buf)
         comptime BLOCKS = (BATCH_SIZE + Self.TPB - 1) // Self.TPB
 
         @always_inline
         def extract_wrapper(
-            states: LayoutTensor[
-                gpu_dtype,
-                Layout.row_major(BATCH_SIZE, STATE_SIZE),
-                ImmutAnyOrigin,
-            ],
-            obs: LayoutTensor[
-                gpu_dtype, Layout.row_major(BATCH_SIZE, OBS_DIM), MutAnyOrigin
-            ],
+            states: ImmTile[gpu_dtype, BATCH_SIZE, STATE_SIZE],
+            obs: Tile[gpu_dtype, BATCH_SIZE, OBS_DIM],
         ):
             var idx = Int(block_dim.x * block_idx.x + thread_idx.x)
             if idx < BATCH_SIZE:
@@ -1041,18 +983,12 @@ struct SpaceInvadersEnv[DTYPE: DType](
         mut states_buf: DeviceBuffer[gpu_dtype],
         rng_seed: UInt64 = 0,
     ) raises:
-        var states = LayoutTensor[
-            gpu_dtype, Layout.row_major(BATCH_SIZE, STATE_SIZE)
-        ](states_buf)
+        var states = tile[BATCH_SIZE, STATE_SIZE](states_buf)
         comptime BLOCKS = (BATCH_SIZE + Self.TPB - 1) // Self.TPB
 
         @always_inline
         def reset_wrapper(
-            states: LayoutTensor[
-                gpu_dtype,
-                Layout.row_major(BATCH_SIZE, STATE_SIZE),
-                MutAnyOrigin,
-            ],
+            states: Tile[gpu_dtype, BATCH_SIZE, STATE_SIZE],
         ):
             Self.reset_kernel[BATCH_SIZE, STATE_SIZE](states)
 
@@ -1078,32 +1014,18 @@ struct SpaceInvadersEnv[DTYPE: DType](
             Pointer[Scalar[DType.uint64], MutAnyOrigin]
         ] = None,
     ) raises:
-        var states = LayoutTensor[
-            gpu_dtype, Layout.row_major(BATCH_SIZE, STATE_SIZE)
-        ](states_buf)
-        var dones = LayoutTensor[
-            gpu_dtype, Layout.row_major(BATCH_SIZE)
-        ](dones_buf)
+        var states = tile[BATCH_SIZE, STATE_SIZE](states_buf)
+        var dones = tile[BATCH_SIZE](dones_buf)
         comptime BLOCKS = (BATCH_SIZE + Self.TPB - 1) // Self.TPB
 
         if Bool(rng_counter_ptr):
-            var counter_t = LayoutTensor[
-                DType.uint64, Layout.row_major(1), MutAnyOrigin
-            ](rng_counter_ptr.value())
+            var counter_t = tile[1](rng_counter_ptr.value())
 
             @always_inline
             def sel_reset_counter_wrapper(
-                states: LayoutTensor[
-                    gpu_dtype,
-                    Layout.row_major(BATCH_SIZE, STATE_SIZE),
-                    MutAnyOrigin,
-                ],
-                dones: LayoutTensor[
-                    gpu_dtype, Layout.row_major(BATCH_SIZE), MutAnyOrigin
-                ],
-                counter: LayoutTensor[
-                    DType.uint64, Layout.row_major(1), MutAnyOrigin
-                ],
+                states: Tile[gpu_dtype, BATCH_SIZE, STATE_SIZE],
+                dones: Tile[gpu_dtype, BATCH_SIZE],
+                counter: Tile[DType.uint64, 1],
             ):
                 Self.selective_reset_kernel[BATCH_SIZE, STATE_SIZE](
                     states,
@@ -1125,14 +1047,8 @@ struct SpaceInvadersEnv[DTYPE: DType](
 
             @always_inline
             def sel_reset_wrapper(
-                states: LayoutTensor[
-                    gpu_dtype,
-                    Layout.row_major(BATCH_SIZE, STATE_SIZE),
-                    MutAnyOrigin,
-                ],
-                dones: LayoutTensor[
-                    gpu_dtype, Layout.row_major(BATCH_SIZE), MutAnyOrigin
-                ],
+                states: Tile[gpu_dtype, BATCH_SIZE, STATE_SIZE],
+                dones: Tile[gpu_dtype, BATCH_SIZE],
                 rng_seed: Scalar[DType.uint64],
             ):
                 Self.selective_reset_kernel[BATCH_SIZE, STATE_SIZE](

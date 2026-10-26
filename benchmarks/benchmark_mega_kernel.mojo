@@ -23,7 +23,7 @@ from max.gpu import thread_idx, block_idx, block_dim
 from max.gpu.sync import barrier
 from max.gpu.host import DeviceContext
 from max.gpu.memory import AddressSpace
-from layout import Layout, LayoutTensor
+from noeira.core.tiles import Tile, ImmTile, tile
 from noeira.core.fmt import fit
 
 
@@ -41,39 +41,25 @@ def fused_dqn_train_kernel[
     TPB: Int,  # Threads per block
 ](
     # Network weights (mutable for Adam update)
-    W1: LayoutTensor[
-        dtype, Layout.row_major(OBS_DIM * HIDDEN_DIM), MutAnyOrigin
-    ],
-    b1: LayoutTensor[dtype, Layout.row_major(HIDDEN_DIM), MutAnyOrigin],
-    W2: LayoutTensor[
-        dtype, Layout.row_major(HIDDEN_DIM * OUT_DIM), MutAnyOrigin
-    ],
-    b2: LayoutTensor[dtype, Layout.row_major(OUT_DIM), MutAnyOrigin],
+    W1: Tile[dtype, OBS_DIM * HIDDEN_DIM],
+    b1: Tile[dtype, HIDDEN_DIM],
+    W2: Tile[dtype, HIDDEN_DIM * OUT_DIM],
+    b2: Tile[dtype, OUT_DIM],
     # Adam state (mutable)
-    m_W1: LayoutTensor[
-        dtype, Layout.row_major(OBS_DIM * HIDDEN_DIM), MutAnyOrigin
-    ],
-    v_W1: LayoutTensor[
-        dtype, Layout.row_major(OBS_DIM * HIDDEN_DIM), MutAnyOrigin
-    ],
-    m_b1: LayoutTensor[dtype, Layout.row_major(HIDDEN_DIM), MutAnyOrigin],
-    v_b1: LayoutTensor[dtype, Layout.row_major(HIDDEN_DIM), MutAnyOrigin],
-    m_W2: LayoutTensor[
-        dtype, Layout.row_major(HIDDEN_DIM * OUT_DIM), MutAnyOrigin
-    ],
-    v_W2: LayoutTensor[
-        dtype, Layout.row_major(HIDDEN_DIM * OUT_DIM), MutAnyOrigin
-    ],
-    m_b2: LayoutTensor[dtype, Layout.row_major(OUT_DIM), MutAnyOrigin],
-    v_b2: LayoutTensor[dtype, Layout.row_major(OUT_DIM), MutAnyOrigin],
+    m_W1: Tile[dtype, OBS_DIM * HIDDEN_DIM],
+    v_W1: Tile[dtype, OBS_DIM * HIDDEN_DIM],
+    m_b1: Tile[dtype, HIDDEN_DIM],
+    v_b1: Tile[dtype, HIDDEN_DIM],
+    m_W2: Tile[dtype, HIDDEN_DIM * OUT_DIM],
+    v_W2: Tile[dtype, HIDDEN_DIM * OUT_DIM],
+    m_b2: Tile[dtype, OUT_DIM],
+    v_b2: Tile[dtype, OUT_DIM],
     # Batch data (immutable)
-    obs: LayoutTensor[dtype, Layout.row_major(BATCH * OBS_DIM), ImmutAnyOrigin],
-    next_obs: LayoutTensor[
-        dtype, Layout.row_major(BATCH * OBS_DIM), ImmutAnyOrigin
-    ],
-    actions: LayoutTensor[DType.int32, Layout.row_major(BATCH), ImmutAnyOrigin],
-    rewards: LayoutTensor[dtype, Layout.row_major(BATCH), ImmutAnyOrigin],
-    dones: LayoutTensor[dtype, Layout.row_major(BATCH), ImmutAnyOrigin],
+    obs: ImmTile[dtype, BATCH * OBS_DIM],
+    next_obs: ImmTile[dtype, BATCH * OBS_DIM],
+    actions: ImmTile[DType.int32, BATCH],
+    rewards: ImmTile[dtype, BATCH],
+    dones: ImmTile[dtype, BATCH],
     # Hyperparameters (compile-time for efficiency)
     gamma: Scalar[dtype],  # Discount factor
     lr: Scalar[dtype],  # Learning rate
@@ -82,7 +68,7 @@ def fused_dqn_train_kernel[
     epsilon: Scalar[dtype],  # Adam epsilon
     t_step: Scalar[dtype],  # Time step for bias correction
     # Output (for debugging/monitoring)
-    loss_out: LayoutTensor[dtype, Layout.row_major(BATCH), MutAnyOrigin],
+    loss_out: Tile[dtype, BATCH],
 ):
     """Fused DQN training kernel.
 
@@ -388,58 +374,24 @@ def benchmark_mega_kernel[
     ctx.synchronize()
 
     # Create tensors
-    var W1_t = LayoutTensor[
-        dtype, Layout.row_major(OBS_DIM * HIDDEN_DIM), MutAnyOrigin
-    ](W1)
-    var b1_t = LayoutTensor[dtype, Layout.row_major(HIDDEN_DIM), MutAnyOrigin](
-        b1
-    )
-    var W2_t = LayoutTensor[
-        dtype, Layout.row_major(HIDDEN_DIM * OUT_DIM), MutAnyOrigin
-    ](W2)
-    var b2_t = LayoutTensor[dtype, Layout.row_major(OUT_DIM), MutAnyOrigin](b2)
-    var m_W1_t = LayoutTensor[
-        dtype, Layout.row_major(OBS_DIM * HIDDEN_DIM), MutAnyOrigin
-    ](m_W1)
-    var v_W1_t = LayoutTensor[
-        dtype, Layout.row_major(OBS_DIM * HIDDEN_DIM), MutAnyOrigin
-    ](v_W1)
-    var m_b1_t = LayoutTensor[
-        dtype, Layout.row_major(HIDDEN_DIM), MutAnyOrigin
-    ](m_b1)
-    var v_b1_t = LayoutTensor[
-        dtype, Layout.row_major(HIDDEN_DIM), MutAnyOrigin
-    ](v_b1)
-    var m_W2_t = LayoutTensor[
-        dtype, Layout.row_major(HIDDEN_DIM * OUT_DIM), MutAnyOrigin
-    ](m_W2)
-    var v_W2_t = LayoutTensor[
-        dtype, Layout.row_major(HIDDEN_DIM * OUT_DIM), MutAnyOrigin
-    ](v_W2)
-    var m_b2_t = LayoutTensor[dtype, Layout.row_major(OUT_DIM), MutAnyOrigin](
-        m_b2
-    )
-    var v_b2_t = LayoutTensor[dtype, Layout.row_major(OUT_DIM), MutAnyOrigin](
-        v_b2
-    )
-    var obs_t = LayoutTensor[
-        dtype, Layout.row_major(BATCH * OBS_DIM), ImmutAnyOrigin
-    ](obs)
-    var next_obs_t = LayoutTensor[
-        dtype, Layout.row_major(BATCH * OBS_DIM), ImmutAnyOrigin
-    ](next_obs)
-    var actions_t = LayoutTensor[
-        DType.int32, Layout.row_major(BATCH), ImmutAnyOrigin
-    ](actions)
-    var rewards_t = LayoutTensor[
-        dtype, Layout.row_major(BATCH), ImmutAnyOrigin
-    ](rewards)
-    var dones_t = LayoutTensor[dtype, Layout.row_major(BATCH), ImmutAnyOrigin](
-        dones
-    )
-    var loss_t = LayoutTensor[dtype, Layout.row_major(BATCH), MutAnyOrigin](
-        loss_out
-    )
+    var W1_t = tile[OBS_DIM * HIDDEN_DIM](W1)
+    var b1_t = tile[HIDDEN_DIM](b1)
+    var W2_t = tile[HIDDEN_DIM * OUT_DIM](W2)
+    var b2_t = tile[OUT_DIM](b2)
+    var m_W1_t = tile[OBS_DIM * HIDDEN_DIM](m_W1)
+    var v_W1_t = tile[OBS_DIM * HIDDEN_DIM](v_W1)
+    var m_b1_t = tile[HIDDEN_DIM](m_b1)
+    var v_b1_t = tile[HIDDEN_DIM](v_b1)
+    var m_W2_t = tile[HIDDEN_DIM * OUT_DIM](m_W2)
+    var v_W2_t = tile[HIDDEN_DIM * OUT_DIM](v_W2)
+    var m_b2_t = tile[OUT_DIM](m_b2)
+    var v_b2_t = tile[OUT_DIM](v_b2)
+    var obs_t = tile[BATCH * OBS_DIM](obs)
+    var next_obs_t = tile[BATCH * OBS_DIM](next_obs)
+    var actions_t = tile[BATCH](actions)
+    var rewards_t = tile[BATCH](rewards)
+    var dones_t = tile[BATCH](dones)
+    var loss_t = tile[BATCH](loss_out)
 
     # Hyperparameters
     var gamma = Scalar[dtype](0.99)
@@ -535,10 +487,10 @@ def benchmark_kernel_launch_overhead(
     buf.enqueue_fill(0)
     ctx.synchronize()
 
-    var buf_t = LayoutTensor[dtype, Layout.row_major(size), MutAnyOrigin](buf)
+    var buf_t = tile[size](buf)
 
     def trivial_kernel(
-        buf: LayoutTensor[dtype, Layout.row_major(size), MutAnyOrigin]
+        buf: Tile[dtype, size]
     ):
         var i = Int(thread_idx.x)
         if i < size:

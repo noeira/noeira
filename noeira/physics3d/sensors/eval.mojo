@@ -41,7 +41,8 @@ a measurement.
 
 from max.gpu import thread_idx, block_idx, block_dim
 from max.gpu.host import DeviceContext
-from layout import Layout, LayoutTensor
+from layout import TileTensor, TensorLayout
+from noeira.core.tiles import RowMajor, Tile
 
 from noeira.physics3d.fields import (
     Data, Model, Dims, DimsLike, DYN1, DYN2, rl1, rl2,
@@ -138,9 +139,9 @@ def _atleast1(n: Int) -> Int:
 
 @always_inline
 def _apply_cutoff[
-    DTYPE: DType, L_SD: Layout
+    DTYPE: DType, L_SD: TensorLayout
 ](
-    sensordata: LayoutTensor[DTYPE, L_SD, MutAnyOrigin],
+    sensordata: TileTensor[DTYPE, L_SD, MutAnyOrigin],
     env: Int,
     adr: Int,
     dim: Int,
@@ -213,34 +214,26 @@ def _eval_stage[
     # The GPU bind needs STATIC layouts; the CPU one needs runtime ones,
     # because a dynamic dimension provider leaves every `D.N*` poisoned.
     # Both spellings describe the same buffers — see `fields.Model`.
-    comptime G_SENS = Layout.row_major(
-        _max_one[D.NSENSOR](), MODEL_SENSOR_SIZE
-    )
-    comptime G_SD = Layout.row_major(BATCH, _max_one[D.NSENSORDATA]())
-    comptime G_B3 = Layout.row_major(BATCH, D.NBODY * 3)
-    comptime G_B4 = Layout.row_major(BATCH, D.NBODY * 4)
-    comptime G_B6 = Layout.row_major(BATCH, D.NBODY * 6)
-    comptime G_S3 = Layout.row_major(BATCH, _max_one[D.NSITE * 3]())
-    comptime G_NQ = Layout.row_major(BATCH, D.NQ)
-    comptime G_NV = Layout.row_major(BATCH, D.NV)
-    comptime G_TEN = Layout.row_major(BATCH, _max_one[D.NTENDON]())
-    comptime G_ACT = Layout.row_major(BATCH, _max_one[D.NACT]())
-    comptime G_CON = Layout.row_major(BATCH, D.MAX_CONTACTS * CONTACT_SIZE)
-    comptime G_META = Layout.row_major(BATCH, METADATA_SIZE)
-    comptime G_BODY = Layout.row_major(D.NBODY, MODEL_BODY_SIZE)
-    comptime G_SITE = Layout.row_major(_max_one[D.NSITE](), MODEL_SITE_SIZE)
-    comptime G_GEOM = Layout.row_major(_max_one[D.NGEOM](), MODEL_GEOM_SIZE)
-    comptime G_JOINT = Layout.row_major(D.NJOINT, MODEL_JOINT_SIZE)
-    comptime G_MESH_META = Layout.row_major(
-        MAX_GPU_MESHES * MODEL_MESH_META_SIZE
-    )
-    comptime G_TRI = Layout.row_major(
-        _max_one[D.NMESH_TRI * MESH_ARENA_FLOATS_PER_TRI]()
-    )
-    comptime G_HF_META = Layout.row_major(
-        MAX_GPU_HFIELDS * MODEL_HFIELD_META_SIZE
-    )
-    comptime G_HF = Layout.row_major(BATCH * _max_one[D.NHFIELD_DATA]())
+    comptime G_SENS = RowMajor[_max_one[D.NSENSOR](), MODEL_SENSOR_SIZE]
+    comptime G_SD = RowMajor[BATCH, _max_one[D.NSENSORDATA]()]
+    comptime G_B3 = RowMajor[BATCH, D.NBODY * 3]
+    comptime G_B4 = RowMajor[BATCH, D.NBODY * 4]
+    comptime G_B6 = RowMajor[BATCH, D.NBODY * 6]
+    comptime G_S3 = RowMajor[BATCH, _max_one[D.NSITE * 3]()]
+    comptime G_NQ = RowMajor[BATCH, D.NQ]
+    comptime G_NV = RowMajor[BATCH, D.NV]
+    comptime G_TEN = RowMajor[BATCH, _max_one[D.NTENDON]()]
+    comptime G_ACT = RowMajor[BATCH, _max_one[D.NACT]()]
+    comptime G_CON = RowMajor[BATCH, D.MAX_CONTACTS * CONTACT_SIZE]
+    comptime G_META = RowMajor[BATCH, METADATA_SIZE]
+    comptime G_BODY = RowMajor[D.NBODY, MODEL_BODY_SIZE]
+    comptime G_SITE = RowMajor[_max_one[D.NSITE](), MODEL_SITE_SIZE]
+    comptime G_GEOM = RowMajor[_max_one[D.NGEOM](), MODEL_GEOM_SIZE]
+    comptime G_JOINT = RowMajor[D.NJOINT, MODEL_JOINT_SIZE]
+    comptime G_MESH_META = RowMajor[MAX_GPU_MESHES * MODEL_MESH_META_SIZE]
+    comptime G_TRI = RowMajor[_max_one[D.NMESH_TRI * MESH_ARENA_FLOATS_PER_TRI]()]
+    comptime G_HF_META = RowMajor[MAX_GPU_HFIELDS * MODEL_HFIELD_META_SIZE]
+    comptime G_HF = RowMajor[BATCH * _max_one[D.NHFIELD_DATA]()]
 
     # ── the batched views, bound ONCE for the whole pass ──────────────────
     #
@@ -269,31 +262,31 @@ def _eval_stage[
         var rl_GEOM = rl2(_atleast1(mdm.get_ngeom()), MODEL_GEOM_SIZE)
         var rl_JOINT = rl2(mdm.get_njoint(), MODEL_JOINT_SIZE)
 
-        var xpos_v = d.xpos.lt_dyn["cpu", DYN2](rl_B3)
-        var xquat_v = d.xquat.lt_dyn["cpu", DYN2](rl_B4)
-        var xipos_v = d.xipos.lt_dyn["cpu", DYN2](rl_B3)
-        var xvel_v = d.xvel.lt_dyn["cpu", DYN2](rl_B3)
-        var xangvel_v = d.xangvel.lt_dyn["cpu", DYN2](rl_B3)
-        var site_xpos_v = d.site_xpos.lt_dyn["cpu", DYN2](rl_S3)
-        var site_xpos_acc_v = d.site_xpos_acc.lt_dyn["cpu", DYN2](rl_S3)
-        var xquat_acc_v = d.xquat_acc.lt_dyn["cpu", DYN2](rl_B4)
-        var cvel_v = d.cvel.lt_dyn["cpu", DYN2](rl_B6)
-        var cacc_v = d.cacc.lt_dyn["cpu", DYN2](rl_B6)
-        var cfrc_int_v = d.cfrc_int.lt_dyn["cpu", DYN2](rl_B6)
-        var stcom_v = d.subtree_com.lt_dyn["cpu", DYN2](rl_B3)
-        var qpos_v = d.qpos.lt_dyn["cpu", DYN2](rl_NQ)
-        var qvel_v = d.qvel.lt_dyn["cpu", DYN2](rl_NV)
-        var qfrc_v = d.qfrc.lt_dyn["cpu", DYN2](rl_NV)
-        var tenlen_v = d.ten_length.lt_dyn["cpu", DYN2](rl_TEN)
-        var actlen_v = d.actuator_length.lt_dyn["cpu", DYN2](rl_ACT)
-        var sdata_v = d.sensordata.lt_dyn["cpu", DYN2](rl_SD)
-        var con_v = d.contacts.lt_dyn["cpu", DYN2](rl_CON)
-        var dmeta_v = d.meta.lt_dyn["cpu", DYN2](rl_META)
-        var bodies_v = m.bodies.lt_dyn["cpu", DYN2](rl_BODY)
-        var sites_v = m.sites.lt_dyn["cpu", DYN2](rl_SITE)
-        var geoms_v = m.geoms.lt_dyn["cpu", DYN2](rl_GEOM)
-        var joints_v = m.joints.lt_dyn["cpu", DYN2](rl_JOINT)
-        var sensors_v = m.sensors.lt_dyn["cpu", DYN2](
+        var xpos_v = d.xpos.tt_dyn["cpu", DYN2](rl_B3)
+        var xquat_v = d.xquat.tt_dyn["cpu", DYN2](rl_B4)
+        var xipos_v = d.xipos.tt_dyn["cpu", DYN2](rl_B3)
+        var xvel_v = d.xvel.tt_dyn["cpu", DYN2](rl_B3)
+        var xangvel_v = d.xangvel.tt_dyn["cpu", DYN2](rl_B3)
+        var site_xpos_v = d.site_xpos.tt_dyn["cpu", DYN2](rl_S3)
+        var site_xpos_acc_v = d.site_xpos_acc.tt_dyn["cpu", DYN2](rl_S3)
+        var xquat_acc_v = d.xquat_acc.tt_dyn["cpu", DYN2](rl_B4)
+        var cvel_v = d.cvel.tt_dyn["cpu", DYN2](rl_B6)
+        var cacc_v = d.cacc.tt_dyn["cpu", DYN2](rl_B6)
+        var cfrc_int_v = d.cfrc_int.tt_dyn["cpu", DYN2](rl_B6)
+        var stcom_v = d.subtree_com.tt_dyn["cpu", DYN2](rl_B3)
+        var qpos_v = d.qpos.tt_dyn["cpu", DYN2](rl_NQ)
+        var qvel_v = d.qvel.tt_dyn["cpu", DYN2](rl_NV)
+        var qfrc_v = d.qfrc.tt_dyn["cpu", DYN2](rl_NV)
+        var tenlen_v = d.ten_length.tt_dyn["cpu", DYN2](rl_TEN)
+        var actlen_v = d.actuator_length.tt_dyn["cpu", DYN2](rl_ACT)
+        var sdata_v = d.sensordata.tt_dyn["cpu", DYN2](rl_SD)
+        var con_v = d.contacts.tt_dyn["cpu", DYN2](rl_CON)
+        var dmeta_v = d.meta.tt_dyn["cpu", DYN2](rl_META)
+        var bodies_v = m.bodies.tt_dyn["cpu", DYN2](rl_BODY)
+        var sites_v = m.sites.tt_dyn["cpu", DYN2](rl_SITE)
+        var geoms_v = m.geoms.tt_dyn["cpu", DYN2](rl_GEOM)
+        var joints_v = m.joints.tt_dyn["cpu", DYN2](rl_JOINT)
+        var sensors_v = m.sensors.tt_dyn["cpu", DYN2](
             rl2(_atleast1(nsensor), MODEL_SENSOR_SIZE)
         )
         # The rangefinder's four extra tables. ⚠ BOUND EVEN WHEN NO MODEL HAS ONE:
@@ -301,16 +294,16 @@ def _eval_stage[
         # or floors to a single element, so there is nothing to guard and a guard
         # would be a second predicate that can disagree with the sensor table.
         var hfn = _atleast1(dm.get_nhfield_data())
-        var mesh_meta_v = m.mesh_meta.lt_dyn["cpu", DYN1](
+        var mesh_meta_v = m.mesh_meta.tt_dyn["cpu", DYN1](
             rl1(MAX_GPU_MESHES * MODEL_MESH_META_SIZE)
         )
-        var mesh_tris_v = m.mesh_tris.lt_dyn["cpu", DYN1](
+        var mesh_tris_v = m.mesh_tris.tt_dyn["cpu", DYN1](
             rl1(_atleast1(mdm.get_nmesh_tri() * MESH_ARENA_FLOATS_PER_TRI))
         )
-        var hf_meta_v = m.hfield_meta.lt_dyn["cpu", DYN1](
+        var hf_meta_v = m.hfield_meta.tt_dyn["cpu", DYN1](
             rl1(MAX_GPU_HFIELDS * MODEL_HFIELD_META_SIZE)
         )
-        var hf_v = d.hfield_data.lt_dyn["cpu", DYN1](rl1(BATCH * hfn))
+        var hf_v = d.hfield_data.tt_dyn["cpu", DYN1](rl1(BATCH * hfn))
 
         for env in range(BATCH):
             _eval_sensor_env[DTYPE, D](
@@ -337,31 +330,31 @@ def _eval_stage[
                 D.NMESH_TRI, D.NHFIELD_DATA, BATCH,
             ]
         ](
-            m.sensors.lt["gpu", G_SENS](),
-            d.sensordata.lt["gpu", G_SD](),
-            d.xpos.lt["gpu", G_B3](),
-            d.xquat.lt["gpu", G_B4](),
-            d.xipos.lt["gpu", G_B3](),
-            d.xvel.lt["gpu", G_B3](),
-            d.xangvel.lt["gpu", G_B3](),
-            d.site_xpos.lt["gpu", G_S3](),
-            d.site_xpos_acc.lt["gpu", G_S3](),
-            d.xquat_acc.lt["gpu", G_B4](),
-            d.cvel.lt["gpu", G_B6](),
-            d.cacc.lt["gpu", G_B6](),
-            d.cfrc_int.lt["gpu", G_B6](),
-            d.subtree_com.lt["gpu", G_B3](),
-            d.qpos.lt["gpu", G_NQ](),
-            d.qvel.lt["gpu", G_NV](),
-            d.qfrc.lt["gpu", G_NV](),
-            d.ten_length.lt["gpu", G_TEN](),
-            d.actuator_length.lt["gpu", G_ACT](),
-            d.contacts.lt["gpu", G_CON](),
-            d.meta.lt["gpu", G_META](),
-            m.bodies.lt["gpu", G_BODY](),
-            m.sites.lt["gpu", G_SITE](),
-            m.geoms.lt["gpu", G_GEOM](),
-            m.joints.lt["gpu", G_JOINT](),
+            m.sensors.tt["gpu", _max_one[D.NSENSOR](), MODEL_SENSOR_SIZE](),
+            d.sensordata.tt["gpu", BATCH, _max_one[D.NSENSORDATA]()](),
+            d.xpos.tt["gpu", BATCH, D.NBODY * 3](),
+            d.xquat.tt["gpu", BATCH, D.NBODY * 4](),
+            d.xipos.tt["gpu", BATCH, D.NBODY * 3](),
+            d.xvel.tt["gpu", BATCH, D.NBODY * 3](),
+            d.xangvel.tt["gpu", BATCH, D.NBODY * 3](),
+            d.site_xpos.tt["gpu", BATCH, _max_one[D.NSITE * 3]()](),
+            d.site_xpos_acc.tt["gpu", BATCH, _max_one[D.NSITE * 3]()](),
+            d.xquat_acc.tt["gpu", BATCH, D.NBODY * 4](),
+            d.cvel.tt["gpu", BATCH, D.NBODY * 6](),
+            d.cacc.tt["gpu", BATCH, D.NBODY * 6](),
+            d.cfrc_int.tt["gpu", BATCH, D.NBODY * 6](),
+            d.subtree_com.tt["gpu", BATCH, D.NBODY * 3](),
+            d.qpos.tt["gpu", BATCH, D.NQ](),
+            d.qvel.tt["gpu", BATCH, D.NV](),
+            d.qfrc.tt["gpu", BATCH, D.NV](),
+            d.ten_length.tt["gpu", BATCH, _max_one[D.NTENDON]()](),
+            d.actuator_length.tt["gpu", BATCH, _max_one[D.NACT]()](),
+            d.contacts.tt["gpu", BATCH, D.MAX_CONTACTS * CONTACT_SIZE](),
+            d.meta.tt["gpu", BATCH, METADATA_SIZE](),
+            m.bodies.tt["gpu", D.NBODY, MODEL_BODY_SIZE](),
+            m.sites.tt["gpu", _max_one[D.NSITE](), MODEL_SITE_SIZE](),
+            m.geoms.tt["gpu", _max_one[D.NGEOM](), MODEL_GEOM_SIZE](),
+            m.joints.tt["gpu", D.NJOINT, MODEL_JOINT_SIZE](),
             Int32(stage),
             Int32(1) if have_rne_post else Int32(0),
             grid_dim=(BLOCKS,),
@@ -373,18 +366,18 @@ def _eval_stage[
                 D.NMESH_TRI, D.NHFIELD_DATA, BATCH,
             ]
         ](
-            m.sensors.lt["gpu", G_SENS](),
-            d.sensordata.lt["gpu", G_SD](),
-            m.sites.lt["gpu", G_SITE](),
-            d.site_xpos.lt["gpu", G_S3](),
-            d.xpos.lt["gpu", G_B3](),
-            d.xquat.lt["gpu", G_B4](),
-            m.geoms.lt["gpu", G_GEOM](),
-            m.bodies.lt["gpu", G_BODY](),
-            m.mesh_meta.lt["gpu", G_MESH_META](),
-            m.mesh_tris.lt["gpu", G_TRI](),
-            m.hfield_meta.lt["gpu", G_HF_META](),
-            d.hfield_data.lt["gpu", G_HF](),
+            m.sensors.tt["gpu", _max_one[D.NSENSOR](), MODEL_SENSOR_SIZE](),
+            d.sensordata.tt["gpu", BATCH, _max_one[D.NSENSORDATA]()](),
+            m.sites.tt["gpu", _max_one[D.NSITE](), MODEL_SITE_SIZE](),
+            d.site_xpos.tt["gpu", BATCH, _max_one[D.NSITE * 3]()](),
+            d.xpos.tt["gpu", BATCH, D.NBODY * 3](),
+            d.xquat.tt["gpu", BATCH, D.NBODY * 4](),
+            m.geoms.tt["gpu", _max_one[D.NGEOM](), MODEL_GEOM_SIZE](),
+            m.bodies.tt["gpu", D.NBODY, MODEL_BODY_SIZE](),
+            m.mesh_meta.tt["gpu", MAX_GPU_MESHES * MODEL_MESH_META_SIZE](),
+            m.mesh_tris.tt["gpu", _max_one[D.NMESH_TRI * MESH_ARENA_FLOATS_PER_TRI]()](),
+            m.hfield_meta.tt["gpu", MAX_GPU_HFIELDS * MODEL_HFIELD_META_SIZE](),
+            d.hfield_data.tt["gpu", BATCH * _max_one[D.NHFIELD_DATA]()](),
             Int32(D.NGEOM),
             Int32(D.NHFIELD_DATA),
             Int32(stage),
@@ -396,48 +389,48 @@ def _eval_stage[
 def _eval_sensor_env[
     DTYPE: DType,
     D: DimsLike,
-    L_SENS: Layout,
-    L_SD: Layout,
-    L_B3: Layout,
-    L_B4: Layout,
-    L_B6: Layout,
-    L_S3: Layout,
-    L_NQ: Layout,
-    L_NV: Layout,
-    L_TEN: Layout,
-    L_ACT: Layout,
-    L_CON: Layout,
-    L_META: Layout,
-    L_BODY: Layout,
-    L_SITE: Layout,
-    L_GEOM: Layout,
-    L_JOINT: Layout,
+    L_SENS: TensorLayout,
+    L_SD: TensorLayout,
+    L_B3: TensorLayout,
+    L_B4: TensorLayout,
+    L_B6: TensorLayout,
+    L_S3: TensorLayout,
+    L_NQ: TensorLayout,
+    L_NV: TensorLayout,
+    L_TEN: TensorLayout,
+    L_ACT: TensorLayout,
+    L_CON: TensorLayout,
+    L_META: TensorLayout,
+    L_BODY: TensorLayout,
+    L_SITE: TensorLayout,
+    L_GEOM: TensorLayout,
+    L_JOINT: TensorLayout,
 ](
-    sensors: LayoutTensor[DTYPE, L_SENS, MutAnyOrigin],
-    sensordata: LayoutTensor[DTYPE, L_SD, MutAnyOrigin],
-    xpos: LayoutTensor[DTYPE, L_B3, MutAnyOrigin],
-    xquat: LayoutTensor[DTYPE, L_B4, MutAnyOrigin],
-    xipos: LayoutTensor[DTYPE, L_B3, MutAnyOrigin],
-    xvel: LayoutTensor[DTYPE, L_B3, MutAnyOrigin],
-    xangvel: LayoutTensor[DTYPE, L_B3, MutAnyOrigin],
-    site_xpos: LayoutTensor[DTYPE, L_S3, MutAnyOrigin],
-    site_xpos_acc: LayoutTensor[DTYPE, L_S3, MutAnyOrigin],
-    xquat_acc: LayoutTensor[DTYPE, L_B4, MutAnyOrigin],
-    cvel: LayoutTensor[DTYPE, L_B6, MutAnyOrigin],
-    cacc: LayoutTensor[DTYPE, L_B6, MutAnyOrigin],
-    cfrc_int: LayoutTensor[DTYPE, L_B6, MutAnyOrigin],
-    subtree_com: LayoutTensor[DTYPE, L_B3, MutAnyOrigin],
-    qpos: LayoutTensor[DTYPE, L_NQ, MutAnyOrigin],
-    qvel: LayoutTensor[DTYPE, L_NV, MutAnyOrigin],
-    qfrc: LayoutTensor[DTYPE, L_NV, MutAnyOrigin],
-    ten_length: LayoutTensor[DTYPE, L_TEN, MutAnyOrigin],
-    actuator_length: LayoutTensor[DTYPE, L_ACT, MutAnyOrigin],
-    contacts: LayoutTensor[DTYPE, L_CON, MutAnyOrigin],
-    dmeta: LayoutTensor[DTYPE, L_META, MutAnyOrigin],
-    bodies: LayoutTensor[DTYPE, L_BODY, MutAnyOrigin],
-    sites: LayoutTensor[DTYPE, L_SITE, MutAnyOrigin],
-    geoms: LayoutTensor[DTYPE, L_GEOM, MutAnyOrigin],
-    joints: LayoutTensor[DTYPE, L_JOINT, MutAnyOrigin],
+    sensors: TileTensor[DTYPE, L_SENS, MutAnyOrigin],
+    sensordata: TileTensor[DTYPE, L_SD, MutAnyOrigin],
+    xpos: TileTensor[DTYPE, L_B3, MutAnyOrigin],
+    xquat: TileTensor[DTYPE, L_B4, MutAnyOrigin],
+    xipos: TileTensor[DTYPE, L_B3, MutAnyOrigin],
+    xvel: TileTensor[DTYPE, L_B3, MutAnyOrigin],
+    xangvel: TileTensor[DTYPE, L_B3, MutAnyOrigin],
+    site_xpos: TileTensor[DTYPE, L_S3, MutAnyOrigin],
+    site_xpos_acc: TileTensor[DTYPE, L_S3, MutAnyOrigin],
+    xquat_acc: TileTensor[DTYPE, L_B4, MutAnyOrigin],
+    cvel: TileTensor[DTYPE, L_B6, MutAnyOrigin],
+    cacc: TileTensor[DTYPE, L_B6, MutAnyOrigin],
+    cfrc_int: TileTensor[DTYPE, L_B6, MutAnyOrigin],
+    subtree_com: TileTensor[DTYPE, L_B3, MutAnyOrigin],
+    qpos: TileTensor[DTYPE, L_NQ, MutAnyOrigin],
+    qvel: TileTensor[DTYPE, L_NV, MutAnyOrigin],
+    qfrc: TileTensor[DTYPE, L_NV, MutAnyOrigin],
+    ten_length: TileTensor[DTYPE, L_TEN, MutAnyOrigin],
+    actuator_length: TileTensor[DTYPE, L_ACT, MutAnyOrigin],
+    contacts: TileTensor[DTYPE, L_CON, MutAnyOrigin],
+    dmeta: TileTensor[DTYPE, L_META, MutAnyOrigin],
+    bodies: TileTensor[DTYPE, L_BODY, MutAnyOrigin],
+    sites: TileTensor[DTYPE, L_SITE, MutAnyOrigin],
+    geoms: TileTensor[DTYPE, L_GEOM, MutAnyOrigin],
+    joints: TileTensor[DTYPE, L_JOINT, MutAnyOrigin],
     dims: D,
     nsensor: Int,
     env: Int,
@@ -829,31 +822,31 @@ def _eval_sensor_env[
 def _eval_rangefinder_env[
     DTYPE: DType,
     D: DimsLike,
-    L_SENS: Layout,
-    L_SD: Layout,
-    L_SITE: Layout,
-    L_S3: Layout,
-    L_B3: Layout,
-    L_B4: Layout,
-    L_GEOM: Layout,
-    L_BODY: Layout,
-    L_MESH_META: Layout,
-    L_TRI: Layout,
-    L_HF_META: Layout,
-    L_HF: Layout,
+    L_SENS: TensorLayout,
+    L_SD: TensorLayout,
+    L_SITE: TensorLayout,
+    L_S3: TensorLayout,
+    L_B3: TensorLayout,
+    L_B4: TensorLayout,
+    L_GEOM: TensorLayout,
+    L_BODY: TensorLayout,
+    L_MESH_META: TensorLayout,
+    L_TRI: TensorLayout,
+    L_HF_META: TensorLayout,
+    L_HF: TensorLayout,
 ](
-    sensors: LayoutTensor[DTYPE, L_SENS, MutAnyOrigin],
-    sensordata: LayoutTensor[DTYPE, L_SD, MutAnyOrigin],
-    sites: LayoutTensor[DTYPE, L_SITE, MutAnyOrigin],
-    site_xpos: LayoutTensor[DTYPE, L_S3, MutAnyOrigin],
-    xpos: LayoutTensor[DTYPE, L_B3, MutAnyOrigin],
-    xquat: LayoutTensor[DTYPE, L_B4, MutAnyOrigin],
-    geoms: LayoutTensor[DTYPE, L_GEOM, MutAnyOrigin],
-    bodies: LayoutTensor[DTYPE, L_BODY, MutAnyOrigin],
-    mesh_meta: LayoutTensor[DTYPE, L_MESH_META, MutAnyOrigin],
-    mesh_tris: LayoutTensor[DTYPE, L_TRI, MutAnyOrigin],
-    hfield_meta: LayoutTensor[DTYPE, L_HF_META, MutAnyOrigin],
-    hfield_data: LayoutTensor[DTYPE, L_HF, MutAnyOrigin],
+    sensors: TileTensor[DTYPE, L_SENS, MutAnyOrigin],
+    sensordata: TileTensor[DTYPE, L_SD, MutAnyOrigin],
+    sites: TileTensor[DTYPE, L_SITE, MutAnyOrigin],
+    site_xpos: TileTensor[DTYPE, L_S3, MutAnyOrigin],
+    xpos: TileTensor[DTYPE, L_B3, MutAnyOrigin],
+    xquat: TileTensor[DTYPE, L_B4, MutAnyOrigin],
+    geoms: TileTensor[DTYPE, L_GEOM, MutAnyOrigin],
+    bodies: TileTensor[DTYPE, L_BODY, MutAnyOrigin],
+    mesh_meta: TileTensor[DTYPE, L_MESH_META, MutAnyOrigin],
+    mesh_tris: TileTensor[DTYPE, L_TRI, MutAnyOrigin],
+    hfield_meta: TileTensor[DTYPE, L_HF_META, MutAnyOrigin],
+    hfield_data: TileTensor[DTYPE, L_HF, MutAnyOrigin],
     ngeom: Int,
     hf_stride: Int,
     nsensor: Int,
@@ -907,16 +900,16 @@ def _eval_rangefinder_env[
         comptime if DTYPE == DType.float32:
             sensordata[env, adr] = rebind[Scalar[DTYPE]](
                 rangefinder_ray[DType.float32](
-                    rebind[LayoutTensor[DType.float32, L_SITE, MutAnyOrigin]](sites),
-                    rebind[LayoutTensor[DType.float32, L_S3, MutAnyOrigin]](site_xpos),
-                    rebind[LayoutTensor[DType.float32, L_B3, MutAnyOrigin]](xpos),
-                    rebind[LayoutTensor[DType.float32, L_B4, MutAnyOrigin]](xquat),
-                    rebind[LayoutTensor[DType.float32, L_GEOM, MutAnyOrigin]](geoms),
-                    rebind[LayoutTensor[DType.float32, L_BODY, MutAnyOrigin]](bodies),
-                    rebind[LayoutTensor[DType.float32, L_MESH_META, MutAnyOrigin]](mesh_meta),
-                    rebind[LayoutTensor[DType.float32, L_TRI, MutAnyOrigin]](mesh_tris),
-                    rebind[LayoutTensor[DType.float32, L_HF_META, MutAnyOrigin]](hfield_meta),
-                    rebind[LayoutTensor[DType.float32, L_HF, MutAnyOrigin]](hfield_data),
+                    rebind[TileTensor[DType.float32, L_SITE, MutAnyOrigin]](sites),
+                    rebind[TileTensor[DType.float32, L_S3, MutAnyOrigin]](site_xpos),
+                    rebind[TileTensor[DType.float32, L_B3, MutAnyOrigin]](xpos),
+                    rebind[TileTensor[DType.float32, L_B4, MutAnyOrigin]](xquat),
+                    rebind[TileTensor[DType.float32, L_GEOM, MutAnyOrigin]](geoms),
+                    rebind[TileTensor[DType.float32, L_BODY, MutAnyOrigin]](bodies),
+                    rebind[TileTensor[DType.float32, L_MESH_META, MutAnyOrigin]](mesh_meta),
+                    rebind[TileTensor[DType.float32, L_TRI, MutAnyOrigin]](mesh_tris),
+                    rebind[TileTensor[DType.float32, L_HF_META, MutAnyOrigin]](hfield_meta),
+                    rebind[TileTensor[DType.float32, L_HF, MutAnyOrigin]](hfield_data),
                     ngeom, hf_stride, env, objid,
                 )
             )
@@ -924,16 +917,16 @@ def _eval_rangefinder_env[
             comptime if DTYPE == DType.float64:
                 sensordata[env, adr] = rebind[Scalar[DTYPE]](
                     rangefinder_ray[DType.float64](
-                        rebind[LayoutTensor[DType.float64, L_SITE, MutAnyOrigin]](sites),
-                        rebind[LayoutTensor[DType.float64, L_S3, MutAnyOrigin]](site_xpos),
-                        rebind[LayoutTensor[DType.float64, L_B3, MutAnyOrigin]](xpos),
-                        rebind[LayoutTensor[DType.float64, L_B4, MutAnyOrigin]](xquat),
-                        rebind[LayoutTensor[DType.float64, L_GEOM, MutAnyOrigin]](geoms),
-                        rebind[LayoutTensor[DType.float64, L_BODY, MutAnyOrigin]](bodies),
-                        rebind[LayoutTensor[DType.float64, L_MESH_META, MutAnyOrigin]](mesh_meta),
-                        rebind[LayoutTensor[DType.float64, L_TRI, MutAnyOrigin]](mesh_tris),
-                        rebind[LayoutTensor[DType.float64, L_HF_META, MutAnyOrigin]](hfield_meta),
-                        rebind[LayoutTensor[DType.float64, L_HF, MutAnyOrigin]](hfield_data),
+                        rebind[TileTensor[DType.float64, L_SITE, MutAnyOrigin]](sites),
+                        rebind[TileTensor[DType.float64, L_S3, MutAnyOrigin]](site_xpos),
+                        rebind[TileTensor[DType.float64, L_B3, MutAnyOrigin]](xpos),
+                        rebind[TileTensor[DType.float64, L_B4, MutAnyOrigin]](xquat),
+                        rebind[TileTensor[DType.float64, L_GEOM, MutAnyOrigin]](geoms),
+                        rebind[TileTensor[DType.float64, L_BODY, MutAnyOrigin]](bodies),
+                        rebind[TileTensor[DType.float64, L_MESH_META, MutAnyOrigin]](mesh_meta),
+                        rebind[TileTensor[DType.float64, L_TRI, MutAnyOrigin]](mesh_tris),
+                        rebind[TileTensor[DType.float64, L_HF_META, MutAnyOrigin]](hfield_meta),
+                        rebind[TileTensor[DType.float64, L_HF, MutAnyOrigin]](hfield_data),
                         ngeom, hf_stride, env, objid,
                     )
                 )
@@ -969,31 +962,31 @@ def _sensor_stage_kernel[
     NHF: Int,
     BATCH: Int,
 ](
-    sensors: LayoutTensor[DTYPE, Layout.row_major(_max_one[NSENSOR](), MODEL_SENSOR_SIZE), MutAnyOrigin],
-    sensordata: LayoutTensor[DTYPE, Layout.row_major(BATCH, _max_one[NSENSORDATA]()), MutAnyOrigin],
-    xpos: LayoutTensor[DTYPE, Layout.row_major(BATCH, NBODY * 3), MutAnyOrigin],
-    xquat: LayoutTensor[DTYPE, Layout.row_major(BATCH, NBODY * 4), MutAnyOrigin],
-    xipos: LayoutTensor[DTYPE, Layout.row_major(BATCH, NBODY * 3), MutAnyOrigin],
-    xvel: LayoutTensor[DTYPE, Layout.row_major(BATCH, NBODY * 3), MutAnyOrigin],
-    xangvel: LayoutTensor[DTYPE, Layout.row_major(BATCH, NBODY * 3), MutAnyOrigin],
-    site_xpos: LayoutTensor[DTYPE, Layout.row_major(BATCH, _max_one[NSITE * 3]()), MutAnyOrigin],
-    site_xpos_acc: LayoutTensor[DTYPE, Layout.row_major(BATCH, _max_one[NSITE * 3]()), MutAnyOrigin],
-    xquat_acc: LayoutTensor[DTYPE, Layout.row_major(BATCH, NBODY * 4), MutAnyOrigin],
-    cvel: LayoutTensor[DTYPE, Layout.row_major(BATCH, NBODY * 6), MutAnyOrigin],
-    cacc: LayoutTensor[DTYPE, Layout.row_major(BATCH, NBODY * 6), MutAnyOrigin],
-    cfrc_int: LayoutTensor[DTYPE, Layout.row_major(BATCH, NBODY * 6), MutAnyOrigin],
-    subtree_com: LayoutTensor[DTYPE, Layout.row_major(BATCH, NBODY * 3), MutAnyOrigin],
-    qpos: LayoutTensor[DTYPE, Layout.row_major(BATCH, NQ), MutAnyOrigin],
-    qvel: LayoutTensor[DTYPE, Layout.row_major(BATCH, NV), MutAnyOrigin],
-    qfrc: LayoutTensor[DTYPE, Layout.row_major(BATCH, NV), MutAnyOrigin],
-    ten_length: LayoutTensor[DTYPE, Layout.row_major(BATCH, _max_one[NTENDON]()), MutAnyOrigin],
-    actuator_length: LayoutTensor[DTYPE, Layout.row_major(BATCH, _max_one[NACT]()), MutAnyOrigin],
-    contacts: LayoutTensor[DTYPE, Layout.row_major(BATCH, MAX_CONTACTS * CONTACT_SIZE), MutAnyOrigin],
-    dmeta: LayoutTensor[DTYPE, Layout.row_major(BATCH, METADATA_SIZE), MutAnyOrigin],
-    bodies: LayoutTensor[DTYPE, Layout.row_major(NBODY, MODEL_BODY_SIZE), MutAnyOrigin],
-    sites: LayoutTensor[DTYPE, Layout.row_major(_max_one[NSITE](), MODEL_SITE_SIZE), MutAnyOrigin],
-    geoms: LayoutTensor[DTYPE, Layout.row_major(_max_one[NGEOM](), MODEL_GEOM_SIZE), MutAnyOrigin],
-    joints: LayoutTensor[DTYPE, Layout.row_major(NJOINT, MODEL_JOINT_SIZE), MutAnyOrigin],
+    sensors: Tile[DTYPE, _max_one[NSENSOR](), MODEL_SENSOR_SIZE],
+    sensordata: Tile[DTYPE, BATCH, _max_one[NSENSORDATA]()],
+    xpos: Tile[DTYPE, BATCH, NBODY * 3],
+    xquat: Tile[DTYPE, BATCH, NBODY * 4],
+    xipos: Tile[DTYPE, BATCH, NBODY * 3],
+    xvel: Tile[DTYPE, BATCH, NBODY * 3],
+    xangvel: Tile[DTYPE, BATCH, NBODY * 3],
+    site_xpos: Tile[DTYPE, BATCH, _max_one[NSITE * 3]()],
+    site_xpos_acc: Tile[DTYPE, BATCH, _max_one[NSITE * 3]()],
+    xquat_acc: Tile[DTYPE, BATCH, NBODY * 4],
+    cvel: Tile[DTYPE, BATCH, NBODY * 6],
+    cacc: Tile[DTYPE, BATCH, NBODY * 6],
+    cfrc_int: Tile[DTYPE, BATCH, NBODY * 6],
+    subtree_com: Tile[DTYPE, BATCH, NBODY * 3],
+    qpos: Tile[DTYPE, BATCH, NQ],
+    qvel: Tile[DTYPE, BATCH, NV],
+    qfrc: Tile[DTYPE, BATCH, NV],
+    ten_length: Tile[DTYPE, BATCH, _max_one[NTENDON]()],
+    actuator_length: Tile[DTYPE, BATCH, _max_one[NACT]()],
+    contacts: Tile[DTYPE, BATCH, MAX_CONTACTS * CONTACT_SIZE],
+    dmeta: Tile[DTYPE, BATCH, METADATA_SIZE],
+    bodies: Tile[DTYPE, NBODY, MODEL_BODY_SIZE],
+    sites: Tile[DTYPE, _max_one[NSITE](), MODEL_SITE_SIZE],
+    geoms: Tile[DTYPE, _max_one[NGEOM](), MODEL_GEOM_SIZE],
+    joints: Tile[DTYPE, NJOINT, MODEL_JOINT_SIZE],
     # ⚠⚠ `Int32`, NOT `Int`, AND NOT `Bool`. `Int` and `UInt` do not conform
     # to `DevicePassable` — the launch fails to compile with "use a
     # fixed-width type such as Int32 or Int64 instead" — and there is no
@@ -1038,18 +1031,18 @@ def _sensor_rangefinder_kernel[
     NBODY: Int, NSITE: Int, NGEOM: Int, NSENSOR: Int, NSENSORDATA: Int,
     NMESH_TRI: Int, NHF: Int, BATCH: Int,
 ](
-    sensors: LayoutTensor[DTYPE, Layout.row_major(_max_one[NSENSOR](), MODEL_SENSOR_SIZE), MutAnyOrigin],
-    sensordata: LayoutTensor[DTYPE, Layout.row_major(BATCH, _max_one[NSENSORDATA]()), MutAnyOrigin],
-    sites: LayoutTensor[DTYPE, Layout.row_major(_max_one[NSITE](), MODEL_SITE_SIZE), MutAnyOrigin],
-    site_xpos: LayoutTensor[DTYPE, Layout.row_major(BATCH, _max_one[NSITE * 3]()), MutAnyOrigin],
-    xpos: LayoutTensor[DTYPE, Layout.row_major(BATCH, NBODY * 3), MutAnyOrigin],
-    xquat: LayoutTensor[DTYPE, Layout.row_major(BATCH, NBODY * 4), MutAnyOrigin],
-    geoms: LayoutTensor[DTYPE, Layout.row_major(_max_one[NGEOM](), MODEL_GEOM_SIZE), MutAnyOrigin],
-    bodies: LayoutTensor[DTYPE, Layout.row_major(NBODY, MODEL_BODY_SIZE), MutAnyOrigin],
-    mesh_meta: LayoutTensor[DTYPE, Layout.row_major(MAX_GPU_MESHES * MODEL_MESH_META_SIZE), MutAnyOrigin],
-    mesh_tris: LayoutTensor[DTYPE, Layout.row_major(_max_one[NMESH_TRI * MESH_ARENA_FLOATS_PER_TRI]()), MutAnyOrigin],
-    hfield_meta: LayoutTensor[DTYPE, Layout.row_major(MAX_GPU_HFIELDS * MODEL_HFIELD_META_SIZE), MutAnyOrigin],
-    hfield_data: LayoutTensor[DTYPE, Layout.row_major(BATCH * _max_one[NHF]()), MutAnyOrigin],
+    sensors: Tile[DTYPE, _max_one[NSENSOR](), MODEL_SENSOR_SIZE],
+    sensordata: Tile[DTYPE, BATCH, _max_one[NSENSORDATA]()],
+    sites: Tile[DTYPE, _max_one[NSITE](), MODEL_SITE_SIZE],
+    site_xpos: Tile[DTYPE, BATCH, _max_one[NSITE * 3]()],
+    xpos: Tile[DTYPE, BATCH, NBODY * 3],
+    xquat: Tile[DTYPE, BATCH, NBODY * 4],
+    geoms: Tile[DTYPE, _max_one[NGEOM](), MODEL_GEOM_SIZE],
+    bodies: Tile[DTYPE, NBODY, MODEL_BODY_SIZE],
+    mesh_meta: Tile[DTYPE, MAX_GPU_MESHES * MODEL_MESH_META_SIZE],
+    mesh_tris: Tile[DTYPE, _max_one[NMESH_TRI * MESH_ARENA_FLOATS_PER_TRI]()],
+    hfield_meta: Tile[DTYPE, MAX_GPU_HFIELDS * MODEL_HFIELD_META_SIZE],
+    hfield_data: Tile[DTYPE, BATCH * _max_one[NHF]()],
     ngeom: Int32,
     hf_stride: Int32,
     stage: Int32,

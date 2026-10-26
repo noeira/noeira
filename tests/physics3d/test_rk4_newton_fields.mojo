@@ -22,7 +22,7 @@ Run: pixi run -e apple mojo run -I . tests/physics3d/test_rk4_newton_fields.mojo
 
 from std.math import abs
 from max.gpu.host import DeviceContext
-from std.sys import has_nvidia_gpu_accelerator
+from std.sys import default_accelerator
 
 from noeira.nn.core.tensor import TensorImpl
 from noeira.physics3d.fields import Data, Model, Dims
@@ -97,7 +97,7 @@ comptime GOLD_RTOL = 1e-3
 def _check(name: StringLiteral, got: Float64, gold: Float64) raises:
     var denom = abs(gold) if abs(gold) > 1e-9 else 1.0
     var rel = abs(got - gold) / denom
-    if rel > GOLD_RTOL and not has_nvidia_gpu_accelerator():
+    if rel > GOLD_RTOL and not default_accelerator().is_nvidia_gpu():
         raise Error(
             String(name) + " fingerprint " + String(got) + " != golden "
             + String(gold) + " (rel " + String(rel) + ")"
@@ -147,7 +147,7 @@ def main() raises:
         if ncon_seen == 0:
             raise Error("no contacts at step " + String(step) + " — vacuous")
         if not HARVEST:
-            if ncon_seen != GOLD_NCON and not has_nvidia_gpu_accelerator():
+            if ncon_seen != GOLD_NCON and not default_accelerator().is_nvidia_gpu():
                 raise Error(
                     "step " + String(step) + ": ncon " + String(ncon_seen)
                     + " != golden " + String(GOLD_NCON)

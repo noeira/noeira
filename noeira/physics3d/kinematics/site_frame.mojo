@@ -21,7 +21,7 @@ The site record's quaternion is (x, y, z, w), matching `BODY_IDX_QUAT_*`.
 """
 
 from std.collections import Array
-from layout import Layout, LayoutTensor
+from layout import TileTensor, TensorLayout
 
 from ..gpu.constants import (
     MODEL_SITE_SIZE,
@@ -37,17 +37,13 @@ from .quat_math import gpu_quat_mul
 @always_inline
 def site_world_quat[
     DTYPE: DType,
-    L_SITES: Layout,
-    L_XQUAT: Layout,
+    L_SITES: TensorLayout,
+    L_XQUAT: TensorLayout,
 ](
     env: Int,
     site_idx: Int,
-    sites: LayoutTensor[
-        DTYPE, L_SITES, MutAnyOrigin
-    ],
-    xquat: LayoutTensor[
-        DTYPE, L_XQUAT, MutAnyOrigin
-    ],
+    sites: TileTensor[DTYPE, L_SITES, MutAnyOrigin],
+    xquat: TileTensor[DTYPE, L_XQUAT, MutAnyOrigin],
 ) -> Array[Scalar[DTYPE], 4]:
     """`xquat[site_body] * site_quat` as (x, y, z, w) — MuJoCo's `site_xmat`.
 

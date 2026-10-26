@@ -11,7 +11,6 @@ views (mirrors `SingleCriticStep`). CPU + GPU.
 """
 
 from max.gpu.host import DeviceContext
-from layout import Layout, LayoutTensor
 
 from noeira.nn.constants import DT
 from noeira.nn.core.amp import AMPPolicy, NoAMP
@@ -19,6 +18,7 @@ from noeira.nn.core.module import Module
 from noeira.nn.optimizer.adam import Adam
 from ..q_update_block import DQNQUpdateBlock
 from ...training.trainer_block import TrainerState
+from noeira.core.tiles import Tile
 
 
 struct DQNQUpdateStep[
@@ -64,16 +64,14 @@ struct DQNQUpdateStep[
         accumulator (CUDA-graph capture); `state.critic_loss` then holds a 0
         sentinel — read the running loss via `inner.mse_loss.read_accum`."""
         var weights: Optional[
-            LayoutTensor[DT, Layout.row_major(Self.BATCH), MutAnyOrigin]
+            Tile[DT, Self.BATCH]
         ] = None
         var td_residuals: Optional[
-            LayoutTensor[DT, Layout.row_major(Self.BATCH), MutAnyOrigin]
+            Tile[DT, Self.BATCH]
         ] = None
         if state.has_per:
-            weights = state.mb_w.lt[target, Layout.row_major(Self.BATCH)]()
-            td_residuals = state.td_residuals.lt[
-                target, Layout.row_major(Self.BATCH)
-            ]()
+            weights = state.mb_w.tt[target, Self.BATCH]()
+            td_residuals = state.td_residuals.tt[target, Self.BATCH]()
 
         var loss = self.inner.step[target, POLICY, ACCUMULATE](
             q_online,

@@ -45,7 +45,6 @@ from std.math import abs
 from std.python import Python, PythonObject
 from std.testing import assert_true, TestSuite
 from max.gpu.host import DeviceContext
-from layout import Layout, LayoutTensor
 
 from noeira.nn.core.tensor import TensorImpl
 from noeira.physics3d.parser import parse_xml, ModelDefFromXML
@@ -223,23 +222,17 @@ def _gpu_qfrc() raises -> List[Float64]:
     M.init_spec_fields[DTYPE](ctx, sfg)
     M.apply_actions_kernel_gpu[DTYPE, BATCH, NACT](
         ctx,
-        t_qfrc.lt["gpu", Layout.row_major(BATCH, NV)](),
-        t_act_in.lt["gpu", Layout.row_major(BATCH, NACT)](),
-        t_qpos.lt["gpu", Layout.row_major(BATCH, NQ)](),
-        t_qvel.lt["gpu", Layout.row_major(BATCH, NV)](),
-        t_actv.lt["gpu", Layout.row_major(BATCH, NA_F)](),
-        sfg.actuators.lt[
-            "gpu", Layout.row_major(M.NACT_F * MODEL_ACTUATOR_SIZE)
-        ](),
-        sfg.act_tendons.lt[
-            "gpu", Layout.row_major(M.NTEN_F * MODEL_ACT_TENDON_SIZE)
-        ](),
-        sfg.joint_limits.lt[
-            "gpu", Layout.row_major(M.NJOINT * JLIM_SIZE)
-        ](),
-        t_actd.lt["gpu", Layout.row_major(BATCH, NV)](),
-        t_aact.lt["gpu", Layout.row_major(BATCH, M.NACT_F)](),
-        t_meta.lt["gpu", Layout.row_major(BATCH, METADATA_SIZE)](),
+        t_qfrc.tt["gpu", BATCH, NV](),
+        t_act_in.tt["gpu", BATCH, NACT](),
+        t_qpos.tt["gpu", BATCH, NQ](),
+        t_qvel.tt["gpu", BATCH, NV](),
+        t_actv.tt["gpu", BATCH, NA_F](),
+        sfg.actuators.tt["gpu", M.NACT_F * MODEL_ACTUATOR_SIZE](),
+        sfg.act_tendons.tt["gpu", M.NTEN_F * MODEL_ACT_TENDON_SIZE](),
+        sfg.joint_limits.tt["gpu", M.NJOINT * JLIM_SIZE](),
+        t_actd.tt["gpu", BATCH, NV](),
+        t_aact.tt["gpu", BATCH, M.NACT_F](),
+        t_meta.tt["gpu", BATCH, METADATA_SIZE](),
     )
     ctx.synchronize()
     t_qfrc.download(ctx)

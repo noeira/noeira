@@ -142,9 +142,10 @@ comptime LAG_MAX_DELAY: Int = 4
 
 
 struct ServoLag(Movable):
-    """The REAL follower's servos, as seen from the control loop: each joint
-    target reaches the joint `delay` ticks late and through a first-order lag
-    of time constant `tau` —
+    """The REAL follower's servos, as seen from the control loop.
+
+    Each joint target reaches the joint `delay` ticks late and through a
+    first-order lag of time constant `tau` —
 
         u_t  = the commanded target (`delta_target`)
         y_t  = y_{t-1} + alpha (u_{t-d} - y_{t-1})     alpha = 1 - exp(-dt / tau)

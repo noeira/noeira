@@ -4,9 +4,9 @@ Promoted from amortized PC test files
 (`test_{pendulum,mountain_car}_amortized_pc.mojo`).
 """
 
-from layout import Layout, LayoutTensor
 from std.math import sqrt
 from std.sys import simd_width_of
+from noeira.core.tiles import Tile
 
 comptime _SW = simd_width_of[DType.float32]()
 
@@ -14,7 +14,7 @@ comptime _SW = simd_width_of[DType.float32]()
 def clip_grad_norm[
     SIZE: Int, dtype: DType = DType.float32
 ](
-    grads: LayoutTensor[dtype, Layout.row_major(SIZE), MutAnyOrigin],
+    grads: Tile[dtype, SIZE],
     max_norm: Float64,
 ):
     """Global L2-norm gradient clipping (in-place).
@@ -63,9 +63,9 @@ def clip_grad_norm[
 def spectral_norm_clamp[
     IN: Int, OUT: Int, dtype: DType = DType.float32
 ](
-    W: LayoutTensor[dtype, Layout.row_major(IN, OUT), MutAnyOrigin],
-    u: LayoutTensor[dtype, Layout.row_major(IN), MutAnyOrigin],
-    v: LayoutTensor[dtype, Layout.row_major(OUT), MutAnyOrigin],
+    W: Tile[dtype, IN, OUT],
+    u: Tile[dtype, IN],
+    v: Tile[dtype, OUT],
     target_sigma: Float64,
     n_power_iters: Int = 1,
 ) -> Float64:

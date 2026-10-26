@@ -27,7 +27,8 @@ from noeira.nn.core.mm import mm, bmm
 from std.math import exp, sqrt
 from max.gpu import thread_idx, block_idx, block_dim, global_idx
 from max.gpu.host import DeviceContext
-from layout import Layout, LayoutTensor, row_major
+from layout import row_major
+from noeira.core.tiles import RowMajor, Tile
 
 from noeira.nn.constants import DT, TPB
 from ..core.tensor import Tensor, TensorImpl
@@ -164,10 +165,10 @@ def _masked_fwd_kernel[
     IN_DIM: Int, OUT_DIM: Int, CACHE_SIZE: Int,
     K_OFF: Int, V_OFF: Int, ATTN_OFF: Int, ADT: DType = DT,
 ](
-    output: LayoutTensor[ADT, Layout.row_major(BATCH, OUT_DIM), MutAnyOrigin],
-    input: LayoutTensor[ADT, Layout.row_major(BATCH, IN_DIM), MutAnyOrigin],
-    cache: LayoutTensor[DT, Layout.row_major(BATCH, CACHE_SIZE), MutAnyOrigin],
-    mask: LayoutTensor[DT, Layout.row_major(SEQ * SEQ), MutAnyOrigin],
+    output: Tile[ADT, BATCH, OUT_DIM],
+    input: Tile[ADT, BATCH, IN_DIM],
+    cache: Tile[DT, BATCH, CACHE_SIZE],
+    mask: Tile[DT, SEQ * SEQ],
 ):
     var blk = Int(block_idx.x)
     var b = blk // N_HEADS
@@ -243,7 +244,7 @@ def _masked_fwd_kernel[
 def _masked_zero_grad_kernel[
     BATCH: Int, IN_DIM: Int, ADT: DType = DT
 ](
-    grad_input: LayoutTensor[ADT, Layout.row_major(BATCH, IN_DIM), MutAnyOrigin],
+    grad_input: Tile[ADT, BATCH, IN_DIM],
 ):
     var idx = Int(global_idx.x)
     if idx < BATCH * IN_DIM:
@@ -255,9 +256,9 @@ def _masked_dV_kernel[
     IN_DIM: Int, OUT_DIM: Int, CACHE_SIZE: Int, V_OFF: Int, ATTN_OFF: Int,
     ADT: DType = DT,
 ](
-    grad_input: LayoutTensor[ADT, Layout.row_major(BATCH, IN_DIM), MutAnyOrigin],
-    grad_output: LayoutTensor[ADT, Layout.row_major(BATCH, OUT_DIM), MutAnyOrigin],
-    cache: LayoutTensor[DT, Layout.row_major(BATCH, CACHE_SIZE), MutAnyOrigin],
+    grad_input: Tile[ADT, BATCH, IN_DIM],
+    grad_output: Tile[ADT, BATCH, OUT_DIM],
+    cache: Tile[DT, BATCH, CACHE_SIZE],
 ):
     # dV[j] = Σ_i attn[i,j] * grad_out[i]. Full i-range (mask gates via attn=0).
     var blk = Int(block_idx.x)
@@ -292,9 +293,9 @@ def _masked_dscore_dQ_kernel[
     IN_DIM: Int, OUT_DIM: Int, CACHE_SIZE: Int,
     K_OFF: Int, V_OFF: Int, ATTN_OFF: Int, ADT: DType = DT,
 ](
-    grad_input: LayoutTensor[ADT, Layout.row_major(BATCH, IN_DIM), MutAnyOrigin],
-    grad_output: LayoutTensor[ADT, Layout.row_major(BATCH, OUT_DIM), MutAnyOrigin],
-    cache: LayoutTensor[DT, Layout.row_major(BATCH, CACHE_SIZE), MutAnyOrigin],
+    grad_input: Tile[ADT, BATCH, IN_DIM],
+    grad_output: Tile[ADT, BATCH, OUT_DIM],
+    cache: Tile[DT, BATCH, CACHE_SIZE],
 ):
     # Per row i: dot_sum, then d_score (overwrites cache.attn), then dQ.
     var blk = Int(block_idx.x)
@@ -357,8 +358,8 @@ def _masked_dK_kernel[
     BATCH: Int, DIM: Int, N_HEADS: Int, SEQ: Int, HEAD_DIM: Int,
     IN_DIM: Int, CACHE_SIZE: Int, K_OFF: Int, ATTN_OFF: Int, ADT: DType = DT,
 ](
-    grad_input: LayoutTensor[ADT, Layout.row_major(BATCH, IN_DIM), MutAnyOrigin],
-    cache: LayoutTensor[DT, Layout.row_major(BATCH, CACHE_SIZE), MutAnyOrigin],
+    grad_input: Tile[ADT, BATCH, IN_DIM],
+    cache: Tile[DT, BATCH, CACHE_SIZE],
 ):
     # dK[j] = Σ_i d_score[i,j] * Q[i]. Reads d_score from cache.attn. Full range.
     var blk = Int(block_idx.x)
@@ -394,9 +395,9 @@ def _masked_softmax_kernel[
     BATCH: Int, N_HEADS: Int, SEQ: Int, HEAD_DIM: Int,
     CACHE_SIZE: Int, SCORES: Int, BH: Int,
 ](
-    scores: LayoutTensor[DT, Layout.row_major(SCORES), MutAnyOrigin],
-    cache: LayoutTensor[DT, Layout.row_major(BATCH, CACHE_SIZE), MutAnyOrigin],
-    mask: LayoutTensor[DT, Layout.row_major(SEQ * SEQ), MutAnyOrigin],
+    scores: Tile[DT, SCORES],
+    cache: Tile[DT, BATCH, CACHE_SIZE],
+    mask: Tile[DT, SEQ * SEQ],
 ):
     var blk = Int(block_idx.x)
     if blk >= BH:
@@ -580,20 +581,20 @@ struct MaskedAttention[
         mut out: TensorImpl[Self.ACT_DT],
         c: DeviceContext,
     ) raises:
-        comptime lay_in = Layout.row_major(B, Self.IN_DIM0)
-        comptime lay_out = Layout.row_major(B, Self.OUT_DIM)
-        comptime lay_c = Layout.row_major(B, Self.CACHE_SIZE)
-        comptime lay_m = Layout.row_major(Self.MASK_SIZE)
+        comptime lay_in = RowMajor[B, Self.IN_DIM0]
+        comptime lay_out = RowMajor[B, Self.OUT_DIM]
+        comptime lay_c = RowMajor[B, Self.CACHE_SIZE]
+        comptime lay_m = RowMajor[Self.MASK_SIZE]
         comptime kernel = _masked_fwd_kernel[
             B, Self.DIM, Self.N_HEADS, Self.SEQ_LEN, Self.HEAD_DIM,
             Self.IN_DIM0, Self.OUT_DIM, Self.CACHE_SIZE,
             Self.K_OFF, Self.V_OFF, Self.ATTN_OFF, Self.ADT,
         ]
         c.enqueue_function[kernel](
-            out.lt["gpu", lay_out](),
-            in0.lt["gpu", lay_in](),
-            self.cache.lt["gpu", lay_c](),
-            self.mask.lt["gpu", lay_m](),
+            out.tt["gpu", B, Self.OUT_DIM](),
+            in0.tt["gpu", B, Self.IN_DIM0](),
+            self.cache.tt["gpu", B, Self.CACHE_SIZE](),
+            self.mask.tt["gpu", Self.MASK_SIZE](),
             grid_dim=B * Self.N_HEADS, block_dim=TPB,
         )
 
@@ -610,12 +611,12 @@ struct MaskedAttention[
         comptime SCORES = BH * Self.SEQ_LEN * Self.SEQ_LEN
         self._ensure_scratch_gpu[B](c)
 
-        comptime lay_in = Layout.row_major(B, Self.IN_DIM0)
-        comptime lay_out = Layout.row_major(B, Self.OUT_DIM)
-        comptime lay_c = Layout.row_major(B, Self.CACHE_SIZE)
-        comptime lay_m = Layout.row_major(Self.MASK_SIZE)
-        comptime lay_p = Layout.row_major(PACKED)
-        comptime lay_s = Layout.row_major(SCORES)
+        comptime lay_in = RowMajor[B, Self.IN_DIM0]
+        comptime lay_out = RowMajor[B, Self.OUT_DIM]
+        comptime lay_c = RowMajor[B, Self.CACHE_SIZE]
+        comptime lay_m = RowMajor[Self.MASK_SIZE]
+        comptime lay_p = RowMajor[PACKED]
+        comptime lay_s = RowMajor[SCORES]
 
         # 1. pack QKV → (BH, SEQ, HEAD_DIM) + write cache.
         comptime pelems = B * Self.SEQ_LEN * Self.DIM
@@ -625,11 +626,11 @@ struct MaskedAttention[
             Self.IN_DIM0, Self.CACHE_SIZE, PACKED, Self.ADT,
         ]
         c.enqueue_function[pack_k](
-            self.sp0.lt["gpu", lay_p](),
-            self.sp1.lt["gpu", lay_p](),
-            self.sp2.lt["gpu", lay_p](),
-            self.cache.lt["gpu", lay_c](),
-            in0.lt["gpu", lay_in](),
+            self.sp0.tt["gpu", PACKED](),
+            self.sp1.tt["gpu", PACKED](),
+            self.sp2.tt["gpu", PACKED](),
+            self.cache.tt["gpu", B, Self.CACHE_SIZE](),
+            in0.tt["gpu", B, Self.IN_DIM0](),
             grid_dim=pblocks, block_dim=TPB,
         )
 
@@ -644,9 +645,9 @@ struct MaskedAttention[
             Self.CACHE_SIZE, SCORES, BH,
         ]
         c.enqueue_function[sm_k](
-            self.ss0.lt["gpu", lay_s](),
-            self.cache.lt["gpu", lay_c](),
-            self.mask.lt["gpu", lay_m](),
+            self.ss0.tt["gpu", SCORES](),
+            self.cache.tt["gpu", B, Self.CACHE_SIZE](),
+            self.mask.tt["gpu", Self.MASK_SIZE](),
             grid_dim=BH, block_dim=TPB,
         )
 
@@ -661,8 +662,8 @@ struct MaskedAttention[
             Self.OUT_DIM, PACKED, Self.ADT,
         ]
         c.enqueue_function[up_k](
-            out.lt["gpu", lay_out](),
-            self.sp3.lt["gpu", lay_p](),
+            out.tt["gpu", B, Self.OUT_DIM](),
+            self.sp3.tt["gpu", PACKED](),
             grid_dim=pblocks, block_dim=TPB,
         )
 
@@ -792,15 +793,15 @@ struct MaskedAttention[
         mut gin: TensorImpl[Self.ACT_DT],
         c: DeviceContext,
     ) raises:
-        comptime lay_in = Layout.row_major(B, Self.IN_DIM0)
-        comptime lay_out = Layout.row_major(B, Self.OUT_DIM)
-        comptime lay_c = Layout.row_major(B, Self.CACHE_SIZE)
+        comptime lay_in = RowMajor[B, Self.IN_DIM0]
+        comptime lay_out = RowMajor[B, Self.OUT_DIM]
+        comptime lay_c = RowMajor[B, Self.CACHE_SIZE]
         comptime grid_bh = B * Self.N_HEADS
         # 1) zero grad_input.
         comptime zk = _masked_zero_grad_kernel[B, Self.IN_DIM0, Self.ADT]
         comptime zn = (B * Self.IN_DIM0 + TPB - 1) // TPB
         c.enqueue_function[zk](
-            gin.lt["gpu", lay_in](), grid_dim=zn, block_dim=TPB
+            gin.tt["gpu", B, Self.IN_DIM0](), grid_dim=zn, block_dim=TPB
         )
         # 2) dV.
         comptime dvk = _masked_dV_kernel[
@@ -809,9 +810,9 @@ struct MaskedAttention[
             Self.V_OFF, Self.ATTN_OFF, Self.ADT,
         ]
         c.enqueue_function[dvk](
-            gin.lt["gpu", lay_in](),
-            grad_output.lt["gpu", lay_out](),
-            self.cache.lt["gpu", lay_c](),
+            gin.tt["gpu", B, Self.IN_DIM0](),
+            grad_output.tt["gpu", B, Self.OUT_DIM](),
+            self.cache.tt["gpu", B, Self.CACHE_SIZE](),
             grid_dim=grid_bh, block_dim=TPB,
         )
         # 3) dscore + dQ.
@@ -821,9 +822,9 @@ struct MaskedAttention[
             Self.K_OFF, Self.V_OFF, Self.ATTN_OFF, Self.ADT,
         ]
         c.enqueue_function[dqk](
-            gin.lt["gpu", lay_in](),
-            grad_output.lt["gpu", lay_out](),
-            self.cache.lt["gpu", lay_c](),
+            gin.tt["gpu", B, Self.IN_DIM0](),
+            grad_output.tt["gpu", B, Self.OUT_DIM](),
+            self.cache.tt["gpu", B, Self.CACHE_SIZE](),
             grid_dim=grid_bh, block_dim=TPB,
         )
         # 4) dK.
@@ -832,8 +833,8 @@ struct MaskedAttention[
             Self.IN_DIM0, Self.CACHE_SIZE, Self.K_OFF, Self.ATTN_OFF, Self.ADT,
         ]
         c.enqueue_function[dkk](
-            gin.lt["gpu", lay_in](),
-            self.cache.lt["gpu", lay_c](),
+            gin.tt["gpu", B, Self.IN_DIM0](),
+            self.cache.tt["gpu", B, Self.CACHE_SIZE](),
             grid_dim=grid_bh, block_dim=TPB,
         )
 
@@ -854,11 +855,11 @@ struct MaskedAttention[
         comptime HD = Self.HEAD_DIM
         self._ensure_scratch_gpu[B](c)
 
-        comptime lay_in = Layout.row_major(B, Self.IN_DIM0)
-        comptime lay_out = Layout.row_major(B, Self.OUT_DIM)
-        comptime lay_c = Layout.row_major(B, Self.CACHE_SIZE)
-        comptime lay_p = Layout.row_major(PACKED)
-        comptime lay_s = Layout.row_major(SCORES)
+        comptime lay_in = RowMajor[B, Self.IN_DIM0]
+        comptime lay_out = RowMajor[B, Self.OUT_DIM]
+        comptime lay_c = RowMajor[B, Self.CACHE_SIZE]
+        comptime lay_p = RowMajor[PACKED]
+        comptime lay_s = RowMajor[SCORES]
 
         comptime pelems = B * SL * Self.DIM
         comptime pblocks = (pelems + TPB - 1) // TPB
@@ -870,12 +871,12 @@ struct MaskedAttention[
             Self.IN_DIM0, Self.OUT_DIM, Self.CACHE_SIZE, PACKED, Self.ADT,
         ]
         c.enqueue_function[pin_k](
-            self.sp0.lt["gpu", lay_p](),
-            self.sp1.lt["gpu", lay_p](),
-            self.sp2.lt["gpu", lay_p](),
-            self.sp3.lt["gpu", lay_p](),
-            grad_output.lt["gpu", lay_out](),
-            self.cache.lt["gpu", lay_c](),
+            self.sp0.tt["gpu", PACKED](),
+            self.sp1.tt["gpu", PACKED](),
+            self.sp2.tt["gpu", PACKED](),
+            self.sp3.tt["gpu", PACKED](),
+            grad_output.tt["gpu", B, Self.OUT_DIM](),
+            self.cache.tt["gpu", B, Self.CACHE_SIZE](),
             grid_dim=pblocks, block_dim=TPB,
         )
 
@@ -889,9 +890,9 @@ struct MaskedAttention[
             B, Self.N_HEADS, SL, HD, Self.CACHE_SIZE, SCORES, BH,
         ]
         c.enqueue_function[jvp_k](
-            self.ss1.lt["gpu", lay_s](),
-            self.ss0.lt["gpu", lay_s](),
-            self.cache.lt["gpu", lay_c](),
+            self.ss1.tt["gpu", SCORES](),
+            self.ss0.tt["gpu", SCORES](),
+            self.cache.tt["gpu", B, Self.CACHE_SIZE](),
             grid_dim=BH, block_dim=TPB,
         )
 
@@ -900,8 +901,8 @@ struct MaskedAttention[
             B, Self.N_HEADS, SL, HD, Self.CACHE_SIZE, SCORES, BH,
         ]
         c.enqueue_function[tac_k](
-            self.ss0.lt["gpu", lay_s](),
-            self.cache.lt["gpu", lay_c](),
+            self.ss0.tt["gpu", SCORES](),
+            self.cache.tt["gpu", B, Self.CACHE_SIZE](),
             grid_dim=sblocks, block_dim=TPB,
         )
 
@@ -913,8 +914,8 @@ struct MaskedAttention[
         # 6. dscore_T(ss0) = transpose(dscore(ss1)).
         comptime ts_k = _attn_transpose_scores_kernel[SL, SCORES, BH]
         c.enqueue_function[ts_k](
-            self.ss0.lt["gpu", lay_s](),
-            self.ss1.lt["gpu", lay_s](),
+            self.ss0.tt["gpu", SCORES](),
+            self.ss1.tt["gpu", SCORES](),
             grid_dim=sblocks, block_dim=TPB,
         )
 
@@ -933,10 +934,10 @@ struct MaskedAttention[
             B, Self.DIM, Self.N_HEADS, SL, HD, Self.IN_DIM0, PACKED, Self.ADT,
         ]
         c.enqueue_function[ug_k](
-            gin.lt["gpu", lay_in](),
-            self.sp1.lt["gpu", lay_p](),
-            self.sp0.lt["gpu", lay_p](),
-            self.sp3.lt["gpu", lay_p](),
+            gin.tt["gpu", B, Self.IN_DIM0](),
+            self.sp1.tt["gpu", PACKED](),
+            self.sp0.tt["gpu", PACKED](),
+            self.sp3.tt["gpu", PACKED](),
             grid_dim=pblocks, block_dim=TPB,
         )
 

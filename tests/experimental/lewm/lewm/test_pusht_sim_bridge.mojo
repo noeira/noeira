@@ -10,7 +10,7 @@ Run:  pixi run mojo run -I . tests/experimental/lewm/test_pusht_sim_bridge.mojo
 
 from std.memory import alloc
 from std.testing import assert_true
-from layout import Layout, LayoutTensor
+from noeira.core.tiles import tile
 
 from noeira.nn.constants import DT
 from noeira.envs.pusht.render_swm import render_pusht_swm_at  # what the bridge draws with
@@ -34,7 +34,7 @@ def main() raises:
 
     # reference HWC [0,255]
     var hwc = alloc[Scalar[DT]](HW * 3).as_unsafe_any_origin()
-    var hwc_t = LayoutTensor[DT, Layout.row_major(OUT, OUT, 3), MutAnyOrigin](hwc)
+    var hwc_t = tile[OUT, OUT, 3](hwc)
     render_pusht_swm_at[OUT](bcx, bcy, bang, acx, acy, hwc_t)
 
     # bridge CHW [0,1]

@@ -193,13 +193,13 @@ struct OscPose(Movable & Deinitable):
         """Goal = the current eef pose, nullspace target = the current
         joints. Needs `update()` first."""
         osc_reset_gpu[DT](
-            self.state_t.lt_dyn["cpu", DYN2](rl2(1, OSC_STATE_WORDS)),
-            self.work_t.lt_dyn["cpu", DYN2](rl2(1, OSC_WORK_WORDS)),
-            self.refs_t.lt_dyn["cpu", DYN1](rl1(OSC_REF_WORDS)),
-            d.qpos.lt_dyn["cpu", DYN2](rl2(1, self.nq)),
-            d.xquat.lt_dyn["cpu", DYN2](rl2(1, d.dims.get_nbody() * 4)),
-            d.site_xpos.lt_dyn["cpu", DYN2](rl2(1, d.dims.get_nsite() * 3)),
-            m.sites.lt_dyn["cpu", DYN2](
+            self.state_t.tt_dyn["cpu", DYN2](rl2(1, OSC_STATE_WORDS)),
+            self.work_t.tt_dyn["cpu", DYN2](rl2(1, OSC_WORK_WORDS)),
+            self.refs_t.tt_dyn["cpu", DYN1](rl1(OSC_REF_WORDS)),
+            d.qpos.tt_dyn["cpu", DYN2](rl2(1, self.nq)),
+            d.xquat.tt_dyn["cpu", DYN2](rl2(1, d.dims.get_nbody() * 4)),
+            d.site_xpos.tt_dyn["cpu", DYN2](rl2(1, d.dims.get_nsite() * 3)),
+            m.sites.tt_dyn["cpu", DYN2](
                 rl2(d.dims.get_nsite(), MODEL_SITE_SIZE)
             ),
             0,
@@ -216,13 +216,13 @@ struct OscPose(Movable & Deinitable):
             raise Error("osc: set_goal needs at least six numbers")
         self._write_action(action)
         osc_set_goal_gpu[DT](
-            self.state_t.lt_dyn["cpu", DYN2](rl2(1, OSC_STATE_WORDS)),
-            self.work_t.lt_dyn["cpu", DYN2](rl2(1, OSC_WORK_WORDS)),
-            self.refs_t.lt_dyn["cpu", DYN1](rl1(OSC_REF_WORDS)),
-            self.act_t.lt_dyn["cpu", DYN2](rl2(1, OSC_ACTION_DIM)),
-            d.xquat.lt_dyn["cpu", DYN2](rl2(1, d.dims.get_nbody() * 4)),
-            d.site_xpos.lt_dyn["cpu", DYN2](rl2(1, d.dims.get_nsite() * 3)),
-            m.sites.lt_dyn["cpu", DYN2](
+            self.state_t.tt_dyn["cpu", DYN2](rl2(1, OSC_STATE_WORDS)),
+            self.work_t.tt_dyn["cpu", DYN2](rl2(1, OSC_WORK_WORDS)),
+            self.refs_t.tt_dyn["cpu", DYN1](rl1(OSC_REF_WORDS)),
+            self.act_t.tt_dyn["cpu", DYN2](rl2(1, OSC_ACTION_DIM)),
+            d.xquat.tt_dyn["cpu", DYN2](rl2(1, d.dims.get_nbody() * 4)),
+            d.site_xpos.tt_dyn["cpu", DYN2](rl2(1, d.dims.get_nsite() * 3)),
+            m.sites.tt_dyn["cpu", DYN2](
                 rl2(d.dims.get_nsite(), MODEL_SITE_SIZE)
             ),
             0,
@@ -243,22 +243,22 @@ struct OscPose(Movable & Deinitable):
         var nj = d.dims.get_njoint()
         self._write_action(action)
         osc_run_gpu[DT](
-            self.state_t.lt_dyn["cpu", DYN2](rl2(1, OSC_STATE_WORDS)),
-            self.work_t.lt_dyn["cpu", DYN2](rl2(1, OSC_WORK_WORDS)),
-            self.refs_t.lt_dyn["cpu", DYN1](rl1(OSC_REF_WORDS)),
-            self.ctrl_t.lt_dyn["cpu", DYN2](rl2(1, self.nact)),
-            d.qpos.lt_dyn["cpu", DYN2](rl2(1, self.nq)),
-            d.qvel.lt_dyn["cpu", DYN2](rl2(1, self.nv)),
-            d.xquat.lt_dyn["cpu", DYN2](rl2(1, nb * 4)),
-            d.site_xpos.lt_dyn["cpu", DYN2](rl2(1, ns * 3)),
-            d.subtree_com.lt_dyn["cpu", DYN2](rl2(1, nb * 3)),
-            scratch.cdof.lt_dyn["cpu", DYN2](rl2(1, self.nv * 6)),
-            scratch.M.lt_dyn["cpu", DYN2](rl2(1, self.nv * self.nv)),
-            scratch.bias.lt_dyn["cpu", DYN2](rl2(1, self.nv)),
-            m.joints.lt_dyn["cpu", DYN2](rl2(nj, MODEL_JOINT_SIZE)),
-            m.bodies.lt_dyn["cpu", DYN2](rl2(nb, MODEL_BODY_SIZE)),
-            m.sites.lt_dyn["cpu", DYN2](rl2(ns, MODEL_SITE_SIZE)),
-            m.meta.lt_dyn["cpu", DYN1](rl1(MODEL_META_SIZE)),
+            self.state_t.tt_dyn["cpu", DYN2](rl2(1, OSC_STATE_WORDS)),
+            self.work_t.tt_dyn["cpu", DYN2](rl2(1, OSC_WORK_WORDS)),
+            self.refs_t.tt_dyn["cpu", DYN1](rl1(OSC_REF_WORDS)),
+            self.ctrl_t.tt_dyn["cpu", DYN2](rl2(1, self.nact)),
+            d.qpos.tt_dyn["cpu", DYN2](rl2(1, self.nq)),
+            d.qvel.tt_dyn["cpu", DYN2](rl2(1, self.nv)),
+            d.xquat.tt_dyn["cpu", DYN2](rl2(1, nb * 4)),
+            d.site_xpos.tt_dyn["cpu", DYN2](rl2(1, ns * 3)),
+            d.subtree_com.tt_dyn["cpu", DYN2](rl2(1, nb * 3)),
+            scratch.cdof.tt_dyn["cpu", DYN2](rl2(1, self.nv * 6)),
+            scratch.M.tt_dyn["cpu", DYN2](rl2(1, self.nv * self.nv)),
+            scratch.bias.tt_dyn["cpu", DYN2](rl2(1, self.nv)),
+            m.joints.tt_dyn["cpu", DYN2](rl2(nj, MODEL_JOINT_SIZE)),
+            m.bodies.tt_dyn["cpu", DYN2](rl2(nb, MODEL_BODY_SIZE)),
+            m.sites.tt_dyn["cpu", DYN2](rl2(ns, MODEL_SITE_SIZE)),
+            m.meta.tt_dyn["cpu", DYN1](rl1(MODEL_META_SIZE)),
             0,
             self.nv,
         )
@@ -269,10 +269,10 @@ struct OscPose(Movable & Deinitable):
                 " pseudo-inverse and a plausible torque; this refuses."
             )
         osc_gripper_gpu[DT, ACT_DIM=OSC_ACTION_DIM](
-            self.state_t.lt_dyn["cpu", DYN2](rl2(1, OSC_STATE_WORDS)),
-            self.refs_t.lt_dyn["cpu", DYN1](rl1(OSC_REF_WORDS)),
-            self.ctrl_t.lt_dyn["cpu", DYN2](rl2(1, self.nact)),
-            self.act_t.lt_dyn["cpu", DYN2](rl2(1, OSC_ACTION_DIM)),
+            self.state_t.tt_dyn["cpu", DYN2](rl2(1, OSC_STATE_WORDS)),
+            self.refs_t.tt_dyn["cpu", DYN1](rl1(OSC_REF_WORDS)),
+            self.ctrl_t.tt_dyn["cpu", DYN2](rl2(1, self.nact)),
+            self.act_t.tt_dyn["cpu", DYN2](rl2(1, OSC_ACTION_DIM)),
             0,
         )
         var out = List[Float64]()
@@ -381,10 +381,10 @@ struct PandaGripperRamp(Movable & Deinitable):
         """One SIM step of the ramp; returns the two finger ctrls."""
         self.act_t.data[OSC_ACTION_DIM - 1] = Scalar[DT](action)
         osc_gripper_gpu[DT, ACT_DIM=OSC_ACTION_DIM](
-            self.state_t.lt_dyn["cpu", DYN2](rl2(1, OSC_STATE_WORDS)),
-            self.refs_t.lt_dyn["cpu", DYN1](rl1(OSC_REF_WORDS)),
-            self.ctrl_t.lt_dyn["cpu", DYN2](rl2(1, 2)),
-            self.act_t.lt_dyn["cpu", DYN2](rl2(1, OSC_ACTION_DIM)),
+            self.state_t.tt_dyn["cpu", DYN2](rl2(1, OSC_STATE_WORDS)),
+            self.refs_t.tt_dyn["cpu", DYN1](rl1(OSC_REF_WORDS)),
+            self.ctrl_t.tt_dyn["cpu", DYN2](rl2(1, 2)),
+            self.act_t.tt_dyn["cpu", DYN2](rl2(1, OSC_ACTION_DIM)),
             0,
         )
         var out = List[Float64]()

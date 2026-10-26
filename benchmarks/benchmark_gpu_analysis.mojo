@@ -27,7 +27,7 @@ from max.gpu import thread_idx, block_idx, block_dim
 from max.gpu.sync import barrier
 from max.gpu.host import DeviceContext
 from max.gpu.memory import AddressSpace
-from layout import Layout, LayoutTensor
+from noeira.core.tiles import Tile, ImmTile, tile
 from noeira.core.fmt import fit
 
 
@@ -118,16 +118,10 @@ def gpu_forward_kernel[
     OUT_DIM: Int,
     TPB: Int,
 ](
-    output: LayoutTensor[
-        dtype, Layout.row_major(BATCH * OUT_DIM), MutAnyOrigin
-    ],
-    obs: LayoutTensor[dtype, Layout.row_major(BATCH * OBS_DIM), ImmutAnyOrigin],
-    W1: LayoutTensor[
-        dtype, Layout.row_major(OBS_DIM * HIDDEN_DIM), ImmutAnyOrigin
-    ],
-    W2: LayoutTensor[
-        dtype, Layout.row_major(HIDDEN_DIM * OUT_DIM), ImmutAnyOrigin
-    ],
+    output: Tile[dtype, BATCH * OUT_DIM],
+    obs: ImmTile[dtype, BATCH * OBS_DIM],
+    W1: ImmTile[dtype, OBS_DIM * HIDDEN_DIM],
+    W2: ImmTile[dtype, HIDDEN_DIM * OUT_DIM],
 ):
     """GPU forward pass - one thread per batch element."""
     var batch_idx = Int(block_dim.x * block_idx.x + thread_idx.x)
@@ -176,18 +170,10 @@ def benchmark_gpu[
     out_gpu.enqueue_fill(0)
     ctx.synchronize()
 
-    var obs_t = LayoutTensor[
-        dtype, Layout.row_major(BATCH * OBS_DIM), ImmutAnyOrigin
-    ](obs_gpu)
-    var W1_t = LayoutTensor[
-        dtype, Layout.row_major(OBS_DIM * HIDDEN_DIM), ImmutAnyOrigin
-    ](W1_gpu)
-    var W2_t = LayoutTensor[
-        dtype, Layout.row_major(HIDDEN_DIM * OUT_DIM), ImmutAnyOrigin
-    ](W2_gpu)
-    var out_t = LayoutTensor[
-        dtype, Layout.row_major(BATCH * OUT_DIM), MutAnyOrigin
-    ](out_gpu)
+    var obs_t = tile[BATCH * OBS_DIM](obs_gpu)
+    var W1_t = tile[OBS_DIM * HIDDEN_DIM](W1_gpu)
+    var W2_t = tile[HIDDEN_DIM * OUT_DIM](W2_gpu)
+    var out_t = tile[BATCH * OUT_DIM](out_gpu)
 
     comptime num_blocks = (BATCH + TPB - 1) // TPB
     comptime kernel = gpu_forward_kernel[

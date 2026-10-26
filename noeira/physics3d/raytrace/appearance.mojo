@@ -84,7 +84,7 @@ a CUBE face. Both are here and dispatched on the texture's type.
 
 from std.math import floor, sqrt, exp, log, cos
 
-from layout import Layout, LayoutTensor
+from layout import TileTensor, TensorLayout
 
 from noeira.math3d import Vec3 as Vec3Generic, Quat as QuatGeneric
 
@@ -168,9 +168,9 @@ struct Texel[DTYPE: DType](Copyable, ImplicitlyCopyable, Movable):
 
 @always_inline
 def _bilinear_level[
-    DTYPE: DType, L_TEXELS: Layout
+    DTYPE: DType, L_TEXELS: TensorLayout
 ](
-    texels: LayoutTensor[DType.uint8, L_TEXELS, MutAnyOrigin],
+    texels: TileTensor[DType.uint8, L_TEXELS, MutAnyOrigin],
     adr: Int,
     w: Int,
     h: Int,
@@ -233,10 +233,10 @@ def mip_level_adr(adr: Int, w: Int, h: Int, level: Int) -> Int:
 
 
 def sample_texture_lod[
-    DTYPE: DType, L_TEX: Layout, L_TEXELS: Layout
+    DTYPE: DType, L_TEX: TensorLayout, L_TEXELS: TensorLayout
 ](
-    textures: LayoutTensor[DTYPE, L_TEX, MutAnyOrigin],
-    texels: LayoutTensor[DType.uint8, L_TEXELS, MutAnyOrigin],
+    textures: TileTensor[DTYPE, L_TEX, MutAnyOrigin],
+    texels: TileTensor[DType.uint8, L_TEXELS, MutAnyOrigin],
     texid: Int,
     u: Scalar[DTYPE],
     v: Scalar[DTYPE],
@@ -316,10 +316,10 @@ def sample_texture_lod[
 
 
 def sample_texture[
-    DTYPE: DType, L_TEX: Layout, L_TEXELS: Layout
+    DTYPE: DType, L_TEX: TensorLayout, L_TEXELS: TensorLayout
 ](
-    textures: LayoutTensor[DTYPE, L_TEX, MutAnyOrigin],
-    texels: LayoutTensor[DType.uint8, L_TEXELS, MutAnyOrigin],
+    textures: TileTensor[DTYPE, L_TEX, MutAnyOrigin],
+    texels: TileTensor[DType.uint8, L_TEXELS, MutAnyOrigin],
     texid: Int,
     u: Scalar[DTYPE],
     v: Scalar[DTYPE],
@@ -331,9 +331,9 @@ def sample_texture[
 
 
 def texture_lod[
-    DTYPE: DType, L_TEX: Layout
+    DTYPE: DType, L_TEX: TensorLayout
 ](
-    textures: LayoutTensor[DTYPE, L_TEX, MutAnyOrigin],
+    textures: TileTensor[DTYPE, L_TEX, MutAnyOrigin],
     texid: Int,
     dudx: Scalar[DTYPE],
     dvdx: Scalar[DTYPE],
@@ -371,10 +371,10 @@ struct UV[DTYPE: DType](Copyable, ImplicitlyCopyable, Movable):
 
 
 def geom_uv[
-    DTYPE: DType, L_GEOMS: Layout, L_UV: Layout
+    DTYPE: DType, L_GEOMS: TensorLayout, L_UV: TensorLayout
 ](
-    geoms: LayoutTensor[DTYPE, L_GEOMS, MutAnyOrigin],
-    mesh_uv: LayoutTensor[DTYPE, L_UV, MutAnyOrigin],
+    geoms: TileTensor[DTYPE, L_GEOMS, MutAnyOrigin],
+    mesh_uv: TileTensor[DTYPE, L_UV, MutAnyOrigin],
     g: Int,
     tri: Int,
     bu: Scalar[DTYPE],
@@ -532,28 +532,28 @@ def geom_uv[
 def shade_lights[
     DTYPE: DType,
     SHADOWS: Bool,
-    L_LIGHTS: Layout,
-    L_GEOMS: Layout,
-    L_BODIES: Layout,
-    L_XPOS: Layout,
-    L_XQUAT: Layout,
-    L_MESH_META: Layout,
-    L_TRI: Layout,
-    L_HF_META: Layout,
-    L_HF: Layout,
+    L_LIGHTS: TensorLayout,
+    L_GEOMS: TensorLayout,
+    L_BODIES: TensorLayout,
+    L_XPOS: TensorLayout,
+    L_XQUAT: TensorLayout,
+    L_MESH_META: TensorLayout,
+    L_TRI: TensorLayout,
+    L_HF_META: TensorLayout,
+    L_HF: TensorLayout,
 ](
-    lights: LayoutTensor[DTYPE, L_LIGHTS, MutAnyOrigin],
+    lights: TileTensor[DTYPE, L_LIGHTS, MutAnyOrigin],
     nlight: Int,
-    geoms: LayoutTensor[DTYPE, L_GEOMS, MutAnyOrigin],
+    geoms: TileTensor[DTYPE, L_GEOMS, MutAnyOrigin],
     ngeom: Int,
-    bodies: LayoutTensor[DTYPE, L_BODIES, MutAnyOrigin],
-    xpos: LayoutTensor[DTYPE, L_XPOS, MutAnyOrigin],
-    xquat: LayoutTensor[DTYPE, L_XQUAT, MutAnyOrigin],
+    bodies: TileTensor[DTYPE, L_BODIES, MutAnyOrigin],
+    xpos: TileTensor[DTYPE, L_XPOS, MutAnyOrigin],
+    xquat: TileTensor[DTYPE, L_XQUAT, MutAnyOrigin],
     env: Int,
-    mesh_meta: LayoutTensor[DTYPE, L_MESH_META, MutAnyOrigin],
-    mesh_tris: LayoutTensor[DTYPE, L_TRI, MutAnyOrigin],
-    hfield_meta: LayoutTensor[DTYPE, L_HF_META, MutAnyOrigin],
-    hfield_data: LayoutTensor[DTYPE, L_HF, MutAnyOrigin],
+    mesh_meta: TileTensor[DTYPE, L_MESH_META, MutAnyOrigin],
+    mesh_tris: TileTensor[DTYPE, L_TRI, MutAnyOrigin],
+    hfield_meta: TileTensor[DTYPE, L_HF_META, MutAnyOrigin],
+    hfield_data: TileTensor[DTYPE, L_HF, MutAnyOrigin],
     hf_stride: Int,
     point: Vec3Generic[DTYPE],
     normal: Vec3Generic[DTYPE],

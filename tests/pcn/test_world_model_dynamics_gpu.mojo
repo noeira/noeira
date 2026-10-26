@@ -22,7 +22,7 @@ from max.gpu.host import DeviceContext
 from std.math import sqrt, log, cos, pi
 from std.random.philox import Random as PhiloxRandom
 from std.time import perf_counter_ns
-from layout import Layout, LayoutTensor
+from noeira.core.tiles import Tile, tile
 
 from noeira.nn.constants import DT as dtype
 from noeira.experimental.pcn.pc_constants import TPB
@@ -75,10 +75,10 @@ def _set_action_target_kernel[
     DATA_DIM: Int,
     KDT: DType,
 ](
-    actions_slice: LayoutTensor[KDT, Layout.row_major(BATCH), MutAnyOrigin],
-    states_slice: LayoutTensor[KDT, Layout.row_major(BATCH), MutAnyOrigin],
-    x_in: LayoutTensor[KDT, Layout.row_major(BATCH, AUG_DIM), MutAnyOrigin],
-    y_tgt: LayoutTensor[KDT, Layout.row_major(BATCH, DATA_DIM), MutAnyOrigin],
+    actions_slice: Tile[KDT, BATCH],
+    states_slice: Tile[KDT, BATCH],
+    x_in: Tile[KDT, BATCH, AUG_DIM],
+    y_tgt: Tile[KDT, BATCH, DATA_DIM],
 ):
     var b = Int(block_dim.x * block_idx.x + thread_idx.x)
     if b >= BATCH:
@@ -94,10 +94,8 @@ def _set_prev_hidden_kernel[
     LATENT_DIM: Int,
     KDT: DType,
 ](
-    latents: LayoutTensor[
-        KDT, Layout.row_major(BATCH, LATENT_DIM), MutAnyOrigin
-    ],
-    x_in: LayoutTensor[KDT, Layout.row_major(BATCH, AUG_DIM), MutAnyOrigin],
+    latents: Tile[KDT, BATCH, LATENT_DIM],
+    x_in: Tile[KDT, BATCH, AUG_DIM],
 ):
     var idx = Int(block_dim.x * block_idx.x + thread_idx.x)
     if idx >= BATCH * HIDDEN:
@@ -113,7 +111,7 @@ def _set_action_eval_kernel[
     HIDDEN: Int,
     KDT: DType,
 ](
-    x_in: LayoutTensor[KDT, Layout.row_major(BATCH, AUG_DIM), MutAnyOrigin],
+    x_in: Tile[KDT, BATCH, AUG_DIM],
     action_value: Scalar[KDT],
 ):
     """Set x_in[:, HIDDEN] = action_value for all batch elements (broadcast)."""
@@ -127,7 +125,7 @@ def _zero_x_in_kernel[
     BATCH: Int,
     AUG_DIM: Int,
     KDT: DType,
-](x_in: LayoutTensor[KDT, Layout.row_major(BATCH, AUG_DIM), MutAnyOrigin],):
+](x_in: Tile[KDT, BATCH, AUG_DIM],):
     var idx = Int(block_dim.x * block_idx.x + thread_idx.x)
     if idx >= BATCH * AUG_DIM:
         return
@@ -189,9 +187,7 @@ def main() raises:
     var params_init_host = ctx.enqueue_create_host_buffer[dtype](NET.PARAM_SIZE)
     for i in range(NET.PARAM_SIZE):
         params_init_host.unsafe_ptr()[i] = Scalar[dtype](0)
-    var params_init_t = LayoutTensor[
-        dtype, Layout.row_major(NET.PARAM_SIZE), MutAnyOrigin
-    ](params_init_host.unsafe_ptr().as_unsafe_any_origin())
+    var params_init_t = tile[NET.PARAM_SIZE](params_init_host.unsafe_ptr().as_unsafe_any_origin())
     NET.pc_init_params[PCXavier, dtype](params_init_t)
 
     var params_dbuf = ctx.enqueue_create_buffer[dtype](NET.PARAM_SIZE)
@@ -214,36 +210,16 @@ def main() raises:
     var x_in_dbuf = ctx.enqueue_create_buffer[dtype](BATCH * AUG_DIM)
     var y_tgt_dbuf = ctx.enqueue_create_buffer[dtype](BATCH * DATA_DIM)
 
-    var params_t = LayoutTensor[
-        dtype, Layout.row_major(NET.PARAM_SIZE), MutAnyOrigin
-    ](params_dbuf)
-    var grads_t = LayoutTensor[
-        dtype, Layout.row_major(NET.PARAM_SIZE), MutAnyOrigin
-    ](grads_dbuf)
-    var lat_t = LayoutTensor[
-        dtype, Layout.row_major(BATCH, NET.LATENT_DIM), MutAnyOrigin
-    ](lat_dbuf)
-    var mu_eps_t = LayoutTensor[
-        dtype, Layout.row_major(BATCH, NET.SCRATCH_OUT_DIM), MutAnyOrigin
-    ](mu_eps_dbuf)
-    var a_below_t = LayoutTensor[
-        dtype, Layout.row_major(BATCH, NET.SCRATCH_IN_DIM), MutAnyOrigin
-    ](a_below_dbuf)
-    var z_below_t = LayoutTensor[
-        dtype, Layout.row_major(BATCH, NET.SCRATCH_IN_DIM), MutAnyOrigin
-    ](z_below_dbuf)
-    var dx_t = LayoutTensor[
-        dtype, Layout.row_major(BATCH, NET.LATENT_DIM), MutAnyOrigin
-    ](dx_dbuf)
-    var noise_t = LayoutTensor[
-        dtype, Layout.row_major(BATCH, NET.LATENT_DIM), MutAnyOrigin
-    ](noise_dbuf)
-    var x_in_t = LayoutTensor[
-        dtype, Layout.row_major(BATCH, AUG_DIM), MutAnyOrigin
-    ](x_in_dbuf)
-    var y_tgt_t = LayoutTensor[
-        dtype, Layout.row_major(BATCH, DATA_DIM), MutAnyOrigin
-    ](y_tgt_dbuf)
+    var params_t = tile[NET.PARAM_SIZE](params_dbuf)
+    var grads_t = tile[NET.PARAM_SIZE](grads_dbuf)
+    var lat_t = tile[BATCH, NET.LATENT_DIM](lat_dbuf)
+    var mu_eps_t = tile[BATCH, NET.SCRATCH_OUT_DIM](mu_eps_dbuf)
+    var a_below_t = tile[BATCH, NET.SCRATCH_IN_DIM](a_below_dbuf)
+    var z_below_t = tile[BATCH, NET.SCRATCH_IN_DIM](z_below_dbuf)
+    var dx_t = tile[BATCH, NET.LATENT_DIM](dx_dbuf)
+    var noise_t = tile[BATCH, NET.LATENT_DIM](noise_dbuf)
+    var x_in_t = tile[BATCH, AUG_DIM](x_in_dbuf)
+    var y_tgt_t = tile[BATCH, DATA_DIM](y_tgt_dbuf)
 
     # Adam state on GPU
     var opt_state_dbuf = ctx.enqueue_create_buffer[dtype](
@@ -265,14 +241,8 @@ def main() raises:
     opt_global_init.unsafe_ptr()[1] = Scalar[dtype](1.0)
     ctx.enqueue_copy(opt_global_dbuf, opt_global_init)
 
-    var opt_state_t = LayoutTensor[
-        dtype,
-        Layout.row_major(NET.PARAM_SIZE, OPT.STATE_PER_PARAM),
-        MutAnyOrigin,
-    ](opt_state_dbuf)
-    var opt_global_t = LayoutTensor[
-        dtype, Layout.row_major(OPT.GLOBAL_STATE_SIZE), MutAnyOrigin
-    ](opt_global_dbuf)
+    var opt_state_t = tile[NET.PARAM_SIZE, OPT.STATE_PER_PARAM](opt_state_dbuf)
+    var opt_global_t = tile[OPT.GLOBAL_STATE_SIZE](opt_global_dbuf)
 
     # Per-batch rollout buffers (column-major time, contiguous per-step slice).
     var actions_host = ctx.enqueue_create_host_buffer[dtype](SEQ_LEN * BATCH)
@@ -329,12 +299,8 @@ def main() raises:
             )
 
             for t in range(1, SEQ_LEN + 1):
-                var actions_slice = LayoutTensor[
-                    dtype, Layout.row_major(BATCH), MutAnyOrigin
-                ](actions_dbuf.unsafe_ptr().as_unsafe_any_origin() + (t - 1) * BATCH)
-                var states_slice = LayoutTensor[
-                    dtype, Layout.row_major(BATCH), MutAnyOrigin
-                ](states_dbuf.unsafe_ptr().as_unsafe_any_origin() + t * BATCH)
+                var actions_slice = tile[BATCH](actions_dbuf.unsafe_ptr().as_unsafe_any_origin() + (t - 1) * BATCH)
+                var states_slice = tile[BATCH](states_dbuf.unsafe_ptr().as_unsafe_any_origin() + t * BATCH)
 
                 comptime sat_k = _set_action_target_kernel[
                     BATCH, AUG_DIM, HIDDEN, DATA_DIM, dtype
@@ -464,39 +430,15 @@ def main() raises:
         EVAL_BATCH * DATA_DIM
     )
 
-    var eval_lat_t = LayoutTensor[
-        dtype, Layout.row_major(EVAL_BATCH, NET.LATENT_DIM), MutAnyOrigin
-    ](eval_lat_dbuf)
-    var eval_mu_eps_t = LayoutTensor[
-        dtype,
-        Layout.row_major(EVAL_BATCH, NET.SCRATCH_OUT_DIM),
-        MutAnyOrigin,
-    ](eval_mu_eps_dbuf)
-    var eval_a_below_t = LayoutTensor[
-        dtype,
-        Layout.row_major(EVAL_BATCH, NET.SCRATCH_IN_DIM),
-        MutAnyOrigin,
-    ](eval_a_below_dbuf)
-    var eval_z_below_t = LayoutTensor[
-        dtype,
-        Layout.row_major(EVAL_BATCH, NET.SCRATCH_IN_DIM),
-        MutAnyOrigin,
-    ](eval_z_below_dbuf)
-    var eval_dx_t = LayoutTensor[
-        dtype, Layout.row_major(EVAL_BATCH, NET.LATENT_DIM), MutAnyOrigin
-    ](eval_dx_dbuf)
-    var eval_noise_t = LayoutTensor[
-        dtype, Layout.row_major(EVAL_BATCH, NET.LATENT_DIM), MutAnyOrigin
-    ](eval_noise_dbuf)
-    var eval_x_in_t = LayoutTensor[
-        dtype, Layout.row_major(EVAL_BATCH, AUG_DIM), MutAnyOrigin
-    ](eval_x_in_dbuf)
-    var eval_y_dummy_t = LayoutTensor[
-        dtype, Layout.row_major(EVAL_BATCH, DATA_DIM), MutAnyOrigin
-    ](eval_y_dummy_dbuf)
-    var eval_sample_t = LayoutTensor[
-        dtype, Layout.row_major(EVAL_BATCH, DATA_DIM), MutAnyOrigin
-    ](eval_sample_dbuf)
+    var eval_lat_t = tile[EVAL_BATCH, NET.LATENT_DIM](eval_lat_dbuf)
+    var eval_mu_eps_t = tile[EVAL_BATCH, NET.SCRATCH_OUT_DIM](eval_mu_eps_dbuf)
+    var eval_a_below_t = tile[EVAL_BATCH, NET.SCRATCH_IN_DIM](eval_a_below_dbuf)
+    var eval_z_below_t = tile[EVAL_BATCH, NET.SCRATCH_IN_DIM](eval_z_below_dbuf)
+    var eval_dx_t = tile[EVAL_BATCH, NET.LATENT_DIM](eval_dx_dbuf)
+    var eval_noise_t = tile[EVAL_BATCH, NET.LATENT_DIM](eval_noise_dbuf)
+    var eval_x_in_t = tile[EVAL_BATCH, AUG_DIM](eval_x_in_dbuf)
+    var eval_y_dummy_t = tile[EVAL_BATCH, DATA_DIM](eval_y_dummy_dbuf)
+    var eval_sample_t = tile[EVAL_BATCH, DATA_DIM](eval_sample_dbuf)
 
     # Zero eval_x_in to start
     comptime zero_k_eval = _zero_x_in_kernel[EVAL_BATCH, AUG_DIM, dtype]

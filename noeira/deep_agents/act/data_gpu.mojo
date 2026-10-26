@@ -47,7 +47,6 @@ from max.gpu import global_idx, thread_idx
 from std.memory import Pointer
 from std.random.philox import Random as PhiloxRandom
 from max.gpu.host import DeviceContext
-from layout import Layout, LayoutTensor
 
 from noeira.nn.constants import DT, TPB
 from noeira.nn.core.ptr import mptr
@@ -72,6 +71,7 @@ from .config import (
     IMAGENET_STD_G,
     IMAGENET_STD_B,
 )
+from noeira.core.tiles import Tile
 
 comptime U8 = DType.uint8
 comptime I32 = DType.int32
@@ -89,14 +89,14 @@ comptime UPLOAD_CHUNK_ROWS = 64
 def _act_draw_kernel[
     B: Int, K: Int
 ](
-    g: LayoutTensor[I32, Layout.row_major(B), MutAnyOrigin],
-    n_real: LayoutTensor[I32, Layout.row_major(B), MutAnyOrigin],
-    eps: LayoutTensor[I32, Layout.row_major(B), MutAnyOrigin],
-    ep_start: LayoutTensor[I32, Layout.row_major(B), MutAnyOrigin],
-    ep_len: LayoutTensor[I32, Layout.row_major(B), MutAnyOrigin],
+    g: Tile[I32, B],
+    n_real: Tile[I32, B],
+    eps: Tile[I32, B],
+    ep_start: Tile[I32, B],
+    ep_len: Tile[I32, B],
     n_split: Int32,
     seed: UInt64,
-    offset_buf: LayoutTensor[U64, Layout.row_major(1), MutAnyOrigin],
+    offset_buf: Tile[U64, 1],
 ):
     """Thread `b` picks an episode from the split, then a start step in it.
 
@@ -145,7 +145,7 @@ def _act_draw_kernel[
 
 def _act_advance_offset_kernel[
     B: Int
-](offset: LayoutTensor[U64, Layout.row_major(1), MutAnyOrigin]):
+](offset: Tile[U64, 1]):
     """Bump the RNG offset by the 2 draws per row this batch consumed."""
     if Int(thread_idx.x) == 0:
         offset[0] = offset[0] + UInt64(B * 2)
@@ -158,8 +158,8 @@ def _act_gather_images_kernel[
     B: Int, IMG_ELEMS: Int, CAM_ELEMS: Int, HW: Int
 ](
     src: Pointer[Scalar[U8], MutAnyOrigin],
-    g: LayoutTensor[I32, Layout.row_major(B), MutAnyOrigin],
-    out_img: LayoutTensor[DT, Layout.row_major(B * IMG_ELEMS), MutAnyOrigin],
+    g: Tile[I32, B],
+    out_img: Tile[DT, B * IMG_ELEMS],
     n_rows: Int64,
 ):
     """`out[b, e] = (src[g[b], e]/255 - mean_ch) * inv_std_ch`.
@@ -207,9 +207,9 @@ def _act_gather_images_kernel[
 def _act_aug_draw_kernel[
     B: Int, N_CAM: Int, IMG_H: Int, IMG_W: Int
 ](
-    params: LayoutTensor[DT, Layout.row_major(B * N_CAM * AUG_WORDS), MutAnyOrigin],
+    params: Tile[DT, B * N_CAM * AUG_WORDS],
     seed: UInt64,
-    offset_buf: LayoutTensor[U64, Layout.row_major(1), MutAnyOrigin],
+    offset_buf: Tile[U64, 1],
     brightness: Float32,
     contrast: Float32,
     gamma: Float32,
@@ -251,11 +251,9 @@ def _act_gather_images_aug_kernel[
     B: Int, N_CAM: Int, IMG_H: Int, IMG_W: Int
 ](
     src: Pointer[Scalar[U8], MutAnyOrigin],
-    g: LayoutTensor[I32, Layout.row_major(B), MutAnyOrigin],
-    params: LayoutTensor[DT, Layout.row_major(B * N_CAM * AUG_WORDS), MutAnyOrigin],
-    out_img: LayoutTensor[
-        DT, Layout.row_major(B * N_CAM * 3 * IMG_H * IMG_W), MutAnyOrigin
-    ],
+    g: Tile[I32, B],
+    params: Tile[DT, B * N_CAM * AUG_WORDS],
+    out_img: Tile[DT, B * N_CAM * 3 * IMG_H * IMG_W],
     n_rows: Int64,
 ):
     """`_act_gather_images_kernel` with the augmented byte in place of the
@@ -304,11 +302,11 @@ def _act_gather_images_aug_kernel[
 def _act_gather_qpos_kernel[
     B: Int, QPOS: Int
 ](
-    src: LayoutTensor[DT, Layout.row_major(1), MutAnyOrigin],
-    g: LayoutTensor[I32, Layout.row_major(B), MutAnyOrigin],
-    mean: LayoutTensor[DT, Layout.row_major(QPOS), MutAnyOrigin],
-    std: LayoutTensor[DT, Layout.row_major(QPOS), MutAnyOrigin],
-    out_q: LayoutTensor[DT, Layout.row_major(B * QPOS), MutAnyOrigin],
+    src: Tile[DT, 1],
+    g: Tile[I32, B],
+    mean: Tile[DT, QPOS],
+    std: Tile[DT, QPOS],
+    out_q: Tile[DT, B * QPOS],
 ):
     var i = Int(global_idx.x)
     if i >= B * QPOS:
@@ -324,13 +322,13 @@ def _act_gather_qpos_kernel[
 def _act_gather_actions_kernel[
     B: Int, K: Int, ADIM: Int
 ](
-    src: LayoutTensor[DT, Layout.row_major(1), MutAnyOrigin],
-    g: LayoutTensor[I32, Layout.row_major(B), MutAnyOrigin],
-    n_real: LayoutTensor[I32, Layout.row_major(B), MutAnyOrigin],
-    mean: LayoutTensor[DT, Layout.row_major(ADIM), MutAnyOrigin],
-    std: LayoutTensor[DT, Layout.row_major(ADIM), MutAnyOrigin],
-    out_a: LayoutTensor[DT, Layout.row_major(B * K * ADIM), MutAnyOrigin],
-    out_v: LayoutTensor[DT, Layout.row_major(B * K), MutAnyOrigin],
+    src: Tile[DT, 1],
+    g: Tile[I32, B],
+    n_real: Tile[I32, B],
+    mean: Tile[DT, ADIM],
+    std: Tile[DT, ADIM],
+    out_a: Tile[DT, B * K * ADIM],
+    out_v: Tile[DT, B * K],
     n_rows: Int64,
 ):
     """Actions `[g, g+K)`, padded past the episode end.
@@ -559,16 +557,14 @@ struct ACTDeviceDataset[
         """Draw + gather a batch. NO host work, NO H2D, NO synchronization."""
         comptime nb = (B + TPB - 1) // TPB
         ctx.enqueue_function[_act_draw_kernel[B, K]](
-            self.g.lt["gpu", Layout.row_major(B)](),
-            self.n_real.lt["gpu", Layout.row_major(B)](),
-            (self.val_eps if val else self.train_eps).lt[
-                "gpu", Layout.row_major(B)
-            ](),
-            self.ep_start.lt["gpu", Layout.row_major(B)](),
-            self.ep_len.lt["gpu", Layout.row_major(B)](),
+            self.g.tt["gpu", B](),
+            self.n_real.tt["gpu", B](),
+            (self.val_eps if val else self.train_eps).tt["gpu", B](),
+            self.ep_start.tt["gpu", B](),
+            self.ep_len.tt["gpu", B](),
             Int32(self.n_val if val else self.n_train),
             self.seed,
-            self.rng_offset.lt["gpu", Layout.row_major(1)](),
+            self.rng_offset.tt["gpu", 1](),
             grid_dim=nb,
             block_dim=TPB,
         )
@@ -578,11 +574,9 @@ struct ACTDeviceDataset[
             ctx.enqueue_function[
                 _act_aug_draw_kernel[B, Self.N_CAM, Self.IMG_H, Self.IMG_W]
             ](
-                self.aug_params.lt[
-                    "gpu", Layout.row_major(B * Self.N_CAM * AUG_WORDS)
-                ](),
+                self.aug_params.tt["gpu", B * Self.N_CAM * AUG_WORDS](),
                 self.seed,
-                self.rng_offset.lt["gpu", Layout.row_major(1)](),
+                self.rng_offset.tt["gpu", 1](),
                 self.aug.brightness,
                 self.aug.contrast,
                 self.aug.gamma,
@@ -595,7 +589,7 @@ struct ACTDeviceDataset[
                 block_dim=TPB,
             )
         ctx.enqueue_function[_act_advance_offset_kernel[B]](
-            self.rng_offset.lt["gpu", Layout.row_major(1)](),
+            self.rng_offset.tt["gpu", 1](),
             grid_dim=1,
             block_dim=1,
         )
@@ -709,11 +703,9 @@ struct ACTDeviceDataset[
                 ]
             ](
                 self.images_u8.dev.value(),
-                self.g.lt["gpu", Layout.row_major(B)](),
-                self.aug_params.lt[
-                    "gpu", Layout.row_major(B * Self.N_CAM * AUG_WORDS)
-                ](),
-                out_images.lt["gpu", Layout.row_major(B * Self.IMG_ELEMS)](),
+                self.g.tt["gpu", B](),
+                self.aug_params.tt["gpu", B * Self.N_CAM * AUG_WORDS](),
+                out_images.tt["gpu", B * Self.IMG_ELEMS](),
                 Int64(self.n_rows),
                 grid_dim=nimg,
                 block_dim=TPB,
@@ -725,31 +717,31 @@ struct ACTDeviceDataset[
                 ]
             ](
                 self.images_u8.dev.value(),
-                self.g.lt["gpu", Layout.row_major(B)](),
-                out_images.lt["gpu", Layout.row_major(B * Self.IMG_ELEMS)](),
+                self.g.tt["gpu", B](),
+                out_images.tt["gpu", B * Self.IMG_ELEMS](),
                 Int64(self.n_rows),
                 grid_dim=nimg,
                 block_dim=TPB,
             )
         comptime nq = (B * Self.QPOS + TPB - 1) // TPB
         ctx.enqueue_function[_act_gather_qpos_kernel[B, Self.QPOS]](
-            self.qpos_raw.lt["gpu", Layout.row_major(1)](),
-            self.g.lt["gpu", Layout.row_major(B)](),
-            self.qpos_mean.lt["gpu", Layout.row_major(Self.QPOS)](),
-            self.qpos_std.lt["gpu", Layout.row_major(Self.QPOS)](),
-            out_qpos.lt["gpu", Layout.row_major(B * Self.QPOS)](),
+            self.qpos_raw.tt["gpu", 1](),
+            self.g.tt["gpu", B](),
+            self.qpos_mean.tt["gpu", Self.QPOS](),
+            self.qpos_std.tt["gpu", Self.QPOS](),
+            out_qpos.tt["gpu", B * Self.QPOS](),
             grid_dim=nq,
             block_dim=TPB,
         )
         comptime na = (B * K * Self.ADIM + TPB - 1) // TPB
         ctx.enqueue_function[_act_gather_actions_kernel[B, K, Self.ADIM]](
-            self.action_raw.lt["gpu", Layout.row_major(1)](),
-            self.g.lt["gpu", Layout.row_major(B)](),
-            self.n_real.lt["gpu", Layout.row_major(B)](),
-            self.action_mean.lt["gpu", Layout.row_major(Self.ADIM)](),
-            self.action_std.lt["gpu", Layout.row_major(Self.ADIM)](),
-            out_actions.lt["gpu", Layout.row_major(B * K * Self.ADIM)](),
-            out_valid.lt["gpu", Layout.row_major(B * K)](),
+            self.action_raw.tt["gpu", 1](),
+            self.g.tt["gpu", B](),
+            self.n_real.tt["gpu", B](),
+            self.action_mean.tt["gpu", Self.ADIM](),
+            self.action_std.tt["gpu", Self.ADIM](),
+            out_actions.tt["gpu", B * K * Self.ADIM](),
+            out_valid.tt["gpu", B * K](),
             Int64(self.n_rows),
             grid_dim=na,
             block_dim=TPB,

@@ -61,7 +61,6 @@ only the position pipeline it does read — forward kinematics, `subtree_com`,
 
 from std.math import sqrt
 from std.collections import Array
-from layout import Layout, LayoutTensor
 
 from noeira.nn.core.tensor import TensorImpl
 
@@ -253,18 +252,18 @@ def qpos_from_site_pose[
     var rl_SITE = rl2(dm.get_nsite(), MODEL_SITE_SIZE)
     var rl_SX = rl2(1, dm.get_nsite() * 3)
 
-    var joints_v = mf.joints.lt_dyn["cpu", DYN2](rl_JNT)
-    var bodies_v = mf.bodies.lt_dyn["cpu", DYN2](rl_BOD)
-    var sites_v = mf.sites.lt_dyn["cpu", DYN2](rl_SITE)
-    var mmeta_v = mf.meta.lt_dyn["cpu", DYN1](rl_MET)
-    var qpos_v = d.qpos.lt_dyn["cpu", DYN2](rl_QPOS)
+    var joints_v = mf.joints.tt_dyn["cpu", DYN2](rl_JNT)
+    var bodies_v = mf.bodies.tt_dyn["cpu", DYN2](rl_BOD)
+    var sites_v = mf.sites.tt_dyn["cpu", DYN2](rl_SITE)
+    var mmeta_v = mf.meta.tt_dyn["cpu", DYN1](rl_MET)
+    var qpos_v = d.qpos.tt_dyn["cpu", DYN2](rl_QPOS)
 
     var scratch = DynamicsScratch[DTYPE, D, 1]()
     # ⚠ Its own buffer, NOT a borrowed `Data` field. `d.qacc`/`d.qvel` would
     # have done the job and silently clobbered a physics output that the
     # caller has every reason to expect IK left alone.
     var update_t = TensorImpl[DTYPE].alloc(nv)
-    var update_nv = update_t.lt_dyn["cpu", DYN2](rl_NV)
+    var update_nv = update_t.tt_dyn["cpu", DYN2](rl_NV)
 
     var site_body = Int(rebind[Scalar[DTYPE]](sites_v[site, SITE_IDX_BODY]))
 
@@ -350,9 +349,9 @@ def qpos_from_site_pose[
 
         compute_subtree_com["cpu"](d, mf)
         compute_cdof["cpu"](d, mf, scratch)
-        var subtree_v = d.subtree_com.lt_dyn["cpu", DYN2](rl_NB3)
-        var cdof_v = scratch.cdof.lt_dyn["cpu", DYN2](rl_CDOF)
-        var sxpos_v = d.site_xpos.lt_dyn["cpu", DYN2](rl_SX)
+        var subtree_v = d.subtree_com.tt_dyn["cpu", DYN2](rl_NB3)
+        var cdof_v = scratch.cdof.tt_dyn["cpu", DYN2](rl_CDOF)
+        var sxpos_v = d.site_xpos.tt_dyn["cpu", DYN2](rl_SX)
         jac_site[DTYPE, cap[D.NV]()](
             0, subtree_v, joints_v, bodies_v, mmeta_v, cdof_v,
             sites_v, sxpos_v, site, jp, jr, nv,

@@ -422,7 +422,9 @@ struct ChatClient(Movable):
 
     def extra(mut self, var key: String, var json_value: String) raises:
         """Add a top-level request field this client does not model — the
-        provider-specific knobs. `json_value` is JSON text, spliced as is:
+        provider-specific knobs.
+
+        `json_value` is JSON text, spliced as is:
 
             llm.extra("reasoning_effort", '"low"')              # OpenAI-style
             llm.extra("chat_template_kwargs", '{"enable_thinking": false}')
@@ -733,7 +735,7 @@ struct ChatClient(Movable):
         var msgs = List[ChatMessage]()
         msgs.append(ChatMessage.user(prompt^))
         var r = self.chat(msgs, system)
-        return r.text^
+        return r.text.copy()
 
 
 # ═══════════════════════════════════════════════════════════════════════════

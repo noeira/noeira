@@ -5,8 +5,8 @@ They implement both CPU and GPU execution paths following the nn pattern.
 """
 
 from ..constants import dtype, BODY_STATE_SIZE
-from layout import LayoutTensor, Layout
 from max.gpu.host import DeviceContext, DeviceBuffer
+from noeira.core.tiles import Tile
 
 
 trait Integrator(ImplicitlyCopyable):
@@ -35,14 +35,8 @@ trait Integrator(ImplicitlyCopyable):
         NUM_BODIES: Int,
     ](
         self,
-        mut bodies: LayoutTensor[
-            dtype,
-            Layout.row_major(BATCH, NUM_BODIES, BODY_STATE_SIZE),
-            MutAnyOrigin,
-        ],
-        forces: LayoutTensor[
-            dtype, Layout.row_major(BATCH, NUM_BODIES, 3), MutAnyOrigin
-        ],
+        bodies: Tile[dtype, BATCH, NUM_BODIES, BODY_STATE_SIZE],
+        forces: Tile[dtype, BATCH, NUM_BODIES, 3],
         gravity_x: Scalar[dtype],
         gravity_y: Scalar[dtype],
         dt: Scalar[dtype],
@@ -63,11 +57,7 @@ trait Integrator(ImplicitlyCopyable):
         NUM_BODIES: Int,
     ](
         self,
-        mut bodies: LayoutTensor[
-            dtype,
-            Layout.row_major(BATCH, NUM_BODIES, BODY_STATE_SIZE),
-            MutAnyOrigin,
-        ],
+        bodies: Tile[dtype, BATCH, NUM_BODIES, BODY_STATE_SIZE],
         dt: Scalar[dtype],
     ):
         """Integrate positions: x' = x + v' * dt.

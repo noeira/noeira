@@ -16,16 +16,17 @@ observation — host and device, shared by the vectorised PPO drivers
 Held against each other by `tests/tasks/test_ppo_family_device_kernels.mojo`.
 """
 
-from layout import Layout, LayoutTensor
 from max.gpu import global_idx
 from max.gpu.host import DeviceContext
 from std.math import sqrt, sqrt as fsqrt
 
 from noeira.nn.constants import DT, TPB
 from noeira.nn.core.tensor import Tensor
+from noeira.core.tiles import Tile
+from noeira.io.fileio import write_text_atomic
 
 
-comptime _V[n: Int] = LayoutTensor[DT, Layout.row_major(n), MutAnyOrigin]
+comptime _V[n: Int] = Tile[DT, n]
 
 
 struct RunningMeanStd(Movable):
@@ -96,7 +97,7 @@ struct RunningMeanStd(Movable):
                 dst[unsafe_offset = i * dim + k] = Scalar[DT](v)
 
     def load(mut self, path: String) raises:
-        var txt = String()
+        var txt: String
         with open(path, "r") as f:
             txt = f.read()
         var lines = txt.split("\n")
@@ -116,8 +117,7 @@ struct RunningMeanStd(Movable):
         for k in range(len(self.var_)):
             s += " " + String(self.var_[k])
         s += "\n"
-        with open(path, "w") as f:
-            f.write(s)
+        write_text_atomic(path, s)
 
 
 
@@ -262,18 +262,18 @@ def update_rms_device[N: Int, D: Int](
     the shared count."""
     var us = Int32(1) if use_skip else Int32(0)
     ctx.enqueue_function[_rms_update_k[N, D]](
-        x.lt["gpu", Layout.row_major(N * D)](),
-        skip.lt["gpu", Layout.row_major(N)](),
+        x.tt["gpu", N * D](),
+        skip.tt["gpu", N](),
         us,
-        mean.lt["gpu", Layout.row_major(D)](),
-        var_.lt["gpu", Layout.row_major(D)](),
-        count.lt["gpu", Layout.row_major(1)](),
+        mean.tt["gpu", D](),
+        var_.tt["gpu", D](),
+        count.tt["gpu", 1](),
         grid_dim=(D + TPB - 1) // TPB, block_dim=TPB,
     )
     ctx.enqueue_function[_rms_count_k[N]](
-        skip.lt["gpu", Layout.row_major(N)](),
+        skip.tt["gpu", N](),
         us,
-        count.lt["gpu", Layout.row_major(1)](),
+        count.tt["gpu", 1](),
         grid_dim=1, block_dim=1,
     )
 
@@ -291,12 +291,12 @@ def normalize_device[N: Int, D: Int](
     """`RunningMeanStd.normalize_into` on the device (`zero_rows`: the rows
     flagged in `zero` written as 0)."""
     ctx.enqueue_function[_rms_normalize_k[N, D]](
-        src.lt["gpu", Layout.row_major(N * D)](),
-        dst.lt["gpu", Layout.row_major(N * D)](),
-        mean.lt["gpu", Layout.row_major(D)](),
-        var_.lt["gpu", Layout.row_major(D)](),
+        src.tt["gpu", N * D](),
+        dst.tt["gpu", N * D](),
+        mean.tt["gpu", D](),
+        var_.tt["gpu", D](),
         Scalar[DT](clip),
-        zero.lt["gpu", Layout.row_major(N)](),
+        zero.tt["gpu", N](),
         Int32(1) if zero_rows else Int32(0),
         grid_dim=(N * D + TPB - 1) // TPB, block_dim=TPB,
     )

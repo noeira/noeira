@@ -34,7 +34,6 @@ Example:
     ```
 """
 
-from layout import LayoutTensor, Layout
 
 from .joints.revolute import RevoluteJointSolver
 from .constants import (
@@ -124,9 +123,7 @@ struct PhysicsState[
         BATCH: Int
     ](
         self,
-        states: LayoutTensor[
-            dtype, Layout.row_major(BATCH, Self.STATE_SIZE), MutAnyOrigin
-        ],
+        states: Tile[dtype, BATCH, Self.STATE_SIZE],
         body: Int,
         x: Float64,
         y: Float64,
@@ -141,9 +138,7 @@ struct PhysicsState[
         BATCH: Int
     ](
         self,
-        states: LayoutTensor[
-            dtype, Layout.row_major(BATCH, Self.STATE_SIZE), MutAnyOrigin
-        ],
+        states: Tile[dtype, BATCH, Self.STATE_SIZE],
         body: Int,
         angle: Float64,
     ):
@@ -156,9 +151,7 @@ struct PhysicsState[
         BATCH: Int
     ](
         self,
-        states: LayoutTensor[
-            dtype, Layout.row_major(BATCH, Self.STATE_SIZE), MutAnyOrigin
-        ],
+        states: Tile[dtype, BATCH, Self.STATE_SIZE],
         body: Int,
         vx: Float64,
         vy: Float64,
@@ -175,9 +168,7 @@ struct PhysicsState[
         BATCH: Int
     ](
         self,
-        states: LayoutTensor[
-            dtype, Layout.row_major(BATCH, Self.STATE_SIZE), MutAnyOrigin
-        ],
+        states: Tile[dtype, BATCH, Self.STATE_SIZE],
         body: Int,
         mass: Float64,
         inertia: Float64,
@@ -202,9 +193,7 @@ struct PhysicsState[
         BATCH: Int
     ](
         self,
-        states: LayoutTensor[
-            dtype, Layout.row_major(BATCH, Self.STATE_SIZE), MutAnyOrigin
-        ],
+        states: Tile[dtype, BATCH, Self.STATE_SIZE],
         body: Int,
         shape_idx: Int,
     ):
@@ -217,9 +206,7 @@ struct PhysicsState[
         BATCH: Int
     ](
         self,
-        states: LayoutTensor[
-            dtype, Layout.row_major(BATCH, Self.STATE_SIZE), MutAnyOrigin
-        ],
+        states: Tile[dtype, BATCH, Self.STATE_SIZE],
         body: Int,
     ) -> Scalar[dtype]:
         """Get body x position."""
@@ -231,9 +218,7 @@ struct PhysicsState[
         BATCH: Int
     ](
         self,
-        states: LayoutTensor[
-            dtype, Layout.row_major(BATCH, Self.STATE_SIZE), MutAnyOrigin
-        ],
+        states: Tile[dtype, BATCH, Self.STATE_SIZE],
         body: Int,
     ) -> Scalar[dtype]:
         """Get body y position."""
@@ -245,9 +230,7 @@ struct PhysicsState[
         BATCH: Int
     ](
         self,
-        states: LayoutTensor[
-            dtype, Layout.row_major(BATCH, Self.STATE_SIZE), MutAnyOrigin
-        ],
+        states: Tile[dtype, BATCH, Self.STATE_SIZE],
         body: Int,
     ) -> Scalar[dtype]:
         """Get body angle."""
@@ -259,9 +242,7 @@ struct PhysicsState[
         BATCH: Int
     ](
         self,
-        states: LayoutTensor[
-            dtype, Layout.row_major(BATCH, Self.STATE_SIZE), MutAnyOrigin
-        ],
+        states: Tile[dtype, BATCH, Self.STATE_SIZE],
         body: Int,
     ) -> Scalar[dtype]:
         """Get body x velocity."""
@@ -273,9 +254,7 @@ struct PhysicsState[
         BATCH: Int
     ](
         self,
-        states: LayoutTensor[
-            dtype, Layout.row_major(BATCH, Self.STATE_SIZE), MutAnyOrigin
-        ],
+        states: Tile[dtype, BATCH, Self.STATE_SIZE],
         body: Int,
     ) -> Scalar[dtype]:
         """Get body y velocity."""
@@ -287,9 +266,7 @@ struct PhysicsState[
         BATCH: Int
     ](
         self,
-        states: LayoutTensor[
-            dtype, Layout.row_major(BATCH, Self.STATE_SIZE), MutAnyOrigin
-        ],
+        states: Tile[dtype, BATCH, Self.STATE_SIZE],
         body: Int,
     ) -> Scalar[dtype]:
         """Get body angular velocity."""
@@ -310,9 +287,7 @@ struct PhysicsState[
         BATCH: Int
     ](
         self,
-        states: LayoutTensor[
-            dtype, Layout.row_major(BATCH, Self.STATE_SIZE), MutAnyOrigin
-        ],
+        states: Tile[dtype, BATCH, Self.STATE_SIZE],
     ):
         """Clear all forces for this environment."""
         for body in range(Self.NUM_BODIES):
@@ -326,9 +301,7 @@ struct PhysicsState[
         BATCH: Int
     ](
         self,
-        states: LayoutTensor[
-            dtype, Layout.row_major(BATCH, Self.STATE_SIZE), MutAnyOrigin
-        ],
+        states: Tile[dtype, BATCH, Self.STATE_SIZE],
         body: Int,
         fx: Float64,
         fy: Float64,
@@ -347,9 +320,7 @@ struct PhysicsState[
         BATCH: Int
     ](
         self,
-        states: LayoutTensor[
-            dtype, Layout.row_major(BATCH, Self.STATE_SIZE), MutAnyOrigin
-        ],
+        states: Tile[dtype, BATCH, Self.STATE_SIZE],
         body: Int,
         torque: Float64,
     ):
@@ -364,9 +335,7 @@ struct PhysicsState[
         BATCH: Int
     ](
         self,
-        states: LayoutTensor[
-            dtype, Layout.row_major(BATCH, Self.STATE_SIZE), MutAnyOrigin
-        ],
+        states: Tile[dtype, BATCH, Self.STATE_SIZE],
         body: Int,
         fx: Float64,
         fy: Float64,
@@ -392,9 +361,7 @@ struct PhysicsState[
         BATCH: Int
     ](
         self,
-        states: LayoutTensor[
-            dtype, Layout.row_major(BATCH, Self.STATE_SIZE), MutAnyOrigin
-        ],
+        states: Tile[dtype, BATCH, Self.STATE_SIZE],
     ) -> Int:
         """Get number of active joints."""
         return Int(states[self.env, Self.JOINT_COUNT_OFFSET])
@@ -404,9 +371,7 @@ struct PhysicsState[
         BATCH: Int
     ](
         self,
-        states: LayoutTensor[
-            dtype, Layout.row_major(BATCH, Self.STATE_SIZE), MutAnyOrigin
-        ],
+        states: Tile[dtype, BATCH, Self.STATE_SIZE],
         count: Int,
     ):
         """Set joint count."""
@@ -417,9 +382,7 @@ struct PhysicsState[
         BATCH: Int
     ](
         self,
-        states: LayoutTensor[
-            dtype, Layout.row_major(BATCH, Self.STATE_SIZE), MutAnyOrigin
-        ],
+        states: Tile[dtype, BATCH, Self.STATE_SIZE],
         body_a: Int,
         body_b: Int,
         anchor_ax: Float64,
@@ -445,11 +408,11 @@ struct PhysicsState[
         if joint_idx >= Self.MAX_JOINTS:
             return -1
 
-        var ref = Scalar[dtype](0)
+        var ref_angle = Scalar[dtype](0)
         if reference_angle:
-            ref = Scalar[dtype](reference_angle.value())
+            ref_angle = Scalar[dtype](reference_angle.value())
         else:
-            ref = self.get_body_angle[BATCH](states, body_b) - self.get_body_angle[
+            ref_angle = self.get_body_angle[BATCH](states, body_b) - self.get_body_angle[
                 BATCH
             ](states, body_a)
         RevoluteJointSolver.write_joint[BATCH, Self.STATE_SIZE](
@@ -462,7 +425,7 @@ struct PhysicsState[
             anchor_ay=Scalar[dtype](anchor_ay),
             anchor_bx=Scalar[dtype](anchor_bx),
             anchor_by=Scalar[dtype](anchor_by),
-            reference_angle=ref,
+            reference_angle=ref_angle,
             lower_limit=Scalar[dtype](lower_limit),
             upper_limit=Scalar[dtype](upper_limit),
             enable_limit=enable_limit,
@@ -481,9 +444,7 @@ struct PhysicsState[
         BATCH: Int
     ](
         self,
-        states: LayoutTensor[
-            dtype, Layout.row_major(BATCH, Self.STATE_SIZE), MutAnyOrigin
-        ],
+        states: Tile[dtype, BATCH, Self.STATE_SIZE],
     ):
         """Clear all joints for this environment."""
         for j in range(Self.MAX_JOINTS):
@@ -506,9 +467,7 @@ struct PhysicsState[
         BATCH: Int
     ](
         self,
-        states: LayoutTensor[
-            dtype, Layout.row_major(BATCH, Self.STATE_SIZE), MutAnyOrigin
-        ],
+        states: Tile[dtype, BATCH, Self.STATE_SIZE],
     ) -> Int:
         """Get number of active edges."""
         return Int(states[self.env, Self.EDGE_COUNT_OFFSET])
@@ -518,9 +477,7 @@ struct PhysicsState[
         BATCH: Int
     ](
         self,
-        states: LayoutTensor[
-            dtype, Layout.row_major(BATCH, Self.STATE_SIZE), MutAnyOrigin
-        ],
+        states: Tile[dtype, BATCH, Self.STATE_SIZE],
         count: Int,
     ):
         """Set edge count."""
@@ -531,9 +488,7 @@ struct PhysicsState[
         BATCH: Int
     ](
         self,
-        states: LayoutTensor[
-            dtype, Layout.row_major(BATCH, Self.STATE_SIZE), MutAnyOrigin
-        ],
+        states: Tile[dtype, BATCH, Self.STATE_SIZE],
         edge: Int,
         x0: Float64,
         y0: Float64,
@@ -558,6 +513,7 @@ struct PhysicsState[
 
 
 from .constants import SHAPE_POLYGON, SHAPE_MAX_SIZE, CONTACT_DATA_SIZE
+from noeira.core.tiles import Tile, tile
 
 
 struct PhysicsStateOwned[
@@ -667,99 +623,63 @@ struct PhysicsStateOwned[
     @always_inline
     def get_state_tensor(
         mut self,
-    ) -> LayoutTensor[
-        dtype, Layout.row_major(1, Self.STATE_SIZE), MutAnyOrigin
-    ]:
+    ) -> Tile[dtype, 1, Self.STATE_SIZE]:
         """Get tensor view of state (1 x STATE_SIZE for single env)."""
         # Build directly from the List (-> Span, origin inferred concrete),
         # then widened to the MutAnyOrigin return type -- no UnsafeAnyOrigin
         # hatch and no unsafe_ptr.
-        return LayoutTensor[
-            dtype, Layout.row_major(1, Self.STATE_SIZE)
-        ](self.state)
+        return tile[1, Self.STATE_SIZE](self.state)
 
     @always_inline
     def get_bodies_tensor(
         mut self,
-    ) -> LayoutTensor[
-        dtype,
-        Layout.row_major(1, Self.NUM_BODIES, BODY_STATE_SIZE),
-        MutAnyOrigin,
-    ]:
+    ) -> Tile[dtype, 1, Self.NUM_BODIES, BODY_STATE_SIZE]:
         """Get tensor view of body state (for compatibility with old code)."""
         # Bodies are at BODIES_OFFSET in the state buffer. A Span slice gives a
         # non-copying sub-view with a concrete origin -- no unsafe_ptr/hatch.
-        return LayoutTensor[
-            dtype,
-            Layout.row_major(1, Self.NUM_BODIES, BODY_STATE_SIZE),
-        ](Span(self.state)[Self.BODIES_OFFSET :])
+        return tile[1, Self.NUM_BODIES, BODY_STATE_SIZE](Span(self.state)[Self.BODIES_OFFSET :])
 
     @always_inline
     def get_shapes_tensor(
         mut self,
-    ) -> LayoutTensor[
-        dtype, Layout.row_major(Self.NUM_SHAPES, SHAPE_MAX_SIZE), MutAnyOrigin
-    ]:
+    ) -> Tile[dtype, Self.NUM_SHAPES, SHAPE_MAX_SIZE]:
         """Get tensor view of shapes."""
-        return LayoutTensor[
-            dtype,
-            Layout.row_major(Self.NUM_SHAPES, SHAPE_MAX_SIZE),
-        ](self.shapes)
+        return tile[Self.NUM_SHAPES, SHAPE_MAX_SIZE](self.shapes)
 
     @always_inline
     def get_forces_tensor(
         mut self,
-    ) -> LayoutTensor[
-        dtype, Layout.row_major(1, Self.NUM_BODIES, 3), MutAnyOrigin
-    ]:
+    ) -> Tile[dtype, 1, Self.NUM_BODIES, 3]:
         """Get tensor view of forces."""
-        return LayoutTensor[
-            dtype, Layout.row_major(1, Self.NUM_BODIES, 3)
-        ](Span(self.state)[Self.FORCES_OFFSET :])
+        return tile[1, Self.NUM_BODIES, 3](Span(self.state)[Self.FORCES_OFFSET :])
 
     @always_inline
     def get_contacts_tensor(
         mut self,
-    ) -> LayoutTensor[
-        dtype,
-        Layout.row_major(1, Self.MAX_CONTACTS, CONTACT_DATA_SIZE),
-        MutAnyOrigin,
-    ]:
+    ) -> Tile[dtype, 1, Self.MAX_CONTACTS, CONTACT_DATA_SIZE]:
         """Get tensor view of contacts."""
-        return LayoutTensor[
-            dtype,
-            Layout.row_major(1, Self.MAX_CONTACTS, CONTACT_DATA_SIZE),
-        ](self.contacts)
+        return tile[1, Self.MAX_CONTACTS, CONTACT_DATA_SIZE](self.contacts)
 
     @always_inline
     def get_contact_counts_tensor(
         mut self,
-    ) -> LayoutTensor[dtype, Layout.row_major(1), MutAnyOrigin]:
+    ) -> Tile[dtype, 1]:
         """Get tensor view of contact counts (single element for single env)."""
-        return LayoutTensor[dtype, Layout.row_major(1)](self.contact_counts)
+        return tile[1](self.contact_counts)
 
     @always_inline
     def get_joints_tensor(
         mut self,
-    ) -> LayoutTensor[
-        dtype,
-        Layout.row_major(1, Self.MAX_JOINTS, JOINT_DATA_SIZE),
-        MutAnyOrigin,
-    ]:
+    ) -> Tile[dtype, 1, Self.MAX_JOINTS, JOINT_DATA_SIZE]:
         """Get tensor view of joints."""
-        return LayoutTensor[
-            dtype,
-            Layout.row_major(1, Self.MAX_JOINTS, JOINT_DATA_SIZE),
-        ](Span(self.state)[Self.JOINTS_OFFSET :])
+        return tile[1, Self.MAX_JOINTS, JOINT_DATA_SIZE](Span(self.state)[Self.JOINTS_OFFSET :])
 
     @always_inline
     def get_joint_counts_tensor(
         mut self,
-    ) -> LayoutTensor[dtype, Layout.row_major(1), MutAnyOrigin]:
+    ) -> Tile[dtype, 1]:
         """Get tensor view of joint counts."""
-        return LayoutTensor[dtype, Layout.row_major(1)](
-            Span(self.state)[Self.JOINT_COUNT_OFFSET :]
-        )
+        return tile[1](Span(self.state)[Self.JOINT_COUNT_OFFSET :])
 
     # =========================================================================
     # Helper accessor

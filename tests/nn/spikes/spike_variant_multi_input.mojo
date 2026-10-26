@@ -27,7 +27,8 @@ Probe C: can Variant wrap distinct LayoutTensor types?
 """
 
 from std.utils import Variant
-from layout import LayoutTensor, Layout, TileTensor, TensorLayout, row_major
+from layout import TileTensor, TensorLayout, row_major
+from noeira.core.tiles import RowMajor
 
 from noeira.nn.constants import DT
 
@@ -80,10 +81,10 @@ def probe_c_layouttensor_variant() raises:
     we *can* write the concrete type."""
     print("--- Probe C: Variant[LayoutTensor[Layout1], LayoutTensor[Layout2]] ---")
 
-    comptime L1 = Layout.row_major(2, 3)
-    comptime L2 = Layout.row_major(2, 5)
-    comptime Tile1 = LayoutTensor[DT, L1, MutAnyOrigin]
-    comptime Tile2 = LayoutTensor[DT, L2, MutAnyOrigin]
+    comptime L1 = RowMajor[2, 3]
+    comptime L2 = RowMajor[2, 5]
+    comptime Tile1 = TileTensor[DT, L1, MutAnyOrigin]
+    comptime Tile2 = TileTensor[DT, L2, MutAnyOrigin]
 
     var a = List[Scalar[DT]](length=6, fill=Scalar[DT](1.0))
     var b = List[Scalar[DT]](length=10, fill=Scalar[DT](2.0))

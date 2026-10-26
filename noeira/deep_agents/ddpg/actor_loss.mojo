@@ -24,7 +24,6 @@ accumulator drained at flush (no per-step D2H — capture-friendly). Shared by T
 from max.gpu import thread_idx
 from max.gpu.primitives import block
 from max.gpu.host import DeviceContext, DeviceBuffer
-from layout import Layout, LayoutTensor
 
 from noeira.nn.constants import DT, TPB_REDUCE
 from noeira.nn.core.amp import AMPPolicy, NoAMP
@@ -37,6 +36,7 @@ from noeira.nn.primitives.scale import Scale
 from noeira.nn.combinators.compute_graph import ComputeGraph
 from noeira.nn.combinators.graph_decl import InputSlot, Node, ExternalNode
 from ..loss.loss_block import LossBlock
+from noeira.core.tiles import Tile
 
 
 # ── Device reduction (single block; grid=1, block=TPB_REDUCE) ──────────
@@ -46,8 +46,8 @@ from ..loss.loss_block import LossBlock
 def _ddpg_loss_mean_acc_kernel[
     B: Int
 ](
-    src: LayoutTensor[DT, Layout.row_major(B, 1), MutAnyOrigin],
-    acc: LayoutTensor[DT, Layout.row_major(1, 2), MutAnyOrigin],
+    src: Tile[DT, B, 1],
+    acc: Tile[DT, 1, 2],
 ):
     var t = Int(thread_idx.x)
     var my_sum: Scalar[DT] = 0.0
@@ -173,8 +173,8 @@ struct DDPGActorLoss[
         else:
             # Device-reduce -mean q into the accumulator (NO D2H).
             var c = ctx.value()
-            var loss_v = self._loss_out.lt["gpu", Layout.row_major(BB, 1)]()
-            var acc_v = self._loss_acc.lt["gpu", Layout.row_major(1, 2)]()
+            var loss_v = self._loss_out.tt["gpu", BB, 1]()
+            var acc_v = self._loss_acc.tt["gpu", 1, 2]()
             c.enqueue_function[_ddpg_loss_mean_acc_kernel[BB]](
                 loss_v, acc_v, grid_dim=1, block_dim=TPB_REDUCE,
             )

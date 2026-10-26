@@ -131,7 +131,7 @@ def hf_client(var token: String = String("")) raises -> HttpClient:
         except:
             token = String("")
     if token != "":
-        c.bearer(token^)
+        c.bearer(token)
     return c^
 
 

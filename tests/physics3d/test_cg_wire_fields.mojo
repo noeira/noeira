@@ -15,7 +15,7 @@ Run: pixi run -e apple mojo run -I . tests/physics3d/test_cg_wire_fields.mojo
 """
 
 from std.math import abs
-from std.sys import has_nvidia_gpu_accelerator
+from std.sys import default_accelerator
 from max.gpu.host import DeviceContext
 
 from noeira.nn.core.tensor import TensorImpl
@@ -111,7 +111,7 @@ def part_a(ctx: DeviceContext) raises:
         if err > worst_v:
             worst_v = err
     print("  Euler CG vs Newton worst rel err  qpos:", worst_q, " qvel:", worst_v)
-    if (worst_q > 5e-2 or worst_v > 5e-2) and not has_nvidia_gpu_accelerator():
+    if (worst_q > 5e-2 or worst_v > 5e-2) and not default_accelerator().is_nvidia_gpu():
         raise Error("Part A: Euler CG trajectory diverges from Newton")
     print("  Part A PASS: Euler CG ≈ Newton over", N_STEPS, "steps")
 

@@ -58,12 +58,13 @@ from max.gpu import barrier, block_dim, block_idx, thread_idx
 from max.gpu.primitives import warp
 from max.gpu.host import DeviceContext
 from max.gpu.memory import AddressSpace
-from layout import Layout, LayoutTensor, TileTensor, row_major, Idx
+from layout import TileTensor, row_major, Idx
+from noeira.core.tiles import RowMajor, Tile, shared_tile
 from linalg.bmm import batched_matmul
-from std.sys.info import has_nvidia_gpu_accelerator
+from std.sys.info import default_accelerator
 from nn.attention.gpu.mha import flash_attention_dispatch
 from nn.attention.mha_mask import NullMask
-from nn.attention.mha_operand import LayoutTensorMHAOperand
+from nn.attention.mha_operand import TileTensorMHAOperand
 
 from noeira.nn.constants import DT, TPB
 from ..core.tensor import Tensor, TensorImpl
@@ -96,8 +97,8 @@ masked; turns a NaN into a zero context vector."""
 def _xa_pack_kernel[
     BATCH: Int, DIM: Int, N_HEADS: Int, LEN: Int, HEAD_DIM: Int, PACKED: Int
 ](
-    packed: LayoutTensor[DT, Layout.row_major(PACKED), MutAnyOrigin],
-    src: LayoutTensor[DT, Layout.row_major(BATCH, LEN * DIM), MutAnyOrigin],
+    packed: Tile[DT, PACKED],
+    src: Tile[DT, BATCH, LEN * DIM],
 ):
     """token-major `(BATCH, LEN, DIM)` -> head-major `(BH, LEN, HEAD_DIM)`."""
     var idx = Int(block_dim.x * block_idx.x + thread_idx.x)
@@ -118,8 +119,8 @@ def _xa_pack_kernel[
 def _xa_unpack_kernel[
     BATCH: Int, DIM: Int, N_HEADS: Int, LEN: Int, HEAD_DIM: Int, PACKED: Int
 ](
-    dst: LayoutTensor[DT, Layout.row_major(BATCH, LEN * DIM), MutAnyOrigin],
-    packed: LayoutTensor[DT, Layout.row_major(PACKED), MutAnyOrigin],
+    dst: Tile[DT, BATCH, LEN * DIM],
+    packed: Tile[DT, PACKED],
 ):
     """head-major -> token-major (the inverse of `_xa_pack_kernel`)."""
     var idx = Int(block_dim.x * block_idx.x + thread_idx.x)
@@ -140,8 +141,8 @@ def _xa_unpack_kernel[
 def _xa_pack_kt_kernel[
     BATCH: Int, DIM: Int, NH: Int, KL: Int, HD: Int, PK: Int
 ](
-    dst: LayoutTensor[DT, Layout.row_major(PK), MutAnyOrigin],
-    src: LayoutTensor[DT, Layout.row_major(BATCH, KL * DIM), MutAnyOrigin],
+    dst: Tile[DT, PK],
+    src: Tile[DT, BATCH, KL * DIM],
 ):
     """token-major `(BATCH, KL, DIM)` -> `(BH, HD, KL)`, the score matmul's B.
 
@@ -167,9 +168,9 @@ def _xa_row_stats_kernel[
     BATCH: Int, N_HEADS: Int, QL: Int, KL: Int, HEAD_DIM: Int,
     MASKED: Bool, SCORES: Int, ROWS: Int,
 ](
-    scores: LayoutTensor[DT, Layout.row_major(SCORES), MutAnyOrigin],
-    stats: LayoutTensor[DT, Layout.row_major(ROWS * 2), MutAnyOrigin],
-    mask: LayoutTensor[DT, Layout.row_major(BATCH, KL), MutAnyOrigin],
+    scores: Tile[DT, SCORES],
+    stats: Tile[DT, ROWS * 2],
+    mask: Tile[DT, BATCH, KL],
 ):
     """Softmax pass 1: one thread per (b, h, i) — the row max and 1/denominator.
 
@@ -208,10 +209,10 @@ def _xa_element_softmax_kernel[
     BATCH: Int, N_HEADS: Int, QL: Int, KL: Int, HEAD_DIM: Int,
     MASKED: Bool, SCORES: Int, ROWS: Int,
 ](
-    scores: LayoutTensor[DT, Layout.row_major(SCORES), MutAnyOrigin],
-    stats: LayoutTensor[DT, Layout.row_major(ROWS * 2), MutAnyOrigin],
-    mask: LayoutTensor[DT, Layout.row_major(BATCH, KL), MutAnyOrigin],
-    attn: LayoutTensor[DT, Layout.row_major(SCORES), MutAnyOrigin],
+    scores: Tile[DT, SCORES],
+    stats: Tile[DT, ROWS * 2],
+    mask: Tile[DT, BATCH, KL],
+    attn: Tile[DT, SCORES],
 ):
     """Softmax pass 2: one thread per (b, h, i, j), straight into the cache.
 
@@ -247,9 +248,9 @@ def _xa_softmax_kernel[
     BATCH: Int, N_HEADS: Int, QL: Int, KL: Int, HEAD_DIM: Int,
     MASKED: Bool, ATTN_SIZE: Int, SCORES: Int, BH: Int,
 ](
-    scores: LayoutTensor[DT, Layout.row_major(SCORES), MutAnyOrigin],
-    attn: LayoutTensor[DT, Layout.row_major(BATCH, ATTN_SIZE), MutAnyOrigin],
-    mask: LayoutTensor[DT, Layout.row_major(BATCH, KL), MutAnyOrigin],
+    scores: Tile[DT, SCORES],
+    attn: Tile[DT, BATCH, ATTN_SIZE],
+    mask: Tile[DT, BATCH, KL],
 ):
     """One block per (b, h); threads stride over query rows.
 
@@ -316,9 +317,9 @@ def _xa_softmax_jvp_kernel[
     BATCH: Int, N_HEADS: Int, QL: Int, KL: Int, HEAD_DIM: Int,
     ATTN_SIZE: Int, SCORES: Int, BH: Int,
 ](
-    dscore: LayoutTensor[DT, Layout.row_major(SCORES), MutAnyOrigin],
-    dattn: LayoutTensor[DT, Layout.row_major(SCORES), MutAnyOrigin],
-    attn: LayoutTensor[DT, Layout.row_major(BATCH, ATTN_SIZE), MutAnyOrigin],
+    dscore: Tile[DT, SCORES],
+    dattn: Tile[DT, SCORES],
+    attn: Tile[DT, BATCH, ATTN_SIZE],
 ):
     """`dscore = scale * a * (dattn - sum_k a_k * dattn_k)`.
 
@@ -358,8 +359,8 @@ def _xa_softmax_jvp_kernel[
 
 
 def _xa_transpose_k_kernel[BH: Int, KL: Int, HD: Int, PK: Int](
-    out_t: LayoutTensor[DT, Layout.row_major(PK), MutAnyOrigin],
-    k: LayoutTensor[DT, Layout.row_major(PK), MutAnyOrigin],
+    out_t: Tile[DT, PK],
+    k: Tile[DT, PK],
 ):
     """packed keys `(BH, KL, HD)` -> `(BH, HD, KL)`, contiguous.
 
@@ -382,8 +383,8 @@ def _xa_transpose_k_kernel[BH: Int, KL: Int, HD: Int, PK: Int](
 def _xa_transpose_attn_kernel[
     BATCH: Int, N_HEADS: Int, QL: Int, KL: Int, ATTN_SIZE: Int, SCORES: Int
 ](
-    out_t: LayoutTensor[DT, Layout.row_major(SCORES), MutAnyOrigin],
-    attn: LayoutTensor[DT, Layout.row_major(BATCH, ATTN_SIZE), MutAnyOrigin],
+    out_t: Tile[DT, SCORES],
+    attn: Tile[DT, BATCH, ATTN_SIZE],
 ):
     """cache `(BH, QL, KL)` -> `(BH, KL, QL)`."""
     var idx = Int(block_dim.x * block_idx.x + thread_idx.x)
@@ -401,8 +402,8 @@ def _xa_transpose_attn_kernel[
 
 
 def _xa_transpose_scores_kernel[QL: Int, KL: Int, SCORES: Int](
-    out_t: LayoutTensor[DT, Layout.row_major(SCORES), MutAnyOrigin],
-    src: LayoutTensor[DT, Layout.row_major(SCORES), MutAnyOrigin],
+    out_t: Tile[DT, SCORES],
+    src: Tile[DT, SCORES],
 ):
     """`(BH, QL, KL)` -> `(BH, KL, QL)`."""
     var idx = Int(block_dim.x * block_idx.x + thread_idx.x)
@@ -418,7 +419,7 @@ def _xa_transpose_scores_kernel[QL: Int, KL: Int, SCORES: Int](
 
 
 def _xa_zero_kernel[N: Int](
-    g: LayoutTensor[DT, Layout.row_major(N), MutAnyOrigin]
+    g: Tile[DT, N]
 ):
     var i = Int(block_dim.x * block_idx.x + thread_idx.x)
     if i < N:
@@ -486,8 +487,9 @@ comptime XA_FUSED_BQ: Int = 128
 comptime XA_FUSED_BK: Int = 32
 """Keys per shared-memory tile of the fused forward."""
 comptime XA_FUSED_R: Int = 1
-"""Query rows per THREAD (shipped default). `benchmarks/cross_attention_bench.mojo`
-ranks the (R, SPLIT, KU, DOT_FMA, EXP2) grid on the Orin; the defaults are
+"""Query rows per THREAD (shipped default).
+
+`benchmarks/cross_attention_bench.mojo` ranks the (R, SPLIT, KU, DOT_FMA, EXP2) grid on the Orin; the defaults are
 its row N, the best at SigLIP's shape on 20 Sep 2026:
 
     two-pass path (A)                      8.45 ms
@@ -530,7 +532,7 @@ def xa_fused_routes_to_max[MASKED: Bool, HD: Int]() -> Bool:
     comptime if not XA_FUSED_VIA_MAX:
         return False
     else:
-        return has_nvidia_gpu_accelerator() and (not MASKED) and HD == 64
+        return default_accelerator().is_nvidia_gpu() and (not MASKED) and HD == 64
 
 
 def _xa_fused_split[HD: Int]() -> Int:
@@ -549,11 +551,11 @@ def _xa_fused_kernel[
     B: Int, DIM: Int, NH: Int, QL: Int, KL: Int, HD: Int, MASKED: Bool,
     R: Int, SPLIT: Int, KU: Int, DOT_FMA: Bool = False, EXP2: Bool = False,
 ](
-    q: LayoutTensor[DT, Layout.row_major(B, QL * DIM), MutAnyOrigin],
-    k: LayoutTensor[DT, Layout.row_major(B, KL * DIM), MutAnyOrigin],
-    v: LayoutTensor[DT, Layout.row_major(B, KL * DIM), MutAnyOrigin],
-    m: LayoutTensor[DT, Layout.row_major(B, KL), MutAnyOrigin],
-    dst: LayoutTensor[DT, Layout.row_major(B, QL * DIM), MutAnyOrigin],
+    q: Tile[DT, B, QL * DIM],
+    k: Tile[DT, B, KL * DIM],
+    v: Tile[DT, B, KL * DIM],
+    m: Tile[DT, B, KL],
+    dst: Tile[DT, B, QL * DIM],
 ):
     """grid (ceil(QL/BQ), NH, B), block `xa_fused_block[R, SPLIT]()`. `m` is
     read only when MASKED (the unmasked instantiation is handed any tensor
@@ -589,18 +591,9 @@ def _xa_fused_kernel[
     )
     comptime TILE = BK * HD
 
-    var ks = LayoutTensor[
-        DT, Layout.row_major(TILE), MutAnyOrigin,
-        address_space=AddressSpace.SHARED,
-    ].stack_allocation()
-    var vs = LayoutTensor[
-        DT, Layout.row_major(TILE), MutAnyOrigin,
-        address_space=AddressSpace.SHARED,
-    ].stack_allocation()
-    var ms = LayoutTensor[
-        DT, Layout.row_major(BK), MutAnyOrigin,
-        address_space=AddressSpace.SHARED,
-    ].stack_allocation()
+    var ks = shared_tile[DT, TILE]()
+    var vs = shared_tile[DT, TILE]()
+    var ms = shared_tile[DT, BK]()
 
     var qt = Int(block_idx.x)
     var h = Int(block_idx.y)
@@ -1154,9 +1147,9 @@ struct CrossAttention[
         token-major output. Nothing is packed and nothing is cached."""
         comptime QL = Self.Q_LEN
         comptime KL = Self.KV_LEN
-        comptime lay_q = Layout.row_major(B, Self.Q_DIM)
-        comptime lay_kv = Layout.row_major(B, Self.KV_DIM)
-        comptime lay_m = Layout.row_major(B, KL)
+        comptime lay_q = RowMajor[B, Self.Q_DIM]
+        comptime lay_kv = RowMajor[B, Self.KV_DIM]
+        comptime lay_m = RowMajor[B, KL]
         comptime SPLIT = _xa_fused_split[Self.HEAD_DIM]()
         comptime kern = _xa_fused_kernel[
             B, Self.DIM, Self.N_HEADS, QL, KL, Self.HEAD_DIM, Self.MASKED,
@@ -1170,9 +1163,9 @@ struct CrossAttention[
         comptime if Self.MASKED:
             ref m = inputs[3]
             c.enqueue_function[kern](
-                q.lt["gpu", lay_q](), k.lt["gpu", lay_kv](),
-                v.lt["gpu", lay_kv](), m.lt["gpu", lay_m](),
-                out.lt["gpu", lay_q](),
+                q.tt["gpu", B, Self.Q_DIM](), k.tt["gpu", B, Self.KV_DIM](),
+                v.tt["gpu", B, Self.KV_DIM](), m.tt["gpu", B, KL](),
+                out.tt["gpu", B, Self.Q_DIM](),
                 grid_dim=(qtiles, Self.N_HEADS, B),
                 block_dim=blk,
             )
@@ -1180,12 +1173,12 @@ struct CrossAttention[
             # The mask slot is never read; hand it the output as a stand-in
             # of the right layout, as `_forward_gpu` does with the cache.
             c.enqueue_function[kern](
-                q.lt["gpu", lay_q](), k.lt["gpu", lay_kv](),
-                v.lt["gpu", lay_kv](),
-                rebind[LayoutTensor[DT, lay_m, MutAnyOrigin]](
-                    out.lt["gpu", lay_m]()
+                q.tt["gpu", B, Self.Q_DIM](), k.tt["gpu", B, Self.KV_DIM](),
+                v.tt["gpu", B, Self.KV_DIM](),
+                rebind[TileTensor[DT, lay_m, MutAnyOrigin]](
+                    out.tt["gpu", B, KL]()
                 ),
-                out.lt["gpu", lay_q](),
+                out.tt["gpu", B, Self.Q_DIM](),
                 grid_dim=(qtiles, Self.N_HEADS, B),
                 block_dim=blk,
             )
@@ -1236,10 +1229,10 @@ struct CrossAttention[
                 _is_cache_length_accurate=True,
                 _use_valid_length=False,
             ](
-                o_tt.to_layout_tensor(),
-                q_tt.to_layout_tensor(),
-                LayoutTensorMHAOperand(k_tt),
-                LayoutTensorMHAOperand(v_tt),
+                o_tt,
+                q_tt,
+                TileTensorMHAOperand(k_tt),
+                TileTensorMHAOperand(v_tt),
                 NullMask(),
                 QL,
                 KL,
@@ -1265,13 +1258,13 @@ struct CrossAttention[
         comptime SC = BH * QL * KL
         self._ensure_scratch_gpu[B](c)
 
-        comptime lay_q = Layout.row_major(B, Self.Q_DIM)
-        comptime lay_kv = Layout.row_major(B, Self.KV_DIM)
-        comptime lay_pq = Layout.row_major(PQ)
-        comptime lay_pk = Layout.row_major(PK)
-        comptime lay_s = Layout.row_major(SC)
-        comptime lay_a = Layout.row_major(B, Self.ATTN_SIZE)
-        comptime lay_m = Layout.row_major(B, KL)
+        comptime lay_q = RowMajor[B, Self.Q_DIM]
+        comptime lay_kv = RowMajor[B, Self.KV_DIM]
+        comptime lay_pq = RowMajor[PQ]
+        comptime lay_pk = RowMajor[PK]
+        comptime lay_s = RowMajor[SC]
+        comptime lay_a = RowMajor[B, Self.ATTN_SIZE]
+        comptime lay_m = RowMajor[B, KL]
 
         ref q = inputs[0]
         ref k = inputs[1]
@@ -1283,23 +1276,23 @@ struct CrossAttention[
         c.enqueue_function[
             _xa_pack_kernel[B, Self.DIM, Self.N_HEADS, QL, HD, PQ]
         ](
-            self.sq0.lt["gpu", lay_pq](),
-            q.lt["gpu", lay_q](),
+            self.sq0.tt["gpu", PQ](),
+            q.tt["gpu", B, Self.Q_DIM](),
             grid_dim=qblocks, block_dim=TPB,
         )
         # k packs STRAIGHT INTO Kt (BH, HD, KL) — one pass, not pack + transpose.
         c.enqueue_function[
             _xa_pack_kt_kernel[B, Self.DIM, Self.N_HEADS, KL, HD, PK]
         ](
-            self.sk0.lt["gpu", lay_pk](),
-            k.lt["gpu", lay_kv](),
+            self.sk0.tt["gpu", PK](),
+            k.tt["gpu", B, Self.KV_DIM](),
             grid_dim=(PK + TPB - 1) // TPB, block_dim=TPB,
         )
         c.enqueue_function[
             _xa_pack_kernel[B, Self.DIM, Self.N_HEADS, KL, HD, PK]
         ](
-            self.sk1.lt["gpu", lay_pk](),
-            v.lt["gpu", lay_kv](),
+            self.sk1.tt["gpu", PK](),
+            v.tt["gpu", B, Self.KV_DIM](),
             grid_dim=kblocks, block_dim=TPB,
         )
 
@@ -1319,7 +1312,7 @@ struct CrossAttention[
         #    still needs SOME tensor for the parameter, so the cache is passed
         #    as an inert stand-in rather than allocating a dummy.
         comptime ROWS = BH * QL
-        comptime lay_st = Layout.row_major(ROWS * 2)
+        comptime lay_st = RowMajor[ROWS * 2]
         comptime st = _xa_row_stats_kernel[
             B, Self.N_HEADS, QL, KL, HD, Self.MASKED, SC, ROWS
         ]
@@ -1331,34 +1324,34 @@ struct CrossAttention[
         comptime if Self.MASKED:
             ref m = inputs[3]
             c.enqueue_function[st](
-                self.ss0.lt["gpu", lay_s](),
-                self.sst.lt["gpu", lay_st](),
-                m.lt["gpu", lay_m](),
+                self.ss0.tt["gpu", SC](),
+                self.sst.tt["gpu", ROWS * 2](),
+                m.tt["gpu", B, KL](),
                 grid_dim=rowblocks, block_dim=TPB,
             )
             c.enqueue_function[el](
-                self.ss0.lt["gpu", lay_s](),
-                self.sst.lt["gpu", lay_st](),
-                m.lt["gpu", lay_m](),
-                self.attn.lt["gpu", lay_s](),
+                self.ss0.tt["gpu", SC](),
+                self.sst.tt["gpu", ROWS * 2](),
+                m.tt["gpu", B, KL](),
+                self.attn.tt["gpu", SC](),
                 grid_dim=elblocks, block_dim=TPB,
             )
         else:
             c.enqueue_function[st](
-                self.ss0.lt["gpu", lay_s](),
-                self.sst.lt["gpu", lay_st](),
-                rebind[LayoutTensor[DT, lay_m, MutAnyOrigin]](
-                    self.attn.lt["gpu", lay_m]()
+                self.ss0.tt["gpu", SC](),
+                self.sst.tt["gpu", ROWS * 2](),
+                rebind[TileTensor[DT, lay_m, MutAnyOrigin]](
+                    self.attn.tt["gpu", B, KL]()
                 ),
                 grid_dim=rowblocks, block_dim=TPB,
             )
             c.enqueue_function[el](
-                self.ss0.lt["gpu", lay_s](),
-                self.sst.lt["gpu", lay_st](),
-                rebind[LayoutTensor[DT, lay_m, MutAnyOrigin]](
-                    self.attn.lt["gpu", lay_m]()
+                self.ss0.tt["gpu", SC](),
+                self.sst.tt["gpu", ROWS * 2](),
+                rebind[TileTensor[DT, lay_m, MutAnyOrigin]](
+                    self.attn.tt["gpu", B, KL]()
                 ),
-                self.attn.lt["gpu", lay_s](),
+                self.attn.tt["gpu", SC](),
                 grid_dim=elblocks, block_dim=TPB,
             )
 
@@ -1372,8 +1365,8 @@ struct CrossAttention[
         c.enqueue_function[
             _xa_unpack_kernel[B, Self.DIM, Self.N_HEADS, QL, HD, PQ]
         ](
-            out.lt["gpu", lay_q](),
-            self.sq1.lt["gpu", lay_pq](),
+            out.tt["gpu", B, Self.Q_DIM](),
+            self.sq1.tt["gpu", PQ](),
             grid_dim=qblocks, block_dim=TPB,
         )
 
@@ -1395,12 +1388,12 @@ struct CrossAttention[
         comptime SC = BH * QL * KL
         self._ensure_scratch_gpu[B](c)
 
-        comptime lay_q = Layout.row_major(B, Self.Q_DIM)
-        comptime lay_kv = Layout.row_major(B, Self.KV_DIM)
-        comptime lay_pq = Layout.row_major(PQ)
-        comptime lay_pk = Layout.row_major(PK)
-        comptime lay_s = Layout.row_major(SC)
-        comptime lay_a = Layout.row_major(B, Self.ATTN_SIZE)
+        comptime lay_q = RowMajor[B, Self.Q_DIM]
+        comptime lay_kv = RowMajor[B, Self.KV_DIM]
+        comptime lay_pq = RowMajor[PQ]
+        comptime lay_pk = RowMajor[PK]
+        comptime lay_s = RowMajor[SC]
+        comptime lay_a = RowMajor[B, Self.ATTN_SIZE]
 
         ref q = forward_input[0]
         ref k = forward_input[1]
@@ -1423,29 +1416,29 @@ struct CrossAttention[
         c.enqueue_function[
             _xa_pack_kernel[B, Self.DIM, Self.N_HEADS, QL, HD, PQ]
         ](
-            self.sq0.lt["gpu", lay_pq](),
-            grad_output.lt["gpu", lay_q](),
+            self.sq0.tt["gpu", PQ](),
+            grad_output.tt["gpu", B, Self.Q_DIM](),
             grid_dim=qblocks, block_dim=TPB,
         )
         c.enqueue_function[
             _xa_pack_kernel[B, Self.DIM, Self.N_HEADS, QL, HD, PQ]
         ](
-            self.sq1.lt["gpu", lay_pq](),
-            q.lt["gpu", lay_q](),
+            self.sq1.tt["gpu", PQ](),
+            q.tt["gpu", B, Self.Q_DIM](),
             grid_dim=qblocks, block_dim=TPB,
         )
         c.enqueue_function[
             _xa_pack_kernel[B, Self.DIM, Self.N_HEADS, KL, HD, PK]
         ](
-            self.sk0.lt["gpu", lay_pk](),
-            k.lt["gpu", lay_kv](),
+            self.sk0.tt["gpu", PK](),
+            k.tt["gpu", B, Self.KV_DIM](),
             grid_dim=kblocks, block_dim=TPB,
         )
         c.enqueue_function[
             _xa_pack_kernel[B, Self.DIM, Self.N_HEADS, KL, HD, PK]
         ](
-            self.sk1.lt["gpu", lay_pk](),
-            v.lt["gpu", lay_kv](),
+            self.sk1.tt["gpu", PK](),
+            v.tt["gpu", B, Self.KV_DIM](),
             grid_dim=kblocks, block_dim=TPB,
         )
 
@@ -1461,9 +1454,9 @@ struct CrossAttention[
                 B, Self.N_HEADS, QL, KL, HD, Self.ATTN_SIZE, SC, BH
             ]
         ](
-            self.ss1.lt["gpu", lay_s](),
-            self.ss0.lt["gpu", lay_s](),
-            self.attn.lt["gpu", lay_a](),
+            self.ss1.tt["gpu", SC](),
+            self.ss0.tt["gpu", SC](),
+            self.attn.tt["gpu", B, Self.ATTN_SIZE](),
             grid_dim=BH, block_dim=TPB,
         )
 
@@ -1473,8 +1466,8 @@ struct CrossAttention[
                 B, Self.N_HEADS, QL, KL, Self.ATTN_SIZE, SC
             ]
         ](
-            self.ss0.lt["gpu", lay_s](),
-            self.attn.lt["gpu", lay_a](),
+            self.ss0.tt["gpu", SC](),
+            self.attn.tt["gpu", B, Self.ATTN_SIZE](),
             grid_dim=sblocks, block_dim=TPB,
         )
 
@@ -1490,8 +1483,8 @@ struct CrossAttention[
 
         # 7. dscore_T(ss0) = transpose(dscore)  — ss0 free, attn_T read at 5.
         c.enqueue_function[_xa_transpose_scores_kernel[QL, KL, SC]](
-            self.ss0.lt["gpu", lay_s](),
-            self.ss1.lt["gpu", lay_s](),
+            self.ss0.tt["gpu", SC](),
+            self.ss1.tt["gpu", SC](),
             grid_dim=sblocks, block_dim=TPB,
         )
 
@@ -1504,22 +1497,22 @@ struct CrossAttention[
         c.enqueue_function[
             _xa_unpack_kernel[B, Self.DIM, Self.N_HEADS, QL, HD, PQ]
         ](
-            gq.lt["gpu", lay_q](),
-            self.sq2.lt["gpu", lay_pq](),
+            gq.tt["gpu", B, Self.Q_DIM](),
+            self.sq2.tt["gpu", PQ](),
             grid_dim=qblocks, block_dim=TPB,
         )
         c.enqueue_function[
             _xa_unpack_kernel[B, Self.DIM, Self.N_HEADS, KL, HD, PK]
         ](
-            gk.lt["gpu", lay_kv](),
-            self.sk0.lt["gpu", lay_pk](),
+            gk.tt["gpu", B, Self.KV_DIM](),
+            self.sk0.tt["gpu", PK](),
             grid_dim=kblocks, block_dim=TPB,
         )
         c.enqueue_function[
             _xa_unpack_kernel[B, Self.DIM, Self.N_HEADS, KL, HD, PK]
         ](
-            gv.lt["gpu", lay_kv](),
-            self.sk2.lt["gpu", lay_pk](),
+            gv.tt["gpu", B, Self.KV_DIM](),
+            self.sk2.tt["gpu", PK](),
             grid_dim=kblocks, block_dim=TPB,
         )
 
@@ -1529,7 +1522,7 @@ struct CrossAttention[
             ref gm = grad_inputs[3]
             gm.ensure_gpu(c, B * KL)
             c.enqueue_function[_xa_zero_kernel[B * KL]](
-                gm.lt["gpu", Layout.row_major(B * KL)](),
+                gm.tt["gpu", B * KL](),
                 grid_dim=(B * KL + TPB - 1) // TPB, block_dim=TPB,
             )
 

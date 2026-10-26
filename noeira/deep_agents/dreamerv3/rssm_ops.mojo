@@ -23,7 +23,6 @@ from std.math import tanh, exp
 from max.gpu import global_idx
 from max.gpu.host import DeviceContext, DeviceBuffer
 from std.random.philox import Random as PhiloxRandom
-from layout import Layout, LayoutTensor
 
 from noeira.nn.constants import DT, TPB
 from noeira.nn.core.tensor import Tensor
@@ -31,6 +30,7 @@ from noeira.nn.core.tensor_refs import TensorRefs
 from noeira.nn.core.module import Module
 from noeira.nn.core.initializer import Initializer
 from noeira.nn.core.amp import AMPPolicy, NoAMP
+from noeira.core.tiles import Tile, tile
 
 
 @always_inline
@@ -49,8 +49,8 @@ def _sig(x: Scalar[DT]) -> Scalar[DT]:
 
 
 def _asq_fwd_kernel[N: Int](
-    x: LayoutTensor[DT, Layout.row_major(N), MutAnyOrigin],
-    o: LayoutTensor[DT, Layout.row_major(N), MutAnyOrigin],
+    x: Tile[DT, N],
+    o: Tile[DT, N],
 ):
     var i = Int(global_idx.x)
     if i < N:
@@ -61,9 +61,9 @@ def _asq_fwd_kernel[N: Int](
 
 
 def _asq_bwd_kernel[N: Int](
-    x: LayoutTensor[DT, Layout.row_major(N), MutAnyOrigin],
-    go: LayoutTensor[DT, Layout.row_major(N), MutAnyOrigin],
-    gi: LayoutTensor[DT, Layout.row_major(N), MutAnyOrigin],
+    x: Tile[DT, N],
+    go: Tile[DT, N],
+    gi: Tile[DT, N],
 ):
     var i = Int(global_idx.x)
     if i < N:
@@ -81,9 +81,9 @@ def _sigk(x: Scalar[DT]) -> Scalar[DT]:
 # ── GRUGate: N=B·D, D=DETER, DPB=DETER//BLOCKS. gru [B,3D], deter/nd [B,D];
 #    block grp uses gru lanes [grp·3·DPB : +3·DPB]. ──────────────────────
 def _gru_fwd_kernel[N: Int, D: Int, DPB: Int](
-    gru: LayoutTensor[DT, Layout.row_major(N * 3), MutAnyOrigin],
-    deter: LayoutTensor[DT, Layout.row_major(N), MutAnyOrigin],
-    nd: LayoutTensor[DT, Layout.row_major(N), MutAnyOrigin],
+    gru: Tile[DT, N * 3],
+    deter: Tile[DT, N],
+    nd: Tile[DT, N],
 ):
     var i = Int(global_idx.x)
     if i < N:
@@ -99,11 +99,11 @@ def _gru_fwd_kernel[N: Int, D: Int, DPB: Int](
 
 
 def _gru_bwd_kernel[N: Int, D: Int, DPB: Int](
-    gru: LayoutTensor[DT, Layout.row_major(N * 3), MutAnyOrigin],
-    deter: LayoutTensor[DT, Layout.row_major(N), MutAnyOrigin],
-    go: LayoutTensor[DT, Layout.row_major(N), MutAnyOrigin],
-    g_gru: LayoutTensor[DT, Layout.row_major(N * 3), MutAnyOrigin],
-    g_deter: LayoutTensor[DT, Layout.row_major(N), MutAnyOrigin],
+    gru: Tile[DT, N * 3],
+    deter: Tile[DT, N],
+    go: Tile[DT, N],
+    g_gru: Tile[DT, N * 3],
+    g_deter: Tile[DT, N],
 ):
     var i = Int(global_idx.x)
     if i < N:
@@ -132,11 +132,11 @@ def _gru_bwd_kernel[N: Int, D: Int, DPB: Int](
 def _bga_fwd_kernel[
     NO: Int, OUT: Int, D: Int, H: Int, DPB: Int, PG: Int
 ](
-    deter: LayoutTensor[DT, Layout.row_major(NO), MutAnyOrigin],
-    x0: LayoutTensor[DT, Layout.row_major(NO), MutAnyOrigin],
-    x1: LayoutTensor[DT, Layout.row_major(NO), MutAnyOrigin],
-    x2: LayoutTensor[DT, Layout.row_major(NO), MutAnyOrigin],
-    o: LayoutTensor[DT, Layout.row_major(NO), MutAnyOrigin],
+    deter: Tile[DT, NO],
+    x0: Tile[DT, NO],
+    x1: Tile[DT, NO],
+    x2: Tile[DT, NO],
+    o: Tile[DT, NO],
 ):
     var i = Int(global_idx.x)
     if i < NO:
@@ -157,8 +157,8 @@ def _bga_fwd_kernel[
 def _bga_bwd_deter_kernel[
     ND: Int, GON: Int, OUT: Int, D: Int, DPB: Int, PG: Int
 ](
-    go: LayoutTensor[DT, Layout.row_major(GON), MutAnyOrigin],
-    g_deter: LayoutTensor[DT, Layout.row_major(ND), MutAnyOrigin],
+    go: Tile[DT, GON],
+    g_deter: Tile[DT, ND],
 ):
     var i = Int(global_idx.x)
     if i < ND:
@@ -172,10 +172,10 @@ def _bga_bwd_deter_kernel[
 def _bga_bwd_x_kernel[
     NH: Int, GON: Int, OUT: Int, H: Int, DPB: Int, PG: Int, BLOCKS: Int
 ](
-    go: LayoutTensor[DT, Layout.row_major(GON), MutAnyOrigin],
-    gx0: LayoutTensor[DT, Layout.row_major(NH), MutAnyOrigin],
-    gx1: LayoutTensor[DT, Layout.row_major(NH), MutAnyOrigin],
-    gx2: LayoutTensor[DT, Layout.row_major(NH), MutAnyOrigin],
+    go: Tile[DT, GON],
+    gx0: Tile[DT, NH],
+    gx1: Tile[DT, NH],
+    gx2: Tile[DT, NH],
 ):
     var i = Int(global_idx.x)
     if i < NH:
@@ -211,10 +211,10 @@ def _bga_bwd_x_kernel[
 #    stable device buffer (created in `make`, never recreated) and is read/advanced
 #    purely device-side — the proven imagination-noise pattern.
 def _st_sample_kernel[NG: Int, C: Int](
-    z: LayoutTensor[DT, Layout.row_major(NG * C), MutAnyOrigin],
-    o: LayoutTensor[DT, Layout.row_major(NG * C), MutAnyOrigin],
+    z: Tile[DT, NG * C],
+    o: Tile[DT, NG * C],
     seed: UInt64,
-    offset_buf: LayoutTensor[DType.uint64, Layout.row_major(1), MutAnyOrigin],
+    offset_buf: Tile[DType.uint64, 1],
     unimix: Scalar[DT],
 ):
     var gg = Int(global_idx.x)
@@ -251,7 +251,7 @@ def _st_sample_kernel[NG: Int, C: Int](
 
 
 def _st_off_inc_k[STRIDE: Int](
-    offset_buf: LayoutTensor[DType.uint64, Layout.row_major(1), MutAnyOrigin],
+    offset_buf: Tile[DType.uint64, 1],
 ):
     """Advance the device stoch-sample Philox offset by STRIDE (one thread).
     Capture-safe: pure device read-modify-write, no host sync."""
@@ -260,9 +260,9 @@ def _st_off_inc_k[STRIDE: Int](
 
 
 def _st_bwd_kernel[NG: Int, C: Int](
-    z: LayoutTensor[DT, Layout.row_major(NG * C), MutAnyOrigin],
-    go: LayoutTensor[DT, Layout.row_major(NG * C), MutAnyOrigin],
-    gz: LayoutTensor[DT, Layout.row_major(NG * C), MutAnyOrigin],
+    z: Tile[DT, NG * C],
+    go: Tile[DT, NG * C],
+    gz: Tile[DT, NG * C],
     one_m_u: Scalar[DT],
 ):
     var gg = Int(global_idx.x)
@@ -332,8 +332,8 @@ struct ActionSquash[ACT: Int](Module):
             out.ensure_gpu(c, N)
             comptime nb = (N + TPB - 1) // TPB
             c.enqueue_function[_asq_fwd_kernel[N]](
-                in0.lt["gpu", Layout.row_major(N)](),
-                out.lt["gpu", Layout.row_major(N)](),
+                in0.tt["gpu", N](),
+                out.tt["gpu", N](),
                 grid_dim=nb,
                 block_dim=TPB,
             )
@@ -366,9 +366,9 @@ struct ActionSquash[ACT: Int](Module):
             gin.ensure_gpu(c, N)
             comptime nb = (N + TPB - 1) // TPB
             c.enqueue_function[_asq_bwd_kernel[N]](
-                fin.lt["gpu", Layout.row_major(N)](),
-                grad_output.lt["gpu", Layout.row_major(N)](),
-                gin.lt["gpu", Layout.row_major(N)](),
+                fin.tt["gpu", N](),
+                grad_output.tt["gpu", N](),
+                gin.tt["gpu", N](),
                 grid_dim=nb,
                 block_dim=TPB,
             )
@@ -443,11 +443,11 @@ struct BlockGroupAssemble[DETER: Int, H: Int, BLOCKS: Int](Module):
             out.ensure_gpu(c, NO)
             comptime nb = (NO + TPB - 1) // TPB
             c.enqueue_function[_bga_fwd_kernel[NO, OUT, D, HH, dpb, pg]](
-                deter.lt["gpu", Layout.row_major(NO)](),
-                x0.lt["gpu", Layout.row_major(NO)](),
-                x1.lt["gpu", Layout.row_major(NO)](),
-                x2.lt["gpu", Layout.row_major(NO)](),
-                out.lt["gpu", Layout.row_major(NO)](),
+                deter.tt["gpu", NO](),
+                x0.tt["gpu", NO](),
+                x1.tt["gpu", NO](),
+                x2.tt["gpu", NO](),
+                out.tt["gpu", NO](),
                 grid_dim=nb,
                 block_dim=TPB,
             )
@@ -510,8 +510,8 @@ struct BlockGroupAssemble[DETER: Int, H: Int, BLOCKS: Int](Module):
             g_x2.ensure_gpu(c, NH)
             comptime nbd = (ND + TPB - 1) // TPB
             c.enqueue_function[_bga_bwd_deter_kernel[ND, GON, OUT, D, dpb, pg]](
-                grad_output.lt["gpu", Layout.row_major(GON)](),
-                g_deter.lt["gpu", Layout.row_major(ND)](),
+                grad_output.tt["gpu", GON](),
+                g_deter.tt["gpu", ND](),
                 grid_dim=nbd,
                 block_dim=TPB,
             )
@@ -519,10 +519,10 @@ struct BlockGroupAssemble[DETER: Int, H: Int, BLOCKS: Int](Module):
             c.enqueue_function[
                 _bga_bwd_x_kernel[NH, GON, OUT, HH, dpb, pg, g]
             ](
-                grad_output.lt["gpu", Layout.row_major(GON)](),
-                g_x0.lt["gpu", Layout.row_major(NH)](),
-                g_x1.lt["gpu", Layout.row_major(NH)](),
-                g_x2.lt["gpu", Layout.row_major(NH)](),
+                grad_output.tt["gpu", GON](),
+                g_x0.tt["gpu", NH](),
+                g_x1.tt["gpu", NH](),
+                g_x2.tt["gpu", NH](),
                 grid_dim=nbh,
                 block_dim=TPB,
             )
@@ -596,9 +596,9 @@ struct GRUGate[DETER: Int, BLOCKS: Int](Module):
             comptime nb = (N + TPB - 1) // TPB
             # gru is [B, 3D] = N*3 elements; deter/out are [B, D] = N.
             c.enqueue_function[_gru_fwd_kernel[N, D, dpb]](
-                gru.lt["gpu", Layout.row_major(N * 3)](),
-                deter.lt["gpu", Layout.row_major(N)](),
-                out.lt["gpu", Layout.row_major(N)](),
+                gru.tt["gpu", N * 3](),
+                deter.tt["gpu", N](),
+                out.tt["gpu", N](),
                 grid_dim=nb,
                 block_dim=TPB,
             )
@@ -661,11 +661,11 @@ struct GRUGate[DETER: Int, BLOCKS: Int](Module):
             g_deter.ensure_gpu(c, N)
             comptime nb = (N + TPB - 1) // TPB
             c.enqueue_function[_gru_bwd_kernel[N, D, dpb]](
-                gru.lt["gpu", Layout.row_major(N * 3)](),
-                deter.lt["gpu", Layout.row_major(N)](),
-                grad_output.lt["gpu", Layout.row_major(N)](),
-                g_gru.lt["gpu", Layout.row_major(N * 3)](),
-                g_deter.lt["gpu", Layout.row_major(N)](),
+                gru.tt["gpu", N * 3](),
+                deter.tt["gpu", N](),
+                grad_output.tt["gpu", N](),
+                g_gru.tt["gpu", N * 3](),
+                g_deter.tt["gpu", N](),
                 grid_dim=nb,
                 block_dim=TPB,
             )
@@ -780,12 +780,10 @@ struct StraightThroughSample[STOCH: Int, CLASSES: Int](Module):
                 var ob = c.enqueue_create_buffer[DType.uint64](1)
                 ob.enqueue_fill(UInt64(0))
                 self.off_d = ob^
-            var off_lt = LayoutTensor[DType.uint64, Layout.row_major(1)](
-                self.off_d.value()
-            )
+            var off_lt = tile[1](self.off_d.value())
             c.enqueue_function[_st_sample_kernel[NG, C]](
-                z.lt["gpu", Layout.row_major(NN)](),
-                out.lt["gpu", Layout.row_major(NN)](),
+                z.tt["gpu", NN](),
+                out.tt["gpu", NN](),
                 self.seed, off_lt, self.unimix,
                 grid_dim=nb,
                 block_dim=TPB,
@@ -841,9 +839,9 @@ struct StraightThroughSample[STOCH: Int, CLASSES: Int](Module):
             gz.ensure_gpu(c, NN)
             comptime nb = (NG + TPB - 1) // TPB
             c.enqueue_function[_st_bwd_kernel[NG, C]](
-                z.lt["gpu", Layout.row_major(NN)](),
-                grad_output.lt["gpu", Layout.row_major(NN)](),
-                gz.lt["gpu", Layout.row_major(NN)](),
+                z.tt["gpu", NN](),
+                grad_output.tt["gpu", NN](),
+                gz.tt["gpu", NN](),
                 one_m_u,
                 grid_dim=nb,
                 block_dim=TPB,

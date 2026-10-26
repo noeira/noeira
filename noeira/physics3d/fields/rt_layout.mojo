@@ -1,5 +1,12 @@
 """`DYN1`/`DYN2` + `rl1`/`rl2` — a tensor view whose EXTENTS are runtime.
 
+TileTensor form (LayoutTensor migration, docs/MOJO_1_2_MAX_26_7_UPGRADE.md §5):
+`DYN2` is now the TYPE of `row_major(Coord(rows, cols))` with runtime extents
+and `rl2` returns that layout VALUE; `t.lt_dyn["cpu", DYN2](rl)` is
+`t.tt_dyn["cpu", DYN2](rl)`. The kernels it feeds are generic over
+`L: TensorLayout`, so one body still serves both legs. The text below
+predates the migration and still describes the design.
+
 This is phase 3a. `Scratch` (2b.2) solved the function-local buffers; this
 solves the other half: the `LayoutTensor` views a dispatcher builds over
 `Data`/`Model` tensors. Today they read
@@ -59,31 +66,4 @@ and the output is silently zeroed). So a dispatcher with both branches keeps
 are not redundant; they serve different legs.
 """
 
-from std.utils import IndexList
-from layout import Layout, RuntimeLayout
-
-comptime DYN1 = Layout.row_major[1]()
-"""A 1-D layout with its extent UNKNOWN at compile time; `rl1` supplies it."""
-
-comptime DYN2 = Layout.row_major[2]()
-"""A 2-D layout with both extents UNKNOWN at compile time; `rl2` supplies
-them. Nearly every physics3d field is `[BATCH, F]`, so this is the common
-one."""
-
-
-@always_inline
-def rl1(n: Int) -> RuntimeLayout[DYN1]:
-    """Extents for a `DYN1` view. Pass the LIVE length."""
-    return RuntimeLayout[DYN1].row_major(IndexList[1](n))
-
-
-@always_inline
-def rl2(rows: Int, cols: Int) -> RuntimeLayout[DYN2]:
-    """Extents for a `DYN2` view — row-major `[rows, cols]`.
-
-    ⚠ `cols` IS THE ROW STRIDE, so it is the argument a cap-as-stride bug
-    lands in. It must be the live per-row width (`dm.get_nv()`,
-    `dm.get_nbody() * 3`), never a cap and never a container's allocated
-    width if that differs.
-    """
-    return RuntimeLayout[DYN2].row_major(IndexList[2](rows, cols))
+from noeira.core.tiles import DYN1, DYN2, rl1, rl2

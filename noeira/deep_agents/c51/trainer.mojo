@@ -25,7 +25,6 @@ from std.math import exp as fexp, log as flog
 from std.random import random_float64
 from max.gpu import global_idx
 from max.gpu.host import DeviceContext, DeviceBuffer
-from layout import Layout, LayoutTensor
 
 from noeira.core.logger import Logger, NoOpLogger
 from noeira.nn.constants import DT, TPB
@@ -39,7 +38,7 @@ from noeira.nn.optimizer.adam import Adam
 from noeira.nn.core.checkpoint import (
     BinaryCheckpointWriter, BinaryCheckpointReader, CheckpointReader,
     CheckpointScalars, write_model, read_model, _split_lines, _is_v3_header,
-    _read_file_bytes, _write_file_bytes,
+    _read_file_bytes,
 )
 
 from noeira.nn.core.log_bundle import log_bundle
@@ -59,6 +58,7 @@ from ..data.n_step_replay import GPUNStepBuffer
 from .target_y_block import C51TargetYBlock
 from .blocks.q_update_step import C51QUpdateStep
 from .metrics import C51Metrics
+from noeira.core.tiles import RowMajor, Tile
 
 
 # ──────────────────────────────────────────────────────────────────────────
@@ -68,12 +68,12 @@ from .metrics import C51Metrics
 # buffers; the trainer reduces them via DeviceMeanAccum. Mirrors the CPU walk.
 # ──────────────────────────────────────────────────────────────────────────
 def _c51_diag_kernel[BATCH: Int, NK: Int](
-    logits: LayoutTensor[DT, Layout.row_major(BATCH, NK), MutAnyOrigin],
-    m: LayoutTensor[DT, Layout.row_major(BATCH, NK), MutAnyOrigin],
-    z: LayoutTensor[DT, Layout.row_major(NK), MutAnyOrigin],
-    eq_out: LayoutTensor[DT, Layout.row_major(BATCH), MutAnyOrigin],
-    ent_out: LayoutTensor[DT, Layout.row_major(BATCH), MutAnyOrigin],
-    tq_out: LayoutTensor[DT, Layout.row_major(BATCH), MutAnyOrigin],
+    logits: Tile[DT, BATCH, NK],
+    m: Tile[DT, BATCH, NK],
+    z: Tile[DT, NK],
+    eq_out: Tile[DT, BATCH],
+    ent_out: Tile[DT, BATCH],
+    tq_out: Tile[DT, BATCH],
 ):
     var b = Int(global_idx.x)
     if b >= BATCH:
@@ -454,34 +454,34 @@ struct C51Trainer[
         comptime if Self.train_target == "gpu":
             var t_diag = perf_counter_ns()
             var c = self.ctx.value()
-            comptime LBNK = Layout.row_major(Self.BATCH, Self.N_ATOMS)
-            comptime LNK = Layout.row_major(Self.N_ATOMS)
-            comptime LB = Layout.row_major(Self.BATCH)
+            comptime LBNK = RowMajor[Self.BATCH, Self.N_ATOMS]
+            comptime LNK = RowMajor[Self.N_ATOMS]
+            comptime LB = RowMajor[Self.BATCH]
             comptime n_blocks = (Self.BATCH + TPB - 1) // TPB
             comptime diag_k = _c51_diag_kernel[Self.BATCH, Self.N_ATOMS]
             c.enqueue_function[diag_k](
-                self.q_update_blk.inner._logits_a.lt["gpu", LBNK](),
-                self._mb_m.lt["gpu", LBNK](),
-                self.target_y_blk._z.lt["gpu", LNK](),
-                self._diag_eq.lt["gpu", LB](),
-                self._diag_ent.lt["gpu", LB](),
-                self._diag_tq.lt["gpu", LB](),
+                self.q_update_blk.inner._logits_a.tt["gpu", Self.BATCH, Self.N_ATOMS](),
+                self._mb_m.tt["gpu", Self.BATCH, Self.N_ATOMS](),
+                self.target_y_blk._z.tt["gpu", Self.N_ATOMS](),
+                self._diag_eq.tt["gpu", Self.BATCH](),
+                self._diag_ent.tt["gpu", Self.BATCH](),
+                self._diag_tq.tt["gpu", Self.BATCH](),
                 grid_dim=n_blocks, block_dim=TPB,
             )
             self._q_mean_dev.accumulate_gpu_lt[Self.BATCH](
-                self._diag_eq.lt["gpu", LB]()
+                self._diag_eq.tt["gpu", Self.BATCH]()
             )
             self._target_mean_dev.accumulate_gpu_lt[Self.BATCH](
-                self._diag_tq.lt["gpu", LB]()
+                self._diag_tq.tt["gpu", Self.BATCH]()
             )
             self._dist_entropy_mean_dev.accumulate_gpu_lt[Self.BATCH](
-                self._diag_ent.lt["gpu", LB]()
+                self._diag_ent.tt["gpu", Self.BATCH]()
             )
             self._reward_mean_dev.accumulate_gpu_lt[Self.BATCH](
-                self.state.mb_r.lt["gpu", LB]()
+                self.state.mb_r.tt["gpu", Self.BATCH]()
             )
             self._done_mean_dev.accumulate_gpu_lt[Self.BATCH](
-                self.state.mb_d.lt["gpu", LB]()
+                self.state.mb_d.tt["gpu", Self.BATCH]()
             )
             self.timer.accumulate(Self._T_DIAG, t_diag)
 
@@ -904,7 +904,7 @@ struct C51Trainer[
         and the counter as `K` scalars. Optimizer moments NOT persisted (resume
         re-warms, matching the storage SAC/DQN checkpoints). Target net
         hard-copied from online on load."""
-        var w = BinaryCheckpointWriter(save_moments=False)
+        var w = BinaryCheckpointWriter.to_file(path, save_moments=False)
         write_model[Self.train_target](w, self.pair.online, self.ctx, "q_net")
         var sc = CheckpointScalars()
         sc.set("eps.epsilon", Float64(self.epsilon))
@@ -912,7 +912,7 @@ struct C51Trainer[
         sc.set("eps.epsilon_min", Float64(self.epsilon_min))
         sc.set_int("total_train_steps", self._total_train_steps)
         w.write_scalars(sc)
-        _write_file_bytes(path, w.content)
+        w.commit()
 
     def load_state(mut self, path: String) raises:
         """Inverse of `save_state`: restore online params + state + ε + counter,

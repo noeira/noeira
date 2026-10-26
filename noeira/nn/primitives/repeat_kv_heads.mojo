@@ -33,7 +33,6 @@ Param-free, cache-free. CPU + GPU.
 
 from max.gpu import global_idx
 from max.gpu.host import DeviceContext
-from layout import Layout, LayoutTensor
 
 from noeira.nn.constants import DT, TPB
 from ..core.tensor import Tensor
@@ -42,15 +41,14 @@ from ..core.module import Module
 from ..core.param import ParamVisitor
 from ..core.initializer import Initializer
 from ..core.amp import AMPPolicy, NoAMP
+from noeira.core.tiles import Tile
 
 
 def _rkv_fwd_kernel[
     BATCH: Int, SEQ: Int, N_KV: Int, REP: Int, HD: Int
 ](
-    src: LayoutTensor[DT, Layout.row_major(BATCH, SEQ * N_KV * HD), MutAnyOrigin],
-    dst: LayoutTensor[
-        DT, Layout.row_major(BATCH, SEQ * N_KV * REP * HD), MutAnyOrigin
-    ],
+    src: Tile[DT, BATCH, SEQ * N_KV * HD],
+    dst: Tile[DT, BATCH, SEQ * N_KV * REP * HD],
 ):
     comptime IN_W = N_KV * HD
     comptime OUT_W = N_KV * REP * HD
@@ -73,10 +71,8 @@ def _rkv_fwd_kernel[
 def _rkv_bwd_kernel[
     BATCH: Int, SEQ: Int, N_KV: Int, REP: Int, HD: Int
 ](
-    go: LayoutTensor[
-        DT, Layout.row_major(BATCH, SEQ * N_KV * REP * HD), MutAnyOrigin
-    ],
-    gi: LayoutTensor[DT, Layout.row_major(BATCH, SEQ * N_KV * HD), MutAnyOrigin],
+    go: Tile[DT, BATCH, SEQ * N_KV * REP * HD],
+    gi: Tile[DT, BATCH, SEQ * N_KV * HD],
 ):
     comptime IN_W = N_KV * HD
     comptime OUT_W = N_KV * REP * HD
@@ -151,8 +147,8 @@ struct RepeatKVHeads[SEQ: Int, N_KV: Int, REP: Int, HEAD_DIM: Int](Module):
                     B, Self.SEQ, Self.N_KV, Self.REP, Self.HEAD_DIM
                 ]
             ](
-                x.lt["gpu", Layout.row_major(B, Self.IN_N)](),
-                out.lt["gpu", Layout.row_major(B, Self.OUT_N)](),
+                x.tt["gpu", B, Self.IN_N](),
+                out.tt["gpu", B, Self.OUT_N](),
                 grid_dim=n_blocks,
                 block_dim=TPB,
             )
@@ -195,8 +191,8 @@ struct RepeatKVHeads[SEQ: Int, N_KV: Int, REP: Int, HEAD_DIM: Int](Module):
                     B, Self.SEQ, Self.N_KV, Self.REP, Self.HEAD_DIM
                 ]
             ](
-                grad_output.lt["gpu", Layout.row_major(B, Self.OUT_N)](),
-                gin.lt["gpu", Layout.row_major(B, Self.IN_N)](),
+                grad_output.tt["gpu", B, Self.OUT_N](),
+                gin.tt["gpu", B, Self.IN_N](),
                 grid_dim=n_blocks,
                 block_dim=TPB,
             )

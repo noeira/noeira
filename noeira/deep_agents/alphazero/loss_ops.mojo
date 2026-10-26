@@ -27,7 +27,6 @@ receives `forward_input` (no cached input pointers), `ctx` is a method arg (no
 from std.math import exp, log, tanh
 from max.gpu.host import DeviceContext
 from max.gpu import global_idx
-from layout import Layout, LayoutTensor
 
 from noeira.nn.constants import DT, TPB
 from noeira.nn.core.tensor import Tensor
@@ -35,13 +34,14 @@ from noeira.nn.core.tensor_refs import TensorRefs
 from noeira.nn.core.module import Module
 from noeira.nn.core.initializer import Initializer
 from noeira.nn.core.amp import AMPPolicy, NoAMP
+from noeira.core.tiles import Tile
 
 
 # ── GPU kernels (one thread per batch row). ───────────────────────────────
 def _az_loss_fwd_kernel[B: Int, ACT: Int](
-    pred: LayoutTensor[DT, Layout.row_major(B * (ACT + 1)), MutAnyOrigin],
-    tgt: LayoutTensor[DT, Layout.row_major(B * (ACT + 1)), MutAnyOrigin],
-    o: LayoutTensor[DT, Layout.row_major(B), MutAnyOrigin],
+    pred: Tile[DT, B * (ACT + 1)],
+    tgt: Tile[DT, B * (ACT + 1)],
+    o: Tile[DT, B],
 ):
     var b = Int(global_idx.x)
     if b < B:
@@ -66,11 +66,11 @@ def _az_loss_fwd_kernel[B: Int, ACT: Int](
 
 
 def _az_loss_bwd_kernel[B: Int, ACT: Int](
-    go: LayoutTensor[DT, Layout.row_major(B), MutAnyOrigin],
-    pred: LayoutTensor[DT, Layout.row_major(B * (ACT + 1)), MutAnyOrigin],
-    tgt: LayoutTensor[DT, Layout.row_major(B * (ACT + 1)), MutAnyOrigin],
-    gp: LayoutTensor[DT, Layout.row_major(B * (ACT + 1)), MutAnyOrigin],
-    gt: LayoutTensor[DT, Layout.row_major(B * (ACT + 1)), MutAnyOrigin],
+    go: Tile[DT, B],
+    pred: Tile[DT, B * (ACT + 1)],
+    tgt: Tile[DT, B * (ACT + 1)],
+    gp: Tile[DT, B * (ACT + 1)],
+    gt: Tile[DT, B * (ACT + 1)],
 ):
     var b = Int(global_idx.x)
     if b < B:
@@ -144,9 +144,9 @@ struct AZLossOp[ACT: Int](Module):
         else:
             var c = ctx.value()
             out.ensure_gpu(c, B)
-            var predl = pred.lt["gpu", Layout.row_major(B * W)]()
-            var tgtl = tgt.lt["gpu", Layout.row_major(B * W)]()
-            var ol = out.lt["gpu", Layout.row_major(B)]()
+            var predl = pred.tt["gpu", B * W]()
+            var tgtl = tgt.tt["gpu", B * W]()
+            var ol = out.tt["gpu", B]()
             comptime nb = (B + TPB - 1) // TPB
             c.enqueue_function[_az_loss_fwd_kernel[B, Self.ACT]](
                 predl, tgtl, ol, grid_dim=nb, block_dim=TPB
@@ -198,11 +198,11 @@ struct AZLossOp[ACT: Int](Module):
             var c = ctx.value()
             g_pred.ensure_gpu(c, B * W)
             g_tgt.ensure_gpu(c, B * W)
-            var gol = grad_output.lt["gpu", Layout.row_major(B)]()
-            var predl = pred.lt["gpu", Layout.row_major(B * W)]()
-            var tgtl = tgt.lt["gpu", Layout.row_major(B * W)]()
-            var gpl = g_pred.lt["gpu", Layout.row_major(B * W)]()
-            var gtl = g_tgt.lt["gpu", Layout.row_major(B * W)]()
+            var gol = grad_output.tt["gpu", B]()
+            var predl = pred.tt["gpu", B * W]()
+            var tgtl = tgt.tt["gpu", B * W]()
+            var gpl = g_pred.tt["gpu", B * W]()
+            var gtl = g_tgt.tt["gpu", B * W]()
             comptime nb = (B + TPB - 1) // TPB
             c.enqueue_function[_az_loss_bwd_kernel[B, Self.ACT]](
                 gol, predl, tgtl, gpl, gtl, grid_dim=nb, block_dim=TPB

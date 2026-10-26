@@ -18,21 +18,21 @@ fixed buffers, no host work on the GPU path).
 
 from max.gpu import global_idx
 from max.gpu.host import DeviceContext
-from layout import Layout, LayoutTensor
 
 from noeira.nn.constants import DT, TPB
+from noeira.core.tiles import Tile
 
 
 def _mask_bootstrap_kernel[
     N: Int
 ](
-    r: LayoutTensor[DT, Layout.row_major(N), MutAnyOrigin],
-    term: LayoutTensor[DT, Layout.row_major(N), MutAnyOrigin],
-    y: LayoutTensor[DT, Layout.row_major(N, 1), MutAnyOrigin],
+    r: Tile[DT, N],
+    term: Tile[DT, N],
+    y: Tile[DT, N, 1],
 ):
     var i = Int(global_idx.x)
     if i < N:
-        var nonterm: y.element_type = 1.0 - term[i]
+        var nonterm: y.ElementType = 1.0 - term[i]
         y[i, 0] = r[i] + nonterm * y[i, 0]
 
 
@@ -40,9 +40,9 @@ def apply_terminal_mask[
     target: StaticString, N: Int
 ](
     ctx: Optional[DeviceContext],
-    mb_r: LayoutTensor[DT, Layout.row_major(N), MutAnyOrigin],
-    mb_term: LayoutTensor[DT, Layout.row_major(N), MutAnyOrigin],
-    mb_y: LayoutTensor[DT, Layout.row_major(N, 1), MutAnyOrigin],
+    mb_r: Tile[DT, N],
+    mb_term: Tile[DT, N],
+    mb_y: Tile[DT, N, 1],
 ) raises:
     """In-place `mb_y[b] = r[b] + (1 − term[b]) · mb_y[b]` over N samples.
 
@@ -50,7 +50,7 @@ def apply_terminal_mask[
     target. `ctx` is required (and used) only on the GPU path."""
     comptime if target == "cpu":
         for b in range(N):
-            var nonterm: mb_y.element_type = 1.0 - mb_term[b]
+            var nonterm: mb_y.ElementType = 1.0 - mb_term[b]
             mb_y[b, 0] = mb_r[b] + nonterm * mb_y[b, 0]
     else:
         comptime n_blocks = (N + TPB - 1) // TPB

@@ -31,7 +31,7 @@ Run: pixi run -e apple mojo run -I . tests/physics3d/test_sap_fields.mojo
 
 from std.math import abs
 from max.gpu.host import DeviceContext
-from std.sys import has_nvidia_gpu_accelerator
+from std.sys import default_accelerator
 from std.testing import TestSuite
 
 from noeira.nn.core.tensor import TensorImpl
@@ -507,14 +507,14 @@ def _part_a_humanoid(ctx: DeviceContext) raises:
         print("  HARVEST GOLD_NCON_H =", ncon_h)
         print("  HARVEST GOLD_CON_H  =", fp_h)
     else:
-        if ncon_h != GOLD_NCON_H and not has_nvidia_gpu_accelerator():
+        if ncon_h != GOLD_NCON_H and not default_accelerator().is_nvidia_gpu():
             raise Error(
                 "humanoid SAP contacts " + String(ncon_h) + " != golden "
                 + String(GOLD_NCON_H)
             )
         var denom = abs(GOLD_CON_H) if abs(GOLD_CON_H) > 1e-9 else 1.0
         if abs(fp_h - GOLD_CON_H) / denom > GOLD_RTOL and (
-            not has_nvidia_gpu_accelerator()
+            not default_accelerator().is_nvidia_gpu()
         ):
             raise Error(
                 "humanoid SAP fingerprint " + String(fp_h) + " != golden "
@@ -797,14 +797,14 @@ def _part_b_sawyer(ctx: DeviceContext) raises:
         print("  HARVEST GOLD_CON_S  =", fp_s)
         print("  HARVEST GOLD_SOL_S  =", fp_s_sol)
     else:
-        if ncon_s != GOLD_NCON_S and not has_nvidia_gpu_accelerator():
+        if ncon_s != GOLD_NCON_S and not default_accelerator().is_nvidia_gpu():
             raise Error(
                 "sawyer SAP contacts " + String(ncon_s) + " != golden "
                 + String(GOLD_NCON_S)
             )
         var denom = abs(GOLD_CON_S) if abs(GOLD_CON_S) > 1e-9 else 1.0
         if abs(fp_s - GOLD_CON_S) / denom > GOLD_RTOL and (
-            not has_nvidia_gpu_accelerator()
+            not default_accelerator().is_nvidia_gpu()
         ):
             raise Error(
                 "sawyer SAP GEOMETRY fingerprint " + String(fp_s)
@@ -812,7 +812,7 @@ def _part_b_sawyer(ctx: DeviceContext) raises:
             )
         var sdenom = abs(GOLD_SOL_S) if abs(GOLD_SOL_S) > 1e-9 else 1.0
         if abs(fp_s_sol - GOLD_SOL_S) / sdenom > GOLD_RTOL and (
-            not has_nvidia_gpu_accelerator()
+            not default_accelerator().is_nvidia_gpu()
         ):
             raise Error(
                 "sawyer SAP SOLPARAM fingerprint " + String(fp_s_sol)

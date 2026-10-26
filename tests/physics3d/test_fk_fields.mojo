@@ -24,7 +24,7 @@ Run: pixi run -e apple mojo run -I . tests/physics3d/test_fk_fields.mojo
 
 from std.math import abs
 from max.gpu.host import DeviceContext
-from std.sys import has_nvidia_gpu_accelerator
+from std.sys import default_accelerator, has_accelerator
 
 from noeira.nn.core.tensor import TensorImpl
 from noeira.physics3d.joint_types import JNT_HINGE
@@ -135,7 +135,7 @@ def _gold_check(name: String, got: Float64, gold: Float64) raises:
     else:
         var denom = abs(gold) if abs(gold) > 1e-9 else 1.0
         if abs(got - gold) / denom > GOLD_RTOL and (
-            not has_nvidia_gpu_accelerator()
+            not default_accelerator().is_nvidia_gpu()
         ):
             raise Error(
                 name + " fingerprint " + String(got) + " != golden "
@@ -385,6 +385,12 @@ def test_synthetic_sites() raises:
 
 
 def main() raises:
-    test_walker2d()
-    test_synthetic_sites()
-    print("test_fk_fields: ALL PASS")
+    comptime if has_accelerator():
+        test_walker2d()
+        test_synthetic_sites()
+        print("test_fk_fields: ALL PASS")
+    else:
+        print(
+            "test_fk_fields: SKIPPED (no accelerator;"
+            " run with -e apple / -e nvidia)"
+        )

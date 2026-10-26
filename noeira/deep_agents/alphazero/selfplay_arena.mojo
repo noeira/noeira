@@ -46,7 +46,6 @@ from noeira.nn.core.param import walk_params
 from std.math import exp, log, tanh
 from std.memory import Pointer
 from max.gpu.host import DeviceContext, DeviceBuffer
-from layout import Layout, LayoutTensor
 
 from noeira.nn.constants import DT
 from noeira.nn.core.module import Module
@@ -75,6 +74,7 @@ from ..zero.mcts_adapters import AZPredGPU, AZEnvGPU
 from ..zero.example_replay import MCTSExampleReplay
 from ..zero.symmetries import BoardAugmenter
 from ..zero.evaluators import GPUEvaluator, RandomOpponent
+from noeira.core.tiles import tile
 
 
 @fieldwise_init
@@ -406,10 +406,8 @@ def run_alphazero_selfplay_arena[
         net.set_attr["training"](Scalar[DT](0.0))
         var pred = AZPredGPU[OBS, ACT, NET].make(net)
         var env_ad = AZEnvGPU[ENV, STATE, OBS, ACT]()
-        var root_obs = LayoutTensor[DT, Layout.row_major(N_ENVS, OBS)](obs_dev)
-        var root_legal = LayoutTensor[DT, Layout.row_major(N_ENVS * ACT)](
-            legal_dev
-        )
+        var root_obs = tile[N_ENVS, OBS](obs_dev)
+        var root_legal = tile[N_ENVS * ACT](legal_dev)
         mcts.search_gpu_alphazero[type_of(pred), type_of(env_ad)](
             ctx,
             pred,
@@ -444,10 +442,8 @@ def run_alphazero_selfplay_arena[
         #     policies_out, so the one-hot policy this overwrites for greedy
         #     plies is harmless. The kernel is legal-mask aware.
         ctx.enqueue_copy(ep_steps_dev, ep_steps_h)
-        var ep_t = LayoutTensor[DT, Layout.row_major(N_ENVS)](ep_steps_dev)
-        var legal_t = LayoutTensor[DT, Layout.row_major(N_ENVS * ACT)](
-            legal_dev
-        )
+        var ep_t = tile[N_ENVS](ep_steps_dev)
+        var legal_t = tile[N_ENVS * ACT](legal_dev)
         mcts.extract_actions_temp[TEMP_MOVES](
             ctx,
             ep_t,

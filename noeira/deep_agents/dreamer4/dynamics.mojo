@@ -54,7 +54,8 @@ no atomics are needed — the signal/step vocabs are tiny (KMAX+1, log2 KMAX+1).
 from max.gpu import global_idx
 from max.gpu.host import DeviceContext, DeviceBuffer
 from max.gpu.memory import AddressSpace
-from layout import Layout, LayoutTensor, TileTensor, row_major
+from layout import TileTensor, row_major
+from noeira.core.tiles import Tile, tile
 
 from noeira.nn.constants import DT, TPB
 from noeira.nn.core.module import Module
@@ -97,14 +98,14 @@ def _pos(a: Int, fallback: Int) -> Int:
 def _dyn_assemble_kernel[
     BT: Int, S: Int, D: Int, NSP: Int, NREG: Int, NSIG: Int, NSTEP: Int
 ](
-    proj_out: LayoutTensor[DT, Layout.row_major(BT * NSP * D), MutAnyOrigin],
-    action_base: LayoutTensor[DT, Layout.row_major(D), MutAnyOrigin],
-    signal_table: LayoutTensor[DT, Layout.row_major(NSIG * D), MutAnyOrigin],
-    step_table: LayoutTensor[DT, Layout.row_major(NSTEP * D), MutAnyOrigin],
-    register: LayoutTensor[DT, Layout.row_major(NREG * D), MutAnyOrigin],
-    sig: LayoutTensor[DT, Layout.row_major(BT), MutAnyOrigin],
-    step: LayoutTensor[DT, Layout.row_major(BT), MutAnyOrigin],
-    grid: LayoutTensor[DT, Layout.row_major(BT * S * D), MutAnyOrigin],
+    proj_out: Tile[DT, BT * NSP * D],
+    action_base: Tile[DT, D],
+    signal_table: Tile[DT, NSIG * D],
+    step_table: Tile[DT, NSTEP * D],
+    register: Tile[DT, NREG * D],
+    sig: Tile[DT, BT],
+    step: Tile[DT, BT],
+    grid: Tile[DT, BT * S * D],
 ):
     var idx = Int(global_idx.x)
     if idx >= BT * S * D:
@@ -136,8 +137,8 @@ def _dyn_assemble_kernel[
 
 # grad_grid → grad_proj_out (spatial tokens at cols [3D, (3+NSP)D)).
 def _dyn_grad_proj_kernel[BT: Int, S: Int, D: Int, NSP: Int](
-    ggrid: LayoutTensor[DT, Layout.row_major(BT * S * D), MutAnyOrigin],
-    gproj: LayoutTensor[DT, Layout.row_major(BT * NSP * D), MutAnyOrigin],
+    ggrid: Tile[DT, BT * S * D],
+    gproj: Tile[DT, BT * NSP * D],
 ):
     var idx = Int(global_idx.x)
     if idx >= BT * NSP * D:
@@ -149,8 +150,8 @@ def _dyn_grad_proj_kernel[BT: Int, S: Int, D: Int, NSP: Int](
 
 # action_base grad: gbase[d] += Σ_bt ggrid[bt, d].
 def _dyn_grad_base_kernel[BT: Int, S: Int, D: Int](
-    ggrid: LayoutTensor[DT, Layout.row_major(BT * S * D), MutAnyOrigin],
-    gbase: LayoutTensor[DT, Layout.row_major(D), MutAnyOrigin],
+    ggrid: Tile[DT, BT * S * D],
+    gbase: Tile[DT, D],
 ):
     var d = Int(global_idx.x)
     if d >= D:
@@ -163,8 +164,8 @@ def _dyn_grad_base_kernel[BT: Int, S: Int, D: Int](
 
 # register grad: greg[k] += Σ_bt ggrid[bt, REG_OFF + k].
 def _dyn_grad_reg_kernel[BT: Int, S: Int, D: Int, NSP: Int, NREG: Int](
-    ggrid: LayoutTensor[DT, Layout.row_major(BT * S * D), MutAnyOrigin],
-    greg: LayoutTensor[DT, Layout.row_major(NREG * D), MutAnyOrigin],
+    ggrid: Tile[DT, BT * S * D],
+    greg: Tile[DT, NREG * D],
 ):
     var k = Int(global_idx.x)
     if k >= NREG * D:
@@ -178,9 +179,9 @@ def _dyn_grad_reg_kernel[BT: Int, S: Int, D: Int, NSP: Int, NREG: Int](
 
 # signal-table grad (index-masked batch reduction; signal token at col [D,2D)).
 def _dyn_grad_sig_kernel[BT: Int, S: Int, D: Int, NSIG: Int](
-    ggrid: LayoutTensor[DT, Layout.row_major(BT * S * D), MutAnyOrigin],
-    sig: LayoutTensor[DT, Layout.row_major(BT), MutAnyOrigin],
-    gsig: LayoutTensor[DT, Layout.row_major(NSIG * D), MutAnyOrigin],
+    ggrid: Tile[DT, BT * S * D],
+    sig: Tile[DT, BT],
+    gsig: Tile[DT, NSIG * D],
 ):
     var e = Int(global_idx.x)
     if e >= NSIG * D:
@@ -197,9 +198,9 @@ def _dyn_grad_sig_kernel[BT: Int, S: Int, D: Int, NSIG: Int](
 
 # step-table grad (index-masked; step token at col [2D,3D)).
 def _dyn_grad_step_kernel[BT: Int, S: Int, D: Int, NSTEP: Int](
-    ggrid: LayoutTensor[DT, Layout.row_major(BT * S * D), MutAnyOrigin],
-    step: LayoutTensor[DT, Layout.row_major(BT), MutAnyOrigin],
-    gstep: LayoutTensor[DT, Layout.row_major(NSTEP * D), MutAnyOrigin],
+    ggrid: Tile[DT, BT * S * D],
+    step: Tile[DT, BT],
+    gstep: Tile[DT, NSTEP * D],
 ):
     var e = Int(global_idx.x)
     if e >= NSTEP * D:
@@ -217,8 +218,8 @@ def _dyn_grad_step_kernel[BT: Int, S: Int, D: Int, NSTEP: Int](
 # action conditioning: add the act-MLP output into the action token (col [0,D))
 # of the assembled grid — fires only when ACOND (one thread per (bt,d)).
 def _dyn_add_act_kernel[BT: Int, S: Int, D: Int](
-    aout: LayoutTensor[DT, Layout.row_major(BT * D), MutAnyOrigin],
-    grid: LayoutTensor[DT, Layout.row_major(BT * S * D), MutAnyOrigin],
+    aout: Tile[DT, BT * D],
+    grid: Tile[DT, BT * S * D],
 ):
     var e = Int(global_idx.x)
     if e >= BT * D:
@@ -234,8 +235,8 @@ def _dyn_add_act_kernel[BT: Int, S: Int, D: Int](
 # action conditioning vjp: extract the action-token grad (col [0,D)) into a
 # packed [BT, D] buffer = the act-MLP's grad_output (same grad as action_base).
 def _dyn_extract_token0_kernel[BT: Int, S: Int, D: Int](
-    ggrid: LayoutTensor[DT, Layout.row_major(BT * S * D), MutAnyOrigin],
-    gaout: LayoutTensor[DT, Layout.row_major(BT * D), MutAnyOrigin],
+    ggrid: Tile[DT, BT * S * D],
+    gaout: Tile[DT, BT * D],
 ):
     var e = Int(global_idx.x)
     if e >= BT * D:
@@ -249,8 +250,8 @@ def _dyn_extract_token0_kernel[BT: Int, S: Int, D: Int](
 # (S - NAGENT)·D = AGENT_OFF; AG_DIM = NAGENT·D. One thread per (bt, k). ──
 # write the agent input into the grid agent columns.
 def _dyn_set_agent_kernel[BT: Int, S: Int, D: Int, NAGENT: Int](
-    agin: LayoutTensor[DT, Layout.row_major(BT * NAGENT * D), MutAnyOrigin],
-    grid: LayoutTensor[DT, Layout.row_major(BT * S * D), MutAnyOrigin],
+    agin: Tile[DT, BT * NAGENT * D],
+    grid: Tile[DT, BT * S * D],
 ):
     comptime AG = NAGENT * D
     comptime OFF = (S - NAGENT) * D
@@ -264,8 +265,8 @@ def _dyn_set_agent_kernel[BT: Int, S: Int, D: Int, NAGENT: Int](
 
 # extract h_t = transformer-output agent columns into a packed [BT, AG] buffer.
 def _dyn_extract_agent_fwd_kernel[BT: Int, S: Int, D: Int, NAGENT: Int](
-    tfout: LayoutTensor[DT, Layout.row_major(BT * S * D), MutAnyOrigin],
-    agout: LayoutTensor[DT, Layout.row_major(BT * NAGENT * D), MutAnyOrigin],
+    tfout: Tile[DT, BT * S * D],
+    agout: Tile[DT, BT * NAGENT * D],
 ):
     comptime AG = NAGENT * D
     comptime OFF = (S - NAGENT) * D
@@ -279,8 +280,8 @@ def _dyn_extract_agent_fwd_kernel[BT: Int, S: Int, D: Int, NAGENT: Int](
 
 # add the h_t grad into the agent columns of the transformer-output grad.
 def _dyn_add_agent_grad_kernel[BT: Int, S: Int, D: Int, NAGENT: Int](
-    gagout: LayoutTensor[DT, Layout.row_major(BT * NAGENT * D), MutAnyOrigin],
-    gtfout: LayoutTensor[DT, Layout.row_major(BT * S * D), MutAnyOrigin],
+    gagout: Tile[DT, BT * NAGENT * D],
+    gtfout: Tile[DT, BT * S * D],
 ):
     comptime AG = NAGENT * D
     comptime OFF = (S - NAGENT) * D
@@ -297,8 +298,8 @@ def _dyn_add_agent_grad_kernel[BT: Int, S: Int, D: Int, NAGENT: Int](
 
 # extract the grad wrt the agent input from the grid grad agent columns.
 def _dyn_extract_agent_grad_kernel[BT: Int, S: Int, D: Int, NAGENT: Int](
-    ggrid: LayoutTensor[DT, Layout.row_major(BT * S * D), MutAnyOrigin],
-    gagin: LayoutTensor[DT, Layout.row_major(BT * NAGENT * D), MutAnyOrigin],
+    ggrid: Tile[DT, BT * S * D],
+    gagin: Tile[DT, BT * NAGENT * D],
 ):
     comptime AG = NAGENT * D
     comptime OFF = (S - NAGENT) * D
@@ -731,30 +732,14 @@ struct Dreamer4Dynamics[
 
             comptime AN = BATCH * Self.SD
             comptime PN = BATCH * Self.NSP * Self.D
-            var proj_lt = LayoutTensor[DT, Layout.row_major(PN), MutAnyOrigin](
-                self.proj_out.dev.value()
-            )
-            var ab_lt = LayoutTensor[DT, Layout.row_major(Self.D), MutAnyOrigin](
-                self.action_base.val.dev.value()
-            )
-            var sg_lt = LayoutTensor[
-                DT, Layout.row_major(Self.NSIG * Self.D), MutAnyOrigin
-            ](self.signal_table.val.dev.value())
-            var st_lt = LayoutTensor[
-                DT, Layout.row_major(Self.NSTEP * Self.D), MutAnyOrigin
-            ](self.step_table.val.dev.value())
-            var rg_lt = LayoutTensor[
-                DT, Layout.row_major(Self.NREG * Self.D), MutAnyOrigin
-            ](self.register.val.dev.value())
-            var si_lt = LayoutTensor[DT, Layout.row_major(BATCH), MutAnyOrigin](
-                self.sig_stage.dev.value()
-            )
-            var sp_lt = LayoutTensor[DT, Layout.row_major(BATCH), MutAnyOrigin](
-                self.step_stage.dev.value()
-            )
-            var grid_lt = LayoutTensor[DT, Layout.row_major(AN), MutAnyOrigin](
-                self.grid.dev.value()
-            )
+            var proj_lt = tile[PN](self.proj_out.dev.value())
+            var ab_lt = tile[Self.D](self.action_base.val.dev.value())
+            var sg_lt = tile[Self.NSIG * Self.D](self.signal_table.val.dev.value())
+            var st_lt = tile[Self.NSTEP * Self.D](self.step_table.val.dev.value())
+            var rg_lt = tile[Self.NREG * Self.D](self.register.val.dev.value())
+            var si_lt = tile[BATCH](self.sig_stage.dev.value())
+            var sp_lt = tile[BATCH](self.step_stage.dev.value())
+            var grid_lt = tile[AN](self.grid.dev.value())
             comptime ak = _dyn_assemble_kernel[
                 BATCH, Self.S, Self.D, Self.NSP, Self.NREG, Self.NSIG, Self.NSTEP
             ]
@@ -768,9 +753,7 @@ struct Dreamer4Dynamics[
                 self.act_mlp.forward[target, BATCH, POLICY=POLICY](
                     TensorRefs[1](self.cache_act), self.act_out, ctx
                 )
-                var aout_lt = LayoutTensor[
-                    DT, Layout.row_major(BATCH * Self.D), MutAnyOrigin
-                ](self.act_out.dev.value())
+                var aout_lt = tile[BATCH * Self.D](self.act_out.dev.value())
                 comptime addk = _dyn_add_act_kernel[BATCH, Self.S, Self.D]
                 c.enqueue_function[addk](
                     aout_lt, grid_lt,
@@ -778,9 +761,7 @@ struct Dreamer4Dynamics[
                 )
             # agent token input → grid agent columns
             comptime if Self.AGENT:
-                var agin_lt = LayoutTensor[
-                    DT, Layout.row_major(BATCH * Self.AG_DIM), MutAnyOrigin
-                ](self.cache_agent_in.dev.value())
+                var agin_lt = tile[BATCH * Self.AG_DIM](self.cache_agent_in.dev.value())
                 comptime stk = _dyn_set_agent_kernel[
                     BATCH, Self.S, Self.D, Self.NAGENT
                 ]
@@ -796,12 +777,8 @@ struct Dreamer4Dynamics[
             )
             # h_t = transformer output agent columns
             comptime if Self.AGENT:
-                var tfout_lt = LayoutTensor[
-                    DT, Layout.row_major(BATCH * Self.SD), MutAnyOrigin
-                ](self.tf_out.dev.value())
-                var agout_lt = LayoutTensor[
-                    DT, Layout.row_major(BATCH * Self.AG_DIM), MutAnyOrigin
-                ](self.agent_out.dev.value())
+                var tfout_lt = tile[BATCH * Self.SD](self.tf_out.dev.value())
+                var agout_lt = tile[BATCH * Self.AG_DIM](self.agent_out.dev.value())
                 comptime exk = _dyn_extract_agent_fwd_kernel[
                     BATCH, Self.S, Self.D, Self.NAGENT
                 ]
@@ -928,12 +905,8 @@ struct Dreamer4Dynamics[
                 for i in range(BATCH * Self.AG_DIM):
                     goh2.unsafe_ptr()[unsafe_offset=i] = self.grad_agent_out.data[i]
                 c.enqueue_copy(self.grad_agent_out.dev.value(), goh2)
-                var gagout_lt = LayoutTensor[
-                    DT, Layout.row_major(BATCH * Self.AG_DIM), MutAnyOrigin
-                ](self.grad_agent_out.dev.value())
-                var gtfout_lt = LayoutTensor[
-                    DT, Layout.row_major(BATCH * Self.SD), MutAnyOrigin
-                ](self.grad_tf_out.dev.value())
+                var gagout_lt = tile[BATCH * Self.AG_DIM](self.grad_agent_out.dev.value())
+                var gtfout_lt = tile[BATCH * Self.SD](self.grad_tf_out.dev.value())
                 comptime agk = _dyn_add_agent_grad_kernel[
                     BATCH, Self.S, Self.D, Self.NAGENT
                 ]
@@ -948,12 +921,8 @@ struct Dreamer4Dynamics[
                 TensorRefs[1](self.grad_grid), ctx,
             )
 
-            var ggrid_lt = LayoutTensor[DT, Layout.row_major(AN), MutAnyOrigin](
-                self.grad_grid.dev.value()
-            )
-            var gpo_lt = LayoutTensor[DT, Layout.row_major(PN), MutAnyOrigin](
-                self.grad_proj_out.dev.value()
-            )
+            var ggrid_lt = tile[AN](self.grad_grid.dev.value())
+            var gpo_lt = tile[PN](self.grad_proj_out.dev.value())
             comptime gpk = _dyn_grad_proj_kernel[BATCH, Self.S, Self.D, Self.NSP]
             c.enqueue_function[gpk](
                 ggrid_lt, gpo_lt, grid_dim=(PN + TPB - 1) // TPB, block_dim=TPB,
@@ -965,9 +934,7 @@ struct Dreamer4Dynamics[
             # agent input grad = grid grad agent columns (feeds the TaskEmbedder
             # backward).
             comptime if Self.AGENT:
-                var gagin_lt = LayoutTensor[
-                    DT, Layout.row_major(BATCH * Self.AG_DIM), MutAnyOrigin
-                ](self.grad_agent_in.dev.value())
+                var gagin_lt = tile[BATCH * Self.AG_DIM](self.grad_agent_in.dev.value())
                 comptime egk = _dyn_extract_agent_grad_kernel[
                     BATCH, Self.S, Self.D, Self.NAGENT
                 ]
@@ -978,24 +945,12 @@ struct Dreamer4Dynamics[
                 )
 
             # raw conditioning-param grads (storage vjp always computes them).
-            var gab_lt = LayoutTensor[
-                DT, Layout.row_major(Self.D), MutAnyOrigin
-            ](self.action_base.grd.dev.value())
-            var greg_lt = LayoutTensor[
-                DT, Layout.row_major(Self.NREG * Self.D), MutAnyOrigin
-            ](self.register.grd.dev.value())
-            var gsig_lt = LayoutTensor[
-                DT, Layout.row_major(Self.NSIG * Self.D), MutAnyOrigin
-            ](self.signal_table.grd.dev.value())
-            var gstp_lt = LayoutTensor[
-                DT, Layout.row_major(Self.NSTEP * Self.D), MutAnyOrigin
-            ](self.step_table.grd.dev.value())
-            var si_lt = LayoutTensor[
-                DT, Layout.row_major(BATCH), MutAnyOrigin
-            ](self.sig_stage.dev.value())
-            var sp_lt = LayoutTensor[
-                DT, Layout.row_major(BATCH), MutAnyOrigin
-            ](self.step_stage.dev.value())
+            var gab_lt = tile[Self.D](self.action_base.grd.dev.value())
+            var greg_lt = tile[Self.NREG * Self.D](self.register.grd.dev.value())
+            var gsig_lt = tile[Self.NSIG * Self.D](self.signal_table.grd.dev.value())
+            var gstp_lt = tile[Self.NSTEP * Self.D](self.step_table.grd.dev.value())
+            var si_lt = tile[BATCH](self.sig_stage.dev.value())
+            var sp_lt = tile[BATCH](self.step_stage.dev.value())
             comptime bk = _dyn_grad_base_kernel[BATCH, Self.S, Self.D]
             c.enqueue_function[bk](
                 ggrid_lt, gab_lt,
@@ -1027,9 +982,7 @@ struct Dreamer4Dynamics[
             )
             # action MLP grad: act-token grad (ggrid col [0,D)) → act_mlp.vjp
             comptime if Self.ACOND:
-                var gaout_lt = LayoutTensor[
-                    DT, Layout.row_major(BATCH * Self.D), MutAnyOrigin
-                ](self.grad_act_out.dev.value())
+                var gaout_lt = tile[BATCH * Self.D](self.grad_act_out.dev.value())
                 comptime xk = _dyn_extract_token0_kernel[
                     BATCH, Self.S, Self.D
                 ]

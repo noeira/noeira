@@ -238,7 +238,7 @@ struct SmolVLAQueryWorker[
         var sp_frozen = Linear[SMOLVLA_STATE_DIM, SMOLLM_DIM].make[
             Self.target, Deterministic
         ](self.ctx)
-        load_trainables[
+        _ = load_trainables[
             Self.target, SMOLLM_LAYERS, SMOLVLA_EXPERT_W, EXPERT_FF,
             SMOLLM_DIM, SMOLLM_KV_W, SMOLVLA_ACTION_DIM,
         ](
@@ -256,6 +256,9 @@ struct SmolVLAQueryWorker[
         # Inference only from here: the towers' attention fused (see
         # `SmolVLAPolicy.set_fused_vision_attention`) unless asked not to.
         p.set_fused_vision_attention(self.fused_vision)
+        # Nothing trains here: every gradient buffer goes back.
+        var n_frozen = p.freeze_all[Self.target](self.ctx)
+        print("             " + String(n_frozen) + " values frozen")
         self.pol = p^
 
         var tasks = TaskTokens(self.tasks_path)

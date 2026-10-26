@@ -25,7 +25,7 @@ QUATERNION ORDER: `Data.xquat` and the packed geom record are both
 """
 
 from std.collections import Array
-from layout import Layout, LayoutTensor
+from layout import TileTensor, TensorLayout
 
 from ..fields import Data, Dims, DimsLike
 from ..gpu.constants import (
@@ -86,15 +86,11 @@ def geom_xmat_elem[DTYPE: DType, D: DimsLike](
 @always_inline
 def geom_xquat_gpu[
     DTYPE: DType,
-    L_XQUAT: Layout,
-    L_GEOMS: Layout,
+    L_XQUAT: TensorLayout,
+    L_GEOMS: TensorLayout,
 ](
-    xquat: LayoutTensor[
-        DTYPE, L_XQUAT, MutAnyOrigin
-    ],
-    geoms: LayoutTensor[
-        DTYPE, L_GEOMS, MutAnyOrigin
-    ],
+    xquat: TileTensor[DTYPE, L_XQUAT, MutAnyOrigin],
+    geoms: TileTensor[DTYPE, L_GEOMS, MutAnyOrigin],
     env: Int,
     geom: Int,
 ) -> Array[Scalar[DTYPE], 4]:

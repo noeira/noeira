@@ -17,7 +17,7 @@ the format.
 """
 
 from std.math import abs, sqrt
-from std.sys import has_nvidia_gpu_accelerator
+from std.sys import default_accelerator
 from max.gpu.host import DeviceContext
 
 from noeira.nn.constants import DT
@@ -95,7 +95,7 @@ def tf32_gemm[target: StaticString]() -> Bool:
     gradients ~0.3 std off while a wrong VJP flips or rotates them. The CPU
     leg on the same machine keeps the exact float32 check."""
     comptime if target == "gpu":
-        return has_nvidia_gpu_accelerator()
+        return default_accelerator().is_nvidia_gpu()
     return False
 
 
@@ -114,7 +114,7 @@ def ref_input[target: StaticString](
 def std_err[target: StaticString](
     dump_dir: String, name: String, mut got: Tensor, ctx: Optional[DeviceContext]
 ) raises -> Float64:
-    """max |got - ref| / std(ref) over the reference's elements."""
+    """`max |got - ref| / std(ref)` over the reference's elements."""
     comptime if target == "gpu":
         ctx.value().synchronize()
         got.download(ctx.value())

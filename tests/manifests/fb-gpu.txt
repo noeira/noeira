@@ -41,6 +41,13 @@ tests/deep_agents/test_fb_ring_derived_next.mojo
 # driver runs end to end, two device steps advance the counters, and the
 # checkpoint loads into the CPU FBTrainer the eval scripts build. ~5 min.
 tests/deep_agents/test_fb_online_smoke.mojo
+# FB-MEBE online (FB_MEBE_G1_PLAN.md §2): the pool refresh writes B(s) of
+# real ring rows, inverse-density, filter honoured; boundaries on the
+# truncation schedule; the r_reg column equals its host recomputation row by
+# row; the driver runs with the step captured; prior rows (`attach_prior`)
+# fill batch rows [0, PRIOR_ROWS) with their own regularity reward and reach
+# the pool and the mixed eval embedding.
+tests/deep_agents/test_fb_mebe_online_smoke.mojo
 
 # The batched GPU walker raises `done` at MAX_STEPS on every lane — the env
 # side of the `episodes 0` symptom of the first online run (§18.7). ~2 min.
@@ -63,3 +70,10 @@ tests/nn/test_arena_slice_alignment_gpu.mojo
 # FRESH grad stash per backward, so B-net's `RMSNorm[256]` gamma was a 1 KB
 # device alloc+free on every vjp — illegal inside a CUDA-graph capture. Cheap.
 tests/nn/test_stop_grad_params_reuse_gpu.mojo
+
+# FB-MEBE's G1 pieces (FB_MEBE_G1_PLAN.md §12): B on ϑ_g = the bare MLP on
+# gathered columns; the 22-task suite peaks at each target and drops only on
+# the axes it names; the fall kernel resets every `delay` steps as a boundary;
+# on a 64-lane G1 (NVIDIA only) the reset noise stays in its lanes and band,
+# and the regularity terms equal a host recomputation. ~1 min.
+tests/deep_agents/test_fb_mebe_g1.mojo

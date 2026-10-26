@@ -20,13 +20,12 @@ is GPU-only. The reductions stay in LN_ACC (fp32) so accuracy is unchanged.
 """
 
 from std.math import sqrt
-from max.gpu import thread_idx, block_idx, global_idx
+from max.gpu import thread_idx, block_idx
 from max.gpu.primitives import block
-from max.gpu.sync import barrier
-from max.gpu.memory import AddressSpace
 from max.gpu.host import DeviceContext
 from std.utils.numerics import get_accum_type
-from layout import Layout, LayoutTensor, TileTensor, row_major
+from layout import TileTensor, row_major
+from noeira.core.tiles import RowMajor, Tile
 
 from noeira.nn.constants import DT, CPU_SIMD_W
 from ..core.tensor import Tensor, TensorImpl
@@ -36,6 +35,7 @@ from ..core.module import Module
 from ..core.param import Param, ParamVisitor
 from ..core.initializer import Initializer
 from ..core.amp import AMPPolicy, NoAMP
+from .linear import enqueue_dot_bias_grad
 
 
 comptime LN_EPS: Scalar[DT] = 1e-5
@@ -66,12 +66,12 @@ def _layer_norm_forward_kernel[
     # struct's `EPS`, so `LayerNorm[DIM, EPS=1e-12]` was 1e-12 on CPU and 1e-5
     # on GPU. Gate: tests/nn/test_layer_norm_eps_gpu.mojo.
 ](
-    input: LayoutTensor[ADT, Layout.row_major(BATCH, DIM), MutAnyOrigin],
-    output: LayoutTensor[ADT, Layout.row_major(BATCH, DIM), MutAnyOrigin],
-    gamma: LayoutTensor[DT, Layout.row_major(DIM), MutAnyOrigin],
-    beta: LayoutTensor[DT, Layout.row_major(DIM), MutAnyOrigin],
-    cache_xhat: LayoutTensor[DT, Layout.row_major(BATCH, DIM), MutAnyOrigin],
-    cache_inv_std: LayoutTensor[DT, Layout.row_major(BATCH), MutAnyOrigin],
+    input: Tile[ADT, BATCH, DIM],
+    output: Tile[ADT, BATCH, DIM],
+    gamma: Tile[DT, DIM],
+    beta: Tile[DT, DIM],
+    cache_xhat: Tile[DT, BATCH, DIM],
+    cache_inv_std: Tile[DT, BATCH],
 ):
     var b = Int(block_idx.x)
     var t = Int(thread_idx.x)
@@ -153,11 +153,11 @@ def _layer_norm_backward_dx_kernel[
     DIM: Int,
     ADT: DType = DT,
 ](
-    grad_output: LayoutTensor[ADT, Layout.row_major(BATCH, DIM), MutAnyOrigin],
-    gamma: LayoutTensor[DT, Layout.row_major(DIM), MutAnyOrigin],
-    cache_xhat: LayoutTensor[DT, Layout.row_major(BATCH, DIM), MutAnyOrigin],
-    cache_inv_std: LayoutTensor[DT, Layout.row_major(BATCH), MutAnyOrigin],
-    grad_input: LayoutTensor[ADT, Layout.row_major(BATCH, DIM), MutAnyOrigin],
+    grad_output: Tile[ADT, BATCH, DIM],
+    gamma: Tile[DT, DIM],
+    cache_xhat: Tile[DT, BATCH, DIM],
+    cache_inv_std: Tile[DT, BATCH],
+    grad_input: Tile[ADT, BATCH, DIM],
 ):
     var b = Int(block_idx.x)
     var t = Int(thread_idx.x)
@@ -227,87 +227,6 @@ def _layer_norm_backward_dx_kernel[
                 inv_std * (g - mean_g - xh * mean_g_xhat)
             ).cast[ADT]()
             idx += LN_TPB
-
-
-comptime _DP_COLS = 32
-comptime _DP_ROWS = 8
-comptime _DP_CHUNK = 1024
-"""Rows per partial sum of the γ / β gradients."""
-
-
-def _ln_dparams_partial_kernel[
-    BATCH: Int, DIM: Int, ADT: DType = DT
-](
-    grad_output: LayoutTensor[ADT, Layout.row_major(BATCH, DIM), MutAnyOrigin],
-    cache_xhat: LayoutTensor[DT, Layout.row_major(BATCH, DIM), MutAnyOrigin],
-    part: LayoutTensor[
-        DT,
-        Layout.row_major(2 * ((BATCH + _DP_CHUNK - 1) // _DP_CHUNK) * DIM),
-        MutAnyOrigin,
-    ],
-):
-    """`part[c, j] = Σ go·x̂` and `part[CHUNKS + c, j] = Σ go` over the rows of
-    chunk c (`_DP_CHUNK` rows). Block (`_DP_COLS`, `_DP_ROWS`): lanes along j,
-    so a warp reads 32 consecutive columns of a row (coalesced); the
-    `_DP_ROWS` row-strided sums are reduced in a fixed order in shared memory.
-    Replaces one block per COLUMN with threads walking the rows, which read 32
-    different rows per warp load (`enqueue_bias_grad`'s fix, two sums)."""
-    comptime CHUNKS = (BATCH + _DP_CHUNK - 1) // _DP_CHUNK
-    var tx = Int(thread_idx.x)
-    var ty = Int(thread_idx.y)
-    var j = Int(block_idx.x) * _DP_COLS + tx
-    var ch = Int(block_idx.y)
-    var r0 = ch * _DP_CHUNK
-    var r1 = min(r0 + _DP_CHUNK, BATCH)
-    var acc = LayoutTensor[
-        DT, Layout.row_major(2 * _DP_ROWS, _DP_COLS), MutAnyOrigin,
-        address_space=AddressSpace.SHARED,
-    ].stack_allocation()
-    var sg: Scalar[DT] = 0
-    var sb: Scalar[DT] = 0
-    if j < DIM:
-        var r = r0 + ty
-        while r < r1:
-            var go = rebind[Scalar[ADT]](grad_output[r, j]).cast[DT]()
-            sg += go * rebind[Scalar[DT]](cache_xhat[r, j])
-            sb += go
-            r += _DP_ROWS
-    acc[ty, tx] = sg
-    acc[_DP_ROWS + ty, tx] = sb
-    barrier()
-    if ty == 0 and j < DIM:
-        var tg: Scalar[DT] = 0
-        var tb: Scalar[DT] = 0
-        comptime for k in range(_DP_ROWS):
-            tg += rebind[Scalar[DT]](acc[k, tx])
-            tb += rebind[Scalar[DT]](acc[_DP_ROWS + k, tx])
-        part[ch * DIM + j] = tg
-        part[(CHUNKS + ch) * DIM + j] = tb
-
-
-def _ln_dparams_final_kernel[
-    BATCH: Int, DIM: Int
-](
-    part: LayoutTensor[
-        DT,
-        Layout.row_major(2 * ((BATCH + _DP_CHUNK - 1) // _DP_CHUNK) * DIM),
-        MutAnyOrigin,
-    ],
-    grad_gamma: LayoutTensor[DT, Layout.row_major(DIM), MutAnyOrigin],
-    grad_beta: LayoutTensor[DT, Layout.row_major(DIM), MutAnyOrigin],
-):
-    """`dγ[j] += Σ_c part[c, j]`, `dβ[j] += Σ_c part[CHUNKS + c, j]`, chunks
-    in order (deterministic)."""
-    comptime CHUNKS = (BATCH + _DP_CHUNK - 1) // _DP_CHUNK
-    var j = Int(global_idx.x)
-    if j < DIM:
-        var tg: Scalar[DT] = 0
-        var tb: Scalar[DT] = 0
-        for c in range(CHUNKS):
-            tg += rebind[Scalar[DT]](part[c * DIM + j])
-            tb += rebind[Scalar[DT]](part[(CHUNKS + c) * DIM + j])
-        grad_gamma[j] = rebind[Scalar[DT]](grad_gamma[j]) + tg
-        grad_beta[j] = rebind[Scalar[DT]](grad_beta[j]) + tb
 
 
 struct LayerNorm[DIM_: Int, ADT: DType = DT, EPS: Scalar[DT] = LN_EPS](Module):
@@ -431,18 +350,18 @@ struct LayerNorm[DIM_: Int, ADT: DType = DT, EPS: Scalar[DT] = LN_EPS](Module):
                 outd.ensure_gpu(c, B * Self.DIM_)
                 self.cache_xhat.ensure_gpu(c, B * Self.DIM_)
                 self.cache_inv_std.ensure_gpu(c, B)
-                comptime l2d = Layout.row_major(B, Self.DIM_)
-                comptime lb = Layout.row_major(B)
-                comptime ld = Layout.row_major(Self.DIM_)
+                comptime l2d = RowMajor[B, Self.DIM_]
+                comptime lb = RowMajor[B]
+                comptime ld = RowMajor[Self.DIM_]
                 c.enqueue_function[
                     _layer_norm_forward_kernel[B, Self.DIM_, Self.ADT, Self.EPS]
                 ](
-                    in0d.lt["gpu", l2d](),
-                    outd.lt["gpu", l2d](),
-                    self.gamma.val.lt["gpu", ld](),
-                    self.beta.val.lt["gpu", ld](),
-                    self.cache_xhat.lt["gpu", l2d](),
-                    self.cache_inv_std.lt["gpu", lb](),
+                    in0d.tt["gpu", B, Self.DIM_](),
+                    outd.tt["gpu", B, Self.DIM_](),
+                    self.gamma.val.tt["gpu", Self.DIM_](),
+                    self.beta.val.tt["gpu", Self.DIM_](),
+                    self.cache_xhat.tt["gpu", B, Self.DIM_](),
+                    self.cache_inv_std.tt["gpu", B](),
                     grid_dim=B,
                     block_dim=LN_TPB,
                 )
@@ -456,18 +375,18 @@ struct LayerNorm[DIM_: Int, ADT: DType = DT, EPS: Scalar[DT] = LN_EPS](Module):
             out.ensure_gpu(c, B * Self.DIM_)
             self.cache_xhat.ensure_gpu(c, B * Self.DIM_)
             self.cache_inv_std.ensure_gpu(c, B)
-            comptime l2d = Layout.row_major(B, Self.DIM_)
-            comptime lb = Layout.row_major(B)
-            comptime ld = Layout.row_major(Self.DIM_)
+            comptime l2d = RowMajor[B, Self.DIM_]
+            comptime lb = RowMajor[B]
+            comptime ld = RowMajor[Self.DIM_]
             c.enqueue_function[
                 _layer_norm_forward_kernel[B, Self.DIM_, Self.ADT, Self.EPS]
             ](
-                in0.lt["gpu", l2d](),
-                out.lt["gpu", l2d](),
-                self.gamma.val.lt["gpu", ld](),
-                self.beta.val.lt["gpu", ld](),
-                self.cache_xhat.lt["gpu", l2d](),
-                self.cache_inv_std.lt["gpu", lb](),
+                in0.tt["gpu", B, Self.DIM_](),
+                out.tt["gpu", B, Self.DIM_](),
+                self.gamma.val.tt["gpu", Self.DIM_](),
+                self.beta.val.tt["gpu", Self.DIM_](),
+                self.cache_xhat.tt["gpu", B, Self.DIM_](),
+                self.cache_inv_std.tt["gpu", B](),
                 grid_dim=B,
                 block_dim=LN_TPB,
             )
@@ -486,6 +405,14 @@ struct LayerNorm[DIM_: Int, ADT: DType = DT, EPS: Scalar[DT] = LN_EPS](Module):
         ctx: Optional[DeviceContext] = None,
     ) raises:
         ref gin = grad_inputs[0]
+        # A frozen γ/β (EMPTY gradient buffers, `Param.freeze`) gets no
+        # gradient: grad_input does not read dγ or dβ, so it is the same bits
+        # either way. Same rule, same predicate as `Linear.vjp`. γ and β
+        # freeze together; one frozen without the other is refused, since the
+        # GPU writes both in one kernel.
+        var want_dp = self.gamma.grd.n > 0
+        if want_dp != (self.beta.grd.n > 0):
+            raise Error("LayerNorm: gamma and beta must be frozen together")
         comptime if Self.ACT_DT == DT:
             # ── fp32 path (legacy NoAMP, byte-identical) ──
             # ACT_DT IS DT here — rebind the activation refs (sound; see forward).
@@ -537,6 +464,8 @@ struct LayerNorm[DIM_: Int, ADT: DType = DT, EPS: Scalar[DT] = LN_EPS](Module):
                         gi_p[unsafe_offset=row + d] = inv_std * (g - mean_g - xh * mean_g_xhat)
                         d += 1
                     # dγ += go·x̂ ; dβ += go  (accumulated across the batch)
+                    if not want_dp:
+                        continue
                     d = 0
                     while d + W <= Self.DIM_:
                         var go = go_p.unsafe_load[width=W](row + d)
@@ -554,21 +483,22 @@ struct LayerNorm[DIM_: Int, ADT: DType = DT, EPS: Scalar[DT] = LN_EPS](Module):
             else:
                 var c = ctx.value()
                 gind.ensure_gpu(c, B * Self.DIM_)
-                comptime l2d = Layout.row_major(B, Self.DIM_)
-                comptime lb = Layout.row_major(B)
-                comptime ld = Layout.row_major(Self.DIM_)
+                comptime l2d = RowMajor[B, Self.DIM_]
+                comptime lb = RowMajor[B]
+                comptime ld = RowMajor[Self.DIM_]
                 c.enqueue_function[
                     _layer_norm_backward_dx_kernel[B, Self.DIM_, Self.ADT]
                 ](
-                    god.lt["gpu", l2d](),
-                    self.gamma.val.lt["gpu", ld](),
-                    self.cache_xhat.lt["gpu", l2d](),
-                    self.cache_inv_std.lt["gpu", lb](),
-                    gind.lt["gpu", l2d](),
+                    god.tt["gpu", B, Self.DIM_](),
+                    self.gamma.val.tt["gpu", Self.DIM_](),
+                    self.cache_xhat.tt["gpu", B, Self.DIM_](),
+                    self.cache_inv_std.tt["gpu", B](),
+                    gind.tt["gpu", B, Self.DIM_](),
                     grid_dim=B,
                     block_dim=LN_TPB,
                 )
-                self._dparams_gpu[B](grad_output, c)
+                if want_dp:
+                    self._dparams_gpu[B](grad_output, c)
         else:
             # ── bf16-flow path (GPU-only). I/O activations cast at the boundary;
             #    grad math + γ/β masters + cache stay fp32 (fp32-internal). ──
@@ -577,47 +507,34 @@ struct LayerNorm[DIM_: Int, ADT: DType = DT, EPS: Scalar[DT] = LN_EPS](Module):
             ), "bf16-flow LayerNorm is GPU-only"
             var c = ctx.value()
             gin.ensure_gpu(c, B * Self.DIM_)
-            comptime l2d = Layout.row_major(B, Self.DIM_)
-            comptime lb = Layout.row_major(B)
-            comptime ld = Layout.row_major(Self.DIM_)
+            comptime l2d = RowMajor[B, Self.DIM_]
+            comptime lb = RowMajor[B]
+            comptime ld = RowMajor[Self.DIM_]
             c.enqueue_function[
                 _layer_norm_backward_dx_kernel[B, Self.DIM_, Self.ADT]
             ](
-                grad_output.lt["gpu", l2d](),
-                self.gamma.val.lt["gpu", ld](),
-                self.cache_xhat.lt["gpu", l2d](),
-                self.cache_inv_std.lt["gpu", lb](),
-                gin.lt["gpu", l2d](),
+                grad_output.tt["gpu", B, Self.DIM_](),
+                self.gamma.val.tt["gpu", Self.DIM_](),
+                self.cache_xhat.tt["gpu", B, Self.DIM_](),
+                self.cache_inv_std.tt["gpu", B](),
+                gin.tt["gpu", B, Self.DIM_](),
                 grid_dim=B,
                 block_dim=LN_TPB,
             )
-            self._dparams_gpu[B](grad_output, c)
+            if want_dp:
+                self._dparams_gpu[B](grad_output, c)
 
     def _dparams_gpu[B: Int](
         mut self, mut go: TensorImpl[Self.ACT_DT], c: DeviceContext
     ) raises:
-        """dγ += Σ go·x̂, dβ += Σ go over the B rows: chunk partials, then
-        the chunks summed in order."""
-        comptime CHUNKS = (B + _DP_CHUNK - 1) // _DP_CHUNK
-        comptime l2d = Layout.row_major(B, Self.DIM_)
-        comptime ld = Layout.row_major(Self.DIM_)
-        comptime lp = Layout.row_major(2 * CHUNKS * Self.DIM_)
-        self.dp_part.ensure_gpu(c, 2 * CHUNKS * Self.DIM_)
-        c.enqueue_function[
-            _ln_dparams_partial_kernel[B, Self.DIM_, Self.ADT]
-        ](
-            go.lt["gpu", l2d](),
-            self.cache_xhat.lt["gpu", l2d](),
-            self.dp_part.lt["gpu", lp](),
-            grid_dim=((Self.DIM_ + _DP_COLS - 1) // _DP_COLS, CHUNKS),
-            block_dim=(_DP_COLS, _DP_ROWS),
-        )
-        c.enqueue_function[_ln_dparams_final_kernel[B, Self.DIM_]](
-            self.dp_part.lt["gpu", lp](),
-            self.gamma.grd.lt["gpu", ld](),
-            self.beta.grd.lt["gpu", ld](),
-            grid_dim=(Self.DIM_ + 255) // 256,
-            block_dim=256,
+        """dγ += Σ go·x̂, dβ += Σ go over the B rows (`enqueue_dot_bias_grad`:
+        chunk partials with lanes along the features, then the chunks summed
+        in order). It replaced one block per COLUMN with threads walking the
+        rows, which read 32 different rows per warp load."""
+        enqueue_dot_bias_grad[Self.ADT](
+            c, go.dev.value(), self.cache_xhat.dev.value(),
+            self.gamma.grd.dev.value(), self.beta.grd.dev.value(),
+            B, Self.DIM_, self.dp_part,
         )
 
     # for_each_param / zero_grad inherit the Module reflection defaults

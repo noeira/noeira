@@ -25,7 +25,6 @@ kernels); only the input-norm (predict) and the norm-Jacobian (act_deriv) are
 new. CPU; GPU deferred (raise-stubs) — the CIFAR experiment runs on CPU.
 """
 
-from layout import Layout, LayoutTensor
 from max.gpu.host import DeviceContext
 from std.math import sqrt
 
@@ -33,6 +32,7 @@ from std.math import sqrt
 from .predictive_model import PCActivation, PCReLU, PCBlockTrait
 from .pc_initializer import PCInitializer
 from .pc_conv_block import ConvPCBlock
+from noeira.core.tiles import Tile, tile
 
 comptime _RMS_EPS: Float64 = 1e-6
 
@@ -77,9 +77,7 @@ struct NormConvPCBlock[
     def pc_init_params[
         INIT: PCInitializer, dtype: DType = DType.float32
     ](
-        mut params: LayoutTensor[
-            dtype, Layout.row_major(Self.PARAM_SIZE), MutAnyOrigin
-        ],
+        params: Tile[dtype, Self.PARAM_SIZE],
     ) raises:
         """Delegate to the inner conv block's nn init."""
         Self.INNER.pc_init_params[INIT, dtype](params)
@@ -89,12 +87,8 @@ struct NormConvPCBlock[
     def _channel_rmsnorm[
         BATCH: Int, dtype: DType
     ](
-        u: LayoutTensor[
-            dtype, Layout.row_major(BATCH, Self.IN_DIM), MutAnyOrigin
-        ],
-        mut dst: LayoutTensor[
-            dtype, Layout.row_major(BATCH, Self.IN_DIM), MutAnyOrigin
-        ],
+        u: Tile[dtype, BATCH, Self.IN_DIM],
+        dst: Tile[dtype, BATCH, Self.IN_DIM],
     ):
         for b in range(BATCH):
             for c in range(Self.in_channels):
@@ -117,26 +111,16 @@ struct NormConvPCBlock[
     def predict[
         BATCH: Int, dtype: DType = DType.float32
     ](
-        x_below: LayoutTensor[
-            dtype, Layout.row_major(BATCH, Self.IN_DIM), MutAnyOrigin
-        ],
-        params: LayoutTensor[
-            dtype, Layout.row_major(Self.PARAM_SIZE), MutAnyOrigin
-        ],
-        mut mu: LayoutTensor[
-            dtype, Layout.row_major(BATCH, Self.OUT_DIM), MutAnyOrigin
-        ],
-        mut a_below: LayoutTensor[
-            dtype, Layout.row_major(BATCH, Self.IN_DIM), MutAnyOrigin
-        ],
+        x_below: Tile[dtype, BATCH, Self.IN_DIM],
+        params: Tile[dtype, Self.PARAM_SIZE],
+        mu: Tile[dtype, BATCH, Self.OUT_DIM],
+        a_below: Tile[dtype, BATCH, Self.IN_DIM],
     ):
         # u = ACT(x_below)  → owned scratch;  a_below = RMSNorm_ch(u)
         var u_buf = List[Scalar[dtype]](
             length=BATCH * Self.IN_DIM, fill=Scalar[dtype](0)
         )
-        var u = LayoutTensor[
-            dtype, Layout.row_major(BATCH, Self.IN_DIM), MutAnyOrigin
-        ](u_buf)
+        var u = tile[BATCH, Self.IN_DIM](u_buf)
         Self.ACT.apply[BATCH, Self.IN_DIM, dtype](x_below, u)
         Self._channel_rmsnorm[BATCH, dtype](u, a_below)
         # μ = Conv(a_below).  INNER (Identity-style use): pass a_below as the
@@ -148,15 +132,9 @@ struct NormConvPCBlock[
     def eps_compute[
         BATCH: Int, dtype: DType = DType.float32
     ](
-        x_above: LayoutTensor[
-            dtype, Layout.row_major(BATCH, Self.OUT_DIM), MutAnyOrigin
-        ],
-        mu: LayoutTensor[
-            dtype, Layout.row_major(BATCH, Self.OUT_DIM), MutAnyOrigin
-        ],
-        mut eps: LayoutTensor[
-            dtype, Layout.row_major(BATCH, Self.OUT_DIM), MutAnyOrigin
-        ],
+        x_above: Tile[dtype, BATCH, Self.OUT_DIM],
+        mu: Tile[dtype, BATCH, Self.OUT_DIM],
+        eps: Tile[dtype, BATCH, Self.OUT_DIM],
     ):
         Self.INNER.eps_compute[BATCH, dtype](x_above, mu, eps)
 
@@ -164,15 +142,9 @@ struct NormConvPCBlock[
     def pull_back[
         BATCH: Int, dtype: DType = DType.float32
     ](
-        eps_above: LayoutTensor[
-            dtype, Layout.row_major(BATCH, Self.OUT_DIM), MutAnyOrigin
-        ],
-        params: LayoutTensor[
-            dtype, Layout.row_major(Self.PARAM_SIZE), MutAnyOrigin
-        ],
-        mut z_below: LayoutTensor[
-            dtype, Layout.row_major(BATCH, Self.IN_DIM), MutAnyOrigin
-        ],
+        eps_above: Tile[dtype, BATCH, Self.OUT_DIM],
+        params: Tile[dtype, Self.PARAM_SIZE],
+        z_below: Tile[dtype, BATCH, Self.IN_DIM],
     ):
         # Convᵀ(ε) — independent of the input-side norm.
         Self.INNER.pull_back[BATCH, dtype](eps_above, params, z_below)
@@ -185,23 +157,15 @@ struct NormConvPCBlock[
     def act_derivative_mul[
         BATCH: Int, dtype: DType = DType.float32
     ](
-        x_below: LayoutTensor[
-            dtype, Layout.row_major(BATCH, Self.IN_DIM), MutAnyOrigin
-        ],
-        z_in: LayoutTensor[
-            dtype, Layout.row_major(BATCH, Self.IN_DIM), MutAnyOrigin
-        ],
-        mut z_out: LayoutTensor[
-            dtype, Layout.row_major(BATCH, Self.IN_DIM), MutAnyOrigin
-        ],
+        x_below: Tile[dtype, BATCH, Self.IN_DIM],
+        z_in: Tile[dtype, BATCH, Self.IN_DIM],
+        z_out: Tile[dtype, BATCH, Self.IN_DIM],
     ):
         # u = ACT(x_below)  → owned scratch
         var u_buf = List[Scalar[dtype]](
             length=BATCH * Self.IN_DIM, fill=Scalar[dtype](0)
         )
-        var u = LayoutTensor[
-            dtype, Layout.row_major(BATCH, Self.IN_DIM), MutAnyOrigin
-        ](u_buf)
+        var u = tile[BATCH, Self.IN_DIM](u_buf)
         Self.ACT.apply[BATCH, Self.IN_DIM, dtype](x_below, u)
 
         # g = RMSNorm_ch_Jᵀ(z_in; u)  (per input channel over spatial_in)
@@ -237,9 +201,7 @@ struct NormConvPCBlock[
                         )
                     )
         # z_out = ACT'(x_below) ⊙ g
-        var g = LayoutTensor[
-            dtype, Layout.row_major(BATCH, Self.IN_DIM), MutAnyOrigin
-        ](g_buf)
+        var g = tile[BATCH, Self.IN_DIM](g_buf)
         Self.ACT.apply_derivative_mul[BATCH, Self.IN_DIM, dtype](
             x_below, g, z_out
         )
@@ -250,15 +212,9 @@ struct NormConvPCBlock[
     def weight_grad[
         BATCH: Int, dtype: DType = DType.float32
     ](
-        eps_above: LayoutTensor[
-            dtype, Layout.row_major(BATCH, Self.OUT_DIM), MutAnyOrigin
-        ],
-        a_below: LayoutTensor[
-            dtype, Layout.row_major(BATCH, Self.IN_DIM), MutAnyOrigin
-        ],
-        mut grads: LayoutTensor[
-            dtype, Layout.row_major(Self.PARAM_SIZE), MutAnyOrigin
-        ],
+        eps_above: Tile[dtype, BATCH, Self.OUT_DIM],
+        a_below: Tile[dtype, BATCH, Self.IN_DIM],
+        grads: Tile[dtype, Self.PARAM_SIZE],
     ):
         # a_below is the cached NORMALIZED conv input → standard conv weight grad.
         Self.INNER.weight_grad[BATCH, dtype](eps_above, a_below, grads)
@@ -272,18 +228,10 @@ struct NormConvPCBlock[
         BATCH: Int, dtype: DType = DType.float32
     ](
         ctx: DeviceContext,
-        x_below: LayoutTensor[
-            dtype, Layout.row_major(BATCH, Self.IN_DIM), MutAnyOrigin
-        ],
-        params: LayoutTensor[
-            dtype, Layout.row_major(Self.PARAM_SIZE), MutAnyOrigin
-        ],
-        mut mu: LayoutTensor[
-            dtype, Layout.row_major(BATCH, Self.OUT_DIM), MutAnyOrigin
-        ],
-        mut a_below: LayoutTensor[
-            dtype, Layout.row_major(BATCH, Self.IN_DIM), MutAnyOrigin
-        ],
+        x_below: Tile[dtype, BATCH, Self.IN_DIM],
+        params: Tile[dtype, Self.PARAM_SIZE],
+        mu: Tile[dtype, BATCH, Self.OUT_DIM],
+        a_below: Tile[dtype, BATCH, Self.IN_DIM],
     ) raises:
         raise Error("NormConvPCBlock.predict_gpu: GPU port deferred")
 
@@ -292,15 +240,9 @@ struct NormConvPCBlock[
         BATCH: Int, dtype: DType = DType.float32
     ](
         ctx: DeviceContext,
-        x_above: LayoutTensor[
-            dtype, Layout.row_major(BATCH, Self.OUT_DIM), MutAnyOrigin
-        ],
-        mu: LayoutTensor[
-            dtype, Layout.row_major(BATCH, Self.OUT_DIM), MutAnyOrigin
-        ],
-        mut eps: LayoutTensor[
-            dtype, Layout.row_major(BATCH, Self.OUT_DIM), MutAnyOrigin
-        ],
+        x_above: Tile[dtype, BATCH, Self.OUT_DIM],
+        mu: Tile[dtype, BATCH, Self.OUT_DIM],
+        eps: Tile[dtype, BATCH, Self.OUT_DIM],
     ) raises:
         raise Error("NormConvPCBlock.eps_compute_gpu: GPU port deferred")
 
@@ -309,15 +251,9 @@ struct NormConvPCBlock[
         BATCH: Int, dtype: DType = DType.float32
     ](
         ctx: DeviceContext,
-        eps_above: LayoutTensor[
-            dtype, Layout.row_major(BATCH, Self.OUT_DIM), MutAnyOrigin
-        ],
-        params: LayoutTensor[
-            dtype, Layout.row_major(Self.PARAM_SIZE), MutAnyOrigin
-        ],
-        mut z_below: LayoutTensor[
-            dtype, Layout.row_major(BATCH, Self.IN_DIM), MutAnyOrigin
-        ],
+        eps_above: Tile[dtype, BATCH, Self.OUT_DIM],
+        params: Tile[dtype, Self.PARAM_SIZE],
+        z_below: Tile[dtype, BATCH, Self.IN_DIM],
     ) raises:
         raise Error("NormConvPCBlock.pull_back_gpu: GPU port deferred")
 
@@ -326,15 +262,9 @@ struct NormConvPCBlock[
         BATCH: Int, dtype: DType = DType.float32
     ](
         ctx: DeviceContext,
-        x_below: LayoutTensor[
-            dtype, Layout.row_major(BATCH, Self.IN_DIM), MutAnyOrigin
-        ],
-        z_in: LayoutTensor[
-            dtype, Layout.row_major(BATCH, Self.IN_DIM), MutAnyOrigin
-        ],
-        mut z_out: LayoutTensor[
-            dtype, Layout.row_major(BATCH, Self.IN_DIM), MutAnyOrigin
-        ],
+        x_below: Tile[dtype, BATCH, Self.IN_DIM],
+        z_in: Tile[dtype, BATCH, Self.IN_DIM],
+        z_out: Tile[dtype, BATCH, Self.IN_DIM],
     ) raises:
         raise Error("NormConvPCBlock.act_derivative_mul_gpu: GPU port deferred")
 
@@ -343,14 +273,8 @@ struct NormConvPCBlock[
         BATCH: Int, dtype: DType = DType.float32
     ](
         ctx: DeviceContext,
-        eps_above: LayoutTensor[
-            dtype, Layout.row_major(BATCH, Self.OUT_DIM), MutAnyOrigin
-        ],
-        a_below: LayoutTensor[
-            dtype, Layout.row_major(BATCH, Self.IN_DIM), MutAnyOrigin
-        ],
-        mut grads: LayoutTensor[
-            dtype, Layout.row_major(Self.PARAM_SIZE), MutAnyOrigin
-        ],
+        eps_above: Tile[dtype, BATCH, Self.OUT_DIM],
+        a_below: Tile[dtype, BATCH, Self.IN_DIM],
+        grads: Tile[dtype, Self.PARAM_SIZE],
     ) raises:
         raise Error("NormConvPCBlock.weight_grad_gpu: GPU port deferred")

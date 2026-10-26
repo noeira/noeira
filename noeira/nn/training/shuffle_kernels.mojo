@@ -8,15 +8,15 @@ storage `Trainer.train_gpu` drives them over `TensorImpl[int32]`/`[uint64]`
 shuffle scratch (no legacy import).
 """
 
-from layout import Layout, LayoutTensor
 from max.gpu import block_dim, block_idx, thread_idx
 from std.random.philox import Random as PhiloxRandom
+from noeira.core.tiles import Tile
 
 
 @always_inline
 def init_identity_indices_kernel[
     N: Int,
-](indices: LayoutTensor[DType.int32, Layout.row_major(N), MutAnyOrigin]):
+](indices: Tile[DType.int32, N]):
     """Fill indices[i] = i. Parallel over N threads."""
     var i = Int(block_dim.x * block_idx.x + thread_idx.x)
     if i < N:
@@ -27,8 +27,8 @@ def init_identity_indices_kernel[
 def fisher_yates_shuffle_kernel[
     N: Int,
 ](
-    indices: LayoutTensor[DType.int32, Layout.row_major(N), MutAnyOrigin],
-    seed_buf: LayoutTensor[DType.uint64, Layout.row_major(1), MutAnyOrigin],
+    indices: Tile[DType.int32, N],
+    seed_buf: Tile[DType.uint64, 1],
 ):
     """Serial Fisher-Yates shuffle on a single GPU thread.
 
@@ -53,7 +53,7 @@ def fisher_yates_shuffle_kernel[
 
 @always_inline
 def increment_seed_kernel(
-    seed_buf: LayoutTensor[DType.uint64, Layout.row_major(1), MutAnyOrigin],
+    seed_buf: Tile[DType.uint64, 1],
 ):
     """Bump the device-side RNG seed so each epoch has a different
     permutation."""
@@ -68,9 +68,9 @@ def gather_rows_kernel[
     DIM: Int,
     dtype: DType,
 ](
-    batch_out: LayoutTensor[dtype, Layout.row_major(BATCH, DIM), MutAnyOrigin],
-    full: LayoutTensor[dtype, Layout.row_major(N_TOTAL, DIM), MutAnyOrigin],
-    indices: LayoutTensor[DType.int32, Layout.row_major(N_TOTAL), MutAnyOrigin],
+    batch_out: Tile[dtype, BATCH, DIM],
+    full: Tile[dtype, N_TOTAL, DIM],
+    indices: Tile[DType.int32, N_TOTAL],
     # ⚠ Int32, NOT Int — `Int`/`UInt` are not `DevicePassable`. A bare
     # `Int` still compiles in `pixi run build` and fails only where the
     # kernel is LAUNCHED; keep the `Int32(...)` casts at the call sites.
@@ -94,10 +94,10 @@ def gather_rows_at_counter_kernel[
     DIM: Int,
     dtype: DType,
 ](
-    batch_out: LayoutTensor[dtype, Layout.row_major(BATCH, DIM), MutAnyOrigin],
-    full: LayoutTensor[dtype, Layout.row_major(N_TOTAL, DIM), MutAnyOrigin],
-    indices: LayoutTensor[DType.int32, Layout.row_major(N_TOTAL), MutAnyOrigin],
-    counter: LayoutTensor[DType.int32, Layout.row_major(1), MutAnyOrigin],
+    batch_out: Tile[dtype, BATCH, DIM],
+    full: Tile[dtype, N_TOTAL, DIM],
+    indices: Tile[DType.int32, N_TOTAL],
+    counter: Tile[DType.int32, 1],
 ):
     """`gather_rows_kernel` at offset `counter[0] * BATCH`, read from device
     memory: the same launch serves every batch of the epoch, so it can be
@@ -115,17 +115,17 @@ def gather_rows_at_counter_kernel[
 
 @always_inline
 def advance_counter_kernel(
-    counter: LayoutTensor[DType.int32, Layout.row_major(1), MutAnyOrigin],
+    counter: Tile[DType.int32, 1],
 ):
-    """counter += 1 (one thread)."""
+    """`counter += 1` (one thread)."""
     if Int(thread_idx.x) == 0 and Int(block_idx.x) == 0:
         counter.ptr[unsafe_offset=0] = counter.ptr[unsafe_offset=0] + 1
 
 
 @always_inline
 def reset_counter_kernel(
-    counter: LayoutTensor[DType.int32, Layout.row_major(1), MutAnyOrigin],
+    counter: Tile[DType.int32, 1],
 ):
-    """counter = 0 (one thread)."""
+    """`counter = 0` (one thread)."""
     if Int(thread_idx.x) == 0 and Int(block_idx.x) == 0:
         counter.ptr[unsafe_offset=0] = 0

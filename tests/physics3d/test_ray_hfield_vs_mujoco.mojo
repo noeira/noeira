@@ -265,7 +265,7 @@ def test_ray_hfield_vs_mujoco() raises:
 
     # ⚠ Built ONCE, outside the loop: `lt_dyn` needs `mut`, and the grid does
     # not move between rays.
-    var hf_view = b.d.hfield_data.lt_dyn["cpu", DYN1](rl1(nrow * ncol))
+    var hf_view = b.d.hfield_data.tt_dyn["cpu", DYN1](rl1(nrow * ncol))
 
     var rng = Lcg(0xC0FFEE)
     var hits = Array[Int, 4](fill=0)

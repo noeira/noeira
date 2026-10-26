@@ -19,7 +19,6 @@ Build with the `RP_ACTOR_LINVEL` the RP run was trained with.
 from std.math import abs, sqrt
 from std.random import seed as seed_rng, random_float64
 from std.sys import argv
-from layout import Layout
 from noeira.core.cont_action import ContAction
 from noeira.nn.core.tensor import TensorImpl
 from noeira.physics3d.gpu.constants import METADATA_SIZE, CONTACT_SIZE, CONTACT_IDX_BODY_A, CONTACT_IDX_BODY_B, META_IDX_NUM_CONTACTS
@@ -39,8 +38,8 @@ comptime E = UnitreeG1WalkRP[False]
 def _mix_obs(mut env: E) -> List[Float64]:
     var o = TensorImpl[DType.float64].alloc(G1_WALK_OBS_DIM)
     g1_walk_obs[DType.float64, 1, NQ, NV, G1_WALK_OBS_DIM, False](
-        env.d.qpos.lt["cpu", Layout.row_major(1, NQ)](), env.d.qvel.lt["cpu", Layout.row_major(1, NV)](),
-        env.d.meta.lt["cpu", Layout.row_major(1, METADATA_SIZE)](), o.lt["cpu", Layout.row_major(1, G1_WALK_OBS_DIM)](), 0)
+        env.d.qpos.tt["cpu", 1, NQ](), env.d.qvel.tt["cpu", 1, NV](),
+        env.d.meta.tt["cpu", 1, METADATA_SIZE](), o.tt["cpu", 1, G1_WALK_OBS_DIM](), 0)
     var l = List[Float64]()
     for k in range(G1_WALK_OBS_DIM): l.append(Float64(o.data[k]))
     return l^

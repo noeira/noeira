@@ -17,7 +17,7 @@ runs with `-D NN_GEMM_PATH=max`:
 """
 
 from std.math import abs, sqrt
-from std.sys import has_nvidia_gpu_accelerator
+from std.sys import default_accelerator
 from max.gpu.host import DeviceContext
 
 from noeira.nn.constants import DT
@@ -27,7 +27,7 @@ from noeira.nn.core.initializer import Kaiming
 from noeira.nn.primitives.linear import Linear
 
 
-comptime TOL = 1e-2 if has_nvidia_gpu_accelerator() else 1e-4
+comptime TOL = 1e-2 if default_accelerator().is_nvidia_gpu() else 1e-4
 
 
 def check[IN: Int, OUT: Int, B: Int](ctx: DeviceContext) raises:

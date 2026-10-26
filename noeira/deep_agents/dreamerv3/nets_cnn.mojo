@@ -37,7 +37,6 @@ LINEAR (no activation) — raw tokens / raw pixel logits.
 
 from max.gpu import global_idx
 from max.gpu.host import DeviceContext
-from layout import Layout, LayoutTensor
 
 from noeira.nn.combinators.sequential import Sequential
 from noeira.nn.primitives.conv2d import Conv2D
@@ -60,6 +59,7 @@ from noeira.nn.core.initializer import Initializer
 from noeira.nn.core.walkers import join_name
 from noeira.nn.core.amp import AMPPolicy, NoAMP
 from noeira.nn.constants import DT, TPB, LAYOUT_NCHW
+from noeira.core.tiles import Tile
 
 
 # ── stride-2 building blocks (k=4, s=2, p=1) ──────────────────────────────────
@@ -188,9 +188,9 @@ comptime DreamerEncoderCNNPool[
 def _stem_split_k[
     B: Int, D: Int, S: Int
 ](
-    feat: LayoutTensor[DT, Layout.row_major(B * (D + S)), MutAnyOrigin],
-    xd: LayoutTensor[DT, Layout.row_major(B * D), MutAnyOrigin],
-    xs: LayoutTensor[DT, Layout.row_major(B * S), MutAnyOrigin],
+    feat: Tile[DT, B * (D + S)],
+    xd: Tile[DT, B * D],
+    xs: Tile[DT, B * S],
 ):
     """feat[b] = [deter | stoch] → xd[b], xs[b]. One thread per feat element."""
     var i = Int(global_idx.x)
@@ -206,9 +206,9 @@ def _stem_split_k[
 def _stem_merge_k[
     B: Int, D: Int, S: Int
 ](
-    gxd: LayoutTensor[DT, Layout.row_major(B * D), MutAnyOrigin],
-    gxs: LayoutTensor[DT, Layout.row_major(B * S), MutAnyOrigin],
-    gfeat: LayoutTensor[DT, Layout.row_major(B * (D + S)), MutAnyOrigin],
+    gxd: Tile[DT, B * D],
+    gxs: Tile[DT, B * S],
+    gfeat: Tile[DT, B * (D + S)],
 ):
     """Inverse of `_stem_split_k` (disjoint scatter — no accumulation)."""
     var i = Int(global_idx.x)
@@ -224,9 +224,9 @@ def _stem_merge_k[
 def _stem_add_k[
     N: Int
 ](
-    a: LayoutTensor[DT, Layout.row_major(N), MutAnyOrigin],
-    b: LayoutTensor[DT, Layout.row_major(N), MutAnyOrigin],
-    dst: LayoutTensor[DT, Layout.row_major(N), MutAnyOrigin],
+    a: Tile[DT, N],
+    b: Tile[DT, N],
+    dst: Tile[DT, N],
 ):
     var i = Int(global_idx.x)
     if i < N:
@@ -341,9 +341,9 @@ struct DreamerDecoderStem[
             self.xs.ensure_gpu(c, B * Self.SC)
             comptime nb = (B * F + TPB - 1) // TPB
             c.enqueue_function[_stem_split_k[B, Self.DETER, Self.SC]](
-                feat.lt["gpu", Layout.row_major(B * F)](),
-                self.xd.lt["gpu", Layout.row_major(B * Self.DETER)](),
-                self.xs.lt["gpu", Layout.row_major(B * Self.SC)](),
+                feat.tt["gpu", B * F](),
+                self.xd.tt["gpu", B * Self.DETER](),
+                self.xs.tt["gpu", B * Self.SC](),
                 grid_dim=nb,
                 block_dim=TPB,
             )
@@ -387,9 +387,9 @@ struct DreamerDecoderStem[
             out.ensure_gpu(c, B * Self.U)
             comptime nb = (B * Self.U + TPB - 1) // TPB
             c.enqueue_function[_stem_add_k[B * Self.U]](
-                self.x0.lt["gpu", Layout.row_major(B * Self.U)](),
-                self.x1.lt["gpu", Layout.row_major(B * Self.U)](),
-                out.lt["gpu", Layout.row_major(B * Self.U)](),
+                self.x0.tt["gpu", B * Self.U](),
+                self.x1.tt["gpu", B * Self.U](),
+                out.tt["gpu", B * Self.U](),
                 grid_dim=nb,
                 block_dim=TPB,
             )
@@ -443,9 +443,9 @@ struct DreamerDecoderStem[
             gfeat.ensure_gpu(c, B * F)
             comptime nb = (B * F + TPB - 1) // TPB
             c.enqueue_function[_stem_merge_k[B, Self.DETER, Self.SC]](
-                self.gxd.lt["gpu", Layout.row_major(B * Self.DETER)](),
-                self.gxs.lt["gpu", Layout.row_major(B * Self.SC)](),
-                gfeat.lt["gpu", Layout.row_major(B * F)](),
+                self.gxd.tt["gpu", B * Self.DETER](),
+                self.gxs.tt["gpu", B * Self.SC](),
+                gfeat.tt["gpu", B * F](),
                 grid_dim=nb,
                 block_dim=TPB,
             )

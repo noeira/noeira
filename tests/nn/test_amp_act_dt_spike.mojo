@@ -20,7 +20,8 @@ Run: pixi run -e apple mojo run -I . tests/nn/test_amp_act_dt_spike.mojo
 from std.memory import Pointer
 from max.gpu import global_idx
 from max.gpu.host import DeviceContext
-from layout import Layout, LayoutTensor, TileTensor, row_major
+from layout import TileTensor, row_major
+from noeira.core.tiles import Tile
 from linalg.matmul import matmul as max_matmul
 
 from std.testing import assert_true
@@ -72,8 +73,8 @@ trait ModuleA(Movable, Defaultable, Deinitable):
 
 # ── cast kernel (fp32 -> ACT_DT) for the bias and the entry boundary ─────
 def _cast_kernel[SRC: DType, DST: DType, N: Int](
-    src: LayoutTensor[SRC, Layout.row_major(N), MutAnyOrigin],
-    dst: LayoutTensor[DST, Layout.row_major(N), MutAnyOrigin],
+    src: Tile[SRC, N],
+    dst: Tile[DST, N],
 ):
     var i = Int(global_idx.x)
     if i < N:
@@ -81,8 +82,8 @@ def _cast_kernel[SRC: DType, DST: DType, N: Int](
 
 
 def _bias_add_kernel[ADT: DType, B: Int, OUT: Int](
-    acc: LayoutTensor[ADT, Layout.row_major(B, OUT), MutAnyOrigin],
-    bias: LayoutTensor[ADT, Layout.row_major(OUT), MutAnyOrigin],
+    acc: Tile[ADT, B, OUT],
+    bias: Tile[ADT, OUT],
 ):
     var idx = Int(global_idx.x)
     if idx < B * OUT:
@@ -136,8 +137,8 @@ struct LinearA[IN_: Int, OUT_: Int, ADT: DType = DT](ModuleA):
             var wv = TileTensor(self.weight.val.dev.value(), row_major[Self.IN_, Self.OUT_]())
             var ov = TileTensor(out.dev.value(), row_major[B, Self.OUT_]())
             max_matmul[target="gpu"](ov, xv, wv, c)
-            var ol = out.lt["gpu", Layout.row_major(B, Self.OUT_)]()
-            var bl = self.bias.val.lt["gpu", Layout.row_major(Self.OUT_)]()
+            var ol = out.tt["gpu", B, Self.OUT_]()
+            var bl = self.bias.val.tt["gpu", Self.OUT_]()
             c.enqueue_function[_bias_add_kernel[Self.ADT, B, Self.OUT_]](
                 ol, bl, grid_dim=(B * Self.OUT_ + 255) // 256, block_dim=256)
         else:
@@ -147,20 +148,20 @@ struct LinearA[IN_: Int, OUT_: Int, ADT: DType = DT](ModuleA):
             self.b_a.ensure_gpu(c, Self.OUT_)
             if self.weight.val.version != self._wv:
                 c.enqueue_function[_cast_kernel[DT, Self.ADT, Self.W_SIZE]](
-                    self.weight.val.lt["gpu", Layout.row_major(Self.W_SIZE)](),
-                    self.w_bf.lt["gpu", Layout.row_major(Self.W_SIZE)](),
+                    self.weight.val.tt["gpu", Self.W_SIZE](),
+                    self.w_bf.tt["gpu", Self.W_SIZE](),
                     grid_dim=(Self.W_SIZE + 255) // 256, block_dim=256)
                 c.enqueue_function[_cast_kernel[DT, Self.ADT, Self.OUT_]](
-                    self.bias.val.lt["gpu", Layout.row_major(Self.OUT_)](),
-                    self.b_a.lt["gpu", Layout.row_major(Self.OUT_)](),
+                    self.bias.val.tt["gpu", Self.OUT_](),
+                    self.b_a.tt["gpu", Self.OUT_](),
                     grid_dim=(Self.OUT_ + 255) // 256, block_dim=256)
                 self._wv = self.weight.val.version
             var xv = TileTensor(x.dev.value(), row_major[B, Self.IN_]())
             var wv = TileTensor(self.w_bf.dev.value(), row_major[Self.IN_, Self.OUT_]())
             var ov = TileTensor(out.dev.value(), row_major[B, Self.OUT_]())
             max_matmul[target="gpu"](ov, xv, wv, c)
-            var ol = out.lt["gpu", Layout.row_major(B, Self.OUT_)]()
-            var bl = self.b_a.lt["gpu", Layout.row_major(Self.OUT_)]()
+            var ol = out.tt["gpu", B, Self.OUT_]()
+            var bl = self.b_a.tt["gpu", Self.OUT_]()
             c.enqueue_function[_bias_add_kernel[Self.ADT, B, Self.OUT_]](
                 ol, bl, grid_dim=(B * Self.OUT_ + 255) // 256, block_dim=256)
 

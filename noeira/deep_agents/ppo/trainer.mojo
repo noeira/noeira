@@ -44,13 +44,12 @@ from noeira.nn.core.module import Module
 from noeira.nn.core.tensor import Tensor
 from noeira.nn.core.tensor_refs import TensorRefs
 from noeira.nn.core.call import call_forward, call_vjp
-from layout import Layout, LayoutTensor
 from noeira.nn.core.initializer import Xavier
 from noeira.nn.optimizer.adam import Adam
 from noeira.nn.core.checkpoint import (
     BinaryCheckpointWriter, BinaryCheckpointReader, CheckpointReader,
     CheckpointScalars, write_model, read_model, _split_lines, _is_v3_header,
-    _read_file_bytes, _write_file_bytes,
+    _read_file_bytes,
 )
 
 from noeira.nn.core.log_bundle import log_bundle
@@ -76,6 +75,7 @@ from .objective import (
     EPS_STD,
     LOG_2PI,
 )
+from noeira.core.tiles import Tile
 
 
 # Diagnostic constants — aliased from ppo/objective.mojo (S4, 2026-06-07)
@@ -100,13 +100,13 @@ comptime _DIAG_LOG_2PI = LOG_2PI
 # clip-indicator into three `[MB]` buffers (reduced to means by the trainer).
 # ──────────────────────────────────────────────────────────────────────────
 def _ppo_diag_per_sample_kernel[MB: Int, ACT: Int](
-    ao: LayoutTensor[DT, Layout.row_major(MB, 2 * ACT), MutAnyOrigin],
-    act: LayoutTensor[DT, Layout.row_major(MB, ACT), MutAnyOrigin],
-    olp: LayoutTensor[DT, Layout.row_major(MB), MutAnyOrigin],
+    ao: Tile[DT, MB, 2 * ACT],
+    act: Tile[DT, MB, ACT],
+    olp: Tile[DT, MB],
     clip_eps: Scalar[DT],
-    ent_out: LayoutTensor[DT, Layout.row_major(MB), MutAnyOrigin],
-    kl_out: LayoutTensor[DT, Layout.row_major(MB), MutAnyOrigin],
-    clip_out: LayoutTensor[DT, Layout.row_major(MB), MutAnyOrigin],
+    ent_out: Tile[DT, MB],
+    kl_out: Tile[DT, MB],
+    clip_out: Tile[DT, MB],
 ):
     var b = Int(global_idx.x)
     if b >= MB:
@@ -148,9 +148,9 @@ def _ppo_diag_per_sample_kernel[MB: Int, ACT: Int](
 # Var(ret) is ~0. Writes the scalar into `ev_out[0]`. Launch grid_dim=1,
 # block_dim=TPB_REDUCE.
 def _ppo_ev_kernel[MB: Int](
-    ret: LayoutTensor[DT, Layout.row_major(MB), MutAnyOrigin],
-    v: LayoutTensor[DT, Layout.row_major(MB), MutAnyOrigin],
-    ev_out: LayoutTensor[DT, Layout.row_major(1), MutAnyOrigin],
+    ret: Tile[DT, MB],
+    v: Tile[DT, MB],
+    ev_out: Tile[DT, 1],
 ):
     var t = Int(thread_idx.x)
     var s_ret: Scalar[DT] = 0.0
@@ -796,35 +796,35 @@ struct PPOTrainer[
         comptime n_blocks = (MB + TPB - 1) // TPB
         comptime per_k = _ppo_diag_per_sample_kernel[MB, ACT]
         ctx.enqueue_function[per_k](
-            self._diag_ao.lt["gpu", Layout.row_major(MB, 2 * ACT)](),
-            self.state.mb_act.lt["gpu", Layout.row_major(MB, ACT)](),
-            self.state.mb_olp.lt["gpu", Layout.row_major(MB)](),
+            self._diag_ao.tt["gpu", MB, 2 * ACT](),
+            self.state.mb_act.tt["gpu", MB, ACT](),
+            self.state.mb_olp.tt["gpu", MB](),
             self.clip_eps,
-            self._diag_ent.lt["gpu", Layout.row_major(MB)](),
-            self._diag_kl.lt["gpu", Layout.row_major(MB)](),
-            self._diag_clip.lt["gpu", Layout.row_major(MB)](),
+            self._diag_ent.tt["gpu", MB](),
+            self._diag_kl.tt["gpu", MB](),
+            self._diag_clip.tt["gpu", MB](),
             grid_dim=n_blocks, block_dim=TPB,
         )
         self._entropy_mean_dev.accumulate_gpu_lt[MB](
-            self._diag_ent.lt["gpu", Layout.row_major(MB)]()
+            self._diag_ent.tt["gpu", MB]()
         )
         self._kl_mean_dev.accumulate_gpu_lt[MB](
-            self._diag_kl.lt["gpu", Layout.row_major(MB)]()
+            self._diag_kl.tt["gpu", MB]()
         )
         self._clip_mean_dev.accumulate_gpu_lt[MB](
-            self._diag_clip.lt["gpu", Layout.row_major(MB)]()
+            self._diag_clip.tt["gpu", MB]()
         )
 
         comptime ev_k = _ppo_ev_kernel[MB]
         ctx.enqueue_function[ev_k](
-            self.state.mb_ret.lt["gpu", Layout.row_major(MB)](),
-            self.state.mb_v.lt["gpu", Layout.row_major(MB)](),
-            self._diag_ev.lt["gpu", Layout.row_major(1)](),
+            self.state.mb_ret.tt["gpu", MB](),
+            self.state.mb_v.tt["gpu", MB](),
+            self._diag_ev.tt["gpu", 1](),
             grid_dim=1, block_dim=TPB_REDUCE,
         )
         # The EV scalar lives in a [1] buffer; reducing it folds (ev, +1).
         self._ev_mean_dev.accumulate_gpu_lt[1](
-            self._diag_ev.lt["gpu", Layout.row_major(1)]()
+            self._diag_ev.tt["gpu", 1]()
         )
 
     # ──────────────────────────────────────────────────────────────────
@@ -1100,13 +1100,13 @@ struct PPOTrainer[
         name-prefixed `actor.` / `critic.`; the train-step counter as a `K`
         section. Atomic and chunked; target-agnostic (GPU params download
         first). Optimizer moments NOT persisted (on-policy resume re-rolls)."""
-        var w = BinaryCheckpointWriter(save_moments=False)
+        var w = BinaryCheckpointWriter.to_file(path, save_moments=False)
         write_model[Self.train_target](w, self.actor, self.ctx, "actor")
         write_model[Self.train_target](w, self.critic, self.ctx, "critic")
         var sc = CheckpointScalars()
         sc.set_int("total_train_steps", self._total_train_steps)
         w.write_scalars(sc)
-        _write_file_bytes(path, w.content)
+        w.commit()
 
     def load_state(mut self, path: String) raises:
         """Restore actor + critic (v3, or the legacy v2 text this trainer

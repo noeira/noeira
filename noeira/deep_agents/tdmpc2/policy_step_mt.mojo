@@ -18,7 +18,6 @@ no-op at MAX_ACT=1) — same spirit as the QP-dropout caveats.
 
 from max.gpu import global_idx
 from max.gpu.host import DeviceContext
-from layout import Layout, LayoutTensor
 
 from noeira.nn.constants import DT, TPB
 from noeira.nn.core.tensor import Tensor
@@ -189,8 +188,8 @@ struct PolicyStepMT[
             comptime nb = (BB + TPB - 1) // TPB
             ref qsum = self.graph.node_output["qsum"]()
             c.enqueue_function[_scale_copy_k[BB]](
-                qsum.lt["gpu", Layout.row_major(BB)](),
-                self.grad.lt["gpu", Layout.row_major(BB)](),
+                qsum.tt["gpu", BB](),
+                self.grad.tt["gpu", BB](),
                 Scalar[DT](0.5),
                 grid_dim=nb, block_dim=TPB,
             )
@@ -262,7 +261,7 @@ struct PolicyStepMT[
                 self.grad.upload_resident(ctx.value())
         else:
             seed_grad_inv_batch[target, BB](
-                self.grad.lt[target, Layout.row_major(BB, 1)](), ctx=ctx
+                self.grad.tt[target, BB, 1](), ctx=ctx
             )
         self.graph.vjp[BB, target](self.grad, ctx, policy, q_a, q_b)
 

@@ -38,7 +38,7 @@ scope really was as narrow as it claimed.
 """
 
 from std.collections import Array
-from layout import Layout, LayoutTensor
+from layout import TileTensor, TensorLayout
 
 from ..kinematics.site_frame import site_world_quat, site_world_quat_list
 from ..kinematics.quat_math import quat_rotate_inverse
@@ -248,18 +248,12 @@ def _site_transport_gpu[
 @always_inline
 def _site_com_offset_gpu[
     DTYPE: DType,
-    L_SITE_XPOS: Layout,
-    L_SUBTREE_COM: Layout,
-    L_BODIES: Layout](
-    site_xpos: LayoutTensor[
-        DTYPE, L_SITE_XPOS, MutAnyOrigin
-    ],
-    subtree_com: LayoutTensor[
-        DTYPE, L_SUBTREE_COM, MutAnyOrigin
-    ],
-    bodies: LayoutTensor[
-        DTYPE, L_BODIES, MutAnyOrigin
-    ],
+    L_SITE_XPOS: TensorLayout,
+    L_SUBTREE_COM: TensorLayout,
+    L_BODIES: TensorLayout](
+    site_xpos: TileTensor[DTYPE, L_SITE_XPOS, MutAnyOrigin],
+    subtree_com: TileTensor[DTYPE, L_SUBTREE_COM, MutAnyOrigin],
+    bodies: TileTensor[DTYPE, L_BODIES, MutAnyOrigin],
     env: Int,
     body: Int,
     site: Int,
@@ -278,34 +272,20 @@ def _site_com_offset_gpu[
 @always_inline
 def site_accelerometer_gpu[
     DTYPE: DType,
-    L_CVEL: Layout,
-    L_SUBTREE_COM: Layout,
-    L_SITE_XPOS: Layout,
-    L_XQUAT: Layout,
-    L_BODIES: Layout,
-    L_SITES: Layout,
+    L_CVEL: TensorLayout,
+    L_SUBTREE_COM: TensorLayout,
+    L_SITE_XPOS: TensorLayout,
+    L_XQUAT: TensorLayout,
+    L_BODIES: TensorLayout,
+    L_SITES: TensorLayout,
 ](
-    cvel: LayoutTensor[
-        DTYPE, L_CVEL, MutAnyOrigin
-    ],
-    cacc: LayoutTensor[
-        DTYPE, L_CVEL, MutAnyOrigin
-    ],
-    subtree_com: LayoutTensor[
-        DTYPE, L_SUBTREE_COM, MutAnyOrigin
-    ],
-    site_xpos: LayoutTensor[
-        DTYPE, L_SITE_XPOS, MutAnyOrigin
-    ],
-    xquat: LayoutTensor[
-        DTYPE, L_XQUAT, MutAnyOrigin
-    ],
-    bodies: LayoutTensor[
-        DTYPE, L_BODIES, MutAnyOrigin
-    ],
-    sites: LayoutTensor[
-        DTYPE, L_SITES, MutAnyOrigin
-    ],
+    cvel: TileTensor[DTYPE, L_CVEL, MutAnyOrigin],
+    cacc: TileTensor[DTYPE, L_CVEL, MutAnyOrigin],
+    subtree_com: TileTensor[DTYPE, L_SUBTREE_COM, MutAnyOrigin],
+    site_xpos: TileTensor[DTYPE, L_SITE_XPOS, MutAnyOrigin],
+    xquat: TileTensor[DTYPE, L_XQUAT, MutAnyOrigin],
+    bodies: TileTensor[DTYPE, L_BODIES, MutAnyOrigin],
+    sites: TileTensor[DTYPE, L_SITES, MutAnyOrigin],
     env: Int,
     body: Int,
     site: Int,
@@ -367,31 +347,19 @@ def site_accelerometer_gpu[
 @always_inline
 def site_force_torque_gpu[
     DTYPE: DType,
-    L_CFRC_INT: Layout,
-    L_SUBTREE_COM: Layout,
-    L_SITE_XPOS: Layout,
-    L_XQUAT: Layout,
-    L_BODIES: Layout,
-    L_SITES: Layout,
+    L_CFRC_INT: TensorLayout,
+    L_SUBTREE_COM: TensorLayout,
+    L_SITE_XPOS: TensorLayout,
+    L_XQUAT: TensorLayout,
+    L_BODIES: TensorLayout,
+    L_SITES: TensorLayout,
 ](
-    cfrc_int: LayoutTensor[
-        DTYPE, L_CFRC_INT, MutAnyOrigin
-    ],
-    subtree_com: LayoutTensor[
-        DTYPE, L_SUBTREE_COM, MutAnyOrigin
-    ],
-    site_xpos: LayoutTensor[
-        DTYPE, L_SITE_XPOS, MutAnyOrigin
-    ],
-    xquat: LayoutTensor[
-        DTYPE, L_XQUAT, MutAnyOrigin
-    ],
-    bodies: LayoutTensor[
-        DTYPE, L_BODIES, MutAnyOrigin
-    ],
-    sites: LayoutTensor[
-        DTYPE, L_SITES, MutAnyOrigin
-    ],
+    cfrc_int: TileTensor[DTYPE, L_CFRC_INT, MutAnyOrigin],
+    subtree_com: TileTensor[DTYPE, L_SUBTREE_COM, MutAnyOrigin],
+    site_xpos: TileTensor[DTYPE, L_SITE_XPOS, MutAnyOrigin],
+    xquat: TileTensor[DTYPE, L_XQUAT, MutAnyOrigin],
+    bodies: TileTensor[DTYPE, L_BODIES, MutAnyOrigin],
+    sites: TileTensor[DTYPE, L_SITES, MutAnyOrigin],
     env: Int,
     body: Int,
     site: Int,

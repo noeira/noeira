@@ -28,7 +28,6 @@ Regenerate the goldens: pixi run python scripts/dump_mujoco_wrap.py
 Run: pixi run mojo run -I . tests/physics3d/test_wrap_tendon_vs_mujoco.mojo
 """
 
-from layout import Layout, LayoutTensor
 from noeira.physics3d.parser.runtime_load import (
     dims_from_flat, build_model_runtime,
 )
@@ -154,16 +153,16 @@ def _tendon_lengths(
     var rl_B4 = rl2(1, dims.get_nbody() * 4)
     var rl_CDOF = rl2(1, nv * 6)
 
-    var ten_v = mf.tendons.lt_dyn["cpu", DYN2](rl_TEN)
-    var site_v = mf.sites.lt_dyn["cpu", DYN2](rl_SITE)
-    var geom_v = mf.geoms.lt_dyn["cpu", DYN2](rl_GEOM)
-    var body_v = mf.bodies.lt_dyn["cpu", DYN2](rl_BODY)
-    var joint_v = mf.joints.lt_dyn["cpu", DYN2](rl_JOINT)
-    var meta_v = mf.meta.lt_dyn["cpu", DYN1](rl_META)
-    var stcom_v = d.subtree_com.lt_dyn["cpu", DYN2](rl_B3)
-    var xpos_v = d.xpos.lt_dyn["cpu", DYN2](rl_B3)
-    var xquat_v = d.xquat.lt_dyn["cpu", DYN2](rl_B4)
-    var cdof_v = sc.cdof.lt_dyn["cpu", DYN2](rl_CDOF)
+    var ten_v = mf.tendons.tt_dyn["cpu", DYN2](rl_TEN)
+    var site_v = mf.sites.tt_dyn["cpu", DYN2](rl_SITE)
+    var geom_v = mf.geoms.tt_dyn["cpu", DYN2](rl_GEOM)
+    var body_v = mf.bodies.tt_dyn["cpu", DYN2](rl_BODY)
+    var joint_v = mf.joints.tt_dyn["cpu", DYN2](rl_JOINT)
+    var meta_v = mf.meta.tt_dyn["cpu", DYN1](rl_META)
+    var stcom_v = d.subtree_com.tt_dyn["cpu", DYN2](rl_B3)
+    var xpos_v = d.xpos.tt_dyn["cpu", DYN2](rl_B3)
+    var xquat_v = d.xquat.tt_dyn["cpu", DYN2](rl_B4)
+    var cdof_v = sc.cdof.tt_dyn["cpu", DYN2](rl_CDOF)
 
     var J = Scratch[Scalar[DTYPE], 0](nv, fill=Scalar[DTYPE](0))
     out.clear()

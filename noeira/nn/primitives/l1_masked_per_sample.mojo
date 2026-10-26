@@ -34,7 +34,8 @@ compares gradients against autograd on synthetic data can hit one.
 
 from max.gpu import global_idx
 from max.gpu.host import DeviceContext
-from layout import Layout, LayoutTensor, TileTensor, row_major
+from layout import TileTensor, row_major
+from noeira.core.tiles import Tile
 
 from noeira.nn.constants import DT, TPB
 from ..core.tensor import Tensor
@@ -48,10 +49,10 @@ from ..core.amp import AMPPolicy, NoAMP
 def _l1m_forward_kernel[
     BATCH: Int, K: Int, D: Int
 ](
-    pred: LayoutTensor[DT, Layout.row_major(BATCH, K * D), MutAnyOrigin],
-    tgt: LayoutTensor[DT, Layout.row_major(BATCH, K * D), MutAnyOrigin],
-    valid: LayoutTensor[DT, Layout.row_major(BATCH, K), MutAnyOrigin],
-    o: LayoutTensor[DT, Layout.row_major(BATCH, 1), MutAnyOrigin],
+    pred: Tile[DT, BATCH, K * D],
+    tgt: Tile[DT, BATCH, K * D],
+    valid: Tile[DT, BATCH, K],
+    o: Tile[DT, BATCH, 1],
 ):
     var r = Int(global_idx.x)
     if r >= BATCH:
@@ -71,12 +72,12 @@ def _l1m_forward_kernel[
 def _l1m_backward_kernel[
     BATCH: Int, K: Int, D: Int
 ](
-    go: LayoutTensor[DT, Layout.row_major(BATCH, 1), MutAnyOrigin],
-    pred: LayoutTensor[DT, Layout.row_major(BATCH, K * D), MutAnyOrigin],
-    tgt: LayoutTensor[DT, Layout.row_major(BATCH, K * D), MutAnyOrigin],
-    valid: LayoutTensor[DT, Layout.row_major(BATCH, K), MutAnyOrigin],
-    gp: LayoutTensor[DT, Layout.row_major(BATCH, K * D), MutAnyOrigin],
-    gt: LayoutTensor[DT, Layout.row_major(BATCH, K * D), MutAnyOrigin],
+    go: Tile[DT, BATCH, 1],
+    pred: Tile[DT, BATCH, K * D],
+    tgt: Tile[DT, BATCH, K * D],
+    valid: Tile[DT, BATCH, K],
+    gp: Tile[DT, BATCH, K * D],
+    gt: Tile[DT, BATCH, K * D],
 ):
     var idx = Int(global_idx.x)
     if idx >= BATCH * K * D:
@@ -98,7 +99,7 @@ def _l1m_backward_kernel[
 
 def _l1m_zero_kernel[
     N: Int
-](g: LayoutTensor[DT, Layout.row_major(N), MutAnyOrigin]):
+](g: Tile[DT, N]):
     var i = Int(global_idx.x)
     if i < N:
         g.ptr[unsafe_offset=i] = Scalar[DT](0.0)
@@ -157,10 +158,10 @@ struct L1MaskedPerSample[K: Int, D: Int](Module):
             var c = ctx.value()
             out.ensure_gpu(c, B)
             c.enqueue_function[_l1m_forward_kernel[B, Self.K, Self.D]](
-                pred.lt["gpu", Layout.row_major(B, Self.N)](),
-                tgt.lt["gpu", Layout.row_major(B, Self.N)](),
-                valid.lt["gpu", Layout.row_major(B, Self.K)](),
-                out.lt["gpu", Layout.row_major(B, 1)](),
+                pred.tt["gpu", B, Self.N](),
+                tgt.tt["gpu", B, Self.N](),
+                valid.tt["gpu", B, Self.K](),
+                out.tt["gpu", B, 1](),
                 grid_dim=(B + TPB - 1) // TPB,
                 block_dim=TPB,
             )
@@ -216,17 +217,17 @@ struct L1MaskedPerSample[K: Int, D: Int](Module):
             gt.ensure_gpu(c, B * Self.N)
             gv.ensure_gpu(c, B * Self.K)
             c.enqueue_function[_l1m_backward_kernel[B, Self.K, Self.D]](
-                grad_output.lt["gpu", Layout.row_major(B, 1)](),
-                pred.lt["gpu", Layout.row_major(B, Self.N)](),
-                tgt.lt["gpu", Layout.row_major(B, Self.N)](),
-                valid.lt["gpu", Layout.row_major(B, Self.K)](),
-                gp.lt["gpu", Layout.row_major(B, Self.N)](),
-                gt.lt["gpu", Layout.row_major(B, Self.N)](),
+                grad_output.tt["gpu", B, 1](),
+                pred.tt["gpu", B, Self.N](),
+                tgt.tt["gpu", B, Self.N](),
+                valid.tt["gpu", B, Self.K](),
+                gp.tt["gpu", B, Self.N](),
+                gt.tt["gpu", B, Self.N](),
                 grid_dim=(B * Self.N + TPB - 1) // TPB,
                 block_dim=TPB,
             )
             c.enqueue_function[_l1m_zero_kernel[B * Self.K]](
-                gv.lt["gpu", Layout.row_major(B * Self.K)](),
+                gv.tt["gpu", B * Self.K](),
                 grid_dim=(B * Self.K + TPB - 1) // TPB,
                 block_dim=TPB,
             )

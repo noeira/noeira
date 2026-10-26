@@ -12,15 +12,16 @@ Gate: real within ~2x sim. It also prints the real actions' per-joint mean
 and std in the SIM normaliser's units: teleop has no target-mode clamp, so
 actions far outside the sim distribution are a confound to read first.
 
-    pixi run -e apple mojo build -I . -D SO101_WM_B=16 \\
-        examples/lewm/lewm_so101_real_check.mojo -o build/so101_real_check
-    build/so101_real_check --dump <run>/epoch_7 --stats <run>/action_stats.txt \\
+    pixi run -e apple mojo run -I . examples/lewm/lewm_so101_real_check.mojo \\
+        --dump <run>/epoch_7 --stats <run>/action_stats.txt \\
         --real ~/.cache/noeira/act_so101/so101-tower__cube-in-bowl-printed_240x320_undist.h5 \\
         [--sim teacher.rendered.h5] [--batches 40]
 
-v2 (`-D SO101_WM_PROPRIO=1`, a `-D SO101_WM_PROPRIO=1` training run): the
-windows carry proprio, normalised with the run's `prop_stats.txt` (`--pstats`,
-default beside `--stats`).
+v2 (a `-D SO101_WM_PROPRIO=1` training run) is recognised by its dump's
+`prop_emb` tensors, so one binary serves both (`mojo run`: the laptop's
+linker rejects this driver's symbol lengths). Its windows carry proprio,
+normalised with the run's `prop_stats.txt` (`--pstats`, default beside
+`--stats`).
 
 Per data set, mean over `--batches` batches (eval mode):
 
@@ -36,6 +37,7 @@ Per data set, mean over `--batches` batches (eval mode):
 
 from std.sys import argv
 from std.sys.defines import get_defined_int
+from std.os.path import exists
 from std.math import sqrt
 from std.random import seed
 from max.gpu.host import DeviceContext
@@ -48,7 +50,6 @@ from noeira.experimental.lewm.so101_data import So101WMData, ACT_IN, CAMS, JOINT
 
 comptime R = 112
 comptime B = get_defined_int["SO101_WM_B", 16]()
-comptime PROPRIO = get_defined_int["SO101_WM_PROPRIO", 0]() == 1
 comptime TR = LeWMRefTrainer["gpu", B, CAMS * 3, R, ACT_IN]
 comptime TRP = LeWMProprioTrainer["gpu", B, CAMS * 3, R, ACT_IN, PROP]
 comptime PIX = T * CAMS * 3 * R * R
@@ -77,7 +78,7 @@ struct _Losses(Copyable, Movable):
 
 
 def _losses[TRT: WMWindowLoss](
-    mut tr: TRT, data: So101WMData[R], batches: Int,
+    mut tr: TRT, data: So101WMData[R], batches: Int, proprio: Bool,
 ) raises -> _Losses:
     """The four losses (see the header) on the SAME windows, averaged over
     `batches` batches (train + val starts alternately)."""
@@ -97,7 +98,7 @@ def _losses[TRT: WMWindowLoss](
         for i in range(len(act)):
             rolled[i] = act[(i + ACT) % len(act)]
         out.shuffled += tr.window_losses(pix, rolled, pro)[0]
-        comptime if PROPRIO:
+        if proprio:
             out.no_prop += tr.window_losses(pix, act, zero)[0]
     var n = Float64(batches)
     out.pred /= n
@@ -107,11 +108,11 @@ def _losses[TRT: WMWindowLoss](
     return out^
 
 
-def _report(label: String, l: _Losses):
+def _report(label: String, l: _Losses, proprio: Bool):
     var line = String("  ") + label + " pred " + String(Float32(l.pred))
     line += " | copy-last " + String(Float32(l.copy_last)) + " (pred / copy " + String(Float32(l.pred / l.copy_last)) + ")"
     line += " | actions shuffled x" + String(Float32(l.shuffled / l.pred))
-    comptime if PROPRIO:
+    if proprio:
         line += " | proprio zeroed x" + String(Float32(l.no_prop / l.pred))
     print(line)
 
@@ -154,30 +155,31 @@ def _prop_spread(data: So101WMData[R], label: String):
 
 def _check[TRT: WMWindowLoss](
     mut tr: TRT, real: String, sim: String, stats: String, pstats: String, batches: Int,
+    proprio: Bool,
 ) raises:
     var rp = List[String]()
     rp.append(real)
     var rd = So101WMData[R](rp, teleop=True)
     rd.load_action_stats(stats)
-    if PROPRIO:
+    if proprio:
         rd.load_prop_stats(pstats)
     print("  real:", rd.n_rows, "rows,", rd.n_episodes, "episodes,",
           len(rd.train_starts) + len(rd.val_starts), "windows")
     _action_spread(rd, String("real"))
-    if PROPRIO:
+    if proprio:
         _prop_spread(rd, String("real"))
-    var lr_ = _losses(tr, rd, batches)
-    _report(String("real"), lr_)
+    var lr_ = _losses(tr, rd, batches, proprio)
+    _report(String("real"), lr_, proprio)
     if sim.byte_length() > 0:
         var sp = List[String]()
         sp.append(sim)
         var sd = So101WMData[R](sp)
         sd.load_action_stats(stats)
-        if PROPRIO:
+        if proprio:
             sd.load_prop_stats(pstats)
         _action_spread(sd, String("sim"))
-        var ls = _losses(tr, sd, batches)
-        _report(String("sim "), ls)
+        var ls = _losses(tr, sd, batches, proprio)
+        _report(String("sim "), ls, proprio)
         print("  real / sim pred:", Float32(lr_.pred / ls.pred), "(gate: <= ~2)")
 
 
@@ -196,15 +198,15 @@ def main() raises:
     seed(7)
     var c = DeviceContext()
     var ctx = Optional(c)
-    comptime if PROPRIO:
+    if exists(dump + "/ours.prop_emb.0.0.weight.bin"):
         var tr = TRP(ctx, dropout=False)
         var n = tr.load(dump)
         tr.set_eval()
         print("S2 prediction check | v2 (proprio) model", dump, "(", n, "tensors ) | batch", B, "x", batches)
-        _check(tr, real, sim, stats, pstats, batches)
+        _check(tr, real, sim, stats, pstats, batches, True)
     else:
         var tr = TR(ctx, dropout=False)
         var n = tr.load(dump)
         tr.set_eval()
         print("S2 prediction check | v1 model", dump, "(", n, "tensors ) | batch", B, "x", batches)
-        _check(tr, real, sim, stats, pstats, batches)
+        _check(tr, real, sim, stats, pstats, batches, False)

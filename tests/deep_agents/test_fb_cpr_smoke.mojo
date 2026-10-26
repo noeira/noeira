@@ -18,6 +18,10 @@ NOWHERE else.
       differently; the same seed twice moves it identically.
   [6] checkpoint: FB file + `.cpr` sidecar round-trip (D logits on a probe
       equal after `load_state`); a missing sidecar RAISES.
+  [7] `stash_critic_grads` (the actor step's backward through F1, F2, Q_D1
+      and Q_D2 with their gradient buffers moved out, so no dW is formed)
+      leaves EVERY net bit-identical to the old form-and-discard path over
+      three steps: B, F1, F2, actor, D, Q_D1, Q_D2.
 
 ⚠ Smoke gate on random data. Whether CPR closes any of the walker gap is
 the run (`examples/fb/fb_train_cpr_gpu.mojo`), not this file.
@@ -397,6 +401,42 @@ def test_checkpoint(ref b: _Batch) raises:
     print("      ok")
 
 
+def _read_all(mut c: CPR) raises -> List[_ReadVals]:
+    var out = List[_ReadVals]()
+    for k in range(7):
+        out.append(_ReadVals())
+    c.t.bnet.online.for_each_param["cpu"](out[0], None)
+    c.t.f1.online.for_each_param["cpu"](out[1], None)
+    c.t.f2.online.for_each_param["cpu"](out[2], None)
+    c.t.actor.online.for_each_param["cpu"](out[3], None)
+    c.head.disc.for_each_param["cpu"](out[4], None)
+    c.head.qd1.online.for_each_param["cpu"](out[5], None)
+    c.head.qd2.online.for_each_param["cpu"](out[6], None)
+    return out^
+
+
+def test_stash_critic_grads(ref b: _Batch) raises:
+    print("[7] stash_critic_grads: every net bit-identical to form-and-discard ...")
+    # ⚠ One arm AFTER the other, never interleaved: the CPR step draws from
+    # the global host RNG, which `_make_cpr` re-seeds.
+    var c0 = _make_cpr(1.0, 10.0, 1.0)
+    c0.t.stash_critic_grads = False
+    _load(c0, b)
+    for _ in range(3):
+        _ = c0.train_step()
+    var r0 = _read_all(c0)
+    var c1 = _make_cpr(1.0, 10.0, 1.0)
+    assert_true(c1.t.stash_critic_grads, "the stash is not the default")
+    _load(c1, b)
+    for _ in range(3):
+        _ = c1.train_step()
+    var r1 = _read_all(c1)
+    var names: List[String] = ["B", "F1", "F2", "actor", "D", "Q_D1", "Q_D2"]
+    for k in range(7):
+        assert_true(_same(r0[k], r1[k]), names[k] + " differs with the stash")
+    print("      7 / 7 nets bit-identical after 3 steps")
+
+
 def main() raises:
     print("=" * 70)
     print("FBCPRTrainer smoke")
@@ -407,4 +447,5 @@ def main() raises:
     test_reg_moves_actor_only(b)
     test_gp_contributes(b)
     test_checkpoint(b)
+    test_stash_critic_grads(b)
     print("\n[PASS] FBCPRTrainer smoke")

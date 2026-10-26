@@ -26,7 +26,6 @@ row t = 3 (the next episode) — the fixture gives that row a huge reward.
     pixi run mojo run -I . tests/nn/test_ppo_gae_truncation.mojo
 """
 
-from layout import Layout
 from max.gpu.host import DeviceContext
 from std.random import random_float64, seed
 from std.testing import assert_true

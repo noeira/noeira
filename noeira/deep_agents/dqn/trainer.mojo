@@ -29,7 +29,6 @@ train step (all gather/scatter on-device).
 from noeira.nn.core.param import walk_params
 from std.random import random_float64
 from max.gpu.host import DeviceContext, DeviceBuffer
-from layout import Layout, LayoutTensor
 
 from noeira.core.logger import Logger, NoOpLogger
 from noeira.nn.constants import DT
@@ -43,7 +42,7 @@ from noeira.nn.optimizer.adam import Adam
 from noeira.nn.core.checkpoint import (
     BinaryCheckpointWriter, BinaryCheckpointReader, CheckpointReader,
     CheckpointScalars, write_model, read_model, _split_lines, _is_v3_header,
-    _read_file_bytes, _write_file_bytes,
+    _read_file_bytes,
 )
 
 from noeira.nn.core.log_bundle import log_bundle
@@ -64,6 +63,7 @@ from ..training.blocks import SampleBlock, SinglePolyakStep
 from .target_y_block import DQNTargetYBlock
 from .blocks.q_update_step import DQNQUpdateStep
 from .metrics import DQNMetrics
+from noeira.core.tiles import RowMajor
 
 
 struct DQNTrainer[
@@ -402,22 +402,22 @@ struct DQNTrainer[
         # `_train_step_impl`.
         comptime if Self.train_target == "gpu":
             var t_diag = perf_counter_ns()
-            comptime lb = Layout.row_major(Self.BATCH)
+            comptime lb = RowMajor[Self.BATCH]
             self._q_mean_dev.accumulate_gpu_lt[Self.BATCH](
-                self.q_update_blk.inner._mb_q_gath.lt["gpu", lb]()
+                self.q_update_blk.inner._mb_q_gath.tt["gpu", Self.BATCH]()
             )
             self._target_mean_dev.accumulate_gpu_lt[Self.BATCH](
-                self.state.mb_y.lt["gpu", lb]()
+                self.state.mb_y.tt["gpu", Self.BATCH]()
             )
             self._td_error_mean_dev.accumulate_gpu_abs_diff_lt[Self.BATCH](
-                self.q_update_blk.inner._mb_q_gath.lt["gpu", lb](),
-                self.state.mb_y.lt["gpu", lb](),
+                self.q_update_blk.inner._mb_q_gath.tt["gpu", Self.BATCH](),
+                self.state.mb_y.tt["gpu", Self.BATCH](),
             )
             self._reward_mean_dev.accumulate_gpu_lt[Self.BATCH](
-                self.state.mb_r.lt["gpu", lb]()
+                self.state.mb_r.tt["gpu", Self.BATCH]()
             )
             self._done_mean_dev.accumulate_gpu_lt[Self.BATCH](
-                self.state.mb_d.lt["gpu", lb]()
+                self.state.mb_d.tt["gpu", Self.BATCH]()
             )
             self.timer.accumulate(Self._T_DIAG, t_diag)
 
@@ -850,7 +850,7 @@ struct DQNTrainer[
         as `K` sections. Atomic and chunked. On GPU device params download to
         host first; the on-disk format is target-agnostic (train-on-GPU →
         eval-on-CPU loads). The target net is hard-copied from online on load."""
-        var w = BinaryCheckpointWriter(save_moments=False)
+        var w = BinaryCheckpointWriter.to_file(path, save_moments=False)
         write_model[Self.train_target](w, self.pair.online, self.ctx, "q_net")
         var sc = CheckpointScalars()
         sc.set("eps.epsilon", Float64(self.epsilon))
@@ -858,7 +858,7 @@ struct DQNTrainer[
         sc.set("eps.epsilon_min", Float64(self.epsilon_min))
         sc.set_int("total_train_steps", self._total_train_steps)
         w.write_scalars(sc)
-        _write_file_bytes(path, w.content)
+        w.commit()
 
     def load_state(mut self, path: String) raises:
         """Inverse of `save_state`: restore online params + state, ε scalars +

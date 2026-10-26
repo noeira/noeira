@@ -13,7 +13,6 @@ Algorithm (matching Gymnasium car_racing.py):
 from std.math import sin, cos, sqrt, pi, atan2
 from std.random import random_float64
 from std.random.philox import Random as PhiloxRandom
-from layout import Layout, LayoutTensor
 
 from noeira.physics2d.car.constants import (
     TILE_DATA_SIZE,
@@ -32,6 +31,7 @@ from noeira.physics2d.car.constants import (
 from noeira.physics2d import dtype
 
 from .constants import CRConstants
+from noeira.core.tiles import Tile
 
 
 # =============================================================================
@@ -227,11 +227,7 @@ struct TrackTile[DTYPE: DType](Copyable, ImplicitlyCopyable, Movable):
         self,
         # by-value (not `mut`): a concrete-origin view widens into MutAnyOrigin
         # by value (as kernel params do); setitem writes through the pointer.
-        tiles: LayoutTensor[
-            dtype,
-            Layout.row_major(MAX_TILES, TILE_DATA_SIZE),
-            MutAnyOrigin,
-        ],
+        tiles: Tile[dtype, MAX_TILES, TILE_DATA_SIZE],
         idx: Int,
     ):
         """Write tile data to GPU buffer."""
@@ -659,11 +655,7 @@ struct TrackGenerator[DTYPE: DType](Copyable, Movable):
     ](
         self,
         # by-value (not `mut`): see per-tile `to_buffer` above.
-        tiles: LayoutTensor[
-            dtype,
-            Layout.row_major(MAX_TILES, TILE_DATA_SIZE),
-            MutAnyOrigin,
-        ],
+        tiles: Tile[dtype, MAX_TILES, TILE_DATA_SIZE],
     ):
         """Copy track data to GPU buffer."""
         for i in range(min(self.track_length, MAX_TILES)):

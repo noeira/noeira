@@ -55,7 +55,6 @@ from std.time import perf_counter_ns
 
 from max.gpu import global_idx
 from max.gpu.host import DeviceBuffer, DeviceContext
-from layout import Layout, LayoutTensor
 
 from noeira.core.run import RunContext, register_run
 from noeira.core.run_session import RunLogger, finish_run, run_logger
@@ -112,6 +111,7 @@ from noeira.tasks.pixel_student import (
     PROPRIO, JOINT_SCALE, JOINT_VEL_SCALE, student_act, write_pixel_manifest,
     PROPRIO_STATE, HIST_WORDS, TARGET_LEAD_SCALE,
 )
+from noeira.core.tiles import Tile
 
 comptime M = So101TowerModel
 comptime C = So101TowerConfig
@@ -150,8 +150,8 @@ comptime OverheadRenderer = TowerRendererSized[
 def _pack_camera_kernel[
     N: Int, RW: Int, RH: Int, P: Int
 ](
-    rgb: LayoutTensor[DT, Layout.row_major(N * RW * RH * 3), MutAnyOrigin],
-    ring: LayoutTensor[DT, Layout.row_major(1), MutAnyOrigin],
+    rgb: Tile[DT, N * RW * RH * 3],
+    ring: Tile[DT, 1],
     base_row: Int64,
     ch0: Int64,
     wx0: Scalar[DT],
@@ -205,12 +205,12 @@ def _pack_camera_kernel[
 def _pack_proprio_kernel[
     N: Int, NQ_: Int, NV_: Int
 ](
-    qpos: LayoutTensor[DT, Layout.row_major(N * NQ_), MutAnyOrigin],
-    qvel: LayoutTensor[DT, Layout.row_major(N * NV_), MutAnyOrigin],
-    qa: LayoutTensor[DT, Layout.row_major(ACT_DIM), MutAnyOrigin],
-    da: LayoutTensor[DT, Layout.row_major(ACT_DIM), MutAnyOrigin],
-    hist: LayoutTensor[DT, Layout.row_major(N * HW1), MutAnyOrigin],
-    ring: LayoutTensor[DT, Layout.row_major(1), MutAnyOrigin],
+    qpos: Tile[DT, N * NQ_],
+    qvel: Tile[DT, N * NV_],
+    qa: Tile[DT, ACT_DIM],
+    da: Tile[DT, ACT_DIM],
+    hist: Tile[DT, N * HW1],
+    ring: Tile[DT, 1],
     base_row: Int64,
 ):
     """The actuated joints (qpos addresses `qa`) — with `DAGGER_JOINT_VEL`
@@ -240,10 +240,10 @@ comptime AUG_WORDS = 7
 def _gather_kernel[
     B: Int
 ](
-    ring: LayoutTensor[DT, Layout.row_major(1), MutAnyOrigin],
-    g: LayoutTensor[DT, Layout.row_major(B), MutAnyOrigin],
-    x: LayoutTensor[DT, Layout.row_major(B * IN_DIM), MutAnyOrigin],
-    aug: LayoutTensor[DT, Layout.row_major(B * AUG_WORDS), MutAnyOrigin],
+    ring: Tile[DT, 1],
+    g: Tile[DT, B],
+    x: Tile[DT, B * IN_DIM],
+    aug: Tile[DT, B * AUG_WORDS],
     blank: Int64,
     use_aug: Int64,
 ):
@@ -444,10 +444,8 @@ struct PixelObs(Movable):
                 ctx.enqueue_function[_pack_camera_kernel[
                     N_ENVS, OVERHEAD_RENDER_W, OVERHEAD_RENDER_H, OBS_PX
                 ]](
-                    rgb.lt["gpu", Layout.row_major(
-                        N_ENVS * OVERHEAD_RENDER_W * OVERHEAD_RENDER_H * 3
-                    )](),
-                    self.ring.lt["gpu", Layout.row_major(1)](),
+                    rgb.tt["gpu", N_ENVS * OVERHEAD_RENDER_W * OVERHEAD_RENDER_H * 3](),
+                    self.ring.tt["gpu", 1](),
                     Int64(base_row),
                     Int64(3 * k),
                     Scalar[DT](self.win[4 * k]), Scalar[DT](self.win[4 * k + 1]),
@@ -464,8 +462,8 @@ struct PixelObs(Movable):
                 ctx.enqueue_function[_pack_camera_kernel[
                     N_ENVS, RENDER, RENDER, OBS_PX
                 ]](
-                    rgb.lt["gpu", Layout.row_major(N_ENVS * RENDER * RENDER * 3)](),
-                    self.ring.lt["gpu", Layout.row_major(1)](),
+                    rgb.tt["gpu", N_ENVS * RENDER * RENDER * 3](),
+                    self.ring.tt["gpu", 1](),
                     Int64(base_row),
                     Int64(3 * k),
                     Scalar[DT](self.win[4 * k]), Scalar[DT](self.win[4 * k + 1]),
@@ -475,12 +473,12 @@ struct PixelObs(Movable):
                 )
         comptime n_q = (N_ENVS * PROPRIO + TPB - 1) // TPB
         ctx.enqueue_function[_pack_proprio_kernel[N_ENVS, NQ, NV]](
-            self.rd.qpos.lt["gpu", Layout.row_major(N_ENVS * NQ)](),
-            self.rd.qvel.lt["gpu", Layout.row_major(N_ENVS * NV)](),
-            self.qa.lt["gpu", Layout.row_major(ACT_DIM)](),
-            self.da.lt["gpu", Layout.row_major(ACT_DIM)](),
-            self.hist_t.lt["gpu", Layout.row_major(N_ENVS * HW1)](),
-            self.ring.lt["gpu", Layout.row_major(1)](),
+            self.rd.qpos.tt["gpu", N_ENVS * NQ](),
+            self.rd.qvel.tt["gpu", N_ENVS * NV](),
+            self.qa.tt["gpu", ACT_DIM](),
+            self.da.tt["gpu", ACT_DIM](),
+            self.hist_t.tt["gpu", N_ENVS * HW1](),
+            self.ring.tt["gpu", 1](),
             Int64(base_row),
             grid_dim=n_q,
             block_dim=TPB,
@@ -520,10 +518,10 @@ struct PixelObs(Movable):
     ) raises:
         comptime n = (B * IN_DIM + TPB - 1) // TPB
         ctx.enqueue_function[_gather_kernel[B]](
-            self.ring.lt["gpu", Layout.row_major(1)](),
-            g.lt["gpu", Layout.row_major(B)](),
-            x.lt["gpu", Layout.row_major(B * IN_DIM)](),
-            self.aug.lt["gpu", Layout.row_major(B * AUG_WORDS)](),
+            self.ring.tt["gpu", 1](),
+            g.tt["gpu", B](),
+            x.tt["gpu", B * IN_DIM](),
+            self.aug.tt["gpu", B * AUG_WORDS](),
             Int64(1 if self.blank else 0),
             Int64(1 if (augment and self.aug_on and B == BATCH) else 0),
             grid_dim=n,
@@ -731,7 +729,7 @@ def run_pixel_dagger(args: List[String], driver: String) raises:
         # ── the student ──────────────────────────────────────────────────
         var student = StudentNet.make["gpu", Kaiming](Optional(ctx))
         if init_student.byte_length() > 0:
-            load_params["gpu"](student, init_student, Optional(ctx))
+            _ = load_params["gpu"](student, init_student, Optional(ctx))
             print("  init: student from", init_student)
         var opt = Adam(lr=Scalar[DT](lr))
 
@@ -1317,7 +1315,7 @@ def _dump_obs_png(
                 for y in range(W):
                     for x in range(W):
                         for c in range(3):
-                            var v = Float64(hp[
+                            var v = Float64(hp[unsafe_offset=
                                 lane * ROW + (3 * cam + c) * PLANE
                                 + (y // S) * OBS_PX + x // S
                             ]) + 0.5

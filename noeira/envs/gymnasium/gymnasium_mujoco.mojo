@@ -291,7 +291,7 @@ struct GymMuJoCoEnv(
         action_list.append(Scalar[DTYPE](action))
         for _ in range(1, self._action_dim):
             action_list.append(Scalar[DTYPE](0.0))
-        return self.step_continuous_vec(action_list^)
+        return self.step_continuous_vec(action_list)
 
     def step_continuous_vec[
         DTYPE: DType

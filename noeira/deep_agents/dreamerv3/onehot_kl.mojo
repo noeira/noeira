@@ -34,7 +34,6 @@ test (`test_dreamer_pr2.mojo`).
 from std.math import exp, log
 from max.gpu import global_idx
 from max.gpu.host import DeviceContext
-from layout import Layout, LayoutTensor
 
 from noeira.nn.constants import DT, TPB
 from noeira.nn.core.tensor import Tensor
@@ -42,6 +41,7 @@ from noeira.nn.core.tensor_refs import TensorRefs
 from noeira.nn.core.module import Module
 from noeira.nn.core.initializer import Initializer
 from noeira.nn.core.amp import AMPPolicy, NoAMP
+from noeira.core.tiles import Tile
 
 
 @always_inline
@@ -57,13 +57,13 @@ def _mptr[
 #    fwd2 (per batch): Σ_s KL → free-nats clamp → out[B,2] + active[B].
 #    bwd (per group): asymmetric dyn→prior / rep→post grads.  ────────────
 def _kl_fwd1_kernel[NG: Int, C: Int](
-    post: LayoutTensor[DT, Layout.row_major(NG * C), MutAnyOrigin],
-    prior: LayoutTensor[DT, Layout.row_major(NG * C), MutAnyOrigin],
-    smpo: LayoutTensor[DT, Layout.row_major(NG * C), MutAnyOrigin],
-    ppo: LayoutTensor[DT, Layout.row_major(NG * C), MutAnyOrigin],
-    smpr: LayoutTensor[DT, Layout.row_major(NG * C), MutAnyOrigin],
-    ppr: LayoutTensor[DT, Layout.row_major(NG * C), MutAnyOrigin],
-    klpart: LayoutTensor[DT, Layout.row_major(NG), MutAnyOrigin],
+    post: Tile[DT, NG * C],
+    prior: Tile[DT, NG * C],
+    smpo: Tile[DT, NG * C],
+    ppo: Tile[DT, NG * C],
+    smpr: Tile[DT, NG * C],
+    ppr: Tile[DT, NG * C],
+    klpart: Tile[DT, NG],
     u: Scalar[DT],
 ):
     var g = Int(global_idx.x)
@@ -112,9 +112,9 @@ def _kl_fwd1_kernel[NG: Int, C: Int](
 
 
 def _kl_fwd2_kernel[B: Int, STOCH: Int](
-    klpart: LayoutTensor[DT, Layout.row_major(B * STOCH), MutAnyOrigin],
-    outb: LayoutTensor[DT, Layout.row_major(B * 2), MutAnyOrigin],
-    active: LayoutTensor[DT, Layout.row_major(B), MutAnyOrigin],
+    klpart: Tile[DT, B * STOCH],
+    outb: Tile[DT, B * 2],
+    active: Tile[DT, B],
     free_nats: Scalar[DT],
 ):
     var b = Int(global_idx.x)
@@ -129,14 +129,14 @@ def _kl_fwd2_kernel[B: Int, STOCH: Int](
 
 
 def _kl_bwd_kernel[NG: Int, C: Int, STOCH: Int](
-    go: LayoutTensor[DT, Layout.row_major(NG // STOCH * 2), MutAnyOrigin],
-    active: LayoutTensor[DT, Layout.row_major(NG // STOCH), MutAnyOrigin],
-    smpo: LayoutTensor[DT, Layout.row_major(NG * C), MutAnyOrigin],
-    ppo: LayoutTensor[DT, Layout.row_major(NG * C), MutAnyOrigin],
-    smpr: LayoutTensor[DT, Layout.row_major(NG * C), MutAnyOrigin],
-    ppr: LayoutTensor[DT, Layout.row_major(NG * C), MutAnyOrigin],
-    g_post: LayoutTensor[DT, Layout.row_major(NG * C), MutAnyOrigin],
-    g_prior: LayoutTensor[DT, Layout.row_major(NG * C), MutAnyOrigin],
+    go: Tile[DT, NG // STOCH * 2],
+    active: Tile[DT, NG // STOCH],
+    smpo: Tile[DT, NG * C],
+    ppo: Tile[DT, NG * C],
+    smpr: Tile[DT, NG * C],
+    ppr: Tile[DT, NG * C],
+    g_post: Tile[DT, NG * C],
+    g_prior: Tile[DT, NG * C],
     one_m_u: Scalar[DT],
 ):
     var g = Int(global_idx.x)
@@ -435,21 +435,21 @@ struct OneHotKLLoss[STOCH: Int, CLASSES: Int](Module):
             var act = Tensor.alloc_gpu(c, B)
             comptime nb1 = (NG + TPB - 1) // TPB
             c.enqueue_function[_kl_fwd1_kernel[NG, Self.CLASSES]](
-                post.lt["gpu", Layout.row_major(NN)](),
-                prior.lt["gpu", Layout.row_major(NN)](),
-                smpo.lt["gpu", Layout.row_major(NN)](),
-                ppo.lt["gpu", Layout.row_major(NN)](),
-                smpr.lt["gpu", Layout.row_major(NN)](),
-                ppr.lt["gpu", Layout.row_major(NN)](),
-                klp.lt["gpu", Layout.row_major(NG)](),
+                post.tt["gpu", NN](),
+                prior.tt["gpu", NN](),
+                smpo.tt["gpu", NN](),
+                ppo.tt["gpu", NN](),
+                smpr.tt["gpu", NN](),
+                ppr.tt["gpu", NN](),
+                klp.tt["gpu", NG](),
                 self.unimix,
                 grid_dim=nb1, block_dim=TPB,
             )
             comptime nb2 = (B + TPB - 1) // TPB
             c.enqueue_function[_kl_fwd2_kernel[B, Self.STOCH]](
-                klp.lt["gpu", Layout.row_major(NG)](),
-                out.lt["gpu", Layout.row_major(B * 2)](),
-                act.lt["gpu", Layout.row_major(B)](),
+                klp.tt["gpu", NG](),
+                out.tt["gpu", B * 2](),
+                act.tt["gpu", B](),
                 self.free_nats,
                 grid_dim=nb2, block_dim=TPB,
             )
@@ -528,13 +528,13 @@ struct OneHotKLLoss[STOCH: Int, CLASSES: Int](Module):
             var act = Tensor.alloc_gpu(c, B)
             comptime nb1 = (NG + TPB - 1) // TPB
             c.enqueue_function[_kl_fwd1_kernel[NG, Self.CLASSES]](
-                post.lt["gpu", Layout.row_major(NN)](),
-                prior.lt["gpu", Layout.row_major(NN)](),
-                smpo.lt["gpu", Layout.row_major(NN)](),
-                ppo.lt["gpu", Layout.row_major(NN)](),
-                smpr.lt["gpu", Layout.row_major(NN)](),
-                ppr.lt["gpu", Layout.row_major(NN)](),
-                klp.lt["gpu", Layout.row_major(NG)](),
+                post.tt["gpu", NN](),
+                prior.tt["gpu", NN](),
+                smpo.tt["gpu", NN](),
+                ppo.tt["gpu", NN](),
+                smpr.tt["gpu", NN](),
+                ppr.tt["gpu", NN](),
+                klp.tt["gpu", NG](),
                 self.unimix,
                 grid_dim=nb1, block_dim=TPB,
             )
@@ -542,22 +542,22 @@ struct OneHotKLLoss[STOCH: Int, CLASSES: Int](Module):
             var dout = Tensor.alloc_gpu(c, B * 2)
             comptime nb2 = (B + TPB - 1) // TPB
             c.enqueue_function[_kl_fwd2_kernel[B, Self.STOCH]](
-                klp.lt["gpu", Layout.row_major(NG)](),
-                dout.lt["gpu", Layout.row_major(B * 2)](),
-                act.lt["gpu", Layout.row_major(B)](),
+                klp.tt["gpu", NG](),
+                dout.tt["gpu", B * 2](),
+                act.tt["gpu", B](),
                 self.free_nats,
                 grid_dim=nb2, block_dim=TPB,
             )
             comptime nb = (NG + TPB - 1) // TPB
             c.enqueue_function[_kl_bwd_kernel[NG, Self.CLASSES, Self.STOCH]](
-                grad_output.lt["gpu", Layout.row_major(B * 2)](),
-                act.lt["gpu", Layout.row_major(B)](),
-                smpo.lt["gpu", Layout.row_major(NN)](),
-                ppo.lt["gpu", Layout.row_major(NN)](),
-                smpr.lt["gpu", Layout.row_major(NN)](),
-                ppr.lt["gpu", Layout.row_major(NN)](),
-                g_post.lt["gpu", Layout.row_major(NN)](),
-                g_prior.lt["gpu", Layout.row_major(NN)](),
+                grad_output.tt["gpu", B * 2](),
+                act.tt["gpu", B](),
+                smpo.tt["gpu", NN](),
+                ppo.tt["gpu", NN](),
+                smpr.tt["gpu", NN](),
+                ppr.tt["gpu", NN](),
+                g_post.tt["gpu", NN](),
+                g_prior.tt["gpu", NN](),
                 one_m_u,
                 grid_dim=nb, block_dim=TPB,
             )

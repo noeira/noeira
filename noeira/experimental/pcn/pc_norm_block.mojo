@@ -22,7 +22,6 @@ the FULL flattened feature vector (global RMSNorm), per sample.
 CPU naive + GPU (per-row reduction kernels). Conforms to PCBlockTrait.
 """
 
-from layout import Layout, LayoutTensor
 from max.gpu import thread_idx, block_idx, block_dim
 from max.gpu.host import DeviceContext
 from std.math import sqrt
@@ -31,6 +30,7 @@ from .pc_constants import TPB
 from .pc_initializer import PCInitializer
 
 from .predictive_model import PCBlockTrait
+from noeira.core.tiles import Tile, tile
 
 comptime _RMS_EPS: Float64 = 1e-6
 
@@ -53,9 +53,7 @@ struct NormPCBlock[dim: Int](PCBlockTrait):
     def pc_init_params[
         INIT: PCInitializer, dtype: DType = DType.float32
     ](
-        mut params: LayoutTensor[
-            dtype, Layout.row_major(Self.PARAM_SIZE), MutAnyOrigin
-        ],
+        params: Tile[dtype, Self.PARAM_SIZE],
     ) raises:
         """Init: γ = 1 (INIT unused — RMSNorm scale, not a weight)."""
         for i in range(Self.dim):
@@ -69,18 +67,10 @@ struct NormPCBlock[dim: Int](PCBlockTrait):
     def predict[
         BATCH: Int, dtype: DType = DType.float32
     ](
-        x_below: LayoutTensor[
-            dtype, Layout.row_major(BATCH, Self.IN_DIM), MutAnyOrigin
-        ],
-        params: LayoutTensor[
-            dtype, Layout.row_major(Self.PARAM_SIZE), MutAnyOrigin
-        ],
-        mut mu: LayoutTensor[
-            dtype, Layout.row_major(BATCH, Self.OUT_DIM), MutAnyOrigin
-        ],
-        mut a_below: LayoutTensor[
-            dtype, Layout.row_major(BATCH, Self.IN_DIM), MutAnyOrigin
-        ],
+        x_below: Tile[dtype, BATCH, Self.IN_DIM],
+        params: Tile[dtype, Self.PARAM_SIZE],
+        mu: Tile[dtype, BATCH, Self.OUT_DIM],
+        a_below: Tile[dtype, BATCH, Self.IN_DIM],
     ):
         # a_below cached = x_below (raw); direct LayoutTensor element indexing.
         for b in range(BATCH):
@@ -104,15 +94,9 @@ struct NormPCBlock[dim: Int](PCBlockTrait):
     def eps_compute[
         BATCH: Int, dtype: DType = DType.float32
     ](
-        x_above: LayoutTensor[
-            dtype, Layout.row_major(BATCH, Self.OUT_DIM), MutAnyOrigin
-        ],
-        mu: LayoutTensor[
-            dtype, Layout.row_major(BATCH, Self.OUT_DIM), MutAnyOrigin
-        ],
-        mut eps: LayoutTensor[
-            dtype, Layout.row_major(BATCH, Self.OUT_DIM), MutAnyOrigin
-        ],
+        x_above: Tile[dtype, BATCH, Self.OUT_DIM],
+        mu: Tile[dtype, BATCH, Self.OUT_DIM],
+        eps: Tile[dtype, BATCH, Self.OUT_DIM],
     ):
         # ε = x_above − μ (elementwise; scalar LayoutTensor indexing).
         for b in range(BATCH):
@@ -128,15 +112,9 @@ struct NormPCBlock[dim: Int](PCBlockTrait):
     def pull_back[
         BATCH: Int, dtype: DType = DType.float32
     ](
-        eps_above: LayoutTensor[
-            dtype, Layout.row_major(BATCH, Self.OUT_DIM), MutAnyOrigin
-        ],
-        params: LayoutTensor[
-            dtype, Layout.row_major(Self.PARAM_SIZE), MutAnyOrigin
-        ],
-        mut z_below: LayoutTensor[
-            dtype, Layout.row_major(BATCH, Self.IN_DIM), MutAnyOrigin
-        ],
+        eps_above: Tile[dtype, BATCH, Self.OUT_DIM],
+        params: Tile[dtype, Self.PARAM_SIZE],
+        z_below: Tile[dtype, BATCH, Self.IN_DIM],
     ):
         # z = ε ⊙ γ (per-feature scale; direct element indexing).
         for b in range(BATCH):
@@ -152,15 +130,9 @@ struct NormPCBlock[dim: Int](PCBlockTrait):
     def act_derivative_mul[
         BATCH: Int, dtype: DType = DType.float32
     ](
-        x_below: LayoutTensor[
-            dtype, Layout.row_major(BATCH, Self.IN_DIM), MutAnyOrigin
-        ],
-        z_in: LayoutTensor[
-            dtype, Layout.row_major(BATCH, Self.IN_DIM), MutAnyOrigin
-        ],
-        mut z_out: LayoutTensor[
-            dtype, Layout.row_major(BATCH, Self.IN_DIM), MutAnyOrigin
-        ],
+        x_below: Tile[dtype, BATCH, Self.IN_DIM],
+        z_in: Tile[dtype, BATCH, Self.IN_DIM],
+        z_out: Tile[dtype, BATCH, Self.IN_DIM],
     ):
         # Apply the RMSNorm Jacobian to z using x_below (direct element indexing;
         # Float64 reductions preserved bit-for-bit).
@@ -198,15 +170,9 @@ struct NormPCBlock[dim: Int](PCBlockTrait):
     def weight_grad[
         BATCH: Int, dtype: DType = DType.float32
     ](
-        eps_above: LayoutTensor[
-            dtype, Layout.row_major(BATCH, Self.OUT_DIM), MutAnyOrigin
-        ],
-        a_below: LayoutTensor[
-            dtype, Layout.row_major(BATCH, Self.IN_DIM), MutAnyOrigin
-        ],
-        mut grads: LayoutTensor[
-            dtype, Layout.row_major(Self.PARAM_SIZE), MutAnyOrigin
-        ],
+        eps_above: Tile[dtype, BATCH, Self.OUT_DIM],
+        a_below: Tile[dtype, BATCH, Self.IN_DIM],
+        grads: Tile[dtype, Self.PARAM_SIZE],
     ):
         # dγ_i = −Σ_b ε[b,i]·n[b,i] (direct element indexing; same accumulation
         # order as before → bit-identical; −sign baked in).
@@ -232,16 +198,10 @@ struct NormPCBlock[dim: Int](PCBlockTrait):
     def _predict_kernel[
         BATCH: Int, dtype: DType
     ](
-        x_below: LayoutTensor[
-            dtype, Layout.row_major(BATCH, Self.dim), MutAnyOrigin
-        ],
-        params: LayoutTensor[dtype, Layout.row_major(Self.dim), MutAnyOrigin],
-        mu: LayoutTensor[
-            dtype, Layout.row_major(BATCH, Self.dim), MutAnyOrigin
-        ],
-        a_below: LayoutTensor[
-            dtype, Layout.row_major(BATCH, Self.dim), MutAnyOrigin
-        ],
+        x_below: Tile[dtype, BATCH, Self.dim],
+        params: Tile[dtype, Self.dim],
+        mu: Tile[dtype, BATCH, Self.dim],
+        a_below: Tile[dtype, BATCH, Self.dim],
     ):
         var b = Int(block_dim.x * block_idx.x + thread_idx.x)
         if b >= BATCH:
@@ -260,15 +220,9 @@ struct NormPCBlock[dim: Int](PCBlockTrait):
     def _eps_kernel[
         BATCH: Int, dtype: DType
     ](
-        x_above: LayoutTensor[
-            dtype, Layout.row_major(BATCH, Self.dim), MutAnyOrigin
-        ],
-        mu: LayoutTensor[
-            dtype, Layout.row_major(BATCH, Self.dim), MutAnyOrigin
-        ],
-        eps: LayoutTensor[
-            dtype, Layout.row_major(BATCH, Self.dim), MutAnyOrigin
-        ],
+        x_above: Tile[dtype, BATCH, Self.dim],
+        mu: Tile[dtype, BATCH, Self.dim],
+        eps: Tile[dtype, BATCH, Self.dim],
     ):
         var idx = Int(block_dim.x * block_idx.x + thread_idx.x)
         if idx >= BATCH * Self.dim:
@@ -279,13 +233,9 @@ struct NormPCBlock[dim: Int](PCBlockTrait):
     def _pull_back_kernel[
         BATCH: Int, dtype: DType
     ](
-        eps_above: LayoutTensor[
-            dtype, Layout.row_major(BATCH, Self.dim), MutAnyOrigin
-        ],
-        params: LayoutTensor[dtype, Layout.row_major(Self.dim), MutAnyOrigin],
-        z_below: LayoutTensor[
-            dtype, Layout.row_major(BATCH, Self.dim), MutAnyOrigin
-        ],
+        eps_above: Tile[dtype, BATCH, Self.dim],
+        params: Tile[dtype, Self.dim],
+        z_below: Tile[dtype, BATCH, Self.dim],
     ):
         var idx = Int(block_dim.x * block_idx.x + thread_idx.x)
         if idx >= BATCH * Self.dim:
@@ -297,15 +247,9 @@ struct NormPCBlock[dim: Int](PCBlockTrait):
     def _act_deriv_kernel[
         BATCH: Int, dtype: DType
     ](
-        x_below: LayoutTensor[
-            dtype, Layout.row_major(BATCH, Self.dim), MutAnyOrigin
-        ],
-        z_in: LayoutTensor[
-            dtype, Layout.row_major(BATCH, Self.dim), MutAnyOrigin
-        ],
-        z_out: LayoutTensor[
-            dtype, Layout.row_major(BATCH, Self.dim), MutAnyOrigin
-        ],
+        x_below: Tile[dtype, BATCH, Self.dim],
+        z_in: Tile[dtype, BATCH, Self.dim],
+        z_out: Tile[dtype, BATCH, Self.dim],
     ):
         var b = Int(block_dim.x * block_idx.x + thread_idx.x)
         if b >= BATCH:
@@ -334,10 +278,8 @@ struct NormPCBlock[dim: Int](PCBlockTrait):
     def _rms_per_row_kernel[
         BATCH: Int, dtype: DType
     ](
-        a_below: LayoutTensor[
-            dtype, Layout.row_major(BATCH, Self.dim), MutAnyOrigin
-        ],
-        inv_r_buf: LayoutTensor[dtype, Layout.row_major(BATCH), MutAnyOrigin],
+        a_below: Tile[dtype, BATCH, Self.dim],
+        inv_r_buf: Tile[dtype, BATCH],
     ):
         var b = Int(block_dim.x * block_idx.x + thread_idx.x)
         if b >= BATCH:
@@ -355,14 +297,10 @@ struct NormPCBlock[dim: Int](PCBlockTrait):
     def _weight_grad_kernel[
         BATCH: Int, dtype: DType
     ](
-        eps_above: LayoutTensor[
-            dtype, Layout.row_major(BATCH, Self.dim), MutAnyOrigin
-        ],
-        a_below: LayoutTensor[
-            dtype, Layout.row_major(BATCH, Self.dim), MutAnyOrigin
-        ],
-        inv_r_buf: LayoutTensor[dtype, Layout.row_major(BATCH), MutAnyOrigin],
-        grads: LayoutTensor[dtype, Layout.row_major(Self.dim), MutAnyOrigin],
+        eps_above: Tile[dtype, BATCH, Self.dim],
+        a_below: Tile[dtype, BATCH, Self.dim],
+        inv_r_buf: Tile[dtype, BATCH],
+        grads: Tile[dtype, Self.dim],
     ):
         var i = Int(block_dim.x * block_idx.x + thread_idx.x)
         if i >= Self.dim:
@@ -381,18 +319,10 @@ struct NormPCBlock[dim: Int](PCBlockTrait):
         BATCH: Int, dtype: DType = DType.float32
     ](
         ctx: DeviceContext,
-        x_below: LayoutTensor[
-            dtype, Layout.row_major(BATCH, Self.IN_DIM), MutAnyOrigin
-        ],
-        params: LayoutTensor[
-            dtype, Layout.row_major(Self.PARAM_SIZE), MutAnyOrigin
-        ],
-        mut mu: LayoutTensor[
-            dtype, Layout.row_major(BATCH, Self.OUT_DIM), MutAnyOrigin
-        ],
-        mut a_below: LayoutTensor[
-            dtype, Layout.row_major(BATCH, Self.IN_DIM), MutAnyOrigin
-        ],
+        x_below: Tile[dtype, BATCH, Self.IN_DIM],
+        params: Tile[dtype, Self.PARAM_SIZE],
+        mu: Tile[dtype, BATCH, Self.OUT_DIM],
+        a_below: Tile[dtype, BATCH, Self.IN_DIM],
     ) raises:
         comptime k = Self._predict_kernel[BATCH, dtype]
         var blocks = (BATCH + TPB - 1) // TPB
@@ -405,15 +335,9 @@ struct NormPCBlock[dim: Int](PCBlockTrait):
         BATCH: Int, dtype: DType = DType.float32
     ](
         ctx: DeviceContext,
-        x_above: LayoutTensor[
-            dtype, Layout.row_major(BATCH, Self.OUT_DIM), MutAnyOrigin
-        ],
-        mu: LayoutTensor[
-            dtype, Layout.row_major(BATCH, Self.OUT_DIM), MutAnyOrigin
-        ],
-        mut eps: LayoutTensor[
-            dtype, Layout.row_major(BATCH, Self.OUT_DIM), MutAnyOrigin
-        ],
+        x_above: Tile[dtype, BATCH, Self.OUT_DIM],
+        mu: Tile[dtype, BATCH, Self.OUT_DIM],
+        eps: Tile[dtype, BATCH, Self.OUT_DIM],
     ) raises:
         comptime k = Self._eps_kernel[BATCH, dtype]
         var threads = BATCH * Self.dim
@@ -427,15 +351,9 @@ struct NormPCBlock[dim: Int](PCBlockTrait):
         BATCH: Int, dtype: DType = DType.float32
     ](
         ctx: DeviceContext,
-        eps_above: LayoutTensor[
-            dtype, Layout.row_major(BATCH, Self.OUT_DIM), MutAnyOrigin
-        ],
-        params: LayoutTensor[
-            dtype, Layout.row_major(Self.PARAM_SIZE), MutAnyOrigin
-        ],
-        mut z_below: LayoutTensor[
-            dtype, Layout.row_major(BATCH, Self.IN_DIM), MutAnyOrigin
-        ],
+        eps_above: Tile[dtype, BATCH, Self.OUT_DIM],
+        params: Tile[dtype, Self.PARAM_SIZE],
+        z_below: Tile[dtype, BATCH, Self.IN_DIM],
     ) raises:
         comptime k = Self._pull_back_kernel[BATCH, dtype]
         var threads = BATCH * Self.dim
@@ -449,15 +367,9 @@ struct NormPCBlock[dim: Int](PCBlockTrait):
         BATCH: Int, dtype: DType = DType.float32
     ](
         ctx: DeviceContext,
-        x_below: LayoutTensor[
-            dtype, Layout.row_major(BATCH, Self.IN_DIM), MutAnyOrigin
-        ],
-        z_in: LayoutTensor[
-            dtype, Layout.row_major(BATCH, Self.IN_DIM), MutAnyOrigin
-        ],
-        mut z_out: LayoutTensor[
-            dtype, Layout.row_major(BATCH, Self.IN_DIM), MutAnyOrigin
-        ],
+        x_below: Tile[dtype, BATCH, Self.IN_DIM],
+        z_in: Tile[dtype, BATCH, Self.IN_DIM],
+        z_out: Tile[dtype, BATCH, Self.IN_DIM],
     ) raises:
         comptime k = Self._act_deriv_kernel[BATCH, dtype]
         var blocks = (BATCH + TPB - 1) // TPB
@@ -470,20 +382,12 @@ struct NormPCBlock[dim: Int](PCBlockTrait):
         BATCH: Int, dtype: DType = DType.float32
     ](
         ctx: DeviceContext,
-        eps_above: LayoutTensor[
-            dtype, Layout.row_major(BATCH, Self.OUT_DIM), MutAnyOrigin
-        ],
-        a_below: LayoutTensor[
-            dtype, Layout.row_major(BATCH, Self.IN_DIM), MutAnyOrigin
-        ],
-        mut grads: LayoutTensor[
-            dtype, Layout.row_major(Self.PARAM_SIZE), MutAnyOrigin
-        ],
+        eps_above: Tile[dtype, BATCH, Self.OUT_DIM],
+        a_below: Tile[dtype, BATCH, Self.IN_DIM],
+        grads: Tile[dtype, Self.PARAM_SIZE],
     ) raises:
         var inv_r_buf = ctx.enqueue_create_buffer[dtype](BATCH)
-        var inv_r = LayoutTensor[dtype, Layout.row_major(BATCH), MutAnyOrigin](
-            inv_r_buf
-        )
+        var inv_r = tile[BATCH](inv_r_buf)
         comptime kr = Self._rms_per_row_kernel[BATCH, dtype]
         var rblocks = (BATCH + TPB - 1) // TPB
         ctx.enqueue_function[kr](

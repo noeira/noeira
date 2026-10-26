@@ -25,7 +25,6 @@ ONE origin (§B0). CPU + GPU.
 
 from max.gpu import global_idx
 from max.gpu.host import DeviceContext
-from layout import Layout, LayoutTensor
 
 from noeira.nn.constants import DT, TPB
 from noeira.nn.core.module import Module
@@ -37,6 +36,7 @@ from noeira.nn.core.call import call_forward
 from noeira.nn.core.initializer import Zero
 from noeira.nn.primitives.reduce_max import ReduceMax
 from noeira.nn.primitives.gather_cols import GatherCols
+from noeira.core.tiles import Tile
 
 
 # ──────────────────────────────────────────────────────────────────────
@@ -48,8 +48,8 @@ def _argmax_idx_kernel[
     BATCH: Int,
     NA: Int,
 ](
-    q: LayoutTensor[DT, Layout.row_major(BATCH, NA), MutAnyOrigin],
-    idx_out: LayoutTensor[DT, Layout.row_major(BATCH, 1), MutAnyOrigin],
+    q: Tile[DT, BATCH, NA],
+    idx_out: Tile[DT, BATCH, 1],
 ):
     """`idx_out[b, 0] = argmax_a q[b, a]`, emitted as Scalar[DT]."""
     var b = Int(global_idx.x)
@@ -67,10 +67,10 @@ def _argmax_idx_kernel[
 def _target_y_finalize_kernel[
     BATCH: Int,
 ](
-    max_q: LayoutTensor[DT, Layout.row_major(BATCH, 1), MutAnyOrigin],
-    r: LayoutTensor[DT, Layout.row_major(BATCH), MutAnyOrigin],
-    d: LayoutTensor[DT, Layout.row_major(BATCH), MutAnyOrigin],
-    y_out: LayoutTensor[DT, Layout.row_major(BATCH), MutAnyOrigin],
+    max_q: Tile[DT, BATCH, 1],
+    r: Tile[DT, BATCH],
+    d: Tile[DT, BATCH],
+    y_out: Tile[DT, BATCH],
     gamma: Scalar[DT],
 ):
     """`y_out[b] = r[b] + γ · max_q[b, 0] · (1 − d[b])`."""
@@ -204,10 +204,8 @@ struct DQNTargetYBlock[
                 ctx.value().enqueue_function[
                     _argmax_idx_kernel[Self.BATCH, Self.NA]
                 ](
-                    self._q_on.lt["gpu", Layout.row_major(Self.BATCH, Self.NA)](),
-                    self._gather_in[1].lt[
-                        "gpu", Layout.row_major(Self.BATCH, 1)
-                    ](),
+                    self._q_on.tt["gpu", Self.BATCH, Self.NA](),
+                    self._gather_in[1].tt["gpu", Self.BATCH, 1](),
                     grid_dim=n_blocks,
                     block_dim=TPB,
                 )
@@ -234,10 +232,10 @@ struct DQNTargetYBlock[
         else:
             comptime n_blocks = (Self.BATCH + TPB - 1) // TPB
             ctx.value().enqueue_function[_target_y_finalize_kernel[Self.BATCH]](
-                self._max_q.lt["gpu", Layout.row_major(Self.BATCH, 1)](),
-                mb_r.lt["gpu", Layout.row_major(Self.BATCH)](),
-                mb_d.lt["gpu", Layout.row_major(Self.BATCH)](),
-                mb_y.lt["gpu", Layout.row_major(Self.BATCH)](),
+                self._max_q.tt["gpu", Self.BATCH, 1](),
+                mb_r.tt["gpu", Self.BATCH](),
+                mb_d.tt["gpu", Self.BATCH](),
+                mb_y.tt["gpu", Self.BATCH](),
                 self.gamma,
                 grid_dim=n_blocks,
                 block_dim=TPB,

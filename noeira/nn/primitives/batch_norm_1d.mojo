@@ -21,15 +21,23 @@ Backward (training cache):
 """
 
 from std.math import sqrt
-from max.gpu import thread_idx, block_idx
+from std.sys import default_accelerator
+from max.gpu import thread_idx, block_idx, global_idx
 from max.gpu.primitives import block
 from max.gpu.host import DeviceContext
-from layout import Layout, LayoutTensor, TileTensor, row_major
+from layout import TileTensor, row_major
+from noeira.core.tiles import RowMajor, Tile
 
 from noeira.nn.constants import DT
 from ..core.polyak import polyak_tensor
 from ..core.tensor import Tensor, TensorImpl
-from .linear import _cast_f2b_kernel, _cast_b2f_kernel
+from .linear import (
+    _cast_f2b_kernel,
+    _cast_b2f_kernel,
+    enqueue_dot_bias_grad,
+    enqueue_col_mean_var,
+)
+from ..core.fill import fill_dev
 from ..core.tensor_refs import TensorRefs
 from ..core.module import Module
 from ..core.param import Param, ParamVisitor
@@ -41,6 +49,18 @@ from ..core.amp import AMPPolicy, NoAMP
 comptime BN_DEFAULT_EPS: Float64 = 1e-5
 comptime BN_DEFAULT_MOM: Float64 = 0.1
 comptime BN_TPB: Int = 128
+comptime BN_TWO_PASS_MIN_ELEMS = (
+    1 << 19 if default_accelerator().is_nvidia_gpu() else 1 << 18
+)
+"""Smallest B·DIM whose train-mode forward and backward leave the fused
+one-block-per-feature kernels for coalesced chunked reductions plus an
+element-wise pass (forward: `enqueue_col_mean_var` + normalize, three
+launches; backward: a fill, `enqueue_dot_bias_grad` and dx, four). Against
+the fused kernel's one launch (`bench_param_grad_reductions.mojo`):
+  M1 Pro: forward 512 x 2048 4.0x, 256 x 1024 (2^18) 2.1x, 256 x 512 1.2x
+  (19 us), 128 x 512 0.74x; backward 4.1x, 1.4x, 0.88x.
+  RTX 5090: forward 2^20 3.3x, 2^19 1.3-2.2x, 2^18 1.35x (4 us); backward
+  3.0x, 1.4-1.5x, 0.81x."""
 
 
 # ── GPU kernels (verbatim from legacy; args MutAnyOrigin = GPU ABI) ─────
@@ -49,14 +69,14 @@ def _bn1d_forward_train_kernel[
     DIM: Int,
     EPSILON: Float64,
 ](
-    input: LayoutTensor[DT, Layout.row_major(BATCH, DIM), MutAnyOrigin],
-    output: LayoutTensor[DT, Layout.row_major(BATCH, DIM), MutAnyOrigin],
-    gamma: LayoutTensor[DT, Layout.row_major(DIM), MutAnyOrigin],
-    beta: LayoutTensor[DT, Layout.row_major(DIM), MutAnyOrigin],
-    cache_mean: LayoutTensor[DT, Layout.row_major(DIM), MutAnyOrigin],
-    cache_var: LayoutTensor[DT, Layout.row_major(DIM), MutAnyOrigin],
-    cache_xhat: LayoutTensor[DT, Layout.row_major(BATCH, DIM), MutAnyOrigin],
-    cache_inv_std: LayoutTensor[DT, Layout.row_major(DIM), MutAnyOrigin],
+    input: Tile[DT, BATCH, DIM],
+    output: Tile[DT, BATCH, DIM],
+    gamma: Tile[DT, DIM],
+    beta: Tile[DT, DIM],
+    cache_mean: Tile[DT, DIM],
+    cache_var: Tile[DT, DIM],
+    cache_xhat: Tile[DT, BATCH, DIM],
+    cache_inv_std: Tile[DT, DIM],
 ):
     var f = Int(block_idx.x)
     var t = Int(thread_idx.x)
@@ -64,20 +84,20 @@ def _bn1d_forward_train_kernel[
         return
     var inv_n: Scalar[DT] = 1.0 / Scalar[DT](Float32(BATCH))
     var eps = Scalar[DT](EPSILON)
-    var my_sum: input.element_type = 0.0
+    var my_sum: input.ElementType = 0.0
     var b = t
     while b < BATCH:
         my_sum += input[b, f]
         b += BN_TPB
     var mean = block.sum[block_size=BN_TPB, broadcast=True](val=my_sum) * inv_n
-    var my_var: input.element_type = 0.0
+    var my_var: input.ElementType = 0.0
     b = t
     while b < BATCH:
         var d = input[b, f] - mean
         my_var += d * d
         b += BN_TPB
     var var_ = block.sum[block_size=BN_TPB, broadcast=True](val=my_var) * inv_n
-    var inv_std: input.element_type = 1.0 / sqrt(var_ + eps)
+    var inv_std: input.ElementType = 1.0 / sqrt(var_ + eps)
     # Caches only — NO running-stat write here. The EMA runs in its own kernel
     # (_bn1d_update_running_kernel); folding it in dropped the stores on NVIDIA
     # at large BATCH (the BatchNorm2D B>64 store-drop, same cause).
@@ -96,15 +116,51 @@ def _bn1d_forward_train_kernel[
         b += BN_TPB
 
 
+def _bn1d_normalize_train_kernel[
+    BATCH: Int,
+    DIM: Int,
+    EPSILON: Float64,
+](
+    input: Tile[DT, BATCH, DIM],
+    output: Tile[DT, BATCH, DIM],
+    gamma: Tile[DT, DIM],
+    beta: Tile[DT, DIM],
+    cache_mean: Tile[DT, DIM],
+    cache_var: Tile[DT, DIM],
+    cache_xhat: Tile[DT, BATCH, DIM],
+    cache_inv_std: Tile[DT, DIM],
+):
+    """`_bn1d_forward_train_kernel`'s normalize, one thread per element
+    (coalesced), from the batch statistics `enqueue_col_mean_var` wrote into
+    `cache_mean` / `cache_var`. Row 0 stores `cache_inv_std`."""
+    var i = Int(global_idx.x)
+    if i >= BATCH * DIM:
+        return
+    var b = i // DIM
+    var f = i % DIM
+    var inv_std: Scalar[DT] = 1.0 / sqrt(
+        rebind[Scalar[DT]](cache_var[f]) + Scalar[DT](EPSILON)
+    )
+    if b == 0:
+        cache_inv_std[f] = inv_std
+    var xh = (
+        rebind[Scalar[DT]](input[b, f]) - rebind[Scalar[DT]](cache_mean[f])
+    ) * inv_std
+    cache_xhat[b, f] = xh
+    output[b, f] = rebind[Scalar[DT]](gamma[f]) * xh + rebind[Scalar[DT]](
+        beta[f]
+    )
+
+
 def _bn1d_update_running_kernel[
     DIM: Int,
     MOMENTUM: Float64,
     VAR_CORR: Float64 = 1.0,
 ](
-    cache_mean: LayoutTensor[DT, Layout.row_major(DIM), MutAnyOrigin],
-    cache_var: LayoutTensor[DT, Layout.row_major(DIM), MutAnyOrigin],
-    running_mean: LayoutTensor[DT, Layout.row_major(DIM), MutAnyOrigin],
-    running_var: LayoutTensor[DT, Layout.row_major(DIM), MutAnyOrigin],
+    cache_mean: Tile[DT, DIM],
+    cache_var: Tile[DT, DIM],
+    running_mean: Tile[DT, DIM],
+    running_var: Tile[DT, DIM],
 ):
     """Running-stat EMA in its OWN kernel (one thread / feature). Mirrors the
     BatchNorm2D split: keeping the running_mean/running_var read-modify-write out
@@ -126,12 +182,12 @@ def _bn1d_forward_eval_kernel[
     DIM: Int,
     EPSILON: Float64,
 ](
-    input: LayoutTensor[DT, Layout.row_major(BATCH, DIM), MutAnyOrigin],
-    output: LayoutTensor[DT, Layout.row_major(BATCH, DIM), MutAnyOrigin],
-    gamma: LayoutTensor[DT, Layout.row_major(DIM), MutAnyOrigin],
-    beta: LayoutTensor[DT, Layout.row_major(DIM), MutAnyOrigin],
-    running_mean: LayoutTensor[DT, Layout.row_major(DIM), MutAnyOrigin],
-    running_var: LayoutTensor[DT, Layout.row_major(DIM), MutAnyOrigin],
+    input: Tile[DT, BATCH, DIM],
+    output: Tile[DT, BATCH, DIM],
+    gamma: Tile[DT, DIM],
+    beta: Tile[DT, DIM],
+    running_mean: Tile[DT, DIM],
+    running_var: Tile[DT, DIM],
 ):
     var f = Int(block_idx.x)
     var t = Int(thread_idx.x)
@@ -140,7 +196,7 @@ def _bn1d_forward_eval_kernel[
     var eps = Scalar[DT](EPSILON)
     var rm = running_mean[f]
     var rv = running_var[f]
-    var inv_std: input.element_type = 1.0 / sqrt(rv + eps)
+    var inv_std: input.ElementType = 1.0 / sqrt(rv + eps)
     var g = gamma[f]
     var bt = beta[f]
     var b = t
@@ -155,14 +211,14 @@ def _bn1d_backward_eval_kernel[
     DIM: Int,
     EPSILON: Float64,
 ](
-    grad_output: LayoutTensor[DT, Layout.row_major(BATCH, DIM), MutAnyOrigin],
-    input: LayoutTensor[DT, Layout.row_major(BATCH, DIM), MutAnyOrigin],
-    gamma: LayoutTensor[DT, Layout.row_major(DIM), MutAnyOrigin],
-    running_mean: LayoutTensor[DT, Layout.row_major(DIM), MutAnyOrigin],
-    running_var: LayoutTensor[DT, Layout.row_major(DIM), MutAnyOrigin],
-    grad_input: LayoutTensor[DT, Layout.row_major(BATCH, DIM), MutAnyOrigin],
-    grad_gamma: LayoutTensor[DT, Layout.row_major(DIM), MutAnyOrigin],
-    grad_beta: LayoutTensor[DT, Layout.row_major(DIM), MutAnyOrigin],
+    grad_output: Tile[DT, BATCH, DIM],
+    input: Tile[DT, BATCH, DIM],
+    gamma: Tile[DT, DIM],
+    running_mean: Tile[DT, DIM],
+    running_var: Tile[DT, DIM],
+    grad_input: Tile[DT, BATCH, DIM],
+    grad_gamma: Tile[DT, DIM],
+    grad_beta: Tile[DT, DIM],
 ):
     """Eval mode: y = γ·(x − μ_run)·inv + β is affine in x, so
     dx = dy·γ·inv, dγ += Σ dy·x̂, dβ += Σ dy (x̂ from the running stats)."""
@@ -194,13 +250,13 @@ def _bn1d_backward_kernel[
     BATCH: Int,
     DIM: Int,
 ](
-    grad_output: LayoutTensor[DT, Layout.row_major(BATCH, DIM), MutAnyOrigin],
-    gamma: LayoutTensor[DT, Layout.row_major(DIM), MutAnyOrigin],
-    cache_xhat: LayoutTensor[DT, Layout.row_major(BATCH, DIM), MutAnyOrigin],
-    cache_inv_std: LayoutTensor[DT, Layout.row_major(DIM), MutAnyOrigin],
-    grad_input: LayoutTensor[DT, Layout.row_major(BATCH, DIM), MutAnyOrigin],
-    grad_gamma: LayoutTensor[DT, Layout.row_major(DIM), MutAnyOrigin],
-    grad_beta: LayoutTensor[DT, Layout.row_major(DIM), MutAnyOrigin],
+    grad_output: Tile[DT, BATCH, DIM],
+    gamma: Tile[DT, DIM],
+    cache_xhat: Tile[DT, BATCH, DIM],
+    cache_inv_std: Tile[DT, DIM],
+    grad_input: Tile[DT, BATCH, DIM],
+    grad_gamma: Tile[DT, DIM],
+    grad_beta: Tile[DT, DIM],
 ):
     var f = Int(block_idx.x)
     var t = Int(thread_idx.x)
@@ -209,10 +265,10 @@ def _bn1d_backward_kernel[
     var inv_n: Scalar[DT] = 1.0 / Scalar[DT](Float32(BATCH))
     var g = gamma[f]
     var inv_std = cache_inv_std[f]
-    var my_sum_dxhat: grad_output.element_type = 0.0
-    var my_sum_dxhat_xhat: grad_output.element_type = 0.0
-    var my_dgamma: grad_output.element_type = 0.0
-    var my_dbeta: grad_output.element_type = 0.0
+    var my_sum_dxhat: grad_output.ElementType = 0.0
+    var my_sum_dxhat_xhat: grad_output.ElementType = 0.0
+    var my_dgamma: grad_output.ElementType = 0.0
+    var my_dbeta: grad_output.ElementType = 0.0
     var b = t
     while b < BATCH:
         var dy = grad_output[b, f]
@@ -245,6 +301,44 @@ def _bn1d_backward_kernel[
         var dxhat = dy * g
         grad_input[b, f] = inv_std * (dxhat - m1 - xh * m2)
         b += BN_TPB
+
+
+def _bn1d_backward_dx_kernel[
+    BATCH: Int,
+    DIM: Int,
+](
+    grad_output: Tile[DT, BATCH, DIM],
+    gamma: Tile[DT, DIM],
+    cache_xhat: Tile[DT, BATCH, DIM],
+    cache_inv_std: Tile[DT, DIM],
+    sums: Tile[DT, 2 * DIM],
+    grad_input: Tile[DT, BATCH, DIM],
+    grad_gamma: Tile[DT, DIM],
+    grad_beta: Tile[DT, DIM],
+):
+    """`_bn1d_backward_kernel`'s dx, one thread per element (coalesced), from
+    the column sums `sums[f] = Σ dy·x̂` and `sums[DIM + f] = Σ dy` the
+    two-pass helper wrote. Row 0 adds them to the γ / β grads. Σ dxhat and
+    Σ dxhat·x̂ are γ times those sums."""
+    var i = Int(global_idx.x)
+    if i >= BATCH * DIM:
+        return
+    var b = i // DIM
+    var f = i % DIM
+    var inv_n: Scalar[DT] = 1.0 / Scalar[DT](Float32(BATCH))
+    var g = rebind[Scalar[DT]](gamma[f])
+    var s_gx = rebind[Scalar[DT]](sums[f])
+    var s_g = rebind[Scalar[DT]](sums[DIM + f])
+    var m1 = g * s_g * inv_n
+    var m2 = g * s_gx * inv_n
+    var dy = rebind[Scalar[DT]](grad_output[b, f])
+    var xh = rebind[Scalar[DT]](cache_xhat[b, f])
+    grad_input[b, f] = rebind[Scalar[DT]](cache_inv_std[f]) * (
+        dy * g - m1 - xh * m2
+    )
+    if b == 0:
+        grad_gamma[f] = rebind[Scalar[DT]](grad_gamma[f]) + s_gx
+        grad_beta[f] = rebind[Scalar[DT]](grad_beta[f]) + s_g
 
 
 struct BatchNorm1D[
@@ -280,6 +374,12 @@ struct BatchNorm1D[
     var cache_var: Tensor  # [DIM] (GPU: batch var, fed to the running-stat EMA)
     var cache_is_training: Bool
     var training: Bool
+    var bwd_sums: Tensor
+    """[2·DIM] Σ dy·x̂ then Σ dy: the two-pass backward's column sums."""
+    var bwd_part: Tensor
+    """Chunk partials of those sums (`enqueue_dot_bias_grad`)."""
+    var fwd_part: Tensor
+    """Chunk statistics of the train forward (`enqueue_col_mean_var`)."""
 
     @staticmethod
     def _var_corr[B: Int]() -> Float64:
@@ -299,6 +399,9 @@ struct BatchNorm1D[
         self.cache_var = Tensor()
         self.cache_is_training = False
         self.training = True
+        self.bwd_sums = Tensor()
+        self.bwd_part = Tensor()
+        self.fwd_part = Tensor()
 
     @staticmethod
     def make[
@@ -465,41 +568,71 @@ struct BatchNorm1D[
         else:
             var c = ctx.value()
             out.ensure_gpu(c, B * Self.DIM_)
-            comptime l2d = Layout.row_major(B, Self.DIM_)
-            comptime ld = Layout.row_major(Self.DIM_)
+            comptime l2d = RowMajor[B, Self.DIM_]
+            comptime ld = RowMajor[Self.DIM_]
             if self.training:
                 self.cache_xhat.ensure_gpu(c, B * Self.DIM_)
                 self.cache_inv_std.ensure_gpu(c, Self.DIM_)
                 self.cache_mean.ensure_gpu(c, Self.DIM_)
                 self.cache_var.ensure_gpu(c, Self.DIM_)
-                c.enqueue_function[
-                    _bn1d_forward_train_kernel[
-                        B,
-                        Self.DIM_,
-                        Self.EPSILON,
-                    ]
-                ](
-                    in0.lt["gpu", l2d](),
-                    out.lt["gpu", l2d](),
-                    self.gamma.val.lt["gpu", ld](),
-                    self.beta.val.lt["gpu", ld](),
-                    self.cache_mean.lt["gpu", ld](),
-                    self.cache_var.lt["gpu", ld](),
-                    self.cache_xhat.lt["gpu", l2d](),
-                    self.cache_inv_std.lt["gpu", ld](),
-                    grid_dim=Self.DIM_,
-                    block_dim=BN_TPB,
-                )
+                comptime if B * Self.DIM_ >= BN_TWO_PASS_MIN_ELEMS:
+                    # One block per feature walks the rows three times (Σx,
+                    # Σ(x - mean)², normalize), 32 different rows per warp
+                    # load: 578 us at LeWM's projector (512 x 2048) on an M1
+                    # Pro, 148 us as coalesced chunk statistics + a normalize
+                    # pass. The statistics stay a centred two-pass (shifted,
+                    # per chunk, chunks merged exactly): variance as accurate
+                    # as the old kernel's, the mean more (6x at offset 1000).
+                    enqueue_col_mean_var(
+                        c, in0.dev.value(), self.cache_mean.dev.value(),
+                        self.cache_var.dev.value(), B, Self.DIM_,
+                        self.fwd_part,
+                    )
+                    c.enqueue_function[
+                        _bn1d_normalize_train_kernel[
+                            B, Self.DIM_, Self.EPSILON
+                        ]
+                    ](
+                        in0.tt["gpu", B, Self.DIM_](),
+                        out.tt["gpu", B, Self.DIM_](),
+                        self.gamma.val.tt["gpu", Self.DIM_](),
+                        self.beta.val.tt["gpu", Self.DIM_](),
+                        self.cache_mean.tt["gpu", Self.DIM_](),
+                        self.cache_var.tt["gpu", Self.DIM_](),
+                        self.cache_xhat.tt["gpu", B, Self.DIM_](),
+                        self.cache_inv_std.tt["gpu", Self.DIM_](),
+                        grid_dim=(B * Self.DIM_ + 255) // 256,
+                        block_dim=256,
+                    )
+                else:
+                    c.enqueue_function[
+                        _bn1d_forward_train_kernel[
+                            B,
+                            Self.DIM_,
+                            Self.EPSILON,
+                        ]
+                    ](
+                        in0.tt["gpu", B, Self.DIM_](),
+                        out.tt["gpu", B, Self.DIM_](),
+                        self.gamma.val.tt["gpu", Self.DIM_](),
+                        self.beta.val.tt["gpu", Self.DIM_](),
+                        self.cache_mean.tt["gpu", Self.DIM_](),
+                        self.cache_var.tt["gpu", Self.DIM_](),
+                        self.cache_xhat.tt["gpu", B, Self.DIM_](),
+                        self.cache_inv_std.tt["gpu", Self.DIM_](),
+                        grid_dim=Self.DIM_,
+                        block_dim=BN_TPB,
+                    )
                 # Running-stat EMA in a dedicated kernel (see kernel docstring).
                 c.enqueue_function[
                     _bn1d_update_running_kernel[
                         Self.DIM_, Self.MOMENTUM, Self._var_corr[B]()
                     ]
                 ](
-                    self.cache_mean.lt["gpu", ld](),
-                    self.cache_var.lt["gpu", ld](),
-                    self.running_mean.t.lt["gpu", ld](),
-                    self.running_var.t.lt["gpu", ld](),
+                    self.cache_mean.tt["gpu", Self.DIM_](),
+                    self.cache_var.tt["gpu", Self.DIM_](),
+                    self.running_mean.t.tt["gpu", Self.DIM_](),
+                    self.running_var.t.tt["gpu", Self.DIM_](),
                     grid_dim=Self.DIM_,
                     block_dim=1,
                 )
@@ -512,12 +645,12 @@ struct BatchNorm1D[
                         Self.EPSILON,
                     ]
                 ](
-                    in0.lt["gpu", l2d](),
-                    out.lt["gpu", l2d](),
-                    self.gamma.val.lt["gpu", ld](),
-                    self.beta.val.lt["gpu", ld](),
-                    self.running_mean.t.lt["gpu", ld](),
-                    self.running_var.t.lt["gpu", ld](),
+                    in0.tt["gpu", B, Self.DIM_](),
+                    out.tt["gpu", B, Self.DIM_](),
+                    self.gamma.val.tt["gpu", Self.DIM_](),
+                    self.beta.val.tt["gpu", Self.DIM_](),
+                    self.running_mean.t.tt["gpu", Self.DIM_](),
+                    self.running_var.t.tt["gpu", Self.DIM_](),
                     grid_dim=Self.DIM_,
                     block_dim=BN_TPB,
                 )
@@ -644,19 +777,44 @@ struct BatchNorm1D[
         else:
             var c = ctx.value()
             gin.ensure_gpu(c, B * Self.DIM_)
-            comptime l2d = Layout.row_major(B, Self.DIM_)
-            comptime ld = Layout.row_major(Self.DIM_)
-            c.enqueue_function[_bn1d_backward_kernel[B, Self.DIM_]](
-                grad_output.lt["gpu", l2d](),
-                self.gamma.val.lt["gpu", ld](),
-                self.cache_xhat.lt["gpu", l2d](),
-                self.cache_inv_std.lt["gpu", ld](),
-                gin.lt["gpu", l2d](),
-                self.gamma.grd.lt["gpu", ld](),
-                self.beta.grd.lt["gpu", ld](),
-                grid_dim=Self.DIM_,
-                block_dim=BN_TPB,
-            )
+            comptime l2d = RowMajor[B, Self.DIM_]
+            comptime ld = RowMajor[Self.DIM_]
+            comptime if B * Self.DIM_ >= BN_TWO_PASS_MIN_ELEMS:
+                # One block per feature walks the rows twice, 32 different
+                # rows per warp load: 574 us at LeWM's projector (512 x
+                # 2048) on an M1 Pro, 141 us as column sums + a dx pass.
+                comptime D = Self.DIM_
+                self.bwd_sums.ensure_gpu(c, 2 * D)
+                fill_dev(self.bwd_sums.dev.value(), 2 * D, Scalar[DT](0), c)
+                var s_dy = self.bwd_sums.dev.value().create_sub_buffer[DT](D, D)
+                enqueue_dot_bias_grad[DT](
+                    c, grad_output.dev.value(), self.cache_xhat.dev.value(),
+                    self.bwd_sums.dev.value(), s_dy, B, D, self.bwd_part,
+                )
+                c.enqueue_function[_bn1d_backward_dx_kernel[B, D]](
+                    grad_output.tt["gpu", B, D](),
+                    self.gamma.val.tt["gpu", D](),
+                    self.cache_xhat.tt["gpu", B, D](),
+                    self.cache_inv_std.tt["gpu", D](),
+                    self.bwd_sums.tt["gpu", 2 * D](),
+                    gin.tt["gpu", B, D](),
+                    self.gamma.grd.tt["gpu", D](),
+                    self.beta.grd.tt["gpu", D](),
+                    grid_dim=(B * D + 255) // 256,
+                    block_dim=256,
+                )
+            else:
+                c.enqueue_function[_bn1d_backward_kernel[B, Self.DIM_]](
+                    grad_output.tt["gpu", B, Self.DIM_](),
+                    self.gamma.val.tt["gpu", Self.DIM_](),
+                    self.cache_xhat.tt["gpu", B, Self.DIM_](),
+                    self.cache_inv_std.tt["gpu", Self.DIM_](),
+                    gin.tt["gpu", B, Self.DIM_](),
+                    self.gamma.grd.tt["gpu", Self.DIM_](),
+                    self.beta.grd.tt["gpu", Self.DIM_](),
+                    grid_dim=Self.DIM_,
+                    block_dim=BN_TPB,
+                )
 
     def _vjp_eval[target: StaticString, B: Int](
         mut self,
@@ -687,17 +845,17 @@ struct BatchNorm1D[
         else:
             var c = ctx.value()
             gin.ensure_gpu(c, B * Self.DIM_)
-            comptime l2d = Layout.row_major(B, Self.DIM_)
-            comptime ld = Layout.row_major(Self.DIM_)
+            comptime l2d = RowMajor[B, Self.DIM_]
+            comptime ld = RowMajor[Self.DIM_]
             c.enqueue_function[_bn1d_backward_eval_kernel[B, Self.DIM_, Self.EPSILON]](
-                grad_output.lt["gpu", l2d](),
-                x.lt["gpu", l2d](),
-                self.gamma.val.lt["gpu", ld](),
-                self.running_mean.t.lt["gpu", ld](),
-                self.running_var.t.lt["gpu", ld](),
-                gin.lt["gpu", l2d](),
-                self.gamma.grd.lt["gpu", ld](),
-                self.beta.grd.lt["gpu", ld](),
+                grad_output.tt["gpu", B, Self.DIM_](),
+                x.tt["gpu", B, Self.DIM_](),
+                self.gamma.val.tt["gpu", Self.DIM_](),
+                self.running_mean.t.tt["gpu", Self.DIM_](),
+                self.running_var.t.tt["gpu", Self.DIM_](),
+                gin.tt["gpu", B, Self.DIM_](),
+                self.gamma.grd.tt["gpu", Self.DIM_](),
+                self.beta.grd.tt["gpu", Self.DIM_](),
                 grid_dim=Self.DIM_,
                 block_dim=BN_TPB,
             )

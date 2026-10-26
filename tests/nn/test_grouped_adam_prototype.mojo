@@ -16,7 +16,7 @@ a device buffer (`UInt64`) and dereference it (`Pointer(unsafe_from_address=…)
 If this builds + passes on Apple → the pattern is portable (no platform gate
 needed). If it fails to compile/run on Apple but works on NVIDIA → the real
 implementation gates the grouped kernel under
-`comptime if has_nvidia_gpu_accelerator()` and Apple keeps the per-tensor path
+`comptime if default_accelerator().is_nvidia_gpu()` and Apple keeps the per-tensor path
 (bit-identical math; capture is NVIDIA-only anyway).
 
 This file wires NOTHING into Adam — it's a throwaway probe. Run:
@@ -25,7 +25,7 @@ This file wires NOTHING into Adam — it's a throwaway probe. Run:
 """
 
 from std.math import sqrt
-from std.sys import has_nvidia_gpu_accelerator
+from std.sys import default_accelerator
 from max.gpu import thread_idx, block_idx, block_dim
 from max.gpu.host import DeviceContext, DeviceBuffer
 
@@ -214,7 +214,7 @@ def main() raises:
         print("  grid =", "(", blocks_x, ",", n_params, ")  block =", TPB)
         print("  max abs err vs host Adam =", max_err)
         var ok = max_err < 1e-5
-        comptime if has_nvidia_gpu_accelerator():
+        comptime if default_accelerator().is_nvidia_gpu():
             if ok:
                 print(
                     "  PASS (NVIDIA) — grouped multi-tensor Adam works:"
@@ -243,7 +243,7 @@ def main() raises:
                     "  EXPECTED FAIL (Apple/Metal) — raw device-address deref"
                     " doesn't land (err≈LR ⇒ params untouched). This is the"
                     " documented Metal limitation. The real fix therefore gates"
-                    " the grouped kernel under has_nvidia_gpu_accelerator() and"
+                    " the grouped kernel under default_accelerator().is_nvidia_gpu() and"
                     " Apple keeps the per-tensor path (bit-identical math;"
                     " CUDA-graph capture is NVIDIA-only anyway)."
                     " ACTION: run this on an NVIDIA box — it must print PASS."

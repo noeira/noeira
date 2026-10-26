@@ -15,7 +15,6 @@ Pixel layout: `[BATCH, H, W, 3]` as Float32 in [0, 255].
 """
 
 from std.math import cos, sin
-from layout import Layout, LayoutTensor
 from max.gpu import thread_idx, block_idx, block_dim
 from max.gpu.host import DeviceContext, DeviceBuffer
 
@@ -27,6 +26,7 @@ from .geometry import (
     t_rect_stem_vertex,
     t_origin_from_body,
 )
+from noeira.core.tiles import Tile, ImmTile, tile
 
 
 comptime IMG_H: Int = 96
@@ -204,9 +204,7 @@ def render_pixel_obs_single(
     block_angle: Scalar[dtype],
     agent_cx: Scalar[dtype],
     agent_cy: Scalar[dtype],
-    pixels: LayoutTensor[
-        dtype, Layout.row_major(IMG_H, IMG_W, IMG_C), MutAnyOrigin
-    ],
+    pixels: Tile[dtype, IMG_H, IMG_W, IMG_C],
 ):
     """CPU rasterizer for a single env. `pixels` is the H × W × 3 output."""
     var scale = Scalar[dtype](PIXEL_SCALE)
@@ -251,7 +249,7 @@ def render_pusht_rgb_at[
     block_angle: Scalar[dtype],
     agent_cx: Scalar[dtype],
     agent_cy: Scalar[dtype],
-    pixels: LayoutTensor[dtype, Layout.row_major(OUT, OUT, IMG_C), MutAnyOrigin],
+    pixels: Tile[dtype, OUT, OUT, IMG_C],
 ):
     """CPU rasterizer for a single env at OUT × OUT × 3 (HWC, [0, 255])."""
     var scale = Scalar[dtype](512.0 / Float64(OUT))
@@ -286,26 +284,15 @@ def render_pixel_obs_kernel_gpu[
     """Launch one thread per (env, pixel) and write `[BATCH, H, W, 3]`.
     `pixels` must have `BATCH * H * W * 3` floats allocated.
     """
-    var state_t = LayoutTensor[
-        dtype, Layout.row_major(BATCH_SIZE, STATE_SIZE)
-    ](states)
-    var pix_t = LayoutTensor[
-        dtype,
-        Layout.row_major(BATCH_SIZE, IMG_H, IMG_W, IMG_C),
-    ](pixels)
+    var state_t = tile[BATCH_SIZE, STATE_SIZE](states)
+    var pix_t = tile[BATCH_SIZE, IMG_H, IMG_W, IMG_C](pixels)
     # Grid: (BATCH, H), block: (W,). Each thread handles one pixel.
     comptime BLOCKS_X = (IMG_W + TPB - 1) // TPB
 
     @always_inline
     def render_wrapper(
-        st: LayoutTensor[
-            dtype, Layout.row_major(BATCH_SIZE, STATE_SIZE), ImmutAnyOrigin
-        ],
-        px: LayoutTensor[
-            dtype,
-            Layout.row_major(BATCH_SIZE, IMG_H, IMG_W, IMG_C),
-            MutAnyOrigin,
-        ],
+        st: ImmTile[dtype, BATCH_SIZE, STATE_SIZE],
+        px: Tile[dtype, BATCH_SIZE, IMG_H, IMG_W, IMG_C],
     ):
         var env = Int(block_idx.z)
         var r = Int(block_idx.y)

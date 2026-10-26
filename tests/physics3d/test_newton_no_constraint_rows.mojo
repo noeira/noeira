@@ -72,7 +72,7 @@ from noeira.physics3d.solver.newton_solve import (
 from noeira.physics3d.gpu.constants import (
     META_IDX_NUM_CONTACTS, METADATA_SIZE, MODEL_JOINT_SIZE,
 )
-from layout import Layout
+from noeira.core.tiles import RowMajor
 from noeira.physics3d.model.model_dims import ModelDims
 
 comptime DTYPE = DType.float64
@@ -143,10 +143,10 @@ def _prep(
     Leaves `sc.qacc_constrained` holding `qacc_smooth` — the unconstrained
     acceleration — which is exactly the quantity MuJoCo copies through when
     `nefc == 0`, and the one the arms below compare across the solve."""
-    comptime L_JOINT = Layout.row_major(NJOINT, MODEL_JOINT_SIZE)
-    comptime L_M = Layout.row_major(BATCH, NV * NV)
-    comptime L_NV = Layout.row_major(BATCH, NV)
-    comptime L_QPOS = Layout.row_major(BATCH, NQ)
+    comptime L_JOINT = RowMajor[NJOINT, MODEL_JOINT_SIZE]
+    comptime L_M = RowMajor[BATCH, NV * NV]
+    comptime L_NV = RowMajor[BATCH, NV]
+    comptime L_QPOS = RowMajor[BATCH, NQ]
 
     forward_kinematics["cpu", DTYPE, BATCH=BATCH](d, mf, None)
     compute_body_velocities["cpu", DTYPE, BATCH=BATCH](d, mf, None)
@@ -154,27 +154,27 @@ def _prep(
     compute_cdof["cpu", DTYPE, BATCH=BATCH](d, mf, sc, None)
     compute_mass_matrix["cpu", DTYPE, BATCH=BATCH](d, mf, sc, None)
 
-    var joints_v = mf.joints.lt["cpu", L_JOINT]()
-    var M_v = sc.M.lt["cpu", L_M]()
+    var joints_v = mf.joints.tt["cpu", NJOINT, MODEL_JOINT_SIZE]()
+    var M_v = sc.M.tt["cpu", BATCH, NV * NV]()
     for e in range(BATCH):
         _armature_env[DTYPE](e, AsStatic[MD](), joints_v, M_v)
     ldl_factor["cpu", DTYPE, BATCH=BATCH](mf, sc, None)
     compute_m_inv["cpu", DTYPE, BATCH=BATCH](mf, sc, None)
     compute_bias_forces_rne["cpu", DTYPE, BATCH=BATCH](d, mf, sc, None)
 
-    var qpos_v = d.qpos.lt["cpu", L_QPOS]()
-    var qvel_v = d.qvel.lt["cpu", L_NV]()
-    var qfrc_v = d.qfrc.lt["cpu", L_NV]()
-    var bias_v = sc.bias.lt["cpu", L_NV]()
-    var fnet_v = sc.fnet.lt["cpu", L_NV]()
+    var qpos_v = d.qpos.tt["cpu", BATCH, NQ]()
+    var qvel_v = d.qvel.tt["cpu", BATCH, NV]()
+    var qfrc_v = d.qfrc.tt["cpu", BATCH, NV]()
+    var bias_v = sc.bias.tt["cpu", BATCH, NV]()
+    var fnet_v = sc.fnet.tt["cpu", BATCH, NV]()
     for e in range(BATCH):
         _fnet_passive_env[DTYPE](
             e, AsStatic[MD](), qpos_v, qvel_v, qfrc_v, joints_v, bias_v, fnet_v
         )
     ldl_solve["cpu", DTYPE, BATCH=BATCH](mf, sc, None)
-    var qacc_ws_v = sc.qacc_ws.lt["cpu", L_NV]()
-    var qacc_v = d.qacc.lt["cpu", L_NV]()
-    var qacc_c_v = sc.qacc_constrained.lt["cpu", L_NV]()
+    var qacc_ws_v = sc.qacc_ws.tt["cpu", BATCH, NV]()
+    var qacc_v = d.qacc.tt["cpu", BATCH, NV]()
+    var qacc_c_v = sc.qacc_constrained.tt["cpu", BATCH, NV]()
     for e in range(BATCH):
         _qacc_writeback_env[DTYPE](
             e, AsStatic[MD](), qacc_ws_v, qacc_v, qacc_c_v

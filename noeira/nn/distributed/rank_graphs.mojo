@@ -36,7 +36,7 @@ On non-NVIDIA `CUDAGraph` is a compile-time no-op, so `run` runs the step
 eagerly every call: bit-identical to the uncaptured loop (the Mac path).
 """
 
-from std.sys import has_nvidia_gpu_accelerator
+from std.sys import default_accelerator
 from max.gpu.host import DeviceContext
 
 from noeira.cuda.graph import CUDAGraph
@@ -77,7 +77,7 @@ struct RankGraphs(Movable):
         runs `STEP` once eagerly — module loads, autotuning and first-use
         allocations happen outside the window — then records a second pass
         that does NOT execute, so every call is exactly one update."""
-        comptime if not has_nvidia_gpu_accelerator():
+        comptime if not default_accelerator().is_nvidia_gpu():
             STEP()
             return
         if self.state == _CAPTURED:

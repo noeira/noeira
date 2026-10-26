@@ -86,16 +86,16 @@ from ..gpu.constants import (
     CONTACT_IDX_BODY_A,
     CONTACT_IDX_BODY_B,
 )
-from layout import Layout, LayoutTensor
+from layout import TileTensor, TensorLayout
 
 
 @always_inline
 def sort_contacts_mujoco_order[
     DTYPE: DType,
-    L_CONTACTS: Layout,
+    L_CONTACTS: TensorLayout,
 ](
     env: Int,
-    contacts: LayoutTensor[DTYPE, L_CONTACTS, MutAnyOrigin],
+    contacts: TileTensor[DTYPE, L_CONTACTS, MutAnyOrigin],
     num_contacts: Int,
 ):
     """Reorder `contacts[env]` by body pair, stably. See the module docstring.

@@ -23,10 +23,10 @@ envs (`term ≡ 0`) the mask reduces to `r + γ·(combined − α·lp)`.
 
 from max.gpu import block_dim, block_idx, thread_idx
 from max.gpu.host import DeviceContext
-from layout import Layout, LayoutTensor
 
 from noeira.nn.constants import DT, TPB
 from noeira.nn.core.tensor import Tensor
+from noeira.core.tiles import RowMajor, Tile
 
 
 # =============================================================================
@@ -106,16 +106,12 @@ def _redq_ensemble_target_kernel[
     MODE: Int,
     BATCH: Int,
 ](
-    out_y: LayoutTensor[DT, Layout.row_major(BATCH), MutAnyOrigin],
-    rewards: LayoutTensor[DT, Layout.row_major(BATCH), MutAnyOrigin],
-    q_next: LayoutTensor[
-        DT, Layout.row_major(N_ENSEMBLE, BATCH), MutAnyOrigin,
-    ],
-    terms: LayoutTensor[DT, Layout.row_major(BATCH), MutAnyOrigin],
-    log_probs: LayoutTensor[DT, Layout.row_major(BATCH), MutAnyOrigin],
-    subset_idxs: LayoutTensor[
-        DType.uint32, Layout.row_major(N_MIN), MutAnyOrigin,
-    ],
+    out_y: Tile[DT, BATCH],
+    rewards: Tile[DT, BATCH],
+    q_next: Tile[DT, N_ENSEMBLE, BATCH],
+    terms: Tile[DT, BATCH],
+    log_probs: Tile[DT, BATCH],
+    subset_idxs: Tile[DType.uint32, N_MIN],
     gamma: Scalar[DT],
     alpha: Scalar[DT],
 ):
@@ -171,16 +167,12 @@ def _redq_ensemble_target_dev_kernel[
     MODE: Int,
     BATCH: Int,
 ](
-    out_y: LayoutTensor[DT, Layout.row_major(BATCH), MutAnyOrigin],
-    rewards: LayoutTensor[DT, Layout.row_major(BATCH), MutAnyOrigin],
-    q_next: LayoutTensor[
-        DT, Layout.row_major(N_ENSEMBLE, BATCH), MutAnyOrigin,
-    ],
-    terms: LayoutTensor[DT, Layout.row_major(BATCH), MutAnyOrigin],
-    log_probs: LayoutTensor[DT, Layout.row_major(BATCH), MutAnyOrigin],
-    subset_idxs: LayoutTensor[
-        DType.uint32, Layout.row_major(N_MIN), MutAnyOrigin,
-    ],
+    out_y: Tile[DT, BATCH],
+    rewards: Tile[DT, BATCH],
+    q_next: Tile[DT, N_ENSEMBLE, BATCH],
+    terms: Tile[DT, BATCH],
+    log_probs: Tile[DT, BATCH],
+    subset_idxs: Tile[DType.uint32, N_MIN],
     gamma: Scalar[DT],
     alpha_ptr: Pointer[Scalar[DT], MutAnyOrigin],
 ):
@@ -232,9 +224,7 @@ def redq_ensemble_target_gpu_dev[
     mut q_next: Tensor,         # [N_ENSEMBLE, BATCH]
     mut terms: Tensor,          # [BATCH]
     mut log_probs: Tensor,      # [BATCH]
-    subset_dev: LayoutTensor[
-        DType.uint32, Layout.row_major(N_MIN), MutAnyOrigin,
-    ],
+    subset_dev: Tile[DType.uint32, N_MIN],
     gamma: Scalar[DT],
     alpha_ptr: Pointer[Scalar[DT], MutAnyOrigin],
 ) raises:
@@ -246,18 +236,18 @@ def redq_ensemble_target_gpu_dev[
     comptime assert N_MIN >= 1, "N_MIN must be >= 1"
     comptime assert N_MIN <= N_ENSEMBLE, "N_MIN must be <= N_ENSEMBLE"
 
-    comptime lb = Layout.row_major(BATCH)
-    comptime lq = Layout.row_major(N_ENSEMBLE, BATCH)
+    comptime lb = RowMajor[BATCH]
+    comptime lq = RowMajor[N_ENSEMBLE, BATCH]
     comptime n_blocks = (BATCH + TPB - 1) // TPB
     comptime kernel = _redq_ensemble_target_dev_kernel[
         N_ENSEMBLE, N_MIN, MODE, BATCH,
     ]
     ctx.enqueue_function[kernel](
-        out_y.lt["gpu", lb](),
-        rewards.lt["gpu", lb](),
-        q_next.lt["gpu", lq](),
-        terms.lt["gpu", lb](),
-        log_probs.lt["gpu", lb](),
+        out_y.tt["gpu", BATCH](),
+        rewards.tt["gpu", BATCH](),
+        q_next.tt["gpu", N_ENSEMBLE, BATCH](),
+        terms.tt["gpu", BATCH](),
+        log_probs.tt["gpu", BATCH](),
         subset_dev,
         gamma,
         alpha_ptr,
@@ -278,9 +268,7 @@ def redq_ensemble_target_gpu[
     mut q_next: Tensor,         # [N_ENSEMBLE, BATCH]
     mut terms: Tensor,          # [BATCH]
     mut log_probs: Tensor,      # [BATCH]
-    subset_dev: LayoutTensor[
-        DType.uint32, Layout.row_major(N_MIN), MutAnyOrigin,
-    ],
+    subset_dev: Tile[DType.uint32, N_MIN],
     gamma: Scalar[DT],
     alpha: Scalar[DT],
 ) raises:
@@ -296,18 +284,18 @@ def redq_ensemble_target_gpu[
     comptime assert N_MIN >= 1, "N_MIN must be >= 1"
     comptime assert N_MIN <= N_ENSEMBLE, "N_MIN must be <= N_ENSEMBLE"
 
-    comptime lb = Layout.row_major(BATCH)
-    comptime lq = Layout.row_major(N_ENSEMBLE, BATCH)
+    comptime lb = RowMajor[BATCH]
+    comptime lq = RowMajor[N_ENSEMBLE, BATCH]
     comptime n_blocks = (BATCH + TPB - 1) // TPB
     comptime kernel = _redq_ensemble_target_kernel[
         N_ENSEMBLE, N_MIN, MODE, BATCH,
     ]
     ctx.enqueue_function[kernel](
-        out_y.lt["gpu", lb](),
-        rewards.lt["gpu", lb](),
-        q_next.lt["gpu", lq](),
-        terms.lt["gpu", lb](),
-        log_probs.lt["gpu", lb](),
+        out_y.tt["gpu", BATCH](),
+        rewards.tt["gpu", BATCH](),
+        q_next.tt["gpu", N_ENSEMBLE, BATCH](),
+        terms.tt["gpu", BATCH](),
+        log_probs.tt["gpu", BATCH](),
         subset_dev,
         gamma,
         alpha,

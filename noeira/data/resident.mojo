@@ -39,7 +39,7 @@ from max.gpu import block_dim, block_idx, thread_idx
 from max.gpu.host import DeviceContext, DeviceBuffer
 from std.memory import alloc
 from std.utils import IndexList
-from layout import Layout, LayoutTensor, RuntimeLayout
+from layout import TileTensor
 
 from noeira.nn.constants import TPB
 from noeira.nn.core.ptr import mptr
@@ -47,8 +47,7 @@ from .column import ColumnSpec, dtype_bytes
 from .store import TrajectoryStore
 
 
-comptime DYN1 = Layout.row_major[1]()
-comptime DYN2 = Layout.row_major[2]()
+from noeira.core.tiles import DYN1, DYN2, rl1, rl2
 
 comptime IDX_DT = DType.int32
 """Row indices are int32: a store beyond 2^31 rows would be ~200 GB of state
@@ -60,20 +59,18 @@ def _dyn2[
     dtype: DType
 ](
     buf: DeviceBuffer[dtype], rows: Int, cols: Int
-) -> LayoutTensor[dtype, DYN2, MutAnyOrigin]:
-    return LayoutTensor[dtype, DYN2, MutAnyOrigin](
-        mptr(buf.unsafe_ptr()),
-        RuntimeLayout[DYN2].row_major(IndexList[2](rows, cols)),
+) -> TileTensor[dtype, DYN2, MutAnyOrigin]:
+    return TileTensor[dtype, DYN2, MutAnyOrigin](
+        ptr=mptr(buf.unsafe_ptr()), layout=rl2(rows, cols)
     )
 
 
 @always_inline
 def _dyn1[
     dtype: DType
-](buf: DeviceBuffer[dtype], n: Int) -> LayoutTensor[dtype, DYN1, MutAnyOrigin]:
-    return LayoutTensor[dtype, DYN1, MutAnyOrigin](
-        mptr(buf.unsafe_ptr()),
-        RuntimeLayout[DYN1].row_major(IndexList[1](n)),
+](buf: DeviceBuffer[dtype], n: Int) -> TileTensor[dtype, DYN1, MutAnyOrigin]:
+    return TileTensor[dtype, DYN1, MutAnyOrigin](
+        ptr=mptr(buf.unsafe_ptr()), layout=rl1(n)
     )
 
 
@@ -82,9 +79,9 @@ def _dyn1[
 def _gather_rows_kernel[
     dtype: DType
 ](
-    src: LayoutTensor[dtype, DYN2, MutAnyOrigin],
-    idx: LayoutTensor[IDX_DT, DYN1, MutAnyOrigin],
-    dst: LayoutTensor[dtype, DYN2, MutAnyOrigin],
+    src: TileTensor[dtype, DYN2, MutAnyOrigin],
+    idx: TileTensor[IDX_DT, DYN1, MutAnyOrigin],
+    dst: TileTensor[dtype, DYN2, MutAnyOrigin],
 ):
     """One thread per (lane, element): `dst[i, d] = src[idx[i], d]`.
 
@@ -96,8 +93,8 @@ def _gather_rows_kernel[
     Shapes ride in the `RuntimeLayout`, so `row_dim` is read off the tensor
     rather than baked in as a comptime parameter.
     """
-    var batch = dst.dim(0)
-    var row_dim = dst.dim(1)
+    var batch = Int(dst.dim[0]())
+    var row_dim = Int(dst.dim[1]())
     var t = Int(block_dim.x * block_idx.x + thread_idx.x)
     if t >= batch * row_dim:
         return

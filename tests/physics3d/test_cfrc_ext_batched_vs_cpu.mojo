@@ -135,11 +135,11 @@ def test_batched_cfrc_ext_matches_cpu() raises:
     compute_cfrc_ext[DTYPE, 1](
         ctx,
         AsStatic[MD](),
-        d.xipos.lt["gpu", type_of(d).L_B3](),
-        d.contacts.lt["gpu", type_of(d).L_CONTACTS](),
-        d.meta.lt["gpu", type_of(d).L_META](),
-        d.cfrc_ext.lt["gpu", type_of(d).L_B6](),
-        mf.bodies.lt["gpu", type_of(mf).L_BODY](),
+        d.xipos.tt_dyn["gpu", type_of(d).L_B3](type_of(d).L_B3()),
+        d.contacts.tt_dyn["gpu", type_of(d).L_CONTACTS](type_of(d).L_CONTACTS()),
+        d.meta.tt_dyn["gpu", type_of(d).L_META](type_of(d).L_META()),
+        d.cfrc_ext.tt_dyn["gpu", type_of(d).L_B6](type_of(d).L_B6()),
+        mf.bodies.tt_dyn["gpu", type_of(mf).L_BODY](type_of(mf).L_BODY()),
     )
     ctx.synchronize()
     d.cfrc_ext.download(ctx)

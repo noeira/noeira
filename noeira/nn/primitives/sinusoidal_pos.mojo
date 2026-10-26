@@ -24,7 +24,8 @@ No params. Conforms to `Module`.
 from std.math import exp, sin, cos, sqrt, log
 from max.gpu import global_idx
 from max.gpu.host import DeviceContext
-from layout import Layout, LayoutTensor, TileTensor, row_major
+from layout import TileTensor, row_major
+from noeira.core.tiles import Tile
 
 from noeira.nn.constants import DT, TPB
 from ..core.tensor import Tensor
@@ -64,9 +65,9 @@ def build_sinusoid_bias[
 def _pos_add_kernel[
     BATCH: Int, N: Int
 ](
-    input: LayoutTensor[DT, Layout.row_major(BATCH, N), MutAnyOrigin],
-    bias: LayoutTensor[DT, Layout.row_major(N), MutAnyOrigin],
-    output: LayoutTensor[DT, Layout.row_major(BATCH, N), MutAnyOrigin],
+    input: Tile[DT, BATCH, N],
+    bias: Tile[DT, N],
+    output: Tile[DT, BATCH, N],
 ):
     var idx = Int(global_idx.x)
     if idx >= BATCH * N:
@@ -80,8 +81,8 @@ def _pos_add_kernel[
 def _copy_kernel[
     BATCH: Int, N: Int
 ](
-    src: LayoutTensor[DT, Layout.row_major(BATCH, N), MutAnyOrigin],
-    dst: LayoutTensor[DT, Layout.row_major(BATCH, N), MutAnyOrigin],
+    src: Tile[DT, BATCH, N],
+    dst: Tile[DT, BATCH, N],
 ):
     var idx = Int(global_idx.x)
     if idx >= BATCH * N:
@@ -138,9 +139,9 @@ struct SinusoidalPosAdd[T_: Int, S_: Int, D_: Int, SCALE_: Bool = False](Module)
             out.ensure_gpu(c, B * Self.N)
             comptime n_blocks = (B * Self.N + TPB - 1) // TPB
             c.enqueue_function[_pos_add_kernel[B, Self.N]](
-                in0.lt["gpu", Layout.row_major(B, Self.N)](),
-                self.bias.lt["gpu", Layout.row_major(Self.N)](),
-                out.lt["gpu", Layout.row_major(B, Self.N)](),
+                in0.tt["gpu", B, Self.N](),
+                self.bias.tt["gpu", Self.N](),
+                out.tt["gpu", B, Self.N](),
                 grid_dim=n_blocks,
                 block_dim=TPB,
             )
@@ -171,8 +172,8 @@ struct SinusoidalPosAdd[T_: Int, S_: Int, D_: Int, SCALE_: Bool = False](Module)
             gin.ensure_gpu(c, B * Self.N)
             comptime n_blocks = (B * Self.N + TPB - 1) // TPB
             c.enqueue_function[_copy_kernel[B, Self.N]](
-                grad_output.lt["gpu", Layout.row_major(B, Self.N)](),
-                gin.lt["gpu", Layout.row_major(B, Self.N)](),
+                grad_output.tt["gpu", B, Self.N](),
+                gin.tt["gpu", B, Self.N](),
                 grid_dim=n_blocks,
                 block_dim=TPB,
             )

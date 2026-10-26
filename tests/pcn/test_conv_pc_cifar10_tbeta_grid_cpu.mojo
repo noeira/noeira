@@ -30,10 +30,10 @@ Run:
     pixi run mojo run -I . tests/pcn/test_conv_pc_cifar10_tbeta_grid_cpu.mojo
 """
 
-from std.memory import alloc, memset
+from std.memory import alloc, unsafe_memset
 from std.time import perf_counter_ns
 from std.math import sqrt
-from layout import Layout, LayoutTensor
+from noeira.core.tiles import tile
 
 from noeira.nn.constants import DT as dtype
 from noeira.nn.core.ptr import mptr
@@ -110,11 +110,11 @@ def main() raises:
     var params_buf = alloc[Scalar[dtype]](NET.PARAM_SIZE).as_unsafe_any_origin()
     var snap_buf = alloc[Scalar[dtype]](NET.PARAM_SIZE).as_unsafe_any_origin()
     var grads_buf = alloc[Scalar[dtype]](NET.PARAM_SIZE).as_unsafe_any_origin()
-    memset(params_buf, 0, NET.PARAM_SIZE)
-    memset(snap_buf, 0, NET.PARAM_SIZE)
-    memset(grads_buf, 0, NET.PARAM_SIZE)
-    var params = LayoutTensor[dtype, Layout.row_major(NET.PARAM_SIZE), MutAnyOrigin](params_buf)
-    var grads = LayoutTensor[dtype, Layout.row_major(NET.PARAM_SIZE), MutAnyOrigin](grads_buf)
+    unsafe_memset(params_buf, 0, NET.PARAM_SIZE)
+    unsafe_memset(snap_buf, 0, NET.PARAM_SIZE)
+    unsafe_memset(grads_buf, 0, NET.PARAM_SIZE)
+    var params = tile[NET.PARAM_SIZE](params_buf)
+    var grads = tile[NET.PARAM_SIZE](grads_buf)
 
     # One draw, snapshotted — every arm restores from this.
     NET.pc_init_params[PCXavier, dtype](params)
@@ -123,8 +123,8 @@ def main() raises:
 
     var opt_state_buf = alloc[Scalar[dtype]](NET.PARAM_SIZE * OPT.STATE_PER_PARAM).as_unsafe_any_origin()
     var opt_global_buf = alloc[Scalar[dtype]](OPT.GLOBAL_STATE_SIZE).as_unsafe_any_origin()
-    var opt_state = LayoutTensor[dtype, Layout.row_major(NET.PARAM_SIZE, OPT.STATE_PER_PARAM), MutAnyOrigin](opt_state_buf)
-    var opt_global = LayoutTensor[dtype, Layout.row_major(OPT.GLOBAL_STATE_SIZE), MutAnyOrigin](opt_global_buf)
+    var opt_state = tile[NET.PARAM_SIZE, OPT.STATE_PER_PARAM](opt_state_buf)
+    var opt_global = tile[OPT.GLOBAL_STATE_SIZE](opt_global_buf)
 
     var lat_buf = alloc[Scalar[dtype]](BATCH * NET.LATENT_DIM).as_unsafe_any_origin()
     var mu_eps_buf_raw = alloc[Scalar[dtype]](BATCH * NET.SCRATCH_OUT_DIM).as_unsafe_any_origin()
@@ -136,15 +136,15 @@ def main() raises:
     var x_buf = alloc[Scalar[dtype]](BATCH * IN).as_unsafe_any_origin()
     var y_buf = alloc[Scalar[dtype]](BATCH * NET.OUT_DIM).as_unsafe_any_origin()
 
-    var latents = LayoutTensor[dtype, Layout.row_major(BATCH, NET.LATENT_DIM), MutAnyOrigin](lat_buf)
-    var mu_eps_buf = LayoutTensor[dtype, Layout.row_major(BATCH, NET.SCRATCH_OUT_DIM), MutAnyOrigin](mu_eps_buf_raw)
-    var a_below_buf = LayoutTensor[dtype, Layout.row_major(BATCH, NET.SCRATCH_IN_DIM), MutAnyOrigin](a_below_buf_raw)
-    var z_below_buf = LayoutTensor[dtype, Layout.row_major(BATCH, NET.SCRATCH_IN_DIM), MutAnyOrigin](z_below_buf_raw)
-    var dx_buf = LayoutTensor[dtype, Layout.row_major(BATCH, NET.LATENT_DIM), MutAnyOrigin](dx_buf_raw)
-    var errors = LayoutTensor[dtype, Layout.row_major(BATCH, NET.LATENT_DIM), MutAnyOrigin](err_buf_raw)
-    var eval_out = LayoutTensor[dtype, Layout.row_major(BATCH, NET.OUT_DIM), MutAnyOrigin](eval_out_buf)
-    var x_batch = LayoutTensor[dtype, Layout.row_major(BATCH, IN), MutAnyOrigin](x_buf)
-    var y_batch = LayoutTensor[dtype, Layout.row_major(BATCH, NET.OUT_DIM), MutAnyOrigin](y_buf)
+    var latents = tile[BATCH, NET.LATENT_DIM](lat_buf)
+    var mu_eps_buf = tile[BATCH, NET.SCRATCH_OUT_DIM](mu_eps_buf_raw)
+    var a_below_buf = tile[BATCH, NET.SCRATCH_IN_DIM](a_below_buf_raw)
+    var z_below_buf = tile[BATCH, NET.SCRATCH_IN_DIM](z_below_buf_raw)
+    var dx_buf = tile[BATCH, NET.LATENT_DIM](dx_buf_raw)
+    var errors = tile[BATCH, NET.LATENT_DIM](err_buf_raw)
+    var eval_out = tile[BATCH, NET.OUT_DIM](eval_out_buf)
+    var x_batch = tile[BATCH, IN](x_buf)
+    var y_batch = tile[BATCH, NET.OUT_DIM](y_buf)
 
     # ── Arms: (T_infer, spike_sigma) ─────────────────────────────────────────
     # Arm A (T=6, β=1) is NOT re-run: pc_init_params is deterministic across
@@ -177,15 +177,15 @@ def main() raises:
         # Reset EVERYTHING that carries state between arms.
         for i in range(NET.PARAM_SIZE):
             params_buf[i] = snap_buf[i]
-        memset(grads_buf, 0, NET.PARAM_SIZE)
-        memset(opt_state_buf, 0, NET.PARAM_SIZE * OPT.STATE_PER_PARAM)
-        memset(opt_global_buf, 0, OPT.GLOBAL_STATE_SIZE)
-        memset(lat_buf, 0, BATCH * NET.LATENT_DIM)
-        memset(mu_eps_buf_raw, 0, BATCH * NET.SCRATCH_OUT_DIM)
-        memset(a_below_buf_raw, 0, BATCH * NET.SCRATCH_IN_DIM)
-        memset(z_below_buf_raw, 0, BATCH * NET.SCRATCH_IN_DIM)
-        memset(dx_buf_raw, 0, BATCH * NET.LATENT_DIM)
-        memset(err_buf_raw, 0, BATCH * NET.LATENT_DIM)
+        unsafe_memset(grads_buf, 0, NET.PARAM_SIZE)
+        unsafe_memset(opt_state_buf, 0, NET.PARAM_SIZE * OPT.STATE_PER_PARAM)
+        unsafe_memset(opt_global_buf, 0, OPT.GLOBAL_STATE_SIZE)
+        unsafe_memset(lat_buf, 0, BATCH * NET.LATENT_DIM)
+        unsafe_memset(mu_eps_buf_raw, 0, BATCH * NET.SCRATCH_OUT_DIM)
+        unsafe_memset(a_below_buf_raw, 0, BATCH * NET.SCRATCH_IN_DIM)
+        unsafe_memset(z_below_buf_raw, 0, BATCH * NET.SCRATCH_IN_DIM)
+        unsafe_memset(dx_buf_raw, 0, BATCH * NET.LATENT_DIM)
+        unsafe_memset(err_buf_raw, 0, BATCH * NET.LATENT_DIM)
 
         var step_num: Int = 0
         var last_tr: Float64 = 0.0

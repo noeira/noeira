@@ -20,7 +20,8 @@ Example usage:
     ```
 """
 
-from layout import LayoutTensor, Layout
+from layout import Layout
+from noeira.core.tiles import Tile, tile
 from max.gpu import thread_idx, block_idx, block_dim
 from max.gpu.host import DeviceContext, DeviceBuffer
 
@@ -64,16 +65,8 @@ struct CarPhysicsKernel:
         CONTROLS_OFFSET: Int,
         MAX_TILES: Int,
     ](
-        state: LayoutTensor[
-            dtype,
-            Layout.row_major(BATCH, STATE_SIZE),
-            MutAnyOrigin,
-        ],
-        tiles: LayoutTensor[
-            dtype,
-            Layout.row_major(MAX_TILES, TILE_DATA_SIZE),
-            MutAnyOrigin,
-        ],
+        state: Tile[dtype, BATCH, STATE_SIZE],
+        tiles: Tile[dtype, MAX_TILES, TILE_DATA_SIZE],
         num_active_tiles: Int,
         dt: Scalar[dtype],
     ):
@@ -127,32 +120,16 @@ struct CarPhysicsKernel:
             num_active_tiles: Number of valid tiles in buffer.
             dt: Time step.
         """
-        var state = LayoutTensor[
-            dtype,
-            Layout.row_major(BATCH, STATE_SIZE),
-            MutAnyOrigin,
-        ](erase_origin(state_buf.unsafe_ptr()))
+        var state = tile[BATCH, STATE_SIZE](erase_origin(state_buf.unsafe_ptr()))
 
-        var tiles = LayoutTensor[
-            dtype,
-            Layout.row_major(MAX_TILES, TILE_DATA_SIZE),
-            MutAnyOrigin,
-        ](erase_origin(tiles_buf.unsafe_ptr()))
+        var tiles = tile[MAX_TILES, TILE_DATA_SIZE](erase_origin(tiles_buf.unsafe_ptr()))
 
         comptime BLOCKS = (BATCH + TPB - 1) // TPB
 
         @always_inline
         def kernel_wrapper(
-            state: LayoutTensor[
-                dtype,
-                Layout.row_major(BATCH, STATE_SIZE),
-                MutAnyOrigin,
-            ],
-            tiles: LayoutTensor[
-                dtype,
-                Layout.row_major(MAX_TILES, TILE_DATA_SIZE),
-                MutAnyOrigin,
-            ],
+            state: Tile[dtype, BATCH, STATE_SIZE],
+            tiles: Tile[dtype, MAX_TILES, TILE_DATA_SIZE],
             num_active_tiles_arg: Int64,
             dt: Scalar[dtype],
         ):

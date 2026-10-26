@@ -38,7 +38,8 @@ from std.memory import alloc
 from std.math import tanh, exp, sqrt, log, cos
 from std.random import random_float64
 from std.random.philox import Random as PhiloxRandom
-from layout import Layout, LayoutTensor, TileTensor, row_major
+from layout import TileTensor, row_major
+from noeira.core.tiles import Tile, tile
 from max.gpu import global_idx
 from max.gpu.primitives import block
 from max.gpu.host import DeviceContext, DeviceBuffer, HostBuffer
@@ -97,8 +98,8 @@ def _mk[target: StaticString](
 
 
 def _bcopy[N: Int](
-    src: LayoutTensor[DT, Layout.row_major(N), MutAnyOrigin],
-    dst: LayoutTensor[DT, Layout.row_major(N), MutAnyOrigin],
+    src: Tile[DT, N],
+    dst: Tile[DT, N],
 ):
     """Contiguous device→device copy (carry / grad threading)."""
     var i = Int(global_idx.x)
@@ -107,15 +108,15 @@ def _bcopy[N: Int](
 
 
 def _seed_asm_k[B_: Int, CARRY_: Int, D_: Int, SC_: Int](
-    seed: LayoutTensor[DT, Layout.row_major(B_ * CARRY_), MutAnyOrigin],
-    gcd: LayoutTensor[DT, Layout.row_major(B_ * D_), MutAnyOrigin],
-    gcs: LayoutTensor[DT, Layout.row_major(B_ * SC_), MutAnyOrigin],
-    dnd: LayoutTensor[DT, Layout.row_major(B_ * D_), MutAnyOrigin],
-    rnd: LayoutTensor[DT, Layout.row_major(B_ * D_), MutAnyOrigin],
-    cnd: LayoutTensor[DT, Layout.row_major(B_ * D_), MutAnyOrigin],
-    dsn: LayoutTensor[DT, Layout.row_major(B_ * SC_), MutAnyOrigin],
-    rsn: LayoutTensor[DT, Layout.row_major(B_ * SC_), MutAnyOrigin],
-    csn: LayoutTensor[DT, Layout.row_major(B_ * SC_), MutAnyOrigin],
+    seed: Tile[DT, B_ * CARRY_],
+    gcd: Tile[DT, B_ * D_],
+    gcs: Tile[DT, B_ * SC_],
+    dnd: Tile[DT, B_ * D_],
+    rnd: Tile[DT, B_ * D_],
+    cnd: Tile[DT, B_ * D_],
+    dsn: Tile[DT, B_ * SC_],
+    rsn: Tile[DT, B_ * SC_],
+    csn: Tile[DT, B_ * SC_],
     dyn: Scalar[DT],
     rep: Scalar[DT],
 ):
@@ -146,9 +147,9 @@ def _seed_asm_k[B_: Int, CARRY_: Int, D_: Int, SC_: Int](
 
 
 def _feat_concat_k[B_: Int, D_: Int, SC_: Int](
-    deter: LayoutTensor[DT, Layout.row_major(B_ * D_), MutAnyOrigin],
-    stoch: LayoutTensor[DT, Layout.row_major(B_ * SC_), MutAnyOrigin],
-    feat: LayoutTensor[DT, Layout.row_major(B_ * (D_ + SC_)), MutAnyOrigin],
+    deter: Tile[DT, B_ * D_],
+    stoch: Tile[DT, B_ * SC_],
+    feat: Tile[DT, B_ * (D_ + SC_)],
 ):
     """feat[b] = concat(deter[b], stoch[b])  (FEAT = D + SC). One thread per
     output element over B*(D+SC) (was B-parallel with a serial FEAT loop → a
@@ -165,9 +166,9 @@ def _feat_concat_k[B_: Int, D_: Int, SC_: Int](
 
 
 def _rowscale_k[B_: Int, W_: Int](
-    src: LayoutTensor[DT, Layout.row_major(B_ * W_), MutAnyOrigin],
-    dst: LayoutTensor[DT, Layout.row_major(B_ * W_), MutAnyOrigin],
-    m: LayoutTensor[DT, Layout.row_major(B_), MutAnyOrigin],
+    src: Tile[DT, B_ * W_],
+    dst: Tile[DT, B_ * W_],
+    m: Tile[DT, B_],
 ):
     var i = Int(global_idx.x)
     if i < B_ * W_:
@@ -175,8 +176,8 @@ def _rowscale_k[B_: Int, W_: Int](
 
 
 def _rowscale_inplace_k[B_: Int, W_: Int](
-    buf: LayoutTensor[DT, Layout.row_major(B_ * W_), MutAnyOrigin],
-    m: LayoutTensor[DT, Layout.row_major(B_), MutAnyOrigin],
+    buf: Tile[DT, B_ * W_],
+    m: Tile[DT, B_],
 ):
     var i = Int(global_idx.x)
     if i < B_ * W_:
@@ -196,9 +197,9 @@ def _rowscale_inplace_k[B_: Int, W_: Int](
 
 @always_inline
 def _dev_twp[BINS_: Int, NL: Int, NB: Int](
-    logits: LayoutTensor[DT, Layout.row_major(NL), MutAnyOrigin],
+    logits: Tile[DT, NL],
     base: Int,
-    bins: LayoutTensor[DT, Layout.row_major(NB), MutAnyOrigin],
+    bins: Tile[DT, NB],
 ) -> Scalar[DT]:
     """Σ_c softmax(logits[base:base+BINS])_c · bins_c (device twohot_pred)."""
     var zmax = rebind[Scalar[DT]](logits[base])
@@ -222,9 +223,9 @@ def _dev_twp[BINS_: Int, NL: Int, NB: Int](
 
 @always_inline
 def _dev_twohot_ce[BINS_: Int, NL: Int, NB: Int](
-    logits: LayoutTensor[DT, Layout.row_major(NL), MutAnyOrigin],
+    logits: Tile[DT, NL],
     base: Int,
-    bins: LayoutTensor[DT, Layout.row_major(NB), MutAnyOrigin],
+    bins: Tile[DT, NB],
     target: Scalar[DT],
 ) -> Scalar[DT]:
     """Twohot cross-entropy of `target` vs logits[base:] (device twohot_loss)."""
@@ -271,12 +272,12 @@ def _dev_twohot_ce[BINS_: Int, NL: Int, NB: Int](
 
 @always_inline
 def _dev_twohot_ce_bwd[BINS_: Int, NL: Int, NB: Int, NG: Int](
-    logits: LayoutTensor[DT, Layout.row_major(NL), MutAnyOrigin],
+    logits: Tile[DT, NL],
     base: Int,
-    bins: LayoutTensor[DT, Layout.row_major(NB), MutAnyOrigin],
+    bins: Tile[DT, NB],
     target: Scalar[DT],
     upstream: Scalar[DT],
-    grad: LayoutTensor[DT, Layout.row_major(NG), MutAnyOrigin],
+    grad: Tile[DT, NG],
 ):
     """Accumulate upstream·(softmax − twohot(target)) into grad[base:base+BINS]
     (device twohot_loss_backward; grad slice must be pre-zeroed)."""
@@ -325,8 +326,8 @@ def _dev_twohot_ce_bwd[BINS_: Int, NL: Int, NB: Int, NG: Int](
 
 
 def _hist_store_k[W_: Int, TI_: Int, NS_: Int](
-    src: LayoutTensor[DT, Layout.row_major(NS_ * W_), MutAnyOrigin],
-    hist: LayoutTensor[DT, Layout.row_major(NS_ * TI_ * W_), MutAnyOrigin],
+    src: Tile[DT, NS_ * W_],
+    hist: Tile[DT, NS_ * TI_ * W_],
     t_arg: Int64,
 ):
     """Scatter the per-step output src[NS,W] into hist[NS,TI,W] at step t. One
@@ -342,8 +343,8 @@ def _hist_store_k[W_: Int, TI_: Int, NS_: Int](
 
 
 def _hist_load_k[W_: Int, TI_: Int, NS_: Int](
-    hist: LayoutTensor[DT, Layout.row_major(NS_ * TI_ * W_), MutAnyOrigin],
-    dst: LayoutTensor[DT, Layout.row_major(NS_ * W_), MutAnyOrigin],
+    hist: Tile[DT, NS_ * TI_ * W_],
+    dst: Tile[DT, NS_ * W_],
     t_arg: Int64,
 ):
     """Gather hist[NS,TI,W] step t into the contiguous dst[NS,W]. One thread per
@@ -359,9 +360,9 @@ def _hist_load_k[W_: Int, TI_: Int, NS_: Int](
 
 
 def _hist_load_pol2_k[ACT_: Int, TI_: Int, NS_: Int](
-    gpm: LayoutTensor[DT, Layout.row_major(NS_ * TI_ * ACT_), MutAnyOrigin],
-    gps: LayoutTensor[DT, Layout.row_major(NS_ * TI_ * ACT_), MutAnyOrigin],
-    dst: LayoutTensor[DT, Layout.row_major(NS_ * 2 * ACT_), MutAnyOrigin],
+    gpm: Tile[DT, NS_ * TI_ * ACT_],
+    gps: Tile[DT, NS_ * TI_ * ACT_],
+    dst: Tile[DT, NS_ * 2 * ACT_],
     t_arg: Int64,
 ):
     """Continuous policy cotangent: gather step-t gpmean → dst[:, 0:ACT] and
@@ -382,9 +383,9 @@ def _hist_load_pol2_k[ACT_: Int, TI_: Int, NS_: Int](
 
 
 def _noise_philox_k[N_: Int](
-    dst: LayoutTensor[DT, Layout.row_major(N_), MutAnyOrigin],
+    dst: Tile[DT, N_],
     seed: UInt64,
-    offset_buf: LayoutTensor[DType.uint64, Layout.row_major(1), MutAnyOrigin],
+    offset_buf: Tile[DType.uint64, 1],
 ):
     """Device imagination noise: element i ← uniform[-1,1] via Philox(seed+i,
     offset). Replaces the host `random_float64` gen + H2D upload (Stage 3 P4
@@ -403,7 +404,7 @@ def _noise_philox_k[N_: Int](
 
 
 def _noise_off_inc_k[STRIDE: Int](
-    offset_buf: LayoutTensor[DType.uint64, Layout.row_major(1), MutAnyOrigin],
+    offset_buf: Tile[DType.uint64, 1],
 ):
     """Advance the device noise offset by STRIDE (one thread)."""
     if Int(global_idx.x) == 0:
@@ -411,11 +412,11 @@ def _noise_off_inc_k[STRIDE: Int](
 
 
 def _cat_sample_hist_k[C_: Int, TI_: Int, NS_: Int](
-    pb: LayoutTensor[DT, Layout.row_major(NS_ * C_), MutAnyOrigin],
-    noise: LayoutTensor[DT, Layout.row_major(TI_ * NS_ * C_), MutAnyOrigin],
-    at: LayoutTensor[DT, Layout.row_major(NS_ * C_), MutAnyOrigin],
-    pmean_h: LayoutTensor[DT, Layout.row_major(NS_ * TI_ * C_), MutAnyOrigin],
-    acts_h: LayoutTensor[DT, Layout.row_major(NS_ * TI_ * C_), MutAnyOrigin],
+    pb: Tile[DT, NS_ * C_],
+    noise: Tile[DT, TI_ * NS_ * C_],
+    at: Tile[DT, NS_ * C_],
+    pmean_h: Tile[DT, NS_ * TI_ * C_],
+    acts_h: Tile[DT, NS_ * TI_ * C_],
     u: Scalar[DT],
     t_arg: Int64,
 ):
@@ -458,12 +459,12 @@ def _cat_sample_hist_k[C_: Int, TI_: Int, NS_: Int](
 
 
 def _gaussian_sample_hist_k[ACT_: Int, TI_: Int, NS_: Int](
-    pb: LayoutTensor[DT, Layout.row_major(NS_ * 2 * ACT_), MutAnyOrigin],
-    noise: LayoutTensor[DT, Layout.row_major(TI_ * NS_ * ACT_), MutAnyOrigin],
-    at: LayoutTensor[DT, Layout.row_major(NS_ * ACT_), MutAnyOrigin],
-    pmean_h: LayoutTensor[DT, Layout.row_major(NS_ * TI_ * ACT_), MutAnyOrigin],
-    pstd_h: LayoutTensor[DT, Layout.row_major(NS_ * TI_ * ACT_), MutAnyOrigin],
-    acts_h: LayoutTensor[DT, Layout.row_major(NS_ * TI_ * ACT_), MutAnyOrigin],
+    pb: Tile[DT, NS_ * 2 * ACT_],
+    noise: Tile[DT, TI_ * NS_ * ACT_],
+    at: Tile[DT, NS_ * ACT_],
+    pmean_h: Tile[DT, NS_ * TI_ * ACT_],
+    pstd_h: Tile[DT, NS_ * TI_ * ACT_],
+    acts_h: Tile[DT, NS_ * TI_ * ACT_],
     minstd: Scalar[DT],
     maxstd: Scalar[DT],
     t_arg: Int64,
@@ -497,11 +498,11 @@ def _gaussian_sample_hist_k[ACT_: Int, TI_: Int, NS_: Int](
 
 
 def _rewconv_hist_k[BINS_: Int, TI_: Int, NS_: Int](
-    rew_logits: LayoutTensor[DT, Layout.row_major(NS_ * BINS_), MutAnyOrigin],
-    con_logit: LayoutTensor[DT, Layout.row_major(NS_), MutAnyOrigin],
-    bins: LayoutTensor[DT, Layout.row_major(BINS_), MutAnyOrigin],
-    rewv_h: LayoutTensor[DT, Layout.row_major(NS_ * TI_), MutAnyOrigin],
-    conv_h: LayoutTensor[DT, Layout.row_major(NS_ * TI_), MutAnyOrigin],
+    rew_logits: Tile[DT, NS_ * BINS_],
+    con_logit: Tile[DT, NS_],
+    bins: Tile[DT, BINS_],
+    rewv_h: Tile[DT, NS_ * TI_],
+    conv_h: Tile[DT, NS_ * TI_],
     t_arg: Int64,
 ):
     """rewv = twohot_pred(rew logits); conv = sigmoid(con logit) → histories."""
@@ -516,12 +517,12 @@ def _rewconv_hist_k[BINS_: Int, TI_: Int, NS_: Int](
 
 
 def _imag_ret_k[NS_: Int, TI_: Int, BINS_: Int](
-    vlog: LayoutTensor[DT, Layout.row_major(NS_ * TI_ * BINS_), MutAnyOrigin],
-    svlog: LayoutTensor[DT, Layout.row_major(NS_ * TI_ * BINS_), MutAnyOrigin],
-    rewv: LayoutTensor[DT, Layout.row_major(NS_ * TI_), MutAnyOrigin],
-    conv: LayoutTensor[DT, Layout.row_major(NS_ * TI_), MutAnyOrigin],
-    bins: LayoutTensor[DT, Layout.row_major(BINS_), MutAnyOrigin],
-    ret: LayoutTensor[DT, Layout.row_major(NS_ * (TI_ - 1)), MutAnyOrigin],
+    vlog: Tile[DT, NS_ * TI_ * BINS_],
+    svlog: Tile[DT, NS_ * TI_ * BINS_],
+    rewv: Tile[DT, NS_ * TI_],
+    conv: Tile[DT, NS_ * TI_],
+    bins: Tile[DT, BINS_],
+    ret: Tile[DT, NS_ * (TI_ - 1)],
     lam: Scalar[DT],
     # ⚠ Int32, NOT Int — `Int`/`UInt` are not `DevicePassable`. A bare
     # `Int` still compiles in `pixi run build` and fails only where the
@@ -557,8 +558,8 @@ def _imag_ret_k[NS_: Int, TI_: Int, BINS_: Int](
 
 
 def _ret_perc_neigh_k[N_: Int](
-    ret: LayoutTensor[DT, Layout.row_major(N_), MutAnyOrigin],
-    neigh: LayoutTensor[DT, Layout.row_major(4), MutAnyOrigin],
+    ret: Tile[DT, N_],
+    neigh: Tile[DT, 4],
     lo_floor_arg: Int64,
     hi_floor_arg: Int64,
 ):
@@ -594,9 +595,9 @@ def _ret_perc_neigh_k[N_: Int](
 
 
 def _ret_perc_ema_k(
-    neigh: LayoutTensor[DT, Layout.row_major(4), MutAnyOrigin],
-    state: LayoutTensor[DT, Layout.row_major(2), MutAnyOrigin],
-    rscale: LayoutTensor[DT, Layout.row_major(1), MutAnyOrigin],
+    neigh: Tile[DT, 4],
+    state: Tile[DT, 2],
+    rscale: Tile[DT, 1],
     lo_frac: Scalar[DT],
     hi_frac: Scalar[DT],
     rate: Scalar[DT],
@@ -636,8 +637,8 @@ comptime DIAG_N = 16
 
 
 def _diag_sum_k[N_: Int](
-    data: LayoutTensor[DT, Layout.row_major(N_), MutAnyOrigin],
-    dst: LayoutTensor[DT, Layout.row_major(DIAG_N), MutAnyOrigin],
+    data: Tile[DT, N_],
+    dst: Tile[DT, DIAG_N],
     slot_arg: Int64,
 ):
     # Mojo 1.0: `Int`/`UInt` are not `DevicePassable`; the kernel takes
@@ -655,8 +656,8 @@ def _diag_sum_k[N_: Int](
 
 
 def _diag_sum_sq_k[N_: Int](
-    data: LayoutTensor[DT, Layout.row_major(N_), MutAnyOrigin],
-    dst: LayoutTensor[DT, Layout.row_major(DIAG_N), MutAnyOrigin],
+    data: Tile[DT, N_],
+    dst: Tile[DT, DIAG_N],
     s_sum_arg: Int64,
     s_sq_arg: Int64,
 ):
@@ -682,8 +683,8 @@ def _diag_sum_sq_k[N_: Int](
 
 
 def _diag_abs_sum_k[N_: Int](
-    data: LayoutTensor[DT, Layout.row_major(N_), MutAnyOrigin],
-    dst: LayoutTensor[DT, Layout.row_major(DIAG_N), MutAnyOrigin],
+    data: Tile[DT, N_],
+    dst: Tile[DT, DIAG_N],
     slot_arg: Int64,
 ):
     # Mojo 1.0: `Int`/`UInt` are not `DevicePassable`; the kernel takes
@@ -702,8 +703,8 @@ def _diag_abs_sum_k[N_: Int](
 
 
 def _diag_min_k[N_: Int](
-    data: LayoutTensor[DT, Layout.row_major(N_), MutAnyOrigin],
-    dst: LayoutTensor[DT, Layout.row_major(DIAG_N), MutAnyOrigin],
+    data: Tile[DT, N_],
+    dst: Tile[DT, DIAG_N],
     slot_arg: Int64,
 ):
     # Mojo 1.0: `Int`/`UInt` are not `DevicePassable`; the kernel takes
@@ -723,9 +724,9 @@ def _diag_min_k[N_: Int](
 
 
 def _diag_twohot_sum_sq_k[NBT_: Int, BINS_: Int, NL_: Int, NB_: Int](
-    vlog: LayoutTensor[DT, Layout.row_major(NL_), MutAnyOrigin],
-    bins: LayoutTensor[DT, Layout.row_major(NB_), MutAnyOrigin],
-    dst: LayoutTensor[DT, Layout.row_major(DIAG_N), MutAnyOrigin],
+    vlog: Tile[DT, NL_],
+    bins: Tile[DT, NB_],
+    dst: Tile[DT, DIAG_N],
     s_sum_arg: Int64,
     s_sq_arg: Int64,
 ):
@@ -752,18 +753,18 @@ def _diag_twohot_sum_sq_k[NBT_: Int, BINS_: Int, NL_: Int, NB_: Int](
 
 
 def _imag_bwd_k[NS_: Int, TI_: Int, BINS_: Int, C_: Int](
-    vlog: LayoutTensor[DT, Layout.row_major(NS_ * TI_ * BINS_), MutAnyOrigin],
-    svlog: LayoutTensor[DT, Layout.row_major(NS_ * TI_ * BINS_), MutAnyOrigin],
-    pmean: LayoutTensor[DT, Layout.row_major(NS_ * TI_ * C_), MutAnyOrigin],
-    acts: LayoutTensor[DT, Layout.row_major(NS_ * TI_ * C_), MutAnyOrigin],
-    conv: LayoutTensor[DT, Layout.row_major(NS_ * TI_), MutAnyOrigin],
-    ret: LayoutTensor[DT, Layout.row_major(NS_ * (TI_ - 1)), MutAnyOrigin],
-    bins: LayoutTensor[DT, Layout.row_major(BINS_), MutAnyOrigin],
-    gvlog: LayoutTensor[DT, Layout.row_major(NS_ * TI_ * BINS_), MutAnyOrigin],
-    gpmean: LayoutTensor[DT, Layout.row_major(NS_ * TI_ * C_), MutAnyOrigin],
-    polloss: LayoutTensor[DT, Layout.row_major(NS_ * (TI_ - 1)), MutAnyOrigin],
-    valloss: LayoutTensor[DT, Layout.row_major(NS_ * (TI_ - 1)), MutAnyOrigin],
-    rscale_buf: LayoutTensor[DT, Layout.row_major(1), MutAnyOrigin],
+    vlog: Tile[DT, NS_ * TI_ * BINS_],
+    svlog: Tile[DT, NS_ * TI_ * BINS_],
+    pmean: Tile[DT, NS_ * TI_ * C_],
+    acts: Tile[DT, NS_ * TI_ * C_],
+    conv: Tile[DT, NS_ * TI_],
+    ret: Tile[DT, NS_ * (TI_ - 1)],
+    bins: Tile[DT, BINS_],
+    gvlog: Tile[DT, NS_ * TI_ * BINS_],
+    gpmean: Tile[DT, NS_ * TI_ * C_],
+    polloss: Tile[DT, NS_ * (TI_ - 1)],
+    valloss: Tile[DT, NS_ * (TI_ - 1)],
+    rscale_buf: Tile[DT, 1],
     lam: Scalar[DT],
     actent: Scalar[DT],
     slowreg: Scalar[DT],
@@ -851,20 +852,20 @@ def _imag_bwd_k[NS_: Int, TI_: Int, BINS_: Int, C_: Int](
 
 
 def _imag_bwd_continuous_k[NS_: Int, TI_: Int, BINS_: Int, C_: Int](
-    vlog: LayoutTensor[DT, Layout.row_major(NS_ * TI_ * BINS_), MutAnyOrigin],
-    svlog: LayoutTensor[DT, Layout.row_major(NS_ * TI_ * BINS_), MutAnyOrigin],
-    pmean: LayoutTensor[DT, Layout.row_major(NS_ * TI_ * C_), MutAnyOrigin],
-    pstd: LayoutTensor[DT, Layout.row_major(NS_ * TI_ * C_), MutAnyOrigin],
-    acts: LayoutTensor[DT, Layout.row_major(NS_ * TI_ * C_), MutAnyOrigin],
-    conv: LayoutTensor[DT, Layout.row_major(NS_ * TI_), MutAnyOrigin],
-    ret: LayoutTensor[DT, Layout.row_major(NS_ * (TI_ - 1)), MutAnyOrigin],
-    bins: LayoutTensor[DT, Layout.row_major(BINS_), MutAnyOrigin],
-    gvlog: LayoutTensor[DT, Layout.row_major(NS_ * TI_ * BINS_), MutAnyOrigin],
-    gpmean: LayoutTensor[DT, Layout.row_major(NS_ * TI_ * C_), MutAnyOrigin],
-    gpstd: LayoutTensor[DT, Layout.row_major(NS_ * TI_ * C_), MutAnyOrigin],
-    polloss: LayoutTensor[DT, Layout.row_major(NS_ * (TI_ - 1)), MutAnyOrigin],
-    valloss: LayoutTensor[DT, Layout.row_major(NS_ * (TI_ - 1)), MutAnyOrigin],
-    rscale_buf: LayoutTensor[DT, Layout.row_major(1), MutAnyOrigin],
+    vlog: Tile[DT, NS_ * TI_ * BINS_],
+    svlog: Tile[DT, NS_ * TI_ * BINS_],
+    pmean: Tile[DT, NS_ * TI_ * C_],
+    pstd: Tile[DT, NS_ * TI_ * C_],
+    acts: Tile[DT, NS_ * TI_ * C_],
+    conv: Tile[DT, NS_ * TI_],
+    ret: Tile[DT, NS_ * (TI_ - 1)],
+    bins: Tile[DT, BINS_],
+    gvlog: Tile[DT, NS_ * TI_ * BINS_],
+    gpmean: Tile[DT, NS_ * TI_ * C_],
+    gpstd: Tile[DT, NS_ * TI_ * C_],
+    polloss: Tile[DT, NS_ * (TI_ - 1)],
+    valloss: Tile[DT, NS_ * (TI_ - 1)],
+    rscale_buf: Tile[DT, 1],
     actent: Scalar[DT],
     slowreg: Scalar[DT],
     inv_im: Scalar[DT],
@@ -948,20 +949,20 @@ def _imag_bwd_continuous_k[NS_: Int, TI_: Int, BINS_: Int, C_: Int](
 
 
 def _imag_bwd_continuous_pt_k[NS_: Int, TI_: Int, BINS_: Int, C_: Int](
-    vlog: LayoutTensor[DT, Layout.row_major(NS_ * TI_ * BINS_), MutAnyOrigin],
-    svlog: LayoutTensor[DT, Layout.row_major(NS_ * TI_ * BINS_), MutAnyOrigin],
-    pmean: LayoutTensor[DT, Layout.row_major(NS_ * TI_ * C_), MutAnyOrigin],
-    pstd: LayoutTensor[DT, Layout.row_major(NS_ * TI_ * C_), MutAnyOrigin],
-    acts: LayoutTensor[DT, Layout.row_major(NS_ * TI_ * C_), MutAnyOrigin],
-    conv: LayoutTensor[DT, Layout.row_major(NS_ * TI_), MutAnyOrigin],
-    ret: LayoutTensor[DT, Layout.row_major(NS_ * (TI_ - 1)), MutAnyOrigin],
-    bins: LayoutTensor[DT, Layout.row_major(BINS_), MutAnyOrigin],
-    gvlog: LayoutTensor[DT, Layout.row_major(NS_ * TI_ * BINS_), MutAnyOrigin],
-    gpmean: LayoutTensor[DT, Layout.row_major(NS_ * TI_ * C_), MutAnyOrigin],
-    gpstd: LayoutTensor[DT, Layout.row_major(NS_ * TI_ * C_), MutAnyOrigin],
-    polloss: LayoutTensor[DT, Layout.row_major(NS_ * (TI_ - 1)), MutAnyOrigin],
-    valloss: LayoutTensor[DT, Layout.row_major(NS_ * (TI_ - 1)), MutAnyOrigin],
-    rscale_buf: LayoutTensor[DT, Layout.row_major(1), MutAnyOrigin],
+    vlog: Tile[DT, NS_ * TI_ * BINS_],
+    svlog: Tile[DT, NS_ * TI_ * BINS_],
+    pmean: Tile[DT, NS_ * TI_ * C_],
+    pstd: Tile[DT, NS_ * TI_ * C_],
+    acts: Tile[DT, NS_ * TI_ * C_],
+    conv: Tile[DT, NS_ * TI_],
+    ret: Tile[DT, NS_ * (TI_ - 1)],
+    bins: Tile[DT, BINS_],
+    gvlog: Tile[DT, NS_ * TI_ * BINS_],
+    gpmean: Tile[DT, NS_ * TI_ * C_],
+    gpstd: Tile[DT, NS_ * TI_ * C_],
+    polloss: Tile[DT, NS_ * (TI_ - 1)],
+    valloss: Tile[DT, NS_ * (TI_ - 1)],
+    rscale_buf: Tile[DT, 1],
     actent: Scalar[DT],
     slowreg: Scalar[DT],
     inv_im: Scalar[DT],
@@ -1043,9 +1044,9 @@ def _imag_bwd_continuous_pt_k[NS_: Int, TI_: Int, BINS_: Int, C_: Int](
 
 
 def _box_muller_gaussian_k[N_: Int](
-    dst: LayoutTensor[DT, Layout.row_major(N_), MutAnyOrigin],
+    dst: Tile[DT, N_],
     seed: UInt64,
-    offset_buf: LayoutTensor[DType.uint64, Layout.row_major(1), MutAnyOrigin],
+    offset_buf: Tile[DType.uint64, 1],
 ):
     """Device N(0,1) imagination noise via Box-Muller — the Gaussian counterpart
     of `_noise_philox_k` (which yields uniform[-1,1] for the discrete categorical
@@ -1070,10 +1071,10 @@ def _box_muller_gaussian_k[N_: Int](
 def _repval_setup_k[
     NS_: Int, TI_: Int, FEAT_: Int, B_: Int, T_: Int
 ](
-    ret: LayoutTensor[DT, Layout.row_major(NS_ * (TI_ - 1)), MutAnyOrigin],
-    feats: LayoutTensor[DT, Layout.row_major(NS_ * TI_ * FEAT_), MutAnyOrigin],
-    boot: LayoutTensor[DT, Layout.row_major(B_ * T_), MutAnyOrigin],
-    feat_bt: LayoutTensor[DT, Layout.row_major(B_ * T_ * FEAT_), MutAnyOrigin],
+    ret: Tile[DT, NS_ * (TI_ - 1)],
+    feats: Tile[DT, NS_ * TI_ * FEAT_],
+    boot: Tile[DT, B_ * T_],
+    feat_bt: Tile[DT, B_ * T_ * FEAT_],
 ):
     """Assemble repval inputs: boot[b,j]=ret[s,0], feat_bt[b,j]=feats[s,0]
     where s=j*B+b (NS=T·B start flattening). Matches `_ac_cpu` repval setup."""
@@ -1091,13 +1092,13 @@ def _repval_setup_k[
 
 
 def _repl_bwd_k[B_: Int, T_: Int, BINS_: Int](
-    last: LayoutTensor[DT, Layout.row_major(B_ * T_), MutAnyOrigin],
-    rew: LayoutTensor[DT, Layout.row_major(B_ * T_), MutAnyOrigin],
-    boot: LayoutTensor[DT, Layout.row_major(B_ * T_), MutAnyOrigin],
-    svlr: LayoutTensor[DT, Layout.row_major(B_ * T_ * BINS_), MutAnyOrigin],
-    bins: LayoutTensor[DT, Layout.row_major(BINS_), MutAnyOrigin],
-    gvlr: LayoutTensor[DT, Layout.row_major(B_ * T_ * BINS_), MutAnyOrigin],
-    vlogits: LayoutTensor[DT, Layout.row_major(B_ * T_ * BINS_), MutAnyOrigin],
+    last: Tile[DT, B_ * T_],
+    rew: Tile[DT, B_ * T_],
+    boot: Tile[DT, B_ * T_],
+    svlr: Tile[DT, B_ * T_ * BINS_],
+    bins: Tile[DT, BINS_],
+    gvlr: Tile[DT, B_ * T_ * BINS_],
+    vlogits: Tile[DT, B_ * T_ * BINS_],
     horizon: Scalar[DT],
     lam: Scalar[DT],
     slowreg: Scalar[DT],
@@ -1160,12 +1161,12 @@ def _repl_bwd_k[B_: Int, T_: Int, BINS_: Int](
 #    heads systematically favor one action's imagined futures (early model
 #    exploitation), the policy-collapse driver. ──────────────────────────
 def _diag_adv_act_k[NS_: Int, TI_: Int, BINS_: Int, C_: Int](
-    acts: LayoutTensor[DT, Layout.row_major(NS_ * TI_ * C_), MutAnyOrigin],
-    ret: LayoutTensor[DT, Layout.row_major(NS_ * (TI_ - 1)), MutAnyOrigin],
-    vlog: LayoutTensor[DT, Layout.row_major(NS_ * TI_ * BINS_), MutAnyOrigin],
-    bins: LayoutTensor[DT, Layout.row_major(BINS_), MutAnyOrigin],
-    rscale_buf: LayoutTensor[DT, Layout.row_major(1), MutAnyOrigin],
-    out_d: LayoutTensor[DT, Layout.row_major(2 * C_), MutAnyOrigin],
+    acts: Tile[DT, NS_ * TI_ * C_],
+    ret: Tile[DT, NS_ * (TI_ - 1)],
+    vlog: Tile[DT, NS_ * TI_ * BINS_],
+    bins: Tile[DT, BINS_],
+    rscale_buf: Tile[DT, 1],
+    out_d: Tile[DT, 2 * C_],
 ):
     if Int(global_idx.x) == 0:
         comptime TM1 = TI_ - 1
@@ -1317,15 +1318,15 @@ struct DreamerState[
 # ──────────────────────────────────────────────────────────────────────
 
 
-def _zero_k[N_: Int](buf: LayoutTensor[DT, Layout.row_major(N_), MutAnyOrigin]):
+def _zero_k[N_: Int](buf: Tile[DT, N_]):
     var i = Int(global_idx.x)
     if i < N_:
         buf[i] = Scalar[DT](0.0)
 
 
 def _wm_slice_store_k[N_: Int, T_: Int](
-    src: LayoutTensor[DT, Layout.row_major(N_), MutAnyOrigin],
-    dst: LayoutTensor[DT, Layout.row_major(T_ * N_), MutAnyOrigin],
+    src: Tile[DT, N_],
+    dst: Tile[DT, T_ * N_],
     t_arg: Int64,
 ):
     """Store the per-step buffer src[N] into the time-major dst[T,N] at step t."""
@@ -1340,15 +1341,15 @@ def _wm_slice_store_k[N_: Int, T_: Int](
 def _wm_carry_in_k[
     B_: Int, D_: Int, SC_: Int, ACT_: Int, TOK_: Int, T_: Int
 ](
-    cdeter: LayoutTensor[DT, Layout.row_major((T_ + 1) * B_ * D_), MutAnyOrigin],
-    cstoch: LayoutTensor[DT, Layout.row_major((T_ + 1) * B_ * SC_), MutAnyOrigin],
-    mbact: LayoutTensor[DT, Layout.row_major(B_ * T_ * ACT_), MutAnyOrigin],
-    toks: LayoutTensor[DT, Layout.row_major(T_ * B_ * TOK_), MutAnyOrigin],
-    mbfst: LayoutTensor[DT, Layout.row_major(B_ * (T_ + 1)), MutAnyOrigin],
-    cin_d: LayoutTensor[DT, Layout.row_major(B_ * D_), MutAnyOrigin],
-    cin_s: LayoutTensor[DT, Layout.row_major(B_ * SC_), MutAnyOrigin],
-    at: LayoutTensor[DT, Layout.row_major(B_ * ACT_), MutAnyOrigin],
-    tkscr: LayoutTensor[DT, Layout.row_major(B_ * TOK_), MutAnyOrigin],
+    cdeter: Tile[DT, (T_ + 1) * B_ * D_],
+    cstoch: Tile[DT, (T_ + 1) * B_ * SC_],
+    mbact: Tile[DT, B_ * T_ * ACT_],
+    toks: Tile[DT, T_ * B_ * TOK_],
+    mbfst: Tile[DT, B_ * (T_ + 1)],
+    cin_d: Tile[DT, B_ * D_],
+    cin_s: Tile[DT, B_ * SC_],
+    at: Tile[DT, B_ * ACT_],
+    tkscr: Tile[DT, B_ * TOK_],
     t_arg: Int64,
 ):
     """Masked carry/action input + token window for core step t (keep = cut the
@@ -1388,10 +1389,10 @@ def _wm_carry_in_k[
 
 
 def _wm_carry_out_k[B_: Int, D_: Int, SC_: Int, CARRY_: Int, T_: Int](
-    outbuf: LayoutTensor[DT, Layout.row_major(B_ * CARRY_), MutAnyOrigin],
-    cdeter: LayoutTensor[DT, Layout.row_major((T_ + 1) * B_ * D_), MutAnyOrigin],
-    cstoch: LayoutTensor[DT, Layout.row_major((T_ + 1) * B_ * SC_), MutAnyOrigin],
-    klbuf: LayoutTensor[DT, Layout.row_major(T_ * B_ * 2), MutAnyOrigin],
+    outbuf: Tile[DT, B_ * CARRY_],
+    cdeter: Tile[DT, (T_ + 1) * B_ * D_],
+    cstoch: Tile[DT, (T_ + 1) * B_ * SC_],
+    klbuf: Tile[DT, T_ * B_ * 2],
     t_arg: Int64,
 ):
     """Extract next carry (deter/stoch) + the (dyn_kl, rep_kl) losses from the
@@ -1419,16 +1420,16 @@ def _wm_carry_out_k[B_: Int, D_: Int, SC_: Int, CARRY_: Int, T_: Int](
 
 
 def _wm_head_in_k[B_: Int, D_: Int, SC_: Int, OBS_: Int, T_: Int](
-    cdeter: LayoutTensor[DT, Layout.row_major((T_ + 1) * B_ * D_), MutAnyOrigin],
-    cstoch: LayoutTensor[DT, Layout.row_major((T_ + 1) * B_ * SC_), MutAnyOrigin],
-    mbobs: LayoutTensor[DT, Layout.row_major(B_ * (T_ + 1) * OBS_), MutAnyOrigin],
-    mbrew: LayoutTensor[DT, Layout.row_major(B_ * T_), MutAnyOrigin],
-    mbdne: LayoutTensor[DT, Layout.row_major(B_ * T_), MutAnyOrigin],
-    ndn: LayoutTensor[DT, Layout.row_major(B_ * D_), MutAnyOrigin],
-    snn: LayoutTensor[DT, Layout.row_major(B_ * SC_), MutAnyOrigin],
-    rtg: LayoutTensor[DT, Layout.row_major(B_ * OBS_), MutAnyOrigin],
-    rwt: LayoutTensor[DT, Layout.row_major(B_), MutAnyOrigin],
-    cnt: LayoutTensor[DT, Layout.row_major(B_), MutAnyOrigin],
+    cdeter: Tile[DT, (T_ + 1) * B_ * D_],
+    cstoch: Tile[DT, (T_ + 1) * B_ * SC_],
+    mbobs: Tile[DT, B_ * (T_ + 1) * OBS_],
+    mbrew: Tile[DT, B_ * T_],
+    mbdne: Tile[DT, B_ * T_],
+    ndn: Tile[DT, B_ * D_],
+    snn: Tile[DT, B_ * SC_],
+    rtg: Tile[DT, B_ * OBS_],
+    rwt: Tile[DT, B_],
+    cnt: Tile[DT, B_],
     horizon: Scalar[DT],
     t_arg: Int64,
 ):
@@ -1460,8 +1461,8 @@ def _wm_head_in_k[B_: Int, D_: Int, SC_: Int, OBS_: Int, T_: Int](
 
 
 def _wm_enc_in_k[B_: Int, OBS_: Int, T_: Int](
-    mbobs: LayoutTensor[DT, Layout.row_major(B_ * (T_ + 1) * OBS_), MutAnyOrigin],
-    ob: LayoutTensor[DT, Layout.row_major(B_ * OBS_), MutAnyOrigin],
+    mbobs: Tile[DT, B_ * (T_ + 1) * OBS_],
+    ob: Tile[DT, B_ * OBS_],
     t_arg: Int64,
 ):
     """Encoder input window = obs frame t+1 (batch-major). One thread per pixel
@@ -1477,11 +1478,11 @@ def _wm_enc_in_k[B_: Int, OBS_: Int, T_: Int](
 
 
 def _wm_keep_mask_k[B_: Int, D_: Int, SC_: Int, T_: Int](
-    gdt: LayoutTensor[DT, Layout.row_major(B_ * D_), MutAnyOrigin],
-    gst: LayoutTensor[DT, Layout.row_major(B_ * SC_), MutAnyOrigin],
-    mbfst: LayoutTensor[DT, Layout.row_major(B_ * (T_ + 1)), MutAnyOrigin],
-    gcd: LayoutTensor[DT, Layout.row_major(B_ * D_), MutAnyOrigin],
-    gcs: LayoutTensor[DT, Layout.row_major(B_ * SC_), MutAnyOrigin],
+    gdt: Tile[DT, B_ * D_],
+    gst: Tile[DT, B_ * SC_],
+    mbfst: Tile[DT, B_ * (T_ + 1)],
+    gcd: Tile[DT, B_ * D_],
+    gcs: Tile[DT, B_ * SC_],
     t_arg: Int64,
 ):
     """Cut the BPTT carry gradient at an episode boundary: gcd/gcs = keep·core
@@ -2019,8 +2020,8 @@ struct WMStep[
         # ── encode tokens: enc(obs frame t+1) → toks_d[t] (device-resident) ──
         for t in range(Self.T):
             ctx.enqueue_function[_wm_enc_in_k[Self.B, OBSD, Tt]](
-                self.mbobs_d.lt["gpu", Layout.row_major(Self.B * (Tt + 1) * OBSD)](),
-                self.ob.lt["gpu", Layout.row_major(Self.B * OBSD)](),
+                self.mbobs_d.tt["gpu", Self.B * (Tt + 1) * OBSD](),
+                self.ob.tt["gpu", Self.B * OBSD](),
                 Int64(t), grid_dim=nbBO, block_dim=TPB,
             )
             enc.forward[target, Self.B](
@@ -2029,33 +2030,33 @@ struct WMStep[
                 ctx,
             )
             ctx.enqueue_function[_wm_slice_store_k[Self.B * TOK, Tt]](
-                self.tkscr.lt["gpu", Layout.row_major(Self.B * TOK)](),
-                self.toks_d.lt["gpu", Layout.row_major(TKD)](),
+                self.tkscr.tt["gpu", Self.B * TOK](),
+                self.toks_d.tt["gpu", TKD](),
                 Int64(t), grid_dim=nbTOK, block_dim=TPB,
             )
 
         # zero the carry sequence (init carry at index 0 must be 0).
         ctx.enqueue_function[_zero_k[CD]](
-            self.cdeter_d.lt["gpu", Layout.row_major(CD)](),
+            self.cdeter_d.tt["gpu", CD](),
             grid_dim=(CD + TPB - 1) // TPB, block_dim=TPB,
         )
         ctx.enqueue_function[_zero_k[CS]](
-            self.cstoch_d.lt["gpu", Layout.row_major(CS)](),
+            self.cstoch_d.tt["gpu", CS](),
             grid_dim=(CS + TPB - 1) // TPB, block_dim=TPB,
         )
 
         # ── forward scan (no per-step host sync) ──
         for t in range(Self.T):
             ctx.enqueue_function[_wm_carry_in_k[Self.B, D, SCl, ACTD, TOK, Tt]](
-                self.cdeter_d.lt["gpu", Layout.row_major(CD)](),
-                self.cstoch_d.lt["gpu", Layout.row_major(CS)](),
-                self.mbact_d.lt["gpu", Layout.row_major(Self.B * Tt * ACTD)](),
-                self.toks_d.lt["gpu", Layout.row_major(TKD)](),
-                self.mbfst_d.lt["gpu", Layout.row_major(Self.B * (Tt + 1))](),
-                self.cin_d.lt["gpu", Layout.row_major(Self.B * D)](),
-                self.cin_s.lt["gpu", Layout.row_major(Self.B * SCl)](),
-                self.at.lt["gpu", Layout.row_major(Self.B * ACTD)](),
-                self.tkscr.lt["gpu", Layout.row_major(Self.B * TOK)](),
+                self.cdeter_d.tt["gpu", CD](),
+                self.cstoch_d.tt["gpu", CS](),
+                self.mbact_d.tt["gpu", Self.B * Tt * ACTD](),
+                self.toks_d.tt["gpu", TKD](),
+                self.mbfst_d.tt["gpu", Self.B * (Tt + 1)](),
+                self.cin_d.tt["gpu", Self.B * D](),
+                self.cin_s.tt["gpu", Self.B * SCl](),
+                self.at.tt["gpu", Self.B * ACTD](),
+                self.tkscr.tt["gpu", Self.B * TOK](),
                 Int64(t), grid_dim=nbBW, block_dim=TPB,
             )
             core.set_input["deter", Self.B](self.cin_d, ctx)
@@ -2064,23 +2065,23 @@ struct WMStep[
             core.set_input["tokens", Self.B](self.tkscr, ctx)
             core.forward[Self.B, target](self.outbuf, ctx)
             ctx.enqueue_function[_wm_carry_out_k[Self.B, D, SCl, CARRYl, Tt]](
-                self.outbuf.lt["gpu", Layout.row_major(Self.B * CARRYl)](),
-                self.cdeter_d.lt["gpu", Layout.row_major(CD)](),
-                self.cstoch_d.lt["gpu", Layout.row_major(CS)](),
-                self.klbuf_d.lt["gpu", Layout.row_major(Tt * Self.B * 2)](),
+                self.outbuf.tt["gpu", Self.B * CARRYl](),
+                self.cdeter_d.tt["gpu", CD](),
+                self.cstoch_d.tt["gpu", CS](),
+                self.klbuf_d.tt["gpu", Tt * Self.B * 2](),
                 Int64(t), grid_dim=nbBW, block_dim=TPB,
             )
             ctx.enqueue_function[_wm_head_in_k[Self.B, D, SCl, OBSD, Tt]](
-                self.cdeter_d.lt["gpu", Layout.row_major(CD)](),
-                self.cstoch_d.lt["gpu", Layout.row_major(CS)](),
-                self.mbobs_d.lt["gpu", Layout.row_major(Self.B * (Tt + 1) * OBSD)](),
-                self.mbrew_d.lt["gpu", Layout.row_major(Self.B * Tt)](),
-                self.mbdne_d.lt["gpu", Layout.row_major(Self.B * Tt)](),
-                self.ndn.lt["gpu", Layout.row_major(Self.B * D)](),
-                self.snn.lt["gpu", Layout.row_major(Self.B * SCl)](),
-                self.rtg.lt["gpu", Layout.row_major(Self.B * OBSD)](),
-                self.rwt.lt["gpu", Layout.row_major(Self.B)](),
-                self.cnt.lt["gpu", Layout.row_major(Self.B)](),
+                self.cdeter_d.tt["gpu", CD](),
+                self.cstoch_d.tt["gpu", CS](),
+                self.mbobs_d.tt["gpu", Self.B * (Tt + 1) * OBSD](),
+                self.mbrew_d.tt["gpu", Self.B * Tt](),
+                self.mbdne_d.tt["gpu", Self.B * Tt](),
+                self.ndn.tt["gpu", Self.B * D](),
+                self.snn.tt["gpu", Self.B * SCl](),
+                self.rtg.tt["gpu", Self.B * OBSD](),
+                self.rwt.tt["gpu", Self.B](),
+                self.cnt.tt["gpu", Self.B](),
                 self.horizon, Int64(t), grid_dim=nbBO, block_dim=TPB,
             )
             dec.set_input["stoch_new", Self.B](self.snn, ctx)
@@ -2088,8 +2089,8 @@ struct WMStep[
             dec.set_input["rtgt", Self.B](self.rtg, ctx)
             dec.forward[Self.B, target](self.dl, ctx)
             ctx.enqueue_function[_wm_slice_store_k[Self.B, Tt]](
-                self.dl.lt["gpu", Layout.row_major(Self.B)](),
-                self.obsl_d.lt["gpu", Layout.row_major(Tt * Self.B)](),
+                self.dl.tt["gpu", Self.B](),
+                self.obsl_d.tt["gpu", Tt * Self.B](),
                 Int64(t), grid_dim=nbB, block_dim=TPB,
             )
             rew.set_input["nd", Self.B](self.ndn, ctx)
@@ -2097,8 +2098,8 @@ struct WMStep[
             rew.set_input["rtgt", Self.B](self.rwt, ctx)
             rew.forward[Self.B, target](self.dl, ctx)
             ctx.enqueue_function[_wm_slice_store_k[Self.B, Tt]](
-                self.dl.lt["gpu", Layout.row_major(Self.B)](),
-                self.rewl_d.lt["gpu", Layout.row_major(Tt * Self.B)](),
+                self.dl.tt["gpu", Self.B](),
+                self.rewl_d.tt["gpu", Tt * Self.B](),
                 Int64(t), grid_dim=nbB, block_dim=TPB,
             )
             con.set_input["nd", Self.B](self.ndn, ctx)
@@ -2106,8 +2107,8 @@ struct WMStep[
             con.set_input["ctgt", Self.B](self.cnt, ctx)
             con.forward[Self.B, target](self.dl, ctx)
             ctx.enqueue_function[_wm_slice_store_k[Self.B, Tt]](
-                self.dl.lt["gpu", Layout.row_major(Self.B)](),
-                self.conl_d.lt["gpu", Layout.row_major(Tt * Self.B)](),
+                self.dl.tt["gpu", Self.B](),
+                self.conl_d.tt["gpu", Tt * Self.B](),
                 Int64(t), grid_dim=nbB, block_dim=TPB,
             )
 
@@ -2119,11 +2120,11 @@ struct WMStep[
         rew.zero_grad[target](ctx)
         con.zero_grad[target](ctx)
         ctx.enqueue_function[_zero_k[Self.B * D]](
-            self.gcd.lt["gpu", Layout.row_major(Self.B * D)](),
+            self.gcd.tt["gpu", Self.B * D](),
             grid_dim=(Self.B * D + TPB - 1) // TPB, block_dim=TPB,
         )
         ctx.enqueue_function[_zero_k[Self.B * SCl]](
-            self.gcs.lt["gpu", Layout.row_major(Self.B * SCl)](),
+            self.gcs.tt["gpu", Self.B * SCl](),
             grid_dim=(Self.B * SCl + TPB - 1) // TPB, block_dim=TPB,
         )
         # ones1 (constant loss cotangent) is uploaded ONCE in make — no per-step
@@ -2133,28 +2134,28 @@ struct WMStep[
             var t = Self.T - 1 - rev
             # masked carry/action/tokens input + head inputs/targets (device).
             ctx.enqueue_function[_wm_carry_in_k[Self.B, D, SCl, ACTD, TOK, Tt]](
-                self.cdeter_d.lt["gpu", Layout.row_major(CD)](),
-                self.cstoch_d.lt["gpu", Layout.row_major(CS)](),
-                self.mbact_d.lt["gpu", Layout.row_major(Self.B * Tt * ACTD)](),
-                self.toks_d.lt["gpu", Layout.row_major(TKD)](),
-                self.mbfst_d.lt["gpu", Layout.row_major(Self.B * (Tt + 1))](),
-                self.cin_d.lt["gpu", Layout.row_major(Self.B * D)](),
-                self.cin_s.lt["gpu", Layout.row_major(Self.B * SCl)](),
-                self.at.lt["gpu", Layout.row_major(Self.B * ACTD)](),
-                self.tkscr.lt["gpu", Layout.row_major(Self.B * TOK)](),
+                self.cdeter_d.tt["gpu", CD](),
+                self.cstoch_d.tt["gpu", CS](),
+                self.mbact_d.tt["gpu", Self.B * Tt * ACTD](),
+                self.toks_d.tt["gpu", TKD](),
+                self.mbfst_d.tt["gpu", Self.B * (Tt + 1)](),
+                self.cin_d.tt["gpu", Self.B * D](),
+                self.cin_s.tt["gpu", Self.B * SCl](),
+                self.at.tt["gpu", Self.B * ACTD](),
+                self.tkscr.tt["gpu", Self.B * TOK](),
                 Int64(t), grid_dim=nbBW, block_dim=TPB,
             )
             ctx.enqueue_function[_wm_head_in_k[Self.B, D, SCl, OBSD, Tt]](
-                self.cdeter_d.lt["gpu", Layout.row_major(CD)](),
-                self.cstoch_d.lt["gpu", Layout.row_major(CS)](),
-                self.mbobs_d.lt["gpu", Layout.row_major(Self.B * (Tt + 1) * OBSD)](),
-                self.mbrew_d.lt["gpu", Layout.row_major(Self.B * Tt)](),
-                self.mbdne_d.lt["gpu", Layout.row_major(Self.B * Tt)](),
-                self.ndn.lt["gpu", Layout.row_major(Self.B * D)](),
-                self.snn.lt["gpu", Layout.row_major(Self.B * SCl)](),
-                self.rtg.lt["gpu", Layout.row_major(Self.B * OBSD)](),
-                self.rwt.lt["gpu", Layout.row_major(Self.B)](),
-                self.cnt.lt["gpu", Layout.row_major(Self.B)](),
+                self.cdeter_d.tt["gpu", CD](),
+                self.cstoch_d.tt["gpu", CS](),
+                self.mbobs_d.tt["gpu", Self.B * (Tt + 1) * OBSD](),
+                self.mbrew_d.tt["gpu", Self.B * Tt](),
+                self.mbdne_d.tt["gpu", Self.B * Tt](),
+                self.ndn.tt["gpu", Self.B * D](),
+                self.snn.tt["gpu", Self.B * SCl](),
+                self.rtg.tt["gpu", Self.B * OBSD](),
+                self.rwt.tt["gpu", Self.B](),
+                self.cnt.tt["gpu", Self.B](),
                 self.horizon, Int64(t), grid_dim=nbBO, block_dim=TPB,
             )
             # dec
@@ -2178,15 +2179,15 @@ struct WMStep[
             # assemble the core vjp seed on device via _seed_asm_k (reads the
             # head grad_inputs + carry-grad accumulators gcd/gcs, all device).
             ctx.enqueue_function[_seed_asm_k[Self.B, CARRYl, D, SCl]](
-                self.seed.lt["gpu", Layout.row_major(Self.B * CARRYl)](),
-                self.gcd.lt["gpu", Layout.row_major(Self.B * D)](),
-                self.gcs.lt["gpu", Layout.row_major(Self.B * SCl)](),
-                dec.grad_input["nd"]().lt["gpu", Layout.row_major(Self.B * D)](),
-                rew.grad_input["nd"]().lt["gpu", Layout.row_major(Self.B * D)](),
-                con.grad_input["nd"]().lt["gpu", Layout.row_major(Self.B * D)](),
-                dec.grad_input["stoch_new"]().lt["gpu", Layout.row_major(Self.B * SCl)](),
-                rew.grad_input["stoch_new"]().lt["gpu", Layout.row_major(Self.B * SCl)](),
-                con.grad_input["stoch_new"]().lt["gpu", Layout.row_major(Self.B * SCl)](),
+                self.seed.tt["gpu", Self.B * CARRYl](),
+                self.gcd.tt["gpu", Self.B * D](),
+                self.gcs.tt["gpu", Self.B * SCl](),
+                dec.grad_input["nd"]().tt["gpu", Self.B * D](),
+                rew.grad_input["nd"]().tt["gpu", Self.B * D](),
+                con.grad_input["nd"]().tt["gpu", Self.B * D](),
+                dec.grad_input["stoch_new"]().tt["gpu", Self.B * SCl](),
+                rew.grad_input["stoch_new"]().tt["gpu", Self.B * SCl](),
+                con.grad_input["stoch_new"]().tt["gpu", Self.B * SCl](),
                 DYN, REP, grid_dim=nbBW, block_dim=TPB,
             )
             core.set_input["deter", Self.B](self.cin_d, ctx)
@@ -2198,19 +2199,19 @@ struct WMStep[
             # Finding 3: cut the BPTT carry gradient at an episode boundary —
             # row-scale the core grad_inputs by the keep mask into gcd/gcs (device).
             ctx.enqueue_function[_wm_keep_mask_k[Self.B, D, SCl, Tt]](
-                core.grad_input["deter"]().lt["gpu", Layout.row_major(Self.B * D)](),
-                core.grad_input["stoch"]().lt["gpu", Layout.row_major(Self.B * SCl)](),
-                self.mbfst_d.lt["gpu", Layout.row_major(Self.B * (Tt + 1))](),
-                self.gcd.lt["gpu", Layout.row_major(Self.B * D)](),
-                self.gcs.lt["gpu", Layout.row_major(Self.B * SCl)](),
+                core.grad_input["deter"]().tt["gpu", Self.B * D](),
+                core.grad_input["stoch"]().tt["gpu", Self.B * SCl](),
+                self.mbfst_d.tt["gpu", Self.B * (Tt + 1)](),
+                self.gcd.tt["gpu", Self.B * D](),
+                self.gcs.tt["gpu", Self.B * SCl](),
                 Int64(t), grid_dim=nbBW, block_dim=TPB,
             )
             # encoder backward — re-encode obs frame t+1, vjp the token grad.
             ref gtok = core.grad_input["tokens"]()
             ctx.enqueue_copy(self.gtok.dev.value(), gtok.dev.value())
             ctx.enqueue_function[_wm_enc_in_k[Self.B, OBSD, Tt]](
-                self.mbobs_d.lt["gpu", Layout.row_major(Self.B * (Tt + 1) * OBSD)](),
-                self.ob.lt["gpu", Layout.row_major(Self.B * OBSD)](),
+                self.mbobs_d.tt["gpu", Self.B * (Tt + 1) * OBSD](),
+                self.ob.tt["gpu", Self.B * OBSD](),
                 Int64(t), grid_dim=nbBO, block_dim=TPB,
             )
             enc.forward[target, Self.B](
@@ -2555,11 +2556,9 @@ struct ACStep[
         each step so successive steps draw disjoint streams."""
         comptime NSC = Self.T_IMAG * Self.T * Self.B * Self.ACT
         comptime nbN = (NSC + TPB - 1) // TPB
-        var off_lt = LayoutTensor[DType.uint64, Layout.row_major(1)](
-            self.noise_off_d.value()
-        )
+        var off_lt = tile[1](self.noise_off_d.value())
         ctx.enqueue_function[_noise_philox_k[NSC]](
-            self.noise_d.lt["gpu", Layout.row_major(NSC)](),
+            self.noise_d.tt["gpu", NSC](),
             self.noise_seed, off_lt,
             grid_dim=nbN, block_dim=TPB,
         )
@@ -2981,35 +2980,35 @@ struct ACStep[
         # ── imagination rollout (fully on device) ──
         for t in range(TI):
             ctx.enqueue_function[_feat_concat_k[NS, D, SCl]](
-                self.cd.lt["gpu", Layout.row_major(NS * D)](),
-                self.cs.lt["gpu", Layout.row_major(NS * SCl)](),
-                self.fb.lt["gpu", Layout.row_major(NS * FEATl)](),
+                self.cd.tt["gpu", NS * D](),
+                self.cs.tt["gpu", NS * SCl](),
+                self.fb.tt["gpu", NS * FEATl](),
                 grid_dim=nbNF, block_dim=TPB,
             )
             ctx.enqueue_function[_hist_store_k[FEATl, TI, NS]](
-                self.fb.lt["gpu", Layout.row_major(NS * FEATl)](),
-                self.feats_d.lt["gpu", Layout.row_major(NS * TI * FEATl)](),
+                self.fb.tt["gpu", NS * FEATl](),
+                self.feats_d.tt["gpu", NS * TI * FEATl](),
                 Int64(t), grid_dim=nbNF, block_dim=TPB,
             )
             policy.forward[target, NS](TensorRefs[1](self.fb), self.pb, ctx)
             ctx.enqueue_function[_cat_sample_hist_k[ACTD, TI, NS]](
-                self.pb.lt["gpu", Layout.row_major(NS * ACTD)](),
-                self.noise_d.lt["gpu", Layout.row_major(TI * NS * ACTD)](),
-                self.at.lt["gpu", Layout.row_major(NS * ACTD)](),
-                self.pmean_d.lt["gpu", Layout.row_major(NS * TI * ACTD)](),
-                self.acts_d.lt["gpu", Layout.row_major(NS * TI * ACTD)](),
+                self.pb.tt["gpu", NS * ACTD](),
+                self.noise_d.tt["gpu", TI * NS * ACTD](),
+                self.at.tt["gpu", NS * ACTD](),
+                self.pmean_d.tt["gpu", NS * TI * ACTD](),
+                self.acts_d.tt["gpu", NS * TI * ACTD](),
                 UNIMIX, Int64(t), grid_dim=nbB, block_dim=TPB,
             )
             value.forward[target, NS](TensorRefs[1](self.fb), self.vb, ctx)
             slowvalue.forward[target, NS](TensorRefs[1](self.fb), self.svb, ctx)
             ctx.enqueue_function[_hist_store_k[BINSl, TI, NS]](
-                self.vb.lt["gpu", Layout.row_major(NS * BINSl)](),
-                self.vlog_d.lt["gpu", Layout.row_major(NS * TI * BINSl)](),
+                self.vb.tt["gpu", NS * BINSl](),
+                self.vlog_d.tt["gpu", NS * TI * BINSl](),
                 Int64(t), grid_dim=nbNF, block_dim=TPB,
             )
             ctx.enqueue_function[_hist_store_k[BINSl, TI, NS]](
-                self.svb.lt["gpu", Layout.row_major(NS * BINSl)](),
-                self.svlog_d.lt["gpu", Layout.row_major(NS * TI * BINSl)](),
+                self.svb.tt["gpu", NS * BINSl](),
+                self.svlog_d.tt["gpu", NS * TI * BINSl](),
                 Int64(t), grid_dim=nbNF, block_dim=TPB,
             )
             rew.set_input["nd", NS](self.cd, ctx)
@@ -3023,11 +3022,11 @@ struct ACStep[
             con.forward[NS, target](self.dummy1, ctx)
             ref con_logit = con.node_output["con"]()
             ctx.enqueue_function[_rewconv_hist_k[BINSl, TI, NS]](
-                rew_logits.lt["gpu", Layout.row_major(NS * BINSl)](),
-                con_logit.lt["gpu", Layout.row_major(NS)](),
-                self.bins_d.lt["gpu", Layout.row_major(BINSl)](),
-                self.rewv_d.lt["gpu", Layout.row_major(NS * TI)](),
-                self.conv_d.lt["gpu", Layout.row_major(NS * TI)](),
+                rew_logits.tt["gpu", NS * BINSl](),
+                con_logit.tt["gpu", NS](),
+                self.bins_d.tt["gpu", BINSl](),
+                self.rewv_d.tt["gpu", NS * TI](),
+                self.conv_d.tt["gpu", NS * TI](),
                 Int64(t), grid_dim=nbBS, block_dim=BLKS,
             )
             imagine.set_input["deter", NS](self.cd, ctx)
@@ -3041,12 +3040,12 @@ struct ACStep[
 
         # ── λ-return on device → ret_d ──
         ctx.enqueue_function[_imag_ret_k[NS, TI, BINSl]](
-            self.vlog_d.lt["gpu", Layout.row_major(NS * TI * BINSl)](),
-            self.svlog_d.lt["gpu", Layout.row_major(NS * TI * BINSl)](),
-            self.rewv_d.lt["gpu", Layout.row_major(NS * TI)](),
-            self.conv_d.lt["gpu", Layout.row_major(NS * TI)](),
-            self.bins_d.lt["gpu", Layout.row_major(BINSl)](),
-            self.ret_d.lt["gpu", Layout.row_major(NS * TM1)](),
+            self.vlog_d.tt["gpu", NS * TI * BINSl](),
+            self.svlog_d.tt["gpu", NS * TI * BINSl](),
+            self.rewv_d.tt["gpu", NS * TI](),
+            self.conv_d.tt["gpu", NS * TI](),
+            self.bins_d.tt["gpu", BINSl](),
+            self.ret_d.tt["gpu", NS * TM1](),
             self.lam, Int32(1) if self.slowtar else Int32(0),
             grid_dim=nbBS, block_dim=BLKS,
         )
@@ -3061,14 +3060,14 @@ struct ACStep[
         var lo_floor = Int(idx_lo)
         var hi_floor = Int(idx_hi)
         ctx.enqueue_function[_ret_perc_neigh_k[NRET]](
-            self.ret_d.lt["gpu", Layout.row_major(NRET)](),
-            self.neigh_d.lt["gpu", Layout.row_major(4)](),
+            self.ret_d.tt["gpu", NRET](),
+            self.neigh_d.tt["gpu", 4](),
             Int64(lo_floor), Int64(hi_floor), grid_dim=nbRET, block_dim=TPB,
         )
         ctx.enqueue_function[_ret_perc_ema_k](
-            self.neigh_d.lt["gpu", Layout.row_major(4)](),
-            self.retstate_d.lt["gpu", Layout.row_major(2)](),
-            self.rscale_d.lt["gpu", Layout.row_major(1)](),
+            self.neigh_d.tt["gpu", 4](),
+            self.retstate_d.tt["gpu", 2](),
+            self.rscale_d.tt["gpu", 1](),
             idx_lo - Scalar[DT](lo_floor), idx_hi - Scalar[DT](hi_floor),
             retnorm.rate, retnorm.limit, grid_dim=1, block_dim=1,
         )
@@ -3076,18 +3075,18 @@ struct ACStep[
         # ── imag-loss backward (grads + per-(b,t) losses) on device ──
         var inv_im = Scalar[DT](1.0) / Scalar[DT](NS * TM1)
         ctx.enqueue_function[_imag_bwd_k[NS, TI, BINSl, ACTD]](
-            self.vlog_d.lt["gpu", Layout.row_major(NS * TI * BINSl)](),
-            self.svlog_d.lt["gpu", Layout.row_major(NS * TI * BINSl)](),
-            self.pmean_d.lt["gpu", Layout.row_major(NS * TI * ACTD)](),
-            self.acts_d.lt["gpu", Layout.row_major(NS * TI * ACTD)](),
-            self.conv_d.lt["gpu", Layout.row_major(NS * TI)](),
-            self.ret_d.lt["gpu", Layout.row_major(NS * TM1)](),
-            self.bins_d.lt["gpu", Layout.row_major(BINSl)](),
-            self.gvlog_d.lt["gpu", Layout.row_major(NS * TI * BINSl)](),
-            self.gpmean_d.lt["gpu", Layout.row_major(NS * TI * ACTD)](),
-            self.polloss_d.lt["gpu", Layout.row_major(NS * TM1)](),
-            self.valloss_d.lt["gpu", Layout.row_major(NS * TM1)](),
-            self.rscale_d.lt["gpu", Layout.row_major(1)](),
+            self.vlog_d.tt["gpu", NS * TI * BINSl](),
+            self.svlog_d.tt["gpu", NS * TI * BINSl](),
+            self.pmean_d.tt["gpu", NS * TI * ACTD](),
+            self.acts_d.tt["gpu", NS * TI * ACTD](),
+            self.conv_d.tt["gpu", NS * TI](),
+            self.ret_d.tt["gpu", NS * TM1](),
+            self.bins_d.tt["gpu", BINSl](),
+            self.gvlog_d.tt["gpu", NS * TI * BINSl](),
+            self.gpmean_d.tt["gpu", NS * TI * ACTD](),
+            self.polloss_d.tt["gpu", NS * TM1](),
+            self.valloss_d.tt["gpu", NS * TM1](),
+            self.rscale_d.tt["gpu", 1](),
             self.lam, self.actent, self.slowreg, inv_im, UNIMIX,
             grid_dim=nbBS, block_dim=BLKS,
         )
@@ -3097,14 +3096,14 @@ struct ACStep[
         opol.zero_grad[target, M=Self.PolT](policy, ctx)
         for t in range(TI):
             ctx.enqueue_function[_hist_load_k[FEATl, TI, NS]](
-                self.feats_d.lt["gpu", Layout.row_major(NS * TI * FEATl)](),
-                self.ftt.lt["gpu", Layout.row_major(NS * FEATl)](),
+                self.feats_d.tt["gpu", NS * TI * FEATl](),
+                self.ftt.tt["gpu", NS * FEATl](),
                 Int64(t), grid_dim=nbNF, block_dim=TPB,
             )
             value.forward[target, NS](TensorRefs[1](self.ftt), self.vscr, ctx)
             ctx.enqueue_function[_hist_load_k[BINSl, TI, NS]](
-                self.gvlog_d.lt["gpu", Layout.row_major(NS * TI * BINSl)](),
-                self.gvt.lt["gpu", Layout.row_major(NS * BINSl)](),
+                self.gvlog_d.tt["gpu", NS * TI * BINSl](),
+                self.gvt.tt["gpu", NS * BINSl](),
                 Int64(t), grid_dim=nbNF, block_dim=TPB,
             )
             value.vjp[target, NS](
@@ -3112,8 +3111,8 @@ struct ACStep[
             )
             policy.forward[target, NS](TensorRefs[1](self.ftt), self.pscr, ctx)
             ctx.enqueue_function[_hist_load_k[ACTD, TI, NS]](
-                self.gpmean_d.lt["gpu", Layout.row_major(NS * TI * ACTD)](),
-                self.polg.lt["gpu", Layout.row_major(NS * ACTD)](),
+                self.gpmean_d.tt["gpu", NS * TI * ACTD](),
+                self.polg.tt["gpu", NS * ACTD](),
                 Int64(t), grid_dim=nbNF, block_dim=TPB,
             )
             policy.vjp[target, NS](
@@ -3122,23 +3121,23 @@ struct ACStep[
 
         # ── repval: ground value on REAL replay transitions (device) ──
         ctx.enqueue_function[_repval_setup_k[NS, TI, FEATl, Self.B, Self.T]](
-            self.ret_d.lt["gpu", Layout.row_major(NS * TM1)](),
-            self.feats_d.lt["gpu", Layout.row_major(NS * TI * FEATl)](),
-            self.boot_d.lt["gpu", Layout.row_major(BT)](),
-            self.feat_bt.lt["gpu", Layout.row_major(BT * FEATl)](),
+            self.ret_d.tt["gpu", NS * TM1](),
+            self.feats_d.tt["gpu", NS * TI * FEATl](),
+            self.boot_d.tt["gpu", BT](),
+            self.feat_bt.tt["gpu", BT * FEATl](),
             grid_dim=nbBT, block_dim=TPB,
         )
         value.forward[target, BT](TensorRefs[1](self.feat_bt), self.vlr, ctx)
         slowvalue.forward[target, BT](TensorRefs[1](self.feat_bt), self.svlr, ctx)
         var inv_rep = self.repval_scale / Scalar[DT](Self.B * TM1R)
         ctx.enqueue_function[_repl_bwd_k[Self.B, Self.T, BINSl]](
-            self.mbdne_d.lt["gpu", Layout.row_major(BT)](),
-            self.mbrew_d.lt["gpu", Layout.row_major(BT)](),
-            self.boot_d.lt["gpu", Layout.row_major(BT)](),
-            self.svlr.lt["gpu", Layout.row_major(BT * BINSl)](),
-            self.bins_d.lt["gpu", Layout.row_major(BINSl)](),
-            self.g_vlr.lt["gpu", Layout.row_major(BT * BINSl)](),
-            self.vlr.lt["gpu", Layout.row_major(BT * BINSl)](),
+            self.mbdne_d.tt["gpu", BT](),
+            self.mbrew_d.tt["gpu", BT](),
+            self.boot_d.tt["gpu", BT](),
+            self.svlr.tt["gpu", BT * BINSl](),
+            self.bins_d.tt["gpu", BINSl](),
+            self.g_vlr.tt["gpu", BT * BINSl](),
+            self.vlr.tt["gpu", BT * BINSl](),
             self.horizon, self.lam, self.slowreg, inv_rep,
             grid_dim=nbB1, block_dim=TPB,
         )
@@ -3170,61 +3169,61 @@ struct ACStep[
             comptime NFT = NS * TI * FEATl
             comptime r1 = 1  # single-block reductions
             ctx.enqueue_function[_diag_sum_k[NTM]](
-                self.polloss_d.lt["gpu", Layout.row_major(NTM)](),
-                self.diag_d.lt["gpu", Layout.row_major(DIAG_N)](),
+                self.polloss_d.tt["gpu", NTM](),
+                self.diag_d.tt["gpu", DIAG_N](),
                 Int64(0), grid_dim=r1, block_dim=TPB_REDUCE,
             )
             ctx.enqueue_function[_diag_sum_k[NTM]](
-                self.valloss_d.lt["gpu", Layout.row_major(NTM)](),
-                self.diag_d.lt["gpu", Layout.row_major(DIAG_N)](),
+                self.valloss_d.tt["gpu", NTM](),
+                self.diag_d.tt["gpu", DIAG_N](),
                 Int64(1), grid_dim=r1, block_dim=TPB_REDUCE,
             )
             ctx.enqueue_function[_diag_sum_k[NTI]](
-                self.rewv_d.lt["gpu", Layout.row_major(NTI)](),
-                self.diag_d.lt["gpu", Layout.row_major(DIAG_N)](),
+                self.rewv_d.tt["gpu", NTI](),
+                self.diag_d.tt["gpu", DIAG_N](),
                 Int64(2), grid_dim=r1, block_dim=TPB_REDUCE,
             )
             ctx.enqueue_function[_diag_sum_k[NTI]](
-                self.conv_d.lt["gpu", Layout.row_major(NTI)](),
-                self.diag_d.lt["gpu", Layout.row_major(DIAG_N)](),
+                self.conv_d.tt["gpu", NTI](),
+                self.diag_d.tt["gpu", DIAG_N](),
                 Int64(3), grid_dim=r1, block_dim=TPB_REDUCE,
             )
             ctx.enqueue_function[_diag_min_k[NTI]](
-                self.conv_d.lt["gpu", Layout.row_major(NTI)](),
-                self.diag_d.lt["gpu", Layout.row_major(DIAG_N)](),
+                self.conv_d.tt["gpu", NTI](),
+                self.diag_d.tt["gpu", DIAG_N](),
                 Int64(4), grid_dim=r1, block_dim=TPB_REDUCE,
             )
             ctx.enqueue_function[_diag_sum_sq_k[NTM]](
-                self.ret_d.lt["gpu", Layout.row_major(NTM)](),
-                self.diag_d.lt["gpu", Layout.row_major(DIAG_N)](),
+                self.ret_d.tt["gpu", NTM](),
+                self.diag_d.tt["gpu", DIAG_N](),
                 Int64(5), Int64(6), grid_dim=r1, block_dim=TPB_REDUCE,
             )
             ctx.enqueue_function[_diag_abs_sum_k[NPM]](
-                self.pmean_d.lt["gpu", Layout.row_major(NPM)](),
-                self.diag_d.lt["gpu", Layout.row_major(DIAG_N)](),
+                self.pmean_d.tt["gpu", NPM](),
+                self.diag_d.tt["gpu", DIAG_N](),
                 Int64(7), grid_dim=r1, block_dim=TPB_REDUCE,
             )
             ctx.enqueue_function[
                 _diag_twohot_sum_sq_k[NTI, BINSl, NS * TI * BINSl, BINSl]
             ](
-                self.vlog_d.lt["gpu", Layout.row_major(NS * TI * BINSl)](),
-                self.bins_d.lt["gpu", Layout.row_major(BINSl)](),
-                self.diag_d.lt["gpu", Layout.row_major(DIAG_N)](),
+                self.vlog_d.tt["gpu", NS * TI * BINSl](),
+                self.bins_d.tt["gpu", BINSl](),
+                self.diag_d.tt["gpu", DIAG_N](),
                 Int64(8), Int64(9), grid_dim=r1, block_dim=TPB_REDUCE,
             )
             ctx.enqueue_function[_diag_sum_sq_k[NFT]](
-                self.feats_d.lt["gpu", Layout.row_major(NFT)](),
-                self.diag_d.lt["gpu", Layout.row_major(DIAG_N)](),
+                self.feats_d.tt["gpu", NFT](),
+                self.diag_d.tt["gpu", DIAG_N](),
                 Int64(10), Int64(11), grid_dim=r1, block_dim=TPB_REDUCE,
             )
             # per-action mean advantage (collapse-driver probe; serial, diag-only)
             ctx.enqueue_function[_diag_adv_act_k[NS, TI, BINSl, ACTD]](
-                self.acts_d.lt["gpu", Layout.row_major(NS * TI * ACTD)](),
-                self.ret_d.lt["gpu", Layout.row_major(NS * TM1)](),
-                self.vlog_d.lt["gpu", Layout.row_major(NS * TI * BINSl)](),
-                self.bins_d.lt["gpu", Layout.row_major(BINSl)](),
-                self.rscale_d.lt["gpu", Layout.row_major(1)](),
-                self.adv_diag_d.lt["gpu", Layout.row_major(2 * ACTD)](),
+                self.acts_d.tt["gpu", NS * TI * ACTD](),
+                self.ret_d.tt["gpu", NS * TM1](),
+                self.vlog_d.tt["gpu", NS * TI * BINSl](),
+                self.bins_d.tt["gpu", BINSl](),
+                self.rscale_d.tt["gpu", 1](),
+                self.adv_diag_d.tt["gpu", 2 * ACTD](),
                 grid_dim=1, block_dim=1,
             )
             self.diag_d.download(ctx)
@@ -3330,36 +3329,36 @@ struct ACStep[
         # ── imagination rollout (fully on device) ──
         for t in range(TI):
             ctx.enqueue_function[_feat_concat_k[NS, D, SCl]](
-                self.cd.lt["gpu", Layout.row_major(NS * D)](),
-                self.cs.lt["gpu", Layout.row_major(NS * SCl)](),
-                self.fb.lt["gpu", Layout.row_major(NS * FEATl)](),
+                self.cd.tt["gpu", NS * D](),
+                self.cs.tt["gpu", NS * SCl](),
+                self.fb.tt["gpu", NS * FEATl](),
                 grid_dim=nbNF, block_dim=TPB,
             )
             ctx.enqueue_function[_hist_store_k[FEATl, TI, NS]](
-                self.fb.lt["gpu", Layout.row_major(NS * FEATl)](),
-                self.feats_d.lt["gpu", Layout.row_major(NS * TI * FEATl)](),
+                self.fb.tt["gpu", NS * FEATl](),
+                self.feats_d.tt["gpu", NS * TI * FEATl](),
                 Int64(t), grid_dim=nbNF, block_dim=TPB,
             )
             policy.forward[target, NS](TensorRefs[1](self.fb), self.pb, ctx)
             ctx.enqueue_function[_gaussian_sample_hist_k[ACTD, TI, NS]](
-                self.pb.lt["gpu", Layout.row_major(NS * 2 * ACTD)](),
-                self.noise_d.lt["gpu", Layout.row_major(TI * NS * ACTD)](),
-                self.at.lt["gpu", Layout.row_major(NS * ACTD)](),
-                self.pmean_d.lt["gpu", Layout.row_major(NS * TI * ACTD)](),
-                self.pstd_d.lt["gpu", Layout.row_major(NS * TI * ACTD)](),
-                self.acts_d.lt["gpu", Layout.row_major(NS * TI * ACTD)](),
+                self.pb.tt["gpu", NS * 2 * ACTD](),
+                self.noise_d.tt["gpu", TI * NS * ACTD](),
+                self.at.tt["gpu", NS * ACTD](),
+                self.pmean_d.tt["gpu", NS * TI * ACTD](),
+                self.pstd_d.tt["gpu", NS * TI * ACTD](),
+                self.acts_d.tt["gpu", NS * TI * ACTD](),
                 MINSTD, MAXSTD, Int64(t), grid_dim=nbB, block_dim=TPB,
             )
             value.forward[target, NS](TensorRefs[1](self.fb), self.vb, ctx)
             slowvalue.forward[target, NS](TensorRefs[1](self.fb), self.svb, ctx)
             ctx.enqueue_function[_hist_store_k[BINSl, TI, NS]](
-                self.vb.lt["gpu", Layout.row_major(NS * BINSl)](),
-                self.vlog_d.lt["gpu", Layout.row_major(NS * TI * BINSl)](),
+                self.vb.tt["gpu", NS * BINSl](),
+                self.vlog_d.tt["gpu", NS * TI * BINSl](),
                 Int64(t), grid_dim=nbNF, block_dim=TPB,
             )
             ctx.enqueue_function[_hist_store_k[BINSl, TI, NS]](
-                self.svb.lt["gpu", Layout.row_major(NS * BINSl)](),
-                self.svlog_d.lt["gpu", Layout.row_major(NS * TI * BINSl)](),
+                self.svb.tt["gpu", NS * BINSl](),
+                self.svlog_d.tt["gpu", NS * TI * BINSl](),
                 Int64(t), grid_dim=nbNF, block_dim=TPB,
             )
             rew.set_input["nd", NS](self.cd, ctx)
@@ -3373,11 +3372,11 @@ struct ACStep[
             con.forward[NS, target](self.dummy1, ctx)
             ref con_logit = con.node_output["con"]()
             ctx.enqueue_function[_rewconv_hist_k[BINSl, TI, NS]](
-                rew_logits.lt["gpu", Layout.row_major(NS * BINSl)](),
-                con_logit.lt["gpu", Layout.row_major(NS)](),
-                self.bins_d.lt["gpu", Layout.row_major(BINSl)](),
-                self.rewv_d.lt["gpu", Layout.row_major(NS * TI)](),
-                self.conv_d.lt["gpu", Layout.row_major(NS * TI)](),
+                rew_logits.tt["gpu", NS * BINSl](),
+                con_logit.tt["gpu", NS](),
+                self.bins_d.tt["gpu", BINSl](),
+                self.rewv_d.tt["gpu", NS * TI](),
+                self.conv_d.tt["gpu", NS * TI](),
                 Int64(t), grid_dim=nbBS, block_dim=BLKS,
             )
             imagine.set_input["deter", NS](self.cd, ctx)
@@ -3391,12 +3390,12 @@ struct ACStep[
 
         # ── λ-return on device → ret_d ──
         ctx.enqueue_function[_imag_ret_k[NS, TI, BINSl]](
-            self.vlog_d.lt["gpu", Layout.row_major(NS * TI * BINSl)](),
-            self.svlog_d.lt["gpu", Layout.row_major(NS * TI * BINSl)](),
-            self.rewv_d.lt["gpu", Layout.row_major(NS * TI)](),
-            self.conv_d.lt["gpu", Layout.row_major(NS * TI)](),
-            self.bins_d.lt["gpu", Layout.row_major(BINSl)](),
-            self.ret_d.lt["gpu", Layout.row_major(NS * TM1)](),
+            self.vlog_d.tt["gpu", NS * TI * BINSl](),
+            self.svlog_d.tt["gpu", NS * TI * BINSl](),
+            self.rewv_d.tt["gpu", NS * TI](),
+            self.conv_d.tt["gpu", NS * TI](),
+            self.bins_d.tt["gpu", BINSl](),
+            self.ret_d.tt["gpu", NS * TM1](),
             self.lam, Int32(1) if self.slowtar else Int32(0),
             grid_dim=nbBS, block_dim=BLKS,
         )
@@ -3408,14 +3407,14 @@ struct ACStep[
         var lo_floor = Int(idx_lo)
         var hi_floor = Int(idx_hi)
         ctx.enqueue_function[_ret_perc_neigh_k[NRET]](
-            self.ret_d.lt["gpu", Layout.row_major(NRET)](),
-            self.neigh_d.lt["gpu", Layout.row_major(4)](),
+            self.ret_d.tt["gpu", NRET](),
+            self.neigh_d.tt["gpu", 4](),
             Int64(lo_floor), Int64(hi_floor), grid_dim=nbRET, block_dim=TPB,
         )
         ctx.enqueue_function[_ret_perc_ema_k](
-            self.neigh_d.lt["gpu", Layout.row_major(4)](),
-            self.retstate_d.lt["gpu", Layout.row_major(2)](),
-            self.rscale_d.lt["gpu", Layout.row_major(1)](),
+            self.neigh_d.tt["gpu", 4](),
+            self.retstate_d.tt["gpu", 2](),
+            self.rscale_d.tt["gpu", 1](),
             idx_lo - Scalar[DT](lo_floor), idx_hi - Scalar[DT](hi_floor),
             retnorm.rate, retnorm.limit, grid_dim=1, block_dim=1,
         )
@@ -3428,34 +3427,34 @@ struct ACStep[
         comptime NTB = NS * TI * BINSl
         comptime NTA = NS * TI * ACTD
         ctx.enqueue_function[_zero_k[NTB]](
-            self.gvlog_d.lt["gpu", Layout.row_major(NTB)](),
+            self.gvlog_d.tt["gpu", NTB](),
             grid_dim=(NTB + TPB - 1) // TPB, block_dim=TPB,
         )
         ctx.enqueue_function[_zero_k[NTA]](
-            self.gpmean_d.lt["gpu", Layout.row_major(NTA)](),
+            self.gpmean_d.tt["gpu", NTA](),
             grid_dim=(NTA + TPB - 1) // TPB, block_dim=TPB,
         )
         ctx.enqueue_function[_zero_k[NTA]](
-            self.gpstd_d.lt["gpu", Layout.row_major(NTA)](),
+            self.gpstd_d.tt["gpu", NTA](),
             grid_dim=(NTA + TPB - 1) // TPB, block_dim=TPB,
         )
         # one thread per (start, imagination step) over NS*(TI-1) — full occupancy
         comptime nbPT = (NS * TM1 + TPB - 1) // TPB
         ctx.enqueue_function[_imag_bwd_continuous_pt_k[NS, TI, BINSl, ACTD]](
-            self.vlog_d.lt["gpu", Layout.row_major(NS * TI * BINSl)](),
-            self.svlog_d.lt["gpu", Layout.row_major(NS * TI * BINSl)](),
-            self.pmean_d.lt["gpu", Layout.row_major(NS * TI * ACTD)](),
-            self.pstd_d.lt["gpu", Layout.row_major(NS * TI * ACTD)](),
-            self.acts_d.lt["gpu", Layout.row_major(NS * TI * ACTD)](),
-            self.conv_d.lt["gpu", Layout.row_major(NS * TI)](),
-            self.ret_d.lt["gpu", Layout.row_major(NS * TM1)](),
-            self.bins_d.lt["gpu", Layout.row_major(BINSl)](),
-            self.gvlog_d.lt["gpu", Layout.row_major(NS * TI * BINSl)](),
-            self.gpmean_d.lt["gpu", Layout.row_major(NS * TI * ACTD)](),
-            self.gpstd_d.lt["gpu", Layout.row_major(NS * TI * ACTD)](),
-            self.polloss_d.lt["gpu", Layout.row_major(NS * TM1)](),
-            self.valloss_d.lt["gpu", Layout.row_major(NS * TM1)](),
-            self.rscale_d.lt["gpu", Layout.row_major(1)](),
+            self.vlog_d.tt["gpu", NS * TI * BINSl](),
+            self.svlog_d.tt["gpu", NS * TI * BINSl](),
+            self.pmean_d.tt["gpu", NS * TI * ACTD](),
+            self.pstd_d.tt["gpu", NS * TI * ACTD](),
+            self.acts_d.tt["gpu", NS * TI * ACTD](),
+            self.conv_d.tt["gpu", NS * TI](),
+            self.ret_d.tt["gpu", NS * TM1](),
+            self.bins_d.tt["gpu", BINSl](),
+            self.gvlog_d.tt["gpu", NS * TI * BINSl](),
+            self.gpmean_d.tt["gpu", NS * TI * ACTD](),
+            self.gpstd_d.tt["gpu", NS * TI * ACTD](),
+            self.polloss_d.tt["gpu", NS * TM1](),
+            self.valloss_d.tt["gpu", NS * TM1](),
+            self.rscale_d.tt["gpu", 1](),
             self.actent, self.slowreg, inv_im, MINSTD, MAXSTD,
             grid_dim=nbPT, block_dim=TPB,
         )
@@ -3465,14 +3464,14 @@ struct ACStep[
         opol.zero_grad[target, M=Self.PolT](policy, ctx)
         for t in range(TI):
             ctx.enqueue_function[_hist_load_k[FEATl, TI, NS]](
-                self.feats_d.lt["gpu", Layout.row_major(NS * TI * FEATl)](),
-                self.ftt.lt["gpu", Layout.row_major(NS * FEATl)](),
+                self.feats_d.tt["gpu", NS * TI * FEATl](),
+                self.ftt.tt["gpu", NS * FEATl](),
                 Int64(t), grid_dim=nbNF, block_dim=TPB,
             )
             value.forward[target, NS](TensorRefs[1](self.ftt), self.vscr, ctx)
             ctx.enqueue_function[_hist_load_k[BINSl, TI, NS]](
-                self.gvlog_d.lt["gpu", Layout.row_major(NS * TI * BINSl)](),
-                self.gvt.lt["gpu", Layout.row_major(NS * BINSl)](),
+                self.gvlog_d.tt["gpu", NS * TI * BINSl](),
+                self.gvt.tt["gpu", NS * BINSl](),
                 Int64(t), grid_dim=nbNF, block_dim=TPB,
             )
             value.vjp[target, NS](
@@ -3480,9 +3479,9 @@ struct ACStep[
             )
             policy.forward[target, NS](TensorRefs[1](self.ftt), self.pscr, ctx)
             ctx.enqueue_function[_hist_load_pol2_k[ACTD, TI, NS]](
-                self.gpmean_d.lt["gpu", Layout.row_major(NS * TI * ACTD)](),
-                self.gpstd_d.lt["gpu", Layout.row_major(NS * TI * ACTD)](),
-                self.polg.lt["gpu", Layout.row_major(NS * 2 * ACTD)](),
+                self.gpmean_d.tt["gpu", NS * TI * ACTD](),
+                self.gpstd_d.tt["gpu", NS * TI * ACTD](),
+                self.polg.tt["gpu", NS * 2 * ACTD](),
                 Int64(t), grid_dim=nbNF, block_dim=TPB,
             )
             policy.vjp[target, NS](
@@ -3491,23 +3490,23 @@ struct ACStep[
 
         # ── repval: ground value on REAL replay transitions (device) ──
         ctx.enqueue_function[_repval_setup_k[NS, TI, FEATl, Self.B, Self.T]](
-            self.ret_d.lt["gpu", Layout.row_major(NS * TM1)](),
-            self.feats_d.lt["gpu", Layout.row_major(NS * TI * FEATl)](),
-            self.boot_d.lt["gpu", Layout.row_major(BT)](),
-            self.feat_bt.lt["gpu", Layout.row_major(BT * FEATl)](),
+            self.ret_d.tt["gpu", NS * TM1](),
+            self.feats_d.tt["gpu", NS * TI * FEATl](),
+            self.boot_d.tt["gpu", BT](),
+            self.feat_bt.tt["gpu", BT * FEATl](),
             grid_dim=nbBT, block_dim=TPB,
         )
         value.forward[target, BT](TensorRefs[1](self.feat_bt), self.vlr, ctx)
         slowvalue.forward[target, BT](TensorRefs[1](self.feat_bt), self.svlr, ctx)
         var inv_rep = self.repval_scale / Scalar[DT](Self.B * TM1R)
         ctx.enqueue_function[_repl_bwd_k[Self.B, Self.T, BINSl]](
-            self.mbdne_d.lt["gpu", Layout.row_major(BT)](),
-            self.mbrew_d.lt["gpu", Layout.row_major(BT)](),
-            self.boot_d.lt["gpu", Layout.row_major(BT)](),
-            self.svlr.lt["gpu", Layout.row_major(BT * BINSl)](),
-            self.bins_d.lt["gpu", Layout.row_major(BINSl)](),
-            self.g_vlr.lt["gpu", Layout.row_major(BT * BINSl)](),
-            self.vlr.lt["gpu", Layout.row_major(BT * BINSl)](),
+            self.mbdne_d.tt["gpu", BT](),
+            self.mbrew_d.tt["gpu", BT](),
+            self.boot_d.tt["gpu", BT](),
+            self.svlr.tt["gpu", BT * BINSl](),
+            self.bins_d.tt["gpu", BINSl](),
+            self.g_vlr.tt["gpu", BT * BINSl](),
+            self.vlr.tt["gpu", BT * BINSl](),
             self.horizon, self.lam, self.slowreg, inv_rep,
             grid_dim=nbB1, block_dim=TPB,
         )
@@ -3528,57 +3527,57 @@ struct ACStep[
             comptime NFT = NS * TI * FEATl
             comptime r1 = 1
             ctx.enqueue_function[_diag_sum_k[NTM]](
-                self.polloss_d.lt["gpu", Layout.row_major(NTM)](),
-                self.diag_d.lt["gpu", Layout.row_major(DIAG_N)](),
+                self.polloss_d.tt["gpu", NTM](),
+                self.diag_d.tt["gpu", DIAG_N](),
                 Int64(0), grid_dim=r1, block_dim=TPB_REDUCE,
             )
             ctx.enqueue_function[_diag_sum_k[NTM]](
-                self.valloss_d.lt["gpu", Layout.row_major(NTM)](),
-                self.diag_d.lt["gpu", Layout.row_major(DIAG_N)](),
+                self.valloss_d.tt["gpu", NTM](),
+                self.diag_d.tt["gpu", DIAG_N](),
                 Int64(1), grid_dim=r1, block_dim=TPB_REDUCE,
             )
             ctx.enqueue_function[_diag_sum_k[NTI]](
-                self.rewv_d.lt["gpu", Layout.row_major(NTI)](),
-                self.diag_d.lt["gpu", Layout.row_major(DIAG_N)](),
+                self.rewv_d.tt["gpu", NTI](),
+                self.diag_d.tt["gpu", DIAG_N](),
                 Int64(2), grid_dim=r1, block_dim=TPB_REDUCE,
             )
             ctx.enqueue_function[_diag_sum_k[NTI]](
-                self.conv_d.lt["gpu", Layout.row_major(NTI)](),
-                self.diag_d.lt["gpu", Layout.row_major(DIAG_N)](),
+                self.conv_d.tt["gpu", NTI](),
+                self.diag_d.tt["gpu", DIAG_N](),
                 Int64(3), grid_dim=r1, block_dim=TPB_REDUCE,
             )
             ctx.enqueue_function[_diag_min_k[NTI]](
-                self.conv_d.lt["gpu", Layout.row_major(NTI)](),
-                self.diag_d.lt["gpu", Layout.row_major(DIAG_N)](),
+                self.conv_d.tt["gpu", NTI](),
+                self.diag_d.tt["gpu", DIAG_N](),
                 Int64(4), grid_dim=r1, block_dim=TPB_REDUCE,
             )
             ctx.enqueue_function[_diag_sum_sq_k[NTM]](
-                self.ret_d.lt["gpu", Layout.row_major(NTM)](),
-                self.diag_d.lt["gpu", Layout.row_major(DIAG_N)](),
+                self.ret_d.tt["gpu", NTM](),
+                self.diag_d.tt["gpu", DIAG_N](),
                 Int64(5), Int64(6), grid_dim=r1, block_dim=TPB_REDUCE,
             )
             ctx.enqueue_function[_diag_abs_sum_k[NPM]](
-                self.pmean_d.lt["gpu", Layout.row_major(NPM)](),
-                self.diag_d.lt["gpu", Layout.row_major(DIAG_N)](),
+                self.pmean_d.tt["gpu", NPM](),
+                self.diag_d.tt["gpu", DIAG_N](),
                 Int64(7), grid_dim=r1, block_dim=TPB_REDUCE,
             )
             ctx.enqueue_function[
                 _diag_twohot_sum_sq_k[NTI, BINSl, NS * TI * BINSl, BINSl]
             ](
-                self.vlog_d.lt["gpu", Layout.row_major(NS * TI * BINSl)](),
-                self.bins_d.lt["gpu", Layout.row_major(BINSl)](),
-                self.diag_d.lt["gpu", Layout.row_major(DIAG_N)](),
+                self.vlog_d.tt["gpu", NS * TI * BINSl](),
+                self.bins_d.tt["gpu", BINSl](),
+                self.diag_d.tt["gpu", DIAG_N](),
                 Int64(8), Int64(9), grid_dim=r1, block_dim=TPB_REDUCE,
             )
             ctx.enqueue_function[_diag_sum_sq_k[NFT]](
-                self.feats_d.lt["gpu", Layout.row_major(NFT)](),
-                self.diag_d.lt["gpu", Layout.row_major(DIAG_N)](),
+                self.feats_d.tt["gpu", NFT](),
+                self.diag_d.tt["gpu", DIAG_N](),
                 Int64(10), Int64(11), grid_dim=r1, block_dim=TPB_REDUCE,
             )
             # slot 12: Σ std_raw → dbg_pstd (raw; continuous-only diagnostic)
             ctx.enqueue_function[_diag_sum_k[NPM]](
-                self.pstd_d.lt["gpu", Layout.row_major(NPM)](),
-                self.diag_d.lt["gpu", Layout.row_major(DIAG_N)](),
+                self.pstd_d.tt["gpu", NPM](),
+                self.diag_d.tt["gpu", DIAG_N](),
                 Int64(12), grid_dim=r1, block_dim=TPB_REDUCE,
             )
             self.diag_d.download(ctx)

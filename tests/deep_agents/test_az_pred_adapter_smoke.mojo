@@ -11,7 +11,7 @@ Run (Apple Metal):
 
 from max.gpu.host import DeviceContext
 from std.testing import assert_true
-from layout import Layout, LayoutTensor
+from noeira.core.tiles import tile
 
 from noeira.nn.constants import DT
 from noeira.nn.core.initializer import Kaiming
@@ -42,12 +42,8 @@ def main() raises:
     ctx.synchronize()
 
     # The planner hands the adapter typed device views over its own buffers.
-    var hidden_lt = LayoutTensor[
-        DT, Layout.row_major(B, OBS), MutAnyOrigin
-    ](hidden_dev)
-    var pred_lt = LayoutTensor[
-        DT, Layout.row_major(B, PRED_OUT), MutAnyOrigin
-    ](pred_dev)
+    var hidden_lt = tile[B, OBS](hidden_dev)
+    var pred_lt = tile[B, PRED_OUT](pred_dev)
 
     adapter.predict_gpu[B](ctx, hidden_lt, pred_lt)
 

@@ -37,7 +37,7 @@ is listed as owed in the assessment. It is not claimed here.
 """
 
 from std.os.path import exists
-from std.sys import has_accelerator, has_nvidia_gpu_accelerator
+from std.sys import has_accelerator, default_accelerator
 
 from noeira.physics3d.parser.runtime_load import parse_model_runtime
 from noeira.physics3d.dynamics.osc_pose import ARM_DOF, OscPoseConfig
@@ -193,7 +193,7 @@ def main() raises:
     # ── 3. the env elaborates, and refuses without its record ─────────────
     print()
     print("--- 3. the env instantiates, and refuses to step unarmed ---")
-    if not has_nvidia_gpu_accelerator():
+    if not default_accelerator().is_nvidia_gpu():
         print("     no NVIDIA target: the config and the record are checked")
         print("     above; the env's own kernels need one. See the header.")
         print()
@@ -208,9 +208,9 @@ def main() raises:
     # failed to compile metallib" for the Newton solver at nv = 37. A `try`
     # around the construction cannot catch a metallib that never compiled, and
     # a runtime `has_accelerator()` guard does not stop elaboration — so the
-    # whole leg is behind `comptime if has_nvidia_gpu_accelerator()`, which is
+    # whole leg is behind `comptime if default_accelerator().is_nvidia_gpu()`, which is
     # the only form that keeps the kernels out of an Apple build entirely.
-    comptime if has_nvidia_gpu_accelerator():
+    comptime if default_accelerator().is_nvidia_gpu():
         from max.gpu.host import DeviceContext
         var ctx = DeviceContext()
         var env = LiberoGoalOscEnv[N_ENVS](ctx)

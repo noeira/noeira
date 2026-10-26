@@ -24,7 +24,6 @@ from std.math import exp, log
 from std.math import abs as math_abs
 from max.gpu import global_idx
 from max.gpu.host import DeviceContext
-from layout import Layout, LayoutTensor
 
 from noeira.nn.constants import DT, TPB
 from ..core.tensor import Tensor
@@ -34,6 +33,7 @@ from ..core.tensor_refs import TensorRefs
 # and are re-exported here so `from ...storage.loss.two_hot import symlog`
 # call-sites keep working.
 from noeira.nn.primitives.ops.symlog_math import symlog, symexp
+from noeira.core.tiles import Tile
 
 
 # ──────────────────────────────────────────────────────────────────────
@@ -552,10 +552,10 @@ def decode_value_backward_batch[
 def two_hot_ce_fwd_kernel[
     B: Int, BINS: Int, SYMLOG: Bool
 ](
-    lg: LayoutTensor[DT, Layout.row_major(B * BINS), MutAnyOrigin],
-    tg: LayoutTensor[DT, Layout.row_major(B), MutAnyOrigin],
-    bins: LayoutTensor[DT, Layout.row_major(BINS), MutAnyOrigin],
-    o: LayoutTensor[DT, Layout.row_major(B), MutAnyOrigin],
+    lg: Tile[DT, B * BINS],
+    tg: Tile[DT, B],
+    bins: Tile[DT, BINS],
+    o: Tile[DT, B],
 ):
     var b = Int(global_idx.x)
     if b < B:
@@ -612,11 +612,11 @@ def two_hot_ce_fwd_kernel[
 def two_hot_ce_bwd_kernel[
     B: Int, BINS: Int, SYMLOG: Bool
 ](
-    go: LayoutTensor[DT, Layout.row_major(B), MutAnyOrigin],
-    lg: LayoutTensor[DT, Layout.row_major(B * BINS), MutAnyOrigin],
-    tg: LayoutTensor[DT, Layout.row_major(B), MutAnyOrigin],
-    bins: LayoutTensor[DT, Layout.row_major(BINS), MutAnyOrigin],
-    glg: LayoutTensor[DT, Layout.row_major(B * BINS), MutAnyOrigin],
+    go: Tile[DT, B],
+    lg: Tile[DT, B * BINS],
+    tg: Tile[DT, B],
+    bins: Tile[DT, BINS],
+    glg: Tile[DT, B * BINS],
 ):
     var b = Int(global_idx.x)
     if b < B:
@@ -675,9 +675,9 @@ def two_hot_ce_bwd_kernel[
 def decode_value_fwd_kernel[
     B: Int, BINS: Int
 ](
-    lg: LayoutTensor[DT, Layout.row_major(B * BINS), MutAnyOrigin],
-    bins: LayoutTensor[DT, Layout.row_major(BINS), MutAnyOrigin],
-    o: LayoutTensor[DT, Layout.row_major(B), MutAnyOrigin],
+    lg: Tile[DT, B * BINS],
+    bins: Tile[DT, BINS],
+    o: Tile[DT, B],
 ):
     var b = Int(global_idx.x)
     if b < B:
@@ -704,10 +704,10 @@ def decode_value_fwd_kernel[
 def decode_value_bwd_kernel[
     B: Int, BINS: Int
 ](
-    go: LayoutTensor[DT, Layout.row_major(B), MutAnyOrigin],
-    lg: LayoutTensor[DT, Layout.row_major(B * BINS), MutAnyOrigin],
-    bins: LayoutTensor[DT, Layout.row_major(BINS), MutAnyOrigin],
-    glg: LayoutTensor[DT, Layout.row_major(B * BINS), MutAnyOrigin],
+    go: Tile[DT, B],
+    lg: Tile[DT, B * BINS],
+    bins: Tile[DT, BINS],
+    glg: Tile[DT, B * BINS],
 ):
     var b = Int(global_idx.x)
     if b < B:

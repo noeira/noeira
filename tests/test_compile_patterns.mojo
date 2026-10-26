@@ -18,7 +18,8 @@ from std.random import seed, random_float64
 from max.gpu import thread_idx, block_idx, block_dim
 from max.gpu.sync import barrier
 from max.gpu.host import DeviceContext, DeviceBuffer
-from layout import LayoutTensor, Layout
+from layout import TileTensor, TensorLayout
+from noeira.core.tiles import RowMajor, Tile, tile
 
 from noeira.nn.constants import DT as dtype
 from noeira.core.fmt import fit
@@ -40,9 +41,9 @@ comptime OUT_DIM = 32
 def pattern_a_kernel[
     BATCH: Int,  # <-- This compile-time Int causes recompilation!
 ](
-    output: LayoutTensor[dtype, Layout.row_major(BATCH, OUT_DIM), MutAnyOrigin],
-    input: LayoutTensor[dtype, Layout.row_major(BATCH, IN_DIM), MutAnyOrigin],
-    W: LayoutTensor[dtype, Layout.row_major(IN_DIM, OUT_DIM), MutAnyOrigin],
+    output: Tile[dtype, BATCH, OUT_DIM],
+    input: Tile[dtype, BATCH, IN_DIM],
+    W: Tile[dtype, IN_DIM, OUT_DIM],
 ):
     """Compile-time BATCH: recompiled for every batch size."""
     var row = Int(block_idx.y * TILE + thread_idx.y)
@@ -66,28 +67,18 @@ def launch_pattern_a[
     W_buf: DeviceBuffer[dtype],
 ) raises:
     """Launch Pattern A kernel."""
-    var output = LayoutTensor[
-        dtype, Layout.row_major(BATCH, OUT_DIM), MutAnyOrigin
-    ](output_buf.unsafe_ptr().as_unsafe_any_origin().unsafe_mut_cast[True]())
-    var input = LayoutTensor[
-        dtype, Layout.row_major(BATCH, IN_DIM), MutAnyOrigin
-    ](input_buf.unsafe_ptr().as_unsafe_any_origin().unsafe_mut_cast[True]())
-    var W = LayoutTensor[
-        dtype, Layout.row_major(IN_DIM, OUT_DIM), MutAnyOrigin
-    ](W_buf.unsafe_ptr().as_unsafe_any_origin().unsafe_mut_cast[True]())
+    var output = tile[BATCH, OUT_DIM](output_buf.unsafe_ptr().as_unsafe_any_origin().unsafe_mut_cast[True]())
+    var input = tile[BATCH, IN_DIM](input_buf.unsafe_ptr().as_unsafe_any_origin().unsafe_mut_cast[True]())
+    var W = tile[IN_DIM, OUT_DIM](W_buf.unsafe_ptr().as_unsafe_any_origin().unsafe_mut_cast[True]())
 
     comptime grid_x = (OUT_DIM + TILE - 1) // TILE
     comptime grid_y = (BATCH + TILE - 1) // TILE
 
     @always_inline
     def wrapper(
-        output: LayoutTensor[
-            dtype, Layout.row_major(BATCH, OUT_DIM), MutAnyOrigin
-        ],
-        input: LayoutTensor[
-            dtype, Layout.row_major(BATCH, IN_DIM), MutAnyOrigin
-        ],
-        W: LayoutTensor[dtype, Layout.row_major(IN_DIM, OUT_DIM), MutAnyOrigin],
+        output: Tile[dtype, BATCH, OUT_DIM],
+        input: Tile[dtype, BATCH, IN_DIM],
+        W: Tile[dtype, IN_DIM, OUT_DIM],
     ):
         pattern_a_kernel[BATCH](output, input, W)
 
@@ -109,13 +100,13 @@ def launch_pattern_a[
 
 @always_inline
 def pattern_b_kernel[
-    out_layout: Layout,  # <-- Layout TYPE, not a dimension Int
-    in_layout: Layout,
-    W_layout: Layout,
+    out_layout: TensorLayout,  # <-- Layout TYPE, not a dimension Int
+    in_layout: TensorLayout,
+    W_layout: TensorLayout,
 ](
-    output: LayoutTensor[dtype, out_layout, MutAnyOrigin],
-    input: LayoutTensor[dtype, in_layout, MutAnyOrigin],
-    W: LayoutTensor[dtype, W_layout, MutAnyOrigin],
+    output: TileTensor[dtype, out_layout, MutAnyOrigin],
+    input: TileTensor[dtype, in_layout, MutAnyOrigin],
+    W: TileTensor[dtype, W_layout, MutAnyOrigin],
     # ⚠ Int32, NOT UInt. The p07 puzzle spells this `UInt`, but `Int`/`UInt`
     # stopped conforming to `DevicePassable` in Mojo 1.0.0rc2, so the puzzle's
     # literal form no longer compiles. What Pattern B actually contrasts —
@@ -146,17 +137,13 @@ def launch_pattern_b[
 ) raises:
     """Launch Pattern B kernel with runtime batch."""
     # Layouts are fixed at compile time based on BUFFER_SIZE
-    comptime out_layout = Layout.row_major(BUFFER_SIZE, OUT_DIM)
-    comptime in_layout = Layout.row_major(BUFFER_SIZE, IN_DIM)
-    comptime W_layout = Layout.row_major(IN_DIM, OUT_DIM)
+    comptime out_layout = RowMajor[BUFFER_SIZE, OUT_DIM]
+    comptime in_layout = RowMajor[BUFFER_SIZE, IN_DIM]
+    comptime W_layout = RowMajor[IN_DIM, OUT_DIM]
 
-    var output = LayoutTensor[dtype, out_layout, MutAnyOrigin](
-        output_buf.unsafe_ptr().as_unsafe_any_origin().unsafe_mut_cast[True]()
-    )
-    var input = LayoutTensor[dtype, in_layout, MutAnyOrigin](
-        input_buf.unsafe_ptr().as_unsafe_any_origin().unsafe_mut_cast[True]()
-    )
-    var W = LayoutTensor[dtype, W_layout, MutAnyOrigin](W_buf.unsafe_ptr().as_unsafe_any_origin().unsafe_mut_cast[True]())
+    var output = tile[BUFFER_SIZE, OUT_DIM](output_buf.unsafe_ptr().as_unsafe_any_origin().unsafe_mut_cast[True]())
+    var input = tile[BUFFER_SIZE, IN_DIM](input_buf.unsafe_ptr().as_unsafe_any_origin().unsafe_mut_cast[True]())
+    var W = tile[IN_DIM, OUT_DIM](W_buf.unsafe_ptr().as_unsafe_any_origin().unsafe_mut_cast[True]())
 
     comptime grid_x = (OUT_DIM + TILE - 1) // TILE
     var grid_y = (actual_batch + TILE - 1) // TILE  # Runtime grid!

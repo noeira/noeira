@@ -28,7 +28,6 @@ Example:
 """
 
 from std.math import sqrt
-from layout import LayoutTensor, Layout
 
 from .joints.revolute import RevoluteJointSolver
 from .constants import (
@@ -62,6 +61,7 @@ from .constants import (
     JOINT_REVOLUTE,
     JOINT_FLAG_LIMIT_ENABLED,
 )
+from noeira.core.tiles import Tile
 
 
 struct PhysicsEnvHelpers:
@@ -82,9 +82,7 @@ struct PhysicsEnvHelpers:
         STATE_SIZE: Int,
         BODIES_OFFSET: Int,
     ](
-        states: LayoutTensor[
-            dtype, Layout.row_major(BATCH, STATE_SIZE), MutAnyOrigin
-        ],
+        states: Tile[dtype, BATCH, STATE_SIZE],
         env: Int,
         body: Int,
         x: Float64,
@@ -147,9 +145,7 @@ struct PhysicsEnvHelpers:
         STATE_SIZE: Int,
         BODIES_OFFSET: Int,
     ](
-        states: LayoutTensor[
-            dtype, Layout.row_major(BATCH, STATE_SIZE), MutAnyOrigin
-        ],
+        states: Tile[dtype, BATCH, STATE_SIZE],
         env: Int,
         body: Int,
         x: Float64,
@@ -183,9 +179,7 @@ struct PhysicsEnvHelpers:
         STATE_SIZE: Int,
         BODIES_OFFSET: Int,
     ](
-        states: LayoutTensor[
-            dtype, Layout.row_major(BATCH, STATE_SIZE), MutAnyOrigin
-        ],
+        states: Tile[dtype, BATCH, STATE_SIZE],
         env: Int,
         body: Int,
         x: Float64,
@@ -203,9 +197,7 @@ struct PhysicsEnvHelpers:
         STATE_SIZE: Int,
         BODIES_OFFSET: Int,
     ](
-        states: LayoutTensor[
-            dtype, Layout.row_major(BATCH, STATE_SIZE), MutAnyOrigin
-        ],
+        states: Tile[dtype, BATCH, STATE_SIZE],
         env: Int,
         body: Int,
         vx: Float64,
@@ -229,9 +221,7 @@ struct PhysicsEnvHelpers:
         STATE_SIZE: Int,
         BODIES_OFFSET: Int,
     ](
-        states: LayoutTensor[
-            dtype, Layout.row_major(BATCH, STATE_SIZE), MutAnyOrigin
-        ],
+        states: Tile[dtype, BATCH, STATE_SIZE],
         env: Int,
         body: Int,
     ) -> Scalar[dtype]:
@@ -246,9 +236,7 @@ struct PhysicsEnvHelpers:
         STATE_SIZE: Int,
         BODIES_OFFSET: Int,
     ](
-        states: LayoutTensor[
-            dtype, Layout.row_major(BATCH, STATE_SIZE), MutAnyOrigin
-        ],
+        states: Tile[dtype, BATCH, STATE_SIZE],
         env: Int,
         body: Int,
     ) -> Scalar[dtype]:
@@ -263,9 +251,7 @@ struct PhysicsEnvHelpers:
         STATE_SIZE: Int,
         BODIES_OFFSET: Int,
     ](
-        states: LayoutTensor[
-            dtype, Layout.row_major(BATCH, STATE_SIZE), MutAnyOrigin
-        ],
+        states: Tile[dtype, BATCH, STATE_SIZE],
         env: Int,
         body: Int,
     ) -> Scalar[dtype]:
@@ -280,9 +266,7 @@ struct PhysicsEnvHelpers:
         STATE_SIZE: Int,
         BODIES_OFFSET: Int,
     ](
-        states: LayoutTensor[
-            dtype, Layout.row_major(BATCH, STATE_SIZE), MutAnyOrigin
-        ],
+        states: Tile[dtype, BATCH, STATE_SIZE],
         env: Int,
         body: Int,
     ) -> Scalar[dtype]:
@@ -297,9 +281,7 @@ struct PhysicsEnvHelpers:
         STATE_SIZE: Int,
         BODIES_OFFSET: Int,
     ](
-        states: LayoutTensor[
-            dtype, Layout.row_major(BATCH, STATE_SIZE), MutAnyOrigin
-        ],
+        states: Tile[dtype, BATCH, STATE_SIZE],
         env: Int,
         body: Int,
     ) -> Scalar[dtype]:
@@ -314,9 +296,7 @@ struct PhysicsEnvHelpers:
         STATE_SIZE: Int,
         BODIES_OFFSET: Int,
     ](
-        states: LayoutTensor[
-            dtype, Layout.row_major(BATCH, STATE_SIZE), MutAnyOrigin
-        ],
+        states: Tile[dtype, BATCH, STATE_SIZE],
         env: Int,
         body: Int,
     ) -> Scalar[dtype]:
@@ -331,9 +311,7 @@ struct PhysicsEnvHelpers:
         STATE_SIZE: Int,
         BODIES_OFFSET: Int,
     ](
-        states: LayoutTensor[
-            dtype, Layout.row_major(BATCH, STATE_SIZE), MutAnyOrigin
-        ],
+        states: Tile[dtype, BATCH, STATE_SIZE],
         env: Int,
         body: Int,
     ) -> Tuple[
@@ -366,9 +344,7 @@ struct PhysicsEnvHelpers:
         STATE_SIZE: Int,
         FORCES_OFFSET: Int,
     ](
-        states: LayoutTensor[
-            dtype, Layout.row_major(BATCH, STATE_SIZE), MutAnyOrigin
-        ],
+        states: Tile[dtype, BATCH, STATE_SIZE],
         env: Int,
         body: Int,
         fx: Float64,
@@ -391,9 +367,7 @@ struct PhysicsEnvHelpers:
         STATE_SIZE: Int,
         FORCES_OFFSET: Int,
     ](
-        states: LayoutTensor[
-            dtype, Layout.row_major(BATCH, STATE_SIZE), MutAnyOrigin
-        ],
+        states: Tile[dtype, BATCH, STATE_SIZE],
         env: Int,
         body: Int,
         fx: Float64,
@@ -414,9 +388,7 @@ struct PhysicsEnvHelpers:
         STATE_SIZE: Int,
         FORCES_OFFSET: Int,
     ](
-        states: LayoutTensor[
-            dtype, Layout.row_major(BATCH, STATE_SIZE), MutAnyOrigin
-        ],
+        states: Tile[dtype, BATCH, STATE_SIZE],
         env: Int,
     ):
         """Clear all forces for an environment."""
@@ -437,9 +409,7 @@ struct PhysicsEnvHelpers:
         STATE_SIZE: Int,
         JOINT_COUNT_OFFSET: Int,
     ](
-        states: LayoutTensor[
-            dtype, Layout.row_major(BATCH, STATE_SIZE), MutAnyOrigin
-        ],
+        states: Tile[dtype, BATCH, STATE_SIZE],
         env: Int,
     ) -> Int:
         """Get number of active joints."""
@@ -452,9 +422,7 @@ struct PhysicsEnvHelpers:
         STATE_SIZE: Int,
         JOINT_COUNT_OFFSET: Int,
     ](
-        states: LayoutTensor[
-            dtype, Layout.row_major(BATCH, STATE_SIZE), MutAnyOrigin
-        ],
+        states: Tile[dtype, BATCH, STATE_SIZE],
         env: Int,
         count: Int,
     ):
@@ -471,9 +439,7 @@ struct PhysicsEnvHelpers:
         JOINTS_OFFSET: Int,
         JOINT_COUNT_OFFSET: Int,
     ](
-        states: LayoutTensor[
-            dtype, Layout.row_major(BATCH, STATE_SIZE), MutAnyOrigin
-        ],
+        states: Tile[dtype, BATCH, STATE_SIZE],
         env: Int,
         body_a: Int,
         body_b: Int,
@@ -500,11 +466,11 @@ struct PhysicsEnvHelpers:
         if joint_idx >= MAX_JOINTS:
             return -1
 
-        var ref = Scalar[dtype](0)
+        var ref_angle = Scalar[dtype](0)
         if reference_angle:
-            ref = Scalar[dtype](reference_angle.value())
+            ref_angle = Scalar[dtype](reference_angle.value())
         else:
-            ref = Self.get_body_angle[BATCH, STATE_SIZE, BODIES_OFFSET](
+            ref_angle = Self.get_body_angle[BATCH, STATE_SIZE, BODIES_OFFSET](
                 states, env, body_b
             ) - Self.get_body_angle[BATCH, STATE_SIZE, BODIES_OFFSET](
                 states, env, body_a
@@ -519,7 +485,7 @@ struct PhysicsEnvHelpers:
             anchor_ay=Scalar[dtype](anchor_ay),
             anchor_bx=Scalar[dtype](anchor_bx),
             anchor_by=Scalar[dtype](anchor_by),
-            reference_angle=ref,
+            reference_angle=ref_angle,
             lower_limit=Scalar[dtype](lower_limit),
             upper_limit=Scalar[dtype](upper_limit),
             enable_limit=enable_limit,
@@ -546,9 +512,7 @@ struct PhysicsEnvHelpers:
         STATE_SIZE: Int,
         EDGE_COUNT_OFFSET: Int,
     ](
-        states: LayoutTensor[
-            dtype, Layout.row_major(BATCH, STATE_SIZE), MutAnyOrigin
-        ],
+        states: Tile[dtype, BATCH, STATE_SIZE],
         env: Int,
     ) -> Int:
         """Get number of active terrain edges."""
@@ -561,9 +525,7 @@ struct PhysicsEnvHelpers:
         STATE_SIZE: Int,
         EDGE_COUNT_OFFSET: Int,
     ](
-        states: LayoutTensor[
-            dtype, Layout.row_major(BATCH, STATE_SIZE), MutAnyOrigin
-        ],
+        states: Tile[dtype, BATCH, STATE_SIZE],
         env: Int,
         count: Int,
     ):
@@ -577,9 +539,7 @@ struct PhysicsEnvHelpers:
         STATE_SIZE: Int,
         EDGES_OFFSET: Int,
     ](
-        states: LayoutTensor[
-            dtype, Layout.row_major(BATCH, STATE_SIZE), MutAnyOrigin
-        ],
+        states: Tile[dtype, BATCH, STATE_SIZE],
         env: Int,
         edge: Int,
         x0: Float64,
@@ -606,9 +566,7 @@ struct PhysicsEnvHelpers:
         EDGES_OFFSET: Int,
         EDGE_COUNT_OFFSET: Int,
     ](
-        states: LayoutTensor[
-            dtype, Layout.row_major(BATCH, STATE_SIZE), MutAnyOrigin
-        ],
+        states: Tile[dtype, BATCH, STATE_SIZE],
         env: Int,
         ground_y: Float64,
         x_min: Float64,
@@ -634,9 +592,7 @@ struct PhysicsEnvHelpers:
         STATE_SIZE: Int,
         METADATA_OFFSET: Int,
     ](
-        states: LayoutTensor[
-            dtype, Layout.row_major(BATCH, STATE_SIZE), MutAnyOrigin
-        ],
+        states: Tile[dtype, BATCH, STATE_SIZE],
         env: Int,
         field: Int,
     ) -> Scalar[dtype]:
@@ -650,9 +606,7 @@ struct PhysicsEnvHelpers:
         STATE_SIZE: Int,
         METADATA_OFFSET: Int,
     ](
-        states: LayoutTensor[
-            dtype, Layout.row_major(BATCH, STATE_SIZE), MutAnyOrigin
-        ],
+        states: Tile[dtype, BATCH, STATE_SIZE],
         env: Int,
         field: Int,
         value: Float64,
@@ -671,9 +625,7 @@ struct PhysicsEnvHelpers:
         STATE_SIZE: Int,
         OBS_OFFSET: Int,
     ](
-        states: LayoutTensor[
-            dtype, Layout.row_major(BATCH, STATE_SIZE), MutAnyOrigin
-        ],
+        states: Tile[dtype, BATCH, STATE_SIZE],
         env: Int,
         idx: Int,
     ) -> Scalar[dtype]:
@@ -687,9 +639,7 @@ struct PhysicsEnvHelpers:
         STATE_SIZE: Int,
         OBS_OFFSET: Int,
     ](
-        states: LayoutTensor[
-            dtype, Layout.row_major(BATCH, STATE_SIZE), MutAnyOrigin
-        ],
+        states: Tile[dtype, BATCH, STATE_SIZE],
         env: Int,
         idx: Int,
         value: Float64,

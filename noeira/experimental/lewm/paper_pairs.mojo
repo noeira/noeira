@@ -24,11 +24,11 @@ same way — kept here once, not twice:
 
 from std.math import sqrt, cos, sin, log, pi, abs
 from std.random.philox import Random as PhiloxRandom
-from layout import Layout, LayoutTensor
 
 from noeira.nn.constants import DT
 from noeira.envs.pusht import PushTEnv, PConstants
 from noeira.envs.pusht.render_swm import render_pusht_swm_at, render_pusht_swm_canvas_goal
+from noeira.core.tiles import tile
 
 
 comptime PAIR_IMG = 224
@@ -54,9 +54,7 @@ def render_frame(mut env: PairEnv) raises -> List[Scalar[DT]]:
     var ag = env.agent_pos()
     var bp = env.block_pose()
     var buf = List[Scalar[DT]](length=PAIR_HW * 3, fill=Scalar[DT](0))
-    var pix = LayoutTensor[DT, Layout.row_major(PAIR_IMG, PAIR_IMG, 3), MutAnyOrigin](
-        rebind[Pointer[Scalar[DT], MutAnyOrigin]](buf.unsafe_ptr())
-    )
+    var pix = tile[PAIR_IMG, PAIR_IMG, 3](rebind[Pointer[Scalar[DT], MutAnyOrigin]](buf.unsafe_ptr()))
     render_pusht_swm_at[PAIR_IMG](
         rebind[Scalar[DT]](bp[0]), rebind[Scalar[DT]](bp[1]), rebind[Scalar[DT]](bp[2]),
         rebind[Scalar[DT]](ag[0]), rebind[Scalar[DT]](ag[1]), pix,
@@ -65,7 +63,7 @@ def render_frame(mut env: PairEnv) raises -> List[Scalar[DT]]:
 
 
 def gauss(seed: UInt64, n: Int, offset: UInt64) -> List[Scalar[DT]]:
-    """n standard normals (Box-Muller over Philox)."""
+    """`n` standard normals (Box-Muller over Philox)."""
     var out = List[Scalar[DT]](capacity=n)
     var i = 0
     var ctr = offset
@@ -84,12 +82,12 @@ def gauss(seed: UInt64, n: Int, offset: UInt64) -> List[Scalar[DT]]:
 
 
 def pair_success(mut env: PairEnv, goal: List[Scalar[DT]], g: Int) -> Bool:
-    """swm `eval_state`: ‖goal[:4] - cur[:4]‖ < 20 and wrapped |Δ angle| < π/9."""
+    """`swm` `eval_state`: ‖goal[:4] - cur[:4]‖ < 20 and wrapped |Δ angle| < π/9."""
     return pair_margin(env, goal, g) < 1.0
 
 
 def pair_margin(mut env: PairEnv, goal: List[Scalar[DT]], g: Int) -> Float64:
-    """max(‖goal[:4] - cur[:4]‖ / 20, wrapped |Δ angle| / (π/9)): how far
+    """`max(‖goal[:4] - cur[:4]‖ / 20, wrapped |Δ angle| / (π/9))`: how far
     from `pair_success` (< 1 = success) — a continuous outcome, far less
     noisy per pair than the success bit."""
     var ag = env.agent_pos()

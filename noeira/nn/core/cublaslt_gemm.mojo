@@ -38,7 +38,7 @@ creation cannot run inside a CUDA-graph capture):
 NVIDIA only.
 """
 
-from std.sys import has_nvidia_gpu_accelerator
+from std.sys import default_accelerator
 from std.sys.defines import get_defined_string
 from std.ffi import _get_global_or_null, external_call
 from std.memory.alloc import Layout as AllocLayout
@@ -68,7 +68,7 @@ comptime EPI_BIAS = 1
 comptime EPI_GELU_AUX_BIAS = 2
 comptime EPI_DGELU = 3
 comptime EPI_RELU_AUX_BIAS = 4
-"""y = relu(acc + bias) and a BITMASK of (acc + bias > 0) in `aux`: one bit
+"""`y = relu(acc + bias)` and a BITMASK of (acc + bias > 0) in `aux`: one bit
 per element, bit (row r, column j) at bit index r * aux_ld + j of the byte
 array, aux_ld a multiple of 128 (cuBLASLt's rule)."""
 
@@ -119,14 +119,14 @@ def _check(rc: Int32, what: String) raises:
 
 def _new[fname: StaticString]() raises -> Int:
     """`fname(&out)` for a create function with one out-pointer argument."""
-    var p = alloc[Int](1)
-    p[0] = 0
+    var p = alloc(AllocLayout[Int](count=1)).unsafe_leak()
+    p[] = 0
     _check(
         _get_dylib_function[fname, def(Int) thin abi("C") -> Int32]()(Int(p)),
         String(fname),
     )
-    var out = p[0]
-    p.free()
+    var out = p[]
+    p.unsafe_free()
     return out
 
 
@@ -144,22 +144,22 @@ def _set_i32(desc: Int, attr: Int32, v: Int32) raises:
     # The value goes through a HEAP buffer: a stack local whose address
     # reaches C only as an `Int` was not stored before the call (the
     # library read garbage — `EPILOGUE = DEFAULT` came back NOT_SUPPORTED).
-    var p = alloc[Int32](1)
-    p[0] = v
+    var p = alloc(AllocLayout[Int32](count=1)).unsafe_leak()
+    p[] = v
     _set_desc(desc, attr, Int(p), 4)
-    p.free()
+    p.unsafe_free()
 
 
 def _set_i64(desc: Int, attr: Int32, v: Int64) raises:
-    var p = alloc[Int64](1)
-    p[0] = v
+    var p = alloc(AllocLayout[Int64](count=1)).unsafe_leak()
+    p[] = v
     _set_desc(desc, attr, Int(p), 8)
-    p.free()
+    p.unsafe_free()
 
 
 def _layout(dt: Int32, rows: Int, cols: Int, ld: Int) raises -> Int:
-    var p = alloc[Int](1)
-    p[0] = 0
+    var p = alloc(AllocLayout[Int](count=1)).unsafe_leak()
+    p[] = 0
     _check(
         _get_dylib_function[
             "cublasLtMatrixLayoutCreate",
@@ -167,8 +167,8 @@ def _layout(dt: Int32, rows: Int, cols: Int, ld: Int) raises -> Int:
         ]()(Int(p), dt, UInt64(rows), UInt64(cols), Int64(ld)),
         "cublasLtMatrixLayoutCreate",
     )
-    var out = p[0]
-    p.free()
+    var out = p[]
+    p.unsafe_free()
     return out
 
 
@@ -186,7 +186,7 @@ def _handle(c: DeviceContext) raises -> Int:
     var p = alloc(AllocLayout[_Handle].single()).unsafe_leak()
     p.unsafe_write(_Handle(h))
     external_call["KGEN_CompilerRT_InsertGlobal", NoneType](
-        StringSlice(name), p.bitcast[NoneType]()
+        StringSlice(name), p.unsafe_bitcast[NoneType]()
     )
     return h
 
@@ -199,11 +199,11 @@ def _alpha_beta() -> Int:
     var g = _get_global_or_null("NOEIRA_CUBLASLT_ALPHA_BETA")
     if g:
         return Int(g.value())
-    var p = alloc[Float32](2)
-    p[0] = 1.0
-    p[1] = 0.0
+    var p = alloc(AllocLayout[Float32](count=2)).unsafe_leak()
+    p[] = 1.0
+    p[unsafe_offset=1] = 0.0
     external_call["KGEN_CompilerRT_InsertGlobal", NoneType](
-        StringSlice("NOEIRA_CUBLASLT_ALPHA_BETA"), p.bitcast[NoneType]()
+        StringSlice("NOEIRA_CUBLASLT_ALPHA_BETA"), p.unsafe_bitcast[NoneType]()
     )
     return Int(p)
 
@@ -231,8 +231,8 @@ def _plan[
     if g:
         return g.value().unsafe_bitcast[_Plan]()[].copy()
     var h = _handle(c)
-    var dp = alloc[Int](1)
-    dp[0] = 0
+    var dp = alloc(AllocLayout[Int](count=1)).unsafe_leak()
+    dp[] = 0
     _check(
         _get_dylib_function[
             "cublasLtMatmulDescCreate", def(Int, Int32, Int32) thin abi("C") -> Int32
@@ -245,8 +245,8 @@ def _plan[
         ),
         "cublasLtMatmulDescCreate",
     )
-    var desc = dp[0]
-    dp.free()
+    var desc = dp[]
+    dp.unsafe_free()
     # cuBLASLt's A is our b (op TB), its B our a (op TA): see the module doc.
     _set_i32(desc, Int32(Attr.CUBLASLT_MATMUL_DESC_TRANSA._value), Int32(1 if TB else 0))
     _set_i32(desc, Int32(Attr.CUBLASLT_MATMUL_DESC_TRANSB._value), Int32(1 if TA else 0))
@@ -261,8 +261,8 @@ def _plan[
     var lb = _layout(_dt[IN_DT](), M if TA else K, K if TA else M, M if TA else K)
     var ld = _layout(_dt[OUT_DT](), N, M, N)
     var pref = _new["cublasLtMatmulPreferenceCreate"]()
-    var ws = alloc[Int64](1)
-    ws[0] = Int64(CUBLAS_WS_BYTES)
+    var ws = alloc(AllocLayout[Int64](count=1)).unsafe_leak()
+    ws[] = Int64(CUBLAS_WS_BYTES)
     _check(
         _get_dylib_function[
             "cublasLtMatmulPreferenceSetAttribute",
@@ -270,10 +270,10 @@ def _plan[
         ]()(pref, Int32(Preference.MAX_WORKSPACE_BYTES._value), Int(ws), 8),
         "cublasLtMatmulPreferenceSetAttribute",
     )
-    ws.free()
-    var algo = alloc[UInt8](_HEUR_BYTES)
-    var n_found_p = alloc[Int32](1)
-    n_found_p[0] = 0
+    ws.unsafe_free()
+    var algo = alloc(AllocLayout[UInt8](count=_HEUR_BYTES)).unsafe_leak()
+    var n_found_p = alloc(AllocLayout[Int32](count=1)).unsafe_leak()
+    n_found_p[] = 0
     _check(
         _get_dylib_function[
             "cublasLtMatmulAlgoGetHeuristic",
@@ -281,8 +281,8 @@ def _plan[
         ]()(h, desc, la, lb, ld, ld, pref, Int32(1), Int(algo), Int(n_found_p)),
         "cublasLtMatmulAlgoGetHeuristic",
     )
-    var n_found = n_found_p[0]
-    n_found_p.free()
+    var n_found = n_found_p[]
+    n_found_p.unsafe_free()
     if n_found < 1:
         raise Error(
             "cuBLASLt: no algorithm for [" + String(M) + "x" + String(N) + "] K="
@@ -292,7 +292,7 @@ def _plan[
     var p = alloc(AllocLayout[_Plan].single()).unsafe_leak()
     p.unsafe_write(plan.copy())
     external_call["KGEN_CompilerRT_InsertGlobal", NoneType](
-        StringSlice(name), p.bitcast[NoneType]()
+        StringSlice(name), p.unsafe_bitcast[NoneType]()
     )
     return plan^
 
@@ -319,7 +319,7 @@ def cublaslt_gemm[
     read by `EPI_DGELU` — or the `EPI_RELU_AUX_BIAS` bitmask. beta = 0.
     `TF32`: fp32 operands computed in TF32 (`cublas_tf32`'s rule), else full
     fp32 / bf16 accumulation in fp32."""
-    comptime assert has_nvidia_gpu_accelerator(), "cuBLASLt is NVIDIA-only"
+    comptime assert default_accelerator().is_nvidia_gpu(), "cuBLASLt is NVIDIA-only"
     # The bias is OUT_DT: cuBLASLt rejects an fp32 bias with a bf16 output
     # (INVALID_VALUE from the heuristic on cuBLAS 12.9).
     var plan = _plan[TA, TB, IN_DT, OUT_DT, OUT_DT, TF32](c, M, N, K, epi, aux_ld)

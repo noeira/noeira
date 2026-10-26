@@ -149,10 +149,10 @@ def main() raises:
                     adr += fmd.joints[k].nq
                 d.qpos.data[adr + 3] = Scalar[DT](1)
         forward_kinematics["cpu", DT, DynDims, 1](d, m)
-        var xpos_c = d.xpos.lt_dyn["cpu", DYN2](rl2(1, nb * 3))
-        var xquat_c = d.xquat.lt_dyn["cpu", DYN2](rl2(1, nb * 4))
-        var com_c = d.subtree_com.lt_dyn["cpu", DYN2](rl2(1, nb * 3))
-        var cams_c = m.cameras.lt_dyn["cpu", DYN1](
+        var xpos_c = d.xpos.tt_dyn["cpu", DYN2](rl2(1, nb * 3))
+        var xquat_c = d.xquat.tt_dyn["cpu", DYN2](rl2(1, nb * 4))
+        var com_c = d.subtree_com.tt_dyn["cpu", DYN2](rl2(1, nb * 3))
+        var cams_c = m.cameras.tt_dyn["cpu", DYN1](
             rl1(MAX_GPU_CAMERAS * MODEL_CAM_SIZE)
         )
         for c in range(N_CAM):

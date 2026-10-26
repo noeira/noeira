@@ -207,7 +207,6 @@ from std.time import perf_counter_ns
 
 from max.gpu.host import DeviceContext, DeviceBuffer
 
-from layout import Layout, LayoutTensor
 
 from noeira.nn.constants import DT
 from noeira.nn.core.ptr import mptr
@@ -248,6 +247,7 @@ from noeira.tasks.active import active_mask, init_region_words
 from noeira.tasks.lanes import lane_task, lanes_for_task
 from noeira.tasks.shaping import shaping_words, SHAPING_WORDS
 from noeira.tasks.critic_health import critic_health
+from noeira.core.tiles import tile
 
 
 # ⚠⚠ 32, MATCHING THE TWO EXAMPLES THAT TRAIN ON THIS STACK.
@@ -652,15 +652,9 @@ def round_rate[M: ModelDefLike, C: Phyics3dEnvConfig](
     for step in range(C.MAX_STEPS):
         agent.trainer.select_greedy_action_batched[N_ENVS](
             ctx,
-            LayoutTensor[DT, Layout.row_major(N_ENVS, OBS_DIM[M, C]), MutAnyOrigin](
-                env.obs_ptr()
-            ),
-            LayoutTensor[DT, Layout.row_major(N_ENVS, ACT_DIM), MutAnyOrigin](
-                env.action_ptr()
-            ),
-            LayoutTensor[DT, Layout.row_major(N_ENVS, AO), MutAnyOrigin](
-                mptr(ao.unsafe_ptr())
-            ),
+            tile[N_ENVS, OBS_DIM[M, C]](env.obs_ptr()),
+            tile[N_ENVS, ACT_DIM](env.action_ptr()),
+            tile[N_ENVS, AO](mptr(ao.unsafe_ptr())),
         )
         env.step_batch[N_ENVS](ctx, UInt64(step + 1))
         # ⚠⚠ THE GOAL BIT, NOT THE REWARD. This read `reward > 0.5`, which
@@ -1129,7 +1123,7 @@ def run_sac[M: ModelDefLike, C: Phyics3dEnvConfig](
         # ⚠ THE CONFIG GOES TO BOTH HALVES: `/runs` for the dashboard and
         # `metrics.config.kv` beside the CSV, so a CSV read later still says
         # what produced it. Hence the composite is built BEFORE `set_config`.
-        var logger = CompositeLogger(CsvLogger(csv_path), remote^)
+        var logger = CompositeLogger(CsvLogger(csv_path), remote)
         logger.set_config("algorithm", "SAC")
         logger.set_config("family", f.name)
         logger.set_config("task", task_name)

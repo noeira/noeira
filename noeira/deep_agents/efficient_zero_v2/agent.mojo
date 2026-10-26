@@ -212,8 +212,8 @@ struct EZv2DiscreteAgent[
     def load(mut self, path: String) raises:
         """Inverse of `save` — restores all five net weights from the per-net
         sidecars. Optimizer state is not checkpointed (session-local)."""
-        load_params["cpu", Self.REP](self.rep, path + ".rep", None)
-        load_params["cpu", Self.DYN](self.dyn, path + ".dyn", None)
-        load_params["cpu", Self.PRED](self.pred, path + ".pred", None)
-        load_params["cpu", Self.PROJM](self.proj, path + ".proj", None)
-        load_params["cpu", Self.PREDH](self.predh, path + ".predh", None)
+        _ = load_params["cpu", Self.REP](self.rep, path + ".rep", None)
+        _ = load_params["cpu", Self.DYN](self.dyn, path + ".dyn", None)
+        _ = load_params["cpu", Self.PRED](self.pred, path + ".pred", None)
+        _ = load_params["cpu", Self.PROJM](self.proj, path + ".proj", None)
+        _ = load_params["cpu", Self.PREDH](self.predh, path + ".predh", None)

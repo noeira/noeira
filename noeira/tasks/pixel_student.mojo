@@ -82,7 +82,7 @@ comptime IN_DIM = C_IN * PLANE
 comptime HID = 256
 comptime JOINT_SCALE: Float64 = 0.5
 comptime JOINT_VEL_SCALE: Float64 = 0.2
-"""rad/s -> plane value: the arm's joint speeds reach ~2-3 rad/s."""
+"""Rad/s -> plane value: the arm's joint speeds reach ~2-3 rad/s."""
 comptime IMAGE_OFFSET: Float64 = 0.5
 comptime GRIPPER_ACT = ACT - 1
 comptime CAM_FOVY_DEG: Float64 = 73.7398

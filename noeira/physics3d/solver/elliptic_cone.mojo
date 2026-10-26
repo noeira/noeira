@@ -39,7 +39,7 @@ one-sided normal constraint MuJoCo emits as `mjCNSTR_CONTACT_FRICTIONLESS`.
 
 from std.math import sqrt
 
-from layout import Layout, LayoutTensor
+from layout import TileTensor, TensorLayout
 
 from ..fields.scratch import Scratch
 
@@ -339,7 +339,7 @@ def ell_add_contact_hessian[
     M_CAP: Int,
     HN: Int,
     JT_CAP: Int,
-    L_WS: Layout,
+    L_WS: TensorLayout,
     N_CAP: Int = 1,
     IX_CAP: Int = 1,
     SPARSE: Bool = False,
@@ -360,7 +360,7 @@ def ell_add_contact_hessian[
     nv: Int,
     cn_n: Scratch[Int, N_CAP],
     cn_ix: Scratch[Int, IX_CAP],
-    solver: LayoutTensor[DTYPE, L_WS, MutAnyOrigin],
+    solver: TileTensor[DTYPE, L_WS, MutAnyOrigin],
     env: Int,
     ws_Jt_idx: Int,
     mc: Int,

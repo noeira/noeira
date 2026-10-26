@@ -26,7 +26,6 @@ host-staged path samples with: a device-rollout run is NOT bit-identical to a
 host-rollout one (its eager and captured runs are).
 """
 
-from layout import Layout, LayoutTensor
 from max.gpu import global_idx
 from max.gpu.host import DeviceBuffer, DeviceContext
 from std.math import exp as fexp, log as flog
@@ -42,14 +41,15 @@ from noeira.nn.random.box_muller import (
 )
 from .act_step import LOG_2PI, EPS_STD, _clamp_log_std
 from ...training.onpolicy_state import OnPolicyState
+from noeira.core.tiles import Tile, tile
 
 
 comptime _Ptr = Pointer[Scalar[DT], MutAnyOrigin]
 
 
 def _copy_kernel[N: Int](
-    src: LayoutTensor[DT, Layout.row_major(N), MutAnyOrigin],
-    dst: LayoutTensor[DT, Layout.row_major(N), MutAnyOrigin],
+    src: Tile[DT, N],
+    dst: Tile[DT, N],
 ):
     var i = Int(global_idx.x)
     if i < N:
@@ -57,13 +57,13 @@ def _copy_kernel[N: Int](
 
 
 def _sample_continuous_kernel[N_ENVS: Int, ACT: Int](
-    ao: LayoutTensor[DT, Layout.row_major(N_ENVS * 2 * ACT), MutAnyOrigin],
-    v1: LayoutTensor[DT, Layout.row_major(N_ENVS), MutAnyOrigin],
-    z: LayoutTensor[DT, Layout.row_major(N_ENVS * ACT), MutAnyOrigin],
-    action: LayoutTensor[DT, Layout.row_major(N_ENVS * ACT), MutAnyOrigin],
-    ca: LayoutTensor[DT, Layout.row_major(N_ENVS * ACT), MutAnyOrigin],
-    clp: LayoutTensor[DT, Layout.row_major(N_ENVS), MutAnyOrigin],
-    cval: LayoutTensor[DT, Layout.row_major(N_ENVS), MutAnyOrigin],
+    ao: Tile[DT, N_ENVS * 2 * ACT],
+    v1: Tile[DT, N_ENVS],
+    z: Tile[DT, N_ENVS * ACT],
+    action: Tile[DT, N_ENVS * ACT],
+    ca: Tile[DT, N_ENVS * ACT],
+    clp: Tile[DT, N_ENVS],
+    cval: Tile[DT, N_ENVS],
     action_scale: Scalar[DT],
 ):
     """`PPOActStep.step`'s sampling walk for env `e` (one thread)."""
@@ -91,14 +91,14 @@ def _sample_continuous_kernel[N_ENVS: Int, ACT: Int](
 
 
 def _sample_discrete_kernel[N_ENVS: Int, N: Int](
-    logits: LayoutTensor[DT, Layout.row_major(N_ENVS * N), MutAnyOrigin],
-    v1: LayoutTensor[DT, Layout.row_major(N_ENVS), MutAnyOrigin],
-    offset: LayoutTensor[DType.uint64, Layout.row_major(1), MutAnyOrigin],
+    logits: Tile[DT, N_ENVS * N],
+    v1: Tile[DT, N_ENVS],
+    offset: Tile[DType.uint64, 1],
     seed: UInt64,
-    action: LayoutTensor[DT, Layout.row_major(N_ENVS), MutAnyOrigin],
-    ca: LayoutTensor[DT, Layout.row_major(N_ENVS), MutAnyOrigin],
-    clp: LayoutTensor[DT, Layout.row_major(N_ENVS), MutAnyOrigin],
-    cval: LayoutTensor[DT, Layout.row_major(N_ENVS), MutAnyOrigin],
+    action: Tile[DT, N_ENVS],
+    ca: Tile[DT, N_ENVS],
+    clp: Tile[DT, N_ENVS],
+    cval: Tile[DT, N_ENVS],
 ):
     """`PPODiscreteActStep.step`'s softmax + inverse-CDF sample for env `e`
     (one thread). The uniform is Philox(seed, subsequence=e, offset)."""
@@ -139,22 +139,22 @@ def _sample_discrete_kernel[N_ENVS: Int, N: Int](
 
 def _record_kernel[N_ENVS: Int, OBS: Int, ACT: Int, RN: Int](
     t: Int32,
-    ob1: LayoutTensor[DT, Layout.row_major(N_ENVS * OBS), MutAnyOrigin],
-    ca: LayoutTensor[DT, Layout.row_major(N_ENVS * ACT), MutAnyOrigin],
-    clp: LayoutTensor[DT, Layout.row_major(N_ENVS), MutAnyOrigin],
-    cval: LayoutTensor[DT, Layout.row_major(N_ENVS), MutAnyOrigin],
-    reward: LayoutTensor[DT, Layout.row_major(N_ENVS), MutAnyOrigin],
-    done: LayoutTensor[DT, Layout.row_major(N_ENVS), MutAnyOrigin],
-    terminated: LayoutTensor[DT, Layout.row_major(N_ENVS), MutAnyOrigin],
-    next_obs: LayoutTensor[DT, Layout.row_major(N_ENVS * OBS), MutAnyOrigin],
-    obs_buf: LayoutTensor[DT, Layout.row_major(RN * OBS), MutAnyOrigin],
-    act_buf: LayoutTensor[DT, Layout.row_major(RN * ACT), MutAnyOrigin],
-    olp_buf: LayoutTensor[DT, Layout.row_major(RN), MutAnyOrigin],
-    val_buf: LayoutTensor[DT, Layout.row_major(RN), MutAnyOrigin],
-    rew_buf: LayoutTensor[DT, Layout.row_major(RN), MutAnyOrigin],
-    done_buf: LayoutTensor[DT, Layout.row_major(RN), MutAnyOrigin],
-    term_buf: LayoutTensor[DT, Layout.row_major(RN), MutAnyOrigin],
-    next_buf: LayoutTensor[DT, Layout.row_major(RN * OBS), MutAnyOrigin],
+    ob1: Tile[DT, N_ENVS * OBS],
+    ca: Tile[DT, N_ENVS * ACT],
+    clp: Tile[DT, N_ENVS],
+    cval: Tile[DT, N_ENVS],
+    reward: Tile[DT, N_ENVS],
+    done: Tile[DT, N_ENVS],
+    terminated: Tile[DT, N_ENVS],
+    next_obs: Tile[DT, N_ENVS * OBS],
+    obs_buf: Tile[DT, RN * OBS],
+    act_buf: Tile[DT, RN * ACT],
+    olp_buf: Tile[DT, RN],
+    val_buf: Tile[DT, RN],
+    rew_buf: Tile[DT, RN],
+    done_buf: Tile[DT, RN],
+    term_buf: Tile[DT, RN],
+    next_buf: Tile[DT, RN * OBS],
 ):
     """`PPORecordStep.step` for env `e` at row `t` (one thread), with the
     driver's `mark_terminal_env` folded in: term = (terminated > 0.5)."""
@@ -179,13 +179,13 @@ def _record_kernel[N_ENVS: Int, OBS: Int, ACT: Int, RN: Int](
 
 
 def _gae_kernel[N_ENVS: Int, T: Int](
-    nval: LayoutTensor[DT, Layout.row_major(T * N_ENVS), MutAnyOrigin],
-    rew: LayoutTensor[DT, Layout.row_major(T * N_ENVS), MutAnyOrigin],
-    val: LayoutTensor[DT, Layout.row_major(T * N_ENVS), MutAnyOrigin],
-    done: LayoutTensor[DT, Layout.row_major(T * N_ENVS), MutAnyOrigin],
-    term: LayoutTensor[DT, Layout.row_major(T * N_ENVS), MutAnyOrigin],
-    adv: LayoutTensor[DT, Layout.row_major(T * N_ENVS), MutAnyOrigin],
-    ret: LayoutTensor[DT, Layout.row_major(T * N_ENVS), MutAnyOrigin],
+    nval: Tile[DT, T * N_ENVS],
+    rew: Tile[DT, T * N_ENVS],
+    val: Tile[DT, T * N_ENVS],
+    done: Tile[DT, T * N_ENVS],
+    term: Tile[DT, T * N_ENVS],
+    adv: Tile[DT, T * N_ENVS],
+    ret: Tile[DT, T * N_ENVS],
     gamma: Scalar[DT],
     gae_lambda: Scalar[DT],
 ):
@@ -237,10 +237,8 @@ struct PPODeviceRollout(Defaultable & Movable & Deinitable):
 
     def _offset_lt(
         mut self,
-    ) -> LayoutTensor[DType.uint64, Layout.row_major(1), MutAnyOrigin]:
-        return LayoutTensor[DType.uint64, Layout.row_major(1), MutAnyOrigin](
-            self._offset.value()
-        )
+    ) -> Tile[DType.uint64, 1]:
+        return tile[1](self._offset.value())
 
     def copy_obs[
         OBS: Int, ACT: Int, RL: Int, MB: Int, N_ENVS: Int
@@ -252,8 +250,8 @@ struct PPODeviceRollout(Defaultable & Movable & Deinitable):
         comptime N = N_ENVS * OBS
         var c = state.ctx.value()
         c.enqueue_function[_copy_kernel[N]](
-            LayoutTensor[DT, Layout.row_major(N), MutAnyOrigin](obs_ptr),
-            state.ob1.lt["gpu", Layout.row_major(N)](),
+            tile[N](obs_ptr),
+            state.ob1.tt["gpu", N](),
             grid_dim=(N + TPB - 1) // TPB,
             block_dim=TPB,
         )
@@ -280,13 +278,13 @@ struct PPODeviceRollout(Defaultable & Movable & Deinitable):
             self._offset_lt(), grid_dim=1, block_dim=1
         )
         c.enqueue_function[_sample_continuous_kernel[N_ENVS, ACT]](
-            state.ao1.lt["gpu", Layout.row_major(N_ENVS * 2 * ACT)](),
-            state.v1.lt["gpu", Layout.row_major(N_ENVS)](),
-            state.z.lt["gpu", Layout.row_major(NZ)](),
-            LayoutTensor[DT, Layout.row_major(NZ), MutAnyOrigin](action_ptr),
-            state.cached_action.lt["gpu", Layout.row_major(NZ)](),
-            state.cached_log_prob.lt["gpu", Layout.row_major(N_ENVS)](),
-            state.cached_value.lt["gpu", Layout.row_major(N_ENVS)](),
+            state.ao1.tt["gpu", N_ENVS * 2 * ACT](),
+            state.v1.tt["gpu", N_ENVS](),
+            state.z.tt["gpu", NZ](),
+            tile[NZ](action_ptr),
+            state.cached_action.tt["gpu", NZ](),
+            state.cached_log_prob.tt["gpu", N_ENVS](),
+            state.cached_value.tt["gpu", N_ENVS](),
             action_scale,
             grid_dim=(N_ENVS + TPB - 1) // TPB,
             block_dim=TPB,
@@ -304,14 +302,14 @@ struct PPODeviceRollout(Defaultable & Movable & Deinitable):
         `state.v1`: the categorical sample, then the offset advances by 1."""
         var c = state.ctx.value()
         c.enqueue_function[_sample_discrete_kernel[N_ENVS, N_ACTIONS]](
-            logits.lt["gpu", Layout.row_major(N_ENVS * N_ACTIONS)](),
-            state.v1.lt["gpu", Layout.row_major(N_ENVS)](),
+            logits.tt["gpu", N_ENVS * N_ACTIONS](),
+            state.v1.tt["gpu", N_ENVS](),
             self._offset_lt(),
             self.seed,
-            LayoutTensor[DT, Layout.row_major(N_ENVS), MutAnyOrigin](action_ptr),
-            state.cached_action.lt["gpu", Layout.row_major(N_ENVS)](),
-            state.cached_log_prob.lt["gpu", Layout.row_major(N_ENVS)](),
-            state.cached_value.lt["gpu", Layout.row_major(N_ENVS)](),
+            tile[N_ENVS](action_ptr),
+            state.cached_action.tt["gpu", N_ENVS](),
+            state.cached_log_prob.tt["gpu", N_ENVS](),
+            state.cached_value.tt["gpu", N_ENVS](),
             grid_dim=(N_ENVS + TPB - 1) // TPB,
             block_dim=TPB,
         )
@@ -338,26 +336,22 @@ struct PPODeviceRollout(Defaultable & Movable & Deinitable):
         var c = state.ctx.value()
         c.enqueue_function[_record_kernel[N_ENVS, OBS, ACT, RN]](
             Int32(t),
-            state.ob1.lt["gpu", Layout.row_major(N_ENVS * OBS)](),
-            state.cached_action.lt["gpu", Layout.row_major(N_ENVS * ACT)](),
-            state.cached_log_prob.lt["gpu", Layout.row_major(N_ENVS)](),
-            state.cached_value.lt["gpu", Layout.row_major(N_ENVS)](),
-            LayoutTensor[DT, Layout.row_major(N_ENVS), MutAnyOrigin](reward_ptr),
-            LayoutTensor[DT, Layout.row_major(N_ENVS), MutAnyOrigin](done_ptr),
-            LayoutTensor[DT, Layout.row_major(N_ENVS), MutAnyOrigin](
-                terminated_ptr
-            ),
-            LayoutTensor[DT, Layout.row_major(N_ENVS * OBS), MutAnyOrigin](
-                next_obs_ptr
-            ),
-            state.obs_buf.lt["gpu", Layout.row_major(RN * OBS)](),
-            state.act_buf.lt["gpu", Layout.row_major(RN * ACT)](),
-            state.olp_buf.lt["gpu", Layout.row_major(RN)](),
-            state.val_buf.lt["gpu", Layout.row_major(RN)](),
-            state.rew_buf.lt["gpu", Layout.row_major(RN)](),
-            state.done_buf.lt["gpu", Layout.row_major(RN)](),
-            state.term_buf.lt["gpu", Layout.row_major(RN)](),
-            state.next_obs_buf.lt["gpu", Layout.row_major(RN * OBS)](),
+            state.ob1.tt["gpu", N_ENVS * OBS](),
+            state.cached_action.tt["gpu", N_ENVS * ACT](),
+            state.cached_log_prob.tt["gpu", N_ENVS](),
+            state.cached_value.tt["gpu", N_ENVS](),
+            tile[N_ENVS](reward_ptr),
+            tile[N_ENVS](done_ptr),
+            tile[N_ENVS](terminated_ptr),
+            tile[N_ENVS * OBS](next_obs_ptr),
+            state.obs_buf.tt["gpu", RN * OBS](),
+            state.act_buf.tt["gpu", RN * ACT](),
+            state.olp_buf.tt["gpu", RN](),
+            state.val_buf.tt["gpu", RN](),
+            state.rew_buf.tt["gpu", RN](),
+            state.done_buf.tt["gpu", RN](),
+            state.term_buf.tt["gpu", RN](),
+            state.next_obs_buf.tt["gpu", RN * OBS](),
             grid_dim=(N_ENVS + TPB - 1) // TPB,
             block_dim=TPB,
         )
@@ -376,13 +370,13 @@ struct PPODeviceRollout(Defaultable & Movable & Deinitable):
         comptime RN = RL * N_ENVS
         var c = state.ctx.value()
         c.enqueue_function[_gae_kernel[N_ENVS, RL]](
-            state.next_val_buf.lt["gpu", Layout.row_major(RN)](),
-            state.rew_buf.lt["gpu", Layout.row_major(RN)](),
-            state.val_buf.lt["gpu", Layout.row_major(RN)](),
-            state.done_buf.lt["gpu", Layout.row_major(RN)](),
-            state.term_buf.lt["gpu", Layout.row_major(RN)](),
-            state.adv_buf.lt["gpu", Layout.row_major(RN)](),
-            state.ret_buf.lt["gpu", Layout.row_major(RN)](),
+            state.next_val_buf.tt["gpu", RN](),
+            state.rew_buf.tt["gpu", RN](),
+            state.val_buf.tt["gpu", RN](),
+            state.done_buf.tt["gpu", RN](),
+            state.term_buf.tt["gpu", RN](),
+            state.adv_buf.tt["gpu", RN](),
+            state.ret_buf.tt["gpu", RN](),
             gamma,
             gae_lambda,
             grid_dim=(N_ENVS + TPB - 1) // TPB,

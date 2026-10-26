@@ -17,7 +17,6 @@ explicitly) — no softmax cache. Mirrors the device-resident accumulator
 """
 
 from max.gpu.host import DeviceContext
-from layout import Layout
 
 from noeira.nn.constants import DT, TPB, TPB_REDUCE
 from std.math import exp, log
@@ -85,9 +84,9 @@ struct SequenceCrossEntropyLoss[SEQ_LEN: Int, VOCAB: Int](
             self.partial.ensure_gpu(c, BT)
             comptime nblk = (BT + TPB_REDUCE - 1) // TPB_REDUCE
             c.enqueue_function[_ce_fwd_kernel[BT, Self.VOCAB]](
-                logits.lt["gpu", Layout.row_major(BT, Self.VOCAB)](),
-                targets.lt["gpu", Layout.row_major(BT, Self.VOCAB)](),
-                self.partial.lt["gpu", Layout.row_major(BT)](),
+                logits.tt["gpu", BT, Self.VOCAB](),
+                targets.tt["gpu", BT, Self.VOCAB](),
+                self.partial.tt["gpu", BT](),
                 grid_dim=nblk,
                 block_dim=TPB_REDUCE,
             )
@@ -114,15 +113,15 @@ struct SequenceCrossEntropyLoss[SEQ_LEN: Int, VOCAB: Int](
             self.partial.ensure_gpu(c, BT)
             comptime nblk = (BT + TPB_REDUCE - 1) // TPB_REDUCE
             c.enqueue_function[_ce_fwd_kernel[BT, Self.VOCAB]](
-                logits.lt["gpu", Layout.row_major(BT, Self.VOCAB)](),
-                targets.lt["gpu", Layout.row_major(BT, Self.VOCAB)](),
-                self.partial.lt["gpu", Layout.row_major(BT)](),
+                logits.tt["gpu", BT, Self.VOCAB](),
+                targets.tt["gpu", BT, Self.VOCAB](),
+                self.partial.tt["gpu", BT](),
                 grid_dim=nblk,
                 block_dim=TPB_REDUCE,
             )
             c.enqueue_function[_ce_reduce_kernel[BT]](
-                self.partial.lt["gpu", Layout.row_major(BT)](),
-                self.loss_acc.lt["gpu", Layout.row_major(2)](),
+                self.partial.tt["gpu", BT](),
+                self.loss_acc.tt["gpu", 2](),
                 grid_dim=1,
                 block_dim=TPB_REDUCE,
             )
@@ -183,9 +182,9 @@ struct SequenceCrossEntropyLoss[SEQ_LEN: Int, VOCAB: Int](
             grad.ensure_gpu(c, M)
             comptime nblk = (BT + TPB_REDUCE - 1) // TPB_REDUCE
             c.enqueue_function[_ce_bwd_kernel[BT, Self.VOCAB]](
-                logits.lt["gpu", Layout.row_major(BT, Self.VOCAB)](),
-                targets.lt["gpu", Layout.row_major(BT, Self.VOCAB)](),
-                grad.lt["gpu", Layout.row_major(BT, Self.VOCAB)](),
+                logits.tt["gpu", BT, Self.VOCAB](),
+                targets.tt["gpu", BT, Self.VOCAB](),
+                grad.tt["gpu", BT, Self.VOCAB](),
                 grid_dim=nblk,
                 block_dim=TPB_REDUCE,
             )

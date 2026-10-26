@@ -30,7 +30,8 @@ in, because this framework is f32 everywhere (`nn.constants.DT`). Every other
 dtype is REJECTED BY NAME rather than silently reinterpreted; integer tensors
 do occur in real files (`num_batches_tracked` is `I64` with shape `[]`) and a
 caller that means to skip them should check `dtype_of` and skip them, not
-receive garbage floats. Writing: `F32` only.
+receive garbage floats. Writing: `F32`, and `BF16` rounded to nearest-even
+from f32 values, as torch's `.to(torch.bfloat16)` rounds.
 
 ⚠ Host byte order is assumed little-endian, which every platform this repo
 builds for is. The dtype conversions read bytes explicitly, so only the raw
@@ -574,6 +575,19 @@ def _check_unique(ref names: List[String], path: String) raises:
 # ══════════════════════════════════════════════════════════════════════════
 
 
+def f32_to_bf16_bits(v: Float32) -> UInt16:
+    """The bfloat16 bits of `v`, rounded to nearest with ties to even, the
+    rounding torch's `.to(torch.bfloat16)` does (c10's
+    `round_to_nearest_even`): add 0x7FFF plus the lowest kept bit, keep the
+    top 16. A NaN becomes torch's quiet NaN, 0x7FC0, which the add could
+    otherwise carry into an infinity; ±inf and overflow come out as ±inf."""
+    var bits = bitcast[DType.uint32](v)
+    if (bits & UInt32(0x7FFFFFFF)) > UInt32(0x7F800000):
+        return UInt16(0x7FC0)
+    var bias = UInt32(0x7FFF) + ((bits >> UInt32(16)) & UInt32(1))
+    return UInt16((bits + bias) >> UInt32(16))
+
+
 def _json_escape(s: String) -> String:
     """JSON string body for `s`. Tensor names are dotted ASCII in practice, so
     this rarely does anything — which is the reason to write it now rather
@@ -622,6 +636,8 @@ struct SafeTensorsWriter(Movable):
     var shape_rank: List[Int]
     var begins: List[Int]
     var ends: List[Int]
+    var dtypes: List[Int]
+    """Per tensor, the header's dtype: `ST_F32`, `ST_BF16` or `ST_U8`."""
     var data: List[UInt8]
     var meta_keys: List[String]
     var meta_vals: List[String]
@@ -633,6 +649,7 @@ struct SafeTensorsWriter(Movable):
         self.shape_rank = List[Int]()
         self.begins = List[Int]()
         self.ends = List[Int]()
+        self.dtypes = List[Int]()
         self.data = List[UInt8]()
         self.meta_keys = List[String]()
         self.meta_vals = List[String]()
@@ -644,6 +661,7 @@ struct SafeTensorsWriter(Movable):
         self.shape_rank = move.shape_rank^
         self.begins = move.begins^
         self.ends = move.ends^
+        self.dtypes = move.dtypes^
         self.data = move.data^
         self.meta_keys = move.meta_keys^
         self.meta_vals = move.meta_vals^
@@ -655,19 +673,11 @@ struct SafeTensorsWriter(Movable):
     def size(self) -> Int:
         return len(self.names)
 
-    def add_f32(
-        mut self,
-        var name: String,
-        ref shape: List[Int],
-        ref vals: List[Float32],
-        count: Int,
+    def _entry(
+        mut self, name: String, ref shape: List[Int], count: Int, n_vals: Int
     ) raises:
-        """Append the FIRST `count` values of `vals` under `name`, with the
-        declared `shape`.
-
-        ⚠ `count` is separate from `len(vals)` on purpose: an `nn` `Tensor`'s
-        backing list can be longer than the param it holds (padded or reused),
-        so the walk's comptime `N` is the authority on how much is live.
+        """Validate one tensor and record its shape. `add_f32` and `add_bf16`
+        share it, then append the name, dtype and bytes themselves.
 
         ⚠ `shape` is CHECKED against `count`, not derived from it. The whole
         point of carrying a shape is that a consumer reshapes by it; a shape
@@ -697,15 +707,31 @@ struct SafeTensorsWriter(Movable):
                 "safetensors: '" + name + "' declares shape " + s + "] = "
                 + String(numel) + " elements but carries " + String(count)
             )
-
+        if count < 0 or count > n_vals:
+            raise Error(
+                "safetensors: '" + name + "' asks for " + String(count)
+                + " values from a list of " + String(n_vals)
+            )
         var start = len(self.shape_data)
         for i in range(len(shape)):
             self.shape_data.append(shape[i])
-        if count < 0 or count > len(vals):
-            raise Error(
-                "safetensors: '" + name + "' asks for " + String(count)
-                + " values from a list of " + String(len(vals))
-            )
+        self.shape_start.append(start)
+        self.shape_rank.append(len(shape))
+
+    def add_f32(
+        mut self,
+        var name: String,
+        ref shape: List[Int],
+        ref vals: List[Float32],
+        count: Int,
+    ) raises:
+        """Append the FIRST `count` values of `vals` under `name`, with the
+        declared `shape`.
+
+        ⚠ `count` is separate from `len(vals)` on purpose: an `nn` `Tensor`'s
+        backing list can be longer than the param it holds (padded or reused),
+        so the walk's comptime `N` is the authority on how much is live."""
+        self._entry(name, shape, count, len(vals))
         var begin = len(self.data)
         self.data.resize(begin + count * 4, 0)
         unsafe_memcpy(
@@ -714,10 +740,55 @@ struct SafeTensorsWriter(Movable):
             count=count * 4,
         )
         self.names.append(name^)
-        self.shape_start.append(start)
-        self.shape_rank.append(len(shape))
+        self.dtypes.append(ST_F32)
         self.begins.append(begin)
         self.ends.append(begin + count * 4)
+
+    def add_bf16(
+        mut self,
+        var name: String,
+        ref shape: List[Int],
+        ref vals: List[Float32],
+        count: Int,
+    ) raises:
+        """`add_f32`, stored as bfloat16: each value rounded to nearest, ties
+        to even (`f32_to_bf16_bits`). For a file a bf16 consumer reads, such
+        as a PEFT adapter for a bf16 model."""
+        self._entry(name, shape, count, len(vals))
+        var begin = len(self.data)
+        self.data.resize(begin + count * 2, 0)
+        for k in range(count):
+            var b = f32_to_bf16_bits(vals[k])
+            self.data[begin + 2 * k] = UInt8(Int(b & 0xFF))
+            self.data[begin + 2 * k + 1] = UInt8(Int(b >> 8))
+        self.names.append(name^)
+        self.dtypes.append(ST_BF16)
+        self.begins.append(begin)
+        self.ends.append(begin + count * 2)
+
+    def add_u8(
+        mut self,
+        var name: String,
+        ref shape: List[Int],
+        ref vals: List[UInt8],
+        count: Int,
+    ) raises:
+        """Append the first `count` bytes of `vals` under `name` as U8, with
+        the declared `shape`. For quantized weights, whose blocks are bytes
+        (`nn/quant/q4_0.mojo`); `SafeTensors.read_raw` reads them back."""
+        self._entry(name, shape, count, len(vals))
+        var begin = len(self.data)
+        self.data.resize(begin + count, 0)
+        if count > 0:
+            unsafe_memcpy(
+                dest=self.data.unsafe_ptr().unsafe_offset(begin),
+                src=vals.unsafe_ptr(),
+                count=count,
+            )
+        self.names.append(name^)
+        self.dtypes.append(ST_U8)
+        self.begins.append(begin)
+        self.ends.append(begin + count)
 
     def add_f32_list(
         mut self, var name: String, ref shape: List[Int], ref vals: List[Float32]
@@ -742,7 +813,8 @@ struct SafeTensorsWriter(Movable):
             if not first:
                 out += ","
             first = False
-            out += '"' + _json_escape(self.names[i]) + '":{"dtype":"F32"'
+            out += '"' + _json_escape(self.names[i]) + '":{"dtype":"'
+            out += dtype_name(self.dtypes[i]) + '"'
             out += ',"shape":['
             for k in range(self.shape_rank[i]):
                 if k > 0:

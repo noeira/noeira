@@ -42,7 +42,6 @@ writes `smeta[env, META_IDX_NUM_CONTACTS]` on both targets), so the grasp rung
 reads the same contact records the device would.
 """
 
-from layout import Layout, LayoutTensor
 
 from noeira.nn.core.tensor import TensorImpl
 from noeira.envs.phyics3d_env_config import Phyics3dEnvConfig
@@ -51,6 +50,7 @@ from noeira.physics3d.gpu.constants import (
     CONTACT_SIZE, METADATA_SIZE, MODEL_BODY_SIZE, MODEL_CURRICULUM_SIZE,
     MODEL_GEOM_SIZE, MODEL_SITE_SIZE,
 )
+from noeira.core.tiles import RowMajor
 
 
 def family_reward_host[
@@ -73,20 +73,20 @@ def family_reward_host[
     comptime NS = D.NSITE
     comptime NG = D.NGEOM
     comptime MC = D.MAX_CONTACTS
-    comptime L_Q = Layout.row_major(1, NQ)
-    comptime L_V = Layout.row_major(1, NV)
-    comptime L_B3 = Layout.row_major(1, NB * 3)
-    comptime L_B4 = Layout.row_major(1, NB * 4)
-    comptime L_B6 = Layout.row_major(1, NB * 6)
-    comptime L_S3 = Layout.row_major(1, NS * 3)
-    comptime L_CON = Layout.row_major(1, MC * CONTACT_SIZE)
-    comptime L_META = Layout.row_major(1, METADATA_SIZE)
-    comptime L_CUR = Layout.row_major(1, MODEL_CURRICULUM_SIZE)
-    comptime L_ACT = Layout.row_major(1, ACT)
-    comptime L_NA = Layout.row_major(1, 1)
-    comptime L_BODIES = Layout.row_major(NB, MODEL_BODY_SIZE)
-    comptime L_SITES = Layout.row_major(NS, MODEL_SITE_SIZE)
-    comptime L_GEOMS = Layout.row_major(NG, MODEL_GEOM_SIZE)
+    comptime L_Q = RowMajor[1, NQ]
+    comptime L_V = RowMajor[1, NV]
+    comptime L_B3 = RowMajor[1, NB * 3]
+    comptime L_B4 = RowMajor[1, NB * 4]
+    comptime L_B6 = RowMajor[1, NB * 6]
+    comptime L_S3 = RowMajor[1, NS * 3]
+    comptime L_CON = RowMajor[1, MC * CONTACT_SIZE]
+    comptime L_META = RowMajor[1, METADATA_SIZE]
+    comptime L_CUR = RowMajor[1, MODEL_CURRICULUM_SIZE]
+    comptime L_ACT = RowMajor[1, ACT]
+    comptime L_NA = RowMajor[1, 1]
+    comptime L_BODIES = RowMajor[NB, MODEL_BODY_SIZE]
+    comptime L_SITES = RowMajor[NS, MODEL_SITE_SIZE]
+    comptime L_GEOMS = RowMajor[NG, MODEL_GEOM_SIZE]
 
     if len(action) != ACT:
         raise Error(
@@ -103,29 +103,29 @@ def family_reward_host[
     return C.compute_reward_and_done_gpu[
         DTYPE, 1, NQ, NV, NB, ACT, NS * 3, MC, NS, NG, 1
     ](
-        d.qpos.lt["cpu", L_Q](),
-        d.qvel.lt["cpu", L_V](),
-        d.xpos.lt["cpu", L_B3](),
-        d.xipos.lt["cpu", L_B3](),
-        d.xquat.lt["cpu", L_B4](),
-        d.xvel.lt["cpu", L_B3](),
-        mf.bodies.lt["cpu", L_BODIES](),
-        d.site_xpos.lt["cpu", L_S3](),
-        d.contacts.lt["cpu", L_CON](),
-        mf.sites.lt["cpu", L_SITES](),
-        mf.geoms.lt["cpu", L_GEOMS](),
-        d.cfrc_ext.lt["cpu", L_B6](),
-        d.cvel.lt["cpu", L_B6](),
-        d.meta.lt["cpu", L_META](),
-        mf.curriculum.lt["cpu", L_CUR](),
-        actions_t.lt["cpu", L_ACT](),
-        d.xangvel.lt["cpu", L_B3](),
-        d.cacc.lt["cpu", L_B6](),
-        d.cfrc_int.lt["cpu", L_B6](),
-        d.subtree_com.lt["cpu", L_B3](),
-        d.site_xpos_acc.lt["cpu", L_S3](),
-        d.xquat_acc.lt["cpu", L_B4](),
-        act_t.lt["cpu", L_NA](),
+        d.qpos.tt["cpu", 1, NQ](),
+        d.qvel.tt["cpu", 1, NV](),
+        d.xpos.tt["cpu", 1, NB * 3](),
+        d.xipos.tt["cpu", 1, NB * 3](),
+        d.xquat.tt["cpu", 1, NB * 4](),
+        d.xvel.tt["cpu", 1, NB * 3](),
+        mf.bodies.tt["cpu", NB, MODEL_BODY_SIZE](),
+        d.site_xpos.tt["cpu", 1, NS * 3](),
+        d.contacts.tt["cpu", 1, MC * CONTACT_SIZE](),
+        mf.sites.tt["cpu", NS, MODEL_SITE_SIZE](),
+        mf.geoms.tt["cpu", NG, MODEL_GEOM_SIZE](),
+        d.cfrc_ext.tt["cpu", 1, NB * 6](),
+        d.cvel.tt["cpu", 1, NB * 6](),
+        d.meta.tt["cpu", 1, METADATA_SIZE](),
+        mf.curriculum.tt["cpu", 1, MODEL_CURRICULUM_SIZE](),
+        actions_t.tt["cpu", 1, ACT](),
+        d.xangvel.tt["cpu", 1, NB * 3](),
+        d.cacc.tt["cpu", 1, NB * 6](),
+        d.cfrc_int.tt["cpu", 1, NB * 6](),
+        d.subtree_com.tt["cpu", 1, NB * 3](),
+        d.site_xpos_acc.tt["cpu", 1, NS * 3](),
+        d.xquat_acc.tt["cpu", 1, NB * 4](),
+        act_t.tt["cpu", 1, 1](),
         0,
         step_count,
         frame_skip,

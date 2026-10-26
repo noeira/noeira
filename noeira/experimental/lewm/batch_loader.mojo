@@ -32,6 +32,7 @@ never a Mojo `List` (`core/concurrent/worker.mojo`).
 """
 
 from std.memory import alloc
+from std.memory.alloc import Layout as AllocLayout
 from std.math import isnan
 from std.time import perf_counter_ns
 
@@ -134,13 +135,13 @@ struct LewmBatchLoader[B: Int](BackgroundWorker):
         )
         var act = Pointer[Scalar[DT], MutAnyOrigin](
             unsafe_from_address=self.act_addr
-        ) + slot * Self.B * _ACT
+        ).unsafe_offset(slot * Self.B * _ACT)
         var araw = List[Float32](length=_ACT, fill=0)
         var dense = List[UInt8](length=REF_T * 5 * _HWC, fill=0)
         for b in range(Self.B):
             self.ds.value().sample_clip_pixels_uint8(
                 self.clip_idx[k * Self.B + b],
-                stage + b * REF_T * _HWC,
+                stage.unsafe_offset(b * REF_T * _HWC),
                 rebind[Pointer[Scalar[DType.float32], MutAnyOrigin]](araw.unsafe_ptr()),
                 rebind[Pointer[Scalar[DType.uint8], MutAnyOrigin]](dense.unsafe_ptr()),
             )
@@ -156,7 +157,7 @@ struct LewmBatchLoaderThread[B: Int](Movable):
 
     var thread: BackgroundThread[LewmBatchLoader[Self.B]]
     var cells: SharedBlock
-    var act: UnsafePointer[Scalar[DT], MutUntrackedOrigin]
+    var act: Pointer[Scalar[DT], MutUntrackedOrigin]
 
     def __init__(
         out self, h5: String, clip_idx: List[Int], a_mean: List[Float32],
@@ -167,7 +168,7 @@ struct LewmBatchLoaderThread[B: Int](Movable):
         self.cells = SharedBlock(8)
         self.cells.release_store(CELL_REQ, -1)
         self.cells.release_store(CELL_DONE, -1)
-        self.act = alloc[Scalar[DT]](2 * Self.B * _ACT)
+        self.act = alloc(AllocLayout[Scalar[DT]](count=2 * Self.B * _ACT)).unsafe_leak()
         var addrs = List[Int]()
         for st in stages:
             addrs.append(Int(st))
@@ -193,10 +194,10 @@ struct LewmBatchLoaderThread[B: Int](Movable):
         var out = List[Scalar[DT]](capacity=Self.B * _ACT)
         var base = (k % 2) * Self.B * _ACT
         for i in range(Self.B * _ACT):
-            out.append(self.act[base + i])
+            out.append(self.act[unsafe_offset=base + i])
         return out^
 
     def stop(mut self) raises:
         """Join the worker, then free the action slots it wrote."""
         self.thread.stop(drain_ms=0)
-        self.act.free()
+        self.act.unsafe_free()

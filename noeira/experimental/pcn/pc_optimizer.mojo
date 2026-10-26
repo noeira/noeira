@@ -15,11 +15,11 @@
 
 from noeira.nn.constants import DT as dtype
 from .pc_constants import TPB
-from layout import LayoutTensor, Layout
 from std.math import sqrt, exp, log
 from max.gpu import thread_idx, block_idx, block_dim
 from max.gpu.host import DeviceContext, DeviceBuffer
 from std.sys import simd_width_of
+from noeira.core.tiles import Tile, tile
 
 
 comptime _CPU_SIMD_W = simd_width_of[dtype]()
@@ -89,18 +89,10 @@ struct PCAdam[
     def step[
         PARAM_SIZE: Int, dtype: DType = DType.float32
     ](
-        mut params: LayoutTensor[
-            dtype, Layout.row_major(PARAM_SIZE), MutAnyOrigin
-        ],
-        grads: LayoutTensor[dtype, Layout.row_major(PARAM_SIZE), MutAnyOrigin],
-        mut state: LayoutTensor[
-            dtype,
-            Layout.row_major(PARAM_SIZE, Self.STATE_PER_PARAM),
-            MutAnyOrigin,
-        ],
-        mut opt_global_state: LayoutTensor[
-            dtype, Layout.row_major(Self.GLOBAL_STATE_SIZE), MutAnyOrigin
-        ],
+        params: Tile[dtype, PARAM_SIZE],
+        grads: Tile[dtype, PARAM_SIZE],
+        state: Tile[dtype, PARAM_SIZE, Self.STATE_PER_PARAM],
+        opt_global_state: Tile[dtype, Self.GLOBAL_STATE_SIZE],
         step_num: Int,
         lr_scale: Float64 = 1.0,
     ):
@@ -177,17 +169,11 @@ struct PCAdam[
     def step_kernel_impl[
         PARAM_SIZE: Int, dtype: DType = DType.float32
     ](
-        params: LayoutTensor[dtype, Layout.row_major(PARAM_SIZE), MutAnyOrigin],
-        grads: LayoutTensor[dtype, Layout.row_major(PARAM_SIZE), MutAnyOrigin],
-        state: LayoutTensor[
-            dtype, Layout.row_major(PARAM_SIZE, 2), MutAnyOrigin
-        ],
-        counter: LayoutTensor[
-            DType.uint32, Layout.row_major(1), MutAnyOrigin
-        ],
-        lr_scale_view: LayoutTensor[
-            dtype, Layout.row_major(1), MutAnyOrigin
-        ],
+        params: Tile[dtype, PARAM_SIZE],
+        grads: Tile[dtype, PARAM_SIZE],
+        state: Tile[dtype, PARAM_SIZE, 2],
+        counter: Tile[DType.uint32, 1],
+        lr_scale_view: Tile[dtype, 1],
         base_lr: Scalar[dtype],
         beta1: Scalar[dtype],
         beta2: Scalar[dtype],
@@ -240,18 +226,10 @@ struct PCAdam[
         PARAM_SIZE: Int, dtype: DType = DType.float32
     ](
         ctx: DeviceContext,
-        mut params: LayoutTensor[
-            dtype, Layout.row_major(PARAM_SIZE), MutAnyOrigin
-        ],
-        grads: LayoutTensor[dtype, Layout.row_major(PARAM_SIZE), MutAnyOrigin],
-        mut state: LayoutTensor[
-            dtype,
-            Layout.row_major(PARAM_SIZE, Self.STATE_PER_PARAM),
-            MutAnyOrigin,
-        ],
-        mut opt_global_state: LayoutTensor[
-            dtype, Layout.row_major(Self.GLOBAL_STATE_SIZE), MutAnyOrigin
-        ],
+        params: Tile[dtype, PARAM_SIZE],
+        grads: Tile[dtype, PARAM_SIZE],
+        state: Tile[dtype, PARAM_SIZE, Self.STATE_PER_PARAM],
+        opt_global_state: Tile[dtype, Self.GLOBAL_STATE_SIZE],
         step_num: Int,
     ) raises:
         """Launch Adam optimization step on GPU.
@@ -282,19 +260,13 @@ struct PCAdam[
         var log_beta2 = Scalar[dtype](log(Self.BETA2))
 
         # Slot 0 (Float32) → bit-cast UInt32 step counter view.
-        var counter_t = LayoutTensor[
-            DType.uint32, Layout.row_major(1), MutAnyOrigin
-        ](opt_global_state.ptr.unsafe_bitcast[Scalar[DType.uint32]]())
+        var counter_t = tile[1](opt_global_state.ptr.unsafe_bitcast[Scalar[DType.uint32]]())
         # Slot 1 → lr_scale view.
-        var lr_scale_view = LayoutTensor[
-            dtype, Layout.row_major(1), MutAnyOrigin
-        ](opt_global_state.ptr.unsafe_offset(1))
+        var lr_scale_view = tile[1](opt_global_state.ptr.unsafe_offset(1))
 
         @always_inline
         def bump_kernel(
-            c: LayoutTensor[
-                DType.uint32, Layout.row_major(1), MutAnyOrigin
-            ],
+            c: Tile[DType.uint32, 1],
         ):
             if Int(thread_idx.x) == 0:
                 c[0] = c[0] + UInt32(1)
@@ -307,21 +279,11 @@ struct PCAdam[
 
         @always_inline
         def kernel_wrapper(
-            params: LayoutTensor[
-                dtype, Layout.row_major(PARAM_SIZE), MutAnyOrigin
-            ],
-            grads: LayoutTensor[
-                dtype, Layout.row_major(PARAM_SIZE), MutAnyOrigin
-            ],
-            state: LayoutTensor[
-                dtype, Layout.row_major(PARAM_SIZE, 2), MutAnyOrigin
-            ],
-            counter: LayoutTensor[
-                DType.uint32, Layout.row_major(1), MutAnyOrigin
-            ],
-            lr_scale_view: LayoutTensor[
-                dtype, Layout.row_major(1), MutAnyOrigin
-            ],
+            params: Tile[dtype, PARAM_SIZE],
+            grads: Tile[dtype, PARAM_SIZE],
+            state: Tile[dtype, PARAM_SIZE, 2],
+            counter: Tile[DType.uint32, 1],
+            lr_scale_view: Tile[dtype, 1],
             base_lr: Scalar[dtype],
             beta1: Scalar[dtype],
             beta2: Scalar[dtype],
@@ -412,18 +374,10 @@ struct PCAdamW[
     def step[
         PARAM_SIZE: Int, dtype: DType = DType.float32
     ](
-        mut params: LayoutTensor[
-            dtype, Layout.row_major(PARAM_SIZE), MutAnyOrigin
-        ],
-        grads: LayoutTensor[dtype, Layout.row_major(PARAM_SIZE), MutAnyOrigin],
-        mut state: LayoutTensor[
-            dtype,
-            Layout.row_major(PARAM_SIZE, Self.STATE_PER_PARAM),
-            MutAnyOrigin,
-        ],
-        mut opt_global_state: LayoutTensor[
-            dtype, Layout.row_major(Self.GLOBAL_STATE_SIZE), MutAnyOrigin
-        ],
+        params: Tile[dtype, PARAM_SIZE],
+        grads: Tile[dtype, PARAM_SIZE],
+        state: Tile[dtype, PARAM_SIZE, Self.STATE_PER_PARAM],
+        opt_global_state: Tile[dtype, Self.GLOBAL_STATE_SIZE],
         step_num: Int,
         lr_scale: Float64 = 1.0,
     ):
@@ -489,17 +443,11 @@ struct PCAdamW[
     def step_kernel_impl[
         PARAM_SIZE: Int, dtype: DType = DType.float32
     ](
-        params: LayoutTensor[dtype, Layout.row_major(PARAM_SIZE), MutAnyOrigin],
-        grads: LayoutTensor[dtype, Layout.row_major(PARAM_SIZE), MutAnyOrigin],
-        state: LayoutTensor[
-            dtype, Layout.row_major(PARAM_SIZE, 2), MutAnyOrigin
-        ],
-        counter: LayoutTensor[
-            DType.uint32, Layout.row_major(1), MutAnyOrigin
-        ],
-        lr_scale_view: LayoutTensor[
-            dtype, Layout.row_major(1), MutAnyOrigin
-        ],
+        params: Tile[dtype, PARAM_SIZE],
+        grads: Tile[dtype, PARAM_SIZE],
+        state: Tile[dtype, PARAM_SIZE, 2],
+        counter: Tile[DType.uint32, 1],
+        lr_scale_view: Tile[dtype, 1],
         base_lr: Scalar[dtype],
         beta1: Scalar[dtype],
         beta2: Scalar[dtype],
@@ -548,18 +496,10 @@ struct PCAdamW[
         PARAM_SIZE: Int, dtype: DType = DType.float32
     ](
         ctx: DeviceContext,
-        mut params: LayoutTensor[
-            dtype, Layout.row_major(PARAM_SIZE), MutAnyOrigin
-        ],
-        grads: LayoutTensor[dtype, Layout.row_major(PARAM_SIZE), MutAnyOrigin],
-        mut state: LayoutTensor[
-            dtype,
-            Layout.row_major(PARAM_SIZE, Self.STATE_PER_PARAM),
-            MutAnyOrigin,
-        ],
-        mut opt_global_state: LayoutTensor[
-            dtype, Layout.row_major(Self.GLOBAL_STATE_SIZE), MutAnyOrigin
-        ],
+        params: Tile[dtype, PARAM_SIZE],
+        grads: Tile[dtype, PARAM_SIZE],
+        state: Tile[dtype, PARAM_SIZE, Self.STATE_PER_PARAM],
+        opt_global_state: Tile[dtype, Self.GLOBAL_STATE_SIZE],
         step_num: Int,
     ) raises:
         """Launch AdamW optimization step on GPU. See Adam.step_gpu — same
@@ -575,18 +515,12 @@ struct PCAdamW[
         var wd_factor = Scalar[dtype](1.0 - Self.LR * Self.WEIGHT_DECAY)
 
         # Slot 0 → UInt32 step counter view; slot 1 → lr_scale view.
-        var counter_t = LayoutTensor[
-            DType.uint32, Layout.row_major(1), MutAnyOrigin
-        ](opt_global_state.ptr.unsafe_bitcast[Scalar[DType.uint32]]())
-        var lr_scale_view = LayoutTensor[
-            dtype, Layout.row_major(1), MutAnyOrigin
-        ](opt_global_state.ptr.unsafe_offset(1))
+        var counter_t = tile[1](opt_global_state.ptr.unsafe_bitcast[Scalar[DType.uint32]]())
+        var lr_scale_view = tile[1](opt_global_state.ptr.unsafe_offset(1))
 
         @always_inline
         def bump_kernel(
-            c: LayoutTensor[
-                DType.uint32, Layout.row_major(1), MutAnyOrigin
-            ],
+            c: Tile[DType.uint32, 1],
         ):
             if Int(thread_idx.x) == 0:
                 c[0] = c[0] + UInt32(1)
@@ -599,21 +533,11 @@ struct PCAdamW[
 
         @always_inline
         def kernel_wrapper(
-            params: LayoutTensor[
-                dtype, Layout.row_major(PARAM_SIZE), MutAnyOrigin
-            ],
-            grads: LayoutTensor[
-                dtype, Layout.row_major(PARAM_SIZE), MutAnyOrigin
-            ],
-            state: LayoutTensor[
-                dtype, Layout.row_major(PARAM_SIZE, 2), MutAnyOrigin
-            ],
-            counter: LayoutTensor[
-                DType.uint32, Layout.row_major(1), MutAnyOrigin
-            ],
-            lr_scale_view: LayoutTensor[
-                dtype, Layout.row_major(1), MutAnyOrigin
-            ],
+            params: Tile[dtype, PARAM_SIZE],
+            grads: Tile[dtype, PARAM_SIZE],
+            state: Tile[dtype, PARAM_SIZE, 2],
+            counter: Tile[DType.uint32, 1],
+            lr_scale_view: Tile[dtype, 1],
             base_lr: Scalar[dtype],
             beta1: Scalar[dtype],
             beta2: Scalar[dtype],

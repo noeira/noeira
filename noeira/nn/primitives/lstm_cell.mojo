@@ -34,7 +34,8 @@ from std.math import exp, tanh
 from max.gpu import thread_idx, block_idx, global_idx
 from max.gpu.primitives import block
 from max.gpu.host import DeviceContext
-from layout import Layout, LayoutTensor, TileTensor, row_major
+from layout import TileTensor, row_major
+from noeira.core.tiles import Tile, tile
 from linalg.matmul import matmul as max_matmul
 
 from noeira.nn.constants import DT, TPB
@@ -66,13 +67,13 @@ def _sigmoid(x: Scalar[DT]) -> Scalar[DT]:
 def _lstm_gate_fwd_kernel[
     BATCH: Int, H: Int, CACHE: Int, WITH_CACHE: Bool,
 ](
-    ix: LayoutTensor[DT, Layout.row_major(BATCH, 4 * H), MutAnyOrigin],
-    hx: LayoutTensor[DT, Layout.row_major(BATCH, 4 * H), MutAnyOrigin],
-    b: LayoutTensor[DT, Layout.row_major(4 * H), MutAnyOrigin],
-    c_prev: LayoutTensor[DT, Layout.row_major(BATCH, H), MutAnyOrigin],
-    h_t: LayoutTensor[DT, Layout.row_major(BATCH, H), MutAnyOrigin],
-    c_t: LayoutTensor[DT, Layout.row_major(BATCH, H), MutAnyOrigin],
-    cache: LayoutTensor[DT, Layout.row_major(BATCH, CACHE), MutAnyOrigin],
+    ix: Tile[DT, BATCH, 4 * H],
+    hx: Tile[DT, BATCH, 4 * H],
+    b: Tile[DT, 4 * H],
+    c_prev: Tile[DT, BATCH, H],
+    h_t: Tile[DT, BATCH, H],
+    c_t: Tile[DT, BATCH, H],
+    cache: Tile[DT, BATCH, CACHE],
 ):
     """Elementwise gate/cell from the two GEMM pre-activations (ix = x·W_ih,
     hx = h_prev·W_hh). One thread per (sample, hidden unit)."""
@@ -113,12 +114,12 @@ def _lstm_gate_fwd_kernel[
 def _lstm_gate_grad_kernel[
     BATCH: Int, H: Int, CACHE: Int,
 ](
-    dh: LayoutTensor[DT, Layout.row_major(BATCH, H), MutAnyOrigin],
-    dc: LayoutTensor[DT, Layout.row_major(BATCH, H), MutAnyOrigin],
-    c_prev: LayoutTensor[DT, Layout.row_major(BATCH, H), MutAnyOrigin],
-    cache: LayoutTensor[DT, Layout.row_major(BATCH, CACHE), MutAnyOrigin],
-    dc_prev: LayoutTensor[DT, Layout.row_major(BATCH, H), MutAnyOrigin],
-    d_comb: LayoutTensor[DT, Layout.row_major(BATCH, 4 * H), MutAnyOrigin],
+    dh: Tile[DT, BATCH, H],
+    dc: Tile[DT, BATCH, H],
+    c_prev: Tile[DT, BATCH, H],
+    cache: Tile[DT, BATCH, CACHE],
+    dc_prev: Tile[DT, BATCH, H],
+    d_comb: Tile[DT, BATCH, 4 * H],
 ):
     """Gate-grad math → combined pre-activation grad d_comb [BATCH, 4H] + the
     cell-state grad dc_prev. One thread per (sample, hidden unit). The dx /
@@ -153,8 +154,8 @@ def _lstm_gate_grad_kernel[
 def _lstm_accum_kernel[
     N: Int,
 ](
-    dst: LayoutTensor[DT, Layout.row_major(N), MutAnyOrigin],
-    src: LayoutTensor[DT, Layout.row_major(N), MutAnyOrigin],
+    dst: Tile[DT, N],
+    src: Tile[DT, N],
 ):
     """dst += src (accumulate dW_tmp into the persistent param grad)."""
     var i = Int(global_idx.x)
@@ -165,8 +166,8 @@ def _lstm_accum_kernel[
 def _lstm_db_kernel[
     BATCH: Int, H: Int,
 ](
-    d_comb: LayoutTensor[DT, Layout.row_major(BATCH, 4 * H), MutAnyOrigin],
-    db: LayoutTensor[DT, Layout.row_major(4 * H), MutAnyOrigin],
+    d_comb: Tile[DT, BATCH, 4 * H],
+    db: Tile[DT, 4 * H],
 ):
     """Accumulate db += Σ_b d_comb. Grid (4H,)."""
     var k = Int(block_idx.x)
@@ -421,17 +422,13 @@ struct LSTMCell[IN_: Int, HIDDEN: Int](Module):
             comptime gk = _lstm_gate_fwd_kernel[BATCH, H, Self.CACHE_SIZE, True]
             comptime nblk = (BATCH * H + TPB - 1) // TPB
             dctx.enqueue_function[gk](
-                LayoutTensor[DT, Layout.row_major(BATCH, FOURH), MutAnyOrigin](
-                    self._ix.dev.value()
-                ),
-                LayoutTensor[DT, Layout.row_major(BATCH, FOURH), MutAnyOrigin](
-                    self._hx.dev.value()
-                ),
-                self.b.val.lt["gpu", Layout.row_major(FOURH)](),
-                LayoutTensor[DT, Layout.row_major(BATCH, H), MutAnyOrigin](cpb),
-                LayoutTensor[DT, Layout.row_major(BATCH, H), MutAnyOrigin](htb),
-                LayoutTensor[DT, Layout.row_major(BATCH, H), MutAnyOrigin](ctb),
-                LayoutTensor[DT, Layout.row_major(BATCH, Self.CACHE_SIZE), MutAnyOrigin](ccb),
+                tile[BATCH, FOURH](self._ix.dev.value()),
+                tile[BATCH, FOURH](self._hx.dev.value()),
+                self.b.val.tt["gpu", FOURH](),
+                tile[BATCH, H](cpb),
+                tile[BATCH, H](htb),
+                tile[BATCH, H](ctb),
+                tile[BATCH, Self.CACHE_SIZE](ccb),
                 grid_dim=(nblk,), block_dim=(TPB,),
             )
 
@@ -504,20 +501,14 @@ struct LSTMCell[IN_: Int, HIDDEN: Int](Module):
             # cache unused (WITH_CACHE=False) — alias h_t's buffer as a dummy.
             comptime gk = _lstm_gate_fwd_kernel[BATCH, H, Self.CACHE_SIZE, False]
             comptime nblk = (BATCH * H + TPB - 1) // TPB
-            var dummy = LayoutTensor[
-                DT, Layout.row_major(BATCH, Self.CACHE_SIZE), MutAnyOrigin
-            ](h_t.dev.value())
+            var dummy = tile[BATCH, Self.CACHE_SIZE](h_t.dev.value())
             c.enqueue_function[gk](
-                LayoutTensor[DT, Layout.row_major(BATCH, FOURH), MutAnyOrigin](
-                    self._ix.dev.value()
-                ),
-                LayoutTensor[DT, Layout.row_major(BATCH, FOURH), MutAnyOrigin](
-                    self._hx.dev.value()
-                ),
-                self.b.val.lt["gpu", Layout.row_major(FOURH)](),
-                c_prev.lt["gpu", Layout.row_major(BATCH, H)](),
-                h_t.lt["gpu", Layout.row_major(BATCH, H)](),
-                c_t.lt["gpu", Layout.row_major(BATCH, H)](),
+                tile[BATCH, FOURH](self._ix.dev.value()),
+                tile[BATCH, FOURH](self._hx.dev.value()),
+                self.b.val.tt["gpu", FOURH](),
+                c_prev.tt["gpu", BATCH, H](),
+                h_t.tt["gpu", BATCH, H](),
+                c_t.tt["gpu", BATCH, H](),
                 dummy,
                 grid_dim=(nblk,), block_dim=(TPB,),
             )
@@ -672,17 +663,15 @@ struct LSTMCell[IN_: Int, HIDDEN: Int](Module):
             var dcpb = dc_prev.dev.value().create_sub_buffer[DT](dc_prev_off, BATCH * H)
 
             # Phase 1: gate-grad math → d_comb [BATCH, 4H] + dc_prev.
-            var dcomb = LayoutTensor[
-                DT, Layout.row_major(BATCH, FOURH), MutAnyOrigin
-            ](self._dcomb.dev.value())
+            var dcomb = tile[BATCH, FOURH](self._dcomb.dev.value())
             comptime gk = _lstm_gate_grad_kernel[BATCH, H, Self.CACHE_SIZE]
             comptime nbh = (BATCH * H + TPB - 1) // TPB
             c.enqueue_function[gk](
-                LayoutTensor[DT, Layout.row_major(BATCH, H), MutAnyOrigin](dhb),
-                LayoutTensor[DT, Layout.row_major(BATCH, H), MutAnyOrigin](dcb),
-                LayoutTensor[DT, Layout.row_major(BATCH, H), MutAnyOrigin](cpb),
-                LayoutTensor[DT, Layout.row_major(BATCH, Self.CACHE_SIZE), MutAnyOrigin](ccb),
-                LayoutTensor[DT, Layout.row_major(BATCH, H), MutAnyOrigin](dcpb),
+                tile[BATCH, H](dhb),
+                tile[BATCH, H](dcb),
+                tile[BATCH, H](cpb),
+                tile[BATCH, Self.CACHE_SIZE](ccb),
+                tile[BATCH, H](dcpb),
                 dcomb,
                 grid_dim=(nbh,), block_dim=(TPB,),
             )
@@ -744,14 +733,14 @@ struct LSTMCell[IN_: Int, HIDDEN: Int](Module):
             max_matmul[target="gpu"](dWhh_tmp_tt, hT_tt, dcomb_tt, c)
             comptime aih = _lstm_accum_kernel[Self.W_IH_SIZE]
             c.enqueue_function[aih](
-                self.W_ih.grd.lt["gpu", Layout.row_major(Self.W_IH_SIZE)](),
-                self._dWih_tmp.lt["gpu", Layout.row_major(Self.W_IH_SIZE)](),
+                self.W_ih.grd.tt["gpu", Self.W_IH_SIZE](),
+                self._dWih_tmp.tt["gpu", Self.W_IH_SIZE](),
                 grid_dim=((Self.W_IH_SIZE + TPB - 1) // TPB,), block_dim=(TPB,),
             )
             comptime ahh = _lstm_accum_kernel[Self.W_HH_SIZE]
             c.enqueue_function[ahh](
-                self.W_hh.grd.lt["gpu", Layout.row_major(Self.W_HH_SIZE)](),
-                self._dWhh_tmp.lt["gpu", Layout.row_major(Self.W_HH_SIZE)](),
+                self.W_hh.grd.tt["gpu", Self.W_HH_SIZE](),
+                self._dWhh_tmp.tt["gpu", Self.W_HH_SIZE](),
                 grid_dim=((Self.W_HH_SIZE + TPB - 1) // TPB,), block_dim=(TPB,),
             )
 
@@ -759,7 +748,7 @@ struct LSTMCell[IN_: Int, HIDDEN: Int](Module):
             comptime bk = _lstm_db_kernel[BATCH, H]
             c.enqueue_function[bk](
                 dcomb,
-                self.b.grd.lt["gpu", Layout.row_major(FOURH)](),
+                self.b.grd.tt["gpu", FOURH](),
                 grid_dim=(FOURH,), block_dim=(TPB,),
             )
 

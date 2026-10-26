@@ -58,10 +58,13 @@ def drivers() -> List[String]:
 comptime SAVE = "trainer.save_state(checkpoint_path)"
 comptime ANNOUNCE = "announce_checkpoint(checkpoint_path, artifacts, run_dir)"
 
-comptime EXPECT_SITES = 18
+comptime EXPECT_SITES = 19
 """⚠ PINNED. If a driver gains or loses a save site this gate FAILS rather than
 silently scanning a different amount of code — the number is the evidence that
-the scan reached what it was written against."""
+the scan reached what it was written against.
+
+18 -> 19 in 1c52fb89b: the on-policy device rollout (`_run_onpolicy_device_body`)
+saves the final checkpoint on its own exit path, and announces it."""
 
 
 def _read(path: String) raises -> String:

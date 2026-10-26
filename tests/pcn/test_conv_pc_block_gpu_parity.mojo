@@ -17,7 +17,7 @@ Run (NVIDIA):
 
 from std.memory import alloc
 from std.math import sin
-from layout import Layout, LayoutTensor
+from noeira.core.tiles import tile
 from max.gpu.host import DeviceContext
 
 from noeira.experimental.pcn.pc_initializer import PCXavier
@@ -70,25 +70,15 @@ def run_gpu_parity[
         x_buf[i] = Scalar[dtype](sin(Float32(i) * 0.7 + 0.3) * 1.5)
     for i in range(BATCH * OUT):
         eps_buf[i] = Scalar[dtype](sin(Float32(i) * 1.1 + 1.7))
-    var params = LayoutTensor[dtype, Layout.row_major(PSZ), MutAnyOrigin](
-        params_buf
-    )
+    var params = tile[PSZ](params_buf)
     CB.pc_init_params[PCXavier, dtype](params)
 
-    var x = LayoutTensor[dtype, Layout.row_major(BATCH, IN), MutAnyOrigin](x_buf)
-    var a_c = LayoutTensor[dtype, Layout.row_major(BATCH, IN), MutAnyOrigin](
-        a_cpu
-    )
-    var mu_c = LayoutTensor[dtype, Layout.row_major(BATCH, OUT), MutAnyOrigin](
-        mu_cpu
-    )
-    var eps = LayoutTensor[dtype, Layout.row_major(BATCH, OUT), MutAnyOrigin](
-        eps_buf
-    )
-    var z_c = LayoutTensor[dtype, Layout.row_major(BATCH, IN), MutAnyOrigin](
-        z_cpu
-    )
-    var g_c = LayoutTensor[dtype, Layout.row_major(PSZ), MutAnyOrigin](grads_cpu)
+    var x = tile[BATCH, IN](x_buf)
+    var a_c = tile[BATCH, IN](a_cpu)
+    var mu_c = tile[BATCH, OUT](mu_cpu)
+    var eps = tile[BATCH, OUT](eps_buf)
+    var z_c = tile[BATCH, IN](z_cpu)
+    var g_c = tile[PSZ](grads_cpu)
 
     CB.predict[BATCH, dtype](x, params, mu_c, a_c)
     CB.pull_back[BATCH, dtype](eps, params, z_c)
@@ -117,17 +107,13 @@ def run_gpu_parity[
         p_h.unsafe_ptr()[i] = params_buf[i]
     ctx.enqueue_copy(params_d, p_h)
 
-    var x_t = LayoutTensor[dtype, Layout.row_major(BATCH, IN), MutAnyOrigin](x_d)
-    var a_t = LayoutTensor[dtype, Layout.row_major(BATCH, IN), MutAnyOrigin](a_d)
-    var mu_t = LayoutTensor[dtype, Layout.row_major(BATCH, OUT), MutAnyOrigin](
-        mu_d
-    )
-    var eps_t = LayoutTensor[dtype, Layout.row_major(BATCH, OUT), MutAnyOrigin](
-        eps_d
-    )
-    var p_t = LayoutTensor[dtype, Layout.row_major(PSZ), MutAnyOrigin](params_d)
-    var z_t = LayoutTensor[dtype, Layout.row_major(BATCH, IN), MutAnyOrigin](z_d)
-    var g_t = LayoutTensor[dtype, Layout.row_major(PSZ), MutAnyOrigin](grads_d)
+    var x_t = tile[BATCH, IN](x_d)
+    var a_t = tile[BATCH, IN](a_d)
+    var mu_t = tile[BATCH, OUT](mu_d)
+    var eps_t = tile[BATCH, OUT](eps_d)
+    var p_t = tile[PSZ](params_d)
+    var z_t = tile[BATCH, IN](z_d)
+    var g_t = tile[PSZ](grads_d)
 
     # ── GPU ops ───────────────────────────────────────────────────────────────
     CB.predict_gpu[BATCH, dtype](ctx, x_t, p_t, mu_t, a_t)

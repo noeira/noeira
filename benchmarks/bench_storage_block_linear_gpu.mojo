@@ -11,7 +11,7 @@ from max.gpu import global_idx, thread_idx, block_idx
 from max.gpu.primitives import block
 from max.gpu.host import DeviceContext
 from std.time import perf_counter_ns
-from layout import Layout, LayoutTensor
+from noeira.core.tiles import Tile, tile
 
 comptime DT = DType.float32
 comptime TPB = 128
@@ -20,9 +20,9 @@ comptime TPB = 128
 def _dw_serial[
     BATCH: Int, IN: Int, OUT: Int, BLK: Int
 ](
-    x: LayoutTensor[DT, Layout.row_major(BATCH * IN), MutAnyOrigin],
-    go: LayoutTensor[DT, Layout.row_major(BATCH * OUT), MutAnyOrigin],
-    grad_w: LayoutTensor[DT, Layout.row_major(BLK * (IN // BLK) * (OUT // BLK)), MutAnyOrigin],
+    x: Tile[DT, BATCH * IN],
+    go: Tile[DT, BATCH * OUT],
+    grad_w: Tile[DT, BLK * (IN // BLK) * (OUT // BLK)],
 ):
     comptime IPB = IN // BLK
     comptime OPB = OUT // BLK
@@ -44,9 +44,9 @@ def _dw_serial[
 def _dw_blockreduce[
     BATCH: Int, IN: Int, OUT: Int, BLK: Int
 ](
-    x: LayoutTensor[DT, Layout.row_major(BATCH * IN), MutAnyOrigin],
-    go: LayoutTensor[DT, Layout.row_major(BATCH * OUT), MutAnyOrigin],
-    grad_w: LayoutTensor[DT, Layout.row_major(BLK * (IN // BLK) * (OUT // BLK)), MutAnyOrigin],
+    x: Tile[DT, BATCH * IN],
+    go: Tile[DT, BATCH * OUT],
+    grad_w: Tile[DT, BLK * (IN // BLK) * (OUT // BLK)],
 ):
     comptime IPB = IN // BLK
     comptime OPB = OUT // BLK
@@ -79,9 +79,9 @@ def _time[
     _ = x.enqueue_fill(Scalar[DT](0.01))
     _ = go.enqueue_fill(Scalar[DT](0.01))
     _ = gw.enqueue_fill(Scalar[DT](0.0))
-    var xl = LayoutTensor[DT, Layout.row_major(BATCH * IN), MutAnyOrigin](x)
-    var gol = LayoutTensor[DT, Layout.row_major(BATCH * OUT), MutAnyOrigin](go)
-    var gwl = LayoutTensor[DT, Layout.row_major(WS), MutAnyOrigin](gw)
+    var xl = tile[BATCH * IN](x)
+    var gol = tile[BATCH * OUT](go)
+    var gwl = tile[WS](gw)
     var us = Float64(0)
 
     comptime if REDUCE:

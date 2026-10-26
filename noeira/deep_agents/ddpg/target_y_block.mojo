@@ -26,7 +26,6 @@ Surface:
 """
 
 from max.gpu.host import DeviceContext
-from layout import Layout
 
 from noeira.nn.constants import DT
 from noeira.nn.core.amp import AMPPolicy, NoAMP
@@ -119,7 +118,7 @@ struct DDPGTargetYBlock[
         # mb_y now holds the bootstrap γ·Q'; fold in reward + terminal mask.
         apply_terminal_mask[target, Self.BATCH](
             ctx,
-            state.mb_r.lt[target, Layout.row_major(Self.BATCH)](),
-            state.mb_d.lt[target, Layout.row_major(Self.BATCH)](),
-            state.mb_y.lt[target, Layout.row_major(Self.BATCH, 1)](),
+            state.mb_r.tt[target, Self.BATCH](),
+            state.mb_d.tt[target, Self.BATCH](),
+            state.mb_y.tt[target, Self.BATCH, 1](),
         )

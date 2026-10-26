@@ -27,7 +27,6 @@ grad_output, not the forward input). Conforms to `Module`.
 from std.math import exp
 from max.gpu import global_idx
 from max.gpu.host import DeviceContext
-from layout import Layout, LayoutTensor
 
 from noeira.nn.constants import DT, TPB
 from ..core.tensor import Tensor
@@ -36,16 +35,17 @@ from ..core.module import Module
 from ..core.param import ParamVisitor
 from ..core.initializer import Initializer
 from ..core.amp import AMPPolicy, NoAMP
+from noeira.core.tiles import RowMajor, Tile
 
 
 # ── GPU kernels (verbatim from legacy; args MutAnyOrigin = GPU ABI) ───────
 def _swiglu_forward_kernel[
     BATCH: Int, HIDDEN: Int
 ](
-    input: LayoutTensor[DT, Layout.row_major(BATCH, 2 * HIDDEN), MutAnyOrigin],
-    output: LayoutTensor[DT, Layout.row_major(BATCH, HIDDEN), MutAnyOrigin],
-    cache_u: LayoutTensor[DT, Layout.row_major(BATCH, HIDDEN), MutAnyOrigin],
-    cache_v: LayoutTensor[DT, Layout.row_major(BATCH, HIDDEN), MutAnyOrigin],
+    input: Tile[DT, BATCH, 2 * HIDDEN],
+    output: Tile[DT, BATCH, HIDDEN],
+    cache_u: Tile[DT, BATCH, HIDDEN],
+    cache_v: Tile[DT, BATCH, HIDDEN],
 ):
     var idx = Int(global_idx.x)
     if idx >= BATCH * HIDDEN:
@@ -63,12 +63,10 @@ def _swiglu_forward_kernel[
 def _swiglu_backward_kernel[
     BATCH: Int, HIDDEN: Int
 ](
-    grad_output: LayoutTensor[DT, Layout.row_major(BATCH, HIDDEN), MutAnyOrigin],
-    cache_u: LayoutTensor[DT, Layout.row_major(BATCH, HIDDEN), MutAnyOrigin],
-    cache_v: LayoutTensor[DT, Layout.row_major(BATCH, HIDDEN), MutAnyOrigin],
-    grad_input: LayoutTensor[
-        DT, Layout.row_major(BATCH, 2 * HIDDEN), MutAnyOrigin
-    ],
+    grad_output: Tile[DT, BATCH, HIDDEN],
+    cache_u: Tile[DT, BATCH, HIDDEN],
+    cache_v: Tile[DT, BATCH, HIDDEN],
+    grad_input: Tile[DT, BATCH, 2 * HIDDEN],
 ):
     var idx = Int(global_idx.x)
     if idx >= BATCH * HIDDEN:
@@ -146,15 +144,15 @@ struct SwiGLU[HIDDEN: Int](Module):
             out.ensure_gpu(c, B * Self.OUT_DIM)
             self.cache_u.ensure_gpu(c, CN)
             self.cache_v.ensure_gpu(c, CN)
-            comptime lin = Layout.row_major(B, 2 * Self.HIDDEN)
-            comptime lout = Layout.row_major(B, Self.HIDDEN)
+            comptime lin = RowMajor[B, 2 * Self.HIDDEN]
+            comptime lout = RowMajor[B, Self.HIDDEN]
             comptime n_blocks = (CN + TPB - 1) // TPB
             comptime kernel = _swiglu_forward_kernel[B, Self.HIDDEN]
             c.enqueue_function[kernel](
-                in0.lt["gpu", lin](),
-                out.lt["gpu", lout](),
-                self.cache_u.lt["gpu", lout](),
-                self.cache_v.lt["gpu", lout](),
+                in0.tt["gpu", B, 2 * Self.HIDDEN](),
+                out.tt["gpu", B, Self.HIDDEN](),
+                self.cache_u.tt["gpu", B, Self.HIDDEN](),
+                self.cache_v.tt["gpu", B, Self.HIDDEN](),
                 grid_dim=n_blocks,
                 block_dim=TPB,
             )
@@ -195,15 +193,15 @@ struct SwiGLU[HIDDEN: Int](Module):
         else:
             var c = ctx.value()
             gin.ensure_gpu(c, B * Self.IN_DIM0)
-            comptime lin = Layout.row_major(B, 2 * Self.HIDDEN)
-            comptime lout = Layout.row_major(B, Self.HIDDEN)
+            comptime lin = RowMajor[B, 2 * Self.HIDDEN]
+            comptime lout = RowMajor[B, Self.HIDDEN]
             comptime n_blocks = (CN + TPB - 1) // TPB
             comptime kernel = _swiglu_backward_kernel[B, Self.HIDDEN]
             c.enqueue_function[kernel](
-                grad_output.lt["gpu", lout](),
-                self.cache_u.lt["gpu", lout](),
-                self.cache_v.lt["gpu", lout](),
-                gin.lt["gpu", lin](),
+                grad_output.tt["gpu", B, Self.HIDDEN](),
+                self.cache_u.tt["gpu", B, Self.HIDDEN](),
+                self.cache_v.tt["gpu", B, Self.HIDDEN](),
+                gin.tt["gpu", B, 2 * Self.HIDDEN](),
                 grid_dim=n_blocks,
                 block_dim=TPB,
             )

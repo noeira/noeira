@@ -2,7 +2,6 @@
 
 from std.math import sin, cos
 from max.gpu.host import DeviceContext, DeviceBuffer
-from layout import Layout, LayoutTensor
 
 from noeira.physics3d.fields import Data, Dims, DimsLike
 from noeira.physics3d.gpu.constants import (
@@ -19,6 +18,7 @@ from noeira.physics3d.gpu.constants import (
 from .inverted_double_pendulum_xml import InvertedDoublePendulumModel
 
 from ..phyics3d_env_config import Phyics3dEnvConfig
+from noeira.core.tiles import Tile
 
 
 # Pole segment length (each segment 0.6 m)
@@ -138,12 +138,8 @@ struct InvertedDoublePendulumConfig(Phyics3dEnvConfig):
         BATCH_SIZE: Int,
         NQ_F: Int,
     ](
-        qpos: LayoutTensor[
-            DTYPE, Layout.row_major(BATCH_SIZE, NQ_F), MutAnyOrigin
-        ],
-        meta: LayoutTensor[
-            DTYPE, Layout.row_major(BATCH_SIZE, METADATA_SIZE), MutAnyOrigin
-        ],
+        qpos: Tile[DTYPE, BATCH_SIZE, NQ_F],
+        meta: Tile[DTYPE, BATCH_SIZE, METADATA_SIZE],
         env: Int,
     ):
         # Save cart x position (qpos[0]) into META_IDX_PREV_X
@@ -165,77 +161,29 @@ struct InvertedDoublePendulumConfig(Phyics3dEnvConfig):
         NGEOM_F: Int,
         NA_F: Int,
     ](
-        qpos: LayoutTensor[
-            DTYPE, Layout.row_major(BATCH_SIZE, NQ_F), MutAnyOrigin
-        ],
-        qvel: LayoutTensor[
-            DTYPE, Layout.row_major(BATCH_SIZE, NV_F), MutAnyOrigin
-        ],
-        xpos: LayoutTensor[
-            DTYPE, Layout.row_major(BATCH_SIZE, NBODY_F * 3), MutAnyOrigin
-        ],
-        xipos: LayoutTensor[
-            DTYPE, Layout.row_major(BATCH_SIZE, NBODY_F * 3), MutAnyOrigin
-        ],
-        xquat: LayoutTensor[
-            DTYPE, Layout.row_major(BATCH_SIZE, NBODY_F * 4), MutAnyOrigin
-        ],
-        xvel: LayoutTensor[
-            DTYPE, Layout.row_major(BATCH_SIZE, NBODY_F * 3), MutAnyOrigin
-        ],
-        bodies: LayoutTensor[
-            DTYPE, Layout.row_major(NBODY_F, MODEL_BODY_SIZE), MutAnyOrigin
-        ],
-        site_xpos: LayoutTensor[
-            DTYPE, Layout.row_major(BATCH_SIZE, SITE_DIM), MutAnyOrigin
-        ],
-        contacts: LayoutTensor[
-            DTYPE,
-            Layout.row_major(BATCH_SIZE, MC_F * CONTACT_SIZE),
-            MutAnyOrigin,
-        ],
-        sites: LayoutTensor[
-            DTYPE, Layout.row_major(NSITE_F, MODEL_SITE_SIZE), MutAnyOrigin
-        ],
-        geoms: LayoutTensor[
-            DTYPE, Layout.row_major(NGEOM_F, MODEL_GEOM_SIZE), MutAnyOrigin
-        ],
-        cfrc_ext: LayoutTensor[
-            DTYPE, Layout.row_major(BATCH_SIZE, NBODY_F * 6), MutAnyOrigin
-        ],
-        cvel: LayoutTensor[
-            DTYPE, Layout.row_major(BATCH_SIZE, NBODY_F * 6), MutAnyOrigin
-        ],
-        meta: LayoutTensor[
-            DTYPE, Layout.row_major(BATCH_SIZE, METADATA_SIZE), MutAnyOrigin
-        ],
-        curriculum: LayoutTensor[
-            DTYPE, Layout.row_major(1, MODEL_CURRICULUM_SIZE), MutAnyOrigin
-        ],
-        actions: LayoutTensor[
-            DTYPE, Layout.row_major(BATCH_SIZE, ACTION_DIM), MutAnyOrigin
-        ],
-        xangvel: LayoutTensor[
-            DTYPE, Layout.row_major(BATCH_SIZE, NBODY_F * 3), MutAnyOrigin
-        ],
-        cacc: LayoutTensor[
-            DTYPE, Layout.row_major(BATCH_SIZE, NBODY_F * 6), MutAnyOrigin
-        ],
-        cfrc_int: LayoutTensor[
-            DTYPE, Layout.row_major(BATCH_SIZE, NBODY_F * 6), MutAnyOrigin
-        ],
-        subtree_com: LayoutTensor[
-            DTYPE, Layout.row_major(BATCH_SIZE, NBODY_F * 3), MutAnyOrigin
-        ],
-        site_xpos_acc: LayoutTensor[
-            DTYPE, Layout.row_major(BATCH_SIZE, SITE_DIM), MutAnyOrigin
-        ],
-        xquat_acc: LayoutTensor[
-            DTYPE, Layout.row_major(BATCH_SIZE, NBODY_F * 4), MutAnyOrigin
-        ],
-        act: LayoutTensor[
-            DTYPE, Layout.row_major(BATCH_SIZE, NA_F), MutAnyOrigin
-        ],
+        qpos: Tile[DTYPE, BATCH_SIZE, NQ_F],
+        qvel: Tile[DTYPE, BATCH_SIZE, NV_F],
+        xpos: Tile[DTYPE, BATCH_SIZE, NBODY_F * 3],
+        xipos: Tile[DTYPE, BATCH_SIZE, NBODY_F * 3],
+        xquat: Tile[DTYPE, BATCH_SIZE, NBODY_F * 4],
+        xvel: Tile[DTYPE, BATCH_SIZE, NBODY_F * 3],
+        bodies: Tile[DTYPE, NBODY_F, MODEL_BODY_SIZE],
+        site_xpos: Tile[DTYPE, BATCH_SIZE, SITE_DIM],
+        contacts: Tile[DTYPE, BATCH_SIZE, MC_F * CONTACT_SIZE],
+        sites: Tile[DTYPE, NSITE_F, MODEL_SITE_SIZE],
+        geoms: Tile[DTYPE, NGEOM_F, MODEL_GEOM_SIZE],
+        cfrc_ext: Tile[DTYPE, BATCH_SIZE, NBODY_F * 6],
+        cvel: Tile[DTYPE, BATCH_SIZE, NBODY_F * 6],
+        meta: Tile[DTYPE, BATCH_SIZE, METADATA_SIZE],
+        curriculum: Tile[DTYPE, 1, MODEL_CURRICULUM_SIZE],
+        actions: Tile[DTYPE, BATCH_SIZE, ACTION_DIM],
+        xangvel: Tile[DTYPE, BATCH_SIZE, NBODY_F * 3],
+        cacc: Tile[DTYPE, BATCH_SIZE, NBODY_F * 6],
+        cfrc_int: Tile[DTYPE, BATCH_SIZE, NBODY_F * 6],
+        subtree_com: Tile[DTYPE, BATCH_SIZE, NBODY_F * 3],
+        site_xpos_acc: Tile[DTYPE, BATCH_SIZE, SITE_DIM],
+        xquat_acc: Tile[DTYPE, BATCH_SIZE, NBODY_F * 4],
+        act: Tile[DTYPE, BATCH_SIZE, NA_F],
         env: Int,
         step_count: Int,
         frame_skip: Int,
@@ -294,71 +242,27 @@ struct InvertedDoublePendulumConfig(Phyics3dEnvConfig):
         NGEOM_F: Int,
         NA_F: Int,
     ](
-        qpos: LayoutTensor[
-            DTYPE, Layout.row_major(BATCH_SIZE, NQ_F), MutAnyOrigin
-        ],
-        qvel: LayoutTensor[
-            DTYPE, Layout.row_major(BATCH_SIZE, NV_F), MutAnyOrigin
-        ],
-        xpos: LayoutTensor[
-            DTYPE, Layout.row_major(BATCH_SIZE, NBODY_F * 3), MutAnyOrigin
-        ],
-        xquat: LayoutTensor[
-            DTYPE, Layout.row_major(BATCH_SIZE, NBODY_F * 4), MutAnyOrigin
-        ],
-        xvel: LayoutTensor[
-            DTYPE, Layout.row_major(BATCH_SIZE, NBODY_F * 3), MutAnyOrigin
-        ],
-        bodies: LayoutTensor[
-            DTYPE, Layout.row_major(NBODY_F, MODEL_BODY_SIZE), MutAnyOrigin
-        ],
-        site_xpos: LayoutTensor[
-            DTYPE, Layout.row_major(BATCH_SIZE, SITE_DIM), MutAnyOrigin
-        ],
-        contacts: LayoutTensor[
-            DTYPE,
-            Layout.row_major(BATCH_SIZE, MC_F * CONTACT_SIZE),
-            MutAnyOrigin,
-        ],
-        sites: LayoutTensor[
-            DTYPE, Layout.row_major(NSITE_F, MODEL_SITE_SIZE), MutAnyOrigin
-        ],
-        geoms: LayoutTensor[
-            DTYPE, Layout.row_major(NGEOM_F, MODEL_GEOM_SIZE), MutAnyOrigin
-        ],
-        meta: LayoutTensor[
-            DTYPE, Layout.row_major(BATCH_SIZE, METADATA_SIZE), MutAnyOrigin
-        ],
-        obs: LayoutTensor[
-            DTYPE, Layout.row_major(BATCH_SIZE, OBS_DIM), MutAnyOrigin
-        ],
-        xipos: LayoutTensor[
-            DTYPE, Layout.row_major(BATCH_SIZE, NBODY_F * 3), MutAnyOrigin
-        ],
-        xangvel: LayoutTensor[
-            DTYPE, Layout.row_major(BATCH_SIZE, NBODY_F * 3), MutAnyOrigin
-        ],
-        cvel: LayoutTensor[
-            DTYPE, Layout.row_major(BATCH_SIZE, NBODY_F * 6), MutAnyOrigin
-        ],
-        cacc: LayoutTensor[
-            DTYPE, Layout.row_major(BATCH_SIZE, NBODY_F * 6), MutAnyOrigin
-        ],
-        cfrc_int: LayoutTensor[
-            DTYPE, Layout.row_major(BATCH_SIZE, NBODY_F * 6), MutAnyOrigin
-        ],
-        subtree_com: LayoutTensor[
-            DTYPE, Layout.row_major(BATCH_SIZE, NBODY_F * 3), MutAnyOrigin
-        ],
-        site_xpos_acc: LayoutTensor[
-            DTYPE, Layout.row_major(BATCH_SIZE, SITE_DIM), MutAnyOrigin
-        ],
-        xquat_acc: LayoutTensor[
-            DTYPE, Layout.row_major(BATCH_SIZE, NBODY_F * 4), MutAnyOrigin
-        ],
-        act: LayoutTensor[
-            DTYPE, Layout.row_major(BATCH_SIZE, NA_F), MutAnyOrigin
-        ],
+        qpos: Tile[DTYPE, BATCH_SIZE, NQ_F],
+        qvel: Tile[DTYPE, BATCH_SIZE, NV_F],
+        xpos: Tile[DTYPE, BATCH_SIZE, NBODY_F * 3],
+        xquat: Tile[DTYPE, BATCH_SIZE, NBODY_F * 4],
+        xvel: Tile[DTYPE, BATCH_SIZE, NBODY_F * 3],
+        bodies: Tile[DTYPE, NBODY_F, MODEL_BODY_SIZE],
+        site_xpos: Tile[DTYPE, BATCH_SIZE, SITE_DIM],
+        contacts: Tile[DTYPE, BATCH_SIZE, MC_F * CONTACT_SIZE],
+        sites: Tile[DTYPE, NSITE_F, MODEL_SITE_SIZE],
+        geoms: Tile[DTYPE, NGEOM_F, MODEL_GEOM_SIZE],
+        meta: Tile[DTYPE, BATCH_SIZE, METADATA_SIZE],
+        obs: Tile[DTYPE, BATCH_SIZE, OBS_DIM],
+        xipos: Tile[DTYPE, BATCH_SIZE, NBODY_F * 3],
+        xangvel: Tile[DTYPE, BATCH_SIZE, NBODY_F * 3],
+        cvel: Tile[DTYPE, BATCH_SIZE, NBODY_F * 6],
+        cacc: Tile[DTYPE, BATCH_SIZE, NBODY_F * 6],
+        cfrc_int: Tile[DTYPE, BATCH_SIZE, NBODY_F * 6],
+        subtree_com: Tile[DTYPE, BATCH_SIZE, NBODY_F * 3],
+        site_xpos_acc: Tile[DTYPE, BATCH_SIZE, SITE_DIM],
+        xquat_acc: Tile[DTYPE, BATCH_SIZE, NBODY_F * 4],
+        act: Tile[DTYPE, BATCH_SIZE, NA_F],
         env: Int,
     ) -> Bool:
         comptime assert (

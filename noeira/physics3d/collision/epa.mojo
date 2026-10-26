@@ -37,7 +37,7 @@ rest of the fields path makes for `mesh_polyvert` and `mesh_edges`.
 """
 
 from std.math import sqrt, abs
-from layout import Layout, LayoutTensor
+from layout import TileTensor, TensorLayout
 
 from .ccd_workspace import (
     EPA_V_CAP,
@@ -100,8 +100,8 @@ def epa_mindist4[DTYPE: DType]() -> Scalar[DTYPE]:
 
 
 @always_inline
-def ev[DTYPE: DType, L_WS: Layout](
-    ws: LayoutTensor[DTYPE, L_WS, MutAnyOrigin], wrow: Int, i: Int, k: Int
+def ev[DTYPE: DType, L_WS: TensorLayout](
+    ws: TileTensor[DTYPE, L_WS, MutAnyOrigin], wrow: Int, i: Int, k: Int
 ) -> Scalar[DTYPE]:
     """`pt->verts[i]` component `k` — 0..2 Minkowski, 3..5 / 6..8 witnesses,
     9 / 10 the support indices."""
@@ -109,8 +109,8 @@ def ev[DTYPE: DType, L_WS: Layout](
 
 
 @always_inline
-def set_ev[DTYPE: DType, L_WS: Layout](
-    ws: LayoutTensor[DTYPE, L_WS, MutAnyOrigin],
+def set_ev[DTYPE: DType, L_WS: TensorLayout](
+    ws: TileTensor[DTYPE, L_WS, MutAnyOrigin],
     wrow: Int,
     i: Int,
     k: Int,
@@ -120,8 +120,8 @@ def set_ev[DTYPE: DType, L_WS: Layout](
 
 
 @always_inline
-def sv[DTYPE: DType, L_WS: Layout](
-    ws: LayoutTensor[DTYPE, L_WS, MutAnyOrigin],
+def sv[DTYPE: DType, L_WS: TensorLayout](
+    ws: TileTensor[DTYPE, L_WS, MutAnyOrigin],
     wrow: Int,
     base: Int,
     i: Int,
@@ -137,8 +137,8 @@ def sv[DTYPE: DType, L_WS: Layout](
 
 
 @always_inline
-def set_sv[DTYPE: DType, L_WS: Layout](
-    ws: LayoutTensor[DTYPE, L_WS, MutAnyOrigin],
+def set_sv[DTYPE: DType, L_WS: TensorLayout](
+    ws: TileTensor[DTYPE, L_WS, MutAnyOrigin],
     wrow: Int,
     base: Int,
     i: Int,
@@ -149,24 +149,24 @@ def set_sv[DTYPE: DType, L_WS: Layout](
 
 
 @always_inline
-def ef[DTYPE: DType, L_WS: Layout](
-    ws: LayoutTensor[DTYPE, L_WS, MutAnyOrigin], wrow: Int, f: Int, c: Int
+def ef[DTYPE: DType, L_WS: TensorLayout](
+    ws: TileTensor[DTYPE, L_WS, MutAnyOrigin], wrow: Int, f: Int, c: Int
 ) -> Int:
     """`Face::verts[c]`."""
     return Int(rebind[Scalar[DTYPE]](ws[wrow, CCD_WS_EF + f * 3 + c]))
 
 
 @always_inline
-def eadj[DTYPE: DType, L_WS: Layout](
-    ws: LayoutTensor[DTYPE, L_WS, MutAnyOrigin], wrow: Int, f: Int, c: Int
+def eadj[DTYPE: DType, L_WS: TensorLayout](
+    ws: TileTensor[DTYPE, L_WS, MutAnyOrigin], wrow: Int, f: Int, c: Int
 ) -> Int:
     """`Face::adj[c]` — the face across edge `c`."""
     return Int(rebind[Scalar[DTYPE]](ws[wrow, CCD_WS_EADJ + f * 3 + c]))
 
 
 @always_inline
-def set_eadj[DTYPE: DType, L_WS: Layout](
-    ws: LayoutTensor[DTYPE, L_WS, MutAnyOrigin],
+def set_eadj[DTYPE: DType, L_WS: TensorLayout](
+    ws: TileTensor[DTYPE, L_WS, MutAnyOrigin],
     wrow: Int,
     f: Int,
     c: Int,
@@ -176,62 +176,62 @@ def set_eadj[DTYPE: DType, L_WS: Layout](
 
 
 @always_inline
-def efv[DTYPE: DType, L_WS: Layout](
-    ws: LayoutTensor[DTYPE, L_WS, MutAnyOrigin], wrow: Int, f: Int, c: Int
+def efv[DTYPE: DType, L_WS: TensorLayout](
+    ws: TileTensor[DTYPE, L_WS, MutAnyOrigin], wrow: Int, f: Int, c: Int
 ) -> Scalar[DTYPE]:
     """`Face::v[c]` — the origin projected onto the face's plane."""
     return rebind[Scalar[DTYPE]](ws[wrow, CCD_WS_EFV + f * 3 + c])
 
 
 @always_inline
-def efd[DTYPE: DType, L_WS: Layout](
-    ws: LayoutTensor[DTYPE, L_WS, MutAnyOrigin], wrow: Int, f: Int
+def efd[DTYPE: DType, L_WS: TensorLayout](
+    ws: TileTensor[DTYPE, L_WS, MutAnyOrigin], wrow: Int, f: Int
 ) -> Scalar[DTYPE]:
     """`Face::dist2`."""
     return rebind[Scalar[DTYPE]](ws[wrow, CCD_WS_EFD + f])
 
 
 @always_inline
-def efi[DTYPE: DType, L_WS: Layout](
-    ws: LayoutTensor[DTYPE, L_WS, MutAnyOrigin], wrow: Int, f: Int
+def efi[DTYPE: DType, L_WS: TensorLayout](
+    ws: TileTensor[DTYPE, L_WS, MutAnyOrigin], wrow: Int, f: Int
 ) -> Int:
     """`Face::index` — >= 0 slot in `map`, -1 not in map, -2 deleted."""
     return Int(rebind[Scalar[DTYPE]](ws[wrow, CCD_WS_EFI + f]))
 
 
 @always_inline
-def set_efi[DTYPE: DType, L_WS: Layout](
-    ws: LayoutTensor[DTYPE, L_WS, MutAnyOrigin], wrow: Int, f: Int, v: Int
+def set_efi[DTYPE: DType, L_WS: TensorLayout](
+    ws: TileTensor[DTYPE, L_WS, MutAnyOrigin], wrow: Int, f: Int, v: Int
 ):
     ws[wrow, CCD_WS_EFI + f] = Scalar[DTYPE](v)
 
 
 @always_inline
-def emap[DTYPE: DType, L_WS: Layout](
-    ws: LayoutTensor[DTYPE, L_WS, MutAnyOrigin], wrow: Int, i: Int
+def emap[DTYPE: DType, L_WS: TensorLayout](
+    ws: TileTensor[DTYPE, L_WS, MutAnyOrigin], wrow: Int, i: Int
 ) -> Int:
     """`pt->map[i]` — the face index in candidate slot `i`."""
     return Int(rebind[Scalar[DTYPE]](ws[wrow, CCD_WS_MAP + i]))
 
 
 @always_inline
-def set_emap[DTYPE: DType, L_WS: Layout](
-    ws: LayoutTensor[DTYPE, L_WS, MutAnyOrigin], wrow: Int, i: Int, f: Int
+def set_emap[DTYPE: DType, L_WS: TensorLayout](
+    ws: TileTensor[DTYPE, L_WS, MutAnyOrigin], wrow: Int, i: Int, f: Int
 ):
     ws[wrow, CCD_WS_MAP + i] = Scalar[DTYPE](f)
 
 
 @always_inline
-def ehor[DTYPE: DType, L_WS: Layout](
-    ws: LayoutTensor[DTYPE, L_WS, MutAnyOrigin], wrow: Int, h: Int, c: Int
+def ehor[DTYPE: DType, L_WS: TensorLayout](
+    ws: TileTensor[DTYPE, L_WS, MutAnyOrigin], wrow: Int, h: Int, c: Int
 ) -> Int:
     """`horizon.indices[h]` (c == 0) and `horizon.edges[h]` (c == 1)."""
     return Int(rebind[Scalar[DTYPE]](ws[wrow, CCD_WS_HOR + h * 2 + c]))
 
 
 @always_inline
-def set_center[DTYPE: DType, L_WS: Layout](
-    ws: LayoutTensor[DTYPE, L_WS, MutAnyOrigin],
+def set_center[DTYPE: DType, L_WS: TensorLayout](
+    ws: TileTensor[DTYPE, L_WS, MutAnyOrigin],
     wrow: Int,
     cx: Scalar[DTYPE],
     cy: Scalar[DTYPE],
@@ -547,8 +547,8 @@ def ray_triangle[DTYPE: DType](
 
 
 @always_inline
-def attach_face[DTYPE: DType, L_WS: Layout](
-    ws: LayoutTensor[DTYPE, L_WS, MutAnyOrigin],
+def attach_face[DTYPE: DType, L_WS: TensorLayout](
+    ws: TileTensor[DTYPE, L_WS, MutAnyOrigin],
     wrow: Int,
     f: Int,
     v1: Int,
@@ -629,8 +629,8 @@ def attach_face[DTYPE: DType, L_WS: Layout](
 
 
 @always_inline
-def delete_face[DTYPE: DType, L_WS: Layout](
-    ws: LayoutTensor[DTYPE, L_WS, MutAnyOrigin],
+def delete_face[DTYPE: DType, L_WS: TensorLayout](
+    ws: TileTensor[DTYPE, L_WS, MutAnyOrigin],
     wrow: Int,
     f: Int,
     mut nmap: Int,
@@ -646,8 +646,8 @@ def delete_face[DTYPE: DType, L_WS: Layout](
 
 
 @always_inline
-def get_edge[DTYPE: DType, L_WS: Layout](
-    ws: LayoutTensor[DTYPE, L_WS, MutAnyOrigin], wrow: Int, f: Int, vertex: Int
+def get_edge[DTYPE: DType, L_WS: TensorLayout](
+    ws: TileTensor[DTYPE, L_WS, MutAnyOrigin], wrow: Int, f: Int, vertex: Int
 ) -> Int:
     """`getEdge` — which edge of `f` starts at `vertex`."""
     if ef[DTYPE, L_WS](ws, wrow, f, 0) == vertex:
@@ -658,8 +658,8 @@ def get_edge[DTYPE: DType, L_WS: Layout](
 
 
 @always_inline
-def _add_edge[DTYPE: DType, L_WS: Layout](
-    ws: LayoutTensor[DTYPE, L_WS, MutAnyOrigin],
+def _add_edge[DTYPE: DType, L_WS: TensorLayout](
+    ws: TileTensor[DTYPE, L_WS, MutAnyOrigin],
     wrow: Int,
     mut nhor: Int,
     face: Int,
@@ -674,8 +674,8 @@ def _add_edge[DTYPE: DType, L_WS: Layout](
 
 
 @always_inline
-def _visible[DTYPE: DType, L_WS: Layout](
-    ws: LayoutTensor[DTYPE, L_WS, MutAnyOrigin],
+def _visible[DTYPE: DType, L_WS: TensorLayout](
+    ws: TileTensor[DTYPE, L_WS, MutAnyOrigin],
     wrow: Int,
     f: Int,
     wx: Scalar[DTYPE],
@@ -698,8 +698,8 @@ def _visible[DTYPE: DType, L_WS: Layout](
 
 
 @always_inline
-def _horizon_rec[DTYPE: DType, L_WS: Layout](
-    ws: LayoutTensor[DTYPE, L_WS, MutAnyOrigin],
+def _horizon_rec[DTYPE: DType, L_WS: TensorLayout](
+    ws: TileTensor[DTYPE, L_WS, MutAnyOrigin],
     wrow: Int,
     f0: Int,
     e0: Int,
@@ -795,8 +795,8 @@ def _horizon_rec[DTYPE: DType, L_WS: Layout](
 
 
 @always_inline
-def horizon[DTYPE: DType, L_WS: Layout](
-    ws: LayoutTensor[DTYPE, L_WS, MutAnyOrigin],
+def horizon[DTYPE: DType, L_WS: TensorLayout](
+    ws: TileTensor[DTYPE, L_WS, MutAnyOrigin],
     wrow: Int,
     f0: Int,
     wx: Scalar[DTYPE],
@@ -843,8 +843,8 @@ def horizon[DTYPE: DType, L_WS: Layout](
 
 
 @always_inline
-def epa_witness[DTYPE: DType, L_WS: Layout](
-    ws: LayoutTensor[DTYPE, L_WS, MutAnyOrigin], wrow: Int, f: Int
+def epa_witness[DTYPE: DType, L_WS: TensorLayout](
+    ws: TileTensor[DTYPE, L_WS, MutAnyOrigin], wrow: Int, f: Int
 ) -> Array[Scalar[DTYPE], 6]:
     """`epaWitness` — the witness points on each geom for face `f`.
 

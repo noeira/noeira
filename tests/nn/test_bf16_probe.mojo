@@ -16,7 +16,7 @@ from std.math import abs as fabs
 from max.gpu import global_idx
 from max.gpu.host import DeviceContext
 from std.testing import assert_true
-from layout import Layout, LayoutTensor
+from noeira.core.tiles import RowMajor, Tile, tile
 
 
 comptime FP32 = DType.float32
@@ -26,8 +26,8 @@ comptime BF16 = DType.bfloat16
 def _fp32_to_bf16_kernel[
     N: Int,
 ](
-    src: LayoutTensor[FP32, Layout.row_major(N), MutAnyOrigin],
-    dst: LayoutTensor[BF16, Layout.row_major(N), MutAnyOrigin],
+    src: Tile[FP32, N],
+    dst: Tile[BF16, N],
 ):
     var i = Int(global_idx.x)
     if i < N:
@@ -38,8 +38,8 @@ def _fp32_to_bf16_kernel[
 def _bf16_to_fp32_kernel[
     N: Int,
 ](
-    src: LayoutTensor[BF16, Layout.row_major(N), MutAnyOrigin],
-    dst: LayoutTensor[FP32, Layout.row_major(N), MutAnyOrigin],
+    src: Tile[BF16, N],
+    dst: Tile[FP32, N],
 ):
     var i = Int(global_idx.x)
     if i < N:
@@ -65,12 +65,12 @@ def test_bf16_roundtrip() raises:
     var dev_fp32_out = ctx.enqueue_create_buffer[FP32](N)
     ctx.enqueue_copy(dev_fp32_in, host_in)
 
-    comptime layout_fp32 = Layout.row_major(N)
-    comptime layout_bf16 = Layout.row_major(N)
+    comptime layout_fp32 = RowMajor[N]
+    comptime layout_bf16 = RowMajor[N]
 
-    var lt_in   = LayoutTensor[FP32, layout_fp32, MutAnyOrigin](dev_fp32_in)
-    var lt_bf16 = LayoutTensor[BF16, layout_bf16, MutAnyOrigin](dev_bf16)
-    var lt_out  = LayoutTensor[FP32, layout_fp32, MutAnyOrigin](dev_fp32_out)
+    var lt_in   = tile[N](dev_fp32_in)
+    var lt_bf16 = tile[N](dev_bf16)
+    var lt_out  = tile[N](dev_fp32_out)
 
     comptime TPB = 64
     comptime BLOCKS = (N + TPB - 1) // TPB

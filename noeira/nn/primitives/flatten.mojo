@@ -17,7 +17,6 @@ by the channels_last checkpoint migration, not by this Module).
 
 from max.gpu import global_idx
 from max.gpu.host import DeviceContext
-from layout import Layout, LayoutTensor
 
 from noeira.nn.constants import DT, CPU_SIMD_W, TPB
 from ..core.tensor import Tensor, TensorImpl
@@ -26,13 +25,14 @@ from ..core.module import Module
 from ..core.param import ParamVisitor
 from ..core.initializer import Initializer
 from ..core.amp import AMPPolicy, NoAMP
+from noeira.core.tiles import Tile
 
 
 def _flatten_copy_kernel[
     N: Int, ADT: DType = DT
 ](
-    src: LayoutTensor[ADT, Layout.row_major(N), MutAnyOrigin],
-    dst: LayoutTensor[ADT, Layout.row_major(N), MutAnyOrigin],
+    src: Tile[ADT, N],
+    dst: Tile[ADT, N],
 ):
     var idx = Int(global_idx.x)
     if idx < N:
@@ -83,8 +83,8 @@ struct Flatten[DIM_: Int, ADT: DType = DT](Module):
             out.ensure_gpu(c, N)
             comptime nblk = (N + TPB - 1) // TPB
             c.enqueue_function[_flatten_copy_kernel[N, Self.ACT_DT]](
-                in0.lt["gpu", Layout.row_major(N)](),
-                out.lt["gpu", Layout.row_major(N)](),
+                in0.tt["gpu", N](),
+                out.tt["gpu", N](),
                 grid_dim=nblk,
                 block_dim=TPB,
             )
@@ -120,8 +120,8 @@ struct Flatten[DIM_: Int, ADT: DType = DT](Module):
             gin.ensure_gpu(c, N)
             comptime nblk = (N + TPB - 1) // TPB
             c.enqueue_function[_flatten_copy_kernel[N, Self.ACT_DT]](
-                grad_output.lt["gpu", Layout.row_major(N)](),
-                gin.lt["gpu", Layout.row_major(N)](),
+                grad_output.tt["gpu", N](),
+                gin.tt["gpu", N](),
                 grid_dim=nblk,
                 block_dim=TPB,
             )

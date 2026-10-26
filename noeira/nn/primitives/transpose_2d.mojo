@@ -22,7 +22,8 @@ from max.gpu import global_idx, thread_idx, block_idx
 from max.gpu.sync import barrier
 from max.gpu.memory import AddressSpace
 from max.gpu.host import DeviceContext
-from layout import Layout, LayoutTensor, TileTensor, row_major
+from layout import TileTensor, row_major
+from noeira.core.tiles import RowMajor, Tile, tile, shared_tile
 
 from noeira.nn.constants import DT, TPB
 
@@ -51,15 +52,10 @@ def _transpose2d_kernel[
     BATCH: Int, A: Int, B: Int
 ](
     # src laid out (A, B) per sample, dst laid out (B, A) per sample.
-    src: LayoutTensor[DT, Layout.row_major(BATCH, A * B), MutAnyOrigin],
-    dst: LayoutTensor[DT, Layout.row_major(BATCH, A * B), MutAnyOrigin],
+    src: Tile[DT, BATCH, A * B],
+    dst: Tile[DT, BATCH, A * B],
 ):
-    var tile = LayoutTensor[
-        DT,
-        Layout.row_major(T2D_TILE, T2D_TILE + 1),
-        MutAnyOrigin,
-        address_space=AddressSpace.SHARED,
-    ].stack_allocation()
+    var tile = shared_tile[DT, T2D_TILE, T2D_TILE + 1]()
 
     var b = Int(block_idx.z)
     var cy = Int(block_idx.y) * T2D_TILE     # tile origin in i (A dim)
@@ -124,13 +120,13 @@ struct Transpose2D[A_: Int, B_: Int](Module):
         else:
             var c = ctx.value()
             out.ensure_gpu(c, B * AB)
-            comptime l2d = Layout.row_major(B, AB)
+            comptime l2d = RowMajor[B, AB]
             # tile grid: x over j (B_ cols), y over i (A_ rows), z over batch.
             comptime gx = (Self.B_ + T2D_TILE - 1) // T2D_TILE
             comptime gy = (Self.A_ + T2D_TILE - 1) // T2D_TILE
             c.enqueue_function[_transpose2d_kernel[B, Self.A_, Self.B_]](
-                in0.lt["gpu", l2d](),
-                out.lt["gpu", l2d](),
+                in0.tt["gpu", B, AB](),
+                out.tt["gpu", B, AB](),
                 grid_dim=(gx, gy, B),
                 block_dim=(T2D_TILE, T2D_BR),
             )
@@ -164,14 +160,14 @@ struct Transpose2D[A_: Int, B_: Int](Module):
         else:
             var c = ctx.value()
             gin.ensure_gpu(c, B * AB)
-            comptime l2d = Layout.row_major(B, AB)
+            comptime l2d = RowMajor[B, AB]
             # Inverse permutation: treat grad_out as (B,A), write grad_in (A,B).
             # Kernel A,B are swapped → grid x over A_ cols, y over B_ rows.
             comptime gx = (Self.A_ + T2D_TILE - 1) // T2D_TILE
             comptime gy = (Self.B_ + T2D_TILE - 1) // T2D_TILE
             c.enqueue_function[_transpose2d_kernel[B, Self.B_, Self.A_]](
-                grad_output.lt["gpu", l2d](),
-                gin.lt["gpu", l2d](),
+                grad_output.tt["gpu", B, AB](),
+                gin.tt["gpu", B, AB](),
                 grid_dim=(gx, gy, B),
                 block_dim=(T2D_TILE, T2D_BR),
             )

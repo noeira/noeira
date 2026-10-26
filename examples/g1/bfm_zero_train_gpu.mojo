@@ -96,10 +96,11 @@ by the G3.4 eval, never one alone.
 from std.math import sqrt
 from std.random import seed, random_float64
 from std.sys import argv
+from std.sys.defines import get_defined_int, get_defined_string
 from std.time import perf_counter_ns
 from max.gpu import global_idx
 
-from layout import Layout, LayoutTensor
+from noeira.core.tiles import tile
 from max.gpu.host import DeviceContext, DeviceBuffer
 
 from noeira.cuda import CUDAGraph, maybe_capture_replay
@@ -207,7 +208,21 @@ comptime BATCH: Int = 1024
 # the buffer). A LOSS is not, and needs 1024/3 + CAP 1 M as the control before
 # anything is concluded. That control is also the CAP probe §12.23 has been
 # asking for since the ring rewrite and which has never been run.
-comptime CAP: Int = 1_000_000
+#
+# `-D G1_RING_DT=fp16` stores the ring's `obs` and `z` columns as fp16
+# (docs §16): 3256 -> 1690 B per transition, so `-D G1_CAP=2000000` costs
+# what CAP 1 M costs in fp32. fp16, not bf16: the ring holds RAW observations
+# and fp16 rounds them 9x finer (worst 0.005 std against 0.047). The
+# defaults stay fp32 / 1 M — the run at 36.9 M -> 100 M was launched on them,
+# and a buffer change goes through a short A/B first.
+comptime CAP: Int = get_defined_int["G1_CAP", 1_000_000]()
+comptime RING_DT: DType = (
+    DType.float16 if get_defined_string["G1_RING_DT", "fp32"]() == "fp16"
+    else (
+        DType.bfloat16 if get_defined_string["G1_RING_DT", "fp32"]() == "bf16"
+        else DType.float32
+    )
+)
 comptime SEQ: Int = 8
 comptime ZBUF: Int = 8192
 comptime T_EPISODE: Int = 500
@@ -230,6 +245,7 @@ comptime QNet = BFMFTower[OBS, ACT, D, H, L, 1]
 comptime Agent = FBCPROnlineAgent[
     FNet, BNet, ANet, DNet, QNet, OBS, ACT, D, BATCH, CAP, N_ENVS, SEQ, ZBUF,
     G1_ACTOR_EXTRA,   # DERIVED_TAIL — the 401 the ring does NOT store (§12.36)
+    RING_DT,
 ]
 comptime NQ = UnitreeG1Model.NQ
 comptime NV = UnitreeG1Model.NV
@@ -588,6 +604,11 @@ def main() raises:
     var seed_v = atol(_flag(String("--seed"), String(20260909)))
     var lie_prob = atof(_flag(String("--lie-prob"), String(G1_LIE_DOWN_PROB)))
     var track_on = not _has("--no-track")
+    # The actor step backpropagates through F1, F2, Q_D1 and Q_D2 for dQ/da
+    # only; by default their gradient buffers are moved out for that pass so
+    # no dW GEMM runs (`noeira/nn/core/grad_stash.mojo`, same bits).
+    # `--no-grad-stash` forms and discards them as before, for an A/B.
+    var grad_stash = not _has("--no-grad-stash")
     # 0 turns the in-loop tracking eval off. 1 is one segment per clip (40
     # segments, ~35 s) — ~3 % of a 20-minute checkpoint interval, and the only
     # number in the file that measures the thing the run is FOR.
@@ -661,6 +682,8 @@ def main() raises:
     logger.set_config("env", "unitree_g1")
     logger.set_config("target", "gpu")
     logger.set_config("lanes", String(N_ENVS))
+    logger.set_config("cap", String(CAP))
+    logger.set_config("ring_dt", String(RING_DT))
     logger.set_config("obs", String(OBS))
     logger.set_config("act", String(ACT))
     logger.set_config("d", String(D))
@@ -674,6 +697,7 @@ def main() raises:
     logger.set_config("t_episode", String(T_EPISODE))
     logger.set_config("track_len", String(TRACK_LEN))
     logger.set_config("lie_prob", String(lie_prob))
+    logger.set_config("grad_stash", String(grad_stash))
     # ⚠ AFTER the config and before step 0 — `register_run` seeds the
     # dashboard from the run (id, project, commit, seed, host) and POSTs
     # `/runs`. A run that dies before step 0 otherwise never appears at all.
@@ -804,6 +828,7 @@ def main() raises:
     g1_build_tail_spec(tail_spec)
     agent.attach_tail_spec(tail_spec)
     agent.set_action_norm(G1_NORMALIZE_TO, G1_ACTION_CLIP)
+    agent.base.t.stash_critic_grads = grad_stash
     agent.attach_expert_windows(eobs^, starts8_dev^, len(starts8))
     if track_on:
         agent.base.enable_z_pin()
@@ -1073,10 +1098,10 @@ def main() raises:
         _pack_obs()
         ctx.enqueue_copy(prev_obs, full_obs)
         agent.select_action_batched[N_ENVS](
-            LayoutTensor[DT, Layout.row_major(N_ENVS, OBS), MutAnyOrigin](full_obs),
-            LayoutTensor[DT, Layout.row_major(N_ENVS, ACT), MutAnyOrigin](env._action),
-            LayoutTensor[DT, Layout.row_major(N_ENVS, 2 * ACT), MutAnyOrigin](ao),
-            LayoutTensor[DT, Layout.row_major(N_ENVS, ACT + 1), MutAnyOrigin](alp),
+            tile[N_ENVS, OBS](full_obs),
+            tile[N_ENVS, ACT](env._action),
+            tile[N_ENVS, 2 * ACT](ao),
+            tile[N_ENVS, ACT + 1](alp),
             env_steps,
         )
         # push(state_t, a_{t-1}) then last_action = a_t, before the env moves

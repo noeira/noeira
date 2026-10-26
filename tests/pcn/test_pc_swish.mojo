@@ -14,7 +14,7 @@ Run:
 
 from std.math import abs as mabs
 from max.gpu.host import DeviceContext
-from layout import Layout, LayoutTensor
+from noeira.core.tiles import tile
 
 from noeira.experimental.pcn import PCSwish
 from noeira.nn.core.ptr import mptr
@@ -70,18 +70,10 @@ def main() raises:
     for _ in range(BATCH * DIM):
         z_out_buf.append(0.0)
 
-    var x_t = LayoutTensor[
-        DType.float32, Layout.row_major(BATCH, DIM), MutAnyOrigin
-    ](mptr(x_buf))
-    var a_t = LayoutTensor[
-        DType.float32, Layout.row_major(BATCH, DIM), MutAnyOrigin
-    ](mptr(a_buf))
-    var z_in_t = LayoutTensor[
-        DType.float32, Layout.row_major(BATCH, DIM), MutAnyOrigin
-    ](mptr(z_in_buf))
-    var z_out_t = LayoutTensor[
-        DType.float32, Layout.row_major(BATCH, DIM), MutAnyOrigin
-    ](mptr(z_out_buf))
+    var x_t = tile[BATCH, DIM](mptr(x_buf))
+    var a_t = tile[BATCH, DIM](mptr(a_buf))
+    var z_in_t = tile[BATCH, DIM](mptr(z_in_buf))
+    var z_out_t = tile[BATCH, DIM](mptr(z_out_buf))
 
     PCSwish.apply[BATCH, DIM, DType.float32](x_t, a_t)
     PCSwish.apply_derivative_mul[BATCH, DIM, DType.float32](x_t, z_in_t, z_out_t)
@@ -125,18 +117,10 @@ def main() raises:
         ctx.enqueue_copy(z_in_dbuf, z_in_host)
         ctx.synchronize()
 
-        var x_d_t = LayoutTensor[
-            DType.float32, Layout.row_major(BATCH, DIM), MutAnyOrigin
-        ](x_dbuf.unsafe_ptr().as_unsafe_any_origin())
-        var a_d_t = LayoutTensor[
-            DType.float32, Layout.row_major(BATCH, DIM), MutAnyOrigin
-        ](a_dbuf.unsafe_ptr().as_unsafe_any_origin())
-        var z_in_d_t = LayoutTensor[
-            DType.float32, Layout.row_major(BATCH, DIM), MutAnyOrigin
-        ](z_in_dbuf.unsafe_ptr().as_unsafe_any_origin())
-        var z_out_d_t = LayoutTensor[
-            DType.float32, Layout.row_major(BATCH, DIM), MutAnyOrigin
-        ](z_out_dbuf.unsafe_ptr().as_unsafe_any_origin())
+        var x_d_t = tile[BATCH, DIM](x_dbuf.unsafe_ptr().as_unsafe_any_origin())
+        var a_d_t = tile[BATCH, DIM](a_dbuf.unsafe_ptr().as_unsafe_any_origin())
+        var z_in_d_t = tile[BATCH, DIM](z_in_dbuf.unsafe_ptr().as_unsafe_any_origin())
+        var z_out_d_t = tile[BATCH, DIM](z_out_dbuf.unsafe_ptr().as_unsafe_any_origin())
 
         PCSwish.apply_gpu[BATCH, DIM, DType.float32](ctx, x_d_t, a_d_t)
         PCSwish.apply_derivative_mul_gpu[BATCH, DIM, DType.float32](

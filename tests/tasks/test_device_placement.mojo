@@ -153,7 +153,7 @@ from noeira.physics3d.parser.runtime_load import (
 from noeira.physics3d.fields import Data, Model, DynDims
 from noeira.physics3d.kinematics.forward_kinematics import forward_kinematics
 
-from layout import Layout, LayoutTensor
+from noeira.core.tiles import RowMajor
 from noeira.nn.core.tensor import TensorImpl
 
 
@@ -370,9 +370,9 @@ def _parity[T: PlacementTable](
     drawn joint is counted."""
     comptime NQ = T.NQ
     comptime NV = T.NV
-    comptime L_Q = Layout.row_major(BATCH, NQ)
-    comptime L_V = Layout.row_major(BATCH, NV)
-    comptime L_M = Layout.row_major(BATCH, METADATA_SIZE)
+    comptime L_Q = RowMajor[BATCH, NQ]
+    comptime L_V = RowMajor[BATCH, NV]
+    comptime L_M = RowMajor[BATCH, METADATA_SIZE]
     var words = init_region_words(t, f)
     var jwords = joint_init_words[T](t)
     var qs = TensorImpl[DT].alloc(BATCH * NQ)
@@ -404,9 +404,9 @@ def _parity[T: PlacementTable](
     var meta_before = List[Float64]()
     for i in range(BATCH * METADATA_SIZE):
         meta_before.append(Float64(ms.data[i]))
-    var qt = qs.lt["cpu", L_Q]()
-    var vt = vs.lt["cpu", L_V]()
-    var mt = ms.lt["cpu", L_M]()
+    var qt = qs.tt["cpu", BATCH, NQ]()
+    var vt = vs.tt["cpu", BATCH, NV]()
+    var mt = ms.tt["cpu", BATCH, METADATA_SIZE]()
 
     for lane in range(BATCH):
         reset_task_slots[T, DT, BATCH, NQ, NV](qt, vt, mt, lane, SEED)
@@ -1342,9 +1342,9 @@ def main() raises:
         zv.data[i] = Scalar[DT](QVEL_SENTINEL)
     for i in range(BATCH * METADATA_SIZE):
         zm.data[i] = Scalar[DT](0)
-    var zqt = zs.lt["cpu", Layout.row_major(BATCH, NQ0)]()
-    var zvt = zv.lt["cpu", Layout.row_major(BATCH, NV0)]()
-    var zmt = zm.lt["cpu", Layout.row_major(BATCH, METADATA_SIZE)]()
+    var zqt = zs.tt["cpu", BATCH, NQ0]()
+    var zvt = zv.tt["cpu", BATCH, NV0]()
+    var zmt = zm.tt["cpu", BATCH, METADATA_SIZE]()
     # ⚠ THE FIVE UNUSED TENSORS ARE SIZE-1 SCRATCH, named so they outlive the
     # call — the hook ends with `_ = joints` / `_ = bodies` / ...
     var dj = TensorImpl[DT].alloc(MODEL_JOINT_SIZE)
@@ -1355,11 +1355,11 @@ def main() raises:
     for lane in range(BATCH):
         So101TabletopConfig.init_qpos_gpu[DT, BATCH, NQ0, 1, NV0, 1, 1](
             zqt, zvt,
-            dj.lt["cpu", Layout.row_major(1, MODEL_JOINT_SIZE)](),
-            dm3.lt["cpu", Layout.row_major(BATCH, 3)](),
-            dm4.lt["cpu", Layout.row_major(BATCH, 4)](),
-            db.lt["cpu", Layout.row_major(1, MODEL_BODY_SIZE)](),
-            dg.lt["cpu", Layout.row_major(1, MODEL_GEOM_SIZE)](),
+            dj.tt["cpu", 1, MODEL_JOINT_SIZE](),
+            dm3.tt["cpu", BATCH, 3](),
+            dm4.tt["cpu", BATCH, 4](),
+            db.tt["cpu", 1, MODEL_BODY_SIZE](),
+            dg.tt["cpu", 1, MODEL_GEOM_SIZE](),
             zmt, lane, SEED,
         )
     var parked_ok = True

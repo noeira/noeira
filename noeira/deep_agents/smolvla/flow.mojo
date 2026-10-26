@@ -41,10 +41,10 @@ layout is why this needs its own helper.
 
 from max.gpu import global_idx
 from max.gpu.host import DeviceContext
-from layout import Layout, LayoutTensor
 
 from noeira.nn.constants import DT, TPB
 from noeira.nn.core.tensor import Tensor
+from noeira.core.tiles import Tile
 
 
 struct EulerSchedule[STEPS: Int](Movable):
@@ -83,8 +83,8 @@ struct EulerSchedule[STEPS: Int](Movable):
             var c = ctx.value()
             comptime nb = (N + TPB - 1) // TPB
             c.enqueue_function[_euler_step_kernel[N]](
-                x.lt["gpu", Layout.row_major(N)](),
-                v.lt["gpu", Layout.row_major(N)](),
+                x.tt["gpu", N](),
+                v.tt["gpu", N](),
                 d,
                 grid_dim=nb,
                 block_dim=TPB,
@@ -94,8 +94,8 @@ struct EulerSchedule[STEPS: Int](Movable):
 def _euler_step_kernel[
     N: Int
 ](
-    x: LayoutTensor[DT, Layout.row_major(N), MutAnyOrigin],
-    v: LayoutTensor[DT, Layout.row_major(N), MutAnyOrigin],
+    x: Tile[DT, N],
+    v: Tile[DT, N],
     dt: Scalar[DT],
 ):
     var i = Int(global_idx.x)
@@ -109,9 +109,9 @@ def _euler_step_kernel[
 def _token_concat_kernel[
     BATCH: Int, SEQ: Int, DA: Int, DB: Int, B_STRIDE: Int
 ](
-    a: LayoutTensor[DT, Layout.row_major(BATCH, SEQ * DA), MutAnyOrigin],
-    b: LayoutTensor[DT, Layout.row_major(DB), MutAnyOrigin],
-    dst: LayoutTensor[DT, Layout.row_major(BATCH, SEQ * (DA + DB)), MutAnyOrigin],
+    a: Tile[DT, BATCH, SEQ * DA],
+    b: Tile[DT, DB],
+    dst: Tile[DT, BATCH, SEQ * (DA + DB)],
 ):
     comptime D = DA + DB
     var idx = Int(global_idx.x)
@@ -173,9 +173,9 @@ def token_concat[
         c.enqueue_function[
             _token_concat_kernel[BATCH, SEQ, DA, DB, B_STRIDE]
         ](
-            a.lt["gpu", Layout.row_major(BATCH, SEQ * DA)](),
-            b.lt["gpu", Layout.row_major(DB)](),
-            dst.lt["gpu", Layout.row_major(BATCH, SEQ * D)](),
+            a.tt["gpu", BATCH, SEQ * DA](),
+            b.tt["gpu", DB](),
+            dst.tt["gpu", BATCH, SEQ * D](),
             grid_dim=nb,
             block_dim=TPB,
         )
@@ -184,10 +184,8 @@ def token_concat[
 def _token_split_a_kernel[
     BATCH: Int, SEQ: Int, DA: Int, DB: Int
 ](
-    src: LayoutTensor[
-        DT, Layout.row_major(BATCH, SEQ * (DA + DB)), MutAnyOrigin
-    ],
-    dst: LayoutTensor[DT, Layout.row_major(BATCH, SEQ * DA), MutAnyOrigin],
+    src: Tile[DT, BATCH, SEQ * (DA + DB)],
+    dst: Tile[DT, BATCH, SEQ * DA],
 ):
     comptime D = DA + DB
     var idx = Int(global_idx.x)
@@ -235,8 +233,8 @@ def token_split_a[
         dst.ensure_gpu(c, N)
         comptime nb = (N + TPB - 1) // TPB
         c.enqueue_function[_token_split_a_kernel[BATCH, SEQ, DA, DB]](
-            src.lt["gpu", Layout.row_major(BATCH, SEQ * D)](),
-            dst.lt["gpu", Layout.row_major(BATCH, SEQ * DA)](),
+            src.tt["gpu", BATCH, SEQ * D](),
+            dst.tt["gpu", BATCH, SEQ * DA](),
             grid_dim=nb,
             block_dim=TPB,
         )

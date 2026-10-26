@@ -33,7 +33,7 @@ rather than one task.
    policy to run away.
 """
 
-from layout import Layout, LayoutTensor
+from noeira.core.tiles import RowMajor
 
 from noeira.nn.core.tensor import TensorImpl
 from noeira.physics3d.gpu.constants import (
@@ -62,9 +62,9 @@ comptime CFG = So101TabletopConfig
 # is what keeps these equal to the composed scene's.
 comptime NB = So101TabletopModel.NBODY
 comptime NS = So101TabletopModel.NSITE
-comptime L_XP = Layout.row_major(BATCH, NB * 3)
-comptime L_XQ = Layout.row_major(BATCH, NB * 4)
-comptime L_SP = Layout.row_major(BATCH, NS * 3)
+comptime L_XP = RowMajor[BATCH, NB * 3]
+comptime L_XQ = RowMajor[BATCH, NB * 4]
+comptime L_SP = RowMajor[BATCH, NS * 3]
 
 
 struct Tally(Copyable, ImplicitlyCopyable, Movable):
@@ -126,8 +126,8 @@ def main() raises:
     var nb = NB
     var ns = NS
 
-    comptime L_META = Layout.row_major(BATCH, METADATA_SIZE)
-    comptime L_CUR = Layout.row_major(1, MODEL_CURRICULUM_SIZE)
+    comptime L_META = RowMajor[BATCH, METADATA_SIZE]
+    comptime L_CUR = RowMajor[1, MODEL_CURRICULUM_SIZE]
     var meta = TensorImpl[DTYPE].alloc(BATCH * METADATA_SIZE)
     var cur = TensorImpl[DTYPE].alloc(MODEL_CURRICULUM_SIZE)
     var cw = region_table_words(
@@ -216,16 +216,16 @@ def main() raises:
                     xpos.data[cube_a * 3 + 2] = Scalar[DTYPE](0.04)
 
                     var holds = eval_tape_gpu[DTYPE, BATCH, NB, NS * 3](
-                        meta.lt["cpu", L_META](), cur.lt["cpu", L_CUR](),
-                        xpos.lt["cpu", L_XP](), xquat.lt["cpu", L_XQ](),
-                        sxp.lt["cpu", L_SP](),
+                        meta.tt["cpu", BATCH, METADATA_SIZE](), cur.tt["cpu", 1, MODEL_CURRICULUM_SIZE](),
+                        xpos.tt["cpu", BATCH, NB * 3](), xquat.tt["cpu", BATCH, NB * 4](),
+                        sxp.tt["cpu", BATCH, NS * 3](),
                         0,
                     )
                     var d = Float64(
                         tape_distance_gpu[DTYPE, BATCH, NB, NS * 3](
-                            meta.lt["cpu", L_META](), cur.lt["cpu", L_CUR](),
-                            xpos.lt["cpu", L_XP](), xquat.lt["cpu", L_XQ](),
-                            sxp.lt["cpu", L_SP](),
+                            meta.tt["cpu", BATCH, METADATA_SIZE](), cur.tt["cpu", 1, MODEL_CURRICULUM_SIZE](),
+                            xpos.tt["cpu", BATCH, NB * 3](), xquat.tt["cpu", BATCH, NB * 4](),
+                            sxp.tt["cpu", BATCH, NS * 3](),
                             0,
                         )
                     )
@@ -283,9 +283,9 @@ def main() raises:
         xpos.data[brick * 3 + 2] = Scalar[DTYPE](0.04)
         var d = Float64(
             tape_distance_gpu[DTYPE, BATCH, NB, NS * 3](
-                meta.lt["cpu", L_META](), cur.lt["cpu", L_CUR](),
-                xpos.lt["cpu", L_XP](), xquat.lt["cpu", L_XQ](),
-                sxp.lt["cpu", L_SP](),
+                meta.tt["cpu", BATCH, METADATA_SIZE](), cur.tt["cpu", 1, MODEL_CURRICULUM_SIZE](),
+                xpos.tt["cpu", BATCH, NB * 3](), xquat.tt["cpu", BATCH, NB * 4](),
+                sxp.tt["cpu", BATCH, NS * 3](),
                 0,
             )
         )

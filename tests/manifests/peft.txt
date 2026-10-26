@@ -1,0 +1,30 @@
+# Frozen parameters and, later, LoRA / int4 (noeira/nn/peft, noeira/nn/quant).
+#   pixi run test-peft            (CPU; the *_gpu entries need an accelerator)
+tests/nn/peft/test_linear_freeze.mojo
+tests/nn/peft/test_linear_freeze_gpu.mojo
+tests/nn/peft/test_grad_stash.mojo
+tests/nn/peft/test_freeze_params.mojo
+tests/nn/peft/test_freeze_params_gpu.mojo
+tests/nn/peft/test_freeze_optimizers.mojo
+tests/nn/peft/test_freeze_optimizers_gpu.mojo
+tests/nn/peft/test_frozen_checkpoint.mojo
+tests/deep_agents/smolvla/test_train_state_proj_frozen_tower.mojo
+tests/nn/peft/test_lora.mojo
+tests/nn/peft/test_lora_gpu.mojo
+tests/nn/peft/test_peft_io.mojo
+tests/deep_agents/smolvla/test_lora_wiring.mojo
+tests/deep_agents/smolvla/test_lora_wiring_gpu.mojo
+tests/deep_agents/smolvla/test_finetune_lora.mojo
+tests/nn/quant/test_q4_0.mojo
+tests/nn/quant/test_qlinear.mojo
+tests/nn/quant/test_qlinear_gpu.mojo
+tests/deep_agents/smolvla/test_q4_tower.mojo
+tests/deep_agents/smolvla/test_q4_tower_gpu.mojo
+tests/nn/quant/test_cholesky.mojo
+tests/nn/quant/test_gptq.mojo
+tests/deep_agents/smolvla/test_gptq_tower.mojo
+tests/deep_agents/smolvla/test_gptq_tower_gpu.mojo
+tests/nn/quant/test_qlora.mojo
+tests/nn/quant/test_qlora_gpu.mojo
+tests/deep_agents/smolvla/test_qlora_tower.mojo
+tests/deep_agents/smolvla/test_qlora_tower_gpu.mojo

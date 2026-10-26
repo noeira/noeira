@@ -12,7 +12,7 @@ for is slower, not wrong. First written inline in the Newton for the
 contact rows (PERFORMANCE.md §13.25), shared from §13.26 on.
 """
 
-from layout import Layout, LayoutTensor
+from layout import TileTensor, TensorLayout
 
 from ..fields.scratch import Scratch
 from ..gpu.constants import JOINT_IDX_BODY_ID
@@ -22,11 +22,11 @@ from ..gpu.constants import JOINT_IDX_BODY_ID
 def body_joint_map[
     DTYPE: DType,
     B_CAP: Int,
-    L_JOINTS: Layout,
+    L_JOINTS: TensorLayout,
 ](
     njoint: Int,
     nbody: Int,
-    joints: LayoutTensor[DTYPE, L_JOINTS, MutAnyOrigin],
+    joints: TileTensor[DTYPE, L_JOINTS, MutAnyOrigin],
     mut jnt_adr: Scratch[Int, B_CAP],
     mut jnt_num: Scratch[Int, B_CAP],
 ) -> Bool:

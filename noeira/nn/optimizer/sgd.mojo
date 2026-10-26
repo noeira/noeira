@@ -11,7 +11,6 @@ Update: `if decay: g += wd·p ; p -= lr·g`.
 
 from max.gpu import global_idx
 from max.gpu.host import DeviceContext
-from layout import Layout, LayoutTensor
 
 from noeira.nn.constants import DT, TPB
 from ..core.tensor import Tensor
@@ -153,6 +152,8 @@ struct SGD(Movable, ParamVisitor, ParamVisitorRT, Optimizer):
         apply_decay: Bool,
         ctx: Optional[DeviceContext],
     ) raises:
+        if grad.n == 0:  # frozen param: no gradient, nothing to do
+            return
         comptime if target == "cpu":
             for i in range(n):
                 var p = param.data[i]

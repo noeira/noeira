@@ -24,7 +24,6 @@ owned-Tensor scratch, TensorRefs forward/vjp, per-net clip_grad_norm + begin_ste
 
 from noeira.nn.core.param import walk_params
 from std.memory import alloc
-from layout import Layout, LayoutTensor
 from max.gpu import global_idx
 from max.gpu.host import DeviceContext, DeviceBuffer, HostBuffer
 
@@ -53,6 +52,7 @@ from ..muzero.blocks import (
     _mz_bcopy_k,
 )
 from ..zero.twohot_targets import mz_two_hot_target_batch
+from noeira.core.tiles import RowMajor, Tile
 
 
 def _a(n: Int) -> Pointer[Scalar[DT], MutAnyOrigin]:
@@ -353,9 +353,9 @@ def ezv2_unroll_train_step_continuous_cpu[
 def _ez_build_dyn_in_cont_k[
     B_: Int, LATENT_: Int, ACT_DIM_: Int, DYN_IN_: Int,
 ](
-    din: LayoutTensor[DT, Layout.row_major(B_ * DYN_IN_), MutAnyOrigin],
-    zk: LayoutTensor[DT, Layout.row_major(B_ * LATENT_), MutAnyOrigin],
-    act: LayoutTensor[DT, Layout.row_major(B_ * ACT_DIM_), MutAnyOrigin],
+    din: Tile[DT, B_ * DYN_IN_],
+    zk: Tile[DT, B_ * LATENT_],
+    act: Tile[DT, B_ * ACT_DIM_],
 ):
     """Assemble the continuous dynamics input row ``[z_k | a_k]`` per sample —
     the continuous twin of ``_mz_build_dyn_in_k`` (which one-hots a discrete
@@ -486,15 +486,15 @@ def ezv2_unroll_train_step_continuous_gpu[
     ctx.enqueue_copy(loss_d.dev.value(), h_loss)
 
     # device-view layouts (built off the storage Tensors via .lt / .lt_at)
-    comptime LB = Layout.row_major(B)
-    comptime LBOBS = Layout.row_major(B * OBS)
-    comptime LBL = Layout.row_major(B * LATENT)
-    comptime LBDI = Layout.row_major(B * DYN_IN)
-    comptime LBDO = Layout.row_major(B * DYN_OUT)
-    comptime LBPO = Layout.row_major(B * PRED_OUT)
-    comptime LBBINS = Layout.row_major(B * BINS)
-    comptime LBAD = Layout.row_major(B * ACT_DIM)
-    comptime LBPROJ = Layout.row_major(B * PROJ)
+    comptime LB = RowMajor[B]
+    comptime LBOBS = RowMajor[B * OBS]
+    comptime LBL = RowMajor[B * LATENT]
+    comptime LBDI = RowMajor[B * DYN_IN]
+    comptime LBDO = RowMajor[B * DYN_OUT]
+    comptime LBPO = RowMajor[B * PRED_OUT]
+    comptime LBBINS = RowMajor[B * BINS]
+    comptime LBAD = RowMajor[B * ACT_DIM]
+    comptime LBPROJ = RowMajor[B * PROJ]
 
     comptime nbDIN = (B * DYN_IN + TPB - 1) // TPB
     comptime nbLAT = (B * LATENT + TPB - 1) // TPB
@@ -517,40 +517,40 @@ def ezv2_unroll_train_step_continuous_gpu[
 
     # ── forward scan: z0 = h(obs0); z_{k+1} = g(z_k, a_k).latent ──
     ctx.enqueue_function[kBcopyOBS](
-        d_obs.lt_at["gpu", LBOBS](0), d_obs_work.lt["gpu", LBOBS](),
+        d_obs.tt_at["gpu", B * OBS](0), d_obs_work.tt["gpu", B * OBS](),
         grid_dim=nbOBS, block_dim=TPB,
     )
     call_forward["gpu", B](rep, TensorRefs[REP.ARITY](d_obs_work), z_work, octx)
     ctx.enqueue_function[kBcopy](
-        z_work.lt["gpu", LBL](), zst.lt_at["gpu", LBL](0),
+        z_work.tt["gpu", B * LATENT](), zst.tt_at["gpu", B * LATENT](0),
         grid_dim=nbLAT, block_dim=TPB,
     )
     for k in range(K):
         ctx.enqueue_function[kBuild](
-            din.lt["gpu", LBDI](),
-            zst.lt_at["gpu", LBL](k * B * LATENT),
-            d_act.lt_at["gpu", LBAD](k * B * ACT_DIM),
+            din.tt["gpu", B * DYN_IN](),
+            zst.tt_at["gpu", B * LATENT](k * B * LATENT),
+            d_act.tt_at["gpu", B * ACT_DIM](k * B * ACT_DIM),
             grid_dim=nbDIN, block_dim=TPB,
         )
         call_forward["gpu", B](dyn, TensorRefs[DYN.ARITY](din), dout, octx)
         ctx.enqueue_function[kCopyL](
-            zst.lt_at["gpu", LBL]((k + 1) * B * LATENT),
-            dout.lt["gpu", LBDO](),
+            zst.tt_at["gpu", B * LATENT]((k + 1) * B * LATENT),
+            dout.tt["gpu", B * DYN_OUT](),
             grid_dim=nbLAT, block_dim=TPB,
         )
 
     # ── target pre-pass: t_k = g_proj(h(obs_k)), detached, k = 1..K ──
     for k in range(1, K + 1):
         ctx.enqueue_function[kBcopyOBS](
-            d_obs.lt_at["gpu", LBOBS](k * B * OBS),
-            d_obs_work.lt["gpu", LBOBS](),
+            d_obs.tt_at["gpu", B * OBS](k * B * OBS),
+            d_obs_work.tt["gpu", B * OBS](),
             grid_dim=nbOBS, block_dim=TPB,
         )
         call_forward["gpu", B](rep, TensorRefs[REP.ARITY](d_obs_work), ztmp, octx)
         call_forward["gpu", B](proj, TensorRefs[PROJM.ARITY](ztmp), projo, octx)
         ctx.enqueue_function[kBcopyPROJ](
-            projo.lt["gpu", LBPROJ](),
-            tstore.lt_at["gpu", LBPROJ]((k - 1) * B * PROJ),
+            projo.tt["gpu", B * PROJ](),
+            tstore.tt_at["gpu", B * PROJ]((k - 1) * B * PROJ),
             grid_dim=nbPROJ, block_dim=TPB,
         )
 
@@ -564,8 +564,8 @@ def ezv2_unroll_train_step_continuous_gpu[
     for rk in range(K + 1):
         var k = K - rk
         ctx.enqueue_function[kBcopy](
-            zst.lt_at["gpu", LBL](k * B * LATENT),
-            zk_work.lt["gpu", LBL](),
+            zst.tt_at["gpu", B * LATENT](k * B * LATENT),
+            zk_work.tt["gpu", B * LATENT](),
             grid_dim=nbLAT, block_dim=TPB,
         )
 
@@ -573,24 +573,24 @@ def ezv2_unroll_train_step_continuous_gpu[
         call_forward["gpu", B](pred, TensorRefs[PRED.ARITY](zk_work), pout, octx)
         # policy: squashed-Gaussian NLL over the [0, 2*ACT_DIM) slice.
         ctx.enqueue_function[kPol](
-            pout.lt["gpu", LBPO](),
-            d_pol.lt_at["gpu", LBAD](k * B * ACT_DIM),
-            gpout.lt["gpu", LBPO](),
-            loss_d.lt_at["gpu", LB](0),
+            pout.tt["gpu", B * PRED_OUT](),
+            d_pol.tt_at["gpu", B * ACT_DIM](k * B * ACT_DIM),
+            gpout.tt["gpu", B * PRED_OUT](),
+            loss_d.tt_at["gpu", B](0),
             pscale, policy_coef,
             max_action, min_std, soft_clamp, init_std, ent_scale,
             grid_dim=nbB, block_dim=TPB,
         )
         # value: categorical soft-CE over [2*ACT_DIM, 2*ACT_DIM+BINS).
         ctx.enqueue_function[kTwoHot](
-            twv.lt["gpu", LBBINS](), d_val.lt_at["gpu", LB](k * B),
+            twv.tt["gpu", B * BINS](), d_val.tt_at["gpu", B](k * B),
             v_min, v_max, grid_dim=nbB, block_dim=TPB,
         )
         ctx.enqueue_function[kValCE](
-            pout.lt["gpu", LBPO](),
-            twv.lt["gpu", LBBINS](),
-            gpout.lt["gpu", LBPO](),
-            loss_d.lt_at["gpu", LB](B),                # value block
+            pout.tt["gpu", B * PRED_OUT](),
+            twv.tt["gpu", B * BINS](),
+            gpout.tt["gpu", B * PRED_OUT](),
+            loss_d.tt_at["gpu", B](B),                # value block
             gscale * value_coef, value_coef,
             grid_dim=nbB, block_dim=TPB,
         )
@@ -605,11 +605,11 @@ def ezv2_unroll_train_step_continuous_gpu[
             call_forward["gpu", B](proj, TensorRefs[PROJM.ARITY](zk_work), projo, octx)
             call_forward["gpu", B](predh, TensorRefs[PREDH.ARITY](projo), pk, octx)
             ctx.enqueue_function[kCons](
-                pk.lt["gpu", LBPROJ](),
-                tstore.lt_at["gpu", LBPROJ]((k - 1) * B * PROJ),
-                gpk.lt["gpu", LBPROJ](),
-                loss_d.lt_at["gpu", LB](3 * B),            # consistency block
-                d_cmask.lt_at["gpu", LB]((k - 1) * B),     # boundary mask row k
+                pk.tt["gpu", B * PROJ](),
+                tstore.tt_at["gpu", B * PROJ]((k - 1) * B * PROJ),
+                gpk.tt["gpu", B * PROJ](),
+                loss_d.tt_at["gpu", B](3 * B),            # consistency block
+                d_cmask.tt_at["gpu", B]((k - 1) * B),     # boundary mask row k
                 cscale, Scalar[DT](1.0),
                 grid_dim=nbB, block_dim=TPB,
             )
@@ -624,34 +624,34 @@ def ezv2_unroll_train_step_continuous_gpu[
                 TensorRefs[PROJM.ARITY](gzcons), octx,
             )
             ctx.enqueue_function[kAccum](
-                gpin.lt["gpu", LBL](),
-                gzcons.lt["gpu", LBL](),
+                gpin.tt["gpu", B * LATENT](),
+                gzcons.tt["gpu", B * LATENT](),
                 grid_dim=nbLAT, block_dim=TPB,
             )
 
         # (c) dynamics: carry grad from z_{k+1} + reward head, ½ on hidden input
         if k < K:
             ctx.enqueue_function[kBuild](
-                din.lt["gpu", LBDI](),
-                zst.lt_at["gpu", LBL](k * B * LATENT),
-                d_act.lt_at["gpu", LBAD](k * B * ACT_DIM),
+                din.tt["gpu", B * DYN_IN](),
+                zst.tt_at["gpu", B * LATENT](k * B * LATENT),
+                d_act.tt_at["gpu", B * ACT_DIM](k * B * ACT_DIM),
                 grid_dim=nbDIN, block_dim=TPB,
             )
             call_forward["gpu", B](dyn, TensorRefs[DYN.ARITY](din), dout, octx)
             ctx.enqueue_function[kCarry](
-                gdout.lt["gpu", LBDO](),
-                gz.lt["gpu", LBL](),
+                gdout.tt["gpu", B * DYN_OUT](),
+                gz.tt["gpu", B * LATENT](),
                 grid_dim=nbLAT, block_dim=TPB,
             )
             ctx.enqueue_function[kTwoHot](
-                twr.lt["gpu", LBBINS](), d_rew.lt_at["gpu", LB](k * B),
+                twr.tt["gpu", B * BINS](), d_rew.tt_at["gpu", B](k * B),
                 v_min, v_max, grid_dim=nbB, block_dim=TPB,
             )
             ctx.enqueue_function[kRewCE](
-                dout.lt["gpu", LBDO](),
-                twr.lt["gpu", LBBINS](),
-                gdout.lt["gpu", LBDO](),
-                loss_d.lt_at["gpu", LB](2 * B),            # reward block
+                dout.tt["gpu", B * DYN_OUT](),
+                twr.tt["gpu", B * BINS](),
+                gdout.tt["gpu", B * DYN_OUT](),
+                loss_d.tt_at["gpu", B](2 * B),            # reward block
                 gscale, Scalar[DT](1.0),
                 grid_dim=nbB, block_dim=TPB,
             )
@@ -661,21 +661,21 @@ def ezv2_unroll_train_step_continuous_gpu[
                 TensorRefs[DYN.ARITY](gdin), octx,
             )
             ctx.enqueue_function[kHalf](
-                gpin.lt["gpu", LBL](),
-                gdin.lt["gpu", LBDI](),
+                gpin.tt["gpu", B * LATENT](),
+                gdin.tt["gpu", B * DYN_IN](),
                 grid_dim=nbLAT, block_dim=TPB,
             )
 
         # carry ← full grad wrt z_k for the next (k-1) iteration
         ctx.enqueue_function[kBcopy](
-            gpin.lt["gpu", LBL](),
-            gz.lt["gpu", LBL](),
+            gpin.tt["gpu", B * LATENT](),
+            gz.tt["gpu", B * LATENT](),
             grid_dim=nbLAT, block_dim=TPB,
         )
 
     # ── rep: re-forward obs0 (cache clobbered by target pre-pass), then vjp ──
     ctx.enqueue_function[kBcopyOBS](
-        d_obs.lt_at["gpu", LBOBS](0), d_obs_work.lt["gpu", LBOBS](),
+        d_obs.tt_at["gpu", B * OBS](0), d_obs_work.tt["gpu", B * OBS](),
         grid_dim=nbOBS, block_dim=TPB,
     )
     call_forward["gpu", B](rep, TensorRefs[REP.ARITY](d_obs_work), z_work, octx)

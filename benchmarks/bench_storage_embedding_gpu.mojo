@@ -13,7 +13,8 @@ Run (NVIDIA — perf sign-off):
 from max.gpu import global_idx
 from max.gpu.host import DeviceContext
 from std.time import perf_counter_ns
-from layout import Layout, LayoutTensor, TileTensor, row_major
+from layout import TileTensor, row_major
+from noeira.core.tiles import RowMajor, Tile, tile
 from linalg.matmul import matmul as max_matmul
 
 comptime DT = DType.float32
@@ -23,9 +24,9 @@ comptime TPB = 128
 def _emb_fwd_naive[
     B: Int, VOCAB: Int, ED: Int
 ](
-    input: LayoutTensor[DT, Layout.row_major(B, VOCAB), MutAnyOrigin],
-    weight: LayoutTensor[DT, Layout.row_major(VOCAB, ED), MutAnyOrigin],
-    output: LayoutTensor[DT, Layout.row_major(B, ED), MutAnyOrigin],
+    input: Tile[DT, B, VOCAB],
+    weight: Tile[DT, VOCAB, ED],
+    output: Tile[DT, B, ED],
 ):
     var gid = Int(global_idx.x)
     if gid >= B * ED:
@@ -49,9 +50,9 @@ def _time[
     _ = inp.enqueue_fill(Scalar[DT](0.01))
     _ = w.enqueue_fill(Scalar[DT](0.02))
 
-    comptime lbv = Layout.row_major(B, VOCAB)
-    comptime lw = Layout.row_major(VOCAB, ED)
-    comptime lbe = Layout.row_major(B, ED)
+    comptime lbv = RowMajor[B, VOCAB]
+    comptime lw = RowMajor[VOCAB, ED]
+    comptime lbe = RowMajor[B, ED]
 
     comptime if GEMM:
         var in_v = TileTensor(inp, row_major[B, VOCAB]())
@@ -72,9 +73,9 @@ def _time[
             "us/iter ", gflop / (us / 1e6) / 1e3, "TFLOP/s",
         )
     else:
-        var it = LayoutTensor[DT, lbv, MutAnyOrigin](inp)
-        var wt = LayoutTensor[DT, lw, MutAnyOrigin](w)
-        var ot = LayoutTensor[DT, lbe, MutAnyOrigin](out)
+        var it = tile[B, VOCAB](inp)
+        var wt = tile[VOCAB, ED](w)
+        var ot = tile[B, ED](out)
         comptime nblk = (B * ED + TPB - 1) // TPB
         comptime for _ in range(WARMUP):
             ctx.enqueue_function[_emb_fwd_naive[B, VOCAB, ED]](

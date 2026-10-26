@@ -33,7 +33,6 @@ are written twice and the RULES (`goal_frame`, the layout) once.
 test_libero_task_hooks.mojo` (every LIBERO family) demand identical vectors.
 """
 
-from layout import Layout, LayoutTensor
 
 from noeira.physics3d.fields import Data, DimsLike
 from noeira.physics3d.gpu.constants import (
@@ -45,6 +44,7 @@ from .obs import (
 from .gpu_eval import goal_frame_ids
 from .predicates import OP_IN, OP_ON, OP_AT_REGION
 from .placement.table import PlacementTable
+from noeira.core.tiles import Tile
 
 
 comptime TASK_GOAL_WORDS: Int = 9
@@ -75,11 +75,9 @@ def repark_inactive_slots[
     NQ_F: Int,
     NV_F: Int,
 ](
-    qpos: LayoutTensor[DTYPE, Layout.row_major(BATCH_SIZE, NQ_F), MutAnyOrigin],
-    qvel: LayoutTensor[DTYPE, Layout.row_major(BATCH_SIZE, NV_F), MutAnyOrigin],
-    meta: LayoutTensor[
-        DTYPE, Layout.row_major(BATCH_SIZE, METADATA_SIZE), MutAnyOrigin
-    ],
+    qpos: Tile[DTYPE, BATCH_SIZE, NQ_F],
+    qvel: Tile[DTYPE, BATCH_SIZE, NV_F],
+    meta: Tile[DTYPE, BATCH_SIZE, METADATA_SIZE],
     env: Int,
 ):
     """Pin every INACTIVE free slot at its park pose, pose AND velocity.
@@ -121,18 +119,12 @@ def write_task_obs[
     SITE_DIM: Int,
     OBS_DIM: Int,
 ](
-    qpos: LayoutTensor[DTYPE, Layout.row_major(BATCH_SIZE, NQ_F), MutAnyOrigin],
-    qvel: LayoutTensor[DTYPE, Layout.row_major(BATCH_SIZE, NV_F), MutAnyOrigin],
-    xpos: LayoutTensor[
-        DTYPE, Layout.row_major(BATCH_SIZE, NBODY_F * 3), MutAnyOrigin
-    ],
-    site_xpos: LayoutTensor[
-        DTYPE, Layout.row_major(BATCH_SIZE, SITE_DIM), MutAnyOrigin
-    ],
-    meta: LayoutTensor[
-        DTYPE, Layout.row_major(BATCH_SIZE, METADATA_SIZE), MutAnyOrigin
-    ],
-    obs: LayoutTensor[DTYPE, Layout.row_major(BATCH_SIZE, OBS_DIM), MutAnyOrigin],
+    qpos: Tile[DTYPE, BATCH_SIZE, NQ_F],
+    qvel: Tile[DTYPE, BATCH_SIZE, NV_F],
+    xpos: Tile[DTYPE, BATCH_SIZE, NBODY_F * 3],
+    site_xpos: Tile[DTYPE, BATCH_SIZE, SITE_DIM],
+    meta: Tile[DTYPE, BATCH_SIZE, METADATA_SIZE],
+    obs: Tile[DTYPE, BATCH_SIZE, OBS_DIM],
     env: Int,
 ):
     """The observation of lane `env`, laid out as the module header says.

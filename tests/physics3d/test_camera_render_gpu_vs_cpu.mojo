@@ -29,7 +29,7 @@ from std.math import abs, sqrt
 from std.sys import has_accelerator
 from max.gpu.host import DeviceContext
 from std.testing import assert_true, assert_almost_equal, TestSuite
-from layout import Layout
+from noeira.core.tiles import RowMajor
 
 from noeira.math3d import Vec3 as Vec3Generic
 from noeira.physics3d.fields import Data, Model, Dims, init_hfield_data
@@ -343,13 +343,13 @@ def test_a_body_camera_is_carried_by_its_body() raises:
     var d = Data[GT, GD, BATCH]()
     _build(m, d)
 
-    comptime L_B3 = Layout.row_major(BATCH, NBODY * 3)
-    comptime L_B4 = Layout.row_major(BATCH, NBODY * 4)
-    comptime L_CAM = Layout.row_major(type_of(m).L_CAM.size())
-    var cams = m.cameras.lt["cpu", type_of(m).L_CAM]()
-    var xpos = d.xpos.lt["cpu", L_B3]()
-    var xquat = d.xquat.lt["cpu", L_B4]()
-    var com = d.subtree_com.lt["cpu", L_B3]()
+    comptime L_B3 = RowMajor[BATCH, NBODY * 3]
+    comptime L_B4 = RowMajor[BATCH, NBODY * 4]
+    comptime L_CAM = RowMajor[type_of(m).L_CAM.size()]
+    var cams = m.cameras.tt_dyn["cpu", type_of(m).L_CAM](type_of(m).L_CAM())
+    var xpos = d.xpos.tt["cpu", BATCH, NBODY * 3]()
+    var xquat = d.xquat.tt["cpu", BATCH, NBODY * 4]()
+    var com = d.subtree_com.tt["cpu", BATCH, NBODY * 3]()
 
     var w0 = camera_world_frame[GT](cams, xpos, xquat, com, 0, CAM_WORLD)
     var w1 = camera_world_frame[GT](cams, xpos, xquat, com, 1, CAM_WORLD)

@@ -32,7 +32,6 @@ Tolerances are Float32 against Float64 (relative 1e-4 or absolute 1e-5).
     pixi run -e apple mojo run -I . tests/tasks/test_ppo_family_device_kernels.mojo
 """
 
-from layout import Layout
 from max.gpu.host import DeviceContext
 from std.math import sqrt
 from std.random import random_float64, seed
@@ -156,12 +155,12 @@ def test_targets(ctx: DeviceContext) raises:
         var t_lo = up(ctx, lo)
         var t_hi = up(ctx, hi)
         ctx.enqueue_function[_targets_k[N]](
-            t_act.lt["gpu", Layout.row_major(N * ACT)](),
-            t_q.lt["gpu", Layout.row_major(N * ACT)](),
-            t_tg.lt["gpu", Layout.row_major(N * ACT)](),
-            t_tp.lt["gpu", Layout.row_major(N * ACT)](),
-            t_lo.lt["gpu", Layout.row_major(ACT)](),
-            t_hi.lt["gpu", Layout.row_major(ACT)](),
+            t_act.tt["gpu", N * ACT](),
+            t_q.tt["gpu", N * ACT](),
+            t_tg.tt["gpu", N * ACT](),
+            t_tp.tt["gpu", N * ACT](),
+            t_lo.tt["gpu", ACT](),
+            t_hi.tt["gpu", ACT](),
             Int32(mode), Scalar[DT](0.1), Scalar[DT](0.2), Scalar[DT](lead),
             grid_dim=GA, block_dim=TPB,
         )
@@ -218,19 +217,19 @@ def test_servo(ctx: DeviceContext) raises:
         _targets_to_env(tg, mptr(env_h.unsafe_ptr()), lo, hi, lag)
         var t_tg = up(ctx, tg)
         ctx.enqueue_function[_to_env_k[N]](
-            t_tg.lt["gpu", Layout.row_major(N * ACT)](),
-            t_act.lt["gpu", Layout.row_major(N * ACT)](),
-            t_env.lt["gpu", Layout.row_major(N * ACT)](),
-            t_lo.lt["gpu", Layout.row_major(ACT)](),
-            t_hi.lt["gpu", Layout.row_major(ACT)](),
+            t_tg.tt["gpu", N * ACT](),
+            t_act.tt["gpu", N * ACT](),
+            t_env.tt["gpu", N * ACT](),
+            t_lo.tt["gpu", ACT](),
+            t_hi.tt["gpu", ACT](),
             Int32(1), Int32(tick),
-            st[6].lt["gpu", Layout.row_major(_L_SIZE)](),
-            st[0].lt["gpu", Layout.row_major(N * ACT)](),
-            st[1].lt["gpu", Layout.row_major(N * ACT)](),
-            st[2].lt["gpu", Layout.row_major(N * ACT)](),
-            st[3].lt["gpu", Layout.row_major(N * LAG_MAX_DELAY * ACT)](),
-            st[4].lt["gpu", Layout.row_major(N * ACT)](),
-            st[5].lt["gpu", Layout.row_major(N * ACT)](),
+            st[6].tt["gpu", _L_SIZE](),
+            st[0].tt["gpu", N * ACT](),
+            st[1].tt["gpu", N * ACT](),
+            st[2].tt["gpu", N * ACT](),
+            st[3].tt["gpu", N * LAG_MAX_DELAY * ACT](),
+            st[4].tt["gpu", N * ACT](),
+            st[5].tt["gpu", N * ACT](),
             grid_dim=GA, block_dim=TPB,
         )
         var env_d = down(ctx, t_env)
@@ -288,24 +287,24 @@ def test_reset(ctx: DeviceContext) raises:
         var t_vc = zeros(ctx, N * ACT)
         var t_off = zeros(ctx, N * ACT)
         ctx.enqueue_function[_reset_k[N, E_OBS, 12]](
-            t_raw.lt["gpu", Layout.row_major(N * E_OBS)](),
-            t_qa.lt["gpu", Layout.row_major(ACT)](),
-            t_done.lt["gpu", Layout.row_major(N)](),
+            t_raw.tt["gpu", N * E_OBS](),
+            t_qa.tt["gpu", ACT](),
+            t_done.tt["gpu", N](),
             Int32(1),
-            t_q.lt["gpu", Layout.row_major(N * ACT)](),
-            t_tp.lt["gpu", Layout.row_major(N * ACT)](),
-            t_hist.lt["gpu", Layout.row_major(N * 12 + 1)](),
-            t_hp.lt["gpu", Layout.row_major(N)](),
-            t_dm.lt["gpu", Layout.row_major(N)](),
-            t_dv.lt["gpu", Layout.row_major(N)](),
-            t_rs.lt["gpu", Layout.row_major(N)](),
-            t_cfg.lt["gpu", Layout.row_major(_L_SIZE)](),
-            t_al.lt["gpu", Layout.row_major(N * ACT)](),
-            t_de.lt["gpu", Layout.row_major(N * ACT)](),
-            t_y.lt["gpu", Layout.row_major(N * ACT)](),
-            t_ring.lt["gpu", Layout.row_major(N * LAG_MAX_DELAY * ACT)](),
-            t_vc.lt["gpu", Layout.row_major(N * ACT)](),
-            t_off.lt["gpu", Layout.row_major(N * ACT)](),
+            t_q.tt["gpu", N * ACT](),
+            t_tp.tt["gpu", N * ACT](),
+            t_hist.tt["gpu", N * 12 + 1](),
+            t_hp.tt["gpu", N](),
+            t_dm.tt["gpu", N](),
+            t_dv.tt["gpu", N](),
+            t_rs.tt["gpu", N](),
+            t_cfg.tt["gpu", _L_SIZE](),
+            t_al.tt["gpu", N * ACT](),
+            t_de.tt["gpu", N * ACT](),
+            t_y.tt["gpu", N * ACT](),
+            t_ring.tt["gpu", N * LAG_MAX_DELAY * ACT](),
+            t_vc.tt["gpu", N * ACT](),
+            t_off.tt["gpu", N * ACT](),
             UInt64(7), UInt64(0),
             grid_dim=G, block_dim=TPB,
         )
@@ -432,23 +431,23 @@ def test_reward(ctx: DeviceContext) raises:
         var t_rn = zeros(ctx, N)
         var t_ep = zeros(ctx, N * 3)
         ctx.enqueue_function[_ret_k[N]](
-            t_r.lt["gpu", Layout.row_major(N)](),
-            t_acc.lt["gpu", Layout.row_major(N)](),
-            t_raw.lt["gpu", Layout.row_major(N)](),
-            t_rets.lt["gpu", Layout.row_major(N)](),
+            t_r.tt["gpu", N](),
+            t_acc.tt["gpu", N](),
+            t_raw.tt["gpu", N](),
+            t_rets.tt["gpu", N](),
             Scalar[DT](0.99),
             grid_dim=G, block_dim=TPB,
         )
         update_rms_device[N, 1](ctx, t_rets, t_skip, t_rm, t_rv, t_rc, False)
         ctx.enqueue_function[_rew_k[N]](
-            t_r.lt["gpu", Layout.row_major(N)](),
-            t_dn.lt["gpu", Layout.row_major(N)](),
-            t_rv.lt["gpu", Layout.row_major(1)](),
-            t_rn.lt["gpu", Layout.row_major(N)](),
-            t_succ.lt["gpu", Layout.row_major(N)](),
-            t_raw.lt["gpu", Layout.row_major(N)](),
-            t_acc.lt["gpu", Layout.row_major(N)](),
-            t_ep.lt["gpu", Layout.row_major(N * 3)](),
+            t_r.tt["gpu", N](),
+            t_dn.tt["gpu", N](),
+            t_rv.tt["gpu", 1](),
+            t_rn.tt["gpu", N](),
+            t_succ.tt["gpu", N](),
+            t_raw.tt["gpu", N](),
+            t_acc.tt["gpu", N](),
+            t_ep.tt["gpu", N * 3](),
             Scalar[DT](10.0),
             grid_dim=G, block_dim=TPB,
         )
@@ -554,17 +553,17 @@ def test_tick_post(ctx: DeviceContext) raises:
         var t_done = up(ctx, done)
         var t_meta = up(ctx, meta)
         ctx.enqueue_function[_tick_k[N, E_OBS]](
-            t_raw.lt["gpu", Layout.row_major(N * E_OBS)](),
-            t_rew.lt["gpu", Layout.row_major(N)](),
-            t_done.lt["gpu", Layout.row_major(N)](),
-            t_meta.lt["gpu", Layout.row_major(N * METADATA_SIZE)](),
-            t_qa.lt["gpu", Layout.row_major(ACT)](),
-            t_dm.lt["gpu", Layout.row_major(N)](),
-            t_dv.lt["gpu", Layout.row_major(N)](),
-            t_rs.lt["gpu", Layout.row_major(N)](),
-            t_su.lt["gpu", Layout.row_major(N)](),
-            t_term.lt["gpu", Layout.row_major(N * E_OBS)](),
-            t_stats.lt["gpu", Layout.row_major(N * _S_SIZE)](),
+            t_raw.tt["gpu", N * E_OBS](),
+            t_rew.tt["gpu", N](),
+            t_done.tt["gpu", N](),
+            t_meta.tt["gpu", N * METADATA_SIZE](),
+            t_qa.tt["gpu", ACT](),
+            t_dm.tt["gpu", N](),
+            t_dv.tt["gpu", N](),
+            t_rs.tt["gpu", N](),
+            t_su.tt["gpu", N](),
+            t_term.tt["gpu", N * E_OBS](),
+            t_stats.tt["gpu", N * _S_SIZE](),
             Scalar[DT](dive_w), Scalar[DT](1.0e3), Scalar[DT](1.0e3),
             grid_dim=G, block_dim=TPB,
         )
@@ -585,15 +584,15 @@ def test_tick_post(ctx: DeviceContext) raises:
     var t_do = zeros(ctx, N)
     var t_envd = zeros(ctx, N)
     ctx.enqueue_function[_post_k[N, E_OBS]](
-        t_raw.lt["gpu", Layout.row_major(N * E_OBS)](),
-        t_term.lt["gpu", Layout.row_major(N * E_OBS)](),
-        t_post.lt["gpu", Layout.row_major(N * E_OBS)](),
-        t_rs.lt["gpu", Layout.row_major(N)](),
-        t_sp.lt["gpu", Layout.row_major(N)](),
-        t_dm.lt["gpu", Layout.row_major(N)](),
-        t_ro.lt["gpu", Layout.row_major(N)](),
-        t_do.lt["gpu", Layout.row_major(N)](),
-        t_envd.lt["gpu", Layout.row_major(N)](),
+        t_raw.tt["gpu", N * E_OBS](),
+        t_term.tt["gpu", N * E_OBS](),
+        t_post.tt["gpu", N * E_OBS](),
+        t_rs.tt["gpu", N](),
+        t_sp.tt["gpu", N](),
+        t_dm.tt["gpu", N](),
+        t_ro.tt["gpu", N](),
+        t_do.tt["gpu", N](),
+        t_envd.tt["gpu", N](),
         Scalar[DT](smooth_w), Int32(REP),
         grid_dim=G, block_dim=TPB,
     )
@@ -660,11 +659,11 @@ def test_augment(ctx: DeviceContext) raises:
     var t_qa = up(ctx, qa)
     var t_aug = zeros(ctx, N * A)
     ctx.enqueue_function[augment_k[N, E_OBS, W, T, ACT]](
-        t_raw.lt["gpu", Layout.row_major(N * E_OBS)](),
-        t_hist.lt["gpu", Layout.row_major(N * W + 1)](),
-        t_tp.lt["gpu", Layout.row_major(N * ACT)](),
-        t_qa.lt["gpu", Layout.row_major(ACT)](),
-        t_aug.lt["gpu", Layout.row_major(N * A)](),
+        t_raw.tt["gpu", N * E_OBS](),
+        t_hist.tt["gpu", N * W + 1](),
+        t_tp.tt["gpu", N * ACT](),
+        t_qa.tt["gpu", ACT](),
+        t_aug.tt["gpu", N * A](),
         grid_dim=G, block_dim=TPB,
     )
     var got = down(ctx, t_aug)
@@ -699,11 +698,11 @@ def test_smooth(ctx: DeviceContext) raises:
     var t_sp = zeros(ctx, N)
     var t_st = zeros(ctx, N * _S_SIZE)
     ctx.enqueue_function[_smooth_k[N]](
-        t_act.lt["gpu", Layout.row_major(N * ACT)](),
-        t_prev.lt["gpu", Layout.row_major(N * ACT)](),
-        t_hp.lt["gpu", Layout.row_major(N)](),
-        t_sp.lt["gpu", Layout.row_major(N)](),
-        t_st.lt["gpu", Layout.row_major(N * _S_SIZE)](),
+        t_act.tt["gpu", N * ACT](),
+        t_prev.tt["gpu", N * ACT](),
+        t_hp.tt["gpu", N](),
+        t_sp.tt["gpu", N](),
+        t_st.tt["gpu", N * _S_SIZE](),
         Scalar[DT](w),
         grid_dim=G, block_dim=TPB,
     )
@@ -739,8 +738,8 @@ def test_hist_push(ctx: DeviceContext) raises:
     var t_h = up(ctx, hist)
     var t_a = up(ctx, act)
     ctx.enqueue_function[_hist_push_k[N, W]](
-        t_h.lt["gpu", Layout.row_major(N * W)](),
-        t_a.lt["gpu", Layout.row_major(N * ACT)](),
+        t_h.tt["gpu", N * W](),
+        t_a.tt["gpu", N * ACT](),
         grid_dim=G, block_dim=TPB,
     )
     var got = down(ctx, t_h)
@@ -755,7 +754,7 @@ def test_exec_noise(ctx: DeviceContext) raises:
     var sigma = 0.2
     var t_a = zeros(ctx, N * ACT)
     ctx.enqueue_function[_exec_noise_k[N]](
-        t_a.lt["gpu", Layout.row_major(N * ACT)](),
+        t_a.tt["gpu", N * ACT](),
         Scalar[DT](sigma), UInt64(99), UInt64(0),
         grid_dim=GA, block_dim=TPB,
     )
@@ -773,7 +772,7 @@ def test_exec_noise(ctx: DeviceContext) raises:
     assert_true(abs(sd - sigma) < 0.01, "exec noise std is off")
     var t_b = zeros(ctx, N * ACT)
     ctx.enqueue_function[_exec_noise_k[N]](
-        t_b.lt["gpu", Layout.row_major(N * ACT)](),
+        t_b.tt["gpu", N * ACT](),
         Scalar[DT](sigma), UInt64(99), UInt64(1),
         grid_dim=GA, block_dim=TPB,
     )

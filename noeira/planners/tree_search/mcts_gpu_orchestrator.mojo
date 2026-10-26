@@ -38,7 +38,6 @@ orchestrator having to peek at trait-internal model dimensions.
 """
 
 from max.gpu.host import DeviceContext, DeviceBuffer, HostBuffer
-from layout import Layout, LayoutTensor
 
 from noeira.nn.constants import DT as dtype
 
@@ -73,6 +72,7 @@ from .mcts_gpu import (
     mcts_gpu_scatter_root_hidden_kernel,
     mcts_gpu_extract_hidden_kernel,
 )
+from noeira.core.tiles import Tile, tile
 
 
 struct GenericGPUMCTS[
@@ -250,9 +250,7 @@ struct GenericGPUMCTS[
         mut rep: REP,
         mut dyn: DYN,
         mut pred: PRED,
-        obs: LayoutTensor[
-            dtype, Layout.row_major(Self.N_ENVS, REP.OBS_DIM), MutAnyOrigin
-        ],
+        obs: Tile[dtype, Self.N_ENVS, REP.OBS_DIM],
         rng_seed: UInt32 = UInt32(0),
     ) raises:
         """Run ``NUM_SIMULATIONS`` MCTS sims for every env in parallel.
@@ -277,11 +275,7 @@ struct GenericGPUMCTS[
         # method-template binding sees one comptime expression, not
         # ``Self.LATENT`` vs ``REP.LATENT_DIM`` (same value, distinct
         # expressions in Mojo's type system).
-        var hidden_root = LayoutTensor[
-            dtype,
-            Layout.row_major(Self.N_ENVS, REP.LATENT_DIM),
-            MutAnyOrigin,
-        ](self.state.hidden_states)
+        var hidden_root = tile[Self.N_ENVS, REP.LATENT_DIM](self.state.hidden_states)
         rep.encode_gpu[Self.N_ENVS](ctx, obs, hidden_root)
 
         # 1a. Post-encode MinMax scaling. MuZero networks bake this into
@@ -290,10 +284,7 @@ struct GenericGPUMCTS[
         # networks it does real work. Always-on is the safer default —
         # the kernel is idempotent on [0, 1] values.
         comptime BATCH_BLOCKS = (Self.N_ENVS + TPB - 1) // TPB
-        var hidden_root_flat = LayoutTensor[
-            dtype,
-            Layout.row_major(Self.N_ENVS * Self.LATENT),
-        ](self.state.hidden_states)
+        var hidden_root_flat = tile[Self.N_ENVS * Self.LATENT](self.state.hidden_states)
         comptime run_scale_root = mcts_gpu_scale_hidden_kernel[
             Self.N_ENVS, Self.LATENT, dtype
         ]
@@ -314,10 +305,7 @@ struct GenericGPUMCTS[
         # See ``tests/deep_agents/test_muzero_gpu_mcts_per_env_isolation.mojo``
         # and ``test_muzero_network_row_symmetry.mojo`` for the bisection
         # that surfaced this.
-        var hidden_full_flat = LayoutTensor[
-            dtype,
-            Layout.row_major(Self.N_ENVS * Self.MAX_NODES * Self.LATENT),
-        ](self.state.hidden_states)
+        var hidden_full_flat = tile[Self.N_ENVS * Self.MAX_NODES * Self.LATENT](self.state.hidden_states)
         comptime SCATTER_TOTAL = Self.N_ENVS * Self.LATENT
         comptime SCATTER_BLOCKS = (SCATTER_TOTAL + TPB - 1) // TPB
         comptime run_scatter_root = mcts_gpu_scatter_root_hidden_kernel[
@@ -330,56 +318,23 @@ struct GenericGPUMCTS[
         )
 
         # ── 2. Root predict → policy logits + value bins ─────────────
-        var pred_root_in = LayoutTensor[
-            dtype,
-            Layout.row_major(Self.N_ENVS, PRED.LATENT_DIM),
-        ](self.state.hidden_states)
-        var pred_root_out = LayoutTensor[
-            dtype,
-            Layout.row_major(Self.N_ENVS, PRED.PRED_OUT_DIM),
-            MutAnyOrigin,
-        ](self.state.pred_output)
+        var pred_root_in = tile[Self.N_ENVS, PRED.LATENT_DIM](self.state.hidden_states)
+        var pred_root_out = tile[Self.N_ENVS, PRED.PRED_OUT_DIM](self.state.pred_output)
         pred.predict_gpu[Self.N_ENVS](ctx, pred_root_in, pred_root_out)
 
         # ── 3. Zero tree + init root from pred output ────────────────
         self.state.zero_tree(ctx)
 
-        var vc_t = LayoutTensor[
-            dtype,
-            Layout.row_major(Self.N_ENVS * Self.MAX_NODES * Self.ACT),
-        ](self.state.visit_count)
-        var tv_t = LayoutTensor[
-            dtype,
-            Layout.row_major(Self.N_ENVS * Self.MAX_NODES * Self.ACT),
-        ](self.state.total_value)
-        var pr_t = LayoutTensor[
-            dtype,
-            Layout.row_major(Self.N_ENVS * Self.MAX_NODES * Self.ACT),
-        ](self.state.prior)
-        var rw_t = LayoutTensor[
-            dtype,
-            Layout.row_major(Self.N_ENVS * Self.MAX_NODES * Self.ACT),
-        ](self.state.reward)
-        var ci_t = LayoutTensor[
-            dtype,
-            Layout.row_major(Self.N_ENVS * Self.MAX_NODES * Self.ACT),
-        ](self.state.child_idx)
-        var tvis_t = LayoutTensor[
-            dtype,
-            Layout.row_major(Self.N_ENVS * Self.MAX_NODES),
-        ](self.state.total_visits)
-        var nc_t = LayoutTensor[dtype, Layout.row_major(Self.N_ENVS)](
-            self.state.node_count
-        )
-        var po_root_t = LayoutTensor[
-            dtype, Layout.row_major(Self.N_ENVS * Self.PRED_OUT)
-        ](self.state.pred_output)
-        var miq_t = LayoutTensor[dtype, Layout.row_major(Self.N_ENVS)](
-            self.state.min_q
-        )
-        var mxq_t = LayoutTensor[dtype, Layout.row_major(Self.N_ENVS)](
-            self.state.max_q
-        )
+        var vc_t = tile[Self.N_ENVS * Self.MAX_NODES * Self.ACT](self.state.visit_count)
+        var tv_t = tile[Self.N_ENVS * Self.MAX_NODES * Self.ACT](self.state.total_value)
+        var pr_t = tile[Self.N_ENVS * Self.MAX_NODES * Self.ACT](self.state.prior)
+        var rw_t = tile[Self.N_ENVS * Self.MAX_NODES * Self.ACT](self.state.reward)
+        var ci_t = tile[Self.N_ENVS * Self.MAX_NODES * Self.ACT](self.state.child_idx)
+        var tvis_t = tile[Self.N_ENVS * Self.MAX_NODES](self.state.total_visits)
+        var nc_t = tile[Self.N_ENVS](self.state.node_count)
+        var po_root_t = tile[Self.N_ENVS * Self.PRED_OUT](self.state.pred_output)
+        var miq_t = tile[Self.N_ENVS](self.state.min_q)
+        var mxq_t = tile[Self.N_ENVS](self.state.max_q)
 
         comptime run_init = gpu_mcts_init_root_kernel[
             Self.N_ENVS,
@@ -411,31 +366,13 @@ struct GenericGPUMCTS[
         )
 
         # ── 4. MCTS simulation rounds ────────────────────────────────
-        var hs_t = LayoutTensor[
-            dtype,
-            Layout.row_major(Self.N_ENVS * Self.MAX_NODES * Self.LATENT),
-        ](self.state.hidden_states)
-        var b_pp = LayoutTensor[dtype, Layout.row_major(Self.MCTS_TOTAL)](
-            self.state.pending_parent
-        )
-        var b_pa = LayoutTensor[dtype, Layout.row_major(Self.MCTS_TOTAL)](
-            self.state.pending_action
-        )
-        var b_sp = LayoutTensor[
-            dtype,
-            Layout.row_major(Self.MCTS_TOTAL * MAX_DEPTH),
-        ](self.state.search_paths)
-        var b_ap = LayoutTensor[
-            dtype,
-            Layout.row_major(Self.MCTS_TOTAL * MAX_DEPTH),
-        ](self.state.action_paths)
-        var b_pl = LayoutTensor[dtype, Layout.row_major(Self.MCTS_TOTAL)](
-            self.state.path_lengths
-        )
-        var b_di = LayoutTensor[
-            dtype,
-            Layout.row_major(Self.MCTS_TOTAL * Self.DYN_IN),
-        ](self.state.dyn_input)
+        var hs_t = tile[Self.N_ENVS * Self.MAX_NODES * Self.LATENT](self.state.hidden_states)
+        var b_pp = tile[Self.MCTS_TOTAL](self.state.pending_parent)
+        var b_pa = tile[Self.MCTS_TOTAL](self.state.pending_action)
+        var b_sp = tile[Self.MCTS_TOTAL * MAX_DEPTH](self.state.search_paths)
+        var b_ap = tile[Self.MCTS_TOTAL * MAX_DEPTH](self.state.action_paths)
+        var b_pl = tile[Self.MCTS_TOTAL](self.state.path_lengths)
+        var b_di = tile[Self.MCTS_TOTAL * Self.DYN_IN](self.state.dyn_input)
 
         for _round in range(Self.MCTS_ROUNDS):
             # 4a. Batched select + build dynamics input
@@ -477,26 +414,13 @@ struct GenericGPUMCTS[
             # ``Self.DYN_IN`` vs ``DYN.DYN_IN_DIM`` as distinct
             # expressions (Mojo's type system treats unfolded comptime
             # exprs structurally — equal values aren't enough).
-            var dyn_in_b = LayoutTensor[
-                dtype,
-                Layout.row_major(Self.MCTS_TOTAL, DYN.DYN_IN_DIM),
-            ](self.state.dyn_input)
-            var dyn_out_b = LayoutTensor[
-                dtype,
-                Layout.row_major(Self.MCTS_TOTAL, DYN.DYN_OUT_DIM),
-                MutAnyOrigin,
-            ](self.state.dyn_output)
+            var dyn_in_b = tile[Self.MCTS_TOTAL, DYN.DYN_IN_DIM](self.state.dyn_input)
+            var dyn_out_b = tile[Self.MCTS_TOTAL, DYN.DYN_OUT_DIM](self.state.dyn_output)
             dyn.step_gpu[Self.MCTS_TOTAL](ctx, dyn_in_b, dyn_out_b)
 
             # 4c. Extract hidden slice → pred input
-            var pred_in_b = LayoutTensor[
-                dtype,
-                Layout.row_major(Self.MCTS_TOTAL * Self.LATENT),
-            ](self.state.pred_input)
-            var dyn_out_b_flat = LayoutTensor[
-                dtype,
-                Layout.row_major(Self.MCTS_TOTAL * Self.DYN_OUT),
-            ](self.state.dyn_output)
+            var pred_in_b = tile[Self.MCTS_TOTAL * Self.LATENT](self.state.pred_input)
+            var dyn_out_b_flat = tile[Self.MCTS_TOTAL * Self.DYN_OUT](self.state.dyn_output)
             comptime EXTR_TOTAL = Self.MCTS_TOTAL * Self.LATENT
             comptime EXTR_BLK = (EXTR_TOTAL + TPB - 1) // TPB
             comptime run_extr = mcts_gpu_extract_hidden_kernel[
@@ -511,26 +435,13 @@ struct GenericGPUMCTS[
 
             # 4d. Batched prediction forward — same trait-dim trick as
             # the dynamics call above.
-            var pred_in_net = LayoutTensor[
-                dtype,
-                Layout.row_major(Self.MCTS_TOTAL, PRED.LATENT_DIM),
-            ](self.state.pred_input)
-            var pred_out_net = LayoutTensor[
-                dtype,
-                Layout.row_major(Self.MCTS_TOTAL, PRED.PRED_OUT_DIM),
-                MutAnyOrigin,
-            ](self.state.pred_output)
+            var pred_in_net = tile[Self.MCTS_TOTAL, PRED.LATENT_DIM](self.state.pred_input)
+            var pred_out_net = tile[Self.MCTS_TOTAL, PRED.PRED_OUT_DIM](self.state.pred_output)
             pred.predict_gpu[Self.MCTS_TOTAL](ctx, pred_in_net, pred_out_net)
 
             # 4e. Batched expand + backup + remove virtual loss
-            var b_do = LayoutTensor[
-                dtype,
-                Layout.row_major(Self.MCTS_TOTAL * Self.DYN_OUT),
-            ](self.state.dyn_output)
-            var b_po = LayoutTensor[
-                dtype,
-                Layout.row_major(Self.MCTS_TOTAL * Self.PRED_OUT),
-            ](self.state.pred_output)
+            var b_do = tile[Self.MCTS_TOTAL * Self.DYN_OUT](self.state.dyn_output)
+            var b_po = tile[Self.MCTS_TOTAL * Self.PRED_OUT](self.state.pred_output)
             comptime run_exp_bk = gpu_mcts_batched_expand_backup_muzero_kernel[
                 Self.N_ENVS,
                 Self.MAX_NODES,
@@ -569,12 +480,8 @@ struct GenericGPUMCTS[
             )
 
         # ── 5. Extract actions + visit-count policy ──────────────────
-        var act_out_t = LayoutTensor[dtype, Layout.row_major(Self.N_ENVS)](
-            self.actions_out
-        )
-        var pol_out_t = LayoutTensor[
-            dtype, Layout.row_major(Self.N_ENVS * Self.ACT)
-        ](self.policies_out)
+        var act_out_t = tile[Self.N_ENVS](self.actions_out)
+        var pol_out_t = tile[Self.N_ENVS * Self.ACT](self.policies_out)
         comptime run_act = gpu_mcts_extract_actions_kernel[
             Self.N_ENVS, Self.MAX_NODES, Self.ACT, dtype
         ]
@@ -587,9 +494,7 @@ struct GenericGPUMCTS[
         )
 
         # ── 6. Extract root value (visit-weighted Q at root) ─────────
-        var rv_out_t = LayoutTensor[dtype, Layout.row_major(Self.N_ENVS)](
-            self.root_value_out
-        )
+        var rv_out_t = tile[Self.N_ENVS](self.root_value_out)
         comptime run_rv = gpu_mcts_extract_root_value_kernel[
             Self.N_ENVS, Self.MAX_NODES, Self.ACT, dtype
         ]
@@ -615,12 +520,8 @@ struct GenericGPUMCTS[
         mut rep: REP,
         mut dyn: DYN,
         mut pred: PRED,
-        obs: LayoutTensor[
-            dtype, Layout.row_major(Self.N_ENVS, REP.OBS_DIM), MutAnyOrigin
-        ],
-        legal_masks: LayoutTensor[
-            dtype, Layout.row_major(Self.N_ENVS * Self.ACT), MutAnyOrigin
-        ],
+        obs: Tile[dtype, Self.N_ENVS, REP.OBS_DIM],
+        legal_masks: Tile[dtype, Self.N_ENVS * Self.ACT],
         rng_seed: UInt32 = UInt32(0),
     ) raises:
         """Self-play variant of ``search_gpu`` for board games.
@@ -649,19 +550,12 @@ struct GenericGPUMCTS[
         )
 
         # ── 1. Root encode → hidden[node 0] ──────────────────────────
-        var hidden_root = LayoutTensor[
-            dtype,
-            Layout.row_major(Self.N_ENVS, REP.LATENT_DIM),
-            MutAnyOrigin,
-        ](self.state.hidden_states)
+        var hidden_root = tile[Self.N_ENVS, REP.LATENT_DIM](self.state.hidden_states)
         rep.encode_gpu[Self.N_ENVS](ctx, obs, hidden_root)
 
         # 1a. Post-encode MinMax scaling.
         comptime BATCH_BLOCKS = (Self.N_ENVS + TPB - 1) // TPB
-        var hidden_root_flat = LayoutTensor[
-            dtype,
-            Layout.row_major(Self.N_ENVS * Self.LATENT),
-        ](self.state.hidden_states)
+        var hidden_root_flat = tile[Self.N_ENVS * Self.LATENT](self.state.hidden_states)
         comptime run_scale_root = mcts_gpu_scale_hidden_kernel[
             Self.N_ENVS, Self.LATENT, dtype
         ]
@@ -680,10 +574,7 @@ struct GenericGPUMCTS[
         # kernels read ``[N_ENVS * MAX_NODES * LATENT]``), so the same
         # scatter is required for envs 1..N-1 to see their own root
         # hidden state.
-        var hidden_full_flat = LayoutTensor[
-            dtype,
-            Layout.row_major(Self.N_ENVS * Self.MAX_NODES * Self.LATENT),
-        ](self.state.hidden_states)
+        var hidden_full_flat = tile[Self.N_ENVS * Self.MAX_NODES * Self.LATENT](self.state.hidden_states)
         comptime SCATTER_TOTAL = Self.N_ENVS * Self.LATENT
         comptime SCATTER_BLOCKS = (SCATTER_TOTAL + TPB - 1) // TPB
         comptime run_scatter_root = mcts_gpu_scatter_root_hidden_kernel[
@@ -696,15 +587,8 @@ struct GenericGPUMCTS[
         )
 
         # ── 2. Root predict ──────────────────────────────────────────
-        var pred_root_in = LayoutTensor[
-            dtype,
-            Layout.row_major(Self.N_ENVS, PRED.LATENT_DIM),
-        ](self.state.hidden_states)
-        var pred_root_out = LayoutTensor[
-            dtype,
-            Layout.row_major(Self.N_ENVS, PRED.PRED_OUT_DIM),
-            MutAnyOrigin,
-        ](self.state.pred_output)
+        var pred_root_in = tile[Self.N_ENVS, PRED.LATENT_DIM](self.state.hidden_states)
+        var pred_root_out = tile[Self.N_ENVS, PRED.PRED_OUT_DIM](self.state.pred_output)
         pred.predict_gpu[Self.N_ENVS](ctx, pred_root_in, pred_root_out)
 
         # ── 3. Zero tree + init root with noise=0 (legal-mask path
@@ -712,42 +596,16 @@ struct GenericGPUMCTS[
         #       actions). ────────────────────────────────────────────
         self.state.zero_tree(ctx)
 
-        var vc_t = LayoutTensor[
-            dtype,
-            Layout.row_major(Self.N_ENVS * Self.MAX_NODES * Self.ACT),
-        ](self.state.visit_count)
-        var tv_t = LayoutTensor[
-            dtype,
-            Layout.row_major(Self.N_ENVS * Self.MAX_NODES * Self.ACT),
-        ](self.state.total_value)
-        var pr_t = LayoutTensor[
-            dtype,
-            Layout.row_major(Self.N_ENVS * Self.MAX_NODES * Self.ACT),
-        ](self.state.prior)
-        var rw_t = LayoutTensor[
-            dtype,
-            Layout.row_major(Self.N_ENVS * Self.MAX_NODES * Self.ACT),
-        ](self.state.reward)
-        var ci_t = LayoutTensor[
-            dtype,
-            Layout.row_major(Self.N_ENVS * Self.MAX_NODES * Self.ACT),
-        ](self.state.child_idx)
-        var tvis_t = LayoutTensor[
-            dtype,
-            Layout.row_major(Self.N_ENVS * Self.MAX_NODES),
-        ](self.state.total_visits)
-        var nc_t = LayoutTensor[dtype, Layout.row_major(Self.N_ENVS)](
-            self.state.node_count
-        )
-        var po_root_t = LayoutTensor[
-            dtype, Layout.row_major(Self.N_ENVS * Self.PRED_OUT)
-        ](self.state.pred_output)
-        var miq_t = LayoutTensor[dtype, Layout.row_major(Self.N_ENVS)](
-            self.state.min_q
-        )
-        var mxq_t = LayoutTensor[dtype, Layout.row_major(Self.N_ENVS)](
-            self.state.max_q
-        )
+        var vc_t = tile[Self.N_ENVS * Self.MAX_NODES * Self.ACT](self.state.visit_count)
+        var tv_t = tile[Self.N_ENVS * Self.MAX_NODES * Self.ACT](self.state.total_value)
+        var pr_t = tile[Self.N_ENVS * Self.MAX_NODES * Self.ACT](self.state.prior)
+        var rw_t = tile[Self.N_ENVS * Self.MAX_NODES * Self.ACT](self.state.reward)
+        var ci_t = tile[Self.N_ENVS * Self.MAX_NODES * Self.ACT](self.state.child_idx)
+        var tvis_t = tile[Self.N_ENVS * Self.MAX_NODES](self.state.total_visits)
+        var nc_t = tile[Self.N_ENVS](self.state.node_count)
+        var po_root_t = tile[Self.N_ENVS * Self.PRED_OUT](self.state.pred_output)
+        var miq_t = tile[Self.N_ENVS](self.state.min_q)
+        var mxq_t = tile[Self.N_ENVS](self.state.max_q)
 
         comptime run_init = gpu_mcts_init_root_kernel[
             Self.N_ENVS,
@@ -804,31 +662,13 @@ struct GenericGPUMCTS[
             )
 
         # ── 4. Simulation rounds (identical to single-player path) ──
-        var hs_t = LayoutTensor[
-            dtype,
-            Layout.row_major(Self.N_ENVS * Self.MAX_NODES * Self.LATENT),
-        ](self.state.hidden_states)
-        var b_pp = LayoutTensor[dtype, Layout.row_major(Self.MCTS_TOTAL)](
-            self.state.pending_parent
-        )
-        var b_pa = LayoutTensor[dtype, Layout.row_major(Self.MCTS_TOTAL)](
-            self.state.pending_action
-        )
-        var b_sp = LayoutTensor[
-            dtype,
-            Layout.row_major(Self.MCTS_TOTAL * MAX_DEPTH),
-        ](self.state.search_paths)
-        var b_ap = LayoutTensor[
-            dtype,
-            Layout.row_major(Self.MCTS_TOTAL * MAX_DEPTH),
-        ](self.state.action_paths)
-        var b_pl = LayoutTensor[dtype, Layout.row_major(Self.MCTS_TOTAL)](
-            self.state.path_lengths
-        )
-        var b_di = LayoutTensor[
-            dtype,
-            Layout.row_major(Self.MCTS_TOTAL * Self.DYN_IN),
-        ](self.state.dyn_input)
+        var hs_t = tile[Self.N_ENVS * Self.MAX_NODES * Self.LATENT](self.state.hidden_states)
+        var b_pp = tile[Self.MCTS_TOTAL](self.state.pending_parent)
+        var b_pa = tile[Self.MCTS_TOTAL](self.state.pending_action)
+        var b_sp = tile[Self.MCTS_TOTAL * MAX_DEPTH](self.state.search_paths)
+        var b_ap = tile[Self.MCTS_TOTAL * MAX_DEPTH](self.state.action_paths)
+        var b_pl = tile[Self.MCTS_TOTAL](self.state.path_lengths)
+        var b_di = tile[Self.MCTS_TOTAL * Self.DYN_IN](self.state.dyn_input)
 
         for _round in range(Self.MCTS_ROUNDS):
             comptime run_sel_dyn = gpu_mcts_batched_select_and_build_dyn_kernel[
@@ -863,25 +703,12 @@ struct GenericGPUMCTS[
                 block_dim=(TPB,),
             )
 
-            var dyn_in_b = LayoutTensor[
-                dtype,
-                Layout.row_major(Self.MCTS_TOTAL, DYN.DYN_IN_DIM),
-            ](self.state.dyn_input)
-            var dyn_out_b = LayoutTensor[
-                dtype,
-                Layout.row_major(Self.MCTS_TOTAL, DYN.DYN_OUT_DIM),
-                MutAnyOrigin,
-            ](self.state.dyn_output)
+            var dyn_in_b = tile[Self.MCTS_TOTAL, DYN.DYN_IN_DIM](self.state.dyn_input)
+            var dyn_out_b = tile[Self.MCTS_TOTAL, DYN.DYN_OUT_DIM](self.state.dyn_output)
             dyn.step_gpu[Self.MCTS_TOTAL](ctx, dyn_in_b, dyn_out_b)
 
-            var pred_in_b = LayoutTensor[
-                dtype,
-                Layout.row_major(Self.MCTS_TOTAL * Self.LATENT),
-            ](self.state.pred_input)
-            var dyn_out_b_flat = LayoutTensor[
-                dtype,
-                Layout.row_major(Self.MCTS_TOTAL * Self.DYN_OUT),
-            ](self.state.dyn_output)
+            var pred_in_b = tile[Self.MCTS_TOTAL * Self.LATENT](self.state.pred_input)
+            var dyn_out_b_flat = tile[Self.MCTS_TOTAL * Self.DYN_OUT](self.state.dyn_output)
             comptime EXTR_TOTAL = Self.MCTS_TOTAL * Self.LATENT
             comptime EXTR_BLK = (EXTR_TOTAL + TPB - 1) // TPB
             comptime run_extr = mcts_gpu_extract_hidden_kernel[
@@ -894,25 +721,12 @@ struct GenericGPUMCTS[
                 block_dim=(TPB,),
             )
 
-            var pred_in_net = LayoutTensor[
-                dtype,
-                Layout.row_major(Self.MCTS_TOTAL, PRED.LATENT_DIM),
-            ](self.state.pred_input)
-            var pred_out_net = LayoutTensor[
-                dtype,
-                Layout.row_major(Self.MCTS_TOTAL, PRED.PRED_OUT_DIM),
-                MutAnyOrigin,
-            ](self.state.pred_output)
+            var pred_in_net = tile[Self.MCTS_TOTAL, PRED.LATENT_DIM](self.state.pred_input)
+            var pred_out_net = tile[Self.MCTS_TOTAL, PRED.PRED_OUT_DIM](self.state.pred_output)
             pred.predict_gpu[Self.MCTS_TOTAL](ctx, pred_in_net, pred_out_net)
 
-            var b_do = LayoutTensor[
-                dtype,
-                Layout.row_major(Self.MCTS_TOTAL * Self.DYN_OUT),
-            ](self.state.dyn_output)
-            var b_po = LayoutTensor[
-                dtype,
-                Layout.row_major(Self.MCTS_TOTAL * Self.PRED_OUT),
-            ](self.state.pred_output)
+            var b_do = tile[Self.MCTS_TOTAL * Self.DYN_OUT](self.state.dyn_output)
+            var b_po = tile[Self.MCTS_TOTAL * Self.PRED_OUT](self.state.pred_output)
             comptime run_exp_bk = gpu_mcts_batched_expand_backup_muzero_kernel[
                 Self.N_ENVS,
                 Self.MAX_NODES,
@@ -951,12 +765,8 @@ struct GenericGPUMCTS[
             )
 
         # ── 5. Masked action extraction ──────────────────────────────
-        var act_out_t = LayoutTensor[dtype, Layout.row_major(Self.N_ENVS)](
-            self.actions_out
-        )
-        var pol_out_t = LayoutTensor[
-            dtype, Layout.row_major(Self.N_ENVS * Self.ACT)
-        ](self.policies_out)
+        var act_out_t = tile[Self.N_ENVS](self.actions_out)
+        var pol_out_t = tile[Self.N_ENVS * Self.ACT](self.policies_out)
         comptime run_act_masked = gpu_mcts_extract_actions_masked_kernel[
             Self.N_ENVS, Self.MAX_NODES, Self.ACT, dtype
         ]
@@ -971,9 +781,7 @@ struct GenericGPUMCTS[
 
         # ── 6. Root value (same kernel, no masking needed since the
         #       backup already encoded negation). ─────────────────────
-        var rv_out_t = LayoutTensor[dtype, Layout.row_major(Self.N_ENVS)](
-            self.root_value_out
-        )
+        var rv_out_t = tile[Self.N_ENVS](self.root_value_out)
         comptime run_rv = gpu_mcts_extract_root_value_kernel[
             Self.N_ENVS, Self.MAX_NODES, Self.ACT, dtype
         ]
@@ -994,12 +802,8 @@ struct GenericGPUMCTS[
     ](
         mut self,
         ctx: DeviceContext,
-        ep_steps: LayoutTensor[
-            dtype, Layout.row_major(Self.N_ENVS), MutAnyOrigin
-        ],
-        legal_masks: LayoutTensor[
-            dtype, Layout.row_major(Self.N_ENVS * Self.ACT), MutAnyOrigin
-        ],
+        ep_steps: Tile[dtype, Self.N_ENVS],
+        legal_masks: Tile[dtype, Self.N_ENVS * Self.ACT],
         rng_seed: UInt32 = UInt32(0),
         temp_min: Float64 = 0.0,
     ) raises:
@@ -1029,16 +833,9 @@ struct GenericGPUMCTS[
         ``legal_masks`` is required even when every action is legal —
         callers can pass an all-ones buffer in that case.
         """
-        var vc_t = LayoutTensor[
-            dtype,
-            Layout.row_major(Self.N_ENVS * Self.MAX_NODES * Self.ACT),
-        ](self.state.visit_count)
-        var act_out_t = LayoutTensor[dtype, Layout.row_major(Self.N_ENVS)](
-            self.actions_out
-        )
-        var pol_out_t = LayoutTensor[
-            dtype, Layout.row_major(Self.N_ENVS * Self.ACT)
-        ](self.policies_out)
+        var vc_t = tile[Self.N_ENVS * Self.MAX_NODES * Self.ACT](self.state.visit_count)
+        var act_out_t = tile[Self.N_ENVS](self.actions_out)
+        var pol_out_t = tile[Self.N_ENVS * Self.ACT](self.policies_out)
 
         comptime run_temp = gpu_mcts_extract_actions_temp_kernel[
             Self.N_ENVS, Self.MAX_NODES, Self.ACT, dtype
@@ -1068,13 +865,9 @@ struct GenericGPUMCTS[
         ctx: DeviceContext,
         mut pred: PRED,
         mut env: ENV,
-        root_obs: LayoutTensor[
-            dtype, Layout.row_major(Self.N_ENVS, PRED.LATENT_DIM), MutAnyOrigin
-        ],
+        root_obs: Tile[dtype, Self.N_ENVS, PRED.LATENT_DIM],
         root_states: DeviceBuffer[dtype],
-        root_legal_masks: LayoutTensor[
-            dtype, Layout.row_major(Self.N_ENVS * Self.ACT), MutAnyOrigin
-        ],
+        root_legal_masks: Tile[dtype, Self.N_ENVS * Self.ACT],
         rng_seed: UInt64 = UInt64(0),
     ) raises:
         """AlphaZero MCTS path — expansion via true game rules.
@@ -1135,52 +928,22 @@ struct GenericGPUMCTS[
 
         # ── 1. Root predict on obs ───────────────────────────────────
         var pred_root_in = root_obs
-        var pred_root_out = LayoutTensor[
-            dtype,
-            Layout.row_major(Self.N_ENVS, PRED.PRED_OUT_DIM),
-            MutAnyOrigin,
-        ](self.state.pred_output)
+        var pred_root_out = tile[Self.N_ENVS, PRED.PRED_OUT_DIM](self.state.pred_output)
         pred.predict_gpu[Self.N_ENVS](ctx, pred_root_in, pred_root_out)
 
         # ── 2. Zero tree + init root with noise=0 ────────────────────
         self.state.zero_tree(ctx)
 
-        var vc_t = LayoutTensor[
-            dtype,
-            Layout.row_major(Self.N_ENVS * Self.MAX_NODES * Self.ACT),
-        ](self.state.visit_count)
-        var tv_t = LayoutTensor[
-            dtype,
-            Layout.row_major(Self.N_ENVS * Self.MAX_NODES * Self.ACT),
-        ](self.state.total_value)
-        var pr_t = LayoutTensor[
-            dtype,
-            Layout.row_major(Self.N_ENVS * Self.MAX_NODES * Self.ACT),
-        ](self.state.prior)
-        var rw_t = LayoutTensor[
-            dtype,
-            Layout.row_major(Self.N_ENVS * Self.MAX_NODES * Self.ACT),
-        ](self.state.reward)
-        var ci_t = LayoutTensor[
-            dtype,
-            Layout.row_major(Self.N_ENVS * Self.MAX_NODES * Self.ACT),
-        ](self.state.child_idx)
-        var tvis_t = LayoutTensor[
-            dtype,
-            Layout.row_major(Self.N_ENVS * Self.MAX_NODES),
-        ](self.state.total_visits)
-        var nc_t = LayoutTensor[dtype, Layout.row_major(Self.N_ENVS)](
-            self.state.node_count
-        )
-        var po_root_t = LayoutTensor[
-            dtype, Layout.row_major(Self.N_ENVS * Self.PRED_OUT)
-        ](self.state.pred_output)
-        var miq_t = LayoutTensor[dtype, Layout.row_major(Self.N_ENVS)](
-            self.state.min_q
-        )
-        var mxq_t = LayoutTensor[dtype, Layout.row_major(Self.N_ENVS)](
-            self.state.max_q
-        )
+        var vc_t = tile[Self.N_ENVS * Self.MAX_NODES * Self.ACT](self.state.visit_count)
+        var tv_t = tile[Self.N_ENVS * Self.MAX_NODES * Self.ACT](self.state.total_value)
+        var pr_t = tile[Self.N_ENVS * Self.MAX_NODES * Self.ACT](self.state.prior)
+        var rw_t = tile[Self.N_ENVS * Self.MAX_NODES * Self.ACT](self.state.reward)
+        var ci_t = tile[Self.N_ENVS * Self.MAX_NODES * Self.ACT](self.state.child_idx)
+        var tvis_t = tile[Self.N_ENVS * Self.MAX_NODES](self.state.total_visits)
+        var nc_t = tile[Self.N_ENVS](self.state.node_count)
+        var po_root_t = tile[Self.N_ENVS * Self.PRED_OUT](self.state.pred_output)
+        var miq_t = tile[Self.N_ENVS](self.state.min_q)
+        var mxq_t = tile[Self.N_ENVS](self.state.max_q)
 
         # Note: init_root_kernel expects LATENT as a comptime arg even
         # though the AlphaZero path never touches hidden_states. Pass
@@ -1238,20 +1001,11 @@ struct GenericGPUMCTS[
             )
 
         # ── 4. Copy root game state into game_states[node 0] ─────────
-        var gs_t = LayoutTensor[
-            dtype,
-            Layout.row_major(Self.N_ENVS * Self.MAX_NODES * Self.STATE_SIZE),
-        ](self.state.game_states)
+        var gs_t = tile[Self.N_ENVS * Self.MAX_NODES * Self.STATE_SIZE](self.state.game_states)
         var rs_t = rebind[
-            LayoutTensor[
-                dtype,
-                Layout.row_major(Self.N_ENVS * Self.STATE_SIZE),
-                MutAnyOrigin,
-            ]
+            Tile[dtype, Self.N_ENVS * Self.STATE_SIZE]
         ](
-            LayoutTensor[
-                dtype, Layout.row_major(Self.N_ENVS * Self.STATE_SIZE)
-            ](root_states)
+            tile[Self.N_ENVS * Self.STATE_SIZE](root_states)
         )
         comptime run_cp_root = gpu_mcts_copy_root_state_kernel[
             Self.N_ENVS, Self.MAX_NODES, Self.STATE_SIZE, dtype
@@ -1264,27 +1018,12 @@ struct GenericGPUMCTS[
         )
 
         # ── 5. Simulation rounds ─────────────────────────────────────
-        var b_pp = LayoutTensor[dtype, Layout.row_major(Self.MCTS_TOTAL)](
-            self.state.pending_parent
-        )
-        var b_pa = LayoutTensor[dtype, Layout.row_major(Self.MCTS_TOTAL)](
-            self.state.pending_action
-        )
-        var b_sp = LayoutTensor[
-            dtype,
-            Layout.row_major(Self.MCTS_TOTAL * MAX_DEPTH),
-        ](self.state.search_paths)
-        var b_ap = LayoutTensor[
-            dtype,
-            Layout.row_major(Self.MCTS_TOTAL * MAX_DEPTH),
-        ](self.state.action_paths)
-        var b_pl = LayoutTensor[dtype, Layout.row_major(Self.MCTS_TOTAL)](
-            self.state.path_lengths
-        )
-        var b_exp_st = LayoutTensor[
-            dtype,
-            Layout.row_major(Self.MCTS_TOTAL * Self.STATE_SIZE),
-        ](self.state.expansion_states)
+        var b_pp = tile[Self.MCTS_TOTAL](self.state.pending_parent)
+        var b_pa = tile[Self.MCTS_TOTAL](self.state.pending_action)
+        var b_sp = tile[Self.MCTS_TOTAL * MAX_DEPTH](self.state.search_paths)
+        var b_ap = tile[Self.MCTS_TOTAL * MAX_DEPTH](self.state.action_paths)
+        var b_pl = tile[Self.MCTS_TOTAL](self.state.path_lengths)
+        var b_exp_st = tile[Self.MCTS_TOTAL * Self.STATE_SIZE](self.state.expansion_states)
 
         for _round in range(Self.MCTS_ROUNDS):
             # 5a. select + copy parent state to staging
@@ -1335,32 +1074,15 @@ struct GenericGPUMCTS[
             )
 
             # 5c. predict on the post-step obs
-            var p_in = LayoutTensor[
-                dtype,
-                Layout.row_major(Self.MCTS_TOTAL, PRED.LATENT_DIM),
-            ](self.az_exp_obs)
-            var p_out = LayoutTensor[
-                dtype,
-                Layout.row_major(Self.MCTS_TOTAL, PRED.PRED_OUT_DIM),
-                MutAnyOrigin,
-            ](self.state.pred_output)
+            var p_in = tile[Self.MCTS_TOTAL, PRED.LATENT_DIM](self.az_exp_obs)
+            var p_out = tile[Self.MCTS_TOTAL, PRED.PRED_OUT_DIM](self.state.pred_output)
             pred.predict_gpu[Self.MCTS_TOTAL](ctx, p_in, p_out)
 
             # 5d. expand + backup with legal-mask propagation
-            var b_po = LayoutTensor[
-                dtype,
-                Layout.row_major(Self.MCTS_TOTAL * Self.PRED_OUT),
-            ](self.state.pred_output)
-            var b_rew = LayoutTensor[dtype, Layout.row_major(Self.MCTS_TOTAL)](
-                self.state.leaf_values
-            )
-            var b_lm = LayoutTensor[
-                dtype,
-                Layout.row_major(Self.MCTS_TOTAL * Self.ACT),
-            ](self.state.expansion_legal_masks)
-            var b_dones = LayoutTensor[
-                dtype, Layout.row_major(Self.MCTS_TOTAL)
-            ](self.az_exp_dones)
+            var b_po = tile[Self.MCTS_TOTAL * Self.PRED_OUT](self.state.pred_output)
+            var b_rew = tile[Self.MCTS_TOTAL](self.state.leaf_values)
+            var b_lm = tile[Self.MCTS_TOTAL * Self.ACT](self.state.expansion_legal_masks)
+            var b_dones = tile[Self.MCTS_TOTAL](self.az_exp_dones)
 
             comptime run_exp = gpu_mcts_batched_expand_backup_masked_kernel[
                 Self.N_ENVS,
@@ -1401,12 +1123,8 @@ struct GenericGPUMCTS[
             )
 
         # ── 6. Masked action extraction ──────────────────────────────
-        var act_out_t = LayoutTensor[dtype, Layout.row_major(Self.N_ENVS)](
-            self.actions_out
-        )
-        var pol_out_t = LayoutTensor[
-            dtype, Layout.row_major(Self.N_ENVS * Self.ACT)
-        ](self.policies_out)
+        var act_out_t = tile[Self.N_ENVS](self.actions_out)
+        var pol_out_t = tile[Self.N_ENVS * Self.ACT](self.policies_out)
         comptime run_act = gpu_mcts_extract_actions_masked_kernel[
             Self.N_ENVS, Self.MAX_NODES, Self.ACT, dtype
         ]
@@ -1420,9 +1138,7 @@ struct GenericGPUMCTS[
         )
 
         # ── 7. Root value ────────────────────────────────────────────
-        var rv_out_t = LayoutTensor[dtype, Layout.row_major(Self.N_ENVS)](
-            self.root_value_out
-        )
+        var rv_out_t = tile[Self.N_ENVS](self.root_value_out)
         comptime run_rv = gpu_mcts_extract_root_value_kernel[
             Self.N_ENVS, Self.MAX_NODES, Self.ACT, dtype
         ]
@@ -1440,27 +1156,25 @@ struct GenericGPUMCTS[
 
     def actions_view(
         self,
-    ) -> LayoutTensor[dtype, Layout.row_major(Self.N_ENVS), MutAnyOrigin]:
+    ) -> Tile[dtype, Self.N_ENVS]:
         """``[N_ENVS]`` argmax action — caller copies to host to read."""
         # T6: copy the field to a mut local so the view is mut=True and widens
         # into the MutAnyOrigin return type (read-only in practice).
         var b = self.actions_out
-        return LayoutTensor[dtype, Layout.row_major(Self.N_ENVS)](b)
+        return tile[Self.N_ENVS](b)
 
     def policies_view(
         self,
-    ) -> LayoutTensor[
-        dtype, Layout.row_major(Self.N_ENVS * Self.ACT), MutAnyOrigin
-    ]:
+    ) -> Tile[dtype, Self.N_ENVS * Self.ACT]:
         """``[N_ENVS × ACT]`` visit-count policy per env (sums to 1)."""
         # T6: mut local copy → mut=True view → widens into MutAnyOrigin return.
         var b = self.policies_out
-        return LayoutTensor[dtype, Layout.row_major(Self.N_ENVS * Self.ACT)](b)
+        return tile[Self.N_ENVS * Self.ACT](b)
 
     def root_value_view(
         self,
-    ) -> LayoutTensor[dtype, Layout.row_major(Self.N_ENVS), MutAnyOrigin]:
+    ) -> Tile[dtype, Self.N_ENVS]:
         """``[N_ENVS]`` visit-weighted Q at the root."""
         # T6: mut local copy → mut=True view → widens into MutAnyOrigin return.
         var b = self.root_value_out
-        return LayoutTensor[dtype, Layout.row_major(Self.N_ENVS)](b)
+        return tile[Self.N_ENVS](b)

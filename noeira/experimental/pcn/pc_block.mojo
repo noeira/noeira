@@ -18,7 +18,6 @@ so that callers can pass the result directly to an Optimizer.step().
 For the readout, ε_L = target − output (target plays the role of x_above).
 """
 
-from layout import Layout, LayoutTensor
 from max.gpu import thread_idx, block_idx, block_dim
 from max.gpu.sync import barrier
 from max.gpu.host import DeviceContext
@@ -30,7 +29,7 @@ from linalg.matmul.cpu.apple_accelerate import (
     _CBLASOrder,
     _CBLASTranspose,
 )
-from layout.tile_tensor import lt_to_tt
+from noeira.core.tiles import Tile, tile
 
 from .pc_constants import TPB
 from .pc_initializer import PCInitializer
@@ -78,16 +77,10 @@ struct PCBlock[
     def pc_init_params[
         INIT: PCInitializer, dtype: DType = DType.float32
     ](
-        mut params: LayoutTensor[
-            dtype, Layout.row_major(Self.PARAM_SIZE), MutAnyOrigin
-        ],
+        params: Tile[dtype, Self.PARAM_SIZE],
     ) raises:
         """Init: W via INIT.fill(fan_in=in_dim, fan_out=out_dim); zero b."""
-        var W_view = LayoutTensor[
-            dtype,
-            Layout.row_major(Self.in_dim * Self.out_dim),
-            MutAnyOrigin,
-        ](params.ptr)
+        var W_view = tile[Self.in_dim * Self.out_dim](params.ptr)
         INIT.fill[Self.in_dim * Self.out_dim, Self.in_dim, Self.out_dim, dtype](
             W_view
         )
@@ -102,18 +95,10 @@ struct PCBlock[
     def predict[
         BATCH: Int, dtype: DType = DType.float32
     ](
-        x_below: LayoutTensor[
-            dtype, Layout.row_major(BATCH, Self.IN_DIM), MutAnyOrigin
-        ],
-        params: LayoutTensor[
-            dtype, Layout.row_major(Self.PARAM_SIZE), MutAnyOrigin
-        ],
-        mut mu: LayoutTensor[
-            dtype, Layout.row_major(BATCH, Self.OUT_DIM), MutAnyOrigin
-        ],
-        mut a_below: LayoutTensor[
-            dtype, Layout.row_major(BATCH, Self.IN_DIM), MutAnyOrigin
-        ],
+        x_below: Tile[dtype, BATCH, Self.IN_DIM],
+        params: Tile[dtype, Self.PARAM_SIZE],
+        mu: Tile[dtype, BATCH, Self.OUT_DIM],
+        a_below: Tile[dtype, BATCH, Self.IN_DIM],
     ):
         """μ[b, j] = sum_i ACT(x_below[b, i]) * W[i, j] + b[j].
 
@@ -125,16 +110,12 @@ struct PCBlock[
 
         # 2. μ = a_below @ W + b. W/b are sub-views of the param slab; build
         #    them like the GPU path (LayoutTensor over the slab ptr, no rebind),
-        #    and feed the matmul through `lt_to_tt` (no Pointer dance).
-        var W = LayoutTensor[
-            dtype, Layout.row_major(Self.in_dim, Self.out_dim), MutAnyOrigin
-        ](params.ptr)
-        var b_view = LayoutTensor[
-            dtype, Layout.row_major(Self.out_dim), MutAnyOrigin
-        ](params.ptr.unsafe_offset(Self.in_dim * Self.out_dim))
+        #    and feed the matmul the TileTensor views directly.
+        var W = tile[Self.in_dim, Self.out_dim](params.ptr)
+        var b_view = tile[Self.out_dim](params.ptr.unsafe_offset(Self.in_dim * Self.out_dim))
         try:
             max_matmul[target="cpu"](
-                lt_to_tt(mu), lt_to_tt(a_below), lt_to_tt(W), None
+                mu, a_below, W, None
             )
         except:
             pass
@@ -151,15 +132,9 @@ struct PCBlock[
     def eps_compute[
         BATCH: Int, dtype: DType = DType.float32
     ](
-        x_above: LayoutTensor[
-            dtype, Layout.row_major(BATCH, Self.OUT_DIM), MutAnyOrigin
-        ],
-        mu: LayoutTensor[
-            dtype, Layout.row_major(BATCH, Self.OUT_DIM), MutAnyOrigin
-        ],
-        mut eps: LayoutTensor[
-            dtype, Layout.row_major(BATCH, Self.OUT_DIM), MutAnyOrigin
-        ],
+        x_above: Tile[dtype, BATCH, Self.OUT_DIM],
+        mu: Tile[dtype, BATCH, Self.OUT_DIM],
+        eps: Tile[dtype, BATCH, Self.OUT_DIM],
     ):
         # ε = x_above − μ (elementwise; scalar LayoutTensor indexing).
         for sb in range(BATCH):
@@ -174,26 +149,18 @@ struct PCBlock[
     def pull_back[
         BATCH: Int, dtype: DType = DType.float32
     ](
-        eps_above: LayoutTensor[
-            dtype, Layout.row_major(BATCH, Self.OUT_DIM), MutAnyOrigin
-        ],
-        params: LayoutTensor[
-            dtype, Layout.row_major(Self.PARAM_SIZE), MutAnyOrigin
-        ],
-        mut z_below: LayoutTensor[
-            dtype, Layout.row_major(BATCH, Self.IN_DIM), MutAnyOrigin
-        ],
+        eps_above: Tile[dtype, BATCH, Self.OUT_DIM],
+        params: Tile[dtype, Self.PARAM_SIZE],
+        z_below: Tile[dtype, BATCH, Self.IN_DIM],
     ):
         """Formula = z_below[b, i] = sum_j ε_above[b, j] * W[i, j]."""
         # z_below = eps_above @ W^T  → matmul with transpose_b. W is the [in,out]
         # head of the param slab; build it like the GPU path (no rebind) and run
-        # the GEMM through `lt_to_tt`.
-        var W = LayoutTensor[
-            dtype, Layout.row_major(Self.in_dim, Self.out_dim), MutAnyOrigin
-        ](params.ptr)
+        # the GEMM on the TileTensor views.
+        var W = tile[Self.in_dim, Self.out_dim](params.ptr)
         try:
             max_matmul[transpose_b=True, target="cpu"](
-                lt_to_tt(z_below), lt_to_tt(eps_above), lt_to_tt(W), None
+                z_below, eps_above, W, None
             )
         except:
             pass
@@ -206,15 +173,9 @@ struct PCBlock[
     def act_derivative_mul[
         BATCH: Int, dtype: DType = DType.float32
     ](
-        x_below: LayoutTensor[
-            dtype, Layout.row_major(BATCH, Self.IN_DIM), MutAnyOrigin
-        ],
-        z_in: LayoutTensor[
-            dtype, Layout.row_major(BATCH, Self.IN_DIM), MutAnyOrigin
-        ],
-        mut z_out: LayoutTensor[
-            dtype, Layout.row_major(BATCH, Self.IN_DIM), MutAnyOrigin
-        ],
+        x_below: Tile[dtype, BATCH, Self.IN_DIM],
+        z_in: Tile[dtype, BATCH, Self.IN_DIM],
+        z_out: Tile[dtype, BATCH, Self.IN_DIM],
     ):
         Self.ACT.apply_derivative_mul[BATCH, Self.in_dim, dtype](
             x_below, z_in, z_out
@@ -230,15 +191,9 @@ struct PCBlock[
     def weight_grad[
         BATCH: Int, dtype: DType = DType.float32
     ](
-        eps_above: LayoutTensor[
-            dtype, Layout.row_major(BATCH, Self.OUT_DIM), MutAnyOrigin
-        ],
-        a_below: LayoutTensor[
-            dtype, Layout.row_major(BATCH, Self.IN_DIM), MutAnyOrigin
-        ],
-        mut grads: LayoutTensor[
-            dtype, Layout.row_major(Self.PARAM_SIZE), MutAnyOrigin
-        ],
+        eps_above: Tile[dtype, BATCH, Self.OUT_DIM],
+        a_below: Tile[dtype, BATCH, Self.IN_DIM],
+        grads: Tile[dtype, Self.PARAM_SIZE],
     ):
         """Writes gradients (W, b) into `grads` in [W flat | b] layout.
 
@@ -246,12 +201,8 @@ struct PCBlock[
         on the local energy (or output loss for the readout block).
         """
         # Grad sub-views over the slab (like the GPU path; no rebind).
-        var W_grad = LayoutTensor[
-            dtype, Layout.row_major(Self.in_dim, Self.out_dim), MutAnyOrigin
-        ](grads.ptr)
-        var b_grad = LayoutTensor[
-            dtype, Layout.row_major(Self.out_dim), MutAnyOrigin
-        ](grads.ptr.unsafe_offset(Self.in_dim * Self.out_dim))
+        var W_grad = tile[Self.in_dim, Self.out_dim](grads.ptr)
+        var b_grad = tile[Self.out_dim](grads.ptr.unsafe_offset(Self.in_dim * Self.out_dim))
 
         # dE/dW = −(a_below^T @ eps_above), written into W_grad then negated.
         comptime if CompilationTarget.is_macos() and dtype == DType.float32:
@@ -282,21 +233,19 @@ struct PCBlock[
                 pass
         else:
             # Portable: materialize a_belowᵀ into an owned List (no raw alloc),
-            # then GEMM through `lt_to_tt` (max_matmul rejects transpose_a).
+            # then GEMM on the TileTensor views (max_matmul rejects transpose_a).
             var cT = List[Scalar[dtype]](
                 length=Self.in_dim * BATCH, fill=Scalar[dtype](0)
             )
             for bi in range(BATCH):
                 for i in range(Self.in_dim):
                     cT[i * BATCH + bi] = rebind[Scalar[dtype]](a_below[bi, i])
-            var cT_view = LayoutTensor[
-                dtype, Layout.row_major(Self.in_dim, BATCH), MutAnyOrigin
-            ](cT)
+            var cT_view = tile[Self.in_dim, BATCH](cT)
             try:
                 max_matmul[target="cpu"](
-                    lt_to_tt(W_grad),
-                    lt_to_tt(cT_view),
-                    lt_to_tt(eps_above),
+                    W_grad,
+                    cT_view,
+                    eps_above,
                     None,
                 )
             except:
@@ -326,11 +275,9 @@ struct PCBlock[
         OUT: Int,
         dtype: DType,
     ](
-        x_above: LayoutTensor[
-            dtype, Layout.row_major(BATCH, OUT), MutAnyOrigin
-        ],
-        mu: LayoutTensor[dtype, Layout.row_major(BATCH, OUT), MutAnyOrigin],
-        eps: LayoutTensor[dtype, Layout.row_major(BATCH, OUT), MutAnyOrigin],
+        x_above: Tile[dtype, BATCH, OUT],
+        mu: Tile[dtype, BATCH, OUT],
+        eps: Tile[dtype, BATCH, OUT],
     ):
         var idx = Int(block_dim.x * block_idx.x + thread_idx.x)
         if idx >= BATCH * OUT:
@@ -347,10 +294,8 @@ struct PCBlock[
         OUT: Int,
         dtype: DType,
     ](
-        eps_above: LayoutTensor[
-            dtype, Layout.row_major(BATCH, OUT), MutAnyOrigin
-        ],
-        b_grad: LayoutTensor[dtype, Layout.row_major(OUT), MutAnyOrigin],
+        eps_above: Tile[dtype, BATCH, OUT],
+        b_grad: Tile[dtype, OUT],
     ):
         var j = Int(block_dim.x * block_idx.x + thread_idx.x)
         if j >= OUT:
@@ -368,8 +313,8 @@ struct PCBlock[
         OUT: Int,
         dtype: DType,
     ](
-        mu: LayoutTensor[dtype, Layout.row_major(BATCH, OUT), MutAnyOrigin],
-        b: LayoutTensor[dtype, Layout.row_major(OUT), MutAnyOrigin],
+        mu: Tile[dtype, BATCH, OUT],
+        b: Tile[dtype, OUT],
     ):
         var idx = Int(block_dim.x * block_idx.x + thread_idx.x)
         if idx >= BATCH * OUT:
@@ -381,7 +326,7 @@ struct PCBlock[
     def _negate_kernel[
         N: Int,
         dtype: DType,
-    ](buf: LayoutTensor[dtype, Layout.row_major(N), MutAnyOrigin],):
+    ](buf: Tile[dtype, N],):
         var idx = Int(block_dim.x * block_idx.x + thread_idx.x)
         if idx >= N:
             return
@@ -393,8 +338,8 @@ struct PCBlock[
         COLS: Int,
         dtype: DType,
     ](
-        dst: LayoutTensor[dtype, Layout.row_major(COLS, ROWS), MutAnyOrigin],
-        src: LayoutTensor[dtype, Layout.row_major(ROWS, COLS), MutAnyOrigin],
+        dst: Tile[dtype, COLS, ROWS],
+        src: Tile[dtype, ROWS, COLS],
     ):
         var idx = Int(block_dim.x * block_idx.x + thread_idx.x)
         if idx >= ROWS * COLS:
@@ -410,38 +355,24 @@ struct PCBlock[
         BATCH: Int, dtype: DType = DType.float32
     ](
         ctx: DeviceContext,
-        x_below: LayoutTensor[
-            dtype, Layout.row_major(BATCH, Self.IN_DIM), MutAnyOrigin
-        ],
-        params: LayoutTensor[
-            dtype, Layout.row_major(Self.PARAM_SIZE), MutAnyOrigin
-        ],
-        mut mu: LayoutTensor[
-            dtype, Layout.row_major(BATCH, Self.OUT_DIM), MutAnyOrigin
-        ],
-        mut a_below: LayoutTensor[
-            dtype, Layout.row_major(BATCH, Self.IN_DIM), MutAnyOrigin
-        ],
+        x_below: Tile[dtype, BATCH, Self.IN_DIM],
+        params: Tile[dtype, Self.PARAM_SIZE],
+        mu: Tile[dtype, BATCH, Self.OUT_DIM],
+        a_below: Tile[dtype, BATCH, Self.IN_DIM],
     ) raises:
         # 1. a_below = ACT(x_below)
         Self.ACT.apply_gpu[BATCH, Self.in_dim, dtype](ctx, x_below, a_below)
 
         # 2. μ = a_below @ W + b
-        var W = LayoutTensor[
-            dtype,
-            Layout.row_major(Self.in_dim, Self.out_dim),
-            MutAnyOrigin,
-        ](params.ptr)
-        var b_view = LayoutTensor[
-            dtype, Layout.row_major(Self.out_dim), MutAnyOrigin
-        ](params.ptr.unsafe_offset(Self.in_dim * Self.out_dim))
+        var W = tile[Self.in_dim, Self.out_dim](params.ptr)
+        var b_view = tile[Self.out_dim](params.ptr.unsafe_offset(Self.in_dim * Self.out_dim))
 
         # max_matmul writes mu = a_below @ W (no bias), then a separate
         # bias-add kernel folds in b. Apple + NVIDIA (nn convention).
         max_matmul[target="gpu"](
-            lt_to_tt(mu),
-            lt_to_tt(a_below),
-            lt_to_tt(W),
+            mu,
+            a_below,
+            W,
             ctx,
         )
 
@@ -460,15 +391,9 @@ struct PCBlock[
         BATCH: Int, dtype: DType = DType.float32
     ](
         ctx: DeviceContext,
-        x_above: LayoutTensor[
-            dtype, Layout.row_major(BATCH, Self.OUT_DIM), MutAnyOrigin
-        ],
-        mu: LayoutTensor[
-            dtype, Layout.row_major(BATCH, Self.OUT_DIM), MutAnyOrigin
-        ],
-        mut eps: LayoutTensor[
-            dtype, Layout.row_major(BATCH, Self.OUT_DIM), MutAnyOrigin
-        ],
+        x_above: Tile[dtype, BATCH, Self.OUT_DIM],
+        mu: Tile[dtype, BATCH, Self.OUT_DIM],
+        eps: Tile[dtype, BATCH, Self.OUT_DIM],
     ) raises:
         comptime k = Self._eps_kernel[BATCH, Self.out_dim, dtype]
         var threads = BATCH * Self.out_dim
@@ -486,28 +411,18 @@ struct PCBlock[
         BATCH: Int, dtype: DType = DType.float32
     ](
         ctx: DeviceContext,
-        eps_above: LayoutTensor[
-            dtype, Layout.row_major(BATCH, Self.OUT_DIM), MutAnyOrigin
-        ],
-        params: LayoutTensor[
-            dtype, Layout.row_major(Self.PARAM_SIZE), MutAnyOrigin
-        ],
-        mut z_below: LayoutTensor[
-            dtype, Layout.row_major(BATCH, Self.IN_DIM), MutAnyOrigin
-        ],
+        eps_above: Tile[dtype, BATCH, Self.OUT_DIM],
+        params: Tile[dtype, Self.PARAM_SIZE],
+        z_below: Tile[dtype, BATCH, Self.IN_DIM],
     ) raises:
-        var W = LayoutTensor[
-            dtype,
-            Layout.row_major(Self.in_dim, Self.out_dim),
-            MutAnyOrigin,
-        ](params.ptr)
+        var W = tile[Self.in_dim, Self.out_dim](params.ptr)
         # z_below[B, IN] = eps_above[B, OUT] @ W^T[OUT, IN]
         # max_matmul with transpose_b=True treats W (stored [IN, OUT]) as if
         # it were W^T, giving exactly this contraction. Apple + NVIDIA.
         max_matmul[transpose_b=True, target="gpu"](
-            lt_to_tt(z_below),
-            lt_to_tt(eps_above),
-            lt_to_tt(W),
+            z_below,
+            eps_above,
+            W,
             ctx,
         )
 
@@ -516,15 +431,9 @@ struct PCBlock[
         BATCH: Int, dtype: DType = DType.float32
     ](
         ctx: DeviceContext,
-        x_below: LayoutTensor[
-            dtype, Layout.row_major(BATCH, Self.IN_DIM), MutAnyOrigin
-        ],
-        z_in: LayoutTensor[
-            dtype, Layout.row_major(BATCH, Self.IN_DIM), MutAnyOrigin
-        ],
-        mut z_out: LayoutTensor[
-            dtype, Layout.row_major(BATCH, Self.IN_DIM), MutAnyOrigin
-        ],
+        x_below: Tile[dtype, BATCH, Self.IN_DIM],
+        z_in: Tile[dtype, BATCH, Self.IN_DIM],
+        z_out: Tile[dtype, BATCH, Self.IN_DIM],
     ) raises:
         Self.ACT.apply_derivative_mul_gpu[BATCH, Self.in_dim, dtype](
             ctx, x_below, z_in, z_out
@@ -535,34 +444,18 @@ struct PCBlock[
         BATCH: Int, dtype: DType = DType.float32
     ](
         ctx: DeviceContext,
-        eps_above: LayoutTensor[
-            dtype, Layout.row_major(BATCH, Self.OUT_DIM), MutAnyOrigin
-        ],
-        a_below: LayoutTensor[
-            dtype, Layout.row_major(BATCH, Self.IN_DIM), MutAnyOrigin
-        ],
-        mut grads: LayoutTensor[
-            dtype, Layout.row_major(Self.PARAM_SIZE), MutAnyOrigin
-        ],
+        eps_above: Tile[dtype, BATCH, Self.OUT_DIM],
+        a_below: Tile[dtype, BATCH, Self.IN_DIM],
+        grads: Tile[dtype, Self.PARAM_SIZE],
     ) raises:
-        var W_grad = LayoutTensor[
-            dtype,
-            Layout.row_major(Self.in_dim, Self.out_dim),
-            MutAnyOrigin,
-        ](grads.ptr)
-        var b_grad = LayoutTensor[
-            dtype, Layout.row_major(Self.out_dim), MutAnyOrigin
-        ](grads.ptr.unsafe_offset(Self.in_dim * Self.out_dim))
+        var W_grad = tile[Self.in_dim, Self.out_dim](grads.ptr)
+        var b_grad = tile[Self.out_dim](grads.ptr.unsafe_offset(Self.in_dim * Self.out_dim))
 
         # dW[IN, OUT] = -a_below^T[IN, BATCH] @ eps_above[BATCH, OUT]
         # max_matmul has no transpose_a, so materialize a_below^T into a
         # scratch buffer first, then compute the GEMM and negate dW.
         var a_T_buf = ctx.enqueue_create_buffer[dtype](BATCH * Self.in_dim)
-        var a_T = LayoutTensor[
-            dtype,
-            Layout.row_major(Self.in_dim, BATCH),
-            MutAnyOrigin,
-        ](a_T_buf)
+        var a_T = tile[Self.in_dim, BATCH](a_T_buf)
 
         comptime kt = Self._transpose_2d_kernel[BATCH, Self.in_dim, dtype]
         comptime t_blocks = (BATCH * Self.in_dim + TPB - 1) // TPB
@@ -574,18 +467,14 @@ struct PCBlock[
         )
 
         max_matmul[target="gpu"](
-            lt_to_tt(W_grad),
-            lt_to_tt(a_T),
-            lt_to_tt(eps_above),
+            W_grad,
+            a_T,
+            eps_above,
             ctx,
         )
 
         # Bake in the −sign expected by Optimizer.step (params -= lr·grads).
-        var W_grad_flat = LayoutTensor[
-            dtype,
-            Layout.row_major(Self.in_dim * Self.out_dim),
-            MutAnyOrigin,
-        ](grads.ptr)
+        var W_grad_flat = tile[Self.in_dim * Self.out_dim](grads.ptr)
         comptime kn = Self._negate_kernel[Self.in_dim * Self.out_dim, dtype]
         comptime n_blocks = (Self.in_dim * Self.out_dim + TPB - 1) // TPB
         ctx.enqueue_function[kn](

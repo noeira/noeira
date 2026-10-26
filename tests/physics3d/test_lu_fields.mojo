@@ -18,8 +18,7 @@ Run: pixi run -e apple mojo run -I . tests/physics3d/test_lu_fields.mojo
 
 from std.math import abs
 from max.gpu.host import DeviceContext
-from std.sys import has_nvidia_gpu_accelerator
-from layout import Layout
+from std.sys import default_accelerator
 
 from noeira.physics3d.fields import DynamicsScratch, Dims, DimsLike
 from noeira.physics3d.dynamics.lu import (
@@ -127,7 +126,7 @@ def main() raises:
         if d > worst_gpu:
             worst_gpu = d
     print("  fields-GPU vs fields-CPU worst err:", worst_gpu)
-    if worst_gpu > 1e-4 and not has_nvidia_gpu_accelerator():
+    if worst_gpu > 1e-4 and not default_accelerator().is_nvidia_gpu():
         raise Error("fields-GPU LU diverges from fields-CPU")
     print("  Part B PASS: fields-GPU == fields-CPU")
     print("test_lu_fields: ALL PASS")

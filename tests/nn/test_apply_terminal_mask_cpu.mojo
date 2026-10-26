@@ -19,7 +19,7 @@ Run: `pixi run mojo run -I . tests/nn/test_apply_terminal_mask_cpu.mojo`
 
 from std.memory import alloc
 from std.testing import assert_true
-from layout import Layout, LayoutTensor
+from noeira.core.tiles import tile
 
 from noeira.nn.constants import DT
 from noeira.deep_agents.training.terminal_mask import apply_terminal_mask
@@ -49,9 +49,9 @@ def main() raises:
         y[i] = boot[i]  # y enters holding ONLY the bootstrap term
 
     # The helper takes `LayoutTensor` views, not raw pointers.
-    var r_t = LayoutTensor[DT, Layout.row_major(N), MutAnyOrigin](r)
-    var term_t = LayoutTensor[DT, Layout.row_major(N), MutAnyOrigin](term)
-    var y_t = LayoutTensor[DT, Layout.row_major(N, 1), MutAnyOrigin](y)
+    var r_t = tile[N](r)
+    var term_t = tile[N](term)
+    var y_t = tile[N, 1](y)
     apply_terminal_mask["cpu", N](None, r_t, term_t, y_t)
 
     for i in range(N):

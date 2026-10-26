@@ -37,7 +37,7 @@ Run: pixi run -e apple mojo run -I . tests/deep_agents/test_fb_ring_derived_next
 """
 
 from std.testing import assert_true
-from layout import Layout, LayoutTensor
+from noeira.core.tiles import tile
 from max.gpu.host import DeviceContext
 
 from noeira.nn.constants import DT, TPB
@@ -157,9 +157,9 @@ def _case[
     pos_d.enqueue_fill(Int32(pos))
     var off_d = c.enqueue_create_buffer[DType.uint64](1)
     off_d.enqueue_fill(UInt64(0))
-    var size_lt = LayoutTensor[DType.int32, Layout.row_major(1)](size_d)
-    var pos_lt = LayoutTensor[DType.int32, Layout.row_major(1)](pos_d)
-    var off_lt = LayoutTensor[DType.uint64, Layout.row_major(1)](off_d)
+    var size_lt = tile[1](size_d)
+    var pos_lt = tile[1](pos_d)
+    var off_lt = tile[1](off_d)
 
     # ── the all-zero-`r_bnd` POSITIVE CONTROL ────────────────────────────
     # Identical seed and offset, so the raw uniform and therefore `j` are the
@@ -170,7 +170,7 @@ def _case[
     zero_bnd.enqueue_fill(Scalar[DT](0.0))
     var idx_ctl = c.enqueue_create_buffer[IDX_DT](DRAWS)
     c.enqueue_function[ring_indices_kernel[DRAWS, CAP, LANES]](
-        LayoutTensor[IDX_DT, Layout.row_major(DRAWS)](idx_ctl),
+        tile[DRAWS](idx_ctl),
         size_lt, pos_lt, mptr(zero_bnd.unsafe_ptr()), SEED, off_lt,
         grid_dim=_blk(DRAWS), block_dim=TPB,
     )
@@ -178,7 +178,7 @@ def _case[
     var idx = c.enqueue_create_buffer[IDX_DT](DRAWS)
     var idx_n = c.enqueue_create_buffer[IDX_DT](DRAWS)
     c.enqueue_function[ring_indices_kernel[DRAWS, CAP, LANES]](
-        LayoutTensor[IDX_DT, Layout.row_major(DRAWS)](idx),
+        tile[DRAWS](idx),
         size_lt, pos_lt, mptr(r_bnd.unsafe_ptr()), SEED, off_lt,
         grid_dim=_blk(DRAWS), block_dim=TPB,
     )
@@ -338,7 +338,7 @@ def _case[
     pos_d.enqueue_fill(Int32(pos2))
     off_d.enqueue_fill(UInt64(0))
     c.enqueue_function[ring_indices_kernel[DRAWS, CAP, LANES]](
-        LayoutTensor[IDX_DT, Layout.row_major(DRAWS)](idx),
+        tile[DRAWS](idx),
         size_lt, pos_lt, mptr(p2_bnd.unsafe_ptr()), SEED, off_lt,
         grid_dim=_blk(DRAWS), block_dim=TPB,
     )

@@ -43,12 +43,12 @@ from std.math import pow as fpow
 from std.random import random_float64
 from std.random.philox import Random as PhiloxRandom
 from std.utils import IndexList
-from layout import Layout, LayoutTensor, RuntimeLayout
+from layout import TileTensor
 
 from noeira.nn.constants import DT, TPB
 from noeira.nn.core.ptr import mptr
 from .episode_index import EpisodeIndex
-from .resident import DYN1, IDX_DT, IndexBatch
+from .resident import DYN1, IDX_DT, IndexBatch, rl1
 
 
 # ══════════════════════════════════════════════════════════════════════════
@@ -95,7 +95,7 @@ struct UniformSampler(Movable & Deinitable):
 # ══════════════════════════════════════════════════════════════════════════
 
 def _uniform_indices_kernel(
-    indices: LayoutTensor[IDX_DT, DYN1, MutAnyOrigin],
+    indices: TileTensor[IDX_DT, DYN1, MutAnyOrigin],
     size: Int32,
     seed: UInt64,
     offset: UInt64,
@@ -107,7 +107,7 @@ def _uniform_indices_kernel(
     exactly — widening to Float64 here would silently change the draw.
     """
     var i = Int(block_dim.x * block_idx.x + thread_idx.x)
-    var n = indices.dim(0)
+    var n = Int(indices.dim[0]())
     if i >= n:
         return
     var philox = PhiloxRandom(seed=seed + UInt64(i), offset=offset)
@@ -156,9 +156,8 @@ struct UniformDeviceSampler(Movable & Deinitable):
             raise Error("UniformDeviceSampler: batch must be > 0")
         if self.n_rows <= 0:
             raise Error("UniformDeviceSampler: store is empty")
-        var lt = LayoutTensor[IDX_DT, DYN1, MutAnyOrigin](
-            mptr(dev.unsafe_ptr()),
-            RuntimeLayout[DYN1].row_major(IndexList[1](batch)),
+        var lt = TileTensor[IDX_DT, DYN1, MutAnyOrigin](
+            ptr=mptr(dev.unsafe_ptr()), layout=rl1(batch)
         )
         var n_blocks = (batch + TPB - 1) // TPB
         ctx.enqueue_function[_uniform_indices_kernel](

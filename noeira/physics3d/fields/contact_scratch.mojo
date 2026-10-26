@@ -11,11 +11,11 @@ start — the legacy `solver_idx` base is gone.
 from ..constraints.solver_ws import ws_budget, _max_one_rt
 
 from max.gpu.host import DeviceContext
-from layout import Layout
 
 from noeira.nn.core.tensor import TensorImpl
 
 from .dims import DimsLike
+from noeira.core.tiles import RowMajor
 
 
 struct ContactScratch[
@@ -72,7 +72,7 @@ struct ContactScratch[
 
     comptime MC = Self.MAX_CONTACTS if Self.MAX_CONTACTS > 0 else 1
     comptime SOLVER_WS = 81 * Self.MC + 12 * Self.MC * Self.NV
-    comptime L_SOLVER = Layout.row_major(Self.BATCH, Self.SOLVER_WS)
+    comptime L_SOLVER = RowMajor[Self.BATCH, Self.SOLVER_WS]
 
     # ⚠ `Je` GETS ITS OWN TENSOR RATHER THAN WIDENING `solver`. `SOLVER_WS` is
     # the ROW STRIDE of a `[BATCH, SOLVER_WS]` view, and that literal is
@@ -81,7 +81,7 @@ struct ContactScratch[
     # wrong memory — silent corruption, not a crash. A separate tensor leaves
     # every stride untouched and confines the change to the blocked path.
     comptime JE_ELEMS = Self.JE_WS if Self.JE_WS > 0 else 1
-    comptime L_JE = Layout.row_major(Self.BATCH, Self.JE_ELEMS)
+    comptime L_JE = RowMajor[Self.BATCH, Self.JE_ELEMS]
 
     var solver: TensorImpl[Self.DTYPE]  # [BATCH, SOLVER_WS]
     var je: TensorImpl[Self.DTYPE]  # [BATCH, JE_ELEMS] — 1 scalar when unused

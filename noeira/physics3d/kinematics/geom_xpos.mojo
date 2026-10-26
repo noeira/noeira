@@ -23,7 +23,7 @@ from ..gpu.constants import (
     GEOM_IDX_POS_Y,
     GEOM_IDX_POS_Z,
 )
-from layout import Layout, LayoutTensor
+from layout import TileTensor, TensorLayout
 
 from .quat_math import gpu_quat_rotate
 
@@ -69,19 +69,13 @@ def geom_xpos[DTYPE: DType, D: DimsLike](
 @always_inline
 def geom_xpos_gpu[
     DTYPE: DType,
-    L_XPOS: Layout,
-    L_XQUAT: Layout,
-    L_GEOMS: Layout,
+    L_XPOS: TensorLayout,
+    L_XQUAT: TensorLayout,
+    L_GEOMS: TensorLayout,
 ](
-    xpos: LayoutTensor[
-        DTYPE, L_XPOS, MutAnyOrigin
-    ],
-    xquat: LayoutTensor[
-        DTYPE, L_XQUAT, MutAnyOrigin
-    ],
-    geoms: LayoutTensor[
-        DTYPE, L_GEOMS, MutAnyOrigin
-    ],
+    xpos: TileTensor[DTYPE, L_XPOS, MutAnyOrigin],
+    xquat: TileTensor[DTYPE, L_XQUAT, MutAnyOrigin],
+    geoms: TileTensor[DTYPE, L_GEOMS, MutAnyOrigin],
     env: Int,
     geom: Int,
 ) -> Tuple[Scalar[DTYPE], Scalar[DTYPE], Scalar[DTYPE]]:

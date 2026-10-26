@@ -5,7 +5,6 @@ top-down image (car sprite at center, road + grass pixels present, values in
 Run: pixi run -e apple mojo run -I . tests/envs/test_car_racing_pixel_gpu.mojo
 """
 
-from layout import Layout, LayoutTensor
 from max.gpu.host import DeviceContext
 from noeira.physics2d import dtype
 from noeira.envs.car_racing import CarRacingPixel

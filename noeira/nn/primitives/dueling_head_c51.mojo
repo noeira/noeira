@@ -32,7 +32,8 @@ over verbatim.
 
 from max.gpu import global_idx
 from max.gpu.host import DeviceContext
-from layout import Layout, LayoutTensor, TileTensor, row_major
+from layout import TileTensor, row_major
+from noeira.core.tiles import Tile
 
 from noeira.nn.constants import DT, TPB
 from ..core.tensor import Tensor
@@ -47,12 +48,8 @@ from ..core.amp import AMPPolicy, NoAMP
 def _dueling_c51_combine_kernel[
     BATCH: Int, NA: Int, N_ATOMS: Int,
 ](
-    raw_in: LayoutTensor[
-        DT, Layout.row_major(BATCH, (1 + NA) * N_ATOMS), MutAnyOrigin,
-    ],
-    q_out: LayoutTensor[
-        DT, Layout.row_major(BATCH, NA * N_ATOMS), MutAnyOrigin,
-    ],
+    raw_in: Tile[DT, BATCH, (1 + NA) * N_ATOMS],
+    q_out: Tile[DT, BATCH, NA * N_ATOMS],
 ):
     """One thread per (batch, atom). For each atom k:
         mean_A_k = (1/NA) · Σ_a A[b, a, k]
@@ -80,12 +77,8 @@ def _dueling_c51_combine_kernel[
 def _dueling_c51_grad_kernel[
     BATCH: Int, NA: Int, N_ATOMS: Int,
 ](
-    grad_out: LayoutTensor[
-        DT, Layout.row_major(BATCH, NA * N_ATOMS), MutAnyOrigin,
-    ],
-    grad_in: LayoutTensor[
-        DT, Layout.row_major(BATCH, (1 + NA) * N_ATOMS), MutAnyOrigin,
-    ],
+    grad_out: Tile[DT, BATCH, NA * N_ATOMS],
+    grad_in: Tile[DT, BATCH, (1 + NA) * N_ATOMS],
 ):
     """One thread per (batch, atom). For each atom k:
         dV[b, k]      = Σ_a grad_out[b, a, k]
@@ -170,12 +163,8 @@ struct DuelingHeadC51[NA: Int, N_ATOMS: Int](Module):
                 B, Self.NA, Self.N_ATOMS,
             ]
             c.enqueue_function[kernel](
-                in0.lt[
-                    "gpu", Layout.row_major(B, (1 + Self.NA) * Self.N_ATOMS)
-                ](),
-                out.lt[
-                    "gpu", Layout.row_major(B, Self.NA * Self.N_ATOMS)
-                ](),
+                in0.tt["gpu", B, (1 + Self.NA) * Self.N_ATOMS](),
+                out.tt["gpu", B, Self.NA * Self.N_ATOMS](),
                 grid_dim=n_blocks,
                 block_dim=TPB,
             )
@@ -227,12 +216,8 @@ struct DuelingHeadC51[NA: Int, N_ATOMS: Int](Module):
                 B, Self.NA, Self.N_ATOMS,
             ]
             c.enqueue_function[kernel](
-                grad_output.lt[
-                    "gpu", Layout.row_major(B, Self.NA * Self.N_ATOMS)
-                ](),
-                gin.lt[
-                    "gpu", Layout.row_major(B, (1 + Self.NA) * Self.N_ATOMS)
-                ](),
+                grad_output.tt["gpu", B, Self.NA * Self.N_ATOMS](),
+                gin.tt["gpu", B, (1 + Self.NA) * Self.N_ATOMS](),
                 grid_dim=n_blocks,
                 block_dim=TPB,
             )

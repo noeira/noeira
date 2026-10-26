@@ -9,7 +9,6 @@ All physics data is packed per-environment for efficient GPU access.
 """
 
 from std.math import sqrt, cos, sin, pi, tanh
-from layout import Layout, LayoutTensor
 from max.gpu import thread_idx, block_idx, block_dim
 from max.gpu.host import DeviceContext, DeviceBuffer
 from std.memory import alloc
@@ -116,6 +115,7 @@ from noeira.render import (
     make_leg_box,
     scale_vertices,
 )
+from noeira.core.tiles import Tile, ImmTile, tile
 
 # =============================================================================
 # LunarLander Environment
@@ -1593,17 +1593,13 @@ struct LunarLander[
                      seed that still varies per environment.
         """
         # Create 2D LayoutTensor from buffer
-        var states = LayoutTensor[
-            dtype, Layout.row_major(BATCH_SIZE, STATE_SIZE)
-        ](states_buf)
+        var states = tile[BATCH_SIZE, STATE_SIZE](states_buf)
 
         comptime BLOCKS = (BATCH_SIZE + TPB - 1) // TPB
 
         @always_inline
         def reset_wrapper(
-            states: LayoutTensor[
-                dtype, Layout.row_major(BATCH_SIZE, STATE_SIZE), MutAnyOrigin
-            ],
+            states: Tile[dtype, BATCH_SIZE, STATE_SIZE],
             seed: Scalar[dtype],
         ):
             var i = Int(block_dim.x * block_idx.x + thread_idx.x)
@@ -1656,34 +1652,20 @@ struct LunarLander[
             rng_counter_ptr: Optional GPU counter pointer. When non-null, reads
                      seed from GPU memory instead of rng_seed parameter.
         """
-        var states = LayoutTensor[
-            dtype, Layout.row_major(BATCH_SIZE, STATE_SIZE)
-        ](states_buf)
+        var states = tile[BATCH_SIZE, STATE_SIZE](states_buf)
 
-        var dones = LayoutTensor[
-            dtype, Layout.row_major(BATCH_SIZE)
-        ](dones_buf)
+        var dones = tile[BATCH_SIZE](dones_buf)
 
         comptime BLOCKS = (BATCH_SIZE + TPB - 1) // TPB
 
         if Bool(rng_counter_ptr):
-            var counter_t = LayoutTensor[
-                DType.uint64, Layout.row_major(1), MutAnyOrigin
-            ](rng_counter_ptr.value())
+            var counter_t = tile[1](rng_counter_ptr.value())
 
             @always_inline
             def selective_reset_counter_wrapper(
-                states: LayoutTensor[
-                    dtype,
-                    Layout.row_major(BATCH_SIZE, STATE_SIZE),
-                    MutAnyOrigin,
-                ],
-                dones: LayoutTensor[
-                    dtype, Layout.row_major(BATCH_SIZE), MutAnyOrigin
-                ],
-                counter: LayoutTensor[
-                    DType.uint64, Layout.row_major(1), MutAnyOrigin
-                ],
+                states: Tile[dtype, BATCH_SIZE, STATE_SIZE],
+                dones: Tile[dtype, BATCH_SIZE],
+                counter: Tile[DType.uint64, 1],
             ):
                 var i = Int(block_dim.x * block_idx.x + thread_idx.x)
                 if i >= BATCH_SIZE:
@@ -1709,14 +1691,8 @@ struct LunarLander[
 
             @always_inline
             def selective_reset_wrapper(
-                states: LayoutTensor[
-                    dtype,
-                    Layout.row_major(BATCH_SIZE, STATE_SIZE),
-                    MutAnyOrigin,
-                ],
-                dones: LayoutTensor[
-                    dtype, Layout.row_major(BATCH_SIZE), MutAnyOrigin
-                ],
+                states: Tile[dtype, BATCH_SIZE, STATE_SIZE],
+                dones: Tile[dtype, BATCH_SIZE],
                 seed: Scalar[dtype],
             ):
                 var i = Int(block_dim.x * block_idx.x + thread_idx.x)
@@ -1748,25 +1724,15 @@ struct LunarLander[
     ) raises:
         """Extract observations from state buffer (trivial copy: obs = state[0:OBS_DIM]).
         """
-        var states = LayoutTensor[
-            dtype, Layout.row_major(BATCH_SIZE, STATE_SIZE_VAL)
-        ](states_buf)
-        var obs = LayoutTensor[
-            dtype, Layout.row_major(BATCH_SIZE, OBS_DIM_VAL)
-        ](obs_buf)
+        var states = tile[BATCH_SIZE, STATE_SIZE_VAL](states_buf)
+        var obs = tile[BATCH_SIZE, OBS_DIM_VAL](obs_buf)
 
         comptime BLOCKS = (BATCH_SIZE + TPB - 1) // TPB
 
         @always_inline
         def extract_obs(
-            states: LayoutTensor[
-                dtype,
-                Layout.row_major(BATCH_SIZE, STATE_SIZE_VAL),
-                ImmutAnyOrigin,
-            ],
-            obs: LayoutTensor[
-                dtype, Layout.row_major(BATCH_SIZE, OBS_DIM_VAL), MutAnyOrigin
-            ],
+            states: ImmTile[dtype, BATCH_SIZE, STATE_SIZE_VAL],
+            obs: Tile[dtype, BATCH_SIZE, OBS_DIM_VAL],
         ):
             var i = Int(block_dim.x * block_idx.x + thread_idx.x)
             if i >= BATCH_SIZE:
@@ -1819,9 +1785,7 @@ struct LunarLander[
         BATCH: Int,
         STATE_SIZE: Int,
     ](
-        states: LayoutTensor[
-            dtype, Layout.row_major(BATCH, STATE_SIZE), MutAnyOrigin
-        ],
+        states: Tile[dtype, BATCH, STATE_SIZE],
         env: Int,
         init_vx: Scalar[dtype],
         init_vy: Scalar[dtype],
@@ -1916,14 +1880,8 @@ struct LunarLander[
         STATE_SIZE: Int,
     ](
         env: Int,
-        states: LayoutTensor[
-            dtype, Layout.row_major(BATCH, STATE_SIZE), MutAnyOrigin
-        ],
-        contacts: LayoutTensor[
-            dtype,
-            Layout.row_major(BATCH, LLConstants.MAX_CONTACTS, CONTACT_DATA_SIZE),
-            MutAnyOrigin,
-        ],
+        states: Tile[dtype, BATCH, STATE_SIZE],
+        contacts: Tile[dtype, BATCH, LLConstants.MAX_CONTACTS, CONTACT_DATA_SIZE],
         n_contacts: Int,
         n_joints: Int,
         gravity_x: Scalar[dtype],
@@ -1982,9 +1940,7 @@ struct LunarLander[
         BATCH_SIZE: Int,
         STATE_SIZE: Int,
     ](
-        states: LayoutTensor[
-            dtype, Layout.row_major(BATCH_SIZE, STATE_SIZE), MutAnyOrigin
-        ],
+        states: Tile[dtype, BATCH_SIZE, STATE_SIZE],
         env: Int,
         seed: Int,
     ):
@@ -2003,7 +1959,7 @@ struct LunarLander[
         var n_chunks = LLConstants.TERRAIN_CHUNKS
         states[env, LLConstants.EDGE_COUNT_OFFSET] = Scalar[dtype](n_edges)
 
-        var x_spacing: states.element_type = Scalar[dtype](
+        var x_spacing: states.ElementType = Scalar[dtype](
             LLConstants.W_UNITS
         ) / Scalar[dtype](LLConstants.TERRAIN_CHUNKS - 1)
 
@@ -2051,8 +2007,8 @@ struct LunarLander[
 
         # Step 4: Build edges from adjacent chunk heights
         for edge in range(n_edges):
-            var x0: states.element_type = Scalar[dtype](edge) * x_spacing
-            var x1: states.element_type = Scalar[dtype](edge + 1) * x_spacing
+            var x0: states.ElementType = Scalar[dtype](edge) * x_spacing
+            var x1: states.ElementType = Scalar[dtype](edge + 1) * x_spacing
             var y0 = smoothed_heights[edge]
             var y1 = smoothed_heights[edge + 1]
 
@@ -2081,10 +2037,10 @@ struct LunarLander[
         var init_random_scale = Scalar[dtype](
             1000.0 * LLConstants.DT / LLConstants.LANDER_MASS
         )
-        var init_vx: states.element_type = (
+        var init_vx: states.ElementType = (
             velocity_rand[0] * Scalar[dtype](2.0) - Scalar[dtype](1.0)
         ) * init_random_scale
-        var init_vy: states.element_type = (
+        var init_vy: states.ElementType = (
             velocity_rand[1] * Scalar[dtype](2.0) - Scalar[dtype](1.0)
         ) * init_random_scale
 
@@ -2093,19 +2049,19 @@ struct LunarLander[
         )
 
         # Initialize observation - use Scalar[dtype] to avoid Float64 issues
-        var y_norm: states.element_type = Scalar[dtype](
+        var y_norm: states.ElementType = Scalar[dtype](
             (
                 LLConstants.H_UNITS
                 - (LLConstants.HELIPAD_Y + LLConstants.LEG_DOWN)
             )
             / (LLConstants.H_UNITS / 2.0)
         )
-        var vx_norm: states.element_type = (
+        var vx_norm: states.ElementType = (
             init_vx
             * Scalar[dtype](LLConstants.W_UNITS / 2.0)
             / Scalar[dtype](50.0)
         )
-        var vy_norm: states.element_type = (
+        var vy_norm: states.ElementType = (
             init_vy
             * Scalar[dtype](LLConstants.H_UNITS / 2.0)
             / Scalar[dtype](50.0)
@@ -2122,16 +2078,16 @@ struct LunarLander[
 
         # Compute initial shaping (same formula as _finalize_step_gpu)
         # At reset: x_norm=0, angle=0, left_contact=0, right_contact=0
-        var y_norm_abs: states.element_type = y_norm
+        var y_norm_abs: states.ElementType = y_norm
         if y_norm < 0:
             y_norm_abs = -y_norm
-        var dist: states.element_type = (
+        var dist: states.ElementType = (
             y_norm_abs  # sqrt(0² + y_norm²) = |y_norm|
         )
-        var speed: states.element_type = sqrt(
+        var speed: states.ElementType = sqrt(
             vx_norm * vx_norm + vy_norm * vy_norm
         )
-        var init_shaping: states.element_type = (
+        var init_shaping: states.ElementType = (
             Scalar[dtype](-100.0) * dist
             - Scalar[dtype](100.0) * speed
             # angle = 0, left_contact = 0, right_contact = 0
@@ -2157,18 +2113,11 @@ struct LunarLander[
         mut shapes_buf: DeviceBuffer[dtype],
     ) raises:
         """Initialize shape definitions (shared across all environments)."""
-        var shapes = LayoutTensor[
-            dtype,
-            Layout.row_major(LLConstants.NUM_SHAPES * SHAPE_MAX_SIZE),
-        ](shapes_buf)
+        var shapes = tile[LLConstants.NUM_SHAPES * SHAPE_MAX_SIZE](shapes_buf)
 
         @always_inline
         def init_shapes_wrapper(
-            shapes: LayoutTensor[
-                dtype,
-                Layout.row_major(LLConstants.NUM_SHAPES * SHAPE_MAX_SIZE),
-                MutAnyOrigin,
-            ],
+            shapes: Tile[dtype, LLConstants.NUM_SHAPES * SHAPE_MAX_SIZE],
         ):
             var tid = Int(block_dim.x * block_idx.x + thread_idx.x)
             if tid > 0:
@@ -2227,11 +2176,7 @@ struct LunarLander[
         BATCH_SIZE: Int,
     ](
         env: Int,
-        states: LayoutTensor[
-            dtype,
-            Layout.row_major(BATCH_SIZE, LLConstants.STATE_SIZE_VAL),
-            MutAnyOrigin,
-        ],
+        states: Tile[dtype, BATCH_SIZE, LLConstants.STATE_SIZE_VAL],
         step_count: Int,
     ):
         """Apply wind and turbulence forces for GPU computation.
@@ -2294,23 +2239,11 @@ struct LunarLander[
         BATCH_SIZE: Int,
     ](
         env: Int,
-        states: LayoutTensor[
-            dtype,
-            Layout.row_major(BATCH_SIZE, LLConstants.STATE_SIZE_VAL),
-            MutAnyOrigin,
-        ],
-        actions: LayoutTensor[
-            dtype, Layout.row_major(BATCH_SIZE), ImmutAnyOrigin
-        ],
-        edge_counts: LayoutTensor[
-            dtype, Layout.row_major(BATCH_SIZE), MutAnyOrigin
-        ],
-        joint_counts: LayoutTensor[
-            dtype, Layout.row_major(BATCH_SIZE), MutAnyOrigin
-        ],
-        contact_counts: LayoutTensor[
-            dtype, Layout.row_major(BATCH_SIZE), MutAnyOrigin
-        ],
+        states: Tile[dtype, BATCH_SIZE, LLConstants.STATE_SIZE_VAL],
+        actions: ImmTile[dtype, BATCH_SIZE],
+        edge_counts: Tile[dtype, BATCH_SIZE],
+        joint_counts: Tile[dtype, BATCH_SIZE],
+        contact_counts: Tile[dtype, BATCH_SIZE],
     ):
         """Fused setup for single environment: zero + extract + apply_forces."""
         # 1. Zero contact count
@@ -2453,31 +2386,13 @@ struct LunarLander[
         BATCH_SIZE: Int,
     ](
         env: Int,
-        states: LayoutTensor[
-            dtype,
-            Layout.row_major(BATCH_SIZE, LLConstants.STATE_SIZE_VAL),
-            MutAnyOrigin,
-        ],
-        actions: LayoutTensor[
-            dtype, Layout.row_major(BATCH_SIZE), ImmutAnyOrigin
-        ],
-        contacts: LayoutTensor[
-            dtype,
-            Layout.row_major(
-                BATCH_SIZE, LLConstants.MAX_CONTACTS, CONTACT_DATA_SIZE
-            ),
-            MutAnyOrigin,
-        ],
-        contact_counts: LayoutTensor[
-            dtype, Layout.row_major(BATCH_SIZE), MutAnyOrigin
-        ],
-        rewards: LayoutTensor[
-            dtype, Layout.row_major(BATCH_SIZE), MutAnyOrigin
-        ],
-        dones: LayoutTensor[dtype, Layout.row_major(BATCH_SIZE), MutAnyOrigin],
-        terminated_out: LayoutTensor[
-            dtype, Layout.row_major(BATCH_SIZE), MutAnyOrigin
-        ],
+        states: Tile[dtype, BATCH_SIZE, LLConstants.STATE_SIZE_VAL],
+        actions: ImmTile[dtype, BATCH_SIZE],
+        contacts: Tile[dtype, BATCH_SIZE, LLConstants.MAX_CONTACTS, CONTACT_DATA_SIZE],
+        contact_counts: Tile[dtype, BATCH_SIZE],
+        rewards: Tile[dtype, BATCH_SIZE],
+        dones: Tile[dtype, BATCH_SIZE],
+        terminated_out: Tile[dtype, BATCH_SIZE],
     ):
         """Finalize step for single env: obs update + reward + done check."""
         var lander_off = LLConstants.BODIES_OFFSET
@@ -2686,44 +2601,21 @@ struct LunarLander[
         mut contact_counts_buf: DeviceBuffer[dtype],
     ) raises:
         """Fused setup kernel: zero + extract + apply_forces in ONE kernel."""
-        var states = LayoutTensor[
-            dtype,
-            Layout.row_major(BATCH_SIZE, LLConstants.STATE_SIZE_VAL),
-        ](states_buf)
-        var actions = LayoutTensor[
-            dtype, Layout.row_major(BATCH_SIZE)
-        ](actions_buf)
-        var edge_counts = LayoutTensor[
-            dtype, Layout.row_major(BATCH_SIZE)
-        ](edge_counts_buf)
-        var joint_counts = LayoutTensor[
-            dtype, Layout.row_major(BATCH_SIZE)
-        ](joint_counts_buf)
-        var contact_counts = LayoutTensor[
-            dtype, Layout.row_major(BATCH_SIZE)
-        ](contact_counts_buf)
+        var states = tile[BATCH_SIZE, LLConstants.STATE_SIZE_VAL](states_buf)
+        var actions = tile[BATCH_SIZE](actions_buf)
+        var edge_counts = tile[BATCH_SIZE](edge_counts_buf)
+        var joint_counts = tile[BATCH_SIZE](joint_counts_buf)
+        var contact_counts = tile[BATCH_SIZE](contact_counts_buf)
 
         comptime BLOCKS = (BATCH_SIZE + TPB - 1) // TPB
 
         @always_inline
         def setup_kernel(
-            states: LayoutTensor[
-                dtype,
-                Layout.row_major(BATCH_SIZE, LLConstants.STATE_SIZE_VAL),
-                MutAnyOrigin,
-            ],
-            actions: LayoutTensor[
-                dtype, Layout.row_major(BATCH_SIZE), ImmutAnyOrigin
-            ],
-            edge_counts: LayoutTensor[
-                dtype, Layout.row_major(BATCH_SIZE), MutAnyOrigin
-            ],
-            joint_counts: LayoutTensor[
-                dtype, Layout.row_major(BATCH_SIZE), MutAnyOrigin
-            ],
-            contact_counts: LayoutTensor[
-                dtype, Layout.row_major(BATCH_SIZE), MutAnyOrigin
-            ],
+            states: Tile[dtype, BATCH_SIZE, LLConstants.STATE_SIZE_VAL],
+            actions: ImmTile[dtype, BATCH_SIZE],
+            edge_counts: Tile[dtype, BATCH_SIZE],
+            joint_counts: Tile[dtype, BATCH_SIZE],
+            contact_counts: Tile[dtype, BATCH_SIZE],
         ):
             var env = Int(block_dim.x * block_idx.x + thread_idx.x)
             if env >= BATCH_SIZE:
@@ -2768,90 +2660,33 @@ struct LunarLander[
         Same as _physics_finalize_fused_gpu but also extracts observations
         to obs_buf, eliminating the need for a separate extract_obs kernel.
         """
-        var states = LayoutTensor[
-            dtype,
-            Layout.row_major(BATCH_SIZE, LLConstants.STATE_SIZE_VAL),
-        ](states_buf)
-        var shapes = LayoutTensor[
-            dtype,
-            Layout.row_major(LLConstants.NUM_SHAPES, SHAPE_MAX_SIZE),
-        ](shapes_buf)
-        var edge_counts = LayoutTensor[
-            dtype, Layout.row_major(BATCH_SIZE)
-        ](edge_counts_buf)
-        var joint_counts = LayoutTensor[
-            dtype, Layout.row_major(BATCH_SIZE)
-        ](joint_counts_buf)
-        var contacts = LayoutTensor[
-            dtype,
-            Layout.row_major(
-                BATCH_SIZE, LLConstants.MAX_CONTACTS, CONTACT_DATA_SIZE
-            ),
-        ](contacts_buf)
-        var contact_counts = LayoutTensor[
-            dtype, Layout.row_major(BATCH_SIZE)
-        ](contact_counts_buf)
-        var actions = LayoutTensor[
-            dtype, Layout.row_major(BATCH_SIZE)
-        ](actions_buf)
-        var rewards = LayoutTensor[
-            dtype, Layout.row_major(BATCH_SIZE)
-        ](rewards_buf)
-        var dones = LayoutTensor[
-            dtype, Layout.row_major(BATCH_SIZE)
-        ](dones_buf)
-        var terminated_out = LayoutTensor[
-            dtype, Layout.row_major(BATCH_SIZE)
-        ](terminated_buf)
-        var obs = LayoutTensor[
-            dtype, Layout.row_major(BATCH_SIZE, OBS_DIM)
-        ](obs_buf)
+        var states = tile[BATCH_SIZE, LLConstants.STATE_SIZE_VAL](states_buf)
+        var shapes = tile[LLConstants.NUM_SHAPES, SHAPE_MAX_SIZE](shapes_buf)
+        var edge_counts = tile[BATCH_SIZE](edge_counts_buf)
+        var joint_counts = tile[BATCH_SIZE](joint_counts_buf)
+        var contacts = tile[BATCH_SIZE, LLConstants.MAX_CONTACTS, CONTACT_DATA_SIZE](contacts_buf)
+        var contact_counts = tile[BATCH_SIZE](contact_counts_buf)
+        var actions = tile[BATCH_SIZE](actions_buf)
+        var rewards = tile[BATCH_SIZE](rewards_buf)
+        var dones = tile[BATCH_SIZE](dones_buf)
+        var terminated_out = tile[BATCH_SIZE](terminated_buf)
+        var obs = tile[BATCH_SIZE, OBS_DIM](obs_buf)
 
         comptime BLOCKS = (BATCH_SIZE + TPB - 1) // TPB
 
         @always_inline
         def physics_finalize_obs_kernel(
-            states: LayoutTensor[
-                dtype,
-                Layout.row_major(BATCH_SIZE, LLConstants.STATE_SIZE_VAL),
-                MutAnyOrigin,
-            ],
-            shapes: LayoutTensor[
-                dtype,
-                Layout.row_major(LLConstants.NUM_SHAPES, SHAPE_MAX_SIZE),
-                ImmutAnyOrigin,
-            ],
-            edge_counts: LayoutTensor[
-                dtype, Layout.row_major(BATCH_SIZE), ImmutAnyOrigin
-            ],
-            joint_counts: LayoutTensor[
-                dtype, Layout.row_major(BATCH_SIZE), ImmutAnyOrigin
-            ],
-            contacts: LayoutTensor[
-                dtype,
-                Layout.row_major(
-                    BATCH_SIZE, LLConstants.MAX_CONTACTS, CONTACT_DATA_SIZE
-                ),
-                MutAnyOrigin,
-            ],
-            contact_counts: LayoutTensor[
-                dtype, Layout.row_major(BATCH_SIZE), MutAnyOrigin
-            ],
-            actions: LayoutTensor[
-                dtype, Layout.row_major(BATCH_SIZE), ImmutAnyOrigin
-            ],
-            rewards: LayoutTensor[
-                dtype, Layout.row_major(BATCH_SIZE), MutAnyOrigin
-            ],
-            dones: LayoutTensor[
-                dtype, Layout.row_major(BATCH_SIZE), MutAnyOrigin
-            ],
-            terminated_out: LayoutTensor[
-                dtype, Layout.row_major(BATCH_SIZE), MutAnyOrigin
-            ],
-            obs: LayoutTensor[
-                dtype, Layout.row_major(BATCH_SIZE, OBS_DIM), MutAnyOrigin
-            ],
+            states: Tile[dtype, BATCH_SIZE, LLConstants.STATE_SIZE_VAL],
+            shapes: ImmTile[dtype, LLConstants.NUM_SHAPES, SHAPE_MAX_SIZE],
+            edge_counts: ImmTile[dtype, BATCH_SIZE],
+            joint_counts: ImmTile[dtype, BATCH_SIZE],
+            contacts: Tile[dtype, BATCH_SIZE, LLConstants.MAX_CONTACTS, CONTACT_DATA_SIZE],
+            contact_counts: Tile[dtype, BATCH_SIZE],
+            actions: ImmTile[dtype, BATCH_SIZE],
+            rewards: Tile[dtype, BATCH_SIZE],
+            dones: Tile[dtype, BATCH_SIZE],
+            terminated_out: Tile[dtype, BATCH_SIZE],
+            obs: Tile[dtype, BATCH_SIZE, OBS_DIM],
             gravity_x: Scalar[dtype],
             gravity_y: Scalar[dtype],
             dt: Scalar[dtype],
@@ -2942,44 +2777,21 @@ struct LunarLander[
         mut contact_counts_buf: DeviceBuffer[dtype],
     ) raises:
         """Fused setup kernel for continuous actions."""
-        var states = LayoutTensor[
-            dtype,
-            Layout.row_major(BATCH_SIZE, LLConstants.STATE_SIZE_VAL),
-        ](states_buf)
-        var actions = LayoutTensor[
-            dtype, Layout.row_major(BATCH_SIZE, ACTION_DIM)
-        ](actions_buf)
-        var edge_counts = LayoutTensor[
-            dtype, Layout.row_major(BATCH_SIZE)
-        ](edge_counts_buf)
-        var joint_counts = LayoutTensor[
-            dtype, Layout.row_major(BATCH_SIZE)
-        ](joint_counts_buf)
-        var contact_counts = LayoutTensor[
-            dtype, Layout.row_major(BATCH_SIZE)
-        ](contact_counts_buf)
+        var states = tile[BATCH_SIZE, LLConstants.STATE_SIZE_VAL](states_buf)
+        var actions = tile[BATCH_SIZE, ACTION_DIM](actions_buf)
+        var edge_counts = tile[BATCH_SIZE](edge_counts_buf)
+        var joint_counts = tile[BATCH_SIZE](joint_counts_buf)
+        var contact_counts = tile[BATCH_SIZE](contact_counts_buf)
 
         comptime BLOCKS = (BATCH_SIZE + TPB - 1) // TPB
 
         @always_inline
         def setup_kernel_continuous(
-            states: LayoutTensor[
-                dtype,
-                Layout.row_major(BATCH_SIZE, LLConstants.STATE_SIZE_VAL),
-                MutAnyOrigin,
-            ],
-            actions: LayoutTensor[
-                dtype, Layout.row_major(BATCH_SIZE, ACTION_DIM), ImmutAnyOrigin
-            ],
-            edge_counts: LayoutTensor[
-                dtype, Layout.row_major(BATCH_SIZE), MutAnyOrigin
-            ],
-            joint_counts: LayoutTensor[
-                dtype, Layout.row_major(BATCH_SIZE), MutAnyOrigin
-            ],
-            contact_counts: LayoutTensor[
-                dtype, Layout.row_major(BATCH_SIZE), MutAnyOrigin
-            ],
+            states: Tile[dtype, BATCH_SIZE, LLConstants.STATE_SIZE_VAL],
+            actions: ImmTile[dtype, BATCH_SIZE, ACTION_DIM],
+            edge_counts: Tile[dtype, BATCH_SIZE],
+            joint_counts: Tile[dtype, BATCH_SIZE],
+            contact_counts: Tile[dtype, BATCH_SIZE],
         ):
             var env = Int(block_dim.x * block_idx.x + thread_idx.x)
             if env >= BATCH_SIZE:
@@ -3005,23 +2817,11 @@ struct LunarLander[
         ACTION_DIM: Int,
     ](
         env: Int,
-        states: LayoutTensor[
-            dtype,
-            Layout.row_major(BATCH_SIZE, LLConstants.STATE_SIZE_VAL),
-            MutAnyOrigin,
-        ],
-        actions: LayoutTensor[
-            dtype, Layout.row_major(BATCH_SIZE, ACTION_DIM), ImmutAnyOrigin
-        ],
-        edge_counts: LayoutTensor[
-            dtype, Layout.row_major(BATCH_SIZE), MutAnyOrigin
-        ],
-        joint_counts: LayoutTensor[
-            dtype, Layout.row_major(BATCH_SIZE), MutAnyOrigin
-        ],
-        contact_counts: LayoutTensor[
-            dtype, Layout.row_major(BATCH_SIZE), MutAnyOrigin
-        ],
+        states: Tile[dtype, BATCH_SIZE, LLConstants.STATE_SIZE_VAL],
+        actions: ImmTile[dtype, BATCH_SIZE, ACTION_DIM],
+        edge_counts: Tile[dtype, BATCH_SIZE],
+        joint_counts: Tile[dtype, BATCH_SIZE],
+        contact_counts: Tile[dtype, BATCH_SIZE],
     ):
         """Fused setup for single env with continuous actions."""
         # 1. Zero contact count
@@ -3195,90 +2995,33 @@ struct LunarLander[
         dt: Scalar[dtype],
     ) raises:
         """Fused physics + finalize + extract_obs for continuous actions."""
-        var states = LayoutTensor[
-            dtype,
-            Layout.row_major(BATCH_SIZE, LLConstants.STATE_SIZE_VAL),
-        ](states_buf)
-        var shapes = LayoutTensor[
-            dtype,
-            Layout.row_major(LLConstants.NUM_SHAPES, SHAPE_MAX_SIZE),
-        ](shapes_buf)
-        var edge_counts = LayoutTensor[
-            dtype, Layout.row_major(BATCH_SIZE)
-        ](edge_counts_buf)
-        var joint_counts = LayoutTensor[
-            dtype, Layout.row_major(BATCH_SIZE)
-        ](joint_counts_buf)
-        var contacts = LayoutTensor[
-            dtype,
-            Layout.row_major(
-                BATCH_SIZE, LLConstants.MAX_CONTACTS, CONTACT_DATA_SIZE
-            ),
-        ](contacts_buf)
-        var contact_counts = LayoutTensor[
-            dtype, Layout.row_major(BATCH_SIZE)
-        ](contact_counts_buf)
-        var actions = LayoutTensor[
-            dtype, Layout.row_major(BATCH_SIZE, ACTION_DIM)
-        ](actions_buf)
-        var rewards = LayoutTensor[
-            dtype, Layout.row_major(BATCH_SIZE)
-        ](rewards_buf)
-        var dones = LayoutTensor[
-            dtype, Layout.row_major(BATCH_SIZE)
-        ](dones_buf)
-        var terminated_out = LayoutTensor[
-            dtype, Layout.row_major(BATCH_SIZE)
-        ](terminated_buf)
-        var obs = LayoutTensor[
-            dtype, Layout.row_major(BATCH_SIZE, OBS_DIM)
-        ](obs_buf)
+        var states = tile[BATCH_SIZE, LLConstants.STATE_SIZE_VAL](states_buf)
+        var shapes = tile[LLConstants.NUM_SHAPES, SHAPE_MAX_SIZE](shapes_buf)
+        var edge_counts = tile[BATCH_SIZE](edge_counts_buf)
+        var joint_counts = tile[BATCH_SIZE](joint_counts_buf)
+        var contacts = tile[BATCH_SIZE, LLConstants.MAX_CONTACTS, CONTACT_DATA_SIZE](contacts_buf)
+        var contact_counts = tile[BATCH_SIZE](contact_counts_buf)
+        var actions = tile[BATCH_SIZE, ACTION_DIM](actions_buf)
+        var rewards = tile[BATCH_SIZE](rewards_buf)
+        var dones = tile[BATCH_SIZE](dones_buf)
+        var terminated_out = tile[BATCH_SIZE](terminated_buf)
+        var obs = tile[BATCH_SIZE, OBS_DIM](obs_buf)
 
         comptime BLOCKS = (BATCH_SIZE + TPB - 1) // TPB
 
         @always_inline
         def physics_finalize_obs_kernel_continuous(
-            states: LayoutTensor[
-                dtype,
-                Layout.row_major(BATCH_SIZE, LLConstants.STATE_SIZE_VAL),
-                MutAnyOrigin,
-            ],
-            shapes: LayoutTensor[
-                dtype,
-                Layout.row_major(LLConstants.NUM_SHAPES, SHAPE_MAX_SIZE),
-                ImmutAnyOrigin,
-            ],
-            edge_counts: LayoutTensor[
-                dtype, Layout.row_major(BATCH_SIZE), ImmutAnyOrigin
-            ],
-            joint_counts: LayoutTensor[
-                dtype, Layout.row_major(BATCH_SIZE), ImmutAnyOrigin
-            ],
-            contacts: LayoutTensor[
-                dtype,
-                Layout.row_major(
-                    BATCH_SIZE, LLConstants.MAX_CONTACTS, CONTACT_DATA_SIZE
-                ),
-                MutAnyOrigin,
-            ],
-            contact_counts: LayoutTensor[
-                dtype, Layout.row_major(BATCH_SIZE), MutAnyOrigin
-            ],
-            actions: LayoutTensor[
-                dtype, Layout.row_major(BATCH_SIZE, ACTION_DIM), ImmutAnyOrigin
-            ],
-            rewards: LayoutTensor[
-                dtype, Layout.row_major(BATCH_SIZE), MutAnyOrigin
-            ],
-            dones: LayoutTensor[
-                dtype, Layout.row_major(BATCH_SIZE), MutAnyOrigin
-            ],
-            terminated_out: LayoutTensor[
-                dtype, Layout.row_major(BATCH_SIZE), MutAnyOrigin
-            ],
-            obs: LayoutTensor[
-                dtype, Layout.row_major(BATCH_SIZE, OBS_DIM), MutAnyOrigin
-            ],
+            states: Tile[dtype, BATCH_SIZE, LLConstants.STATE_SIZE_VAL],
+            shapes: ImmTile[dtype, LLConstants.NUM_SHAPES, SHAPE_MAX_SIZE],
+            edge_counts: ImmTile[dtype, BATCH_SIZE],
+            joint_counts: ImmTile[dtype, BATCH_SIZE],
+            contacts: Tile[dtype, BATCH_SIZE, LLConstants.MAX_CONTACTS, CONTACT_DATA_SIZE],
+            contact_counts: Tile[dtype, BATCH_SIZE],
+            actions: ImmTile[dtype, BATCH_SIZE, ACTION_DIM],
+            rewards: Tile[dtype, BATCH_SIZE],
+            dones: Tile[dtype, BATCH_SIZE],
+            terminated_out: Tile[dtype, BATCH_SIZE],
+            obs: Tile[dtype, BATCH_SIZE, OBS_DIM],
             gravity_x: Scalar[dtype],
             gravity_y: Scalar[dtype],
             dt: Scalar[dtype],
@@ -3361,31 +3104,13 @@ struct LunarLander[
         ACTION_DIM: Int,
     ](
         env: Int,
-        states: LayoutTensor[
-            dtype,
-            Layout.row_major(BATCH_SIZE, LLConstants.STATE_SIZE_VAL),
-            MutAnyOrigin,
-        ],
-        actions: LayoutTensor[
-            dtype, Layout.row_major(BATCH_SIZE, ACTION_DIM), ImmutAnyOrigin
-        ],
-        contacts: LayoutTensor[
-            dtype,
-            Layout.row_major(
-                BATCH_SIZE, LLConstants.MAX_CONTACTS, CONTACT_DATA_SIZE
-            ),
-            MutAnyOrigin,
-        ],
-        contact_counts: LayoutTensor[
-            dtype, Layout.row_major(BATCH_SIZE), MutAnyOrigin
-        ],
-        rewards: LayoutTensor[
-            dtype, Layout.row_major(BATCH_SIZE), MutAnyOrigin
-        ],
-        dones: LayoutTensor[dtype, Layout.row_major(BATCH_SIZE), MutAnyOrigin],
-        terminated_out: LayoutTensor[
-            dtype, Layout.row_major(BATCH_SIZE), MutAnyOrigin
-        ],
+        states: Tile[dtype, BATCH_SIZE, LLConstants.STATE_SIZE_VAL],
+        actions: ImmTile[dtype, BATCH_SIZE, ACTION_DIM],
+        contacts: Tile[dtype, BATCH_SIZE, LLConstants.MAX_CONTACTS, CONTACT_DATA_SIZE],
+        contact_counts: Tile[dtype, BATCH_SIZE],
+        rewards: Tile[dtype, BATCH_SIZE],
+        dones: Tile[dtype, BATCH_SIZE],
+        terminated_out: Tile[dtype, BATCH_SIZE],
     ):
         """Finalize step for single env with continuous action fuel costs."""
         var lander_off = LLConstants.BODIES_OFFSET
@@ -3801,7 +3526,7 @@ struct LunarLander[
         # Use shape factory for lander body, scale from pixels to world units
         var lander_verts_raw = make_lander_body()
         var lander_verts = scale_vertices(
-            lander_verts_raw^, 1.0 / Float64(LLConstants.SCALE)
+            lander_verts_raw, 1.0 / Float64(LLConstants.SCALE)
         )
 
         # Create transform for lander position and rotation

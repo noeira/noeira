@@ -1,8 +1,10 @@
 name: ci
 
 # Cost/duration model (public repo → standard runners are free):
-#   * per-push/PR: the `smoke` job only — a curated ~11-file CPU manifest
-#     (tests/manifests/smoke.txt), hard-capped by timeout-minutes.
+#   * per-push/PR: `model-dims` and `examples-compile`.
+#   * per-PR only: `smoke` — a curated CPU manifest (tests/manifests/smoke.txt)
+#     that takes ~50 min, too long for every push to dev. Run it on a branch
+#     with `workflow_dispatch` (tier: smoke).
 #   * weekly cron: the full non-GPU discovery sweep (hours) — catches rot in
 #     the long tail without taxing every push.
 #   * GPU tests never run here (no free GPU runners) — `pixi run -e apple|
@@ -40,18 +42,35 @@ concurrency:
   group: ci-${{ github.workflow }}-${{ github.ref }}
   cancel-in-progress: true
 
+# The workspace declares linux-64 only as `{ platform = "linux-64", cuda = "12" }`
+# (lock name `linux-64-cuda-12`), so the lock was solved with `__cuda=12` and the
+# cpu env's linux-64 packages carry it (onnxruntime's cuda129 build pulls
+# cuda-cudart / cuda-nvrtc). A GitHub runner has no GPU, so pixi finds no
+# platform it can run and `pixi install -e cpu --locked` stops at
+# `unsupported-platform: missing virtual packages: __cuda >= 12`. Mocking the
+# virtual package installs the locked env as-is; nothing in the CPU tiers
+# opens a CUDA device.
+env:
+  CONDA_OVERRIDE_CUDA: "12.0"
+
 jobs:
   smoke:
-    if: github.event_name != 'schedule' && (github.event_name != 'workflow_dispatch' || inputs.tier == 'smoke')
+    if: github.event_name == 'pull_request' || (github.event_name == 'workflow_dispatch' && inputs.tier == 'smoke')
     runs-on: ubuntu-latest
-    timeout-minutes: 60
+    # ⚠ The manifest budgets ~15 min; its first full run on a runner
+    # (2026-10-26, 101 files) took 58.5 — inside 60 only by luck.
+    timeout-minutes: 90
     steps:
       - uses: actions/checkout@v4
       - uses: prefix-dev/setup-pixi@v0.9.4
         with:
           environments: cpu
           cache: true
-          cache-write: ${{ github.event_name == 'push' && github.ref == 'refs/heads/dev' }}
+          cache-write: false
+      # The http and serial shims are dlopen'd by a dozen smoke tests and are
+      # not in git (`scripts/build_http.sh`, `scripts/build_serial.sh`).
+      - name: build the native shims
+        run: pixi run -e cpu build-http && pixi run -e cpu build-serial
       - name: smoke tier
         run: pixi run -e cpu test-smoke
 
@@ -59,7 +78,11 @@ jobs:
     # The comptime model dimensions are GENERATED from the .xml assets through
     # MuJoCo. A stale generated file is silent by construction: the counts still
     # compile, they just size the slabs for a model that no longer exists. This
-    # is seconds and needs no Mojo toolchain, so it runs on every push.
+    # is seconds, so it runs on every push.
+    # ⚠ The LIBERO scenes' meshes are not in git
+    # (`noeira/envs/libero/assets.kv` declares the pack), and MuJoCo cannot
+    # load those scenes without them, so the pack is pulled first — through
+    # the same tool and sha256 as any box.
     if: github.event_name != 'schedule' && (github.event_name != 'workflow_dispatch' || inputs.tier == 'smoke')
     runs-on: ubuntu-latest
     timeout-minutes: 15
@@ -69,7 +92,12 @@ jobs:
         with:
           environments: cpu
           cache: true
-          cache-write: false
+          # The one job that writes the pixi cache: it runs on every push to
+          # dev, and a cache a PR writes is visible to that PR only.
+          cache-write: ${{ github.event_name == 'push' && github.ref == 'refs/heads/dev' }}
+      # assets-pull downloads through the http shim (not in git).
+      - name: pull the LIBERO asset pack
+        run: pixi run -e cpu build-http && pixi run -e cpu assets-pull libero
       - name: generated dims are up to date
         run: pixi run -e cpu gen-dims-check
 
@@ -98,6 +126,8 @@ jobs:
           environments: cpu
           cache: true
           cache-write: false
+      - name: build the native shims
+        run: pixi run -e cpu build-http && pixi run -e cpu build-serial
       - name: full CPU sweep
         # Discovery over tests/ minus *_gpu.mojo. Some of the long tail needs
         # local-only assets (references/, ROMs) and will fail on CI — the

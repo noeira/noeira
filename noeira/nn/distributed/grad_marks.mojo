@@ -40,7 +40,7 @@ wrappers. With no driver registered the wrapper behaves as above.
 """
 
 from std.ffi import _get_global_or_null, external_call
-from std.sys import size_of, has_nvidia_gpu_accelerator
+from std.sys import size_of, default_accelerator
 from std.memory.alloc import Layout as AllocLayout
 from max.gpu.host import DeviceContext, DeviceBuffer, DeviceEvent
 
@@ -56,7 +56,7 @@ from noeira.nn.core.graph_visitor import DisplayStep
 
 comptime _REGISTRY = "NOEIRA_GRAD_MARKS"
 
-comptime MARK_EVENTS = has_nvidia_gpu_accelerator()
+comptime MARK_EVENTS = default_accelerator().is_nvidia_gpu()
 """Marks record a device event at their point of the backward. Off on Metal,
 where MAX implements no `ctx.stream()`: there a bucket waits for the whole
 backward (no overlap, same results)."""

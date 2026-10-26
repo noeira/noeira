@@ -59,7 +59,7 @@ comptime _LOG2E = Scalar[F32](1.4426950408889634)
 
 
 def tf32_eligible[ADT: DType, HD: Int, H: Int]() -> Bool:
-    """fp32 activations, a head dim of whole 8-wide k steps, 16-byte rows."""
+    """`fp32` activations, a head dim of whole 8-wide k steps, 16-byte rows."""
     return ADT == F32 and HD % 8 == 0 and HD <= 128 and (H * HD) % 4 == 0
 
 

@@ -38,7 +38,6 @@ Algorithms specify requirements:
 """
 
 from .env import Env
-from layout import LayoutTensor, Layout
 from noeira.nn.constants import DT as dtype
 from max.gpu import (
     block_dim,
@@ -47,6 +46,7 @@ from max.gpu import (
 )
 from max.gpu.host import DeviceContext, DeviceBuffer
 from std.memory import Pointer
+from noeira.core.tiles import Tile, tile
 
 
 # ============================================================================
@@ -571,30 +571,16 @@ trait GPUDiscreteEnv:
             states: State buffer [BATCH_SIZE * STATE_SIZE].
             obs: Observations output [BATCH_SIZE * OBS_DIM].
         """
-        var states_t = LayoutTensor[
-            dtype,
-            Layout.row_major(BATCH_SIZE * STATE_SIZE),
-        ](states)
-        var obs_t = LayoutTensor[
-            dtype,
-            Layout.row_major(BATCH_SIZE * OBS_DIM),
-        ](obs)
+        var states_t = tile[BATCH_SIZE * STATE_SIZE](states)
+        var obs_t = tile[BATCH_SIZE * OBS_DIM](obs)
 
         comptime TPB = 256
         comptime BLOCKS = (BATCH_SIZE + TPB - 1) // TPB
 
         @always_inline
         def extract_wrapper(
-            s: LayoutTensor[
-                dtype,
-                Layout.row_major(BATCH_SIZE * STATE_SIZE),
-                MutAnyOrigin,
-            ],
-            o: LayoutTensor[
-                dtype,
-                Layout.row_major(BATCH_SIZE * OBS_DIM),
-                MutAnyOrigin,
-            ],
+            s: Tile[dtype, BATCH_SIZE * STATE_SIZE],
+            o: Tile[dtype, BATCH_SIZE * OBS_DIM],
         ):
             var e = Int(block_dim.x * block_idx.x + thread_idx.x)
             if e >= BATCH_SIZE:

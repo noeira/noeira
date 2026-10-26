@@ -1,5 +1,5 @@
 """`cublas_gemm` — row-major fp32 GEMMs through cuBLAS, for `Linear`'s
-backward on NVIDIA:
+backward on NVIDIA.
 
     dw[K, N] += x[B, K]ᵀ @ go[B, N]     cublas_gemm[TA=True,  TB=False], β = 1
     gx[B, K]  = go[B, N] @ w[K, N]ᵀ     cublas_gemm[TA=False, TB=True],  β = 0
@@ -29,7 +29,7 @@ NVIDIA only. Deterministic (cuBLAS's default, atomics-free GEMMs), so an
 eager step and its CUDA-graph replay stay bit-identical.
 """
 
-from std.sys import has_nvidia_gpu_accelerator
+from std.sys import default_accelerator
 from std.sys.defines import get_defined_string, is_defined
 from std.ffi import _get_global_or_null, external_call
 from std.memory.alloc import Layout as AllocLayout
@@ -51,7 +51,7 @@ from noeira.nn.constants import DT
 
 
 comptime GEMM_PATH = get_defined_string["NN_GEMM_PATH", "auto"]()
-"""Which GEMM `Linear` / `LinearAct` use on NVIDIA (fp32), for A/B runs:
+"""Which GEMM `Linear` / `LinearAct` use on NVIDIA (fp32), for A/B runs.
 
   - `auto` (default): the backward through `cublas_gemm`; the forward through
     it where `cublas_fwd` says so, MAX's `mm` / `mm_bias` elsewhere;
@@ -83,7 +83,7 @@ def cublas_tf32(m: Int, n: Int, k: Int) -> Bool:
         return False
     return m * n * k >= (1 << 24)
 
-comptime CUBLAS_BWD = has_nvidia_gpu_accelerator() and GEMM_PATH != "max" and GEMM_PATH != "bwdmax" and GEMM_PATH != "linmax"
+comptime CUBLAS_BWD = default_accelerator().is_nvidia_gpu() and GEMM_PATH != "max" and GEMM_PATH != "bwdmax" and GEMM_PATH != "linmax"
 """The NVIDIA fp32 backward of `Linear` / `LinearAct` runs on `cublas_gemm`."""
 
 
@@ -107,7 +107,7 @@ def cublas_fwd(m: Int, n: Int, k: Int, padded: Bool) -> Bool:
         streaming (DreamerV3's [16, 3072] @ [3072, 13824]: 109 vs 144 us).
 
     With this rule every measured shape is within 4% of the faster path."""
-    if not has_nvidia_gpu_accelerator() or GEMM_PATH == "max" or GEMM_PATH == "fwdmax" or GEMM_PATH == "linmax":
+    if not default_accelerator().is_nvidia_gpu() or GEMM_PATH == "max" or GEMM_PATH == "fwdmax" or GEMM_PATH == "linmax":
         return False
     if GEMM_PATH == "cublas":
         return True
@@ -143,7 +143,7 @@ def _shared_workspace(c: DeviceContext) raises -> DeviceBuffer[DType.uint8]:
     var p = alloc(AllocLayout[DeviceBuffer[DType.uint8]].single()).unsafe_leak()
     p.unsafe_write(c.enqueue_create_buffer[DType.uint8](CUBLAS_WS_BYTES))
     external_call["KGEN_CompilerRT_InsertGlobal", NoneType](
-        StringSlice(name), p.bitcast[NoneType]()
+        StringSlice(name), p.unsafe_bitcast[NoneType]()
     )
     return p[]
 
@@ -159,8 +159,9 @@ def cublas_gemm[
     N: Int,
     K: Int,
     beta: Float32,
+    alpha: Float32 = 1.0,
 ) raises:
-    """`dst[M, N] = op(a) @ op(b) + beta · dst`, all row-major fp32 (computed
+    """`dst[M, N] = alpha · op(a) @ op(b) + beta · dst`, all row-major fp32 (computed
     in TF32 when `TF32`, else full fp32; see `cublas_tf32`): op(a) is a[M, K], or a[K, M]ᵀ when `TA`; op(b) is b[K, N], or
     b[N, K]ᵀ when `TB`. The workspace is the context's shared one
     (`_shared_workspace`).
@@ -170,7 +171,7 @@ def cublas_gemm[
     same transpose flags, dims (N, M, K) and the operands' own row strides as
     leading dimensions — MAX's own `c_row_major` mapping."""
     comptime assert DT == DType.float32, "cublas_gemm: fp32 only"
-    _gemm_ex[TA, TB, DT, DT, TF32](c, dst, a, b, M, N, K, beta)
+    _gemm_ex[TA, TB, DT, DT, TF32](c, dst, a, b, M, N, K, beta, alpha)
 
 
 def cublas_gemm_lp[
@@ -204,10 +205,11 @@ def _gemm_ex[
     N: Int,
     K: Int,
     beta: Float32,
+    alpha: Float32 = 1.0,
 ) raises:
     """The one `cublasGemmEx` call behind `cublas_gemm` / `cublas_gemm_lp`
     (row-major mapping in `cublas_gemm`'s docstring)."""
-    comptime assert has_nvidia_gpu_accelerator(), "cuBLAS is NVIDIA-only"
+    comptime assert default_accelerator().is_nvidia_gpu(), "cuBLAS is NVIDIA-only"
     var ws = _shared_workspace(c)
     var handle = _get_global_handle[DT, Backend.CUBLAS](c)._get_cublas()
     check_cublas_error(
@@ -219,7 +221,7 @@ def _gemm_ex[
             cublasMath_t.CUBLAS_TF32_TENSOR_OP_MATH if TF32 else cublasMath_t.CUBLAS_DEFAULT_MATH,
         )
     )
-    var alpha = Float32(1.0)
+    var alpha_v = alpha
     var beta_v = beta
     var lda = M if TA else K
     var ldb = K if TB else N
@@ -231,8 +233,8 @@ def _gemm_ex[
             Int32(N),
             Int32(M),
             Int32(K),
-            UnsafePointer(to=alpha)
-            .bitcast[NoneType]()
+            Pointer(to=alpha_v)
+            .unsafe_bitcast[NoneType]()
             .as_imm()
             .as_unsafe_any_origin(),
             _ffi_void_ptr(b.unsafe_ptr()),
@@ -241,8 +243,8 @@ def _gemm_ex[
             _ffi_void_ptr(a.unsafe_ptr()),
             _convert_to_cublas_datatype[IN_DT](),
             Int32(lda),
-            UnsafePointer(to=beta_v)
-            .bitcast[NoneType]()
+            Pointer(to=beta_v)
+            .unsafe_bitcast[NoneType]()
             .as_imm()
             .as_unsafe_any_origin(),
             _ffi_void_ptr(dst.unsafe_ptr()),

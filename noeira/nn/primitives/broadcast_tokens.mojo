@@ -18,7 +18,8 @@ muzero. Conforms to `Module`. CPU + GPU.
 
 from max.gpu import global_idx
 from max.gpu.host import DeviceContext
-from layout import Layout, LayoutTensor, TileTensor, row_major
+from layout import TileTensor, row_major
+from noeira.core.tiles import Tile
 
 from noeira.nn.constants import DT, TPB
 from ..core.tensor import Tensor, TensorImpl
@@ -33,8 +34,8 @@ from ..core.amp import AMPPolicy, NoAMP
 def _bt_fwd_kernel[
     BATCH: Int, N: Int, DIM: Int, ADT: DType = DT
 ](
-    src: LayoutTensor[ADT, Layout.row_major(BATCH, DIM), MutAnyOrigin],
-    dst: LayoutTensor[ADT, Layout.row_major(BATCH, N * DIM), MutAnyOrigin],
+    src: Tile[ADT, BATCH, DIM],
+    dst: Tile[ADT, BATCH, N * DIM],
 ):
     var gid = Int(global_idx.x)
     comptime total = BATCH * N * DIM
@@ -49,8 +50,8 @@ def _bt_fwd_kernel[
 def _bt_bwd_kernel[
     BATCH: Int, N: Int, DIM: Int, ADT: DType = DT
 ](
-    go: LayoutTensor[ADT, Layout.row_major(BATCH, N * DIM), MutAnyOrigin],
-    gi: LayoutTensor[ADT, Layout.row_major(BATCH, DIM), MutAnyOrigin],
+    go: Tile[ADT, BATCH, N * DIM],
+    gi: Tile[ADT, BATCH, DIM],
 ):
     var gid = Int(global_idx.x)
     comptime total = BATCH * DIM
@@ -112,8 +113,8 @@ struct BroadcastTokens[N_: Int, DIM_: Int, ADT: DType = DT](Module):
             c.enqueue_function[
                 _bt_fwd_kernel[B, Self.N_, Self.DIM_, Self.ACT_DT]
             ](
-                in0.lt["gpu", Layout.row_major(B, Self.DIM_)](),
-                out.lt["gpu", Layout.row_major(B, Self.N_ * Self.DIM_)](),
+                in0.tt["gpu", B, Self.DIM_](),
+                out.tt["gpu", B, Self.N_ * Self.DIM_](),
                 grid_dim=n_blocks,
                 block_dim=TPB,
             )
@@ -150,8 +151,8 @@ struct BroadcastTokens[N_: Int, DIM_: Int, ADT: DType = DT](Module):
             c.enqueue_function[
                 _bt_bwd_kernel[B, Self.N_, Self.DIM_, Self.ACT_DT]
             ](
-                grad_output.lt["gpu", Layout.row_major(B, Self.N_ * Self.DIM_)](),
-                gin.lt["gpu", Layout.row_major(B, Self.DIM_)](),
+                grad_output.tt["gpu", B, Self.N_ * Self.DIM_](),
+                gin.tt["gpu", B, Self.DIM_](),
                 grid_dim=n_blocks,
                 block_dim=TPB,
             )

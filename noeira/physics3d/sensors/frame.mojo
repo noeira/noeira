@@ -85,7 +85,7 @@ from ..gpu.constants import (
     SITE_IDX_QUAT_Z,
     SITE_IDX_QUAT_W,
 )
-from layout import Layout, LayoutTensor
+from layout import TileTensor, TensorLayout
 
 from ..kinematics.quat_math import gpu_quat_mul, gpu_quat_rotate
 from ..kinematics.xmat import quat_xmat_elem
@@ -94,20 +94,20 @@ from ..kinematics.xmat import quat_xmat_elem
 @always_inline
 def frame_object_pose[
     DTYPE: DType,
-    L_B3: Layout,
-    L_B4: Layout,
-    L_S3: Layout,
-    L_BODIES: Layout,
-    L_GEOMS: Layout,
-    L_SITES: Layout,
+    L_B3: TensorLayout,
+    L_B4: TensorLayout,
+    L_S3: TensorLayout,
+    L_BODIES: TensorLayout,
+    L_GEOMS: TensorLayout,
+    L_SITES: TensorLayout,
 ](
-    xpos: LayoutTensor[DTYPE, L_B3, MutAnyOrigin],
-    xquat: LayoutTensor[DTYPE, L_B4, MutAnyOrigin],
-    xipos: LayoutTensor[DTYPE, L_B3, MutAnyOrigin],
-    site_xpos: LayoutTensor[DTYPE, L_S3, MutAnyOrigin],
-    bodies: LayoutTensor[DTYPE, L_BODIES, MutAnyOrigin],
-    geoms: LayoutTensor[DTYPE, L_GEOMS, MutAnyOrigin],
-    sites: LayoutTensor[DTYPE, L_SITES, MutAnyOrigin],
+    xpos: TileTensor[DTYPE, L_B3, MutAnyOrigin],
+    xquat: TileTensor[DTYPE, L_B4, MutAnyOrigin],
+    xipos: TileTensor[DTYPE, L_B3, MutAnyOrigin],
+    site_xpos: TileTensor[DTYPE, L_S3, MutAnyOrigin],
+    bodies: TileTensor[DTYPE, L_BODIES, MutAnyOrigin],
+    geoms: TileTensor[DTYPE, L_GEOMS, MutAnyOrigin],
+    sites: TileTensor[DTYPE, L_SITES, MutAnyOrigin],
     env: Int,
     objtype: Int,
     objid: Int,
@@ -212,11 +212,11 @@ def frame_object_pose[
 @always_inline
 def frame_object_body[
     DTYPE: DType,
-    L_GEOMS: Layout,
-    L_SITES: Layout,
+    L_GEOMS: TensorLayout,
+    L_SITES: TensorLayout,
 ](
-    geoms: LayoutTensor[DTYPE, L_GEOMS, MutAnyOrigin],
-    sites: LayoutTensor[DTYPE, L_SITES, MutAnyOrigin],
+    geoms: TileTensor[DTYPE, L_GEOMS, MutAnyOrigin],
+    sites: TileTensor[DTYPE, L_SITES, MutAnyOrigin],
     objtype: Int,
     objid: Int,
 ) -> Int:
@@ -240,11 +240,11 @@ def frame_object_body[
 
 @always_inline
 def _point_vel_world_lt[
-    DTYPE: DType, L_B3: Layout
+    DTYPE: DType, L_B3: TensorLayout
 ](
-    xvel: LayoutTensor[DTYPE, L_B3, MutAnyOrigin],
-    xangvel: LayoutTensor[DTYPE, L_B3, MutAnyOrigin],
-    xipos: LayoutTensor[DTYPE, L_B3, MutAnyOrigin],
+    xvel: TileTensor[DTYPE, L_B3, MutAnyOrigin],
+    xangvel: TileTensor[DTYPE, L_B3, MutAnyOrigin],
+    xipos: TileTensor[DTYPE, L_B3, MutAnyOrigin],
     env: Int,
     body: Int,
     px: Scalar[DTYPE], py: Scalar[DTYPE], pz: Scalar[DTYPE],
@@ -277,11 +277,11 @@ def _point_vel_world_lt[
 
 @always_inline
 def frame_vel_sensor[
-    DTYPE: DType, L_B3: Layout
+    DTYPE: DType, L_B3: TensorLayout
 ](
-    xvel: LayoutTensor[DTYPE, L_B3, MutAnyOrigin],
-    xangvel: LayoutTensor[DTYPE, L_B3, MutAnyOrigin],
-    xipos: LayoutTensor[DTYPE, L_B3, MutAnyOrigin],
+    xvel: TileTensor[DTYPE, L_B3, MutAnyOrigin],
+    xangvel: TileTensor[DTYPE, L_B3, MutAnyOrigin],
+    xipos: TileTensor[DTYPE, L_B3, MutAnyOrigin],
     env: Int,
     body: Int,
     px: Scalar[DTYPE], py: Scalar[DTYPE], pz: Scalar[DTYPE],

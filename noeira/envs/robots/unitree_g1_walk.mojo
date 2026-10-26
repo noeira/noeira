@@ -27,7 +27,6 @@ or pushes calls `g1_walk_host_pre_step` itself, BEFORE `step` — where the
 batched env calls `pre_step_full_gpu`.
 """
 
-from layout import Layout
 
 from noeira.nn.core.tensor import TensorImpl
 from noeira.physics3d.parser import ModelDefFromXML
@@ -46,6 +45,7 @@ from .unitree_g1_walk_config import (
     g1_walk_pre_step,
     g1_walk_terms,
 )
+from noeira.core.tiles import RowMajor
 
 comptime _pm = UNITREE_G1_DIMS
 
@@ -93,18 +93,18 @@ def g1_walk_host_reset[DTYPE: DType, D: DimsLike](
     """`init_qpos_gpu` for lane 0 with an explicit seed. The caller refreshes
     the FK and body velocities afterwards (`Phyics3dEnv.set_state` with the
     lane's own qpos / qvel does both)."""
-    comptime L_Q = Layout.row_major(1, D.NQ)
-    comptime L_V = Layout.row_major(1, D.NV)
-    comptime L_M = Layout.row_major(1, METADATA_SIZE)
+    comptime L_Q = RowMajor[1, D.NQ]
+    comptime L_V = RowMajor[1, D.NV]
+    comptime L_M = RowMajor[1, METADATA_SIZE]
     if random:
         g1_walk_init[DTYPE, 1, D.NQ, D.NV, True](
-            d.qpos.lt["cpu", L_Q](), d.qvel.lt["cpu", L_V](),
-            d.meta.lt["cpu", L_M](), 0, seed,
+            d.qpos.tt["cpu", 1, D.NQ](), d.qvel.tt["cpu", 1, D.NV](),
+            d.meta.tt["cpu", 1, METADATA_SIZE](), 0, seed,
         )
     else:
         g1_walk_init[DTYPE, 1, D.NQ, D.NV, False](
-            d.qpos.lt["cpu", L_Q](), d.qvel.lt["cpu", L_V](),
-            d.meta.lt["cpu", L_M](), 0, seed,
+            d.qpos.tt["cpu", 1, D.NQ](), d.qvel.tt["cpu", 1, D.NV](),
+            d.meta.tt["cpu", 1, METADATA_SIZE](), 0, seed,
         )
 
 
@@ -113,9 +113,9 @@ def g1_walk_host_pre_step[PUSHES: Bool, DTYPE: DType, D: DimsLike](
 ):
     """`pre_step_full_gpu` for lane 0: command countdown / draw, pushes."""
     g1_walk_pre_step[DTYPE, 1, D.NQ, D.NV, PUSHES](
-        d.qpos.lt["cpu", Layout.row_major(1, D.NQ)](),
-        d.qvel.lt["cpu", Layout.row_major(1, D.NV)](),
-        d.meta.lt["cpu", Layout.row_major(1, METADATA_SIZE)](),
+        d.qpos.tt["cpu", 1, D.NQ](),
+        d.qvel.tt["cpu", 1, D.NV](),
+        d.meta.tt["cpu", 1, METADATA_SIZE](),
         0,
     )
 
@@ -138,12 +138,12 @@ def g1_walk_host_terms[DTYPE: DType, D: DimsLike](
     return g1_walk_terms[
         DTYPE, 1, D.NQ, D.NV, D.NBODY, UNITREE_G1_ACTION_DIM, D.MAX_CONTACTS
     ](
-        d.qpos.lt["cpu", Layout.row_major(1, D.NQ)](),
-        d.qvel.lt["cpu", Layout.row_major(1, D.NV)](),
-        d.xangvel.lt["cpu", Layout.row_major(1, D.NBODY * 3)](),
-        d.contacts.lt["cpu", Layout.row_major(1, D.MAX_CONTACTS * CONTACT_SIZE)](),
-        d.meta.lt["cpu", Layout.row_major(1, METADATA_SIZE)](),
-        a.lt["cpu", Layout.row_major(1, UNITREE_G1_ACTION_DIM)](),
+        d.qpos.tt["cpu", 1, D.NQ](),
+        d.qvel.tt["cpu", 1, D.NV](),
+        d.xangvel.tt["cpu", 1, D.NBODY * 3](),
+        d.contacts.tt["cpu", 1, D.MAX_CONTACTS * CONTACT_SIZE](),
+        d.meta.tt["cpu", 1, METADATA_SIZE](),
+        a.tt["cpu", 1, UNITREE_G1_ACTION_DIM](),
         0,
         terms,
     )

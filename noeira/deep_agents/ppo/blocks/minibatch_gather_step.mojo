@@ -38,7 +38,6 @@ kernels so one minibatch step can be captured once and replayed:
     replay gathers the next minibatch.
 """
 
-from layout import Layout, LayoutTensor
 from max.gpu import global_idx
 from max.gpu.host import DeviceContext
 from std.random import random_float64
@@ -48,23 +47,24 @@ from noeira.nn.constants import DT, TPB
 from noeira.nn.core.fill import fill_dev
 from noeira.nn.core.tensor import Tensor
 from ...training.onpolicy_state import OnPolicyState
+from noeira.core.tiles import Tile
 
 
 def _ppo_gather_kernel[
     OBS: Int, ACT: Int, MB: Int, RN: Int, N_IDX: Int
 ](
-    counter: LayoutTensor[DT, Layout.row_major(1), MutAnyOrigin],
-    idx: LayoutTensor[DT, Layout.row_major(N_IDX), MutAnyOrigin],
-    obs: LayoutTensor[DT, Layout.row_major(RN * OBS), MutAnyOrigin],
-    act: LayoutTensor[DT, Layout.row_major(RN * ACT), MutAnyOrigin],
-    olp: LayoutTensor[DT, Layout.row_major(RN), MutAnyOrigin],
-    adv_all: LayoutTensor[DT, Layout.row_major(N_IDX), MutAnyOrigin],
-    ret: LayoutTensor[DT, Layout.row_major(RN), MutAnyOrigin],
-    mb_obs: LayoutTensor[DT, Layout.row_major(MB * OBS), MutAnyOrigin],
-    mb_act: LayoutTensor[DT, Layout.row_major(MB * ACT), MutAnyOrigin],
-    mb_olp: LayoutTensor[DT, Layout.row_major(MB), MutAnyOrigin],
-    mb_adv: LayoutTensor[DT, Layout.row_major(MB), MutAnyOrigin],
-    mb_ret: LayoutTensor[DT, Layout.row_major(MB), MutAnyOrigin],
+    counter: Tile[DT, 1],
+    idx: Tile[DT, N_IDX],
+    obs: Tile[DT, RN * OBS],
+    act: Tile[DT, RN * ACT],
+    olp: Tile[DT, RN],
+    adv_all: Tile[DT, N_IDX],
+    ret: Tile[DT, RN],
+    mb_obs: Tile[DT, MB * OBS],
+    mb_act: Tile[DT, MB * ACT],
+    mb_olp: Tile[DT, MB],
+    mb_adv: Tile[DT, MB],
+    mb_ret: Tile[DT, MB],
 ):
     """One thread per minibatch row: the device twin of `gather`'s copy loop.
     The minibatch number is read from `counter`, not passed, so a captured
@@ -85,7 +85,7 @@ def _ppo_gather_kernel[
 
 
 def _ppo_counter_advance_kernel(
-    counter: LayoutTensor[DT, Layout.row_major(1), MutAnyOrigin],
+    counter: Tile[DT, 1],
 ):
     if Int(global_idx.x) == 0:
         counter[0] = rebind[Scalar[DT]](counter[0]) + Scalar[DT](1.0)
@@ -303,18 +303,18 @@ struct PPOMinibatchGatherStep[
         c.enqueue_function[
             _ppo_gather_kernel[Self.OBS, Self.ACT, MB, RN, N_IDX]
         ](
-            self._counter.lt["gpu", Layout.row_major(1)](),
-            self._idx_all.lt["gpu", Layout.row_major(N_IDX)](),
-            state.obs_buf.lt["gpu", Layout.row_major(RN * Self.OBS)](),
-            state.act_buf.lt["gpu", Layout.row_major(RN * Self.ACT)](),
-            state.olp_buf.lt["gpu", Layout.row_major(RN)](),
-            self._adv_all.lt["gpu", Layout.row_major(N_IDX)](),
-            state.ret_buf.lt["gpu", Layout.row_major(RN)](),
-            state.mb_obs.lt["gpu", Layout.row_major(MB * Self.OBS)](),
-            state.mb_act.lt["gpu", Layout.row_major(MB * Self.ACT)](),
-            state.mb_olp.lt["gpu", Layout.row_major(MB)](),
-            state.mb_adv.lt["gpu", Layout.row_major(MB)](),
-            state.mb_ret.lt["gpu", Layout.row_major(MB)](),
+            self._counter.tt["gpu", 1](),
+            self._idx_all.tt["gpu", N_IDX](),
+            state.obs_buf.tt["gpu", RN * Self.OBS](),
+            state.act_buf.tt["gpu", RN * Self.ACT](),
+            state.olp_buf.tt["gpu", RN](),
+            self._adv_all.tt["gpu", N_IDX](),
+            state.ret_buf.tt["gpu", RN](),
+            state.mb_obs.tt["gpu", MB * Self.OBS](),
+            state.mb_act.tt["gpu", MB * Self.ACT](),
+            state.mb_olp.tt["gpu", MB](),
+            state.mb_adv.tt["gpu", MB](),
+            state.mb_ret.tt["gpu", MB](),
             grid_dim=(MB + TPB - 1) // TPB,
             block_dim=TPB,
         )
@@ -329,7 +329,7 @@ struct PPOMinibatchGatherStep[
         everything that read this minibatch."""
         var c = state.ctx.value()
         c.enqueue_function[_ppo_counter_advance_kernel](
-            self._counter.lt["gpu", Layout.row_major(1)](),
+            self._counter.tt["gpu", 1](),
             grid_dim=1,
             block_dim=1,
         )

@@ -56,7 +56,7 @@ scripts = ["scripts/build_cuda_intercept.sh"]
 # "feature 'jetson' references platform 'linux-aarch64' which is not declared
 # in the workspace" and every environment fails to resolve — apple and cpu
 # included, not just this one. The workspace entry is what scopes the solve.
-# Everything else (mojo 1.1.0, max 26.6.0, and every conda-forge dep in
+# Everything else (mojo 1.2.0, max 26.7.0, and every conda-forge dep in
 # [dependencies]) is published for linux-aarch64 — checked 2026-09-16 — so the
 # default feature is inherited as-is.
 [feature.jetson]
@@ -185,6 +185,10 @@ transformers = ">=4.50"
 # as-is by `tools/lewm/`) reshapes with einops. Its encoder is HF's ViTModel,
 # which is why `transformers` above serves LeWM too.
 einops = ">=0.7"
+# PEFT, the reference LoRA implementation, for gating noeira/nn/peft (adapter
+# forward/vjp parity, PEFT-format adapter I/O) and for making adapters MAX serve
+# can load. Same argument as transformers above: gate against what everyone uses.
+peft = ">=0.17"
 
 [feature.cpu.dependencies]
 # CPU-only environment for CI and headless test runs: base deps WITHOUT the
@@ -194,8 +198,8 @@ einops = ">=0.7"
 python = ">=3.13.14,<3.14"
 
 [dependencies]
-mojo = "==1.1.0"
-max = "==26.6.0"
+mojo = "==1.2.0"
+max = "==26.7.0"
 gymnasium = ">=1.3.0,<2"
 # ⚠ DECLARED, NOT TRANSITIVE. `noeira/physics3d/collision/native/nra_qhull.c`
 # links libqhull_r to reproduce `mjCMesh::MakeGraph`'s facet ORDER, which is
@@ -207,7 +211,11 @@ qhull = ">=2020.2,<2021"
 # the canonical Farama ROM bundle (see scripts/setup_roms.py) and symlinks them.
 ale-py = ">=0.12.0,<0.13"           # Arcade Learning Environment (requires ROMs)
 pygame = ">=2.6.1,<3"
-python = ">=3.12.13,<3.14"
+# Pinned to 3.13 to match the MOJO_PYTHON_LIBRARY activation string below. The
+# mojo 1.2.0 / max 26.7.0 re-lock resolved 3.12.15 for default, apple,
+# nvidia, amd and jetson under the old `>=3.12.13`, and every Python-interop
+# test then aborted with "Failed to load libpython ... libpython3.13.dylib".
+python = ">=3.13.14,<3.14"
 swig = ">=4.4.1,<5"
 box2d-py = ">=2.3.8,<3"  # for gymnasium Box2D envs (LunarLander, BipedalWalker, CarRacing)
 mujoco = ">=3.12.0,<4"    # for gymnasium MuJoCo envs (HalfCheetah, Ant, Humanoid, etc.)
@@ -336,6 +344,7 @@ test-vision = { cmd = "bash scripts/run_tests.sh tests/manifests/vision.txt", de
 test-swm = { cmd = "bash scripts/run_tests.sh tests/manifests/swm.txt", description = "SWM-H sheaf world model gates (experimental, CPU)" }
 test-fb = { cmd = "bash scripts/run_tests.sh tests/manifests/fb.txt", description = "Forward-Backward zero-shot RL gates (CPU; docs/BFM_ZERO_SHOT_RL.md)" }
 test-lewm = { cmd = "bash scripts/run_tests.sh tests/manifests/lewm.txt", description = "LeWorldModel port self-consistency (experimental, CPU, toy dims)" }
+test-peft = { cmd = "bash scripts/run_tests.sh tests/manifests/peft.txt", description = "Frozen parameters, LoRA, int4 (Q4_0), GPTQ and QLoRA: gates" }
 test-lewm-gpu = { cmd = "bash scripts/run_tests.sh tests/manifests/lewm-gpu.txt", description = "LeWorldModel port GPU paths, toy dims (needs -e apple or -e nvidia)" }
 test-nn-gpu = { cmd = "bash scripts/run_tests.sh tests/manifests/nn-gpu.txt", description = "nn training drivers on the GPU: the GPT / classifier trainers the nn examples run through (needs -e apple or -e nvidia)" }
 test-nn-distributed = { cmd = "bash scripts/run_tests.sh tests/manifests/nn-distributed.txt", description = "nn/distributed gates on the shared-context simulator: DDP, ZeRO-1/2/3, overlap, per-GPU graphs, RankFibers (needs -e apple or -e nvidia)" }

@@ -16,7 +16,7 @@ Run: pixi run -e apple mojo run -I . tests/physics3d/test_qderiv_fields.mojo
 
 from std.math import abs
 from max.gpu.host import DeviceContext
-from std.sys import has_nvidia_gpu_accelerator
+from std.sys import default_accelerator
 
 from noeira.physics3d.fields import (
     Data,
@@ -135,7 +135,7 @@ def main() raises:
         if e > worst:
             worst = e
     print("  fields-GPU vs fields-CPU worst qderiv err:", worst)
-    if worst > 1e-4 and not has_nvidia_gpu_accelerator():
+    if worst > 1e-4 and not default_accelerator().is_nvidia_gpu():
         raise Error("fields-GPU qderiv diverges from fields-CPU")
     print("  Part B PASS: fields-GPU == fields-CPU")
     print("test_qderiv_fields: ALL PASS")

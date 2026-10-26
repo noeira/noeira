@@ -43,7 +43,6 @@ already been bitten by once.
 
 from std.math import pi, sqrt, log, cos
 from std.random.philox import Random as PhiloxRandom
-from layout import Layout, LayoutTensor
 
 from noeira.physics3d.joint_types import JNT_HINGE, JNT_SLIDE, JNT_FREE
 from noeira.physics3d.gpu.constants import (
@@ -53,6 +52,7 @@ from noeira.physics3d.gpu.constants import (
     JOINT_IDX_RANGE_MIN,
     JOINT_IDX_RANGE_MAX,
 )
+from noeira.core.tiles import Tile
 
 
 # A range wider than this counts as unlimited. Same threshold as
@@ -150,12 +150,8 @@ def randomize_limited_and_rotational_joints_gpu[
     RANDOMIZE_UNLIMITED_HINGES: Bool = True,
     RANDOMIZE_FREE_QUAT: Bool = False,
 ](
-    qpos: LayoutTensor[
-        DTYPE, Layout.row_major(BATCH_SIZE, NQ), MutAnyOrigin
-    ],
-    joints: LayoutTensor[
-        DTYPE, Layout.row_major(NJOINT, MODEL_JOINT_SIZE), MutAnyOrigin
-    ],
+    qpos: Tile[DTYPE, BATCH_SIZE, NQ],
+    joints: Tile[DTYPE, NJOINT, MODEL_JOINT_SIZE],
     env: Int,
     seed: Int,
 ):

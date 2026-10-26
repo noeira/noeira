@@ -23,7 +23,7 @@ printed); the padded MAX backward runs with `-D NN_GEMM_PATH=max`.
 """
 
 from std.math import abs, sqrt
-from std.sys import has_nvidia_gpu_accelerator
+from std.sys import default_accelerator
 from max.gpu.host import DeviceContext
 
 from noeira.nn.constants import DT
@@ -34,7 +34,7 @@ from noeira.nn.core.cublas_gemm import CUBLAS_BWD
 from noeira.nn.primitives.linear import Linear
 
 
-comptime TOL = 1e-2 if has_nvidia_gpu_accelerator() else 1e-4
+comptime TOL = 1e-2 if default_accelerator().is_nvidia_gpu() else 1e-4
 
 
 def _cmp(name: String, cpu: Tensor, gpu: Tensor, n: Int) raises -> Float64:

@@ -18,6 +18,7 @@ from max.gpu.host import DeviceContext
 
 from noeira.nn.constants import DT
 from std.memory import UnsafePointer
+from std.sys.defines import is_defined
 from .tensor import Tensor
 from .fill import fill_dev
 
@@ -93,7 +94,17 @@ def _visit_thunk[V: ParamVisitorRT, target: StaticString](
     )
 
 
-struct ParamVisitorRef(ParamVisitor):
+trait IsParamVisitorRef:
+    """Marks `ParamVisitorRef` and nothing else, so a walk generic over
+    `V: ParamVisitor` can tell, at compile time, that it holds the erased
+    ref — and then pass it parameters whose size is only known at RUN time
+    (`ref.call(…, n, …)`), which a `visit[target, N]` cannot take. The
+    functional tape's parameters are the reason (`experimental/functional/`)."""
+
+    pass
+
+
+struct ParamVisitorRef(ParamVisitor, IsParamVisitorRef):
     """A type-erased `ParamVisitor`. Build one with `of[V, target](v)`; it
     borrows `v` for as long as the walk runs and must not outlive it."""
 
@@ -229,6 +240,17 @@ trait IsParam(Movable & Deinitable):
         ...
 
 
+comptime NN_INFERENCE_ONLY = is_defined["NN_INFERENCE_ONLY"]()
+"""`-D NN_INFERENCE_ONLY`: `Param.make` allocates no gradient, so every
+parameter is frozen from birth (see "Frozen params" below). For a binary that
+never trains, such as a robot deploy: the gradient's host and device copies
+are never allocated, where `freeze` after `make` hands them back (the host
+copy to the OS, the device copy to MAX's pool, for this process to reuse).
+
+⚠ A training binary built with it trains nothing. The optimizers skip frozen
+parameters, and adopting a model whose parameters are all frozen raises."""
+
+
 struct Param[NAME: StaticString, APPLY_DECAY: Bool, SIZE: Int](IsParam):
     var val: Tensor
     var grd: Tensor
@@ -250,11 +272,12 @@ struct Param[NAME: StaticString, APPLY_DECAY: Bool, SIZE: Int](IsParam):
         allocates `val.dev`. On GPU `grd.dev` is allocated + zeroed here."""
         var p = Self()
         p.val = Tensor.alloc(Self.SIZE)
-        p.grd = Tensor.alloc(Self.SIZE)
-        comptime if target == "gpu":
-            var c = ctx.value()
-            p.grd.ensure_gpu(c, Self.SIZE)
-            p.grd.dev.value().enqueue_fill(Scalar[DT](0))
+        comptime if not NN_INFERENCE_ONLY:
+            p.grd = Tensor.alloc(Self.SIZE)
+            comptime if target == "gpu":
+                var c = ctx.value()
+                p.grd.ensure_gpu(c, Self.SIZE)
+                p.grd.dev.value().enqueue_fill(Scalar[DT](0))
         return p^
 
     def param_name(self) -> StaticString:
@@ -262,6 +285,37 @@ struct Param[NAME: StaticString, APPLY_DECAY: Bool, SIZE: Int](IsParam):
 
     def param_decay(self) -> Bool:
         return Self.APPLY_DECAY
+
+    # ── Frozen params ──────────────────────────────────────────────────
+    # A Param whose `grd` is EMPTY is frozen: it keeps its value, its name
+    # and its place in the walk (so a checkpoint, a safetensors map or a
+    # torch-name map sees exactly what it saw before), and it has no
+    # gradient and no optimizer state. The predicate is the storage itself,
+    # the convention `State.visit_with` already uses when it hands a visitor
+    # an empty `grad`.
+    def is_frozen(self) -> Bool:
+        return self.grd.n == 0
+
+    def freeze(mut self):
+        """Release the gradient and the optimizer moments, host and device.
+        The value is untouched."""
+        self.grd.release()
+        self.m.release()
+        self.v.release()
+
+    def unfreeze[
+        target: StaticString
+    ](mut self, ctx: Optional[DeviceContext] = None) raises:
+        """Give a frozen param its gradient back, zeroed and allocated the
+        way `make` allocates it. A no-op on a trainable param. The moments
+        come back lazily, on the optimizer's next step, as for a new param."""
+        if self.grd.n > 0:
+            return
+        self.grd = Tensor.alloc(Self.SIZE)
+        comptime if target == "gpu":
+            var c = ctx.value()
+            self.grd.ensure_gpu(c, Self.SIZE)
+            self.grd.dev.value().enqueue_fill(Scalar[DT](0))
 
     def visit_with[target: StaticString, V: ParamVisitor](
         mut self,
@@ -277,6 +331,8 @@ struct Param[NAME: StaticString, APPLY_DECAY: Bool, SIZE: Int](IsParam):
     def zero_grad[
         target: StaticString
     ](mut self, ctx: Optional[DeviceContext]) raises:
+        if self.grd.n == 0:  # frozen: nothing to zero
+            return
         comptime if target == "cpu":
             for k in range(Self.SIZE):
                 self.grd.data[k] = Scalar[DT](0)
@@ -311,6 +367,12 @@ struct ParamVersionBump(ParamVisitor, ParamVisitorRT):
         apply_decay: Bool,
         ctx: Optional[DeviceContext],
     ) raises:
+        # A frozen param (empty gradient) is never written by an optimizer,
+        # so its value did not change and neither does its version: a bump
+        # would only make `Linear` rebuild a padded or bf16 copy of a weight
+        # that is the same as before, every step (LoRA's frozen bases).
+        if grad.n == 0:
+            return
         param.version += 1
 
     def visit[target: StaticString, N: Int](

@@ -30,7 +30,7 @@ from max.gpu import block_dim, block_idx, thread_idx
 from max.gpu.host import DeviceContext, DeviceBuffer
 from std.random import seed as _set_seed
 from std.testing import assert_true
-from layout import Layout, LayoutTensor
+from noeira.core.tiles import Tile, tile
 
 from noeira.nn.constants import DT as dtype, TPB
 from noeira.planners.trajectory import MPPIGPUBatched, RolloutCallbackGPU
@@ -61,9 +61,7 @@ comptime NUM_ITERATIONS: Int = 12
 def _zero_action_kernel[
     dtype: DType, B: Int, ACT_DIM: Int
 ](
-    action_out: LayoutTensor[
-        dtype, Layout.row_major(B, ACT_DIM), MutAnyOrigin
-    ],
+    action_out: Tile[dtype, B, ACT_DIM],
 ) where dtype.is_floating_point():
     """Write zeros into ``action_out`` — the stub has no learned policy
     so ``policy_action_gpu`` degenerates to zero."""
@@ -82,19 +80,11 @@ def _goal_reach_rollout_step_kernel[
     TOTAL_SAMPLES: Int,
     N_ENVS: Int,
 ](
-    z: LayoutTensor[
-        dtype, Layout.row_major(B, DIM), MutAnyOrigin
-    ],
-    a: LayoutTensor[
-        dtype, Layout.row_major(B, DIM), MutAnyOrigin
-    ],
-    z_next_out: LayoutTensor[
-        dtype, Layout.row_major(B, DIM), MutAnyOrigin
-    ],
-    r_out: LayoutTensor[dtype, Layout.row_major(B), MutAnyOrigin],
-    goals: LayoutTensor[
-        dtype, Layout.row_major(N_ENVS, DIM), MutAnyOrigin
-    ],
+    z: Tile[dtype, B, DIM],
+    a: Tile[dtype, B, DIM],
+    z_next_out: Tile[dtype, B, DIM],
+    r_out: Tile[dtype, B],
+    goals: Tile[dtype, N_ENVS, DIM],
 ) where dtype.is_floating_point():
     """One-step IdentityDynamics + per-env goal-reach reward.
 
@@ -123,7 +113,7 @@ def _goal_reach_rollout_step_kernel[
 def _zero_terminal_kernel[
     dtype: DType, B: Int
 ](
-    v_out: LayoutTensor[dtype, Layout.row_major(B), MutAnyOrigin],
+    v_out: Tile[dtype, B],
 ) where dtype.is_floating_point():
     """No bootstrap in the stub — write zeros into ``v_out``."""
     var i = Int(block_dim.x * block_idx.x + thread_idx.x)
@@ -161,12 +151,8 @@ struct GoalReachGPUCallback[
     def policy_action_gpu[B: Int](
         mut self,
         ctx: DeviceContext,
-        z: LayoutTensor[
-            dtype, Layout.row_major(B, Self.LATENT_DIM), MutAnyOrigin
-        ],
-        action_out: LayoutTensor[
-            dtype, Layout.row_major(B, Self.ACTION_DIM), MutAnyOrigin
-        ],
+        z: Tile[dtype, B, Self.LATENT_DIM],
+        action_out: Tile[dtype, B, Self.ACTION_DIM],
     ) raises:
         comptime kernel = _zero_action_kernel[dtype, B, Self.ACTION_DIM]
         comptime BLOCKS = (B + TPB - 1) // TPB
@@ -179,16 +165,10 @@ struct GoalReachGPUCallback[
     def rollout_step_gpu[B: Int](
         mut self,
         ctx: DeviceContext,
-        z: LayoutTensor[
-            dtype, Layout.row_major(B, Self.LATENT_DIM), MutAnyOrigin
-        ],
-        a: LayoutTensor[
-            dtype, Layout.row_major(B, Self.ACTION_DIM), MutAnyOrigin
-        ],
-        z_next_out: LayoutTensor[
-            dtype, Layout.row_major(B, Self.LATENT_DIM), MutAnyOrigin
-        ],
-        r_out: LayoutTensor[dtype, Layout.row_major(B), MutAnyOrigin],
+        z: Tile[dtype, B, Self.LATENT_DIM],
+        a: Tile[dtype, B, Self.ACTION_DIM],
+        z_next_out: Tile[dtype, B, Self.LATENT_DIM],
+        r_out: Tile[dtype, B],
     ) raises:
         comptime assert Self.LATENT_DIM == Self.ACTION_DIM, (
             "GoalReachGPUCallback requires LATENT_DIM == ACTION_DIM"
@@ -201,11 +181,7 @@ struct GoalReachGPUCallback[
             Self.N_ENVS,
         ]
         comptime BLOCKS = (B + TPB - 1) // TPB
-        var goals_view = LayoutTensor[
-            dtype,
-            Layout.row_major(Self.N_ENVS, Self.LATENT_DIM),
-            MutAnyOrigin,
-        ](self.goals_buf.unsafe_ptr().as_unsafe_any_origin())
+        var goals_view = tile[Self.N_ENVS, Self.LATENT_DIM](self.goals_buf.unsafe_ptr().as_unsafe_any_origin())
         ctx.enqueue_function[kernel](
             z,
             a,
@@ -219,10 +195,8 @@ struct GoalReachGPUCallback[
     def terminal_value_gpu[B: Int](
         mut self,
         ctx: DeviceContext,
-        z: LayoutTensor[
-            dtype, Layout.row_major(B, Self.LATENT_DIM), MutAnyOrigin
-        ],
-        v_out: LayoutTensor[dtype, Layout.row_major(B), MutAnyOrigin],
+        z: Tile[dtype, B, Self.LATENT_DIM],
+        v_out: Tile[dtype, B],
         seed: UInt32,
     ) raises:
         comptime kernel = _zero_terminal_kernel[dtype, B]
@@ -301,9 +275,7 @@ def test_mppi_gpu_converges_to_goal() raises:
     for k in range(N_ENVS_1 * LATENT_DIM):
         z0_host[k] = Scalar[dtype](0.0)
     ctx.enqueue_copy(z0_buf, z0_host)
-    var z0_tensor = LayoutTensor[
-        dtype, Layout.row_major(N_ENVS_1, LATENT_DIM), MutAnyOrigin
-    ](z0_buf.unsafe_ptr().as_unsafe_any_origin())
+    var z0_tensor = tile[N_ENVS_1, LATENT_DIM](z0_buf.unsafe_ptr().as_unsafe_any_origin())
 
     # Output action buffer.
     var out_act_buf = ctx.enqueue_create_buffer[dtype](
@@ -312,9 +284,7 @@ def test_mppi_gpu_converges_to_goal() raises:
     var out_act_host = ctx.enqueue_create_host_buffer[dtype](
         N_ENVS_1 * ACTION_DIM
     )
-    var out_act_tensor = LayoutTensor[
-        dtype, Layout.row_major(N_ENVS_1 * ACTION_DIM), MutAnyOrigin
-    ](out_act_buf.unsafe_ptr().as_unsafe_any_origin())
+    var out_act_tensor = tile[N_ENVS_1 * ACTION_DIM](out_act_buf.unsafe_ptr().as_unsafe_any_origin())
 
     planner.plan_gpu(
         ctx,
@@ -397,16 +367,12 @@ def test_mppi_gpu_mean_converges_to_goal() raises:
     for k in range(N_ENVS_1 * LATENT_DIM):
         z0_host[k] = Scalar[dtype](0.0)
     ctx.enqueue_copy(z0_buf, z0_host)
-    var z0_tensor = LayoutTensor[
-        dtype, Layout.row_major(N_ENVS_1, LATENT_DIM), MutAnyOrigin
-    ](z0_buf.unsafe_ptr().as_unsafe_any_origin())
+    var z0_tensor = tile[N_ENVS_1, LATENT_DIM](z0_buf.unsafe_ptr().as_unsafe_any_origin())
 
     var out_act_buf = ctx.enqueue_create_buffer[dtype](
         N_ENVS_1 * ACTION_DIM
     )
-    var out_act_tensor = LayoutTensor[
-        dtype, Layout.row_major(N_ENVS_1 * ACTION_DIM), MutAnyOrigin
-    ](out_act_buf.unsafe_ptr().as_unsafe_any_origin())
+    var out_act_tensor = tile[N_ENVS_1 * ACTION_DIM](out_act_buf.unsafe_ptr().as_unsafe_any_origin())
 
     planner.plan_gpu(
         ctx,
@@ -510,9 +476,7 @@ def test_mppi_gpu_at_goal_stays() raises:
     for k in range(N_ENVS_1 * LATENT_DIM):
         z0_host[k] = Scalar[dtype](1.0)
     ctx.enqueue_copy(z0_buf, z0_host)
-    var z0_tensor = LayoutTensor[
-        dtype, Layout.row_major(N_ENVS_1, LATENT_DIM), MutAnyOrigin
-    ](z0_buf.unsafe_ptr().as_unsafe_any_origin())
+    var z0_tensor = tile[N_ENVS_1, LATENT_DIM](z0_buf.unsafe_ptr().as_unsafe_any_origin())
 
     var out_act_buf = ctx.enqueue_create_buffer[dtype](
         N_ENVS_1 * ACTION_DIM
@@ -520,9 +484,7 @@ def test_mppi_gpu_at_goal_stays() raises:
     var out_act_host = ctx.enqueue_create_host_buffer[dtype](
         N_ENVS_1 * ACTION_DIM
     )
-    var out_act_tensor = LayoutTensor[
-        dtype, Layout.row_major(N_ENVS_1 * ACTION_DIM), MutAnyOrigin
-    ](out_act_buf.unsafe_ptr().as_unsafe_any_origin())
+    var out_act_tensor = tile[N_ENVS_1 * ACTION_DIM](out_act_buf.unsafe_ptr().as_unsafe_any_origin())
 
     planner.plan_gpu(
         ctx,
@@ -607,9 +569,7 @@ def test_mppi_gpu_two_envs_distinct_goals() raises:
     for k in range(N_ENVS_2 * LATENT_DIM):
         z0_host[k] = Scalar[dtype](0.0)
     ctx.enqueue_copy(z0_buf, z0_host)
-    var z0_tensor = LayoutTensor[
-        dtype, Layout.row_major(N_ENVS_2, LATENT_DIM), MutAnyOrigin
-    ](z0_buf.unsafe_ptr().as_unsafe_any_origin())
+    var z0_tensor = tile[N_ENVS_2, LATENT_DIM](z0_buf.unsafe_ptr().as_unsafe_any_origin())
 
     var out_act_buf = ctx.enqueue_create_buffer[dtype](
         N_ENVS_2 * ACTION_DIM
@@ -617,9 +577,7 @@ def test_mppi_gpu_two_envs_distinct_goals() raises:
     var out_act_host = ctx.enqueue_create_host_buffer[dtype](
         N_ENVS_2 * ACTION_DIM
     )
-    var out_act_tensor = LayoutTensor[
-        dtype, Layout.row_major(N_ENVS_2 * ACTION_DIM), MutAnyOrigin
-    ](out_act_buf.unsafe_ptr().as_unsafe_any_origin())
+    var out_act_tensor = tile[N_ENVS_2 * ACTION_DIM](out_act_buf.unsafe_ptr().as_unsafe_any_origin())
 
     planner.plan_gpu(
         ctx,

@@ -24,7 +24,6 @@ policy NLL).
     (sections `rep` / `dyn` / `pred` / `proj` / `predh`), GPU body visitors.
 """
 
-from layout import Layout, LayoutTensor
 from max.gpu.host import DeviceContext
 
 from noeira.nn.constants import DT
@@ -38,6 +37,7 @@ from noeira.planners.tree_search import SampledGumbelGPUMCTS, SinglePlayer
 from noeira.core.logger import Logger, NoOpLogger
 from .selfplay_gpu_continuous import run_ezv2_sampled_selfplay_gpu
 from ..zero.mcts_adapters_mz import MZRepGPU, MZDynGPU, MZContPredGPU
+from noeira.core.tiles import tile
 
 
 @fieldwise_init
@@ -244,9 +244,7 @@ struct EZv2ContinuousAgent[
                 for j in range(Self.OBS):
                     h_obs[j] = Scalar[DT](eo_f[j])
                 self.ctx.enqueue_copy(d_obs, h_obs.unsafe_ptr())
-                var obs_t = LayoutTensor[
-                    DT, Layout.row_major(N_ENVS, Self.OBS), MutAnyOrigin
-                ](d_obs)
+                var obs_t = tile[N_ENVS, Self.OBS](d_obs)
                 planner.search_gpu[
                     type_of(rep_a), type_of(dyn_a), type_of(pred_a),
                 ](self.ctx, rep_a, dyn_a, pred_a, obs_t,
@@ -279,8 +277,8 @@ struct EZv2ContinuousAgent[
 
     def load(mut self, path: String) raises:
         var c = Optional(self.ctx)
-        load_params["gpu", Self.REP](self.rep, path + ".rep", c)
-        load_params["gpu", Self.DYN](self.dyn, path + ".dyn", c)
-        load_params["gpu", Self.PRED](self.pred, path + ".pred", c)
-        load_params["gpu", Self.PROJM](self.proj, path + ".proj", c)
-        load_params["gpu", Self.PREDH](self.predh, path + ".predh", c)
+        _ = load_params["gpu", Self.REP](self.rep, path + ".rep", c)
+        _ = load_params["gpu", Self.DYN](self.dyn, path + ".dyn", c)
+        _ = load_params["gpu", Self.PRED](self.pred, path + ".pred", c)
+        _ = load_params["gpu", Self.PROJM](self.proj, path + ".proj", c)
+        _ = load_params["gpu", Self.PREDH](self.predh, path + ".predh", c)

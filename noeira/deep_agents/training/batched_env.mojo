@@ -46,7 +46,6 @@ reconstructs non-owning views via
 from max.algorithm import parallelize
 from max.gpu import thread_idx
 from max.gpu.host import DeviceContext, DeviceBuffer
-from layout import Layout, LayoutTensor
 
 from noeira.nn.constants import DT
 from noeira.nn.core.ptr import mptr
@@ -59,10 +58,11 @@ from noeira.core.env_traits import (
 
 
 from noeira.nn.core.target_storage import require_ctx
+from noeira.core.tiles import Tile, tile
 
 
 def _increment_env_rng_kernel(
-    counter: LayoutTensor[DType.uint64, Layout.row_major(1), MutAnyOrigin],
+    counter: Tile[DType.uint64, 1],
 ):
     """Bump the device-resident env RNG counter by 1. Launch grid=(1,),
     block=(1,). Enqueued at the head of the selective-reset sequence so each
@@ -698,9 +698,7 @@ struct BatchedGpuEnv[
         # seed. The bump is enqueued on the same stream and is captured into the
         # env-reset graph, so every replay advances the seed.
         _ = rng_seed
-        var cnt_t = LayoutTensor[DType.uint64, Layout.row_major(1)](
-            self._env_rng_counter
-        )
+        var cnt_t = tile[1](self._env_rng_counter)
         c.enqueue_function[_increment_env_rng_kernel](
             cnt_t, grid_dim=(1,), block_dim=(1,)
         )
@@ -892,9 +890,7 @@ struct BatchedGpuDiscreteEnv[
             )
         var c = ctx.value()
         _ = rng_seed
-        var cnt_t = LayoutTensor[DType.uint64, Layout.row_major(1)](
-            self._env_rng_counter
-        )
+        var cnt_t = tile[1](self._env_rng_counter)
         c.enqueue_function[_increment_env_rng_kernel](
             cnt_t, grid_dim=(1,), block_dim=(1,)
         )

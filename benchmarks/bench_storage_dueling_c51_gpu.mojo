@@ -22,7 +22,7 @@ Run (Apple):  pixi run -e apple  mojo run -I . benchmarks/bench_storage_dueling_
 from max.gpu import global_idx
 from max.gpu.host import DeviceContext
 from std.time import perf_counter_ns
-from layout import Layout, LayoutTensor
+from noeira.core.tiles import Tile, tile
 
 comptime DT = DType.float32
 comptime TPB = 128
@@ -32,8 +32,8 @@ comptime NA_CAP = 32   # register-cache Array bound (Atari NA ≤ 18)
 def _combine_naive[
     BATCH: Int, NA: Int, N_ATOMS: Int
 ](
-    raw_in: LayoutTensor[DT, Layout.row_major(BATCH, (1 + NA) * N_ATOMS), MutAnyOrigin],
-    q_out: LayoutTensor[DT, Layout.row_major(BATCH, NA * N_ATOMS), MutAnyOrigin],
+    raw_in: Tile[DT, BATCH, (1 + NA) * N_ATOMS],
+    q_out: Tile[DT, BATCH, NA * N_ATOMS],
 ):
     var lin = Int(global_idx.x)
     var total = BATCH * N_ATOMS
@@ -53,8 +53,8 @@ def _combine_naive[
 def _combine_regcache[
     BATCH: Int, NA: Int, N_ATOMS: Int
 ](
-    raw_in: LayoutTensor[DT, Layout.row_major(BATCH, (1 + NA) * N_ATOMS), MutAnyOrigin],
-    q_out: LayoutTensor[DT, Layout.row_major(BATCH, NA * N_ATOMS), MutAnyOrigin],
+    raw_in: Tile[DT, BATCH, (1 + NA) * N_ATOMS],
+    q_out: Tile[DT, BATCH, NA * N_ATOMS],
 ):
     var lin = Int(global_idx.x)
     var total = BATCH * N_ATOMS
@@ -81,8 +81,8 @@ def _time[
     var ri = ctx.enqueue_create_buffer[DT](BATCH * IN_SIZE)
     var qo = ctx.enqueue_create_buffer[DT](BATCH * OUT_SIZE)
     _ = ri.enqueue_fill(Scalar[DT](0.01)); _ = qo.enqueue_fill(Scalar[DT](0.0))
-    var ril = LayoutTensor[DT, Layout.row_major(BATCH, IN_SIZE), MutAnyOrigin](ri)
-    var qol = LayoutTensor[DT, Layout.row_major(BATCH, OUT_SIZE), MutAnyOrigin](qo)
+    var ril = tile[BATCH, IN_SIZE](ri)
+    var qol = tile[BATCH, OUT_SIZE](qo)
     comptime nb = (BATCH * N_ATOMS + TPB - 1) // TPB
     var us = Float64(0)
     comptime if REG:

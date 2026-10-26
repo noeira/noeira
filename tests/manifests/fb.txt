@@ -62,3 +62,24 @@ tests/deep_agents/test_fb_checkpoint_formats.mojo
 # critic get. Values checked, not widths — a Parallel of the wrong two Slices
 # has the right width.
 tests/fb/test_bfm_actor_view.mojo
+
+# FB-MEBE (noeira-docs/FB_MEBE_G1_PLAN.md §2). The inverse-density draw on
+# distributions whose answer is known: the KDE integrates to 1, β = 0 is
+# uniform buffer sampling and β > 0 lifts the rare cluster, invalid states
+# are never drawn, and φ x 10 gives the same draws (the standardisation leg).
+tests/deep_agents/test_fb_density.mojo
+
+# The regularity critic Q_reg: at λ = 0 the FB nets are BIT-IDENTICAL to a
+# plain FBTrainer; λ > 0 reaches the actor only; the raw / |Q_fb|-scaled
+# switch reaches the trainer; Q -> r / (1 - γ) on a constant reward.
+tests/deep_agents/test_fb_reg_head.mojo
+
+# B on a gathered projection (`WalkerBNetProj`): forward and vjp equal the
+# bare MLP on the hand-gathered columns, and no gradient on unread columns.
+tests/deep_agents/test_fb_proj_b.mojo
+
+# Prior rows (FB_MEBE_G1_PLAN §13.5): a teacher's store laid out for the
+# expert path (transitions first, terminal rows after, nxt inside episodes),
+# the regularity reward recomputed by hand with every term live, a store
+# round trip, and a store of another width refused.
+tests/deep_agents/test_fb_prior.mojo

@@ -314,7 +314,7 @@ struct TrajectoryStoreWriter(Movable):
         afterwards is silently dropped, which is why `close()` is the only
         place the table is read.
         """
-        self._tasks.append(TaskEntry(index, text^))
+        self._tasks.append(TaskEntry(index, text))
 
     def close(mut self) raises:
         """Write the episode index and the manifest, then flush."""

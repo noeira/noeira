@@ -18,7 +18,7 @@ Run (Apple Metal):
 
 from max.gpu.host import DeviceContext
 from std.testing import assert_true
-from layout import Layout, LayoutTensor
+from noeira.core.tiles import tile
 
 from noeira.nn.constants import DT
 from noeira.nn.core.initializer import Kaiming
@@ -66,12 +66,8 @@ def main() raises:
     Env.extract_obs_kernel_gpu[N_ENVS, STATE, OBS](ctx, states, obs, legal)
     ctx.synchronize()
 
-    var root_obs = LayoutTensor[
-        DT, Layout.row_major(N_ENVS, OBS), MutAnyOrigin
-    ](obs.unsafe_ptr().as_unsafe_any_origin())
-    var root_legal = LayoutTensor[
-        DT, Layout.row_major(N_ENVS * ACT), MutAnyOrigin
-    ](legal.unsafe_ptr().as_unsafe_any_origin())
+    var root_obs = tile[N_ENVS, OBS](obs.unsafe_ptr().as_unsafe_any_origin())
+    var root_legal = tile[N_ENVS * ACT](legal.unsafe_ptr().as_unsafe_any_origin())
 
     # ── Run the full AlphaZero MCTS search ──
     mcts.search_gpu_alphazero[type_of(pred), type_of(env)](

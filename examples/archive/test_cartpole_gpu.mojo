@@ -1,7 +1,7 @@
 """Test GPU CartPole vectorized environment."""
 
 from max.gpu.host import DeviceContext
-from layout import Layout, LayoutTensor
+from layout import LayoutTensor
 
 from noeira.envs.cartpole_gpu import (
     NUM_ENVS,

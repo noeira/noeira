@@ -43,7 +43,8 @@ from max.gpu import thread_idx, block_idx, global_idx
 from max.gpu.primitives import block
 from max.gpu.host import DeviceContext, DeviceBuffer
 from max.gpu.memory import AddressSpace
-from layout import Layout, LayoutTensor, TileTensor, row_major
+from layout import TileTensor, row_major
+from noeira.core.tiles import Tile
 
 from noeira.nn.constants import DT, TPB
 from ..core.tensor import Tensor
@@ -78,13 +79,13 @@ def _sigmoid(x: Scalar[DT]) -> Scalar[DT]:
 def _gru_gate_fwd_kernel[
     BATCH: Int, H: Int,
 ](
-    ix: LayoutTensor[DT, Layout.row_major(BATCH, 3 * H), MutAnyOrigin],
-    hx: LayoutTensor[DT, Layout.row_major(BATCH, 3 * H), MutAnyOrigin],
-    b_ih: LayoutTensor[DT, Layout.row_major(3 * H), MutAnyOrigin],
-    b_hh: LayoutTensor[DT, Layout.row_major(3 * H), MutAnyOrigin],
-    h_prev: LayoutTensor[DT, Layout.row_major(BATCH, H), MutAnyOrigin],
-    out_buf: LayoutTensor[DT, Layout.row_major(BATCH, H), MutAnyOrigin],
-    cache: LayoutTensor[DT, Layout.row_major(BATCH, 4 * H), MutAnyOrigin],
+    ix: Tile[DT, BATCH, 3 * H],
+    hx: Tile[DT, BATCH, 3 * H],
+    b_ih: Tile[DT, 3 * H],
+    b_hh: Tile[DT, 3 * H],
+    h_prev: Tile[DT, BATCH, H],
+    out_buf: Tile[DT, BATCH, H],
+    cache: Tile[DT, BATCH, 4 * H],
 ):
     """Elementwise gates from the two GEMM pre-activations. One thread per
     (sample, hidden unit). Reset gate couples in here (ng = tanh(in + r·hn))."""
@@ -120,11 +121,11 @@ def _gru_gate_fwd_kernel[
 def _gru_gate_grad_kernel[
     BATCH: Int, H: Int,
 ](
-    go: LayoutTensor[DT, Layout.row_major(BATCH, H), MutAnyOrigin],
-    cache: LayoutTensor[DT, Layout.row_major(BATCH, 4 * H), MutAnyOrigin],
-    h_prev: LayoutTensor[DT, Layout.row_major(BATCH, H), MutAnyOrigin],
-    d_ix: LayoutTensor[DT, Layout.row_major(BATCH, 3 * H), MutAnyOrigin],
-    d_hx: LayoutTensor[DT, Layout.row_major(BATCH, 3 * H), MutAnyOrigin],
+    go: Tile[DT, BATCH, H],
+    cache: Tile[DT, BATCH, 4 * H],
+    h_prev: Tile[DT, BATCH, H],
+    d_ix: Tile[DT, BATCH, 3 * H],
+    d_hx: Tile[DT, BATCH, 3 * H],
 ):
     """Per-gate pre-activation grads → contiguous d_ix / d_hx [B, 3H]."""
     var gid = Int(global_idx.x)
@@ -159,8 +160,8 @@ def _gru_gate_grad_kernel[
 def _gru_accum_kernel[
     N: Int,
 ](
-    dst: LayoutTensor[DT, Layout.row_major(N), MutAnyOrigin],
-    src: LayoutTensor[DT, Layout.row_major(N), MutAnyOrigin],
+    dst: Tile[DT, N],
+    src: Tile[DT, N],
 ):
     """dst += src (accumulate dW_tmp into the persistent param grad)."""
     var i = Int(global_idx.x)
@@ -171,8 +172,8 @@ def _gru_accum_kernel[
 def _gru_dbsum_kernel[
     BATCH: Int, N: Int,
 ](
-    src: LayoutTensor[DT, Layout.row_major(BATCH, N), MutAnyOrigin],
-    dst: LayoutTensor[DT, Layout.row_major(N), MutAnyOrigin],
+    src: Tile[DT, BATCH, N],
+    dst: Tile[DT, N],
 ):
     """dst[c] += Σ_b src[b, c]. Grid (N,), block-reduce over BATCH."""
     var c = Int(block_idx.x)
@@ -191,9 +192,9 @@ def _gru_dbsum_kernel[
 def _gru_dh_add_zh_kernel[
     BATCH: Int, H: Int,
 ](
-    go: LayoutTensor[DT, Layout.row_major(BATCH, H), MutAnyOrigin],
-    cache: LayoutTensor[DT, Layout.row_major(BATCH, 4 * H), MutAnyOrigin],
-    dh: LayoutTensor[DT, Layout.row_major(BATCH, H), MutAnyOrigin],
+    go: Tile[DT, BATCH, H],
+    cache: Tile[DT, BATCH, 4 * H],
+    dh: Tile[DT, BATCH, H],
 ):
     """dh += go ⊙ z (the direct ∂h'/∂h path through z·h, added after the GEMM)."""
     var gid = Int(global_idx.x)
@@ -326,13 +327,13 @@ struct GRUCell[IN_: Int, HIDDEN: Int](Module):
             comptime gk = _gru_gate_fwd_kernel[B, H]
             comptime nblk = (B * H + TPB - 1) // TPB
             c.enqueue_function[gk](
-                self._ix.lt["gpu", Layout.row_major(B, THREE_H)](),
-                self._hx.lt["gpu", Layout.row_major(B, THREE_H)](),
-                self.b_ih.val.lt["gpu", Layout.row_major(THREE_H)](),
-                self.b_hh.val.lt["gpu", Layout.row_major(THREE_H)](),
-                h_in.lt["gpu", Layout.row_major(B, H)](),
-                out.lt["gpu", Layout.row_major(B, H)](),
-                self._cache.lt["gpu", Layout.row_major(B, 4 * H)](),
+                self._ix.tt["gpu", B, THREE_H](),
+                self._hx.tt["gpu", B, THREE_H](),
+                self.b_ih.val.tt["gpu", THREE_H](),
+                self.b_hh.val.tt["gpu", THREE_H](),
+                h_in.tt["gpu", B, H](),
+                out.tt["gpu", B, H](),
+                self._cache.tt["gpu", B, 4 * H](),
                 grid_dim=(nblk,), block_dim=(TPB,),
             )
             return
@@ -433,17 +434,17 @@ struct GRUCell[IN_: Int, HIDDEN: Int](Module):
             self._dWih_tmp.ensure_gpu(c, Self.W_IH_SIZE)
             self._dWhh_tmp.ensure_gpu(c, Self.W_HH_SIZE)
 
-            var cc = self._cache.lt["gpu", Layout.row_major(B, 4 * H)]()
-            var go_lt = grad_output.lt["gpu", Layout.row_major(B, H)]()
-            var h_lt = h_in.lt["gpu", Layout.row_major(B, H)]()
+            var cc = self._cache.tt["gpu", B, 4 * H]()
+            var go_lt = grad_output.tt["gpu", B, H]()
+            var h_lt = h_in.tt["gpu", B, H]()
 
             # Gate-grad math → contiguous d_ix / d_hx [B, 3H].
             comptime nblk = (B * H + TPB - 1) // TPB
             comptime gk = _gru_gate_grad_kernel[B, H]
             c.enqueue_function[gk](
                 go_lt, cc, h_lt,
-                self._dix.lt["gpu", Layout.row_major(B, THREE_H)](),
-                self._dhx.lt["gpu", Layout.row_major(B, THREE_H)](),
+                self._dix.tt["gpu", B, THREE_H](),
+                self._dhx.tt["gpu", B, THREE_H](),
                 grid_dim=(nblk,), block_dim=(TPB,),
             )
 
@@ -483,7 +484,7 @@ struct GRUCell[IN_: Int, HIDDEN: Int](Module):
             )
             comptime zk = _gru_dh_add_zh_kernel[B, H]
             c.enqueue_function[zk](
-                go_lt, cc, dh_in.lt["gpu", Layout.row_major(B, H)](),
+                go_lt, cc, dh_in.tt["gpu", B, H](),
                 grid_dim=(nblk,), block_dim=(TPB,),
             )
 
@@ -498,27 +499,27 @@ struct GRUCell[IN_: Int, HIDDEN: Int](Module):
             )
             comptime aih = _gru_accum_kernel[Self.W_IH_SIZE]
             c.enqueue_function[aih](
-                self.W_ih.grd.lt["gpu", Layout.row_major(Self.W_IH_SIZE)](),
-                self._dWih_tmp.lt["gpu", Layout.row_major(Self.W_IH_SIZE)](),
+                self.W_ih.grd.tt["gpu", Self.W_IH_SIZE](),
+                self._dWih_tmp.tt["gpu", Self.W_IH_SIZE](),
                 grid_dim=((Self.W_IH_SIZE + TPB - 1) // TPB,), block_dim=(TPB,),
             )
             comptime ahh = _gru_accum_kernel[Self.W_HH_SIZE]
             c.enqueue_function[ahh](
-                self.W_hh.grd.lt["gpu", Layout.row_major(Self.W_HH_SIZE)](),
-                self._dWhh_tmp.lt["gpu", Layout.row_major(Self.W_HH_SIZE)](),
+                self.W_hh.grd.tt["gpu", Self.W_HH_SIZE](),
+                self._dWhh_tmp.tt["gpu", Self.W_HH_SIZE](),
                 grid_dim=((Self.W_HH_SIZE + TPB - 1) // TPB,), block_dim=(TPB,),
             )
 
             # db_ih += Σ_b d_ix ; db_hh += Σ_b d_hx.
             comptime dbk = _gru_dbsum_kernel[B, THREE_H]
             c.enqueue_function[dbk](
-                self._dix.lt["gpu", Layout.row_major(B, THREE_H)](),
-                self.b_ih.grd.lt["gpu", Layout.row_major(THREE_H)](),
+                self._dix.tt["gpu", B, THREE_H](),
+                self.b_ih.grd.tt["gpu", THREE_H](),
                 grid_dim=(THREE_H,), block_dim=(TPB,),
             )
             c.enqueue_function[dbk](
-                self._dhx.lt["gpu", Layout.row_major(B, THREE_H)](),
-                self.b_hh.grd.lt["gpu", Layout.row_major(THREE_H)](),
+                self._dhx.tt["gpu", B, THREE_H](),
+                self.b_hh.grd.tt["gpu", THREE_H](),
                 grid_dim=(THREE_H,), block_dim=(TPB,),
             )
             return

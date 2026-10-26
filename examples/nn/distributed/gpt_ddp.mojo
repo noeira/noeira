@@ -45,7 +45,6 @@ from std.sys import get_defined_int, is_defined
 from std.time import perf_counter_ns
 from std.memory import Pointer
 from max.gpu.host import DeviceContext
-from layout import Layout
 
 from noeira.nn.constants import DT, TPB
 from noeira.nn.core.tensor import Tensor, TensorImpl
@@ -197,14 +196,14 @@ def _rank_step[BL: Int](
             mptr(rk.corpus.dev.value().unsafe_ptr()),
             Int64(rk.corpus.n - SEQ),
             Int64(r * BL),
-            rk.rng.lt["gpu", Layout.row_major(2)](),
-            rk.in_t.lt["gpu", Layout.row_major(TOTAL)](),
-            rk.tgt_t.lt["gpu", Layout.row_major(TOTAL)](),
+            rk.rng.tt["gpu", 2](),
+            rk.in_t.tt["gpu", TOTAL](),
+            rk.tgt_t.tt["gpu", TOTAL](),
             grid_dim=(TOTAL + TPB - 1) // TPB,
             block_dim=TPB,
         )
         c.enqueue_function[advance_step_kernel](
-            rk.rng.lt["gpu", Layout.row_major(2)](), grid_dim=1, block_dim=1
+            rk.rng.tt["gpu", 2](), grid_dim=1, block_dim=1
         )
         net.forward["gpu", BL](
             child_refs[NET.ARITY, DT](rk.in_t), rk.logits, co

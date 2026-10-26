@@ -24,7 +24,6 @@ CPU env, through the GPU hooks' own functions (`unitree_g1_walk_rp.mojo`):
 
 from std.math import abs, sqrt, sin, cos
 
-from layout import Layout
 
 from noeira.core.cont_action import ContAction
 from noeira.nn.core.tensor import TensorImpl
@@ -322,16 +321,16 @@ def check_stumble() raises:
     t.data[CONTACT_IDX_FORCE_N] = 100.0
     t.data[CONTACT_IDX_NX] = 1.0
     var fc = g1r_contacts[DType.float64, 1, 64](
-        t.lt["cpu", Layout.row_major(1, 64 * CONTACT_SIZE)](),
-        m.lt["cpu", Layout.row_major(1, METADATA_SIZE)](), 0,
+        t.tt["cpu", 1, 64 * CONTACT_SIZE](),
+        m.tt["cpu", 1, METADATA_SIZE](), 0,
     )
     var wall = g1r_stumble(fc)
     t.data[CONTACT_IDX_NX] = 0.0
     t.data[CONTACT_IDX_NZ] = 1.0
     t.data[CONTACT_IDX_FORCE_T1] = 80.0      # friction at mu 0.8
     fc = g1r_contacts[DType.float64, 1, 64](
-        t.lt["cpu", Layout.row_major(1, 64 * CONTACT_SIZE)](),
-        m.lt["cpu", Layout.row_major(1, METADATA_SIZE)](), 0,
+        t.tt["cpu", 1, 64 * CONTACT_SIZE](),
+        m.tt["cpu", 1, METADATA_SIZE](), 0,
     )
     var floor = g1r_stumble(fc)
     print("  stumble: wall-normal contact", wall, "| floor contact with friction", floor)

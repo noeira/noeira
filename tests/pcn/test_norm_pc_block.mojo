@@ -11,7 +11,7 @@ Run:
 
 from std.memory import alloc
 from std.math import sin
-from layout import Layout, LayoutTensor
+from noeira.core.tiles import Tile, tile
 
 from noeira.experimental.pcn.pc_initializer import PCXavier
 from noeira.experimental.pcn.pc_norm_block import NormPCBlock
@@ -23,10 +23,10 @@ comptime CB = NormPCBlock[DIM]
 
 
 def _predict_into(
-    x: LayoutTensor[dtype, Layout.row_major(BATCH, DIM), MutAnyOrigin],
-    params: LayoutTensor[dtype, Layout.row_major(DIM), MutAnyOrigin],
-    mut mu: LayoutTensor[dtype, Layout.row_major(BATCH, DIM), MutAnyOrigin],
-    mut a: LayoutTensor[dtype, Layout.row_major(BATCH, DIM), MutAnyOrigin],
+    x: Tile[dtype, BATCH, DIM],
+    params: Tile[dtype, DIM],
+    mu: Tile[dtype, BATCH, DIM],
+    a: Tile[dtype, BATCH, DIM],
 ):
     CB.predict[BATCH, dtype](x, params, mu, a)
 
@@ -52,15 +52,15 @@ def main() raises:
     for i in range(DIM):
         g_buf[i] = Scalar[dtype](0.5 + 0.5 * sin(Float32(i) * 0.9))
 
-    var x = LayoutTensor[dtype, Layout.row_major(BATCH, DIM), MutAnyOrigin](x_buf)
-    var g = LayoutTensor[dtype, Layout.row_major(DIM), MutAnyOrigin](g_buf)
-    var mu = LayoutTensor[dtype, Layout.row_major(BATCH, DIM), MutAnyOrigin](mu_buf)
-    var a = LayoutTensor[dtype, Layout.row_major(BATCH, DIM), MutAnyOrigin](a_buf)
-    var eps = LayoutTensor[dtype, Layout.row_major(BATCH, DIM), MutAnyOrigin](eps_buf)
-    var z = LayoutTensor[dtype, Layout.row_major(BATCH, DIM), MutAnyOrigin](z_buf)
-    var zeff = LayoutTensor[dtype, Layout.row_major(BATCH, DIM), MutAnyOrigin](zeff_buf)
-    var grads = LayoutTensor[dtype, Layout.row_major(DIM), MutAnyOrigin](grads_buf)
-    var y = LayoutTensor[dtype, Layout.row_major(BATCH, DIM), MutAnyOrigin](y_buf)
+    var x = tile[BATCH, DIM](x_buf)
+    var g = tile[DIM](g_buf)
+    var mu = tile[BATCH, DIM](mu_buf)
+    var a = tile[BATCH, DIM](a_buf)
+    var eps = tile[BATCH, DIM](eps_buf)
+    var z = tile[BATCH, DIM](z_buf)
+    var zeff = tile[BATCH, DIM](zeff_buf)
+    var grads = tile[DIM](grads_buf)
+    var y = tile[BATCH, DIM](y_buf)
 
     # ── analytic effective pull-back: zeff = act_deriv(x, pull_back(ε, γ)) ────
     _predict_into(x, g, mu, a)
@@ -73,9 +73,9 @@ def main() raises:
     var mu_p = alloc[Scalar[dtype]](BATCH * DIM).as_unsafe_any_origin()
     var mu_m = alloc[Scalar[dtype]](BATCH * DIM).as_unsafe_any_origin()
     var a_tmp = alloc[Scalar[dtype]](BATCH * DIM).as_unsafe_any_origin()
-    var mu_p_t = LayoutTensor[dtype, Layout.row_major(BATCH, DIM), MutAnyOrigin](mu_p)
-    var mu_m_t = LayoutTensor[dtype, Layout.row_major(BATCH, DIM), MutAnyOrigin](mu_m)
-    var a_tmp_t = LayoutTensor[dtype, Layout.row_major(BATCH, DIM), MutAnyOrigin](a_tmp)
+    var mu_p_t = tile[BATCH, DIM](mu_p)
+    var mu_m_t = tile[BATCH, DIM](mu_m)
+    var a_tmp_t = tile[BATCH, DIM](a_tmp)
 
     var max_jvp_rel: Float64 = 0.0
     for b in range(BATCH):

@@ -14,7 +14,8 @@ Backward: `grad_in[b, d] = OP.scale_factor[DIM]() · grad_out[b, 0]`
 
 from max.gpu import global_idx
 from max.gpu.host import DeviceContext
-from layout import Layout, LayoutTensor, TileTensor, row_major
+from layout import TileTensor, row_major
+from noeira.core.tiles import Tile
 
 from noeira.nn.constants import DT, TPB
 from ..core.tensor import Tensor
@@ -63,8 +64,8 @@ struct MeanOp(ReduceOp):
 def _reduce_forward_kernel[
     BATCH: Int, DIM: Int, OP: ReduceOp,
 ](
-    input: LayoutTensor[DT, Layout.row_major(BATCH, DIM), MutAnyOrigin],
-    output: LayoutTensor[DT, Layout.row_major(BATCH, 1), MutAnyOrigin],
+    input: Tile[DT, BATCH, DIM],
+    output: Tile[DT, BATCH, 1],
 ):
     var b = Int(global_idx.x)
     if b < BATCH:
@@ -77,8 +78,8 @@ def _reduce_forward_kernel[
 def _reduce_broadcast_kernel[
     BATCH: Int, DIM: Int, OP: ReduceOp,
 ](
-    grad_output: LayoutTensor[DT, Layout.row_major(BATCH, 1), MutAnyOrigin],
-    grad_input: LayoutTensor[DT, Layout.row_major(BATCH, DIM), MutAnyOrigin],
+    grad_output: Tile[DT, BATCH, 1],
+    grad_input: Tile[DT, BATCH, DIM],
 ):
     var idx = Int(global_idx.x)
     var total = BATCH * DIM
@@ -137,8 +138,8 @@ struct Reduce[DIM_: Int, OP: ReduceOp](Module):
             c.enqueue_function[
                 _reduce_forward_kernel[B, Self.DIM_, Self.OP]
             ](
-                in0.lt["gpu", Layout.row_major(B, Self.DIM_)](),
-                out.lt["gpu", Layout.row_major(B, 1)](),
+                in0.tt["gpu", B, Self.DIM_](),
+                out.tt["gpu", B, 1](),
                 grid_dim=n_blocks,
                 block_dim=TPB,
             )
@@ -174,8 +175,8 @@ struct Reduce[DIM_: Int, OP: ReduceOp](Module):
             c.enqueue_function[
                 _reduce_broadcast_kernel[B, Self.DIM_, Self.OP]
             ](
-                grad_output.lt["gpu", Layout.row_major(B, 1)](),
-                gin.lt["gpu", Layout.row_major(B, Self.DIM_)](),
+                grad_output.tt["gpu", B, 1](),
+                gin.tt["gpu", B, Self.DIM_](),
                 grid_dim=n_blocks,
                 block_dim=TPB,
             )

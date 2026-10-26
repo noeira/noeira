@@ -20,17 +20,17 @@ each `mut` arg distinctly. See memory:
 
 from max.gpu import global_idx
 from max.gpu.host import DeviceContext
-from layout import Layout, LayoutTensor
 
 from noeira.nn.constants import DT, TPB
+from noeira.core.tiles import Tile
 
 
 def concat_sa[
     OBS: Int, ACT: Int, B: Int
 ](
-    obs: LayoutTensor[DT, Layout.row_major(B, OBS), MutAnyOrigin],
-    act: LayoutTensor[DT, Layout.row_major(B, ACT), MutAnyOrigin],
-    out_sa: LayoutTensor[DT, Layout.row_major(B, OBS + ACT), MutAnyOrigin],
+    obs: Tile[DT, B, OBS],
+    act: Tile[DT, B, ACT],
+    out_sa: Tile[DT, B, OBS + ACT],
 ):
     """`sa[b, :OBS] = obs[b]; sa[b, OBS:] = act[b]`. CPU only."""
     comptime SA = OBS + ACT
@@ -44,9 +44,9 @@ def concat_sa[
 def concat_sa_kernel[
     OBS: Int, ACT: Int, B: Int
 ](
-    obs: LayoutTensor[DT, Layout.row_major(B, OBS), MutAnyOrigin],
-    act: LayoutTensor[DT, Layout.row_major(B, ACT), MutAnyOrigin],
-    out_sa: LayoutTensor[DT, Layout.row_major(B, OBS + ACT), MutAnyOrigin],
+    obs: Tile[DT, B, OBS],
+    act: Tile[DT, B, ACT],
+    out_sa: Tile[DT, B, OBS + ACT],
 ):
     var idx = Int(global_idx.x)
     comptime SA = OBS + ACT
@@ -64,9 +64,9 @@ def concat_sa_gpu[
     OBS: Int, ACT: Int, B: Int
 ](
     ctx: DeviceContext,
-    obs: LayoutTensor[DT, Layout.row_major(B, OBS), MutAnyOrigin],
-    act: LayoutTensor[DT, Layout.row_major(B, ACT), MutAnyOrigin],
-    out_sa: LayoutTensor[DT, Layout.row_major(B, OBS + ACT), MutAnyOrigin],
+    obs: Tile[DT, B, OBS],
+    act: Tile[DT, B, ACT],
+    out_sa: Tile[DT, B, OBS + ACT],
 ) raises:
     """GPU `concat_sa` — one thread per [b, d] over the full SA shape."""
     comptime SA = OBS + ACT

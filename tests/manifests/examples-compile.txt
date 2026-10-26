@@ -63,12 +63,7 @@ examples/tasks/task_policy_viewer.mojo
 #
 #   pixi run mojo run -I . examples/tasks/task_batched_gpu.mojo
 #   pixi run mojo run -I . examples/tasks/task_eval_frozen.mojo
-#   pixi run mojo run -I . # ⚠ WHAT THE SHAPED TERMS ACTUALLY MEASURE, under a random policy. The two
-# distances the reward charges for, against `SHAPE_CLIP` — because
-# `mean_reward` is their weighted SUM and neither can be recovered from it.
-# Measured on `gather`: goal 0.139 m, reach 0.120 m, 0 of 300 steps clipped.
-examples/tasks/task_shaping_probe.mojo
-examples/tasks/sac_task_gpu.mojo --steps 20000
+#   pixi run mojo run -I . examples/tasks/sac_task_gpu.mojo --steps 20000
 #
 # ⚠ THE NVIDIA LEG IS STILL THE ONE THAT MATTERS FOR THROUGHPUT, and a long
 # training run belongs there. What changed is that the GATES can be iterated
@@ -78,12 +73,22 @@ examples/tasks/sac_task_gpu.mojo --steps 20000
 # evaluator, the per-lane tape, the active mask, and Gap D's repark.
 # P4: three runs — frozen table at two reset seeds (must agree bit for bit)
 # and a third that never applies the table (must differ).
+#
+# ⚠ NOT COMPILE-PROBED HERE: they hold GPU device code, and on the CI runner
+# (no GPU) `mojo build` stops at "target 'unknown' is not supported by this
+# build". Probe them on an Apple or NVIDIA machine (`-e apple` / `-e nvidia`).
+# examples/tasks/task_batched_gpu.mojo
+# examples/tasks/task_eval_frozen.mojo
+
+# ⚠ WHAT THE SHAPED TERMS ACTUALLY MEASURE, under a random policy. The two
+# distances the reward charges for, against `SHAPE_CLIP` — because
+# `mean_reward` is their weighted SUM and neither can be recovered from it.
+# Measured on `gather`: goal 0.139 m, reach 0.120 m, 0 of 300 steps clipped.
+examples/tasks/task_shaping_probe.mojo
 
 # ⚠ Needs `references/LIBERO-master` (gitignored); SKIPS LOUDLY without it,
 # and a skip is not a pass. Reports what LIBERO needs that we do not have.
 examples/libero/libero_survey.mojo
-examples/tasks/task_eval_frozen.mojo
-examples/tasks/task_batched_gpu.mojo
 
 # ⚠⚠ THE FIRST POLICY THIS LAYER HAS EVER CARRIED. SAC on `so101_lift_brick`
 # (`--task` takes any of them); every P1-P5 number before it was a harness
@@ -96,7 +101,9 @@ examples/tasks/task_batched_gpu.mojo
 # actor AND every constant action, while `reach` is 0.25 random / 1.00 greedy
 # because a constant action SWEEPS the gripper through the region
 # (`task_null_action.mojo`). `settle` is the probe and is 1.00 by design.
-examples/tasks/sac_task_gpu.mojo
+# ⚠ GPU device code, so not compile-probed on the CI runner (see the P3/P4
+# note above).
+# examples/tasks/sac_task_gpu.mojo
 
 # GPU device code — local-only probes (see note above):
 # examples/bipedal_walker_gpu_demo.mojo

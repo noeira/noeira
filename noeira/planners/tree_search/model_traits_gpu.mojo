@@ -30,9 +30,9 @@ traits (``PUCTFormula`` / ``ExplorationNoise`` / ``PlayerMode``).
 """
 
 from max.gpu.host import DeviceContext, DeviceBuffer
-from layout import Layout, LayoutTensor
 
 from noeira.nn.constants import DT as dtype
+from noeira.core.tiles import Tile
 
 
 trait RepresentationGPU(Deinitable):
@@ -52,12 +52,8 @@ trait RepresentationGPU(Deinitable):
     def encode_gpu[B: Int](
         mut self,
         ctx: DeviceContext,
-        obs: LayoutTensor[
-            dtype, Layout.row_major(B, Self.OBS_DIM), MutAnyOrigin
-        ],
-        mut hidden_out: LayoutTensor[
-            dtype, Layout.row_major(B, Self.LATENT_DIM), MutAnyOrigin
-        ],
+        obs: Tile[dtype, B, Self.OBS_DIM],
+        hidden_out: Tile[dtype, B, Self.LATENT_DIM],
     ) raises:
         """Encode ``obs`` of shape ``(B, OBS_DIM)`` into ``hidden_out``
         of shape ``(B, LATENT_DIM)``. Pure forward; no host sync. The
@@ -93,12 +89,8 @@ trait DynamicsGPU(Deinitable):
     def step_gpu[B: Int](
         mut self,
         ctx: DeviceContext,
-        dyn_in: LayoutTensor[
-            dtype, Layout.row_major(B, Self.DYN_IN_DIM), MutAnyOrigin
-        ],
-        mut dyn_out: LayoutTensor[
-            dtype, Layout.row_major(B, Self.DYN_OUT_DIM), MutAnyOrigin
-        ],
+        dyn_in: Tile[dtype, B, Self.DYN_IN_DIM],
+        dyn_out: Tile[dtype, B, Self.DYN_OUT_DIM],
     ) raises:
         """Forward the dynamics net for the full batch. Input is the
         ``hidden + one-hot-action`` concatenation produced upstream by
@@ -126,12 +118,8 @@ trait PredictionGPU(Deinitable):
     def predict_gpu[B: Int](
         mut self,
         ctx: DeviceContext,
-        hidden: LayoutTensor[
-            dtype, Layout.row_major(B, Self.LATENT_DIM), MutAnyOrigin
-        ],
-        mut pred_out: LayoutTensor[
-            dtype, Layout.row_major(B, Self.PRED_OUT_DIM), MutAnyOrigin
-        ],
+        hidden: Tile[dtype, B, Self.LATENT_DIM],
+        pred_out: Tile[dtype, B, Self.PRED_OUT_DIM],
     ) raises:
         """Forward the prediction net for the full batch. Returns raw
         logits — softmax / categorical decode happen in the MCTS

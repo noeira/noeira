@@ -21,7 +21,8 @@ Differences vs the slab version (deliberate):
 from max.gpu import thread_idx, block_idx, block_dim
 from max.gpu.sync import barrier
 from max.gpu.host import DeviceContext
-from layout import Layout, LayoutTensor
+from layout import TileTensor, TensorLayout
+from noeira.core.tiles import RowMajor, Tile
 
 from .quat_math import (
     gpu_quat_mul,
@@ -81,29 +82,21 @@ comptime FK_TPB: Int = 64
 def _fk_body[
     DTYPE: DType,
     D: DimsLike,
-    L_QPOS: Layout,
-    L_BODIES: Layout,
-    L_JOINTS: Layout,
-    L_XPOS: Layout,
-    L_XQUAT: Layout,
+    L_QPOS: TensorLayout,
+    L_BODIES: TensorLayout,
+    L_JOINTS: TensorLayout,
+    L_XPOS: TensorLayout,
+    L_XQUAT: TensorLayout,
 ](
     env: Int,
     body: Int,
     dims: D,
-    qpos: LayoutTensor[DTYPE, L_QPOS, MutAnyOrigin],
-    bodies: LayoutTensor[
-        DTYPE, L_BODIES, MutAnyOrigin
-    ],
-    joints: LayoutTensor[
-        DTYPE, L_JOINTS, MutAnyOrigin
-    ],
-    xpos: LayoutTensor[DTYPE, L_XPOS, MutAnyOrigin],
-    xquat: LayoutTensor[
-        DTYPE, L_XQUAT, MutAnyOrigin
-    ],
-    xipos: LayoutTensor[
-        DTYPE, L_XPOS, MutAnyOrigin
-    ],
+    qpos: TileTensor[DTYPE, L_QPOS, MutAnyOrigin],
+    bodies: TileTensor[DTYPE, L_BODIES, MutAnyOrigin],
+    joints: TileTensor[DTYPE, L_JOINTS, MutAnyOrigin],
+    xpos: TileTensor[DTYPE, L_XPOS, MutAnyOrigin],
+    xquat: TileTensor[DTYPE, L_XQUAT, MutAnyOrigin],
+    xipos: TileTensor[DTYPE, L_XPOS, MutAnyOrigin],
 ):
     """One body's world pose from its parent (arithmetic verbatim from
     `fk_body_gpu`; only the addressing is per-field). Requires the parent's
@@ -477,28 +470,20 @@ def _fk_body[
 def _fk_env[
     DTYPE: DType,
     D: DimsLike,
-    L_QPOS: Layout,
-    L_BODIES: Layout,
-    L_JOINTS: Layout,
-    L_XPOS: Layout,
-    L_XQUAT: Layout,
+    L_QPOS: TensorLayout,
+    L_BODIES: TensorLayout,
+    L_JOINTS: TensorLayout,
+    L_XPOS: TensorLayout,
+    L_XQUAT: TensorLayout,
 ](
     env: Int,
     dims: D,
-    qpos: LayoutTensor[DTYPE, L_QPOS, MutAnyOrigin],
-    bodies: LayoutTensor[
-        DTYPE, L_BODIES, MutAnyOrigin
-    ],
-    joints: LayoutTensor[
-        DTYPE, L_JOINTS, MutAnyOrigin
-    ],
-    xpos: LayoutTensor[DTYPE, L_XPOS, MutAnyOrigin],
-    xquat: LayoutTensor[
-        DTYPE, L_XQUAT, MutAnyOrigin
-    ],
-    xipos: LayoutTensor[
-        DTYPE, L_XPOS, MutAnyOrigin
-    ],
+    qpos: TileTensor[DTYPE, L_QPOS, MutAnyOrigin],
+    bodies: TileTensor[DTYPE, L_BODIES, MutAnyOrigin],
+    joints: TileTensor[DTYPE, L_JOINTS, MutAnyOrigin],
+    xpos: TileTensor[DTYPE, L_XPOS, MutAnyOrigin],
+    xquat: TileTensor[DTYPE, L_XQUAT, MutAnyOrigin],
+    xipos: TileTensor[DTYPE, L_XPOS, MutAnyOrigin],
 ):
     """Full FK for one env: worldbody identity + topological body walk."""
     var nq = dims.get_nq()
@@ -525,23 +510,17 @@ def _fk_env[
 def _fk_sites[
     DTYPE: DType,
     D: DimsLike,
-    L_SITES: Layout,
-    L_XPOS: Layout,
-    L_XQUAT: Layout,
-    L_SITE_XPOS: Layout,
+    L_SITES: TensorLayout,
+    L_XPOS: TensorLayout,
+    L_XQUAT: TensorLayout,
+    L_SITE_XPOS: TensorLayout,
 ](
     env: Int,
     dims: D,
-    sites: LayoutTensor[
-        DTYPE, L_SITES, MutAnyOrigin
-    ],
-    xpos: LayoutTensor[DTYPE, L_XPOS, MutAnyOrigin],
-    xquat: LayoutTensor[
-        DTYPE, L_XQUAT, MutAnyOrigin
-    ],
-    site_xpos: LayoutTensor[
-        DTYPE, L_SITE_XPOS, MutAnyOrigin
-    ],
+    sites: TileTensor[DTYPE, L_SITES, MutAnyOrigin],
+    xpos: TileTensor[DTYPE, L_XPOS, MutAnyOrigin],
+    xquat: TileTensor[DTYPE, L_XQUAT, MutAnyOrigin],
+    site_xpos: TileTensor[DTYPE, L_SITE_XPOS, MutAnyOrigin],
 ):
     """site_xpos = xpos[body] + rotate(site_pos, xquat[body])."""
     var nbody = dims.get_nbody()
@@ -555,23 +534,17 @@ def _fk_sites[
 @always_inline
 def _fk_site[
     DTYPE: DType,
-    L_SITES: Layout,
-    L_XPOS: Layout,
-    L_XQUAT: Layout,
-    L_SITE_XPOS: Layout,
+    L_SITES: TensorLayout,
+    L_XPOS: TensorLayout,
+    L_XQUAT: TensorLayout,
+    L_SITE_XPOS: TensorLayout,
 ](
     env: Int,
     site_idx: Int,
-    sites: LayoutTensor[
-        DTYPE, L_SITES, MutAnyOrigin
-    ],
-    xpos: LayoutTensor[DTYPE, L_XPOS, MutAnyOrigin],
-    xquat: LayoutTensor[
-        DTYPE, L_XQUAT, MutAnyOrigin
-    ],
-    site_xpos: LayoutTensor[
-        DTYPE, L_SITE_XPOS, MutAnyOrigin
-    ],
+    sites: TileTensor[DTYPE, L_SITES, MutAnyOrigin],
+    xpos: TileTensor[DTYPE, L_XPOS, MutAnyOrigin],
+    xquat: TileTensor[DTYPE, L_XQUAT, MutAnyOrigin],
+    site_xpos: TileTensor[DTYPE, L_SITE_XPOS, MutAnyOrigin],
 ):
     """One site's world position (extracted verbatim from the
     `_fk_sites` loop body so the serial and _mt schedules share the
@@ -604,20 +577,12 @@ def _fk_fields_kernel[
     NJOINT: Int,
     BATCH: Int,
 ](
-    qpos: LayoutTensor[DTYPE, Layout.row_major(BATCH, NQ), MutAnyOrigin],
-    bodies: LayoutTensor[
-        DTYPE, Layout.row_major(NBODY, MODEL_BODY_SIZE), MutAnyOrigin
-    ],
-    joints: LayoutTensor[
-        DTYPE, Layout.row_major(NJOINT, MODEL_JOINT_SIZE), MutAnyOrigin
-    ],
-    xpos: LayoutTensor[DTYPE, Layout.row_major(BATCH, NBODY * 3), MutAnyOrigin],
-    xquat: LayoutTensor[
-        DTYPE, Layout.row_major(BATCH, NBODY * 4), MutAnyOrigin
-    ],
-    xipos: LayoutTensor[
-        DTYPE, Layout.row_major(BATCH, NBODY * 3), MutAnyOrigin
-    ],
+    qpos: Tile[DTYPE, BATCH, NQ],
+    bodies: Tile[DTYPE, NBODY, MODEL_BODY_SIZE],
+    joints: Tile[DTYPE, NJOINT, MODEL_JOINT_SIZE],
+    xpos: Tile[DTYPE, BATCH, NBODY * 3],
+    xquat: Tile[DTYPE, BATCH, NBODY * 4],
+    xipos: Tile[DTYPE, BATCH, NBODY * 3],
 ):
     var env = Int(block_dim.x * block_idx.x + thread_idx.x)
     if env >= BATCH:
@@ -635,26 +600,14 @@ def _fk_fields_sites_kernel[
     NSITE: Int,
     BATCH: Int,
 ](
-    qpos: LayoutTensor[DTYPE, Layout.row_major(BATCH, NQ), MutAnyOrigin],
-    bodies: LayoutTensor[
-        DTYPE, Layout.row_major(NBODY, MODEL_BODY_SIZE), MutAnyOrigin
-    ],
-    joints: LayoutTensor[
-        DTYPE, Layout.row_major(NJOINT, MODEL_JOINT_SIZE), MutAnyOrigin
-    ],
-    sites: LayoutTensor[
-        DTYPE, Layout.row_major(NSITE, MODEL_SITE_SIZE), MutAnyOrigin
-    ],
-    xpos: LayoutTensor[DTYPE, Layout.row_major(BATCH, NBODY * 3), MutAnyOrigin],
-    xquat: LayoutTensor[
-        DTYPE, Layout.row_major(BATCH, NBODY * 4), MutAnyOrigin
-    ],
-    xipos: LayoutTensor[
-        DTYPE, Layout.row_major(BATCH, NBODY * 3), MutAnyOrigin
-    ],
-    site_xpos: LayoutTensor[
-        DTYPE, Layout.row_major(BATCH, NSITE * 3), MutAnyOrigin
-    ],
+    qpos: Tile[DTYPE, BATCH, NQ],
+    bodies: Tile[DTYPE, NBODY, MODEL_BODY_SIZE],
+    joints: Tile[DTYPE, NJOINT, MODEL_JOINT_SIZE],
+    sites: Tile[DTYPE, NSITE, MODEL_SITE_SIZE],
+    xpos: Tile[DTYPE, BATCH, NBODY * 3],
+    xquat: Tile[DTYPE, BATCH, NBODY * 4],
+    xipos: Tile[DTYPE, BATCH, NBODY * 3],
+    site_xpos: Tile[DTYPE, BATCH, NSITE * 3],
 ):
     var env = Int(block_dim.x * block_idx.x + thread_idx.x)
     if env >= BATCH:
@@ -684,29 +637,21 @@ def _fk_env_mt[
     DTYPE: DType,
     N_THREADS: Int,
     D: DimsLike,
-    L_QPOS: Layout,
-    L_BODIES: Layout,
-    L_JOINTS: Layout,
-    L_XPOS: Layout,
-    L_XQUAT: Layout,
+    L_QPOS: TensorLayout,
+    L_BODIES: TensorLayout,
+    L_JOINTS: TensorLayout,
+    L_XPOS: TensorLayout,
+    L_XQUAT: TensorLayout,
 ](
     env: Int,
     tid: Int,
     dims: D,
-    qpos: LayoutTensor[DTYPE, L_QPOS, MutAnyOrigin],
-    bodies: LayoutTensor[
-        DTYPE, L_BODIES, MutAnyOrigin
-    ],
-    joints: LayoutTensor[
-        DTYPE, L_JOINTS, MutAnyOrigin
-    ],
-    xpos: LayoutTensor[DTYPE, L_XPOS, MutAnyOrigin],
-    xquat: LayoutTensor[
-        DTYPE, L_XQUAT, MutAnyOrigin
-    ],
-    xipos: LayoutTensor[
-        DTYPE, L_XPOS, MutAnyOrigin
-    ],
+    qpos: TileTensor[DTYPE, L_QPOS, MutAnyOrigin],
+    bodies: TileTensor[DTYPE, L_BODIES, MutAnyOrigin],
+    joints: TileTensor[DTYPE, L_JOINTS, MutAnyOrigin],
+    xpos: TileTensor[DTYPE, L_XPOS, MutAnyOrigin],
+    xquat: TileTensor[DTYPE, L_XQUAT, MutAnyOrigin],
+    xipos: TileTensor[DTYPE, L_XPOS, MutAnyOrigin],
 ):
     """Level-parallel FK for one env (all block threads must call this —
     it contains barriers)."""
@@ -760,20 +705,12 @@ def _fk_fields_mt_kernel[
     BATCH: Int,
     N_THREADS: Int,
 ](
-    qpos: LayoutTensor[DTYPE, Layout.row_major(BATCH, NQ), MutAnyOrigin],
-    bodies: LayoutTensor[
-        DTYPE, Layout.row_major(NBODY, MODEL_BODY_SIZE), MutAnyOrigin
-    ],
-    joints: LayoutTensor[
-        DTYPE, Layout.row_major(NJOINT, MODEL_JOINT_SIZE), MutAnyOrigin
-    ],
-    xpos: LayoutTensor[DTYPE, Layout.row_major(BATCH, NBODY * 3), MutAnyOrigin],
-    xquat: LayoutTensor[
-        DTYPE, Layout.row_major(BATCH, NBODY * 4), MutAnyOrigin
-    ],
-    xipos: LayoutTensor[
-        DTYPE, Layout.row_major(BATCH, NBODY * 3), MutAnyOrigin
-    ],
+    qpos: Tile[DTYPE, BATCH, NQ],
+    bodies: Tile[DTYPE, NBODY, MODEL_BODY_SIZE],
+    joints: Tile[DTYPE, NJOINT, MODEL_JOINT_SIZE],
+    xpos: Tile[DTYPE, BATCH, NBODY * 3],
+    xquat: Tile[DTYPE, BATCH, NBODY * 4],
+    xipos: Tile[DTYPE, BATCH, NBODY * 3],
 ):
     var env = Int(block_idx.x)
     var tid = Int(thread_idx.x)
@@ -791,26 +728,14 @@ def _fk_fields_sites_mt_kernel[
     BATCH: Int,
     N_THREADS: Int,
 ](
-    qpos: LayoutTensor[DTYPE, Layout.row_major(BATCH, NQ), MutAnyOrigin],
-    bodies: LayoutTensor[
-        DTYPE, Layout.row_major(NBODY, MODEL_BODY_SIZE), MutAnyOrigin
-    ],
-    joints: LayoutTensor[
-        DTYPE, Layout.row_major(NJOINT, MODEL_JOINT_SIZE), MutAnyOrigin
-    ],
-    sites: LayoutTensor[
-        DTYPE, Layout.row_major(NSITE, MODEL_SITE_SIZE), MutAnyOrigin
-    ],
-    xpos: LayoutTensor[DTYPE, Layout.row_major(BATCH, NBODY * 3), MutAnyOrigin],
-    xquat: LayoutTensor[
-        DTYPE, Layout.row_major(BATCH, NBODY * 4), MutAnyOrigin
-    ],
-    xipos: LayoutTensor[
-        DTYPE, Layout.row_major(BATCH, NBODY * 3), MutAnyOrigin
-    ],
-    site_xpos: LayoutTensor[
-        DTYPE, Layout.row_major(BATCH, NSITE * 3), MutAnyOrigin
-    ],
+    qpos: Tile[DTYPE, BATCH, NQ],
+    bodies: Tile[DTYPE, NBODY, MODEL_BODY_SIZE],
+    joints: Tile[DTYPE, NJOINT, MODEL_JOINT_SIZE],
+    sites: Tile[DTYPE, NSITE, MODEL_SITE_SIZE],
+    xpos: Tile[DTYPE, BATCH, NBODY * 3],
+    xquat: Tile[DTYPE, BATCH, NBODY * 4],
+    xipos: Tile[DTYPE, BATCH, NBODY * 3],
+    site_xpos: Tile[DTYPE, BATCH, NSITE * 3],
 ):
     var env = Int(block_idx.x)
     var tid = Int(thread_idx.x)
@@ -846,11 +771,11 @@ def forward_kinematics[
     with PARALLEL=True — one block per env with NV cooperating threads
     (level-parallel, bit-exact vs the serial kernel). CPU ignores
     PARALLEL."""
-    comptime L_QPOS = Layout.row_major(BATCH, D.NQ)
-    comptime L_XPOS = Layout.row_major(BATCH, D.NBODY * 3)
-    comptime L_XQUAT = Layout.row_major(BATCH, D.NBODY * 4)
-    comptime L_BODY = Layout.row_major(D.NBODY, MODEL_BODY_SIZE)
-    comptime L_JOINT = Layout.row_major(D.NJOINT, MODEL_JOINT_SIZE)
+    comptime L_QPOS = RowMajor[BATCH, D.NQ]
+    comptime L_XPOS = RowMajor[BATCH, D.NBODY * 3]
+    comptime L_XQUAT = RowMajor[BATCH, D.NBODY * 4]
+    comptime L_BODY = RowMajor[D.NBODY, MODEL_BODY_SIZE]
+    comptime L_JOINT = RowMajor[D.NJOINT, MODEL_JOINT_SIZE]
 
     comptime if target == "cpu":
         var dm = d.dims
@@ -859,12 +784,12 @@ def forward_kinematics[
         var rl_JOINT = rl2(dm.get_njoint(), MODEL_JOINT_SIZE)
         var rl_XPOS = rl2(BATCH, dm.get_nbody() * 3)
         var rl_XQUAT = rl2(BATCH, dm.get_nbody() * 4)
-        var qpos_v = d.qpos.lt_dyn["cpu", DYN2](rl_QPOS)
-        var bodies_v = m.bodies.lt_dyn["cpu", DYN2](rl_BODY)
-        var joints_v = m.joints.lt_dyn["cpu", DYN2](rl_JOINT)
-        var xpos_v = d.xpos.lt_dyn["cpu", DYN2](rl_XPOS)
-        var xquat_v = d.xquat.lt_dyn["cpu", DYN2](rl_XQUAT)
-        var xipos_v = d.xipos.lt_dyn["cpu", DYN2](rl_XPOS)
+        var qpos_v = d.qpos.tt_dyn["cpu", DYN2](rl_QPOS)
+        var bodies_v = m.bodies.tt_dyn["cpu", DYN2](rl_BODY)
+        var joints_v = m.joints.tt_dyn["cpu", DYN2](rl_JOINT)
+        var xpos_v = d.xpos.tt_dyn["cpu", DYN2](rl_XPOS)
+        var xquat_v = d.xquat.tt_dyn["cpu", DYN2](rl_XQUAT)
+        var xipos_v = d.xipos.tt_dyn["cpu", DYN2](rl_XPOS)
         for e in range(BATCH):
             _fk_env[DTYPE](
                 e, dm, qpos_v, bodies_v, joints_v, xpos_v, xquat_v, xipos_v
@@ -885,8 +810,8 @@ def forward_kinematics[
         if dm.get_nsite() > 0:
             var rl_SITE_REC = rl2(dm.get_nsite(), MODEL_SITE_SIZE)
             var rl_SITE_X = rl2(BATCH, dm.get_nsite() * 3)
-            var sites_v = m.sites.lt_dyn["cpu", DYN2](rl_SITE_REC)
-            var sitex_v = d.site_xpos.lt_dyn["cpu", DYN2](rl_SITE_X)
+            var sites_v = m.sites.tt_dyn["cpu", DYN2](rl_SITE_REC)
+            var sitex_v = d.site_xpos.tt_dyn["cpu", DYN2](rl_SITE_X)
             for e in range(BATCH):
                 _fk_sites[DTYPE](
                     e, dm, sites_v, xpos_v, xquat_v, sitex_v
@@ -896,21 +821,21 @@ def forward_kinematics[
         var c = ctx.value()
         comptime MT_T = D.NV
         comptime if D.NSITE > 0:
-            comptime L_SITE_REC = Layout.row_major(D.NSITE, MODEL_SITE_SIZE)
-            comptime L_SITE_X = Layout.row_major(BATCH, D.NSITE * 3)
+            comptime L_SITE_REC = RowMajor[D.NSITE, MODEL_SITE_SIZE]
+            comptime L_SITE_X = RowMajor[BATCH, D.NSITE * 3]
             c.enqueue_function[
                 _fk_fields_sites_mt_kernel[
                     DTYPE, D.NQ, D.NBODY, D.NJOINT, D.NSITE, BATCH, MT_T
                 ]
             ](
-                d.qpos.lt["gpu", L_QPOS](),
-                m.bodies.lt["gpu", L_BODY](),
-                m.joints.lt["gpu", L_JOINT](),
-                m.sites.lt["gpu", L_SITE_REC](),
-                d.xpos.lt["gpu", L_XPOS](),
-                d.xquat.lt["gpu", L_XQUAT](),
-                d.xipos.lt["gpu", L_XPOS](),
-                d.site_xpos.lt["gpu", L_SITE_X](),
+                d.qpos.tt["gpu", BATCH, D.NQ](),
+                m.bodies.tt["gpu", D.NBODY, MODEL_BODY_SIZE](),
+                m.joints.tt["gpu", D.NJOINT, MODEL_JOINT_SIZE](),
+                m.sites.tt["gpu", D.NSITE, MODEL_SITE_SIZE](),
+                d.xpos.tt["gpu", BATCH, D.NBODY * 3](),
+                d.xquat.tt["gpu", BATCH, D.NBODY * 4](),
+                d.xipos.tt["gpu", BATCH, D.NBODY * 3](),
+                d.site_xpos.tt["gpu", BATCH, D.NSITE * 3](),
                 grid_dim=(BATCH,),
                 block_dim=(MT_T,),
             )
@@ -918,12 +843,12 @@ def forward_kinematics[
             c.enqueue_function[
                 _fk_fields_mt_kernel[DTYPE, D.NQ, D.NBODY, D.NJOINT, BATCH, MT_T]
             ](
-                d.qpos.lt["gpu", L_QPOS](),
-                m.bodies.lt["gpu", L_BODY](),
-                m.joints.lt["gpu", L_JOINT](),
-                d.xpos.lt["gpu", L_XPOS](),
-                d.xquat.lt["gpu", L_XQUAT](),
-                d.xipos.lt["gpu", L_XPOS](),
+                d.qpos.tt["gpu", BATCH, D.NQ](),
+                m.bodies.tt["gpu", D.NBODY, MODEL_BODY_SIZE](),
+                m.joints.tt["gpu", D.NJOINT, MODEL_JOINT_SIZE](),
+                d.xpos.tt["gpu", BATCH, D.NBODY * 3](),
+                d.xquat.tt["gpu", BATCH, D.NBODY * 4](),
+                d.xipos.tt["gpu", BATCH, D.NBODY * 3](),
                 grid_dim=(BATCH,),
                 block_dim=(MT_T,),
             )
@@ -931,19 +856,19 @@ def forward_kinematics[
         var c = ctx.value()
         comptime BLOCKS = (BATCH + FK_TPB - 1) // FK_TPB
         comptime if D.NSITE > 0:
-            comptime L_SITE_REC = Layout.row_major(D.NSITE, MODEL_SITE_SIZE)
-            comptime L_SITE_X = Layout.row_major(BATCH, D.NSITE * 3)
+            comptime L_SITE_REC = RowMajor[D.NSITE, MODEL_SITE_SIZE]
+            comptime L_SITE_X = RowMajor[BATCH, D.NSITE * 3]
             c.enqueue_function[
                 _fk_fields_sites_kernel[DTYPE, D.NQ, D.NBODY, D.NJOINT, D.NSITE, BATCH]
             ](
-                d.qpos.lt["gpu", L_QPOS](),
-                m.bodies.lt["gpu", L_BODY](),
-                m.joints.lt["gpu", L_JOINT](),
-                m.sites.lt["gpu", L_SITE_REC](),
-                d.xpos.lt["gpu", L_XPOS](),
-                d.xquat.lt["gpu", L_XQUAT](),
-                d.xipos.lt["gpu", L_XPOS](),
-                d.site_xpos.lt["gpu", L_SITE_X](),
+                d.qpos.tt["gpu", BATCH, D.NQ](),
+                m.bodies.tt["gpu", D.NBODY, MODEL_BODY_SIZE](),
+                m.joints.tt["gpu", D.NJOINT, MODEL_JOINT_SIZE](),
+                m.sites.tt["gpu", D.NSITE, MODEL_SITE_SIZE](),
+                d.xpos.tt["gpu", BATCH, D.NBODY * 3](),
+                d.xquat.tt["gpu", BATCH, D.NBODY * 4](),
+                d.xipos.tt["gpu", BATCH, D.NBODY * 3](),
+                d.site_xpos.tt["gpu", BATCH, D.NSITE * 3](),
                 grid_dim=(BLOCKS,),
                 block_dim=(FK_TPB,),
             )
@@ -951,12 +876,12 @@ def forward_kinematics[
             c.enqueue_function[
                 _fk_fields_kernel[DTYPE, D.NQ, D.NBODY, D.NJOINT, BATCH]
             ](
-                d.qpos.lt["gpu", L_QPOS](),
-                m.bodies.lt["gpu", L_BODY](),
-                m.joints.lt["gpu", L_JOINT](),
-                d.xpos.lt["gpu", L_XPOS](),
-                d.xquat.lt["gpu", L_XQUAT](),
-                d.xipos.lt["gpu", L_XPOS](),
+                d.qpos.tt["gpu", BATCH, D.NQ](),
+                m.bodies.tt["gpu", D.NBODY, MODEL_BODY_SIZE](),
+                m.joints.tt["gpu", D.NJOINT, MODEL_JOINT_SIZE](),
+                d.xpos.tt["gpu", BATCH, D.NBODY * 3](),
+                d.xquat.tt["gpu", BATCH, D.NBODY * 4](),
+                d.xipos.tt["gpu", BATCH, D.NBODY * 3](),
                 grid_dim=(BLOCKS,),
                 block_dim=(FK_TPB,),
             )
@@ -973,35 +898,25 @@ def forward_kinematics[
 def _vel_body[
     DTYPE: DType,
     D: DimsLike,
-    L_QPOS: Layout,
-    L_QVEL: Layout,
-    L_XPOS: Layout,
-    L_XQUAT: Layout,
-    L_BODIES: Layout,
-    L_JOINTS: Layout,
+    L_QPOS: TensorLayout,
+    L_QVEL: TensorLayout,
+    L_XPOS: TensorLayout,
+    L_XQUAT: TensorLayout,
+    L_BODIES: TensorLayout,
+    L_JOINTS: TensorLayout,
 ](
     env: Int,
     body: Int,
     dims: D,
-    qpos: LayoutTensor[DTYPE, L_QPOS, MutAnyOrigin],
-    qvel: LayoutTensor[DTYPE, L_QVEL, MutAnyOrigin],
-    xpos: LayoutTensor[DTYPE, L_XPOS, MutAnyOrigin],
-    xquat: LayoutTensor[
-        DTYPE, L_XQUAT, MutAnyOrigin
-    ],
-    xipos: LayoutTensor[
-        DTYPE, L_XPOS, MutAnyOrigin
-    ],
-    bodies: LayoutTensor[
-        DTYPE, L_BODIES, MutAnyOrigin
-    ],
-    joints: LayoutTensor[
-        DTYPE, L_JOINTS, MutAnyOrigin
-    ],
-    xvel: LayoutTensor[DTYPE, L_XPOS, MutAnyOrigin],
-    xangvel: LayoutTensor[
-        DTYPE, L_XPOS, MutAnyOrigin
-    ],
+    qpos: TileTensor[DTYPE, L_QPOS, MutAnyOrigin],
+    qvel: TileTensor[DTYPE, L_QVEL, MutAnyOrigin],
+    xpos: TileTensor[DTYPE, L_XPOS, MutAnyOrigin],
+    xquat: TileTensor[DTYPE, L_XQUAT, MutAnyOrigin],
+    xipos: TileTensor[DTYPE, L_XPOS, MutAnyOrigin],
+    bodies: TileTensor[DTYPE, L_BODIES, MutAnyOrigin],
+    joints: TileTensor[DTYPE, L_JOINTS, MutAnyOrigin],
+    xvel: TileTensor[DTYPE, L_XPOS, MutAnyOrigin],
+    xangvel: TileTensor[DTYPE, L_XPOS, MutAnyOrigin],
 ):
     """One body's world velocity from its parent. Requires the parent's
     velocity already written (topological order).
@@ -1331,34 +1246,24 @@ def _vel_body[
 def _body_velocities_env[
     DTYPE: DType,
     D: DimsLike,
-    L_QPOS: Layout,
-    L_QVEL: Layout,
-    L_XPOS: Layout,
-    L_XQUAT: Layout,
-    L_BODIES: Layout,
-    L_JOINTS: Layout,
+    L_QPOS: TensorLayout,
+    L_QVEL: TensorLayout,
+    L_XPOS: TensorLayout,
+    L_XQUAT: TensorLayout,
+    L_BODIES: TensorLayout,
+    L_JOINTS: TensorLayout,
 ](
     env: Int,
     dims: D,
-    qpos: LayoutTensor[DTYPE, L_QPOS, MutAnyOrigin],
-    qvel: LayoutTensor[DTYPE, L_QVEL, MutAnyOrigin],
-    xpos: LayoutTensor[DTYPE, L_XPOS, MutAnyOrigin],
-    xquat: LayoutTensor[
-        DTYPE, L_XQUAT, MutAnyOrigin
-    ],
-    xipos: LayoutTensor[
-        DTYPE, L_XPOS, MutAnyOrigin
-    ],
-    bodies: LayoutTensor[
-        DTYPE, L_BODIES, MutAnyOrigin
-    ],
-    joints: LayoutTensor[
-        DTYPE, L_JOINTS, MutAnyOrigin
-    ],
-    xvel: LayoutTensor[DTYPE, L_XPOS, MutAnyOrigin],
-    xangvel: LayoutTensor[
-        DTYPE, L_XPOS, MutAnyOrigin
-    ],
+    qpos: TileTensor[DTYPE, L_QPOS, MutAnyOrigin],
+    qvel: TileTensor[DTYPE, L_QVEL, MutAnyOrigin],
+    xpos: TileTensor[DTYPE, L_XPOS, MutAnyOrigin],
+    xquat: TileTensor[DTYPE, L_XQUAT, MutAnyOrigin],
+    xipos: TileTensor[DTYPE, L_XPOS, MutAnyOrigin],
+    bodies: TileTensor[DTYPE, L_BODIES, MutAnyOrigin],
+    joints: TileTensor[DTYPE, L_JOINTS, MutAnyOrigin],
+    xvel: TileTensor[DTYPE, L_XPOS, MutAnyOrigin],
+    xangvel: TileTensor[DTYPE, L_XPOS, MutAnyOrigin],
 ):
     var nq = dims.get_nq()
     var nv = dims.get_nv()
@@ -1387,25 +1292,15 @@ def _body_velocities_fields_kernel[
     NJOINT: Int,
     BATCH: Int,
 ](
-    qpos: LayoutTensor[DTYPE, Layout.row_major(BATCH, NQ), MutAnyOrigin],
-    qvel: LayoutTensor[DTYPE, Layout.row_major(BATCH, NV), MutAnyOrigin],
-    xpos: LayoutTensor[DTYPE, Layout.row_major(BATCH, NBODY * 3), MutAnyOrigin],
-    xquat: LayoutTensor[
-        DTYPE, Layout.row_major(BATCH, NBODY * 4), MutAnyOrigin
-    ],
-    xipos: LayoutTensor[
-        DTYPE, Layout.row_major(BATCH, NBODY * 3), MutAnyOrigin
-    ],
-    bodies: LayoutTensor[
-        DTYPE, Layout.row_major(NBODY, MODEL_BODY_SIZE), MutAnyOrigin
-    ],
-    joints: LayoutTensor[
-        DTYPE, Layout.row_major(NJOINT, MODEL_JOINT_SIZE), MutAnyOrigin
-    ],
-    xvel: LayoutTensor[DTYPE, Layout.row_major(BATCH, NBODY * 3), MutAnyOrigin],
-    xangvel: LayoutTensor[
-        DTYPE, Layout.row_major(BATCH, NBODY * 3), MutAnyOrigin
-    ],
+    qpos: Tile[DTYPE, BATCH, NQ],
+    qvel: Tile[DTYPE, BATCH, NV],
+    xpos: Tile[DTYPE, BATCH, NBODY * 3],
+    xquat: Tile[DTYPE, BATCH, NBODY * 4],
+    xipos: Tile[DTYPE, BATCH, NBODY * 3],
+    bodies: Tile[DTYPE, NBODY, MODEL_BODY_SIZE],
+    joints: Tile[DTYPE, NJOINT, MODEL_JOINT_SIZE],
+    xvel: Tile[DTYPE, BATCH, NBODY * 3],
+    xangvel: Tile[DTYPE, BATCH, NBODY * 3],
 ):
     var env = Int(block_dim.x * block_idx.x + thread_idx.x)
     if env >= BATCH:
@@ -1430,25 +1325,15 @@ def _body_velocities_fields_mt_kernel[
     BATCH: Int,
     N_THREADS: Int,
 ](
-    qpos: LayoutTensor[DTYPE, Layout.row_major(BATCH, NQ), MutAnyOrigin],
-    qvel: LayoutTensor[DTYPE, Layout.row_major(BATCH, NV), MutAnyOrigin],
-    xpos: LayoutTensor[DTYPE, Layout.row_major(BATCH, NBODY * 3), MutAnyOrigin],
-    xquat: LayoutTensor[
-        DTYPE, Layout.row_major(BATCH, NBODY * 4), MutAnyOrigin
-    ],
-    xipos: LayoutTensor[
-        DTYPE, Layout.row_major(BATCH, NBODY * 3), MutAnyOrigin
-    ],
-    bodies: LayoutTensor[
-        DTYPE, Layout.row_major(NBODY, MODEL_BODY_SIZE), MutAnyOrigin
-    ],
-    joints: LayoutTensor[
-        DTYPE, Layout.row_major(NJOINT, MODEL_JOINT_SIZE), MutAnyOrigin
-    ],
-    xvel: LayoutTensor[DTYPE, Layout.row_major(BATCH, NBODY * 3), MutAnyOrigin],
-    xangvel: LayoutTensor[
-        DTYPE, Layout.row_major(BATCH, NBODY * 3), MutAnyOrigin
-    ],
+    qpos: Tile[DTYPE, BATCH, NQ],
+    qvel: Tile[DTYPE, BATCH, NV],
+    xpos: Tile[DTYPE, BATCH, NBODY * 3],
+    xquat: Tile[DTYPE, BATCH, NBODY * 4],
+    xipos: Tile[DTYPE, BATCH, NBODY * 3],
+    bodies: Tile[DTYPE, NBODY, MODEL_BODY_SIZE],
+    joints: Tile[DTYPE, NJOINT, MODEL_JOINT_SIZE],
+    xvel: Tile[DTYPE, BATCH, NBODY * 3],
+    xangvel: Tile[DTYPE, BATCH, NBODY * 3],
 ):
     var env = Int(block_idx.x)
     var tid = Int(thread_idx.x)
@@ -1497,12 +1382,12 @@ def compute_body_velocities[
     """Body world velocities qvel -> xvel/xangvel (needs FK products), both
     targets, one body. PARALLEL=True (GPU only): level-parallel cooperative
     kernel, bit-exact vs serial. CPU ignores PARALLEL."""
-    comptime L_NQ = Layout.row_major(BATCH, D.NQ)
-    comptime L_NV = Layout.row_major(BATCH, D.NV)
-    comptime L_B3 = Layout.row_major(BATCH, D.NBODY * 3)
-    comptime L_B4 = Layout.row_major(BATCH, D.NBODY * 4)
-    comptime L_BODY = Layout.row_major(D.NBODY, MODEL_BODY_SIZE)
-    comptime L_JOINT = Layout.row_major(D.NJOINT, MODEL_JOINT_SIZE)
+    comptime L_NQ = RowMajor[BATCH, D.NQ]
+    comptime L_NV = RowMajor[BATCH, D.NV]
+    comptime L_B3 = RowMajor[BATCH, D.NBODY * 3]
+    comptime L_B4 = RowMajor[BATCH, D.NBODY * 4]
+    comptime L_BODY = RowMajor[D.NBODY, MODEL_BODY_SIZE]
+    comptime L_JOINT = RowMajor[D.NJOINT, MODEL_JOINT_SIZE]
 
     comptime if target == "cpu":
         var dm = d.dims
@@ -1512,15 +1397,15 @@ def compute_body_velocities[
         var rl_B4 = rl2(BATCH, dm.get_nbody() * 4)
         var rl_BODY = rl2(dm.get_nbody(), MODEL_BODY_SIZE)
         var rl_JOINT = rl2(dm.get_njoint(), MODEL_JOINT_SIZE)
-        var qpos_v = d.qpos.lt_dyn["cpu", DYN2](rl_NQ)
-        var qvel_v = d.qvel.lt_dyn["cpu", DYN2](rl_NV)
-        var xpos_v = d.xpos.lt_dyn["cpu", DYN2](rl_B3)
-        var xquat_v = d.xquat.lt_dyn["cpu", DYN2](rl_B4)
-        var xipos_v = d.xipos.lt_dyn["cpu", DYN2](rl_B3)
-        var bodies_v = m.bodies.lt_dyn["cpu", DYN2](rl_BODY)
-        var joints_v = m.joints.lt_dyn["cpu", DYN2](rl_JOINT)
-        var xvel_v = d.xvel.lt_dyn["cpu", DYN2](rl_B3)
-        var xangvel_v = d.xangvel.lt_dyn["cpu", DYN2](rl_B3)
+        var qpos_v = d.qpos.tt_dyn["cpu", DYN2](rl_NQ)
+        var qvel_v = d.qvel.tt_dyn["cpu", DYN2](rl_NV)
+        var xpos_v = d.xpos.tt_dyn["cpu", DYN2](rl_B3)
+        var xquat_v = d.xquat.tt_dyn["cpu", DYN2](rl_B4)
+        var xipos_v = d.xipos.tt_dyn["cpu", DYN2](rl_B3)
+        var bodies_v = m.bodies.tt_dyn["cpu", DYN2](rl_BODY)
+        var joints_v = m.joints.tt_dyn["cpu", DYN2](rl_JOINT)
+        var xvel_v = d.xvel.tt_dyn["cpu", DYN2](rl_B3)
+        var xangvel_v = d.xangvel.tt_dyn["cpu", DYN2](rl_B3)
         for e in range(BATCH):
             _body_velocities_env[DTYPE](
                 e, dm, qpos_v, qvel_v, xpos_v, xquat_v, xipos_v, bodies_v,
@@ -1534,15 +1419,15 @@ def compute_body_velocities[
                 DTYPE, D.NQ, D.NV, D.NBODY, D.NJOINT, BATCH, MT_T
             ]
         ](
-            d.qpos.lt["gpu", L_NQ](),
-            d.qvel.lt["gpu", L_NV](),
-            d.xpos.lt["gpu", L_B3](),
-            d.xquat.lt["gpu", L_B4](),
-            d.xipos.lt["gpu", L_B3](),
-            m.bodies.lt["gpu", L_BODY](),
-            m.joints.lt["gpu", L_JOINT](),
-            d.xvel.lt["gpu", L_B3](),
-            d.xangvel.lt["gpu", L_B3](),
+            d.qpos.tt["gpu", BATCH, D.NQ](),
+            d.qvel.tt["gpu", BATCH, D.NV](),
+            d.xpos.tt["gpu", BATCH, D.NBODY * 3](),
+            d.xquat.tt["gpu", BATCH, D.NBODY * 4](),
+            d.xipos.tt["gpu", BATCH, D.NBODY * 3](),
+            m.bodies.tt["gpu", D.NBODY, MODEL_BODY_SIZE](),
+            m.joints.tt["gpu", D.NJOINT, MODEL_JOINT_SIZE](),
+            d.xvel.tt["gpu", BATCH, D.NBODY * 3](),
+            d.xangvel.tt["gpu", BATCH, D.NBODY * 3](),
             grid_dim=(BATCH,),
             block_dim=(MT_T,),
         )
@@ -1552,15 +1437,15 @@ def compute_body_velocities[
         c.enqueue_function[
             _body_velocities_fields_kernel[DTYPE, D.NQ, D.NV, D.NBODY, D.NJOINT, BATCH]
         ](
-            d.qpos.lt["gpu", L_NQ](),
-            d.qvel.lt["gpu", L_NV](),
-            d.xpos.lt["gpu", L_B3](),
-            d.xquat.lt["gpu", L_B4](),
-            d.xipos.lt["gpu", L_B3](),
-            m.bodies.lt["gpu", L_BODY](),
-            m.joints.lt["gpu", L_JOINT](),
-            d.xvel.lt["gpu", L_B3](),
-            d.xangvel.lt["gpu", L_B3](),
+            d.qpos.tt["gpu", BATCH, D.NQ](),
+            d.qvel.tt["gpu", BATCH, D.NV](),
+            d.xpos.tt["gpu", BATCH, D.NBODY * 3](),
+            d.xquat.tt["gpu", BATCH, D.NBODY * 4](),
+            d.xipos.tt["gpu", BATCH, D.NBODY * 3](),
+            m.bodies.tt["gpu", D.NBODY, MODEL_BODY_SIZE](),
+            m.joints.tt["gpu", D.NJOINT, MODEL_JOINT_SIZE](),
+            d.xvel.tt["gpu", BATCH, D.NBODY * 3](),
+            d.xangvel.tt["gpu", BATCH, D.NBODY * 3](),
             grid_dim=(BLOCKS,),
             block_dim=(FK_TPB,),
         )

@@ -11,7 +11,7 @@ with a pre-poisoned destination so an untouched tail cannot pass.
 """
 
 from max.gpu.host import DeviceContext
-from layout import Layout, LayoutTensor
+from noeira.core.tiles import tile
 
 from noeira.nn.constants import DT
 from noeira.planners.trajectory.mppi_kernels import (
@@ -49,12 +49,8 @@ def test_copy_z(ctx: DeviceContext) raises:
 
     comptime k = mppi_copy_z_kernel[DT, BATCH_TOTAL, LATENT]
     ctx.enqueue_function[k](
-        LayoutTensor[DT, Layout.row_major(BATCH_TOTAL, LATENT), MutAnyOrigin](
-            dst
-        ),
-        LayoutTensor[DT, Layout.row_major(BATCH_TOTAL, LATENT), MutAnyOrigin](
-            src
-        ),
+        tile[BATCH_TOTAL, LATENT](dst),
+        tile[BATCH_TOTAL, LATENT](src),
         grid_dim=(Z_BLOCKS,),
         block_dim=(TPB,),
     )
@@ -100,11 +96,9 @@ def test_broadcast_z0(ctx: DeviceContext) raises:
         DT, BATCH_TOTAL, N_ENVS, TOTAL_SAMPLES, LATENT
     ]
     ctx.enqueue_function[k](
-        LayoutTensor[DT, Layout.row_major(N_ENVS, LATENT), MutAnyOrigin](z0),
-        LayoutTensor[DT, Layout.row_major(BATCH_TOTAL, LATENT), MutAnyOrigin](
-            zall
-        ),
-        LayoutTensor[DT, Layout.row_major(BATCH_TOTAL), MutAnyOrigin](ret),
+        tile[N_ENVS, LATENT](z0),
+        tile[BATCH_TOTAL, LATENT](zall),
+        tile[BATCH_TOTAL](ret),
         grid_dim=(Z_BLOCKS,),
         block_dim=(TPB,),
     )

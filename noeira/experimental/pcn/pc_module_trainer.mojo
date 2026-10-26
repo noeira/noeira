@@ -14,7 +14,6 @@ weight slab is the storage that matters for the optimizer + checkpoint, and
 that now lives in `net.weights` (a `Param`).
 """
 
-from layout import Layout, LayoutTensor
 
 from noeira.nn.constants import DT
 from noeira.nn.optimizer.optimizer import Optimizer
@@ -23,6 +22,7 @@ from .predictive_model import PCBlockTrait
 from .pc_sequential import PCSequential
 from .pc_trainer import PCTrainer, PCTrainResult
 from .pc_module import PCModule
+from noeira.core.tiles import Tile, tile
 
 
 def _zeroed(n: Int) -> List[Scalar[DT]]:
@@ -37,24 +37,16 @@ def pc_module_train_one_batch[
 ](
     mut net: PCModule[*BLOCKS],
     mut opt: OPT,
-    x_in: LayoutTensor[
-        DT, Layout.row_major(BATCH, PCSequential[*BLOCKS].IN_DIM), MutAnyOrigin
-    ],
-    y_target: LayoutTensor[
-        DT, Layout.row_major(BATCH, PCSequential[*BLOCKS].OUT_DIM), MutAnyOrigin
-    ],
+    x_in: Tile[DT, BATCH, PCSequential[*BLOCKS].IN_DIM],
+    y_target: Tile[DT, BATCH, PCSequential[*BLOCKS].OUT_DIM],
     T_infer: Int,
     lr_x: Scalar[DT],
 ) raises -> PCTrainResult:
     comptime NET = PCSequential[*BLOCKS]
 
     # Weight + grad views over the owned Param's CPU storage.
-    var params = LayoutTensor[
-        DT, Layout.row_major(NET.PARAM_SIZE), MutAnyOrigin
-    ](net.weights.val.data)
-    var grads = LayoutTensor[
-        DT, Layout.row_major(NET.PARAM_SIZE), MutAnyOrigin
-    ](net.weights.grd.data)
+    var params = tile[NET.PARAM_SIZE](net.weights.val.data)
+    var grads = tile[NET.PARAM_SIZE](net.weights.grd.data)
 
     # Per-call working buffers (Phase B → Scratch/Cache on the holder).
     var latents_s = _zeroed(BATCH * NET.LATENT_DIM)
@@ -63,21 +55,11 @@ def pc_module_train_one_batch[
     var z_below_s = _zeroed(BATCH * NET.SCRATCH_IN_DIM)
     var dx_s = _zeroed(BATCH * NET.LATENT_DIM)
 
-    var latents = LayoutTensor[
-        DT, Layout.row_major(BATCH, NET.LATENT_DIM), MutAnyOrigin
-    ](latents_s)
-    var mu_eps = LayoutTensor[
-        DT, Layout.row_major(BATCH, NET.SCRATCH_OUT_DIM), MutAnyOrigin
-    ](mu_eps_s)
-    var a_below = LayoutTensor[
-        DT, Layout.row_major(BATCH, NET.SCRATCH_IN_DIM), MutAnyOrigin
-    ](a_below_s)
-    var z_below = LayoutTensor[
-        DT, Layout.row_major(BATCH, NET.SCRATCH_IN_DIM), MutAnyOrigin
-    ](z_below_s)
-    var dx = LayoutTensor[
-        DT, Layout.row_major(BATCH, NET.LATENT_DIM), MutAnyOrigin
-    ](dx_s)
+    var latents = tile[BATCH, NET.LATENT_DIM](latents_s)
+    var mu_eps = tile[BATCH, NET.SCRATCH_OUT_DIM](mu_eps_s)
+    var a_below = tile[BATCH, NET.SCRATCH_IN_DIM](a_below_s)
+    var z_below = tile[BATCH, NET.SCRATCH_IN_DIM](z_below_s)
+    var dx = tile[BATCH, NET.LATENT_DIM](dx_s)
 
     # 1. Settling loop fills `grads` (= net.weights.grd) with +∂E/∂W.
     var result = PCTrainer[*BLOCKS].compute_grads_only[BATCH](

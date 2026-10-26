@@ -9,7 +9,7 @@ Run: pixi run -e apple mojo run -I . tests/physics2d/test_car_multibody_gpu.mojo
 """
 
 from std.math import sqrt
-from layout import Layout, LayoutTensor
+from noeira.core.tiles import Tile, tile
 from max.gpu.host import DeviceContext
 from noeira.physics2d import dtype
 from noeira.physics2d.constants import IDX_X, IDX_Y, IDX_ANGLE, IDX_VX, IDX_VY, IDX_OMEGA
@@ -32,7 +32,7 @@ comptime K = 40
 comptime DT = Scalar[dtype](0.02)
 
 
-def init_all(state: LayoutTensor[dtype, Layout.row_major(BATCH, SSZ), MutAnyOrigin]):
+def init_all(state: Tile[dtype, BATCH, SSZ]):
     """Init BATCH cars at origin with per-env controls (mix of gas/steer)."""
     for e in range(BATCH):
         CarDynamicsMB.init_env[BATCH, SSZ, BOFF, FOFF, JOFF, ROFF](
@@ -55,9 +55,7 @@ def main() raises:
     var cbuf = List[Scalar[dtype]](capacity=BATCH * SSZ)
     for _ in range(BATCH * SSZ):
         cbuf.append(Scalar[dtype](0.0))
-    var cstate = LayoutTensor[dtype, Layout.row_major(BATCH, SSZ), MutAnyOrigin](
-        mptr(cbuf)
-    )
+    var cstate = tile[BATCH, SSZ](mptr(cbuf))
     init_all(cstate)
     for _ in range(K):
         for e in range(BATCH):
@@ -68,9 +66,7 @@ def main() raises:
     # --- GPU run -----------------------------------------------------------
     var host = ctx.enqueue_create_host_buffer[dtype](BATCH * SSZ)
     ctx.synchronize()
-    var hstate = LayoutTensor[dtype, Layout.row_major(BATCH, SSZ), MutAnyOrigin](
-        host.unsafe_ptr().as_unsafe_any_origin()
-    )
+    var hstate = tile[BATCH, SSZ](host.unsafe_ptr().as_unsafe_any_origin())
     init_all(hstate)
     var dev = ctx.enqueue_create_buffer[dtype](BATCH * SSZ)
     ctx.enqueue_copy(dev, host)
@@ -83,9 +79,7 @@ def main() raises:
     var gout = ctx.enqueue_create_host_buffer[dtype](BATCH * SSZ)
     ctx.enqueue_copy(gout, dev)
     ctx.synchronize()
-    var gstate = LayoutTensor[dtype, Layout.row_major(BATCH, SSZ), MutAnyOrigin](
-        gout.unsafe_ptr().as_unsafe_any_origin()
-    )
+    var gstate = tile[BATCH, SSZ](gout.unsafe_ptr().as_unsafe_any_origin())
 
     # --- compare hull body state across all envs ---------------------------
     var max_diff: Float64 = 0.0

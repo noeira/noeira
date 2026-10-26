@@ -72,7 +72,6 @@ the device-graph backend rather than recording a partial step.
 from max.gpu import global_idx, thread_idx
 from std.math import sqrt, abs
 from std.random.philox import Random as PhiloxRandom
-from layout import Layout, LayoutTensor
 from max.gpu.host import DeviceContext, DeviceBuffer
 
 from noeira.core.logger import Logger, NoOpLogger
@@ -117,6 +116,7 @@ from .kernels import (
     ensure_t,
     _blocks,
 )
+from noeira.core.tiles import RowMajor, Tile, tile
 
 
 # ══════════════════════════════════════════════════════════════════════
@@ -124,19 +124,36 @@ from .kernels import (
 # ══════════════════════════════════════════════════════════════════════
 
 
+@always_inline
+def to_ring[RDT: DType](x: Scalar[DT]) -> Scalar[RDT]:
+    """`x` in the ring's storage type. fp16 SATURATES at ±65504 rather than
+    storing ±inf: one exploding rollout would otherwise poison every batch
+    that draws the row (a NaN stays a NaN either way)."""
+    comptime if RDT == DType.float16:
+        comptime HMAX = Scalar[DT](65504.0)
+        var y = x
+        if y > HMAX:
+            y = HMAX
+        if y < -HMAX:
+            y = -HMAX
+        return y.cast[RDT]()
+    else:
+        return x.cast[RDT]()
+
+
 def ring_store_kernel[
-    OBS: Int, ACT: Int, D: Int, CAP: Int, LANES: Int
+    OBS: Int, ACT: Int, D: Int, CAP: Int, LANES: Int, RDT: DType = DT
 ](
     obs_src: Pointer[Scalar[DT], MutAnyOrigin],
     act_src: Pointer[Scalar[DT], MutAnyOrigin],
     term_src: Pointer[Scalar[DT], MutAnyOrigin],
     z_src: Pointer[Scalar[DT], MutAnyOrigin],
-    r_obs: Pointer[Scalar[DT], MutAnyOrigin],
+    r_obs: Pointer[Scalar[RDT], MutAnyOrigin],
     r_act: Pointer[Scalar[DT], MutAnyOrigin],
     r_term: Pointer[Scalar[DT], MutAnyOrigin],
     r_bnd: Pointer[Scalar[DT], MutAnyOrigin],
     r_age: Pointer[Scalar[DT], MutAnyOrigin],
-    r_z: Pointer[Scalar[DT], MutAnyOrigin],
+    r_z: Pointer[Scalar[RDT], MutAnyOrigin],
     pos: Int32,
     bnd: Int32,
     age: Int32,
@@ -162,6 +179,9 @@ def ring_store_kernel[
     Element-parallel over the concatenated row width so a wide `z` (128) does
     not serialise inside a per-lane thread. `pos` is a host scalar because
     `record_batch_gpu` is eager — the driver never captures it.
+
+    `RDT` is the storage type of the two WIDE columns, `obs` and `z` (the
+    agent's `RING_DT`); `act` and the three per-row scalars stay `DT`.
     """
     comptime W = OBS + ACT + D + 3
     var t = Int(global_idx.x)
@@ -171,13 +191,17 @@ def ring_store_kernel[
     var k = t % W
     var row = (Int(pos) + lane) % CAP
     if k < OBS:
-        r_obs[unsafe_offset=row * OBS + k] = obs_src[unsafe_offset=lane * OBS + k]
+        r_obs[unsafe_offset=row * OBS + k] = to_ring[RDT](
+            obs_src[unsafe_offset=lane * OBS + k]
+        )
     elif k < OBS + ACT:
         var j = k - OBS
         r_act[unsafe_offset=row * ACT + j] = act_src[unsafe_offset=lane * ACT + j]
     elif k < OBS + ACT + D:
         var j = k - OBS - ACT
-        r_z[unsafe_offset=row * D + j] = z_src[unsafe_offset=lane * D + j]
+        r_z[unsafe_offset=row * D + j] = to_ring[RDT](
+            z_src[unsafe_offset=lane * D + j]
+        )
     elif k == OBS + ACT + D:
         r_term[unsafe_offset=row] = term_src[unsafe_offset=lane]
     elif k == OBS + ACT + D + 1:
@@ -193,12 +217,12 @@ def ring_store_kernel[
 def ring_indices_kernel[
     BATCH: Int, CAP: Int, LANES: Int
 ](
-    indices: LayoutTensor[IDX_DT, Layout.row_major(BATCH), MutAnyOrigin],
-    size_buf: LayoutTensor[DType.int32, Layout.row_major(1), MutAnyOrigin],
-    pos_buf: LayoutTensor[DType.int32, Layout.row_major(1), MutAnyOrigin],
+    indices: Tile[IDX_DT, BATCH],
+    size_buf: Tile[DType.int32, 1],
+    pos_buf: Tile[DType.int32, 1],
     r_bnd: Pointer[Scalar[DT], MutAnyOrigin],
     seed: UInt64,
-    offset_buf: LayoutTensor[DType.uint64, Layout.row_major(1), MutAnyOrigin],
+    offset_buf: Tile[DType.uint64, 1],
 ):
     """The `s` draw, once `s'` is derived rather than stored (§12.23).
 
@@ -293,7 +317,7 @@ def z_lane_resample_kernel[D: Int, LANES: Int, ZBUF: Int](
     z: Pointer[Scalar[DT], MutAnyOrigin],
     gauss: Pointer[Scalar[DT], MutAnyOrigin],
     zbuf: Pointer[Scalar[DT], MutAnyOrigin],
-    zbuf_fill: LayoutTensor[DType.int32, Layout.row_major(1), MutAnyOrigin],
+    zbuf_fill: Tile[DType.int32, 1],
     pick: Pointer[Scalar[DT], MutAnyOrigin],
     iter: Int32,
     hold: Int32,
@@ -381,7 +405,7 @@ def z_relabel_kernel[D: Int, BATCH: Int](
 def zbuf_push_kernel[D: Int, BATCH: Int, ZBUF: Int](
     zbuf: Pointer[Scalar[DT], MutAnyOrigin],
     z: Pointer[Scalar[DT], MutAnyOrigin],
-    head: LayoutTensor[DType.int32, Layout.row_major(1), MutAnyOrigin],
+    head: Tile[DType.int32, 1],
 ):
     """Append the batch's `z` rows to the FIFO at `(head + i) % ZBUF`. The
     head is read from device (captured path); `zbuf_advance_kernel` bumps it
@@ -396,8 +420,8 @@ def zbuf_push_kernel[D: Int, BATCH: Int, ZBUF: Int](
 
 
 def zbuf_advance_kernel[BATCH: Int, ZBUF: Int](
-    head: LayoutTensor[DType.int32, Layout.row_major(1), MutAnyOrigin],
-    fill: LayoutTensor[DType.int32, Layout.row_major(1), MutAnyOrigin],
+    head: Tile[DType.int32, 1],
+    fill: Tile[DType.int32, 1],
 ):
     if Int(thread_idx.x) != 0:
         return
@@ -447,6 +471,18 @@ def z_pin_kernel[D: Int, LANES: Int](
         z_lane[unsafe_offset=i] = z_pin[unsafe_offset=i]
 
 
+def _ring_to_host[
+    RDT: DType
+](ctx: DeviceContext, ref src: DeviceBuffer[RDT], n: Int) raises -> Tensor:
+    var h = ctx.enqueue_create_host_buffer[RDT](n)
+    ctx.enqueue_copy(h, src)
+    ctx.synchronize()
+    var t = Tensor.alloc(n)
+    for i in range(n):
+        t.data[i] = h[i].cast[DT]()
+    return t^
+
+
 struct FBOnlineAgent[
     FNET: Module,
     BNET: Module,
@@ -460,6 +496,7 @@ struct FBOnlineAgent[
     ZBUF: Int = 10_000,
     EXPERT_ROWS: Int = 0,
     DERIVED_TAIL: Int = 0,
+    RING_DT: DType = DT,
 ](OffPolicyAgentGpu):
     """`OffPolicyAgentGpu` conformer around `FBTrainer[..., "gpu"]`.
 
@@ -473,6 +510,15 @@ struct FBOnlineAgent[
     expert rows ONLY (`FBTrainer.fill_bc_mask`); their `z` is always drawn
     fresh (no stored z to keep). Without an attached store the agent samples
     the ring alone, whatever `EXPERT_ROWS` says — one binary, both arms.
+
+    `RING_DT` is the storage type of the ring's `obs` and `z` columns — 3/4
+    of its bytes (docs BFM_ZERO_G1_REPRODUCTION §16). The ring holds RAW
+    observations (the normaliser runs on the gathered batch), so fp16 is the
+    half-width type to use, not bf16: on the G1's 527 stored columns fp16's
+    worst rounding is 0.005 of a feature's std against bf16's 0.047, and the
+    largest |obs| is 29 against fp16's 65504 (saturated on write regardless,
+    `to_ring`). Every gather casts back to `DT`, so nothing downstream of the
+    batch sees the storage type.
     """
 
     comptime AGENT_TRAIN_TARGET: StaticString = "gpu"
@@ -496,9 +542,9 @@ struct FBOnlineAgent[
     var tracker: EpisodeTracker
 
     # ── replay ring (device only — no host mirror of CAP x D floats) ────
-    var r_obs: Tensor
+    var r_obs: Optional[DeviceBuffer[Self.RING_DT]]   # CAP x STORE_OBS
     var r_act: Tensor
-    var r_z: Tensor
+    var r_z: Optional[DeviceBuffer[Self.RING_DT]]     # CAP x D
     var r_term: Tensor
     var r_bnd: Tensor          # CAP, 1 = this row's successor is post-reset
     var r_age: Tensor          # CAP, steps since this lane's reset (capped)
@@ -579,6 +625,16 @@ struct FBOnlineAgent[
     var z_pin: Tensor          # LANES * D
     var z_pin_mask: Tensor     # LANES, 1 = pinned
     var z_pin_on: Bool
+    # ── an EXTERNAL exploration-z source (opt-in, `enable_zsrc`): FB-MEBE's
+    # inverse-density `z = B(s)` pool (`fb/online_mebe.mojo`). When on, it
+    # REPLACES two sources: the lanes draw from it (probability `zbuf_frac`)
+    # instead of the ZBuffer, and the relabel's non-uniform share draws from
+    # it instead of `B(s+)` of the batch — the release's `refresh_z` and
+    # `sample_mixed_z`. `BATCH` rows, rewritten in place by its owner
+    # between steps (eager), so the captured step reads a fixed pointer.
+    var zsrc: Tensor           # BATCH * D
+    var zsrc_fill: Optional[DeviceBuffer[DType.int32]]
+    var zsrc_on: Bool
 
     def __init__(out self):
         self.t = Self.TrainerT()
@@ -587,9 +643,9 @@ struct FBOnlineAgent[
             window=List[Scalar[DT]](), window_size=0, idx=0,
             current_return=Scalar[DT](0.0), ep_count=0,
         )
-        self.r_obs = Tensor()
+        self.r_obs = None
         self.r_act = Tensor()
-        self.r_z = Tensor()
+        self.r_z = None
         self.r_term = Tensor()
         self.r_bnd = Tensor()
         self.r_age = Tensor()
@@ -648,6 +704,9 @@ struct FBOnlineAgent[
         self.z_pin = Tensor()
         self.z_pin_mask = Tensor()
         self.z_pin_on = False
+        self.zsrc = Tensor()
+        self.zsrc_fill = None
+        self.zsrc_on = False
 
     @staticmethod
     def make[
@@ -742,9 +801,13 @@ struct FBOnlineAgent[
         # Ring: device only. A host mirror of CAP x (OBS + ACT + D + 2)
         # floats at CAP = 1 M would be ~350 MB of host RAM nothing reads.
         # `next_obs` is derived, not stored — see `ring_store_kernel`.
-        a.r_obs.ensure_gpu(ctx, Self.CAP * Self.STORE_OBS)
+        var r_o = ctx.enqueue_create_buffer[Self.RING_DT](Self.CAP * Self.STORE_OBS)
+        r_o.enqueue_fill(Scalar[Self.RING_DT](0.0))
+        a.r_obs = r_o^
         a.r_act.ensure_gpu(ctx, Self.CAP * Self.ACT)
-        a.r_z.ensure_gpu(ctx, Self.CAP * Self.D)
+        var r_zb = ctx.enqueue_create_buffer[Self.RING_DT](Self.CAP * Self.D)
+        r_zb.enqueue_fill(Scalar[Self.RING_DT](0.0))
+        a.r_z = r_zb^
         a.r_term.ensure_gpu(ctx, Self.CAP)
         a.r_bnd.ensure_gpu(ctx, Self.CAP)
         # Every row starts flagged. This is NOT what keeps the warmup safe —
@@ -798,6 +861,25 @@ struct FBOnlineAgent[
 
     # ── expert store (A3.5) ──────────────────────────────────────────────
 
+    def ring_obs_ptr(self) -> Pointer[Scalar[Self.RING_DT], MutAnyOrigin]:
+        """The ring's `obs` column (`CAP x STORE_OBS`, `RING_DT`). Readers
+        cast to `DT` (`gather_rows_into_kernel[..., SDT=RING_DT]`)."""
+        return mptr(self.r_obs.value().unsafe_ptr())
+
+    def ring_z_ptr(self) -> Pointer[Scalar[Self.RING_DT], MutAnyOrigin]:
+        """The ring's `z` column (`CAP x D`, `RING_DT`)."""
+        return mptr(self.r_z.value().unsafe_ptr())
+
+    def ring_obs_host(self) raises -> Tensor:
+        """Host copy of the whole `obs` column, widened to `DT` (tests)."""
+        return _ring_to_host(
+            self.ctx.value(), self.r_obs.value(), Self.CAP * Self.STORE_OBS
+        )
+
+    def ring_z_host(self) raises -> Tensor:
+        """Host copy of the whole `z` column, widened to `DT` (tests)."""
+        return _ring_to_host(self.ctx.value(), self.r_z.value(), Self.CAP * Self.D)
+
     def attach_expert(
         mut self,
         var obs: Tensor,
@@ -849,21 +931,11 @@ struct FBOnlineAgent[
         successor and every stored row is a legitimate goal.
         """
         var c = self.ctx.value()
-        var size_lt = LayoutTensor[DType.int32, Layout.row_major(1)](
-            self.size_dev.value()
-        )
-        var pos_lt = LayoutTensor[DType.int32, Layout.row_major(1)](
-            self.pos_dev.value()
-        )
-        var off_lt = LayoutTensor[DType.uint64, Layout.row_major(1)](
-            self.samp_off.value()
-        )
-        var is_lt = LayoutTensor[IDX_DT, Layout.row_major(ROWS)](
-            self.idx_s.value()
-        )
-        var isp_lt = LayoutTensor[IDX_DT, Layout.row_major(ROWS)](
-            self.idx_sp.value()
-        )
+        var size_lt = tile[1](self.size_dev.value())
+        var pos_lt = tile[1](self.pos_dev.value())
+        var off_lt = tile[1](self.samp_off.value())
+        var is_lt = tile[ROWS](self.idx_s.value())
+        var isp_lt = tile[ROWS](self.idx_sp.value())
         comptime nb = _blocks(ROWS)
         c.enqueue_function[ring_indices_kernel[ROWS, Self.CAP, Self.LANES]](
             is_lt, size_lt, pos_lt,
@@ -889,9 +961,9 @@ struct FBOnlineAgent[
         )
         # the STORED head; the derived tail follows below
         c.enqueue_function[
-            gather_rows_into_kernel[Self.STORE_OBS, Self.OBS, ROWS]
+            gather_rows_into_kernel[Self.STORE_OBS, Self.OBS, ROWS, Self.RING_DT]
         ](
-            mptr(self.r_obs.dev.value().unsafe_ptr()), ip_s,
+            self.ring_obs_ptr(), ip_s,
             mptr(self.t.bs.dev.value().unsafe_ptr()).unsafe_offset(row0 * Self.OBS),
             grid_dim=_blocks(ROWS * Self.STORE_OBS), block_dim=TPB,
         )
@@ -901,21 +973,21 @@ struct FBOnlineAgent[
             grid_dim=_blocks(ROWS * Self.ACT), block_dim=TPB,
         )
         c.enqueue_function[
-            gather_rows_into_kernel[Self.STORE_OBS, Self.OBS, ROWS]
+            gather_rows_into_kernel[Self.STORE_OBS, Self.OBS, ROWS, Self.RING_DT]
         ](
-            mptr(self.r_obs.dev.value().unsafe_ptr()), ip_sn,
+            self.ring_obs_ptr(), ip_sn,
             mptr(self.t.bsn.dev.value().unsafe_ptr()).unsafe_offset(row0 * Self.OBS),
             grid_dim=_blocks(ROWS * Self.STORE_OBS), block_dim=TPB,
         )
-        c.enqueue_function[gather_rows_kernel[Self.D, ROWS]](
-            mptr(self.r_z.dev.value().unsafe_ptr()), ip_s,
+        c.enqueue_function[gather_rows_kernel[Self.D, ROWS, Self.RING_DT]](
+            self.ring_z_ptr(), ip_s,
             mptr(self.t.bz.dev.value().unsafe_ptr()).unsafe_offset(row0 * Self.D),
             grid_dim=_blocks(ROWS * Self.D), block_dim=TPB,
         )
         c.enqueue_function[
-            gather_rows_into_kernel[Self.STORE_OBS, Self.OBS, ROWS]
+            gather_rows_into_kernel[Self.STORE_OBS, Self.OBS, ROWS, Self.RING_DT]
         ](
-            mptr(self.r_obs.dev.value().unsafe_ptr()), ip_sp,
+            self.ring_obs_ptr(), ip_sp,
             mptr(self.t.bsp.dev.value().unsafe_ptr()).unsafe_offset(row0 * Self.OBS),
             grid_dim=_blocks(ROWS * Self.STORE_OBS), block_dim=TPB,
         )
@@ -928,12 +1000,12 @@ struct FBOnlineAgent[
         # someone widens a filter.
         comptime if Self.DERIVED_TAIL > 0:
             var sp = self.tail_spec.value().unsafe_ptr()
-            var ro = mptr(self.r_obs.dev.value().unsafe_ptr())
+            var ro = self.ring_obs_ptr()
             var ra = mptr(self.r_act.dev.value().unsafe_ptr())
             var rg = mptr(self.r_age.dev.value().unsafe_ptr())
             comptime TK = derive_tail_kernel[
                 ROWS, Self.CAP, Self.LANES, Self.STORE_OBS, Self.ACT,
-                Self.DERIVED_TAIL, Self.OBS,
+                Self.DERIVED_TAIL, Self.OBS, Self.RING_DT,
             ]
             comptime nbt = _blocks(ROWS * Self.DERIVED_TAIL)
             c.enqueue_function[TK](
@@ -974,14 +1046,10 @@ struct FBOnlineAgent[
         )
         comptime E = Self.EXPERT_ROWS
         var c = self.ctx.value()
-        var size_lt = LayoutTensor[DType.int32, Layout.row_major(1)](
-            self.exp_size_dev.value()
-        )
-        var off_lt = LayoutTensor[DType.uint64, Layout.row_major(1)](
-            self.samp_off.value()
-        )
-        var ie_lt = LayoutTensor[IDX_DT, Layout.row_major(E)](self.idx_e.value())
-        var iesp_lt = LayoutTensor[IDX_DT, Layout.row_major(E)](self.idx_esp.value())
+        var size_lt = tile[1](self.exp_size_dev.value())
+        var off_lt = tile[1](self.samp_off.value())
+        var ie_lt = tile[E](self.idx_e.value())
+        var iesp_lt = tile[E](self.idx_esp.value())
         comptime nb = _blocks(E)
         c.enqueue_function[_uniform_indices_dev_kernel[E]](
             ie_lt, size_lt, self._train_seed + 41, off_lt,
@@ -1040,15 +1108,20 @@ struct FBOnlineAgent[
             grid_dim=_blocks(NP), block_dim=TPB,
         )
         self._roll_off += UInt64(2 * NP)
+        # the lanes' non-uniform source: the ZBuffer, or the external pool
+        var zsrc_ptr = mptr(self.zbuf.dev.value().unsafe_ptr())
+        var fill_ptr = mptr(self.zbuf_fill.value().unsafe_ptr())
+        if self.zsrc_on:
+            zsrc_ptr = mptr(self.zsrc.dev.value().unsafe_ptr())
+            fill_ptr = mptr(self.zsrc_fill.value().unsafe_ptr())
+        var zsrc_fill = tile[1](fill_ptr)
         c.enqueue_function[
             z_lane_resample_kernel[Self.D, Self.LANES, Self.ZBUF]
         ](
             mptr(self.z_lane.dev.value().unsafe_ptr()),
             mptr(self._gauss_lane.dev.value().unsafe_ptr()),
-            mptr(self.zbuf.dev.value().unsafe_ptr()),
-            LayoutTensor[DType.int32, Layout.row_major(1)](
-                self.zbuf_fill.value()
-            ),
+            zsrc_ptr,
+            zsrc_fill,
             mptr(self._pick_lane.dev.value().unsafe_ptr()),
             Int32(self._act_iter),
             Int32(self.z_hold),
@@ -1083,6 +1156,29 @@ struct FBOnlineAgent[
         self.z_pin_mask.upload(self.ctx.value())
         self.z_pin_on = True
 
+    def enable_zsrc(mut self) raises:
+        """Switch the lanes' and the relabel's non-uniform `z` source to the
+        external pool `zsrc` (`BATCH` rows). ⚠ BEFORE any capture: the
+        captured relabel reads the pointer chosen here. The pool starts on
+        the sphere (uniform draws), so a lane or a relabel that reads it
+        before its owner's first refresh gets a uniform `z`, not zeros."""
+        var c = self.ctx.value()
+        ensure_t["gpu"](self.zsrc, Self.BATCH * Self.D, self.ctx)
+        box_muller_normal_gpu[Self.BATCH * Self.D](
+            c, mptr(self.zsrc.dev.value().unsafe_ptr()),
+            self._roll_seed + 9001, UInt64(0),
+        )
+        c.enqueue_function[project_sphere_kernel[Self.D, Self.BATCH]](
+            mptr(self.zsrc.dev.value().unsafe_ptr()),
+            Scalar[DT](sqrt(Float64(Self.D))),
+            grid_dim=_blocks(Self.BATCH), block_dim=TPB,
+        )
+        var f = c.enqueue_create_buffer[DType.int32](1)
+        f.enqueue_fill(Int32(Self.BATCH))
+        self.zsrc_fill = f^
+        c.synchronize()
+        self.zsrc_on = True
+
     def _policy_into(
         mut self,
         obs_ptr: Pointer[Scalar[DT], MutAnyOrigin],
@@ -1090,6 +1186,30 @@ struct FBOnlineAgent[
         std: Float64,
     ) raises:
         """`action = clamp(pi_z(obs, z_lane) + std·n) · scale` for all lanes."""
+        self._policy_into_z(
+            obs_ptr, mptr(self.z_lane.dev.value().unsafe_ptr()), action_ptr, std
+        )
+
+    def policy_with_z(
+        mut self,
+        obs_ptr: Pointer[Scalar[DT], MutAnyOrigin],
+        z_ptr: Pointer[Scalar[DT], MutAnyOrigin],
+        action_ptr: Pointer[Scalar[DT], MutAnyOrigin],
+    ) raises:
+        """Greedy `pi(obs, z)` for `LANES` rows under a CALLER's z (`LANES·D`
+        device floats), for an eval env of the same width: the lanes' own z
+        and RNG offsets are untouched, so an eval between training steps
+        leaves the rollout exactly where it was. Raw obs; the normaliser
+        (if on) is applied here, as for the rollout."""
+        self._policy_into_z(obs_ptr, z_ptr, action_ptr, 0.0)
+
+    def _policy_into_z(
+        mut self,
+        obs_ptr: Pointer[Scalar[DT], MutAnyOrigin],
+        z_ptr: Pointer[Scalar[DT], MutAnyOrigin],
+        action_ptr: Pointer[Scalar[DT], MutAnyOrigin],
+        std: Float64,
+    ) raises:
         var c = self.ctx.value()
         comptime NA = Self.LANES * Self.ACT
         var src = obs_ptr
@@ -1098,7 +1218,7 @@ struct FBOnlineAgent[
             src = mptr(self._obs_scratch.dev.value().unsafe_ptr())
         c.enqueue_function[pack2_kernel[Self.OBS, Self.D, Self.LANES]](
             src,
-            mptr(self.z_lane.dev.value().unsafe_ptr()),
+            z_ptr,
             mptr(self._ain.dev.value().unsafe_ptr()),
             grid_dim=_blocks(Self.LANES * Self.A_IN), block_dim=TPB,
         )
@@ -1124,18 +1244,10 @@ struct FBOnlineAgent[
         N_ENVS: Int
     ](
         mut self,
-        obs: LayoutTensor[
-            DT, Layout.row_major(N_ENVS, Self.AGENT_OBS_DIM), MutAnyOrigin
-        ],
-        action: LayoutTensor[
-            DT, Layout.row_major(N_ENVS, Self.AGENT_ACT_DIM), MutAnyOrigin
-        ],
-        ao_scratch: LayoutTensor[
-            DT, Layout.row_major(N_ENVS, 2 * Self.AGENT_ACT_DIM), MutAnyOrigin
-        ],
-        alp_scratch: LayoutTensor[
-            DT, Layout.row_major(N_ENVS, Self.AGENT_ACT_DIM + 1), MutAnyOrigin
-        ],
+        obs: Tile[DT, N_ENVS, Self.AGENT_OBS_DIM],
+        action: Tile[DT, N_ENVS, Self.AGENT_ACT_DIM],
+        ao_scratch: Tile[DT, N_ENVS, 2 * Self.AGENT_ACT_DIM],
+        alp_scratch: Tile[DT, N_ENVS, Self.AGENT_ACT_DIM + 1],
         step_idx: Int,
     ) raises:
         comptime assert N_ENVS == Self.LANES, (
@@ -1160,15 +1272,9 @@ struct FBOnlineAgent[
     ](
         mut self,
         ctx: Optional[DeviceContext],
-        obs: LayoutTensor[
-            DT, Layout.row_major(N_ENVS, Self.AGENT_OBS_DIM), MutAnyOrigin
-        ],
-        action: LayoutTensor[
-            DT, Layout.row_major(N_ENVS, Self.AGENT_ACT_DIM), MutAnyOrigin
-        ],
-        ao_scratch: LayoutTensor[
-            DT, Layout.row_major(N_ENVS, 2 * Self.AGENT_ACT_DIM), MutAnyOrigin
-        ],
+        obs: Tile[DT, N_ENVS, Self.AGENT_OBS_DIM],
+        action: Tile[DT, N_ENVS, Self.AGENT_ACT_DIM],
+        ao_scratch: Tile[DT, N_ENVS, 2 * Self.AGENT_ACT_DIM],
     ) raises:
         """Greedy under each lane's CURRENT `z` — no noise, no resample.
         ⚠ The env reward this scores is the env's own task; FB is not trained
@@ -1272,19 +1378,20 @@ struct FBOnlineAgent[
         comptime W = Self.STORE_OBS + Self.ACT + Self.D + 3
         ctx.enqueue_function[
             ring_store_kernel[
-                Self.STORE_OBS, Self.ACT, Self.D, Self.CAP, Self.LANES
+                Self.STORE_OBS, Self.ACT, Self.D, Self.CAP, Self.LANES,
+                Self.RING_DT,
             ]
         ](
             mptr(prev_obs_dev.unsafe_ptr()),
             mptr(action_dev.unsafe_ptr()),
             mptr(done_dev.unsafe_ptr()),
             mptr(self.z_lane.dev.value().unsafe_ptr()),
-            mptr(self.r_obs.dev.value().unsafe_ptr()),
+            self.ring_obs_ptr(),
             mptr(self.r_act.dev.value().unsafe_ptr()),
             mptr(self.r_term.dev.value().unsafe_ptr()),
             mptr(self.r_bnd.dev.value().unsafe_ptr()),
             mptr(self.r_age.dev.value().unsafe_ptr()),
-            mptr(self.r_z.dev.value().unsafe_ptr()),
+            self.ring_z_ptr(),
             Int32(self.pos),
             Int32(1) if self.bnd_next else Int32(0),
             Int32(self.age_next),
@@ -1299,16 +1406,12 @@ struct FBOnlineAgent[
         # index draw reads. A host scalar baked into the graph would pin
         # sampling to the capture-time ring for the rest of the run.
         ctx.enqueue_function[_set_size_kernel](
-            LayoutTensor[DType.int32, Layout.row_major(1)](
-                self.size_dev.value()
-            ),
+            tile[1](self.size_dev.value()),
             Int32(self.size),
             grid_dim=1, block_dim=1,
         )
         ctx.enqueue_function[_set_size_kernel](
-            LayoutTensor[DType.int32, Layout.row_major(1)](
-                self.pos_dev.value()
-            ),
+            tile[1](self.pos_dev.value()),
             Int32(self.pos),
             grid_dim=1, block_dim=1,
         )
@@ -1425,9 +1528,7 @@ struct FBOnlineAgent[
         gaussian_dev_t["gpu", Self.BATCH * Self.D](
             self.gauss, self._train_seed + 5, self.rng_dev.value(), self.ctx
         )
-        var off_lt = LayoutTensor[DType.uint64, Layout.row_major(1), MutAnyOrigin](
-            mptr(self.rng_dev.value().unsafe_ptr())
-        )
+        var off_lt = tile[1](mptr(self.rng_dev.value().unsafe_ptr()))
         comptime NP = Self.BATCH * 3
         c.enqueue_function[uniform01_dev_kernel[NP]](
             mptr(self.pick.dev.value().unsafe_ptr()),
@@ -1438,10 +1539,14 @@ struct FBOnlineAgent[
             off_lt, grid_dim=1, block_dim=1
         )
         var keep_from = Int32(Self.EXPERT_ROWS) if self._expert_n > 0 else Int32(0)
+        # the non-uniform share: `B(s+)` of the batch, or the external pool
+        var goal_src = mptr(self.t.b_sp.dev.value().unsafe_ptr())
+        if self.zsrc_on:
+            goal_src = mptr(self.zsrc.dev.value().unsafe_ptr())
         c.enqueue_function[z_relabel_kernel[Self.D, Self.BATCH]](
             mptr(self.t.bz.dev.value().unsafe_ptr()),
             mptr(self.gauss.dev.value().unsafe_ptr()),
-            mptr(self.t.b_sp.dev.value().unsafe_ptr()),
+            goal_src,
             mptr(self.pick.dev.value().unsafe_ptr()),
             Scalar[DT](self.keep_frac), Scalar[DT](self.uniform_frac),
             keep_from,
@@ -1455,12 +1560,8 @@ struct FBOnlineAgent[
 
     def _push_zbuf(mut self) raises:
         var c = self.ctx.value()
-        var head = LayoutTensor[DType.int32, Layout.row_major(1)](
-            self.zbuf_head.value()
-        )
-        var fill = LayoutTensor[DType.int32, Layout.row_major(1)](
-            self.zbuf_fill.value()
-        )
+        var head = tile[1](self.zbuf_head.value())
+        var fill = tile[1](self.zbuf_fill.value())
         c.enqueue_function[zbuf_push_kernel[Self.D, Self.BATCH, Self.ZBUF]](
             mptr(self.zbuf.dev.value().unsafe_ptr()),
             mptr(self.t.bz.dev.value().unsafe_ptr()),
@@ -1480,14 +1581,14 @@ struct FBOnlineAgent[
         # mean|a| over the POLICY'S rows only — the expert rows are not its.
         comptime if Self.EXPERT_ROWS > 0:
             if self._expert_n > 0:
-                comptime lr = Layout.row_major(Self.RING_ROWS * Self.ACT)
+                comptime lr = RowMajor[Self.RING_ROWS * Self.ACT]
                 self._mean_abs_action_dev.accumulate_gpu_abs_lt[
                     Self.RING_ROWS * Self.ACT
-                ](self.t.ba.lt_at["gpu", lr](Self.EXPERT_ROWS * Self.ACT))
+                ](self.t.ba.tt_at["gpu", Self.RING_ROWS * Self.ACT](Self.EXPERT_ROWS * Self.ACT))
                 return
-        comptime lba = Layout.row_major(Self.BATCH * Self.ACT)
+        comptime lba = RowMajor[Self.BATCH * Self.ACT]
         self._mean_abs_action_dev.accumulate_gpu_abs_lt[Self.BATCH * Self.ACT](
-            self.t.ba.lt["gpu", lba]()
+            self.t.ba.tt["gpu", Self.BATCH * Self.ACT]()
         )
 
     def train_step(mut self, step_idx: Int) raises -> Bool:

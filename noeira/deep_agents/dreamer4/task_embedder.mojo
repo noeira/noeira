@@ -29,7 +29,8 @@ share a task id; same trick as the dynamics signal/step tables).
 from max.gpu import global_idx
 from max.gpu.host import DeviceContext, DeviceBuffer, HostBuffer
 from max.gpu.memory import AddressSpace
-from layout import Layout, LayoutTensor, TileTensor, row_major
+from layout import TileTensor, row_major
+from noeira.core.tiles import Tile, tile
 
 from noeira.nn.constants import DT, TPB
 from noeira.nn.core.param import Param, ParamVisitor, ParamWalkable
@@ -42,10 +43,10 @@ from noeira.nn.core.walkers import for_each_param_auto, zero_grad_auto
 def _te_embed_kernel[
     B: Int, T: Int, NAGENT: Int, D: Int, NTASK: Int
 ](
-    ids: LayoutTensor[DT, Layout.row_major(B), MutAnyOrigin],
-    table: LayoutTensor[DT, Layout.row_major(NTASK * D), MutAnyOrigin],
-    base: LayoutTensor[DT, Layout.row_major(D), MutAnyOrigin],
-    out_buf: LayoutTensor[DT, Layout.row_major(B * T * NAGENT * D), MutAnyOrigin],
+    ids: Tile[DT, B],
+    table: Tile[DT, NTASK * D],
+    base: Tile[DT, D],
+    out_buf: Tile[DT, B * T * NAGENT * D],
 ):
     comptime AG = NAGENT * D
     var e = Int(global_idx.x)
@@ -66,10 +67,8 @@ def _te_embed_kernel[
 def _te_grad_base_kernel[
     B: Int, T: Int, NAGENT: Int, D: Int
 ](
-    grad_in: LayoutTensor[
-        DT, Layout.row_major(B * T * NAGENT * D), MutAnyOrigin
-    ],
-    gbase: LayoutTensor[DT, Layout.row_major(D), MutAnyOrigin],
+    grad_in: Tile[DT, B * T * NAGENT * D],
+    gbase: Tile[DT, D],
 ):
     comptime AG = NAGENT * D
     var d = Int(global_idx.x)
@@ -89,11 +88,9 @@ def _te_grad_base_kernel[
 def _te_grad_table_kernel[
     B: Int, T: Int, NAGENT: Int, D: Int, NTASK: Int
 ](
-    grad_in: LayoutTensor[
-        DT, Layout.row_major(B * T * NAGENT * D), MutAnyOrigin
-    ],
-    ids: LayoutTensor[DT, Layout.row_major(B), MutAnyOrigin],
-    gtab: LayoutTensor[DT, Layout.row_major(NTASK * D), MutAnyOrigin],
+    grad_in: Tile[DT, B * T * NAGENT * D],
+    ids: Tile[DT, B],
+    gtab: Tile[DT, NTASK * D],
 ):
     comptime AG = NAGENT * D
     var ed = Int(global_idx.x)
@@ -203,18 +200,10 @@ struct TaskEmbedder[D: Int, NTASK: Int, NAGENT: Int](ParamWalkable):
             for b in range(B):
                 ih.unsafe_ptr()[unsafe_offset=b] = Scalar[DT](Float64(self.cache_ids[b]))
             c.enqueue_copy(self.ids_dev.value(), ih)
-            var ids_lt = LayoutTensor[DT, Layout.row_major(B), MutAnyOrigin](
-                self.ids_dev.value()
-            )
-            var tab_lt = self.task_table.val.lt[
-                "gpu", Layout.row_major(Self.NTASK * Self.D)
-            ]()
-            var base_lt = self.agent_base.val.lt[
-                "gpu", Layout.row_major(Self.D)
-            ]()
-            var out_lt = LayoutTensor[
-                DT, Layout.row_major(B * T * AG), MutAnyOrigin
-            ](dst)
+            var ids_lt = tile[B](self.ids_dev.value())
+            var tab_lt = self.task_table.val.tt["gpu", Self.NTASK * Self.D]()
+            var base_lt = self.agent_base.val.tt["gpu", Self.D]()
+            var out_lt = tile[B * T * AG](dst)
             comptime ek = _te_embed_kernel[B, T, Self.NAGENT, Self.D, Self.NTASK]
             c.enqueue_function[ek](
                 ids_lt, tab_lt, base_lt, out_lt,
@@ -249,18 +238,10 @@ struct TaskEmbedder[D: Int, NTASK: Int, NAGENT: Int](ParamWalkable):
                     gtab[idb * Self.D + d] += ge
         else:
             var c = ctx.value()
-            var gin_lt = LayoutTensor[
-                DT, Layout.row_major(B * T * AG), MutAnyOrigin
-            ](grad_in)
-            var ids_lt = LayoutTensor[DT, Layout.row_major(B), MutAnyOrigin](
-                self.ids_dev.value()
-            )
-            var gbase_lt = self.agent_base.grd.lt[
-                "gpu", Layout.row_major(Self.D)
-            ]()
-            var gtab_lt = self.task_table.grd.lt[
-                "gpu", Layout.row_major(Self.NTASK * Self.D)
-            ]()
+            var gin_lt = tile[B * T * AG](grad_in)
+            var ids_lt = tile[B](self.ids_dev.value())
+            var gbase_lt = self.agent_base.grd.tt["gpu", Self.D]()
+            var gtab_lt = self.task_table.grd.tt["gpu", Self.NTASK * Self.D]()
             comptime bk = _te_grad_base_kernel[B, T, Self.NAGENT, Self.D]
             c.enqueue_function[bk](
                 gin_lt, gbase_lt,

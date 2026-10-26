@@ -24,7 +24,6 @@ Reference: Hansen et al., 2023 — TD-MPC2.
 from std.math import exp, sqrt, cos, log
 from std.random import random_float64
 from max.gpu.host import DeviceContext, DeviceBuffer, HostBuffer
-from layout import Layout, LayoutTensor
 
 from noeira.nn.constants import DT as dtype
 
@@ -41,6 +40,7 @@ from .mppi_kernels import (
     mppi_weighted_mean_std_kernel,
     mppi_select_action_kernel,
 )
+from noeira.core.tiles import Tile, tile
 
 
 # =============================================================================
@@ -553,14 +553,8 @@ struct MPPIGPUBatched[
         mut self,
         ctx: DeviceContext,
         mut callback: CB,
-        z0_tensor: LayoutTensor[
-            dtype, Layout.row_major(Self.N_ENVS, Self.LATENT_DIM), MutAnyOrigin
-        ],
-        out_act_dev: LayoutTensor[
-            dtype,
-            Layout.row_major(Self.N_ENVS * Self.ACTION_DIM),
-            MutAnyOrigin,
-        ],
+        z0_tensor: Tile[dtype, Self.N_ENVS, Self.LATENT_DIM],
+        out_act_dev: Tile[dtype, Self.N_ENVS * Self.ACTION_DIM],
         gamma: Float64,
         temperature: Float64,
         action_scale: Float64 = 1.0,
@@ -599,46 +593,17 @@ struct MPPIGPUBatched[
         ctx.enqueue_copy(self.std_buf, self.std_host)
 
         # ── 2. LayoutTensor views over our buffers ────────────────
-        var z_tensor = LayoutTensor[
-            dtype,
-            Layout.row_major(Self.BATCH_TOTAL, Self.LATENT_DIM),
-        ](self.z_buf)
-        var z_next_tensor = LayoutTensor[
-            dtype,
-            Layout.row_major(Self.BATCH_TOTAL, Self.LATENT_DIM),
-        ](self.z_next_buf)
-        var act_step_tensor = LayoutTensor[
-            dtype,
-            Layout.row_major(Self.BATCH_TOTAL, Self.ACTION_DIM),
-        ](self.act_step_buf)
-        var all_actions_tensor = LayoutTensor[
-            dtype,
-            Layout.row_major(Self.BATCH_TOTAL * Self.HORIZON * Self.ACTION_DIM),
-        ](self.all_actions_buf)
-        var pol_action_tensor = LayoutTensor[
-            dtype,
-            Layout.row_major(Self.BATCH_TOTAL, Self.ACTION_DIM),
-        ](self.pol_action_buf)
-        var reward_step_tensor = LayoutTensor[
-            dtype, Layout.row_major(Self.BATCH_TOTAL)
-        ](self.reward_step_buf)
-        var terminal_v_tensor = LayoutTensor[
-            dtype, Layout.row_major(Self.BATCH_TOTAL)
-        ](self.terminal_v_buf)
-        var returns_tensor = LayoutTensor[
-            dtype, Layout.row_major(Self.BATCH_TOTAL)
-        ](self.returns_buf)
-        var mean_tensor = LayoutTensor[
-            dtype,
-            Layout.row_major(Self.MEAN_STD_TOTAL),
-        ](self.mean_buf)
-        var std_tensor = LayoutTensor[
-            dtype,
-            Layout.row_major(Self.MEAN_STD_TOTAL),
-        ](self.std_buf)
-        var weights_tensor = LayoutTensor[
-            dtype, Layout.row_major(Self.BATCH_TOTAL)
-        ](self.weights_buf)
+        var z_tensor = tile[Self.BATCH_TOTAL, Self.LATENT_DIM](self.z_buf)
+        var z_next_tensor = tile[Self.BATCH_TOTAL, Self.LATENT_DIM](self.z_next_buf)
+        var act_step_tensor = tile[Self.BATCH_TOTAL, Self.ACTION_DIM](self.act_step_buf)
+        var all_actions_tensor = tile[Self.BATCH_TOTAL * Self.HORIZON * Self.ACTION_DIM](self.all_actions_buf)
+        var pol_action_tensor = tile[Self.BATCH_TOTAL, Self.ACTION_DIM](self.pol_action_buf)
+        var reward_step_tensor = tile[Self.BATCH_TOTAL](self.reward_step_buf)
+        var terminal_v_tensor = tile[Self.BATCH_TOTAL](self.terminal_v_buf)
+        var returns_tensor = tile[Self.BATCH_TOTAL](self.returns_buf)
+        var mean_tensor = tile[Self.MEAN_STD_TOTAL](self.mean_buf)
+        var std_tensor = tile[Self.MEAN_STD_TOTAL](self.std_buf)
+        var weights_tensor = tile[Self.BATCH_TOTAL](self.weights_buf)
 
         # ── 3. Main MPPI iterations ──────────────────────────────
         # `num_iters` overrides `NUM_ITERATIONS` at RUNTIME (0 = use the
@@ -744,48 +709,18 @@ def _run_mppi_iteration[
 ](
     ctx: DeviceContext,
     mut callback: CB,
-    z0_tensor: LayoutTensor[
-        dtype, Layout.row_major(N_ENVS, LATENT_DIM), MutAnyOrigin
-    ],
-    z_tensor: LayoutTensor[
-        dtype, Layout.row_major(BATCH_TOTAL, LATENT_DIM), MutAnyOrigin
-    ],
-    z_next_tensor: LayoutTensor[
-        dtype, Layout.row_major(BATCH_TOTAL, LATENT_DIM), MutAnyOrigin
-    ],
-    act_step_tensor: LayoutTensor[
-        dtype, Layout.row_major(BATCH_TOTAL, ACTION_DIM), MutAnyOrigin
-    ],
-    all_actions_tensor: LayoutTensor[
-        dtype,
-        Layout.row_major(BATCH_TOTAL * HORIZON * ACTION_DIM),
-        MutAnyOrigin,
-    ],
-    pol_action_tensor: LayoutTensor[
-        dtype, Layout.row_major(BATCH_TOTAL, ACTION_DIM), MutAnyOrigin
-    ],
-    reward_step_tensor: LayoutTensor[
-        dtype, Layout.row_major(BATCH_TOTAL), MutAnyOrigin
-    ],
-    terminal_v_tensor: LayoutTensor[
-        dtype, Layout.row_major(BATCH_TOTAL), MutAnyOrigin
-    ],
-    returns_tensor: LayoutTensor[
-        dtype, Layout.row_major(BATCH_TOTAL), MutAnyOrigin
-    ],
-    mean_tensor: LayoutTensor[
-        dtype,
-        Layout.row_major(N_ENVS * HORIZON * ACTION_DIM),
-        MutAnyOrigin,
-    ],
-    std_tensor: LayoutTensor[
-        dtype,
-        Layout.row_major(N_ENVS * HORIZON * ACTION_DIM),
-        MutAnyOrigin,
-    ],
-    weights_tensor: LayoutTensor[
-        dtype, Layout.row_major(BATCH_TOTAL), MutAnyOrigin
-    ],
+    z0_tensor: Tile[dtype, N_ENVS, LATENT_DIM],
+    z_tensor: Tile[dtype, BATCH_TOTAL, LATENT_DIM],
+    z_next_tensor: Tile[dtype, BATCH_TOTAL, LATENT_DIM],
+    act_step_tensor: Tile[dtype, BATCH_TOTAL, ACTION_DIM],
+    all_actions_tensor: Tile[dtype, BATCH_TOTAL * HORIZON * ACTION_DIM],
+    pol_action_tensor: Tile[dtype, BATCH_TOTAL, ACTION_DIM],
+    reward_step_tensor: Tile[dtype, BATCH_TOTAL],
+    terminal_v_tensor: Tile[dtype, BATCH_TOTAL],
+    returns_tensor: Tile[dtype, BATCH_TOTAL],
+    mean_tensor: Tile[dtype, N_ENVS * HORIZON * ACTION_DIM],
+    std_tensor: Tile[dtype, N_ENVS * HORIZON * ACTION_DIM],
+    weights_tensor: Tile[dtype, BATCH_TOTAL],
     gamma_scalar: Scalar[dtype],
     temp_scalar: Scalar[dtype],
     rng_seed: UInt32,
@@ -840,12 +775,8 @@ def _run_mppi_iteration[
     # comptime params and the trait's comptime params are
     # syntactically distinct). Same in-memory representation, so we
     # rebind once and reuse the CB-typed views across the loop.
-    comptime CBZTy = LayoutTensor[
-        dtype, Layout.row_major(BATCH_TOTAL, CB.LATENT_DIM), MutAnyOrigin
-    ]
-    comptime CBATy = LayoutTensor[
-        dtype, Layout.row_major(BATCH_TOTAL, CB.ACTION_DIM), MutAnyOrigin
-    ]
+    comptime CBZTy = Tile[dtype, BATCH_TOTAL, CB.LATENT_DIM]
+    comptime CBATy = Tile[dtype, BATCH_TOTAL, CB.ACTION_DIM]
     var z_cb = rebind[CBZTy](z_tensor)
     var z_next_cb = rebind[CBZTy](z_next_tensor)
     var act_step_cb = rebind[CBATy](act_step_tensor)

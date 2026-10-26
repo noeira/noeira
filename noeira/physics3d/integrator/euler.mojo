@@ -23,7 +23,8 @@ each stage is independently gated; fusion is a later NVIDIA perf lever."""
 from max.gpu import thread_idx, block_idx, block_dim
 from max.gpu.host import DeviceContext
 from max.gpu.sync import barrier
-from layout import Layout, LayoutTensor
+from layout import TileTensor, TensorLayout
+from noeira.core.tiles import RowMajor, Tile
 
 from std.math import sqrt
 from ..kinematics.quat_math import quat_integrate, quat_normalize, atan2_device
@@ -116,14 +117,12 @@ comptime _EULER_PROBE: Bool = False
 def _armature_env[
     DTYPE: DType,
     D: DimsLike,
-    L_JOINTS: Layout,
-    L_M: Layout](
+    L_JOINTS: TensorLayout,
+    L_M: TensorLayout](
     env: Int,
     dims: D,
-    joints: LayoutTensor[
-        DTYPE, L_JOINTS, MutAnyOrigin
-    ],
-    M: LayoutTensor[DTYPE, L_M, MutAnyOrigin],
+    joints: TileTensor[DTYPE, L_JOINTS, MutAnyOrigin],
+    M: TileTensor[DTYPE, L_M, MutAnyOrigin],
 ):
     var nv = dims.get_nv()
     var njoint = dims.get_njoint()
@@ -148,19 +147,17 @@ def _armature_env[
 def _fnet_passive_env[
     DTYPE: DType,
     D: DimsLike,
-    L_QPOS: Layout,
-    L_QVEL: Layout,
-    L_JOINTS: Layout](
+    L_QPOS: TensorLayout,
+    L_QVEL: TensorLayout,
+    L_JOINTS: TensorLayout](
     env: Int,
     dims: D,
-    qpos: LayoutTensor[DTYPE, L_QPOS, MutAnyOrigin],
-    qvel: LayoutTensor[DTYPE, L_QVEL, MutAnyOrigin],
-    qfrc: LayoutTensor[DTYPE, L_QVEL, MutAnyOrigin],
-    joints: LayoutTensor[
-        DTYPE, L_JOINTS, MutAnyOrigin
-    ],
-    bias: LayoutTensor[DTYPE, L_QVEL, MutAnyOrigin],
-    fnet: LayoutTensor[DTYPE, L_QVEL, MutAnyOrigin],
+    qpos: TileTensor[DTYPE, L_QPOS, MutAnyOrigin],
+    qvel: TileTensor[DTYPE, L_QVEL, MutAnyOrigin],
+    qfrc: TileTensor[DTYPE, L_QVEL, MutAnyOrigin],
+    joints: TileTensor[DTYPE, L_JOINTS, MutAnyOrigin],
+    bias: TileTensor[DTYPE, L_QVEL, MutAnyOrigin],
+    fnet: TileTensor[DTYPE, L_QVEL, MutAnyOrigin],
 ):
     var nv = dims.get_nv()
     var njoint = dims.get_njoint()
@@ -260,14 +257,12 @@ def _fnet_passive_env[
 def _qacc_writeback_env[
     DTYPE: DType,
     D: DimsLike,
-    L_QACC_WS: Layout](
+    L_QACC_WS: TensorLayout](
     env: Int,
     dims: D,
-    qacc_ws: LayoutTensor[DTYPE, L_QACC_WS, MutAnyOrigin],
-    qacc: LayoutTensor[DTYPE, L_QACC_WS, MutAnyOrigin],
-    qacc_constrained: LayoutTensor[
-        DTYPE, L_QACC_WS, MutAnyOrigin
-    ],
+    qacc_ws: TileTensor[DTYPE, L_QACC_WS, MutAnyOrigin],
+    qacc: TileTensor[DTYPE, L_QACC_WS, MutAnyOrigin],
+    qacc_constrained: TileTensor[DTYPE, L_QACC_WS, MutAnyOrigin],
 ):
     var nv = dims.get_nv()
     for i in range(nv):
@@ -287,18 +282,18 @@ def _qacc_writeback_env[
 def _finalize_integrate_env[
     DTYPE: DType,
     DIMS: DimsLike,
-    L_QPOS: Layout,
-    L_QVEL: Layout,
-    L_JOINTS: Layout,
+    L_QPOS: TensorLayout,
+    L_QVEL: TensorLayout,
+    L_JOINTS: TensorLayout,
 ](
     env: Int,
     dt: Scalar[DTYPE],
     dims: DIMS,
-    qpos: LayoutTensor[DTYPE, L_QPOS, MutAnyOrigin],
-    qvel: LayoutTensor[DTYPE, L_QVEL, MutAnyOrigin],
-    qacc: LayoutTensor[DTYPE, L_QVEL, MutAnyOrigin],
-    joints: LayoutTensor[DTYPE, L_JOINTS, MutAnyOrigin],
-    qacc_ws: LayoutTensor[DTYPE, L_QVEL, MutAnyOrigin],
+    qpos: TileTensor[DTYPE, L_QPOS, MutAnyOrigin],
+    qvel: TileTensor[DTYPE, L_QVEL, MutAnyOrigin],
+    qacc: TileTensor[DTYPE, L_QVEL, MutAnyOrigin],
+    joints: TileTensor[DTYPE, L_JOINTS, MutAnyOrigin],
+    qacc_ws: TileTensor[DTYPE, L_QVEL, MutAnyOrigin],
 ):
     var nv = dims.get_nv()
     var njoint = dims.get_njoint()
@@ -397,14 +392,14 @@ def _finalize_integrate_env[
 def _finalize_damping_env[
     DTYPE: DType,
     DIMS: DimsLike,
-    L_JOINTS: Layout,
-    L_M: Layout,
+    L_JOINTS: TensorLayout,
+    L_M: TensorLayout,
 ](
     env: Int,
     dt: Scalar[DTYPE],
     dims: DIMS,
-    joints: LayoutTensor[DTYPE, L_JOINTS, MutAnyOrigin],
-    M: LayoutTensor[DTYPE, L_M, MutAnyOrigin],
+    joints: TileTensor[DTYPE, L_JOINTS, MutAnyOrigin],
+    M: TileTensor[DTYPE, L_M, MutAnyOrigin],
 ):
     """`M_hat = M + dt * diag(damping)`, in place — `mj_Euler`'s implicit
     damping (engine_forward.c, `eulerdamp`). ONE spelling, shared by the dense
@@ -444,26 +439,26 @@ def _finalize_damping_env[
 def _finalize_tree_env[
     DTYPE: DType,
     DIMS: DimsLike,
-    L_QPOS: Layout,
-    L_QVEL: Layout,
-    L_JOINTS: Layout,
-    L_M: Layout,
-    L_P: Layout,
+    L_QPOS: TensorLayout,
+    L_QVEL: TensorLayout,
+    L_JOINTS: TensorLayout,
+    L_M: TensorLayout,
+    L_P: TensorLayout,
 ](
     env: Int,
     dt: Scalar[DTYPE],
     dims: DIMS,
-    qpos: LayoutTensor[DTYPE, L_QPOS, MutAnyOrigin],
-    qvel: LayoutTensor[DTYPE, L_QVEL, MutAnyOrigin],
-    qacc: LayoutTensor[DTYPE, L_QVEL, MutAnyOrigin],
-    joints: LayoutTensor[DTYPE, L_JOINTS, MutAnyOrigin],
-    M: LayoutTensor[DTYPE, L_M, MutAnyOrigin],
-    L: LayoutTensor[DTYPE, L_M, MutAnyOrigin],
-    D: LayoutTensor[DTYPE, L_QVEL, MutAnyOrigin],
-    fnet: LayoutTensor[DTYPE, L_QVEL, MutAnyOrigin],
-    qacc_ws: LayoutTensor[DTYPE, L_QVEL, MutAnyOrigin],
-    qacc_constrained: LayoutTensor[DTYPE, L_QVEL, MutAnyOrigin],
-    dofp: LayoutTensor[DTYPE, L_P, MutAnyOrigin],
+    qpos: TileTensor[DTYPE, L_QPOS, MutAnyOrigin],
+    qvel: TileTensor[DTYPE, L_QVEL, MutAnyOrigin],
+    qacc: TileTensor[DTYPE, L_QVEL, MutAnyOrigin],
+    joints: TileTensor[DTYPE, L_JOINTS, MutAnyOrigin],
+    M: TileTensor[DTYPE, L_M, MutAnyOrigin],
+    L: TileTensor[DTYPE, L_M, MutAnyOrigin],
+    D: TileTensor[DTYPE, L_QVEL, MutAnyOrigin],
+    fnet: TileTensor[DTYPE, L_QVEL, MutAnyOrigin],
+    qacc_ws: TileTensor[DTYPE, L_QVEL, MutAnyOrigin],
+    qacc_constrained: TileTensor[DTYPE, L_QVEL, MutAnyOrigin],
+    dofp: TileTensor[DTYPE, L_P, MutAnyOrigin],
     eulerdamp_off: Bool,
 ):
     """`_finalize_env` on the tree-ordered LDL (CPU, `NTREE > 0`).
@@ -532,34 +527,30 @@ def _finalize_tree_env[
 def _finalize_env[
     DTYPE: DType,
     DIMS: DimsLike,
-    L_QPOS: Layout,
-    L_QVEL: Layout,
-    L_JOINTS: Layout,
-    L_M: Layout,
-    L_TREE: Layout](
+    L_QPOS: TensorLayout,
+    L_QVEL: TensorLayout,
+    L_JOINTS: TensorLayout,
+    L_M: TensorLayout,
+    L_TREE: TensorLayout](
     env: Int,
     dt: Scalar[DTYPE],
     dims: DIMS,
-    qpos: LayoutTensor[DTYPE, L_QPOS, MutAnyOrigin],
-    qvel: LayoutTensor[DTYPE, L_QVEL, MutAnyOrigin],
-    qacc: LayoutTensor[DTYPE, L_QVEL, MutAnyOrigin],
-    joints: LayoutTensor[
-        DTYPE, L_JOINTS, MutAnyOrigin
-    ],
-    M: LayoutTensor[DTYPE, L_M, MutAnyOrigin],
-    L: LayoutTensor[DTYPE, L_M, MutAnyOrigin],
-    D: LayoutTensor[DTYPE, L_QVEL, MutAnyOrigin],
-    fnet: LayoutTensor[DTYPE, L_QVEL, MutAnyOrigin],
-    qacc_ws: LayoutTensor[DTYPE, L_QVEL, MutAnyOrigin],
-    qacc_constrained: LayoutTensor[
-        DTYPE, L_QVEL, MutAnyOrigin
-    ],
+    qpos: TileTensor[DTYPE, L_QPOS, MutAnyOrigin],
+    qvel: TileTensor[DTYPE, L_QVEL, MutAnyOrigin],
+    qacc: TileTensor[DTYPE, L_QVEL, MutAnyOrigin],
+    joints: TileTensor[DTYPE, L_JOINTS, MutAnyOrigin],
+    M: TileTensor[DTYPE, L_M, MutAnyOrigin],
+    L: TileTensor[DTYPE, L_M, MutAnyOrigin],
+    D: TileTensor[DTYPE, L_QVEL, MutAnyOrigin],
+    fnet: TileTensor[DTYPE, L_QVEL, MutAnyOrigin],
+    qacc_ws: TileTensor[DTYPE, L_QVEL, MutAnyOrigin],
+    qacc_constrained: TileTensor[DTYPE, L_QVEL, MutAnyOrigin],
     # ⚠ M's DIAGONAL BLOCKS, for the `M_hat` re-factorisation below. Threaded
     # and not yet read — see `dynamics/ldl.mojo`'s header. ⚠⚠ NOTE THIS IS A
     # SECOND DENSE LDL PER STEP, distinct from the `ldl_factor` in `step`:
     # `M_hat = M + dt*diag(damping)` adds to the DIAGONAL only, so it has the
     # same block structure and the same O(nv^3) cost.
-    trees: LayoutTensor[DTYPE, L_TREE, MutAnyOrigin],
+    trees: TileTensor[DTYPE, L_TREE, MutAnyOrigin],
     # ⚠⚠ `<option><flag eulerdamp="disable"/></option>` — mjDSBL_EULERDAMP.
     # `mj_EulerSkip` puts its ENTIRE damping scan behind this flag and, when
     # it is set, integrates velocity explicitly: `qvel += h * qacc`, with the
@@ -606,10 +597,8 @@ def _finalize_env[
 def _armature_kernel[
     DTYPE: DType, NV: Int, NJOINT: Int, BATCH: Int
 ](
-    joints: LayoutTensor[
-        DTYPE, Layout.row_major(NJOINT, MODEL_JOINT_SIZE), MutAnyOrigin
-    ],
-    M: LayoutTensor[DTYPE, Layout.row_major(BATCH, NV * NV), MutAnyOrigin],
+    joints: Tile[DTYPE, NJOINT, MODEL_JOINT_SIZE],
+    M: Tile[DTYPE, BATCH, NV * NV],
 ):
     var env = Int(block_dim.x * block_idx.x + thread_idx.x)
     if env >= BATCH:
@@ -620,14 +609,12 @@ def _armature_kernel[
 def _fnet_passive_kernel[
     DTYPE: DType, NQ: Int, NV: Int, NJOINT: Int, BATCH: Int
 ](
-    qpos: LayoutTensor[DTYPE, Layout.row_major(BATCH, NQ), MutAnyOrigin],
-    qvel: LayoutTensor[DTYPE, Layout.row_major(BATCH, NV), MutAnyOrigin],
-    qfrc: LayoutTensor[DTYPE, Layout.row_major(BATCH, NV), MutAnyOrigin],
-    joints: LayoutTensor[
-        DTYPE, Layout.row_major(NJOINT, MODEL_JOINT_SIZE), MutAnyOrigin
-    ],
-    bias: LayoutTensor[DTYPE, Layout.row_major(BATCH, NV), MutAnyOrigin],
-    fnet: LayoutTensor[DTYPE, Layout.row_major(BATCH, NV), MutAnyOrigin],
+    qpos: Tile[DTYPE, BATCH, NQ],
+    qvel: Tile[DTYPE, BATCH, NV],
+    qfrc: Tile[DTYPE, BATCH, NV],
+    joints: Tile[DTYPE, NJOINT, MODEL_JOINT_SIZE],
+    bias: Tile[DTYPE, BATCH, NV],
+    fnet: Tile[DTYPE, BATCH, NV],
 ):
     var env = Int(block_dim.x * block_idx.x + thread_idx.x)
     if env >= BATCH:
@@ -640,11 +627,9 @@ def _fnet_passive_kernel[
 def _qacc_writeback_kernel[
     DTYPE: DType, NV: Int, BATCH: Int
 ](
-    qacc_ws: LayoutTensor[DTYPE, Layout.row_major(BATCH, NV), MutAnyOrigin],
-    qacc: LayoutTensor[DTYPE, Layout.row_major(BATCH, NV), MutAnyOrigin],
-    qacc_constrained: LayoutTensor[
-        DTYPE, Layout.row_major(BATCH, NV), MutAnyOrigin
-    ],
+    qacc_ws: Tile[DTYPE, BATCH, NV],
+    qacc: Tile[DTYPE, BATCH, NV],
+    qacc_constrained: Tile[DTYPE, BATCH, NV],
 ):
     var env = Int(block_dim.x * block_idx.x + thread_idx.x)
     if env >= BATCH:
@@ -658,23 +643,17 @@ def _finalize_kernel[
     DTYPE: DType, NQ: Int, NV: Int, NJOINT: Int, BATCH: Int
 ](
     dt: Scalar[DTYPE],
-    qpos: LayoutTensor[DTYPE, Layout.row_major(BATCH, NQ), MutAnyOrigin],
-    qvel: LayoutTensor[DTYPE, Layout.row_major(BATCH, NV), MutAnyOrigin],
-    qacc: LayoutTensor[DTYPE, Layout.row_major(BATCH, NV), MutAnyOrigin],
-    joints: LayoutTensor[
-        DTYPE, Layout.row_major(NJOINT, MODEL_JOINT_SIZE), MutAnyOrigin
-    ],
-    M: LayoutTensor[DTYPE, Layout.row_major(BATCH, NV * NV), MutAnyOrigin],
-    L: LayoutTensor[DTYPE, Layout.row_major(BATCH, NV * NV), MutAnyOrigin],
-    D: LayoutTensor[DTYPE, Layout.row_major(BATCH, NV), MutAnyOrigin],
-    fnet: LayoutTensor[DTYPE, Layout.row_major(BATCH, NV), MutAnyOrigin],
-    qacc_ws: LayoutTensor[DTYPE, Layout.row_major(BATCH, NV), MutAnyOrigin],
-    qacc_constrained: LayoutTensor[
-        DTYPE, Layout.row_major(BATCH, NV), MutAnyOrigin
-    ],
-    trees: LayoutTensor[
-        DTYPE, Layout.row_major(NV * MODEL_TREE_SIZE), MutAnyOrigin
-    ],
+    qpos: Tile[DTYPE, BATCH, NQ],
+    qvel: Tile[DTYPE, BATCH, NV],
+    qacc: Tile[DTYPE, BATCH, NV],
+    joints: Tile[DTYPE, NJOINT, MODEL_JOINT_SIZE],
+    M: Tile[DTYPE, BATCH, NV * NV],
+    L: Tile[DTYPE, BATCH, NV * NV],
+    D: Tile[DTYPE, BATCH, NV],
+    fnet: Tile[DTYPE, BATCH, NV],
+    qacc_ws: Tile[DTYPE, BATCH, NV],
+    qacc_constrained: Tile[DTYPE, BATCH, NV],
+    trees: Tile[DTYPE, NV * MODEL_TREE_SIZE],
     # ⚠ A SCALAR, NOT A `Bool`, so the launch does not need a second
     # argument kind — every other model constant reaching a kernel here
     # arrives the same way.
@@ -713,14 +692,10 @@ def _finalize_rhs_kernel[
     DTYPE: DType, NV: Int, NJOINT: Int, BATCH: Int
 ](
     dt: Scalar[DTYPE],
-    joints: LayoutTensor[
-        DTYPE, Layout.row_major(NJOINT, MODEL_JOINT_SIZE), MutAnyOrigin
-    ],
-    M: LayoutTensor[DTYPE, Layout.row_major(BATCH, NV * NV), MutAnyOrigin],
-    fnet: LayoutTensor[DTYPE, Layout.row_major(BATCH, NV), MutAnyOrigin],
-    qacc_constrained: LayoutTensor[
-        DTYPE, Layout.row_major(BATCH, NV), MutAnyOrigin
-    ],
+    joints: Tile[DTYPE, NJOINT, MODEL_JOINT_SIZE],
+    M: Tile[DTYPE, BATCH, NV * NV],
+    fnet: Tile[DTYPE, BATCH, NV],
+    qacc_constrained: Tile[DTYPE, BATCH, NV],
 ):
     """One block per env, `NV` threads: `fnet = M * qacc_constrained` one row
     per thread (the dense path's ascending sum, so the same bits), then
@@ -772,16 +747,12 @@ def _finalize_integrate_kernel[
     DTYPE: DType, NQ: Int, NV: Int, NJOINT: Int, BATCH: Int
 ](
     dt: Scalar[DTYPE],
-    qpos: LayoutTensor[DTYPE, Layout.row_major(BATCH, NQ), MutAnyOrigin],
-    qvel: LayoutTensor[DTYPE, Layout.row_major(BATCH, NV), MutAnyOrigin],
-    qacc: LayoutTensor[DTYPE, Layout.row_major(BATCH, NV), MutAnyOrigin],
-    joints: LayoutTensor[
-        DTYPE, Layout.row_major(NJOINT, MODEL_JOINT_SIZE), MutAnyOrigin
-    ],
-    qacc_ws: LayoutTensor[DTYPE, Layout.row_major(BATCH, NV), MutAnyOrigin],
-    qacc_constrained: LayoutTensor[
-        DTYPE, Layout.row_major(BATCH, NV), MutAnyOrigin
-    ],
+    qpos: Tile[DTYPE, BATCH, NQ],
+    qvel: Tile[DTYPE, BATCH, NV],
+    qacc: Tile[DTYPE, BATCH, NV],
+    joints: Tile[DTYPE, NJOINT, MODEL_JOINT_SIZE],
+    qacc_ws: Tile[DTYPE, BATCH, NV],
+    qacc_constrained: Tile[DTYPE, BATCH, NV],
     # 1 = `eulerdamp` disabled: integrate the constrained acceleration as is,
     # as `_finalize_env`'s first branch does.
     use_constrained: Scalar[DTYPE],
@@ -976,19 +947,19 @@ struct EulerIntegrator[
             _e_crba += _e_now - _e_last
             _e_last = _e_now
 
-        comptime L_JOINT = Layout.row_major(Self.D.NJOINT, MODEL_JOINT_SIZE)
-        comptime L_M = Layout.row_major(Self.BATCH, Self.D.NV * Self.D.NV)
-        comptime L_TREE = Layout.row_major(Self.D.NV * MODEL_TREE_SIZE)
-        comptime L_NV = Layout.row_major(Self.BATCH, Self.D.NV)
-        comptime L_QPOS = Layout.row_major(Self.BATCH, Self.D.NQ)
+        comptime L_JOINT = RowMajor[Self.D.NJOINT, MODEL_JOINT_SIZE]
+        comptime L_M = RowMajor[Self.BATCH, Self.D.NV * Self.D.NV]
+        comptime L_TREE = RowMajor[Self.D.NV * MODEL_TREE_SIZE]
+        comptime L_NV = RowMajor[Self.BATCH, Self.D.NV]
+        comptime L_QPOS = RowMajor[Self.BATCH, Self.D.NQ]
         comptime BLOCKS = (Self.BATCH + EU_TPB - 1) // EU_TPB
 
         comptime if target == "cpu":
             var dm = d.dims
             var rl_JOINT = rl2(dm.get_njoint(), MODEL_JOINT_SIZE)
             var rl_M = rl2(Self.BATCH, dm.get_nv() * dm.get_nv())
-            var joints_v = m.joints.lt_dyn["cpu", DYN2](rl_JOINT)
-            var M_v = self.scratch.M.lt_dyn["cpu", DYN2](rl_M)
+            var joints_v = m.joints.tt_dyn["cpu", DYN2](rl_JOINT)
+            var M_v = self.scratch.M.tt_dyn["cpu", DYN2](rl_M)
             for e in range(Self.BATCH):
                 _armature_env[
                     Self.DTYPE](e, dm, joints_v, M_v)
@@ -996,8 +967,8 @@ struct EulerIntegrator[
             ctx.value().enqueue_function[
                 _armature_kernel[Self.DTYPE, Self.D.NV, Self.D.NJOINT, Self.BATCH]
             ](
-                m.joints.lt["gpu", L_JOINT](),
-                self.scratch.M.lt["gpu", L_M](),
+                m.joints.tt["gpu", Self.D.NJOINT, MODEL_JOINT_SIZE](),
+                self.scratch.M.tt["gpu", Self.BATCH, Self.D.NV * Self.D.NV](),
                 grid_dim=(BLOCKS,),
                 block_dim=(EU_TPB,),
             )
@@ -1057,12 +1028,12 @@ struct EulerIntegrator[
             var rl_QPOS = rl2(Self.BATCH, dm.get_nq())
             var rl_NV = rl2(Self.BATCH, dm.get_nv())
             var rl_JOINT = rl2(dm.get_njoint(), MODEL_JOINT_SIZE)
-            var qpos_v = d.qpos.lt_dyn["cpu", DYN2](rl_QPOS)
-            var qvel_v = d.qvel.lt_dyn["cpu", DYN2](rl_NV)
-            var qfrc_v = d.qfrc.lt_dyn["cpu", DYN2](rl_NV)
-            var joints_v2 = m.joints.lt_dyn["cpu", DYN2](rl_JOINT)
-            var bias_v = self.scratch.bias.lt_dyn["cpu", DYN2](rl_NV)
-            var fnet_v = self.scratch.fnet.lt_dyn["cpu", DYN2](rl_NV)
+            var qpos_v = d.qpos.tt_dyn["cpu", DYN2](rl_QPOS)
+            var qvel_v = d.qvel.tt_dyn["cpu", DYN2](rl_NV)
+            var qfrc_v = d.qfrc.tt_dyn["cpu", DYN2](rl_NV)
+            var joints_v2 = m.joints.tt_dyn["cpu", DYN2](rl_JOINT)
+            var bias_v = self.scratch.bias.tt_dyn["cpu", DYN2](rl_NV)
+            var fnet_v = self.scratch.fnet.tt_dyn["cpu", DYN2](rl_NV)
             for e in range(Self.BATCH):
                 _fnet_passive_env[
                     Self.DTYPE](e, dm, qpos_v, qvel_v, qfrc_v, joints_v2, bias_v, fnet_v)
@@ -1072,12 +1043,12 @@ struct EulerIntegrator[
                     Self.DTYPE, Self.D.NQ, Self.D.NV, Self.D.NJOINT, Self.BATCH
                 ]
             ](
-                d.qpos.lt["gpu", L_QPOS](),
-                d.qvel.lt["gpu", L_NV](),
-                d.qfrc.lt["gpu", L_NV](),
-                m.joints.lt["gpu", L_JOINT](),
-                self.scratch.bias.lt["gpu", L_NV](),
-                self.scratch.fnet.lt["gpu", L_NV](),
+                d.qpos.tt["gpu", Self.BATCH, Self.D.NQ](),
+                d.qvel.tt["gpu", Self.BATCH, Self.D.NV](),
+                d.qfrc.tt["gpu", Self.BATCH, Self.D.NV](),
+                m.joints.tt["gpu", Self.D.NJOINT, MODEL_JOINT_SIZE](),
+                self.scratch.bias.tt["gpu", Self.BATCH, Self.D.NV](),
+                self.scratch.fnet.tt["gpu", Self.BATCH, Self.D.NV](),
                 grid_dim=(BLOCKS,),
                 block_dim=(EU_TPB,),
             )
@@ -1103,9 +1074,9 @@ struct EulerIntegrator[
         comptime if target == "cpu":
             var dm = d.dims
             var rl_NV = rl2(Self.BATCH, dm.get_nv())
-            var qacc_ws_v = self.scratch.qacc_ws.lt_dyn["cpu", DYN2](rl_NV)
-            var qacc_v = d.qacc.lt_dyn["cpu", DYN2](rl_NV)
-            var qacc_c_v = self.scratch.qacc_constrained.lt_dyn["cpu", DYN2](rl_NV)
+            var qacc_ws_v = self.scratch.qacc_ws.tt_dyn["cpu", DYN2](rl_NV)
+            var qacc_v = d.qacc.tt_dyn["cpu", DYN2](rl_NV)
+            var qacc_c_v = self.scratch.qacc_constrained.tt_dyn["cpu", DYN2](rl_NV)
             for e in range(Self.BATCH):
                 _qacc_writeback_env[Self.DTYPE](
                     e, dm, qacc_ws_v, qacc_v, qacc_c_v
@@ -1114,9 +1085,9 @@ struct EulerIntegrator[
             ctx.value().enqueue_function[
                 _qacc_writeback_kernel[Self.DTYPE, Self.D.NV, Self.BATCH]
             ](
-                self.scratch.qacc_ws.lt["gpu", L_NV](),
-                d.qacc.lt["gpu", L_NV](),
-                self.scratch.qacc_constrained.lt["gpu", L_NV](),
+                self.scratch.qacc_ws.tt["gpu", Self.BATCH, Self.D.NV](),
+                d.qacc.tt["gpu", Self.BATCH, Self.D.NV](),
+                self.scratch.qacc_constrained.tt["gpu", Self.BATCH, Self.D.NV](),
                 grid_dim=(BLOCKS,),
                 block_dim=(EU_TPB,),
             )
@@ -1286,22 +1257,22 @@ struct EulerIntegrator[
             var rl_NV = rl2(Self.BATCH, dm.get_nv())
             var rl_JOINT = rl2(dm.get_njoint(), MODEL_JOINT_SIZE)
             var rl_M = rl2(Self.BATCH, dm.get_nv() * dm.get_nv())
-            var qpos_v3 = d.qpos.lt_dyn["cpu", DYN2](rl_QPOS)
-            var qvel_v3 = d.qvel.lt_dyn["cpu", DYN2](rl_NV)
-            var qacc_v3 = d.qacc.lt_dyn["cpu", DYN2](rl_NV)
-            var joints_v3 = m.joints.lt_dyn["cpu", DYN2](rl_JOINT)
-            var M_v3 = self.scratch.M.lt_dyn["cpu", DYN2](rl_M)
-            var L_v3 = self.scratch.L.lt_dyn["cpu", DYN2](rl_M)
-            var D_v3 = self.scratch.D.lt_dyn["cpu", DYN2](rl_NV)
-            var fnet_v3 = self.scratch.fnet.lt_dyn["cpu", DYN2](rl_NV)
-            var qacc_ws_v3 = self.scratch.qacc_ws.lt_dyn["cpu", DYN2](rl_NV)
-            var qacc_c_v3 = self.scratch.qacc_constrained.lt_dyn["cpu", DYN2](rl_NV)
+            var qpos_v3 = d.qpos.tt_dyn["cpu", DYN2](rl_QPOS)
+            var qvel_v3 = d.qvel.tt_dyn["cpu", DYN2](rl_NV)
+            var qacc_v3 = d.qacc.tt_dyn["cpu", DYN2](rl_NV)
+            var joints_v3 = m.joints.tt_dyn["cpu", DYN2](rl_JOINT)
+            var M_v3 = self.scratch.M.tt_dyn["cpu", DYN2](rl_M)
+            var L_v3 = self.scratch.L.tt_dyn["cpu", DYN2](rl_M)
+            var D_v3 = self.scratch.D.tt_dyn["cpu", DYN2](rl_NV)
+            var fnet_v3 = self.scratch.fnet.tt_dyn["cpu", DYN2](rl_NV)
+            var qacc_ws_v3 = self.scratch.qacc_ws.tt_dyn["cpu", DYN2](rl_NV)
+            var qacc_c_v3 = self.scratch.qacc_constrained.tt_dyn["cpu", DYN2](rl_NV)
             var rl_TREE = rl1(dm.get_nv() * MODEL_TREE_SIZE)
-            var trees_v3 = m.trees.lt_dyn["cpu", DYN1](rl_TREE)
+            var trees_v3 = m.trees.tt_dyn["cpu", DYN1](rl_TREE)
             # Tree-ordered when the parser built the tables (the LDL
             # dispatchers' own rule), dense otherwise.
             var use_tree3 = Int(m.meta.data[MODEL_META_IDX_NTREE]) > 0
-            var P_v3 = m.dof_parentid.lt_dyn["cpu", DYN1](
+            var P_v3 = m.dof_parentid.tt_dyn["cpu", DYN1](
                 rl1(dm.get_nv() if dm.get_nv() > 0 else 1)
             )
             for e in range(Self.BATCH):
@@ -1333,10 +1304,10 @@ struct EulerIntegrator[
                     ]
                 ](
                     dt,
-                    m.joints.lt["gpu", L_JOINT](),
-                    self.scratch.M.lt["gpu", L_M](),
-                    self.scratch.fnet.lt["gpu", L_NV](),
-                    self.scratch.qacc_constrained.lt["gpu", L_NV](),
+                    m.joints.tt["gpu", Self.D.NJOINT, MODEL_JOINT_SIZE](),
+                    self.scratch.M.tt["gpu", Self.BATCH, Self.D.NV * Self.D.NV](),
+                    self.scratch.fnet.tt["gpu", Self.BATCH, Self.D.NV](),
+                    self.scratch.qacc_constrained.tt["gpu", Self.BATCH, Self.D.NV](),
                     grid_dim=(Self.BATCH,),
                     block_dim=(Self.D.NV if Self.D.NV > 0 else 1,),
                 )
@@ -1350,12 +1321,12 @@ struct EulerIntegrator[
                 ]
             ](
                 dt,
-                d.qpos.lt["gpu", L_QPOS](),
-                d.qvel.lt["gpu", L_NV](),
-                d.qacc.lt["gpu", L_NV](),
-                m.joints.lt["gpu", L_JOINT](),
-                self.scratch.qacc_ws.lt["gpu", L_NV](),
-                self.scratch.qacc_constrained.lt["gpu", L_NV](),
+                d.qpos.tt["gpu", Self.BATCH, Self.D.NQ](),
+                d.qvel.tt["gpu", Self.BATCH, Self.D.NV](),
+                d.qacc.tt["gpu", Self.BATCH, Self.D.NV](),
+                m.joints.tt["gpu", Self.D.NJOINT, MODEL_JOINT_SIZE](),
+                self.scratch.qacc_ws.tt["gpu", Self.BATCH, Self.D.NV](),
+                self.scratch.qacc_constrained.tt["gpu", Self.BATCH, Self.D.NV](),
                 Scalar[Self.DTYPE](1) if eulerdamp_off
                 else Scalar[Self.DTYPE](0),
                 grid_dim=(BLOCKS,),
@@ -1368,17 +1339,17 @@ struct EulerIntegrator[
                 ]
             ](
                 dt,
-                d.qpos.lt["gpu", L_QPOS](),
-                d.qvel.lt["gpu", L_NV](),
-                d.qacc.lt["gpu", L_NV](),
-                m.joints.lt["gpu", L_JOINT](),
-                self.scratch.M.lt["gpu", L_M](),
-                self.scratch.L.lt["gpu", L_M](),
-                self.scratch.D.lt["gpu", L_NV](),
-                self.scratch.fnet.lt["gpu", L_NV](),
-                self.scratch.qacc_ws.lt["gpu", L_NV](),
-                self.scratch.qacc_constrained.lt["gpu", L_NV](),
-                m.trees.lt["gpu", L_TREE](),
+                d.qpos.tt["gpu", Self.BATCH, Self.D.NQ](),
+                d.qvel.tt["gpu", Self.BATCH, Self.D.NV](),
+                d.qacc.tt["gpu", Self.BATCH, Self.D.NV](),
+                m.joints.tt["gpu", Self.D.NJOINT, MODEL_JOINT_SIZE](),
+                self.scratch.M.tt["gpu", Self.BATCH, Self.D.NV * Self.D.NV](),
+                self.scratch.L.tt["gpu", Self.BATCH, Self.D.NV * Self.D.NV](),
+                self.scratch.D.tt["gpu", Self.BATCH, Self.D.NV](),
+                self.scratch.fnet.tt["gpu", Self.BATCH, Self.D.NV](),
+                self.scratch.qacc_ws.tt["gpu", Self.BATCH, Self.D.NV](),
+                self.scratch.qacc_constrained.tt["gpu", Self.BATCH, Self.D.NV](),
+                m.trees.tt["gpu", Self.D.NV * MODEL_TREE_SIZE](),
                 Scalar[Self.DTYPE](1) if eulerdamp_off
                 else Scalar[Self.DTYPE](0),
                 grid_dim=(BLOCKS,),

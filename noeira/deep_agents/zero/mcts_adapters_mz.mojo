@@ -23,7 +23,6 @@ The scratch Tensors are reused across calls (lazily grown).
 
 from max.gpu import global_idx
 from max.gpu.host import DeviceContext
-from layout import Layout, LayoutTensor
 
 from noeira.nn.constants import DT, TPB
 from noeira.nn.core.module import Module
@@ -35,11 +34,12 @@ from noeira.planners.tree_search import (
     DynamicsGPU,
     PredictionGPU,
 )
+from noeira.core.tiles import Tile
 
 
 def _copy2d_kernel[B: Int, D: Int](
-    src: LayoutTensor[DT, Layout.row_major(B, D), MutAnyOrigin],
-    dst: LayoutTensor[DT, Layout.row_major(B, D), MutAnyOrigin],
+    src: Tile[DT, B, D],
+    dst: Tile[DT, B, D],
 ):
     """Element copy between two device LayoutTensors (planner buffer ↔ owned
     scratch). Both are real allocations, so a 2-operand copy kernel is safe."""
@@ -68,16 +68,14 @@ struct MZRepGPU[OBS: Int, LATENT: Int, NET: Module, o: Origin[mut=True]](
     def encode_gpu[B: Int](
         mut self,
         ctx: DeviceContext,
-        obs: LayoutTensor[DT, Layout.row_major(B, Self.OBS_DIM), MutAnyOrigin],
-        mut hidden_out: LayoutTensor[
-            DT, Layout.row_major(B, Self.LATENT_DIM), MutAnyOrigin
-        ],
+        obs: Tile[DT, B, Self.OBS_DIM],
+        hidden_out: Tile[DT, B, Self.LATENT_DIM],
     ) raises:
         comptime ID = Self.OBS_DIM
         comptime OD = Self.LATENT_DIM
         self.sc_in.ensure_gpu(ctx, B * ID)
         self.sc_out.ensure_gpu(ctx, B * OD)
-        var sin = self.sc_in.lt["gpu", Layout.row_major(B, ID)]()
+        var sin = self.sc_in.tt["gpu", B, ID]()
         ctx.enqueue_function[_copy2d_kernel[B, ID]](
             obs, sin, grid_dim=(B * ID + TPB - 1) // TPB, block_dim=TPB
         )
@@ -85,7 +83,7 @@ struct MZRepGPU[OBS: Int, LATENT: Int, NET: Module, o: Origin[mut=True]](
             self.net[],
             TensorRefs[Self.NET.ARITY](self.sc_in), self.sc_out, Optional(ctx)
         )
-        var sout = self.sc_out.lt["gpu", Layout.row_major(B, OD)]()
+        var sout = self.sc_out.tt["gpu", B, OD]()
         ctx.enqueue_function[_copy2d_kernel[B, OD]](
             sout, hidden_out, grid_dim=(B * OD + TPB - 1) // TPB, block_dim=TPB
         )
@@ -113,18 +111,14 @@ struct MZDynGPU[
     def step_gpu[B: Int](
         mut self,
         ctx: DeviceContext,
-        dyn_in: LayoutTensor[
-            DT, Layout.row_major(B, Self.DYN_IN_DIM), MutAnyOrigin
-        ],
-        mut dyn_out: LayoutTensor[
-            DT, Layout.row_major(B, Self.DYN_OUT_DIM), MutAnyOrigin
-        ],
+        dyn_in: Tile[DT, B, Self.DYN_IN_DIM],
+        dyn_out: Tile[DT, B, Self.DYN_OUT_DIM],
     ) raises:
         comptime ID = Self.DYN_IN_DIM
         comptime OD = Self.DYN_OUT_DIM
         self.sc_in.ensure_gpu(ctx, B * ID)
         self.sc_out.ensure_gpu(ctx, B * OD)
-        var sin = self.sc_in.lt["gpu", Layout.row_major(B, ID)]()
+        var sin = self.sc_in.tt["gpu", B, ID]()
         ctx.enqueue_function[_copy2d_kernel[B, ID]](
             dyn_in, sin, grid_dim=(B * ID + TPB - 1) // TPB, block_dim=TPB
         )
@@ -132,7 +126,7 @@ struct MZDynGPU[
             self.net[],
             TensorRefs[Self.NET.ARITY](self.sc_in), self.sc_out, Optional(ctx)
         )
-        var sout = self.sc_out.lt["gpu", Layout.row_major(B, OD)]()
+        var sout = self.sc_out.tt["gpu", B, OD]()
         ctx.enqueue_function[_copy2d_kernel[B, OD]](
             sout, dyn_out, grid_dim=(B * OD + TPB - 1) // TPB, block_dim=TPB
         )
@@ -160,18 +154,14 @@ struct MZPredGPU[
     def predict_gpu[B: Int](
         mut self,
         ctx: DeviceContext,
-        hidden: LayoutTensor[
-            DT, Layout.row_major(B, Self.LATENT_DIM), MutAnyOrigin
-        ],
-        mut pred_out: LayoutTensor[
-            DT, Layout.row_major(B, Self.PRED_OUT_DIM), MutAnyOrigin
-        ],
+        hidden: Tile[DT, B, Self.LATENT_DIM],
+        pred_out: Tile[DT, B, Self.PRED_OUT_DIM],
     ) raises:
         comptime ID = Self.LATENT_DIM
         comptime OD = Self.PRED_OUT_DIM
         self.sc_in.ensure_gpu(ctx, B * ID)
         self.sc_out.ensure_gpu(ctx, B * OD)
-        var sin = self.sc_in.lt["gpu", Layout.row_major(B, ID)]()
+        var sin = self.sc_in.tt["gpu", B, ID]()
         ctx.enqueue_function[_copy2d_kernel[B, ID]](
             hidden, sin, grid_dim=(B * ID + TPB - 1) // TPB, block_dim=TPB
         )
@@ -179,7 +169,7 @@ struct MZPredGPU[
             self.net[],
             TensorRefs[Self.NET.ARITY](self.sc_in), self.sc_out, Optional(ctx)
         )
-        var sout = self.sc_out.lt["gpu", Layout.row_major(B, OD)]()
+        var sout = self.sc_out.tt["gpu", B, OD]()
         ctx.enqueue_function[_copy2d_kernel[B, OD]](
             sout, pred_out, grid_dim=(B * OD + TPB - 1) // TPB, block_dim=TPB
         )
@@ -207,18 +197,14 @@ struct MZContPredGPU[
     def predict_gpu[B: Int](
         mut self,
         ctx: DeviceContext,
-        hidden: LayoutTensor[
-            DT, Layout.row_major(B, Self.LATENT_DIM), MutAnyOrigin
-        ],
-        mut pred_out: LayoutTensor[
-            DT, Layout.row_major(B, Self.PRED_OUT_DIM), MutAnyOrigin
-        ],
+        hidden: Tile[DT, B, Self.LATENT_DIM],
+        pred_out: Tile[DT, B, Self.PRED_OUT_DIM],
     ) raises:
         comptime ID = Self.LATENT_DIM
         comptime OD = Self.PRED_OUT_DIM
         self.sc_in.ensure_gpu(ctx, B * ID)
         self.sc_out.ensure_gpu(ctx, B * OD)
-        var sin = self.sc_in.lt["gpu", Layout.row_major(B, ID)]()
+        var sin = self.sc_in.tt["gpu", B, ID]()
         ctx.enqueue_function[_copy2d_kernel[B, ID]](
             hidden, sin, grid_dim=(B * ID + TPB - 1) // TPB, block_dim=TPB
         )
@@ -226,7 +212,7 @@ struct MZContPredGPU[
             self.net[],
             TensorRefs[Self.NET.ARITY](self.sc_in), self.sc_out, Optional(ctx)
         )
-        var sout = self.sc_out.lt["gpu", Layout.row_major(B, OD)]()
+        var sout = self.sc_out.tt["gpu", B, OD]()
         ctx.enqueue_function[_copy2d_kernel[B, OD]](
             sout, pred_out, grid_dim=(B * OD + TPB - 1) // TPB, block_dim=TPB
         )

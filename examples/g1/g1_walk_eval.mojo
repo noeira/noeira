@@ -53,7 +53,6 @@ from noeira.envs.robots.unitree_g1_walk_config import (
 from noeira.envs.robots.unitree_g1_walk_rp import (
     UnitreeG1WalkRP, g1r_host_reset, g1r_host_terms,
 )
-from layout import Layout
 from noeira.nn.core.tensor import TensorImpl
 from noeira.physics3d.gpu.constants import METADATA_SIZE
 from noeira.envs.robots.unitree_g1_walk_config import g1_walk_obs
@@ -362,10 +361,10 @@ struct SwitchSim(WalkSim):
     def _walker_obs(mut self) -> List[Float64]:
         var o = TensorImpl[DType.float64].alloc(G1_WALK_OBS_DIM)
         g1_walk_obs[DType.float64, 1, NQ, NV, G1_WALK_OBS_DIM, False](
-            self.env.d.qpos.lt["cpu", Layout.row_major(1, NQ)](),
-            self.env.d.qvel.lt["cpu", Layout.row_major(1, NV)](),
-            self.env.d.meta.lt["cpu", Layout.row_major(1, METADATA_SIZE)](),
-            o.lt["cpu", Layout.row_major(1, G1_WALK_OBS_DIM)](),
+            self.env.d.qpos.tt["cpu", 1, NQ](),
+            self.env.d.qvel.tt["cpu", 1, NV](),
+            self.env.d.meta.tt["cpu", 1, METADATA_SIZE](),
+            o.tt["cpu", 1, G1_WALK_OBS_DIM](),
             0,
         )
         var l = List[Float64]()

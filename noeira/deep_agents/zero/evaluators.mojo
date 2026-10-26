@@ -23,10 +23,10 @@ Ported from `deep_agents/muzero/evaluators.mojo` onto `nn` (`DT`).
 
 from max.gpu import block_dim, block_idx, thread_idx
 from max.gpu.host import DeviceContext, DeviceBuffer
-from layout import Layout, LayoutTensor
 
 from noeira.nn.constants import DT
 from noeira.core import TwoPlayerDiscreteEnv, Saveable
+from noeira.core.tiles import Tile, tile
 
 
 # ═══════════════════════════════════════════════════════════════════════════
@@ -87,8 +87,8 @@ trait CPUEvaluator:
 def _random_legal_kernel[
     N_ENVS: Int, ACT: Int
 ](
-    actions_out: LayoutTensor[DT, Layout.row_major(N_ENVS), MutAnyOrigin],
-    legal_masks: LayoutTensor[DT, Layout.row_major(N_ENVS * ACT), MutAnyOrigin],
+    actions_out: Tile[DT, N_ENVS],
+    legal_masks: Tile[DT, N_ENVS * ACT],
     seed: UInt64,
 ):
     """Pick a uniform random legal action per env (xorshift on env id+seed)."""
@@ -162,11 +162,11 @@ struct RandomOpponent(GPUEvaluator & CPUEvaluator):
         comptime ENV_BLOCKS = (N_ENVS + TPB - 1) // TPB
         comptime run = _random_legal_kernel[N_ENVS, ACT]
         var act_t = rebind[
-            LayoutTensor[DT, Layout.row_major(N_ENVS), MutAnyOrigin]
-        ](LayoutTensor[DT, Layout.row_major(N_ENVS)](actions_out))
+            Tile[DT, N_ENVS]
+        ](tile[N_ENVS](actions_out))
         var lm_t = rebind[
-            LayoutTensor[DT, Layout.row_major(N_ENVS * ACT), MutAnyOrigin]
-        ](LayoutTensor[DT, Layout.row_major(N_ENVS * ACT)](legal_masks))
+            Tile[DT, N_ENVS * ACT]
+        ](tile[N_ENVS * ACT](legal_masks))
         ctx.enqueue_function[run](
             act_t,
             lm_t,
@@ -299,10 +299,8 @@ def _ttt_minimax_iter(mut board: Array[Int, 9], my_mark: Int) -> Int:
 def _ttt_minimax_kernel[
     N_ENVS: Int, STATE_SIZE: Int
 ](
-    actions_out: LayoutTensor[DT, Layout.row_major(N_ENVS), MutAnyOrigin],
-    game_states: LayoutTensor[
-        DT, Layout.row_major(N_ENVS * STATE_SIZE), MutAnyOrigin
-    ],
+    actions_out: Tile[DT, N_ENVS],
+    game_states: Tile[DT, N_ENVS * STATE_SIZE],
 ):
     var e = Int(block_dim.x * block_idx.x + thread_idx.x)
     if e >= N_ENVS:
@@ -376,13 +374,11 @@ struct GPUMinimaxTicTacToe(GPUEvaluator & CPUEvaluator):
         comptime ENV_BLOCKS = (N_ENVS + TPB - 1) // TPB
         comptime run = _ttt_minimax_kernel[N_ENVS, STATE_SIZE]
         var act_t = rebind[
-            LayoutTensor[DT, Layout.row_major(N_ENVS), MutAnyOrigin]
-        ](LayoutTensor[DT, Layout.row_major(N_ENVS)](actions_out))
+            Tile[DT, N_ENVS]
+        ](tile[N_ENVS](actions_out))
         var gs_t = rebind[
-            LayoutTensor[
-                DT, Layout.row_major(N_ENVS * STATE_SIZE), MutAnyOrigin
-            ]
-        ](LayoutTensor[DT, Layout.row_major(N_ENVS * STATE_SIZE)](game_states))
+            Tile[DT, N_ENVS * STATE_SIZE]
+        ](tile[N_ENVS * STATE_SIZE](game_states))
         ctx.enqueue_function[run](
             act_t,
             gs_t,
@@ -514,10 +510,8 @@ def _c4_minimax_ab(
 def _c4_minimax_kernel[
     N_ENVS: Int, STATE_SIZE: Int, DEPTH: Int
 ](
-    actions_out: LayoutTensor[DT, Layout.row_major(N_ENVS), MutAnyOrigin],
-    game_states: LayoutTensor[
-        DT, Layout.row_major(N_ENVS * STATE_SIZE), MutAnyOrigin
-    ],
+    actions_out: Tile[DT, N_ENVS],
+    game_states: Tile[DT, N_ENVS * STATE_SIZE],
 ):
     comptime ROWS = 6
     comptime COLS = 7
@@ -611,13 +605,11 @@ struct GPUMinimaxConnectFour[DEPTH: Int = 5](GPUEvaluator & CPUEvaluator):
         comptime ENV_BLOCKS = (N_ENVS + TPB - 1) // TPB
         comptime run = _c4_minimax_kernel[N_ENVS, STATE_SIZE, Self.DEPTH]
         var act_t = rebind[
-            LayoutTensor[DT, Layout.row_major(N_ENVS), MutAnyOrigin]
-        ](LayoutTensor[DT, Layout.row_major(N_ENVS)](actions_out))
+            Tile[DT, N_ENVS]
+        ](tile[N_ENVS](actions_out))
         var gs_t = rebind[
-            LayoutTensor[
-                DT, Layout.row_major(N_ENVS * STATE_SIZE), MutAnyOrigin
-            ]
-        ](LayoutTensor[DT, Layout.row_major(N_ENVS * STATE_SIZE)](game_states))
+            Tile[DT, N_ENVS * STATE_SIZE]
+        ](tile[N_ENVS * STATE_SIZE](game_states))
         ctx.enqueue_function[run](
             act_t,
             gs_t,

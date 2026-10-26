@@ -20,10 +20,10 @@ Run:
     pixi run mojo run -I . tests/pcn/test_bidirectional_pc.mojo
 """
 
-from std.memory import alloc, memset
+from std.memory import alloc, unsafe_memset
 from std.time import perf_counter_ns
 from std.math import exp
-from layout import Layout, LayoutTensor
+from noeira.core.tiles import tile
 
 from noeira.nn.constants import DT as dtype
 from noeira.experimental.pcn.pc_initializer import PCXavier
@@ -88,14 +88,14 @@ def main() raises:
     var up_grads_buf = alloc[Scalar[dtype]](UP_PARAM_SIZE).as_unsafe_any_origin()
     var up_opt_state_buf = alloc[Scalar[dtype]](UP_PARAM_SIZE * OPT.STATE_PER_PARAM).as_unsafe_any_origin()
     var up_opt_global_buf = alloc[Scalar[dtype]](OPT.GLOBAL_STATE_SIZE).as_unsafe_any_origin()
-    memset(up_params_buf, 0, UP_PARAM_SIZE)
-    memset(up_grads_buf, 0, UP_PARAM_SIZE)
-    memset(up_opt_state_buf, 0, UP_PARAM_SIZE * OPT.STATE_PER_PARAM)
-    memset(up_opt_global_buf, 0, OPT.GLOBAL_STATE_SIZE)
-    var up_params = LayoutTensor[dtype, Layout.row_major(UP_PARAM_SIZE), MutAnyOrigin](up_params_buf)
-    var up_grads = LayoutTensor[dtype, Layout.row_major(UP_PARAM_SIZE), MutAnyOrigin](up_grads_buf)
-    var up_opt_state = LayoutTensor[dtype, Layout.row_major(UP_PARAM_SIZE, OPT.STATE_PER_PARAM), MutAnyOrigin](up_opt_state_buf)
-    var up_opt_global = LayoutTensor[dtype, Layout.row_major(OPT.GLOBAL_STATE_SIZE), MutAnyOrigin](up_opt_global_buf)
+    unsafe_memset(up_params_buf, 0, UP_PARAM_SIZE)
+    unsafe_memset(up_grads_buf, 0, UP_PARAM_SIZE)
+    unsafe_memset(up_opt_state_buf, 0, UP_PARAM_SIZE * OPT.STATE_PER_PARAM)
+    unsafe_memset(up_opt_global_buf, 0, OPT.GLOBAL_STATE_SIZE)
+    var up_params = tile[UP_PARAM_SIZE](up_params_buf)
+    var up_grads = tile[UP_PARAM_SIZE](up_grads_buf)
+    var up_opt_state = tile[UP_PARAM_SIZE, OPT.STATE_PER_PARAM](up_opt_state_buf)
+    var up_opt_global = tile[OPT.GLOBAL_STATE_SIZE](up_opt_global_buf)
     UP_NET.pc_init_params[PCXavier, dtype](up_params)
 
     # ── Allocate DOWN params + Adam state ───────────────────────────────────
@@ -103,23 +103,23 @@ def main() raises:
     var dn_grads_buf = alloc[Scalar[dtype]](DOWN_PARAM_SIZE).as_unsafe_any_origin()
     var dn_opt_state_buf = alloc[Scalar[dtype]](DOWN_PARAM_SIZE * OPT.STATE_PER_PARAM).as_unsafe_any_origin()
     var dn_opt_global_buf = alloc[Scalar[dtype]](OPT.GLOBAL_STATE_SIZE).as_unsafe_any_origin()
-    memset(dn_params_buf, 0, DOWN_PARAM_SIZE)
-    memset(dn_grads_buf, 0, DOWN_PARAM_SIZE)
-    memset(dn_opt_state_buf, 0, DOWN_PARAM_SIZE * OPT.STATE_PER_PARAM)
-    memset(dn_opt_global_buf, 0, OPT.GLOBAL_STATE_SIZE)
-    var dn_params = LayoutTensor[dtype, Layout.row_major(DOWN_PARAM_SIZE), MutAnyOrigin](dn_params_buf)
-    var dn_grads = LayoutTensor[dtype, Layout.row_major(DOWN_PARAM_SIZE), MutAnyOrigin](dn_grads_buf)
-    var dn_opt_state = LayoutTensor[dtype, Layout.row_major(DOWN_PARAM_SIZE, OPT.STATE_PER_PARAM), MutAnyOrigin](dn_opt_state_buf)
-    var dn_opt_global = LayoutTensor[dtype, Layout.row_major(OPT.GLOBAL_STATE_SIZE), MutAnyOrigin](dn_opt_global_buf)
+    unsafe_memset(dn_params_buf, 0, DOWN_PARAM_SIZE)
+    unsafe_memset(dn_grads_buf, 0, DOWN_PARAM_SIZE)
+    unsafe_memset(dn_opt_state_buf, 0, DOWN_PARAM_SIZE * OPT.STATE_PER_PARAM)
+    unsafe_memset(dn_opt_global_buf, 0, OPT.GLOBAL_STATE_SIZE)
+    var dn_params = tile[DOWN_PARAM_SIZE](dn_params_buf)
+    var dn_grads = tile[DOWN_PARAM_SIZE](dn_grads_buf)
+    var dn_opt_state = tile[DOWN_PARAM_SIZE, OPT.STATE_PER_PARAM](dn_opt_state_buf)
+    var dn_opt_global = tile[OPT.GLOBAL_STATE_SIZE](dn_opt_global_buf)
     DOWN_NET.pc_init_params[PCXavier, dtype](dn_params)
 
     # ── Shared latents x0, x1 (both HIDDEN-dim) ────────────────────────────
     var x0_buf = alloc[Scalar[dtype]](BATCH * HIDDEN).as_unsafe_any_origin()
     var x1_buf = alloc[Scalar[dtype]](BATCH * HIDDEN).as_unsafe_any_origin()
-    memset(x0_buf, 0, BATCH * HIDDEN)
-    memset(x1_buf, 0, BATCH * HIDDEN)
-    var x0 = LayoutTensor[dtype, Layout.row_major(BATCH, HIDDEN), MutAnyOrigin](x0_buf)
-    var x1 = LayoutTensor[dtype, Layout.row_major(BATCH, HIDDEN), MutAnyOrigin](x1_buf)
+    unsafe_memset(x0_buf, 0, BATCH * HIDDEN)
+    unsafe_memset(x1_buf, 0, BATCH * HIDDEN)
+    var x0 = tile[BATCH, HIDDEN](x0_buf)
+    var x1 = tile[BATCH, HIDDEN](x1_buf)
 
     # ── Per-block scratch buffers ───────────────────────────────────────────
     # UP: block_0 (784→256), block_1 (256→256), block_2 (256→10)
@@ -154,48 +154,48 @@ def main() raises:
     # ── Per-batch input buffers ─────────────────────────────────────────────
     var image_buf = alloc[Scalar[dtype]](BATCH * 784).as_unsafe_any_origin()
     var label_oh_buf = alloc[Scalar[dtype]](BATCH * 10).as_unsafe_any_origin()
-    memset(image_buf, 0, BATCH * 784)
-    memset(label_oh_buf, 0, BATCH * 10)
+    unsafe_memset(image_buf, 0, BATCH * 784)
+    unsafe_memset(label_oh_buf, 0, BATCH * 10)
 
     # ── Param block views ───────────────────────────────────────────────────
-    var up_p0 = LayoutTensor[dtype, Layout.row_major(UB0.PARAM_SIZE), MutAnyOrigin](up_params_buf)
-    var up_p1 = LayoutTensor[dtype, Layout.row_major(UB1.PARAM_SIZE), MutAnyOrigin](up_params_buf + UB0.PARAM_SIZE)
-    var up_p2 = LayoutTensor[dtype, Layout.row_major(UB2.PARAM_SIZE), MutAnyOrigin](up_params_buf + UB0.PARAM_SIZE + UB1.PARAM_SIZE)
-    var dn_p0 = LayoutTensor[dtype, Layout.row_major(DB0.PARAM_SIZE), MutAnyOrigin](dn_params_buf)
-    var dn_p1 = LayoutTensor[dtype, Layout.row_major(DB1.PARAM_SIZE), MutAnyOrigin](dn_params_buf + DB0.PARAM_SIZE)
-    var dn_p2 = LayoutTensor[dtype, Layout.row_major(DB2.PARAM_SIZE), MutAnyOrigin](dn_params_buf + DB0.PARAM_SIZE + DB1.PARAM_SIZE)
-    var up_g0 = LayoutTensor[dtype, Layout.row_major(UB0.PARAM_SIZE), MutAnyOrigin](up_grads_buf)
-    var up_g1 = LayoutTensor[dtype, Layout.row_major(UB1.PARAM_SIZE), MutAnyOrigin](up_grads_buf + UB0.PARAM_SIZE)
-    var up_g2 = LayoutTensor[dtype, Layout.row_major(UB2.PARAM_SIZE), MutAnyOrigin](up_grads_buf + UB0.PARAM_SIZE + UB1.PARAM_SIZE)
-    var dn_g0 = LayoutTensor[dtype, Layout.row_major(DB0.PARAM_SIZE), MutAnyOrigin](dn_grads_buf)
-    var dn_g1 = LayoutTensor[dtype, Layout.row_major(DB1.PARAM_SIZE), MutAnyOrigin](dn_grads_buf + DB0.PARAM_SIZE)
-    var dn_g2 = LayoutTensor[dtype, Layout.row_major(DB2.PARAM_SIZE), MutAnyOrigin](dn_grads_buf + DB0.PARAM_SIZE + DB1.PARAM_SIZE)
+    var up_p0 = tile[UB0.PARAM_SIZE](up_params_buf)
+    var up_p1 = tile[UB1.PARAM_SIZE](up_params_buf + UB0.PARAM_SIZE)
+    var up_p2 = tile[UB2.PARAM_SIZE](up_params_buf + UB0.PARAM_SIZE + UB1.PARAM_SIZE)
+    var dn_p0 = tile[DB0.PARAM_SIZE](dn_params_buf)
+    var dn_p1 = tile[DB1.PARAM_SIZE](dn_params_buf + DB0.PARAM_SIZE)
+    var dn_p2 = tile[DB2.PARAM_SIZE](dn_params_buf + DB0.PARAM_SIZE + DB1.PARAM_SIZE)
+    var up_g0 = tile[UB0.PARAM_SIZE](up_grads_buf)
+    var up_g1 = tile[UB1.PARAM_SIZE](up_grads_buf + UB0.PARAM_SIZE)
+    var up_g2 = tile[UB2.PARAM_SIZE](up_grads_buf + UB0.PARAM_SIZE + UB1.PARAM_SIZE)
+    var dn_g0 = tile[DB0.PARAM_SIZE](dn_grads_buf)
+    var dn_g1 = tile[DB1.PARAM_SIZE](dn_grads_buf + DB0.PARAM_SIZE)
+    var dn_g2 = tile[DB2.PARAM_SIZE](dn_grads_buf + DB0.PARAM_SIZE + DB1.PARAM_SIZE)
 
     # ── Tensor views ────────────────────────────────────────────────────────
-    var image_t = LayoutTensor[dtype, Layout.row_major(BATCH, 784), MutAnyOrigin](image_buf)
-    var label_oh_t = LayoutTensor[dtype, Layout.row_major(BATCH, 10), MutAnyOrigin](label_oh_buf)
-    var up_mu0_t = LayoutTensor[dtype, Layout.row_major(BATCH, HIDDEN), MutAnyOrigin](up_mu0_buf)
-    var up_eps0_t = LayoutTensor[dtype, Layout.row_major(BATCH, HIDDEN), MutAnyOrigin](up_eps0_buf)
-    var up_a0_t = LayoutTensor[dtype, Layout.row_major(BATCH, 784), MutAnyOrigin](up_a0_buf)
-    var up_mu1_t = LayoutTensor[dtype, Layout.row_major(BATCH, HIDDEN), MutAnyOrigin](up_mu1_buf)
-    var up_eps1_t = LayoutTensor[dtype, Layout.row_major(BATCH, HIDDEN), MutAnyOrigin](up_eps1_buf)
-    var up_a1_t = LayoutTensor[dtype, Layout.row_major(BATCH, HIDDEN), MutAnyOrigin](up_a1_buf)
-    var up_mu2_t = LayoutTensor[dtype, Layout.row_major(BATCH, 10), MutAnyOrigin](up_mu2_buf)
-    var up_eps2_t = LayoutTensor[dtype, Layout.row_major(BATCH, 10), MutAnyOrigin](up_eps2_buf)
-    var up_a2_t = LayoutTensor[dtype, Layout.row_major(BATCH, HIDDEN), MutAnyOrigin](up_a2_buf)
-    var up_z1_t = LayoutTensor[dtype, Layout.row_major(BATCH, HIDDEN), MutAnyOrigin](up_z1_buf)
-    var up_z2_t = LayoutTensor[dtype, Layout.row_major(BATCH, HIDDEN), MutAnyOrigin](up_z2_buf)
-    var dn_mu0_t = LayoutTensor[dtype, Layout.row_major(BATCH, HIDDEN), MutAnyOrigin](dn_mu0_buf)
-    var dn_eps0_t = LayoutTensor[dtype, Layout.row_major(BATCH, HIDDEN), MutAnyOrigin](dn_eps0_buf)
-    var dn_a0_t = LayoutTensor[dtype, Layout.row_major(BATCH, 10), MutAnyOrigin](dn_a0_buf)
-    var dn_mu1_t = LayoutTensor[dtype, Layout.row_major(BATCH, HIDDEN), MutAnyOrigin](dn_mu1_buf)
-    var dn_eps1_t = LayoutTensor[dtype, Layout.row_major(BATCH, HIDDEN), MutAnyOrigin](dn_eps1_buf)
-    var dn_a1_t = LayoutTensor[dtype, Layout.row_major(BATCH, HIDDEN), MutAnyOrigin](dn_a1_buf)
-    var dn_mu2_t = LayoutTensor[dtype, Layout.row_major(BATCH, 784), MutAnyOrigin](dn_mu2_buf)
-    var dn_eps2_t = LayoutTensor[dtype, Layout.row_major(BATCH, 784), MutAnyOrigin](dn_eps2_buf)
-    var dn_a2_t = LayoutTensor[dtype, Layout.row_major(BATCH, HIDDEN), MutAnyOrigin](dn_a2_buf)
-    var dn_z1_t = LayoutTensor[dtype, Layout.row_major(BATCH, HIDDEN), MutAnyOrigin](dn_z1_buf)
-    var dn_z2_t = LayoutTensor[dtype, Layout.row_major(BATCH, HIDDEN), MutAnyOrigin](dn_z2_buf)
+    var image_t = tile[BATCH, 784](image_buf)
+    var label_oh_t = tile[BATCH, 10](label_oh_buf)
+    var up_mu0_t = tile[BATCH, HIDDEN](up_mu0_buf)
+    var up_eps0_t = tile[BATCH, HIDDEN](up_eps0_buf)
+    var up_a0_t = tile[BATCH, 784](up_a0_buf)
+    var up_mu1_t = tile[BATCH, HIDDEN](up_mu1_buf)
+    var up_eps1_t = tile[BATCH, HIDDEN](up_eps1_buf)
+    var up_a1_t = tile[BATCH, HIDDEN](up_a1_buf)
+    var up_mu2_t = tile[BATCH, 10](up_mu2_buf)
+    var up_eps2_t = tile[BATCH, 10](up_eps2_buf)
+    var up_a2_t = tile[BATCH, HIDDEN](up_a2_buf)
+    var up_z1_t = tile[BATCH, HIDDEN](up_z1_buf)
+    var up_z2_t = tile[BATCH, HIDDEN](up_z2_buf)
+    var dn_mu0_t = tile[BATCH, HIDDEN](dn_mu0_buf)
+    var dn_eps0_t = tile[BATCH, HIDDEN](dn_eps0_buf)
+    var dn_a0_t = tile[BATCH, 10](dn_a0_buf)
+    var dn_mu1_t = tile[BATCH, HIDDEN](dn_mu1_buf)
+    var dn_eps1_t = tile[BATCH, HIDDEN](dn_eps1_buf)
+    var dn_a1_t = tile[BATCH, HIDDEN](dn_a1_buf)
+    var dn_mu2_t = tile[BATCH, 784](dn_mu2_buf)
+    var dn_eps2_t = tile[BATCH, 784](dn_eps2_buf)
+    var dn_a2_t = tile[BATCH, HIDDEN](dn_a2_buf)
+    var dn_z1_t = tile[BATCH, HIDDEN](dn_z1_buf)
+    var dn_z2_t = tile[BATCH, HIDDEN](dn_z2_buf)
 
     # ── Train ───────────────────────────────────────────────────────────────
     print("\n  epoch | up_loss | dn_loss | test_acc | wall_t (s)")
@@ -305,8 +305,8 @@ def main() raises:
         # End-of-epoch: quick accuracy check
         var correct: Int = 0
         var pred_buf = alloc[Scalar[dtype]](BATCH * 10).as_unsafe_any_origin()
-        memset(pred_buf, 0, BATCH * 10)
-        var pred_t = LayoutTensor[dtype, Layout.row_major(BATCH, 10), MutAnyOrigin](pred_buf)
+        unsafe_memset(pred_buf, 0, BATCH * 10)
+        var pred_t = tile[BATCH, 10](pred_buf)
         for tb in range(N_TEST_BATCHES):
             for i in range(BATCH):
                 var sample_idx = tb * BATCH + i
@@ -338,12 +338,12 @@ def main() raises:
     # ── Generation: pass each one-hot label through DOWN forward_eval ───────
     var gen_label_buf = alloc[Scalar[dtype]](BATCH * 10).as_unsafe_any_origin()
     var gen_image_buf = alloc[Scalar[dtype]](BATCH * 784).as_unsafe_any_origin()
-    memset(gen_label_buf, 0, BATCH * 10)
-    memset(gen_image_buf, 0, BATCH * 784)
+    unsafe_memset(gen_label_buf, 0, BATCH * 10)
+    unsafe_memset(gen_image_buf, 0, BATCH * 784)
     for c in range(10):
         gen_label_buf[c * 10 + c] = Scalar[dtype](1.0)
-    var gen_label_t = LayoutTensor[dtype, Layout.row_major(BATCH, 10), MutAnyOrigin](gen_label_buf)
-    var gen_image_t = LayoutTensor[dtype, Layout.row_major(BATCH, 784), MutAnyOrigin](gen_image_buf)
+    var gen_label_t = tile[BATCH, 10](gen_label_buf)
+    var gen_image_t = tile[BATCH, 784](gen_image_buf)
     DOWN_NET.forward_eval[BATCH, dtype](gen_label_t, dn_params, gen_image_t)
 
     # Stats on generated images
@@ -365,7 +365,7 @@ def main() raises:
     # Find one real test sample per class for comparison
     var real_digits_buf = alloc[Scalar[dtype]](10 * 784).as_unsafe_any_origin()
     var found = alloc[UInt8](10).as_unsafe_any_origin()
-    memset(found, 0, 10)
+    unsafe_memset(found, 0, 10)
     var found_count: Int = 0
     for i in range(MNIST.N_TEST):
         var c = Int(ds.test_labels[i])
@@ -412,8 +412,8 @@ def main() raises:
     # ── Verdict ─────────────────────────────────────────────────────────────
     # Re-run final accuracy (already computed above but recompute clean)
     var final_pred_buf = alloc[Scalar[dtype]](BATCH * 10).as_unsafe_any_origin()
-    memset(final_pred_buf, 0, BATCH * 10)
-    var final_pred_t = LayoutTensor[dtype, Layout.row_major(BATCH, 10), MutAnyOrigin](final_pred_buf)
+    unsafe_memset(final_pred_buf, 0, BATCH * 10)
+    var final_pred_t = tile[BATCH, 10](final_pred_buf)
     var final_correct: Int = 0
     for tb in range(N_TEST_BATCHES):
         for i in range(BATCH):

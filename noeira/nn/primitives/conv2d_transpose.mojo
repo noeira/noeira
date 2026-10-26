@@ -11,7 +11,8 @@ so the GPU path REUSES the LAYOUT-parametrized free kernels in `conv2d.mojo`
 (`_im2col_kernel`, `_dx_col2im_kernel`, `_go_transpose_kernel`,
 `_wT_transpose_kernel`, `_accum_kernel`, `_backward_db_kernel`) with a
 channel/spatial substitution (IC↔OC, H↔OH_t), plus two tiny scatter/bias
-kernels. The CPU path is direct nested loops (the obvious-correctness ground
+kernels; past `_db_two_pass` the bias gradient goes through `linear.mojo`'s
+shared reductions. The CPU path is direct nested loops (the obvious-correctness ground
 truth the GPU is gated against).
 
 Spatial (PyTorch ConvTranspose2d convention, output_padding OP):
@@ -36,7 +37,8 @@ DT). bf16-flow is a follow-up mirroring Conv2D's `ADT` branch.
 
 from max.gpu import global_idx
 from max.gpu.host import DeviceContext
-from layout import Layout, LayoutTensor, TileTensor, row_major
+from layout import TileTensor, row_major
+from noeira.core.tiles import Tile
 from linalg.matmul import matmul as max_matmul
 from noeira.nn.core.splitk_gemm import (
     splitk_path_applies,
@@ -52,6 +54,7 @@ from ..core.param import Param, ParamVisitor
 from ..core.initializer import Initializer
 from ..core.amp import AMPPolicy, NoAMP
 from ..core.polyak import polyak_tensor
+from .linear import enqueue_bias_grad, enqueue_channel_grad
 from .conv2d import (
     _in_off,
     _col_off,
@@ -63,6 +66,7 @@ from .conv2d import (
     _wT_transpose_kernel,
     _accum_kernel,
     _backward_db_kernel,
+    _db_two_pass,
     CONV_TPB,
     CONV_DW_TPB,
 )
@@ -77,8 +81,8 @@ def _scatter_small_kernel[
     BS: Int,
     LAYOUT: Int = LAYOUT_NCHW,
 ](
-    packed: LayoutTensor[DT, Layout.row_major(BS, IC), MutAnyOrigin],
-    out_small: LayoutTensor[DT, Layout.row_major(BATCH, IN_FLAT), MutAnyOrigin],
+    packed: Tile[DT, BS, IC],
+    out_small: Tile[DT, BATCH, IN_FLAT],
 ):
     """Scatter the [BS, IC] GEMM result into the small ("input"-shaped) tensor
     `[BATCH, IC·H·W]`. `packed[b·SI + s, ic] → out_small[b, off(ic,s)]`
@@ -99,8 +103,8 @@ def _addbias_big_kernel[
     OUT_FLAT: Int,
     LAYOUT: Int = LAYOUT_NCHW,
 ](
-    out_big: LayoutTensor[DT, Layout.row_major(BATCH, OUT_FLAT), MutAnyOrigin],
-    bias: LayoutTensor[DT, Layout.row_major(OC), MutAnyOrigin],
+    out_big: Tile[DT, BATCH, OUT_FLAT],
+    bias: Tile[DT, OC],
 ):
     """Add the per-(big)-channel bias to every spatial position of the output."""
     var idx = Int(global_idx.x)
@@ -169,6 +173,10 @@ struct Conv2DTranspose[
     # needs its own measurement.
     var sk_ws: Tensor
     var _sk_p: Int
+    var db_rows: Tensor
+    """[B·OC] per-(sample, channel) sums: stage 1 of the NCHW bias grad."""
+    var db_part: Tensor
+    """Chunk partials of `enqueue_bias_grad` (stage 2)."""
 
     def __init__(out self):
         self.weight = Param["weight", True, Self.W_SIZE]()
@@ -181,6 +189,8 @@ struct Conv2DTranspose[
         self.dW_tmp = Tensor()
         self.sk_ws = Tensor()
         self._sk_p = -1
+        self.db_rows = Tensor()
+        self.db_part = Tensor()
 
     @staticmethod
     def make[
@@ -268,16 +278,16 @@ struct Conv2DTranspose[
                     B, Self.IC_, Self.SI, Self.IN_FLAT, BS, DT, Self.LAYOUT
                 ]
             ](
-                in0.lt["gpu", Layout.row_major(B, Self.IN_FLAT)](),
-                self.xT_t.lt["gpu", Layout.row_major(Self.IC_, BS)](),
+                in0.tt["gpu", B, Self.IN_FLAT](),
+                self.xT_t.tt["gpu", Self.IC_, BS](),
                 grid_dim=nb_xt,
                 block_dim=CONV_TPB,
             )
             # (2) wTT[COLT, IC] = transpose(weight[IC, COLT])
             comptime nb_wt = (Self.IC_ * Self.COLT + CONV_TPB - 1) // CONV_TPB
             c.enqueue_function[_wT_transpose_kernel[Self.IC_, Self.COLT]](
-                self.weight.val.lt["gpu", Layout.row_major(Self.IC_, Self.COLT)](),
-                self.wTT_t.lt["gpu", Layout.row_major(Self.COLT, Self.IC_)](),
+                self.weight.val.tt["gpu", Self.IC_, Self.COLT](),
+                self.wTT_t.tt["gpu", Self.COLT, Self.IC_](),
                 grid_dim=nb_wt,
                 block_dim=CONV_TPB,
             )
@@ -316,8 +326,8 @@ struct Conv2DTranspose[
                     Self.LAYOUT,
                 ]
             ](
-                self.dcolT_t.lt["gpu", Layout.row_major(Self.COLT, BS)](),
-                out.lt["gpu", Layout.row_major(B, Self.OUT_FLAT)](),
+                self.dcolT_t.tt["gpu", Self.COLT, BS](),
+                out.tt["gpu", B, Self.OUT_FLAT](),
                 grid_dim=nb_c2i,
                 block_dim=CONV_DW_TPB,
             )
@@ -328,8 +338,8 @@ struct Conv2DTranspose[
                     B, Self.OC_, Self.SBIG, Self.OUT_FLAT, Self.LAYOUT
                 ]
             ](
-                out.lt["gpu", Layout.row_major(B, Self.OUT_FLAT)](),
-                self.bias.val.lt["gpu", Layout.row_major(Self.OC_)](),
+                out.tt["gpu", B, Self.OUT_FLAT](),
+                self.bias.val.tt["gpu", Self.OC_](),
                 grid_dim=nb_bb,
                 block_dim=CONV_TPB,
             )
@@ -443,8 +453,8 @@ struct Conv2DTranspose[
                     Self.LAYOUT,
                 ]
             ](
-                grad_output.lt["gpu", Layout.row_major(B, Self.OUT_FLAT)](),
-                self.ecol_t.lt["gpu", Layout.row_major(BS, Self.COLT)](),
+                grad_output.tt["gpu", B, Self.OUT_FLAT](),
+                self.ecol_t.tt["gpu", BS, Self.COLT](),
                 grid_dim=nb_ec,
                 block_dim=CONV_TPB,
             )
@@ -465,8 +475,8 @@ struct Conv2DTranspose[
                     B, Self.IC_, Self.SI, Self.IN_FLAT, BS, Self.LAYOUT
                 ]
             ](
-                self.gxp_t.lt["gpu", Layout.row_major(BS, Self.IC_)](),
-                gin.lt["gpu", Layout.row_major(B, Self.IN_FLAT)](),
+                self.gxp_t.tt["gpu", BS, Self.IC_](),
+                gin.tt["gpu", B, Self.IN_FLAT](),
                 grid_dim=nb_sc,
                 block_dim=CONV_TPB,
             )
@@ -477,8 +487,8 @@ struct Conv2DTranspose[
                     B, Self.IC_, Self.SI, Self.IN_FLAT, BS, DT, Self.LAYOUT
                 ]
             ](
-                fin.lt["gpu", Layout.row_major(B, Self.IN_FLAT)](),
-                self.xT_t.lt["gpu", Layout.row_major(Self.IC_, BS)](),
+                fin.tt["gpu", B, Self.IN_FLAT](),
+                self.xT_t.tt["gpu", Self.IC_, BS](),
                 grid_dim=nb_xt,
                 block_dim=CONV_TPB,
             )
@@ -507,28 +517,42 @@ struct Conv2DTranspose[
                 max_matmul[target="gpu"](dW_tmp_tt, xT_tt, ecol2_tt, c)
             comptime nb_acc = (Self.W_SIZE + CONV_TPB - 1) // CONV_TPB
             c.enqueue_function[_accum_kernel[Self.W_SIZE]](
-                self.weight.grd.lt["gpu", Layout.row_major(Self.W_SIZE)](),
-                self.dW_tmp.lt["gpu", Layout.row_major(Self.W_SIZE)](),
+                self.weight.grd.tt["gpu", Self.W_SIZE](),
+                self.dW_tmp.tt["gpu", Self.W_SIZE](),
                 grid_dim=nb_acc,
                 block_dim=CONV_TPB,
             )
-            # (5) d_bias[OC] += Σ grad_output over big spatial
-            c.enqueue_function[
-                _backward_db_kernel[
-                    B,
-                    Self.OC_,
-                    Self.OHt,
-                    Self.OWt,
-                    Self.OUT_FLAT,
-                    DT,
-                    Self.LAYOUT,
-                ]
-            ](
-                grad_output.lt["gpu", Layout.row_major(B, Self.OUT_FLAT)](),
-                self.bias.grd.lt["gpu", Layout.row_major(Self.OC_)](),
-                grid_dim=Self.OC_,
-                block_dim=CONV_DW_TPB,
-            )
+            # (5) d_bias[OC] += Σ grad_output over big spatial. One block per
+            # channel gave DreamerV3's RGB decoder head 4 blocks walking
+            # B·OH·OW values each: 766 -> 80 us two-pass on an M1 Pro, 178 ->
+            # 11 on a 5090. Small maps keep it (`_db_two_pass`).
+            comptime if not _db_two_pass[Self.LAYOUT, B, Self.OC_, Self.SBIG]():
+                c.enqueue_function[
+                    _backward_db_kernel[
+                        B,
+                        Self.OC_,
+                        Self.OHt,
+                        Self.OWt,
+                        Self.OUT_FLAT,
+                        DT,
+                        Self.LAYOUT,
+                    ]
+                ](
+                    grad_output.tt["gpu", B, Self.OUT_FLAT](),
+                    self.bias.grd.tt["gpu", Self.OC_](),
+                    grid_dim=Self.OC_,
+                    block_dim=CONV_DW_TPB,
+                )
+            elif Self.LAYOUT == LAYOUT_NHWC:
+                enqueue_bias_grad[DT](
+                    c, grad_output.dev.value(), self.bias.grd.dev.value(),
+                    B * Self.SBIG, Self.OC_, self.db_part,
+                )
+            else:
+                enqueue_channel_grad[DT](
+                    c, grad_output.dev.value(), self.bias.grd.dev.value(),
+                    B, Self.OC_, Self.SBIG, self.db_rows, self.db_part,
+                )
 
     def polyak_from[
         target: StaticString

@@ -45,8 +45,8 @@ Kernels:
     ``N_ENVS``, block = 1.
 """
 
-from layout import LayoutTensor, Layout
 from max.gpu import thread_idx, block_idx, block_dim
+from noeira.core.tiles import Tile
 
 
 # =============================================================================
@@ -59,17 +59,15 @@ def ilqr_copy_z0_kernel[
     N_ENVS: Int,
     LATENT_DIM: Int,
 ](
-    z0: LayoutTensor[dtype, Layout.row_major(N_ENVS, LATENT_DIM), MutAnyOrigin],
-    z_seq: LayoutTensor[
-        dtype, Layout.row_major(N_ENVS * LATENT_DIM), MutAnyOrigin
-    ],
+    z0: Tile[dtype, N_ENVS, LATENT_DIM],
+    z_seq: Tile[dtype, N_ENVS * LATENT_DIM],
 ):
     """Copy ``z0[e, d]`` → ``z_seq[0, e, d]``."""
     var e = Int(block_idx.x)
     var d = Int(thread_idx.x)
     if e >= N_ENVS or d >= LATENT_DIM:
         return
-    z_seq[e * LATENT_DIM + d] = rebind[z_seq.element_type](z0[e, d])
+    z_seq[e * LATENT_DIM + d] = rebind[z_seq.ElementType](z0[e, d])
 
 
 # =============================================================================
@@ -82,11 +80,9 @@ def ilqr_reduce_cost_kernel[
     HORIZON: Int,
     N_ENVS: Int,
 ](
-    step_cost: LayoutTensor[
-        dtype, Layout.row_major(HORIZON * N_ENVS), MutAnyOrigin
-    ],
-    term_cost: LayoutTensor[dtype, Layout.row_major(N_ENVS), MutAnyOrigin],
-    total_out: LayoutTensor[dtype, Layout.row_major(N_ENVS), MutAnyOrigin],
+    step_cost: Tile[dtype, HORIZON * N_ENVS],
+    term_cost: Tile[dtype, N_ENVS],
+    total_out: Tile[dtype, N_ENVS],
 ):
     """Per-env reduce: sum step_cost over horizon + terminal cost."""
     var e = Int(thread_idx.x)
@@ -96,7 +92,7 @@ def ilqr_reduce_cost_kernel[
     for t in range(HORIZON):
         s += rebind[Scalar[dtype]](step_cost[t * N_ENVS + e])
     s += rebind[Scalar[dtype]](term_cost[e])
-    total_out[e] = rebind[total_out.element_type](s)
+    total_out[e] = rebind[total_out.ElementType](s)
 
 
 # =============================================================================
@@ -111,37 +107,13 @@ def ilqr_apply_control_update_kernel[
     LATENT_DIM: Int,
     ACTION_DIM: Int,
 ](
-    U: LayoutTensor[
-        dtype,
-        Layout.row_major(HORIZON * N_ENVS * ACTION_DIM),
-        MutAnyOrigin,
-    ],
-    k_seq: LayoutTensor[
-        dtype,
-        Layout.row_major(HORIZON * N_ENVS * ACTION_DIM),
-        MutAnyOrigin,
-    ],
-    K_seq: LayoutTensor[
-        dtype,
-        Layout.row_major(HORIZON * N_ENVS * ACTION_DIM * LATENT_DIM),
-        MutAnyOrigin,
-    ],
-    z_seq: LayoutTensor[
-        dtype,
-        Layout.row_major((HORIZON + 1) * N_ENVS * LATENT_DIM),
-        MutAnyOrigin,
-    ],
-    z_trial: LayoutTensor[
-        dtype,
-        Layout.row_major((HORIZON + 1) * N_ENVS * LATENT_DIM),
-        MutAnyOrigin,
-    ],
+    U: Tile[dtype, HORIZON * N_ENVS * ACTION_DIM],
+    k_seq: Tile[dtype, HORIZON * N_ENVS * ACTION_DIM],
+    K_seq: Tile[dtype, HORIZON * N_ENVS * ACTION_DIM * LATENT_DIM],
+    z_seq: Tile[dtype, (HORIZON + 1) * N_ENVS * LATENT_DIM],
+    z_trial: Tile[dtype, (HORIZON + 1) * N_ENVS * LATENT_DIM],
     alpha: Scalar[dtype],
-    U_trial: LayoutTensor[
-        dtype,
-        Layout.row_major(HORIZON * N_ENVS * ACTION_DIM),
-        MutAnyOrigin,
-    ],
+    U_trial: Tile[dtype, HORIZON * N_ENVS * ACTION_DIM],
     # ⚠ Int32, NOT Int — `Int`/`UInt` are not `DevicePassable`. A bare
     # `Int` still compiles in `pixi run build` and fails only where the
     # kernel is LAUNCHED; keep the `Int32(...)` casts at the call sites.
@@ -166,7 +138,7 @@ def ilqr_apply_control_update_kernel[
         var zs = rebind[Scalar[dtype]](z_seq[z_base + j])
         fb += k_val * (zt - zs)
     var u_old = rebind[Scalar[dtype]](U[u_base + i])
-    U_trial[u_base + i] = rebind[U_trial.element_type](u_old + alpha * ff + fb)
+    U_trial[u_base + i] = rebind[U_trial.ElementType](u_old + alpha * ff + fb)
 
 
 # =============================================================================
@@ -181,61 +153,19 @@ def ilqr_backward_pass_kernel[
     LATENT_DIM: Int,
     ACTION_DIM: Int,
 ](
-    A_seq: LayoutTensor[
-        dtype,
-        Layout.row_major(HORIZON * N_ENVS * LATENT_DIM * LATENT_DIM),
-        MutAnyOrigin,
-    ],
-    B_seq: LayoutTensor[
-        dtype,
-        Layout.row_major(HORIZON * N_ENVS * LATENT_DIM * ACTION_DIM),
-        MutAnyOrigin,
-    ],
-    l_z_seq: LayoutTensor[
-        dtype,
-        Layout.row_major(HORIZON * N_ENVS * LATENT_DIM),
-        MutAnyOrigin,
-    ],
-    l_u_seq: LayoutTensor[
-        dtype,
-        Layout.row_major(HORIZON * N_ENVS * ACTION_DIM),
-        MutAnyOrigin,
-    ],
-    l_zz_seq: LayoutTensor[
-        dtype,
-        Layout.row_major(HORIZON * N_ENVS * LATENT_DIM * LATENT_DIM),
-        MutAnyOrigin,
-    ],
-    l_uu_seq: LayoutTensor[
-        dtype,
-        Layout.row_major(HORIZON * N_ENVS * ACTION_DIM * ACTION_DIM),
-        MutAnyOrigin,
-    ],
-    l_zu_seq: LayoutTensor[
-        dtype,
-        Layout.row_major(HORIZON * N_ENVS * LATENT_DIM * ACTION_DIM),
-        MutAnyOrigin,
-    ],
-    V_z_term: LayoutTensor[
-        dtype, Layout.row_major(N_ENVS * LATENT_DIM), MutAnyOrigin
-    ],
-    V_zz_term: LayoutTensor[
-        dtype,
-        Layout.row_major(N_ENVS * LATENT_DIM * LATENT_DIM),
-        MutAnyOrigin,
-    ],
-    K_seq: LayoutTensor[
-        dtype,
-        Layout.row_major(HORIZON * N_ENVS * ACTION_DIM * LATENT_DIM),
-        MutAnyOrigin,
-    ],
-    k_seq: LayoutTensor[
-        dtype,
-        Layout.row_major(HORIZON * N_ENVS * ACTION_DIM),
-        MutAnyOrigin,
-    ],
+    A_seq: Tile[dtype, HORIZON * N_ENVS * LATENT_DIM * LATENT_DIM],
+    B_seq: Tile[dtype, HORIZON * N_ENVS * LATENT_DIM * ACTION_DIM],
+    l_z_seq: Tile[dtype, HORIZON * N_ENVS * LATENT_DIM],
+    l_u_seq: Tile[dtype, HORIZON * N_ENVS * ACTION_DIM],
+    l_zz_seq: Tile[dtype, HORIZON * N_ENVS * LATENT_DIM * LATENT_DIM],
+    l_uu_seq: Tile[dtype, HORIZON * N_ENVS * ACTION_DIM * ACTION_DIM],
+    l_zu_seq: Tile[dtype, HORIZON * N_ENVS * LATENT_DIM * ACTION_DIM],
+    V_z_term: Tile[dtype, N_ENVS * LATENT_DIM],
+    V_zz_term: Tile[dtype, N_ENVS * LATENT_DIM * LATENT_DIM],
+    K_seq: Tile[dtype, HORIZON * N_ENVS * ACTION_DIM * LATENT_DIM],
+    k_seq: Tile[dtype, HORIZON * N_ENVS * ACTION_DIM],
     mu: Scalar[dtype],
-    bw_ok: LayoutTensor[DType.int32, Layout.row_major(N_ENVS), MutAnyOrigin],
+    bw_ok: Tile[DType.int32, N_ENVS],
 ):
     """Single-thread-per-env Riccati backward pass with LM
     regularization. Sequential ``t = T-1 .. 0`` per block.
@@ -397,7 +327,7 @@ def ilqr_backward_pass_kernel[
                 quu_solve[ii * ACTION_DIM + j] = s / d
 
         if not pd_ok:
-            bw_ok[e] = rebind[bw_ok.element_type](Scalar[DType.int32](0))
+            bw_ok[e] = rebind[bw_ok.ElementType](Scalar[DType.int32](0))
             return
 
         for c in range(_RHS_W):
@@ -422,11 +352,11 @@ def ilqr_backward_pass_kernel[
 
         # Write k, K to global buffers.
         for i in range(ACTION_DIM):
-            k_seq[k_off + i] = rebind[k_seq.element_type](
+            k_seq[k_off + i] = rebind[k_seq.ElementType](
                 rhs_solve[i * _RHS_W + 0]
             )
             for j in range(LATENT_DIM):
-                K_seq[K_off + i * LATENT_DIM + j] = rebind[K_seq.element_type](
+                K_seq[K_off + i * LATENT_DIM + j] = rebind[K_seq.ElementType](
                     rhs_solve[i * _RHS_W + 1 + j]
                 )
 
@@ -494,7 +424,7 @@ def ilqr_backward_pass_kernel[
                     tmp_LL[i * LATENT_DIM + j] + cij + cji
                 )
 
-    bw_ok[e] = rebind[bw_ok.element_type](Scalar[DType.int32](1))
+    bw_ok[e] = rebind[bw_ok.ElementType](Scalar[DType.int32](1))
 
 
 # =============================================================================
@@ -509,28 +439,12 @@ def ilqr_accept_kernel[
     LATENT_DIM: Int,
     ACTION_DIM: Int,
 ](
-    U_trial: LayoutTensor[
-        dtype,
-        Layout.row_major(HORIZON * N_ENVS * ACTION_DIM),
-        MutAnyOrigin,
-    ],
-    z_trial: LayoutTensor[
-        dtype,
-        Layout.row_major((HORIZON + 1) * N_ENVS * LATENT_DIM),
-        MutAnyOrigin,
-    ],
-    trial_cost: LayoutTensor[dtype, Layout.row_major(N_ENVS), MutAnyOrigin],
-    U: LayoutTensor[
-        dtype,
-        Layout.row_major(HORIZON * N_ENVS * ACTION_DIM),
-        MutAnyOrigin,
-    ],
-    z_seq: LayoutTensor[
-        dtype,
-        Layout.row_major((HORIZON + 1) * N_ENVS * LATENT_DIM),
-        MutAnyOrigin,
-    ],
-    total_cost: LayoutTensor[dtype, Layout.row_major(N_ENVS), MutAnyOrigin],
+    U_trial: Tile[dtype, HORIZON * N_ENVS * ACTION_DIM],
+    z_trial: Tile[dtype, (HORIZON + 1) * N_ENVS * LATENT_DIM],
+    trial_cost: Tile[dtype, N_ENVS],
+    U: Tile[dtype, HORIZON * N_ENVS * ACTION_DIM],
+    z_seq: Tile[dtype, (HORIZON + 1) * N_ENVS * LATENT_DIM],
+    total_cost: Tile[dtype, N_ENVS],
 ):
     """Per-env unconditional copy of trial → current."""
     var e = Int(block_idx.x)
@@ -539,9 +453,9 @@ def ilqr_accept_kernel[
     for t in range(HORIZON):
         var off = (t * N_ENVS + e) * ACTION_DIM
         for a in range(ACTION_DIM):
-            U[off + a] = rebind[U.element_type](U_trial[off + a])
+            U[off + a] = rebind[U.ElementType](U_trial[off + a])
     for t in range(HORIZON + 1):
         var off = (t * N_ENVS + e) * LATENT_DIM
         for d in range(LATENT_DIM):
-            z_seq[off + d] = rebind[z_seq.element_type](z_trial[off + d])
-    total_cost[e] = rebind[total_cost.element_type](trial_cost[e])
+            z_seq[off + d] = rebind[z_seq.ElementType](z_trial[off + d])
+    total_cost[e] = rebind[total_cost.ElementType](trial_cost[e])

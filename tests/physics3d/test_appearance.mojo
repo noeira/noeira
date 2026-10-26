@@ -23,7 +23,7 @@ as the default one.
 
 from std.math import sqrt
 
-from layout import Layout, LayoutTensor
+from layout import TileTensor
 
 from noeira.math3d import Vec3
 from noeira.nn.core.tensor import TensorImpl
@@ -166,16 +166,16 @@ def _look(fx: Float64, fy: Float64, fz: Float64) -> CameraFrame[DT]:
 def _shoot[
     REFLECT: Bool, SAMPLES: Int = 1
 ](
-    geoms: LayoutTensor[DT, DYN2, MutAnyOrigin],
-    app: LayoutTensor[DT, DYN1, MutAnyOrigin],
-    bodies: LayoutTensor[DT, DYN2, MutAnyOrigin],
-    xpos: LayoutTensor[DT, DYN2, MutAnyOrigin],
-    xquat: LayoutTensor[DT, DYN2, MutAnyOrigin],
-    empty: LayoutTensor[DT, DYN1, MutAnyOrigin],
-    texels: LayoutTensor[DType.uint8, DYN1, MutAnyOrigin],
-    mats: LayoutTensor[DT, DYN1, MutAnyOrigin],
-    texs: LayoutTensor[DT, DYN1, MutAnyOrigin],
-    lights: LayoutTensor[DT, DYN1, MutAnyOrigin],
+    geoms: TileTensor[DT, DYN2, MutAnyOrigin],
+    app: TileTensor[DT, DYN1, MutAnyOrigin],
+    bodies: TileTensor[DT, DYN2, MutAnyOrigin],
+    xpos: TileTensor[DT, DYN2, MutAnyOrigin],
+    xquat: TileTensor[DT, DYN2, MutAnyOrigin],
+    empty: TileTensor[DT, DYN1, MutAnyOrigin],
+    texels: TileTensor[DType.uint8, DYN1, MutAnyOrigin],
+    mats: TileTensor[DT, DYN1, MutAnyOrigin],
+    texs: TileTensor[DT, DYN1, MutAnyOrigin],
+    lights: TileTensor[DT, DYN1, MutAnyOrigin],
     frame: CameraFrame[DT],
     bg: Vec3[DT],
 ) raises -> Float64:
@@ -205,8 +205,8 @@ def main() raises:
     var meta = TensorImpl[DT]()
     var px = TensorImpl[DType.uint8]()
     _tex_tables(meta, px, 4, 4, TEX_2D)
-    var mv = meta.lt_dyn["cpu", DYN1](rl1(meta.n))
-    var pv = px.lt_dyn["cpu", DYN1](rl1(px.n))
+    var mv = meta.tt_dyn["cpu", DYN1](rl1(meta.n))
+    var pv = px.tt_dyn["cpu", DYN1](rl1(px.n))
 
     # A texel CENTRE is at (i + 0.5)/w, and there the bilinear weights are
     # (1, 0): the sample must be that texel exactly. Getting the half-texel
@@ -255,8 +255,8 @@ def main() raises:
     var cmeta = TensorImpl[DT]()
     var cpx = TensorImpl[DType.uint8]()
     _tex_tables(cmeta, cpx, 4, 4, TEX_CUBE)
-    var cmv = cmeta.lt_dyn["cpu", DYN1](rl1(cmeta.n))
-    var cpv = cpx.lt_dyn["cpu", DYN1](rl1(cpx.n))
+    var cmv = cmeta.tt_dyn["cpu", DYN1](rl1(cmeta.n))
+    var cpv = cpx.tt_dyn["cpu", DYN1](rl1(cpx.n))
     var c_out = sample_texture[DT](cmv, cpv, 0, Scalar[DT](1.9), Scalar[DT](0.5))
     var c_edge = sample_texture[DT](cmv, cpv, 0, Scalar[DT](1.0), Scalar[DT](0.5))
     t.near(
@@ -326,8 +326,8 @@ def main() raises:
     var mpx = TensorImpl[DType.uint8].alloc(len(mip))
     for i in range(len(mip)):
         mpx.data[i] = mip[i]
-    var mmv = mmeta.lt_dyn["cpu", DYN1](rl1(mmeta.n))
-    var mpv = mpx.lt_dyn["cpu", DYN1](rl1(mpx.n))
+    var mmv = mmeta.tt_dyn["cpu", DYN1](rl1(mmeta.n))
+    var mpv = mpx.tt_dyn["cpu", DYN1](rl1(mpx.n))
     # At a level-1 texel centre (0.25, 0.25) the sample IS that texel.
     var l1 = sample_texture_lod[DT](
         mmv, mpv, 0, Scalar[DT](0.25), Scalar[DT](0.25), Scalar[DT](1)
@@ -381,7 +381,7 @@ def main() raises:
     geoms.data[MODEL_GEOM_SIZE + GEOM_IDX_TYPE] = Scalar[DT](GEOM_PLANE)
     geoms.data[MODEL_GEOM_SIZE + GEOM_IDX_HALF_X] = 3.0
     geoms.data[MODEL_GEOM_SIZE + GEOM_IDX_HALF_Y] = 2.0
-    var gv = geoms.lt_dyn["cpu", DYN2](rl2(2, MODEL_GEOM_SIZE))
+    var gv = geoms.tt_dyn["cpu", DYN2](rl2(2, MODEL_GEOM_SIZE))
     var uvs = TensorImpl[DT].alloc(VIS_UV_WORDS)
     uvs.data[0] = 0.0
     uvs.data[1] = 0.0
@@ -389,7 +389,7 @@ def main() raises:
     uvs.data[3] = 0.0
     uvs.data[4] = 0.0
     uvs.data[5] = 1.0
-    var uvv = uvs.lt_dyn["cpu", DYN1](rl1(uvs.n))
+    var uvv = uvs.tt_dyn["cpu", DYN1](rl1(uvs.n))
 
     var one = Scalar[DT](1)
     # A box's +Z face: `u = (x/sx + 1)/2`, `v = 1 - (y/sy + 1)/2`. The centre
@@ -453,7 +453,7 @@ def main() raises:
     # weights corner 0, `bv` corner 1, and `1 - bu - bv` corner 2 — the same
     # order `ray_triangle` solves for.
     geoms.data[GEOM_IDX_TYPE] = Scalar[DT](GEOM_MESH)
-    var gv2 = geoms.lt_dyn["cpu", DYN2](rl2(2, MODEL_GEOM_SIZE))
+    var gv2 = geoms.tt_dyn["cpu", DYN2](rl2(2, MODEL_GEOM_SIZE))
     var mu = geom_uv[DT](
         gv2, uvv, 0, 0, Scalar[DT](0.25), Scalar[DT](0.5),
         Vec3[DT](0, 0, 0), Vec3[DT](0, 0, 1),
@@ -523,16 +523,16 @@ def main() raises:
     var rmat = TensorImpl[DT].alloc(MAX_VIS_MATERIALS * VIS_MAT_WORDS)
     var rtex = TensorImpl[DT].alloc(MAX_VIS_TEXTURES * VIS_TEX_WORDS)
 
-    var gv3 = rg.lt_dyn["cpu", DYN2](rl2(2, MODEL_GEOM_SIZE))
-    var av = ra.lt_dyn["cpu", DYN1](rl1(ra.n))
-    var bv = rb.lt_dyn["cpu", DYN2](rl2(1, MODEL_BODY_SIZE))
-    var xv = rx.lt_dyn["cpu", DYN2](rl2(1, 3))
-    var qv = rq.lt_dyn["cpu", DYN2](rl2(1, 4))
-    var e1 = one_f.lt_dyn["cpu", DYN1](rl1(1))
-    var eu = one_u8.lt_dyn["cpu", DYN1](rl1(1))
-    var mtv = rmat.lt_dyn["cpu", DYN1](rl1(rmat.n))
-    var ttv = rtex.lt_dyn["cpu", DYN1](rl1(rtex.n))
-    var ltv = rl.lt_dyn["cpu", DYN1](rl1(rl.n))
+    var gv3 = rg.tt_dyn["cpu", DYN2](rl2(2, MODEL_GEOM_SIZE))
+    var av = ra.tt_dyn["cpu", DYN1](rl1(ra.n))
+    var bv = rb.tt_dyn["cpu", DYN2](rl2(1, MODEL_BODY_SIZE))
+    var xv = rx.tt_dyn["cpu", DYN2](rl2(1, 3))
+    var qv = rq.tt_dyn["cpu", DYN2](rl2(1, 4))
+    var e1 = one_f.tt_dyn["cpu", DYN1](rl1(1))
+    var eu = one_u8.tt_dyn["cpu", DYN1](rl1(1))
+    var mtv = rmat.tt_dyn["cpu", DYN1](rl1(rmat.n))
+    var ttv = rtex.tt_dyn["cpu", DYN1](rl1(rtex.n))
+    var ltv = rl.tt_dyn["cpu", DYN1](rl1(rl.n))
     var bg = Vec3[DT](0, 0, 0)
 
     # The top face: ambient on the mirror (0.2 * 0.4) plus HALF the lid's own

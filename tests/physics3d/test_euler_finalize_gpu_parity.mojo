@@ -12,6 +12,16 @@ same values and the same worst digit, which is what says the split is the
 old kernel's arithmetic. The bound below is 1e-5 absolute: two decades
 above that rounding, five decades below what a halved damping does (0.32).
 
+⚠ ON NVIDIA IT READ 2.24e-05 UNTIL 2026-10-20, AND THE CAUSE WAS sin/cos.
+CUDA lowers float32 `std.math.sin` / `cos` to `sin.approx` / `cos.approx`:
+sin(0.025) came back 0.024997149 for 0.024997396, a 1e-5 relative error on
+every hinge quaternion in FK (the per-stage diff of one step put the first
+divergence in `xquat`, then `bias` 7.5e-6, `qacc` 1.4e-5). It was not the
+1.2 toolchain (the 1.1 PTX already used the approximations) and not the x86
+CPU leg (it matches the Mac's to the digit). FK now takes `sin_cos_device`
+(quat_math), and the RTX 5090 reads 4.8e-07; Apple, which keeps `std.math`,
+still reads 1.49e-06. The band was not moved.
+
 WHY THIS FILE EXISTS. The finalize's implicit damping (`M_hat = M +
 dt*diag(damping)`, `mj_Euler`'s eulerdamp) runs only when a dof has damping,
 and the two gates that were green while a mutant halved that damping did not

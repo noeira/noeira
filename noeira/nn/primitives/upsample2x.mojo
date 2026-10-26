@@ -12,7 +12,8 @@ gradients. Pure architectural op — no params, no cache. CPU + GPU.
 
 from max.gpu import global_idx
 from max.gpu.host import DeviceContext
-from layout import Layout, LayoutTensor, TileTensor, row_major
+from layout import TileTensor, row_major
+from noeira.core.tiles import Tile
 
 from noeira.nn.constants import DT, TPB
 from ..core.tensor import Tensor
@@ -25,10 +26,8 @@ from ..core.amp import AMPPolicy, NoAMP
 def _up2x_fwd_kernel[
     B: Int, C: Int, H: Int, W: Int,
 ](
-    inp: LayoutTensor[DT, Layout.row_major(B * C * H * W), MutAnyOrigin],
-    dst: LayoutTensor[
-        DT, Layout.row_major(B * C * (2 * H) * (2 * W)), MutAnyOrigin
-    ],
+    inp: Tile[DT, B * C * H * W],
+    dst: Tile[DT, B * C * (2 * H) * (2 * W)],
 ):
     """One thread per OUTPUT element; reads its source cell."""
     comptime OH = 2 * H
@@ -44,10 +43,8 @@ def _up2x_fwd_kernel[
 def _up2x_bwd_kernel[
     B: Int, C: Int, H: Int, W: Int,
 ](
-    gout: LayoutTensor[
-        DT, Layout.row_major(B * C * (2 * H) * (2 * W)), MutAnyOrigin
-    ],
-    gin: LayoutTensor[DT, Layout.row_major(B * C * H * W), MutAnyOrigin],
+    gout: Tile[DT, B * C * (2 * H) * (2 * W)],
+    gin: Tile[DT, B * C * H * W],
 ):
     """One thread per INPUT element; sums its 2×2 output cell grads."""
     comptime OH = 2 * H
@@ -122,8 +119,8 @@ struct Upsample2x[C: Int, H: Int, W: Int](Module):
             comptime n_blocks = (B * Self.OUT_FLAT + TPB - 1) // TPB
             comptime kernel = _up2x_fwd_kernel[B, Self.C, Self.H, Self.W]
             c.enqueue_function[kernel](
-                in0.lt["gpu", Layout.row_major(B * Self.IN_FLAT)](),
-                out.lt["gpu", Layout.row_major(B * Self.OUT_FLAT)](),
+                in0.tt["gpu", B * Self.IN_FLAT](),
+                out.tt["gpu", B * Self.OUT_FLAT](),
                 grid_dim=n_blocks,
                 block_dim=TPB,
             )
@@ -165,8 +162,8 @@ struct Upsample2x[C: Int, H: Int, W: Int](Module):
             comptime n_blocks = (B * Self.IN_FLAT + TPB - 1) // TPB
             comptime kernel = _up2x_bwd_kernel[B, Self.C, Self.H, Self.W]
             c.enqueue_function[kernel](
-                grad_output.lt["gpu", Layout.row_major(B * Self.OUT_FLAT)](),
-                gin.lt["gpu", Layout.row_major(B * Self.IN_FLAT)](),
+                grad_output.tt["gpu", B * Self.OUT_FLAT](),
+                gin.tt["gpu", B * Self.IN_FLAT](),
                 grid_dim=n_blocks,
                 block_dim=TPB,
             )

@@ -43,7 +43,7 @@ differed from MuJoCo's by up to 1.6e-3 on every mesh group of
 
 from std.math import sqrt, abs
 
-from layout import Layout, LayoutTensor
+from layout import TileTensor, TensorLayout
 
 from ..constants import GEOM_BOX, GEOM_MESH
 from ..kinematics.quat_math import quat_rotate, quat_rotate_inverse
@@ -189,9 +189,9 @@ comptime MC_DEBUG_RING: Bool = False
 
 @always_inline
 def _wr[
-    DTYPE: DType, L_WS: Layout
+    DTYPE: DType, L_WS: TensorLayout
 ](
-    ws: LayoutTensor[DTYPE, L_WS, MutAnyOrigin], wrow: Int, i: Int
+    ws: TileTensor[DTYPE, L_WS, MutAnyOrigin], wrow: Int, i: Int
 ) -> Scalar[DTYPE]:
     """One slot of the CCD workspace row.
 
@@ -205,9 +205,9 @@ def _wr[
 
 @always_inline
 def _wv[
-    DTYPE: DType, L_WS: Layout
+    DTYPE: DType, L_WS: TensorLayout
 ](
-    ws: LayoutTensor[DTYPE, L_WS, MutAnyOrigin],
+    ws: TileTensor[DTYPE, L_WS, MutAnyOrigin],
     wrow: Int,
     off: Int,
     i: Int,
@@ -293,11 +293,9 @@ def _box_corner_index[
 @always_inline
 def _mesh_vertex_index[
     DTYPE: DType,
-    L_MESH_VERTS: Layout](
+    L_MESH_VERTS: TensorLayout](
     lx: Scalar[DTYPE], ly: Scalar[DTYPE], lz: Scalar[DTYPE],
-    mesh_verts: LayoutTensor[
-        DTYPE, L_MESH_VERTS, MutAnyOrigin
-    ],
+    mesh_verts: TileTensor[DTYPE, L_MESH_VERTS, MutAnyOrigin],
     vert_adr: Int, num_verts: Int,
 ) -> Int:
     """Nearest hull vertex to a local-frame support point, or -1 if none.
@@ -400,9 +398,9 @@ def _plane_normal[
 
 @always_inline
 def _polygon_quad[
-    DTYPE: DType, L_WS: Layout
+    DTYPE: DType, L_WS: TensorLayout
 ](
-    ws: LayoutTensor[DTYPE, L_WS, MutAnyOrigin],
+    ws: TileTensor[DTYPE, L_WS, MutAnyOrigin],
     wrow: Int,
     nvert: Int,
     mut r0: Int, mut r1: Int, mut r2: Int, mut r3: Int,
@@ -491,9 +489,9 @@ def _polygon_quad[
 
 @always_inline
 def _polygon_clip[
-    DTYPE: DType, L_WS: Layout
+    DTYPE: DType, L_WS: TensorLayout
 ](
-    ws: LayoutTensor[DTYPE, L_WS, MutAnyOrigin],
+    ws: TileTensor[DTYPE, L_WS, MutAnyOrigin],
     wrow: Int,
     # ⚠ THE TWO FACES ARRIVE AS OFFSETS, NOT AS FIXED REGIONS, because the
     # caller swaps their roles: the edge/face branches clip face1 against
@@ -687,9 +685,9 @@ def _polygon_clip[
 
 @always_inline
 def _emit_out[
-    DTYPE: DType, L_WS: Layout
+    DTYPE: DType, L_WS: TensorLayout
 ](
-    ws: LayoutTensor[DTYPE, L_WS, MutAnyOrigin],
+    ws: TileTensor[DTYPE, L_WS, MutAnyOrigin],
     wrow: Int,
     k: Int,
     src: Int,
@@ -957,9 +955,9 @@ def _box_edge_normals[
 
 @always_inline
 def _box_face[
-    DTYPE: DType, L_WS: Layout
+    DTYPE: DType, L_WS: TensorLayout
 ](
-    ws: LayoutTensor[DTYPE, L_WS, MutAnyOrigin],
+    ws: TileTensor[DTYPE, L_WS, MutAnyOrigin],
     wrow: Int,
     o_face: Int,
     face_id: Int,
@@ -1021,21 +1019,15 @@ def _box_face[
 @always_inline
 def _mesh_normals[
     DTYPE: DType,
-    L_MESH_POLYS: Layout,
-    L_MESH_POLYMAP: Layout,
-    L_MESH_VERT_POLYMAP: Layout](
+    L_MESH_POLYS: TensorLayout,
+    L_MESH_POLYMAP: TensorLayout,
+    L_MESH_VERT_POLYMAP: TensorLayout](
     dim: Int, v1i: Int, v2i: Int, v3i: Int,
     qx: Scalar[DTYPE], qy: Scalar[DTYPE], qz: Scalar[DTYPE], qw: Scalar[DTYPE],
     vert_adr: Int, poly_adr: Int,
-    mesh_polys: LayoutTensor[
-        DTYPE, L_MESH_POLYS, MutAnyOrigin
-    ],
-    mesh_polymap: LayoutTensor[
-        DTYPE, L_MESH_POLYMAP, MutAnyOrigin
-    ],
-    mesh_vert_polymap: LayoutTensor[
-        DTYPE, L_MESH_VERT_POLYMAP, MutAnyOrigin
-    ],
+    mesh_polys: TileTensor[DTYPE, L_MESH_POLYS, MutAnyOrigin],
+    mesh_polymap: TileTensor[DTYPE, L_MESH_POLYMAP, MutAnyOrigin],
+    mesh_vert_polymap: TileTensor[DTYPE, L_MESH_VERT_POLYMAP, MutAnyOrigin],
     mut n: Array[Scalar[DTYPE], MC_MAX_DEG * 3],
     mut idx: Array[Int, MC_MAX_DEG],
 ) -> Int:
@@ -1139,10 +1131,10 @@ def _mesh_normals[
 @always_inline
 def _mesh_edge_normals[
     DTYPE: DType,
-    L_MESH_VERTS: Layout,
-    L_MESH_POLYS: Layout,
-    L_MESH_POLYVERT: Layout,
-    L_MESH_VERT_POLYMAP: Layout](
+    L_MESH_VERTS: TensorLayout,
+    L_MESH_POLYS: TensorLayout,
+    L_MESH_POLYVERT: TensorLayout,
+    L_MESH_VERT_POLYMAP: TensorLayout](
     dim: Int,
     v1x: Scalar[DTYPE], v1y: Scalar[DTYPE], v1z: Scalar[DTYPE],
     v2x: Scalar[DTYPE], v2y: Scalar[DTYPE], v2z: Scalar[DTYPE],
@@ -1150,21 +1142,11 @@ def _mesh_edge_normals[
     gx: Scalar[DTYPE], gy: Scalar[DTYPE], gz: Scalar[DTYPE],
     qx: Scalar[DTYPE], qy: Scalar[DTYPE], qz: Scalar[DTYPE], qw: Scalar[DTYPE],
     vert_adr: Int, poly_adr: Int,
-    mesh_verts: LayoutTensor[
-        DTYPE, L_MESH_VERTS, MutAnyOrigin
-    ],
-    mesh_polys: LayoutTensor[
-        DTYPE, L_MESH_POLYS, MutAnyOrigin
-    ],
-    mesh_polyvert: LayoutTensor[
-        DTYPE, L_MESH_POLYVERT, MutAnyOrigin
-    ],
-    mesh_polymap: LayoutTensor[
-        DTYPE, L_MESH_POLYVERT, MutAnyOrigin
-    ],
-    mesh_vert_polymap: LayoutTensor[
-        DTYPE, L_MESH_VERT_POLYMAP, MutAnyOrigin
-    ],
+    mesh_verts: TileTensor[DTYPE, L_MESH_VERTS, MutAnyOrigin],
+    mesh_polys: TileTensor[DTYPE, L_MESH_POLYS, MutAnyOrigin],
+    mesh_polyvert: TileTensor[DTYPE, L_MESH_POLYVERT, MutAnyOrigin],
+    mesh_polymap: TileTensor[DTYPE, L_MESH_POLYVERT, MutAnyOrigin],
+    mesh_vert_polymap: TileTensor[DTYPE, L_MESH_VERT_POLYMAP, MutAnyOrigin],
     mut n: Array[Scalar[DTYPE], MC_MAX_DEG * 3],
     mut endverts: Array[Scalar[DTYPE], MC_MAX_DEG * 3],
 ) -> Int:
@@ -1247,26 +1229,20 @@ def _mesh_edge_normals[
 @always_inline
 def _mesh_face[
     DTYPE: DType,
-    L_MESH_VERTS: Layout,
-    L_MESH_POLYS: Layout,
-    L_MESH_POLYVERT: Layout,
-    L_WS: Layout](
-    ws: LayoutTensor[DTYPE, L_WS, MutAnyOrigin],
+    L_MESH_VERTS: TensorLayout,
+    L_MESH_POLYS: TensorLayout,
+    L_MESH_POLYVERT: TensorLayout,
+    L_WS: TensorLayout](
+    ws: TileTensor[DTYPE, L_WS, MutAnyOrigin],
     wrow: Int,
     o_face: Int,
     face_id: Int,
     gx: Scalar[DTYPE], gy: Scalar[DTYPE], gz: Scalar[DTYPE],
     qx: Scalar[DTYPE], qy: Scalar[DTYPE], qz: Scalar[DTYPE], qw: Scalar[DTYPE],
     vert_adr: Int, poly_adr: Int,
-    mesh_verts: LayoutTensor[
-        DTYPE, L_MESH_VERTS, MutAnyOrigin
-    ],
-    mesh_polys: LayoutTensor[
-        DTYPE, L_MESH_POLYS, MutAnyOrigin
-    ],
-    mesh_polyvert: LayoutTensor[
-        DTYPE, L_MESH_POLYVERT, MutAnyOrigin
-    ],
+    mesh_verts: TileTensor[DTYPE, L_MESH_VERTS, MutAnyOrigin],
+    mesh_polys: TileTensor[DTYPE, L_MESH_POLYS, MutAnyOrigin],
+    mesh_polyvert: TileTensor[DTYPE, L_MESH_POLYVERT, MutAnyOrigin],
 ) -> Int:
     """`meshFace` — one polygon in world coordinates, REVERSED.
 
@@ -1347,12 +1323,12 @@ def _aligned_face_edge[
 def native_multicontact_contacts[
     DTYPE: DType,
     D: DimsLike,
-    L_MESH_VERTS: Layout,
-    L_MESH_POLYS: Layout,
-    L_MESH_POLYVERT: Layout,
-    L_MESH_VERT_POLYMAP: Layout,
-    L_CONTACTS: Layout,
-    L_WS: Layout,
+    L_MESH_VERTS: TensorLayout,
+    L_MESH_POLYS: TensorLayout,
+    L_MESH_POLYVERT: TensorLayout,
+    L_MESH_VERT_POLYMAP: TensorLayout,
+    L_CONTACTS: TensorLayout,
+    L_WS: TensorLayout,
 ](
     env: Int, body_a: Int, body_b: Int,
     gi_type: Int,
@@ -1368,21 +1344,11 @@ def native_multicontact_contacts[
     hxj: Scalar[DTYPE], hyj: Scalar[DTYPE], hzj: Scalar[DTYPE],
     rbound_j: Scalar[DTYPE], va2: Int, mnv2: Int, pa2: Int, pn2: Int,
     dims: D,
-    mesh_verts: LayoutTensor[
-        DTYPE, L_MESH_VERTS, MutAnyOrigin
-    ],
-    mesh_polys: LayoutTensor[
-        DTYPE, L_MESH_POLYS, MutAnyOrigin
-    ],
-    mesh_polyvert: LayoutTensor[
-        DTYPE, L_MESH_POLYVERT, MutAnyOrigin
-    ],
-    mesh_polymap: LayoutTensor[
-        DTYPE, L_MESH_POLYVERT, MutAnyOrigin
-    ],
-    mesh_vert_polymap: LayoutTensor[
-        DTYPE, L_MESH_VERT_POLYMAP, MutAnyOrigin
-    ],
+    mesh_verts: TileTensor[DTYPE, L_MESH_VERTS, MutAnyOrigin],
+    mesh_polys: TileTensor[DTYPE, L_MESH_POLYS, MutAnyOrigin],
+    mesh_polyvert: TileTensor[DTYPE, L_MESH_POLYVERT, MutAnyOrigin],
+    mesh_polymap: TileTensor[DTYPE, L_MESH_POLYVERT, MutAnyOrigin],
+    mesh_vert_polymap: TileTensor[DTYPE, L_MESH_VERT_POLYMAP, MutAnyOrigin],
     wf1: Array[Scalar[DTYPE], 9],
     wf2: Array[Scalar[DTYPE], 9],
     wx: Array[Scalar[DTYPE], 6],
@@ -1396,13 +1362,10 @@ def native_multicontact_contacts[
     contact_friction_roll: Scalar[DTYPE],
     contact_condim: Int,
     flip_normal: Bool,
-    contacts: LayoutTensor[
-        DTYPE, L_CONTACTS,
-        MutAnyOrigin,
-    ],
+    contacts: TileTensor[DTYPE, L_CONTACTS, MutAnyOrigin],
     # The polygon buffers, one row per env — see `ccd_workspace.mojo`. This
     # routine shares `d.ccd_ws` with EPA and uses a DISJOINT region of it.
-    ws: LayoutTensor[DTYPE, L_WS, MutAnyOrigin],
+    ws: TileTensor[DTYPE, L_WS, MutAnyOrigin],
     wrow: Int,
     mut num_contacts: Int,
     # ⚠ THE GAP HALF OF THE PAIR'S MARGIN, DEFAULTED TO 0 SO EVERY

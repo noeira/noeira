@@ -22,8 +22,8 @@ Run:
 """
 
 from std.math import abs as mabs
-from std.memory import alloc, memset
-from layout import Layout, LayoutTensor
+from std.memory import alloc, unsafe_memset
+from noeira.core.tiles import tile
 
 from noeira.nn.constants import DT as dtype
 from noeira.experimental.pcn.pc_initializer import PCXavier
@@ -69,9 +69,7 @@ def main() raises:
     var eps_raw = alloc[Scalar[dtype]](SCRATCH).as_unsafe_any_origin()
     for i in range(SCRATCH):
         eps_raw[unsafe_offset=i] = 1.0
-    var eps_t = LayoutTensor[
-        dtype, Layout.row_major(BATCH, NET.SCRATCH_OUT_DIM), MutAnyOrigin
-    ](eps_raw)
+    var eps_t = tile[BATCH, NET.SCRATCH_OUT_DIM](eps_raw)
 
     comptime TARGET_LEVEL = 1
     var inv_sigma = Scalar[dtype](2.0)
@@ -125,10 +123,8 @@ def main() raises:
 
     # ── Shared setup for the driver checks ───────────────────────────────────
     var params_buf = alloc[Scalar[dtype]](NET.PARAM_SIZE).as_unsafe_any_origin()
-    memset(params_buf, 0, NET.PARAM_SIZE)
-    var params = LayoutTensor[
-        dtype, Layout.row_major(NET.PARAM_SIZE), MutAnyOrigin
-    ](params_buf)
+    unsafe_memset(params_buf, 0, NET.PARAM_SIZE)
+    var params = tile[NET.PARAM_SIZE](params_buf)
     NET.pc_init_params[PCXavier, dtype](params)
 
     var lat_buf = alloc[Scalar[dtype]](BATCH * NET.LATENT_DIM).as_unsafe_any_origin()
@@ -136,27 +132,17 @@ def main() raises:
     var a_below_raw = alloc[Scalar[dtype]](BATCH * NET.SCRATCH_IN_DIM).as_unsafe_any_origin()
     var z_below_raw = alloc[Scalar[dtype]](BATCH * NET.SCRATCH_IN_DIM).as_unsafe_any_origin()
     var dx_raw = alloc[Scalar[dtype]](BATCH * NET.LATENT_DIM).as_unsafe_any_origin()
-    memset(lat_buf, 0, BATCH * NET.LATENT_DIM)
-    memset(mu_eps_raw, 0, BATCH * NET.SCRATCH_OUT_DIM)
-    memset(a_below_raw, 0, BATCH * NET.SCRATCH_IN_DIM)
-    memset(z_below_raw, 0, BATCH * NET.SCRATCH_IN_DIM)
-    memset(dx_raw, 0, BATCH * NET.LATENT_DIM)
+    unsafe_memset(lat_buf, 0, BATCH * NET.LATENT_DIM)
+    unsafe_memset(mu_eps_raw, 0, BATCH * NET.SCRATCH_OUT_DIM)
+    unsafe_memset(a_below_raw, 0, BATCH * NET.SCRATCH_IN_DIM)
+    unsafe_memset(z_below_raw, 0, BATCH * NET.SCRATCH_IN_DIM)
+    unsafe_memset(dx_raw, 0, BATCH * NET.LATENT_DIM)
 
-    var latents = LayoutTensor[
-        dtype, Layout.row_major(BATCH, NET.LATENT_DIM), MutAnyOrigin
-    ](lat_buf)
-    var mu_eps_buf = LayoutTensor[
-        dtype, Layout.row_major(BATCH, NET.SCRATCH_OUT_DIM), MutAnyOrigin
-    ](mu_eps_raw)
-    var a_below_buf = LayoutTensor[
-        dtype, Layout.row_major(BATCH, NET.SCRATCH_IN_DIM), MutAnyOrigin
-    ](a_below_raw)
-    var z_below_buf = LayoutTensor[
-        dtype, Layout.row_major(BATCH, NET.SCRATCH_IN_DIM), MutAnyOrigin
-    ](z_below_raw)
-    var dx_buf = LayoutTensor[
-        dtype, Layout.row_major(BATCH, NET.LATENT_DIM), MutAnyOrigin
-    ](dx_raw)
+    var latents = tile[BATCH, NET.LATENT_DIM](lat_buf)
+    var mu_eps_buf = tile[BATCH, NET.SCRATCH_OUT_DIM](mu_eps_raw)
+    var a_below_buf = tile[BATCH, NET.SCRATCH_IN_DIM](a_below_raw)
+    var z_below_buf = tile[BATCH, NET.SCRATCH_IN_DIM](z_below_raw)
+    var dx_buf = tile[BATCH, NET.LATENT_DIM](dx_raw)
 
     var x_raw = alloc[Scalar[dtype]](BATCH * NET.IN_DIM).as_unsafe_any_origin()
     var y_raw = alloc[Scalar[dtype]](BATCH * NET.OUT_DIM).as_unsafe_any_origin()
@@ -169,28 +155,18 @@ def main() raises:
             y_raw[unsafe_offset=b * NET.OUT_DIM + k] = (
                 1.0 if k == (b % NET.OUT_DIM) else 0.0
             )
-    var x_in = LayoutTensor[
-        dtype, Layout.row_major(BATCH, NET.IN_DIM), MutAnyOrigin
-    ](x_raw)
-    var y_target = LayoutTensor[
-        dtype, Layout.row_major(BATCH, NET.OUT_DIM), MutAnyOrigin
-    ](y_raw)
+    var x_in = tile[BATCH, NET.IN_DIM](x_raw)
+    var y_target = tile[BATCH, NET.OUT_DIM](y_raw)
 
     var g_base = alloc[Scalar[dtype]](NET.PARAM_SIZE).as_unsafe_any_origin()
     var g_off = alloc[Scalar[dtype]](NET.PARAM_SIZE).as_unsafe_any_origin()
     var g_on = alloc[Scalar[dtype]](NET.PARAM_SIZE).as_unsafe_any_origin()
-    memset(g_base, 0, NET.PARAM_SIZE)
-    memset(g_off, 0, NET.PARAM_SIZE)
-    memset(g_on, 0, NET.PARAM_SIZE)
-    var grads_base = LayoutTensor[
-        dtype, Layout.row_major(NET.PARAM_SIZE), MutAnyOrigin
-    ](g_base)
-    var grads_off = LayoutTensor[
-        dtype, Layout.row_major(NET.PARAM_SIZE), MutAnyOrigin
-    ](g_off)
-    var grads_on = LayoutTensor[
-        dtype, Layout.row_major(NET.PARAM_SIZE), MutAnyOrigin
-    ](g_on)
+    unsafe_memset(g_base, 0, NET.PARAM_SIZE)
+    unsafe_memset(g_off, 0, NET.PARAM_SIZE)
+    unsafe_memset(g_on, 0, NET.PARAM_SIZE)
+    var grads_base = tile[NET.PARAM_SIZE](g_base)
+    var grads_off = tile[NET.PARAM_SIZE](g_off)
+    var grads_on = tile[NET.PARAM_SIZE](g_on)
 
     # ── Check 2: default == explicit σ=1, bitwise ────────────────────────────
     print("\n[2] disabled default is bitwise identical to spike_sigma=1")
@@ -256,16 +232,12 @@ def main() raises:
     print("\n[5] forward updates move interior grads, not the readout block")
 
     var lat0_raw = alloc[Scalar[dtype]](BATCH * NET.LATENT_DIM).as_unsafe_any_origin()
-    memset(lat0_raw, 0, BATCH * NET.LATENT_DIM)
-    var latents_0 = LayoutTensor[
-        dtype, Layout.row_major(BATCH, NET.LATENT_DIM), MutAnyOrigin
-    ](lat0_raw)
+    unsafe_memset(lat0_raw, 0, BATCH * NET.LATENT_DIM)
+    var latents_0 = tile[BATCH, NET.LATENT_DIM](lat0_raw)
 
     var g_fwd = alloc[Scalar[dtype]](NET.PARAM_SIZE).as_unsafe_any_origin()
-    memset(g_fwd, 0, NET.PARAM_SIZE)
-    var grads_fwd = LayoutTensor[
-        dtype, Layout.row_major(NET.PARAM_SIZE), MutAnyOrigin
-    ](g_fwd)
+    unsafe_memset(g_fwd, 0, NET.PARAM_SIZE)
+    var grads_fwd = tile[NET.PARAM_SIZE](g_fwd)
 
     var r_fwd = TRAINER.compute_grads_only_fwd[BATCH](
         params, grads_fwd, latents, latents_0, mu_eps_buf, a_below_buf,

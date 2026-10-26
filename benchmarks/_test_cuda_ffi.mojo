@@ -17,7 +17,7 @@ from max.gpu import thread_idx, block_idx, block_dim
 from std.ffi import OwnedDLHandle, c_int
 from std.memory import alloc
 from std.time import perf_counter_ns
-from layout import Layout, LayoutTensor
+from noeira.core.tiles import Tile, ImmTile, tile
 from noeira.nn.constants import DT as dtype
 
 
@@ -25,9 +25,9 @@ comptime CUptr = Pointer[NoneType, MutAnyOrigin]
 
 
 def add_kernel[N: Int](
-    output: LayoutTensor[dtype, Layout.row_major(N), MutAnyOrigin],
-    a: LayoutTensor[dtype, Layout.row_major(N), ImmutAnyOrigin],
-    b: LayoutTensor[dtype, Layout.row_major(N), ImmutAnyOrigin],
+    output: Tile[dtype, N],
+    a: ImmTile[dtype, N],
+    b: ImmTile[dtype, N],
 ):
     var tid = Int(thread_idx.x) + Int(block_idx.x) * Int(block_dim.x)
     if tid < N:
@@ -35,8 +35,8 @@ def add_kernel[N: Int](
 
 
 def scale_kernel[N: Int](
-    output: LayoutTensor[dtype, Layout.row_major(N), MutAnyOrigin],
-    input: LayoutTensor[dtype, Layout.row_major(N), ImmutAnyOrigin],
+    output: Tile[dtype, N],
+    input: ImmTile[dtype, N],
 ):
     var tid = Int(thread_idx.x) + Int(block_idx.x) * Int(block_dim.x)
     if tid < N:
@@ -44,7 +44,7 @@ def scale_kernel[N: Int](
 
 
 def relu_kernel[N: Int](
-    data: LayoutTensor[dtype, Layout.row_major(N), MutAnyOrigin],
+    data: Tile[dtype, N],
 ):
     var tid = Int(thread_idx.x) + Int(block_idx.x) * Int(block_dim.x)
     if tid < N:
@@ -99,12 +99,12 @@ def main() raises:
     d_buf.enqueue_fill(Scalar[dtype](0.0))
     ctx.synchronize()
 
-    var a_t = LayoutTensor[dtype, Layout.row_major(N), ImmutAnyOrigin](a_buf)
-    var b_t = LayoutTensor[dtype, Layout.row_major(N), ImmutAnyOrigin](b_buf)
-    var c_t = LayoutTensor[dtype, Layout.row_major(N), MutAnyOrigin](c_buf)
-    var c_i = LayoutTensor[dtype, Layout.row_major(N), ImmutAnyOrigin](c_buf)
-    var d_t = LayoutTensor[dtype, Layout.row_major(N), MutAnyOrigin](d_buf)
-    var d_i = LayoutTensor[dtype, Layout.row_major(N), ImmutAnyOrigin](d_buf)
+    var a_t = tile[N](a_buf)
+    var b_t = tile[N](b_buf)
+    var c_t = tile[N](c_buf)
+    var c_i = tile[N](c_buf)
+    var d_t = tile[N](d_buf)
+    var d_i = tile[N](d_buf)
 
     comptime k_add = add_kernel[N]
     comptime k_scale = scale_kernel[N]

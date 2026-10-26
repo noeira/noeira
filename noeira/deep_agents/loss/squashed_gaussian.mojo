@@ -42,7 +42,8 @@ from std.math import exp, log, tanh as ftanh
 from max.gpu import global_idx
 from max.gpu.host import DeviceContext
 from max.gpu.memory import AddressSpace
-from layout import Layout, LayoutTensor, TileTensor
+from layout import TileTensor
+from noeira.core.tiles import Tile, tile
 
 from noeira.nn.constants import DT, TPB, TPB_REDUCE
 
@@ -193,13 +194,11 @@ def squashed_gaussian_backward[ACT: Int, BATCH: Int](
 def _sg_forward_kernel[
     ACT: Int, BATCH: Int,
 ](
-    actor_output: LayoutTensor[
-        DT, Layout.row_major(BATCH, 2 * ACT), MutAnyOrigin,
-    ],
-    z: LayoutTensor[DT, Layout.row_major(BATCH, ACT), MutAnyOrigin],
+    actor_output: Tile[DT, BATCH, 2 * ACT],
+    z: Tile[DT, BATCH, ACT],
     action_scale: Scalar[DT],
-    action: LayoutTensor[DT, Layout.row_major(BATCH, ACT), MutAnyOrigin],
-    log_prob: LayoutTensor[DT, Layout.row_major(BATCH), MutAnyOrigin],
+    action: Tile[DT, BATCH, ACT],
+    log_prob: Tile[DT, BATCH],
 ):
     var b = Int(global_idx.x)
     if b >= BATCH:
@@ -231,18 +230,12 @@ def _sg_forward_kernel[
 def _sg_backward_kernel[
     ACT: Int, BATCH: Int,
 ](
-    actor_output: LayoutTensor[
-        DT, Layout.row_major(BATCH, 2 * ACT), MutAnyOrigin,
-    ],
-    z: LayoutTensor[DT, Layout.row_major(BATCH, ACT), MutAnyOrigin],
-    grad_action: LayoutTensor[
-        DT, Layout.row_major(BATCH, ACT), MutAnyOrigin,
-    ],
-    grad_log_prob: LayoutTensor[DT, Layout.row_major(BATCH), MutAnyOrigin],
+    actor_output: Tile[DT, BATCH, 2 * ACT],
+    z: Tile[DT, BATCH, ACT],
+    grad_action: Tile[DT, BATCH, ACT],
+    grad_log_prob: Tile[DT, BATCH],
     action_scale: Scalar[DT],
-    grad_actor_output: LayoutTensor[
-        DT, Layout.row_major(BATCH, 2 * ACT), MutAnyOrigin,
-    ],
+    grad_actor_output: Tile[DT, BATCH, 2 * ACT],
 ):
     var idx = Int(global_idx.x)
     var total = BATCH * ACT
@@ -301,12 +294,10 @@ def squashed_gaussian_forward_gpu[ACT: Int, BATCH: Int](
 
     Pointer-based API (not TileTensor) because callers thread raw
     DeviceBuffer pointers through the SAC trainer scratch."""
-    var ao_lt = LayoutTensor[
-        DT, Layout.row_major(BATCH, 2 * ACT), MutAnyOrigin,
-    ](actor_output_ptr)
-    var z_lt = LayoutTensor[DT, Layout.row_major(BATCH, ACT), MutAnyOrigin](z_ptr)
-    var a_lt = LayoutTensor[DT, Layout.row_major(BATCH, ACT), MutAnyOrigin](action_ptr)
-    var lp_lt = LayoutTensor[DT, Layout.row_major(BATCH), MutAnyOrigin](log_prob_ptr)
+    var ao_lt = tile[BATCH, 2 * ACT](actor_output_ptr)
+    var z_lt = tile[BATCH, ACT](z_ptr)
+    var a_lt = tile[BATCH, ACT](action_ptr)
+    var lp_lt = tile[BATCH](log_prob_ptr)
     comptime TPB = TPB_REDUCE
     comptime n_blocks = (BATCH + TPB - 1) // TPB
     comptime kernel = _sg_forward_kernel[ACT, BATCH]
@@ -326,19 +317,11 @@ def squashed_gaussian_backward_gpu[ACT: Int, BATCH: Int](
     grad_actor_output_ptr: Pointer[Scalar[DT], MutAnyOrigin],
 ) raises:
     """GPU backward — one thread per [b, j], no reduction."""
-    var ao_lt = LayoutTensor[
-        DT, Layout.row_major(BATCH, 2 * ACT), MutAnyOrigin,
-    ](actor_output_ptr)
-    var z_lt = LayoutTensor[DT, Layout.row_major(BATCH, ACT), MutAnyOrigin](z_ptr)
-    var ga_lt = LayoutTensor[
-        DT, Layout.row_major(BATCH, ACT), MutAnyOrigin,
-    ](grad_action_ptr)
-    var glp_lt = LayoutTensor[
-        DT, Layout.row_major(BATCH), MutAnyOrigin,
-    ](grad_log_prob_ptr)
-    var gao_lt = LayoutTensor[
-        DT, Layout.row_major(BATCH, 2 * ACT), MutAnyOrigin,
-    ](grad_actor_output_ptr)
+    var ao_lt = tile[BATCH, 2 * ACT](actor_output_ptr)
+    var z_lt = tile[BATCH, ACT](z_ptr)
+    var ga_lt = tile[BATCH, ACT](grad_action_ptr)
+    var glp_lt = tile[BATCH](grad_log_prob_ptr)
+    var gao_lt = tile[BATCH, 2 * ACT](grad_actor_output_ptr)
     comptime total = BATCH * ACT
     comptime n_blocks = (total + TPB - 1) // TPB
     comptime kernel = _sg_backward_kernel[ACT, BATCH]

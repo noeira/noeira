@@ -41,7 +41,6 @@ elementwise helper kernels reuse REDQ's actor-loss kernels.
 """
 
 from max.gpu.host import DeviceContext
-from layout import Layout
 
 from noeira.nn.constants import DT, TPB
 from noeira.nn.core.amp import AMPPolicy, NoAMP
@@ -241,10 +240,10 @@ struct EnsembleActorStepOFE[
                 Self.PHI_S_DIM, Self.ACT, BB, Self.SA_IN_DIM, Self.ALP_DIM,
             ]
             c.enqueue_function[kernel](
-                phi_s.lt["gpu", Layout.row_major(BB, Self.PHI_S_DIM)](),
-                self._mb_alp.lt["gpu", Layout.row_major(BB, Self.ALP_DIM)](),
-                self._mb_sa_in.lt["gpu", Layout.row_major(BB, Self.SA_IN_DIM)](),
-                self._mb_lp.lt["gpu", Layout.row_major(BB)](),
+                phi_s.tt["gpu", BB, Self.PHI_S_DIM](),
+                self._mb_alp.tt["gpu", BB, Self.ALP_DIM](),
+                self._mb_sa_in.tt["gpu", BB, Self.SA_IN_DIM](),
+                self._mb_lp.tt["gpu", BB](),
                 grid_dim=n_blocks, block_dim=TPB,
             )
 
@@ -262,7 +261,7 @@ struct EnsembleActorStepOFE[
             var c = ctx.value()
             comptime nbb = (BB + TPB - 1) // TPB
             c.enqueue_function[_eal_zero_kernel[BB]](
-                self._mb_q_sum.lt["gpu", Layout.row_major(BB)](),
+                self._mb_q_sum.tt["gpu", BB](),
                 grid_dim=nbb, block_dim=TPB,
             )
         for i in range(Self.N):
@@ -277,8 +276,8 @@ struct EnsembleActorStepOFE[
                 var c = ctx.value()
                 comptime nbb = (BB + TPB - 1) // TPB
                 c.enqueue_function[_eal_add_into_kernel[BB]](
-                    self._mb_q_sum.lt["gpu", Layout.row_major(BB)](),
-                    self._mb_q_i.lt["gpu", Layout.row_major(BB)](),
+                    self._mb_q_sum.tt["gpu", BB](),
+                    self._mb_q_i.tt["gpu", BB](),
                     grid_dim=nbb, block_dim=TPB,
                 )
 
@@ -311,7 +310,7 @@ struct EnsembleActorStepOFE[
             var c = ctx.value()
             comptime nbb = (BB + TPB - 1) // TPB
             c.enqueue_function[_eal_fill_const_kernel[BB]](
-                self._mb_grad_q_i.lt["gpu", Layout.row_major(BB)](),
+                self._mb_grad_q_i.tt["gpu", BB](),
                 grad_q_val,
                 grid_dim=nbb, block_dim=TPB,
             )
@@ -323,9 +322,7 @@ struct EnsembleActorStepOFE[
             var c = ctx.value()
             comptime n_blocks_z = (PSA_TOTAL + TPB - 1) // TPB
             c.enqueue_function[_eal_zero_kernel[PSA_TOTAL]](
-                self._mb_grad_phi_sa_sum.lt[
-                    "gpu", Layout.row_major(PSA_TOTAL)
-                ](),
+                self._mb_grad_phi_sa_sum.tt["gpu", PSA_TOTAL](),
                 grid_dim=n_blocks_z, block_dim=TPB,
             )
         for i in range(Self.N):
@@ -351,12 +348,8 @@ struct EnsembleActorStepOFE[
                 var c = ctx.value()
                 comptime n_blocks_a = (PSA_TOTAL + TPB - 1) // TPB
                 c.enqueue_function[_eal_add_into_kernel[PSA_TOTAL]](
-                    self._mb_grad_phi_sa_sum.lt[
-                        "gpu", Layout.row_major(PSA_TOTAL)
-                    ](),
-                    self._mb_grad_phi_sa_i.lt[
-                        "gpu", Layout.row_major(PSA_TOTAL)
-                    ](),
+                    self._mb_grad_phi_sa_sum.tt["gpu", PSA_TOTAL](),
+                    self._mb_grad_phi_sa_i.tt["gpu", PSA_TOTAL](),
                     grid_dim=n_blocks_a, block_dim=TPB,
                 )
 
@@ -387,10 +380,8 @@ struct EnsembleActorStepOFE[
                 BB, Self.PHI_S_DIM, Self.ACT, Self.SA_IN_DIM, Self.ALP_DIM,
             ]
             c.enqueue_function[build_galp](
-                self._mb_grad_sa_in.lt[
-                    "gpu", Layout.row_major(BB, Self.SA_IN_DIM)
-                ](),
-                self._mb_grad_alp.lt["gpu", Layout.row_major(BB, Self.ALP_DIM)](),
+                self._mb_grad_sa_in.tt["gpu", BB, Self.SA_IN_DIM](),
+                self._mb_grad_alp.tt["gpu", BB, Self.ALP_DIM](),
                 grad_lp_val,
                 grid_dim=n_blocks_g, block_dim=TPB,
             )

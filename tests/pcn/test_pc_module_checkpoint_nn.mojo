@@ -22,7 +22,7 @@ Run:
 from std.random import seed, random_float64
 from std.testing import assert_true
 from std.math import abs
-from layout import Layout, LayoutTensor
+from noeira.core.tiles import tile
 
 from noeira.nn.constants import DT
 from noeira.nn.optimizer.adam import AdamW
@@ -71,12 +71,8 @@ def main() raises:
             for i in range(IN):
                 acc += x_s[b * IN + i] * w_true[i * OUT + j]
             y_s[b * OUT + j] = acc
-    var x_in = LayoutTensor[DT, Layout.row_major(BATCH, IN), MutAnyOrigin](
-        mptr(x_s)
-    )
-    var y_target = LayoutTensor[DT, Layout.row_major(BATCH, OUT), MutAnyOrigin](
-        mptr(y_s)
-    )
+    var x_in = tile[BATCH, IN](mptr(x_s))
+    var y_target = tile[BATCH, OUT](mptr(y_s))
 
     # Train with AdamW (proves optimizer-generic trainer).
     var net = Net.make_pcn[PCXavier]()
@@ -113,18 +109,10 @@ def main() raises:
     # Functional equivalence: same forward_eval output.
     var o1 = List[Scalar[DT]](length=BATCH * OUT, fill=Scalar[DT](0))
     var o2 = List[Scalar[DT]](length=BATCH * OUT, fill=Scalar[DT](0))
-    var p1 = LayoutTensor[DT, Layout.row_major(PSIZE), MutAnyOrigin](
-        mptr(net.weights.val.data)
-    )
-    var p2 = LayoutTensor[DT, Layout.row_major(PSIZE), MutAnyOrigin](
-        mptr(net2.weights.val.data)
-    )
-    var out1 = LayoutTensor[DT, Layout.row_major(BATCH, OUT), MutAnyOrigin](
-        mptr(o1)
-    )
-    var out2 = LayoutTensor[DT, Layout.row_major(BATCH, OUT), MutAnyOrigin](
-        mptr(o2)
-    )
+    var p1 = tile[PSIZE](mptr(net.weights.val.data))
+    var p2 = tile[PSIZE](mptr(net2.weights.val.data))
+    var out1 = tile[BATCH, OUT](mptr(o1))
+    var out2 = tile[BATCH, OUT](mptr(o2))
     Seq.forward_eval[BATCH](x_in, p1, out1)
     Seq.forward_eval[BATCH](x_in, p2, out2)
     var out_diff = Float64(0.0)

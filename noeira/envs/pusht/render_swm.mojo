@@ -29,11 +29,11 @@ inclusive). G4b measures what is left.
 """
 
 from std.math import cos, sin, sqrt, floor
-from layout import Layout, LayoutTensor
 
 from noeira.physics2d import dtype
 from .constants import PConstants
 from .geometry import t_rect_long_vertex, t_rect_stem_vertex
+from noeira.core.tiles import Tile
 
 
 comptime CANVAS = 512
@@ -207,9 +207,9 @@ def render_pusht_swm_canvas_goal(
 def render_pusht_swm_at[OUT: Int](
     block_x: Scalar[dtype], block_y: Scalar[dtype], block_angle: Scalar[dtype],
     agent_x: Scalar[dtype], agent_y: Scalar[dtype],
-    pix: LayoutTensor[dtype, Layout.row_major(OUT, OUT, 3), MutAnyOrigin],
+    pix: Tile[dtype, OUT, OUT, 3],
 ):
-    """swm 0.0.6's frame at OUT x OUT, HWC in [0, 255] — the same contract as
+    """`swm` 0.0.6's frame at OUT x OUT, HWC in [0, 255] — the same contract as
     `render.render_pusht_rgb_at`. The resize is `cv2.resize`'s INTER_LINEAR."""
     var canvas = render_pusht_swm_canvas(
         Float64(block_x), Float64(block_y), Float64(block_angle),

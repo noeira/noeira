@@ -38,7 +38,8 @@ from max.gpu.sync import barrier
 from max.gpu.memory import AddressSpace
 from max.gpu.host import DeviceContext, DeviceBuffer
 from std.time import perf_counter_ns
-from layout import Layout, LayoutTensor, TileTensor, row_major, Idx
+from layout import TileTensor, row_major, Idx
+from noeira.core.tiles import Tile, tile, shared_tile
 from layout.tile_layout import Layout as TileLayout
 from linalg.matmul import matmul as max_matmul
 from linalg.bmm import batched_matmul
@@ -58,20 +59,14 @@ def _implicit_gemm_fwd[
     IC: Int, K: Int, S: Int, P: Int, H: Int, W: Int, OH: Int, OW: Int,
     IN_FLAT: Int, COL: Int, SO: Int, BS: Int, OC: Int,
 ](
-    input: LayoutTensor[DT, Layout.row_major(BS // SO * IN_FLAT), MutAnyOrigin],
-    gather: LayoutTensor[IT, Layout.row_major(SO * COL), MutAnyOrigin],
-    weight: LayoutTensor[DT, Layout.row_major(OC, COL), MutAnyOrigin],
-    bias: LayoutTensor[DT, Layout.row_major(OC), MutAnyOrigin],
-    output: LayoutTensor[DT, Layout.row_major(BS, OC), MutAnyOrigin],
+    input: Tile[DT, BS // SO * IN_FLAT],
+    gather: Tile[IT, SO * COL],
+    weight: Tile[DT, OC, COL],
+    bias: Tile[DT, OC],
+    output: Tile[DT, BS, OC],
 ):
-    var a_sh = LayoutTensor[
-        DT, Layout.row_major(TILE, TILE), MutAnyOrigin,
-        address_space=AddressSpace.SHARED,
-    ].stack_allocation()
-    var b_sh = LayoutTensor[
-        DT, Layout.row_major(TILE, TILE), MutAnyOrigin,
-        address_space=AddressSpace.SHARED,
-    ].stack_allocation()
+    var a_sh = shared_tile[DT, TILE, TILE]()
+    var b_sh = shared_tile[DT, TILE, TILE]()
 
     var ty = Int(thread_idx.y)
     var tx = Int(thread_idx.x)
@@ -110,8 +105,8 @@ def _implicit_gemm_fwd[
 
 # ── baseline helpers ──────────────────────────────────────────────────────
 def _bias_add[BS: Int, OC: Int](
-    output: LayoutTensor[DT, Layout.row_major(BS, OC), MutAnyOrigin],
-    bias: LayoutTensor[DT, Layout.row_major(OC), MutAnyOrigin],
+    output: Tile[DT, BS, OC],
+    bias: Tile[DT, OC],
 ):
     var idx = Int(global_idx.x)
     if idx >= BS * OC:
@@ -177,11 +172,11 @@ def _verify[
     _ = obuf.enqueue_fill(Scalar[DT](-999.0))
 
     var g = _build_gather[IC, K, S, P, H, W, OH, OW, COL, SO](ctx)
-    var inl = LayoutTensor[DT, Layout.row_major(BATCH * IN_FLAT), MutAnyOrigin](inp)
-    var gl = LayoutTensor[IT, Layout.row_major(SO * COL), MutAnyOrigin](g)
-    var wl = LayoutTensor[DT, Layout.row_major(OC, COL), MutAnyOrigin](wbuf)
-    var bl = LayoutTensor[DT, Layout.row_major(OC), MutAnyOrigin](bbuf)
-    var ol = LayoutTensor[DT, Layout.row_major(BS, OC), MutAnyOrigin](obuf)
+    var inl = tile[BATCH * IN_FLAT](inp)
+    var gl = tile[SO * COL](g)
+    var wl = tile[OC, COL](wbuf)
+    var bl = tile[OC](bbuf)
+    var ol = tile[BS, OC](obuf)
     comptime gx = (OC + TILE - 1) // TILE
     comptime gy = (BS + TILE - 1) // TILE
     ctx.enqueue_function[
@@ -224,13 +219,13 @@ def _time_baseline[
     _ = inp.enqueue_fill(Scalar[DT](0.01))
     _ = wbuf.enqueue_fill(Scalar[DT](0.01))
     _ = bbuf.enqueue_fill(Scalar[DT](0.0))
-    var inl = LayoutTensor[DT, Layout.row_major(BATCH, IN_FLAT), MutAnyOrigin](inp)
-    var coll = LayoutTensor[DT, Layout.row_major(BS, COL), MutAnyOrigin](colb)
+    var inl = tile[BATCH, IN_FLAT](inp)
+    var coll = tile[BS, COL](colb)
     var col_tt = TileTensor(colb, row_major[BS, COL]())
     var w_tt = TileTensor(wbuf, row_major[OC, COL]())
     var outp_tt = TileTensor(obuf, row_major[BS, OC]())
-    var bl = LayoutTensor[DT, Layout.row_major(OC), MutAnyOrigin](bbuf)
-    var ol = LayoutTensor[DT, Layout.row_major(BS, OC), MutAnyOrigin](obuf)
+    var bl = tile[OC](bbuf)
+    var ol = tile[BS, OC](obuf)
     comptime nb_col = (BS * COL + TPB - 1) // TPB
     comptime nb_bias = (BS * OC + TPB - 1) // TPB
 
@@ -269,11 +264,11 @@ def _time_o5[
     _ = wbuf.enqueue_fill(Scalar[DT](0.01))
     _ = bbuf.enqueue_fill(Scalar[DT](0.0))
     var g = _build_gather[IC, K, S, P, H, W, OH, OW, COL, SO](ctx)
-    var inl = LayoutTensor[DT, Layout.row_major(BATCH * IN_FLAT), MutAnyOrigin](inp)
-    var gl = LayoutTensor[IT, Layout.row_major(SO * COL), MutAnyOrigin](g)
-    var wl = LayoutTensor[DT, Layout.row_major(OC, COL), MutAnyOrigin](wbuf)
-    var bl = LayoutTensor[DT, Layout.row_major(OC), MutAnyOrigin](bbuf)
-    var ol = LayoutTensor[DT, Layout.row_major(BS, OC), MutAnyOrigin](obuf)
+    var inl = tile[BATCH * IN_FLAT](inp)
+    var gl = tile[SO * COL](g)
+    var wl = tile[OC, COL](wbuf)
+    var bl = tile[OC](bbuf)
+    var ol = tile[BS, OC](obuf)
     comptime gx = (OC + TILE - 1) // TILE
     comptime gy = (BS + TILE - 1) // TILE
 
@@ -304,10 +299,8 @@ def _mec_lower_kernel[
     BATCH: Int, IC: Int, K: Int, S: Int, P: Int, H: Int, W: Int, OW: Int,
     IN_FLAT: Int, HP: Int,
 ](
-    input: LayoutTensor[DT, Layout.row_major(BATCH * IN_FLAT), MutAnyOrigin],
-    lout: LayoutTensor[
-        DT, Layout.row_major(BATCH * OW * HP * K * IC), MutAnyOrigin
-    ],
+    input: Tile[DT, BATCH * IN_FLAT],
+    lout: Tile[DT, BATCH * OW * HP * K * IC],
 ):
     var idx = Int(global_idx.x)
     comptime LW = HP * K * IC  # L row width
@@ -334,11 +327,9 @@ def _mec_lower_kernel[
 def _mec_scatter_bias[
     BATCH: Int, OC: Int, OH: Int, OW: Int, BS: Int,
 ](
-    cmat: LayoutTensor[
-        DT, Layout.row_major(OH * BATCH * OW * OC), MutAnyOrigin
-    ],
-    bias: LayoutTensor[DT, Layout.row_major(OC), MutAnyOrigin],
-    output: LayoutTensor[DT, Layout.row_major(BS * OC), MutAnyOrigin],
+    cmat: Tile[DT, OH * BATCH * OW * OC],
+    bias: Tile[DT, OC],
+    output: Tile[DT, BS * OC],
 ):
     var idx = Int(global_idx.x)
     if idx >= BS * OC:
@@ -376,12 +367,10 @@ def _time_mec[
     _ = inp.enqueue_fill(Scalar[DT](0.01))
     _ = wbuf.enqueue_fill(Scalar[DT](0.01))
     _ = bbuf.enqueue_fill(Scalar[DT](0.0))
-    var inl = LayoutTensor[
-        DT, Layout.row_major(BATCH * IN_FLAT), MutAnyOrigin
-    ](inp)
-    var ll = LayoutTensor[DT, Layout.row_major(LN), MutAnyOrigin](lbuf)
-    var bl = LayoutTensor[DT, Layout.row_major(OC), MutAnyOrigin](bbuf)
-    var ol = LayoutTensor[DT, Layout.row_major(BS * OC), MutAnyOrigin](obuf)
+    var inl = tile[BATCH * IN_FLAT](inp)
+    var ll = tile[LN](lbuf)
+    var bl = tile[OC](bbuf)
+    var ol = tile[BS * OC](obuf)
     var a_lay = TileLayout(
         (Idx[OH], Idx[BOW], Idx[COL]),
         (Idx[S * K * IC], Idx[HP * K * IC], Idx[1]),
@@ -389,9 +378,7 @@ def _time_mec[
     var a_tt = TileTensor(lbuf, a_lay)
     var w_tt = TileTensor(wbuf, row_major[OH, OC, COL]())
     var c_tt = TileTensor(cbuf, row_major[OH, BOW, OC]())
-    var cl = LayoutTensor[
-        DT, Layout.row_major(OH * BOW * OC), MutAnyOrigin
-    ](cbuf)
+    var cl = tile[OH * BOW * OC](cbuf)
     comptime nb_l = (LN + TPB - 1) // TPB
     comptime nb_sc = (BS * OC + TPB - 1) // TPB
 
@@ -461,12 +448,10 @@ def _verify_mec[
                     hw[(oh * OC + oc) * COL + k] = wv
     _ = obuf.enqueue_fill(Scalar[DT](-999.0))
 
-    var inl = LayoutTensor[
-        DT, Layout.row_major(BATCH * IN_FLAT), MutAnyOrigin
-    ](inp)
-    var ll = LayoutTensor[DT, Layout.row_major(LN), MutAnyOrigin](lbuf)
-    var bl = LayoutTensor[DT, Layout.row_major(OC), MutAnyOrigin](bbuf)
-    var ol = LayoutTensor[DT, Layout.row_major(BS * OC), MutAnyOrigin](obuf)
+    var inl = tile[BATCH * IN_FLAT](inp)
+    var ll = tile[LN](lbuf)
+    var bl = tile[OC](bbuf)
+    var ol = tile[BS * OC](obuf)
     var a_lay = TileLayout(
         (Idx[OH], Idx[BOW], Idx[COL]),
         (Idx[S * K * IC], Idx[HP * K * IC], Idx[1]),
@@ -474,9 +459,7 @@ def _verify_mec[
     var a_tt = TileTensor(lbuf, a_lay)
     var w_tt = TileTensor(wbuf, row_major[OH, OC, COL]())
     var c_tt = TileTensor(cbuf, row_major[OH, BOW, OC]())
-    var cl = LayoutTensor[
-        DT, Layout.row_major(OH * BOW * OC), MutAnyOrigin
-    ](cbuf)
+    var cl = tile[OH * BOW * OC](cbuf)
     comptime nb_l = (LN + TPB - 1) // TPB
     comptime nb_sc = (BS * OC + TPB - 1) // TPB
     ctx.enqueue_function[

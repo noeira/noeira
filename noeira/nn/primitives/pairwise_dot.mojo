@@ -55,7 +55,8 @@ inference path reusing this primitive would land exactly on that bug.
 from noeira.nn.core.mm import mm, bmm
 from max.gpu import global_idx
 from max.gpu.host import DeviceContext
-from layout import Layout, LayoutTensor, TileTensor, row_major
+from layout import TileTensor, row_major
+from noeira.core.tiles import RowMajor, Tile
 from linalg.bmm import batched_matmul
 from linalg.matmul import matmul as max_matmul
 
@@ -120,9 +121,9 @@ from ..core.amp import AMPPolicy, NoAMP
 
 
 def _pd_forward_kernel[BATCH: Int, D: Int](
-    a: LayoutTensor[DT, Layout.row_major(BATCH, D), MutAnyOrigin],
-    c: LayoutTensor[DT, Layout.row_major(BATCH, D), MutAnyOrigin],
-    m: LayoutTensor[DT, Layout.row_major(BATCH, BATCH), MutAnyOrigin],
+    a: Tile[DT, BATCH, D],
+    c: Tile[DT, BATCH, D],
+    m: Tile[DT, BATCH, BATCH],
 ):
     var idx = Int(global_idx.x)
     if idx >= BATCH * BATCH:
@@ -136,9 +137,9 @@ def _pd_forward_kernel[BATCH: Int, D: Int](
 
 
 def _pd_da_kernel[BATCH: Int, D: Int](
-    g: LayoutTensor[DT, Layout.row_major(BATCH, BATCH), MutAnyOrigin],
-    c: LayoutTensor[DT, Layout.row_major(BATCH, D), MutAnyOrigin],
-    ga: LayoutTensor[DT, Layout.row_major(BATCH, D), MutAnyOrigin],
+    g: Tile[DT, BATCH, BATCH],
+    c: Tile[DT, BATCH, D],
+    ga: Tile[DT, BATCH, D],
 ):
     # dA[i,k] = sum_j G[i,j]·C[j,k]
     var idx = Int(global_idx.x)
@@ -153,9 +154,9 @@ def _pd_da_kernel[BATCH: Int, D: Int](
 
 
 def _pd_dc_kernel[BATCH: Int, D: Int](
-    g: LayoutTensor[DT, Layout.row_major(BATCH, BATCH), MutAnyOrigin],
-    a: LayoutTensor[DT, Layout.row_major(BATCH, D), MutAnyOrigin],
-    gc: LayoutTensor[DT, Layout.row_major(BATCH, D), MutAnyOrigin],
+    g: Tile[DT, BATCH, BATCH],
+    a: Tile[DT, BATCH, D],
+    gc: Tile[DT, BATCH, D],
 ):
     # dC[j,k] = sum_i G[i,j]·A[i,k]  — note G is read down its COLUMN j.
     var idx = Int(global_idx.x)
@@ -242,13 +243,13 @@ struct PairwiseDot[D_: Int, BATCH: Int](Module):
                     out.dev.value(), a.dev.value(), c.dev.value(), dc
                 )
             else:
-                comptime lay_in = Layout.row_major(B, Self.D_)
-                comptime lay_m = Layout.row_major(B, B)
+                comptime lay_in = RowMajor[B, Self.D_]
+                comptime lay_m = RowMajor[B, B]
                 comptime n_blocks = (B * B + TPB - 1) // TPB
                 dc.enqueue_function[_pd_forward_kernel[B, Self.D_]](
-                    a.lt["gpu", lay_in](),
-                    c.lt["gpu", lay_in](),
-                    out.lt["gpu", lay_m](),
+                    a.tt["gpu", B, Self.D_](),
+                    c.tt["gpu", B, Self.D_](),
+                    out.tt["gpu", B, B](),
                     grid_dim=n_blocks,
                     block_dim=TPB,
                 )
@@ -295,20 +296,20 @@ struct PairwiseDot[D_: Int, BATCH: Int](Module):
             var dc = ctx.value()
             ga.ensure_gpu(dc, B * Self.D_)
             gc.ensure_gpu(dc, B * Self.D_)
-            comptime lay_in = Layout.row_major(B, Self.D_)
-            comptime lay_m = Layout.row_major(B, B)
+            comptime lay_in = RowMajor[B, Self.D_]
+            comptime lay_m = RowMajor[B, B]
             comptime n_blocks = (B * Self.D_ + TPB - 1) // TPB
             dc.enqueue_function[_pd_da_kernel[B, Self.D_]](
-                grad_output.lt["gpu", lay_m](),
-                c.lt["gpu", lay_in](),
-                ga.lt["gpu", lay_in](),
+                grad_output.tt["gpu", B, B](),
+                c.tt["gpu", B, Self.D_](),
+                ga.tt["gpu", B, Self.D_](),
                 grid_dim=n_blocks,
                 block_dim=TPB,
             )
             dc.enqueue_function[_pd_dc_kernel[B, Self.D_]](
-                grad_output.lt["gpu", lay_m](),
-                a.lt["gpu", lay_in](),
-                gc.lt["gpu", lay_in](),
+                grad_output.tt["gpu", B, B](),
+                a.tt["gpu", B, Self.D_](),
+                gc.tt["gpu", B, Self.D_](),
                 grid_dim=n_blocks,
                 block_dim=TPB,
             )
@@ -323,9 +324,9 @@ struct PairwiseDot[D_: Int, BATCH: Int](Module):
 
 
 def _rd_forward_kernel[BATCH: Int, D: Int](
-    a: LayoutTensor[DT, Layout.row_major(BATCH, D), MutAnyOrigin],
-    c: LayoutTensor[DT, Layout.row_major(BATCH, D), MutAnyOrigin],
-    o: LayoutTensor[DT, Layout.row_major(BATCH, 1), MutAnyOrigin],
+    a: Tile[DT, BATCH, D],
+    c: Tile[DT, BATCH, D],
+    o: Tile[DT, BATCH, 1],
 ):
     var i = Int(global_idx.x)
     if i >= BATCH:
@@ -337,11 +338,11 @@ def _rd_forward_kernel[BATCH: Int, D: Int](
 
 
 def _rd_backward_kernel[BATCH: Int, D: Int](
-    g: LayoutTensor[DT, Layout.row_major(BATCH, 1), MutAnyOrigin],
-    a: LayoutTensor[DT, Layout.row_major(BATCH, D), MutAnyOrigin],
-    c: LayoutTensor[DT, Layout.row_major(BATCH, D), MutAnyOrigin],
-    ga: LayoutTensor[DT, Layout.row_major(BATCH, D), MutAnyOrigin],
-    gc: LayoutTensor[DT, Layout.row_major(BATCH, D), MutAnyOrigin],
+    g: Tile[DT, BATCH, 1],
+    a: Tile[DT, BATCH, D],
+    c: Tile[DT, BATCH, D],
+    ga: Tile[DT, BATCH, D],
+    gc: Tile[DT, BATCH, D],
 ):
     var idx = Int(global_idx.x)
     if idx >= BATCH * D:
@@ -393,13 +394,13 @@ struct RowDot[D_: Int](Module):
         else:
             var dc = ctx.value()
             out.ensure_gpu(dc, B)
-            comptime lay_in = Layout.row_major(B, Self.D_)
-            comptime lay_o = Layout.row_major(B, 1)
+            comptime lay_in = RowMajor[B, Self.D_]
+            comptime lay_o = RowMajor[B, 1]
             comptime n_blocks = (B + TPB - 1) // TPB
             dc.enqueue_function[_rd_forward_kernel[B, Self.D_]](
-                a.lt["gpu", lay_in](),
-                c.lt["gpu", lay_in](),
-                out.lt["gpu", lay_o](),
+                a.tt["gpu", B, Self.D_](),
+                c.tt["gpu", B, Self.D_](),
+                out.tt["gpu", B, 1](),
                 grid_dim=n_blocks,
                 block_dim=TPB,
             )
@@ -438,15 +439,15 @@ struct RowDot[D_: Int](Module):
             var dc = ctx.value()
             ga.ensure_gpu(dc, B * Self.D_)
             gc.ensure_gpu(dc, B * Self.D_)
-            comptime lay_in = Layout.row_major(B, Self.D_)
-            comptime lay_o = Layout.row_major(B, 1)
+            comptime lay_in = RowMajor[B, Self.D_]
+            comptime lay_o = RowMajor[B, 1]
             comptime n_blocks = (B * Self.D_ + TPB - 1) // TPB
             dc.enqueue_function[_rd_backward_kernel[B, Self.D_]](
-                grad_output.lt["gpu", lay_o](),
-                a.lt["gpu", lay_in](),
-                c.lt["gpu", lay_in](),
-                ga.lt["gpu", lay_in](),
-                gc.lt["gpu", lay_in](),
+                grad_output.tt["gpu", B, 1](),
+                a.tt["gpu", B, Self.D_](),
+                c.tt["gpu", B, Self.D_](),
+                ga.tt["gpu", B, Self.D_](),
+                gc.tt["gpu", B, Self.D_](),
                 grid_dim=n_blocks,
                 block_dim=TPB,
             )
