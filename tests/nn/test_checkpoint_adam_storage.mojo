@@ -8,6 +8,7 @@ Run: pixi run -e apple mojo run -I . tests/nn/test_checkpoint_adam_storage.mojo
 """
 
 from std.testing import assert_true
+from std.sys import has_accelerator
 from max.gpu.host import DeviceContext
 
 from noeira.nn.constants import DT
@@ -85,8 +86,15 @@ def main() raises:
     print("=" * 70)
     var oc = _check["cpu"]("/tmp/storage_ckpt_cpu.txt", None)
     print("  CPU:", "OK" if oc else "FAIL")
-    var c = DeviceContext()
-    var og = _check["gpu"]("/tmp/storage_ckpt_gpu.txt", Optional(c))
-    print("  GPU:", "OK" if og else "FAIL")
+    var og = True
+    comptime if has_accelerator():
+        var c = DeviceContext()
+        og = _check["gpu"]("/tmp/storage_ckpt_gpu.txt", Optional(c))
+        print("  GPU:", "OK" if og else "FAIL")
+    else:
+        print(
+            "  GPU: SKIPPED (no accelerator;"
+            " run with -e apple / -e nvidia)"
+        )
     assert_true(oc and og, "checkpoint round-trip")
     print("CHECKPOINT + ADAM.STEP OK")

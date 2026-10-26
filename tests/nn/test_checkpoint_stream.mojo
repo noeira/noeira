@@ -24,6 +24,7 @@ Run: pixi run -e apple mojo run -I . tests/nn/test_checkpoint_stream.mojo
 """
 
 from std.testing import assert_true
+from std.sys import has_accelerator
 from max.gpu.host import DeviceContext
 
 from noeira.nn.constants import DT
@@ -225,11 +226,19 @@ def _misuse() raises -> Bool:
 def main() raises:
     print("Checkpoint v3: streaming writer vs in-memory writer")
     var ok_cpu = _identity["cpu"](None, "cpu")
-    var ctx = DeviceContext()
-    var ok_gpu = _identity["gpu"](Optional(ctx), "gpu")
+    var ok_gpu = True
+    var ok_host = True
+    comptime if has_accelerator():
+        var ctx = DeviceContext()
+        ok_gpu = _identity["gpu"](Optional(ctx), "gpu")
+        ok_host = _host_copies(ctx)
+    else:
+        print(
+            "  gpu legs (identity, host copies): SKIPPED (no accelerator;"
+            " run with -e apple / -e nvidia)"
+        )
     var ok_atomic = _atomic()
     var ok_misuse = _misuse()
-    var ok_host = _host_copies(ctx)
     assert_true(
         ok_cpu and ok_gpu and ok_atomic and ok_misuse and ok_host,
         "streaming checkpoint",

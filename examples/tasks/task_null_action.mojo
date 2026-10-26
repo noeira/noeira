@@ -38,7 +38,7 @@ rollout, `Phyics3dEnv` gives exactly that, and it runs in the normal suite
 where a GPU example cannot.
 """
 
-from std.sys import argv
+from std.sys import argv, has_accelerator
 
 
 from noeira.tasks.spec import (
@@ -244,7 +244,7 @@ def kind_name(k: Int) -> String:
     return String("SWEPT THROUGH (degenerate)")
 
 
-def main() raises:
+def _run() raises:
     var a = argv()
     if len(a) > 1:
         # single-task diagnosis
@@ -343,3 +343,15 @@ def main() raises:
     print("  a brick. That is why the SAC example trains `lift`.")
     print()
     print("=== PASS ===")
+
+
+def main() raises:
+    # `Phyics3dEnv()` opens a DeviceContext for its model upload, so there is
+    # nothing to run on a host with no accelerator (the CI runner).
+    comptime if has_accelerator():
+        _run()
+    else:
+        print(
+            "task_null_action: SKIPPED (no accelerator;"
+            " run with -e apple / -e nvidia)"
+        )

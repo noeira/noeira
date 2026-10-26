@@ -10,6 +10,7 @@ Run:
 """
 
 from std.testing import assert_true, assert_equal
+from std.sys import has_accelerator
 from max.gpu.host import DeviceContext
 
 from noeira.nn.constants import DT
@@ -68,5 +69,11 @@ def main() raises:
     print("L0 storage TrainerState gate")
     print("=" * 60)
     test_cpu()
-    test_gpu()
+    comptime if has_accelerator():
+        test_gpu()
+    else:
+        print(
+            "TrainerState GPU: SKIPPED (no accelerator;"
+            " run with -e apple / -e nvidia)"
+        )
     print("ALL PASSED")

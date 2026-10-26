@@ -24,7 +24,7 @@ Run: pixi run -e apple mojo run -I . tests/physics3d/test_fk_fields.mojo
 
 from std.math import abs
 from max.gpu.host import DeviceContext
-from std.sys import default_accelerator
+from std.sys import default_accelerator, has_accelerator
 
 from noeira.nn.core.tensor import TensorImpl
 from noeira.physics3d.joint_types import JNT_HINGE
@@ -385,6 +385,12 @@ def test_synthetic_sites() raises:
 
 
 def main() raises:
-    test_walker2d()
-    test_synthetic_sites()
-    print("test_fk_fields: ALL PASS")
+    comptime if has_accelerator():
+        test_walker2d()
+        test_synthetic_sites()
+        print("test_fk_fields: ALL PASS")
+    else:
+        print(
+            "test_fk_fields: SKIPPED (no accelerator;"
+            " run with -e apple / -e nvidia)"
+        )

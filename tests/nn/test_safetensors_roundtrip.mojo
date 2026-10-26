@@ -29,6 +29,7 @@ parameters, and that a device model's weights actually reach the file.
 
 from std.memory import bitcast
 from std.testing import assert_true
+from std.sys import has_accelerator
 from max.gpu.host import DeviceContext
 
 from noeira.io.safetensors import SafeTensors, SafeTensorsWriter
@@ -207,83 +208,7 @@ def differ(ref a: Capture, ref b: Capture) -> Int:
     return n
 
 
-def main() raises:
-    var fails = 0
-    print("nn <-> safetensors round trip")
-    print("")
-
-    # ══════════════════════════════════════════════════════════════════════
-    print("CPU, parameters only")
-    var a = NET.make["cpu", Deterministic](None)
-    var p = Perturb()
-    a.for_each_param["cpu", Perturb](p, None)
-    var n_saved = save_safetensors["cpu"](a, String("/tmp/st_net.safetensors"))
-    check(fails, "4 tensors written", n_saved == 4, String(n_saved))
-
-    var f = SafeTensors(String("/tmp/st_net.safetensors"))
-    check(fails, "names are the walked names",
-          f.has(String("0.weight")) and f.has(String("1.bias")),
-          f.names[0] + " ... " + f.names[len(f.names) - 1])
-    check(fails, "shape is rank-1 [N]",
-          f.shape_str(String("0.weight")) == "[" + String(D * H) + "]",
-          f.shape_str(String("0.weight")))
-
-    var b = NET.make["cpu", Kaiming](None)
-    var ca = Capture()
-    a.for_each_param["cpu", Capture](ca, None)
-    var cb0 = Capture()
-    b.for_each_param["cpu", Capture](cb0, None)
-    # ⚠ The anti-vacuity check. Without it, "the values agree after loading"
-    # is also true of a loader that loaded nothing into an identical model.
-    check(fails, "the two models DIFFER before the load",
-          differ(ca, cb0) > NET_VALS // 2,
-          String(differ(ca, cb0)) + " of " + String(len(ca.vals)) + " differ")
-
-    var n_loaded = load_safetensors["cpu"](b, String("/tmp/st_net.safetensors"))
-    var cb1 = Capture()
-    b.for_each_param["cpu", Capture](cb1, None)
-    check(fails, "every value is bit-identical after the load",
-          differ(ca, cb1) == 0 and len(ca.vals) == NET_VALS,
-          String(len(ca.vals)) + " compared, " + String(differ(ca, cb1))
-          + " differ")
-    check(fails, "load count matches", n_loaded == 4, String(n_loaded))
-
-    # ══════════════════════════════════════════════════════════════════════
-    print("")
-    print("CPU, BatchNorm — parameters AND running statistics")
-    var c = BN.make["cpu", Deterministic](None)
-    var pc = Perturb()
-    c.for_each_param["cpu", Perturb](pc, None)
-    c.for_each_state["cpu", Perturb](pc, None)
-    var n_bn = save_safetensors["cpu"](c, String("/tmp/st_bn.safetensors"))
-
-    var fbn = SafeTensors(String("/tmp/st_bn.safetensors"))
-    var n_stats = 0
-    for i in range(fbn.size()):
-        if fbn.names[i].endswith("running_mean") or fbn.names[i].endswith(
-            "running_var"
-        ):
-            n_stats += 1
-    check(fails, "running statistics are in the file", n_stats == 4,
-          String(n_stats) + " of " + String(n_bn) + " tensors")
-
-    var d = BN.make["cpu", Kaiming](None)
-    var sa = Capture()
-    c.for_each_state["cpu", Capture](sa, None)
-    var sd0 = Capture()
-    d.for_each_state["cpu", Capture](sd0, None)
-    check(fails, "the statistics DIFFER before the load",
-          differ(sa, sd0) > 0,
-          String(differ(sa, sd0)) + " of " + String(len(sa.vals)) + " differ")
-
-    _ = load_safetensors["cpu"](d, String("/tmp/st_bn.safetensors"))
-    var sd1 = Capture()
-    d.for_each_state["cpu", Capture](sd1, None)
-    check(fails, "statistics are bit-identical after the load",
-          differ(sa, sd1) == 0 and len(sa.vals) > 0,
-          String(len(sa.vals)) + " compared, " + String(differ(sa, sd1))
-          + " differ")
-
+def _gpu_legs(mut fails: Int) raises:
     # ══════════════════════════════════════════════════════════════════════
     print("")
     print("GPU — the weights that reach the file are the DEVICE's")
@@ -364,6 +289,94 @@ def main() raises:
           differ(clg, clh1) == 0,
           String(len(clg.vals)) + " compared, " + String(differ(clg, clh1))
           + " differ")
+
+
+
+def main() raises:
+    var fails = 0
+    print("nn <-> safetensors round trip")
+    print("")
+
+    # ══════════════════════════════════════════════════════════════════════
+    print("CPU, parameters only")
+    var a = NET.make["cpu", Deterministic](None)
+    var p = Perturb()
+    a.for_each_param["cpu", Perturb](p, None)
+    var n_saved = save_safetensors["cpu"](a, String("/tmp/st_net.safetensors"))
+    check(fails, "4 tensors written", n_saved == 4, String(n_saved))
+
+    var f = SafeTensors(String("/tmp/st_net.safetensors"))
+    check(fails, "names are the walked names",
+          f.has(String("0.weight")) and f.has(String("1.bias")),
+          f.names[0] + " ... " + f.names[len(f.names) - 1])
+    check(fails, "shape is rank-1 [N]",
+          f.shape_str(String("0.weight")) == "[" + String(D * H) + "]",
+          f.shape_str(String("0.weight")))
+
+    var b = NET.make["cpu", Kaiming](None)
+    var ca = Capture()
+    a.for_each_param["cpu", Capture](ca, None)
+    var cb0 = Capture()
+    b.for_each_param["cpu", Capture](cb0, None)
+    # ⚠ The anti-vacuity check. Without it, "the values agree after loading"
+    # is also true of a loader that loaded nothing into an identical model.
+    check(fails, "the two models DIFFER before the load",
+          differ(ca, cb0) > NET_VALS // 2,
+          String(differ(ca, cb0)) + " of " + String(len(ca.vals)) + " differ")
+
+    var n_loaded = load_safetensors["cpu"](b, String("/tmp/st_net.safetensors"))
+    var cb1 = Capture()
+    b.for_each_param["cpu", Capture](cb1, None)
+    check(fails, "every value is bit-identical after the load",
+          differ(ca, cb1) == 0 and len(ca.vals) == NET_VALS,
+          String(len(ca.vals)) + " compared, " + String(differ(ca, cb1))
+          + " differ")
+    check(fails, "load count matches", n_loaded == 4, String(n_loaded))
+
+    # ══════════════════════════════════════════════════════════════════════
+    print("")
+    print("CPU, BatchNorm — parameters AND running statistics")
+    var c = BN.make["cpu", Deterministic](None)
+    var pc = Perturb()
+    c.for_each_param["cpu", Perturb](pc, None)
+    c.for_each_state["cpu", Perturb](pc, None)
+    var n_bn = save_safetensors["cpu"](c, String("/tmp/st_bn.safetensors"))
+
+    var fbn = SafeTensors(String("/tmp/st_bn.safetensors"))
+    var n_stats = 0
+    for i in range(fbn.size()):
+        if fbn.names[i].endswith("running_mean") or fbn.names[i].endswith(
+            "running_var"
+        ):
+            n_stats += 1
+    check(fails, "running statistics are in the file", n_stats == 4,
+          String(n_stats) + " of " + String(n_bn) + " tensors")
+
+    var d = BN.make["cpu", Kaiming](None)
+    var sa = Capture()
+    c.for_each_state["cpu", Capture](sa, None)
+    var sd0 = Capture()
+    d.for_each_state["cpu", Capture](sd0, None)
+    check(fails, "the statistics DIFFER before the load",
+          differ(sa, sd0) > 0,
+          String(differ(sa, sd0)) + " of " + String(len(sa.vals)) + " differ")
+
+    _ = load_safetensors["cpu"](d, String("/tmp/st_bn.safetensors"))
+    var sd1 = Capture()
+    d.for_each_state["cpu", Capture](sd1, None)
+    check(fails, "statistics are bit-identical after the load",
+          differ(sa, sd1) == 0 and len(sa.vals) > 0,
+          String(len(sa.vals)) + " compared, " + String(differ(sa, sd1))
+          + " differ")
+
+    comptime if has_accelerator():
+        _gpu_legs(fails)
+    else:
+        print("")
+        print(
+            "GPU legs: SKIPPED (no accelerator;"
+            " run with -e apple / -e nvidia)"
+        )
 
     print("")
     print("refusals")
