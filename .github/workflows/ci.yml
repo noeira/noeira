@@ -55,7 +55,9 @@ jobs:
   smoke:
     if: github.event_name != 'schedule' && (github.event_name != 'workflow_dispatch' || inputs.tier == 'smoke')
     runs-on: ubuntu-latest
-    timeout-minutes: 60
+    # ⚠ The manifest budgets ~15 min; its first full run on a runner
+    # (2026-10-26, 101 files) took 58.5 — inside 60 only by luck.
+    timeout-minutes: 90
     steps:
       - uses: actions/checkout@v4
       - uses: prefix-dev/setup-pixi@v0.9.4
@@ -63,6 +65,10 @@ jobs:
           environments: cpu
           cache: true
           cache-write: ${{ github.event_name == 'push' && github.ref == 'refs/heads/dev' }}
+      # The http and serial shims are dlopen'd by a dozen smoke tests and are
+      # not in git (`scripts/build_http.sh`, `scripts/build_serial.sh`).
+      - name: build the native shims
+        run: pixi run -e cpu build-http && pixi run -e cpu build-serial
       - name: smoke tier
         run: pixi run -e cpu test-smoke
 
@@ -70,7 +76,11 @@ jobs:
     # The comptime model dimensions are GENERATED from the .xml assets through
     # MuJoCo. A stale generated file is silent by construction: the counts still
     # compile, they just size the slabs for a model that no longer exists. This
-    # is seconds and needs no Mojo toolchain, so it runs on every push.
+    # is seconds, so it runs on every push.
+    # ⚠ The LIBERO scenes' meshes are not in git
+    # (`noeira/envs/libero/assets.kv` declares the pack), and MuJoCo cannot
+    # load those scenes without them, so the pack is pulled first — through
+    # the same tool and sha256 as any box.
     if: github.event_name != 'schedule' && (github.event_name != 'workflow_dispatch' || inputs.tier == 'smoke')
     runs-on: ubuntu-latest
     timeout-minutes: 15
@@ -81,6 +91,8 @@ jobs:
           environments: cpu
           cache: true
           cache-write: false
+      - name: pull the LIBERO asset pack
+        run: pixi run -e cpu assets-pull libero
       - name: generated dims are up to date
         run: pixi run -e cpu gen-dims-check
 
@@ -109,6 +121,8 @@ jobs:
           environments: cpu
           cache: true
           cache-write: false
+      - name: build the native shims
+        run: pixi run -e cpu build-http && pixi run -e cpu build-serial
       - name: full CPU sweep
         # Discovery over tests/ minus *_gpu.mojo. Some of the long tail needs
         # local-only assets (references/, ROMs) and will fail on CI — the
