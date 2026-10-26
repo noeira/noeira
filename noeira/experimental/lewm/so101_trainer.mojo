@@ -1,5 +1,5 @@
 """LeWMSo101Trainer — `LeWMRefTrainer`'s training step over the SO-101 world
-models' graphs (noeira-docs/SO101_LEWM_PLAN.md S1):
+models' graphs (noeira-docs/SO101_LEWM_PLAN.md S1).
 
 | alias | graph | model |
 |---|---|---|
