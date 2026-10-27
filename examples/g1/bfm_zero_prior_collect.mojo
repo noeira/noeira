@@ -28,6 +28,16 @@ lane by the BFM-Zero driver's kernels, reset per lane.
     ./bfm_prior_collect --ckpt projects/g1/policies/bfm_room.ckpt \\
         --z g1_teacher_z_s36000.txt --rows 1000000 --out g1_prior_s36000.h5
 
+`--suite PROMPTS` (e.g. `raw,centred,wide`) collects nothing: per prompt it
+runs FB-MEBE's in-loop eval (`fb_mebe_g1_gpu.mojo`'s `_eval`) on the
+teacher instead — all 22 suite tasks at once, 46 lanes each, 250 steps from
+the stand keyframe with the same fixed reset seed and noise, scored by
+`g1_cmd_step_kernel` — and prints the same `SUITE` and `[eval @ …]` lines,
+`@` holding the prompt's index. So the teacher and a FB-MEBE arm are read
+on one paired protocol (§13.6's CPU eval was not):
+
+    ./bfm_prior_collect --z g1_teacher_z3_s36000.txt --suite raw,centred,wide
+
 ⚠ NVIDIA: like FB-MEBE's driver, the G1 fields path does not run on Metal
 at 1024 lanes in useful time.
 """
@@ -49,7 +59,10 @@ from noeira.deep_agents.fb.bfm_towers import (
 )
 from noeira.deep_agents.fb.g1_mebe import (
     G1RegWeights,
+    G1M_CMD_P,
     G1M_COL_VX, G1M_COL_VY, G1M_COL_WZ, G1M_COL_H,
+    g1_cmd_suite,
+    g1_cmd_step_kernel,
     g1_fall_kernel,
     g1_reset_noise_kernel,
     g1_reg_env_kernel,
@@ -88,6 +101,10 @@ comptime Teacher = FBOnlineAgent[
 comptime FALL_H: Float64 = 0.45
 comptime FALL_GZ: Float64 = -0.5
 comptime FALL_DELAY: Int = 25
+# `--suite`: FB-MEBE's eval constants (`fb_mebe_g1_gpu.mojo`)
+comptime EVAL_LEN: Int = 250
+comptime EVAL_FALL_H: Float64 = 0.5
+comptime EVAL_SEED: UInt64 = 0xE7A1
 
 # the suite's 13 velocity tasks and standing — the teacher's strength (§13.6)
 comptime DEFAULT_TASKS = (
@@ -142,6 +159,7 @@ def main() raises:
     var reset_noise = atof(_flag(String("--reset-noise"), String(0.1)))
     var seed_v = atol(_flag(String("--seed"), String(1)))
     var tasks_s = _flag(String("--tasks"), String(DEFAULT_TASKS))
+    var suite_s = _flag(String("--suite"), String(""))
     if z_path.byte_length() == 0:
         raise Error("--z FILE is required (bfm_zero_suite_eval --dump-z)")
     var names = List[String]()
@@ -206,6 +224,137 @@ def main() raises:
                 mptr(h_live.unsafe_ptr()), mptr(mask.unsafe_ptr()),
                 grid_dim=_blocks(N_ENVS * (G1_N_ACT + G1_HIST_DIM)), block_dim=TPB,
             )
+
+        def _teacher_step(expl: Float64) capturing raises:
+            """The teacher acts on every lane: its full obs from the history
+            tail, the action into `env._action`, then the tail advanced
+            (push(state_t, a_{t-1}), last_action = a_t — the BFM driver's
+            order). The env is not stepped here."""
+            ctx.enqueue_function[g1_pack_full_obs_kernel[N_ENVS]](
+                mptr(env._obs.unsafe_ptr()), mptr(h_last.unsafe_ptr()),
+                mptr(h_hist.unsafe_ptr()), mptr(full_obs.unsafe_ptr()),
+                grid_dim=_blocks(N_ENVS * OBS), block_dim=TPB,
+            )
+            t._policy_into_z(
+                mptr(full_obs.unsafe_ptr()), mptr(z_dev.unsafe_ptr()),
+                mptr(env._action.unsafe_ptr()), expl,
+            )
+            ctx.enqueue_function[g1_hist_push_kernel[N_ENVS]](
+                mptr(env._obs.unsafe_ptr()), mptr(h_last.unsafe_ptr()),
+                mptr(h_hist.unsafe_ptr()), mptr(h_live.unsafe_ptr()),
+                grid_dim=_blocks(N_ENVS * G1_HIST_STEP), block_dim=TPB,
+            )
+            h_live.enqueue_fill(Scalar[DT](1.0))
+            ctx.enqueue_function[g1_scale_clip_kernel[N_ENVS * G1_N_ACT]](
+                mptr(h_last.unsafe_ptr()), mptr(env._action.unsafe_ptr()),
+                Scalar[DT](G1_NORMALIZE_TO), Scalar[DT](G1_ACTION_CLIP),
+                grid_dim=_blocks(N_ENVS * G1_N_ACT), block_dim=TPB,
+            )
+
+        # ── `--suite`: FB-MEBE's in-loop eval, on the teacher (header) ────
+        if suite_s.byte_length() > 0:
+            var suite = g1_cmd_suite()
+            var n_s = len(suite)
+            var reps = N_ENVS // n_s
+            var s_names = List[String]()
+            for k in range(n_s):
+                s_names.append(suite[k].name)
+            print("  suite eval:", n_s, "tasks x", reps, "lanes x", EVAL_LEN,
+                  "steps, prompts", suite_s, "(no rows collected)")
+            var e_task = ctx.enqueue_create_buffer[DType.int32](N_ENVS)
+            var e_params = ctx.enqueue_create_buffer[DT](n_s * G1M_CMD_P)
+            var e_ret = ctx.enqueue_create_buffer[DT](N_ENVS)
+            var e_fell = ctx.enqueue_create_buffer[DT](N_ENVS)
+            var e_ar = ctx.enqueue_create_buffer[DT](N_ENVS)
+            var e_prev_a = ctx.enqueue_create_buffer[DT](N_ENVS * ACT)
+            var h_task = ctx.enqueue_create_host_buffer[DType.int32](N_ENVS)
+            var h_params = ctx.enqueue_create_host_buffer[DT](n_s * G1M_CMD_P)
+            for l in range(N_ENVS):
+                h_task[l] = Int32(l % n_s) if l < reps * n_s else Int32(-1)
+            for k in range(n_s):
+                var p = suite[k].params()
+                for j in range(G1M_CMD_P):
+                    h_params[k * G1M_CMD_P + j] = Scalar[DT](p[j])
+            ctx.enqueue_copy(e_task, h_task)
+            ctx.enqueue_copy(e_params, h_params)
+            var h_ret = ctx.enqueue_create_host_buffer[DT](N_ENVS)
+            var h_fell = ctx.enqueue_create_host_buffer[DT](N_ENVS)
+            var h_ar = ctx.enqueue_create_host_buffer[DT](N_ENVS)
+            var pi = 0
+            for pn in suite_s.split(","):
+                var zp = _read_z(z_path, String(pn), s_names)
+                for l in range(N_ENVS):
+                    var k = Int(h_task[l])
+                    for j in range(D):
+                        h_z[l * D + j] = Scalar[DT](zp[k * D + j]) if k >= 0 else Scalar[DT](0.0)
+                ctx.enqueue_copy(z_dev, h_z)
+                # every lane to the stand keyframe + the eval's fixed noise
+                env._done.enqueue_fill(Scalar[DT](1.0))
+                env.selective_reset_batch[N_ENVS](Optional(ctx), EVAL_SEED)
+                _after_reset(EVAL_SEED)
+                h_last.enqueue_fill(Scalar[DT](0.0))
+                h_hist.enqueue_fill(Scalar[DT](0.0))
+                _hist_reset(ones)
+                e_ret.enqueue_fill(Scalar[DT](0.0))
+                e_fell.enqueue_fill(Scalar[DT](0.0))
+                e_ar.enqueue_fill(Scalar[DT](0.0))
+                e_prev_a.enqueue_fill(Scalar[DT](0.0))
+                var sp = List[Float64](length=2 * n_s, fill=0.0)
+                var te = perf_counter_ns()
+                for st_i in range(EVAL_LEN):
+                    _teacher_step(0.0)
+                    env.step_batch[N_ENVS](Optional(ctx), UInt64(st_i))
+                    ctx.enqueue_function[g1_cmd_step_kernel[SP, N_ENVS]](
+                        mptr(env._obs.unsafe_ptr()), mptr(e_task.unsafe_ptr()),
+                        mptr(e_params.unsafe_ptr()), mptr(e_ret.unsafe_ptr()),
+                        mptr(e_fell.unsafe_ptr()), mptr(env._action.unsafe_ptr()),
+                        mptr(e_prev_a.unsafe_ptr()), mptr(e_ar.unsafe_ptr()),
+                        Scalar[DT](EVAL_FALL_H), Int32(ACT),
+                        grid_dim=_blocks(N_ENVS), block_dim=TPB,
+                    )
+                    ctx.enqueue_copy(h_post, env._obs)
+                    ctx.synchronize()
+                    for l in range(reps * n_s):
+                        var k = l % n_s
+                        sp[2 * k] += abs(Float64(h_post[l * SP + G1M_COL_WZ]))
+                        sp[2 * k + 1] += abs(Float64(h_post[l * SP + G1M_COL_VX]) - suite[k].vx)
+                ctx.enqueue_copy(h_ret, e_ret)
+                ctx.enqueue_copy(h_fell, e_fell)
+                ctx.enqueue_copy(h_ar, e_ar)
+                ctx.synchronize()
+                var fam_sum = List[Float64](length=3, fill=0.0)
+                var fam_n = List[Int](length=3, fill=0)
+                var fall_all = 0.0
+                var wz_all = 0.0
+                for k in range(n_s):
+                    var r = 0.0
+                    var f = 0.0
+                    var a = 0.0
+                    for l in range(reps * n_s):
+                        if l % n_s == k:
+                            r += Float64(h_ret[l])
+                            f += Float64(h_fell[l])
+                            a += Float64(h_ar[l]) / Float64(EVAL_LEN)
+                    r /= Float64(reps)
+                    f /= Float64(reps)
+                    a /= Float64(reps)
+                    fall_all += f
+                    fam_sum[suite[k].family] += r
+                    fam_n[suite[k].family] += 1
+                    var nn = Float64(reps * EVAL_LEN)
+                    wz_all += sp[2 * k] / nn
+                    print("SUITE", pi, suite[k].name, suite[k].family, r, f, a,
+                          sp[2 * k] / nn, sp[2 * k + 1] / nn)
+                print(
+                    "  [eval @", pi, "] velocity", fam_sum[0] / Float64(fam_n[0]),
+                    " posture", fam_sum[1] / Float64(fam_n[1]),
+                    " composite", fam_sum[2] / Float64(fam_n[2]),
+                    " fall", fall_all / Float64(n_s),
+                    " |wz|", wz_all / Float64(n_s),
+                    "  (", Float64(perf_counter_ns() - te) / 1e9, "s )  prompt", pn,
+                )
+                pi += 1
+            return
 
         # ── per-lane state ────────────────────────────────────────────────
         var task = List[Int](length=N_ENVS, fill=0)
@@ -279,27 +428,7 @@ def main() raises:
         var s = 0
         while written < target:
             ctx.enqueue_copy(prev_obs, env._obs)
-            ctx.enqueue_function[g1_pack_full_obs_kernel[N_ENVS]](
-                mptr(env._obs.unsafe_ptr()), mptr(h_last.unsafe_ptr()),
-                mptr(h_hist.unsafe_ptr()), mptr(full_obs.unsafe_ptr()),
-                grid_dim=_blocks(N_ENVS * OBS), block_dim=TPB,
-            )
-            t._policy_into_z(
-                mptr(full_obs.unsafe_ptr()), mptr(z_dev.unsafe_ptr()),
-                mptr(env._action.unsafe_ptr()), expl_std,
-            )
-            # push(state_t, a_{t-1}) then last_action = a_t (the BFM driver's order)
-            ctx.enqueue_function[g1_hist_push_kernel[N_ENVS]](
-                mptr(env._obs.unsafe_ptr()), mptr(h_last.unsafe_ptr()),
-                mptr(h_hist.unsafe_ptr()), mptr(h_live.unsafe_ptr()),
-                grid_dim=_blocks(N_ENVS * G1_HIST_STEP), block_dim=TPB,
-            )
-            h_live.enqueue_fill(Scalar[DT](1.0))
-            ctx.enqueue_function[g1_scale_clip_kernel[N_ENVS * G1_N_ACT]](
-                mptr(h_last.unsafe_ptr()), mptr(env._action.unsafe_ptr()),
-                Scalar[DT](G1_NORMALIZE_TO), Scalar[DT](G1_ACTION_CLIP),
-                grid_dim=_blocks(N_ENVS * G1_N_ACT), block_dim=TPB,
-            )
+            _teacher_step(expl_std)
             env.step_batch[N_ENVS](Optional(ctx), UInt64(seed_v) + UInt64(s))
             ctx.enqueue_function[
                 g1_reg_env_kernel[N_ENVS, EnvT.NQ, EnvT.NBODY, EnvT.MC]
