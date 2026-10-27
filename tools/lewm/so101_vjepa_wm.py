@@ -180,7 +180,7 @@ class Feats:
     """Encoded frames of one or more npz files and their windows."""
 
     def __init__(self, paths, n_episodes=0):
-        g, ep, tick, q, act, ok = [], [], [], [], [], []
+        g, ep, lep, tick, q, act, ok = [], [], [], [], [], [], []
         base = 0
         for p in paths:
             z = np.load(p)
@@ -188,6 +188,7 @@ class Feats:
             keep = e < n_episodes if n_episodes else np.ones(len(e), bool)
             g.append(z["grid"][keep])
             ep.append(e[keep] + base)
+            lep.append(e[keep])
             tick.append(z["tick"][keep])
             q.append(z["q"][keep])
             act.append(z["act"][keep])
@@ -195,6 +196,7 @@ class Feats:
             base += int(e.max()) + 1
         self.grid = np.concatenate(g)  # (n, 2, 12, D) f16
         self.ep, self.tick = np.concatenate(ep), np.concatenate(tick)
+        lep = np.concatenate(lep)
         self.q, self.act, self.ok = np.concatenate(q), np.concatenate(act), np.concatenate(ok)
         n = len(self.ep)
         # window start i: frames i..i+3 in one episode, consecutive ticks, all
@@ -206,7 +208,9 @@ class Feats:
         for t in range(T):
             good &= self.ok[s + t]
         self.starts = s[good]
-        self.val = (self.ep[self.starts] % VAL_EVERY) == VAL_EVERY - 1
+        # by each file's own episode number, so a file keeps its split when
+        # it is mixed with others (or listed twice to weight it)
+        self.val = (lep[self.starts] % VAL_EVERY) == VAL_EVERY - 1
 
     def act_stats(self):
         a = self.act[self.ok].reshape(-1, FS, J).reshape(-1, J).astype(np.float64)
@@ -336,6 +340,8 @@ def cmd_eval(a):
     g = torch.Generator(device=dev).manual_seed(0)
     for name, path in sets.items():
         fe = Feats(path.split(","), a.episodes)
+        if a.val_only:
+            fe.starts = fe.starts[fe.val]
         D = fe.grid.shape[-1]
         grid = torch.from_numpy(fe.grid.reshape(len(fe.grid), 24, D)).to(dev)
         act = torch.from_numpy(((fe.act.reshape(-1, FS, J) - mu) / sd).reshape(-1, FS * J).astype(np.float32)).to(dev)
@@ -410,6 +416,8 @@ def main():
     s.add_argument("--set", action="append", required=True, help="name:feats.npz[,more.npz]")
     s.add_argument("--sim", default="sim_dr", help="the set the q probe is fitted on")
     s.add_argument("--episodes", type=int, default=0, help="first N episodes of each set (0 = all)")
+    s.add_argument("--val-only", action="store_true",
+                   help="the predictor on the validation episodes only (the probe still uses all)")
     s.add_argument("--tag", default="final")
     a = p.parse_args()
     {"split": cmd_split, "export-real": cmd_export_real, "encode": cmd_encode,
