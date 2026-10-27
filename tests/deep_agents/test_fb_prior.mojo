@@ -9,9 +9,9 @@
       terminal row — never across episodes.
   [2] the regularity reward, row by row, against a hand recomputation of
       `reg_reward_kernel`'s rule: q̇ finite difference to the SUCCESSOR,
-      a_prev = 0 on each episode's first row, and the angular-velocity price
-      read on the successor. Each term is checked to be non-zero somewhere,
-      so a dropped term cannot pass.
+      a_prev = 0 on each episode's first row, and the angular-velocity and
+      arm prices read on the successor. Each term is checked to be non-zero
+      somewhere, so a dropped term cannot pass.
   [3] a store round trip: `load_prior_rows` over a written store gives the
       same table, actions and rewards as `prior_rows` over the arrays.
   [4] a store of another width is refused.
@@ -41,6 +41,9 @@ comptime ACT = 3
 comptime QD_OFF = 2
 comptime QD_N = 2
 comptime ANG_OFF = 5
+comptime ARM_Q = 0
+comptime ARM_QD = 3
+comptime ARM_N = 2
 comptime DT_CTRL = 0.02
 comptime OUT = "/tmp/noeira_test_fb_prior.h5"
 
@@ -85,7 +88,7 @@ def _reg() -> RegRewardConfig:
 
 
 def _price() -> PriorPrice:
-    return PriorPrice(ANG_OFF, 0.25, 0.02)
+    return PriorPrice(ANG_OFF, 0.25, 0.02, ARM_Q, ARM_QD, ARM_N, 0.3, 0.07)
 
 
 def test_layout() raises:
@@ -135,6 +138,7 @@ def test_reward() raises:
     var acc_live = 0
     var ar_live = 0
     var price_live = 0
+    var arm_live = 0
     for r in range(p.n_valid):
         var s = src[r]
         var acc = 0.0
@@ -149,6 +153,13 @@ def test_reward() raises:
         var wy = Float64(_obs(s + 1, ANG_OFF + 1))
         var wz = Float64(_obs(s + 1, ANG_OFF + 2))
         var price = pr.w_yaw * wz * wz + pr.w_angxy * (wx * wx + wy * wy)
+        var dev = 0.0
+        var qd = 0.0
+        for k in range(ARM_N):
+            dev += Float64(_obs(s + 1, ARM_Q + k)) ** 2
+            qd += Float64(_obs(s + 1, ARM_QD + k)) ** 2
+        var arm = (pr.w_arm_dev * dev + pr.w_arm_qd * qd) / Float64(ARM_N)
+        price += arm
         var want = -reg.w_acc * acc - reg.w_ar * ar + reg.w_env * (Float64(_renv(s)) - price)
         var err = abs(Float64(p.rew.data[r]) - want) / max(1.0, abs(want))
         if err > worst:
@@ -157,12 +168,15 @@ def test_reward() raises:
             acc_live += 1
         if reg.w_ar * ar > 1e-3:
             ar_live += 1
-        if price > 1e-3:
+        if price - arm > 1e-3:
             price_live += 1
-    print("      worst rel |Δ|", worst, "  rows with a live acc / ar / price term:",
-          acc_live, ar_live, price_live)
+        if arm > 1e-3:
+            arm_live += 1
+    print("      worst rel |Δ|", worst, "  rows with a live acc / ar / price / arm term:",
+          acc_live, ar_live, price_live, arm_live)
     assert_true(worst < 1e-5, "prior reward differs from the hand recomputation")
-    assert_true(acc_live > 0 and ar_live > 0 and price_live > 0, "a reward term is dead in the fixture")
+    assert_true(acc_live > 0 and ar_live > 0 and price_live > 0 and arm_live > 0,
+                "a reward term is dead in the fixture")
 
 
 def _write_store(path: String, w: Int) raises:

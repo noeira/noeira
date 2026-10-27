@@ -29,6 +29,10 @@ and the §12.6 levers against the spin MEBE bought on φ ∋ ωz:
     --w-yaw 0.5 --w-angxy 0.05
                            −w_yaw·ωz² − w_angxy·(ωx² + ωy²) in Q_reg's
                            simulator half (needs --reg > 0)
+    --w-arm-dev 0.25 --w-arm-qd 0.05
+                           −(w_arm_dev·Σ(q − q_default)² + w_arm_qd·Σq̇²) / 14
+                           over the arm joints, same place (plan §13.14:
+                           unpriced arms were swung as balance mass)
 
     pixi run -e nvidia mojo build -I . examples/fb/fb_mebe_g1_gpu.mojo -o fb_mebe_g1
     ./fb_mebe_g1 --explore sphere --reg 0 --tag gfb_s1 --seed 1
@@ -113,6 +117,7 @@ from noeira.deep_agents.fb.g1_mebe import (
     G1Cmd,
     G1M_CMD_P,
     G1M_COL_VX, G1M_COL_VY, G1M_COL_WZ, G1M_COL_H, G1M_COL_GZ, G1M_COL_QD,
+    G1M_ARM0, G1M_N_ARM,
     g1_cmd_suite,
     g1_cmd_reward_obs,
     g1_cmd_step_kernel,
@@ -120,6 +125,7 @@ from noeira.deep_agents.fb.g1_mebe import (
     g1_reset_noise_kernel,
     g1_reg_env_kernel,
     g1_angvel_price_kernel,
+    g1_arm_price_kernel,
 )
 from noeira.deep_agents.fb.prior import PriorPrice, load_prior_rows
 from noeira.envs.robots import UnitreeG1Batched
@@ -234,6 +240,9 @@ def main() raises:
     var h_min = atof(_flag(String("--h-min"), String(0.0)))
     var w_yaw = atof(_flag(String("--w-yaw"), String(0.0)))
     var w_angxy = atof(_flag(String("--w-angxy"), String(0.0)))
+    var w_arm_dev = atof(_flag(String("--w-arm-dev"), String(0.0)))
+    var w_arm_qd = atof(_flag(String("--w-arm-qd"), String(0.0)))
+    var arm_price = w_arm_dev > 0.0 or w_arm_qd > 0.0
     var prior_path = _flag(String("--prior"), String(""))
     var prior_bc = atof(_flag(String("--prior-bc"), String(0.0)))
     if prior_bc > 0.0 and prior_path.byte_length() == 0:
@@ -250,6 +259,8 @@ def main() raises:
         raise Error("--phi must be 'vxvywzh', 'vxvyh', 'vxh' or 'vx'")
     if (w_yaw > 0.0 or w_angxy > 0.0) and reg <= 0.0:
         raise Error("--w-yaw / --w-angxy price Q_reg: they need --reg > 0")
+    if arm_price and reg <= 0.0:
+        raise Error("--w-arm-dev / --w-arm-qd price Q_reg: they need --reg > 0")
     if warmup < BATCH:
         raise Error("--warmup must be >= BATCH")
     var n_batched = total // N_ENVS
@@ -310,7 +321,8 @@ def main() raises:
     print("  nets                =", "F/Q tower H", H, "L", L, "| actor H", H, "L", LA, "| B ϑ(10) ->", HB, "->", D)
     print("  explore             =", explore, " β", beta, " eps_rel", eps_rel, " refresh", refresh, " explore_frac", explore_frac)
     print("  upright g_z bound    =", upright_gz, "  |vy| box", vy_max, "  h floor", h_min, "(0 = off)")
-    print("  φ / |ωz| box        =", phi, "/", wz_max, "(0 = off)   ang-vel price yaw", w_yaw, " xy", w_angxy)
+    print("  φ / |ωz| box        =", phi, "/", wz_max, "(0 = off)   ang-vel price yaw", w_yaw, " xy", w_angxy,
+          "  arm price dev", w_arm_dev, " qd", w_arm_qd)
     print("  Q_reg λ (raw)       =", reg, " w_acc", w_acc, " w_ar", w_ar, " w_env", w_env,
           " (und", rw.undesired, " fo", rw.feet_orient, " lim", rw.limits, " slide", rw.slide, ")")
     print("  N_ENVS / BATCH / D  =", N_ENVS, "/", BATCH, "/", D)
@@ -356,6 +368,8 @@ def main() raises:
         logger.set_config("h_min", String(h_min))
         logger.set_config("w_yaw", String(w_yaw))
         logger.set_config("w_angxy", String(w_angxy))
+        logger.set_config("w_arm_dev", String(w_arm_dev))
+        logger.set_config("w_arm_qd", String(w_arm_qd))
         logger.set_config("prior", prior_path)
         logger.set_config("prior_rows", String(PRIOR_ROWS if prior_path.byte_length() > 0 else 0))
         logger.set_config("prior_bc", String(prior_bc))
@@ -374,8 +388,14 @@ def main() raises:
         if prior_path.byte_length() > 0:
             # the ring's price is on only with Q_reg and a weight (below)
             var price = PriorPrice.none()
-            if use_reg and (w_yaw > 0.0 or w_angxy > 0.0):
-                price = PriorPrice(G1M_COL_WZ - 2, w_yaw, w_angxy)
+            if use_reg and (w_yaw > 0.0 or w_angxy > 0.0 or arm_price):
+                price = PriorPrice(
+                    G1M_COL_WZ - 2 if (w_yaw > 0.0 or w_angxy > 0.0) else -1,
+                    w_yaw, w_angxy,
+                    G1M_ARM0, G1M_COL_QD + G1M_ARM0,
+                    G1M_N_ARM if arm_price else 0,
+                    w_arm_dev, w_arm_qd,
+                )
             var t_p = perf_counter_ns()
             var pr = load_prior_rows(prior_path, OBS, ACT, regc, price)
             var r_mean = 0.0
@@ -638,6 +658,12 @@ def main() raises:
                 ctx.enqueue_function[g1_angvel_price_kernel[OBS, N_ENVS]](
                     mptr(env._obs.unsafe_ptr()), mptr(r_env.unsafe_ptr()),
                     Scalar[DT](w_yaw), Scalar[DT](w_angxy),
+                    grid_dim=_blocks(N_ENVS), block_dim=TPB,
+                )
+            if use_reg and arm_price:
+                ctx.enqueue_function[g1_arm_price_kernel[OBS, N_ENVS]](
+                    mptr(env._obs.unsafe_ptr()), mptr(r_env.unsafe_ptr()),
+                    Scalar[DT](w_arm_dev), Scalar[DT](w_arm_qd),
                     grid_dim=_blocks(N_ENVS), block_dim=TPB,
                 )
             ctx.enqueue_function[g1_fall_kernel[OBS, N_ENVS]](

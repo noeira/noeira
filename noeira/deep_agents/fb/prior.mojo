@@ -35,7 +35,10 @@ with `a_prev = 0` on an episode's first row, `q̇` read at
 `[qd_off, qd_off + qd_n)`, and
 `env = r_env − w_yaw·ωz'² − w_angxy·(ωx'² + ωy'²)` — the ring's
 `g1_angvel_price_kernel`, on the SUCCESSOR's angular velocity at
-`[ang_off, ang_off + 3)` (`ang_off < 0`: no price).
+`[ang_off, ang_off + 3)` (`ang_off < 0`: no price). The arm price
+(`g1_arm_price_kernel`) subtracts `(w_arm_dev·Σq² + w_arm_qd·Σq̇²) / arm_n`
+over the successor's `[arm_q, arm_q + arm_n)` and `[arm_qd, arm_qd + arm_n)`
+(`arm_n = 0`: no price).
 
 `PriorRows.windows(seq)` is what the prior-row BC encodes its `z` from
 (FB-CPR's `encode_expert`, `fb/cpr.mojo`): for transition row `p`, the table
@@ -53,14 +56,34 @@ from noeira.data.store import TrajectoryStore
 from .online_mebe import RegRewardConfig
 
 
-@fieldwise_init
 struct PriorPrice(Copyable, ImplicitlyCopyable, Movable):
-    """The angular-velocity price the driver adds to the ring's env term
-    (`--w-yaw`, `--w-angxy`); `ang_off` is the first of (ωx, ωy, ωz)."""
+    """The prices the driver adds to the ring's env term: angular velocity
+    (`--w-yaw`, `--w-angxy`; `ang_off` is the first of (ωx, ωy, ωz)) and the
+    arms (`--w-arm-dev`, `--w-arm-qd`; `arm_q` / `arm_qd` the first arm
+    joint's position / velocity column)."""
 
     var ang_off: Int
     var w_yaw: Float64
     var w_angxy: Float64
+    var arm_q: Int
+    var arm_qd: Int
+    var arm_n: Int
+    var w_arm_dev: Float64
+    var w_arm_qd: Float64
+
+    def __init__(
+        out self, ang_off: Int, w_yaw: Float64, w_angxy: Float64,
+        arm_q: Int = 0, arm_qd: Int = 0, arm_n: Int = 0,
+        w_arm_dev: Float64 = 0.0, w_arm_qd: Float64 = 0.0,
+    ):
+        self.ang_off = ang_off
+        self.w_yaw = w_yaw
+        self.w_angxy = w_angxy
+        self.arm_q = arm_q
+        self.arm_qd = arm_qd
+        self.arm_n = arm_n
+        self.w_arm_dev = w_arm_dev
+        self.w_arm_qd = w_arm_qd
 
     @staticmethod
     def none() -> Self:
@@ -220,6 +243,16 @@ def prior_rows(
                 var wy = Float64(obs[o + 1])
                 var wz = Float64(obs[o + 2])
                 env -= price.w_yaw * wz * wz + price.w_angxy * (wx * wx + wy * wy)
+            if price.arm_n > 0:
+                var o = (s + 1) * w
+                var dev = 0.0
+                var qd = 0.0
+                for k in range(price.arm_n):
+                    var q = Float64(obs[o + price.arm_q + k])
+                    var v = Float64(obs[o + price.arm_qd + k])
+                    dev += q * q
+                    qd += v * v
+                env -= (price.w_arm_dev * dev + price.w_arm_qd * qd) / Float64(price.arm_n)
             out.rew.data[p] = Scalar[DT](
                 -reg.w_acc * acc - reg.w_ar * ar + reg.w_env * env
             )

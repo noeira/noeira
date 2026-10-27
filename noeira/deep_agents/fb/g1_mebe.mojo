@@ -64,6 +64,8 @@ comptime G1M_COL_VX: Int = 341
 comptime G1M_COL_VY: Int = 342
 comptime G1M_COL_WZ: Int = 436
 comptime G1M_COL_QD: Int = 29      # joint velocities, 29 from here
+comptime G1M_ARM0: Int = 15        # arms: joints 15..28 (`unitree_g1_pd.mojo`)
+comptime G1M_N_ARM: Int = 14
 comptime G1M_THETA: Int = 10
 
 comptime G1BNetProj[OBS: Int, D: Int, HB: Int] = Sequential[
@@ -258,6 +260,31 @@ def g1_angvel_price_kernel[OBS_W: Int, LANES: Int](
     r_env[unsafe_offset=l] = r_env[unsafe_offset=l] - (
         w_yaw * wz * wz + w_xy * (wx * wx + wy * wy)
     )
+
+
+def g1_arm_price_kernel[OBS_W: Int, LANES: Int](
+    obs: Pointer[Scalar[DT], MutAnyOrigin],
+    r_env: Pointer[Scalar[DT], MutAnyOrigin],
+    w_dev: Scalar[DT],
+    w_qd: Scalar[DT],
+):
+    """One thread per lane, after `g1_reg_env_kernel` (it ADDS to `r_env`):
+    `−w_dev·mean(q − q_default)² − w_qd·mean(q̇²)` over the 14 arm joints of
+    the post-step obs. Plan §13.14: with nothing pricing the arms, gbc swung
+    them as balance mass (arm speed 6× the teacher's)."""
+    var l = Int(global_idx.x)
+    if l >= LANES:
+        return
+    var o = l * OBS_W
+    var dev = Scalar[DT](0)
+    var qd = Scalar[DT](0)
+    comptime for k in range(G1M_ARM0, G1M_ARM0 + G1M_N_ARM):
+        var q = obs[unsafe_offset=o + k]
+        var v = obs[unsafe_offset=o + G1M_COL_QD + k]
+        dev += q * q
+        qd += v * v
+    var inv = Scalar[DT](1.0 / Float64(G1M_N_ARM))
+    r_env[unsafe_offset=l] = r_env[unsafe_offset=l] - inv * (w_dev * dev + w_qd * qd)
 
 
 # ── the base-command suite (§3) ──────────────────────────────────────────
