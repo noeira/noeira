@@ -28,6 +28,14 @@ task, every step, as text (`t lane q0 … q35`) for an offline render.
 With `--dump-pool`, it writes the 65 536 sampled ring rows' (vx, vy, ωz,
 h, g_z) as text, for offline joint histograms of what the ring holds.
 
+`--prior FILE` attaches a seeded arm's prior rows as the driver does
+(same `PriorPrice`), so the collection's MEBE pool draws them at the
+batch's share. `--dump-zpool FILE` then writes the TRAINING EVAL's reward
+pool (32 768 rows, each a prior row w.p. `PRIOR_FRAC`, drawn as `_eval`
+draws them) as a `TrajectoryStore`, one episode, columns `obs` (the raw
+527-wide row) and `b` (its `B(s)`, 64). A laptop demo can then build
+`z = E_pool[r · B]` for any command with no ring and no GPU.
+
     pixi run -e nvidia mojo build -I . examples/fb/fb_mebe_g1_probe_gpu.mojo -o fb_mebe_g1_probe
     ./fb_mebe_g1_probe --ckpt <run>/checkpoints/step_19988480.ckpt --reg 1 --dump qpos.txt
 
@@ -38,6 +46,7 @@ h, g_z) as text, for offline joint histograms of what the ring holds.
 from std.math import sqrt
 from std.random import seed
 from std.sys import argv
+from std.sys.defines import get_defined_int
 from std.time import perf_counter_ns
 from noeira.core.tiles import tile
 from max.gpu.host import DeviceContext
@@ -65,6 +74,9 @@ from noeira.deep_agents.fb.g1_mebe import (
     g1_fall_kernel,
     g1_reset_noise_kernel,
 )
+from noeira.deep_agents.fb.prior import PriorPrice, load_prior_rows
+from noeira.data.column import ColumnSpec
+from noeira.data.store import TrajectoryStoreWriter
 from noeira.envs.robots import UnitreeG1Batched
 from noeira.envs.robots.unitree_g1_xml import UNITREE_G1_OBS_DIM
 
@@ -81,13 +93,15 @@ comptime BATCH: Int = 1024
 comptime CAP: Int = 524_288   # ≥ the default --collect's 409 600 rows (still
                               # OOMs beside two G1 training runs on a 5090)
 comptime ZBUF: Int = 8192
+comptime PRIOR_ROWS: Int = get_defined_int["PRIOR_ROWS", 256]()
 comptime EnvT = UnitreeG1Batched[N_ENVS]
 comptime FNet = BFMFTower[OBS, ACT, D, H, L, D]
 comptime BNet = G1BNetProj[OBS, D, HB]
 comptime ANet = BFMActorTower[OBS, D, H, LA, ACT]
 comptime QNet = BFMFTower[OBS, ACT, D, H, L, 1]
 comptime Agent = FBMebeOnlineAgent[
-    FNet, BNet, ANet, QNet, OBS, ACT, D, BATCH, CAP, N_ENVS, ZBUF
+    FNet, BNet, ANet, QNet, OBS, ACT, D, BATCH, CAP, N_ENVS, ZBUF, 0, DT,
+    PRIOR_ROWS,
 ]
 
 comptime CTRL_DT: Float64 = 0.02
@@ -153,6 +167,10 @@ def main() raises:
     var seed_v = atol(_flag(String("--seed"), String(1)))
     var dump = _flag(String("--dump"), String(""))
     var dump_pool = _flag(String("--dump-pool"), String(""))
+    var prior_path = _flag(String("--prior"), String(""))
+    var dump_zpool = _flag(String("--dump-zpool"), String(""))
+    var w_yaw = atof(_flag(String("--w-yaw"), String(0.0)))
+    var w_angxy = atof(_flag(String("--w-angxy"), String(0.0)))
     var phi = _flag(String("--phi"), String("vxvywzh"))
     var wz_max = atof(_flag(String("--wz-max"), String(0.0)))
     var upright_gz = atof(_flag(String("--upright-gz"), String(-0.93)))
@@ -215,6 +233,16 @@ def main() raises:
             episode_len=0,
         )
         agent.load_state(ckpt)
+        if prior_path.byte_length() > 0:
+            # the driver's attach (`fb_mebe_g1_gpu.mojo`), same price
+            var price = PriorPrice.none()
+            if use_reg and (w_yaw > 0.0 or w_angxy > 0.0):
+                price = PriorPrice(G1M_COL_WZ - 2, w_yaw, w_angxy)
+            var pr = load_prior_rows(prior_path, OBS, ACT, regc, price)
+            var nxt = pr.upload(ctx)
+            var nv = pr.n_valid
+            agent.attach_prior(pr.take_obs(), pr.take_act(), nxt^, pr.take_rew(), nv)
+            print("  [prior]", nv, "transitions,", pr.n_term, "episodes attached")
         var env = EnvT(ctx)
         var eval_env = EnvT(ctx)
 
@@ -296,6 +324,46 @@ def main() raises:
             with open(dump_pool, "w") as fh:
                 fh.write(txt)
             print("[dump] pool rows ->", dump_pool)
+        if dump_zpool.byte_length() > 0:
+            # the training eval's pool, drawn as `_eval` draws it
+            var zrng = SplitMix64(UInt64(seed_v) * 7919)
+            var zrows = List[Int]()
+            var zfrom = List[Bool]()
+            var n_prior = agent.prior_rows()
+            for _ in range(EVAL_POOL):
+                if n_prior > 0 and zrng.uniform() < Agent.PRIOR_FRAC:
+                    zrows.append(zrng.below(n_prior))
+                    zfrom.append(True)
+                else:
+                    zrows.append(zrng.below(agent.replay_size()))
+                    zfrom.append(False)
+            var zraw = List[Scalar[DT]]()
+            var zbs = List[Scalar[DT]]()
+            if n_prior > 0:
+                agent.embed_rows_mixed(zrows, zfrom, zraw, zbs)
+            else:
+                agent.embed_rows(zrows, zraw, zbs)
+            var n_p = 0
+            for i in range(EVAL_POOL):
+                if zfrom[i]:
+                    n_p += 1
+            var fo = List[Float32](length=EVAL_POOL * OBS, fill=0)
+            var fb = List[Float32](length=EVAL_POOL * D, fill=0)
+            for i in range(EVAL_POOL * OBS):
+                fo[i] = Float32(zraw[i])
+            for i in range(EVAL_POOL * D):
+                fb[i] = Float32(zbs[i])
+            var zcols = List[ColumnSpec]()
+            zcols.append(ColumnSpec(String("obs"), DType.float32, OBS))
+            zcols.append(ColumnSpec(String("b"), DType.float32, D))
+            var zw = TrajectoryStoreWriter(
+                dump_zpool, zcols^, env_id=String("builtin:unitree_g1"), seed=seed_v,
+            )
+            zw.append[DType.float32](String("obs"), fo.unsafe_ptr().as_unsafe_any_origin(), EVAL_POOL)
+            zw.append[DType.float32](String("b"), fb.unsafe_ptr().as_unsafe_any_origin(), EVAL_POOL)
+            zw.end_episode()
+            zw.close()
+            print("[dump] z pool:", EVAL_POOL, "rows (", n_p, "prior ) ->", dump_zpool)
 
         # ── eval buffers ───────────────────────────────────────────────────
         var e_task = ctx.enqueue_create_buffer[DType.int32](N_ENVS)
