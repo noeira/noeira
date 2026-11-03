@@ -289,6 +289,32 @@ def _exp_term[dt: DType](w: Float64, std: Float64, e: Scalar[dt]) -> Scalar[dt] 
     return Scalar[dt](SM_DT * w) * exp(-e / Scalar[dt](std * std))
 
 
+def sm_observation_lane[dt: DType](table: FP[dt], s: FP[dt], a: FP[dt], xi: FP[dt], obs: FP[dt]):
+    """`analytic_observation(s, a, xi, q0)` (93): [q + bias − q0, q̇, ω_body,
+    R⁻¹ g (RAW root quaternion), a] — the noise-free proprioception after
+    taking `a` and landing in `s`."""
+    for j in range(SM_N_DOF):
+        obs[unsafe_offset=j] = _at(s, 7 + j) + _at(xi, 1 + j) - _at(table, HT_Q0 + j)
+        obs[unsafe_offset=29 + j] = _at(s, 42 + j)
+        obs[unsafe_offset=64 + j] = _at(a, j)
+    var pg = qapply_inv(_q4(s, 3), Q4[dt](0, 0, -1, 0))
+    for c in range(3):
+        obs[unsafe_offset=58 + c] = _at(s, 39 + c)
+        obs[unsafe_offset=61 + c] = pg[c]
+
+
+def sm_observation_vjp_lane[dt: DType](s: FP[dt], g_obs: FP[dt], g_s: FP[dt], g_a: FP[dt]):
+    """`g_s`, `g_a` += the observation's VJP (ADDS)."""
+    var g_pg = Q4[dt](g_obs[unsafe_offset=61], g_obs[unsafe_offset=62], g_obs[unsafe_offset=63], 0)
+    _add4(g_s, 3, qapply_inv_vjp_q(_q4(s, 3), Q4[dt](0, 0, -1, 0), g_pg))
+    for j in range(SM_N_DOF):
+        g_s[unsafe_offset=7 + j] += g_obs[unsafe_offset=j]
+        g_s[unsafe_offset=42 + j] += g_obs[unsafe_offset=29 + j]
+        g_a[unsafe_offset=j] += g_obs[unsafe_offset=64 + j]
+    for c in range(3):
+        g_s[unsafe_offset=39 + c] += g_obs[unsafe_offset=58 + c]
+
+
 # ── forward ─────────────────────────────────────────────────────────────────
 def g1_heads_lane[dt: DType](
     tree: FP[dt], table: FP[dt], s: FP[dt], a: FP[dt], a_prev: FP[dt], xi: FP[dt], rf: FP[dt],
@@ -360,15 +386,7 @@ def g1_heads_lane[dt: DType](
     feat[unsafe_offset=0] = tf[0]
     feat[unsafe_offset=1] = tf[1]
 
-    # observation
-    for j in range(SM_N_DOF):
-        obs[unsafe_offset=j] = _at(s, 7 + j) + _at(xi, 1 + j) - _at(table, HT_Q0 + j)
-        obs[unsafe_offset=29 + j] = _at(s, 42 + j)
-        obs[unsafe_offset=64 + j] = _at(a, j)
-    var pg = qapply_inv(sq, grav)
-    for c in range(3):
-        obs[unsafe_offset=58 + c] = _at(s, 39 + c)
-        obs[unsafe_offset=61 + c] = pg[c]
+    sm_observation_lane(table, s, a, xi, obs)
     return total
 
 
@@ -489,14 +507,5 @@ def g1_heads_vjp_lane[dt: DType](
         g_s[unsafe_offset=G1_FK_NQ + i] += gqvel[unsafe_offset=i]
 
     # ── termination features and observation: the raw root quaternion ──
-    var grav = Q4[dt](0, 0, -1, 0)
-    var sq = _q4(s, 3)
     sm_term_features_vjp(s, g_feat[unsafe_offset=0], g_feat[unsafe_offset=1], g_s)
-    var g_pg = Q4[dt](g_obs[unsafe_offset=61], g_obs[unsafe_offset=62], g_obs[unsafe_offset=63], 0)
-    _add4(g_s, 3, qapply_inv_vjp_q(sq, grav, g_pg))
-    for j in range(SM_N_DOF):
-        g_s[unsafe_offset=7 + j] += g_obs[unsafe_offset=j]
-        g_s[unsafe_offset=42 + j] += g_obs[unsafe_offset=29 + j]
-        g_a[unsafe_offset=j] += g_obs[unsafe_offset=64 + j]
-    for c in range(3):
-        g_s[unsafe_offset=39 + c] += g_obs[unsafe_offset=58 + c]
+    sm_observation_vjp_lane(s, g_obs, g_s, g_a)

@@ -13,4 +13,7 @@ with its hand-written VJP.
 M4: `state_spec` (canonical features, explicit integration, the training
 error, with VJPs) and `world_model` (dynamics MLP + termination head on
 `nn`, the k-step loss of Eq. 1 and its reverse scan).
+M5: `policy` (goal encoder + decoder, critic, history and root-error inputs)
+and `imagination` (the H-step rollout through the frozen world model and the
+gradient of −J/H into the policy).
 """

@@ -109,3 +109,9 @@ tests/deep_agents/supermimic/test_supermimic_heads.mojo /tmp/sm_heads
 #   uv run --no-project --python 3.12 --with torch --with mujoco==3.12.0 \
 #       --with numpy python tools/supermimic/wm_oracle.py --out /tmp/sm_wm
 tests/deep_agents/supermimic/test_supermimic_wm.mojo /tmp/sm_wm
+# SuperMimic M5: the H = 32 imagined rollout through the frozen world model
+# and its policy gradient, against the reproduction's imagine / ImagStep /
+# policy_objective run verbatim in torch:
+#   uv run --no-project --python 3.12 --with torch --with mujoco==3.12.0 \
+#       --with numpy python tools/supermimic/imag_oracle.py --out /tmp/sm_imag
+tests/deep_agents/supermimic/test_supermimic_imag.mojo /tmp/sm_imag
