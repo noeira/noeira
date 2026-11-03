@@ -17,4 +17,7 @@ M5: `policy` (goal encoder + decoder, critic, history and root-error inputs)
 and `imagination` (the H-step rollout through the frozen world model and the
 gradient of −J/H into the policy), `trainer` (one `PolicyTrainer.update`:
 the clipped actor step, TD(λ) targets, the critic's 5 × 4 minibatch fit).
+M2: `motion_library` (bins, goal window, reference rows, the return-based
+reset sampler), `replay` (the ring of k-step windows and history starts) and
+`env` (the tracking env on our CPU G1, one simulator per lane).
 """

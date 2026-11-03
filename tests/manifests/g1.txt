@@ -121,3 +121,7 @@ tests/deep_agents/supermimic/test_supermimic_imag.mojo /tmp/sm_imag
 #   uv run --no-project --python 3.12 --with torch --with mujoco==3.12.0 \
 #       --with numpy python tools/supermimic/lib_oracle.py --out /tmp/sm_lib
 tests/deep_agents/supermimic/test_supermimic_lib.mojo /tmp/sm_lib
+# SuperMimic M2c: the tracking env on our CPU G1 (known-answer checks: a held
+# pose at full reward, resets, the encoder bias in obs and PD target, foot
+# friction, termination and clip-end rows, frame and replay bookkeeping)
+tests/deep_agents/supermimic/test_supermimic_env.mojo
