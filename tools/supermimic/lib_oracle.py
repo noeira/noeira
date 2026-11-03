@@ -17,6 +17,11 @@
   env (`__new__` + the attributes those two methods read). `torch.multinomial`
   is wrapped to record the bin distribution and inject the bins; `torch.rand`
   injects the uniform draws. Files `s_*` (sampler) and `f_*` (finalize).
+* `ReplayBuffer` (`data/replay_buffer.py`) VERBATIM, fed a recorded sequence
+  of `add` / `end_episode` calls (3 envs, a 40-row ring that wraps, episodes
+  of 3–25 steps each closed by a terminal row); `multinomial` is wrapped to
+  capture the window and start masks and to pick (and record) eligible rows.
+  Files `r_*`.
 """
 
 from __future__ import annotations
@@ -172,7 +177,67 @@ def main() -> None:
     sv("f_return0", f0)
     sv("f_return1", cmd.bin_return)
     print(f"  [sampler] {n_draw} draws over {nb} bins; finalize {E} episodes ({sum(1 for t_, c_ in zip(term, cend) if not t_ and not c_)} truncated)")
+    replay_part(R, a.out, rng)
     print(f"-> {a.out}")
+
+
+def replay_part(R, out: Path, rng) -> None:
+    rb_mod = _load_by_path("sm_replay_buffer", R / "data" / "replay_buffer.py")
+    E, T, K, HIST = 3, 40, 8, 10
+    rb = rb_mod.ReplayBuffer(E, T, 71, 29, 33, "cpu")
+    calls = []   # one row per add: e, r, done, frame, terminal, ep_start, end_after, then s | a | a_exec | xi
+    for e in range(E):
+        for _ in range(7):
+            L = int(rng.integers(3, 26))
+            xi = rng.normal(0, 1, 33).astype(np.float32)
+            for t in range(L + 1):
+                term = t == L
+                s_ = rng.normal(0, 1, 71).astype(np.float32)
+                a_ = np.zeros(29, np.float32) if term else rng.normal(0, 1, 29).astype(np.float32)
+                ae = np.zeros(29, np.float32) if term else (a_ + 0.1 * rng.normal(0, 1, 29)).astype(np.float32)
+                r_ = 0.0 if term else float(np.float32(rng.uniform(0, 0.1)))
+                d_ = float(term and rng.random() < 0.6)
+                fr = int(rng.integers(0, 274))
+                st = t == 0
+                ids = torch.tensor([e])
+                rb.add(ids, s=torch.tensor(s_)[None], a=torch.tensor(a_)[None], a_exec=torch.tensor(ae)[None],
+                       xi=torch.tensor(xi)[None], r=torch.tensor([r_]), done=torch.tensor([d_]), frame=torch.tensor([fr]),
+                       clip=torch.tensor([0]), terminal=torch.tensor([term]), ep_start=torch.tensor([st]))
+                if term:
+                    rb.end_episode(ids)
+                calls.append(np.concatenate([[e, r_, d_, fr, float(term), float(st), float(term)], s_, a_, ae, xi]))
+    np.save(out / "r_calls.npy", np.stack(calls).astype(np.float64))
+    masks, picks = [], []
+    real_mn = torch.multinomial
+
+    def pick(p_, n, replacement=False):
+        masks.append(p_.clone())
+        elig = np.nonzero(p_.numpy() > 0)[0]
+        idx = torch.tensor(rng.choice(elig, n))
+        picks.append(idx.clone())
+        return idx
+
+    torch.multinomial = pick
+    try:
+        w = rb.sample_windows(12, K)
+        st = rb.sample_starts(12, HIST)
+    finally:
+        torch.multinomial = real_mn
+    sv = lambda name, x: np.save(out / f"{name}.npy", np.ascontiguousarray(np.asarray(x.detach().numpy() if torch.is_tensor(x) else x, dtype=np.float64).reshape(len(x), -1)))  # noqa: E731
+    sv("r_wmask", masks[0][:, None])
+    sv("r_smask", masks[1][:, None])
+    sv("r_wpick", picks[0][:, None])
+    sv("r_spick", picks[1][:, None])
+    sv("r_w_states", w.states.reshape(-1, 71))
+    sv("r_w_a_exec", w.a_exec.reshape(-1, 29))
+    sv("r_w_xi", w.xi)
+    sv("r_w_done", w.done.reshape(-1, 1))
+    sv("r_w_frame", w.frame.reshape(-1, 1))
+    sv("r_s_state", st.state)
+    sv("r_s_prev_action", st.prev_action)
+    sv("r_s_hist_states", st.hist_states.reshape(-1, 71))
+    sv("r_s_hist_actions", st.hist_actions.reshape(-1, 29))
+    print(f"  [replay] {len(calls)} adds over {E} envs x {T} rows; {int(masks[0].sum())} window rows, {int(masks[1].sum())} start rows")
 
 
 if __name__ == "__main__":
