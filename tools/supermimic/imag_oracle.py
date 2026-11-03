@@ -183,6 +183,10 @@ def main() -> None:
         # would leave the late steps out of J: bias it to ~2 % a step
         linears(wm.term_head.mlp)[-1].bias.fill_(-4.0)
 
+    import copy
+
+    fresh = (copy.deepcopy(wm), copy.deepcopy(policy), copy.deepcopy(critic))
+
     # ── the start batch ──
     frame = rng.integers(0, L - 1, N)
     frame[0] = L_CLIP - 5          # a lane whose clip ends inside the horizon
@@ -261,7 +265,62 @@ def main() -> None:
     print(f"  N={N} H={H}: J {float(J.detach()):.6f}, undiscounted return "
           f"{float((ro.survival[:-1] * ro.rewards).sum(0).mean()):.4f}, survival_H {float(ro.survival[-1].mean()):.3f}, "
           f"mean reward {float(ro.rewards.mean()):.5f}, |a| {float(ro.actions.abs().mean()):.3f}")
+    trainer_run(ho, R, fresh, lib, start, a.out)
     print(f"-> {a.out}")
+
+
+def trainer_run(ho, R, fresh, lib, start, out: Path) -> None:
+    """`PolicyTrainer.update` VERBATIM on copies of the same initial networks
+    and the same start batch (a stub buffer returns it). `torch.randperm` and
+    `gae_targets` are wrapped to RECORD their draws / inputs / outputs, so the
+    Mojo side can replay the critic's minibatch order exactly. Files `u_*`."""
+    ptmod = ho._load("supermimic.imagination.policy_trainer", R / "imagination" / "policy_trainer.py")
+    wm, policy, critic = fresh
+    perms, gae_io = [], []
+    real_randperm = torch.randperm
+
+    def rec_randperm(*args, **kw):
+        p_ = real_randperm(*args, **kw)
+        perms.append(p_.clone())
+        return p_
+
+    real_gae = ptmod.gae_targets
+
+    def rec_gae(rewards, dhat_next, values, gamma, lam):
+        t_ = real_gae(rewards, dhat_next, values, gamma, lam)
+        gae_io.append((values.clone(), t_.clone()))
+        return t_
+
+    class Buf:
+        def sample_starts(self, b, h):
+            return start
+
+    cfg = ptmod.PolicyTrainerCfg(horizon=H, batch_size=N, compile=None, obs_noise=False)
+    tr = ptmod.PolicyTrainer(wm, policy, critic, lib, cfg)
+    torch.manual_seed(5)
+    torch.randperm = rec_randperm
+    ptmod.gae_targets = rec_gae
+    try:
+        met = tr.update(Buf())
+    finally:
+        torch.randperm = real_randperm
+        ptmod.gae_targets = real_gae
+    assert len(perms) == cfg.critic_epochs and len(gae_io) == 1
+
+    def lin(mlp):
+        return [x for x in mlp.net if isinstance(x, torch.nn.Linear)]
+
+    def flat(lins):
+        return np.concatenate([np.concatenate([l.weight.detach().numpy().T.ravel(), l.bias.detach().numpy().ravel()]) for l in lins])[None, :]
+
+    np.save(out / "u_policy.npy", flat(lin(policy.encoders["motion"].mlp) + lin(policy.decoder.mlp)))
+    np.save(out / "u_critic.npy", flat(lin(critic.mlp)))
+    np.save(out / "u_perms.npy", torch.stack(perms).numpy().astype(np.float64).reshape(1, -1))
+    np.save(out / "u_values.npy", gae_io[0][0].numpy().reshape(-1, 1))
+    np.save(out / "u_targets.npy", gae_io[0][1].numpy().reshape(-1, 1))
+    keys = ("imag_objective", "imag_return_undisc", "policy_grad_norm", "critic_loss", "critic_value_mean", "critic_target_mean")
+    np.save(out / "u_metrics.npy", np.array([[met[k] for k in keys]]))
+    print("  [update] " + ", ".join(f"{k} {met[k]:.6g}" for k in keys))
 
 
 if __name__ == "__main__":

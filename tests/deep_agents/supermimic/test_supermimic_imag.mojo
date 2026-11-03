@@ -18,6 +18,13 @@ WHAT EACH SECTION CAN CATCH
     survival, root-error features, V(s_H), and J to 1e-4 relative (plan M5).
     Float32 over 32 steps through a world model: per-element bounds are
     1e-3 of each quantity's scale.
+[4] one `PolicyTrainer.update` (the reproduction's, verbatim, with its
+    `randperm` draws recorded and replayed here): V on all (H+1)·N imagined
+    states and the TD(λ) targets (1e-5 of scale), the pre-clip policy grad
+    norm, the policy after its clipped Adam step (well-conditioned elements
+    within 2 fp32 ulps of max(|w|, lr)), the critic after its 20 minibatch
+    steps (elements that moved ≥ 10 % of the largest move: to 1e-3 of it),
+    the last minibatch loss (1e-4).
 [3] the policy gradient (encoder + decoder, every parameter): cosine
     ≥ 0.99999 AND max error ≤ 1e-4 of the largest component, per network.
     Measured agreement is 3e-7 of the largest.
@@ -29,7 +36,10 @@ carried gradients, measured (encoder / decoder):
     no survival-chain gradient                 cosine 0.9986  / 0.9948,   max err 5e-2 / 8e-2
     no critic gradient into s_H                cosine 0.9993  / 0.9990,   max err 6e-2 / 5e-2
 The first two pass at 0.999 and at a 1e-2 error bound; the bounds above
-fail all four.
+fail all four. A swapped λ / (1 − λ) in the TD(λ) recursion fails [4].
+
+NOT COVERED: `clip_grad_value(0.1)` never binds here (the policy's gradient
+norm is 4e-3), so a broken value clip would pass.
 """
 
 from std.math import sqrt
@@ -41,6 +51,7 @@ from noeira.core.bytes import string_from_bytes
 from noeira.deep_agents.supermimic.g1_fk import g1_fk_tree
 from noeira.deep_agents.supermimic.heads import SM_REF_DIM, g1_heads_table
 from noeira.deep_agents.supermimic.imagination import SMImagBatch, sm_imagine
+from noeira.deep_agents.supermimic.trainer import SMPolicyTrainer
 from noeira.deep_agents.supermimic.policy import SMCritic, SMPolicy, SM_GOAL_DIM, SM_OBS
 from noeira.deep_agents.supermimic.world_model import SMWorldModel
 from noeira.envs.robots import UnitreeG1
@@ -126,6 +137,23 @@ struct _Grads(ParamVisitor):
     ) raises:
         for i in range(N_):
             self.out.append(Float64(grad.data[i]))
+
+
+struct _Params(ParamVisitor):
+    var out: List[Float64]
+
+    def __init__(out self):
+        self.out = List[Float64]()
+
+    def __init__(out self, *, deinit move: Self):
+        self.out = move.out^
+
+    def visit[target: StaticString, N_: Int](
+        mut self, name: String, mut param: Tensor, mut grad: Tensor,
+        mut m: Tensor, mut v: Tensor, apply_decay: Bool, ctx: Optional[DeviceContext],
+    ) raises:
+        for i in range(N_):
+            self.out.append(Float64(param.data[i]))
 
 
 def _fill(mut dst: List[Scalar[DT]], src: List[Float64]) raises:
@@ -263,6 +291,88 @@ def main() raises:
         t.truth(cs >= 0.99999 and md <= 1e-4 * mx, nm + ": cosine " + String(cs) + ", max err " + String(md / mx) + " of the largest (|g|max " + String(mx) + ")")
     _ = nets
     _ = bounds
+
+
+    print("\n[4] one PolicyTrainer.update, replaying the reference's minibatch draws")
+    var wm2 = SMWorldModel[32, 16].make[Kaiming]()
+    var pol2 = SMPolicy[24, 20, 16, 12, 28, 22, 18, 14].make[Kaiming]()
+    var critic2 = SMCritic[16, 12].make["cpu", Kaiming](None)
+    var w0 = load_npy_2d_f64(dump + "/i_weights.npy", total).values.copy()
+    var ld2 = _Load(w0.copy(), names.copy(), sizes.copy())
+    wm2.for_each_param["cpu"](ld2, None)
+    pol2.for_each_param["cpu"](ld2, None)
+    critic2.for_each_param["cpu"](ld2, None, String("critic"))
+    comptime ROWS = H * N
+    var pf = load_npy_2d_f64(dump + "/u_perms.npy", 5 * ROWS).values.copy()
+    var perms = List[Int](length=len(pf), fill=0)
+    for i in range(len(pf)):
+        perms[i] = Int(pf[i])
+    var tr = SMPolicyTrainer()
+    var vals = List[Float64]()
+    var tgts = List[Float64]()
+    var met = tr.update[32, 16, 24, 20, 16, 12, 28, 22, 18, 14, 16, 12, N, H](wm2, pol2, critic2, tree, table, ib, perms, vals, tgts)
+    var um = load_npy_2d_f64(dump + "/u_metrics.npy", 6).values.copy()
+    var wv = load_npy_2d_f64(dump + "/u_values.npy", 1).values.copy()
+    var wt = load_npy_2d_f64(dump + "/u_targets.npy", 1).values.copy()
+    var ev = 0.0
+    var sv = 0.0
+    for i in range(len(wv)):
+        ev = max(ev, abs(vals[i] - wv[i]))
+        sv = max(sv, abs(wv[i]))
+    var et = 0.0
+    var st = 0.0
+    for i in range(len(wt)):
+        et = max(et, abs(tgts[i] - wt[i]))
+        st = max(st, abs(wt[i]))
+    t.truth(len(vals) == len(wv) and ev <= 1e-5 * sv, String(len(vals)) + " values: max err " + String(ev) + " (scale " + String(sv) + ")")
+    t.truth(len(tgts) == len(wt) and et <= 1e-5 * st, String(len(tgts)) + " TD(lambda) targets: max err " + String(et) + " (scale " + String(st) + ")")
+    t.truth(abs(met.policy_grad_norm - um[2]) <= 1e-4 * um[2], "policy grad norm " + String(met.policy_grad_norm) + " (oracle " + String(um[2]) + ")")
+    t.truth(abs(met.imag_objective - um[0]) <= 1e-4 * abs(um[0]), "objective " + String(met.imag_objective) + " (oracle " + String(um[0]) + ")")
+    # the policy after one clipped Adam step
+    var pg = _Params()
+    pol2.for_each_param["cpu"](pg, None)
+    var wpol = load_npy_2d_f64(dump + "/u_policy.npy", len(pg.out)).values.copy()
+    var clip = min(1.0, 1.0 / (um[2] + 1e-6))
+    var e_good = 0.0
+    var e_rest = 0.0
+    for i in range(len(wpol)):
+        var d = abs(pg.out[i] - wpol[i])
+        var gi = max(min(wg[lo + i] * clip, 0.1), -0.1)
+        if abs(gi) > 1e-6:
+            # fp32 ulps of max(|w|, lr): near w = 0 the update's own rounding rules
+            e_good = max(e_good, d / (max(abs(wpol[i]), 2e-4) * 1.1920929e-7))
+        else:
+            e_rest = max(e_rest, d)
+    t.truth(e_good <= 2.0 and e_rest <= 2e-5, "policy after its step: " + String(e_good) + " fp32 ulps (well-conditioned), " + String(e_rest) + " abs near eps")
+    # the critic after 5 x 4 minibatch steps: compare the MOVES
+    var cg = _Params()
+    critic2.for_each_param["cpu"](cg, None)
+    var wcr = load_npy_2d_f64(dump + "/u_critic.npy", len(cg.out)).values.copy()
+    var c0 = 0
+    for k in range(len(names)):
+        if names[k].startswith("critic."):
+            break
+        c0 += sizes[k]
+    # After 20 Adam steps an element whose gradient sits near eps moves almost
+    # arbitrarily under fp32 noise (Adam normalises it up to ~lr a step). So:
+    # elements that MOVED (≥ 10 % of the largest move) tightly, the rest bounded.
+    var mmax = 0.0
+    for i in range(len(wcr)):
+        mmax = max(mmax, abs(wcr[i] - w0[c0 + i]))
+    var d_big = 0.0
+    var d_small = 0.0
+    var n_big = 0
+    for i in range(len(wcr)):
+        var mv_ref = wcr[i] - w0[c0 + i]
+        var d = abs((cg.out[i] - w0[c0 + i]) - mv_ref)
+        if abs(mv_ref) >= 0.1 * mmax:
+            d_big = max(d_big, d)
+            n_big += 1
+        else:
+            d_small = max(d_small, d)
+    t.truth(d_big <= 1e-3 * mmax, "critic after 20 steps, " + String(n_big) + " elements that moved: agree to " + String(d_big / mmax) + " of the largest move (" + String(mmax) + ")")
+    t.truth(d_small <= 0.5 * mmax, String(len(wcr) - n_big) + " elements that barely moved: within " + String(d_small / mmax) + " of the largest move")
+    t.truth(abs(met.critic_loss - um[3]) <= 1e-4 * um[3], "last critic minibatch loss " + String(met.critic_loss) + " (oracle " + String(um[3]) + ")")
 
     print("\n===", t.checks - t.fails, "/", t.checks, "passed ===")
     if t.fails != 0:

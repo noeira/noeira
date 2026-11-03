@@ -15,5 +15,6 @@ error, with VJPs) and `world_model` (dynamics MLP + termination head on
 `nn`, the k-step loss of Eq. 1 and its reverse scan).
 M5: `policy` (goal encoder + decoder, critic, history and root-error inputs)
 and `imagination` (the H-step rollout through the frozen world model and the
-gradient of −J/H into the policy).
+gradient of −J/H into the policy), `trainer` (one `PolicyTrainer.update`:
+the clipped actor step, TD(λ) targets, the critic's 5 × 4 minibatch fit).
 """
