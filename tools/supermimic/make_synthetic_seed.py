@@ -341,6 +341,11 @@ def main() -> None:
             feas.append(f"{p.stem}\t{dump_feasibility(mc, fb, model, skel, p, ref_dir, p.stem)}")
     (a.out / "clips.tsv").write_text("\n".join(lines) + "\n")
     (a.out / "feasibility.tsv").write_text("\n".join(feas) + "\n")
+    marker = a.out / "REAL"
+    if a.real_dir is not None:
+        marker.write_text(str(a.real_dir) + "\n")  # the gate then skips the fixture-coverage checks
+    elif marker.exists():
+        marker.unlink()
     for l in feas:
         print("  feasibility", l.replace("\t", ": ") or "keep")
 

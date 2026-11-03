@@ -34,7 +34,8 @@ WHAT EACH SECTION CAN CATCH
     `feasibility_filter` run on our MjModel: per-frame lowest link origin and
     sole height (1e-12 m: FK of nearly equal poses) and the verdict, exactly.
     The fixtures must reach all four verdicts, and each of the upright,
-    standing, still and duration gates is shown stopping one.
+    standing, still and duration gates is shown stopping one (fixtures
+    only: a `--real-dir` dump, marked by a `REAL` file, checks parity).
 [7] `import_seed_clips` over every CSV of the dump, refused one included:
     the manifest's verdicts are the name filter's, else the feasibility
     oracle's; the store holds exactly the kept clips, in order, named in the
@@ -159,6 +160,10 @@ def main() raises:
     var a = argv()
     var dump = String(a[1]) if len(a) > 1 else String("/tmp/seed_synth")
     var t = Tally()
+    # A `--real-dir` dump checks parity only; the coverage checks (every
+    # verdict reached, a refusal present) are properties of the FIXTURES.
+    var synthetic = not exists(dump + "/REAL")
+    print("dump:", dump, "(synthetic fixtures)" if synthetic else "(REAL clips: coverage checks skipped)")
     comptime H = 0.7071067811865476
 
     # ── [1] the Euler convention ────────────────────────────────────────────
@@ -358,10 +363,15 @@ def main() raises:
         )
         seen[want] = seen.get(want, 0) + 1
         n_feas += 1
-    t.truth(
-        "" in seen and "elevated_support" in seen and "ground_penetration" in seen and "floating_feet" in seen,
-        String(n_feas) + " clips reach all four verdicts (worst height err " + String(worst_h) + " m)",
-    )
+    var verdicts = String("")
+    for e in seen.items():
+        verdicts += " " + (e.key if e.key.byte_length() > 0 else String("keep")) + "=" + String(e.value)
+    print("    verdicts:" + verdicts + "; worst height err " + String(worst_h) + " m")
+    if synthetic:
+        t.truth(
+            "" in seen and "elevated_support" in seen and "ground_penetration" in seen and "floating_feet" in seen,
+            String(n_feas) + " fixture clips reach all four verdicts",
+        )
 
     # ── [7] the import: store + manifest ────────────────────────────────────
     print("\n[7] import_seed_clips over the whole dump, read back")
@@ -403,7 +413,10 @@ def main() raises:
         if r.startswith("name:"):
             n_name_drop += 1
     t.truth(bad == 0, String(len(man) - 1) + " verdicts = name filter, then feasibility (refused for the reader's refusals)")
-    t.truth(n_name_drop > 0 and summ.refused > 0, "the dump exercises a name drop and a refusal")
+    if synthetic:
+        t.truth(n_name_drop > 0 and summ.refused > 0, "the fixtures exercise a name drop and a refusal")
+    else:
+        print("    real dump: " + String(n_name_drop) + " name drops, " + String(summ.refused) + " refused")
     var st = TrajectoryStore(lib)
     t.truth(st.n_episodes() == summ.kept and summ.kept == len(kept_names), String(st.n_episodes()) + " episodes = kept clips")
     var refc = st.load_column[DType.float32](String(SEED_REF_COLUMN))
