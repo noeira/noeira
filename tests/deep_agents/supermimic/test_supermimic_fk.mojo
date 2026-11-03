@@ -1,4 +1,4 @@
-"""SuperMimic M3a: the per-lane G1 FK and its VJP (`deep_agents/supermimic/g1_fk`).
+"""SuperMimic M3a: the per-lane FK and its VJP (`deep_agents/supermimic/kinematics`), on the G1.
 
     uv run --no-project --python 3.12 --with torch --with mujoco==3.12.0 --with numpy \\
         python tools/supermimic/heads_oracle.py --out /tmp/sm_heads
@@ -27,11 +27,15 @@ from std.math import sqrt
 from std.random import random_float64, seed
 from std.sys import argv
 
-from noeira.deep_agents.supermimic.g1_fk import (
-    FK_DADR, FK_JPOS, FK_JTYPE, FK_QADR, FK_REC, G1_FK_FIXED, G1_FK_NB, G1_FK_NQ, G1_FK_NV, G1FKTree,
-    g1_fk_lane, g1_fk_tree, g1_fk_vjp_lane,
+from noeira.deep_agents.supermimic.kinematics import (
+    FK_DADR, FK_JPOS, FK_JTYPE, FK_QADR, FK_REC, SM_FK_FIXED, SMFKTree, sm_fk_lane, sm_fk_tree,
+    sm_fk_vjp_lane,
 )
-from noeira.envs.robots import UnitreeG1
+from noeira.deep_agents.supermimic.robot import G1Robot, G1Sim
+
+comptime G1_FK_NB = G1Robot.NBODY
+comptime G1_FK_NQ = G1Robot.NQ
+comptime G1_FK_NV = G1Robot.NV
 from noeira.io.npy import load_npy_2d_f64
 from noeira.physics3d.joint_types import JNT_FREE, JNT_HINGE
 
@@ -84,9 +88,9 @@ struct FKOut[dt: DType](Movable):
         self.ang = move.ang^
 
 
-def _fk[dt: DType](mut tree: G1FKTree[dt], mut qp: List[Scalar[dt]], mut qv: List[Scalar[dt]]) -> FKOut[dt] where dt.is_floating_point():
+def _fk[dt: DType](mut tree: SMFKTree[dt], mut qp: List[Scalar[dt]], mut qv: List[Scalar[dt]]) -> FKOut[dt] where dt.is_floating_point():
     var o = FKOut[dt]()
-    g1_fk_lane[dt](tree.ptr(), _p(qp), _p(qv), _p(o.pos), _p(o.quat), _p(o.lin), _p(o.ang))
+    sm_fk_lane[dt, G1_FK_NB](tree.ptr(), _p(qp), _p(qv), _p(o.pos), _p(o.quat), _p(o.lin), _p(o.ang))
     return o^
 
 
@@ -112,7 +116,7 @@ def _loss(o: FKOut[DType.float64], c: List[List[Float64]], b: Int) -> Float64:
 
 
 def suite(
-    mut t: Tally, mut tree: G1FKTree[DType.float64], mut tree32: G1FKTree[DType.float32],
+    mut t: Tally, mut tree: SMFKTree[DType.float64], mut tree32: SMFKTree[DType.float32],
     dump: String, pre: String, tag: String,
 ) raises:
     var qpos = load_npy_2d_f64(dump + "/" + pre + "qpos.npy", G1_FK_NQ)
@@ -180,7 +184,7 @@ def suite(
         var ga = _cast[DType.float64](cot[3], b * G1_FK_NB * 3, G1_FK_NB * 3)
         var gq = List[Float64](length=G1_FK_NQ, fill=0.0)
         var gv = List[Float64](length=G1_FK_NV, fill=0.0)
-        g1_fk_vjp_lane[DType.float64](
+        sm_fk_vjp_lane[DType.float64, G1_FK_NB, G1_FK_NQ, G1_FK_NV](
             tree.ptr(), _p(qp), _p(qv), _p(outs[b].pos), _p(outs[b].quat), _p(outs[b].ang),
             _p(gp), _p(gqt), _p(gl), _p(ga), _p(gq), _p(gv),
         )
@@ -228,11 +232,10 @@ def main() raises:
     var a = argv()
     var dump = String(a[1]) if len(a) > 1 else String("/tmp/sm_heads")
     var t = Tally()
-    var env = UnitreeG1[DType.float64]()
-    _ = env.reset()
+    var sim = G1Sim.create()
 
     print("\n[1] the tree")
-    var tree = g1_fk_tree[DType.float64](env)
+    var tree = sm_fk_tree[DType.float64, G1Robot](sim)
     var nh = 0
     var nfix = 0
     var addr_ok = True
@@ -242,12 +245,12 @@ def main() raises:
             if Int(tree.data[i * FK_REC + FK_QADR]) != 7 + nh or Int(tree.data[i * FK_REC + FK_DADR]) != 6 + nh:
                 addr_ok = False
             nh += 1
-        elif jt == G1_FK_FIXED:
+        elif jt == SM_FK_FIXED:
             nfix += 1
     t.truth(Int(tree.data[FK_JTYPE]) == JNT_FREE and nh == 29 and nfix == G1_FK_NB - 30 and addr_ok,
         "1 free root, " + String(nh) + " hinges at qpos 7.. / dof 6.., " + String(nfix) + " fixed bodies")
 
-    var tree32 = g1_fk_tree[DType.float32](env)
+    var tree32 = sm_fk_tree[DType.float32, G1Robot](sim)
     suite(t, tree, tree32, dump, String(""), String(" (our asset)"))
 
     # Our asset (and mjlab's) puts every hinge anchor at its body origin, so

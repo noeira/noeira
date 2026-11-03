@@ -12,9 +12,9 @@ Its lanes are a third near the reference, a third far, and a third within
 
 WHAT EACH SECTION CAN CATCH
 ===========================
-[1] the per-model table: the 14 tracked bodies resolve to the reproduction's
-    FK rows on our model (by NAME on its side, by `g1_skeleton_body` on
-    ours), and mjlab's soft joint limits (range × 0.9 about its midpoint).
+[1] the per-robot table: the 14 tracked bodies, resolved BY NAME from the
+    MJCF on both sides, give the reproduction's FK rows; mjlab's soft joint
+    limits (range × 0.9 about its midpoint).
 [2] float64 forward: the 8 weighted terms, the total, the 2 termination
     features and the 93-d observation, 1e-12.
 [3] float64 VJP against torch autograd: d/ds (71), d/da, d/da_prev, 1e-9
@@ -41,14 +41,22 @@ from std.math import cos, sin
 from std.random import random_float64, seed
 from std.sys import argv
 
-from noeira.deep_agents.supermimic.g1_fk import G1FKTree, g1_fk_tree
 from noeira.deep_agents.supermimic.heads import (
-    G1HeadsTable, HT_HI, HT_LO, HT_TRACKED, SM_N_DOF, SM_N_TERMS, SM_N_TRACKED, SM_OBS_DIM,
-    SM_REF_DIM, SM_SCRATCH, SM_STATE_DIM, SM_XI_DIM, g1_heads_lane, g1_heads_table, g1_heads_vjp_lane,
-    sq_quat_err, sq_quat_err_vjp,
+    SM_N_TERMS, SMHeadLayout, sm_heads_lane, sm_heads_vjp_lane, sq_quat_err, sq_quat_err_vjp,
 )
-from noeira.deep_agents.supermimic.g1_fk import Q4
-from noeira.envs.robots import UnitreeG1
+from noeira.deep_agents.supermimic.kinematics import Q4
+from noeira.deep_agents.supermimic.robot import G1Robot, G1Sim, SMDims
+from noeira.deep_agents.supermimic.tables import SMTables, sm_tables
+
+comptime D = SMDims[G1Robot]
+comptime L = SMHeadLayout[G1Robot]
+comptime SM_N_DOF = D.NDOF
+comptime SM_N_TRACKED = D.N_TRACKED
+comptime SM_OBS_DIM = D.OBS
+comptime SM_REF_DIM = D.REF
+comptime SM_SCRATCH = L.SCRATCH
+comptime SM_STATE_DIM = D.S
+comptime SM_XI_DIM = D.X
 from noeira.io.npy import load_npy_2d_f64
 
 
@@ -118,9 +126,9 @@ struct Lane[dt: DType](Movable):
         self.scratch = move.scratch^
         self.total = move.total
 
-    def forward(mut self, mut tree: G1FKTree[Self.dt], mut table: G1HeadsTable[Self.dt]) where Self.dt.is_floating_point():
-        self.total = g1_heads_lane[Self.dt](
-            tree.ptr(), table.ptr(), _p(self.s), _p(self.a), _p(self.ap), _p(self.xi), _p(self.rf),
+    def forward(mut self, mut tb: SMTables[Self.dt]) where Self.dt.is_floating_point():
+        self.total = sm_heads_lane[Self.dt, G1Robot](
+            tb.tree_ptr(), tb.head_ptr(), _p(self.s), _p(self.a), _p(self.ap), _p(self.xi), _p(self.rf),
             _p(self.terms), _p(self.feat), _p(self.obs), _p(self.scratch),
         )
 
@@ -168,27 +176,25 @@ def main() raises:
     var av = argv()
     var dump = String(av[1]) if len(av) > 1 else String("/tmp/sm_heads")
     var t = Tally()
-    var env = UnitreeG1[DType.float64]()
-    _ = env.reset()
+    var sim = G1Sim.create()
     var d = Dump(dump)
     var B = d.B
     var third = B // 3
 
     print("\n[1] the per-model table")
     var q0 = load_npy_2d_f64(dump + "/h_q0.npy", SM_N_DOF).values.copy()
-    var tree = g1_fk_tree[DType.float64](env)
-    var table = g1_heads_table[DType.float64](env, q0)
+    var table = sm_tables[DType.float64, G1Robot](sim, q0)
     var tr = load_npy_2d_f64(dump + "/h_tracked.npy", SM_N_TRACKED)
     var bad = 0
     for k in range(SM_N_TRACKED):
-        if Int(table.data[HT_TRACKED + k]) != Int(tr.values[k]):
+        if Int(table.head[L.TRACKED + k]) != Int(tr.values[k]):
             bad += 1
-    t.truth(bad == 0, "14 tracked bodies = the reproduction's rows by name")
+    t.truth(bad == 0, "14 tracked bodies resolved by name = the reproduction's rows by name")
     var soft = load_npy_2d_f64(dump + "/h_soft.npy", 2)
     var e_soft = 0.0
     for j in range(SM_N_DOF):
-        e_soft = max(e_soft, abs(Float64(table.data[HT_LO + j]) - soft.values[j * 2]))
-        e_soft = max(e_soft, abs(Float64(table.data[HT_HI + j]) - soft.values[j * 2 + 1]))
+        e_soft = max(e_soft, abs(Float64(table.head[L.LO + j]) - soft.values[j * 2]))
+        e_soft = max(e_soft, abs(Float64(table.head[L.HI + j]) - soft.values[j * 2 + 1]))
     t.truth(e_soft <= 1e-12, "soft joint limits (x0.9), max err " + String(e_soft))
 
     print("\n[2] float64 forward,", B, "lanes")
@@ -202,7 +208,7 @@ def main() raises:
     var lanes = List[Lane[DType.float64]]()
     for b in range(B):
         var l = Lane[DType.float64](d, b)
-        l.forward(tree, table)
+        l.forward(table)
         for k in range(SM_N_TERMS):
             e_t = max(e_t, _rel(Float64(l.terms[k]), w_terms[b * SM_N_TERMS + k]))
         e_t = max(e_t, _rel(Float64(l.total), w_total[b]))
@@ -232,8 +238,8 @@ def main() raises:
         var gs = List[Float64](length=SM_STATE_DIM, fill=0.0)
         var ga = List[Float64](length=SM_N_DOF, fill=0.0)
         var gap = List[Float64](length=SM_N_DOF, fill=0.0)
-        g1_heads_vjp_lane[DType.float64](
-            tree.ptr(), table.ptr(), _p(lanes[b].s), _p(lanes[b].a), _p(lanes[b].ap), _p(lanes[b].rf),
+        sm_heads_vjp_lane[DType.float64, G1Robot](
+            table.tree_ptr(), table.head_ptr(), _p(lanes[b].s), _p(lanes[b].a), _p(lanes[b].ap), _p(lanes[b].rf),
             g_r[b], _p(gf), _p(go), _p(lanes[b].scratch), _p(gs), _p(ga), _p(gap),
         )
         var kind = 0 if b < third else (1 if b < 2 * third else 2)
@@ -272,7 +278,7 @@ def main() raises:
             for k in range(SM_N_DOF):
                 l.a[k] += sc * da[k]
                 l.ap[k] += sc * dap[k]
-            l.forward(tree, table)
+            l.forward(table)
             v.append(_objective(l, g_r[b], g_f, g_o, b))
         var fd = (v[0] - v[1]) / (2.0 * h)
         var an = 0.0
@@ -284,12 +290,11 @@ def main() raises:
     t.truth(e_fd <= 1e-6, "16 directions over near and far lanes: max rel err " + String(e_fd))
 
     print("\n[5] float32 forward")
-    var tree32 = g1_fk_tree[DType.float32](env)
-    var table32 = g1_heads_table[DType.float32](env, q0)
+    var table32 = sm_tables[DType.float32, G1Robot](sim, q0)
     var e32 = 0.0
     for b in range(B):
         var l = Lane[DType.float32](d, b)
-        l.forward(tree32, table32)
+        l.forward(table32)
         for k in range(SM_N_TERMS):
             e32 = max(e32, _rel(Float64(l.terms[k]), w_terms[b * SM_N_TERMS + k]))
         for k in range(2):

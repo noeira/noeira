@@ -39,14 +39,18 @@ from std.sys import argv
 from max.gpu.host import DeviceContext
 
 from noeira.core.bytes import string_from_bytes
-from noeira.deep_agents.supermimic.g1_fk import FP
+from noeira.deep_agents.supermimic.kinematics import FP
+from noeira.deep_agents.supermimic.robot import G1Robot, SMDims
 from noeira.deep_agents.supermimic.state_spec import (
-    SM_DELTA_DIM, SM_ERR_DIM, SM_FEAT_DIM, SM_WM_DT, sm_canonical_lane, sm_canonical_vjp_lane,
-    sm_error_lane, sm_error_vjp_lane, sm_integrate_lane, sm_integrate_vjp_lane,
+    SM_WM_DT, sm_canonical_lane, sm_canonical_vjp_lane, sm_error_lane, sm_error_vjp_lane,
+    sm_integrate_lane, sm_integrate_vjp_lane,
 )
-from noeira.deep_agents.supermimic.world_model import (
-    SMWindowBatch, SMWorldModel, SM_WM_IN, sm_wm_window_loss,
-)
+from noeira.deep_agents.supermimic.world_model import SMWindowBatch, SMWorldModel, sm_wm_window_loss
+
+comptime SM_DELTA_DIM = SMDims[G1Robot].DELTA
+comptime SM_ERR_DIM = SMDims[G1Robot].DELTA
+comptime SM_FEAT_DIM = SMDims[G1Robot].S
+comptime SM_WM_IN = SMDims[G1Robot].WM_IN
 from noeira.io.fileio import read_file_bytes
 from noeira.io.npy import load_npy_2d_f64
 from noeira.nn.constants import DT
@@ -202,12 +206,12 @@ def main() raises:
     var gdi = List[Float64](length=n * SM_DELTA_DIM, fill=0.0)
     var gse = List[Float64](length=n * 71, fill=0.0)
     for b in range(n):
-        sm_canonical_lane[DType.float64](_p(sv, b * 71), _p(feat, b * SM_FEAT_DIM))
-        sm_integrate_lane[DType.float64](_p(sv, b * 71), _p(dlt, b * SM_DELTA_DIM), _p(nxt, b * 71))
-        sm_error_lane[DType.float64](_p(sv, b * 71), _p(st, b * 71), _p(err, b * SM_ERR_DIM))
-        sm_canonical_vjp_lane[DType.float64](_p(sv, b * 71), _p(g_feat, b * SM_FEAT_DIM), _p(gsc, b * 71))
-        sm_integrate_vjp_lane[DType.float64](_p(sv, b * 71), _p(dlt, b * SM_DELTA_DIM), _p(g_next, b * 71), _p(gsi, b * 71), _p(gdi, b * SM_DELTA_DIM))
-        sm_error_vjp_lane[DType.float64](_p(sv, b * 71), _p(st, b * 71), _p(g_err, b * SM_ERR_DIM), _p(gse, b * 71))
+        sm_canonical_lane[DType.float64, G1Robot](_p(sv, b * 71), _p(feat, b * SM_FEAT_DIM))
+        sm_integrate_lane[DType.float64, G1Robot](_p(sv, b * 71), _p(dlt, b * SM_DELTA_DIM), _p(nxt, b * 71))
+        sm_error_lane[DType.float64, G1Robot](_p(sv, b * 71), _p(st, b * 71), _p(err, b * SM_ERR_DIM))
+        sm_canonical_vjp_lane[DType.float64, G1Robot](_p(sv, b * 71), _p(g_feat, b * SM_FEAT_DIM), _p(gsc, b * 71))
+        sm_integrate_vjp_lane[DType.float64, G1Robot](_p(sv, b * 71), _p(dlt, b * SM_DELTA_DIM), _p(g_next, b * 71), _p(gsi, b * 71), _p(gdi, b * SM_DELTA_DIM))
+        sm_error_vjp_lane[DType.float64, G1Robot](_p(sv, b * 71), _p(st, b * 71), _p(g_err, b * SM_ERR_DIM), _p(gse, b * 71))
     t.truth(_lane_err(feat, w_feat) <= 1e-12, "canonical: max err " + String(_lane_err(feat, w_feat)))
     t.truth(_lane_err(nxt, w_next) <= 1e-12, "integrate: max err " + String(_lane_err(nxt, w_next)))
     t.truth(_lane_err(err, w_err) <= 1e-12, "error_vector: max err " + String(_lane_err(err, w_err)))
@@ -241,9 +245,9 @@ def main() raises:
             var f = List[Float64](length=SM_FEAT_DIM, fill=0.0)
             var o = List[Float64](length=71, fill=0.0)
             var e = List[Float64](length=SM_ERR_DIM, fill=0.0)
-            sm_canonical_lane[DType.float64](_p(sx), _p(f))
-            sm_integrate_lane[DType.float64](_p(sx), _p(dx), _p(o))
-            sm_error_lane[DType.float64](_p(sx), _p(st, b * 71), _p(e))
+            sm_canonical_lane[DType.float64, G1Robot](_p(sx), _p(f))
+            sm_integrate_lane[DType.float64, G1Robot](_p(sx), _p(dx), _p(o))
+            sm_error_lane[DType.float64, G1Robot](_p(sx), _p(st, b * 71), _p(e))
             for k in range(SM_FEAT_DIM):
                 v[sg * 3 + 0] += g_feat[b * SM_FEAT_DIM + k] * f[k]
             for k in range(71):
@@ -279,29 +283,29 @@ def main() raises:
     for k in range(len(sizes)):
         total += sizes[k]
     var wv = load_npy_2d_f64(dump + "/b_weights.npy", total).values.copy()
-    var wm = SMWorldModel[H, TH].make[Kaiming]()
+    var wm = SMWorldModel[G1Robot, H, TH].make[Kaiming]()
     var ld = _Load(wv.copy(), names.copy(), sizes.copy())
     wm.for_each_param["cpu"](ld, None)
     t.truth(ld.bad == 0 and ld.k == len(names) and ld.at == len(wv), String(ld.k) + " params loaded by name, " + String(ld.at) + " values")
-    var batch = SMWindowBatch(K, B)
+    var batch = SMWindowBatch[G1Robot](K, B)
     var bs = load_npy_2d_f64(dump + "/b_states.npy", 71).values.copy()
     var ba = load_npy_2d_f64(dump + "/b_a_exec.npy", 29).values.copy()
     var bx = load_npy_2d_f64(dump + "/b_xi.npy", 33).values.copy()
     var bd = load_npy_2d_f64(dump + "/b_done.npy", 1).values.copy()
     var br = load_npy_2d_f64(dump + "/b_ref_root.npy", 7).values.copy()
     for i in range(len(bs)):
-        batch.states[i] = Scalar[DT](bs[i])
+        batch.states.data[i] = Scalar[DT](bs[i])
     for i in range(len(ba)):
-        batch.a_exec[i] = Scalar[DT](ba[i])
+        batch.a_exec.data[i] = Scalar[DT](ba[i])
     for i in range(len(bx)):
-        batch.xi[i] = Scalar[DT](bx[i])
+        batch.xi.data[i] = Scalar[DT](bx[i])
     for i in range(len(bd)):
-        batch.done[i] = Scalar[DT](bd[i])
+        batch.done.data[i] = Scalar[DT](bd[i])
     for i in range(len(br)):
-        batch.ref_root[i] = Scalar[DT](br[i])
+        batch.ref_root.data[i] = Scalar[DT](br[i])
     var want = load_npy_2d_f64(dump + "/b_loss.npy", 6).values.copy()
     wm.zero_grad["cpu"](None)
-    var lo = sm_wm_window_loss[H, TH, B](wm, batch, True)
+    var lo = sm_wm_window_loss[G1Robot, H, TH, B](wm, batch, True)
     t.truth(_rel(lo.loss, want[0]) <= 1e-5, "loss " + String(lo.loss) + " (oracle " + String(want[0]) + ")")
     t.truth(_rel(lo.state_loss, want[1]) <= 1e-5 and _rel(lo.term_bce, want[2]) <= 1e-5,
         "state loss " + String(lo.state_loss) + ", BCE " + String(lo.term_bce))
@@ -360,7 +364,7 @@ def main() raises:
 
     # ── [6] zero init ──
     print("\n[6] make: the dynamics start at constant velocity")
-    var wz = SMWorldModel[H, TH].make[Kaiming]()
+    var wz = SMWorldModel[G1Robot, H, TH].make[Kaiming]()
     var x = TensorImpl[DT].alloc(B * SM_WM_IN)
     for i in range(B * SM_WM_IN):
         x.data[i] = Scalar[DT](random_float64(-1.0, 1.0))
@@ -371,7 +375,7 @@ def main() raises:
         mx = max(mx, abs(Float64(dl.data[i])))
     var zero = List[Float64](length=SM_DELTA_DIM, fill=0.0)
     var o = List[Float64](length=71, fill=0.0)
-    sm_integrate_lane[DType.float64](_p(sv, 0), _p(zero), _p(o))
+    sm_integrate_lane[DType.float64, G1Robot](_p(sv, 0), _p(zero), _p(o))
     var ce = 0.0
     for k in range(3):
         ce = max(ce, abs(o[k] - (sv[k] + SM_WM_DT * sv[36 + k])))

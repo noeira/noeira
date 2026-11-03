@@ -48,13 +48,11 @@ from std.sys import argv
 from max.gpu.host import DeviceContext
 
 from noeira.core.bytes import string_from_bytes
-from noeira.deep_agents.supermimic.g1_fk import g1_fk_tree
-from noeira.deep_agents.supermimic.heads import SM_REF_DIM, g1_heads_table
+from noeira.deep_agents.supermimic.config import SMConfig, SMCriticOf, SMPolicyOf, SMWorldModelOf
 from noeira.deep_agents.supermimic.imagination import SMImagBatch, sm_imagine
-from noeira.deep_agents.supermimic.trainer import SMPolicyTrainer
-from noeira.deep_agents.supermimic.policy import SMCritic, SMPolicy, SM_GOAL_DIM, SM_OBS
-from noeira.deep_agents.supermimic.world_model import SMWorldModel
-from noeira.envs.robots import UnitreeG1
+from noeira.deep_agents.supermimic.robot import G1Robot, G1Sim, SMDims
+from noeira.deep_agents.supermimic.tables import sm_tables
+from noeira.deep_agents.supermimic.trainer import SuperMimicTrainer
 from noeira.io.fileio import read_file_bytes
 from noeira.io.npy import load_npy_2d_f64
 from noeira.nn.constants import DT
@@ -65,6 +63,11 @@ from noeira.nn.core.tensor import Tensor
 
 comptime N = 8
 comptime H = 32
+# the oracle's widths (imag_oracle.py): WM 32 / 16, encoder 24-20-16-12, decoder 28-22-18-14, critic 16-12
+comptime TC = SMConfig["cpu", G1Robot, 32, 16, 24, 20, 16, 12, 28, 22, 18, 14, 16, 12, N, 64, N, H]
+comptime SM_GOAL_DIM = SMDims[G1Robot].GOAL
+comptime SM_OBS = SMDims[G1Robot].OBS
+comptime SM_REF_DIM = SMDims[G1Robot].REF
 
 
 struct Tally:
@@ -177,8 +180,7 @@ def main() raises:
     var av = argv()
     var dump = String(av[1]) if len(av) > 1 else String("/tmp/sm_imag")
     var t = Tally()
-    var env = UnitreeG1[DType.float64]()
-    _ = env.reset()
+    var sim = G1Sim.create()
 
     print("\n[1] the five networks")
     var names = List[String]()
@@ -193,9 +195,9 @@ def main() raises:
     var total = 0
     for k in range(len(sizes)):
         total += sizes[k]
-    var wm = SMWorldModel[32, 16].make[Kaiming]()
-    var pol = SMPolicy[24, 20, 16, 12, 28, 22, 18, 14].make[Kaiming]()
-    var critic = SMCritic[16, 12].make["cpu", Kaiming](None)
+    var wm = SMWorldModelOf[TC].make[Kaiming]()
+    var pol = SMPolicyOf[TC].make[Kaiming]()
+    var critic = SMCriticOf[TC].make["cpu", Kaiming](None)
     var ld = _Load(load_npy_2d_f64(dump + "/i_weights.npy", total).values.copy(), names.copy(), sizes.copy())
     wm.for_each_param["cpu"](ld, None)
     pol.for_each_param["cpu"](ld, None)
@@ -203,19 +205,18 @@ def main() raises:
     t.truth(ld.bad == 0 and ld.k == len(names) and ld.at == total, String(ld.k) + " params by name, " + String(total) + " values")
 
     var q0 = load_npy_2d_f64(dump + "/i_q0.npy", 29).values.copy()
-    var tree = g1_fk_tree[DT](env)
-    var table = g1_heads_table[DT](env, q0)
-    var ib = SMImagBatch(N, H)
-    _fill(ib.state, load_npy_2d_f64(dump + "/i_state.npy", 71).values)
-    _fill(ib.prev_action, load_npy_2d_f64(dump + "/i_prev_action.npy", 29).values)
-    _fill(ib.xi, load_npy_2d_f64(dump + "/i_xi.npy", 33).values)
-    _fill(ib.hist0, load_npy_2d_f64(dump + "/i_hist0.npy", SM_OBS).values)
-    _fill(ib.goals, load_npy_2d_f64(dump + "/i_goals.npy", SM_GOAL_DIM).values)
-    _fill(ib.refs, load_npy_2d_f64(dump + "/i_refs.npy", SM_REF_DIM).values)
+    var tb = sm_tables[DT, G1Robot](sim, q0)
+    var ib = SMImagBatch[G1Robot](N, H)
+    _fill(ib.state.data, load_npy_2d_f64(dump + "/i_state.npy", 71).values)
+    _fill(ib.prev_action.data, load_npy_2d_f64(dump + "/i_prev_action.npy", 29).values)
+    _fill(ib.xi.data, load_npy_2d_f64(dump + "/i_xi.npy", 33).values)
+    _fill(ib.hist0.data, load_npy_2d_f64(dump + "/i_hist0.npy", SM_OBS).values)
+    _fill(ib.goals.data, load_npy_2d_f64(dump + "/i_goals.npy", SM_GOAL_DIM).values)
+    _fill(ib.refs.data, load_npy_2d_f64(dump + "/i_refs.npy", SM_REF_DIM).values)
 
     print("\n[2] the forward rollout, H =", H)
     pol.zero_grad["cpu"](None)
-    var o = sm_imagine[32, 16, 24, 20, 16, 12, 28, 22, 18, 14, 16, 12, N](wm, pol, critic, tree, table, ib, 0.99, True)
+    var o = sm_imagine[TC, N](wm, pol, critic, tb, ib, 0.99, True)
     var wj = load_npy_2d_f64(dump + "/i_j.npy", 2).values.copy()
     var ej = abs(o.j - wj[0]) / max(abs(wj[0]), 1e-12)
     t.truth(ej <= 1e-4, "J " + String(o.j) + " (oracle " + String(wj[0]) + "), rel err " + String(ej))
@@ -234,19 +235,19 @@ def main() raises:
         var want = load_npy_2d_f64(dump + "/i_" + qs[k] + ".npy", cols[k]).values.copy()
         var r: Tuple[Float64, Float64]
         if qs[k] == "states":
-            r = _err(o.states, want)
+            r = _err(o.states.data, want)
         elif qs[k] == "actions":
-            r = _err(o.actions, want)
+            r = _err(o.actions.data, want)
         elif qs[k] == "rewards":
-            r = _err(o.rewards, want)
+            r = _err(o.rewards.data, want)
         elif qs[k] == "dhat":
-            r = _err(o.dhat, want)
+            r = _err(o.dhat.data, want)
         elif qs[k] == "survival":
-            r = _err(o.survival, want)
+            r = _err(o.survival.data, want)
         elif qs[k] == "e_root":
-            r = _err(o.e_root, want)
+            r = _err(o.e_root.data, want)
         else:
-            r = _err(o.value_h, want)
+            r = _err(o.value_h.data, want)
         t.truth(r[0] <= 1e-3 * max(r[1], 1e-3), qs[k] + ": max err " + String(r[0]) + " (scale " + String(r[1]) + ")")
 
     print("\n[3] the policy gradient")
@@ -294,23 +295,20 @@ def main() raises:
 
 
     print("\n[4] one PolicyTrainer.update, replaying the reference's minibatch draws")
-    var wm2 = SMWorldModel[32, 16].make[Kaiming]()
-    var pol2 = SMPolicy[24, 20, 16, 12, 28, 22, 18, 14].make[Kaiming]()
-    var critic2 = SMCritic[16, 12].make["cpu", Kaiming](None)
+    var tr = SuperMimicTrainer[TC](sm_tables[DT, G1Robot](sim, q0))
     var w0 = load_npy_2d_f64(dump + "/i_weights.npy", total).values.copy()
     var ld2 = _Load(w0.copy(), names.copy(), sizes.copy())
-    wm2.for_each_param["cpu"](ld2, None)
-    pol2.for_each_param["cpu"](ld2, None)
-    critic2.for_each_param["cpu"](ld2, None, String("critic"))
+    tr.wm.for_each_param["cpu"](ld2, None)
+    tr.pol.for_each_param["cpu"](ld2, None)
+    tr.critic.for_each_param["cpu"](ld2, None, String("critic"))
     comptime ROWS = H * N
     var pf = load_npy_2d_f64(dump + "/u_perms.npy", 5 * ROWS).values.copy()
     var perms = List[Int](length=len(pf), fill=0)
     for i in range(len(pf)):
         perms[i] = Int(pf[i])
-    var tr = SMPolicyTrainer()
     var vals = List[Float64]()
     var tgts = List[Float64]()
-    var met = tr.update[32, 16, 24, 20, 16, 12, 28, 22, 18, 14, 16, 12, N, H](wm2, pol2, critic2, tree, table, ib, perms, vals, tgts)
+    var met = tr.policy_update[N](ib, perms, vals, tgts)
     var um = load_npy_2d_f64(dump + "/u_metrics.npy", 6).values.copy()
     var wv = load_npy_2d_f64(dump + "/u_values.npy", 1).values.copy()
     var wt = load_npy_2d_f64(dump + "/u_targets.npy", 1).values.copy()
@@ -330,7 +328,7 @@ def main() raises:
     t.truth(abs(met.imag_objective - um[0]) <= 1e-4 * abs(um[0]), "objective " + String(met.imag_objective) + " (oracle " + String(um[0]) + ")")
     # the policy after one clipped Adam step
     var pg = _Params()
-    pol2.for_each_param["cpu"](pg, None)
+    tr.pol.for_each_param["cpu"](pg, None)
     var wpol = load_npy_2d_f64(dump + "/u_policy.npy", len(pg.out)).values.copy()
     var clip = min(1.0, 1.0 / (um[2] + 1e-6))
     var e_good = 0.0
@@ -346,7 +344,7 @@ def main() raises:
     t.truth(e_good <= 2.0 and e_rest <= 2e-5, "policy after its step: " + String(e_good) + " fp32 ulps (well-conditioned), " + String(e_rest) + " abs near eps")
     # the critic after 5 x 4 minibatch steps: compare the MOVES
     var cg = _Params()
-    critic2.for_each_param["cpu"](cg, None)
+    tr.critic.for_each_param["cpu"](cg, None)
     var wcr = load_npy_2d_f64(dump + "/u_critic.npy", len(cg.out)).values.copy()
     var c0 = 0
     for k in range(len(names)):

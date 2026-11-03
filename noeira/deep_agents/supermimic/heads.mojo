@@ -25,34 +25,26 @@ branch |v|² equals 4·atan2(|xyz|, w)²·|q|² EXACTLY (sin(½θ) = |xyz|/|q|),
 which is what is computed here; the Taylor branch is reproduced as written.
 Both forms and their derivatives are gated against torch.
 
-Layouts (per lane):
-    s       71   qpos 36 | qvel 35 (root angular velocity in the BODY frame)
-    rf    189   14 tracked bodies × [pos 3, quat 4, lin vel 3, ang vel 3]
-                 (world), then the reference root pos 3, quat 4
-    xi      33   sim context; [1:30] is the encoder bias
-    terms    8   REWARD_TERM_NAMES' order, weighted and × dt
+Layouts (per lane; G1 widths in brackets, `SMDims[R]` in general):
+    s      S [71]    qpos | qvel (root angular velocity in the BODY frame)
+    rf     R [189]   n_tracked bodies × [pos 3, quat 4, lin vel 3, ang vel 3]
+                     (world), then the reference root pos 3, quat 4
+    xi     X [33]    sim context; [1 : 1 + n] is the encoder bias
+    terms  8         REWARD_TERM_NAMES' order, weighted and × dt
+The robot's tracked rows, anchor, q0 and soft limits are a runtime table
+(`SMHeadLayout[R]`, built by `tables.sm_tables`). Everything here is
+pointer-in / pointer-out with no allocation: a GPU kernel's per-lane body.
 """
 
 from std.math import atan2, cos, exp, sin, sqrt
 
-from noeira.deep_agents.supermimic.g1_fk import (
-    FP, G1_FK_NB, G1_FK_NQ, G1_FK_NV, Q4, cross3, dot3, g1_fk_lane, g1_fk_vjp_lane, qapply,
-    qapply_vjp, qconj, qmul,
+from noeira.deep_agents.supermimic.kinematics import (
+    FP, Q4, cross3, dot3, qapply, qapply_vjp, qconj, qmul, sm_fk_lane, sm_fk_vjp_lane,
 )
-from noeira.envs.robots import UnitreeG1
-from noeira.envs.robots.unitree_g1_priv_obs import g1_skeleton_body
-from noeira.physics3d.gpu.constants import JOINT_IDX_RANGE_MAX, JOINT_IDX_RANGE_MIN, MODEL_JOINT_SIZE
+from noeira.deep_agents.supermimic.robot import SMDims, TrackingRobot
 
 
-comptime SM_N_DOF: Int = 29
-comptime SM_STATE_DIM: Int = 71
-comptime SM_OBS_DIM: Int = 93
-comptime SM_XI_DIM: Int = 33
-comptime SM_N_TRACKED: Int = 14
-comptime SM_REF_BODY: Int = 13
-comptime SM_REF_DIM: Int = SM_N_TRACKED * SM_REF_BODY + 7
 comptime SM_N_TERMS: Int = 8
-comptime SM_ANCHOR_SLOT: Int = 7         # torso_link in the tracked list
 
 # TrackingRewardCfg (rewards.py)
 comptime SM_DT: Float64 = 0.02
@@ -70,7 +62,6 @@ comptime SM_W_ROOT_POS: Float64 = 0.5
 comptime SM_W_ROOT_ORI: Float64 = 0.5
 comptime SM_W_ACTION_RATE: Float64 = -0.1
 comptime SM_W_JOINT_LIMIT: Float64 = -2.0
-comptime SM_SOFT_LIMIT_FACTOR: Float64 = 0.9   # mjlab's G1 `soft_joint_pos_limit_factor`
 
 # term order (compiled.py REWARD_TERM_NAMES)
 comptime T_ROOT_POS: Int = 0
@@ -82,70 +73,20 @@ comptime T_BODY_ANG: Int = 5
 comptime T_ACTION_RATE: Int = 6
 comptime T_JOINT_LIMIT: Int = 7
 
-# per-lane FK scratch: pos 3 | quat 4 | lin 3 | ang 3 per body, then the same for its cotangents
-comptime SM_FK_BLOCK: Int = G1_FK_NB * 13
-comptime SM_SCRATCH: Int = 2 * SM_FK_BLOCK + G1_FK_NQ + G1_FK_NV
 
-
-def sm_tracked_skeleton_index(k: Int) -> Int:
-    """Tracked body k (the reproduction's TRACKED_BODIES order) → its index in
-    the reference's 30 `body_names` (`g1_skeleton_body`'s order): pelvis,
-    left hip roll / knee / ankle roll, the same on the right, torso, left
-    shoulder roll / elbow / wrist yaw, the same on the right."""
-    var t: List[Int] = [0, 2, 4, 6, 8, 10, 12, 15, 17, 19, 22, 24, 26, 29]
-    return t[k]
-
-
-def sm_tracked_fk_index(k: Int) -> Int:
-    """Tracked body k → its row in `g1_fk_lane`'s outputs (body id − 1)."""
-    return g1_skeleton_body(sm_tracked_skeleton_index(k)) - 1
-
-
-struct G1HeadsTable[dt: DType](Movable):
-    """Per-model constants: tracked FK rows (14), q0 (29), soft lo (29), soft hi (29)."""
-    var data: List[Scalar[Self.dt]]
-
-    def __init__(out self, var data: List[Scalar[Self.dt]]):
-        self.data = data^
-
-    def __init__(out self, *, deinit move: Self):
-        self.data = move.data^
-
-    def ptr(mut self) -> FP[Self.dt]:
-        return self.data.unsafe_ptr().as_unsafe_any_origin()
-
-
-comptime HT_TRACKED: Int = 0
-comptime HT_Q0: Int = SM_N_TRACKED
-comptime HT_LO: Int = HT_Q0 + SM_N_DOF
-comptime HT_HI: Int = HT_LO + SM_N_DOF
-comptime HT_SIZE: Int = HT_HI + SM_N_DOF
-
-
-def g1_soft_limits(env: UnitreeG1[DType.float64], j: Int, factor: Float64 = SM_SOFT_LIMIT_FACTOR) -> Tuple[Float64, Float64]:
-    """mjlab's soft joint limits of hinge `j` (0..28): the range shrunk about
-    its midpoint by `factor` (`entity.py`, `soft_joint_pos_limit_factor`)."""
-    var o = (j + 1) * MODEL_JOINT_SIZE
-    var lo = Float64(env.mf.joints.data[o + JOINT_IDX_RANGE_MIN])
-    var hi = Float64(env.mf.joints.data[o + JOINT_IDX_RANGE_MAX])
-    var mid = (lo + hi) / 2.0
-    var half = 0.5 * (hi - lo) * factor
-    return (mid - half, mid + half)
-
-
-def g1_heads_table[dt: DType](env: UnitreeG1[DType.float64], q0: List[Float64]) raises -> G1HeadsTable[dt]:
-    """The table for our G1 with default joint positions `q0` (29)."""
-    if len(q0) != SM_N_DOF:
-        raise Error("g1_heads_table: q0 has " + String(len(q0)) + " entries, want 29")
-    var t = List[Scalar[dt]](length=HT_SIZE, fill=Scalar[dt](0))
-    for k in range(SM_N_TRACKED):
-        t[HT_TRACKED + k] = Scalar[dt](sm_tracked_fk_index(k))
-    for j in range(SM_N_DOF):
-        var lim = g1_soft_limits(env, j)
-        t[HT_Q0 + j] = Scalar[dt](q0[j])
-        t[HT_LO + j] = Scalar[dt](lim[0])
-        t[HT_HI + j] = Scalar[dt](lim[1])
-    return G1HeadsTable[dt](t^)
+struct SMHeadLayout[R: TrackingRobot]:
+    """The heads' per-robot table (built by `tables.sm_tables`):
+    [anchor slot | tracked FK rows (n_tracked) | q0 (n) | soft lo (n) | soft hi (n)].
+    The anchor slot is the anchor's index in the tracked list."""
+    comptime ANCHOR = 0
+    comptime TRACKED = 1
+    comptime Q0 = 1 + Self.R.N_TRACKED
+    comptime LO = Self.Q0 + Self.R.NDOF
+    comptime HI = Self.LO + Self.R.NDOF
+    comptime SIZE = Self.HI + Self.R.NDOF
+    # per-lane scratch: the FK block (pos 3 | quat 4 | lin 3 | ang 3 per body),
+    # the same for its cotangents, then ∂/∂qpos, ∂/∂qvel
+    comptime SCRATCH = 2 * SMDims[Self.R].FK_BLOCK + Self.R.NQ + Self.R.NV
 
 
 # ── pieces ──────────────────────────────────────────────────────────────────
@@ -289,52 +230,58 @@ def _exp_term[dt: DType](w: Float64, std: Float64, e: Scalar[dt]) -> Scalar[dt] 
     return Scalar[dt](SM_DT * w) * exp(-e / Scalar[dt](std * std))
 
 
-def sm_observation_lane[dt: DType](table: FP[dt], s: FP[dt], a: FP[dt], xi: FP[dt], obs: FP[dt]):
-    """`analytic_observation(s, a, xi, q0)` (93): [q + bias − q0, q̇, ω_body,
-    R⁻¹ g (RAW root quaternion), a] — the noise-free proprioception after
-    taking `a` and landing in `s`."""
-    for j in range(SM_N_DOF):
-        obs[unsafe_offset=j] = _at(s, 7 + j) + _at(xi, 1 + j) - _at(table, HT_Q0 + j)
-        obs[unsafe_offset=29 + j] = _at(s, 42 + j)
-        obs[unsafe_offset=64 + j] = _at(a, j)
+def sm_observation_lane[dt: DType, R: TrackingRobot](table: FP[dt], s: FP[dt], a: FP[dt], xi: FP[dt], obs: FP[dt]):
+    """`analytic_observation(s, a, xi, q0)` (3n + 6): [q + bias − q0, q̇,
+    ω_body, R⁻¹ g (RAW root quaternion), a] — the noise-free proprioception
+    after taking `a` and landing in `s`."""
+    comptime D = SMDims[R]
+    comptime L = SMHeadLayout[R]
+    for j in range(D.NDOF):
+        obs[unsafe_offset=j] = _at(s, 7 + j) + _at(xi, 1 + j) - _at(table, L.Q0 + j)
+        obs[unsafe_offset=D.NDOF + j] = _at(s, D.NQ + 6 + j)
+        obs[unsafe_offset=2 * D.NDOF + 6 + j] = _at(a, j)
     var pg = qapply_inv(_q4(s, 3), Q4[dt](0, 0, -1, 0))
     for c in range(3):
-        obs[unsafe_offset=58 + c] = _at(s, 39 + c)
-        obs[unsafe_offset=61 + c] = pg[c]
+        obs[unsafe_offset=2 * D.NDOF + c] = _at(s, D.NQ + 3 + c)
+        obs[unsafe_offset=2 * D.NDOF + 3 + c] = pg[c]
 
 
-def sm_observation_vjp_lane[dt: DType](s: FP[dt], g_obs: FP[dt], g_s: FP[dt], g_a: FP[dt]):
+def sm_observation_vjp_lane[dt: DType, R: TrackingRobot](s: FP[dt], g_obs: FP[dt], g_s: FP[dt], g_a: FP[dt]):
     """`g_s`, `g_a` += the observation's VJP (ADDS)."""
-    var g_pg = Q4[dt](g_obs[unsafe_offset=61], g_obs[unsafe_offset=62], g_obs[unsafe_offset=63], 0)
+    comptime D = SMDims[R]
+    var g_pg = Q4[dt](g_obs[unsafe_offset=2 * D.NDOF + 3], g_obs[unsafe_offset=2 * D.NDOF + 4], g_obs[unsafe_offset=2 * D.NDOF + 5], 0)
     _add4(g_s, 3, qapply_inv_vjp_q(_q4(s, 3), Q4[dt](0, 0, -1, 0), g_pg))
-    for j in range(SM_N_DOF):
+    for j in range(D.NDOF):
         g_s[unsafe_offset=7 + j] += g_obs[unsafe_offset=j]
-        g_s[unsafe_offset=42 + j] += g_obs[unsafe_offset=29 + j]
-        g_a[unsafe_offset=j] += g_obs[unsafe_offset=64 + j]
+        g_s[unsafe_offset=D.NQ + 6 + j] += g_obs[unsafe_offset=D.NDOF + j]
+        g_a[unsafe_offset=j] += g_obs[unsafe_offset=2 * D.NDOF + 6 + j]
     for c in range(3):
-        g_s[unsafe_offset=39 + c] += g_obs[unsafe_offset=58 + c]
+        g_s[unsafe_offset=D.NQ + 3 + c] += g_obs[unsafe_offset=2 * D.NDOF + c]
 
 
 # ── forward ─────────────────────────────────────────────────────────────────
-def g1_heads_lane[dt: DType](
+def sm_heads_lane[dt: DType, R: TrackingRobot](
     tree: FP[dt], table: FP[dt], s: FP[dt], a: FP[dt], a_prev: FP[dt], xi: FP[dt], rf: FP[dt],
     terms: FP[dt], feat: FP[dt], obs: FP[dt], scratch: FP[dt],
 ) -> Scalar[dt] where dt.is_floating_point():
-    """Writes the 8 weighted terms, the 2 termination features and the 93-d
+    """Writes the 8 weighted terms, the 2 termination features and the
     observation of reaching `s` (= s_{t+1}) by `a` after `a_prev`, against
     the reference frame `rf`; returns the total reward. `scratch` holds
-    `SM_SCRATCH` values; its first `SM_FK_BLOCK` (the FK) are what
-    `g1_heads_vjp_lane` reads back."""
+    `SMHeadLayout[R].SCRATCH` values; its first `FK_BLOCK` (the FK) are what
+    `sm_heads_vjp_lane` reads back."""
+    comptime D = SMDims[R]
+    comptime L = SMHeadLayout[R]
     var pos = scratch
-    var quat = scratch.unsafe_offset(G1_FK_NB * 3)
-    var lin = scratch.unsafe_offset(G1_FK_NB * 7)
-    var ang = scratch.unsafe_offset(G1_FK_NB * 10)
-    g1_fk_lane[dt](tree, s, s.unsafe_offset(G1_FK_NQ), pos, quat, lin, ang)
+    var quat = scratch.unsafe_offset(D.NB * 3)
+    var lin = scratch.unsafe_offset(D.NB * 7)
+    var ang = scratch.unsafe_offset(D.NB * 10)
+    sm_fk_lane[dt, D.NB](tree, s, s.unsafe_offset(D.NQ), pos, quat, lin, ang)
 
-    var ai = Int(_at(table, HT_TRACKED + SM_ANCHOR_SLOT))
+    var aslot = Int(_at(table, L.ANCHOR))
+    var ai = Int(_at(table, L.TRACKED + aslot))
     var ra_p = _v3(pos, ai * 3)
     var ra_q = _q4(quat, ai * 4)
-    var mb = SM_ANCHOR_SLOT * SM_REF_BODY
+    var mb = aslot * D.REF_BODY
     var ma_p = _v3(rf, mb)
     var ma_q = _q4(rf, mb + 3)
     # re-anchoring: xy and yaw of the robot anchor, z / roll / pitch of the reference
@@ -345,9 +292,9 @@ def g1_heads_lane[dt: DType](
     var e_bo = Scalar[dt](0)
     var e_bl = Scalar[dt](0)
     var e_ba = Scalar[dt](0)
-    for k in range(SM_N_TRACKED):
-        var b = Int(_at(table, HT_TRACKED + k))
-        var rb = k * SM_REF_BODY
+    for k in range(D.N_TRACKED):
+        var b = Int(_at(table, L.TRACKED + k))
+        var rb = k * D.REF_BODY
         var rel_p = dpos + qapply(dori, _v3(rf, rb) - ma_p)
         var rel_q = qmul(dori, _q4(rf, rb + 3))
         var dp = rel_p - _v3(pos, b * 3)
@@ -357,7 +304,7 @@ def g1_heads_lane[dt: DType](
         e_bl += dot3(dl, dl)
         var da = _v3(rf, rb + 10) - _v3(ang, b * 3)
         e_ba += dot3(da, da)
-    var inv_n = Scalar[dt](1.0 / Float64(SM_N_TRACKED))
+    var inv_n = Scalar[dt](1.0 / Float64(D.N_TRACKED))
     var drp = ma_p - ra_p
     terms[unsafe_offset=T_ROOT_POS] = _exp_term(SM_W_ROOT_POS, SM_STD_ROOT_POS, dot3(drp, drp))
     terms[unsafe_offset=T_ROOT_ORI] = _exp_term(SM_W_ROOT_ORI, SM_STD_ROOT_ORI, sq_quat_err(qmul(ma_q, qconj(ra_q))))
@@ -367,11 +314,11 @@ def g1_heads_lane[dt: DType](
     terms[unsafe_offset=T_BODY_ANG] = _exp_term(SM_W_BODY_ANG, SM_STD_BODY_ANG, e_ba * inv_n)
     var ar = Scalar[dt](0)
     var jl = Scalar[dt](0)
-    for j in range(SM_N_DOF):
+    for j in range(D.NDOF):
         var d = _at(a, j) - _at(a_prev, j)
         ar += d * d
         var q = _at(s, 7 + j)
-        jl += max(_at(table, HT_LO + j) - q, Scalar[dt](0)) + max(q - _at(table, HT_HI + j), Scalar[dt](0))
+        jl += max(_at(table, L.LO + j) - q, Scalar[dt](0)) + max(q - _at(table, L.HI + j), Scalar[dt](0))
     terms[unsafe_offset=T_ACTION_RATE] = Scalar[dt](SM_DT * SM_W_ACTION_RATE) * ar
     terms[unsafe_offset=T_JOINT_LIMIT] = Scalar[dt](SM_DT * SM_W_JOINT_LIMIT) * jl
     var total = terms[unsafe_offset=0]
@@ -381,48 +328,51 @@ def g1_heads_lane[dt: DType](
     # termination features (the state's root pose, not the FK's)
     var grav = Q4[dt](0, 0, -1, 0)
     var sq = _q4(s, 3)
-    var rr = SM_N_TRACKED * SM_REF_BODY
+    var rr = D.N_TRACKED * D.REF_BODY
     var tf = sm_term_features(s, _at(rf, rr + 2), _q4(rf, rr + 3))
     feat[unsafe_offset=0] = tf[0]
     feat[unsafe_offset=1] = tf[1]
 
-    sm_observation_lane(table, s, a, xi, obs)
+    sm_observation_lane[dt, R](table, s, a, xi, obs)
     return total
 
 
 # ── VJP ─────────────────────────────────────────────────────────────────────
-def g1_heads_vjp_lane[dt: DType](
+def sm_heads_vjp_lane[dt: DType, R: TrackingRobot](
     tree: FP[dt], table: FP[dt], s: FP[dt], a: FP[dt], a_prev: FP[dt], rf: FP[dt],
     g_r: Scalar[dt], g_feat: FP[dt], g_obs: FP[dt], scratch: FP[dt],
     g_s: FP[dt], g_a: FP[dt], g_ap: FP[dt],
 ) where dt.is_floating_point():
-    """`g_s` (71), `g_a` (29), `g_ap` (29) ← the VJP of `g1_heads_lane` for the
-    cotangents `g_r` (total reward), `g_feat` (2) and `g_obs` (93). `scratch`
-    must hold that forward call's FK (its first `SM_FK_BLOCK` values); the
+    """`g_s` (S), `g_a` (n), `g_ap` (n) ← the VJP of `sm_heads_lane` for the
+    cotangents `g_r` (total reward), `g_feat` (2) and `g_obs` (3n + 6). `scratch`
+    must hold that forward call's FK (its first `FK_BLOCK` values); the
     rest of it is overwritten. Outputs are written, not added to."""
+    comptime D = SMDims[R]
+    comptime L = SMHeadLayout[R]
     var pos = scratch
-    var quat = scratch.unsafe_offset(G1_FK_NB * 3)
-    var lin = scratch.unsafe_offset(G1_FK_NB * 7)
-    var ang = scratch.unsafe_offset(G1_FK_NB * 10)
-    var gpos = scratch.unsafe_offset(SM_FK_BLOCK)
-    var gquat = gpos.unsafe_offset(G1_FK_NB * 3)
-    var glin = gpos.unsafe_offset(G1_FK_NB * 7)
-    var gang = gpos.unsafe_offset(G1_FK_NB * 10)
-    var gqpos = gpos.unsafe_offset(SM_FK_BLOCK)
-    var gqvel = gqpos.unsafe_offset(G1_FK_NQ)
-    for i in range(SM_FK_BLOCK):
+    var quat = scratch.unsafe_offset(D.NB * 3)
+    var lin = scratch.unsafe_offset(D.NB * 7)
+    var ang = scratch.unsafe_offset(D.NB * 10)
+    var gpos = scratch.unsafe_offset(D.FK_BLOCK)
+    var gquat = gpos.unsafe_offset(D.NB * 3)
+    var glin = gpos.unsafe_offset(D.NB * 7)
+    var gang = gpos.unsafe_offset(D.NB * 10)
+    var gqpos = gpos.unsafe_offset(D.FK_BLOCK)
+    var gqvel = gqpos.unsafe_offset(D.NQ)
+    for i in range(D.FK_BLOCK):
         gpos[unsafe_offset=i] = 0
-    for i in range(SM_STATE_DIM):
+    for i in range(D.S):
         g_s[unsafe_offset=i] = 0
-    for j in range(SM_N_DOF):
+    for j in range(D.NDOF):
         g_a[unsafe_offset=j] = 0
         g_ap[unsafe_offset=j] = 0
 
     # ── the reward ──
-    var ai = Int(_at(table, HT_TRACKED + SM_ANCHOR_SLOT))
+    var aslot = Int(_at(table, L.ANCHOR))
+    var ai = Int(_at(table, L.TRACKED + aslot))
     var ra_p = _v3(pos, ai * 3)
     var ra_q = _q4(quat, ai * 4)
-    var mb = SM_ANCHOR_SLOT * SM_REF_BODY
+    var mb = aslot * D.REF_BODY
     var ma_p = _v3(rf, mb)
     var ma_q = _q4(rf, mb + 3)
     var dpos = Q4[dt](ra_p[0], ra_p[1], ma_p[2], 0)
@@ -434,9 +384,9 @@ def g1_heads_vjp_lane[dt: DType](
     var e_bo = Scalar[dt](0)
     var e_bl = Scalar[dt](0)
     var e_ba = Scalar[dt](0)
-    for k in range(SM_N_TRACKED):
-        var b = Int(_at(table, HT_TRACKED + k))
-        var rb = k * SM_REF_BODY
+    for k in range(D.N_TRACKED):
+        var b = Int(_at(table, L.TRACKED + k))
+        var rb = k * D.REF_BODY
         var dp = dpos + qapply(dori, _v3(rf, rb) - ma_p) - _v3(pos, b * 3)
         e_bp += dot3(dp, dp)
         e_bo += sq_quat_err(qmul(qmul(dori, _q4(rf, rb + 3)), qconj(_q4(quat, b * 4))))
@@ -444,7 +394,7 @@ def g1_heads_vjp_lane[dt: DType](
         e_bl += dot3(dl, dl)
         var da = _v3(rf, rb + 10) - _v3(ang, b * 3)
         e_ba += dot3(da, da)
-    var inv_n = Scalar[dt](1.0 / Float64(SM_N_TRACKED))
+    var inv_n = Scalar[dt](1.0 / Float64(D.N_TRACKED))
     var drp = ma_p - ra_p
     var d_root = qmul(ma_q, qconj(ra_q))
     # ∂r/∂e = −term / σ²
@@ -460,9 +410,9 @@ def g1_heads_vjp_lane[dt: DType](
     var g_raq = qconj(qmul(qconj(ma_q), sq_quat_err_vjp(d_root) * ge_ro))
     var g_dori = Q4[dt](0)
     var g_dpos = Q4[dt](0)
-    for k in range(SM_N_TRACKED):
-        var b = Int(_at(table, HT_TRACKED + k))
-        var rb = k * SM_REF_BODY
+    for k in range(D.N_TRACKED):
+        var b = Int(_at(table, L.TRACKED + k))
+        var rb = k * D.REF_BODY
         var off = _v3(rf, rb) - ma_p
         var rel_p = dpos + qapply(dori, off)
         var rq = _q4(rf, rb + 3)
@@ -487,25 +437,25 @@ def g1_heads_vjp_lane[dt: DType](
     _add4(gquat, ai * 4, g_raq)
 
     # action rate and joint limits
-    for j in range(SM_N_DOF):
+    for j in range(D.NDOF):
         var d = (_at(a, j) - _at(a_prev, j)) * Scalar[dt](2 * SM_DT * SM_W_ACTION_RATE) * g_r
         g_a[unsafe_offset=j] = d
         g_ap[unsafe_offset=j] = -d
         var q = _at(s, 7 + j)
         var gj = Scalar[dt](0)
-        if _at(table, HT_LO + j) - q > 0:
+        if _at(table, L.LO + j) - q > 0:
             gj -= 1
-        if q - _at(table, HT_HI + j) > 0:
+        if q - _at(table, L.HI + j) > 0:
             gj += 1
         g_s[unsafe_offset=7 + j] = gj * Scalar[dt](SM_DT * SM_W_JOINT_LIMIT) * g_r
 
     # through the FK
-    g1_fk_vjp_lane[dt](tree, s, s.unsafe_offset(G1_FK_NQ), pos, quat, ang, gpos, gquat, glin, gang, gqpos, gqvel)
-    for i in range(G1_FK_NQ):
+    sm_fk_vjp_lane[dt, D.NB, D.NQ, D.NV](tree, s, s.unsafe_offset(D.NQ), pos, quat, ang, gpos, gquat, glin, gang, gqpos, gqvel)
+    for i in range(D.NQ):
         g_s[unsafe_offset=i] += gqpos[unsafe_offset=i]
-    for i in range(G1_FK_NV):
-        g_s[unsafe_offset=G1_FK_NQ + i] += gqvel[unsafe_offset=i]
+    for i in range(D.NV):
+        g_s[unsafe_offset=D.NQ + i] += gqvel[unsafe_offset=i]
 
     # ── termination features and observation: the raw root quaternion ──
     sm_term_features_vjp(s, g_feat[unsafe_offset=0], g_feat[unsafe_offset=1], g_s)
-    sm_observation_vjp_lane(s, g_obs, g_s, g_a)
+    sm_observation_vjp_lane[dt, R](s, g_obs, g_s, g_a)

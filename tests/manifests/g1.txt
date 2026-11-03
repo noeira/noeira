@@ -125,3 +125,6 @@ tests/deep_agents/supermimic/test_supermimic_lib.mojo /tmp/sm_lib
 # pose at full reward, resets, the encoder bias in obs and PD target, foot
 # friction, termination and clip-end rows, frame and replay bookkeeping)
 tests/deep_agents/supermimic/test_supermimic_env.mojo
+# The shared per-env episodic window replay (deep_agents/data), against the
+# SuperMimic reproduction's ReplayBuffer (same dump as test_supermimic_lib)
+tests/deep_agents/data/test_episodic_replay.mojo /tmp/sm_lib

@@ -1,35 +1,28 @@
-# +--------------------------------------------------------------------------+ #
-# | SuperMimic M2d: the replay ring — k-step windows and history starts
-# +--------------------------------------------------------------------------+ #
-"""The reproduction's `ReplayBuffer` (`data/replay_buffer.py`), on the host.
+"""EpisodicReplay[S, A, X] — the CPU per-env episodic window replay.
 
-A ring of `capacity` rows per env. A row holds the state s_t at the start of a
-control step and the transition that followed: clean action a_t, executed
-action, ξ, reward r_{t+1}, the termination label `done` of the row's state,
-the target frame, and bookkeeping (episode id, `terminal`, `ep_start`). When
-an episode ends a TERMINAL row holds s_{T+1} (no transition out of it).
+Conforms to `EpisodicReplayBuffer` (see there for the row and window
+semantics). Storage is `[env, time]`: row (e, t) at flat index `e·T + t`, a
+write pointer and an episode counter per env. Sampling is uniform with
+replacement over the eligible rows, as `torch.multinomial` of the mask;
+`windows_at` / `starts_at` take the flat indices directly so another run's
+draws can be replayed exactly.
 
-    window (k): rows t..t+k valid, one episode, t..t+k−1 non-terminal, and
-                the window not reaching the write pointer
-    start (h):  a non-terminal row t with the h rows before it (backfilled
-                with the episode's first row before its start; the action
-                before each history state is 0 at the episode's start)
-
-Sampling is uniform over the eligible rows (`torch.multinomial` of the mask);
-`*_at` take the flat indices `e·T + t` directly, to replay another run's draws.
+Ported from the SuperMimic reproduction's `data/replay_buffer.py` and gated
+against it (`tests/deep_agents/data/test_episodic_replay.mojo`). The context
+channel is named `xi` after its first user (the sim context ξ).
 """
 
 from std.random import random_ui64
 
 from noeira.nn.constants import DT
+from .episodic_replay_buffer import EpisodicReplayBuffer
 
 
-comptime RB_S: Int = 71
-comptime RB_A: Int = 29
-comptime RB_XI: Int = 33
+struct EpisodicReplay[S_: Int, A_: Int, X_: Int](EpisodicReplayBuffer):
+    comptime S = Self.S_
+    comptime A = Self.A_
+    comptime X = Self.X_
 
-
-struct SMReplayBuffer(Movable):
     var E: Int
     var T: Int
     var s: List[Scalar[DT]]
@@ -50,10 +43,10 @@ struct SMReplayBuffer(Movable):
         self.E = num_envs
         self.T = capacity
         var n = num_envs * capacity
-        self.s = List[Scalar[DT]](length=n * RB_S, fill=0)
-        self.a = List[Scalar[DT]](length=n * RB_A, fill=0)
-        self.a_exec = List[Scalar[DT]](length=n * RB_A, fill=0)
-        self.xi = List[Scalar[DT]](length=n * RB_XI, fill=0)
+        self.s = List[Scalar[DT]](length=n * Self.S, fill=0)
+        self.a = List[Scalar[DT]](length=n * Self.A, fill=0)
+        self.a_exec = List[Scalar[DT]](length=n * Self.A, fill=0)
+        self.xi = List[Scalar[DT]](length=n * Self.X, fill=0)
         self.r = List[Scalar[DT]](length=n, fill=0)
         self.done = List[Scalar[DT]](length=n, fill=0)
         self.frame = List[Int](length=n, fill=0)
@@ -83,17 +76,17 @@ struct SMReplayBuffer(Movable):
 
     def add(
         mut self, e: Int, s: List[Scalar[DT]], a: List[Scalar[DT]], a_exec: List[Scalar[DT]],
-        xi: List[Scalar[DT]], r: Float64, done: Float64, frame: Int, terminal: Bool, ep_start: Bool,
+        x: List[Scalar[DT]], r: Float64, done: Float64, frame: Int, terminal: Bool, ep_start: Bool,
     ):
         var p = self.ptr[e]
         var i = e * self.T + p
-        for k in range(RB_S):
-            self.s[i * RB_S + k] = s[k]
-        for k in range(RB_A):
-            self.a[i * RB_A + k] = a[k]
-            self.a_exec[i * RB_A + k] = a_exec[k]
-        for k in range(RB_XI):
-            self.xi[i * RB_XI + k] = xi[k]
+        for k in range(Self.S):
+            self.s[i * Self.S + k] = s[k]
+        for k in range(Self.A):
+            self.a[i * Self.A + k] = a[k]
+            self.a_exec[i * Self.A + k] = a_exec[k]
+        for k in range(Self.X):
+            self.xi[i * Self.X + k] = x[k]
         self.r[i] = Scalar[DT](r)
         self.done[i] = Scalar[DT](done)
         self.frame[i] = frame
@@ -105,6 +98,12 @@ struct SMReplayBuffer(Movable):
 
     def end_episode(mut self, e: Int):
         self.ep_counter[e] += 1
+
+    def num_envs(self) -> Int:
+        return self.E
+
+    def capacity(self) -> Int:
+        return self.T
 
     @always_inline
     def _at(self, e: Int, t: Int) -> Int:
@@ -150,47 +149,47 @@ struct SMReplayBuffer(Movable):
             if mask[i]:
                 elig.append(i)
         if len(elig) == 0:
-            raise Error("SMReplayBuffer: no sampleable rows yet")
+            raise Error("EpisodicReplay: no sampleable rows yet")
         var out = List[Int](length=n, fill=0)
         for j in range(n):
             out[j] = elig[Int(random_ui64(0, UInt64(len(elig) - 1)))]
         return out^
 
-    def windows_at(self, idx: List[Int], k: Int) -> SMWindows:
+    def windows_at(self, idx: List[Int], k: Int) -> EpisodicWindows[Self.S, Self.A, Self.X]:
         """The windows starting at flat rows `idx` (t-major outputs)."""
         var n = len(idx)
-        var w = SMWindows(k, n)
+        var w = EpisodicWindows[Self.S, Self.A, Self.X](k, n)
         for c in range(n):
             var e = idx[c] // self.T
             var t = idx[c] % self.T
             var i0 = e * self.T + t
-            for k2 in range(RB_XI):
-                w.xi[c * RB_XI + k2] = self.xi[i0 * RB_XI + k2]
+            for k2 in range(Self.X):
+                w.xi[c * Self.X + k2] = self.xi[i0 * Self.X + k2]
             for j in range(k + 1):
                 var i = self._at(e, t + j)
-                for q in range(RB_S):
-                    w.states[(j * n + c) * RB_S + q] = self.s[i * RB_S + q]
+                for q in range(Self.S):
+                    w.states[(j * n + c) * Self.S + q] = self.s[i * Self.S + q]
                 if j < k:
-                    for q in range(RB_A):
-                        w.a_exec[(j * n + c) * RB_A + q] = self.a_exec[i * RB_A + q]
-                        w.a_clean[(j * n + c) * RB_A + q] = self.a[i * RB_A + q]
+                    for q in range(Self.A):
+                        w.a_exec[(j * n + c) * Self.A + q] = self.a_exec[i * Self.A + q]
+                        w.a_clean[(j * n + c) * Self.A + q] = self.a[i * Self.A + q]
                     w.reward[j * n + c] = self.r[i]
                     w.frame[j * n + c] = self.frame[i]
                 if j >= 1:
                     w.done[(j - 1) * n + c] = self.done[i]
         return w^
 
-    def starts_at(self, idx: List[Int], hist: Int) -> SMStarts:
+    def starts_at(self, idx: List[Int], hist: Int) -> EpisodicStarts[Self.S, Self.A, Self.X]:
         var n = len(idx)
-        var st = SMStarts(hist, n)
+        var st = EpisodicStarts[Self.S, Self.A, Self.X](hist, n)
         for c in range(n):
             var e = idx[c] // self.T
             var t = idx[c] % self.T
             var i0 = e * self.T + t
-            for q in range(RB_S):
-                st.state[c * RB_S + q] = self.s[i0 * RB_S + q]
-            for q in range(RB_XI):
-                st.xi[c * RB_XI + q] = self.xi[i0 * RB_XI + q]
+            for q in range(Self.S):
+                st.state[c * Self.S + q] = self.s[i0 * Self.S + q]
+            for q in range(Self.X):
+                st.xi[c * Self.X + q] = self.xi[i0 * Self.X + q]
             st.frame[c] = self.frame[i0]
             # rows t−hist+1 .. t; outside the episode → its first row in the window
             var tt = List[Int](length=hist, fill=0)
@@ -206,18 +205,18 @@ struct SMReplayBuffer(Movable):
                     break
             for h in range(hist):
                 var ih = tt[h] if same[h] else tt[first_ok]
-                for q in range(RB_S):
-                    st.hist_states[(h * n + c) * RB_S + q] = self.s[ih * RB_S + q]
+                for q in range(Self.S):
+                    st.hist_states[(h * n + c) * Self.S + q] = self.s[ih * Self.S + q]
                 var tp = e * self.T + ((ih - e * self.T) - 1 + self.T) % self.T
                 var prev_ok = self.ep_id[tp] == self.ep_id[i0] and self.valid[tp] and not self.ep_start[ih]
-                for q in range(RB_A):
-                    st.hist_actions[(h * n + c) * RB_A + q] = self.a[tp * RB_A + q] if prev_ok else Scalar[DT](0)
-            for q in range(RB_A):
-                st.prev_action[c * RB_A + q] = st.hist_actions[((hist - 1) * n + c) * RB_A + q]
+                for q in range(Self.A):
+                    st.hist_actions[(h * n + c) * Self.A + q] = self.a[tp * Self.A + q] if prev_ok else Scalar[DT](0)
+            for q in range(Self.A):
+                st.prev_action[c * Self.A + q] = st.hist_actions[((hist - 1) * n + c) * Self.A + q]
         return st^
 
 
-struct SMWindows(Movable):
+struct EpisodicWindows[S: Int, A: Int, X: Int](Movable):
     """k-step windows, t-major: states [(k+1)·n·71], a_exec / a_clean
     [k·n·29], xi [n·33] (at the window start), reward / done / frame [k·n]
     (done = the label of state j+1)."""
@@ -234,10 +233,10 @@ struct SMWindows(Movable):
     def __init__(out self, k: Int, n: Int):
         self.k = k
         self.n = n
-        self.states = List[Scalar[DT]](length=(k + 1) * n * RB_S, fill=0)
-        self.a_exec = List[Scalar[DT]](length=k * n * RB_A, fill=0)
-        self.a_clean = List[Scalar[DT]](length=k * n * RB_A, fill=0)
-        self.xi = List[Scalar[DT]](length=n * RB_XI, fill=0)
+        self.states = List[Scalar[DT]](length=(k + 1) * n * Self.S, fill=0)
+        self.a_exec = List[Scalar[DT]](length=k * n * Self.A, fill=0)
+        self.a_clean = List[Scalar[DT]](length=k * n * Self.A, fill=0)
+        self.xi = List[Scalar[DT]](length=n * Self.X, fill=0)
         self.reward = List[Scalar[DT]](length=k * n, fill=0)
         self.done = List[Scalar[DT]](length=k * n, fill=0)
         self.frame = List[Int](length=k * n, fill=0)
@@ -254,7 +253,7 @@ struct SMWindows(Movable):
         self.frame = move.frame^
 
 
-struct SMStarts(Movable):
+struct EpisodicStarts[S: Int, A: Int, X: Int](Movable):
     """Start states with their history: state [n·71], xi [n·33], frame [n],
     prev_action [n·29], hist_states [h·n·71] (oldest first), hist_actions
     [h·n·29] (the clean action before each history state)."""
@@ -270,12 +269,12 @@ struct SMStarts(Movable):
     def __init__(out self, hist: Int, n: Int):
         self.hist = hist
         self.n = n
-        self.state = List[Scalar[DT]](length=n * RB_S, fill=0)
-        self.xi = List[Scalar[DT]](length=n * RB_XI, fill=0)
+        self.state = List[Scalar[DT]](length=n * Self.S, fill=0)
+        self.xi = List[Scalar[DT]](length=n * Self.X, fill=0)
         self.frame = List[Int](length=n, fill=0)
-        self.prev_action = List[Scalar[DT]](length=n * RB_A, fill=0)
-        self.hist_states = List[Scalar[DT]](length=hist * n * RB_S, fill=0)
-        self.hist_actions = List[Scalar[DT]](length=hist * n * RB_A, fill=0)
+        self.prev_action = List[Scalar[DT]](length=n * Self.A, fill=0)
+        self.hist_states = List[Scalar[DT]](length=hist * n * Self.S, fill=0)
+        self.hist_actions = List[Scalar[DT]](length=hist * n * Self.A, fill=0)
 
     def __init__(out self, *, deinit move: Self):
         self.hist = move.hist

@@ -29,10 +29,14 @@ robot. It is still a pose the PD holds, so a zero policy tracks it.
 from std.sys import argv
 
 from noeira.core.cont_action import ContAction
-from noeira.deep_agents.supermimic.env import SMG1Env, SM_EPISODE_STEPS
+from noeira.deep_agents.supermimic.env import SMReplayOf, SMTrackingEnv, SM_EPISODE_STEPS
 from noeira.deep_agents.supermimic.motion_library import SMMotionLibrary
-from noeira.deep_agents.supermimic.policy import SM_HIST, SM_OBS
-from noeira.deep_agents.supermimic.replay import SMReplayBuffer
+from noeira.deep_agents.supermimic.robot import G1Robot, SMDims
+
+comptime SM_HIST = SMDims[G1Robot].HIST
+comptime SM_OBS = SMDims[G1Robot].OBS
+comptime SMG1Env = SMTrackingEnv[G1Robot]
+comptime SMReplayBuffer = SMReplayOf[G1Robot]
 from noeira.envs.robots import UnitreeG1
 from noeira.envs.robots.unitree_g1_pd import G1_N_DOF, g1_default_pos
 from noeira.nn.constants import DT
@@ -70,7 +74,7 @@ def _standing_row() raises -> List[Scalar[DT]]:
     return row^
 
 
-def _library(stand: List[Scalar[DT]], lens: List[Int], dz: Float64) raises -> SMMotionLibrary:
+def _library(stand: List[Scalar[DT]], lens: List[Int], dz: Float64) raises -> SMMotionLibrary[G1Robot]:
     var total = 0
     for c in range(len(lens)):
         total += lens[c]
@@ -82,7 +86,7 @@ def _library(stand: List[Scalar[DT]], lens: List[Int], dz: Float64) raises -> SM
     var q0 = List[Float64](length=G1_N_DOF, fill=0.0)
     for j in range(G1_N_DOF):
         q0[j] = g1_default_pos(j)
-    return SMMotionLibrary(rows^, lens, q0)
+    return SMMotionLibrary[G1Robot](rows^, lens, q0)
 
 
 def main() raises:
@@ -145,13 +149,12 @@ def main() raises:
     t.truth(e_obs <= 1e-6, "observed joints = q + bias - q0 (max err " + String(e_obs) + ")")
     var bad_f = 0
     for i in range(2):
-        for g in env4.foot_geoms:
-            var o = g * MODEL_GEOM_SIZE
-            if Float64(env4.lanes[i].sim.mf.geoms.data[o + GEOM_IDX_PRIORITY]) != 1.0:
+        for g in env4.tables.feet:
+            if env4.lanes[i].sim.geom_field(g, GEOM_IDX_PRIORITY) != 1.0:
                 bad_f += 1
-            if abs(Float64(env4.lanes[i].sim.mf.geoms.data[o + GEOM_IDX_FRICTION]) - Float64(env4.lanes[i].xi[0])) > 1e-6:
+            if abs(env4.lanes[i].sim.geom_field(g, GEOM_IDX_FRICTION) - Float64(env4.lanes[i].xi[0])) > 1e-6:
                 bad_f += 1
-    t.truth(bad_f == 0, "8 foot spheres: priority 1, friction = xi[0]")
+    t.truth(bad_f == 0 and len(env4.tables.feet) == 8, String(len(env4.tables.feet)) + " foot geoms found by body name: priority 1, friction = xi[0]")
 
     # the bias in the PD target: the same env with bias b settles ~ −b away
     var ea = SMG1Env(1, _library(stand, lens, 0.0), dr=False, obs_noise=False, reset_noise=False, action_noise=0.0, rng_seed=9)

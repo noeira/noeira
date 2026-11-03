@@ -3,10 +3,10 @@
 # +--------------------------------------------------------------------------+ #
 """The reproduction's compact `MotionLibrary` (`envs/mdp/motion_library.py`)
 and the reset sampler of its `MultiClipMotionCommand` (`envs/mdp/commands.py`,
-plan D14), on our G1.
+plan D14), for any `TrackingRobot`.
 
 THE LIBRARY. Clips are concatenated on one global frame axis; a frame holds
-the 71-d reference row `[root pos, root quat WXYZ, q, root lin vel (world),
+the S-wide reference row `[root pos, root quat WXYZ, q, root lin vel (world),
 root ang vel (world), q̇]` (`data/bones_seed_import.mojo`'s store). Clips are
 cut into bins of 50 frames (1 s), numbered globally; the last bin of a clip
 may be short. Per frame, on the fly:
@@ -35,22 +35,20 @@ EMA in float32 (its `bin_return` is a float32 tensor), ~1e-7 apart.
 
 from std.math import ceil, exp, log
 
-from noeira.deep_agents.supermimic.g1_fk import FP, G1FKTree, Q4, g1_fk_lane, qapply
-from noeira.deep_agents.supermimic.heads import (
-    G1HeadsTable, HT_TRACKED, SM_N_TRACKED, SM_REF_BODY, SM_REF_DIM, qapply_inv, yaw_quat,
-)
+from noeira.deep_agents.supermimic.heads import SMHeadLayout, qapply_inv, yaw_quat
+from noeira.deep_agents.supermimic.kinematics import FP, Q4, qapply, sm_fk_lane
+from noeira.deep_agents.supermimic.robot import SMDims, TrackingRobot
+from noeira.deep_agents.supermimic.tables import SMTables
 from noeira.nn.constants import DT
 
 
-comptime SM_GOAL_FEAT: Int = 68
 comptime SM_GOAL_K: Int = 10
 comptime SM_BIN_FRAMES: Int = 50
-comptime SM_REF_ROW: Int = 71
 
 
-struct SMMotionLibrary(Movable):
-    var rows: List[Scalar[DT]]         # num_frames × 71
-    var q0: List[Scalar[DT]]           # 29
+struct SMMotionLibrary[R: TrackingRobot](Movable):
+    var rows: List[Scalar[DT]]         # num_frames × S
+    var q0: List[Scalar[DT]]           # n
     var clip_start: List[Int]
     var clip_len: List[Int]
     var frame_clip: List[Int]
@@ -69,13 +67,13 @@ struct SMMotionLibrary(Movable):
             if clip_len[c] < 1:
                 raise Error("SMMotionLibrary: clip " + String(c) + " is empty")
             total += clip_len[c]
-        if total * SM_REF_ROW != len(rows):
+        if total * SMDims[Self.R].S != len(rows):
             raise Error("SMMotionLibrary: " + String(len(rows)) + " values for " + String(total) + " frames")
-        if len(q0) != 29:
+        if len(q0) != Self.R.NDOF:
             raise Error("SMMotionLibrary: q0 has " + String(len(q0)) + " entries")
         self.rows = rows^
-        self.q0 = List[Scalar[DT]](length=29, fill=0)
-        for j in range(29):
+        self.q0 = List[Scalar[DT]](length=Self.R.NDOF, fill=0)
+        for j in range(Self.R.NDOF):
             self.q0[j] = Scalar[DT](q0[j])
         self.num_frames = total
         self.num_clips = len(clip_len)
@@ -124,61 +122,66 @@ struct SMMotionLibrary(Movable):
 
     @always_inline
     def _row(mut self, f: Int) -> FP[DT]:
-        return self.rows.unsafe_ptr().unsafe_offset(f * SM_REF_ROW).as_unsafe_any_origin()
+        return self.rows.unsafe_ptr().unsafe_offset(f * SMDims[Self.R].S).as_unsafe_any_origin()
 
     def goal_features(mut self, f: Int, dst: FP[DT]):
-        """`goal_features(ref(f), q0)` (68) into `dst`."""
+        """`goal_features(ref(f), q0)` (2n + 10) into `dst`."""
+        comptime n = Self.R.NDOF
+        comptime NQ = Self.R.NQ
         var r = self._row(f)
         var q = Q4[DT](r[unsafe_offset=3], r[unsafe_offset=4], r[unsafe_offset=5], r[unsafe_offset=6])
         var grav = qapply_inv(q, Q4[DT](0, 0, -1, 0))
-        var ang_b = qapply_inv(q, Q4[DT](r[unsafe_offset=39], r[unsafe_offset=40], r[unsafe_offset=41], 0))
-        var lin_h = qapply_inv(yaw_quat(q), Q4[DT](r[unsafe_offset=36], r[unsafe_offset=37], r[unsafe_offset=38], 0))
-        for j in range(29):
+        var ang_b = qapply_inv(q, Q4[DT](r[unsafe_offset=NQ + 3], r[unsafe_offset=NQ + 4], r[unsafe_offset=NQ + 5], 0))
+        var lin_h = qapply_inv(yaw_quat(q), Q4[DT](r[unsafe_offset=NQ], r[unsafe_offset=NQ + 1], r[unsafe_offset=NQ + 2], 0))
+        for j in range(n):
             dst[unsafe_offset=j] = r[unsafe_offset=7 + j] - self.q0[j]
-            dst[unsafe_offset=29 + j] = r[unsafe_offset=42 + j]
+            dst[unsafe_offset=n + j] = r[unsafe_offset=NQ + 6 + j]
         for c in range(3):
-            dst[unsafe_offset=58 + c] = grav[c]
-            dst[unsafe_offset=61 + c] = ang_b[c]
-            dst[unsafe_offset=64 + c] = lin_h[c]
-        dst[unsafe_offset=67] = r[unsafe_offset=2]
+            dst[unsafe_offset=2 * n + c] = grav[c]
+            dst[unsafe_offset=2 * n + 3 + c] = ang_b[c]
+            dst[unsafe_offset=2 * n + 6 + c] = lin_h[c]
+        dst[unsafe_offset=2 * n + 9] = r[unsafe_offset=2]
 
     def goal_window(mut self, f: Int, dst: FP[DT]):
-        """(680) features of f .. f+9, clamped at the clip's last frame."""
+        """(10 · (2n + 10)) features of f .. f+9, clamped at the clip's last frame."""
         var last = self.last_frame_of(f)
         for k in range(SM_GOAL_K):
-            self.goal_features(min(f + k, last), dst.unsafe_offset(k * SM_GOAL_FEAT))
+            self.goal_features(min(f + k, last), dst.unsafe_offset(k * SMDims[Self.R].GOAL_FRAME))
 
     def ref_qpos_qvel(mut self, f: Int, qpos: FP[DT], qvel: FP[DT]):
         """MuJoCo layout: qvel's root angular velocity in the BODY frame."""
+        comptime NQ = Self.R.NQ
         var r = self._row(f)
-        for k in range(36):
+        for k in range(NQ):
             qpos[unsafe_offset=k] = r[unsafe_offset=k]
         var q = Q4[DT](r[unsafe_offset=3], r[unsafe_offset=4], r[unsafe_offset=5], r[unsafe_offset=6])
-        var ang_b = qapply_inv(q, Q4[DT](r[unsafe_offset=39], r[unsafe_offset=40], r[unsafe_offset=41], 0))
+        var ang_b = qapply_inv(q, Q4[DT](r[unsafe_offset=NQ + 3], r[unsafe_offset=NQ + 4], r[unsafe_offset=NQ + 5], 0))
         for k in range(3):
-            qvel[unsafe_offset=k] = r[unsafe_offset=36 + k]
+            qvel[unsafe_offset=k] = r[unsafe_offset=NQ + k]
             qvel[unsafe_offset=3 + k] = ang_b[k]
-        for j in range(29):
-            qvel[unsafe_offset=6 + j] = r[unsafe_offset=42 + j]
+        for j in range(Self.R.NDOF):
+            qvel[unsafe_offset=6 + j] = r[unsafe_offset=NQ + 6 + j]
 
-    def reference_row(mut self, f: Int, mut tree: G1FKTree[DT], mut table: G1HeadsTable[DT], dst: FP[DT]):
-        """The heads' `ref` (189) at frame f: tracked bodies by our FK of the
-        reference state, then the library's root pos and quat."""
-        var qpos = List[Scalar[DT]](length=36, fill=0)
-        var qvel = List[Scalar[DT]](length=35, fill=0)
-        var fk = List[Scalar[DT]](length=40 * 13, fill=0)
+    def reference_row(mut self, f: Int, mut tb: SMTables[DT], dst: FP[DT]):
+        """The heads' `ref` (13·n_tracked + 7) at frame f: the tracked bodies
+        by our FK of the reference state, then the library's root pos and quat."""
+        comptime D = SMDims[Self.R]
+        comptime L = SMHeadLayout[Self.R]
+        var qpos = List[Scalar[DT]](length=D.NQ, fill=0)
+        var qvel = List[Scalar[DT]](length=D.NV, fill=0)
+        var fk = List[Scalar[DT]](length=D.FK_BLOCK, fill=0)
         var qp = qpos.unsafe_ptr().as_unsafe_any_origin()
         var qv = qvel.unsafe_ptr().as_unsafe_any_origin()
         self.ref_qpos_qvel(f, qp, qv)
         var base = fk.unsafe_ptr().as_unsafe_any_origin()
         var pos = base
-        var quat = base.unsafe_offset(40 * 3)
-        var lin = base.unsafe_offset(40 * 7)
-        var ang = base.unsafe_offset(40 * 10)
-        g1_fk_lane[DT](tree.ptr(), qp, qv, pos, quat, lin, ang)
-        for k in range(SM_N_TRACKED):
-            var b = Int(table.data[HT_TRACKED + k])
-            var o = k * SM_REF_BODY
+        var quat = base.unsafe_offset(D.NB * 3)
+        var lin = base.unsafe_offset(D.NB * 7)
+        var ang = base.unsafe_offset(D.NB * 10)
+        sm_fk_lane[DT, D.NB](tb.tree_ptr(), qp, qv, pos, quat, lin, ang)
+        for k in range(D.N_TRACKED):
+            var b = Int(tb.head[L.TRACKED + k])
+            var o = k * D.REF_BODY
             for c in range(3):
                 dst[unsafe_offset=o + c] = pos[unsafe_offset=b * 3 + c]
                 dst[unsafe_offset=o + 7 + c] = lin[unsafe_offset=b * 3 + c]
@@ -186,7 +189,7 @@ struct SMMotionLibrary(Movable):
             for c in range(4):
                 dst[unsafe_offset=o + 3 + c] = quat[unsafe_offset=b * 4 + c]
         var r = self._row(f)
-        var rr = SM_N_TRACKED * SM_REF_BODY
+        var rr = D.N_TRACKED * D.REF_BODY
         for c in range(7):
             dst[unsafe_offset=rr + c] = r[unsafe_offset=c]
 
@@ -256,7 +259,7 @@ struct SMResetSampler(Movable):
         return p^
 
     @staticmethod
-    def frame_from(lib: SMMotionLibrary, b: Int, u: Float64) -> Int:
+    def frame_from[R: TrackingRobot](lib: SMMotionLibrary[R], b: Int, u: Float64) -> Int:
         """A uniform draw `u` in [0, 1) inside bin b, kept ≥ 2 frames before
         the clip's end (and inside the clip)."""
         var f = lib.bin_start[b] + Int(u * Float64(lib.bin_end[b] - lib.bin_start[b]))

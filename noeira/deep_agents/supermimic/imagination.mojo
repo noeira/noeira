@@ -28,55 +28,47 @@ the last forward's activations; see `world_model.mojo`).
 from std.math import exp
 from std.random import random_float64
 
-from noeira.deep_agents.supermimic.g1_fk import FP, G1FKTree, Q4
-from noeira.deep_agents.supermimic.heads import (
-    G1HeadsTable, SM_N_TERMS, SM_N_TRACKED, SM_REF_BODY, SM_REF_DIM, SM_SCRATCH, g1_heads_lane,
-    g1_heads_vjp_lane,
-)
+from noeira.deep_agents.supermimic.config import SMConfigT, SMCriticOf, SMPolicyOf, SMWorldModelOf
+from noeira.deep_agents.supermimic.heads import SM_N_TERMS, SMHeadLayout, sm_heads_lane, sm_heads_vjp_lane
+from noeira.deep_agents.supermimic.kinematics import FP, Q4
 from noeira.deep_agents.supermimic.policy import (
-    SMCritic, SMPolicy, SM_ACT, SM_CRITIC_IN, SM_DEC_IN, SM_EROOT, SM_GOAL_DIM, SM_HIST, SM_LATENT,
-    SM_OBS, sm_goal_scale, sm_hist_flat_index, sm_obs_noise_half, sm_obs_scale, sm_root_error_lane,
+    sm_goal_scale, sm_hist_flat_index, sm_obs_noise_half, sm_obs_scale, sm_root_error_lane,
     sm_root_error_vjp_lane,
 )
+from noeira.deep_agents.supermimic.robot import SMDims, TrackingRobot
 from noeira.deep_agents.supermimic.state_spec import (
-    SM_DELTA_DIM, SM_FEAT_DIM, sm_canonical_lane, sm_canonical_vjp_lane, sm_integrate_lane,
-    sm_integrate_vjp_lane, sm_xi_normalize,
+    sm_canonical_lane, sm_canonical_vjp_lane, sm_integrate_lane, sm_integrate_vjp_lane, sm_xi_normalize,
 )
-from noeira.deep_agents.supermimic.world_model import (
-    SMWorldModel, SM_HEIGHT_THR, SM_TERM_IN, SM_TILT_THR, SM_WM_IN,
-)
+from noeira.deep_agents.supermimic.tables import SMTables
+from noeira.deep_agents.supermimic.world_model import SM_HEIGHT_THR, SM_TERM_IN, SM_TILT_THR
 from noeira.nn.constants import DT
 from noeira.nn.core.tensor import TensorImpl
 from noeira.nn.core.tensor_refs import TensorRefs
 
 
-comptime _S: Int = 71
-comptime _XI: Int = 33
-comptime _RR: Int = SM_N_TRACKED * SM_REF_BODY      # the reference root's offset in a ref row
-
-
-struct SMImagBatch(Movable):
-    """Start states and the per-step data of an imagined rollout (t-major).
-    hist0 [10·n·93] the start's observation history (oldest first);
-    goals [(H+1)·n·680], refs [(H+1)·n·189] for frames min(frame + t, clip end)."""
+struct SMImagBatch[R: TrackingRobot](Movable):
+    """Start states and the per-step data of an imagined rollout (t-major), as
+    `nn` tensors (host `.data`, device `.dev` on the GPU path).
+    hist0 [10·n·OBS] the start's observation history (oldest first);
+    goals [(H+1)·n·GOAL], refs [(H+1)·n·REF] for frames min(frame + t, clip end)."""
     var n: Int
     var h: Int
-    var state: List[Scalar[DT]]
-    var prev_action: List[Scalar[DT]]
-    var xi: List[Scalar[DT]]
-    var hist0: List[Scalar[DT]]
-    var goals: List[Scalar[DT]]
-    var refs: List[Scalar[DT]]
+    var state: TensorImpl[DT]
+    var prev_action: TensorImpl[DT]
+    var xi: TensorImpl[DT]
+    var hist0: TensorImpl[DT]
+    var goals: TensorImpl[DT]
+    var refs: TensorImpl[DT]
 
     def __init__(out self, n: Int, h: Int):
         self.n = n
         self.h = h
-        self.state = List[Scalar[DT]](length=n * _S, fill=0)
-        self.prev_action = List[Scalar[DT]](length=n * SM_ACT, fill=0)
-        self.xi = List[Scalar[DT]](length=n * _XI, fill=0)
-        self.hist0 = List[Scalar[DT]](length=SM_HIST * n * SM_OBS, fill=0)
-        self.goals = List[Scalar[DT]](length=(h + 1) * n * SM_GOAL_DIM, fill=0)
-        self.refs = List[Scalar[DT]](length=(h + 1) * n * SM_REF_DIM, fill=0)
+        self.state = TensorImpl[DT].alloc(n * SMDims[Self.R].S)
+        self.prev_action = TensorImpl[DT].alloc(n * Self.R.NDOF)
+        self.xi = TensorImpl[DT].alloc(n * SMDims[Self.R].X)
+        self.hist0 = TensorImpl[DT].alloc(SMDims[Self.R].HIST * n * SMDims[Self.R].OBS)
+        self.goals = TensorImpl[DT].alloc((h + 1) * n * SMDims[Self.R].GOAL)
+        self.refs = TensorImpl[DT].alloc((h + 1) * n * SMDims[Self.R].REF)
 
     def __init__(out self, *, deinit move: Self):
         self.n = move.n
@@ -89,30 +81,30 @@ struct SMImagBatch(Movable):
         self.refs = move.refs^
 
 
-struct SMImagOut(Movable):
+struct SMImagOut[R: TrackingRobot](Movable):
     """Per-step results, t-major: states [(H+1)·n·71], actions [H·n·29],
     rewards [H·n] (r_{t+1}), dhat [(H+1)·n] (d_0 = 0), survival [(H+1)·n],
     e_root [(H+1)·n·4], value_h [n]; and the objective."""
     var j: Float64
     var return_undisc: Float64
-    var states: List[Scalar[DT]]
-    var actions: List[Scalar[DT]]
-    var rewards: List[Scalar[DT]]
-    var dhat: List[Scalar[DT]]
-    var survival: List[Scalar[DT]]
-    var e_root: List[Scalar[DT]]
-    var value_h: List[Scalar[DT]]
+    var states: TensorImpl[DT]
+    var actions: TensorImpl[DT]
+    var rewards: TensorImpl[DT]
+    var dhat: TensorImpl[DT]
+    var survival: TensorImpl[DT]
+    var e_root: TensorImpl[DT]
+    var value_h: TensorImpl[DT]
 
     def __init__(out self, n: Int, h: Int):
         self.j = 0
         self.return_undisc = 0
-        self.states = List[Scalar[DT]](length=(h + 1) * n * _S, fill=0)
-        self.actions = List[Scalar[DT]](length=h * n * SM_ACT, fill=0)
-        self.rewards = List[Scalar[DT]](length=h * n, fill=0)
-        self.dhat = List[Scalar[DT]](length=(h + 1) * n, fill=0)
-        self.survival = List[Scalar[DT]](length=(h + 1) * n, fill=0)
-        self.e_root = List[Scalar[DT]](length=(h + 1) * n * SM_EROOT, fill=0)
-        self.value_h = List[Scalar[DT]](length=n, fill=0)
+        self.states = TensorImpl[DT].alloc((h + 1) * n * SMDims[Self.R].S)
+        self.actions = TensorImpl[DT].alloc(h * n * Self.R.NDOF)
+        self.rewards = TensorImpl[DT].alloc(h * n)
+        self.dhat = TensorImpl[DT].alloc((h + 1) * n)
+        self.survival = TensorImpl[DT].alloc((h + 1) * n)
+        self.e_root = TensorImpl[DT].alloc((h + 1) * n * SMDims[Self.R].EROOT)
+        self.value_h = TensorImpl[DT].alloc(n)
 
     def __init__(out self, *, deinit move: Self):
         self.j = move.j
@@ -142,46 +134,63 @@ def _sigmoid(x: Float64) -> Float64:
 
 
 @always_inline
-def _root_q(mut l: List[Scalar[DT]], off: Int) -> Q4[DT]:
-    return Q4[DT](l[off + _RR + 3], l[off + _RR + 4], l[off + _RR + 5], l[off + _RR + 6])
+def _root_q[R: TrackingRobot](mut l: List[Scalar[DT]], off: Int) -> Q4[DT]:
+    """The reference root's quaternion in a ref row at `off`."""
+    comptime RR = 13 * R.N_TRACKED
+    return Q4[DT](l[off + RR + 3], l[off + RR + 4], l[off + RR + 5], l[off + RR + 6])
 
 
 @always_inline
-def _root_p(mut l: List[Scalar[DT]], off: Int) -> Q4[DT]:
-    return Q4[DT](l[off + _RR], l[off + _RR + 1], l[off + _RR + 2], 0)
+def _root_p[R: TrackingRobot](mut l: List[Scalar[DT]], off: Int) -> Q4[DT]:
+    comptime RR = 13 * R.N_TRACKED
+    return Q4[DT](l[off + RR], l[off + RR + 1], l[off + RR + 2], 0)
 
 
-def sm_imagine[
-    HW: Int, TH: Int, E1: Int, E2: Int, E3: Int, E4: Int, D1: Int, D2: Int, D3: Int, D4: Int,
-    C1: Int, C2: Int, N: Int,
-](
-    mut wm: SMWorldModel[HW, TH],
-    mut pol: SMPolicy[E1, E2, E3, E4, D1, D2, D3, D4],
-    mut critic: SMCritic[C1, C2],
-    mut tree: G1FKTree[DT],
-    mut table: G1HeadsTable[DT],
-    mut ib: SMImagBatch,
+def sm_imagine[C: SMConfigT, N: Int](
+    mut wm: SMWorldModelOf[C],
+    mut pol: SMPolicyOf[C],
+    mut critic: SMCriticOf[C],
+    mut tb: SMTables[DT],
+    mut ib: SMImagBatch[C.ROBOT],
     gamma: Float64,
     grad: Bool,
     obs_noise: Bool = False,
-) raises -> SMImagOut:
+) raises -> SMImagOut[C.ROBOT]:
     """The rollout; with `grad`, ADDS d(−J/H)/d params into the policy's grads
     (zero them first). The world model's and critic's grads are polluted.
     `obs_noise` adds Table A.1's uniform sensor noise to each imagined
     observation as it enters the history (`rollout.py`'s `add_noise`); it is
     data, so the gradient path is unchanged."""
+    comptime R = C.ROBOT
+    comptime D = SMDims[R]
+    comptime n = R.NDOF
+    comptime _S = D.S
+    comptime _XI = D.X
+    comptime SM_ACT = R.NDOF
+    comptime SM_OBS = D.OBS
+    comptime SM_GOAL_DIM = D.GOAL
+    comptime SM_REF_DIM = D.REF
+    comptime SM_HIST = D.HIST
+    comptime SM_LATENT = D.LATENT
+    comptime SM_DEC_IN = D.DEC_IN
+    comptime SM_EROOT = D.EROOT
+    comptime SM_CRITIC_IN = D.CRITIC_IN
+    comptime SM_FEAT_DIM = D.S
+    comptime SM_DELTA_DIM = D.DELTA
+    comptime SM_WM_IN = D.WM_IN
+    comptime SM_SCRATCH = SMHeadLayout[R].SCRATCH
     if ib.n != N:
         raise Error("sm_imagine: " + String(ib.n) + " lanes, compiled for " + String(N))
     var H = ib.h
-    var o = SMImagOut(N, H)
+    var o = SMImagOut[R](N, H)
     var xin = List[Scalar[DT]](length=N * _XI, fill=0)
     for i in range(N * _XI):
-        xin[i] = Scalar[DT](sm_xi_normalize(i % _XI, Float64(ib.xi[i])))
+        xin[i] = Scalar[DT](sm_xi_normalize[n](i % _XI, Float64(ib.xi.data[i])))
     var O = List[Scalar[DT]](length=(SM_HIST + H) * N * SM_OBS, fill=0)    # observation slots
     for i in range(SM_HIST * N * SM_OBS):
-        O[i] = ib.hist0[i]
+        O[i] = ib.hist0.data[i]
     for i in range(N * _S):
-        o.states[i] = ib.state[i]
+        o.states.data[i] = ib.state.data[i]
     var encs = List[TensorImpl[DT]]()
     var decs = List[TensorImpl[DT]]()
     var xs = List[TensorImpl[DT]]()
@@ -191,15 +200,15 @@ def sm_imagine[
     var terms = List[Scalar[DT]](length=SM_N_TERMS, fill=0)
     var feat = List[Scalar[DT]](length=2, fill=0)
     for b in range(N):
-        o.survival[b] = 1
-        sm_root_error_lane[DT](_r(o.states, b * _S), _root_p(ib.refs, b * SM_REF_DIM), _root_q(ib.refs, b * SM_REF_DIM), _r(o.e_root, b * SM_EROOT))
+        o.survival.data[b] = 1
+        sm_root_error_lane[DT](_r(o.states.data, b * _S), _root_p[R](ib.refs.data, b * SM_REF_DIM), _root_q[R](ib.refs.data, b * SM_REF_DIM), _r(o.e_root.data, b * SM_EROOT))
 
     for t in range(H):
         # the policy
         var ein = TensorImpl[DT].alloc(N * SM_GOAL_DIM)
         for b in range(N):
             for k in range(SM_GOAL_DIM):
-                ein.data[b * SM_GOAL_DIM + k] = ib.goals[(t * N + b) * SM_GOAL_DIM + k] * Scalar[DT](sm_goal_scale(k))
+                ein.data[b * SM_GOAL_DIM + k] = ib.goals.data[(t * N + b) * SM_GOAL_DIM + k] * Scalar[DT](sm_goal_scale[n](k))
         var z = TensorImpl[DT].alloc(N * SM_LATENT)
         pol.enc.forward["cpu", N](TensorRefs[1, _, DT](ein), z, None)
         var din = TensorImpl[DT].alloc(N * SM_DEC_IN)
@@ -209,15 +218,15 @@ def sm_imagine[
             for hh in range(SM_HIST):
                 var ob = ((t + hh) * N + b) * SM_OBS
                 for k in range(SM_OBS):
-                    din.data[b * SM_DEC_IN + SM_LATENT + sm_hist_flat_index(hh, k)] = O[ob + k] * Scalar[DT](sm_obs_scale(k))
+                    din.data[b * SM_DEC_IN + SM_LATENT + sm_hist_flat_index[n](hh, k)] = O[ob + k] * Scalar[DT](sm_obs_scale[n](k))
         var act = TensorImpl[DT].alloc(N * SM_ACT)
         pol.dec.forward["cpu", N](TensorRefs[1, _, DT](din), act, None)
         for i in range(N * SM_ACT):
-            o.actions[t * N * SM_ACT + i] = act.data[i]
+            o.actions.data[t * N * SM_ACT + i] = act.data[i]
         # the world model
         var x = TensorImpl[DT].alloc(N * SM_WM_IN)
         for b in range(N):
-            sm_canonical_lane[DT](_r(o.states, (t * N + b) * _S), _t(x, b * SM_WM_IN))
+            sm_canonical_lane[DT, R](_r(o.states.data, (t * N + b) * _S), _t(x, b * SM_WM_IN))
             for k in range(SM_ACT):
                 x.data[b * SM_WM_IN + SM_FEAT_DIM + k] = act.data[b * SM_ACT + k]
             for k in range(_XI):
@@ -227,18 +236,18 @@ def sm_imagine[
         var tin = TensorImpl[DT].alloc(N * SM_TERM_IN)
         for b in range(N):
             var sn = ((t + 1) * N + b) * _S
-            sm_integrate_lane[DT](_r(o.states, (t * N + b) * _S), _t(dl, b * SM_DELTA_DIM), _r(o.states, sn))
-            var ap = _r(ib.prev_action, b * SM_ACT) if t == 0 else _r(o.actions, ((t - 1) * N + b) * SM_ACT)
-            var rr = g1_heads_lane[DT](
-                tree.ptr(), table.ptr(), _r(o.states, sn), _r(o.actions, (t * N + b) * SM_ACT), ap,
-                _r(ib.xi, b * _XI), _r(ib.refs, (t * N + b) * SM_REF_DIM), _r(terms, 0), _r(feat, 0),
+            sm_integrate_lane[DT, R](_r(o.states.data, (t * N + b) * _S), _t(dl, b * SM_DELTA_DIM), _r(o.states.data, sn))
+            var ap = _r(ib.prev_action.data, b * SM_ACT) if t == 0 else _r(o.actions.data, ((t - 1) * N + b) * SM_ACT)
+            var rr = sm_heads_lane[DT, R](
+                tb.tree_ptr(), tb.head_ptr(), _r(o.states.data, sn), _r(o.actions.data, (t * N + b) * SM_ACT), ap,
+                _r(ib.xi.data, b * _XI), _r(ib.refs.data, (t * N + b) * SM_REF_DIM), _r(terms, 0), _r(feat, 0),
                 _r(O, ((SM_HIST + t) * N + b) * SM_OBS), _r(scratch, 0),
             )
-            o.rewards[t * N + b] = rr
+            o.rewards.data[t * N + b] = rr
             if obs_noise:
                 var ob = ((SM_HIST + t) * N + b) * SM_OBS
                 for k in range(SM_OBS):
-                    var hw = sm_obs_noise_half(k)
+                    var hw = sm_obs_noise_half[n](k)
                     if hw > 0:
                         O[ob + k] += Scalar[DT](random_float64(-hw, hw))
             var x0 = feat[0] / Scalar[DT](SM_HEIGHT_THR)
@@ -248,13 +257,13 @@ def sm_imagine[
             tin.data[b * 4 + 2] = abs(x0)
             tin.data[b * 4 + 3] = abs(x1)
             var ro = ((t + 1) * N + b) * SM_REF_DIM
-            sm_root_error_lane[DT](_r(o.states, sn), _root_p(ib.refs, ro), _root_q(ib.refs, ro), _r(o.e_root, ((t + 1) * N + b) * SM_EROOT))
+            sm_root_error_lane[DT](_r(o.states.data, sn), _root_p[R](ib.refs.data, ro), _root_q[R](ib.refs.data, ro), _r(o.e_root.data, ((t + 1) * N + b) * SM_EROOT))
         var lg = TensorImpl[DT].alloc(N)
         wm.term.forward["cpu", N](TensorRefs[1, _, DT](tin), lg, None)
         for b in range(N):
             var d = Scalar[DT](_sigmoid(Float64(lg.data[b])))
-            o.dhat[(t + 1) * N + b] = d
-            o.survival[(t + 1) * N + b] = o.survival[t * N + b] * (1 - d)
+            o.dhat.data[(t + 1) * N + b] = d
+            o.survival.data[(t + 1) * N + b] = o.survival.data[t * N + b] * (1 - d)
         encs.append(ein^)
         decs.append(din^)
         xs.append(x^)
@@ -264,26 +273,26 @@ def sm_imagine[
     # the critic at s_H
     var cin = TensorImpl[DT].alloc(N * SM_CRITIC_IN)
     for b in range(N):
-        sm_canonical_lane[DT](_r(o.states, (H * N + b) * _S), _t(cin, b * SM_CRITIC_IN))
+        sm_canonical_lane[DT, R](_r(o.states.data, (H * N + b) * _S), _t(cin, b * SM_CRITIC_IN))
         for k in range(SM_GOAL_DIM):
-            cin.data[b * SM_CRITIC_IN + SM_FEAT_DIM + k] = ib.goals[(H * N + b) * SM_GOAL_DIM + k] * Scalar[DT](sm_goal_scale(k))
+            cin.data[b * SM_CRITIC_IN + SM_FEAT_DIM + k] = ib.goals.data[(H * N + b) * SM_GOAL_DIM + k] * Scalar[DT](sm_goal_scale[n](k))
         for k in range(_XI):
             cin.data[b * SM_CRITIC_IN + SM_FEAT_DIM + SM_GOAL_DIM + k] = xin[b * _XI + k]
         for k in range(SM_EROOT):
-            cin.data[b * SM_CRITIC_IN + SM_FEAT_DIM + SM_GOAL_DIM + _XI + k] = o.e_root[(H * N + b) * SM_EROOT + k]
+            cin.data[b * SM_CRITIC_IN + SM_FEAT_DIM + SM_GOAL_DIM + _XI + k] = o.e_root.data[(H * N + b) * SM_EROOT + k]
     var vh = TensorImpl[DT].alloc(N)
     critic.forward["cpu", N](TensorRefs[1, _, DT](cin), vh, None)
     var jsum = 0.0
     var usum = 0.0
     for b in range(N):
-        o.value_h[b] = vh.data[b]
+        o.value_h.data[b] = vh.data[b]
         var jb = 0.0
         var gp = 1.0
         for t in range(H):
-            jb += gp * Float64(o.survival[t * N + b]) * Float64(o.rewards[t * N + b])
-            usum += Float64(o.survival[t * N + b]) * Float64(o.rewards[t * N + b])
+            jb += gp * Float64(o.survival.data[t * N + b]) * Float64(o.rewards.data[t * N + b])
+            usum += Float64(o.survival.data[t * N + b]) * Float64(o.rewards.data[t * N + b])
             gp *= gamma
-        jb += gp * Float64(o.survival[H * N + b]) * Float64(vh.data[b])
+        jb += gp * Float64(o.survival.data[H * N + b]) * Float64(vh.data[b])
         jsum += jb
     o.j = jsum / Float64(N)
     o.return_undisc = usum / Float64(N)
@@ -300,17 +309,17 @@ def sm_imagine[
         gH *= gamma
     for b in range(N):
         var gc = gJ * gH * Float64(vh.data[b])          # ∂J/∂c_H
-        gv.data[b] = Scalar[DT](gJ * gH * Float64(o.survival[H * N + b]))
+        gv.data[b] = Scalar[DT](gJ * gH * Float64(o.survival.data[H * N + b]))
         var gp = gH
         var t = H - 1
         while t >= 0:
             gp /= gamma
-            var c_t = Float64(o.survival[t * N + b])
-            var d1 = Float64(o.dhat[(t + 1) * N + b])
+            var c_t = Float64(o.survival.data[t * N + b])
+            var d1 = Float64(o.dhat.data[(t + 1) * N + b])
             g_r[t * N + b] = gJ * gp * c_t
             var g_d = -gc * c_t                         # c_{t+1} = c_t (1 − d_{t+1})
             g_lg[t * N + b] = g_d * d1 * (1.0 - d1)
-            gc = gJ * gp * Float64(o.rewards[t * N + b]) + gc * (1.0 - d1)
+            gc = gJ * gp * Float64(o.rewards.data[t * N + b]) + gc * (1.0 - d1)
             t -= 1
 
     # ── V(s_H) ──
@@ -319,9 +328,9 @@ def sm_imagine[
     var gcin = TensorImpl[DT].alloc(N * SM_CRITIC_IN)
     critic.vjp["cpu", N](TensorRefs[1, _, DT](cin), gv, TensorRefs[1, _, DT](gcin), None)
     for b in range(N):
-        sm_canonical_vjp_lane[DT](_r(o.states, (H * N + b) * _S), _t(gcin, b * SM_CRITIC_IN), _r(gs, b * _S))
+        sm_canonical_vjp_lane[DT, R](_r(o.states.data, (H * N + b) * _S), _t(gcin, b * SM_CRITIC_IN), _r(gs, b * _S))
         sm_root_error_vjp_lane[DT](
-            _r(o.states, (H * N + b) * _S), _root_q(ib.refs, (H * N + b) * SM_REF_DIM),
+            _r(o.states.data, (H * N + b) * _S), _root_q[R](ib.refs.data, (H * N + b) * SM_REF_DIM),
             _t(gcin, b * SM_CRITIC_IN + SM_FEAT_DIM + SM_GOAL_DIM + _XI), _r(gs, b * _S),
         )
 
@@ -348,19 +357,19 @@ def sm_imagine[
             gfeat[0] = (gtin.data[b * 4 + 0] + s0 * gtin.data[b * 4 + 2]) / Scalar[DT](SM_HEIGHT_THR)
             gfeat[1] = (gtin.data[b * 4 + 1] + s1 * gtin.data[b * 4 + 3]) / Scalar[DT](SM_TILT_THR)
             var sn = ((t + 1) * N + b) * _S
-            var ap = _r(ib.prev_action, b * SM_ACT) if t == 0 else _r(o.actions, ((t - 1) * N + b) * SM_ACT)
+            var ap = _r(ib.prev_action.data, b * SM_ACT) if t == 0 else _r(o.actions.data, ((t - 1) * N + b) * SM_ACT)
             var obs_tmp = List[Scalar[DT]](length=SM_OBS, fill=0)
-            _ = g1_heads_lane[DT](
-                tree.ptr(), table.ptr(), _r(o.states, sn), _r(o.actions, (t * N + b) * SM_ACT), ap,
-                _r(ib.xi, b * _XI), _r(ib.refs, (t * N + b) * SM_REF_DIM), _r(terms, 0), _r(feat, 0),
+            _ = sm_heads_lane[DT, R](
+                tb.tree_ptr(), tb.head_ptr(), _r(o.states.data, sn), _r(o.actions.data, (t * N + b) * SM_ACT), ap,
+                _r(ib.xi.data, b * _XI), _r(ib.refs.data, (t * N + b) * SM_REF_DIM), _r(terms, 0), _r(feat, 0),
                 _r(obs_tmp, 0), _r(scratch, 0),
             )
             var g_s1 = List[Scalar[DT]](length=_S, fill=0)
             var g_a1 = List[Scalar[DT]](length=SM_ACT, fill=0)
             var g_ap1 = List[Scalar[DT]](length=SM_ACT, fill=0)
-            g1_heads_vjp_lane[DT](
-                tree.ptr(), table.ptr(), _r(o.states, sn), _r(o.actions, (t * N + b) * SM_ACT), ap,
-                _r(ib.refs, (t * N + b) * SM_REF_DIM), Scalar[DT](g_r[t * N + b]), _r(gfeat, 0),
+            sm_heads_vjp_lane[DT, R](
+                tb.tree_ptr(), tb.head_ptr(), _r(o.states.data, sn), _r(o.actions.data, (t * N + b) * SM_ACT), ap,
+                _r(ib.refs.data, (t * N + b) * SM_REF_DIM), Scalar[DT](g_r[t * N + b]), _r(gfeat, 0),
                 _r(gO, ((SM_HIST + t) * N + b) * SM_OBS), _r(scratch, 0),
                 _r(g_s1, 0), _r(g_a1, 0), _r(g_ap1, 0),
             )
@@ -373,8 +382,8 @@ def sm_imagine[
         var gprev = List[Scalar[DT]](length=N * _S, fill=0)
         var gdl = TensorImpl[DT].alloc(N * SM_DELTA_DIM)
         for b in range(N):
-            sm_integrate_vjp_lane[DT](
-                _r(o.states, (t * N + b) * _S), _t(dls[t], b * SM_DELTA_DIM), _r(gs, b * _S),
+            sm_integrate_vjp_lane[DT, R](
+                _r(o.states.data, (t * N + b) * _S), _t(dls[t], b * SM_DELTA_DIM), _r(gs, b * _S),
                 _r(gprev, b * _S), _t(gdl, b * SM_DELTA_DIM),
             )
         var redl = TensorImpl[DT].alloc(N * SM_DELTA_DIM)
@@ -383,7 +392,7 @@ def sm_imagine[
         wm.dyn.vjp["cpu", N](TensorRefs[1, _, DT](xs[t]), gdl, TensorRefs[1, _, DT](gx), None)
         for b in range(N):
             if t > 0:
-                sm_canonical_vjp_lane[DT](_r(o.states, (t * N + b) * _S), _t(gx, b * SM_WM_IN), _r(gprev, b * _S))
+                sm_canonical_vjp_lane[DT, R](_r(o.states.data, (t * N + b) * _S), _t(gx, b * SM_WM_IN), _r(gprev, b * _S))
             for k in range(SM_ACT):
                 ga.data[b * SM_ACT + k] += gx.data[b * SM_WM_IN + SM_FEAT_DIM + k]
         # the policy at step t
@@ -398,7 +407,7 @@ def sm_imagine[
             for hh in range(SM_HIST):
                 var ob = ((t + hh) * N + b) * SM_OBS
                 for k in range(SM_OBS):
-                    gO[ob + k] += gdin.data[b * SM_DEC_IN + SM_LATENT + sm_hist_flat_index(hh, k)] * Scalar[DT](sm_obs_scale(k))
+                    gO[ob + k] += gdin.data[b * SM_DEC_IN + SM_LATENT + sm_hist_flat_index[n](hh, k)] * Scalar[DT](sm_obs_scale[n](k))
         var rez = TensorImpl[DT].alloc(N * SM_LATENT)
         pol.enc.forward["cpu", N](TensorRefs[1, _, DT](encs[t]), rez, None)
         var gein = TensorImpl[DT].alloc(N * SM_GOAL_DIM)

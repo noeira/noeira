@@ -1,23 +1,33 @@
-"""SuperMimic on noeira's G1 — `docs/SUPERMIMIC_PORT_PLAN.md`.
+"""SuperMimic — `docs/SUPERMIMIC_PORT_PLAN.md`.
 
 A world model fit on replay from a simulator that is never differentiated,
 and a policy trained by BPTT through it (H = 32) with ANALYTIC reward and
 observation heads, which run through a differentiable forward kinematics.
 
 Ported from the MIT reproduction in `references/SuperMimic-Reproduced`
-(Copyright (c) 2026 Yuxi Liu), on the BFM-Zero G1 body (plan D-1).
+(Copyright (c) 2026 Yuxi Liu). Generic over the robot (`robot.mojo`:
+`TrackingRobot` + `TrackingSim`; `G1Robot` is noeira's BFM-Zero G1, plan D-1).
 
-M3: `g1_fk` (per-lane FK of every body's pose and world velocity at its
-origin) and `heads` (reward terms, termination features, observation), each
-with its hand-written VJP.
-M4: `state_spec` (canonical features, explicit integration, the training
-error, with VJPs) and `world_model` (dynamics MLP + termination head on
-`nn`, the k-step loss of Eq. 1 and its reverse scan).
-M5: `policy` (goal encoder + decoder, critic, history and root-error inputs)
-and `imagination` (the H-step rollout through the frozen world model and the
-gradient of −J/H into the policy), `trainer` (one `PolicyTrainer.update`:
-the clipped actor step, TD(λ) targets, the critic's 5 × 4 minibatch fit).
-M2: `motion_library` (bins, goal window, reference rows, the return-based
-reset sampler), `replay` (the ring of k-step windows and history starts) and
-`env` (the tracking env on our CPU G1, one simulator per lane).
+Layout (SAC's pattern):
+    config.mojo         SMConfigT: target, robot, widths, shapes; presets
+    agent.mojo          SuperMimicAgent: env + replay + trainer + schedule
+    trainer.mojo        SuperMimicTrainer: networks, tables, the blocks
+    blocks/             ActStep, WorldModelUpdateStep, ActorStep, CriticFitStep
+                        — each `step[target]`, the GPU branches still raise
+    robot.mojo          TrackingRobot / TrackingSim, SMDims, G1Robot / G1Sim
+    tables.mojo         a robot's runtime tables (FK tree, heads, feet)
+    kinematics.mojo     per-lane FK + VJP          ┐ pointer-in / pointer-out,
+    heads.mojo          reward, termination, obs   │ no allocation: the bodies
+    state_spec.mojo     features, integration, err ┘ of the GPU kernels
+    world_model.mojo    dynamics + termination head, Eq. 1's k-step loss
+    policy.mojo         encoder / decoder / critic, history and goal layouts
+    imagination.mojo    the H-step rollout and −J/H's gradient
+    motion_library.mojo the reference library and the reset sampler
+    env.mojo            the tracking env, one `R.SIM` lane per env
+The replay is the shared `deep_agents.data.EpisodicReplay`.
 """
+
+from .config import SMConfigT, SMConfig, SMPaperG1, SMSmokeG1, SMWorldModelOf, SMPolicyOf, SMCriticOf
+from .robot import TrackingRobot, TrackingSim, SMDims, G1Robot, G1Sim
+from .agent import SuperMimicAgent, SMSchedule
+from .trainer import SuperMimicTrainer, SMUpdateMetrics

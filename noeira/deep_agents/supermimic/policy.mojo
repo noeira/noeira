@@ -8,9 +8,9 @@ root-error features).
     a = decoder([tanh(encoder(goal ⊙ gscale)),  hist ⊙ oscale])
     V = critic([canonical(s), goal ⊙ gscale, normalise(ξ), e_root(s, ref)])
 
-    goal (680)  = 10 future frames × [q 29, q̇ 29, grav 3, ω_b 3, v_h 3, h 1],
-                  divided per term by (1, 5, 1, 2, 1, 1)
-    hist (930)  = the last 10 observations, TERM-MAJOR (mjlab's layout):
+    goal (G)    = 10 future frames × [q n, q̇ n, grav 3, ω_b 3, v_h 3, h 1],
+                  divided per term by (1, 5, 1, 2, 1, 1)          (680 on the G1)
+    hist        = the last 10 observations, TERM-MAJOR (mjlab's layout):  (930)
                   [q of obs 0..9, q̇ of obs 0..9, ω 0..9, grav 0..9, a 0..9],
                   divided per term by (1, 5, 2, 1, 1)
     e_root (4)  = [R_yaw(ref)⁻¹ (p − p_ref) (3), wrap(yaw(q) − yaw(q_ref))]
@@ -22,7 +22,8 @@ critic (71 + 680 + 33 + 4) → 256-128 → 1. All SiLU.
 
 from std.math import atan2, floor, pi
 
-from noeira.deep_agents.supermimic.g1_fk import FP, Q4, dot3, qapply_vjp, qconj
+from noeira.deep_agents.supermimic.kinematics import FP, Q4, dot3, qapply_vjp, qconj
+from noeira.deep_agents.supermimic.robot import SMDims, TrackingRobot
 from noeira.deep_agents.supermimic.heads import qapply_inv, yaw_quat, yaw_quat_vjp
 from noeira.nn.combinators.sequential import Sequential
 from noeira.nn.core.initializer import Initializer
@@ -35,37 +36,26 @@ from noeira.nn.primitives.linear_swish import LinearSwish
 from max.gpu.host import DeviceContext
 
 
-comptime SM_GOAL_DIM: Int = 680
-comptime SM_GOAL_FRAME: Int = 68
-comptime SM_LATENT: Int = 32
-comptime SM_HIST: Int = 10
-comptime SM_OBS: Int = 93
-comptime SM_HIST_FLAT: Int = SM_HIST * SM_OBS              # 930
-comptime SM_DEC_IN: Int = SM_LATENT + SM_HIST_FLAT         # 962
-comptime SM_EROOT: Int = 4
-comptime SM_CRITIC_IN: Int = 71 + SM_GOAL_DIM + 33 + SM_EROOT   # 788
-comptime SM_ACT: Int = 29
-
-comptime SMEncoder[H1: Int, H2: Int, H3: Int, H4: Int] = Sequential[
-    LinearSwish[SM_GOAL_DIM, H1], LinearSwish[H1, H2], LinearSwish[H2, H3], LinearSwish[H3, H4],
-    Linear[H4, SM_LATENT], Tanh[SM_LATENT],
+comptime SMEncoder[R: TrackingRobot, H1: Int, H2: Int, H3: Int, H4: Int] = Sequential[
+    LinearSwish[SMDims[R].GOAL, H1], LinearSwish[H1, H2], LinearSwish[H2, H3], LinearSwish[H3, H4],
+    Linear[H4, SMDims[R].LATENT], Tanh[SMDims[R].LATENT],
 ]
-comptime SMDecoder[H1: Int, H2: Int, H3: Int, H4: Int] = Sequential[
-    LinearSwish[SM_DEC_IN, H1], LinearSwish[H1, H2], LinearSwish[H2, H3], LinearSwish[H3, H4],
-    Linear[H4, SM_ACT],
+comptime SMDecoder[R: TrackingRobot, H1: Int, H2: Int, H3: Int, H4: Int] = Sequential[
+    LinearSwish[SMDims[R].DEC_IN, H1], LinearSwish[H1, H2], LinearSwish[H2, H3], LinearSwish[H3, H4],
+    Linear[H4, R.NDOF],
 ]
-comptime SMCritic[C1: Int, C2: Int] = Sequential[
-    LinearSwish[SM_CRITIC_IN, C1], LinearSwish[C1, C2], Linear[C2, 1],
+comptime SMCritic[R: TrackingRobot, C1: Int, C2: Int] = Sequential[
+    LinearSwish[SMDims[R].CRITIC_IN, C1], LinearSwish[C1, C2], Linear[C2, 1],
 ]
 
 
-struct SMPolicy[E1: Int, E2: Int, E3: Int, E4: Int, D1: Int, D2: Int, D3: Int, D4: Int](ParamWalkable):
+struct SMPolicy[R: TrackingRobot, E1: Int, E2: Int, E3: Int, E4: Int, D1: Int, D2: Int, D3: Int, D4: Int](ParamWalkable):
     """The motion encoder and the decoder, walked as one model (the policy's
     clip spans both). Params `encoder.<i>.*`, `decoder.<i>.*`."""
-    var enc: SMEncoder[Self.E1, Self.E2, Self.E3, Self.E4]
-    var dec: SMDecoder[Self.D1, Self.D2, Self.D3, Self.D4]
+    var enc: SMEncoder[Self.R, Self.E1, Self.E2, Self.E3, Self.E4]
+    var dec: SMDecoder[Self.R, Self.D1, Self.D2, Self.D3, Self.D4]
 
-    def __init__(out self, var enc: SMEncoder[Self.E1, Self.E2, Self.E3, Self.E4], var dec: SMDecoder[Self.D1, Self.D2, Self.D3, Self.D4]):
+    def __init__(out self, var enc: SMEncoder[Self.R, Self.E1, Self.E2, Self.E3, Self.E4], var dec: SMDecoder[Self.R, Self.D1, Self.D2, Self.D3, Self.D4]):
         self.enc = enc^
         self.dec = dec^
 
@@ -76,8 +66,8 @@ struct SMPolicy[E1: Int, E2: Int, E3: Int, E4: Int, D1: Int, D2: Int, D3: Int, D
     @staticmethod
     def make[INIT: Initializer]() raises -> Self:
         return Self(
-            SMEncoder[Self.E1, Self.E2, Self.E3, Self.E4].make["cpu", INIT](None),
-            SMDecoder[Self.D1, Self.D2, Self.D3, Self.D4].make["cpu", INIT](None),
+            SMEncoder[Self.R, Self.E1, Self.E2, Self.E3, Self.E4].make["cpu", INIT](None),
+            SMDecoder[Self.R, Self.D1, Self.D2, Self.D3, Self.D4].make["cpu", INIT](None),
         )
 
     def for_each_param[target: StaticString, V: ParamVisitor](
@@ -98,67 +88,69 @@ struct SMPolicy[E1: Int, E2: Int, E3: Int, E4: Int, D1: Int, D2: Int, D3: Int, D
 
 
 @always_inline
-def sm_goal_scale(i: Int) -> Float64:
-    """1 / scale of goal entry `i` (per frame: q 1, q̇ 5, grav 1, ω_b 2, v_h 1, h 1)."""
-    var k = i % SM_GOAL_FRAME
-    if k < 29:
+def sm_goal_scale[n: Int](i: Int) -> Float64:
+    """1 / scale of goal entry `i` (per frame of 2n + 10: q 1, q̇ 5, grav 1,
+    ω_b 2, v_h 1, h 1)."""
+    var k = i % (2 * n + 10)
+    if k < n:
         return 1.0
-    if k < 58:
+    if k < 2 * n:
         return 0.2
-    if k < 61:
+    if k < 2 * n + 3:
         return 1.0
-    if k < 64:
+    if k < 2 * n + 6:
         return 0.5
     return 1.0
 
 
 @always_inline
-def sm_hist_flat_index(h: Int, o: Int) -> Int:
-    """Where entry `o` (0..92) of history slot `h` (0 oldest .. 9) sits in the
-    term-major 930: each term's 10 slots are contiguous, terms in obs order."""
+def sm_hist_flat_index[n: Int](h: Int, o: Int) -> Int:
+    """Where entry `o` (0 .. 3n+5) of history slot `h` (0 oldest .. 9) sits in
+    the term-major flat history: each term's 10 slots are contiguous, terms in
+    obs order (q n, q̇ n, ω 3, grav 3, a n)."""
     var start: Int
     var d: Int
-    if o < 29:
+    if o < n:
         start = 0
-        d = 29
-    elif o < 58:
-        start = 29
-        d = 29
-    elif o < 61:
-        start = 58
+        d = n
+    elif o < 2 * n:
+        start = n
+        d = n
+    elif o < 2 * n + 3:
+        start = 2 * n
         d = 3
-    elif o < 64:
-        start = 61
+    elif o < 2 * n + 6:
+        start = 2 * n + 3
         d = 3
     else:
-        start = 64
-        d = 29
-    return SM_HIST * start + h * d + (o - start)
+        start = 2 * n + 6
+        d = n
+    return 10 * start + h * d + (o - start)
 
 
 @always_inline
-def sm_obs_scale(o: Int) -> Float64:
+def sm_obs_scale[n: Int](o: Int) -> Float64:
     """1 / scale of observation entry `o`: q 1, q̇ 5, ω 2, grav 1, a 1."""
-    if o < 29:
+    if o < n:
         return 1.0
-    if o < 58:
+    if o < 2 * n:
         return 0.2
-    if o < 61:
+    if o < 2 * n + 3:
         return 0.5
     return 1.0
 
 
 @always_inline
-def sm_obs_noise_half(o: Int) -> Float64:
+def sm_obs_noise_half[n: Int](o: Int) -> Float64:
     """Table A.1's uniform noise half-width of observation entry `o`:
     q 0.01, q̇ 0.5, ω 0.2, grav 0.05, a 0."""
-    if o < 29:
+    if o < n:
         return 0.01
-    if o < 58:
+    if o < 2 * n:
         return 0.5
-    if o < 61:
+    if o < 2 * n + 3:
         return 0.2
-    if o < 64:
+    if o < 2 * n + 6:
         return 0.05
     return 0.0
 

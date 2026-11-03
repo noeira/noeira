@@ -1,13 +1,13 @@
 # +--------------------------------------------------------------------------+ #
-# | SuperMimic M3a: differentiable per-lane FK of the G1, with its VJP
+# | SuperMimic: differentiable per-lane FK of a free-root hinge tree, with its VJP
 # +--------------------------------------------------------------------------+ #
 """Every body's world pose and world velocity at its ORIGIN from `(qpos, qvel)`,
 and the vector-Jacobian product back to `(qpos, qvel)`. One lane = one state;
 nothing here allocates, so the same functions become a GPU kernel's body.
 
 The reproduction's `G1Kinematics.forward` (`kinematics/g1_fk.py`), formula for
-formula, on OUR model's tree (`G1FKTree`, read from the engine's model
-records). MuJoCo conventions: `qpos` = root pos, root quat WXYZ (normalised
+formula, on any robot's tree (`SMFKTree`, read from its simulator's model
+records by `sm_fk_tree[R]`). `NB` is the body count without the world. MuJoCo conventions: `qpos` = root pos, root quat WXYZ (normalised
 here, so the VJP carries the normalisation), 29 hinges; `qvel` = root linear
 velocity (world), root angular velocity (BODY frame), 29 hinge rates.
 
@@ -31,25 +31,22 @@ keeps the quaternion unit, which is every direction the FK ever moves one in.
 
 from std.math import cos, sin, sqrt
 
-from noeira.envs.robots import UnitreeG1
+from noeira.deep_agents.supermimic.robot import TrackingRobot, TrackingSim
 from noeira.physics3d.gpu.constants import (
     BODY_IDX_PARENT, BODY_IDX_POS_X, BODY_IDX_POS_Y, BODY_IDX_POS_Z, BODY_IDX_QUAT_W,
     BODY_IDX_QUAT_X, BODY_IDX_QUAT_Y, BODY_IDX_QUAT_Z, JOINT_IDX_AXIS_X, JOINT_IDX_AXIS_Y,
     JOINT_IDX_AXIS_Z, JOINT_IDX_BODY_ID, JOINT_IDX_DOF_ADR, JOINT_IDX_POS_X, JOINT_IDX_POS_Y,
-    JOINT_IDX_POS_Z, JOINT_IDX_QPOS_ADR, JOINT_IDX_TYPE, MODEL_BODY_SIZE, MODEL_JOINT_SIZE,
+    JOINT_IDX_POS_Z, JOINT_IDX_QPOS_ADR, JOINT_IDX_TYPE,
 )
 from noeira.physics3d.joint_types import JNT_FREE, JNT_HINGE
 
 
-comptime G1_FK_NB: Int = 40        # our 41 bodies minus the world
-comptime G1_FK_NQ: Int = 36
-comptime G1_FK_NV: Int = 35
-comptime G1_FK_FIXED: Int = -1     # a body with no joint
+comptime SM_FK_FIXED: Int = -1     # a body with no joint
 
 # One tree record per body (index = MuJoCo body id − 1).
 comptime FK_REC: Int = 18
 comptime FK_PARENT: Int = 0        # parent's record index, −1 for the root
-comptime FK_JTYPE: Int = 1         # JNT_FREE, JNT_HINGE or G1_FK_FIXED
+comptime FK_JTYPE: Int = 1         # JNT_FREE, JNT_HINGE or SM_FK_FIXED
 comptime FK_QADR: Int = 2
 comptime FK_DADR: Int = 3
 comptime FK_POS: Int = 4           # body_pos (3), in the parent frame
@@ -62,8 +59,8 @@ comptime FP[dt: DType] = Pointer[Scalar[dt], MutAnyOrigin]
 comptime Q4[dt: DType] = SIMD[dt, 4]   # quaternion (w, x, y, z) or vector (x, y, z, 0)
 
 
-struct G1FKTree[dt: DType](Movable):
-    """The tree table, `G1_FK_NB × FK_REC` scalars of `dt`."""
+struct SMFKTree[dt: DType](Movable):
+    """The tree table, `NB × FK_REC` scalars of `dt` (body id − 1 per record)."""
     var data: List[Scalar[Self.dt]]
 
     def __init__(out self, var data: List[Scalar[Self.dt]]):
@@ -76,56 +73,54 @@ struct G1FKTree[dt: DType](Movable):
         return self.data.unsafe_ptr().as_unsafe_any_origin()
 
 
-def g1_fk_tree[dt: DType](env: UnitreeG1[DType.float64]) raises -> G1FKTree[dt]:
-    """The FK table from the engine's model records (what MuJoCo calls
+def sm_fk_tree[dt: DType, R: TrackingRobot](sim: R.SIM) raises -> SMFKTree[dt]:
+    """The FK table from the simulator's model records (what MuJoCo calls
     `body_parentid`, `body_pos`, `body_quat`, `jnt_*`). Refuses a body with
-    more than one joint or a joint type other than free / hinge."""
-    comptime E = UnitreeG1[DType.float64]
-    comptime assert E.NBODY - 1 == G1_FK_NB, "G1_FK_NB is our G1's body count minus the world"
-    var t = List[Scalar[dt]](length=G1_FK_NB * FK_REC, fill=Scalar[dt](0))
-    var njnt = List[Int](length=G1_FK_NB, fill=0)
-    for b in range(1, E.NBODY):
-        var o = b * MODEL_BODY_SIZE
+    more than one joint, a joint other than free / hinge, or a root that is
+    not the free joint."""
+    comptime NB = R.NBODY
+    var t = List[Scalar[dt]](length=NB * FK_REC, fill=Scalar[dt](0))
+    var njnt = List[Int](length=NB, fill=0)
+    for b in range(1, NB + 1):
         var r = (b - 1) * FK_REC
-        var parent = Int(env.mf.bodies.data[o + BODY_IDX_PARENT])
+        var parent = Int(sim.body_field(b, BODY_IDX_PARENT))
         if parent >= b:
-            raise Error("g1_fk_tree: body " + String(b) + " precedes its parent " + String(parent))
+            raise Error("sm_fk_tree: body " + String(b) + " precedes its parent " + String(parent))
         t[r + FK_PARENT] = Scalar[dt](parent - 1)
-        t[r + FK_JTYPE] = Scalar[dt](G1_FK_FIXED)
-        t[r + FK_POS + 0] = Scalar[dt](env.mf.bodies.data[o + BODY_IDX_POS_X])
-        t[r + FK_POS + 1] = Scalar[dt](env.mf.bodies.data[o + BODY_IDX_POS_Y])
-        t[r + FK_POS + 2] = Scalar[dt](env.mf.bodies.data[o + BODY_IDX_POS_Z])
-        t[r + FK_QUAT + 0] = Scalar[dt](env.mf.bodies.data[o + BODY_IDX_QUAT_W])
-        t[r + FK_QUAT + 1] = Scalar[dt](env.mf.bodies.data[o + BODY_IDX_QUAT_X])
-        t[r + FK_QUAT + 2] = Scalar[dt](env.mf.bodies.data[o + BODY_IDX_QUAT_Y])
-        t[r + FK_QUAT + 3] = Scalar[dt](env.mf.bodies.data[o + BODY_IDX_QUAT_Z])
-    for j in range(E.NJOINT):
-        var o = j * MODEL_JOINT_SIZE
-        var b = Int(env.mf.joints.data[o + JOINT_IDX_BODY_ID])
-        var jt = Int(env.mf.joints.data[o + JOINT_IDX_TYPE])
+        t[r + FK_JTYPE] = Scalar[dt](SM_FK_FIXED)
+        t[r + FK_POS + 0] = Scalar[dt](sim.body_field(b, BODY_IDX_POS_X))
+        t[r + FK_POS + 1] = Scalar[dt](sim.body_field(b, BODY_IDX_POS_Y))
+        t[r + FK_POS + 2] = Scalar[dt](sim.body_field(b, BODY_IDX_POS_Z))
+        t[r + FK_QUAT + 0] = Scalar[dt](sim.body_field(b, BODY_IDX_QUAT_W))
+        t[r + FK_QUAT + 1] = Scalar[dt](sim.body_field(b, BODY_IDX_QUAT_X))
+        t[r + FK_QUAT + 2] = Scalar[dt](sim.body_field(b, BODY_IDX_QUAT_Y))
+        t[r + FK_QUAT + 3] = Scalar[dt](sim.body_field(b, BODY_IDX_QUAT_Z))
+    for j in range(R.NJOINT):
+        var b = Int(sim.joint_field(j, JOINT_IDX_BODY_ID))
+        var jt = Int(sim.joint_field(j, JOINT_IDX_TYPE))
         if jt != JNT_FREE and jt != JNT_HINGE:
-            raise Error("g1_fk_tree: joint " + String(j) + " is neither free nor hinge")
+            raise Error("sm_fk_tree: joint " + String(j) + " is neither free nor hinge")
         if b < 1:
-            raise Error("g1_fk_tree: joint " + String(j) + " on the world")
+            raise Error("sm_fk_tree: joint " + String(j) + " on the world")
         njnt[b - 1] += 1
         var r = (b - 1) * FK_REC
         t[r + FK_JTYPE] = Scalar[dt](jt)
-        t[r + FK_QADR] = Scalar[dt](env.mf.joints.data[o + JOINT_IDX_QPOS_ADR])
-        t[r + FK_DADR] = Scalar[dt](env.mf.joints.data[o + JOINT_IDX_DOF_ADR])
-        t[r + FK_JPOS + 0] = Scalar[dt](env.mf.joints.data[o + JOINT_IDX_POS_X])
-        t[r + FK_JPOS + 1] = Scalar[dt](env.mf.joints.data[o + JOINT_IDX_POS_Y])
-        t[r + FK_JPOS + 2] = Scalar[dt](env.mf.joints.data[o + JOINT_IDX_POS_Z])
-        t[r + FK_JAXIS + 0] = Scalar[dt](env.mf.joints.data[o + JOINT_IDX_AXIS_X])
-        t[r + FK_JAXIS + 1] = Scalar[dt](env.mf.joints.data[o + JOINT_IDX_AXIS_Y])
-        t[r + FK_JAXIS + 2] = Scalar[dt](env.mf.joints.data[o + JOINT_IDX_AXIS_Z])
-        # qpos0 is a hinge's `ref`; our asset sets none, so 0 (the gate against
-        # MuJoCo's own FK would show a non-zero one).
-    for i in range(G1_FK_NB):
+        t[r + FK_QADR] = Scalar[dt](sim.joint_field(j, JOINT_IDX_QPOS_ADR))
+        t[r + FK_DADR] = Scalar[dt](sim.joint_field(j, JOINT_IDX_DOF_ADR))
+        t[r + FK_JPOS + 0] = Scalar[dt](sim.joint_field(j, JOINT_IDX_POS_X))
+        t[r + FK_JPOS + 1] = Scalar[dt](sim.joint_field(j, JOINT_IDX_POS_Y))
+        t[r + FK_JPOS + 2] = Scalar[dt](sim.joint_field(j, JOINT_IDX_POS_Z))
+        t[r + FK_JAXIS + 0] = Scalar[dt](sim.joint_field(j, JOINT_IDX_AXIS_X))
+        t[r + FK_JAXIS + 1] = Scalar[dt](sim.joint_field(j, JOINT_IDX_AXIS_Y))
+        t[r + FK_JAXIS + 2] = Scalar[dt](sim.joint_field(j, JOINT_IDX_AXIS_Z))
+        # qpos0 is a hinge's `ref`; 0 unless the asset sets one (the FK gate
+        # against MuJoCo would show it)
+    for i in range(NB):
         if njnt[i] > 1:
-            raise Error("g1_fk_tree: body " + String(i + 1) + " has " + String(njnt[i]) + " joints")
+            raise Error("sm_fk_tree: body " + String(i + 1) + " has " + String(njnt[i]) + " joints")
     if Int(t[FK_JTYPE]) != JNT_FREE or Int(t[FK_PARENT]) != -1:
-        raise Error("g1_fk_tree: body 1 must be the free-joint root")
-    return G1FKTree[dt](t^)
+        raise Error("sm_fk_tree: body 1 must be the free-joint root")
+    return SMFKTree[dt](t^)
 
 
 # ── small quaternion / vector algebra on SIMD[dt, 4] ────────────────────────
@@ -229,10 +224,10 @@ def qapply_vjp[dt: DType](q: Q4[dt], v: Q4[dt], g: Q4[dt]) -> Tuple[Q4[dt], Q4[d
 
 
 # ── forward ─────────────────────────────────────────────────────────────────
-def g1_fk_lane[dt: DType](
+def sm_fk_lane[dt: DType, NB: Int](
     tree: FP[dt], qpos: FP[dt], qvel: FP[dt], pos: FP[dt], quat: FP[dt], lin: FP[dt], ang: FP[dt]
 ) where dt.is_floating_point():
-    """One state's FK: `pos`/`lin`/`ang` `G1_FK_NB × 3`, `quat` `G1_FK_NB × 4`
+    """One state's FK: `pos`/`lin`/`ang` `NB × 3`, `quat` `NB × 4`
     (WXYZ), world frame, at each body's origin."""
     var q = _q4(qpos, 3)
     var nrm = sqrt(q[0] * q[0] + q[1] * q[1] + q[2] * q[2] + q[3] * q[3])
@@ -241,7 +236,7 @@ def g1_fk_lane[dt: DType](
     _put4(quat, 0, q)
     _put3(lin, 0, _v3(qvel, 0))
     _put3(ang, 0, qapply(q, _v3(qvel, 3)))
-    for i in range(1, G1_FK_NB):
+    for i in range(1, NB):
         var r = i * FK_REC
         var p = _ix(tree, r + FK_PARENT)
         var pp = _v3(pos, p * 3)
@@ -273,13 +268,13 @@ def g1_fk_lane[dt: DType](
 
 
 # ── VJP ─────────────────────────────────────────────────────────────────────
-def g1_fk_vjp_lane[dt: DType](
+def sm_fk_vjp_lane[dt: DType, NB: Int, NQ: Int, NV: Int](
     tree: FP[dt], qpos: FP[dt], qvel: FP[dt],
     pos: FP[dt], quat: FP[dt], ang: FP[dt],
     gpos: FP[dt], gquat: FP[dt], glin: FP[dt], gang: FP[dt],
     gqpos: FP[dt], gqvel: FP[dt],
 ) where dt.is_floating_point():
-    """`gqpos` (36) and `gqvel` (35) ← the VJP of `g1_fk_lane` at `(qpos, qvel)`
+    """`gqpos` (NQ) and `gqvel` (NV) ← the VJP of `sm_fk_lane` at `(qpos, qvel)`
     against the cotangents `gpos`, `gquat`, `glin`, `gang` (same layouts as the
     outputs). `pos`, `quat`, `ang` are that call's outputs.
 
@@ -288,11 +283,11 @@ def g1_fk_vjp_lane[dt: DType](
     cotangent plus everything its subtree sends up). Pass copies if the
     caller needs them. `gqpos` / `gqvel` are written, not added to.
     """
-    for k in range(G1_FK_NQ):
+    for k in range(NQ):
         gqpos[unsafe_offset=k] = 0
-    for k in range(G1_FK_NV):
+    for k in range(NV):
         gqvel[unsafe_offset=k] = 0
-    var i = G1_FK_NB - 1
+    var i = NB - 1
     while i >= 1:
         var r = i * FK_REC
         var p = _ix(tree, r + FK_PARENT)
