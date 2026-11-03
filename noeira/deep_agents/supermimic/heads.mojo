@@ -199,6 +199,22 @@ def qapply_inv_vjp_q[dt: DType](q: Q4[dt], v: Q4[dt], g: Q4[dt]) -> Q4[dt]:
 
 
 @always_inline
+def sm_term_features[dt: DType](s: FP[dt], rf_root_z: Scalar[dt], rf_root_q: Q4[dt]) -> SIMD[dt, 2]:
+    """`AnalyticHeads.termination_features`: [ref root z − z, (R_ref⁻¹ g)_z −
+    (R⁻¹ g)_z], g = (0, 0, −1), R from the state's RAW root quaternion. The
+    paper terminates at |height| > 0.25 m or |tilt| > 0.8."""
+    var grav = Q4[dt](0, 0, -1, 0)
+    return SIMD[dt, 2](rf_root_z - _at(s, 2), qapply_inv(rf_root_q, grav)[2] - qapply_inv(_q4(s, 3), grav)[2])
+
+
+@always_inline
+def sm_term_features_vjp[dt: DType](s: FP[dt], g0: Scalar[dt], g1: Scalar[dt], g_s: FP[dt]):
+    """`g_s += ∂/∂s <(g0, g1), sm_term_features(s, ·)>` (ADDS)."""
+    g_s[unsafe_offset=2] -= g0
+    _add4(g_s, 3, qapply_inv_vjp_q(_q4(s, 3), Q4[dt](0, 0, -1, 0), Q4[dt](0, 0, -g1, 0)))
+
+
+@always_inline
 def sq_quat_err[dt: DType](d: Q4[dt]) -> Scalar[dt] where dt.is_floating_point():
     """|axis_angle_from_quat(d)|² (mjlab), d = q1 ⊗ q̄2."""
     var s = Scalar[dt](-1) if d[0] < 0 else Scalar[dt](1)
@@ -340,8 +356,9 @@ def g1_heads_lane[dt: DType](
     var grav = Q4[dt](0, 0, -1, 0)
     var sq = _q4(s, 3)
     var rr = SM_N_TRACKED * SM_REF_BODY
-    feat[unsafe_offset=0] = _at(rf, rr + 2) - _at(s, 2)
-    feat[unsafe_offset=1] = qapply_inv(_q4(rf, rr + 3), grav)[2] - qapply_inv(sq, grav)[2]
+    var tf = sm_term_features(s, _at(rf, rr + 2), _q4(rf, rr + 3))
+    feat[unsafe_offset=0] = tf[0]
+    feat[unsafe_offset=1] = tf[1]
 
     # observation
     for j in range(SM_N_DOF):
@@ -474,8 +491,8 @@ def g1_heads_vjp_lane[dt: DType](
     # ── termination features and observation: the raw root quaternion ──
     var grav = Q4[dt](0, 0, -1, 0)
     var sq = _q4(s, 3)
-    g_s[unsafe_offset=2] -= g_feat[unsafe_offset=0]
-    var g_pg = Q4[dt](g_obs[unsafe_offset=61], g_obs[unsafe_offset=62], g_obs[unsafe_offset=63] - g_feat[unsafe_offset=1], 0)
+    sm_term_features_vjp(s, g_feat[unsafe_offset=0], g_feat[unsafe_offset=1], g_s)
+    var g_pg = Q4[dt](g_obs[unsafe_offset=61], g_obs[unsafe_offset=62], g_obs[unsafe_offset=63], 0)
     _add4(g_s, 3, qapply_inv_vjp_q(sq, grav, g_pg))
     for j in range(SM_N_DOF):
         g_s[unsafe_offset=7 + j] += g_obs[unsafe_offset=j]

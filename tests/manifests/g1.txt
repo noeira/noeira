@@ -104,3 +104,8 @@ tests/data/test_bones_seed.mojo /tmp/seed_synth
 #       --with numpy python tools/supermimic/heads_oracle.py --out /tmp/sm_heads
 tests/deep_agents/supermimic/test_supermimic_fk.mojo /tmp/sm_heads
 tests/deep_agents/supermimic/test_supermimic_heads.mojo /tmp/sm_heads
+# SuperMimic M4: the world model's state spec (features, integration, error)
+# and its k = 8 loss + gradient on our nn, against the reproduction's torch:
+#   uv run --no-project --python 3.12 --with torch --with mujoco==3.12.0 \
+#       --with numpy python tools/supermimic/wm_oracle.py --out /tmp/sm_wm
+tests/deep_agents/supermimic/test_supermimic_wm.mojo /tmp/sm_wm
