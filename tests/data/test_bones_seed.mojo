@@ -27,6 +27,18 @@ WHAT EACH SECTION CAN CATCH
     shaped as substring traps plus every clip name of the dump.
 [5] the BFM-Zero path runs: `convert_seed_clip` on one clip, the store's row
     count, and its first root pose equal to the clip's (float32).
+[6] the feasibility filter on OUR G1. First each threshold's edge on rows
+    and heights built here (29 vs 30 frames elevated, 80 % vs 81 % below
+    −0.08, 24 vs 25 frames floating, a joint speed that opens the "still"
+    gate). Then every clip of the dump against the reproduction's
+    `feasibility_filter` run on our MjModel: per-frame lowest link origin and
+    sole height (1e-12 m: FK of nearly equal poses) and the verdict, exactly.
+    The fixtures must reach all four verdicts, and each of the upright,
+    standing, still and duration gates is shown stopping one.
+[7] `import_seed_clips` over every CSV of the dump, refused one included:
+    the manifest's verdicts are the name filter's, else the feasibility
+    oracle's; the store holds exactly the kept clips, in order, named in the
+    task table, their rows the float32 of `resample_mjlab`.
 """
 
 from std.math import ceil, sqrt
@@ -38,7 +50,15 @@ from noeira.data.bones_seed import (
     SEED_RAW_DIM, SEED_REF_DIM, euler_xyz_deg_to_quat_wxyz, load_seed_csv,
     parse_seed_csv, resample_mjlab, seed_name_filter,
 )
+from noeira.data.bones_seed import MimicMotion
+from noeira.data.bones_seed_filter import (
+    SeedBodyHeights, feasibility_reason, longest_run, seed_body_heights,
+)
+from noeira.data.bones_seed_import import (
+    SEED_MOTION_ID_COLUMN, SEED_REF_COLUMN, import_seed_clips,
+)
 from noeira.data.bones_seed_store import convert_seed_clip
+from noeira.data.store import TrajectoryStore
 from noeira.envs.robots import UnitreeG1
 from noeira.envs.robots.unitree_g1_pd import G1_N_DOF, g1_dof_name
 from noeira.io.fileio import read_file_bytes
@@ -109,6 +129,30 @@ def _lines(path: String) raises -> List[String]:
         if String(l).strip().byte_length() > 0:
             out.append(String(l))
     return out^
+
+
+def _mask(n: Int, lo: Int, hi: Int) -> List[Bool]:
+    var m = List[Bool](length=n, fill=False)
+    for i in range(lo, hi):
+        m[i] = True
+    return m^
+
+
+def _fill(mut v: List[Float64], lo: Int, hi: Int, x: Float64):
+    for i in range(lo, hi):
+        v[i] = x
+
+
+def _still_motion(n: Int, qd: Float64 = 0.0) -> MimicMotion:
+    """`n` 50 Hz rows standing still: pelvis at 0.79 m, upright, every joint
+    speed `qd`."""
+    var fr = List[Float64](length=n * SEED_REF_DIM, fill=0.0)
+    for i in range(n):
+        fr[i * SEED_REF_DIM + 2] = 0.79
+        fr[i * SEED_REF_DIM + 3] = 1.0
+        for j in range(G1_N_DOF):
+            fr[i * SEED_REF_DIM + 42 + j] = qd
+    return MimicMotion(50.0, n, fr^)
 
 
 def main() raises:
@@ -255,6 +299,134 @@ def main() raises:
             "row 0's root rotation is frame 0's up to sign (|<q/|q|,q'>| = " + String(abs(d) / nq)
             + ", |q| = " + String(nq) + ")",
         )
+
+    # ── [6] the feasibility filter on our G1 ────────────────────────────────
+    print("\n[6] the feasibility filter: threshold edges by construction")
+    t.truth(longest_run(_mask(10, 3, 7)) == 4 and longest_run(_mask(5, 0, 0)) == 0 and longest_run(_mask(5, 0, 5)) == 5, "longest_run")
+    var still = _still_motion(100)
+    var h = SeedBodyHeights(100)
+    t.truth(feasibility_reason(still, h) == "", "standing still on the floor: kept")
+    _fill(h.zmin, 0, 29, 0.25)
+    t.truth(feasibility_reason(still, h) == "", "zmin > 0.20 for 29 frames (0.58 s): kept")
+    _fill(h.zmin, 0, 30, 0.25)
+    t.truth(feasibility_reason(still, h) == "elevated_support", "for 30 frames (0.6 s): elevated_support")
+    h = SeedBodyHeights(100)
+    _fill(h.zmin, 0, 80, -0.09)
+    t.truth(feasibility_reason(still, h) == "", "zmin < -0.08 on 80 % of frames: kept (needs MORE than 80 %)")
+    _fill(h.zmin, 0, 81, -0.09)
+    t.truth(feasibility_reason(still, h) == "ground_penetration", "on 81 %: ground_penetration")
+    h = SeedBodyHeights(100)
+    h.zmin[50] = -0.1201
+    t.truth(feasibility_reason(still, h) == "ground_penetration", "one frame below -0.12: ground_penetration")
+    h = SeedBodyHeights(100)
+    _fill(h.foot_z, 10, 34, 0.03)
+    t.truth(feasibility_reason(still, h) == "", "soles at 0.03 m for 24 frames (0.48 s): kept")
+    _fill(h.foot_z, 10, 35, 0.03)
+    t.truth(feasibility_reason(still, h) == "floating_feet", "for 25 frames (0.5 s): floating_feet")
+    var spin = _still_motion(100, qd=0.51)
+    t.truth(feasibility_reason(spin, h) == "", "the same, joint speed RMS 0.51 rad/s (not still): kept")
+
+    print("\n[6] the feasibility filter on our G1 against `feasibility_filter`")
+    var feas = _lines(dump + "/feasibility.tsv")
+    var path_of = Dict[String, String]()
+    for li in range(len(clips)):
+        var f = clips[li].split("\t")
+        path_of[String(f[0])] = String(f[2])
+    var env6 = UnitreeG1[DType.float64]()
+    _ = env6.reset()
+    var seen = Dict[String, Int]()
+    var worst_h = 0.0
+    var n_feas = 0
+    for li in range(len(feas)):
+        var f = feas[li].split("\t")
+        var stem = String(f[0])
+        var want = String(f[1]) if len(f) > 1 else String("")
+        var m = resample_mjlab(load_seed_csv(path_of[stem], stem))
+        var hh = seed_body_heights(m, env6)
+        var oh = load_npy_2d_f64(dump + "/ref/" + stem + ".feas.npy", 2)
+        var e = 0.0
+        if oh.rows == m.n:
+            for i in range(m.n):
+                e = max(e, max(abs(hh.zmin[i] - oh.values[i * 2]), abs(hh.foot_z[i] - oh.values[i * 2 + 1])))
+        else:
+            e = 1.0
+        worst_h = max(worst_h, e)
+        var got = feasibility_reason(m, hh)
+        t.truth(
+            e <= 1e-12 and got == want,
+            stem + ": '" + got + "' (oracle '" + want + "'), heights max err " + String(e),
+        )
+        seen[want] = seen.get(want, 0) + 1
+        n_feas += 1
+    t.truth(
+        "" in seen and "elevated_support" in seen and "ground_penetration" in seen and "floating_feet" in seen,
+        String(n_feas) + " clips reach all four verdicts (worst height err " + String(worst_h) + " m)",
+    )
+
+    # ── [7] the import: store + manifest ────────────────────────────────────
+    print("\n[7] import_seed_clips over the whole dump, read back")
+    var want_reason = Dict[String, String]()
+    for li in range(len(names)):
+        var f = names[li].split("\t")
+        var r = String(f[1]) if len(f) > 1 else String("")
+        if r.byte_length() > 0:
+            want_reason[String(f[0])] = r
+    for li in range(len(feas)):
+        var f = feas[li].split("\t")
+        var stem = String(f[0])
+        if stem not in want_reason:
+            want_reason[stem] = String(f[1]) if len(f) > 1 else String("")
+    var all_paths = List[String]()
+    for li in range(len(clips)):
+        var f = clips[li].split("\t")
+        all_paths.append(String(f[2]))
+        if String(f[1]) == "refused":
+            want_reason[String(f[0])] = "refused"
+    var lib = dump + "/lib.h5"
+    var man_path = dump + "/lib.manifest.csv"
+    var summ = import_seed_clips(all_paths, lib, man_path, verbose=False)
+    var man = _lines(man_path)
+    t.truth(man[0] == "name,frames,keep,reason" and len(man) == len(all_paths) + 1, "manifest: the reproduction's header, one row per input")
+    var bad = 0
+    var kept_names = List[String]()
+    var n_name_drop = 0
+    for li in range(1, len(man)):
+        var f = man[li].split(",")
+        var nm = String(f[0])
+        var r = String(f[3]) if len(f) > 3 else String("")
+        var keep = String(f[2]) == "1"
+        if nm not in want_reason or want_reason[nm] != r or keep != (r.byte_length() == 0):
+            bad += 1
+            print("    manifest mismatch:", man[li])
+        if keep:
+            kept_names.append(nm)
+        if r.startswith("name:"):
+            n_name_drop += 1
+    t.truth(bad == 0, String(len(man) - 1) + " verdicts = name filter, then feasibility (refused for the reader's refusals)")
+    t.truth(n_name_drop > 0 and summ.refused > 0, "the dump exercises a name drop and a refusal")
+    var st = TrajectoryStore(lib)
+    t.truth(st.n_episodes() == summ.kept and summ.kept == len(kept_names), String(st.n_episodes()) + " episodes = kept clips")
+    var refc = st.load_column[DType.float32](String(SEED_REF_COLUMN))
+    var mid = st.load_column[DType.int32](String(SEED_MOTION_ID_COLUMN))
+    var row_bad = 0
+    var name_bad = 0
+    for e in range(st.n_episodes()):
+        var nm = st.manifest.task_text(e)
+        if nm != kept_names[e]:
+            name_bad += 1
+        var m = resample_mjlab(load_seed_csv(path_of[nm], nm))
+        var off = Int(st.episodes.ep_offset[e])
+        if Int(st.episodes.ep_len[e]) != m.n:
+            row_bad += 1
+            continue
+        for i in range(m.n):
+            if Int(mid[off + i]) != e:
+                row_bad += 1
+            for k in range(SEED_REF_DIM):
+                if refc[(off + i) * SEED_REF_DIM + k] != Float32(m.frames[i * SEED_REF_DIM + k]):
+                    row_bad += 1
+    t.truth(name_bad == 0, "episode e's task text is the e-th kept clip's name")
+    t.truth(row_bad == 0, String(st.n_rows()) + " rows = float32 of resample_mjlab, motion_id = episode")
 
     print("\n===", t.checks - t.fails, "/", t.checks, "passed ===")
     if t.fails != 0:

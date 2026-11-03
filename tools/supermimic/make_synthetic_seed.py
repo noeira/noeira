@@ -49,6 +49,17 @@ Every fixture is shaped to break one thing if it is wrong:
   * `extra_column`: an unknown column between the root and the joints; the
     reader must select by NAME.
   * `permuted_joints`: two joint columns swapped; both sides must REFUSE it.
+  * `feas_*`: straight-legged clips on our G1, one per verdict of the
+    feasibility filter (elevated, hard and soft penetration, floating feet)
+    and one per gate that must stop a verdict (too short, moving, tilted
+    30 deg, pelvis above 0.85 m, 70 % below -0.08 m).
+
+THE FEASIBILITY ORACLE is the reproduction's `feasibility_filter` and
+`_foot_sole_height` verbatim, run on OUR MjModel
+(`noeira/envs/robots/assets/unitree_g1.xml`): their `forward_kinematics` on
+the resampled clip, restricted to the 30 skeleton bodies, and our 8 foot
+spheres preset in place of mjlab's 14 capsules. It writes `feasibility.tsv`
+and `<stem>.feas.npy` (lowest link origin, sole height per frame).
 """
 
 from __future__ import annotations
@@ -136,6 +147,44 @@ def fixtures(rng: np.random.Generator) -> dict[str, dict]:
     eul = np.stack([2 * np.sin(t), 1 + 0 * t, -170 + 60 * t], 1)
     out["extra_column_001__A108"] = dict(pos_cm=pos, eul_deg=eul, joints_deg=_joint_traj(t, rng, 25), extra=True)
     out["permuted_joints_001__A109"] = dict(pos_cm=pos, eul_deg=eul, joints_deg=_joint_traj(t, rng, 25), permute=True)
+    out.update(feasibility_fixtures())
+    return out
+
+
+# Our G1 in its zero pose with the pelvis at 0.793 m has its soles at 1.1 mm
+# and its lowest link origin (an ankle roll link) at 0.036 m (measured).
+STAND_Z_CM = 79.3
+
+
+def feasibility_fixtures() -> dict[str, dict]:
+    """Straight-legged clips, one per verdict of `feasibility_filter` and one
+    per gate that must STOP a verdict. `dz_cm(t)` offsets the pelvis height."""
+    out: dict[str, dict] = {}
+
+    def still(name, n, dz_cm, roll_deg=0.0, vx_cm_s=0.0):
+        t = np.arange(n) / FPS
+        dz = np.array([dz_cm(x) for x in t])
+        pos = np.stack([vx_cm_s * t, 0 * t, STAND_Z_CM + dz], 1)
+        eul = np.stack([roll_deg + 0 * t, 0 * t, 15 + 0 * t], 1)
+        out[name] = dict(pos_cm=pos, eul_deg=eul, joints_deg=np.zeros((n, 29)))
+
+    def box(t0, t1, h):
+        return lambda x: h if t0 <= x < t1 else 0.0
+
+    still("feas_stand_001__F001", 240, lambda x: 0.0)                       # keep
+    still("feas_float_001__F002", 240, lambda x: 5.0)                       # floating_feet
+    still("feas_float_short_001__F003", 240, box(0.8, 1.2, 5.0))            # 0.4 s < 0.5 s: keep
+    still("feas_float_long_001__F004", 240, box(0.6, 1.4, 5.0))             # 0.8 s: floating_feet
+    still("feas_float_moving_001__F005", 240, lambda x: 5.0, vx_cm_s=30.0)  # not still: keep
+    still("feas_float_tilt30_001__F006", 240, lambda x: 5.0, roll_deg=30.0)  # not upright: keep
+    still("feas_float_tilt15_001__F007", 240, lambda x: 5.0, roll_deg=15.0)  # upright: floating_feet
+    still("feas_float_high_001__F008", 240, lambda x: 8.0)                  # pelvis 0.873: not standing: keep
+    still("feas_elevated_001__F009", 240, box(0.5, 1.5, 25.0))              # elevated_support
+    still("feas_elevated_short_001__F010", 240, box(0.8, 1.3, 25.0))        # 0.5 s < 0.6 s
+    still("feas_pen_hard_001__F011", 240, box(1.0, 1.2, -17.0))             # one dip < -0.12
+    still("feas_pen_soft_001__F012", 240, lambda x: -13.0)                  # < -0.08 everywhere
+    still("feas_pen_soft70_001__F013", 240, box(0.0, 1.4, -13.0))           # 70 % < -0.08: keep
+    still("sit_on_chair_001__F014", 240, lambda x: 0.0)                     # feasible, but the NAME drops it
     return out
 
 
@@ -197,6 +246,60 @@ def dump_clip(mc, csv_path: Path, out_dir: Path, stem: str) -> str:
     return "ok"
 
 
+G1_XML = REPO / "noeira" / "envs" / "robots" / "assets" / "unitree_g1.xml"
+
+
+def our_g1(fb):
+    """Our G1's MjModel, its 30 skeleton bodies (mjlab's names: no world, no
+    `dummy_*` foot frame, no `*_rubber_hand`) and its 8 foot spheres, preset
+    into the reproduction's filter module in place of mjlab's model and
+    its 14 capsules (its `_foot_sole_height` asserts those only when it
+    loads the model itself)."""
+    import mujoco
+
+    m = mujoco.MjModel.from_xml_path(str(G1_XML))
+    names = [mujoco.mj_id2name(m, mujoco.mjtObj.mjOBJ_BODY, b) for b in range(m.nbody)]
+    skel = [b for b in range(1, m.nbody) if not names[b].startswith("dummy_") and not names[b].endswith("_rubber_hand")]
+    assert len(skel) == 30, len(skel)
+    ankles = {names.index("left_ankle_roll_link"), names.index("right_ankle_roll_link")}
+    feet = [
+        g for g in range(m.ngeom)
+        if m.geom_type[g] == mujoco.mjtGeom.mjGEOM_SPHERE and (m.geom_contype[g] or m.geom_conaffinity[g])
+    ]
+    assert len(feet) == 8 and all(m.geom_bodyid[g] in ankles or m.body_parentid[m.geom_bodyid[g]] in ankles for g in feet)
+    assert (m.geom_size[feet, 1] == 0).all()  # a sphere: the capsule formula's half-length term vanishes
+    fb._MODEL = m
+    fb._FOOT_GEOMS = feet
+    return m, skel
+
+
+def dump_feasibility(mc, fb, model, skel, csv_path: Path, out_dir: Path, stem: str) -> str:
+    """The reproduction's `feasibility_filter` on our body: its `forward_kinematics`
+    on the resampled clip, the npz it reads (float64 here, see
+    `data/bones_seed_filter.mojo`), restricted to the 30 skeleton bodies.
+    Writes `<stem>.feas.npy` [n_out, 2] = (zmin, foot sole z); returns the reason."""
+    raw = load_csv_oracle(csv_path, mc.G1_JOINT_NAMES)
+    m = mc.resample_motion(raw, FPS, 50.0)
+    bodies = mc.forward_kinematics(model, m)
+    k = [b - 1 for b in skel]  # BodyStates drops the world
+    npz = out_dir / f"{stem}.bodies.npz"
+    np.savez(
+        npz,
+        body_names=np.array([bodies.body_names[i] for i in k]),
+        body_pos_w=bodies.pos_w[:, k],
+        body_quat_w=bodies.quat_w[:, k],
+        body_lin_vel_w=bodies.lin_vel_w[:, k],
+        joint_pos=m.joint_pos,
+        joint_vel=m.joint_vel,
+    )
+    reason = fb.feasibility_filter(str(npz)) or ""
+    zmin = bodies.pos_w[:, k, 2].min(1)
+    foot = fb._foot_sole_height(str(npz), np.ones(m.num_frames, dtype=bool))
+    npz.unlink()
+    np.save(out_dir / f"{stem}.feas.npy", np.stack([zmin, foot], 1))
+    return reason
+
+
 NAME_PROBES = [
     # keep
     "walk_forward_R_001__A001", "jog_turn_left_002__A010_M", "deposit_object_001__A002",
@@ -228,11 +331,18 @@ def main() -> None:
         src = csv_dir
     else:
         src = a.real_dir
+    model, skel = our_g1(fb)
     lines = []
+    feas = []
     for p in sorted(src.glob("*.csv")):
         status = dump_clip(mc, p, ref_dir, p.stem)
         lines.append(f"{p.stem}\t{status}\t{p.resolve()}")
+        if status == "ok":
+            feas.append(f"{p.stem}\t{dump_feasibility(mc, fb, model, skel, p, ref_dir, p.stem)}")
     (a.out / "clips.tsv").write_text("\n".join(lines) + "\n")
+    (a.out / "feasibility.tsv").write_text("\n".join(feas) + "\n")
+    for l in feas:
+        print("  feasibility", l.replace("\t", ": ") or "keep")
 
     names = NAME_PROBES + [p.stem for p in sorted(src.glob("*.csv"))]
     rows = [f"{n}\t{fb.name_filter(n) or ''}" for n in names]
