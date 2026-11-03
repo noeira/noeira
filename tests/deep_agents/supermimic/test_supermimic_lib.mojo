@@ -1,0 +1,172 @@
+"""SuperMimic M2: the motion library and the return-based reset sampler.
+
+    uv run --no-project --python 3.12 --with torch --with mujoco==3.12.0 --with numpy \\
+        python tools/supermimic/lib_oracle.py --out /tmp/sm_lib
+    pixi run mojo run -I . tests/deep_agents/supermimic/test_supermimic_lib.mojo /tmp/sm_lib
+
+The oracle is the reproduction's compact `MotionLibrary` and its
+`MultiClipMotionCommand._sample_frames` / `_finalize_episodes`, verbatim, on a
+synthetic packed library of four clips (73 / 120 / 50 / 31 frames).
+
+WHAT EACH SECTION CAN CATCH
+===========================
+[1] the bins (start, end, clip; short last bins), `last_frame_of` and
+    `bin_of_frame` on every frame: exact.
+[2] the 680-d goal window on every frame, clamped at each clip's end
+    (the last 9 frames of every clip exercise the clamp): 1e-6 of scale.
+[3] the heads' reference row (189) on every frame: the tracked bodies by OUR
+    FK of the reference state against the reproduction's FK on our model.
+[4] the sampler's bin distribution and its memory update (1e-6), and the
+    frames it picks for injected (bin, u) draws: exact.
+[5] `_finalize_episodes` on six episodes — terminated, clip-ended and
+    truncated (the last 100 steps dropped) — into the bin returns: 1e-5.
+"""
+
+from std.sys import argv
+
+from noeira.deep_agents.supermimic.g1_fk import g1_fk_tree
+from noeira.deep_agents.supermimic.heads import SM_REF_DIM, g1_heads_table
+from noeira.deep_agents.supermimic.motion_library import (
+    SMEpisodeLog, SMMotionLibrary, SMResetSampler,
+)
+from noeira.envs.robots import UnitreeG1
+from noeira.io.npy import load_npy_2d_f64
+from noeira.nn.constants import DT
+
+
+struct Tally:
+    var checks: Int
+    var fails: Int
+
+    def __init__(out self):
+        self.checks = 0
+        self.fails = 0
+
+    def truth(mut self, ok: Bool, msg: String):
+        self.checks += 1
+        if ok:
+            print("  ok:", msg)
+        else:
+            self.fails += 1
+            print("  FAIL:", msg)
+
+
+def main() raises:
+    var av = argv()
+    var dump = String(av[1]) if len(av) > 1 else String("/tmp/sm_lib")
+    var t = Tally()
+    var env = UnitreeG1[DType.float64]()
+    _ = env.reset()
+
+    var refv = load_npy_2d_f64(dump + "/l_ref.npy", 71).values.copy()
+    var lensf = load_npy_2d_f64(dump + "/l_lens.npy", 1).values.copy()
+    var lens = List[Int]()
+    for i in range(len(lensf)):
+        lens.append(Int(lensf[i]))
+    var q0 = load_npy_2d_f64(dump + "/l_q0.npy", 29).values.copy()
+    var rows = List[Scalar[DT]](length=len(refv), fill=0)
+    for i in range(len(refv)):
+        rows[i] = Scalar[DT](refv[i])
+    var lib = SMMotionLibrary(rows^, lens, q0)
+    var F = lib.num_frames
+
+    print("\n[1] bins and frame queries,", F, "frames")
+    var bins = load_npy_2d_f64(dump + "/l_bins.npy", 3)
+    var bad = 0 if bins.rows == lib.num_bins else 1
+    for b in range(min(bins.rows, lib.num_bins)):
+        if lib.bin_start[b] != Int(bins.values[b * 3]) or lib.bin_end[b] != Int(bins.values[b * 3 + 1]) or lib.bin_clip[b] != Int(bins.values[b * 3 + 2]):
+            bad += 1
+    t.truth(bad == 0, String(lib.num_bins) + " bins: start, end, clip")
+    var last = load_npy_2d_f64(dump + "/l_last.npy", 1).values.copy()
+    var bof = load_npy_2d_f64(dump + "/l_bin_of.npy", 1).values.copy()
+    var bad2 = 0
+    for f in range(F):
+        if lib.last_frame_of(f) != Int(last[f]) or lib.bin_of_frame(f) != Int(bof[f]):
+            bad2 += 1
+    t.truth(bad2 == 0, "last_frame_of and bin_of_frame on every frame")
+
+    print("\n[2] the goal window")
+    var wg = load_npy_2d_f64(dump + "/l_goal.npy", 680).values.copy()
+    var g = List[Scalar[DT]](length=680, fill=0)
+    var eg = 0.0
+    var sg = 0.0
+    for f in range(F):
+        lib.goal_window(f, g.unsafe_ptr().as_unsafe_any_origin())
+        for k in range(680):
+            eg = max(eg, abs(Float64(g[k]) - wg[f * 680 + k]))
+            sg = max(sg, abs(wg[f * 680 + k]))
+    t.truth(eg <= 1e-6 * sg, "every frame: max err " + String(eg) + " (scale " + String(sg) + ")")
+
+    print("\n[3] the reference rows (our FK)")
+    var tree = g1_fk_tree[DT](env)
+    var table = g1_heads_table[DT](env, q0)
+    var wr = load_npy_2d_f64(dump + "/l_refrow.npy", SM_REF_DIM).values.copy()
+    var rr = List[Scalar[DT]](length=SM_REF_DIM, fill=0)
+    var er = 0.0
+    var srr = 0.0
+    for f in range(F):
+        lib.reference_row(f, tree, table, rr.unsafe_ptr().as_unsafe_any_origin())
+        for k in range(SM_REF_DIM):
+            er = max(er, abs(Float64(rr[k]) - wr[f * SM_REF_DIM + k]))
+            srr = max(srr, abs(wr[f * SM_REF_DIM + k]))
+    t.truth(er <= 1e-5 * srr, "every frame: max err " + String(er) + " (scale " + String(srr) + ")")
+
+    print("\n[4] the sampler")
+    var sm = SMResetSampler(lib.num_bins)
+    var r0 = load_npy_2d_f64(dump + "/s_return0.npy", 1).values.copy()
+    var m0 = load_npy_2d_f64(dump + "/s_memory0.npy", 1).values.copy()
+    for b in range(lib.num_bins):
+        sm.bin_return[b] = r0[b]
+        sm.bin_memory[b] = m0[b]
+    var p = sm.probabilities()
+    var wp = load_npy_2d_f64(dump + "/s_p.npy", 1).values.copy()
+    var m1 = load_npy_2d_f64(dump + "/s_memory1.npy", 1).values.copy()
+    var ep = 0.0
+    var em = 0.0
+    for b in range(lib.num_bins):
+        ep = max(ep, abs(p[b] - wp[b]))
+        em = max(em, abs(sm.bin_memory[b] - m1[b]))
+    t.truth(ep <= 1e-6 and em <= 1e-6, "bin distribution (max err " + String(ep) + ") and memory update (" + String(em) + ")")
+    var sb = load_npy_2d_f64(dump + "/s_b.npy", 1).values.copy()
+    var su = load_npy_2d_f64(dump + "/s_u.npy", 1).values.copy()
+    var sf = load_npy_2d_f64(dump + "/s_frames.npy", 1).values.copy()
+    var bad3 = 0
+    for i in range(len(sb)):
+        if SMResetSampler.frame_from(lib, Int(sb[i]), su[i]) != Int(sf[i]):
+            bad3 += 1
+    t.truth(bad3 == 0, String(len(sb)) + " injected draws pick the reference's frames")
+
+    print("\n[5] finalize")
+    var fl = load_npy_2d_f64(dump + "/f_lens.npy", 1).values.copy()
+    var ff = load_npy_2d_f64(dump + "/f_flags.npy", 2).values.copy()
+    var tmax = 0
+    for e in range(len(fl)):
+        tmax = max(tmax, Int(fl[e]))
+    var frw = load_npy_2d_f64(dump + "/f_rewards.npy", tmax).values.copy()
+    var fbn = load_npy_2d_f64(dump + "/f_bins.npy", tmax).values.copy()
+    var eps = List[SMEpisodeLog]()
+    for e in range(len(fl)):
+        var lg = SMEpisodeLog()
+        for k in range(Int(fl[e])):
+            lg.rewards.append(frw[e * tmax + k])
+            lg.bins.append(Int(fbn[e * tmax + k]))
+        lg.terminated = ff[e * 2] > 0.5
+        lg.clip_end = ff[e * 2 + 1] > 0.5
+        eps.append(lg^)
+    var fr0 = load_npy_2d_f64(dump + "/f_return0.npy", 1).values.copy()
+    var fr1 = load_npy_2d_f64(dump + "/f_return1.npy", 1).values.copy()
+    var sm2 = SMResetSampler(lib.num_bins)
+    for b in range(lib.num_bins):
+        sm2.bin_return[b] = fr0[b]
+    sm2.finalize(eps)
+    var efin = 0.0
+    var moved = 0
+    for b in range(lib.num_bins):
+        efin = max(efin, abs(sm2.bin_return[b] - fr1[b]) / max(1.0, abs(fr1[b])))
+        if abs(fr1[b] - fr0[b]) > 1e-6:
+            moved += 1
+    t.truth(efin <= 1e-5 and moved > 0, String(moved) + " bins moved; max rel err " + String(efin))
+
+    print("\n===", t.checks - t.fails, "/", t.checks, "passed ===")
+    if t.fails != 0:
+        raise Error("test_supermimic_lib: " + String(t.fails) + " failed")
