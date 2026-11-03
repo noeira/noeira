@@ -89,3 +89,9 @@ tests/data/test_amass.mojo
 #     --max-clips 4 --full --keep-source --out /tmp/amass_gate.h5
 # with $C the Hub cache dir of g1/ACCAD/Female1General_c3d.
 tests/data/test_amass_vs_mujoco.mojo /tmp/amass_gate.h5 /tmp/amass_ref
+# BONES-SEED (M1 of docs/SUPERMIMIC_PORT_PLAN.md): the CSV reader, scipy's
+# extrinsic Euler, mjlab's resample (SuperMimic's 71-d reference rows) and the
+# name filter, against the SuperMimic reproduction's own code; plus the
+# BFM-Zero store path. Synthetic CSVs only (SEED is confidential); build them:
+#   pixi run python tools/supermimic/make_synthetic_seed.py --out /tmp/seed_synth
+tests/data/test_bones_seed.mojo /tmp/seed_synth
