@@ -96,3 +96,11 @@ tests/data/test_amass_vs_mujoco.mojo /tmp/amass_gate.h5 /tmp/amass_ref
 # (SEED is confidential); build them:
 #   pixi run python tools/supermimic/make_synthetic_seed.py --out /tmp/seed_synth
 tests/data/test_bones_seed.mojo /tmp/seed_synth
+# SuperMimic M3 (docs/SUPERMIMIC_PORT_PLAN.md): the per-lane G1 FK and the
+# analytic heads, with their hand-written VJPs, against MuJoCo and against
+# the reproduction's torch code run on our model. The oracle needs torch,
+# which pixi does not ship; uv runs it in a throwaway env:
+#   uv run --no-project --python 3.12 --with torch --with mujoco==3.12.0 \
+#       --with numpy python tools/supermimic/heads_oracle.py --out /tmp/sm_heads
+tests/deep_agents/supermimic/test_supermimic_fk.mojo /tmp/sm_heads
+tests/deep_agents/supermimic/test_supermimic_heads.mojo /tmp/sm_heads
