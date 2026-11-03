@@ -108,3 +108,8 @@ examples/libero/libero_survey.mojo
 # GPU device code — local-only probes (see note above):
 # examples/bipedal_walker_gpu_demo.mojo
 # examples/bipedal_walker_cpu_gpu_compare.mojo
+
+# SuperMimic (docs/SUPERMIMIC_PORT_PLAN.md): the SEED library import and the
+# CPU training loop. CPU only.
+examples/g1/seed_import.mojo
+examples/g1/supermimic_train.mojo

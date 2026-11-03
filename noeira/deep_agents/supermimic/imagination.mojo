@@ -26,6 +26,7 @@ the last forward's activations; see `world_model.mojo`).
 """
 
 from std.math import exp
+from std.random import random_float64
 
 from noeira.deep_agents.supermimic.g1_fk import FP, G1FKTree, Q4
 from noeira.deep_agents.supermimic.heads import (
@@ -34,7 +35,8 @@ from noeira.deep_agents.supermimic.heads import (
 )
 from noeira.deep_agents.supermimic.policy import (
     SMCritic, SMPolicy, SM_ACT, SM_CRITIC_IN, SM_DEC_IN, SM_EROOT, SM_GOAL_DIM, SM_HIST, SM_LATENT,
-    SM_OBS, sm_goal_scale, sm_hist_flat_index, sm_obs_scale, sm_root_error_lane, sm_root_error_vjp_lane,
+    SM_OBS, sm_goal_scale, sm_hist_flat_index, sm_obs_noise_half, sm_obs_scale, sm_root_error_lane,
+    sm_root_error_vjp_lane,
 )
 from noeira.deep_agents.supermimic.state_spec import (
     SM_DELTA_DIM, SM_FEAT_DIM, sm_canonical_lane, sm_canonical_vjp_lane, sm_integrate_lane,
@@ -161,9 +163,13 @@ def sm_imagine[
     mut ib: SMImagBatch,
     gamma: Float64,
     grad: Bool,
+    obs_noise: Bool = False,
 ) raises -> SMImagOut:
     """The rollout; with `grad`, ADDS d(−J/H)/d params into the policy's grads
-    (zero them first). The world model's and critic's grads are polluted."""
+    (zero them first). The world model's and critic's grads are polluted.
+    `obs_noise` adds Table A.1's uniform sensor noise to each imagined
+    observation as it enters the history (`rollout.py`'s `add_noise`); it is
+    data, so the gradient path is unchanged."""
     if ib.n != N:
         raise Error("sm_imagine: " + String(ib.n) + " lanes, compiled for " + String(N))
     var H = ib.h
@@ -229,6 +235,12 @@ def sm_imagine[
                 _r(O, ((SM_HIST + t) * N + b) * SM_OBS), _r(scratch, 0),
             )
             o.rewards[t * N + b] = rr
+            if obs_noise:
+                var ob = ((SM_HIST + t) * N + b) * SM_OBS
+                for k in range(SM_OBS):
+                    var hw = sm_obs_noise_half(k)
+                    if hw > 0:
+                        O[ob + k] += Scalar[DT](random_float64(-hw, hw))
             var x0 = feat[0] / Scalar[DT](SM_HEIGHT_THR)
             var x1 = feat[1] / Scalar[DT](SM_TILT_THR)
             tin.data[b * 4 + 0] = x0

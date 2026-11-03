@@ -148,6 +148,21 @@ def sm_obs_scale(o: Int) -> Float64:
     return 1.0
 
 
+@always_inline
+def sm_obs_noise_half(o: Int) -> Float64:
+    """Table A.1's uniform noise half-width of observation entry `o`:
+    q 0.01, q̇ 0.5, ω 0.2, grav 0.05, a 0."""
+    if o < 29:
+        return 0.01
+    if o < 58:
+        return 0.5
+    if o < 61:
+        return 0.2
+    if o < 64:
+        return 0.05
+    return 0.0
+
+
 # ── the critic's privileged root-error features ─────────────────────────────
 @always_inline
 def _heading_yaw[dt: DType](q: Q4[dt]) -> Scalar[dt] where dt.is_floating_point():

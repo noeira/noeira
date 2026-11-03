@@ -126,6 +126,7 @@ struct SMPolicyTrainer(Movable):
         perms: List[Int],
         mut values_out: List[Float64],
         mut targets_out: List[Float64],
+        obs_noise: Bool = False,
     ) raises -> SMUpdateMetrics:
         """One update. `perms` is either empty (draw here) or
         `SM_CRITIC_EPOCHS × (H·N)` indices, epoch-major. `values_out` /
@@ -138,7 +139,7 @@ struct SMPolicyTrainer(Movable):
         # ── actor ──
         pol.zero_grad["cpu"](None)
         var o = sm_imagine[HW, TH, E1, E2, E3, E4, D1, D2, D3, D4, C1, C2, N](
-            wm, pol, critic, tree, table, ib, SM_GAMMA, True
+            wm, pol, critic, tree, table, ib, SM_GAMMA, True, obs_noise
         )
         var gn = clip_grad_norm["cpu"](pol, Scalar[DT](SM_CLIP_NORM), None)
         var cv = _ClipValueCPU(Scalar[DT](SM_CLIP_VALUE))

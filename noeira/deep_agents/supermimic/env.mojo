@@ -47,7 +47,7 @@ from noeira.deep_agents.supermimic.heads import (
 from noeira.deep_agents.supermimic.motion_library import (
     SMEpisodeLog, SMMotionLibrary, SMResetSampler,
 )
-from noeira.deep_agents.supermimic.policy import SM_HIST, SM_OBS
+from noeira.deep_agents.supermimic.policy import SM_HIST, SM_OBS, sm_obs_noise_half
 from noeira.deep_agents.supermimic.replay import SMReplayBuffer
 from noeira.envs.robots import UnitreeG1
 from noeira.envs.robots.unitree_g1_pd import G1_N_DOF, g1_default_pos, g1_effort, g1_kp
@@ -67,11 +67,6 @@ comptime SM_MAX_LOGGED: Int = 502           # min(ceil(10 / 0.02) + 2, 1024)
 comptime SM_ACTION_NOISE: Float64 = 0.1
 comptime SM_HEIGHT_TERM: Float64 = 0.25
 comptime SM_TILT_TERM: Float64 = 0.8
-# Table A.1 sensor noise (uniform half-widths), obs order
-comptime _NZ_Q: Float64 = 0.01
-comptime _NZ_QD: Float64 = 0.5
-comptime _NZ_W: Float64 = 0.2
-comptime _NZ_G: Float64 = 0.05
 
 
 @always_inline
@@ -358,7 +353,7 @@ struct SMG1Env(Movable):
         )
         if self.obs_noise:
             for k in range(SM_OBS):
-                var h = _NZ_Q if k < 29 else (_NZ_QD if k < 58 else (_NZ_W if k < 61 else (_NZ_G if k < 64 else 0.0)))
+                var h = sm_obs_noise_half(k)
                 if h > 0:
                     o[k] += Scalar[DT](_u(-h, h))
         if ln.hist_fresh:
@@ -391,7 +386,7 @@ struct SMG1Env(Movable):
             ln.prev_xi[k] = ln.xi[k]
         ln.prev_frame = ln.frame
 
-    def goal(mut self, i: Int, dst: List[Scalar[DT]]):
+    def goal(mut self, i: Int, mut dst: List[Scalar[DT]]):
         """The 680-d goal window of lane i's current target frame."""
         self.lib.goal_window(self.lanes[i].frame, dst.unsafe_ptr().as_unsafe_any_origin())
 
