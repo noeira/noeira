@@ -428,6 +428,7 @@ def g1_command_questions(
     destinations: List[String] = List[String](),
     dest_descs: List[String] = List[String](),
     with_chain: Bool = True,
+    rotate: Int = 0,
 ) raises -> JevQuestions:
     """The choice over the bank, plus the two cheap guards.
 
@@ -435,20 +436,34 @@ def g1_command_questions(
     caller that runs the first step only — on a local model each question is
     a row of its own, and those two are the longest.
 
+    `rotate=k` rotates the real options (bank rows + aliases) left by k;
+    `talk` and `none` stay last. 0, the default, is the request every measured
+    number used. It exists for order-sensitivity tests: an answer that changes
+    with the option order is a flip.
+
     ⚠ The option descriptions are GENERATED from each compound
     (`bank.describe`). A hand-written blurb would drift from the terms the
     command was gated on, and the drift is invisible — the robot doing one
     thing while the model was told another.
     """
-    var options = List[String]()
-    var descs = List[String]()
+    var real = List[String]()
+    var real_descs = List[String]()
     for i in range(bank.count()):
-        options.append(bank.name_at(i))
-        descs.append(bank.describe(i))
+        real.append(bank.name_at(i))
+        real_descs.append(bank.describe(i))
     # the aliases are offered as ordinary options; `g1_decide` resolves them
     for i in range(G1_N_ALIAS):
-        options.append(g1_alias_name(i))
-        descs.append(g1_alias_desc(i))
+        real.append(g1_alias_name(i))
+        real_descs.append(g1_alias_desc(i))
+    var options = List[String]()
+    var descs = List[String]()
+    var n_real = len(real)
+    for i in range(n_real):
+        var j = (i + rotate) % n_real if n_real > 0 else 0
+        if j < 0:
+            j += n_real
+        options.append(real[j])
+        descs.append(real_descs[j])
     # `none` last and ALWAYS present: without it the model must pick
     # something, and "something" for an impossible request is a real command
     # the robot will actually run.
