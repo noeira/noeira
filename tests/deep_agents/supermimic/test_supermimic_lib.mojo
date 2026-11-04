@@ -20,6 +20,10 @@ WHAT EACH SECTION CAN CATCH
     frames it picks for injected (bin, u) draws: exact.
 [5] `_finalize_episodes` on six episodes — terminated, clip-ended and
     truncated (the last 100 steps dropped) — into the bin returns: 1e-5.
+[6] the sampler's draw statistics (`note_draw` / `take_stats`) on 20 bins
+    of known returns, against hand-computed values: the drawn bins' mean,
+    the all-bins mean, the hard share against the PREVIOUS window's bottom
+    decile, and the counters cleared after a take.
 
 Planted mutants: a disabled truncation rule fails [5], an unclamped goal
 window fails [2]. (The replay ring's gate moved to
@@ -31,7 +35,7 @@ from std.sys import argv
 from noeira.deep_agents.supermimic.robot import G1Robot, G1Sim, SMDims
 from noeira.deep_agents.supermimic.tables import sm_tables
 from noeira.deep_agents.supermimic.motion_library import (
-    SMEpisodeLog, SMMotionLibrary, SMResetSampler,
+    SM_G_MAX, SMEpisodeLog, SMMotionLibrary, SMResetSampler,
 )
 from noeira.io.npy import load_npy_2d_f64
 from noeira.nn.constants import DT
@@ -169,6 +173,22 @@ def main() raises:
             moved += 1
     t.truth(efin <= 1e-5 and moved > 0, String(moved) + " bins moved; max rel err " + String(efin))
 
+    print("\n[6] draw statistics")
+    var sm3 = SMResetSampler(20)
+    for b in range(20):
+        sm3.bin_return[b] = 0.05 * SM_G_MAX * Float64(b)         # 0, 0.05, ..., 0.95 of G_MAX
+    var s0 = sm3.take_stats()                                       # sets the decile: bins 0, 1 are below it
+    t.truth(s0.resets == 0 and s0.reset_hard_share == 0.0, "no draws: zero resets, zero hard share")
+    var draws: List[Int] = [0, 1, 10, 19]
+    for k in range(len(draws)):
+        sm3.note_draw(draws[k])
+    var s1 = sm3.take_stats()
+    t.truth(s1.resets == 4, "4 draws counted (" + String(s1.resets) + ")")
+    t.truth(abs(s1.reset_bin_return - 0.375) < 1e-12, "drawn bins' mean 0.375 (" + String(s1.reset_bin_return) + ")")
+    t.truth(abs(s1.bin_return_mean - 0.475) < 1e-12, "all bins' mean 0.475 (" + String(s1.bin_return_mean) + ")")
+    t.truth(abs(s1.reset_hard_share - 0.5) < 1e-12, "hard share 2 / 4 (" + String(s1.reset_hard_share) + ")")
+    var s2 = sm3.take_stats()
+    t.truth(s2.resets == 0 and s2.reset_hard_share == 0.0, "counters cleared after a take")
 
     print("\n===", t.checks - t.fails, "/", t.checks, "passed ===")
     if t.fails != 0:

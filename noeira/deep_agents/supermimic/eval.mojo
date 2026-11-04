@@ -25,7 +25,7 @@ from noeira.deep_agents.supermimic.env_gpu import ST_ENDING, ST_TERMINATED, SMRe
 from noeira.deep_agents.supermimic.heads import SM_N_TERMS
 from noeira.deep_agents.supermimic.lanes import talloc
 from noeira.deep_agents.supermimic.motion_library import SMMotionLibrary
-from noeira.deep_agents.supermimic.robot import SMDims, TrackingBatchedSim
+from noeira.deep_agents.supermimic.robot import SMDims, TrackingBatchedSim, TrackingRobot
 from noeira.deep_agents.supermimic.trainer import SuperMimicTrainer
 from noeira.nn.constants import DT
 
@@ -85,14 +85,29 @@ def sm_benchmark_gpu[C: SMConfigT, BS: TrackingBatchedSim](
 ) raises -> List[SMClipResult]:
     """Every clip of `lib` (the first `max_clips` if > 0), the protocol above,
     with the trainer's policy over the device env's lanes."""
-    comptime R = C.ROBOT
-    comptime N = BS.N
-    comptime assert C.LANES == N, "the config's lanes must be the simulator's"
     var n_clips = lib.num_clips if max_clips <= 0 else min(max_clips, lib.num_clips)
-    var env = SMTrackingEnvGpu[R, BS](
+    var env = sm_benchmark_env[C.ROBOT, BS](ctx, lib^, sim^)
+    var rb = SMReplayGpuOf[C.ROBOT](ctx, BS.N, 4)          # the env writes rows; nobody samples them
+    return sm_benchmark_run[C, BS](ctx, trainer, env, rb, n_clips, verbose)
+
+
+def sm_benchmark_env[R: TrackingRobot, BS: TrackingBatchedSim](
+    ctx: DeviceContext, var lib: SMMotionLibrary[R], var sim: BS,
+) raises -> SMTrackingEnvGpu[R, BS]:
+    """The protocol's env: no noise, no domain randomisation, no cap."""
+    return SMTrackingEnvGpu[R, BS](
         ctx, lib^, sim^, dr=False, obs_noise=False, reset_noise=False, action_noise=0.0, max_episode_steps=0,
     )
-    var rb = SMReplayGpuOf[R](ctx, N, 4)          # the env writes rows; nobody samples them
+
+
+def sm_benchmark_run[C: SMConfigT, BS: TrackingBatchedSim](
+    ctx: DeviceContext, mut trainer: SuperMimicTrainer[C], mut env: SMTrackingEnvGpu[C.ROBOT, BS],
+    mut rb: SMReplayGpuOf[C.ROBOT], n_clips: Int, verbose: Bool = True,
+) raises -> List[SMClipResult]:
+    """The first `n_clips` clips of `env`'s library, the protocol above, over
+    an env from `sm_benchmark_env`. Re-runnable: it restarts every lane."""
+    comptime R = C.ROBOT
+    comptime N = BS.N          # any lane count: the policy acts on N lanes (training's C.LANES need not match)
     var current = List[Int](length=N, fill=0)
     var nxt = List[Int](length=N, fill=0)
     var active = List[Bool](length=N, fill=False)
@@ -149,3 +164,34 @@ def sm_benchmark_gpu[C: SMConfigT, BS: TrackingBatchedSim](
             print("  evaluated", len(results), "/", n_clips)
             next_report += 1000
     return results^
+
+
+struct SMInRunBench[C: SMConfigT, BS: TrackingBatchedSim](Movable):
+    """The protocol on a FIXED clip set during training, every `every`
+    iterations: an unbiased learning curve beside `avg_reward`, whose
+    episodes the reset sampler chooses. Its own env (a second simulator over
+    its own small library), so training's lanes, replay and domain
+    randomisation are untouched. Logged as `bench_norm_return` (mean) and
+    `bench_failed` (fraction of clips). Its simulator may have fewer lanes
+    than training's (the policy acts on any lane count): the 5090 has ~2.7 GB
+    left beside a paper-width run on the full fp32 library."""
+    var env: SMTrackingEnvGpu[Self.C.ROBOT, Self.BS]
+    var rb: SMReplayGpuOf[Self.C.ROBOT]
+    var every: Int
+
+    def __init__(out self, ctx: DeviceContext, var lib: SMMotionLibrary[Self.C.ROBOT], var sim: Self.BS, every: Int) raises:
+        self.env = sm_benchmark_env[Self.C.ROBOT, Self.BS](ctx, lib^, sim^)
+        self.rb = SMReplayGpuOf[Self.C.ROBOT](ctx, Self.BS.N, 4)
+        self.every = every
+
+    def __init__(out self, *, deinit move: Self):
+        self.env = move.env^
+        self.rb = move.rb^
+        self.every = move.every
+
+    def due(self, it: Int, total: Int) -> Bool:
+        return self.every > 0 and (it % self.every == 0 or it == total)
+
+    def run(mut self, ctx: DeviceContext, mut trainer: SuperMimicTrainer[Self.C]) raises -> SMBenchmarkSummary:
+        var res = sm_benchmark_run[Self.C, Self.BS](ctx, trainer, self.env, self.rb, self.env.lib.num_clips, verbose=False)
+        return sm_summarize(res)

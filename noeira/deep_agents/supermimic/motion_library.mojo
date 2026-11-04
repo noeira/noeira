@@ -33,6 +33,7 @@ Precision: float64 here; the reproduction accumulates the bin sums and the
 EMA in float32 (its `bin_return` is a float32 tensor), ~1e-7 apart.
 """
 
+from std.builtin.sort import sort
 from std.math import ceil, exp, log
 
 from max.gpu.host import DeviceBuffer, DeviceContext
@@ -303,17 +304,75 @@ struct SMEpisodeLog(Copyable, Movable):
             self.bins[cap - 1] = b
 
 
+@fieldwise_init
+struct SMSamplerStats(Copyable, Movable):
+    """What the resets of one log window drew, in units of SM_G_MAX (1 = a
+    bin whose estimate is the maximum return). They make the training
+    curve readable: `avg_reward` averages the episodes that FINISHED, and the
+    sampler moves resets toward the bins it estimates hard, so a falling
+    `avg_reward` with a falling `reset_bin_return` is the curriculum, not
+    the policy."""
+    var resets: Int
+    var reset_bin_return: Float64     # mean G_b of the drawn bins
+    var bin_return_mean: Float64      # mean G_b over all bins (the estimate's level)
+    var reset_hard_share: Float64     # share of draws below the last window's bottom-decile G_b
+
+
 struct SMResetSampler(Movable):
     var bin_return: List[Float64]
     var bin_memory: List[Float64]
+    var n_draw: Int                   # draws since the last `take_stats`
+    var draw_g: Float64
+    var draw_hard: Int
+    var hard_g: Float64               # the bottom-decile G_b at the last `take_stats`
 
     def __init__(out self, num_bins: Int):
         self.bin_return = List[Float64](length=num_bins, fill=SM_G_MAX)
         self.bin_memory = List[Float64](length=num_bins, fill=1.0 / Float64(num_bins))
+        self.n_draw = 0
+        self.draw_g = 0.0
+        self.draw_hard = 0
+        self.hard_g = -1e300
 
     def __init__(out self, *, deinit move: Self):
         self.bin_return = move.bin_return^
         self.bin_memory = move.bin_memory^
+        self.n_draw = move.n_draw
+        self.draw_g = move.draw_g
+        self.draw_hard = move.draw_hard
+        self.hard_g = move.hard_g
+
+    def note_draw(mut self, b: Int):
+        """Count a reset drawn from bin b (the envs call it after each draw)."""
+        var g = self.bin_return[b]
+        self.n_draw += 1
+        self.draw_g += g
+        if g < self.hard_g:
+            self.draw_hard += 1
+
+    def take_stats(mut self) -> SMSamplerStats:
+        """The window's draws (then cleared); refreshes the bottom-decile
+        threshold the next window's hard share is counted against. O(bins
+        log bins), once per log line."""
+        var nb = len(self.bin_return)
+        var srt = self.bin_return.copy()
+        sort(srt)
+        var mean = 0.0
+        for b in range(nb):
+            mean += srt[b]
+        mean /= Float64(max(nb, 1))
+        var n = self.n_draw
+        var out = SMSamplerStats(
+            n,
+            (self.draw_g / Float64(n) if n > 0 else mean) / SM_G_MAX,
+            mean / SM_G_MAX,
+            Float64(self.draw_hard) / Float64(n) if n > 0 else 0.0,
+        )
+        self.hard_g = srt[nb // 10] if nb > 0 else -1e300
+        self.n_draw = 0
+        self.draw_g = 0.0
+        self.draw_hard = 0
+        return out^
 
     def probabilities(mut self) -> List[Float64]:
         """The bin distribution of one draw; updates the memory (as every

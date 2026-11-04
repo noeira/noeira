@@ -41,6 +41,8 @@ from max.gpu.host import DeviceBuffer, DeviceContext
 from noeira.core.cont_action import ContAction
 from noeira.envs.robots import UnitreeG1
 from noeira.envs.robots.unitree_g1 import UnitreeG1BatchedDR
+from noeira.envs.robots.unitree_g1_mjlab import UnitreeG1Mjlab, UnitreeG1MjlabBatchedDR
+from noeira.envs.robots.unitree_g1_mjlab_pd import G1M_N_DOF, g1m_action_scale, g1m_default_pos
 from noeira.nn.constants import DT
 from noeira.nn.core.ptr import mptr
 from noeira.envs.robots.unitree_g1_pd import G1_N_DOF, g1_default_pos, g1_effort, g1_kp
@@ -430,3 +432,186 @@ struct G1Robot(TrackingRobot):
     @staticmethod
     def soft_limit_factor() -> Float64:
         return 0.9       # mjlab's G1 `soft_joint_pos_limit_factor`
+
+
+# ── the G1 as mjlab models it (the reproduction's body, `UnitreeG1Mjlab`) ────
+struct G1MjlabSim(TrackingSim):
+    """`UnitreeG1Mjlab` on the CPU. Its env action is mjlab's own (`q0 +
+    scale·a`, unclipped), so the SuperMimic action a with bias b is handed
+    over as `a − b/scale`: the target is `q0 + scale·a − b`."""
+    var env: UnitreeG1Mjlab[DType.float64]
+
+    def __init__(out self, var env: UnitreeG1Mjlab[DType.float64]):
+        self.env = env^
+
+    def __init__(out self, *, deinit move: Self):
+        self.env = move.env^
+
+    @staticmethod
+    def create() raises -> Self:
+        var e = UnitreeG1Mjlab[DType.float64]()
+        _ = e.reset()
+        return Self(e^)
+
+    def set_state(mut self, qpos: List[Float64], qvel: List[Float64]):
+        self.env.set_state(qpos, qvel)
+
+    def control_step(mut self, a: List[Float64], bias: List[Float64]):
+        var act = ContAction[G1M_N_DOF]()
+        for j in range(G1M_N_DOF):
+            act.data[j] = a[j] - bias[j] / g1m_action_scale(j)
+        _ = self.env.step(act)
+
+    def qpos(self, i: Int) -> Float64:
+        return Float64(self.env.d.qpos.data[i])
+
+    def qvel(self, i: Int) -> Float64:
+        return Float64(self.env.d.qvel.data[i])
+
+    def body_field(self, b: Int, k: Int) -> Float64:
+        return Float64(self.env.mf.bodies.data[b * MODEL_BODY_SIZE + k])
+
+    def set_body_field(mut self, b: Int, k: Int, v: Float64):
+        self.env.mf.bodies.data[b * MODEL_BODY_SIZE + k] = v
+
+    def joint_field(self, j: Int, k: Int) -> Float64:
+        return Float64(self.env.mf.joints.data[j * MODEL_JOINT_SIZE + k])
+
+    def geom_field(self, g: Int, k: Int) -> Float64:
+        return Float64(self.env.mf.geoms.data[g * MODEL_GEOM_SIZE + k])
+
+    def set_geom_field(mut self, g: Int, k: Int, v: Float64):
+        self.env.mf.geoms.data[g * MODEL_GEOM_SIZE + k] = v
+
+    def num_geoms(self) -> Int:
+        return UnitreeG1Mjlab[DType.float64].NGEOM
+
+
+def _k_g1m_action(
+    n_lanes: Int64, a: Pointer[Scalar[DT], MutAnyOrigin], bias: Pointer[Scalar[DT], MutAnyOrigin], bias_stride: Int64,
+    k: Pointer[Scalar[DT], MutAnyOrigin], dst: Pointer[Scalar[DT], MutAnyOrigin],
+):
+    """mjlab's env action for the SuperMimic action a and bias b: `a − b·k`,
+    k = 1/scale per joint."""
+    var i = Int(global_idx.x)
+    if i >= Int(n_lanes) * G1M_N_DOF:
+        return
+    var l = i // G1M_N_DOF
+    var j = i % G1M_N_DOF
+    dst[unsafe_offset=i] = a[unsafe_offset=i] - bias[unsafe_offset=l * Int(bias_stride) + j] * k[unsafe_offset=j]
+
+
+struct G1MjlabBatchedSim[N_: Int](TrackingBatchedSim):
+    """`UnitreeG1MjlabBatchedDR[N]` (float32), per-lane friction / CoM
+    overrides, `G1MjlabSim`'s action law as a kernel."""
+    comptime N = Self.N_
+    comptime LANE_DR = True
+    var env: UnitreeG1MjlabBatchedDR[Self.N_]
+    var kgain: DeviceBuffer[DT]
+
+    def __init__(out self, var env: UnitreeG1MjlabBatchedDR[Self.N_], var kgain: DeviceBuffer[DT]):
+        self.env = env^
+        self.kgain = kgain^
+
+    def __init__(out self, *, deinit move: Self):
+        self.env = move.env^
+        self.kgain = move.kgain^
+
+    @staticmethod
+    def create(ctx: DeviceContext) raises -> Self:
+        var env = UnitreeG1MjlabBatchedDR[Self.N_](ctx)
+        env.reset_batch[Self.N_](Optional(ctx), 0)
+        var k = ctx.enqueue_create_buffer[DT](G1M_N_DOF)
+        var hk = ctx.enqueue_create_host_buffer[DT](G1M_N_DOF)
+        ctx.synchronize()
+        for j in range(G1M_N_DOF):
+            hk[j] = Scalar[DT](1.0 / g1m_action_scale(j))
+        ctx.enqueue_copy(k, hk)
+        ctx.synchronize()
+        return Self(env^, k^)
+
+    def lane_dr_ptr(mut self) -> Pointer[Scalar[DT], MutAnyOrigin]:
+        return self.env.lane_dr_ptr()
+
+    def qpos_ptr(mut self) -> Pointer[Scalar[DT], MutAnyOrigin]:
+        return mptr(self.env.d.qpos.dev.value().unsafe_ptr())
+
+    def qvel_ptr(mut self) -> Pointer[Scalar[DT], MutAnyOrigin]:
+        return mptr(self.env.d.qvel.dev.value().unsafe_ptr())
+
+    def control_step(
+        mut self, ctx: DeviceContext, a: Pointer[Scalar[DT], MutAnyOrigin],
+        bias: Pointer[Scalar[DT], MutAnyOrigin], bias_stride: Int, seed: UInt64,
+    ) raises:
+        comptime NA = Self.N_ * G1M_N_DOF
+        ctx.enqueue_function[_k_g1m_action](
+            Int64(Self.N_), a, bias, Int64(bias_stride), mptr(self.kgain.unsafe_ptr()), self.env.action_ptr(),
+            grid_dim=ceildiv(NA, 128), block_dim=128,
+        )
+        self.env.step_batch[Self.N_](Optional(ctx), seed)
+
+    def reset_lanes(mut self, ctx: DeviceContext, mask: Pointer[Scalar[DT], MutAnyOrigin], seed: UInt64) raises:
+        ctx.enqueue_function[_k_copy_mask](
+            Int64(Self.N_), mask, mptr(self.env._done.unsafe_ptr()), grid_dim=ceildiv(Self.N_, 128), block_dim=128
+        )
+        self.env.selective_reset_batch[Self.N_](Optional(ctx), seed)
+
+    def refresh(mut self, ctx: DeviceContext) raises:
+        self.env._run_fields_fk(ctx)
+        self.env._run_fields_vel(ctx)
+
+    def body_field(self, b: Int, k: Int) -> Float64:
+        return Float64(self.env.mf.bodies.data[b * MODEL_BODY_SIZE + k])
+
+    def set_body_field_all(mut self, ctx: DeviceContext, b: Int, k: Int, v: Float64) raises:
+        self.env.mf.bodies.data[b * MODEL_BODY_SIZE + k] = Scalar[DT](v)
+        self.env.mf.bodies.upload_resident(ctx)
+
+    def set_geom_field_all(mut self, ctx: DeviceContext, g: Int, k: Int, v: Float64) raises:
+        self.env.mf.geoms.data[g * MODEL_GEOM_SIZE + k] = Scalar[DT](v)
+        self.env.mf.geoms.upload_resident(ctx)
+
+
+struct G1MjlabRobot(TrackingRobot):
+    """The G1 as mjlab models it (`UnitreeG1Mjlab`): 29 DoF, 30 bodies, the
+    reproduction's 14 tracked bodies, mjlab's knees-bent default pose. The
+    joint order is `G1Robot`'s, so the same library rows drive it."""
+    comptime NQ = 36
+    comptime NV = 35
+    comptime NDOF = G1M_N_DOF
+    comptime NBODY = UnitreeG1Mjlab[DType.float64].NBODY - 1
+    comptime NJOINT = UnitreeG1Mjlab[DType.float64].NJOINT
+    comptime N_TRACKED = 14
+    comptime SIM = G1MjlabSim
+
+    @staticmethod
+    def mjcf_path() -> String:
+        return "noeira/envs/robots/assets/unitree_g1_mjlab.xml"
+
+    @staticmethod
+    def tracked_bodies() -> List[String]:
+        return G1Robot.tracked_bodies()
+
+    @staticmethod
+    def anchor_body() -> String:
+        return "torso_link"
+
+    @staticmethod
+    def root_body() -> String:
+        return "pelvis"
+
+    @staticmethod
+    def foot_bodies() -> List[String]:
+        return ["left_ankle_roll_link", "right_ankle_roll_link"]
+
+    @staticmethod
+    def com_body() -> String:
+        return "torso_link"
+
+    @staticmethod
+    def default_joint_pos(j: Int) -> Float64:
+        return g1m_default_pos(j)
+
+    @staticmethod
+    def soft_limit_factor() -> Float64:
+        return 0.9

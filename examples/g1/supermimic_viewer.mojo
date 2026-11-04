@@ -6,13 +6,15 @@ protocol (Appendix F: from each clip's first frame to its end, no noise, no
 domain randomisation, no episode cap), one lane of the CPU env, drawn.
 
     pixi run mojo build -I . -Xlinker -ld_classic -D SM_PAPER=1 examples/g1/supermimic_viewer.mojo -o /tmp/smview
-    pixi run /tmp/smview --ckpt <last.ckpt> --store <store or dir> --clips 0 17 42 --fps 50
+    pixi run /tmp/smview --ckpt <last.ckpt> --store <store or dir> --clips 0 17 42 --fps 50 [--record demo.mp4]
 
 A paper-width checkpoint trained on the GPU loads into the CPU trainer
 bit for bit (`test_supermimic_gpu` [6]). Each clip prints its normalised
 return (Σ r / (0.1 · steps), 1 = perfect) and whether it failed, as the
 benchmark scores it, so the picture and the number come together. SPACE
-pauses; closing the window ends the run.
+pauses; closing the window ends the run. `--record PATH` writes every
+drawn frame to PATH (mp4 or gif, needs `ffmpeg`) at the playback rate; V
+toggles a recording into the working directory as usual.
 
 ⚠ CPU PHYSICS. The env is the float64 single-lane path; the checkpoint
 trained against the float32 batched one. The two agree to 1e-7 over a step
@@ -31,21 +33,27 @@ from noeira.data.store import TrajectoryStore
 from noeira.deep_agents.supermimic import SMConfig, SuperMimicTrainer
 from noeira.deep_agents.supermimic.env import SMReplayOf, SMTrackingEnv
 from noeira.deep_agents.supermimic.motion_library import SMMotionLibrary
-from noeira.deep_agents.supermimic.robot import G1Robot, G1Sim, SMDims, TrackingSim
+from noeira.deep_agents.supermimic.robot import G1Robot, G1Sim, SMDims, TrackingSim, G1BatchedSim, G1MjlabRobot, G1MjlabSim, G1MjlabBatchedSim
 from noeira.envs.robots.unitree_g1_pd import G1_N_DOF, g1_default_pos
 from noeira.nn.constants import DT
 from noeira.nn.core.tensor import TensorImpl
 
 
 comptime P = get_defined_int["SM_PAPER", 0]() != 0
+
+# The robot: mjlab's G1 (the reproduction's body) by default; `-D SM_BFM_G1=1`
+# selects BFM-Zero's G1 (checkpoints trained before 2026-11-05 are on it).
+comptime BFM_G1 = get_defined_int["SM_BFM_G1", 0]() != 0
+comptime Robot = G1Robot if BFM_G1 else G1MjlabRobot
+comptime RBatched[N: Int] = G1BatchedSim[N] if BFM_G1 else G1MjlabBatchedSim[N]
 # the training example's widths (a checkpoint loads only into its own), one lane
 comptime C = SMConfig[
-    "cpu", G1Robot,
+    "cpu", Robot,
     2048 if P else 128, 64 if P else 64, 2048 if P else 128, 1024 if P else 64, 512 if P else 64, 256 if P else 32,
     2048 if P else 128, 1024 if P else 64, 512 if P else 64, 256 if P else 32, 256 if P else 64, 128 if P else 32,
     1, 64, 16, 32,
 ]
-comptime D = SMDims[G1Robot]
+comptime D = SMDims[Robot]
 
 
 def _opt(args: List[String], name: String, fallback: String) -> String:
@@ -82,7 +90,7 @@ def _store_paths(spec: String) raises -> List[String]:
     return out^
 
 
-def _library(spec: String, upto: Int) raises -> SMMotionLibrary[G1Robot]:
+def _library(spec: String, upto: Int) raises -> SMMotionLibrary[Robot]:
     """Clips 0 .. upto of the stores, in order (enough for the chosen ones)."""
     var paths = _store_paths(spec)
     var lens = List[Int]()
@@ -104,8 +112,8 @@ def _library(spec: String, upto: Int) raises -> SMMotionLibrary[G1Robot]:
             rows[o + i] = refc[i]
     var q0 = List[Float64](length=G1_N_DOF, fill=0.0)
     for j in range(G1_N_DOF):
-        q0[j] = g1_default_pos(j)
-    return SMMotionLibrary[G1Robot](rows^, lens, q0)
+        q0[j] = Robot.default_joint_pos(j)
+    return SMMotionLibrary[Robot](rows^, lens, q0)
 
 
 def main() raises:
@@ -117,6 +125,7 @@ def main() raises:
     var store = _opt(args, String("--store"), String(""))
     var fps = Int(_opt(args, String("--fps"), String("50")))
     var clips = _ints_after(args, String("--clips"))
+    var record = _opt(args, String("--record"), String(""))
     if ckpt == "" or store == "":
         raise Error("give --ckpt PATH and --store PATH")
     if len(clips) == 0:
@@ -124,18 +133,21 @@ def main() raises:
     var upto = 0
     for k in range(len(clips)):
         upto = max(upto, clips[k])
-    var trainer = SuperMimicTrainer[C].for_robot(G1Sim.create())
+    var trainer = SuperMimicTrainer[C].for_robot(Robot.SIM.create())
     var ctr = trainer.load_state(ckpt)
     print("checkpoint at iteration", ctr[0], "(", ctr[1], "updates )")
-    var env = SMTrackingEnv[G1Robot](
+    var env = SMTrackingEnv[Robot](
         1, _library(store, upto), dr=False, obs_noise=False, reset_noise=False, action_noise=0.0, max_episode_steps=0,
     )
-    var rb = SMReplayOf[G1Robot](1, 64)
+    var rb = SMReplayOf[Robot](1, 64)
     var first: List[Int] = [env.lib.clip_start[clips[0]]]
     env.restart(first)
     env.next_frame[0] = env.lib.clip_start[clips[1]] if len(clips) > 1 else env.lib.clip_start[clips[0]]
     if not env.lanes[0].sim.env.init_renderer():
         raise Error("no window (the renderer did not open)")
+    if record.byte_length() > 0:
+        env.lanes[0].sim.env.start_recording(record, fps)
+        print("recording to", record)
     var delay = max(1000 // max(fps, 1), 1)
     var hist = TensorImpl[DT].alloc(D.HIST * D.OBS)
     var goals = TensorImpl[DT].alloc(D.GOAL)
@@ -166,4 +178,6 @@ def main() raises:
             if k < len(clips):
                 print("clip", clips[k], ":", env.lib.clip_len[clips[k]], "frames")
                 env.next_frame[0] = env.lib.clip_start[clips[k + 1]] if k + 1 < len(clips) else env.lib.clip_start[clips[k]]
+    if record.byte_length() > 0:
+        env.lanes[0].sim.env.stop_recording()
     env.lanes[0].sim.env.close_renderer()

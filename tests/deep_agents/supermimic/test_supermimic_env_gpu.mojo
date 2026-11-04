@@ -29,28 +29,32 @@ action (a pose the PD holds), so answers are known.
 Run (box): pixi run -e nvidia mojo run -I . tests/deep_agents/supermimic/test_supermimic_env_gpu.mojo
 """
 
-from std.math import isnan
+from std.math import ceildiv, isnan
 from std.random import random_float64, seed
-from std.sys import default_accelerator
+from std.sys import default_accelerator, get_defined_int
 
+from max.gpu import global_idx
 from max.gpu.host import DeviceContext
 
 from noeira.core.cont_action import ContAction
 from noeira.deep_agents.supermimic.env import SMReplayOf, SMTrackingEnv
 from noeira.deep_agents.supermimic.env_gpu import ST_CLIP_END, ST_ENDING, ST_TERMINATED, SMReplayGpuOf, SMTrackingEnvGpu
 from noeira.deep_agents.supermimic.motion_library import SMMotionLibrary
-from noeira.deep_agents.supermimic.robot import G1BatchedSim, G1Robot, SMDims
+from noeira.deep_agents.supermimic.robot import G1BatchedSim, G1MjlabBatchedSim, G1MjlabRobot, G1Robot, SMDims
 from noeira.envs.robots import UnitreeG1
 from noeira.envs.robots.unitree_g1_pd import G1_N_DOF, g1_default_pos
 from noeira.nn.constants import DT
+from noeira.nn.core.ptr import mptr
 from noeira.nn.core.tensor import TensorImpl
 
 
-comptime R = G1Robot
+# `-D SM_MJLAB=1`: the same gate on mjlab's G1.
+comptime TEST_MJLAB = get_defined_int["SM_MJLAB", 0]() != 0
+comptime R = G1MjlabRobot if TEST_MJLAB else G1Robot
 comptime D = SMDims[R]
 comptime n = R.NDOF
 comptime NL = 8
-comptime BS = G1BatchedSim[NL]
+comptime BS = G1MjlabBatchedSim[NL] if TEST_MJLAB else G1BatchedSim[NL]
 comptime EnvG = SMTrackingEnvGpu[R, BS]
 
 
@@ -72,14 +76,15 @@ struct Tally:
 
 
 def _standing_row() raises -> List[Scalar[DT]]:
-    var env = UnitreeG1[DType.float64]()
-    _ = env.reset()
-    var a = ContAction[G1_N_DOF]()
+    """The robot under test settled for 2 s under zero action (no bias)
+    from its `stand` start, through its own CPU tracking sim."""
+    var sim = R.SIM.create()
+    var a = List[Float64](length=G1_N_DOF, fill=0.0)
     for _ in range(100):
-        _ = env.step(a)
+        sim.control_step(a, a)
     var row = List[Scalar[DT]](length=D.S, fill=0)
     for k in range(R.NQ):
-        row[k] = Scalar[DT](env.d.qpos.data[k])
+        row[k] = Scalar[DT](sim.qpos(k))
     return row^
 
 
@@ -94,8 +99,15 @@ def _library(stand: List[Scalar[DT]], lens: List[Int], dz: Float64) raises -> SM
         rows[f * D.S + 2] += Scalar[DT](dz)
     var q0 = List[Float64](length=n, fill=0.0)
     for j in range(n):
-        q0[j] = g1_default_pos(j)
+        q0[j] = R.default_joint_pos(j)
     return SMMotionLibrary[R](rows^, lens, q0)
+
+
+def _k_bcast(n_lanes: Int64, w: Int64, src: Pointer[Scalar[DT], MutAnyOrigin], dst: Pointer[Scalar[DT], MutAnyOrigin]):
+    """dst[l · w + k] = src[k] for every lane l (n_lanes = 1: a plain copy)."""
+    var i = Int(global_idx.x)
+    if i < Int(n_lanes) * Int(w):
+        dst[unsafe_offset=i] = src[unsafe_offset=i % Int(w)]
 
 
 def _dl(ctx: DeviceContext, mut t: TensorImpl[DT]) raises -> List[Scalar[DT]]:
@@ -179,15 +191,23 @@ def test_termination(ctx: DeviceContext, stand: List[Scalar[DT]], mut tl: Tally)
     seed(3)
     var env = EnvG(ctx, _library(stand, [400], 0.3), BS.create(ctx), dr=False, obs_noise=False, reset_noise=False, action_noise=0.0)
     # the reset put every lane AT the raised reference: back to the floor pose
-    env.sim.env.d.qpos.download(ctx)      # sizes the host copies before writing them
-    env.sim.env.d.qvel.download(ctx)
-    for l in range(NL):
-        for k in range(R.NQ):
-            env.sim.env.d.qpos.data[l * R.NQ + k] = stand[k]
-        for k in range(R.NV):
-            env.sim.env.d.qvel.data[l * R.NV + k] = 0
-    env.sim.env.d.qpos.upload_resident(ctx)
-    env.sim.env.d.qvel.upload_resident(ctx)
+    # (through the batched-sim interface's device pointers, so any robot's sim works)
+    var hq = TensorImpl[DT].alloc(R.NQ)
+    var hv = TensorImpl[DT].alloc(R.NV)
+    for k in range(R.NQ):
+        hq.data[k] = stand[k]
+    for k in range(R.NV):
+        hv.data[k] = 0
+    hq.upload_resident(ctx)
+    hv.upload_resident(ctx)
+    ctx.enqueue_function[_k_bcast](
+        Int64(NL), Int64(R.NQ), mptr(hq.dev.value().unsafe_ptr()), env.sim.qpos_ptr(),
+        grid_dim=ceildiv(NL * R.NQ, 128), block_dim=128,
+    )
+    ctx.enqueue_function[_k_bcast](
+        Int64(NL), Int64(R.NV), mptr(hv.dev.value().unsafe_ptr()), env.sim.qvel_ptr(),
+        grid_dim=ceildiv(NL * R.NV, 128), block_dim=128,
+    )
     env.sim.refresh(ctx)
     env._observe(ctx)          # the env's state (and next rows) read back from the simulator
     var rb = SMReplayGpuOf[R](ctx, NL, 64)
@@ -262,7 +282,14 @@ def test_bookkeeping(ctx: DeviceContext, stand: List[Scalar[DT]], mut tl: Tally)
     for i in range(len(s)):
         nan += 1 if isnan(s[i]) else 0
     var x = _dl(ctx, env.xi)
-    var dr = _dl(ctx, env.sim.env.d.lane_dr)
+    comptime NDR = NL * (R.NBODY + 1) * 4
+    var drt = TensorImpl[DT].alloc(NDR)
+    drt.upload_resident(ctx)
+    ctx.enqueue_function[_k_bcast](
+        Int64(1), Int64(NDR), env.sim.lane_dr_ptr(), mptr(drt.dev.value().unsafe_ptr()),
+        grid_dim=ceildiv(NDR, 128), block_dim=128,
+    )
+    var dr = _dl(ctx, drt)
     var hfeet = ctx.enqueue_create_host_buffer[DType.int32](max(env.n_feet, 1))
     ctx.enqueue_copy(hfeet, env.feet)
     ctx.synchronize()

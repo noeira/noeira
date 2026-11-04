@@ -25,17 +25,22 @@ WHAT EACH SECTION CAN CATCH
 
 from std.math import sqrt
 from std.random import random_float64, seed
-from std.sys import argv
+from std.sys import argv, get_defined_int
 
 from noeira.deep_agents.supermimic.kinematics import (
     FK_DADR, FK_JPOS, FK_JTYPE, FK_QADR, FK_REC, SM_FK_FIXED, SMFKTree, sm_fk_lane, sm_fk_tree,
     sm_fk_vjp_lane,
 )
-from noeira.deep_agents.supermimic.robot import G1Robot, G1Sim
+from noeira.deep_agents.supermimic.robot import G1Robot, G1Sim, G1MjlabRobot, G1MjlabSim
 
-comptime G1_FK_NB = G1Robot.NBODY
-comptime G1_FK_NQ = G1Robot.NQ
-comptime G1_FK_NV = G1Robot.NV
+# `-D SM_MJLAB=1`: the same gate on mjlab's G1 (oracle dumped with `--xml
+# noeira/envs/robots/assets/unitree_g1_mjlab.xml`).
+comptime TEST_MJLAB = get_defined_int["SM_MJLAB", 0]() != 0
+comptime TRobot = G1MjlabRobot if TEST_MJLAB else G1Robot
+
+comptime G1_FK_NB = TRobot.NBODY
+comptime G1_FK_NQ = TRobot.NQ
+comptime G1_FK_NV = TRobot.NV
 from noeira.io.npy import load_npy_2d_f64
 from noeira.physics3d.joint_types import JNT_FREE, JNT_HINGE
 
@@ -232,10 +237,10 @@ def main() raises:
     var a = argv()
     var dump = String(a[1]) if len(a) > 1 else String("/tmp/sm_heads")
     var t = Tally()
-    var sim = G1Sim.create()
+    var sim = TRobot.SIM.create()
 
     print("\n[1] the tree")
-    var tree = sm_fk_tree[DType.float64, G1Robot](sim)
+    var tree = sm_fk_tree[DType.float64, TRobot](sim)
     var nh = 0
     var nfix = 0
     var addr_ok = True
@@ -250,7 +255,7 @@ def main() raises:
     t.truth(Int(tree.data[FK_JTYPE]) == JNT_FREE and nh == 29 and nfix == G1_FK_NB - 30 and addr_ok,
         "1 free root, " + String(nh) + " hinges at qpos 7.. / dof 6.., " + String(nfix) + " fixed bodies")
 
-    var tree32 = sm_fk_tree[DType.float32, G1Robot](sim)
+    var tree32 = sm_fk_tree[DType.float32, TRobot](sim)
     suite(t, tree, tree32, dump, String(""), String(" (our asset)"))
 
     # Our asset (and mjlab's) puts every hinge anchor at its body origin, so

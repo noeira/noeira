@@ -45,7 +45,7 @@ The replay is the shared `deep_agents.data.EpisodicReplay` (host) or
 """
 
 from .config import SMConfigT, SMConfig, SMPaperG1, SMSmokeG1, SMWorldModelOf, SMPolicyOf, SMCriticOf
-from .robot import TrackingRobot, TrackingSim, TrackingBatchedSim, SMDims, G1Robot, G1Sim, G1BatchedSim
+from .robot import TrackingRobot, TrackingSim, TrackingBatchedSim, SMDims, G1Robot, G1Sim, G1BatchedSim, G1MjlabRobot, G1MjlabSim, G1MjlabBatchedSim
 from .agent import SuperMimicAgent, SMSchedule, sm_agent, sm_schedule
 from .agent_gpu import SuperMimicAgentGpu, sm_agent_gpu
 from .metrics import SMMetrics

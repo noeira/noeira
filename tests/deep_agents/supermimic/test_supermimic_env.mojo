@@ -4,10 +4,11 @@
 
 No reference implementation runs here (the reproduction's env is mjlab on
 MuJoCo Warp); every section checks a behaviour whose answer is known BY
-CONSTRUCTION. The reference library is built in the test from our G1's
-pose after 2 s of zero action from the `stand` start. That pose is LYING
-(pelvis ~0.11 m): open-loop PD on the default pose does not balance the
-robot. It is still a pose the PD holds, so a zero policy tracks it.
+CONSTRUCTION. The reference library is built in the test from the robot's
+pose after 2 s of zero action from its `stand` start (through its own
+tracking sim). On both G1s that pose is LYING (open-loop PD on the default
+pose does not balance the robot). It is still a pose the PD holds, so a zero
+policy tracks it. `-D SM_MJLAB=1` runs every section on mjlab's G1.
 
 [1] holding the pose: the settled reference, zero action, no noise, no DR —
     every step's reward within 2 % of its maximum (0.1), no termination.
@@ -15,7 +16,7 @@ robot. It is still a pose the PD holds, so a zero policy tracks it.
     every component of the difference inside its configured range.
 [3] the encoder bias: the observation's joint block is q + bias − q0 (no
     obs noise), and the PD target carries −bias (a biased lane settles ~ −b
-    from an unbiased twin); the 8 foot spheres carry priority 1 and ξ's
+    from an unbiased twin); the foot geoms (8 spheres; 14 capsules on mjlab's G1) carry priority 1 and ξ's
     friction.
 [4] termination: a reference 0.3 m above the robot terminates the first
     step: a transition row and a terminal row labelled 1, then a reset.
@@ -26,17 +27,21 @@ robot. It is still a pose the PD holds, so a zero policy tracks it.
     rewards and frames match the env's.
 """
 
-from std.sys import argv
+from std.sys import argv, get_defined_int
 
 from noeira.core.cont_action import ContAction
 from noeira.deep_agents.supermimic.env import SMReplayOf, SMTrackingEnv, SM_EPISODE_STEPS
 from noeira.deep_agents.supermimic.motion_library import SMMotionLibrary
-from noeira.deep_agents.supermimic.robot import G1Robot, SMDims
+from noeira.deep_agents.supermimic.robot import G1MjlabRobot, G1Robot, SMDims
 
-comptime SM_HIST = SMDims[G1Robot].HIST
-comptime SM_OBS = SMDims[G1Robot].OBS
-comptime SMG1Env = SMTrackingEnv[G1Robot]
-comptime SMReplayBuffer = SMReplayOf[G1Robot]
+# `-D SM_MJLAB=1`: the same gate on mjlab's G1.
+comptime TEST_MJLAB = get_defined_int["SM_MJLAB", 0]() != 0
+comptime TRobot = G1MjlabRobot if TEST_MJLAB else G1Robot
+
+comptime SM_HIST = SMDims[TRobot].HIST
+comptime SM_OBS = SMDims[TRobot].OBS
+comptime SMG1Env = SMTrackingEnv[TRobot]
+comptime SMReplayBuffer = SMReplayOf[TRobot]
 from noeira.envs.robots import UnitreeG1
 from noeira.envs.robots.unitree_g1_pd import G1_N_DOF, g1_default_pos
 from noeira.nn.constants import DT
@@ -61,20 +66,20 @@ struct Tally:
 
 
 def _standing_row() raises -> List[Scalar[DT]]:
-    """Our G1 settled for 2 s under zero action from its `stand` start."""
-    var env = UnitreeG1[DType.float64]()
-    _ = env.reset()
-    var a = ContAction[G1_N_DOF]()
+    """The robot under test settled for 2 s under zero action (no bias) from
+    its `stand` start, through its own tracking sim."""
+    var sim = TRobot.SIM.create()
+    var a = List[Float64](length=G1_N_DOF, fill=0.0)
     for _ in range(100):
-        _ = env.step(a)
+        sim.control_step(a, a)
     var row = List[Scalar[DT]](length=71, fill=0)
     for k in range(36):
-        row[k] = Scalar[DT](env.d.qpos.data[k])
+        row[k] = Scalar[DT](sim.qpos(k))
     # zero velocities: a still reference
     return row^
 
 
-def _library(stand: List[Scalar[DT]], lens: List[Int], dz: Float64) raises -> SMMotionLibrary[G1Robot]:
+def _library(stand: List[Scalar[DT]], lens: List[Int], dz: Float64) raises -> SMMotionLibrary[TRobot]:
     var total = 0
     for c in range(len(lens)):
         total += lens[c]
@@ -85,8 +90,8 @@ def _library(stand: List[Scalar[DT]], lens: List[Int], dz: Float64) raises -> SM
         rows[f * 71 + 2] += Scalar[DT](dz)
     var q0 = List[Float64](length=G1_N_DOF, fill=0.0)
     for j in range(G1_N_DOF):
-        q0[j] = g1_default_pos(j)
-    return SMMotionLibrary[G1Robot](rows^, lens, q0)
+        q0[j] = TRobot.default_joint_pos(j)
+    return SMMotionLibrary[TRobot](rows^, lens, q0)
 
 
 def main() raises:
@@ -144,7 +149,7 @@ def main() raises:
         ref ln = env4.lanes[i]
         var last = (SM_HIST - 1) * SM_OBS
         for j in range(G1_N_DOF):
-            var want = Float64(ln.s[7 + j]) + Float64(ln.xi[1 + j]) - g1_default_pos(j)
+            var want = Float64(ln.s[7 + j]) + Float64(ln.xi[1 + j]) - TRobot.default_joint_pos(j)
             e_obs = max(e_obs, abs(Float64(ln.hist[last + j]) - want))
     t.truth(e_obs <= 1e-6, "observed joints = q + bias - q0 (max err " + String(e_obs) + ")")
     var bad_f = 0
@@ -154,7 +159,9 @@ def main() raises:
                 bad_f += 1
             if abs(env4.lanes[i].sim.geom_field(g, GEOM_IDX_FRICTION) - Float64(env4.lanes[i].xi[0])) > 1e-6:
                 bad_f += 1
-    t.truth(bad_f == 0 and len(env4.tables.feet) == 8, String(len(env4.tables.feet)) + " foot geoms found by body name: priority 1, friction = xi[0]")
+    # BFM-Zero's G1: 4 contact spheres per foot; mjlab's: 7 capsules per foot
+    var want_feet = 14 if TEST_MJLAB else 8
+    t.truth(bad_f == 0 and len(env4.tables.feet) == want_feet, String(len(env4.tables.feet)) + " foot geoms found by body name: priority 1, friction = xi[0]")
 
     # the bias in the PD target: the same env with bias b settles ~ −b away
     var ea = SMG1Env(1, _library(stand, lens, 0.0), dr=False, obs_noise=False, reset_noise=False, action_noise=0.0, rng_seed=9)

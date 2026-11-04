@@ -36,3 +36,6 @@ from .so_arm101 import SoArm101Reach, SoArm101ReachConfig
 from .unitree_g1_xml import UnitreeG1Model
 from .unitree_g1_config import UnitreeG1Config
 from .unitree_g1 import UnitreeG1, UnitreeG1Batched, UnitreeG1BatchedDR
+from .unitree_g1_mjlab_xml import UnitreeG1MjlabModel
+from .unitree_g1_mjlab_config import UnitreeG1MjlabConfig
+from .unitree_g1_mjlab import UnitreeG1Mjlab, UnitreeG1MjlabBatched, UnitreeG1MjlabBatchedDR

@@ -36,16 +36,22 @@ from noeira.deep_agents.supermimic import SMConfig, SuperMimicTrainer
 from noeira.deep_agents.supermimic.eval import sm_benchmark_gpu, sm_summarize, sm_term_name
 from noeira.deep_agents.supermimic.heads import SM_N_TERMS
 from noeira.deep_agents.supermimic.motion_library import SMMotionLibrary
-from noeira.deep_agents.supermimic.robot import G1BatchedSim, G1Robot, G1Sim, TrackingSim
+from noeira.deep_agents.supermimic.robot import G1BatchedSim, G1Robot, G1Sim, TrackingSim, G1MjlabRobot, G1MjlabSim, G1MjlabBatchedSim
 from noeira.envs.robots.unitree_g1_pd import G1_N_DOF, g1_default_pos
 from noeira.io.artifact_sink import sink_for_run
 from noeira.nn.constants import DT
 
 
 comptime P = get_defined_int["SM_PAPER", 0]() != 0
+
+# The robot: mjlab's G1 (the reproduction's body) by default; `-D SM_BFM_G1=1`
+# selects BFM-Zero's G1 (checkpoints trained before 2026-11-05 are on it).
+comptime BFM_G1 = get_defined_int["SM_BFM_G1", 0]() != 0
+comptime Robot = G1Robot if BFM_G1 else G1MjlabRobot
+comptime RBatched[N: Int] = G1BatchedSim[N] if BFM_G1 else G1MjlabBatchedSim[N]
 # the training example's widths: a checkpoint loads only into its own config
 comptime C = SMConfig[
-    "gpu", G1Robot,
+    "gpu", Robot,
     2048 if P else 128, 64 if P else 64, 2048 if P else 128, 1024 if P else 64, 512 if P else 64, 256 if P else 32,
     2048 if P else 128, 1024 if P else 64, 512 if P else 64, 256 if P else 32, 256 if P else 64, 128 if P else 32,
     4096 if P else 8, 2048 if P else 64, 4096 if P else 16, 32,
@@ -62,7 +68,7 @@ def _opt(args: List[String], name: String, fallback: String) -> String:
 def _q0() -> List[Float64]:
     var q0 = List[Float64](length=G1_N_DOF, fill=0.0)
     for j in range(G1_N_DOF):
-        q0[j] = g1_default_pos(j)
+        q0[j] = Robot.default_joint_pos(j)
     return q0^
 
 
@@ -82,7 +88,7 @@ def _store_paths(spec: String) raises -> List[String]:
     return out^
 
 
-def _library(spec: String, max_clips: Int) raises -> SMMotionLibrary[G1Robot]:
+def _library(spec: String, max_clips: Int) raises -> SMMotionLibrary[Robot]:
     var paths = _store_paths(spec)
     var lens = List[Int]()
     var rows = List[Scalar[DT]]()
@@ -104,7 +110,7 @@ def _library(spec: String, max_clips: Int) raises -> SMMotionLibrary[G1Robot]:
         for i in range(rows_n * 71):
             rows[o + i] = refc[i]
     print("  library:", len(lens), "clips,", len(rows) // 71, "frames from", len(paths), "store(s)")
-    return SMMotionLibrary[G1Robot](rows^, lens, _q0())
+    return SMMotionLibrary[Robot](rows^, lens, _q0())
 
 
 def main() raises:
@@ -130,12 +136,12 @@ def main() raises:
     var artifacts = sink_for_run(run.id, run.dir)
     print("SuperMimic benchmark:", ckpt, "| run", run.dir)
     var ctx = DeviceContext()
-    var trainer = SuperMimicTrainer[C].for_robot(G1Sim.create(), Optional(ctx))
+    var trainer = SuperMimicTrainer[C].for_robot(Robot.SIM.create(), Optional(ctx))
     var ctr = trainer.load_state(ckpt)
     print("  checkpoint at iteration", ctr[0], ",", ctr[1], "updates")
     var lib = _library(store, max_clips)
     var t0 = perf_counter_ns()
-    var res = sm_benchmark_gpu[C, G1BatchedSim[C.LANES]](ctx, trainer, lib^, G1BatchedSim[C.LANES].create(ctx), max_clips)
+    var res = sm_benchmark_gpu[C, RBatched[C.LANES]](ctx, trainer, lib^, RBatched[C.LANES].create(ctx), max_clips)
     var s = sm_summarize(res)
     var secs = Float64(perf_counter_ns() - t0) * 1e-9
     print("\n", s.clips, "clips | failed", s.failed, "(", 100.0 * Float64(s.failed) / Float64(max(s.clips, 1)), "% ) | mean norm return", s.mean_norm_return, "| step-weighted", s.step_weighted_norm_return, "|", secs, "s")

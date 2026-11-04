@@ -83,6 +83,7 @@ struct SuperMimicAgent[C: SMConfigT](Movable):
     var ep_sum: List[Float64]
     var ep_n: List[Int]
     var finished: List[Float64]     # normalised returns Σr / (0.1·T) of finished episodes
+    var finished_len: List[Int]     # their lengths (steps)
     var t_sim: Float64
     var t_wm: Float64
     var t_pi: Float64
@@ -108,6 +109,7 @@ struct SuperMimicAgent[C: SMConfigT](Movable):
         self.ep_sum = List[Float64](length=Self.C.LANES, fill=0.0)
         self.ep_n = List[Int](length=Self.C.LANES, fill=0)
         self.finished = List[Float64]()
+        self.finished_len = List[Int]()
         self.t_sim = 0.0
         self.t_wm = 0.0
         self.t_pi = 0.0
@@ -125,6 +127,7 @@ struct SuperMimicAgent[C: SMConfigT](Movable):
         self.ep_sum = move.ep_sum^
         self.ep_n = move.ep_n^
         self.finished = move.finished^
+        self.finished_len = move.finished_len^
         self.t_sim = move.t_sim
         self.t_wm = move.t_wm
         self.t_pi = move.t_pi
@@ -205,6 +208,7 @@ struct SuperMimicAgent[C: SMConfigT](Movable):
             self.ep_n[i] += 1
             if self.env.lanes[i].ep_len == 0:      # reset this step
                 self.finished.append(self.ep_sum[i] / (0.1 * Float64(self.ep_n[i])))
+                self.finished_len.append(self.ep_n[i])
                 self.ep_sum[i] = 0.0
                 self.ep_n[i] = 0
         self.t_sim += Float64(perf_counter_ns() - t0) * 1e-9
@@ -255,10 +259,11 @@ struct SuperMimicAgent[C: SMConfigT](Movable):
         for it in range(1, iters + 1):
             lg.add(self.iterate())
             if sm_tick[Self.C, L](
-                self.trainer, lg, it, iters, self.updates, self.finished, self.lr, self.t_sim, self.t_wm, self.t_pi,
+                self.trainer, lg, self.env.sampler, it, iters, self.updates, self.finished, self.finished_len, self.lr, self.t_sim, self.t_wm, self.t_pi,
                 log_every, logger, verbose, checkpoint_every, checkpoint_path, artifacts, run_dir,
             ):
                 self.finished = List[Float64]()
+                self.finished_len = List[Int]()
         self.last_avg_reward = lg.last_avg
 
 

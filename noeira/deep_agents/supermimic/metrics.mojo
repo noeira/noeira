@@ -27,12 +27,21 @@ is the same one:
 SuperMimic's own (no dashboard group yet): `wm_nse_1step` / `wm_nse_8step`
 (the world model's open-loop error at 1 and k steps, the paper's diagnostic),
 `lr`, and the time split `sim_s` / `wm_s` / `pi_s`.
+
+THE CURRICULUM'S (`SMSamplerStats`, in units of the sampler's G_MAX):
+`episode_len` (the finished episodes' mean length), `reset_bin_return`
+(the mean estimated return of the bins the window's resets drew),
+`bin_return_mean` (the estimate over all bins) and `reset_hard_share` (the
+share of resets in the previous window's hardest decile of bins; 0.1 =
+uniform). `avg_reward` is an average over FINISHED episodes whose start the
+sampler chooses: read it against these.
 """
 
 from std.time import perf_counter_ns
 
 from noeira.core.logger import Logger
 from noeira.deep_agents.supermimic.config import SMConfigT
+from noeira.deep_agents.supermimic.motion_library import SMResetSampler, SMSamplerStats
 from noeira.deep_agents.supermimic.trainer import SMUpdateMetrics, SuperMimicTrainer
 from noeira.deep_agents.training.checkpoint import announce_checkpoint
 from noeira.io.artifact_sink import ArtifactSink
@@ -78,6 +87,10 @@ struct SMMetrics(Copyable, Movable):
     var sim_s: LogScalar[DT]
     var wm_s: LogScalar[DT]
     var pi_s: LogScalar[DT]
+    var episode_len: LogScalar[DT]
+    var reset_bin_return: LogScalar[DT]
+    var bin_return_mean: LogScalar[DT]
+    var reset_hard_share: LogScalar[DT]
 
 
 @always_inline
@@ -107,6 +120,7 @@ struct SMTrainLog(Movable):
     var t0: Int
     var t_win: Int
     var last_avg: Float64
+    var last_len: Float64
 
     def __init__(out self, horizon: Int, lanes: Int):
         self.horizon = horizon
@@ -129,6 +143,7 @@ struct SMTrainLog(Movable):
         self.t0 = perf_counter_ns()
         self.t_win = self.t0
         self.last_avg = 0.0
+        self.last_len = 0.0
 
     def __init__(out self, *, deinit move: Self):
         self.horizon = move.horizon
@@ -151,6 +166,7 @@ struct SMTrainLog(Movable):
         self.t0 = move.t0
         self.t_win = move.t_win
         self.last_avg = move.last_avg
+        self.last_len = move.last_len
 
     def add(mut self, r: SMIterInfo):
         self.n_it += 1
@@ -172,13 +188,16 @@ struct SMTrainLog(Movable):
         self.tmn += r.pi.critic_target_mean
 
     def flush(
-        mut self, updates: Int, finished: List[Float64], lr: Float64,
+        mut self, updates: Int, finished: List[Float64], finished_len: List[Int], ss: SMSamplerStats, lr: Float64,
         t_sim: Float64, t_wm: Float64, t_pi: Float64,
     ) -> SMMetrics:
         """The window's bundle; starts the next window."""
         var tr = 0.0
+        var tl = 0
         for k in range(len(finished)):
             tr += finished[k]
+        for k in range(len(finished_len)):
+            tl += finished_len[k]
         var nf = len(finished)
         var d = Float64(max(self.n_up, 1))
         var di = Float64(max(self.n_it, 1))
@@ -187,6 +206,8 @@ struct SMTrainLog(Movable):
         var h = Float64(self.horizon)
         if nf > 0:            # a window with no finished episode repeats the last value
             self.last_avg = tr / Float64(nf)
+        if len(finished_len) > 0:
+            self.last_len = Float64(tl) / Float64(len(finished_len))
         var m = SMMetrics(
             _ls(self.last_avg), _ls(Float64(nf)),
             _ls(self.rsum / di), _ls(Float64(self.nterm) / (di * Float64(self.lanes))),
@@ -196,6 +217,7 @@ struct SMTrainLog(Movable):
             _ls(lr), _ls(Float64(updates)), _ls(Float64(self.n_up)),
             _ls(Float64(self.n_it) / max(win_s, 1e-9)), _ls(Float64(now - self.t0) * 1e-9),
             _ls(t_sim), _ls(t_wm), _ls(t_pi),
+            _ls(self.last_len), _ls(ss.reset_bin_return), _ls(ss.bin_return_mean), _ls(ss.reset_hard_share),
         )
         self.n_it = 0
         self.n_up = 0
@@ -224,6 +246,7 @@ def sm_print_metrics(it: Int, m: SMMetrics):
         "| wm", m.wm_loss.v, "nse1", m.wm_nse_1step.v, "nse8", m.wm_nse_8step.v,
         "| pi_loss", m.policy_loss.v, "imag_r", m.imagined_reward_mean.v, "|g|", m.actor_grad_norm.v,
         "| critic", m.critic_loss.v, "V", m.value_mean.v, "R", m.value_target_mean.v,
+        "| len", m.episode_len.v, "G_reset", m.reset_bin_return.v, "G_bins", m.bin_return_mean.v, "hard", m.reset_hard_share.v,
         "|", m.steps_per_s.v, "steps/s | sim/wm/pi", m.sim_s.v, m.wm_s.v, m.pi_s.v, "s",
     )
 
@@ -237,8 +260,8 @@ def sm_emit[L: Logger](logger: Optional[Pointer[L, MutAnyOrigin]], m: SMMetrics,
 
 
 def sm_tick[C: SMConfigT, L: Logger](
-    mut trainer: SuperMimicTrainer[C], mut lg: SMTrainLog, it: Int, total: Int, updates: Int,
-    finished: List[Float64], lr: Float64, t_sim: Float64, t_wm: Float64, t_pi: Float64,
+    mut trainer: SuperMimicTrainer[C], mut lg: SMTrainLog, mut sampler: SMResetSampler, it: Int, total: Int, updates: Int,
+    finished: List[Float64], finished_len: List[Int], lr: Float64, t_sim: Float64, t_wm: Float64, t_pi: Float64,
     log_every: Int, logger: Optional[Pointer[L, MutAnyOrigin]], verbose: Bool,
     checkpoint_every: Int, checkpoint_path: String, artifacts: Optional[ArtifactSink], run_dir: String,
 ) raises -> Bool:
@@ -248,7 +271,7 @@ def sm_tick[C: SMConfigT, L: Logger](
     (the caller then starts a new window of finished episodes)."""
     var logged = False
     if log_every > 0 and (it % log_every == 0 or it == total):
-        var m = lg.flush(updates, finished, lr, t_sim, t_wm, t_pi)
+        var m = lg.flush(updates, finished, finished_len, sampler.take_stats(), lr, t_sim, t_wm, t_pi)
         if verbose:
             sm_print_metrics(it, m)
         sm_emit(logger, m, it)

@@ -31,6 +31,7 @@ from noeira.deep_agents.supermimic.agent import SMSchedule, sm_cosine_lr, sm_sch
 from noeira.deep_agents.supermimic.metrics import SMIterInfo, SMTrainLog, sm_tick
 from noeira.io.artifact_sink import ArtifactSink
 from noeira.deep_agents.supermimic.config import SMConfigT
+from noeira.deep_agents.supermimic.eval import SMInRunBench
 from noeira.deep_agents.supermimic.env_gpu import SMReplayGpuOf, SMTrackingEnvGpu
 from noeira.deep_agents.supermimic.heads import SMHeadLayout, sm_observation_lane
 from noeira.deep_agents.supermimic.imagination import SMImagBatch
@@ -109,6 +110,7 @@ struct SuperMimicAgentGpu[C: SMConfigT, BS: TrackingBatchedSim](Movable):
     var ep_sum: List[Float64]
     var ep_n: List[Int]
     var finished: List[Float64]
+    var finished_len: List[Int]     # their lengths (steps)
     var t_sim: Float64
     var t_wm: Float64
     var t_pi: Float64
@@ -154,6 +156,7 @@ struct SuperMimicAgentGpu[C: SMConfigT, BS: TrackingBatchedSim](Movable):
         self.ep_sum = List[Float64](length=Self.C.LANES, fill=0.0)
         self.ep_n = List[Int](length=Self.C.LANES, fill=0)
         self.finished = List[Float64]()
+        self.finished_len = List[Int]()
         self.t_sim = 0.0
         self.t_wm = 0.0
         self.t_pi = 0.0
@@ -196,6 +199,7 @@ struct SuperMimicAgentGpu[C: SMConfigT, BS: TrackingBatchedSim](Movable):
         self.ep_sum = move.ep_sum^
         self.ep_n = move.ep_n^
         self.finished = move.finished^
+        self.finished_len = move.finished_len^
         self.t_sim = move.t_sim
         self.t_wm = move.t_wm
         self.t_pi = move.t_pi
@@ -270,6 +274,7 @@ struct SuperMimicAgentGpu[C: SMConfigT, BS: TrackingBatchedSim](Movable):
         for i in range(Self.C.LANES):
             if len(self.env.logs[i].rewards) == 0:
                 self.finished.append(self.ep_sum[i] / (0.1 * Float64(max(self.ep_n[i], 1))))
+                self.finished_len.append(self.ep_n[i])
                 self.ep_sum[i] = 0.0
                 self.ep_n[i] = 0
         self.t_sim += Float64(perf_counter_ns() - t0) * 1e-9
@@ -299,7 +304,7 @@ struct SuperMimicAgentGpu[C: SMConfigT, BS: TrackingBatchedSim](Movable):
                 info.updated = True
         return info^
 
-    def train[L: Logger = NoOpLogger](
+    def train[L: Logger = NoOpLogger, BB: TrackingBatchedSim = Self.BS](
         mut self,
         iters: Int,
         log_every: Int = 50,
@@ -310,16 +315,34 @@ struct SuperMimicAgentGpu[C: SMConfigT, BS: TrackingBatchedSim](Movable):
         checkpoint_path: String = "",
         artifacts: Optional[ArtifactSink] = None,
         run_dir: String = "",
+        bench: Optional[Pointer[SMInRunBench[Self.C, BB], MutAnyOrigin]] = None,
     ) raises:
-        """As `SuperMimicAgent.train`."""
+        """As `SuperMimicAgent.train`; with `bench`, the fixed-clip benchmark
+        every `bench.every` iterations and at the end (`SMInRunBench`)."""
         var lg = SMTrainLog(Self.C.HORIZON, Self.C.LANES)
         for it in range(1, iters + 1):
             lg.add(self.iterate())
             if sm_tick[Self.C, L](
-                self.trainer, lg, it, iters, self.updates, self.finished, self.lr, self.t_sim, self.t_wm, self.t_pi,
+                self.trainer, lg, self.env.sampler, it, iters, self.updates, self.finished, self.finished_len, self.lr, self.t_sim, self.t_wm, self.t_pi,
                 log_every, logger, verbose, checkpoint_every, checkpoint_path, artifacts, run_dir,
             ):
                 self.finished = List[Float64]()
+                self.finished_len = List[Int]()
+            if bench and bench.value()[].due(it, iters):
+                var bp = bench.value()
+                var tb = perf_counter_ns()
+                var sm = bp[].run(self.ctx, self.trainer)
+                var fail = Float64(sm.failed) / Float64(max(sm.clips, 1))
+                if verbose:
+                    print(
+                        "  bench @", it, ":", sm.clips, "clips | norm return", sm.mean_norm_return, "| failed", sm.failed,
+                        "|", Float64(perf_counter_ns() - tb) * 1e-9, "s",
+                    )
+                if logger:
+                    var lp = logger.value()
+                    lp[].log_scalar("bench_norm_return", sm.mean_norm_return, it)
+                    lp[].log_scalar("bench_failed", fail, it)
+                    lp[].flush()
         self.last_avg_reward = lg.last_avg
 
 

@@ -39,17 +39,22 @@ taking q̄ for q, and the observation's gravity using the NORMALISED root.
 
 from std.math import cos, sin
 from std.random import random_float64, seed
-from std.sys import argv
+from std.sys import argv, get_defined_int
 
 from noeira.deep_agents.supermimic.heads import (
     SM_N_TERMS, SMHeadLayout, sm_heads_lane, sm_heads_vjp_lane, sq_quat_err, sq_quat_err_vjp,
 )
 from noeira.deep_agents.supermimic.kinematics import Q4
-from noeira.deep_agents.supermimic.robot import G1Robot, G1Sim, SMDims
+from noeira.deep_agents.supermimic.robot import G1Robot, G1Sim, SMDims, G1MjlabRobot, G1MjlabSim
+
+# `-D SM_MJLAB=1`: the same gate on mjlab's G1 (oracle dumped with `--xml
+# noeira/envs/robots/assets/unitree_g1_mjlab.xml`).
+comptime TEST_MJLAB = get_defined_int["SM_MJLAB", 0]() != 0
+comptime TRobot = G1MjlabRobot if TEST_MJLAB else G1Robot
 from noeira.deep_agents.supermimic.tables import SMTables, sm_tables
 
-comptime D = SMDims[G1Robot]
-comptime L = SMHeadLayout[G1Robot]
+comptime D = SMDims[TRobot]
+comptime L = SMHeadLayout[TRobot]
 comptime SM_N_DOF = D.NDOF
 comptime SM_N_TRACKED = D.N_TRACKED
 comptime SM_OBS_DIM = D.OBS
@@ -127,7 +132,7 @@ struct Lane[dt: DType](Movable):
         self.total = move.total
 
     def forward(mut self, mut tb: SMTables[Self.dt]) where Self.dt.is_floating_point():
-        self.total = sm_heads_lane[Self.dt, G1Robot](
+        self.total = sm_heads_lane[Self.dt, TRobot](
             tb.tree_ptr(), tb.head_ptr(), _p(self.s), _p(self.a), _p(self.ap), _p(self.xi), _p(self.rf),
             _p(self.terms), _p(self.feat), _p(self.obs), _p(self.scratch),
         )
@@ -176,14 +181,14 @@ def main() raises:
     var av = argv()
     var dump = String(av[1]) if len(av) > 1 else String("/tmp/sm_heads")
     var t = Tally()
-    var sim = G1Sim.create()
+    var sim = TRobot.SIM.create()
     var d = Dump(dump)
     var B = d.B
     var third = B // 3
 
     print("\n[1] the per-model table")
     var q0 = load_npy_2d_f64(dump + "/h_q0.npy", SM_N_DOF).values.copy()
-    var table = sm_tables[DType.float64, G1Robot](sim, q0)
+    var table = sm_tables[DType.float64, TRobot](sim, q0)
     var tr = load_npy_2d_f64(dump + "/h_tracked.npy", SM_N_TRACKED)
     var bad = 0
     for k in range(SM_N_TRACKED):
@@ -238,7 +243,7 @@ def main() raises:
         var gs = List[Float64](length=SM_STATE_DIM, fill=0.0)
         var ga = List[Float64](length=SM_N_DOF, fill=0.0)
         var gap = List[Float64](length=SM_N_DOF, fill=0.0)
-        sm_heads_vjp_lane[DType.float64, G1Robot](
+        sm_heads_vjp_lane[DType.float64, TRobot](
             table.tree_ptr(), table.head_ptr(), _p(lanes[b].s), _p(lanes[b].a), _p(lanes[b].ap), _p(lanes[b].rf),
             g_r[b], _p(gf), _p(go), _p(lanes[b].scratch), _p(gs), _p(ga), _p(gap),
         )
@@ -290,7 +295,7 @@ def main() raises:
     t.truth(e_fd <= 1e-6, "16 directions over near and far lanes: max rel err " + String(e_fd))
 
     print("\n[5] float32 forward")
-    var table32 = sm_tables[DType.float32, G1Robot](sim, q0)
+    var table32 = sm_tables[DType.float32, TRobot](sim, q0)
     var e32 = 0.0
     for b in range(B):
         var l = Lane[DType.float32](d, b)

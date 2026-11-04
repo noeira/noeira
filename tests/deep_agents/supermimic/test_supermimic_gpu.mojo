@@ -31,7 +31,9 @@ from noeira.deep_agents.supermimic.blocks import sm_random_perm
 from noeira.deep_agents.supermimic.config import SMConfig
 from noeira.deep_agents.supermimic.imagination import SMImagBatch, sm_imagine
 from noeira.deep_agents.supermimic.params import sm_restore, sm_snapshot
-from noeira.deep_agents.supermimic.robot import G1Robot, G1Sim, SMDims, TrackingSim
+from std.sys import get_defined_int
+
+from noeira.deep_agents.supermimic.robot import G1Robot, G1Sim, SMDims, TrackingSim, G1MjlabRobot
 from noeira.deep_agents.supermimic.trainer import SuperMimicTrainer
 from noeira.deep_agents.supermimic.world_model import SMWindowBatch, SMWorldModel, sm_wm_window_loss
 from noeira.nn.constants import DT
@@ -39,7 +41,9 @@ from noeira.nn.core.initializer import Kaiming
 from noeira.nn.core.tensor import TensorImpl
 
 
-comptime R = G1Robot
+# `-D SM_MJLAB=1`: the same gate on mjlab's G1.
+comptime TEST_MJLAB = get_defined_int["SM_MJLAB", 0]() != 0
+comptime R = G1MjlabRobot if TEST_MJLAB else G1Robot
 comptime D = SMDims[R]
 comptime n = R.NDOF
 comptime NB = 16          # policy batch
@@ -262,7 +266,7 @@ def _cpu_trainer() raises -> SuperMimicTrainer[TC]:
     """A CPU trainer, the dynamics' zero last layer perturbed so the rollout
     moves."""
     seed(11)
-    var tc = SuperMimicTrainer[TC].for_robot(G1Sim.create())
+    var tc = SuperMimicTrainer[TC].for_robot(R.SIM.create())
     var w = sm_snapshot["cpu"](tc.wm, None)
     for i in range(len(w)):
         for k in range(len(w[i])):
@@ -273,7 +277,7 @@ def _cpu_trainer() raises -> SuperMimicTrainer[TC]:
 
 def _gpu_twin(mut tc: SuperMimicTrainer[TC], ctx: DeviceContext) raises -> SuperMimicTrainer[TG]:
     """A GPU trainer holding the CPU one's weights."""
-    var tg = SuperMimicTrainer[TG].for_robot(G1Sim.create(), ctx)
+    var tg = SuperMimicTrainer[TG].for_robot(R.SIM.create(), ctx)
     sm_restore["gpu"](tg.wm, sm_snapshot["cpu"](tc.wm, None), ctx)
     sm_restore["gpu"](tg.pol, sm_snapshot["cpu"](tc.pol, None), ctx)
     sm_restore["gpu"](tg.critic, sm_snapshot["cpu"](tc.critic, None), ctx)
@@ -410,14 +414,14 @@ def test_checkpoint(ctx: DeviceContext, mut tl: Tally) raises:
     _ = tg.wm_update[B](w)
     var path = String("/tmp/sm_ckpt_gpu_test.ckpt")
     tg.save_state(path, 123, 45)
-    var fresh = SuperMimicTrainer[TC].for_robot(G1Sim.create())
+    var fresh = SuperMimicTrainer[TC].for_robot(R.SIM.create())
     var ctr = fresh.load_state(path)
     var bad = _same(sm_snapshot["gpu"](tg.wm, ctx), sm_snapshot["cpu"](fresh.wm, None))
     bad += _same(sm_snapshot["gpu"](tg.pol, ctx), sm_snapshot["cpu"](fresh.pol, None))
     bad += _same(sm_snapshot["gpu"](tg.critic, ctx), sm_snapshot["cpu"](fresh.critic, None))
     tl.check(bad == 0 and ctr[0] == 123 and ctr[1] == 45, "GPU file -> CPU trainer: " + String(bad) + " mismatching weights, counters " + String(ctr[0]) + " / " + String(ctr[1]))
     tc.save_state(path, 7, 3)
-    var fg = SuperMimicTrainer[TG].for_robot(G1Sim.create(), ctx)
+    var fg = SuperMimicTrainer[TG].for_robot(R.SIM.create(), ctx)
     var cg = fg.load_state(path)
     var bad2 = _same(sm_snapshot["cpu"](tc.wm, None), sm_snapshot["gpu"](fg.wm, ctx))
     bad2 += _same(sm_snapshot["cpu"](tc.pol, None), sm_snapshot["gpu"](fg.pol, ctx))

@@ -274,12 +274,14 @@ def main() -> None:
     ap.add_argument("--out", type=Path, required=True)
     ap.add_argument("--batch", type=int, default=64)
     ap.add_argument("--seed", type=int, default=11)
+    ap.add_argument("--xml", type=Path, default=G1_XML,
+                    help="the G1 model (default ours; noeira/envs/robots/assets/unitree_g1_mjlab.xml for mjlab's)")
     a = ap.parse_args()
     a.out.mkdir(parents=True, exist_ok=True)
     torch.set_default_dtype(torch.float64)
     fkmod, headsmod = reference_modules()
     rng = np.random.default_rng(a.seed)
-    m = mujoco.MjModel.from_xml_path(str(G1_XML))
+    m = mujoco.MjModel.from_xml_path(str(a.xml))
     dump(fkmod, m, a.out, "", a.batch, rng)
     dump_heads(fkmod, headsmod, m, a.out, a.batch, rng)
     # ⚠ EVERY HINGE ANCHOR OF OUR G1 (and of mjlab's) IS AT ITS BODY ORIGIN

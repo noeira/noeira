@@ -35,6 +35,12 @@ Options
 --seed S
 --no-noise     no observation / action / reset noise, no DR (debugging)
 --ckpt-every N checkpoint every N steps (default 0: only at the end)
+--bench-every N  SM_GPU=2: the Appendix F benchmark on a fixed clip set every N
+               steps and at the end (`SMInRunBench`; default 0 = off), logged
+               as `bench_norm_return` / `bench_failed`: the unbiased learning
+               curve (`avg_reward` averages episodes the reset sampler chose)
+--bench-clips K  that set: K clips evenly spaced over the library (default
+               the benchmark's lane count, 512 at paper scale: one clip per lane)
 
 THE RUN IS AN OBJECT ON DISK: `runs/<id>/` holds `run.kv`, `metrics.csv` (the
 `SMMetrics` bundle every `--log` steps) and the checkpoint `last` (world
@@ -56,9 +62,10 @@ from noeira.data.store import TrajectoryStore
 from noeira.core.run import RunContext, register_run
 from noeira.core.run_session import RunLogger, finish_run, run_logger
 from noeira.deep_agents.supermimic import SMConfig, sm_agent, sm_agent_gpu
+from noeira.deep_agents.supermimic.eval import SMInRunBench
 from noeira.io.artifact_sink import ArtifactSink, sink_for_run
 from noeira.deep_agents.supermimic.motion_library import SMMotionLibrary
-from noeira.deep_agents.supermimic.robot import G1BatchedSim, G1Robot
+from noeira.deep_agents.supermimic.robot import G1BatchedSim, G1Robot, G1Sim, G1MjlabRobot, G1MjlabSim, G1MjlabBatchedSim
 from noeira.envs.robots import UnitreeG1
 from noeira.envs.robots.unitree_g1_pd import G1_N_DOF, g1_default_pos
 from noeira.nn.constants import DT
@@ -67,14 +74,22 @@ from noeira.nn.constants import DT
 comptime MODE = get_defined_int["SM_GPU", 0]()       # 0 CPU, 1 nets on the GPU, 2 all on the GPU
 comptime TARGET: StaticString = "gpu" if MODE != 0 else "cpu"
 comptime P = get_defined_int["SM_PAPER", 0]() != 0
+
+# The robot: mjlab's G1 (the reproduction's body) by default; `-D SM_BFM_G1=1`
+# selects BFM-Zero's G1 (checkpoints trained before 2026-11-05 are on it).
+comptime BFM_G1 = get_defined_int["SM_BFM_G1", 0]() != 0
+comptime Robot = G1Robot if BFM_G1 else G1MjlabRobot
+comptime RBatched[N: Int] = G1BatchedSim[N] if BFM_G1 else G1MjlabBatchedSim[N]
 # SMPaperG1's widths with -D SM_PAPER=1, SMSmokeG1's otherwise (one concrete
-# SMConfig, so its robot stays G1Robot for the library's type)
+# SMConfig, so its robot stays Robot for the library's type)
 comptime C = SMConfig[
-    TARGET, G1Robot,
+    TARGET, Robot,
     2048 if P else 128, 64 if P else 64, 2048 if P else 128, 1024 if P else 64, 512 if P else 64, 256 if P else 32,
     2048 if P else 128, 1024 if P else 64, 512 if P else 64, 256 if P else 32, 256 if P else 64, 128 if P else 32,
     4096 if P else 8, 2048 if P else 64, 4096 if P else 16, 32,
 ]
+comptime BENCH_LANES = 512 if P else 8         # the in-run benchmark's simulator (memory: see SMInRunBench)
+comptime BenchSim = RBatched[BENCH_LANES]
 
 
 def _opt(args: List[String], name: String, fallback: String) -> String:
@@ -94,11 +109,11 @@ def _flag(args: List[String], name: String) -> Bool:
 def _q0() -> List[Float64]:
     var q0 = List[Float64](length=G1_N_DOF, fill=0.0)
     for j in range(G1_N_DOF):
-        q0[j] = g1_default_pos(j)
+        q0[j] = Robot.default_joint_pos(j)
     return q0^
 
 
-def _synthetic() raises -> SMMotionLibrary[G1Robot]:
+def _synthetic() raises -> SMMotionLibrary[Robot]:
     """Our G1 settled 2 s under zero action, then two clips of it swaying its
     arms and waist (sinusoids on the reference joints, velocities consistent)."""
     var env = UnitreeG1[DType.float64]()
@@ -116,7 +131,7 @@ def _synthetic() raises -> SMMotionLibrary[G1Robot]:
             var w = 1.5 + 0.1 * Float64(j)
             rows[f * 71 + 7 + j] += Scalar[DT](0.3 * sin(w * t))
             rows[f * 71 + 42 + j] = Scalar[DT](0.3 * w * sin(w * t + 1.5707963267948966))
-    return SMMotionLibrary[G1Robot](rows^, lens, _q0())
+    return SMMotionLibrary[Robot](rows^, lens, _q0())
 
 
 def _store_paths(spec: String) raises -> List[String]:
@@ -139,7 +154,7 @@ def _store_paths(spec: String) raises -> List[String]:
     return out^
 
 
-def _from_store(spec: String, max_clips: Int) raises -> SMMotionLibrary[G1Robot]:
+def _from_store(spec: String, max_clips: Int) raises -> SMMotionLibrary[Robot]:
     """The clips of every store, concatenated (each store's episodes are
     contiguous from row 0); `max_clips` > 0 stops after that many."""
     var paths = _store_paths(spec)
@@ -164,12 +179,41 @@ def _from_store(spec: String, max_clips: Int) raises -> SMMotionLibrary[G1Robot]
             rows[o + i] = refc[i]
     var frames = len(rows) // 71
     print("  library:", len(lens), "clips,", frames, "frames (", Float64(frames) / 50.0 / 3600.0, "h ) from", len(paths), "store(s)")
-    return SMMotionLibrary[G1Robot](rows^, lens, _q0())
+    return SMMotionLibrary[Robot](rows^, lens, _q0())
+
+
+def _subset(lib: SMMotionLibrary[Robot], k: Int) raises -> SMMotionLibrary[Robot]:
+    """K clips evenly spaced over `lib` (clip i · n / K): a fixed set that
+    spans every store of a sorted import."""
+    var n = lib.num_clips
+    var kk = min(max(k, 1), n)
+    var lens = List[Int]()
+    var rows = List[Scalar[DT]]()
+    comptime S = 71
+    for i in range(kk):
+        var c = i * n // kk
+        var f0 = lib.clip_start[c]
+        var l = lib.clip_len[c]
+        lens.append(l)
+        var o = len(rows)
+        rows.resize(o + l * S, 0)
+        for j in range(l * S):
+            rows[o + j] = lib.rows[f0 * S + j]
+    return SMMotionLibrary[Robot](rows^, lens, _q0())
+
+
+def _bench(
+    ctx: DeviceContext, var lib: SMMotionLibrary[Robot], every: Int,
+) raises -> SMInRunBench[C, BenchSim]:
+    print("  in-run benchmark:", lib.num_clips, "clips,", lib.num_frames, "frames, every", every, "steps")
+    var sim = BenchSim.create(ctx)
+    return SMInRunBench[C, BenchSim](ctx, lib^, sim^, every)
 
 
 def _train(
-    var lib: SMMotionLibrary[G1Robot], iters: Int, log_every: Int, noise: Bool, seed_v: Int, ckpt_every: Int,
+    var lib: SMMotionLibrary[Robot], iters: Int, log_every: Int, noise: Bool, seed_v: Int, ckpt_every: Int,
     lp: Pointer[RunLogger, MutAnyOrigin], ckpt: String, artifacts: Optional[ArtifactSink], run_dir: String,
+    bench_every: Int, bench_clips: Int,
 ) raises -> String:
     """Train in the build's mode; returns the run's outcome."""
     var t0 = perf_counter_ns()
@@ -177,8 +221,17 @@ def _train(
     var avg: Float64
     comptime if MODE == 2:
         var dctx = DeviceContext()
-        var agent = sm_agent_gpu[C, G1BatchedSim[C.LANES]](dctx, lib^, G1BatchedSim[C.LANES].create(dctx), iters, noise, seed_v)
-        agent.train[RunLogger](iters, log_every, logger=lp, checkpoint_every=ckpt_every, checkpoint_path=ckpt, artifacts=artifacts, run_dir=run_dir)
+        var bench_lib = Optional(_subset(lib, (bench_clips if bench_clips > 0 else BENCH_LANES) if bench_every > 0 else 1))
+        var agent = sm_agent_gpu[C, RBatched[C.LANES]](dctx, lib^, RBatched[C.LANES].create(dctx), iters, noise, seed_v)
+        if bench_every > 0:
+            var bench = _bench(dctx, bench_lib.take(), bench_every)
+            agent.train[RunLogger, BenchSim](
+                iters, log_every, logger=lp, checkpoint_every=ckpt_every, checkpoint_path=ckpt, artifacts=artifacts, run_dir=run_dir,
+                bench=Pointer(to=bench).as_unsafe_any_origin(),
+            )
+            _ = bench^
+        else:
+            agent.train[RunLogger](iters, log_every, logger=lp, checkpoint_every=ckpt_every, checkpoint_path=ckpt, artifacts=artifacts, run_dir=run_dir)
         updates = agent.updates
         avg = agent.last_avg_reward
     else:
@@ -206,6 +259,10 @@ def main() raises:
     var noise = not _flag(args, String("--no-noise"))
 
     var ckpt_every = Int(_opt(args, String("--ckpt-every"), String("0")))
+    var bench_every = Int(_opt(args, String("--bench-every"), String("0")))
+    var bench_clips = Int(_opt(args, String("--bench-clips"), String("0")))
+    if bench_every > 0 and MODE != 2:
+        raise Error("--bench-every needs the device env (-D SM_GPU=2)")
 
     var lib = _from_store(store, max_clips) if store != "" else _synthetic()
     var mode_s = String("cpu") if MODE == 0 else (String("gpu-nets") if MODE == 1 else String("gpu-all"))
@@ -231,12 +288,13 @@ def main() raises:
     logger.set_config("noise", String(noise))
     logger.set_config("library_frames", String(lib.num_frames))
     logger.set_config("library_clips", String(lib.num_clips))
+    logger.set_config("bench_every", String(bench_every))
     register_run(run, logger)
     var artifacts = sink_for_run(run.id, run.dir)
     var lp = Pointer(to=logger).as_unsafe_any_origin()
     var ckpt = run.checkpoint_path(String("last"))
     print("SuperMimic, mode", MODE, "(" + String(TARGET) + "):", C.LANES, "lanes, H =", C.HORIZON, ", WM batch", C.WM_BATCH, ", policy batch", C.PI_BATCH, ", noise", noise)
     print("  run", run.dir)
-    var outcome = _train(lib^, iters, log_every, noise, seed_v, ckpt_every, lp, ckpt, artifacts, run.dir)
+    var outcome = _train(lib^, iters, log_every, noise, seed_v, ckpt_every, lp, ckpt, artifacts, run.dir, bench_every, bench_clips)
     finish_run(run, logger, artifacts, outcome)
     _ = logger  # lifetime extender for lp

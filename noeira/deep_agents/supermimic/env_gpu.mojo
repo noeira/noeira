@@ -537,6 +537,7 @@ struct SMTrackingEnvGpu[R: TrackingRobot, BS: TrackingBatchedSim](Movable):
         for l in lanes:
             var x = random_float64(0.0, acc)
             var b = SMResetSampler.bin_from_cdf(cdf, x)
+            self.sampler.note_draw(b)
             var f = SMResetSampler.frame_from[Self.R](self.lib, b, random_float64(0.0, 1.0))
             if self.next_frame[l] >= 0:      # the evaluation's clip queue
                 f = self.next_frame[l]
