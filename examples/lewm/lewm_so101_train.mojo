@@ -1,7 +1,7 @@
 """Train a LeWM world model on the SO-101 tower's rendered teacher rollouts.
 
 noeira-docs/SO101_LEWM_PLAN.md S1. The reference LeWM stack
-(`experimental/lewm/ref_*`, the published PushT model's architecture and
+(`deep_agents/lewm/`, the published PushT model's architecture and
 recipe) re-shaped for the rig:
 
     input    the two cameras stacked as 6 channels at R × R (R = 112,
@@ -40,15 +40,15 @@ from std.random import seed
 from max.gpu.host import DeviceContext
 
 from noeira.nn.constants import DT
-from noeira.experimental.lewm.ref_trainer import LeWMRefTrainer, RefStepStats, recipe_lr
-from noeira.experimental.lewm.so101_trainer import (
+from noeira.deep_agents.lewm.trainer import LeWMRefTrainer, RefStepStats, recipe_lr
+from noeira.experimental.lewm_so101.trainer import (
     LeWMSo101Trainer,
     LeWMProprioTrainer,
     LeWMIDMTrainer,
     LeWMProprioIDMTrainer,
 )
 from noeira.nn.combinators.graph_module2 import NamedNodeGraph
-from noeira.experimental.lewm.so101_data import So101WMData, T, ACT_IN, CAMS, JOINTS, PROP
+from noeira.experimental.lewm_so101.data import So101WMData, T, ACT_IN, CAMS, JOINTS, PROP
 
 
 comptime R = 112

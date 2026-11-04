@@ -74,7 +74,7 @@ file: the tool prints the running size.
 ## `--resize R` — the world model's frames, stored small
 
 `--resize R` stores each camera area-averaged to R × R
-(`experimental/lewm/so101_frames.AreaResize`, the SAME resampler the real
+(`vision/area_resize.AreaResize`, the SAME resampler the real
 frames go through in SO101_LEWM_PLAN S2; the 4:3 aspect is squashed on
 purpose, identically in both domains): `images` becomes (2 × 3 × R × R).
 Rendering is unchanged — 320 × 240, 4x MSAA — and the host check still runs
@@ -131,7 +131,7 @@ from std.time import perf_counter_ns
 from max.gpu.host import DeviceContext
 
 from noeira.data.column import ColumnSpec
-from noeira.experimental.lewm.so101_frames import AreaResize
+from noeira.vision.area_resize import AreaResize
 from noeira.data.store import TrajectoryStoreWriter
 from noeira.deep_agents.demos.file import DemoSet, read_demo_file
 from noeira.envs.phyics3d_env import Phyics3dEnv

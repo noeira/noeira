@@ -144,7 +144,7 @@ trait NamedNodeGraph(TwoInputGraph):
     """`TwoInputGraph` plus the by-NAME node surface a trainer drives: a node's
     attribute, a node's output, and whether a node exists. For a trainer that
     is generic over several graphs of one family (the SO-101 world models,
-    `experimental/lewm/so101_trainer.mojo`); `ComputeGraph` conforms."""
+    `experimental/lewm_so101/trainer.mojo`); `ComputeGraph` conforms."""
 
     @staticmethod
     def has_node[name: StaticString]() -> Bool:

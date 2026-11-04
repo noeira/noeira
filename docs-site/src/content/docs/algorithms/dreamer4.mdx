@@ -208,10 +208,11 @@ in progress. It is documented so the state is knowable, not because it is ready.
 ## Related work
 
 The same territory is being explored from another direction in
-`noeira/experimental/lewm/` — a reference-exact port of LeWM, a JEPA-style
-world model with no reconstruction loss, which matches the published PushT
-checkpoint against PyTorch and is being trained on the SO-101 rig. It is
-research code with no stability guarantee at all.
+`noeira/deep_agents/lewm/` — a reference-exact port of LeWM, a JEPA-style
+world model with no reconstruction loss. It matches the published PushT
+checkpoint against PyTorch, layer for layer and gradient for gradient, and
+trains and plans natively. Its SO-101 sim-to-real variants are research code
+in `noeira/experimental/lewm_so101/`, with no stability guarantee at all.
 
 ## Next
 

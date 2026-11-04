@@ -72,17 +72,18 @@ from noeira.nn.constants import DT
 from noeira.nn.core.initializer import Kaiming
 from noeira.deep_agents.act.refload import RefDump
 from noeira.envs.pusht import PushTAction
-from noeira.experimental.lewm.ref_load import load_ref
-from noeira.experimental.lewm.ref_rollout import (
+from noeira.deep_agents.lewm.load import load_ref
+from noeira.deep_agents.lewm.rollout import (
     LeWMRefRollout, RefEncoder, encode_ref, cem_step, PlanCost, REF_EMB, REF_ACT,
 )
-from noeira.experimental.lewm.intact import IntactDirect
-from noeira.experimental.lewm.ref_trainer import (
+from noeira.deep_agents.lewm.intact import IntactDirect
+from noeira.deep_agents.lewm.trainer import (
     LeWMRefTrainer, TrainerSnapshot, FillFromSnapshot, REF_T,
 )
-from noeira.experimental.lewm.paper_pairs import (
+from noeira.deep_agents.lewm.adaptation import tta_windows
+from noeira.envs.pusht.eval_pairs import (
     PairEnv, PAIR_HW, imagenet_from_hwc255, render_frame, gauss,
-    VisualShift, shift_frame, tta_windows, pair_margin, DynShift,
+    VisualShift, shift_frame, pair_margin, DynShift,
 )
 
 

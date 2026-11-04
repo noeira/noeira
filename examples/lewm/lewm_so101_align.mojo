@@ -43,9 +43,9 @@ from noeira.nn.constants import DT
 from noeira.nn.core.tensor import Tensor
 from noeira.nn.core.tensor_refs import TensorRefs
 from noeira.nn.core.initializer import Kaiming
-from noeira.experimental.lewm.ref_model import LeWMEncoderRef
-from noeira.experimental.lewm.ref_load import load_ref
-from noeira.experimental.lewm.so101_data import So101WMData, CAMS, JOINTS
+from noeira.deep_agents.lewm.model import LeWMEncoderRef
+from noeira.deep_agents.lewm.load import load_ref
+from noeira.experimental.lewm_so101.data import So101WMData, CAMS, JOINTS
 from noeira.data.store import TrajectoryStore
 
 

@@ -38,7 +38,7 @@ from noeira.tasks.placement.so101_tower import So101TowerPlacement
 from noeira.tasks.posed_reset import posed_qpos
 from noeira.tasks.so101_tower_xml import So101TowerModel
 from noeira.tasks.so101_tower_rig import So101TowerUnits, RIG_JOINT_ZERO_FOLLOWER
-from noeira.experimental.lewm.so101_data import So101Rig, JOINTS
+from noeira.experimental.lewm_so101.data import So101Rig, JOINTS
 
 comptime W = 320
 comptime H = 240

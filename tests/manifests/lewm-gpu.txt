@@ -2,10 +2,10 @@
 #
 # GPU paths of the LeWM port that need no torch dump: frames, windows and
 # the reconstruction probe; then the framework gates the port depends on.
-tests/experimental/lewm/lewm/test_pixel_convert_gpu.mojo
-tests/experimental/lewm/lewm/test_window_source_hwc.mojo
-tests/experimental/lewm/lewm/test_decoder.mojo
-tests/experimental/lewm/lewm/test_pong_data_gpu.mojo
+tests/data/test_pixel_convert_gpu.mojo
+tests/data/test_window_source_hwc.mojo
+tests/deep_agents/lewm/test_decoder.mojo
+tests/data/test_pong_data_gpu.mojo
 
 # --- framework gates LeWM depends on (P2) ---
 tests/nn/test_layer_norm_eps_gpu.mojo

@@ -35,12 +35,12 @@ from noeira.nn.constants import DT
 from noeira.nn.core.initializer import Kaiming
 from noeira.nn.datasets.lewm_pusht import LewmPushTExpert
 from noeira.deep_agents.act.refload import RefDump
-from noeira.experimental.lewm.ref_load import load_ref
-from noeira.experimental.lewm.ref_rollout import (
+from noeira.deep_agents.lewm.load import load_ref
+from noeira.deep_agents.lewm.rollout import (
     LeWMRefRollout, RefEncoder, encode_ref, REF_EMB, REF_ACT,
 )
-from noeira.experimental.lewm.decoder import patchify, unpatchify
-from noeira.experimental.lewm.decoder_trainer import LeWMDecoderTrainer
+from noeira.deep_agents.lewm.decoder import patchify, unpatchify
+from noeira.deep_agents.lewm.decoder_trainer import LeWMDecoderTrainer
 from noeira.io.png import save_png
 
 

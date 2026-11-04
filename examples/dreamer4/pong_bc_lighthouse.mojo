@@ -39,7 +39,7 @@ from noeira.nn.core.tensor import Tensor
 from noeira.nn.core.tensor_refs import TensorRefs
 from noeira.nn.core.initializer import Xavier
 from noeira.nn.optimizer.adam import Adam
-from noeira.experimental.lewm.pong_data import WindowSource
+from noeira.data.window_source import WindowSource
 from noeira.envs.arcade_games.pong.offline_buffer import PongOfflineBuffer
 
 from noeira.deep_agents.dreamer4.tokenizer import Dreamer4Tokenizer

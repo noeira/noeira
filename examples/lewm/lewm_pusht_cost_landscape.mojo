@@ -31,9 +31,9 @@ from max.gpu.host import DeviceContext
 from noeira.nn.constants import DT
 from noeira.nn.core.initializer import Kaiming
 from noeira.deep_agents.act.refload import RefDump
-from noeira.experimental.lewm.ref_load import load_ref
-from noeira.experimental.lewm.ref_rollout import RefEncoder, encode_ref, REF_EMB
-from noeira.experimental.lewm.paper_pairs import (
+from noeira.deep_agents.lewm.load import load_ref
+from noeira.deep_agents.lewm.rollout import RefEncoder, encode_ref, REF_EMB
+from noeira.envs.pusht.eval_pairs import (
     PairEnv, PAIR_HW, imagenet_from_hwc255, render_frame, pair_margin,
     VisualShift, shift_frame,
 )

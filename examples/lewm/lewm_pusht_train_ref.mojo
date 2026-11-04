@@ -50,8 +50,8 @@ from max.gpu.host import DeviceContext
 
 from noeira.nn.constants import DT
 from noeira.deep_agents.act.refload import RefDump
-from noeira.experimental.lewm.ref_trainer import LeWMRefTrainer, recipe_lr, RefStepStats
-from noeira.experimental.lewm.batch_loader import LewmBatchLoaderThread
+from noeira.deep_agents.lewm.trainer import LeWMRefTrainer, recipe_lr, RefStepStats, REF_T, REF_IMG, REF_ACT_IN
+from noeira.data.lewm_pusht_loader import LewmBatchLoaderThread
 
 
 comptime B = 128
@@ -123,7 +123,7 @@ def _validate[BB: Int](
     var vuse = List[Int](capacity=n_val * BB)
     for k in range(n_val * BB):
         vuse.append(Int(val_idx[k]))
-    var vloader = LewmBatchLoaderThread[BB](h5, vuse, am, asd, stages)
+    var vloader = LewmBatchLoaderThread[BB, REF_T, REF_IMG, REF_ACT_IN](h5, vuse, am, asd, stages)
     tr.set_eval()
     vloader.request(0)
     var v = List[Float64](length=3, fill=0.0)
@@ -273,7 +273,7 @@ def main() raises:
         var use = List[Int](capacity=(steps_per_epoch - first) * B)
         for k in range(first * B, steps_per_epoch * B):
             use.append(clips[k])
-        var loader = LewmBatchLoaderThread[B](h5, use, am, asd, stages)
+        var loader = LewmBatchLoaderThread[B, REF_T, REF_IMG, REF_ACT_IN](h5, use, am, asd, stages)
         tr.set_train()
         if first < steps_per_epoch:
             loader.request(0)

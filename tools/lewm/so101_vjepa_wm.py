@@ -17,7 +17,7 @@ applied to real.
 
 ## Frames and actions
 
-The ViT-tiny windows (`experimental/lewm/so101_data.mojo`): T = 4 frames
+The ViT-tiny windows (`experimental/lewm_so101/data.mojo`): T = 4 frames
 FS = 5 ticks apart; for frame t, the FS per-tick changes of the commanded
 target from that tick on, z-scored per joint with the training set's
 statistics. Here only the ticks 0, 5, 10, ... of each episode are encoded

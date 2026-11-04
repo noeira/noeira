@@ -14,7 +14,7 @@ from noeira.nn.constants import DT
 from noeira.nn.core.tensor import Tensor
 from noeira.nn.core.param import ParamVisitor
 from noeira.nn.core.initializer import Kaiming
-from noeira.experimental.lewm.ref_model import LeWMLossGraphRef
+from noeira.deep_agents.lewm.model import LeWMLossGraphRef
 
 
 comptime Graph = LeWMLossGraphRef[

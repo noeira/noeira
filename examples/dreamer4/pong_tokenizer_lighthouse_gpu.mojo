@@ -23,7 +23,7 @@ from noeira.nn.optimizer.adam import Adam
 from noeira.envs.arcade_games.pong.online_sampler import (
     OnlinePongSampler, ScriptedPongPolicy,
 )
-from noeira.experimental.lewm.pong_data import WindowSource
+from noeira.data.window_source import WindowSource
 from noeira.deep_agents.dreamer4.tokenizer import Dreamer4Tokenizer
 from noeira.deep_agents.dreamer4.recon_loss import (
     masked_recon_grad_gpu, full_recon_psnr,

@@ -89,11 +89,11 @@ from noeira.tasks.so101_tower_rig import (
 from noeira.tasks.so101_tower_xml import So101TowerModel
 from noeira.tasks.spec import load_family
 from noeira.data.store import TrajectoryStore
-from noeira.experimental.lewm.ref_model import LeWMEncoderRef, ActionEmbedderRef
-from noeira.experimental.lewm.ref_load import load_ref
-from noeira.experimental.lewm.ref_rollout import LeWMRefRollout, REF_CTX
-from noeira.experimental.lewm.so101_frames import AreaResize
-from noeira.experimental.lewm.so101_data import FS, JOINTS, ACT_IN, CAMS, PROP, So101WMData
+from noeira.deep_agents.lewm.model import LeWMEncoderRef, ActionEmbedderRef
+from noeira.deep_agents.lewm.load import load_ref
+from noeira.deep_agents.lewm.rollout import LeWMRefRollout, REF_CTX
+from noeira.vision.area_resize import AreaResize
+from noeira.experimental.lewm_so101.data import FS, JOINTS, ACT_IN, CAMS, PROP, So101WMData
 
 comptime E = Phyics3dEnv[So101TowerModel, So101TowerConfig, DT, False]
 comptime NQ = So101TowerModel.NQ

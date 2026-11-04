@@ -29,8 +29,8 @@ from max.gpu.host import DeviceContext
 
 from noeira.nn.constants import DT
 from noeira.deep_agents.act.refload import RefDump
-from noeira.experimental.lewm.ref_trainer import LeWMRefTrainer, REF_T, REF_IMG, REF_ACT_IN
-from noeira.experimental.lewm.batch_loader import LewmBatchLoaderThread
+from noeira.deep_agents.lewm.trainer import LeWMRefTrainer, REF_T, REF_IMG, REF_ACT_IN
+from noeira.data.lewm_pusht_loader import LewmBatchLoaderThread
 
 
 comptime B = 128
@@ -95,7 +95,7 @@ def main() raises:
     var asd: List[Float32] = [Float32(a_std[0]), Float32(a_std[1])]
     # the reads run on their own thread (batch_loader.mojo): a step's ~4,000
     # kernel launches hold this one
-    var loader = LewmBatchLoaderThread[B](h5, idx, am, asd, stages)
+    var loader = LewmBatchLoaderThread[B, REF_T, REF_IMG, REF_ACT_IN](h5, idx, am, asd, stages)
 
     var ours = List[Float64]()
     var theirs = List[Float64]()

@@ -49,9 +49,9 @@ from std.random import seed
 from max.gpu.host import DeviceContext
 
 from noeira.nn.constants import DT
-from noeira.experimental.lewm.ref_trainer import LeWMRefTrainer, WMWindowLoss
-from noeira.experimental.lewm.so101_trainer import LeWMProprioTrainer
-from noeira.experimental.lewm.so101_data import So101WMData, ACT_IN, CAMS, JOINTS, PROP, T, FS
+from noeira.deep_agents.lewm.trainer import LeWMRefTrainer, WMWindowLoss
+from noeira.experimental.lewm_so101.trainer import LeWMProprioTrainer
+from noeira.experimental.lewm_so101.data import So101WMData, ACT_IN, CAMS, JOINTS, PROP, T, FS
 
 
 comptime R = 112

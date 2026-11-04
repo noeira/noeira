@@ -47,11 +47,11 @@ from noeira.envs.pusht.render_swm import render_pusht_swm_at, render_pusht_swm_c
 from noeira.io.video.encoder import VideoEncoder
 from noeira.io.fileio import rename_over
 from std.os import makedirs
-from noeira.experimental.lewm.ref_load import load_ref
-from noeira.experimental.lewm.ref_rollout import (
+from noeira.deep_agents.lewm.load import load_ref
+from noeira.deep_agents.lewm.rollout import (
     LeWMRefRollout, RefEncoder, encode_ref, cem_step, REF_EMB, REF_ACT,
 )
-from noeira.experimental.lewm.paper_pairs import (
+from noeira.envs.pusht.eval_pairs import (
     imagenet_from_hwc255, render_frame, gauss, pair_success, video_frame,
 )
 
