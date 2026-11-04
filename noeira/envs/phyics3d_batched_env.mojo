@@ -125,6 +125,7 @@ struct Phyics3dBatchedEnv[
     SOLVER: StaticString = "newton",
     PARALLEL_GPU: Bool = True,
     CRBA_TREEWALK: Bool = True,
+    LANE_DR: Bool = False,
 ](BatchedEnv):
     """GPU-batched MuJoCo env, physics on the per-field tensor path,
     driver IO via the `BatchedEnv` ABI. See module docstring.
@@ -136,7 +137,12 @@ struct Phyics3dBatchedEnv[
     production mass-matrix algorithm — tolerance-equal to dense at
     ~1e-8/eval, exactly as in legacy). Gates that need a bit-exact
     baseline against a serial legacy reference pin these params
-    explicitly."""
+    explicitly.
+
+    LANE_DR=True (Euler integrator only): the physics reads `d.lane_dr`,
+    per-lane overrides of shared model quantities — contact friction by
+    body and a CoM offset by body (`physics3d/constraints/lane_dr.mojo`).
+    Off by default: every other env compiles exactly as before."""
 
     comptime ENV_TARGET: StaticString = "gpu"
     comptime OBS_DIM: Int = Self.MODEL_DEF.OBS_DIM
@@ -259,6 +265,7 @@ struct Phyics3dBatchedEnv[
         RNE_POST = Self.CONFIG.RNE_POST,
         MAX_CONDIM = Self.MODEL_DEF.MAX_CONDIM,
         NOSLIP_ITER = Self.MODEL_DEF.NOSLIP_ITER,
+        LANE_DR = Self.LANE_DR,
     ]
     var integ_rk4: Self.IntegRK4
     var integ_euler: Self.IntegEuler
@@ -901,14 +908,14 @@ struct Phyics3dBatchedEnv[
         """Fields FK over the whole batch (mf -> Data xpos/xquat/xipos
         [+ site_xpos]). Replaces the legacy slab `forward_kinematics_gpu` in
         the reset paths so reset no longer reads the model slab."""
-        forward_kinematics["gpu", DT, BATCH=Self.N_ENVS](self.d, self.mf, c)
+        forward_kinematics["gpu", DT, BATCH=Self.N_ENVS, LANE_DR=Self.LANE_DR](self.d, self.mf, c)
 
     def _run_fields_vel(mut self, c: DeviceContext) raises:
         """Body world velocities (xvel/xangvel) over the batch, from the
         current qvel. Companion to `_run_fields_fk` — the integrators compute
         these mid-step, so hooks reading them after integration need a
         refresh. Mirrors `Phyics3dEnv._fields_vel`."""
-        compute_body_velocities["gpu", DT, BATCH=Self.N_ENVS](self.d, self.mf, c)
+        compute_body_velocities["gpu", DT, BATCH=Self.N_ENVS, LANE_DR=Self.LANE_DR](self.d, self.mf, c)
 
     # ── hook kernels (legacy Phyics3dEnv GPU code, verbatim) ──────────
 
@@ -1422,6 +1429,7 @@ struct Phyics3dBatchedEnv[
             comptime if Self.CONFIG.INTEGRATOR == "euler":
                 self.integ_euler.step["gpu"](self.d, self.mf, ctx)
             else:
+                comptime assert not Self.LANE_DR, "LANE_DR (per-lane DR) is wired into the Euler integrator only"
                 self.integ_rk4.step["gpu"](self.d, self.mf, ctx)
         comptime if DEBUG:
             c.synchronize()
@@ -1711,6 +1719,13 @@ struct Phyics3dBatchedEnv[
 
     def obs_ptr(self) -> Pointer[Scalar[DT], MutAnyOrigin]:
         return mptr(self._obs.unsafe_ptr())
+
+    def lane_dr_ptr(mut self) -> Pointer[Scalar[DT], MutAnyOrigin]:
+        """`Data.lane_dr` on the device, `[N_ENVS, NBODY * 4]`: per-lane
+        overrides of shared model quantities (`physics3d/constraints/
+        lane_dr.mojo`). Read by the physics only when this env is built with
+        `LANE_DR=True`."""
+        return self.d.lane_dr.dev.value().unsafe_ptr().as_unsafe_any_origin()
 
     def action_ptr(self) -> Pointer[Scalar[DT], MutAnyOrigin]:
         return mptr(self._action.unsafe_ptr())

@@ -47,3 +47,8 @@ tests/physics3d/test_sin_cos_device.mojo
 # knob does. Self-contained: the tower scene from the tree, no dumps.
 tests/physics3d/test_domain_randomization_gpu.mojo
 tests/tasks/test_device_placement_gpu.mojo
+# Per-lane domain randomisation (`Data.lane_dr`, LANE_DR=True): a 2-lane
+# batch with per-lane friction / CoM overrides equals, lane for lane and bit
+# for bit, a plain batch carrying the same values in its model; zeros are the
+# model. Runs on Metal and NVIDIA (the dm_control quadruped).
+tests/physics3d/test_lane_dr_gpu.mojo

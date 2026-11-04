@@ -62,6 +62,7 @@ from ..solver.je_budget import je_ws_size
 from ..solver.cg_solve import solve_cg
 from ..solver.island_pgs_solve import solve_island_pgs
 from ..collision.broadphase_sap import detect_contacts_auto
+from ..constraints.lane_dr import apply_lane_friction
 from ..types import ConeType
 from ..dynamics.rne import compute_bias_forces_rne
 from ..dynamics.rne_post import compute_rne_post
@@ -779,9 +780,13 @@ struct EulerIntegrator[
     RNE_POST: Bool = False,
     MAX_CONDIM: Int = 3,
     NOSLIP_ITER: Int = 0,
+    LANE_DR: Bool = False,
 ](Movable):
     """Owns its scratch; steps contact-free dynamics on either target. See
     module docstring for what is deliberately not yet ported.
+    LANE_DR=True: each lane's per-body overrides in `Data.lane_dr`
+    (`constraints/lane_dr.mojo`): contact friction after detection, the
+    CoM offset in FK and body velocities.
     PARALLEL_GPU=True: the GPU FK / body-velocity / cdof / CRBA /
     LDL-factor / M^-1 / RNE stages run their cooperative within-env (_mt)
     kernels (bit-exact vs serial; other stages stay serial). CPU ignores
@@ -865,7 +870,7 @@ struct EulerIntegrator[
         var _e_last: Int = 0
         comptime if _EULER_PROBE:
             _e_last = Int(perf_counter_ns())
-        forward_kinematics[target, Self.DTYPE, BATCH=Self.BATCH, PARALLEL = Self.PARALLEL_GPU](d, m, ctx)
+        forward_kinematics[target, Self.DTYPE, BATCH=Self.BATCH, PARALLEL = Self.PARALLEL_GPU, LANE_DR = Self.LANE_DR](d, m, ctx)
         # ⚠⚠ `subtree_com` IS BUILT HERE, BEFORE THE POSITION-STAGE SENSORS,
         # AND IT USED TO BE BUILT AFTER THEM. It is `mj_comPos`, part of
         # `mj_fwdPosition` and therefore upstream of `mj_sensorPos`
@@ -926,7 +931,7 @@ struct EulerIntegrator[
             var _e_now = Int(perf_counter_ns())
             _e_fk += _e_now - _e_last
             _e_last = _e_now
-        compute_body_velocities[target, Self.DTYPE, BATCH=Self.BATCH, PARALLEL = Self.PARALLEL_GPU](d, m, ctx)
+        compute_body_velocities[target, Self.DTYPE, BATCH=Self.BATCH, PARALLEL = Self.PARALLEL_GPU, LANE_DR = Self.LANE_DR](d, m, ctx)
         # ── mj_sensorVel ──────────────────────────────────────────────────
         # `mj_fwdVelocity`'s point (engine_forward.c:1814). velocimeter, gyro
         # and subtreelinvel read `xvel`/`xangvel`, which exist as of the line
@@ -1107,6 +1112,11 @@ struct EulerIntegrator[
             # O(N^2) otherwise; same routing as the legacy step kernel's
             # detect_contacts_auto_gpu call).
             detect_contacts_auto[target, Self.DTYPE, BATCH=Self.BATCH](d, m, ctx)
+            # LANE_DR: each lane's per-body friction overrides, on the
+            # contacts just detected, before any solver reads them
+            # (`constraints/lane_dr.mojo`).
+            comptime if Self.LANE_DR:
+                apply_lane_friction[target, Self.DTYPE, Self.D, Self.BATCH](d, ctx)
             comptime if _EULER_PROBE:
                 var _e_now = Int(perf_counter_ns())
                 _e_coll += _e_now - _e_last

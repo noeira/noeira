@@ -108,6 +108,11 @@ struct Data[
     # the flag down every actuator counts, because nothing can be saturated
     # in a step that never actuated.
     var actdamp_act: TensorImpl[Self.DTYPE]  # [BATCH, NACT]
+    # PER-LANE OVERRIDES OF SHARED MODEL QUANTITIES (domain randomisation):
+    # per body, a contact-friction override and a CoM offset —
+    # `constraints/lane_dr.mojo` has the layout. Zero = the model's values.
+    # Read ONLY by an integrator / FK built with `LANE_DR=True`.
+    var lane_dr: TensorImpl[Self.DTYPE]  # [BATCH, NBODY*4]
     # World space (FK products)
     var xpos: TensorImpl[Self.DTYPE]  # [BATCH, NBODY*3]
     var xquat: TensorImpl[Self.DTYPE]  # [BATCH, NBODY*4]
@@ -321,6 +326,7 @@ struct Data[
         if _nact_alloc < 1:
             _nact_alloc = 1
         self.actdamp_act = TensorImpl[Self.DTYPE].alloc(_nact_alloc)
+        self.lane_dr = TensorImpl[Self.DTYPE].alloc(B * dims.get_nbody() * 4)
         self.xpos = TensorImpl[Self.DTYPE].alloc(B * dims.get_nbody() * 3)
         self.xquat = TensorImpl[Self.DTYPE].alloc(B * dims.get_nbody() * 4)
         self.xipos = TensorImpl[Self.DTYPE].alloc(B * dims.get_nbody() * 3)
@@ -422,6 +428,7 @@ struct Data[
         self.qacc_warmstart.upload(ctx)
         self.dof_actdamp.upload(ctx)
         self.actdamp_act.upload(ctx)
+        self.lane_dr.upload(ctx)
         self.xpos.upload(ctx)
         self.xquat.upload(ctx)
         self.xipos.upload(ctx)

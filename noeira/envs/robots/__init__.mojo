@@ -35,4 +35,4 @@ from .so_arm100 import SoArm100Reach, SoArm100ReachConfig
 from .so_arm101 import SoArm101Reach, SoArm101ReachConfig
 from .unitree_g1_xml import UnitreeG1Model
 from .unitree_g1_config import UnitreeG1Config
-from .unitree_g1 import UnitreeG1, UnitreeG1Batched
+from .unitree_g1 import UnitreeG1, UnitreeG1Batched, UnitreeG1BatchedDR

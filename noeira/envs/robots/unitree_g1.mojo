@@ -24,3 +24,9 @@ comptime UnitreeG1[DTYPE: DType = DType.float64] = Phyics3dEnv[
 comptime UnitreeG1Batched[N_ENVS: Int] = Phyics3dBatchedEnv[
     UnitreeG1Model, UnitreeG1Config, N_ENVS, TERMINATE_ON_UNHEALTHY=False
 ]
+
+comptime UnitreeG1BatchedDR[N_ENVS: Int] = Phyics3dBatchedEnv[
+    UnitreeG1Model, UnitreeG1Config, N_ENVS, TERMINATE_ON_UNHEALTHY=False, LANE_DR=True
+]
+"""The same batch with per-lane overrides of contact friction and CoM
+(`physics3d/constraints/lane_dr.mojo`): SuperMimic's domain randomisation."""
