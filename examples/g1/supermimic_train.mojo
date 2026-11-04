@@ -1,8 +1,16 @@
 # +--------------------------------------------------------------------------+ #
-# | SuperMimic on our G1 — the training loop, CPU smoke scale
+# | SuperMimic on our G1 — the training loop, smoke scale
 # +--------------------------------------------------------------------------+ #
-"""Algorithm A.1 end to end on the CPU (`SuperMimicAgent[SMSmokeG1]`):
-collect, fit the world model, improve the policy through it.
+"""Algorithm A.1 end to end: collect, fit the world model, improve the policy.
+
+Smoke scale by default (`SMSmokeG1`'s widths). The env and
+replay run on the CPU; the networks and the four update blocks run on the
+CPU, or on the GPU when built with `-D SM_GPU=1`. `-D SM_GPU=2` puts the env
+and the replay on the device too (`SuperMimicAgentGpu` over the batched G1:
+NVIDIA only); `-D SM_PAPER=1` the paper's widths and 4096 lanes:
+
+    pixi run -e apple mojo build -I . -D SM_GPU=1 examples/g1/supermimic_train.mojo -o sm_train_gpu
+    pixi run -e nvidia mojo build -I . -D SM_GPU=2 -D SM_PAPER=1 examples/g1/supermimic_train.mojo -o sm_train_dev
 
     # a SuperMimic library store (examples/g1/seed_import.mojo's output):
     pixi run mojo run -I . examples/g1/supermimic_train.mojo --store seed_g1_50hz.h5 --iters 400
@@ -28,20 +36,33 @@ Options
 """
 
 from std.math import sin
-from std.sys import argv
+from std.sys import argv, get_defined_int
+
+from max.gpu.host import DeviceContext
 from std.time import perf_counter_ns
 
 from noeira.core.cont_action import ContAction
 from noeira.data.store import TrajectoryStore
-from noeira.deep_agents.supermimic import SMSchedule, SMSmokeG1, SuperMimicAgent
+from noeira.deep_agents.supermimic import SMConfig, SMSchedule, SuperMimicAgent
+from noeira.deep_agents.supermimic.agent_gpu import SuperMimicAgentGpu
 from noeira.deep_agents.supermimic.motion_library import SMMotionLibrary
-from noeira.deep_agents.supermimic.robot import G1Robot
+from noeira.deep_agents.supermimic.robot import G1BatchedSim, G1Robot
 from noeira.envs.robots import UnitreeG1
 from noeira.envs.robots.unitree_g1_pd import G1_N_DOF, g1_default_pos
 from noeira.nn.constants import DT
 
 
-comptime C = SMSmokeG1
+comptime MODE = get_defined_int["SM_GPU", 0]()       # 0 CPU, 1 nets on the GPU, 2 all on the GPU
+comptime TARGET: StaticString = "gpu" if MODE != 0 else "cpu"
+comptime P = get_defined_int["SM_PAPER", 0]() != 0
+# SMPaperG1's widths with -D SM_PAPER=1, SMSmokeG1's otherwise (one concrete
+# SMConfig, so its robot stays G1Robot for the library's type)
+comptime C = SMConfig[
+    TARGET, G1Robot,
+    2048 if P else 128, 64 if P else 64, 2048 if P else 128, 1024 if P else 64, 512 if P else 64, 256 if P else 32,
+    2048 if P else 128, 1024 if P else 64, 512 if P else 64, 256 if P else 32, 256 if P else 64, 128 if P else 32,
+    4096 if P else 8, 2048 if P else 64, 4096 if P else 16, 32,
+]
 
 
 def _opt(args: List[String], name: String, fallback: String) -> String:
@@ -118,8 +139,19 @@ def main() raises:
     var noise = not _flag(args, String("--no-noise"))
 
     var lib = _from_store(store, max_clips) if store != "" else _synthetic()
-    var agent = SuperMimicAgent[C](lib^, SMSchedule(iters, 0.4, 40, 2e-4, 1000, noise, seed_v))
-    print("SuperMimic CPU smoke (SMSmokeG1):", C.LANES, "lanes, H =", C.HORIZON, ", WM batch", C.WM_BATCH, ", policy batch", C.PI_BATCH, ", noise", noise)
+    var sched = SMSchedule(iters, 0.4, 40, 2e-4, 1000, noise, seed_v)
+    print("SuperMimic, mode", MODE, "(" + String(TARGET) + "):", C.LANES, "lanes, H =", C.HORIZON, ", WM batch", C.WM_BATCH, ", policy batch", C.PI_BATCH, ", noise", noise)
     var t0 = perf_counter_ns()
-    agent.train(iters, log_every)
-    print("done:", iters, "steps,", agent.updates, "updates in", Float64(perf_counter_ns() - t0) * 1e-9, "s")
+    comptime if MODE == 2:
+        var dctx = DeviceContext()
+        var sim = G1BatchedSim[C.LANES].create(dctx)
+        var agent = SuperMimicAgentGpu[C, G1BatchedSim[C.LANES]](dctx, lib^, sim^, sched^)
+        agent.train(iters, log_every)
+        print("done:", iters, "steps,", agent.updates, "updates in", Float64(perf_counter_ns() - t0) * 1e-9, "s")
+    else:
+        var ctx: Optional[DeviceContext] = None
+        comptime if TARGET == "gpu":
+            ctx = DeviceContext()
+        var agent = SuperMimicAgent[C](lib^, sched^, ctx)
+        agent.train(iters, log_every)
+        print("done:", iters, "steps,", agent.updates, "updates in", Float64(perf_counter_ns() - t0) * 1e-9, "s")

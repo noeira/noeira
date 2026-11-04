@@ -140,12 +140,12 @@ def qapply_inv_vjp_q[dt: DType](q: Q4[dt], v: Q4[dt], g: Q4[dt]) -> Q4[dt]:
 
 
 @always_inline
-def sm_term_features[dt: DType](s: FP[dt], rf_root_z: Scalar[dt], rf_root_q: Q4[dt]) -> SIMD[dt, 2]:
+def sm_term_features[dt: DType](s: FP[dt], rf_root_z: Scalar[dt], rf_root_q: Q4[dt]) -> Tuple[Scalar[dt], Scalar[dt]]:
     """`AnalyticHeads.termination_features`: [ref root z − z, (R_ref⁻¹ g)_z −
     (R⁻¹ g)_z], g = (0, 0, −1), R from the state's RAW root quaternion. The
     paper terminates at |height| > 0.25 m or |tilt| > 0.8."""
     var grav = Q4[dt](0, 0, -1, 0)
-    return SIMD[dt, 2](rf_root_z - _at(s, 2), qapply_inv(rf_root_q, grav)[2] - qapply_inv(_q4(s, 3), grav)[2])
+    return (rf_root_z - _at(s, 2), qapply_inv(rf_root_q, grav)[2] - qapply_inv(_q4(s, 3), grav)[2])
 
 
 @always_inline
@@ -226,8 +226,12 @@ def _qinv[dt: DType](q: Q4[dt]) -> Q4[dt]:
 
 
 @always_inline
-def _exp_term[dt: DType](w: Float64, std: Float64, e: Scalar[dt]) -> Scalar[dt] where dt.is_floating_point():
-    return Scalar[dt](SM_DT * w) * exp(-e / Scalar[dt](std * std))
+def _exp_term[dt: DType, w: Float64, std: Float64](e: Scalar[dt]) -> Scalar[dt] where dt.is_floating_point():
+    """`dt · w · exp(−e / std²)`; the constants are parameters so no double
+    reaches a kernel (Metal has none)."""
+    comptime k = SM_DT * w
+    comptime s2 = std * std
+    return Scalar[dt](k) * exp(-e / Scalar[dt](s2))
 
 
 def sm_observation_lane[dt: DType, R: TrackingRobot](table: FP[dt], s: FP[dt], a: FP[dt], xi: FP[dt], obs: FP[dt]):
@@ -241,7 +245,7 @@ def sm_observation_lane[dt: DType, R: TrackingRobot](table: FP[dt], s: FP[dt], a
         obs[unsafe_offset=D.NDOF + j] = _at(s, D.NQ + 6 + j)
         obs[unsafe_offset=2 * D.NDOF + 6 + j] = _at(a, j)
     var pg = qapply_inv(_q4(s, 3), Q4[dt](0, 0, -1, 0))
-    for c in range(3):
+    comptime for c in range(3):
         obs[unsafe_offset=2 * D.NDOF + c] = _at(s, D.NQ + 3 + c)
         obs[unsafe_offset=2 * D.NDOF + 3 + c] = pg[c]
 
@@ -255,7 +259,7 @@ def sm_observation_vjp_lane[dt: DType, R: TrackingRobot](s: FP[dt], g_obs: FP[dt
         g_s[unsafe_offset=7 + j] += g_obs[unsafe_offset=j]
         g_s[unsafe_offset=D.NQ + 6 + j] += g_obs[unsafe_offset=D.NDOF + j]
         g_a[unsafe_offset=j] += g_obs[unsafe_offset=2 * D.NDOF + 6 + j]
-    for c in range(3):
+    comptime for c in range(3):
         g_s[unsafe_offset=D.NQ + 3 + c] += g_obs[unsafe_offset=2 * D.NDOF + c]
 
 
@@ -304,14 +308,15 @@ def sm_heads_lane[dt: DType, R: TrackingRobot](
         e_bl += dot3(dl, dl)
         var da = _v3(rf, rb + 10) - _v3(ang, b * 3)
         e_ba += dot3(da, da)
-    var inv_n = Scalar[dt](1.0 / Float64(D.N_TRACKED))
+    comptime INV_N = 1.0 / Float64(D.N_TRACKED)
+    var inv_n = Scalar[dt](INV_N)
     var drp = ma_p - ra_p
-    terms[unsafe_offset=T_ROOT_POS] = _exp_term(SM_W_ROOT_POS, SM_STD_ROOT_POS, dot3(drp, drp))
-    terms[unsafe_offset=T_ROOT_ORI] = _exp_term(SM_W_ROOT_ORI, SM_STD_ROOT_ORI, sq_quat_err(qmul(ma_q, qconj(ra_q))))
-    terms[unsafe_offset=T_BODY_POS] = _exp_term(SM_W_BODY_POS, SM_STD_BODY_POS, e_bp * inv_n)
-    terms[unsafe_offset=T_BODY_ORI] = _exp_term(SM_W_BODY_ORI, SM_STD_BODY_ORI, e_bo * inv_n)
-    terms[unsafe_offset=T_BODY_LIN] = _exp_term(SM_W_BODY_LIN, SM_STD_BODY_LIN, e_bl * inv_n)
-    terms[unsafe_offset=T_BODY_ANG] = _exp_term(SM_W_BODY_ANG, SM_STD_BODY_ANG, e_ba * inv_n)
+    terms[unsafe_offset=T_ROOT_POS] = _exp_term[dt, SM_W_ROOT_POS, SM_STD_ROOT_POS](dot3(drp, drp))
+    terms[unsafe_offset=T_ROOT_ORI] = _exp_term[dt, SM_W_ROOT_ORI, SM_STD_ROOT_ORI](sq_quat_err(qmul(ma_q, qconj(ra_q))))
+    terms[unsafe_offset=T_BODY_POS] = _exp_term[dt, SM_W_BODY_POS, SM_STD_BODY_POS](e_bp * inv_n)
+    terms[unsafe_offset=T_BODY_ORI] = _exp_term[dt, SM_W_BODY_ORI, SM_STD_BODY_ORI](e_bo * inv_n)
+    terms[unsafe_offset=T_BODY_LIN] = _exp_term[dt, SM_W_BODY_LIN, SM_STD_BODY_LIN](e_bl * inv_n)
+    terms[unsafe_offset=T_BODY_ANG] = _exp_term[dt, SM_W_BODY_ANG, SM_STD_BODY_ANG](e_ba * inv_n)
     var ar = Scalar[dt](0)
     var jl = Scalar[dt](0)
     for j in range(D.NDOF):
@@ -394,16 +399,17 @@ def sm_heads_vjp_lane[dt: DType, R: TrackingRobot](
         e_bl += dot3(dl, dl)
         var da = _v3(rf, rb + 10) - _v3(ang, b * 3)
         e_ba += dot3(da, da)
-    var inv_n = Scalar[dt](1.0 / Float64(D.N_TRACKED))
+    comptime INV_N = 1.0 / Float64(D.N_TRACKED)
+    var inv_n = Scalar[dt](INV_N)
     var drp = ma_p - ra_p
     var d_root = qmul(ma_q, qconj(ra_q))
     # ∂r/∂e = −term / σ²
-    var ge_rp = -g_r * _exp_term(SM_W_ROOT_POS, SM_STD_ROOT_POS, dot3(drp, drp)) / Scalar[dt](SM_STD_ROOT_POS * SM_STD_ROOT_POS)
-    var ge_ro = -g_r * _exp_term(SM_W_ROOT_ORI, SM_STD_ROOT_ORI, sq_quat_err(d_root)) / Scalar[dt](SM_STD_ROOT_ORI * SM_STD_ROOT_ORI)
-    var ge_bp = -g_r * _exp_term(SM_W_BODY_POS, SM_STD_BODY_POS, e_bp * inv_n) / Scalar[dt](SM_STD_BODY_POS * SM_STD_BODY_POS) * inv_n
-    var ge_bo = -g_r * _exp_term(SM_W_BODY_ORI, SM_STD_BODY_ORI, e_bo * inv_n) / Scalar[dt](SM_STD_BODY_ORI * SM_STD_BODY_ORI) * inv_n
-    var ge_bl = -g_r * _exp_term(SM_W_BODY_LIN, SM_STD_BODY_LIN, e_bl * inv_n) / Scalar[dt](SM_STD_BODY_LIN * SM_STD_BODY_LIN) * inv_n
-    var ge_ba = -g_r * _exp_term(SM_W_BODY_ANG, SM_STD_BODY_ANG, e_ba * inv_n) / Scalar[dt](SM_STD_BODY_ANG * SM_STD_BODY_ANG) * inv_n
+    var ge_rp = -g_r * _exp_term[dt, SM_W_ROOT_POS, SM_STD_ROOT_POS](dot3(drp, drp)) / Scalar[dt](SM_STD_ROOT_POS * SM_STD_ROOT_POS)
+    var ge_ro = -g_r * _exp_term[dt, SM_W_ROOT_ORI, SM_STD_ROOT_ORI](sq_quat_err(d_root)) / Scalar[dt](SM_STD_ROOT_ORI * SM_STD_ROOT_ORI)
+    var ge_bp = -g_r * _exp_term[dt, SM_W_BODY_POS, SM_STD_BODY_POS](e_bp * inv_n) / Scalar[dt](SM_STD_BODY_POS * SM_STD_BODY_POS) * inv_n
+    var ge_bo = -g_r * _exp_term[dt, SM_W_BODY_ORI, SM_STD_BODY_ORI](e_bo * inv_n) / Scalar[dt](SM_STD_BODY_ORI * SM_STD_BODY_ORI) * inv_n
+    var ge_bl = -g_r * _exp_term[dt, SM_W_BODY_LIN, SM_STD_BODY_LIN](e_bl * inv_n) / Scalar[dt](SM_STD_BODY_LIN * SM_STD_BODY_LIN) * inv_n
+    var ge_ba = -g_r * _exp_term[dt, SM_W_BODY_ANG, SM_STD_BODY_ANG](e_ba * inv_n) / Scalar[dt](SM_STD_BODY_ANG * SM_STD_BODY_ANG) * inv_n
 
     var g_rap = drp * (ge_rp * -2)                       # e_root_pos = |ma − ra|²
     # e_root_ori = sqerr(ma ⊗ r̄a): ∂/∂ra = conj(conj(ma) ⊗ g_d)

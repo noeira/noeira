@@ -33,10 +33,11 @@ ROBOT-SPECIFIC CHOICES (made by the robot's conformers, see `robot.mojo`)
 * Rewards and terminations read the state exactly; mjlab's read derived
   kinematics one substep stale (its documented trade-off).
 
-THE GPU PATH replaces the lanes by one batched simulator and steps 2–6 by
-kernels over the same per-lane functions (`sm_heads_lane`,
-`sm_observation_lane`, …); the replay becomes the episodic ring's device
-sibling.
+THE GPU PATH (`env_gpu.mojo`) replaces the lanes by one batched simulator
+and steps 2–6 by kernels over the same per-lane functions (`sm_heads_lane`,
+`sm_observation_lane`, `sm_reset_state_lane` below, the library's
+reference-row and goal-window lanes); the replay becomes the episodic ring's
+device sibling.
 """
 
 from std.math import cos, log, sin, sqrt
@@ -46,7 +47,7 @@ from noeira.deep_agents.data import EpisodicReplay
 from noeira.deep_agents.supermimic.heads import (
     SM_N_TERMS, SMHeadLayout, qapply_inv, sm_heads_lane, sm_observation_lane,
 )
-from noeira.deep_agents.supermimic.kinematics import Q4, qmul
+from noeira.deep_agents.supermimic.kinematics import FP, Q4, qmul
 from noeira.deep_agents.supermimic.motion_library import (
     SMEpisodeLog, SMMotionLibrary, SMResetSampler,
 )
@@ -81,18 +82,68 @@ def _randn() -> Float64:
 
 
 @always_inline
-def quat_from_euler_xyz(roll: Float64, pitch: Float64, yaw: Float64) -> Q4[DType.float64]:
+def quat_from_euler_xyz[dt: DType = DType.float64](roll: Scalar[dt], pitch: Scalar[dt], yaw: Scalar[dt]) -> Q4[dt] where dt.is_floating_point():
     """mjlab's `quat_from_euler_xyz` (WXYZ)."""
-    var cy = cos(yaw * 0.5)
-    var sy = sin(yaw * 0.5)
-    var cr = cos(roll * 0.5)
-    var sr = sin(roll * 0.5)
-    var cp = cos(pitch * 0.5)
-    var sp = sin(pitch * 0.5)
-    return Q4[DType.float64](
+    var cy = cos(yaw * Scalar[dt](0.5))
+    var sy = sin(yaw * Scalar[dt](0.5))
+    var cr = cos(roll * Scalar[dt](0.5))
+    var sr = sin(roll * Scalar[dt](0.5))
+    var cp = cos(pitch * Scalar[dt](0.5))
+    var sp = sin(pitch * Scalar[dt](0.5))
+    return Q4[dt](
         cy * cr * cp + sy * sr * sp, cy * sr * cp - sy * cr * sp,
         cy * cr * sp + sy * sr * cp, sy * cr * cp - cy * sr * sp,
     )
+
+
+comptime SM_RESET_UNIFORMS[R: TrackingRobot] = 12 + R.NDOF
+"""Uniforms in [−1, 1) one noisy reset consumes: root pos 3, root roll /
+pitch / yaw 3, root linear velocity 3, root angular velocity 3, joints n."""
+
+
+@always_inline
+def sm_reset_state_lane[dt: DType, R: TrackingRobot](
+    rows: FP[DT], f: Int, u: FP[dt], noise: Bool, lo: FP[dt], hi: FP[dt], qpos: FP[dt], qvel: FP[dt]
+) where dt.is_floating_point():
+    """The reset state at library frame f (`_write_reference`, both envs):
+    the reference state, with noise Table A.1's reset ranges scaled from
+    `u` (`SM_RESET_UNIFORMS[R]` values in [−1, 1)), joints clamped to the
+    soft limits [lo, hi]. The root's world angular velocity goes into the
+    free joint's BODY frame. MuJoCo layout out."""
+    comptime NQ = R.NQ
+    comptime n = R.NDOF
+    var r = rows.unsafe_offset(f * SMDims[R].S)
+    var p0 = Scalar[dt](r[unsafe_offset=0])
+    var p1 = Scalar[dt](r[unsafe_offset=1])
+    var p2 = Scalar[dt](r[unsafe_offset=2])
+    var q = Q4[dt](Scalar[dt](r[unsafe_offset=3]), Scalar[dt](r[unsafe_offset=4]), Scalar[dt](r[unsafe_offset=5]), Scalar[dt](r[unsafe_offset=6]))
+    var lin = Q4[dt](Scalar[dt](r[unsafe_offset=NQ]), Scalar[dt](r[unsafe_offset=NQ + 1]), Scalar[dt](r[unsafe_offset=NQ + 2]), 0)
+    var ang = Q4[dt](Scalar[dt](r[unsafe_offset=NQ + 3]), Scalar[dt](r[unsafe_offset=NQ + 4]), Scalar[dt](r[unsafe_offset=NQ + 5]), 0)
+    if noise:
+        p0 += Scalar[dt](0.05) * u[unsafe_offset=0]
+        p1 += Scalar[dt](0.05) * u[unsafe_offset=1]
+        p2 += Scalar[dt](0.01) * u[unsafe_offset=2]
+        var e = quat_from_euler_xyz[dt](
+            Scalar[dt](0.1) * u[unsafe_offset=3], Scalar[dt](0.1) * u[unsafe_offset=4], Scalar[dt](0.2) * u[unsafe_offset=5]
+        )
+        q = qmul(e, q)
+        lin += Q4[dt](Scalar[dt](0.5) * u[unsafe_offset=6], Scalar[dt](0.5) * u[unsafe_offset=7], Scalar[dt](0.2) * u[unsafe_offset=8], 0)
+        ang += Q4[dt](Scalar[dt](0.52) * u[unsafe_offset=9], Scalar[dt](0.52) * u[unsafe_offset=10], Scalar[dt](0.78) * u[unsafe_offset=11], 0)
+    qpos[unsafe_offset=0] = p0
+    qpos[unsafe_offset=1] = p1
+    qpos[unsafe_offset=2] = p2
+    comptime for k in range(4):
+        qpos[unsafe_offset=3 + k] = q[k]
+    var wb = qapply_inv(q, ang)
+    comptime for c in range(3):
+        qvel[unsafe_offset=c] = lin[c]
+        qvel[unsafe_offset=3 + c] = wb[c]
+    for j in range(n):
+        var qj = Scalar[dt](r[unsafe_offset=7 + j])
+        if noise:
+            qj += Scalar[dt](0.1) * u[unsafe_offset=12 + j]
+        qpos[unsafe_offset=7 + j] = min(max(qj, lo[unsafe_offset=j]), hi[unsafe_offset=j])
+        qvel[unsafe_offset=6 + j] = Scalar[dt](r[unsafe_offset=NQ + 6 + j])
 
 
 struct SMLane[R: TrackingRobot](Movable):
@@ -273,50 +324,28 @@ struct SMTrackingEnv[R: TrackingRobot](Movable):
                 ln.a_last[j] = 0
 
     def _write_reference(mut self, i: Int, f: Int) raises:
+        """The reset state at frame f (`sm_reset_state_lane`, float64) into
+        lane i's simulator; the noise uniforms drawn in the lane's order."""
         comptime NQ = Self.R.NQ
         comptime n = Self.R.NDOF
-        var r = f * SMDims[Self.R].S
-        ref rows = self.lib.rows
-        var pos = List[Float64](length=3, fill=0.0)
-        var lin = List[Float64](length=3, fill=0.0)
-        var ang = List[Float64](length=3, fill=0.0)
-        for c in range(3):
-            pos[c] = Float64(rows[r + c])
-            lin[c] = Float64(rows[r + NQ + c])
-            ang[c] = Float64(rows[r + NQ + 3 + c])
-        var q = Q4[DType.float64](Float64(rows[r + 3]), Float64(rows[r + 4]), Float64(rows[r + 5]), Float64(rows[r + 6]))
-        var qj = List[Float64](length=n, fill=0.0)
-        for j in range(n):
-            qj[j] = Float64(rows[r + 7 + j])
+        var u = List[Float64](length=SM_RESET_UNIFORMS[Self.R], fill=0.0)
         if self.reset_noise:
-            pos[0] += _u(-0.05, 0.05)
-            pos[1] += _u(-0.05, 0.05)
-            pos[2] += _u(-0.01, 0.01)
-            var e = quat_from_euler_xyz(_u(-0.1, 0.1), _u(-0.1, 0.1), _u(-0.2, 0.2))
-            q = qmul(e, q)
-            lin[0] += _u(-0.5, 0.5)
-            lin[1] += _u(-0.5, 0.5)
-            lin[2] += _u(-0.2, 0.2)
-            ang[0] += _u(-0.52, 0.52)
-            ang[1] += _u(-0.52, 0.52)
-            ang[2] += _u(-0.78, 0.78)
-            for j in range(n):
-                qj[j] += _u(-0.1, 0.1)
+            for k in range(len(u)):
+                u[k] = _u(-1.0, 1.0)
         ref ln = self.lanes[i]
-        var qpos = List[Float64](length=NQ, fill=0.0)
-        var qvel = List[Float64](length=Self.R.NV, fill=0.0)
-        for c in range(3):
-            qpos[c] = pos[c]
-            qvel[c] = lin[c]
-        for k in range(4):
-            qpos[3 + k] = q[k]
-        var wb = qapply_inv(q, Q4[DType.float64](ang[0], ang[1], ang[2], 0))   # the free joint's ω is in the body frame
-        for c in range(3):
-            qvel[3 + c] = wb[c]
+        var lo = List[Float64](length=n, fill=0.0)
+        var hi = List[Float64](length=n, fill=0.0)
         for j in range(n):
             var lim = sm_soft_limits[Self.R](ln.sim, j)
-            qpos[7 + j] = min(max(qj[j], lim[0]), lim[1])
-            qvel[6 + j] = Float64(rows[r + NQ + 6 + j])
+            lo[j] = lim[0]
+            hi[j] = lim[1]
+        var qpos = List[Float64](length=NQ, fill=0.0)
+        var qvel = List[Float64](length=Self.R.NV, fill=0.0)
+        sm_reset_state_lane[DType.float64, Self.R](
+            self.lib.rows_ptr(), f, u.unsafe_ptr().as_unsafe_any_origin(), self.reset_noise,
+            lo.unsafe_ptr().as_unsafe_any_origin(), hi.unsafe_ptr().as_unsafe_any_origin(),
+            qpos.unsafe_ptr().as_unsafe_any_origin(), qvel.unsafe_ptr().as_unsafe_any_origin(),
+        )
         ln.sim.set_state(qpos, qvel)
         ln.read_state()
 
@@ -422,12 +451,7 @@ struct SMTrackingEnv[R: TrackingRobot](Movable):
             self.last_terminated[i] = terminated
             rsum += Float64(r)
             # the sampler's per-step log, with f_t's bin
-            if len(ln.log.rewards) < SM_MAX_LOGGED:
-                ln.log.rewards.append(Float64(r))
-                ln.log.bins.append(self.lib.bin_of_frame(ln.frame))
-            else:
-                ln.log.rewards[SM_MAX_LOGGED - 1] = Float64(r)
-                ln.log.bins[SM_MAX_LOGGED - 1] = self.lib.bin_of_frame(ln.frame)
+            ln.log.log(Float64(r), self.lib.bin_of_frame(ln.frame), SM_MAX_LOGGED)
             for j in range(n):
                 ln.a_last[j] = a_now[j]
             if terminated or time_out:

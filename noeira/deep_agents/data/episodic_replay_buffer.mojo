@@ -21,7 +21,9 @@ frame), and bookkeeping: episode id, `terminal`, `ep_start`.
                 before each history state (0 at the episode's start)
 
 Widths are comptime (`S`, `A`, `X`); env count and per-env capacity are
-runtime. Device backends override the raising hooks below (next round).
+runtime. The device sibling, `EpisodicReplayGpu`, keeps the same rows and
+rules behind a device API (a batched `add_step`, on-device masks and draws,
+gathers into device buffers) instead of this host-list trait.
 """
 
 from max.gpu.host import DeviceContext

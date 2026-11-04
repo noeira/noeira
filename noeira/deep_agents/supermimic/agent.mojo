@@ -3,7 +3,7 @@
 The reproduction's `training/loop.py` (paper Algorithm A.1). The trainer owns
 the algorithm (`trainer.mojo`); the agent owns the data side and the loop:
 
-    var agent = SuperMimicAgent[SMSmokeG1](library^, SMSchedule(...))
+    var agent = SuperMimicAgent[SMSmokeG1["cpu"]](library^, SMSchedule(...))
     agent.train(iters=400, log_every=50)
 
 Every iteration: the policy acts on every lane (`trainer.act`), one env step
@@ -19,6 +19,8 @@ replay's device sibling fills them on the device instead.
 from std.math import cos, pi
 from std.random import random_float64
 from std.time import perf_counter_ns
+
+from max.gpu.host import DeviceContext
 
 from noeira.deep_agents.data import EpisodicReplay
 from noeira.deep_agents.supermimic.config import SMConfigT
@@ -81,14 +83,18 @@ struct SuperMimicAgent[C: SMConfigT](Movable):
     var t_wm: Float64
     var t_pi: Float64
 
-    def __init__(out self, var lib: SMMotionLibrary[Self.C.ROBOT], var sched: SMSchedule) raises:
+    def __init__(
+        out self, var lib: SMMotionLibrary[Self.C.ROBOT], var sched: SMSchedule, ctx: Optional[DeviceContext] = None
+    ) raises:
+        """`ctx` is required when the config's target is "gpu" (the networks
+        and updates run there; the env and replay stay on the host)."""
         var noise = sched.noise
         self.env = SMTrackingEnv[Self.C.ROBOT](
             Self.C.LANES, lib^, dr=noise, obs_noise=noise, reset_noise=noise,
             action_noise=0.1 if noise else 0.0, rng_seed=sched.seed,
         )
         self.rb = SMReplayOf[Self.C.ROBOT](Self.C.LANES, sched.replay_capacity)
-        self.trainer = SuperMimicTrainer[Self.C].for_robot(self.env.lanes[0].sim)
+        self.trainer = SuperMimicTrainer[Self.C].for_robot(self.env.lanes[0].sim, ctx)
         self.sched = sched^
         self.iteration = 0
         self.updates = 0
@@ -223,46 +229,63 @@ struct SuperMimicAgent[C: SMConfigT](Movable):
 
     def train(mut self, iters: Int, log_every: Int) raises:
         """`iters` iterations, a log line every `log_every`."""
-        var n_up = 0
-        var wl = 0.0
-        var w1 = 0.0
-        var w8 = 0.0
-        var ij = 0.0
-        var iu = 0.0
-        var cl = 0.0
-        var vm = 0.0
-        var tmn = 0.0
+        var lg = SMTrainLog()
         for it in range(iters):
             var r = self.iterate()
-            if r.updated:
-                n_up += 1
-                wl += r.wm.loss
-                w1 += r.wm.nse_1step
-                w8 += r.wm.nse_kstep
-                ij += r.pi.imag_objective
-                iu += r.pi.imag_return_undisc
-                cl += r.pi.critic_loss
-                vm += r.pi.critic_value_mean
-                tmn += r.pi.critic_target_mean
+            lg.add(r)
             if (it + 1) % log_every == 0:
-                var tr = 0.0
-                for k in range(len(self.finished)):
-                    tr += self.finished[k]
-                var nf = len(self.finished)
-                var d = Float64(max(n_up, 1))
-                print(
-                    "it", it + 1, "| updates", self.updates, "| train_ret", (tr / Float64(nf)) if nf > 0 else -1.0, "(n=", nf, ")",
-                    "| wm loss", wl / d, "nse1", w1 / d, "nse8", w8 / d,
-                    "| imag J", ij / d, "ret", iu / d, "| critic", cl / d, "V", vm / d, "R", tmn / d,
-                    "| t sim/wm/pi", self.t_sim, self.t_wm, self.t_pi,
-                )
+                lg.flush(it + 1, self.updates, self.finished, self.t_sim, self.t_wm, self.t_pi)
                 self.finished = List[Float64]()
-                n_up = 0
-                wl = 0.0
-                w1 = 0.0
-                w8 = 0.0
-                ij = 0.0
-                iu = 0.0
-                cl = 0.0
-                vm = 0.0
-                tmn = 0.0
+
+
+struct SMTrainLog:
+    """Means of the update metrics between two log lines (both agents)."""
+    var n_up: Int
+    var wl: Float64
+    var w1: Float64
+    var w8: Float64
+    var ij: Float64
+    var iu: Float64
+    var cl: Float64
+    var vm: Float64
+    var tmn: Float64
+
+    def __init__(out self):
+        self.n_up = 0
+        self.wl = 0.0
+        self.w1 = 0.0
+        self.w8 = 0.0
+        self.ij = 0.0
+        self.iu = 0.0
+        self.cl = 0.0
+        self.vm = 0.0
+        self.tmn = 0.0
+
+    def add(mut self, r: SMIterInfo):
+        if not r.updated:
+            return
+        self.n_up += 1
+        self.wl += r.wm.loss
+        self.w1 += r.wm.nse_1step
+        self.w8 += r.wm.nse_kstep
+        self.ij += r.pi.imag_objective
+        self.iu += r.pi.imag_return_undisc
+        self.cl += r.pi.critic_loss
+        self.vm += r.pi.critic_value_mean
+        self.tmn += r.pi.critic_target_mean
+
+    def flush(mut self, it: Int, updates: Int, finished: List[Float64], t_sim: Float64, t_wm: Float64, t_pi: Float64):
+        """Print the line (train_ret = the finished episodes' normalised
+        returns) and start a new window."""
+        var tr = 0.0
+        for k in range(len(finished)):
+            tr += finished[k]
+        var nf = len(finished)
+        var d = Float64(max(self.n_up, 1))
+        print(
+            "it", it, "| updates", updates, "| train_ret", (tr / Float64(nf)) if nf > 0 else -1.0, "(n=", nf, ")",
+            "| wm loss", self.wl / d, "nse1", self.w1 / d, "nse8", self.w8 / d,
+            "| imag J", self.ij / d, "ret", self.iu / d, "| critic", self.cl / d, "V", self.vm / d, "R", self.tmn / d,
+            "| t sim/wm/pi", t_sim, t_wm, t_pi,
+        )
+        self = SMTrainLog()

@@ -27,10 +27,9 @@ from std.math import exp, log
 
 from noeira.deep_agents.supermimic.kinematics import FP
 from noeira.deep_agents.supermimic.robot import SMDims, TrackingRobot
-from noeira.deep_agents.supermimic.heads import sm_term_features, sm_term_features_vjp
-from noeira.deep_agents.supermimic.state_spec import (
-    sm_canonical_lane, sm_canonical_vjp_lane, sm_error_lane, sm_error_vjp_lane, sm_integrate_lane,
-    sm_integrate_vjp_lane, sm_xi_normalize,
+from noeira.deep_agents.supermimic.lanes import (
+    SM_HEIGHT_THR, SM_TERM_IN, SM_TILT_THR, sm_canon_back, sm_wm_dyn_back, sm_wm_err_back, sm_wm_in, sm_wm_step,
+    talloc, tp,
 )
 from noeira.nn.combinators.sequential import Sequential
 from noeira.nn.constants import DT
@@ -46,9 +45,6 @@ from noeira.nn.primitives.zero_linear import ZeroLinear
 from max.gpu.host import DeviceContext
 
 
-comptime SM_TERM_IN: Int = 4
-comptime SM_HEIGHT_THR: Float64 = 0.25
-comptime SM_TILT_THR: Float64 = 0.8
 
 comptime SMDynamics[R: TrackingRobot, H: Int] = Sequential[
     LinearSwish[SMDims[R].WM_IN, H], LinearSwish[H, H], LinearSwish[H, H], ZeroLinear[H, SMDims[R].DELTA],
@@ -75,8 +71,8 @@ struct SMWorldModel[R: TrackingRobot, H: Int, TH: Int](ParamWalkable):
         self.term = move.term^
 
     @staticmethod
-    def make[INIT: Initializer]() raises -> Self:
-        return Self(SMDynamics[Self.R, Self.H].make["cpu", INIT](None), SMTermHead[Self.TH].make["cpu", INIT](None))
+    def make[INIT: Initializer, target: StaticString = "cpu"](ctx: Optional[DeviceContext] = None) raises -> Self:
+        return Self(SMDynamics[Self.R, Self.H].make[target, INIT](ctx), SMTermHead[Self.TH].make[target, INIT](ctx))
 
     def for_each_param[target: StaticString, V: ParamVisitor](
         mut self, mut visitor: V, ctx: Optional[DeviceContext], prefix: String = String("")
@@ -126,6 +122,14 @@ struct SMWindowBatch[R: TrackingRobot](Movable):
         self.done = move.done^
         self.ref_root = move.ref_root^
 
+    def to_device(mut self, ctx: DeviceContext) raises:
+        """Copy the host fields into their device buffers (kept across calls)."""
+        self.states.upload_resident(ctx)
+        self.a_exec.upload_resident(ctx)
+        self.xi.upload_resident(ctx)
+        self.done.upload_resident(ctx)
+        self.ref_root.upload_resident(ctx)
+
 
 @fieldwise_init
 struct SMWMLoss(Copyable, Movable):
@@ -137,145 +141,119 @@ struct SMWMLoss(Copyable, Movable):
 
 
 @always_inline
-def _row(mut l: List[Scalar[DT]], off: Int) -> FP[DT]:
-    return l.unsafe_ptr().unsafe_offset(off).as_unsafe_any_origin()
-
-
-@always_inline
-def _trow(mut t: TensorImpl[DT], off: Int) -> FP[DT]:
-    return t.data.unsafe_ptr().unsafe_offset(off).as_unsafe_any_origin()
-
-
-@always_inline
 def _sigmoid(x: Float64) -> Float64:
     return 1.0 / (1.0 + exp(-x)) if x >= 0 else exp(x) / (1.0 + exp(x))
 
 
-def sm_wm_window_loss[R: TrackingRobot, H: Int, TH: Int, B: Int](
-    mut wm: SMWorldModel[R, H, TH], mut w: SMWindowBatch[R], grad: Bool, w_term: Float64 = 1.0
+def sm_wm_window_loss[R: TrackingRobot, H: Int, TH: Int, B: Int, target: StaticString = "cpu"](
+    mut wm: SMWorldModel[R, H, TH], mut w: SMWindowBatch[R], grad: Bool, w_term: Float64 = 1.0,
+    ctx: Optional[DeviceContext] = None,
 ) raises -> SMWMLoss:
     """Eq. 1 on one batch of windows. With `grad`, ADDS d loss / d params into
-    the model's grads (call `wm.zero_grad` first)."""
+    the model's grads (call `wm.zero_grad` first). On "gpu" the batch must be
+    on the device (`w.to_device`) and the model made there; the per-lane
+    phases are `lanes.mojo`'s, the reductions to the scalars below run on the
+    host over per-lane values (K·B square errors and logits)."""
     comptime D = SMDims[R]
-    comptime SM_S = D.S
-    comptime SM_A = R.NDOF
-    comptime SM_XI = D.X
-    comptime SM_WM_IN = D.WM_IN
-    comptime SM_FEAT_DIM = D.S
-    comptime SM_DELTA_DIM = D.DELTA
-    comptime SM_ERR_DIM = D.DELTA
+    comptime S = D.S
+    comptime n = R.NDOF
     if w.b != B:
         raise Error("sm_wm_window_loss: batch of " + String(w.b) + " lanes, compiled for " + String(B))
     var K = w.k
-    var sp = List[Scalar[DT]](length=(K + 1) * B * SM_S, fill=0)   # the predicted chain
-    for i in range(B * SM_S):
-        sp[i] = w.states.data[i]
-    var xin = List[Scalar[DT]](length=B * SM_XI, fill=0)
-    for i in range(B * SM_XI):
-        xin[i] = Scalar[DT](sm_xi_normalize[R.NDOF](i % SM_XI, Float64(w.xi.data[i])))
+    var sp = talloc[target]((K + 1) * B * S, ctx)                  # the predicted chain
+    var errs = talloc[target](K * B * D.DELTA, ctx)
+    var sq = talloc[target](K * B, ctx)
+    var lgall = talloc[target](K * B, ctx)
+    comptime if target == "gpu":
+        ctx.value().enqueue_copy(sp.dev.value().create_sub_buffer[DT](0, B * S), w.states.dev.value().create_sub_buffer[DT](0, B * S))
+    else:
+        for i in range(B * S):
+            sp.data[i] = w.states.data[i]
     var xs = List[TensorImpl[DT]]()
     var ds = List[TensorImpl[DT]]()
     var tins = List[TensorImpl[DT]]()
-    var lgs = List[TensorImpl[DT]]()
-    var errs = List[Scalar[DT]](length=K * B * SM_ERR_DIM, fill=0)
+    for j in range(K):
+        var x = talloc[target](B * D.WM_IN, ctx)
+        sm_wm_in[target, R](ctx, B, tp[target](sp).unsafe_offset(j * B * S), tp[target](w.a_exec).unsafe_offset(j * B * n), tp[target](w.xi), tp[target](x))
+        var dl = talloc[target](B * D.DELTA, ctx)
+        wm.dyn.forward[target, B](TensorRefs[1, _, DT](x), dl, ctx)
+        var tin = talloc[target](B * SM_TERM_IN, ctx)
+        sm_wm_step[target, R](
+            ctx, B, tp[target](sp).unsafe_offset(j * B * S), tp[target](dl), tp[target](sp).unsafe_offset((j + 1) * B * S),
+            tp[target](w.states).unsafe_offset((j + 1) * B * S), tp[target](w.ref_root).unsafe_offset(j * B * 7),
+            tp[target](errs).unsafe_offset(j * B * D.DELTA), tp[target](tin), tp[target](sq).unsafe_offset(j * B),
+        )
+        var lg = talloc[target](B, ctx)
+        wm.term.forward[target, B](TensorRefs[1, _, DT](tin), lg, ctx)
+        comptime if target == "gpu":
+            ctx.value().enqueue_copy(lgall.dev.value().create_sub_buffer[DT](j * B, B), lg.dev.value())
+        else:
+            for b in range(B):
+                lgall.data[j * B + b] = lg.data[b]
+        xs.append(x^)
+        ds.append(dl^)
+        tins.append(tin^)
+    # the scalars, on the host
+    comptime if target == "gpu":
+        sq.download_enqueue(ctx.value())
+        lgall.download_enqueue(ctx.value())
+        w.done.download_enqueue(ctx.value())
+        ctx.value().synchronize()
+        sq.download_finalize()
+        lgall.download_finalize()
+        w.done.download_finalize()
     var state_tot = 0.0
     var bce_tot = 0.0
     var nse1 = 0.0
     var nsek = 0.0
     for j in range(K):
-        var x = TensorImpl[DT].alloc(B * SM_WM_IN)
-        for b in range(B):
-            sm_canonical_lane[DT, R](_row(sp, (j * B + b) * SM_S), _trow(x, b * SM_WM_IN))
-            for k in range(SM_A):
-                x.data[b * SM_WM_IN + SM_FEAT_DIM + k] = w.a_exec.data[(j * B + b) * SM_A + k]
-            for k in range(SM_XI):
-                x.data[b * SM_WM_IN + SM_FEAT_DIM + SM_A + k] = xin[b * SM_XI + k]
-        var dl = TensorImpl[DT].alloc(B * SM_DELTA_DIM)
-        wm.dyn.forward["cpu", B](TensorRefs[1, _, DT](x), dl, None)
-        var tin = TensorImpl[DT].alloc(B * SM_TERM_IN)
         var nse = 0.0
         for b in range(B):
-            var so = ((j + 1) * B + b) * SM_S
-            sm_integrate_lane[DT, R](_row(sp, (j * B + b) * SM_S), _trow(dl, b * SM_DELTA_DIM), _row(sp, so))
-            var eo = (j * B + b) * SM_ERR_DIM
-            sm_error_lane[DT, R](_row(sp, so), _row(w.states.data, so), _row(errs, eo))
-            var sq = 0.0
-            for d in range(SM_ERR_DIM):
-                sq += Float64(errs[eo + d]) * Float64(errs[eo + d])
-            state_tot += sq / Float64(B)
-            nse += sq / Float64(SM_ERR_DIM * B)
-            var r = (j * B + b) * 7
-            var q = SIMD[DT, 4](w.ref_root.data[r + 3], w.ref_root.data[r + 4], w.ref_root.data[r + 5], w.ref_root.data[r + 6])
-            var f = sm_term_features[DT](_row(sp, so), w.ref_root.data[r + 2], q)
-            var x0 = f[0] / Scalar[DT](SM_HEIGHT_THR)
-            var x1 = f[1] / Scalar[DT](SM_TILT_THR)
-            tin.data[b * 4 + 0] = x0
-            tin.data[b * 4 + 1] = x1
-            tin.data[b * 4 + 2] = abs(x0)
-            tin.data[b * 4 + 3] = abs(x1)
-        var lg = TensorImpl[DT].alloc(B)
-        wm.term.forward["cpu", B](TensorRefs[1, _, DT](tin), lg, None)
-        for b in range(B):
-            var l = Float64(lg.data[b])
+            var v = Float64(sq.data[j * B + b])
+            state_tot += v / Float64(B)
+            nse += v / Float64(D.DELTA * B)
+            var l = Float64(lgall.data[j * B + b])
             var y = Float64(w.done.data[j * B + b])
             bce_tot += (max(l, 0.0) - l * y + log(1.0 + exp(-abs(l)))) / Float64(B)
         if j == 0:
             nse1 = nse
         nsek = nse
-        xs.append(x^)
-        ds.append(dl^)
-        tins.append(tin^)
-        lgs.append(lg^)
     var out = SMWMLoss(state_tot / Float64(K) + w_term * bce_tot / Float64(K), state_tot / Float64(K), bce_tot / Float64(K), nse1, nsek)
     if not grad:
         return out^
 
     # ── the reverse scan ──
-    var gs = List[Scalar[DT]](length=B * SM_S, fill=0)          # d loss / d s_{j+1}
+    var gs = talloc[target](B * S, ctx)                 # d loss / d s_{j+1}
+    var gprev = talloc[target](B * S, ctx)
+    var glg = talloc[target](B, ctx)
+    var gtin = talloc[target](B * SM_TERM_IN, ctx)
+    var gdl = talloc[target](B * D.DELTA, ctx)
+    var gx = talloc[target](B * D.WM_IN, ctx)
+    var relg = talloc[target](B, ctx)
+    var redl = talloc[target](B * D.DELTA, ctx)
     var cs = Scalar[DT](2.0 / Float64(K * B))
-    var cb = w_term / Float64(K * B)
+    var cb = Scalar[DT](w_term / Float64(K * B))
     var j = K - 1
     while j >= 0:
-        var g_err = List[Scalar[DT]](length=SM_ERR_DIM, fill=0)
-        var glg = TensorImpl[DT].alloc(B)
-        for b in range(B):
-            var eo = (j * B + b) * SM_ERR_DIM
-            for d in range(SM_ERR_DIM):
-                g_err[d] = errs[eo + d] * cs
-            var so = ((j + 1) * B + b) * SM_S
-            sm_error_vjp_lane[DT, R](_row(sp, so), _row(w.states.data, so), _row(g_err, 0), _row(gs, b * SM_S))
-            glg.data[b] = Scalar[DT]((_sigmoid(Float64(lgs[j].data[b])) - Float64(w.done.data[j * B + b])) * cb)
-        var gtin = TensorImpl[DT].alloc(B * SM_TERM_IN)
+        var s1 = tp[target](sp).unsafe_offset((j + 1) * B * S)
+        sm_wm_err_back[target, R](
+            ctx, B, s1, tp[target](w.states).unsafe_offset((j + 1) * B * S), tp[target](errs).unsafe_offset(j * B * D.DELTA),
+            tp[target](lgall).unsafe_offset(j * B), tp[target](w.done).unsafe_offset(j * B), cs, cb, tp[target](gs), tp[target](glg),
+        )
         # ⚠ RE-RUN THE STEP'S FORWARD FIRST: the fused Linear+SiLU leaves keep
         # the activations of their LAST forward call, which is step k − 1's.
         # A `vjp` at step j against them is the wrong gradient (measured: term
         # head cosine 0.98 against torch before this line).
-        var relg = TensorImpl[DT].alloc(B)
-        wm.term.forward["cpu", B](TensorRefs[1, _, DT](tins[j]), relg, None)
-        wm.term.vjp["cpu", B](TensorRefs[1, _, DT](tins[j]), glg, TensorRefs[1, _, DT](gtin), None)
-        for b in range(B):
-            var x0 = tins[j].data[b * 4 + 0]
-            var x1 = tins[j].data[b * 4 + 1]
-            var s0 = Scalar[DT](1) if x0 > 0 else (Scalar[DT](-1) if x0 < 0 else Scalar[DT](0))
-            var s1 = Scalar[DT](1) if x1 > 0 else (Scalar[DT](-1) if x1 < 0 else Scalar[DT](0))
-            var g0 = (gtin.data[b * 4 + 0] + s0 * gtin.data[b * 4 + 2]) / Scalar[DT](SM_HEIGHT_THR)
-            var g1 = (gtin.data[b * 4 + 1] + s1 * gtin.data[b * 4 + 3]) / Scalar[DT](SM_TILT_THR)
-            sm_term_features_vjp[DT](_row(sp, ((j + 1) * B + b) * SM_S), g0, g1, _row(gs, b * SM_S))
+        wm.term.forward[target, B](TensorRefs[1, _, DT](tins[j]), relg, ctx)
+        wm.term.vjp[target, B](TensorRefs[1, _, DT](tins[j]), glg, TensorRefs[1, _, DT](gtin), ctx)
         # through s_{j+1} = integrate(s_j, dynamics([canonical(s_j), a_j, ξ]))
-        var gprev = List[Scalar[DT]](length=B * SM_S, fill=0)
-        var gdl = TensorImpl[DT].alloc(B * SM_DELTA_DIM)
-        for b in range(B):
-            sm_integrate_vjp_lane[DT, R](
-                _row(sp, (j * B + b) * SM_S), _trow(ds[j], b * SM_DELTA_DIM), _row(gs, b * SM_S),
-                _row(gprev, b * SM_S), _trow(gdl, b * SM_DELTA_DIM),
-            )
-        var gx = TensorImpl[DT].alloc(B * SM_WM_IN)
-        var redl = TensorImpl[DT].alloc(B * SM_DELTA_DIM)
-        wm.dyn.forward["cpu", B](TensorRefs[1, _, DT](xs[j]), redl, None)   # see the term head's note
-        wm.dyn.vjp["cpu", B](TensorRefs[1, _, DT](xs[j]), gdl, TensorRefs[1, _, DT](gx), None)
-        if j > 0:   # s_0 is data
-            for b in range(B):
-                sm_canonical_vjp_lane[DT, R](_row(sp, (j * B + b) * SM_S), _trow(gx, b * SM_WM_IN), _row(gprev, b * SM_S))
-        gs = gprev^
+        sm_wm_dyn_back[target, R](
+            ctx, B, tp[target](tins[j]), tp[target](gtin), tp[target](sp).unsafe_offset(j * B * S), s1,
+            tp[target](ds[j]), tp[target](gs), tp[target](gprev), tp[target](gdl),
+        )
+        wm.dyn.forward[target, B](TensorRefs[1, _, DT](xs[j]), redl, ctx)   # see the term head's note
+        wm.dyn.vjp[target, B](TensorRefs[1, _, DT](xs[j]), gdl, TensorRefs[1, _, DT](gx), ctx)
+        # s_0 is data: no canonical VJP at j = 0
+        sm_canon_back[target, R](ctx, B, D.WM_IN, tp[target](sp).unsafe_offset(j * B * S), tp[target](gx), tp[target](gprev), tp[target](gs), j > 0)
         j -= 1
     return out^

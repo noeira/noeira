@@ -81,8 +81,8 @@ comptime SMPaperG1[target: StaticString] = SMConfig[
 ]
 """The paper's widths (Table A.4) and shapes on our G1."""
 
-comptime SMSmokeG1 = SMConfig[
-    "cpu", G1Robot, 128, 64, 128, 64, 64, 32, 128, 64, 64, 32, 64, 32,
+comptime SMSmokeG1[target: StaticString = "cpu"] = SMConfig[
+    target, G1Robot, 128, 64, 128, 64, 64, 32, 128, 64, 64, 32, 64, 32,
     8, 64, 16, 32,
 ]
-"""CPU smoke scale: wiring, not results."""
+"""Smoke scale: wiring, not results."""

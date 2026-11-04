@@ -64,10 +64,10 @@ struct SMPolicy[R: TrackingRobot, E1: Int, E2: Int, E3: Int, E4: Int, D1: Int, D
         self.dec = move.dec^
 
     @staticmethod
-    def make[INIT: Initializer]() raises -> Self:
+    def make[INIT: Initializer, target: StaticString = "cpu"](ctx: Optional[DeviceContext] = None) raises -> Self:
         return Self(
-            SMEncoder[Self.R, Self.E1, Self.E2, Self.E3, Self.E4].make["cpu", INIT](None),
-            SMDecoder[Self.R, Self.D1, Self.D2, Self.D3, Self.D4].make["cpu", INIT](None),
+            SMEncoder[Self.R, Self.E1, Self.E2, Self.E3, Self.E4].make[target, INIT](ctx),
+            SMDecoder[Self.R, Self.D1, Self.D2, Self.D3, Self.D4].make[target, INIT](ctx),
         )
 
     def for_each_param[target: StaticString, V: ParamVisitor](
@@ -88,7 +88,7 @@ struct SMPolicy[R: TrackingRobot, E1: Int, E2: Int, E3: Int, E4: Int, D1: Int, D
 
 
 @always_inline
-def sm_goal_scale[n: Int](i: Int) -> Float64:
+def sm_goal_scale[n: Int, dt: DType = DType.float64](i: Int) -> Scalar[dt]:
     """1 / scale of goal entry `i` (per frame of 2n + 10: q 1, q̇ 5, grav 1,
     ω_b 2, v_h 1, h 1)."""
     var k = i % (2 * n + 10)
@@ -129,7 +129,7 @@ def sm_hist_flat_index[n: Int](h: Int, o: Int) -> Int:
 
 
 @always_inline
-def sm_obs_scale[n: Int](o: Int) -> Float64:
+def sm_obs_scale[n: Int, dt: DType = DType.float64](o: Int) -> Scalar[dt]:
     """1 / scale of observation entry `o`: q 1, q̇ 5, ω 2, grav 1, a 1."""
     if o < n:
         return 1.0
@@ -141,7 +141,7 @@ def sm_obs_scale[n: Int](o: Int) -> Float64:
 
 
 @always_inline
-def sm_obs_noise_half[n: Int](o: Int) -> Float64:
+def sm_obs_noise_half[n: Int, dt: DType = DType.float64](o: Int) -> Scalar[dt]:
     """Table A.1's uniform noise half-width of observation entry `o`:
     q 0.01, q̇ 0.5, ω 0.2, grav 0.05, a 0."""
     if o < n:
@@ -201,5 +201,5 @@ def sm_root_error_vjp_lane[dt: DType](s: FP[dt], rf_root_q: Q4[dt], g: FP[dt], g
     g_s[unsafe_offset=2] += gv[2]
     var q = Q4[dt](s[unsafe_offset=3], s[unsafe_offset=4], s[unsafe_offset=5], s[unsafe_offset=6])
     var gq = _heading_yaw_vjp(q, g[unsafe_offset=3])
-    for k in range(4):
+    comptime for k in range(4):
         g_s[unsafe_offset=3 + k] += gq[k]

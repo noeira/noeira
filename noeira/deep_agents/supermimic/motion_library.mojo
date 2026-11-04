@@ -35,6 +35,8 @@ EMA in float32 (its `bin_return` is a float32 tensor), ~1e-7 apart.
 
 from std.math import ceil, exp, log
 
+from max.gpu.host import DeviceBuffer, DeviceContext
+
 from noeira.deep_agents.supermimic.heads import SMHeadLayout, qapply_inv, yaw_quat
 from noeira.deep_agents.supermimic.kinematics import FP, Q4, qapply, sm_fk_lane
 from noeira.deep_agents.supermimic.robot import SMDims, TrackingRobot
@@ -59,6 +61,8 @@ struct SMMotionLibrary[R: TrackingRobot](Movable):
     var num_frames: Int
     var num_clips: Int
     var num_bins: Int
+    var rows_dev: Optional[DeviceBuffer[DT]]          # after `to_device`
+    var last_dev: Optional[DeviceBuffer[DType.int32]]  # per frame: its clip's last frame
 
     def __init__(out self, var rows: List[Scalar[DT]], clip_len: List[Int], q0: List[Float64]) raises:
         """From concatenated reference rows and each clip's frame count."""
@@ -97,6 +101,8 @@ struct SMMotionLibrary[R: TrackingRobot](Movable):
                 self.bin_clip.append(c)
             st += clip_len[c]
         self.num_bins = len(self.bin_start)
+        self.rows_dev = None
+        self.last_dev = None
 
     def __init__(out self, *, deinit move: Self):
         self.rows = move.rows^
@@ -111,6 +117,31 @@ struct SMMotionLibrary[R: TrackingRobot](Movable):
         self.num_frames = move.num_frames
         self.num_clips = move.num_clips
         self.num_bins = move.num_bins
+        self.rows_dev = move.rows_dev^
+        self.last_dev = move.last_dev^
+
+    def to_device(mut self, ctx: DeviceContext) raises:
+        """The rows and each frame's clip end on the device (once)."""
+        var r = ctx.enqueue_create_buffer[DT](len(self.rows))
+        var l = ctx.enqueue_create_buffer[DType.int32](self.num_frames)
+        var hr = ctx.enqueue_create_host_buffer[DT](len(self.rows))
+        var hl = ctx.enqueue_create_host_buffer[DType.int32](self.num_frames)
+        ctx.synchronize()
+        for i in range(len(self.rows)):
+            hr[i] = self.rows[i]
+        for f in range(self.num_frames):
+            hl[f] = Int32(self.last_frame_of(f))
+        ctx.enqueue_copy(r, hr)
+        ctx.enqueue_copy(l, hl)
+        ctx.synchronize()
+        self.rows_dev = r^
+        self.last_dev = l^
+
+    def rows_ptr(mut self) -> FP[DT]:
+        return self.rows.unsafe_ptr().as_unsafe_any_origin()
+
+    def q0_ptr(mut self) -> FP[DT]:
+        return self.q0.unsafe_ptr().as_unsafe_any_origin()
 
     def last_frame_of(self, f: Int) -> Int:
         var c = self.frame_clip[f]
@@ -126,72 +157,100 @@ struct SMMotionLibrary[R: TrackingRobot](Movable):
 
     def goal_features(mut self, f: Int, dst: FP[DT]):
         """`goal_features(ref(f), q0)` (2n + 10) into `dst`."""
-        comptime n = Self.R.NDOF
-        comptime NQ = Self.R.NQ
-        var r = self._row(f)
-        var q = Q4[DT](r[unsafe_offset=3], r[unsafe_offset=4], r[unsafe_offset=5], r[unsafe_offset=6])
-        var grav = qapply_inv(q, Q4[DT](0, 0, -1, 0))
-        var ang_b = qapply_inv(q, Q4[DT](r[unsafe_offset=NQ + 3], r[unsafe_offset=NQ + 4], r[unsafe_offset=NQ + 5], 0))
-        var lin_h = qapply_inv(yaw_quat(q), Q4[DT](r[unsafe_offset=NQ], r[unsafe_offset=NQ + 1], r[unsafe_offset=NQ + 2], 0))
-        for j in range(n):
-            dst[unsafe_offset=j] = r[unsafe_offset=7 + j] - self.q0[j]
-            dst[unsafe_offset=n + j] = r[unsafe_offset=NQ + 6 + j]
-        for c in range(3):
-            dst[unsafe_offset=2 * n + c] = grav[c]
-            dst[unsafe_offset=2 * n + 3 + c] = ang_b[c]
-            dst[unsafe_offset=2 * n + 6 + c] = lin_h[c]
-        dst[unsafe_offset=2 * n + 9] = r[unsafe_offset=2]
+        sm_goal_features_lane[Self.R](self.rows_ptr(), f, self.q0_ptr(), dst)
 
     def goal_window(mut self, f: Int, dst: FP[DT]):
         """(10 · (2n + 10)) features of f .. f+9, clamped at the clip's last frame."""
-        var last = self.last_frame_of(f)
-        for k in range(SM_GOAL_K):
-            self.goal_features(min(f + k, last), dst.unsafe_offset(k * SMDims[Self.R].GOAL_FRAME))
+        sm_goal_window_lane[Self.R](self.rows_ptr(), f, self.last_frame_of(f), self.q0_ptr(), dst)
 
     def ref_qpos_qvel(mut self, f: Int, qpos: FP[DT], qvel: FP[DT]):
         """MuJoCo layout: qvel's root angular velocity in the BODY frame."""
-        comptime NQ = Self.R.NQ
-        var r = self._row(f)
-        for k in range(NQ):
-            qpos[unsafe_offset=k] = r[unsafe_offset=k]
-        var q = Q4[DT](r[unsafe_offset=3], r[unsafe_offset=4], r[unsafe_offset=5], r[unsafe_offset=6])
-        var ang_b = qapply_inv(q, Q4[DT](r[unsafe_offset=NQ + 3], r[unsafe_offset=NQ + 4], r[unsafe_offset=NQ + 5], 0))
-        for k in range(3):
-            qvel[unsafe_offset=k] = r[unsafe_offset=NQ + k]
-            qvel[unsafe_offset=3 + k] = ang_b[k]
-        for j in range(Self.R.NDOF):
-            qvel[unsafe_offset=6 + j] = r[unsafe_offset=NQ + 6 + j]
+        sm_ref_qpos_qvel_lane[Self.R](self.rows_ptr(), f, qpos, qvel)
 
     def reference_row(mut self, f: Int, mut tb: SMTables[DT], dst: FP[DT]):
         """The heads' `ref` (13·n_tracked + 7) at frame f: the tracked bodies
         by our FK of the reference state, then the library's root pos and quat."""
-        comptime D = SMDims[Self.R]
-        comptime L = SMHeadLayout[Self.R]
-        var qpos = List[Scalar[DT]](length=D.NQ, fill=0)
-        var qvel = List[Scalar[DT]](length=D.NV, fill=0)
-        var fk = List[Scalar[DT]](length=D.FK_BLOCK, fill=0)
-        var qp = qpos.unsafe_ptr().as_unsafe_any_origin()
-        var qv = qvel.unsafe_ptr().as_unsafe_any_origin()
-        self.ref_qpos_qvel(f, qp, qv)
-        var base = fk.unsafe_ptr().as_unsafe_any_origin()
-        var pos = base
-        var quat = base.unsafe_offset(D.NB * 3)
-        var lin = base.unsafe_offset(D.NB * 7)
-        var ang = base.unsafe_offset(D.NB * 10)
-        sm_fk_lane[DT, D.NB](tb.tree_ptr(), qp, qv, pos, quat, lin, ang)
-        for k in range(D.N_TRACKED):
-            var b = Int(tb.head[L.TRACKED + k])
-            var o = k * D.REF_BODY
-            for c in range(3):
-                dst[unsafe_offset=o + c] = pos[unsafe_offset=b * 3 + c]
-                dst[unsafe_offset=o + 7 + c] = lin[unsafe_offset=b * 3 + c]
-                dst[unsafe_offset=o + 10 + c] = ang[unsafe_offset=b * 3 + c]
-            for c in range(4):
-                dst[unsafe_offset=o + 3 + c] = quat[unsafe_offset=b * 4 + c]
-        var r = self._row(f)
-        var rr = D.N_TRACKED * D.REF_BODY
-        for c in range(7):
-            dst[unsafe_offset=rr + c] = r[unsafe_offset=c]
+        var scratch = List[Scalar[DT]](length=SM_REF_SCRATCH[Self.R], fill=0)
+        sm_reference_row_lane[Self.R](
+            self.rows_ptr(), f, tb.tree_ptr(), tb.head_ptr(), scratch.unsafe_ptr().as_unsafe_any_origin(), dst
+        )
+
+
+# ── the per-frame functions, one body for the host and the device ──────────
+comptime SM_REF_SCRATCH[R: TrackingRobot] = R.NQ + R.NV + SMDims[R].FK_BLOCK
+"""`sm_reference_row_lane`'s scratch: qpos, qvel, the FK block."""
+
+
+@always_inline
+def sm_goal_features_lane[R: TrackingRobot](rows: FP[DT], f: Int, q0: FP[DT], dst: FP[DT]):
+    """`goal_features(ref(f), q0)`: [q − q0, q̇, R⁻¹ g, R⁻¹ ω, R_yaw⁻¹ v, root z]."""
+    comptime n = R.NDOF
+    comptime NQ = R.NQ
+    var r = rows.unsafe_offset(f * SMDims[R].S)
+    var q = Q4[DT](r[unsafe_offset=3], r[unsafe_offset=4], r[unsafe_offset=5], r[unsafe_offset=6])
+    var grav = qapply_inv(q, Q4[DT](0, 0, -1, 0))
+    var ang_b = qapply_inv(q, Q4[DT](r[unsafe_offset=NQ + 3], r[unsafe_offset=NQ + 4], r[unsafe_offset=NQ + 5], 0))
+    var lin_h = qapply_inv(yaw_quat(q), Q4[DT](r[unsafe_offset=NQ], r[unsafe_offset=NQ + 1], r[unsafe_offset=NQ + 2], 0))
+    for j in range(n):
+        dst[unsafe_offset=j] = r[unsafe_offset=7 + j] - q0[unsafe_offset=j]
+        dst[unsafe_offset=n + j] = r[unsafe_offset=NQ + 6 + j]
+    comptime for c in range(3):
+        dst[unsafe_offset=2 * n + c] = grav[c]
+        dst[unsafe_offset=2 * n + 3 + c] = ang_b[c]
+        dst[unsafe_offset=2 * n + 6 + c] = lin_h[c]
+    dst[unsafe_offset=2 * n + 9] = r[unsafe_offset=2]
+
+
+@always_inline
+def sm_goal_window_lane[R: TrackingRobot](rows: FP[DT], f: Int, last: Int, q0: FP[DT], dst: FP[DT]):
+    """The features of f .. f+9, clamped at `last` (the clip's last frame)."""
+    for k in range(SM_GOAL_K):
+        sm_goal_features_lane[R](rows, min(f + k, last), q0, dst.unsafe_offset(k * SMDims[R].GOAL_FRAME))
+
+
+@always_inline
+def sm_ref_qpos_qvel_lane[R: TrackingRobot](rows: FP[DT], f: Int, qpos: FP[DT], qvel: FP[DT]):
+    """The reference state at f in MuJoCo layout (root ω into the body frame)."""
+    comptime NQ = R.NQ
+    var r = rows.unsafe_offset(f * SMDims[R].S)
+    for k in range(NQ):
+        qpos[unsafe_offset=k] = r[unsafe_offset=k]
+    var q = Q4[DT](r[unsafe_offset=3], r[unsafe_offset=4], r[unsafe_offset=5], r[unsafe_offset=6])
+    var ang_b = qapply_inv(q, Q4[DT](r[unsafe_offset=NQ + 3], r[unsafe_offset=NQ + 4], r[unsafe_offset=NQ + 5], 0))
+    comptime for k in range(3):
+        qvel[unsafe_offset=k] = r[unsafe_offset=NQ + k]
+        qvel[unsafe_offset=3 + k] = ang_b[k]
+    for j in range(R.NDOF):
+        qvel[unsafe_offset=6 + j] = r[unsafe_offset=NQ + 6 + j]
+
+
+@always_inline
+def sm_reference_row_lane[R: TrackingRobot](rows: FP[DT], f: Int, tree: FP[DT], table: FP[DT], scratch: FP[DT], dst: FP[DT]):
+    """The heads' `ref` at frame f; `scratch` holds `SM_REF_SCRATCH[R]`."""
+    comptime D = SMDims[R]
+    comptime L = SMHeadLayout[R]
+    var qp = scratch
+    var qv = scratch.unsafe_offset(D.NQ)
+    var base = scratch.unsafe_offset(D.NQ + D.NV)
+    sm_ref_qpos_qvel_lane[R](rows, f, qp, qv)
+    var pos = base
+    var quat = base.unsafe_offset(D.NB * 3)
+    var lin = base.unsafe_offset(D.NB * 7)
+    var ang = base.unsafe_offset(D.NB * 10)
+    sm_fk_lane[DT, D.NB](tree, qp, qv, pos, quat, lin, ang)
+    for k in range(D.N_TRACKED):
+        var b = Int(table[unsafe_offset=L.TRACKED + k])
+        var o = k * D.REF_BODY
+        comptime for c in range(3):
+            dst[unsafe_offset=o + c] = pos[unsafe_offset=b * 3 + c]
+            dst[unsafe_offset=o + 7 + c] = lin[unsafe_offset=b * 3 + c]
+            dst[unsafe_offset=o + 10 + c] = ang[unsafe_offset=b * 3 + c]
+        comptime for c in range(4):
+            dst[unsafe_offset=o + 3 + c] = quat[unsafe_offset=b * 4 + c]
+    var r = rows.unsafe_offset(f * D.S)
+    var rr = D.N_TRACKED * D.REF_BODY
+    comptime for c in range(7):
+        dst[unsafe_offset=rr + c] = r[unsafe_offset=c]
 
 
 # ── the reset sampler ───────────────────────────────────────────────────────
@@ -218,6 +277,16 @@ struct SMEpisodeLog(Copyable, Movable):
         self.bins = List[Int]()
         self.terminated = False
         self.clip_end = False
+
+    def log(mut self, r: Float64, b: Int, cap: Int):
+        """One step's reward and bin; past `cap` steps the last slot is
+        overwritten (the recorder's bounded per-episode buffer)."""
+        if len(self.rewards) < cap:
+            self.rewards.append(r)
+            self.bins.append(b)
+        else:
+            self.rewards[cap - 1] = r
+            self.bins[cap - 1] = b
 
 
 struct SMResetSampler(Movable):

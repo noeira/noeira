@@ -37,7 +37,7 @@ comptime SM_WM_DT: Float64 = 0.02
 
 # StateSpecCfg's scales, expanded to one value per entry (n = the robot's DoF)
 @always_inline
-def sm_in_scale[n: Int](i: Int) -> Float64:
+def sm_in_scale[n: Int, dt: DType = DType.float64](i: Int) -> Scalar[dt]:
     """[root_z 1, rot6d 6, lin_vel_h 3, ang_vel_b 3, joint_pos n, joint_vel n]
     divided by (1, 1, 1, 2, 1, 5)."""
     if i < 10:
@@ -50,7 +50,7 @@ def sm_in_scale[n: Int](i: Int) -> Float64:
 
 
 @always_inline
-def sm_out_scale[n: Int](i: Int) -> Float64:
+def sm_out_scale[n: Int, dt: DType = DType.float64](i: Int) -> Scalar[dt]:
     """[dv_h 3, dw_b 3, dqd n, dp_h 3, dθ_b 3, dq n] × (0.3, 0.5, 2, 0.01, 0.02, 0.02)."""
     if i < 3:
         return 0.3
@@ -64,7 +64,7 @@ def sm_out_scale[n: Int](i: Int) -> Float64:
 
 
 @always_inline
-def sm_err_scale[n: Int](i: Int) -> Float64:
+def sm_err_scale[n: Int, dt: DType = DType.float64](i: Int) -> Scalar[dt]:
     """[Δp 3, rotvec 3, Δv 3, Δw 3, Δqj n, Δqd n] / (0.05, 0.1, 0.5, 1, 0.1, 2)."""
     if i < 3:
         return 0.05
@@ -80,7 +80,7 @@ def sm_err_scale[n: Int](i: Int) -> Float64:
 
 
 @always_inline
-def sm_xi_normalize[n: Int](i: Int, x: Float64) -> Float64:
+def sm_xi_normalize[n: Int, dt: DType = DType.float64](i: Int, x: Scalar[dt]) -> Scalar[dt]:
     """`(xi − offset) / scale`: friction (0.75, 0.45), n encoder biases (0, 0.01),
     CoM offset (0, 0.05)."""
     if i == 0:
@@ -148,22 +148,25 @@ def qapply_inv_vjp[dt: DType](q: Q4[dt], v: Q4[dt], g: Q4[dt]) -> Tuple[Q4[dt], 
 
 
 @always_inline
-def rot6d[dt: DType](q: Q4[dt]) -> SIMD[dt, 8]:
-    """[m00, m01, m10, m11, m20, m21] of mjlab's `matrix_from_quat` (lanes 6–7 = 0)."""
+def rot6d[dt: DType](q: Q4[dt]) -> Array[Scalar[dt], 6]:
+    """[m00, m01, m10, m11, m20, m21] of mjlab's `matrix_from_quat`."""
     var w = q[0]
     var x = q[1]
     var y = q[2]
     var z = q[3]
     var t = Scalar[dt](2) / (q * q).reduce_add()
-    return SIMD[dt, 8](
-        1 - t * (y * y + z * z), t * (x * y - z * w),
-        t * (x * y + z * w), 1 - t * (x * x + z * z),
-        t * (x * z - y * w), t * (y * z + x * w), 0, 0,
-    )
+    var r = Array[Scalar[dt], 6](uninitialized=True)
+    r[0] = 1 - t * (y * y + z * z)
+    r[1] = t * (x * y - z * w)
+    r[2] = t * (x * y + z * w)
+    r[3] = 1 - t * (x * x + z * z)
+    r[4] = t * (x * z - y * w)
+    r[5] = t * (y * z + x * w)
+    return r^
 
 
 @always_inline
-def rot6d_vjp[dt: DType](q: Q4[dt], g: SIMD[dt, 8]) -> Q4[dt]:
+def rot6d_vjp[dt: DType](q: Q4[dt], g: Array[Scalar[dt], 6]) -> Q4[dt]:
     var w = q[0]
     var x = q[1]
     var y = q[2]
@@ -271,10 +274,10 @@ def sm_canonical_lane[dt: DType, R: TrackingRobot](s: FP[dt], feat: FP[dt]) wher
     var r6 = rot6d(ql)
     var vh = qapply_inv(hq, _v3(s, NQ))
     feat[unsafe_offset=0] = _at(s, 2)
-    for k in range(6):
+    comptime for k in range(6):
         feat[unsafe_offset=1 + k] = r6[k]
     _put3(feat, 7, vh)
-    for k in range(3):
+    comptime for k in range(3):
         feat[unsafe_offset=10 + k] = _at(s, NQ + 3 + k) / 2
     for j in range(n):
         feat[unsafe_offset=13 + j] = _at(s, 7 + j)
@@ -294,8 +297,8 @@ def sm_canonical_vjp_lane[dt: DType, R: TrackingRobot](s: FP[dt], g_feat: FP[dt]
     if ql[0] < 0:
         sg = -1
         ql = -ql
-    var g6 = SIMD[dt, 8](0)
-    for k in range(6):
+    var g6 = Array[Scalar[dt], 6](fill=Scalar[dt](0))
+    comptime for k in range(6):
         g6[k] = _at(g_feat, 1 + k)
     var gql = rot6d_vjp(ql, g6) * sg                   # back through the sign flip
     # ql = h̄ ⊗ q
@@ -308,7 +311,7 @@ def sm_canonical_vjp_lane[dt: DType, R: TrackingRobot](s: FP[dt], g_feat: FP[dt]
     g_q += yaw_quat_vjp(q, g_hq)
     _add4(g_s, 3, qnormalize_vjp(q, qn[1], g_q))
     g_s[unsafe_offset=2] += _at(g_feat, 0)
-    for k in range(3):
+    comptime for k in range(3):
         g_s[unsafe_offset=NQ + 3 + k] += _at(g_feat, 10 + k) / 2
     for j in range(n):
         g_s[unsafe_offset=7 + j] += _at(g_feat, 13 + j)
@@ -325,24 +328,21 @@ def sm_integrate_lane[dt: DType, R: TrackingRobot](s: FP[dt], delta: FP[dt], s_o
     var qn = qnormalize(_q4(s, 3))
     var q = qn[0]
     var hq = yaw_quat(q)
-    var d = List[Scalar[dt]](length=DD, fill=Scalar[dt](0))
-    for i in range(DD):
-        d[i] = _at(delta, i) * Scalar[dt](sm_out_scale[n](i))
-    var dvh = Q4[dt](d[0], d[1], d[2], 0)
-    var dwb = Q4[dt](d[3], d[4], d[5], 0)
-    var dph = Q4[dt](d[6 + n], d[7 + n], d[8 + n], 0)
-    var dth = Q4[dt](d[9 + n], d[10 + n], d[11 + n], 0)
+    var dvh = _v3(delta, 0) * Scalar[dt](0.3)
+    var dwb = _v3(delta, 3) * Scalar[dt](0.5)
+    var dph = _v3(delta, 6 + n) * Scalar[dt](0.01)
+    var dth = _v3(delta, 9 + n) * Scalar[dt](0.02)
     var v1 = _v3(s, NQ) + qapply(hq, dvh)
     var w1 = _v3(s, NQ + 3) + dwb
     var p1 = _v3(s, 0) + v1 * dtt + qapply(hq, dph)
     var q1 = qnormalize(qmul(q, quat_from_rotvec(w1 * dtt + dth)))[0]
     _put3(s_out, 0, p1)
-    for k in range(4):
+    comptime for k in range(4):
         s_out[unsafe_offset=3 + k] = q1[k]
     for j in range(n):
-        var qd1 = _at(s, NQ + 6 + j) + d[6 + j]
+        var qd1 = _at(s, NQ + 6 + j) + _at(delta, 6 + j) * Scalar[dt](2.0)
         s_out[unsafe_offset=NQ + 6 + j] = qd1
-        s_out[unsafe_offset=7 + j] = _at(s, 7 + j) + dtt * qd1 + d[12 + n + j]
+        s_out[unsafe_offset=7 + j] = _at(s, 7 + j) + dtt * qd1 + _at(delta, 12 + n + j) * Scalar[dt](0.02)
     _put3(s_out, NQ, v1)
     _put3(s_out, NQ + 3, w1)
 
@@ -359,35 +359,32 @@ def sm_integrate_vjp_lane[dt: DType, R: TrackingRobot](
     var qn = qnormalize(_q4(s, 3))
     var q = qn[0]
     var hq = yaw_quat(q)
-    var d = List[Scalar[dt]](length=DD, fill=Scalar[dt](0))
-    for i in range(DD):
-        d[i] = _at(delta, i) * Scalar[dt](sm_out_scale[n](i))
-    var dvh = Q4[dt](d[0], d[1], d[2], 0)
-    var dwb = Q4[dt](d[3], d[4], d[5], 0)
-    var dph = Q4[dt](d[6 + n], d[7 + n], d[8 + n], 0)
-    var dth = Q4[dt](d[9 + n], d[10 + n], d[11 + n], 0)
+    var dvh = _v3(delta, 0) * Scalar[dt](0.3)
+    var dwb = _v3(delta, 3) * Scalar[dt](0.5)
+    var dph = _v3(delta, 6 + n) * Scalar[dt](0.01)
+    var dth = _v3(delta, 9 + n) * Scalar[dt](0.02)
     var w1 = _v3(s, NQ + 3) + dwb
     var r = w1 * dtt + dth
     var e = quat_from_rotvec(r)
     var qq = qmul(q, e)
     var qqn = qnormalize(qq)
-    var gd = List[Scalar[dt]](length=DD, fill=Scalar[dt](0))
+    # g_delta is written in place, already × out_scale (the d = delta ⊙ out_scale chain)
     # qj' = qj + dt qd' + dq ; qd' = qd + dqd
     for j in range(n):
         var gqj = _at(g_out, 7 + j)
         var gqd1 = _at(g_out, NQ + 6 + j) + dtt * gqj
         g_s[unsafe_offset=7 + j] += gqj
-        gd[12 + n + j] = gqj
+        g_delta[unsafe_offset=12 + n + j] = gqj * Scalar[dt](0.02)
         g_s[unsafe_offset=NQ + 6 + j] += gqd1
-        gd[6 + j] = gqd1
+        g_delta[unsafe_offset=6 + j] = gqd1 * Scalar[dt](2.0)
     # q' = normalise(q ⊗ exp(r)),  r = dt w' + dθ
     var gqq = qnormalize_vjp(qqn[0], qqn[1], _q4(g_out, 3))
     var g_q = qmul(gqq, qconj(e))
     var gr = quat_from_rotvec_vjp(r, qmul(qconj(q), gqq))
     var gw1 = _v3(g_out, NQ + 3) + gr * dtt
-    for k in range(3):
-        gd[9 + n + k] = gr[k]
-        gd[3 + k] = gw1[k]
+    comptime for k in range(3):
+        g_delta[unsafe_offset=9 + n + k] = gr[k] * Scalar[dt](0.02)
+        g_delta[unsafe_offset=3 + k] = gw1[k] * Scalar[dt](0.5)
     _add3(g_s, NQ + 3, gw1)
     # p' = p + dt v' + R_h dp_h ; v' = v + R_h dv_h
     var gp1 = _v3(g_out, 0)
@@ -396,13 +393,11 @@ def sm_integrate_vjp_lane[dt: DType, R: TrackingRobot](
     var gv1 = _v3(g_out, NQ) + gp1 * dtt
     _add3(g_s, NQ, gv1)
     var a2 = qapply_vjp(hq, dvh, gv1)
-    for k in range(3):
-        gd[6 + n + k] = a1[1][k]
-        gd[k] = a2[1][k]
+    comptime for k in range(3):
+        g_delta[unsafe_offset=6 + n + k] = a1[1][k] * Scalar[dt](0.01)
+        g_delta[unsafe_offset=k] = a2[1][k] * Scalar[dt](0.3)
     g_q += yaw_quat_vjp(q, a1[0] + a2[0])
     _add4(g_s, 3, qnormalize_vjp(q, qn[1], g_q))
-    for i in range(DD):
-        g_delta[unsafe_offset=i] = gd[i] * Scalar[dt](sm_out_scale[n](i))
 
 
 # ── the training error ──────────────────────────────────────────────────────
@@ -414,14 +409,14 @@ def sm_error_lane[dt: DType, R: TrackingRobot](sp: FP[dt], st: FP[dt], err: FP[d
     var q1 = qnormalize(_q4(sp, 3))[0]
     var q2 = qnormalize(_q4(st, 3))[0]
     var rv = rotvec_from_quat(qmul(qconj(q2), q1))
-    for k in range(3):
-        err[unsafe_offset=k] = (_at(sp, k) - _at(st, k)) / Scalar[dt](sm_err_scale[n](k))
-        err[unsafe_offset=3 + k] = rv[k] / Scalar[dt](sm_err_scale[n](3))
-        err[unsafe_offset=6 + k] = (_at(sp, NQ + k) - _at(st, NQ + k)) / Scalar[dt](sm_err_scale[n](6))
-        err[unsafe_offset=9 + k] = (_at(sp, NQ + 3 + k) - _at(st, NQ + 3 + k)) / Scalar[dt](sm_err_scale[n](9))
+    comptime for k in range(3):
+        err[unsafe_offset=k] = (_at(sp, k) - _at(st, k)) / (sm_err_scale[n, dt](k))
+        err[unsafe_offset=3 + k] = rv[k] / (sm_err_scale[n, dt](3))
+        err[unsafe_offset=6 + k] = (_at(sp, NQ + k) - _at(st, NQ + k)) / (sm_err_scale[n, dt](6))
+        err[unsafe_offset=9 + k] = (_at(sp, NQ + 3 + k) - _at(st, NQ + 3 + k)) / (sm_err_scale[n, dt](9))
     for j in range(n):
-        err[unsafe_offset=12 + j] = (_at(sp, 7 + j) - _at(st, 7 + j)) / Scalar[dt](sm_err_scale[n](12))
-        err[unsafe_offset=12 + n + j] = (_at(sp, NQ + 6 + j) - _at(st, NQ + 6 + j)) / Scalar[dt](sm_err_scale[n](12 + n))
+        err[unsafe_offset=12 + j] = (_at(sp, 7 + j) - _at(st, 7 + j)) / (sm_err_scale[n, dt](12))
+        err[unsafe_offset=12 + n + j] = (_at(sp, NQ + 6 + j) - _at(st, NQ + 6 + j)) / (sm_err_scale[n, dt](12 + n))
 
 
 def sm_error_vjp_lane[dt: DType, R: TrackingRobot](sp: FP[dt], st: FP[dt], g_err: FP[dt], g_sp: FP[dt]) where dt.is_floating_point():
@@ -432,13 +427,13 @@ def sm_error_vjp_lane[dt: DType, R: TrackingRobot](sp: FP[dt], st: FP[dt], g_err
     var n1 = qnormalize(_q4(sp, 3))
     var q2 = qnormalize(_q4(st, 3))[0]
     var dq = qmul(qconj(q2), n1[0])
-    var g_rv = Q4[dt](_at(g_err, 3), _at(g_err, 4), _at(g_err, 5), 0) / Scalar[dt](sm_err_scale[n](3))
+    var g_rv = Q4[dt](_at(g_err, 3), _at(g_err, 4), _at(g_err, 5), 0) / (sm_err_scale[n, dt](3))
     var g_q1 = qmul(q2, rotvec_from_quat_vjp(dq, g_rv))
     _add4(g_sp, 3, qnormalize_vjp(n1[0], n1[1], g_q1))
-    for k in range(3):
-        g_sp[unsafe_offset=k] += _at(g_err, k) / Scalar[dt](sm_err_scale[n](k))
-        g_sp[unsafe_offset=NQ + k] += _at(g_err, 6 + k) / Scalar[dt](sm_err_scale[n](6))
-        g_sp[unsafe_offset=NQ + 3 + k] += _at(g_err, 9 + k) / Scalar[dt](sm_err_scale[n](9))
+    comptime for k in range(3):
+        g_sp[unsafe_offset=k] += _at(g_err, k) / (sm_err_scale[n, dt](k))
+        g_sp[unsafe_offset=NQ + k] += _at(g_err, 6 + k) / (sm_err_scale[n, dt](6))
+        g_sp[unsafe_offset=NQ + 3 + k] += _at(g_err, 9 + k) / (sm_err_scale[n, dt](9))
     for j in range(n):
-        g_sp[unsafe_offset=7 + j] += _at(g_err, 12 + j) / Scalar[dt](sm_err_scale[n](12))
-        g_sp[unsafe_offset=NQ + 6 + j] += _at(g_err, 12 + n + j) / Scalar[dt](sm_err_scale[n](12 + n))
+        g_sp[unsafe_offset=7 + j] += _at(g_err, 12 + j) / (sm_err_scale[n, dt](12))
+        g_sp[unsafe_offset=NQ + 6 + j] += _at(g_err, 12 + n + j) / (sm_err_scale[n, dt](12 + n))

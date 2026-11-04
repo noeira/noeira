@@ -16,6 +16,11 @@ with the encoder bias), whatever the underlying env's own action convention.
 It exposes the model's body / joint / geom records for the tables SuperMimic
 builds once (FK tree, foot geoms, limits) and for per-episode randomisation.
 
+`TrackingBatchedSim`: N lanes of the same robot on the device (the GPU env,
+`env_gpu.mojo`), with the same action law. Its model records are SHARED by
+the lanes (one model per batch), so model-field randomisation applies to
+every lane at once; per-lane state (qpos, qvel) is device memory.
+
 Every width the method uses follows from the robot (`SMDims[R]`):
 
     state     S  = nq + nv                      71 on the G1 (29 DoF)
@@ -26,10 +31,16 @@ Every width the method uses follows from the robot (`SMDims[R]`):
     ref row   R  = 13·n_tracked + 7             189
 """
 
-from max.gpu.host import DeviceContext
+from std.math import ceildiv
+
+from max.gpu import global_idx
+from max.gpu.host import DeviceBuffer, DeviceContext
 
 from noeira.core.cont_action import ContAction
 from noeira.envs.robots import UnitreeG1
+from noeira.envs.robots.unitree_g1 import UnitreeG1Batched
+from noeira.nn.constants import DT
+from noeira.nn.core.ptr import mptr
 from noeira.envs.robots.unitree_g1_pd import G1_N_DOF, g1_default_pos, g1_effort, g1_kp
 from noeira.physics3d.gpu.constants import MODEL_BODY_SIZE, MODEL_GEOM_SIZE, MODEL_JOINT_SIZE
 from noeira.physics3d.parser.runtime_load import parse_model_runtime
@@ -74,6 +85,53 @@ trait TrackingSim(Movable & Deinitable):
         ...
 
     def num_geoms(self) -> Int:
+        ...
+
+
+trait TrackingBatchedSim(Movable & Deinitable):
+    """N simulator lanes on the device. Pointers are device pointers into
+    float32 buffers; lane l's slice starts at l·width."""
+    comptime N: Int
+
+    @staticmethod
+    def create(ctx: DeviceContext) raises -> Self:
+        ...
+
+    def qpos_ptr(mut self) -> Pointer[Scalar[DT], MutAnyOrigin]:
+        """[N · nq] (MuJoCo layout)."""
+        ...
+
+    def qvel_ptr(mut self) -> Pointer[Scalar[DT], MutAnyOrigin]:
+        """[N · nv]; the free joint's angular velocity in the body frame."""
+        ...
+
+    def control_step(
+        mut self, ctx: DeviceContext, a: Pointer[Scalar[DT], MutAnyOrigin],
+        bias: Pointer[Scalar[DT], MutAnyOrigin], bias_stride: Int, seed: UInt64,
+    ) raises:
+        """One control step for every lane, PD target `q0 + scale·a − bias`:
+        a [N · n], lane l's bias at bias[l · bias_stride : + n]."""
+        ...
+
+    def reset_lanes(mut self, ctx: DeviceContext, mask: Pointer[Scalar[DT], MutAnyOrigin], seed: UInt64) raises:
+        """Clear the lanes with mask[l] > 0.5 (solver carries, activations) to
+        a fresh-episode state; the caller then writes their qpos / qvel and
+        calls `refresh`."""
+        ...
+
+    def refresh(mut self, ctx: DeviceContext) raises:
+        """Kinematics from the current qpos / qvel (after writing them)."""
+        ...
+
+    def body_field(self, b: Int, k: Int) -> Float64:
+        """Model body record b, field k (the host copy of the shared model)."""
+        ...
+
+    def set_body_field_all(mut self, ctx: DeviceContext, b: Int, k: Int, v: Float64) raises:
+        """Model body record b, field k, for every lane (shared model)."""
+        ...
+
+    def set_geom_field_all(mut self, ctx: DeviceContext, g: Int, k: Int, v: Float64) raises:
         ...
 
 
@@ -222,6 +280,95 @@ struct G1Sim(TrackingSim):
 
     def num_geoms(self) -> Int:
         return UnitreeG1[DType.float64].NGEOM
+
+
+def _k_g1_action(
+    n_lanes: Int64, a: Pointer[Scalar[DT], MutAnyOrigin], bias: Pointer[Scalar[DT], MutAnyOrigin], bias_stride: Int64,
+    k: Pointer[Scalar[DT], MutAnyOrigin], dst: Pointer[Scalar[DT], MutAnyOrigin],
+):
+    """BFM-Zero's env action for the SuperMimic action a and bias b:
+    `a/5 − b · kp/(1.25·effort)` (k holds kp/(1.25·effort) per joint)."""
+    var i = Int(global_idx.x)
+    if i >= Int(n_lanes) * G1_N_DOF:
+        return
+    var l = i // G1_N_DOF
+    var j = i % G1_N_DOF
+    dst[unsafe_offset=i] = a[unsafe_offset=i] / 5 - bias[unsafe_offset=l * Int(bias_stride) + j] * k[unsafe_offset=j]
+
+
+def _k_copy_mask(n: Int64, src: Pointer[Scalar[DT], MutAnyOrigin], dst: Pointer[Scalar[DT], MutAnyOrigin]):
+    var i = Int(global_idx.x)
+    if i < Int(n):
+        dst[unsafe_offset=i] = src[unsafe_offset=i]
+
+
+struct G1BatchedSim[N_: Int](TrackingBatchedSim):
+    """`UnitreeG1Batched[N]` (float32, NVIDIA only: the G1's nv overflows
+    Metal's per-thread stack). The same action law as `G1Sim`, as a kernel
+    writing the env's action buffer; resets go through the env's own
+    `selective_reset_batch` (it clears what `mj_resetData` clears)."""
+    comptime N = Self.N_
+    var env: UnitreeG1Batched[Self.N_]
+    var kgain: DeviceBuffer[DT]
+
+    def __init__(out self, var env: UnitreeG1Batched[Self.N_], var kgain: DeviceBuffer[DT]):
+        self.env = env^
+        self.kgain = kgain^
+
+    def __init__(out self, *, deinit move: Self):
+        self.env = move.env^
+        self.kgain = move.kgain^
+
+    @staticmethod
+    def create(ctx: DeviceContext) raises -> Self:
+        var env = UnitreeG1Batched[Self.N_](ctx)
+        env.reset_batch[Self.N_](Optional(ctx), 0)
+        var k = ctx.enqueue_create_buffer[DT](G1_N_DOF)
+        var hk = ctx.enqueue_create_host_buffer[DT](G1_N_DOF)
+        ctx.synchronize()
+        for j in range(G1_N_DOF):
+            hk[j] = Scalar[DT](g1_kp(j) / (1.25 * g1_effort(j)))
+        ctx.enqueue_copy(k, hk)
+        ctx.synchronize()
+        return Self(env^, k^)
+
+    def qpos_ptr(mut self) -> Pointer[Scalar[DT], MutAnyOrigin]:
+        return mptr(self.env.d.qpos.dev.value().unsafe_ptr())
+
+    def qvel_ptr(mut self) -> Pointer[Scalar[DT], MutAnyOrigin]:
+        return mptr(self.env.d.qvel.dev.value().unsafe_ptr())
+
+    def control_step(
+        mut self, ctx: DeviceContext, a: Pointer[Scalar[DT], MutAnyOrigin],
+        bias: Pointer[Scalar[DT], MutAnyOrigin], bias_stride: Int, seed: UInt64,
+    ) raises:
+        comptime NA = Self.N_ * G1_N_DOF
+        ctx.enqueue_function[_k_g1_action](
+            Int64(Self.N_), a, bias, Int64(bias_stride), mptr(self.kgain.unsafe_ptr()), self.env.action_ptr(),
+            grid_dim=ceildiv(NA, 128), block_dim=128,
+        )
+        self.env.step_batch[Self.N_](Optional(ctx), seed)
+
+    def reset_lanes(mut self, ctx: DeviceContext, mask: Pointer[Scalar[DT], MutAnyOrigin], seed: UInt64) raises:
+        ctx.enqueue_function[_k_copy_mask](
+            Int64(Self.N_), mask, mptr(self.env._done.unsafe_ptr()), grid_dim=ceildiv(Self.N_, 128), block_dim=128
+        )
+        self.env.selective_reset_batch[Self.N_](Optional(ctx), seed)
+
+    def refresh(mut self, ctx: DeviceContext) raises:
+        self.env._run_fields_fk(ctx)
+        self.env._run_fields_vel(ctx)
+
+    def body_field(self, b: Int, k: Int) -> Float64:
+        return Float64(self.env.mf.bodies.data[b * MODEL_BODY_SIZE + k])
+
+    def set_body_field_all(mut self, ctx: DeviceContext, b: Int, k: Int, v: Float64) raises:
+        self.env.mf.bodies.data[b * MODEL_BODY_SIZE + k] = Scalar[DT](v)
+        self.env.mf.bodies.upload_resident(ctx)
+
+    def set_geom_field_all(mut self, ctx: DeviceContext, g: Int, k: Int, v: Float64) raises:
+        self.env.mf.geoms.data[g * MODEL_GEOM_SIZE + k] = Scalar[DT](v)
+        self.env.mf.geoms.upload_resident(ctx)
 
 
 struct G1Robot(TrackingRobot):

@@ -1,0 +1,20 @@
+# G1 GPU manifest — `pixi run -e apple test-g1-gpu` (or -e nvidia).
+#
+# SuperMimic's device path against its CPU path (same weights, same inputs);
+# the CPU path carries the torch-oracle gates in g1.txt. Tolerances: vectors
+# by cosine >= 0.99999 and max err <= 1e-4 of the largest; optimiser steps
+# split into elements that moved (1e-3 of the largest move) and near-eps ones
+# (Adam's step is ill-conditioned there). Measured on Apple 2026-11-03:
+# gradients 1.9e-7..4.2e-7, moved weights 7.8e-6..7.4e-5 of the largest move.
+#
+# ⚠ A GPU-vs-CPU band written on Metal is a TF32 trap on CUDA: compare weights
+# bit-for-bit first if a 5090 run lands outside it.
+tests/deep_agents/supermimic/test_supermimic_gpu.mojo
+# The device episodic ring against the CPU ring (masks exact, gathers
+# bit-identical, draws all eligible).
+tests/deep_agents/data/test_episodic_replay_gpu.mojo
+# The device env over the batched G1 — NVIDIA ONLY (prints SKIP elsewhere:
+# the batched G1 does not build for Metal): known answers + one-step parity
+# with the CPU env. Its bands were set before any NVIDIA run; read the
+# printed values first.
+tests/deep_agents/supermimic/test_supermimic_env_gpu.mojo

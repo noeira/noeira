@@ -56,7 +56,94 @@ comptime FK_JAXIS: Int = 14        # jnt_axis (3), body frame
 comptime FK_QPOS0: Int = 17
 
 comptime FP[dt: DType] = Pointer[Scalar[dt], MutAnyOrigin]
-comptime Q4[dt: DType] = SIMD[dt, 4]   # quaternion (w, x, y, z) or vector (x, y, z, 0)
+struct Q4[dt: DType](ImplicitlyCopyable, Movable):
+    """A quaternion (w, x, y, z) or a 3-vector (x, y, z, 0): four scalars with
+    SIMD's arithmetic, NOT a `SIMD[dt, 4]`. ⚠ Metal's linker (air-lld)
+    segfaults on vector arithmetic whose operand has literal lanes
+    (`SIMD(x, y, 1, 0) * q`): LLVM folds the constant lanes into a shuffle it
+    cannot link. Every `_v3` here carries a literal 0, so the lane math cannot
+    use SIMD on the device. `reduce_add` keeps SIMD's pairwise order
+    ((a0 + a2) + (a1 + a3)) so CPU results are unchanged."""
+    var a0: Scalar[Self.dt]
+    var a1: Scalar[Self.dt]
+    var a2: Scalar[Self.dt]
+    var a3: Scalar[Self.dt]
+
+    @always_inline
+    def __init__(out self, a0: Scalar[Self.dt], a1: Scalar[Self.dt], a2: Scalar[Self.dt], a3: Scalar[Self.dt]):
+        self.a0 = a0
+        self.a1 = a1
+        self.a2 = a2
+        self.a3 = a3
+
+    @always_inline
+    def __init__(out self, s: Scalar[Self.dt]):
+        """All four lanes `s`."""
+        self.a0 = s
+        self.a1 = s
+        self.a2 = s
+        self.a3 = s
+
+    @always_inline
+    def __getitem__(self, i: Int) -> Scalar[Self.dt]:
+        if i == 0:
+            return self.a0
+        if i == 1:
+            return self.a1
+        if i == 2:
+            return self.a2
+        return self.a3
+
+    @always_inline
+    def __setitem__(mut self, i: Int, v: Scalar[Self.dt]):
+        if i == 0:
+            self.a0 = v
+        elif i == 1:
+            self.a1 = v
+        elif i == 2:
+            self.a2 = v
+        else:
+            self.a3 = v
+
+    @always_inline
+    def __add__(self, o: Self) -> Self:
+        return Self(self.a0 + o.a0, self.a1 + o.a1, self.a2 + o.a2, self.a3 + o.a3)
+
+    @always_inline
+    def __sub__(self, o: Self) -> Self:
+        return Self(self.a0 - o.a0, self.a1 - o.a1, self.a2 - o.a2, self.a3 - o.a3)
+
+    @always_inline
+    def __mul__(self, o: Self) -> Self:
+        return Self(self.a0 * o.a0, self.a1 * o.a1, self.a2 * o.a2, self.a3 * o.a3)
+
+    @always_inline
+    def __mul__(self, k: Scalar[Self.dt]) -> Self:
+        return Self(self.a0 * k, self.a1 * k, self.a2 * k, self.a3 * k)
+
+    @always_inline
+    def __rmul__(self, k: Scalar[Self.dt]) -> Self:
+        return Self(k * self.a0, k * self.a1, k * self.a2, k * self.a3)
+
+    @always_inline
+    def __truediv__(self, k: Scalar[Self.dt]) -> Self:
+        return Self(self.a0 / k, self.a1 / k, self.a2 / k, self.a3 / k)
+
+    @always_inline
+    def __neg__(self) -> Self:
+        return Self(-self.a0, -self.a1, -self.a2, -self.a3)
+
+    @always_inline
+    def __iadd__(mut self, o: Self):
+        self = self + o
+
+    @always_inline
+    def __isub__(mut self, o: Self):
+        self = self - o
+
+    @always_inline
+    def reduce_add(self) -> Scalar[Self.dt]:
+        return (self.a0 + self.a2) + (self.a1 + self.a3)
 
 
 struct SMFKTree[dt: DType](Movable):
@@ -123,7 +210,7 @@ def sm_fk_tree[dt: DType, R: TrackingRobot](sim: R.SIM) raises -> SMFKTree[dt]:
     return SMFKTree[dt](t^)
 
 
-# ── small quaternion / vector algebra on SIMD[dt, 4] ────────────────────────
+# ── small quaternion / vector algebra on Q4 ──────────────────────────────────
 @always_inline
 def _at[dt: DType](p: FP[dt], i: Int) -> Scalar[dt]:
     return p[unsafe_offset=i]

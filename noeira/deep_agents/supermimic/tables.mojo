@@ -16,6 +16,8 @@ Both tables are flat `dt` arrays: on the GPU they become two constant buffers
 every lane reads.
 """
 
+from max.gpu.host import DeviceBuffer, DeviceContext
+
 from noeira.deep_agents.supermimic.heads import SMHeadLayout
 from noeira.deep_agents.supermimic.kinematics import FP, SMFKTree, sm_fk_tree
 from noeira.deep_agents.supermimic.robot import TrackingRobot, TrackingSim, sm_body_ids
@@ -31,6 +33,8 @@ struct SMTables[dt: DType](Movable):
     var feet: List[Int]
     var com_body: Int
     var root_row: Int
+    var tree_dev: Optional[DeviceBuffer[Self.dt]]
+    var head_dev: Optional[DeviceBuffer[Self.dt]]
 
     def __init__(out self, var tree: SMFKTree[Self.dt], var head: List[Scalar[Self.dt]], var feet: List[Int], com_body: Int, root_row: Int):
         self.tree = tree^
@@ -38,6 +42,8 @@ struct SMTables[dt: DType](Movable):
         self.feet = feet^
         self.com_body = com_body
         self.root_row = root_row
+        self.tree_dev = None
+        self.head_dev = None
 
     def __init__(out self, *, deinit move: Self):
         self.tree = move.tree^
@@ -45,6 +51,38 @@ struct SMTables[dt: DType](Movable):
         self.feet = move.feet^
         self.com_body = move.com_body
         self.root_row = move.root_row
+        self.tree_dev = move.tree_dev^
+        self.head_dev = move.head_dev^
+
+    def to_device(mut self, ctx: DeviceContext) raises:
+        """Copy both tables to the device (once; they never change)."""
+        var t = ctx.enqueue_create_buffer[Self.dt](len(self.tree.data))
+        var h = ctx.enqueue_create_buffer[Self.dt](len(self.head))
+        var ht = ctx.enqueue_create_host_buffer[Self.dt](len(self.tree.data))
+        var hh = ctx.enqueue_create_host_buffer[Self.dt](len(self.head))
+        ctx.synchronize()
+        for i in range(len(self.tree.data)):
+            ht[i] = self.tree.data[i]
+        for i in range(len(self.head)):
+            hh[i] = self.head[i]
+        ctx.enqueue_copy(t, ht)
+        ctx.enqueue_copy(h, hh)
+        ctx.synchronize()
+        self.tree_dev = t^
+        self.head_dev = h^
+
+    def tree_p[target: StaticString](mut self) -> FP[Self.dt]:
+        """The FK table on `target` ("gpu" needs `to_device` first)."""
+        comptime if target == "gpu":
+            return rebind[FP[Self.dt]](self.tree_dev.value().unsafe_ptr().as_unsafe_any_origin())
+        else:
+            return self.tree.ptr()
+
+    def head_p[target: StaticString](mut self) -> FP[Self.dt]:
+        comptime if target == "gpu":
+            return rebind[FP[Self.dt]](self.head_dev.value().unsafe_ptr().as_unsafe_any_origin())
+        else:
+            return self.head_ptr()
 
     def tree_ptr(mut self) -> FP[Self.dt]:
         return self.tree.ptr()
