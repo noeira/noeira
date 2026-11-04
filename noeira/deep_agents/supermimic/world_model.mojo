@@ -139,6 +139,14 @@ struct SMWMLoss(Copyable, Movable):
     var nse_1step: Float64
     var nse_kstep: Float64
 
+    def add_scaled(mut self, l: SMWMLoss, w: Float64):
+        """self += w · l (the mean over an update's batches)."""
+        self.loss += w * l.loss
+        self.state_loss += w * l.state_loss
+        self.term_bce += w * l.term_bce
+        self.nse_1step += w * l.nse_1step
+        self.nse_kstep += w * l.nse_kstep
+
 
 @always_inline
 def _sigmoid(x: Float64) -> Float64:

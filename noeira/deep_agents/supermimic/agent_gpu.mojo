@@ -4,9 +4,9 @@
 the device env (`env_gpu.SMTrackingEnvGpu`) and the device replay
 (`EpisodicReplayGpu`), feeding the trainer device-resident batches:
 
-    var sim = G1BatchedSim[4096].create(ctx)
-    var agent = SuperMimicAgentGpu[SMPaperG1["gpu"], G1BatchedSim[4096]](ctx, lib^, sim^, SMSchedule(...))
-    agent.train(iters, log_every)
+    var agent = sm_agent_gpu[SMPaperG1["gpu"], G1BatchedSim[4096]](
+        ctx, lib^, G1BatchedSim[4096].create(ctx), total_iterations=iters)
+    agent.train(iters, log_every, logger=..., checkpoint_every=..., ...)   # as SuperMimicAgent
 
 What stays on the host per step: the reset sampler's per-lane log (one small
 download, see `env_gpu.mojo`) and the scalars the trainer reports.
@@ -26,9 +26,10 @@ from std.time import perf_counter_ns
 from max.gpu import global_idx
 from max.gpu.host import DeviceBuffer, DeviceContext
 
-from noeira.deep_agents.supermimic.agent import (
-    SM_WM_BATCHES, SM_WM_K, SMIterInfo, SMSchedule, SMTrainLog, sm_cosine_lr,
-)
+from noeira.core.logger import Logger, NoOpLogger
+from noeira.deep_agents.supermimic.agent import SMSchedule, sm_cosine_lr, sm_schedule
+from noeira.deep_agents.supermimic.metrics import SMIterInfo, SMTrainLog, sm_tick
+from noeira.io.artifact_sink import ArtifactSink
 from noeira.deep_agents.supermimic.config import SMConfigT
 from noeira.deep_agents.supermimic.env_gpu import SMReplayGpuOf, SMTrackingEnvGpu
 from noeira.deep_agents.supermimic.heads import SMHeadLayout, sm_observation_lane
@@ -111,6 +112,8 @@ struct SuperMimicAgentGpu[C: SMConfigT, BS: TrackingBatchedSim](Movable):
     var t_sim: Float64
     var t_wm: Float64
     var t_pi: Float64
+    var lr: Float64
+    var last_avg_reward: Float64      # the last log window's avg_reward (the run's outcome)
     # device batches, allocated once
     var wb: SMWindowBatch[Self.C.ROBOT]
     var ib: SMImagBatch[Self.C.ROBOT]
@@ -132,7 +135,7 @@ struct SuperMimicAgentGpu[C: SMConfigT, BS: TrackingBatchedSim](Movable):
         comptime D = SMDims[R]
         comptime assert Self.C.TARGET == "gpu", "SuperMimicAgentGpu needs a GPU config"
         comptime assert Self.C.LANES == Self.BS.N, "the config's lanes must be the simulator's"
-        comptime K = SM_WM_K
+        comptime K = Self.C.DEF_WM_K
         comptime B = Self.C.WM_BATCH
         comptime BP = Self.C.PI_BATCH
         comptime H = Self.C.HORIZON
@@ -154,6 +157,8 @@ struct SuperMimicAgentGpu[C: SMConfigT, BS: TrackingBatchedSim](Movable):
         self.t_sim = 0.0
         self.t_wm = 0.0
         self.t_pi = 0.0
+        self.lr = self.sched.lr
+        self.last_avg_reward = 0.0
         self.wb = SMWindowBatch[R](K, B)
         self.wb.states.ensure_gpu(ctx, (K + 1) * B * D.S)
         self.wb.a_exec.ensure_gpu(ctx, K * B * R.NDOF)
@@ -194,6 +199,8 @@ struct SuperMimicAgentGpu[C: SMConfigT, BS: TrackingBatchedSim](Movable):
         self.t_sim = move.t_sim
         self.t_wm = move.t_wm
         self.t_pi = move.t_pi
+        self.lr = move.lr
+        self.last_avg_reward = move.last_avg_reward
         self.wb = move.wb^
         self.ib = move.ib^
         self.goals = move.goals^
@@ -210,7 +217,7 @@ struct SuperMimicAgentGpu[C: SMConfigT, BS: TrackingBatchedSim](Movable):
     # ── data plumbing: device replay → the trainer's device batches ──
     def _window_batch(mut self) raises:
         comptime R = Self.C.ROBOT
-        comptime K = SM_WM_K
+        comptime K = Self.C.DEF_WM_K
         comptime B = Self.C.WM_BATCH
         var ctx = self.ctx
         self.rb.sample_windows(ctx, K, B, random_ui64(0, 0xFFFFFFFFFFFF), mptr(self.w_idx.unsafe_ptr()))
@@ -265,25 +272,20 @@ struct SuperMimicAgentGpu[C: SMConfigT, BS: TrackingBatchedSim](Movable):
                 self.finished.append(self.ep_sum[i] / (0.1 * Float64(max(self.ep_n[i], 1))))
                 self.ep_sum[i] = 0.0
                 self.ep_n[i] = 0
-        _ = si
         self.t_sim += Float64(perf_counter_ns() - t0) * 1e-9
         self.iteration += 1
-        var info = SMIterInfo(False, SMWMLoss(0, 0, 0, 0, 0), SMUpdateMetrics(0, 0, 0, 0, 0, 0))
+        var info = SMIterInfo(False, SMWMLoss(0, 0, 0, 0, 0), SMUpdateMetrics(0, 0, 0, 0, 0, 0), si.reward_mean, si.n_terminated)
         if self.iteration >= self.sched.warmup:
             self.utd_acc += self.sched.utd
             while self.utd_acc >= 1.0:
                 self.utd_acc -= 1.0
-                self.trainer.set_lr(sm_cosine_lr(self.iteration, self.sched.total_iterations, self.sched.lr))
+                self.lr = sm_cosine_lr(self.iteration, self.sched.total_iterations, self.sched.lr)
+                self.trainer.set_lr(self.lr)
                 var t1 = perf_counter_ns()
                 var acc = SMWMLoss(0, 0, 0, 0, 0)
-                for _ in range(SM_WM_BATCHES):
+                for _ in range(Self.C.DEF_WM_BATCHES):
                     self._window_batch()
-                    var l = self.trainer.wm_update[Self.C.WM_BATCH](self.wb, resident=True)
-                    acc.loss += l.loss / Float64(SM_WM_BATCHES)
-                    acc.state_loss += l.state_loss / Float64(SM_WM_BATCHES)
-                    acc.term_bce += l.term_bce / Float64(SM_WM_BATCHES)
-                    acc.nse_1step += l.nse_1step / Float64(SM_WM_BATCHES)
-                    acc.nse_kstep += l.nse_kstep / Float64(SM_WM_BATCHES)
+                    acc.add_scaled(self.trainer.wm_update[Self.C.WM_BATCH](self.wb, resident=True), 1.0 / Float64(Self.C.DEF_WM_BATCHES))
                 var t2 = perf_counter_ns()
                 self._start_batch()
                 var vals = List[Float64]()
@@ -297,12 +299,41 @@ struct SuperMimicAgentGpu[C: SMConfigT, BS: TrackingBatchedSim](Movable):
                 info.updated = True
         return info^
 
-    def train(mut self, iters: Int, log_every: Int) raises:
-        """`iters` iterations, a log line every `log_every`."""
-        var lg = SMTrainLog()
-        for it in range(iters):
-            var r = self.iterate()
-            lg.add(r)
-            if (it + 1) % log_every == 0:
-                lg.flush(it + 1, self.updates, self.finished, self.t_sim, self.t_wm, self.t_pi)
+    def train[L: Logger = NoOpLogger](
+        mut self,
+        iters: Int,
+        log_every: Int = 50,
+        *,
+        logger: Optional[Pointer[L, MutAnyOrigin]] = None,
+        verbose: Bool = True,
+        checkpoint_every: Int = 0,
+        checkpoint_path: String = "",
+        artifacts: Optional[ArtifactSink] = None,
+        run_dir: String = "",
+    ) raises:
+        """As `SuperMimicAgent.train`."""
+        var lg = SMTrainLog(Self.C.HORIZON, Self.C.LANES)
+        for it in range(1, iters + 1):
+            lg.add(self.iterate())
+            if sm_tick[Self.C, L](
+                self.trainer, lg, it, iters, self.updates, self.finished, self.lr, self.t_sim, self.t_wm, self.t_pi,
+                log_every, logger, verbose, checkpoint_every, checkpoint_path, artifacts, run_dir,
+            ):
                 self.finished = List[Float64]()
+        self.last_avg_reward = lg.last_avg
+
+
+def sm_agent_gpu[C: SMConfigT, BS: TrackingBatchedSim](
+    ctx: DeviceContext,
+    var lib: SMMotionLibrary[C.ROBOT],
+    var sim: BS,
+    total_iterations: Int,
+    noise: Bool = True,
+    seed: Int = 0,
+    utd: Float64 = C.DEF_UTD,
+    warmup: Int = C.DEF_WARMUP,
+    lr: Float64 = C.DEF_LR,
+    replay_capacity: Int = C.DEF_REPLAY_CAP,
+) raises -> SuperMimicAgentGpu[C, BS]:
+    """`SuperMimicAgentGpu[C, BS]` with the config's tuned defaults."""
+    return SuperMimicAgentGpu[C, BS](ctx, lib^, sim^, sm_schedule[C](total_iterations, noise, seed, utd, warmup, lr, replay_capacity))

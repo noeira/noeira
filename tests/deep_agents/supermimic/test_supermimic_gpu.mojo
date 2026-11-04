@@ -13,6 +13,9 @@ optimiser and reductions agree there.
       metrics, values / targets, the policy's and critic's weight deltas
   [4] one world-model update (clip + Adam): loss, the weight deltas
   [5] the action step on host tensors through the device
+  [6] the checkpoint across targets: a GPU trainer's file loaded into a
+      fresh CPU trainer (and a CPU file into a fresh GPU trainer) restores
+      every weight bit-identically and the loop's counters
 
 Vectors compare by cosine >= 0.99999 and max err <= 1e-4 of the largest.
 
@@ -377,6 +380,51 @@ def test_act(ctx: DeviceContext, mut tl: Tally) raises:
     _vec("actions", a, b, tl)
 
 
+def _same(a: List[List[Scalar[DT]]], b: List[List[Scalar[DT]]]) -> Int:
+    """Mismatching elements (bitwise equality on float32)."""
+    var bad = 0
+    if len(a) != len(b):
+        return -1
+    for i in range(len(a)):
+        if len(a[i]) != len(b[i]):
+            return -1
+        for k in range(len(a[i])):
+            bad += 1 if a[i][k] != b[i][k] else 0
+    return bad
+
+
+def test_checkpoint(ctx: DeviceContext, mut tl: Tally) raises:
+    print("[6] the checkpoint across targets")
+    var tc = _cpu_trainer()
+    var tg = _gpu_twin(tc, ctx)
+    # move the GPU weights away from the CPU's: one world-model update
+    seed(16)
+    comptime B = 32
+    comptime K = 4
+    var w = SMWindowBatch[R](K, B)
+    for t in range(K + 1):
+        for b in range(B):
+            _rand_state(w.states, (t * B + b) * D.S)
+    for i in range(K * B):
+        w.ref_root.data[i * 7 + 3] = 1
+    _ = tg.wm_update[B](w)
+    var path = String("/tmp/sm_ckpt_gpu_test.ckpt")
+    tg.save_state(path, 123, 45)
+    var fresh = SuperMimicTrainer[TC].for_robot(G1Sim.create())
+    var ctr = fresh.load_state(path)
+    var bad = _same(sm_snapshot["gpu"](tg.wm, ctx), sm_snapshot["cpu"](fresh.wm, None))
+    bad += _same(sm_snapshot["gpu"](tg.pol, ctx), sm_snapshot["cpu"](fresh.pol, None))
+    bad += _same(sm_snapshot["gpu"](tg.critic, ctx), sm_snapshot["cpu"](fresh.critic, None))
+    tl.check(bad == 0 and ctr[0] == 123 and ctr[1] == 45, "GPU file -> CPU trainer: " + String(bad) + " mismatching weights, counters " + String(ctr[0]) + " / " + String(ctr[1]))
+    tc.save_state(path, 7, 3)
+    var fg = SuperMimicTrainer[TG].for_robot(G1Sim.create(), ctx)
+    var cg = fg.load_state(path)
+    var bad2 = _same(sm_snapshot["cpu"](tc.wm, None), sm_snapshot["gpu"](fg.wm, ctx))
+    bad2 += _same(sm_snapshot["cpu"](tc.pol, None), sm_snapshot["gpu"](fg.pol, ctx))
+    bad2 += _same(sm_snapshot["cpu"](tc.critic, None), sm_snapshot["gpu"](fg.critic, ctx))
+    tl.check(bad2 == 0 and cg[0] == 7 and cg[1] == 3, "CPU file -> GPU trainer: " + String(bad2) + " mismatching weights, counters " + String(cg[0]) + " / " + String(cg[1]))
+
+
 def main() raises:
     var ctx = DeviceContext()
     var tl = Tally()
@@ -385,6 +433,7 @@ def main() raises:
     test_policy_update(ctx, tl)
     test_wm_update(ctx, tl)
     test_act(ctx, tl)
+    test_checkpoint(ctx, tl)
     print("\n===", tl.ok, "/", tl.total, "passed ===")
     if tl.ok != tl.total:
         raise Error("test_supermimic_gpu: " + String(tl.total - tl.ok) + " failed")

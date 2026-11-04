@@ -10,7 +10,11 @@ dozen widths, and the network types are derived from it:
     SMCriticOf[C]       critic (CRIT1, CRIT2)
 
 `SMPaperG1` is the paper's setup on our G1 (Table A.4 widths, 4096 lanes,
-batch 2048, H = 32); `SMSmokeG1` is a CPU smoke scale.
+batch 2048, H = 32); `SMSmokeG1` is a smoke scale.
+
+The tuned scalars ride on the config too (`DEF_*`, Table A.3), as SAC's do:
+the agents' factories (`sm_agent`, `sm_agent_gpu`) default every knob to
+them, and every knob stays overridable at the call.
 """
 
 from noeira.deep_agents.supermimic.policy import SMCritic, SMPolicy
@@ -39,6 +43,14 @@ trait SMConfigT:
     comptime WM_BATCH: Int       # k-step windows per world-model batch
     comptime PI_BATCH: Int       # imagined starts per policy update
     comptime HORIZON: Int        # imagined steps
+    # tuned scalars (defaults of the factories)
+    comptime DEF_LR: Float64         # all three networks, cosine-decayed
+    comptime DEF_GAMMA: Float64      # imagination and TD(λ)
+    comptime DEF_UTD: Float64        # updates per env step
+    comptime DEF_WARMUP: Int         # env steps before the first update
+    comptime DEF_REPLAY_CAP: Int     # replay rows per lane
+    comptime DEF_WM_K: Int           # world-model window length
+    comptime DEF_WM_BATCHES: Int     # world-model batches per update
 
 
 comptime SMWorldModelOf[C: SMConfigT] = SMWorldModel[C.ROBOT, C.WM_H, C.TERM_H]
@@ -73,6 +85,13 @@ struct SMConfig[
     comptime WM_BATCH = Self.wm_batch
     comptime PI_BATCH = Self.pi_batch
     comptime HORIZON = Self.horizon
+    comptime DEF_LR = 2e-4
+    comptime DEF_GAMMA = 0.99
+    comptime DEF_UTD = 0.4
+    comptime DEF_WARMUP = 40
+    comptime DEF_REPLAY_CAP = 1000
+    comptime DEF_WM_K = 8
+    comptime DEF_WM_BATCHES = 10
 
 
 comptime SMPaperG1[target: StaticString] = SMConfig[

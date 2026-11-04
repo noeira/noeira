@@ -19,12 +19,12 @@ A device env and replay will hand device tensors over directly.
 from max.gpu.host import DeviceContext
 
 from noeira.deep_agents.supermimic.blocks import ActStep, ActorStep, CriticFitStep, WorldModelUpdateStep
-from noeira.deep_agents.supermimic.blocks.actor_step import SM_GAMMA
 from noeira.deep_agents.supermimic.config import SMConfigT, SMCriticOf, SMPolicyOf, SMWorldModelOf
 from noeira.deep_agents.supermimic.imagination import SMImagBatch
 from noeira.deep_agents.supermimic.tables import SMTables, sm_tables
 from noeira.deep_agents.supermimic.world_model import SMWindowBatch, SMWMLoss
 from noeira.nn.constants import DT
+from noeira.nn.core.checkpoint import CheckpointScalars, load_params_multi, save_params_multi
 from noeira.nn.core.initializer import Kaiming
 from noeira.nn.core.param import ParamVisitor
 from noeira.nn.core.tensor import Tensor, TensorImpl
@@ -118,6 +118,22 @@ struct SuperMimicTrainer[C: SMConfigT](Movable):
             q0[j] = Self.C.ROBOT.default_joint_pos(j)
         return Self(sm_tables[DT, Self.C.ROBOT](sim, q0), ctx)
 
+    # ── checkpoint: ONE v3 file, world model + policy + critic ──
+    def save_state(mut self, path: String, iteration: Int, updates: Int) raises:
+        """The three networks' weights and the loop's counters (`iteration`,
+        `updates`, as `K` scalars) into one v3 binary checkpoint (atomic
+        write). Optimiser moments are NOT saved (SAC's choice: a resume
+        re-warms Adam; the paper-width moments would triple the file)."""
+        var sc = CheckpointScalars()
+        sc.set_int("iteration", iteration)
+        sc.set_int("updates", updates)
+        save_params_multi[Self.C.TARGET](path, self.ctx, False, self.wm, self.pol, self.critic, scalars=sc)
+
+    def load_state(mut self, path: String) raises -> Tuple[Int, Int]:
+        """Restore the three networks; returns (iteration, updates)."""
+        var sc = load_params_multi[Self.C.TARGET](path, self.ctx, self.wm, self.pol, self.critic)
+        return (sc.get_int("iteration", 0), sc.get_int("updates", 0))
+
     def set_lr(mut self, lr: Float64):
         """The same lr for world model, policy and critic (`Trainer.run`)."""
         self.wm_blk.opt.lr = Scalar[DT](lr)
@@ -164,6 +180,6 @@ struct SuperMimicTrainer[C: SMConfigT](Movable):
                 ib.to_device(self.ctx.value())
         var ro = self.actor_blk.step[Self.C.TARGET, N](self.wm, self.pol, self.critic, self.tables, ib, obs_noise, self.ctx)
         var cf = self.critic_blk.step[Self.C.TARGET, N, Self.C.HORIZON](
-            self.critic, ro[0], ib, SM_GAMMA, perms, values_out, targets_out, self.ctx
+            self.critic, ro[0], ib, Self.C.DEF_GAMMA, perms, values_out, targets_out, self.ctx
         )
         return SMUpdateMetrics(ro[0].j, ro[0].return_undisc, ro[1], cf.last_loss, cf.value_mean, cf.target_mean)

@@ -21,7 +21,7 @@ WHAT EACH SECTION CAN CATCH
     M4) and max error ≤ 1e-4 of the largest component, per layer.
 [5] `clip_grad_norm(1.0)` + one `Adam(2e-4)` step against torch's: the
     pre-clip norm (1e-5); stepped weights whose clipped gradient is > 1e-6,
-    within two float32 ulps of the weight (the rest, near Adam's eps, only bounded by 10 % of lr).
+    within two float32 ulps of max(|weight|, lr) (the rest, near Adam's eps, only bounded by 10 % of lr).
 [6] the zero-initialised dynamics: `make` gives delta = 0, so one step is
     exactly constant-velocity integration.
 
@@ -352,14 +352,18 @@ def main() raises:
     for i in range(len(ws)):
         var d = abs(pc.out[i] - ws[i])
         if abs(wg[i] * scale) > 1e-6:
-            # in float32 ulps of the weight (a stepped weight is rounded to fp32)
-            e_good = max(e_good, d / (abs(ws[i]) * 1.1920929e-7 + 1e-12))
+            # in float32 ulps of the step's operands: `w − lr·m̂/√v̂` rounds at
+            # the larger of |w| and the step (~lr), so a weight the step
+            # carries near zero is not judged in ulps of its own tiny value
+            # (2026-11-03: |w| = 3.3e-5 after the step read 4.5 "ulps of the
+            # weight" for an error 1e-7 of lr)
+            e_good = max(e_good, d / (max(abs(ws[i]), 2e-4) * 1.1920929e-7))
         else:
             e_rest = max(e_rest, d)
             n_rest += 1
     # 0.5 ulp is the final rounding; the fp32 gradient's own error reaches
     # the update through eps/|g| when |g| is ~1e-6 (measured 1.5 ulp worst)
-    t.truth(e_good <= 2.0, "stepped weights with |clipped g| > 1e-6: max err " + String(e_good) + " float32 ulps of the weight")
+    t.truth(e_good <= 2.0, "stepped weights with |clipped g| > 1e-6: max err " + String(e_good) + " float32 ulps of max(|w|, lr)")
     t.truth(e_rest <= 2e-5, String(n_rest) + " near-eps elements: max abs err " + String(e_rest) + " (lr 2e-4)")
 
     # ── [6] zero init ──

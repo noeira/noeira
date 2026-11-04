@@ -33,6 +33,12 @@ Options
 --log N        log every N steps (default 25)
 --seed S
 --no-noise     no observation / action / reset noise, no DR (debugging)
+--ckpt-every N checkpoint every N steps (default 0: only at the end)
+
+THE RUN IS AN OBJECT ON DISK: `runs/<id>/` holds `run.kv`, `metrics.csv` (the
+`SMMetrics` bundle every `--log` steps) and the checkpoint `last` (world
+model + policy + critic, one v3 file); the monitor gets the same metrics
+under the same id when `.env` names it (`NOEIRA_CLOUD_URL`).
 """
 
 from std.math import sin
@@ -43,8 +49,10 @@ from std.time import perf_counter_ns
 
 from noeira.core.cont_action import ContAction
 from noeira.data.store import TrajectoryStore
-from noeira.deep_agents.supermimic import SMConfig, SMSchedule, SuperMimicAgent
-from noeira.deep_agents.supermimic.agent_gpu import SuperMimicAgentGpu
+from noeira.core.run import RunContext, register_run
+from noeira.core.run_session import RunLogger, finish_run, run_logger
+from noeira.deep_agents.supermimic import SMConfig, sm_agent, sm_agent_gpu
+from noeira.io.artifact_sink import ArtifactSink, sink_for_run
 from noeira.deep_agents.supermimic.motion_library import SMMotionLibrary
 from noeira.deep_agents.supermimic.robot import G1BatchedSim, G1Robot
 from noeira.envs.robots import UnitreeG1
@@ -126,6 +134,32 @@ def _from_store(path: String, max_clips: Int) raises -> SMMotionLibrary[G1Robot]
     return SMMotionLibrary[G1Robot](rows^, lens, _q0())
 
 
+def _train(
+    var lib: SMMotionLibrary[G1Robot], iters: Int, log_every: Int, noise: Bool, seed_v: Int, ckpt_every: Int,
+    lp: Pointer[RunLogger, MutAnyOrigin], ckpt: String, artifacts: Optional[ArtifactSink], run_dir: String,
+) raises -> String:
+    """Train in the build's mode; returns the run's outcome."""
+    var t0 = perf_counter_ns()
+    var updates: Int
+    var avg: Float64
+    comptime if MODE == 2:
+        var dctx = DeviceContext()
+        var agent = sm_agent_gpu[C, G1BatchedSim[C.LANES]](dctx, lib^, G1BatchedSim[C.LANES].create(dctx), iters, noise, seed_v)
+        agent.train[RunLogger](iters, log_every, logger=lp, checkpoint_every=ckpt_every, checkpoint_path=ckpt, artifacts=artifacts, run_dir=run_dir)
+        updates = agent.updates
+        avg = agent.last_avg_reward
+    else:
+        var ctx: Optional[DeviceContext] = None
+        comptime if TARGET == "gpu":
+            ctx = DeviceContext()
+        var agent = sm_agent[C](lib^, iters, noise, seed_v, ctx=ctx)
+        agent.train[RunLogger](iters, log_every, logger=lp, checkpoint_every=ckpt_every, checkpoint_path=ckpt, artifacts=artifacts, run_dir=run_dir)
+        updates = agent.updates
+        avg = agent.last_avg_reward
+    print("done:", iters, "steps,", updates, "updates in", Float64(perf_counter_ns() - t0) * 1e-9, "s")
+    return String("avg_reward=") + String(avg) + String(",updates=") + String(updates)
+
+
 def main() raises:
     var raw = argv()
     var args = List[String]()
@@ -138,20 +172,38 @@ def main() raises:
     var max_clips = Int(_opt(args, String("--max-clips"), String("0")))
     var noise = not _flag(args, String("--no-noise"))
 
+    var ckpt_every = Int(_opt(args, String("--ckpt-every"), String("0")))
+
     var lib = _from_store(store, max_clips) if store != "" else _synthetic()
-    var sched = SMSchedule(iters, 0.4, 40, 2e-4, 1000, noise, seed_v)
+    var mode_s = String("cpu") if MODE == 0 else (String("gpu-nets") if MODE == 1 else String("gpu-all"))
+    var run = RunContext(
+        project=String("g1"),
+        driver=String("examples/g1/supermimic_train.mojo"),
+        slug=String("supermimic-") + mode_s + (String("-paper") if P else String("-smoke")),
+        env=String("noeira:g1/supermimic_tracking"),
+        dataset=String("synthetic") if store == "" else store,
+        seed=seed_v,
+    )
+    var logger = run_logger(run, buffer_size=64)
+    logger.set_config("algorithm", "SuperMimic")
+    logger.set_config("target", String(TARGET))
+    logger.set_config("mode", mode_s)
+    logger.set_config("lanes", String(C.LANES))
+    logger.set_config("horizon", String(C.HORIZON))
+    logger.set_config("wm_width", String(C.WM_H))
+    logger.set_config("wm_batch", String(C.WM_BATCH))
+    logger.set_config("pi_batch", String(C.PI_BATCH))
+    logger.set_config("lr", String(C.DEF_LR))
+    logger.set_config("utd", String(C.DEF_UTD))
+    logger.set_config("noise", String(noise))
+    logger.set_config("library_frames", String(lib.num_frames))
+    logger.set_config("library_clips", String(lib.num_clips))
+    register_run(run, logger)
+    var artifacts = sink_for_run(run.id, run.dir)
+    var lp = Pointer(to=logger).as_unsafe_any_origin()
+    var ckpt = run.checkpoint_path(String("last"))
     print("SuperMimic, mode", MODE, "(" + String(TARGET) + "):", C.LANES, "lanes, H =", C.HORIZON, ", WM batch", C.WM_BATCH, ", policy batch", C.PI_BATCH, ", noise", noise)
-    var t0 = perf_counter_ns()
-    comptime if MODE == 2:
-        var dctx = DeviceContext()
-        var sim = G1BatchedSim[C.LANES].create(dctx)
-        var agent = SuperMimicAgentGpu[C, G1BatchedSim[C.LANES]](dctx, lib^, sim^, sched^)
-        agent.train(iters, log_every)
-        print("done:", iters, "steps,", agent.updates, "updates in", Float64(perf_counter_ns() - t0) * 1e-9, "s")
-    else:
-        var ctx: Optional[DeviceContext] = None
-        comptime if TARGET == "gpu":
-            ctx = DeviceContext()
-        var agent = SuperMimicAgent[C](lib^, sched^, ctx)
-        agent.train(iters, log_every)
-        print("done:", iters, "steps,", agent.updates, "updates in", Float64(perf_counter_ns() - t0) * 1e-9, "s")
+    print("  run", run.dir)
+    var outcome = _train(lib^, iters, log_every, noise, seed_v, ckpt_every, lp, ckpt, artifacts, run.dir)
+    finish_run(run, logger, artifacts, outcome)
+    _ = logger  # lifetime extender for lp

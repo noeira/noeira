@@ -31,7 +31,6 @@ from noeira.nn.optimizer.grad_clip import clip_grad_norm
 comptime SM_GAE_LAMBDA: Float64 = 0.95
 comptime SM_CRITIC_EPOCHS: Int = 5
 comptime SM_CRITIC_MB: Int = 4
-comptime SM_CRITIC_LR: Float64 = 2e-4
 comptime SM_CRITIC_CLIP: Float64 = 1.0
 
 
@@ -57,13 +56,18 @@ struct SMCriticFit(Copyable, Movable):
 
 
 struct CriticFitStep[C: SMConfigT](Movable):
+    """On "gpu" the optimiser adopts the critic into its arena at the first
+    step: its 20 clips per update stay on the device."""
     var opt: Adam
+    var adopted: Bool
 
     def __init__(out self):
-        self.opt = Adam(lr=Scalar[DT](SM_CRITIC_LR))
+        self.opt = Adam(lr=Scalar[DT](Self.C.DEF_LR))
+        self.adopted = False
 
     def __init__(out self, *, deinit move: Self):
         self.opt = move.opt^
+        self.adopted = move.adopted
 
     def step[target: StaticString, N: Int, H: Int](
         mut self,
@@ -78,6 +82,10 @@ struct CriticFitStep[C: SMConfigT](Movable):
     ) raises -> SMCriticFit:
         """`values_out` / `targets_out` receive V on the (H+1)·N states and the
         H·N targets."""
+        comptime if target == "gpu":
+            if not self.adopted:
+                self.opt.adopt[target](critic, ctx)
+                self.adopted = True
         comptime R = Self.C.ROBOT
         comptime D = SMDims[R]
         comptime CIN = D.CRITIC_IN
@@ -117,7 +125,10 @@ struct CriticFitStep[C: SMConfigT](Movable):
                 sm_mse[target](ctx, MB, tp[target](pred), tp[target](y), tp[target](g), tp[target](sq))
                 critic.zero_grad[target](ctx)
                 critic.vjp[target, MB](TensorRefs[1, _, DT](xin), g, TensorRefs[1, _, DT](gin), ctx)
-                _ = clip_grad_norm[target](critic, Scalar[DT](SM_CRITIC_CLIP), ctx)
+                comptime if target == "gpu":
+                    self.opt.clip_grads_device[target](critic, Scalar[DT](SM_CRITIC_CLIP), ctx)
+                else:
+                    _ = clip_grad_norm[target](critic, Scalar[DT](SM_CRITIC_CLIP), ctx)
                 self.opt.step[target](critic, ctx)
         comptime if target == "gpu":
             values.download_enqueue(ctx.value())

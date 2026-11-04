@@ -22,7 +22,8 @@ Layout (SAC's pattern):
     config.mojo         SMConfigT: target, robot, widths, shapes; presets
     agent.mojo          SuperMimicAgent: env + replay + trainer + schedule
     agent_gpu.mojo      SuperMimicAgentGpu: the same loop, device env + replay
-    trainer.mojo        SuperMimicTrainer: networks, tables, the blocks
+    trainer.mojo        SuperMimicTrainer: networks, tables, the blocks, checkpoint
+    metrics.mojo        SMMetrics (dashboard names), the log window, sm_tick
     blocks/             ActStep, WorldModelUpdateStep, ActorStep, CriticFitStep
                         — each `step[target]`
     lanes.mojo          the scans' per-lane phases, CPU loop or kernel
@@ -45,6 +46,7 @@ The replay is the shared `deep_agents.data.EpisodicReplay` (host) or
 
 from .config import SMConfigT, SMConfig, SMPaperG1, SMSmokeG1, SMWorldModelOf, SMPolicyOf, SMCriticOf
 from .robot import TrackingRobot, TrackingSim, TrackingBatchedSim, SMDims, G1Robot, G1Sim, G1BatchedSim
-from .agent import SuperMimicAgent, SMSchedule
-from .agent_gpu import SuperMimicAgentGpu
+from .agent import SuperMimicAgent, SMSchedule, sm_agent, sm_schedule
+from .agent_gpu import SuperMimicAgentGpu, sm_agent_gpu
+from .metrics import SMMetrics
 from .trainer import SuperMimicTrainer, SMUpdateMetrics

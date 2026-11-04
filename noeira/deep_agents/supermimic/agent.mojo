@@ -3,8 +3,9 @@
 The reproduction's `training/loop.py` (paper Algorithm A.1). The trainer owns
 the algorithm (`trainer.mojo`); the agent owns the data side and the loop:
 
-    var agent = SuperMimicAgent[SMSmokeG1["cpu"]](library^, SMSchedule(...))
-    agent.train(iters=400, log_every=50)
+    var agent = sm_agent[SMSmokeG1["cpu"]](library^, total_iterations=400)
+    agent.train(400, log_every=50, logger=logger_ptr, checkpoint_every=100,
+                checkpoint_path=run.checkpoint_path("last"), artifacts=artifacts, run_dir=run.dir)
 
 Every iteration: the policy acts on every lane (`trainer.act`), one env step
 (rows into the episodic replay ring); after a warm-up and at the UTD ratio,
@@ -22,11 +23,15 @@ from std.time import perf_counter_ns
 
 from max.gpu.host import DeviceContext
 
+from noeira.core.logger import Logger, NoOpLogger
+from noeira.io.artifact_sink import ArtifactSink
+
 from noeira.deep_agents.data import EpisodicReplay
 from noeira.deep_agents.supermimic.config import SMConfigT
 from noeira.deep_agents.supermimic.env import SMReplayOf, SMTrackingEnv
 from noeira.deep_agents.supermimic.heads import sm_observation_lane
 from noeira.deep_agents.supermimic.imagination import SMImagBatch
+from noeira.deep_agents.supermimic.metrics import SMIterInfo, SMTrainLog, sm_tick
 from noeira.deep_agents.supermimic.motion_library import SMMotionLibrary
 from noeira.deep_agents.supermimic.policy import sm_obs_noise_half
 from noeira.deep_agents.supermimic.robot import SMDims
@@ -34,10 +39,6 @@ from noeira.deep_agents.supermimic.trainer import SMUpdateMetrics, SuperMimicTra
 from noeira.deep_agents.supermimic.world_model import SMWindowBatch, SMWMLoss
 from noeira.nn.constants import DT
 from noeira.nn.core.tensor import TensorImpl
-
-
-comptime SM_WM_K: Int = 8
-comptime SM_WM_BATCHES: Int = 10
 
 
 def sm_cosine_lr(step: Int, total: Int, base: Float64, final_ratio: Float64 = 0.03, decay_fraction: Float64 = 250000.0 / 320000.0) -> Float64:
@@ -51,21 +52,24 @@ def sm_cosine_lr(step: Int, total: Int, base: Float64, final_ratio: Float64 = 0.
 
 @fieldwise_init
 struct SMSchedule(Copyable, Movable):
-    """`ScheduleCfg` + the env's noise flags."""
+    """`ScheduleCfg` + the env's noise flags. `sm_schedule[C](...)` fills the
+    tuned values from the config's `DEF_*`."""
     var total_iterations: Int
-    var utd: Float64              # updates per env step (0.4)
-    var warmup: Int               # env steps before the first update (40)
-    var lr: Float64               # 2e-4
-    var replay_capacity: Int      # rows per lane (1000)
+    var utd: Float64              # updates per env step
+    var warmup: Int               # env steps before the first update
+    var lr: Float64
+    var replay_capacity: Int      # rows per lane
     var noise: Bool               # obs / action / reset noise and domain randomisation
     var seed: Int
 
 
-@fieldwise_init
-struct SMIterInfo(Copyable, Movable):
-    var updated: Bool
-    var wm: SMWMLoss
-    var pi: SMUpdateMetrics
+def sm_schedule[C: SMConfigT](
+    total_iterations: Int, noise: Bool = True, seed: Int = 0,
+    utd: Float64 = C.DEF_UTD, warmup: Int = C.DEF_WARMUP, lr: Float64 = C.DEF_LR,
+    replay_capacity: Int = C.DEF_REPLAY_CAP,
+) -> SMSchedule:
+    """The schedule from the config's tuned defaults, any of them overridable."""
+    return SMSchedule(total_iterations, utd, warmup, lr, replay_capacity, noise, seed)
 
 
 struct SuperMimicAgent[C: SMConfigT](Movable):
@@ -82,6 +86,8 @@ struct SuperMimicAgent[C: SMConfigT](Movable):
     var t_sim: Float64
     var t_wm: Float64
     var t_pi: Float64
+    var lr: Float64
+    var last_avg_reward: Float64      # the last log window's avg_reward (the run's outcome)
 
     def __init__(
         out self, var lib: SMMotionLibrary[Self.C.ROBOT], var sched: SMSchedule, ctx: Optional[DeviceContext] = None
@@ -105,6 +111,8 @@ struct SuperMimicAgent[C: SMConfigT](Movable):
         self.t_sim = 0.0
         self.t_wm = 0.0
         self.t_pi = 0.0
+        self.lr = self.sched.lr
+        self.last_avg_reward = 0.0
 
     def __init__(out self, *, deinit move: Self):
         self.env = move.env^
@@ -120,13 +128,16 @@ struct SuperMimicAgent[C: SMConfigT](Movable):
         self.t_sim = move.t_sim
         self.t_wm = move.t_wm
         self.t_pi = move.t_pi
+        self.lr = move.lr
+        self.last_avg_reward = move.last_avg_reward
 
     # ── data plumbing: replay → the trainer's batches ──
     def window_batch(mut self) raises -> SMWindowBatch[Self.C.ROBOT]:
         comptime S = SMDims[Self.C.ROBOT].S
-        var idx = SMReplayOf[Self.C.ROBOT].sample_indices(self.rb.window_mask(SM_WM_K), Self.C.WM_BATCH)
-        var w = self.rb.windows_at(idx, SM_WM_K)
-        var wb = SMWindowBatch[Self.C.ROBOT](SM_WM_K, Self.C.WM_BATCH)
+        comptime K = Self.C.DEF_WM_K
+        var idx = SMReplayOf[Self.C.ROBOT].sample_indices(self.rb.window_mask(K), Self.C.WM_BATCH)
+        var w = self.rb.windows_at(idx, K)
+        var wb = SMWindowBatch[Self.C.ROBOT](K, Self.C.WM_BATCH)
         for i in range(len(w.states)):
             wb.states.data[i] = w.states[i]
         for i in range(len(w.a_exec)):
@@ -188,7 +199,7 @@ struct SuperMimicAgent[C: SMConfigT](Movable):
         var goals = TensorImpl[DT].alloc(Self.C.LANES * D.GOAL)
         self.env.policy_inputs(hist, goals)
         var a = self.trainer.act[Self.C.LANES](hist, goals)
-        _ = self.env.step(a.data, self.rb)
+        var si = self.env.step(a.data, self.rb)
         for i in range(Self.C.LANES):
             self.ep_sum[i] += self.env.last_reward[i]
             self.ep_n[i] += 1
@@ -198,22 +209,18 @@ struct SuperMimicAgent[C: SMConfigT](Movable):
                 self.ep_n[i] = 0
         self.t_sim += Float64(perf_counter_ns() - t0) * 1e-9
         self.iteration += 1
-        var info = SMIterInfo(False, SMWMLoss(0, 0, 0, 0, 0), SMUpdateMetrics(0, 0, 0, 0, 0, 0))
+        var info = SMIterInfo(False, SMWMLoss(0, 0, 0, 0, 0), SMUpdateMetrics(0, 0, 0, 0, 0, 0), si.reward_mean, si.n_terminated)
         if self.iteration >= self.sched.warmup:
             self.utd_acc += self.sched.utd
             while self.utd_acc >= 1.0:
                 self.utd_acc -= 1.0
-                self.trainer.set_lr(sm_cosine_lr(self.iteration, self.sched.total_iterations, self.sched.lr))
+                self.lr = sm_cosine_lr(self.iteration, self.sched.total_iterations, self.sched.lr)
+                self.trainer.set_lr(self.lr)
                 var t1 = perf_counter_ns()
                 var acc = SMWMLoss(0, 0, 0, 0, 0)
-                for _ in range(SM_WM_BATCHES):
+                for _ in range(Self.C.DEF_WM_BATCHES):
                     var wb = self.window_batch()
-                    var l = self.trainer.wm_update[Self.C.WM_BATCH](wb)
-                    acc.loss += l.loss / Float64(SM_WM_BATCHES)
-                    acc.state_loss += l.state_loss / Float64(SM_WM_BATCHES)
-                    acc.term_bce += l.term_bce / Float64(SM_WM_BATCHES)
-                    acc.nse_1step += l.nse_1step / Float64(SM_WM_BATCHES)
-                    acc.nse_kstep += l.nse_kstep / Float64(SM_WM_BATCHES)
+                    acc.add_scaled(self.trainer.wm_update[Self.C.WM_BATCH](wb), 1.0 / Float64(Self.C.DEF_WM_BATCHES))
                 var t2 = perf_counter_ns()
                 var ib = self.start_batch()
                 var vals = List[Float64]()
@@ -227,65 +234,45 @@ struct SuperMimicAgent[C: SMConfigT](Movable):
                 info.updated = True
         return info^
 
-    def train(mut self, iters: Int, log_every: Int) raises:
-        """`iters` iterations, a log line every `log_every`."""
-        var lg = SMTrainLog()
-        for it in range(iters):
-            var r = self.iterate()
-            lg.add(r)
-            if (it + 1) % log_every == 0:
-                lg.flush(it + 1, self.updates, self.finished, self.t_sim, self.t_wm, self.t_pi)
+    def train[L: Logger = NoOpLogger](
+        mut self,
+        iters: Int,
+        log_every: Int = 50,
+        *,
+        logger: Optional[Pointer[L, MutAnyOrigin]] = None,
+        verbose: Bool = True,
+        checkpoint_every: Int = 0,
+        checkpoint_path: String = "",
+        artifacts: Optional[ArtifactSink] = None,
+        run_dir: String = "",
+    ) raises:
+        """`iters` iterations. Every `log_every`: one `SMMetrics` bundle to
+        `logger` (the run's CSV + monitor, `run_session.run_logger`) and a
+        terminal line; every `checkpoint_every` and at the end: the
+        trainer's one-file checkpoint at `checkpoint_path`, offered to
+        `artifacts` (SAC's `train` arguments)."""
+        var lg = SMTrainLog(Self.C.HORIZON, Self.C.LANES)
+        for it in range(1, iters + 1):
+            lg.add(self.iterate())
+            if sm_tick[Self.C, L](
+                self.trainer, lg, it, iters, self.updates, self.finished, self.lr, self.t_sim, self.t_wm, self.t_pi,
+                log_every, logger, verbose, checkpoint_every, checkpoint_path, artifacts, run_dir,
+            ):
                 self.finished = List[Float64]()
+        self.last_avg_reward = lg.last_avg
 
 
-struct SMTrainLog:
-    """Means of the update metrics between two log lines (both agents)."""
-    var n_up: Int
-    var wl: Float64
-    var w1: Float64
-    var w8: Float64
-    var ij: Float64
-    var iu: Float64
-    var cl: Float64
-    var vm: Float64
-    var tmn: Float64
-
-    def __init__(out self):
-        self.n_up = 0
-        self.wl = 0.0
-        self.w1 = 0.0
-        self.w8 = 0.0
-        self.ij = 0.0
-        self.iu = 0.0
-        self.cl = 0.0
-        self.vm = 0.0
-        self.tmn = 0.0
-
-    def add(mut self, r: SMIterInfo):
-        if not r.updated:
-            return
-        self.n_up += 1
-        self.wl += r.wm.loss
-        self.w1 += r.wm.nse_1step
-        self.w8 += r.wm.nse_kstep
-        self.ij += r.pi.imag_objective
-        self.iu += r.pi.imag_return_undisc
-        self.cl += r.pi.critic_loss
-        self.vm += r.pi.critic_value_mean
-        self.tmn += r.pi.critic_target_mean
-
-    def flush(mut self, it: Int, updates: Int, finished: List[Float64], t_sim: Float64, t_wm: Float64, t_pi: Float64):
-        """Print the line (train_ret = the finished episodes' normalised
-        returns) and start a new window."""
-        var tr = 0.0
-        for k in range(len(finished)):
-            tr += finished[k]
-        var nf = len(finished)
-        var d = Float64(max(self.n_up, 1))
-        print(
-            "it", it, "| updates", updates, "| train_ret", (tr / Float64(nf)) if nf > 0 else -1.0, "(n=", nf, ")",
-            "| wm loss", self.wl / d, "nse1", self.w1 / d, "nse8", self.w8 / d,
-            "| imag J", self.ij / d, "ret", self.iu / d, "| critic", self.cl / d, "V", self.vm / d, "R", self.tmn / d,
-            "| t sim/wm/pi", t_sim, t_wm, t_pi,
-        )
-        self = SMTrainLog()
+def sm_agent[C: SMConfigT](
+    var lib: SMMotionLibrary[C.ROBOT],
+    total_iterations: Int,
+    noise: Bool = True,
+    seed: Int = 0,
+    utd: Float64 = C.DEF_UTD,
+    warmup: Int = C.DEF_WARMUP,
+    lr: Float64 = C.DEF_LR,
+    replay_capacity: Int = C.DEF_REPLAY_CAP,
+    ctx: Optional[DeviceContext] = None,
+) raises -> SuperMimicAgent[C]:
+    """`SuperMimicAgent[C]` with the config's tuned defaults (SAC's
+    `agent_from_config`); `ctx` for a "gpu" config."""
+    return SuperMimicAgent[C](lib^, sm_schedule[C](total_iterations, noise, seed, utd, warmup, lr, replay_capacity), ctx)

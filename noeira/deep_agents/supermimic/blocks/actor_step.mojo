@@ -22,8 +22,6 @@ from noeira.nn.optimizer.adam import Adam
 from noeira.nn.optimizer.grad_clip import clip_grad_norm
 
 
-comptime SM_GAMMA: Float64 = 0.99
-comptime SM_LR: Float64 = 2e-4
 comptime SM_CLIP_NORM: Float64 = 1.0
 comptime SM_CLIP_VALUE: Float64 = 0.1
 
@@ -44,13 +42,18 @@ struct ClipValue(ParamVisitor):
 
 
 struct ActorStep[C: SMConfigT](Movable):
+    """On "gpu" the optimiser adopts the policy into its arena at the first
+    step (one fused clip; see `WorldModelUpdateStep`)."""
     var opt: Adam
+    var adopted: Bool
 
     def __init__(out self):
-        self.opt = Adam(lr=Scalar[DT](SM_LR), beta1=Scalar[DT](0.9), beta2=Scalar[DT](0.95))
+        self.opt = Adam(lr=Scalar[DT](Self.C.DEF_LR), beta1=Scalar[DT](0.9), beta2=Scalar[DT](0.95))
+        self.adopted = False
 
     def __init__(out self, *, deinit move: Self):
         self.opt = move.opt^
+        self.adopted = move.adopted
 
     def step[target: StaticString, N: Int](
         mut self,
@@ -62,10 +65,14 @@ struct ActorStep[C: SMConfigT](Movable):
         obs_noise: Bool,
         ctx: Optional[DeviceContext] = None,
     ) raises -> Tuple[SMImagOut[Self.C.ROBOT], Float64]:
+        comptime if target == "gpu":
+            if not self.adopted:
+                self.opt.adopt[target](pol, ctx)
+                self.adopted = True
         pol.zero_grad[target](ctx)
         var seed = UInt32(random_ui64(1, 0xFFFFFFFF)) if obs_noise else UInt32(0)
-        var o = sm_imagine[Self.C, N, target](wm, pol, critic, tb, ib, SM_GAMMA, True, seed, ctx)
-        var gn = clip_grad_norm[target](pol, Scalar[DT](SM_CLIP_NORM), ctx)
+        var o = sm_imagine[Self.C, N, target](wm, pol, critic, tb, ib, Self.C.DEF_GAMMA, True, seed, ctx)
+        var gn = self.opt.clip_grads[target](pol, Scalar[DT](SM_CLIP_NORM), ctx)
         var cv = ClipValue(Scalar[DT](SM_CLIP_VALUE))
         pol.for_each_param[target](cv, ctx)
         self.opt.step[target](pol, ctx)
