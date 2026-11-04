@@ -223,12 +223,17 @@ struct SMTrackingEnv[R: TrackingRobot](Movable):
     var action_noise: Float64
     var last_reward: List[Float64]
     var last_terminated: List[Bool]
+    var max_episode_steps: Int      # 0: no cap (the evaluation: the clip's end decides)
+    var next_frame: List[Int]       # ≥ 0: the lane's next reset frame instead of a draw
 
     def __init__(
         out self, n: Int, var lib: SMMotionLibrary[Self.R], dr: Bool = True, obs_noise: Bool = True,
         reset_noise: Bool = True, action_noise: Float64 = SM_ACTION_NOISE, rng_seed: Int = 0,
+        max_episode_steps: Int = SM_EPISODE_STEPS,
     ) raises:
         seed(rng_seed)
+        self.max_episode_steps = max_episode_steps
+        self.next_frame = List[Int](length=n, fill=-1)
         self.lanes = List[SMLane[Self.R]]()
         for _ in range(n):
             self.lanes.append(SMLane[Self.R]())
@@ -283,9 +288,27 @@ struct SMTrackingEnv[R: TrackingRobot](Movable):
         self.action_noise = move.action_noise
         self.last_reward = move.last_reward^
         self.last_terminated = move.last_terminated^
+        self.max_episode_steps = move.max_episode_steps
+        self.next_frame = move.next_frame^
 
     def num_lanes(self) -> Int:
         return len(self.lanes)
+
+    def restart(mut self, frames: List[Int]) raises:
+        """Every lane reset to `frames[i]` (they also become each lane's next
+        reset frame), then the construction's command update and observation
+        — the evaluation's start. Set `next_frame` again to queue clips."""
+        var all = List[Int]()
+        for i in range(len(self.lanes)):
+            self.next_frame[i] = frames[i]
+            all.append(i)
+        self._reset(all)
+        for i in range(len(self.lanes)):
+            self._advance_frame(i)
+        for i in range(len(self.lanes)):
+            self._observe(i)
+            self._remember(i)
+            self.lanes[i].ep_start = True
 
     def _set_friction(mut self, i: Int, mu: Float64):
         ref ln = self.lanes[i]
@@ -311,6 +334,8 @@ struct SMTrackingEnv[R: TrackingRobot](Movable):
             var x = random_float64(0.0, acc)
             var b = SMResetSampler.bin_from_cdf(cdf, x)
             var f = SMResetSampler.frame_from[Self.R](self.lib, b, random_float64(0.0, 1.0))
+            if self.next_frame[i] >= 0:      # the evaluation's clip queue
+                f = self.next_frame[i]
             self._write_reference(i, f)
             ref ln = self.lanes[i]
             ln.frame = f
@@ -444,7 +469,7 @@ struct SMTrackingEnv[R: TrackingRobot](Movable):
                 obs_tmp.unsafe_ptr().as_unsafe_any_origin(), scratch.unsafe_ptr().as_unsafe_any_origin(),
             )
             var terminated = abs(Float64(feat[0])) > SM_HEIGHT_TERM or abs(Float64(feat[1])) > SM_TILT_TERM
-            var time_out = ln.ep_len >= SM_EPISODE_STEPS or ln.clip_end
+            var time_out = (self.max_episode_steps > 0 and ln.ep_len >= self.max_episode_steps) or ln.clip_end
             self.last_reward[i] = Float64(r)
             self.last_terminated[i] = terminated
             rsum += Float64(r)

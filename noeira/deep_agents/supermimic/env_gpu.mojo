@@ -131,10 +131,10 @@ def _k_act[n: Int](nl: Int64, seed: UInt32, std: Scalar[DT], a: FP[DT], ae: FP[D
 
 
 def _k_post[R: TrackingRobot](
-    nl: Int64, tree: FP[DT], table: FP[DT], rows: FP[DT], qpos: FP[DT], qvel: FP[DT],
+    nl: Int64, max_steps: Int64, tree: FP[DT], table: FP[DT], rows: FP[DT], qpos: FP[DT], qvel: FP[DT],
     a: FP[DT], s: FP[DT], a_last: FP[DT], xi: FP[DT], scratch: FP[DT],
     frame: FPi, prev_frame: FPi, ep_len: FPi, flags: FPi,
-    out_r: FP[DT], out_i: FPi, rd: FP[DT], meta: FPi, mask: FP[DT],
+    out_r: FP[DT], out_i: FPi, rd: FP[DT], meta: FPi, mask: FP[DT], out_terms: FP[DT],
 ):
     """Steps 2–4 for lane l: the state after the control step, the reward and
     termination against f_t, the replay row metadata, the ending flag."""
@@ -163,7 +163,9 @@ def _k_post[R: TrackingRobot](
     var fl = flags[unsafe_offset=l]
     var terminated = abs(sc[unsafe_offset=SC.FEAT]) > Scalar[DT](SM_HEIGHT_TERM) or abs(sc[unsafe_offset=SC.FEAT + 1]) > Scalar[DT](SM_TILT_TERM)
     var clip_end = (fl & LF_CLIP_END) != 0
-    var ending = terminated or Int(el) >= SM_EPISODE_STEPS or clip_end
+    var ending = terminated or (max_steps > 0 and Int(el) >= Int(max_steps)) or clip_end
+    for k in range(SM_N_TERMS):
+        out_terms[unsafe_offset=l * SM_N_TERMS + k] = sc[unsafe_offset=SC.TERMS + k]
     for j in range(n):
         a_last[unsafe_offset=l * n + j] = al[unsafe_offset=j]
     out_r[unsafe_offset=l] = r
@@ -344,14 +346,18 @@ struct SMTrackingEnvGpu[R: TrackingRobot, BS: TrackingBatchedSim](Movable):
     var meta: DeviceBuffer[DType.int32]
     var out_i: DeviceBuffer[DType.int32]
     var reset_f: DeviceBuffer[DType.int32]
-    var h_out_i: List[Int32]
+    var h_out_i: List[Int32]                 # the last step's (frame, ST_* status) per lane, host
     var feet: DeviceBuffer[DType.int32]      # the foot geoms' bodies
     var n_feet: Int
+    var max_episode_steps: Int               # 0: no cap (the evaluation)
+    var next_frame: List[Int]                # ≥ 0: the lane's next reset frame instead of a draw
+    var out_terms: TensorImpl[DT]            # [N · 8] the last step's weighted reward terms
 
     def __init__(
         out self, ctx: DeviceContext, var lib: SMMotionLibrary[Self.R], var sim: Self.BS,
         dr: Bool = True, obs_noise: Bool = True, reset_noise: Bool = True,
         action_noise: Float64 = SM_ACTION_NOISE, friction_period: Int = SM_EPISODE_STEPS, rng_seed: Int = 0,
+        max_episode_steps: Int = SM_EPISODE_STEPS,
     ) raises:
         """`tables` must be built from a CPU lane of the same robot (the model
         records); `sim` is the batched simulator, already created."""
@@ -398,6 +404,9 @@ struct SMTrackingEnvGpu[R: TrackingRobot, BS: TrackingBatchedSim](Movable):
         self.out_i = ctx.enqueue_create_buffer[DType.int32](NL * 2)
         self.reset_f = ctx.enqueue_create_buffer[DType.int32](NL)
         self.h_out_i = List[Int32](length=NL * 2, fill=0)
+        self.max_episode_steps = max_episode_steps
+        self.next_frame = List[Int](length=NL, fill=-1)
+        self.out_terms = talloc["gpu"](NL * SM_N_TERMS, ctx)
         # the foot geoms' bodies (the per-lane friction overrides are by body)
         var fb = List[Int]()
         for g in self.tables.feet:
@@ -478,9 +487,23 @@ struct SMTrackingEnvGpu[R: TrackingRobot, BS: TrackingBatchedSim](Movable):
         self.h_out_i = move.h_out_i^
         self.feet = move.feet^
         self.n_feet = move.n_feet
+        self.max_episode_steps = move.max_episode_steps
+        self.next_frame = move.next_frame^
+        self.out_terms = move.out_terms^
 
     def num_lanes(self) -> Int:
         return Self.BS.N
+
+    def restart(mut self, ctx: DeviceContext, frames: List[Int]) raises:
+        """Every lane reset to `frames[l]` (they also become each lane's next
+        reset frame), then the construction's command update and observation
+        — the evaluation's start. Set `next_frame` again to queue clips."""
+        var all = List[Int]()
+        for l in range(Self.BS.N):
+            self.next_frame[l] = frames[l]
+            all.append(l)
+        self._reset(ctx, all)
+        self._observe(ctx)
 
     def _set_xi_all(mut self, ctx: DeviceContext, k: Int, v: Float64) raises:
         ctx.enqueue_function[_k_set_xi](
@@ -514,7 +537,10 @@ struct SMTrackingEnvGpu[R: TrackingRobot, BS: TrackingBatchedSim](Movable):
         for l in lanes:
             var x = random_float64(0.0, acc)
             var b = SMResetSampler.bin_from_cdf(cdf, x)
-            hf[l] = Int32(SMResetSampler.frame_from[Self.R](self.lib, b, random_float64(0.0, 1.0)))
+            var f = SMResetSampler.frame_from[Self.R](self.lib, b, random_float64(0.0, 1.0))
+            if self.next_frame[l] >= 0:      # the evaluation's clip queue
+                f = self.next_frame[l]
+            hf[l] = Int32(f)
             hm[l] = 1
             self.logs[l] = SMEpisodeLog()
         ctx.enqueue_copy(self.reset_f, hf)
@@ -568,11 +594,12 @@ struct SMTrackingEnvGpu[R: TrackingRobot, BS: TrackingBatchedSim](Movable):
         self.sim.control_step(ctx, tp["gpu"](self.a_exec), tp["gpu"](self.xi).unsafe_offset(1), D.X, UInt64(_seed(st, RNG_ACT, self.seed_base)))
         # 2.–4. reward, termination, the replay rows
         ctx.enqueue_function[_k_post[Self.R]](
-            Int64(NL), self.tables.tree_p["gpu"](), self.tables.head_p["gpu"](), mptr(self.lib.rows_dev.value().unsafe_ptr()),
+            Int64(NL), Int64(self.max_episode_steps), self.tables.tree_p["gpu"](), self.tables.head_p["gpu"](), mptr(self.lib.rows_dev.value().unsafe_ptr()),
             self.sim.qpos_ptr(), self.sim.qvel_ptr(), tp["gpu"](actions), tp["gpu"](self.s), tp["gpu"](self.a_last),
             tp["gpu"](self.xi), tp["gpu"](self.scratch),
             mptr(self.frame.unsafe_ptr()), mptr(self.prev_frame.unsafe_ptr()), mptr(self.ep_len.unsafe_ptr()), mptr(self.flags.unsafe_ptr()),
             tp["gpu"](self.out_r), mptr(self.out_i.unsafe_ptr()), tp["gpu"](self.rd), mptr(self.meta.unsafe_ptr()), tp["gpu"](self.mask),
+            tp["gpu"](self.out_terms),
             grid_dim=ceildiv(NL, _TPB), block_dim=_TPB,
         )
         rb.add_step(
@@ -594,6 +621,8 @@ struct SMTrackingEnvGpu[R: TrackingRobot, BS: TrackingBatchedSim](Movable):
             var r = Float64(self.out_r.data[l])
             var f = Int(hi[2 * l])
             var stt = hi[2 * l + 1]
+            self.h_out_i[2 * l] = hi[2 * l]           # the last step's (frame, status), for callers
+            self.h_out_i[2 * l + 1] = stt
             self.last_reward[l] = r
             rsum += r
             self.logs[l].log(r, self.lib.bin_of_frame(f), SM_MAX_LOGGED)
