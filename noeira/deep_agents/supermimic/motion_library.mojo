@@ -121,19 +121,33 @@ struct SMMotionLibrary[R: TrackingRobot](Movable):
         self.last_dev = move.last_dev^
 
     def to_device(mut self, ctx: DeviceContext) raises:
-        """The rows and each frame's clip end on the device (once)."""
-        var r = ctx.enqueue_create_buffer[DT](len(self.rows))
+        """The rows and each frame's clip end on the device (once), through
+        a fixed 64 MB staging buffer: the full SEED library is ~13 GB of
+        rows, and one pinned host copy of it would double the host memory
+        and take seconds to pin."""
+        comptime CH = 16 * 1024 * 1024        # floats per staging copy
+        var nr = len(self.rows)
+        var r = ctx.enqueue_create_buffer[DT](nr)
         var l = ctx.enqueue_create_buffer[DType.int32](self.num_frames)
-        var hr = ctx.enqueue_create_host_buffer[DT](len(self.rows))
-        var hl = ctx.enqueue_create_host_buffer[DType.int32](self.num_frames)
+        var hr = ctx.enqueue_create_host_buffer[DT](min(nr, CH))
+        var hl = ctx.enqueue_create_host_buffer[DType.int32](min(self.num_frames, CH))
         ctx.synchronize()
-        for i in range(len(self.rows)):
-            hr[i] = self.rows[i]
-        for f in range(self.num_frames):
-            hl[f] = Int32(self.last_frame_of(f))
-        ctx.enqueue_copy(r, hr)
-        ctx.enqueue_copy(l, hl)
-        ctx.synchronize()
+        var o = 0
+        while o < nr:
+            var m = min(CH, nr - o)
+            for i in range(m):
+                hr[i] = self.rows[o + i]
+            ctx.enqueue_copy(r.create_sub_buffer[DT](o, m), hr.create_sub_buffer[DT](0, m))
+            ctx.synchronize()                 # the staging buffer is refilled next
+            o += m
+        o = 0
+        while o < self.num_frames:
+            var m = min(CH, self.num_frames - o)
+            for i in range(m):
+                hl[i] = Int32(self.last_frame_of(o + i))
+            ctx.enqueue_copy(l.create_sub_buffer[DType.int32](o, m), hl.create_sub_buffer[DType.int32](0, m))
+            ctx.synchronize()
+            o += m
         self.rows_dev = r^
         self.last_dev = l^
 
@@ -326,6 +340,22 @@ struct SMResetSampler(Movable):
         for b in range(nb):
             p[b] /= ps
         return p^
+
+    @staticmethod
+    def bin_from_cdf(cdf: List[Float64], x: Float64) -> Int:
+        """The first bin whose cumulative probability reaches x (the last bin
+        if none does): what the linear scan `while b < len − 1 and cdf[b] <
+        x: b += 1` returns, in O(log bins) — the full SEED has ~10⁶ bins and
+        every resetting lane draws one."""
+        var lo = 0
+        var hi = len(cdf) - 1
+        while lo < hi:
+            var mid = (lo + hi) // 2
+            if cdf[mid] < x:
+                lo = mid + 1
+            else:
+                hi = mid
+        return lo
 
     @staticmethod
     def frame_from[R: TrackingRobot](lib: SMMotionLibrary[R], b: Int, u: Float64) -> Int:

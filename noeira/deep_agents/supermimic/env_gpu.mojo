@@ -22,12 +22,14 @@ features), `sm_observation_lane`, `sm_reset_state_lane`, the library's
 `sm_reference_row_lane` / `sm_goal_window_lane`. Noise comes from a counter
 hash of (seed, lane, entry) instead of the host RNG.
 
-⚠ MODEL RANDOMISATION IS SHARED. A batched simulator holds ONE model for all
-lanes, so foot friction and the CoM offset — model fields on the CPU env,
-drawn per lane — are drawn for the whole batch: the CoM offset once, the
-friction every `friction_period` steps (0 = once). ξ records the values in
-force, so every replay row is still labelled with its true context; what is
-lost is the per-batch diversity. The encoder bias is per lane (it lives in
+MODEL RANDOMISATION, PER LANE when the simulator has `LANE_DR` (the G1's
+does): the foot friction is drawn per lane at every reset (U(0.3, 1.2)) and
+written as that lane's contact-friction override on the foot BODIES, the
+CoM offset per lane once at start-up (mjlab's startup event), both through
+`physics3d/constraints/lane_dr.mojo` — the CPU env's draws, lane for lane.
+A simulator without it shares one model: the CoM offset is drawn once for
+the batch and the friction every `friction_period` steps (0 = once). Either
+way ξ records the values in force. The encoder bias is per lane (it lives in
 the action and the observation, not the model).
 
 The env never touches the host's lists in the step except through the one
@@ -59,7 +61,8 @@ from noeira.deep_agents.supermimic.tables import SMTables, sm_tables
 from noeira.nn.constants import DT
 from noeira.nn.core.ptr import mptr
 from noeira.nn.core.tensor import TensorImpl
-from noeira.physics3d.gpu.constants import BODY_IDX_IPOS_X, GEOM_IDX_FRICTION, GEOM_IDX_PRIORITY
+from noeira.physics3d.constraints.lane_dr import LANE_DR_FRICTION, LANE_DR_IPOS_X, LANE_DR_STRIDE
+from noeira.physics3d.gpu.constants import BODY_IDX_IPOS_X, GEOM_IDX_BODY, GEOM_IDX_FRICTION, GEOM_IDX_PRIORITY
 
 
 comptime SMReplayGpuOf[R: TrackingRobot] = EpisodicReplayGpu[SMDims[R].S, R.NDOF, SMDims[R].X]
@@ -82,6 +85,8 @@ comptime RNG_ACT: UInt32 = 1
 comptime RNG_RESET: UInt32 = 2
 comptime RNG_BIAS: UInt32 = 3
 comptime RNG_OBS: UInt32 = 4
+comptime RNG_FRICTION: UInt32 = 5
+comptime RNG_COM: UInt32 = 6
 
 
 struct SMEnvGpuScratch[R: TrackingRobot]:
@@ -176,9 +181,10 @@ def _k_post[R: TrackingRobot](
 
 
 def _k_inject[R: TrackingRobot](
-    nl: Int64, seed_reset: UInt32, seed_bias: UInt32, noise: Int64, dr: Int64,
+    nl: Int64, seed_reset: UInt32, seed_bias: UInt32, seed_mu: UInt32, noise: Int64, dr: Int64, lane_mu: Int64,
     rows: FP[DT], table: FP[DT], reset_f: FPi, qpos: FP[DT], qvel: FP[DT], scratch: FP[DT],
     xi: FP[DT], a_last: FP[DT], frame: FPi, ep_len: FPi, flags: FPi,
+    lane_dr: FP[DT], feet: FPi, n_feet: Int64,
 ):
     """Step 4b for the lanes the host gave a frame: the reset state (shared
     law) into the simulator, ξ's bias re-drawn, the episode bookkeeping."""
@@ -202,6 +208,13 @@ def _k_inject[R: TrackingRobot](
     if dr != 0:
         for j in range(n):
             xi[unsafe_offset=l * D.X + 1 + j] = Scalar[DT](0.01) * _uni(seed_bias, l, j)
+        if lane_mu != 0:
+            # this lane's foot friction, U(0.3, 1.2): the override on every foot body
+            var mu = Scalar[DT](0.75) + Scalar[DT](0.45) * _uni(seed_mu, l, 0)
+            for k in range(Int(n_feet)):
+                var b = Int(feet[unsafe_offset=k])
+                lane_dr[unsafe_offset=(l * (R.NBODY + 1) + b) * LANE_DR_STRIDE + LANE_DR_FRICTION] = mu
+            xi[unsafe_offset=l * D.X] = mu
     for j in range(n):
         a_last[unsafe_offset=l * n + j] = 0
     frame[unsafe_offset=l] = Int32(f)
@@ -274,6 +287,21 @@ def _k_goals[R: TrackingRobot](nl: Int64, rows: FP[DT], table: FP[DT], last: FPi
     sm_goal_window_lane[R](rows, f, Int(last[unsafe_offset=f]), table.unsafe_offset(L.Q0), goals.unsafe_offset(l * D.GOAL))
 
 
+def _k_lane_com[R: TrackingRobot](nl: Int64, seed: UInt32, body: Int64, lane_dr: FP[DT], xi: FP[DT]):
+    """Lane l's CoM offset of `body` (mjlab's startup event: ±(0.025, 0.05,
+    0.05) m), as its lane override and in ξ's last three entries."""
+    comptime D = SMDims[R]
+    var l = Int(global_idx.x)
+    if l >= Int(nl):
+        return
+    var o = (l * (R.NBODY + 1) + Int(body)) * LANE_DR_STRIDE + LANE_DR_IPOS_X
+    comptime for c in range(3):
+        var h = Scalar[DT](0.025) if c == 0 else Scalar[DT](0.05)
+        var d = h * _uni(seed, l, c)
+        lane_dr[unsafe_offset=o + c] = d
+        xi[unsafe_offset=l * D.X + 1 + R.NDOF + c] = d
+
+
 def _k_set_xi(nl: Int64, x: Int64, k: Int64, v: Scalar[DT], xi: FP[DT]):
     """ξ[l, k] = v for every lane (a shared model field's value)."""
     var l = Int(global_idx.x)
@@ -317,6 +345,8 @@ struct SMTrackingEnvGpu[R: TrackingRobot, BS: TrackingBatchedSim](Movable):
     var out_i: DeviceBuffer[DType.int32]
     var reset_f: DeviceBuffer[DType.int32]
     var h_out_i: List[Int32]
+    var feet: DeviceBuffer[DType.int32]      # the foot geoms' bodies
+    var n_feet: Int
 
     def __init__(
         out self, ctx: DeviceContext, var lib: SMMotionLibrary[Self.R], var sim: Self.BS,
@@ -368,18 +398,44 @@ struct SMTrackingEnvGpu[R: TrackingRobot, BS: TrackingBatchedSim](Movable):
         self.out_i = ctx.enqueue_create_buffer[DType.int32](NL * 2)
         self.reset_f = ctx.enqueue_create_buffer[DType.int32](NL)
         self.h_out_i = List[Int32](length=NL * 2, fill=0)
-        # the shared model: feet get priority 1 (their friction is used as
-        # is), the CoM offset is drawn once, the friction per period
+        # the foot geoms' bodies (the per-lane friction overrides are by body)
+        var fb = List[Int]()
+        for g in self.tables.feet:
+            var b = Int(cpu_lane.geom_field(g, GEOM_IDX_BODY))
+            var seen = False
+            for k in range(len(fb)):
+                seen = seen or fb[k] == b
+            if not seen:
+                fb.append(b)
+        self.n_feet = len(fb)
+        self.feet = ctx.enqueue_create_buffer[DType.int32](max(len(fb), 1))
+        var hfb = ctx.enqueue_create_host_buffer[DType.int32](max(len(fb), 1))
+        ctx.synchronize()
+        for k in range(len(fb)):
+            hfb[k] = Int32(fb[k])
+        ctx.enqueue_copy(self.feet, hfb)
+        # the model: feet get priority 1 (their friction is used as is)
         for g in self.tables.feet:
             self.sim.set_geom_field_all(ctx, g, GEOM_IDX_PRIORITY, 1.0)
         var cb = self.tables.com_body
-        if dr:
-            var rng: List[Float64] = [0.025, 0.05, 0.05]
-            for c in range(3):
-                var d = random_float64(-rng[c], rng[c])
-                self.sim.set_body_field_all(ctx, cb, BODY_IDX_IPOS_X + c, self.sim.body_field(cb, BODY_IDX_IPOS_X + c) + d)
-                self._set_xi_all(ctx, 1 + n + c, d)
-        self._draw_friction(ctx)
+        comptime if Self.BS.LANE_DR:
+            # per lane: the CoM offset now, the friction at every reset
+            if dr:
+                ctx.enqueue_function[_k_lane_com[Self.R]](
+                    Int64(NL), _seed(0, RNG_COM, self.seed_base), Int64(cb), self.sim.lane_dr_ptr(), tp["gpu"](self.xi),
+                    grid_dim=ceildiv(NL, _TPB), block_dim=_TPB,
+                )
+            else:
+                self._set_xi_all(ctx, 0, 1.0)     # the model's foot friction, 1
+        else:
+            # one model: the CoM offset once, the friction per period
+            if dr:
+                var rng: List[Float64] = [0.025, 0.05, 0.05]
+                for c in range(3):
+                    var d = random_float64(-rng[c], rng[c])
+                    self.sim.set_body_field_all(ctx, cb, BODY_IDX_IPOS_X + c, self.sim.body_field(cb, BODY_IDX_IPOS_X + c) + d)
+                    self._set_xi_all(ctx, 1 + n + c, d)
+            self._draw_friction(ctx)
         # every lane reset, then mjlab's `reset()` command update (frame + 1)
         var all = List[Int]()
         for l in range(NL):
@@ -420,6 +476,8 @@ struct SMTrackingEnvGpu[R: TrackingRobot, BS: TrackingBatchedSim](Movable):
         self.out_i = move.out_i^
         self.reset_f = move.reset_f^
         self.h_out_i = move.h_out_i^
+        self.feet = move.feet^
+        self.n_feet = move.n_feet
 
     def num_lanes(self) -> Int:
         return Self.BS.N
@@ -455,9 +513,7 @@ struct SMTrackingEnvGpu[R: TrackingRobot, BS: TrackingBatchedSim](Movable):
             cdf[b] = acc
         for l in lanes:
             var x = random_float64(0.0, acc)
-            var b = 0
-            while b < len(cdf) - 1 and cdf[b] < x:
-                b += 1
+            var b = SMResetSampler.bin_from_cdf(cdf, x)
             hf[l] = Int32(SMResetSampler.frame_from[Self.R](self.lib, b, random_float64(0.0, 1.0)))
             hm[l] = 1
             self.logs[l] = SMEpisodeLog()
@@ -467,10 +523,12 @@ struct SMTrackingEnvGpu[R: TrackingRobot, BS: TrackingBatchedSim](Movable):
         self.sim.reset_lanes(ctx, tp["gpu"](self.mask), UInt64(_seed(st, RNG_RESET, self.seed_base)))
         ctx.enqueue_function[_k_inject[Self.R]](
             Int64(NL), _seed(st, RNG_RESET, self.seed_base), _seed(st, RNG_BIAS, self.seed_base),
-            Int64(1 if self.reset_noise else 0), Int64(1 if self.dr else 0),
+            _seed(st, RNG_FRICTION, self.seed_base),
+            Int64(1 if self.reset_noise else 0), Int64(1 if self.dr else 0), Int64(1 if Self.BS.LANE_DR else 0),
             mptr(self.lib.rows_dev.value().unsafe_ptr()), self.tables.head_p["gpu"](), mptr(self.reset_f.unsafe_ptr()),
             self.sim.qpos_ptr(), self.sim.qvel_ptr(), tp["gpu"](self.scratch), tp["gpu"](self.xi), tp["gpu"](self.a_last),
             mptr(self.frame.unsafe_ptr()), mptr(self.ep_len.unsafe_ptr()), mptr(self.flags.unsafe_ptr()),
+            self.sim.lane_dr_ptr(), mptr(self.feet.unsafe_ptr()), Int64(self.n_feet),
             grid_dim=ceildiv(NL, _TPB), block_dim=_TPB,
         )
         self.sim.refresh(ctx)
@@ -553,8 +611,9 @@ struct SMTrackingEnvGpu[R: TrackingRobot, BS: TrackingBatchedSim](Movable):
         if len(lanes) > 0:
             self._reset(ctx, lanes)
         self.step_count += 1
-        if self.dr and self.friction_period > 0 and self.step_count % self.friction_period == 0:
-            self._draw_friction(ctx)
+        comptime if not Self.BS.LANE_DR:
+            if self.dr and self.friction_period > 0 and self.step_count % self.friction_period == 0:
+                self._draw_friction(ctx)
         # 5.–6. frames, observations, the next rows
         self._observe(ctx)
         return SMStepInfo(rsum / Float64(NL), n_term, n_trunc)

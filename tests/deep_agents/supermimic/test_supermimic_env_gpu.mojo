@@ -22,7 +22,9 @@ action (a pose the PD holds), so answers are known.
     step 62, flagged at its clip's end, never terminated.
 [5] bookkeeping under noise and DR, 60 random steps: every ring holds one
     row per step plus one per ended episode, no NaN in any state, every
-    frame inside the library, ξ's friction the shared draw.
+    frame inside the library; PER-LANE DR: each lane's ξ friction in
+    [0.3, 1.2], not all lanes equal, and each lane's foot-body friction
+    overrides (`lane_dr`) equal to its ξ.
 
 Run (box): pixi run -e nvidia mojo run -I . tests/deep_agents/supermimic/test_supermimic_env_gpu.mojo
 """
@@ -260,11 +262,20 @@ def test_bookkeeping(ctx: DeviceContext, stand: List[Scalar[DT]], mut tl: Tally)
     for i in range(len(s)):
         nan += 1 if isnan(s[i]) else 0
     var x = _dl(ctx, env.xi)
-    var mu_ok = True
+    var dr = _dl(ctx, env.sim.env.d.lane_dr)
+    var hfeet = ctx.enqueue_create_host_buffer[DType.int32](max(env.n_feet, 1))
+    ctx.enqueue_copy(hfeet, env.feet)
+    ctx.synchronize()
+    var mu_ok = env.n_feet > 0
+    var distinct = False
     for l in range(NL):
-        mu_ok = mu_ok and x[l * D.X] == x[0] and Float64(x[0]) >= 0.3 and Float64(x[0]) <= 1.2
+        var mu = Float64(x[l * D.X])
+        mu_ok = mu_ok and mu >= 0.3 and mu <= 1.2
+        distinct = distinct or x[l * D.X] != x[0]
+        for k in range(env.n_feet):
+            mu_ok = mu_ok and dr[(l * (R.NBODY + 1) + Int(hfeet[k])) * 4] == x[l * D.X]
     tl.check(rows == 60 * NL + ends, String(rows) + " rows = 60 x 8 + " + String(ends) + " terminal rows")
-    tl.check(nan == 0 and frames_ok and mu_ok, "no NaN, frames inside the library, shared friction " + String(x[0]))
+    tl.check(nan == 0 and frames_ok and mu_ok and distinct, "no NaN, frames inside the library, per-lane friction on " + String(env.n_feet) + " foot bodies (lane 0 " + String(x[0]) + ", lane 1 " + String(x[D.X]) + ")")
 
 
 def main() raises:

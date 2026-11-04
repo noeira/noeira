@@ -27,7 +27,8 @@ together (losses fall, nothing diverges), not what the method reaches.
 
 Options
 -------
---store PATH   a SuperMimic library store (`ref` column, one episode per clip)
+--store PATH   a SuperMimic library store (`ref` column, one episode per clip),
+               a comma-separated list, or a directory of stores
 --max-clips N  use the first N clips of the store (0 = all)
 --iters N      env steps (default 200)
 --log N        log every N steps (default 25)
@@ -42,6 +43,9 @@ under the same id when `.env` names it (`NOEIRA_CLOUD_URL`).
 """
 
 from std.math import sin
+from std.builtin.sort import sort
+from std.os import listdir
+from std.os.path import isdir
 from std.sys import argv, get_defined_int
 
 from max.gpu.host import DeviceContext
@@ -115,22 +119,51 @@ def _synthetic() raises -> SMMotionLibrary[G1Robot]:
     return SMMotionLibrary[G1Robot](rows^, lens, _q0())
 
 
-def _from_store(path: String, max_clips: Int) raises -> SMMotionLibrary[G1Robot]:
-    var st = TrajectoryStore(path)
-    var refc = st.load_column[DType.float32](String("ref"))
-    var n_ep = st.n_episodes()
-    if max_clips > 0:
-        n_ep = min(n_ep, max_clips)
+def _store_paths(spec: String) raises -> List[String]:
+    """`--store`: one store, a comma-separated list, or a directory (every
+    `*.h5` in it, sorted: an import split in shards / chunks)."""
+    var out = List[String]()
+    if isdir(spec):
+        var names = List[String]()
+        for n in listdir(spec):
+            if String(n).endswith(".h5"):
+                names.append(String(n))
+        sort(names)
+        for k in range(len(names)):
+            out.append(spec + "/" + names[k])
+    else:
+        for part in spec.split(","):
+            out.append(String(part))
+    if len(out) == 0:
+        raise Error("no store in " + spec)
+    return out^
+
+
+def _from_store(spec: String, max_clips: Int) raises -> SMMotionLibrary[G1Robot]:
+    """The clips of every store, concatenated (each store's episodes are
+    contiguous from row 0); `max_clips` > 0 stops after that many."""
+    var paths = _store_paths(spec)
     var lens = List[Int]()
-    var rows_n = 0
-    for e in range(n_ep):
-        var l = Int(st.episodes.ep_len[e])
-        lens.append(l)
-        rows_n += l
-    var rows = List[Scalar[DT]](length=rows_n * 71, fill=0)
-    for i in range(rows_n * 71):      # episodes are contiguous from row 0
-        rows[i] = refc[i]
-    print("  library:", n_ep, "clips,", rows_n, "frames (", Float64(rows_n) / 50.0 / 3600.0, "h ) from", path)
+    var rows = List[Scalar[DT]]()
+    for p in range(len(paths)):
+        if max_clips > 0 and len(lens) >= max_clips:
+            break
+        var st = TrajectoryStore(paths[p])
+        var refc = st.load_column[DType.float32](String("ref"))
+        var n_ep = st.n_episodes()
+        if max_clips > 0:
+            n_ep = min(n_ep, max_clips - len(lens))
+        var rows_n = 0
+        for e in range(n_ep):
+            var l = Int(st.episodes.ep_len[e])
+            lens.append(l)
+            rows_n += l
+        var o = len(rows)
+        rows.resize(o + rows_n * 71, 0)
+        for i in range(rows_n * 71):
+            rows[o + i] = refc[i]
+    var frames = len(rows) // 71
+    print("  library:", len(lens), "clips,", frames, "frames (", Float64(frames) / 50.0 / 3600.0, "h ) from", len(paths), "store(s)")
     return SMMotionLibrary[G1Robot](rows^, lens, _q0())
 
 

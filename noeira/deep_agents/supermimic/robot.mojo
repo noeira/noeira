@@ -18,8 +18,10 @@ builds once (FK tree, foot geoms, limits) and for per-episode randomisation.
 
 `TrackingBatchedSim`: N lanes of the same robot on the device (the GPU env,
 `env_gpu.mojo`), with the same action law. Its model records are SHARED by
-the lanes (one model per batch), so model-field randomisation applies to
-every lane at once; per-lane state (qpos, qvel) is device memory.
+the lanes (one model per batch); a sim with `LANE_DR` also takes per-lane
+overrides of contact friction and CoM by body (`lane_dr_ptr`,
+`physics3d/constraints/lane_dr.mojo`), which is how the env randomises them
+per lane. Per-lane state (qpos, qvel) is device memory.
 
 Every width the method uses follows from the robot (`SMDims[R]`):
 
@@ -38,7 +40,7 @@ from max.gpu.host import DeviceBuffer, DeviceContext
 
 from noeira.core.cont_action import ContAction
 from noeira.envs.robots import UnitreeG1
-from noeira.envs.robots.unitree_g1 import UnitreeG1Batched
+from noeira.envs.robots.unitree_g1 import UnitreeG1BatchedDR
 from noeira.nn.constants import DT
 from noeira.nn.core.ptr import mptr
 from noeira.envs.robots.unitree_g1_pd import G1_N_DOF, g1_default_pos, g1_effort, g1_kp
@@ -92,9 +94,15 @@ trait TrackingBatchedSim(Movable & Deinitable):
     """N simulator lanes on the device. Pointers are device pointers into
     float32 buffers; lane l's slice starts at l·width."""
     comptime N: Int
+    comptime LANE_DR: Bool       # takes per-lane friction / CoM overrides
 
     @staticmethod
     def create(ctx: DeviceContext) raises -> Self:
+        ...
+
+    def lane_dr_ptr(mut self) -> Pointer[Scalar[DT], MutAnyOrigin]:
+        """[N · (NBODY + 1) · LANE_DR_STRIDE] on the device (world body
+        included); read by the physics only when `LANE_DR`."""
         ...
 
     def qpos_ptr(mut self) -> Pointer[Scalar[DT], MutAnyOrigin]:
@@ -303,15 +311,16 @@ def _k_copy_mask(n: Int64, src: Pointer[Scalar[DT], MutAnyOrigin], dst: Pointer[
 
 
 struct G1BatchedSim[N_: Int](TrackingBatchedSim):
-    """`UnitreeG1Batched[N]` (float32, NVIDIA only: the G1's nv overflows
-    Metal's per-thread stack). The same action law as `G1Sim`, as a kernel
+    """`UnitreeG1BatchedDR[N]` (float32, NVIDIA only: the G1's nv overflows
+    Metal's per-thread stack), with per-lane friction / CoM overrides. The same action law as `G1Sim`, as a kernel
     writing the env's action buffer; resets go through the env's own
     `selective_reset_batch` (it clears what `mj_resetData` clears)."""
     comptime N = Self.N_
-    var env: UnitreeG1Batched[Self.N_]
+    comptime LANE_DR = True
+    var env: UnitreeG1BatchedDR[Self.N_]
     var kgain: DeviceBuffer[DT]
 
-    def __init__(out self, var env: UnitreeG1Batched[Self.N_], var kgain: DeviceBuffer[DT]):
+    def __init__(out self, var env: UnitreeG1BatchedDR[Self.N_], var kgain: DeviceBuffer[DT]):
         self.env = env^
         self.kgain = kgain^
 
@@ -321,7 +330,7 @@ struct G1BatchedSim[N_: Int](TrackingBatchedSim):
 
     @staticmethod
     def create(ctx: DeviceContext) raises -> Self:
-        var env = UnitreeG1Batched[Self.N_](ctx)
+        var env = UnitreeG1BatchedDR[Self.N_](ctx)
         env.reset_batch[Self.N_](Optional(ctx), 0)
         var k = ctx.enqueue_create_buffer[DT](G1_N_DOF)
         var hk = ctx.enqueue_create_host_buffer[DT](G1_N_DOF)
@@ -331,6 +340,9 @@ struct G1BatchedSim[N_: Int](TrackingBatchedSim):
         ctx.enqueue_copy(k, hk)
         ctx.synchronize()
         return Self(env^, k^)
+
+    def lane_dr_ptr(mut self) -> Pointer[Scalar[DT], MutAnyOrigin]:
+        return self.env.lane_dr_ptr()
 
     def qpos_ptr(mut self) -> Pointer[Scalar[DT], MutAnyOrigin]:
         return mptr(self.env.d.qpos.dev.value().unsafe_ptr())

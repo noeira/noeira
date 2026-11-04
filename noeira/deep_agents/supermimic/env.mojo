@@ -309,9 +309,7 @@ struct SMTrackingEnv[R: TrackingRobot](Movable):
                 for j in range(Self.R.NDOF):
                     self.lanes[i].xi[1 + j] = Scalar[DT](_u(-0.01, 0.01))
             var x = random_float64(0.0, acc)
-            var b = 0
-            while b < len(cdf) - 1 and cdf[b] < x:
-                b += 1
+            var b = SMResetSampler.bin_from_cdf(cdf, x)
             var f = SMResetSampler.frame_from[Self.R](self.lib, b, random_float64(0.0, 1.0))
             self._write_reference(i, f)
             ref ln = self.lanes[i]
