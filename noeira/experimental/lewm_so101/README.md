@@ -11,7 +11,7 @@ It builds on the reference LeWM in `noeira/deep_agents/lewm/`:
 
 | file | what |
 |---|---|
-| `graphs.mojo` | `LeWMLossGraphRef` with proprioception in the latent (v2) and with an inverse-dynamics term (IDM) |
+| `graphs.mojo` | `LeWMLossGraph` with proprioception in the latent (v2) and with an inverse-dynamics term (IDM) |
 | `trainer.mojo` | the reference training step over those graphs |
 | `data.mojo` | training windows from rendered and real `TrajectoryStore`s (T = 4 frames, 5 ticks apart) |
 

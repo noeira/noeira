@@ -1,11 +1,11 @@
 """G2a — the reference-exact LeWM forward against torch, stage by stage.
 
 docs/LEWM_REOPEN_PLAN.md P2. The published checkpoint (quentinll/lewm-pusht)
-runs through `ref_model.mojo`'s modules and through torch (float64,
+runs through `model.mojo`'s modules and through torch (float64,
 `tools/lewm/dump_lewm_reference.py`). Each STAGE is fed the reference's own
 input for that stage and compared with the reference's output, so an error
 shows where it is made instead of compounding; the whole encoder also runs
-end to end. Weights load by the loss graph's walk names (`ref_load.load_ref`
+end to end. Weights load by the loss graph's walk names (`load.load_dump`
 with the node prefix), so a stage that loads is also a check that the graph
 names what the converter mapped.
 
@@ -17,7 +17,7 @@ Needs the dump:
     pixi run mojo run -I . tools/lewm/list_ref_params.mojo > /tmp/lewm_ref/ours_names.tsv
     pixi run -e act-ref python tools/lewm/convert_ref_to_ours.py --dump /tmp/lewm_ref
 Run:
-    pixi run -e apple mojo run -I . tests/deep_agents/lewm/test_ref_forward.mojo
+    pixi run -e apple mojo run -I . tests/deep_agents/lewm/test_forward.mojo
 """
 
 from std.sys import argv
@@ -32,14 +32,14 @@ from noeira.nn import Sequential, Tokenwise, LayerNorm, BiasAdd, LearnedTokens
 from noeira.nn.models.vit import PatchEmbed
 from noeira.deep_agents.lewm.model import (
     ViTBlockHF,
-    ProjectorRef,
-    LeWMEncoderRef,
-    ActionEmbedderRef,
-    ConditionalTransformerBlockRef,
+    LeWMProjector,
+    LeWMEncoder,
+    LeWMActionEmbedder,
+    LeWMPredictorBlock,
     HF_VIT_LN_EPS,
     TORCH_LN_EPS,
 )
-from noeira.deep_agents.lewm.load import load_ref, ref_input, std_err, tf32_gemm
+from noeira.deep_agents.lewm.load import load_dump, dump_input, std_err, tf32_gemm
 
 
 comptime TOL = 1e-4
@@ -87,38 +87,38 @@ def _encoder[target: StaticString](
         BiasAdd[SEQ * HID],
     ]
     var embed = Embed.make[target, Kaiming](ctx)
-    _ = load_ref[target](embed, dump, String("emb.0."), ctx)
-    var pix = ref_input[target](dump, String("enc.pixels"), ctx)
+    _ = load_dump[target](embed, dump, String("emb.0."), ctx)
+    var pix = dump_input[target](dump, String("enc.pixels"), ctx)
     var out = Tensor.alloc(N_ENC * SEQ * HID)
     embed.forward[target, N_ENC](TensorRefs[1](pix), out, ctx)
     g.check(String("enc  patch+cls+pos"), std_err[target](dump, String("enc.vit_embeddings"), out, ctx))
 
     var blk = ViTBlockHF[HID, 3, SEQ, 4 * HID].make[target, Kaiming](ctx)
     for i in range(12):
-        _ = load_ref[target](blk, dump, String("emb.0.3.") + String(i) + ".", ctx)
+        _ = load_dump[target](blk, dump, String("emb.0.3.") + String(i) + ".", ctx)
         var src = String("enc.vit_embeddings") if i == 0 else String("enc.vit_layer") + String(i - 1)
-        var x = ref_input[target](dump, src, ctx)
+        var x = dump_input[target](dump, src, ctx)
         var y = Tensor.alloc(N_ENC * SEQ * HID)
         blk.forward[target, N_ENC](TensorRefs[1](x), y, ctx)
         g.check(String("enc  vit block ") + String(i), std_err[target](dump, String("enc.vit_layer") + String(i), y, ctx))
 
     var ln = Tokenwise[SEQ, LayerNorm[HID, DT, HF_VIT_LN_EPS]].make[target, Kaiming](ctx)
-    _ = load_ref[target](ln, dump, String("emb.0.4."), ctx)
-    var x11 = ref_input[target](dump, String("enc.vit_layer11"), ctx)
+    _ = load_dump[target](ln, dump, String("emb.0.4."), ctx)
+    var x11 = dump_input[target](dump, String("enc.vit_layer11"), ctx)
     var lno = Tensor.alloc(N_ENC * SEQ * HID)
     ln.forward[target, N_ENC](TensorRefs[1](x11), lno, ctx)
     g.check(String("enc  final LN"), std_err[target](dump, String("enc.vit_final_ln"), lno, ctx))
 
-    var proj = ProjectorRef[HID, PROJ_H, EMB].make[target, Kaiming](ctx)
-    _ = load_ref[target](proj, dump, String("emb.0.6."), ctx)
+    var proj = LeWMProjector[HID, PROJ_H, EMB].make[target, Kaiming](ctx)
+    _ = load_dump[target](proj, dump, String("emb.0.6."), ctx)
     proj.set_attr["training"](Scalar[DT](0.0))
-    var cls = ref_input[target](dump, String("enc.cls"), ctx)
+    var cls = dump_input[target](dump, String("enc.cls"), ctx)
     var emb = Tensor.alloc(N_ENC * EMB)
     proj.forward[target, N_ENC](TensorRefs[1](cls), emb, ctx)
     g.check(String("enc  projector (BN eval)"), std_err[target](dump, String("enc.emb"), emb, ctx))
 
-    var enc = LeWMEncoderRef[3, IMG, PATCH, HID, 3, 12, EMB, PROJ_H].make[target, Kaiming](ctx)
-    _ = load_ref[target](enc, dump, String("emb.0."), ctx)
+    var enc = LeWMEncoder[3, IMG, PATCH, HID, 3, 12, EMB, PROJ_H].make[target, Kaiming](ctx)
+    _ = load_dump[target](enc, dump, String("emb.0."), ctx)
     enc.set_attr["training"](Scalar[DT](0.0))
     var e2e = Tensor.alloc(N_ENC * EMB)
     enc.forward[target, N_ENC](TensorRefs[1](pix), e2e, ctx)
@@ -128,9 +128,9 @@ def _encoder[target: StaticString](
 def _action[target: StaticString](
     dump: String, ctx: Optional[DeviceContext], mut g: Gate
 ) raises:
-    var ae = ActionEmbedderRef[T_ACT, 10, EMB].make[target, Kaiming](ctx)
-    _ = load_ref[target](ae, dump, String("act_emb."), ctx)
-    var a = ref_input[target](dump, String("act.in"), ctx)
+    var ae = LeWMActionEmbedder[T_ACT, 10, EMB].make[target, Kaiming](ctx)
+    _ = load_dump[target](ae, dump, String("act_emb."), ctx)
+    var a = dump_input[target](dump, String("act.in"), ctx)
     var out = Tensor.alloc(B * T_ACT * EMB)
     ae.forward[target, B](TensorRefs[1](a), out, ctx)
     g.check(String("act  embedder"), std_err[target](dump, String("act.act_emb"), out, ctx))
@@ -140,19 +140,19 @@ def _predictor[target: StaticString](
     dump: String, ctx: Optional[DeviceContext], mut g: Gate
 ) raises:
     var pe = BiasAdd[H * EMB].make[target, Kaiming](ctx)
-    _ = load_ref[target](pe, dump, String("x_pe."), ctx)
-    var emb = ref_input[target](dump, String("pred.emb"), ctx)
+    _ = load_dump[target](pe, dump, String("x_pe."), ctx)
+    var emb = dump_input[target](dump, String("pred.emb"), ctx)
     var xp = Tensor.alloc(B * H * EMB)
     pe.forward[target, B](TensorRefs[1](emb), xp, ctx)
     g.check(String("pred position embedding"), std_err[target](dump, String("pred.x_pos"), xp, ctx))
 
-    var blk = ConditionalTransformerBlockRef[EMB, 16, H, 2048, 64].make[target, Kaiming](ctx)
+    var blk = LeWMPredictorBlock[EMB, 16, H, 2048, 64].make[target, Kaiming](ctx)
     for i in range(6):
-        _ = load_ref[target](blk, dump, String("pred_raw.") + String(i) + ".", ctx)
+        _ = load_dump[target](blk, dump, String("pred_raw.") + String(i) + ".", ctx)
         var ins = TensorPack[2]()
         var src = String("pred.x_pos") if i == 0 else String("pred.blk") + String(i - 1)
-        var xv = ref_input[target](dump, src, ctx)
-        var cv = ref_input[target](dump, String("pred.act_emb"), ctx)
+        var xv = dump_input[target](dump, src, ctx)
+        var cv = dump_input[target](dump, String("pred.act_emb"), ctx)
         ins[0].ensure(B * H * EMB)
         ins[1].ensure(B * H * EMB)
         for q in range(B * H * EMB):
@@ -166,16 +166,16 @@ def _predictor[target: StaticString](
         g.check(String("pred AdaLN block ") + String(i), std_err[target](dump, String("pred.blk") + String(i), y, ctx))
 
     var ln = Tokenwise[H, LayerNorm[EMB, DT, TORCH_LN_EPS]].make[target, Kaiming](ctx)
-    _ = load_ref[target](ln, dump, String("pred_ln."), ctx)
-    var b5 = ref_input[target](dump, String("pred.blk5"), ctx)
+    _ = load_dump[target](ln, dump, String("pred_ln."), ctx)
+    var b5 = dump_input[target](dump, String("pred.blk5"), ctx)
     var lno = Tensor.alloc(B * H * EMB)
     ln.forward[target, B](TensorRefs[1](b5), lno, ctx)
     g.check(String("pred final LN"), std_err[target](dump, String("pred.final_ln"), lno, ctx))
 
-    var pp = Tokenwise[H, ProjectorRef[EMB, PROJ_H, EMB]].make[target, Kaiming](ctx)
-    _ = load_ref[target](pp, dump, String("pred."), ctx)
+    var pp = Tokenwise[H, LeWMProjector[EMB, PROJ_H, EMB]].make[target, Kaiming](ctx)
+    _ = load_dump[target](pp, dump, String("pred."), ctx)
     pp.set_attr["training"](Scalar[DT](0.0))
-    var fl = ref_input[target](dump, String("pred.final_ln"), ctx)
+    var fl = dump_input[target](dump, String("pred.final_ln"), ctx)
     var pred = Tensor.alloc(B * H * EMB)
     pp.forward[target, B](TensorRefs[1](fl), pred, ctx)
     g.check(String("pred pred_proj (BN eval)"), std_err[target](dump, String("pred.pred"), pred, ctx))

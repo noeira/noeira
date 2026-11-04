@@ -20,7 +20,7 @@ GPU:
      update bit-identical (its gradient never flows through the target) and
      changes the encoder projector's (it loses the target-side gradient).
 
-    pixi run -e apple mojo run -I . tests/deep_agents/lewm/test_ref_tta.mojo
+    pixi run -e apple mojo run -I . tests/deep_agents/lewm/test_tta.mojo
 """
 
 from std.math import abs
@@ -30,9 +30,9 @@ from max.gpu.host import DeviceContext
 from noeira.nn.constants import DT
 from noeira.deep_agents.act.refload import RefDump
 from noeira.deep_agents.lewm.trainer import (
-    LeWMRefTrainer, TrainerSnapshot, FillFromSnapshot,
+    LeWMTrainer, TrainerSnapshot, FillFromSnapshot,
 )
-from noeira.deep_agents.lewm.rollout import LeWMRefRollout, REF_EMB, REF_ACT
+from noeira.deep_agents.lewm.rollout import LeWMRollout, LEWM_EMB, LEWM_ACT
 from noeira.deep_agents.lewm.adaptation import tta_windows
 from noeira.envs.pusht.eval_pairs import PAIR_HW
 
@@ -77,7 +77,7 @@ def main() raises:
     var fails = 0
     print("P7 TTA machinery (published weights, Apple GPU)")
     var keep: List[String] = ["pred_raw.5.", "pred."]
-    var tr = LeWMRefTrainer["gpu", TB](ctx, lr=5e-4, wd=0.0, max_norm=1.0, dropout=False)
+    var tr = LeWMTrainer["gpu", TB](ctx, lr=5e-4, wd=0.0, max_norm=1.0, dropout=False)
     _ = tr.load(dump)
     tr.set_keep(keep)
     tr.reset_optimizer()
@@ -105,17 +105,17 @@ def main() raises:
     # 4. planner sync (on the adapted trainer, before anything else moves it)
     seed(3)
     var start = List[Scalar[DT]]()
-    for _ in range(REF_EMB):
+    for _ in range(LEWM_EMB):
         start.append(Scalar[DT](random_float64(-1, 1)))
     var cand = List[Scalar[DT]]()
-    for _ in range(8 * 5 * REF_ACT):
+    for _ in range(8 * 5 * LEWM_ACT):
         cand.append(Scalar[DT](random_float64(-1, 1)))
-    var roll_base = LeWMRefRollout["gpu", 8, 5](dump, ctx)
+    var roll_base = LeWMRollout["gpu", 8, 5](dump, ctx)
     var r_base = roll_base.rollout(start, cand)
     _ = tr.save_dump(String(TMP))
-    var roll_ind = LeWMRefRollout["gpu", 8, 5](String(TMP), ctx)
+    var roll_ind = LeWMRollout["gpu", 8, 5](String(TMP), ctx)
     var r_ind = roll_ind.rollout(start, cand)
-    var roll_sync = LeWMRefRollout["gpu", 8, 5](dump, ctx)
+    var roll_sync = LeWMRollout["gpu", 8, 5](dump, ctx)
     var snap = tr.export_params(keep, False)
     var fp = FillFromSnapshot(snap, String("pred_raw."))
     var fa = FillFromSnapshot(snap, String("act_emb."))

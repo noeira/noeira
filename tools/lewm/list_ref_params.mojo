@@ -14,10 +14,10 @@ from noeira.nn.constants import DT
 from noeira.nn.core.tensor import Tensor
 from noeira.nn.core.param import ParamVisitor
 from noeira.nn.core.initializer import Kaiming
-from noeira.deep_agents.lewm.model import LeWMLossGraphRef
+from noeira.deep_agents.lewm.model import LeWMLossGraph
 
 
-comptime Graph = LeWMLossGraphRef[
+comptime Graph = LeWMLossGraph[
     3, 224, 14, 192, 3, 12, 192, 2048,  # IN_CH IMG PATCH HIDDEN HEADS LAYERS EMB PROJ_H
     4, 10, 3, 1,                        # T ACT H N_PREDS
     16, 64, 2048, 6,                    # PRED_HEADS PRED_DIM_HEAD PRED_FF DEPTH

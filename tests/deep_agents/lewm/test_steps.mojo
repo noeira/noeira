@@ -5,7 +5,7 @@ docs/LEWM_REOPEN_PLAN.md P6. The dump's `steps` section ran `train.py`'s step
 five times from the published weights in float64 (each step its own (4, 4)
 window and SIGReg matrix, dropout off): `clip_grad_norm_(1.0)` then torch
 AdamW (lr 5e-5, wd 1.0 on EVERY parameter — the gate's wd: at the recipe's
-1e-3 the decay is below float32). `ref_trainer.LeWMRefTrainer` replays it:
+1e-3 the decay is below float32). `trainer.LeWMTrainer` replays it:
 
   * per step: loss, pred loss, SIGReg, pre-clip norm (relative) — each step
     runs on OUR weights after our previous steps, so an optimizer error
@@ -22,7 +22,7 @@ Mutation (`--mutate-decay`): AdamW skipping the `apply_decay=False` params
 (`nn.Adam`'s default) must fail.
 
 Run (after `pixi run dump-lewm-ref`):
-    pixi run -e apple mojo run -I . tests/deep_agents/lewm/test_ref_steps.mojo
+    pixi run -e apple mojo run -I . tests/deep_agents/lewm/test_steps.mojo
 """
 
 from std.sys import argv
@@ -34,7 +34,7 @@ from noeira.nn.core.tensor import Tensor
 from noeira.nn.core.param import ParamVisitor
 from noeira.deep_agents.act.refload import RefDump
 from noeira.deep_agents.lewm.load import tf32_gemm
-from noeira.deep_agents.lewm.trainer import LeWMRefTrainer
+from noeira.deep_agents.lewm.trainer import LeWMTrainer
 
 
 comptime B = 4
@@ -205,7 +205,7 @@ def _run[target: StaticString](
     var rd = RefDump(dump)
     var hp = rd.get(String("steps.hparams"))  # lr, wd, clip, K
     var K = Int(hp[3])
-    var tr = LeWMRefTrainer[target, B](
+    var tr = LeWMTrainer[target, B](
         ctx, lr=Float64(hp[0]), wd=Float64(hp[1]), max_norm=Float64(hp[2]),
         decay_all=decay_all,
     )

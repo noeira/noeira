@@ -34,23 +34,23 @@ from noeira.nn.core.tensor_refs import TensorRefs
 from noeira.nn.core.initializer import Kaiming
 from noeira.nn import BiasAdd, RepeatConditional, Tokenwise, LayerNorm
 from .model import (
-    ActionEmbedderRef,
-    ConditionalTransformerBlockRef,
-    ProjectorRef,
-    LeWMEncoderRef,
+    LeWMActionEmbedder,
+    LeWMPredictorBlock,
+    LeWMProjector,
+    LeWMEncoder,
     TORCH_LN_EPS,
 )
-from .load import load_ref
+from .load import load_dump
 
 
 # the published model (config.json of quentinll/lewm-pusht)
-comptime REF_EMB = 192
-comptime REF_ACT = 10       # frameskip 5 x 2
-comptime REF_CTX = 3        # predictor num_frames
-comptime REF_DEPTH = 6
-comptime REF_PROJ_H = 2048
+comptime LEWM_EMB = 192
+comptime LEWM_ACT = 10       # frameskip 5 x 2
+comptime LEWM_CTX = 3        # predictor num_frames
+comptime LEWM_DEPTH = 6
+comptime LEWM_PROJ_H = 2048
 
-comptime RefEncoder = LeWMEncoderRef[3, 224, 14, 192, 3, 12, REF_EMB, REF_PROJ_H]
+comptime LeWMPaperEncoder = LeWMEncoder[3, 224, 14, 192, 3, 12, LEWM_EMB, LEWM_PROJ_H]
 
 
 def _up[target: StaticString](
@@ -76,57 +76,57 @@ def _down[target: StaticString](
     return out^
 
 
-def encode_ref[target: StaticString, N: Int](
-    mut enc: RefEncoder, pixels: List[Scalar[DT]], ctx: Optional[DeviceContext]
+def encode_frames[target: StaticString, N: Int](
+    mut enc: LeWMPaperEncoder, pixels: List[Scalar[DT]], ctx: Optional[DeviceContext]
 ) raises -> List[Scalar[DT]]:
     """N ImageNet-normalised CHW frames -> N x EMB (BN in eval mode)."""
     enc.set_attr["training"](Scalar[DT](0.0))
     var x = _up[target](pixels, ctx)
-    var out = Tensor.alloc(N * REF_EMB)
+    var out = Tensor.alloc(N * LEWM_EMB)
     enc.forward[target, N](TensorRefs[1](x), out, ctx)
-    return _down[target](out, N * REF_EMB, ctx)
+    return _down[target](out, N * LEWM_EMB, ctx)
 
 
-struct LeWMRefRollout[target: StaticString, S: Int, HORIZON: Int, ACT: Int = REF_ACT]:
+struct LeWMRollout[target: StaticString, S: Int, HORIZON: Int, ACT: Int = LEWM_ACT]:
     """S candidate action sequences of HORIZON blocks, rolled out from one
     start embedding. The predictor and action embedder of the published
-    model, loaded by the loss graph's walk names (`ref_load`). `ACT` is the
+    model, loaded by the loss graph's walk names (`load`). `ACT` is the
     action block's width (PushT 10; the SO-101 model 30)."""
 
-    comptime D = REF_EMB
-    comptime H = REF_CTX
+    comptime D = LEWM_EMB
+    comptime H = LEWM_CTX
 
-    var ae: ActionEmbedderRef[Self.HORIZON, Self.ACT, REF_EMB]
-    var pe: BiasAdd[REF_CTX * REF_EMB]
+    var ae: LeWMActionEmbedder[Self.HORIZON, Self.ACT, LEWM_EMB]
+    var pe: BiasAdd[LEWM_CTX * LEWM_EMB]
     var pred: RepeatConditional[
-        REF_DEPTH,
-        ConditionalTransformerBlockRef[REF_EMB, 16, REF_CTX, 2048, 64],
+        LEWM_DEPTH,
+        LeWMPredictorBlock[LEWM_EMB, 16, LEWM_CTX, 2048, 64],
     ]
-    var ln: Tokenwise[REF_CTX, LayerNorm[REF_EMB, DT, TORCH_LN_EPS]]
-    var pp: Tokenwise[REF_CTX, ProjectorRef[REF_EMB, REF_PROJ_H, REF_EMB]]
+    var ln: Tokenwise[LEWM_CTX, LayerNorm[LEWM_EMB, DT, TORCH_LN_EPS]]
+    var pp: Tokenwise[LEWM_CTX, LeWMProjector[LEWM_EMB, LEWM_PROJ_H, LEWM_EMB]]
     var ctx: Optional[DeviceContext]
 
     def __init__(out self, dump_dir: String, ctx: Optional[DeviceContext]) raises:
         self.ctx = ctx
-        self.ae = ActionEmbedderRef[Self.HORIZON, Self.ACT, REF_EMB].make[
+        self.ae = LeWMActionEmbedder[Self.HORIZON, Self.ACT, LEWM_EMB].make[
             Self.target, Kaiming
         ](ctx)
-        self.pe = BiasAdd[REF_CTX * REF_EMB].make[Self.target, Kaiming](ctx)
+        self.pe = BiasAdd[LEWM_CTX * LEWM_EMB].make[Self.target, Kaiming](ctx)
         self.pred = RepeatConditional[
-            REF_DEPTH,
-            ConditionalTransformerBlockRef[REF_EMB, 16, REF_CTX, 2048, 64],
+            LEWM_DEPTH,
+            LeWMPredictorBlock[LEWM_EMB, 16, LEWM_CTX, 2048, 64],
         ].make[Self.target, Kaiming](ctx)
-        self.ln = Tokenwise[REF_CTX, LayerNorm[REF_EMB, DT, TORCH_LN_EPS]].make[
+        self.ln = Tokenwise[LEWM_CTX, LayerNorm[LEWM_EMB, DT, TORCH_LN_EPS]].make[
             Self.target, Kaiming
         ](ctx)
-        self.pp = Tokenwise[REF_CTX, ProjectorRef[REF_EMB, REF_PROJ_H, REF_EMB]].make[
+        self.pp = Tokenwise[LEWM_CTX, LeWMProjector[LEWM_EMB, LEWM_PROJ_H, LEWM_EMB]].make[
             Self.target, Kaiming
         ](ctx)
-        _ = load_ref[Self.target](self.ae, dump_dir, String("act_emb."), ctx)
-        _ = load_ref[Self.target](self.pe, dump_dir, String("x_pe."), ctx)
-        _ = load_ref[Self.target](self.pred, dump_dir, String("pred_raw."), ctx)
-        _ = load_ref[Self.target](self.ln, dump_dir, String("pred_ln."), ctx)
-        _ = load_ref[Self.target](self.pp, dump_dir, String("pred."), ctx)
+        _ = load_dump[Self.target](self.ae, dump_dir, String("act_emb."), ctx)
+        _ = load_dump[Self.target](self.pe, dump_dir, String("x_pe."), ctx)
+        _ = load_dump[Self.target](self.pred, dump_dir, String("pred_raw."), ctx)
+        _ = load_dump[Self.target](self.ln, dump_dir, String("pred_ln."), ctx)
+        _ = load_dump[Self.target](self.pp, dump_dir, String("pred."), ctx)
         self.pp.set_attr["training"](Scalar[DT](0.0))
 
     def sync_from[V: ParamVisitor](mut self, mut fill_pred: V, mut fill_ae: V, mut fill_pe: V,
@@ -150,7 +150,7 @@ struct LeWMRefRollout[target: StaticString, S: Int, HORIZON: Int, ACT: Int = REF
     ) raises -> List[Scalar[DT]]:
         """One predictor pass over (S, 3, D) left-aligned contexts; returns
         the output token L-1 of every row, (S, D)."""
-        comptime HD = REF_CTX * REF_EMB
+        comptime HD = LEWM_CTX * LEWM_EMB
         var x = _up[Self.target](x_ctx, self.ctx)
         var xp = Tensor.alloc(Self.S * HD)
         self.pe.forward[Self.target, Self.S](TensorRefs[1](x), xp, self.ctx)
@@ -329,7 +329,7 @@ struct CEMStep(Movable):
 def cem_step[
     target: StaticString, S: Int, HORIZON: Int, K: Int
 ](
-    mut roll: LeWMRefRollout[target, S, HORIZON],
+    mut roll: LeWMRollout[target, S, HORIZON],
     start_emb: List[Scalar[DT]],
     goal_emb: List[Scalar[DT]],
     mean: List[Scalar[DT]],
@@ -347,8 +347,8 @@ def cem_step[
 
     `var` in the reference IS a standard deviation (it multiplies the noise).
     `noise` is the caller's (S, HORIZON, ACT) draw, so a gate can replay
-    torch's generator exactly. `step_w`: `LeWMRefRollout.cost`."""
-    comptime A = HORIZON * REF_ACT
+    torch's generator exactly. `step_w`: `LeWMRollout.cost`."""
+    comptime A = HORIZON * LEWM_ACT
     var cand = List[Scalar[DT]](length=S * A, fill=Scalar[DT](0))
     for s in range(S):
         for i in range(A):

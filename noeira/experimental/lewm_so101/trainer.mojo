@@ -1,4 +1,4 @@
-"""LeWMSo101Trainer — `LeWMRefTrainer`'s training step over the SO-101 world
+"""LeWMSo101Trainer — `LeWMTrainer`'s training step over the SO-101 world
 models' graphs (noeira-docs/SO101_LEWM_PLAN.md S1).
 
 | alias | graph | model |
@@ -7,13 +7,13 @@ models' graphs (noeira-docs/SO101_LEWM_PLAN.md S1).
 | `LeWMIDMTrainer` | `LeWMLossGraphIDM` | v1 + inverse dynamics |
 | `LeWMProprioIDMTrainer` | `LeWMLossGraphProprioIDM` | v2 + inverse dynamics |
 
-(v1 itself trains on `LeWMRefTrainer`, the PushT trainer re-shaped.)
+(v1 itself trains on `LeWMTrainer`, the PushT trainer re-shaped.)
 
-Same recipe, same helpers (`ref_trainer`'s qkv-bias mask, torch-style clip,
+Same recipe, same helpers (`trainer`'s qkv-bias mask, torch-style clip,
 AdamW on every parameter, `_DumpWriter`): only the graph differs — v2 by a
 third input, each frame's proprioception, and the two nodes that fold it into
 the latent; the IDM graphs by H-JEPA's inverse-dynamics term, weight `idm`
-(`ref_model`'s inverse-dynamics section). Generic over the graph
+(`model`'s inverse-dynamics section). Generic over the graph
 (`NamedNodeGraph`) so the three share one step; the PushT graph keeps its own
 trainer and its parameter set for its parity gates. `PROP` is 0 for a graph
 without a "proprio" slot (pass an empty `pro`). Floats in (`train_step` /
@@ -33,11 +33,11 @@ from .graphs import (
     LeWMLossGraphIDM,
     LeWMLossGraphProprioIDM,
 )
-from noeira.deep_agents.lewm.load import LoadRef
+from noeira.deep_agents.lewm.load import LoadDump
 from noeira.deep_agents.act.refload import RefDump
 from noeira.deep_agents.lewm.trainer import (
-    REF_T,
-    RefStepStats,
+    LEWM_T,
+    LeWMStepStats,
     WMWindowLoss,
     WindowLatents,
     node_host,
@@ -74,7 +74,7 @@ comptime LeWMProprioTrainer[
         12,
         192,
         2048,
-        REF_T,
+        LEWM_T,
         ACT_IN,
         PROP,
         3,
@@ -106,7 +106,7 @@ comptime LeWMIDMTrainer[
         12,
         192,
         2048,
-        REF_T,
+        LEWM_T,
         ACT_IN,
         3,
         1,
@@ -138,7 +138,7 @@ comptime LeWMProprioIDMTrainer[
         12,
         192,
         2048,
-        REF_T,
+        LEWM_T,
         ACT_IN,
         PROP,
         3,
@@ -163,9 +163,9 @@ struct LeWMSo101Trainer[
     PROP: Int,
     G: NamedNodeGraph,
 ](Movable, WMWindowLoss):
-    comptime PIX = REF_T * Self.IN_CH * Self.IMG * Self.IMG
-    comptime ACT = REF_T * Self.ACT_IN
-    comptime PRO = REF_T * Self.PROP
+    comptime PIX = LEWM_T * Self.IN_CH * Self.IMG * Self.IMG
+    comptime ACT = LEWM_T * Self.ACT_IN
+    comptime PRO = LEWM_T * Self.PROP
     comptime IDM = Self.G.has_node["il"]()
     """The graph carries the inverse-dynamics term."""
     comptime GT = TensorImpl[Self.G.ACT_DT]
@@ -249,7 +249,7 @@ struct LeWMSo101Trainer[
 
     def load(mut self, dump_dir: String) raises -> Int:
         """Every Param and BN State from a dump (`save_dump`)."""
-        var lv = LoadRef(RefDump(dump_dir), String(""))
+        var lv = LoadDump(RefDump(dump_dir), String(""))
         self.graph.for_each_param[Self.target](lv, self.ctx)
         self.graph.for_each_state[Self.target](lv, self.ctx)
         lv.check()
@@ -302,7 +302,7 @@ struct LeWMSo101Trainer[
         pix: List[Scalar[DT]],
         act: List[Scalar[DT]],
         pro: List[Scalar[DT]],
-    ) raises -> RefStepStats:
+    ) raises -> LeWMStepStats:
         """`pix` (B, T, IN_CH, IMG, IMG) normalised; act (B, T, ACT_IN) and
         pro (B, T, PROP) z-scored."""
         self.graph.zero_grad[Self.target](self.ctx)
@@ -362,7 +362,7 @@ struct LeWMSo101Trainer[
         pix: List[Scalar[DT]],
         act: List[Scalar[DT]],
         pro: List[Scalar[DT]],
-    ) raises -> RefStepStats:
+    ) raises -> LeWMStepStats:
         """Forward only, in the current mode (no update)."""
         self._inputs(pix, act, pro)
         self.graph.forward[Self.B, Self.target](
@@ -393,22 +393,22 @@ struct LeWMSo101Trainer[
         image latent itself otherwise."""
         _ = self.loss_of(pix, act, pro)
         var img = node_host[Self.target](
-            self._out["emb"](), Self.B * REF_T * 192, self.ctx
+            self._out["emb"](), Self.B * LEWM_T * 192, self.ctx
         )
         var z: List[Float32]
         comptime if Self.G.has_node["z"]():
             z = node_host[Self.target](
-                self._out["z"](), Self.B * REF_T * 192, self.ctx
+                self._out["z"](), Self.B * LEWM_T * 192, self.ctx
             )
         else:
             z = img.copy()
         var pred = node_host[Self.target](
-            self._out["pred"](), Self.B * (REF_T - 1) * 192, self.ctx
+            self._out["pred"](), Self.B * (LEWM_T - 1) * 192, self.ctx
         )
         return WindowLatents(img^, z^, pred^)
 
-    def _stats(mut self) raises -> RefStepStats:
-        var stats = RefStepStats(0.0, 0.0, 0.0, 0.0)
+    def _stats(mut self) raises -> LeWMStepStats:
+        var stats = LeWMStepStats(0.0, 0.0, 0.0, 0.0)
         comptime if Self.target == "gpu":
             var c = self.ctx.value()
             c.synchronize()
@@ -431,8 +431,8 @@ struct LeWMSo101Trainer[
         return stats^
 
     def save_dump(mut self, dir: String) raises -> Int:
-        """Every Param and BN State to `dir` (`ref_trainer._DumpWriter`'s
-        format, which `load_ref` / `load` read)."""
+        """Every Param and BN State to `dir` (`trainer._DumpWriter`'s
+        format, which `load_dump` / `load` read)."""
         makedirs(dir, exist_ok=True)
         var w = _DumpWriter(dir)
         self.graph.for_each_param[Self.target](w, self.ctx)

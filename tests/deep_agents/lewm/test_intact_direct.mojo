@@ -27,8 +27,8 @@ from max.gpu.host import DeviceContext
 from noeira.nn.constants import DT
 from noeira.nn.core.initializer import Kaiming
 from noeira.deep_agents.act.refload import RefDump
-from noeira.deep_agents.lewm.load import load_ref
-from noeira.deep_agents.lewm.rollout import RefEncoder, encode_ref, REF_EMB, REF_ACT
+from noeira.deep_agents.lewm.load import load_dump
+from noeira.deep_agents.lewm.rollout import LeWMPaperEncoder, encode_frames, LEWM_EMB, LEWM_ACT
 from noeira.envs.pusht.eval_pairs import imagenet_from_hwc255, PAIR_HW
 from noeira.deep_agents.lewm.intact import IntactDirect
 
@@ -64,12 +64,12 @@ def _run[target: StaticString](dump: String, fixture: String, ctx: Optional[Devi
     var pi_ref = rd.get(String("intact.plan_intact"))
     var pa_ref = rd.get(String("intact.plan_aligned"))
     var a_hist = rd.get(String("intact.a_hist"))
-    var n = len(z0_ref) // REF_EMB
+    var n = len(z0_ref) // LEWM_EMB
     var sp = fx.get(String("pairs.start_pixels"))
     var gp = fx.get(String("pairs.goal_pixels"))
 
-    var enc = RefEncoder.make[target, Kaiming](ctx)
-    _ = load_ref[target](enc, dump, String("emb.0."), ctx)
+    var enc = LeWMPaperEncoder.make[target, Kaiming](ctx)
+    _ = load_dump[target](enc, dump, String("emb.0."), ctx)
     var di = IntactDirect[target, HORIZON](dump, ctx)
     var e_z = 0.0
     var e_m = 0.0
@@ -77,24 +77,24 @@ def _run[target: StaticString](dump: String, fixture: String, ctx: Optional[Devi
     var e_pi = 0.0
     var e_pa = 0.0
     for e in range(n):
-        var z0 = encode_ref[target, 1](enc, imagenet_from_hwc255(sp, e * PAIR_HW * 3), ctx)
-        var zg = encode_ref[target, 1](enc, imagenet_from_hwc255(gp, e * PAIR_HW * 3), ctx)
-        e_z = max(e_z, max(_err(z0, z0_ref, e * REF_EMB, REF_EMB), _err(zg, zg_ref, e * REF_EMB, REF_EMB)))
+        var z0 = encode_frames[target, 1](enc, imagenet_from_hwc255(sp, e * PAIR_HW * 3), ctx)
+        var zg = encode_frames[target, 1](enc, imagenet_from_hwc255(gp, e * PAIR_HW * 3), ctx)
+        e_z = max(e_z, max(_err(z0, z0_ref, e * LEWM_EMB, LEWM_EMB), _err(zg, zg_ref, e * LEWM_EMB, LEWM_EMB)))
         var m = List[Scalar[DT]]()
-        for d in range(REF_EMB):
+        for d in range(LEWM_EMB):
             m.append(zg[d] - z0[d])
         var o = di.actor_out(z0, m)
         var mean = List[Scalar[DT]]()
         var ls = List[Scalar[DT]]()
-        for i in range(REF_ACT):
+        for i in range(LEWM_ACT):
             mean.append(o[i])
-            ls.append(min(Scalar[DT](2.0), max(Scalar[DT](-5.0), o[REF_ACT + i])))
-        e_m = max(e_m, _err(mean, m_ref, e * REF_ACT, REF_ACT))
-        e_s = max(e_s, _err(ls, s_ref, e * REF_ACT, REF_ACT))
+            ls.append(min(Scalar[DT](2.0), max(Scalar[DT](-5.0), o[LEWM_ACT + i])))
+        e_m = max(e_m, _err(mean, m_ref, e * LEWM_ACT, LEWM_ACT))
+        e_s = max(e_s, _err(ls, s_ref, e * LEWM_ACT, LEWM_ACT))
         var pi = di.plan(z0, zg, a_hist, False)
         var pa = di.plan(z0, zg, a_hist, True)
-        e_pi = max(e_pi, _err(pi, pi_ref, e * HORIZON * REF_ACT, HORIZON * REF_ACT))
-        e_pa = max(e_pa, _err(pa, pa_ref, e * HORIZON * REF_ACT, HORIZON * REF_ACT))
+        e_pi = max(e_pi, _err(pi, pi_ref, e * HORIZON * LEWM_ACT, HORIZON * LEWM_ACT))
+        e_pa = max(e_pa, _err(pa, pa_ref, e * HORIZON * LEWM_ACT, HORIZON * LEWM_ACT))
     var worst = max(max(e_z, e_m), max(e_s, max(e_pi, e_pa)))
     var flag = String("") if worst <= TOL else String("  ✗")
     print("  --", target, ":", n, "pairs | z0/zg", e_z, "| actor mean", e_m, "log σ", e_s,

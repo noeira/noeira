@@ -15,7 +15,7 @@ Then the 4 iterations are chained on OUR OWN state and the final plan is
 compared with torch's (informational when a tie occurred, gated otherwise).
 
 Run (after `pixi run dump-lewm-ref`):
-    pixi run -e apple mojo run -I . tests/deep_agents/lewm/test_ref_cem.mojo
+    pixi run -e apple mojo run -I . tests/deep_agents/lewm/test_cem.mojo
 """
 
 from std.sys import argv
@@ -25,9 +25,9 @@ from max.gpu.host import DeviceContext
 from noeira.nn.constants import DT
 from noeira.nn.core.initializer import Kaiming
 from noeira.deep_agents.act.refload import RefDump
-from noeira.deep_agents.lewm.load import load_ref, tf32_gemm
+from noeira.deep_agents.lewm.load import load_dump, tf32_gemm
 from noeira.deep_agents.lewm.rollout import (
-    LeWMRefRollout, RefEncoder, encode_ref, cem_step, REF_EMB, REF_ACT,
+    LeWMRollout, LeWMPaperEncoder, encode_frames, cem_step, LEWM_EMB, LEWM_ACT,
 )
 
 
@@ -35,8 +35,8 @@ comptime S = 64
 comptime HORIZON = 5
 comptime K = 8
 comptime N_STEPS = 4
-comptime A = HORIZON * REF_ACT
-comptime D = REF_EMB
+comptime A = HORIZON * LEWM_ACT
+comptime D = LEWM_EMB
 
 
 def _max_abs(a: List[Scalar[DT]], b: List[Scalar[DT]]) -> Float64:
@@ -55,19 +55,19 @@ def _run[target: StaticString](dump: String, ctx: Optional[DeviceContext]) raise
     else:
         print("  --", target)
     var rd = RefDump(dump)
-    var enc = RefEncoder.make[target, Kaiming](ctx)
-    _ = load_ref[target](enc, dump, String("emb.0."), ctx)
+    var enc = LeWMPaperEncoder.make[target, Kaiming](ctx)
+    _ = load_dump[target](enc, dump, String("emb.0."), ctx)
     var pix = rd.get(String("cem.start_pixels"))
     var gpx = rd.get(String("cem.goal_pixels"))
     for i in range(len(gpx)):
         pix.append(gpx[i])
-    var se = encode_ref[target, 2](enc, pix, ctx)
+    var se = encode_frames[target, 2](enc, pix, ctx)
     var start = List[Scalar[DT]](capacity=D)
     var goal = List[Scalar[DT]](capacity=D)
     for d in range(D):
         start.append(se[d])
         goal.append(se[D + d])
-    var roll = LeWMRefRollout[target, S, HORIZON](dump, ctx)
+    var roll = LeWMRollout[target, S, HORIZON](dump, ctx)
 
     var fails = 0
     var ties = 0

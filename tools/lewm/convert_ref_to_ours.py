@@ -9,7 +9,7 @@ layouts, so the Mojo gates read it with `refload.LoadRefParams` unchanged.
     pixi run -e act-ref python tools/lewm/convert_ref_to_ours.py --dump /tmp/lewm_ref
 
 Writes, into the same dump directory, for every Param / State name of
-`ref_model.LeWMLossGraphRef` (as listed by `list_ref_params.mojo`):
+`model.LeWMLossGraph` (as listed by `list_ref_params.mojo`):
 
     ours.<name>          the checkpoint value           (P and S)
     ours_grad.<name>     d loss / d param of `train`     (P)
@@ -29,7 +29,7 @@ linear and applies the same way to weights, gradients and Adam deltas.
   order (shift_msa, scale_msa, gate_msa, shift_mlp, scale_mlp, gate_mlp) ->
   our `sh1 sc1 g1 sh2 sc2 g2` ZeroLinears.
 - the predictor's `to_qkv` has NO bias; ours does -> zeros, no grad/adam
-  counterpart (the documented deviation, ref_model.mojo).
+  counterpart (the documented deviation, model.mojo).
 - patch Conv2D: ours `[OC, IC*K*K]` = torch `[OC, IC, K, K]` flattened.
 
 Coverage is asserted both ways: every one of our names is produced, and every

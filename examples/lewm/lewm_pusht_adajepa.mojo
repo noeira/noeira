@@ -12,7 +12,7 @@ Two arms per pair, on identical pairs and identical CEM noise:
   adapt   after each executed block: the latest windows of 4 frames (history
           3 + 1, frameskip 5) with the executed actions (z-scored with the
           TRAINING normaliser — the model's space, not the planner's
-          population-std one), `--tta-steps` steps of `LeWMRefTrainer`
+          population-std one), `--tta-steps` steps of `LeWMTrainer`
           (`set_keep` subset, wd 0, Adam per `--adam`, dropout off, BN per
           `--tta-bn`), then the planner's predictor side (and encoder, when
           adapted) re-synced, and the goal re-encoded.
@@ -72,13 +72,13 @@ from noeira.nn.constants import DT
 from noeira.nn.core.initializer import Kaiming
 from noeira.deep_agents.act.refload import RefDump
 from noeira.envs.pusht import PushTAction
-from noeira.deep_agents.lewm.load import load_ref
+from noeira.deep_agents.lewm.load import load_dump
 from noeira.deep_agents.lewm.rollout import (
-    LeWMRefRollout, RefEncoder, encode_ref, cem_step, PlanCost, REF_EMB, REF_ACT,
+    LeWMRollout, LeWMPaperEncoder, encode_frames, cem_step, PlanCost, LEWM_EMB, LEWM_ACT,
 )
 from noeira.deep_agents.lewm.intact import IntactDirect
 from noeira.deep_agents.lewm.trainer import (
-    LeWMRefTrainer, TrainerSnapshot, FillFromSnapshot, REF_T,
+    LeWMTrainer, TrainerSnapshot, FillFromSnapshot, LEWM_T,
 )
 from noeira.deep_agents.lewm.adaptation import tta_windows
 from noeira.envs.pusht.eval_pairs import (
@@ -93,7 +93,7 @@ comptime K = 30
 comptime ITERS = 30
 comptime HORIZON = 5
 comptime FRAMESKIP = 5
-comptime A = HORIZON * REF_ACT
+comptime A = HORIZON * LEWM_ACT
 comptime TB = 4
 """Adaptation batch: the latest TB windows of the episode (cycled while the
 episode has fewer)."""
@@ -146,8 +146,8 @@ def _keep_for(subset: String) raises -> List[String]:
 
 
 def _sync_planner(
-    mut tr: LeWMRefTrainer[TARGET, TB], mut enc: RefEncoder,
-    mut roll: LeWMRefRollout[TARGET, S, HORIZON], cfg: Cfg, ctx: Optional[DeviceContext],
+    mut tr: LeWMTrainer[TARGET, TB], mut enc: LeWMPaperEncoder,
+    mut roll: LeWMRollout[TARGET, S, HORIZON], cfg: Cfg, ctx: Optional[DeviceContext],
     full: Bool,
 ) raises -> Int:
     """The planner's copies <- the trainer: the adapted subset (all tensors
@@ -172,8 +172,8 @@ def _sync_planner(
 
 def _episode(
     e: Int, adapt: Bool, cfg: Cfg,
-    mut env: PairEnv, mut enc: RefEncoder, mut roll: LeWMRefRollout[TARGET, S, HORIZON],
-    mut tr: LeWMRefTrainer[TARGET, TB], mut di: Optional[IntactDirect[TARGET, HORIZON]],
+    mut env: PairEnv, mut enc: LeWMPaperEncoder, mut roll: LeWMRollout[TARGET, S, HORIZON],
+    mut tr: LeWMTrainer[TARGET, TB], mut di: Optional[IntactDirect[TARGET, HORIZON]],
     ctx: Optional[DeviceContext],
     start_pix: List[Scalar[DT]], goal_pix: List[Scalar[DT]], goal_state: List[Scalar[DT]],
     a_mean: List[Scalar[DT]], a_scale: List[Scalar[DT]], a_std_train: List[Scalar[DT]],
@@ -188,7 +188,7 @@ def _episode(
     for i in range(FRAME):
         goal.append(goal_pix[e * FRAME + i])
     shift_frame(goal, 0, cfg.shift, UInt64(e) * 7919 + 2)
-    var goal_emb = encode_ref[TARGET, 1](enc, imagenet_from_hwc255(goal, 0), ctx)
+    var goal_emb = encode_frames[TARGET, 1](enc, imagenet_from_hwc255(goal, 0), ctx)
     var frames = List[List[Scalar[DT]]]()
     frames.append(first^)
     var acts = List[List[Scalar[DT]]]()
@@ -203,7 +203,7 @@ def _episode(
         pend_x.append(Float64(ag0[0]))
         pend_y.append(Float64(ag0[1]))
     while step < cfg.budget:
-        var start_emb = encode_ref[TARGET, 1](enc, imagenet_from_hwc255(frames[len(frames) - 1], 0), ctx)
+        var start_emb = encode_frames[TARGET, 1](enc, imagenet_from_hwc255(frames[len(frames) - 1], 0), ctx)
         var mean = init.copy()
         var std = List[Scalar[DT]](length=A, fill=Scalar[DT](1))
         var step_w = cfg.cost.weights(HORIZON, out.replans)
@@ -220,16 +220,16 @@ def _episode(
                 std = st.std.copy()
         out.replans += 1
         # swm warm start: the next replan's mean = this plan's unexecuted blocks, zero-padded
-        var kept = A - cfg.receding * REF_ACT
+        var kept = A - cfg.receding * LEWM_ACT
         for j in range(A):
-            init[j] = mean[cfg.receding * REF_ACT + j] if cfg.warm_start and j < kept else Scalar[DT](0)
+            init[j] = mean[cfg.receding * LEWM_ACT + j] if cfg.warm_start and j < kept else Scalar[DT](0)
         for blk in range(cfg.receding):
-            var block = List[Scalar[DT]](capacity=REF_ACT)
+            var block = List[Scalar[DT]](capacity=LEWM_ACT)
             for k in range(FRAMESKIP):
                 if step >= cfg.budget:
                     break
-                var ax = Float64(mean[blk * REF_ACT + 2 * k + 0]) * Float64(a_scale[0]) + Float64(a_mean[0])
-                var ay = Float64(mean[blk * REF_ACT + 2 * k + 1]) * Float64(a_scale[1]) + Float64(a_mean[1])
+                var ax = Float64(mean[blk * LEWM_ACT + 2 * k + 0]) * Float64(a_scale[0]) + Float64(a_mean[0])
+                var ay = Float64(mean[blk * LEWM_ACT + 2 * k + 1]) * Float64(a_scale[1]) + Float64(a_mean[1])
                 # the executed action in the model's (training) normalisation
                 block.append(Scalar[DT]((ax - Float64(a_mean[0])) / Float64(a_std_train[0])))
                 block.append(Scalar[DT]((ay - Float64(a_mean[1])) / Float64(a_std_train[1])))
@@ -245,15 +245,15 @@ def _episode(
                 out.margin = min(out.margin, mg)
                 if mg < 1.0:
                     out.ok = True
-            if len(block) < REF_ACT:
+            if len(block) < LEWM_ACT:
                 break  # a block cut by the budget is not a model step
             acts.append(block^)
             var fr = render_frame(env)
             shift_frame(fr, 0, cfg.shift, UInt64(e) * 7919 + UInt64(len(frames)) * 13 + 3)
             frames.append(fr^)
         # measure (both arms), adapt (adapt arm), then plan with the updated model
-        if len(frames) >= REF_T and step < cfg.budget:
-            var bt = tta_windows[TB, REF_T](frames, acts)
+        if len(frames) >= LEWM_T and step < cfg.budget:
+            var bt = tta_windows[TB, LEWM_T](frames, acts)
             var pre = tr.loss_of(bt[0], bt[1])
             out.pred_loss += pre.pred_loss
             out.measured += 1
@@ -268,7 +268,7 @@ def _episode(
             tr.set_bn_training(False)
             _ = _sync_planner(tr, enc, roll, cfg, ctx, False)
             if cfg.touches_encoder or cfg.tta_bn_train:
-                goal_emb = encode_ref[TARGET, 1](enc, imagenet_from_hwc255(goal, 0), ctx)
+                goal_emb = encode_frames[TARGET, 1](enc, imagenet_from_hwc255(goal, 0), ctx)
             out.adapts += 1
     if out.adapts > 0:
         out.pre_loss /= Float64(out.adapts)
@@ -382,17 +382,17 @@ def main() raises:
 
     var c = DeviceContext()
     var ctx = Optional(c)
-    var enc = RefEncoder.make[TARGET, Kaiming](ctx)
-    _ = load_ref[TARGET](enc, dump, String("emb.0."), ctx)
-    var roll = LeWMRefRollout[TARGET, S, HORIZON](dump, ctx)
+    var enc = LeWMPaperEncoder.make[TARGET, Kaiming](ctx)
+    _ = load_dump[TARGET](enc, dump, String("emb.0."), ctx)
+    var roll = LeWMRollout[TARGET, S, HORIZON](dump, ctx)
     var di: Optional[IntactDirect[TARGET, HORIZON]] = None
     if cfg.direct:
         di = IntactDirect[TARGET, HORIZON](dump, ctx)
     # a raw zero block in the training normalisation (INTACT's episode start)
-    var a_zero = List[Scalar[DT]](capacity=REF_ACT)
-    for k in range(REF_ACT):
+    var a_zero = List[Scalar[DT]](capacity=LEWM_ACT)
+    for k in range(LEWM_ACT):
         a_zero.append(Scalar[DT]((0.0 - Float64(a_mean[k % 2])) / Float64(a_std_train[k % 2])))
-    var tr = LeWMRefTrainer[TARGET, TB](ctx, lr=tta_lr, wd=0.0, max_norm=1.0,
+    var tr = LeWMTrainer[TARGET, TB](ctx, lr=tta_lr, wd=0.0, max_norm=1.0,
                                        sigreg_lambda=lam, dropout=False)
     _ = tr.load(dump)
     tr.set_keep(cfg.keep)

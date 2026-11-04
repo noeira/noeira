@@ -5,14 +5,14 @@
 # torch run (tools/lewm/dump_lewm_reference.py, float64). CPU + GPU in each.
 # Needs the dump in /tmp/lewm_ref and the weights in
 # ~/.cache/noeira/lewm_pusht/hf/ (docs/LEWM_REOPEN_PLAN.md P1/P2).
-tests/deep_agents/lewm/test_ref_forward.mojo
-tests/deep_agents/lewm/test_ref_train.mojo
-tests/deep_agents/lewm/test_ref_rollout.mojo
-tests/deep_agents/lewm/test_ref_cem.mojo
+tests/deep_agents/lewm/test_forward.mojo
+tests/deep_agents/lewm/test_train.mojo
+tests/deep_agents/lewm/test_rollout.mojo
+tests/deep_agents/lewm/test_cem.mojo
 # P6 — five chained training steps (AdamW, clip, decay on every parameter)
-tests/deep_agents/lewm/test_ref_steps.mojo
+tests/deep_agents/lewm/test_steps.mojo
 # P7 — the test-time-adaptation machinery (mask, BN, restore, planner sync, windows)
-tests/deep_agents/lewm/test_ref_tta.mojo
+tests/deep_agents/lewm/test_tta.mojo
 
 # P4 — PushT against the dataset (docs/LEWM_REOPEN_PLAN.md). Need box session
 # A's fixture + pymunk oracle in ~/.cache/noeira/lewm_pusht/session_a/ and,

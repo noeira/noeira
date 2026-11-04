@@ -1,7 +1,7 @@
 """G2b — the reference-exact LeWM TRAINING step against torch: loss, every
 gradient, BN running stats.
 
-docs/LEWM_REOPEN_PLAN.md P2. `ref_model.LeWMLossGraphRef` loaded with the
+docs/LEWM_REOPEN_PLAN.md P2. `model.LeWMLossGraph` loaded with the
 published checkpoint runs the dump's `train` window (B = 4, T = 4) exactly as
 `train.py:lejepa_forward` does in torch (float64): BN in TRAIN mode, dropout
 off, SIGReg on torch's own projection matrix (injected via `fixed_a`),
@@ -10,7 +10,7 @@ off, SIGReg on torch's own projection matrix (injected via `fixed_a`),
   * the loss and its two terms, the embeddings, the predictions;
   * d loss / d param for every one of the 309 parameters with a torch
     counterpart (the 6 predictor qkv biases have none: the documented
-    deviation, ref_model.mojo) — this is the check of every VJP the model uses;
+    deviation, model.mojo) — this is the check of every VJP the model uses;
   * BN running stats after the step (the unbiased update);
   * the global gradient norm over the mapped parameters (torch:
     `clip_grad_norm_`'s return, `adamw.grad_norm`).
@@ -27,8 +27,8 @@ otherwise roundoff over roundoff — and each gradient is held to
 max(TOL, 10 x torch's own float32 error on it), measured by the dumper's
 `--noise` in the same metric.
 
-Run (after the dump + convert, see test_ref_forward.mojo):
-    pixi run -e apple mojo run -I . tests/deep_agents/lewm/test_ref_train.mojo
+Run (after the dump + convert, see test_forward.mojo):
+    pixi run -e apple mojo run -I . tests/deep_agents/lewm/test_train.mojo
 """
 
 from std.sys import argv
@@ -40,8 +40,8 @@ from noeira.nn.core.tensor import Tensor
 from noeira.nn.core.param import ParamVisitor
 from noeira.nn.core.initializer import Kaiming
 from noeira.deep_agents.act.refload import RefDump
-from noeira.deep_agents.lewm.model import LeWMLossGraphRef
-from noeira.deep_agents.lewm.load import LoadRef, ref_input, std_err, tf32_gemm
+from noeira.deep_agents.lewm.model import LeWMLossGraph
+from noeira.deep_agents.lewm.load import LoadDump, dump_input, std_err, tf32_gemm
 
 
 comptime TOL = 1e-4
@@ -60,7 +60,7 @@ comptime H = 3
 comptime EMB = 192
 comptime LAMBDA = 0.09
 
-comptime Graph = LeWMLossGraphRef[
+comptime Graph = LeWMLossGraph[
     3, 224, 14, 192, 3, 12, EMB, 2048,
     T, 10, H, 1,
     16, 64, 2048, 6,
@@ -218,7 +218,7 @@ def _run[target: StaticString](dump: String, ctx: Optional[DeviceContext]) raise
     else:
         print("  --", target)
     var g = Graph.make[target, Kaiming](ctx)
-    var lv = LoadRef(RefDump(dump), String(""))
+    var lv = LoadDump(RefDump(dump), String(""))
     g.for_each_param[target](lv, ctx)
     g.for_each_state[target](lv, ctx)
     lv.check()
@@ -233,8 +233,8 @@ def _run[target: StaticString](dump: String, ctx: Optional[DeviceContext]) raise
             h[i] = a[i]
     g.set_node_attr_buf["sig", "fixed_a"](abuf)
 
-    var pix = ref_input[target](dump, String("train.pixels"), ctx)
-    var act = ref_input[target](dump, String("train.action"), ctx)
+    var pix = dump_input[target](dump, String("train.pixels"), ctx)
+    var act = dump_input[target](dump, String("train.action"), ctx)
     g.zero_grad[target](ctx)
     g.set_input["pixels", B](pix, ctx)
     g.set_input["actions", B](act, ctx)

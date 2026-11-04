@@ -5,7 +5,7 @@ visualise, on the FROZEN encoder: "Decoder (Visualization Only)"). This:
 
 1. loads a checkpoint (`--dump`: one of the training run's `epoch_<k>/`, or
    the published weights' converted dump) into the reference encoder and the
-   planning rollout (`ref_rollout`);
+   planning rollout (`rollout`);
 2. trains the reconstruction probe (`decoder.mojo`: learned per-patch queries
    reading the 192-d embedding) for `--dec-steps` on random dataset frames,
    the encoder frozen and in eval mode;
@@ -19,7 +19,7 @@ visualise, on the FROZEN encoder: "Decoder (Visualization Only)"). This:
 
    and prints, per step, ‖predicted − encoded‖ / ‖encoded‖ in latent space.
 
-    pixi run -e nvidia mojo run -I . examples/lewm/lewm_pusht_decode_ref.mojo \\
+    pixi run -e nvidia mojo run -I . examples/lewm/lewm_pusht_decode.mojo \\
         --dump /workspace/lewm_train/epoch_7 --out /workspace/lewm_viz/epoch_7
 """
 
@@ -35,9 +35,9 @@ from noeira.nn.constants import DT
 from noeira.nn.core.initializer import Kaiming
 from noeira.nn.datasets.lewm_pusht import LewmPushTExpert
 from noeira.deep_agents.act.refload import RefDump
-from noeira.deep_agents.lewm.load import load_ref
+from noeira.deep_agents.lewm.load import load_dump
 from noeira.deep_agents.lewm.rollout import (
-    LeWMRefRollout, RefEncoder, encode_ref, REF_EMB, REF_ACT,
+    LeWMRollout, LeWMPaperEncoder, encode_frames, LEWM_EMB, LEWM_ACT,
 )
 from noeira.deep_agents.lewm.decoder import patchify, unpatchify
 from noeira.deep_agents.lewm.decoder_trainer import LeWMDecoderTrainer
@@ -53,7 +53,7 @@ comptime HORIZON = WIN - 1
 comptime PATCH_D = 16
 comptime N_Q = (IMG // PATCH_D) * (IMG // PATCH_D)
 comptime PATCH_PX = 3 * PATCH_D * PATCH_D
-comptime Decoder = LeWMDecoderTrainer[REF_EMB, 192, N_Q, PATCH_PX, 768, 4, NB, "gpu"]
+comptime Decoder = LeWMDecoderTrainer[LEWM_EMB, 192, N_Q, PATCH_PX, 768, 4, NB, "gpu"]
 comptime GAP = 4
 
 
@@ -82,11 +82,11 @@ def _decode(
 ) raises -> List[Scalar[DT]]:
     """NB embeddings -> NB images, CHW [0, 1]-ish (host)."""
     with emb_dev.map_to_host() as h:
-        for i in range(NB * REF_EMB):
+        for i in range(NB * LEWM_EMB):
             h[i] = embs[i] if i < len(embs) else Scalar[DT](0)
     var recon = List[Scalar[DT]](length=NB * N_Q * PATCH_PX, fill=Scalar[DT](0))
     dec.recon_into(
-        TileTensor(_p(emb_dev), row_major[NB, REF_EMB]()),
+        TileTensor(_p(emb_dev), row_major[NB, LEWM_EMB]()),
         rebind[Pointer[Scalar[DT], MutAnyOrigin]](recon.unsafe_ptr()),
     )
     var img = List[Scalar[DT]](length=NB * IMG_DIM, fill=Scalar[DT](0))
@@ -146,9 +146,9 @@ def main() raises:
 
     var c = DeviceContext()
     var ctx = Optional(c)
-    var enc = RefEncoder.make["gpu", Kaiming](ctx)
-    _ = load_ref["gpu"](enc, dump, String("emb.0."), ctx)
-    var roll = LeWMRefRollout["gpu", 1, HORIZON](dump, ctx)
+    var enc = LeWMPaperEncoder.make["gpu", Kaiming](ctx)
+    _ = load_dump["gpu"](enc, dump, String("emb.0."), ctx)
+    var roll = LeWMRollout["gpu", 1, HORIZON](dump, ctx)
     var dec = Decoder.make(lr=Scalar[DT](1e-3), ctx=ctx)
     var st = RefDump(stats_dir)
     var a_mean = st.get(String("run.action_mean"))
@@ -163,7 +163,7 @@ def main() raises:
     var enc_in = List[Scalar[DT]](length=NB * IMG_DIM, fill=Scalar[DT](0))
     var img01 = List[Scalar[DT]](length=NB * IMG_DIM, fill=Scalar[DT](0))
     var tgt = List[Scalar[DT]](length=NB * N_Q * PATCH_PX, fill=Scalar[DT](0))
-    var emb_dev = c.enqueue_create_buffer[DT](NB * REF_EMB)
+    var emb_dev = c.enqueue_create_buffer[DT](NB * LEWM_EMB)
     var tgt_dev = c.enqueue_create_buffer[DT](NB * N_Q * PATCH_PX)
     seed(7)
     var t0 = perf_counter_ns()
@@ -177,20 +177,20 @@ def main() raises:
                 rebind[Pointer[Scalar[DType.uint8], MutAnyOrigin]](dense.unsafe_ptr()),
             )
         _frames(u8, NB, enc_in, img01)
-        var emb = encode_ref["gpu", NB](enc, enc_in, ctx)
+        var emb = encode_frames["gpu", NB](enc, enc_in, ctx)
         patchify["cpu", NB, 3, IMG, PATCH_D](
             None,
             rebind[Pointer[Scalar[DT], MutAnyOrigin]](img01.unsafe_ptr()),
             rebind[Pointer[Scalar[DT], MutAnyOrigin]](tgt.unsafe_ptr()),
         )
         with emb_dev.map_to_host() as h:
-            for k in range(NB * REF_EMB):
+            for k in range(NB * LEWM_EMB):
                 h[k] = emb[k]
         with tgt_dev.map_to_host() as h:
             for k in range(NB * N_Q * PATCH_PX):
                 h[k] = tgt[k]
         _ = dec.train_step(
-            TileTensor(_p(emb_dev), row_major[NB, REF_EMB]()),
+            TileTensor(_p(emb_dev), row_major[NB, LEWM_EMB]()),
             TileTensor(_p(tgt_dev), row_major[NB, N_Q * PATCH_PX]()),
         )
         if step % 250 == 0 or step == dec_steps:
@@ -233,19 +233,19 @@ def main() raises:
             rebind[Pointer[Scalar[DType.uint8], MutAnyOrigin]](wdense.unsafe_ptr()),
         )
         _frames(wu8, WIN, w_in, w01)
-        var e_all = encode_ref["gpu", NB](enc, w_in, ctx)  # rows >= WIN are padding
-        var start = List[Scalar[DT]](capacity=REF_EMB)
-        for d in range(REF_EMB):
+        var e_all = encode_frames["gpu", NB](enc, w_in, ctx)  # rows >= WIN are padding
+        var start = List[Scalar[DT]](capacity=LEWM_EMB)
+        for d in range(LEWM_EMB):
             start.append(e_all[d])
-        var acts = List[Scalar[DT]](capacity=HORIZON * REF_ACT)
-        for j in range(HORIZON * REF_ACT):
+        var acts = List[Scalar[DT]](capacity=HORIZON * LEWM_ACT)
+        for j in range(HORIZON * LEWM_ACT):
             var z = (wact[j] - Float32(a_mean[j % 2])) / Float32(a_std[j % 2])
             acts.append(Scalar[DT](0) if isnan(z) else rebind[Scalar[DT]](z))
         var pred = roll.rollout(start, acts)  # (1, WIN, D), entry 0 = start
-        var both = List[Scalar[DT]](capacity=NB * REF_EMB)
-        for j in range(WIN * REF_EMB):
+        var both = List[Scalar[DT]](capacity=NB * LEWM_EMB)
+        for j in range(WIN * LEWM_EMB):
             both.append(e_all[j])
-        for j in range(WIN * REF_EMB):
+        for j in range(WIN * LEWM_EMB):
             both.append(pred[j])
         var dimg = _decode(dec, both, emb_dev, c)
         var canvas = List[UInt8](length=cw * chh * 3, fill=255)
@@ -256,9 +256,9 @@ def main() raises:
             _put(canvas, cw, 2, t, dimg, (WIN + t) * IMG_DIM)
             var num = 0.0
             var den = 0.0
-            for d in range(REF_EMB):
-                var r = Float64(e_all[t * REF_EMB + d])
-                num += (Float64(pred[t * REF_EMB + d]) - r) ** 2
+            for d in range(LEWM_EMB):
+                var r = Float64(e_all[t * LEWM_EMB + d])
+                num += (Float64(pred[t * LEWM_EMB + d]) - r) ** 2
                 den += r * r
             var e = sqrt(num / den)
             err_sum[t] += e

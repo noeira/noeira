@@ -3,7 +3,7 @@
 docs/LEWM_REOPEN_PLAN.md P3. The dump's `rollout` section ran
 stable_worldmodel 0.1.1 `get_cost` on S = 8 candidate sequences of 5 z-scored
 action blocks from one start frame (history 1, growing to the predictor's 3)
-toward one goal frame. Ours (`ref_rollout.LeWMRefRollout`, the left-aligned
+toward one goal frame. Ours (`rollout.LeWMRollout`, the left-aligned
 causal context on the fixed 3-token predictor) must give:
 
   * the start and goal embeddings (encoder, BN eval);
@@ -18,7 +18,7 @@ causal context on the fixed 3-token predictor) must give:
 Unit: max |ours - torch| / std(torch) for embeddings; relative for costs.
 
 Run (after `pixi run dump-lewm-ref`):
-    pixi run -e apple mojo run -I . tests/deep_agents/lewm/test_ref_rollout.mojo
+    pixi run -e apple mojo run -I . tests/deep_agents/lewm/test_rollout.mojo
 """
 
 from std.sys import argv
@@ -28,9 +28,9 @@ from max.gpu.host import DeviceContext
 from noeira.nn.constants import DT
 from noeira.nn.core.initializer import Kaiming
 from noeira.deep_agents.act.refload import RefDump
-from noeira.deep_agents.lewm.load import load_ref, tf32_gemm
+from noeira.deep_agents.lewm.load import load_dump, tf32_gemm
 from noeira.deep_agents.lewm.rollout import (
-    LeWMRefRollout, RefEncoder, encode_ref, PlanCost, REF_EMB,
+    LeWMRollout, LeWMPaperEncoder, encode_frames, PlanCost, LEWM_EMB,
 )
 
 
@@ -40,7 +40,7 @@ comptime TOL_TF32 = 5e-2       # CUDA GPU leg: measured 2.2e-2 at step 5 (5090)
 comptime COST_TOL_TF32 = 3e-2  # measured 7.6e-3 relative
 comptime S = 8
 comptime HORIZON = 5
-comptime D = REF_EMB
+comptime D = LEWM_EMB
 
 
 def _std_err(got: List[Scalar[DT]], want: List[Scalar[DT]], off_g: Int, off_w: Int, n: Int) -> Float64:
@@ -67,13 +67,13 @@ def _run[target: StaticString](dump: String, ctx: Optional[DeviceContext]) raise
         print("  --", target)
     var fails = 0
     var rd = RefDump(dump)
-    var enc = RefEncoder.make[target, Kaiming](ctx)
-    _ = load_ref[target](enc, dump, String("emb.0."), ctx)
+    var enc = LeWMPaperEncoder.make[target, Kaiming](ctx)
+    _ = load_dump[target](enc, dump, String("emb.0."), ctx)
     var pix = rd.get(String("roll.start_pixels"))
     var gpx = rd.get(String("roll.goal_pixels"))
     for i in range(len(gpx)):
         pix.append(gpx[i])
-    var se = encode_ref[target, 2](enc, pix, ctx)  # [start | goal]
+    var se = encode_frames[target, 2](enc, pix, ctx)  # [start | goal]
     var start = List[Scalar[DT]](capacity=D)
     var goal = List[Scalar[DT]](capacity=D)
     for d in range(D):
@@ -88,7 +88,7 @@ def _run[target: StaticString](dump: String, ctx: Optional[DeviceContext]) raise
     if e_start > tol or e_goal > tol:
         fails += 1
 
-    var roll = LeWMRefRollout[target, S, HORIZON](dump, ctx)
+    var roll = LeWMRollout[target, S, HORIZON](dump, ctx)
     var embs = roll.rollout(start, rd.get(String("roll.candidates")))
     for t in range(1, HORIZON + 1):
         var worst = 0.0

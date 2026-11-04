@@ -14,7 +14,7 @@ ticks — one world-model step — the critic
        z-scored with the training run's `action_stats.txt`, repeated for
        `--h` model steps;
     4. rolls the predictor from the last 3 OBSERVED latents and the executed
-       blocks between them (`LeWMRefRollout.rollout_ctx`), and scores each
+       blocks between them (`LeWMRollout.rollout_ctx`), and scores each
        candidate against a REFERENCE PATH: the teacher's own run on the same
        scene, rendered at 112 (`ppo_state_probe_sim --demos` →
        `tower_demo_rerender --resize 112`), one latent every 5 ticks.
@@ -89,9 +89,9 @@ from noeira.tasks.so101_tower_rig import (
 from noeira.tasks.so101_tower_xml import So101TowerModel
 from noeira.tasks.spec import load_family
 from noeira.data.store import TrajectoryStore
-from noeira.deep_agents.lewm.model import LeWMEncoderRef, ActionEmbedderRef
-from noeira.deep_agents.lewm.load import load_ref
-from noeira.deep_agents.lewm.rollout import LeWMRefRollout, REF_CTX
+from noeira.deep_agents.lewm.model import LeWMEncoder, LeWMActionEmbedder
+from noeira.deep_agents.lewm.load import load_dump
+from noeira.deep_agents.lewm.rollout import LeWMRollout, LEWM_CTX
 from noeira.vision.area_resize import AreaResize
 from noeira.experimental.lewm_so101.data import FS, JOINTS, ACT_IN, CAMS, PROP, So101WMData
 
@@ -101,14 +101,14 @@ comptime NV = So101TowerModel.NV
 comptime R = 112
 comptime EMB = 192
 comptime FR = CAMS * 3 * R * R
-comptime Enc = LeWMEncoderRef[CAMS * 3, R, 14, 192, 3, 12, EMB, 2048]
+comptime Enc = LeWMEncoder[CAMS * 3, R, 14, 192, 3, 12, EMB, 2048]
 comptime K = get_defined_int["CRITIC_K", 16]()
 """Candidates per decision (δ_0 = 0 included)."""
 comptime HMAX = get_defined_int["CRITIC_HMAX", 4]()
 """The most model steps `--h` may ask for (the rollout's buffer)."""
-comptime HOR = REF_CTX - 1 + HMAX
-comptime Roll = LeWMRefRollout["gpu", K, HOR, ACT_IN]
-comptime PropEmb = ActionEmbedderRef[1, PROP, EMB]
+comptime HOR = LEWM_CTX - 1 + HMAX
+comptime Roll = LeWMRollout["gpu", K, HOR, ACT_IN]
+comptime PropEmb = LeWMActionEmbedder[1, PROP, EMB]
 comptime POST_GOAL = 31
 """Ticks run after the brick first reaches the bowl."""
 
@@ -150,7 +150,7 @@ def _encode(
 
 
 struct _Prop(Movable):
-    """A v2 model's proprio embedder (`prop_emb.*`, `ref_model.
+    """A v2 model's proprio embedder (`prop_emb.*`, `model.
     LeWMLossGraphProprio`): z = enc(frame) + prop_emb(q, qd, lead z-scored with
     the run's `prop_stats.txt`). Off for a v1 dump (no `prop_emb` tensors)."""
 
@@ -166,7 +166,7 @@ struct _Prop(Movable):
         self.std = List[Float64](length=PROP, fill=1.0)
         if not self.on:
             return
-        _ = load_ref["gpu"](self.mod, wm, String("prop_emb."), ctx)
+        _ = load_dump["gpu"](self.mod, wm, String("prop_emb."), ctx)
         var k = 0
         with open(pstats, "r") as fh:
             for ln in fh.read().split("\n"):
@@ -347,7 +347,7 @@ def main() raises:
     var roll = Roll(wm, octx)
     var prop = _Prop(wm, _arg(args, "--pstats", String(stats[byte = 0 : stats.rfind("/") + 1]) + "prop_stats.txt"), octx)
     if True:
-        var n_enc = load_ref["gpu"](enc, wm, String("emb.0."), octx)
+        var n_enc = load_dump["gpu"](enc, wm, String("emb.0."), octx)
         enc.set_attr["training"](Scalar[DT](0.0))
         var j = 0
         with open(stats, "r") as fh:
@@ -425,7 +425,7 @@ def main() raises:
         var lead = List[Float64](length=TARGET_OBS, fill=0.0)
         var delta = List[Float64](length=ACT, fill=0.0)
         # the critic's memory: observed latents and the executed blocks
-        # between them (z-scored), the last REF_CTX of each
+        # between them (z-scored), the last LEWM_CTX of each
         var z_hist = List[List[Scalar[DT]]]()
         var a_hist = List[List[Scalar[DT]]]()
         var blk = List[Scalar[DT]](length=ACT_IN, fill=Scalar[DT](0))
@@ -516,9 +516,9 @@ def main() raises:
                 if t > 0:
                     a_hist.append(blk.copy())
                 z_hist.append(z.copy())
-                if len(z_hist) > REF_CTX:
+                if len(z_hist) > LEWM_CTX:
                     _ = z_hist.pop(0)
-                if len(a_hist) > REF_CTX - 1:
+                if len(a_hist) > LEWM_CTX - 1:
                     _ = a_hist.pop(0)
                 # progress along the reference: nearest within the window ahead
                 var best_i = i_star

@@ -29,8 +29,8 @@ from max.gpu.host import DeviceContext
 from noeira.nn.constants import DT
 from noeira.nn.core.initializer import Kaiming
 from noeira.deep_agents.act.refload import RefDump
-from noeira.deep_agents.lewm.load import load_ref
-from noeira.deep_agents.lewm.rollout import RefEncoder, encode_ref, REF_EMB
+from noeira.deep_agents.lewm.load import load_dump
+from noeira.deep_agents.lewm.rollout import LeWMPaperEncoder, encode_frames, LEWM_EMB
 from noeira.envs.pusht.encoder_frame import sim_frame_chw_norm
 
 
@@ -131,8 +131,8 @@ def main() raises:
 
     var c = DeviceContext()
     var ctx = Optional(c)
-    var enc = RefEncoder.make["gpu", Kaiming](ctx)
-    _ = load_ref["gpu"](enc, String("/tmp/lewm_ref"), String("emb.0."), ctx)
+    var enc = LeWMPaperEncoder.make["gpu", Kaiming](ctx)
+    _ = load_dump["gpu"](enc, String("/tmp/lewm_ref"), String("emb.0."), ctx)
     var gap = List[List[Float64]]()    # same 3 pairs
     var ratio = List[List[Float64]]()
     for _ in range(3):
@@ -150,15 +150,15 @@ def main() raises:
             _norm_chw01(real01, off, xr)
             _norm_chw01(next01, off, xn)
             _norm_chw01(swm01, off, xw)
-        var eo = encode_ref["gpu", NB](enc, xo, ctx)
-        var er = encode_ref["gpu", NB](enc, xr, ctx)
-        var en = encode_ref["gpu", NB](enc, xn, ctx)
-        var ew = encode_ref["gpu", NB](enc, xw, ctx)
+        var eo = encode_frames["gpu", NB](enc, xo, ctx)
+        var er = encode_frames["gpu", NB](enc, xr, ctx)
+        var en = encode_frames["gpu", NB](enc, xn, ctx)
+        var ew = encode_frames["gpu", NB](enc, xw, ctx)
         for k in range(NB):
             var g = List[Float64](length=3, fill=0.0)
             var st = 0.0
-            for d in range(REF_EMB):
-                var i = k * REF_EMB + d
+            for d in range(LEWM_EMB):
+                var i = k * LEWM_EMB + d
                 g[0] += (Float64(eo[i]) - Float64(er[i])) ** 2
                 g[1] += (Float64(eo[i]) - Float64(ew[i])) ** 2
                 g[2] += (Float64(er[i]) - Float64(ew[i])) ** 2

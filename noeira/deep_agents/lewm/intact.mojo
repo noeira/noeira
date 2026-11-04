@@ -39,18 +39,18 @@ from noeira.nn.core.tensor_refs import TensorRefs
 from noeira.nn.core.initializer import Kaiming
 from noeira.nn import Sequential, Linear, LayerNorm, GELU
 from .model import TORCH_LN_EPS
-from .load import load_ref
-from .rollout import LeWMRefRollout, REF_EMB, REF_ACT, REF_CTX
+from .load import load_dump
+from .rollout import LeWMRollout, LEWM_EMB, LEWM_ACT, LEWM_CTX
 
 
-comptime ACTOR_IN = 3 * REF_EMB
+comptime ACTOR_IN = 3 * LEWM_EMB
 comptime ACTOR_H = 1024
 
-comptime IntentActorRef = Sequential[
+comptime IntentActor = Sequential[
     Linear[ACTOR_IN, ACTOR_H], LayerNorm[ACTOR_H, DT, TORCH_LN_EPS], GELU[ACTOR_H],
     Linear[ACTOR_H, ACTOR_H], LayerNorm[ACTOR_H, DT, TORCH_LN_EPS], GELU[ACTOR_H],
     Linear[ACTOR_H, ACTOR_H], LayerNorm[ACTOR_H, DT, TORCH_LN_EPS], GELU[ACTOR_H],
-    Linear[ACTOR_H, 2 * REF_ACT],
+    Linear[ACTOR_H, 2 * LEWM_ACT],
 ]
 """`module.IntentActionActor` without the action-history slot (P8)."""
 
@@ -58,37 +58,37 @@ comptime IntentActorRef = Sequential[
 struct IntactDirect[target: StaticString, HORIZON: Int]:
     """The actor and a one-row predictor: Direct plans for one (start, goal)."""
 
-    var actor: IntentActorRef
-    var roll: LeWMRefRollout[Self.target, 1, Self.HORIZON]
+    var actor: IntentActor
+    var roll: LeWMRollout[Self.target, 1, Self.HORIZON]
     var ctx: Optional[DeviceContext]
 
     def __init__(out self, dump_dir: String, ctx: Optional[DeviceContext]) raises:
         self.ctx = ctx
-        self.actor = IntentActorRef.make[Self.target, Kaiming](ctx)
-        var n = load_ref[Self.target](self.actor, dump_dir, String("actor."), ctx)
+        self.actor = IntentActor.make[Self.target, Kaiming](ctx)
+        var n = load_dump[Self.target](self.actor, dump_dir, String("actor."), ctx)
         if n == 0:
             raise Error("IntactDirect: no `ours.actor.*` in " + dump_dir
                         + " (convert with tools/lewm/intact_reference.py)")
-        self.roll = LeWMRefRollout[Self.target, 1, Self.HORIZON](dump_dir, ctx)
+        self.roll = LeWMRollout[Self.target, 1, Self.HORIZON](dump_dir, ctx)
 
     def actor_out(
         mut self, z: List[Scalar[DT]], m: List[Scalar[DT]]
     ) raises -> List[Scalar[DT]]:
         """(mean[10], log σ[10], unclamped) for one latent and one intent."""
         var x = Tensor.alloc(ACTOR_IN)
-        for d in range(REF_EMB):
+        for d in range(LEWM_EMB):
             x.data[d] = z[d]
-            x.data[REF_EMB + d] = m[d]
-            x.data[2 * REF_EMB + d] = z[d] * m[d]
+            x.data[LEWM_EMB + d] = m[d]
+            x.data[2 * LEWM_EMB + d] = z[d] * m[d]
         comptime if Self.target == "gpu":
             x.upload(self.ctx.value())
-        var y = Tensor.alloc(2 * REF_ACT)
+        var y = Tensor.alloc(2 * LEWM_ACT)
         self.actor.forward[Self.target, 1](TensorRefs[1](x), y, self.ctx)
         comptime if Self.target == "gpu":
             self.ctx.value().synchronize()
             y.download(self.ctx.value())
-        var out = List[Scalar[DT]](capacity=2 * REF_ACT)
-        for i in range(2 * REF_ACT):
+        var out = List[Scalar[DT]](capacity=2 * LEWM_ACT)
+        for i in range(2 * LEWM_ACT):
             out.append(y.data[i])
         return out^
 
@@ -101,21 +101,21 @@ struct IntactDirect[target: StaticString, HORIZON: Int]:
     ) raises -> List[Scalar[DT]]:
         """The Direct plan, (HORIZON, ACT) in the training normalisation.
         `a_hist` = a_{−1}, read only by the unaligned (INTACT) context."""
-        comptime D = REF_EMB
+        comptime D = LEWM_EMB
         var embs = List[List[Scalar[DT]]]()
         embs.append(z0.copy())
         var acts = List[List[Scalar[DT]]]()
         if not aligned:
             acts.append(a_hist.copy())
-        var plan = List[Scalar[DT]](capacity=Self.HORIZON * REF_ACT)
+        var plan = List[Scalar[DT]](capacity=Self.HORIZON * LEWM_ACT)
         for k in range(Self.HORIZON):
             ref cur = embs[len(embs) - 1]
             var m = List[Scalar[DT]](capacity=D)
             for d in range(D):
                 m.append(zg[d] - cur[d])
             var o = self.actor_out(cur, m)
-            var a = List[Scalar[DT]](capacity=REF_ACT)
-            for i in range(REF_ACT):
+            var a = List[Scalar[DT]](capacity=LEWM_ACT)
+            for i in range(LEWM_ACT):
                 a.append(o[i])
                 plan.append(o[i])
             if k == Self.HORIZON - 1:
@@ -124,23 +124,23 @@ struct IntactDirect[target: StaticString, HORIZON: Int]:
             # history with its newest entry replaced by a_k
             var ctx_a = List[List[Scalar[DT]]]()
             if aligned:
-                var L = min(REF_CTX, len(embs))
+                var L = min(LEWM_CTX, len(embs))
                 for j in range(len(embs) - L, len(embs) - 1):
                     ctx_a.append(acts[j].copy())
                 ctx_a.append(a.copy())
             else:
-                var L = min(REF_CTX, min(len(embs), len(acts)))
+                var L = min(LEWM_CTX, min(len(embs), len(acts)))
                 for j in range(len(acts) - L, len(acts) - 1):
                     ctx_a.append(acts[j].copy())
                 ctx_a.append(a.copy())
             var L = len(ctx_a)
-            var blocks = List[Scalar[DT]](length=Self.HORIZON * REF_ACT, fill=Scalar[DT](0))
+            var blocks = List[Scalar[DT]](length=Self.HORIZON * LEWM_ACT, fill=Scalar[DT](0))
             for j in range(L):
-                for i in range(REF_ACT):
-                    blocks[j * REF_ACT + i] = ctx_a[j][i]
+                for i in range(LEWM_ACT):
+                    blocks[j * LEWM_ACT + i] = ctx_a[j][i]
             var ae = self.roll.embed_actions(blocks)
-            var x = List[Scalar[DT]](length=REF_CTX * D, fill=Scalar[DT](0))
-            var c = List[Scalar[DT]](length=REF_CTX * D, fill=Scalar[DT](0))
+            var x = List[Scalar[DT]](length=LEWM_CTX * D, fill=Scalar[DT](0))
+            var c = List[Scalar[DT]](length=LEWM_CTX * D, fill=Scalar[DT](0))
             for j in range(L):
                 ref e = embs[len(embs) - L + j]
                 for d in range(D):

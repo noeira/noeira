@@ -1,4 +1,4 @@
-"""The SO-101 world models' training graphs: `LeWMLossGraphRef` with
+"""The SO-101 world models' training graphs: `LeWMLossGraph` with
 proprioception in the latent (v2) and with an inverse-dynamics term (IDM).
 
 noeira-docs/SO101_LEWM_PLAN.md S1 and its 24 Oct section. Closed 2 Nov: a
@@ -25,10 +25,10 @@ from noeira.nn import (
 )
 from noeira.nn.primitives.grad_gate import GradGate
 from noeira.deep_agents.lewm.model import (
-    LeWMEncoderRef,
-    ActionEmbedderRef,
-    ConditionalTransformerBlockRef,
-    ProjectorRef,
+    LeWMEncoder,
+    LeWMActionEmbedder,
+    LeWMPredictorBlock,
+    LeWMProjector,
     TORCH_LN_EPS,
 )
 
@@ -61,15 +61,15 @@ comptime LeWMLossGraphProprio[
         "emb",
         Tokenwise[
             T,
-            LeWMEncoderRef[
+            LeWMEncoder[
                 IN_CH, IMG, PATCH, HIDDEN, ENC_HEADS, ENC_LAYERS, EMB, PROJ_H
             ],
         ],
         "pixels",
     ],
-    Node["prop_emb", ActionEmbedderRef[T, PROP, EMB], "proprio"],
+    Node["prop_emb", LeWMActionEmbedder[T, PROP, EMB], "proprio"],
     Node["z", Add[T * EMB], "emb", "prop_emb"],
-    Node["act_emb", ActionEmbedderRef[T, ACT, EMB], "actions"],
+    Node["act_emb", LeWMActionEmbedder[T, ACT, EMB], "actions"],
     Node["ctx_x", Slice[T * EMB, 0, H * EMB], "z"],
     Node["ctx_a", Slice[T * EMB, 0, H * EMB], "act_emb"],
     Node["tgt", Slice[T * EMB, N_PREDS * EMB, (N_PREDS + H) * EMB], "z"],
@@ -79,7 +79,7 @@ comptime LeWMLossGraphProprio[
         "pred_raw",
         RepeatConditional[
             DEPTH,
-            ConditionalTransformerBlockRef[
+            LeWMPredictorBlock[
                 EMB, PRED_HEADS, H, PRED_FF, PRED_DIM_HEAD
             ],
         ],
@@ -87,13 +87,13 @@ comptime LeWMLossGraphProprio[
         "ctx_a",
     ],
     Node["pred_ln", Tokenwise[H, LayerNorm[EMB, DT, TORCH_LN_EPS]], "pred_raw"],
-    Node["pred", Tokenwise[H, ProjectorRef[EMB, PROJ_H, EMB]], "pred_ln"],
+    Node["pred", Tokenwise[H, LeWMProjector[EMB, PROJ_H, EMB]], "pred_ln"],
     Node["pl", MSEPerSample[H * EMB], "pred", "tgt_sg"],
     Node["sig", SIGReg[EMB, T, SIG_PROJ, SIG_KNOTS], "z"],
     Node["sig_s", Scale[1], "sig"],
     Node["loss", Add[1], "pl", "sig_s"],
 ]
-"""`LeWMLossGraphRef` with PROPRIOCEPTION in the latent (DINO-WM's recipe;
+"""`LeWMLossGraph` with PROPRIOCEPTION in the latent (DINO-WM's recipe;
 noeira-docs/SO101_LEWM_PLAN.md S1 v2): each frame's `PROP` proprio words go
 through their own embedder (`prop_emb`, the action embedder's shape) and are
 ADDED to the image latent, z = enc(pixels) + prop_emb(proprio). Everything
@@ -126,7 +126,7 @@ image encoder: `emb.0.*` loads unchanged), plus `prop_emb` and `z`."""
 # graphs: in v2 a head on z could read the action off the proprio embedding
 # and leave the image encoder collapsed. Its parameters are the `idm_*` nodes;
 # every other name is the plain graph's, so a dump loads into the plain
-# graph (`LoadRef` reads only the names it is asked for) and the offline
+# graph (`LoadDump` reads only the names it is asked for) and the offline
 # checks run unchanged.
 
 
@@ -157,13 +157,13 @@ comptime LeWMLossGraphIDM[
         "emb",
         Tokenwise[
             T,
-            LeWMEncoderRef[
+            LeWMEncoder[
                 IN_CH, IMG, PATCH, HIDDEN, ENC_HEADS, ENC_LAYERS, EMB, PROJ_H
             ],
         ],
         "pixels",
     ],
-    Node["act_emb", ActionEmbedderRef[T, ACT, EMB], "actions"],
+    Node["act_emb", LeWMActionEmbedder[T, ACT, EMB], "actions"],
     Node["ctx_x", Slice[T * EMB, 0, H * EMB], "emb"],
     Node["ctx_a", Slice[T * EMB, 0, H * EMB], "act_emb"],
     Node["tgt", Slice[T * EMB, N_PREDS * EMB, (N_PREDS + H) * EMB], "emb"],
@@ -173,7 +173,7 @@ comptime LeWMLossGraphIDM[
         "pred_raw",
         RepeatConditional[
             DEPTH,
-            ConditionalTransformerBlockRef[
+            LeWMPredictorBlock[
                 EMB, PRED_HEADS, H, PRED_FF, PRED_DIM_HEAD
             ],
         ],
@@ -181,7 +181,7 @@ comptime LeWMLossGraphIDM[
         "ctx_a",
     ],
     Node["pred_ln", Tokenwise[H, LayerNorm[EMB, DT, TORCH_LN_EPS]], "pred_raw"],
-    Node["pred", Tokenwise[H, ProjectorRef[EMB, PROJ_H, EMB]], "pred_ln"],
+    Node["pred", Tokenwise[H, LeWMProjector[EMB, PROJ_H, EMB]], "pred_ln"],
     Node["pl", MSEPerSample[H * EMB], "pred", "tgt_sg"],
     Node["sig", SIGReg[EMB, T, SIG_PROJ, SIG_KNOTS], "emb"],
     Node["sig_s", Scale[1], "sig"],
@@ -198,7 +198,7 @@ comptime LeWMLossGraphIDM[
     Node["loss_ps", Add[1], "pl", "sig_s"],
     Node["loss", Add[1], "loss_ps", "il_s"],
 ]
-"""`LeWMLossGraphRef` (v1) + γ·L_idm on the image latent: loss = pred +
+"""`LeWMLossGraph` (v1) + γ·L_idm on the image latent: loss = pred +
 λ·SIGReg + γ·L_idm, per sample; γ = `il_s.multiplier`, the IDM loss itself
 is `il` (see the section header)."""
 
@@ -232,15 +232,15 @@ comptime LeWMLossGraphProprioIDM[
         "emb",
         Tokenwise[
             T,
-            LeWMEncoderRef[
+            LeWMEncoder[
                 IN_CH, IMG, PATCH, HIDDEN, ENC_HEADS, ENC_LAYERS, EMB, PROJ_H
             ],
         ],
         "pixels",
     ],
-    Node["prop_emb", ActionEmbedderRef[T, PROP, EMB], "proprio"],
+    Node["prop_emb", LeWMActionEmbedder[T, PROP, EMB], "proprio"],
     Node["z", Add[T * EMB], "emb", "prop_emb"],
-    Node["act_emb", ActionEmbedderRef[T, ACT, EMB], "actions"],
+    Node["act_emb", LeWMActionEmbedder[T, ACT, EMB], "actions"],
     Node["ctx_x", Slice[T * EMB, 0, H * EMB], "z"],
     Node["ctx_a", Slice[T * EMB, 0, H * EMB], "act_emb"],
     Node["tgt", Slice[T * EMB, N_PREDS * EMB, (N_PREDS + H) * EMB], "z"],
@@ -250,7 +250,7 @@ comptime LeWMLossGraphProprioIDM[
         "pred_raw",
         RepeatConditional[
             DEPTH,
-            ConditionalTransformerBlockRef[
+            LeWMPredictorBlock[
                 EMB, PRED_HEADS, H, PRED_FF, PRED_DIM_HEAD
             ],
         ],
@@ -258,7 +258,7 @@ comptime LeWMLossGraphProprioIDM[
         "ctx_a",
     ],
     Node["pred_ln", Tokenwise[H, LayerNorm[EMB, DT, TORCH_LN_EPS]], "pred_raw"],
-    Node["pred", Tokenwise[H, ProjectorRef[EMB, PROJ_H, EMB]], "pred_ln"],
+    Node["pred", Tokenwise[H, LeWMProjector[EMB, PROJ_H, EMB]], "pred_ln"],
     Node["pl", MSEPerSample[H * EMB], "pred", "tgt_sg"],
     Node["sig", SIGReg[EMB, T, SIG_PROJ, SIG_KNOTS], "z"],
     Node["sig_s", Scale[1], "sig"],

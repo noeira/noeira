@@ -6,12 +6,12 @@ layouts, so loading is by name with no layout logic here (that lives in ONE
 place, the converter's `MAP`). `noeira.deep_agents.act.refload.RefDump` reads
 the format.
 
-- `load_ref[target](module, dump_dir, prefix, ctx)`: every Param AND State of
+- `load_dump[target](module, dump_dir, prefix, ctx)`: every Param AND State of
   `module` from `ours.<prefix><name>`. A sub-module of the loss graph loads
   with the graph prefix of its node (e.g. one ViT block: `emb.0.3.<i>.`). Any
   name the dump lacks raises — a weight left at its init reads as a small
   disagreement, not as the missing weight it is.
-- `ref_input[target](dump_dir, name, ctx)`: a dumped activation as a Tensor.
+- `dump_input[target](dump_dir, name, ctx)`: a dumped activation as a Tensor.
 - `std_err(dump_dir, name, got, ctx)`: max |got - ref| / std(ref), the unit
   every LeWM gate is held in (torch's own float32 error is 1e-6..1e-5 of it).
 """
@@ -27,8 +27,8 @@ from noeira.nn.core.module import Module
 from noeira.deep_agents.act.refload import RefDump, _fill
 
 
-struct LoadRef(ParamVisitor):
-    """The visitor `load_ref` runs; public for walkables that are not a
+struct LoadDump(ParamVisitor):
+    """The visitor `load_dump` runs; public for walkables that are not a
     `Module` (a `ComputeGraph`: walk params AND state, then `check()`)."""
 
     var dump: RefDump
@@ -59,7 +59,7 @@ struct LoadRef(ParamVisitor):
         var vals = self.dump.get(key)
         if len(vals) != N:
             raise Error(
-                "load_ref: '" + key + "' has " + String(len(vals))
+                "load_dump: '" + key + "' has " + String(len(vals))
                 + " values, the param holds " + String(N)
             )
         _fill(param, vals, ctx)
@@ -67,19 +67,19 @@ struct LoadRef(ParamVisitor):
 
     def check(self) raises:
         if len(self.missing) > 0:
-            var msg = String("load_ref: ") + String(len(self.missing)) + " name(s) not in the dump, e.g. "
+            var msg = String("load_dump: ") + String(len(self.missing)) + " name(s) not in the dump, e.g. "
             for i in range(min(3, len(self.missing))):
                 msg += self.missing[i] + " "
             raise Error(msg)
 
 
-def load_ref[
+def load_dump[
     target: StaticString, M: Module
 ](
     mut module: M, dump_dir: String, prefix: String, ctx: Optional[DeviceContext]
 ) raises -> Int:
     """Fill every Param and State of `module`; returns how many."""
-    var v = LoadRef(RefDump(dump_dir), prefix)
+    var v = LoadDump(RefDump(dump_dir), prefix)
     module.for_each_param[target](v, ctx)
     module.for_each_state[target](v, ctx)
     v.check()
@@ -99,7 +99,7 @@ def tf32_gemm[target: StaticString]() -> Bool:
     return False
 
 
-def ref_input[target: StaticString](
+def dump_input[target: StaticString](
     dump_dir: String, name: String, ctx: Optional[DeviceContext]
 ) raises -> Tensor:
     var vals = RefDump(dump_dir).get(name)

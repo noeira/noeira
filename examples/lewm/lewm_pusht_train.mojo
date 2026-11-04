@@ -1,6 +1,6 @@
 """P6.2 — train the reference-exact LeWM on PushT the way `train.py` does.
 
-docs/LEWM_REOPEN_PLAN.md P6. `ref_trainer.LeWMRefTrainer` (gated against
+docs/LEWM_REOPEN_PLAN.md P6. `trainer.LeWMTrainer` (gated against
 torch: G6a five steps, P6.1 1000 steps at batch 128) driven like le-wm-main's
 `train.py`:
 
@@ -32,7 +32,7 @@ torch: G6a five steps, P6.1 1000 steps at batch 128) driven like le-wm-main's
 
 Not the recipe: float32 / TF32 instead of bf16; our shuffle RNG is not torch's.
 
-    pixi run -e nvidia mojo run -I . examples/lewm/lewm_pusht_train_ref.mojo \\
+    pixi run -e nvidia mojo run -I . examples/lewm/lewm_pusht_train.mojo \\
         --h5 .../pusht_expert_train.h5 --split /workspace/lewm_split \\
         --init /workspace/lewm_parity128 --stats /workspace/lewm_parity128 \\
         --out /workspace/lewm_train --epochs 10
@@ -50,7 +50,7 @@ from max.gpu.host import DeviceContext
 
 from noeira.nn.constants import DT
 from noeira.deep_agents.act.refload import RefDump
-from noeira.deep_agents.lewm.trainer import LeWMRefTrainer, recipe_lr, RefStepStats, REF_T, REF_IMG, REF_ACT_IN
+from noeira.deep_agents.lewm.trainer import LeWMTrainer, recipe_lr, LeWMStepStats, LEWM_T, LEWM_IMG, LEWM_ACT_IN
 from noeira.data.lewm_pusht_loader import LewmBatchLoaderThread
 
 
@@ -94,7 +94,7 @@ def _read(path: String) raises -> String:
 
 
 def _save_resume[BB: Int](
-    mut tr: LeWMRefTrainer["gpu", BB], odir: String, step: Int, ep: Int, s_next: Int,
+    mut tr: LeWMTrainer["gpu", BB], odir: String, step: Int, ep: Int, s_next: Int,
     min_gb: Float64,
 ) raises:
     """Into the slot `latest` does not name, then flip `latest`."""
@@ -114,7 +114,7 @@ def _save_resume[BB: Int](
 
 
 def _validate[BB: Int](
-    mut tr: LeWMRefTrainer["gpu", BB], h5: String, val_idx: List[Scalar[DT]], n_val: Int,
+    mut tr: LeWMTrainer["gpu", BB], h5: String, val_idx: List[Scalar[DT]], n_val: Int,
     am: List[Float32], asd: List[Float32],
     stages: List[Pointer[Scalar[DType.uint8], MutAnyOrigin]],
 ) raises -> List[Float64]:
@@ -123,7 +123,7 @@ def _validate[BB: Int](
     var vuse = List[Int](capacity=n_val * BB)
     for k in range(n_val * BB):
         vuse.append(Int(val_idx[k]))
-    var vloader = LewmBatchLoaderThread[BB, REF_T, REF_IMG, REF_ACT_IN](h5, vuse, am, asd, stages)
+    var vloader = LewmBatchLoaderThread[BB, LEWM_T, LEWM_IMG, LEWM_ACT_IN](h5, vuse, am, asd, stages)
     tr.set_eval()
     vloader.request(0)
     var v = List[Float64](length=3, fill=0.0)
@@ -218,7 +218,7 @@ def main() raises:
 
     var c = DeviceContext()
     var ctx = Optional(c)
-    var tr = LeWMRefTrainer["gpu", B](ctx, lr=5e-5, wd=1e-3, max_norm=1.0, dropout=True)
+    var tr = LeWMTrainer["gpu", B](ctx, lr=5e-5, wd=1e-3, max_norm=1.0, dropout=True)
     var n = tr.load(init)
     var step = 0
     var ep0 = 0
@@ -273,7 +273,7 @@ def main() raises:
         var use = List[Int](capacity=(steps_per_epoch - first) * B)
         for k in range(first * B, steps_per_epoch * B):
             use.append(clips[k])
-        var loader = LewmBatchLoaderThread[B, REF_T, REF_IMG, REF_ACT_IN](h5, use, am, asd, stages)
+        var loader = LewmBatchLoaderThread[B, LEWM_T, LEWM_IMG, LEWM_ACT_IN](h5, use, am, asd, stages)
         tr.set_train()
         if first < steps_per_epoch:
             loader.request(0)

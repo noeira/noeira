@@ -49,14 +49,14 @@ from std.random import seed
 from max.gpu.host import DeviceContext
 
 from noeira.nn.constants import DT
-from noeira.deep_agents.lewm.trainer import LeWMRefTrainer, WMWindowLoss
+from noeira.deep_agents.lewm.trainer import LeWMTrainer, WMWindowLoss
 from noeira.experimental.lewm_so101.trainer import LeWMProprioTrainer
 from noeira.experimental.lewm_so101.data import So101WMData, ACT_IN, CAMS, JOINTS, PROP, T, FS
 
 
 comptime R = 112
 comptime B = get_defined_int["SO101_WM_B", 16]()
-comptime TR = LeWMRefTrainer["gpu", B, CAMS * 3, R, ACT_IN]
+comptime TR = LeWMTrainer["gpu", B, CAMS * 3, R, ACT_IN]
 comptime TRP = LeWMProprioTrainer["gpu", B, CAMS * 3, R, ACT_IN, PROP]
 comptime FRAME_PIX = CAMS * 3 * R * R
 comptime PIX = T * FRAME_PIX

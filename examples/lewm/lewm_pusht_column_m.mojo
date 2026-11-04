@@ -5,9 +5,9 @@ Column R (box session A) ran le-wm-main's `eval.py` on stable-worldmodel
 0.0.6: 98 % (49 / 50). This runs the same protocol on the same 50 pairs with
 nothing of theirs but the weights:
 
-  * the model: `ref_model.mojo` loaded from the converted checkpoint
+  * the model: `model.mojo` loaded from the converted checkpoint
     (gated against torch: G2a / G2b);
-  * the planner: `ref_rollout.cem_step` — CEM 300 x 30, top 30, horizon 5,
+  * the planner: `rollout.cem_step` — CEM 300 x 30, top 30, horizon 5,
     variance 1, from mean 0 at every replan (gated: G2d / G3);
   * the env: our PushT, frictionless with the T turning about its cog
     (gated against pymunk: G4a), started like swm's `_set_state` (recorded
@@ -47,9 +47,9 @@ from noeira.envs.pusht.render_swm import render_pusht_swm_at, render_pusht_swm_c
 from noeira.io.video.encoder import VideoEncoder
 from noeira.io.fileio import rename_over
 from std.os import makedirs
-from noeira.deep_agents.lewm.load import load_ref
+from noeira.deep_agents.lewm.load import load_dump
 from noeira.deep_agents.lewm.rollout import (
-    LeWMRefRollout, RefEncoder, encode_ref, cem_step, REF_EMB, REF_ACT,
+    LeWMRollout, LeWMPaperEncoder, encode_frames, cem_step, LEWM_EMB, LEWM_ACT,
 )
 from noeira.envs.pusht.eval_pairs import (
     imagenet_from_hwc255, render_frame, gauss, pair_success, video_frame,
@@ -65,7 +65,7 @@ comptime FRAMESKIP = 5
 comptime BUDGET = 50
 comptime IMG = 224
 comptime HW = IMG * IMG
-comptime A = HORIZON * REF_ACT
+comptime A = HORIZON * LEWM_ACT
 comptime F = DType.float32
 
 
@@ -105,9 +105,9 @@ def main() raises:
 
     var c = DeviceContext()
     var ctx = Optional(c)
-    var enc = RefEncoder.make[TARGET, Kaiming](ctx)
-    _ = load_ref[TARGET](enc, dump, String("emb.0."), ctx)
-    var roll = LeWMRefRollout[TARGET, S, HORIZON](dump, ctx)
+    var enc = LeWMPaperEncoder.make[TARGET, Kaiming](ctx)
+    _ = load_dump[TARGET](enc, dump, String("emb.0."), ctx)
+    var roll = LeWMRollout[TARGET, S, HORIZON](dump, ctx)
 
     var n_success = 0
     var successes = List[Bool]()
@@ -126,7 +126,7 @@ def main() raises:
         var clip = List[List[UInt8]]()  # --video: the episode's frames
         if video.byte_length() > 0:
             clip.append(video_frame(env, goal_state, e))
-        var goal_emb = encode_ref[TARGET, 1](
+        var goal_emb = encode_frames[TARGET, 1](
             enc, imagenet_from_hwc255(goal_pix, e * HW * 3), ctx
         )
         var ok = False
@@ -136,7 +136,7 @@ def main() raises:
             # observation: the dataset's start frame first (swm overwrites
             # the first info with it), our render of the env afterwards
             var frame = imagenet_from_hwc255(start_pix, e * HW * 3) if step == 0 else imagenet_from_hwc255(render_frame(env), 0)
-            var start_emb = encode_ref[TARGET, 1](enc, frame, ctx)
+            var start_emb = encode_frames[TARGET, 1](enc, frame, ctx)
             var mean = List[Scalar[DT]](length=A, fill=Scalar[DT](0))
             var std = List[Scalar[DT]](length=A, fill=Scalar[DT](1))
             for it in range(ITERS):
@@ -150,8 +150,8 @@ def main() raises:
                 for k in range(FRAMESKIP):
                     if step >= BUDGET:
                         break
-                    var ax = Float64(mean[blk * REF_ACT + 2 * k + 0]) * Float64(a_scale[0]) + Float64(a_mean[0])
-                    var ay = Float64(mean[blk * REF_ACT + 2 * k + 1]) * Float64(a_scale[1]) + Float64(a_mean[1])
+                    var ax = Float64(mean[blk * LEWM_ACT + 2 * k + 0]) * Float64(a_scale[0]) + Float64(a_mean[0])
+                    var ay = Float64(mean[blk * LEWM_ACT + 2 * k + 1]) * Float64(a_scale[1]) + Float64(a_mean[1])
                     var ag = env.agent_pos()
                     _ = env.step(PushTAction[F](
                         Scalar[F](Float64(ag[0]) + 100.0 * ax),

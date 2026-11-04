@@ -14,19 +14,19 @@ recipe) re-shaped for the rig:
 
 v1 has no proprioception (the arm is only in the pictures); S3 found its
 predictor barely reads its actions. v2 (`-D SO101_WM_PROPRIO=1`) adds each
-frame's q, qd and target lead to the latent (`ref_model.LeWMLossGraphProprio`).
+frame's q, qd and target lead to the latent (`model.LeWMLossGraphProprio`).
 
 `-D SO101_WM_IDM=1` adds H-JEPA's inverse-dynamics term to either (`--idm`
 γ, default 100): a head regresses each action block from the two IMAGE
 latents it joins. Per-episode looks (S0 re-render, 23 Oct) let both models
 collapse onto the look and drop the arm — the slow-feature collapse that term
-rules out (`ref_model`'s inverse-dynamics section). The dumps load into the
+rules out (`model`'s inverse-dynamics section). The dumps load into the
 plain v1 / v2 graphs, so the offline checks run on them unchanged.
 
     pixi run -e nvidia mojo run -I . examples/lewm/lewm_so101_train.mojo \\
         --stores a.rendered.h5,b.rendered.h5 --epochs 10 --out runs/so101_wm
 
-Writes `<out>/epoch_<k>/` (the converted-dump format `load_ref` reads),
+Writes `<out>/epoch_<k>/` (the converted-dump format `load_dump` reads),
 `<out>/action_stats.txt` (per-joint mean and std of the target change, the
 normaliser the critic must reuse) and `<out>/log.csv` (`idm` / `val_idm`:
 the unweighted inverse-dynamics loss, 0 / -1 without the term).
@@ -40,7 +40,7 @@ from std.random import seed
 from max.gpu.host import DeviceContext
 
 from noeira.nn.constants import DT
-from noeira.deep_agents.lewm.trainer import LeWMRefTrainer, RefStepStats, recipe_lr
+from noeira.deep_agents.lewm.trainer import LeWMTrainer, LeWMStepStats, recipe_lr
 from noeira.experimental.lewm_so101.trainer import (
     LeWMSo101Trainer,
     LeWMProprioTrainer,
@@ -59,7 +59,7 @@ comptime PROPRIO = get_defined_int["SO101_WM_PROPRIO", 0]() == 1
 (`LeWMProprioTrainer`; writes `prop_stats.txt` too)."""
 comptime IDM = get_defined_int["SO101_WM_IDM", 0]() == 1
 """H-JEPA's inverse-dynamics term on v1 or v2 (`--idm` sets its weight)."""
-comptime TR = LeWMRefTrainer["gpu", B, CAMS * 3, R, ACT_IN]
+comptime TR = LeWMTrainer["gpu", B, CAMS * 3, R, ACT_IN]
 comptime TRP = LeWMProprioTrainer["gpu", B, CAMS * 3, R, ACT_IN, PROP]
 comptime TRI = LeWMIDMTrainer["gpu", B, CAMS * 3, R, ACT_IN]
 comptime TRPI = LeWMProprioIDMTrainer["gpu", B, CAMS * 3, R, ACT_IN, PROP]
@@ -159,7 +159,7 @@ struct _Log(Movable):
         return self.out + "/epoch_" + String((step + 1 + self.per_epoch - 1) // self.per_epoch - 1)
 
     def after(
-        mut self, step: Int, total: Int, lr_s: Float64, st: RefStepStats, val_pred: Float64,
+        mut self, step: Int, total: Int, lr_s: Float64, st: LeWMStepStats, val_pred: Float64,
         idm: Float64 = 0.0, val_idm: Float64 = -1.0,
     ) raises:
         self.acc_pred += st.pred_loss

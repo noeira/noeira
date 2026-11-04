@@ -4,7 +4,7 @@ docs/LEWM_REOPEN_PLAN.md P6. `tools/lewm/train_parity_ref.py` trained the
 reference LeWM from its random init on the real PushT dataset and recorded the
 init, the batches (clip indices), the action normaliser and every step's SIGReg
 matrix; `convert_ref_to_ours.py --dump <run>` put the init in our names. This
-takes the SAME steps with `ref_trainer.LeWMRefTrainer` — same init, same
+takes the SAME steps with `trainer.LeWMTrainer` — same init, same
 windows read natively from the same HDF5 file, same matrices, AdamW lr 5e-5,
 wd 1e-3 on every parameter, clip 1.0 — and prints both loss curves.
 
@@ -29,7 +29,7 @@ from max.gpu.host import DeviceContext
 
 from noeira.nn.constants import DT
 from noeira.deep_agents.act.refload import RefDump
-from noeira.deep_agents.lewm.trainer import LeWMRefTrainer, REF_T, REF_IMG, REF_ACT_IN
+from noeira.deep_agents.lewm.trainer import LeWMTrainer, LEWM_T, LEWM_IMG, LEWM_ACT_IN
 from noeira.data.lewm_pusht_loader import LewmBatchLoaderThread
 
 
@@ -37,9 +37,9 @@ comptime B = 128
 """The recipe's batch, and the torch run's (`--batch 128`). Until
 `49a56a667` this graph could not take one step at 64 on a 32 GB 5090; with
 the ViT blocks checkpointed it peaks at 17.2 GB."""
-comptime HW = REF_IMG * REF_IMG
-comptime PIX = REF_T * 3 * HW
-comptime ACT = REF_T * REF_ACT_IN
+comptime HW = LEWM_IMG * LEWM_IMG
+comptime PIX = LEWM_T * 3 * HW
+comptime ACT = LEWM_T * LEWM_ACT_IN
 comptime WINDOW = 50
 comptime GATE_EARLY = 5e-3
 comptime GATE_WINDOW = 3e-2
@@ -81,7 +81,7 @@ def main() raises:
 
     var c = DeviceContext()
     var ctx = Optional(c)
-    var tr = LeWMRefTrainer["gpu", B](
+    var tr = LeWMTrainer["gpu", B](
         ctx, lr=Float64(hp[0]), wd=Float64(hp[1]), max_norm=Float64(hp[2])
     )
     var n = tr.load(run)
@@ -95,7 +95,7 @@ def main() raises:
     var asd: List[Float32] = [Float32(a_std[0]), Float32(a_std[1])]
     # the reads run on their own thread (batch_loader.mojo): a step's ~4,000
     # kernel launches hold this one
-    var loader = LewmBatchLoaderThread[B, REF_T, REF_IMG, REF_ACT_IN](h5, idx, am, asd, stages)
+    var loader = LewmBatchLoaderThread[B, LEWM_T, LEWM_IMG, LEWM_ACT_IN](h5, idx, am, asd, stages)
 
     var ours = List[Float64]()
     var theirs = List[Float64]()
@@ -120,7 +120,7 @@ def main() raises:
             var stage = stages[0]
             tr.pix.download(c)
             var diff = 0
-            for f in range(B * REF_T):
+            for f in range(B * LEWM_T):
                 for p in range(HW):
                     for ch in range(3):
                         var x = Float32(stage[(f * HW + p) * 3 + ch]) / Float32(255.0)

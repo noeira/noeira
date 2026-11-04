@@ -2,7 +2,7 @@
 # +--------------------------------------------------------------------------+ #
 # | LeWM training under a supervisor: restarted from the last resume state
 # +--------------------------------------------------------------------------+ #
-# `examples/lewm/lewm_pusht_train_ref.mojo --resume` continues from
+# `examples/lewm/lewm_pusht_train.mojo --resume` continues from
 # `<out>/latest` (or starts fresh when there is none), so a crashed run is
 # simply relaunched. Up to MAX_ATTEMPTS, a minute apart; every attempt and its
 # exit code go to `<out>/supervisor.log`, the run's output to `<out>/run.log`.

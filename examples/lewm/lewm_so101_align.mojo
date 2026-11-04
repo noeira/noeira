@@ -43,8 +43,8 @@ from noeira.nn.constants import DT
 from noeira.nn.core.tensor import Tensor
 from noeira.nn.core.tensor_refs import TensorRefs
 from noeira.nn.core.initializer import Kaiming
-from noeira.deep_agents.lewm.model import LeWMEncoderRef
-from noeira.deep_agents.lewm.load import load_ref
+from noeira.deep_agents.lewm.model import LeWMEncoder
+from noeira.deep_agents.lewm.load import load_dump
 from noeira.experimental.lewm_so101.data import So101WMData, CAMS, JOINTS
 from noeira.data.store import TrajectoryStore
 
@@ -52,7 +52,7 @@ from noeira.data.store import TrajectoryStore
 comptime R = 112
 comptime EMB = 192
 comptime NB = 16
-comptime Enc = LeWMEncoderRef[CAMS * 3, R, 14, 192, 3, 12, EMB, 2048]
+comptime Enc = LeWMEncoder[CAMS * 3, R, 14, 192, 3, 12, EMB, 2048]
 comptime FR = CAMS * 3 * R * R
 
 
@@ -205,7 +205,7 @@ def main() raises:
     var c = DeviceContext()
     var ctx = Optional(c)
     var enc = Enc.make["gpu", Kaiming](ctx)
-    var n_loaded = load_ref["gpu"](enc, dump, String("emb.0."), ctx)
+    var n_loaded = load_dump["gpu"](enc, dump, String("emb.0."), ctx)
     var land = _arg(args, "--landscape", "")
     if land.byte_length() > 0:
         var kind = _arg(args, "--kind", "sim")

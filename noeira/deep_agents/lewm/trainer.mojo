@@ -1,14 +1,14 @@
-"""LeWMRefTrainer — trains the reference-exact LeWM the way le-wm-main's
+"""LeWMTrainer — trains the reference-exact LeWM the way le-wm-main's
 `train.py` does (docs/LEWM_REOPEN_PLAN.md P6).
 
 One `train_step` = `lejepa_forward` + `loss.backward()` + Lightning's
-`gradient_clip_val` + `AdamW.step()`, over `ref_model.LeWMLossGraphRef` at the
+`gradient_clip_val` + `AdamW.step()`, over `model.LeWMLossGraph` at the
 paper's dimensions:
 
   * the loss graph in TRAIN mode (BatchNorm on batch statistics, unbiased
     running-variance update), batch mean via the 1/B seed;
   * the predictor's attention `to_qkv` bias — ours has one, the reference
-    does not (ref_model.mojo) — gets its gradient ZEROED before the clip: it
+    does not (model.mojo) — gets its gradient ZEROED before the clip: it
     takes no part in the norm, its moments stay 0, and decay of 0 is 0, so it
     stays at the 0 it was loaded with;
   * torch's `clip_grad_norm_`: total norm over every gradient, coefficient
@@ -41,22 +41,22 @@ from noeira.nn.core.param import ParamVisitor
 from noeira.nn.core.initializer import Kaiming
 from noeira.nn.optimizer.adam import Adam
 from noeira.deep_agents.act.refload import RefDump, _fill
-from .model import LeWMLossGraphRef
-from .load import LoadRef
+from .model import LeWMLossGraph
+from .load import LoadDump
 from noeira.nn.optimizer.grad_clip import _sum_sq_kernel_rt, GC_TPB
 from noeira.io.fileio import write_file_atomic
 from noeira.core.tiles import Tile
 
 
-comptime REF_T = 4
+comptime LEWM_T = 4
 """Frames per training window: history 3 + 1 prediction."""
-comptime REF_ACT_IN = 10
+comptime LEWM_ACT_IN = 10
 """Frameskip 5 x 2: the action embedder's input per frame."""
-comptime REF_IMG = 224
+comptime LEWM_IMG = 224
 
-comptime LeWMRefGraph = LeWMLossGraphRef[
-    3, REF_IMG, 14, 192, 3, 12, 192, 2048,
-    REF_T, REF_ACT_IN, 3, 1,
+comptime LeWMPaperGraph = LeWMLossGraph[
+    3, LEWM_IMG, 14, 192, 3, 12, 192, 2048,
+    LEWM_T, LEWM_ACT_IN, 3, 1,
     16, 64, 2048, 6,
     1024, 17,
 ]
@@ -64,7 +64,7 @@ comptime LeWMRefGraph = LeWMLossGraphRef[
 predictor 6 x (16 heads x 64), FF 2048, SIGReg 1024 projections x 17 knots."""
 
 
-comptime _HW = REF_IMG * REF_IMG
+comptime _HW = LEWM_IMG * LEWM_IMG
 
 
 def recipe_lr(step: Int, total_steps: Int, base_lr: Float64 = 5e-5) -> Float64:
@@ -475,8 +475,8 @@ struct _MomentIO(ParamVisitor):
 
 struct _DumpWriter(ParamVisitor):
     """Every Param / State as `ours.<name>.bin` (float32 LE) + a manifest line —
-    the format `RefDump` / `load_ref` read, so a checkpoint loads where the
-    published weights do (`LeWMRefRollout`, the column-M runner's --dump)."""
+    the format `RefDump` / `load_dump` read, so a checkpoint loads where the
+    published weights do (`LeWMRollout`, the column-M runner's --dump)."""
 
     var dir: String
     var manifest: String
@@ -569,7 +569,7 @@ def copy_last_loss[
 
 
 @fieldwise_init
-struct RefStepStats(Copyable, Movable, Writable):
+struct LeWMStepStats(Copyable, Movable, Writable):
     var loss: Float64
     var pred_loss: Float64
     var sigreg_loss: Float64
@@ -577,9 +577,9 @@ struct RefStepStats(Copyable, Movable, Writable):
     """The pre-clip total norm (torch `clip_grad_norm_`'s return)."""
 
 
-struct LeWMRefTrainer[
+struct LeWMTrainer[
     target: StaticString, B: Int,
-    IN_CH: Int = 3, IMG: Int = REF_IMG, ACT_IN: Int = REF_ACT_IN,
+    IN_CH: Int = 3, IMG: Int = LEWM_IMG, ACT_IN: Int = LEWM_ACT_IN,
 ](Movable, WMWindowLoss):
     """The LeWM training step. The defaults are the published PushT model;
     `IN_CH` / `IMG` / `ACT_IN` re-shape it for another rig (SO-101: the two
@@ -588,11 +588,11 @@ struct LeWMRefTrainer[
     (`staging` / `submit_staged`) is PushT's layout only; other shapes feed
     normalised floats through `train_step` / `loss_of`."""
 
-    comptime PIX = REF_T * Self.IN_CH * Self.IMG * Self.IMG
-    comptime ACT = REF_T * Self.ACT_IN
-    comptime Graph = LeWMLossGraphRef[
+    comptime PIX = LEWM_T * Self.IN_CH * Self.IMG * Self.IMG
+    comptime ACT = LEWM_T * Self.ACT_IN
+    comptime Graph = LeWMLossGraph[
         Self.IN_CH, Self.IMG, 14, 192, 3, 12, 192, 2048,
-        REF_T, Self.ACT_IN, 3, 1,
+        LEWM_T, Self.ACT_IN, 3, 1,
         16, 64, 2048, 6,
         1024, 17,
     ]
@@ -637,9 +637,9 @@ struct LeWMRefTrainer[
     ) raises:
         comptime assert Self.target == "cpu" or Self.target == "gpu"
         self.graph = Self.Graph.make[Self.target, Kaiming](ctx)
-        # the 12 ViT blocks recompute their forward in the vjp (ref_model)
+        # the 12 ViT blocks recompute their forward in the vjp (model)
         self.graph.set_node_attr["emb", "checkpoint"](Scalar[DT](1 if checkpoint else 0))
-        # the predictor's dropout (ref_model.PRED_DROPOUT): the recipe trains
+        # the predictor's dropout (model.PRED_DROPOUT): the recipe trains
         # with it; the torch parity gates run without
         self.dropout_on = dropout
         self.keep = List[String]()
@@ -677,7 +677,7 @@ struct LeWMRefTrainer[
 
     def load(mut self, dump_dir: String) raises -> Int:
         """Every Param and BN State from a converted dump (`ours.<name>`)."""
-        var lv = LoadRef(RefDump(dump_dir), String(""))
+        var lv = LoadDump(RefDump(dump_dir), String(""))
         self.graph.for_each_param[Self.target](lv, self.ctx)
         self.graph.for_each_state[Self.target](lv, self.ctx)
         lv.check()
@@ -699,7 +699,7 @@ struct LeWMRefTrainer[
 
     def train_step(
         mut self, pix: List[Scalar[DT]], act: List[Scalar[DT]]
-    ) raises -> RefStepStats:
+    ) raises -> LeWMStepStats:
         """`pix`: (B, T, 3, 224, 224) ImageNet-normalised; act: (B, T, 10)
         z-scored, NaN already zeroed (train.py's `nan_to_num`)."""
         var t = Int(perf_counter_ns())
@@ -720,7 +720,7 @@ struct LeWMRefTrainer[
         ⚠ Slot s is read by an ASYNC copy once submitted: refill it only
         after the `finish()` of the step that read it."""
         comptime assert Self.target == "gpu", "staging: GPU only"
-        comptime assert Self.IN_CH == 3 and Self.IMG == REF_IMG, "staging: PushT's layout only"
+        comptime assert Self.IN_CH == 3 and Self.IMG == LEWM_IMG, "staging: PushT's layout only"
         if len(self.pix_host) == 0:
             var c = self.ctx.value()
             for _ in range(2):
@@ -783,7 +783,7 @@ struct LeWMRefTrainer[
         self.graph.for_each_state[Self.target](f, self.ctx)
         return f.n
 
-    def loss_of(mut self, pix: List[Scalar[DT]], act: List[Scalar[DT]]) raises -> RefStepStats:
+    def loss_of(mut self, pix: List[Scalar[DT]], act: List[Scalar[DT]]) raises -> LeWMStepStats:
         """Forward only, in the current mode (no update): the loss on a batch."""
         for i in range(Self.B * Self.PIX):
             self.pix.data[i] = pix[i]
@@ -793,7 +793,7 @@ struct LeWMRefTrainer[
         self.graph.set_input["pixels", Self.B](self.pix, self.ctx)
         self.graph.set_input["actions", Self.B](self.act, self.ctx)
         self.graph.forward[Self.B, Self.target](self.loss, self.ctx)
-        var stats = RefStepStats(0.0, 0.0, 0.0, 0.0)
+        var stats = LeWMStepStats(0.0, 0.0, 0.0, 0.0)
         comptime if Self.target == "gpu":
             var c = self.ctx.value()
             c.synchronize()
@@ -824,8 +824,8 @@ struct LeWMRefTrainer[
     ) raises -> WindowLatents:
         """`WMWindowLoss`: no proprio, so `z` is the image latent."""
         _ = self.loss_of(pix, act)
-        var img = node_host[Self.target](self.graph.node_output["emb"](), Self.B * REF_T * 192, self.ctx)
-        var pred = node_host[Self.target](self.graph.node_output["pred"](), Self.B * (REF_T - 1) * 192, self.ctx)
+        var img = node_host[Self.target](self.graph.node_output["emb"](), Self.B * LEWM_T * 192, self.ctx)
+        var pred = node_host[Self.target](self.graph.node_output["pred"](), Self.B * (LEWM_T - 1) * 192, self.ctx)
         var z = img.copy()
         return WindowLatents(img^, z^, pred^)
 
@@ -839,7 +839,7 @@ struct LeWMRefTrainer[
         self.graph.set_attr["training"](Scalar[DT](1))
         self.graph.set_node_attr["pred_raw", "dropout"](Scalar[DT](1 if self.dropout_on else 0))
 
-    def eval_staged(mut self, act: List[Scalar[DT]], slot: Int = 0) raises -> RefStepStats:
+    def eval_staged(mut self, act: List[Scalar[DT]], slot: Int = 0) raises -> LeWMStepStats:
         """The validation loss on the frames in `staging(slot)`: forward only,
         in eval mode (call `set_eval` first). grad_norm is 0."""
         comptime assert Self.target == "gpu", "eval_staged: GPU only"
@@ -847,7 +847,7 @@ struct LeWMRefTrainer[
         self.graph.set_input["pixels", Self.B](self.pix, self.ctx)
         self.graph.set_input["actions", Self.B](self.act, self.ctx)
         self.graph.forward[Self.B, Self.target](self.loss, self.ctx)
-        var stats = RefStepStats(0.0, 0.0, 0.0, 0.0)
+        var stats = LeWMStepStats(0.0, 0.0, 0.0, 0.0)
         var c = self.ctx.value()
         c.synchronize()
         self.loss.download(c)
@@ -916,19 +916,19 @@ struct LeWMRefTrainer[
         """Staging slot -> device uint8 -> normalised `pix`; actions up."""
         var c = self.ctx.value()
         if len(self.pix_host) == 0:
-            raise Error("LeWMRefTrainer: call staging() and fill it first")
+            raise Error("LeWMTrainer: call staging() and fill it first")
         c.enqueue_copy(self.pix_u8.value(), self.pix_host[slot])
         self.pix.ensure_gpu(c, Self.B * Self.PIX)
         c.enqueue_function[_lewm_pixels_kernel](
             self.pix_u8.value(),
             self.pix.dev.value(),
-            Int64(Self.B * REF_T),
+            Int64(Self.B * LEWM_T),
             grid_dim=(Self.B * Self.PIX + TPB - 1) // TPB,
             block_dim=TPB,
         )
         self._set_actions(act)
 
-    def train_step_staged(mut self, act: List[Scalar[DT]], slot: Int = 0) raises -> RefStepStats:
+    def train_step_staged(mut self, act: List[Scalar[DT]], slot: Int = 0) raises -> LeWMStepStats:
         """`submit_staged` then `finish`."""
         self.submit_staged(act, slot)
         return self.finish()
@@ -965,7 +965,7 @@ struct LeWMRefTrainer[
         var mask = _MaskPredQKVBias()
         self.graph.for_each_param[Self.target](mask, self.ctx)
         if mask.n_masked != 6:
-            raise Error("LeWMRefTrainer: masked " + String(mask.n_masked) + " predictor qkv biases, expected 6")
+            raise Error("LeWMTrainer: masked " + String(mask.n_masked) + " predictor qkv biases, expected 6")
         if len(self.keep) > 0:
             var mk = _MaskKeep(self.keep)
             self.graph.for_each_param[Self.target](mk, self.ctx)
@@ -978,7 +978,7 @@ struct LeWMRefTrainer[
             var ss = _GradSumSq(self.norm_parts.dev.value())
             self.graph.for_each_param[Self.target](ss, self.ctx)
             if ss.k > 512:
-                raise Error("LeWMRefTrainer: more than 512 parameter tensors")
+                raise Error("LeWMTrainer: more than 512 parameter tensors")
             c.enqueue_function[_clip_coef_kernel](
                 self.norm_parts.dev.value(), Int64(ss.k), Scalar[DT](self.max_norm),
                 self.norm_dev.dev.value(), grid_dim=1, block_dim=1,
@@ -998,10 +998,10 @@ struct LeWMRefTrainer[
         self.graph.for_each_param[Self.target](self.opt, self.ctx)
         self._lap(4, t)
 
-    def finish(mut self) raises -> RefStepStats:
+    def finish(mut self) raises -> LeWMStepStats:
         """Wait for the submitted step; its loss, the two terms and the
         pre-clip gradient norm."""
-        var stats = RefStepStats(0.0, 0.0, 0.0, self.norm_host)
+        var stats = LeWMStepStats(0.0, 0.0, 0.0, self.norm_host)
         comptime if Self.target == "gpu":
             var c = self.ctx.value()
             c.synchronize()

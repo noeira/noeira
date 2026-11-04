@@ -31,8 +31,8 @@ from max.gpu.host import DeviceContext
 from noeira.nn.constants import DT
 from noeira.nn.core.initializer import Kaiming
 from noeira.deep_agents.act.refload import RefDump
-from noeira.deep_agents.lewm.load import load_ref
-from noeira.deep_agents.lewm.rollout import RefEncoder, encode_ref, REF_EMB
+from noeira.deep_agents.lewm.load import load_dump
+from noeira.deep_agents.lewm.rollout import LeWMPaperEncoder, encode_frames, LEWM_EMB
 from noeira.envs.pusht.eval_pairs import (
     PairEnv, PAIR_HW, imagenet_from_hwc255, render_frame, pair_margin,
     VisualShift, shift_frame,
@@ -104,8 +104,8 @@ def main() raises:
 
     var c = DeviceContext()
     var ctx = Optional(c)
-    var enc = RefEncoder.make[TARGET, Kaiming](ctx)
-    _ = load_ref[TARGET](enc, dump, String("emb.0."), ctx)
+    var enc = LeWMPaperEncoder.make[TARGET, Kaiming](ctx)
+    _ = load_dump[TARGET](enc, dump, String("emb.0."), ctx)
     print("cost landscape on", dump, ":", n_pairs, "pairs x", K, "states (k = 0 the goal itself)")
 
     # the states and their true distances, once for every shift
@@ -146,7 +146,7 @@ def main() raises:
             for q in range(FRAME):
                 goal.append(goal_pix[e * FRAME + q])
             shift_frame(goal, 0, shift, UInt64(e) * 7919 + 2)
-            var ge = encode_ref[TARGET, 1](enc, imagenet_from_hwc255(goal, 0), ctx)
+            var ge = encode_frames[TARGET, 1](enc, imagenet_from_hwc255(goal, 0), ctx)
             var batch = List[Scalar[DT]](capacity=K * FRAME)
             for k in range(K):
                 var f = List[Scalar[DT]](capacity=FRAME)
@@ -155,12 +155,12 @@ def main() raises:
                 shift_frame(f, 0, shift, UInt64(e) * 7919 + UInt64(k) * 13 + 3)
                 for v in imagenet_from_hwc255(f, 0):
                     batch.append(v)
-            var xe = encode_ref[TARGET, K](enc, batch, ctx)
+            var xe = encode_frames[TARGET, K](enc, batch, ctx)
             var cost = List[Float64]()
             for k in range(K):
                 var acc = 0.0
-                for d in range(REF_EMB):
-                    acc += (Float64(xe[k * REF_EMB + d]) - Float64(ge[d])) ** 2
+                for d in range(LEWM_EMB):
+                    acc += (Float64(xe[k * LEWM_EMB + d]) - Float64(ge[d])) ** 2
                 cost.append(acc)
             rho_sum += _spearman(cost, dists[e])
             var r = _ranks(cost)
