@@ -5,7 +5,8 @@ test_supermimic_env: a reference library from our G1's pose after 2 s of zero
 action (a pose the PD holds), so answers are known.
 
 [1] holding the pose: zero action, no noise, no DR — every lane's reward
-    within 2 % of its maximum (0.1) for 30 steps, no ending.
+    within 2 % of its maximum (0.1) for 30 steps, no termination (a lane
+    reset near its clip's end may time out: that is not a failure).
 [2] the CPU env, noise off, on a library whose frames are all the same
     pose (so the two envs' reset draws, which consume the host RNG
     differently, cannot matter): after the reset the GPU lanes' states and
@@ -14,7 +15,9 @@ action (a pose the PD holds), so answers are known.
     printed (one control step of float32 physics).
 [3] termination: a reference 0.3 m above the robot ends every lane at the
     first step: each ring holds a transition row then a terminal row
-    labelled 1, its episode counter advanced, and the lane restarted.
+    labelled 1, its episode counter advanced, and the lane restarted. (The
+    reset puts the robot AT the raised reference, so the test drops every
+    lane back to the floor pose first, as the CPU test does.)
 [4] the clip's end: a 60-frame clip, zero action: every lane times out by
     step 62, flagged at its clip's end, never terminated.
 [5] bookkeeping under noise and DR, 60 random steps: every ring holds one
@@ -116,17 +119,19 @@ def _zeros() -> List[Scalar[DT]]:
 def test_hold(ctx: DeviceContext, stand: List[Scalar[DT]], mut tl: Tally) raises:
     print("[1] holding the pose (zero action, no noise, no DR)")
     seed(1)
-    var env = EnvG(ctx, _library(stand, [400], 0.0), BS.create(ctx), dr=False, obs_noise=False, reset_noise=False, action_noise=0.0)
+    var env = EnvG(ctx, _library(stand, [600], 0.0), BS.create(ctx), dr=False, obs_noise=False, reset_noise=False, action_noise=0.0)
     var rb = SMReplayGpuOf[R](ctx, NL, 64)
     var a = _actions(ctx, _zeros())
     var worst = 1.0
-    var ended = 0
+    var term = 0
+    var trunc = 0
     for _ in range(30):
         var si = env.step(ctx, a, rb)
-        ended += si.n_terminated + si.n_truncated
+        term += si.n_terminated
+        trunc += si.n_truncated
         for l in range(NL):
             worst = min(worst, env.last_reward[l] / 0.1)
-    tl.check(worst >= 0.98 and ended == 0, "30 steps x 8 lanes: worst reward " + String(worst) + " of the maximum, " + String(ended) + " endings")
+    tl.check(worst >= 0.98 and term == 0, "30 steps x 8 lanes: worst reward " + String(worst) + " of the maximum, " + String(term) + " terminations (" + String(trunc) + " clip-end time-outs)")
 
 
 def test_vs_cpu(ctx: DeviceContext, stand: List[Scalar[DT]], mut tl: Tally) raises:
@@ -171,6 +176,18 @@ def test_termination(ctx: DeviceContext, stand: List[Scalar[DT]], mut tl: Tally)
     print("[3] termination: the reference 0.3 m above")
     seed(3)
     var env = EnvG(ctx, _library(stand, [400], 0.3), BS.create(ctx), dr=False, obs_noise=False, reset_noise=False, action_noise=0.0)
+    # the reset put every lane AT the raised reference: back to the floor pose
+    env.sim.env.d.qpos.download(ctx)      # sizes the host copies before writing them
+    env.sim.env.d.qvel.download(ctx)
+    for l in range(NL):
+        for k in range(R.NQ):
+            env.sim.env.d.qpos.data[l * R.NQ + k] = stand[k]
+        for k in range(R.NV):
+            env.sim.env.d.qvel.data[l * R.NV + k] = 0
+    env.sim.env.d.qpos.upload_resident(ctx)
+    env.sim.env.d.qvel.upload_resident(ctx)
+    env.sim.refresh(ctx)
+    env._observe(ctx)          # the env's state (and next rows) read back from the simulator
     var rb = SMReplayGpuOf[R](ctx, NL, 64)
     var a = _actions(ctx, _zeros())
     var si = env.step(ctx, a, rb)
