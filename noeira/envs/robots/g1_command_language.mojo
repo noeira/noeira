@@ -422,6 +422,83 @@ def g1_route_destination(
     return String("")
 
 
+def _g1_command_options(
+    ref bank: G1CommandBank,
+    only: List[String],
+    rotate: Int,
+    mut options: List[String],
+    mut descs: List[String],
+    name_desc: Bool = False,
+) raises:
+    """The command question's options: the real ones (bank rows + aliases,
+    `only` keeps just those named), rotated left by `rotate`, then `talk` and
+    `none`. The one copy of that list and its descriptions.
+
+    `name_desc`: each description starts with its option's name
+    (`left_hand_up: arms: left_hand_height above 0.93, ...`). ⚠ A model that
+    shows an option by its description ALONE never reads the name: d1
+    (LiquidAI's `prompt.py`, `_option_line`, style `desc` by default) saw
+    only the bank's predicates and picked the three plain-English aliases
+    for clear commands (RB-1, 11-05). Its `name_desc` style writes exactly
+    `name: description`, which this reproduces through the description."""
+    var real = List[String]()
+    var real_descs = List[String]()
+    for i in range(bank.count()):
+        real.append(bank.name_at(i))
+        real_descs.append(bank.describe(i))
+    # the aliases are offered as ordinary options; `g1_decide` resolves them
+    for i in range(G1_N_ALIAS):
+        real.append(g1_alias_name(i))
+        real_descs.append(g1_alias_desc(i))
+    if len(only) > 0:
+        var kept = List[String]()
+        var kept_descs = List[String]()
+        for i in range(len(real)):
+            for n in only:
+                if n == real[i]:
+                    kept.append(real[i])
+                    kept_descs.append(real_descs[i])
+                    break
+        if len(kept) != len(only):
+            raise Error("g1 command options: `only` names an option that does not exist")
+        real = kept^
+        real_descs = kept_descs^
+    var n_real = len(real)
+    for i in range(n_real):
+        var j = (i + rotate) % n_real if n_real > 0 else 0
+        if j < 0:
+            j += n_real
+        options.append(real[j])
+        descs.append(real[j] + ": " + real_descs[j] if name_desc else real_descs[j])
+    # `none` last and ALWAYS present: without it the model must pick
+    # something, and "something" for an impossible request is a real command
+    # the robot will actually run.
+    options.append(String(G1_OPT_TALK))
+    descs.append(String(
+        "the speaker is talking TO the robot but not asking it to move —"
+        " a greeting, a question, a remark. Answer in words, not motion."
+    ))
+    options.append(String(G1_OPT_NONE))
+    descs.append(String("not one of these, or not a command for this robot"))
+
+
+def g1_add_command_choice(
+    mut q: JevQuestions,
+    ref bank: G1CommandBank,
+    id: String,
+    only: List[String] = List[String](),
+    rotate: Int = 0,
+    name_desc: Bool = False,
+) raises:
+    """The command question again under another `id`, over `only` (with
+    `talk` and `none`), for a caller that splits the option list across
+    questions; `g1_decide(command_id=id)` reads it."""
+    var options = List[String]()
+    var descs = List[String]()
+    _g1_command_options(bank, only, rotate, options, descs, name_desc)
+    q.choice(id, g1_command_instruction(), options, descs)
+
+
 def g1_command_questions(
     ref bank: G1CommandBank,
     with_addressed: Bool = False,
@@ -429,6 +506,8 @@ def g1_command_questions(
     dest_descs: List[String] = List[String](),
     with_chain: Bool = True,
     rotate: Int = 0,
+    only: List[String] = List[String](),
+    name_desc: Bool = False,
 ) raises -> JevQuestions:
     """The choice over the bank, plus the two cheap guards.
 
@@ -441,39 +520,22 @@ def g1_command_questions(
     number used. It exists for order-sensitivity tests: an answer that changes
     with the option order is a flip.
 
+    `only`: offer just these real options (bank rows or aliases, kept in bank
+    order), for a caller that splits the list (`g1_add_command_choice` asks
+    the rest). Empty, the default, offers all of them.
+
+    `name_desc`: each real option's description starts with its name
+    (`_g1_command_options`). Off by default: every measured number used the
+    descriptions alone.
+
     ⚠ The option descriptions are GENERATED from each compound
     (`bank.describe`). A hand-written blurb would drift from the terms the
     command was gated on, and the drift is invisible — the robot doing one
     thing while the model was told another.
     """
-    var real = List[String]()
-    var real_descs = List[String]()
-    for i in range(bank.count()):
-        real.append(bank.name_at(i))
-        real_descs.append(bank.describe(i))
-    # the aliases are offered as ordinary options; `g1_decide` resolves them
-    for i in range(G1_N_ALIAS):
-        real.append(g1_alias_name(i))
-        real_descs.append(g1_alias_desc(i))
     var options = List[String]()
     var descs = List[String]()
-    var n_real = len(real)
-    for i in range(n_real):
-        var j = (i + rotate) % n_real if n_real > 0 else 0
-        if j < 0:
-            j += n_real
-        options.append(real[j])
-        descs.append(real_descs[j])
-    # `none` last and ALWAYS present: without it the model must pick
-    # something, and "something" for an impossible request is a real command
-    # the robot will actually run.
-    options.append(String(G1_OPT_TALK))
-    descs.append(String(
-        "the speaker is talking TO the robot but not asking it to move —"
-        " a greeting, a question, a remark. Answer in words, not motion."
-    ))
-    options.append(String(G1_OPT_NONE))
-    descs.append(String("not one of these, or not a command for this robot"))
+    _g1_command_options(bank, only, rotate, options, descs, name_desc)
 
     var q = JevQuestions()
     q.choice(String(G1_Q_COMMAND), g1_command_instruction(), options, descs)
@@ -772,20 +834,24 @@ def g1_decide(
     min_dest: Float64 = 0.5,
     refuse_placeless: Bool = False,
     dest_decided: Bool = False,
+    command_id: String = String(G1_Q_COMMAND),
 ) raises -> G1LangPick:
     """Apply the rule above. Returns an empty `name` with a `reason` set when
     the honest answer is to do nothing.
 
     `dest_decided`: the destination was asked in an EARLIER request
     (`g1_destination_questions`) and routed nothing, so these answers carry
-    no destination question but `refuse_placeless` still applies."""
+    no destination question but `refuse_placeless` still applies.
+
+    `command_id`: which command question to read (`g1_add_command_choice`);
+    an option it does not offer reads as probability 0."""
     var r = G1LangPick()
-    r.p_none = ans.probability(String(G1_Q_COMMAND), String(G1_OPT_NONE))
+    r.p_none = ans.probability(command_id, String(G1_OPT_NONE))
     r.needs_world = ans.noul(String(G1_Q_NEEDS_WORLD))
     if with_addressed:
         r.addressed = ans.noul(String(G1_Q_ADDRESSED))
 
-    var p_talk = ans.probability(String(G1_Q_COMMAND), String(G1_OPT_TALK))
+    var p_talk = ans.probability(command_id, String(G1_OPT_TALK))
 
     # the best REAL option — never the argmax, see the header. Aliases
     # compete on equal terms and are resolved to their target afterwards.
@@ -793,7 +859,7 @@ def g1_decide(
         var nm = bank.name_at(i) if i < bank.count() else g1_alias_name(
             i - bank.count()
         )
-        var p = ans.probability(String(G1_Q_COMMAND), nm)
+        var p = ans.probability(command_id, nm)
         if p > r.conf:
             r.conf = p
             r.name = g1_resolve(nm)
