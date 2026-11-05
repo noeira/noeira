@@ -143,10 +143,10 @@ def main() raises:
     var first: List[Int] = [env.lib.clip_start[clips[0]]]
     env.restart(first)
     env.next_frame[0] = env.lib.clip_start[clips[1]] if len(clips) > 1 else env.lib.clip_start[clips[0]]
-    if not env.lanes[0].sim.env.init_renderer():
+    if not env.lanes[0].sim.init_renderer():
         raise Error("no window (the renderer did not open)")
     if record.byte_length() > 0:
-        env.lanes[0].sim.env.start_recording(record, fps)
+        env.lanes[0].sim.start_recording(record, fps)
         print("recording to", record)
     var delay = max(1000 // max(fps, 1), 1)
     var hist = TensorImpl[DT].alloc(D.HIST * D.OBS)
@@ -156,19 +156,19 @@ def main() raises:
     var steps = 0
     print("clip", clips[0], ":", env.lib.clip_len[clips[0]], "frames")
     while k < len(clips):
-        if env.lanes[0].sim.env.check_renderer_quit():
+        if env.lanes[0].sim.check_renderer_quit():
             break
-        if env.lanes[0].sim.env.renderer_paused():
-            env.lanes[0].sim.env.render_frame()
-            env.lanes[0].sim.env.renderer_delay(delay)
+        if env.lanes[0].sim.renderer_paused():
+            env.lanes[0].sim.render_frame()
+            env.lanes[0].sim.renderer_delay(delay)
             continue
         env.policy_inputs(hist, goals)
         var a = trainer.act[1](hist, goals)
         _ = env.step(a.data, rb)
         ret += env.last_reward[0]
         steps += 1
-        env.lanes[0].sim.env.render_frame()
-        env.lanes[0].sim.env.renderer_delay(delay)
+        env.lanes[0].sim.render_frame()
+        env.lanes[0].sim.renderer_delay(delay)
         if env.lanes[0].ep_len == 0:            # the clip ended (the lane was reset to the next)
             var failed = env.last_terminated[0]
             print("  normalised return", ret / (0.1 * Float64(max(steps, 1))), "|", steps, "steps |", "FAILED" if failed else "completed")
@@ -179,5 +179,5 @@ def main() raises:
                 print("clip", clips[k], ":", env.lib.clip_len[clips[k]], "frames")
                 env.next_frame[0] = env.lib.clip_start[clips[k + 1]] if k + 1 < len(clips) else env.lib.clip_start[clips[k]]
     if record.byte_length() > 0:
-        env.lanes[0].sim.env.stop_recording()
-    env.lanes[0].sim.env.close_renderer()
+        env.lanes[0].sim.stop_recording()
+    env.lanes[0].sim.close_renderer()

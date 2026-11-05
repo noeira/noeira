@@ -91,6 +91,31 @@ trait TrackingSim(Movable & Deinitable):
     def num_geoms(self) -> Int:
         ...
 
+    # The window, for `supermimic_viewer` (forwards to the env's renderer).
+    def init_renderer(mut self) raises -> Bool:
+        ...
+
+    def render_frame(mut self) raises:
+        ...
+
+    def renderer_delay(self, ms: Int):
+        ...
+
+    def check_renderer_quit(mut self) -> Bool:
+        ...
+
+    def renderer_paused(self) -> Bool:
+        ...
+
+    def start_recording(mut self, path: String, fps: Int) raises:
+        ...
+
+    def stop_recording(mut self) raises:
+        ...
+
+    def close_renderer(mut self) raises:
+        ...
+
 
 trait TrackingBatchedSim(Movable & Deinitable):
     """N simulator lanes on the device. Pointers are device pointers into
@@ -291,6 +316,30 @@ struct G1Sim(TrackingSim):
     def num_geoms(self) -> Int:
         return UnitreeG1[DType.float64].NGEOM
 
+    def init_renderer(mut self) raises -> Bool:
+        return self.env.init_renderer()
+
+    def render_frame(mut self) raises:
+        self.env.render_frame()
+
+    def renderer_delay(self, ms: Int):
+        self.env.renderer_delay(ms)
+
+    def check_renderer_quit(mut self) -> Bool:
+        return self.env.check_renderer_quit()
+
+    def renderer_paused(self) -> Bool:
+        return self.env.renderer_paused()
+
+    def start_recording(mut self, path: String, fps: Int) raises:
+        self.env.start_recording(path, fps)
+
+    def stop_recording(mut self) raises:
+        self.env.stop_recording()
+
+    def close_renderer(mut self) raises:
+        self.env.close_renderer()
+
 
 def _k_g1_action(
     n_lanes: Int64, a: Pointer[Scalar[DT], MutAnyOrigin], bias: Pointer[Scalar[DT], MutAnyOrigin], bias_stride: Int64,
@@ -485,6 +534,30 @@ struct G1MjlabSim(TrackingSim):
 
     def num_geoms(self) -> Int:
         return UnitreeG1Mjlab[DType.float64].NGEOM
+
+    def init_renderer(mut self) raises -> Bool:
+        return self.env.init_renderer()
+
+    def render_frame(mut self) raises:
+        self.env.render_frame()
+
+    def renderer_delay(self, ms: Int):
+        self.env.renderer_delay(ms)
+
+    def check_renderer_quit(mut self) -> Bool:
+        return self.env.check_renderer_quit()
+
+    def renderer_paused(self) -> Bool:
+        return self.env.renderer_paused()
+
+    def start_recording(mut self, path: String, fps: Int) raises:
+        self.env.start_recording(path, fps)
+
+    def stop_recording(mut self) raises:
+        self.env.stop_recording()
+
+    def close_renderer(mut self) raises:
+        self.env.close_renderer()
 
 
 def _k_g1m_action(
