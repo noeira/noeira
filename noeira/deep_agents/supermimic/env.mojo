@@ -223,6 +223,8 @@ struct SMTrackingEnv[R: TrackingRobot](Movable):
     var action_noise: Float64
     var last_reward: List[Float64]
     var last_terminated: List[Bool]
+    var last_violated: List[Bool]   # the termination condition held this step (even when `terminations` is off)
+    var terminations: Bool          # False: a failing lane keeps running to its clip's end (viewers only)
     var max_episode_steps: Int      # 0: no cap (the evaluation: the clip's end decides)
     var next_frame: List[Int]       # ≥ 0: the lane's next reset frame instead of a draw
 
@@ -249,6 +251,8 @@ struct SMTrackingEnv[R: TrackingRobot](Movable):
         self.action_noise = action_noise
         self.last_reward = List[Float64](length=n, fill=0.0)
         self.last_terminated = List[Bool](length=n, fill=False)
+        self.last_violated = List[Bool](length=n, fill=False)
+        self.terminations = True
         for i in range(n):
             ref ln = self.lanes[i]
             var cb = self.tables.com_body
@@ -288,6 +292,8 @@ struct SMTrackingEnv[R: TrackingRobot](Movable):
         self.action_noise = move.action_noise
         self.last_reward = move.last_reward^
         self.last_terminated = move.last_terminated^
+        self.last_violated = move.last_violated^
+        self.terminations = move.terminations
         self.max_episode_steps = move.max_episode_steps
         self.next_frame = move.next_frame^
 
@@ -469,7 +475,12 @@ struct SMTrackingEnv[R: TrackingRobot](Movable):
                 terms.unsafe_ptr().as_unsafe_any_origin(), feat.unsafe_ptr().as_unsafe_any_origin(),
                 obs_tmp.unsafe_ptr().as_unsafe_any_origin(), scratch.unsafe_ptr().as_unsafe_any_origin(),
             )
-            var terminated = abs(Float64(feat[0])) > SM_HEIGHT_TERM or abs(Float64(feat[1])) > SM_TILT_TERM
+            var violated = abs(Float64(feat[0])) > SM_HEIGHT_TERM or abs(Float64(feat[1])) > SM_TILT_TERM
+            # ⚠ `terminations` off is for watching a failure play out (the
+            # motion picker): the lane runs on past a state no training
+            # episode ever reached, and its return is not the benchmark's.
+            var terminated = violated and self.terminations
+            self.last_violated[i] = violated
             var time_out = (self.max_episode_steps > 0 and ln.ep_len >= self.max_episode_steps) or ln.clip_end
             self.last_reward[i] = Float64(r)
             self.last_terminated[i] = terminated
