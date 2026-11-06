@@ -159,7 +159,7 @@ def _read_pid(mut pipe: Pipe) raises -> Int:
     var pid = 0
     var one = SIMD[DType.uint8, 1](0)
     for _ in range(24):
-        var n = external_call["read", Int](fd, Pointer(to=one), Int(1))  # Int fd: see Pipe.read_available
+        var n = external_call["read", Int](Int32(fd), Pointer(to=one), Int(1))  # Int32 fd: see Pipe.read_available
         if n != 1:
             raise Error("proc: the shell died before starting its command")
         var c = Int(one[0])

@@ -390,8 +390,11 @@ struct SerialPort(Movable):
     def write_bytes[
         mut: Bool, //, o: Origin[mut=mut]
     ](mut self, buf: Span[UInt8, o]) raises -> Int:
+        # ⚠ `Int32` fd, like `read` below: since Mojo 1.2.0 the stdlib declares
+        # `write` with an `Int32` fd, and an `Int` fd fails at LLVM lowering
+        # in any binary that also writes a file.
         var n = external_call["write", Int](
-            Int(self.fd), buf.unsafe_ptr(), len(buf)
+            Int32(self.fd), buf.unsafe_ptr(), len(buf)
         )
         if n < 0:
             raise Error("serial: write failed, errno=" + String(errno()))
@@ -419,12 +422,11 @@ struct SerialPort(Movable):
         var deadline = perf_counter_ns() + timeout_ms * 1_000_000
         var got = 0
         while got < want:
-            # ⚠ `Int(self.fd)`, not `self.fd` — same collision as `write`
-            # above: the stdlib declares `read` with an `index` fd
-            # (`std/io/file_descriptor.mojo:117`) and a second declaration
-            # with `si32` fails at LLVM lowering, not at parse.
+            # ⚠ `Int32` fd: the stdlib declares `read` with an `Int32` fd since Mojo 1.2.0 (an `Int` fd fails at LLVM lowering,
+            # "existing function with conflicting signature", in any binary that also reads a file).
+            # Before 1.2 it was an `index` fd (`std/io/file_descriptor.mojo:117`).
             var n = external_call["read", Int](
-                Int(self.fd), buf.unsafe_ptr().unsafe_offset(got), want - got
+                Int32(self.fd), buf.unsafe_ptr().unsafe_offset(got), want - got
             )
             if n > 0:
                 got += n

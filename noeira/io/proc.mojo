@@ -173,10 +173,10 @@ struct Pipe(Movable):
             raise Error("proc: poll failed on: " + self.command)
         if ready == 0:
             return 0
-        # ⚠ `Int` fd, not `Int32`: the stdlib declares `read` with an index fd
-        # (`serial/port.mojo` records the collision), and a second declaration
-        # with `si32` fails at LLVM lowering in any binary that links both.
-        var n = external_call["read", Int](self.fileno(), dst, count)
+        # ⚠ `Int32` fd: the stdlib declares `read` with an `Int32` fd since Mojo 1.2.0 (an `Int` fd fails at LLVM lowering,
+        # "existing function with conflicting signature", in any binary that also reads a file).
+        # It was the other way round before 1.2 (`serial/port.mojo`, `audio_io._read_pid`).
+        var n = external_call["read", Int](Int32(self.fileno()), dst, count)
         if n < 0:
             raise Error("proc: read failed on: " + self.command)
         if n == 0:
