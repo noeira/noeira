@@ -25,6 +25,9 @@ action (a pose the PD holds), so answers are known.
     frame inside the library; PER-LANE DR: each lane's ξ friction in
     [0.3, 1.2], not all lanes equal, and each lane's foot-body friction
     overrides (`lane_dr`) equal to its ξ.
+[6] prompt lanes: a tracking error ends a tracker lane and not a prompt lane, a
+    fall does end one, its task reward comes back, and it never reaches the
+    reset sampler.
 
 Run (box): pixi run -e nvidia mojo run -I . tests/deep_agents/supermimic/test_supermimic_env_gpu.mojo
 """
@@ -39,7 +42,9 @@ from max.gpu.host import DeviceContext
 from noeira.core.cont_action import ContAction
 from noeira.deep_agents.supermimic.env import SMReplayOf, SMTrackingEnv
 from noeira.deep_agents.supermimic.env_gpu import ST_CLIP_END, ST_ENDING, ST_TERMINATED, SMReplayGpuOf, SMTrackingEnvGpu
+from noeira.deep_agents.supermimic.lanes import talloc, tp
 from noeira.deep_agents.supermimic.motion_library import SMMotionLibrary
+from noeira.deep_agents.supermimic.prompt import SMSpec, sm_spec_velocity
 from noeira.deep_agents.supermimic.robot import G1BatchedSim, G1MjlabBatchedSim, G1MjlabRobot, G1Robot, SMDims
 from noeira.envs.robots import UnitreeG1
 from noeira.envs.robots.unitree_g1_pd import G1_N_DOF, g1_default_pos
@@ -305,6 +310,88 @@ def test_bookkeeping(ctx: DeviceContext, stand: List[Scalar[DT]], mut tl: Tally)
     tl.check(nan == 0 and frames_ok and mu_ok and distinct, "no NaN, frames inside the library, per-lane friction on " + String(env.n_feet) + " foot bodies (lane 0 " + String(x[0]) + ", lane 1 " + String(x[D.X]) + ")")
 
 
+def _put_all(ctx: DeviceContext, mut env: EnvG, qp: List[Scalar[DT]]) raises:
+    """Every lane at `qp`, at rest (the reference stays where it is)."""
+    var hq = TensorImpl[DT].alloc(R.NQ)
+    var hv = TensorImpl[DT].alloc(R.NV)
+    for k in range(R.NQ):
+        hq.data[k] = qp[k]
+    hq.upload_resident(ctx)
+    hv.upload_resident(ctx)
+    ctx.enqueue_function[_k_bcast](
+        Int64(NL), Int64(R.NQ), mptr(hq.dev.value().unsafe_ptr()), env.sim.qpos_ptr(), grid_dim=ceildiv(NL * R.NQ, 128), block_dim=128,
+    )
+    ctx.enqueue_function[_k_bcast](
+        Int64(NL), Int64(R.NV), mptr(hv.dev.value().unsafe_ptr()), env.sim.qvel_ptr(), grid_dim=ceildiv(NL * R.NV, 128), block_dim=128,
+    )
+    env.sim.refresh(ctx)
+    env._observe(ctx)
+
+
+def test_prompt_lanes(ctx: DeviceContext, stand: List[Scalar[DT]], mut tl: Tally) raises:
+    print("[6] prompt lanes (`env.mojo`'s rules, on the device)")
+    # ⚠ not `stand`: that settled row is LYING (see `_standing_row`), a fall to
+    # this rule. The fresh keyframe is upright.
+    var sim0 = R.SIM.create()
+    var up = List[Scalar[DT]](length=D.S, fill=0)
+    for k in range(R.NQ):
+        up[k] = Scalar[DT](sim0.qpos(k))
+    var lens: List[Int] = [400]
+    var env = EnvG(ctx, _library(up, lens, 0.3), BS.create(ctx), dr=False, obs_noise=False, reset_noise=False, action_noise=0.0)
+    env.prompt_from = 4
+    _put_all(ctx, env, up)
+    var specs = talloc["gpu"](NL * SMSpec.SIZE, Optional(ctx))
+    for l in range(NL):
+        sm_spec_velocity[DT](specs.data.unsafe_ptr().unsafe_offset(l * SMSpec.SIZE).as_unsafe_any_origin(), 0, 0, 0)
+    specs.upload_resident(ctx)
+    var rb = SMReplayGpuOf[R](ctx, NL, 64)
+    var a = _actions(ctx, _zeros())
+    var g0 = 0.0
+    for b in range(len(env.sampler.bin_return)):
+        g0 += env.sampler.bin_return[b]
+    _ = env.step(ctx, a, rb, tp["gpu"](specs))
+    var tracker_end = True
+    var prompt_run = True
+    for l in range(NL):
+        var ended = (env.h_out_i[2 * l + 1] & ST_TERMINATED) != 0
+        if l < 4:
+            tracker_end = tracker_end and ended
+        else:
+            prompt_run = prompt_run and not ended
+    tl.check(tracker_end, "a tracking error ends the tracker lanes")
+    tl.check(prompt_run, "it does not end the prompt lanes")
+    env.prompt_r.download(ctx)
+    var r_ok = True
+    for l in range(4, NL):
+        r_ok = r_ok and Float64(env.prompt_r.data[l]) > 0.05 and Float64(env.prompt_r.data[l]) < 0.0801
+    tl.check(r_ok, "their task reward: about dt · Σ w = 0.08, got " + String(env.prompt_r.data[4]))
+    var g1 = 0.0
+    for b in range(len(env.sampler.bin_return)):
+        g1 += env.sampler.bin_return[b]
+    tl.check(g1 != g0, "the tracker lanes reached the sampler (the next check has teeth)")
+    # every lane a prompt lane, lying on its back: Table A.6's fall, and no estimate moves
+    var env2 = EnvG(ctx, _library(up, lens, 0.0), BS.create(ctx), dr=False, obs_noise=False, reset_noise=False, action_noise=0.0)
+    env2.prompt_from = 0
+    var lying = up.copy()
+    lying[2] = 0.4
+    lying[3] = 0.7071068
+    lying[4] = 0
+    lying[5] = 0.7071068
+    lying[6] = 0
+    _put_all(ctx, env2, lying)
+    var rb2 = SMReplayGpuOf[R](ctx, NL, 64)
+    var a2 = _actions(ctx, _zeros())
+    var g2 = 0.0
+    for b in range(len(env2.sampler.bin_return)):
+        g2 += env2.sampler.bin_return[b]
+    var si = env2.step(ctx, a2, rb2, tp["gpu"](specs))
+    var g3 = 0.0
+    for b in range(len(env2.sampler.bin_return)):
+        g3 += env2.sampler.bin_return[b]
+    tl.check(si.n_terminated == NL, "a fall ends a prompt lane: " + String(si.n_terminated) + " of 8")
+    tl.check(g2 == g3, "prompt lanes never reach the reset sampler")
+
+
 def main() raises:
     comptime if not default_accelerator().is_nvidia_gpu():
         # the batched G1 is NVIDIA only; never instantiated here
@@ -319,6 +406,7 @@ def main() raises:
         test_termination(ctx, stand, tl)
         test_clip_end(ctx, stand, tl)
         test_bookkeeping(ctx, stand, tl)
+        test_prompt_lanes(ctx, stand, tl)
         print("\n===", tl.ok, "/", tl.total, "passed ===")
         if tl.ok != tl.total:
             raise Error("test_supermimic_env_gpu: " + String(tl.total - tl.ok) + " failed")

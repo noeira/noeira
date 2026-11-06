@@ -44,9 +44,8 @@ comptime SMDecoder[R: TrackingRobot, H1: Int, H2: Int, H3: Int, H4: Int] = Seque
     LinearSwish[SMDims[R].DEC_IN, H1], LinearSwish[H1, H2], LinearSwish[H2, H3], LinearSwish[H3, H4],
     Linear[H4, R.NDOF],
 ]
-comptime SMCritic[R: TrackingRobot, C1: Int, C2: Int] = Sequential[
-    LinearSwish[SMDims[R].CRITIC_IN, C1], LinearSwish[C1, C2], Linear[C2, 1],
-]
+comptime SMValueNet[IN: Int, C1: Int, C2: Int] = Sequential[LinearSwish[IN, C1], LinearSwish[C1, C2], Linear[C2, 1]]
+comptime SMCritic[R: TrackingRobot, C1: Int, C2: Int] = SMValueNet[SMDims[R].CRITIC_IN, C1, C2]
 
 
 struct SMPolicy[R: TrackingRobot, E1: Int, E2: Int, E3: Int, E4: Int, D1: Int, D2: Int, D3: Int, D4: Int](ParamWalkable):

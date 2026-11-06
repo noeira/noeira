@@ -19,7 +19,9 @@ from std.random import random_ui64
 
 from noeira.deep_agents.supermimic.config import SMConfigT, SMCriticOf
 from noeira.deep_agents.supermimic.imagination import SMImagBatch, SMImagOut
+from noeira.deep_agents.supermimic.kinematics import FP
 from noeira.deep_agents.supermimic.lanes import sm_critic_in, sm_gae, sm_mb_gather, sm_mse, talloc, tp
+from noeira.deep_agents.supermimic.policy import SMValueNet
 from noeira.deep_agents.supermimic.robot import SMDims, TrackingRobot
 from noeira.nn.constants import DT
 from noeira.nn.core.tensor import TensorImpl
@@ -55,6 +57,86 @@ struct SMCriticFit(Copyable, Movable):
     var target_mean: Float64
 
 
+def sm_value_fit[target: StaticString, CIN: Int, C1: Int, C2: Int, N: Int, H: Int](
+    mut critic: SMValueNet[CIN, C1, C2],
+    mut opt: Adam,
+    mut X: TensorImpl[DT],
+    rewards: FP[DT],
+    dhat: FP[DT],
+    gamma: Float64,
+    perms: List[Int],
+    mut values_out: List[Float64],
+    mut targets_out: List[Float64],
+    ctx: Optional[DeviceContext] = None,
+) raises -> SMCriticFit:
+    """The fit on prebuilt inputs `X` [(H+1)·N·CIN]: V on every imagined state,
+    the TD(λ) targets of `rewards` [H·N] and `dhat` [(H+1)·N], 5 epochs × 4
+    minibatches. `values_out` / `targets_out` receive the (H+1)·N values and
+    H·N targets."""
+    comptime ROWS = H * N
+    comptime MB = ROWS // SM_CRITIC_MB
+    comptime assert ROWS % SM_CRITIC_MB == 0, "H·N must split into the critic's 4 minibatches"
+    var values = talloc[target]((H + 1) * N, ctx)
+    critic.forward[target, (H + 1) * N](TensorRefs[1, _, DT](X), values, ctx)
+    var targets = talloc[target](ROWS, ctx)
+    sm_gae[target](ctx, N, H, Scalar[DT](gamma), Scalar[DT](SM_GAE_LAMBDA), tp[target](values), rewards, dhat, tp[target](targets))
+    # the fit, rows t < H
+    var idx = TensorImpl[DT].alloc(ROWS)
+    var xin = talloc[target](MB * CIN, ctx)
+    var y = talloc[target](MB, ctx)
+    var pred = talloc[target](MB, ctx)
+    var g = talloc[target](MB, ctx)
+    var sq = talloc[target](MB, ctx)
+    var gin = talloc[target](MB * CIN, ctx)
+    for ep in range(SM_CRITIC_EPOCHS):
+        var perm: List[Int]
+        if len(perms) == 0:
+            perm = sm_random_perm(ROWS)
+        else:
+            perm = List[Int](length=ROWS, fill=0)
+            for i in range(ROWS):
+                perm[i] = perms[ep * ROWS + i]
+        for i in range(ROWS):
+            idx.data[i] = Scalar[DT](perm[i])          # exact below 2^24 rows
+        comptime if target == "gpu":
+            idx.upload_resident(ctx.value())
+        for mbi in range(SM_CRITIC_MB):
+            sm_mb_gather[target](ctx, MB, CIN, tp[target](idx).unsafe_offset(mbi * MB), tp[target](X), tp[target](targets), tp[target](xin), tp[target](y))
+            critic.forward[target, MB](TensorRefs[1, _, DT](xin), pred, ctx)
+            sm_mse[target](ctx, MB, tp[target](pred), tp[target](y), tp[target](g), tp[target](sq))
+            critic.zero_grad[target](ctx)
+            critic.vjp[target, MB](TensorRefs[1, _, DT](xin), g, TensorRefs[1, _, DT](gin), ctx)
+            comptime if target == "gpu":
+                opt.clip_grads_device[target](critic, Scalar[DT](SM_CRITIC_CLIP), ctx)
+            else:
+                _ = clip_grad_norm[target](critic, Scalar[DT](SM_CRITIC_CLIP), ctx)
+            opt.step[target](critic, ctx)
+    comptime if target == "gpu":
+        values.download_enqueue(ctx.value())
+        targets.download_enqueue(ctx.value())
+        sq.download_enqueue(ctx.value())
+        ctx.value().synchronize()
+        values.download_finalize()
+        targets.download_finalize()
+        sq.download_finalize()
+    var last = 0.0
+    for i in range(MB):
+        last += Float64(sq.data[i]) / Float64(MB)
+    values_out = List[Float64](length=(H + 1) * N, fill=0.0)
+    for i in range((H + 1) * N):
+        values_out[i] = Float64(values.data[i])
+    targets_out = List[Float64](length=ROWS, fill=0.0)
+    for i in range(ROWS):
+        targets_out[i] = Float64(targets.data[i])
+    var vm = 0.0
+    for i in range(len(values_out)):
+        vm += values_out[i]
+    var tm = 0.0
+    for i in range(len(targets_out)):
+        tm += targets_out[i]
+    return SMCriticFit(last, vm / Float64(len(values_out)), tm / Float64(len(targets_out)))
+
+
 struct CriticFitStep[C: SMConfigT](Movable):
     """On "gpu" the optimiser adopts the critic into its arena at the first
     step: its 20 clips per update stay on the device."""
@@ -87,70 +169,10 @@ struct CriticFitStep[C: SMConfigT](Movable):
                 self.opt.adopt[target](critic, ctx)
                 self.adopted = True
         comptime R = Self.C.ROBOT
-        comptime D = SMDims[R]
-        comptime CIN = D.CRITIC_IN
-        comptime ROWS = H * N
-        comptime MB = ROWS // SM_CRITIC_MB
-        comptime assert ROWS % SM_CRITIC_MB == 0, "H·N must split into the critic's 4 minibatches"
-        # inputs, detached; V on every imagined state
+        comptime CIN = SMDims[R].CRITIC_IN
+        # inputs, detached
         var X = talloc[target]((H + 1) * N * CIN, ctx)
         sm_critic_in[target, R](ctx, (H + 1) * N, N, tp[target](o.states), tp[target](ib.goals), tp[target](ib.xi), tp[target](o.e_root), tp[target](X))
-        var values = talloc[target]((H + 1) * N, ctx)
-        critic.forward[target, (H + 1) * N](TensorRefs[1, _, DT](X), values, ctx)
-        var targets = talloc[target](ROWS, ctx)
-        sm_gae[target](ctx, N, H, Scalar[DT](gamma), Scalar[DT](SM_GAE_LAMBDA), tp[target](values), tp[target](o.rewards), tp[target](o.dhat), tp[target](targets))
-        # the fit, rows t < H
-        var idx = TensorImpl[DT].alloc(ROWS)
-        var xin = talloc[target](MB * CIN, ctx)
-        var y = talloc[target](MB, ctx)
-        var pred = talloc[target](MB, ctx)
-        var g = talloc[target](MB, ctx)
-        var sq = talloc[target](MB, ctx)
-        var gin = talloc[target](MB * CIN, ctx)
-        for ep in range(SM_CRITIC_EPOCHS):
-            var perm: List[Int]
-            if len(perms) == 0:
-                perm = sm_random_perm(ROWS)
-            else:
-                perm = List[Int](length=ROWS, fill=0)
-                for i in range(ROWS):
-                    perm[i] = perms[ep * ROWS + i]
-            for i in range(ROWS):
-                idx.data[i] = Scalar[DT](perm[i])          # exact below 2^24 rows
-            comptime if target == "gpu":
-                idx.upload_resident(ctx.value())
-            for mbi in range(SM_CRITIC_MB):
-                sm_mb_gather[target](ctx, MB, CIN, tp[target](idx).unsafe_offset(mbi * MB), tp[target](X), tp[target](targets), tp[target](xin), tp[target](y))
-                critic.forward[target, MB](TensorRefs[1, _, DT](xin), pred, ctx)
-                sm_mse[target](ctx, MB, tp[target](pred), tp[target](y), tp[target](g), tp[target](sq))
-                critic.zero_grad[target](ctx)
-                critic.vjp[target, MB](TensorRefs[1, _, DT](xin), g, TensorRefs[1, _, DT](gin), ctx)
-                comptime if target == "gpu":
-                    self.opt.clip_grads_device[target](critic, Scalar[DT](SM_CRITIC_CLIP), ctx)
-                else:
-                    _ = clip_grad_norm[target](critic, Scalar[DT](SM_CRITIC_CLIP), ctx)
-                self.opt.step[target](critic, ctx)
-        comptime if target == "gpu":
-            values.download_enqueue(ctx.value())
-            targets.download_enqueue(ctx.value())
-            sq.download_enqueue(ctx.value())
-            ctx.value().synchronize()
-            values.download_finalize()
-            targets.download_finalize()
-            sq.download_finalize()
-        var last = 0.0
-        for i in range(MB):
-            last += Float64(sq.data[i]) / Float64(MB)
-        values_out = List[Float64](length=(H + 1) * N, fill=0.0)
-        for i in range((H + 1) * N):
-            values_out[i] = Float64(values.data[i])
-        targets_out = List[Float64](length=ROWS, fill=0.0)
-        for i in range(ROWS):
-            targets_out[i] = Float64(targets.data[i])
-        var vm = 0.0
-        for i in range(len(values_out)):
-            vm += values_out[i]
-        var tm = 0.0
-        for i in range(len(targets_out)):
-            tm += targets_out[i]
-        return SMCriticFit(last, vm / Float64(len(values_out)), tm / Float64(len(targets_out)))
+        return sm_value_fit[target, CIN, Self.C.CRIT1, Self.C.CRIT2, N, H](
+            critic, self.opt, X, tp[target](o.rewards), tp[target](o.dhat), gamma, perms, values_out, targets_out, ctx
+        )

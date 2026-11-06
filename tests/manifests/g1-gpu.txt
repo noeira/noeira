@@ -10,6 +10,7 @@
 # ⚠ A GPU-vs-CPU band written on Metal is a TF32 trap on CUDA: compare weights
 # bit-for-bit first if a 5090 run lands outside it.
 tests/deep_agents/supermimic/test_supermimic_gpu.mojo
+tests/deep_agents/supermimic/test_supermimic_prompt_gpu.mojo
 # The device episodic ring against the CPU ring (masks exact, gathers
 # bit-identical, draws all eligible).
 tests/deep_agents/data/test_episodic_replay_gpu.mojo

@@ -208,6 +208,11 @@ trait TrackingRobot:
         ...
 
     @staticmethod
+    def hand_bodies() -> List[String]:
+        """Left, then right: the bodies the prompt reward places (`prompt.mojo`)."""
+        ...
+
+    @staticmethod
     def default_joint_pos(j: Int) -> Float64:
         ...
 
@@ -475,6 +480,10 @@ struct G1Robot(TrackingRobot):
         return "torso_link"
 
     @staticmethod
+    def hand_bodies() -> List[String]:
+        return ["left_wrist_yaw_link", "right_wrist_yaw_link"]
+
+    @staticmethod
     def default_joint_pos(j: Int) -> Float64:
         return g1_default_pos(j)
 
@@ -680,6 +689,10 @@ struct G1MjlabRobot(TrackingRobot):
     @staticmethod
     def com_body() -> String:
         return "torso_link"
+
+    @staticmethod
+    def hand_bodies() -> List[String]:
+        return ["left_wrist_yaw_link", "right_wrist_yaw_link"]
 
     @staticmethod
     def default_joint_pos(j: Int) -> Float64:

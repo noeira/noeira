@@ -26,14 +26,17 @@ struct WorldModelUpdateStep[C: SMConfigT](Movable):
     (`opt.read_clip_norm` reads it)."""
     var opt: Adam
     var adopted: Bool
+    var w_term: Float64       # the termination BCE's weight (Eq. 1: 1)
 
     def __init__(out self):
         self.opt = Adam(lr=Scalar[DT](Self.C.DEF_LR))
         self.adopted = False
+        self.w_term = 1.0
 
     def __init__(out self, *, deinit move: Self):
         self.opt = move.opt^
         self.adopted = move.adopted
+        self.w_term = move.w_term
 
     def step[target: StaticString, B: Int](
         mut self, mut wm: SMWorldModelOf[Self.C], mut w: SMWindowBatch[Self.C.ROBOT], ctx: Optional[DeviceContext] = None
@@ -45,7 +48,7 @@ struct WorldModelUpdateStep[C: SMConfigT](Movable):
                 self.opt.adopt[target](wm, ctx)
                 self.adopted = True
         wm.zero_grad[target](ctx)
-        var l = sm_wm_window_loss[Self.C.ROBOT, Self.C.WM_H, Self.C.TERM_H, B, target](wm, w, True, ctx=ctx)
+        var l = sm_wm_window_loss[Self.C.ROBOT, Self.C.WM_H, Self.C.TERM_H, B, target](wm, w, True, self.w_term, ctx)
         var gn: Float64
         comptime if target == "gpu":
             self.opt.clip_grads_device[target](wm, Scalar[DT](SM_WM_CLIP), ctx)

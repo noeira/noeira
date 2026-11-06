@@ -56,6 +56,7 @@ from noeira.deep_agents.supermimic.motion_library import (
     SM_REF_SCRATCH, SMEpisodeLog, SMMotionLibrary, SMResetSampler, sm_goal_window_lane, sm_reference_row_lane,
 )
 from noeira.deep_agents.supermimic.policy import sm_obs_noise_half
+from noeira.deep_agents.supermimic.prompt import SMSpec, sm_prompt_fell, sm_prompt_reward_lane
 from noeira.deep_agents.supermimic.robot import SMDims, TrackingBatchedSim, TrackingRobot
 from noeira.deep_agents.supermimic.tables import SMTables, sm_tables
 from noeira.nn.constants import DT
@@ -130,8 +131,31 @@ def _k_act[n: Int](nl: Int64, seed: UInt32, std: Scalar[DT], a: FP[DT], ae: FP[D
     ae[unsafe_offset=i] = a[unsafe_offset=i] + (std * _randn(seed, l, j) if std > 0 else Scalar[DT](0))
 
 
+def _k_prompt_r[R: TrackingRobot](
+    nl: Int64, from_lane: Int64, tree: FP[DT], table: FP[DT], qpos: FP[DT], qvel: FP[DT],
+    a: FP[DT], a_last: FP[DT], spec: FP[DT], s: FP[DT], scratch: FP[DT], out_r: FP[DT],
+):
+    """A prompt lane's task reward, before `_k_post` overwrites `a_last`; its
+    FK and atoms land in the heads' scratch, which `_k_post` rewrites."""
+    comptime D = SMDims[R]
+    comptime n = R.NDOF
+    comptime SC = SMEnvGpuScratch[R]
+    var l = Int(global_idx.x)
+    if l >= Int(nl) or l < Int(from_lane):
+        return
+    var sl = s.unsafe_offset(l * D.S)
+    for k in range(R.NQ):
+        sl[unsafe_offset=k] = qpos[unsafe_offset=l * R.NQ + k]
+    for k in range(R.NV):
+        sl[unsafe_offset=R.NQ + k] = qvel[unsafe_offset=l * R.NV + k]
+    out_r[unsafe_offset=l] = sm_prompt_reward_lane[DT, R](
+        tree, table, sl, a.unsafe_offset(l * n), a_last.unsafe_offset(l * n), spec.unsafe_offset(l * SMSpec.SIZE),
+        scratch.unsafe_offset(l * SC.SIZE),
+    )
+
+
 def _k_post[R: TrackingRobot](
-    nl: Int64, max_steps: Int64, tree: FP[DT], table: FP[DT], rows: FP[DT], qpos: FP[DT], qvel: FP[DT],
+    nl: Int64, max_steps: Int64, prompt_from: Int64, tree: FP[DT], table: FP[DT], rows: FP[DT], qpos: FP[DT], qvel: FP[DT],
     a: FP[DT], s: FP[DT], a_last: FP[DT], xi: FP[DT], scratch: FP[DT],
     frame: FPi, prev_frame: FPi, ep_len: FPi, flags: FPi,
     out_r: FP[DT], out_i: FPi, rd: FP[DT], meta: FPi, mask: FP[DT], out_terms: FP[DT],
@@ -162,6 +186,8 @@ def _k_post[R: TrackingRobot](
     )
     var fl = flags[unsafe_offset=l]
     var terminated = abs(sc[unsafe_offset=SC.FEAT]) > Scalar[DT](SM_HEIGHT_TERM) or abs(sc[unsafe_offset=SC.FEAT + 1]) > Scalar[DT](SM_TILT_TERM)
+    if l >= Int(prompt_from):
+        terminated = sm_prompt_fell[DT](sl)
     var clip_end = (fl & LF_CLIP_END) != 0
     var ending = terminated or (max_steps > 0 and Int(el) >= Int(max_steps)) or clip_end
     for k in range(SM_N_TERMS):
@@ -352,6 +378,8 @@ struct SMTrackingEnvGpu[R: TrackingRobot, BS: TrackingBatchedSim](Movable):
     var max_episode_steps: Int               # 0: no cap (the evaluation)
     var next_frame: List[Int]                # ≥ 0: the lane's next reset frame instead of a draw
     var out_terms: TensorImpl[DT]            # [N · 8] the last step's weighted reward terms
+    var prompt_from: Int                     # lanes from here on run a prompt interface (`env.mojo`)
+    var prompt_r: TensorImpl[DT]             # [N] their task reward (`step` given `specs`)
 
     def __init__(
         out self, ctx: DeviceContext, var lib: SMMotionLibrary[Self.R], var sim: Self.BS,
@@ -407,6 +435,8 @@ struct SMTrackingEnvGpu[R: TrackingRobot, BS: TrackingBatchedSim](Movable):
         self.max_episode_steps = max_episode_steps
         self.next_frame = List[Int](length=NL, fill=-1)
         self.out_terms = talloc["gpu"](NL * SM_N_TERMS, ctx)
+        self.prompt_from = NL
+        self.prompt_r = talloc["gpu"](NL, ctx)
         # the foot geoms' bodies (the per-lane friction overrides are by body)
         var fb = List[Int]()
         for g in self.tables.feet:
@@ -490,6 +520,8 @@ struct SMTrackingEnvGpu[R: TrackingRobot, BS: TrackingBatchedSim](Movable):
         self.max_episode_steps = move.max_episode_steps
         self.next_frame = move.next_frame^
         self.out_terms = move.out_terms^
+        self.prompt_from = move.prompt_from
+        self.prompt_r = move.prompt_r^
 
     def num_lanes(self) -> Int:
         return Self.BS.N
@@ -581,8 +613,11 @@ struct SMTrackingEnvGpu[R: TrackingRobot, BS: TrackingBatchedSim](Movable):
             grid_dim=ceildiv(Self.BS.N, _TPB), block_dim=_TPB,
         )
 
-    def step(mut self, ctx: DeviceContext, mut actions: TensorImpl[DT], mut rb: SMReplayGpuOf[Self.R]) raises -> SMStepInfo:
-        """One control step for every lane; `actions` [N·n] (clean, device)."""
+    def step(
+        mut self, ctx: DeviceContext, mut actions: TensorImpl[DT], mut rb: SMReplayGpuOf[Self.R], specs: Optional[FP[DT]] = None,
+    ) raises -> SMStepInfo:
+        """One control step for every lane; `actions` [N·n] (clean, device).
+        Prompt lanes as in `env.mojo`: `specs` [N·SPEC] on the device."""
         comptime NL = Self.BS.N
         comptime n = Self.R.NDOF
         comptime D = SMDims[Self.R]
@@ -593,9 +628,16 @@ struct SMTrackingEnvGpu[R: TrackingRobot, BS: TrackingBatchedSim](Movable):
             grid_dim=ceildiv(NL * n, _TPB), block_dim=_TPB,
         )
         self.sim.control_step(ctx, tp["gpu"](self.a_exec), tp["gpu"](self.xi).unsafe_offset(1), D.X, UInt64(_seed(st, RNG_ACT, self.seed_base)))
+        if specs:
+            ctx.enqueue_function[_k_prompt_r[Self.R]](
+                Int64(NL), Int64(self.prompt_from), self.tables.tree_p["gpu"](), self.tables.head_p["gpu"](),
+                self.sim.qpos_ptr(), self.sim.qvel_ptr(), tp["gpu"](actions), tp["gpu"](self.a_last), specs.value(),
+                tp["gpu"](self.s), tp["gpu"](self.scratch), tp["gpu"](self.prompt_r),
+                grid_dim=ceildiv(NL, _TPB), block_dim=_TPB,
+            )
         # 2.–4. reward, termination, the replay rows
         ctx.enqueue_function[_k_post[Self.R]](
-            Int64(NL), Int64(self.max_episode_steps), self.tables.tree_p["gpu"](), self.tables.head_p["gpu"](), mptr(self.lib.rows_dev.value().unsafe_ptr()),
+            Int64(NL), Int64(self.max_episode_steps), Int64(self.prompt_from), self.tables.tree_p["gpu"](), self.tables.head_p["gpu"](), mptr(self.lib.rows_dev.value().unsafe_ptr()),
             self.sim.qpos_ptr(), self.sim.qvel_ptr(), tp["gpu"](actions), tp["gpu"](self.s), tp["gpu"](self.a_last),
             tp["gpu"](self.xi), tp["gpu"](self.scratch),
             mptr(self.frame.unsafe_ptr()), mptr(self.prev_frame.unsafe_ptr()), mptr(self.ep_len.unsafe_ptr()), mptr(self.flags.unsafe_ptr()),
@@ -626,12 +668,15 @@ struct SMTrackingEnvGpu[R: TrackingRobot, BS: TrackingBatchedSim](Movable):
             self.h_out_i[2 * l + 1] = stt
             self.last_reward[l] = r
             rsum += r
-            self.logs[l].log(r, self.lib.bin_of_frame(f), SM_MAX_LOGGED)
+            var tracker_lane = l < self.prompt_from
+            if tracker_lane:
+                self.logs[l].log(r, self.lib.bin_of_frame(f), SM_MAX_LOGGED)
             if (stt & ST_ENDING) != 0:
                 var term = (stt & ST_TERMINATED) != 0
                 self.logs[l].terminated = term
                 self.logs[l].clip_end = (stt & ST_CLIP_END) != 0
-                ending.append(self.logs[l].copy())
+                if tracker_lane:
+                    ending.append(self.logs[l].copy())
                 lanes.append(l)
                 if term:
                     n_term += 1

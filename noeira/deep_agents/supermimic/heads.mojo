@@ -76,14 +76,16 @@ comptime T_JOINT_LIMIT: Int = 7
 
 struct SMHeadLayout[R: TrackingRobot]:
     """The heads' per-robot table (built by `tables.sm_tables`):
-    [anchor slot | tracked FK rows (n_tracked) | q0 (n) | soft lo (n) | soft hi (n)].
-    The anchor slot is the anchor's index in the tracked list."""
+    [anchor slot | tracked FK rows (n_tracked) | q0 (n) | soft lo (n) | soft hi (n)
+    | hand FK rows (2)]. The anchor slot is the anchor's index in the tracked
+    list; the hands are read by the prompt interface's reward (`prompt.mojo`)."""
     comptime ANCHOR = 0
     comptime TRACKED = 1
     comptime Q0 = 1 + Self.R.N_TRACKED
     comptime LO = Self.Q0 + Self.R.NDOF
     comptime HI = Self.LO + Self.R.NDOF
-    comptime SIZE = Self.HI + Self.R.NDOF
+    comptime HANDS = Self.HI + Self.R.NDOF
+    comptime SIZE = Self.HANDS + 2
     # per-lane scratch: the FK block (pos 3 | quat 4 | lin 3 | ang 3 per body),
     # the same for its cotangents, then ∂/∂qpos, ∂/∂qvel
     comptime SCRATCH = 2 * SMDims[Self.R].FK_BLOCK + Self.R.NQ + Self.R.NV

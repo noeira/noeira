@@ -100,9 +100,10 @@ struct SMImagOut[R: TrackingRobot](Movable):
     """Per-step results, t-major, on the rollout's target: states
     [(H+1)·n·S], actions [H·n·NDOF], rewards [H·n] (r_{t+1}), dhat [(H+1)·n]
     (d_0 = 0), survival [(H+1)·n], e_root [(H+1)·n·4], value_h [n]; and the
-    objective (host scalars)."""
+    objective (host scalars; `align_mse` is the prompt interface's, 0 here)."""
     var j: Float64
     var return_undisc: Float64
+    var align_mse: Float64
     var states: TensorImpl[DT]
     var actions: TensorImpl[DT]
     var rewards: TensorImpl[DT]
@@ -115,6 +116,7 @@ struct SMImagOut[R: TrackingRobot](Movable):
         """Host tensors."""
         self.j = 0
         self.return_undisc = 0
+        self.align_mse = 0
         self.states = TensorImpl[DT].alloc((h + 1) * n * SMDims[Self.R].S)
         self.actions = TensorImpl[DT].alloc(h * n * Self.R.NDOF)
         self.rewards = TensorImpl[DT].alloc(h * n)
@@ -127,6 +129,7 @@ struct SMImagOut[R: TrackingRobot](Movable):
         """Device tensors when `ctx` is given, host tensors otherwise."""
         self.j = 0
         self.return_undisc = 0
+        self.align_mse = 0
         self.states = _alloc((h + 1) * n * SMDims[Self.R].S, ctx)
         self.actions = _alloc(h * n * Self.R.NDOF, ctx)
         self.rewards = _alloc(h * n, ctx)
@@ -138,6 +141,7 @@ struct SMImagOut[R: TrackingRobot](Movable):
     def __init__(out self, *, deinit move: Self):
         self.j = move.j
         self.return_undisc = move.return_undisc
+        self.align_mse = move.align_mse
         self.states = move.states^
         self.actions = move.actions^
         self.rewards = move.rewards^

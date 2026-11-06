@@ -8,7 +8,7 @@ What they hold, for the per-lane functions:
     tree   the FK table (`kinematics.sm_fk_tree`)
     head   the heads' table (`heads.SMHeadLayout[R]`): anchor slot, tracked
            FK rows, q0, soft joint limits (mjlab's: the range shrunk about
-           its midpoint by the robot's factor)
+           its midpoint by the robot's factor), the hands' FK rows
     feet   the collision geoms on the foot bodies or their descendants
     com    the body whose CoM offset is randomised; root, its FK row
 
@@ -126,6 +126,11 @@ def sm_tables[dt: DType, R: TrackingRobot](sim: R.SIM, q0: List[Float64]) raises
         head[L.Q0 + j] = Scalar[dt](q0[j])
         head[L.LO + j] = Scalar[dt](lim[0])
         head[L.HI + j] = Scalar[dt](lim[1])
+    var hands = sm_body_ids[R](R.hand_bodies())
+    if len(hands) != 2:
+        raise Error("sm_tables: the robot declares " + String(len(hands)) + " hand bodies, the prompt reward reads 2")
+    head[L.HANDS] = Scalar[dt](hands[0] - 1)
+    head[L.HANDS + 1] = Scalar[dt](hands[1] - 1)
     # the feet: colliding geoms on a foot body or any body below one
     var foot_ids = sm_body_ids[R](R.foot_bodies())
     var feet = List[Int]()

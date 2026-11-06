@@ -141,15 +141,16 @@ def _start_ok(e: Int, t: Int, hist: Int, T: Int, ptr_e: Int, flags: FPi) -> Bool
     return (fi & FLAG_VALID) != 0 and (fi & FLAG_TERMINAL) == 0 and _dist(ptr_e, t, T) < T - hist - 1
 
 
-def _k_compact(E: Int64, T: Int64, k: Int64, starts: Int64, ptr: FPi, epid: FPi, flags: FPi, elig: FPi, count: FPi):
-    """Env e's eligible rows, in order, into elig[e·T :]; their number into count[e]."""
+def _k_compact(E: Int64, T: Int64, k: Int64, starts: Int64, first: Int64, ptr: FPi, epid: FPi, flags: FPi, elig: FPi, count: FPi):
+    """Env e's eligible rows, in order, into elig[e·T :]; their number into
+    count[e]. Envs below `first` have none."""
     var e = Int(global_idx.x)
     if e >= Int(E):
         return
     var t_ = Int(T)
     var pe = Int(ptr[unsafe_offset=e])
     var c = 0
-    for t in range(t_):
+    for t in range(t_ if e >= Int(first) else 0):
         var ok = _start_ok(e, t, Int(k), t_, pe, flags) if starts != 0 else _window_ok(e, t, Int(k), t_, pe, epid, flags)
         if ok:
             elig[unsafe_offset=e * t_ + c] = Int32(e * t_ + t)
@@ -362,9 +363,9 @@ struct EpisodicReplayGpu[S_: Int, A_: Int, X_: Int](Movable):
             grid_dim=_grid(self.E), block_dim=_TPB,
         )
 
-    def _eligible(mut self, ctx: DeviceContext, k: Int, starts: Bool) raises:
+    def _eligible(mut self, ctx: DeviceContext, k: Int, starts: Bool, first_env: Int = 0) raises:
         ctx.enqueue_function[_k_compact](
-            Int64(self.E), Int64(self.T), Int64(k), Int64(1 if starts else 0), mptr(self.ptr.unsafe_ptr()),
+            Int64(self.E), Int64(self.T), Int64(k), Int64(1 if starts else 0), Int64(first_env), mptr(self.ptr.unsafe_ptr()),
             mptr(self.ep_id.unsafe_ptr()), mptr(self.flags.unsafe_ptr()), mptr(self.elig.unsafe_ptr()),
             mptr(self.count.unsafe_ptr()), grid_dim=_grid(self.E), block_dim=_TPB,
         )
@@ -376,9 +377,10 @@ struct EpisodicReplayGpu[S_: Int, A_: Int, X_: Int](Movable):
         self._eligible(ctx, k, False)
         self._draw(ctx, n, seed, idx)
 
-    def sample_starts(mut self, ctx: DeviceContext, hist: Int, n: Int, seed: UInt64, idx: FPi) raises:
-        """n flat rows where a start with an h-row history may be drawn."""
-        self._eligible(ctx, hist, True)
+    def sample_starts(mut self, ctx: DeviceContext, hist: Int, n: Int, seed: UInt64, idx: FPi, first_env: Int = 0) raises:
+        """n flat rows where a start with an h-row history may be drawn, from
+        envs `first_env` on."""
+        self._eligible(ctx, hist, True, first_env)
         self._draw(ctx, n, seed, idx)
 
     def _draw(mut self, ctx: DeviceContext, n: Int, seed: UInt64, idx: FPi) raises:

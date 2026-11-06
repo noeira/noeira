@@ -40,6 +40,17 @@ Layout (SAC's pattern):
     motion_library.mojo the reference library and the reset sampler
     env.mojo            the tracking env, one `R.SIM` lane per env
     env_gpu.mojo        the tracking env on a batched device simulator
+
+The prompt interface (a downstream interface on a frozen tracker, the paper's
+Appendix B and G; `noeira-docs/SUPERMIMIC_BFM_HYBRID_PLAN.md` §0):
+    prompt.mojo         the task reward over a spec, the fall logit, their VJP
+    prompt_policy.mojo  SMPromptConfigT, the prompt encoder and its critic
+    prompt_lanes.mojo   the scan's per-lane phases
+    prompt_imagination.mojo  the rollout through the frozen decoder, −J/H's gradient
+    prompt_bank.mojo    an interface's data: reference commands, the command bank, z
+    prompt_trainer.mojo SMPromptTrainer: a tracker, frozen, and the two new networks
+    prompt_agent.mojo   the loop on the CPU env (smoke scale)
+    prompt_agent_gpu.mojo  the loop on the device env
 The replay is the shared `deep_agents.data.EpisodicReplay` (host) or
 `EpisodicReplayGpu` (device).
 """
@@ -50,3 +61,5 @@ from .agent import SuperMimicAgent, SMSchedule, sm_agent, sm_schedule
 from .agent_gpu import SuperMimicAgentGpu, sm_agent_gpu
 from .metrics import SMMetrics
 from .trainer import SuperMimicTrainer, SMUpdateMetrics
+from .prompt_policy import SMPromptConfigT, SMPromptConfig
+from .prompt_trainer import SMPromptTrainer

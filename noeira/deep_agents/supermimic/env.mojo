@@ -52,6 +52,7 @@ from noeira.deep_agents.supermimic.motion_library import (
     SMEpisodeLog, SMMotionLibrary, SMResetSampler,
 )
 from noeira.deep_agents.supermimic.policy import sm_obs_noise_half
+from noeira.deep_agents.supermimic.prompt import SMPromptScratch, SMSpec, sm_prompt_fell, sm_prompt_reward_lane
 from noeira.deep_agents.supermimic.robot import SMDims, TrackingRobot, TrackingSim
 from noeira.deep_agents.supermimic.tables import SMTables, sm_soft_limits, sm_tables
 from noeira.nn.constants import DT
@@ -227,6 +228,8 @@ struct SMTrackingEnv[R: TrackingRobot](Movable):
     var terminations: Bool          # False: a failing lane keeps running to its clip's end (viewers only)
     var max_episode_steps: Int      # 0: no cap (the evaluation: the clip's end decides)
     var next_frame: List[Int]       # ≥ 0: the lane's next reset frame instead of a draw
+    var prompt_from: Int            # lanes from here on run a prompt interface: fall-only termination, no sampler log
+    var last_prompt_r: List[Float64]  # their task reward (`step` given `specs`)
 
     def __init__(
         out self, n: Int, var lib: SMMotionLibrary[Self.R], dr: Bool = True, obs_noise: Bool = True,
@@ -236,6 +239,8 @@ struct SMTrackingEnv[R: TrackingRobot](Movable):
         seed(rng_seed)
         self.max_episode_steps = max_episode_steps
         self.next_frame = List[Int](length=n, fill=-1)
+        self.prompt_from = n
+        self.last_prompt_r = List[Float64](length=n, fill=0.0)
         self.lanes = List[SMLane[Self.R]]()
         for _ in range(n):
             self.lanes.append(SMLane[Self.R]())
@@ -296,6 +301,8 @@ struct SMTrackingEnv[R: TrackingRobot](Movable):
         self.terminations = move.terminations
         self.max_episode_steps = move.max_episode_steps
         self.next_frame = move.next_frame^
+        self.prompt_from = move.prompt_from
+        self.last_prompt_r = move.last_prompt_r^
 
     def num_lanes(self) -> Int:
         return len(self.lanes)
@@ -432,8 +439,13 @@ struct SMTrackingEnv[R: TrackingRobot](Movable):
                 hist.data[i * D.HIST * D.OBS + k] = self.lanes[i].hist[k]
             self.lib.goal_window(self.lanes[i].frame, goals.data.unsafe_ptr().unsafe_offset(i * D.GOAL).as_unsafe_any_origin())
 
-    def step(mut self, actions: List[Scalar[DT]], mut rb: SMReplayOf[Self.R]) raises -> SMStepInfo:
-        """One control step for every lane; `actions` is [L·n] (clean)."""
+    def step(
+        mut self, actions: List[Scalar[DT]], mut rb: SMReplayOf[Self.R], specs: Optional[FP[DT]] = None,
+    ) raises -> SMStepInfo:
+        """One control step for every lane; `actions` is [L·n] (clean). Lanes
+        from `prompt_from` on terminate on a fall alone, stay out of the reset
+        sampler, and with `specs` [L·SPEC] report their task reward in
+        `last_prompt_r`."""
         comptime D = SMDims[Self.R]
         comptime n = Self.R.NDOF
         var nl = len(self.lanes)
@@ -450,6 +462,7 @@ struct SMTrackingEnv[R: TrackingRobot](Movable):
         var rf = List[Scalar[DT]](length=D.REF, fill=0)
         var a_cmd = List[Float64](length=n, fill=0.0)
         var bias = List[Float64](length=n, fill=0.0)
+        var ps = List[Scalar[DT]](length=SMPromptScratch[Self.R].SIZE, fill=0)
         for i in range(nl):
             ref ln = self.lanes[i]
             # 1. the executed action through the PD (bias folded into the target)
@@ -475,7 +488,16 @@ struct SMTrackingEnv[R: TrackingRobot](Movable):
                 terms.unsafe_ptr().as_unsafe_any_origin(), feat.unsafe_ptr().as_unsafe_any_origin(),
                 obs_tmp.unsafe_ptr().as_unsafe_any_origin(), scratch.unsafe_ptr().as_unsafe_any_origin(),
             )
+            var prompt_lane = i >= self.prompt_from
             var violated = abs(Float64(feat[0])) > SM_HEIGHT_TERM or abs(Float64(feat[1])) > SM_TILT_TERM
+            if prompt_lane:
+                violated = sm_prompt_fell[DT](ln.s.unsafe_ptr().as_unsafe_any_origin())
+                if specs:
+                    self.last_prompt_r[i] = Float64(sm_prompt_reward_lane[DT, Self.R](
+                        self.tables.tree_ptr(), self.tables.head_ptr(), ln.s.unsafe_ptr().as_unsafe_any_origin(),
+                        a_now.unsafe_ptr().as_unsafe_any_origin(), ln.a_last.unsafe_ptr().as_unsafe_any_origin(),
+                        specs.value().unsafe_offset(i * SMSpec.SIZE), ps.unsafe_ptr().as_unsafe_any_origin(),
+                    ))
             # ⚠ `terminations` off is for watching a failure play out (the
             # motion picker): the lane runs on past a state no training
             # episode ever reached, and its return is not the benchmark's.
@@ -486,7 +508,8 @@ struct SMTrackingEnv[R: TrackingRobot](Movable):
             self.last_terminated[i] = terminated
             rsum += Float64(r)
             # the sampler's per-step log, with f_t's bin
-            ln.log.log(Float64(r), self.lib.bin_of_frame(ln.frame), SM_MAX_LOGGED)
+            if not prompt_lane:
+                ln.log.log(Float64(r), self.lib.bin_of_frame(ln.frame), SM_MAX_LOGGED)
             for j in range(n):
                 ln.a_last[j] = a_now[j]
             if terminated or time_out:
@@ -501,7 +524,8 @@ struct SMTrackingEnv[R: TrackingRobot](Movable):
                 rb.end_episode(i)
                 ln.log.terminated = terminated
                 ln.log.clip_end = ln.clip_end
-                ending.append(ln.log.copy())
+                if not prompt_lane:
+                    ending.append(ln.log.copy())
                 resets.append(i)
                 if terminated:
                     n_term += 1

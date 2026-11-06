@@ -115,6 +115,13 @@ tests/deep_agents/supermimic/test_supermimic_wm.mojo /tmp/sm_wm
 #   uv run --no-project --python 3.12 --with torch --with mujoco==3.12.0 \
 #       --with numpy python tools/supermimic/imag_oracle.py --out /tmp/sm_imag
 tests/deep_agents/supermimic/test_supermimic_imag.mojo /tmp/sm_imag
+# The prompt interface (`deep_agents/supermimic/prompt*.mojo`). The oracle is a
+# second implementation of the reward, numpy + MuJoCo, no torch:
+#   uv run --no-project --python 3.12 --with mujoco==3.12.0 --with numpy \
+#       python tools/supermimic/prompt_oracle.py --out /tmp/sm_prompt
+tests/deep_agents/supermimic/test_supermimic_prompt.mojo /tmp/sm_prompt
+tests/deep_agents/supermimic/test_supermimic_prompt_imag.mojo
+tests/deep_agents/supermimic/test_supermimic_prompt_data.mojo
 # SuperMimic M2: the motion library (bins, goal window, reference rows by our
 # FK) and the return-based reset sampler, against the reproduction's
 # MotionLibrary and MultiClipMotionCommand:
