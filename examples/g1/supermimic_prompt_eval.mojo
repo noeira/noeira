@@ -206,8 +206,9 @@ def suite[E: EvalEnv](mut e: E, mut tr: Trainer, tasks: List[SMEvalTask], frames
     """The suite, and the honesty probe at step `HONEST_T0` on the same lanes."""
     var nt = len(tasks)
     var task_of = List[Int](length=LANES, fill=0)
-    var cmds = talloc[TARGET](LANES * CMD, tr.base.ctx)
-    var specs = talloc[TARGET](LANES * SMSpec.SIZE, tr.base.ctx)
+    # host-filled: `step` uploads them (`talloc` on the device has no host list)
+    var cmds = TensorImpl[DT].alloc(LANES * CMD)
+    var specs = TensorImpl[DT].alloc(LANES * SMSpec.SIZE)
     for l in range(LANES):
         var k = l % nt
         task_of[l] = k
@@ -274,8 +275,9 @@ def step_test[E: EvalEnv](mut e: E, mut tr: Trainer, cmd_of: List[Scalar[DT]], f
     """Appendix G.2. `cmd_of` [672·CMD]: the interface's command for each."""
     var cl = sm_step_commands()
     var nc = min(len(cl), LANES // 4)
-    var cmds = talloc[TARGET](LANES * CMD, tr.base.ctx)
-    var specs = talloc[TARGET](LANES * SMSpec.SIZE, tr.base.ctx)
+    # host-filled: `step` uploads them (`talloc` on the device has no host list)
+    var cmds = TensorImpl[DT].alloc(LANES * CMD)
+    var specs = TensorImpl[DT].alloc(LANES * SMSpec.SIZE)
     for l in range(LANES):
         var k = (l // 4) % nc
         for i in range(CMD):

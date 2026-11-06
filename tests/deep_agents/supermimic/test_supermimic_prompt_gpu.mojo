@@ -6,8 +6,8 @@
 Same weights, same batch, small networks: the CPU path carries the oracle and
 finite-difference gates (`test_supermimic_prompt`, `test_supermimic_prompt_imag`),
 this one that the kernels compute the same thing. Bands as `test_supermimic_gpu`:
-vectors by cosine ≥ 0.99999 and max error ≤ 1e-4 of the largest; weights after a
-step by the elements that moved.
+vectors by cosine ≥ 0.99999 and max error ≤ 1e-4 of the largest; an optimiser's
+steps by the elements that moved.
 
 [1] the rollout: states, actions, rewards, survival, J, the alignment's MSE.
 [2] −J/H's gradient over the encoder.
@@ -98,6 +98,73 @@ def _lists(name: String, a: List[List[Scalar[DT]]], b: List[List[Scalar[DT]]], m
     _flat(name, fa, fb, tl)
 
 
+def _floats(name: String, a: List[Float64], b: List[Float64], mut tl: Tally):
+    var big = 1e-30
+    var err = 0.0
+    for i in range(len(a)):
+        big = max(big, abs(a[i]))
+        err = max(err, abs(a[i] - b[i]))
+    tl.check(len(a) == len(b) and err <= 1e-4 * big, name + ": " + String(len(a)) + " values, max err " + String(err / big) + " of the largest")
+
+
+def _delta(a: List[List[Scalar[DT]]], b: List[List[Scalar[DT]]]) -> List[List[Scalar[DT]]]:
+    var o = b.copy()
+    for k in range(len(o)):
+        for i in range(len(o[k])):
+            o[k][i] = b[k][i] - a[k][i]
+    return o^
+
+
+def _compare_steps(name: String, a: List[List[Scalar[DT]]], b: List[List[Scalar[DT]]], mut tl: Tally):
+    """`test_supermimic_gpu`'s rule for optimiser steps: Adam moves an element
+    whose gradient is near eps by an amount ill-conditioned in g, so the
+    elements that moved (at least half the largest move) must agree to 1e-3 of
+    that move, and the rest stay within it. Comparing weights directly reads
+    CUDA's TF32 as a failure."""
+    var big = 0.0
+    for i in range(len(a)):
+        for k in range(len(a[i])):
+            big = max(big, abs(Float64(a[i][k])))
+    var em = 0.0
+    var er = 0.0
+    var nm = 0
+    var nr = 0
+    var wp = 0
+    var we = 0
+    for i in range(len(a)):
+        for k in range(len(a[i])):
+            var x = Float64(a[i][k])
+            var e = abs(x - Float64(b[i][k]))
+            if abs(x) >= 0.5 * big:
+                if e > em:
+                    em = e
+                    wp = i
+                    we = k
+                nm += 1
+            else:
+                er = max(er, e)
+                nr += 1
+    if em > 1e-3 * big:
+        print("  worst: parameter", wp, "of", len(a), "(", len(a[wp]), "elements ), element", we, "moved", a[wp][we], "vs", b[wp][we], ", largest move", big)
+        for i in range(len(a)):
+            var c = 0
+            var w = 0.0
+            for k in range(len(a[i])):
+                var e = abs(Float64(a[i][k]) - Float64(b[i][k]))
+                w = max(w, e)
+                if e > 1e-4 * big:
+                    c += 1
+            print("    parameter", i, ":", c, "of", len(a[i]), "off by more than 1e-4, worst", w / big)
+            if c > 0 and c < 100:
+                var line = String("      elements")
+                for k in range(len(a[i])):
+                    if abs(Float64(a[i][k]) - Float64(b[i][k])) > 1e-4 * big:
+                        line += " " + String(k)
+                print(line)
+    tl.check(em <= 1e-3 * big, name + ": " + String(nm) + " elements that moved agree to " + String(em / big) + " of the largest move")
+    tl.check(er <= big, name + ": " + String(nr) + " that barely moved within " + String(er / big) + " of the largest move")
+
+
 def _same(a: List[List[Scalar[DT]]], b: List[List[Scalar[DT]]]) -> Bool:
     for k in range(len(a)):
         for i in range(len(a[k])):
@@ -111,7 +178,17 @@ def _batch() -> SMPromptBatch[R, CMD]:
     for b in range(N):
         var o = b * D.S
         ib.state.data[o + 2] = Scalar[DT](0.74 + 0.01 * Float64(b))
-        ib.state.data[o + 3] = 1
+        # a real tilt: at the identity the rotation's zero features leave a critic weight
+        # a gradient near rounding, and Adam scales that up to a full step (0.2 % off on
+        # 62 weights of features 2 and 3, against 3e-5 with this tilt)
+        var qx = random_float64(-0.1, 0.1)
+        var qy = random_float64(-0.1, 0.1)
+        var qz = random_float64(-0.5, 0.5)
+        var qn = sqrt(1.0 + qx * qx + qy * qy + qz * qz)
+        ib.state.data[o + 3] = Scalar[DT](1.0 / qn)
+        ib.state.data[o + 4] = Scalar[DT](qx / qn)
+        ib.state.data[o + 5] = Scalar[DT](qy / qn)
+        ib.state.data[o + 6] = Scalar[DT](qz / qn)
         for j in range(D.NDOF):
             ib.state.data[o + 7 + j] = Scalar[DT](R.default_joint_pos(j) + random_float64(-0.1, 0.1))
             ib.state.data[o + D.NQ + 6 + j] = Scalar[DT](random_float64(-0.5, 0.5))
@@ -206,17 +283,23 @@ def main() raises:
     var p0 = sm_snapshot["gpu"](tg.base.pol, Optional(ctx))
     var w0 = sm_snapshot["gpu"](tg.base.wm, Optional(ctx))
     var e0 = sm_snapshot["gpu"](tg.enc, Optional(ctx))
-    var vals = List[Float64]()
-    var tgts = List[Float64]()
+    var v0 = sm_snapshot["gpu"](tg.critic, Optional(ctx))
+    var vc = List[Float64]()
+    var rc = List[Float64]()
+    var vg = List[Float64]()
+    var rg = List[Float64]()
     var perms = List[Int](length=5 * H * N, fill=0)
     for ep in range(5):
         for i in range(H * N):
             perms[ep * H * N + i] = i
-    _ = tc.policy_update[N](ib, perms, vals, tgts, False)
-    var up = tg.policy_update[N](ig, perms, vals, tgts, False, resident=True)
+    var uc = tc.policy_update[N](ib, perms, vc, rc, False)
+    var up = tg.policy_update[N](ig, perms, vg, rg, False, resident=True)
     print("  J", up.imag_objective, "|g|", up.policy_grad_norm, "critic", up.critic_loss)
-    _lists("the encoder after its step", sm_snapshot["cpu"](tc.enc, None), sm_snapshot["gpu"](tg.enc, Optional(ctx)), tl)
-    _lists("its critic after 20 steps", sm_snapshot["cpu"](tc.critic, None), sm_snapshot["gpu"](tg.critic, Optional(ctx)), tl)
+    tl.check(abs(uc.critic_loss - up.critic_loss) <= 1e-3 * abs(uc.critic_loss), "last critic loss " + String(uc.critic_loss) + " vs " + String(up.critic_loss))
+    _floats("values", vc, vg, tl)
+    _floats("TD(lambda) targets", rc, rg, tl)
+    _compare_steps("the encoder's step", _delta(e0, sm_snapshot["cpu"](tc.enc, None)), _delta(e0, sm_snapshot["gpu"](tg.enc, Optional(ctx))), tl)
+    _compare_steps("its critic, 20 steps", _delta(v0, sm_snapshot["cpu"](tc.critic, None)), _delta(v0, sm_snapshot["gpu"](tg.critic, Optional(ctx))), tl)
     tl.check(not _same(e0, sm_snapshot["gpu"](tg.enc, Optional(ctx))), "the encoder moved on the device")
     tl.check(_same(p0, sm_snapshot["gpu"](tg.base.pol, Optional(ctx))), "the decoder and the motion encoder did not")
     tl.check(_same(w0, sm_snapshot["gpu"](tg.base.wm, Optional(ctx))), "the world model did not")

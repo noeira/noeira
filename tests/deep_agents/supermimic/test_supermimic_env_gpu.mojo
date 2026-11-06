@@ -42,7 +42,7 @@ from max.gpu.host import DeviceContext
 from noeira.core.cont_action import ContAction
 from noeira.deep_agents.supermimic.env import SMReplayOf, SMTrackingEnv
 from noeira.deep_agents.supermimic.env_gpu import ST_CLIP_END, ST_ENDING, ST_TERMINATED, SMReplayGpuOf, SMTrackingEnvGpu
-from noeira.deep_agents.supermimic.lanes import talloc, tp
+from noeira.deep_agents.supermimic.lanes import tp
 from noeira.deep_agents.supermimic.motion_library import SMMotionLibrary
 from noeira.deep_agents.supermimic.prompt import SMSpec, sm_spec_velocity
 from noeira.deep_agents.supermimic.robot import G1BatchedSim, G1MjlabBatchedSim, G1MjlabRobot, G1Robot, SMDims
@@ -340,7 +340,7 @@ def test_prompt_lanes(ctx: DeviceContext, stand: List[Scalar[DT]], mut tl: Tally
     var env = EnvG(ctx, _library(up, lens, 0.3), BS.create(ctx), dr=False, obs_noise=False, reset_noise=False, action_noise=0.0)
     env.prompt_from = 4
     _put_all(ctx, env, up)
-    var specs = talloc["gpu"](NL * SMSpec.SIZE, Optional(ctx))
+    var specs = TensorImpl[DT].alloc(NL * SMSpec.SIZE)        # host-filled, then uploaded
     for l in range(NL):
         sm_spec_velocity[DT](specs.data.unsafe_ptr().unsafe_offset(l * SMSpec.SIZE).as_unsafe_any_origin(), 0, 0, 0)
     specs.upload_resident(ctx)
