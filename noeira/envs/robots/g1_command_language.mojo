@@ -195,6 +195,25 @@ def g1_since_word(seconds: Float64) -> String:
     return String("a_while")
 
 
+comptime G1_TRAIL_N: Int = 4
+"""Places in `places_visited_recently`, most recent first."""
+comptime G1_HEARD_N: Int = 3
+"""Utterances in `recently_heard`, most recent first."""
+comptime G1_LOG_N: Int = 64
+"""Events `G1Context.log` keeps; the oldest go first."""
+
+
+@fieldwise_init
+struct G1Event(Copyable, Movable):
+    """One thing the robot remembers: `arrived` (text = the place) or `heard`
+    (text = an earlier utterance). `t_s` is the caller's clock in seconds;
+    only its order is read."""
+
+    var kind: String
+    var text: String
+    var t_s: Float64
+
+
 struct G1Context(Copyable, Movable):
     """What the robot is doing, for the next instruction to be relative to."""
 
@@ -215,6 +234,21 @@ struct G1Context(Copyable, Movable):
     """The destination the robot stands in now, "" for none."""
     var arrived: String
     """The destination it last arrived at, "" for none."""
+    var geometry: Bool
+    """Send `places_around_you` (`around`) and `places_visited_recently` (the
+    trail, from `log`). OFF by default. RB-1's compact S1 (`s1c`): the largest
+    effect that bench measured, spatial 19 -> 48/70 on hosted Jev
+    (`docs/ROOM_BENCH_RB1_PLAN.md`, 2026-11-05/06)."""
+    var around: List[String]
+    """One line per place, rendered by the caller from the robot's pose:
+    `"table: left, 3.5 m, next to sofa"`. The caller owns the geometry (and
+    its buckets); this sends the words."""
+    var memory: Bool
+    """Send `recently_heard` (the last `G1_HEARD_N` utterances from `log`).
+    OFF by default."""
+    var log: List[G1Event]
+    """Arrivals and earlier utterances, oldest first (`arrived_at`,
+    `heard_said`). Read by the trail, `recently_heard` and `g1_other_one`."""
 
     def __init__(out self):
         self.doing = String("")
@@ -224,6 +258,47 @@ struct G1Context(Copyable, Movable):
         self.walking_to = String("")
         self.at = String("")
         self.arrived = String("")
+        self.geometry = False
+        self.around = List[String]()
+        self.memory = False
+        self.log = List[G1Event]()
+
+    def _remember(mut self, kind: String, text: String, t_s: Float64):
+        self.log.append(G1Event(kind, text, t_s))
+        while len(self.log) > G1_LOG_N:
+            _ = self.log.pop(0)
+
+    def arrived_at(mut self, place: String, t_s: Float64):
+        """The robot has just arrived at `place`."""
+        self._remember(String("arrived"), place, t_s)
+
+    def heard_said(mut self, utterance: String, t_s: Float64):
+        """An utterance, logged AFTER the decision it was the instruction of:
+        `recently_heard` is what was said before, never the sentence being
+        decided."""
+        self._remember(String("heard"), utterance, t_s)
+
+    def trail(self) -> List[String]:
+        """Arrivals, most recent first, a repeat of the head not re-added, at
+        most `G1_TRAIL_N` (RB-1's reducer rule, `rb1_reduce`)."""
+        var all = List[String]()
+        for e in self.log:
+            if e.kind == "arrived" and (len(all) == 0 or all[0] != e.text):
+                all.insert(0, e.text)
+        var out = List[String]()
+        for i in range(min(len(all), G1_TRAIL_N)):
+            out.append(all[i])
+        return out^
+
+    def heard_recent(self) -> List[String]:
+        """The last `G1_HEARD_N` utterances, most recent first."""
+        var out = List[String]()
+        var i = len(self.log) - 1
+        while i >= 0 and len(out) < G1_HEARD_N:
+            if self.log[i].kind == "heard":
+                out.append(self.log[i].text)
+            i -= 1
+        return out^
 
     def began(mut self, name: String):
         """Record that `name` has just started.
@@ -288,6 +363,26 @@ def g1_command_state(instruction: String, ref ctx: G1Context) raises -> String:
         w.member("currently_walking_to", ctx.walking_to if ctx.walking_to != "" else String("none"))
         w.member("currently_at", ctx.at if ctx.at != "" else String("none"))
         w.member("last_arrived_at", ctx.arrived if ctx.arrived != "" else String("none"))
+    # ⚠ THESE KEYS AND THEIR ORDER ARE RB-1's `s1c` (+ mem-2's `recently_heard`),
+    # byte for byte: `room_bench --check-state` compares this writer with the
+    # bench's. Each key is present whenever its switch is on, empty or not.
+    if ctx.geometry:
+        w.key("places_around_you")
+        w.begin_array()
+        for line in ctx.around:
+            w.string(line)
+        w.end_array()
+        w.key("places_visited_recently")
+        w.begin_array()
+        for t in ctx.trail():
+            w.string(t)
+        w.end_array()
+    if ctx.memory:
+        w.key("recently_heard")
+        w.begin_array()
+        for h in ctx.heard_recent():
+            w.string(h)
+        w.end_array()
     w.end_object()
     return w.done()
 
@@ -420,6 +515,131 @@ def g1_route_destination(
     ):
         return pick
     return String("")
+
+
+comptime G1_Q_IS_GO_MEMORY: String = "is_go_memory"
+comptime G1_Q_MEMORY_REF: String = "memory_ref"
+
+
+def g1_add_memory_reference(mut q: JevQuestions) raises:
+    """Which REMEMBERED place a request means: RB-1's memory parser route
+    (`docs/ROOM_BENCH_RB1_PLAN.md`, 2026-11-06). The model names the reference;
+    code computes the place from `G1Context.log` (`g1_route_memory`).
+
+    ⚠ THE WORDING AND THE OPTIONS ARE THE MEASURED ONES (room_bench `mem2p`,
+    frozen bb824a6d): on the held-out memory set "the other one" went 2 -> 8/8
+    (hosted Jev) and 0 -> 4/8 (d1), every routed answer right. Five options
+    are asked although only `other_one` is acted on (`g1_route_memory`)."""
+    q.noul(
+        String(G1_Q_IS_GO_MEMORY),
+        String(
+            "Is the instruction telling the robot to move on to a place now, even if it"
+            " does not name the place (back, on, the next one, the other one), rather"
+            " than a question, a remark, or a story about what happened?"
+        ),
+    )
+    var opts = List[String]()
+    var descs = List[String]()
+    opts.append(String("previous_stop"))
+    descs.append(String("go back to the place the robot was at just before the one it is at now"))
+    opts.append(String("starting_point"))
+    descs.append(String("go back to the first place the robot went to, where it started"))
+    opts.append(String("other_one"))
+    descs.append(String("go to the other place, of two mentioned earlier, that the robot did not take"))
+    opts.append(String("next_errand"))
+    descs.append(String("go on to the next place of an errand list that is not done yet"))
+    opts.append(String(G1_OPT_NONE))
+    descs.append(String("none of these: the instruction names its place, or asks for no remembered place"))
+    q.choice(
+        String(G1_Q_MEMORY_REF),
+        String("Which remembered place does the instruction ask the robot to go to?"),
+        opts, descs,
+    )
+
+
+def g1_place_mentions(
+    text: String, places: List[String], words: List[String]
+) -> List[String]:
+    """The places `text` names, in the order they first appear: each place's
+    own name or one of its `words[i]` (comma-separated, "" for none), whole
+    words, a plural `s` allowed, lowercased. Read on the robot's MEMORY (what
+    was heard), never on the instruction being decided — on the instruction
+    this is the keyword baseline the model is measured against."""
+    var clean = String(" ")
+    for cp in text.lower().codepoint_slices():
+        var c = String(cp)
+        if c == "," or c == "." or c == "!" or c == "?" or c == ":" or c == ";" or c == "'" or c == "’" or c == "\"" or c == "-":
+            clean += " "
+        else:
+            clean += c
+    clean += " "
+    var at = List[Int]()
+    var names = List[String]()
+    for i in range(len(places)):
+        var forms = List[String]()
+        forms.append(places[i])
+        if i < len(words) and words[i] != "":
+            for w in words[i].split(","):
+                forms.append(String(w))
+        var first = -1
+        for w in forms:
+            for f in [String(" ") + w + " ", String(" ") + w + "s "]:
+                var k = clean.find(f)
+                if k >= 0 and (first < 0 or k < first):
+                    first = k
+        if first >= 0:
+            var j = len(at)
+            while j > 0 and at[j - 1] > first:
+                j -= 1
+            at.insert(j, first)
+            names.insert(j, places[i])
+    return names^
+
+
+def g1_other_one(
+    ref ctx: G1Context, places: List[String], words: List[String]
+) -> String:
+    """"The other one": the latest heard utterance that names two places or
+    more; of those, the ones that are not where the robot is, not where it is
+    walking, and not arrived at since it was heard. Exactly one, or "" (the
+    log does not settle it, and the caller falls through to the commands)."""
+    var i = len(ctx.log) - 1
+    while i >= 0:
+        if ctx.log[i].kind == "heard":
+            var named = g1_place_mentions(ctx.log[i].text, places, words)
+            if len(named) >= 2:
+                var left = List[String]()
+                for p in named:
+                    if p == ctx.at or p == ctx.walking_to:
+                        continue
+                    var taken = False
+                    for j in range(i + 1, len(ctx.log)):
+                        if ctx.log[j].kind == "arrived" and ctx.log[j].text == p:
+                            taken = True
+                    if not taken:
+                        left.append(p)
+                return left[0] if len(left) == 1 else String("")
+        i -= 1
+    return String("")
+
+
+def g1_route_memory(
+    ref ans: JevAnswers, ref ctx: G1Context, places: List[String],
+    words: List[String], min_gate: Float64 = 0.5,
+) raises -> String:
+    """The place a memory reference routes, or "": the gate >= `min_gate`, the
+    reference `other_one`, and `g1_other_one` settles it.
+
+    ⚠ ONLY `other_one`. RB-1 measured the others too, and they stay off here:
+    `previous_stop` sent the robot to the wrong place on both anchored items
+    ("go back to where you were before the table": it has no anchor), and a
+    robot with no errand list or object sightings has nothing for
+    `next_errand` or a where-question to read."""
+    if ans.noul(String(G1_Q_IS_GO_MEMORY)) < min_gate:
+        return String("")
+    if ans.choice(String(G1_Q_MEMORY_REF)) != "other_one":
+        return String("")
+    return g1_other_one(ctx, places, words)
 
 
 def _g1_command_options(

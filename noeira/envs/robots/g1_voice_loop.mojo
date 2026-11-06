@@ -68,6 +68,7 @@ from noeira.envs.robots.g1_command_language import (
     g1_command_questions, g1_decide, g1_decide_chain, g1_command_state,
     g1_since_word, G1Context, G1LangPick, G1_Q_EXTENT,
     g1_destination_questions, g1_route_destination,
+    g1_add_memory_reference, g1_route_memory, g1_other_one,
 )
 from noeira.envs.robots.g1_reward_vocab import G1Term
 from noeira.envs.robots.g1_spec import (
@@ -264,6 +265,15 @@ struct G1VoiceConfig(Copyable, Movable):
     `os_voice_for(lang)`. Otherwise the voice's name for the backend in use."""
     var tts_dl: Float64
     """Seconds a synthesis may take before the OS voice says it instead."""
+    var memory_route: Bool
+    """`request_wording` only: the command request also asks which
+    remembered place a request means (`g1_add_memory_reference`), and "the
+    other one" goes to the place `G1Context.log` settles, ahead of the command
+    decision (`g1_route_memory`). The caller keeps the log (`arrived_at`, and
+    `heard_said` with `take_heard`). OFF by default."""
+    var dest_words: List[String]
+    """Per destination, other words for it in what is heard ("frigo,
+    réfrigérateur"), comma-separated; "" for none. `g1_place_mentions`."""
 
     def __init__(out self):
         self.lang = String("")
@@ -294,6 +304,8 @@ struct G1VoiceConfig(Copyable, Movable):
         self.tts_spec = String("")
         self.tts_voice = String("")
         self.tts_dl = VL_TTS_DEADLINE_S
+        self.memory_route = False
+        self.dest_words = List[String]()
 
 
 struct G1VoiceLoop(Movable):
@@ -316,6 +328,12 @@ struct G1VoiceLoop(Movable):
     var llm: ChatClient
     var cfg: G1VoiceConfig
     var quest: JevQuestions
+    var quest_mem: JevQuestions
+    """`memory_route`: `quest` plus the memory reference, asked only when the
+    log could settle "the other one" (otherwise its answer cannot route, and
+    on a local model each question is a prompt of its own: ~300 ms on d1)."""
+    var mem_asked: Bool
+    """The current second request carries the memory reference."""
     var dest_q: JevQuestions
     """`request_wording` only: the first request. Empty otherwise."""
     var asked: String
@@ -332,6 +350,8 @@ struct G1VoiceLoop(Movable):
 
     var state: Int
     var heard: String
+    var heard_new: String
+    """The utterance just sent for a decision, until `take_heard`."""
     var pick: G1LangPick
     var t_wait: Int
     var mute_until: Int
@@ -417,12 +437,19 @@ struct G1VoiceLoop(Movable):
         # which is where a missing microphone should stop a program.
         self.mic = MicCapture.start(16000, self.cfg.mic_dev)
         self.dest_q = JevQuestions()
+        self.quest_mem = JevQuestions()
+        self.mem_asked = False
         if self.cfg.request_wording and len(self.cfg.destinations) > 0:
             # two requests: the destination first, then the commands WITHOUT it
             self.dest_q = g1_destination_questions(self.cfg.destinations)
             self.quest = g1_command_questions(
                 bank, True, List[String](), List[String](), self.cfg.chain,
             )
+            if self.cfg.memory_route:
+                self.quest_mem = g1_command_questions(
+                    bank, True, List[String](), List[String](), self.cfg.chain,
+                )
+                g1_add_memory_reference(self.quest_mem)
         else:
             self.quest = g1_command_questions(
                 bank, True, self.cfg.destinations, self.cfg.dest_descs,
@@ -451,6 +478,7 @@ struct G1VoiceLoop(Movable):
 
         self.state = VL_ST_IDLE
         self.heard = String("")
+        self.heard_new = String("")
         self.pick = G1LangPick()
         self.t_wait = perf_counter_ns()
         self.mute_until = perf_counter_ns()
@@ -480,6 +508,8 @@ struct G1VoiceLoop(Movable):
         self.llm = move.llm^
         self.cfg = move.cfg^
         self.quest = move.quest^
+        self.quest_mem = move.quest_mem^
+        self.mem_asked = move.mem_asked
         self.dest_q = move.dest_q^
         self.asked = move.asked^
         self.dest_ms = move.dest_ms
@@ -490,6 +520,7 @@ struct G1VoiceLoop(Movable):
         self.znew = move.znew^
         self.state = move.state
         self.heard = move.heard^
+        self.heard_new = move.heard_new^
         self.pick = move.pick^
         self.t_wait = move.t_wait
         self.mute_until = move.mute_until
@@ -648,6 +679,14 @@ struct G1VoiceLoop(Movable):
         except e:
             self.mic_dead = String(e)
             return String("[mic] ") + self.mic_dead
+
+    def take_heard(mut self) -> String:
+        """The utterance just sent for a decision, consumed; "" when none.
+        For `G1Context.heard_said`: logged after its own state was built, so
+        `recently_heard` never holds the sentence being decided."""
+        var h = self.heard_new
+        self.heard_new = String("")
+        return h
 
     def take_note(mut self) -> String:
         """The last log line, consumed. Empty when there is nothing new."""
@@ -870,6 +909,8 @@ struct G1VoiceLoop(Movable):
                     else:
                         try:
                             self.asked = g1_command_state(self.heard, ctx)
+                            self.heard_new = self.heard
+                            self.mem_asked = False
                             self.dest_ms = 0.0
                             if self._two_requests():
                                 self.jev.start(self.asked, self.dest_q)
@@ -902,7 +943,7 @@ struct G1VoiceLoop(Movable):
                 except:
                     ready = True
                 if ready:
-                    ev = self._destination()
+                    ev = self._destination(ctx)
 
         # ── deciding ──────────────────────────────────────────────────
         elif self.state == VL_ST_JEV:
@@ -981,7 +1022,7 @@ struct G1VoiceLoop(Movable):
     def _two_requests(self) -> Bool:
         return self.cfg.request_wording and len(self.cfg.destinations) > 0
 
-    def _destination(mut self) -> G1VoiceEvent:
+    def _destination(mut self, ref ctx: G1Context) -> G1VoiceEvent:
         """The first request's answer: a goto, or the commands' request."""
         var ev = G1VoiceEvent.none()
         self.state = VL_ST_IDLE
@@ -1000,12 +1041,22 @@ struct G1VoiceLoop(Movable):
             # ⚠ THE SAME STATE, not a fresh one: the robot may have moved on
             # while the first request was answered, and the two answers must
             # be about the same moment.
-            self.jev.start(self.asked, self.quest)
+            self.mem_asked = self._settles_other_one(ctx)
+            if self.mem_asked:
+                self.jev.start(self.asked, self.quest_mem)
+            else:
+                self.jev.start(self.asked, self.quest)
             self.t_wait = perf_counter_ns()
             self.state = VL_ST_JEV
         except e:
             self.note = String("[jev] FAILED: ") + String(e)
         return ev^
+
+    def _settles_other_one(self, ref ctx: G1Context) -> Bool:
+        """Whether the log names a place "the other one" could mean right now."""
+        return self.cfg.memory_route and g1_other_one(
+            ctx, self.cfg.destinations, self.cfg.dest_words
+        ) != ""
 
     def _jev_ms(self, ms: Float64) -> String:
         """`  (jev 3412 ms)`, or `  (jev 680 + 2290 ms)` after two requests:
@@ -1033,7 +1084,18 @@ struct G1VoiceLoop(Movable):
             ev.p_none = self.pick.p_none
             ev.needs_world = self.pick.needs_world
             ev.text = self.heard
-            if self.pick.destination != "":
+            # "the other one": a remembered place, settled by the log, ahead of
+            # the commands (RB-1's parser route: the model names the reference)
+            var mem = String("")
+            if two and self.cfg.memory_route:
+                if self.mem_asked:
+                    mem = g1_route_memory(ans, ctx, self.cfg.destinations, self.cfg.dest_words)
+            if mem != "":
+                ev.kind = VL_WORLD
+                ev.destination = mem
+                self.note = (String("[memory] other one -> ") + mem
+                             + self._jev_ms(ans.latency_ms))
+            elif self.pick.destination != "":
                 # ⚠ A DESTINATION IS A SUCCESS WITH A DIFFERENT HANDLER, and
                 # `g1_decide` has already cleared `name` so a stale bank row
                 # cannot race the planner.

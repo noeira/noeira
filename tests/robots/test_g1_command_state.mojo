@@ -31,6 +31,7 @@ tier: the parts that need the live service are measured through
 
 from noeira.envs.robots.g1_command_language import (
     G1Context, g1_arm_of, g1_since_word, g1_command_state, G1_N_RECENT,
+    g1_place_mentions, g1_other_one,
 )
 
 
@@ -178,6 +179,91 @@ def main() raises:
     var s2 = g1_command_state(String("dis \"bonjour\" a\\ll"), q)
     t.truth(s2.find("\\\"bonjour\\\"") >= 0, "a quote in the transcript is escaped")
     t.truth(s2.find("a\\\\ll") >= 0, "a backslash in the transcript is escaped")
+
+    # ── the room state (RB-1's s1c + recently_heard) ─────────────────
+    # ⚠ OFF, NOTHING CHANGES: the measured requests (8 Oct, RB-1's S0) must
+    # stay byte-identical for every caller that does not ask for these keys.
+    print("-- room state: geometry and memory")
+    var off = G1Context()
+    off.places = True
+    off.arrived_at(String("fridge"), 1.0)
+    off.heard_said(String("the fridge or the table"), 2.0)
+    var s_off = g1_command_state(String("x"), off)
+    t.truth(
+        s_off.find("places_around_you") < 0 and s_off.find("recently_heard") < 0
+        and s_off.find("places_visited_recently") < 0,
+        "switches off: a log alone adds no key",
+    )
+    var on = G1Context()
+    on.geometry = True
+    on.memory = True
+    var s_on = g1_command_state(String("x"), on)
+    t.truth(
+        s_on.find("\"places_around_you\":[],\"places_visited_recently\":[],\"recently_heard\":[]") >= 0,
+        "switches on, nothing known: every key present, empty, in s1c's order",
+    )
+    on.around.append(String("table: left, 3.5 m, next to sofa"))
+    on.arrived_at(String("door"), 1.0)
+    on.arrived_at(String("fridge"), 2.0)
+    on.arrived_at(String("table"), 3.0)
+    on.arrived_at(String("table"), 4.0)
+    on.arrived_at(String("sofa"), 5.0)
+    on.arrived_at(String("door"), 6.0)
+    var tr = on.trail()
+    t.truth(
+        len(tr) == 4 and tr[0] == "door" and tr[1] == "sofa" and tr[2] == "table" and tr[3] == "fridge",
+        "trail: most recent first, a repeat not re-added, capped at 4 (the oldest door dropped)",
+    )
+    for h in ["a", "b", "c", "d"]:
+        on.heard_said(String(h), 7.0)
+    var hr = on.heard_recent()
+    t.truth(len(hr) == 3 and hr[0] == "d" and hr[2] == "b", "recently_heard: the last 3, most recent first")
+    var s_full = g1_command_state(String("x"), on)
+    t.truth(
+        s_full.find("\"places_around_you\":[\"table: left, 3.5 m, next to sofa\"]") >= 0
+        and s_full.find("\"recently_heard\":[\"d\",\"c\",\"b\"]") >= 0,
+        "the caller's place lines and the heard utterances are sent as written",
+    )
+
+    # ── "the other one", settled by the log ───────────────────────────
+    print("-- g1_place_mentions, g1_other_one")
+    var pl = List[String]()
+    var wd = List[String]()
+    for p in ["fridge", "door", "table", "sofa"]:
+        pl.append(String(p))
+    wd.append(String("frigo,réfrigérateur"))
+    wd.append(String("porte"))
+    wd.append(String(""))
+    wd.append(String("canapé,couch"))
+    var mn = g1_place_mentions(String("Le canapé, ou plutôt les tables ? Non: le frigo."), pl, wd)
+    t.truth(
+        len(mn) == 3 and mn[0] == "sofa" and mn[1] == "table" and mn[2] == "fridge",
+        "mentions: in order of appearance, synonyms and plurals, punctuation ignored",
+    )
+    t.truth(len(g1_place_mentions(String("the doorbell rang"), pl, wd)) == 0, "whole words only: doorbell is no door")
+    var o1 = G1Context()
+    o1.heard_said(String("the fridge, or the table, go to the fridge"), 1.0)
+    o1.arrived_at(String("fridge"), 2.0)
+    t.truth(g1_other_one(o1, pl, wd) == "table", "arrived at one of two: the other")
+    var o2 = G1Context()
+    o2.heard_said(String("the fridge or the table"), 1.0)
+    o2.arrived_at(String("fridge"), 2.0)
+    o2.at = String("")
+    t.truth(g1_other_one(o2, pl, wd) == "table", "arrived and left again: still taken")
+    var o3 = G1Context()
+    o3.heard_said(String("go to the sofa or the door"), 1.0)
+    o3.walking_to = String("sofa")
+    t.truth(g1_other_one(o3, pl, wd) == "door", "walking to one of two: the other")
+    var o4 = G1Context()
+    o4.heard_said(String("fridge, table or sofa"), 1.0)
+    o4.arrived_at(String("sofa"), 2.0)
+    t.truth(g1_other_one(o4, pl, wd) == "", "two left: not settled")
+    var o5 = G1Context()
+    o5.heard_said(String("the fridge or the table"), 1.0)
+    o5.heard_said(String("salut"), 2.0)
+    o5.arrived_at(String("table"), 3.0)
+    t.truth(g1_other_one(o5, pl, wd) == "fridge", "the latest utterance naming two places, not the latest one")
+    t.truth(g1_other_one(G1Context(), pl, wd) == "", "nothing heard: not settled")
 
     print("===", t.checks - t.fails, "/", t.checks, "passed ===")
     if t.fails != 0:
