@@ -35,7 +35,7 @@ from std.random import random_float64
 
 from max.gpu.host import DeviceContext
 
-from noeira.deep_agents.fb.g1_mebe import G1Cmd, g1_cmd_reward, g1_cmd_suite
+from noeira.deep_agents.fb.g1_mebe import G1Cmd, G1M_SIG_G, G1M_SIG_H, G1M_SIG_V, G1M_SIG_W, g1_cmd_reward, g1_cmd_suite
 from noeira.deep_agents.supermimic.kinematics import FP, sm_fk_lane
 from noeira.deep_agents.supermimic.motion_library import SMMotionLibrary
 from noeira.deep_agents.supermimic.prompt import SMSpec, SM_P_LEAN_DEFAULT, sm_prompt_atoms_lane, sm_spec_velocity
@@ -195,6 +195,8 @@ struct SMEvalTally(Movable):
     var qd: List[Float64]
     var rock: List[Float64]
     var n: List[Int]
+    var kern: List[Float64]        # per lane: k_v k_w k_g k_h, then vx vy wz h
+    var trained: List[Float64]     # the reward the encoder was trained on
     var atoms: List[Scalar[DT]]
     var fk: List[Scalar[DT]]
 
@@ -206,6 +208,8 @@ struct SMEvalTally(Movable):
         self.qd = List[Float64](length=lanes, fill=0.0)
         self.rock = List[Float64](length=lanes, fill=0.0)
         self.n = List[Int](length=lanes, fill=0)
+        self.kern = List[Float64](length=lanes * 8, fill=0.0)
+        self.trained = List[Float64](length=lanes, fill=0.0)
         self.atoms = List[Scalar[DT]](length=SMSpec.ATOMS, fill=0)
         self.fk = List[Scalar[DT]](length=fk_block, fill=0)
 
@@ -217,6 +221,8 @@ struct SMEvalTally(Movable):
         self.qd = move.qd^
         self.rock = move.rock^
         self.n = move.n^
+        self.kern = move.kern^
+        self.trained = move.trained^
         self.atoms = move.atoms^
         self.fk = move.fk^
 
@@ -271,6 +277,16 @@ struct SMEvalTally(Movable):
             var w1 = Float64(s[unsafe_offset=D.NQ + 4])
             self.rock[l] += 0.5 * (w0 * w0 + w1 * w1)
             self.n[l] += 1
+            if len(task.suite) > 0:
+                ref p = task.suite
+                self.kern[l * 8] += exp(-((vx - p[0]) ** 2 + (vy - p[1]) ** 2) / (G1M_SIG_V * G1M_SIG_V))
+                self.kern[l * 8 + 1] += exp(-((wz - p[2]) ** 2) / (G1M_SIG_W * G1M_SIG_W))
+                self.kern[l * 8 + 2] += exp(-((gx - p[3]) ** 2 + (gy - p[4]) ** 2) / (G1M_SIG_G * G1M_SIG_G))
+                self.kern[l * 8 + 3] += exp(-((h - p[5]) ** 2) / (G1M_SIG_H * G1M_SIG_H))
+            self.kern[l * 8 + 4] += vx
+            self.kern[l * 8 + 5] += vy
+            self.kern[l * 8 + 6] += wz
+            self.kern[l * 8 + 7] += h
 
     def report(self, tasks: List[SMEvalTask], task_of: List[Int]):
         """Per task and per family, as FB-MEBE's `[eval]` lines read."""
@@ -312,6 +328,17 @@ struct SMEvalTally(Movable):
                 sq += qd[k]
                 sr += rk[k]
                 sn += ns[k]
+        print("--- each task's kernels from step", SM_E_SKIP, "(the suite's widths): k_v k_w k_g k_h | vx vy wz h | training reward per step, of", 0.02 * SM_B_TASK_WEIGHT)
+        for k in range(nt):
+            var sums = List[Float64](length=8, fill=0.0)
+            var tr = 0.0
+            for l in range(len(self.ret)):
+                if task_of[l] == k:
+                    tr += self.trained[l]
+                    for i in range(8):
+                        sums[i] += self.kern[l * 8 + i]
+            var d = Float64(max(ns[k], 1))
+            print(tasks[k].name, "|", sums[0] / d, sums[1] / d, sums[2] / d, sums[3] / d, "|", sums[4] / d, sums[5] / d, sums[6] / d, sums[7] / d, "|", tr / d)
         print("--- per family: mean return, fall share")
         for g in range(4):
             if fam_n[g] > 0:

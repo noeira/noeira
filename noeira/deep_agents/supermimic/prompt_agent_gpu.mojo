@@ -143,6 +143,7 @@ struct SMPromptAgentGpu[P: SMPromptConfigT, BS: TrackingBatchedSim](Movable):
     var align_warm: Int           # updates at the alignment's raised weight
     var nref: Int
     var iteration: Int
+    var resumed_at: Int           # the iteration this process started from
     var updates: Int
     var utd_acc: Float64
     var wb: SMWindowBatch[Self.P.BASE.ROBOT]
@@ -191,6 +192,7 @@ struct SMPromptAgentGpu[P: SMPromptConfigT, BS: TrackingBatchedSim](Movable):
         self.align_warm = 0
         self.nref = Int(Float64(BP) * Self.P.DEF_REF_SHARE)
         self.iteration = 0
+        self.resumed_at = 0
         self.updates = 0
         self.utd_acc = 0.0
         self.wb = SMWindowBatch[R](K, NW)
@@ -229,6 +231,7 @@ struct SMPromptAgentGpu[P: SMPromptConfigT, BS: TrackingBatchedSim](Movable):
         self.align_warm = move.align_warm
         self.nref = move.nref
         self.iteration = move.iteration
+        self.resumed_at = move.resumed_at
         self.updates = move.updates
         self.utd_acc = move.utd_acc
         self.wb = move.wb^
@@ -297,6 +300,13 @@ struct SMPromptAgentGpu[P: SMPromptConfigT, BS: TrackingBatchedSim](Movable):
             grid_dim=ceildiv(BP, _TPB), block_dim=_TPB,
         )
 
+    def resume(mut self, iteration: Int, updates: Int):
+        """Go on from a saved run: the counts and the cosine schedule continue. The
+        replay is empty again, so the warm-up runs again, and Adam's moments restart."""
+        self.iteration = iteration
+        self.resumed_at = iteration
+        self.updates = updates
+
     def iterate(mut self) raises -> SMPromptLog:
         """One env step, and the updates it is owed."""
         comptime B = Self.P.BASE
@@ -317,7 +327,7 @@ struct SMPromptAgentGpu[P: SMPromptConfigT, BS: TrackingBatchedSim](Movable):
             False, rsum / Float64(max(B.LANES - self.split, 1)), falls, SMWMLoss(0, 0, 0, 0, 0), SMPromptUpdate(0, 0, 0, 0, 0, 0, 0),
         )
         self.iteration += 1
-        if self.iteration >= self.sched.warmup:
+        if self.iteration - self.resumed_at >= self.sched.warmup:
             self.utd_acc += self.sched.utd
             while self.utd_acc >= 1.0:
                 self.utd_acc -= 1.0
@@ -346,7 +356,7 @@ struct SMPromptAgentGpu[P: SMPromptConfigT, BS: TrackingBatchedSim](Movable):
         var n = 0
         var last = SMPromptUpdate(0, 0, 0, 0, 0, 0, 0)
         var lw = SMWMLoss(0, 0, 0, 0, 0)
-        for it in range(1, iters + 1):
+        for it in range(self.iteration + 1, iters + 1):
             var r = self.iterate()
             rs += r.sim_r
             fs += r.falls

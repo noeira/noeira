@@ -30,8 +30,12 @@ Options
 --max-clips N   the first N clips (0 = all)
 --bank K        command-bank rows (default 4096 at paper scale, 64 at smoke scale)
 --pool P        frames of the pool z is computed over (default 131072)
+--z-beta B      z retrieves with r^B, the reward stays r (default 1); the eval must match
+--z-ess N       each reward sharpens as far as an effective sample size of N (default off)
+--no-hold-out   train on the held-out rewards too: G3's comparator, never a result
 --split S       lanes below S keep tracking (default half)
 --align-warm U  updates at 100× the alignment's weight (default 2000 at paper scale)
+--resume PATH   go on from this run's checkpoint, up to --iters in all
 --iters N --log N --seed S --ckpt-every N --out PATH --no-noise
 
 ⚠ A SEED store is confidential: private compute only, and the pool and bank are
@@ -178,10 +182,13 @@ def main() raises:
     var max_clips = Int(_opt(args, String("--max-clips"), String("0")))
     var bank = Int(_opt(args, String("--bank"), String("4096" if PAPER else "64")))
     var pool = Int(_opt(args, String("--pool"), String("131072")))
+    var z_beta = Float64(_opt(args, String("--z-beta"), String("1")))
+    var z_ess = Float64(_opt(args, String("--z-ess"), String("0")))
     var split = Int(_opt(args, String("--split"), String(C.LANES // 2)))
     var ckpt_every = Int(_opt(args, String("--ckpt-every"), String("0")))
     var align_warm = Int(_opt(args, String("--align-warm"), String("2000" if PAPER else "0")))
     var out_path = _opt(args, String("--out"), String(""))
+    var resume = _opt(args, String("--resume"), String(""))
     var noise = not _flag(args, String("--no-noise"))
     comptime if PAPER:
         if tracker == "":
@@ -197,18 +204,27 @@ def main() raises:
         var c0 = base.load_state(tracker)
         print("tracker at iteration", c0[0])
     var t0 = perf_counter_ns()
-    var data = sm_prompt_data[C, CMD](base, lib, bank, pool)
+    var data = sm_prompt_data[C, CMD](base, lib, bank, pool, z_beta, z_ess, not _flag(args, String("--no-hold-out")))
     print("tables:", data.frames, "frames,", data.bank_n, "bank rows in", Float64(perf_counter_ns() - t0) * 1e-9, "s")
     var tr = SMPromptTrainer[P](base^)
+    var at_it = 0
+    var at_up = 0
+    if resume != "":
+        var c1 = tr.load_state(resume)
+        at_it = c1[0]
+        at_up = c1[1]
+        print("resuming at iteration", at_it, ", update", at_up)
     var sched = sm_schedule[C](iters, noise, seed_v)
     print("prompt interface:", CMD, "-D command,", C.LANES - split, "of", C.LANES, "lanes, H =", C.HORIZON, ", batch", C.PI_BATCH)
     comptime if MODE == 2:
         comptime Sim = G1MjlabBatchedSim[C.LANES]
         var agent = SMPromptAgentGpu[P, Sim](ctx.value(), lib^, Sim.create(ctx.value()), tr^, data^, sched^, split)
         agent.align_warm = align_warm
+        agent.resume(at_it, at_up)
         agent.train(iters, log_every, ckpt_every, out_path)
     else:
         var agent = SMPromptAgent[P](lib^, tr^, data^, sched^, split)
         agent.align_warm = align_warm
+        agent.resume(at_it, at_up)
         agent.train(iters, log_every, out_path)
     print("done")

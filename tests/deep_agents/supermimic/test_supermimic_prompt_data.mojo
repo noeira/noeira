@@ -14,16 +14,20 @@ WHAT EACH SECTION CAN CATCH
 [3] z: a spec that selects one cluster of frames returns that cluster's latent
     minus the pool's mean, with its effective sample size; kernels MULTIPLY (a
     frame that meets one of two kernels does not count); a spec that selects
-    nothing leaves z alone and reports it.
+    nothing leaves z alone and reports it. Sharpening, by hand: a fixed beta and
+    an effective sample size target retrieve the walking frames from a pool
+    that mostly stands; a target the pool cannot reach leaves r alone, and a
+    rare reward keeps its frames.
 [4] the family: weights share Σ w = 4, a tilt prompt drops the lean price,
     walking with a hand placed is held out, and standing with one is not.
 [5] a prompt lane on the CPU env: a tracking error that ends a tracker lane does
     not end it; a fall does; it never reaches the reset sampler's estimates.
 [6] commands: a lane holds its command `DEF_HOLD` steps, draws again after, and
     both sources appear with the right share.
+[7] resume: the counts go on from the checkpoint and the warm-up runs again.
 """
 
-from std.math import cos, sin
+from std.math import cos, exp, sin
 from std.random import random_float64, seed
 
 from noeira.deep_agents.supermimic.agent import sm_schedule
@@ -172,6 +176,49 @@ def main() raises:
     )
     t.truth(ess2 == 0.0 and z2[0] == 9, "kernels multiply: meeting one of two selects nothing, and z is left alone")
 
+    # sharpening: 2000 frames stand (latent e0), 40 walk at vx 0.5 (latent e1), 2 at
+    # vx 3 (latent e2). A wide kernel at vx 0.5 is swamped by the standing frames.
+    comptime NS = 2042
+    var sa = List[Scalar[DT]](length=NS * F, fill=0)
+    var sl = List[Scalar[DT]](length=NS * L, fill=0)
+    var sbar = List[Scalar[DT]](length=L, fill=0)
+    for f in range(NS):
+        var c = 0 if f < 2000 else (1 if f < 2040 else 2)
+        sa[f * F + SMSpec.A_VX] = Scalar[DT](0.0 if c == 0 else (0.5 if c == 1 else 3.0))
+        sl[f * L + c] = 1
+    var sq = List[Scalar[DT]](length=SMSpec.SIZE, fill=0)
+    sq[SMSpec.T + SMSpec.A_VX] = 0.5
+    sq[SMSpec.IW + SMSpec.A_VX] = 4
+    var sqp = sq.unsafe_ptr().as_unsafe_any_origin()
+    var sap = sa.unsafe_ptr().as_unsafe_any_origin()
+    var slp = sl.unsafe_ptr().as_unsafe_any_origin()
+    var sbp = sbar.unsafe_ptr().as_unsafe_any_origin()
+    var z0 = List[Scalar[DT]](length=L, fill=0)
+    var z8 = List[Scalar[DT]](length=L, fill=0)
+    var zt = List[Scalar[DT]](length=L, fill=0)
+    var e0 = sm_z_of_spec(sqp, sap, slp, sbp, NS, L, z0.unsafe_ptr().as_unsafe_any_origin())
+    var e8 = sm_z_of_spec(sqp, sap, slp, sbp, NS, L, z8.unsafe_ptr().as_unsafe_any_origin(), 8.0)
+    var et = sm_z_of_spec(sqp, sap, slp, sbp, NS, L, zt.unsafe_ptr().as_unsafe_any_origin(), 1.0, 100.0)
+    print("  ess", e0, e8, et, "walking share", z0[1], z8[1], zt[1])
+    # by hand: 2000 frames at e^-1 and 40 at 1, then the same at r^8
+    var w8 = exp(-8.0)
+    t.truth(abs(Float64(z0[1]) - 40.0 / (2000.0 * exp(-1.0) + 40.0)) < 1e-5, "r: the walking frames' share, by hand")
+    t.truth(abs(Float64(z8[1]) - 40.0 / (2000.0 * w8 + 40.0)) < 1e-5, "r^8: their share, by hand")
+    t.truth(Float64(z0[1]) < 0.06 and Float64(z8[1]) > 0.9, "sharper retrieval leaves the standing frames behind")
+    # ESS 100 of 40 frames at 1 and 2000 at w: (40 + 2000 w)² = 100 (40 + 2000 w²), w = 0.01173
+    t.truth(et >= 100.0 and et < 106.0, "a target of 100 lands just above 100 (the bisection keeps the sharper side's ESS above it)")
+    t.truth(abs(Float64(zt[1]) - 40.0 / (40.0 + 2000.0 * 0.01173)) < 0.03, "and on the share that size implies, by hand")
+    var zn = List[Scalar[DT]](length=L, fill=0)
+    var en = sm_z_of_spec(sqp, sap, slp, sbp, NS, L, zn.unsafe_ptr().as_unsafe_any_origin(), 1.0, 1e6)
+    var same = abs(en - e0) < 1e-6
+    for k in range(L):
+        same = same and abs(Float64(zn[k]) - Float64(z0[k])) < 1e-6
+    t.truth(same, "a target the pool cannot reach leaves r alone")
+    sq[SMSpec.T + SMSpec.A_VX] = 3
+    var zr = List[Scalar[DT]](length=L, fill=0)
+    var er = sm_z_of_spec(sqp, sap, slp, sbp, NS, L, zr.unsafe_ptr().as_unsafe_any_origin(), 1.0, 100.0)
+    t.truth(abs(er - 2.0) < 1e-6 and abs(Float64(zr[2]) - 1.0) < 1e-5, "a rare reward keeps its two frames: nothing is lost to the target")
+
     print("\n[4] the family")
     var sp = spec.unsafe_ptr().as_unsafe_any_origin()
     var sum_ok = True
@@ -296,6 +343,12 @@ def main() raises:
     agent._commands(cmds)
     t.truth(abs(Float64(cmds.data[0]) - 0.25) < 1e-5, "a reference command reads the frame's velocity, 0.5 m/s over the range's 2")
     t.truth(agent.specs[SMSpec.T + SMSpec.A_VX] == 0.5, "and its spec targets that velocity")
+
+    print("\n[7] resume")
+    agent.resume(1000, 400)
+    agent.train(1002, 0)
+    t.truth(agent.iteration == 1002, "a resumed run counts on to its total, not by it")
+    t.truth(agent.updates == 400, "and waits for the warm-up again: its replay is empty")
 
     print("\n===", t.checks - t.fails, "/", t.checks, "passed ===")
     if t.fails > 0:

@@ -57,6 +57,9 @@ from noeira.nn.core.tensor_refs import TensorRefs
 
 comptime SM_B_WINDOW_HALF: Int = 12          # the centred 25-frame mean
 comptime SM_B_MIN_ESS: Float64 = 32.0
+comptime SM_B_E_CUT: Float64 = 14.0
+comptime SM_B_LOG_B_MAX: Float64 = 8.317766166719343   # ln 4096
+comptime SM_B_SHARPEN_STEPS: Int = 9
 comptime SM_B_LATENT_BATCH: Int = 1024
 # Appendix G's uniform ranges, and the command's normalisation
 comptime SM_B_VX_LO: Float64 = -1.5
@@ -86,6 +89,8 @@ struct SMPromptData[CMD: Int](Movable):
     var pool_lat: List[Scalar[DT]]
     var lbar: List[Scalar[DT]]
     var z_scale: Float64
+    var z_beta: Float64            # z retrieves with r^beta: 1 is the reward itself
+    var z_ess: Float64             # > 0: each reward sharpens to this effective sample size
 
     def __init__(out self, frames: Int, bank_n: Int, latent: Int):
         self.frames = frames
@@ -99,6 +104,8 @@ struct SMPromptData[CMD: Int](Movable):
         self.pool_lat = List[Scalar[DT]]()
         self.lbar = List[Scalar[DT]]()
         self.z_scale = 1.0
+        self.z_beta = 1.0
+        self.z_ess = 0.0
 
     def __init__(out self, *, deinit move: Self):
         self.frames = move.frames
@@ -112,13 +119,15 @@ struct SMPromptData[CMD: Int](Movable):
         self.pool_lat = move.pool_lat^
         self.lbar = move.lbar^
         self.z_scale = move.z_scale
+        self.z_beta = move.z_beta
+        self.z_ess = move.z_ess
 
     def z_of(mut self, spec: FP[DT], z: FP[DT]) -> Float64:
         """z of any reward over the pool, in command units; returns its
         effective sample size."""
         var ess = sm_z_of_spec(
             spec, self.pool_atoms.unsafe_ptr().as_unsafe_any_origin(), self.pool_lat.unsafe_ptr().as_unsafe_any_origin(),
-            self.lbar.unsafe_ptr().as_unsafe_any_origin(), self.pool_n, Self.CMD, z,
+            self.lbar.unsafe_ptr().as_unsafe_any_origin(), self.pool_n, Self.CMD, z, self.z_beta, self.z_ess,
         )
         if ess >= 1:
             for k in range(Self.CMD):
@@ -306,30 +315,85 @@ def sm_draw_spec(spec: FP[DT], pool: FP[DT], n_pool: Int):
             spec[unsafe_offset=SMSpec.W + g] = w
 
 
-def sm_z_of_spec(
-    spec: FP[DT], pool_atoms: FP[DT], pool_lat: FP[DT], lbar: FP[DT], n_pool: Int, latent: Int, z: FP[DT]
-) -> Float64:
-    """z(r) over the pool for the PRODUCT of the spec's kernels (module doc);
-    returns the effective sample size (Σr)² / Σr². `z` is untouched below 1."""
+def _ess_of(es: List[Float64], emin: Float64, b: Float64) -> Float64:
+    """The effective sample size of `exp(-b (e - emin))`."""
     var s1 = 0.0
     var s2 = 0.0
-    var acc = List[Float64](length=latent, fill=0.0)
+    for i in range(len(es)):
+        var x = b * (es[i] - emin)
+        if x > SM_B_E_CUT:
+            continue
+        var r = exp(-x)
+        s1 += r
+        s2 += r * r
+    return s1 * s1 / max(s2, 1e-300)
+
+
+def _sharpest(es: List[Float64], emin: Float64, target: Float64) -> Float64:
+    """The largest b in [1, e^SM_B_LOG_B_MAX] with ESS >= `target`; 1 if even
+    b = 1 falls short, so a reward the pool barely holds is left as it is."""
+    if _ess_of(es, emin, 1.0) <= target:
+        return 1.0
+    if _ess_of(es, emin, exp(SM_B_LOG_B_MAX)) >= target:
+        return exp(SM_B_LOG_B_MAX)
+    var lo = 0.0
+    var hi = SM_B_LOG_B_MAX
+    for _ in range(SM_B_SHARPEN_STEPS):
+        var mid = 0.5 * (lo + hi)
+        if _ess_of(es, emin, exp(mid)) >= target:
+            lo = mid
+        else:
+            hi = mid
+    return exp(lo)
+
+
+def sm_z_of_spec(
+    spec: FP[DT], pool_atoms: FP[DT], pool_lat: FP[DT], lbar: FP[DT], n_pool: Int, latent: Int, z: FP[DT],
+    beta: Float64 = 1.0, ess_target: Float64 = 0.0,
+) -> Float64:
+    """z(r^beta) over the pool for the PRODUCT of the spec's kernels (module doc);
+    returns the effective sample size (Σr)² / Σr². `z` is untouched below 1.
+
+    Most of the motion stands still, so at beta = 1 a slow command retrieves
+    mostly standing. `beta` > 1 sharpens the retrieval and leaves the reward alone,
+    but one beta cannot suit every reward: 8 loses most large commands. With
+    `ess_target` > 0 each reward sharpens as far as the pool lets it."""
+    var es = List[Float64]()
+    var fs = List[Int]()
     for f in range(n_pool):
         var e = 0.0
         for a in range(SMSpec.ATOMS):
             var iw = Float64(spec[unsafe_offset=SMSpec.IW + a])
             if iw > 0:
                 var d = Float64(pool_atoms[unsafe_offset=f * SMSpec.ATOMS + a]) - Float64(spec[unsafe_offset=SMSpec.T + a])
-                e += iw * d * d
-                if e > 14.0:      # e⁻¹⁴ ~ 1e-6: this frame says nothing
+                e += beta * iw * d * d
+                if e > SM_B_E_CUT:      # e⁻¹⁴ ~ 1e-6: this frame says nothing
                     break
-        if e > 14.0:
+        if e > SM_B_E_CUT:
             continue
-        var r = exp(-e)
+        es.append(e)
+        fs.append(f)
+    if len(es) == 0:
+        return 0.0
+    var emin = 0.0
+    var b = 1.0
+    if ess_target > 0:
+        emin = es[0]
+        for i in range(len(es)):
+            emin = min(emin, es[i])
+        b = _sharpest(es, emin, ess_target)
+    var s1 = 0.0
+    var s2 = 0.0
+    var acc = List[Float64](length=latent, fill=0.0)
+    for i in range(len(es)):
+        var x = b * (es[i] - emin)
+        if x > SM_B_E_CUT:
+            continue
+        var r = exp(-x)
         s1 += r
         s2 += r * r
         for k in range(latent):
-            acc[k] += r * Float64(pool_lat[unsafe_offset=f * latent + k])
+            acc[k] += r * Float64(pool_lat[unsafe_offset=fs[i] * latent + k])
     if s1 <= 0:
         return 0.0
     var ess = s1 * s1 / s2
@@ -381,7 +445,7 @@ def _fill_velocity[CMD: Int](mut d: SMPromptData[CMD], frames: Int, bank_n: Int)
 
 
 def _fill_z[R: TrackingRobot, CMD: Int](
-    mut d: SMPromptData[CMD], lib: SMMotionLibrary[R], bank_n: Int, pool_n: Int, atoms: List[Scalar[DT]], lat: List[Scalar[DT]],
+    mut d: SMPromptData[CMD], lib: SMMotionLibrary[R], bank_n: Int, pool_n: Int, atoms: List[Scalar[DT]], lat: List[Scalar[DT]], hold_out: Bool = True,
 ):
     """The reward-derived z: the module's first table."""
     comptime RW = CMD + SMSpec.SIZE
@@ -428,7 +492,7 @@ def _fill_z[R: TrackingRobot, CMD: Int](
     while k < bank_n:
         var row = bp.unsafe_offset(k * RW)
         sm_draw_spec(row.unsafe_offset(CMD), pap, np)
-        if sm_spec_held_out(row.unsafe_offset(CMD)):
+        if hold_out and sm_spec_held_out(row.unsafe_offset(CMD)):
             dropped_held += 1
             continue
         var ess = d.z_of(row.unsafe_offset(CMD), row)
@@ -440,16 +504,20 @@ def _fill_z[R: TrackingRobot, CMD: Int](
 
 
 def sm_prompt_data[C: SMConfigT, CMD: Int](
-    mut tr: SuperMimicTrainer[C], mut lib: SMMotionLibrary[C.ROBOT], bank_n: Int, pool_n: Int = 131072
+    mut tr: SuperMimicTrainer[C], mut lib: SMMotionLibrary[C.ROBOT], bank_n: Int, pool_n: Int = 131072, z_beta: Float64 = 1.0, z_ess: Float64 = 0.0, hold_out: Bool = True
 ) raises -> SMPromptData[CMD]:
     """An interface's tables from a tracker and a library: the velocity
     command when CMD is 3, a reward-derived z when CMD is the latent's width."""
     var atoms = List[Scalar[DT]]()
     var lat = List[Scalar[DT]]()
+    if z_ess > 0 and z_ess < SM_B_MIN_ESS:
+        raise Error("sm_prompt_data: z_ess " + String(z_ess) + " sharpens rewards below the bank's floor of " + String(SM_B_MIN_ESS))
     var d = _common[C, CMD](tr, lib, bank_n, atoms, lat)
+    d.z_beta = z_beta
+    d.z_ess = z_ess
     comptime if CMD == 3:
         _fill_velocity[CMD](d, lib.num_frames, bank_n)
     else:
         comptime assert CMD == SMDims[C.ROBOT].LATENT, "CMD is 3 (velocity) or the latent's width (z)"
-        _fill_z[C.ROBOT, CMD](d, lib, bank_n, pool_n, atoms, lat)
+        _fill_z[C.ROBOT, CMD](d, lib, bank_n, pool_n, atoms, lat, hold_out)
     return d^

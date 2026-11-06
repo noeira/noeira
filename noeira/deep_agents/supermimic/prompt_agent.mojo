@@ -68,6 +68,7 @@ struct SMPromptAgent[P: SMPromptConfigT](Movable):
     var split: Int
     var align_warm: Int           # updates at the alignment's raised weight
     var iteration: Int
+    var resumed_at: Int           # the iteration this process started from
     var updates: Int
     var utd_acc: Float64
     var src: List[Int]            # per lane: −1 a reference command, else a bank row
@@ -91,6 +92,7 @@ struct SMPromptAgent[P: SMPromptConfigT](Movable):
         self.split = split
         self.align_warm = 0
         self.iteration = 0
+        self.resumed_at = 0
         self.updates = 0
         self.utd_acc = 0.0
         self.src = List[Int](length=L, fill=-1)
@@ -106,6 +108,7 @@ struct SMPromptAgent[P: SMPromptConfigT](Movable):
         self.split = move.split
         self.align_warm = move.align_warm
         self.iteration = move.iteration
+        self.resumed_at = move.resumed_at
         self.updates = move.updates
         self.utd_acc = move.utd_acc
         self.src = move.src^
@@ -224,6 +227,13 @@ struct SMPromptAgent[P: SMPromptConfigT](Movable):
         return ib^
 
     # ── the loop ──
+    def resume(mut self, iteration: Int, updates: Int):
+        """Go on from a saved run: the counts and the cosine schedule continue. The
+        replay is empty again, so the warm-up runs again, and Adam's moments restart."""
+        self.iteration = iteration
+        self.resumed_at = iteration
+        self.updates = updates
+
     def iterate(mut self) raises -> SMPromptLog:
         """One env step, and the updates it is owed."""
         comptime B = Self.P.BASE
@@ -246,7 +256,7 @@ struct SMPromptAgent[P: SMPromptConfigT](Movable):
         )
         _ = si^
         self.iteration += 1
-        if self.iteration >= self.sched.warmup:
+        if self.iteration - self.resumed_at >= self.sched.warmup:
             self.utd_acc += self.sched.utd
             while self.utd_acc >= 1.0:
                 self.utd_acc -= 1.0
@@ -273,7 +283,7 @@ struct SMPromptAgent[P: SMPromptConfigT](Movable):
         var n = 0
         var last = SMPromptUpdate(0, 0, 0, 0, 0, 0, 0)
         var lw = SMWMLoss(0, 0, 0, 0, 0)
-        for it in range(1, iters + 1):
+        for it in range(self.iteration + 1, iters + 1):
             var r = self.iterate()
             rs += r.sim_r
             fs += r.falls

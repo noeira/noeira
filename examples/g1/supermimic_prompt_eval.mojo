@@ -38,7 +38,7 @@ from noeira.deep_agents.supermimic.motion_library import SMMotionLibrary
 from noeira.deep_agents.supermimic.prompt import SMSpec, sm_spec_velocity
 from noeira.deep_agents.supermimic.prompt_bank import sm_prompt_data
 from noeira.deep_agents.supermimic.prompt_eval import (
-    SM_E_STEP_STEPS, SM_E_STEP_TAIL, SM_E_SUITE_STEPS, SMEvalTally, SMEvalTask, sm_eval_tasks, sm_median, sm_stand_library,
+    SM_E_SKIP, SM_E_STEP_STEPS, SM_E_STEP_TAIL, SM_E_SUITE_STEPS, SMEvalTally, SMEvalTask, sm_eval_tasks, sm_median, sm_stand_library,
     sm_step_commands,
 )
 from noeira.deep_agents.supermimic.prompt_imagination import SMPromptBatch, sm_imagine_prompt
@@ -250,6 +250,8 @@ def suite[E: EvalEnv](mut e: E, mut tr: Trainer, tasks: List[SMEvalTask], frames
         e.read(states, ended, rews)
         for l in range(LANES):
             tally.step[Robot](tr.base.tables, l, t, states.unsafe_ptr().unsafe_offset(l * D.S).as_unsafe_any_origin(), ended[l], tasks[task_of[l]])
+            if t >= SM_E_SKIP and not tally.ended[l]:
+                tally.trained[l] += rews[l]
             if t >= HONEST_T0 and t < HONEST_T0 + H:
                 sim[l] += rews[l]
                 if ended[l]:
@@ -410,6 +412,8 @@ def main() raises:
     var store = _opt(args, String("--store"), String(""))
     var bank = Int(_opt(args, String("--bank"), String("4096" if PAPER else "64")))
     var pool = Int(_opt(args, String("--pool"), String("131072")))
+    var z_beta = Float64(_opt(args, String("--z-beta"), String("1")))
+    var z_ess = Float64(_opt(args, String("--z-ess"), String("0")))
     var max_clips = Int(_opt(args, String("--max-clips"), String("0")))
     var do_suite = _flag(args, String("--suite")) or not _flag(args, String("--step-test"))
     var do_step = _flag(args, String("--step-test"))
@@ -424,7 +428,7 @@ def main() raises:
     var base = SuperMimicTrainer[C].for_robot(Robot.SIM.create(), ctx)
     if tracker != "":
         print("tracker at iteration", base.load_state(tracker)[0])
-    var data = sm_prompt_data[C, CMD](base, lib, bank, pool)
+    var data = sm_prompt_data[C, CMD](base, lib, bank, pool, z_beta, z_ess)
     var tr = Trainer(base^)
     if prompt != "":
         print("prompt interface at iteration", tr.load_state(prompt)[0])
