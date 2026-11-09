@@ -24,9 +24,17 @@ WHAT EACH SECTION CAN CATCH
     of known returns, against hand-computed values: the drawn bins' mean,
     the all-bins mean, the hard share against the PREVIOUS window's bottom
     decile, and the counters cleared after a take.
+[7] realmimic's count estimator (`bin_estimator="count"`) against its own
+    `_finalize_episodes` on six episodes (terminated, clip-ended, timed out,
+    one shorter than the 50-step continuation window), bins at 0, 3 and 25
+    visits: the returns (1e-5) and the visit counts (exact); a fresh count
+    sampler starts every bin at 0, unvisited.
+[8] seeding the count estimator from a benchmark: a failed clip's bins at 0,
+    another's at G_MAX x its return, each one visit; the hard term then puts
+    most of its mass on the failed clip.
 
 Planted mutants: a disabled truncation rule fails [5], an unclamped goal
-window fails [2]. (The replay ring's gate moved to
+window fails [2]; a dropped continuation and a fixed EMA α each fail [7]. (The replay ring's gate moved to
 `tests/deep_agents/data/test_episodic_replay.mojo`.)
 """
 
@@ -189,6 +197,73 @@ def main() raises:
     t.truth(abs(s1.reset_hard_share - 0.5) < 1e-12, "hard share 2 / 4 (" + String(s1.reset_hard_share) + ")")
     var s2 = sm3.take_stats()
     t.truth(s2.resets == 0 and s2.reset_hard_share == 0.0, "counters cleared after a take")
+
+    print("\n[7] the count estimator (realmimic)")
+    var fresh = SMResetSampler(lib.num_bins, True)
+    var zero = True
+    for b in range(lib.num_bins):
+        zero = zero and fresh.bin_return[b] == 0.0 and fresh.bin_count[b] == 0.0
+    t.truth(zero and fresh.untouched_share() == 1.0, "a fresh count sampler starts every bin at 0, unvisited")
+    var cl = load_npy_2d_f64(dump + "/c_lens.npy", 1).values.copy()
+    var cf = load_npy_2d_f64(dump + "/c_flags.npy", 2).values.copy()
+    var cmax = 0
+    for e in range(len(cl)):
+        cmax = max(cmax, Int(cl[e]))
+    var crw = load_npy_2d_f64(dump + "/c_rewards.npy", cmax).values.copy()
+    var cbn = load_npy_2d_f64(dump + "/c_bins.npy", cmax).values.copy()
+    var ceps = List[SMEpisodeLog]()
+    for e in range(len(cl)):
+        var lg = SMEpisodeLog()
+        for k in range(Int(cl[e])):
+            lg.rewards.append(crw[e * cmax + k])
+            lg.bins.append(Int(cbn[e * cmax + k]))
+        lg.terminated = cf[e * 2] > 0.5
+        lg.clip_end = cf[e * 2 + 1] > 0.5
+        ceps.append(lg^)
+    var cr0 = load_npy_2d_f64(dump + "/c_return0.npy", 1).values.copy()
+    var cc0 = load_npy_2d_f64(dump + "/c_count0.npy", 1).values.copy()
+    var cr1 = load_npy_2d_f64(dump + "/c_return1.npy", 1).values.copy()
+    var cc1 = load_npy_2d_f64(dump + "/c_count1.npy", 1).values.copy()
+    var smc = SMResetSampler(lib.num_bins, True)
+    var regimes = List[Bool](length=3, fill=False)
+    for b in range(lib.num_bins):
+        smc.bin_return[b] = cr0[b]
+        smc.bin_count[b] = cc0[b]
+        regimes[0] = regimes[0] or cc0[b] == 0.0
+        regimes[1] = regimes[1] or (cc0[b] > 0.0 and cc0[b] < 20.0)
+        regimes[2] = regimes[2] or cc0[b] >= 20.0
+    t.truth(regimes[0] and regimes[1] and regimes[2], "the fixture holds unvisited, young (< 1/α) and old (≥ 1/α) bins")
+    smc.finalize(ceps)
+    var ecnt = 0.0
+    var cnt_ok = True
+    for b in range(lib.num_bins):
+        ecnt = max(ecnt, abs(smc.bin_return[b] - cr1[b]) / max(1.0, abs(cr1[b])))
+        cnt_ok = cnt_ok and smc.bin_count[b] == cc1[b]
+    t.truth(ecnt <= 1e-5, "the bin returns fold as realmimic's: max rel err " + String(ecnt))
+    t.truth(cnt_ok, "one visit counted per touched bin")
+    t.truth(smc.untouched_share() == 0.0, "every bin of the fixture was visited")
+
+    print("\n[8] seeded from a benchmark")
+    var sd = SMResetSampler(lib.num_bins, True)
+    var rets: List[Float64] = [0.9, 0.5, 0.95, 1.2]
+    var fl8: List[Bool] = [False, False, True, False]
+    sd.seed_from_benchmark(lib.bin_clip, rets, fl8)
+    var seeded = True
+    for b in range(lib.num_bins):
+        var c = lib.bin_clip[b]
+        var want = 0.0 if fl8[c] else min(SM_G_MAX * rets[c], SM_G_MAX)
+        seeded = seeded and abs(sd.bin_return[b] - want) < 1e-12 and sd.bin_count[b] == 1.0
+    t.truth(seeded, "failed clip's bins at 0, the others at G_MAX x return (capped), one visit each")
+    var p8 = sd.probabilities()
+    var on_failed = 0.0
+    var n_failed_bins = 0
+    for b in range(lib.num_bins):
+        if fl8[lib.bin_clip[b]]:
+            on_failed += p8[b]
+            n_failed_bins += 1
+    var uniform_share = Float64(n_failed_bins) / Float64(lib.num_bins)
+    print("  the failed clip holds", n_failed_bins, "of", lib.num_bins, "bins and", on_failed, "of the draw mass")
+    t.truth(on_failed > uniform_share + 0.3, "the draws go to the failed clip well beyond its uniform share")
 
     print("\n===", t.checks - t.fails, "/", t.checks, "passed ===")
     if t.fails != 0:

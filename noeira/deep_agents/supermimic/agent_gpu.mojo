@@ -27,7 +27,7 @@ from max.gpu import global_idx
 from max.gpu.host import DeviceBuffer, DeviceContext
 
 from noeira.core.logger import Logger, NoOpLogger
-from noeira.deep_agents.supermimic.agent import SMSchedule, sm_cosine_lr, sm_schedule
+from noeira.deep_agents.supermimic.agent import SMSchedule, sm_cosine_lr, sm_restart_lr, sm_schedule
 from noeira.deep_agents.supermimic.metrics import SMIterInfo, SMTrainLog, sm_tick
 from noeira.io.artifact_sink import ArtifactSink
 from noeira.deep_agents.supermimic.config import SMConfigT
@@ -116,6 +116,10 @@ struct SuperMimicAgentGpu[C: SMConfigT, BS: TrackingBatchedSim](Movable):
     var t_pi: Float64
     var lr: Float64
     var last_avg_reward: Float64      # the last log window's avg_reward (the run's outcome)
+    var resumed_at: Int               # the iteration this process started from (the warm-up counts from it)
+    var restart_at: Int               # a warm restart of the lr from this iteration (-1: none)
+    var restart_ratio: Float64
+    var restart_decay: Int
     # device batches, allocated once
     var wb: SMWindowBatch[Self.C.ROBOT]
     var ib: SMImagBatch[Self.C.ROBOT]
@@ -151,6 +155,10 @@ struct SuperMimicAgentGpu[C: SMConfigT, BS: TrackingBatchedSim](Movable):
         self.trainer = SuperMimicTrainer[Self.C].for_robot(R.SIM.create(), Optional(ctx))
         self.sched = sched^
         self.iteration = 0
+        self.resumed_at = 0
+        self.restart_at = -1
+        self.restart_ratio = 0.3
+        self.restart_decay = 0
         self.updates = 0
         self.utd_acc = 0.0
         self.ep_sum = List[Float64](length=Self.C.LANES, fill=0.0)
@@ -205,6 +213,10 @@ struct SuperMimicAgentGpu[C: SMConfigT, BS: TrackingBatchedSim](Movable):
         self.t_pi = move.t_pi
         self.lr = move.lr
         self.last_avg_reward = move.last_avg_reward
+        self.resumed_at = move.resumed_at
+        self.restart_at = move.restart_at
+        self.restart_ratio = move.restart_ratio
+        self.restart_decay = move.restart_decay
         self.wb = move.wb^
         self.ib = move.ib^
         self.goals = move.goals^
@@ -280,11 +292,11 @@ struct SuperMimicAgentGpu[C: SMConfigT, BS: TrackingBatchedSim](Movable):
         self.t_sim += Float64(perf_counter_ns() - t0) * 1e-9
         self.iteration += 1
         var info = SMIterInfo(False, SMWMLoss(0, 0, 0, 0, 0), SMUpdateMetrics(0, 0, 0, 0, 0, 0), si.reward_mean, si.n_terminated)
-        if self.iteration >= self.sched.warmup:
+        if self.iteration - self.resumed_at >= self.sched.warmup:     # a resumed replay starts empty
             self.utd_acc += self.sched.utd
             while self.utd_acc >= 1.0:
                 self.utd_acc -= 1.0
-                self.lr = sm_cosine_lr(self.iteration, self.sched.total_iterations, self.sched.lr)
+                self.lr = self._lr()
                 self.trainer.set_lr(self.lr)
                 var t1 = perf_counter_ns()
                 var acc = SMWMLoss(0, 0, 0, 0, 0)
@@ -304,6 +316,26 @@ struct SuperMimicAgentGpu[C: SMConfigT, BS: TrackingBatchedSim](Movable):
                 info.updated = True
         return info^
 
+    def resume(mut self, iteration: Int, updates: Int, lr_restart_ratio: Float64 = 0.0, lr_restart_decay: Int = 0):
+        """Go on from a checkpoint's counters (`SuperMimicTrainer.load_state`):
+        the iterations count on to the run's total, the warm-up runs again (the
+        replay is empty) and Adam re-warms (its moments are not saved). With a
+        restart ratio and decay, realmimic's warm restart for resumed runs: the
+        lr restarts at ratio x lr and decays by a second cosine to the first's
+        final ratio over `lr_restart_decay` iterations."""
+        self.iteration = iteration
+        self.updates = updates
+        self.resumed_at = iteration
+        if lr_restart_ratio > 0.0 and lr_restart_decay > 0:
+            self.restart_at = iteration
+            self.restart_ratio = lr_restart_ratio
+            self.restart_decay = lr_restart_decay
+
+    def _lr(self) -> Float64:
+        if self.restart_at >= 0 and self.iteration >= self.restart_at:
+            return sm_restart_lr(self.iteration - self.restart_at, self.restart_decay, self.sched.lr, self.restart_ratio)
+        return sm_cosine_lr(self.iteration, self.sched.total_iterations, self.sched.lr)
+
     def train[L: Logger = NoOpLogger, BB: TrackingBatchedSim = Self.BS](
         mut self,
         iters: Int,
@@ -320,7 +352,7 @@ struct SuperMimicAgentGpu[C: SMConfigT, BS: TrackingBatchedSim](Movable):
         """As `SuperMimicAgent.train`; with `bench`, the fixed-clip benchmark
         every `bench.every` iterations and at the end (`SMInRunBench`)."""
         var lg = SMTrainLog(Self.C.HORIZON, Self.C.LANES)
-        for it in range(1, iters + 1):
+        for it in range(self.iteration + 1, iters + 1):
             lg.add(self.iterate())
             if sm_tick[Self.C, L](
                 self.trainer, lg, self.env.sampler, it, iters, self.updates, self.finished, self.finished_len, self.lr, self.t_sim, self.t_wm, self.t_pi,

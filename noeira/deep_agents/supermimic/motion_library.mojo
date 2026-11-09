@@ -278,6 +278,7 @@ comptime SM_SAMPLER_GAMMA: Float64 = 0.99
 comptime SM_EMA_ALPHA: Float64 = 0.05
 comptime SM_MEMORY_ALPHA: Float64 = 0.01
 comptime SM_MIN_REMAINING: Int = 100
+comptime SM_BOOTSTRAP_STEPS: Int = 50      # the count estimator: final steps whose mean reward sets the continuation
 
 
 struct SMEpisodeLog(Copyable, Movable):
@@ -319,16 +320,35 @@ struct SMSamplerStats(Copyable, Movable):
 
 
 struct SMResetSampler(Movable):
+    """The reproduction's return-based reset sampler, with two estimators
+    of a bin's return G_b:
+
+    EMA (the reproduction's, `count=False`): every bin starts at G_MAX, the
+    best possible, and moves 5 % per visit; a truncated episode drops its
+    last 100 steps, a clip's end is left as it is.
+
+    COUNT (realmimic's `bin_estimator="count"`, `envs/mdp/commands.py`):
+    every bin starts at 0, the worst, so unvisited bins are drawn first; a
+    bin's estimate is the running mean of its first 1/α visits, then the
+    same EMA (α = max(1/(n + 1), 0.05), one visit per bin per fold); an
+    episode no fall ended (a time-out or its clip's end) continues with its
+    last 50 steps' mean reward held forever, v = rate/(1 − γ) clamped to
+    [0, G_MAX]. realmimic's finding: with ~10⁶ bins the EMA estimate keeps the
+    rare hard ones looking easy and every clip's last second looking hard."""
     var bin_return: List[Float64]
     var bin_memory: List[Float64]
+    var bin_count: List[Float64]      # visits per bin (the count estimator; empty with the EMA one)
+    var count: Bool
     var n_draw: Int                   # draws since the last `take_stats`
     var draw_g: Float64
     var draw_hard: Int
     var hard_g: Float64               # the bottom-decile G_b at the last `take_stats`
 
-    def __init__(out self, num_bins: Int):
-        self.bin_return = List[Float64](length=num_bins, fill=SM_G_MAX)
+    def __init__(out self, num_bins: Int, count: Bool = False):
+        self.count = count
+        self.bin_return = List[Float64](length=num_bins, fill=0.0 if count else SM_G_MAX)
         self.bin_memory = List[Float64](length=num_bins, fill=1.0 / Float64(num_bins))
+        self.bin_count = List[Float64](length=num_bins if count else 0, fill=0.0)
         self.n_draw = 0
         self.draw_g = 0.0
         self.draw_hard = 0
@@ -337,10 +357,38 @@ struct SMResetSampler(Movable):
     def __init__(out self, *, deinit move: Self):
         self.bin_return = move.bin_return^
         self.bin_memory = move.bin_memory^
+        self.bin_count = move.bin_count^
+        self.count = move.count
         self.n_draw = move.n_draw
         self.draw_g = move.draw_g
         self.draw_hard = move.draw_hard
         self.hard_g = move.hard_g
+
+    def seed_from_benchmark(mut self, bin_clip: List[Int], norm_return: List[Float64], failed: List[Bool]):
+        """Start the count estimator from a benchmark of the current policy
+        (every clip played once, as `eval.mojo` does): a failed clip's bins at
+        0, the worst; another clip's at G_MAX x its normalised return (a
+        per-step reward 0.1 x r held forever is G_MAX x r); each as ONE visit,
+        so real visits take over by the running mean. A fine-tune of a trained
+        policy then skips the coverage phase the pessimistic start costs (the
+        benchmark already visited every clip). Not realmimic's: its runs
+        start from scratch."""
+        for b in range(len(self.bin_return)):
+            var c = bin_clip[b]
+            self.bin_return[b] = 0.0 if failed[c] else min(max(SM_G_MAX * norm_return[c], 0.0), SM_G_MAX)
+            if self.count:
+                self.bin_count[b] = 1.0
+
+    def untouched_share(self) -> Float64:
+        """The share of bins no episode has visited yet (the count estimator's
+        coverage; 0 with the EMA one, which does not count)."""
+        if not self.count or len(self.bin_count) == 0:
+            return 0.0
+        var n = 0
+        for b in range(len(self.bin_count)):
+            if self.bin_count[b] == 0.0:
+                n += 1
+        return Float64(n) / Float64(len(self.bin_count))
 
     def note_draw(mut self, b: Int):
         """Count a reset drawn from bin b (the envs call it after each draw)."""
@@ -427,6 +475,9 @@ struct SMResetSampler(Movable):
     def finalize(mut self, episodes: List[SMEpisodeLog]):
         """Fold a batch of finished episodes (all those reset at one step) into
         the per-bin return estimates."""
+        if self.count:
+            self._finalize_count(episodes)
+            return
         var nb = len(self.bin_return)
         var sums = List[Float64](length=nb, fill=0.0)
         var cnts = List[Float64](length=nb, fill=0.0)
@@ -447,3 +498,37 @@ struct SMResetSampler(Movable):
         for b in range(nb):
             if cnts[b] > 0:
                 self.bin_return[b] = (1.0 - SM_EMA_ALPHA) * self.bin_return[b] + SM_EMA_ALPHA * sums[b] / cnts[b]
+
+    def _finalize_count(mut self, episodes: List[SMEpisodeLog]):
+        """realmimic's count fold (`_finalize_episodes`, `bin_estimator ==
+        "count"`, no critic bootstrap: its `bootstrap_fn` is never set)."""
+        var nb = len(self.bin_return)
+        var sums = List[Float64](length=nb, fill=0.0)
+        var cnts = List[Float64](length=nb, fill=0.0)
+        for e in range(len(episodes)):
+            var T = len(episodes[e].rewards)
+            if T == 0:
+                continue
+            # an episode no fall ended continues: its last steps' reward rate, held forever
+            var rtg = 0.0
+            if not episodes[e].terminated:
+                var k0 = max(T - SM_BOOTSTRAP_STEPS, 0)
+                var rate = 0.0
+                for k in range(k0, T):
+                    rate += episodes[e].rewards[k]
+                rate /= Float64(T - k0)
+                rtg = min(max(rate / (1.0 - SM_SAMPLER_GAMMA), 0.0), SM_G_MAX)
+            # R_t = Σ_{s≥t} γ^{s−t} r_s + γ^{T−t} v, every step kept
+            var t = T - 1
+            while t >= 0:
+                rtg = episodes[e].rewards[t] + SM_SAMPLER_GAMMA * rtg
+                var b = episodes[e].bins[t]
+                sums[b] += rtg
+                cnts[b] += 1.0
+                t -= 1
+        for b in range(nb):
+            if cnts[b] > 0:
+                var mean = min(max(sums[b] / cnts[b], 0.0), SM_G_MAX)
+                var alpha = max(1.0 / (self.bin_count[b] + 1.0), SM_EMA_ALPHA)
+                self.bin_count[b] += 1.0
+                self.bin_return[b] = (1.0 - alpha) * self.bin_return[b] + alpha * mean

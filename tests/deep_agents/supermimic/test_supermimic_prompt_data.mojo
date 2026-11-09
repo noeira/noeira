@@ -25,6 +25,9 @@ WHAT EACH SECTION CAN CATCH
 [6] commands: a lane holds its command `DEF_HOLD` steps, draws again after, and
     both sources appear with the right share.
 [7] resume: the counts go on from the checkpoint and the warm-up runs again.
+[8] the pool's file: what `z_of` reads comes back from `save_pool`'s file bit
+    for bit (its scalars, and z for rewards that select frames), and a file of
+    another command width is refused.
 """
 
 from std.math import cos, exp, sin
@@ -37,7 +40,7 @@ from noeira.deep_agents.supermimic.motion_library import SMMotionLibrary
 from noeira.deep_agents.supermimic.prompt import SMSpec, sm_spec_velocity
 from noeira.deep_agents.supermimic.prompt_agent import SMPromptAgent
 from noeira.deep_agents.supermimic.prompt_bank import (
-    sm_draw_spec, sm_frame_atoms, sm_prompt_data, sm_spec_held_out, sm_window_mean, sm_z_of_spec,
+    SMPromptData, sm_draw_spec, sm_frame_atoms, sm_prompt_data, sm_spec_held_out, sm_window_mean, sm_z_of_spec,
 )
 from noeira.deep_agents.supermimic.prompt_policy import SMPromptConfig
 from noeira.deep_agents.supermimic.prompt_trainer import SMPromptTrainer
@@ -349,6 +352,52 @@ def main() raises:
     agent.train(1002, 0)
     t.truth(agent.iteration == 1002, "a resumed run counts on to its total, not by it")
     t.truth(agent.updates == 400, "and waits for the warm-up again: its replay is empty")
+
+    print("\n[8] the pool's file")
+    comptime ZW = 8
+    comptime NPOOL = 200
+    var dz = SMPromptData[ZW](0, 0, ZW)
+    dz.pool_n = NPOOL
+    dz.pool_atoms = List[Scalar[DT]](length=NPOOL * F, fill=0)
+    dz.pool_lat = List[Scalar[DT]](length=NPOOL * ZW, fill=0)
+    dz.lbar = List[Scalar[DT]](length=ZW, fill=0)
+    for i in range(NPOOL * F):
+        dz.pool_atoms[i] = Scalar[DT](random_float64(-1.0, 1.0))
+    for i in range(NPOOL * ZW):
+        dz.pool_lat[i] = Scalar[DT](random_float64(-1.0, 1.0))
+    for k in range(ZW):
+        dz.lbar[k] = Scalar[DT](random_float64(-0.1, 0.1))
+    dz.z_scale = 3.25
+    dz.z_beta = 2.0
+    dz.z_ess = 40.0
+    var pool_path = String("/tmp/sm_pool_test.bin")
+    dz.save_pool(pool_path)
+    var back = SMPromptData[ZW].load_pool(pool_path)
+    t.truth(back.pool_n == NPOOL and back.z_scale == 3.25 and back.z_beta == 2.0 and back.z_ess == 40.0, "its scalars come back")
+    var spec8 = List[Scalar[DT]](length=SMSpec.SIZE, fill=0)
+    var za = List[Scalar[DT]](length=ZW, fill=0)
+    var zb = List[Scalar[DT]](length=ZW, fill=0)
+    var asks: List[Float64] = [0.5, 0.0, 0.0, -0.3, 0.2, 0.4, 0.0, 0.0, -0.8]
+    var same_z = True
+    var moved = False
+    for c in range(3):
+        sm_spec_velocity[DT](spec8.unsafe_ptr().as_unsafe_any_origin(), Scalar[DT](asks[3 * c]), Scalar[DT](asks[3 * c + 1]), Scalar[DT](asks[3 * c + 2]))
+        for k in range(ZW):
+            za[k] = 0
+            zb[k] = 0
+        var ea = dz.z_of(spec8.unsafe_ptr().as_unsafe_any_origin(), za.unsafe_ptr().as_unsafe_any_origin())
+        var eb = back.z_of(spec8.unsafe_ptr().as_unsafe_any_origin(), zb.unsafe_ptr().as_unsafe_any_origin())
+        same_z = same_z and ea == eb
+        for k in range(ZW):
+            same_z = same_z and za[k] == zb[k]
+            moved = moved or za[k] != 0
+    t.truth(same_z and moved, "z_of reads the same z from the file, bit for bit (and the rewards did select frames)")
+    var refused = False
+    try:
+        _ = SMPromptData[ZW + 1].load_pool(pool_path)
+    except:
+        refused = True
+    t.truth(refused, "a file of another command width is refused")
 
     print("\n===", t.checks - t.fails, "/", t.checks, "passed ===")
     if t.fails > 0:

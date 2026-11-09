@@ -41,6 +41,22 @@ Options
                curve (`avg_reward` averages episodes the reset sampler chose)
 --bench-clips K  that set: K clips evenly spaced over the library (default
                the benchmark's lane count, 512 at paper scale: one clip per lane)
+--bench-list FILE  that set: the clips whose library indices FILE lists, one per
+               line (e.g. a benchmark's failures and hardest clips)
+--resume PATH  go on from a checkpoint (`last`, or a run's `final.ckpt`): its
+               networks and counters; `--iters` stays the run's TOTAL. The
+               replay and Adam start empty, the sampler's estimates fresh
+--lr-restart R   with --resume, realmimic's warm restart: the lr restarts at
+               R x lr (default 0.3) and decays by a second cosine to 0.03 x lr
+               over --lr-restart-decay N iterations (default: to --iters);
+               0 = go on with the first schedule
+--sampler S    the reset sampler's bin estimate: `ema` (the reproduction's,
+               default) or `count` (realmimic's: pessimistic for unvisited
+               bins, a running mean, clip ends continued)
+--sampler-seed CSV  with `count`: start the estimate from a benchmark of the
+               resumed policy (`supermimic_eval`'s benchmark.csv on the same
+               library): failed clips' bins at 0, the others at G_MAX x their
+               return, one visit each; skips the coverage phase of a fine-tune
 
 THE RUN IS AN OBJECT ON DISK: `runs/<id>/` holds `run.kv`, `metrics.csv` (the
 `SMMetrics` bundle every `--log` steps) and the checkpoint `last` (world
@@ -64,7 +80,7 @@ from noeira.core.run_session import RunLogger, finish_run, run_logger
 from noeira.deep_agents.supermimic import SMConfig, sm_agent, sm_agent_gpu
 from noeira.deep_agents.supermimic.eval import SMInRunBench
 from noeira.io.artifact_sink import ArtifactSink, sink_for_run
-from noeira.deep_agents.supermimic.motion_library import SMMotionLibrary
+from noeira.deep_agents.supermimic.motion_library import SMMotionLibrary, SMResetSampler
 from noeira.deep_agents.supermimic.robot import G1BatchedSim, G1Robot, G1Sim, G1MjlabRobot, G1MjlabSim, G1MjlabBatchedSim
 from noeira.envs.robots import UnitreeG1
 from noeira.envs.robots.unitree_g1_pd import G1_N_DOF, g1_default_pos
@@ -182,6 +198,58 @@ def _from_store(spec: String, max_clips: Int) raises -> SMMotionLibrary[Robot]:
     return SMMotionLibrary[Robot](rows^, lens, _q0())
 
 
+def _subset_of(lib: SMMotionLibrary[Robot], clips: List[Int]) raises -> SMMotionLibrary[Robot]:
+    """The listed clips of `lib`, in that order."""
+    var lens = List[Int]()
+    var rows = List[Scalar[DT]]()
+    comptime S = 71
+    for i in range(len(clips)):
+        var c = clips[i]
+        if c < 0 or c >= lib.num_clips:
+            raise Error("--bench-list: clip " + String(c) + " is outside the library's " + String(lib.num_clips))
+        var f0 = lib.clip_start[c]
+        var l = lib.clip_len[c]
+        lens.append(l)
+        var o = len(rows)
+        rows.resize(o + l * S, 0)
+        for j in range(l * S):
+            rows[o + j] = lib.rows[f0 * S + j]
+    return SMMotionLibrary[Robot](rows^, lens, _q0())
+
+
+def _read_benchmark(path: String, n_clips: Int) raises -> Tuple[List[Float64], List[Bool]]:
+    """A benchmark.csv's per-clip normalised return and failure, indexed by its `clip` column."""
+    var ret = List[Float64](length=n_clips, fill=-1.0)
+    var failed = List[Bool](length=n_clips, fill=False)
+    var seen = 0
+    with open(path, "r") as f:
+        var lines = f.read().split("\n")
+        for i in range(1, len(lines)):
+            var t = String(lines[i].strip())
+            if t.byte_length() == 0:
+                continue
+            var cols = t.split(",")
+            var c = Int(String(cols[0]))
+            if c < 0 or c >= n_clips:
+                raise Error("--sampler-seed: clip " + String(c) + " is outside the library's " + String(n_clips))
+            ret[c] = Float64(String(cols[3]))
+            failed[c] = String(cols[4]) == "1"
+            seen += 1
+    if seen != n_clips:
+        raise Error("--sampler-seed: " + String(seen) + " clips in " + path + ", the library has " + String(n_clips))
+    return (ret^, failed^)
+
+
+def _read_ints(path: String) raises -> List[Int]:
+    var out = List[Int]()
+    with open(path, "r") as f:
+        for line in f.read().split("\n"):
+            var t = String(line.strip())
+            if t.byte_length() > 0:
+                out.append(Int(t))
+    return out^
+
+
 def _subset(lib: SMMotionLibrary[Robot], k: Int) raises -> SMMotionLibrary[Robot]:
     """K clips evenly spaced over `lib` (clip i · n / K): a fixed set that
     spans every store of a sorted import."""
@@ -213,7 +281,8 @@ def _bench(
 def _train(
     var lib: SMMotionLibrary[Robot], iters: Int, log_every: Int, noise: Bool, seed_v: Int, ckpt_every: Int,
     lp: Pointer[RunLogger, MutAnyOrigin], ckpt: String, artifacts: Optional[ArtifactSink], run_dir: String,
-    bench_every: Int, bench_clips: Int,
+    bench_every: Int, bench_clips: Int, bench_list: List[Int], resume: String, lr_restart: Float64, lr_restart_decay: Int,
+    count: Bool, sampler_seed: String,
 ) raises -> String:
     """Train in the build's mode; returns the run's outcome."""
     var t0 = perf_counter_ns()
@@ -221,8 +290,20 @@ def _train(
     var avg: Float64
     comptime if MODE == 2:
         var dctx = DeviceContext()
-        var bench_lib = Optional(_subset(lib, (bench_clips if bench_clips > 0 else BENCH_LANES) if bench_every > 0 else 1))
+        var bench_lib = Optional(_subset_of(lib, bench_list) if len(bench_list) > 0 else _subset(lib, (bench_clips if bench_clips > 0 else BENCH_LANES) if bench_every > 0 else 1))
         var agent = sm_agent_gpu[C, RBatched[C.LANES]](dctx, lib^, RBatched[C.LANES].create(dctx), iters, noise, seed_v)
+        if count:
+            agent.env.sampler = SMResetSampler(agent.env.lib.num_bins, True)
+            if sampler_seed.byte_length() > 0:
+                var bm = _read_benchmark(sampler_seed, agent.env.lib.num_clips)
+                agent.env.sampler.seed_from_benchmark(agent.env.lib.bin_clip, bm[0], bm[1])
+                print("  count estimator seeded from", sampler_seed)
+        if resume.byte_length() > 0:
+            var ctr = agent.trainer.load_state(resume)
+            var decay = lr_restart_decay if lr_restart_decay > 0 else iters - ctr[0]
+            agent.resume(ctr[0], ctr[1], lr_restart, decay)
+            print("  resumed from", resume, "at iteration", ctr[0], "(", ctr[1], "updates ), to", iters, "| lr restart", lr_restart, "over", decay, "iterations")
+        print("  reset sampler:", "count (realmimic)" if count else "ema (the reproduction's)")
         if bench_every > 0:
             var bench = _bench(dctx, bench_lib.take(), bench_every)
             agent.train[RunLogger, BenchSim](
@@ -239,6 +320,18 @@ def _train(
         comptime if TARGET == "gpu":
             ctx = DeviceContext()
         var agent = sm_agent[C](lib^, iters, noise, seed_v, ctx=ctx)
+        if count:
+            agent.env.sampler = SMResetSampler(agent.env.lib.num_bins, True)
+            if sampler_seed.byte_length() > 0:
+                var bm = _read_benchmark(sampler_seed, agent.env.lib.num_clips)
+                agent.env.sampler.seed_from_benchmark(agent.env.lib.bin_clip, bm[0], bm[1])
+                print("  count estimator seeded from", sampler_seed)
+        if resume.byte_length() > 0:
+            var ctr = agent.trainer.load_state(resume)
+            var decay = lr_restart_decay if lr_restart_decay > 0 else iters - ctr[0]
+            agent.resume(ctr[0], ctr[1], lr_restart, decay)
+            print("  resumed from", resume, "at iteration", ctr[0], "(", ctr[1], "updates ), to", iters, "| lr restart", lr_restart, "over", decay, "iterations")
+        print("  reset sampler:", "count (realmimic)" if count else "ema (the reproduction's)")
         agent.train[RunLogger](iters, log_every, logger=lp, checkpoint_every=ckpt_every, checkpoint_path=ckpt, artifacts=artifacts, run_dir=run_dir)
         updates = agent.updates
         avg = agent.last_avg_reward
@@ -261,6 +354,17 @@ def main() raises:
     var ckpt_every = Int(_opt(args, String("--ckpt-every"), String("0")))
     var bench_every = Int(_opt(args, String("--bench-every"), String("0")))
     var bench_clips = Int(_opt(args, String("--bench-clips"), String("0")))
+    var bench_list_path = _opt(args, String("--bench-list"), String(""))
+    var resume = _opt(args, String("--resume"), String(""))
+    var lr_restart = Float64(_opt(args, String("--lr-restart"), String("0.3")))
+    var lr_restart_decay = Int(_opt(args, String("--lr-restart-decay"), String("0")))
+    var sampler = _opt(args, String("--sampler"), String("ema"))
+    if sampler != "ema" and sampler != "count":
+        raise Error("--sampler is ema or count, not " + sampler)
+    var sampler_seed = _opt(args, String("--sampler-seed"), String(""))
+    if sampler_seed.byte_length() > 0 and sampler != "count":
+        raise Error("--sampler-seed seeds the count estimator: give --sampler count")
+    var bench_list = _read_ints(bench_list_path) if bench_list_path.byte_length() > 0 else List[Int]()
     if bench_every > 0 and MODE != 2:
         raise Error("--bench-every needs the device env (-D SM_GPU=2)")
 
@@ -289,12 +393,18 @@ def main() raises:
     logger.set_config("library_frames", String(lib.num_frames))
     logger.set_config("library_clips", String(lib.num_clips))
     logger.set_config("bench_every", String(bench_every))
+    logger.set_config("sampler", sampler + (String(" seeded from ") + sampler_seed if sampler_seed.byte_length() > 0 else String("")))
+    logger.set_config("resume", resume)
+    logger.set_config("lr_restart", String(lr_restart) if resume.byte_length() > 0 else String("off"))
     register_run(run, logger)
     var artifacts = sink_for_run(run.id, run.dir)
     var lp = Pointer(to=logger).as_unsafe_any_origin()
     var ckpt = run.checkpoint_path(String("last"))
     print("SuperMimic, mode", MODE, "(" + String(TARGET) + "):", C.LANES, "lanes, H =", C.HORIZON, ", WM batch", C.WM_BATCH, ", policy batch", C.PI_BATCH, ", noise", noise)
     print("  run", run.dir)
-    var outcome = _train(lib^, iters, log_every, noise, seed_v, ckpt_every, lp, ckpt, artifacts, run.dir, bench_every, bench_clips)
+    var outcome = _train(
+        lib^, iters, log_every, noise, seed_v, ckpt_every, lp, ckpt, artifacts, run.dir, bench_every, bench_clips, bench_list, resume,
+        lr_restart, lr_restart_decay, sampler == "count", sampler_seed,
+    )
     finish_run(run, logger, artifacts, outcome)
     _ = logger  # lifetime extender for lp

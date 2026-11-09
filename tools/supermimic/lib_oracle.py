@@ -22,6 +22,11 @@
   of 3–25 steps each closed by a terminal row); `multinomial` is wrapped to
   capture the window and start masks and to pick (and record) eligible rows.
   Files `r_*`.
+* realmimic's `_finalize_episodes` with `bin_estimator="count"` (its default;
+  `references/realmimic/src/supermimic/envs/mdp/commands.py`) VERBATIM on six
+  episodes (two terminated, one at its clip's end, three timed out, one of
+  them shorter than the 50-step continuation window), bins starting at 0, 3 or
+  25 visits so both the running mean and the EMA floor fold. Files `c_*`.
 """
 
 from __future__ import annotations
@@ -51,6 +56,50 @@ def _load_by_path(name, path):
 def f32(x):
     return np.asarray(x, dtype=np.float32).astype(np.float64)
 
+
+def count_part(ho, lib, tracked, sv, rng) -> None:
+    """realmimic's count estimator on six episodes (files `c_*`)."""
+    rmod = _load_by_path("realmimic_commands", ho.REPO / "references" / "realmimic" / "src" / "supermimic" / "envs" / "mdp" / "commands.py")
+    torch.set_default_dtype(torch.float32)
+    cfg = rmod.MultiClipMotionCommandCfg(npz_files=[], anchor_body_name="torso_link", body_names=tracked)
+    assert cfg.bin_estimator == "count" and cfg.bootstrap_steps == 50, (cfg.bin_estimator, cfg.bootstrap_steps)
+    cmd = rmod.MultiClipMotionCommand.__new__(rmod.MultiClipMotionCommand)
+    cmd.cfg = cfg
+    cmd.library = lib
+    cmd.device = torch.device("cpu")
+    nb = lib.num_bins
+    E = 6
+    cmd.max_ep_steps = 502
+    cmd._gamma_pow = cfg.gamma ** torch.arange(cmd.max_ep_steps, dtype=torch.float64)
+    cmd.ep_rewards = torch.zeros(E, cmd.max_ep_steps)
+    cmd.ep_bins = torch.zeros(E, cmd.max_ep_steps, dtype=torch.long)
+    lens = [40, 230, 180, 7, 150, 30]
+    term = [True, False, False, True, False, False]
+    cend = [False, True, False, False, False, False]   # 2, 4 and 5 time out; 5 is shorter than the 50-step window
+    for e in range(E):
+        cmd.ep_rewards[e, : lens[e]] = torch.tensor(rng.uniform(0.0, 0.15, lens[e]), dtype=torch.float32)
+        cmd.ep_bins[e, : lens[e]] = torch.tensor(rng.integers(0, nb, lens[e]))
+    cmd.ep_len = torch.tensor(lens)
+    cmd.clip_end = torch.tensor(cend)
+    cmd.bootstrap_fn = None
+    cmd._env = types.SimpleNamespace(termination_manager=types.SimpleNamespace(terminated=torch.tensor(term)))
+    cmd.unphysical = torch.zeros(E, dtype=torch.bool)
+    cmd.unphysical_episodes = 0
+    cmd.metrics = {"episode_return_to_go": torch.zeros(E)}
+    counts0 = rng.choice(np.array([0.0, 3.0, 25.0]), nb)
+    cmd.bin_count = torch.tensor(counts0, dtype=torch.float32)
+    cmd.bin_return = torch.tensor(np.where(counts0 == 0, 0.0, rng.uniform(0.0, cfg.g_max, nb)), dtype=torch.float32)
+    sv("c_rewards", cmd.ep_rewards[:, :max(lens)])
+    sv("c_bins", cmd.ep_bins[:, :max(lens)])
+    sv("c_lens", np.array(lens, dtype=np.float64)[:, None])
+    sv("c_flags", np.stack([np.array(term, dtype=np.float64), np.array(cend, dtype=np.float64)], -1))
+    sv("c_return0", cmd.bin_return.clone())
+    sv("c_count0", cmd.bin_count.clone())
+    cmd._finalize_episodes(torch.arange(E))
+    sv("c_return1", cmd.bin_return)
+    sv("c_count1", cmd.bin_count)
+    touched = int((cmd.bin_count != torch.tensor(counts0, dtype=torch.float32)).sum())
+    print(f"  [count] realmimic's estimator: {E} episodes, {touched} of {nb} bins folded")
 
 def main() -> None:
     ap = argparse.ArgumentParser(description=__doc__.splitlines()[0])
@@ -178,6 +227,7 @@ def main() -> None:
     sv("f_return1", cmd.bin_return)
     print(f"  [sampler] {n_draw} draws over {nb} bins; finalize {E} episodes ({sum(1 for t_, c_ in zip(term, cend) if not t_ and not c_)} truncated)")
     replay_part(R, a.out, rng)
+    count_part(ho, lib, tracked, sv, rng)          # last: the earlier parts keep their random streams
     print(f"-> {a.out}")
 
 

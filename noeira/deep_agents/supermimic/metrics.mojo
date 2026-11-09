@@ -274,6 +274,8 @@ def sm_tick[C: SMConfigT, L: Logger](
         var m = lg.flush(updates, finished, finished_len, sampler.take_stats(), lr, t_sim, t_wm, t_pi)
         if verbose:
             sm_print_metrics(it, m)
+            if sampler.count:
+                print("  sampler: count estimator, untouched bins", sampler.untouched_share())
         sm_emit(logger, m, it)
         logged = True
     if checkpoint_path.byte_length() > 0 and ((checkpoint_every > 0 and it % checkpoint_every == 0) or it == total):

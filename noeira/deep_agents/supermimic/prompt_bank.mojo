@@ -38,6 +38,7 @@ out of training for the zero-shot gate: walking with a hand placed.
 """
 
 from std.math import exp, sqrt
+from std.memory import bitcast
 from std.random import random_float64, random_ui64
 
 from max.gpu.host import DeviceContext
@@ -50,6 +51,7 @@ from noeira.deep_agents.supermimic.prompt import SM_P_LEAN_DEFAULT, SMSpec, sm_p
 from noeira.deep_agents.supermimic.robot import SMDims, TrackingRobot
 from noeira.deep_agents.supermimic.tables import SMTables
 from noeira.deep_agents.supermimic.trainer import SuperMimicTrainer
+from noeira.io.fileio import read_file_bytes, write_file_atomic
 from noeira.nn.constants import DT
 from noeira.nn.core.tensor import TensorImpl
 from noeira.nn.core.tensor_refs import TensorRefs
@@ -71,6 +73,32 @@ comptime SM_B_IW_H: Float64 = 156.25         # σ 0.08 m
 comptime SM_B_IW_TILT: Float64 = 44.44       # σ 0.15
 comptime SM_B_IW_HAND: Float64 = 44.44       # σ 0.15 m
 comptime SM_B_TASK_WEIGHT: Float64 = 4.0     # Σ w, Table A.6's
+comptime SM_POOL_MAGIC: StaticString = "SMPOOL01"   # `SMPromptData.save_pool`'s file
+
+
+def _put_u64(mut b: List[UInt8], v: UInt64):
+    for i in range(8):
+        b.append(UInt8((v >> UInt64(8 * i)) & 0xFF))
+
+
+def _get_u64(b: List[UInt8], o: Int) -> UInt64:
+    var v: UInt64 = 0
+    for i in range(8):
+        v |= UInt64(b[o + i]) << UInt64(8 * i)
+    return v
+
+
+def _put_f32(mut b: List[UInt8], x: Scalar[DT]):
+    var u = bitcast[DType.uint32](Float32(x))
+    for i in range(4):
+        b.append(UInt8((u >> UInt32(8 * i)) & 0xFF))
+
+
+def _get_f32(b: List[UInt8], o: Int) -> Scalar[DT]:
+    var u: UInt32 = 0
+    for i in range(4):
+        u |= UInt32(b[o + i]) << UInt32(8 * i)
+    return Scalar[DT](bitcast[DType.float32](u))
 
 
 struct SMPromptData[CMD: Int](Movable):
@@ -133,6 +161,65 @@ struct SMPromptData[CMD: Int](Movable):
             for k in range(Self.CMD):
                 z[unsafe_offset=k] *= Scalar[DT](self.z_scale)
         return ess
+
+    def save_pool(self, path: String) raises:
+        """What `z_of` reads, to `path`: the pool's atoms and latents, the mean
+        latent, z's scale and sharpening. A process that only asks z (a demo)
+        then loads it instead of encoding every frame of the library. The
+        latents are the tracker's on the store's frames: the file is as private
+        as the store."""
+        var b = List[UInt8]()
+        for c in SM_POOL_MAGIC.as_bytes():
+            b.append(c)
+        _put_u64(b, UInt64(Self.CMD))
+        _put_u64(b, UInt64(self.pool_n))
+        _put_u64(b, UInt64(len(self.pool_atoms)))
+        _put_u64(b, bitcast[DType.uint64](self.z_scale))
+        _put_u64(b, bitcast[DType.uint64](self.z_beta))
+        _put_u64(b, bitcast[DType.uint64](self.z_ess))
+        for i in range(len(self.lbar)):
+            _put_f32(b, self.lbar[i])
+        for i in range(len(self.pool_atoms)):
+            _put_f32(b, self.pool_atoms[i])
+        for i in range(len(self.pool_lat)):
+            _put_f32(b, self.pool_lat[i])
+        write_file_atomic(path, b)
+
+    @staticmethod
+    def load_pool(path: String) raises -> Self:
+        """`save_pool`'s file back: an interface data that answers `z_of` (no
+        bank, no reference commands). Refuses another command width."""
+        var b = read_file_bytes(path)
+        var m = SM_POOL_MAGIC.byte_length()
+        if len(b) < m + 48:
+            raise Error("load_pool: " + path + " is too short for a pool file")
+        for i in range(m):
+            if b[i] != SM_POOL_MAGIC.as_bytes()[i]:
+                raise Error("load_pool: " + path + " is not a pool file")
+        var cmd = Int(_get_u64(b, m))
+        if cmd != Self.CMD:
+            raise Error("load_pool: " + path + " holds a " + String(cmd) + "-wide command, not " + String(Self.CMD))
+        var d = Self(0, 0, Self.CMD)
+        d.pool_n = Int(_get_u64(b, m + 8))
+        var na = Int(_get_u64(b, m + 16))
+        d.z_scale = bitcast[DType.float64](_get_u64(b, m + 24))
+        d.z_beta = bitcast[DType.float64](_get_u64(b, m + 32))
+        d.z_ess = bitcast[DType.float64](_get_u64(b, m + 40))
+        var o = m + 48
+        if len(b) != o + 4 * (Self.CMD + na + d.pool_n * Self.CMD):
+            raise Error("load_pool: " + path + " has the wrong size for its counts")
+        d.lbar = List[Scalar[DT]](length=Self.CMD, fill=0)
+        for i in range(Self.CMD):
+            d.lbar[i] = _get_f32(b, o + 4 * i)
+        o += 4 * Self.CMD
+        d.pool_atoms = List[Scalar[DT]](length=na, fill=0)
+        for i in range(na):
+            d.pool_atoms[i] = _get_f32(b, o + 4 * i)
+        o += 4 * na
+        d.pool_lat = List[Scalar[DT]](length=d.pool_n * Self.CMD, fill=0)
+        for i in range(d.pool_n * Self.CMD):
+            d.pool_lat[i] = _get_f32(b, o + 4 * i)
+        return d^
 
     def to_device(mut self, ctx: DeviceContext) raises:
         self.cmd_ref.upload_resident(ctx)
