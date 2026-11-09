@@ -321,8 +321,29 @@ def scan_endpoints_world(
     kinematic model; here the geom id plays that part. A no-return clears up
     to `max_clear` metres.
     """
+    var kept = List[Int]()
+    scan_endpoints_world_labelled(
+        origin, q, dirs, ranges, geom_ids, self_geom, max_clear, endpoints, hits, kept
+    )
+
+
+def scan_endpoints_world_labelled(
+    origin: Vec3Generic[_F64],
+    q: QuatGeneric[_F64],
+    dirs: List[Float64],
+    ranges: List[Float64],
+    geom_ids: List[Int],
+    self_geom: List[Bool],
+    max_clear: Float64,
+    mut endpoints: List[Float64],
+    mut hits: List[Bool],
+    mut kept_geom: List[Int],
+):
+    """`scan_endpoints_world`, plus the geom id of every KEPT beam (-1 for a
+    no-return) — what an oracle detector labels (`places.PlaceMap`)."""
     endpoints = List[Float64]()
     hits = List[Bool]()
+    kept_geom = List[Int]()
     var n = len(ranges)
     for b in range(n):
         var g = geom_ids[b]
@@ -337,6 +358,7 @@ def scan_endpoints_world(
         endpoints.append(origin.y + r * d.y)
         endpoints.append(origin.z + r * d.z)
         hits.append(hit)
+        kept_geom.append(g if hit else -1)
 
 
 def depth_endpoints_world(

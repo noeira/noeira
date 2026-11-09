@@ -32,12 +32,15 @@ def _inside(gtype, size, p):
     raise ValueError(f"geom type {gtype} not handled")
 
 
-def truth_cells(m, d, x0, y0, res, nx, ny, z_lo, z_hi, robot_root, dz=0.025, sub=3):
-    """bool [ny * nx], row j column i — the layout of VoxelMap.occupied_2d."""
+def truth_cells(m, d, x0, y0, res, nx, ny, z_lo, z_hi, robot_root, dz=0.025, sub=3, only=None):
+    """bool [ny * nx], row j column i — the layout of VoxelMap.occupied_2d.
+    `only`: a set of geom ids to restrict to (one object's footprint)."""
     occ = np.zeros((ny, nx), dtype=bool)
     off = (np.arange(sub) + 0.5) / sub * res
     zs = np.arange(z_lo + 0.5 * dz, z_hi, dz)
     for g in range(m.ngeom):
+        if only is not None and g not in only:
+            continue
         gt = int(m.geom_type[g])
         if gt in (0, 1):
             continue
@@ -70,3 +73,15 @@ def truth_cells(m, d, x0, y0, res, nx, ny, z_lo, z_hi, robot_root, dz=0.025, sub
         inside = inside.reshape(len(ii), sub, len(jj), sub, len(zs)).any(axis=(1, 3, 4))
         occ[j0 : j1 + 1, i0 : i1 + 1] |= inside.T
     return occ.reshape(-1)
+
+
+def geoms_by_prefix(m, prefix):
+    """Geom ids whose name starts with `prefix` (the public room names an
+    object's parts `table_top`, `table_leg1`, ...)."""
+    import mujoco
+    out = set()
+    for g in range(m.ngeom):
+        nm = mujoco.mj_id2name(m, mujoco.mjtObj.mjOBJ_GEOM, g)
+        if nm and nm.startswith(prefix):
+            out.add(g)
+    return out
