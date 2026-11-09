@@ -1,0 +1,17 @@
+# A non-repetitive 3D lidar, Livox MID-360 class.
+# Datasheet: 360 x (-7..+52) deg FOV, 200 000 points/s, 10 Hz typical
+# -> 20 000 points per frame, 0.1 m minimum range, 40 m at 10 % reflectivity,
+# range precision <= 2 cm (1 sigma, at 10 m).
+# The pattern is APPROXIMATED (uniform in solid angle, see lidar.mojo), not
+# Livox's rosette.
+name = spiral_mid360_class
+pattern = spiral
+h_fov_deg = 360
+v_min_deg = -7
+v_max_deg = 52
+points = 20000
+range_min = 0.1
+range_max = 40
+range_sigma = 0.02
+dropout = 0.0
+rate_hz = 10

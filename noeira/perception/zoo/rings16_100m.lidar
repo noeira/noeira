@@ -1,0 +1,16 @@
+# A 16-beam spinning 3D lidar, Velodyne VLP-16 (Puck) class.
+# Datasheet: 16 channels, vertical -15..+15 deg (2 deg apart), up to 100 m,
+# +-3 cm typical accuracy (taken as sigma here: pessimistic), 0.2 deg
+# horizontal at 10 Hz -> 1800 azimuths. range_min is assumed, not quoted.
+name = rings16_100m
+pattern = rings
+h_fov_deg = 360
+h_samples = 1800
+v_min_deg = -15
+v_max_deg = 15
+v_samples = 16
+range_min = 0.3
+range_max = 100
+range_sigma = 0.03
+dropout = 0.0
+rate_hz = 10

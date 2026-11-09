@@ -1,0 +1,13 @@
+# A single-plane 2D spinning lidar, RPLidar-A2 class.
+# Representative figures (A2M8 datasheet: 0.15-12 m, 8000 samples/s, 10 Hz
+# typical -> 800 samples per turn). Check the exact unit's datasheet before
+# buying; the noise is a constant sigma (the datasheet gives % of range).
+name = planar_2d_12m
+pattern = fan
+h_fov_deg = 360
+h_samples = 800
+range_min = 0.15
+range_max = 12
+range_sigma = 0.01
+dropout = 0.01
+rate_hz = 10
