@@ -11,6 +11,10 @@ buying it, so nothing here is written for one sensor or one robot:
   depth_scan.mojo   the depth image: `depth_scan_cpu`, `BatchedDepthCamera`,
                     a mount from an MJCF `<camera>`
   spec_text.mojo    the `key = value` reader every spec file uses
+  sensor_scene.mojo `SensorScene`: a ray-ready copy of a scene (triangle soup
+                    sized automatically) that a scan reads beside the simulator
+  occupancy.mojo    `VoxelMap`: a log-odds voxel band from scans / depth images,
+                    projected to the 2D obstacle cells `nav2d.NavGrid` takes
   lidar_scan.mojo   the scan itself over `Model`/`Data`: `lidar_scan_cpu` and
                     `BatchedLidar` (one GPU thread per lane x ray), both on
                     `physics3d.ray.ray_model` (= MuJoCo's `mj_ray`)
@@ -56,3 +60,5 @@ from .depth_scan import (
     depth_scan_cpu,
     BatchedDepthCamera,
 )
+from .occupancy import VoxelMap, scan_endpoints_world, depth_endpoints_world
+from .sensor_scene import SensorScene, ray_ready_dims

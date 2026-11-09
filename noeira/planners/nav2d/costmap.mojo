@@ -6,7 +6,8 @@
     grid.clearance(x, y)               # metres to the nearest footprint
 
 Robot-agnostic: it knows footprints (oriented rectangles and circles on the
-ground plane), never bodies or robots. `planners/nav2d/scene.mojo` builds the
+ground plane), never bodies or robots — OR, from a sensed map, a set of
+occupied cells (`set_obstacle_cells`, fed by `perception.VoxelMap`). `planners/nav2d/scene.mojo` builds the
 footprints from a parsed MJCF model; a hand-written list works as well.
 
 ⚠ WHY A NAVIGATION FUNCTION AND NOT A DISTANCE-TO-GOAL. A local optimiser
@@ -91,6 +92,62 @@ struct Footprint(Copyable, ImplicitlyCopyable, Movable, Writable):
         else:
             w.write("rect(", self.cx, ", ", self.cy, ", ", self.hx, " x ",
                     self.hy, ", yaw=", self.yaw, ")")
+
+
+def _edt_1d(f: List[Float64], n: Int, mut d: List[Float64], mut v: List[Int], mut z: List[Float64]):
+    """Felzenszwalb & Huttenlocher's exact 1D squared distance transform:
+    d[q] = min_p ((q - p)^2 + f[p]), in O(n). `v`, `z` are scratch."""
+    comptime INF = 1.0e20
+    var k = 0
+    v[0] = 0
+    z[0] = -INF
+    z[1] = INF
+    for q in range(1, n):
+        var s = ((f[q] + Float64(q * q)) - (f[v[k]] + Float64(v[k] * v[k]))) / Float64(2 * q - 2 * v[k])
+        while s <= z[k]:
+            k -= 1
+            s = ((f[q] + Float64(q * q)) - (f[v[k]] + Float64(v[k] * v[k]))) / Float64(2 * q - 2 * v[k])
+        k += 1
+        v[k] = q
+        z[k] = s
+        z[k + 1] = INF
+    k = 0
+    for q in range(n):
+        while z[k + 1] < Float64(q):
+            k += 1
+        d[q] = Float64((q - v[k]) * (q - v[k])) + f[v[k]]
+
+
+def cell_distance_transform(occ: List[Bool], nx: Int, ny: Int) -> List[Float64]:
+    """Exact Euclidean distance, in CELLS, from each cell centre to the nearest
+    occupied cell centre (0 on an occupied cell; 1e10 if there is none).
+    Two separable passes of `_edt_1d` (columns, then rows)."""
+    comptime INF = 1.0e20
+    var g = List[Float64](length=nx * ny, fill=INF)
+    for c in range(nx * ny):
+        if occ[c]:
+            g[c] = 0.0
+    var m = max(nx, ny)
+    var f = List[Float64](length=m, fill=0.0)
+    var d = List[Float64](length=m, fill=0.0)
+    var v = List[Int](length=m, fill=0)
+    var z = List[Float64](length=m + 1, fill=0.0)
+    for i in range(nx):
+        for j in range(ny):
+            f[j] = g[j * nx + i]
+        _edt_1d(f, ny, d, v, z)
+        for j in range(ny):
+            g[j * nx + i] = d[j]
+    for j in range(ny):
+        for i in range(nx):
+            f[i] = g[j * nx + i]
+        _edt_1d(f, nx, d, v, z)
+        for i in range(nx):
+            g[j * nx + i] = d[i]
+    var out = List[Float64](length=nx * ny, fill=1.0e10)
+    for c in range(nx * ny):
+        out[c] = sqrt(g[c]) if g[c] < 1.0e19 else 1.0e10
+    return out^
 
 
 struct _MinHeap(Movable):
@@ -216,6 +273,35 @@ struct NavGrid(Movable):
     def is_free(self, x: Float64, y: Float64) -> Bool:
         """Clearance at (x, y) itself (not the cell centre) >= inflate."""
         return self.clearance(x, y) >= self.inflate
+
+    def set_obstacle_cells(mut self, occ: List[Bool]) raises:
+        """Replace the clearance with one computed from OCCUPIED CELLS (a
+        sensed map, `[ny * nx]`, row j column i — `perception.VoxelMap`'s
+        `occupied_2d` on the same box and resolution). Re-runs Dijkstra if a
+        goal is set, so a map update is one call.
+
+        ⚠ CONSERVATIVE BY UP TO 0.21 CELL. The exact transform gives the
+        distance between CELL CENTRES; the distance to an occupied cell's
+        square is between that minus res/2 (straight on) and minus
+        res*sqrt(2)/2 (diagonal). The second is subtracted, so clearance is
+        never overstated — a robot kept `inflate` from a cell centre-distance
+        might otherwise touch the cell's corner.
+        """
+        if len(occ) != self.nx * self.ny:
+            raise Error("NavGrid.set_obstacle_cells: " + String(len(occ)) + " cells for a "
+                        + String(self.nx) + " x " + String(self.ny) + " grid")
+        var dc = cell_distance_transform(occ, self.nx, self.ny)
+        var half_diag = 0.5 * self.res * 1.4142135623730951
+        for c in range(len(dc)):
+            if occ[c]:
+                self.clear[c] = 0.0
+            elif dc[c] >= 1.0e9:
+                self.clear[c] = 1.0e9
+            else:
+                var v = dc[c] * self.res - half_diag
+                self.clear[c] = v if v > 0.0 else 0.0
+        if self.has_goal:
+            self.set_goal(self.goal_x, self.goal_y)
 
     def set_goal(mut self, gx: Float64, gy: Float64) raises:
         """Dijkstra from the goal over free cells, 8-connected, in metres.

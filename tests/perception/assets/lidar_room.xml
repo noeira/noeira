@@ -2,7 +2,9 @@
   <!-- The lidar gate's scene: the public G1 in a 6 x 5 m room with one of
        every geom type a lidar can meet (box, cylinder, capsule, sphere,
        ellipsoid, heightfield, and the G1's own meshes), plus one INVISIBLE
-       box (alpha 0) standing in the beam's way, which `mj_ray` skips.
+       box (alpha 0) standing in the beam's way, which `mj_ray` skips — and which
+       collides with nothing, so it is a decoration and not an obstacle (an
+       invisible COLLIDING geom would be glass: real, and unseeable by rays).
 
        ⚠ THE WALLS ARE 2.5 m TALL ON PURPOSE. A head lidar sits ~1.3 m up and
        sweeps upward; the demo room's 1 m walls (sized for its cameras) would
@@ -36,7 +38,7 @@
       <geom name="ball" type="sphere" size="0.15" pos="0.9 1.2 0.15"/>
       <geom name="pouf" type="ellipsoid" size="0.35 0.25 0.2" pos="-1.9 -1.6 0.2" euler="0 0 0.5"/>
       <geom name="rug" type="hfield" hfield="rug" pos="1.2 0.4 0.0"/>
-      <geom name="ghost" type="box" size="0.05 0.6 0.6" pos="1.0 0 1.0" rgba="1 0 0 0"/>
+      <geom name="ghost" type="box" size="0.05 0.6 0.6" pos="1.0 0 1.0" rgba="1 0 0 0" contype="0" conaffinity="0"/>
     </body>
   </worldbody>
 </mujoco>

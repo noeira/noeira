@@ -29,6 +29,7 @@ from std.testing import assert_true
 from noeira.physics3d.fields import Data, Model, DynDims, init_hfield_data
 from noeira.physics3d.parser.full_parser import parse_xml_full
 from noeira.physics3d.kinematics.forward_kinematics import forward_kinematics
+from noeira.perception import ray_ready_dims
 from noeira.physics3d.parser.runtime_load import (
     read_model_source,
     dims_from_flat,
@@ -53,35 +54,9 @@ struct Lcg(Copyable, Movable):
         return (self.u01() * 2.0 - 1.0) * a
 
 
-def mesh_budget_dims(path: String, dtype_bytes: Int = 8) raises -> DynDims:
-    """The mesh budgets a scene needs, found the way the loader reports them
-    (it raises with the triangle count, and on a short vertex budget)."""
-    var src = read_model_source(path)
-    var fmd = parse_xml_full(src[0], src[1])
-    var verts = 65536
-    var tris = 1
-    for _ in range(30):
-        var dims = dims_from_flat(fmd, max_contacts=16, nmesh_verts=verts, nmesh_tri=tris)
-        var m = Model[DT, DynDims](dims)
-        try:
-            build_model_runtime[DT](fmd, dims, m)
-            return dims
-        except e:
-            var msg = String(e)
-            var k = msg.find("Pass nmesh_tri=")
-            if k >= 0:
-                var bytes = msg.as_bytes()
-                var j = k + 15
-                var v = 0
-                while j < len(bytes) and bytes[j] >= 48 and bytes[j] <= 57:
-                    v = v * 10 + Int(bytes[j]) - 48
-                    j += 1
-                tris = v
-            elif msg.find("mesh vertex capacity") >= 0:
-                verts *= 2
-            else:
-                raise e^
-    raise Error("could not size the mesh budgets of " + path)
+def mesh_budget_dims(path: String) raises -> DynDims:
+    """The mesh budgets a scene needs — `perception.ray_ready_dims`."""
+    return ray_ready_dims(path)
 
 
 struct Built(Movable):
