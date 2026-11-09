@@ -13,6 +13,10 @@ buying it, so nothing here is written for one sensor or one robot:
   spec_text.mojo    the `key = value` reader every spec file uses
   sensor_scene.mojo `SensorScene`: a ray-ready copy of a scene (triangle soup
                     sized automatically) that a scan reads beside the simulator
+  localise.mojo     `Odometry` (drifting dead reckoning, `zoo/*.odom`), a
+                    `LikelihoodField` from a map, `correlative_match`
+  slam.mojo         `ScanToMapSlam`: predict / match / insert (motion filter),
+                    or localisation in a frozen prior map
   occupancy.mojo    `VoxelMap`: a log-odds voxel band from scans / depth images,
                     projected to the 2D obstacle cells `nav2d.NavGrid` takes
   lidar_scan.mojo   the scan itself over `Model`/`Data`: `lidar_scan_cpu` and
@@ -62,3 +66,8 @@ from .depth_scan import (
 )
 from .occupancy import VoxelMap, scan_endpoints_world, depth_endpoints_world
 from .sensor_scene import SensorScene, ray_ready_dims
+from .localise import (
+    OdometrySpec, Odometry, odometry_spec_from_text, load_odometry_spec,
+    LikelihoodField, Match, correlative_match, wrap_angle, base_frame_points, retarget_scan,
+)
+from .slam import ScanToMapSlam

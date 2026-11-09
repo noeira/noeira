@@ -1,0 +1,7 @@
+# A poor estimator: 10 % scale error (slip, soft floor), an uncalibrated gyro
+# (~1 deg/s bias). ASSUMED — the case a map has to rescue.
+name = legged_poor
+scale_sigma = 0.10
+lin_noise = 0.10
+gyro_bias_sigma = 0.017
+gyro_noise = 0.02

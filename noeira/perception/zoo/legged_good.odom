@@ -1,0 +1,9 @@
+# Leg odometry + a calibrated MEMS gyro, a well-tuned humanoid. ASSUMED values,
+# of the order quoted for legged-robot proprioceptive estimators (a few % of
+# distance, gyro bias ~0.1 deg/s after calibration): check against the real
+# robot's estimator once one is chosen.
+name = legged_good
+scale_sigma = 0.03
+lin_noise = 0.05
+gyro_bias_sigma = 0.002
+gyro_noise = 0.01
