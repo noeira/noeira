@@ -32,7 +32,18 @@ tier: the parts that need the live service are measured through
 from noeira.envs.robots.g1_command_language import (
     G1Context, g1_arm_of, g1_since_word, g1_command_state, G1_N_RECENT,
     g1_place_mentions, g1_other_one,
+    g1_route_triage, g1_resolve_trail, g1_trail_arrivals, G1Triage,
+    G1_TRIAGE_OFF, G1_TRIAGE_FULL, G1_TRIAGE_NARROW,
 )
+from noeira.ai.jev import JevAnswers
+from noeira.io.json import parse_json
+
+
+def _kind_answer(top: String, probs: String) raises -> JevAnswers:
+    """A Jev answer to the triage alone: `probs` is the JSON body of `probabilities`."""
+    var body = (String('{"model":"t","usage":{"input_tokens":1},"answers":{"kind":{"choice":"')
+                + top + String('","probabilities":{') + probs + String("}}}}"))
+    return JevAnswers(parse_json(List[UInt8](body.as_bytes())), 0.0)
 
 
 struct Tally:
@@ -264,6 +275,58 @@ def main() raises:
     o5.arrived_at(String("table"), 3.0)
     t.truth(g1_other_one(o5, pl, wd) == "fridge", "the latest utterance naming two places, not the latest one")
     t.truth(g1_other_one(G1Context(), pl, wd) == "", "nothing heard: not settled")
+
+    # ── the triage (RB-2): the two policies, as room_bench `s2` measured them ──
+    print("-- g1_route_triage")
+    var a_unsafe = _kind_answer(String("unsafe"), String('"unsafe":0.6,"go_place":0.3,"act_here":0.1'))
+    var tf = g1_route_triage(a_unsafe, G1_TRIAGE_FULL)
+    t.truth(tf.kind == "unsafe" and tf.talks() and abs(tf.p - 0.6) < 1e-9, "full: unsafe .6 -> talks, p = the talk mass")
+    t.truth(g1_route_triage(a_unsafe, G1_TRIAGE_OFF).kind == "", "off: never acts")
+    # ⚠ the mass rule: neither kind reaches .5, together they do
+    var a_split = _kind_answer(String("unsettled"), String('"remembered":0.45,"unsettled":0.48,"talk":0.07'))
+    var ts = g1_route_triage(a_split, G1_TRIAGE_FULL)
+    t.truth(ts.kind == "unsettled" and ts.talks(), "full: remembered .45 / unsettled .48 + talk .07 -> unsettled by mass (no fall-through)")
+    var a_below = _kind_answer(String("unsettled"), String('"remembered":0.45,"unsettled":0.48,"go_place":0.07'))
+    t.truth(g1_route_triage(a_below, G1_TRIAGE_FULL).kind == "", "full: talk mass .48 < .5 and no top >= .5 -> does not act")
+    t.truth(abs(ts.place_mass - 0.93) < 1e-9, "place mass = go_place + remembered + unsettled")
+    var a_spl = _kind_answer(String("go_place"), String('"go_place":0.4,"speaker_side":0.35,"talk":0.25'))
+    var tg = g1_route_triage(a_spl, G1_TRIAGE_FULL)
+    t.truth(tg.kind == "talk" and tg.talks(), "full: top go_place .4, talk kinds .6 -> `talk`")
+    var a_rem = _kind_answer(String("remembered"), String('"remembered":0.7,"unsettled":0.2,"talk":0.1'))
+    t.truth(g1_route_triage(a_rem, G1_TRIAGE_FULL).kind == "remembered", "full: remembered .7 -> the trail request")
+    t.truth(g1_route_triage(a_rem, G1_TRIAGE_NARROW).kind == "", "narrow: remembered never acts (d1)")
+    var a_low = _kind_answer(String("speaker_side"), String('"speaker_side":0.42,"go_place":0.38,"talk":0.2'))
+    t.truth(g1_route_triage(a_low, G1_TRIAGE_NARROW).kind == "speaker_side", "narrow: speaker_side .42 >= .4 acts")
+    var a_tk = _kind_answer(String("talk"), String('"talk":0.9,"go_place":0.1'))
+    var tn = g1_route_triage(a_tk, G1_TRIAGE_NARROW)
+    t.truth(tn.kind == "" and tn.place_mass == 0.0, "narrow: talk never acts, no place mass")
+    var a_act = _kind_answer(String("act_here"), String('"act_here":0.49,"go_place":0.51'))
+    t.truth(g1_route_triage(a_act, G1_TRIAGE_NARROW).kind == "", "narrow: act_here .49 (not the top) does not act")
+
+    # ── the trail, resolved from the log ──────────────────────────────
+    print("-- g1_resolve_trail")
+    var tc = G1Context()
+    tc.arrived_at(String("fridge"), 1.0)
+    tc.arrived_at(String("door"), 2.0)
+    tc.heard_said(String("nice"), 3.0)
+    tc.arrived_at(String("table"), 4.0)
+    tc.arrived_at(String("sofa"), 5.0)
+    tc.at = String("sofa")
+    var arr = g1_trail_arrivals(tc)
+    t.truth(len(arr) == 4 and arr[0] == "fridge" and arr[3] == "sofa", "arrivals: oldest first, heard skipped")
+    t.truth(g1_resolve_trail(String("before_landmark"), String("door"), tc) == "fridge", "before the door -> fridge (not the previous stop)")
+    t.truth(g1_resolve_trail(String("after_landmark"), String("fridge"), tc) == "door", "after the fridge -> door")
+    t.truth(g1_resolve_trail(String("previous_stop"), String("none"), tc) == "table", "previous stop -> table")
+    t.truth(g1_resolve_trail(String("starting_point"), String("none"), tc) == "fridge", "starting point -> fridge")
+    t.truth(g1_resolve_trail(String("before_landmark"), String("shelf"), tc) == "", "a landmark not on the trail: not settled (ask)")
+    t.truth(g1_resolve_trail(String("after_landmark"), String("table"), tc) == "", "after the table is here: not settled")
+    t.truth(g1_resolve_trail(String("before_landmark"), String("none"), tc) == "", "before, no landmark: not settled")
+    var tw = G1Context()
+    tw.arrived_at(String("door"), 1.0)
+    tw.arrived_at(String("fridge"), 2.0)
+    tw.arrived_at(String("door"), 3.0)
+    t.truth(g1_resolve_trail(String("before_landmark"), String("door"), tw) == "fridge",
+            "between two visits to the door: the LATEST visit's predecessor")
 
     print("===", t.checks - t.fails, "/", t.checks, "passed ===")
     if t.fails != 0:

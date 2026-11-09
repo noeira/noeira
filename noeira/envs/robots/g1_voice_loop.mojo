@@ -69,6 +69,9 @@ from noeira.envs.robots.g1_command_language import (
     g1_since_word, G1Context, G1LangPick, G1_Q_EXTENT,
     g1_destination_questions, g1_route_destination,
     g1_add_memory_reference, g1_route_memory, g1_other_one,
+    g1_add_triage, g1_route_triage, g1_trail_questions, g1_resolve_trail,
+    g1_command_moves, G1Triage, G1_TRIAGE_OFF, G1_TRIAGE_FULL,
+    G1_Q_TRAIL_REL, G1_Q_TRAIL_ANCHOR,
 )
 from noeira.envs.robots.g1_reward_vocab import G1Term
 from noeira.envs.robots.g1_spec import (
@@ -86,6 +89,8 @@ comptime VL_ST_SPEC: Int = 4
 comptime VL_ST_CHAT: Int = 5
 comptime VL_ST_DEST: Int = 6
 """The first of the two requests `request_wording` makes: destination only."""
+comptime VL_ST_TRAIL: Int = 7
+"""`triage`: the trail request, after the triage said `remembered`."""
 
 # ── the events ────────────────────────────────────────────────────────────
 comptime VL_NONE: Int = 0
@@ -274,6 +279,21 @@ struct G1VoiceConfig(Copyable, Movable):
     var dest_words: List[String]
     """Per destination, other words for it in what is heard ("frigo,
     réfrigérateur"), comma-separated; "" for none. `g1_place_mentions`."""
+    var triage: Int
+    """`request_wording` only: RB-2's triage (`g1_add_triage`), one more
+    choice in the first request naming WHAT the sentence asks.
+    `G1_TRIAGE_FULL` (hosted Jev): unsafe, the speaker's side, a place the
+    state cannot settle, or plain talk -> a spoken reply and NO motion;
+    "back to where I was before X" -> the trail request, resolved from
+    `G1Context.log`; a step or a turn -> no goto; a request for a place
+    that routed no place is never turned into a walk. `G1_TRIAGE_NARROW`
+    (d1): unsafe and the speaker's side only, and no goto for a step.
+    OFF (`G1_TRIAGE_OFF`) by default. The caller keeps the log, as for
+    `memory_route`."""
+    var name_desc: Bool
+    """Each option's description starts with its name, in the command
+    request and the triage (d1 reads an option by its description alone:
+    RB-1's d1 arm). OFF by default: Jev was measured without."""
 
     def __init__(out self):
         self.lang = String("")
@@ -306,6 +326,8 @@ struct G1VoiceConfig(Copyable, Movable):
         self.tts_dl = VL_TTS_DEADLINE_S
         self.memory_route = False
         self.dest_words = List[String]()
+        self.triage = G1_TRIAGE_OFF
+        self.name_desc = False
 
 
 struct G1VoiceLoop(Movable):
@@ -336,6 +358,12 @@ struct G1VoiceLoop(Movable):
     """The current second request carries the memory reference."""
     var dest_q: JevQuestions
     """`request_wording` only: the first request. Empty otherwise."""
+    var trail_q: JevQuestions
+    """`triage`: the trail request. Empty otherwise."""
+    var tri: G1Triage
+    """The current decision's triage (the walk guard reads it in `_decide`)."""
+    var trail_dest: String
+    """The place the first request routed, for a trail answer `named`."""
     var asked: String
     """The state the current decision was asked with, for its second
     request."""
@@ -439,15 +467,23 @@ struct G1VoiceLoop(Movable):
         self.dest_q = JevQuestions()
         self.quest_mem = JevQuestions()
         self.mem_asked = False
+        self.trail_q = JevQuestions()
+        self.tri = G1Triage()
+        self.trail_dest = String("")
         if self.cfg.request_wording and len(self.cfg.destinations) > 0:
             # two requests: the destination first, then the commands WITHOUT it
             self.dest_q = g1_destination_questions(self.cfg.destinations)
+            if self.cfg.triage != G1_TRIAGE_OFF:
+                g1_add_triage(self.dest_q, self.cfg.name_desc)
+                self.trail_q = g1_trail_questions(self.cfg.destinations, self.cfg.name_desc)
             self.quest = g1_command_questions(
                 bank, True, List[String](), List[String](), self.cfg.chain,
+                name_desc=self.cfg.name_desc,
             )
             if self.cfg.memory_route:
                 self.quest_mem = g1_command_questions(
                     bank, True, List[String](), List[String](), self.cfg.chain,
+                    name_desc=self.cfg.name_desc,
                 )
                 g1_add_memory_reference(self.quest_mem)
         else:
@@ -511,6 +547,9 @@ struct G1VoiceLoop(Movable):
         self.quest_mem = move.quest_mem^
         self.mem_asked = move.mem_asked
         self.dest_q = move.dest_q^
+        self.trail_q = move.trail_q^
+        self.tri = move.tri^
+        self.trail_dest = move.trail_dest^
         self.asked = move.asked^
         self.dest_ms = move.dest_ms
         self.spec_q = move.spec_q^
@@ -911,6 +950,7 @@ struct G1VoiceLoop(Movable):
                             self.asked = g1_command_state(self.heard, ctx)
                             self.heard_new = self.heard
                             self.mem_asked = False
+                            self.tri = G1Triage()
                             self.dest_ms = 0.0
                             if self._two_requests():
                                 self.jev.start(self.asked, self.dest_q)
@@ -944,6 +984,26 @@ struct G1VoiceLoop(Movable):
                     ready = True
                 if ready:
                     ev = self._destination(ctx)
+
+        # ── deciding: the trail request (`triage`, "back to before X") ─
+        elif self.state == VL_ST_TRAIL:
+            var el = Float64(perf_counter_ns() - self.t_wait) / 1e9
+            if el > self.cfg.jev_dl:
+                self.note = (String("[jev] GAVE UP after ") + _vl_f2(el)
+                             + String(" s"))
+                try:
+                    self.jev.cancel()
+                except:
+                    pass
+                self.state = VL_ST_IDLE
+            else:
+                var ready: Bool
+                try:
+                    ready = self.jev.poll()
+                except:
+                    ready = True
+                if ready:
+                    ev = self._trail(ctx)
 
         # ── deciding ──────────────────────────────────────────────────
         elif self.state == VL_ST_JEV:
@@ -1029,6 +1089,27 @@ struct G1VoiceLoop(Movable):
         try:
             var ans = self.jev.result()
             var dest = g1_route_destination(ans)
+            if self.cfg.triage != G1_TRIAGE_OFF:
+                # ⚠ THE TRIAGE OVERRIDES A CONFIDENT DESTINATION: "climb onto the
+                # table" routes the table, and it is the kind that says no
+                self.tri = g1_route_triage(ans, self.cfg.triage)
+                if self.tri.talks():
+                    self._reply(
+                        _vl_triage_hint(self.tri.kind),
+                        String("[triage] ") + self.tri.kind + String(" ")
+                        + _vl_f2(self.tri.p) + String(" -> reply, no motion")
+                        + self._jev_ms(ans.latency_ms),
+                    )
+                    return ev^
+                if self.tri.kind == "remembered":
+                    self.dest_ms = ans.latency_ms
+                    self.trail_dest = dest
+                    self.jev.start(self.asked, self.trail_q)
+                    self.t_wait = perf_counter_ns()
+                    self.state = VL_ST_TRAIL
+                    return ev^
+                if self.tri.kind == "act_here":
+                    dest = String("")   # a step or a turn is not a place
             if dest != "":
                 ev.kind = VL_WORLD
                 ev.destination = dest
@@ -1051,6 +1132,52 @@ struct G1VoiceLoop(Movable):
         except e:
             self.note = String("[jev] FAILED: ") + String(e)
         return ev^
+
+    def _trail(mut self, ref ctx: G1Context) -> G1VoiceEvent:
+        """The trail request's answer: the place the log settles, or a reply
+        asking which place (never a guess)."""
+        var ev = G1VoiceEvent.none()
+        self.state = VL_ST_IDLE
+        try:
+            var ans = self.jev.result()
+            var rel = ans.choice(String(G1_Q_TRAIL_REL))
+            var anc = ans.choice(String(G1_Q_TRAIL_ANCHOR))
+            var place = g1_resolve_trail(rel, anc, ctx)
+            if rel == "named" and self.trail_dest != "":
+                place = self.trail_dest
+            if place != "":
+                ev.kind = VL_WORLD
+                ev.destination = place
+                ev.text = self.heard
+                self.note = (String("[trail] ") + rel + String(" (") + anc
+                             + String(") -> ") + place + self._jev_ms(ans.latency_ms))
+            else:
+                self._reply(
+                    _vl_triage_hint(String("unsettled")),
+                    String("[trail] ") + rel + String(" (") + anc
+                    + String(") not settled by the log -> ask")
+                    + self._jev_ms(ans.latency_ms),
+                )
+        except e:
+            self.note = String("[jev] FAILED: ") + String(e)
+        return ev^
+
+    def _reply(mut self, hint: String, note: String):
+        """A spoken reply and nothing else: the robot's motion is unchanged.
+        `hint` is added to the reply's system prompt ("" = a plain reply)."""
+        try:
+            var msgs = List[ChatMessage]()
+            msgs.append(ChatMessage.user(self.heard))
+            var sys = self.cfg.chat_sys
+            if hint != "":
+                sys += String(" ") + hint
+            self.llm.start(msgs, sys, List[ToolSpec](), False)
+            self.t_wait = perf_counter_ns()
+            self.note = note
+            self.state = VL_ST_CHAT
+        except e:
+            self.note = String("[talk] could not start: ") + String(e)
+            self.state = VL_ST_IDLE
 
     def _settles_other_one(self, ref ctx: G1Context) -> Bool:
         """Whether the log names a place "the other one" could mean right now."""
@@ -1090,7 +1217,17 @@ struct G1VoiceLoop(Movable):
             if two and self.cfg.memory_route:
                 if self.mem_asked:
                     mem = g1_route_memory(ans, ctx, self.cfg.destinations, self.cfg.dest_words)
-            if mem != "":
+            if (self.cfg.triage == G1_TRIAGE_FULL and two and mem == ""
+                    and self.tri.place_mass >= 0.5 and self.pick.name != ""
+                    and g1_command_moves(bank, self.pick.name)):
+                # ⚠ A REQUEST FOR A PLACE THAT ROUTED NO PLACE IS NEVER A WALK:
+                # "go where I told you yesterday" came back `walk` (RB-2)
+                self._reply(
+                    _vl_triage_hint(String("unsettled")),
+                    String("[triage] a place, none routed: ") + self.pick.name
+                    + String(" -> ask") + self._jev_ms(ans.latency_ms),
+                )
+            elif mem != "":
                 ev.kind = VL_WORLD
                 ev.destination = mem
                 self.note = (String("[memory] other one -> ") + mem
@@ -1241,6 +1378,9 @@ struct G1VoiceLoop(Movable):
         if self.state == VL_ST_DEST:
             return (String("deciding: where? ") + _vl_f2(el) + String("s / ")
                     + _vl_f2(self.cfg.jev_dl) + String("s"))
+        if self.state == VL_ST_TRAIL:
+            return (String("deciding: which place before? ") + _vl_f2(el)
+                    + String("s / ") + _vl_f2(self.cfg.jev_dl) + String("s"))
         if self.state == VL_ST_JEV:
             return (String("deciding ") + _vl_f2(el) + String("s / ")
                     + _vl_f2(self.cfg.jev_dl) + String("s"))
@@ -1310,6 +1450,28 @@ struct G1VoiceLoop(Movable):
         peak under the label "noise floor" — two different numbers, and the
         one it showed was the loudest thing in the first second."""
         return self.floor
+
+
+def _vl_triage_hint(kind: String) -> String:
+    """What the reply is told when the triage stopped the motion."""
+    if kind == "unsafe":
+        return String(
+            "You were asked for something you cannot do safely (climbing on"
+            " furniture, acrobatics, moving furniture). Say briefly that you"
+            " will not do it."
+        )
+    if kind == "speaker_side":
+        return String(
+            "The speaker named a place by THEIR own left, right, front or back,"
+            " and you cannot tell where they stand. Ask briefly which place"
+            " they mean."
+        )
+    if kind == "unsettled":
+        return String(
+            "You do not know which place the speaker means. Ask briefly which"
+            " one."
+        )
+    return String("")
 
 
 def _vl_ns(seconds: Float64) -> Int:

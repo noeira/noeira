@@ -642,6 +642,264 @@ def g1_route_memory(
     return g1_other_one(ctx, places, words)
 
 
+# ── the triage (RB-2) ─────────────────────────────────────────────────────
+# ⚠ WHAT THE SENTENCE ASKS, BEFORE WHERE IT POINTS. RB-1 ended with no model
+# safe: "climb onto the table" went to the table, "go to the one on MY left"
+# picked the robot's left, "did I ask you to go to the door?" walked. The
+# destination question cannot see these, because each one does name a place.
+# One more choice in the SAME first request names the kind of sentence, and
+# code acts on it (`docs/ROOM_BENCH_RB2_PLAN.md` §6-7, 2026-11-09):
+#   hosted Jev, `G1_TRIAGE_FULL`: held-out dangerous answers 17 -> 4 / 72,
+#     RB-1's used sets 221 -> 248 / 276 exact, dangerous 20 -> 2;
+#   d1, `G1_TRIAGE_NARROW`: held-out 19 -> 11, RB-1's sets 199 -> 204.
+# The wordings below are the measured ones (room_bench `--state s2`, frozen
+# e7c388dc / fefbc522); an edit needs a re-measure, on NEW held-out items.
+
+comptime G1_TRIAGE_OFF: Int = 0
+comptime G1_TRIAGE_FULL: Int = 1
+"""Every kind acts, by probability MASS (hosted Jev)."""
+comptime G1_TRIAGE_NARROW: Int = 2
+"""Only the kinds d1 reads reliably act: top unsafe / speaker_side >= 0.4,
+top act_here >= 0.5. d1's kinds are diffuse: on RB-1's sets `talk` and
+`unsettled` refused plain spatial requests and the trail relation sent
+anchored items to the previous stop, so those stay off for it."""
+
+comptime G1_Q_KIND: String = "kind"
+comptime G1_Q_TRAIL_REL: String = "trail_relation"
+comptime G1_Q_TRAIL_ANCHOR: String = "trail_anchor"
+comptime G1_KIND_TALK: String = "unsafe,speaker_side,unsettled,talk"
+"""The kinds that move nothing: the robot answers, or asks back."""
+
+
+def g1_add_triage(mut q: JevQuestions, name_desc: Bool = False) raises:
+    """The triage choice, appended to the destination request
+    (`g1_destination_questions`): no extra request. `name_desc`: each
+    description starts with its option's name (d1, as `g1_command_questions`)."""
+    var opts = List[String]()
+    var descs = List[String]()
+    opts.append(String("go_place"))
+    descs.append(String(
+        "it asks the robot to go to one of the places now, named, or described from the robot's own"
+        " position or from the room, or the other one of two places just mentioned (recently_heard)"
+    ))
+    opts.append(String("remembered"))
+    descs.append(String(
+        "it asks the robot to go back to a place on its recent trail (places_visited_recently):"
+        " where it was before or after somewhere, its last stop, where it started"
+    ))
+    opts.append(String("act_here"))
+    descs.append(String(
+        "it asks for a step, a turn, a gesture, a stop or a wait where the robot is, not for a place"
+    ))
+    opts.append(String("unsafe"))
+    descs.append(String(
+        "it asks for something a walking robot cannot or must not do: acrobatics (a flip or"
+        " somersault, a cartwheel, a handstand, the splits), climbing, standing or jumping on or over"
+        " furniture, sitting on top of something not made for sitting, lying down, pushing or lifting"
+        " furniture. Going to sit on a seat is not unsafe"
+    ))
+    opts.append(String("speaker_side"))
+    descs.append(String(
+        "it picks the place by the SPEAKER's own left, right, front or back, which the robot does"
+        " not know"
+    ))
+    opts.append(String("unsettled"))
+    descs.append(String(
+        "it asks the robot to go to a place the state cannot settle: one from a time the state does"
+        " not cover (yesterday, this morning, last week: the trail has no dates), one someone else"
+        " chose, or one that fits none of the places"
+    ))
+    opts.append(String("talk"))
+    descs.append(String(
+        "it asks the robot to do nothing: a question, a remark, a story about what happened, or what"
+        " someone else is doing or will do"
+    ))
+    if name_desc:
+        for i in range(len(opts)):
+            descs[i] = opts[i] + ": " + descs[i]
+    q.choice(
+        String(G1_Q_KIND),
+        String("What does the instruction ask of the robot, as the speaker finally means it?"),
+        opts, descs,
+    )
+
+
+struct G1Triage(Copyable, Movable):
+    """What the triage decided. `kind` is "" when it does not act (the
+    destination and the commands decide as before)."""
+
+    var kind: String
+    """A `G1_KIND_TALK` kind, `remembered`, `act_here`, `go_place`, or ""."""
+    var p: Float64
+    """The probability `kind` acted on (the mass, for a talk kind under FULL)."""
+    var top: String
+    var top_p: Float64
+    var talk_mass: Float64
+    var place_mass: Float64
+    """P(go_place + remembered + unsettled): the sentence is about going to a
+    place. FULL only (0 under NARROW)."""
+
+    def __init__(out self):
+        self.kind = String("")
+        self.p = 0.0
+        self.top = String("")
+        self.top_p = 0.0
+        self.talk_mass = 0.0
+        self.place_mass = 0.0
+
+    def talks(self) -> Bool:
+        for t in String(G1_KIND_TALK).split(","):
+            if String(t) == self.kind:
+                return True
+        return False
+
+
+def g1_route_triage(ref ans: JevAnswers, policy: Int) raises -> G1Triage:
+    """The triage's decision under `policy` (`G1_TRIAGE_FULL` / `_NARROW`).
+
+    ⚠ FULL READS MASSES, NOT THE TOP KIND ALONE: kinds that agree on what to do
+    split their probability ("before the sofa" with no sofa on the trail:
+    remembered .45 / unsettled .5, neither >= .5, and it fell through to
+    `back`)."""
+    var t = G1Triage()
+    if policy == G1_TRIAGE_OFF:
+        return t^
+    var k = String(G1_Q_KIND)
+    t.top = ans.choice(k)
+    t.top_p = ans.probability(k, t.top)
+    if policy == G1_TRIAGE_NARROW:
+        if (t.top == "unsafe" or t.top == "speaker_side") and t.top_p >= 0.4:
+            t.kind = t.top
+            t.p = t.top_p
+        elif t.top == "act_here" and t.top_p >= 0.5:
+            t.kind = t.top
+            t.p = t.top_p
+        return t^
+    for name in String(G1_KIND_TALK).split(","):
+        t.talk_mass += ans.probability(k, String(name))
+    t.place_mass = (ans.probability(k, String("go_place"))
+                    + ans.probability(k, String("remembered"))
+                    + ans.probability(k, String("unsettled")))
+    if t.top == "remembered" and t.top_p >= 0.5:
+        t.kind = t.top
+        t.p = t.top_p
+    elif t.talk_mass >= 0.5:
+        # the talk kind named is the top one when it is a talk kind, else `talk`
+        t.kind = String("talk") if (
+            t.top == "go_place" or t.top == "remembered" or t.top == "act_here"
+        ) else t.top
+        t.p = t.talk_mass
+    elif t.top_p >= 0.5:
+        t.kind = t.top
+        t.p = t.top_p
+    return t^
+
+
+def g1_trail_questions(places: List[String], name_desc: Bool = False) raises -> JevQuestions:
+    """The trail request, asked only when the triage says `remembered`: the
+    model names the relation and the landmark, `g1_resolve_trail` computes the
+    place from `G1Context.log` (the ordering stays in code)."""
+    var q = JevQuestions()
+    var opts = List[String]()
+    var descs = List[String]()
+    opts.append(String("previous_stop"))
+    descs.append(String(
+        "the place the robot was at just before the one it is at now, or last left (\"where you were"
+        " before\", \"your last stop\", \"the place before this one\")"
+    ))
+    opts.append(String("starting_point"))
+    descs.append(String(
+        "the FIRST place on the robot's trail (\"where you started\", \"the first place you went to\")"
+    ))
+    opts.append(String("before_landmark"))
+    descs.append(String(
+        "the place the robot was at just BEFORE a place the instruction names (also: the place between"
+        " two visits to it)"
+    ))
+    opts.append(String("after_landmark"))
+    descs.append(String("the place the robot went to just AFTER a place the instruction names"))
+    opts.append(String("named"))
+    descs.append(String("the place the instruction names itself, as the place to go back to"))
+    if name_desc:
+        for i in range(len(opts)):
+            descs[i] = opts[i] + ": " + descs[i]
+    q.choice(
+        String(G1_Q_TRAIL_REL),
+        String("Which place of its trail does the instruction send the robot back to?"),
+        opts, descs,
+    )
+    var aops = places.copy()
+    var adesc = List[String]()
+    for p in places:
+        adesc.append(String("the ") + p + " is the landmark (before or after the " + p + ")")
+    aops.append(String("none"))
+    adesc.append(String("the instruction names no landmark"))
+    if name_desc:
+        for i in range(len(aops)):
+            adesc[i] = aops[i] + ": " + adesc[i]
+    q.choice(
+        String(G1_Q_TRAIL_ANCHOR),
+        String("If the instruction places its target BEFORE or AFTER another place, which place is that?"),
+        aops, adesc,
+    )
+    return q^
+
+
+def g1_trail_arrivals(ref ctx: G1Context) -> List[String]:
+    """Every arrival in the log, OLDEST first, a repeat in a row collapsed
+    (uncapped, unlike `trail()`)."""
+    var out = List[String]()
+    for e in ctx.log:
+        if e.kind == "arrived" and (len(out) == 0 or out[len(out) - 1] != e.text):
+            out.append(e.text)
+    return out^
+
+
+def g1_resolve_trail(rel: String, anchor: String, ref ctx: G1Context) -> String:
+    """The place a trail reference names, or "" when the log does not settle
+    it (the caller asks back): `previous_stop` = the first trail entry that is
+    not where the robot is; `starting_point` = the oldest trail entry, unless
+    the robot is there; `before_landmark` / `after_landmark` = the arrival just
+    before / after the LATEST arrival at `anchor`, unless that is where the
+    robot is. `named` is the caller's (the destination the first request
+    routed)."""
+    var tr = ctx.trail()
+    if rel == "previous_stop":
+        for t in tr:
+            if t != ctx.at:
+                return t
+        return String("")
+    if rel == "starting_point":
+        if len(tr) == 0:
+            return String("")
+        var first = tr[len(tr) - 1]
+        return first if first != ctx.at else String("")
+    if anchor == "none" or anchor == "":
+        return String("")
+    var arr = g1_trail_arrivals(ctx)
+    var k = -1
+    for i in range(len(arr)):
+        if arr[i] == anchor:
+            k = i
+    if k < 0:
+        return String("")
+    if rel == "before_landmark":
+        return arr[k - 1] if k > 0 and arr[k - 1] != ctx.at else String("")
+    if rel == "after_landmark":
+        return arr[k + 1] if k + 1 < len(arr) and arr[k + 1] != ctx.at else String("")
+    return String("")
+
+
+def g1_command_moves(ref bank: G1CommandBank, name: String) -> Bool:
+    """Whether a command (or an alias, by its target) moves the robot: bank
+    group `locomotion` or `combo`."""
+    var i = bank.find(g1_resolve(name))
+    if i < 0:
+        return False
+    var g = bank.group_at(i)
+    return g == "locomotion" or g == "combo"
+
+
 def _g1_command_options(
     ref bank: G1CommandBank,
     only: List[String],

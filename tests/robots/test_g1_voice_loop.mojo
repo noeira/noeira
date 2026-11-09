@@ -35,6 +35,7 @@ from noeira.envs.robots.g1_voice_loop import (
     g1_vad_open_at, g1_vad_close_at, g1_vad_floor_step,
     VL_NONE, VL_COMMAND, VL_SPEC, VL_WORLD, VL_TALK, VL_REFUSED,
     VL_ST_IDLE, VL_ST_REC, VL_ST_STT, VL_ST_JEV, VL_ST_SPEC, VL_ST_CHAT,
+    VL_ST_DEST, VL_ST_TRAIL,
     VL_OPEN_MULT, VL_CLOSE_MULT, VL_OPEN_MIN, VL_FLOOR_MIN,
     VL_OPEN_FRAMES, VL_MIN_PEAK_MULT, VL_ECHO_TAIL_S,
     VL_STT_DEADLINE_S, VL_JEV_DEADLINE_S, VL_CHAT_DEADLINE_S,
@@ -166,16 +167,20 @@ def main() raises:
     sts.append(VL_ST_JEV)
     sts.append(VL_ST_SPEC)
     sts.append(VL_ST_CHAT)
+    sts.append(VL_ST_DEST)
+    sts.append(VL_ST_TRAIL)
     var sdup = 0
     for i in range(len(sts)):
         for j in range(i + 1, len(sts)):
             if sts[i] == sts[j]:
                 sdup += 1
-    t.truth(sdup == 0, "the six states are distinct")
+    t.truth(sdup == 0, "the eight states are distinct")
 
     # ── the config's defaults are the measured ones ───────────────────
     print("-- config defaults")
     var c = G1VoiceConfig()
+    # ⚠ OFF unless asked: the measured requests of every other caller stay byte-identical
+    t.truth(c.triage == 0 and not c.name_desc, "the triage and name_desc are OFF by default")
     t.truth(c.stt_dl == VL_STT_DEADLINE_S and c.jev_dl == VL_JEV_DEADLINE_S,
             "the config defaults to the module's measured deadlines")
     t.truth(c.max_none == 0.25,
