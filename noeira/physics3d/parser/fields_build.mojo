@@ -442,7 +442,7 @@ from noeira.physics3d.gpu.constants import (
 )
 from .mesh_bvh_build import build_mesh_bvh
 from .flat_model import (
-    FlatModelDef, _EQ_CONNECT, _EQ_WELD, _EQ_JOINT,
+    FlatModelDef, GeomData, _EQ_CONNECT, _EQ_WELD, _EQ_JOINT,
     ACT_KIND_POSITION, ACT_KIND_VELOCITY,
 )
 from .flat_model import (
@@ -1223,6 +1223,24 @@ def rbound_of(
     return radius
 
 
+def _geom_ray_visible(fmd: FlatModelDef, gd: GeomData) -> Bool:
+    """`ray_eliminate`'s two STATIC rules, collapsed to one flag. MuJoCo:
+
+        matid <  0 and rgba[3] == 0        -> invisible
+        matid >= 0 and mat_rgba[3] == 0    -> invisible
+
+    ⚠ THE MATERIAL WINS WHEN THERE IS ONE — a geom with `rgba` opaque and an
+    alpha-0 MATERIAL is invisible, and reading only `rgba` would leave a
+    decoration in front of every rangefinder.
+
+    ONE function because two callers need it: `GEOM_IDX_RAY_VISIBLE`, and the
+    decision to load a non-colliding mesh for the rays (see the mesh loops).
+    """
+    if gd.material_id >= 0 and gd.material_id < len(fmd.materials):
+        return fmd.materials[gd.material_id].rgba_a != 0.0
+    return gd.rgba_a != 0.0
+
+
 def build_model_fields_from_flat[
 
     DTYPE: DType,
@@ -1707,10 +1725,12 @@ def build_model_fields_from_flat[
     #
     # ⚠ COMPUTED ONLY WHERE IT IS USED: a mesh geom that is neither collidable
     # nor a source of body inertia (its body carries an explicit `<inertial>`)
-    # gets nothing, and keeps its declared frame. That is dog — 162 visual-only
+    # nor seen by rays (the model carries no triangle soup) gets nothing, and
+    # keeps its declared frame. That is dog — 162 visual-only
     # meshes whose frames reach nothing but the renderer — and it is what keeps
     # this off dog's build path entirely. The same filter §22 applied to hull
     # construction, for the same reason.
+    var rays_carried = mf.dims.get_nmesh_tri() > 0
     var mesh_inertia_cache = List[MeshInertia[DTYPE]]()
     var mesh_inertia_valid = List[Bool](
         length=fmd.num_mesh_assets, fill=False
@@ -1732,7 +1752,19 @@ def build_model_fields_from_flat[
             continue
         var collidable = gd_m.contype != 0 or gd_m.conaffinity != 0
         var needs_inertia = not body_has_explicit_inertia[gd_m.body_id]
-        if not (collidable or needs_inertia):
+        # ⚠ AND A MESH THE RAYS WILL SEE. When the model carries the triangle
+        # soup (`nmesh_tri > 0`, i.e. someone rays it), a VISIBLE mesh geom
+        # needs its frame composed and its triangles loaded even if it can
+        # collide with nothing — `mj_ray` sees visual geoms. Skipping it left
+        # the G1's visual-only meshes 1-8 cm off and unrotated, and invisible
+        # to `ray_model` altogether (tests/perception/test_lidar_vs_mujoco).
+        # A model that is not rayed keeps the dog exemption below.
+        var for_rays = (
+            gd_m.geom_type == GEOM_MESH
+            and rays_carried
+            and _geom_ray_visible(fmd, gd_m)
+        )
+        if not (collidable or needs_inertia or for_rays):
             continue
         try:
             # ⚠ THE INERTIA MUST SEE THE SCALED MESH. `mesh_pos`/`mesh_quat`
@@ -1809,20 +1841,11 @@ def build_model_fields_from_flat[
             gd.friction_roll
         )
         mf.geoms.data[o + GEOM_IDX_PRIORITY] = Scalar[DTYPE](gd.priority)
-        # `ray_eliminate`'s two STATIC rules, collapsed to one flag. MuJoCo:
-        #   matid <  0 and rgba[3] == 0        -> invisible
-        #   matid >= 0 and mat_rgba[3] == 0    -> invisible
-        # Neither can change after the model is built, so a ray never has to
-        # look at a colour. ⚠ THE MATERIAL WINS WHEN THERE IS ONE — a geom
-        # with `rgba` opaque and an alpha-0 MATERIAL is invisible, and reading
-        # only `rgba` would leave a decoration in front of every rangefinder.
-        var _ray_vis = 1.0
-        if gd.material_id >= 0 and gd.material_id < len(fmd.materials):
-            if fmd.materials[gd.material_id].rgba_a == 0.0:
-                _ray_vis = 0.0
-        elif gd.rgba_a == 0.0:
-            _ray_vis = 0.0
-        mf.geoms.data[o + GEOM_IDX_RAY_VISIBLE] = Scalar[DTYPE](_ray_vis)
+        # `ray_eliminate`'s static rules (see `_geom_ray_visible`). Neither can
+        # change after the model is built, so a ray never looks at a colour.
+        mf.geoms.data[o + GEOM_IDX_RAY_VISIBLE] = Scalar[DTYPE](
+            1.0 if _geom_ray_visible(fmd, gd) else 0.0
+        )
         mf.geoms.data[o + GEOM_IDX_GROUP] = Scalar[DTYPE](gd.group)
         mf.geoms.data[o + GEOM_IDX_SOLREF_0] = Scalar[DTYPE](gd.solref_0)
         mf.geoms.data[o + GEOM_IDX_SOLREF_1] = Scalar[DTYPE](gd.solref_1)
@@ -2064,6 +2087,13 @@ def build_model_fields_from_flat[
         # also what lets the capacity check below be a hard error: otherwise
         # dog would fail a check for a feature it does not use.
         var mesh_collidable = gd.contype != 0 or gd.conaffinity != 0
+        # A visible mesh is also loaded when the model carries the triangle
+        # soup, so `ray_model` sees what `mj_ray` sees — see the inertia loop.
+        # ⚠ IT STAYS OUT OF COLLISION: the contype/conaffinity filter rejects
+        # the geom before any consumer reads its hull.
+        var mesh_wanted = mesh_collidable or (
+            rays_carried and _geom_ray_visible(fmd, gd)
+        )
         # ⚠ A SKIPPED MESH GEOM MUST NOT KEEP ITS ASSET INDEX. The main geom
         # loop writes `GEOM_IDX_MESH_ID = gd.mesh_id`, which is the index into
         # the XML's mesh ASSETS; the loop below overwrites it with the
@@ -2074,13 +2104,13 @@ def build_model_fields_from_flat[
         # today (the collision filter rejects those geoms first), but a stale
         # index that is only safe because of a check somewhere else is the
         # shape of the `mesh_vertadr` unit bug. Make it unusable instead.
-        if gd.geom_type == GEOM_MESH and not mesh_collidable:
+        if gd.geom_type == GEOM_MESH and not mesh_wanted:
             mf.geoms.data[o + GEOM_IDX_MESH_ID] = Scalar[DTYPE](-1)
         if (
             gd.geom_type == GEOM_MESH
             and gd.mesh_id >= 0
             and gd.mesh_filename.byte_length() > 0
-            and mesh_collidable
+            and mesh_wanted
         ):
             if loaded_mesh_ids[gd.mesh_id] >= 0:
                 var mid = loaded_mesh_ids[gd.mesh_id]
