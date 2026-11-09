@@ -57,6 +57,40 @@ def _pos(n: Int) -> Int:
 
 
 @always_inline
+def mount_world_pose[
+    DTYPE: DType, L_XPOS: TensorLayout, L_XQUAT: TensorLayout
+](
+    xpos: TileTensor[DTYPE, L_XPOS, MutAnyOrigin],
+    xquat: TileTensor[DTYPE, L_XQUAT, MutAnyOrigin],
+    env: Int,
+    body: Int,
+    mpos: Vec3Generic[DTYPE],
+    mquat: QuatGeneric[DTYPE],
+) -> Tuple[Vec3Generic[DTYPE], QuatGeneric[DTYPE]] where DTYPE.is_floating_point():
+    """The sensor frame in the world: (origin, orientation).
+
+    ONE composition for every sensor (lidar, depth camera), so the MuJoCo
+    gates of each cover the others. Body 0 (the world) is the identity —
+    `Data.xquat` row 0 is not relied on.
+    """
+    if body <= 0:
+        return (mpos, mquat)
+    # `Data.xquat` is packed (x, y, z, w); `Quat` takes (w, x, y, z).
+    var bq = QuatGeneric[DTYPE](
+        rebind[Scalar[DTYPE]](xquat[env, body * 4 + 3]),
+        rebind[Scalar[DTYPE]](xquat[env, body * 4 + 0]),
+        rebind[Scalar[DTYPE]](xquat[env, body * 4 + 1]),
+        rebind[Scalar[DTYPE]](xquat[env, body * 4 + 2]),
+    )
+    var bp = Vec3Generic[DTYPE](
+        rebind[Scalar[DTYPE]](xpos[env, body * 3 + 0]),
+        rebind[Scalar[DTYPE]](xpos[env, body * 3 + 1]),
+        rebind[Scalar[DTYPE]](xpos[env, body * 3 + 2]),
+    )
+    return (bp + bq.rotate_vec(mpos), bq * mquat)
+
+
+@always_inline
 def lidar_cast[
     DTYPE: DType,
     L_GEOMS: TensorLayout,
@@ -92,25 +126,10 @@ def lidar_cast[
     exclude body 0 — every static geom, the floor and walls included — which
     for a fixed test rig is a sensor that sees only moving things.
     """
-    var origin = mpos
-    var q = mquat
-    var exclude = -1
-    if body > 0:
-        # `Data.xquat` is packed (x, y, z, w); `Quat` takes (w, x, y, z).
-        var bq = QuatGeneric[DTYPE](
-            rebind[Scalar[DTYPE]](xquat[env, body * 4 + 3]),
-            rebind[Scalar[DTYPE]](xquat[env, body * 4 + 0]),
-            rebind[Scalar[DTYPE]](xquat[env, body * 4 + 1]),
-            rebind[Scalar[DTYPE]](xquat[env, body * 4 + 2]),
-        )
-        var bp = Vec3Generic[DTYPE](
-            rebind[Scalar[DTYPE]](xpos[env, body * 3 + 0]),
-            rebind[Scalar[DTYPE]](xpos[env, body * 3 + 1]),
-            rebind[Scalar[DTYPE]](xpos[env, body * 3 + 2]),
-        )
-        origin = bp + bq.rotate_vec(mpos)
-        q = bq * mquat
-        exclude = body
+    var pose = mount_world_pose[DTYPE](xpos, xquat, env, body, mpos, mquat)
+    var origin = pose[0]
+    var q = pose[1]
+    var exclude = body if body > 0 else -1
     var wdir = q.rotate_vec(dir)
     return ray_model[DTYPE](
         geoms, ngeom, bodies, xpos, xquat, env,

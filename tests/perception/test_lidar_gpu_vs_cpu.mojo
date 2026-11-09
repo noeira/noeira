@@ -25,11 +25,7 @@ from std.testing import assert_true, TestSuite
 
 from noeira.physics3d.fields import Data, Model, DynDims, init_hfield_data
 from noeira.physics3d.parser.full_parser import parse_xml_full
-from noeira.physics3d.parser.runtime_load import (
-    read_model_source,
-    dims_from_flat,
-    build_model_runtime,
-)
+from noeira.physics3d.parser.runtime_load import read_model_source, build_model_runtime
 from noeira.physics3d.kinematics.forward_kinematics import forward_kinematics
 from noeira.perception import (
     LidarSpec,
@@ -39,6 +35,7 @@ from noeira.perception import (
     lidar_scan_cpu,
     BatchedLidar,
 )
+from mj_reference import Lcg, mesh_budget_dims
 
 comptime GT = DType.float32
 comptime B = 8
@@ -47,51 +44,6 @@ comptime SCENE = "tests/perception/assets/lidar_room.xml"
 comptime TORSO = 24
 # The pelvis: the robot's root body.
 comptime PELVIS = 1
-
-
-struct Lcg(Copyable, Movable):
-    var s: UInt64
-
-    def __init__(out self, seed: UInt64):
-        self.s = seed
-
-    def u01(mut self) -> Float64:
-        self.s = self.s * 6364136223846793005 + 1442695040888963407
-        return Float64((self.s >> 11) & 0xFFFFFFFFFFFFF) / Float64(1 << 52)
-
-    def sym(mut self, a: Float64) -> Float64:
-        return (self.u01() * 2.0 - 1.0) * a
-
-
-def _dims_for(path: String) raises -> DynDims:
-    """The mesh budgets this scene needs, found the way the loader reports
-    them (it raises with the number)."""
-    var src = read_model_source(path)
-    var fmd = parse_xml_full(src[0], src[1])
-    var verts = 65536
-    var tris = 1
-    for _ in range(30):
-        var dims = dims_from_flat(fmd, max_contacts=16, nmesh_verts=verts, nmesh_tri=tris)
-        var m = Model[GT, DynDims](dims)
-        try:
-            build_model_runtime[GT](fmd, dims, m)
-            return dims
-        except e:
-            var msg = String(e)
-            var k = msg.find("Pass nmesh_tri=")
-            if k >= 0:
-                var bytes = msg.as_bytes()
-                var j = k + 15
-                var v = 0
-                while j < len(bytes) and bytes[j] >= 48 and bytes[j] <= 57:
-                    v = v * 10 + Int(bytes[j]) - 48
-                    j += 1
-                tris = v
-            elif msg.find("mesh vertex capacity") >= 0:
-                verts *= 2
-            else:
-                raise e^
-    raise Error("could not size the mesh budgets")
 
 
 def _compare(
@@ -150,7 +102,7 @@ def test_lidar_gpu_matches_cpu() raises:
         print("  SKIP — no accelerator on this machine")
         return
     var ctx = DeviceContext()
-    var dims = _dims_for(SCENE)
+    var dims = mesh_budget_dims(SCENE)
     var src = read_model_source(SCENE)
     var fmd = parse_xml_full(src[0], src[1])
     var m = Model[GT, DynDims](dims)

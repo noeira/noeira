@@ -1,0 +1,20 @@
+# A time-of-flight depth camera, Azure-Kinect-NFOV / Orbbec-Femto class:
+# 640 x 576, ~75 x 65 deg. fx = 320 / tan(37.5 deg), fy = 288 / tan(32.5 deg).
+# The noise is ASSUMED (sigma = 2 mm + 0.1 % of z): check the unit's datasheet.
+# ToF has no stereo shadow; multipath and dark-surface loss are not modelled.
+name = tof_class_640x576
+width = 640
+height = 576
+fx = 417.0
+fy = 452.1
+cx = 319.5
+cy = 287.5
+model = tof
+sigma_a = 0.002
+sigma_b = 0.001
+range_min = 0.25
+range_max = 5.5
+depth_unit = 0.001
+max_incidence_deg = 80
+dropout = 0.005
+rate_hz = 30

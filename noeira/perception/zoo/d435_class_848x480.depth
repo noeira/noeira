@@ -1,0 +1,23 @@
+# An active-stereo depth camera, Intel RealSense D435 class, at 848 x 480.
+# Datasheet: 87 x 58 deg depth FOV, 50 mm baseline, "< 2 % at 2 m" RMS error,
+# 1 mm depth unit, up to 90 fps. fx = 424 / tan(43.5 deg), fy = 240 / tan(29 deg).
+# subpixel 0.08 px is a typical disparity error for good texture (it gives
+# ~1.4 % at 2 m here); range_min 0.28 m is the documented min-Z at this
+# resolution, approximately; max_incidence and dropout are ASSUMED.
+name = d435_class_848x480
+width = 848
+height = 480
+fx = 446.9
+fy = 433.0
+cx = 423.5
+cy = 239.5
+model = stereo
+baseline = 0.05
+subpixel = 0.08
+range_min = 0.28
+range_max = 10
+depth_unit = 0.001
+max_incidence_deg = 80
+dropout = 0.01
+stereo_shadow = 1
+rate_hz = 30

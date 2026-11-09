@@ -1,0 +1,21 @@
+# The D435 class at 424 x 240 — the resolution an RL observation can afford.
+# Same optics as d435_class_848x480 (fx, fy, cx, cy halved for the binning);
+# the disparity error in pixels is taken as the same, so the depth error per
+# metre doubles. range_min ~0.16 m at this resolution (approximate).
+name = d435_class_424x240
+width = 424
+height = 240
+fx = 223.45
+fy = 216.5
+cx = 211.5
+cy = 119.5
+model = stereo
+baseline = 0.05
+subpixel = 0.08
+range_min = 0.16
+range_max = 10
+depth_unit = 0.001
+max_incidence_deg = 80
+dropout = 0.01
+stereo_shadow = 1
+rate_hz = 30

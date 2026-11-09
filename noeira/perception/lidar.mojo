@@ -33,6 +33,8 @@ as "free up to range_max", never as a distance.
 
 from std.math import cos, sin, sqrt, log, pi, asin
 
+from .spec_text import spec_lines, read_text
+
 comptime LIDAR_FAN: Int = 0
 comptime LIDAR_RINGS: Int = 1
 comptime LIDAR_SPIRAL: Int = 2
@@ -153,18 +155,9 @@ def lidar_spec_from_text(text: String) raises -> LidarSpec:
     """
     var s = LidarSpec()
     var seen_pattern = False
-    for raw in text.split("\n"):
-        var full = String(raw)
-        var hash = full.find("#")
-        var cut = String(full[byte=0:hash]) if hash >= 0 else full
-        var line = String(cut.strip())
-        if line.byte_length() == 0:
-            continue
-        var eq = line.find("=")
-        if eq < 0:
-            raise Error("lidar spec: expected `key = value`, got '" + line + "'")
-        var k = String(String(line[byte=0:eq]).strip())
-        var v = String(String(line[byte=eq + 1 : line.byte_length()]).strip())
+    for ln in spec_lines(text, "lidar"):
+        var k = ln.key
+        var v = ln.value
         if k == "name":
             s.name = v
         elif k == "pattern":
@@ -201,10 +194,7 @@ def lidar_spec_from_text(text: String) raises -> LidarSpec:
 
 
 def load_lidar_spec(path: String) raises -> LidarSpec:
-    var f = open(path, "r")
-    var text = f.read()
-    f.close()
-    return lidar_spec_from_text(text)
+    return lidar_spec_from_text(read_text(path))
 
 
 def _azimuth(spec: LidarSpec, i: Int, n: Int) -> Float64:
