@@ -19,3 +19,9 @@
 tests/concurrent/test_control_block.mojo
 tests/concurrent/test_ring.mojo
 tests/concurrent/test_worker.mojo
+
+# `noeira.ai.local_service`: a model on its own thread, polled like an API call
+# (what the in-process speech services stand on). Toy models, no weights: the
+# load state, a poll that never blocks while the model works, cancel dropping
+# the stale reply, errors and an oversize reply reported through `take`.
+tests/ai/test_local_service.mojo

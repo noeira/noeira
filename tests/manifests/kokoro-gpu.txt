@@ -16,6 +16,20 @@
 # per-stage and end-to-end timings.
 tests/audio/test_kokoro_gpu.mojo
 
+# `KokoroService` (`noeira/audio/kokoro/service.mojo`): Kokoro on a worker thread
+# behind `TextToSpeechService`. Its WAV equals a direct `speak` byte for byte, a
+# 50 Hz caller's worst `poll` stays under 2 ms (Orin: 134 us; M1: 61 us),
+# cancel, and a missing checkpoint reported as such.
+tests/audio/test_kokoro_service_gpu.mojo
+
+# Both in-process speech services in one process (`ParakeetService` +
+# `KokoroService`): Parakeet behind the service against transformers' padded
+# transcripts (and non-vacuity: unpadded must differ), then Kokoro -> Parakeet
+# round trips under a 50 Hz caller (worst call < 2 ms). Also needs Parakeet's
+# checkpoint and clips (`parakeet-ref.txt`). Orin, TF32 build: 18/18, three
+# exact round trips, worst call 294 us, 1.9 GB for the two.
+tests/audio/test_speech_services_gpu.mojo
+
 # ⚠ The default build is full fp32 on every target. `-D KOKORO_TF32=1` runs the
 # generator's convolutions in TF32 on NVIDIA (82 against 135 ms on the Orin) and
 # the gate then holds the waveform to 1e-2 instead of 2e-4 — a build-time

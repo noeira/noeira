@@ -22,6 +22,19 @@
 `TextToSpeech` speaks OpenAI's `/audio/speech`, which Kokoro-FastAPI and
 speaches also serve locally, so the same migration path holds.
 
+## The two services, and the backends behind them
+
+`SpeechToTextService` and `TextToSpeechService` are the surface a real-time
+caller drives (`G1VoiceLoopOf[STT, TTS]`): `start`, then `poll` once a frame
+until it says the call is over, then `result`, which is what raises. Nothing
+in it may block a frame. The HTTP clients here are one implementation; the
+models in Mojo are the other (`noeira.audio.parakeet.service`,
+`noeira.audio.kokoro.service`), running on a thread of their own. Each backend
+reads its own spec string (`from_spec`), so a caller picks the TYPE at build
+time and the spec at run time. Mojo has no trait objects: a runtime choice
+between the HTTP clients and the in-process models would compile both models
+into every binary.
+
 ⚠ SEND 16 kHz MONO. Every Whisper resamples to 16 kHz mono internally, so a
 48 kHz stereo capture is 6x the upload for the same transcript — and upload
 is most of the latency on a slow link. `transcribe(audio)` converts first.
@@ -47,7 +60,72 @@ struct Transcript(Copyable, Movable):
     var latency_ms: Float64
 
 
-struct SpeechToText(Movable):
+trait SpeechToTextService(Movable & Deinitable):
+    """Speech to text, driven without blocking: `start`, `poll` each frame
+    until True, then `result`.
+
+    ⚠ `poll` RETURNING TRUE MEANS THE CALL IS OVER, NOT THAT IT WORKED:
+    `result` is what raises. A caller's deadline is its own (`cancel`)."""
+
+    @staticmethod
+    def from_spec(spec: String) raises -> Self:
+        """The backend named by `spec` (each backend documents its own)."""
+        ...
+
+    def set_language(mut self, lang: String):
+        """ISO-639-1 hint ("en", "fr"); "" lets the model detect it."""
+        ...
+
+    def set_hint(mut self, vocab: String) -> Bool:
+        """Words the recogniser should prefer. False when this backend takes
+        no text hint — the caller then knows it was not sent."""
+        ...
+
+    def warm_up(mut self):
+        """Make the first call as fast as the next ones (a connection, a load)."""
+        ...
+
+    def start(mut self, ref audio: WavAudio) raises:
+        ...
+
+    def poll(mut self, timeout_ms: Int = 0) raises -> Bool:
+        ...
+
+    def result(mut self) raises -> Transcript:
+        ...
+
+    def cancel(mut self) raises:
+        """Abandon the call in flight; its result, if one comes, is dropped."""
+        ...
+
+
+trait TextToSpeechService(Movable & Deinitable):
+    """Text to speech, driven without blocking like `SpeechToTextService`."""
+
+    @staticmethod
+    def from_spec(spec: String, voice: String) raises -> Self:
+        """The backend named by `spec`, speaking with `voice` (Kokoro's
+        names: `af_heart`, `ff_siwis`, ...)."""
+        ...
+
+    def warm_up(mut self):
+        ...
+
+    def start(mut self, text: String) raises:
+        ...
+
+    def poll(mut self, timeout_ms: Int = 0) raises -> Bool:
+        ...
+
+    def result_wav_bytes(mut self) raises -> List[UInt8]:
+        """The reply as a WAV file's bytes."""
+        ...
+
+    def cancel(mut self) raises:
+        ...
+
+
+struct SpeechToText(Movable, SpeechToTextService):
     var kind: Int
     var url: String
     """The full endpoint, e.g. `https://api.openai.com/v1/audio/transcriptions`."""
@@ -130,6 +208,28 @@ struct SpeechToText(Movable):
             "https://router.huggingface.co/hf-inference/models/" + model,
             model.copy(), key^,
         )
+
+    @staticmethod
+    def from_spec(spec: String) raises -> SpeechToText:
+        """`groq`, `local:<base_url>` (an OpenAI-compatible server on this
+        machine, e.g. `local:http://127.0.0.1:8765/v1` — Phonon-2's `phonon
+        serve`), anything else Hugging Face's Whisper."""
+        if spec.startswith("local:"):
+            return SpeechToText.openai_compatible(String(spec[byte=6:]), String("phonon-2"))
+        if spec == "groq":
+            return SpeechToText.groq()
+        return SpeechToText.huggingface()
+
+    def set_language(mut self, lang: String):
+        self.language = lang
+
+    def set_hint(mut self, vocab: String) -> Bool:
+        """⚠ NOT ON THE HUGGING FACE BACKEND (see `prompt`): False there, and
+        nothing is set."""
+        if self.kind == STT_RAW:
+            return False
+        self.prompt = vocab
+        return True
 
     def start_wav_bytes(mut self, ref wav: List[UInt8]) raises:
         """Upload in the background; `poll` it, then `result`."""
@@ -234,7 +334,7 @@ struct SpeechToText(Movable):
         return self.transcribe(audio)
 
 
-struct TextToSpeech(Movable):
+struct TextToSpeech(Movable, TextToSpeechService):
     var url: String
     var model: String
     var voice: String
@@ -286,6 +386,14 @@ struct TextToSpeech(Movable):
     ) raises -> TextToSpeech:
         """Kokoro-FastAPI: `("http://localhost:8880/v1", "kokoro", "af_heart")`."""
         return TextToSpeech(base_url + "/audio/speech", model^, voice^, key^)
+
+    @staticmethod
+    def from_spec(spec: String, voice: String) raises -> TextToSpeech:
+        """`local:<base_url>`: an OpenAI-compatible `/audio/speech` server on
+        this machine (Kokoro-FastAPI, `kokoro_serve.py`), model `kokoro`."""
+        if spec.startswith("local:"):
+            return TextToSpeech.openai_compatible(String(spec[byte=6:]), String("kokoro"), voice)
+        raise Error("tts: unknown spec '" + spec + "' — local:<base_url>")
 
     def start(mut self, text: String) raises:
         """Synthesise in the background; `poll` it, then `result`."""

@@ -60,7 +60,9 @@ from std.time import perf_counter_ns
 from noeira.ai.audio_io import MicCapture, rms, LocalVoice, os_voice_for
 from noeira.ai.chat import ChatClient, ChatMessage, ToolSpec
 from noeira.ai.jev import JevClient, JevQuestions
-from noeira.ai.speech import SpeechToText, STT_RAW, TextToSpeech
+from noeira.ai.speech import (
+    SpeechToText, TextToSpeech, SpeechToTextService, TextToSpeechService,
+)
 from noeira.io.fileio import write_file_atomic
 from noeira.io.wav import WavAudio
 from noeira.envs.robots.g1_command_bank import G1CommandBank
@@ -330,13 +332,21 @@ struct G1VoiceConfig(Copyable, Movable):
         self.name_desc = False
 
 
-struct G1VoiceLoop(Movable):
+comptime G1VoiceLoop = G1VoiceLoopOf[SpeechToText, TextToSpeech]
+"""The loop on the HTTP clients: `stt_spec` / `tts_spec` choose among hosted
+services and local servers at run time."""
+
+
+struct G1VoiceLoopOf[STT: SpeechToTextService, TTS: TextToSpeechService](Movable):
     """The microphone, the detector, the recogniser, the decision and the
-    voice — one object, polled once a frame."""
+    voice — one object, polled once a frame.
+
+    `STT` / `TTS` are the backends, chosen at BUILD time (`G1VoiceLoop` is the
+    HTTP one); `cfg.stt_spec` / `cfg.tts_spec` go to their `from_spec`."""
 
     var mic: MicCapture
     var voice: LocalVoice
-    var tts: Optional[TextToSpeech]
+    var tts: Optional[Self.TTS]
     """`tts_spec` set: the synthesiser. Its WAV is played through `voice`, so
     `voice.speaking()` stays the one end signal."""
     var tts_busy: Bool
@@ -345,7 +355,7 @@ struct G1VoiceLoop(Movable):
     var tts_text: String
     """What is being synthesised, for the OS-voice fallback."""
     var tts_t0: Int
-    var stt: SpeechToText
+    var stt: Self.STT
     var jev: JevClient
     var llm: ChatClient
     var cfg: G1VoiceConfig
@@ -405,26 +415,21 @@ struct G1VoiceLoop(Movable):
         BEFORE its loop starts rather than be swallowed inside one."""
         self.cfg = cfg^
         self.jev = JevClient.from_env()
-        # `local:<base_url>` is any OpenAI-compatible server on this machine
-        # (Phonon-2's `phonon serve`: English only, `language` is ignored,
-        # `prompt` is read as a hotword list — at most 25 words).
-        if self.cfg.stt_spec.startswith("local:"):
-            self.stt = SpeechToText.openai_compatible(
-                String(self.cfg.stt_spec[byte=6:]), String("phonon-2")
-            )
-        elif self.cfg.stt_spec == "groq":
-            self.stt = SpeechToText.groq()
-        else:
-            self.stt = SpeechToText.huggingface()
+        # The backend reads its own spec. For the HTTP client, `local:<base_url>`
+        # is any OpenAI-compatible server on this machine (Phonon-2's `phonon
+        # serve`: English only, `language` is ignored, `prompt` is read as a
+        # hotword list — at most 25 words).
+        self.stt = Self.STT.from_spec(self.cfg.stt_spec)
         if self.cfg.lang != "":
-            self.stt.language = self.cfg.lang
+            self.stt.set_language(self.cfg.lang)
         # ⚠ THE VOCABULARY GOES ONLY TO A BACKEND THAT TAKES ONE. HF's Whisper
         # accepts a prompt as token ids, never as text, and the client RAISES
         # rather than dropping it — which is right, because a silently dropped
         # hint and a hint that did not help are indistinguishable from outside
-        # and that is exactly how "cours" was misdiagnosed (§12.56).
-        if self.cfg.vocab != "" and self.stt.kind != STT_RAW:
-            self.stt.prompt = self.cfg.vocab
+        # and that is exactly how "cours" was misdiagnosed (§12.56). So the
+        # backend says whether it took it.
+        if self.cfg.vocab != "":
+            _ = self.stt.set_hint(self.cfg.vocab)
         self.llm = ChatClient.from_spec(self.cfg.llm_spec)
         # ⚠ BOTH OF THESE ARE MEASURED AND BELONG WITH THE CLIENT. A reply is
         # one short sentence, so 120 tokens is generous — and Qwen THINKS
@@ -446,16 +451,11 @@ struct G1VoiceLoop(Movable):
             else os_voice_for(self.cfg.lang)
         )
         self.tts = None
-        if self.cfg.tts_spec.startswith("local:"):
+        if self.cfg.tts_spec != "":
             var kv = self.cfg.tts_voice
             if kv == "":
                 kv = String("ff_siwis") if self.cfg.lang == "fr" else String("af_heart")
-            self.tts = TextToSpeech.openai_compatible(
-                String(self.cfg.tts_spec[byte=6:]), String("kokoro"), kv^
-            )
-        elif self.cfg.tts_spec != "":
-            raise Error("tts: unknown spec '" + self.cfg.tts_spec
-                        + "' — \"\" (the OS voice) or local:<base_url>")
+            self.tts = Self.TTS.from_spec(self.cfg.tts_spec, kv)
         self.tts_busy = False
         self.tts_text = String("")
         self.tts_t0 = 0
