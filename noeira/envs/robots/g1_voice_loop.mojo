@@ -59,7 +59,7 @@ from std.time import perf_counter_ns
 
 from noeira.ai.audio_io import MicCapture, rms, LocalVoice, os_voice_for
 from noeira.ai.chat import ChatClient, ChatMessage, ToolSpec
-from noeira.ai.jev import JevClient, JevQuestions
+from noeira.ai.jev import JevClient, JevQuestions, DecisionService
 from noeira.ai.speech import (
     SpeechToText, TextToSpeech, SpeechToTextService, TextToSpeechService,
 )
@@ -272,6 +272,9 @@ struct G1VoiceConfig(Copyable, Movable):
     `os_voice_for(lang)`. Otherwise the voice's name for the backend in use."""
     var tts_dl: Float64
     """Seconds a synthesis may take before the OS voice says it instead."""
+    var dec_spec: String
+    """The decision backend's spec (`DEC.from_spec`): for `JevClient`, "" =
+    hosted Jev or `JEV_URL`; for `D1Service`, `native` / `native:<dir>`."""
     var memory_route: Bool
     """`request_wording` only: the command request also asks which
     remembered place a request means (`g1_add_memory_reference`), and "the
@@ -326,23 +329,25 @@ struct G1VoiceConfig(Copyable, Movable):
         self.tts_spec = String("")
         self.tts_voice = String("")
         self.tts_dl = VL_TTS_DEADLINE_S
+        self.dec_spec = String("")
         self.memory_route = False
         self.dest_words = List[String]()
         self.triage = G1_TRIAGE_OFF
         self.name_desc = False
 
 
-comptime G1VoiceLoop = G1VoiceLoopOf[SpeechToText, TextToSpeech]
-"""The loop on the HTTP clients: `stt_spec` / `tts_spec` choose among hosted
-services and local servers at run time."""
+comptime G1VoiceLoop = G1VoiceLoopOf[SpeechToText, TextToSpeech, JevClient]
+"""The loop on the HTTP clients: `stt_spec` / `tts_spec` / `dec_spec` choose
+among hosted services and local servers at run time."""
 
 
-struct G1VoiceLoopOf[STT: SpeechToTextService, TTS: TextToSpeechService](Movable):
+struct G1VoiceLoopOf[STT: SpeechToTextService, TTS: TextToSpeechService, DEC: DecisionService](Movable):
     """The microphone, the detector, the recogniser, the decision and the
     voice — one object, polled once a frame.
 
-    `STT` / `TTS` are the backends, chosen at BUILD time (`G1VoiceLoop` is the
-    HTTP one); `cfg.stt_spec` / `cfg.tts_spec` go to their `from_spec`."""
+    `STT` / `TTS` / `DEC` are the backends, chosen at BUILD time (`G1VoiceLoop`
+    is the HTTP trio); `cfg.stt_spec` / `cfg.tts_spec` / `cfg.dec_spec` go to
+    their `from_spec`."""
 
     var mic: MicCapture
     var voice: LocalVoice
@@ -356,7 +361,7 @@ struct G1VoiceLoopOf[STT: SpeechToTextService, TTS: TextToSpeechService](Movable
     """What is being synthesised, for the OS-voice fallback."""
     var tts_t0: Int
     var stt: Self.STT
-    var jev: JevClient
+    var jev: Self.DEC
     var llm: ChatClient
     var cfg: G1VoiceConfig
     var quest: JevQuestions
@@ -414,7 +419,7 @@ struct G1VoiceLoopOf[STT: SpeechToTextService, TTS: TextToSpeechService](Movable
         pool and resolving API keys are all things that should stop a program
         BEFORE its loop starts rather than be swallowed inside one."""
         self.cfg = cfg^
-        self.jev = JevClient.from_env()
+        self.jev = Self.DEC.from_spec(self.cfg.dec_spec)
         # The backend reads its own spec. For the HTTP client, `local:<base_url>`
         # is any OpenAI-compatible server on this machine (Phonon-2's `phonon
         # serve`: English only, `language` is ignored, `prompt` is read as a

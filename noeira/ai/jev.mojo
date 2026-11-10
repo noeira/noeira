@@ -196,7 +196,40 @@ struct JevAnswers(Movable):
         return self.doc.number(p)
 
 
-struct JevClient(Movable):
+trait DecisionService(Movable & Deinitable):
+    """System One decisions, driven without blocking: `start` (a JSON state) or
+    `start_text`, `poll` each frame until True, then `result`. The HTTP client
+    (`JevClient`: hosted Jev, or any Jev-compatible server) and the model in
+    this process (`noeira.llm.d1.service.D1Service`) both serve it, so a caller
+    (`G1VoiceLoopOf`) picks one at BUILD time.
+
+    ⚠ `poll` RETURNING TRUE MEANS THE CALL IS OVER, NOT THAT IT WORKED:
+    `result` is what raises."""
+
+    @staticmethod
+    def from_spec(spec: String) raises -> Self:
+        ...
+
+    def warm_up(mut self):
+        ...
+
+    def start(mut self, state_json: String, ref questions: JevQuestions) raises:
+        ...
+
+    def start_text(mut self, state_text: String, ref questions: JevQuestions) raises:
+        ...
+
+    def poll(mut self, timeout_ms: Int = 0) raises -> Bool:
+        ...
+
+    def result(mut self) raises -> JevAnswers:
+        ...
+
+    def cancel(mut self) raises:
+        ...
+
+
+struct JevClient(Movable, DecisionService):
     var url: String
     var model: String
     var retries: Int
@@ -243,6 +276,14 @@ struct JevClient(Movable):
             return JevClient(find_api_key(["LAYA_API_KEY"]), model^, local^)
         var key = api_key(["JEV_API_KEY", "TYPESAFE_API_KEY"])
         return JevClient(key^, model^)
+
+    @staticmethod
+    def from_spec(spec: String) raises -> JevClient:
+        """"" = `from_env` (hosted Jev, or `JEV_URL`); anything else is the URL
+        of a Jev-compatible server (`LAYA_API_KEY` if set)."""
+        if spec.byte_length() == 0:
+            return JevClient.from_env()
+        return JevClient(find_api_key(["LAYA_API_KEY"]), String("jev-latest"), spec)
 
     def request_body(
         self, state: String, state_is_json: Bool, ref questions: JevQuestions

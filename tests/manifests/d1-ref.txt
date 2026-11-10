@@ -53,3 +53,10 @@ tests/llm/test_lfm3_backward_gpu.mojo
 # from fridge (0.97) to the label (sofa) in a few steps, the other two answers
 # keeping their picks. Needs only the checkpoint (no dumps).
 tests/llm/test_d1_finetune_smoke_gpu.mojo
+
+# D1Service (noeira/llm/d1/service.mojo): d1 on its own thread behind the
+# voice loop's DecisionService (JevQuestions in, JevAnswers out), asked by a
+# 50 Hz caller: answers equal d1's own (answers.json), the caller never held
+# more than 2 ms (Orin, bf16: 21 us while d1 works 249 ms), a missing checkpoint
+# FAILED with its reason. One copy of the model only.
+tests/llm/test_d1_service_gpu.mojo
