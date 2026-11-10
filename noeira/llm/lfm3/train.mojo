@@ -30,6 +30,7 @@ from .kernels import (
 from .kernels_bwd import (
     rms_bwd_kernel, swiglu_bwd_kernel, short_conv_bwd_kernel, gate_bwd_kernel, attn_dp_kernel,
     softmax_bwd_rows_kernel, attn_dq_kernel, attn_dkv_kernel, lm_head_bwd_kernel, scatter_rows_kernel, axpy_kernel,
+    adamw_kernel,
 )
 from .model import Lfm3Text, LT_CONV, LT_FULL, LT_SLIDING, LF_TF32
 
@@ -224,3 +225,67 @@ def backward(mut lm: Lfm3Text, dfinal: DeviceBuffer[DT], t: Int) raises -> Devic
         dx = dx_in^
         li -= 1
     return dx^
+
+
+struct LoraAdamW(Movable):
+    """AdamW over every adapter of an `Lfm3Text` (its `lora_a` / `lora_b`),
+    the gradients zeroed by each step. Liquid's cookbook: lr 2e-4."""
+
+    var lr: Float32
+    var b1: Float32
+    var b2: Float32
+    var eps: Float32
+    var wd: Float32
+    var t: Int
+    var m: List[DeviceBuffer[DT]]
+    var v: List[DeviceBuffer[DT]]
+
+    def __init__(out self, mut lm: Lfm3Text, lr: Float32 = 2e-4, wd: Float32 = 0.0) raises:
+        self.lr = lr
+        self.b1 = 0.9
+        self.b2 = 0.999
+        self.eps = 1e-8
+        self.wd = wd
+        self.t = 0
+        self.m = List[DeviceBuffer[DT]]()
+        self.v = List[DeviceBuffer[DT]]()
+        for j in range(len(lm.lora_a)):
+            for which in range(2):
+                var n = len(lm.lora_a[j]) if which == 0 else len(lm.lora_b[j])
+                var mb = lm.new(n)
+                mb.enqueue_fill(0.0)
+                var vb = lm.new(n)
+                vb.enqueue_fill(0.0)
+                self.m.append(mb^)
+                self.v.append(vb^)
+
+    def step(mut self, mut lm: Lfm3Text) raises:
+        self.t += 1
+        var c1 = Float32(1.0 - Float64(self.b1) ** self.t)
+        var c2 = Float32(1.0 - Float64(self.b2) ** self.t)
+        for j in range(len(lm.lora_a)):
+            for which in range(2):
+                var p = lm.lora_a[j] if which == 0 else lm.lora_b[j]
+                var g = lm.lora_da[j] if which == 0 else lm.lora_db[j]
+                var n = len(p)
+                lm.ctx.enqueue_function[adamw_kernel](
+                    p, g, self.m[2 * j + which], self.v[2 * j + which], Int64(n), self.lr, self.b1, self.b2,
+                    self.eps, self.wd, c1, c2, grid_dim=_blocks(n), block_dim=TPB,
+                )
+
+
+def train_step(
+    mut lm: Lfm3Text, mut opt: LoraAdamW, ids: List[Int], groups: List[Int], state_len: Int,
+    slots: List[Int], targets: List[Int],
+) raises -> Float64:
+    """One row: forward (training), the slots' cross-entropy, backward, AdamW.
+    Returns the loss before the step."""
+    lm.training = True
+    var taps = List[DeviceBuffer[DT]]()
+    var h = lm.forward(ids, groups, state_len, taps)
+    var lt = slot_loss(lm, h, len(ids), slots, targets)
+    _ = backward(lm, lt[1], len(ids))
+    opt.step(lm)
+    lm.training = False
+    lm.act = List[Dict[String, DeviceBuffer[DT]]]()  # free the activations
+    return lt[0]

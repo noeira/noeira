@@ -46,3 +46,10 @@ tests/llm/test_d1_system_one_gpu.mojo
 # argmax (p ~ 0.98) every gradient scales with 1 - p and fp32's ~3e-4 in that
 # log-probability moved them all by ~2 %.
 tests/llm/test_lfm3_backward_gpu.mojo
+
+# Fine-tuning d1 in Mojo, end to end (a smoke test of the loop, not a recipe):
+# fresh PEFT-initialised adapters (B = 0) leave every answer exactly as the
+# base model's; AdamW on one labelled row moves "Where should the robot walk?"
+# from fridge (0.97) to the label (sofa) in a few steps, the other two answers
+# keeping their picks. Needs only the checkpoint (no dumps).
+tests/llm/test_d1_finetune_smoke_gpu.mojo

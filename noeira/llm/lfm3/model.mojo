@@ -46,6 +46,7 @@ layers (no zero tail). Bit 4: no output gate.
 """
 
 from std.math import cos, sin, pow
+from std.random import random_float64, seed as set_seed
 from std.memory import unsafe_memcpy
 from std.sys import default_accelerator
 from std.sys.defines import is_defined
@@ -328,6 +329,53 @@ struct Lfm3Text(Movable):
             self.lora_da.append(da^)
             self.lora_db.append(db^)
             self.lora_shape.append((sa[1], sb[0]))
+
+    def init_lora(mut self, rank: Int, alpha: Float32, seed: Int = 0) raises:
+        """Fresh adapters on every linear Liquid's recipe adapts (q k v o,
+        in_proj out_proj, w1 w2 w3), PEFT's initialisation: A uniform in
+        +-1/sqrt(in) (kaiming_uniform with a = sqrt 5), B ZERO — the adapted
+        model starts exactly as the base one. Scale `alpha / rank`."""
+        set_seed(seed)
+        self.lora_index = Dict[String, Int]()
+        self.lora_a = List[DeviceBuffer[DT]]()
+        self.lora_b = List[DeviceBuffer[DT]]()
+        self.lora_da = List[DeviceBuffer[DT]]()
+        self.lora_db = List[DeviceBuffer[DT]]()
+        self.lora_shape = List[Tuple[Int, Int]]()
+        self.lora_rank = rank
+        self.lora_scale = alpha / Float32(rank)
+        var dm = self.cfg.hidden
+        for li in range(len(self.cfg.layer_types)):
+            var p = String("layers.") + String(li) + "."
+            var mods = List[String]()
+            if self.cfg.layer_types[li] == LT_CONV:
+                mods.append(p + "conv.in_proj")
+                mods.append(p + "conv.out_proj")
+            else:
+                for m in ["self_attn.q_proj", "self_attn.k_proj", "self_attn.v_proj", "self_attn.o_proj"]:
+                    mods.append(p + String(m))
+            for m in ["feed_forward.w1", "feed_forward.w3", "feed_forward.w2"]:
+                mods.append(p + String(m))
+            for key in mods:
+                var n_el = len(self.dev[self.index[key + ".weight"]])
+                var fan_in = self.cfg.ff if key.endswith("w2") else dm
+                var fan_out = n_el // fan_in
+                var bound = 1.0 / (Float64(fan_in) ** 0.5)
+                var a = List[Float32](capacity=rank * fan_in)
+                for _ in range(rank * fan_in):
+                    a.append(Float32((random_float64() * 2.0 - 1.0) * bound))
+                self.lora_index[key] = len(self.lora_a)
+                self.lora_a.append(self._upload(a))
+                var b = self.new(fan_out * rank)
+                b.enqueue_fill(0.0)
+                self.lora_b.append(b^)
+                var da = self.new(rank * fan_in)
+                da.enqueue_fill(0.0)
+                var db = self.new(fan_out * rank)
+                db.enqueue_fill(0.0)
+                self.lora_da.append(da^)
+                self.lora_db.append(db^)
+                self.lora_shape.append((fan_in, fan_out))
 
     def _upload(self, v: List[Float32]) raises -> DeviceBuffer[DT]:
         var h = self.ctx.enqueue_create_host_buffer[DT](len(v))

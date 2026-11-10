@@ -223,3 +223,21 @@ def axpy_kernel(dst: Ptr, src: Ptr, n_n: Int64, alpha: Float32):
     var i = Int(global_idx.x)
     if i < Int(n_n):
         dst[unsafe_offset=i] = dst[unsafe_offset=i] + Scalar[DT](alpha) * src[unsafe_offset=i]
+
+
+def adamw_kernel(
+    p: Ptr, g: Ptr, m: Ptr, v: Ptr, n_n: Int64, lr: Float32, b1: Float32, b2: Float32, eps: Float32,
+    wd: Float32, c1: Float32, c2: Float32,
+):
+    """AdamW, in place: `m, v` the moments, `c1 = 1 - b1^t`, `c2 = 1 - b2^t`;
+    decoupled weight decay. The gradient is then zeroed."""
+    var i = Int(global_idx.x)
+    if i < Int(n_n):
+        var gi = g[unsafe_offset=i]
+        var mi = Scalar[DT](b1) * m[unsafe_offset=i] + Scalar[DT](1 - b1) * gi
+        var vi = Scalar[DT](b2) * v[unsafe_offset=i] + Scalar[DT](1 - b2) * gi * gi
+        m[unsafe_offset=i] = mi
+        v[unsafe_offset=i] = vi
+        var upd = (mi / Scalar[DT](c1)) / (sqrt(vi / Scalar[DT](c2)) + Scalar[DT](eps))
+        p[unsafe_offset=i] = p[unsafe_offset=i] - Scalar[DT](lr) * (upd + Scalar[DT](wd) * p[unsafe_offset=i])
+        g[unsafe_offset=i] = Scalar[DT](0)
