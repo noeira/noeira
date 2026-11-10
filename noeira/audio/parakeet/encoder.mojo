@@ -39,7 +39,8 @@ the `Linear` and `LayerNorm` calls go to that target as they are, and every
 other step is either the plain loop below (CPU, written for exactness against
 the reference) or the kernel of the same name in `kernels.mojo` (device). On a
 device the buffers stay there: `pk_subsample` uploads `feats`, `pk_encode`
-downloads `proj`, and a caller that wants `x` on the host downloads it.
+leaves `proj` there for the device decoder, and a caller that wants `x` or
+`proj` on the host downloads it.
 
 ## What the device path does differently, and why
 
@@ -64,11 +65,12 @@ With launches out of the way the GEMMs are the cost (114 of 127 ms on an M1
 Pro), and at the compiled maximum most of their rows are padding (a 2.5 s
 command in an 8 s shape: 45 rows of 101). The BUFFERS keep their compiled
 size, but `_gemm_any`, the norms and the activations take the valid row count:
-Metal's GEMM (runtime extents) and Accelerate's take it as an argument; MAX's
+Metal's GEMM (runtime extents) and Accelerate's take it as an argument. MAX's
 NVIDIA GEMM tiles its rows at compile time, so there — and on a CPU without
-Accelerate — the full compiled shape runs and the answer to padding cost is a
-smaller compiled bucket. Rows beyond the valid length then hold whatever an
-earlier clip left: finite, and never read.
+Accelerate — the full compiled shape runs. On the Orin that costs almost
+nothing: its GEMM time at these sizes is the streaming of the weights, not
+the rows (35.3 ms at 51 rows, 37.3 ms at 101; `stt.mojo`). Rows beyond the
+valid length hold whatever an earlier clip left: finite, and never read.
 
 `tests/audio/test_parakeet_reference.mojo` gates every stage on the CPU and
 `tests/audio/test_parakeet_gpu.mojo` on the device.
@@ -723,8 +725,8 @@ def pk_encode[F_MAX: Int, target: StaticString = "cpu"](
     ctx: Optional[DeviceContext] = None,
 ) raises -> Int:
     """The whole encoder: `ws.feats` -> `ws.x` (`[T, 1024]`) and `ws.proj`
-    (`[T, 640]`, what the joint network reads; on the HOST for either target).
-    Returns the valid frames."""
+    (`[T, 640]`, what the joint network reads), both on `target`. Returns the
+    valid frames."""
     comptime T = PkEncoderWork[F_MAX].T
     if not ws.relk_ready:
         pk_prepare_positions[F_MAX, target](m, ws, ctx)
@@ -732,6 +734,4 @@ def pk_encode[F_MAX: Int, target: StaticString = "cpu"](
     for layer in range(PK_LAYERS):
         _block[F_MAX, target](m.layers[layer], ws, layer, valid, ctx)
     m.enc_proj.forward[target, T](TensorRefs[1](ws.x), ws.proj, ctx)
-    comptime if target == "gpu":
-        ws.proj.download(ctx.value())
     return valid

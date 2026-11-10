@@ -10,7 +10,7 @@ The device path shares the `Linear` / `LayerNorm` leaves with the CPU path and
 replaces every plain loop with a kernel (`kernels.mojo`), so it is gated on the
 REFERENCE again rather than on the CPU path: subsampling, each block from the
 reference's own input, the chain, the encoder projection, then the greedy
-trace and the transcript (decoded on the host), which must be equal. Same
+trace and the transcript (decoded on the device too), which must be equal. Same
 dumps, same compiled maximum, same error measure (max |d| over the valid
 frames / max |reference|).
 
@@ -18,14 +18,23 @@ Falsification, with what a device-loaded model still allows (its weights have
 no host copy to edit): the padding mask dropped, and the positional table
 shifted by one offset. Each must push block 0 over `STAGE_BOUND`.
 
-⚠ The bounds are Metal's, where the GEMMs are fp32. On CUDA `Linear` may use
-TF32 tensor-core GEMMs (docs: nn GEMM dispatch); the measured errors are
-printed so the bound for that target is set from a run, not guessed.
+## Two sets of bounds, because NVIDIA's GEMMs are TF32 by default
+
+On Metal, and on NVIDIA built with `-D NN_CUBLAS_FP32=1`, every GEMM is fp32
+and the bounds are the CPU gate's (2e-5 a stage, 5e-5 the chain; measured
+2.9e-6 at worst on an Orin). By default nn's large GEMMs on NVIDIA run on the
+tensor cores in TF32 (10-bit mantissa products, `cublas_tf32`): 2.4x faster on
+the Orin (52 ms against 127 ms for the encoder) and 4e-4 a stage, 8e-4 the
+chain. So the default NVIDIA build is held to `1.5e-3` / `3e-3` — still under
+the smallest defect (4.2e-3) — and, like every build, to the EQUAL trace and
+transcript. The fp32 build is what proves the device code; the TF32 bound only
+says the precision loss stayed where it was measured.
 """
 
 from std.os import getenv
 from std.os.path import exists
-from std.sys import argv
+from std.sys import argv, default_accelerator
+from std.sys.defines import is_defined, get_defined_int
 from std.time import perf_counter_ns
 from max.gpu.host import DeviceContext
 
@@ -41,10 +50,12 @@ from noeira.audio.parakeet.weights import ParakeetTDT
 from noeira.nn.core.tensor import Tensor
 
 
-comptime F_MAX: Int = 801
+comptime F_MAX: Int = get_defined_int["PK_F_MAX", 801]()
+"""Mel frames compiled for: 801 (8 s) unless built with `-D PK_F_MAX=401` (4 s)."""
 comptime T_MAX: Int = PkEncoderWork[F_MAX].T
-comptime STAGE_BOUND: Float64 = 2.0e-5
-comptime CHAIN_BOUND: Float64 = 5.0e-5
+comptime TF32: Bool = default_accelerator().is_nvidia_gpu() and not is_defined["NN_CUBLAS_FP32"]()
+comptime STAGE_BOUND: Float64 = 1.5e-3 if TF32 else 2.0e-5
+comptime CHAIN_BOUND: Float64 = 3.0e-3 if TF32 else 5.0e-5
 
 
 def _abs(x: Float64) -> Float64:
@@ -127,6 +138,8 @@ def main() raises:
     print("Parakeet encoder ON THE DEVICE vs transformers ParakeetForTDT")
     print("  reference dumps: " + root + "   compiled maximum: " + String(F_MAX)
           + " mel frames, " + String(T_MAX) + " encoder frames")
+    print("  GEMMs: " + (String("TF32 (NVIDIA default)") if TF32 else String("fp32"))
+          + "   bounds: stage " + String(STAGE_BOUND) + ", chain " + String(CHAIN_BOUND))
     var fails = 0
     var ctx = DeviceContext()
     var t_load = perf_counter_ns()
@@ -136,7 +149,7 @@ def main() raises:
           + " ms: every parameter filled, every fp32 tensor of the file read")
     var tok = ParakeetTokenizer.load(parakeet_snapshot_dir() + "/tokenizer.json", PK_VOCAB)
     var ws = PkEncoderWork[F_MAX].make["gpu"](ctx)
-    var dw = PkDecodeWork()
+    var dw = PkDecodeWork.make["gpu"](ctx)
     var compared = 0
 
     for c in range(len(cases)):
@@ -183,19 +196,21 @@ def main() raises:
         var valid2 = pk_encode[F_MAX, "gpu"](model, ws, n_mel, ctx)
         var t0 = perf_counter_ns()
         valid2 = pk_encode[F_MAX, "gpu"](model, ws, n_mel, ctx)
+        ctx.synchronize()
         var t1 = perf_counter_ns()
         ws.x.download(ctx)
+        ws.proj.download(ctx)
         var want_last = load_npy_f64(dir + "/layer_23.npy")
         var want_proj = load_npy_f64(dir + "/encoder_proj.npy")
         fails += check(String("chain: block 23 output"), rel_error(ws.x, want_last, valid2 * PK_D), CHAIN_BOUND)
         fails += check(String("chain: encoder projection"), rel_error(ws.proj, want_proj, valid2 * PK_DEC), CHAIN_BOUND)
 
-        # decoding on the host from the device's projection
+        # decoding on the device, from the projection where it is
         var want_tokens = load_npy_f64(dir + "/tokens.npy")
         var want_durs = load_npy_f64(dir + "/durations.npy")
         var want_text = read_line(dir + "/transcript.txt")
         var t2 = perf_counter_ns()
-        var trace = pk_greedy_decode(model, ws.proj, valid2, T_MAX, dw)
+        var trace = pk_greedy_decode["gpu", T_MAX](model, ws.proj, valid2, T_MAX, dw, ctx)
         var t3 = perf_counter_ns()
         var text = tok.decode(trace.text_ids())
         var trace_ok = same_trace(trace, want_tokens, want_durs)
@@ -203,8 +218,8 @@ def main() raises:
         print("  " + ("PASS" if trace_ok else "FAIL") + "  token/duration trace: "
               + String(len(trace.tokens)) + " steps (reference " + String(len(want_tokens)) + ")")
         print("  " + ("PASS" if text_ok else "FAIL") + "  transcript: '" + text + "'")
-        print("        encoder (warm, incl. upload + download) " + String(Float64(Int(t1 - t0)) / 1.0e6)
-              + " ms, decode on the host " + String(Float64(Int(t3 - t2)) / 1.0e6) + " ms")
+        print("        encoder (warm, incl. the upload) " + String(Float64(Int(t1 - t0)) / 1.0e6)
+              + " ms, decode on the device " + String(Float64(Int(t3 - t2)) / 1.0e6) + " ms")
         if not trace_ok:
             fails += 1
         if not text_ok:

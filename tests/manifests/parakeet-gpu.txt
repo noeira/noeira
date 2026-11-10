@@ -5,12 +5,23 @@
 # how to produce them). ⚠ Loads 2.5 GB of weights onto the GPU: one GPU model
 # process at a time on a 16 GB machine.
 
-# The device path against transformers again, not against our CPU path:
-# subsampling, each block from the reference's own input, the chain, the
-# encoder projection, the greedy trace and the transcript (equal), at one
+# The device path (encoder AND decoder) against transformers again, not against
+# our CPU path: subsampling, each block from the reference's own input, the
+# chain, the encoder projection, the greedy trace and the transcript (equal), at one
 # compiled maximum for the plain dumps and the reference's padded one; two
 # injected defects (padding mask dropped, positions off by one).
 tests/audio/test_parakeet_gpu.mojo
+
+# ⚠ On NVIDIA the default build runs nn's large GEMMs in TF32 and the gate uses
+# its TF32 bounds (1.5e-3 / 3e-3). The build that PROVES the device code is the
+# full-fp32 one, held to the CPU's bounds:
+#
+#   pixi run -e nvidia mojo build -D NN_CUBLAS_FP32=1 -I . tests/audio/test_parakeet_gpu.mojo \
+#     -o build/test_parakeet_gpu_fp32 && ./build/test_parakeet_gpu_fp32
+#
+# On the Orin: `pixi run -e jetson build-jetson ...` (adds `--target-accelerator
+# sm_87`), and run the binary with JetPack's cuBLAS first on the loader path
+# (`LD_LIBRARY_PATH=/usr/local/cuda/lib64:$LD_LIBRARY_PATH`).
 
 # The transcript gate with the encoder on the device is a BUILD-time variant of
 # the CPU one (the target is a comptime parameter; `mojo run -D` can be stale):

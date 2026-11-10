@@ -36,10 +36,10 @@ laptop. Fine-tuning unfreezes what it trains.
 
 ## On a device
 
-`load["gpu"]` puts the ENCODER (subsampling, the 24 blocks, the encoder
-projection: 99 % of the weights) on the device and keeps the prediction network
-and the joint on the host, where the greedy loop runs them one token at a time
-(`decode.mojo`). Two things about how, both measured:
+`load["gpu"]` puts every parameter on the device: the encoder (subsampling, the
+24 blocks, the encoder projection: 99 % of the weights) and the prediction
+network and joint the greedy loop runs one token at a time (`decode.mojo`).
+Two things about how, both measured:
 
 - **One arena per block, not one buffer per parameter.** On Metal every kernel
   launch costs ~22 us plus ~0.22 us for EACH live device buffer in the process
@@ -48,7 +48,8 @@ and the joint on the host, where the greedy loop runs them one token at a time
   the whole encode was launch overhead (162 ms of it for 912 launches). A
   sub-buffer of an arena is free: 1 arena + 1,200 sub-buffers measures 21.7 us.
   So each block's parameters and running statistics are slices of one device
-  buffer (`arenas`), each slice starting on a multiple of `PK_ARENA_ALIGN`
+  buffer (`arenas`; one more for the subsampling and projection, one for the
+  decoder: 26), each slice starting on a multiple of `PK_ARENA_ALIGN`
   elements — MAX's GEMM loads its operands with 16-byte vectors and faults on a
   slice that starts off that boundary.
 - **No host copies.** A parameter uploaded the ordinary way exists three times:
@@ -432,7 +433,7 @@ struct ParakeetTDT(ParamWalkable):
     def walk_decoder[target: StaticString, V: ParamVisitor](
         mut self, mut visitor: V, ctx: Optional[DeviceContext], prefix: String
     ) raises:
-        """The prediction network and the joint (always host-resident)."""
+        """The prediction network and the joint."""
         self.embedding.for_each_param[target](
             visitor, ctx, join_name(prefix, String("embedding"))
         )
@@ -516,10 +517,18 @@ struct ParakeetTDT(ParamWalkable):
                 self.layers[i].walk[target](w, ctx, name)
                 self.layers[i].walk_state[target](w, ctx, name)
                 self.arenas.append(ai)
+            # The prediction network and the joint: one more arena.
+            var cd = PkCount()
+            self.walk_decoder["cpu"](cd, None, String(""))
+            var ad = c.enqueue_create_buffer[DT](cd.elements)
+            ad.enqueue_fill(0.0)
+            w.begin(ad, cd.elements)
+            self.walk_decoder[target](w, ctx, String(""))
+            self.arenas.append(ad)
         else:
             self.walk_encoder[target](w, ctx, String(""))
             self.for_each_state[target](w, ctx)
-        self.walk_decoder["cpu"](w, None, String(""))
+            self.walk_decoder[target](w, ctx, String(""))
         w.ld.report(String("parakeet"))
         if len(w.ld.loaded) + len(w.ld.zeroed) != w.ld.map.size():
             raise Error(

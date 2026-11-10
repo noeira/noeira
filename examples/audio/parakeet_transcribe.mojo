@@ -23,8 +23,8 @@ the model is two minutes of compile):
         -o build/parakeet_transcribe_gpu                  (-e nvidia on a CUDA machine)
 """
 
-from std.sys import argv
-from std.sys.defines import is_defined
+from std.sys import argv, default_accelerator
+from std.sys.defines import is_defined, get_defined_int
 from std.time import perf_counter_ns
 from max.gpu.host import DeviceContext
 
@@ -38,8 +38,12 @@ from noeira.audio.parakeet.encoder import (
 from noeira.audio.parakeet.stt import ParakeetSTT
 
 
-comptime F_MAX: Int = 801
+comptime F_MAX: Int = get_defined_int["PK_F_MAX", 801]()
+"""Mel frames compiled for: 801 (8 s) unless built with `-D PK_F_MAX=401` (4 s)."""
 comptime TARGET: StaticString = "gpu" if is_defined["PK_GPU"]() else "cpu"
+comptime F_SHORT: Int = 401 if (is_defined["PK_GPU"]() and default_accelerator().is_nvidia_gpu() and F_MAX > 401) else 0
+"""On NVIDIA: a second, 4 s shape for the clips that fit (`stt.mojo`). The
+`--profile` breakdown below always times the 8 s shape."""
 
 
 def sync(ctx: Optional[DeviceContext]) raises:
@@ -73,9 +77,9 @@ def main() raises:
         return
 
     var t0 = perf_counter_ns()
-    var stt = ParakeetSTT[F_MAX, TARGET].load()
+    var stt = ParakeetSTT[F_MAX, TARGET, F_SHORT].load()
     print("loaded in", Int(ms(t0, perf_counter_ns())), "ms; encoder on the", TARGET,
-          "; compiled for", ParakeetSTT[F_MAX, TARGET].max_seconds(), "s")
+          "; compiled for", ParakeetSTT[F_MAX, TARGET, F_SHORT].max_seconds(), "s")
 
     for f in range(len(files)):
         var wav = load_wav(files[f]).to_mono().resample(16000)
@@ -105,10 +109,11 @@ def main() raises:
         stt.model.enc_proj.forward[TARGET, T](
             TensorRefs[1](stt.enc.x), stt.enc.proj, stt.ctx
         )
-        comptime if TARGET == "gpu":
-            stt.enc.proj.download(stt.ctx.value())
+        sync(stt.ctx)
         var p4 = perf_counter_ns()
-        var trace = pk_greedy_decode(stt.model, stt.enc.proj, valid, T, stt.dec)
+        var trace = pk_greedy_decode[TARGET, T](
+            stt.model, stt.enc.proj, valid, T, stt.dec, stt.ctx
+        )
         var p5 = perf_counter_ns()
         # The GEMMs of the 24 blocks alone, on whatever the buffers hold.
         var g0 = perf_counter_ns()
@@ -143,7 +148,7 @@ def main() raises:
         print("  ", n_mel, "mel frames,", valid, "of", T, "encoder frames,",
               len(trace.tokens) - 1, "decode steps")
         print("  front end", ms(p0, p1), "ms | subsampling", ms(p1, p2),
-              "ms | 24 blocks", ms(p2, p3), "ms | projection (+ download)", ms(p3, p4),
+              "ms | 24 blocks", ms(p2, p3), "ms | projection", ms(p3, p4),
               "ms | decode", ms(p4, p5), "ms | total", ms(p0, p5), "ms")
         print("  alone: the blocks' 240 GEMMs", ms(g0, g1), "ms | their 120 LayerNorms",
               ms(g1, g2), "ms | 1000 x one elementwise pass over [T, 1024]", ms(g2, g3), "ms")

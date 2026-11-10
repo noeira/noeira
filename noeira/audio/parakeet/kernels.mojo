@@ -3,7 +3,8 @@
 # +--------------------------------------------------------------------------+ #
 """Everything in the encoder that is not a `Linear` or a `LayerNorm`, as device
 kernels: the subsampling convolutions, the relative-position attention, the
-conformer convolution, and the elementwise glue.
+conformer convolution, and the elementwise glue. And, at the end, the
+prediction network and the joint that the greedy decoder runs once per token.
 
 Each kernel is the transcription of the CPU loop of the same name in
 `encoder.mojo`, one thread per OUTPUT element, with the compiled maximum in its
@@ -260,3 +261,90 @@ def dw1d_bn_silu_kernel[T: Int, D: Int, K: Int, EPS: Scalar[DT]](
         rebind[Scalar[DT]](variance[c]) + EPS
     ) * rebind[Scalar[DT]](gamma[c]) + rebind[Scalar[DT]](beta[c])
     dst[t, c] = n / (Scalar[DT](1) + exp(-n))
+
+
+# ── the prediction network and the joint (one token at a time) ─────────────
+# Weights are `Linear`'s layout, `[in, out]`: output `j` reads column `j`, so
+# the threads of a warp read neighbouring elements at every step of the loop.
+
+
+def embed_row_kernel[V: Int, H: Int](
+    emb: Tile[DT, V, H], x: Tile[DT, H], token_n: Int64
+):
+    """`x = emb[token]`."""
+    var i = Int(global_idx.x)
+    if i >= H:
+        return
+    x[i] = rebind[Scalar[DT]](emb[Int(token_n), i])
+
+
+def lstm_gates_kernel[H: Int](
+    x: Tile[DT, H],
+    h: Tile[DT, H],
+    w_ih: Tile[DT, H, 4 * H],
+    b_ih: Tile[DT, 4 * H],
+    w_hh: Tile[DT, H, 4 * H],
+    b_hh: Tile[DT, 4 * H],
+    g: Tile[DT, 4 * H],
+):
+    """`g = x @ W_ih + b_ih + h @ W_hh + b_hh`: the four gates' pre-activations."""
+    var j = Int(global_idx.x)
+    if j >= 4 * H:
+        return
+    var acc = rebind[Scalar[DT]](b_ih[j]) + rebind[Scalar[DT]](b_hh[j])
+    for i in range(H):
+        acc += rebind[Scalar[DT]](x[i]) * rebind[Scalar[DT]](w_ih[i, j])
+        acc += rebind[Scalar[DT]](h[i]) * rebind[Scalar[DT]](w_hh[i, j])
+    g[j] = acc
+
+
+def lstm_update_kernel[H: Int](g: Tile[DT, 4 * H], c: Tile[DT, H], h: Tile[DT, H]):
+    """torch's gate order `i, f, g, o`: `c = s(f) c + s(i) tanh(g)`,
+    `h = s(o) tanh(c)`. `tanh` through `exp`: the libm symbol is not
+    guaranteed on a device."""
+    var i = Int(global_idx.x)
+    if i >= H:
+        return
+    var one = Scalar[DT](1)
+    var two = Scalar[DT](2)
+    var gi = one / (one + exp(-rebind[Scalar[DT]](g[i])))
+    var gf = one / (one + exp(-rebind[Scalar[DT]](g[H + i])))
+    var gg = one - two / (exp(two * rebind[Scalar[DT]](g[2 * H + i])) + one)
+    var go = one / (one + exp(-rebind[Scalar[DT]](g[3 * H + i])))
+    var cn = gf * rebind[Scalar[DT]](c[i]) + gi * gg
+    c[i] = cn
+    h[i] = go * (one - two / (exp(two * cn) + one))
+
+
+def matvec_bias_kernel[IN: Int, OUT: Int](
+    x: Tile[DT, IN], w: Tile[DT, IN, OUT], b: Tile[DT, OUT], y: Tile[DT, OUT]
+):
+    """`y = x @ W + b` for one row."""
+    var j = Int(global_idx.x)
+    if j >= OUT:
+        return
+    var acc = rebind[Scalar[DT]](b[j])
+    for i in range(IN):
+        acc += rebind[Scalar[DT]](x[i]) * rebind[Scalar[DT]](w[i, j])
+    y[j] = acc
+
+
+def joint_kernel[T: Int, H: Int, OUT: Int](
+    enc: Tile[DT, T, H],
+    dec: Tile[DT, H],
+    w: Tile[DT, H, OUT],
+    b: Tile[DT, OUT],
+    logits: Tile[DT, OUT],
+    frame_n: Int64,
+):
+    """`logits = relu(enc[frame] + dec) @ W + b`."""
+    var j = Int(global_idx.x)
+    if j >= OUT:
+        return
+    var frame = Int(frame_n)
+    var acc = rebind[Scalar[DT]](b[j])
+    for i in range(H):
+        var z = rebind[Scalar[DT]](enc[frame, i]) + rebind[Scalar[DT]](dec[i])
+        if z > Scalar[DT](0):
+            acc += z * rebind[Scalar[DT]](w[i, j])
+    logits[j] = acc
