@@ -13,3 +13,11 @@
 # added tokens inside text, d1's prompts), 75 decodes exact, and d1's packed
 # rows rebuilt id for id from its prompt texts.
 tests/text/test_bpe_reference.mojo
+
+# The LFM3 text backbone on the device (noeira/llm/lfm3) against d1's own code,
+# layer by layer, on the dumped rows (state + questions under the `set` mask):
+# the embedding, 24 layers, the final norm and the slots' log-softmax over the
+# vocabulary (fp32 bound 1e-4; measured <= 6.1e-6 on the Orin), every tensor
+# used, three injected defects. ⚠ GPU, and the fp32 dumps: run it on the Orin
+# (bf16 weights 3.8 GB on the device + a 3.8 GB staging copy at load).
+tests/llm/test_lfm3_d1_reference_gpu.mojo
