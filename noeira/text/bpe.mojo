@@ -80,6 +80,9 @@ struct ByteLevelBPE(Movable):
     var added: List[String]
     var added_ids: List[Int]
     """Added tokens, longest first."""
+    var added_special: List[Bool]
+    """Whether each added token is `special` (what a caller's text must not
+    turn into: d1's `plain` breaks those, not `<think>`)."""
     var byte_char: List[String]
     """Byte -> its byte-level character (UTF-8)."""
     var char_byte: Dict[Int, Int]
@@ -95,6 +98,7 @@ struct ByteLevelBPE(Movable):
         self.merges = Dict[Int, Int]()
         self.added = List[String]()
         self.added_ids = List[Int]()
+        self.added_special = List[Bool]()
         self.byte_char = List[String]()
         self.char_byte = Dict[Int, Int]()
         self.ignore_merges = False
@@ -192,6 +196,8 @@ struct ByteLevelBPE(Movable):
             var id = doc.integer(doc.field(a, "id"))
             t.added.append(c)
             t.added_ids.append(id)
+            var sp = doc.field(a, "special")
+            t.added_special.append(sp >= 0 and doc.boolean(sp))
             t.pieces[id] = c
             t.is_added[id] = True
             if c.byte_length() == 0 or c.as_bytes()[0] != 60:

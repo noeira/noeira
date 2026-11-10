@@ -21,3 +21,10 @@ tests/text/test_bpe_reference.mojo
 # used, three injected defects. ⚠ GPU, and the fp32 dumps: run it on the Orin
 # (bf16 weights 3.8 GB on the device + a 3.8 GB staging copy at load).
 tests/llm/test_lfm3_d1_reference_gpu.mojo
+
+# d1's System One in Mojo (noeira/llm/d1: prompts, `set` packing, readout,
+# calibration, answers in hosted Jev's JSON) against d1's own code: the three
+# cases' prompts text-exact and rows id-exact (`--prompt-only` runs this part
+# with the tokenizer alone, on any machine), then on the device the answers —
+# same picks and levels, probabilities within 1e-4 (measured <= 1.8e-6).
+tests/llm/test_d1_system_one_gpu.mojo
