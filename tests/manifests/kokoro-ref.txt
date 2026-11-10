@@ -24,3 +24,12 @@ tests/audio/test_kokoro_weights.mojo
 # the STFT on the reference's source, and the generator from the reference's
 # source spectrum down to the waveform (2e-4). Eight injected defects.
 tests/audio/test_kokoro_reference.mojo
+
+# Text -> phonemes through espeak-ng (noeira/audio/espeak.mojo + kokoro/g2p.mojo):
+# 28 English and French sentences, EXACT equality with phonemizer 3.4.0, with
+# kokoro-onnx's phonemes and with upstream misaki's two espeak mappings (98
+# strings), the library's version, and four falsification probes. Needs the
+# library (`python3 tools/kokoro/fetch_espeak_ng.py`) and the reference, made
+# with the DEPLOYMENT's Python (it is what the robot runs today):
+#   ~/.cache/noeira/local-ai/tts-venv/bin/python tools/kokoro/dump_g2p_reference.py
+tests/audio/test_espeak_reference.mojo

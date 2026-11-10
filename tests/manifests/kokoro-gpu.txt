@@ -1,0 +1,29 @@
+# Kokoro-82M port, the model ON THE DEVICE — `pixi run -e nvidia test-kokoro-gpu`
+# (or -e apple)
+#
+# The companion to `kokoro-ref.txt`, same converted checkpoint and reference
+# dumps (see its header for how to produce them). The weights are 330 MB: it
+# fits beside anything, but keep one GPU model process at a time on a 16 GB
+# machine.
+
+# `noeira/audio/kokoro/device.mojo` against hexgrad's KModel again, not against
+# our CPU path: PL-BERT, the duration encoder and LSTM, the frames per phoneme
+# (EQUAL), the text encoder, pitch and energy, the decoder's blocks (1e-4), and
+# the generator fed the reference's own source spectrum down to `conv_post` and
+# the waveform (2e-4; see `kokoro-ref.txt` for why the harmonic source is gated
+# apart). Three injected defects (the style row's halves exchanged, one frame
+# moved between phonemes, the source spectrum one frame late). Prints the
+# per-stage and end-to-end timings.
+tests/audio/test_kokoro_gpu.mojo
+
+# ⚠ The default build is full fp32 on every target. `-D KOKORO_TF32=1` runs the
+# generator's convolutions in TF32 on NVIDIA (82 against 135 ms on the Orin) and
+# the gate then holds the waveform to 1e-2 instead of 2e-4 — a build-time
+# variant (`mojo run -D` can be stale):
+#
+#   pixi run -e nvidia mojo build -D KOKORO_TF32=1 -I . tests/audio/test_kokoro_gpu.mojo \
+#     -o build/test_kokoro_gpu_tf32 && ./build/test_kokoro_gpu_tf32
+#
+# On the Orin: `pixi run -e jetson build-jetson ...` (adds `--target-accelerator
+# sm_87`), and run the binary with JetPack's cuBLAS first on the loader path
+# (`LD_LIBRARY_PATH=/usr/local/cuda/lib64:$LD_LIBRARY_PATH`).

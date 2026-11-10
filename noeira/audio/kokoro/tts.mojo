@@ -3,13 +3,17 @@
 # +--------------------------------------------------------------------------+ #
 """`KokoroTTS` — text-to-speech with `hexgrad/Kokoro-82M`, no Python, on the CPU.
 
-    var tts = KokoroTTS.load()                       # ~/.cache/noeira/kokoro
-    var s = tts.synthesize("bɔ̃ʒˈuʁ.", "ff_siwis")    # PHONEMES, and a voice
+    var tts = KokoroTTS.load()                          # ~/.cache/noeira/kokoro
+    var es = EspeakNG.open()                            # ~/.cache/noeira/espeak-ng
+    var s = tts.speak(es, "Bonjour, je suis Noé.", "ff_siwis")
     save_wav("out.wav", wav_from_float32(s.audio, 24000))
 
-The input is a PHONEME string in Kokoro's alphabet (IPA plus a few letters;
-`config.json`'s `vocab`), not text: text -> phonemes is espeak-ng's job and
-its binding is the next piece (docs/NN_MODEL_PORTS_PLAN.md §11.3, decided: A).
+`speak` takes TEXT: espeak-ng turns it into Kokoro's phonemes (`g2p.mojo`; the
+language comes from the voice's first letter; the mapping is the deployment's
+for English and upstream Kokoro's for French and the rest, unless `mode` says
+otherwise — chosen by a round trip through Parakeet, see `g2p.mojo`). `synthesize` takes the PHONEME string
+directly, in Kokoro's alphabet (IPA plus a few letters; `config.json`'s
+`vocab`).
 
 What `synthesize` does is `KModel.forward`: ids = 0, the phonemes' ids, 0
 (characters outside the vocabulary are dropped, as upstream); the voice's
@@ -21,12 +25,14 @@ same seed gives the same waveform, and no seed gives the reference's — its
 generator is torch's. The words do not depend on it.
 """
 
-from std.math import cos, log, sqrt, pi
+from std.math import cos, sin, log, sqrt, pi
 
 from noeira.io.json import load_json
 from noeira.io.safetensors import SafeTensors
 from noeira.nn.random.hash_mask import hash_u64
+from noeira.audio.espeak import EspeakNG
 from .decoder import kk_decode, KokoroNoise, KK_HARMONICS, KK_SAMPLES_PER_FRAME
+from .g2p import kokoro_language, kokoro_default_g2p, kokoro_phonemes
 from .paths import kokoro_dir
 from .prosody import kk_durations, kk_acoustic, KK_CONTEXT
 from .weights import KokoroWeights
@@ -42,11 +48,17 @@ struct KokoroSpeech(Movable):
     var pred_dur: List[Int]
     """Frames per token (40 frames per second), boundary tokens included."""
     var frames: Int
+    var phonemes: String
+    """What was spoken, in Kokoro's alphabet."""
 
-    def __init__(out self, var audio: List[Float32], var pred_dur: List[Int], frames: Int):
+    def __init__(
+        out self, var audio: List[Float32], var pred_dur: List[Int], frames: Int,
+        var phonemes: String,
+    ):
         self.audio = audio^
         self.pred_dur = pred_dur^
         self.frames = frames
+        self.phonemes = phonemes^
 
 
 def _unit(seed: UInt64, stream: UInt64, idx: Int) -> Float64:
@@ -61,11 +73,27 @@ def kokoro_noise(samples: Int, seed: UInt64) -> KokoroNoise:
     for h in range(KK_HARMONICS):
         n.phase.append(Float32(_unit(seed, 1, h)))
     var count = samples * KK_HARMONICS
-    for i in range(count):
-        var u1 = _unit(seed, 2, i)
-        var u2 = _unit(seed, 3, i)
-        n.sines.append(Float32(sqrt(-2.0 * log(u1)) * cos(2.0 * pi * u2)))
+    n.sines = List[Float32](length=count, fill=0.0)
+    # Box-Muller gives two independent normals per pair of uniforms: both used.
+    for p in range((count + 1) // 2):
+        var r = sqrt(-2.0 * log(_unit(seed, 2, p)))
+        var th = 2.0 * pi * _unit(seed, 3, p)
+        n.sines[2 * p] = Float32(r * cos(th))
+        if 2 * p + 1 < count:
+            n.sines[2 * p + 1] = Float32(r * sin(th))
     return n^
+
+
+def kokoro_vocab(dir: String) raises -> Dict[String, Int]:
+    """The phoneme vocabulary in `dir/config.json`."""
+    var doc = load_json(dir + "/config.json")
+    var vocab = doc.field(doc.root(), "vocab")
+    var out = Dict[String, Int]()
+    for i in range(doc.size(vocab)):
+        out[doc.key_at(vocab, i)] = doc.integer(doc.at(vocab, i))
+    if len(out) == 0:
+        raise Error("kokoro: " + dir + "/config.json has no phoneme vocabulary")
+    return out^
 
 
 struct KokoroTTS(Movable):
@@ -87,12 +115,7 @@ struct KokoroTTS(Movable):
             dir = kokoro_dir()
         var t = Self()
         t.w = KokoroWeights.load(dir + "/kokoro-v1_0.safetensors")
-        var doc = load_json(dir + "/config.json")
-        var vocab = doc.field(doc.root(), "vocab")
-        for i in range(doc.size(vocab)):
-            t.vocab[doc.key_at(vocab, i)] = doc.integer(doc.at(vocab, i))
-        if len(t.vocab) == 0:
-            raise Error("kokoro: " + dir + "/config.json has no phoneme vocabulary")
+        t.vocab = kokoro_vocab(dir)
         t.dir = dir^
         return t^
 
@@ -134,4 +157,18 @@ struct KokoroTTS(Movable):
         var a = kk_acoustic(self.w, ids, ref_s, p)
         var noise = kokoro_noise(p.frames * KK_SAMPLES_PER_FRAME, seed)
         var d = kk_decode(self.w, a, ref_s, noise)
-        return KokoroSpeech(d.audio.copy(), p.pred_dur.copy(), p.frames)
+        return KokoroSpeech(d.audio.copy(), p.pred_dur.copy(), p.frames, phonemes)
+
+    def speak(
+        mut self, mut es: EspeakNG, text: String, voice: String,
+        speed: Float32 = 1.0, seed: UInt64 = 0, mode: Int = -1,
+    ) raises -> KokoroSpeech:
+        """Speak `text` with `voice`: espeak-ng in the voice's language, then
+        `synthesize`. `mode` is a `KK_G2P_*` (`g2p.mojo`); -1 = the default
+        for that language (`kokoro_default_g2p`)."""
+        var language = kokoro_language(voice)
+        var m = mode if mode >= 0 else kokoro_default_g2p(language)
+        var ps = kokoro_phonemes(es, text, language, m, self.vocab)
+        if ps.byte_length() == 0:
+            raise Error("kokoro: nothing to say in '" + text + "'")
+        return self.synthesize(ps, voice, speed, seed)

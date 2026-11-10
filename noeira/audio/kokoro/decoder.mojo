@@ -221,6 +221,14 @@ def kk_stft(ref x: List[Float32], mut out: Tensor) -> Int:
     var win = _hann_periodic(N)
     out.ensure(frames * 2 * B)
     var buf = List[Float32](length=N, fill=0.0)
+    # The twiddles, once: cos / sin of 2 pi k j / N.
+    var tc = List[Float64](length=B * N, fill=0.0)
+    var ts = List[Float64](length=B * N, fill=0.0)
+    for k in range(B):
+        for j in range(N):
+            var ang = 2.0 * pi * Float64(k * j) / Float64(N)
+            tc[k * N + j] = cos(ang)
+            ts[k * N + j] = sin(ang)
     for m in range(frames):
         for j in range(N):
             var idx = m * KK_HOP - half + j
@@ -233,9 +241,8 @@ def kk_stft(ref x: List[Float32], mut out: Tensor) -> Int:
             var re = 0.0
             var im = 0.0
             for j in range(N):
-                var ang = 2.0 * pi * Float64(k * j) / Float64(N)
-                re += Float64(buf[j]) * cos(ang)
-                im -= Float64(buf[j]) * sin(ang)
+                re += Float64(buf[j]) * tc[k * N + j]
+                im -= Float64(buf[j]) * ts[k * N + j]
             out.data[m * 2 * B + k] = Float32(sqrt(re * re + im * im))
             out.data[m * 2 * B + B + k] = Float32(atan2(im, re))
     return frames
@@ -251,21 +258,33 @@ def kk_istft(ref post: Tensor, frames: Int) -> List[Float32]:
     var total = KK_HOP * (frames - 1) + N
     var acc = List[Float64](length=total, fill=0.0)
     var env = List[Float64](length=total, fill=0.0)
+    var tc = List[Float64](length=B * N, fill=0.0)
+    var ts = List[Float64](length=B * N, fill=0.0)
+    for k in range(B):
+        for j in range(N):
+            var ang = 2.0 * pi * Float64(k * j) / Float64(N)
+            tc[k * N + j] = cos(ang)
+            ts[k * N + j] = sin(ang)
+    var re = List[Float64](length=B, fill=0.0)
+    var im = List[Float64](length=B, fill=0.0)
     for m in range(frames):
         var base = m * 2 * B
+        # Each bin as a complex weight once per frame: the real FFT's DC and
+        # Nyquist bins count once, the middle bins twice.
+        for k in range(B):
+            var mag = exp(Float64(post.data[base + k]))
+            var ph = Float64(sin(post.data[base + B + k]))
+            var wk = 1.0 if (k == 0 or k == B - 1) else 2.0
+            re[k] = wk * mag * cos(ph)
+            im[k] = wk * mag * sin(ph)
         for j in range(N):
-            # Inverse real FFT: DC, 2 x the middle bins, the Nyquist bin's real part.
+            # Inverse real FFT; the Nyquist bin's imaginary part is dropped.
             var v = 0.0
             for k in range(B):
-                var mag = exp(Float64(post.data[base + k]))
-                var ph = Float64(sin(post.data[base + B + k]))
-                var ang = 2.0 * pi * Float64(k * j) / Float64(N)
-                if k == 0:
-                    v += mag * cos(ph)
-                elif k == B - 1:
-                    v += mag * cos(ph) * cos(ang)
+                if k == B - 1:
+                    v += re[k] * tc[k * N + j]
                 else:
-                    v += 2.0 * mag * cos(ph + ang)
+                    v += re[k] * tc[k * N + j] - im[k] * ts[k * N + j]
             v /= Float64(N)
             acc[m * KK_HOP + j] += v * Float64(win[j])
             env[m * KK_HOP + j] += Float64(win[j]) * Float64(win[j])
