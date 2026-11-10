@@ -35,3 +35,14 @@ tests/llm/test_d1_system_one_gpu.mojo
 # bounds: layers 2e-2, slots 5e-3, answers 3e-3 (measured 9.1e-3 / 1.6e-3 /
 # 8.1e-4). The fp32 build is the one that proves the code (it alone resolves
 # the RoPE-tail defect, ~3e-3).
+
+# LFM3's backward with LoRA (noeira/llm/lfm3/train.mojo: the forward's own
+# activations under `training`, a VJP per operation, adapter gradients through
+# cuBLAS) against torch autograd through d1's own code with the same 142
+# adapters (tools/d1/dump_d1_grad_reference.py, rank 16, scale 2, B nonzero):
+# the adapted forward, the loss, d/d embeddings and all 284 adapter gradients
+# (bound 3e-3; measured <= 2.6e-4 / 1.0e-3), and three backward defects caught.
+# ⚠ The reference's loss targets each slot's THIRD most likely token: with the
+# argmax (p ~ 0.98) every gradient scales with 1 - p and fp32's ~3e-4 in that
+# log-probability moved them all by ~2 %.
+tests/llm/test_lfm3_backward_gpu.mojo

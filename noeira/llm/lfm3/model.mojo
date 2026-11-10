@@ -167,6 +167,21 @@ struct Lfm3Text(Movable):
     var scratch: DeviceBuffer[DT]
     """A weight widened to fp32 for its GEMM (the largest weight's size)."""
     var debug: Int
+    var training: Bool
+    """`forward` keeps what the backward needs (`act`, `act_x_last`) — see `train.mojo`."""
+    var act: List[Dict[String, DeviceBuffer[DT]]]
+    var act_x_last: List[DeviceBuffer[DT]]
+    var cur: Dict[String, DeviceBuffer[DT]]
+    var lora_index: Dict[String, Int]
+    """Adapted linear (`layers.<i>.<module>`) -> its slot in the lists below."""
+    var lora_a: List[DeviceBuffer[DT]]
+    var lora_b: List[DeviceBuffer[DT]]
+    var lora_da: List[DeviceBuffer[DT]]
+    var lora_db: List[DeviceBuffer[DT]]
+    var lora_shape: List[Tuple[Int, Int]]
+    """(in, out) of each adapted linear."""
+    var lora_rank: Int
+    var lora_scale: Float32
 
     def __init__(
         out self, var ctx: DeviceContext, var cfg: Lfm3Config, var arena: DeviceBuffer[DType.uint16],
@@ -183,6 +198,18 @@ struct Lfm3Text(Movable):
         self.names = names^
         self.scratch = scratch^
         self.debug = 0
+        self.training = False
+        self.act = List[Dict[String, DeviceBuffer[DT]]]()
+        self.act_x_last = List[DeviceBuffer[DT]]()
+        self.cur = Dict[String, DeviceBuffer[DT]]()
+        self.lora_index = Dict[String, Int]()
+        self.lora_a = List[DeviceBuffer[DT]]()
+        self.lora_b = List[DeviceBuffer[DT]]()
+        self.lora_da = List[DeviceBuffer[DT]]()
+        self.lora_db = List[DeviceBuffer[DT]]()
+        self.lora_shape = List[Tuple[Int, Int]]()
+        self.lora_rank = 0
+        self.lora_scale = 0.0
 
     @staticmethod
     def load(var ctx: DeviceContext, dir: String) raises -> Lfm3Text:
@@ -263,7 +290,68 @@ struct Lfm3Text(Movable):
             var bv = TileTensor(b, row_major(n, k))
             max_matmul[transpose_b=True, target="gpu"](ov, av, bv, self.ctx)
 
+    def gemm_acc(
+        self, dst: DeviceBuffer[DT], a: DeviceBuffer[DT], b: DeviceBuffer[DT], m: Int, n: Int, k: Int,
+        alpha: Float32, beta: Float32,
+    ) raises:
+        """`dst = alpha a[m, k] @ b[n, k]^T + beta dst` (NVIDIA: the LoRA path)."""
+        comptime if default_accelerator().is_nvidia_gpu():
+            cublas_gemm[False, True, LF_TF32](self.ctx, dst, a, b, m, n, k, beta, alpha)
+        else:
+            raise Error("lfm3: LoRA and training run on NVIDIA (cuBLAS) only")
+
+    def load_lora(mut self, path: String, rank: Int, scale: Float32) raises:
+        """Adapters from a safetensors file of `layers.<i>.<module>.lora_A`
+        [rank, in] and `.lora_B` [out, rank] (fp32), PEFT's convention:
+        `y = x W^T + scale (x A^T) B^T`. Gradients start at zero."""
+        var st = SafeTensors(path)
+        self.lora_rank = rank
+        self.lora_scale = scale
+        for i in range(st.size()):
+            var name = st.names[i]
+            if not name.endswith(".lora_A"):
+                continue
+            var key = String(name[byte=0:name.byte_length() - 7])
+            if key + ".weight" not in self.index:
+                raise Error("lfm3: an adapter for '" + key + "', which is not a weight here")
+            var sa = st.shape(name)
+            var sb = st.shape(key + ".lora_B")
+            if sa[0] != rank or sb[1] != rank:
+                raise Error("lfm3: adapter '" + key + "' is not rank " + String(rank))
+            self.lora_index[key] = len(self.lora_a)
+            self.lora_a.append(self._upload(st.read_f32(name)))
+            self.lora_b.append(self._upload(st.read_f32(key + ".lora_B")))
+            var da = self.new(rank * sa[1])
+            da.enqueue_fill(0.0)
+            var db = self.new(sb[0] * rank)
+            db.enqueue_fill(0.0)
+            self.lora_da.append(da^)
+            self.lora_db.append(db^)
+            self.lora_shape.append((sa[1], sb[0]))
+
+    def _upload(self, v: List[Float32]) raises -> DeviceBuffer[DT]:
+        var h = self.ctx.enqueue_create_host_buffer[DT](len(v))
+        for i in range(len(v)):
+            h[i] = v[i]
+        var d = self.new(len(v))
+        self.ctx.enqueue_copy(d, h)
+        return d^
+
     def linear(mut self, name: String, x: DeviceBuffer[DT], t: Int, k: Int) raises -> DeviceBuffer[DT]:
+        var y = self._linear_base(name, x, t, k)
+        var li = self.lora_index.get(name)
+        if li:
+            var j = li.value()
+            var r = self.lora_rank
+            var n = self.lora_shape[j][1]
+            var xa = self.new(t * r)
+            self.gemm_acc(xa, x, self.lora_a[j], t, r, k, 1.0, 0.0)
+            self.gemm_acc(y, xa, self.lora_b[j], t, n, r, self.lora_scale, 1.0)
+            if self.training:
+                self.cur["xa:" + name] = xa
+        return y^
+
+    def _linear_base(mut self, name: String, x: DeviceBuffer[DT], t: Int, k: Int) raises -> DeviceBuffer[DT]:
         """`x[t, k] @ W^T` for the bf16 weight `name` ([n, k]): widened into the
         scratch first, or (LFM3_BF16) against the weight in place."""
         var wb = self.w(name + ".weight")
@@ -289,7 +377,9 @@ struct Lfm3Text(Movable):
             x, y, self.w(name + ".weight"), Int64(dim), self.cfg.eps, grid_dim=rows, block_dim=TPB,
         )
 
-    def rope_tables(self, t: Int, theta: Float64, prf: Float64) raises -> Tuple[DeviceBuffer[DT], DeviceBuffer[DT]]:
+    def rope_tables(
+        self, t: Int, theta: Float64, prf: Float64, neg_sin: Bool = False,
+    ) raises -> Tuple[DeviceBuffer[DT], DeviceBuffer[DT]]:
         """cos / sin `[t, head_dim / 2]`, as torch computes them in fp32: the
         frequencies `1 / theta^(2i / head_dim)` for i < prf head_dim / 2 and 0
         after (the zero tail), the angle `pos * freq` in fp32."""
@@ -305,7 +395,8 @@ struct Lfm3Text(Movable):
             for i in range(half):
                 var a = Float32(pos) * inv[i]
                 hc[pos * half + i] = Float32(cos(Float64(a)))
-                hs[pos * half + i] = Float32(sin(Float64(a)))
+                var sv = Float32(sin(Float64(a)))
+                hs[pos * half + i] = -sv if neg_sin else sv  # -sin: the rotation's transpose (its VJP)
         var dc = self.new(t * half)
         var ds = self.new(t * half)
         self.ctx.enqueue_copy(dc, hc)
@@ -345,11 +436,19 @@ struct Lfm3Text(Movable):
         var rs = self.rope_tables(t, self.cfg.theta_sliding, self.cfg.prf_sliding)
         var sc = self.new(nh * t * t)
         var scale = Float32(1.0) / Float32(Float64(hd) ** 0.5)
+        if self.training:
+            self.act = List[Dict[String, DeviceBuffer[DT]]]()
+            self.act_x_last = List[DeviceBuffer[DT]]()
         for li in range(len(self.cfg.layer_types)):
             var p = String("layers.") + String(li) + "."
             var kind = self.cfg.layer_types[li]
+            self.cur = Dict[String, DeviceBuffer[DT]]()
+            if self.training:
+                self.cur["x_in"] = self._copy(x, t * dm)
             var hn = self.new(t * dm)
             self.rms(p + "operator_norm", x, hn, t, dm)
+            if self.training:
+                self.cur["hn"] = hn
             var o: DeviceBuffer[DT]
             if kind == LT_CONV:
                 var bcx = self.linear(p + "conv.in_proj", hn, t, dm)
@@ -358,12 +457,19 @@ struct Lfm3Text(Movable):
                     bcx, self.w(p + "conv.conv.weight"), z, Int64(dm), Int64(self.cfg.conv_k),
                     grid_dim=(_blocks(dm), t), block_dim=TPB,
                 )
+                if self.training:
+                    self.cur["bcx"] = bcx
+                    self.cur["z"] = z
                 o = self.linear(p + "conv.out_proj", z, t, dm)
             else:
                 var q = self.linear(p + "self_attn.q_proj", hn, t, dm)
                 var k = self.linear(p + "self_attn.k_proj", hn, t, dm)
                 var v = self.linear(p + "self_attn.v_proj", hn, t, dm)
                 var g = self.linear(p + "self_attn.gate_proj", hn, t, dm)
+                if self.training:
+                    self.cur["q_lin"] = self._copy(q, t * dm)
+                    self.cur["k_lin"] = self._copy(k, t * nkv * hd)
+                    self.cur["v"] = v
                 self.rms(p + "self_attn.q_norm", q, q, t * nh, hd)
                 self.rms(p + "self_attn.k_norm", k, k, t * nkv, hd)
                 var cos_t = rf[0] if kind == LT_FULL else rs[0]
@@ -380,6 +486,19 @@ struct Lfm3Text(Movable):
                     Int64(state_len), Int64(self.cfg.window), grid_dim=(_blocks(t), t, nh), block_dim=TPB,
                 )
                 self.ctx.enqueue_function[softmax_rows_kernel](sc, Int64(t), grid_dim=nh * t, block_dim=TPB)
+                if self.training:
+                    self.cur["q"] = q
+                    self.cur["k"] = k
+                    self.cur["P"] = self._copy(sc, nh * t * t)
+                    self.cur["g"] = g
+                    var ones = self.new(t * nh)
+                    ones.enqueue_fill(30.0)  # sigmoid(30) = 1 - 9e-14: the output before its gate
+                    var a_pre = self.new(t * dm)
+                    self.ctx.enqueue_function[attn_out_kernel](
+                        sc, v, ones, a_pre, Int64(t), Int64(nh), Int64(nkv), Int64(hd),
+                        grid_dim=(_blocks(nh * hd), t), block_dim=TPB,
+                    )
+                    self.cur["a_pre"] = a_pre
                 if (self.debug & 4) != 0:
                     g = self.new(t * nh)
                     g.enqueue_fill(30.0)  # sigmoid = 1: the gate off
@@ -388,20 +507,40 @@ struct Lfm3Text(Movable):
                     sc, v, g, a, Int64(t), Int64(nh), Int64(nkv), Int64(hd),
                     grid_dim=(_blocks(nh * hd), t), block_dim=TPB,
                 )
+                if self.training:
+                    self.cur["a"] = a
                 o = self.linear(p + "self_attn.o_proj", a, t, dm)
+            if self.training:
+                self.cur["o"] = self._copy(o, t * dm)
             self.rms(p + "post_operator_norm", o, o, t, dm)
             self.ctx.enqueue_function[add_kernel](x, o, Int64(t * dm), grid_dim=_blocks(t * dm), block_dim=TPB)
+            if self.training:
+                self.cur["h_mid"] = self._copy(x, t * dm)
             var fnrm = self.new(t * dm)
             self.rms(p + "ffn_norm", x, fnrm, t, dm)
+            if self.training:
+                self.cur["fn"] = fnrm
             var a1 = self.linear(p + "feed_forward.w1", fnrm, t, dm)
             var a3 = self.linear(p + "feed_forward.w3", fnrm, t, dm)
             var ff = self.cfg.ff
+            if self.training:
+                self.cur["a1"] = self._copy(a1, t * ff)
+                self.cur["a3"] = a3
             self.ctx.enqueue_function[swiglu_kernel](a1, a3, a1, Int64(t * ff), grid_dim=_blocks(t * ff), block_dim=TPB)
+            if self.training:
+                self.cur["sw"] = a1
             var f = self.linear(p + "feed_forward.w2", a1, t, ff)
+            if self.training:
+                self.cur["f"] = self._copy(f, t * dm)
             self.rms(p + "post_ffn_norm", f, f, t, dm)
             self.ctx.enqueue_function[add_kernel](x, f, Int64(t * dm), grid_dim=_blocks(t * dm), block_dim=TPB)
             if keep_taps:
                 taps.append(self._copy(x, t * dm))
+            if self.training:
+                self.act.append(self.cur^)
+                self.cur = Dict[String, DeviceBuffer[DT]]()
+        if self.training:
+            self.act_x_last.append(self._copy(x, t * dm))
         var out = self.new(t * dm)
         self.rms("embedding_norm", x, out, t, dm)
         return out^
