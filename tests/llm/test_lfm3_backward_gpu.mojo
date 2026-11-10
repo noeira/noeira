@@ -20,15 +20,22 @@ from noeira.io.npy import load_npy_f64
 from noeira.io.safetensors import SafeTensors
 from noeira.llm.lfm3 import Lfm3Text
 from noeira.llm.lfm3.train import slot_loss, backward
+from noeira.llm.lfm3.model import LF_BF16
 from noeira.nn.constants import DT
 
 
-comptime FWD_BOUND: Float64 = 1e-4
-comptime GRAD_BOUND: Float64 = 3e-3
+comptime FWD_BOUND: Float64 = 5e-3 if LF_BF16 else 1e-4
+"""LFM3_BF16: measured <= 1.4e-3."""
+comptime FALSIFY_FACTOR: Float64 = 5.0 if LF_BF16 else 10.0
+"""How far past GRAD_BOUND a defect must land: the bf16 bound is already 20x
+the fp32 one, and the mildest defect (q's norm skipped, 0.40) is 6.7x it."""
+comptime GRAD_BOUND: Float64 = 6e-2 if LF_BF16 else 3e-3
 """fp32 against fp32 through 24 layers and back: measured <= 2.6e-4 on the
 embeddings, <= 1.0e-3 on an adapter (mean 1.3e-4 / 2.2e-4; the worst always in
 layer 23, nearest the loss, which reads the logits' own ~3e-4 fp32 differences).
-Three times the worst. Needs a WELL-CONDITIONED loss: the reference's targets
+Three times the worst. LFM3_BF16 (bf16-rounded GEMM operands both ways, the
+adapters fp32): measured <= 2.1e-2 on the embeddings, <= 2.7e-2 on an adapter
+(mean 8e-3), twice that. Needs a WELL-CONDITIONED loss: the reference's targets
 are each slot's third most likely token (`dump_d1_grad_reference.py`)."""
 
 
@@ -120,7 +127,7 @@ def main() raises:
             lzw.append(Float32(x))
         check(fails, rel_err(lz, lzw) < FWD_BOUND, String("adapted forward, slots' log-softmax  rel err = ") + String(rel_err(lz, lzw)))
         var want_loss = meta.number(meta.field(meta.root(), "loss"))
-        check(fails, abs(lt[0] - want_loss) < 1e-4 * max(1.0, abs(want_loss)),
+        check(fails, abs(lt[0] - want_loss) < (1e-2 if LF_BF16 else 1e-4) * max(1.0, abs(want_loss)),
               String("loss ") + String(lt[0]) + " against " + String(want_loss))
 
         var st = SafeTensors(gdir + "/grads.safetensors")
@@ -147,7 +154,7 @@ def main() raises:
                 worst_at = key + ".lora_B"
         check(fails, worst < GRAD_BOUND, String(n) + " adapter gradients, worst " + worst_at + "  rel err = " + String(worst)
               + " (mean " + String(mean / Float64(n)) + ")")
-        print("     forward + loss + backward:", ms, "ms (fp32)")
+        print("     forward + loss + backward:", ms, "ms", "(LFM3_BF16)" if LF_BF16 else "(fp32)")
     # falsification: three backward defects on the first case must land far past the bound
     var gdir = grad_dir + "/" + cases[0]
     var meta = load_json(gdir + "/meta.json")
@@ -179,7 +186,7 @@ def main() raises:
         var d = backward(lm, lt[1], len(ids))
         lm.training = False
         var e = rel_err(lm.download(d, len(ids) * lm.cfg.hidden), want_e)
-        check(fails, e > 10.0 * GRAD_BOUND, String("defect caught: ") + names[i] + "  d embeddings rel err = " + String(e))
+        check(fails, e > FALSIFY_FACTOR * GRAD_BOUND, String("defect caught: ") + names[i] + "  d embeddings rel err = " + String(e))
     lm.debug = 0
     if fails > 0:
         raise Error(String(fails) + " FAILED")

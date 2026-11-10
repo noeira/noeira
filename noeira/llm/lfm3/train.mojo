@@ -12,6 +12,9 @@ layer's activations in `lm.act`.
     var lt = slot_loss(lm, h, len(ids), slots, targets)   # loss, d final
     var d_embeds = backward(lm, lt[1], len(ids))          # LoRA grads accumulate in lm.lora_da / lora_db
 
+With `-D LFM3_BF16=1` the frozen weights' backward GEMMs (`dx = dy W`) run on the
+tensor cores like the forward's (dy rounded to bf16); the adapters stay fp32.
+
 The loss: `-sum_s log_softmax(lm_head(h[slot_s]))[target_s]`, cross-entropy
 over the vocabulary at each slot (the readout d1 reads its answers from). The
 base weights are frozen: each linear's backward is `dx = dy W` (W widened as in
@@ -23,7 +26,7 @@ from std.math import exp
 from max.gpu.host import DeviceContext, DeviceBuffer
 
 from noeira.nn.constants import DT
-from noeira.nn.core.cublas_gemm import cublas_gemm
+from noeira.nn.core.cublas_gemm import cublas_gemm, cublas_gemm_lp
 from .kernels import (
     TPB, rope_kernel, gather_rows_kernel, lm_head_kernel, log_softmax_rows_kernel, bf16_to_f32_kernel,
 )
@@ -32,7 +35,7 @@ from .kernels_bwd import (
     softmax_bwd_rows_kernel, attn_dq_kernel, attn_dkv_kernel, lm_head_bwd_kernel, scatter_rows_kernel, axpy_kernel,
     adamw_kernel,
 )
-from .model import Lfm3Text, LT_CONV, LT_FULL, LT_SLIDING, LF_TF32
+from .model import Lfm3Text, LT_CONV, LT_FULL, LT_SLIDING, LF_TF32, LF_BF16
 
 
 def _blocks(n: Int) -> Int:
@@ -65,10 +68,15 @@ def linear_bwd(
     adapter's gradients accumulate."""
     var wb = lm.w(name + ".weight")
     var n = len(wb) // k
-    var wf = lm.scratch.create_sub_buffer[DT](0, n * k)
-    lm.ctx.enqueue_function[bf16_to_f32_kernel](wb, wf, Int64(n * k), grid_dim=_blocks(n * k), block_dim=TPB)
     var dx = lm.new(t * k)
-    _gemm[False, False](lm, dx, dy, wf, t, k, n, 1.0, 0.0)
+    comptime if LF_BF16:
+        # the frozen weight in place, dy rounded to bf16: the forward's tensor-core path
+        var dyb = lm.to_bf16(dy, t * n)
+        cublas_gemm_lp[False, False, DType.bfloat16, DT](lm.ctx, dx, dyb, lm.weight_bf16(name), t, k, n, 0.0)
+    else:
+        var wf = lm.scratch.create_sub_buffer[DT](0, n * k)
+        lm.ctx.enqueue_function[bf16_to_f32_kernel](wb, wf, Int64(n * k), grid_dim=_blocks(n * k), block_dim=TPB)
+        _gemm[False, False](lm, dx, dy, wf, t, k, n, 1.0, 0.0)
     var li = lm.lora_index.get(name)
     if li:
         var j = li.value()

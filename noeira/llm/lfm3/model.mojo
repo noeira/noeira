@@ -405,20 +405,30 @@ struct Lfm3Text(Movable):
         var wb = self.w(name + ".weight")
         var n = len(wb) // k
         comptime if LF_BF16:
-            var xb = self.ctx.enqueue_create_buffer[DType.bfloat16](t * k)
-            self.ctx.enqueue_function[f32_to_bf16_kernel](x, xb, Int64(t * k), grid_dim=_blocks(t * k), block_dim=TPB)
-            var i = self.index.get(name + ".weight").value()
-            var wv = DeviceBuffer[DType.bfloat16](
-                self.ctx, self.arena.unsafe_ptr().bitcast[Scalar[DType.bfloat16]]() + self.offs[i], n * k, owning=False,
-            )
+            var xb = self.to_bf16(x, t * k)
             var yb = self.new(t * n)
-            cublas_gemm_lp[False, True, DType.bfloat16, DT](self.ctx, yb, xb, wv, t, n, k, 0.0)
+            cublas_gemm_lp[False, True, DType.bfloat16, DT](self.ctx, yb, xb, self.weight_bf16(name), t, n, k, 0.0)
             return yb^
         var wf = self.scratch.create_sub_buffer[DT](0, n * k)
         self.ctx.enqueue_function[bf16_to_f32_kernel](wb, wf, Int64(n * k), grid_dim=_blocks(n * k), block_dim=TPB)
         var y = self.new(t * n)
         self.gemm_tb(y, x, wf, t, n, k)
         return y^
+
+    def weight_bf16(mut self, name: String) raises -> DeviceBuffer[DType.bfloat16]:
+        """The bf16 weight `name` in place, typed for cuBLAS: a non-owning view
+        of its slice of the arena (the forward's and the backward's GEMMs)."""
+        var wb = self.w(name + ".weight")
+        var i = self.index.get(name + ".weight").value()
+        return DeviceBuffer[DType.bfloat16](
+            self.ctx, self.arena.unsafe_ptr().bitcast[Scalar[DType.bfloat16]]() + self.offs[i], len(wb), owning=False,
+        )
+
+    def to_bf16(self, x: DeviceBuffer[DT], n: Int) raises -> DeviceBuffer[DType.bfloat16]:
+        """`x` rounded to bf16 (nearest even), for a tensor-core GEMM operand."""
+        var xb = self.ctx.enqueue_create_buffer[DType.bfloat16](n)
+        self.ctx.enqueue_function[f32_to_bf16_kernel](x, xb, Int64(n), grid_dim=_blocks(n), block_dim=TPB)
+        return xb^
 
     def rms(mut self, name: String, x: DeviceBuffer[DT], y: DeviceBuffer[DT], rows: Int, dim: Int) raises:
         self.ctx.enqueue_function[rms_kernel](
