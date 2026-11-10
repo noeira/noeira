@@ -190,6 +190,20 @@ einops = ">=0.7"
 # can load. Same argument as transformers above: gate against what everyone uses.
 peft = ">=0.17"
 
+[feature.detect.dependencies]
+# Open-vocabulary DETECTORS, for EVALUATION ONLY (SPATIAL_PERCEPTION_PLAN P3
+# step 2): `tools/perception/detector_eval.py` scores OWLv2 and Grounding DINO
+# (+ SAM for masks) per word on real indoor photos (NYU Depth v2's labelled
+# set), to choose the detector that replaces P3's oracle labels. Nothing under
+# `noeira/` imports torch. Its own solve group, so it cannot move any other
+# environment's pins.
+pytorch = ">=2.5,<3"
+torchvision = ">=0.20,<1"
+transformers = ">=4.50"
+h5py = ">=3.10"
+pillow = ">=10"
+numpy = ">=1.26"
+
 [feature.cpu.dependencies]
 # CPU-only environment for CI and headless test runs: base deps WITHOUT the
 # CUDA toolchain the `default`/`nvidia` envs pull on linux-64 (GBs of
@@ -306,6 +320,8 @@ apple = { features = ["apple"], solve-group = "apple" }
 cpu = { features = ["cpu"], solve-group = "cpu" }
 # Reference-gate environment only — see [feature.act-ref.dependencies].
 act-ref = { features = ["act-ref"], solve-group = "act-ref" }
+# Detector evaluation only — see [feature.detect.dependencies].
+detect = { features = ["detect"], solve-group = "detect" }
 default = { features = ["nvidia"] }
 
 [tasks]
