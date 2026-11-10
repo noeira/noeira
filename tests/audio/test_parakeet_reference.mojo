@@ -254,11 +254,13 @@ def main() raises:
     var saved_pos = ws.pos.data.copy()
     for i in range(len(saved_pos) - PK_D):
         ws.pos.data[i] = saved_pos[i + PK_D]
+    ws.relk_ready = False  # the projected tables are a cache of `pos`
     set_rows(ws.x, sub0, PK_D, T_MAX)
     pk_block[F_MAX](model, ws, 0, valid0)
     fails += caught(String("relative positions off by one"), rel_error(ws.x, want0, valid0 * PK_D))
     for i in range(len(saved_pos)):
         ws.pos.data[i] = saved_pos[i]
+    ws.relk_ready = False
 
     # (c) BatchNorm without its running variance
     var saved_var = model.layers[0].bn.running_var.t.data.copy()

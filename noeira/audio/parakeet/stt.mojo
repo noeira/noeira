@@ -17,9 +17,12 @@ the model transcribes a command cut tight markedly worse ("walk to the fridge"
 -> "Yeah." with no margin; docs/NN_MODEL_PORTS_PLAN.md §10.2). A caller whose
 capture already has half a second of margin passes 0.
 
-CPU, fp32, written for exactness against the reference; the GPU path and the
-other precisions come next (same plan, §9.4).
+`TARGET` is "cpu" (default) or "gpu": `ParakeetSTT[801, "gpu"].load()` runs
+the encoder on the device (Metal or CUDA) and the token-by-token decoder on
+the host. fp32 on both; the other precisions come next (same plan, §9.4).
 """
+
+from max.gpu.host import DeviceContext
 
 from noeira.audio.mel import LogMel
 from .config import PK_MELS, PK_VOCAB
@@ -50,7 +53,8 @@ struct PkResult(Movable):
         self.encoder_frames = encoder_frames
 
 
-struct ParakeetSTT[F_MAX: Int = 801](Movable):
+struct ParakeetSTT[F_MAX: Int = 801, TARGET: StaticString = "cpu"](Movable):
+    var ctx: Optional[DeviceContext]
     var model: ParakeetTDT
     var tokenizer: ParakeetTokenizer
     var front: LogMel[]
@@ -59,6 +63,7 @@ struct ParakeetSTT[F_MAX: Int = 801](Movable):
     var _padded: List[Float32]
 
     def __init__(out self):
+        self.ctx = None
         self.model = ParakeetTDT()
         self.tokenizer = ParakeetTokenizer()
         self.front = LogMel[]()
@@ -73,8 +78,11 @@ struct ParakeetSTT[F_MAX: Int = 801](Movable):
         if dir == "":
             dir = parakeet_snapshot_dir()
         var s = Self()
-        s.model = ParakeetTDT.make["cpu"]()
-        s.model.load["cpu"](dir + "/model.safetensors")
+        comptime if Self.TARGET == "gpu":
+            s.ctx = DeviceContext()
+        s.model = ParakeetTDT.make[Self.TARGET](s.ctx)
+        s.model.load[Self.TARGET](dir + "/model.safetensors", s.ctx)
+        s.enc = PkEncoderWork[Self.F_MAX].make[Self.TARGET](s.ctx)
         s.tokenizer = ParakeetTokenizer.load(dir + "/tokenizer.json", PK_VOCAB)
         return s^
 
@@ -97,7 +105,9 @@ struct ParakeetSTT[F_MAX: Int = 801](Movable):
             n_mel = self.front.extract[Self.F_MAX](self._padded, self.enc.feats.data)
         else:
             n_mel = self.front.extract[Self.F_MAX](audio, self.enc.feats.data)
-        var valid = pk_encode[Self.F_MAX](self.model, self.enc, n_mel)
+        var valid = pk_encode[Self.F_MAX, Self.TARGET](
+            self.model, self.enc, n_mel, self.ctx
+        )
         var trace = pk_greedy_decode(
             self.model, self.enc.proj, valid, PkEncoderWork[Self.F_MAX].T, self.dec
         )

@@ -1,0 +1,19 @@
+# Parakeet-TDT port, encoder ON THE DEVICE — `pixi run -e apple test-parakeet-gpu`
+# (or -e nvidia)
+#
+# The companion to `parakeet-ref.txt`, same reference dumps (see its header for
+# how to produce them). ⚠ Loads 2.5 GB of weights onto the GPU: one GPU model
+# process at a time on a 16 GB machine.
+
+# The device path against transformers again, not against our CPU path:
+# subsampling, each block from the reference's own input, the chain, the
+# encoder projection, the greedy trace and the transcript (equal), at one
+# compiled maximum for the plain dumps and the reference's padded one; two
+# injected defects (padding mask dropped, positions off by one).
+tests/audio/test_parakeet_gpu.mojo
+
+# The transcript gate with the encoder on the device is a BUILD-time variant of
+# the CPU one (the target is a comptime parameter; `mojo run -D` can be stale):
+#
+#   pixi run -e apple mojo build -D PK_GPU=1 -I . tests/audio/test_parakeet_transcripts.mojo \
+#     -o build/test_parakeet_transcripts_gpu && ./build/test_parakeet_transcripts_gpu

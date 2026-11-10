@@ -387,6 +387,7 @@ test-vla-gpu = { cmd = "bash scripts/run_tests.sh tests/manifests/vla-gpu.txt", 
 test-vla-weights = { cmd = "bash scripts/run_tests.sh tests/manifests/vla-weights.txt", description = "SmolVLA gates needing the published weights (~907 MB download, cached)" }
 test-vla-ref = { cmd = "bash scripts/run_tests.sh tests/manifests/vla-ref.txt", description = "SmolVLA gates needing a reference dump, not the weights (run dump-vla-ref first)" }
 test-parakeet-ref = { cmd = "bash scripts/run_tests.sh tests/manifests/parakeet-ref.txt", description = "Parakeet-TDT port vs transformers, stage by stage (needs the dumps listed in the manifest)" }
+test-parakeet-gpu = { cmd = "bash scripts/run_tests.sh tests/manifests/parakeet-gpu.txt", description = "Parakeet-TDT encoder on the device vs transformers (use -e apple|nvidia; same dumps as test-parakeet-ref)" }
 dump-vla-ref = { cmd = "pixi run -e act-ref python tools/vla/dump_smolvla_reference.py --out /tmp/vla_ref && pixi run -e act-ref python tools/vla/dump_smolvla_image_reference.py --out /tmp/vla_img && pixi run -e act-ref python tools/vla/dump_smolvla_norm_reference.py --out /tmp/vla_norm", description = "Dump the SmolVLM activations, image preprocessing and normalisation references" }
 test-gpu = { cmd = "bash scripts/run_tests.sh --discover tests --gpu-only", description = "All *_gpu.mojo tests (use -e apple|nvidia)" }
 test-physics3d-mujoco = { cmd = "bash scripts/run_tests.sh tests/manifests/physics3d-mujoco.txt", description = "physics3d live gates vs the pixi MuJoCo 3.12 runtime (local; ~2 h)" }

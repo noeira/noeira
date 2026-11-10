@@ -10,6 +10,12 @@
         --manifest ~/.cache/noeira/parakeet/clips/manifest.tsv \
         --out ~/.cache/noeira/parakeet/clips/ref_parakeet_v3_pad05.tsv
     pixi run mojo run -I . tests/audio/test_parakeet_transcripts.mojo [clips_dir]
+    pixi run -e apple mojo build -D PK_GPU=1 -I . tests/audio/test_parakeet_transcripts.mojo \
+        -o build/test_parakeet_transcripts_gpu      # the same gate, encoder on the device
+
+⚠ The device is chosen at BUILD time (`-D PK_GPU=1`, with `mojo build`, not
+`mojo run -D`): a runtime flag would instantiate the model for both targets in
+one binary, and one instantiation is already two minutes of compile.
 
 Every clip goes WAV -> `ParakeetSTT.transcribe` (our front end, encoder,
 decoder, tokenizer; no reference array anywhere) in two forms — as cut, and
@@ -27,10 +33,14 @@ not be telling the two apart.
 from std.os import getenv
 from std.os.path import exists
 from std.sys import argv
+from std.sys.defines import is_defined
 from std.time import perf_counter_ns
 
 from noeira.io.wav import load_wav
 from noeira.audio.parakeet.stt import ParakeetSTT
+
+
+comptime TARGET: StaticString = "gpu" if is_defined["PK_GPU"]() else "cpu"
 
 
 def read_text(path: String) raises -> String:
@@ -75,8 +85,9 @@ def main() raises:
     if len(plain) != len(padded) or len(plain) == 0:
         raise Error("the two reference files do not list the same clips")
 
-    print("Parakeet in Mojo vs transformers, transcripts (" + String(len(plain) // 2) + " clips, two forms)")
-    var stt = ParakeetSTT[801].load()
+    print("Parakeet in Mojo (" + String(TARGET) + ") vs transformers, transcripts ("
+          + String(len(plain) // 2) + " clips, two forms)")
+    var stt = ParakeetSTT[801, TARGET].load()
     var fails = 0
     var crossed = 0
     var total_ns = 0
@@ -121,7 +132,7 @@ def main() raises:
         fails += 1
     print(
         "  " + String(total_ns // 1000000) + " ms for " + String(total_audio)
-        + " s of audio (CPU fp32, compiled for " + String(ParakeetSTT[801].max_seconds())
+        + " s of audio (" + String(TARGET) + " fp32, compiled for " + String(ParakeetSTT[801].max_seconds())
         + " s)"
     )
     print("")

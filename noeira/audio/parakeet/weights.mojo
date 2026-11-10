@@ -28,18 +28,46 @@ attention, feed-forward and conformer conv weight). Those biases are `TN_ZEROS`
 in the name map: filled with zeros on load, and that is the function the
 checkpoint computes.
 
-`make` FREEZES by default (no gradient buffers): the model is 627 M parameters,
-2.5 GB in fp32, and a gradient per parameter would double that on a 16 GB
+`make` allocates NOTHING: it builds the tree of leaves, and `load` allocates each
+parameter as it fills it. A parameter with no gradient buffer is frozen
+(`Param.is_frozen`), so a loaded model is frozen by construction — 627 M
+parameters are 2.5 GB in fp32 and a gradient each would double that on a 16 GB
 laptop. Fine-tuning unfreezes what it trains.
+
+## On a device
+
+`load["gpu"]` puts the ENCODER (subsampling, the 24 blocks, the encoder
+projection: 99 % of the weights) on the device and keeps the prediction network
+and the joint on the host, where the greedy loop runs them one token at a time
+(`decode.mojo`). Two things about how, both measured:
+
+- **One arena per block, not one buffer per parameter.** On Metal every kernel
+  launch costs ~22 us plus ~0.22 us for EACH live device buffer in the process
+  (MAX marks every tracked buffer as used, per launch). With a buffer per
+  parameter the encoder has ~1,200 of them and every launch costs ~190 us —
+  the whole encode was launch overhead (162 ms of it for 912 launches). A
+  sub-buffer of an arena is free: 1 arena + 1,200 sub-buffers measures 21.7 us.
+  So each block's parameters and running statistics are slices of one device
+  buffer (`arenas`), each slice starting on a multiple of `PK_ARENA_ALIGN`
+  elements — MAX's GEMM loads its operands with 16-byte vectors and faults on a
+  slice that starts off that boundary.
+- **No host copies.** A parameter uploaded the ordinary way exists three times:
+  the host list, the pinned staging buffer `Tensor` keeps, and the device
+  buffer — 7.5 GB here, on a machine whose host and device share 16 GB. Each
+  parameter's two host copies are freed as soon as its values have landed
+  (after a synchronize), so the peak is the device copy plus one tensor. The
+  consequence: a device-loaded encoder cannot be read, saved or edited from
+  the host. Load on the CPU for that.
 """
 
 from max.gpu.host import DeviceContext
 
-from noeira.nn.core.initializer import Zero
-from noeira.nn.core.param import Param, ParamVisitor, ParamWalkable
+from noeira.nn.constants import DT
+from max.gpu.host import DeviceBuffer
+from noeira.nn.core.param import Param, ParamVisitor, ParamVisitorRT, ParamWalkable
+from noeira.nn.core.tensor import Tensor
 from noeira.nn.core.walkers import join_name, for_each_param_auto, zero_grad_auto
 from noeira.nn.core.torch_names import LoadTorchNamed
-from noeira.nn.peft.freeze import FreezeParams
 from noeira.nn.primitives.linear import Linear
 from noeira.nn.primitives.layer_norm import LayerNorm
 from noeira.nn.primitives.batch_norm_1d import BatchNorm1D
@@ -50,6 +78,102 @@ from .config import (
     PK_DEC_LAYERS, PK_VOCAB, PK_JOINT, PK_FILE_TENSORS, PK_FILE_WEIGHTS,
 )
 from .names import parakeet_name_map
+
+
+def _drop_host(mut t: Tensor):
+    """Free a tensor's host list and pinned staging buffer; the device buffer
+    and the logical length stay. ⚠ Only after a synchronize: the staging buffer
+    is the source of an upload that may still be in flight."""
+    t.hbuf = None
+    t.hcap = 0
+    t._h2d_done = None
+    t.data = List[Scalar[DT]]()
+
+
+comptime PK_ARENA_ALIGN: Int = 32
+"""Elements (128 bytes): every arena slice starts on a multiple of this."""
+
+
+def _arena_span(n: Int) -> Int:
+    """Arena elements a parameter of `n` values takes. ⚠ The ONE place the
+    rule lives: `PkCount` sizes an arena with it and `PkLoad` places with it."""
+    return ((n + PK_ARENA_ALIGN - 1) // PK_ARENA_ALIGN) * PK_ARENA_ALIGN
+
+
+struct PkCount(Movable, ParamVisitor, ParamVisitorRT):
+    """Sums the arena elements of the parameters it visits."""
+
+    var elements: Int
+
+    def __init__(out self):
+        self.elements = 0
+
+    def visit_rt[target: StaticString](
+        mut self, name: String, mut param: Tensor, mut grad: Tensor,
+        mut m: Tensor, mut v: Tensor, n: Int, apply_decay: Bool,
+        ctx: Optional[DeviceContext],
+    ) raises:
+        self.elements += _arena_span(n)
+
+    def visit[target: StaticString, N: Int](
+        mut self, name: String, mut param: Tensor, mut grad: Tensor,
+        mut m: Tensor, mut v: Tensor, apply_decay: Bool,
+        ctx: Optional[DeviceContext],
+    ) raises:
+        self.visit_rt[target](name, param, grad, m, v, N, apply_decay, ctx)
+
+
+struct PkLoad(Movable, ParamVisitor, ParamVisitorRT):
+    """`LoadTorchNamed`; on a device, each parameter lands in the next slice of
+    the current arena (`begin`) and its host copies are freed."""
+
+    var ld: LoadTorchNamed[""]
+    var arena: Optional[DeviceBuffer[DT]]
+    var capacity: Int
+    var offset: Int
+
+    def __init__(out self, var ld: LoadTorchNamed[""]):
+        self.ld = ld^
+        self.arena = None
+        self.capacity = 0
+        self.offset = 0
+
+    def begin(mut self, arena: DeviceBuffer[DT], capacity: Int):
+        """The arena the next device parameters are sliced from."""
+        self.arena = arena
+        self.capacity = capacity
+        self.offset = 0
+
+    def visit_rt[target: StaticString](
+        mut self, name: String, mut param: Tensor, mut grad: Tensor,
+        mut m: Tensor, mut v: Tensor, n: Int, apply_decay: Bool,
+        ctx: Optional[DeviceContext],
+    ) raises:
+        comptime if target == "gpu":
+            # Host fill only (no context, so no buffer of its own) ...
+            self.ld.visit_rt["cpu"](name, param, grad, m, v, n, apply_decay, None)
+            if len(param.data) < n:
+                # Not filled: unmapped or missing. `report` raises on it.
+                return
+            if self.offset + _arena_span(n) > self.capacity:
+                raise Error("parakeet: '" + name + "' does not fit the arena sized for its block")
+            # ... then into the arena slice, and the host copies go.
+            var c = ctx.value()
+            param.dev = self.arena.value().create_sub_buffer[DT](self.offset, n)
+            param.n = n
+            param.upload_resident(c)
+            c.synchronize()
+            _drop_host(param)
+            self.offset += _arena_span(n)
+        else:
+            self.ld.visit_rt[target](name, param, grad, m, v, n, apply_decay, ctx)
+
+    def visit[target: StaticString, N: Int](
+        mut self, name: String, mut param: Tensor, mut grad: Tensor,
+        mut m: Tensor, mut v: Tensor, apply_decay: Bool,
+        ctx: Optional[DeviceContext],
+    ) raises:
+        self.visit_rt[target](name, param, grad, m, v, N, apply_decay, ctx)
 
 
 struct PkConv[C: Int, TAPS: Int](Movable):
@@ -63,15 +187,6 @@ struct PkConv[C: Int, TAPS: Int](Movable):
     def __init__(out self):
         self.weight = Param["weight", True, Self.C * Self.TAPS]()
         self.bias = Param["bias", False, Self.C]()
-
-    @staticmethod
-    def make[target: StaticString](
-        ctx: Optional[DeviceContext] = None
-    ) raises -> Self:
-        var c = Self()
-        c.weight = Param["weight", True, Self.C * Self.TAPS].make[target](ctx)
-        c.bias = Param["bias", False, Self.C].make[target](ctx)
-        return c^
 
     def walk[target: StaticString, V: ParamVisitor](
         mut self, mut v: V, ctx: Optional[DeviceContext], prefix: String
@@ -103,19 +218,6 @@ struct PkSubsampling(Movable):
         self.dw2 = PkConv[PK_SUB_CH, 9]()
         self.pw2 = Linear[PK_SUB_CH, PK_SUB_CH]()
         self.linear = Linear[PK_SUB_FLAT, PK_D]()
-
-    @staticmethod
-    def make[target: StaticString](
-        ctx: Optional[DeviceContext] = None
-    ) raises -> Self:
-        var s = Self()
-        s.conv0 = PkConv[PK_SUB_CH, 9].make[target](ctx)
-        s.dw1 = PkConv[PK_SUB_CH, 9].make[target](ctx)
-        s.pw1 = Linear[PK_SUB_CH, PK_SUB_CH].make[target, Zero](ctx)
-        s.dw2 = PkConv[PK_SUB_CH, 9].make[target](ctx)
-        s.pw2 = Linear[PK_SUB_CH, PK_SUB_CH].make[target, Zero](ctx)
-        s.linear = Linear[PK_SUB_FLAT, PK_D].make[target, Zero](ctx)
-        return s^
 
     def walk[target: StaticString, V: ParamVisitor](
         mut self, mut v: V, ctx: Optional[DeviceContext], prefix: String
@@ -196,33 +298,6 @@ struct PkConformerLayer(Movable):
         self.ff2_b = Linear[PK_FF, PK_D]()
         self.norm_out = LayerNorm[PK_D]()
 
-    @staticmethod
-    def make[target: StaticString](
-        ctx: Optional[DeviceContext] = None
-    ) raises -> Self:
-        var l = Self()
-        l.norm_ff1 = LayerNorm[PK_D].make[target, Zero](ctx)
-        l.ff1_a = Linear[PK_D, PK_FF].make[target, Zero](ctx)
-        l.ff1_b = Linear[PK_FF, PK_D].make[target, Zero](ctx)
-        l.norm_att = LayerNorm[PK_D].make[target, Zero](ctx)
-        l.q = Linear[PK_D, PK_D].make[target, Zero](ctx)
-        l.k = Linear[PK_D, PK_D].make[target, Zero](ctx)
-        l.v = Linear[PK_D, PK_D].make[target, Zero](ctx)
-        l.o = Linear[PK_D, PK_D].make[target, Zero](ctx)
-        l.rel_k = Linear[PK_D, PK_D].make[target, Zero](ctx)
-        l.bias_u = Param["bias_u", False, PK_D].make[target](ctx)
-        l.bias_v = Param["bias_v", False, PK_D].make[target](ctx)
-        l.norm_conv = LayerNorm[PK_D].make[target, Zero](ctx)
-        l.pw1 = Linear[PK_D, 2 * PK_D].make[target, Zero](ctx)
-        l.dw = PkConv[PK_D, PK_CONV_K].make[target](ctx)
-        l.bn = BatchNorm1D[PK_D].make[target, Zero](ctx)
-        l.pw2 = Linear[PK_D, PK_D].make[target, Zero](ctx)
-        l.norm_ff2 = LayerNorm[PK_D].make[target, Zero](ctx)
-        l.ff2_a = Linear[PK_D, PK_FF].make[target, Zero](ctx)
-        l.ff2_b = Linear[PK_FF, PK_D].make[target, Zero](ctx)
-        l.norm_out = LayerNorm[PK_D].make[target, Zero](ctx)
-        return l^
-
     def walk[target: StaticString, V: ParamVisitor](
         mut self, mut v: V, ctx: Optional[DeviceContext], prefix: String
     ) raises:
@@ -290,15 +365,6 @@ struct PkLSTMLayer(Movable):
         self.ih = Linear[PK_DEC, 4 * PK_DEC]()
         self.hh = Linear[PK_DEC, 4 * PK_DEC]()
 
-    @staticmethod
-    def make[target: StaticString](
-        ctx: Optional[DeviceContext] = None
-    ) raises -> Self:
-        var l = Self()
-        l.ih = Linear[PK_DEC, 4 * PK_DEC].make[target, Zero](ctx)
-        l.hh = Linear[PK_DEC, 4 * PK_DEC].make[target, Zero](ctx)
-        return l^
-
     def walk[target: StaticString, V: ParamVisitor](
         mut self, mut v: V, ctx: Optional[DeviceContext], prefix: String
     ) raises:
@@ -323,8 +389,11 @@ struct ParakeetTDT(ParamWalkable):
     var lstm: List[PkLSTMLayer]
     var dec_proj: Linear[PK_DEC, PK_DEC]
     var joint: Linear[PK_DEC, PK_JOINT]
+    var arenas: List[DeviceBuffer[DT]]
+    """Device only: the buffers the encoder's parameters are slices of."""
 
     def __init__(out self):
+        self.arenas = List[DeviceBuffer[DT]]()
         self.sub = PkSubsampling()
         self.layers = List[PkConformerLayer]()
         self.enc_proj = Linear[PK_D, PK_DEC]()
@@ -334,37 +403,23 @@ struct ParakeetTDT(ParamWalkable):
         self.joint = Linear[PK_DEC, PK_JOINT]()
 
     @staticmethod
-    def make[target: StaticString, FROZEN: Bool = True](
+    def make[target: StaticString](
         ctx: Optional[DeviceContext] = None
     ) raises -> Self:
-        """Allocate every parameter (zeros; `load` fills them). `FROZEN` frees
-        each piece's gradient buffers as soon as the piece exists, so the peak
-        is the values plus ONE block's gradients, not twice the model."""
+        """The tree of leaves, with no parameter allocated: `load[target]`
+        allocates each one as it fills it (module docstring). `target` and
+        `ctx` are accepted so the call reads like every other `make`."""
         var m = Self()
-        var f = FreezeParams()
-        m.sub = PkSubsampling.make[target](ctx)
-        comptime if FROZEN:
-            m.sub.walk[target](f, ctx, String("sub"))
-        for i in range(PK_LAYERS):
-            m.layers.append(PkConformerLayer.make[target](ctx))
-            comptime if FROZEN:
-                m.layers[i].walk[target](f, ctx, String("layers"))
-        m.enc_proj = Linear[PK_D, PK_DEC].make[target, Zero](ctx)
-        m.embedding = Embedding[PK_VOCAB, PK_DEC].make[target, Zero](ctx)
+        for _ in range(PK_LAYERS):
+            m.layers.append(PkConformerLayer())
         for _ in range(PK_DEC_LAYERS):
-            m.lstm.append(PkLSTMLayer.make[target](ctx))
-        m.dec_proj = Linear[PK_DEC, PK_DEC].make[target, Zero](ctx)
-        m.joint = Linear[PK_DEC, PK_JOINT].make[target, Zero](ctx)
-        comptime if FROZEN:
-            m.for_each_param[target](f, ctx)
+            m.lstm.append(PkLSTMLayer())
         return m^
 
-    def for_each_param[target: StaticString, V: ParamVisitor](
-        mut self,
-        mut visitor: V,
-        ctx: Optional[DeviceContext],
-        prefix: String = String(""),
+    def walk_encoder[target: StaticString, V: ParamVisitor](
+        mut self, mut visitor: V, ctx: Optional[DeviceContext], prefix: String
     ) raises:
+        """The parameters that live on `target`: subsampling, blocks, projection."""
         self.sub.walk[target](visitor, ctx, join_name(prefix, String("sub")))
         for i in range(len(self.layers)):
             self.layers[i].walk[target](
@@ -373,6 +428,11 @@ struct ParakeetTDT(ParamWalkable):
         self.enc_proj.for_each_param[target](
             visitor, ctx, join_name(prefix, String("enc_proj"))
         )
+
+    def walk_decoder[target: StaticString, V: ParamVisitor](
+        mut self, mut visitor: V, ctx: Optional[DeviceContext], prefix: String
+    ) raises:
+        """The prediction network and the joint (always host-resident)."""
         self.embedding.for_each_param[target](
             visitor, ctx, join_name(prefix, String("embedding"))
         )
@@ -386,6 +446,15 @@ struct ParakeetTDT(ParamWalkable):
         self.joint.for_each_param[target](
             visitor, ctx, join_name(prefix, String("joint"))
         )
+
+    def for_each_param[target: StaticString, V: ParamVisitor](
+        mut self,
+        mut visitor: V,
+        ctx: Optional[DeviceContext],
+        prefix: String = String(""),
+    ) raises:
+        self.walk_encoder[target](visitor, ctx, prefix)
+        self.walk_decoder[target](visitor, ctx, prefix)
 
     def for_each_state[target: StaticString, V: ParamVisitor](
         mut self,
@@ -423,24 +492,49 @@ struct ParakeetTDT(ParamWalkable):
         - every fp32 tensor of the file was read: the only tensors left
           unclaimed are the 24 `num_batches_tracked` counters.
         """
-        var ld = LoadTorchNamed[""](SafeTensors(path), parakeet_name_map())
-        self.for_each_param[target](ld, ctx)
-        self.for_each_state[target](ld, ctx)
-        ld.report(String("parakeet"))
-        if len(ld.loaded) + len(ld.zeroed) != ld.map.size():
+        var w = PkLoad(LoadTorchNamed[""](SafeTensors(path), parakeet_name_map()))
+        comptime if target == "gpu":
+            var c = ctx.value()
+            # Subsampling + projection share the first arena; then one per block.
+            var c0 = PkCount()
+            self.sub.walk["cpu"](c0, None, String("sub"))
+            self.enc_proj.for_each_param["cpu"](c0, None, String("enc_proj"))
+            var a0 = c.enqueue_create_buffer[DT](c0.elements)
+            a0.enqueue_fill(0.0)
+            w.begin(a0, c0.elements)
+            self.sub.walk[target](w, ctx, String("sub"))
+            self.enc_proj.for_each_param[target](w, ctx, String("enc_proj"))
+            self.arenas.append(a0)
+            for i in range(len(self.layers)):
+                var name = String("layers." + String(i))
+                var ci = PkCount()
+                self.layers[i].walk["cpu"](ci, None, name)
+                self.layers[i].walk_state["cpu"](ci, None, name)
+                var ai = c.enqueue_create_buffer[DT](ci.elements)
+                ai.enqueue_fill(0.0)
+                w.begin(ai, ci.elements)
+                self.layers[i].walk[target](w, ctx, name)
+                self.layers[i].walk_state[target](w, ctx, name)
+                self.arenas.append(ai)
+        else:
+            self.walk_encoder[target](w, ctx, String(""))
+            self.for_each_state[target](w, ctx)
+        self.walk_decoder["cpu"](w, None, String(""))
+        w.ld.report(String("parakeet"))
+        if len(w.ld.loaded) + len(w.ld.zeroed) != w.ld.map.size():
             raise Error(
-                "parakeet: filled " + String(len(ld.loaded) + len(ld.zeroed))
-                + " of the map's " + String(ld.map.size()) + " entries — the"
+                "parakeet: filled " + String(len(w.ld.loaded) + len(w.ld.zeroed))
+                + " of the map's " + String(w.ld.map.size()) + " entries — the"
                 " walk never emitted the others, so those weights stay zero"
             )
-        if len(ld.file.names) != PK_FILE_TENSORS or len(ld.loaded) != PK_FILE_WEIGHTS:
+        if len(w.ld.file.names) != PK_FILE_TENSORS or len(w.ld.loaded) != PK_FILE_WEIGHTS:
             raise Error(
-                "parakeet: read " + String(len(ld.loaded)) + " tensors of a file"
-                " of " + String(len(ld.file.names)) + ", expected "
+                "parakeet: read " + String(len(w.ld.loaded)) + " tensors of a file"
+                " of " + String(len(w.ld.file.names)) + ", expected "
                 + String(PK_FILE_WEIGHTS) + " of " + String(PK_FILE_TENSORS)
                 + " — not the checkpoint this map was written against"
             )
-        var left = ld.unclaimed()
+        var left = w.ld.unclaimed()
         for i in range(len(left)):
             if not left[i].endswith("num_batches_tracked"):
                 raise Error(
