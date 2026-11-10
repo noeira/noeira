@@ -39,7 +39,6 @@ import json
 import os
 import time
 
-import h5py
 import numpy as np
 import torch
 from PIL import Image
@@ -122,25 +121,33 @@ def ap_voc(scores, tps, n_gt):
     return ap, float(prec[b]), float(rec[b]), float(sorted_scores[b])
 
 
+def _cast(inp, dev, dtype):
+    """Move a processor's batch to the device, floating tensors in `dtype`."""
+    return {k: (v.to(dev, dtype) if torch.is_floating_point(v) else v.to(dev)) for k, v in inp.items()}
+
+
 class Owl:
     name = "owlv2-base"
 
-    def __init__(self, dev):
+    def __init__(self, dev, dtype=torch.float32):
         from transformers import Owlv2Processor, Owlv2ForObjectDetection
         self.p = Owlv2Processor.from_pretrained("google/owlv2-base-patch16-ensemble")
-        self.m = Owlv2ForObjectDetection.from_pretrained("google/owlv2-base-patch16-ensemble").to(dev).eval()
+        self.m = Owlv2ForObjectDetection.from_pretrained("google/owlv2-base-patch16-ensemble").to(dev, dtype).eval()
         self.dev = dev
+        self.dtype = dtype
 
     @torch.no_grad()
     def __call__(self, img, words):
         pil = Image.fromarray(img)
-        inp = self.p(text=[[f"a photo of a {w}" for w in words]], images=pil, return_tensors="pt").to(self.dev)
+        inp = _cast(self.p(text=[[f"a photo of a {w}" for w in words]], images=pil, return_tensors="pt"),
+                    self.dev, self.dtype)
         out = self.m(**inp)
         # OWLv2 pads to a square: boxes are relative to the padded side.
         s = max(img.shape[0], img.shape[1])
         res = self.p.post_process_grounded_object_detection(out, threshold=0.01, target_sizes=torch.tensor([[s, s]]))[0]
         dets = []
-        for b, sc, l in zip(res["boxes"].cpu().numpy(), res["scores"].cpu().numpy(), res["labels"].cpu().numpy()):
+        for b, sc, l in zip(res["boxes"].float().cpu().numpy(), res["scores"].float().cpu().numpy(),
+                            res["labels"].cpu().numpy()):
             dets.append((words[int(l)], float(sc), b.astype(np.float64)))
         return dets
 
@@ -148,26 +155,27 @@ class Owl:
 class GDino:
     name = "grounding-dino-tiny"
 
-    def __init__(self, dev):
+    def __init__(self, dev, dtype=torch.float32):
         from transformers import AutoProcessor, AutoModelForZeroShotObjectDetection
         mid = "IDEA-Research/grounding-dino-tiny"
         self.p = AutoProcessor.from_pretrained(mid)
-        self.m = AutoModelForZeroShotObjectDetection.from_pretrained(mid).to(dev).eval()
+        self.m = AutoModelForZeroShotObjectDetection.from_pretrained(mid).to(dev, dtype).eval()
         self.dev = dev
+        self.dtype = dtype
 
     @torch.no_grad()
     def __call__(self, img, words):
         pil = Image.fromarray(img)
         text = ". ".join(words) + "."
-        inp = self.p(images=pil, text=text, return_tensors="pt").to(self.dev)
+        inp = _cast(self.p(images=pil, text=text, return_tensors="pt"), self.dev, self.dtype)
         out = self.m(**inp)
         res = self.p.post_process_grounded_object_detection(
-            out, inp.input_ids, threshold=0.05, text_threshold=0.05,
+            out, inp["input_ids"], threshold=0.05, text_threshold=0.05,
             target_sizes=[img.shape[:2]],
         )[0]
         labels = res.get("text_labels", res.get("labels"))
         dets = []
-        for b, sc, l in zip(res["boxes"].cpu().numpy(), res["scores"].cpu().numpy(), labels):
+        for b, sc, l in zip(res["boxes"].float().cpu().numpy(), res["scores"].float().cpu().numpy(), labels):
             lw = str(l).strip()
             # A phrase can come back merged ("table sofa"): credit each word in it.
             for w in words:
@@ -184,17 +192,18 @@ class Sam3:
 
     name = "sam3"
 
-    def __init__(self, dev):
+    def __init__(self, dev, dtype=torch.float32):
         from transformers import Sam3Model, Sam3Processor
         self.p = Sam3Processor.from_pretrained("facebook/sam3")
-        self.m = Sam3Model.from_pretrained("facebook/sam3").to(dev).eval()
+        self.m = Sam3Model.from_pretrained("facebook/sam3").to(dev, dtype).eval()
         self.dev = dev
+        self.dtype = dtype
 
     @torch.no_grad()
     def __call__(self, img, words):
         pil = Image.fromarray(img)
         inp = self.p(images=pil, return_tensors="pt")
-        pv = inp["pixel_values"].to(self.dev)
+        pv = inp["pixel_values"].to(self.dev, self.dtype)
         ve = self.m.get_vision_features(pixel_values=pv)
         dets = []
         for w in words:
@@ -204,28 +213,30 @@ class Sam3:
             res = self.p.post_process_instance_segmentation(
                 out, threshold=0.05, mask_threshold=0.5, target_sizes=[img.shape[:2]]
             )[0]
-            for b, sc, mk in zip(res["boxes"].cpu().numpy(), res["scores"].cpu().numpy(),
+            for b, sc, mk in zip(res["boxes"].float().cpu().numpy(), res["scores"].float().cpu().numpy(),
                                  res["masks"].cpu().numpy()):
                 dets.append((w, float(sc), b.astype(np.float64), mk.astype(bool)))
         return dets
 
 
 class Sam:
-    def __init__(self, dev):
+    def __init__(self, dev, dtype=torch.float32):
         from transformers import SamModel, SamProcessor
         self.p = SamProcessor.from_pretrained("facebook/sam-vit-base")
-        self.m = SamModel.from_pretrained("facebook/sam-vit-base").to(dev).eval()
+        self.m = SamModel.from_pretrained("facebook/sam-vit-base").to(dev, dtype).eval()
         self.dev = dev
+        self.dtype = dtype
 
     @torch.no_grad()
     def __call__(self, img, box):
         pil = Image.fromarray(img)
         inp = self.p(pil, input_boxes=[[[float(v) for v in box]]], return_tensors="pt")
-        # MPS has no float64: the processor builds some tensors in it.
-        inp = {k: (v.float() if v.dtype == torch.float64 else v).to(self.dev) for k, v in inp.items()}
+        # MPS has no float64 (the processor builds some tensors in it): every
+        # floating tensor goes in the model's dtype.
+        inp = _cast(inp, self.dev, self.dtype)
         out = self.m(**inp, multimask_output=False)
         masks = self.p.image_processor.post_process_masks(
-            out.pred_masks.cpu(), inp["original_sizes"].cpu(), inp["reshaped_input_sizes"].cpu()
+            out.pred_masks.float().cpu(), inp["original_sizes"].cpu(), inp["reshaped_input_sizes"].cpu()
         )
         return masks[0][0, 0].numpy().astype(bool)
 
@@ -267,6 +278,7 @@ def main():
     a = ap.parse_args()
     os.makedirs(a.out, exist_ok=True)
     dev = device()
+    import h5py  # only the dataset needs it (the latency script imports this module)
     f = h5py.File(os.path.expanduser(a.mat), "r")
     idx, counts = select(f, a.per_word, a.negatives, a.seed)
     if a.limit:
