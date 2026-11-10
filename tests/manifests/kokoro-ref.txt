@@ -1,0 +1,26 @@
+# Kokoro-82M port gates needing the reference — `pixi run test-kokoro-ref`
+#
+# The port of hexgrad/Kokoro-82M (docs/NN_MODEL_PORTS_PLAN.md §11), stage by
+# stage against hexgrad's own `KModel`. Reference side, once (the `detect`
+# environment; `tools/kokoro/_reference.py` has the two setup commands for the
+# model code and the weights):
+#
+#   pixi run -e detect python tools/kokoro/convert_kokoro_checkpoint.py   # safetensors + check.tsv + voices
+#   pixi run -e detect python tools/kokoro/dump_kokoro_reference.py       # ~/.cache/noeira/kokoro/ref/<case>
+#
+# Each test defaults to ~/.cache/noeira/kokoro and takes the folder as its
+# first argument.
+
+# The weights as the port holds them: 459 tensors (the 89 weight-normalised
+# convolutions folded) with torch's names, shapes and position-weighted sums,
+# both directions, and the check that an unfolded weight would not have passed.
+tests/audio/test_kokoro_weights.mojo
+
+# The model, stage by stage, from `input_ids` and the voice's style row:
+# PL-BERT, the duration encoder and LSTM, the frames per phoneme (EQUAL), the
+# text encoder, the alignment, pitch and energy, the decoder's blocks; then the
+# vocoder in three gates — the harmonic source with the reference's recorded
+# noise (bounded by the REFERENCE's float32 phase rounding, 2e-2 of its peak),
+# the STFT on the reference's source, and the generator from the reference's
+# source spectrum down to the waveform (2e-4). Eight injected defects.
+tests/audio/test_kokoro_reference.mojo
