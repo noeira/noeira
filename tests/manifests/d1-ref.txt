@@ -1,0 +1,15 @@
+# d1-2B / LFM3 port gates needing the reference — `pixi run test-d1-ref`
+#
+# The port of LiquidAI's d1-2B (docs/NN_MODEL_PORTS_PLAN.md §12), against its own
+# code. Reference side (once):
+#
+#   scp denis@jetson.local:.cache/noeira/local-ai/d1/d1-2B/tokenizer.json ~/.cache/noeira/d1/
+#   # d1's own code in fp32, on a machine with transformers 5.19 + torchvision (the Orin, §12.4):
+#   python tools/d1/dump_d1_reference.py --out ~/.cache/noeira/d1/ref
+#   pixi run -e detect python tools/text/dump_bpe_reference.py       # tokenizers' ids for the BPE gate
+
+# LFM3's byte-level BPE in Mojo (noeira/text/bpe.mojo) against Hugging Face
+# `tokenizers`: 75 strings exact (each branch of the split regex, non-ASCII,
+# added tokens inside text, d1's prompts), 75 decodes exact, and d1's packed
+# rows rebuilt id for id from its prompt texts.
+tests/text/test_bpe_reference.mojo
