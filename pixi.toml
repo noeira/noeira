@@ -203,6 +203,11 @@ transformers = ">=4.50"
 h5py = ">=3.10"
 pillow = ">=10"
 numpy = ">=1.26"
+# Also the REFERENCE environment of the model ports (docs/NN_MODEL_PORTS_PLAN.md):
+# `tools/parakeet/dump_parakeet_reference.py` drives transformers' own Parakeet,
+# whose feature extractor takes its mel filterbank from librosa and refuses to
+# construct without it. Gating only, like everything else here.
+librosa = ">=0.10"
 
 [feature.cpu.dependencies]
 # CPU-only environment for CI and headless test runs: base deps WITHOUT the
@@ -381,6 +386,7 @@ test-vla = { cmd = "bash scripts/run_tests.sh tests/manifests/vla.txt", descript
 test-vla-gpu = { cmd = "bash scripts/run_tests.sh tests/manifests/vla-gpu.txt", description = "SmolVLA GPU smokes (vision tower forward/vjp at real shapes)" }
 test-vla-weights = { cmd = "bash scripts/run_tests.sh tests/manifests/vla-weights.txt", description = "SmolVLA gates needing the published weights (~907 MB download, cached)" }
 test-vla-ref = { cmd = "bash scripts/run_tests.sh tests/manifests/vla-ref.txt", description = "SmolVLA gates needing a reference dump, not the weights (run dump-vla-ref first)" }
+test-parakeet-ref = { cmd = "bash scripts/run_tests.sh tests/manifests/parakeet-ref.txt", description = "Parakeet-TDT port vs transformers, stage by stage (needs the dumps listed in the manifest)" }
 dump-vla-ref = { cmd = "pixi run -e act-ref python tools/vla/dump_smolvla_reference.py --out /tmp/vla_ref && pixi run -e act-ref python tools/vla/dump_smolvla_image_reference.py --out /tmp/vla_img && pixi run -e act-ref python tools/vla/dump_smolvla_norm_reference.py --out /tmp/vla_norm", description = "Dump the SmolVLM activations, image preprocessing and normalisation references" }
 test-gpu = { cmd = "bash scripts/run_tests.sh --discover tests --gpu-only", description = "All *_gpu.mojo tests (use -e apple|nvidia)" }
 test-physics3d-mujoco = { cmd = "bash scripts/run_tests.sh tests/manifests/physics3d-mujoco.txt", description = "physics3d live gates vs the pixi MuJoCo 3.12 runtime (local; ~2 h)" }

@@ -51,7 +51,8 @@ from .tensor import Tensor
 comptime TN_PLAIN = 0
 """Same numbers, same order — a rename only."""
 comptime TN_TRANSPOSE = 1
-"""Their `[R, C]` is our `[C, R]`. `nn.Linear` and nothing else, so far."""
+"""Their `[R, C]` is our `[C, R]`: `nn.Linear`, and a kernel-1 convolution
+(`[R, C, 1]`, `[R, C, 1, 1]`), which is the same matrix."""
 comptime TN_ZEROS = 2
 """Ours exists, theirs does not: fill with zeros on load, skip on save."""
 
@@ -103,10 +104,18 @@ struct TorchNameMap(Movable):
                     "TorchNameMap: '" + ours + "' mapped twice (to '"
                     + self.theirs[i] + "' and '" + theirs + "')"
                 )
-        if kind == TN_TRANSPOSE and len(shape) != 2:
+        # A kernel-1 convolution IS a linear: `[out, in, 1]` (Conv1d) and
+        # `[out, in, 1, 1]` (Conv2d) hold the same numbers in the same order
+        # as `[out, in]`, so they transpose the same way.
+        var matrix = len(shape) >= 2
+        for i in range(2, len(shape)):
+            if shape[i] != 1:
+                matrix = False
+        if kind == TN_TRANSPOSE and not matrix:
             raise Error(
                 "TorchNameMap: '" + ours + "' is marked TN_TRANSPOSE but its"
-                " shape has rank " + String(len(shape))
+                " shape is not [out, in] (or [out, in, 1...]): rank "
+                + String(len(shape))
             )
         var start = len(self.shape_data)
         for i in range(len(shape)):

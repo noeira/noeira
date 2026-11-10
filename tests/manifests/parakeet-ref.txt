@@ -1,0 +1,47 @@
+# Parakeet-TDT port gates needing a reference dump — `pixi run test-parakeet-ref`
+#
+# The port of nvidia/parakeet-tdt-0.6b-v3 into `nn` (docs/NN_MODEL_PORTS_PLAN.md,
+# M1), stage by stage against transformers' own implementation. Produce the
+# dumps first (the `detect` environment, CPU; the weights are 2.5 GB in the HF
+# cache):
+#
+#   for c in "fr_10 0 fr_10" "fr_10 8 fr_10_pad8" "en_16 0 en_16"; do set -- $c
+#     pixi run -e detect python tools/parakeet/dump_parakeet_reference.py \
+#       --wav ~/.cache/noeira/parakeet/clips/$1.wav --pad-s $2 \
+#       --out ~/.cache/noeira/parakeet/ref/$3
+#   done
+#
+# and, for the transcript gate, the reference's transcripts of the clip set in
+# both forms (as cut, and with 0.5 s of silence on both sides):
+#
+#   pixi run -e detect python tools/parakeet/transcribe_reference.py \
+#     --manifest ~/.cache/noeira/parakeet/clips/manifest.tsv \
+#     --out ~/.cache/noeira/parakeet/clips/ref_parakeet_v3.tsv
+#   pixi run -e detect python tools/parakeet/transcribe_reference.py --pad-s 0.5 \
+#     --manifest ~/.cache/noeira/parakeet/clips/manifest.tsv \
+#     --out ~/.cache/noeira/parakeet/clips/ref_parakeet_v3_pad05.tsv
+#
+# Each test defaults to ~/.cache/noeira/parakeet/{ref,clips} and takes the
+# folder as its first argument. ⚠ The two model tests load 2.5 GB of weights
+# and take ~2 min to compile each: one at a time on a 16 GB machine.
+
+# The log-mel front end (pre-emphasis, STFT, slaney filterbank, log, per-bin
+# normalization) at ONE compiled maximum frame count: the filterbank identical
+# to librosa's in float32, the window within one ulp of torch's, the features
+# within two stated bounds (bins with signal / all bins), zero beyond the valid
+# length on the reference's own padded path, and four injected defects caught.
+tests/audio/test_log_mel_reference.mojo
+
+# The model, stage by stage, at one compiled maximum (801 mel frames) for the
+# plain dumps and the reference's own padded one: the load's accounting (699
+# weights read, each parameter filled), the positional table, the subsampling,
+# each of the 24 blocks from the reference's own input, the chain on our
+# intermediates, then the greedy token/duration trace and the transcript,
+# which must be EQUAL. Six injected defects (four in a block, two in the
+# decoder), each checked to move the result.
+tests/audio/test_parakeet_reference.mojo
+
+# The task metric: WAV -> `ParakeetSTT.transcribe` (our front end, encoder,
+# decoder and tokenizer, no reference array) on the 18 clips in both forms;
+# the 36 transcripts equal transformers', character for character.
+tests/audio/test_parakeet_transcripts.mojo
