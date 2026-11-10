@@ -45,13 +45,18 @@ flat index with 32-bit unsigned arithmetic (`_u`).
 ## Precision
 
 fp32 throughout by default. `-D KOKORO_TF32=1` lets cuBLAS run the vocoder's large
-GEMMs in TF32 (NVIDIA): faster, gated against its own bound.
+GEMMs in TF32 (NVIDIA): faster, gated against its own bound. In that build the
+vocoder's convolutions go through cuDNN's implicit GEMM instead of im2col
+(`cudnn_conv.mojo`: no window matrix written and read back; 2-3x per
+convolution on the Orin), unless cuDNN is unusable or `KOKORO_IM2COL` is set in
+the environment.
 """
 
 from std.math import exp, sqrt, sin
 from std.memory import stack_allocation
 from std.sys import default_accelerator
 from std.sys.defines import is_defined
+from std.os import getenv
 from max.gpu import global_idx, thread_idx, block_idx
 from max.gpu.host import DeviceContext, DeviceBuffer
 from max.gpu.memory import AddressSpace
@@ -65,6 +70,7 @@ from noeira.nn.core.cublas_gemm import cublas_gemm
 from noeira.nn.core.fill import fill_dev
 from noeira.nn.core.tensor import Tensor
 from noeira.audio.espeak import EspeakNG
+from .cudnn_conv import CudnnConv1d
 from .decoder import (
     kk_harmonic_source, kk_stft, kk_istft, KokoroNoise, KK_SAMPLES_PER_FRAME,
 )
@@ -563,11 +569,13 @@ struct KokoroDevice(Movable):
     """Tensor `i` of `w`, on the device (a slice of `arena`)."""
     var vocab: Dict[String, Int]
     var dir: String
+    var cudnn: Optional[CudnnConv1d]
+    """The TF32 convolutions' cuDNN (NVIDIA, `-D KOKORO_TF32=1`), else None."""
 
     def __init__(
         out self, var ctx: DeviceContext, var w: KokoroWeights,
         var arena: DeviceBuffer[DT], var dev: List[DeviceBuffer[DT]],
-        var vocab: Dict[String, Int], var dir: String,
+        var vocab: Dict[String, Int], var dir: String, var cudnn: Optional[CudnnConv1d],
     ):
         self.ctx = ctx^
         self.w = w^
@@ -575,6 +583,7 @@ struct KokoroDevice(Movable):
         self.dev = dev^
         self.vocab = vocab^
         self.dir = dir^
+        self.cudnn = cudnn^
 
     @staticmethod
     def load(var ctx: DeviceContext, var dir: String = String("")) raises -> Self:
@@ -615,7 +624,11 @@ struct KokoroDevice(Movable):
         for i in range(len(w.tensors)):
             if w.tensors[i].n > 4096:
                 w.tensors[i].data = List[Scalar[DT]]()
-        return Self(ctx^, w^, arena^, dev^, vocab^, dir^)
+        var cudnn: Optional[CudnnConv1d] = None
+        comptime if KD_TF32 and default_accelerator().is_nvidia_gpu():
+            if getenv("KOKORO_IM2COL") == "":
+                cudnn = CudnnConv1d.create(ctx)
+        return Self(ctx^, w^, arena^, dev^, vocab^, dir^, cudnn^)
 
     # ── plumbing ─────────────────────────────────────────────────────────
 
@@ -725,6 +738,11 @@ struct KokoroDevice(Movable):
         var y = DSeq(self.new(l_out * c_out), l_out, c_out)
         if k == 1 and stride == 1 and padding == 0:
             self.gemm[True, TF32](y.buf, x.buf, self.dev[wi], l_out, c_out, c_in)
+        elif TF32 and self.cudnn:
+            var ctx = self.ctx
+            self.cudnn.value().forward(
+                ctx, x.buf, self.dev[wi], y.buf, x.rows, c_in, c_out, k, l_out, stride, padding, dilation,
+            )
         else:
             var width = c_in * k
             var chunk = IM2COL_BUDGET // width

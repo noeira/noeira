@@ -24,6 +24,17 @@ tests/audio/test_kokoro_gpu.mojo
 #   pixi run -e nvidia mojo build -D KOKORO_TF32=1 -I . tests/audio/test_kokoro_gpu.mojo \
 #     -o build/test_kokoro_gpu_tf32 && ./build/test_kokoro_gpu_tf32
 #
+# In the TF32 build the vocoder's convolutions go through cuDNN's implicit GEMM
+# (`noeira/audio/kokoro/cudnn_conv.mojo`; generator 82 -> 55 ms on the Orin).
+# `KOKORO_IM2COL=1` in the environment runs the same binary on im2col + cuBLAS,
+# for an A/B; both pass the TF32 bounds.
+#
 # On the Orin: `pixi run -e jetson build-jetson ...` (adds `--target-accelerator
-# sm_87`), and run the binary with JetPack's cuBLAS first on the loader path
-# (`LD_LIBRARY_PATH=/usr/local/cuda/lib64:$LD_LIBRARY_PATH`).
+# sm_87`), and run the binary with JetPack's cuBLAS AND cuDNN first on the loader
+# path. The jetson env's own cuDNN 9.10.2 fails every convolution on the Orin
+# (EXECUTION_FAILED; the model then falls back to im2col and says so), and
+# /usr/lib/aarch64-linux-gnu cannot go first as a whole, so link JetPack's
+# libcudnn*.so.9 into a directory of their own:
+#
+#   mkdir -p ~/cudnn-jetpack && ln -sf /usr/lib/aarch64-linux-gnu/libcudnn*.so.9 ~/cudnn-jetpack/
+#   LD_LIBRARY_PATH=~/cudnn-jetpack:/usr/local/cuda/lib64:$LD_LIBRARY_PATH ./build/test_kokoro_gpu_tf32
