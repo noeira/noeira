@@ -271,3 +271,9 @@ def log_softmax_rows_kernel(x: Ptr, v_n: Int64):
         x[unsafe_offset=row + j] = x[unsafe_offset=row + j] - lz
         j += TPB
 
+
+def f32_to_bf16_kernel(src: Ptr, dst: Pointer[Scalar[DType.bfloat16], MutAnyOrigin], n_n: Int64):
+    """Round to bf16 (nearest even) for a tensor-core GEMM's operand."""
+    var i = Int(global_idx.x)
+    if i < Int(n_n):
+        dst[unsafe_offset=i] = src[unsafe_offset=i].cast[DType.bfloat16]()

@@ -25,9 +25,12 @@ from noeira.io.npy import load_npy_f64
 from noeira.text.bpe import ByteLevelBPE
 from noeira.llm.d1 import D1, parse_questions, pack_rows
 from noeira.llm.d1.prompt import prefix_text, suffix_text, py_json_dumps
+from noeira.llm.lfm3.model import LF_BF16
 
 
-comptime PROB_BOUND: Float64 = 1e-4
+comptime PROB_BOUND: Float64 = 3e-3 if LF_BF16 else 1e-4
+"""fp32: measured <= 1.8e-6. LFM3_BF16: measured <= 8.1e-4 (the Orin,
+2026-11-10), against d1's own fp32 answers; the picks are equal either way."""
 
 comptime ROOM_STATE = """{"robot": {"at": "door", "facing": "kitchen", "doing": "standing"}, "places": {"fridge": "3.1 m ahead, slightly left", "door": "here", "table": "2.0 m to the right", "sofa": "4.5 m behind"}, "heard": "Can you go to the fridge and wait there?", "recently": ["walked to the door", "heard: hello robot"]}"""
 comptime ROOM_Q = """{"addressed": {"type": "noul", "instructions": "Is the speaker asking the robot to do something?"}, "destination": {"type": "choice", "instructions": "Where should the robot walk?", "criteria": {"fridge": "walk to the fridge", "door": "walk to the door", "table": "walk to the table", "sofa": "walk to the sofa", "nowhere": "do not walk anywhere"}}, "urgency": {"type": "score", "instructions": "How urgent is the request?", "criteria": ["not urgent", "somewhat urgent", "very urgent"]}}"""
@@ -95,7 +98,7 @@ def main() raises:
     var questions: List[String] = [ROOM_Q, FR_Q, many_questions()]
     var fails = 0
 
-    print("d1 System One in Mojo vs d1-2B's own code")
+    print("d1 System One in Mojo vs d1-2B's own code", "(LFM3_BF16)" if LF_BF16 else "(fp32)")
     var tok = ByteLevelBPE.load(model_dir + "/tokenizer.json")
     # 1. prompts and rows
     for c in range(3):

@@ -32,9 +32,12 @@ LM (`state_len = 0`, no groups) is `causal_full = True`.
 ## Precision
 
 Activations fp32. Weights stay bf16 on the device (the checkpoint's own type:
-nothing is lost against an fp32 reference, which is the bf16 weights upcast)
-and are widened into a scratch buffer for each GEMM. The GEMMs are fp32
-(`-D LFM3_TF32=1`: TF32 on NVIDIA). A bf16-activation build is the next step.
+nothing is lost against an fp32 reference, which is the bf16 weights upcast).
+Default: each weight is widened into a scratch buffer and the GEMM is fp32
+(`-D LFM3_TF32=1`: TF32 on NVIDIA) — the build that PROVES the code. With
+`-D LFM3_BF16=1` (NVIDIA) a GEMM rounds its activations to bf16 and runs on the
+tensor cores against the weights in place (`cublas_gemm_lp`, fp32
+accumulation and output) — what torch and llama.cpp run d1 in.
 
 ## `debug` (falsification only)
 
@@ -51,17 +54,18 @@ from layout import TileTensor, row_major
 from linalg.matmul import matmul as max_matmul
 
 from noeira.nn.constants import DT
-from noeira.nn.core.cublas_gemm import cublas_gemm
+from noeira.nn.core.cublas_gemm import cublas_gemm, cublas_gemm_lp
 from noeira.io.json import load_json
 from noeira.io.safetensors import SafeTensors, ST_BF16
 from .kernels import (
     TPB, bf16_to_f32_kernel, embed_kernel, rms_kernel, add_kernel, short_conv_kernel, rope_kernel,
     scores_kernel, softmax_rows_kernel, attn_out_kernel, swiglu_kernel, gather_rows_kernel,
-    lm_head_kernel, log_softmax_rows_kernel,
+    lm_head_kernel, log_softmax_rows_kernel, f32_to_bf16_kernel,
 )
 
 
 comptime LF_TF32: Bool = is_defined["LFM3_TF32"]()
+comptime LF_BF16: Bool = is_defined["LFM3_BF16"]() and default_accelerator().is_nvidia_gpu()
 comptime LT_CONV: Int = 0
 comptime LT_FULL: Int = 1
 comptime LT_SLIDING: Int = 2
@@ -156,6 +160,8 @@ struct Lfm3Text(Movable):
     var index: Dict[String, Int]
     """Tensor name (without the prefix) -> its slot in `dev`."""
     var dev: List[DeviceBuffer[DType.uint16]]
+    var offs: List[Int]
+    """Each tensor's offset in the arena (elements)."""
     var used: List[Bool]
     var names: List[String]
     var scratch: DeviceBuffer[DT]
@@ -164,14 +170,15 @@ struct Lfm3Text(Movable):
 
     def __init__(
         out self, var ctx: DeviceContext, var cfg: Lfm3Config, var arena: DeviceBuffer[DType.uint16],
-        var index: Dict[String, Int], var dev: List[DeviceBuffer[DType.uint16]], var names: List[String],
-        var scratch: DeviceBuffer[DT],
+        var index: Dict[String, Int], var dev: List[DeviceBuffer[DType.uint16]], var offs: List[Int],
+        var names: List[String], var scratch: DeviceBuffer[DT],
     ):
         self.ctx = ctx^
         self.cfg = cfg^
         self.arena = arena^
         self.index = index^
         self.dev = dev^
+        self.offs = offs^
         self.used = List[Bool](length=len(self.dev), fill=False)
         self.names = names^
         self.scratch = scratch^
@@ -206,6 +213,7 @@ struct Lfm3Text(Movable):
         ctx.synchronize()
         var index = Dict[String, Int]()
         var dev = List[DeviceBuffer[DType.uint16]]()
+        var offs = List[Int]()
         var names = List[String]()
         var off = 0
         for i in picked:
@@ -216,13 +224,14 @@ struct Lfm3Text(Movable):
             var short = String(name[byte=prefix.byte_length():])
             index[short] = len(dev)
             dev.append(arena.create_sub_buffer[DType.uint16](off, n))
+            offs.append(off)
             names.append(short)
             off += (n + _ALIGN - 1) // _ALIGN * _ALIGN
         ctx.enqueue_copy(arena, staging)
         ctx.synchronize()
         _ = staging^
         var scratch = ctx.enqueue_create_buffer[DT](largest)
-        return Lfm3Text(ctx^, cfg^, arena^, index^, dev^, names^, scratch^)
+        return Lfm3Text(ctx^, cfg^, arena^, index^, dev^, offs^, names^, scratch^)
 
     # ── plumbing ─────────────────────────────────────────────────────────
 
@@ -255,10 +264,20 @@ struct Lfm3Text(Movable):
             max_matmul[transpose_b=True, target="gpu"](ov, av, bv, self.ctx)
 
     def linear(mut self, name: String, x: DeviceBuffer[DT], t: Int, k: Int) raises -> DeviceBuffer[DT]:
-        """`x[t, k] @ W^T` for the bf16 weight `name` ([n, k]), widened into the
-        scratch first."""
+        """`x[t, k] @ W^T` for the bf16 weight `name` ([n, k]): widened into the
+        scratch first, or (LFM3_BF16) against the weight in place."""
         var wb = self.w(name + ".weight")
         var n = len(wb) // k
+        comptime if LF_BF16:
+            var xb = self.ctx.enqueue_create_buffer[DType.bfloat16](t * k)
+            self.ctx.enqueue_function[f32_to_bf16_kernel](x, xb, Int64(t * k), grid_dim=_blocks(t * k), block_dim=TPB)
+            var i = self.index.get(name + ".weight").value()
+            var wv = DeviceBuffer[DType.bfloat16](
+                self.ctx, self.arena.unsafe_ptr().bitcast[Scalar[DType.bfloat16]]() + self.offs[i], n * k, owning=False,
+            )
+            var yb = self.new(t * n)
+            cublas_gemm_lp[False, True, DType.bfloat16, DT](self.ctx, yb, xb, wv, t, n, k, 0.0)
+            return yb^
         var wf = self.scratch.create_sub_buffer[DT](0, n * k)
         self.ctx.enqueue_function[bf16_to_f32_kernel](wb, wf, Int64(n * k), grid_dim=_blocks(n * k), block_dim=TPB)
         var y = self.new(t * n)

@@ -28,3 +28,10 @@ tests/llm/test_lfm3_d1_reference_gpu.mojo
 # with the tokenizer alone, on any machine), then on the device the answers —
 # same picks and levels, probabilities within 1e-4 (measured <= 1.8e-6).
 tests/llm/test_d1_system_one_gpu.mojo
+
+# ⚠ Both device gates have a bf16 build, `-D LFM3_BF16=1` (NVIDIA): GEMMs on the
+# tensor cores against the bf16 weights in place, activations rounded to bf16 at
+# each GEMM — 3.7x faster on the Orin (250 tokens: 249 against 920 ms). Its own
+# bounds: layers 2e-2, slots 5e-3, answers 3e-3 (measured 9.1e-3 / 1.6e-3 /
+# 8.1e-4). The fp32 build is the one that proves the code (it alone resolves
+# the RoPE-tail defect, ~3e-3).

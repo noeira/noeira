@@ -24,12 +24,18 @@ from max.gpu.host import DeviceContext, DeviceBuffer
 from noeira.io.json import load_json
 from noeira.io.npy import load_npy_f64
 from noeira.llm.lfm3 import Lfm3Text
-from noeira.llm.lfm3.model import LF_TF32
+from noeira.llm.lfm3.model import LF_TF32, LF_BF16
 from noeira.nn.constants import DT
 
 
-comptime STAGE_BOUND: Float64 = 1e-4
-comptime FALSIFY_MIN: Float64 = 10.0 * STAGE_BOUND
+comptime STAGE_BOUND: Float64 = 2e-2 if LF_BF16 else 1e-4
+"""Each layer's output and the final norm. fp32: the reference's own order of
+operations (measured <= 6.1e-6). LFM3_BF16 (bf16-rounded GEMM operands, fp32
+accumulation): measured <= 4.2e-3 per layer, 9.1e-3 after the final norm (the
+Orin, 2026-11-10); the bound is twice that."""
+comptime SLOT_BOUND: Float64 = 5e-3 if LF_BF16 else 1e-4
+"""The slots' log-softmax over the vocabulary. LFM3_BF16: measured <= 1.6e-3."""
+comptime FALSIFY_MIN: Float64 = 10.0 * SLOT_BOUND
 """A defect must land ten times past the bound the gate holds the port to.
 Not more: the zero tail touches only frequency slots 32-63, whose angles are
 below 1e-3 rad per position, so rotating them too moves the slots by ~3e-3 on a
@@ -118,7 +124,7 @@ def main() raises:
             print("  ", cases[ci], "row", r, ":", t, "tokens, state", row.state_len, ",", len(row.slots), "slots")
             check(fails, worst < STAGE_BOUND, String("embedding and 24 layers, worst ") + worst_at + "  rel err = " + String(worst))
             check(fails, ef < STAGE_BOUND, String("final norm  rel err = ") + String(ef))
-            check(fails, el < STAGE_BOUND, String("slots' log-softmax over the vocabulary  rel err = ") + String(el))
+            check(fails, el < SLOT_BOUND, String("slots' log-softmax over the vocabulary  rel err = ") + String(el))
 
     var un = lm.unused()
     check(fails, len(un) == 0, String("every language-model tensor used (") + String(len(un)) + " unused"
@@ -130,6 +136,11 @@ def main() raises:
     var names: List[String] = ["full layers causal instead of `set`", "full RoPE instead of the zero tail", "output gate off"]
     var bits: List[Int] = [1, 2, 4]
     for i in range(3):
+        if LF_BF16 and bits[i] == 2:
+            # ~3e-3 on the slots: the size of the bf16 build's own noise. The
+            # fp32 build resolves it (2.9e-3 against 1.4e-6); this one cannot.
+            print("  (skip) defect", names[i], "— below the bf16 build's resolution; the fp32 build gates it")
+            continue
         lm.debug = bits[i]
         var taps = List[DeviceBuffer[DT]]()
         var h = lm.forward(row.ids, row.groups, row.state_len, taps)
@@ -143,7 +154,7 @@ def main() raises:
     var h = lm.forward(row.ids, row.groups, row.state_len, taps)
     var lz = lm.slot_logz(h, len(row.ids), row.slots)
     print("  forward + slots,", len(row.ids), "tokens, warm:", Float64(perf_counter_ns() - t1) / 1e6, "ms",
-          "(LFM3_TF32)" if LF_TF32 else "(fp32)")
+          "(LFM3_BF16)" if LF_BF16 else ("(LFM3_TF32)" if LF_TF32 else "(fp32)"))
     _ = lz^
 
     if fails > 0:
