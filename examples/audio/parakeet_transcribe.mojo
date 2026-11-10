@@ -41,6 +41,8 @@ from noeira.audio.parakeet.stt import ParakeetSTT
 comptime F_MAX: Int = get_defined_int["PK_F_MAX", 801]()
 """Mel frames compiled for: 801 (8 s) unless built with `-D PK_F_MAX=401` (4 s)."""
 comptime TARGET: StaticString = "gpu" if is_defined["PK_GPU"]() else "cpu"
+comptime WEIGHTS: StaticString = "fp16" if is_defined["PK_FP16"]() else "fp32"
+"""`-D PK_FP16=1` (NVIDIA, with `PK_GPU`): half-precision GEMM weights."""
 comptime F_SHORT: Int = 401 if (is_defined["PK_GPU"]() and default_accelerator().is_nvidia_gpu() and F_MAX > 401) else 0
 """On NVIDIA: a second, 4 s shape for the clips that fit (`stt.mojo`). The
 `--profile` breakdown below always times the 8 s shape."""
@@ -77,9 +79,9 @@ def main() raises:
         return
 
     var t0 = perf_counter_ns()
-    var stt = ParakeetSTT[F_MAX, TARGET, F_SHORT].load()
+    var stt = ParakeetSTT[F_MAX, TARGET, F_SHORT, WEIGHTS].load()
     print("loaded in", Int(ms(t0, perf_counter_ns())), "ms; encoder on the", TARGET,
-          "; compiled for", ParakeetSTT[F_MAX, TARGET, F_SHORT].max_seconds(), "s")
+          "; compiled for", ParakeetSTT[F_MAX, TARGET, F_SHORT, WEIGHTS].max_seconds(), "s")
 
     for f in range(len(files)):
         var wav = load_wav(files[f]).to_mono().resample(16000)
@@ -102,7 +104,7 @@ def main() raises:
         sync(stt.ctx)
         var p2 = perf_counter_ns()
         for layer in range(PK_LAYERS):
-            pk_block[F_MAX, TARGET](stt.model, stt.enc, layer, valid, stt.ctx)
+            pk_block[F_MAX, TARGET, WEIGHTS](stt.model, stt.enc, layer, valid, stt.ctx)
         sync(stt.ctx)
         var p3 = perf_counter_ns()
         comptime T = PkEncoderWork[F_MAX].T
@@ -117,7 +119,7 @@ def main() raises:
         var p5 = perf_counter_ns()
         # The GEMMs of the 24 blocks alone, on whatever the buffers hold.
         var g0 = perf_counter_ns()
-        for layer in range(PK_LAYERS):
+        for layer in range(PK_LAYERS if WEIGHTS == "fp32" else 0):
             _gemm_any[TARGET, T, PK_D, PK_FF](stt.model.layers[layer].ff1_a, stt.enc.h, stt.enc.ff, valid, stt.ctx)
             _gemm_any[TARGET, T, PK_FF, PK_D](stt.model.layers[layer].ff1_b, stt.enc.ff, stt.enc.y, valid, stt.ctx)
             _gemm_any[TARGET, T, PK_D, PK_D](stt.model.layers[layer].q, stt.enc.h, stt.enc.q, valid, stt.ctx)
@@ -150,5 +152,5 @@ def main() raises:
         print("  front end", ms(p0, p1), "ms | subsampling", ms(p1, p2),
               "ms | 24 blocks", ms(p2, p3), "ms | projection", ms(p3, p4),
               "ms | decode", ms(p4, p5), "ms | total", ms(p0, p5), "ms")
-        print("  alone: the blocks' 240 GEMMs", ms(g0, g1), "ms | their 120 LayerNorms",
+        print("  alone: the blocks' 240 GEMMs (fp32 weights only)", ms(g0, g1), "ms | their 120 LayerNorms",
               ms(g1, g2), "ms | 1000 x one elementwise pass over [T, 1024]", ms(g2, g3), "ms")

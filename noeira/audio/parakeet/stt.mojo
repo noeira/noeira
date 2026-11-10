@@ -23,6 +23,11 @@ once the weights are smaller (half precision, int4) and the rows matter
 again. The transcripts do not depend on the shape (the NVIDIA transcript gate
 runs the two-shape build).
 
+`WEIGHTS = "fp16"` (NVIDIA, with `TARGET = "gpu"`) stores the encoder blocks'
+GEMM weights in half precision — 96 % of the parameters, 1.3 GB on the device
+instead of 2.5 — with fp32 activations; see `weights.mojo` for why that is the
+lever on an Orin. "fp32" (default) is the reference form.
+
 `pad_s` adds silence on both sides before the front end. ⚠ It is not cosmetic:
 the model transcribes a command cut tight markedly worse ("walk to the fridge"
 -> "Yeah." with no margin; docs/NN_MODEL_PORTS_PLAN.md §10.2). A caller whose
@@ -66,7 +71,7 @@ struct PkResult(Movable):
         self.encoder_frames = encoder_frames
 
 
-def _transcribe_at[F: Int, target: StaticString](
+def _transcribe_at[F: Int, target: StaticString, WEIGHTS: StaticString](
     mut model: ParakeetTDT, mut front: LogMel[], mut enc: PkEncoderWork[F],
     mut dec: PkDecodeWork, ref tokenizer: ParakeetTokenizer,
     ref audio: List[Float32], ctx: Optional[DeviceContext],
@@ -74,7 +79,7 @@ def _transcribe_at[F: Int, target: StaticString](
     """Front end, encoder, decoder and tokenizer at the compiled shape `F`."""
     comptime T = PkEncoderWork[F].T
     var n_mel = front.extract[F](audio, enc.feats.data)
-    var valid = pk_encode[F, target](model, enc, n_mel, ctx)
+    var valid = pk_encode[F, target, WEIGHTS](model, enc, n_mel, ctx)
     var trace = pk_greedy_decode[target, T](model, enc.proj, valid, T, dec, ctx)
     var ids = trace.text_ids()
     var text = tokenizer.decode(ids)
@@ -82,7 +87,8 @@ def _transcribe_at[F: Int, target: StaticString](
 
 
 struct ParakeetSTT[
-    F_MAX: Int = 801, TARGET: StaticString = "cpu", F_SHORT: Int = 0
+    F_MAX: Int = 801, TARGET: StaticString = "cpu", F_SHORT: Int = 0,
+    WEIGHTS: StaticString = "fp32",
 ](Movable):
     comptime FS: Int = Self.F_SHORT if Self.F_SHORT > 0 else 8
     """The short shape's frames; a token size when there is none (never run)."""
@@ -117,10 +123,10 @@ struct ParakeetSTT[
         comptime if Self.TARGET == "gpu":
             s.ctx = DeviceContext()
         s.model = ParakeetTDT.make[Self.TARGET](s.ctx)
-        s.model.load[Self.TARGET](dir + "/model.safetensors", s.ctx)
-        s.enc = PkEncoderWork[Self.F_MAX].make[Self.TARGET](s.ctx)
+        s.model.load[Self.TARGET, Self.WEIGHTS](dir + "/model.safetensors", s.ctx)
+        s.enc = PkEncoderWork[Self.F_MAX].make[Self.TARGET, Self.WEIGHTS](s.ctx)
         comptime if Self.F_SHORT > 0:
-            s.enc_short = PkEncoderWork[Self.FS].make[Self.TARGET](s.ctx)
+            s.enc_short = PkEncoderWork[Self.FS].make[Self.TARGET, Self.WEIGHTS](s.ctx)
         s.dec = PkDecodeWork.make[Self.TARGET](s.ctx)
         s.tokenizer = ParakeetTokenizer.load(dir + "/tokenizer.json", PK_VOCAB)
         return s^
@@ -147,11 +153,11 @@ struct ParakeetSTT[
         """At the short shape when there is one and the clip fits, else at `F_MAX`."""
         comptime if Self.F_SHORT > 0:
             if len(audio) // PK_HOP <= Self.F_SHORT:
-                return _transcribe_at[Self.FS, Self.TARGET](
+                return _transcribe_at[Self.FS, Self.TARGET, Self.WEIGHTS](
                     self.model, self.front, self.enc_short, self.dec,
                     self.tokenizer, audio, self.ctx,
                 )
-        return _transcribe_at[Self.F_MAX, Self.TARGET](
+        return _transcribe_at[Self.F_MAX, Self.TARGET, Self.WEIGHTS](
             self.model, self.front, self.enc, self.dec, self.tokenizer, audio,
             self.ctx,
         )

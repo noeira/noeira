@@ -41,6 +41,10 @@ from noeira.audio.parakeet.stt import ParakeetSTT
 
 
 comptime TARGET: StaticString = "gpu" if is_defined["PK_GPU"]() else "cpu"
+comptime WEIGHTS: StaticString = "fp16" if is_defined["PK_FP16"]() else "fp32"
+"""`-D PK_FP16=1` (with `PK_GPU`, NVIDIA): the half-precision-weights build,
+held to the SAME float32 reference transcripts — the claim is that halving the
+weights changes no transcript."""
 comptime F_SHORT: Int = 401 if (is_defined["PK_GPU"]() and default_accelerator().is_nvidia_gpu() and not is_defined["PK_ONE_SHAPE"]()) else 0
 """On NVIDIA the gate runs the deployment's two shapes (4 s and 8 s): every
 clip here fits the short one. `-D PK_ONE_SHAPE=1` holds it to the 8 s shape."""
@@ -88,9 +92,9 @@ def main() raises:
     if len(plain) != len(padded) or len(plain) == 0:
         raise Error("the two reference files do not list the same clips")
 
-    print("Parakeet in Mojo (" + String(TARGET) + ") vs transformers, transcripts ("
+    print("Parakeet in Mojo (" + String(TARGET) + ", " + String(WEIGHTS) + " weights) vs transformers, transcripts ("
           + String(len(plain) // 2) + " clips, two forms)")
-    var stt = ParakeetSTT[801, TARGET, F_SHORT].load()
+    var stt = ParakeetSTT[801, TARGET, F_SHORT, WEIGHTS].load()
     var fails = 0
     var crossed = 0
     var total_ns = 0
@@ -135,7 +139,7 @@ def main() raises:
         fails += 1
     print(
         "  " + String(total_ns // 1000000) + " ms for " + String(total_audio)
-        + " s of audio (" + String(TARGET) + " fp32, compiled for " + String(ParakeetSTT[801].max_seconds())
+        + " s of audio (" + String(TARGET) + ", " + String(WEIGHTS) + " weights, compiled for " + String(ParakeetSTT[801].max_seconds())
         + " s" + (String(" and a ") + String(F_SHORT) + "-frame short shape" if F_SHORT > 0 else String("")) + ")"
     )
     print("")

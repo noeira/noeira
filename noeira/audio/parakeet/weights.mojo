@@ -59,6 +59,20 @@ Two things about how, both measured:
   (after a synchronize), so the peak is the device copy plus one tensor. The
   consequence: a device-loaded encoder cannot be read, saved or edited from
   the host. Load on the CPU for that.
+
+## Half-precision weights (`load["gpu", "fp16"]`, NVIDIA)
+
+On an Orin the encoder's GEMM time is the STREAMING of its weights — 2.4 GB of
+fp32 per clip, 35-37 ms whatever the row count — so the lever is their size.
+With `WEIGHTS = "fp16"` the eleven GEMM weights of each block (the two
+feed-forwards, the five attention projections, the two pointwise convolutions:
+96 % of the parameters) are converted to float16 on the host and stored ONLY
+in that form, in a float16 arena per block (`PkConformerLayer.half`, one
+buffer per `PK_GEMM_*` slot). Everything else — norms, biases, the depthwise
+convolution, the subsampling, the decoder — stays fp32, and so do the
+activations: the GEMM's other operand is cast per call (`encoder.mojo`).
+The `Linear` leaves of those eleven weights are then EMPTY (no host copy, no
+device buffer): this is a deployment form, not one to fine-tune or save.
 """
 
 from max.gpu.host import DeviceContext
@@ -91,6 +105,41 @@ def _drop_host(mut t: Tensor):
     t.data = List[Scalar[DT]]()
 
 
+comptime PK_HALF = DType.float16
+
+# The eleven GEMM weights of a block, in the order `PkConformerLayer.walk`
+# visits them — which is the order their half-precision copies are stored in.
+comptime PK_GEMM_FF1_A: Int = 0
+comptime PK_GEMM_FF1_B: Int = 1
+comptime PK_GEMM_Q: Int = 2
+comptime PK_GEMM_K: Int = 3
+comptime PK_GEMM_V: Int = 4
+comptime PK_GEMM_O: Int = 5
+comptime PK_GEMM_REL_K: Int = 6
+comptime PK_GEMM_PW1: Int = 7
+comptime PK_GEMM_PW2: Int = 8
+comptime PK_GEMM_FF2_A: Int = 9
+comptime PK_GEMM_FF2_B: Int = 10
+comptime PK_GEMM_SLOTS: Int = 11
+
+
+def pk_gemm_slot(name: String) -> Int:
+    """The `PK_GEMM_*` slot of a walked parameter name, or -1 when it is not
+    one of a block's GEMM weights. ⚠ The slot order must be the walk's:
+    `PkLoad` raises when a weight arrives out of it."""
+    if not name.startswith("layers."):
+        return -1
+    var slots: List[String] = [
+        ".ff1_a.weight", ".ff1_b.weight", ".q.weight", ".k.weight",
+        ".v.weight", ".o.weight", ".rel_k.weight", ".pw1.weight",
+        ".pw2.weight", ".ff2_a.weight", ".ff2_b.weight",
+    ]
+    for i in range(len(slots)):
+        if name.endswith(slots[i]):
+            return i
+    return -1
+
+
 comptime PK_ARENA_ALIGN: Int = 32
 """Elements (128 bytes): every arena slice starts on a multiple of this."""
 
@@ -101,19 +150,32 @@ def _arena_span(n: Int) -> Int:
     return ((n + PK_ARENA_ALIGN - 1) // PK_ARENA_ALIGN) * PK_ARENA_ALIGN
 
 
+comptime PK_COUNT_ALL: Int = 0
+comptime PK_COUNT_GEMM: Int = 1
+comptime PK_COUNT_OTHER: Int = 2
+
+
 struct PkCount(Movable, ParamVisitor, ParamVisitorRT):
-    """Sums the arena elements of the parameters it visits."""
+    """Sums the arena elements of the parameters it visits: all of them, only
+    the blocks' GEMM weights, or everything but those."""
 
     var elements: Int
+    var which: Int
 
-    def __init__(out self):
+    def __init__(out self, which: Int = PK_COUNT_ALL):
         self.elements = 0
+        self.which = which
 
     def visit_rt[target: StaticString](
         mut self, name: String, mut param: Tensor, mut grad: Tensor,
         mut m: Tensor, mut v: Tensor, n: Int, apply_decay: Bool,
         ctx: Optional[DeviceContext],
     ) raises:
+        var gemm = pk_gemm_slot(name) >= 0
+        if self.which == PK_COUNT_GEMM and not gemm:
+            return
+        if self.which == PK_COUNT_OTHER and gemm:
+            return
         self.elements += _arena_span(n)
 
     def visit[target: StaticString, N: Int](
@@ -132,18 +194,64 @@ struct PkLoad(Movable, ParamVisitor, ParamVisitorRT):
     var arena: Optional[DeviceBuffer[DT]]
     var capacity: Int
     var offset: Int
+    var half_arena: Optional[DeviceBuffer[PK_HALF]]
+    """Set by `begin_half`: the blocks' GEMM weights go there, as float16."""
+    var half_capacity: Int
+    var half_offset: Int
+    var half_out: List[DeviceBuffer[PK_HALF]]
+    """The float16 slices placed since `begin_half`, in slot order."""
 
     def __init__(out self, var ld: LoadTorchNamed[""]):
         self.ld = ld^
         self.arena = None
         self.capacity = 0
         self.offset = 0
+        self.half_arena = None
+        self.half_capacity = 0
+        self.half_offset = 0
+        self.half_out = List[DeviceBuffer[PK_HALF]]()
 
     def begin(mut self, arena: DeviceBuffer[DT], capacity: Int):
         """The arena the next device parameters are sliced from."""
         self.arena = arena
         self.capacity = capacity
         self.offset = 0
+
+    def begin_half(mut self, arena: DeviceBuffer[PK_HALF], capacity: Int):
+        """The float16 arena the next block's GEMM weights are sliced from."""
+        self.half_arena = arena
+        self.half_capacity = capacity
+        self.half_offset = 0
+        self.half_out = List[DeviceBuffer[PK_HALF]]()
+
+    def _place_half(
+        mut self, name: String, mut param: Tensor, n: Int, slot: Int,
+        c: DeviceContext,
+    ) raises:
+        """`param`'s host values, as float16, into the next float16 slice; the
+        fp32 host copy is freed and NO fp32 device copy is made."""
+        if slot != len(self.half_out):
+            raise Error(
+                "parakeet: GEMM weight '" + name + "' arrived as number "
+                + String(len(self.half_out)) + " of its block, its slot is "
+                + String(slot) + " — the walk order and PK_GEMM_* have drifted"
+            )
+        if self.half_offset + _arena_span(n) > self.half_capacity:
+            raise Error("parakeet: '" + name + "' does not fit its float16 arena")
+        var hb = c.enqueue_create_host_buffer[PK_HALF](n)
+        c.synchronize()
+        var limit = Float32(65504.0)
+        for i in range(n):
+            var v = param.data[i]
+            if v > limit or v < -limit:
+                raise Error("parakeet: '" + name + "' has a weight beyond float16's range")
+            hb[i] = v.cast[PK_HALF]()
+        var slice = self.half_arena.value().create_sub_buffer[PK_HALF](self.half_offset, n)
+        c.enqueue_copy(slice, hb)
+        c.synchronize()
+        self.half_out.append(slice)
+        self.half_offset += _arena_span(n)
+        param.data = List[Scalar[DT]]()
 
     def visit_rt[target: StaticString](
         mut self, name: String, mut param: Tensor, mut grad: Tensor,
@@ -156,6 +264,11 @@ struct PkLoad(Movable, ParamVisitor, ParamVisitorRT):
             if len(param.data) < n:
                 # Not filled: unmapped or missing. `report` raises on it.
                 return
+            if self.half_arena:
+                var slot = pk_gemm_slot(name)
+                if slot >= 0:
+                    self._place_half(name, param, n, slot, ctx.value())
+                    return
             if self.offset + _arena_span(n) > self.capacity:
                 raise Error("parakeet: '" + name + "' does not fit the arena sized for its block")
             # ... then into the arena slice, and the host copies go.
@@ -276,8 +389,12 @@ struct PkConformerLayer(Movable):
     var ff2_a: Linear[PK_D, PK_FF]
     var ff2_b: Linear[PK_FF, PK_D]
     var norm_out: LayerNorm[PK_D]
+    var half: List[DeviceBuffer[PK_HALF]]
+    """Half-precision load only: the block's eleven GEMM weights as float16
+    device buffers, indexed by `PK_GEMM_*` (their `Linear` leaves are empty)."""
 
     def __init__(out self):
+        self.half = List[DeviceBuffer[PK_HALF]]()
         self.norm_ff1 = LayerNorm[PK_D]()
         self.ff1_a = Linear[PK_D, PK_FF]()
         self.ff1_b = Linear[PK_FF, PK_D]()
@@ -392,9 +509,12 @@ struct ParakeetTDT(ParamWalkable):
     var joint: Linear[PK_DEC, PK_JOINT]
     var arenas: List[DeviceBuffer[DT]]
     """Device only: the buffers the encoder's parameters are slices of."""
+    var half_arenas: List[DeviceBuffer[PK_HALF]]
+    """Half-precision load only: one float16 arena per block."""
 
     def __init__(out self):
         self.arenas = List[DeviceBuffer[DT]]()
+        self.half_arenas = List[DeviceBuffer[PK_HALF]]()
         self.sub = PkSubsampling()
         self.layers = List[PkConformerLayer]()
         self.enc_proj = Linear[PK_D, PK_DEC]()
@@ -482,7 +602,7 @@ struct ParakeetTDT(ParamWalkable):
         self.dec_proj.zero_grad[target](ctx)
         self.joint.zero_grad[target](ctx)
 
-    def load[target: StaticString](
+    def load[target: StaticString, WEIGHTS: StaticString = "fp32"](
         mut self, path: String, ctx: Optional[DeviceContext] = None
     ) raises:
         """Fill every parameter and running statistic from the published
@@ -493,6 +613,12 @@ struct ParakeetTDT(ParamWalkable):
         - every fp32 tensor of the file was read: the only tensors left
           unclaimed are the 24 `num_batches_tracked` counters.
         """
+        comptime assert WEIGHTS == "fp32" or WEIGHTS == "fp16", (
+            "ParakeetTDT.load: WEIGHTS is 'fp32' or 'fp16'"
+        )
+        comptime assert WEIGHTS == "fp32" or target == "gpu", (
+            "ParakeetTDT.load: half-precision weights are a device form"
+        )
         var w = PkLoad(LoadTorchNamed[""](SafeTensors(path), parakeet_name_map()))
         comptime if target == "gpu":
             var c = ctx.value()
@@ -508,14 +634,31 @@ struct ParakeetTDT(ParamWalkable):
             self.arenas.append(a0)
             for i in range(len(self.layers)):
                 var name = String("layers." + String(i))
-                var ci = PkCount()
+                # In half precision the GEMM weights are counted, and placed,
+                # in the block's float16 arena and nowhere else.
+                var ci = PkCount(PK_COUNT_OTHER if WEIGHTS == "fp16" else PK_COUNT_ALL)
                 self.layers[i].walk["cpu"](ci, None, name)
                 self.layers[i].walk_state["cpu"](ci, None, name)
                 var ai = c.enqueue_create_buffer[DT](ci.elements)
                 ai.enqueue_fill(0.0)
                 w.begin(ai, ci.elements)
+                comptime if WEIGHTS == "fp16":
+                    var ch = PkCount(PK_COUNT_GEMM)
+                    self.layers[i].walk["cpu"](ch, None, name)
+                    var ah = c.enqueue_create_buffer[PK_HALF](ch.elements)
+                    ah.enqueue_fill(0.0)
+                    w.begin_half(ah, ch.elements)
+                    self.half_arenas.append(ah)
                 self.layers[i].walk[target](w, ctx, name)
                 self.layers[i].walk_state[target](w, ctx, name)
+                comptime if WEIGHTS == "fp16":
+                    if len(w.half_out) != PK_GEMM_SLOTS:
+                        raise Error(
+                            "parakeet: block " + String(i) + " placed "
+                            + String(len(w.half_out)) + " float16 weights, expected "
+                            + String(PK_GEMM_SLOTS)
+                        )
+                    self.layers[i].half = w.half_out.copy()
                 self.arenas.append(ai)
             # The prediction network and the joint: one more arena.
             var cd = PkCount()

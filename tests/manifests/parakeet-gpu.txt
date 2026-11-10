@@ -23,6 +23,22 @@ tests/audio/test_parakeet_gpu.mojo
 # sm_87`), and run the binary with JetPack's cuBLAS first on the loader path
 # (`LD_LIBRARY_PATH=/usr/local/cuda/lib64:$LD_LIBRARY_PATH`).
 
+# HALF-PRECISION WEIGHTS (NVIDIA): `-D PK_FP16=1` builds the form that stores the
+# blocks' GEMM weights as float16. Its stage gate reads a reference dumped with
+# the SAME weights rounded (not the float32 one: the rounding alone moves the
+# encoder output by up to 1e-2):
+#
+#   for c in "fr_10 0 fr_10" "fr_10 8 fr_10_pad8" "en_16 0 en_16"; do set -- $c
+#     pixi run -e detect python tools/parakeet/dump_parakeet_reference.py --weights float16 \
+#       --wav ~/.cache/noeira/parakeet/clips/$1.wav --pad-s $2 \
+#       --out ~/.cache/noeira/parakeet/ref16/$3
+#   done
+#   mojo build -D PK_FP16=1 ... tests/audio/test_parakeet_gpu.mojo                  (stages, vs ref16)
+#   mojo build -D PK_GPU=1 -D PK_FP16=1 ... tests/audio/test_parakeet_transcripts.mojo   (vs the fp32 transcripts)
+#
+# `tools/parakeet/weight_precision_check.py` is the torch-side experiment that
+# chose float16 over bfloat16 (0 against 1 of 36 transcripts changed).
+
 # The transcript gate with the encoder on the device is a BUILD-time variant of
 # the CPU one (the target is a comptime parameter; `mojo run -D` can be stale):
 #

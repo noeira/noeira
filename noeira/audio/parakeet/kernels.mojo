@@ -348,3 +348,15 @@ def joint_kernel[T: Int, H: Int, OUT: Int](
         if z > Scalar[DT](0):
             acc += z * rebind[Scalar[DT]](w[i, j])
     logits[j] = acc
+
+
+# ── half-precision weights: the activation side of a GEMM ──────────────────
+
+
+def cast_half_kernel[N: Int](src: Tile[DT, N], dst: Tile[DType.float16, N]):
+    """`dst = float16(src)`: a GEMM whose weights are stored in half precision
+    takes its other operand in half precision too."""
+    var i = Int(global_idx.x)
+    if i >= N:
+        return
+    dst[i] = rebind[Scalar[DT]](src[i]).cast[DType.float16]()

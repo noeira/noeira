@@ -30,18 +30,47 @@ part. `--compare-pad a,b,c` prints, for each padded length, the largest
 difference on the valid frames against the unpadded run, whether the token trace
 is the same, and the encoder time.
 
+`--weights float16` rounds the encoder blocks' GEMM weights (`GEMM_WEIGHTS`:
+the two feed-forwards, the five attention projections, the two pointwise
+convolutions — 264 tensors, 96 % of the parameters) to that precision and back
+to float32 before running, everything else untouched. That is the reference of
+the port's half-precision build (`ParakeetSTT[..., WEIGHTS="fp16"]`), which
+stores exactly those weights as float16: gated against the float32 reference
+it would be "wrong" by the rounding itself (1e-2 on the encoder output), and a
+bound that loose would pass real defects.
+
 `ParakeetFeatureExtractor` takes its mel filterbank from `librosa`, which is why
 the `detect` environment lists it (pixi.toml).
 """
 
 import argparse
 import os
+import re
 import time
 import wave
 
 import numpy as np
 
 MODEL = "nvidia/parakeet-tdt-0.6b-v3"
+GEMM_WEIGHTS = re.compile(
+    r"^encoder\.layers\.\d+\.(feed_forward[12]\.linear[12]|self_attn\.(q|k|v|o|relative_k)_proj"
+    r"|conv\.pointwise_conv[12])\.weight$"
+)
+"""The weights the port's half-precision build stores as float16 (its
+`pk_gemm_slot`): keep the two lists the same."""
+
+
+def round_gemm_weights(model, precision, torch):
+    """Round the blocks' GEMM weights to `precision` and back, in place.
+    Returns the tensors' names."""
+    sd = model.state_dict()
+    names = [k for k in sd if GEMM_WEIGHTS.match(k)]
+    if len(names) != 11 * model.config.encoder_config.num_hidden_layers:
+        raise SystemExit(f"expected 11 GEMM weights per block, matched {len(names)}")
+    dt = getattr(torch, precision)
+    for k in names:
+        sd[k].copy_(sd[k].to(dt).to(torch.float32))
+    return names
 
 
 def read_wav(path):
@@ -89,6 +118,8 @@ def main():
     ap.add_argument("--out", default=None)
     ap.add_argument("--pad-s", type=float, default=0.0)
     ap.add_argument("--compare-pad", default=None, help="comma list of padded lengths in seconds")
+    ap.add_argument("--weights", default="float32", choices=["float32", "float16", "bfloat16"],
+                    help="precision the blocks' GEMM weights are rounded to")
     args = ap.parse_args()
 
     import torch
@@ -97,6 +128,9 @@ def main():
     torch.set_grad_enabled(False)
     proc = AutoProcessor.from_pretrained(MODEL)
     model = ParakeetForTDT.from_pretrained(MODEL, dtype=torch.float32).eval()
+    if args.weights != "float32":
+        n = len(round_gemm_weights(model, args.weights, torch))
+        print(f"{n} GEMM weight tensors rounded to {args.weights}")
     audio = read_wav(args.wav)
 
     if args.compare_pad:

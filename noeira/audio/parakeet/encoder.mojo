@@ -72,6 +72,15 @@ nothing: its GEMM time at these sizes is the streaming of the weights, not
 the rows (35.3 ms at 51 rows, 37.3 ms at 101; `stt.mojo`). Rows beyond the
 valid length hold whatever an earlier clip left: finite, and never read.
 
+## Half-precision weights (`WEIGHTS = "fp16"`, NVIDIA)
+
+The blocks' GEMMs then read their weight from the block's float16 buffers
+(`weights.mojo`) and go through cuBLASLt with float16 operands and a float32
+result: the activation operand is cast into the workspace's `x16` first (one
+small kernel; `q`, `k`, `v` share one cast of the same input), the output and
+everything around the GEMM stay fp32. The subsampling and the encoder
+projection keep their fp32 `Linear`s (4 % of the weights).
+
 `tests/audio/test_parakeet_reference.mojo` gates every stage on the CPU and
 `tests/audio/test_parakeet_gpu.mojo` on the device.
 """
@@ -84,6 +93,9 @@ from linalg.matmul import matmul as max_matmul
 
 from noeira.nn.constants import DT, TPB
 from noeira.nn.core.cpu_gemm import gemm_cpu
+from noeira.nn.core.cublaslt_gemm import cublaslt_gemm, EPI_NONE
+from noeira.nn.core.tensor import TensorImpl
+from max.gpu.host import DeviceBuffer
 from noeira.nn.primitives.layer_norm import (
     LayerNorm, _layer_norm_forward_kernel, LN_TPB, LN_EPS,
 )
@@ -97,9 +109,13 @@ from .config import (
 from .kernels import (
     conv3x3_s2_first_kernel, dw3x3_s2_kernel, relu_rows_kernel,
     flatten_tfc_kernel, silu_kernel, add_scaled_kernel, rel_scores_kernel,
-    rel_apply_kernel, glu_rows_kernel, dw1d_bn_silu_kernel,
+    rel_apply_kernel, glu_rows_kernel, dw1d_bn_silu_kernel, cast_half_kernel,
 )
-from .weights import ParakeetTDT, PkConformerLayer
+from .weights import (
+    ParakeetTDT, PkConformerLayer, PK_HALF, PK_GEMM_FF1_A, PK_GEMM_FF1_B,
+    PK_GEMM_Q, PK_GEMM_K, PK_GEMM_V, PK_GEMM_O, PK_GEMM_REL_K, PK_GEMM_PW1,
+    PK_GEMM_PW2, PK_GEMM_FF2_A, PK_GEMM_FF2_B,
+)
 
 
 def pk_pos_table(t: Int) -> List[Float32]:
@@ -160,6 +176,9 @@ struct PkEncoderWork[F_MAX: Int](Movable):
     """CPU: one query's `[T]` logits."""
     var scores_dev: Tensor
     """Device: all the logits, `[HEADS, T, T]`."""
+    var x16: TensorImpl[PK_HALF]
+    """Device, half-precision weights only: a GEMM's activation operand as
+    float16 (`[T, 4096]`, which also holds the `[2T - 1, 1024]` positions)."""
 
     def __init__(out self):
         """The CPU workspace (`make["cpu"]`)."""
@@ -193,9 +212,10 @@ struct PkEncoderWork[F_MAX: Int](Movable):
         self.proj = Tensor.alloc(Self.T * PK_DEC)
         self.scores = List[Float32](length=Self.T, fill=0.0)
         self.scores_dev = Tensor()
+        self.x16 = TensorImpl[PK_HALF]()
 
     @staticmethod
-    def make[target: StaticString](
+    def make[target: StaticString, WEIGHTS: StaticString = "fp32"](
         ctx: Optional[DeviceContext] = None
     ) raises -> Self:
         """The workspace on `target`. On a device every buffer also exists
@@ -227,6 +247,8 @@ struct PkEncoderWork[F_MAX: Int](Movable):
             w.proj.ensure_gpu(c, Self.T * PK_DEC)
             w.scores_dev = Tensor.alloc_gpu(c, PK_HEADS * Self.T * Self.T)
             w.pos.upload_resident(c)
+            comptime if WEIGHTS == "fp16":
+                w.x16 = TensorImpl[PK_HALF].alloc_gpu(c, Self.T * PK_FF)
         return w^
 
 
@@ -591,7 +613,32 @@ def _gemm_any[target: StaticString, B: Int, IN: Int, OUT: Int](
         lin.forward[target, B](TensorRefs[1](x), dst, ctx)
 
 
-def pk_prepare_positions[F_MAX: Int, target: StaticString = "cpu"](
+def _gemm_half[B: Int, IN: Int, OUT: Int](
+    w16: DeviceBuffer[PK_HALF], mut x: Tensor, mut x16: TensorImpl[PK_HALF],
+    mut dst: Tensor, rows: Int, c: DeviceContext, cast: Bool = True,
+) raises:
+    """`dst[B, OUT] (fp32) = float16(x[B, IN]) @ w16[IN, OUT]`, the weight
+    stored in half precision. `cast = False` reuses `x16` as the previous call
+    left it (the same `x`). The cast covers the `rows` valid rows; the GEMM
+    runs the compiled `B` rows (cuBLASLt plans are per shape)."""
+    comptime assert default_accelerator().is_nvidia_gpu(), (
+        "half-precision weights run through cuBLASLt: NVIDIA only"
+    )
+    comptime N = B * IN
+    if cast:
+        c.enqueue_function[cast_half_kernel[N]](
+            x.tt["gpu", N](), x16.tt["gpu", N](),
+            grid_dim=(rows * IN + TPB - 1) // TPB, block_dim=TPB,
+        )
+    dst.ensure_gpu(c, B * OUT)
+    cublaslt_gemm[False, False, PK_HALF, DT](
+        c, dst.dev.value(), x16.dev.value(), w16, B, OUT, IN, EPI_NONE,
+    )
+
+
+def pk_prepare_positions[
+    F_MAX: Int, target: StaticString = "cpu", WEIGHTS: StaticString = "fp32"
+](
     mut m: ParakeetTDT, mut ws: PkEncoderWork[F_MAX],
     ctx: Optional[DeviceContext] = None,
 ) raises:
@@ -600,7 +647,15 @@ def pk_prepare_positions[F_MAX: Int, target: StaticString = "cpu"](
     comptime P = PkEncoderWork[F_MAX].P
     comptime N = P * PK_D
     for layer in range(PK_LAYERS):
-        _gemm_any[target, P, PK_D, PK_D](m.layers[layer].rel_k, ws.pos, ws.relk, P, ctx)
+        comptime if WEIGHTS == "fp16":
+            _gemm_half[P, PK_D, PK_D](
+                m.layers[layer].half[PK_GEMM_REL_K], ws.pos, ws.x16, ws.relk,
+                P, ctx.value(),
+            )
+        else:
+            _gemm_any[target, P, PK_D, PK_D](
+                m.layers[layer].rel_k, ws.pos, ws.relk, P, ctx
+            )
         comptime if target == "cpu":
             for i in range(N):
                 ws.relk_all.data[layer * N + i] = ws.relk.data[i]
@@ -610,7 +665,7 @@ def pk_prepare_positions[F_MAX: Int, target: StaticString = "cpu"](
     ws.relk_ready = True
 
 
-def _block[F_MAX: Int, target: StaticString](
+def _block[F_MAX: Int, target: StaticString, WEIGHTS: StaticString](
     mut l: PkConformerLayer, mut ws: PkEncoderWork[F_MAX], layer: Int,
     valid: Int, ctx: Optional[DeviceContext],
 ) raises:
@@ -621,16 +676,31 @@ def _block[F_MAX: Int, target: StaticString](
 
     # 1. first feed-forward, half-weighted
     _ln_any[target, T](l.norm_ff1, ws.x, ws.h, ws.ln_xhat, ws.ln_inv, valid, ctx)
-    _gemm_any[target, T, D, PK_FF](l.ff1_a, ws.h, ws.ff, valid, ctx)
+    comptime if WEIGHTS == "fp16":
+        _gemm_half[T, D, PK_FF](l.half[PK_GEMM_FF1_A], ws.h, ws.x16, ws.ff, valid, ctx.value())
+    else:
+        _gemm_any[target, T, D, PK_FF](l.ff1_a, ws.h, ws.ff, valid, ctx)
     _silu_any[target, T * PK_FF](ws.ff, valid * PK_FF, ctx)
-    _gemm_any[target, T, PK_FF, D](l.ff1_b, ws.ff, ws.y, valid, ctx)
+    comptime if WEIGHTS == "fp16":
+        _gemm_half[T, PK_FF, D](l.half[PK_GEMM_FF1_B], ws.ff, ws.x16, ws.y, valid, ctx.value())
+    else:
+        _gemm_any[target, T, PK_FF, D](l.ff1_b, ws.ff, ws.y, valid, ctx)
     _add_scaled_any[target, N](ws.x, ws.y, 0.5, valid * D, ctx)
 
     # 2. relative-position self-attention
     _ln_any[target, T](l.norm_att, ws.x, ws.h, ws.ln_xhat, ws.ln_inv, valid, ctx)
-    _gemm_any[target, T, D, D](l.q, ws.h, ws.q, valid, ctx)
-    _gemm_any[target, T, D, D](l.k, ws.h, ws.k, valid, ctx)
-    _gemm_any[target, T, D, D](l.v, ws.h, ws.v, valid, ctx)
+    comptime if WEIGHTS == "fp16":
+        _gemm_half[T, D, D](l.half[PK_GEMM_Q], ws.h, ws.x16, ws.q, valid, ctx.value())
+    else:
+        _gemm_any[target, T, D, D](l.q, ws.h, ws.q, valid, ctx)
+    comptime if WEIGHTS == "fp16":
+        _gemm_half[T, D, D](l.half[PK_GEMM_K], ws.h, ws.x16, ws.k, valid, ctx.value(), False)
+    else:
+        _gemm_any[target, T, D, D](l.k, ws.h, ws.k, valid, ctx)
+    comptime if WEIGHTS == "fp16":
+        _gemm_half[T, D, D](l.half[PK_GEMM_V], ws.h, ws.x16, ws.v, valid, ctx.value(), False)
+    else:
+        _gemm_any[target, T, D, D](l.v, ws.h, ws.v, valid, ctx)
     comptime if target == "cpu":
         _rel_attention(
             ws.q, ws.k, ws.v, ws.relk_all, l.bias_u.val, l.bias_v.val,
@@ -657,12 +727,18 @@ def _block[F_MAX: Int, target: StaticString](
             Int64(valid),
             grid_dim=(N + TPB - 1) // TPB, block_dim=TPB,
         )
-    _gemm_any[target, T, D, D](l.o, ws.att, ws.y, valid, ctx)
+    comptime if WEIGHTS == "fp16":
+        _gemm_half[T, D, D](l.half[PK_GEMM_O], ws.att, ws.x16, ws.y, valid, ctx.value())
+    else:
+        _gemm_any[target, T, D, D](l.o, ws.att, ws.y, valid, ctx)
     _add_scaled_any[target, N](ws.x, ws.y, 1.0, valid * D, ctx)
 
     # 3. convolution module
     _ln_any[target, T](l.norm_conv, ws.x, ws.h, ws.ln_xhat, ws.ln_inv, valid, ctx)
-    _gemm_any[target, T, D, 2 * D](l.pw1, ws.h, ws.glu, valid, ctx)
+    comptime if WEIGHTS == "fp16":
+        _gemm_half[T, D, 2 * D](l.half[PK_GEMM_PW1], ws.h, ws.x16, ws.glu, valid, ctx.value())
+    else:
+        _gemm_any[target, T, D, 2 * D](l.pw1, ws.h, ws.glu, valid, ctx)
     comptime if target == "cpu":
         _glu_rows(ws.glu, ws.h, valid, T)
         _dw1d_bn_silu(
@@ -688,14 +764,23 @@ def _block[F_MAX: Int, target: StaticString](
             Int64(valid),
             grid_dim=(N + TPB - 1) // TPB, block_dim=TPB,
         )
-    _gemm_any[target, T, D, D](l.pw2, ws.conv, ws.y, valid, ctx)
+    comptime if WEIGHTS == "fp16":
+        _gemm_half[T, D, D](l.half[PK_GEMM_PW2], ws.conv, ws.x16, ws.y, valid, ctx.value())
+    else:
+        _gemm_any[target, T, D, D](l.pw2, ws.conv, ws.y, valid, ctx)
     _add_scaled_any[target, N](ws.x, ws.y, 1.0, valid * D, ctx)
 
     # 4. second feed-forward, half-weighted
     _ln_any[target, T](l.norm_ff2, ws.x, ws.h, ws.ln_xhat, ws.ln_inv, valid, ctx)
-    _gemm_any[target, T, D, PK_FF](l.ff2_a, ws.h, ws.ff, valid, ctx)
+    comptime if WEIGHTS == "fp16":
+        _gemm_half[T, D, PK_FF](l.half[PK_GEMM_FF2_A], ws.h, ws.x16, ws.ff, valid, ctx.value())
+    else:
+        _gemm_any[target, T, D, PK_FF](l.ff2_a, ws.h, ws.ff, valid, ctx)
     _silu_any[target, T * PK_FF](ws.ff, valid * PK_FF, ctx)
-    _gemm_any[target, T, PK_FF, D](l.ff2_b, ws.ff, ws.y, valid, ctx)
+    comptime if WEIGHTS == "fp16":
+        _gemm_half[T, PK_FF, D](l.half[PK_GEMM_FF2_B], ws.ff, ws.x16, ws.y, valid, ctx.value())
+    else:
+        _gemm_any[target, T, PK_FF, D](l.ff2_b, ws.ff, ws.y, valid, ctx)
     _add_scaled_any[target, N](ws.x, ws.y, 0.5, valid * D, ctx)
 
     # 5. output norm, back into `x`
@@ -710,17 +795,21 @@ def _block[F_MAX: Int, target: StaticString](
         ws.x.dev = hd
 
 
-def pk_block[F_MAX: Int, target: StaticString = "cpu"](
+def pk_block[
+    F_MAX: Int, target: StaticString = "cpu", WEIGHTS: StaticString = "fp32"
+](
     mut m: ParakeetTDT, mut ws: PkEncoderWork[F_MAX], layer: Int, valid: Int,
     ctx: Optional[DeviceContext] = None,
 ) raises:
     """Apply conformer block `layer` to `ws.x` in place (`valid` of `T` frames)."""
     if not ws.relk_ready:
-        pk_prepare_positions[F_MAX, target](m, ws, ctx)
-    _block[F_MAX, target](m.layers[layer], ws, layer, valid, ctx)
+        pk_prepare_positions[F_MAX, target, WEIGHTS](m, ws, ctx)
+    _block[F_MAX, target, WEIGHTS](m.layers[layer], ws, layer, valid, ctx)
 
 
-def pk_encode[F_MAX: Int, target: StaticString = "cpu"](
+def pk_encode[
+    F_MAX: Int, target: StaticString = "cpu", WEIGHTS: StaticString = "fp32"
+](
     mut m: ParakeetTDT, mut ws: PkEncoderWork[F_MAX], n_mel: Int,
     ctx: Optional[DeviceContext] = None,
 ) raises -> Int:
@@ -729,9 +818,9 @@ def pk_encode[F_MAX: Int, target: StaticString = "cpu"](
     valid frames."""
     comptime T = PkEncoderWork[F_MAX].T
     if not ws.relk_ready:
-        pk_prepare_positions[F_MAX, target](m, ws, ctx)
+        pk_prepare_positions[F_MAX, target, WEIGHTS](m, ws, ctx)
     var valid = pk_subsample[F_MAX, target](m, ws, n_mel, ctx)
     for layer in range(PK_LAYERS):
-        _block[F_MAX, target](m.layers[layer], ws, layer, valid, ctx)
+        _block[F_MAX, target, WEIGHTS](m.layers[layer], ws, layer, valid, ctx)
     m.enc_proj.forward[target, T](TensorRefs[1](ws.x), ws.proj, ctx)
     return valid
