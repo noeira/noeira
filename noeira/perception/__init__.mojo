@@ -19,6 +19,11 @@ buying it, so nothing here is written for one sensor or one robot:
                     or localisation in a frozen prior map
   places.mojo       `PlaceMap` (labelled returns per object), oriented
                     footprints, approach points that face into the room
+  detector.mojo     NOT re-exported here (it pulls SAM 3 and the GPU in):
+                    `Sam3Service` (words -> masks on the camera's RGB, in this
+                    process on its own thread), `mask_place`, and
+                    `detections_endpoints_world` (registered depth -> the
+                    labelled returns `PlaceMap.add_scan` takes) — P3 step 2
   occupancy.mojo    `VoxelMap`: a log-odds voxel band from scans / depth images,
                     projected to the 2D obstacle cells `nav2d.NavGrid` takes
   lidar_scan.mojo   the scan itself over `Model`/`Data`: `lidar_scan_cpu` and
