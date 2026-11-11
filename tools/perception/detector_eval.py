@@ -425,6 +425,32 @@ class Precomputed:
         return dets
 
 
+class RfDetrFt:
+    """A FINE-TUNED RF-DETR-Seg-Small (`--detectors rfdetr-ft:<checkpoint>`,
+    `finetune_rfdetr.py`): its own classes, named in the checkpoint; a word
+    scores the detections of the class of the same name."""
+
+    def __init__(self, dev, path=""):
+        import rfdetr
+        p = os.path.expanduser(path)
+        self.name = "rfdetr-ft-" + os.path.basename(os.path.dirname(p))
+        rd = os.environ.get("RFDETR_DEVICE")
+        self.m = rfdetr.RFDETRSegSmall(pretrain_weights=p, **({"device": rd} if rd else {}))
+        names = self.m.class_names
+        self.names = dict(enumerate(names)) if isinstance(names, (list, tuple)) else dict(names)
+
+    def __call__(self, img, words):
+        d = self.m.predict(Image.fromarray(img), threshold=0.01)
+        dets = []
+        for k in range(len(d.xyxy)):
+            w = self.names.get(int(d.class_id[k]), "")
+            if w not in words:
+                continue
+            mk = d.mask[k].astype(bool) if d.mask is not None else None
+            dets.append((w, float(d.confidence[k]), d.xyxy[k].astype(np.float64), mk))
+        return dets
+
+
 def box_centre_mask(box, shape):
     """The central half of a box (each side shrunk by a quarter of its extent)."""
     x0, y0, x1, y1 = box
@@ -500,8 +526,14 @@ def main():
     for z in "nsm":
         table[f"yolo26{z}"] = partial(Yolo26, size=z)
         table[f"rfdetr-seg-{z}"] = partial(RfDetrSeg, size=z)
-    chosen = [partial(Precomputed, path=d.split(":", 1)[1]) if d.startswith("precomputed:") else table[d.strip()]
-              for d in a.detectors.split(",")]
+    def _pick(d):
+        if d.startswith("precomputed:"):
+            return partial(Precomputed, path=d.split(":", 1)[1])
+        if d.startswith("rfdetr-ft:"):
+            return partial(RfDetrFt, path=d.split(":", 1)[1])
+        return table[d.strip()]
+
+    chosen = [_pick(d) for d in a.detectors.split(",")]
     sam = Sam(dev) if any(D in (Owl, GDino, OmDet) for D in chosen) else None
     report = {"images": len(idx), "present_counts": counts, "selection_seed": a.seed, "detectors": {}}
     for Det in chosen:
