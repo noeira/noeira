@@ -22,6 +22,7 @@ from noeira.io.json import parse_json
 from noeira.llm.d1 import D1, parse_questions, pack_rows, readout_ids
 from noeira.llm.d1.prompt import prefix_text, suffix_text, py_json_dumps
 from noeira.llm.lfm3.train import LoraAdamW, train_step
+from noeira.llm.lfm3.model import LF_BF16
 
 
 comptime STATE = """{"robot": {"at": "door", "facing": "kitchen", "doing": "standing"}, "places": {"fridge": "3.1 m ahead, slightly left", "door": "here", "table": "2.0 m to the right", "sofa": "4.5 m behind"}, "heard": "Can you go to the fridge and wait there?", "recently": ["walked to the door", "heard: hello robot"]}"""
@@ -93,7 +94,7 @@ def main() raises:
         last = loss
         print("    step", step, "loss", loss)
     d1.lm.ctx.synchronize()
-    print("  ", STEPS, "steps in", (perf_counter_ns() - t0) // 1_000_000, "ms (fp32,", len(rows[0].ids), "tokens)")
+    print("  ", STEPS, "steps in", (perf_counter_ns() - t0) // 1_000_000, "ms (" + ("LFM3_BF16" if LF_BF16 else "fp32") + ",", len(rows[0].ids), "tokens)")
     var tuned = answers(d1)
     print("  tuned: destination", tuned[0], "(", tuned[2], "), P(yes)", tuned[1], ", urgency level", tuned[3])
     check(fails, last < 0.25 * first, String("the loss fell: ") + String(first) + " -> " + String(last))

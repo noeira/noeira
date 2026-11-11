@@ -24,6 +24,7 @@ comptime TPB: Int = 256
 comptime Ptr = Pointer[Scalar[DT], MutAnyOrigin]
 comptime HPtr = Pointer[Scalar[DType.uint16], MutAnyOrigin]
 comptime IPtr = Pointer[Scalar[DType.int32], MutAnyOrigin]
+comptime BPtr = Pointer[Scalar[DType.bfloat16], MutAnyOrigin]
 comptime NEG_INF: Float32 = -3.0e38
 
 
@@ -78,6 +79,28 @@ def rms_kernel(x: Ptr, y: Ptr, w: HPtr, dim_n: Int64, eps: Float32):
         d += TPB
 
 
+def rms_bf16_kernel(x: Ptr, y: Ptr, yb: BPtr, w: HPtr, dim_n: Int64, eps: Float32):
+    """`rms_kernel`, and `y` rounded to bf16 into `yb` as well (the operand of
+    the tensor-core GEMMs that read it: one rounding pass fewer)."""
+    var dim = Int(dim_n)
+    var row = Int(block_idx.x) * dim
+    var tid = Int(thread_idx.x)
+    var s = Scalar[DT](0)
+    var d = tid
+    while d < dim:
+        var v = x[unsafe_offset=row + d]
+        s += v * v
+        d += TPB
+    var tot = block.sum[block_size=TPB, broadcast=True](val=s)
+    var inv = Scalar[DT](1) / sqrt(tot / Scalar[DT](dim) + Scalar[DT](eps))
+    d = tid
+    while d < dim:
+        var o = _bf(w[unsafe_offset=d]) * (x[unsafe_offset=row + d] * inv)
+        y[unsafe_offset=row + d] = o
+        yb[unsafe_offset=row + d] = o.cast[DType.bfloat16]()
+        d += TPB
+
+
 def add_kernel(dst: Ptr, src: Ptr, n_n: Int64):
     var i = Int(global_idx.x)
     if i < Int(n_n):
@@ -122,14 +145,26 @@ def rope_kernel(x: Ptr, cos_t: Ptr, sin_t: Ptr, heads_n: Int64, half_n: Int64):
     x[unsafe_offset=base + half + i] = b * c + a * s
 
 
+@always_inline
+def _sees(i: Int, j: Int, mode: Int, state: Int, window: Int, groups: IPtr) -> Bool:
+    """May token `i` attend to token `j`? Mode 0 (`set`, full attention):
+    `i < state or j < state or group[i] == group[j]`; mode 1 (sliding):
+    `i - window < j <= i`; mode 2: causal. The ONE place the masks are written."""
+    if mode == 0:
+        return i < state or j < state or groups[unsafe_offset=i] == groups[unsafe_offset=j]
+    if mode == 1:
+        return j <= i and j > i - window
+    return j <= i
+
+
 def scores_kernel(
     q: Ptr, k: Ptr, sc: Ptr, groups: IPtr, t_n: Int64, heads_n: Int64, kv_heads_n: Int64,
     hd_n: Int64, scale: Float32, mode_n: Int64, state_n: Int64, window_n: Int64,
 ):
     """`sc[h, i, j] = q[i, h] . k[j, h / rep] * scale`, or NEG_INF where `i` may
-    not see `j`. Mode 0 (`set`, full attention): `i < state or j < state or
-    group[i] == group[j]`; mode 1 (sliding): `i - window < j <= i`; mode 2:
-    causal. Grid `(ceil(T / TPB), T, heads)`."""
+    not see `j` (`_sees`). A dot product per thread: the path off NVIDIA (on
+    NVIDIA the scores are GEMMs, then `masked_softmax_kernel`).
+    Grid `(ceil(T / TPB), T, heads)`."""
     var t = Int(t_n)
     var j = Int(block_idx.x) * TPB + Int(thread_idx.x)
     var i = Int(block_idx.y)
@@ -138,15 +173,7 @@ def scores_kernel(
         return
     var heads = Int(heads_n)
     var hd = Int(hd_n)
-    var mode = Int(mode_n)
-    var sees: Bool
-    if mode == 0:
-        var s = Int(state_n)
-        sees = i < s or j < s or groups[unsafe_offset=i] == groups[unsafe_offset=j]
-    elif mode == 1:
-        sees = j <= i and j > i - Int(window_n)
-    else:
-        sees = j <= i
+    var sees = _sees(i, j, Int(mode_n), Int(state_n), Int(window_n), groups)
     var out = h * t * t + i * t + j
     if not sees:
         sc[unsafe_offset=out] = Scalar[DT](NEG_INF)
@@ -187,6 +214,104 @@ def softmax_rows_kernel(sc: Ptr, t_n: Int64):
         j += TPB
 
 
+def split_heads_kernel(src: Ptr, dst: Ptr, t_n: Int64, heads_n: Int64, hd_n: Int64):
+    """`dst[h, t, d] = src[t, h, d]`: heads-major, so that the heads sharing a
+    KV head are ONE contiguous `[rep T, hd]` GEMM operand.
+    Grid `(ceil(heads hd / TPB), T)`."""
+    var heads = Int(heads_n)
+    var hd = Int(hd_n)
+    var col = Int(block_idx.x) * TPB + Int(thread_idx.x)
+    var t = Int(block_idx.y)
+    if col >= heads * hd:
+        return
+    var h = _div(col, hd)
+    var d = col - h * hd
+    dst[unsafe_offset=(h * Int(t_n) + t) * hd + d] = src[unsafe_offset=t * heads * hd + col]
+
+
+comptime SM_CACHE: Int = 8
+"""Scores per thread `masked_softmax_kernel` keeps in registers: rows up to
+TPB * SM_CACHE = 2048 keys take one pass, longer ones three."""
+
+
+def masked_softmax_kernel(
+    sc: Ptr, groups: IPtr, t_n: Int64, scale: Float32, mode_n: Int64, state_n: Int64, window_n: Int64,
+):
+    """Row `(h, i)` of the raw scores `sc[h, i, :] = q . k` to the attention
+    probabilities in place: `softmax_j(scale sc)` over the `j` that `i` sees
+    (`_sees`), 0 elsewhere — what `scores_kernel` + `softmax_rows_kernel`
+    leave. A block per row; grid `(T, heads)`."""
+    var t = Int(t_n)
+    var i = Int(block_idx.x)
+    var h = Int(block_idx.y)
+    var row = (h * t + i) * t
+    var tid = Int(thread_idx.x)
+    var mode = Int(mode_n)
+    var state = Int(state_n)
+    var window = Int(window_n)
+    var m = Scalar[DT](NEG_INF)
+    if t <= TPB * SM_CACHE:
+        # the row in registers: one read and one write of it, not three of each
+        var vals = SIMD[DT, SM_CACHE](NEG_INF)
+        comptime for c in range(SM_CACHE):
+            var jc = tid + c * TPB
+            if jc < t and _sees(i, jc, mode, state, window, groups):
+                vals[c] = sc[unsafe_offset=row + jc] * Scalar[DT](scale)
+                m = max(m, vals[c])
+        var top_r = block.max[block_size=TPB, broadcast=True](val=m)
+        var s_r = Scalar[DT](0)
+        comptime for c in range(SM_CACHE):
+            var e = exp(vals[c] - top_r) if vals[c] > Scalar[DT](NEG_INF) else Scalar[DT](0)
+            vals[c] = e
+            s_r += e
+        var inv_r = Scalar[DT](1) / block.sum[block_size=TPB, broadcast=True](val=s_r)
+        comptime for c in range(SM_CACHE):
+            var jc = tid + c * TPB
+            if jc < t:
+                sc[unsafe_offset=row + jc] = vals[c] * inv_r
+        return
+    var j = tid
+    while j < t:
+        var v = Scalar[DT](NEG_INF)
+        if _sees(i, j, mode, state, window, groups):
+            v = sc[unsafe_offset=row + j] * Scalar[DT](scale)
+        sc[unsafe_offset=row + j] = v
+        m = max(m, v)
+        j += TPB
+    var top = block.max[block_size=TPB, broadcast=True](val=m)
+    var s = Scalar[DT](0)
+    j = tid
+    while j < t:
+        var v = sc[unsafe_offset=row + j]
+        var e = exp(v - top) if v > Scalar[DT](NEG_INF) else Scalar[DT](0)
+        sc[unsafe_offset=row + j] = e
+        s += e
+        j += TPB
+    var tot = block.sum[block_size=TPB, broadcast=True](val=s)
+    var inv = Scalar[DT](1) / tot
+    j = tid
+    while j < t:
+        sc[unsafe_offset=row + j] = sc[unsafe_offset=row + j] * inv
+        j += TPB
+
+
+def merge_heads_gate_kernel(oh: Ptr, gate: Ptr, dst: Ptr, t_n: Int64, heads_n: Int64, hd_n: Int64):
+    """`dst[i, h, d] = sigmoid(gate[i, h]) * oh[h, i, d]`: the per-head GEMM
+    outputs back to token-major, through the output gate.
+    Grid `(ceil(heads hd / TPB), T)`."""
+    var heads = Int(heads_n)
+    var hd = Int(hd_n)
+    var col = Int(block_idx.x) * TPB + Int(thread_idx.x)
+    var i = Int(block_idx.y)
+    if col >= heads * hd:
+        return
+    var h = _div(col, hd)
+    var d = col - h * hd
+    dst[unsafe_offset=i * heads * hd + col] = (
+        oh[unsafe_offset=(h * Int(t_n) + i) * hd + d] * _sigmoid(gate[unsafe_offset=i * heads + h])
+    )
+
+
 def attn_out_kernel(
     p: Ptr, v: Ptr, gate: Ptr, dst: Ptr, t_n: Int64, heads_n: Int64, kv_heads_n: Int64, hd_n: Int64,
 ):
@@ -218,6 +343,15 @@ def swiglu_kernel(a: Ptr, b: Ptr, dst: Ptr, n_n: Int64):
         dst[unsafe_offset=i] = x * _sigmoid(x) * b[unsafe_offset=i]
 
 
+def swiglu_bf16_kernel(a: Ptr, b: Ptr, dstb: BPtr, n_n: Int64):
+    """`silu(a) * b` straight to bf16 (the w2 GEMM's operand), when nothing
+    needs it in fp32 (inference without adapters)."""
+    var i = Int(global_idx.x)
+    if i < Int(n_n):
+        var x = a[unsafe_offset=i]
+        dstb[unsafe_offset=i] = (x * _sigmoid(x) * b[unsafe_offset=i]).cast[DType.bfloat16]()
+
+
 def gather_rows_kernel(x: Ptr, rows: IPtr, dst: Ptr, d_n: Int64):
     """`out[s, :] = x[rows[s], :]`. Grid `(ceil(D / TPB), S)`."""
     var d = Int(block_idx.x) * TPB + Int(thread_idx.x)
@@ -227,25 +361,36 @@ def gather_rows_kernel(x: Ptr, rows: IPtr, dst: Ptr, d_n: Int64):
         dst[unsafe_offset=s * dim + d] = x[unsafe_offset=Int(rows[unsafe_offset=s]) * dim + d]
 
 
-def lm_head_kernel(h: Ptr, table: HPtr, logits: Ptr, v_n: Int64, d_n: Int64):
-    """`logits[s, v] = h[s] . table[v]` (the tied head, bf16 rows read in place):
-    a warp per vocabulary row, 8 rows per block. Grid `(ceil(V / 8), S)`."""
+comptime LM_SLOTS: Int = 16
+"""Most slots one pass over the vocabulary serves: the table (0.5 GB for d1)
+is read once per LM_SLOTS slots, not once per slot. A caller pads its rows to
+a multiple of LM_SLOTS (`Lfm3Text.lm_head`)."""
+
+
+def lm_head_kernel[NS: Int](h: Ptr, table: HPtr, logits: Ptr, v_n: Int64, d_n: Int64, s_n: Int64):
+    """`logits[s, v] = h[s] . table[v]` for the `NS` rows of `h` (the tied
+    head, bf16 rows read in place; `s_n` <= NS of them are written, the rest
+    are padding): a warp per vocabulary row, 8 rows per block, each slot's sum
+    in the order one slot alone would take. NS is compile-time so the inner
+    loop has no branch (a runtime slot count in it made one slot cost 71 ms,
+    against 5). Grid `ceil(V / 8)`."""
     var tid = Int(thread_idx.x)
     var vrow = Int(block_idx.x) * 8 + (tid >> 5)
     var lane = tid & 31
-    var s = Int(block_idx.y)
     var dim = Int(d_n)
-    var acc = Scalar[DT](0)
+    var acc = SIMD[DT, NS](0)
     if vrow < Int(v_n):
-        var hb = s * dim
         var tb = vrow * dim
         var d = lane
         while d < dim:
-            acc += h[unsafe_offset=hb + d] * _bf(table[unsafe_offset=tb + d])
+            var tv = _bf(table[unsafe_offset=tb + d])
+            comptime for c in range(NS):
+                acc[c] += h[unsafe_offset=c * dim + d] * tv
             d += 32
-    acc = warp.sum(acc)
-    if lane == 0 and vrow < Int(v_n):
-        logits[unsafe_offset=s * Int(v_n) + vrow] = acc
+    comptime for c in range(NS):
+        var tot = warp.sum(acc[c])
+        if lane == 0 and vrow < Int(v_n) and c < Int(s_n):
+            logits[unsafe_offset=c * Int(v_n) + vrow] = tot
 
 
 def log_softmax_rows_kernel(x: Ptr, v_n: Int64):

@@ -37,7 +37,14 @@ Default: each weight is widened into a scratch buffer and the GEMM is fp32
 (`-D LFM3_TF32=1`: TF32 on NVIDIA) — the build that PROVES the code. With
 `-D LFM3_BF16=1` (NVIDIA) a GEMM rounds its activations to bf16 and runs on the
 tensor cores against the weights in place (`cublas_gemm_lp`, fp32
-accumulation and output) — what torch and llama.cpp run d1 in.
+accumulation and output) — what torch and llama.cpp run d1 in. Its GEMM
+operands are rounded where they are made (`rms_b`, `swiglu_bf16_kernel`), once
+per input shared by several linears.
+
+The attention on NVIDIA: `q k^T` and `P v` as cuBLAS GEMMs, one per KV head
+(fp32; TF32 in the TF32 and bf16 builds, `LF_ATTN_TF32`), the mask and softmax
+in one kernel (`attn_probs`, `attn_apply`). It was a dot product per thread:
+59 % of a 685-token call on the Orin (634 ms), now ~20 ms.
 
 ## `debug` (falsification only)
 
@@ -61,12 +68,17 @@ from noeira.io.safetensors import SafeTensors, ST_BF16
 from .kernels import (
     TPB, bf16_to_f32_kernel, embed_kernel, rms_kernel, add_kernel, short_conv_kernel, rope_kernel,
     scores_kernel, softmax_rows_kernel, attn_out_kernel, swiglu_kernel, gather_rows_kernel,
-    lm_head_kernel, log_softmax_rows_kernel, f32_to_bf16_kernel,
+    lm_head_kernel, log_softmax_rows_kernel, f32_to_bf16_kernel, split_heads_kernel, masked_softmax_kernel,
+    merge_heads_gate_kernel, LM_SLOTS, rms_bf16_kernel, swiglu_bf16_kernel,
 )
 
 
 comptime LF_TF32: Bool = is_defined["LFM3_TF32"]()
 comptime LF_BF16: Bool = is_defined["LFM3_BF16"]() and default_accelerator().is_nvidia_gpu()
+comptime LF_ATTN_TF32: Bool = LF_TF32 or LF_BF16
+"""The attention's two GEMMs (q k^T, P v) in TF32 in the fast builds; fp32
+in the default one. TF32 keeps 10 mantissa bits to bf16's 7, and the scores
+are not rounded to bf16 at all."""
 comptime LT_CONV: Int = 0
 comptime LT_FULL: Int = 1
 comptime LT_SLIDING: Int = 2
@@ -385,8 +397,13 @@ struct Lfm3Text(Movable):
         self.ctx.enqueue_copy(d, h)
         return d^
 
-    def linear(mut self, name: String, x: DeviceBuffer[DT], t: Int, k: Int) raises -> DeviceBuffer[DT]:
-        var y = self._linear_base(name, x, t, k)
+    def linear(
+        mut self, name: String, x: DeviceBuffer[DT], t: Int, k: Int,
+        xb: Optional[DeviceBuffer[DType.bfloat16]] = None,
+    ) raises -> DeviceBuffer[DT]:
+        """`x[t, k] @ W^T` (+ the adapter's term). `xb`: `x` already rounded to
+        bf16 (LFM3_BF16; `rms_b`), shared by the linears that read one input."""
+        var y = self._linear_base(name, x, t, k, xb)
         var li = self.lora_index.get(name)
         if li:
             var j = li.value()
@@ -399,15 +416,22 @@ struct Lfm3Text(Movable):
                 self.cur["xa:" + name] = xa
         return y^
 
-    def _linear_base(mut self, name: String, x: DeviceBuffer[DT], t: Int, k: Int) raises -> DeviceBuffer[DT]:
+    def _linear_base(
+        mut self, name: String, x: DeviceBuffer[DT], t: Int, k: Int,
+        xb: Optional[DeviceBuffer[DType.bfloat16]] = None,
+    ) raises -> DeviceBuffer[DT]:
         """`x[t, k] @ W^T` for the bf16 weight `name` ([n, k]): widened into the
         scratch first, or (LFM3_BF16) against the weight in place."""
         var wb = self.w(name + ".weight")
         var n = len(wb) // k
         comptime if LF_BF16:
-            var xb = self.to_bf16(x, t * k)
+            var xbb: DeviceBuffer[DType.bfloat16]
+            if xb:
+                xbb = xb.value()
+            else:
+                xbb = self.to_bf16(x, t * k)
             var yb = self.new(t * n)
-            cublas_gemm_lp[False, True, DType.bfloat16, DT](self.ctx, yb, xb, self.weight_bf16(name), t, n, k, 0.0)
+            cublas_gemm_lp[False, True, DType.bfloat16, DT](self.ctx, yb, xbb, self.weight_bf16(name), t, n, k, 0.0)
             return yb^
         var wf = self.scratch.create_sub_buffer[DT](0, n * k)
         self.ctx.enqueue_function[bf16_to_f32_kernel](wb, wf, Int64(n * k), grid_dim=_blocks(n * k), block_dim=TPB)
@@ -430,10 +454,93 @@ struct Lfm3Text(Movable):
         self.ctx.enqueue_function[f32_to_bf16_kernel](x, xb, Int64(n), grid_dim=_blocks(n), block_dim=TPB)
         return xb^
 
+    def rms_b(
+        mut self, name: String, x: DeviceBuffer[DT], y: DeviceBuffer[DT], rows: Int, dim: Int,
+    ) raises -> Optional[DeviceBuffer[DType.bfloat16]]:
+        """`rms`, and (LFM3_BF16) its output rounded to bf16 by the same kernel,
+        for the GEMMs that read it; None in the other builds."""
+        comptime if LF_BF16:
+            var yb = self.ctx.enqueue_create_buffer[DType.bfloat16](rows * dim)
+            self.ctx.enqueue_function[rms_bf16_kernel](
+                x, y, yb, self.w(name + ".weight"), Int64(dim), self.cfg.eps, grid_dim=rows, block_dim=TPB,
+            )
+            return Optional(yb^)
+        self.rms(name, x, y, rows, dim)
+        return None
+
     def rms(mut self, name: String, x: DeviceBuffer[DT], y: DeviceBuffer[DT], rows: Int, dim: Int) raises:
         self.ctx.enqueue_function[rms_kernel](
             x, y, self.w(name + ".weight"), Int64(dim), self.cfg.eps, grid_dim=rows, block_dim=TPB,
         )
+
+    def _split_heads(self, x: DeviceBuffer[DT], t: Int, heads: Int) raises -> DeviceBuffer[DT]:
+        var hd = self.cfg.head_dim
+        var y = self.new(heads * t * hd)
+        self.ctx.enqueue_function[split_heads_kernel](
+            x, y, Int64(t), Int64(heads), Int64(hd), grid_dim=(_blocks(heads * hd), t), block_dim=TPB,
+        )
+        return y^
+
+    def attn_probs(
+        self, q: DeviceBuffer[DT], k: DeviceBuffer[DT], sc: DeviceBuffer[DT], groups: DeviceBuffer[DType.int32],
+        t: Int, mode: Int, state_len: Int,
+    ) raises:
+        """`sc[h, i, :]` = the attention probabilities of query `i` in head `h`
+        (0 where `i` may not see `j`), from `q[T, heads, hd]` and `k[T, kv, hd]`
+        after their norms and RoPE. NVIDIA: one GEMM per KV head (its `rep`
+        query heads stacked, `[rep T, hd] @ [T, hd]^T`), then the mask and the
+        softmax in one kernel. Elsewhere: a dot product per thread."""
+        var hd = self.cfg.head_dim
+        var nh = self.cfg.heads
+        var nkv = self.cfg.kv_heads
+        var scale = Float32(1.0) / Float32(Float64(hd) ** 0.5)
+        comptime if default_accelerator().is_nvidia_gpu():
+            var rep = nh // nkv
+            var qh = self._split_heads(q, t, nh)
+            var kh = self._split_heads(k, t, nkv)
+            for kv in range(nkv):
+                cublas_gemm[False, True, LF_ATTN_TF32](
+                    self.ctx, sc.create_sub_buffer[DT](kv * rep * t * t, rep * t * t),
+                    qh.create_sub_buffer[DT](kv * rep * t * hd, rep * t * hd),
+                    kh.create_sub_buffer[DT](kv * t * hd, t * hd), rep * t, t, hd, 0.0,
+                )
+            self.ctx.enqueue_function[masked_softmax_kernel](
+                sc, groups, Int64(t), scale, Int64(mode), Int64(state_len), Int64(self.cfg.window),
+                grid_dim=(t, nh), block_dim=TPB,
+            )
+        else:
+            self.ctx.enqueue_function[scores_kernel](
+                q, k, sc, groups, Int64(t), Int64(nh), Int64(nkv), Int64(hd), scale, Int64(mode),
+                Int64(state_len), Int64(self.cfg.window), grid_dim=(_blocks(t), t, nh), block_dim=TPB,
+            )
+            self.ctx.enqueue_function[softmax_rows_kernel](sc, Int64(t), grid_dim=nh * t, block_dim=TPB)
+
+    def attn_apply(
+        self, sc: DeviceBuffer[DT], v: DeviceBuffer[DT], gate: DeviceBuffer[DT], dst: DeviceBuffer[DT], t: Int,
+    ) raises:
+        """`dst[i, h, :] = sigmoid(gate[i, h]) * sum_j sc[h, i, j] v[j, h / rep, :]`.
+        NVIDIA: one GEMM per KV head (`[rep T, T] @ [T, hd]`), then the gate."""
+        var hd = self.cfg.head_dim
+        var nh = self.cfg.heads
+        var nkv = self.cfg.kv_heads
+        comptime if default_accelerator().is_nvidia_gpu():
+            var rep = nh // nkv
+            var vh = self._split_heads(v, t, nkv)
+            var oh = self.new(nh * t * hd)
+            for kv in range(nkv):
+                cublas_gemm[False, False, LF_ATTN_TF32](
+                    self.ctx, oh.create_sub_buffer[DT](kv * rep * t * hd, rep * t * hd),
+                    sc.create_sub_buffer[DT](kv * rep * t * t, rep * t * t),
+                    vh.create_sub_buffer[DT](kv * t * hd, t * hd), rep * t, hd, t, 0.0,
+                )
+            self.ctx.enqueue_function[merge_heads_gate_kernel](
+                oh, gate, dst, Int64(t), Int64(nh), Int64(hd), grid_dim=(_blocks(nh * hd), t), block_dim=TPB,
+            )
+        else:
+            self.ctx.enqueue_function[attn_out_kernel](
+                sc, v, gate, dst, Int64(t), Int64(nh), Int64(nkv), Int64(hd),
+                grid_dim=(_blocks(nh * hd), t), block_dim=TPB,
+            )
 
     def rope_tables(
         self, t: Int, theta: Float64, prf: Float64, neg_sin: Bool = False,
@@ -493,7 +600,6 @@ struct Lfm3Text(Movable):
         var rf = self.rope_tables(t, self.cfg.theta_full, full_prf)
         var rs = self.rope_tables(t, self.cfg.theta_sliding, self.cfg.prf_sliding)
         var sc = self.new(nh * t * t)
-        var scale = Float32(1.0) / Float32(Float64(hd) ** 0.5)
         if self.training:
             self.act = List[Dict[String, DeviceBuffer[DT]]]()
             self.act_x_last = List[DeviceBuffer[DT]]()
@@ -504,12 +610,12 @@ struct Lfm3Text(Movable):
             if self.training:
                 self.cur["x_in"] = self._copy(x, t * dm)
             var hn = self.new(t * dm)
-            self.rms(p + "operator_norm", x, hn, t, dm)
+            var hnb = self.rms_b(p + "operator_norm", x, hn, t, dm)
             if self.training:
                 self.cur["hn"] = hn
             var o: DeviceBuffer[DT]
             if kind == LT_CONV:
-                var bcx = self.linear(p + "conv.in_proj", hn, t, dm)
+                var bcx = self.linear(p + "conv.in_proj", hn, t, dm, hnb)
                 var z = self.new(t * dm)
                 self.ctx.enqueue_function[short_conv_kernel](
                     bcx, self.w(p + "conv.conv.weight"), z, Int64(dm), Int64(self.cfg.conv_k),
@@ -520,10 +626,10 @@ struct Lfm3Text(Movable):
                     self.cur["z"] = z
                 o = self.linear(p + "conv.out_proj", z, t, dm)
             else:
-                var q = self.linear(p + "self_attn.q_proj", hn, t, dm)
-                var k = self.linear(p + "self_attn.k_proj", hn, t, dm)
-                var v = self.linear(p + "self_attn.v_proj", hn, t, dm)
-                var g = self.linear(p + "self_attn.gate_proj", hn, t, dm)
+                var q = self.linear(p + "self_attn.q_proj", hn, t, dm, hnb)
+                var k = self.linear(p + "self_attn.k_proj", hn, t, dm, hnb)
+                var v = self.linear(p + "self_attn.v_proj", hn, t, dm, hnb)
+                var g = self.linear(p + "self_attn.gate_proj", hn, t, dm, hnb)
                 if self.training:
                     self.cur["q_lin"] = self._copy(q, t * dm)
                     self.cur["k_lin"] = self._copy(k, t * nkv * hd)
@@ -539,11 +645,7 @@ struct Lfm3Text(Movable):
                     k, cos_t, sin_t, Int64(nkv), Int64(hd // 2), grid_dim=(_blocks(nkv * hd // 2), t), block_dim=TPB,
                 )
                 var mode = 1 if kind == LT_SLIDING else (2 if (causal_full or (self.debug & 1) != 0) else 0)
-                self.ctx.enqueue_function[scores_kernel](
-                    q, k, sc, dgr, Int64(t), Int64(nh), Int64(nkv), Int64(hd), scale, Int64(mode),
-                    Int64(state_len), Int64(self.cfg.window), grid_dim=(_blocks(t), t, nh), block_dim=TPB,
-                )
-                self.ctx.enqueue_function[softmax_rows_kernel](sc, Int64(t), grid_dim=nh * t, block_dim=TPB)
+                self.attn_probs(q, k, sc, dgr, t, mode, state_len)
                 if self.training:
                     self.cur["q"] = q
                     self.cur["k"] = k
@@ -552,19 +654,13 @@ struct Lfm3Text(Movable):
                     var ones = self.new(t * nh)
                     ones.enqueue_fill(30.0)  # sigmoid(30) = 1 - 9e-14: the output before its gate
                     var a_pre = self.new(t * dm)
-                    self.ctx.enqueue_function[attn_out_kernel](
-                        sc, v, ones, a_pre, Int64(t), Int64(nh), Int64(nkv), Int64(hd),
-                        grid_dim=(_blocks(nh * hd), t), block_dim=TPB,
-                    )
+                    self.attn_apply(sc, v, ones, a_pre, t)
                     self.cur["a_pre"] = a_pre
                 if (self.debug & 4) != 0:
                     g = self.new(t * nh)
                     g.enqueue_fill(30.0)  # sigmoid = 1: the gate off
                 var a = self.new(t * dm)
-                self.ctx.enqueue_function[attn_out_kernel](
-                    sc, v, g, a, Int64(t), Int64(nh), Int64(nkv), Int64(hd),
-                    grid_dim=(_blocks(nh * hd), t), block_dim=TPB,
-                )
+                self.attn_apply(sc, v, g, a, t)
                 if self.training:
                     self.cur["a"] = a
                 o = self.linear(p + "self_attn.o_proj", a, t, dm)
@@ -575,19 +671,26 @@ struct Lfm3Text(Movable):
             if self.training:
                 self.cur["h_mid"] = self._copy(x, t * dm)
             var fnrm = self.new(t * dm)
-            self.rms(p + "ffn_norm", x, fnrm, t, dm)
+            var fnb = self.rms_b(p + "ffn_norm", x, fnrm, t, dm)
             if self.training:
                 self.cur["fn"] = fnrm
-            var a1 = self.linear(p + "feed_forward.w1", fnrm, t, dm)
-            var a3 = self.linear(p + "feed_forward.w3", fnrm, t, dm)
+            var a1 = self.linear(p + "feed_forward.w1", fnrm, t, dm, fnb)
+            var a3 = self.linear(p + "feed_forward.w3", fnrm, t, dm, fnb)
             var ff = self.cfg.ff
             if self.training:
                 self.cur["a1"] = self._copy(a1, t * ff)
                 self.cur["a3"] = a3
-            self.ctx.enqueue_function[swiglu_kernel](a1, a3, a1, Int64(t * ff), grid_dim=_blocks(t * ff), block_dim=TPB)
+            var swb = Optional[DeviceBuffer[DType.bfloat16]](None)
+            comptime if LF_BF16:
+                if not self.training and len(self.lora_index) == 0:  # nothing reads silu(a1) a3 in fp32
+                    var b = self.ctx.enqueue_create_buffer[DType.bfloat16](t * ff)
+                    self.ctx.enqueue_function[swiglu_bf16_kernel](a1, a3, b, Int64(t * ff), grid_dim=_blocks(t * ff), block_dim=TPB)
+                    swb = Optional(b^)
+            if not swb:
+                self.ctx.enqueue_function[swiglu_kernel](a1, a3, a1, Int64(t * ff), grid_dim=_blocks(t * ff), block_dim=TPB)
             if self.training:
                 self.cur["sw"] = a1
-            var f = self.linear(p + "feed_forward.w2", a1, t, ff)
+            var f = self.linear(p + "feed_forward.w2", a1, t, ff, swb)
             if self.training:
                 self.cur["f"] = self._copy(f, t * dm)
             self.rms(p + "post_ffn_norm", f, f, t, dm)
@@ -613,14 +716,45 @@ struct Lfm3Text(Movable):
             hs[i] = Int32(slots[i])
         var ds = self.ctx.enqueue_create_buffer[DType.int32](s)
         self.ctx.enqueue_copy(ds, hs)
-        var rows = self.new(s * dm)
+        var rows = self.slot_rows(s)
         self.ctx.enqueue_function[gather_rows_kernel](h, ds, rows, Int64(dm), grid_dim=(_blocks(dm), s), block_dim=TPB)
         var logits = self.new(s * v)
-        self.ctx.enqueue_function[lm_head_kernel](
-            rows, self.w("embed_tokens.weight"), logits, Int64(v), Int64(dm), grid_dim=((v + 7) // 8, s), block_dim=256,
-        )
+        self.lm_head(rows, logits, s)
         self.ctx.enqueue_function[log_softmax_rows_kernel](logits, Int64(v), grid_dim=s, block_dim=TPB)
         return self.download(logits, s * v)
+
+    def slot_rows(self, s: Int) raises -> DeviceBuffer[DT]:
+        """A zeroed `[S, hidden]` buffer padded to a multiple of LM_SLOTS rows:
+        what `lm_head` reads the slots' hidden states from."""
+        var n = (s + LM_SLOTS - 1) // LM_SLOTS * LM_SLOTS * self.cfg.hidden
+        var rows = self.new(n)
+        rows.enqueue_fill(0.0)
+        return rows^
+
+    def lm_head(mut self, rows: DeviceBuffer[DT], logits: DeviceBuffer[DT], s: Int) raises:
+        """`logits[s, :] = rows[s] @ embed^T` for the first `s` rows of `rows`
+        (from `slot_rows`): one pass over the table per LM_SLOTS slots, the last
+        pass with the fewest slots (1, 2, 4, 8 or 16) that covers what is left."""
+        var dm = self.cfg.hidden
+        var v = self.cfg.vocab
+        var table = self.w("embed_tokens.weight")
+        var s0 = 0
+        while s0 < s:
+            var left = s - s0
+            var r = rows.create_sub_buffer[DT](s0 * dm, LM_SLOTS * dm)  # padded: always LM_SLOTS rows from s0
+            var lg = logits.create_sub_buffer[DT](s0 * v, min(left, LM_SLOTS) * v)
+            var ns = Int64(min(left, LM_SLOTS))
+            if left >= 16:
+                self.ctx.enqueue_function[lm_head_kernel[16]](r, table, lg, Int64(v), Int64(dm), ns, grid_dim=(v + 7) // 8, block_dim=256)
+            elif left > 4:
+                self.ctx.enqueue_function[lm_head_kernel[8]](r, table, lg, Int64(v), Int64(dm), ns, grid_dim=(v + 7) // 8, block_dim=256)
+            elif left > 2:
+                self.ctx.enqueue_function[lm_head_kernel[4]](r, table, lg, Int64(v), Int64(dm), ns, grid_dim=(v + 7) // 8, block_dim=256)
+            elif left == 2:
+                self.ctx.enqueue_function[lm_head_kernel[2]](r, table, lg, Int64(v), Int64(dm), ns, grid_dim=(v + 7) // 8, block_dim=256)
+            else:
+                self.ctx.enqueue_function[lm_head_kernel[1]](r, table, lg, Int64(v), Int64(dm), ns, grid_dim=(v + 7) // 8, block_dim=256)
+            s0 += LM_SLOTS
 
     def _copy(self, x: DeviceBuffer[DT], n: Int) raises -> DeviceBuffer[DT]:
         var b = self.new(n)

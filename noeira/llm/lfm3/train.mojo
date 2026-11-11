@@ -28,7 +28,7 @@ from max.gpu.host import DeviceContext, DeviceBuffer
 from noeira.nn.constants import DT
 from noeira.nn.core.cublas_gemm import cublas_gemm, cublas_gemm_lp
 from .kernels import (
-    TPB, rope_kernel, gather_rows_kernel, lm_head_kernel, log_softmax_rows_kernel, bf16_to_f32_kernel,
+    TPB, rope_kernel, gather_rows_kernel, log_softmax_rows_kernel, bf16_to_f32_kernel,
 )
 from .kernels_bwd import (
     rms_bwd_kernel, swiglu_bwd_kernel, short_conv_bwd_kernel, gate_bwd_kernel, attn_dp_kernel,
@@ -108,12 +108,10 @@ def slot_loss(
         hs[i] = Int32(slots[i])
     var ds = lm.ctx.enqueue_create_buffer[DType.int32](s)
     lm.ctx.enqueue_copy(ds, hs)
-    var rows = lm.new(s * dm)
+    var rows = lm.slot_rows(s)
     lm.ctx.enqueue_function[gather_rows_kernel](h, ds, rows, Int64(dm), grid_dim=(_blocks(dm), s), block_dim=TPB)
     var logz = lm.new(s * v)
-    lm.ctx.enqueue_function[lm_head_kernel](
-        rows, lm.w("embed_tokens.weight"), logz, Int64(v), Int64(dm), grid_dim=((v + 7) // 8, s), block_dim=256,
-    )
+    lm.lm_head(rows, logz, s)
     lm.ctx.enqueue_function[log_softmax_rows_kernel](logz, Int64(v), grid_dim=s, block_dim=TPB)
     var lz = lm.download(logz, s * v)
     # d logits = softmax - onehot(target), per slot
