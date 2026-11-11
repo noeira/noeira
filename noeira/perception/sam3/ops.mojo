@@ -28,7 +28,12 @@ from linalg.matmul import matmul as max_matmul
 
 from noeira.io.safetensors import SafeTensors, ST_F32, ST_BF16
 from noeira.nn.constants import DT
-from noeira.nn.core.cublas_gemm import cublas_gemm, cublas_gemm_lp
+from noeira.nn.core.cublas_gemm import cublas_gemm, cublas_gemm_lp, _shared_workspace, CUBLAS_WS_BYTES
+from linalg.matmul.vendor.blas import _get_global_handle, Backend, _ffi_void_ptr
+from _cublas.cublas import (
+    _get_dylib_function as _cublas_fn, Algorithm, ComputeType, _convert_to_cublas_datatype,
+    _convert_to_cublas_transpose, check_cublas_error, cublasMath_t, cublasSetMathMode, cublasSetWorkspace,
+)
 from noeira.nn.primitives.flash_attention_tf32 import _tf32_fwd_kernel, TF_TQ, TF_WARPS
 from max.gpu import WARP_SIZE
 
@@ -453,6 +458,59 @@ def attn_softmax_kernel(sc: Ptr, bias: Ptr, tk_n: Int64, scale: Float32, key_len
         j += TPB
 
 
+def gemm_strided_batched[TA: Bool, TB: Bool](
+    ctx: DeviceContext, dst: DeviceBuffer[DT], a: DeviceBuffer[DT], b: DeviceBuffer[DT], m: Int, n: Int, k: Int,
+    lda: Int, ldb: Int, ldc: Int, sa: Int, sb: Int, sc: Int, batch: Int,
+) raises:
+    """`dst_i[m, n] = op(a_i) @ op(b_i)` for i < batch, row-major with explicit
+    row strides (`ld*`) and per-batch element strides (`s*`): `a_i` is [m, k]
+    (or [k, m]^T with TA), `b_i` [k, n] (or [n, k]^T with TB). One
+    `cublasGemmStridedBatchedEx` (MAX does not bind it; same C-ABI trick as
+    `nn.core.cudnn_conv`), fp32 (TF32 with SAM3_TF32). Heads interleaved in
+    `[t, heads hd]` are a batch with stride `hd` and row stride `heads hd`.
+    The row-major mapping is `cublas_gemm`'s: cuBLAS gets (b, a), dims (n, m)."""
+    comptime assert default_accelerator().is_nvidia_gpu(), "cuBLAS is NVIDIA-only"
+    var ws = _shared_workspace(ctx)
+    var handle = _get_global_handle[DT, Backend.CUBLAS](ctx)._get_cublas()
+    check_cublas_error(cublasSetWorkspace(handle, _ffi_void_ptr(ws.unsafe_ptr()), CUBLAS_WS_BYTES))
+    check_cublas_error(
+        cublasSetMathMode(handle, cublasMath_t.CUBLAS_TF32_TENSOR_OP_MATH if SAM3_TF32 else cublasMath_t.CUBLAS_DEFAULT_MATH)
+    )
+    var alpha = Float32(1.0)
+    var beta = Float32(0.0)
+    var op_b = _convert_to_cublas_transpose(TB)
+    var op_a = _convert_to_cublas_transpose(TA)
+    var dt = _convert_to_cublas_datatype[DT]()
+    var compute = ComputeType.COMPUTE_32F_FAST_TF32 if SAM3_TF32 else ComputeType.COMPUTE_32F
+    var algo = Algorithm.DEFAULT
+    var st = _cublas_fn[
+        "cublasGemmStridedBatchedEx",
+        def(
+            type_of(handle), type_of(op_b), type_of(op_a), Int32, Int32, Int32, Int,
+            Int, type_of(dt), Int32, Int64,
+            Int, type_of(dt), Int32, Int64,
+            Int, Int, type_of(dt), Int32, Int64, Int32, type_of(compute), type_of(algo),
+        ) thin abi("C") -> Int32,
+    ]()(
+        handle, op_b, op_a, Int32(n), Int32(m), Int32(k), Int(Pointer(to=alpha)),
+        Int(b.unsafe_ptr()), dt, Int32(ldb), Int64(sb),
+        Int(a.unsafe_ptr()), dt, Int32(lda), Int64(sa),
+        Int(Pointer(to=beta)), Int(dst.unsafe_ptr()), dt, Int32(ldc), Int64(sc), Int32(batch), compute, algo,
+    )
+    _ = alpha
+    _ = beta
+    if st != 0:
+        raise Error("sam3: cublasGemmStridedBatchedEx failed with status " + String(st))
+
+
+comptime MHA_BATCHED: Bool = default_accelerator().is_nvidia_gpu()
+"""On NVIDIA, `mha` takes every head at once (two strided-batched GEMMs and one
+softmax launch, not ~4 launches a head) whenever the scores fit in 64 M floats
+— every attention of a word (cross-attentions on 32 text keys, the decoder's
+200 queries on 5184 image tokens); the fp32 DETR encoder's 5184^2 self-attention
+stays per head."""
+
+
 def mha(
     ctx: DeviceContext, q: DeviceBuffer[DT], k: DeviceBuffer[DT], v: DeviceBuffer[DT], tq: Int, tk: Int,
     heads: Int, hd: Int, key_len: Int, bias: Optional[DeviceBuffer[DT]] = None,
@@ -461,8 +519,21 @@ def mha(
     `k`, `v [tk, heads hd]`: per head `softmax(q k^T / sqrt(hd) + bias_h)` over
     the first `key_len` keys (a padding mask whose real keys come first), then
     `@ v`. `bias`: `[heads, tq, tk]`, added before the softmax (SAM 3's box
-    relative-position bias). One head at a time (a 5184 x 5184 head is 107 MB)."""
+    relative-position bias). One head at a time (a 5184 x 5184 head is 107 MB),
+    or all at once (`MHA_BATCHED`)."""
     var scale = Float32(1.0) / Float32(Float64(hd) ** 0.5)
+    comptime if MHA_BATCHED:
+        if heads * tq * tk <= (64 << 20):
+            var ld = heads * hd
+            var sc = ctx.enqueue_create_buffer[DT](heads * tq * tk)
+            gemm_strided_batched[False, True](ctx, sc, q, k, tq, tk, hd, ld, ld, tk, hd, hd, tq * tk, heads)
+            var bp = bias.value() if bias else sc
+            ctx.enqueue_function[attn_softmax_kernel](
+                sc, bp, Int64(tk), scale, Int64(key_len), Int64(1 if bias else 0), grid_dim=heads * tq, block_dim=TPB,
+            )
+            var out = ctx.enqueue_create_buffer[DT](tq * ld)
+            gemm_strided_batched[False, False](ctx, out, sc, v, tq, hd, tk, tk, ld, ld, tq * tk, hd, hd, heads)
+            return out^
     var qh = ctx.enqueue_create_buffer[DT](heads * tq * hd)
     var kh = ctx.enqueue_create_buffer[DT](heads * tk * hd)
     var vh = ctx.enqueue_create_buffer[DT](heads * tk * hd)
