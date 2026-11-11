@@ -22,7 +22,7 @@ from std.sys import default_accelerator
 from std.sys.defines import is_defined
 from max.gpu import global_idx, thread_idx, block_idx
 from max.gpu.host import DeviceContext, DeviceBuffer, HostBuffer
-from max.gpu.primitives import block
+from max.gpu.primitives import block, warp
 from layout import TileTensor, row_major
 from linalg.matmul import matmul as max_matmul
 
@@ -503,6 +503,49 @@ def attn_softmax_kernel(sc: Ptr, bias: Ptr, tk_n: Int64, scale: Float32, key_len
         j += TPB
 
 
+def attn_softmax_warp_kernel(
+    sc: Ptr, bias: Ptr, rows_n: Int64, tk_n: Int64, scale: Float32, key_len_n: Int64, has_bias: Int64,
+):
+    """`attn_softmax_kernel` with a WARP per row, 8 rows a block (the batched
+    `mha`'s): a block per row left 224 of 256 threads idle on 32 text keys and
+    synchronised the block three times a row. Same operations per element.
+    Grid `ceil(rows / 8)`, 256 threads."""
+    var tid = Int(thread_idx.x)
+    var r = Int(block_idx.x) * 8 + (tid >> 5)
+    if r >= Int(rows_n):
+        return  # a whole warp leaves together (r is per warp)
+    var lane = tid & 31
+    var tk = Int(tk_n)
+    var row = r * tk
+    var kl = Int(key_len_n)
+    var m = Scalar[DT](-3.0e38)
+    var j = lane
+    while j < tk:
+        var v = Scalar[DT](-3.0e38)
+        if j < kl:
+            v = sc[unsafe_offset=row + j] * Scalar[DT](scale)
+            if has_bias != 0:
+                v += bias[unsafe_offset=row + j]
+        sc[unsafe_offset=row + j] = v
+        m = max(m, v)
+        j += 32
+    var top = warp.max(m)
+    var s = Scalar[DT](0)
+    j = lane
+    while j < tk:
+        var e = Scalar[DT](0)
+        if j < kl:
+            e = exp(sc[unsafe_offset=row + j] - top)
+        sc[unsafe_offset=row + j] = e
+        s += e
+        j += 32
+    var inv = Scalar[DT](1) / warp.sum(s)
+    j = lane
+    while j < tk:
+        sc[unsafe_offset=row + j] = sc[unsafe_offset=row + j] * inv
+        j += 32
+
+
 def gemm_strided_batched[TA: Bool, TB: Bool](
     ctx: DeviceContext, dst: DeviceBuffer[DT], a: DeviceBuffer[DT], b: DeviceBuffer[DT], m: Int, n: Int, k: Int,
     lda: Int, ldb: Int, ldc: Int, sa: Int, sb: Int, sc: Int, batch: Int,
@@ -573,9 +616,15 @@ def mha(
             var sc = ctx.enqueue_create_buffer[DT](heads * tq * tk)
             gemm_strided_batched[False, True](ctx, sc, q, k, tq, tk, hd, ld, ld, tk, hd, hd, tq * tk, heads)
             var bp = bias.value() if bias else sc
-            ctx.enqueue_function[attn_softmax_kernel](
-                sc, bp, Int64(tk), scale, Int64(key_len), Int64(1 if bias else 0), grid_dim=heads * tq, block_dim=TPB,
-            )
+            if tk <= 256:  # short rows (text keys, the 201 queries): a warp a row
+                ctx.enqueue_function[attn_softmax_warp_kernel](
+                    sc, bp, Int64(heads * tq), Int64(tk), scale, Int64(key_len), Int64(1 if bias else 0),
+                    grid_dim=(heads * tq + 7) // 8, block_dim=256,
+                )
+            else:  # long rows (5184 image keys): a block a row measured faster
+                ctx.enqueue_function[attn_softmax_kernel](
+                    sc, bp, Int64(tk), scale, Int64(key_len), Int64(1 if bias else 0), grid_dim=heads * tq, block_dim=TPB,
+                )
             var out = ctx.enqueue_create_buffer[DT](tq * ld)
             gemm_strided_batched[False, False](ctx, out, sc, v, tq, hd, tk, tk, ld, ld, tq * tk, hd, hd, heads)
             return out^
