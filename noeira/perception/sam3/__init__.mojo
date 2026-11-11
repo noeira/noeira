@@ -7,6 +7,7 @@ score out. Ported stage by stage against transformers' `Sam3Model`
     neck.mojo  `Sam3Neck`: the 4-level FPN (288, 144, 72, 36) and its sine position encoding
     text.mojo  `Sam3Text`: CLIP's text encoder + SAM 3's projection (tokens: noeira/text/clip_bpe.mojo)
     detr.mojo  `Sam3DetrEncoder`: the image tokens fused with the prompt
+    decoder.mojo `Sam3Decoder`: 200 queries + presence, box refinement with the box RPB, the scoring
     ops.mojo   weights on the device, the GEMM, the shared kernels
 """
 
@@ -15,3 +16,4 @@ from .vit import Sam3ViT
 from .neck import Sam3Neck, FpnLevel, position_encoding
 from .text import Sam3Text
 from .detr import Sam3DetrEncoder
+from .decoder import Sam3Decoder, Sam3Detections
