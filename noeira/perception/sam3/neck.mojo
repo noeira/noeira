@@ -82,9 +82,11 @@ def convt_scatter_kernel(y: Ptr, b: Ptr, dst: Ptr, w_n: Int64, cout_n: Int64, sw
 
 def shift_kernel(x: Ptr, dst: Ptr, h_n: Int64, w_n: Int64, c_n: Int64, dy_n: Int64, dx_n: Int64):
     """`dst[r W + c, :] = x[(r + dy) W + c + dx, :]`, zero outside the grid (a 3x3
-    conv's tap). Grid `(ceil(C / TPB), H W)`."""
-    var ch = Int(block_idx.x) * TPB + Int(thread_idx.x)
-    var n = Int(block_idx.y)
+    conv's tap). Grid `(H W, ceil(C / TPB))` — the positions on x: 288 x 288 is
+    82 944, past CUDA's 65 535 limit on grid y (Metal has none; the first Orin
+    run failed here)."""
+    var ch = Int(block_idx.y) * TPB + Int(thread_idx.x)
+    var n = Int(block_idx.x)
     var cc = Int(c_n)
     if ch >= cc:
         return
@@ -152,7 +154,7 @@ def conv3x3(
     for t in range(9):
         ctx.enqueue_function[shift_kernel](
             x, xs, Int64(h), Int64(w), Int64(FPN), Int64(t // 3 - 1), Int64(t % 3 - 1),
-            grid_dim=(blocks(FPN), n), block_dim=TPB,
+            grid_dim=(n, blocks(FPN)), block_dim=TPB,
         )
         var tw = 8 - t if flip else t
         gemm_tb(ctx, part, xs, taps.create_sub_buffer[DT](tw * FPN * FPN, FPN * FPN), n, FPN, FPN)

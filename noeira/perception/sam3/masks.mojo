@@ -55,9 +55,10 @@ struct Sam3Masks(Movable):
 
 def upsample2_add_kernel(coarse: Ptr, fine: Ptr, dst: Ptr, wf_n: Int64):
     """`dst[r, c] = coarse[r // 2, c // 2] + fine[r, c]` (nearest x2, token-major,
-    C channels). Grid `(ceil(C / TPB), H W)` of the fine grid."""
-    var ch = Int(block_idx.x) * TPB + Int(thread_idx.x)
-    var n = Int(block_idx.y)
+    C channels). Grid `(H W, ceil(C / TPB))` of the fine grid (positions on x:
+    CUDA caps grid y at 65 535)."""
+    var ch = Int(block_idx.y) * TPB + Int(thread_idx.x)
+    var n = Int(block_idx.x)
     if ch >= C:
         return
     var wf = Int(wf_n)
@@ -171,7 +172,7 @@ struct Sam3MaskDecoder(Movable):
             ww *= 2
             var n = hh * ww
             var s = self.new(n * C)
-            ctx.enqueue_function[upsample2_add_kernel](prev, fine, s, Int64(ww), grid_dim=(blocks(C), n), block_dim=TPB)
+            ctx.enqueue_function[upsample2_add_kernel](prev, fine, s, Int64(ww), grid_dim=(n, blocks(C)), block_dim=TPB)
             var cv = conv3x3(ctx, s, hh, ww, self.taps[stage], self.wts.w(String("pixel_decoder.conv_layers.") + String(stage) + ".bias"))
             var nw = self.wts.w(String("pixel_decoder.norms.") + String(stage) + ".weight")
             var nb = self.wts.w(String("pixel_decoder.norms.") + String(stage) + ".bias")

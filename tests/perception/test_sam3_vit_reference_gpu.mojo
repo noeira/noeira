@@ -25,7 +25,12 @@ from noeira.perception.sam3 import Sam3ViT, sam3_checkpoint
 from noeira.perception.sam3.ops import SAM3_TF32
 
 
-comptime BOUND: Float64 = 1e-2 if SAM3_TF32 else 1e-4
+comptime BOUND: Float64 = 1e-2 if SAM3_TF32 else 3e-4
+"""fp32. The error stays ~1e-6 through the windowed layers and grows at each
+GLOBAL one (softmax sums over 5184 keys, in whatever order the GEMM library
+takes): measured at layer 31 4.9e-5 on Metal (MAX matmul) and 1.1e-4 on the
+Orin (cuBLAS fp32), 2026-11-11. The downstream gates (neck, masks, end to end)
+take this backbone's output; the bound is ~2.7x the worst."""
 comptime FALSIFY: Float64 = 10.0 * BOUND
 
 
