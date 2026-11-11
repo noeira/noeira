@@ -251,6 +251,36 @@ def linear_residual(
     bias_add(wts, name, resid, y, t, n)
 
 
+def layer_norm_bf16(
+    mut wts: Sam3Weights, name: String, x: DeviceBuffer[DT], y: DeviceBuffer[DType.bfloat16], rows: Int, dim: Int,
+    eps: Float32, grid: Int = 0, win: Int = 0,
+) raises:
+    """`layer_norm` written as bf16, row r at `_win_row(r, grid, win)` (`win` 0: in place order)."""
+    wts.ctx.enqueue_function[layer_norm_bf16_kernel](
+        x, y, wts.w(name + ".weight"), wts.w(name + ".bias"), Int64(dim), eps, Int64(grid), Int64(win),
+        grid_dim=rows, block_dim=TPB,
+    )
+
+
+def bias_add_perm(
+    mut wts: Sam3Weights, name: String, x: DeviceBuffer[DT], y: DeviceBuffer[DT], rows: Int, cols: Int, grid: Int, win: Int,
+) raises:
+    """`bias_add` with `y` in window order (`_win_row`)."""
+    wts.ctx.enqueue_function[bias_add_perm_kernel](
+        x, y, wts.w(name + ".bias"), Int64(cols), Int64(grid), Int64(win), grid_dim=(rows, blocks(cols)), block_dim=TPB,
+    )
+
+
+def mlp_residual_b[ACT: Int](
+    mut wts: Sam3Weights, fc1: String, fc2: String, xb: DeviceBuffer[DType.bfloat16], t: Int, d: Int, ff: Int,
+    resid: DeviceBuffer[DT],
+) raises:
+    """`mlp_residual` from an input already in bf16 (SAM3_BF16)."""
+    var f1 = wts.ctx.enqueue_create_buffer[DT](t * ff)
+    linear_into_b(wts, fc1, xb, t, d, f1, bias=False)
+    _mlp_tail[ACT](wts, fc1, fc2, f1, t, d, ff, resid)
+
+
 def mlp_residual[ACT: Int](
     mut wts: Sam3Weights, fc1: String, fc2: String, x: DeviceBuffer[DT], t: Int, d: Int, ff: Int,
     resid: DeviceBuffer[DT],
@@ -260,12 +290,25 @@ def mlp_residual[ACT: Int](
     unfused order); with SAM3_BF16 the activation writes fc2's bf16 operand."""
     var f1 = wts.ctx.enqueue_create_buffer[DT](t * ff)
     linear_into(wts, fc1, x, t, d, f1, bias=False)
+    _mlp_tail[ACT](wts, fc1, fc2, f1, t, d, ff, resid)
+
+
+def _mlp_tail[ACT: Int](
+    mut wts: Sam3Weights, fc1: String, fc2: String, f1: DeviceBuffer[DT], t: Int, d: Int, ff: Int,
+    resid: DeviceBuffer[DT],
+) raises:
+    """`resid += fc2(act(f1 + fc1.bias))`."""
     var f2 = wts.ctx.enqueue_create_buffer[DT](t * d)
     comptime if SAM3_BF16:
         var fb = wts.ctx.enqueue_create_buffer[DType.bfloat16](t * ff)
-        wts.ctx.enqueue_function[bias_act_bf16_kernel[ACT]](
-            f1, wts.w(fc1 + ".bias"), fb, Int64(ff), grid_dim=(t, blocks(ff)), block_dim=TPB,
-        )
+        if ff % 4 == 0:
+            wts.ctx.enqueue_function[bias_act_bf16_v4_kernel[ACT]](
+                f1, wts.w(fc1 + ".bias"), fb, Int64(ff), grid_dim=(t, (ff // 4 + TPB - 1) // TPB), block_dim=TPB,
+            )
+        else:
+            wts.ctx.enqueue_function[bias_act_bf16_kernel[ACT]](
+                f1, wts.w(fc1 + ".bias"), fb, Int64(ff), grid_dim=(t, blocks(ff)), block_dim=TPB,
+            )
         cublas_gemm_lp[False, True, DType.bfloat16, DT](wts.ctx, f2, fb, wts.w_bf16(fc2 + ".weight"), t, d, ff, 0.0)
     else:
         wts.ctx.enqueue_function[bias_act_kernel[ACT]](
@@ -279,12 +322,12 @@ def mlp_residual[ACT: Int](
 
 
 @always_inline
-def _act[ACT: Int](v: Scalar[DT]) -> Scalar[DT]:
-    """1: exact GELU (`gelu_kernel`'s); 2: ReLU; else identity."""
+def _act[ACT: Int, W: Int = 1](v: SIMD[DT, W]) -> SIMD[DT, W]:
+    """1: exact GELU (`gelu_kernel`'s); 2: ReLU; else identity — per lane."""
     comptime if ACT == 1:
-        return Scalar[DT](0.5) * v * (Scalar[DT](1) + erf(v * Scalar[DT](0.7071067811865476)))
+        return SIMD[DT, W](0.5) * v * (SIMD[DT, W](1) + erf(v * SIMD[DT, W](0.7071067811865476)))
     elif ACT == 2:
-        return max(v, Scalar[DT](0))
+        return max(v, SIMD[DT, W](0))
     else:
         return v
 
@@ -306,6 +349,73 @@ def bias_act_bf16_kernel[ACT: Int](x: Ptr, b: Ptr, dst: BPtr, cols_n: Int64):
     if c < cols:
         var i = Int(block_idx.x) * cols + c
         dst[unsafe_offset=i] = _act[ACT](x[unsafe_offset=i] + b[unsafe_offset=c]).cast[DType.bfloat16]()
+
+
+def bias_act_bf16_v4_kernel[ACT: Int](x: Ptr, b: Ptr, dst: BPtr, cols_n: Int64):
+    """`bias_act_bf16_kernel` four columns a thread (16-byte loads; `cols` a
+    multiple of 4): the same per-element operations. Grid `(rows, ceil(cols /
+    4 TPB))`."""
+    var c = (Int(block_idx.y) * TPB + Int(thread_idx.x)) * 4
+    var cols = Int(cols_n)
+    if c < cols:
+        var i = Int(block_idx.x) * cols + c
+        var v = x.unsafe_load[width=4, alignment=16](i) + b.unsafe_load[width=4, alignment=16](c)
+        dst.unsafe_store[alignment=8](i, _act[ACT, 4](v).cast[DType.bfloat16]())
+
+
+@always_inline
+def _win_row(n: Int, grid: Int, win: Int) -> Int:
+    """Raster row `n` of a `grid x grid` map -> its row in window order (the
+    `win x win` windows row-major, their tokens row-major) — `vit.window_kernel`'s
+    order; `win` 0: `n`."""
+    if win == 0:
+        return n
+    var r = _d(n, grid)
+    var c = n - r * grid
+    var wr = _d(r, win)
+    var wc = _d(c, win)
+    return ((wr * _d(grid, win) + wc) * win + (r - wr * win)) * win + (c - wc * win)
+
+
+def layer_norm_bf16_kernel(
+    x: Ptr, y: BPtr, w: Ptr, b: Ptr, dim_n: Int64, eps: Float32, grid_n: Int64, win_n: Int64,
+):
+    """`layer_norm_kernel`'s arithmetic, the result rounded to bf16 (the next
+    GEMM's operand) into row `_win_row(r)` — the backbone's windowed layers get
+    their input in window order without a permutation pass. A block per row."""
+    var dim = Int(dim_n)
+    var r = Int(block_idx.x)
+    var row = r * dim
+    var orow = _win_row(r, Int(grid_n), Int(win_n)) * dim
+    var tid = Int(thread_idx.x)
+    var s = Scalar[DT](0)
+    var d = tid
+    while d < dim:
+        s += x[unsafe_offset=row + d]
+        d += TPB
+    var mean = block.sum[block_size=TPB, broadcast=True](val=s) / Scalar[DT](dim)
+    var q = Scalar[DT](0)
+    d = tid
+    while d < dim:
+        var v = x[unsafe_offset=row + d] - mean
+        q += v * v
+        d += TPB
+    var inv = Scalar[DT](1) / sqrt(block.sum[block_size=TPB, broadcast=True](val=q) / Scalar[DT](dim) + Scalar[DT](eps))
+    d = tid
+    while d < dim:
+        y[unsafe_offset=orow + d] = ((x[unsafe_offset=row + d] - mean) * inv * w[unsafe_offset=d] + b[unsafe_offset=d]).cast[DType.bfloat16]()
+        d += TPB
+
+
+def bias_add_perm_kernel(x: Ptr, y: Ptr, b: Ptr, cols_n: Int64, grid_n: Int64, win_n: Int64):
+    """`x[r, c] += y[_win_row(r), c] + b[c]`: a residual add reading a
+    window-order result in raster order. Grid `(rows, ceil(cols / TPB))`."""
+    var c = Int(block_idx.y) * TPB + Int(thread_idx.x)
+    var cols = Int(cols_n)
+    if c < cols:
+        var r = Int(block_idx.x)
+        var i = r * cols + c
+        x[unsafe_offset=i] = x[unsafe_offset=i] + (y[unsafe_offset=_win_row(r, Int(grid_n), Int(win_n)) * cols + c] + b[unsafe_offset=c])
 
 
 def bias_add_kernel(x: Ptr, y: Ptr, b: Ptr, cols_n: Int64):

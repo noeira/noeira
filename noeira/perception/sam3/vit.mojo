@@ -50,7 +50,7 @@ from noeira.llm.lfm3.model import attention_probs, attention_apply, split_heads
 from .ops import (
     Sam3Weights, TPB, Ptr, blocks, linear, layer_norm, gemm_tb, add_kernel, gelu_kernel, rope_pairs_kernel,
     put_head_kernel, mha, linear_into, flash_self, USE_FLASH, bias_add, mlp_residual,
-    SAM3_BF16, linear_into_b, flash_self_bf16, qkv_rope_bf16_kernel,
+    SAM3_BF16, linear_into_b, flash_self_bf16, qkv_rope_bf16_kernel, layer_norm_bf16, bias_add_perm, mlp_residual_b,
 )
 
 
@@ -187,14 +187,22 @@ struct Sam3ViT(Movable):
         for li in range(LAYERS):
             var p = String("layers.") + String(li) + "."
             var glob = is_global(li) and (self.debug & 2) == 0
-            var h = self.new(NTOK * DIM)
-            layer_norm(self.wts, p + "layer_norm1", x, h, NTOK, DIM, EPS)
             var hw: DeviceBuffer[DT]
-            if glob:
-                hw = h
+            var hb: DeviceBuffer[DType.bfloat16]
+            comptime if SAM3_BF16:
+                # bf16: LN1 written as the GEMM's bf16 operand, in window order (no permutation pass)
+                hw = self.new(1)
+                hb = ctx.enqueue_create_buffer[DType.bfloat16](NTOK * DIM)
+                layer_norm_bf16(self.wts, p + "layer_norm1", x, hb, NTOK, DIM, EPS, GRID, 0 if glob else WIN)
             else:
-                hw = self.new(NTOK * DIM)
-                ctx.enqueue_function[window_kernel](h, hw, Int64(0), grid_dim=(blocks(DIM), NTOK), block_dim=TPB)
+                hb = ctx.enqueue_create_buffer[DType.bfloat16](1)
+                var h = self.new(NTOK * DIM)
+                layer_norm(self.wts, p + "layer_norm1", x, h, NTOK, DIM, EPS)
+                if glob:
+                    hw = h
+                else:
+                    hw = self.new(NTOK * DIM)
+                    ctx.enqueue_function[window_kernel](h, hw, Int64(0), grid_dim=(blocks(DIM), NTOK), block_dim=TPB)
             var c_t = self.rope_glob[0] if glob else self.rope_win[0]
             var s_t = self.rope_glob[1] if glob else self.rope_win[1]
             var a = self.new(NTOK * DIM)
@@ -203,7 +211,7 @@ struct Sam3ViT(Movable):
                 # bf16: the q | k | v GEMM without bias, then bias + RoPE + bf16 in one pass,
                 # the bf16 fused attention, its bf16 output straight into o_proj's GEMM
                 var qkv = self.new(3 * NTOK * DIM)
-                linear_into(self.wts, p + "attention.qkv_proj", hw, NTOK, DIM, qkv, bias=False)
+                linear_into_b(self.wts, p + "attention.qkv_proj", hb, NTOK, DIM, qkv, bias=False)
                 var qb = ctx.enqueue_create_buffer[DType.bfloat16](3 * NTOK * DIM)
                 ctx.enqueue_function[qkv_rope_bf16_kernel](
                     qkv, self.wts.w(p + "attention.qkv_proj.bias"), c_t, s_t, qb, Int64(HEADS), Int64(HD // 2),
@@ -260,14 +268,21 @@ struct Sam3ViT(Movable):
                 linear_into(self.wts, p + "attention.o_proj", a, NTOK, DIM, o, bias=False)
             # o_proj's bias folded into the residual add (a bias is per column: the window
             # permutation commutes with it)
-            if not glob:
-                var orr = self.new(NTOK * DIM)
-                ctx.enqueue_function[window_kernel](o, orr, Int64(1), grid_dim=(blocks(DIM), NTOK), block_dim=TPB)
-                o = orr
-            bias_add(self.wts, p + "attention.o_proj", x, o, NTOK, DIM)
-            var h2 = self.new(NTOK * DIM)
-            layer_norm(self.wts, p + "layer_norm2", x, h2, NTOK, DIM, EPS)
-            mlp_residual[1](self.wts, p + "mlp.fc1", p + "mlp.fc2", h2, NTOK, DIM, FF, x)
+            comptime if SAM3_BF16:
+                # the residual add reads the window-order result through the same map
+                bias_add_perm(self.wts, p + "attention.o_proj", x, o, NTOK, DIM, GRID, 0 if glob else WIN)
+                var h2b = ctx.enqueue_create_buffer[DType.bfloat16](NTOK * DIM)
+                layer_norm_bf16(self.wts, p + "layer_norm2", x, h2b, NTOK, DIM, EPS)
+                mlp_residual_b[1](self.wts, p + "mlp.fc1", p + "mlp.fc2", h2b, NTOK, DIM, FF, x)
+            else:
+                if not glob:
+                    var orr = self.new(NTOK * DIM)
+                    ctx.enqueue_function[window_kernel](o, orr, Int64(1), grid_dim=(blocks(DIM), NTOK), block_dim=TPB)
+                    o = orr
+                bias_add(self.wts, p + "attention.o_proj", x, o, NTOK, DIM)
+                var h2 = self.new(NTOK * DIM)
+                layer_norm(self.wts, p + "layer_norm2", x, h2, NTOK, DIM, EPS)
+                mlp_residual[1](self.wts, p + "mlp.fc1", p + "mlp.fc2", h2, NTOK, DIM, FF, x)
             if keep_taps:
                 taps.append(_copy(ctx, x, NTOK * DIM))
         return x^
