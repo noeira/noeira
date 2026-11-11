@@ -2,7 +2,9 @@
 segmented — warm (one untimed round first).
 
     build-jetson benchmarks/bench_sam3_gpu.mojo [-D SAM3_TF32=1] -o build/bench_sam3
-    SAM3_CHECKPOINT=... ./build/bench_sam3 [ref dir] [reps]
+    SAM3_CHECKPOINT=... [SAM3_STAGES=1] ./build/bench_sam3 [ref dir] [reps]
+
+`SAM3_STAGES=1`: a word's time split by stage (synchronised after each).
 
 The picture is the reference's (`tools/perception/dump_sam3_reference.py`, 640 x 480).
 """
@@ -32,6 +34,9 @@ def main() raises:
     var img = sam.encode_image(pic)
     for w in words:
         _ = sam.segment(img, w)
+    sam.timing = getenv("SAM3_STAGES").byte_length() > 0
+    for i in range(5):
+        sam.stage_ms[i] = 0.0
     var enc_ms = 0.0
     var seg_ms = 0.0
     for _ in range(reps):
@@ -45,3 +50,11 @@ def main() raises:
             seg_ms += Float64(perf_counter_ns() - t1) / 1e6
     print("SAM 3", "(bf16 linears)" if SAM3_BF16 else ("(TF32)" if SAM3_TF32 else "(fp32)"), ": encode_image", enc_ms / Float64(reps), "ms, segment",
           seg_ms / Float64(reps * len(words)), "ms a word")
+    if sam.timing:
+        var names: List[String] = ["text", "detr encoder", "decoder", "mask decoder", "host masks"]
+        var n = Float64(reps * len(words))
+        var tot = 0.0
+        for i in range(5):
+            print("  ", names[i], sam.stage_ms[i] / n, "ms a word")
+            tot += sam.stage_ms[i]
+        print("   after the last stage (scope exit)", seg_ms / n - tot / n, "ms a word")

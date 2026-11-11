@@ -25,6 +25,7 @@ do for a TEXT prompt, in Mojo (`tools/perception/detector_eval.py`'s use).
 """
 
 from std.math import exp
+from std.time import perf_counter_ns
 from max.gpu.host import DeviceContext, DeviceBuffer
 
 from noeira.ai.picture import Picture
@@ -68,6 +69,11 @@ struct Sam3(Movable):
     var dec: Sam3Decoder
     var masks: Sam3MaskDecoder
     var tok: ClipBPE
+    var timing: Bool
+    """Benchmarks: synchronise after each stage of `segment` and add its time
+    to `stage_ms` (tokens + text, DETR encoder, decoder, mask decoder, host
+    post-processing)."""
+    var stage_ms: List[Float64]
 
     def __init__(out self, var ctx: DeviceContext, path: String = String("")) raises:
         var p = path if path.byte_length() > 0 else sam3_checkpoint()
@@ -79,6 +85,16 @@ struct Sam3(Movable):
         self.enc = Sam3DetrEncoder(ctx, p)
         self.dec = Sam3Decoder(ctx, p)
         self.masks = Sam3MaskDecoder(ctx^, p)
+        self.timing = False
+        self.stage_ms = List[Float64](length=5, fill=0.0)
+
+    def _lap(mut self, stage: Int, mut t: Int) raises:
+        if not self.timing:
+            return
+        self.vit.wts.ctx.synchronize()
+        var now = perf_counter_ns()
+        self.stage_ms[stage] += Float64(now - t) / 1e6
+        t = now
 
     def pixel_values(self, pic: Picture) raises -> DeviceBuffer[DT]:
         """[3, 1008, 1008], the processor's `pixel_values`."""
@@ -112,12 +128,16 @@ struct Sam3(Movable):
     def segment(
         mut self, img: Sam3Image, word: String, threshold: Float32 = 0.3, mask_threshold: Float32 = 0.5,
     ) raises -> List[Sam3Instance]:
+        var t = perf_counter_ns()
         var toks = self.tok.encode(word, 32)
         var none = List[DeviceBuffer[DT]]()
         var tf = self.text.forward(toks, none)
+        self._lap(0, t)
         ref l72 = img.levels[2]
         var fused = self.enc.forward(l72.x, img.pos72, l72.h * l72.w, tf, toks.length, none)
+        self._lap(1, t)
         var det = self.dec.forward(fused, img.pos72, tf, toks.length)
+        self._lap(2, t)
         var pres = Float32(1.0) / (Float32(1.0) + exp(-det.presence))
         var kept = List[Int]()
         var scores = List[Float32]()
@@ -130,6 +150,7 @@ struct Sam3(Movable):
         if len(kept) == 0:
             return out^
         var m = self.masks.forward(det.queries, img.levels[0].x, img.levels[1].x, fused, tf, toks.length, img.levels[0].h, img.levels[0].w)
+        self._lap(3, t)
         var mh = m.h
         var mw = m.w
         ref ctx = self.vit.wts.ctx
@@ -152,4 +173,5 @@ struct Sam3(Movable):
             box.append(det.boxes[q * 4 + 2] * Float32(img.width))
             box.append(det.boxes[q * 4 + 3] * Float32(img.height))
             out.append(Sam3Instance(scores[k], box^, mask^, q))
+        self._lap(4, t)
         return out^

@@ -21,7 +21,8 @@ normalised, 128 features per axis, temperature 1e4) depends on its shape alone:
 Layout: everything here is TOKEN-MAJOR, `[row w + col, channel]` (torch's
 CHW transposed), so a 1x1 conv is a linear and a transposed conv a GEMM plus a
 scatter. A 3x3 conv is nine GEMMs on shifted copies (an im2col of the 288x288
-level would be 764 MB).
+level would be 764 MB) — or, in the TF32 / bf16 builds on NVIDIA, one cuDNN
+implicit-GEMM call (`CONV_CUDNN`).
 
 `debug` (falsification only): bit 1, the 3x3 taps flipped (a convolution, not
 torch's correlation); bit 2, the transposed conv's dy and dx swapped.
@@ -36,13 +37,18 @@ from std.sys import default_accelerator
 
 from noeira.nn.constants import DT
 from noeira.nn.core.cublas_gemm import cublas_gemm
-from .ops import Sam3Weights, TPB, Ptr, blocks, linear, gemm_tb, add_kernel, gelu_kernel, SAM3_TF32, _d
+from noeira.nn.core.cudnn_conv import cudnn_conv_forward
+from .ops import Sam3Weights, TPB, Ptr, blocks, linear, gemm_tb, add_kernel, gelu_kernel, bias_kernel, SAM3_TF32, _d
 
 
 comptime NECK_PREFIX = "detector_model.vision_encoder.neck."
 comptime FPN: Int = 256
 comptime IN_DIM: Int = 1024
 comptime GRID: Int = 72
+comptime CONV_CUDNN: Bool = SAM3_TF32 and default_accelerator().is_nvidia_gpu()
+"""TF32 / bf16 builds on NVIDIA: the 3x3 convs through cuDNN's implicit GEMM
+(TF32), which never writes the shifted copies (at 288 x 288 the nine taps moved
+~4.6 GB a conv). The fp32 build keeps the nine GEMMs (the strict gates' path)."""
 
 
 def gemm_nn(ctx: DeviceContext, dst: DeviceBuffer[DT], a: DeviceBuffer[DT], b: DeviceBuffer[DT], m: Int, n: Int, k: Int) raises:
@@ -100,14 +106,16 @@ def shift_kernel(x: Ptr, dst: Ptr, h_n: Int64, w_n: Int64, c_n: Int64, dy_n: Int
     dst[unsafe_offset=n * cc + ch] = v
 
 
-def tap_weights_kernel(w: Ptr, dst: Ptr, co_n: Int64, ci_n: Int64):
-    """`dst[t, co, ci] = w[co, ci, ky, kx]`, t = 3 ky + kx. Grid `(ceil(ci / TPB), co, 9)`."""
+def tap_weights_kernel(w: Ptr, dst: Ptr, co_n: Int64, ci_n: Int64, krsc: Int64):
+    """`dst[t, co, ci] = w[co, ci, ky, kx]`, t = 3 ky + kx; with `krsc`
+    `dst[co, t, ci]` (cuDNN's NHWC filter). Grid `(ceil(ci / TPB), co, 9)`."""
     var ci = Int(block_idx.x) * TPB + Int(thread_idx.x)
     var co = Int(block_idx.y)
     var t = Int(block_idx.z)
     var cin = Int(ci_n)
     if ci < cin:
-        dst[unsafe_offset=(t * Int(co_n) + co) * cin + ci] = w[unsafe_offset=(co * cin + ci) * 9 + t]
+        var d = (co * 9 + t) * cin + ci if krsc != 0 else (t * Int(co_n) + co) * cin + ci
+        dst[unsafe_offset=d] = w[unsafe_offset=(co * cin + ci) * 9 + t]
 
 
 def fill_rows_kernel(dst: Ptr, b: Ptr, cols_n: Int64, n_n: Int64):
@@ -136,9 +144,12 @@ def maxpool2_kernel(x: Ptr, dst: Ptr, w_n: Int64, c_n: Int64):
 
 
 def conv3x3_taps(ctx: DeviceContext, w: DeviceBuffer[DT]) raises -> DeviceBuffer[DT]:
-    """A [256, 256, 3, 3] conv weight as [9, 256, 256], one GEMM operand per tap."""
+    """A [256, 256, 3, 3] conv weight as [9, 256, 256], one GEMM operand per tap
+    — or, with CONV_CUDNN, as cuDNN's NHWC filter [256, 3, 3, 256]."""
     var t = ctx.enqueue_create_buffer[DT](9 * FPN * FPN)
-    ctx.enqueue_function[tap_weights_kernel](w, t, Int64(FPN), Int64(FPN), grid_dim=(blocks(FPN), FPN, 9), block_dim=TPB)
+    ctx.enqueue_function[tap_weights_kernel](
+        w, t, Int64(FPN), Int64(FPN), Int64(1 if CONV_CUDNN else 0), grid_dim=(blocks(FPN), FPN, 9), block_dim=TPB,
+    )
     return t^
 
 
@@ -148,8 +159,28 @@ def conv3x3(
 ) raises -> DeviceBuffer[DT]:
     """A 256 -> 256 3x3 conv, padding 1, on token-major `x` [h w, 256]: the bias,
     then per tap a shifted copy through one GEMM (`taps`: `conv3x3_taps`).
-    `flip` (falsification only): the taps reversed — a convolution."""
+    `flip` (falsification only): the taps reversed — a convolution.
+    CONV_CUDNN: one cuDNN call (the SAM 3 grids 288 / 144 / 72 / 36, square),
+    then the bias."""
     var n = h * w
+    comptime if CONV_CUDNN:
+        if flip:
+            raise Error("sam3 conv3x3: `flip` is the fp32 path's (the nine GEMMs)")
+        var y = ctx.enqueue_create_buffer[DT](n * FPN)
+        if h != w:
+            raise Error("sam3 conv3x3: cuDNN path built for square grids, not " + String(h) + "x" + String(w))
+        if h == 288:
+            cudnn_conv_forward[1, FPN, FPN, 3, 1, 1, 288, 288, True, True](ctx, y, x, taps)
+        elif h == 144:
+            cudnn_conv_forward[1, FPN, FPN, 3, 1, 1, 144, 144, True, True](ctx, y, x, taps)
+        elif h == 72:
+            cudnn_conv_forward[1, FPN, FPN, 3, 1, 1, 72, 72, True, True](ctx, y, x, taps)
+        elif h == 36:
+            cudnn_conv_forward[1, FPN, FPN, 3, 1, 1, 36, 36, True, True](ctx, y, x, taps)
+        else:
+            raise Error("sam3 conv3x3: no cuDNN plan for " + String(h) + "x" + String(w))
+        ctx.enqueue_function[bias_kernel](y, bias, Int64(FPN), Int64(n), grid_dim=(n, blocks(FPN)), block_dim=TPB)
+        return y^
     var out = ctx.enqueue_create_buffer[DT](n * FPN)
     ctx.enqueue_function[fill_rows_kernel](out, bias, Int64(FPN), Int64(n * FPN), grid_dim=blocks(n * FPN), block_dim=TPB)
     var xs = ctx.enqueue_create_buffer[DT](n * FPN)
