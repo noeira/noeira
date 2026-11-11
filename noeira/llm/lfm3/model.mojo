@@ -71,6 +71,7 @@ from .kernels import (
     lm_head_kernel, log_softmax_rows_kernel, f32_to_bf16_kernel, split_heads_kernel, masked_softmax_kernel,
     merge_heads_gate_kernel, LM_SLOTS, rms_bf16_kernel, swiglu_bf16_kernel,
 )
+from .vision_kernels import put_rows_kernel
 
 
 comptime LF_TF32: Bool = is_defined["LFM3_TF32"]()
@@ -473,74 +474,19 @@ struct Lfm3Text(Movable):
             x, y, self.w(name + ".weight"), Int64(dim), self.cfg.eps, grid_dim=rows, block_dim=TPB,
         )
 
-    def _split_heads(self, x: DeviceBuffer[DT], t: Int, heads: Int) raises -> DeviceBuffer[DT]:
-        var hd = self.cfg.head_dim
-        var y = self.new(heads * t * hd)
-        self.ctx.enqueue_function[split_heads_kernel](
-            x, y, Int64(t), Int64(heads), Int64(hd), grid_dim=(_blocks(heads * hd), t), block_dim=TPB,
-        )
-        return y^
-
     def attn_probs(
         self, q: DeviceBuffer[DT], k: DeviceBuffer[DT], sc: DeviceBuffer[DT], groups: DeviceBuffer[DType.int32],
         t: Int, mode: Int, state_len: Int,
     ) raises:
-        """`sc[h, i, :]` = the attention probabilities of query `i` in head `h`
-        (0 where `i` may not see `j`), from `q[T, heads, hd]` and `k[T, kv, hd]`
-        after their norms and RoPE. NVIDIA: one GEMM per KV head (its `rep`
-        query heads stacked, `[rep T, hd] @ [T, hd]^T`), then the mask and the
-        softmax in one kernel. Elsewhere: a dot product per thread."""
-        var hd = self.cfg.head_dim
-        var nh = self.cfg.heads
-        var nkv = self.cfg.kv_heads
-        var scale = Float32(1.0) / Float32(Float64(hd) ** 0.5)
-        comptime if default_accelerator().is_nvidia_gpu():
-            var rep = nh // nkv
-            var qh = self._split_heads(q, t, nh)
-            var kh = self._split_heads(k, t, nkv)
-            for kv in range(nkv):
-                cublas_gemm[False, True, LF_ATTN_TF32](
-                    self.ctx, sc.create_sub_buffer[DT](kv * rep * t * t, rep * t * t),
-                    qh.create_sub_buffer[DT](kv * rep * t * hd, rep * t * hd),
-                    kh.create_sub_buffer[DT](kv * t * hd, t * hd), rep * t, t, hd, 0.0,
-                )
-            self.ctx.enqueue_function[masked_softmax_kernel](
-                sc, groups, Int64(t), scale, Int64(mode), Int64(state_len), Int64(self.cfg.window),
-                grid_dim=(t, nh), block_dim=TPB,
-            )
-        else:
-            self.ctx.enqueue_function[scores_kernel](
-                q, k, sc, groups, Int64(t), Int64(nh), Int64(nkv), Int64(hd), scale, Int64(mode),
-                Int64(state_len), Int64(self.cfg.window), grid_dim=(_blocks(t), t, nh), block_dim=TPB,
-            )
-            self.ctx.enqueue_function[softmax_rows_kernel](sc, Int64(t), grid_dim=nh * t, block_dim=TPB)
+        attention_probs(
+            self.ctx, q, k, sc, groups, t, self.cfg.heads, self.cfg.kv_heads, self.cfg.head_dim, mode, state_len,
+            self.cfg.window,
+        )
 
     def attn_apply(
         self, sc: DeviceBuffer[DT], v: DeviceBuffer[DT], gate: DeviceBuffer[DT], dst: DeviceBuffer[DT], t: Int,
     ) raises:
-        """`dst[i, h, :] = sigmoid(gate[i, h]) * sum_j sc[h, i, j] v[j, h / rep, :]`.
-        NVIDIA: one GEMM per KV head (`[rep T, T] @ [T, hd]`), then the gate."""
-        var hd = self.cfg.head_dim
-        var nh = self.cfg.heads
-        var nkv = self.cfg.kv_heads
-        comptime if default_accelerator().is_nvidia_gpu():
-            var rep = nh // nkv
-            var vh = self._split_heads(v, t, nkv)
-            var oh = self.new(nh * t * hd)
-            for kv in range(nkv):
-                cublas_gemm[False, False, LF_ATTN_TF32](
-                    self.ctx, oh.create_sub_buffer[DT](kv * rep * t * hd, rep * t * hd),
-                    sc.create_sub_buffer[DT](kv * rep * t * t, rep * t * t),
-                    vh.create_sub_buffer[DT](kv * t * hd, t * hd), rep * t, hd, t, 0.0,
-                )
-            self.ctx.enqueue_function[merge_heads_gate_kernel](
-                oh, gate, dst, Int64(t), Int64(nh), Int64(hd), grid_dim=(_blocks(nh * hd), t), block_dim=TPB,
-            )
-        else:
-            self.ctx.enqueue_function[attn_out_kernel](
-                sc, v, gate, dst, Int64(t), Int64(nh), Int64(nkv), Int64(hd),
-                grid_dim=(_blocks(nh * hd), t), block_dim=TPB,
-            )
+        attention_apply(self.ctx, sc, v, gate, True, dst, t, self.cfg.heads, self.cfg.kv_heads, self.cfg.head_dim)
 
     def rope_tables(
         self, t: Int, theta: Float64, prf: Float64, neg_sin: Bool = False,
@@ -573,9 +519,12 @@ struct Lfm3Text(Movable):
     def forward(
         mut self, ids: List[Int], groups: List[Int], state_len: Int,
         mut taps: List[DeviceBuffer[DT]], keep_taps: Bool = False, causal_full: Bool = False,
+        image_feats: Optional[DeviceBuffer[DT]] = None, image_token: Int = -1,
     ) raises -> DeviceBuffer[DT]:
         """`[T, hidden]` after the final norm. `taps` (with `keep_taps`): the
-        embedding, then each layer's output."""
+        embedding, then each layer's output. `image_feats` (LFM3-VL,
+        `Lfm3Vision.encode_all`): one row per `image_token` in `ids`, in order,
+        written over those tokens' embeddings (transformers' `masked_scatter`)."""
         var t = len(ids)
         var dm = self.cfg.hidden
         var hd = self.cfg.head_dim
@@ -594,6 +543,26 @@ struct Lfm3Text(Movable):
         self.ctx.enqueue_function[embed_kernel](
             did, self.w("embed_tokens.weight"), x, Int64(dm), grid_dim=(_blocks(dm), t), block_dim=TPB,
         )
+        if image_feats:
+            var at = List[Int]()
+            for i in range(t):
+                if ids[i] == image_token:
+                    at.append(i)
+            var feats = image_feats.value()
+            if len(at) * dm != len(feats):
+                raise Error(
+                    "lfm3: " + String(len(at)) + " image tokens in the prompt for " + String(len(feats) // dm)
+                    + " rows of image features"
+                )
+            if len(at) > 0:
+                var hp = self.ctx.enqueue_create_host_buffer[DType.int32](len(at))
+                for i in range(len(at)):
+                    hp[i] = Int32(at[i])
+                var dp = self.ctx.enqueue_create_buffer[DType.int32](len(at))
+                self.ctx.enqueue_copy(dp, hp)
+                self.ctx.enqueue_function[put_rows_kernel](
+                    feats, dp, x, Int64(dm), grid_dim=(_blocks(dm), len(at)), block_dim=TPB,
+                )
         if keep_taps:
             taps.append(self._copy(x, t * dm))
         var full_prf = 1.0 if (self.debug & 2) != 0 else self.cfg.prf_full
@@ -769,3 +738,75 @@ struct Lfm3Text(Movable):
         for i in range(n):
             out.append(h[i])
         return out^
+
+
+# ── the attention, shared by the text backbone and the vision tower ─────
+
+def split_heads(ctx: DeviceContext, x: DeviceBuffer[DT], t: Int, heads: Int, hd: Int) raises -> DeviceBuffer[DT]:
+    var y = ctx.enqueue_create_buffer[DT](heads * t * hd)
+    ctx.enqueue_function[split_heads_kernel](
+        x, y, Int64(t), Int64(heads), Int64(hd), grid_dim=(_blocks(heads * hd), t), block_dim=TPB,
+    )
+    return y^
+
+
+def attention_probs(
+    ctx: DeviceContext, q: DeviceBuffer[DT], k: DeviceBuffer[DT], sc: DeviceBuffer[DT],
+    groups: DeviceBuffer[DType.int32], t: Int, nh: Int, nkv: Int, hd: Int, mode: Int, state_len: Int, window: Int,
+) raises:
+    """`sc[h, i, :]` = the attention probabilities of query `i` in head `h`
+    (0 where `i` may not see `j`: `kernels._sees`, mode 3 = every token sees
+    every token), from `q[T, nh, hd]` and `k[T, nkv, hd]` after their norms and
+    RoPE; scale `1 / sqrt(hd)`. NVIDIA: one GEMM per KV head (its `rep` query
+    heads stacked, `[rep T, hd] @ [T, hd]^T`), then the mask and the softmax in
+    one kernel. Elsewhere: a dot product per thread. `groups` is read in mode 0
+    only (any int32 buffer otherwise)."""
+    var scale = Float32(1.0) / Float32(Float64(hd) ** 0.5)
+    comptime if default_accelerator().is_nvidia_gpu():
+        var rep = nh // nkv
+        var qh = split_heads(ctx, q, t, nh, hd)
+        var kh = split_heads(ctx, k, t, nkv, hd)
+        for kv in range(nkv):
+            cublas_gemm[False, True, LF_ATTN_TF32](
+                ctx, sc.create_sub_buffer[DT](kv * rep * t * t, rep * t * t),
+                qh.create_sub_buffer[DT](kv * rep * t * hd, rep * t * hd),
+                kh.create_sub_buffer[DT](kv * t * hd, t * hd), rep * t, t, hd, 0.0,
+            )
+        ctx.enqueue_function[masked_softmax_kernel](
+            sc, groups, Int64(t), scale, Int64(mode), Int64(state_len), Int64(window),
+            grid_dim=(t, nh), block_dim=TPB,
+        )
+    else:
+        ctx.enqueue_function[scores_kernel](
+            q, k, sc, groups, Int64(t), Int64(nh), Int64(nkv), Int64(hd), scale, Int64(mode),
+            Int64(state_len), Int64(window), grid_dim=(_blocks(t), t, nh), block_dim=TPB,
+        )
+        ctx.enqueue_function[softmax_rows_kernel](sc, Int64(t), grid_dim=nh * t, block_dim=TPB)
+
+
+def attention_apply(
+    ctx: DeviceContext, sc: DeviceBuffer[DT], v: DeviceBuffer[DT], gate: DeviceBuffer[DT], has_gate: Bool,
+    dst: DeviceBuffer[DT], t: Int, nh: Int, nkv: Int, hd: Int,
+) raises:
+    """`dst[i, h, :] = g * sum_j sc[h, i, j] v[j, h / rep, :]`, `g` =
+    `sigmoid(gate[i, h])` (`has_gate`) or 1 (`gate` then unread). NVIDIA: one
+    GEMM per KV head (`[rep T, T] @ [T, hd]`), then the gate."""
+    comptime if default_accelerator().is_nvidia_gpu():
+        var rep = nh // nkv
+        var vh = split_heads(ctx, v, t, nkv, hd)
+        var oh = ctx.enqueue_create_buffer[DT](nh * t * hd)
+        for kv in range(nkv):
+            cublas_gemm[False, False, LF_ATTN_TF32](
+                ctx, oh.create_sub_buffer[DT](kv * rep * t * hd, rep * t * hd),
+                sc.create_sub_buffer[DT](kv * rep * t * t, rep * t * t),
+                vh.create_sub_buffer[DT](kv * t * hd, t * hd), rep * t, hd, t, 0.0,
+            )
+        ctx.enqueue_function[merge_heads_gate_kernel](
+            oh, gate, dst, Int64(t), Int64(nh), Int64(hd), Int64(1 if has_gate else 0),
+            grid_dim=(_blocks(nh * hd), t), block_dim=TPB,
+        )
+    else:
+        ctx.enqueue_function[attn_out_kernel](
+            sc, v, gate, dst, Int64(t), Int64(nh), Int64(nkv), Int64(hd), Int64(1 if has_gate else 0),
+            grid_dim=(_blocks(nh * hd), t), block_dim=TPB,
+        )

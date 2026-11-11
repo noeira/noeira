@@ -17,7 +17,7 @@ ASCII Python dict literal padded with spaces so that data starts aligned to
 64 bytes, and it ends with `\\n`. Three keys matter: `descr` (a dtype
 string), `fortran_order` (a bool) and `shape` (a tuple).
 
-WHAT IS SUPPORTED, AND WHY THE REST RAISES. `<f8`, `<f4`, `<i8`, `<i4` and
+WHAT IS SUPPORTED, AND WHY THE REST RAISES. `<f8`, `<f4`, `<i8`, `<i4`, `|u1` (pictures) and
 their `=`/`|`-prefixed and prefix-less spellings, C order only. Everything
 else raises by NAME:
 
@@ -216,9 +216,12 @@ def parse_npy_header(prefix: List[UInt8], total_size: Int) raises -> NpyHeader:
     elif body == "i4" or body == "u4":
         item_size = 4
         is_float = False
+    elif body == "u1":
+        item_size = 1
+        is_float = False
     else:
         raise Error(
-            "npy: dtype `" + descr + "` is not one we read — f4/f8/i4/i8 only"
+            "npy: dtype `" + descr + "` is not one we read — f4/f8/i4/i8/u1 only"
             " (an `O` dtype is a pickle: see io/pickle.mojo)"
         )
 
@@ -279,6 +282,9 @@ def load_npy_f64(path: String) raises -> List[Float64]:
         var p = src.unsafe_bitcast[Float32]()
         for i in range(hd.n_elems):
             out[i] = Float64(p[unsafe_offset=i])
+    elif hd.item_size == 1:
+        for i in range(hd.n_elems):
+            out[i] = Float64(src[unsafe_offset=i])
     elif hd.item_size == 8:
         var p = src.unsafe_bitcast[Int64]()
         for i in range(hd.n_elems):

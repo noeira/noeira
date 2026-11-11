@@ -7,6 +7,10 @@
 #   # d1's own code in fp32, on a machine with transformers 5.19 + torchvision (the Orin, §12.4):
 #   python tools/d1/dump_d1_reference.py --out ~/.cache/noeira/d1/ref
 #   pixi run -e detect python tools/text/dump_bpe_reference.py       # tokenizers' ids for the BPE gate
+#   # pictures (NYU frames, then d1 with them in `media`, fp32, the Orin):
+#   pixi run -e detect python tools/perception/detector_latency.py --export-nyu 4 \
+#       --mat ~/.cache/noeira/datasets/nyu_depth_v2/nyu_depth_v2_labeled.mat --images ~/.cache/noeira/d1/nyu
+#   python tools/d1/dump_d1_vl_reference.py --images ~/.cache/noeira/d1/nyu --out ~/.cache/noeira/d1/ref_vl
 
 # LFM3's byte-level BPE in Mojo (noeira/text/bpe.mojo) against Hugging Face
 # `tokenizers`: 75 strings exact (each branch of the split regex, non-ASCII,
@@ -62,3 +66,19 @@ tests/llm/test_d1_finetune_smoke_gpu.mojo
 # more than 2 ms (Orin, bf16: 21 us while d1 works 249 ms), a missing checkpoint
 # FAILED with its reason. One copy of the model only.
 tests/llm/test_d1_service_gpu.mojo
+
+# LFM3-VL's vision tower (noeira/llm/lfm3/vision.mojo: patchify, 14 conv /
+# attention layers with axial 2-D RoPE, the 2x2-merge GELU projector) and d1
+# with pictures, against d1's own code on NYU room frames: pixel values exact
+# (the processor's bicubic resize is the identity at 640x480), the tower and
+# projector (fp32 1e-4; measured <= 2.9e-5), the packed rows with the pictures'
+# markup id-exact, the backbone's text rows (1e-4) and image rows (2e-3: their
+# input is the tower's output, amplified), the slots and the answers (measured
+# <= 2.1e-6), every vision tensor used, four defects caught (raster patch
+# order, conv neighbours in token order, RoPE axes swapped, features left out).
+# bf16 (`-D LFM3_BF16=1`): the tower drifts 0.09-0.13 from fp32 — torch's own
+# bf16 tower drifts 0.05-0.12 on the same pictures — answers within 2.6e-3,
+# 307 ms for a 640x480 picture and three questions on the Orin;
+# `-D LFM3_VIS_TF32=1` keeps the tower's activations fp32 (0.02-0.03, answers
+# 1.1e-3, +56 ms a picture).
+tests/llm/test_lfm3_vl_reference_gpu.mojo

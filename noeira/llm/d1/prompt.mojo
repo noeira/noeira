@@ -300,10 +300,11 @@ def suffix_text(mut tok: ByteLevelBPE, q: D1Question) raises -> String:
     return plain(tok, question_block(tok, q)) + IM_END + "\n" + IM_START + "assistant\n" + LEAD
 
 
-def prefix_text(ref tok: ByteLevelBPE, state_block: String) -> String:
+def prefix_text(ref tok: ByteLevelBPE, state_block: String, media: String = "") -> String:
     """`state_block`: the state as text, or Python's indented JSON — WITHOUT the
-    blank line (added here)."""
-    return String(BOS) + IM_START + "user\n" + plain(tok, state_block + "\n\n") + "\n" + HEADER
+    blank line (added here). `media`: the pictures' markup (special tokens kept:
+    it is the processor's, not the caller's text), at the head of the turn."""
+    return String(BOS) + IM_START + "user\n" + media + plain(tok, state_block + "\n\n") + "\n" + HEADER
 
 
 # ── packing and readout ids ──────────────────────────────────────────────

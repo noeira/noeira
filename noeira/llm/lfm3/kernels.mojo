@@ -149,7 +149,11 @@ def rope_kernel(x: Ptr, cos_t: Ptr, sin_t: Ptr, heads_n: Int64, half_n: Int64):
 def _sees(i: Int, j: Int, mode: Int, state: Int, window: Int, groups: IPtr) -> Bool:
     """May token `i` attend to token `j`? Mode 0 (`set`, full attention):
     `i < state or j < state or group[i] == group[j]`; mode 1 (sliding):
-    `i - window < j <= i`; mode 2: causal. The ONE place the masks are written."""
+    `i - window < j <= i`; mode 2: causal; mode 3: every token sees every
+    token (the vision tower, one picture at a time). The ONE place the masks
+    are written."""
+    if mode == 3:
+        return True
     if mode == 0:
         return i < state or j < state or groups[unsafe_offset=i] == groups[unsafe_offset=j]
     if mode == 1:
@@ -295,9 +299,10 @@ def masked_softmax_kernel(
         j += TPB
 
 
-def merge_heads_gate_kernel(oh: Ptr, gate: Ptr, dst: Ptr, t_n: Int64, heads_n: Int64, hd_n: Int64):
-    """`dst[i, h, d] = sigmoid(gate[i, h]) * oh[h, i, d]`: the per-head GEMM
-    outputs back to token-major, through the output gate.
+def merge_heads_gate_kernel(oh: Ptr, gate: Ptr, dst: Ptr, t_n: Int64, heads_n: Int64, hd_n: Int64, has_gate: Int64):
+    """`dst[i, h, d] = sigmoid(gate[i, h]) * oh[h, i, d]` (`has_gate`; else
+    `oh[h, i, d]`, the vision tower): the per-head GEMM outputs back to
+    token-major, through the output gate.
     Grid `(ceil(heads hd / TPB), T)`."""
     var heads = Int(heads_n)
     var hd = Int(hd_n)
@@ -307,13 +312,14 @@ def merge_heads_gate_kernel(oh: Ptr, gate: Ptr, dst: Ptr, t_n: Int64, heads_n: I
         return
     var h = _div(col, hd)
     var d = col - h * hd
-    dst[unsafe_offset=i * heads * hd + col] = (
-        oh[unsafe_offset=(h * Int(t_n) + i) * hd + d] * _sigmoid(gate[unsafe_offset=i * heads + h])
-    )
+    var o = oh[unsafe_offset=(h * Int(t_n) + i) * hd + d]
+    if has_gate != 0:
+        o = o * _sigmoid(gate[unsafe_offset=i * heads + h])
+    dst[unsafe_offset=i * heads * hd + col] = o
 
 
 def attn_out_kernel(
-    p: Ptr, v: Ptr, gate: Ptr, dst: Ptr, t_n: Int64, heads_n: Int64, kv_heads_n: Int64, hd_n: Int64,
+    p: Ptr, v: Ptr, gate: Ptr, dst: Ptr, t_n: Int64, heads_n: Int64, kv_heads_n: Int64, hd_n: Int64, has_gate: Int64,
 ):
     """`out[i, h, d] = sigmoid(gate[i, h]) * sum_j p[h, i, j] v[j, h / rep, d]`.
     Grid `(ceil(heads hd / TPB), T)`."""
@@ -332,7 +338,9 @@ def attn_out_kernel(
     var acc = Scalar[DT](0)
     for j in range(t):
         acc += p[unsafe_offset=pb + j] * v[unsafe_offset=j * kvw + kvh * hd + d]
-    dst[unsafe_offset=i * heads * hd + col] = acc * _sigmoid(gate[unsafe_offset=i * heads + h])
+    if has_gate != 0:
+        acc = acc * _sigmoid(gate[unsafe_offset=i * heads + h])
+    dst[unsafe_offset=i * heads * hd + col] = acc
 
 
 def swiglu_kernel(a: Ptr, b: Ptr, dst: Ptr, n_n: Int64):

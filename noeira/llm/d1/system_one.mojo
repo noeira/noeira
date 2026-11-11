@@ -7,6 +7,7 @@
 
     var d1 = D1.load(DeviceContext(), dir)
     var answers = d1.system_one(state_json, True, questions_json)   # {"answers": {...}, "usage": {...}}
+    var seen = d1.system_one(state_json, True, questions_json, pictures)   # with pictures (d1's `media`)
 
 One forward per row of up to 16 questions (`prompt.pack_rows`), the answers
 read at each question's last token: the best log-probability among each
@@ -14,6 +15,12 @@ option's token forms (`prompt.readout_ids`), divided by the calibration's
 temperature, softmaxed. Answers: `noul` P(yes); `choice` the likeliest option,
 its confidence and every probability; `score` the MEDIAN level (d1's default
 `score_readout`), its confidence, probabilities and legend.
+
+Pictures (d1's `media`, LFM3-VL's tower: `noeira.llm.lfm3.vision`): their
+markup heads the user turn, before the state (`<|vision_start|>`, one
+`<|image|>` per 2x2 block of patches, `<|vision_end|>`, each picture in turn),
+so under `set` every question sees them; the tower runs once per call and its
+features fill the `<|image|>` tokens of every row.
 """
 
 from std.math import exp
@@ -21,7 +28,7 @@ from max.gpu.host import DeviceContext, DeviceBuffer
 
 from noeira.io.json import JsonWriter, load_json, parse_json, J_STRING
 from noeira.nn.constants import DT
-from noeira.llm.lfm3 import Lfm3Text
+from noeira.llm.lfm3 import Lfm3Text, Lfm3Vision, Picture
 from noeira.text.bpe import ByteLevelBPE
 from .prompt import (
     D1Question, D1Row, Q_NOUL, Q_CHOICE, Q_SCORE, parse_questions, py_json_dumps, prefix_text, suffix_text,
@@ -37,8 +44,11 @@ struct D1(Movable):
     var set_size: Int
     var last_rows: List[D1Row]
     """The rows of the last call (the gate compares them with d1's)."""
+    var vision: Optional[Lfm3Vision]
+    """The picture encoder (`D1.load(..., vision=True)`); None: text only."""
 
-    def __init__(out self, var lm: Lfm3Text, var tok: ByteLevelBPE, temperature: Float64):
+    def __init__(out self, var lm: Lfm3Text, var tok: ByteLevelBPE, temperature: Float64, var vision: Optional[Lfm3Vision] = None):
+        self.vision = vision^
         self.lm = lm^
         self.tok = tok^
         self.temperature = temperature
@@ -46,7 +56,11 @@ struct D1(Movable):
         self.last_rows = List[D1Row]()
 
     @staticmethod
-    def load(var ctx: DeviceContext, dir: String) raises -> D1:
+    def load(var ctx: DeviceContext, dir: String, vision: Bool = False) raises -> D1:
+        """`vision`: load the picture encoder too (~0.4 GB more on the device)."""
+        var vis = Optional[Lfm3Vision](None)
+        if vision:
+            vis = Optional(Lfm3Vision.load(ctx, dir))
         var lm = Lfm3Text.load(ctx^, dir)
         var tok = ByteLevelBPE.load(dir + "/tokenizer.json")
         var cal = load_json(dir + "/calibration.json")
@@ -54,11 +68,15 @@ struct D1(Movable):
         var per = cal.field(cal.root(), "temperatures")
         if per >= 0 and cal.size(per) > 0:
             raise Error("d1: per-bucket temperatures are not implemented")
-        return D1(lm^, tok^, t)
+        return D1(lm^, tok^, t, vis^)
 
-    def system_one(mut self, state: String, state_is_json: Bool, questions_json: String) raises -> String:
+    def system_one(
+        mut self, state: String, state_is_json: Bool, questions_json: String,
+        pictures: List[Picture] = List[Picture](),
+    ) raises -> String:
         """`state`: text, or a JSON value (`state_is_json`); `questions_json`:
-        `{name: {type, instructions, criteria}}`. Returns d1's answer JSON."""
+        `{name: {type, instructions, criteria}}`; `pictures`: what the state
+        shows (needs `D1.load(..., vision=True)`). Returns d1's answer JSON."""
         var block: String
         if state_is_json:
             var sd = parse_json(_bytes(state))
@@ -69,7 +87,18 @@ struct D1(Movable):
         var qs = parse_questions(qd, qd.root())
         if len(qs) == 0:
             raise Error("d1: no questions")
-        var prefix = prefix_text(self.tok, block)
+        var media = String("")
+        var feats = Optional[DeviceBuffer[DT]](None)
+        var image_token = -1
+        if len(pictures) > 0:
+            if not self.vision:
+                raise Error("d1: pictures need the vision tower (D1.load(..., vision=True))")
+            ref vis = self.vision.value()
+            for pic in pictures:
+                media += vis.markup(pic, "<|image|>", "<|vision_start|>", "<|vision_end|>")
+            feats = Optional(vis.encode_all(pictures))
+            image_token = vis.cfg.image_token
+        var prefix = prefix_text(self.tok, block, media)
         var suffixes = List[String]()
         for q in qs:
             suffixes.append(suffix_text(self.tok, q))
@@ -80,7 +109,9 @@ struct D1(Movable):
         for row in rows:
             read += len(row.ids)
             var taps = List[DeviceBuffer[DT]]()
-            var h = self.lm.forward(row.ids, row.groups, row.state_len, taps)
+            var h = self.lm.forward(
+                row.ids, row.groups, row.state_len, taps, image_feats=feats.copy(), image_token=image_token,
+            )
             var logz = self.lm.slot_logz(h, len(row.ids), row.slots)
             for s in range(len(row.slots)):
                 ref q = qs[row.first + s]
