@@ -130,6 +130,36 @@ def maxpool2_kernel(x: Ptr, dst: Ptr, w_n: Int64, c_n: Int64):
     dst[unsafe_offset=n * cc + ch] = max(a, b)
 
 
+def conv3x3_taps(ctx: DeviceContext, w: DeviceBuffer[DT]) raises -> DeviceBuffer[DT]:
+    """A [256, 256, 3, 3] conv weight as [9, 256, 256], one GEMM operand per tap."""
+    var t = ctx.enqueue_create_buffer[DT](9 * FPN * FPN)
+    ctx.enqueue_function[tap_weights_kernel](w, t, Int64(FPN), Int64(FPN), grid_dim=(blocks(FPN), FPN, 9), block_dim=TPB)
+    return t^
+
+
+def conv3x3(
+    ctx: DeviceContext, x: DeviceBuffer[DT], h: Int, w: Int, taps: DeviceBuffer[DT], bias: DeviceBuffer[DT],
+    flip: Bool = False,
+) raises -> DeviceBuffer[DT]:
+    """A 256 -> 256 3x3 conv, padding 1, on token-major `x` [h w, 256]: the bias,
+    then per tap a shifted copy through one GEMM (`taps`: `conv3x3_taps`).
+    `flip` (falsification only): the taps reversed — a convolution."""
+    var n = h * w
+    var out = ctx.enqueue_create_buffer[DT](n * FPN)
+    ctx.enqueue_function[fill_rows_kernel](out, bias, Int64(FPN), Int64(n * FPN), grid_dim=blocks(n * FPN), block_dim=TPB)
+    var xs = ctx.enqueue_create_buffer[DT](n * FPN)
+    var part = ctx.enqueue_create_buffer[DT](n * FPN)
+    for t in range(9):
+        ctx.enqueue_function[shift_kernel](
+            x, xs, Int64(h), Int64(w), Int64(FPN), Int64(t // 3 - 1), Int64(t % 3 - 1),
+            grid_dim=(blocks(FPN), n), block_dim=TPB,
+        )
+        var tw = 8 - t if flip else t
+        gemm_tb(ctx, part, xs, taps.create_sub_buffer[DT](tw * FPN * FPN, FPN * FPN), n, FPN, FPN)
+        ctx.enqueue_function[add_kernel](out, part, Int64(n * FPN), grid_dim=blocks(n * FPN), block_dim=TPB)
+    return out^
+
+
 @fieldwise_init
 struct FpnLevel(Copyable, Movable):
     var x: DeviceBuffer[DT]
@@ -149,12 +179,7 @@ struct Sam3Neck(Movable):
         self.debug = 0
         self.taps = List[DeviceBuffer[DT]]()
         for i in range(4):
-            var w = self.wts.w(String("fpn_layers.") + String(i) + ".proj2.weight")
-            var t = self.wts.ctx.enqueue_create_buffer[DT](9 * FPN * FPN)
-            self.wts.ctx.enqueue_function[tap_weights_kernel](
-                w, t, Int64(FPN), Int64(FPN), grid_dim=(blocks(FPN), FPN, 9), block_dim=TPB,
-            )
-            self.taps.append(t^)
+            self.taps.append(conv3x3_taps(self.wts.ctx, self.wts.w(String("fpn_layers.") + String(i) + ".proj2.weight")))
 
     def new(self, n: Int) raises -> DeviceBuffer[DT]:
         return self.wts.ctx.enqueue_create_buffer[DT](n)
@@ -172,24 +197,10 @@ struct Sam3Neck(Movable):
         return out^
 
     def _conv3(mut self, level: Int, x: DeviceBuffer[DT], h: Int, w: Int) raises -> DeviceBuffer[DT]:
-        ref ctx = self.wts.ctx
-        var n = h * w
-        var out = self.new(n * FPN)
-        ctx.enqueue_function[fill_rows_kernel](
-            out, self.wts.w(String("fpn_layers.") + String(level) + ".proj2.bias"), Int64(FPN), Int64(n * FPN),
-            grid_dim=blocks(n * FPN), block_dim=TPB,
+        return conv3x3(
+            self.wts.ctx, x, h, w, self.taps[level], self.wts.w(String("fpn_layers.") + String(level) + ".proj2.bias"),
+            (self.debug & 1) != 0,
         )
-        var xs = self.new(n * FPN)
-        var part = self.new(n * FPN)
-        for t in range(9):
-            ctx.enqueue_function[shift_kernel](
-                x, xs, Int64(h), Int64(w), Int64(FPN), Int64(t // 3 - 1), Int64(t % 3 - 1),
-                grid_dim=(blocks(FPN), n), block_dim=TPB,
-            )
-            var tw = 8 - t if (self.debug & 1) != 0 else t
-            gemm_tb(ctx, part, xs, self.taps[level].create_sub_buffer[DT](tw * FPN * FPN, FPN * FPN), n, FPN, FPN)
-            ctx.enqueue_function[add_kernel](out, part, Int64(n * FPN), grid_dim=blocks(n * FPN), block_dim=TPB)
-        return out^
 
     def forward(mut self, backbone_out: DeviceBuffer[DT]) raises -> List[FpnLevel]:
         """[72 x 72, 1024] -> the four levels (scale 4, 2, 1, 0.5)."""
