@@ -36,12 +36,17 @@ the presence row 0.
 `text' = LN(text + text_mlp(text))`, mean over the real tokens, `text_proj`;
 `logit = clamp(query_proj(output_norm(q[1:])) . text' / 16, +-12)`.
 
-The box arithmetic (200 boxes), the presence head (its last layer has ONE
-output: `max_matmul` is wrong at N = 1 off NVIDIA) and the pooled dot products
-run on the host in fp32, as torch does them.
+The presence head (its last layer has ONE output: `max_matmul` is wrong at
+N = 1 off NVIDIA) and the pooled dot products run on the host in fp32, as torch
+does them. On NVIDIA (`DEV_BOXES`) the boxes stay on the device: the sine
+encoding, the RPB deltas and the refinement are kernels, every layer's boxes
+land in one buffer and the presence rows in another, both read back ONCE after
+the last layer (the host round trip per layer — two synchronisations — was
+most of the decoder's time). Off NVIDIA the box arithmetic runs on the host.
 """
 
 from std.math import exp, log, log2, sin, cos, pow, sqrt
+from std.sys import default_accelerator
 from max.gpu import thread_idx, block_idx
 from max.gpu.host import DeviceContext, DeviceBuffer
 
@@ -64,6 +69,9 @@ comptime G: Int = 72
 comptime NV: Int = G * G
 comptime T_LEN: Int = 32
 comptime EPS: Float32 = 1e-5
+comptime NPF: Int = 128
+"""Sine features per box coordinate."""
+comptime DEV_BOXES: Bool = default_accelerator().is_nvidia_gpu()
 
 
 @fieldwise_init
@@ -101,6 +109,52 @@ def rpb_kernel(dy: Ptr, dx: Ptr, bias: Ptr):
     bias[unsafe_offset=out] = dy[unsafe_offset=(q * G + r) * NH + h] + dx[unsafe_offset=(q * G + c) * NH + h]
 
 
+def sine_boxes_kernel(boxes: Ptr, dim_t: Ptr, dst: Ptr, xy_n: Int64):
+    """`_sine_boxes` on the device: `dst[q, slot 128 + j]`, slots y, x, w, h
+    (x, y with `xy_n`). The same fp32 product and quotient as the host's. Grid
+    `(ceil(512 / TPB), Q)`."""
+    var e = Int(block_idx.x) * TPB + Int(thread_idx.x)
+    var q = Int(block_idx.y)
+    if e >= 4 * NPF:
+        return
+    var slot = e // NPF
+    var j = e - slot * NPF
+    var src = slot
+    if xy_n == 0 and slot < 2:
+        src = 1 - slot
+    var v = boxes[unsafe_offset=q * 4 + src] * Scalar[DT](6.283185307179586) / dim_t[unsafe_offset=j]
+    dst[unsafe_offset=(q * 4 + slot) * NPF + j] = sin(v) if j % 2 == 0 else cos(v)
+
+
+def rpb_inputs_kernel(boxes: Ptr, dy: Ptr, dx: Ptr):
+    """`_rpb_inputs` on the device: `dy`, `dx` [Q G, 2]. Grid `(ceil(G / TPB), Q)`."""
+    var j = Int(block_idx.x) * TPB + Int(thread_idx.x)
+    var q = Int(block_idx.y)
+    if j >= G:
+        return
+    var cx = boxes[unsafe_offset=q * 4]
+    var cy = boxes[unsafe_offset=q * 4 + 1]
+    var w = boxes[unsafe_offset=q * 4 + 2]
+    var h = boxes[unsafe_offset=q * 4 + 3]
+    var x0 = cx - Scalar[DT](0.5) * w
+    var y0 = cy - Scalar[DT](0.5) * h
+    var x1 = cx + Scalar[DT](0.5) * w
+    var y1 = cy + Scalar[DT](0.5) * h
+    var cj = Scalar[DT](j) / Scalar[DT](G)
+    var b = (q * G + j) * 2
+    dy[unsafe_offset=b] = _logd(cj - y0)
+    dy[unsafe_offset=b + 1] = _logd(cj - y1)
+    dx[unsafe_offset=b] = _logd(cj - x0)
+    dx[unsafe_offset=b + 1] = _logd(cj - x1)
+
+
+def box_update_kernel(delta: Ptr, src: Ptr, dst: Ptr):
+    """`dst = sigmoid(delta + inverse_sigmoid(src))` over [Q, 4]. Grid `ceil(4 Q / TPB)`."""
+    var i = Int(block_idx.x) * TPB + Int(thread_idx.x)
+    if i < Q * 4:
+        dst[unsafe_offset=i] = _sigmoid(delta[unsafe_offset=i] + _inverse_sigmoid(src[unsafe_offset=i]))
+
+
 def pad_row0_kernel(src: Ptr, dst: Ptr):
     """`dst[0] = 0`, `dst[1 + q] = src[q]` ([Q, DM] -> [QP, DM])."""
     var i = Int(block_idx.x) * TPB + Int(thread_idx.x)
@@ -112,6 +166,8 @@ struct Sam3Decoder(Movable):
     var wts: Sam3Weights
     var sco: Sam3Weights
     var ref0: List[Float32]
+    var dim_t: DeviceBuffer[DT]
+    """The sine encoding's 128 divisors (the host's values)."""
     var host: Dict[String, List[Float32]]
     """Small tensors read on the host (the presence head, text_proj)."""
     var debug: Int
@@ -124,9 +180,14 @@ struct Sam3Decoder(Movable):
         self.debug = 0
         self.host = Dict[String, List[Float32]]()
         self.ref0 = List[Float32]()
+        self.dim_t = self.wts.ctx.enqueue_create_buffer[DT](1)  # set below (methods need every field)
         var rp = self._down(self.wts.w("reference_points.weight"), Q * 4)
         for v in rp:
             self.ref0.append(Float32(1.0) / (Float32(1.0) + exp(-v)))
+        var dt = List[Float32](length=NPF, fill=0.0)
+        for j in range(NPF):
+            dt[j] = Float32(pow(10000.0, Float64(Float32(2 * (j // 2)) / Float32(NPF))))
+        self.dim_t = self._up(dt)
         var names: List[String] = [
             "presence_layer_norm.weight", "presence_layer_norm.bias", "presence_head.layer1.weight",
             "presence_head.layer1.bias", "presence_head.layer2.weight", "presence_head.layer2.bias",
@@ -200,6 +261,11 @@ struct Sam3Decoder(Movable):
         var kpos = self.new(NV * DM)
         ctx.enqueue_function[add_into_kernel](kpos, fused, pos, Int64(NV * DM), grid_dim=blocks(NV * DM), block_dim=TPB)
         var boxes = self.ref0.copy()
+        # DEV_BOXES: slot li holds the boxes layer li reads, slot NL the final ones
+        var btaps = self.new((NL + 1) * Q * 4)
+        var pres_rows = self.new(NL * DM)
+        comptime if DEV_BOXES:
+            ctx.enqueue_copy(btaps.create_sub_buffer[DT](0, Q * 4), self._up(self.ref0))
         var layer_q = List[DeviceBuffer[DT]]()
         var layer_b = List[List[Float32]]()
         var layer_p = List[Float32]()
@@ -207,16 +273,34 @@ struct Sam3Decoder(Movable):
         var presence = Float32(0)
         for li in range(NL):
             var p = String("layers.") + String(li) + "."
-            layer_b.append(boxes.copy())
-            var sine = self._up(_sine_boxes(boxes, (self.debug & 2) != 0))
+            var bd = btaps.create_sub_buffer[DT](li * Q * 4, Q * 4)
+            var sine: DeviceBuffer[DT]
+            comptime if DEV_BOXES:
+                sine = self.new(Q * 4 * NPF)
+                ctx.enqueue_function[sine_boxes_kernel](
+                    bd, self.dim_t, sine, Int64(1 if (self.debug & 2) != 0 else 0),
+                    grid_dim=(blocks(4 * NPF), Q), block_dim=TPB,
+                )
+            else:
+                layer_b.append(boxes.copy())
+                sine = self._up(_sine_boxes(boxes, (self.debug & 2) != 0))
             var qpos = self._mlp("ref_point_head", sine, Q, 2 * DM, 2)
             var qp = self.new(QP * DM)
             ctx.enqueue_function[pad_row0_kernel](qpos, qp, grid_dim=blocks(QP * DM), block_dim=TPB)
             var bias = Optional[DeviceBuffer[DT]](None)
             if (self.debug & 1) == 0:
-                var dl = _rpb_inputs(boxes)
-                var dy = self._mlp("box_rpb_embed_y", self._up(dl[0]), Q * G, 2, 2)
-                var dx = self._mlp("box_rpb_embed_x", self._up(dl[1]), Q * G, 2, 2)
+                var dyi: DeviceBuffer[DT]
+                var dxi: DeviceBuffer[DT]
+                comptime if DEV_BOXES:
+                    dyi = self.new(Q * G * 2)
+                    dxi = self.new(Q * G * 2)
+                    ctx.enqueue_function[rpb_inputs_kernel](bd, dyi, dxi, grid_dim=(blocks(G), Q), block_dim=TPB)
+                else:
+                    var dl = _rpb_inputs(boxes)
+                    dyi = self._up(dl[0])
+                    dxi = self._up(dl[1])
+                var dy = self._mlp("box_rpb_embed_y", dyi, Q * G, 2, 2)
+                var dx = self._mlp("box_rpb_embed_x", dxi, Q * G, 2, 2)
                 var b = self.new(NH * QP * NV)
                 ctx.enqueue_function[rpb_kernel](dy, dx, b, grid_dim=(blocks(NV), QP, NH), block_dim=TPB)
                 bias = Optional(b^)
@@ -241,17 +325,42 @@ struct Sam3Decoder(Movable):
             # box refinement
             var qn = self.new(Q * DM)
             layer_norm(self.wts, "output_layer_norm", hidden.create_sub_buffer[DT](DM, Q * DM), qn, Q, DM, EPS)
-            var delta = self._down(self._mlp("box_head", qn, Q, DM, 3), Q * 4)
-            var nb = List[Float32](capacity=Q * 4)
-            for i in range(Q * 4):
-                nb.append(_sigmoid(delta[i] + _inverse_sigmoid(boxes[i])))
-            boxes = nb^
-            # presence
-            presence = self._presence(self._down(hidden, DM))
-            layer_p.append(presence)
+            comptime if DEV_BOXES:
+                var dd = self._mlp("box_head", qn, Q, DM, 3)
+                ctx.enqueue_function[box_update_kernel](
+                    dd, bd, btaps.create_sub_buffer[DT]((li + 1) * Q * 4, Q * 4), grid_dim=blocks(Q * 4), block_dim=TPB,
+                )
+                ctx.enqueue_copy(pres_rows.create_sub_buffer[DT](li * DM, DM), hidden.create_sub_buffer[DT](0, DM))
+            else:
+                var delta = self._down(self._mlp("box_head", qn, Q, DM, 3), Q * 4)
+                var nb = List[Float32](capacity=Q * 4)
+                for i in range(Q * 4):
+                    nb.append(_sigmoid(delta[i] + _inverse_sigmoid(boxes[i])))
+                boxes = nb^
+                # presence
+                presence = self._presence(self._down(hidden, DM))
+                layer_p.append(presence)
             if keep_taps:
                 layer_q.append(qn)
             last_q = qn
+        comptime if DEV_BOXES:
+            # the one read-back: every layer's boxes, then the presence rows
+            var all_b = self._down(btaps, (NL + 1) * Q * 4)
+            for li in range(NL + 1):
+                var one = List[Float32](capacity=Q * 4)
+                for i in range(Q * 4):
+                    one.append(all_b[li * Q * 4 + i])
+                if li < NL:
+                    layer_b.append(one^)
+                else:
+                    boxes = one^
+            var pr = self._down(pres_rows, NL * DM)
+            for li in range(NL):
+                var row = List[Float32](capacity=DM)
+                for d in range(DM):
+                    row.append(pr[li * DM + d])
+                presence = self._presence(row)
+                layer_p.append(presence)
         var logits = self._scores(last_q, text, text_len)
         var xyxy = List[Float32](capacity=Q * 4)
         for i in range(Q):
