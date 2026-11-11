@@ -150,10 +150,13 @@ def _sees(i: Int, j: Int, mode: Int, state: Int, window: Int, groups: IPtr) -> B
     """May token `i` attend to token `j`? Mode 0 (`set`, full attention):
     `i < state or j < state or group[i] == group[j]`; mode 1 (sliding):
     `i - window < j <= i`; mode 2: causal; mode 3: every token sees every
-    token (the vision tower, one picture at a time). The ONE place the masks
-    are written."""
+    token (the vision tower, one picture at a time); mode 4: causal over the
+    first `state` keys only (CLIP's text under a padding mask: a padded query
+    still reads every real token). The ONE place the masks are written."""
     if mode == 3:
         return True
+    if mode == 4:
+        return j <= i and j < state
     if mode == 0:
         return i < state or j < state or groups[unsafe_offset=i] == groups[unsafe_offset=j]
     if mode == 1:
