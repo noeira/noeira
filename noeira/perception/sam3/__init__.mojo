@@ -9,6 +9,7 @@ score out. Ported stage by stage against transformers' `Sam3Model`
     detr.mojo  `Sam3DetrEncoder`: the image tokens fused with the prompt
     decoder.mojo `Sam3Decoder`: 200 queries + presence, box refinement with the box RPB, the scoring
     masks.mojo `Sam3MaskDecoder`: the pixel decoder, 200 masks at 288 x 288, the semantic map
+    sam3.mojo  `Sam3`: the whole detector — `encode_image(picture)`, `segment(image, word)`
     ops.mojo   weights on the device, the GEMM, the shared kernels
 """
 
@@ -19,3 +20,4 @@ from .text import Sam3Text
 from .detr import Sam3DetrEncoder
 from .decoder import Sam3Decoder, Sam3Detections
 from .masks import Sam3MaskDecoder, Sam3Masks
+from .sam3 import Sam3, Sam3Image, Sam3Instance

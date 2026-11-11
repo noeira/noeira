@@ -31,6 +31,9 @@ Written to `<out>/`:
     words/<w>/pred_logits.npy, pred_boxes.npy, presence.npy   the model's outputs [200], [200, 4] xyxy, [1]
     words/<w>/pred_masks.npy, semantic_seg.npy                 the mask decoder's [200, 288, 288], [288, 288]
                                                                (MASK_WORDS only: 66 MB each)
+    words/<w>/post_scores.npy, post_boxes.npy, post_masks.npy  `post_process_instance_segmentation`
+                                                               (threshold 0.3, mask 0.5, the image's size):
+                                                               [k], [k, 4] pixels, [k, H, W] uint8
 """
 
 import argparse
@@ -104,6 +107,7 @@ def main():
                "layers": list(LAYERS), "fpn": shapes, "words": [w for w in args.words.split(",") if w]},
               open(os.path.join(args.out, "meta.json"), "w"), indent=1)
     print("vision:", {k: tuple(v.shape) for k, v in cap.items() if not isinstance(k, int)}, "fpn", shapes)
+    args.image_hw = np.asarray(img).shape[:2]
     if args.words:
         dump_heads(model, proc, ve, args)
 
@@ -130,8 +134,14 @@ def dump_heads(model, proc, ve, args):
         if w in MASK_WORDS:
             np.save(os.path.join(out, "pred_masks.npy"), o.pred_masks[0].float().numpy())
             np.save(os.path.join(out, "semantic_seg.npy"), o.semantic_seg[0, 0].float().numpy())
+        res = proc.post_process_instance_segmentation(o, threshold=0.3, mask_threshold=0.5,
+                                                       target_sizes=[tuple(args.image_hw)])[0]
+        np.save(os.path.join(out, "post_scores.npy"), res["scores"].float().numpy())
+        np.save(os.path.join(out, "post_boxes.npy"), res["boxes"].float().numpy())
+        np.save(os.path.join(out, "post_masks.npy"), res["masks"].numpy().astype(np.uint8))
         best = o.pred_logits[0].sigmoid() * o.presence_logits[0].sigmoid()
-        print(f"  heads {w!r}: presence {o.presence_logits[0].item():.3f}, best query score {best.max().item():.3f}")
+        print(f"  heads {w!r}: presence {o.presence_logits[0].item():.3f}, best query score {best.max().item():.3f}, "
+              f"{len(res['scores'])} kept at 0.3")
 
 
 def dump_words(model, proc, args):

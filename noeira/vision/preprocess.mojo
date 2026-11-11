@@ -61,9 +61,11 @@ struct _Coeffs(Movable):
     var bounds: List[Int]
     """`2 * out_size`: (xmin, count) per output pixel."""
     var kk: List[Int64]
-    """`out_size * ksize` fixed-point weights, 22 fractional bits."""
+    """`out_size * ksize` fixed-point weights, `precision` fractional bits."""
+    var precision: Int
+    """22 (PIL), or torch's int16 rule (`torch_int16`)."""
 
-    def __init__(out self, in_size: Int, out_size: Int):
+    def __init__(out self, in_size: Int, out_size: Int, torch_int16: Bool = False):
         var scale = Float64(in_size) / Float64(out_size)
         var filterscale = scale
         if filterscale < 1.0:
@@ -72,6 +74,8 @@ struct _Coeffs(Movable):
         self.ksize = Int(ceil(support)) * 2 + 1
         self.bounds = List[Int](unsafe_uninit_length=2 * out_size)
         self.kk = List[Int64](unsafe_uninit_length=out_size * self.ksize)
+        self.precision = _PRECISION_BITS
+        var all_w = List[Float64](length=out_size * self.ksize, fill=0.0)
 
         var w = List[Float64](unsafe_uninit_length=self.ksize)
         for xx in range(out_size):
@@ -98,30 +102,57 @@ struct _Coeffs(Movable):
             for x in range(xmax, self.ksize):
                 w[x] = 0.0
 
-            # Fixed point, PIL's `normalize_coeffs_8bpc`.
             for x in range(self.ksize):
-                var f = w[x] * Float64(1 << _PRECISION_BITS)
-                if w[x] < 0.0:
-                    self.kk[xx * self.ksize + x] = Int64(-0.5 + f)
-                else:
-                    self.kk[xx * self.ksize + x] = Int64(0.5 + f)
+                all_w[xx * self.ksize + x] = w[x]
             self.bounds[xx * 2] = xmin
             self.bounds[xx * 2 + 1] = xmax
+        if torch_int16:
+            # torch's uint8 antialias kernel (`_compute_index_ranges_int16_weights`):
+            # the most fractional bits that keep the axis's largest weight below 2^15
+            var w_max = 0.0
+            for v in all_w:
+                w_max = max(w_max, v)
+            var prec = 0
+            while prec < 15:
+                if Int(0.5 + w_max * Float64(1 << (prec + 1))) >= (1 << 15):
+                    break
+                prec += 1
+            self.precision = prec
+        # Fixed point, PIL's `normalize_coeffs_8bpc` (torch's rounding is the same)
+        for i in range(out_size * self.ksize):
+            var f = all_w[i] * Float64(1 << self.precision)
+            if all_w[i] < 0.0:
+                self.kk[i] = Int64(-0.5 + f)
+            else:
+                self.kk[i] = Int64(0.5 + f)
 
     def __init__(out self, *, deinit move: Self):
         self.ksize = move.ksize
         self.bounds = move.bounds^
         self.kk = move.kk^
+        self.precision = move.precision
 
 
 @always_inline
-def _clip8(v: Int64) -> UInt8:
-    var s = v >> Int64(_PRECISION_BITS)
+def _clip8(v: Int64, precision: Int = _PRECISION_BITS) -> UInt8:
+    var s = v >> Int64(precision)
     if s < 0:
         return 0
     if s > 255:
         return 255
     return UInt8(s)
+
+
+def torch_bilinear_aa_u8(
+    src: List[UInt8], src_w: Int, src_h: Int, channels: Int, mut dst: List[UInt8], dst_w: Int, dst_h: Int,
+) raises:
+    """torch's uint8 BILINEAR with antialias (`F.interpolate(..., antialias=True)`
+    on a uint8 tensor: torchvision's `resize`, so transformers' fast image
+    processors — SAM 3's): PIL's coefficients and two 8-bit passes, but int16
+    weights whose fractional bits are chosen per axis (the most that keep the
+    largest weight below 2^15) where PIL uses 22. Measured on SAM 3's 640x480 ->
+    1008x1008: PIL's arithmetic was 19 727 values off (by up to 2); this, 0."""
+    _resample_u8(src, src_w, src_h, channels, dst, dst_w, dst_h, True)
 
 
 def pil_bilinear_u8(
@@ -140,6 +171,13 @@ def pil_bilinear_u8(
     training pipeline ever changes filter, this must change with it or the
     gate will say so.
     """
+    _resample_u8(src, src_w, src_h, channels, dst, dst_w, dst_h, False)
+
+
+def _resample_u8(
+    src: List[UInt8], src_w: Int, src_h: Int, channels: Int, mut dst: List[UInt8], dst_w: Int, dst_h: Int,
+    torch_int16: Bool,
+) raises:
     if src_w <= 0 or src_h <= 0 or dst_w <= 0 or dst_h <= 0:
         raise String("pil_bilinear_u8: degenerate size")
     if len(src) < src_w * src_h * channels:
@@ -149,13 +187,16 @@ def pil_bilinear_u8(
     if len(dst) < dst_w * dst_h * channels:
         dst.resize(dst_w * dst_h * channels, 0)
 
-    var hc = _Coeffs(src_w, dst_w)
-    var vc = _Coeffs(src_h, dst_h)
+    var hc = _Coeffs(src_w, dst_w, torch_int16)
+    var vc = _Coeffs(src_h, dst_h, torch_int16)
 
     # ⚠ 8-BIT INTERMEDIATE, matching PIL. See the module docstring.
     var tmp = List[UInt8](unsafe_uninit_length=dst_w * src_h * channels)
 
-    var round = Int64(1) << Int64(_PRECISION_BITS - 1)
+    var hp = hc.precision
+    var vp = vc.precision
+    var hround = Int64(1) << Int64(hp - 1)
+    var vround = Int64(1) << Int64(vp - 1)
 
     # ⚠⚠ RAW POINTERS AND TWO ROW-PARALLEL PASSES. This was 8.7 ms of a 69 ms
     # ACT deployment query — the largest item outside the network, and the only
@@ -188,13 +229,13 @@ def pil_bilinear_u8(
             var xmax = hb[unsafe_offset = xx * 2 + 1]
             var kbase = xx * hks
             for c in range(channels):
-                var acc = round
+                var acc = hround
                 for x in range(xmax):
                     acc += (
                         Int64(sp[unsafe_offset = srow + (xmin + x) * channels + c])
                         * hk[unsafe_offset = kbase + x]
                     )
-                tp[unsafe_offset = trow + xx * channels + c] = _clip8(acc)
+                tp[unsafe_offset = trow + xx * channels + c] = _clip8(acc, hp)
 
     # vertical: (src_h, dst_w) -> (dst_h, dst_w)
     def _vrow(yy: Int) {imm}:
@@ -204,7 +245,7 @@ def pil_bilinear_u8(
         var drow = yy * dst_w * channels
         for xx in range(dst_w):
             for c in range(channels):
-                var acc = round
+                var acc = vround
                 for y in range(ymax):
                     acc += (
                         Int64(
@@ -216,7 +257,7 @@ def pil_bilinear_u8(
                         )
                         * vk[unsafe_offset = kbase + y]
                     )
-                dp[unsafe_offset = drow + xx * channels + c] = _clip8(acc)
+                dp[unsafe_offset = drow + xx * channels + c] = _clip8(acc, vp)
 
     # ⚠ A FLOOR, NOT A TUNED CROSSOVER — same shape of rule as the conv
     # kernels, and for the same measured reason: `parallelize` costs a fixed
