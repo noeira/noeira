@@ -46,6 +46,21 @@ which this object knows nothing about. `poll` returns a decision; scheduling it
 is the caller's business, and §12.60 is what happens when a decision assumes
 something about the robot it is not entitled to.
 
+## The camera: the caller's frame, this loop's moment
+
+A frame is ROBOT state, so the caller supplies it (`see`); this loop says WHEN
+one is worth taking (`wants_view`: a segment opened, so a decision is coming,
+and no frame has come in since — one render per utterance, not per tick).
+With `cfg.see`, the frame of the UTTERANCE — taken when its segment opened,
+what "in front of you" refers to — is sent with EVERY request of its decision
+(the two requests must be about the same moment, as `asked` already is); the
+reward-spec request reads the instruction alone and stays blind. Its age is
+measured against the segment's opening, NOT the decision's start: the first
+headless run waited 14.5 s for a recogniser still loading and the frame it
+had was the right one. A frame taken more than `cfg.see_max_age_s` before the
+segment opened is not sent (the decision is asked blind, and the note says so). A backend that cannot see (`JevClient`: the trait's default raises)
+is asked blind and the loop stops trying.
+
 ## ⚠ `poll` DOES NOT RAISE
 
 It is declared non-raising so the compiler enforces it. A render loop that
@@ -60,6 +75,7 @@ from std.time import perf_counter_ns
 from noeira.ai.audio_io import MicCapture, rms, LocalVoice, os_voice_for
 from noeira.ai.chat import ChatClient, ChatMessage, ToolSpec
 from noeira.ai.jev import JevClient, JevQuestions, DecisionService
+from noeira.ai.picture import Picture
 from noeira.ai.speech import (
     SpeechToText, TextToSpeech, SpeechToTextService, TextToSpeechService,
 )
@@ -93,6 +109,11 @@ comptime VL_ST_DEST: Int = 6
 """The first of the two requests `request_wording` makes: destination only."""
 comptime VL_ST_TRAIL: Int = 7
 """`triage`: the trail request, after the triage said `remembered`."""
+
+comptime _VL_Q_CMD: Int = 0
+comptime _VL_Q_DEST: Int = 1
+comptime _VL_Q_TRAIL: Int = 2
+comptime _VL_Q_MEM: Int = 3
 
 # ── the events ────────────────────────────────────────────────────────────
 comptime VL_NONE: Int = 0
@@ -183,6 +204,13 @@ def g1_vad_floor_step(floor: Float64, level: Float64) -> Float64:
     """
     var f = floor * 0.98 + level * 0.02
     return f if f > VL_FLOOR_MIN else VL_FLOOR_MIN
+
+
+def g1_view_fresh(seg_t_ns: Int, view_t_ns: Int, max_age_s: Float64) -> Bool:
+    """Whether a frame taken at `view_t_ns` may go with the utterance whose
+    segment opened at `seg_t_ns`: taken after it opened (however long the
+    recogniser then took), or at most `max_age_s` before."""
+    return Float64(seg_t_ns - view_t_ns) / 1e9 <= max_age_s
 
 
 @fieldwise_init
@@ -299,6 +327,16 @@ struct G1VoiceConfig(Copyable, Movable):
     """Each option's description starts with its name, in the command
     request and the triage (d1 reads an option by its description alone:
     RB-1's d1 arm). OFF by default: Jev was measured without."""
+    var see: Bool
+    """Decisions see the caller's latest frame (`see`, `wants_view`; the
+    module note). Needs a backend that can see (`D1Service`). OFF by
+    default: every bench so far measured blind decisions."""
+    var see_max_age_s: Float64
+    """A frame taken longer than this before its utterance began is not sent."""
+    var mic_input: String
+    """ffmpeg input arguments used verbatim instead of the device
+    (`MicCapture.start`'s `input_args`): `-re -i clip.wav` runs the whole loop
+    on a recording, headless. "" = the microphone (`mic_dev`)."""
 
     def __init__(out self):
         self.lang = String("")
@@ -334,6 +372,9 @@ struct G1VoiceConfig(Copyable, Movable):
         self.dest_words = List[String]()
         self.triage = G1_TRIAGE_OFF
         self.name_desc = False
+        self.see = False
+        self.see_max_age_s = 2.0
+        self.mic_input = String("")
 
 
 comptime G1VoiceLoop = G1VoiceLoopOf[SpeechToText, TextToSpeech, JevClient]
@@ -413,6 +454,17 @@ struct G1VoiceLoopOf[STT: SpeechToTextService, TTS: TextToSpeechService, DEC: De
     var note: String
     """The last thing worth printing. The caller drains it with `take_note`,
     so this object never owns the log format."""
+    var view: List[Picture]
+    """The caller's latest frame (`see`): empty, or one picture."""
+    var view_t: Int
+    var view_due: Bool
+    """A segment opened and no frame has come in since (`wants_view`)."""
+    var seg_t: Int
+    """When the current segment opened (a frame's age is measured to it)."""
+    var asked_view: List[Picture]
+    """The frame the current decision was asked with (empty: blind)."""
+    var view_blind: Bool
+    """The backend refused a picture once: asked blind from then on."""
 
     def __init__(out self, var cfg: G1VoiceConfig, ref bank: G1CommandBank) raises:
         """⚠ RAISES, unlike `poll`. Opening the microphone, reading a 70 MB
@@ -468,7 +520,7 @@ struct G1VoiceLoopOf[STT: SpeechToTextService, TTS: TextToSpeechService, DEC: De
         # there is no separate `start()` for it and the field cannot be a
         # not-yet-opened capture. A failure here raises out of `__init__`,
         # which is where a missing microphone should stop a program.
-        self.mic = MicCapture.start(16000, self.cfg.mic_dev)
+        self.mic = MicCapture.start(16000, self.cfg.mic_dev, self.cfg.mic_input)
         self.dest_q = JevQuestions()
         self.quest_mem = JevQuestions()
         self.mem_asked = False
@@ -536,6 +588,12 @@ struct G1VoiceLoopOf[STT: SpeechToTextService, TTS: TextToSpeechService, DEC: De
         self.mic_dead = String("")
         self.checked_silence = False
         self.note = String("")
+        self.view = List[Picture]()
+        self.view_t = 0
+        self.view_due = False
+        self.seg_t = 0
+        self.asked_view = List[Picture]()
+        self.view_blind = False
 
     def __init__(out self, *, deinit move: Self):
         self.mic = move.mic^
@@ -581,6 +639,12 @@ struct G1VoiceLoopOf[STT: SpeechToTextService, TTS: TextToSpeechService, DEC: De
         self.mic_dead = move.mic_dead^
         self.checked_silence = move.checked_silence
         self.note = move.note^
+        self.view = move.view^
+        self.view_t = move.view_t
+        self.view_due = move.view_due
+        self.seg_t = move.seg_t
+        self.asked_view = move.asked_view^
+        self.view_blind = move.view_blind
 
     # ── what the caller may do to it ──────────────────────────────────
     def start(mut self) raises:
@@ -710,7 +774,7 @@ struct G1VoiceLoopOf[STT: SpeechToTextService, TTS: TextToSpeechService, DEC: De
             self.state = VL_ST_IDLE
             return String("[mic] closed")
         try:
-            self.mic = MicCapture.start(16000, self.cfg.mic_dev)
+            self.mic = MicCapture.start(16000, self.cfg.mic_dev, self.cfg.mic_input)
             self.mic_on = True
             self.mic_dead = String("")
             # ⚠ and the detector starts over: a floor learned before the gap
@@ -723,6 +787,19 @@ struct G1VoiceLoopOf[STT: SpeechToTextService, TTS: TextToSpeechService, DEC: De
         except e:
             self.mic_dead = String(e)
             return String("[mic] ") + self.mic_dead
+
+    def see(mut self, var pic: Picture):
+        """The robot's latest frame (RGB24, sides multiples of 32 for d1's
+        tower). Kept until the next one; read when a decision starts."""
+        self.view = List[Picture]()
+        self.view.append(pic^)
+        self.view_t = perf_counter_ns()
+        self.view_due = False
+
+    def wants_view(self) -> Bool:
+        """True from the moment a segment opens until a frame comes in
+        (`see`): render one then, not every tick. False without `cfg.see`."""
+        return self.cfg.see and self.view_due and not self.view_blind
 
     def take_heard(mut self) -> String:
         """The utterance just sent for a decision, consumed; "" when none.
@@ -858,6 +935,8 @@ struct G1VoiceLoopOf[STT: SpeechToTextService, TTS: TextToSpeechService, DEC: De
             self.peak = self.level
             self.quiet_since = perf_counter_ns()
             self.forced = False
+            self.view_due = True
+            self.seg_t = perf_counter_ns()
             self.state = VL_ST_REC
 
         # ── recording ─────────────────────────────────────────────────
@@ -953,15 +1032,16 @@ struct G1VoiceLoopOf[STT: SpeechToTextService, TTS: TextToSpeechService, DEC: De
                     else:
                         try:
                             self.asked = g1_command_state(self.heard, ctx)
+                            self._snapshot_view()
                             self.heard_new = self.heard
                             self.mem_asked = False
                             self.tri = G1Triage()
                             self.dest_ms = 0.0
                             if self._two_requests():
-                                self.jev.start(self.asked, self.dest_q)
+                                self._ask(_VL_Q_DEST)
                                 self.state = VL_ST_DEST
                             else:
-                                self.jev.start(self.asked, self.quest)
+                                self._ask(_VL_Q_CMD)
                                 self.state = VL_ST_JEV
                             self.t_wait = perf_counter_ns()
                         except e:
@@ -1084,6 +1164,58 @@ struct G1VoiceLoopOf[STT: SpeechToTextService, TTS: TextToSpeechService, DEC: De
 
         return ev^
 
+    def _snapshot_view(mut self):
+        """The frame this decision is asked with: the latest, if `cfg.see`
+        and it is fresh enough; otherwise none (and the note says why)."""
+        self.asked_view = List[Picture]()
+        if not self.cfg.see or self.view_blind:
+            return
+        if len(self.view) == 0:
+            self._add_note(String("[see] no frame yet — asking blind"))
+            return
+        var age = Float64(self.seg_t - self.view_t) / 1e9
+        if not g1_view_fresh(self.seg_t, self.view_t, self.cfg.see_max_age_s):
+            self._add_note(String("[see] the frame is ") + _vl_f2(age) + String(" s older than the utterance — asking blind"))
+            return
+        self.asked_view.append(self.view[0].copy())
+
+    def _add_note(mut self, msg: String):
+        """`msg` after whatever this poll noted already (the caller prints
+        `take_note` once a frame)."""
+        if self.note == "":
+            self.note = msg
+        else:
+            self.note += String("\n  ") + msg
+
+    def _ask(mut self, which: Int) raises:
+        """Start one request of the current decision (`_VL_Q_*`: which question
+        set — by number, as `self`'s own fields cannot be passed beside a
+        mutable `self`), with its frame if it has one. A backend that cannot
+        see is asked blind, now and from then on."""
+        if len(self.asked_view) > 0:
+            try:
+                if which == _VL_Q_DEST:
+                    self.jev.start_seeing(self.asked, True, self.dest_q, self.asked_view)
+                elif which == _VL_Q_TRAIL:
+                    self.jev.start_seeing(self.asked, True, self.trail_q, self.asked_view)
+                elif which == _VL_Q_MEM:
+                    self.jev.start_seeing(self.asked, True, self.quest_mem, self.asked_view)
+                else:
+                    self.jev.start_seeing(self.asked, True, self.quest, self.asked_view)
+                return
+            except e:
+                self._add_note(String("[see] the decision backend cannot see (") + String(e) + String(") — blind from now on"))
+                self.view_blind = True
+                self.asked_view = List[Picture]()
+        if which == _VL_Q_DEST:
+            self.jev.start(self.asked, self.dest_q)
+        elif which == _VL_Q_TRAIL:
+            self.jev.start(self.asked, self.trail_q)
+        elif which == _VL_Q_MEM:
+            self.jev.start(self.asked, self.quest_mem)
+        else:
+            self.jev.start(self.asked, self.quest)
+
     def _two_requests(self) -> Bool:
         return self.cfg.request_wording and len(self.cfg.destinations) > 0
 
@@ -1109,7 +1241,7 @@ struct G1VoiceLoopOf[STT: SpeechToTextService, TTS: TextToSpeechService, DEC: De
                 if self.tri.kind == "remembered":
                     self.dest_ms = ans.latency_ms
                     self.trail_dest = dest
-                    self.jev.start(self.asked, self.trail_q)
+                    self._ask(_VL_Q_TRAIL)
                     self.t_wait = perf_counter_ns()
                     self.state = VL_ST_TRAIL
                     return ev^
@@ -1129,9 +1261,9 @@ struct G1VoiceLoopOf[STT: SpeechToTextService, TTS: TextToSpeechService, DEC: De
             # be about the same moment.
             self.mem_asked = self._settles_other_one(ctx)
             if self.mem_asked:
-                self.jev.start(self.asked, self.quest_mem)
+                self._ask(_VL_Q_MEM)
             else:
-                self.jev.start(self.asked, self.quest)
+                self._ask(_VL_Q_CMD)
             self.t_wait = perf_counter_ns()
             self.state = VL_ST_JEV
         except e:
@@ -1196,7 +1328,10 @@ struct G1VoiceLoopOf[STT: SpeechToTextService, TTS: TextToSpeechService, DEC: De
         var s = String("  (jev ")
         if self.dest_ms > 0.0:
             s += String(Int(self.dest_ms)) + String(" + ")
-        return s + String(Int(ms)) + String(" ms)")
+        s += String(Int(ms)) + String(" ms")
+        if len(self.asked_view) > 0:
+            s += String(", seeing ") + String(self.asked_view[0].width) + String("x") + String(self.asked_view[0].height)
+        return s + String(")")
 
     def _decide(mut self, ref ctx: G1Context, ref bank: G1CommandBank) -> G1VoiceEvent:
         """The decision, and the four ways it can go."""

@@ -32,7 +32,7 @@ Nothing here opens a device or touches the network.
 
 from noeira.envs.robots.g1_voice_loop import (
     G1VoiceConfig, G1VoiceEvent,
-    g1_vad_open_at, g1_vad_close_at, g1_vad_floor_step,
+    g1_vad_open_at, g1_vad_close_at, g1_vad_floor_step, g1_view_fresh,
     VL_NONE, VL_COMMAND, VL_SPEC, VL_WORLD, VL_TALK, VL_REFUSED,
     VL_ST_IDLE, VL_ST_REC, VL_ST_STT, VL_ST_JEV, VL_ST_SPEC, VL_ST_CHAT,
     VL_ST_DEST, VL_ST_TRAIL,
@@ -210,6 +210,20 @@ def main() raises:
     t.truth(VL_OPEN_MULT > VL_CLOSE_MULT,
             "the opening multiplier exceeds the closing one, or it would "
             "close as soon as it opened")
+
+    # ── the camera: off by default, and a frame belongs to its utterance ──
+    print("-- see")
+    t.truth(not c.see, "decisions are blind by default (every bench measured them blind)")
+    t.truth(c.mic_input == "", "the microphone, not a recording, by default")
+    var s = 1_000_000_000_000
+    t.truth(g1_view_fresh(s, s + 50_000_000, 2.0),
+            "a frame taken just after the segment opened is the utterance's")
+    t.truth(g1_view_fresh(s, s - 1_500_000_000, 2.0), "1.5 s before the utterance: fresh at 2 s")
+    t.truth(not g1_view_fresh(s, s - 2_500_000_000, 2.0), "2.5 s before: stale at 2 s")
+    # the first headless run: the recogniser was still loading, the transcript came
+    # 14.5 s after the frame, and the frame was still the right one
+    t.truth(g1_view_fresh(s, s + 31_000_000, 2.0),
+            "age is measured to the segment's opening, not to a slow transcript")
 
     print("===", t.checks - t.fails, "/", t.checks, "passed ===")
     if t.fails != 0:
