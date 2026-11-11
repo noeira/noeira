@@ -342,7 +342,11 @@ class RfDetrSeg:
         import rfdetr
         cls = {"n": rfdetr.RFDETRSegNano, "s": rfdetr.RFDETRSegSmall, "m": rfdetr.RFDETRSegMedium}[size]
         self.name = f"rfdetr-seg-{size}"
-        self.m = cls()
+        # RFDETR_DEVICE=cpu: the CPU reference (MPS samples the deformable attention with other rounding)
+        rd = os.environ.get("RFDETR_DEVICE")
+        self.m = cls(device=rd) if rd else cls()
+        if rd:
+            self.name += "-" + rd
         from rfdetr.assets.coco_classes import COCO_CLASSES  # {COCO id: name}
         self.names = COCO_CLASSES
 
@@ -386,6 +390,38 @@ class OmDet:
         for b, sc, l in zip(res["boxes"].float().cpu().numpy(), res["scores"].float().cpu().numpy(), labels):
             if str(l) in words:
                 dets.append((str(l), float(sc), b.astype(np.float64)))
+        return dets
+
+
+class Precomputed:
+    """Detections a separate program wrote (`--detectors precomputed:<dir>`):
+    `<dir>/nyu_<i>.det` per frame, from `--export-frames` (the Mojo RF-DETR,
+    `tools/perception/rfdetr_frames.mojo`). Format: `[u32 count]` then per
+    detection `[u32 COCO id][f32 score][f32 x0 y0 x1 y1][u32 h][u32 w][mask bits,
+    row-major, LSB first]`; the COCO ids map back to the words (`COCO_OF`)."""
+
+    def __init__(self, dev, path=""):
+        self.dir = os.path.expanduser(path)
+        self.name = "precomputed-" + os.path.basename(self.dir.rstrip("/"))
+        self.frame = None
+        from rfdetr.assets.coco_classes import COCO_CLASSES
+        self.id_of = {name: cid for cid, name in COCO_CLASSES.items()}
+
+    def __call__(self, img, words):
+        b = open(os.path.join(self.dir, f"nyu_{self.frame:04d}.det"), "rb").read()
+        word_of = {self.id_of[COCO_OF[w]]: w for w in words if COCO_OF.get(w)}
+        n = int(np.frombuffer(b, "<u4", 1, 0)[0])
+        at, dets = 4, []
+        for _ in range(n):
+            cid = int(np.frombuffer(b, "<u4", 1, at)[0])
+            sc = float(np.frombuffer(b, "<f4", 1, at + 4)[0])
+            box = np.frombuffer(b, "<f4", 4, at + 8).astype(np.float64)
+            h, w = (int(v) for v in np.frombuffer(b, "<u4", 2, at + 24))
+            nb = (h * w + 7) // 8
+            bits = np.unpackbits(np.frombuffer(b, np.uint8, nb, at + 32), bitorder="little")[: h * w]
+            at += 32 + nb
+            if cid in word_of:
+                dets.append((word_of[cid], sc, box, bits.reshape(h, w).astype(bool)))
         return dets
 
 
@@ -435,6 +471,8 @@ def main():
     ap.add_argument("--detectors", default="owlv2,gdino",
                     help="comma list of owlv2, gdino, sam3, omdet-turbo, yoloe-26{n,s,m,l}, yolo26{n,s,m}, rfdetr-seg-{n,s,m}")
     ap.add_argument("--tag", default="", help="suffix for report.json (separate runs per detector)")
+    ap.add_argument("--export-frames", default="",
+                    help="write the selected frames as <dir>/nyu_<i>.npy (uint8 HWC) + frames.txt, then stop")
     a = ap.parse_args()
     os.makedirs(a.out, exist_ok=True)
     dev = device()
@@ -445,6 +483,16 @@ def main():
         idx = idx[: a.limit]
     print(f"device {dev}; images with the word (>= {MIN_FRAC:.1%} of the frame): {counts}; evaluated {len(idx)}")
     words = list(WORDS)
+    if a.export_frames:
+        d = os.path.expanduser(a.export_frames)
+        os.makedirs(d, exist_ok=True)
+        for i in idx:
+            img, _, _, _ = load(f, i)
+            np.save(os.path.join(d, f"nyu_{i:04d}.npy"), img)
+        with open(os.path.join(d, "frames.txt"), "w") as fh:
+            fh.write("\n".join(str(i) for i in idx) + "\n")
+        print(f"exported {len(idx)} frames to {d}")
+        return
     from functools import partial
     table = {"owlv2": Owl, "gdino": GDino, "sam3": Sam3, "omdet-turbo": OmDet}
     for z in "nsml":
@@ -452,7 +500,8 @@ def main():
     for z in "nsm":
         table[f"yolo26{z}"] = partial(Yolo26, size=z)
         table[f"rfdetr-seg-{z}"] = partial(RfDetrSeg, size=z)
-    chosen = [table[d.strip()] for d in a.detectors.split(",")]
+    chosen = [partial(Precomputed, path=d.split(":", 1)[1]) if d.startswith("precomputed:") else table[d.strip()]
+              for d in a.detectors.split(",")]
     sam = Sam(dev) if any(D in (Owl, GDino, OmDet) for D in chosen) else None
     report = {"images": len(idx), "present_counts": counts, "selection_seed": a.seed, "detectors": {}}
     for Det in chosen:
@@ -461,6 +510,8 @@ def main():
         t_det = 0.0
         for k, i in enumerate(idx):
             img, lab, ins, dep = load(f, i)
+            if hasattr(det, "frame"):
+                det.frame = i
             t0 = time.perf_counter()
             dets = det(img, words)
             t_det += time.perf_counter() - t0

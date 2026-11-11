@@ -473,14 +473,20 @@ struct RfDetr(Movable):
         var none = List[DeviceBuffer[DT]]()
         return self.decode(self.backbone(self.pixel_values(pic), none))
 
-    def detect(mut self, pic: Picture, threshold: Float32 = 0.3) raises -> List[RfDetrInstance]:
+    def detect(
+        mut self, pic: Picture, threshold: Float32 = 0.3, keep: List[Int] = List[Int](),
+    ) raises -> List[RfDetrInstance]:
+        """`keep`: only these COCO ids (empty: all) — the others' masks are never made."""
         var raw = self.forward(pic)
-        return self.post_process(raw, pic.height, pic.width, threshold)
+        return self.post_process(raw, pic.height, pic.width, threshold, keep)
 
     def post_process(
-        mut self, ref raw: RfDetrRaw, height: Int, width: Int, threshold: Float32,
+        mut self, ref raw: RfDetrRaw, height: Int, width: Int, threshold: Float32, keep: List[Int] = List[Int](),
     ) raises -> List[RfDetrInstance]:
         # (query, class) pairs above the threshold, descending score, stable (the lower flat index first)
+        # rfdetr's rule: the 100 best (query, class) pairs over ALL classes (sigmoid, descending, stable),
+        # then the threshold; `keep` filters only AFTER that cut (filtering first let more low-score
+        # pairs of the kept classes in: 197 vs 191 matched tables over the NYU eval)
         var flat = List[Int]()
         var prob = List[Float32]()
         for i in range(NQ * NCLS):
@@ -488,21 +494,27 @@ struct RfDetr(Movable):
             if s > threshold:
                 flat.append(i)
                 prob.append(s)
-        for i in range(1, len(flat)):  # insertion sort: a handful kept
-            var j = i
-            while j > 0 and prob[j - 1] < prob[j]:
-                var tp = prob[j - 1]
-                prob[j - 1] = prob[j]
-                prob[j] = tp
-                var tf = flat[j - 1]
-                flat[j - 1] = flat[j]
-                flat[j] = tf
-                j -= 1
+        _sort_desc(flat, prob)
+        if len(flat) > NQ:
+            flat.resize(NQ, 0)
+            prob.resize(NQ, 0.0)
+        if len(keep) > 0:
+            var f2 = List[Int]()
+            var p2 = List[Float32]()
+            for k in range(len(flat)):
+                var wanted = False
+                for c in keep:
+                    wanted = wanted or c == flat[k] % NCLS
+                if wanted:
+                    f2.append(flat[k])
+                    p2.append(prob[k])
+            flat = f2^
+            prob = p2^
         var out = List[RfDetrInstance]()
         comptime NPX = MASK * MASK
         ref ctx = self.wts.ctx
         var hbuf = ctx.enqueue_create_host_buffer[DT](NPX)
-        for k in range(min(len(flat), NQ)):
+        for k in range(len(flat)):
             var q = flat[k] // NCLS
             var label = flat[k] - q * NCLS
             var cx = raw.boxes[q * 4]
@@ -536,6 +548,38 @@ def rfdetr_checkpoint() raises -> String:
     if env.byte_length() > 0:
         return env
     return getenv("HOME") + "/.cache/noeira/rfdetr/seg-small/model.safetensors"
+
+
+def _sort_desc(mut idx: List[Int], mut val: List[Float32]):
+    """Both by `val` descending, stable (equal values keep their order — the
+    lower flat index first, as `argsort(stable=True)`): a merge sort."""
+    var n = len(idx)
+    var width = 1
+    var i2 = List[Int](length=n, fill=0)
+    var v2 = List[Float32](length=n, fill=0.0)
+    while width < n:
+        var lo = 0
+        while lo < n:
+            var mid = min(lo + width, n)
+            var hi = min(lo + 2 * width, n)
+            var a = lo
+            var b = mid
+            var o = lo
+            while a < mid or b < hi:
+                if b >= hi or (a < mid and val[a] >= val[b]):
+                    i2[o] = idx[a]
+                    v2[o] = val[a]
+                    a += 1
+                else:
+                    i2[o] = idx[b]
+                    v2[o] = val[b]
+                    b += 1
+                o += 1
+            lo += 2 * width
+        for k in range(n):
+            idx[k] = i2[k]
+            val[k] = v2[k]
+        width *= 2
 
 
 def _top_k(v: List[Float32], k: Int) -> List[Int]:
