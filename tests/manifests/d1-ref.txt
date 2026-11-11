@@ -63,8 +63,11 @@ tests/llm/test_d1_finetune_smoke_gpu.mojo
 # D1Service (noeira/llm/d1/service.mojo): d1 on its own thread behind the
 # voice loop's DecisionService (JevQuestions in, JevAnswers out), asked by a
 # 50 Hz caller: answers equal d1's own (answers.json), the caller never held
-# more than 2 ms (Orin, bf16: 21 us while d1 works 249 ms), a missing checkpoint
-# FAILED with its reason. One copy of the model only.
+# more than 2 ms (Orin, bf16: 15 us while d1 works 112-169 ms); WITH A PICTURE
+# (`start_seeing`, the VL reference's 640x480 frame, 0.9 MB through the ring):
+# answers equal d1's own with it (bf16 1.7e-3), `start_seeing` 0.6 ms, the
+# call ~310 ms; a 100x100 picture fails ITS call with the reason and the next
+# call answers; a missing checkpoint FAILED. One copy of the model only.
 tests/llm/test_d1_service_gpu.mojo
 
 # LFM3-VL's vision tower (noeira/llm/lfm3/vision.mojo: patchify, 14 conv /

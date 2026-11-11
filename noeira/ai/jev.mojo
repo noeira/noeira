@@ -36,6 +36,7 @@ calibration away.
 
 from std.os import getenv
 
+from noeira.ai.picture import Picture
 from noeira.io.http import HttpClient
 from noeira.io.json import J_NUMBER, J_OBJECT, J_STRING, JsonDoc, JsonWriter, parse_json
 
@@ -218,6 +219,14 @@ trait DecisionService(Movable & Deinitable):
 
     def start_text(mut self, state_text: String, ref questions: JevQuestions) raises:
         ...
+
+    def start_seeing(
+        mut self, state: String, state_is_json: Bool, ref questions: JevQuestions, ref pictures: List[Picture],
+    ) raises:
+        """`start` with what the state shows (`Picture`s, RGB24): the decision
+        reads them too. Default: RAISES — a service that cannot see says so
+        rather than answering without the pictures (`D1Service` can)."""
+        raise Error("decision: this service takes no pictures (D1Service with a vision checkpoint does)")
 
     def poll(mut self, timeout_ms: Int = 0) raises -> Bool:
         ...

@@ -54,6 +54,7 @@ from max.gpu.host import DeviceContext, DeviceBuffer
 from layout import TileTensor, row_major
 from linalg.matmul import matmul as max_matmul
 
+from noeira.ai.picture import Picture
 from noeira.nn.constants import DT
 from noeira.nn.core.cublas_gemm import cublas_gemm, cublas_gemm_lp
 from noeira.io.json import load_json
@@ -75,21 +76,6 @@ comptime VIS_TF32: Bool = LF_TF32 or LF_VIS_TF32
 comptime VT_CONV: Int = 0
 comptime VT_ATTN: Int = 1
 comptime _ALIGN: Int = 64
-
-
-struct Picture(Copyable, Movable):
-    """An RGB picture, `rgb[(y W + x) 3 + c]` (HWC, uint8)."""
-
-    var rgb: List[UInt8]
-    var height: Int
-    var width: Int
-
-    def __init__(out self, var rgb: List[UInt8], height: Int, width: Int) raises:
-        if len(rgb) != height * width * 3:
-            raise Error("picture: " + String(len(rgb)) + " bytes for " + String(height) + "x" + String(width) + "x3")
-        self.rgb = rgb^
-        self.height = height
-        self.width = width
 
 
 struct Lfm3VisionConfig(Copyable, Movable):

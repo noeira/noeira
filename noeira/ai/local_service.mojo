@@ -43,6 +43,7 @@ connection. Do not put a model here in the process that runs a robot's
 balance controller.
 """
 
+from std.memory import unsafe_memcpy
 from std.time import perf_counter_ns
 
 from noeira.core.concurrent.block import SharedBlock
@@ -118,8 +119,8 @@ def svc_push(
     _put_i64(d, 0, id)
     _put_i64(d, 8, status)
     _put_i64(d, 16, latency_us)
-    for i in range(len(payload)):
-        d[unsafe_offset=_HEADER + i] = payload[i]
+    if len(payload) > 0:  # one copy (a camera frame is ~1 MB: a byte loop cost the caller ~1 ms)
+        unsafe_memcpy(dest=d.unsafe_offset(_HEADER), src=payload.unsafe_ptr(), count=len(payload))
     ring.end_push(n)
     return True
 
@@ -130,9 +131,9 @@ def svc_pop(ring: SharedRing) -> Optional[SvcMsg]:
         return None
     var d = c.data()
     var n = c.len - _HEADER
-    var payload = List[UInt8](capacity=max(n, 0))
-    for i in range(n):
-        payload.append(d[unsafe_offset=_HEADER + i])
+    var payload = List[UInt8](unsafe_uninit_length=max(n, 0))
+    if n > 0:
+        unsafe_memcpy(dest=payload.unsafe_ptr(), src=d.unsafe_offset(_HEADER), count=n)
     var m = SvcMsg(_get_i64(d, 0), _get_i64(d, 8), _get_i64(d, 16), payload^)
     ring.end_pop()
     return m^
