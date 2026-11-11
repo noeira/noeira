@@ -23,7 +23,7 @@ from max.gpu.host import DeviceContext, DeviceBuffer
 from noeira.nn.constants import DT
 from .ops import (
     Sam3Weights, TPB, blocks, linear, layer_norm, mha, add_kernel, add_into_kernel, relu_kernel,
-    linear_into, flash_self, USE_FLASH,
+    linear_into, flash_self, USE_FLASH, linear_residual, mlp_residual,
 )
 
 
@@ -81,22 +81,17 @@ struct Sam3DetrEncoder(Movable):
                 flash_self[FLASH_N, D_HEADS, D_HD](ctx, qkv, a)
             else:
                 a = mha(ctx, q, k, v, n, n, D_HEADS, D_HD, n)
-            var o = linear(self.wts, p + "self_attn.o_proj", a, n, D_MODEL)
-            ctx.enqueue_function[add_kernel](x, o, Int64(n * D_MODEL), grid_dim=blocks(n * D_MODEL), block_dim=TPB)
+            linear_residual(self.wts, p + "self_attn.o_proj", a, n, D_MODEL, x, D_MODEL)
             var h2 = self.new(n * D_MODEL)
             layer_norm(self.wts, p + "layer_norm2", x, h2, n, D_MODEL, D_EPS)
             var cq = linear(self.wts, p + "cross_attn.q_proj", h2, n, D_MODEL)
             var ck = linear(self.wts, p + "cross_attn.k_proj", text, T_LEN, D_MODEL)
             var cv = linear(self.wts, p + "cross_attn.v_proj", text, T_LEN, D_MODEL)
             var ca = mha(ctx, cq, ck, cv, n, T_LEN, D_HEADS, D_HD, T_LEN if (self.debug & 1) != 0 else text_len)
-            var co = linear(self.wts, p + "cross_attn.o_proj", ca, n, D_MODEL)
-            ctx.enqueue_function[add_kernel](x, co, Int64(n * D_MODEL), grid_dim=blocks(n * D_MODEL), block_dim=TPB)
+            linear_residual(self.wts, p + "cross_attn.o_proj", ca, n, D_MODEL, x, D_MODEL)
             var h3 = self.new(n * D_MODEL)
             layer_norm(self.wts, p + "layer_norm3", x, h3, n, D_MODEL, D_EPS)
-            var f1 = linear(self.wts, p + "mlp.fc1", h3, n, D_MODEL)
-            ctx.enqueue_function[relu_kernel](f1, Int64(n * D_FF), grid_dim=blocks(n * D_FF), block_dim=TPB)
-            var f2 = linear(self.wts, p + "mlp.fc2", f1, n, D_FF)
-            ctx.enqueue_function[add_kernel](x, f2, Int64(n * D_MODEL), grid_dim=blocks(n * D_MODEL), block_dim=TPB)
+            mlp_residual[2](self.wts, p + "mlp.fc1", p + "mlp.fc2", h3, n, D_MODEL, D_FF, x)
             if keep_taps:
                 var c = self.new(n * D_MODEL)
                 ctx.enqueue_copy(c, x)

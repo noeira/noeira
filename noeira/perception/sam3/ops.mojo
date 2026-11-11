@@ -137,6 +137,32 @@ struct Sam3Weights(Movable):
         self.bf16[name] = b
         return b^
 
+    def concat(mut self, name: String, parts: List[String]) raises:
+        """`name.weight` / `name.bias`: the parts' stacked along the output axis
+        (q, k, v as ONE GEMM whose rows are `[q | k | v]`, the fused attention's
+        interleaved input). The parts count as used; their device copies are
+        released (the stacked one replaces them)."""
+        var suffixes = List[String]()
+        suffixes.append(".weight")
+        suffixes.append(".bias")
+        for suffix in suffixes:
+            var total = 0
+            for part in parts:
+                total += len(self.w(part + suffix))
+            var d = self.ctx.enqueue_create_buffer[DT](total)
+            var off = 0
+            for part in parts:
+                var src = self.w(part + suffix)
+                self.ctx.enqueue_copy(d.create_sub_buffer[DT](off, len(src)), src)
+                off += len(src)
+            self.ctx.synchronize()
+            for part in parts:
+                self.dev[self.index[part + suffix]] = self.ctx.enqueue_create_buffer[DT](1)
+            self.index[name + suffix] = len(self.dev)
+            self.dev.append(d^)
+            self.used.append(False)
+            self.names.append(name + suffix)
+
     def unused(self, under: String = String("")) -> List[String]:
         var out = List[String]()
         for i in range(len(self.used)):
@@ -186,9 +212,87 @@ def linear_into(
             y, wts.w(name + ".bias"), Int64(n), Int64(t), grid_dim=(t, blocks(n)), block_dim=TPB,
         )
 
+def bias_add(mut wts: Sam3Weights, name: String, x: DeviceBuffer[DT], y: DeviceBuffer[DT], rows: Int, cols: Int) raises:
+    """`x += y + name.bias` in one pass (a residual add with the linear's bias
+    folded in: the same floats as `y + b` then `x + (y + b)`)."""
+    wts.ctx.enqueue_function[bias_add_kernel](
+        x, y, wts.w(name + ".bias"), Int64(cols), grid_dim=(rows, blocks(cols)), block_dim=TPB,
+    )
+
+
+def linear_residual(
+    mut wts: Sam3Weights, name: String, x: DeviceBuffer[DT], t: Int, k: Int, resid: DeviceBuffer[DT], n: Int,
+) raises:
+    """`resid += x W^T + b` (`resid` [t, n])."""
+    var y = wts.ctx.enqueue_create_buffer[DT](t * n)
+    linear_into(wts, name, x, t, k, y, bias=False)
+    bias_add(wts, name, resid, y, t, n)
+
+
+def mlp_residual[ACT: Int](
+    mut wts: Sam3Weights, fc1: String, fc2: String, x: DeviceBuffer[DT], t: Int, d: Int, ff: Int,
+    resid: DeviceBuffer[DT],
+) raises:
+    """`resid += fc2(act(fc1(x)))`, `ACT` 1 exact GELU, 2 ReLU: fc1's bias rides
+    the activation's pass, fc2's the residual add's (the same floats as the
+    unfused order); with SAM3_BF16 the activation writes fc2's bf16 operand."""
+    var f1 = wts.ctx.enqueue_create_buffer[DT](t * ff)
+    linear_into(wts, fc1, x, t, d, f1, bias=False)
+    var f2 = wts.ctx.enqueue_create_buffer[DT](t * d)
+    comptime if SAM3_BF16:
+        var fb = wts.ctx.enqueue_create_buffer[DType.bfloat16](t * ff)
+        wts.ctx.enqueue_function[bias_act_bf16_kernel[ACT]](
+            f1, wts.w(fc1 + ".bias"), fb, Int64(ff), grid_dim=(t, blocks(ff)), block_dim=TPB,
+        )
+        cublas_gemm_lp[False, True, DType.bfloat16, DT](wts.ctx, f2, fb, wts.w_bf16(fc2 + ".weight"), t, d, ff, 0.0)
+    else:
+        wts.ctx.enqueue_function[bias_act_kernel[ACT]](
+            f1, wts.w(fc1 + ".bias"), Int64(ff), grid_dim=(t, blocks(ff)), block_dim=TPB,
+        )
+        gemm_tb(wts.ctx, f2, f1, wts.w(fc2 + ".weight"), t, d, ff)
+    bias_add(wts, fc2, resid, f2, t, d)
 
 
 # ── kernels ──────────────────────────────────────────────────────────────
+
+
+@always_inline
+def _act[ACT: Int](v: Scalar[DT]) -> Scalar[DT]:
+    """1: exact GELU (`gelu_kernel`'s); 2: ReLU; else identity."""
+    comptime if ACT == 1:
+        return Scalar[DT](0.5) * v * (Scalar[DT](1) + erf(v * Scalar[DT](0.7071067811865476)))
+    elif ACT == 2:
+        return max(v, Scalar[DT](0))
+    else:
+        return v
+
+
+def bias_act_kernel[ACT: Int](x: Ptr, b: Ptr, cols_n: Int64):
+    """`x[r, c] = act(x[r, c] + b[c])` in place. Grid `(rows, ceil(cols / TPB))`."""
+    var c = Int(block_idx.y) * TPB + Int(thread_idx.x)
+    var cols = Int(cols_n)
+    if c < cols:
+        var i = Int(block_idx.x) * cols + c
+        x[unsafe_offset=i] = _act[ACT](x[unsafe_offset=i] + b[unsafe_offset=c])
+
+
+def bias_act_bf16_kernel[ACT: Int](x: Ptr, b: Ptr, dst: BPtr, cols_n: Int64):
+    """`dst[r, c] = bf16(act(x[r, c] + b[c]))` (the next GEMM's operand).
+    Grid `(rows, ceil(cols / TPB))`."""
+    var c = Int(block_idx.y) * TPB + Int(thread_idx.x)
+    var cols = Int(cols_n)
+    if c < cols:
+        var i = Int(block_idx.x) * cols + c
+        dst[unsafe_offset=i] = _act[ACT](x[unsafe_offset=i] + b[unsafe_offset=c]).cast[DType.bfloat16]()
+
+
+def bias_add_kernel(x: Ptr, y: Ptr, b: Ptr, cols_n: Int64):
+    """`x[r, c] += y[r, c] + b[c]`. Grid `(rows, ceil(cols / TPB))`."""
+    var c = Int(block_idx.y) * TPB + Int(thread_idx.x)
+    var cols = Int(cols_n)
+    if c < cols:
+        var i = Int(block_idx.x) * cols + c
+        x[unsafe_offset=i] = x[unsafe_offset=i] + (y[unsafe_offset=i] + b[unsafe_offset=c])
 
 
 def to_bf16_kernel(src: Ptr, dst: BPtr, n_n: Int64):
@@ -254,10 +358,12 @@ def layer_norm(mut wts: Sam3Weights, name: String, x: DeviceBuffer[DT], y: Devic
     )
 
 
-def rope_pairs_kernel(x: Ptr, cos_t: Ptr, sin_t: Ptr, heads_n: Int64, pairs_n: Int64):
-    """PAIRWISE RoPE in place on `x[T, heads, 2 pairs]`: (2i, 2i+1) turned by
-    angle `i` (`cos_t` / `sin_t` [T, pairs]) — transformers' `rotate_pairwise`,
-    not the rotate-half of LFM3. Grid `(ceil(heads pairs / TPB), T)`."""
+def rope_pairs_kernel(x: Ptr, cos_t: Ptr, sin_t: Ptr, heads_n: Int64, pairs_n: Int64, stride_n: Int64):
+    """PAIRWISE RoPE in place on `x[T, heads, 2 pairs]` (rows `stride` apart:
+    `heads 2 pairs`, or `3 x` that inside a `[q | k | v]` row): (2i, 2i+1)
+    turned by angle `i` (`cos_t` / `sin_t` [T, pairs]) — transformers'
+    `rotate_pairwise`, not the rotate-half of LFM3. Grid `(ceil(heads pairs /
+    TPB), T)`."""
     var pairs = Int(pairs_n)
     var heads = Int(heads_n)
     var idx = Int(block_idx.x) * TPB + Int(thread_idx.x)
@@ -266,7 +372,7 @@ def rope_pairs_kernel(x: Ptr, cos_t: Ptr, sin_t: Ptr, heads_n: Int64, pairs_n: I
         return
     var h = _d(idx, pairs)
     var i = idx - h * pairs
-    var base = (t * heads + h) * 2 * pairs + 2 * i
+    var base = t * Int(stride_n) + h * 2 * pairs + 2 * i
     var c = cos_t[unsafe_offset=t * pairs + i]
     var s = sin_t[unsafe_offset=t * pairs + i]
     var a = x[unsafe_offset=base]
@@ -399,17 +505,18 @@ FlashAttention-2 forward (`nn/primitives/flash_attention_tf32.mojo`): no S x S
 score matrix. The fp32 build keeps `mha` (the strict gates' path)."""
 
 
-def flash_self[S: Int, H: Int, HD: Int](
+def flash_self[S: Int, H: Int, HD: Int, IL: Bool = False](
     ctx: DeviceContext, qkv: DeviceBuffer[DT], dst: DeviceBuffer[DT], batch: Int = 1,
 ) raises:
     """Bidirectional attention, `batch` independent samples: `qkv` holds per
     sample `[Q tokens | K tokens | V tokens]` ([S, H HD] each, heads interleaved),
+    or with `IL` S rows of `[q | k | v]` (one GEMM's output);
     `dst` per sample [S, H HD]; scale 1 / sqrt(HD), TF32 products."""
     comptime if default_accelerator().is_nvidia_gpu():
-        var oc = ctx.enqueue_create_buffer[DT](batch * S * H * HD)
         var lse = ctx.enqueue_create_buffer[DT](batch * H * S)
-        ctx.enqueue_function[_tf32_fwd_kernel[H, S, HD, False, False]](
-            qkv, dst, oc, lse, grid_dim=((S + TF_TQ - 1) // TF_TQ, batch * H), block_dim=TF_WARPS * WARP_SIZE,
+        ctx.enqueue_function[_tf32_fwd_kernel[H, S, HD, False, IL]](
+            qkv, dst, dst, lse,  # the kernel's backward cache of the output IS the output
+            grid_dim=((S + TF_TQ - 1) // TF_TQ, batch * H), block_dim=TF_WARPS * WARP_SIZE,
         )
     else:
         raise Error("sam3: flash_self runs on NVIDIA only")

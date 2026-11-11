@@ -49,7 +49,7 @@ from noeira.nn.constants import DT
 from noeira.llm.lfm3.model import attention_probs, attention_apply, split_heads
 from .ops import (
     Sam3Weights, TPB, Ptr, blocks, linear, layer_norm, gemm_tb, add_kernel, gelu_kernel, rope_pairs_kernel,
-    put_head_kernel, mha, linear_into, flash_self, USE_FLASH,
+    put_head_kernel, mha, linear_into, flash_self, USE_FLASH, bias_add, mlp_residual,
 )
 
 
@@ -145,6 +145,14 @@ struct Sam3ViT(Movable):
         self.rope_win = _rope_table(self.wts.ctx, True, debug)
         self.rope_glob = _rope_table(self.wts.ctx, False, debug)
         self.dummy = self.wts.ctx.enqueue_create_buffer[DType.int32](1)
+        comptime if USE_FLASH:
+            for li in range(LAYERS):
+                var p = String("layers.") + String(li) + ".attention."
+                var parts = List[String]()
+                parts.append(p + "q_proj")
+                parts.append(p + "k_proj")
+                parts.append(p + "v_proj")
+                self.wts.concat(p + "qkv_proj", parts)
 
     def set_debug(mut self, debug: Int) raises:
         self.debug = debug
@@ -186,38 +194,37 @@ struct Sam3ViT(Movable):
             else:
                 hw = self.new(NTOK * DIM)
                 ctx.enqueue_function[window_kernel](h, hw, Int64(0), grid_dim=(blocks(DIM), NTOK), block_dim=TPB)
-            # q | k | v in one buffer (the fused kernel's input layout)
-            var qkv = self.new(3 * NTOK * DIM)
-            var q = qkv.create_sub_buffer[DT](0, NTOK * DIM)
-            var k = qkv.create_sub_buffer[DT](NTOK * DIM, NTOK * DIM)
-            var v = qkv.create_sub_buffer[DT](2 * NTOK * DIM, NTOK * DIM)
-            linear_into(self.wts, p + "attention.q_proj", hw, NTOK, DIM, q)
-            linear_into(self.wts, p + "attention.k_proj", hw, NTOK, DIM, k)
-            linear_into(self.wts, p + "attention.v_proj", hw, NTOK, DIM, v)
             var c_t = self.rope_glob[0] if glob else self.rope_win[0]
             var s_t = self.rope_glob[1] if glob else self.rope_win[1]
-            ctx.enqueue_function[rope_pairs_kernel](
-                q, c_t, s_t, Int64(HEADS), Int64(HD // 2), grid_dim=(blocks(HEADS * HD // 2), NTOK), block_dim=TPB,
-            )
-            ctx.enqueue_function[rope_pairs_kernel](
-                k, c_t, s_t, Int64(HEADS), Int64(HD // 2), grid_dim=(blocks(HEADS * HD // 2), NTOK), block_dim=TPB,
-            )
             var a = self.new(NTOK * DIM)
             comptime if USE_FLASH:
+                # one GEMM: rows [q | k | v] (the fused kernel's interleaved input); windows are
+                # 576 consecutive rows already (hw is in window order), nine samples
+                var qkv = linear(self.wts, p + "attention.qkv_proj", hw, NTOK, DIM)
+                ctx.enqueue_function[rope_pairs_kernel](
+                    qkv, c_t, s_t, Int64(HEADS), Int64(HD // 2), Int64(3 * DIM),
+                    grid_dim=(blocks(HEADS * HD // 2), NTOK), block_dim=TPB,
+                )
+                ctx.enqueue_function[rope_pairs_kernel](
+                    qkv.create_sub_buffer[DT](DIM, 3 * NTOK * DIM - DIM), c_t, s_t, Int64(HEADS), Int64(HD // 2),
+                    Int64(3 * DIM), grid_dim=(blocks(HEADS * HD // 2), NTOK), block_dim=TPB,
+                )
                 if glob:
-                    flash_self[NTOK, HEADS, HD](ctx, qkv, a)
+                    flash_self[NTOK, HEADS, HD, True](ctx, qkv, a)
                 else:
-                    # per window [Q | K | V], nine samples of 576 tokens
-                    var wt = WIN * WIN
-                    var qkvw = self.new(3 * NTOK * DIM)
-                    for w in range(NWIN):
-                        for part in range(3):
-                            ctx.enqueue_copy(
-                                qkvw.create_sub_buffer[DT]((w * 3 + part) * wt * DIM, wt * DIM),
-                                qkv.create_sub_buffer[DT](part * NTOK * DIM + w * wt * DIM, wt * DIM),
-                            )
-                    flash_self[WIN * WIN, HEADS, HD](ctx, qkvw, a, NWIN)
+                    flash_self[WIN * WIN, HEADS, HD, True](ctx, qkv, a, NWIN)
             else:
+                var q = linear(self.wts, p + "attention.q_proj", hw, NTOK, DIM)
+                var k = linear(self.wts, p + "attention.k_proj", hw, NTOK, DIM)
+                var v = linear(self.wts, p + "attention.v_proj", hw, NTOK, DIM)
+                ctx.enqueue_function[rope_pairs_kernel](
+                    q, c_t, s_t, Int64(HEADS), Int64(HD // 2), Int64(DIM),
+                    grid_dim=(blocks(HEADS * HD // 2), NTOK), block_dim=TPB,
+                )
+                ctx.enqueue_function[rope_pairs_kernel](
+                    k, c_t, s_t, Int64(HEADS), Int64(HD // 2), Int64(DIM),
+                    grid_dim=(blocks(HEADS * HD // 2), NTOK), block_dim=TPB,
+                )
                 if glob:
                     # one head at a time (`ops.mha`): all sixteen would hold 1.7 GB of scores
                     a = mha(ctx, q, k, v, NTOK, NTOK, HEADS, HD, NTOK)
@@ -231,18 +238,18 @@ struct Sam3ViT(Movable):
                         )
                         var aw = a.create_sub_buffer[DT](off, wt * DIM)
                         attention_apply(ctx, sc_win, v.create_sub_buffer[DT](off, wt * DIM), aw, False, aw, wt, HEADS, HEADS, HD)
-            var o = linear(self.wts, p + "attention.o_proj", a, NTOK, DIM)
+            # o_proj with its bias folded into the residual add (a bias is per column: the
+            # window permutation commutes with it)
+            var o = self.new(NTOK * DIM)
+            linear_into(self.wts, p + "attention.o_proj", a, NTOK, DIM, o, bias=False)
             if not glob:
                 var orr = self.new(NTOK * DIM)
                 ctx.enqueue_function[window_kernel](o, orr, Int64(1), grid_dim=(blocks(DIM), NTOK), block_dim=TPB)
                 o = orr
-            ctx.enqueue_function[add_kernel](x, o, Int64(NTOK * DIM), grid_dim=blocks(NTOK * DIM), block_dim=TPB)
+            bias_add(self.wts, p + "attention.o_proj", x, o, NTOK, DIM)
             var h2 = self.new(NTOK * DIM)
             layer_norm(self.wts, p + "layer_norm2", x, h2, NTOK, DIM, EPS)
-            var f1 = linear(self.wts, p + "mlp.fc1", h2, NTOK, DIM)
-            ctx.enqueue_function[gelu_kernel](f1, Int64(NTOK * FF), grid_dim=blocks(NTOK * FF), block_dim=TPB)
-            var f2 = linear(self.wts, p + "mlp.fc2", f1, NTOK, FF)
-            ctx.enqueue_function[add_kernel](x, f2, Int64(NTOK * DIM), grid_dim=blocks(NTOK * DIM), block_dim=TPB)
+            mlp_residual[1](self.wts, p + "mlp.fc1", p + "mlp.fc2", h2, NTOK, DIM, FF, x)
             if keep_taps:
                 taps.append(_copy(ctx, x, NTOK * DIM))
         return x^
