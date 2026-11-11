@@ -23,6 +23,7 @@ from max.gpu.host import DeviceContext, DeviceBuffer
 from noeira.nn.constants import DT
 from .ops import (
     Sam3Weights, TPB, blocks, linear, layer_norm, mha, add_kernel, add_into_kernel, relu_kernel,
+    linear_into, flash_self, USE_FLASH,
 )
 
 
@@ -34,6 +35,8 @@ comptime D_FF: Int = 2048
 comptime D_LAYERS: Int = 6
 comptime D_EPS: Float32 = 1e-5
 comptime T_LEN: Int = 32
+comptime FLASH_N: Int = 72 * 72
+"""The fused self-attention's token count (compile-time in the kernel)."""
 
 
 struct Sam3DetrEncoder(Movable):
@@ -63,10 +66,21 @@ struct Sam3DetrEncoder(Movable):
             layer_norm(self.wts, p + "layer_norm1", x, h, n, D_MODEL, D_EPS)
             var hp = self.new(n * D_MODEL)
             ctx.enqueue_function[add_into_kernel](hp, h, pos, Int64(n * D_MODEL), grid_dim=blocks(n * D_MODEL), block_dim=TPB)
-            var q = linear(self.wts, p + "self_attn.q_proj", hp, n, D_MODEL)
-            var k = linear(self.wts, p + "self_attn.k_proj", hp, n, D_MODEL)
-            var v = linear(self.wts, p + "self_attn.v_proj", hp if (self.debug & 2) != 0 else h, n, D_MODEL)
-            var a = mha(ctx, q, k, v, n, n, D_HEADS, D_HD, n)
+            var qkv = self.new(3 * n * D_MODEL)
+            var q = qkv.create_sub_buffer[DT](0, n * D_MODEL)
+            var k = qkv.create_sub_buffer[DT](n * D_MODEL, n * D_MODEL)
+            var v = qkv.create_sub_buffer[DT](2 * n * D_MODEL, n * D_MODEL)
+            linear_into(self.wts, p + "self_attn.q_proj", hp, n, D_MODEL, q)
+            linear_into(self.wts, p + "self_attn.k_proj", hp, n, D_MODEL, k)
+            linear_into(self.wts, p + "self_attn.v_proj", hp if (self.debug & 2) != 0 else h, n, D_MODEL, v)
+            var a: DeviceBuffer[DT]
+            comptime if USE_FLASH:
+                if n != FLASH_N:
+                    raise Error("sam3 detr: the fused attention is built for 72 x 72 tokens, not " + String(n))
+                a = self.new(n * D_MODEL)
+                flash_self[FLASH_N, D_HEADS, D_HD](ctx, qkv, a)
+            else:
+                a = mha(ctx, q, k, v, n, n, D_HEADS, D_HD, n)
             var o = linear(self.wts, p + "self_attn.o_proj", a, n, D_MODEL)
             ctx.enqueue_function[add_kernel](x, o, Int64(n * D_MODEL), grid_dim=blocks(n * D_MODEL), block_dim=TPB)
             var h2 = self.new(n * D_MODEL)

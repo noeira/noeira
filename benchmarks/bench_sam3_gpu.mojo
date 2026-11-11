@@ -15,7 +15,7 @@ from max.gpu.host import DeviceContext
 from noeira.ai.picture import Picture
 from noeira.io.npy import load_npy_f64
 from noeira.perception.sam3 import Sam3
-from noeira.perception.sam3.ops import SAM3_TF32
+from noeira.perception.sam3.ops import SAM3_TF32, SAM3_BF16
 
 
 def main() raises:
@@ -43,5 +43,5 @@ def main() raises:
             var t1 = perf_counter_ns()
             _ = sam.segment(img, w)
             seg_ms += Float64(perf_counter_ns() - t1) / 1e6
-    print("SAM 3", "(TF32)" if SAM3_TF32 else "(fp32)", ": encode_image", enc_ms / Float64(reps), "ms, segment",
+    print("SAM 3", "(bf16 linears)" if SAM3_BF16 else ("(TF32)" if SAM3_TF32 else "(fp32)"), ": encode_image", enc_ms / Float64(reps), "ms, segment",
           seg_ms / Float64(reps * len(words)), "ms a word")

@@ -19,12 +19,15 @@ from noeira.ai.picture import Picture
 from noeira.io.npy import load_npy_f64
 from noeira.nn.constants import DT
 from noeira.perception.sam3 import Sam3
-from noeira.perception.sam3.ops import SAM3_TF32
+from noeira.perception.sam3.ops import SAM3_TF32, SAM3_BF16
 
 
-comptime SCORE_BOUND: Float64 = 1e-2 if SAM3_TF32 else 1e-4
-comptime BOX_BOUND: Float64 = 2.0 if SAM3_TF32 else 0.05
+comptime SCORE_BOUND: Float64 = 2e-2 if SAM3_BF16 else (1e-2 if SAM3_TF32 else 1e-4)
+comptime BOX_BOUND: Float64 = 3.0 if SAM3_BF16 else (2.0 if SAM3_TF32 else 0.05)
 comptime MASK_FLIP: Float64 = 1e-2 if SAM3_TF32 else 1e-4
+"""TF32 / bf16 (`-D SAM3_BF16=1`: the linears on bf16 tensor cores): the same
+kept instances are required; the score, box and mask bounds are loose and the
+measured drift is printed (the decision is the kept set and the IoU)."""
 comptime BF16_SCORE: Float64 = 5e-3
 comptime BF16_BOX: Float64 = 0.1
 comptime BF16_FLIP: Float64 = 5e-4
@@ -45,7 +48,7 @@ def main() raises:
     var args = argv()
     var ref_dir = String(args[1]) if len(args) > 1 else getenv("HOME") + "/.cache/noeira/sam3/ref"
     var fails = 0
-    print("SAM 3 end to end vs transformers", "(TF32)" if SAM3_TF32 else "(fp32)")
+    print("SAM 3 end to end vs transformers", "(bf16 linears)" if SAM3_BF16 else ("(TF32)" if SAM3_TF32 else "(fp32)"))
     var t0 = perf_counter_ns()
     var sam = Sam3(DeviceContext())
     var bf16w = sam.vit.wts.bf16_source

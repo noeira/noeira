@@ -49,7 +49,7 @@ from noeira.nn.constants import DT
 from noeira.llm.lfm3.model import attention_probs, attention_apply, split_heads
 from .ops import (
     Sam3Weights, TPB, Ptr, blocks, linear, layer_norm, gemm_tb, add_kernel, gelu_kernel, rope_pairs_kernel,
-    put_head_kernel, mha,
+    put_head_kernel, mha, linear_into, flash_self, USE_FLASH,
 )
 
 
@@ -186,9 +186,14 @@ struct Sam3ViT(Movable):
             else:
                 hw = self.new(NTOK * DIM)
                 ctx.enqueue_function[window_kernel](h, hw, Int64(0), grid_dim=(blocks(DIM), NTOK), block_dim=TPB)
-            var q = linear(self.wts, p + "attention.q_proj", hw, NTOK, DIM)
-            var k = linear(self.wts, p + "attention.k_proj", hw, NTOK, DIM)
-            var v = linear(self.wts, p + "attention.v_proj", hw, NTOK, DIM)
+            # q | k | v in one buffer (the fused kernel's input layout)
+            var qkv = self.new(3 * NTOK * DIM)
+            var q = qkv.create_sub_buffer[DT](0, NTOK * DIM)
+            var k = qkv.create_sub_buffer[DT](NTOK * DIM, NTOK * DIM)
+            var v = qkv.create_sub_buffer[DT](2 * NTOK * DIM, NTOK * DIM)
+            linear_into(self.wts, p + "attention.q_proj", hw, NTOK, DIM, q)
+            linear_into(self.wts, p + "attention.k_proj", hw, NTOK, DIM, k)
+            linear_into(self.wts, p + "attention.v_proj", hw, NTOK, DIM, v)
             var c_t = self.rope_glob[0] if glob else self.rope_win[0]
             var s_t = self.rope_glob[1] if glob else self.rope_win[1]
             ctx.enqueue_function[rope_pairs_kernel](
@@ -198,19 +203,34 @@ struct Sam3ViT(Movable):
                 k, c_t, s_t, Int64(HEADS), Int64(HD // 2), grid_dim=(blocks(HEADS * HD // 2), NTOK), block_dim=TPB,
             )
             var a = self.new(NTOK * DIM)
-            if glob:
-                # one head at a time (`ops.mha`): all sixteen would hold 1.7 GB of scores
-                a = mha(ctx, q, k, v, NTOK, NTOK, HEADS, HD, NTOK)
+            comptime if USE_FLASH:
+                if glob:
+                    flash_self[NTOK, HEADS, HD](ctx, qkv, a)
+                else:
+                    # per window [Q | K | V], nine samples of 576 tokens
+                    var wt = WIN * WIN
+                    var qkvw = self.new(3 * NTOK * DIM)
+                    for w in range(NWIN):
+                        for part in range(3):
+                            ctx.enqueue_copy(
+                                qkvw.create_sub_buffer[DT]((w * 3 + part) * wt * DIM, wt * DIM),
+                                qkv.create_sub_buffer[DT](part * NTOK * DIM + w * wt * DIM, wt * DIM),
+                            )
+                    flash_self[WIN * WIN, HEADS, HD](ctx, qkvw, a, NWIN)
             else:
-                var wt = WIN * WIN
-                for w in range(NWIN):
-                    var off = w * wt * DIM
-                    attention_probs(
-                        ctx, q.create_sub_buffer[DT](off, wt * DIM), k.create_sub_buffer[DT](off, wt * DIM),
-                        sc_win, self.dummy, wt, HEADS, HEADS, HD, 3, 0, 0,
-                    )
-                    var aw = a.create_sub_buffer[DT](off, wt * DIM)
-                    attention_apply(ctx, sc_win, v.create_sub_buffer[DT](off, wt * DIM), aw, False, aw, wt, HEADS, HEADS, HD)
+                if glob:
+                    # one head at a time (`ops.mha`): all sixteen would hold 1.7 GB of scores
+                    a = mha(ctx, q, k, v, NTOK, NTOK, HEADS, HD, NTOK)
+                else:
+                    var wt = WIN * WIN
+                    for w in range(NWIN):
+                        var off = w * wt * DIM
+                        attention_probs(
+                            ctx, q.create_sub_buffer[DT](off, wt * DIM), k.create_sub_buffer[DT](off, wt * DIM),
+                            sc_win, self.dummy, wt, HEADS, HEADS, HD, 3, 0, 0,
+                        )
+                        var aw = a.create_sub_buffer[DT](off, wt * DIM)
+                        attention_apply(ctx, sc_win, v.create_sub_buffer[DT](off, wt * DIM), aw, False, aw, wt, HEADS, HEADS, HD)
             var o = linear(self.wts, p + "attention.o_proj", a, NTOK, DIM)
             if not glob:
                 var orr = self.new(NTOK * DIM)

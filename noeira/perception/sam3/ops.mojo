@@ -8,6 +8,11 @@ buffer each (the checkpoint is fp32: `facebook/sam3`'s `model.safetensors`, the
 VIDEO model — the image detector is `detector_model.*`, the tracker is never
 loaded). `linear`: `x W^T + b` through `gemm_tb` (cuBLAS on NVIDIA, fp32 or
 `-D SAM3_TF32=1`; MAX's matmul elsewhere).
+
+`-D SAM3_BF16=1` (NVIDIA): every `linear` on the bf16 tensor cores — its
+activations rounded to bf16, the weight's bf16 copy (made on first use, kept
+beside the fp32 one: +1.7 GB), fp32 accumulation and output, as LFM3's bf16
+build; the attention's GEMMs and the 3x3 convs stay TF32.
 """
 
 from std.math import sqrt, erf, exp
@@ -23,10 +28,15 @@ from linalg.matmul import matmul as max_matmul
 
 from noeira.io.safetensors import SafeTensors, ST_F32, ST_BF16
 from noeira.nn.constants import DT
-from noeira.nn.core.cublas_gemm import cublas_gemm
+from noeira.nn.core.cublas_gemm import cublas_gemm, cublas_gemm_lp
+from noeira.nn.primitives.flash_attention_tf32 import _tf32_fwd_kernel, TF_TQ, TF_WARPS
+from max.gpu import WARP_SIZE
 
 
-comptime SAM3_TF32: Bool = is_defined["SAM3_TF32"]()
+comptime SAM3_BF16: Bool = is_defined["SAM3_BF16"]() and default_accelerator().is_nvidia_gpu()
+comptime SAM3_TF32: Bool = is_defined["SAM3_TF32"]() or SAM3_BF16
+"""TF32 for every GEMM `linear` does not take to bf16 (the attention's, the convs')."""
+comptime BPtr = Pointer[Scalar[DType.bfloat16], MutAnyOrigin]
 comptime TPB: Int = 256
 comptime Ptr = Pointer[Scalar[DT], MutAnyOrigin]
 
@@ -63,6 +73,8 @@ struct Sam3Weights(Movable):
     var bf16_source: Bool
     """The file held bf16 (`tools/perception/extract_sam3_detector.py`): the
     weights were widened to fp32 here, and they are the fp32 model's rounded."""
+    var bf16: Dict[String, DeviceBuffer[DType.bfloat16]]
+    """SAM3_BF16: each linear weight's bf16 copy, made on first use."""
 
     def __init__(out self, var ctx: DeviceContext, path: String, prefix: String) raises:
         """Every tensor whose name starts with `prefix`, the prefix dropped;
@@ -73,6 +85,7 @@ struct Sam3Weights(Movable):
         self.used = List[Bool]()
         self.names = List[String]()
         self.bf16_source = False
+        self.bf16 = Dict[String, DeviceBuffer[DType.bfloat16]]()
         var st = SafeTensors(path)
         for i in range(st.size()):
             var name = st.names[i]
@@ -113,6 +126,17 @@ struct Sam3Weights(Movable):
         self.used[i.value()] = True
         return self.dev[i.value()]
 
+    def w_bf16(mut self, name: String) raises -> DeviceBuffer[DType.bfloat16]:
+        """`name`'s bf16 copy (rounded to nearest even once, then kept)."""
+        var c = self.bf16.get(name)
+        if c:
+            return c.value()
+        var f = self.w(name)
+        var b = self.ctx.enqueue_create_buffer[DType.bfloat16](len(f))
+        self.ctx.enqueue_function[to_bf16_kernel](f, b, Int64(len(f)), grid_dim=blocks(len(f)), block_dim=TPB)
+        self.bf16[name] = b
+        return b^
+
     def unused(self, under: String = String("")) -> List[String]:
         var out = List[String]()
         for i in range(len(self.used)):
@@ -135,18 +159,43 @@ def gemm_tb(ctx: DeviceContext, dst: DeviceBuffer[DT], a: DeviceBuffer[DT], b: D
 
 def linear(mut wts: Sam3Weights, name: String, x: DeviceBuffer[DT], t: Int, k: Int, bias: Bool = True) raises -> DeviceBuffer[DT]:
     """`x[t, k] @ W^T (+ b)` for `name.weight` [n, k] (and `name.bias`)."""
+    var n = len(wts.w(name + ".weight")) // k
+    var y = wts.ctx.enqueue_create_buffer[DT](t * n)
+    linear_into(wts, name, x, t, k, y, bias)
+    return y^
+
+
+def linear_into(
+    mut wts: Sam3Weights, name: String, x: DeviceBuffer[DT], t: Int, k: Int, y: DeviceBuffer[DT], bias: Bool = True,
+) raises:
+    """`linear`, written into `y` (e.g. a slot of a Q|K|V buffer)."""
     var wb = wts.w(name + ".weight")
     var n = len(wb) // k
-    var y = wts.ctx.enqueue_create_buffer[DT](t * n)
+    comptime if SAM3_BF16:
+        var xb = wts.ctx.enqueue_create_buffer[DType.bfloat16](t * k)
+        wts.ctx.enqueue_function[to_bf16_kernel](x, xb, Int64(t * k), grid_dim=blocks(t * k), block_dim=TPB)
+        cublas_gemm_lp[False, True, DType.bfloat16, DT](wts.ctx, y, xb, wts.w_bf16(name + ".weight"), t, n, k, 0.0)
+        if bias:
+            wts.ctx.enqueue_function[bias_kernel](
+                y, wts.w(name + ".bias"), Int64(n), Int64(t), grid_dim=(t, blocks(n)), block_dim=TPB,
+            )
+        return
     gemm_tb(wts.ctx, y, x, wb, t, n, k)
     if bias:
         wts.ctx.enqueue_function[bias_kernel](
             y, wts.w(name + ".bias"), Int64(n), Int64(t), grid_dim=(t, blocks(n)), block_dim=TPB,
         )
-    return y^
+
 
 
 # ── kernels ──────────────────────────────────────────────────────────────
+
+
+def to_bf16_kernel(src: Ptr, dst: BPtr, n_n: Int64):
+    """Round to bf16 (nearest even): a tensor-core GEMM's operand."""
+    var i = Int(global_idx.x)
+    if i < Int(n_n):
+        dst[unsafe_offset=i] = src[unsafe_offset=i].cast[DType.bfloat16]()
 
 
 def bias_kernel(x: Ptr, b: Ptr, cols_n: Int64, rows_n: Int64):
@@ -341,3 +390,26 @@ def add_into_kernel(dst: Ptr, a: Ptr, b: Ptr, n_n: Int64):
     var i = Int(global_idx.x)
     if i < Int(n_n):
         dst[unsafe_offset=i] = a[unsafe_offset=i] + b[unsafe_offset=i]
+
+
+comptime USE_FLASH: Bool = SAM3_TF32 and default_accelerator().is_nvidia_gpu()
+"""TF32 / bf16 builds on NVIDIA: the self-attentions of S keys (the backbone's
+windows and global layers, the DETR encoder) through the tree's TF32 tensor-core
+FlashAttention-2 forward (`nn/primitives/flash_attention_tf32.mojo`): no S x S
+score matrix. The fp32 build keeps `mha` (the strict gates' path)."""
+
+
+def flash_self[S: Int, H: Int, HD: Int](
+    ctx: DeviceContext, qkv: DeviceBuffer[DT], dst: DeviceBuffer[DT], batch: Int = 1,
+) raises:
+    """Bidirectional attention, `batch` independent samples: `qkv` holds per
+    sample `[Q tokens | K tokens | V tokens]` ([S, H HD] each, heads interleaved),
+    `dst` per sample [S, H HD]; scale 1 / sqrt(HD), TF32 products."""
+    comptime if default_accelerator().is_nvidia_gpu():
+        var oc = ctx.enqueue_create_buffer[DT](batch * S * H * HD)
+        var lse = ctx.enqueue_create_buffer[DT](batch * H * S)
+        ctx.enqueue_function[_tf32_fwd_kernel[H, S, HD, False, False]](
+            qkv, dst, oc, lse, grid_dim=((S + TF_TQ - 1) // TF_TQ, batch * H), block_dim=TF_WARPS * WARP_SIZE,
+        )
+    else:
+        raise Error("sam3: flash_self runs on NVIDIA only")
