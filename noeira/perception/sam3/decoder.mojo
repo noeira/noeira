@@ -53,6 +53,7 @@ from max.gpu.host import DeviceContext, DeviceBuffer
 from noeira.nn.constants import DT
 from .ops import (
     Sam3Weights, TPB, Ptr, blocks, linear, layer_norm, mha, add_kernel, add_into_kernel, relu_kernel,
+    mha_rpb, MHA_BATCHED,
 )
 
 
@@ -235,11 +236,22 @@ struct Sam3Decoder(Movable):
     def _attn(
         mut self, name: String, q_in: DeviceBuffer[DT], tq: Int, k_in: DeviceBuffer[DT], v_in: DeviceBuffer[DT], tk: Int,
         key_len: Int, bias: Optional[DeviceBuffer[DT]] = None,
+        rpb: Optional[Tuple[DeviceBuffer[DT], DeviceBuffer[DT]]] = None,
     ) raises -> DeviceBuffer[DT]:
+        """`rpb` (NVIDIA): the box bias as its (dy, dx) factors, made per key in
+        the softmax (`ops.mha_rpb`) instead of the [8, 201, 5184] `bias`."""
         var q = linear(self.wts, name + ".q_proj", q_in, tq, DM)
         var k = linear(self.wts, name + ".k_proj", k_in, tk, DM)
         var v = linear(self.wts, name + ".v_proj", v_in, tk, DM)
-        var a = mha(self.wts.ctx, q, k, v, tq, tk, NH, HD, key_len, bias)
+        var a: DeviceBuffer[DT]
+        comptime if MHA_BATCHED:
+            if rpb:
+                var f = rpb.value().copy()
+                a = mha_rpb(self.wts.ctx, q, k, v, tq, tk, NH, HD, f[0], f[1], G)
+            else:
+                a = mha(self.wts.ctx, q, k, v, tq, tk, NH, HD, key_len, bias)
+        else:
+            a = mha(self.wts.ctx, q, k, v, tq, tk, NH, HD, key_len, bias)
         return linear(self.wts, name + ".o_proj", a, tq, DM)
 
     def _post(mut self, name: String, x: DeviceBuffer[DT], delta: DeviceBuffer[DT], rows: Int) raises -> DeviceBuffer[DT]:
@@ -288,6 +300,7 @@ struct Sam3Decoder(Movable):
             var qp = self.new(QP * DM)
             ctx.enqueue_function[pad_row0_kernel](qpos, qp, grid_dim=blocks(QP * DM), block_dim=TPB)
             var bias = Optional[DeviceBuffer[DT]](None)
+            var rpb = Optional[Tuple[DeviceBuffer[DT], DeviceBuffer[DT]]](None)
             if (self.debug & 1) == 0:
                 var dyi: DeviceBuffer[DT]
                 var dxi: DeviceBuffer[DT]
@@ -301,9 +314,12 @@ struct Sam3Decoder(Movable):
                     dxi = self._up(dl[1])
                 var dy = self._mlp("box_rpb_embed_y", dyi, Q * G, 2, 2)
                 var dx = self._mlp("box_rpb_embed_x", dxi, Q * G, 2, 2)
-                var b = self.new(NH * QP * NV)
-                ctx.enqueue_function[rpb_kernel](dy, dx, b, grid_dim=(blocks(NV), QP, NH), block_dim=TPB)
-                bias = Optional(b^)
+                comptime if MHA_BATCHED:
+                    rpb = Optional((dy, dx))
+                else:
+                    var b = self.new(NH * QP * NV)
+                    ctx.enqueue_function[rpb_kernel](dy, dx, b, grid_dim=(blocks(NV), QP, NH), block_dim=TPB)
+                    bias = Optional(b^)
             # self-attention
             var qk = self.new(QP * DM)
             ctx.enqueue_function[add_into_kernel](qk, hidden, qp, Int64(QP * DM), grid_dim=blocks(QP * DM), block_dim=TPB)
@@ -315,7 +331,7 @@ struct Sam3Decoder(Movable):
             hidden = self._post(p + "text_cross_attn_layer_norm", hidden, o, QP)
             # vision cross-attention, with the box bias
             ctx.enqueue_function[add_into_kernel](qk, hidden, qp, Int64(QP * DM), grid_dim=blocks(QP * DM), block_dim=TPB)
-            o = self._attn(p + "vision_cross_attn", qk, QP, kpos, fused, NV, NV, bias)
+            o = self._attn(p + "vision_cross_attn", qk, QP, kpos, fused, NV, NV, bias, rpb)
             hidden = self._post(p + "vision_cross_attn_layer_norm", hidden, o, QP)
             # MLP
             var f1 = linear(self.wts, p + "mlp.fc1", hidden, QP, DM)

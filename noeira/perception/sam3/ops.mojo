@@ -546,6 +546,69 @@ def attn_softmax_warp_kernel(
         j += 32
 
 
+def attn_softmax_rpb_kernel(
+    sc: Ptr, dy: Ptr, dx: Ptr, tq_n: Int64, tk_n: Int64, g_n: Int64, heads_n: Int64, scale: Float32,
+):
+    """`attn_softmax_kernel` (all keys real) with SAM 3's box relative-position
+    bias made per key instead of read from a [heads, tq, tk] tensor:
+    `bias[h, qq, r g + c] = dy[((qq - 1) g + r) heads + h] + dx[((qq - 1) g + c)
+    heads + h]`, 0 for the presence row qq = 0 — the decoder's `rpb_kernel` sum,
+    so the same floats, without writing and reading 33 MB a layer. A block per
+    row of `sc [heads, tq, tk]`; grid `heads tq`."""
+    var ri = Int(block_idx.x)
+    var tq = Int(tq_n)
+    var tk = Int(tk_n)
+    var g = Int(g_n)
+    var heads = Int(heads_n)
+    var h = _d(ri, tq)
+    var qq = ri - h * tq
+    var row = ri * tk
+    var tid = Int(thread_idx.x)
+    var m = Scalar[DT](-3.0e38)
+    var j = tid
+    while j < tk:
+        var v = sc[unsafe_offset=row + j] * Scalar[DT](scale)
+        if qq > 0:
+            var r = _d(j, g)
+            var c = j - r * g
+            v += dy[unsafe_offset=((qq - 1) * g + r) * heads + h] + dx[unsafe_offset=((qq - 1) * g + c) * heads + h]
+        sc[unsafe_offset=row + j] = v
+        m = max(m, v)
+        j += TPB
+    var top = block.max[block_size=TPB, broadcast=True](val=m)
+    var s = Scalar[DT](0)
+    j = tid
+    while j < tk:
+        var e = exp(sc[unsafe_offset=row + j] - top)
+        sc[unsafe_offset=row + j] = e
+        s += e
+        j += TPB
+    var inv = Scalar[DT](1) / block.sum[block_size=TPB, broadcast=True](val=s)
+    j = tid
+    while j < tk:
+        sc[unsafe_offset=row + j] = sc[unsafe_offset=row + j] * inv
+        j += TPB
+
+
+def mha_rpb(
+    ctx: DeviceContext, q: DeviceBuffer[DT], k: DeviceBuffer[DT], v: DeviceBuffer[DT], tq: Int, tk: Int,
+    heads: Int, hd: Int, dy: DeviceBuffer[DT], dx: DeviceBuffer[DT], g: Int,
+) raises -> DeviceBuffer[DT]:
+    """`mha` (batched, NVIDIA) with the decoder's box bias from its two factors
+    (`attn_softmax_rpb_kernel`): `dy`, `dx` [(tq - 1) g, heads], `tk = g g`."""
+    comptime assert MHA_BATCHED, "mha_rpb: the batched (NVIDIA) path"
+    var scale = Float32(1.0) / Float32(Float64(hd) ** 0.5)
+    var ld = heads * hd
+    var sc = ctx.enqueue_create_buffer[DT](heads * tq * tk)
+    gemm_strided_batched[False, True](ctx, sc, q, k, tq, tk, hd, ld, ld, tk, hd, hd, tq * tk, heads)
+    ctx.enqueue_function[attn_softmax_rpb_kernel](
+        sc, dy, dx, Int64(tq), Int64(tk), Int64(g), Int64(heads), scale, grid_dim=heads * tq, block_dim=TPB,
+    )
+    var out = ctx.enqueue_create_buffer[DT](tq * ld)
+    gemm_strided_batched[False, False](ctx, out, sc, v, tq, hd, tk, tk, ld, ld, tq * tk, hd, hd, heads)
+    return out^
+
+
 def gemm_strided_batched[TA: Bool, TB: Bool](
     ctx: DeviceContext, dst: DeviceBuffer[DT], a: DeviceBuffer[DT], b: DeviceBuffer[DT], m: Int, n: Int, k: Int,
     lda: Int, ldb: Int, ldc: Int, sa: Int, sb: Int, sc: Int, batch: Int,
