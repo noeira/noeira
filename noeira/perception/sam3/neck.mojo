@@ -36,7 +36,7 @@ from std.sys import default_accelerator
 
 from noeira.nn.constants import DT
 from noeira.nn.core.cublas_gemm import cublas_gemm
-from .ops import Sam3Weights, TPB, Ptr, blocks, linear, gemm_tb, add_kernel, gelu_kernel, SAM3_TF32
+from .ops import Sam3Weights, TPB, Ptr, blocks, linear, gemm_tb, add_kernel, gelu_kernel, SAM3_TF32, _d
 
 
 comptime NECK_PREFIX = "detector_model.vision_encoder.neck."
@@ -75,7 +75,7 @@ def convt_scatter_kernel(y: Ptr, b: Ptr, dst: Ptr, w_n: Int64, cout_n: Int64, sw
         dy = dx
         dx = t
     var w = Int(w_n)
-    var r = n // w
+    var r = _d(n, w)
     var c = n - r * w
     dst[unsafe_offset=((2 * r + dy) * 2 * w + 2 * c + dx) * cout + co] = y[unsafe_offset=n * 4 * cout + e] + b[unsafe_offset=co]
 
@@ -91,8 +91,9 @@ def shift_kernel(x: Ptr, dst: Ptr, h_n: Int64, w_n: Int64, c_n: Int64, dy_n: Int
     if ch >= cc:
         return
     var w = Int(w_n)
-    var r = n // w + Int(dy_n)
-    var c = n % w + Int(dx_n)
+    var r0 = _d(n, w)
+    var r = r0 + Int(dy_n)
+    var c = n - r0 * w + Int(dx_n)
     var v = Scalar[DT](0)
     if r >= 0 and r < Int(h_n) and c >= 0 and c < w:
         v = x[unsafe_offset=(r * w + c) * cc + ch]
@@ -113,7 +114,8 @@ def fill_rows_kernel(dst: Ptr, b: Ptr, cols_n: Int64, n_n: Int64):
     """`dst[r, c] = b[c]`."""
     var i = Int(block_idx.x) * TPB + Int(thread_idx.x)
     if i < Int(n_n):
-        dst[unsafe_offset=i] = b[unsafe_offset=i % Int(cols_n)]
+        var cols = Int(cols_n)
+        dst[unsafe_offset=i] = b[unsafe_offset=i - _d(i, cols) * cols]
 
 
 def maxpool2_kernel(x: Ptr, dst: Ptr, w_n: Int64, c_n: Int64):
@@ -125,8 +127,9 @@ def maxpool2_kernel(x: Ptr, dst: Ptr, w_n: Int64, c_n: Int64):
         return
     var w = Int(w_n)
     var wo = w // 2
-    var r = (n // wo) * 2
-    var c = (n % wo) * 2
+    var q = _d(n, wo)
+    var r = q * 2
+    var c = (n - q * wo) * 2
     var a = max(x[unsafe_offset=(r * w + c) * cc + ch], x[unsafe_offset=(r * w + c + 1) * cc + ch])
     var b = max(x[unsafe_offset=((r + 1) * w + c) * cc + ch], x[unsafe_offset=((r + 1) * w + c + 1) * cc + ch])
     dst[unsafe_offset=n * cc + ch] = max(a, b)

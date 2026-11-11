@@ -49,7 +49,7 @@ from noeira.nn.constants import DT
 from noeira.llm.lfm3.model import attention_probs, attention_apply, split_heads
 from .ops import (
     Sam3Weights, TPB, Ptr, blocks, linear, layer_norm, gemm_tb, add_kernel, gelu_kernel, rope_pairs_kernel,
-    put_head_kernel,
+    put_head_kernel, mha,
 )
 
 
@@ -175,7 +175,6 @@ struct Sam3ViT(Movable):
         if keep_taps:
             taps.append(_copy(ctx, x, NTOK * DIM))
         var sc_win = self.new(HEADS * WIN * WIN * WIN * WIN)
-        var sc_head = self.new(NTOK * NTOK)
         for li in range(LAYERS):
             var p = String("layers.") + String(li) + "."
             var glob = is_global(li) and (self.debug & 2) == 0
@@ -200,21 +199,8 @@ struct Sam3ViT(Movable):
             )
             var a = self.new(NTOK * DIM)
             if glob:
-                # one head at a time: all sixteen would hold 1.7 GB of scores
-                var qh = split_heads(ctx, q, NTOK, HEADS, HD)
-                var kh = split_heads(ctx, k, NTOK, HEADS, HD)
-                var vh = split_heads(ctx, v, NTOK, HEADS, HD)
-                var oh = self.new(NTOK * HD)
-                for hh in range(HEADS):
-                    var off = hh * NTOK * HD
-                    attention_probs(
-                        ctx, qh.create_sub_buffer[DT](off, NTOK * HD), kh.create_sub_buffer[DT](off, NTOK * HD),
-                        sc_head, self.dummy, NTOK, 1, 1, HD, 3, 0, 0,
-                    )
-                    attention_apply(ctx, sc_head, vh.create_sub_buffer[DT](off, NTOK * HD), oh, False, oh, NTOK, 1, 1, HD)
-                    ctx.enqueue_function[put_head_kernel](
-                        oh, a, Int64(hh), Int64(HD), Int64(HEADS), grid_dim=(blocks(HD), NTOK), block_dim=TPB,
-                    )
+                # one head at a time (`ops.mha`): all sixteen would hold 1.7 GB of scores
+                a = mha(ctx, q, k, v, NTOK, NTOK, HEADS, HD, NTOK)
             else:
                 var wt = WIN * WIN
                 for w in range(NWIN):

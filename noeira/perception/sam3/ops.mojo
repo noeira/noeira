@@ -35,6 +35,14 @@ def blocks(n: Int) -> Int:
     return (n + TPB - 1) // TPB
 
 
+@always_inline
+def _d(a: Int, b: Int) -> Int:
+    """`a // b` for non-negatives below 2^32, in 32-bit arithmetic: a 64-bit
+    divide is a software routine on a GPU (the profile's bias kernel spent most
+    of its 0.65 s on `i % cols`)."""
+    return Int(UInt32(a) // UInt32(b))
+
+
 def sam3_checkpoint() raises -> String:
     """`SAM3_CHECKPOINT`, else the Hugging Face cache's `facebook/sam3` snapshot."""
     var env = getenv("SAM3_CHECKPOINT")
@@ -133,7 +141,7 @@ def linear(mut wts: Sam3Weights, name: String, x: DeviceBuffer[DT], t: Int, k: I
     gemm_tb(wts.ctx, y, x, wb, t, n, k)
     if bias:
         wts.ctx.enqueue_function[bias_kernel](
-            y, wts.w(name + ".bias"), Int64(n), Int64(t * n), grid_dim=blocks(t * n), block_dim=TPB,
+            y, wts.w(name + ".bias"), Int64(n), Int64(t), grid_dim=(t, blocks(n)), block_dim=TPB,
         )
     return y^
 
@@ -141,12 +149,15 @@ def linear(mut wts: Sam3Weights, name: String, x: DeviceBuffer[DT], t: Int, k: I
 # ── kernels ──────────────────────────────────────────────────────────────
 
 
-def bias_kernel(x: Ptr, b: Ptr, cols_n: Int64, n_n: Int64):
-    """`x[r, c] += b[c]`."""
-    var i = Int(global_idx.x)
-    if i < Int(n_n):
-        var cols = Int(cols_n)
-        x[unsafe_offset=i] = x[unsafe_offset=i] + b[unsafe_offset=i % cols]
+def bias_kernel(x: Ptr, b: Ptr, cols_n: Int64, rows_n: Int64):
+    """`x[r, c] += b[c]`. Grid `(rows, ceil(cols / TPB))`: no division, and the
+    rows on x (CUDA caps grid y at 65 535; the pixel decoder's linears have
+    82 944)."""
+    var c = Int(block_idx.y) * TPB + Int(thread_idx.x)
+    var r = Int(block_idx.x)
+    var cols = Int(cols_n)
+    if c < cols:
+        x[unsafe_offset=r * cols + c] = x[unsafe_offset=r * cols + c] + b[unsafe_offset=c]
 
 
 def add_kernel(dst: Ptr, src: Ptr, n_n: Int64):
@@ -204,7 +215,7 @@ def rope_pairs_kernel(x: Ptr, cos_t: Ptr, sin_t: Ptr, heads_n: Int64, pairs_n: I
     var t = Int(block_idx.y)
     if idx >= heads * pairs:
         return
-    var h = idx // pairs
+    var h = _d(idx, pairs)
     var i = idx - h * pairs
     var base = (t * heads + h) * 2 * pairs + 2 * i
     var c = cos_t[unsafe_offset=t * pairs + i]
@@ -247,7 +258,7 @@ def heads_kernel(src: Ptr, dst: Ptr, t_n: Int64, heads_n: Int64, hd_n: Int64):
     var heads = Int(heads_n)
     var hd = Int(hd_n)
     if col < heads * hd:
-        var h = col // hd
+        var h = _d(col, hd)
         dst[unsafe_offset=(h * Int(t_n) + t) * hd + (col - h * hd)] = src[unsafe_offset=t * heads * hd + col]
 
 

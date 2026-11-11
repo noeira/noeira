@@ -28,7 +28,7 @@ from max.gpu.primitives import block, warp
 
 from noeira.nn.constants import DT
 from .ops import (
-    Sam3Weights, TPB, Ptr, blocks, linear, layer_norm, mha, gemm_tb, add_kernel, relu_kernel,
+    Sam3Weights, TPB, Ptr, blocks, linear, layer_norm, mha, gemm_tb, add_kernel, relu_kernel, _d,
 )
 from .neck import conv3x3, conv3x3_taps
 
@@ -62,7 +62,7 @@ def upsample2_add_kernel(coarse: Ptr, fine: Ptr, dst: Ptr, wf_n: Int64):
     if ch >= C:
         return
     var wf = Int(wf_n)
-    var r = n // wf
+    var r = _d(n, wf)
     var c = n - r * wf
     var m = (r // 2) * (wf // 2) + c // 2
     dst[unsafe_offset=n * C + ch] = coarse[unsafe_offset=m * C + ch] + fine[unsafe_offset=n * C + ch]
