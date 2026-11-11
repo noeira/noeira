@@ -14,6 +14,13 @@ Timed per image, after `--warmup` images: OWLv2 (one forward for the four words)
 and SAM-base on the best box of each word found — the pair a deployment would
 run; and SAM 3 (the image encoded once, the four words against it). CUDA times
 are synchronised; peak device memory is reported where the backend exposes it.
+
+The real-time candidates (2026-11-11; `detector_eval.py`'s, in the detcand
+venv): `yoloe-26{n,s,m,l}`, `yolo26{n,s,m}`, `rfdetr-seg-{n,s,m}` (their own
+masks) and `omdet-turbo` (+ SAM-base on its best boxes, as OWLv2). `--dtype
+fp16` runs the Ultralytics models with `half`; `--trt` exports them to a
+TensorRT fp16 engine first (YOLOE with the four words baked in: the vocabulary
+is fixed per engine) — what a Jetson deployment runs.
 """
 
 import argparse
@@ -28,7 +35,53 @@ import torch
 from PIL import Image
 
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
-from detector_eval import WORDS, Owl, Sam, Sam3, device  # noqa: E402
+from detector_eval import WORDS, Owl, Sam, Sam3, OmDet, RfDetrSeg, Yoloe, Yolo26, device  # noqa: E402
+
+
+class _Ultra:
+    """An Ultralytics model timed as deployed: fp16 (`half`), or a TensorRT fp16
+    engine exported once (`trt`; YOLOE's text prompts baked in)."""
+
+    def __init__(self, base, half, trt, words):
+        from ultralytics import YOLO
+        self.name = base.name + ("-trt" if trt else ("-fp16" if half else ""))
+        self.base = base
+        self.half = half
+        self.engine = None
+        if isinstance(base, Yoloe):
+            base.m.set_classes(list(words), base.m.get_text_pe(list(words)))
+            base.words = list(words)
+        if trt:
+            path = base.m.export(format="engine", half=True, imgsz=640, device=0, verbose=False)
+            self.engine = YOLO(path, task="segment")
+
+    def __call__(self, img, words):
+        from detector_eval import _ultra_dets, COCO_OF
+        m = self.engine if self.engine is not None else self.base.m
+        r = m.predict(np.ascontiguousarray(img[..., ::-1]), conf=0.01, verbose=False, device=0,
+                      half=self.half or self.engine is not None, retina_masks=True)[0]
+        if isinstance(self.base, Yoloe):
+            return _ultra_dets(r, lambda c: list(words)[c])
+        back = {COCO_OF[w]: w for w in words if COCO_OF.get(w)}
+        names = m.names
+        return _ultra_dets(r, lambda c: back.get(names[c]))
+
+
+def make(name, dev, dtype, trt, words):
+    """(detector, SAM-base or None) for `name`."""
+    if name == "owlv2":
+        return Owl(dev, dtype), Sam(dev, dtype)
+    if name == "sam3":
+        return Sam3(dev, dtype), None
+    if name == "omdet-turbo":
+        return OmDet(dev, dtype), Sam(dev, dtype)
+    if name.startswith("rfdetr-seg-"):
+        return RfDetrSeg(dev, name[-1]), None
+    if name.startswith("yoloe-26"):
+        return _Ultra(Yoloe(dev, name[-1]), dtype == torch.float16, trt, words), None
+    if name.startswith("yolo26"):
+        return _Ultra(Yolo26(dev, name[-1]), dtype == torch.float16, trt, words), None
+    raise SystemExit(f"unknown detector {name}")
 
 
 def sync(dev):
@@ -93,6 +146,7 @@ def main():
     ap.add_argument("--export-nyu", type=int, default=0)
     ap.add_argument("--mat")
     ap.add_argument("--compare", nargs=2)
+    ap.add_argument("--trt", action="store_true", help="Ultralytics models as TensorRT fp16 engines")
     a = ap.parse_args()
     if a.compare:
         compare(*a.compare)
@@ -113,14 +167,8 @@ def main():
         if dev == "cuda":
             torch.cuda.reset_peak_memory_stats()
         t_load = time.perf_counter()
-        if name == "owlv2":
-            det = Owl(dev, dtype)
-            sam = Sam(dev, dtype)
-        elif name == "sam3":
-            det = Sam3(dev, dtype)
-            sam = None
-        else:
-            raise SystemExit(f"unknown detector {name}")
+        det, sam = make(name, dev, dtype, a.trt, words)
+        name = getattr(det, "name", name)  # e.g. yoloe-26s-seg-trt
         load_s = time.perf_counter() - t_load
         t_det = []
         t_sam = []

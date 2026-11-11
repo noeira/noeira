@@ -29,6 +29,23 @@ words, with SAM (facebook/sam-vit-base) making masks from their boxes; and SAM 3
 (facebook/sam3, gated behind Meta's licence), which segments each word's
 instances itself — its own masks are scored.
 
+Real-time candidates (2026-11-11, `--detectors`; they need `ultralytics` and
+`rfdetr`, kept OUT of the pixi env: a venv on top of it,
+`python -m venv --system-site-packages ~/.cache/noeira/venvs/detcand` from the
+`detect` env's python, then `pip install ultralytics rfdetr`):
+  yoloe-26{n,s,m,l}   YOLOE-26-seg (Ultralytics, AGPL-3.0): open vocabulary, the
+                      four words as text prompts, its own masks
+  yolo26{n,s,m}       YOLO26-seg (AGPL-3.0), COCO's 80 classes: fridge ->
+                      refrigerator, table -> dining table, sofa -> couch; NO door
+  rfdetr-seg-{n,s,m}  RF-DETR-Seg (Roboflow, Apache-2.0), COCO classes, as yolo26
+  omdet-turbo         OmDet-Turbo Swin-T (Apache-2.0): open vocabulary, BOXES —
+                      masked by SAM-base like OWLv2
+Each candidate's input is the RGB frame as is; scores down to 0.01 for AP.
+
+Box-only places (`err3d_box`): beside the mask's place, the median of the depth
+points in the CENTRAL HALF of the matched box (no mask at all) — does a robot's
+place need masks, or does the box's middle do?
+
 Ground truth: an instance is (label == class) & (instance == k); instances under
 0.5 % of the image (blurred far fragments, mislabelled specks) are ignored as
 "difficult" — neither a miss nor a false positive if detected.
@@ -241,6 +258,148 @@ class Sam:
         return masks[0][0, 0].numpy().astype(bool)
 
 
+def _nms_on_cpu():
+    """The env's torchvision has no MPS kernel for NMS (YOLO26's and OmDet's
+    post-processing): run it on the CPU (a few hundred boxes) and hand the
+    indices back on the boxes' device."""
+    import torchvision
+    from torchvision.ops import boxes as tb
+    nms = tb.nms
+    if getattr(nms, "_on_cpu", False):
+        return
+
+    def cpu_nms(b, s, t):
+        return nms(b.float().cpu(), s.float().cpu(), t).to(b.device)  # (the CPU kernel has no fp16)
+
+    cpu_nms._on_cpu = True
+    tb.nms = cpu_nms
+    torchvision.ops.nms = cpu_nms
+
+
+COCO_OF = {"fridge": "refrigerator", "table": "dining table", "sofa": "couch", "door": None}
+
+
+class Yoloe:
+    """YOLOE-26-seg, the words as text prompts (embedded once per word list)."""
+
+    def __init__(self, dev, size="s"):
+        from ultralytics import YOLOE
+        _nms_on_cpu()
+        self.name = f"yoloe-26{size}-seg"
+        self.m = YOLOE(os.path.expanduser(f"~/.cache/noeira/weights/ultra/yoloe-26{size}-seg.pt"))
+        self.dev = dev
+        self.words = None
+
+    def __call__(self, img, words):
+        if self.words != list(words):
+            self.m.set_classes(list(words), self.m.get_text_pe(list(words)))
+            self.words = list(words)
+        # ultralytics reads a numpy image as BGR (OpenCV)
+        r = self.m.predict(np.ascontiguousarray(img[..., ::-1]), conf=0.01, verbose=False, device=self.dev,
+                           retina_masks=True)[0]
+        return _ultra_dets(r, lambda c: self.words[c])
+
+
+def _ultra_dets(r, word_of):
+    dets = []
+    if r.boxes is None or len(r.boxes) == 0:
+        return dets
+    boxes = r.boxes.xyxy.float().cpu().numpy()
+    conf = r.boxes.conf.float().cpu().numpy()
+    cls = r.boxes.cls.cpu().numpy().astype(int)
+    masks = r.masks.data.cpu().numpy() > 0.5 if r.masks is not None else None
+    for k in range(len(boxes)):
+        w = word_of(int(cls[k]))
+        if w is None:
+            continue
+        mk = masks[k] if masks is not None else None
+        dets.append((w, float(conf[k]), boxes[k].astype(np.float64), mk))
+    return dets
+
+
+class Yolo26:
+    """YOLO26-seg on COCO's classes (`COCO_OF`); no door."""
+
+    def __init__(self, dev, size="s"):
+        from ultralytics import YOLO
+        _nms_on_cpu()
+        self.name = f"yolo26{size}-seg"
+        self.m = YOLO(os.path.expanduser(f"~/.cache/noeira/weights/ultra/yolo26{size}-seg.pt"))
+        self.dev = dev
+
+    def __call__(self, img, words):
+        names = self.m.names
+        back = {COCO_OF[w]: w for w in words if COCO_OF.get(w)}
+        r = self.m.predict(np.ascontiguousarray(img[..., ::-1]), conf=0.01, verbose=False, device=self.dev,
+                           retina_masks=True)[0]
+        return _ultra_dets(r, lambda c: back.get(names[c]))
+
+
+class RfDetrSeg:
+    """RF-DETR-Seg on COCO's classes (`COCO_OF`); no door."""
+
+    def __init__(self, dev, size="s"):
+        import rfdetr
+        cls = {"n": rfdetr.RFDETRSegNano, "s": rfdetr.RFDETRSegSmall, "m": rfdetr.RFDETRSegMedium}[size]
+        self.name = f"rfdetr-seg-{size}"
+        self.m = cls()
+        from rfdetr.assets.coco_classes import COCO_CLASSES  # {COCO id: name}
+        self.names = COCO_CLASSES
+
+    def __call__(self, img, words):
+        back = {COCO_OF[w]: w for w in words if COCO_OF.get(w)}
+        d = self.m.predict(Image.fromarray(img), threshold=0.01)
+        dets = []
+        for k in range(len(d.xyxy)):
+            w = back.get(self.names.get(int(d.class_id[k]), ""))
+            if w is None:
+                continue
+            mk = d.mask[k].astype(bool) if d.mask is not None else None
+            dets.append((w, float(d.confidence[k]), d.xyxy[k].astype(np.float64), mk))
+        return dets
+
+
+class OmDet:
+    """OmDet-Turbo Swin-T: open vocabulary, boxes (SAM-base masks them)."""
+
+    name = "omdet-turbo"
+
+    def __init__(self, dev, dtype=torch.float32):
+        from transformers import AutoProcessor, OmDetTurboForObjectDetection
+        _nms_on_cpu()
+        mid = "omlab/omdet-turbo-swin-tiny-hf"
+        self.p = AutoProcessor.from_pretrained(mid)
+        self.m = OmDetTurboForObjectDetection.from_pretrained(mid).to(dev, dtype).eval()
+        self.dev = dev
+        self.dtype = dtype
+
+    @torch.no_grad()
+    def __call__(self, img, words):
+        pil = Image.fromarray(img)
+        inp = _cast(self.p(pil, text=list(words), return_tensors="pt"), self.dev, self.dtype)
+        out = self.m(**inp)
+        res = self.p.post_process_grounded_object_detection(
+            out, text_labels=[list(words)], target_sizes=[img.shape[:2]], threshold=0.01, nms_threshold=0.5,
+        )[0]
+        labels = res.get("text_labels", res.get("classes"))
+        dets = []
+        for b, sc, l in zip(res["boxes"].float().cpu().numpy(), res["scores"].float().cpu().numpy(), labels):
+            if str(l) in words:
+                dets.append((str(l), float(sc), b.astype(np.float64)))
+        return dets
+
+
+def box_centre_mask(box, shape):
+    """The central half of a box (each side shrunk by a quarter of its extent)."""
+    x0, y0, x1, y1 = box
+    w, h = x1 - x0, y1 - y0
+    m = np.zeros(shape, dtype=bool)
+    a, b = int(max(0, y0 + h / 4)), int(min(shape[0], y1 - h / 4))
+    c, d = int(max(0, x0 + w / 4)), int(min(shape[1], x1 - w / 4))
+    m[a:b, c:d] = True
+    return m
+
+
 def select(f, per_word, negatives, seed):
     rng = np.random.default_rng(seed)
     n = f["labels"].shape[0]
@@ -273,7 +432,8 @@ def main():
     ap.add_argument("--negatives", type=int, default=120)
     ap.add_argument("--seed", type=int, default=0)
     ap.add_argument("--limit", type=int, default=0, help="debug: first N selected images")
-    ap.add_argument("--detectors", default="owlv2,gdino", help="comma list of owlv2, gdino, sam3")
+    ap.add_argument("--detectors", default="owlv2,gdino",
+                    help="comma list of owlv2, gdino, sam3, omdet-turbo, yoloe-26{n,s,m,l}, yolo26{n,s,m}, rfdetr-seg-{n,s,m}")
     ap.add_argument("--tag", default="", help="suffix for report.json (separate runs per detector)")
     a = ap.parse_args()
     os.makedirs(a.out, exist_ok=True)
@@ -285,13 +445,19 @@ def main():
         idx = idx[: a.limit]
     print(f"device {dev}; images with the word (>= {MIN_FRAC:.1%} of the frame): {counts}; evaluated {len(idx)}")
     words = list(WORDS)
-    table = {"owlv2": Owl, "gdino": GDino, "sam3": Sam3}
+    from functools import partial
+    table = {"owlv2": Owl, "gdino": GDino, "sam3": Sam3, "omdet-turbo": OmDet}
+    for z in "nsml":
+        table[f"yoloe-26{z}"] = partial(Yoloe, size=z)
+    for z in "nsm":
+        table[f"yolo26{z}"] = partial(Yolo26, size=z)
+        table[f"rfdetr-seg-{z}"] = partial(RfDetrSeg, size=z)
     chosen = [table[d.strip()] for d in a.detectors.split(",")]
-    sam = Sam(dev) if any(D is not Sam3 for D in chosen) else None
+    sam = Sam(dev) if any(D in (Owl, GDino, OmDet) for D in chosen) else None
     report = {"images": len(idx), "present_counts": counts, "selection_seed": a.seed, "detectors": {}}
     for Det in chosen:
         det = Det(dev)
-        recs = {w: {"scores": [], "tps": [], "n_gt": 0, "mask_iou": [], "err3d": []} for w in words}
+        recs = {w: {"scores": [], "tps": [], "n_gt": 0, "mask_iou": [], "err3d": [], "err3d_box": []} for w in words}
         t_det = 0.0
         for k, i in enumerate(idx):
             img, lab, ins, dep = load(f, i)
@@ -332,6 +498,9 @@ def main():
                     cg = centroid3d(gm, dep)
                     if cp is not None and cg is not None:
                         recs[w]["err3d"].append(float(np.linalg.norm(cp - cg)))
+                    cb = centroid3d(box_centre_mask(best_match[0], dep.shape), dep)
+                    if cb is not None and cg is not None:
+                        recs[w]["err3d_box"].append(float(np.linalg.norm(cb - cg)))
             if (k + 1) % 50 == 0:
                 print(f"  {det.name}: {k + 1}/{len(idx)} images, {t_det / (k + 1) * 1000:.0f} ms/image")
         rows = {}
@@ -339,20 +508,24 @@ def main():
             r = recs[w]
             apv, p, rc, thr = ap_voc(r["scores"], r["tps"], r["n_gt"])
             e = np.asarray(r["err3d"])
+            eb = np.asarray(r["err3d_box"])
             rows[w] = {
                 "n_gt": r["n_gt"], "AP50": apv, "P_at_F1": p, "R_at_F1": rc, "thr_at_F1": thr,
                 "mask_iou_median": float(np.median(r["mask_iou"])) if r["mask_iou"] else float("nan"),
                 "err3d_median_m": float(np.median(e)) if len(e) else float("nan"),
                 "err3d_within_0.3m": float(np.mean(e < 0.3)) if len(e) else float("nan"),
                 "n_3d": int(len(e)),
+                "err3d_box_median_m": float(np.median(eb)) if len(eb) else float("nan"),
+                "err3d_box_within_0.3m": float(np.mean(eb < 0.3)) if len(eb) else float("nan"),
             }
         report["detectors"][det.name] = {"ms_per_image": t_det / max(1, len(idx)) * 1000, "words": rows}
         print(f"\n{det.name}  ({t_det / max(1, len(idx)) * 1000:.0f} ms/image on {dev})")
-        print(f"  {'word':7s} {'GT':>4s} {'AP50':>6s} {'P@F1':>6s} {'R@F1':>6s} {'thr':>5s} {'maskIoU':>8s} {'3D med':>7s} {'<0.3m':>6s} {'n3D':>4s}")
+        print(f"  {'word':7s} {'GT':>4s} {'AP50':>6s} {'P@F1':>6s} {'R@F1':>6s} {'thr':>5s} {'maskIoU':>8s} {'3D med':>7s} {'<0.3m':>6s} {'n3D':>4s} {'box3D':>6s} {'<0.3m':>6s}")
         for w in words:
             x = rows[w]
             print(f"  {w:7s} {x['n_gt']:4d} {x['AP50']:6.3f} {x['P_at_F1']:6.3f} {x['R_at_F1']:6.3f} {x['thr_at_F1']:5.2f} "
-                  f"{x['mask_iou_median']:8.3f} {x['err3d_median_m']:7.3f} {x['err3d_within_0.3m']:6.2f} {x['n_3d']:4d}")
+                  f"{x['mask_iou_median']:8.3f} {x['err3d_median_m']:7.3f} {x['err3d_within_0.3m']:6.2f} {x['n_3d']:4d} "
+                  f"{x['err3d_box_median_m']:6.3f} {x['err3d_box_within_0.3m']:6.2f}")
         del det
         if dev == "mps":
             torch.mps.empty_cache()
