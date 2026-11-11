@@ -2,7 +2,8 @@
 # | SuperMimic: the robot interface — what the method needs from a body
 # +--------------------------------------------------------------------------+ #
 """Everything SuperMimic knows about a robot goes through two traits, so a new
-humanoid (RP1, ToddlerBot, …) is one conformer of each.
+humanoid is one conformer of each: the G1 twice (BFM-Zero's body, mjlab's)
+and Berkeley Humanoid Lite (`BhlRobot`).
 
 `TrackingRobot` (comptime, never instantiated): the dimensions, the BODIES BY
 NAME (tracked set, anchor, root, feet, the body whose CoM is randomised), the
@@ -43,6 +44,10 @@ from noeira.envs.robots import UnitreeG1
 from noeira.envs.robots.unitree_g1 import UnitreeG1BatchedDR
 from noeira.envs.robots.unitree_g1_mjlab import UnitreeG1Mjlab, UnitreeG1MjlabBatchedDR
 from noeira.envs.robots.unitree_g1_mjlab_pd import G1M_N_DOF, g1m_action_scale, g1m_default_pos
+from noeira.envs.robots.berkeley_humanoid_lite import BerkeleyHumanoidLite, BerkeleyHumanoidLiteBatchedDR
+from noeira.envs.robots.berkeley_humanoid_lite_pd import (
+    BHL_ACTION_SCALE, BHL_N_DOF, BHL_SOFT_LIMIT_FACTOR, bhl_default_pos,
+)
 from noeira.nn.constants import DT
 from noeira.nn.core.ptr import mptr
 from noeira.envs.robots.unitree_g1_pd import G1_N_DOF, g1_default_pos, g1_effort, g1_kp
@@ -701,3 +706,224 @@ struct G1MjlabRobot(TrackingRobot):
     @staticmethod
     def soft_limit_factor() -> Float64:
         return 0.9
+
+
+# ── Berkeley Humanoid Lite (`BerkeleyHumanoidLite`) ─────────────────────────
+struct BhlSim(TrackingSim):
+    """`BerkeleyHumanoidLite` on the CPU. Its env action is BHL's own (`q0 +
+    0.25·a`, unclipped), so the SuperMimic action a with bias b is handed
+    over as `a − b/0.25`: the target is `q0 + 0.25·a − b`."""
+    var env: BerkeleyHumanoidLite[DType.float64]
+
+    def __init__(out self, var env: BerkeleyHumanoidLite[DType.float64]):
+        self.env = env^
+
+    def __init__(out self, *, deinit move: Self):
+        self.env = move.env^
+
+    @staticmethod
+    def create() raises -> Self:
+        var e = BerkeleyHumanoidLite[DType.float64]()
+        _ = e.reset()
+        return Self(e^)
+
+    def set_state(mut self, qpos: List[Float64], qvel: List[Float64]):
+        self.env.set_state(qpos, qvel)
+
+    def control_step(mut self, a: List[Float64], bias: List[Float64]):
+        var act = ContAction[BHL_N_DOF]()
+        for j in range(BHL_N_DOF):
+            act.data[j] = a[j] - bias[j] / BHL_ACTION_SCALE
+        _ = self.env.step(act)
+
+    def qpos(self, i: Int) -> Float64:
+        return Float64(self.env.d.qpos.data[i])
+
+    def qvel(self, i: Int) -> Float64:
+        return Float64(self.env.d.qvel.data[i])
+
+    def body_field(self, b: Int, k: Int) -> Float64:
+        return Float64(self.env.mf.bodies.data[b * MODEL_BODY_SIZE + k])
+
+    def set_body_field(mut self, b: Int, k: Int, v: Float64):
+        self.env.mf.bodies.data[b * MODEL_BODY_SIZE + k] = v
+
+    def joint_field(self, j: Int, k: Int) -> Float64:
+        return Float64(self.env.mf.joints.data[j * MODEL_JOINT_SIZE + k])
+
+    def geom_field(self, g: Int, k: Int) -> Float64:
+        return Float64(self.env.mf.geoms.data[g * MODEL_GEOM_SIZE + k])
+
+    def set_geom_field(mut self, g: Int, k: Int, v: Float64):
+        self.env.mf.geoms.data[g * MODEL_GEOM_SIZE + k] = v
+
+    def num_geoms(self) -> Int:
+        return BerkeleyHumanoidLite[DType.float64].NGEOM
+
+    def init_renderer(mut self) raises -> Bool:
+        return self.env.init_renderer()
+
+    def render_frame(mut self) raises:
+        self.env.render_frame()
+
+    def renderer_delay(self, ms: Int):
+        self.env.renderer_delay(ms)
+
+    def check_renderer_quit(mut self) -> Bool:
+        return self.env.check_renderer_quit()
+
+    def renderer_paused(self) -> Bool:
+        return self.env.renderer_paused()
+
+    def start_recording(mut self, path: String, fps: Int) raises:
+        self.env.start_recording(path, fps)
+
+    def stop_recording(mut self) raises:
+        self.env.stop_recording()
+
+    def close_renderer(mut self) raises:
+        self.env.close_renderer()
+
+
+def _k_bhl_action(
+    n_lanes: Int64, a: Pointer[Scalar[DT], MutAnyOrigin], bias: Pointer[Scalar[DT], MutAnyOrigin], bias_stride: Int64,
+    k: Pointer[Scalar[DT], MutAnyOrigin], dst: Pointer[Scalar[DT], MutAnyOrigin],
+):
+    """BHL's env action for the SuperMimic action a and bias b: `a − b·k`,
+    k = 1/scale per joint."""
+    var i = Int(global_idx.x)
+    if i >= Int(n_lanes) * BHL_N_DOF:
+        return
+    var l = i // BHL_N_DOF
+    var j = i % BHL_N_DOF
+    dst[unsafe_offset=i] = a[unsafe_offset=i] - bias[unsafe_offset=l * Int(bias_stride) + j] * k[unsafe_offset=j]
+
+
+struct BhlBatchedSim[N_: Int](TrackingBatchedSim):
+    """`BerkeleyHumanoidLiteBatchedDR[N]` (float32), per-lane friction / CoM
+    overrides, `BhlSim`'s action law as a kernel."""
+    comptime N = Self.N_
+    comptime LANE_DR = True
+    var env: BerkeleyHumanoidLiteBatchedDR[Self.N_]
+    var kgain: DeviceBuffer[DT]
+
+    def __init__(out self, var env: BerkeleyHumanoidLiteBatchedDR[Self.N_], var kgain: DeviceBuffer[DT]):
+        self.env = env^
+        self.kgain = kgain^
+
+    def __init__(out self, *, deinit move: Self):
+        self.env = move.env^
+        self.kgain = move.kgain^
+
+    @staticmethod
+    def create(ctx: DeviceContext) raises -> Self:
+        var env = BerkeleyHumanoidLiteBatchedDR[Self.N_](ctx)
+        env.reset_batch[Self.N_](Optional(ctx), 0)
+        var k = ctx.enqueue_create_buffer[DT](BHL_N_DOF)
+        var hk = ctx.enqueue_create_host_buffer[DT](BHL_N_DOF)
+        ctx.synchronize()
+        for j in range(BHL_N_DOF):
+            hk[j] = Scalar[DT](1.0 / BHL_ACTION_SCALE)
+        ctx.enqueue_copy(k, hk)
+        ctx.synchronize()
+        return Self(env^, k^)
+
+    def lane_dr_ptr(mut self) -> Pointer[Scalar[DT], MutAnyOrigin]:
+        return self.env.lane_dr_ptr()
+
+    def qpos_ptr(mut self) -> Pointer[Scalar[DT], MutAnyOrigin]:
+        return mptr(self.env.d.qpos.dev.value().unsafe_ptr())
+
+    def qvel_ptr(mut self) -> Pointer[Scalar[DT], MutAnyOrigin]:
+        return mptr(self.env.d.qvel.dev.value().unsafe_ptr())
+
+    def control_step(
+        mut self, ctx: DeviceContext, a: Pointer[Scalar[DT], MutAnyOrigin],
+        bias: Pointer[Scalar[DT], MutAnyOrigin], bias_stride: Int, seed: UInt64,
+    ) raises:
+        comptime NA = Self.N_ * BHL_N_DOF
+        ctx.enqueue_function[_k_bhl_action](
+            Int64(Self.N_), a, bias, Int64(bias_stride), mptr(self.kgain.unsafe_ptr()), self.env.action_ptr(),
+            grid_dim=ceildiv(NA, 128), block_dim=128,
+        )
+        self.env.step_batch[Self.N_](Optional(ctx), seed)
+
+    def reset_lanes(mut self, ctx: DeviceContext, mask: Pointer[Scalar[DT], MutAnyOrigin], seed: UInt64) raises:
+        ctx.enqueue_function[_k_copy_mask](
+            Int64(Self.N_), mask, mptr(self.env._done.unsafe_ptr()), grid_dim=ceildiv(Self.N_, 128), block_dim=128
+        )
+        self.env.selective_reset_batch[Self.N_](Optional(ctx), seed)
+
+    def refresh(mut self, ctx: DeviceContext) raises:
+        self.env._run_fields_fk(ctx)
+        self.env._run_fields_vel(ctx)
+
+    def body_field(self, b: Int, k: Int) -> Float64:
+        return Float64(self.env.mf.bodies.data[b * MODEL_BODY_SIZE + k])
+
+    def set_body_field_all(mut self, ctx: DeviceContext, b: Int, k: Int, v: Float64) raises:
+        self.env.mf.bodies.data[b * MODEL_BODY_SIZE + k] = Scalar[DT](v)
+        self.env.mf.bodies.upload_resident(ctx)
+
+    def set_geom_field_all(mut self, ctx: DeviceContext, g: Int, k: Int, v: Float64) raises:
+        self.env.mf.geoms.data[g * MODEL_GEOM_SIZE + k] = Scalar[DT](v)
+        self.env.mf.geoms.upload_resident(ctx)
+
+
+struct BhlRobot(TrackingRobot):
+    """Berkeley Humanoid Lite: 22 DoF (5 per arm, 6 per leg, no waist), 26
+    bodies. 13 tracked bodies, the G1 set's counterparts: the base, and per
+    side the thigh, the shank, the foot, the upper arm, the forearm and the
+    hand. There is no torso apart from the base, so the base is root, anchor
+    and the body whose CoM is randomised.
+
+    ⚠ The base frame sits at floor level (`berkeley_humanoid_lite_xml`): a
+    reference's root height is about −0.04 m when the robot stands."""
+    comptime NQ = 29
+    comptime NV = 28
+    comptime NDOF = BHL_N_DOF
+    comptime NBODY = BerkeleyHumanoidLite[DType.float64].NBODY - 1
+    comptime NJOINT = BerkeleyHumanoidLite[DType.float64].NJOINT
+    comptime N_TRACKED = 13
+    comptime SIM = BhlSim
+
+    @staticmethod
+    def mjcf_path() -> String:
+        return "noeira/envs/robots/assets/berkeley_humanoid_lite.xml"
+
+    @staticmethod
+    def tracked_bodies() -> List[String]:
+        return [
+            "base", "leg_left_hip_pitch", "leg_left_knee_pitch", "leg_left_ankle_roll",
+            "leg_right_hip_pitch", "leg_right_knee_pitch", "leg_right_ankle_roll",
+            "arm_left_shoulder_yaw", "arm_left_elbow_pitch", "arm_left_hand_link",
+            "arm_right_shoulder_yaw", "arm_right_elbow_pitch", "arm_right_hand_link",
+        ]
+
+    @staticmethod
+    def anchor_body() -> String:
+        return "base"
+
+    @staticmethod
+    def root_body() -> String:
+        return "base"
+
+    @staticmethod
+    def foot_bodies() -> List[String]:
+        return ["leg_left_ankle_roll", "leg_right_ankle_roll"]
+
+    @staticmethod
+    def com_body() -> String:
+        return "base"
+
+    @staticmethod
+    def hand_bodies() -> List[String]:
+        return ["arm_left_hand_link", "arm_right_hand_link"]
+
+    @staticmethod
+    def default_joint_pos(j: Int) -> Float64:
+        return bhl_default_pos(j)
+
+    @staticmethod
+    def soft_limit_factor() -> Float64:
+        return BHL_SOFT_LIMIT_FACTOR       # BHL's `soft_joint_pos_limit_factor`

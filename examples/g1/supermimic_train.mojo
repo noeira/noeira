@@ -7,7 +7,10 @@ Smoke scale by default (`SMSmokeG1`'s widths). The env and
 replay run on the CPU; the networks and the four update blocks run on the
 CPU, or on the GPU when built with `-D SM_GPU=1`. `-D SM_GPU=2` puts the env
 and the replay on the device too (`SuperMimicAgentGpu` over the batched G1:
-NVIDIA only); `-D SM_PAPER=1` the paper's widths and 4096 lanes:
+NVIDIA only); `-D SM_PAPER=1` the paper's widths and 4096 lanes; `-D
+SM_LIGHT=1` half-width networks and 1024 lanes; `-D SM_BHL=1` Berkeley
+Humanoid Lite instead of the G1 (its stores: `examples/bhl/retarget_import.mojo`;
+`-D BHL_EFFORT_PCT=` / `-D BHL_SPEED_PCT=` scale its torque and speed limits):
 
     pixi run -e apple mojo build -I . -D SM_GPU=1 examples/g1/supermimic_train.mojo -o sm_train_gpu
     pixi run -e nvidia mojo build -I . -D SM_GPU=2 -D SM_PAPER=1 examples/g1/supermimic_train.mojo -o sm_train_dev
@@ -73,7 +76,6 @@ from std.sys import argv, get_defined_int
 from max.gpu.host import DeviceContext
 from std.time import perf_counter_ns
 
-from noeira.core.cont_action import ContAction
 from noeira.data.store import TrajectoryStore
 from noeira.core.run import RunContext, register_run
 from noeira.core.run_session import RunLogger, finish_run, run_logger
@@ -81,30 +83,45 @@ from noeira.deep_agents.supermimic import SMConfig, sm_agent, sm_agent_gpu
 from noeira.deep_agents.supermimic.eval import SMInRunBench
 from noeira.io.artifact_sink import ArtifactSink, sink_for_run
 from noeira.deep_agents.supermimic.motion_library import SMMotionLibrary, SMResetSampler
-from noeira.deep_agents.supermimic.robot import G1BatchedSim, G1Robot, G1Sim, G1MjlabRobot, G1MjlabSim, G1MjlabBatchedSim
-from noeira.envs.robots import UnitreeG1
-from noeira.envs.robots.unitree_g1_pd import G1_N_DOF, g1_default_pos
+from noeira.deep_agents.supermimic.robot import (
+    BhlBatchedSim, BhlRobot, G1BatchedSim, G1MjlabBatchedSim, G1MjlabRobot, G1Robot, SMDims, TrackingSim,
+)
 from noeira.nn.constants import DT
 
 
 comptime MODE = get_defined_int["SM_GPU", 0]()       # 0 CPU, 1 nets on the GPU, 2 all on the GPU
 comptime TARGET: StaticString = "gpu" if MODE != 0 else "cpu"
 comptime P = get_defined_int["SM_PAPER", 0]() != 0
+comptime LIGHT = get_defined_int["SM_LIGHT", 0]() != 0 and not P
 
 # The robot: mjlab's G1 (the reproduction's body) by default; `-D SM_BFM_G1=1`
-# selects BFM-Zero's G1 (checkpoints trained before 2026-11-05 are on it).
+# selects BFM-Zero's G1 (checkpoints trained before 2026-11-05 are on it),
+# `-D SM_BHL=1` Berkeley Humanoid Lite.
 comptime BFM_G1 = get_defined_int["SM_BFM_G1", 0]() != 0
-comptime Robot = G1Robot if BFM_G1 else G1MjlabRobot
-comptime RBatched[N: Int] = G1BatchedSim[N] if BFM_G1 else G1MjlabBatchedSim[N]
-# SMPaperG1's widths with -D SM_PAPER=1, SMSmokeG1's otherwise (one concrete
-# SMConfig, so its robot stays Robot for the library's type)
+comptime BHL = get_defined_int["SM_BHL", 0]() != 0
+comptime Robot = BhlRobot if BHL else (G1Robot if BFM_G1 else G1MjlabRobot)
+comptime RBatched[N: Int] = BhlBatchedSim[N] if BHL else (G1BatchedSim[N] if BFM_G1 else G1MjlabBatchedSim[N])
+comptime S = SMDims[Robot].S                   # a library row: qpos, then qvel
+comptime NDOF = Robot.NDOF
+# The synthetic library sways these joints: the G1's waist and arms, BHL's arms.
+comptime SWAY0 = 0 if BHL else 15
+comptime SWAY1 = 10 if BHL else 29
+# SMPaperG1's widths with -D SM_PAPER=1, a quarter of them with -D SM_LIGHT=1
+# (1024 lanes, half-width networks: a small library without the hardest
+# clips), SMSmokeG1's otherwise (one concrete SMConfig, so its robot stays
+# Robot for the library's type)
 comptime C = SMConfig[
     TARGET, Robot,
-    2048 if P else 128, 64 if P else 64, 2048 if P else 128, 1024 if P else 64, 512 if P else 64, 256 if P else 32,
-    2048 if P else 128, 1024 if P else 64, 512 if P else 64, 256 if P else 32, 256 if P else 64, 128 if P else 32,
-    4096 if P else 8, 2048 if P else 64, 4096 if P else 16, 32,
+    2048 if P else (1024 if LIGHT else 128), 64,
+    2048 if P else (1024 if LIGHT else 128), 1024 if P else (512 if LIGHT else 64),
+    512 if P else (256 if LIGHT else 64), 256 if P else (128 if LIGHT else 32),
+    2048 if P else (1024 if LIGHT else 128), 1024 if P else (512 if LIGHT else 64),
+    512 if P else (256 if LIGHT else 64), 256 if P else (128 if LIGHT else 32),
+    256 if P else (128 if LIGHT else 64), 128 if P else (64 if LIGHT else 32),
+    4096 if P else (1024 if LIGHT else 8), 2048 if P else (1024 if LIGHT else 64),
+    4096 if P else (2048 if LIGHT else 16), 32,
 ]
-comptime BENCH_LANES = 512 if P else 8         # the in-run benchmark's simulator (memory: see SMInRunBench)
+comptime BENCH_LANES = 512 if P else (256 if LIGHT else 8)   # the in-run benchmark's simulator (memory: see SMInRunBench)
 comptime BenchSim = RBatched[BENCH_LANES]
 
 
@@ -123,30 +140,31 @@ def _flag(args: List[String], name: String) -> Bool:
 
 
 def _q0() -> List[Float64]:
-    var q0 = List[Float64](length=G1_N_DOF, fill=0.0)
-    for j in range(G1_N_DOF):
+    var q0 = List[Float64](length=NDOF, fill=0.0)
+    for j in range(NDOF):
         q0[j] = Robot.default_joint_pos(j)
     return q0^
 
 
 def _synthetic() raises -> SMMotionLibrary[Robot]:
-    """Our G1 settled 2 s under zero action, then two clips of it swaying its
-    arms and waist (sinusoids on the reference joints, velocities consistent)."""
-    var env = UnitreeG1[DType.float64]()
-    _ = env.reset()
-    var a = ContAction[G1_N_DOF]()
+    """The robot settled 2 s under zero action, then two clips of it swaying
+    its arms (and the G1's waist): sinusoids on the reference joints,
+    velocities consistent."""
+    var sim = Robot.SIM.create()
+    var zero = List[Float64](length=NDOF, fill=0.0)
     for _ in range(100):
-        _ = env.step(a)
+        sim.control_step(zero, zero)
     var lens: List[Int] = [300, 200]
-    var rows = List[Scalar[DT]](length=500 * 71, fill=0)
+    var rows = List[Scalar[DT]](length=500 * S, fill=0)
+    comptime QD = Robot.NQ + 6      # joint velocities in a row
     for f in range(500):
         var t = Float64(f) * 0.02
-        for k in range(36):
-            rows[f * 71 + k] = Scalar[DT](env.d.qpos.data[k])
-        for j in range(15, 29):   # waist and arms
+        for k in range(Robot.NQ):
+            rows[f * S + k] = Scalar[DT](sim.qpos(k))
+        for j in range(SWAY0, SWAY1):
             var w = 1.5 + 0.1 * Float64(j)
-            rows[f * 71 + 7 + j] += Scalar[DT](0.3 * sin(w * t))
-            rows[f * 71 + 42 + j] = Scalar[DT](0.3 * w * sin(w * t + 1.5707963267948966))
+            rows[f * S + 7 + j] += Scalar[DT](0.3 * sin(w * t))
+            rows[f * S + QD + j] = Scalar[DT](0.3 * w * sin(w * t + 1.5707963267948966))
     return SMMotionLibrary[Robot](rows^, lens, _q0())
 
 
@@ -190,10 +208,10 @@ def _from_store(spec: String, max_clips: Int) raises -> SMMotionLibrary[Robot]:
             lens.append(l)
             rows_n += l
         var o = len(rows)
-        rows.resize(o + rows_n * 71, 0)
-        for i in range(rows_n * 71):
+        rows.resize(o + rows_n * S, 0)
+        for i in range(rows_n * S):
             rows[o + i] = refc[i]
-    var frames = len(rows) // 71
+    var frames = len(rows) // S
     print("  library:", len(lens), "clips,", frames, "frames (", Float64(frames) / 50.0 / 3600.0, "h ) from", len(paths), "store(s)")
     return SMMotionLibrary[Robot](rows^, lens, _q0())
 
@@ -202,7 +220,6 @@ def _subset_of(lib: SMMotionLibrary[Robot], clips: List[Int]) raises -> SMMotion
     """The listed clips of `lib`, in that order."""
     var lens = List[Int]()
     var rows = List[Scalar[DT]]()
-    comptime S = 71
     for i in range(len(clips)):
         var c = clips[i]
         if c < 0 or c >= lib.num_clips:
@@ -257,7 +274,6 @@ def _subset(lib: SMMotionLibrary[Robot], k: Int) raises -> SMMotionLibrary[Robot
     var kk = min(max(k, 1), n)
     var lens = List[Int]()
     var rows = List[Scalar[DT]]()
-    comptime S = 71
     for i in range(kk):
         var c = i * n // kk
         var f0 = lib.clip_start[c]
@@ -371,10 +387,10 @@ def main() raises:
     var lib = _from_store(store, max_clips) if store != "" else _synthetic()
     var mode_s = String("cpu") if MODE == 0 else (String("gpu-nets") if MODE == 1 else String("gpu-all"))
     var run = RunContext(
-        project=String("g1"),
+        project=String("bhl") if BHL else String("g1"),
         driver=String("examples/g1/supermimic_train.mojo"),
-        slug=String("supermimic-") + mode_s + (String("-paper") if P else String("-smoke")),
-        env=String("noeira:g1/supermimic_tracking"),
+        slug=String("supermimic-") + mode_s + (String("-paper") if P else (String("-light") if LIGHT else String("-smoke"))),
+        env=String("noeira:bhl/supermimic_tracking") if BHL else String("noeira:g1/supermimic_tracking"),
         dataset=String("synthetic") if store == "" else store,
         seed=seed_v,
     )

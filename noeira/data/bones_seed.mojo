@@ -261,13 +261,28 @@ def _rotvec_wxyz(q_in: SIMD[DType.float64, 4]) -> SIMD[DType.float64, 4]:
 
 
 def resample_mjlab(clip: SeedClip, out_fps: Float64 = SEED_OUT_FPS) raises -> MimicMotion:
-    """`motion_convert.resample_motion` of the reproduction, line for line."""
-    var n_in = clip.n
-    var input_dt = 1.0 / clip.fps
+    """`motion_convert.resample_motion` of the reproduction, on a SEED G1 clip."""
+    var out = resample_mjlab_rows(clip.raw, clip.n, G1_N_DOF, clip.fps, out_fps)
+    return MimicMotion(out_fps, out[0], out[1].copy())
+
+
+def resample_mjlab_rows(
+    raw: List[Float64], n_in: Int, ndof: Int, in_fps: Float64, out_fps: Float64 = SEED_OUT_FPS,
+) raises -> Tuple[Int, List[Float64]]:
+    """`motion_convert.resample_motion` of the reproduction, line for line,
+    for any hinge count: `raw` is `n_in × (7 + ndof)` (root position, root
+    quaternion WXYZ, joint angles); the result is `(n_out, n_out × (13 + 2·ndof))`
+    rows `[root pos, root quat WXYZ, q, root lin vel (world), root ang vel
+    (world), qd]`."""
+    var input_dt = 1.0 / in_fps
     var output_dt = 1.0 / out_fps
     var duration = Float64(n_in - 1) * input_dt
     var n_out = Int(floor(duration / output_dt + 1e-6)) + 1
-    comptime D = SEED_REF_DIM
+    var RAW = 7 + ndof
+    var D = 13 + 2 * ndof
+    var CV = 7 + ndof          # root linear velocity
+    var CW = 10 + ndof         # root angular velocity
+    var CQD = 13 + ndof        # joint velocities
     var frames = List[Float64](length=n_out * D, fill=0.0)
 
     for i in range(n_out):
@@ -280,18 +295,18 @@ def resample_mjlab(clip: SeedClip, out_fps: Float64 = SEED_OUT_FPS) raises -> Mi
             i0 = n_in - 1
         var i1 = min(i0 + 1, n_in - 1)
         var b = x - Float64(i0)
-        var r0 = i0 * SEED_RAW_DIM
-        var r1 = i1 * SEED_RAW_DIM
+        var r0 = i0 * RAW
+        var r1 = i1 * RAW
         var o = i * D
         for k in range(3):
-            frames[o + k] = clip.raw[r0 + k] * (1.0 - b) + clip.raw[r1 + k] * b
-        for j in range(G1_N_DOF):
-            frames[o + 7 + j] = clip.raw[r0 + 7 + j] * (1.0 - b) + clip.raw[r1 + 7 + j] * b
+            frames[o + k] = raw[r0 + k] * (1.0 - b) + raw[r1 + k] * b
+        for j in range(ndof):
+            frames[o + 7 + j] = raw[r0 + 7 + j] * (1.0 - b) + raw[r1 + 7 + j] * b
         var q0 = SIMD[DType.float64, 4](
-            clip.raw[r0 + 3], clip.raw[r0 + 4], clip.raw[r0 + 5], clip.raw[r0 + 6]
+            raw[r0 + 3], raw[r0 + 4], raw[r0 + 5], raw[r0 + 6]
         )
         var q1 = SIMD[DType.float64, 4](
-            clip.raw[r1 + 3], clip.raw[r1 + 4], clip.raw[r1 + 5], clip.raw[r1 + 6]
+            raw[r1 + 3], raw[r1 + 4], raw[r1 + 5], raw[r1 + 6]
         )
         q0 = q0 / _norm4(q0)
         q1 = q1 / _norm4(q1)
@@ -323,9 +338,9 @@ def resample_mjlab(clip: SeedClip, out_fps: Float64 = SEED_OUT_FPS) raises -> Mi
             var hi = i + 1 if i < n_out - 1 else n_out - 1
             var den = output_dt * Float64(hi - lo)
             for k in range(3):
-                frames[i * D + 36 + k] = (frames[hi * D + k] - frames[lo * D + k]) / den
-            for j in range(G1_N_DOF):
-                frames[i * D + 42 + j] = (frames[hi * D + 7 + j] - frames[lo * D + 7 + j]) / den
+                frames[i * D + CV + k] = (frames[hi * D + k] - frames[lo * D + k]) / den
+            for j in range(ndof):
+                frames[i * D + CQD + j] = (frames[hi * D + 7 + j] - frames[lo * D + 7 + j]) / den
     if n_out >= 3:
         for i in range(1, n_out - 1):
             var a = (i + 1) * D + 3
@@ -336,8 +351,8 @@ def resample_mjlab(clip: SeedClip, out_fps: Float64 = SEED_OUT_FPS) raises -> Mi
             )
             var w = _rotvec_wxyz(rel) / (2.0 * output_dt)
             for k in range(3):
-                frames[i * D + 39 + k] = w[k]
+                frames[i * D + CW + k] = w[k]
         for k in range(3):
-            frames[39 + k] = frames[D + 39 + k]
-            frames[(n_out - 1) * D + 39 + k] = frames[(n_out - 2) * D + 39 + k]
-    return MimicMotion(out_fps, n_out, frames^)
+            frames[CW + k] = frames[D + CW + k]
+            frames[(n_out - 1) * D + CW + k] = frames[(n_out - 2) * D + CW + k]
+    return (n_out, frames^)

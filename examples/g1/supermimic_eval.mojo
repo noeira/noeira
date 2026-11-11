@@ -36,25 +36,38 @@ from noeira.deep_agents.supermimic import SMConfig, SuperMimicTrainer
 from noeira.deep_agents.supermimic.eval import sm_benchmark_gpu, sm_summarize, sm_term_name
 from noeira.deep_agents.supermimic.heads import SM_N_TERMS
 from noeira.deep_agents.supermimic.motion_library import SMMotionLibrary
-from noeira.deep_agents.supermimic.robot import G1BatchedSim, G1Robot, G1Sim, TrackingSim, G1MjlabRobot, G1MjlabSim, G1MjlabBatchedSim
-from noeira.envs.robots.unitree_g1_pd import G1_N_DOF, g1_default_pos
+from noeira.deep_agents.supermimic.robot import (
+    BhlBatchedSim, BhlRobot, G1BatchedSim, G1MjlabBatchedSim, G1MjlabRobot, G1Robot, SMDims, TrackingSim,
+)
 from noeira.io.artifact_sink import sink_for_run
 from noeira.nn.constants import DT
 
 
 comptime P = get_defined_int["SM_PAPER", 0]() != 0
+comptime LIGHT = get_defined_int["SM_LIGHT", 0]() != 0 and not P
 
 # The robot: mjlab's G1 (the reproduction's body) by default; `-D SM_BFM_G1=1`
-# selects BFM-Zero's G1 (checkpoints trained before 2026-11-05 are on it).
+# selects BFM-Zero's G1 (checkpoints trained before 2026-11-05 are on it),
+# `-D SM_BHL=1` Berkeley Humanoid Lite (with `-D BHL_EFFORT_PCT=` / `-D
+# BHL_SPEED_PCT=` to benchmark a checkpoint under other actuator limits).
 comptime BFM_G1 = get_defined_int["SM_BFM_G1", 0]() != 0
-comptime Robot = G1Robot if BFM_G1 else G1MjlabRobot
-comptime RBatched[N: Int] = G1BatchedSim[N] if BFM_G1 else G1MjlabBatchedSim[N]
-# the training example's widths: a checkpoint loads only into its own config
+comptime BHL = get_defined_int["SM_BHL", 0]() != 0
+comptime Robot = BhlRobot if BHL else (G1Robot if BFM_G1 else G1MjlabRobot)
+comptime RBatched[N: Int] = BhlBatchedSim[N] if BHL else (G1BatchedSim[N] if BFM_G1 else G1MjlabBatchedSim[N])
+comptime S = SMDims[Robot].S                   # a library row: qpos, then qvel
+comptime NDOF = Robot.NDOF
+# the training example's widths (`supermimic_train.mojo`, the same three
+# sizes): a checkpoint loads only into its own config
 comptime C = SMConfig[
     "gpu", Robot,
-    2048 if P else 128, 64 if P else 64, 2048 if P else 128, 1024 if P else 64, 512 if P else 64, 256 if P else 32,
-    2048 if P else 128, 1024 if P else 64, 512 if P else 64, 256 if P else 32, 256 if P else 64, 128 if P else 32,
-    4096 if P else 8, 2048 if P else 64, 4096 if P else 16, 32,
+    2048 if P else (1024 if LIGHT else 128), 64,
+    2048 if P else (1024 if LIGHT else 128), 1024 if P else (512 if LIGHT else 64),
+    512 if P else (256 if LIGHT else 64), 256 if P else (128 if LIGHT else 32),
+    2048 if P else (1024 if LIGHT else 128), 1024 if P else (512 if LIGHT else 64),
+    512 if P else (256 if LIGHT else 64), 256 if P else (128 if LIGHT else 32),
+    256 if P else (128 if LIGHT else 64), 128 if P else (64 if LIGHT else 32),
+    4096 if P else (1024 if LIGHT else 8), 2048 if P else (1024 if LIGHT else 64),
+    4096 if P else (2048 if LIGHT else 16), 32,
 ]
 
 
@@ -66,8 +79,8 @@ def _opt(args: List[String], name: String, fallback: String) -> String:
 
 
 def _q0() -> List[Float64]:
-    var q0 = List[Float64](length=G1_N_DOF, fill=0.0)
-    for j in range(G1_N_DOF):
+    var q0 = List[Float64](length=NDOF, fill=0.0)
+    for j in range(NDOF):
         q0[j] = Robot.default_joint_pos(j)
     return q0^
 
@@ -106,10 +119,10 @@ def _library(spec: String, max_clips: Int) raises -> SMMotionLibrary[Robot]:
             lens.append(l)
             rows_n += l
         var o = len(rows)
-        rows.resize(o + rows_n * 71, 0)
-        for i in range(rows_n * 71):
+        rows.resize(o + rows_n * S, 0)
+        for i in range(rows_n * S):
             rows[o + i] = refc[i]
-    print("  library:", len(lens), "clips,", len(rows) // 71, "frames from", len(paths), "store(s)")
+    print("  library:", len(lens), "clips,", len(rows) // S, "frames from", len(paths), "store(s)")
     return SMMotionLibrary[Robot](rows^, lens, _q0())
 
 
@@ -124,7 +137,7 @@ def main() raises:
     if ckpt == "" or store == "":
         raise Error("give --ckpt PATH and --store PATH")
     var run = RunContext(
-        project=String("g1"), driver=String("examples/g1/supermimic_eval.mojo"),
+        project=String("bhl") if BHL else String("g1"), driver=String("examples/g1/supermimic_eval.mojo"),
         slug=String("supermimic-eval"), env=String("noeira:g1/supermimic_tracking"), dataset=store,
     )
     var logger = run_logger(run, buffer_size=64)

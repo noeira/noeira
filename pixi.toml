@@ -397,6 +397,7 @@ test-physics3d-mujoco = { cmd = "bash scripts/run_tests.sh tests/manifests/physi
 test-physics3d-gpu = { cmd = "bash scripts/run_tests.sh tests/manifests/physics3d-gpu.txt", description = "physics3d blocked-kernel gates vs the CPU oracles (use -e nvidia; see the manifest header)" }
 test-fb-gpu = { cmd = "bash scripts/run_tests.sh tests/manifests/fb-gpu.txt", description = "FB device-path parity gates (needs -e nvidia or -e apple)" }
 test-g1 = { cmd = "bash scripts/run_tests.sh tests/manifests/g1.txt", description = "Unitree G1 / BFM-Zero reproduction gates (need the baked G1 assets + lafan_g1_50hz.h5)" }
+test-bhl = { cmd = "bash scripts/run_tests.sh tests/manifests/bhl.txt", description = "Berkeley Humanoid Lite: the baked model vs MuJoCo, and the hhtools trajectory import (needs /tmp/retarget_synth, see the manifest)" }
 test-g1-gpu = { cmd = "bash scripts/run_tests.sh tests/manifests/g1-gpu.txt", description = "SuperMimic GPU path vs its CPU path + the device episodic replay (use -e apple|nvidia)" }
 test-bfm-ref = { cmd = "pixi run -e act-ref bash scripts/run_tests.sh tests/manifests/bfm-ref.txt", description = "BFM-Zero learner gates with torch in-process (act-ref env)" }
 # Model dimensions are GENERATED from the .xml assets via MuJoCo. Editing a

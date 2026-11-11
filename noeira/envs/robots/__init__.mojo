@@ -39,3 +39,6 @@ from .unitree_g1 import UnitreeG1, UnitreeG1Batched, UnitreeG1BatchedDR
 from .unitree_g1_mjlab_xml import UnitreeG1MjlabModel
 from .unitree_g1_mjlab_config import UnitreeG1MjlabConfig
 from .unitree_g1_mjlab import UnitreeG1Mjlab, UnitreeG1MjlabBatched, UnitreeG1MjlabBatchedDR
+from .berkeley_humanoid_lite_xml import BerkeleyHumanoidLiteModel
+from .berkeley_humanoid_lite_config import BerkeleyHumanoidLiteConfig
+from .berkeley_humanoid_lite import BerkeleyHumanoidLite, BerkeleyHumanoidLiteBatched, BerkeleyHumanoidLiteBatchedDR

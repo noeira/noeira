@@ -1,0 +1,8 @@
+# Berkeley Humanoid Lite manifest — `pixi run test-bhl`
+#
+# The baked model against MuJoCo under BHL's PD law (assets from
+# `pixi run python tests/robots/bhl_bake.py`; `--check` there is the bake's own gate).
+tests/robots/test_berkeley_humanoid_lite_vs_mujoco.mojo
+# hhtools trajectories -> SuperMimic's library rows. Fixtures first:
+#   pixi run python tools/supermimic/retarget_oracle.py --out /tmp/retarget_synth
+tests/data/test_retarget_csv.mojo /tmp/retarget_synth
