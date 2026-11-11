@@ -25,6 +25,14 @@ from noeira.perception.sam3.ops import SAM3_TF32
 comptime SCORE_BOUND: Float64 = 1e-2 if SAM3_TF32 else 1e-4
 comptime BOX_BOUND: Float64 = 2.0 if SAM3_TF32 else 0.05
 comptime MASK_FLIP: Float64 = 1e-2 if SAM3_TF32 else 1e-4
+comptime BF16_SCORE: Float64 = 5e-3
+comptime BF16_BOX: Float64 = 0.1
+comptime BF16_FLIP: Float64 = 5e-4
+"""With the bf16 extract (`SAM3_CHECKPOINT=.../detector-bf16/model.safetensors`):
+the weights are the fp32 model's ROUNDED, so this is the drift of a different
+model, measured, not an fp32 parity; the same kept instances are required.
+Measured (Metal, 2026-11-11): scores <= 1.6e-3, boxes <= 0.031 px, masks
+<= 1.4e-4 of the pixels flipped (IoU >= 0.997); the bounds are ~3x that."""
 
 
 def check(mut fails: Int, ok: Bool, what: String):
@@ -40,7 +48,11 @@ def main() raises:
     print("SAM 3 end to end vs transformers", "(TF32)" if SAM3_TF32 else "(fp32)")
     var t0 = perf_counter_ns()
     var sam = Sam3(DeviceContext())
-    print("  loaded in", (perf_counter_ns() - t0) // 1_000_000, "ms")
+    var bf16w = sam.vit.wts.bf16_source
+    var sb = BF16_SCORE if bf16w else SCORE_BOUND
+    var bb = BF16_BOX if bf16w else BOX_BOUND
+    var fb = BF16_FLIP if bf16w else MASK_FLIP
+    print("  loaded in", (perf_counter_ns() - t0) // 1_000_000, "ms", "(bf16 weights, widened)" if bf16w else "")
     var im = load_npy_f64(ref_dir + "/image.npy")
     var rgb = List[UInt8](capacity=len(im))
     for v in im:
@@ -98,7 +110,7 @@ def main() raises:
         var detail = String("")
         if len(got) > 0:
             detail = ", score " + String(got[0].score) + ", box [" + String(Int(got[0].box[0])) + " " + String(Int(got[0].box[1])) + " " + String(Int(got[0].box[2])) + " " + String(Int(got[0].box[3])) + "]"
-        check(fails, ok and es <= SCORE_BOUND and eb <= BOX_BOUND and worst_flip <= MASK_FLIP,
+        check(fails, ok and es <= sb and eb <= bb and worst_flip <= fb,
               repr(w) + ": " + String(len(got)) + " kept (reference " + String(len(ws)) + ")" + detail + "; score |d| " + String(es)
               + ", box |d| " + String(eb) + " px, mask pixels flipped " + String(worst_flip) + ", IoU " + String(worst_iou)
               + "  (" + String(ms) + " ms)")

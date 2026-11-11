@@ -16,12 +16,12 @@ from std.os import listdir, getenv
 from std.sys import default_accelerator
 from std.sys.defines import is_defined
 from max.gpu import global_idx, thread_idx, block_idx
-from max.gpu.host import DeviceContext, DeviceBuffer
+from max.gpu.host import DeviceContext, DeviceBuffer, HostBuffer
 from max.gpu.primitives import block
 from layout import TileTensor, row_major
 from linalg.matmul import matmul as max_matmul
 
-from noeira.io.safetensors import SafeTensors, ST_F32
+from noeira.io.safetensors import SafeTensors, ST_F32, ST_BF16
 from noeira.nn.constants import DT
 from noeira.nn.core.cublas_gemm import cublas_gemm
 
@@ -52,25 +52,41 @@ struct Sam3Weights(Movable):
     var dev: List[DeviceBuffer[DT]]
     var used: List[Bool]
     var names: List[String]
+    var bf16_source: Bool
+    """The file held bf16 (`tools/perception/extract_sam3_detector.py`): the
+    weights were widened to fp32 here, and they are the fp32 model's rounded."""
 
     def __init__(out self, var ctx: DeviceContext, path: String, prefix: String) raises:
-        """Every tensor whose name starts with `prefix`, the prefix dropped."""
+        """Every tensor whose name starts with `prefix`, the prefix dropped;
+        fp32, or bf16 widened to fp32 on the way in."""
         self.ctx = ctx^
         self.index = Dict[String, Int]()
         self.dev = List[DeviceBuffer[DT]]()
         self.used = List[Bool]()
         self.names = List[String]()
+        self.bf16_source = False
         var st = SafeTensors(path)
         for i in range(st.size()):
             var name = st.names[i]
             if not name.startswith(prefix):
                 continue
-            if st.dtypes[i] != ST_F32:
-                raise Error("sam3: " + name + " is not fp32")
             var raw = st.read_raw(name)
-            var n = len(raw) // 4
-            var h = self.ctx.enqueue_create_host_buffer[DT](n)
-            unsafe_memcpy(dest=h.unsafe_ptr().unsafe_bitcast[UInt8](), src=raw.unsafe_ptr(), count=len(raw))
+            var n: Int
+            var h: HostBuffer[DT]
+            if st.dtypes[i] == ST_F32:
+                n = len(raw) // 4
+                h = self.ctx.enqueue_create_host_buffer[DT](n)
+                unsafe_memcpy(dest=h.unsafe_ptr().unsafe_bitcast[UInt8](), src=raw.unsafe_ptr(), count=len(raw))
+            elif st.dtypes[i] == ST_BF16:
+                n = len(raw) // 2
+                h = self.ctx.enqueue_create_host_buffer[DT](n)
+                var src = raw.unsafe_ptr().unsafe_bitcast[UInt16]()
+                var dst = h.unsafe_ptr().unsafe_bitcast[UInt32]()
+                for j in range(n):
+                    dst[unsafe_offset=j] = UInt32(src[unsafe_offset=j]) << 16
+                self.bf16_source = True
+            else:
+                raise Error("sam3: " + name + " is neither fp32 nor bf16")
             var d = self.ctx.enqueue_create_buffer[DT](n)
             self.ctx.enqueue_copy(d, h)
             self.ctx.synchronize()
