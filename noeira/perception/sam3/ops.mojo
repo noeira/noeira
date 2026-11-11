@@ -10,7 +10,7 @@ loaded). `linear`: `x W^T + b` through `gemm_tb` (cuBLAS on NVIDIA, fp32 or
 `-D SAM3_TF32=1`; MAX's matmul elsewhere).
 """
 
-from std.math import sqrt, erf
+from std.math import sqrt, erf, exp
 from std.memory import unsafe_memcpy
 from std.os import listdir, getenv
 from std.sys import default_accelerator
@@ -207,3 +207,110 @@ def put_head_kernel(src: Ptr, dst: Ptr, h_n: Int64, hd_n: Int64, heads_n: Int64)
     var hd = Int(hd_n)
     if d < hd:
         dst[unsafe_offset=(t * Int(heads_n) + Int(h_n)) * hd + d] = src[unsafe_offset=t * hd + d]
+
+
+# ── attention: any query / key counts, one head at a time, GEMMs ──────────
+
+
+def gemm_nn(ctx: DeviceContext, dst: DeviceBuffer[DT], a: DeviceBuffer[DT], b: DeviceBuffer[DT], m: Int, n: Int, k: Int) raises:
+    """`dst[m, n] = a[m, k] @ b[k, n]`."""
+    comptime if default_accelerator().is_nvidia_gpu():
+        cublas_gemm[False, False, SAM3_TF32](ctx, dst, a, b, m, n, k, 0.0)
+    else:
+        var out_buf = dst
+        var av = TileTensor(a, row_major(m, k))
+        var ov = TileTensor(out_buf, row_major(m, n))
+        var bv = TileTensor(b, row_major(k, n))
+        max_matmul[transpose_b=False, target="gpu"](ov, av, bv, ctx)
+
+
+def heads_kernel(src: Ptr, dst: Ptr, t_n: Int64, heads_n: Int64, hd_n: Int64):
+    """`dst[h, t, d] = src[t, h, d]`. Grid `(ceil(heads hd / TPB), T)`."""
+    var col = Int(block_idx.x) * TPB + Int(thread_idx.x)
+    var t = Int(block_idx.y)
+    var heads = Int(heads_n)
+    var hd = Int(hd_n)
+    if col < heads * hd:
+        var h = col // hd
+        dst[unsafe_offset=(h * Int(t_n) + t) * hd + (col - h * hd)] = src[unsafe_offset=t * heads * hd + col]
+
+
+def attn_softmax_kernel(sc: Ptr, bias: Ptr, tk_n: Int64, scale: Float32, key_len_n: Int64, has_bias: Int64):
+    """Row `i` of `sc[tq, tk]` to `softmax_j(scale sc + bias[i, j])` over the
+    keys `j < key_len` (0 after), in place — torch's `qk^T * scaling +
+    attention_mask`. A block per row."""
+    var tk = Int(tk_n)
+    var row = Int(block_idx.x) * tk
+    var tid = Int(thread_idx.x)
+    var kl = Int(key_len_n)
+    var m = Scalar[DT](-3.0e38)
+    var j = tid
+    while j < tk:
+        var v = Scalar[DT](-3.0e38)
+        if j < kl:
+            v = sc[unsafe_offset=row + j] * Scalar[DT](scale)
+            if has_bias != 0:
+                v += bias[unsafe_offset=row + j]
+        sc[unsafe_offset=row + j] = v
+        m = max(m, v)
+        j += TPB
+    var top = block.max[block_size=TPB, broadcast=True](val=m)
+    var s = Scalar[DT](0)
+    j = tid
+    while j < tk:
+        var e = Scalar[DT](0)
+        if j < kl:
+            e = exp(sc[unsafe_offset=row + j] - top)
+        sc[unsafe_offset=row + j] = e
+        s += e
+        j += TPB
+    var inv = Scalar[DT](1) / block.sum[block_size=TPB, broadcast=True](val=s)
+    j = tid
+    while j < tk:
+        sc[unsafe_offset=row + j] = sc[unsafe_offset=row + j] * inv
+        j += TPB
+
+
+def mha(
+    ctx: DeviceContext, q: DeviceBuffer[DT], k: DeviceBuffer[DT], v: DeviceBuffer[DT], tq: Int, tk: Int,
+    heads: Int, hd: Int, key_len: Int, bias: Optional[DeviceBuffer[DT]] = None,
+) raises -> DeviceBuffer[DT]:
+    """Multi-head attention `[tq, heads hd]` from projected `q [tq, heads hd]`,
+    `k`, `v [tk, heads hd]`: per head `softmax(q k^T / sqrt(hd) + bias_h)` over
+    the first `key_len` keys (a padding mask whose real keys come first), then
+    `@ v`. `bias`: `[heads, tq, tk]`, added before the softmax (SAM 3's box
+    relative-position bias). One head at a time (a 5184 x 5184 head is 107 MB)."""
+    var scale = Float32(1.0) / Float32(Float64(hd) ** 0.5)
+    var qh = ctx.enqueue_create_buffer[DT](heads * tq * hd)
+    var kh = ctx.enqueue_create_buffer[DT](heads * tk * hd)
+    var vh = ctx.enqueue_create_buffer[DT](heads * tk * hd)
+    ctx.enqueue_function[heads_kernel](q, qh, Int64(tq), Int64(heads), Int64(hd), grid_dim=(blocks(heads * hd), tq), block_dim=TPB)
+    ctx.enqueue_function[heads_kernel](k, kh, Int64(tk), Int64(heads), Int64(hd), grid_dim=(blocks(heads * hd), tk), block_dim=TPB)
+    ctx.enqueue_function[heads_kernel](v, vh, Int64(tk), Int64(heads), Int64(hd), grid_dim=(blocks(heads * hd), tk), block_dim=TPB)
+    var sc = ctx.enqueue_create_buffer[DT](tq * tk)
+    var oh = ctx.enqueue_create_buffer[DT](tq * hd)
+    var out = ctx.enqueue_create_buffer[DT](tq * heads * hd)
+    for h in range(heads):
+        gemm_tb(ctx, sc, qh.create_sub_buffer[DT](h * tq * hd, tq * hd), kh.create_sub_buffer[DT](h * tk * hd, tk * hd), tq, tk, hd)
+        var bp = sc
+        if bias:
+            bp = bias.value().create_sub_buffer[DT](h * tq * tk, tq * tk)
+        ctx.enqueue_function[attn_softmax_kernel](
+            sc, bp, Int64(tk), scale, Int64(key_len), Int64(1 if bias else 0), grid_dim=tq, block_dim=TPB,
+        )
+        gemm_nn(ctx, oh, sc, vh.create_sub_buffer[DT](h * tk * hd, tk * hd), tq, hd, tk)
+        ctx.enqueue_function[put_head_kernel](oh, out, Int64(h), Int64(hd), Int64(heads), grid_dim=(blocks(hd), tq), block_dim=TPB)
+    return out^
+
+
+def relu_kernel(x: Ptr, n_n: Int64):
+    var i = Int(global_idx.x)
+    if i < Int(n_n):
+        x[unsafe_offset=i] = max(x[unsafe_offset=i], Scalar[DT](0))
+
+
+def add_into_kernel(dst: Ptr, a: Ptr, b: Ptr, n_n: Int64):
+    """`dst = a + b`."""
+    var i = Int(global_idx.x)
+    if i < Int(n_n):
+        dst[unsafe_offset=i] = a[unsafe_offset=i] + b[unsafe_offset=i]

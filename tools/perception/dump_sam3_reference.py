@@ -24,6 +24,13 @@ Written to `<out>/`:
     words/<w>/text_layer<l>.npy          CLIP text layer l's output [32, 1024], l in TEXT_LAYERS
     words/<w>/text_final.npy             after `final_layer_norm` [32, 1024]
     words/<w>/text_features.npy          SAM 3's `text_projection` of it [32, 256] (`get_text_features`)
+    words/<w>/detr_enc.npy               the DETR encoder's output [5184, 256] (with the vision path)
+    words/<w>/dec_hidden.npy             the decoder's per-layer queries, after `output_layer_norm` [6, 200, 256]
+    words/<w>/dec_boxes.npy              the reference boxes each layer READ [6, 200, 4] (cxcywh, sigmoid space)
+    words/<w>/dec_presence.npy           the presence logit after each layer [6]
+    words/<w>/pred_logits.npy, pred_boxes.npy, presence.npy   the model's outputs [200], [200, 4] xyxy, [1]
+    words/<w>/pred_masks.npy, semantic_seg.npy                 the mask decoder's [200, 288, 288], [288, 288]
+                                                               (MASK_WORDS only: 66 MB each)
 """
 
 import argparse
@@ -41,6 +48,7 @@ divergence to a layer kind."""
 
 
 TEXT_LAYERS = (0, 1, 11, 23)
+MASK_WORDS = ("door", "sofa")
 
 
 def main():
@@ -96,6 +104,34 @@ def main():
                "layers": list(LAYERS), "fpn": shapes, "words": [w for w in args.words.split(",") if w]},
               open(os.path.join(args.out, "meta.json"), "w"), indent=1)
     print("vision:", {k: tuple(v.shape) for k, v in cap.items() if not isinstance(k, int)}, "fpn", shapes)
+    if args.words:
+        dump_heads(model, proc, ve, args)
+
+
+def dump_heads(model, proc, ve, args):
+    """Per word, the stages after the encoders, from the vision features above."""
+    for w in [w for w in args.words.split(",") if w]:
+        out = os.path.join(args.out, "words", w.replace(" ", "_"))
+        ti = proc(text=w, return_tensors="pt")
+        cap = {}
+        hooks = [model.detr_encoder.register_forward_hook(lambda m, i, o: cap.__setitem__("enc", o)),
+                 model.detr_decoder.register_forward_hook(lambda m, i, o: cap.__setitem__("dec", o))]
+        o = model(vision_embeds=ve, input_ids=ti["input_ids"], attention_mask=ti["attention_mask"])
+        for h in hooks:
+            h.remove()
+        enc, dec = cap["enc"], cap["dec"]
+        np.save(os.path.join(out, "detr_enc.npy"), enc.last_hidden_state[0].float().numpy())
+        np.save(os.path.join(out, "dec_hidden.npy"), dec.intermediate_hidden_states[:, 0].float().numpy())
+        np.save(os.path.join(out, "dec_boxes.npy"), dec.reference_boxes[:, 0].float().numpy())
+        np.save(os.path.join(out, "dec_presence.npy"), dec.presence_logits[:, 0].reshape(-1).float().numpy())
+        np.save(os.path.join(out, "pred_logits.npy"), o.pred_logits[0].float().numpy())
+        np.save(os.path.join(out, "pred_boxes.npy"), o.pred_boxes[0].float().numpy())
+        np.save(os.path.join(out, "presence.npy"), o.presence_logits[0].reshape(-1).float().numpy())
+        if w in MASK_WORDS:
+            np.save(os.path.join(out, "pred_masks.npy"), o.pred_masks[0].float().numpy())
+            np.save(os.path.join(out, "semantic_seg.npy"), o.semantic_seg[0, 0].float().numpy())
+        best = o.pred_logits[0].sigmoid() * o.presence_logits[0].sigmoid()
+        print(f"  heads {w!r}: presence {o.presence_logits[0].item():.3f}, best query score {best.max().item():.3f}")
 
 
 def dump_words(model, proc, args):
