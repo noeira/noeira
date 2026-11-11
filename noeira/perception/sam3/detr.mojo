@@ -24,6 +24,7 @@ from noeira.nn.constants import DT
 from .ops import (
     Sam3Weights, TPB, blocks, linear, layer_norm, mha, add_kernel, add_into_kernel, relu_kernel,
     linear_into, flash_self, USE_FLASH, linear_residual, mlp_residual,
+    SAM3_BF16, flash_self_bf16, bias_act_bf16_kernel, linear_into_b, bias_add,
 )
 
 
@@ -66,22 +67,45 @@ struct Sam3DetrEncoder(Movable):
             layer_norm(self.wts, p + "layer_norm1", x, h, n, D_MODEL, D_EPS)
             var hp = self.new(n * D_MODEL)
             ctx.enqueue_function[add_into_kernel](hp, h, pos, Int64(n * D_MODEL), grid_dim=blocks(n * D_MODEL), block_dim=TPB)
-            var qkv = self.new(3 * n * D_MODEL)
-            var q = qkv.create_sub_buffer[DT](0, n * D_MODEL)
-            var k = qkv.create_sub_buffer[DT](n * D_MODEL, n * D_MODEL)
-            var v = qkv.create_sub_buffer[DT](2 * n * D_MODEL, n * D_MODEL)
-            linear_into(self.wts, p + "self_attn.q_proj", hp, n, D_MODEL, q)
-            linear_into(self.wts, p + "self_attn.k_proj", hp, n, D_MODEL, k)
-            linear_into(self.wts, p + "self_attn.v_proj", hp if (self.debug & 2) != 0 else h, n, D_MODEL, v)
-            var a: DeviceBuffer[DT]
-            comptime if USE_FLASH:
+            comptime if SAM3_BF16:
+                # bf16: the three GEMMs (TF32: 256 wide) without bias, then bias + bf16 into one
+                # [Q | K | V] buffer, the bf16 fused attention, its output straight into o_proj
                 if n != FLASH_N:
                     raise Error("sam3 detr: the fused attention is built for 72 x 72 tokens, not " + String(n))
-                a = self.new(n * D_MODEL)
-                flash_self[FLASH_N, D_HEADS, D_HD](ctx, qkv, a)
+                var qf = self.new(3 * n * D_MODEL)
+                var qb = ctx.enqueue_create_buffer[DType.bfloat16](3 * n * D_MODEL)
+                var names: List[String] = ["q_proj", "k_proj", "v_proj"]
+                for part in range(3):
+                    var nm = p + "self_attn." + names[part]
+                    var src = hp if part < 2 or (self.debug & 2) != 0 else h
+                    var slot = qf.create_sub_buffer[DT](part * n * D_MODEL, n * D_MODEL)
+                    linear_into(self.wts, nm, src, n, D_MODEL, slot, bias=False)
+                    ctx.enqueue_function[bias_act_bf16_kernel[0]](
+                        slot, self.wts.w(nm + ".bias"), qb.create_sub_buffer[DType.bfloat16](part * n * D_MODEL, n * D_MODEL),
+                        Int64(D_MODEL), grid_dim=(n, blocks(D_MODEL)), block_dim=TPB,
+                    )
+                var ab = ctx.enqueue_create_buffer[DType.bfloat16](n * D_MODEL)
+                flash_self_bf16[FLASH_N, D_HEADS, D_HD](ctx, qb, ab)
+                var o = self.new(n * D_MODEL)
+                linear_into_b(self.wts, p + "self_attn.o_proj", ab, n, D_MODEL, o, bias=False)
+                bias_add(self.wts, p + "self_attn.o_proj", x, o, n, D_MODEL)
             else:
-                a = mha(ctx, q, k, v, n, n, D_HEADS, D_HD, n)
-            linear_residual(self.wts, p + "self_attn.o_proj", a, n, D_MODEL, x, D_MODEL)
+                var qkv = self.new(3 * n * D_MODEL)
+                var q = qkv.create_sub_buffer[DT](0, n * D_MODEL)
+                var k = qkv.create_sub_buffer[DT](n * D_MODEL, n * D_MODEL)
+                var v = qkv.create_sub_buffer[DT](2 * n * D_MODEL, n * D_MODEL)
+                linear_into(self.wts, p + "self_attn.q_proj", hp, n, D_MODEL, q)
+                linear_into(self.wts, p + "self_attn.k_proj", hp, n, D_MODEL, k)
+                linear_into(self.wts, p + "self_attn.v_proj", hp if (self.debug & 2) != 0 else h, n, D_MODEL, v)
+                var a: DeviceBuffer[DT]
+                comptime if USE_FLASH:
+                    if n != FLASH_N:
+                        raise Error("sam3 detr: the fused attention is built for 72 x 72 tokens, not " + String(n))
+                    a = self.new(n * D_MODEL)
+                    flash_self[FLASH_N, D_HEADS, D_HD](ctx, qkv, a)
+                else:
+                    a = mha(ctx, q, k, v, n, n, D_HEADS, D_HD, n)
+                linear_residual(self.wts, p + "self_attn.o_proj", a, n, D_MODEL, x, D_MODEL)
             var h2 = self.new(n * D_MODEL)
             layer_norm(self.wts, p + "layer_norm2", x, h2, n, D_MODEL, D_EPS)
             var cq = linear(self.wts, p + "cross_attn.q_proj", h2, n, D_MODEL)

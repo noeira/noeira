@@ -35,6 +35,7 @@ from _cublas.cublas import (
     _convert_to_cublas_transpose, check_cublas_error, cublasMath_t, cublasSetMathMode, cublasSetWorkspace,
 )
 from noeira.nn.primitives.flash_attention_tf32 import _tf32_fwd_kernel, TF_TQ, TF_WARPS
+from noeira.nn.primitives.flash_attention_mma import _mma_fwd_kernel, MMA_TQ, MMA_WARPS
 from max.gpu import WARP_SIZE
 
 
@@ -43,6 +44,12 @@ comptime SAM3_TF32: Bool = is_defined["SAM3_TF32"]() or SAM3_BF16
 """TF32 for every GEMM `linear` does not take to bf16 (the attention's, the convs')."""
 comptime BPtr = Pointer[Scalar[DType.bfloat16], MutAnyOrigin]
 comptime TPB: Int = 256
+comptime BF16_MIN_K: Int = 1024
+"""SAM3_BF16: a `linear` on an fp32 input takes the bf16 GEMM only when its
+input is at least this wide (the backbone's): at 256 wide the GEMM is
+memory-bound and the input's conversion pass costs what bf16 saves, so the
+narrow ones stay TF32. bf16 operands produced for free (an activation pass, the
+fused attention's output) take the bf16 GEMM at any width (`linear_into_b`)."""
 comptime Ptr = Pointer[Scalar[DT], MutAnyOrigin]
 
 
@@ -203,19 +210,29 @@ def linear_into(
     var wb = wts.w(name + ".weight")
     var n = len(wb) // k
     comptime if SAM3_BF16:
-        var xb = wts.ctx.enqueue_create_buffer[DType.bfloat16](t * k)
-        wts.ctx.enqueue_function[to_bf16_kernel](x, xb, Int64(t * k), grid_dim=blocks(t * k), block_dim=TPB)
-        cublas_gemm_lp[False, True, DType.bfloat16, DT](wts.ctx, y, xb, wts.w_bf16(name + ".weight"), t, n, k, 0.0)
-        if bias:
-            wts.ctx.enqueue_function[bias_kernel](
-                y, wts.w(name + ".bias"), Int64(n), Int64(t), grid_dim=(t, blocks(n)), block_dim=TPB,
-            )
-        return
+        if k >= BF16_MIN_K:
+            var xb = wts.ctx.enqueue_create_buffer[DType.bfloat16](t * k)
+            wts.ctx.enqueue_function[to_bf16_kernel](x, xb, Int64(t * k), grid_dim=blocks(t * k), block_dim=TPB)
+            linear_into_b(wts, name, xb, t, k, y, bias)
+            return
     gemm_tb(wts.ctx, y, x, wb, t, n, k)
     if bias:
         wts.ctx.enqueue_function[bias_kernel](
             y, wts.w(name + ".bias"), Int64(n), Int64(t), grid_dim=(t, blocks(n)), block_dim=TPB,
         )
+
+def linear_into_b(
+    mut wts: Sam3Weights, name: String, xb: DeviceBuffer[DType.bfloat16], t: Int, k: Int, y: DeviceBuffer[DT],
+    bias: Bool = True,
+) raises:
+    """`linear_into` from an input already in bf16 (SAM3_BF16; fp32 out)."""
+    var n = len(wts.w(name + ".weight")) // k
+    cublas_gemm_lp[False, True, DType.bfloat16, DT](wts.ctx, y, xb, wts.w_bf16(name + ".weight"), t, n, k, 0.0)
+    if bias:
+        wts.ctx.enqueue_function[bias_kernel](
+            y, wts.w(name + ".bias"), Int64(n), Int64(t), grid_dim=(t, blocks(n)), block_dim=TPB,
+        )
+
 
 def bias_add(mut wts: Sam3Weights, name: String, x: DeviceBuffer[DT], y: DeviceBuffer[DT], rows: Int, cols: Int) raises:
     """`x += y + name.bias` in one pass (a residual add with the linear's bias
@@ -384,6 +401,34 @@ def rope_pairs_kernel(x: Ptr, cos_t: Ptr, sin_t: Ptr, heads_n: Int64, pairs_n: I
     var b = x[unsafe_offset=base + 1]
     x[unsafe_offset=base] = a * c - b * s
     x[unsafe_offset=base + 1] = b * c + a * s
+
+
+def qkv_rope_bf16_kernel(x: Ptr, b: Ptr, cos_t: Ptr, sin_t: Ptr, dst: BPtr, heads_n: Int64, pairs_n: Int64):
+    """One pass over an interleaved `[q | k | v]` row (`3 heads 2 pairs` wide):
+    the bias, `rope_pairs_kernel`'s rotation on q and k, the bf16 rounding (the
+    bf16 fused attention's input). Grid `(ceil(3 heads pairs / TPB), T)`."""
+    var pairs = Int(pairs_n)
+    var dimp = Int(heads_n) * pairs
+    var idx = Int(block_idx.x) * TPB + Int(thread_idx.x)
+    var t = Int(block_idx.y)
+    if idx >= 3 * dimp:
+        return
+    var part = _d(idx, dimp)
+    var j = idx - part * dimp
+    var i = j - _d(j, pairs) * pairs
+    var col = part * 2 * dimp + 2 * j
+    var base = t * 6 * dimp + col
+    var a = x[unsafe_offset=base] + b[unsafe_offset=col]
+    var c = x[unsafe_offset=base + 1] + b[unsafe_offset=col + 1]
+    if part < 2:
+        var cs = cos_t[unsafe_offset=t * pairs + i]
+        var sn = sin_t[unsafe_offset=t * pairs + i]
+        var ra = a * cs - c * sn
+        var rc = c * cs + a * sn
+        a = ra
+        c = rc
+    dst[unsafe_offset=base] = a.cast[DType.bfloat16]()
+    dst[unsafe_offset=base + 1] = c.cast[DType.bfloat16]()
 
 
 def put_head_kernel(src: Ptr, dst: Ptr, h_n: Int64, hd_n: Int64, heads_n: Int64):
@@ -591,3 +636,19 @@ def flash_self[S: Int, H: Int, HD: Int, IL: Bool = False](
         )
     else:
         raise Error("sam3: flash_self runs on NVIDIA only")
+
+
+def flash_self_bf16[S: Int, H: Int, HD: Int, IL: Bool = False](
+    ctx: DeviceContext, qkv: DeviceBuffer[DType.bfloat16], dst: DeviceBuffer[DType.bfloat16], batch: Int = 1,
+) raises:
+    """`flash_self` on bf16 tensor cores (`nn/primitives/flash_attention_mma.mojo`,
+    PyTorch FA2's numerics: bf16 products, fp32 softmax and accumulators), bf16
+    in and out — SAM3_BF16."""
+    comptime if default_accelerator().is_nvidia_gpu():
+        var lse = ctx.enqueue_create_buffer[DT](batch * H * S)
+        ctx.enqueue_function[_mma_fwd_kernel[DType.bfloat16, H, S, HD, False, IL]](
+            qkv, dst, dst, lse,  # the backward cache of the output IS the output
+            grid_dim=((S + MMA_TQ - 1) // MMA_TQ, batch * H), block_dim=MMA_WARPS * WARP_SIZE,
+        )
+    else:
+        raise Error("sam3: flash_self_bf16 runs on NVIDIA only")

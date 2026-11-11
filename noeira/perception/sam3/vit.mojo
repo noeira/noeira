@@ -50,6 +50,7 @@ from noeira.llm.lfm3.model import attention_probs, attention_apply, split_heads
 from .ops import (
     Sam3Weights, TPB, Ptr, blocks, linear, layer_norm, gemm_tb, add_kernel, gelu_kernel, rope_pairs_kernel,
     put_head_kernel, mha, linear_into, flash_self, USE_FLASH, bias_add, mlp_residual,
+    SAM3_BF16, linear_into_b, flash_self_bf16, qkv_rope_bf16_kernel,
 )
 
 
@@ -197,7 +198,24 @@ struct Sam3ViT(Movable):
             var c_t = self.rope_glob[0] if glob else self.rope_win[0]
             var s_t = self.rope_glob[1] if glob else self.rope_win[1]
             var a = self.new(NTOK * DIM)
-            comptime if USE_FLASH:
+            var o = self.new(NTOK * DIM)
+            comptime if SAM3_BF16:
+                # bf16: the q | k | v GEMM without bias, then bias + RoPE + bf16 in one pass,
+                # the bf16 fused attention, its bf16 output straight into o_proj's GEMM
+                var qkv = self.new(3 * NTOK * DIM)
+                linear_into(self.wts, p + "attention.qkv_proj", hw, NTOK, DIM, qkv, bias=False)
+                var qb = ctx.enqueue_create_buffer[DType.bfloat16](3 * NTOK * DIM)
+                ctx.enqueue_function[qkv_rope_bf16_kernel](
+                    qkv, self.wts.w(p + "attention.qkv_proj.bias"), c_t, s_t, qb, Int64(HEADS), Int64(HD // 2),
+                    grid_dim=(blocks(3 * DIM // 2), NTOK), block_dim=TPB,
+                )
+                var ab = ctx.enqueue_create_buffer[DType.bfloat16](NTOK * DIM)
+                if glob:
+                    flash_self_bf16[NTOK, HEADS, HD, True](ctx, qb, ab)
+                else:
+                    flash_self_bf16[WIN * WIN, HEADS, HD, True](ctx, qb, ab, NWIN)
+                linear_into_b(self.wts, p + "attention.o_proj", ab, NTOK, DIM, o, bias=False)
+            elif USE_FLASH:
                 # one GEMM: rows [q | k | v] (the fused kernel's interleaved input); windows are
                 # 576 consecutive rows already (hw is in window order), nine samples
                 var qkv = linear(self.wts, p + "attention.qkv_proj", hw, NTOK, DIM)
@@ -213,6 +231,7 @@ struct Sam3ViT(Movable):
                     flash_self[NTOK, HEADS, HD, True](ctx, qkv, a)
                 else:
                     flash_self[WIN * WIN, HEADS, HD, True](ctx, qkv, a, NWIN)
+                linear_into(self.wts, p + "attention.o_proj", a, NTOK, DIM, o, bias=False)
             else:
                 var q = linear(self.wts, p + "attention.q_proj", hw, NTOK, DIM)
                 var k = linear(self.wts, p + "attention.k_proj", hw, NTOK, DIM)
@@ -238,10 +257,9 @@ struct Sam3ViT(Movable):
                         )
                         var aw = a.create_sub_buffer[DT](off, wt * DIM)
                         attention_apply(ctx, sc_win, v.create_sub_buffer[DT](off, wt * DIM), aw, False, aw, wt, HEADS, HEADS, HD)
-            # o_proj with its bias folded into the residual add (a bias is per column: the
-            # window permutation commutes with it)
-            var o = self.new(NTOK * DIM)
-            linear_into(self.wts, p + "attention.o_proj", a, NTOK, DIM, o, bias=False)
+                linear_into(self.wts, p + "attention.o_proj", a, NTOK, DIM, o, bias=False)
+            # o_proj's bias folded into the residual add (a bias is per column: the window
+            # permutation commutes with it)
             if not glob:
                 var orr = self.new(NTOK * DIM)
                 ctx.enqueue_function[window_kernel](o, orr, Int64(1), grid_dim=(blocks(DIM), NTOK), block_dim=TPB)
