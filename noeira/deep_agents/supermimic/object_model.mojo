@@ -35,7 +35,7 @@ reaches the object through its features and its integration.
 Param names: `object.<i>.weight|bias`; weights `[IN, OUT]` row-major.
 """
 
-from std.math import exp, log
+from std.math import exp, log, sqrt
 
 from max.gpu.host import DeviceContext
 
@@ -45,7 +45,7 @@ from noeira.deep_agents.supermimic.lanes import (
 from noeira.deep_agents.supermimic.object_lanes import (
     SMObjDims, sm_obj_dyn_back, sm_obj_err_back, sm_obj_feat_back, sm_obj_in, sm_obj_step,
 )
-from noeira.deep_agents.supermimic.object_spec import SM_OBJ, SM_OBJ_CTX, SM_OBJ_DELTA
+from noeira.deep_agents.supermimic.object_spec import SM_OBJ, SM_OBJ_CTX, SM_OBJ_DELTA, SM_OBJ_ERR_POS
 from noeira.deep_agents.supermimic.robot import SMDims, TrackingRobot
 from noeira.deep_agents.supermimic.world_model import SMWindowBatch, SMWorldModel
 from noeira.nn.combinators.sequential import Sequential
@@ -118,6 +118,11 @@ struct SMObjWindowBatch(Movable):
         self.ctx.upload_resident(ctx)
 
 
+comptime SM_OBJ_MOVED: Float64 = 0.02
+"""A window's object "moved" when its logged position at the window's end is
+further than this from its start (m)."""
+
+
 @fieldwise_init
 struct SMObjLoss(Copyable, Movable):
     var loss: Float64            # state_loss + w_obj · obj_loss + w_term · term_bce
@@ -128,6 +133,16 @@ struct SMObjLoss(Copyable, Movable):
     var nse_kstep: Float64
     var obj_nse_1step: Float64   # the object's: mean of eo² over its 12 entries
     var obj_nse_kstep: Float64
+    # The object's open-loop POSITION error in metres, mean over the lanes,
+    # after 1 and after k steps; then the same after k steps over the lanes
+    # whose LOGGED object moved more than `SM_OBJ_MOVED` in the window, and
+    # their share. Filled without `grad` only (an evaluation); −1 otherwise.
+    # ⚠ Most windows of a carry library hold an object at rest, where any model
+    # is right: the `moving` number is the one that says something.
+    var obj_pos_1step: Float64
+    var obj_pos_kstep: Float64
+    var obj_pos_kstep_moving: Float64
+    var moving_share: Float64
 
     def add_scaled(mut self, l: SMObjLoss, w: Float64):
         self.loss += w * l.loss
@@ -138,6 +153,10 @@ struct SMObjLoss(Copyable, Movable):
         self.nse_kstep += w * l.nse_kstep
         self.obj_nse_1step += w * l.obj_nse_1step
         self.obj_nse_kstep += w * l.obj_nse_kstep
+        self.obj_pos_1step += w * l.obj_pos_1step
+        self.obj_pos_kstep += w * l.obj_pos_kstep
+        self.obj_pos_kstep_moving += w * l.obj_pos_kstep_moving
+        self.moving_share += w * l.moving_share
 
 
 def sm_obj_window_loss[R: TrackingRobot, H: Int, TH: Int, HO: Int, B: Int, target: StaticString = "cpu"](
@@ -250,9 +269,37 @@ def sm_obj_window_loss[R: TrackingRobot, H: Int, TH: Int, HO: Int, B: Int, targe
     var fk = Float64(K)
     var out = SMObjLoss(
         state_tot / fk + w_obj * obj_tot / fk + w_term * bce_tot / fk, state_tot / fk, bce_tot / fk, obj_tot / fk,
-        nse1, nsek, onse1, onsek,
+        nse1, nsek, onse1, onsek, -1.0, -1.0, -1.0, -1.0,
     )
     if not grad:
+        # the object's position error in metres, and over the windows where it moved
+        comptime if target == "gpu":
+            errso.download(ctx.value())
+            wo.states.download(ctx.value())
+        var p1 = 0.0
+        var pk = 0.0
+        var pm = 0.0
+        var nm = 0
+        for b in range(B):
+            var e1 = 0.0
+            var ek = 0.0
+            var mv = 0.0
+            for c in range(3):
+                var a1 = Float64(errso.data[b * SM_OBJ_DELTA + c])
+                var ak = Float64(errso.data[((K - 1) * B + b) * SM_OBJ_DELTA + c])
+                var d = Float64(wo.states.data[(K * B + b) * SM_OBJ + c]) - Float64(wo.states.data[b * SM_OBJ + c])
+                e1 += a1 * a1
+                ek += ak * ak
+                mv += d * d
+            p1 += sqrt(e1) * SM_OBJ_ERR_POS / Float64(B)
+            pk += sqrt(ek) * SM_OBJ_ERR_POS / Float64(B)
+            if sqrt(mv) > SM_OBJ_MOVED:
+                pm += sqrt(ek) * SM_OBJ_ERR_POS
+                nm += 1
+        out.obj_pos_1step = p1
+        out.obj_pos_kstep = pk
+        out.obj_pos_kstep_moving = pm / Float64(nm) if nm > 0 else 0.0
+        out.moving_share = Float64(nm) / Float64(B)
         return out^
 
     # ── the reverse scan ──

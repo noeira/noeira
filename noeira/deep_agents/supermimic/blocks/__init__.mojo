@@ -8,3 +8,4 @@ from .wm_update_step import WorldModelUpdateStep
 from .actor_step import ActorStep, ClipValue
 from .critic_fit_step import CriticFitStep, SMCriticFit, sm_random_perm, sm_value_fit
 from .prompt_step import PromptActorStep, PromptCriticStep
+from .obj_update_step import ObjectModelUpdateStep

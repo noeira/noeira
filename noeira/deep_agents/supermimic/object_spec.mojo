@@ -49,6 +49,9 @@ comptime SM_OBJ: Int = 13            # the object's state
 comptime SM_OBJ_FEAT: Int = 15
 comptime SM_OBJ_DELTA: Int = 12
 comptime SM_OBJ_CTX: Int = 2
+comptime SM_OBJ_ERR_POS: Float64 = 0.05
+"""The position scale of the training error (m): its first three entries are
+the position difference in the world over this."""
 # offsets inside o
 comptime _OP: Int = 0
 comptime _OQ: Int = 3
@@ -216,7 +219,7 @@ def sm_obj_error_lane[dt: DType](op: FP[dt], ot: FP[dt], err: FP[dt]) where dt.i
     var q2 = qnormalize(_q4(ot, _OQ))[0]
     var rv = rotvec_from_quat(qmul(qconj(q2), q1))
     comptime for k in range(3):
-        err[unsafe_offset=k] = (op[unsafe_offset=_OP + k] - ot[unsafe_offset=_OP + k]) / Scalar[dt](0.05)
+        err[unsafe_offset=k] = (op[unsafe_offset=_OP + k] - ot[unsafe_offset=_OP + k]) / Scalar[dt](SM_OBJ_ERR_POS)
         err[unsafe_offset=3 + k] = rv[k] / Scalar[dt](0.1)
         err[unsafe_offset=6 + k] = (op[unsafe_offset=_OV + k] - ot[unsafe_offset=_OV + k]) / Scalar[dt](0.5)
         err[unsafe_offset=9 + k] = op[unsafe_offset=_OW + k] - ot[unsafe_offset=_OW + k]
@@ -230,6 +233,6 @@ def sm_obj_error_vjp_lane[dt: DType](op: FP[dt], ot: FP[dt], g_err: FP[dt], g_op
     var g_q1 = qmul(q2, rotvec_from_quat_vjp(qmul(qconj(q2), n1[0]), g_rv))
     _add4(g_op, _OQ, qnormalize_vjp(n1[0], n1[1], g_q1))
     comptime for k in range(3):
-        g_op[unsafe_offset=_OP + k] += g_err[unsafe_offset=k] / Scalar[dt](0.05)
+        g_op[unsafe_offset=_OP + k] += g_err[unsafe_offset=k] / Scalar[dt](SM_OBJ_ERR_POS)
         g_op[unsafe_offset=_OV + k] += g_err[unsafe_offset=6 + k] / Scalar[dt](0.5)
         g_op[unsafe_offset=_OW + k] += g_err[unsafe_offset=9 + k]
