@@ -42,9 +42,12 @@ from max.gpu.host import DeviceBuffer, DeviceContext
 from noeira.core.cont_action import ContAction
 from noeira.envs.robots import UnitreeG1
 from noeira.envs.robots.unitree_g1 import UnitreeG1BatchedDR
-from noeira.envs.robots.unitree_g1_mjlab import UnitreeG1Mjlab, UnitreeG1MjlabBatchedDR
+from noeira.envs.phyics3d_batched_env import Phyics3dBatchedEnv
+from noeira.envs.robots.unitree_g1_mjlab import UnitreeG1Mjlab
 from noeira.envs.robots.unitree_g1_mjlab_box import UnitreeG1MjlabBox
-from noeira.envs.robots.unitree_g1_mjlab_box_xml import G1M_BOX_QPOS, G1M_BOX_QVEL
+from noeira.envs.robots.unitree_g1_mjlab_box_xml import G1M_BOX_QPOS, G1M_BOX_QVEL, UnitreeG1MjlabBoxModel
+from noeira.envs.robots.unitree_g1_mjlab_config import UnitreeG1MjlabConfig
+from noeira.envs.robots.unitree_g1_mjlab_xml import UnitreeG1MjlabModel
 from noeira.envs.robots.unitree_g1_mjlab_pd import G1M_N_DOF, g1m_action_scale, g1m_default_pos
 from noeira.envs.robots.berkeley_humanoid_lite import BerkeleyHumanoidLite, BerkeleyHumanoidLiteBatchedDR
 from noeira.envs.robots.berkeley_humanoid_lite_pd import (
@@ -54,6 +57,7 @@ from noeira.nn.constants import DT
 from noeira.nn.core.ptr import mptr
 from noeira.envs.robots.unitree_g1_pd import G1_N_DOF, g1_default_pos, g1_effort, g1_kp
 from noeira.physics3d.gpu.constants import MODEL_BODY_SIZE, MODEL_GEOM_SIZE, MODEL_JOINT_SIZE
+from noeira.physics3d.model.model_def import ModelDefLike
 from noeira.physics3d.parser.runtime_load import parse_model_runtime
 
 
@@ -143,22 +147,30 @@ trait TrackingBatchedSim(Movable & Deinitable):
     float32 buffers; lane l's slice starts at l·width."""
     comptime N: Int
     comptime LANE_DR: Bool       # takes per-lane friction / CoM overrides
+    # The SIMULATOR's per-lane strides. They are the robot's (R.NQ, R.NV,
+    # R.NBODY + 1) unless the simulator holds more bodies than the robot, which
+    # then come AFTER it in every array (the carry-box family): the robot's
+    # entries are the first ones of a lane either way.
+    comptime SIM_NQ: Int
+    comptime SIM_NV: Int
+    comptime SIM_NBODY: Int      # world included
 
     @staticmethod
     def create(ctx: DeviceContext) raises -> Self:
         ...
 
     def lane_dr_ptr(mut self) -> Pointer[Scalar[DT], MutAnyOrigin]:
-        """[N · (NBODY + 1) · LANE_DR_STRIDE] on the device (world body
+        """[N · SIM_NBODY · LANE_DR_STRIDE] on the device (world body
         included); read by the physics only when `LANE_DR`."""
         ...
 
     def qpos_ptr(mut self) -> Pointer[Scalar[DT], MutAnyOrigin]:
-        """[N · nq] (MuJoCo layout)."""
+        """[N · SIM_NQ] (MuJoCo layout; the robot's nq first)."""
         ...
 
     def qvel_ptr(mut self) -> Pointer[Scalar[DT], MutAnyOrigin]:
-        """[N · nv]; the free joint's angular velocity in the body frame."""
+        """[N · SIM_NV] (the robot's nv first); the free joint's angular
+        velocity in the body frame."""
         ...
 
     def control_step(
@@ -394,6 +406,9 @@ struct G1BatchedSim[N_: Int](TrackingBatchedSim):
     `selective_reset_batch` (it clears what `mj_resetData` clears)."""
     comptime N = Self.N_
     comptime LANE_DR = True
+    comptime SIM_NQ = UnitreeG1BatchedDR[Self.N_].NQ
+    comptime SIM_NV = UnitreeG1BatchedDR[Self.N_].NV
+    comptime SIM_NBODY = UnitreeG1BatchedDR[Self.N_].NBODY
     var env: UnitreeG1BatchedDR[Self.N_]
     var kgain: DeviceBuffer[DT]
 
@@ -604,15 +619,26 @@ def _k_g1m_action(
     dst[unsafe_offset=i] = a[unsafe_offset=i] - bias[unsafe_offset=l * Int(bias_stride) + j] * k[unsafe_offset=j]
 
 
-struct G1MjlabBatchedSim[N_: Int](TrackingBatchedSim):
-    """`UnitreeG1MjlabBatchedDR[N]` (float32), per-lane friction / CoM
-    overrides, `G1MjlabSim`'s action law as a kernel."""
+comptime _G1MjlabBatchedEnv[M: ModelDefLike, N: Int] = Phyics3dBatchedEnv[
+    M, UnitreeG1MjlabConfig, N, TERMINATE_ON_UNHEALTHY=False, LANE_DR=True
+]
+
+
+struct G1MjlabBatchedSimOf[M: ModelDefLike, N_: Int](TrackingBatchedSim):
+    """N lanes (float32) of mjlab's G1 in model `M`, per-lane friction / CoM
+    overrides, `G1MjlabSim`'s action law as a kernel. `M` is the G1's own
+    model (`G1MjlabBatchedSim`) or the one that also holds the free box
+    (`G1MjlabBoxBatchedSim`): the robot, its PD and its config are the same,
+    and the box, when there is one, sits after the robot in every array."""
     comptime N = Self.N_
     comptime LANE_DR = True
-    var env: UnitreeG1MjlabBatchedDR[Self.N_]
+    comptime SIM_NQ = Self.M.NQ
+    comptime SIM_NV = Self.M.NV
+    comptime SIM_NBODY = Self.M.NBODY
+    var env: _G1MjlabBatchedEnv[Self.M, Self.N_]
     var kgain: DeviceBuffer[DT]
 
-    def __init__(out self, var env: UnitreeG1MjlabBatchedDR[Self.N_], var kgain: DeviceBuffer[DT]):
+    def __init__(out self, var env: _G1MjlabBatchedEnv[Self.M, Self.N_], var kgain: DeviceBuffer[DT]):
         self.env = env^
         self.kgain = kgain^
 
@@ -622,7 +648,7 @@ struct G1MjlabBatchedSim[N_: Int](TrackingBatchedSim):
 
     @staticmethod
     def create(ctx: DeviceContext) raises -> Self:
-        var env = UnitreeG1MjlabBatchedDR[Self.N_](ctx)
+        var env = _G1MjlabBatchedEnv[Self.M, Self.N_](ctx)
         env.reset_batch[Self.N_](Optional(ctx), 0)
         var k = ctx.enqueue_create_buffer[DT](G1M_N_DOF)
         var hk = ctx.enqueue_create_host_buffer[DT](G1M_N_DOF)
@@ -673,6 +699,16 @@ struct G1MjlabBatchedSim[N_: Int](TrackingBatchedSim):
     def set_geom_field_all(mut self, ctx: DeviceContext, g: Int, k: Int, v: Float64) raises:
         self.env.mf.geoms.data[g * MODEL_GEOM_SIZE + k] = Scalar[DT](v)
         self.env.mf.geoms.upload_resident(ctx)
+
+
+comptime G1MjlabBatchedSim[N: Int] = G1MjlabBatchedSimOf[UnitreeG1MjlabModel, N]
+"""`UnitreeG1MjlabBatchedDR[N]`: mjlab's G1 alone."""
+
+comptime G1MjlabBoxBatchedSim[N: Int] = G1MjlabBatchedSimOf[UnitreeG1MjlabBoxModel, N]
+"""`UnitreeG1MjlabBoxBatchedDR[N]`: the same robot with the free box in the
+last state slots (qpos `G1M_BOX_QPOS`.., qvel `G1M_BOX_QVEL`.., the last body).
+`SIM_NQ` / `SIM_NV` / `SIM_NBODY` are the simulator's, wider than
+`G1MjlabBoxRobot`'s, and the env strides its lanes by them."""
 
 
 struct G1MjlabRobot(TrackingRobot):
@@ -832,8 +868,8 @@ struct G1MjlabBoxRobot(TrackingRobot):
     reads: its dimensions, bodies and MJCF are `G1MjlabRobot`'s (the box is
     the simulator's last body, joint and geom, outside all of them), so a
     library, a set of tables or a checkpoint of `G1MjlabRobot` is this
-    robot's. CPU lanes only so far (`docs/OBJECT_INTERACTION_PLAN.md`
-    O1.2)."""
+    robot's. Its device lanes are `G1MjlabBoxBatchedSim`
+    (`docs/OBJECT_INTERACTION_PLAN.md` O1.2)."""
     comptime NQ = 36
     comptime NV = 35
     comptime NDOF = G1M_N_DOF
@@ -975,6 +1011,9 @@ struct BhlBatchedSim[N_: Int](TrackingBatchedSim):
     overrides, `BhlSim`'s action law as a kernel."""
     comptime N = Self.N_
     comptime LANE_DR = True
+    comptime SIM_NQ = BerkeleyHumanoidLiteBatchedDR[Self.N_].NQ
+    comptime SIM_NV = BerkeleyHumanoidLiteBatchedDR[Self.N_].NV
+    comptime SIM_NBODY = BerkeleyHumanoidLiteBatchedDR[Self.N_].NBODY
     var env: BerkeleyHumanoidLiteBatchedDR[Self.N_]
     var kgain: DeviceBuffer[DT]
 

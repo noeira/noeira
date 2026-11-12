@@ -131,7 +131,7 @@ def _k_act[n: Int](nl: Int64, seed: UInt32, std: Scalar[DT], a: FP[DT], ae: FP[D
     ae[unsafe_offset=i] = a[unsafe_offset=i] + (std * _randn(seed, l, j) if std > 0 else Scalar[DT](0))
 
 
-def _k_prompt_r[R: TrackingRobot](
+def _k_prompt_r[R: TrackingRobot, QS: Int, VS: Int](
     nl: Int64, from_lane: Int64, tree: FP[DT], table: FP[DT], qpos: FP[DT], qvel: FP[DT],
     a: FP[DT], a_last: FP[DT], spec: FP[DT], s: FP[DT], scratch: FP[DT], out_r: FP[DT],
 ):
@@ -145,16 +145,16 @@ def _k_prompt_r[R: TrackingRobot](
         return
     var sl = s.unsafe_offset(l * D.S)
     for k in range(R.NQ):
-        sl[unsafe_offset=k] = qpos[unsafe_offset=l * R.NQ + k]
+        sl[unsafe_offset=k] = qpos[unsafe_offset=l * QS + k]
     for k in range(R.NV):
-        sl[unsafe_offset=R.NQ + k] = qvel[unsafe_offset=l * R.NV + k]
+        sl[unsafe_offset=R.NQ + k] = qvel[unsafe_offset=l * VS + k]
     out_r[unsafe_offset=l] = sm_prompt_reward_lane[DT, R](
         tree, table, sl, a.unsafe_offset(l * n), a_last.unsafe_offset(l * n), spec.unsafe_offset(l * SMSpec.SIZE),
         scratch.unsafe_offset(l * SC.SIZE),
     )
 
 
-def _k_post[R: TrackingRobot](
+def _k_post[R: TrackingRobot, QS: Int, VS: Int](
     nl: Int64, max_steps: Int64, prompt_from: Int64, tree: FP[DT], table: FP[DT], rows: FP[DT], qpos: FP[DT], qvel: FP[DT],
     a: FP[DT], s: FP[DT], a_last: FP[DT], xi: FP[DT], scratch: FP[DT],
     frame: FPi, prev_frame: FPi, ep_len: FPi, flags: FPi,
@@ -170,9 +170,9 @@ def _k_post[R: TrackingRobot](
         return
     var sl = s.unsafe_offset(l * D.S)
     for k in range(R.NQ):
-        sl[unsafe_offset=k] = qpos[unsafe_offset=l * R.NQ + k]
+        sl[unsafe_offset=k] = qpos[unsafe_offset=l * QS + k]
     for k in range(R.NV):
-        sl[unsafe_offset=R.NQ + k] = qvel[unsafe_offset=l * R.NV + k]
+        sl[unsafe_offset=R.NQ + k] = qvel[unsafe_offset=l * VS + k]
     var el = ep_len[unsafe_offset=l] + 1
     ep_len[unsafe_offset=l] = el
     var f = Int(frame[unsafe_offset=l])
@@ -208,7 +208,7 @@ def _k_post[R: TrackingRobot](
     mask[unsafe_offset=l] = Scalar[DT](1) if ending else Scalar[DT](0)
 
 
-def _k_inject[R: TrackingRobot](
+def _k_inject[R: TrackingRobot, QS: Int, VS: Int, NB: Int](
     nl: Int64, seed_reset: UInt32, seed_bias: UInt32, seed_mu: UInt32, noise: Int64, dr: Int64, lane_mu: Int64,
     rows: FP[DT], table: FP[DT], reset_f: FPi, qpos: FP[DT], qvel: FP[DT], scratch: FP[DT],
     xi: FP[DT], a_last: FP[DT], frame: FPi, ep_len: FPi, flags: FPi,
@@ -231,7 +231,7 @@ def _k_inject[R: TrackingRobot](
         u[unsafe_offset=k] = _uni(seed_reset, l, k)
     sm_reset_state_lane[DT, R](
         rows, f, u, noise != 0, table.unsafe_offset(L.LO), table.unsafe_offset(L.HI),
-        qpos.unsafe_offset(l * R.NQ), qvel.unsafe_offset(l * R.NV),
+        qpos.unsafe_offset(l * QS), qvel.unsafe_offset(l * VS),
     )
     if dr != 0:
         for j in range(n):
@@ -241,7 +241,7 @@ def _k_inject[R: TrackingRobot](
             var mu = Scalar[DT](0.75) + Scalar[DT](0.45) * _uni(seed_mu, l, 0)
             for k in range(Int(n_feet)):
                 var b = Int(feet[unsafe_offset=k])
-                lane_dr[unsafe_offset=(l * (R.NBODY + 1) + b) * LANE_DR_STRIDE + LANE_DR_FRICTION] = mu
+                lane_dr[unsafe_offset=(l * NB + b) * LANE_DR_STRIDE + LANE_DR_FRICTION] = mu
             xi[unsafe_offset=l * D.X] = mu
     for j in range(n):
         a_last[unsafe_offset=l * n + j] = 0
@@ -250,7 +250,7 @@ def _k_inject[R: TrackingRobot](
     flags[unsafe_offset=l] = LF_HIST_FRESH | LF_EP_START
 
 
-def _k_obs[R: TrackingRobot](
+def _k_obs[R: TrackingRobot, QS: Int, VS: Int](
     nl: Int64, seed: UInt32, noise: Int64, table: FP[DT], last: FPi, qpos: FP[DT], qvel: FP[DT],
     s: FP[DT], prev_s: FP[DT], xi: FP[DT], prev_xi: FP[DT], a_last: FP[DT], hist: FP[DT], scratch: FP[DT],
     frame: FPi, prev_frame: FPi, flags: FPi,
@@ -274,9 +274,9 @@ def _k_obs[R: TrackingRobot](
     frame[unsafe_offset=l] = Int32(f)
     var sl = s.unsafe_offset(l * D.S)
     for k in range(R.NQ):
-        sl[unsafe_offset=k] = qpos[unsafe_offset=l * R.NQ + k]
+        sl[unsafe_offset=k] = qpos[unsafe_offset=l * QS + k]
     for k in range(R.NV):
-        sl[unsafe_offset=R.NQ + k] = qvel[unsafe_offset=l * R.NV + k]
+        sl[unsafe_offset=R.NQ + k] = qvel[unsafe_offset=l * VS + k]
     var o = scratch.unsafe_offset(l * SC.SIZE + SC.OBS)
     sm_observation_lane[DT, R](table, sl, a_last.unsafe_offset(l * n), xi.unsafe_offset(l * D.X), o)
     if noise != 0:
@@ -315,14 +315,14 @@ def _k_goals[R: TrackingRobot](nl: Int64, rows: FP[DT], table: FP[DT], last: FPi
     sm_goal_window_lane[R](rows, f, Int(last[unsafe_offset=f]), table.unsafe_offset(L.Q0), goals.unsafe_offset(l * D.GOAL))
 
 
-def _k_lane_com[R: TrackingRobot](nl: Int64, seed: UInt32, body: Int64, lane_dr: FP[DT], xi: FP[DT]):
+def _k_lane_com[R: TrackingRobot, NB: Int](nl: Int64, seed: UInt32, body: Int64, lane_dr: FP[DT], xi: FP[DT]):
     """Lane l's CoM offset of `body` (mjlab's startup event: ±(0.025, 0.05,
     0.05) m), as its lane override and in ξ's last three entries."""
     comptime D = SMDims[R]
     var l = Int(global_idx.x)
     if l >= Int(nl):
         return
-    var o = (l * (R.NBODY + 1) + Int(body)) * LANE_DR_STRIDE + LANE_DR_IPOS_X
+    var o = (l * NB + Int(body)) * LANE_DR_STRIDE + LANE_DR_IPOS_X
     comptime for c in range(3):
         var h = Scalar[DT](0.025) if c == 0 else Scalar[DT](0.05)
         var d = h * _uni(seed, l, c)
@@ -460,7 +460,7 @@ struct SMTrackingEnvGpu[R: TrackingRobot, BS: TrackingBatchedSim](Movable):
         comptime if Self.BS.LANE_DR:
             # per lane: the CoM offset now, the friction at every reset
             if dr:
-                ctx.enqueue_function[_k_lane_com[Self.R]](
+                ctx.enqueue_function[_k_lane_com[Self.R, Self.BS.SIM_NBODY]](
                     Int64(NL), _seed(0, RNG_COM, self.seed_base), Int64(cb), self.sim.lane_dr_ptr(), tp["gpu"](self.xi),
                     grid_dim=ceildiv(NL, _TPB), block_dim=_TPB,
                 )
@@ -580,7 +580,7 @@ struct SMTrackingEnvGpu[R: TrackingRobot, BS: TrackingBatchedSim](Movable):
         ctx.enqueue_copy(self.mask.dev.value(), hm)
         var st = self.step_count
         self.sim.reset_lanes(ctx, tp["gpu"](self.mask), UInt64(_seed(st, RNG_RESET, self.seed_base)))
-        ctx.enqueue_function[_k_inject[Self.R]](
+        ctx.enqueue_function[_k_inject[Self.R, Self.BS.SIM_NQ, Self.BS.SIM_NV, Self.BS.SIM_NBODY]](
             Int64(NL), _seed(st, RNG_RESET, self.seed_base), _seed(st, RNG_BIAS, self.seed_base),
             _seed(st, RNG_FRICTION, self.seed_base),
             Int64(1 if self.reset_noise else 0), Int64(1 if self.dr else 0), Int64(1 if Self.BS.LANE_DR else 0),
@@ -595,7 +595,7 @@ struct SMTrackingEnvGpu[R: TrackingRobot, BS: TrackingBatchedSim](Movable):
 
     def _observe(mut self, ctx: DeviceContext) raises:
         comptime NL = Self.BS.N
-        ctx.enqueue_function[_k_obs[Self.R]](
+        ctx.enqueue_function[_k_obs[Self.R, Self.BS.SIM_NQ, Self.BS.SIM_NV]](
             Int64(NL), _seed(self.step_count, RNG_OBS, self.seed_base), Int64(1 if self.obs_noise else 0),
             self.tables.head_p["gpu"](), mptr(self.lib.last_dev.value().unsafe_ptr()), self.sim.qpos_ptr(), self.sim.qvel_ptr(),
             tp["gpu"](self.s), tp["gpu"](self.prev_s), tp["gpu"](self.xi), tp["gpu"](self.prev_xi), tp["gpu"](self.a_last),
@@ -618,6 +618,17 @@ struct SMTrackingEnvGpu[R: TrackingRobot, BS: TrackingBatchedSim](Movable):
     ) raises -> SMStepInfo:
         """One control step for every lane; `actions` [N·n] (clean, device).
         Prompt lanes as in `env.mojo`: `specs` [N·SPEC] on the device."""
+        self.step_sim(ctx, actions, rb, specs)
+        return self.step_finish(ctx)
+
+    def step_sim(
+        mut self, ctx: DeviceContext, mut actions: TensorImpl[DT], mut rb: SMReplayGpuOf[Self.R], specs: Optional[FP[DT]] = None,
+    ) raises:
+        """The first half of `step` (1.–4.): the control step, the reward and
+        the replay rows. The simulator then holds every lane's state AFTER the
+        step and BEFORE any reset, `meta` the rows `rb` just took and `mask`
+        the ending lanes: what a caller that logs more of the simulator than
+        the robot (`object_env_gpu.mojo`) reads before `step_finish`."""
         comptime NL = Self.BS.N
         comptime n = Self.R.NDOF
         comptime D = SMDims[Self.R]
@@ -629,14 +640,14 @@ struct SMTrackingEnvGpu[R: TrackingRobot, BS: TrackingBatchedSim](Movable):
         )
         self.sim.control_step(ctx, tp["gpu"](self.a_exec), tp["gpu"](self.xi).unsafe_offset(1), D.X, UInt64(_seed(st, RNG_ACT, self.seed_base)))
         if specs:
-            ctx.enqueue_function[_k_prompt_r[Self.R]](
+            ctx.enqueue_function[_k_prompt_r[Self.R, Self.BS.SIM_NQ, Self.BS.SIM_NV]](
                 Int64(NL), Int64(self.prompt_from), self.tables.tree_p["gpu"](), self.tables.head_p["gpu"](),
                 self.sim.qpos_ptr(), self.sim.qvel_ptr(), tp["gpu"](actions), tp["gpu"](self.a_last), specs.value(),
                 tp["gpu"](self.s), tp["gpu"](self.scratch), tp["gpu"](self.prompt_r),
                 grid_dim=ceildiv(NL, _TPB), block_dim=_TPB,
             )
         # 2.–4. reward, termination, the replay rows
-        ctx.enqueue_function[_k_post[Self.R]](
+        ctx.enqueue_function[_k_post[Self.R, Self.BS.SIM_NQ, Self.BS.SIM_NV]](
             Int64(NL), Int64(self.max_episode_steps), Int64(self.prompt_from), self.tables.tree_p["gpu"](), self.tables.head_p["gpu"](), mptr(self.lib.rows_dev.value().unsafe_ptr()),
             self.sim.qpos_ptr(), self.sim.qvel_ptr(), tp["gpu"](actions), tp["gpu"](self.s), tp["gpu"](self.a_last),
             tp["gpu"](self.xi), tp["gpu"](self.scratch),
@@ -649,6 +660,13 @@ struct SMTrackingEnvGpu[R: TrackingRobot, BS: TrackingBatchedSim](Movable):
             ctx, tp["gpu"](self.prev_s), tp["gpu"](actions), tp["gpu"](self.a_exec), tp["gpu"](self.prev_xi),
             tp["gpu"](self.rd), tp["gpu"](self.s), mptr(self.meta.unsafe_ptr()),
         )
+
+    def step_finish(mut self, ctx: DeviceContext) raises -> SMStepInfo:
+        """The second half of `step`: the host's share (the sampler's log, the
+        ending lanes), their resets (4b.), and 5.–6. for every lane. After a
+        step that reset any lane, `reset_f` holds that step's frame per reset
+        lane and −1 elsewhere."""
+        comptime NL = Self.BS.N
         # the sampler's per-step log and the ending episodes (host)
         var hi = ctx.enqueue_create_host_buffer[DType.int32](NL * 2)
         self.out_r.download_enqueue(ctx)
