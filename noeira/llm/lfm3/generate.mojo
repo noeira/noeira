@@ -29,12 +29,19 @@ being relative), 2 = no sliding window on the cache, 4 = the conv history never
 rolled.
 """
 
+from std.sys import default_accelerator
 from max.gpu.host import DeviceBuffer
 
 from noeira.nn.constants import DT
-from .kernels import TPB, embed_kernel, add_kernel, rope_kernel, swiglu_kernel, swiglu_bf16_kernel
-from .generate_kernels import conv_cached_kernel, conv_history_kernel, put_kv_kernel, cached_attention_kernel, MAX_KEYS
-from .model import Lfm3Text, LT_CONV, LT_FULL, LT_SLIDING, LF_BF16
+from noeira.nn.core.cublas_gemm import cublas_gemm
+from .kernels import (
+    TPB, embed_kernel, add_kernel, rope_kernel, swiglu_kernel, swiglu_bf16_kernel, merge_heads_gate_kernel,
+)
+from .generate_kernels import (
+    conv_cached_kernel, conv_history_kernel, put_kv_kernel, cached_attention_kernel, masked_softmax_offset_kernel,
+    MAX_KEYS,
+)
+from .model import Lfm3Text, LT_CONV, LT_FULL, LT_SLIDING, LF_BF16, LF_ATTN_TF32, split_heads
 
 
 def _blocks(n: Int) -> Int:
@@ -197,10 +204,7 @@ def forward_cached(
             )
             var window = lm.cfg.window if (kind == LT_SLIDING and (cache.debug & 2) == 0) else 0
             var a = lm.new(n * dm)
-            lm.ctx.enqueue_function[cached_attention_kernel](
-                q, cache.k[s], cache.v[s], g, a, Int64(p), Int64(nh), Int64(nkv), Int64(hd), Int64(cache.cap),
-                Int64(window), scale, grid_dim=(n, nh), block_dim=TPB,
-            )
+            _attend(lm, q, cache.k[s], cache.v[s], g, a, n, p, cache.cap, window, scale)
             o = lm.linear(pre + "self_attn.o_proj", a, n, dm)
         lm.rms(pre + "post_operator_norm", o, o, n, dm)
         lm.ctx.enqueue_function[add_kernel](x, o, Int64(n * dm), grid_dim=_blocks(n * dm), block_dim=TPB)
@@ -211,6 +215,58 @@ def forward_cached(
     var out = lm.new(n * dm)
     lm.rms("embedding_norm", x, out, n, dm)
     return out^
+
+
+comptime GEMM_ATTN_MIN: Int = 8
+"""Chunks of at least this many tokens (a prefill, a new turn) attend with
+tensor-core GEMMs on NVIDIA; shorter ones (decoding) with the per-query kernel.
+The per-query kernel is linear in the keys for one query, but a 1024-token
+prefill through it took 1.5 s on the Orin."""
+
+
+def _attend(
+    mut lm: Lfm3Text, q: DeviceBuffer[DT], kc: DeviceBuffer[DT], vc: DeviceBuffer[DT], g: DeviceBuffer[DT],
+    dst: DeviceBuffer[DT], n: Int, p: Int, cap: Int, window: Int, scale: Float32,
+) raises:
+    """`dst[n, nh hd]`: the chunk's queries (positions p..p+n-1) against the
+    cached keys 0..p+n-1, through the output gate. Two routes, one mask
+    (`cached_attention_kernel` / `masked_softmax_offset_kernel` write the same
+    rule): per query (decoding), or per KV head as GEMMs `[rep n, hd] @ [L,
+    hd]^T` then `[rep n, L] @ [L, hd]` (the cache is heads-major, so each KV
+    head's keys are one contiguous operand)."""
+    var nh = lm.cfg.heads
+    var nkv = lm.cfg.kv_heads
+    var hd = lm.cfg.head_dim
+    comptime if default_accelerator().is_nvidia_gpu():
+        if n >= GEMM_ATTN_MIN:
+            var l = p + n
+            var rep = nh // nkv
+            var qh = split_heads(lm.ctx, q, n, nh, hd)
+            var sc = lm.new(nh * n * l)
+            var oh = lm.new(nh * n * hd)
+            for kv in range(nkv):
+                cublas_gemm[False, True, LF_ATTN_TF32](
+                    lm.ctx, sc.create_sub_buffer[DT](kv * rep * n * l, rep * n * l),
+                    qh.create_sub_buffer[DT](kv * rep * n * hd, rep * n * hd),
+                    kc.create_sub_buffer[DT](kv * cap * hd, l * hd), rep * n, l, hd, 0.0,
+                )
+            lm.ctx.enqueue_function[masked_softmax_offset_kernel](
+                sc, Int64(n), Int64(l), Int64(p), Int64(window), scale, grid_dim=(n, nh), block_dim=TPB,
+            )
+            for kv in range(nkv):
+                cublas_gemm[False, False, LF_ATTN_TF32](
+                    lm.ctx, oh.create_sub_buffer[DT](kv * rep * n * hd, rep * n * hd),
+                    sc.create_sub_buffer[DT](kv * rep * n * l, rep * n * l),
+                    vc.create_sub_buffer[DT](kv * cap * hd, l * hd), rep * n, hd, l, 0.0,
+                )
+            lm.ctx.enqueue_function[merge_heads_gate_kernel](
+                oh, g, dst, Int64(n), Int64(nh), Int64(hd), Int64(1), grid_dim=(_blocks(nh * hd), n), block_dim=TPB,
+            )
+            return
+    lm.ctx.enqueue_function[cached_attention_kernel](
+        q, kc, vc, g, dst, Int64(p), Int64(nh), Int64(nkv), Int64(hd), Int64(cap), Int64(window), scale,
+        grid_dim=(n, nh), block_dim=TPB,
+    )
 
 
 def forward_cached(mut lm: Lfm3Text, ids: List[Int], mut cache: Lfm3Cache) raises -> DeviceBuffer[DT]:

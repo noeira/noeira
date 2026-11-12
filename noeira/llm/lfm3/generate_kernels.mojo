@@ -138,3 +138,44 @@ def cached_attention_kernel(
             o += sh[jj] * vc[unsafe_offset=vb + jj * hd]
         var g = _sigmoid(gate[unsafe_offset=i * nh + h])
         dst[unsafe_offset=(i * nh + h) * hd + tid] = g * (o / tot)
+
+
+def masked_softmax_offset_kernel(sc: Ptr, n_n: Int64, l_n: Int64, off_n: Int64, window_n: Int64, scale: Float32):
+    """Row `(h, i)` of the raw scores `sc[h, i, :L] = q_i . k_j` (a chunk's `n`
+    queries against the cache's `L` keys) to attention probabilities in place:
+    query `i` is at position `off + i` and sees `j <= off + i`, and `j > off + i
+    - window` when `window > 0`; 0 elsewhere. A block per row; grid `(n, heads)`."""
+    var n = Int(n_n)
+    var l = Int(l_n)
+    var i = Int(block_idx.x)
+    var h = Int(block_idx.y)
+    var row = (h * n + i) * l
+    var tid = Int(thread_idx.x)
+    var qi = Int(off_n) + i
+    var window = Int(window_n)
+    var lo = 0
+    if window > 0 and qi - window + 1 > 0:
+        lo = qi - window + 1
+    var m = Scalar[DT](NEG_INF)
+    var j = tid
+    while j < l:
+        var v = Scalar[DT](NEG_INF)
+        if j >= lo and j <= qi:
+            v = sc[unsafe_offset=row + j] * Scalar[DT](scale)
+        sc[unsafe_offset=row + j] = v
+        m = max(m, v)
+        j += TPB
+    var top = block.max[block_size=TPB, broadcast=True](val=m)
+    var s = Scalar[DT](0)
+    j = tid
+    while j < l:
+        var v = sc[unsafe_offset=row + j]
+        var e = exp(v - top) if v > Scalar[DT](NEG_INF) else Scalar[DT](0)
+        sc[unsafe_offset=row + j] = e
+        s += e
+        j += TPB
+    var inv = Scalar[DT](1) / block.sum[block_size=TPB, broadcast=True](val=s)
+    j = tid
+    while j < l:
+        sc[unsafe_offset=row + j] = sc[unsafe_offset=row + j] * inv
+        j += TPB
