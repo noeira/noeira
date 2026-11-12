@@ -181,7 +181,7 @@ struct BerkeleyHumanoidLiteConfig(Phyics3dEnvConfig):
         m_geoms: List[Scalar[DTYPE]],
         m_sites: List[Scalar[DTYPE]],
     ):
-        """The `stand` keyframe: the base frame at floor level (z ≈ −0.04),
+        """The `stand` keyframe: the root (the pelvis point, z ≈ 0.50),
         identity, BHL's default angles, at rest."""
         for i in range(D.NQ):
             d.qpos.data[i] = Scalar[DTYPE](0)

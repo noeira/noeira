@@ -25,8 +25,17 @@ WHAT IT EMITS:
             `HUMANOID_LITE_CFG`. BHL's MJCF leaves them on;
           * 22 torque `<motor>`s, gear 1, ctrlrange = ± the training effort
             limit (6 N·m legs, 4 N·m arms) instead of forcerange ± 20;
+          * THE ROOT FRAME MOVED TO THE PELVIS: BHL's `base` frame is its CAD
+            origin, at floor level, 0.543 m under the hip joints. The frame of
+            the `base` body (same body, same mass and geometry) is put midway
+            between the two hip roll joints, so the root height is the
+            pelvis's, as on the Unitree G1: a tracking env that ends an
+            episode on the root's height sees a fall (it moved the old frame
+            by 0.1 m only). `BHL_ROOT_IN_CAD_BASE` is that point in BHL's own
+            `base` frame: a root position p with orientation R exported for
+            BHL's URDF (hhtools) becomes p + R * BHL_ROOT_IN_CAD_BASE here;
           * the `stand` keyframe: `HUMANOID_LITE_CFG.init_state` (knees bent),
-            the base lowered so that the soles rest on the ground.
+            the root lowered so that the soles rest on the ground.
         KEPT FROM THE MJCF, not from the Isaac config: armature 0.005 and
         frictionloss 0.1 on every hinge (Isaac: 0.007 hips and knees, 0.002
         ankles and arms, no friction). The real value is an open question of
@@ -106,6 +115,24 @@ def bake_xml(default, groups):
     import mujoco
 
     root = ET.parse(REF_XML).getroot()
+    # The root frame to the pelvis: the `base` body's frame goes midway between the hip roll joints,
+    # and everything the body carries is expressed there. The body itself does not change.
+    base = [b for b in root.iter("body") if b.get("name") == "base"][0]
+    assert base.get("pos") == "0 0 0" and base.get("quat") == "1 0 0 0", "the base body is not at the origin"
+    hips = [[float(v) for v in b.get("pos").split()] for b in base.findall("body")
+            if b.get("name") in ("leg_left_hip_roll", "leg_right_hip_roll")]
+    assert len(hips) == 2 and hips[0][0] == hips[1][0] and hips[0][1] == -hips[1][1] and hips[0][2] == hips[1][2], hips
+    origin = (hips[0][0], 0.0, hips[0][2])
+    moved = 0
+    for child in base:
+        if child.tag == "freejoint":
+            continue
+        assert child.tag in ("inertial", "geom", "body", "site"), child.tag
+        pos = [float(v) for v in child.get("pos", "0 0 0").split()]
+        child.set("pos", " ".join("%.9g" % (pos[k] - origin[k]) for k in range(3)))
+        moved += 1
+    assert moved >= 7, moved
+    base.set("pos", " ".join("%.9g" % v for v in origin))
     for tag in ("asset", "sensor", "equality"):
         for el in root.findall(tag):
             root.remove(el)
@@ -168,17 +195,18 @@ def bake_xml(default, groups):
                     for sz in (-1, 1):
                         lowest = min(lowest, (data.geom_xpos[g] + R @ (s * (sx, sy, sz)))[2])
     assert 0.0 < lowest < 0.1, lowest
-    root_z = round(float(-lowest), 6)
+    root_z = round(float(probe.qpos0[2] - lowest), 6)
+    assert abs(probe.qpos0[2] - origin[2]) < 1e-12 and 0.45 < root_z < 0.55, (probe.qpos0[:3], root_z)
     key = ET.SubElement(ET.SubElement(root, "keyframe"), "key", name="stand")
     key.set("qpos", " ".join(["0 0 %r 1 0 0 0" % root_z] + ["%g" % default.get(n, 0.0) for n in joints]))
     ET.indent(root, space="  ")
     text = HEADER + ET.tostring(root, encoding="unicode") + "\n"
     check = mujoco.MjModel.from_xml_string(text)
     assert (check.nq, check.nv, check.nu, check.njnt, check.nkey) == (29, 28, 22, 23, 1), "unexpected model size"
-    return text, joints, root_z
+    return text, joints, root_z, origin
 
 
-def bake_pd(joints, default, groups, soft, root_z):
+def bake_pd(joints, default, groups, soft, root_z, origin):
     L = ['"""Berkeley Humanoid Lite — PD tables, GENERATED, DO NOT EDIT.', "",
          "Regenerate with:  pixi run python tests/robots/bhl_bake.py",
          "CI checks it with: pixi run python tests/robots/bhl_bake.py --check", "",
@@ -193,6 +221,10 @@ def bake_pd(joints, default, groups, soft, root_z):
          "comptime BHL_SIM_TIMESTEP: Float64 = %r" % TIMESTEP,
          "comptime BHL_CONTROL_DECIMATION: Int = %d" % DECIMATION,
          "comptime BHL_INIT_ROOT_Z: Float64 = %r" % root_z,
+         "# The root frame (midway between the hip roll joints) in BHL's own `base` frame, which is its CAD",
+         "# origin at floor level: a root position exported for BHL's URDF is p + R · this, here.",
+         "comptime BHL_ROOT_IN_CAD_BASE_X: Float64 = %r" % origin[0],
+         "comptime BHL_ROOT_IN_CAD_BASE_Z: Float64 = %r" % origin[2],
          "comptime BHL_ACTION_SCALE: Float64 = %r" % ACTION_SCALE,
          "comptime BHL_SOFT_LIMIT_FACTOR: Float64 = %r" % soft, "", ""]
 
@@ -224,8 +256,8 @@ def main():
         if not os.path.exists(p):
             sys.exit("missing reference file: " + p)
     default, groups, soft = read_cfg()
-    xml, joints, root_z = bake_xml(default, groups)
-    pd = bake_pd(joints, default, groups, soft, root_z)
+    xml, joints, root_z, origin = bake_xml(default, groups)
+    pd = bake_pd(joints, default, groups, soft, root_z, origin)
     bad = 0
     for path, text in ((ASSET_XML, xml), (PD_MOJO, pd)):
         rel = os.path.relpath(path, REPO)

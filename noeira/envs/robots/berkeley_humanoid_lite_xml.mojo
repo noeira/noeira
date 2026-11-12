@@ -10,8 +10,11 @@ Measured against MuJoCo 3.12.0 (`tools/gen_model_dims.py`):
     nbody 27   njnt 23 (1 free + 22 hinge)   nq 29   nv 28   nu 22
     ngeom 12 (1 plane, 7 box, 4 cylinder)   nkey 1   cone pyramidal
 
-⚠ THE BASE FRAME IS AT FLOOR LEVEL (the CAD's origin), 0.68 m under the
-torso's centre of mass: a standing robot has root z ≈ −0.04, not ≈ +0.6.
+⚠ THE ROOT FRAME IS NOT BHL's. BHL's `base` frame is its CAD origin, at floor
+level; the bake moves the frame of that body midway between the hip roll
+joints (`BHL_ROOT_IN_CAD_BASE_*`), so a standing robot has root z ≈ 0.50 and
+a fall lowers it by 0.46 m, as on the G1. A root position exported for BHL's
+own URDF or MJCF has to be moved by R · that offset before it is used here.
 
 ⚠ THE ACTUATORS ARE TORQUE MOTORS; the env computes BHL's PD law every
 substep (`berkeley_humanoid_lite_config`).

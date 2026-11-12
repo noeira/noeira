@@ -418,13 +418,7 @@ def main() raises:
         test_termination(ctx, stand, tl)
         test_clip_end(ctx, stand, tl)
         test_bookkeeping(ctx, stand, tl)
-        comptime if TEST_BHL:
-            # `sm_prompt_fell` compares the root height with SM_P_FALL_H, a G1 height: Berkeley Humanoid
-            # Lite's base frame is at floor level, so every prompt lane reads as fallen. Tracker lanes
-            # (the only ones a tracking run uses, `prompt_from = NL`) do not read that rule.
-            print("[6] prompt lanes: SKIPPED on Berkeley Humanoid Lite (the fall rule is written in G1 heights)")
-        else:
-            test_prompt_lanes(ctx, stand, tl)
+        test_prompt_lanes(ctx, stand, tl)
         print("\n===", tl.ok, "/", tl.total, "passed ===")
         if tl.ok != tl.total:
             raise Error("test_supermimic_env_gpu: " + String(tl.total - tl.ok) + " failed")

@@ -877,8 +877,10 @@ struct BhlRobot(TrackingRobot):
     hand. There is no torso apart from the base, so the base is root, anchor
     and the body whose CoM is randomised.
 
-    ⚠ The base frame sits at floor level (`berkeley_humanoid_lite_xml`): a
-    reference's root height is about −0.04 m when the robot stands."""
+    ⚠ The root is the pelvis point, not BHL's floor-level `base` frame
+    (`berkeley_humanoid_lite_xml`): a reference's root height is about 0.50 m
+    when the robot stands, and a trajectory exported for BHL's own URDF has
+    to be moved there (`BHL_ROOT_IN_CAD_BASE_*`) before it is imported."""
     comptime NQ = 29
     comptime NV = 28
     comptime NDOF = BHL_N_DOF

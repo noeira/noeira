@@ -19,15 +19,15 @@
   <worldbody>
     <light pos="0 0 3.5" dir="0 0 -1" directional="true" />
     <geom name="floor" type="plane" size="0 0 0.05" pos="0 0 0" contype="0" conaffinity="1" />
-    <body name="base" pos="0 0 0" quat="1 0 0 0" childclass="berkeley-humanoid-lite">
+    <body name="base" pos="-0.0290919 0 0.542631" quat="1 0 0 0" childclass="berkeley-humanoid-lite">
       <freejoint name="base_freejoint" />
-      <inertial pos="-0.0030965 0.000264765 0.675059" mass="4.44401" fullinertia="0.0667167 0.0447686 0.0318661 1.21502e-06 -0.00131643 2.88151e-05" />
-      <geom class="collision" pos="-6.93889e-18 7.53521e-18 0.71" quat="0.707107 -2.07306e-15 1.88738e-15 -0.707107" type="box" size="0.075 0.07 0.115" />
-      <body name="imu_2" pos="0.061722 -5.97549e-17 0.68" quat="1 -0 5.77316e-15 -6.03078e-16">
+      <inertial pos="0.0259954 0.000264765 0.132428" mass="4.44401" fullinertia="0.0667167 0.0447686 0.0318661 1.21502e-06 -0.00131643 2.88151e-05" />
+      <geom class="collision" pos="0.0290919 7.53521e-18 0.167369" quat="0.707107 -2.07306e-15 1.88738e-15 -0.707107" type="box" size="0.075 0.07 0.115" />
+      <body name="imu_2" pos="0.0908139 -5.97549e-17 0.137369" quat="1 -0 5.77316e-15 -6.03078e-16">
         <inertial pos="3.00866e-18 9.72026e-19 0.0025" mass="0.00197704" fullinertia="1.11441e-07 4.06118e-08 1.43815e-07 -1.67651e-38 0 1.10203e-39" />
         <site group="3" name="imu" pos="0 -6.33816e-19 0.005" quat="1 0 0 0" />
       </body>
-      <body name="arm_left_shoulder_pitch" pos="5.0759e-15 0.133 0.764028" quat="0.707107 -0.707107 4.44089e-15 4.89969e-15">
+      <body name="arm_left_shoulder_pitch" pos="0.0290919 0.133 0.221397" quat="0.707107 -0.707107 4.44089e-15 4.89969e-15">
         <joint axis="0 0 1" name="arm_left_shoulder_pitch_joint" type="hinge" range="-1.5707963267948983 0.7853981633974465" />
         <inertial pos="-0.00661228 -8.80749e-05 0.0396144" mass="0.342876" fullinertia="0.000218285 0.000260325 0.00022463 -1.17021e-06 1.05191e-05 -4.52438e-07" />
         <body name="arm_left_shoulder_roll" pos="0.0255 -8.88178e-16 0.043" quat="0.701057 0.092296 0.701057 0.092296">
@@ -52,7 +52,7 @@
           </body>
         </body>
       </body>
-      <body name="arm_right_shoulder_pitch" pos="1.19187e-16 -0.133 0.764028" quat="2.71137e-15 4.60842e-15 -0.707107 0.707107">
+      <body name="arm_right_shoulder_pitch" pos="0.0290919 -0.133 0.221397" quat="2.71137e-15 4.60842e-15 -0.707107 0.707107">
         <joint axis="0 0 1" name="arm_right_shoulder_pitch_joint" type="hinge" range="-0.7853981633975158 1.570796326794829" />
         <inertial pos="0.00661228 -1.57066e-05 0.0397088" mass="0.342876" fullinertia="0.000218503 0.000260541 0.000224632 2.55599e-07 -1.17928e-05 5.72405e-07" />
         <body name="arm_right_shoulder_roll" pos="-0.0255 3.10862e-15 0.043" quat="0.701057 0.092296 -0.701057 -0.092296">
@@ -77,7 +77,7 @@
           </body>
         </body>
       </body>
-      <body name="leg_left_hip_roll" pos="-0.0290919 0.08 0.542631" quat="0.92388 9.53922e-16 0.382683 -3.02883e-15">
+      <body name="leg_left_hip_roll" pos="0 0.08 0" quat="0.92388 9.53922e-16 0.382683 -3.02883e-15">
         <joint axis="0 0 1" name="leg_left_hip_roll_joint" type="hinge" range="-0.17453292519943028 1.5707963267948992" />
         <inertial pos="-0.00410941 -0.000112596 -0.0464623" mass="0.83786" fullinertia="0.000979918 0.000896043 0.000727678 6.45954e-06 -1.63173e-05 -5.43389e-06" />
         <body name="leg_left_hip_yaw" pos="0.027 1.11022e-16 -0.052" quat="0.5 -0.5 0.5 -0.5">
@@ -104,7 +104,7 @@
           </body>
         </body>
       </body>
-      <body name="leg_right_hip_roll" pos="-0.0290919 -0.08 0.542631" quat="4.60428e-15 0.382683 -1.11022e-15 0.92388">
+      <body name="leg_right_hip_roll" pos="0 -0.08 0" quat="4.60428e-15 0.382683 -1.11022e-15 0.92388">
         <joint axis="0 0 1" name="leg_right_hip_roll_joint" type="hinge" range="-1.5707963267948752 0.17453292519945426" />
         <inertial pos="0.00410941 -0.00018505 -0.0464478" mass="0.83786" fullinertia="0.000979766 0.000896334 0.000727235 -3.69135e-06 1.57667e-05 -4.74708e-06" />
         <body name="leg_right_hip_yaw" pos="-0.027 3.46945e-16 -0.052" quat="0.5 -0.5 -0.5 0.5">
@@ -159,6 +159,6 @@
   </actuator>
   <option timestep="0.002" integrator="Euler" cone="pyramidal" />
   <keyframe>
-    <key name="stand" qpos="0 0 -0.039291 1 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 -0.2 0.4 -0.3 0 0 0 -0.2 0.4 -0.3 0" />
+    <key name="stand" qpos="0 0 0.50334 1 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 -0.2 0.4 -0.3 0 0 0 -0.2 0.4 -0.3 0" />
   </keyframe>
 </mujoco>

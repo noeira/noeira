@@ -16,7 +16,11 @@ The torque law (computed in the env, every substep):
 comptime BHL_N_DOF: Int = 22
 comptime BHL_SIM_TIMESTEP: Float64 = 0.002
 comptime BHL_CONTROL_DECIMATION: Int = 10
-comptime BHL_INIT_ROOT_Z: Float64 = -0.039291
+comptime BHL_INIT_ROOT_Z: Float64 = 0.50334
+# The root frame (midway between the hip roll joints) in BHL's own `base` frame, which is its CAD
+# origin at floor level: a root position exported for BHL's URDF is p + R · this, here.
+comptime BHL_ROOT_IN_CAD_BASE_X: Float64 = -0.0290919
+comptime BHL_ROOT_IN_CAD_BASE_Z: Float64 = 0.542631
 comptime BHL_ACTION_SCALE: Float64 = 0.25
 comptime BHL_SOFT_LIMIT_FACTOR: Float64 = 0.9
 
