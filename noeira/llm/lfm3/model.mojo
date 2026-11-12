@@ -72,6 +72,10 @@ from .kernels import (
     merge_heads_gate_kernel, LM_SLOTS, rms_bf16_kernel, swiglu_bf16_kernel,
 )
 from .vision_kernels import put_rows_kernel
+from .int8_kernels import (
+    QPtr, q8_quantize_kernel, q8_gemv_kernel, q8_dequant_bf16_kernel, q8_dequant_f32_kernel, q8_embed_kernel,
+    Q8_GEMV_MAX, Q8_RPW,
+)
 
 
 comptime LF_TF32: Bool = is_defined["LFM3_TF32"]()
@@ -80,6 +84,9 @@ comptime LF_ATTN_TF32: Bool = LF_TF32 or LF_BF16
 """The attention's two GEMMs (q k^T, P v) in TF32 in the fast builds; fp32
 in the default one. TF32 keeps 10 mantissa bits to bf16's 7, and the scores
 are not rounded to bf16 at all."""
+comptime LF_INT8: Bool = is_defined["LFM3_INT8"]()
+"""`-D LFM3_INT8=1`: the chat loads its weights as int8 (`Lfm3Text.quantize_int8`;
+with LFM3_BF16 on the Orin). A default, not a switch inside the backbone."""
 comptime LT_CONV: Int = 0
 comptime LT_FULL: Int = 1
 comptime LT_SLIDING: Int = 2
@@ -167,6 +174,20 @@ struct Lfm3Config(Copyable, Movable):
         return cfg^
 
 
+def q8_cols(cfg: Lfm3Config, name: String) -> Int:
+    """The input width `k` of a weight `quantize_int8` / `load(int8=True)`
+    quantizes (`[n, k]`), or 0: the linears (`*_proj`, the MLP's w1 / w2 / w3)
+    and the tied table. Norms and the depthwise conv stay bf16 (tiny)."""
+    if name.endswith("feed_forward.w2.weight"):
+        return cfg.ff
+    if (
+        name == "embed_tokens.weight" or name.endswith("_proj.weight") or name.endswith("feed_forward.w1.weight")
+        or name.endswith("feed_forward.w3.weight")
+    ):
+        return cfg.hidden
+    return 0
+
+
 struct Lfm3Text(Movable):
     var ctx: DeviceContext
     var cfg: Lfm3Config
@@ -196,12 +217,26 @@ struct Lfm3Text(Movable):
     """(in, out) of each adapted linear."""
     var lora_rank: Int
     var lora_scale: Float32
+    var q8_on: Bool
+    """`quantize_int8` ran: the linears and the LM head read int8 weights (`int8_kernels.mojo`)."""
+    var q8: DeviceBuffer[DType.int8]
+    var q8_scale: DeviceBuffer[DT]
+    var q8_index: Dict[String, Int]
+    """Weight name -> its slot in the lists below."""
+    var q8_off: List[Int]
+    """Each weight's offset in `q8` (elements, 64-aligned)."""
+    var q8_soff: List[Int]
+    """Its scales' offset in `q8_scale`."""
+    var q8_rows: List[Int]
+    var q8_cols: List[Int]
+    var q8_bf: DeviceBuffer[DType.bfloat16]
+    """A weight dequantized to bf16 for a chunk's GEMM (LFM3_BF16; the fp32 build uses `scratch`)."""
 
     def __init__(
         out self, var ctx: DeviceContext, var cfg: Lfm3Config, var arena: DeviceBuffer[DType.uint16],
         var index: Dict[String, Int], var dev: List[DeviceBuffer[DType.uint16]], var offs: List[Int],
         var names: List[String], var scratch: DeviceBuffer[DT],
-    ):
+    ) raises:
         self.ctx = ctx^
         self.cfg = cfg^
         self.arena = arena^
@@ -224,18 +259,32 @@ struct Lfm3Text(Movable):
         self.lora_shape = List[Tuple[Int, Int]]()
         self.lora_rank = 0
         self.lora_scale = 0.0
+        self.q8_on = False
+        self.q8 = self.ctx.enqueue_create_buffer[DType.int8](1)
+        self.q8_scale = self.ctx.enqueue_create_buffer[DT](1)
+        self.q8_index = Dict[String, Int]()
+        self.q8_off = List[Int]()
+        self.q8_soff = List[Int]()
+        self.q8_rows = List[Int]()
+        self.q8_cols = List[Int]()
+        self.q8_bf = self.ctx.enqueue_create_buffer[DType.bfloat16](1)
 
     @staticmethod
-    def load(var ctx: DeviceContext, dir: String) raises -> Lfm3Text:
+    def load(var ctx: DeviceContext, dir: String, int8: Bool = False, q8_levels: Int = 127) raises -> Lfm3Text:
         """`config.json` and `model.safetensors` from `dir`: every language-model
         tensor (`model.language_model.*`, or `model.*` for a text-only model)
-        into one bf16 device arena; the vision / audio parts are skipped."""
+        into one bf16 device arena; the vision / audio parts are skipped.
+        `int8`: the linears and the tied table go straight to int8 (one tensor
+        at a time through a staging buffer) and are NOT kept in bf16 — half the
+        memory; inference only (`quantize_int8` keeps both). `q8_levels`: the
+        grid's half-width, 127 (falsification: 7 is a 4-bit grid)."""
         var cfg = Lfm3Config.load(dir + "/config.json")
         var st = SafeTensors(dir + "/model.safetensors")
         var prefix = String("model.language_model.")
         if not st.has(prefix + "embed_tokens.weight"):
             prefix = String("model.")
         var picked = List[Int]()
+        var quant = List[Int]()
         var total = 0
         var largest = 0
         for i in range(st.size()):
@@ -245,12 +294,15 @@ struct Lfm3Text(Movable):
             if st.dtypes[i] != ST_BF16:
                 raise Error("lfm3: " + name + " is not bf16")
             var n = st.numel(name)
-            picked.append(i)
-            total += (n + _ALIGN - 1) // _ALIGN * _ALIGN
             if not name.endswith("embed_tokens.weight"):
                 largest = max(largest, n)
-        var arena = ctx.enqueue_create_buffer[DType.uint16](total)
-        var staging = ctx.enqueue_create_host_buffer[DType.uint16](total)
+            if int8 and q8_cols(cfg, String(name[byte=prefix.byte_length():])) > 0:
+                quant.append(i)
+                continue
+            picked.append(i)
+            total += (n + _ALIGN - 1) // _ALIGN * _ALIGN
+        var arena = ctx.enqueue_create_buffer[DType.uint16](max(total, 1))
+        var staging = ctx.enqueue_create_host_buffer[DType.uint16](max(total, 1))
         ctx.synchronize()
         var index = Dict[String, Int]()
         var dev = List[DeviceBuffer[DType.uint16]]()
@@ -272,7 +324,13 @@ struct Lfm3Text(Movable):
         ctx.synchronize()
         _ = staging^
         var scratch = ctx.enqueue_create_buffer[DT](largest)
-        return Lfm3Text(ctx^, cfg^, arena^, index^, dev^, offs^, names^, scratch^)
+        var lm = Lfm3Text(ctx^, cfg^, arena^, index^, dev^, offs^, names^, scratch^)
+        if int8:
+            var qn = List[String]()
+            for i in quant:
+                qn.append(st.names[i])
+            lm._load_q8(st, prefix, qn, q8_levels)
+        return lm^
 
     # ── plumbing ─────────────────────────────────────────────────────────
 
@@ -422,7 +480,12 @@ struct Lfm3Text(Movable):
         xb: Optional[DeviceBuffer[DType.bfloat16]] = None,
     ) raises -> DeviceBuffer[DT]:
         """`x[t, k] @ W^T` for the bf16 weight `name` ([n, k]): widened into the
-        scratch first, or (LFM3_BF16) against the weight in place."""
+        scratch first, or (LFM3_BF16) against the weight in place; after
+        `quantize_int8`, from its int8 copy (`_linear_q8`)."""
+        if self.q8_on:
+            var qi = self.q8_index.get(name + ".weight")
+            if qi:
+                return self._linear_q8(qi.value(), x, t, k, xb)
         var wb = self.w(name + ".weight")
         var n = len(wb) // k
         comptime if LF_BF16:
@@ -437,6 +500,159 @@ struct Lfm3Text(Movable):
         var wf = self.scratch.create_sub_buffer[DT](0, n * k)
         self.ctx.enqueue_function[bf16_to_f32_kernel](wb, wf, Int64(n * k), grid_dim=_blocks(n * k), block_dim=TPB)
         var y = self.new(t * n)
+        self.gemm_tb(y, x, wf, t, n, k)
+        return y^
+
+    # ── int8 weights ─────────────────────────────────────────────────────
+
+    def _q8_layout(mut self, names: List[String], numels: List[Int]) raises -> Int:
+        """Slots, offsets and shapes for the int8 copies of `names`; allocates
+        `q8`, `q8_scale` and the bf16 dequantization scratch. Returns the
+        largest weight's size (elements)."""
+        var total = 0
+        var rows_total = 0
+        var largest = 0
+        var largest_lin = 0
+        for i in range(len(names)):
+            var k = q8_cols(self.cfg, names[i])
+            var n = numels[i] // k
+            if n * k != numels[i] or k % 512 != 0 or n % Q8_RPW != 0:
+                raise Error("lfm3 int8: " + names[i] + " is not [n, " + String(k) + "] with k a multiple of 512 and n of " + String(Q8_RPW))
+            self.q8_index[names[i]] = len(self.q8_off)
+            self.q8_off.append(total)
+            self.q8_soff.append(rows_total)
+            self.q8_rows.append(n)
+            self.q8_cols.append(k)
+            total += (n * k + _ALIGN - 1) // _ALIGN * _ALIGN
+            rows_total += n
+            largest = max(largest, n * k)
+            if names[i] != "embed_tokens.weight":
+                largest_lin = max(largest_lin, n * k)
+        self.q8 = self.ctx.enqueue_create_buffer[DType.int8](total)
+        self.q8_scale = self.ctx.enqueue_create_buffer[DT](rows_total)
+        comptime if LF_BF16:
+            self.q8_bf = self.ctx.enqueue_create_buffer[DType.bfloat16](largest_lin)
+        return largest
+
+    def _q8_from(mut self, j: Int, w: DeviceBuffer[DType.uint16], levels: Int = 127) raises:
+        """Quantize the bf16 `w` into int8 slot `j`."""
+        var n = self.q8_rows[j]
+        var k = self.q8_cols[j]
+        self.ctx.enqueue_function[q8_quantize_kernel](
+            w, self.q8.create_sub_buffer[DType.int8](self.q8_off[j], n * k),
+            self.q8_scale.create_sub_buffer[DT](self.q8_soff[j], n), Int64(k), Int64(levels), grid_dim=n, block_dim=TPB,
+        )
+
+    def _load_q8(mut self, ref st: SafeTensors, prefix: String, full_names: List[String], levels: Int = 127) raises:
+        """`load(int8=True)`: each tensor read, uploaded to a bf16 staging buffer,
+        quantized, one at a time (the bf16 copy never stays)."""
+        var names = List[String]()
+        var numels = List[Int]()
+        for nm in full_names:
+            names.append(String(nm[byte=prefix.byte_length():]))
+            numels.append(st.numel(nm))
+        var largest = self._q8_layout(names, numels)
+        var dstage = self.ctx.enqueue_create_buffer[DType.uint16](largest)
+        for i in range(len(names)):
+            var raw = st.read_raw(full_names[i])
+            var n = len(raw) // 2
+            var h = self.ctx.enqueue_create_host_buffer[DType.uint16](n)
+            self.ctx.synchronize()
+            unsafe_memcpy(dest=h.unsafe_ptr().unsafe_bitcast[UInt8](), src=raw.unsafe_ptr(), count=len(raw))
+            var d = dstage.create_sub_buffer[DType.uint16](0, n)
+            self.ctx.enqueue_copy(d, h)
+            self._q8_from(self.q8_index.get(names[i]).value(), d, levels)
+            self.ctx.synchronize()  # the staging buffers are reused / freed
+        self.q8_on = True
+
+    def q8_bytes(self) -> Int:
+        """Device bytes of the int8 weights and their scales (0 before int8)."""
+        if not self.q8_on:
+            return 0
+        return len(self.q8) + 4 * len(self.q8_scale)
+
+    def bf16_bytes(self) -> Int:
+        return 2 * len(self.arena)
+
+    def embed_rows(mut self, ids: DeviceBuffer[DType.int32], x: DeviceBuffer[DT], t: Int) raises:
+        """`x[t, :]` = the embeddings of `ids`: from the bf16 table, or the int8
+        one when the model was loaded int8 (no bf16 table then)."""
+        var dm = self.cfg.hidden
+        if not self.index.get("embed_tokens.weight") and self.q8_on:
+            var j = self.q8_index.get("embed_tokens.weight").value()
+            self.ctx.enqueue_function[q8_embed_kernel](
+                ids, self.q8.create_sub_buffer[DType.int8](self.q8_off[j], self.q8_rows[j] * dm),
+                self.q8_scale.create_sub_buffer[DT](self.q8_soff[j], self.q8_rows[j]), x, Int64(dm),
+                grid_dim=(_blocks(dm), t), block_dim=TPB,
+            )
+            return
+        self.ctx.enqueue_function[embed_kernel](
+            ids, self.w("embed_tokens.weight"), x, Int64(dm), grid_dim=(_blocks(dm), t), block_dim=TPB,
+        )
+
+    def quantize_int8(mut self) raises:
+        """Every linear's weight and the tied table to int8, one scale per row
+        (`int8_kernels.mojo`), on the device from the bf16 arena — which STAYS
+        (the embedding lookup reads it; the backward reads the bf16 weights).
+        `load(int8=True)` is the same quantization without the bf16 copy."""
+        var names = List[String]()
+        var numels = List[Int]()
+        for i in range(len(self.names)):
+            if q8_cols(self.cfg, self.names[i]) > 0:
+                names.append(self.names[i])
+                numels.append(len(self.dev[i]))
+        _ = self._q8_layout(names, numels)
+        for nm in names:
+            self._q8_from(self.q8_index.get(nm).value(), self.w(nm))
+        self.ctx.synchronize()
+        self.q8_on = True
+
+    def _q8_gemv(self, j: Int, x: DeviceBuffer[DT], y: DeviceBuffer[DT], t: Int) raises:
+        """`y[t, n] = x[t, k] @ W^T` from weight slot `j`'s int8 rows, `t` <= Q8_GEMV_MAX."""
+        var n = self.q8_rows[j]
+        var k = self.q8_cols[j]
+        var q = self.q8.create_sub_buffer[DType.int8](self.q8_off[j], n * k)
+        var sc = self.q8_scale.create_sub_buffer[DT](self.q8_soff[j], n)
+        var g = (n + 8 * Q8_RPW - 1) // (8 * Q8_RPW)
+        if t == 1:
+            self.ctx.enqueue_function[q8_gemv_kernel[1]](x, q, sc, y, Int64(n), Int64(k), grid_dim=g, block_dim=256)
+        elif t == 2:
+            self.ctx.enqueue_function[q8_gemv_kernel[2]](x, q, sc, y, Int64(n), Int64(k), grid_dim=g, block_dim=256)
+        elif t == 3:  # 2 + 1 (SIMD widths are powers of two)
+            self.ctx.enqueue_function[q8_gemv_kernel[2]](x, q, sc, y, Int64(n), Int64(k), grid_dim=g, block_dim=256)
+            self.ctx.enqueue_function[q8_gemv_kernel[1]](
+                x.create_sub_buffer[DT](2 * k, k), q, sc, y.create_sub_buffer[DT](2 * n, n), Int64(n), Int64(k),
+                grid_dim=g, block_dim=256,
+            )
+        else:
+            self.ctx.enqueue_function[q8_gemv_kernel[4]](x, q, sc, y, Int64(n), Int64(k), grid_dim=g, block_dim=256)
+
+    def _linear_q8(
+        mut self, j: Int, x: DeviceBuffer[DT], t: Int, k: Int, xb: Optional[DeviceBuffer[DType.bfloat16]],
+    ) raises -> DeviceBuffer[DT]:
+        """The int8 route: the GEMV for a few rows; for a chunk, the weight
+        dequantized (bf16 / fp32) and the build's GEMM."""
+        var n = self.q8_rows[j]
+        if k != self.q8_cols[j]:
+            raise Error("lfm3 int8: a [" + String(t) + ", " + String(k) + "] input for a weight of " + String(self.q8_cols[j]) + " columns")
+        var y = self.new(t * n)
+        if t <= Q8_GEMV_MAX:
+            self._q8_gemv(j, x, y, t)
+            return y^
+        var q = self.q8.create_sub_buffer[DType.int8](self.q8_off[j], n * k)
+        var sc = self.q8_scale.create_sub_buffer[DT](self.q8_soff[j], n)
+        comptime if LF_BF16:
+            var wb = self.q8_bf.create_sub_buffer[DType.bfloat16](0, n * k)
+            self.ctx.enqueue_function[q8_dequant_bf16_kernel](q, sc, wb, Int64(k), grid_dim=(_blocks(k // 16), n), block_dim=TPB)
+            var xbb: DeviceBuffer[DType.bfloat16]
+            if xb:
+                xbb = xb.value()
+            else:
+                xbb = self.to_bf16(x, t * k)
+            cublas_gemm_lp[False, True, DType.bfloat16, DT](self.ctx, y, xbb, wb, t, n, k, 0.0)
+            return y^
+        var wf = self.scratch.create_sub_buffer[DT](0, n * k)
+        self.ctx.enqueue_function[q8_dequant_f32_kernel](q, sc, wf, Int64(k), grid_dim=(_blocks(k // 16), n), block_dim=TPB)
         self.gemm_tb(y, x, wf, t, n, k)
         return y^
 
@@ -543,9 +759,7 @@ struct Lfm3Text(Movable):
         self.ctx.enqueue_copy(did, hid)
         self.ctx.enqueue_copy(dgr, hg)
         var x = self.new(t * dm)
-        self.ctx.enqueue_function[embed_kernel](
-            did, self.w("embed_tokens.weight"), x, Int64(dm), grid_dim=(_blocks(dm), t), block_dim=TPB,
-        )
+        self.embed_rows(did, x, t)
         if image_feats:
             self._scatter(x, ids, image_feats.value(), image_token, "image")
         if audio_feats:
@@ -638,7 +852,7 @@ struct Lfm3Text(Movable):
                 self.cur["a3"] = a3
             var swb = Optional[DeviceBuffer[DType.bfloat16]](None)
             comptime if LF_BF16:
-                if not self.training and len(self.lora_index) == 0:  # nothing reads silu(a1) a3 in fp32
+                if not self.training and len(self.lora_index) == 0 and not self.q8_on:  # nothing reads silu(a1) a3 in fp32 (the int8 GEMV does)
                     var b = self.ctx.enqueue_create_buffer[DType.bfloat16](t * ff)
                     self.ctx.enqueue_function[swiglu_bf16_kernel](a1, a3, b, Int64(t * ff), grid_dim=_blocks(t * ff), block_dim=TPB)
                     swb = Optional(b^)
@@ -717,6 +931,17 @@ struct Lfm3Text(Movable):
         pass with the fewest slots (1, 2, 4, 8 or 16) that covers what is left."""
         var dm = self.cfg.hidden
         var v = self.cfg.vocab
+        if self.q8_on:
+            var qi = self.q8_index.get("embed_tokens.weight")
+            if qi and (s <= Q8_GEMV_MAX or not self.index.get("embed_tokens.weight")):
+                var s0 = 0
+                while s0 < s:  # Q8_GEMV_MAX rows a pass over the int8 table
+                    var c = min(Q8_GEMV_MAX, s - s0)
+                    self._q8_gemv(
+                        qi.value(), rows.create_sub_buffer[DT](s0 * dm, c * dm), logits.create_sub_buffer[DT](s0 * v, c * v), c,
+                    )
+                    s0 += c
+                return
         var table = self.w("embed_tokens.weight")
         var s0 = 0
         while s0 < s:

@@ -34,27 +34,56 @@ only this check reaches the window.
 from std.os import getenv
 from std.sys import argv
 from std.time import perf_counter_ns
+from std.math import exp, log
 from max.gpu.host import DeviceContext, DeviceBuffer
 
 from noeira.io.json import load_json
 from noeira.io.npy import load_npy_f64
 from noeira.llm.lfm3 import Lfm3Chat, ChatSettings, Lfm3Cache, forward_cached, last_logits, choose
-from noeira.llm.lfm3.model import LF_BF16
+from noeira.llm.lfm3.model import LF_BF16, LF_INT8
 from noeira.nn.constants import DT
 
 
-comptime STAGE_BOUND: Float64 = 3e-2 if LF_BF16 else 1e-4
+comptime STAGE_BOUND: Float64 = 0.2 if LF_INT8 else (3e-2 if LF_BF16 else 1e-4)
 """Max |d| / max |reference| over a prefill stage."""
-comptime LOGIT_BOUND: Float64 = 3e-2 if LF_BF16 else 1e-4
+comptime LOGIT_BOUND: Float64 = 0.1 if LF_INT8 else (3e-2 if LF_BF16 else 1e-4)
 """Max |d| / max |reference| over one step's logits."""
 comptime TIE: Float64 = 1.0 if LF_BF16 else 0.0
 """A reference top-2 margin (in logits, after the penalty) under which bf16 may flip the token."""
-comptime CACHE_BOUND: Float64 = 6e-2 if LF_BF16 else 1e-4
+comptime CACHE_BOUND: Float64 = 0.1 if LF_INT8 else (6e-2 if LF_BF16 else 1e-4)
 """Cached chunks vs one causal pass, max |d| / max |rows|. In bf16 these are two
 bf16 computations, each ~2e-2 from the fp32 truth at the final norm (the prefill
 stage above), so up to twice that apart (4.5e-2 measured): the check is decisive
 in fp32 only, and the mutants run there."""
 comptime FALSIFY: Float64 = 10.0
+comptime KL_BOUND: Float64 = 0.01 if LF_INT8 else (5e-3 if LF_BF16 else 1e-6)
+"""Mean KL(reference || ours) per teacher-forced step, nats, over the raw logits."""
+comptime TOP1_MIN: Float64 = 0.9 if LF_INT8 else 1.0
+"""Teacher-forced steps whose greedy choice is the reference's (penalty included).
+int8 changes the numbers: its gate is this agreement and the KL, not equal
+tokens (bf16 near-ties aside, the fp32 / bf16 builds must agree everywhere)."""
+
+
+def kl_ref(ref_row: List[Float64], off: Int, got: List[Float32]) -> Float64:
+    """KL(softmax(reference) || softmax(ours)) over one step's logits."""
+    var v = len(got)
+    var mr = -1e300
+    var mg = -1e300
+    for i in range(v):
+        mr = max(mr, ref_row[off + i])
+        mg = max(mg, Float64(got[i]))
+    var zr = 0.0
+    var zg = 0.0
+    for i in range(v):
+        zr += exp(ref_row[off + i] - mr)
+        zg += exp(Float64(got[i]) - mg)
+    var lzr = mr + log(zr)
+    var lzg = mg + log(zg)
+    var kl = 0.0
+    for i in range(v):
+        var lr = ref_row[off + i] - lzr
+        kl += exp(lr) * (lr - (Float64(got[i]) - lzg))
+    return kl
 
 
 def rel_err(got: List[Float32], want: List[Float64], off: Int = 0, n: Int = -1) raises -> Float64:
@@ -165,8 +194,9 @@ def free_run(
             break
     var all_equal = same(chat.reply, want)
     if tie_at >= 0:
-        print("        bf16 near-tie at step", tie_at, ": the free run stops comparing there")
-    check(fails, all_equal or tie_at >= 0, what + ": " + String(s) + " tokens as the reference's, logits <= "
+        print("        near-tie at step", tie_at, ": the free run stops comparing there")
+    # int8: a free run may leave the reference's path (its gate is the teacher-forced agreement and KL)
+    check(fails, all_equal or tie_at >= 0 or LF_INT8, what + ": " + String(s) + " tokens as the reference's, logits <= "
           + String(worst) + " (bound " + String(LOGIT_BOUND) + "): '" + chat.reply_text() + "'")
     check(fails, worst <= LOGIT_BOUND, what + ": logits on the way")
     return all_equal
@@ -195,6 +225,25 @@ def cached_rows(mut chat: Lfm3Chat, seq: List[Int], debug: Int) raises -> List[F
     return out^
 
 
+def int8_mutant_kl(model_dir: String, dir: String) raises -> Float64:
+    """Mean KL over the first case's teacher-forced steps with the weights on a
+    4-bit grid: the KL bound must catch a coarser quantization. Its own scope:
+    the second model is freed on return."""
+    var chat = Lfm3Chat.load(DeviceContext(), model_dir, 1024, True, 7)
+    var v = chat.lm.cfg.vocab
+    var prompt = ints(load_npy_f64(dir + "/prompt_ids.npy"))
+    var gen = ints(load_npy_f64(dir + "/gen_ids.npy"))
+    var glog = load_npy_f64(dir + "/gen_logits.npy")
+    var h = forward_cached(chat.lm, prompt, chat.cache)
+    var tot = kl_ref(glog, 0, last_logits(chat.lm, h, len(prompt)))
+    var steps = min(16, len(gen))
+    for s in range(1, steps):
+        var one: List[Int] = [gen[s - 1]]
+        h = forward_cached(chat.lm, one, chat.cache)
+        tot += kl_ref(glog, s * v, last_logits(chat.lm, h, 1))
+    return tot / Float64(steps)
+
+
 def main() raises:
     var home = getenv("HOME")
     var args = argv()
@@ -205,6 +254,10 @@ def main() raises:
     var t0 = perf_counter_ns()
     var chat = Lfm3Chat.load(DeviceContext(), model_dir, 1024)
     print("  loaded in", (perf_counter_ns() - t0) // 1_000_000, "ms")
+    comptime if LF_INT8:
+        # the int8 path is the one running: no bf16 copy of the linears is left to fall back on
+        check(fails, chat.lm.q8_on and chat.lm.bf16_bytes() < 50_000_000,
+              "int8: weights " + String(chat.lm.q8_bytes()) + " B int8, " + String(chat.lm.bf16_bytes()) + " B bf16 (norms, conv)")
     var v = chat.lm.cfg.vocab
     var dm = chat.lm.cfg.hidden
     var names: List[String] = ["fr_two_turns", "en_penalty", "fr_thinking"]
@@ -254,6 +307,8 @@ def main() raises:
         var lw = 0.0
         var tok_bad = 0
         var ties = 0
+        var kl_sum = 0.0
+        var kl_max = 0.0
         for s in range(steps):
             if s > 0:
                 var one: List[Int] = [gen[s - 1]]
@@ -262,6 +317,9 @@ def main() raises:
                 var lg = last_logits(chat.lm, h, 1)
                 decode_ms.append(Float64(perf_counter_ns() - t1) / 1e6)
                 lw = max(lw, rel_err(lg, glog, s * v, v))
+                var kl = kl_ref(glog, s * v, lg)
+                kl_sum += kl
+                kl_max = max(kl_max, kl)
                 var rng = UInt64(1)
                 var pick = choose(lg, seen, ChatSettings.greedy_with(penalty, steps), rng)
                 if pick != gen[s]:
@@ -272,12 +330,22 @@ def main() raises:
             else:
                 var lg = last_logits(chat.lm, h, p)
                 lw = max(lw, rel_err(lg, glog, 0, v))
+                var kl = kl_ref(glog, 0, lg)
+                kl_sum += kl
+                kl_max = max(kl_max, kl)
                 var rng = UInt64(1)
                 if choose(lg, seen, ChatSettings.greedy_with(penalty, steps), rng) != gen[0]:
                     tok_bad += 1
             seen[gen[s]] = True
         check(fails, lw <= LOGIT_BOUND, "teacher-forced: " + String(steps) + " steps' logits <= " + String(lw) + " (bound " + String(LOGIT_BOUND) + ")")
-        check(fails, tok_bad == 0, "teacher-forced: every greedy choice is the reference's (" + String(ties) + " bf16 near-ties allowed)")
+        var agree = Float64(steps - tok_bad - ties) / Float64(steps)
+        comptime if LF_INT8:
+            check(fails, agree >= TOP1_MIN, "teacher-forced: " + String(steps - tok_bad - ties) + " / " + String(steps)
+                  + " greedy choices are the reference's (min " + String(TOP1_MIN) + ")")
+        else:
+            check(fails, tok_bad == 0, "teacher-forced: every greedy choice is the reference's (" + String(ties) + " bf16 near-ties allowed)")
+        check(fails, kl_sum / Float64(steps) <= KL_BOUND, "teacher-forced: mean KL(reference || ours) " + String(kl_sum / Float64(steps))
+              + " nats, max " + String(kl_max) + " (bound on the mean " + String(KL_BOUND) + ")")
 
         # 4. free-running through the API
         chat.reset(system)
@@ -323,6 +391,11 @@ def main() raises:
             check(fails, em > FALSIFY * CACHE_BOUND, "mutant caught, " + mnames[i] + ": " + String(em))
     else:
         print("  (the cache mutants run in the fp32 build: in bf16 the window mutant is only 2x the two paths' gap)")
+
+    comptime if LF_INT8:
+        var mkl = int8_mutant_kl(model_dir, ref_dir + "/" + names[0])
+        check(fails, mkl > FALSIFY * KL_BOUND, "mutant caught, a 4-bit grid (levels 7): mean KL " + String(mkl)
+              + " > " + String(FALSIFY * KL_BOUND))
 
     # rough speed (step 3 measures properly)
     if len(decode_ms) > 0:

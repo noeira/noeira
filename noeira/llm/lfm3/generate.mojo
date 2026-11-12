@@ -150,9 +150,7 @@ def forward_cached(
     var did = lm.ctx.enqueue_create_buffer[DType.int32](n)
     lm.ctx.enqueue_copy(did, hid)
     var x = lm.new(n * dm)
-    lm.ctx.enqueue_function[embed_kernel](
-        did, lm.w("embed_tokens.weight"), x, Int64(dm), grid_dim=(_blocks(dm), n), block_dim=TPB,
-    )
+    lm.embed_rows(did, x, n)
     if keep_taps:
         taps.append(lm._copy(x, n * dm))
     var rp = 0 if (cache.debug & 1) != 0 else p  # mutant 1: every chunk's positions from 0
@@ -285,7 +283,7 @@ def _mlp(mut lm: Lfm3Text, pre: String, x: DeviceBuffer[DT], n: Int) raises:
     var a3 = lm.linear(pre + "feed_forward.w3", fnrm, n, dm, fnb)
     var swb = Optional[DeviceBuffer[DType.bfloat16]](None)
     comptime if LF_BF16:
-        if len(lm.lora_index) == 0:
+        if len(lm.lora_index) == 0 and not lm.q8_on:  # the int8 GEMV reads the fp32 product
             var b = lm.ctx.enqueue_create_buffer[DType.bfloat16](n * ff)
             lm.ctx.enqueue_function[swiglu_bf16_kernel](a1, a3, b, Int64(n * ff), grid_dim=_blocks(n * ff), block_dim=TPB)
             swb = Optional(b^)

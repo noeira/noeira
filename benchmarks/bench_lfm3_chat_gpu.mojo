@@ -24,7 +24,7 @@ from std.time import perf_counter_ns
 from max.gpu.host import DeviceContext
 
 from noeira.llm.lfm3 import Lfm3Chat, ChatSettings, forward_cached, last_logits, choose
-from noeira.llm.lfm3.model import LF_BF16
+from noeira.llm.lfm3.model import LF_BF16, LF_INT8
 
 
 comptime SYSTEM = (
@@ -57,9 +57,12 @@ def main() raises:
     var args = argv()
     var dir = String(args[1]) if len(args) > 1 else getenv("HOME") + "/.cache/noeira/local-ai/lfm3/LFM3-1.7B"
     var reps = Int(String(args[2])) if len(args) > 2 else 40
-    print("LFM3 chat speed", "(LFM3_BF16)" if LF_BF16 else "(fp32)")
+    print("LFM3 chat speed", "(LFM3_BF16)" if LF_BF16 else "(fp32)", "(LFM3_INT8)" if LF_INT8 else "")
+    var t_load = perf_counter_ns()
     var chat = Lfm3Chat.load(DeviceContext(), dir, 2048)
     var v = chat.lm.cfg.vocab
+    print("  loaded in", Int(ms(t_load)), "ms: weights", r1(Float64(chat.lm.bf16_bytes()) / 1e9), "GB bf16 +",
+          r1(Float64(chat.lm.q8_bytes()) / 1e9), "GB int8")
 
     # 1. one decoded token, in parts
     chat.reset(SYSTEM)

@@ -40,7 +40,7 @@ from max.gpu.host import DeviceContext, DeviceBuffer
 from noeira.nn.constants import DT
 from noeira.io.json import load_json
 from noeira.text.bpe import ByteLevelBPE
-from .model import Lfm3Text
+from .model import Lfm3Text, LF_INT8
 from .generate import Lfm3Cache, forward_cached, last_logits
 
 
@@ -164,10 +164,14 @@ struct Lfm3Chat(Movable):
         self.last_logits = List[Float32]()
 
     @staticmethod
-    def load(var ctx: DeviceContext, dir: String, cap: Int = 4096) raises -> Lfm3Chat:
+    def load(
+        var ctx: DeviceContext, dir: String, cap: Int = 4096, int8: Bool = LF_INT8, q8_levels: Int = 127,
+    ) raises -> Lfm3Chat:
         """`dir`: an LFM3 text checkpoint (config, safetensors, tokenizer,
-        generation_config). `cap`: the conversation's length in tokens."""
-        var lm = Lfm3Text.load(ctx^, dir)
+        generation_config). `cap`: the conversation's length in tokens.
+        `int8`: the weights loaded as int8 (`Lfm3Text.load(int8=True)`, no bf16
+        copy kept; the default is the build's `-D LFM3_INT8=1`)."""
+        var lm = Lfm3Text.load(ctx^, dir, int8, q8_levels)
         var tok = ByteLevelBPE.load(dir + "/tokenizer.json")
         var cache = Lfm3Cache.make(lm, cap)
         var gc = load_json(dir + "/generation_config.json")
