@@ -83,6 +83,7 @@ from noeira.deep_agents.supermimic import SMConfig, sm_agent, sm_agent_gpu
 from noeira.deep_agents.supermimic.eval import SMInRunBench
 from noeira.io.artifact_sink import ArtifactSink, sink_for_run
 from noeira.deep_agents.supermimic.motion_library import SMMotionLibrary, SMResetSampler
+from noeira.envs.robots.berkeley_humanoid_lite_config import BHL_EFFORT_PCT, BHL_SPEED_PCT
 from noeira.deep_agents.supermimic.robot import (
     BhlBatchedSim, BhlRobot, G1BatchedSim, G1MjlabBatchedSim, G1MjlabRobot, G1Robot, SMDims, TrackingSim,
 )
@@ -389,7 +390,8 @@ def main() raises:
     var run = RunContext(
         project=String("bhl") if BHL else String("g1"),
         driver=String("examples/g1/supermimic_train.mojo"),
-        slug=String("supermimic-") + mode_s + (String("-paper") if P else (String("-light") if LIGHT else String("-smoke"))),
+        slug=String("supermimic-") + mode_s + (String("-paper") if P else (String("-light") if LIGHT else String("-smoke")))
+        + (String("-e") + String(BHL_EFFORT_PCT) + String("-s") + String(BHL_SPEED_PCT) if BHL else String("")),
         env=String("noeira:bhl/supermimic_tracking") if BHL else String("noeira:g1/supermimic_tracking"),
         dataset=String("synthetic") if store == "" else store,
         seed=seed_v,
@@ -398,6 +400,10 @@ def main() raises:
     logger.set_config("algorithm", "SuperMimic")
     logger.set_config("target", String(TARGET))
     logger.set_config("mode", mode_s)
+    comptime if BHL:
+        # the two actuator knobs of the go/no-go sweep, in percent of BHL's own limits
+        logger.set_config("bhl_effort_pct", String(BHL_EFFORT_PCT))
+        logger.set_config("bhl_speed_pct", String(BHL_SPEED_PCT))
     logger.set_config("lanes", String(C.LANES))
     logger.set_config("horizon", String(C.HORIZON))
     logger.set_config("wm_width", String(C.WM_H))

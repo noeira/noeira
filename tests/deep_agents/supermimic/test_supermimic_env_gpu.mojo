@@ -30,6 +30,7 @@ action (a pose the PD holds), so answers are known.
     reset sampler.
 
 Run (box): pixi run -e nvidia mojo run -I . tests/deep_agents/supermimic/test_supermimic_env_gpu.mojo
+(`mojo build -D SM_MJLAB=1` or `-D SM_BHL=1` for the other two robots.)
 """
 
 from std.math import ceildiv, isnan
@@ -45,22 +46,33 @@ from noeira.deep_agents.supermimic.env_gpu import ST_CLIP_END, ST_ENDING, ST_TER
 from noeira.deep_agents.supermimic.lanes import tp
 from noeira.deep_agents.supermimic.motion_library import SMMotionLibrary
 from noeira.deep_agents.supermimic.prompt import SMSpec, sm_spec_velocity
-from noeira.deep_agents.supermimic.robot import G1BatchedSim, G1MjlabBatchedSim, G1MjlabRobot, G1Robot, SMDims
-from noeira.envs.robots import UnitreeG1
-from noeira.envs.robots.unitree_g1_pd import G1_N_DOF, g1_default_pos
+from noeira.deep_agents.supermimic.robot import (
+    BhlBatchedSim, BhlRobot, G1BatchedSim, G1MjlabBatchedSim, G1MjlabRobot, G1Robot, SMDims,
+)
 from noeira.nn.constants import DT
 from noeira.nn.core.ptr import mptr
 from noeira.nn.core.tensor import TensorImpl
 
 
-# `-D SM_MJLAB=1`: the same gate on mjlab's G1.
+# `-D SM_MJLAB=1`: the same gate on mjlab's G1. `-D SM_BHL=1`: on Berkeley Humanoid Lite.
 comptime TEST_MJLAB = get_defined_int["SM_MJLAB", 0]() != 0
-comptime R = G1MjlabRobot if TEST_MJLAB else G1Robot
+comptime TEST_BHL = get_defined_int["SM_BHL", 0]() != 0
+comptime R = BhlRobot if TEST_BHL else (G1MjlabRobot if TEST_MJLAB else G1Robot)
 comptime D = SMDims[R]
 comptime n = R.NDOF
 comptime NL = 8
-comptime BS = G1MjlabBatchedSim[NL] if TEST_MJLAB else G1BatchedSim[NL]
+comptime BS = BhlBatchedSim[NL] if TEST_BHL else (G1MjlabBatchedSim[NL] if TEST_MJLAB else G1BatchedSim[NL])
 comptime EnvG = SMTrackingEnvGpu[R, BS]
+# Control steps of zero action before the pose is taken as "held". Both robots are down after 2 s; the
+# G1 is still by then, Berkeley Humanoid Lite's softer PD (kp 20) still moves at 0.28 rad/s and needs 8 s
+# (0.0016 rad/s).
+comptime SETTLE_STEPS = 400 if TEST_BHL else 100
+# [1]'s floor on the reward. On Berkeley Humanoid Lite a reset AT the settled pose is not at rest: the
+# reset clamps every joint into its soft limits (0.9 of the range, BHL's own factor) and BHL's elbows
+# rest ON their hard limit (range [0, pi/2]), so the reset state is 0.0785 rad (5 % of the range) away
+# from the pose before any step. Measured on the CPU env (2026-11-12): 0.979 of the maximum on step 0,
+# 0.9505 at worst over 30 steps while the PD pulls the elbows back. [2] is the parity check.
+comptime HOLD_MIN = 0.93 if TEST_BHL else 0.98
 
 
 struct Tally:
@@ -84,8 +96,8 @@ def _standing_row() raises -> List[Scalar[DT]]:
     """The robot under test settled for 2 s under zero action (no bias)
     from its `stand` start, through its own CPU tracking sim."""
     var sim = R.SIM.create()
-    var a = List[Float64](length=G1_N_DOF, fill=0.0)
-    for _ in range(100):
+    var a = List[Float64](length=n, fill=0.0)
+    for _ in range(SETTLE_STEPS):
         sim.control_step(a, a)
     var row = List[Scalar[DT]](length=D.S, fill=0)
     for k in range(R.NQ):
@@ -150,7 +162,7 @@ def test_hold(ctx: DeviceContext, stand: List[Scalar[DT]], mut tl: Tally) raises
         trunc += si.n_truncated
         for l in range(NL):
             worst = min(worst, env.last_reward[l] / 0.1)
-    tl.check(worst >= 0.98 and term == 0, "30 steps x 8 lanes: worst reward " + String(worst) + " of the maximum, " + String(term) + " terminations (" + String(trunc) + " clip-end time-outs)")
+    tl.check(worst >= HOLD_MIN and term == 0, "30 steps x 8 lanes: worst reward " + String(worst) + " of the maximum, " + String(term) + " terminations (" + String(trunc) + " clip-end time-outs)")
 
 
 def test_vs_cpu(ctx: DeviceContext, stand: List[Scalar[DT]], mut tl: Tally) raises:
@@ -406,7 +418,13 @@ def main() raises:
         test_termination(ctx, stand, tl)
         test_clip_end(ctx, stand, tl)
         test_bookkeeping(ctx, stand, tl)
-        test_prompt_lanes(ctx, stand, tl)
+        comptime if TEST_BHL:
+            # `sm_prompt_fell` compares the root height with SM_P_FALL_H, a G1 height: Berkeley Humanoid
+            # Lite's base frame is at floor level, so every prompt lane reads as fallen. Tracker lanes
+            # (the only ones a tracking run uses, `prompt_from = NL`) do not read that rule.
+            print("[6] prompt lanes: SKIPPED on Berkeley Humanoid Lite (the fall rule is written in G1 heights)")
+        else:
+            test_prompt_lanes(ctx, stand, tl)
         print("\n===", tl.ok, "/", tl.total, "passed ===")
         if tl.ok != tl.total:
             raise Error("test_supermimic_env_gpu: " + String(tl.total - tl.ok) + " failed")

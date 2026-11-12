@@ -36,6 +36,7 @@ from noeira.deep_agents.supermimic import SMConfig, SuperMimicTrainer
 from noeira.deep_agents.supermimic.eval import sm_benchmark_gpu, sm_summarize, sm_term_name
 from noeira.deep_agents.supermimic.heads import SM_N_TERMS
 from noeira.deep_agents.supermimic.motion_library import SMMotionLibrary
+from noeira.envs.robots.berkeley_humanoid_lite_config import BHL_EFFORT_PCT, BHL_SPEED_PCT
 from noeira.deep_agents.supermimic.robot import (
     BhlBatchedSim, BhlRobot, G1BatchedSim, G1MjlabBatchedSim, G1MjlabRobot, G1Robot, SMDims, TrackingSim,
 )
@@ -138,11 +139,15 @@ def main() raises:
         raise Error("give --ckpt PATH and --store PATH")
     var run = RunContext(
         project=String("bhl") if BHL else String("g1"), driver=String("examples/g1/supermimic_eval.mojo"),
-        slug=String("supermimic-eval"), env=String("noeira:g1/supermimic_tracking"), dataset=store,
+        slug=String("supermimic-eval") + (String("-e") + String(BHL_EFFORT_PCT) + String("-s") + String(BHL_SPEED_PCT) if BHL else String("")),
+        env=String("noeira:bhl/supermimic_tracking") if BHL else String("noeira:g1/supermimic_tracking"), dataset=store,
     )
     var logger = run_logger(run, buffer_size=64)
     logger.set_config("algorithm", "SuperMimic")
     logger.set_config("protocol", "appendix_f")
+    comptime if BHL:
+        logger.set_config("bhl_effort_pct", String(BHL_EFFORT_PCT))
+        logger.set_config("bhl_speed_pct", String(BHL_SPEED_PCT))
     logger.set_config("checkpoint", ckpt)
     logger.set_config("lanes", String(C.LANES))
     register_run(run, logger)
