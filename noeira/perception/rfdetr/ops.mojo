@@ -13,11 +13,12 @@ from max.gpu import thread_idx, block_idx, global_idx
 from max.gpu.host import DeviceContext, DeviceBuffer
 
 from noeira.nn.constants import DT
-from noeira.perception.sam3.ops import TPB, Ptr, blocks, gemm_tb, add_kernel, _d
+from noeira.perception.sam3.ops import TPB, Ptr, blocks, gemm_tb, add_kernel, _d, _act
 from noeira.perception.sam3.neck import shift_kernel, tap_weights_kernel
 
 
 comptime IPtr = Pointer[Scalar[DType.int32], MutAnyOrigin]
+comptime U8Ptr = Pointer[Scalar[DType.uint8], MutAnyOrigin]
 
 # The Seg-Small geometry (384 input, patch 12, 2 x 2 windows).
 comptime IMG: Int = 384
@@ -31,6 +32,75 @@ comptime WIN: Int = GRID // NWIN
 comptime WTOK: Int = WIN * WIN + 1
 """257: a window's tokens and its CLS copy."""
 comptime BB_DIM: Int = 384
+
+
+@always_inline
+def _src_index(i: Int, src: Int, dst: Int) -> Tuple[Int, Int, Scalar[DT]]:
+    """torch's bilinear source taps for output `i` (`align_corners=False`, no
+    explicit scale): `max((i + 0.5) src / dst - 0.5, 0)`, its floor, the next
+    (clamped), the weight of the next — `vision.resize_pad._Axis`'s."""
+    var scale = Scalar[DT](src) / Scalar[DT](dst)
+    var real = scale * (Scalar[DT](i) + Scalar[DT](0.5)) - Scalar[DT](0.5)
+    if real < Scalar[DT](0):
+        real = Scalar[DT](0)
+    var lo = Int(real)
+    return (lo, min(lo + 1, src - 1), real - Scalar[DT](lo))
+
+
+def preprocess_kernel(rgb: U8Ptr, dst: Ptr, h_n: Int64, w_n: Int64):
+    """The picture (uint8 HWC RGB, h x w) -> the network's [3, 384, 384]: / 255,
+    torch's separable bilinear (each source row interpolated along x, then the
+    two rows along y — `torch_bilinear_chw`'s order), `(v - mean) / std`.
+    Grid `(ceil(384 / TPB), 384, 3)`."""
+    var x = Int(block_idx.x) * TPB + Int(thread_idx.x)
+    var y = Int(block_idx.y)
+    var c = Int(block_idx.z)
+    if x >= IMG:
+        return
+    var H = Int(h_n)
+    var W = Int(w_n)
+    var ax = _src_index(x, W, IMG)
+    var ay = _src_index(y, H, IMG)
+    var x0 = ax[0]
+    var x1 = ax[1]
+    var wx = ax[2]
+    var y0 = ay[0]
+    var y1 = ay[1]
+    var wy = ay[2]
+    var k = Scalar[DT](255.0)
+    var a = Scalar[DT](Int(rgb[unsafe_offset=(y0 * W + x0) * 3 + c])) / k
+    var b = Scalar[DT](Int(rgb[unsafe_offset=(y0 * W + x1) * 3 + c])) / k
+    var t0 = a * (Scalar[DT](1) - wx) + b * wx
+    a = Scalar[DT](Int(rgb[unsafe_offset=(y1 * W + x0) * 3 + c])) / k
+    b = Scalar[DT](Int(rgb[unsafe_offset=(y1 * W + x1) * 3 + c])) / k
+    var t1 = a * (Scalar[DT](1) - wx) + b * wx
+    var v = t0 * (Scalar[DT](1) - wy) + t1 * wy
+    var mean = Scalar[DT](0.485) if c == 0 else (Scalar[DT](0.456) if c == 1 else Scalar[DT](0.406))
+    var std = Scalar[DT](0.229) if c == 0 else (Scalar[DT](0.224) if c == 1 else Scalar[DT](0.225))
+    dst[unsafe_offset=(c * IMG + y) * IMG + x] = (v - mean) / std
+
+
+def mask_post_kernel(masks: Ptr, qidx: IPtr, dst: U8Ptr, side_n: Int64, h_n: Int64, w_n: Int64):
+    """Kept query `k`'s [side x side] mask logits resized to the picture (torch's
+    separable bilinear, as `torch_bilinear_chw`) and cut at 0 -> `dst[k, y, x]`
+    in {0, 1}. Grid `(ceil(W / TPB), H, K)`."""
+    var x = Int(block_idx.x) * TPB + Int(thread_idx.x)
+    var y = Int(block_idx.y)
+    var k = Int(block_idx.z)
+    var W = Int(w_n)
+    var H = Int(h_n)
+    if x >= W:
+        return
+    var S = Int(side_n)
+    var base = Int(qidx[unsafe_offset=k]) * S * S
+    var ax = _src_index(x, S, W)
+    var ay = _src_index(y, S, H)
+    var wx = ax[2]
+    var wy = ay[2]
+    var t0 = masks[unsafe_offset=base + ay[0] * S + ax[0]] * (Scalar[DT](1) - wx) + masks[unsafe_offset=base + ay[0] * S + ax[1]] * wx
+    var t1 = masks[unsafe_offset=base + ay[1] * S + ax[0]] * (Scalar[DT](1) - wx) + masks[unsafe_offset=base + ay[1] * S + ax[1]] * wx
+    var v = t0 * (Scalar[DT](1) - wy) + t1 * wy
+    dst[unsafe_offset=(k * H + y) * W + x] = UInt8(1) if v > Scalar[DT](0) else UInt8(0)
 
 
 def patchify_kernel(px: Ptr, dst: Ptr):
@@ -96,6 +166,17 @@ def scale_add_kernel(x: Ptr, a: Ptr, lam: Ptr, cols_n: Int64):
     if c < cols:
         var i = Int(block_idx.x) * cols + c
         x[unsafe_offset=i] = x[unsafe_offset=i] + lam[unsafe_offset=c] * a[unsafe_offset=i]
+
+
+def bias_scale_add_kernel(x: Ptr, y: Ptr, b: Ptr, lam: Ptr, cols_n: Int64):
+    """`x[r, c] += lam[c] (y[r, c] + b[c])` — a bias-free linear's bias folded
+    into the layer-scale residual (the same floats as the bias pass, then
+    `scale_add_kernel`). Grid `(rows, ceil(cols / TPB))`."""
+    var c = Int(block_idx.y) * TPB + Int(thread_idx.x)
+    var cols = Int(cols_n)
+    if c < cols:
+        var i = Int(block_idx.x) * cols + c
+        x[unsafe_offset=i] = x[unsafe_offset=i] + lam[unsafe_offset=c] * (y[unsafe_offset=i] + b[unsafe_offset=c])
 
 
 def silu_kernel(x: Ptr, n_n: Int64):
@@ -208,6 +289,57 @@ def dwconv3x3_kernel(x: Ptr, w: Ptr, b: Ptr, dst: Ptr, h_n: Int64, w_n: Int64, c
                 continue
             s += w[unsafe_offset=c * 9 + ky * 3 + kx] * x[unsafe_offset=(yy * W + x2) * C + c]
     dst[unsafe_offset=n * C + c] = s
+
+
+comptime V4_TPB: Int = 64
+"""Threads a block for the 4-channels-a-thread kernels (256 channels = 64 x 4)."""
+
+
+def dw_taps_kernel(w: Ptr, dst: Ptr, c_n: Int64):
+    """`dst[t, c] = w[c, 0, ky, kx]`, t = 3 ky + kx (tap-major: a tap's channels
+    contiguous). Grid `(ceil(C / TPB), 9)`."""
+    var c = Int(block_idx.x) * TPB + Int(thread_idx.x)
+    var t = Int(block_idx.y)
+    if c < Int(c_n):
+        dst[unsafe_offset=t * Int(c_n) + c] = w[unsafe_offset=c * 9 + t]
+
+
+def dwconv3x3_v4_kernel(x: Ptr, wt: Ptr, b: Ptr, dst: Ptr, h_n: Int64, w_n: Int64, c_n: Int64):
+    """`dwconv3x3_kernel` four channels a thread (16-byte loads; `wt` tap-major
+    [9, C], `dw_taps_kernel`), the same per-channel sum order. Grid `(H W,
+    ceil(C / 4 V4_TPB))`, V4_TPB threads."""
+    var c = (Int(block_idx.y) * V4_TPB + Int(thread_idx.x)) * 4
+    var n = Int(block_idx.x)
+    var C = Int(c_n)
+    if c >= C:
+        return
+    var W = Int(w_n)
+    var H = Int(h_n)
+    var y = _d(n, W)
+    var xx = n - y * W
+    var s = b.unsafe_load[width=4, alignment=16](c)
+    for ky in range(3):
+        var yy = y + ky - 1
+        if yy < 0 or yy >= H:
+            continue
+        for kx in range(3):
+            var x2 = xx + kx - 1
+            if x2 < 0 or x2 >= W:
+                continue
+            s += wt.unsafe_load[width=4, alignment=16]((ky * 3 + kx) * C + c) * x.unsafe_load[width=4, alignment=16]((yy * W + x2) * C + c)
+    dst.unsafe_store[alignment=16](n * C + c, s)
+
+
+def bias_gelu_add_kernel(x: Ptr, y: Ptr, b: Ptr, cols_n: Int64):
+    """`x[r, c] += gelu(y[r, c] + b[c])` (exact GELU), four columns a thread: a
+    bias-free linear's bias, its GELU and the residual add in one pass (the
+    same floats as bias, GELU, add). Grid `(rows, ceil(cols / 4 V4_TPB))`."""
+    var c = (Int(block_idx.y) * V4_TPB + Int(thread_idx.x)) * 4
+    var cols = Int(cols_n)
+    if c < cols:
+        var i = Int(block_idx.x) * cols + c
+        var v = y.unsafe_load[width=4, alignment=16](i) + b.unsafe_load[width=4, alignment=16](c)
+        x.unsafe_store[alignment=16](i, x.unsafe_load[width=4, alignment=16](i) + _act[1, 4](v))
 
 
 def upsample_bilinear_kernel(src: Ptr, dst: Ptr, hi_n: Int64, wi_n: Int64, ho_n: Int64, wo_n: Int64, c_n: Int64):

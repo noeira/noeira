@@ -484,9 +484,42 @@ def layer_norm_kernel(x: Ptr, y: Ptr, w: Ptr, b: Ptr, dim_n: Int64, eps: Float32
         d += TPB
 
 
+def layer_norm_warp_kernel(x: Ptr, y: Ptr, w: Ptr, b: Ptr, rows_n: Int64, dim_n: Int64, eps: Float32):
+    """`layer_norm_kernel`'s arithmetic with a WARP per row, 8 rows a block (no
+    block barriers): a block per row of 256 or 384 channels waited on two
+    block-wide reductions a row (RF-DETR's 9216-row mask-head norms, 0.7 ms
+    each on the Orin). Biased variance, two passes; `y` may be `x`.
+    Grid `ceil(rows / 8)`, 256 threads."""
+    var tid = Int(thread_idx.x)
+    var r = Int(block_idx.x) * 8 + (tid >> 5)
+    if r >= Int(rows_n):
+        return  # a whole warp leaves together
+    var lane = tid & 31
+    var dim = Int(dim_n)
+    var row = r * dim
+    var s = Scalar[DT](0)
+    var d = lane
+    while d < dim:
+        s += x[unsafe_offset=row + d]
+        d += 32
+    var mean = warp.sum(s) / Scalar[DT](dim)
+    var q = Scalar[DT](0)
+    d = lane
+    while d < dim:
+        var v = x[unsafe_offset=row + d] - mean
+        q += v * v
+        d += 32
+    var inv = Scalar[DT](1) / sqrt(warp.sum(q) / Scalar[DT](dim) + Scalar[DT](eps))
+    d = lane
+    while d < dim:
+        y[unsafe_offset=row + d] = (x[unsafe_offset=row + d] - mean) * inv * w[unsafe_offset=d] + b[unsafe_offset=d]
+        d += 32
+
+
 def layer_norm(mut wts: Sam3Weights, name: String, x: DeviceBuffer[DT], y: DeviceBuffer[DT], rows: Int, dim: Int, eps: Float32) raises:
-    wts.ctx.enqueue_function[layer_norm_kernel](
-        x, y, wts.w(name + ".weight"), wts.w(name + ".bias"), Int64(dim), eps, grid_dim=rows, block_dim=TPB,
+    wts.ctx.enqueue_function[layer_norm_warp_kernel](
+        x, y, wts.w(name + ".weight"), wts.w(name + ".bias"), Int64(rows), Int64(dim), eps,
+        grid_dim=(rows + 7) // 8, block_dim=256,
     )
 
 

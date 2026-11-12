@@ -60,19 +60,20 @@ bottlenecks WITH a residual.
 
 from std.math import exp, sin, cos, pow
 from std.os import getenv
+from std.memory import unsafe_memcpy
 from max.gpu.host import DeviceContext, DeviceBuffer
 
 from noeira.ai.picture import Picture
 from noeira.nn.constants import DT
-from noeira.vision.resize_pad import torch_bilinear_chw
 from noeira.perception.sam3.ops import (
     Sam3Weights, TPB, blocks, linear, linear_into, layer_norm, gemm_tb, add_kernel, add_into_kernel,
-    gelu_kernel, relu_kernel, bias_kernel, mha,
+    gelu_kernel, relu_kernel, bias_kernel, mha, linear_into, bias_act_kernel, flash_self, USE_FLASH,
 )
 from .ops import (
-    IMG, PATCH, GRID, NTOK, NWIN, WTOK, BB_DIM, IPtr,
-    patchify_kernel, window_embed_kernel, unwindow_kernel, scale_add_kernel, silu_kernel, copy_cols_kernel,
+    IMG, PATCH, GRID, NTOK, NWIN, WTOK, BB_DIM, IPtr, preprocess_kernel, mask_post_kernel,
+    patchify_kernel, window_embed_kernel, unwindow_kernel, scale_add_kernel, bias_scale_add_kernel, silu_kernel, copy_cols_kernel,
     gather_rows_kernel, add_scalar_kernel, msda_kernel, dwconv3x3_kernel, upsample_bilinear_kernel,
+    V4_TPB, dw_taps_kernel, dwconv3x3_v4_kernel, bias_gelu_add_kernel,
     conv_taps, conv3x3_tm,
 )
 
@@ -146,7 +147,8 @@ struct RfDetrRaw(Movable):
 struct RfDetr(Movable):
     var wts: Sam3Weights
     var taps: Dict[String, DeviceBuffer[DT]]
-    """The C2f 3x3 convs' weights per tap, [9, 128, 128]."""
+    """The C2f 3x3 convs' weights per tap, [9, 128, 128]; the mask head's depthwise
+    weights tap-major, [9, 256]."""
     var refpoint: List[Float32]
     """`refpoint_embed[:100]` [100, 4] (host)."""
     var debug: Int
@@ -165,6 +167,22 @@ struct RfDetr(Movable):
             for cv in range(1, 3):
                 var name = PROJ + "0.m." + String(k) + ".cv" + String(cv) + ".conv"
                 self.taps[name] = conv_taps(self.wts.ctx, self.wts.w(name + ".weight"), C2F_HALF, C2F_HALF)
+        for b in range(DEC_LAYERS):
+            var name = String("segmentation_head.blocks.") + String(b) + ".dwconv"
+            var t = self.wts.ctx.enqueue_create_buffer[DT](9 * D)
+            self.wts.ctx.enqueue_function[dw_taps_kernel](
+                self.wts.w(name + ".weight"), t, Int64(D), grid_dim=(blocks(D), 9), block_dim=TPB,
+            )
+            self.taps[name] = t
+        comptime if USE_FLASH:
+            # q, k, v as ONE GEMM per block (rows [q | k | v]: the fused attention's input)
+            for li in range(LAYERS):
+                var a = LAYER + String(li) + ".attention.attention."
+                var parts = List[String]()
+                parts.append(a + "query")
+                parts.append(a + "key")
+                parts.append(a + "value")
+                self.wts.concat(a + "qkv", parts)
         self.refpoint = List[Float32]()
         self.enc_logits = List[Float32]()
         self.dec_ref = List[Float32]()
@@ -195,20 +213,20 @@ struct RfDetr(Movable):
     # ── 1. pixels ─────────────────────────────────────────────────────────
 
     def pixel_values(self, pic: Picture) raises -> DeviceBuffer[DT]:
-        """[3, 384, 384]: the network's input."""
-        var chw = List[Float32](length=3 * pic.height * pic.width, fill=0.0)
-        var hw = pic.height * pic.width
-        for i in range(hw):
-            for c in range(3):
-                chw[c * hw + i] = Float32(pic.rgb[i * 3 + c]) / Float32(255.0)
-        var r = List[Float32]()
-        torch_bilinear_chw(chw, 3, pic.height, pic.width, r, IMG, IMG)
-        var mean: List[Float32] = [0.485, 0.456, 0.406]
-        var std: List[Float32] = [0.229, 0.224, 0.225]
-        for c in range(3):
-            for i in range(IMG * IMG):
-                r[c * IMG * IMG + i] = (r[c * IMG * IMG + i] - mean[c]) / std[c]
-        return self._up(r)
+        """[3, 384, 384]: the network's input — the picture's bytes uploaded, the
+        stretch and normalisation on the device (`ops.preprocess_kernel`; on the
+        host it was 17 ms of a 90 ms frame on the Orin)."""
+        ref ctx = self.wts.ctx
+        var n = pic.height * pic.width * 3
+        var h = ctx.enqueue_create_host_buffer[DType.uint8](n)
+        unsafe_memcpy(dest=h.unsafe_ptr(), src=pic.rgb.unsafe_ptr(), count=n)
+        var d = ctx.enqueue_create_buffer[DType.uint8](n)
+        ctx.enqueue_copy(d, h)
+        var px = self.new(3 * IMG * IMG)
+        ctx.enqueue_function[preprocess_kernel](
+            d, px, Int64(pic.height), Int64(pic.width), grid_dim=(blocks(IMG), IMG, 3), block_dim=TPB,
+        )
+        return px^
 
     # ── 2-3. backbone + projector ─────────────────────────────────────────
 
@@ -238,32 +256,51 @@ struct RfDetr(Movable):
             var p = LAYER + String(li) + "."
             var h = self.new(nrow * BB_DIM)
             layer_norm(self.wts, p + "norm1", x, h, nrow, BB_DIM, BB_EPS)
-            var q = linear(self.wts, p + "attention.attention.query", h, nrow, BB_DIM)
-            var k = linear(self.wts, p + "attention.attention.key", h, nrow, BB_DIM)
-            var v = linear(self.wts, p + "attention.attention.value", h, nrow, BB_DIM)
+            var glob = is_global(li) and (self.debug & 1) == 0
             var a: DeviceBuffer[DT]
-            if is_global(li) and (self.debug & 1) == 0:
-                a = mha(ctx, q, k, v, nrow, nrow, HEADS, BB_DIM // HEADS, nrow)
-            else:
+            comptime if USE_FLASH:
+                # one q | k | v GEMM, then the fused TF32 attention: the 4 windows (257 tokens,
+                # consecutive rows) as a batch, or all 1028 tokens on the global blocks
+                var qkv = linear(self.wts, p + "attention.attention.qkv", h, nrow, BB_DIM)
                 a = self.new(nrow * BB_DIM)
-                for w in range(NWIN * NWIN):
-                    var off = w * WTOK * BB_DIM
-                    var aw = mha(
-                        ctx, q.create_sub_buffer[DT](off, WTOK * BB_DIM), k.create_sub_buffer[DT](off, WTOK * BB_DIM),
-                        v.create_sub_buffer[DT](off, WTOK * BB_DIM), WTOK, WTOK, HEADS, BB_DIM // HEADS, WTOK,
-                    )
-                    ctx.enqueue_copy(a.create_sub_buffer[DT](off, WTOK * BB_DIM), aw)
-            var o = linear(self.wts, p + "attention.output.dense", a, nrow, BB_DIM)
-            ctx.enqueue_function[scale_add_kernel](
-                x, o, self.wts.w(p + "layer_scale1.lambda1"), Int64(BB_DIM), grid_dim=(nrow, blocks(BB_DIM)), block_dim=TPB,
+                if glob:
+                    flash_self[NWIN * NWIN * WTOK, HEADS, BB_DIM // HEADS, True](ctx, qkv, a)
+                else:
+                    flash_self[WTOK, HEADS, BB_DIM // HEADS, True](ctx, qkv, a, NWIN * NWIN)
+            else:
+                var q = linear(self.wts, p + "attention.attention.query", h, nrow, BB_DIM)
+                var k = linear(self.wts, p + "attention.attention.key", h, nrow, BB_DIM)
+                var v = linear(self.wts, p + "attention.attention.value", h, nrow, BB_DIM)
+                if glob:
+                    a = mha(ctx, q, k, v, nrow, nrow, HEADS, BB_DIM // HEADS, nrow)
+                else:
+                    a = self.new(nrow * BB_DIM)
+                    for w in range(NWIN * NWIN):
+                        var off = w * WTOK * BB_DIM
+                        var aw = mha(
+                            ctx, q.create_sub_buffer[DT](off, WTOK * BB_DIM), k.create_sub_buffer[DT](off, WTOK * BB_DIM),
+                            v.create_sub_buffer[DT](off, WTOK * BB_DIM), WTOK, WTOK, HEADS, BB_DIM // HEADS, WTOK,
+                        )
+                        ctx.enqueue_copy(a.create_sub_buffer[DT](off, WTOK * BB_DIM), aw)
+            # the output projection's and fc2's biases ride the layer-scale residual, fc1's the GELU
+            var o = self.new(nrow * BB_DIM)
+            linear_into(self.wts, p + "attention.output.dense", a, nrow, BB_DIM, o, bias=False)
+            ctx.enqueue_function[bias_scale_add_kernel](
+                x, o, self.wts.w(p + "attention.output.dense.bias"), self.wts.w(p + "layer_scale1.lambda1"), Int64(BB_DIM),
+                grid_dim=(nrow, blocks(BB_DIM)), block_dim=TPB,
             )
             var h2 = self.new(nrow * BB_DIM)
             layer_norm(self.wts, p + "norm2", x, h2, nrow, BB_DIM, BB_EPS)
-            var f1 = linear(self.wts, p + "mlp.fc1", h2, nrow, BB_DIM)
-            ctx.enqueue_function[gelu_kernel](f1, Int64(nrow * BB_FF), grid_dim=blocks(nrow * BB_FF), block_dim=TPB)
-            var f2 = linear(self.wts, p + "mlp.fc2", f1, nrow, BB_FF)
-            ctx.enqueue_function[scale_add_kernel](
-                x, f2, self.wts.w(p + "layer_scale2.lambda1"), Int64(BB_DIM), grid_dim=(nrow, blocks(BB_DIM)), block_dim=TPB,
+            var f1 = self.new(nrow * BB_FF)
+            linear_into(self.wts, p + "mlp.fc1", h2, nrow, BB_DIM, f1, bias=False)
+            ctx.enqueue_function[bias_act_kernel[1]](
+                f1, self.wts.w(p + "mlp.fc1.bias"), Int64(BB_FF), grid_dim=(nrow, blocks(BB_FF)), block_dim=TPB,
+            )
+            var f2 = self.new(nrow * BB_DIM)
+            linear_into(self.wts, p + "mlp.fc2", f1, nrow, BB_FF, f2, bias=False)
+            ctx.enqueue_function[bias_scale_add_kernel](
+                x, f2, self.wts.w(p + "mlp.fc2.bias"), self.wts.w(p + "layer_scale2.lambda1"), Int64(BB_DIM),
+                grid_dim=(nrow, blocks(BB_DIM)), block_dim=TPB,
             )
             if keep_taps:
                 keep.append(_copy(ctx, x, nrow * BB_DIM))
@@ -448,14 +485,16 @@ struct RfDetr(Movable):
         for b in range(DEC_LAYERS):
             var p = S + "blocks." + String(b) + "."
             var dw = self.new(NPX * D)
-            ctx.enqueue_function[dwconv3x3_kernel](
-                x, self.wts.w(p + "dwconv.weight"), self.wts.w(p + "dwconv.bias"), dw, Int64(MASK), Int64(MASK), Int64(D),
-                grid_dim=(NPX, blocks(D)), block_dim=TPB,
+            ctx.enqueue_function[dwconv3x3_v4_kernel](
+                x, self.taps[p + "dwconv"], self.wts.w(p + "dwconv.bias"), dw, Int64(MASK), Int64(MASK), Int64(D),
+                grid_dim=(NPX, (D // 4 + V4_TPB - 1) // V4_TPB), block_dim=V4_TPB,
             )
             layer_norm(self.wts, p + "norm", dw, dw, NPX, D, BB_EPS)
-            var pw = linear(self.wts, p + "pwconv1", dw, NPX, D)
-            ctx.enqueue_function[gelu_kernel](pw, Int64(NPX * D), grid_dim=blocks(NPX * D), block_dim=TPB)
-            ctx.enqueue_function[add_kernel](x, pw, Int64(NPX * D), grid_dim=blocks(NPX * D), block_dim=TPB)
+            var pw = self.new(NPX * D)
+            linear_into(self.wts, p + "pwconv1", dw, NPX, D, pw, bias=False)
+            ctx.enqueue_function[bias_gelu_add_kernel](
+                x, pw, self.wts.w(p + "pwconv1.bias"), Int64(D), grid_dim=(NPX, (D // 4 + V4_TPB - 1) // V4_TPB), block_dim=V4_TPB,
+            )
         var pix = linear(self.wts, S + "spatial_features_proj", x, NPX, D)
         var qn = self._ln_new(S + "query_features_block.norm_in", queries, NQ, D, TR_EPS)
         var h1 = linear(self.wts, S + "query_features_block.layers.0", qn, NQ, D)
@@ -511,10 +550,25 @@ struct RfDetr(Movable):
             flat = f2^
             prob = p2^
         var out = List[RfDetrInstance]()
-        comptime NPX = MASK * MASK
+        var nk = len(flat)
+        if nk == 0:
+            return out^
         ref ctx = self.wts.ctx
-        var hbuf = ctx.enqueue_create_host_buffer[DT](NPX)
-        for k in range(len(flat)):
+        # the kept masks resized and cut on the device (`ops.mask_post_kernel`), one copy back
+        var hq = ctx.enqueue_create_host_buffer[DType.int32](nk)
+        for k in range(nk):
+            hq[k] = Int32(flat[k] // NCLS)
+        var dq = ctx.enqueue_create_buffer[DType.int32](nk)
+        ctx.enqueue_copy(dq, hq)
+        var npx = height * width
+        var dm = ctx.enqueue_create_buffer[DType.uint8](nk * npx)
+        ctx.enqueue_function[mask_post_kernel](
+            raw.masks, dq, dm, Int64(MASK), Int64(height), Int64(width), grid_dim=(blocks(width), height, nk), block_dim=TPB,
+        )
+        var hm = ctx.enqueue_create_host_buffer[DType.uint8](nk * npx)
+        ctx.enqueue_copy(hm, dm)
+        ctx.synchronize()
+        for k in range(nk):
             var q = flat[k] // NCLS
             var label = flat[k] - q * NCLS
             var cx = raw.boxes[q * 4]
@@ -528,16 +582,8 @@ struct RfDetr(Movable):
             box.append(min(max((cy - Float32(0.5) * h) * H, Float32(0)), H))
             box.append(min(max((cx + Float32(0.5) * w) * W, Float32(0)), W))
             box.append(min(max((cy + Float32(0.5) * h) * H, Float32(0)), H))
-            ctx.enqueue_copy(hbuf, raw.masks.create_sub_buffer[DT](q * NPX, NPX))
-            ctx.synchronize()
-            var lg = List[Float32](capacity=NPX)
-            for i in range(NPX):
-                lg.append(hbuf[i])
-            var up = List[Float32]()
-            torch_bilinear_chw(lg, 1, MASK, MASK, up, height, width)
-            var mask = List[UInt8](capacity=height * width)
-            for v in up:
-                mask.append(UInt8(1) if v > 0.0 else UInt8(0))
+            var mask = List[UInt8](unsafe_uninit_length=npx)
+            unsafe_memcpy(dest=mask.unsafe_ptr(), src=hm.unsafe_ptr() + k * npx, count=npx)
             out.append(RfDetrInstance(label, prob[k], box^, mask^, q))
         return out^
 
