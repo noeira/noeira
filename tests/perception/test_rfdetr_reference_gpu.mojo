@@ -24,7 +24,7 @@ from noeira.ai.picture import Picture
 from noeira.io.npy import load_npy_f64
 from noeira.nn.constants import DT
 from noeira.perception.rfdetr import RfDetr
-from noeira.perception.sam3.ops import SAM3_TF32
+from noeira.perception.sam3.ops import SAM3_TF32, SAM3_BF16
 
 
 comptime BOUND: Float64 = 1e-4
@@ -183,7 +183,9 @@ def main() raises:
         labels += String(found[k].label) + ":" + String(found[k].score) + " "
     comptime S_B = 1e-4 if STRICT else 0.02
     comptime B_B = 0.05 if STRICT else 2.0
-    comptime I_B = 0.999 if STRICT else 0.99
+    # bf16: one mask of this frame at IoU 0.96 — and over the 524-frame NYU eval the bf16 build scores as fp32
+    # does (AP50 .813 / .543 / .810 vs .812 / .535 / .818, mask IoU and 3D places within noise: 11-12)
+    comptime I_B = 0.999 if STRICT else (0.95 if SAM3_BF16 else 0.99)
     check(fails, same and ds <= S_B and db <= B_B and worst_iou >= I_B,
           String("detections (") + labels + "): labels and order as rfdetr's (" + String(len(rs)) + "), score |d| "
           + String(ds) + ", box |d| " + String(db) + " px, mask IoU >= " + String(worst_iou))

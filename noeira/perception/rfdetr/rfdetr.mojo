@@ -68,6 +68,7 @@ from noeira.nn.constants import DT
 from noeira.perception.sam3.ops import (
     Sam3Weights, TPB, blocks, linear, linear_into, layer_norm, gemm_tb, add_kernel, add_into_kernel,
     gelu_kernel, relu_kernel, bias_kernel, mha, linear_into, bias_act_kernel, flash_self, USE_FLASH,
+    SAM3_BF16, layer_norm_bf16, linear_into_b, flash_self_bf16, bias_act_bf16_v4_kernel,
 )
 from .ops import (
     IMG, PATCH, GRID, NTOK, NWIN, WTOK, BB_DIM, IPtr, preprocess_kernel, mask_post_kernel,
@@ -254,55 +255,58 @@ struct RfDetr(Movable):
         var cat = self.new(NTOK * 4 * BB_DIM)
         for li in range(LAYERS):
             var p = LAYER + String(li) + "."
-            var h = self.new(nrow * BB_DIM)
-            layer_norm(self.wts, p + "norm1", x, h, nrow, BB_DIM, BB_EPS)
-            var glob = is_global(li) and (self.debug & 1) == 0
-            var a: DeviceBuffer[DT]
-            comptime if USE_FLASH:
-                # one q | k | v GEMM, then the fused TF32 attention: the 4 windows (257 tokens,
-                # consecutive rows) as a batch, or all 1028 tokens on the global blocks
-                var qkv = linear(self.wts, p + "attention.attention.qkv", h, nrow, BB_DIM)
-                a = self.new(nrow * BB_DIM)
-                if glob:
-                    flash_self[NWIN * NWIN * WTOK, HEADS, BB_DIM // HEADS, True](ctx, qkv, a)
-                else:
-                    flash_self[WTOK, HEADS, BB_DIM // HEADS, True](ctx, qkv, a, NWIN * NWIN)
+            comptime if SAM3_BF16:
+                self._block_bf16(p, is_global(li) and (self.debug & 1) == 0, x, nrow)
             else:
-                var q = linear(self.wts, p + "attention.attention.query", h, nrow, BB_DIM)
-                var k = linear(self.wts, p + "attention.attention.key", h, nrow, BB_DIM)
-                var v = linear(self.wts, p + "attention.attention.value", h, nrow, BB_DIM)
-                if glob:
-                    a = mha(ctx, q, k, v, nrow, nrow, HEADS, BB_DIM // HEADS, nrow)
-                else:
+                var h = self.new(nrow * BB_DIM)
+                layer_norm(self.wts, p + "norm1", x, h, nrow, BB_DIM, BB_EPS)
+                var glob = is_global(li) and (self.debug & 1) == 0
+                var a: DeviceBuffer[DT]
+                comptime if USE_FLASH:
+                    # one q | k | v GEMM, then the fused TF32 attention: the 4 windows (257 tokens,
+                    # consecutive rows) as a batch, or all 1028 tokens on the global blocks
+                    var qkv = linear(self.wts, p + "attention.attention.qkv", h, nrow, BB_DIM)
                     a = self.new(nrow * BB_DIM)
-                    for w in range(NWIN * NWIN):
-                        var off = w * WTOK * BB_DIM
-                        var aw = mha(
-                            ctx, q.create_sub_buffer[DT](off, WTOK * BB_DIM), k.create_sub_buffer[DT](off, WTOK * BB_DIM),
-                            v.create_sub_buffer[DT](off, WTOK * BB_DIM), WTOK, WTOK, HEADS, BB_DIM // HEADS, WTOK,
-                        )
-                        ctx.enqueue_copy(a.create_sub_buffer[DT](off, WTOK * BB_DIM), aw)
-            # the output projection's and fc2's biases ride the layer-scale residual, fc1's the GELU
-            var o = self.new(nrow * BB_DIM)
-            linear_into(self.wts, p + "attention.output.dense", a, nrow, BB_DIM, o, bias=False)
-            ctx.enqueue_function[bias_scale_add_kernel](
-                x, o, self.wts.w(p + "attention.output.dense.bias"), self.wts.w(p + "layer_scale1.lambda1"), Int64(BB_DIM),
-                grid_dim=(nrow, blocks(BB_DIM)), block_dim=TPB,
-            )
-            var h2 = self.new(nrow * BB_DIM)
-            layer_norm(self.wts, p + "norm2", x, h2, nrow, BB_DIM, BB_EPS)
-            var f1 = self.new(nrow * BB_FF)
-            linear_into(self.wts, p + "mlp.fc1", h2, nrow, BB_DIM, f1, bias=False)
-            ctx.enqueue_function[bias_act_v4_kernel[1]](
-                f1, self.wts.w(p + "mlp.fc1.bias"), Int64(BB_FF), grid_dim=(nrow, (BB_FF // 4 + V4_TPB - 1) // V4_TPB),
-                block_dim=V4_TPB,
-            )
-            var f2 = self.new(nrow * BB_DIM)
-            linear_into(self.wts, p + "mlp.fc2", f1, nrow, BB_FF, f2, bias=False)
-            ctx.enqueue_function[bias_scale_add_kernel](
-                x, f2, self.wts.w(p + "mlp.fc2.bias"), self.wts.w(p + "layer_scale2.lambda1"), Int64(BB_DIM),
-                grid_dim=(nrow, blocks(BB_DIM)), block_dim=TPB,
-            )
+                    if glob:
+                        flash_self[NWIN * NWIN * WTOK, HEADS, BB_DIM // HEADS, True](ctx, qkv, a)
+                    else:
+                        flash_self[WTOK, HEADS, BB_DIM // HEADS, True](ctx, qkv, a, NWIN * NWIN)
+                else:
+                    var q = linear(self.wts, p + "attention.attention.query", h, nrow, BB_DIM)
+                    var k = linear(self.wts, p + "attention.attention.key", h, nrow, BB_DIM)
+                    var v = linear(self.wts, p + "attention.attention.value", h, nrow, BB_DIM)
+                    if glob:
+                        a = mha(ctx, q, k, v, nrow, nrow, HEADS, BB_DIM // HEADS, nrow)
+                    else:
+                        a = self.new(nrow * BB_DIM)
+                        for w in range(NWIN * NWIN):
+                            var off = w * WTOK * BB_DIM
+                            var aw = mha(
+                                ctx, q.create_sub_buffer[DT](off, WTOK * BB_DIM), k.create_sub_buffer[DT](off, WTOK * BB_DIM),
+                                v.create_sub_buffer[DT](off, WTOK * BB_DIM), WTOK, WTOK, HEADS, BB_DIM // HEADS, WTOK,
+                            )
+                            ctx.enqueue_copy(a.create_sub_buffer[DT](off, WTOK * BB_DIM), aw)
+                # the output projection's and fc2's biases ride the layer-scale residual, fc1's the GELU
+                var o = self.new(nrow * BB_DIM)
+                linear_into(self.wts, p + "attention.output.dense", a, nrow, BB_DIM, o, bias=False)
+                ctx.enqueue_function[bias_scale_add_kernel](
+                    x, o, self.wts.w(p + "attention.output.dense.bias"), self.wts.w(p + "layer_scale1.lambda1"), Int64(BB_DIM),
+                    grid_dim=(nrow, blocks(BB_DIM)), block_dim=TPB,
+                )
+                var h2 = self.new(nrow * BB_DIM)
+                layer_norm(self.wts, p + "norm2", x, h2, nrow, BB_DIM, BB_EPS)
+                var f1 = self.new(nrow * BB_FF)
+                linear_into(self.wts, p + "mlp.fc1", h2, nrow, BB_DIM, f1, bias=False)
+                ctx.enqueue_function[bias_act_v4_kernel[1]](
+                    f1, self.wts.w(p + "mlp.fc1.bias"), Int64(BB_FF), grid_dim=(nrow, (BB_FF // 4 + V4_TPB - 1) // V4_TPB),
+                    block_dim=V4_TPB,
+                )
+                var f2 = self.new(nrow * BB_DIM)
+                linear_into(self.wts, p + "mlp.fc2", f1, nrow, BB_FF, f2, bias=False)
+                ctx.enqueue_function[bias_scale_add_kernel](
+                    x, f2, self.wts.w(p + "mlp.fc2.bias"), self.wts.w(p + "layer_scale2.lambda1"), Int64(BB_DIM),
+                    grid_dim=(nrow, blocks(BB_DIM)), block_dim=TPB,
+                )
             if keep_taps:
                 keep.append(_copy(ctx, x, nrow * BB_DIM))
             var t = is_tap(li)
@@ -315,6 +319,49 @@ struct RfDetr(Movable):
         if keep_taps:
             keep.append(_copy(ctx, cat, NTOK * 4 * BB_DIM))
         return self.projector(cat)
+
+    def _block_bf16(mut self, p: String, glob: Bool, x: DeviceBuffer[DT], nrow: Int) raises:
+        """One backbone block on bf16 tensor cores (SAM3_BF16; SAM 3's recipe): each
+        LayerNorm writes its GEMM's bf16 operand, q | k | v get their bias and the
+        bf16 rounding in one pass, the bf16 fused attention's output feeds the
+        output projection's bf16 GEMM, fc1's bias + GELU writes fc2's bf16 operand;
+        the residuals and their layer scale stay fp32."""
+        ref ctx = self.wts.ctx
+        comptime BF = DType.bfloat16
+        var hb = ctx.enqueue_create_buffer[BF](nrow * BB_DIM)
+        layer_norm_bf16(self.wts, p + "norm1", x, hb, nrow, BB_DIM, BB_EPS)
+        var qkv = self.new(nrow * 3 * BB_DIM)
+        linear_into_b(self.wts, p + "attention.attention.qkv", hb, nrow, BB_DIM, qkv, bias=False)
+        var qb = ctx.enqueue_create_buffer[BF](nrow * 3 * BB_DIM)
+        ctx.enqueue_function[bias_act_bf16_v4_kernel[0]](
+            qkv, self.wts.w(p + "attention.attention.qkv.bias"), qb, Int64(3 * BB_DIM),
+            grid_dim=(nrow, (3 * BB_DIM // 4 + TPB - 1) // TPB), block_dim=TPB,
+        )
+        var ab = ctx.enqueue_create_buffer[BF](nrow * BB_DIM)
+        if glob:
+            flash_self_bf16[NWIN * NWIN * WTOK, HEADS, BB_DIM // HEADS, True](ctx, qb, ab)
+        else:
+            flash_self_bf16[WTOK, HEADS, BB_DIM // HEADS, True](ctx, qb, ab, NWIN * NWIN)
+        var o = self.new(nrow * BB_DIM)
+        linear_into_b(self.wts, p + "attention.output.dense", ab, nrow, BB_DIM, o, bias=False)
+        ctx.enqueue_function[bias_scale_add_kernel](
+            x, o, self.wts.w(p + "attention.output.dense.bias"), self.wts.w(p + "layer_scale1.lambda1"), Int64(BB_DIM),
+            grid_dim=(nrow, blocks(BB_DIM)), block_dim=TPB,
+        )
+        var h2b = ctx.enqueue_create_buffer[BF](nrow * BB_DIM)
+        layer_norm_bf16(self.wts, p + "norm2", x, h2b, nrow, BB_DIM, BB_EPS)
+        var f1 = self.new(nrow * BB_FF)
+        linear_into_b(self.wts, p + "mlp.fc1", h2b, nrow, BB_DIM, f1, bias=False)
+        var fb = ctx.enqueue_create_buffer[BF](nrow * BB_FF)
+        ctx.enqueue_function[bias_act_bf16_v4_kernel[1]](
+            f1, self.wts.w(p + "mlp.fc1.bias"), fb, Int64(BB_FF), grid_dim=(nrow, (BB_FF // 4 + TPB - 1) // TPB), block_dim=TPB,
+        )
+        var f2 = self.new(nrow * BB_DIM)
+        linear_into_b(self.wts, p + "mlp.fc2", fb, nrow, BB_FF, f2, bias=False)
+        ctx.enqueue_function[bias_scale_add_kernel](
+            x, f2, self.wts.w(p + "mlp.fc2.bias"), self.wts.w(p + "layer_scale2.lambda1"), Int64(BB_DIM),
+            grid_dim=(nrow, blocks(BB_DIM)), block_dim=TPB,
+        )
 
     def projector(mut self, cat: DeviceBuffer[DT]) raises -> DeviceBuffer[DT]:
         """[1024, 1536] -> [1024, 256] (C2f + LayerNorm)."""
