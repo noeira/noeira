@@ -8,6 +8,7 @@
     var d1 = D1.load(DeviceContext(), dir)
     var answers = d1.system_one(state_json, True, questions_json)   # {"answers": {...}, "usage": {...}}
     var seen = d1.system_one(state_json, True, questions_json, pictures)   # with pictures (d1's `media`)
+    var heard = d1.system_one(state_json, True, questions_json, clips=clips)  # d1-Omni: heard clips (16 kHz mono)
 
 One forward per row of up to 16 questions (`prompt.pack_rows`), the answers
 read at each question's last token: the best log-probability among each
@@ -21,6 +22,11 @@ markup heads the user turn, before the state (`<|vision_start|>`, one
 `<|image|>` per 2x2 block of patches, `<|vision_end|>`, each picture in turn),
 so under `set` every question sees them; the tower runs once per call and its
 features fill the `<|image|>` tokens of every row.
+
+Clips (d1-Omni-2B, `D1.load(..., audio=True)`; `noeira.llm.lfm3.audio`): each
+clip's markup (`<|vision_start|>`, one `<|audio|>` per 80 ms, `<|vision_end|>`,
+d1's processor's) heads the user turn the same way, AFTER the pictures' (d1's
+`media` keeps the caller's order; here pictures come first, then clips).
 """
 
 from std.math import exp
@@ -28,7 +34,7 @@ from max.gpu.host import DeviceContext, DeviceBuffer
 
 from noeira.io.json import JsonWriter, load_json, parse_json, J_STRING
 from noeira.nn.constants import DT
-from noeira.llm.lfm3 import Lfm3Text, Lfm3Vision, Picture
+from noeira.llm.lfm3 import Lfm3Text, Lfm3Vision, Lfm3Audio, Picture
 from noeira.text.bpe import ByteLevelBPE
 from .prompt import (
     D1Question, D1Row, Q_NOUL, Q_CHOICE, Q_SCORE, parse_questions, py_json_dumps, prefix_text, suffix_text,
@@ -46,9 +52,15 @@ struct D1(Movable):
     """The rows of the last call (the gate compares them with d1's)."""
     var vision: Optional[Lfm3Vision]
     """The picture encoder (`D1.load(..., vision=True)`); None: text only."""
+    var audio: Optional[Lfm3Audio]
+    """The audio encoder (`D1.load(..., audio=True)`, an omni checkpoint); None: no clips."""
 
-    def __init__(out self, var lm: Lfm3Text, var tok: ByteLevelBPE, temperature: Float64, var vision: Optional[Lfm3Vision] = None):
+    def __init__(
+        out self, var lm: Lfm3Text, var tok: ByteLevelBPE, temperature: Float64, var vision: Optional[Lfm3Vision] = None,
+        var audio: Optional[Lfm3Audio] = None,
+    ):
         self.vision = vision^
+        self.audio = audio^
         self.lm = lm^
         self.tok = tok^
         self.temperature = temperature
@@ -56,11 +68,15 @@ struct D1(Movable):
         self.last_rows = List[D1Row]()
 
     @staticmethod
-    def load(var ctx: DeviceContext, dir: String, vision: Bool = False) raises -> D1:
-        """`vision`: load the picture encoder too (~0.4 GB more on the device)."""
+    def load(var ctx: DeviceContext, dir: String, vision: Bool = False, audio: Bool = False) raises -> D1:
+        """`vision`: load the picture encoder too (~0.4 GB more on the device);
+        `audio`: the audio encoder (d1-Omni, ~0.2 GB)."""
         var vis = Optional[Lfm3Vision](None)
         if vision:
             vis = Optional(Lfm3Vision.load(ctx, dir))
+        var aud = Optional[Lfm3Audio](None)
+        if audio:
+            aud = Optional(Lfm3Audio.load(ctx, dir))
         var lm = Lfm3Text.load(ctx^, dir)
         var tok = ByteLevelBPE.load(dir + "/tokenizer.json")
         var cal = load_json(dir + "/calibration.json")
@@ -68,15 +84,17 @@ struct D1(Movable):
         var per = cal.field(cal.root(), "temperatures")
         if per >= 0 and cal.size(per) > 0:
             raise Error("d1: per-bucket temperatures are not implemented")
-        return D1(lm^, tok^, t, vis^)
+        return D1(lm^, tok^, t, vis^, aud^)
 
     def system_one(
         mut self, state: String, state_is_json: Bool, questions_json: String,
-        pictures: List[Picture] = List[Picture](),
+        pictures: List[Picture] = List[Picture](), clips: List[List[Float32]] = List[List[Float32]](),
     ) raises -> String:
         """`state`: text, or a JSON value (`state_is_json`); `questions_json`:
         `{name: {type, instructions, criteria}}`; `pictures`: what the state
-        shows (needs `D1.load(..., vision=True)`). Returns d1's answer JSON."""
+        shows (needs `D1.load(..., vision=True)`); `clips`: what was heard, 16
+        kHz mono samples in [-1, 1] (needs `D1.load(..., audio=True)`). Returns
+        d1's answer JSON."""
         var block: String
         if state_is_json:
             var sd = parse_json(_bytes(state))
@@ -98,6 +116,16 @@ struct D1(Movable):
                 media += vis.markup(pic, "<|image|>", "<|vision_start|>", "<|vision_end|>")
             feats = Optional(vis.encode_all(pictures))
             image_token = vis.cfg.image_token
+        var afeats = Optional[DeviceBuffer[DT]](None)
+        var audio_token = -1
+        if len(clips) > 0:
+            if not self.audio:
+                raise Error("d1: clips need the audio encoder (D1.load(..., audio=True), an omni checkpoint)")
+            ref aud = self.audio.value()
+            for ref c in clips:
+                media += aud.markup(len(c), "<|audio|>", "<|vision_start|>", "<|vision_end|>")
+            afeats = Optional(aud.encode_all(clips))
+            audio_token = aud.cfg.audio_token
         var prefix = prefix_text(self.tok, block, media)
         var suffixes = List[String]()
         for q in qs:
@@ -111,6 +139,7 @@ struct D1(Movable):
             var taps = List[DeviceBuffer[DT]]()
             var h = self.lm.forward(
                 row.ids, row.groups, row.state_len, taps, image_feats=feats.copy(), image_token=image_token,
+                audio_feats=afeats.copy(), audio_token=audio_token,
             )
             var logz = self.lm.slot_logz(h, len(row.ids), row.slots)
             for s in range(len(row.slots)):

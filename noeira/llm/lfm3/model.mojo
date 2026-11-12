@@ -520,11 +520,14 @@ struct Lfm3Text(Movable):
         mut self, ids: List[Int], groups: List[Int], state_len: Int,
         mut taps: List[DeviceBuffer[DT]], keep_taps: Bool = False, causal_full: Bool = False,
         image_feats: Optional[DeviceBuffer[DT]] = None, image_token: Int = -1,
+        audio_feats: Optional[DeviceBuffer[DT]] = None, audio_token: Int = -1,
     ) raises -> DeviceBuffer[DT]:
         """`[T, hidden]` after the final norm. `taps` (with `keep_taps`): the
         embedding, then each layer's output. `image_feats` (LFM3-VL,
         `Lfm3Vision.encode_all`): one row per `image_token` in `ids`, in order,
-        written over those tokens' embeddings (transformers' `masked_scatter`)."""
+        written over those tokens' embeddings (transformers' `masked_scatter`);
+        `audio_feats` (LFM3-Omni, `Lfm3Audio.encode_all`) the same over the
+        `audio_token`s."""
         var t = len(ids)
         var dm = self.cfg.hidden
         var hd = self.cfg.head_dim
@@ -544,25 +547,9 @@ struct Lfm3Text(Movable):
             did, self.w("embed_tokens.weight"), x, Int64(dm), grid_dim=(_blocks(dm), t), block_dim=TPB,
         )
         if image_feats:
-            var at = List[Int]()
-            for i in range(t):
-                if ids[i] == image_token:
-                    at.append(i)
-            var feats = image_feats.value()
-            if len(at) * dm != len(feats):
-                raise Error(
-                    "lfm3: " + String(len(at)) + " image tokens in the prompt for " + String(len(feats) // dm)
-                    + " rows of image features"
-                )
-            if len(at) > 0:
-                var hp = self.ctx.enqueue_create_host_buffer[DType.int32](len(at))
-                for i in range(len(at)):
-                    hp[i] = Int32(at[i])
-                var dp = self.ctx.enqueue_create_buffer[DType.int32](len(at))
-                self.ctx.enqueue_copy(dp, hp)
-                self.ctx.enqueue_function[put_rows_kernel](
-                    feats, dp, x, Int64(dm), grid_dim=(_blocks(dm), len(at)), block_dim=TPB,
-                )
+            self._scatter(x, ids, image_feats.value(), image_token, "image")
+        if audio_feats:
+            self._scatter(x, ids, audio_feats.value(), audio_token, "audio")
         if keep_taps:
             taps.append(self._copy(x, t * dm))
         var full_prf = 1.0 if (self.debug & 2) != 0 else self.cfg.prf_full
@@ -674,6 +661,30 @@ struct Lfm3Text(Movable):
         var out = self.new(t * dm)
         self.rms("embedding_norm", x, out, t, dm)
         return out^
+
+    def _scatter(self, x: DeviceBuffer[DT], ids: List[Int], feats: DeviceBuffer[DT], token: Int, what: String) raises:
+        """`x[i] = feats[k]` for the k-th `token` in `ids` (a media encoder's rows
+        over its placeholders' embeddings)."""
+        var dm = self.cfg.hidden
+        var at = List[Int]()
+        for i in range(len(ids)):
+            if ids[i] == token:
+                at.append(i)
+        if len(at) * dm != len(feats):
+            raise Error(
+                "lfm3: " + String(len(at)) + " " + what + " tokens in the prompt for " + String(len(feats) // dm)
+                + " rows of " + what + " features"
+            )
+        if len(at) == 0:
+            return
+        var hp = self.ctx.enqueue_create_host_buffer[DType.int32](len(at))
+        for i in range(len(at)):
+            hp[i] = Int32(at[i])
+        var dp = self.ctx.enqueue_create_buffer[DType.int32](len(at))
+        self.ctx.enqueue_copy(dp, hp)
+        self.ctx.enqueue_function[put_rows_kernel](
+            feats, dp, x, Int64(dm), grid_dim=(_blocks(dm), len(at)), block_dim=TPB,
+        )
 
     def slot_logz(mut self, h: DeviceBuffer[DT], t: Int, slots: List[Int]) raises -> List[Float32]:
         """`log_softmax(h[slot] @ embed^T)` for each slot: `[S, vocab]` on the host."""

@@ -6,4 +6,5 @@ parameters and is not an `nn` module, and the WAV container stays in
 """
 
 from .mel import LogMel, slaney_mel_filterbank, hann_window
+from .lfm3_mel import Lfm3LogMel, hf_mel_filter_bank
 from .espeak import EspeakNG

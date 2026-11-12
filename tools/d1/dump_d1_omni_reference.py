@@ -25,6 +25,7 @@ Per case (`<out>/<case>/`):
                               each question's suffix (text), for the tokenizer gate
     wave.npy                  the waveform the processor took (16 kHz, float32) [N]
     mel.npy                   input_features                       [128, F]
+    mel_f64.npy               the same in float64, numpy's rfft (`mel_f64`: the tight gate) [128, F]
     mel_mask.npy              feature_attention_mask               [F] int32
     down.npy                  the downsampler's output             [T_a, 768]
     enc_layer<l>.npy          encoder layer l's output, l = 0..16  [T_a, 768]
@@ -41,7 +42,8 @@ Per case (`<out>/<case>/`):
 The cases: a clip as the request's media and the room's questions (did the
 speaker address the robot, where should it walk, how urgent) — in English
 ("walk to the fridge"), French ("va près du canapé") and an English negation
-("don't go to the door"). `--sweep` also writes `<out>/sweep.json`: the same
+("don't go to the door"), and `heard_long`, the three joined (past the encoder's
+32-token window). `--sweep` also writes `<out>/sweep.json`: the same
 questions over every clip of the manifest, answers only, each clip HEARD and
 WRITTEN (its transcript as the state's "heard", no audio) — the step-3
 comparison against Parakeet -> d1 reads it.
@@ -74,11 +76,34 @@ QUESTIONS = {
                 "criteria": ["not urgent", "somewhat urgent", "very urgent"]},
 }
 
-CASES = {"heard_en": "en_13.wav", "heard_fr": "fr_05.wav", "heard_neg": "en_17.wav"}
+CASES = {"heard_en": ["en_13.wav"], "heard_fr": ["fr_05.wav"], "heard_neg": ["en_17.wav"],
+         "heard_long": ["en_13.wav", "fr_05.wav", "en_17.wav"]}
+"""Each case's clips, joined by 0.4 s of digital silence into ONE clip. `heard_long` (~5 s, ~60 tokens) is
+the case longer than the encoder's sliding window (32 tokens, 2.56 s): the short ones never reach it."""
 
 
 def save(out, name, x):
-    np.save(os.path.join(out, name), x.detach().float().numpy() if torch.is_tensor(x) else x)
+    # C order always: a transposed tensor would be saved column-major (`fortran_order`), which noeira's reader refuses
+    np.save(os.path.join(out, name), np.ascontiguousarray(x.detach().float().numpy() if torch.is_tensor(x) else x))
+
+
+def mel_f64(fe, wave):
+    """The same features in FLOAT64 by an independent route (numpy's rfft, the extractor's own filter bank cast to
+    float32 as it casts it): the reference's float32 STFT has no digits left in the mel bins with ~1e-10 of power
+    (7.8e-4 off there, 3e-5 above 1e-8), so the port is gated against this, and against the reference with a split
+    bound."""
+    import torch
+
+    w = np.asarray(wave, dtype=np.float64)
+    w = np.pad(w, (0, fe.pad_length(len(w)) - len(w)))
+    frames = 1 + (len(w) - fe.n_fft) // fe.hop_length
+    win = torch.hann_window(fe.win_length).double().numpy()
+    seg = np.stack([w[t * fe.hop_length: t * fe.hop_length + fe.n_fft] * win for t in range(frames)])
+    power = np.abs(np.fft.rfft(seg, axis=1)) ** 2
+    mel = fe.mel_filters.astype(np.float32).astype(np.float64).T @ power.T
+    with np.errstate(divide="ignore"):
+        lg = np.maximum(np.log10(mel), fe.log_floor)
+    return (lg + fe.normalization_offset) / fe.normalization_divisor
 
 
 def main():
@@ -142,8 +167,13 @@ def main():
         hooks.append(layer.register_forward_hook(keep(("lm", li))))
 
     for name in args.cases.split(","):
-        clip = os.path.join(args.clips, CASES[name])
-        media = [{"type": "audio", "path": clip}]
+        read_audio = importlib.import_module(pkg + ".media").read_audio
+        parts = [read_audio(os.path.join(args.clips, f), 16000) for f in CASES[name]]
+        if any(rate != 16000 or w.shape[0] != 1 for w, rate in parts):
+            raise ValueError("the room clips are 16 kHz mono")
+        gap = np.zeros(6400, dtype=np.float32)
+        wave = np.concatenate([x for k, (w, _) in enumerate(parts) for x in ((gap,) if k else ()) + (w[0],)])
+        media = [{"type": "audio", "audio": wave, "sampling_rate": 16000}]
         out = os.path.join(args.out, name)
         os.makedirs(out, exist_ok=True)
         answers = model.system_one(ROOM_STATE, QUESTIONS, media=media)
@@ -156,8 +186,9 @@ def main():
         suffixes, offsets, _ = eng._suffixes(qs)
         with open(os.path.join(out, "prompt.json"), "w") as f:
             json.dump({"prefix": prefix, "suffixes": suffixes, "slot_offsets": offsets, "names": list(QUESTIONS),
-                       "clip": CASES[name]}, f, ensure_ascii=False, indent=1)
+                       "clips": CASES[name]}, f, ensure_ascii=False, indent=1)
         np.save(os.path.join(out, "wave.npy"), np.asarray(eng.media._decoded(items[0]), dtype=np.float32))
+        np.save(os.path.join(out, "mel_f64.npy"), mel_f64(eng.processor.feature_extractor, wave))
 
         seqs = eng._sequences([(ROOM_STATE, qs, media)])
         for r, (_, k, ids, state_len, question, ends, inputs) in enumerate(seqs):
