@@ -2,7 +2,8 @@
 # | hhtools trajectories for Berkeley Humanoid Lite → SuperMimic's library
 # +--------------------------------------------------------------------------+ #
 """Retargeted clips (RoboParty's hhtools, robot `berkeley_humanoid_lite`) into a
-SuperMimic library store for `BhlRobot`.
+SuperMimic library store for `BhlRobot`, or, with `--robot g1`, clips for the
+29-DoF Unitree G1 in the same CSV format into a store for `G1MjlabRobot`.
 
     pixi run mojo run -I . examples/bhl/retarget_import.mojo --csv-dir DIR --out bhl_50hz.h5
 
@@ -18,6 +19,7 @@ Options
 --csv-dir DIR    every `*.csv` under DIR (one level of sub-folders included), sorted
 --list FILE      or the CSV paths FILE lists, one per line
 --out PATH       the store (default bhl_50hz.h5); its manifest is PATH.manifest.csv
+--robot NAME     bhl (default) or g1: whose joints the CSVs must carry, by name
 --max-clips N    stop after N files (0 = all)
 --keep-lift      keep hhtools' `playback_mesh_z_lift` in the root height
 --force          overwrite an existing store
@@ -32,6 +34,7 @@ from std.time import perf_counter_ns
 from noeira.core.bytes import string_from_bytes
 from noeira.data.retarget_csv import import_retarget_clips
 from noeira.envs.robots.berkeley_humanoid_lite_pd import BHL_N_DOF, bhl_dof_name
+from noeira.envs.robots.unitree_g1_mjlab_pd import G1M_N_DOF, g1m_dof_name
 from noeira.io.fileio import read_file_bytes
 
 
@@ -98,14 +101,23 @@ def main() raises:
     if len(paths) == 0:
         raise Error("no CSV selected")
 
+    var robot = _opt(args, String("--robot"), String("bhl"))
+    if robot != "bhl" and robot != "g1":
+        raise Error("--robot is bhl or g1, not " + robot)
     var joints = List[String]()
-    for j in range(BHL_N_DOF):
-        joints.append(String(bhl_dof_name(j)))
+    if robot == "g1":
+        for j in range(G1M_N_DOF):
+            joints.append(String(g1m_dof_name(j)))
+    else:
+        for j in range(BHL_N_DOF):
+            joints.append(String(bhl_dof_name(j)))
     var keep_lift = _flag(args, String("--keep-lift"))
-    print("hhtools (Berkeley Humanoid Lite) -> SuperMimic library: " + String(len(paths)) + " clips -> " + out)
+    var label = String("Unitree G1") if robot == "g1" else String("Berkeley Humanoid Lite")
+    var env_id = String("unitree_g1_retarget_50hz") if robot == "g1" else String("berkeley_humanoid_lite_retarget_50hz")
+    print("retarget CSVs (" + label + ") -> SuperMimic library: " + String(len(paths)) + " clips -> " + out)
     var t0 = perf_counter_ns()
     var s = import_retarget_clips(
-        paths, joints, out, out + ".manifest.csv", String("berkeley_humanoid_lite_retarget_50hz"),
+        paths, joints, out, out + ".manifest.csv", env_id,
         remove_lift=not keep_lift,
     )
     print(
