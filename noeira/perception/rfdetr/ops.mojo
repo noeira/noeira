@@ -8,8 +8,11 @@ pieces — the safetensors weights, linear, LayerNorm, GELU, `mha` — are
 `sam3.ops`'.
 """
 
-from std.math import exp, floor
+from std.math import exp, floor, sin, cos
+from std.memory import stack_allocation
 from max.gpu import thread_idx, block_idx, global_idx
+from max.gpu.sync import barrier
+from max.gpu.memory import AddressSpace
 from max.gpu.host import DeviceContext, DeviceBuffer
 
 from noeira.nn.constants import DT
@@ -202,6 +205,107 @@ def gather_rows_kernel(src: Ptr, idx: IPtr, dst: Ptr, cols_n: Int64):
     if c < cols:
         var i = Int(block_idx.x)
         dst[unsafe_offset=i * cols + c] = src[unsafe_offset=Int(idx[unsafe_offset=i]) * cols + c]
+
+
+def row_max_kernel(x: Ptr, dst: Ptr, rows_n: Int64, cols_n: Int64):
+    """`dst[r] = max_c x[r, c]` (the two-stage's best class logit a token; the
+    host loop's order: start at column 0). Grid `ceil(rows / TPB)`."""
+    var r = Int(global_idx.x)
+    if r < Int(rows_n):
+        var cols = Int(cols_n)
+        var m = x[unsafe_offset=r * cols]
+        for c in range(1, cols):
+            m = max(m, x[unsafe_offset=r * cols + c])
+        dst[unsafe_offset=r] = m
+
+
+comptime TOPK_N: Int = 1024
+"""The two-stage's tokens (32 x 32): one block sorts them all."""
+
+
+def topk_kernel(v: Ptr, idx: IPtr, k_n: Int64):
+    """The `k` largest of `v[0 : 1024]`, descending, ties to the LOWER index —
+    `rfdetr`'s `torch.topk` on the max logits (sorted) — by one block's bitonic sort of
+    (value, index) in shared memory. One block of 1024 threads."""
+    var t = Int(thread_idx.x)
+    var sv = stack_allocation[TOPK_N, Scalar[DT], address_space=AddressSpace.SHARED]()
+    var si = stack_allocation[TOPK_N, Scalar[DType.int32], address_space=AddressSpace.SHARED]()
+    sv[t] = v[unsafe_offset=t]
+    si[t] = Int32(t)
+    barrier()
+    var k = 2
+    while k <= TOPK_N:
+        var j = k // 2
+        while j > 0:
+            var l = t ^ j
+            if l > t:
+                var vt = sv[t]
+                var vl = sv[l]
+                var it = si[t]
+                var il = si[l]
+                # "first" = larger value, or the same value and the lower index
+                var l_first = vl > vt or (vl == vt and il < it)
+                var t_first = vt > vl or (vt == vl and it < il)
+                if ((t & k) == 0 and l_first) or ((t & k) != 0 and t_first):
+                    sv[t] = vl
+                    sv[l] = vt
+                    si[t] = il
+                    si[l] = it
+            barrier()
+            j //= 2
+        k *= 2
+    if t < Int(k_n):
+        idx[unsafe_offset=t] = si[t]
+
+
+def propose_kernel(d: Ptr, idx: IPtr, refpoint: Ptr, dst: Ptr, grid_n: Int64):
+    """The decoder's reference boxes [k, 4] (cxcywh): the two-stage deltas `d` on
+    the fixed anchor of token `idx[i]` ((x + 0.5) / G, (y + 0.5) / G, 0.05,
+    0.05), then the learned `refpoint[i]` composed onto that (both bbox_reparam:
+    `xy = d_xy wh + xy`, `wh = exp(d_wh) wh`) — the host code's operations.
+    Grid `ceil(k / TPB)`."""
+    var i = Int(global_idx.x)
+    if i >= 100:
+        return
+    var G = Int(grid_n)
+    var n = Int(idx[unsafe_offset=i])
+    var ax = (Scalar[DT](n % G) + Scalar[DT](0.5)) / Scalar[DT](G)
+    var ay = (Scalar[DT](n // G) + Scalar[DT](0.5)) / Scalar[DT](G)
+    var aw = Scalar[DT](0.05)
+    var ah = Scalar[DT](0.05)
+    var tx = d[unsafe_offset=i * 4] * aw + ax
+    var ty = d[unsafe_offset=i * 4 + 1] * ah + ay
+    var tw = exp(d[unsafe_offset=i * 4 + 2]) * aw
+    var th = exp(d[unsafe_offset=i * 4 + 3]) * ah
+    dst[unsafe_offset=i * 4] = refpoint[unsafe_offset=i * 4] * tw + tx
+    dst[unsafe_offset=i * 4 + 1] = refpoint[unsafe_offset=i * 4 + 1] * th + ty
+    dst[unsafe_offset=i * 4 + 2] = exp(refpoint[unsafe_offset=i * 4 + 2]) * tw
+    dst[unsafe_offset=i * 4 + 3] = exp(refpoint[unsafe_offset=i * 4 + 3]) * th
+
+
+def sine_kernel(rb: Ptr, dim_t: Ptr, dst: Ptr):
+    """`gen_sineembed_for_position` [k, 512] on the device: per box its y, x, w,
+    h encodings, `a = (c 2 pi) / dim_t[i]`, sin at even i, cos at odd (`gen_sineembed_for_position`'s
+    operations: the scale first, then the division). Grid `(4, k)`, 128 threads."""
+    var i = Int(thread_idx.x)
+    var s = Int(block_idx.x)
+    var q = Int(block_idx.y)
+    var src = 1 if s == 0 else (0 if s == 1 else s)
+    var c = rb[unsafe_offset=q * 4 + src] * Scalar[DT](6.283185307179586)
+    var a = c / dim_t[unsafe_offset=i]
+    dst[unsafe_offset=(q * 4 + s) * 128 + i] = sin(a) if i % 2 == 0 else cos(a)
+
+
+def boxes_kernel(d: Ptr, rb: Ptr, dst: Ptr):
+    """The final boxes [k, 4]: the head's deltas on the reference boxes
+    (bbox_reparam). Grid `ceil(k / TPB)`."""
+    var i = Int(global_idx.x)
+    if i >= 100:
+        return
+    dst[unsafe_offset=i * 4] = d[unsafe_offset=i * 4] * rb[unsafe_offset=i * 4 + 2] + rb[unsafe_offset=i * 4]
+    dst[unsafe_offset=i * 4 + 1] = d[unsafe_offset=i * 4 + 1] * rb[unsafe_offset=i * 4 + 3] + rb[unsafe_offset=i * 4 + 1]
+    dst[unsafe_offset=i * 4 + 2] = exp(d[unsafe_offset=i * 4 + 2]) * rb[unsafe_offset=i * 4 + 2]
+    dst[unsafe_offset=i * 4 + 3] = exp(d[unsafe_offset=i * 4 + 3]) * rb[unsafe_offset=i * 4 + 3]
 
 
 def add_scalar_kernel(x: Ptr, b: Ptr, n_n: Int64):

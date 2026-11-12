@@ -140,8 +140,8 @@ def main() raises:
     var raw = det.decode(src)
     ctx.synchronize()
     print("  two-stage + decoder + heads + masks:", (perf_counter_ns() - t2) // 1_000_000, "ms")
-    _ = gate(fails, "two-stage logits [1024, 91]", f64(det.enc_logits), load_npy_f64(R + "/enc_cls.npy"))
-    _ = gate(fails, "reference boxes [100, 4] (top-100 order included)", f64(det.dec_ref), load_npy_f64(R + "/dec_ref.npy"))
+    _ = gate(fails, "two-stage logits [1024, 91]", f64(det.enc_logits_host()), load_npy_f64(R + "/enc_cls.npy"))
+    _ = gate(fails, "reference boxes [100, 4] (top-100 order included)", f64(det.dec_ref_host()), load_npy_f64(R + "/dec_ref.npy"))
     _ = gate(fails, "query_pos [100, 256]", down(ctx, det.query_pos, 100 * 256), load_npy_f64(R + "/query_pos.npy"))
     for l in range(4):
         _ = gate(fails, String("decoder layer ") + String(l), down(ctx, det.dec_layers[l], 100 * 256), load_npy_f64(R + "/dec_layer" + String(l) + ".npy"))

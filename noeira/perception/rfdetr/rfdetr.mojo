@@ -75,6 +75,7 @@ from .ops import (
     patchify_kernel, window_embed_kernel, unwindow_kernel, scale_add_kernel, bias_scale_add_kernel, silu_kernel, copy_cols_kernel,
     gather_rows_kernel, add_scalar_kernel, msda_kernel, dwconv3x3_kernel, upsample_bilinear_kernel,
     V4_TPB, dw_taps_kernel, dwconv3x3_v4_kernel, bias_gelu_add_kernel, upsample_bilinear_v4_kernel, bias_act_v4_kernel,
+    row_max_kernel, topk_kernel, TOPK_N, propose_kernel, sine_kernel, boxes_kernel,
     conv_taps, conv3x3_tm,
 )
 
@@ -153,9 +154,11 @@ struct RfDetr(Movable):
     var refpoint: List[Float32]
     """`refpoint_embed[:100]` [100, 4] (host)."""
     var debug: Int
-    # what the last forward kept, for the stage gates
-    var enc_logits: List[Float32]
-    var dec_ref: List[Float32]
+    var dim_t: DeviceBuffer[DT]
+    """The sine encoding's 128 divisors (the host's powf values)."""
+    # what the last forward kept, for the stage gates (device: read back only by `*_host`)
+    var enc_cls: DeviceBuffer[DT]
+    var dec_ref_dev: DeviceBuffer[DT]
     var query_pos: DeviceBuffer[DT]
     var dec_layers: List[DeviceBuffer[DT]]
 
@@ -185,11 +188,24 @@ struct RfDetr(Movable):
                 parts.append(a + "value")
                 self.wts.concat(a + "qkv", parts)
         self.refpoint = List[Float32]()
-        self.enc_logits = List[Float32]()
-        self.dec_ref = List[Float32]()
+        self.dim_t = self.wts.ctx.enqueue_create_buffer[DT](1)
+        self.enc_cls = self.wts.ctx.enqueue_create_buffer[DT](1)
+        self.dec_ref_dev = self.wts.ctx.enqueue_create_buffer[DT](1)
         self.query_pos = self.wts.ctx.enqueue_create_buffer[DT](1)
         self.dec_layers = List[DeviceBuffer[DT]]()
         self.refpoint = self._down(self.wts.w("refpoint_embed.weight"), NQ * 4)  # (methods need every field set)
+        var dt = List[Float32](capacity=128)
+        for i in range(128):
+            dt.append(pow(Float32(10000.0), Float32(2 * (i // 2)) / Float32(128)))
+        self.dim_t = self._up(dt)
+
+    def enc_logits_host(self) raises -> List[Float32]:
+        """The last forward's two-stage logits [1024, 91] (a read-back: the gates')."""
+        return self._down(self.enc_cls, NTOK * NCLS)
+
+    def dec_ref_host(self) raises -> List[Float32]:
+        """The last forward's reference boxes [100, 4] (a read-back: the gates')."""
+        return self._down(self.dec_ref_dev, NQ * 4)
 
     def new(self, n: Int) raises -> DeviceBuffer[DT]:
         return self.wts.ctx.enqueue_create_buffer[DT](n)
@@ -441,41 +457,24 @@ struct RfDetr(Movable):
         var pre = linear(self.wts, T + "enc_output.0", src, NTOK, D)
         var normed = self._ln_new(T + "enc_output_norm.0", pre, NTOK, D, TR_EPS)
         var cls = linear(self.wts, T + "enc_out_class_embed.0", normed, NTOK, D)
-        self.enc_logits = self._down(cls, NTOK * NCLS)
-        var best = List[Float32](capacity=NTOK)
-        for n in range(NTOK):
-            var m = self.enc_logits[n * NCLS]
-            for c in range(1, NCLS):
-                m = max(m, self.enc_logits[n * NCLS + c])
-            best.append(m)
-        var top = _top_k(best, NQ)
-        var hidx = ctx.enqueue_create_host_buffer[DType.int32](NQ)
-        for i in range(NQ):
-            hidx[i] = Int32(top[i])
+        self.enc_cls = cls
+        # everything to the decoder's input stays on the device (no host round trip): the best class
+        # logit a token, the top 100 (one block's bitonic sort), their rows, the deltas, the boxes
+        var best = self.new(NTOK)
+        ctx.enqueue_function[row_max_kernel](cls, best, Int64(NTOK), Int64(NCLS), grid_dim=blocks(NTOK), block_dim=TPB)
         var didx = ctx.enqueue_create_buffer[DType.int32](NQ)
-        ctx.enqueue_copy(didx, hidx)
+        ctx.enqueue_function[topk_kernel](best, didx, Int64(NQ), grid_dim=1, block_dim=TOPK_N)
         var tgt_ts = self.new(NQ * D)
         ctx.enqueue_function[gather_rows_kernel](normed, didx, tgt_ts, Int64(D), grid_dim=(NQ, blocks(D)), block_dim=TPB)
-        var dts = self._down(self._mlp(T + "enc_out_bbox_embed.0", tgt_ts, NQ, D, 3), NQ * 4)
-        var refb = List[Float32](capacity=NQ * 4)
-        for i in range(NQ):
-            var n = top[i]
-            var ax = (Float32(n % GRID) + Float32(0.5)) / Float32(GRID)
-            var ay = (Float32(n // GRID) + Float32(0.5)) / Float32(GRID)
-            var aw = Float32(0.05)
-            var ah = Float32(0.05)
-            # the proposal, then the learned refpoint composed onto it (both bbox_reparam)
-            var tx = dts[i * 4] * aw + ax
-            var ty = dts[i * 4 + 1] * ah + ay
-            var tw = exp(dts[i * 4 + 2]) * aw
-            var th = exp(dts[i * 4 + 3]) * ah
-            refb.append(self.refpoint[i * 4] * tw + tx)
-            refb.append(self.refpoint[i * 4 + 1] * th + ty)
-            refb.append(exp(self.refpoint[i * 4 + 2]) * tw)
-            refb.append(exp(self.refpoint[i * 4 + 3]) * th)
-        self.dec_ref = refb.copy()
-        var dref = self._up(refb)
-        self.query_pos = self._mlp(T + "decoder.ref_point_head", self._up(_sine(refb)), NQ, 2 * D, 2)
+        var dts = self._mlp(T + "enc_out_bbox_embed.0", tgt_ts, NQ, D, 3)
+        var dref = self.new(NQ * 4)
+        ctx.enqueue_function[propose_kernel](
+            dts, didx, self.wts.w("refpoint_embed.weight"), dref, Int64(GRID), grid_dim=1, block_dim=128,
+        )
+        self.dec_ref_dev = dref
+        var sine = self.new(NQ * 2 * D)
+        ctx.enqueue_function[sine_kernel](dref, self.dim_t, sine, grid_dim=(4, NQ), block_dim=128)
+        self.query_pos = self._mlp(T + "decoder.ref_point_head", sine, NQ, 2 * D, 2)
         # decoder
         var out = self.new(NQ * D)
         ctx.enqueue_copy(out, self.wts.w("query_feat.weight").create_sub_buffer[DT](0, NQ * D))
@@ -507,16 +506,21 @@ struct RfDetr(Movable):
             out = self._ln_new(p + "norm3", self._sum(out2, f2, NQ * D), NQ, D, TR_EPS)
             self.dec_layers.append(_copy(ctx, out, NQ * D))
             hs.append(self._ln_new(T + "decoder.norm", out, NQ, D, TR_EPS))
-        # heads
-        var logits = self._down(linear(self.wts, "class_embed", hs[DEC_LAYERS - 1], NQ, D), NQ * NCLS)
-        var dl = self._down(self._mlp("bbox_embed", hs[DEC_LAYERS - 1], NQ, D, 3), NQ * 4)
-        var boxes = List[Float32](capacity=NQ * 4)
-        for i in range(NQ):
-            boxes.append(dl[i * 4] * refb[i * 4 + 2] + refb[i * 4])
-            boxes.append(dl[i * 4 + 1] * refb[i * 4 + 3] + refb[i * 4 + 1])
-            boxes.append(exp(dl[i * 4 + 2]) * refb[i * 4 + 2])
-            boxes.append(exp(dl[i * 4 + 3]) * refb[i * 4 + 3])
+        # heads, the mask head, then ONE read-back (logits and boxes) for the host's post-processing
+        var lg = linear(self.wts, "class_embed", hs[DEC_LAYERS - 1], NQ, D)
+        var dl = self._mlp("bbox_embed", hs[DEC_LAYERS - 1], NQ, D, 3)
+        var bx = self.new(NQ * 4)
+        ctx.enqueue_function[boxes_kernel](dl, dref, bx, grid_dim=1, block_dim=128)
         var masks = self.mask_head(src, hs[DEC_LAYERS - 1])
+        var hl = ctx.enqueue_create_host_buffer[DT](NQ * NCLS)
+        var hb = ctx.enqueue_create_host_buffer[DT](NQ * 4)
+        ctx.enqueue_copy(hl, lg)
+        ctx.enqueue_copy(hb, bx)
+        ctx.synchronize()
+        var logits = List[Float32](unsafe_uninit_length=NQ * NCLS)
+        unsafe_memcpy(dest=logits.unsafe_ptr(), src=hl.unsafe_ptr(), count=NQ * NCLS)
+        var boxes = List[Float32](unsafe_uninit_length=NQ * 4)
+        unsafe_memcpy(dest=boxes.unsafe_ptr(), src=hb.unsafe_ptr(), count=NQ * 4)
         return RfDetrRaw(logits^, boxes^, masks^, hs^)
 
     # ── 7. masks ──────────────────────────────────────────────────────────
@@ -675,39 +679,6 @@ def _sort_desc(mut idx: List[Int], mut val: List[Float32]):
             idx[k] = i2[k]
             val[k] = v2[k]
         width *= 2
-
-
-def _top_k(v: List[Float32], k: Int) -> List[Int]:
-    """The indices of the `k` largest, descending; ties to the lower index."""
-    var idx = List[Int]()
-    var used = List[Bool](length=len(v), fill=False)
-    for _ in range(k):
-        var b = -1
-        for i in range(len(v)):
-            if not used[i] and (b < 0 or v[i] > v[b]):
-                b = i
-        used[b] = True
-        idx.append(b)
-    return idx^
-
-
-def _sine(ref_boxes: List[Float32]) -> List[Float32]:
-    """`gen_sineembed_for_position(ref, 128)`: per box its y, x, w, h encodings,
-    `a_i = c 2 pi / 1e4^(2 (i // 2) / 128)`, sin at even i, cos at odd -> [100, 512]."""
-    comptime NF = 128
-    var dim_t = List[Float32](capacity=NF)
-    for i in range(NF):
-        dim_t.append(pow(Float32(10000.0), Float32(2 * (i // 2)) / Float32(NF)))
-    var scale = Float32(6.283185307179586)
-    var order: List[Int] = [1, 0, 2, 3]
-    var out = List[Float32](capacity=len(ref_boxes) // 4 * 4 * NF)
-    for q in range(len(ref_boxes) // 4):
-        for s in range(4):
-            var c = ref_boxes[q * 4 + order[s]] * scale
-            for i in range(NF):
-                var a = c / dim_t[i]
-                out.append(sin(a) if i % 2 == 0 else cos(a))
-    return out^
 
 
 def _copy(ctx: DeviceContext, x: DeviceBuffer[DT], n: Int) raises -> DeviceBuffer[DT]:
