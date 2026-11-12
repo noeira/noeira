@@ -11,8 +11,9 @@ The frame: NYU labelled 921 (the depth registered to the RGB). Gates:
      caller's `start` / `poll` never block long (< 5 ms);
   2. per word the detections rfdetr made of its COCO class at 0.3 (bed 1,
      couch 1, dining table 1, refrigerator 0), mask IoU >= 0.999 against
-     rfdetr's masks;
-  3. each detection's 3D place (`mask_place`) within 1 mm of rfdetr's mask's;
+     rfdetr's masks (0.99 in a TF32 / bf16 build);
+  3. each detection's 3D place (`mask_place`) within 1 mm of rfdetr's mask's
+     (5 mm in TF32 / bf16);
   4. a word COCO does not have ("door") fails at `start`, naming why.
 """
 
@@ -28,8 +29,13 @@ from noeira.io.npy import load_npy_f64
 from noeira.perception.depth import DepthCameraSpec
 from noeira.perception.detections import mask_place
 from noeira.perception.rfdetr.service import RfDetrService, coco_id
+from noeira.perception.sam3.ops import SAM3_TF32
 
 
+comptime IOU_BOUND: Float64 = 0.99 if SAM3_TF32 else 0.999
+comptime PLACE_BOUND: Float64 = 5e-3 if SAM3_TF32 else 1e-3
+"""fp32: rfdetr's masks to the pixel. TF32 / bf16: the detections' masks drift by a
+few edge pixels (IoU 0.998 measured on the Orin), a place by < 1 mm."""
 comptime W: Int = 640
 comptime H: Int = 480
 
@@ -121,7 +127,7 @@ def main() raises:
             var e = 1e9
             if len(pa) == 3 and len(pb) == 3:
                 e = sqrt((pa[0] - pb[0]) ** 2 + (pa[1] - pb[1]) ** 2 + (pa[2] - pb[2]) ** 2)
-            check(fails, iou >= 0.999 and e <= 1e-3, String("'") + words[wi] + "' #" + String(j) + ": score "
+            check(fails, iou >= IOU_BOUND and e <= PLACE_BOUND, String("'") + words[wi] + "' #" + String(j) + ": score "
                   + String(d.score) + ", mask IoU " + String(iou) + ", place (" + String(pa[0] if len(pa) == 3 else 0.0)
                   + ", " + String(pa[1] if len(pa) == 3 else 0.0) + ", " + String(pa[2] if len(pa) == 3 else 0.0)
                   + ") m, |d| vs rfdetr's mask " + String(e) + " m")
