@@ -14,7 +14,8 @@ from max.gpu.host import DeviceContext, DeviceBuffer
 
 from noeira.nn.constants import DT
 from noeira.perception.sam3.ops import TPB, Ptr, blocks, gemm_tb, add_kernel, _d, _act
-from noeira.perception.sam3.neck import shift_kernel, tap_weights_kernel
+from noeira.perception.sam3.neck import shift_kernel, tap_weights_kernel, CONV_CUDNN
+from noeira.nn.core.cudnn_conv import cudnn_conv_forward
 
 
 comptime IPtr = Pointer[Scalar[DType.int32], MutAnyOrigin]
@@ -342,6 +343,43 @@ def bias_gelu_add_kernel(x: Ptr, y: Ptr, b: Ptr, cols_n: Int64):
         x.unsafe_store[alignment=16](i, x.unsafe_load[width=4, alignment=16](i) + _act[1, 4](v))
 
 
+def upsample_bilinear_v4_kernel(src: Ptr, dst: Ptr, hi_n: Int64, wi_n: Int64, ho_n: Int64, wo_n: Int64, c_n: Int64):
+    """`upsample_bilinear_kernel` four channels a thread (16-byte loads), the
+    same per-element arithmetic. Grid `(Ho Wo, ceil(C / 4 V4_TPB))`, V4_TPB threads."""
+    var c = (Int(block_idx.y) * V4_TPB + Int(thread_idx.x)) * 4
+    var n = Int(block_idx.x)
+    var C = Int(c_n)
+    if c >= C:
+        return
+    var Hi = Int(hi_n)
+    var Wi = Int(wi_n)
+    var Wo = Int(wo_n)
+    var oy = _d(n, Wo)
+    var ox = n - oy * Wo
+    var sy = max((Scalar[DT](oy) + Scalar[DT](0.5)) * (Scalar[DT](Hi) / Scalar[DT](Int(ho_n))) - Scalar[DT](0.5), Scalar[DT](0))
+    var sx = max((Scalar[DT](ox) + Scalar[DT](0.5)) * (Scalar[DT](Wi) / Scalar[DT](Wo)) - Scalar[DT](0.5), Scalar[DT](0))
+    var y0 = Int(sy)
+    var x0 = Int(sx)
+    var y1 = min(y0 + 1, Hi - 1)
+    var x1 = min(x0 + 1, Wi - 1)
+    var ly = SIMD[DT, 4](sy - Scalar[DT](y0))
+    var lx = SIMD[DT, 4](sx - Scalar[DT](x0))
+    var one = SIMD[DT, 4](1)
+    var top = src.unsafe_load[width=4, alignment=16]((y0 * Wi + x0) * C + c) * (one - lx) + src.unsafe_load[width=4, alignment=16]((y0 * Wi + x1) * C + c) * lx
+    var bot = src.unsafe_load[width=4, alignment=16]((y1 * Wi + x0) * C + c) * (one - lx) + src.unsafe_load[width=4, alignment=16]((y1 * Wi + x1) * C + c) * lx
+    dst.unsafe_store[alignment=16](n * C + c, top * (one - ly) + bot * ly)
+
+
+def bias_act_v4_kernel[ACT: Int](x: Ptr, b: Ptr, cols_n: Int64):
+    """`x[r, c] = act(x[r, c] + b[c])` in place, four columns a thread (`sam3.ops.
+    bias_act_kernel`'s arithmetic). Grid `(rows, ceil(cols / 4 V4_TPB))`, V4_TPB threads."""
+    var c = (Int(block_idx.y) * V4_TPB + Int(thread_idx.x)) * 4
+    var cols = Int(cols_n)
+    if c < cols:
+        var i = Int(block_idx.x) * cols + c
+        x.unsafe_store[alignment=16](i, _act[ACT, 4](x.unsafe_load[width=4, alignment=16](i) + b.unsafe_load[width=4, alignment=16](c)))
+
+
 def upsample_bilinear_kernel(src: Ptr, dst: Ptr, hi_n: Int64, wi_n: Int64, ho_n: Int64, wo_n: Int64, c_n: Int64):
     """`F.interpolate(bilinear, align_corners=False)` token-major: source pixel
     `max((o + 0.5) in / out - 0.5, 0)`, its floor and the next (clamped).
@@ -370,10 +408,12 @@ def upsample_bilinear_kernel(src: Ptr, dst: Ptr, hi_n: Int64, wi_n: Int64, ho_n:
 
 
 def conv_taps(ctx: DeviceContext, w: DeviceBuffer[DT], cout: Int, cin: Int) raises -> DeviceBuffer[DT]:
-    """A [cout, cin, 3, 3] conv weight as [9, cout, cin], one GEMM operand per tap."""
+    """A [cout, cin, 3, 3] conv weight as [9, cout, cin], one GEMM operand per tap —
+    or, with CONV_CUDNN (TF32 / bf16 builds on NVIDIA), cuDNN's NHWC filter
+    [cout, 3, 3, cin]."""
     var t = ctx.enqueue_create_buffer[DT](9 * cout * cin)
     ctx.enqueue_function[tap_weights_kernel](
-        w, t, Int64(cout), Int64(cin), Int64(0), grid_dim=(blocks(cin), cout, 9), block_dim=TPB,
+        w, t, Int64(cout), Int64(cin), Int64(1 if CONV_CUDNN else 0), grid_dim=(blocks(cin), cout, 9), block_dim=TPB,
     )
     return t^
 
@@ -382,8 +422,16 @@ def conv3x3_tm(
     ctx: DeviceContext, x: DeviceBuffer[DT], h: Int, w: Int, cin: Int, cout: Int, taps: DeviceBuffer[DT],
 ) raises -> DeviceBuffer[DT]:
     """A 3x3 conv, padding 1, no bias, on token-major `x [h w, cin]`: per tap a
-    shifted copy through one GEMM, summed."""
+    shifted copy through one GEMM, summed — or, with CONV_CUDNN, one cuDNN
+    implicit-GEMM call (the C2f's 128 -> 128 at 32 x 32: 9 shifts, 9 GEMMs and 8
+    adds a conv before)."""
     var n = h * w
+    comptime if CONV_CUDNN:
+        if h != GRID or w != GRID or cin != 128 or cout != 128:
+            raise Error("rfdetr conv3x3_tm: the cuDNN plan is built for 128 -> 128 at 32 x 32")
+        var y = ctx.enqueue_create_buffer[DT](n * cout)
+        cudnn_conv_forward[1, 128, 128, 3, 1, 1, GRID, GRID, True, True](ctx, y, x, taps)
+        return y^
     var out = ctx.enqueue_create_buffer[DT](n * cout)
     var xs = ctx.enqueue_create_buffer[DT](n * cin)
     var part = ctx.enqueue_create_buffer[DT](n * cout)

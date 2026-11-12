@@ -73,7 +73,7 @@ from .ops import (
     IMG, PATCH, GRID, NTOK, NWIN, WTOK, BB_DIM, IPtr, preprocess_kernel, mask_post_kernel,
     patchify_kernel, window_embed_kernel, unwindow_kernel, scale_add_kernel, bias_scale_add_kernel, silu_kernel, copy_cols_kernel,
     gather_rows_kernel, add_scalar_kernel, msda_kernel, dwconv3x3_kernel, upsample_bilinear_kernel,
-    V4_TPB, dw_taps_kernel, dwconv3x3_v4_kernel, bias_gelu_add_kernel,
+    V4_TPB, dw_taps_kernel, dwconv3x3_v4_kernel, bias_gelu_add_kernel, upsample_bilinear_v4_kernel, bias_act_v4_kernel,
     conv_taps, conv3x3_tm,
 )
 
@@ -293,8 +293,9 @@ struct RfDetr(Movable):
             layer_norm(self.wts, p + "norm2", x, h2, nrow, BB_DIM, BB_EPS)
             var f1 = self.new(nrow * BB_FF)
             linear_into(self.wts, p + "mlp.fc1", h2, nrow, BB_DIM, f1, bias=False)
-            ctx.enqueue_function[bias_act_kernel[1]](
-                f1, self.wts.w(p + "mlp.fc1.bias"), Int64(BB_FF), grid_dim=(nrow, blocks(BB_FF)), block_dim=TPB,
+            ctx.enqueue_function[bias_act_v4_kernel[1]](
+                f1, self.wts.w(p + "mlp.fc1.bias"), Int64(BB_FF), grid_dim=(nrow, (BB_FF // 4 + V4_TPB - 1) // V4_TPB),
+                block_dim=V4_TPB,
             )
             var f2 = self.new(nrow * BB_DIM)
             linear_into(self.wts, p + "mlp.fc2", f1, nrow, BB_FF, f2, bias=False)
@@ -479,8 +480,9 @@ struct RfDetr(Movable):
         comptime S = "segmentation_head."
         comptime NPX = MASK * MASK
         var x = self.new(NPX * D)
-        ctx.enqueue_function[upsample_bilinear_kernel](
-            src, x, Int64(GRID), Int64(GRID), Int64(MASK), Int64(MASK), Int64(D), grid_dim=(NPX, blocks(D)), block_dim=TPB,
+        ctx.enqueue_function[upsample_bilinear_v4_kernel](
+            src, x, Int64(GRID), Int64(GRID), Int64(MASK), Int64(MASK), Int64(D),
+            grid_dim=(NPX, (D // 4 + V4_TPB - 1) // V4_TPB), block_dim=V4_TPB,
         )
         for b in range(DEC_LAYERS):
             var p = S + "blocks." + String(b) + "."
