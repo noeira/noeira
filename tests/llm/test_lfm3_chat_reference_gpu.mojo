@@ -244,6 +244,59 @@ def int8_mutant_kl(model_dir: String, dir: String) raises -> Float64:
     return tot / Float64(steps)
 
 
+def prefix_checks(mut chat: Lfm3Chat, system: String, turn1: String, mut fails: Int) raises -> Int:
+    """`keep_system`: (1) the first reply's first logits with the system prompt
+    prefilled on its own = with one prefill (two chunkings: CACHE_BOUND);
+    (2) after a reply, `reset` with the same prompt REWINDS and the next first
+    logits are bit-identical; (3) a rewind that leaves the conv histories
+    (`debug 8`) is not. Leaves `keep_system` off."""
+    var g = ChatSettings.greedy_with(1.0, 6)
+    chat.keep_system = False
+    chat.reset(system)
+    chat.user(turn1)
+    chat.start(g)
+    var one_pass = chat.last_logits.copy()
+    chat.keep_system = True
+    chat.sys_mark = None
+    chat.reset(system)  # computes and marks the system prompt
+    var sys_pos = chat.cache.pos
+    chat.user(turn1)
+    chat.start(g)
+    var kept = chat.last_logits.copy()
+    while chat.next():
+        pass
+    chat.reset(system)  # rewinds
+    var rewound_pos = chat.cache.pos
+    chat.user(turn1)
+    chat.start(g)
+    var again = chat.last_logits.copy()
+    while chat.next():
+        pass
+    var e1 = rel_err32(kept, one_pass)
+    var bitwise = 0
+    for i in range(len(again)):
+        if again[i] != kept[i]:
+            bitwise += 1
+    check(fails, e1 <= CACHE_BOUND, "keep_system: the system prompt (" + String(sys_pos) + " tokens) prefilled alone = one prefill: "
+          + String(e1))
+    check(fails, bitwise == 0 and rewound_pos == sys_pos, "keep_system: rewound to the mark, the next reply's first logits bit-identical ("
+          + String(bitwise) + " differ)")
+    chat.cache.debug = 8
+    chat.reset(system)
+    chat.user(turn1)
+    chat.start(g)
+    var stale = chat.last_logits.copy()
+    while chat.next():
+        pass
+    chat.cache.debug = 0
+    var moved = rel_err32(stale, kept)
+    check(fails, moved > CACHE_BOUND, "mutant caught, a rewind that keeps the conv histories: logits moved by " + String(moved)
+          + " (> " + String(CACHE_BOUND) + ")")
+    chat.keep_system = False
+    chat.sys_mark = None
+    return bitwise
+
+
 def main() raises:
     var home = getenv("HOME")
     var args = argv()
@@ -346,6 +399,26 @@ def main() raises:
             check(fails, tok_bad == 0, "teacher-forced: every greedy choice is the reference's (" + String(ties) + " bf16 near-ties allowed)")
         check(fails, kl_sum / Float64(steps) <= KL_BOUND, "teacher-forced: mean KL(reference || ours) " + String(kl_sum / Float64(steps))
               + " nats, max " + String(kl_max) + " (bound on the mean " + String(KL_BOUND) + ")")
+
+        # 4a. the system prompt kept (`keep_system`): prefilled on its own, then
+        # rewound to for the next request — what the robot's service does.
+        # Before the free run: it resets the chat, and turn 2 continues turn 1
+        if c == 0:
+            var first = prefix_checks(chat, system, turn1, fails)
+            # the reference's turn 2 replayed as history (`assistant`): the same tokens
+            if meta.size(turns_n) > 1:
+                var t2r = ints(load_npy_f64(dir + "/turn2_ids.npy"))
+                chat.keep_system = False
+                chat.reset(system)
+                chat.user(turn1)
+                chat.assistant(chat.tok.decode(gen))
+                chat.user(meta.string(meta.at(turns_n, 1)))
+                var want_ids = prompt.copy()
+                want_ids += gen.copy()
+                want_ids += t2r.copy()
+                check(fails, same(chat.prompt_ids(), want_ids), "history replayed (user, assistant, user): the template's "
+                      + String(len(want_ids)) + " tokens")
+            _ = first
 
         # 4. free-running through the API
         chat.reset(system)

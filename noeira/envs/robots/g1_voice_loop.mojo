@@ -73,7 +73,7 @@ string instead.
 from std.time import perf_counter_ns
 
 from noeira.ai.audio_io import MicCapture, rms, LocalVoice, os_voice_for
-from noeira.ai.chat import ChatClient, ChatMessage, ToolSpec
+from noeira.ai.chat import ChatClient, ChatMessage, ToolSpec, ChatService
 from noeira.ai.jev import JevClient, JevQuestions, DecisionService
 from noeira.ai.picture import Picture
 from noeira.ai.speech import (
@@ -279,8 +279,9 @@ struct G1VoiceConfig(Copyable, Movable):
     furnished room. A caller with obstacles sets this; a bare viewer does not.
     """
     var llm_spec: String
-    """Passed to `ChatClient.from_spec` — `hf`, `openai`, `anthropic`, or a
-    local openai-compatible base URL."""
+    """Passed to the reply backend's `from_spec`: for `ChatClient`, `hf`,
+    `openai`, `anthropic`, or a local openai-compatible base URL; for
+    `Lfm3ChatService`, `native` (LFM3-1.7B, int8) / `native-bf16` / `...:<dir>`."""
     var request_wording: Bool
     """Ask the destination as a REQUEST with a yes/no gate, the wording
     measured on a local Jev-compatible model, in a request of its OWN
@@ -382,13 +383,17 @@ comptime G1VoiceLoop = G1VoiceLoopOf[SpeechToText, TextToSpeech, JevClient]
 among hosted services and local servers at run time."""
 
 
-struct G1VoiceLoopOf[STT: SpeechToTextService, TTS: TextToSpeechService, DEC: DecisionService](Movable):
+struct G1VoiceLoopOf[
+    STT: SpeechToTextService, TTS: TextToSpeechService, DEC: DecisionService, LLM: ChatService = ChatClient,
+](Movable):
     """The microphone, the detector, the recogniser, the decision and the
     voice — one object, polled once a frame.
 
-    `STT` / `TTS` / `DEC` are the backends, chosen at BUILD time (`G1VoiceLoop`
-    is the HTTP trio); `cfg.stt_spec` / `cfg.tts_spec` / `cfg.dec_spec` go to
-    their `from_spec`."""
+    `STT` / `TTS` / `DEC` / `LLM` are the backends, chosen at BUILD time
+    (`G1VoiceLoop` is the HTTP ones); `cfg.stt_spec` / `cfg.tts_spec` /
+    `cfg.dec_spec` / `cfg.llm_spec` go to their `from_spec`. `LLM` writes the
+    spoken replies: `ChatClient` (HTTP, the default) or
+    `noeira.llm.lfm3.service.Lfm3ChatService` (LFM3 in this process)."""
 
     var mic: MicCapture
     var voice: LocalVoice
@@ -403,7 +408,7 @@ struct G1VoiceLoopOf[STT: SpeechToTextService, TTS: TextToSpeechService, DEC: De
     var tts_t0: Int
     var stt: Self.STT
     var jev: Self.DEC
-    var llm: ChatClient
+    var llm: Self.LLM
     var cfg: G1VoiceConfig
     var quest: JevQuestions
     var quest_mem: JevQuestions
@@ -487,7 +492,7 @@ struct G1VoiceLoopOf[STT: SpeechToTextService, TTS: TextToSpeechService, DEC: De
         # backend says whether it took it.
         if self.cfg.vocab != "":
             _ = self.stt.set_hint(self.cfg.vocab)
-        self.llm = ChatClient.from_spec(self.cfg.llm_spec)
+        self.llm = Self.LLM.from_spec(self.cfg.llm_spec)
         # ⚠ BOTH OF THESE ARE MEASURED AND BELONG WITH THE CLIENT. A reply is
         # one short sentence, so 120 tokens is generous — and Qwen THINKS
         # before answering unless told not to, which took a reply from
@@ -495,11 +500,7 @@ struct G1VoiceLoopOf[STT: SpeechToTextService, TTS: TextToSpeechService, DEC: De
         # pauses eleven seconds before saying hello is not having a
         # conversation, and a caller that had to remember these would
         # eventually not.
-        self.llm.max_tokens = 120
-        self.llm.extra(
-            String("chat_template_kwargs"),
-            String('{"enable_thinking": false}'),
-        )
+        self.llm.set_reply_limits(120)
         # ⚠ THE VOICE FOLLOWS THE REPLY'S LANGUAGE, not the system's — a
         # French Mac's default voice read the English demo with a French accent
         self.voice = LocalVoice(

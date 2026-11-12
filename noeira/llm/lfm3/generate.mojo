@@ -26,7 +26,7 @@ gives at `p..p+n-1` (`Lfm3Text.forward(..., causal_full=True)`, the gate's
 `Lfm3Cache.debug` (falsification, the gate's mutants): 1 = every chunk's RoPE
 positions from 0 (the offset forgotten; a uniform shift would be invisible, RoPE
 being relative), 2 = no sliding window on the cache, 4 = the conv history never
-rolled.
+rolled, 8 = `rewind` leaves the conv histories as they are.
 """
 
 from std.sys import default_accelerator
@@ -122,6 +122,36 @@ struct Lfm3Cache(Movable):
 
     def left(self) -> Int:
         return self.cap - self.pos
+
+    def mark(self, mut lm: Lfm3Text) raises -> Lfm3CacheMark:
+        """The cache as it is now, to come back to (`rewind`): a prefix kept
+        for the next request (the system prompt). Cheap for LFM3: the position
+        and the 13 conv histories (6 rows each); the keys and values before
+        `pos` are never overwritten by what comes after."""
+        var h = List[DeviceBuffer[DT]]()
+        for b in self.hist:
+            var c = lm.new(len(b))
+            lm.ctx.enqueue_copy(c, b)
+            h.append(c^)
+        return Lfm3CacheMark(self.pos, h^)
+
+    def rewind(mut self, mut lm: Lfm3Text, ref m: Lfm3CacheMark) raises:
+        """Back to `m`: what came after it is forgotten. `debug & 8`
+        (falsification): the position only, the conv histories left as they are."""
+        self.pos = m.pos
+        if (self.debug & 8) != 0:
+            return
+        for i in range(len(self.hist)):
+            lm.ctx.enqueue_copy(self.hist[i], m.hist[i])
+
+
+struct Lfm3CacheMark(Movable):
+    var pos: Int
+    var hist: List[DeviceBuffer[DT]]
+
+    def __init__(out self, pos: Int, var hist: List[DeviceBuffer[DT]]):
+        self.pos = pos
+        self.hist = hist^
 
 
 def forward_cached(

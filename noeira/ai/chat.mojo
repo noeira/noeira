@@ -348,7 +348,53 @@ def _openai_messages(
 # ═══════════════════════════════════════════════════════════════════════════
 
 
-struct ChatClient(Movable):
+trait ChatService(Movable & Deinitable):
+    """A chat reply, driven without blocking: `start`, `poll` each frame until
+    `done`, then `result`. The HTTP client (`ChatClient`: hosted models, or any
+    OpenAI-compatible server) and the model in this process
+    (`noeira.llm.lfm3.service.Lfm3ChatService`) both serve it, so a caller
+    (`G1VoiceLoopOf`) picks one at BUILD time, as for decisions and speech.
+
+    ⚠ `done` MEANS THE CALL IS OVER, NOT THAT IT WORKED: `result` is what raises."""
+
+    @staticmethod
+    def from_spec(spec: String) raises -> Self:
+        ...
+
+    def set_reply_limits(mut self, max_tokens: Int) raises:
+        """A spoken reply's settings: at most `max_tokens` tokens, and no
+        thinking before the answer (a reasoning model's thinking took a reply
+        from 10.8 s to 1.4 s when switched off)."""
+        ...
+
+    def warm_up(mut self):
+        ...
+
+    def start(
+        mut self,
+        ref messages: List[ChatMessage],
+        system: String = String(""),
+        tools: List[ToolSpec] = List[ToolSpec](),
+        stream: Bool = True,
+    ) raises:
+        ...
+
+    def poll(mut self, timeout_ms: Int = 0) raises -> String:
+        """Advance the call; the text that arrived since the last poll ("" when
+        none, or when the backend does not stream)."""
+        ...
+
+    def done(self) -> Bool:
+        ...
+
+    def result(mut self) raises -> ChatResponse:
+        ...
+
+    def cancel(mut self) raises:
+        ...
+
+
+struct ChatClient(Movable, ChatService):
     var provider: Int
     var base_url: String
     """Up to and including the version segment: `https://api.anthropic.com/v1`,
@@ -724,6 +770,12 @@ struct ChatClient(Movable):
         """Open the TLS connection now, before a real-time loop — see
         `noeira.ai.transport.warm_up`."""
         warm_up(self._http, self._endpoint())
+
+    def set_reply_limits(mut self, max_tokens: Int) raises:
+        """`ChatService`: `max_tokens`, and `enable_thinking: false` in the
+        chat template's arguments (Qwen and the like think unless told not to)."""
+        self.max_tokens = max_tokens
+        self.extra(String("chat_template_kwargs"), String('{"enable_thinking": false}'))
 
     def cancel(mut self) raises:
         """Abandon the call in flight (no-op when none)."""

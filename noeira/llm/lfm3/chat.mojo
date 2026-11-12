@@ -41,7 +41,7 @@ from noeira.nn.constants import DT
 from noeira.io.json import load_json
 from noeira.text.bpe import ByteLevelBPE
 from .model import Lfm3Text, LF_INT8
-from .generate import Lfm3Cache, forward_cached, last_logits
+from .generate import Lfm3Cache, Lfm3CacheMark, forward_cached, last_logits
 
 
 comptime BOS = "<|startoftext|>"
@@ -147,6 +147,16 @@ struct Lfm3Chat(Movable):
     var done: Bool
     var last_logits: List[Float32]
     """The raw logits that chose the last token (the gate reads them)."""
+    var closed: Bool
+    """The last assistant message ended with `<|im_end|>` (generated, or `assistant`)."""
+    var keep_system: Bool
+    """Prefix cache: `reset` prefills the system prompt at once and marks the
+    cache there; a `reset` with the SAME prompt rewinds to the mark instead of
+    computing it again (a service answering one request at a time). Off by
+    default: `prompt_ids` then holds the whole prompt, as the gate reads it."""
+    var sys_text: String
+    var sys_ids: List[Int]
+    var sys_mark: Optional[Lfm3CacheMark]
 
     def __init__(out self, var lm: Lfm3Text, var tok: ByteLevelBPE, var cache: Lfm3Cache, eos: Int):
         self.seen = List[Bool](length=lm.cfg.vocab, fill=False)
@@ -162,6 +172,11 @@ struct Lfm3Chat(Movable):
         self.rng = 0
         self.done = True
         self.last_logits = List[Float32]()
+        self.closed = False
+        self.keep_system = False
+        self.sys_text = String("")
+        self.sys_ids = List[Int]()
+        self.sys_mark = None
 
     @staticmethod
     def load(
@@ -180,18 +195,33 @@ struct Lfm3Chat(Movable):
         return Lfm3Chat(lm^, tok^, cache^, eos)
 
     def reset(mut self, system: String) raises:
-        """A new conversation: `system` (empty: none) and nothing else."""
-        self.cache.reset()
+        """A new conversation: `system` (empty: none) and nothing else. With
+        `keep_system`, the system prompt is computed once and reused (above)."""
         self.pending = List[Int]()
         for i in range(len(self.seen)):
             self.seen[i] = False
         self.reply = List[Int]()
         self.turns = 0
         self.done = True
+        self.closed = False
+        if self.keep_system and self.sys_mark and system == self.sys_text:
+            self.cache.rewind(self.lm, self.sys_mark.value())
+            for id in self.sys_ids:
+                self.seen[id] = True
+            return
+        self.cache.reset()
+        self.sys_mark = None
         var head = String(BOS)
         if system.byte_length() > 0:
             head += IM_START + "system\n" + system + IM_END + "\n"
-        self._add(self.tok.encode(head))
+        var ids = self.tok.encode(head)
+        self._add(ids)
+        if self.keep_system:
+            _ = forward_cached(self.lm, self.pending, self.cache)
+            self.pending = List[Int]()
+            self.sys_text = system
+            self.sys_ids = ids^
+            self.sys_mark = self.cache.mark(self.lm)
 
     def user(mut self, text: String) raises:
         """The user's turn, and the assistant's header after it."""
@@ -201,12 +231,25 @@ struct Lfm3Chat(Movable):
             raise Error("lfm3 chat: a second turn with thinking on re-renders the history (reset first)")
         var s = String("")
         if self.turns > 0:
-            # the reply ends with <|im_end|> when it was finished, not when max_tokens cut it
-            s = ("" if (len(self.reply) > 0 and self.reply[len(self.reply) - 1] == self.eos) else String(IM_END)) + "\n"
+            # a reply cut by max_tokens is closed here, as the template closes it
+            s = ("" if self.closed else String(IM_END)) + "\n"
         s += IM_START + "user\n" + text + IM_END + "\n" + IM_START + "assistant\n"
         s += THINK_ON if self.thinking else THINK_OFF
         self._add(self.tok.encode(s))
         self.turns += 1
+        self.closed = False
+        self.reply = List[Int]()
+
+    def assistant(mut self, text: String) raises:
+        """An earlier reply of the conversation, given rather than generated
+        (a caller replaying its history): after `user`, the template's
+        rendering of an assistant message (thinking off)."""
+        if self.turns == 0 or self.closed or len(self.reply) > 0:
+            raise Error("lfm3 chat: an assistant message must follow a user message")
+        if self.thinking:
+            raise Error("lfm3 chat: a replayed history needs thinking off")
+        self._add(self.tok.encode(text + IM_END))
+        self.closed = True
 
     def _add(mut self, ids: List[Int]):
         for id in ids:
@@ -245,6 +288,7 @@ struct Lfm3Chat(Movable):
         self.pending.append(t)  # in the conversation; into the cache with the next feed
         if t == self.eos or len(self.reply) >= self.settings.max_tokens:
             self.done = True
+            self.closed = t == self.eos
 
     def reply_text(self) -> String:
         """The reply so far, without `<|im_end|>`; a character cut between two
