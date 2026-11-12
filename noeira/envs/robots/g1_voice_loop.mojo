@@ -1150,13 +1150,15 @@ struct G1VoiceLoopOf[
                 var done = self.llm.done()
                 if done:
                     var rtxt = String("")
+                    var rms_ = 0.0
                     try:
                         var rep = self.llm.result()
                         rtxt = rep.text
+                        rms_ = rep.latency_ms
                     except e:
                         self.note = String("[talk] FAILED: ") + String(e)
                     if rtxt != "":
-                        self.note = String("[said] ") + rtxt
+                        self.note = String("[said] ") + rtxt + String("  (reply ") + String(Int(rms_)) + String(" ms)")
                         if not self.cfg.mute:
                             self.say(rtxt)
                         ev.kind = VL_TALK
@@ -1464,7 +1466,15 @@ struct G1VoiceLoopOf[
             var sterms = List[G1Term]()
             var n_scaf = g1_spec_from_answers(sa, self.pool, bank, sterms)
             if n_scaf < 0:
-                self.note = String("[spec] the model named no quantity")
+                # ⚠ ADDRESSED, AND NOT A MOTION: "tell me a joke" came here (the
+                # bank has no row for it and no reward can say it). Silence was
+                # the old answer; a spoken reply is the right one, and the motion
+                # is unchanged.
+                self._reply(
+                    String("If the request is not something you can do, say so kindly; otherwise answer it."),
+                    String("[spec] the model named no quantity -> reply"),
+                )
+                return ev^
             else:
                 var v = g1_spec_admit(
                     self.pool, bank, self.zbase, sterms, self.znew, n_scaf
