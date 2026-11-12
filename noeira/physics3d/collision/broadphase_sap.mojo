@@ -2588,6 +2588,17 @@ def _detect_contacts_sap_env[
     var npair = dims.get_npair()
     var num_contacts = 0
 
+    # ⚠ THE TANGENT HINT STARTS ABSENT IN EVERY SLOT: see the same lines in
+    # `contact_detection._detect_contacts_env`. Only the plane/capsule branch
+    # (`_sap_plane_narrow`) writes `CONTACT_IDX_FRAME_T1_*`; a frictional
+    # contact of any other pair used to read what its slot's previous
+    # occupant left. This is the path a CPU env of 16 geoms or more takes
+    # (`detect_contacts_auto`), and where the G1 + box family showed it.
+    for c in range(max_contacts):
+        contacts[env, c * CONTACT_SIZE + CONTACT_IDX_FRAME_T1_X] = 0
+        contacts[env, c * CONTACT_SIZE + CONTACT_IDX_FRAME_T1_Y] = 0
+        contacts[env, c * CONTACT_SIZE + CONTACT_IDX_FRAME_T1_Z] = 0
+
     # ------------------------------------------------------------------
     # 1. Precompute world positions for all ngeom geoms.
     # ------------------------------------------------------------------

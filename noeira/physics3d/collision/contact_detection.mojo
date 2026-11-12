@@ -1962,6 +1962,22 @@ def _detect_contacts_env[
     )
     var num_contacts = 0
 
+    # ⚠ THE TANGENT HINT STARTS ABSENT IN EVERY SLOT. Only the plane/capsule
+    # branches below write `CONTACT_IDX_FRAME_T1_*`; every other pair leaves
+    # it alone (`contact_frame.mojo`), so a frictional contact of any other
+    # pair used to read the hint its slot's PREVIOUS occupant left there. On
+    # the G1 + box family (2026-11-12) a box/capsule contact took a slot the
+    # feet had held and read a foot capsule's axis: the friction pyramid was
+    # turned about the normal, the box's velocity 5e-2 off MuJoCo's from the
+    # first touch (`test_unitree_g1_mjlab_box_vs_mujoco`'s driven catch).
+    # MuJoCo's frame for those pairs has no hint (`mju_makeFrame`'s default
+    # axis), which is zero here, and what the SAP path's staged records carry
+    # — the batched device path was right and this one was not.
+    for c in range(max_contacts):
+        contacts[env, c * CONTACT_SIZE + CONTACT_IDX_FRAME_T1_X] = 0
+        contacts[env, c * CONTACT_SIZE + CONTACT_IDX_FRAME_T1_Y] = 0
+        contacts[env, c * CONTACT_SIZE + CONTACT_IDX_FRAME_T1_Z] = 0
+
     # ⚠⚠ `sa`/`sb` ARE THE LOOP'S ORDER AND `gi`/`gj` ARE MuJoCo'S. The pair
     # this loop names is `sa < sb`, which is the order MuJoCo's own geom loops
     # produce — but the reference then SORTS IT BY TYPE in `pushPairArena`
