@@ -117,7 +117,9 @@ class ReferencePD:
         target = self.default + self.scale * np.asarray(action, dtype=np.float64)
         worst = 0
         for _ in range(decimation):
-            d.ctrl[:] = np.clip(self.kp * (target - d.qpos[7:]) - self.kd * d.qvel[6:], -self.effort, self.effort)
+            # the robot's hinges only: a model with more bodies after the robot (the carry-box family) has more state
+            n = len(self.default)
+            d.ctrl[:] = np.clip(self.kp * (target - d.qpos[7:7 + n]) - self.kd * d.qvel[6:6 + n], -self.effort, self.effort)
             mujoco.mj_step(m, d)
             worst = max(worst, int(d.ncon))
         return worst

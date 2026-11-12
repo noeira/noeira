@@ -43,6 +43,8 @@ from noeira.core.cont_action import ContAction
 from noeira.envs.robots import UnitreeG1
 from noeira.envs.robots.unitree_g1 import UnitreeG1BatchedDR
 from noeira.envs.robots.unitree_g1_mjlab import UnitreeG1Mjlab, UnitreeG1MjlabBatchedDR
+from noeira.envs.robots.unitree_g1_mjlab_box import UnitreeG1MjlabBox
+from noeira.envs.robots.unitree_g1_mjlab_box_xml import G1M_BOX_QPOS, G1M_BOX_QVEL
 from noeira.envs.robots.unitree_g1_mjlab_pd import G1M_N_DOF, g1m_action_scale, g1m_default_pos
 from noeira.envs.robots.berkeley_humanoid_lite import BerkeleyHumanoidLite, BerkeleyHumanoidLiteBatchedDR
 from noeira.envs.robots.berkeley_humanoid_lite_pd import (
@@ -95,6 +97,20 @@ trait TrackingSim(Movable & Deinitable):
 
     def num_geoms(self) -> Int:
         ...
+
+    # A free object beside the robot (`G1MjlabBoxSim`). A simulator without one
+    # keeps these defaults, which REFUSE: a driver that asks for the object of
+    # a robot-only simulator is a wiring mistake, not a zero.
+    def set_box(mut self, q: List[Float64], v: List[Float64]) raises:
+        """The object's pose [pos 3, quat WXYZ] and velocity [linear 3
+        (world), angular 3 (its own frame)]; the robot's state is kept."""
+        raise Error("TrackingSim.set_box: this simulator holds no object")
+
+    def box_qpos(self, k: Int) raises -> Float64:
+        raise Error("TrackingSim.box_qpos: this simulator holds no object")
+
+    def box_qvel(self, k: Int) raises -> Float64:
+        raise Error("TrackingSim.box_qvel: this simulator holds no object")
 
     # The window, for `supermimic_viewer` (forwards to the env's renderer).
     def init_renderer(mut self) raises -> Bool:
@@ -670,6 +686,161 @@ struct G1MjlabRobot(TrackingRobot):
     comptime NJOINT = UnitreeG1Mjlab[DType.float64].NJOINT
     comptime N_TRACKED = 14
     comptime SIM = G1MjlabSim
+
+    @staticmethod
+    def mjcf_path() -> String:
+        return "noeira/envs/robots/assets/unitree_g1_mjlab.xml"
+
+    @staticmethod
+    def tracked_bodies() -> List[String]:
+        return G1Robot.tracked_bodies()
+
+    @staticmethod
+    def anchor_body() -> String:
+        return "torso_link"
+
+    @staticmethod
+    def root_body() -> String:
+        return "pelvis"
+
+    @staticmethod
+    def foot_bodies() -> List[String]:
+        return ["left_ankle_roll_link", "right_ankle_roll_link"]
+
+    @staticmethod
+    def com_body() -> String:
+        return "torso_link"
+
+    @staticmethod
+    def hand_bodies() -> List[String]:
+        return ["left_wrist_yaw_link", "right_wrist_yaw_link"]
+
+    @staticmethod
+    def default_joint_pos(j: Int) -> Float64:
+        return g1m_default_pos(j)
+
+    @staticmethod
+    def soft_limit_factor() -> Float64:
+        return 0.9
+
+
+# ── the same G1 with a free box to carry (`UnitreeG1MjlabBox`) ──────────────
+struct G1MjlabBoxSim(TrackingSim):
+    """`UnitreeG1MjlabBox` on the CPU: `G1MjlabSim`'s robot and action law, plus
+    one free box in the simulator's last state slots. `set_state`, `qpos` and
+    `qvel` address the ROBOT (the trait's contract: a state row is the
+    robot's); the box has its own accessors below, and `set_state` leaves it
+    where it is."""
+    var env: UnitreeG1MjlabBox[DType.float64]
+
+    def __init__(out self, var env: UnitreeG1MjlabBox[DType.float64]):
+        self.env = env^
+
+    def __init__(out self, *, deinit move: Self):
+        self.env = move.env^
+
+    @staticmethod
+    def create() raises -> Self:
+        var e = UnitreeG1MjlabBox[DType.float64]()
+        _ = e.reset()
+        return Self(e^)
+
+    def set_state(mut self, qpos: List[Float64], qvel: List[Float64]):
+        self.env.set_state(qpos, qvel)
+
+    def control_step(mut self, a: List[Float64], bias: List[Float64]):
+        var act = ContAction[G1M_N_DOF]()
+        for j in range(G1M_N_DOF):
+            act.data[j] = a[j] - bias[j] / g1m_action_scale(j)
+        _ = self.env.step(act)
+
+    def set_box(mut self, q: List[Float64], v: List[Float64]) raises:
+        """The box's pose [pos 3, quat WXYZ] and velocity [linear 3 (world),
+        angular 3 (its own frame)]; the robot's state is kept."""
+        if len(q) != 7 or len(v) != 6:
+            raise Error("G1MjlabBoxSim.set_box: a pose of 7 and a velocity of 6, got " + String(len(q)) + " and " + String(len(v)))
+        var qpos = List[Float64]()
+        var qvel = List[Float64]()
+        for i in range(UnitreeG1MjlabBox[DType.float64].NQ):
+            qpos.append(Float64(self.env.d.qpos.data[i]))
+        for i in range(UnitreeG1MjlabBox[DType.float64].NV):
+            qvel.append(Float64(self.env.d.qvel.data[i]))
+        for k in range(7):
+            qpos[G1M_BOX_QPOS + k] = q[k]
+        for k in range(6):
+            qvel[G1M_BOX_QVEL + k] = v[k]
+        self.env.set_state(qpos, qvel)
+
+    def box_qpos(self, k: Int) raises -> Float64:
+        return Float64(self.env.d.qpos.data[G1M_BOX_QPOS + k])
+
+    def box_qvel(self, k: Int) raises -> Float64:
+        return Float64(self.env.d.qvel.data[G1M_BOX_QVEL + k])
+
+    def qpos(self, i: Int) -> Float64:
+        return Float64(self.env.d.qpos.data[i])
+
+    def qvel(self, i: Int) -> Float64:
+        return Float64(self.env.d.qvel.data[i])
+
+    def body_field(self, b: Int, k: Int) -> Float64:
+        return Float64(self.env.mf.bodies.data[b * MODEL_BODY_SIZE + k])
+
+    def set_body_field(mut self, b: Int, k: Int, v: Float64):
+        self.env.mf.bodies.data[b * MODEL_BODY_SIZE + k] = v
+
+    def joint_field(self, j: Int, k: Int) -> Float64:
+        return Float64(self.env.mf.joints.data[j * MODEL_JOINT_SIZE + k])
+
+    def geom_field(self, g: Int, k: Int) -> Float64:
+        return Float64(self.env.mf.geoms.data[g * MODEL_GEOM_SIZE + k])
+
+    def set_geom_field(mut self, g: Int, k: Int, v: Float64):
+        self.env.mf.geoms.data[g * MODEL_GEOM_SIZE + k] = v
+
+    def num_geoms(self) -> Int:
+        return UnitreeG1MjlabBox[DType.float64].NGEOM
+
+    def init_renderer(mut self) raises -> Bool:
+        return self.env.init_renderer()
+
+    def render_frame(mut self) raises:
+        self.env.render_frame()
+
+    def renderer_delay(self, ms: Int):
+        self.env.renderer_delay(ms)
+
+    def check_renderer_quit(mut self) -> Bool:
+        return self.env.check_renderer_quit()
+
+    def renderer_paused(self) -> Bool:
+        return self.env.renderer_paused()
+
+    def start_recording(mut self, path: String, fps: Int) raises:
+        self.env.start_recording(path, fps)
+
+    def stop_recording(mut self) raises:
+        self.env.stop_recording()
+
+    def close_renderer(mut self) raises:
+        self.env.close_renderer()
+
+
+struct G1MjlabBoxRobot(TrackingRobot):
+    """`G1MjlabRobot` in a simulator that also holds a free box
+    (`UnitreeG1MjlabBox`). The ROBOT is the same in every respect the method
+    reads: its dimensions, bodies and MJCF are `G1MjlabRobot`'s (the box is
+    the simulator's last body, joint and geom, outside all of them), so a
+    library, a set of tables or a checkpoint of `G1MjlabRobot` is this
+    robot's. CPU lanes only so far (`docs/OBJECT_INTERACTION_PLAN.md`
+    O1.2)."""
+    comptime NQ = 36
+    comptime NV = 35
+    comptime NDOF = G1M_N_DOF
+    comptime NBODY = UnitreeG1Mjlab[DType.float64].NBODY - 1
+    comptime NJOINT = UnitreeG1Mjlab[DType.float64].NJOINT
+    comptime N_TRACKED = 14
+    comptime SIM = G1MjlabBoxSim
 
     @staticmethod
     def mjcf_path() -> String:

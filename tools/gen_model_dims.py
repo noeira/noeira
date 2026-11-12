@@ -87,6 +87,9 @@ MODELS = [
     # Unitree G1 as mjlab models it (SuperMimic's reproduction), baked by
     # `tests/robots/g1_mjlab_bake.py`.
     ("noeira/envs/robots/unitree_g1_mjlab_xml.mojo", ["UNITREE_G1_MJLAB_XML"]),
+    # The same G1 plus one free box to carry, baked by
+    # `tests/robots/g1_mjlab_box_bake.py` (the box takes the last slots).
+    ("noeira/envs/robots/unitree_g1_mjlab_box_xml.mojo", ["UNITREE_G1_MJLAB_BOX_XML"]),
     # Berkeley Humanoid Lite, baked by `tests/robots/bhl_bake.py`.
     ("noeira/envs/robots/berkeley_humanoid_lite_xml.mojo", ["BERKELEY_HUMANOID_LITE_XML"]),
     # ⚠ THE P0 SCENE-BUDGET PROBE MODELS, and they are here on purpose.

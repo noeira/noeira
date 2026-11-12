@@ -14,6 +14,11 @@
     reward  = 0, no termination (the task layer owns both)
     reset   = the `stand` keyframe: mjlab's `KNEES_BENT_KEYFRAME`
 
+THE SAME CONFIG DRIVES `UnitreeG1MjlabBox` (the robot plus one free box in the
+last state slots, `unitree_g1_mjlab_box_xml.mojo`): the PD addresses the
+robot's 29 hinges only, and the reset puts the box at its key pose, at rest.
+Everything box-specific is behind `NQ > G1M_BOX_QPOS`, false on the G1 alone.
+
 Gains and defaults: the generated `unitree_g1_mjlab_pd.mojo`.
 `test_unitree_g1_mjlab_vs_mujoco` drives MuJoCo with a separate Python
 transcription of the same law per substep and compares `qpos`.
@@ -36,6 +41,7 @@ from noeira.physics3d.gpu.constants import (
 )
 from ..phyics3d_env_config import Phyics3dEnvConfig
 from .unitree_g1_mjlab_xml import ROOT_QPOS_SIZE, ROOT_QVEL_SIZE
+from .unitree_g1_mjlab_box_xml import G1M_BOX_QPOS, G1M_BOX_REST_X, G1M_BOX_REST_Z
 from .unitree_g1_mjlab_pd import (
     G1M_N_DOF,
     G1M_INIT_ROOT_Z,
@@ -173,6 +179,10 @@ struct UnitreeG1MjlabConfig(Phyics3dEnvConfig):
         d.qpos.data[3] = Scalar[DTYPE](1)
         for i in range(G1M_N_DOF):
             d.qpos.data[ROOT_QPOS_SIZE + i] = Scalar[DTYPE](g1m_default_pos(i))
+        if D.NQ > G1M_BOX_QPOS:        # the carry-box family: the box at its key pose
+            d.qpos.data[G1M_BOX_QPOS] = Scalar[DTYPE](G1M_BOX_REST_X)
+            d.qpos.data[G1M_BOX_QPOS + 2] = Scalar[DTYPE](G1M_BOX_REST_Z)
+            d.qpos.data[G1M_BOX_QPOS + 3] = Scalar[DTYPE](1)
 
     @staticmethod
     def compute_reward_and_done_cpu[DTYPE: DType, D: DimsLike](
@@ -373,3 +383,7 @@ struct UnitreeG1MjlabConfig(Phyics3dEnvConfig):
         qpos[env, 3] = Scalar[DTYPE](1)
         comptime for i in range(G1M_N_DOF):
             qpos[env, ROOT_QPOS_SIZE + i] = Scalar[DTYPE](g1m_default_pos(i))
+        comptime if NQ > G1M_BOX_QPOS:        # the carry-box family
+            qpos[env, G1M_BOX_QPOS] = Scalar[DTYPE](G1M_BOX_REST_X)
+            qpos[env, G1M_BOX_QPOS + 2] = Scalar[DTYPE](G1M_BOX_REST_Z)
+            qpos[env, G1M_BOX_QPOS + 3] = Scalar[DTYPE](1)
