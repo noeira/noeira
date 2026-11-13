@@ -43,6 +43,7 @@ state already writes (`WorldState.around_lines`).
 
 from .geometry import PlaceAround
 from .state import WorldState, TASK_DONE, TASK_FAILED
+from .memory import focused_memory
 
 
 comptime REPLY_VIEW_LINES: Int = 0
@@ -153,6 +154,23 @@ def task_sentences(ref ws: WorldState) -> String:
     return t + " It was cancelled: " + ws.last_task.reason + "."
 
 
+def memory_section(ref ws: WorldState) -> String:
+    """What the log says of earlier sessions and days (`noeira.brain.memory`),
+    as a section of its own after the facts; "" for a robot without a memory.
+
+    ⚠ APART FROM "true right now", AND WITH ITS EDGE SAID. Mixed into the
+    facts, yesterday's walk was told as this morning's; and asked about last
+    week, the model moved yesterday there (the restart gate,
+    docs/ROBOT_BRAIN_PLAN.md B3)."""
+    if not ws.memory_on:
+        return String("")
+    var t = String("\n\nWhat you remember from before this session (your own log, by day):")
+    # when the utterance names a time ("hier", "this morning"), only that time's lines
+    for m in focused_memory(ws):
+        t += "\n- " + m
+    return t
+
+
 def reply_live(ref ws: WorldState, style: Int = REPLY_VIEW_LINES) -> String:
     """The facts of this moment."""
     var around = ws.around()
@@ -176,7 +194,7 @@ def reply_live(ref ws: WorldState, style: Int = REPLY_VIEW_LINES) -> String:
         else:
             t += " You have not been anywhere else yet."
         t += " You know of no other place or object in this room."
-        return t
+        return t + memory_section(ws)
     var t = String("Facts, true right now:\n- ") + _now_line(ws) + "\n- " + task_sentences(ws) + "\n"
     if len(around) > 0:
         var items = List[String]()
@@ -198,7 +216,7 @@ def reply_live(ref ws: WorldState, style: Int = REPLY_VIEW_LINES) -> String:
     else:
         t += "- You have not been anywhere else yet.\n"
     t += "- You know of no other place or object in this room."
-    return t
+    return t + memory_section(ws)
 
 
 def reply_view(ref ws: WorldState, style: Int = REPLY_VIEW_LINES) -> ReplyView:

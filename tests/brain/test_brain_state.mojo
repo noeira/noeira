@@ -18,13 +18,20 @@
    arrival ends a step, a deadline fails the task and says so, a new request
    cancels the one in hand, a refused command fails its step, and the reply
    view's task line is right at each stage.
+8. Memory across restarts (`noeira.brain.memory`): a day of the log folded by
+   rule, three processes sharing one robot folder (yesterday, this morning,
+   this afternoon), the digest file, a torn and a damaged log line, the last
+   days only, the places file.
 Exits non-zero on a failure.
 """
 
 from std.os import getenv
+from std.os.path import exists
+from std.time import perf_counter_ns
 from std.sys import exit
 
 from noeira.brain import (
+    restore_memory, digest_lines, log_days, when_words, save_places, load_places, time_refs, focused_memory,
     Task, Step, give_task, cancel_task, refuse_step, tick_tasks, notice_text, task_sentences,
     EX_NONE, EX_START, EX_NOTICE, NOTICE_ALL_DONE, NOTICE_NOT_REACHED, NOTICE_REFUSED,
     TASK_DONE, TASK_FAILED, TASK_CANCELLED,
@@ -33,6 +40,8 @@ from noeira.brain import (
     EV_BEGAN, EV_GOING, EV_ARRIVED, EV_HEARD, EV_SESSION,
 )
 from noeira.brain.bb1 import BB1Set, reply_passes, reply_in_language
+from noeira.brain.memory import date_days
+from noeira.core.run import date_utc
 from noeira.text.spoken import spoken_text
 from noeira.core.bytes import string_from_bytes
 from noeira.io.fileio import read_file_bytes, remove_file
@@ -337,6 +346,158 @@ def main() raises:
             bad_task += 1
             print("     ", s.sid, s.task, "|", line)
     check(fails, bad_task == 0, "the BB-1 situations' tasks: " + String(n - bad_task) + " of " + String(n) + " as written")
+
+    print("8. memory across restarts")
+    check(fails, date_days("1970-01-01") == 0 and date_days("2026-11-13") == 20770 and date_days("2024-02-29") == 19782
+          and date_days("1969-12-31") == -1 and date_days(date_utc(20770 * 86400 + 86399)) == 20770, "dates to days and back")
+    check(fails, when_words(0, "2026-11-13") == "Earlier today, before you were restarted" and when_words(1, "2026-11-12") == "Yesterday"
+          and when_words(3, "2026-11-10") == "3 days ago (2026-11-10)", "when, in words")
+    var evs = List[BrainEvent]()
+    evs.append(BrainEvent(1, String(EV_SESSION), String("Noé"), String("brain")))
+    evs.append(BrainEvent(2, String(EV_HEARD), String("Va au frigo."), String("voice")))
+    evs.append(BrainEvent(3, String("task_started"), String("walk to the fridge"), String("executive")))
+    evs.append(BrainEvent(4, String(EV_ARRIVED), String("door"), String("motion")))
+    evs.append(BrainEvent(5, String("task_done"), String("walk to the fridge"), String("executive")))
+    evs.append(BrainEvent(6, String("task_done"), String("walk to the table, then walk to the door"), String("executive")))
+    evs.append(BrainEvent(7, String("task_done"), String("walk to the fridge"), String("executive")))
+    evs.append(BrainEvent(8, String("task_failed"), String("walk to the sofa | the sofa was not reached after 60 seconds"), String("executive")))
+    evs.append(BrainEvent(9, String("task_cancelled"), String("walk to the door | a new request replaced it"), String("executive")))
+    evs.append(BrainEvent(10, String(EV_HEARD), String("Je m'appelle Denis."), String("voice")))
+    evs.append(BrainEvent(11, String("said"), String("Enchanté."), String("voice")))
+    var dl = digest_lines(evs)
+    check(fails, len(dl) == 4 and dl[0] == "You did: walk to the fridge (2 times); walk to the table, then walk to the door."
+          and dl[1] == "You tried and failed: walk to the sofa (the sofa was not reached after 60 seconds)."
+          and dl[2] == "1 task was interrupted by a new request."
+          and dl[3] == "The last things you were asked or told: \"Va au frigo.\"; \"Je m'appelle Denis.\".",
+          "a day folded by rule; an arrival that was no task is not a memory")
+    if len(dl) == 4:
+        for l in dl:
+            print("       ", l)
+    var none_ev = List[BrainEvent]()
+    none_ev.append(BrainEvent(1, String(EV_SESSION), String("Noé"), String("brain")))
+    none_ev.append(BrainEvent(2, String(EV_ARRIVED), String("fridge"), String("motion")))
+    check(fails, len(digest_lines(none_ev)) == 0, "a session where nothing was asked or done leaves no memory")
+
+    var mdir = getenv("TMPDIR", "/tmp") + "/noeira_brain_mem_" + String(perf_counter_ns())
+    var day = 20770 * 86400            # 2026-11-13T00:00:00Z
+    # yesterday: a walk done, a walk failed, three things heard
+    var y = WorldState(Body.g1_room("Noé"), String("a furnished room"))
+    y.places = [PlaceXY("fridge", 3.0, 0.0), PlaceXY("sofa", -4.5, 0.0)]
+    y.call_place(String("sofa"), String("fr"), String("le canapé"))
+    check(fails, load_places(y, mdir) == 0 and len(y.places) == 2, "no places file: nothing read, nothing changed")
+    save_places(y, mdir)
+    restore_memory(y, mdir, day - 86400 + 3600)
+    check(fails, y.memory_on and len(y.remembered) == 0 and y.memory_error == ""
+          and reply_view(y).live.endswith("- You know of no other place or object in this room.\n\nWhat you remember from before this session"
+          " (your own log, by day):\n- Nothing: you remember no earlier session and no earlier day."),
+          "a first start: nothing remembered, and the view says so")
+    y.open_log(mdir, day - 86400 + 3600)
+    y.heard(String("Bonjour."), day - 86400 + 3601)
+    y.heard(String("Je m'appelle Denis."), day - 86400 + 3602)
+    y.said(String("Enchanté, Denis."), day - 86400 + 3603)
+    y.heard(String("Va au frigo."), day - 86400 + 3604)
+    var w1 = Task(String("Va au frigo."))
+    w1.steps.append(Step.goto(String("fridge")))
+    give_task(y, w1^, 0.0, day - 86400 + 3605)
+    _ = tick_tasks(y, 0.0, day - 86400 + 3605)
+    y.observe_motion(String("goto:fridge"), String("none"), String("fridge"), day - 86400 + 3610)
+    _ = tick_tasks(y, 5.0, day - 86400 + 3610)
+    var w2 = Task(String(""))
+    w2.steps.append(Step.goto(String("sofa")))
+    give_task(y, w2^, 10.0, day - 86400 + 3620)
+    _ = tick_tasks(y, 10.0, day - 86400 + 3620)
+    _ = tick_tasks(y, 71.0, day - 86400 + 3681)
+    # this morning, another process: a task of two steps
+    var m = WorldState(Body.g1_room("Noé"), String("a furnished room"))
+    m.open_log(mdir, day + 9 * 3600)
+    m.heard(String("Va à la table, puis à la porte."), day + 9 * 3600 + 1)
+    var w3 = Task(String(""))
+    w3.steps.append(Step.goto(String("table")))
+    w3.steps.append(Step.goto(String("door")))
+    give_task(m, w3^, 0.0, day + 9 * 3600 + 2)
+    _ = tick_tasks(m, 0.0, day + 9 * 3600 + 2)
+    m.observe_motion(String("goto:table"), String("none"), String("table"), day + 9 * 3600 + 5)
+    _ = tick_tasks(m, 3.0, day + 9 * 3600 + 5)
+    _ = tick_tasks(m, 3.1, day + 9 * 3600 + 5)
+    m.observe_motion(String("goto:door"), String("none"), String("door"), day + 9 * 3600 + 9)
+    _ = tick_tasks(m, 7.0, day + 9 * 3600 + 9)
+    # this afternoon: a new process remembers both
+    var r = WorldState(Body.g1_room("Noé"), String("a furnished room"))
+    restore_memory(r, mdir, day + 15 * 3600)
+    var today_line = String(
+        "Earlier today, before you were restarted: You did: walk to the table, then walk to the door."
+        " The last things you were asked or told: \"Va à la table, puis à la porte.\"."
+    )
+    var yesterday_line = String(
+        "Yesterday: You did: walk to the fridge. You tried and failed: walk to the sofa (the sofa was"
+        " not reached after 60 seconds). The last things you were asked or told: \"Bonjour.\";"
+        " \"Je m'appelle Denis.\"; \"Va au frigo.\"."
+    )
+    check(fails, r.memory_error == "" and len(r.remembered) == 2 and r.remembered[0] == today_line and r.remembered[1] == yesterday_line,
+          "a new process remembers this morning and yesterday")
+    if len(r.remembered) != 2 or r.remembered[0] != today_line or r.remembered[1] != yesterday_line:
+        for l in r.remembered:
+            print("       ", l)
+        print("        error:", r.memory_error)
+    check(fails, reply_view(r).live.endswith("\n\nWhat you remember from before this session (your own log, by day):\n- " + today_line
+          + "\n- " + yesterday_line + "\n- Nothing else: you remember no other day."),
+          "and the reply view carries both, the most recent first")
+    # the time words of the question select the day
+    r.asked = String("Qu'as-tu fait hier ?")
+    var fm = focused_memory(r)
+    check(fails, len(fm) == 1 and fm[0] == yesterday_line and reply_view(r).live.endswith("(your own log, by day):\n- " + yesterday_line),
+          "'hier': yesterday's line alone")
+    r.asked = String("What did you do this morning?")
+    check(fails, len(focused_memory(r)) == 1 and focused_memory(r)[0] == today_line, "'this morning': today's earlier session alone")
+    r.asked = String("Qu'as-tu fait la semaine dernière ?")
+    check(fails, len(focused_memory(r)) == 1 and focused_memory(r)[0]
+          == "About last week: nothing. Your log has no entry for last week, so you do not know what you did then.",
+          "'la semaine dernière': the log has nothing, and the line says so")
+    r.asked = String("Et avant-hier ? Et aujourd'hui ?")
+    check(fails, len(focused_memory(r)) == 2 and focused_memory(r)[0].startswith("About the day before yesterday: nothing.")
+          and focused_memory(r)[1] == today_line, "'avant-hier' is not 'hier'; two times named, two answers")
+    r.asked = String("Où est le frigo ?")
+    check(fails, len(focused_memory(r)) == 3 and focused_memory(r)[2] == "Nothing else: you remember no other day.", "no time named: everything")
+    var refs = time_refs(String("Le cahier est sur la table."))
+    check(fails, len(refs) == 0 and len(time_refs(String("Yesterday?"))) == 1 and time_refs(String("Yesterday?"))[0].lo == 1,
+          "'cahier' does not contain 'hier' as a word")
+    r.asked = String("")
+    var digest = string_from_bytes(read_file_bytes(mdir + "/digest/2026-11-12.md"))
+    check(fails, digest.startswith("# 2026-11-12\n\n- You did: walk to the fridge.\n- You tried and failed: walk to the sofa")
+          and not exists(mdir + "/digest/2026-11-13.md"), "yesterday's digest is written for a person; today's is not, its log is still growing")
+    check(fails, load_places(r, mdir) == 2 and r.places[1].name == "sofa" and r.places[1].x == -4.5
+          and r.word_for(String("sofa"), String("fr")) == "le canapé" and r.word_for(String("fridge"), String("fr")) == "the fridge",
+          "the places and their names come back from places.json")
+    # a torn last line is skipped; a damaged line in the middle leaves its day out and says so
+    with open(mdir + "/log/2026-11-13.jsonl", "a") as f:
+        f.write("{\"t\":17945")
+    var torn = WorldState(Body.g1_room("Noé"), String("a furnished room"))
+    restore_memory(torn, mdir, day + 15 * 3600)
+    check(fails, torn.memory_error == "" and len(torn.remembered) == 2 and torn.remembered[0] == today_line, "a torn last line is skipped")
+    with open(mdir + "/log/2026-11-13.jsonl", "a") as f:
+        f.write("\n" + event_json(BrainEvent(day + 16 * 3600, String(EV_HEARD), String("encore"), String("voice"))) + "\n")
+    var broken = WorldState(Body.g1_room("Noé"), String("a furnished room"))
+    restore_memory(broken, mdir, day + 17 * 3600)
+    check(fails, broken.memory_error.find("line") >= 0 and len(broken.remembered) == 1 and broken.remembered[0] == yesterday_line,
+          "a damaged line in the middle: that day is left out and reported: " + broken.memory_error)
+    # only the last files are read, however old, and an old day is dated
+    var old = WorldState(Body.g1_room("Noé"), String("a furnished room"))
+    old.open_log(mdir, day - 9 * 86400)
+    old.heard(String("il y a très longtemps"), day - 9 * 86400 + 1)
+    var old2 = WorldState(Body.g1_room("Noé"), String("a furnished room"))
+    old2.open_log(mdir, day - 5 * 86400)
+    old2.heard(String("il y a longtemps"), day - 5 * 86400 + 1)
+    var days_seen = log_days(mdir)
+    check(fails, len(days_seen) == 4 and days_seen[0] == "2026-11-04" and days_seen[1] == "2026-11-08" and days_seen[3] == "2026-11-13",
+          "the log's days, oldest first")
+    var later = WorldState(Body.g1_room("Noé"), String("a furnished room"))
+    restore_memory(later, mdir, day + 2 * 86400 + 60)
+    check(fails, len(later.remembered) == 2 and later.remembered[0].startswith("3 days ago (2026-11-12): You did: walk to the fridge.")
+          and later.remembered[1] == "7 days ago (2026-11-08): The last things you were asked or told: \"il y a longtemps\".",
+          "two days later: the last three files are read (one is damaged), the fourth is left out, each day is dated")
+    if len(later.remembered) != 2:
+        for l in later.remembered:
+            print("       ", l)
 
     print("ALL PASS" if fails == 0 else String(fails) + " FAILED")
     if fails != 0:

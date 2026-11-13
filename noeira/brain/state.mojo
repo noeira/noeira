@@ -210,6 +210,23 @@ struct WorldState(Movable):
     var last_task: Task
     """The last task that ended: done, failed or cancelled."""
 
+    var memory_on: Bool
+    """`noeira.brain.memory.restore_memory` was called: the reply view then
+    says what the robot remembers from before this session, or that it
+    remembers nothing."""
+    var remembered: List[String]
+    """One line per earlier stretch of the log, the most recent first:
+    `Yesterday: You did: ...`."""
+    var remembered_ago: List[Int]
+    """For each line of `remembered`, how many days ago its day was (0 = an
+    earlier session of today)."""
+    var asked: String
+    """The utterance being answered, when the caller has it. The reply view
+    selects the memory by its time words (`noeira.brain.memory.focused_memory`);
+    "" = no selection."""
+    var memory_error: String
+    """What `restore_memory` could not read; "" when nothing."""
+
     var events: List[BrainEvent]
     """The last `WS_EVENTS_N` events, oldest first."""
     var log: Optional[EventLog]
@@ -233,6 +250,11 @@ struct WorldState(Movable):
         self.task = Task(String(""))
         self.has_last_task = False
         self.last_task = Task(String(""))
+        self.memory_on = False
+        self.remembered = List[String]()
+        self.remembered_ago = List[Int]()
+        self.asked = String("")
+        self.memory_error = String("")
         self.events = List[BrainEvent]()
         self.log = None
         self.log_error = String("")
