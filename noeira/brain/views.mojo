@@ -44,6 +44,7 @@ state already writes (`WorldState.around_lines`).
 from .geometry import PlaceAround
 from .state import WorldState, TASK_DONE, TASK_FAILED
 from .memory import focused_memory
+from .people import asks_identity, identity_answer
 
 
 comptime REPLY_VIEW_LINES: Int = 0
@@ -129,6 +130,36 @@ def _now_line(ref ws: WorldState) -> String:
     return t
 
 
+def speaker_sentence(ref ws: WorldState) -> String:
+    """Who the robot is talking with, from `noeira.brain.people`; "" for a
+    robot without a people store.
+
+    ⚠ "A PERSON WHOSE NAME IS", NEVER A BARE QUOTE. Given the remembered
+    sentence « Je m'appelle Denis. », the reply model answered that ITS name
+    was Denis (the restart gate, B3). The name is stated as the person's."""
+    if not ws.people_on:
+        return String("")
+    var t = String("You do not know who is talking to you: nobody has told you their name yet.")
+    if ws.speaker_said_name != "":
+        return "The person talking to you has just told you their name: " + ws.speaker_said_name + ". That is the person's name, not yours."
+    if ws.speaker_pending:
+        t = String("The voice of the person talking to you is still being checked: you do not know yet who it is.")
+    elif ws.speaker != "" and ws.speaker_sure:
+        t = "You are talking with a person whose name is " + ws.speaker + ": you recognise their voice."
+    elif ws.speaker != "":
+        t = ("The voice of the person talking to you resembles the voice of " + ws.speaker
+             + ", a person you know, but you are not sure it is " + ws.speaker + ".")
+    elif len(ws.people_known) > 0:
+        # ⚠ NO NAME HERE. With "the people you know by name: Denis" in this line, the reply model greeted
+        # a stranger with « je ne reconnais pas la voix de Denis »: whom the robot knows is not for a
+        # voice it does not know.
+        t = String("You do not recognise the voice of the person talking to you: you do not know who it is.")
+    if asks_identity(ws.asked):
+        # the answer is computed, not composed (`people.identity_answer`)
+        t += " The person is asking who they are. Answer with exactly this sentence and nothing else: \"" + identity_answer(ws) + "\""
+    return t
+
+
 def task_sentences(ref ws: WorldState) -> String:
     """The task in hand, or the last one and how it ended, in words (from
     `noeira.brain.tasks`' record): what "what are you doing?", "what next?"
@@ -178,6 +209,8 @@ def reply_live(ref ws: WorldState, style: Int = REPLY_VIEW_LINES) -> String:
     var nearest = ws.nearest()
     if style == REPLY_VIEW_SENTENCES:
         var t = "Right now: " + _now_line(ws) + " " + task_sentences(ws)
+        if ws.people_on:
+            t += " " + speaker_sentence(ws)
         for p in around:
             if p.name == ws.at:
                 continue
@@ -195,7 +228,10 @@ def reply_live(ref ws: WorldState, style: Int = REPLY_VIEW_LINES) -> String:
             t += " You have not been anywhere else yet."
         t += " You know of no other place or object in this room."
         return t + memory_section(ws)
-    var t = String("Facts, true right now:\n- ") + _now_line(ws) + "\n- " + task_sentences(ws) + "\n"
+    var t = String("Facts, true right now:\n")
+    if ws.people_on:
+        t += "- " + speaker_sentence(ws) + "\n"
+    t += "- " + _now_line(ws) + "\n- " + task_sentences(ws) + "\n"
     if len(around) > 0:
         var items = List[String]()
         for p in around:

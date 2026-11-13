@@ -22,6 +22,10 @@
    rule, three processes sharing one robot folder (yesterday, this morning,
    this afternoon), the digest file, a torn and a damaged log line, the last
    days only, the places file.
+9. People (`noeira.brain.people`): a name given in the first person and
+   nothing else; a voice stored under it, recognised, resembling, unknown;
+   a second person; a rename; another process reading the store back;
+   forgetting; a damaged voice file.
 Exits non-zero on a failure.
 """
 
@@ -31,6 +35,7 @@ from std.time import perf_counter_ns
 from std.sys import exit
 
 from noeira.brain import (
+    People, name_given, asks_identity, identity_answer, speaker_sentence,
     restore_memory, digest_lines, log_days, when_words, save_places, load_places, time_refs, focused_memory,
     Task, Step, give_task, cancel_task, refuse_step, tick_tasks, notice_text, task_sentences,
     EX_NONE, EX_START, EX_NOTICE, NOTICE_ALL_DONE, NOTICE_NOT_REACHED, NOTICE_REFUSED,
@@ -368,7 +373,7 @@ def main() raises:
     check(fails, len(dl) == 4 and dl[0] == "You did: walk to the fridge (2 times); walk to the table, then walk to the door."
           and dl[1] == "You tried and failed: walk to the sofa (the sofa was not reached after 60 seconds)."
           and dl[2] == "1 task was interrupted by a new request."
-          and dl[3] == "The last things you were asked or told: \"Va au frigo.\"; \"Je m'appelle Denis.\".",
+          and dl[3] == "The last things you were asked or told: \"Va au frigo.\"; a person told you their name.",
           "a day folded by rule; an arrival that was no task is not a memory")
     if len(dl) == 4:
         for l in dl:
@@ -431,7 +436,7 @@ def main() raises:
     var yesterday_line = String(
         "Yesterday: You did: walk to the fridge. You tried and failed: walk to the sofa (the sofa was"
         " not reached after 60 seconds). The last things you were asked or told: \"Bonjour.\";"
-        " \"Je m'appelle Denis.\"; \"Va au frigo.\"."
+        " a person told you their name; \"Va au frigo.\"."
     )
     check(fails, r.memory_error == "" and len(r.remembered) == 2 and r.remembered[0] == today_line and r.remembered[1] == yesterday_line,
           "a new process remembers this morning and yesterday")
@@ -498,6 +503,101 @@ def main() raises:
     if len(later.remembered) != 2:
         for l in later.remembered:
             print("       ", l)
+
+    print("9. people")
+    check(fails, name_given("Je m'appelle Denis.") == "Denis" and name_given("je m'appelle denis") == "Denis"
+          and name_given("Bonjour, moi c'est Claire !") == "Claire" and name_given("My name is Jean Dupont.") == "Jean Dupont"
+          and name_given("Je m'appelle Denis et toi ?") == "Denis" and name_given("Call me Sam, please") == "Sam"
+          and name_given("Je m\u2019appelle Zoé.") == "Zoé", "a name given in the first person")
+    check(fails, name_given("Il s'appelle Paul.") == "" and name_given("Je suis fatigué.") == "" and name_given("Comment tu t'appelles ?") == ""
+          and name_given("my name is not important") == "" and name_given("Je m'appelle") == "" and name_given("Où est le frigo ?") == "",
+          "someone else's name, a state, a question, a non-name: nothing")
+    var pdir = getenv("TMPDIR", "/tmp") + "/noeira_brain_people_" + String(perf_counter_ns())
+    var pp = People(pdir)
+    var pw = WorldState(Body.g1_room("Noé"), String("a furnished room"))
+    pw.people_on = True
+    var va: List[Float32] = [1.0, 0.0, 0.0, 0.0]
+    var va2: List[Float32] = [0.9, 0.0, 0.43589, 0.0]       # cosine 0.9 with va
+    var va3: List[Float32] = [0.40, 0.0, 0.0, 0.9165]       # cosine 0.40 with va: resembles
+    var va4: List[Float32] = [0.34, 0.0, 0.0, 0.9404]       # cosine 0.34: what a stranger can reach
+    var vb: List[Float32] = [0.0, 2.0, 0.0, 0.0]            # another voice (not of length 1 on purpose)
+    pp.heard(pw, String("Bonjour."), 1000)
+    pp.voice(pw, va, 1001)
+    check(fails, pw.speaker == "" and len(pp.list) == 0
+          and speaker_sentence(pw) == "You do not know who is talking to you: nobody has told you their name yet.", "an unknown voice, nobody known")
+    pp.heard(pw, String("Comment je m'appelle ?"), 1005)
+    pw.asked = String("Comment je m'appelle ?")
+    pw.language = String("fr")
+    check(fails, pw.speaker_pending and speaker_sentence(pw) == "The voice of the person talking to you is still being checked: you do not know yet"
+          " who it is. The person is asking who they are. Answer with exactly this sentence and nothing else:"
+          " \"Un instant, je n'ai pas encore reconnu ta voix.\"", "a voice not compared yet: nobody's name is given out")
+    pp.voice(pw, va, 1006)
+    check(fails, not pw.speaker_pending and identity_answer(pw) == "Je ne sais pas : tu ne m'as pas encore dit ton nom.", "asked by a voice nobody gave a name to")
+    pw.asked = String("")
+    pw.language = String("")
+    pp.heard(pw, String("Je m'appelle Denis."), 1010)
+    check(fails, speaker_sentence(pw) == "The person talking to you has just told you their name: Denis. That is the person's name, not yours.",
+          "the name is in the view as soon as it is heard, before the voice is known")
+    pp.voice(pw, va, 1012)
+    check(fails, pp.take_met(String("fr")) == "Enchanté, Denis." and pp.take_met(String("fr")) == "", "the introduction is acknowledged, once, with the name said back")
+    check(fails, pw.speaker == "Denis" and pw.speaker_sure and len(pp.list) == 1 and len(pp.list[0].voices) == 1 and pw.speaker_said_name == ""
+          and speaker_sentence(pw) == "You are talking with a person whose name is Denis: you recognise their voice.", "the voice is stored under the name")
+    check(fails, reply_view(pw).live.startswith("Facts, true right now:\n- You are talking with a person whose name is Denis: you recognise their voice.\n- You are standing"),
+          "the reply view starts with who is talking")
+    pw.asked = String("Do you recognise me?")
+    check(fails, asks_identity(pw.asked) and identity_answer(pw) == "Your name is Denis." and speaker_sentence(pw).endswith(
+          "The person is asking who they are. Answer with exactly this sentence and nothing else: \"Your name is Denis.\""), "asked by Denis: the exact answer is in the view")
+    pw.language = String("fr")
+    check(fails, identity_answer(pw) == "Tu t'appelles Denis." and asks_identity("Comment je m\u2019appelle ?") and asks_identity("Qui suis-je ?")
+          and not asks_identity("Comment tu t'appelles ?") and not asks_identity("Où est le frigo ?"), "in French; and what is not a question about the speaker")
+    pw.asked = String("")
+    pw.language = String("")
+    pp.heard(pw, String("Où est le frigo ?"), 1020)
+    pp.voice(pw, va2, 1021)
+    check(fails, pw.speaker == "Denis" and pw.speaker_sure and len(pp.list[0].voices) == 2 and abs(pw.speaker_score - 0.9) < 1e-3,
+          "the same voice later: recognised (0.9), and kept as another sample")
+    pp.voice(pw, va4, 1025)
+    check(fails, pw.speaker == "" and len(pp.list[0].voices) == 2, "0.34, seconds after Denis spoke: NOT Denis (a recognition does not carry over)")
+    pp.voice(pw, va3, 1030)
+    pw.language = String("fr")
+    check(fails, identity_answer(pw) == "Je crois que tu es Denis, mais je n'en suis pas sûr.", "a voice that resembles: said as a belief")
+    pw.language = String("")
+    check(fails, pw.speaker == "Denis" and not pw.speaker_sure
+          and speaker_sentence(pw) == "The voice of the person talking to you resembles the voice of Denis, a person you know, but you are not sure it is Denis.",
+          "0.40: it resembles Denis, not sure")
+    pp.voice(pw, vb, 2000)
+    check(fails, pw.speaker == "" and speaker_sentence(pw) == "You do not recognise the voice of the person talking to you: you do not know who it is."
+          and reply_view(pw).text().find("Denis") < 0, "another voice: not recognised, and the name it knows is nowhere in the prompt")
+    check(fails, identity_answer(pw) == "I do not recognise your voice.", "a stranger asking gets no name")
+    pp.heard(pw, String("Moi c'est Claire."), 2010)
+    pp.voice(pw, vb, 2011)
+    check(fails, pw.speaker == "Claire" and len(pp.list) == 2 and pp.list[1].id == "p2", "a second person")
+    pp.heard(pw, String("Non, je m'appelle Dennis."), 2020)
+    pp.voice(pw, va, 2021)
+    check(fails, pw.speaker == "Dennis" and len(pp.list) == 2 and pp.list[0].name == "Dennis" and pp.list[0].id == "p1",
+          "a known voice gives another name: the same person, renamed")
+    var met = String("")
+    for ev in pw.events:
+        if ev.kind == "met":
+            met += ev.text + " ; "
+    check(fails, met == "Denis ; Claire ; Dennis | the voice known as Denis gave this name ; ", "the record of who was met: " + met)
+    # another process
+    var p2 = People.load(pdir)
+    var pw2 = WorldState(Body.g1_room("Noé"), String("a furnished room"))
+    pw2.people_on = True
+    check(fails, p2.error == "" and len(p2.list) == 2 and p2.list[0].name == "Dennis" and len(p2.list[0].voices) == 3
+          and p2.list[1].name == "Claire" and abs(Float64(p2.list[1].voices[0][1]) - 1.0) < 1e-6 and p2.next_id == 3,
+          "read back by another process: names, voices (stored at length 1), the next id")
+    p2.heard(pw2, String("Comment je m'appelle ?"), 5000)
+    p2.voice(pw2, va2, 5001)
+    check(fails, pw2.speaker == "Dennis" and pw2.speaker_sure, "and the voice is recognised there")
+    check(fails, p2.forget(String("Claire")) and len(p2.list) == 1 and not exists(pdir + "/people/p2.voice") and not p2.forget(String("Claire")),
+          "forget: the person and the voice file are gone")
+    p2.voice(pw2, vb, 5010)
+    check(fails, pw2.speaker == "" and len(People.load(pdir).list) == 1, "and that voice is unknown again, here and on disk")
+    with open(pdir + "/people/p1.voice", "w") as f:
+        f.write("short")
+    check(fails, People.load(pdir).error.find("p1.voice") >= 0, "a damaged voice file is reported: " + People.load(pdir).error)
 
     print("ALL PASS" if fails == 0 else String(fails) + " FAILED")
     if fails != 0:

@@ -51,6 +51,7 @@ from .events import (
 )
 from .bb1 import normalise, has_phrase
 from .geometry import PlaceXY
+from .people import name_given
 from .state import WorldState
 
 
@@ -139,7 +140,15 @@ def digest_lines(ref events: List[BrainEvent]) -> List[String]:
             cancelled += 1
         elif e.kind == EV_HEARD:
             heard_n += 1
-            heard.append(_cut(e.text, MEM_HEARD_CHARS))
+            # ⚠ a self-introduction is kept as a FACT, not as a quote: « Je m'appelle Denis. » quoted
+            # in the memory was read by the reply model as the robot's own name, and given to a stranger
+            # The fact has no name in it either: names live in the people store and come out only for the
+            # voice they belong to (`people.identity_answer`), not for whoever asks about yesterday.
+            var named = name_given(e.text)
+            if named != "":
+                heard.append(String("a person told you their name"))
+            else:
+                heard.append("\"" + _cut(e.text, MEM_HEARD_CHARS) + "\"")
     var lines = List[String]()
     if len(done) > 0:
         var t = String("You did: ")
@@ -172,7 +181,7 @@ def digest_lines(ref events: List[BrainEvent]) -> List[String]:
         for i in range(first, len(heard)):
             if i > first:
                 t += "; "
-            t += "\"" + heard[i] + "\""
+            t += heard[i]
         lines.append(t + ".")
     return lines^
 

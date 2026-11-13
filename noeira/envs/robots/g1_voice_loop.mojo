@@ -476,6 +476,13 @@ struct G1VoiceLoopOf[
     var t_wait: Int
     var mute_until: Int
     var seg: List[Int16]
+    var seg_keep: List[Int16]
+    """The utterance last sent to the recogniser, until `take_segment`."""
+    var reply_override: String
+    """What to say INSTEAD of asking the reply model, when not empty
+    (`set_reply_override`)."""
+    var canned: String
+    """A computed reply on its way out (one poll)."""
     var ring: List[Int16]
     var ring_max: Int
     var floor: Float64
@@ -615,6 +622,9 @@ struct G1VoiceLoopOf[
         self.t_wait = perf_counter_ns()
         self.mute_until = perf_counter_ns()
         self.seg = List[Int16]()
+        self.seg_keep = List[Int16]()
+        self.reply_override = String("")
+        self.canned = String("")
         self.ring = List[Int16]()
         self.ring_max = Int(VL_PREROLL_S * 16000.0)
         self.floor = 0.0010
@@ -668,6 +678,9 @@ struct G1VoiceLoopOf[
         self.t_wait = move.t_wait
         self.mute_until = move.mute_until
         self.seg = move.seg^
+        self.seg_keep = move.seg_keep^
+        self.reply_override = move.reply_override^
+        self.canned = move.canned^
         self.ring = move.ring^
         self.ring_max = move.ring_max
         self.floor = move.floor
@@ -849,6 +862,27 @@ struct G1VoiceLoopOf[
         the state changes. A reply already started keeps the one it had."""
         self.cfg.chat_sys = text^
 
+    def set_reply_override(mut self, var text: String):
+        """A reply the caller has COMPUTED for the utterance being handled: when
+        a reply is due and this is not empty, it is said as it is and the reply
+        model is not asked. "" (the default) = the model replies.
+
+        For an answer that must be exact: who the speaker is
+        (`noeira.brain.people.identity_answer`). Told to say that sentence in
+        its prompt, the reply model still answered « Je m'appelle Noé » when
+        the question came through the no-command route and its hint. Set it
+        before `poll`, each frame, as `set_reply_system`."""
+        self.reply_override = text^
+
+    def take_segment(mut self) -> List[Int16]:
+        """The samples (16 kHz mono) of the utterance last sent to the
+        recogniser, consumed; empty when none is waiting. For a caller that
+        wants the VOICE as well as the words (`noeira.audio.speaker`,
+        `noeira.brain.people`): take it when `take_heard` gives the words."""
+        var s = self.seg_keep^
+        self.seg_keep = List[Int16]()
+        return s^
+
     def take_heard(mut self) -> String:
         """The utterance just sent for a decision, consumed; "" when none.
         For `G1Context.heard_said`: logged after its own state was built, so
@@ -1016,6 +1050,7 @@ struct G1VoiceLoopOf[
                 else:
                     try:
                         var audio = WavAudio(16000, 1, self.seg.copy())
+                        self.seg_keep = self.seg.copy()
                         self.stt.start(audio)
                         self.t_wait = perf_counter_ns()
                         self.note = (String("[stt] ") + String(len(self.seg))
@@ -1195,6 +1230,17 @@ struct G1VoiceLoopOf[
                     ready = True
                 if ready:
                     ev = self._spec(bank)
+
+        # ── a computed reply (`set_reply_override`): out at once ───────
+        elif self.state == VL_ST_CHAT and self.canned != "":
+            var ctxt = spoken_text(self.canned)
+            self.canned = String("")
+            self._add_note(String("[said] ") + ctxt + String("  (computed)"))
+            if not self.cfg.mute:
+                self.say(ctxt)
+            ev.kind = VL_TALK
+            ev.text = ctxt
+            self.state = VL_ST_IDLE
 
         # ── the reply ─────────────────────────────────────────────────
         elif self.state == VL_ST_CHAT:
@@ -1410,6 +1456,13 @@ struct G1VoiceLoopOf[
     def _reply(mut self, hint: String, note: String):
         """A spoken reply and nothing else: the robot's motion is unchanged.
         `hint` is added to the reply's system prompt ("" = a plain reply)."""
+        if self.reply_override != "":
+            # a computed reply: said as it is, the model is not asked
+            self.canned = self.reply_override
+            self.t_wait = perf_counter_ns()
+            self.note = note
+            self.state = VL_ST_CHAT
+            return
         try:
             var msgs = List[ChatMessage]()
             msgs.append(ChatMessage.user(self.heard))
@@ -1509,9 +1562,12 @@ struct G1VoiceLoopOf[
                 try:
                     var msgs = List[ChatMessage]()
                     msgs.append(ChatMessage.user(self.heard))
-                    self.llm.start(
-                        msgs, self.cfg.chat_sys, List[ToolSpec](), False
-                    )
+                    if self.reply_override != "":
+                        self.canned = self.reply_override   # computed: the model is not asked
+                    else:
+                        self.llm.start(
+                            msgs, self.cfg.chat_sys, List[ToolSpec](), False
+                        )
                     self.t_wait = perf_counter_ns()
                     self.note = (String("[talk] ") + _vl_f2(self.pick.conf)
                                  + self._jev_ms(ans.latency_ms))

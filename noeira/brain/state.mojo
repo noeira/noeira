@@ -210,6 +210,26 @@ struct WorldState(Movable):
     var last_task: Task
     """The last task that ended: done, failed or cancelled."""
 
+    var speaker: String
+    """Who is talking to the robot, by voice (`noeira.brain.people`); "" when
+    the voice is unknown or no voice was heard yet."""
+    var speaker_sure: Bool
+    """The voice IS `speaker`'s; False = it only resembles it."""
+    var speaker_score: Float64
+    var speaker_since: Int
+    """Epoch seconds: when `speaker` first gave their name."""
+    var speaker_said_name: String
+    """The name the utterance being answered gives for its speaker, before
+    its voice is known; "" otherwise."""
+    var speaker_pending: Bool
+    """The utterance being answered has been heard and its voice is still
+    being compared: who spoke is not known yet."""
+    var people_on: Bool
+    """A people store is in use: the reply view says who is talking, or that
+    the robot does not know."""
+    var people_known: List[String]
+    """The names of the people the robot knows."""
+
     var memory_on: Bool
     """`noeira.brain.memory.restore_memory` was called: the reply view then
     says what the robot remembers from before this session, or that it
@@ -250,6 +270,14 @@ struct WorldState(Movable):
         self.task = Task(String(""))
         self.has_last_task = False
         self.last_task = Task(String(""))
+        self.speaker = String("")
+        self.speaker_sure = False
+        self.speaker_score = 0.0
+        self.speaker_since = 0
+        self.speaker_said_name = String("")
+        self.speaker_pending = False
+        self.people_on = False
+        self.people_known = List[String]()
         self.memory_on = False
         self.remembered = List[String]()
         self.remembered_ago = List[Int]()

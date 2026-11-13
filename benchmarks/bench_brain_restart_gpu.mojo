@@ -21,14 +21,15 @@ content (`b` is the held-out one: the memory's wording was adjusted on `a`):
 
 `ask` is another process, on the afternoon of 2026-11-13. It builds a state
 with NO place given, reads the places and the memory back from the folder
-(`load_places`, `restore_memory`), and asks the reply model sixteen questions
-(eight in French, eight in English) as the voice loop does, scored by rule
+(`load_places`, `restore_memory`, `People.load`), and asks the reply model
+eighteen questions (nine in French, nine in English) as the voice loop does, scored by rule
 (`noeira.brain.bb1.reply_passes`): what it did yesterday (yesterday's place and
 none of this morning's), whether it reached the place it failed to reach, what
 it did this morning, whether it has been to this morning's second place, the
-speaker's name (as the speaker's, not its own), what was asked this morning,
-where a place is, and what it did last week (which it cannot know: saying so
-is the right answer).
+speaker's name (as the speaker's, not its own; the people store was read back
+too, and the question comes with the person's voice), what was asked this
+morning, where a place is; and two it must NOT answer: what it did last week,
+and the name of a voice it has never heard.
 
 On an empty folder only the last kind can pass: that run shows the answers of
 the first come from the folder.
@@ -41,7 +42,7 @@ from max.gpu.host import DeviceContext
 
 from noeira.brain import (
     WorldState, Body, PlaceXY, Task, Step, give_task, tick_tasks, restore_memory, save_places, load_places,
-    reply_view, places_around,
+    reply_view, places_around, People, asks_identity, identity_answer,
 )
 from noeira.brain.bb1 import reply_passes, reply_in_language
 from noeira.llm.lfm3 import Lfm3Chat, ChatSettings, answer_of
@@ -117,6 +118,14 @@ def write(dir: String, sc: Scenario) raises:
     y.heard(String("Bonjour."), y0 + 10)
     y.said(String("Bonjour !"), y0 + 11)
     y.heard("Je m'appelle " + sc.person + ".", y0 + 20)
+    # the person gives their name: the people store keeps it with the voice that said it
+    var people = People(dir.copy())
+    y.people_on = True
+    people.heard(y, "Je m'appelle " + sc.person + ".", y0 + 20)
+    var their_voice: List[Float32] = [1.0, 0.0, 0.0, 0.0]
+    people.voice(y, their_voice, y0 + 22)
+    if people.error != "":
+        raise Error("the people store was not written: " + people.error)
     y.said("Enchanté, " + sc.person + ".", y0 + 21)
     y.heard("Va " + fr_to(sc.y_done) + ".", y0 + 30)
     var a = Task(String(""))
@@ -149,13 +158,22 @@ def write(dir: String, sc: Scenario) raises:
     print("written:", dir, "| this morning's process remembered", len(m.remembered), "line(s) of yesterday")
 
 
-@fieldwise_init
 struct Q(Copyable, Movable):
     var cat: String
     var lang: String
     var text: String
     var must: String
     var forbid: String
+    var stranger: Bool
+    """Asked by a voice the robot has never heard."""
+
+    def __init__(out self, cat: String, lang: String, text: String, must: String, forbid: String, stranger: Bool = False):
+        self.cat = cat.copy()
+        self.lang = lang.copy()
+        self.text = text.copy()
+        self.must = must.copy()
+        self.forbid = forbid.copy()
+        self.stranger = stranger
 
 
 def side_words(bearing: String) -> String:
@@ -208,7 +226,20 @@ def ask(dir: String, sc: Scenario, out_path: String, model_dir: String) raises:
     qs.append(Q("place", "en", "Where is " + en[2] + "?", side_words(side), String("")))
     qs.append(Q("too_old", "fr", "Qu'as-tu fait la semaine dernière ?", String(NOTHING), all_places))
     qs.append(Q("too_old", "en", "What did you do last week?", String(NOTHING), all_places))
+    # the same question from a voice the robot has never heard: it must not hand out the name it knows
+    var unknown_voice = String(FORGOT) + "|ne reconnais pas|don't recognise|don't recognize|do not recognise|do not recognize|ne te connais pas|ne vous connais pas"
+    qs.append(Q("stranger", "fr", "Comment je m'appelle ?", unknown_voice, sc.person.copy(), True))
+    qs.append(Q("stranger", "en", "What is my name?", unknown_voice, sc.person.copy(), True))
 
+    # who is talking: the store read back from the folder; every question comes with a voice, the
+    # person's own (a little different from the one stored: cosine 0.9) or a stranger's
+    var people = People.load(dir)
+    people.dir = String("")          # asking must not write to the folder
+    ws.people_on = True
+    ws.people_known = people.names()
+    var near_voice: List[Float32] = [0.9, 0.0, 0.43589, 0.0]
+    var other_voice: List[Float32] = [0.0, 1.0, 0.0, 0.0]
+    print("    people read back:", len(people.list), ("| " + people.error) if people.error != "" else String(""))
     var chat = Lfm3Chat.load(DeviceContext(), model_dir, 4096, True)
     var settings = ChatSettings()
     settings.max_tokens = 120
@@ -222,6 +253,11 @@ def ask(dir: String, sc: Scenario, out_path: String, model_dir: String) raises:
     for q in qs:
         ws.language = q.lang.copy()
         ws.asked = q.text.copy()     # the utterance being answered: its time words select the memory
+        people.heard(ws, q.text, now)
+        if q.stranger:
+            people.voice(ws, other_voice, now)
+        else:
+            people.voice(ws, near_voice, now)
         var system = reply_view(ws).text()
         chat.reset(system)
         sys_tokens = len(chat.prompt_ids())
@@ -233,13 +269,16 @@ def ask(dir: String, sc: Scenario, out_path: String, model_dir: String) raises:
         var ms = Float64(perf_counter_ns() - t0) / 1e6
         total_ms += ms
         var reply = spoken_text(answer_of(chat.reply_text()))
+        if asks_identity(q.text):
+            # as the demo does (`G1VoiceLoop.set_reply_override`): who the speaker is, is computed, never composed
+            reply = identity_answer(ws)
         var ok = reply_passes(reply, q.must, q.forbid)
         var in_lang = reply_in_language(reply, q.lang)
         if ok:
             ok_n += 1
         if in_lang:
             lang_n += 1
-        if q.cat != "too_old":
+        if q.cat != "too_old" and q.cat != "stranger":
             known_n += 1
             if ok:
                 known_ok += 1

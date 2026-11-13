@@ -41,6 +41,12 @@ comptime EV_GOING = "going"
 """The robot set off for a place; `text` = the place."""
 comptime EV_ARRIVED = "arrived"
 """The robot arrived; `text` = the place."""
+comptime EV_MET = "met"
+"""A person gave their name; `text` = the name (then " | " and a note when a
+known voice gave another name)."""
+comptime EV_SPEAKER = "speaker"
+"""Whose voice an utterance was: `text` = `<name> | sure 0.71`, `<name> |
+maybe 0.38` or `unknown | 0.12`."""
 comptime EV_TASK_STARTED = "task_started"
 """The executive took a task; `text` = its steps in words."""
 comptime EV_STEP_STARTED = "step_started"
