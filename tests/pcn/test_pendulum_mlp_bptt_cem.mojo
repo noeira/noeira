@@ -695,9 +695,14 @@ def main() raises:
             theta = stepped[0]
             theta_dot = stepped[1]
 
+            # Training only ever calls the encoder with prev_z = 0 and action = 0
+            # (the t = 0 bootstrap), so the filter must call it the same way.
+            # Feeding it `agent_z` and the action drove 65 of its 69 input
+            # columns, which are still at their Xavier init, and that alone
+            # took CartPole from 5/5 to 0/5.
             for j in range(HIDDEN):
-                enc_input_buf[j] = agent_z_buf[j]
-            enc_input_buf[HIDDEN] = Scalar[dtype](action_norm)
+                enc_input_buf[j] = Scalar[dtype](0.0)
+            enc_input_buf[HIDDEN] = Scalar[dtype](0.0)
             enc_input_buf[HIDDEN + ACTION_DIM + 0] = Scalar[dtype](cos(theta))
             enc_input_buf[HIDDEN + ACTION_DIM + 1] = Scalar[dtype](sin(theta))
             enc_input_buf[HIDDEN + ACTION_DIM + 2] = Scalar[dtype](

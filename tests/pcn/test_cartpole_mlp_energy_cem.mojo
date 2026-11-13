@@ -25,7 +25,9 @@ Run:
 from std.math import sqrt, log, cos, sin, tanh, pi
 from std.memory import alloc, unsafe_memset
 from std.random.philox import Random as PhiloxRandom
+from std.sys import argv
 from std.time import perf_counter_ns
+from std.random import seed as seed_rng
 from noeira.core.tiles import tile
 
 from noeira.nn.constants import DT as dtype
@@ -189,6 +191,15 @@ def _gauss_pair(mut rng: PhiloxRandom) -> Tuple[Float64, Float64]:
 
 
 def main() raises:
+    # Optional `--seed N`. The default 0 reproduces the recorded single-seed
+    # run exactly (init, data and eval streams all keep their old seeds).
+    var run_seed: Int = 0
+    var args = argv()
+    if len(args) > 2 and String(args[1]) == "--seed":
+        run_seed = Int(String(args[2]))
+    var seed_off = UInt64(run_seed) * UInt64(1000)
+    if run_seed != 0:
+        seed_rng(run_seed)  # PCXavier draws from the global stream
     print("=" * 60)
     print("CartPole-Continuous — Exp 3: MLP-arch + energy local rules")
     print("=" * 60)
@@ -251,7 +262,7 @@ def main() raises:
     var enc_grads = tile[ENC_PARAM_SIZE](enc_grads_buf)
     var enc_opt_state = tile[ENC_PARAM_SIZE, OPT_ENC.STATE_PER_PARAM](enc_opt_state_buf)
     var enc_opt_global = tile[OPT_ENC.GLOBAL_STATE_SIZE](enc_opt_global_buf)
-    ENC.xavier_init[dtype](enc_params, UInt64(123))
+    ENC.xavier_init[dtype](enc_params, UInt64(123) + seed_off)
 
     # ── Per-step scratch ──────────────────────────────────────────────────────
     var x_aug_buf = alloc[Scalar[dtype]](BATCH * AUG_DIM).as_unsafe_any_origin()
@@ -301,7 +312,7 @@ def main() raises:
     # ── Train ────────────────────────────────────────────────────────────────
     print("\n  epoch | last_obs_loss | wall_t (s)")
     print("  ------+---------------+------------")
-    var rng = PhiloxRandom(seed=UInt64(7), offset=UInt64(0))
+    var rng = PhiloxRandom(seed=UInt64(7) + seed_off, offset=UInt64(0))
     var pc_step_num: Int = 0
     var enc_step_num: Int = 0
     var t0 = perf_counter_ns()
@@ -458,7 +469,7 @@ def main() raises:
     var agent_z_buf = alloc[Scalar[dtype]](HIDDEN).as_unsafe_any_origin()
 
     print("\n  === CEM planning evaluation (no SGLD anywhere) ===")
-    var eval_rng = PhiloxRandom(seed=UInt64(2027), offset=UInt64(0))
+    var eval_rng = PhiloxRandom(seed=UInt64(2027) + seed_off, offset=UInt64(0))
     var n_success: Int = 0
     var sum_steps_survived: Int = 0
     var t_eval_start = perf_counter_ns()

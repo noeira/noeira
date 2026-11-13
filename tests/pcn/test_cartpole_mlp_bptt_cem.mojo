@@ -10,6 +10,7 @@ Run:
 from std.math import sqrt, log, cos, sin, tanh, pi
 from std.memory import alloc, unsafe_memset
 from std.random.philox import Random as PhiloxRandom
+from std.sys import argv
 from std.time import perf_counter_ns
 from noeira.core.tiles import tile
 
@@ -229,6 +230,13 @@ def _lt_backward_accum[
 
 
 def main() raises:
+    # Optional `--seed N`. The default 0 reproduces the recorded single-seed
+    # run exactly (init, data and eval streams all keep their old seeds).
+    var run_seed: Int = 0
+    var args = argv()
+    if len(args) > 2 and String(args[1]) == "--seed":
+        run_seed = Int(String(args[2]))
+    var seed_off = UInt64(run_seed) * UInt64(1000)
     print("=" * 60)
     print("CartPole-Continuous — MLP w/ K-step BPTT + CEM")
     print("=" * 60)
@@ -286,7 +294,7 @@ def main() raises:
     unsafe_memset(T_grads_buf, 0, T_PARAM_SIZE)
     unsafe_memset(T_opt_state_buf, 0, T_PARAM_SIZE * OPT.STATE_PER_PARAM)
     unsafe_memset(T_opt_global_buf, 0, OPT.GLOBAL_STATE_SIZE)
-    _xavier_init_layer(T_params_buf, AUG_DIM, HIDDEN, UInt64(7))
+    _xavier_init_layer(T_params_buf, AUG_DIM, HIDDEN, UInt64(7) + seed_off)
     var T_params = tile[T_PARAM_SIZE](T_params_buf)
     var T_grads = tile[T_PARAM_SIZE](T_grads_buf)
     var T_opt_state = tile[T_PARAM_SIZE, OPT.STATE_PER_PARAM](T_opt_state_buf)
@@ -302,7 +310,7 @@ def main() raises:
     unsafe_memset(D_grads_buf, 0, D_PARAM_SIZE)
     unsafe_memset(D_opt_state_buf, 0, D_PARAM_SIZE * OPT.STATE_PER_PARAM)
     unsafe_memset(D_opt_global_buf, 0, OPT.GLOBAL_STATE_SIZE)
-    _xavier_init_layer(D_params_buf, HIDDEN, OBS_DIM, UInt64(8))
+    _xavier_init_layer(D_params_buf, HIDDEN, OBS_DIM, UInt64(8) + seed_off)
     var D_params = tile[D_PARAM_SIZE](D_params_buf)
     var D_grads = tile[D_PARAM_SIZE](D_grads_buf)
     var D_opt_state = tile[D_PARAM_SIZE, OPT.STATE_PER_PARAM](D_opt_state_buf)
@@ -322,7 +330,7 @@ def main() raises:
     var enc_grads = tile[ENC_PARAM_SIZE](enc_grads_buf)
     var enc_opt_state = tile[ENC_PARAM_SIZE, OPT.STATE_PER_PARAM](enc_opt_state_buf)
     var enc_opt_global = tile[OPT.GLOBAL_STATE_SIZE](enc_opt_global_buf)
-    ENC.xavier_init[dtype](enc_params, UInt64(123))
+    ENC.xavier_init[dtype](enc_params, UInt64(123) + seed_off)
 
     var enc_input_buf = alloc[Scalar[dtype]](BATCH * ENC_INPUT_DIM).as_unsafe_any_origin()
     var enc_hpre_buf = alloc[Scalar[dtype]](BATCH * ENC_HIDDEN_DIM).as_unsafe_any_origin()
@@ -352,7 +360,7 @@ def main() raises:
 
     print("\n  epoch | mean_loss | wall_t (s)")
     print("  ------+-----------+------------")
-    var rng = PhiloxRandom(seed=UInt64(7), offset=UInt64(0))
+    var rng = PhiloxRandom(seed=UInt64(7) + seed_off, offset=UInt64(0))
     var step_num: Int = 0
     var t0 = perf_counter_ns()
 
@@ -562,7 +570,7 @@ def main() raises:
     var agent_z_buf = alloc[Scalar[dtype]](HIDDEN).as_unsafe_any_origin()
 
     print("\n  === CEM planning evaluation (MLP+BPTT) ===")
-    var eval_rng = PhiloxRandom(seed=UInt64(2027), offset=UInt64(0))
+    var eval_rng = PhiloxRandom(seed=UInt64(2027) + seed_off, offset=UInt64(0))
     var n_success: Int = 0
     var sum_steps_survived: Int = 0
     var t_eval_start = perf_counter_ns()
@@ -736,9 +744,14 @@ def main() raises:
             theta = stepped[2]
             theta_dot = stepped[3]
 
+            # Training only ever calls the encoder with prev_z = 0 and action = 0
+            # (the t = 0 bootstrap), so the filter must call it the same way.
+            # Feeding it `agent_z` and the action drove 65 of its 69 input
+            # columns, which are still at their Xavier init, and that alone
+            # took CartPole from 5/5 to 0/5.
             for j in range(HIDDEN):
-                enc_input_buf[j] = agent_z_buf[j]
-            enc_input_buf[HIDDEN] = Scalar[dtype](action_norm)
+                enc_input_buf[j] = Scalar[dtype](0.0)
+            enc_input_buf[HIDDEN] = Scalar[dtype](0.0)
             enc_input_buf[HIDDEN + ACTION_DIM + 0] = Scalar[dtype](
                 x / CP_X_SCALE
             )
