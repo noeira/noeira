@@ -28,7 +28,8 @@ follows the state.
 from noeira.core.bytes import string_from_bytes
 from noeira.io.fileio import read_file_bytes
 from .geometry import PlaceXY
-from .state import WorldState, Body
+from .state import WorldState, Body, Task, Step, STEP_TIMEOUT_S
+from .tasks import give_task, tick_tasks
 
 
 # ── the scoring rule ──────────────────────────────────────────────────────
@@ -224,6 +225,11 @@ struct BB1Scenario(Copyable, Movable):
     var ref_before: List[String]
     var mutant_of: String
     """The scenario this one swaps two places of; "-" for none."""
+    var task: String
+    """The task behind the situation: `run:table>door@0` (in hand, on step 0),
+    `done:sofa>table` (finished), `failed:door` (the place was never
+    reached), `-` (none). The places of its finished steps are the LAST
+    entries of `arrivals`."""
 
     def __init__(out self, ref c: List[String]) raises:
         self.sid = c[0].copy()
@@ -242,8 +248,9 @@ struct BB1Scenario(Copyable, Movable):
         self.ref_nearest = c[10].copy()
         self.ref_before = _list(c[11], ",")
         self.mutant_of = c[12].copy()
+        self.task = c[13].copy()
 
-    def state(self, var body: Body, language: String = String(""), t0: Int = 1_000_000) -> WorldState:
+    def state(self, var body: Body, language: String = String(""), t0: Int = 1_000_000) raises -> WorldState:
         """The scenario as a `WorldState`, its history replayed through
         `observe_motion` one second an arrival. `language`: the conversation's,
         when the caller knows it (`WorldState.language`)."""
@@ -256,16 +263,59 @@ struct BB1Scenario(Copyable, Movable):
             ws.call_place(String("door"), String("fr"), String("la porte"))
             ws.call_place(String("table"), String("fr"), String("la table"))
             ws.call_place(String("sofa"), String("fr"), String("le canapé"))
-        var t = t0
-        for i in range(len(self.arrivals)):
-            # it sets off for the place, then it is there
-            ws.observe_motion(String("goto:") + self.arrivals[i], self.arrivals[i], String("none"), t)
-            ws.observe_motion(String("goto:") + self.arrivals[i], String("none"), self.arrivals[i], t + 1)
-            t += 2
+        # the task's steps, how many of them are finished, and how it stands
+        var kind = String("")
+        var steps = List[String]()
+        var done_steps = 0
+        if self.task != "-":
+            var colon = self.task.find(":")
+            kind = String(self.task[byte=0:colon])
+            var rest = String(self.task[byte = colon + 1 :])
+            var at_mark = rest.find("@")
+            if at_mark >= 0:
+                done_steps = Int(String(rest[byte = at_mark + 1 :]))
+                var names = String(rest[byte=0:at_mark])
+                rest = names^
+            steps = _list(rest, ">")
+            if kind == "done":
+                done_steps = len(steps)
+        var clock = 0.0
+        var now = t0
+        # the arrivals before the task: each a walk of its own, asked and finished
+        for i in range(len(self.arrivals) - done_steps):
+            var one = Task(String(""))
+            one.steps.append(Step.goto(self.arrivals[i]))
+            give_task(ws, one^, clock, now)
+            self._walk(ws, self.arrivals[i], clock, now)
+            clock += 10.0
+            now += 10
+        if kind != "":
+            var task = Task(String(""))
+            for s in steps:
+                task.steps.append(Step.goto(s))
+            give_task(ws, task^, clock, now)
+            for i in range(done_steps):
+                self._walk(ws, steps[i], clock, now)
+                clock += 10.0
+                now += 10
+            if kind == "run":
+                _ = tick_tasks(ws, clock, now)  # the step in hand starts
+            elif kind == "failed":
+                _ = tick_tasks(ws, clock, now)
+                ws.observe_motion(String("goto:") + steps[0], steps[0], String("none"), now)
+                _ = tick_tasks(ws, clock + STEP_TIMEOUT_S + 1.0, now + 61)
         # now: still there (`at`), or gone from it (`at` = none) toward `going`
-        ws.observe_motion(self.doing, self.going, self.at, t)
+        ws.observe_motion(self.doing, self.going, self.at, now + 62)
         ws.observe_pose(self.x, self.y, self.yaw)
         return ws^
+
+    def _walk(self, mut ws: WorldState, place: String, clock: Float64, now: Int):
+        """One step of the task in hand, from its start to the arrival."""
+        _ = tick_tasks(ws, clock, now)
+        ws.observe_motion(String("goto:") + place, place, String("none"), now)
+        ws.observe_motion(String("goto:") + place, String("none"), place, now + 5)
+        _ = tick_tasks(ws, clock + 5.0, now + 5)
+        _ = tick_tasks(ws, clock + 5.1, now + 5)
 
 
 struct BB1Item(Copyable, Movable):
@@ -302,7 +352,7 @@ struct BB1Set(Movable):
     @staticmethod
     def load(dir: String) raises -> BB1Set:
         var sc = List[BB1Scenario]()
-        for r in _rows(dir + "/bb1_scenarios.tsv", 13):
+        for r in _rows(dir + "/bb1_scenarios.tsv", 14):
             sc.append(BB1Scenario(r))
         var it = List[BB1Item]()
         for r in _rows(dir + "/bb1_items.tsv", 9):

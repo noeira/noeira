@@ -31,6 +31,22 @@ people (B4), the task stack (B2), reading a day back at start (B3).
 from .events import (
     BrainEvent, EventLog, EV_SESSION, EV_HEARD, EV_SAID, EV_BEGAN, EV_GOING, EV_ARRIVED,
 )
+
+comptime STEP_PENDING: Int = 0
+comptime STEP_RUNNING: Int = 1
+comptime STEP_DONE: Int = 2
+comptime STEP_FAILED: Int = 3
+
+comptime TASK_RUNNING: Int = 1
+comptime TASK_DONE: Int = 2
+comptime TASK_FAILED: Int = 3
+comptime TASK_CANCELLED: Int = 4
+
+comptime STEP_TIMEOUT_S: Float64 = 60.0
+"""How long a walk to a place may take before its step has failed. The room's
+longest measured walk is about 20 s (`BFM_ZERO_ROOM_PLAN.md` R5b)."""
+comptime STEP_HOLD_S: Float64 = 3.0
+"""How long a step with no place (a posture, a gesture) runs before the next."""
 from .geometry import PlaceXY, PlaceAround, places_around, place_lines, nearest_place
 
 
@@ -84,6 +100,73 @@ struct PlaceWord(Copyable, Movable):
     var word: String
 
 
+struct Step(Copyable, Movable):
+    """One command of the body inside a task (`noeira.brain.tasks`)."""
+
+    var command: String
+    """As the body takes it: `goto:table`, `squat`."""
+    var label: String
+    """In words, for the models: `walk to the table`."""
+    var place: String
+    """The place the step ends at; "" for a step that ends after `hold_s`."""
+    var timeout_s: Float64
+    var hold_s: Float64
+    var status: Int
+    var t_start: Float64
+
+    def __init__(out self, var command: String, var label: String, var place: String):
+        self.command = command^
+        self.label = label^
+        self.place = place^
+        self.timeout_s = STEP_TIMEOUT_S
+        self.hold_s = STEP_HOLD_S
+        self.status = STEP_PENDING
+        self.t_start = 0.0
+
+    @staticmethod
+    def goto(place: String) -> Step:
+        """Walk to a place: done on arrival, failed after `timeout_s`."""
+        return Step("goto:" + place, "walk to the " + place, place.copy())
+
+    @staticmethod
+    def gesture(name: String) -> Step:
+        """A posture or a gesture of the body's own list: done after `hold_s`."""
+        return Step(name.copy(), name.replace("_", " "), String(""))
+
+
+struct Task(Copyable, Movable):
+    """What the robot was asked, as steps to run in order."""
+
+    var said: String
+    """The request as it was heard; "" for a task given by code."""
+    var steps: List[Step]
+    var at: Int
+    """The step in hand."""
+    var status: Int
+    var reason: String
+    """Why it failed or was cancelled; "" otherwise."""
+    var t_start: Float64
+    var t_end: Float64
+
+    def __init__(out self, var said: String):
+        self.said = said^
+        self.steps = List[Step]()
+        self.at = 0
+        self.status = TASK_RUNNING
+        self.reason = String("")
+        self.t_start = 0.0
+        self.t_end = 0.0
+
+    def describe(self) -> String:
+        """`walk to the table, then walk to the door`."""
+        var t = String("")
+        for i in range(len(self.steps)):
+            if i > 0:
+                t += ", then "
+            t += self.steps[i].label
+        return t
+
+
 def _or_none(s: String) -> String:
     return String("") if s == "none" else s
 
@@ -120,6 +203,13 @@ struct WorldState(Movable):
     var at: String
     """The place the robot stands in now; "" for none."""
 
+    var has_task: Bool
+    var task: Task
+    """The task in hand (`has_task`), run by `noeira.brain.tasks`."""
+    var has_last_task: Bool
+    var last_task: Task
+    """The last task that ended: done, failed or cancelled."""
+
     var events: List[BrainEvent]
     """The last `WS_EVENTS_N` events, oldest first."""
     var log: Optional[EventLog]
@@ -139,6 +229,10 @@ struct WorldState(Movable):
         self.doing = String("")
         self.walking_to = String("")
         self.at = String("")
+        self.has_task = False
+        self.task = Task(String(""))
+        self.has_last_task = False
+        self.last_task = Task(String(""))
         self.events = List[BrainEvent]()
         self.log = None
         self.log_error = String("")
@@ -173,6 +267,14 @@ struct WorldState(Movable):
     def call_place(mut self, place: String, language: String, word: String):
         """`place` is called `word` in `language`: ("table", "fr", "la table")."""
         self.place_words.append(PlaceWord(place, language, word))
+
+    def word_for(self, place: String, language: String) -> String:
+        """What to call `place` when speaking `language`: its word if one was
+        given (`la table`), else `the <place>`."""
+        for w in self.place_words:
+            if w.place == place and w.language == language:
+                return w.word.copy()
+        return "the " + place
 
     def words_in(self, language: String) -> List[String]:
         """`place = word` for every known place that has a word in `language`."""

@@ -22,7 +22,8 @@ reply taken as the robot would SPEAK it (`answer_of`: after a stray
 `</think>`; `spoken_text`: no emoji). Each reply is scored by the item's rule
 (`noeira.brain.bb1.reply_passes`).
 
-Printed per prompt: passes per category, the `held_*` ones apart (questions
+Printed per prompt: passes per category, the `task_*` ones (B2: what the
+executive's record lets the robot answer) and the `held_*` ones apart (questions
 never looked at while the view's wording was chosen); the mutant rows (`where_mut`: two
 places swapped in the state) both ways, on the swapped room's truth (the
 reply follows the state) and on the room's truth before the swap (must now
@@ -53,7 +54,7 @@ comptime FIXED = (
 )
 """`projects/g1/scripts/room_demo.mojo`'s `chat_sys` before B1, verbatim."""
 
-comptime CATS = "where_dir,where_dist,nearest,doing,before,can_yes,can_no,unknown,self,chat,held_can_no,held_can_yes,held_unknown,where_mut"
+comptime CATS = "where_dir,where_dist,nearest,doing,before,can_yes,can_no,unknown,self,chat,task_next,task_state,held_can_no,held_can_yes,held_unknown,where_mut"
 
 
 def ms(t0: Int) -> Float64:
@@ -144,17 +145,22 @@ def main() raises:
         var grounded_all = 0
         var held = 0
         var held_all = 0
+        var tasks = 0
+        var tasks_all = 0
         var line = String("")
         for k in range(len(cats)):
             line += "  " + cats[k] + " " + String(n_pass[k]) + "/" + String(n_all[k])
             if cats[k].startswith("held_"):
                 held += n_pass[k]
                 held_all += n_all[k]
+            elif cats[k].startswith("task_"):
+                tasks += n_pass[k]
+                tasks_all += n_all[k]
             elif cats[k] != "where_mut":
                 grounded += n_pass[k]
                 grounded_all += n_all[k]
         var mi = len(cats) - 1
-        print(arms[a] + ":", grounded, "/", grounded_all, "; held out", held, "/", held_all, "|" + line)
+        print(arms[a] + ":", grounded, "/", grounded_all, "; tasks", tasks, "/", tasks_all, "; held out", held, "/", held_all, "|" + line)
         print("   mutant rows: right for the swapped room", n_pass[mi], "/", n_all[mi],
               "; still right for the room before the swap", alt_pass, "/", n_all[mi])
         print("   in the question's language", in_lang, "/", n, "; raw replies with </think>", thinks, ", with emoji or markup", cleaned)

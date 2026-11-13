@@ -16,7 +16,7 @@ from noeira.core.bytes import string_from_bytes
 from noeira.io.fileio import read_file_bytes
 
 
-comptime CATS = "where_dir,where_dist,nearest,doing,before,can_yes,can_no,unknown,self,chat,held_can_no,held_can_yes,held_unknown,where_mut"
+comptime CATS = "where_dir,where_dist,nearest,doing,before,can_yes,can_no,unknown,self,chat,task_next,task_state,held_can_no,held_can_yes,held_unknown,where_mut"
 
 
 def main() raises:
@@ -78,6 +78,8 @@ def main() raises:
         var grounded_all = 0
         var held = 0
         var held_all = 0
+        var tasks = 0
+        var tasks_all = 0
         var total = 0
         var line = String("")
         for k in range(len(cats)):
@@ -86,11 +88,14 @@ def main() raises:
             if cats[k].startswith("held_"):
                 held += n_pass[a][k]
                 held_all += n_all[a][k]
+            elif cats[k].startswith("task_"):
+                tasks += n_pass[a][k]
+                tasks_all += n_all[a][k]
             elif cats[k] != "where_mut":
                 grounded += n_pass[a][k]
                 grounded_all += n_all[a][k]
         var mi = len(cats) - 1
-        print(arms[a] + ":", grounded, "/", grounded_all, "; held out", held, "/", held_all, "|" + line)
+        print(arms[a] + ":", grounded, "/", grounded_all, "; tasks", tasks, "/", tasks_all, "; held out", held, "/", held_all, "|" + line)
         print("   mutant rows: right for the swapped room", n_pass[a][mi], "/", n_all[a][mi],
               "; still right for the room before the swap", alt[a], "/", n_all[a][mi])
         print("   in the question's language", in_lang[a], "/", total)

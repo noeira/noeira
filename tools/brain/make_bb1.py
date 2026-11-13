@@ -50,6 +50,7 @@ WORDS = {
 }
 FR = {"fridge": "le frigo", "door": "la porte", "table": "la table", "sofa": "le canapé"}
 EN = {"fridge": "the fridge", "door": "the door", "table": "the table", "sofa": "the sofa"}
+FR_AT = {"fridge": "au frigo", "door": "à la porte", "table": "à la table", "sofa": "au canapé"}
 
 DIR = {
     "ahead": "devant|en face|tout droit|ahead|in front|straight",
@@ -160,10 +161,13 @@ def make(seed=20261113, out=OUT):
         places = LAYOUTS[layout]
         names = [p[0] for p in places]
         for _ in range(100000):
-            at, going, doing, arrivals = "none", "none", "stand", []
-            if kind == "idle":
+            at, going, doing, arrivals, task = "none", "none", "stand", [], "-"
+            if kind == "idle" or kind == "failed":
                 x, y, yaw = rng.uniform(-1.2, 1.2), rng.uniform(-1.2, 1.2), rng.uniform(-180.0, 180.0)
-            elif kind == "at":
+                if kind == "failed":
+                    # it set off for a place and never got there: standing in the room, the task failed
+                    task = "failed:" + rng.choice(names)
+            elif kind == "at" or kind == "done2":
                 at = rng.choice(names)
                 px, py = [(p[1], p[2]) for p in places if p[0] == at][0]
                 # 0.7 m from the place's centre, on the room's side, facing it
@@ -173,7 +177,11 @@ def make(seed=20261113, out=OUT):
                 prev = rng.sample([n for n in names if n != at], rng.choice([1, 2]))
                 arrivals = prev[::-1] + [at]  # oldest first
                 doing = "goto:" + at
-            else:  # walking
+                task = "done:" + at
+                if kind == "done2":
+                    # a task of two steps, both done: the place before, then this one
+                    task = "done:" + arrivals[-2] + ">" + at
+            else:  # walking, or `two`: walking on the first step of a task of two
                 going = rng.choice(names)
                 was = rng.choice([n for n in names if n != going])
                 x, y = rng.uniform(-1.5, 1.5), rng.uniform(-1.5, 1.5)
@@ -181,11 +189,16 @@ def make(seed=20261113, out=OUT):
                 yaw = wrap(math.degrees(math.atan2(py - y, px - x)) + rng.uniform(-15.0, 15.0))
                 arrivals = [was]
                 doing = "goto:" + going
+                task = "run:" + going + "@0"
+                if kind == "two":
+                    # the first step of two: after this place, another one
+                    then = rng.choice([n for n in names if n != going and n != was])
+                    task = "run:" + going + ">" + then + "@0"
             if clear_of_edges(places, x, y, yaw, at):
                 x, y, yaw = round(x, 3), round(y, 3), round(yaw, 2)
                 if clear_of_edges(places, x, y, yaw, at):
                     return dict(layout=layout, places=places, x=x, y=y, yaw=yaw, doing=doing, going=going, at=at,
-                                arrivals=arrivals)
+                                arrivals=arrivals, task=task)
         raise RuntimeError("no scenario for " + layout + " " + kind)
 
     def add_scenario(s):
@@ -316,9 +329,32 @@ def make(seed=20261113, out=OUT):
                 else:
                     item(s, cat, lang, q, UNKNOWN, "" if k == 0 else "oui|yes")
 
+    # TASKS (B2): what the executive's record lets the robot answer
+    YES_DONE = "oui|yes|terminé|terminée|fini|finie|done|finished|c'est fait|completed"
+    NOT_DONE = "non|no|pas encore|not yet|pas fini|pas terminé|not finished|not done|en cours|still|encore|in progress"
+    NOT_REACHED = ("non|no|pas réussi|could not|couldn't|n'ai pas|did not|didn't|pas arrivé|pas atteint|failed|échoué|"
+                   "not reached|unable|pas pu|wasn't able|was not able")
+    for layout, kind in (("A", "two"), ("B", "two"), ("C", "done2"), ("A", "done2"), ("B", "failed"), ("C", "failed")):
+        s = add_scenario(scenario(layout, kind))
+        for lang in ("fr", "en"):
+            art = FR if lang == "fr" else EN
+            if kind == "two":
+                first, then = s["task"][4:-2].split(">")
+                q = "Que feras-tu après ça ?" if lang == "fr" else "What will you do after that?"
+                item(s, "task_next", lang, q, WORDS[then], other_words([then, first]))
+                q = "As-tu fini ce que je t'ai demandé ?" if lang == "fr" else "Have you finished what I asked?"
+                item(s, "task_state", lang, q, NOT_DONE, "oui|yes")
+            elif kind == "done2":
+                q = "As-tu fini ce que je t'ai demandé ?" if lang == "fr" else "Have you finished what I asked?"
+                item(s, "task_state", lang, q, YES_DONE, "non|no|pas encore|not yet")
+            else:
+                place = s["task"][7:]
+                q = "Es-tu arrivé %s ?" % FR_AT[place] if lang == "fr" else "Did you reach %s?" % art[place]
+                item(s, "task_state", lang, q, NOT_REACHED, "oui|yes")
+
     os.makedirs(out, exist_ok=True)
     with open(os.path.join(out, "bb1_scenarios.tsv"), "w", encoding="utf-8") as f:
-        f.write("# sid\tx\ty\tyaw\tdoing\tgoing\tat\tarrivals\tplaces\tref_lines\tref_nearest\tref_before\tmutant_of\n")
+        f.write("# sid\tx\ty\tyaw\tdoing\tgoing\tat\tarrivals\tplaces\tref_lines\tref_nearest\tref_before\tmutant_of\ttask\n")
         for s in scenarios:
             ar = around(s["places"], s["x"], s["y"], s["yaw"])
             nearest = min(ar, key=lambda a: a[6])[0]
@@ -333,6 +369,7 @@ def make(seed=20261113, out=OUT):
                 ",".join(s["arrivals"]) or "-",
                 ",".join("%s:%s:%s" % (n, repr(float(px)), repr(float(py))) for n, px, py in s["places"]),
                 " ; ".join(line(p) for p in ar), nearest, ",".join(trail[:4]) or "-", s.get("mutant_of", "-"),
+                s["task"],
             ]) + "\n")
     with open(os.path.join(out, "bb1_items.tsv"), "w", encoding="utf-8") as f:
         f.write("# id\tsid\tcat\tlang\tquestion\tmust\tforbid\talt_must\talt_forbid\n")

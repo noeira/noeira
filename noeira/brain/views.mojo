@@ -17,6 +17,7 @@ written from the `WorldState` every turn (docs/ROBOT_BRAIN_PLAN.md §5.2).
 
     Facts, true right now:
     - You are standing at the table.
+    - You have no task right now. Your last task: walk to the table. It is done.
     - Places you know, from where you stand: fridge: ahead of you, 3 m; door: on your left, 4 m; table: here; sofa: behind you, 4.5 m.
     - In French these places are: fridge = le frigo; door = la porte; table = la table; sofa = le canapé.
     - The nearest place to you: table.
@@ -41,7 +42,7 @@ state already writes (`WorldState.around_lines`).
 """
 
 from .geometry import PlaceAround
-from .state import WorldState
+from .state import WorldState, TASK_DONE, TASK_FAILED
 
 
 comptime REPLY_VIEW_LINES: Int = 0
@@ -127,13 +128,38 @@ def _now_line(ref ws: WorldState) -> String:
     return t
 
 
+def task_sentences(ref ws: WorldState) -> String:
+    """The task in hand, or the last one and how it ended, in words (from
+    `noeira.brain.tasks`' record): what "what are you doing?", "what next?"
+    and "did you get there?" are answered from."""
+    if ws.has_task:
+        var n = len(ws.task.steps)
+        var k = ws.task.at
+        if n == 1:
+            return "Your task: " + ws.task.describe() + ". It is in progress."
+        var t = "Your task: " + ws.task.describe() + ". You are on step " + String(k + 1) + " of " + String(n) + ": " + ws.task.steps[k].label + "."
+        if k + 1 < n:
+            t += " Next: " + ws.task.steps[k + 1].label + "."
+        else:
+            t += " It is the last step."
+        return t
+    if not ws.has_last_task:
+        return String("You have no task right now.")
+    var t = "You have no task right now. Your last task: " + ws.last_task.describe() + "."
+    if ws.last_task.status == TASK_DONE:
+        return t + " It is done."
+    if ws.last_task.status == TASK_FAILED:
+        return t + " It failed: " + ws.last_task.reason + "."
+    return t + " It was cancelled: " + ws.last_task.reason + "."
+
+
 def reply_live(ref ws: WorldState, style: Int = REPLY_VIEW_LINES) -> String:
     """The facts of this moment."""
     var around = ws.around()
     var before = ws.been_before()
     var nearest = ws.nearest()
     if style == REPLY_VIEW_SENTENCES:
-        var t = "Right now: " + _now_line(ws)
+        var t = "Right now: " + _now_line(ws) + " " + task_sentences(ws)
         for p in around:
             if p.name == ws.at:
                 continue
@@ -151,7 +177,7 @@ def reply_live(ref ws: WorldState, style: Int = REPLY_VIEW_LINES) -> String:
             t += " You have not been anywhere else yet."
         t += " You know of no other place or object in this room."
         return t
-    var t = String("Facts, true right now:\n- ") + _now_line(ws) + "\n"
+    var t = String("Facts, true right now:\n- ") + _now_line(ws) + "\n- " + task_sentences(ws) + "\n"
     if len(around) > 0:
         var items = List[String]()
         for p in around:

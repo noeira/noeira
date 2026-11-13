@@ -41,6 +41,15 @@ comptime EV_GOING = "going"
 """The robot set off for a place; `text` = the place."""
 comptime EV_ARRIVED = "arrived"
 """The robot arrived; `text` = the place."""
+comptime EV_TASK_STARTED = "task_started"
+"""The executive took a task; `text` = its steps in words."""
+comptime EV_STEP_STARTED = "step_started"
+comptime EV_STEP_DONE = "step_done"
+"""`text` = the step in words ("walk to the table")."""
+comptime EV_TASK_DONE = "task_done"
+comptime EV_TASK_FAILED = "task_failed"
+comptime EV_TASK_CANCELLED = "task_cancelled"
+"""`text` = the task in words, then " | " and why."""
 
 
 @fieldwise_init

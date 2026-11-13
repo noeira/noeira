@@ -13,6 +13,11 @@
 5. The scoring rule on cases with known answers: word boundaries, numbers,
    accents, groups, the forbidden side.
 6. `spoken_text` (what a voice can say) and the language check.
+7. The executive (`noeira.brain.tasks`) on scripted episodes with a body that
+   is only the facts it reports: steps start in order and one at a time, an
+   arrival ends a step, a deadline fails the task and says so, a new request
+   cancels the one in hand, a refused command fails its step, and the reply
+   view's task line is right at each stage.
 Exits non-zero on a failure.
 """
 
@@ -20,6 +25,9 @@ from std.os import getenv
 from std.sys import exit
 
 from noeira.brain import (
+    Task, Step, give_task, cancel_task, refuse_step, tick_tasks, notice_text, task_sentences,
+    EX_NONE, EX_START, EX_NOTICE, NOTICE_ALL_DONE, NOTICE_NOT_REACHED, NOTICE_REFUSED,
+    TASK_DONE, TASK_FAILED, TASK_CANCELLED,
     WorldState, Body, PlaceXY, BrainEvent, EventLog, load_events, event_json, parse_event,
     reply_view, REPLY_VIEW_SENTENCES, metres,
     EV_BEGAN, EV_GOING, EV_ARRIVED, EV_HEARD, EV_SESSION,
@@ -155,6 +163,7 @@ def main() raises:
     var live = (
         "Facts, true right now:\n"
         "- You are standing at the table.\n"
+        "- You have no task right now.\n"
         "- Places you know, from where you stand: fridge: ahead of you, 3 m; door: on your left, 4 m; table: here;"
         " sofa: behind you, 4.5 m.\n"
         "- The nearest place to you: table.\n"
@@ -169,7 +178,7 @@ def main() raises:
         print(v.live)
     check(fails, v.text() == stable + "\n\n" + live, "text = stable, a blank line, live")
     var sent = (
-        "Right now: You are standing at the table. The fridge is ahead of you, 3 m away. The door is on your left, 4 m away."
+        "Right now: You are standing at the table. You have no task right now. The fridge is ahead of you, 3 m away. The door is on your left, 4 m away."
         " The sofa is behind you, 4.5 m away. The nearest place to you is the table. Before this you were at the sofa,"
         " and before that at the door. You know of no other place or object in this room."
     )
@@ -229,6 +238,105 @@ def main() raises:
           "a French question answered in English is seen")
     check(fails, reply_in_language("The fridge is ahead of me.", "en") and not reply_in_language("Le frigo est devant moi.", "en")
           and reply_in_language("anything", "de"), "and the other way; an unlisted language passes")
+
+    print("7. the executive")
+    var x = WorldState(Body.g1_room("Noé"), String("a furnished room"))
+    x.language = String("fr")
+    x.call_place(String("sofa"), String("fr"), String("le canapé"))
+    check(fails, tick_tasks(x, 0.0, 100).kind == EX_NONE and task_sentences(x) == "You have no task right now.", "no task: nothing to do")
+    var trio = Task(String("va à la table puis à la porte"))
+    trio.steps.append(Step.goto(String("table")))
+    trio.steps.append(Step.gesture(String("both_hands_up")))
+    trio.steps.append(Step.goto(String("door")))
+    give_task(x, trio^, 0.0, 100)
+    var a1 = tick_tasks(x, 0.0, 100)
+    check(fails, a1.kind == EX_START and a1.command == "goto:table", "the first step starts: " + a1.command)
+    check(fails, task_sentences(x) == "Your task: walk to the table, then both hands up, then walk to the door."
+          " You are on step 1 of 3: walk to the table. Next: both hands up.", "the task line on step 1")
+    x.observe_motion(String("goto:table"), String("table"), String("none"), 101)
+    check(fails, tick_tasks(x, 5.0, 105).kind == EX_NONE and tick_tasks(x, 9.0, 109).kind == EX_NONE, "walking: nothing new to do")
+    x.observe_motion(String("goto:table"), String("none"), String("table"), 110)
+    check(fails, tick_tasks(x, 10.0, 110).kind == EX_NONE and x.task.at == 1, "arrived: the step is done, the next is in hand")
+    var a2 = tick_tasks(x, 10.1, 110)
+    check(fails, a2.kind == EX_START and a2.command == "both_hands_up", "the second step starts on the next frame")
+    check(fails, tick_tasks(x, 12.0, 112).kind == EX_NONE and x.task.at == 1, "a posture holds")
+    check(fails, tick_tasks(x, 13.2, 113).kind == EX_NONE and x.task.at == 2, "and is done after its hold")
+    var a3 = tick_tasks(x, 13.3, 113)
+    check(fails, a3.kind == EX_START and a3.command == "goto:door"
+          and task_sentences(x).find("You are on step 3 of 3: walk to the door. It is the last step.") >= 0, "the last step starts")
+    x.observe_motion(String("goto:door"), String("none"), String("door"), 120)
+    var a4 = tick_tasks(x, 20.0, 120)
+    check(fails, a4.kind == EX_NOTICE and a4.notice == NOTICE_ALL_DONE and notice_text(x, a4) == "C'est fait." and not x.has_task
+          and a4.command == "" and x.last_task.status == TASK_DONE, "a task of several steps says it is done, and stops nothing")
+    check(fails, task_sentences(x) == "You have no task right now. Your last task: walk to the table, then both hands up, then walk to the door. It is done.",
+          "the task line afterwards")
+    var order = String("")
+    for ev in x.events:
+        if ev.kind.startswith("task_") or ev.kind.startswith("step_"):
+            order += ev.kind + " "
+    check(fails, order == "task_started step_started step_done step_started step_done step_started step_done task_done ",
+          "the record: " + order)
+    # a place never reached
+    var far = Task(String(""))
+    far.steps.append(Step.goto(String("sofa")))
+    give_task(x, far^, 30.0, 130)
+    check(fails, tick_tasks(x, 30.0, 130).command == "goto:sofa" and task_sentences(x) == "Your task: walk to the sofa. It is in progress.", "one step: in progress")
+    x.observe_motion(String("goto:sofa"), String("sofa"), String("none"), 131)
+    check(fails, tick_tasks(x, 89.9, 189).kind == EX_NONE, "59.9 s: still walking")
+    var a5 = tick_tasks(x, 90.1, 190)
+    check(fails, a5.kind == EX_NOTICE and a5.notice == NOTICE_NOT_REACHED and a5.command == "stop"
+          and notice_text(x, a5) == "Je n'ai pas réussi à atteindre le canapé."
+          and x.last_task.status == TASK_FAILED, "past the deadline the task fails and says so: " + notice_text(x, a5))
+    check(fails, task_sentences(x) == "You have no task right now. Your last task: walk to the sofa. It failed: the sofa was not reached after 60 seconds.",
+          "the failure in the task line")
+    x.language = String("en")
+    check(fails, notice_text(x, a5) == "I could not reach the sofa.", "the notice in English, the place without a French word")
+    # a new request replaces the one in hand; one step alone ends silently
+    var t1 = Task(String(""))
+    t1.steps.append(Step.goto(String("fridge")))
+    give_task(x, t1^, 100.0, 200)
+    _ = tick_tasks(x, 100.0, 200)
+    var t2 = Task(String(""))
+    t2.steps.append(Step.goto(String("door")))
+    give_task(x, t2^, 101.0, 201)
+    check(fails, x.last_task.status == TASK_CANCELLED and x.last_task.describe() == "walk to the fridge"
+          and x.task.describe() == "walk to the door" and tick_tasks(x, 101.0, 201).command == "goto:door", "the last request wins")
+    x.observe_motion(String("goto:door"), String("none"), String("door"), 205)
+    check(fails, tick_tasks(x, 105.0, 205).kind == EX_NONE and not x.has_task and x.last_task.status == TASK_DONE,
+          "a single step ends at its arrival and says nothing")
+    var again = Task(String(""))
+    again.steps.append(Step.goto(String("door")))
+    give_task(x, again^, 106.0, 206)
+    check(fails, tick_tasks(x, 106.0, 206).kind == EX_START and tick_tasks(x, 106.1, 206).kind == EX_NONE and not x.has_task
+          and x.last_task.status == TASK_DONE, "asked for the place it is at: done on the next frame")
+    # a command the body does not have
+    var t3 = Task(String(""))
+    t3.steps.append(Step.gesture(String("fly")))
+    give_task(x, t3^, 110.0, 210)
+    _ = tick_tasks(x, 110.0, 210)
+    var a6 = refuse_step(x, 110.0, 210)
+    check(fails, a6.kind == EX_NOTICE and a6.notice == NOTICE_REFUSED and x.last_task.status == TASK_FAILED
+          and x.last_task.reason == "the robot has no command 'fly'" and notice_text(x, a6) == "I do not know how to do that.",
+          "a refused command fails its task")
+    cancel_task(x, String("stop"), 111.0, 211)
+    give_task(x, Task(String("")), 112.0, 212)
+    check(fails, not x.has_task, "cancel with nothing in hand, and a task with no step, change nothing")
+    # every BB-1 situation's task line, against its `task` column
+    var bad_task = 0
+    for s in set.scenarios:
+        var ws = s.state(Body.g1_room("Noé"))
+        var line = task_sentences(ws)
+        var want = String("You have no task right now.")
+        if s.task.startswith("run:"):
+            want = String("Your task: ")
+        elif s.task.startswith("done:"):
+            want = String("It is done.")
+        elif s.task.startswith("failed:"):
+            want = String("It failed: ")
+        if line.find(want) < 0 or (s.task == "-" and line != want):
+            bad_task += 1
+            print("     ", s.sid, s.task, "|", line)
+    check(fails, bad_task == 0, "the BB-1 situations' tasks: " + String(n - bad_task) + " of " + String(n) + " as written")
 
     print("ALL PASS" if fails == 0 else String(fails) + " FAILED")
     if fails != 0:
