@@ -30,10 +30,11 @@ published file, so every convolution has a bias and there is no norm here.
 
 THIS FILE IS THE CPU FORWARD, the one the reference gate runs
 (`tests/audio/test_speaker_reference.mojo`): plain loops, about 2.4 G
-multiply-adds a second of speech.
+multiply-adds a second of speech, one task per output channel.
 """
 
 from std.math import sqrt
+from max.algorithm import parallelize
 
 from noeira.io.safetensors import SafeTensors
 
@@ -75,7 +76,8 @@ struct ConvW(Movable):
 
 def conv(ref x: Plane, ref cw: ConvW, stride: Int, relu: Bool) -> Plane:
     """`k x k` convolution (k = 3 with a border of 1, or k = 1 with none),
-    its bias, and a ReLU when asked."""
+    its bias, and a ReLU when asked. One task per output channel
+    (`parallelize`) when there is enough work to pay for it."""
     var pad = 1 if cw.k == 3 else 0
     var ho = (x.h + 2 * pad - cw.k) // stride + 1
     var wo = (x.w + 2 * pad - cw.k) // stride + 1
@@ -83,39 +85,52 @@ def conv(ref x: Plane, ref cw: ConvW, stride: Int, relu: Bool) -> Plane:
     var xp = x.v.unsafe_ptr()
     var yp = y.v.unsafe_ptr()
     var wp = cw.w.unsafe_ptr()
-    for co in range(cw.cout):
+    var bp = cw.b.unsafe_ptr()
+    var cin = cw.cin
+    var k = cw.k
+    var xh = x.h
+    var xw = x.w
+
+    def _channel(co: Int) {imm}:
         var obase = co * ho * wo
-        var bias = cw.b[co]
+        var bias = bp[unsafe_offset=co]
         for i in range(ho * wo):
             yp[unsafe_offset=obase + i] = bias
-        for ci in range(cw.cin):
-            var ibase = ci * x.h * x.w
-            for ky in range(cw.k):
-                for kx in range(cw.k):
-                    var wv = wp[unsafe_offset=((co * cw.cin + ci) * cw.k + ky) * cw.k + kx]
+        for ci in range(cin):
+            var ibase = ci * xh * xw
+            for ky in range(k):
+                for kx in range(k):
+                    var wv = wp[unsafe_offset=((co * cin + ci) * k + ky) * k + kx]
                     # the output columns whose input column is inside the picture
                     var ox0 = 0
                     while ox0 * stride + kx - pad < 0:
                         ox0 += 1
                     var ox1 = wo
-                    while ox1 > ox0 and (ox1 - 1) * stride + kx - pad >= x.w:
+                    while ox1 > ox0 and (ox1 - 1) * stride + kx - pad >= xw:
                         ox1 -= 1
                     for oy in range(ho):
                         var iy = oy * stride + ky - pad
-                        if iy < 0 or iy >= x.h:
+                        if iy < 0 or iy >= xh:
                             continue
                         var o = obase + oy * wo
-                        var i = ibase + iy * x.w + kx - pad
+                        var i = ibase + iy * xw + kx - pad
                         if stride == 1:
                             for ox in range(ox0, ox1):
                                 yp[unsafe_offset=o + ox] += wv * xp[unsafe_offset=i + ox]
                         else:
                             for ox in range(ox0, ox1):
                                 yp[unsafe_offset=o + ox] += wv * xp[unsafe_offset=i + ox * stride]
-    if relu:
-        for i in range(len(y.v)):
-            if y.v[i] < 0.0:
-                y.v[i] = 0.0
+        if relu:
+            for i in range(ho * wo):
+                if yp[unsafe_offset=obase + i] < 0.0:
+                    yp[unsafe_offset=obase + i] = 0.0
+
+    # `parallelize` costs a fixed ~200 us (nn/primitives/conv2d.mojo): small layers stay on this thread
+    if cw.cout * cin * k * k * ho * wo < (1 << 21):
+        for co in range(cw.cout):
+            _channel(co)
+    else:
+        parallelize(_channel, cw.cout)
     return y^
 
 
