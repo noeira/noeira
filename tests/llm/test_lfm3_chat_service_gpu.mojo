@@ -28,8 +28,9 @@ from max.gpu.host import DeviceContext
 
 from noeira.ai.chat import ChatMessage, ChatService, ToolSpec
 from noeira.core.concurrent.thread import sleep_us
-from noeira.llm.lfm3 import Lfm3Chat, ChatSettings
+from noeira.llm.lfm3 import Lfm3Chat, ChatSettings, answer_of
 from noeira.llm.lfm3.service import Lfm3ChatService
+from noeira.text.bpe import ByteLevelBPE
 
 
 comptime SYSTEM = (
@@ -76,7 +77,13 @@ def direct(mut chat: Lfm3Chat, ref msgs: List[ChatMessage], system: String, max_
     chat.start(s)
     while chat.next():
         pass
-    return chat.reply_text()
+    return chat.answer_text()
+
+
+def chat_think_end(dir: String) raises -> Int:
+    var tok = ByteLevelBPE.load(dir + "/tokenizer.json")
+    var ids = tok.encode(String("</think>"))
+    return ids[0] if len(ids) == 1 else -1
 
 
 def main() raises:
@@ -84,6 +91,10 @@ def main() raises:
     var dir = String(args[1]) if len(args) > 1 else getenv("HOME") + "/.cache/noeira/local-ai/lfm3/LFM3-1.7B"
     var fails = 0
     print("Lfm3ChatService (int8) vs Lfm3Chat")
+    check(fails, answer_of("I have two arms.</think>Two arms! ") == "Two arms!" and answer_of(" Bonjour. ") == "Bonjour."
+          and answer_of("a</think>b</think> c") == "c" and answer_of("x </think>") == "x" and answer_of("") == "",
+          "answer_of: the last non-empty piece between </think> marks, trimmed")
+    check(fails, chat_think_end(dir) > 0, "the tokenizer has one token for </think>")
     var t0 = perf_counter_ns()
     var svc = Lfm3ChatService.from_spec(String("native:") + dir)
     svc.set_reply_limits(120)

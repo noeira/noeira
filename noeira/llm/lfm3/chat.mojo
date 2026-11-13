@@ -128,11 +128,39 @@ def choose(
     return top_i[len(top_i) - 1]
 
 
+def answer_of(text: String) -> String:
+    """The ANSWER in a decoded reply: the last non-empty piece between its
+    `</think>` marks, without the blanks around it; the whole text when
+    there is no mark. `thought</think>answer` -> `answer`;
+    `draft</think>` -> `draft`.
+
+    ⚠ NOT ONLY FOR THINKING ON. With thinking off the prompt already ends
+    with `<think></think>`, and the model still sometimes writes a first
+    draft, `</think>`, then says it again: 22 of 198 replies when the system
+    prompt carried the robot's state, none with a two-line prompt
+    (docs/ROBOT_BRAIN_PLAN.md, B1). `Lfm3Chat` ends such a reply at the mark
+    (`think_end`), so the draft is the answer. A caller that speaks the reply
+    wants this, not `reply_text` (the raw decode, as the gate compares it)."""
+    var best = String("")
+    for part in text.split("</think>"):
+        var p = String(String(part).strip())
+        if p.byte_length() > 0:
+            best = p
+    return best
+
+
 struct Lfm3Chat(Movable):
     var lm: Lfm3Text
     var tok: ByteLevelBPE
     var cache: Lfm3Cache
     var eos: Int
+    var think_end: Int
+    """`</think>`'s id (-1 when the tokenizer has no single token for it).
+    With thinking OFF a reply ends when the model writes it, as at `eos`: the
+    prompt has already closed the thinking, so the mark only starts a second
+    wording of the answer just given. Measured on BB-1: the same score with
+    the draft as with what followed it, and 0.7 s instead of 1.5 s on those
+    replies. With thinking ON it is the model's own mark and ends nothing."""
     var thinking: Bool
     """`<think>` after the assistant header (Liquid's default) instead of `<think></think>`."""
     var pending: List[Int]
@@ -158,12 +186,13 @@ struct Lfm3Chat(Movable):
     var sys_ids: List[Int]
     var sys_mark: Optional[Lfm3CacheMark]
 
-    def __init__(out self, var lm: Lfm3Text, var tok: ByteLevelBPE, var cache: Lfm3Cache, eos: Int):
+    def __init__(out self, var lm: Lfm3Text, var tok: ByteLevelBPE, var cache: Lfm3Cache, eos: Int, think_end: Int = -1):
         self.seen = List[Bool](length=lm.cfg.vocab, fill=False)
         self.lm = lm^
         self.tok = tok^
         self.cache = cache^
         self.eos = eos
+        self.think_end = think_end
         self.thinking = False
         self.pending = List[Int]()
         self.reply = List[Int]()
@@ -192,7 +221,9 @@ struct Lfm3Chat(Movable):
         var gc = load_json(dir + "/generation_config.json")
         var e = gc.field(gc.root(), "eos_token_id")
         var eos = gc.integer(gc.at(e, 0)) if gc.size(e) > 0 else gc.integer(e)
-        return Lfm3Chat(lm^, tok^, cache^, eos)
+        var te = tok.encode(String("</think>"))
+        var think_end = te[0] if len(te) == 1 else -1
+        return Lfm3Chat(lm^, tok^, cache^, eos, think_end)
 
     def reset(mut self, system: String) raises:
         """A new conversation: `system` (empty: none) and nothing else. With
@@ -286,7 +317,8 @@ struct Lfm3Chat(Movable):
         self.reply.append(t)
         self.seen[t] = True
         self.pending.append(t)  # in the conversation; into the cache with the next feed
-        if t == self.eos or len(self.reply) >= self.settings.max_tokens:
+        var draft_end = t == self.think_end and not self.thinking
+        if t == self.eos or draft_end or len(self.reply) >= self.settings.max_tokens:
             self.done = True
             self.closed = t == self.eos
 
@@ -297,6 +329,10 @@ struct Lfm3Chat(Movable):
         if len(ids) > 0 and ids[len(ids) - 1] == self.eos:
             _ = ids.pop()
         return self.tok.decode(ids)
+
+    def answer_text(self) -> String:
+        """What to show or speak: `answer_of(reply_text())`."""
+        return answer_of(self.reply_text())
 
     def prompt_ids(self) -> List[Int]:
         """What `start` will feed (the gate compares it with the template's tokens)."""

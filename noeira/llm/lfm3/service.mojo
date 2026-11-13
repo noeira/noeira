@@ -141,8 +141,9 @@ struct Lfm3ChatModel(LocalModel):
         var first_us = Int(perf_counter_ns() - t0) // 1000
         while c.next():
             pass
-        var ended = len(c.reply) > 0 and c.reply[len(c.reply) - 1] == c.eos
-        var text = c.reply_text()
+        # ended by the model: at `<|im_end|>`, or at a stray `</think>` (`Lfm3Chat.think_end`)
+        var ended = len(c.reply) > 0 and (c.reply[len(c.reply) - 1] == c.eos or c.reply[len(c.reply) - 1] == c.think_end)
+        var text = c.answer_text()  # after a stray `</think>`, if the model wrote one
         var b = List[UInt8](capacity=13 + text.byte_length())
         _put_u32(b, input_tokens)
         _put_u32(b, len(c.reply))

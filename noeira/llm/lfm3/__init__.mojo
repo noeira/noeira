@@ -7,5 +7,5 @@ from .model import Lfm3Text, Lfm3Config, LT_CONV, LT_FULL, LT_SLIDING
 from .vision import Lfm3Vision, Lfm3VisionConfig
 from .audio import Lfm3Audio, Lfm3AudioConfig
 from .generate import Lfm3Cache, forward_cached, last_logits
-from .chat import Lfm3Chat, ChatSettings, choose
+from .chat import Lfm3Chat, ChatSettings, choose, answer_of
 from noeira.ai.picture import Picture
