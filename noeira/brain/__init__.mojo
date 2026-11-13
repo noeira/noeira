@@ -22,7 +22,7 @@ from .geometry import (
 from .events import (
     BrainEvent, EventLog, event_json, parse_event, load_events, robot_dir,
     EV_SESSION, EV_HEARD, EV_SAID, EV_BEGAN, EV_GOING, EV_ARRIVED,
-    EV_MET, EV_SPEAKER, EV_TASK_STARTED, EV_STEP_STARTED, EV_STEP_DONE, EV_TASK_DONE, EV_TASK_FAILED, EV_TASK_CANCELLED,
+    EV_MET, EV_MISSED, EV_SPEAKER, EV_TASK_STARTED, EV_STEP_STARTED, EV_STEP_DONE, EV_TASK_DONE, EV_TASK_FAILED, EV_TASK_CANCELLED,
 )
 from .state import (
     WorldState, Body, PlaceWord, Task, Step, WS_EVENTS_N, WS_TRAIL_N,

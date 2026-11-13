@@ -47,6 +47,11 @@ known voice gave another name)."""
 comptime EV_SPEAKER = "speaker"
 """Whose voice an utterance was: `text` = `<name> | sure 0.71`, `<name> |
 maybe 0.38` or `unknown | 0.12`."""
+comptime EV_MISSED = "missed"
+"""Someone spoke while the robot was busy with the previous utterance, and it
+did not listen: `text` = how long, `1.2 s`. Nothing of it was transcribed. It
+is recorded to be COUNTED (how often people talk over the robot decides what
+to do about it, docs/ROBOT_BRAIN_PLAN.md §15.7); no view or digest reads it."""
 comptime EV_TASK_STARTED = "task_started"
 """The executive took a task; `text` = its steps in words."""
 comptime EV_STEP_STARTED = "step_started"

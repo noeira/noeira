@@ -152,6 +152,13 @@ def main() raises:
     var logged = load_events(dir + "/state/log/2026-11-06.jsonl")
     check(fails, len(logged) >= 2 and logged[len(logged) - 2].kind == EV_SESSION and logged[len(logged) - 1].text == "bonjour"
           and ws2.log_error == "", "the state writes its events to its log")
+    var view_before = reply_view(ws2).text()
+    ws2.missed(1.24, t + 2)
+    var logged2 = load_events(dir + "/state/log/2026-11-06.jsonl")
+    check(fails, len(logged2) == len(logged) + 1 and logged2[len(logged2) - 1].kind == "missed" and logged2[len(logged2) - 1].text == "1.2 s"
+          and logged2[len(logged2) - 1].source == "voice" and logged2[len(logged2) - 1].t == t + 2,
+          "speech the robot did not listen to is one line of the log: its length, nothing else")
+    check(fails, reply_view(ws2).text() == view_before, "and the reply view does not change for it")
     var ws3 = WorldState(Body.g1_room("Noé"), String("a furnished room"))
     ws3.open_log(String("/nonexistent_root_dir/x"), t)
     check(fails, ws3.log_error != "" and len(ws3.events) == 1, "an unwritable log is reported, the event is kept: " + ws3.log_error)

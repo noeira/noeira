@@ -30,6 +30,7 @@ people (B4), the task stack (B2), reading a day back at start (B3).
 
 from .events import (
     BrainEvent, EventLog, EV_SESSION, EV_HEARD, EV_SAID, EV_BEGAN, EV_GOING, EV_ARRIVED,
+    EV_MISSED,
 )
 
 comptime STEP_PENDING: Int = 0
@@ -310,6 +311,10 @@ struct WorldState(Movable):
 
     def heard(mut self, text: String, now: Int):
         self.record(EV_HEARD, text, String("voice"), now)
+
+    def missed(mut self, seconds: Float64, now: Int):
+        """Speech the robot did not listen to (`EV_MISSED`): its length only."""
+        self.record(EV_MISSED, String(round(seconds, 1)) + String(" s"), String("voice"), now)
 
     def said(mut self, text: String, now: Int):
         self.record(EV_SAID, text, String("voice"), now)

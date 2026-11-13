@@ -443,6 +443,9 @@ struct G1VoiceLoopOf[
     """The detector: levels, the pre-roll, the segment in hand (`g1_vad.mojo`)."""
     var seg_keep: List[Int16]
     """The utterance last sent to the recogniser, until `take_segment`."""
+    var missed_s: Float64
+    """Speech not listened to because the loop was busy, in seconds, until
+    `take_missed`."""
     var reply_override: String
     """What to say INSTEAD of asking the reply model, when not empty
     (`set_reply_override`)."""
@@ -583,6 +586,7 @@ struct G1VoiceLoopOf[
         self.t_wait = perf_counter_ns()
         self.mute_until = perf_counter_ns()
         self.seg_keep = List[Int16]()
+        self.missed_s = 0.0
         self.reply_override = String("")
         self.canned = String("")
         self.mic_on = True
@@ -633,6 +637,7 @@ struct G1VoiceLoopOf[
         self.mute_until = move.mute_until
         self.vad = move.vad^
         self.seg_keep = move.seg_keep^
+        self.missed_s = move.missed_s
         self.reply_override = move.reply_override^
         self.canned = move.canned^
         self.mic_on = move.mic_on
@@ -836,6 +841,15 @@ struct G1VoiceLoopOf[
         self.heard_new = String("")
         return h
 
+    def take_missed(mut self) -> Float64:
+        """Seconds of speech that began while the loop was busy and were not
+        listened to, since the last call; 0 when none. For the caller's
+        record (`noeira.brain.WorldState.missed`): the `[vad]` note says the
+        same in the console, where nobody counts it."""
+        var s = self.missed_s
+        self.missed_s = 0.0
+        return s
+
     def take_note(mut self) -> String:
         """The last log line, consumed. Empty when there is nothing new."""
         var n = self.note
@@ -972,6 +986,7 @@ struct G1VoiceLoopOf[
                     self.state = VL_ST_REC
                 if ve.note != "":
                     self.note = ve.note
+                self.missed_s += ve.missed_s
                 if self.state == VL_ST_REC:
                     if ve.done:
                         try:

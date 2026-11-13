@@ -291,6 +291,7 @@ def main() raises:
     var notes = List[String]()
     var at = List[Float64]()
     var opened_early = False
+    var taken = List[Float64]()
     var t0 = perf_counter_ns()
     var run_s = LOAD_S + total_s - 3.2 + 2.0
     print("a", round(total_s, 1), "s recording, utterances of", UTT_S, "s at 6, 9, 14 and 18 s; running", round(run_s, 1), "s")
@@ -298,6 +299,9 @@ def main() raises:
         _ = loop.poll(ctx, bank)
         if loop.stt.loading() and loop.mic:
             opened_early = True
+        var ms = loop.take_missed()
+        if ms > 0.0:
+            taken.append(ms)
         var n = loop.take_note()
         if n != "":
             var el = Float64(perf_counter_ns() - t0) / 1e9
@@ -344,6 +348,9 @@ def main() raises:
     if len(missed) == 1:
         var s = seconds_in(notes[missed[0]])
         check(fails, s > UTT_S - 0.2 and s < UTT_S + 0.2, "it gives the utterance's length: " + notes[missed[0]])
+    check(fails, len(taken) == 1 and taken[0] > UTT_S - 0.2 and taken[0] < UTT_S + 0.2,
+          "and the caller is handed it once, for its record (`take_missed`): "
+          + (String(round(taken[0], 2)) + " s" if len(taken) == 1 else String(len(taken)) + " times"))
     check(fails, loop.stt.calls == 3 and sent == 3 and heard == 3,
           String(loop.stt.calls) + " clips reached the recogniser (3 expected: no clip made of the tail of the second)")
 
