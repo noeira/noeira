@@ -1,0 +1,9 @@
+# Robot brain manifest — `pixi run test-brain`
+#
+# noeira/brain (docs/ROBOT_BRAIN_PLAN.md): the shared state, its event log and
+# the text views the models read. CPU-only, no model: geometry and reducers
+# against tools/brain/make_bb1.py's own arithmetic, the log's round trip, the
+# reply view's text, the BB-1 scoring rule. The bench that asks the reply model
+# (benchmarks/bench_brain_grounded_gpu.mojo) needs LFM3-1.7B and a GPU.
+
+tests/brain/test_brain_state.mojo

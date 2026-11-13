@@ -81,6 +81,7 @@ from noeira.ai.speech import (
 )
 from noeira.io.fileio import write_file_atomic
 from noeira.io.wav import WavAudio
+from noeira.text.spoken import spoken_text
 from noeira.envs.robots.g1_command_bank import G1CommandBank
 from noeira.envs.robots.g1_command_language import (
     g1_command_questions, g1_decide, g1_decide_chain, g1_command_state,
@@ -262,6 +263,8 @@ struct G1VoiceConfig(Copyable, Movable):
     var jev_dl: Float64
     var chat_dl: Float64
     var chat_sys: String
+    """The reply model's system prompt. A caller with a `WorldState` rewrites
+    it from the state (`set_reply_system`)."""
     var pool_path: String
     """"" disables the cache-miss path; the bank then refuses what it has no
     name for instead of writing a reward spec."""
@@ -802,6 +805,13 @@ struct G1VoiceLoopOf[
         (`see`): render one then, not every tick. False without `cfg.see`."""
         return self.cfg.see and self.view_due and not self.view_blind
 
+    def set_reply_system(mut self, var text: String):
+        """The reply model's system prompt from here on (`cfg.chat_sys`).
+        For a caller whose prompt follows the robot's state
+        (`noeira.brain.reply_view`): set it before `poll`, each frame or when
+        the state changes. A reply already started keeps the one it had."""
+        self.cfg.chat_sys = text^
+
     def take_heard(mut self) -> String:
         """The utterance just sent for a decision, consumed; "" when none.
         For `G1Context.heard_said`: logged after its own state was built, so
@@ -1153,7 +1163,8 @@ struct G1VoiceLoopOf[
                     var rms_ = 0.0
                     try:
                         var rep = self.llm.result()
-                        rtxt = rep.text
+                        # what a voice can say: no emoji, no markup (`noeira.text.spoken`)
+                        rtxt = spoken_text(rep.text)
                         rms_ = rep.latency_ms
                     except e:
                         self.note = String("[talk] FAILED: ") + String(e)

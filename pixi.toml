@@ -363,6 +363,7 @@ test-act = { cmd = "bash scripts/run_tests.sh tests/manifests/act.txt", descript
 test-io = { cmd = "bash scripts/run_tests.sh tests/manifests/io.txt", description = "Native parquet / resize / LeRobot-import gates (needs the dumps in tests/manifests/io.txt)" }
 test-vision = { cmd = "bash scripts/run_tests.sh tests/manifests/vision.txt", depends-on = ["build-opencv"], description = "The vision gates (OpenCV shim, calibration, capture) — needs the OpenCV shim, so not in test-smoke" }
 test-swm = { cmd = "bash scripts/run_tests.sh tests/manifests/swm.txt", description = "SWM-H sheaf world model gates (experimental, CPU)" }
+test-brain = { cmd = "bash scripts/run_tests.sh tests/manifests/brain.txt", description = "Robot brain gates: shared state, event log, reply view, BB-1 scoring rule (CPU; docs/ROBOT_BRAIN_PLAN.md)" }
 test-fb = { cmd = "bash scripts/run_tests.sh tests/manifests/fb.txt", description = "Forward-Backward zero-shot RL gates (CPU; docs/BFM_ZERO_SHOT_RL.md)" }
 test-lewm = { cmd = "bash scripts/run_tests.sh tests/manifests/lewm.txt", description = "LeWorldModel data path self-consistency (CPU, toy dims)" }
 test-peft = { cmd = "bash scripts/run_tests.sh tests/manifests/peft.txt", description = "Frozen parameters, LoRA, int4 (Q4_0), GPTQ and QLoRA: gates" }
