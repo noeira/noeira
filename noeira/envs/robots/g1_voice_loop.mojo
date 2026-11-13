@@ -72,7 +72,12 @@ string instead.
 
 from std.time import perf_counter_ns
 
-from noeira.ai.audio_io import MicCapture, rms, LocalVoice, os_voice_for
+from noeira.ai.audio_io import MicCapture, LocalVoice, os_voice_for
+from noeira.envs.robots.g1_vad import (
+    G1Vad, G1VadEvent, g1_vad_open_at, g1_vad_close_at, g1_vad_floor_step,
+    VL_PREROLL_S, VL_DRAIN_S, VL_OPEN_MULT, VL_CLOSE_MULT, VL_OPEN_MIN, VL_OPEN_FRAMES,
+    VL_MIN_PEAK_MULT, VL_FLOOR_MIN, VL_FRAME,
+)
 from noeira.ai.chat import ChatClient, ChatMessage, ToolSpec, ChatService
 from noeira.ai.jev import JevClient, JevQuestions, DecisionService
 from noeira.ai.picture import Picture
@@ -157,59 +162,8 @@ comptime VL_TTS_DEADLINE_S: Float64 = 5.0
 # against "both_hands_up" 2.20 s, the longer word being the shorter sound).
 comptime VL_ECHO_TAIL_S: Float64 = 0.45
 
-comptime VL_PREROLL_S: Float64 = 0.35
-"""Audio kept before the detector opens, so the first syllable survives."""
-comptime VL_DRAIN_S: Float64 = 0.35
-
-# ── the voice-activity detector, every constant measured ──────────────────
-comptime VL_OPEN_MULT: Float64 = 5.0
-comptime VL_CLOSE_MULT: Float64 = 2.5
-comptime VL_OPEN_MIN: Float64 = 0.0060
-comptime VL_OPEN_FRAMES: Int = 3
-comptime VL_MIN_PEAK_MULT: Float64 = 1.6
-comptime VL_FLOOR_MIN: Float64 = 0.00005
-
-
-# ── the detector's arithmetic, as functions so it can be GATED ────────────
-# ⚠ THIS WAS INLINE IN THE LOOP AND THEREFORE UNTESTABLE, which is the wrong
-# place for the three lines with the worst history in this file. Both of
-# §12.55's detector bugs live here.
-
-
-def g1_vad_open_at(floor: Float64) -> Float64:
-    """The level a segment opens at. ⚠ FLOORED, because `floor * 5` in a very
-    quiet room is below the microphone's own noise and the detector would open
-    on nothing."""
-    var v = floor * VL_OPEN_MULT
-    return v if v > VL_OPEN_MIN else VL_OPEN_MIN
-
-
-def g1_vad_close_at(floor: Float64) -> Float64:
-    """The level a segment closes below.
-
-    ⚠ IT NEEDS A FLOOR OF ITS OWN, and this is the bug that cost a session.
-    It was `floor * 2.5` alone, and the floor is an average over QUIET frames
-    — so in a room whose between-word noise sits above that, a segment opens
-    and NEVER CLOSES: one ran the full 10 s max-segment guard for a 3 s
-    question, and another recorded 5.99 s for the word "you". Tying it to the
-    opening threshold keeps the two in proportion whatever the room is doing.
-    """
-    var v = floor * VL_CLOSE_MULT
-    var lo = VL_OPEN_MIN * 0.5
-    return v if v > lo else lo
-
-
-def g1_vad_floor_step(floor: Float64, level: Float64) -> Float64:
-    """One EMA step of the tracked quiet level.
-
-    ⚠ THE FLOOR IS TYPICAL QUIET, NOT THE QUIETEST INSTANT. Tracking the
-    minimum put `close_at` below ordinary room noise, which is the same
-    never-closing failure from the other direction. ⚠ And the CALLER must only
-    call this on frames BELOW `g1_vad_open_at`, or speech raises the floor it
-    is measured against and the detector deafens itself mid-sentence.
-    """
-    var f = floor * 0.98 + level * 0.02
-    return f if f > VL_FLOOR_MIN else VL_FLOOR_MIN
+# The detector (its constants, its thresholds, the frame-by-frame machine) is `g1_vad.mojo`; the
+# names are imported above and still importable from here.
 
 
 def g1_view_fresh(seg_t_ns: Int, view_t_ns: Int, max_age_s: Float64) -> Bool:
@@ -362,7 +316,12 @@ struct G1VoiceConfig(Copyable, Movable):
     var mic_input: String
     """ffmpeg input arguments used verbatim instead of the device
     (`MicCapture.start`'s `input_args`): `-re -i clip.wav` runs the whole loop
-    on a recording, headless. "" = the microphone (`mic_dev`)."""
+    on a recording, headless. "" = the microphone (`mic_dev`). The recording
+    starts when the loop first polls with every model loaded (`loading`; the
+    `[voice] listening` line), not at construction. ⚠ Give it 4 s of room
+    noise at its head: the capture's `-fflags nobuffer` makes ffmpeg drop the
+    first 3.2 s of a FILE (`MicCapture`), and the detector takes its first
+    second to learn the floor."""
 
     def __init__(out self):
         self.lang = String("")
@@ -422,7 +381,12 @@ struct G1VoiceLoopOf[
     spoken replies: `ChatClient` (HTTP, the default) or
     `noeira.llm.lfm3.service.Lfm3ChatService` (LFM3 in this process)."""
 
-    var mic: MicCapture
+    var mic: Optional[MicCapture]
+    """The capture process. ⚠ OPENED AT THE FIRST `poll`, NOT HERE AT
+    CONSTRUCTION: a loop is built, then its caller loads a room for twenty
+    seconds, and a capture started at construction has by then a backlog that
+    comes back faster than real time (`g1_vad.mojo`'s note; in a headless run
+    on a recording it ate the first utterances)."""
     var voice: LocalVoice
     var tts: Optional[Self.TTS]
     """`tts_spec` set: the synthesiser. Its WAV is played through `voice`, so
@@ -475,7 +439,8 @@ struct G1VoiceLoopOf[
     var pick: G1LangPick
     var t_wait: Int
     var mute_until: Int
-    var seg: List[Int16]
+    var vad: G1Vad
+    """The detector: levels, the pre-roll, the segment in hand (`g1_vad.mojo`)."""
     var seg_keep: List[Int16]
     """The utterance last sent to the recogniser, until `take_segment`."""
     var reply_override: String
@@ -483,17 +448,13 @@ struct G1VoiceLoopOf[
     (`set_reply_override`)."""
     var canned: String
     """A computed reply on its way out (one poll)."""
-    var ring: List[Int16]
-    var ring_max: Int
-    var floor: Float64
-    var level: Float64
-    var peak: Float64
-    var quiet_since: Int
-    var above: Int
-    var forced: Bool
     var mic_on: Bool
     var mic_dead: String
     var checked_silence: Bool
+    var t_built: Int
+    """When the loop was built: the models have been loading since."""
+    var wait_what: String
+    """The backends still loading at the last poll, as printed ("" = none)."""
     var note: String
     """The last thing worth printing. The caller drains it with `take_note`,
     so this object never owns the log format."""
@@ -555,11 +516,11 @@ struct G1VoiceLoopOf[
         self.tts_busy = False
         self.tts_text = String("")
         self.tts_t0 = 0
-        # ⚠ `MicCapture.start` IS THE CONSTRUCTOR — it opens the device, so
-        # there is no separate `start()` for it and the field cannot be a
-        # not-yet-opened capture. A failure here raises out of `__init__`,
-        # which is where a missing microphone should stop a program.
-        self.mic = MicCapture.start(16000, self.cfg.mic_dev, self.cfg.mic_input)
+        # ⚠ the capture is NOT opened here: `poll` opens it the first time it
+        # runs (the `mic` field's note). A device that cannot be opened is
+        # reported there, in `mic_dead` and the note, as a dead one is.
+        self.mic = None
+        self.vad = G1Vad(self.cfg.hang_s, self.cfg.min_seg, self.cfg.max_seg)
         self.dest_q = JevQuestions()
         self.quest_mem = JevQuestions()
         self.mem_asked = False
@@ -621,21 +582,14 @@ struct G1VoiceLoopOf[
         self.pick = G1LangPick()
         self.t_wait = perf_counter_ns()
         self.mute_until = perf_counter_ns()
-        self.seg = List[Int16]()
         self.seg_keep = List[Int16]()
         self.reply_override = String("")
         self.canned = String("")
-        self.ring = List[Int16]()
-        self.ring_max = Int(VL_PREROLL_S * 16000.0)
-        self.floor = 0.0010
-        self.level = 0.0
-        self.peak = 0.0
-        self.quiet_since = perf_counter_ns()
-        self.above = 0
-        self.forced = False
         self.mic_on = True
         self.mic_dead = String("")
         self.checked_silence = False
+        self.t_built = perf_counter_ns()
+        self.wait_what = String("")
         self.note = String("")
         self.view = List[Picture]()
         self.view_t = 0
@@ -677,21 +631,15 @@ struct G1VoiceLoopOf[
         self.pick = move.pick^
         self.t_wait = move.t_wait
         self.mute_until = move.mute_until
-        self.seg = move.seg^
+        self.vad = move.vad^
         self.seg_keep = move.seg_keep^
         self.reply_override = move.reply_override^
         self.canned = move.canned^
-        self.ring = move.ring^
-        self.ring_max = move.ring_max
-        self.floor = move.floor
-        self.level = move.level
-        self.peak = move.peak
-        self.quiet_since = move.quiet_since
-        self.above = move.above
-        self.forced = move.forced
         self.mic_on = move.mic_on
         self.mic_dead = move.mic_dead^
         self.checked_silence = move.checked_silence
+        self.t_built = move.t_built
+        self.wait_what = move.wait_what^
         self.note = move.note^
         self.view = move.view^
         self.view_t = move.view_t
@@ -713,7 +661,8 @@ struct G1VoiceLoopOf[
 
     def stop(mut self):
         try:
-            self.mic.stop()
+            if self.mic:
+                self.mic.value().stop()
         except:
             pass
         self._tts_cancel()
@@ -796,14 +745,10 @@ struct G1VoiceLoopOf[
         for the detector to close."""
         if self.state == VL_ST_IDLE:
             self.heard = String("")
-            self.seg = self.ring.copy()
-            self.ring = List[Int16]()
-            self.peak = self.level
-            self.quiet_since = perf_counter_ns()
-            self.forced = False
+            self.vad.open_now()
             self.state = VL_ST_REC
         elif self.state == VL_ST_REC:
-            self.forced = True
+            self.vad.forced = True
 
     def toggle_mic(mut self) -> String:
         """Close or reopen the microphone. Returns a line for the log.
@@ -819,24 +764,24 @@ struct G1VoiceLoopOf[
         """
         if self.mic_on:
             try:
-                self.mic.stop()
+                if self.mic:
+                    self.mic.value().stop()
             except:
                 pass
+            self.mic = None
             self.mic_on = False
-            self.ring = List[Int16]()
-            self.level = 0.0
+            self.vad.restart()
             self.state = VL_ST_IDLE
             return String("[mic] closed")
         try:
-            self.mic = MicCapture.start(16000, self.cfg.mic_dev, self.cfg.mic_input)
+            self.mic = Optional(MicCapture.start(16000, self.cfg.mic_dev, self.cfg.mic_input))
             self.mic_on = True
             self.mic_dead = String("")
             # ⚠ and the detector starts over: a floor learned before the gap
             # describes a room that may have changed, and `checked_silence`
             # must re-run or a newly-muted device would never be reported.
             self.checked_silence = False
-            self.peak = 0.0
-            self.floor = 0.0010
+            self.vad.restart()
             return String("[mic] reopened")
         except e:
             self.mic_dead = String(e)
@@ -902,6 +847,28 @@ struct G1VoiceLoopOf[
         caller may want to suppress a keyboard command that would race it."""
         return self.state != VL_ST_IDLE
 
+    def loading(self) -> String:
+        """The backends still loading or warming up, by role ("" when none).
+
+        ⚠ THE MICROPHONE STAYS CLOSED UNTIL THIS IS EMPTY, and that was the
+        other half of the "lost utterance" (`g1_vad.mojo`'s note). The models
+        load on their own threads while the loop already runs. An utterance
+        spoken then is queued behind the load: its transcription came back
+        6 s after it ended where the recogniser itself takes 80 ms, the loop
+        was still deciding it when the next one arrived, and that one was
+        lost. A robot that cannot answer yet should not be listening yet:
+        the first `[voice] listening` line is when it can."""
+        var w = String("")
+        if self.stt.loading():
+            w += " hear"
+        if self.jev.loading():
+            w += " decide"
+        if self.llm.loading():
+            w += " reply"
+        if self.tts and self.tts.value().loading():
+            w += " speak"
+        return w^
+
     def speaking(mut self) -> Bool:
         """⚠ A GATE THAT RAISES WOULD TAKE THE LOOP DOWN, and the safe default
         is to assume we ARE talking rather than open the microphone onto our
@@ -933,48 +900,54 @@ struct G1VoiceLoopOf[
         if self.speaking():
             self.mute_until = perf_counter_ns() + _vl_ns(VL_ECHO_TAIL_S)
         var echoing = perf_counter_ns() < self.mute_until
-        if self.mic_on and self.mic_dead == "":
+        # ⚠ THE STATE AT THE START OF THIS POLL: a segment that ends below
+        # starts its transcription, whose own branch must wait for the next
+        # poll (the chain after this block was `if REC ... elif STT ...`).
+        var was_rec = self.state == VL_ST_REC
+        var waiting = String("")
+        if self.mic_on and self.mic_dead == "" and not self.mic:
+            waiting = self.loading()
+            if waiting != self.wait_what:
+                # one line each time a backend comes in: the log then says how
+                # long each took, which is what was missing to see this fault
+                var el = _vl_f2(Float64(perf_counter_ns() - self.t_built) / 1e9)
+                if waiting == "":
+                    self.note = String("[voice] listening — every model ready ") + el + String(" s after the loop was built")
+                else:
+                    self.note = (String("[voice] not listening yet (") + el + String(" s) — still loading:") + waiting)
+                self.wait_what = waiting.copy()
+        if waiting != "":
+            pass    # the microphone opens when the models can answer (`loading`)
+        elif self.mic_on and self.mic_dead == "":
             try:
-                var pcm = self.mic.read()
+                if not self.mic:
+                    # opened here, the first time the loop runs with its
+                    # models loaded (the field's note, and `loading`)
+                    self.mic = Optional(MicCapture.start(16000, self.cfg.mic_dev, self.cfg.mic_input))
+                var pcm = self.mic.value().read()
+                var secs = self.mic.value().seconds_read()
+                var ve: G1VadEvent
                 if echoing:
-                    self.level = 0.0
-                    # ⚠ AND DROP THE RING. It holds the last 0.35 s and is
-                    # prepended to the next segment — which would hand Whisper
-                    # the tail of the robot's own sentence as the first
-                    # syllable of yours.
-                    self.ring = List[Int16]()
-                elif len(pcm) > 0:
-                    self.level = rms(pcm)
-                    if self.level > self.peak:
-                        self.peak = self.level
-                    if self.state == VL_ST_REC:
-                        for i in range(len(pcm)):
-                            self.seg.append(pcm[i])
-                    else:
-                        for i in range(len(pcm)):
-                            self.ring.append(pcm[i])
-                        if len(self.ring) > self.ring_max:
-                            var keep = List[Int16]()
-                            for i in range(len(self.ring) - self.ring_max,
-                                           len(self.ring)):
-                                keep.append(self.ring[i])
-                            self.ring = keep^
-                        # ⚠ THE FLOOR IS TYPICAL QUIET, NOT THE QUIETEST
-                        # INSTANT. Tracking the minimum put the close
-                        # threshold BELOW ordinary room noise, so a segment
-                        # that opened never closed — a real session recorded
-                        # 5.99 s for "you" and 7.06 s for "Cool. Run.",
-                        # ending on the max-segment guard rather than on
-                        # silence. Only frames BELOW the open threshold count,
-                        # or speech raises the floor it is measured against
-                        # and the detector deafens itself mid-sentence.
-                        if self.level < g1_vad_open_at(self.floor):
-                            self.floor = g1_vad_floor_step(
-                                self.floor, self.level
-                            )
-                if not self.checked_silence and self.mic.seconds_read() > 1.0:
+                    # ⚠ AND THE PRE-ROLL GOES WITH THEM (`G1Vad.skip`): it would
+                    # hand the recogniser the tail of the robot's own sentence
+                    # as the first syllable of yours.
+                    ve = self.vad.skip(len(pcm))
+                else:
+                    # ⚠ VAD OPENS ONLY FROM IDLE. While a transcription or a
+                    # decision is in flight, speech is still ringed but starts
+                    # nothing — one call per client, and a queue of half-heard
+                    # commands is worse than a missed one. The 1.2 s guard
+                    # keeps the floor estimate from opening a segment on its
+                    # own first samples.
+                    var may_open = self.state == VL_ST_IDLE and self.cfg.vad and secs > 1.2
+                    # ⚠ and what is spoken meanwhile is REPORTED, and never
+                    # opened on its tail when the loop comes back mid-sentence
+                    # (`G1Vad.feed`'s `busy`).
+                    var busy = self.cfg.vad and self.state != VL_ST_IDLE and self.state != VL_ST_REC
+                    ve = self.vad.feed(pcm, may_open, busy)
+                if not self.checked_silence and secs > 1.0:
                     self.checked_silence = True
-                    if self.mic.digital_silence(0.5):
+                    if self.mic.value().digital_silence(0.5):
                         self.mic_dead = String(
                             "mic is digital silence — muted, disabled, or "
                             "permission refused"
@@ -986,85 +959,47 @@ struct G1VoiceLoopOf[
                         # the loudest thing in the first second.
                         self.note = (
                             String("[mic] input live — ")
-                            + _vl_f2(self.mic.seconds_read())
-                            + String(" s read, floor ") + _vl_f4(self.floor)
-                            + String(" peak ") + _vl_f4(self.peak)
+                            + _vl_f2(secs)
+                            + String(" s read, floor ") + _vl_f4(self.vad.floor)
+                            + String(" peak ") + _vl_f4(self.vad.peak)
                         )
+                # ── what the detector found in this poll's audio ──────
+                if ve.opened and self.state == VL_ST_IDLE:
+                    self.heard = String("")
+                    self.pick = G1LangPick()
+                    self.view_due = True
+                    self.seg_t = perf_counter_ns()
+                    self.state = VL_ST_REC
+                if ve.note != "":
+                    self.note = ve.note
+                if self.state == VL_ST_REC:
+                    if ve.done:
+                        try:
+                            var audio = WavAudio(16000, 1, self.vad.seg.copy())
+                            self.seg_keep = self.vad.seg.copy()
+                            self.stt.start(audio)
+                            self.t_wait = perf_counter_ns()
+                            self.note = (String("[stt] ") + String(len(self.vad.seg))
+                                         + String(" samples (") + _vl_f2(ve.seg_s)
+                                         + String(" s ), peak ")
+                                         + _vl_f4(self.vad.peak)
+                                         + (String(" — max-seg") if ve.over
+                                            else String("")))
+                            self.state = VL_ST_STT
+                        except e:
+                            self.note = String("[stt] could not start: ") + String(e)
+                            self.state = VL_ST_IDLE
+                    elif not self.vad.recording:
+                        self.state = VL_ST_IDLE     # the segment was dropped (its note says why)
             except e:
                 self.mic_dead = String(e)
                 self.note = String("[mic] ") + self.mic_dead
-
-        var open_at = g1_vad_open_at(self.floor)
-        var close_at = g1_vad_close_at(self.floor)
-
-        # ⚠ VAD OPENS ONLY FROM IDLE. While a transcription or a decision is
-        # in flight, speech is still ringed but starts nothing — one call per
-        # client, and a queue of half-heard commands is worse than a missed
-        # one. The 1.2 s guard keeps the floor estimate from opening a segment
-        # on its own first samples.
-        if self.level > open_at and not echoing:
-            self.above += 1
-        else:
-            self.above = 0
-        var can_open = self.mic.seconds_read() > 1.2
-        if (self.mic_on and self.mic_dead == "" and self.state == VL_ST_IDLE
-            and self.cfg.vad and not echoing
-            and self.above >= VL_OPEN_FRAMES and can_open):
-            self.heard = String("")
-            self.pick = G1LangPick()
-            self.seg = self.ring.copy()
-            self.ring = List[Int16]()
-            self.peak = self.level
-            self.quiet_since = perf_counter_ns()
-            self.forced = False
-            self.view_due = True
-            self.seg_t = perf_counter_ns()
-            self.state = VL_ST_REC
-
-        # ── recording ─────────────────────────────────────────────────
-        if self.state == VL_ST_REC:
-            if self.level > close_at:
-                self.quiet_since = perf_counter_ns()
-            var quiet_s = Float64(perf_counter_ns() - self.quiet_since) / 1e9
-            var seg_s = Float64(len(self.seg)) / 16000.0
-            # ⚠ THREE WAYS TO END, and the last two are not optional. Silence
-            # is the normal one. A segment that never falls quiet (a fan, a
-            # conversation across the room) would otherwise record for ever
-            # and post a minute of audio; a forced end is what TAB is for.
-            var over = seg_s > self.cfg.max_seg
-            var done = self.forced or over or (quiet_s > self.cfg.hang_s)
-            if done and seg_s > VL_DRAIN_S:
-                self.forced = False
-                # ⚠ a cough, a chair, a door. Below `min_seg` it is not
-                # speech, and sending it costs a Whisper call to be told so.
-                if seg_s < self.cfg.min_seg:
-                    self.note = (String("[vad] dropped ") + _vl_f2(seg_s)
-                                 + String(" s — under ")
-                                 + _vl_f2(self.cfg.min_seg))
+                if self.state == VL_ST_REC:
                     self.state = VL_ST_IDLE
-                elif self.peak < open_at * VL_MIN_PEAK_MULT:
-                    self.note = (String("[vad] dropped — peak ")
-                                 + _vl_f4(self.peak) + String(" under ")
-                                 + _vl_f4(open_at * VL_MIN_PEAK_MULT))
-                    self.state = VL_ST_IDLE
-                else:
-                    try:
-                        var audio = WavAudio(16000, 1, self.seg.copy())
-                        self.seg_keep = self.seg.copy()
-                        self.stt.start(audio)
-                        self.t_wait = perf_counter_ns()
-                        self.note = (String("[stt] ") + String(len(self.seg))
-                                     + String(" samples (") + _vl_f2(seg_s)
-                                     + String(" s ), peak ")
-                                     + _vl_f4(self.peak)
-                                     + (String(" — max-seg") if over
-                                        else String("")))
-                        self.state = VL_ST_STT
-                    except e:
-                        self.note = String("[stt] could not start: ") + String(e)
-                        self.state = VL_ST_IDLE
 
         # ── transcribing ──────────────────────────────────────────────
+        if was_rec:
+            pass    # recording is handled with the microphone, above
         elif self.state == VL_ST_STT:
             # ⚠ THE DEADLINE IS CHECKED BEFORE THE POLL, so a call that has
             # already blown its budget is cancelled rather than waited on for
@@ -1692,7 +1627,7 @@ struct G1VoiceLoopOf[
         to exactly that question (§12.60)."""
         if self.state == VL_ST_REC:
             return (String("LISTENING ")
-                    + _vl_f2(Float64(len(self.seg)) / 16000.0) + String("s"))
+                    + _vl_f2(Float64(len(self.vad.seg)) / 16000.0) + String("s"))
         var el = Float64(perf_counter_ns() - self.t_wait) / 1e9
         if self.state == VL_ST_STT:
             return (String("transcribing ") + _vl_f2(el) + String("s / ")
@@ -1738,7 +1673,7 @@ struct G1VoiceLoopOf[
         return 1 if el < budget * 0.5 else 2
 
     def meter(self) -> Float64:
-        return self.level
+        return self.vad.level
 
     def mic_checked(self) -> Bool:
         """True once the first second of audio has been inspected for digital
@@ -1762,19 +1697,19 @@ struct G1VoiceLoopOf[
     def peak_level(self) -> Float64:
         """The loudest moment of the current segment, so a spike that came and
         went is still visible a frame later."""
-        return self.peak
+        return self.vad.peak
 
     def open_threshold(self) -> Float64:
         """What the level must exceed to start a segment. ⚠ A HUD that shows
         the level without this cannot answer "how far is my voice from
         starting a recording", which is the question a silent demo raises."""
-        return g1_vad_open_at(self.floor)
+        return g1_vad_open_at(self.vad.floor)
 
     def noise_floor(self) -> Float64:
         """⚠ THE FLOOR, NOT THE PEAK. The first version of this printed the
         peak under the label "noise floor" — two different numbers, and the
         one it showed was the loudest thing in the first second."""
-        return self.floor
+        return self.vad.floor
 
 
 def _vl_triage_hint(kind: String) -> String:

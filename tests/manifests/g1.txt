@@ -71,6 +71,17 @@ tests/robots/test_g1_spec.mojo
 # the measured latencies they were derived from.
 tests/robots/test_g1_voice_loop.mojo
 
+# the detector on its own (`G1Vad`): the same samples give the same segments
+# however they are delivered (20 ms chunks to one burst), and speech that
+# begins while the caller is busy is lost whole and reported, never opened on
+# its tail (« Je m'appelle Denis. » was heard as « Denis. »).
+tests/robots/test_g1_vad.mojo
+
+# the real loop on a replayed recording with stand-in models (needs ffmpeg,
+# 25 s of real time): no capture while a model loads, and the utterance the
+# loop is too busy for costs one log line, not a clip of its last syllable.
+tests/robots/test_g1_voice_loop_listen.mojo
+
 # AMASS step 1 — the `[N, 36]` layout of the retargeted dump. Steps 2-5 are
 # `convert_frames`, held by the oracle gate above; step 1 is new and every
 # way it can be wrong is SILENT (XYZW read as WXYZ is a valid rotation, a

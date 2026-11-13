@@ -211,6 +211,12 @@ trait DecisionService(Movable & Deinitable):
     def from_spec(spec: String) raises -> Self:
         ...
 
+    def loading(self) -> Bool:
+        """True while the backend is still loading or warming up (a model in
+        this process); a call made now waits for that first. As
+        `noeira.ai.speech.SpeechToTextService.loading`."""
+        ...
+
     def warm_up(mut self):
         ...
 
@@ -351,6 +357,9 @@ struct JevClient(Movable, DecisionService):
         var reply = self._call.wait(self._http)
         self._call.state = CALL_IDLE
         return JevAnswers(reply.json(), reply.latency_ms)
+
+    def loading(self) -> Bool:
+        return False    # an HTTP client: nothing to load
 
     def warm_up(mut self):
         """Open the TLS connection now, before a real-time loop — see

@@ -103,6 +103,9 @@ struct KokoroService(Movable, TextToSpeechService):
         """`SVC_LOADING`, `SVC_READY` or `SVC_FAILED` (`noeira.ai.local_service`)."""
         return self.call.state()
 
+    def loading(self) -> Bool:
+        return self.call.loading()
+
     def load_ms(self) -> Int:
         return self.call.load_ms()
 

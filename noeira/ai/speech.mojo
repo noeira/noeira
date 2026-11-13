@@ -81,6 +81,14 @@ trait SpeechToTextService(Movable & Deinitable):
         no text hint — the caller then knows it was not sent."""
         ...
 
+    def loading(self) -> Bool:
+        """True while the backend is still loading or warming up: a call made
+        now waits for that first. A real-time caller holds its microphone
+        closed until this is False (`G1VoiceLoopOf.poll`). An HTTP client has
+        nothing to load and says False; a failed load says False too, so the
+        first call reports why."""
+        ...
+
     def warm_up(mut self):
         """Make the first call as fast as the next ones (a connection, a load)."""
         ...
@@ -106,6 +114,10 @@ trait TextToSpeechService(Movable & Deinitable):
     def from_spec(spec: String, voice: String) raises -> Self:
         """The backend named by `spec`, speaking with `voice` (Kokoro's
         names: `af_heart`, `ff_siwis`, ...)."""
+        ...
+
+    def loading(self) -> Bool:
+        """As `SpeechToTextService.loading`."""
         ...
 
     def warm_up(mut self):
@@ -310,6 +322,9 @@ struct SpeechToText(Movable, SpeechToTextService):
             raise Error("speech-to-text: no 'text' in the reply")
         return Transcript(doc.string(t), reply.latency_ms)
 
+    def loading(self) -> Bool:
+        return False    # an HTTP client: nothing to load
+
     def warm_up(mut self):
         """Open the TLS connection now, before a real-time loop — see
         `noeira.ai.transport.warm_up`."""
@@ -426,6 +441,9 @@ struct TextToSpeech(Movable, TextToSpeechService):
     def result(mut self) raises -> WavAudio:
         var b = self.result_wav_bytes()
         return decode_wav(b)
+
+    def loading(self) -> Bool:
+        return False    # an HTTP client: nothing to load
 
     def warm_up(mut self):
         """Open the TLS connection now, before a real-time loop — see

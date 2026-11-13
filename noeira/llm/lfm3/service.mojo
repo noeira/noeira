@@ -189,6 +189,9 @@ struct Lfm3ChatService(Movable, ChatService):
     def state(self) -> Int:
         return self.call.state()
 
+    def loading(self) -> Bool:
+        return self.call.loading()
+
     def load_ms(self) -> Int:
         return self.call.load_ms()
 

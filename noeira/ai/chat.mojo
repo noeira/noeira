@@ -367,6 +367,12 @@ trait ChatService(Movable & Deinitable):
         from 10.8 s to 1.4 s when switched off)."""
         ...
 
+    def loading(self) -> Bool:
+        """True while the backend is still loading or warming up (a model in
+        this process); a call made now waits for that first. As
+        `noeira.ai.speech.SpeechToTextService.loading`."""
+        ...
+
     def warm_up(mut self):
         ...
 
@@ -765,6 +771,9 @@ struct ChatClient(Movable, ChatService):
         r.latency_ms = self._call.latency_ms
         self._call.state = CALL_IDLE
         return r^
+
+    def loading(self) -> Bool:
+        return False    # an HTTP client: nothing to load
 
     def warm_up(mut self):
         """Open the TLS connection now, before a real-time loop — see

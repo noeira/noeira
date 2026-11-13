@@ -386,6 +386,13 @@ struct MicCapture(Movable):
     `input_args` replaces the capture device with any ffmpeg input — the
     gate uses `-re -f lavfi -i sine=...` so it can run with no microphone
     and no permission prompt.
+
+    ⚠ A FILE REPLAYED THIS WAY LOSES ITS FIRST 3.2 s (`-re -i clip.wav`).
+    `-fflags nobuffer` tells ffmpeg not to keep the packets it reads while
+    probing the input: right for a live device (no stale audio at start), but
+    on a 16 kHz mono WAV it is 102 400 bytes that never reach the pipe
+    (ffmpeg 8.1: 3 421 450 bytes out with the flag, 3 523 850 without). A
+    recording needs that much lead-in before its first word.
     """
 
     var sample_rate: Int
