@@ -353,7 +353,23 @@ def sm_heads_vjp_lane[dt: DType, R: TrackingRobot](
     """`g_s` (S), `g_a` (n), `g_ap` (n) ← the VJP of `sm_heads_lane` for the
     cotangents `g_r` (total reward), `g_feat` (2) and `g_obs` (3n + 6). `scratch`
     must hold that forward call's FK (its first `FK_BLOCK` values); the
-    rest of it is overwritten. Outputs are written, not added to."""
+    rest of it is overwritten. Outputs are written, not added to.
+
+    It is `sm_heads_vjp_open_lane` then `sm_heads_vjp_close_lane`: a caller
+    with more terms on the FK's bodies (the object interface's hands) adds
+    their cotangents to the FK block between the two."""
+    sm_heads_vjp_open_lane[dt, R](table, s, a, a_prev, rf, g_r, scratch, g_s, g_a, g_ap)
+    sm_heads_vjp_close_lane[dt, R](tree, s, g_feat, g_obs, scratch, g_s, g_a)
+
+
+def sm_heads_vjp_open_lane[dt: DType, R: TrackingRobot](
+    table: FP[dt], s: FP[dt], a: FP[dt], a_prev: FP[dt], rf: FP[dt], g_r: Scalar[dt], scratch: FP[dt],
+    g_s: FP[dt], g_a: FP[dt], g_ap: FP[dt],
+) where dt.is_floating_point():
+    """The first half: zeroes the FK cotangent block (`scratch[FK_BLOCK :
+    2·FK_BLOCK]`: pos | quat | lin | ang per body) and the outputs, then the
+    reward's cotangents into that block, and its direct terms into `g_s`
+    (joint limits), `g_a`, `g_ap` (action rate)."""
     comptime D = SMDims[R]
     comptime L = SMHeadLayout[R]
     var pos = scratch
@@ -364,8 +380,6 @@ def sm_heads_vjp_lane[dt: DType, R: TrackingRobot](
     var gquat = gpos.unsafe_offset(D.NB * 3)
     var glin = gpos.unsafe_offset(D.NB * 7)
     var gang = gpos.unsafe_offset(D.NB * 10)
-    var gqpos = gpos.unsafe_offset(D.FK_BLOCK)
-    var gqvel = gqpos.unsafe_offset(D.NQ)
     for i in range(D.FK_BLOCK):
         gpos[unsafe_offset=i] = 0
     for i in range(D.S):
@@ -457,7 +471,23 @@ def sm_heads_vjp_lane[dt: DType, R: TrackingRobot](
             gj += 1
         g_s[unsafe_offset=7 + j] = gj * Scalar[dt](SM_DT * SM_W_JOINT_LIMIT) * g_r
 
-    # through the FK
+
+
+def sm_heads_vjp_close_lane[dt: DType, R: TrackingRobot](
+    tree: FP[dt], s: FP[dt], g_feat: FP[dt], g_obs: FP[dt], scratch: FP[dt], g_s: FP[dt], g_a: FP[dt],
+) where dt.is_floating_point():
+    """The second half: the FK cotangent block through the FK into `g_s`
+    (ADDS), then the termination features' and the observation's VJP."""
+    comptime D = SMDims[R]
+    var pos = scratch
+    var quat = scratch.unsafe_offset(D.NB * 3)
+    var ang = scratch.unsafe_offset(D.NB * 10)
+    var gpos = scratch.unsafe_offset(D.FK_BLOCK)
+    var gquat = gpos.unsafe_offset(D.NB * 3)
+    var glin = gpos.unsafe_offset(D.NB * 7)
+    var gang = gpos.unsafe_offset(D.NB * 10)
+    var gqpos = gpos.unsafe_offset(D.FK_BLOCK)
+    var gqvel = gqpos.unsafe_offset(D.NQ)
     sm_fk_vjp_lane[dt, D.NB, D.NQ, D.NV](tree, s, s.unsafe_offset(D.NQ), pos, quat, ang, gpos, gquat, glin, gang, gqpos, gqvel)
     for i in range(D.NQ):
         g_s[unsafe_offset=i] += gqpos[unsafe_offset=i]
