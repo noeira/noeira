@@ -709,6 +709,76 @@ struct PCTrainer[*BLOCKS: PCBlockTrait, dtype: DType = DType.float32]:
         )
 
     # =========================================================================
+    # Backprop control — the SAME net, kernels and weight pass, no relaxation
+    # =========================================================================
+
+    @staticmethod
+    def compute_grads_only_bp[BATCH: Int](
+        params: Tile[Self.dtype, Self.NET.PARAM_SIZE],
+        grads: Tile[Self.dtype, Self.NET.PARAM_SIZE],
+        latents: Tile[Self.dtype, BATCH, Self.NET.LATENT_DIM],
+        mu_eps_buf: Tile[Self.dtype, BATCH, Self.NET.SCRATCH_OUT_DIM],
+        a_below_buf: Tile[Self.dtype, BATCH, Self.NET.SCRATCH_IN_DIM],
+        z_below_buf: Tile[Self.dtype, BATCH, Self.NET.SCRATCH_IN_DIM],
+        x_in: Tile[Self.dtype, BATCH, Self.NET.IN_DIM],
+        y_target: Tile[Self.dtype, BATCH, Self.NET.OUT_DIM],
+    ) -> PCTrainResult:
+        """EXACT backprop gradients of the readout loss 0.5·‖y − ŷ‖², written
+        into `grads` in the same layout and sign as `compute_grads_only`.
+
+        This is the control every PC number needs: same network, same data
+        path, same optimizer, same `weight_grad` kernel — only the credit
+        assignment differs. Gated against finite differences in
+        `tests/pcn/test_bp_grad_parity.mojo`.
+
+        How: at the feedforward state (x_i = μ_i) every interior ε is zero and
+        the readout ε is `y − ŷ` = −∂L/∂ŷ. One top-down sweep replaces each
+        interior ε with δ_{i-1} = act'(x_{i-1}) ⊙ J_iᵀ δ_i = −∂L/∂x_{i-1}; the
+        shared weight pass then yields −δ_i ⊗ act(x_{i-1}) = ∂L/∂W_i.
+
+        It is the first ePC iteration with the states left where the forward
+        pass put them (ePC moves them by the errors before its weight pass).
+        """
+        Self.NET.init_latents[BATCH, Self.dtype](x_in, params, latents)
+        Self._forward_eps[BATCH](
+            x_in, y_target, params, latents, mu_eps_buf, a_below_buf
+        )
+        var output_loss = Self._readout_loss[BATCH](mu_eps_buf)
+
+        comptime for k in range(Self.NET.N - 1):
+            comptime i = Self.NET.N - 1 - k       # i = N-1 .. 1
+
+            # δ_i sits in block i's ε slot (the readout ε on the first rung,
+            # else what rung i+1 wrote there).
+            var li_delta = tile[BATCH, Self.NET.block_types[i].OUT_DIM](mu_eps_buf.ptr.unsafe_offset(BATCH * Self.NET._out_offset[i]()))
+            var li_p_i = tile[Self.NET.block_types[i].PARAM_SIZE](params.ptr.unsafe_offset(Self.NET._param_offset[i]()))
+            var li_z = tile[BATCH, Self.NET.block_types[i].IN_DIM](z_below_buf.ptr.unsafe_offset(BATCH * Self.NET._in_offset[i]()))
+            Self.NET.block_types[i].pull_back[BATCH, Self.dtype](
+                li_delta, li_p_i, li_z
+            )
+
+            var li_x_below = tile[BATCH, Self.NET.block_types[i].IN_DIM](latents.ptr.unsafe_offset(BATCH * Self.NET._latent_offset[i - 1]()))
+            Self.NET.block_types[i].act_derivative_mul[BATCH, Self.dtype](
+                li_x_below, li_z, li_z
+            )
+
+            # δ_{i-1} overwrites block i-1's (zero) interior ε.
+            var li_delta_below = tile[BATCH, Self.NET.block_types[i].IN_DIM](mu_eps_buf.ptr.unsafe_offset(BATCH * Self.NET._out_offset[i - 1]()))
+            for b in range(BATCH):
+                for kk in range(Self.NET.block_types[i].IN_DIM):
+                    li_delta_below[b, kk] = rebind[Scalar[Self.dtype]](
+                        li_z[b, kk]
+                    )
+
+        Self._weight_grads[BATCH](mu_eps_buf, a_below_buf, grads)
+
+        return PCTrainResult(
+            energy_initial=output_loss,
+            energy_final=output_loss,
+            output_loss_final=output_loss,
+        )
+
+    # =========================================================================
     # ePC — error-based predictive coding (Goemaere, Oliviers, Bogacz,
     # Demeester 2026, arXiv:2505.20137). Reference: references/
     # error_based_PC-cifar/pc_e.py. Derivation: docs/PCN_EPC_DERIVATION.md.
