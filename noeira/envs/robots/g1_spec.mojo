@@ -750,6 +750,57 @@ def g1_spec_questions(warn: Bool = True) raises -> JevQuestions:
     return q^
 
 
+comptime G1_Q_MISS_KIND = "spec_kind"
+comptime G1_MISS_MOVE_P: Float64 = 0.5
+"""Under this P(movement), a miss is answered in words and no latent is made."""
+
+
+def g1_add_miss_kind(mut q: JevQuestions, name_desc: Bool = False) raises:
+    """One more question on the spec request (no extra request): what KIND of
+    thing a sentence that matched no command asks for.
+
+    ⚠ WHY: the slots answer "which quantity?" and slot 0 always names one. "Can
+    you open the door?" matched no command, came here, and slot 0 said
+    `body_speed_low` at 0.23: the robot went to a standing latent and said
+    nothing (docs/ROBOT_BRAIN_PLAN.md §11.4). A reward sketch can only express a
+    movement of the robot's own body; whether the sentence asks for one is a
+    question of its own, and it is asked here. `name_desc`: each description
+    starts with its option's name (d1, as `g1_command_questions`)."""
+    var opts = List[String]()
+    var descs = List[String]()
+    opts.append(String("movement"))
+    descs.append(String(
+        "a movement or a posture of the robot's own body: walk, step, turn, lean, bend, crouch, jump,"
+        " lift or lower an arm, a hand or a foot, go faster or slower, stand in some way; also when it"
+        " is asked politely as a question (can you..., could you...)"
+    ))
+    opts.append(String("answer"))
+    descs.append(String(
+        "an answer in words: a question about the robot, the room, the time or anything else, or"
+        " something to say, tell, sing or explain"
+    ))
+    opts.append(String("object"))
+    descs.append(String(
+        "an action on an object or on the room: open, close, pick up, carry, bring, give, push, move"
+        " a thing, switch something on or off; also when it is asked politely as a question"
+    ))
+    if name_desc:
+        for i in range(len(opts)):
+            descs[i] = opts[i] + ": " + descs[i]
+    q.choice(
+        String(G1_Q_MISS_KIND),
+        String("A person says this to a humanoid robot. What is the person asking the robot for?"),
+        opts, descs,
+    )
+
+
+def g1_miss_movement_p(ref ans: JevAnswers) raises -> Float64:
+    """P(the sentence asks for a movement of the robot's own body), from
+    `g1_add_miss_kind`'s question. Under `G1_MISS_MOVE_P` the caller replies
+    in words instead of sketching a reward."""
+    return ans.probability(String(G1_Q_MISS_KIND), String("movement"))
+
+
 def g1_spec_from_answers(
     ref ans: JevAnswers,
     ref pool: G1Pool,

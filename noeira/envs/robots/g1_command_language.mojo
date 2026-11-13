@@ -517,6 +517,140 @@ def g1_route_destination(
     return String("")
 
 
+comptime G1_Q_DESTINATION_THEN: String = "destination_then"
+comptime G1_Q_IS_TWO_PLACES: String = "is_two_places"
+comptime G1_Q_DESTINATION_FIRST: String = "destination_first"
+
+
+def g1_add_two_places_gate(mut q: JevQuestions) raises:
+    """One yes/no question on the destination request (no extra request):
+    does the sentence ask for TWO places, one after the other ("go to the
+    table, then to the door"; docs/ROBOT_BRAIN_PLAN.md, B2)? When it does and
+    a place was routed, the caller asks WHICH two with
+    `g1_two_places_questions`, in a request of its own.
+
+    ⚠ A SECOND PLACE IS ASKED FOR, NOT MENTIONED, the distinction the
+    destination question draws: "the table, not the door" and "the table near
+    the door" have one place. This gate is what holds it: without it the
+    which-place question named the door in both, at 0.75 to 0.85
+    (`bench_brain_dest_chain_gpu`)."""
+    q.noul(
+        String(G1_Q_IS_TWO_PLACES),
+        String(
+            "Does the instruction ask the robot to go to TWO different places, one after the other? A"
+            " place that is refused (\"not the door\"), or that only tells where the first place is"
+            " (\"the table near the door\"), does not count as a second place."
+        ),
+    )
+
+
+def g1_two_places_state(instruction: String) raises -> String:
+    """What the two-place request is asked against: the command state of a
+    robot standing at no place, with nothing of the room in it.
+
+    ⚠ MEASURED, and the lesson of `g1_spec_prompt` again. Against the room's
+    state (the places around the robot, where it stands, its trail) "which
+    place first?" answered the place the robot stood at and 7 of 42 two-place
+    sentences went wrong; against this state none did. Which two places a
+    sentence names, and in which order, is a fact about the sentence. (The
+    sentence as bare text, `instruction: ...`, did worse than this JSON: 32 of
+    42.)"""
+    var ctx = G1Context()
+    ctx.places = True
+    return g1_command_state(instruction, ctx)
+
+
+def g1_two_places_questions(destinations: List[String], name_desc: Bool = False) raises -> JevQuestions:
+    """The request asked when the gate says two places: the destination
+    request over again (destination, its gate, the triage) with the SECOND
+    place, the FIRST of the two, and the two-place gate. `g1_route_two_places`
+    reads it. ⚠ This exact set, against `g1_two_places_state`, is what
+    `bench_brain_dest_chain_gpu` measured; d1's answers move a little with the
+    questions asked beside them, so the set is kept whole."""
+    var q = g1_destination_questions(destinations)
+    g1_add_triage(q, name_desc)
+    var ops = List[String]()
+    var descs = List[String]()
+    for i in range(len(destinations)):
+        ops.append(destinations[i])
+        descs.append(
+            String("after a first place, the instruction asks the robot to go on to the ") + destinations[i]
+        )
+    ops.append(String(G1_OPT_NONE))
+    descs.append(String(
+        "the instruction asks for one place only, or for no place at all: nothing follows"
+    ))
+    if name_desc:
+        for i in range(len(ops)):
+            descs[i] = ops[i] + ": " + descs[i]
+    q.choice(
+        String(G1_Q_DESTINATION_THEN),
+        String(
+            "An instruction may ask the robot to go to a first place and THEN to a second one (\"go to"
+            " the table, then to the door\", \"go to the fridge and come back to the sofa\"). Which"
+            " place is the SECOND one, the one the robot ends at? If the instruction asks for one place,"
+            " or only mentions, describes, refuses or corrects another (\"the table, not the door\","
+            " \"the table near the door\"), choose none."
+        ),
+        ops, descs,
+    )
+    var fops = List[String]()
+    var fdescs = List[String]()
+    for i in range(len(destinations)):
+        fops.append(destinations[i])
+        fdescs.append(
+            String("of the two places asked for, the robot must go to the ") + destinations[i] + String(" first")
+        )
+    fops.append(String(G1_OPT_NONE))
+    fdescs.append(String("the instruction asks for one place only, or for no place at all"))
+    if name_desc:
+        for i in range(len(fops)):
+            fdescs[i] = fops[i] + ": " + fdescs[i]
+    q.choice(
+        String(G1_Q_DESTINATION_FIRST),
+        String(
+            "An instruction may ask the robot to go to two places, one after the other. Which place must"
+            " the robot go to FIRST, before the other one (\"first the fridge, then the table\" = the"
+            " fridge; \"go to the table and come back to the door\" = the table)? Only the places the"
+            " instruction itself asks for count: where the robot is now, or was before, does not. If"
+            " the instruction asks for one place or for none, choose none."
+        ),
+        fops, fdescs,
+    )
+    g1_add_two_places_gate(q)
+    return q^
+
+
+def g1_route_two_places(
+    ref ans: JevAnswers, min_p: Float64 = 0.5, min_two: Float64 = 0.5,
+) raises -> Tuple[String, String]:
+    """`(first, second)` from `g1_two_places_questions`' answers, or `("",
+    "")` when they do not settle two places (the caller then keeps the one
+    place it had routed).
+
+    Two places need a destination routed here too, the gate at `min_two` or
+    more, and a second place other than `none` at `min_p` or more. The first
+    place is the routed destination whenever it differs from the second. Only
+    when the destination question routed the SECOND place (it answers where
+    the robot is asked to end: "stop by the fridge, then the table" routes the
+    table) is the first-of-two question read, and it must name another place
+    at `min_p` or more."""
+    var routed = g1_route_destination(ans)
+    var then = ans.choice(String(G1_Q_DESTINATION_THEN))
+    if (
+        routed == "" or then == G1_OPT_NONE
+        or ans.probability(String(G1_Q_DESTINATION_THEN), then) < min_p
+        or ans.noul(String(G1_Q_IS_TWO_PLACES)) < min_two
+    ):
+        return (String(""), String(""))
+    if routed != then:
+        return (routed, then)
+    var first = ans.choice(String(G1_Q_DESTINATION_FIRST))
+    if first != G1_OPT_NONE and first != then and ans.probability(String(G1_Q_DESTINATION_FIRST), first) >= min_p:
+        return (first, then)
+    return (String(""), String(""))
+
+
 comptime G1_Q_IS_GO_MEMORY: String = "is_go_memory"
 comptime G1_Q_MEMORY_REF: String = "memory_ref"
 

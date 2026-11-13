@@ -1,0 +1,64 @@
+# What a sentence that matched no command asks for: a movement of the robot's own body (-> the reward
+# sketch) or a reply in words (a question, something to say, an action on an object the robot cannot do).
+# `tune` rows are the ones the question's wording may be adjusted on; `held` rows are run once, at the end.
+# split	want	lang	utterance
+tune	movement	fr	Penche-toi en avant.
+tune	movement	fr	Peux-tu lever le pied droit ?
+tune	movement	fr	Marche plus lentement.
+tune	movement	fr	Baisse-toi un peu.
+tune	movement	fr	Lève la main gauche bien haut.
+tune	movement	en	Lean forward.
+tune	movement	en	Could you lift your left foot?
+tune	movement	en	Walk faster.
+tune	movement	en	Crouch down a little.
+tune	movement	en	Put your right hand up high.
+tune	reply	fr	Est-ce que tu peux ouvrir la porte ?
+tune	reply	fr	Où est le frigo ?
+tune	reply	fr	Raconte-moi une blague.
+tune	reply	fr	Quelle heure est-il ?
+tune	reply	fr	Ramasse la tasse sur la table.
+tune	reply	fr	Comment t'appelles-tu ?
+tune	reply	fr	Que fais-tu en ce moment ?
+tune	reply	fr	Apporte-moi un verre d'eau.
+tune	reply	fr	Qu'est-ce que tu sais faire ?
+tune	reply	fr	Allume la lumière.
+tune	reply	en	Can you open the door?
+tune	reply	en	Where is the sofa?
+tune	reply	en	Tell me a story.
+tune	reply	en	What is your name?
+tune	reply	en	Pick up the cup.
+tune	reply	en	What are you doing?
+tune	reply	en	Bring me my keys.
+tune	reply	en	How far is the table?
+tune	reply	en	Close the window.
+tune	reply	en	Are you tired?
+held	movement	fr	Tiens-toi sur une jambe.
+held	movement	fr	Est-ce que tu peux te pencher sur le côté ?
+held	movement	fr	Avance tout doucement.
+held	movement	fr	Mets-toi sur la pointe des pieds.
+held	movement	fr	Écarte les bras.
+held	movement	en	Stand on one leg.
+held	movement	en	Can you bend your knees?
+held	movement	en	Take a step to the left.
+held	movement	en	Keep your head low.
+held	movement	en	Spread your arms wide.
+held	reply	fr	Peux-tu fermer le frigo ?
+held	reply	fr	Où étais-tu juste avant ?
+held	reply	fr	Chante-moi une chanson.
+held	reply	fr	Quel temps fait-il dehors ?
+held	reply	fr	Pousse le canapé contre le mur.
+held	reply	fr	Qui es-tu ?
+held	reply	fr	Est-ce que tu m'entends ?
+held	reply	fr	Donne-moi le livre.
+held	reply	fr	Combien de bras as-tu ?
+held	reply	fr	Éteins la télévision.
+held	reply	en	Could you open the fridge?
+held	reply	en	Where were you before?
+held	reply	en	Say something nice.
+held	reply	en	What day is it?
+held	reply	en	Move the table over there.
+held	reply	en	Who made you?
+held	reply	en	Do you understand French?
+held	reply	en	Hand me the remote.
+held	reply	en	Is the door open?
+held	reply	en	Turn on the oven.

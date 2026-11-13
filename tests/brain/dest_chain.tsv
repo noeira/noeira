@@ -1,0 +1,116 @@
+# The destination request on sentences that ask for one place, two places in order, or none.
+# `first` / `then`: the places the robot should be sent to (`none` = nothing). `tune` rows are the ones
+# the second-place question's wording may be adjusted on; `held` rows are run once, at the end.
+# split	first	then	lang	utterance
+tune	table	door	fr	Va à la table, puis à la porte.
+tune	fridge	sofa	fr	Va au frigo et ensuite au canapé.
+tune	sofa	door	fr	Va au canapé et reviens à la porte.
+tune	door	table	fr	D'abord la porte, ensuite la table.
+tune	table	fridge	fr	Rejoins la table, et après va au frigo.
+tune	fridge	sofa	en	Go to the fridge and then to the sofa.
+tune	table	door	en	Walk to the table, then come back to the door.
+tune	door	fridge	en	First the door, then the fridge.
+tune	sofa	table	en	Go to the sofa, and after that go to the table.
+tune	door	sofa	en	Head to the door and then over to the sofa.
+tune	table	none	fr	Va à la table.
+tune	fridge	none	fr	Va au frigo s'il te plaît.
+tune	sofa	none	fr	Rejoins le canapé.
+tune	door	none	en	Go to the door.
+tune	fridge	none	en	I'm thirsty.
+tune	table	none	en	Walk over to the table please.
+tune	table	none	fr	Va à la table, pas à la porte.
+tune	table	none	fr	Va à la table qui est près de la porte.
+tune	sofa	none	en	Go to the sofa, not the fridge.
+tune	fridge	none	en	Go to the fridge next to the door.
+tune	none	none	fr	La table et la porte sont loin l'une de l'autre.
+tune	none	none	fr	Où est la porte ?
+tune	none	none	en	The sofa is between the table and the fridge.
+tune	none	none	en	Is the door closer than the table?
+held	door	table	fr	Va à la porte, puis à la table.
+held	sofa	fridge	fr	Va au canapé et ensuite au frigo.
+held	fridge	door	fr	Va au frigo et reviens à la porte.
+held	table	sofa	fr	D'abord la table, ensuite le canapé.
+held	door	fridge	fr	Rejoins la porte, et après va au frigo.
+held	sofa	table	en	Go to the sofa and then to the table.
+held	fridge	door	en	Walk to the fridge, then come back to the door.
+held	table	sofa	en	First the table, then the sofa.
+held	door	table	en	Go to the door, and after that go to the table.
+held	fridge	table	en	Head to the fridge and then over to the table.
+held	door	none	fr	Va à la porte.
+held	sofa	none	fr	Va au canapé s'il te plaît.
+held	fridge	none	fr	Rejoins le frigo.
+held	table	none	en	Go to the table.
+held	sofa	none	en	I need to sit down for a while.
+held	door	none	en	Walk over to the door please.
+held	sofa	none	fr	Va au canapé, pas à la table.
+held	fridge	none	fr	Va au frigo qui est à côté du canapé.
+held	door	none	en	Go to the door, not the table.
+held	table	none	en	Go to the table next to the sofa.
+held	none	none	fr	Le frigo et le canapé sont de la même couleur.
+held	none	none	fr	Où est la table ?
+held	none	none	en	The door is between the fridge and the sofa.
+held	none	none	en	Is the sofa closer than the fridge?
+# `fresh`: written after the yes/no gate was added (the `held` rows had been seen by then), other phrasings, run once.
+fresh	door	sofa	fr	Va à la porte, puis retourne au canapé.
+fresh	fridge	table	fr	Passe d'abord au frigo, puis va à la table.
+fresh	table	sofa	fr	Va voir la table et ensuite le canapé.
+fresh	fridge	door	fr	Va au frigo, et quand tu y es, va à la porte.
+fresh	sofa	table	fr	Commence par le canapé, finis par la table.
+fresh	table	fridge	en	Go to the table and afterwards to the fridge.
+fresh	door	sofa	en	Walk to the door, then return to the sofa.
+fresh	fridge	table	en	Stop by the fridge first, then go to the table.
+fresh	sofa	door	en	Go to the sofa, and once you're there, go to the door.
+fresh	table	fridge	en	Start at the table and end at the fridge.
+fresh	sofa	none	fr	Va au canapé maintenant.
+fresh	door	none	fr	Direction la porte.
+fresh	fridge	none	en	Could you go to the fridge?
+fresh	table	none	en	Head for the table.
+fresh	fridge	none	fr	Va au frigo, mais évite le canapé.
+fresh	sofa	none	fr	Ne va pas à la porte, va au canapé.
+fresh	door	none	fr	Rejoins la porte, celle à côté du frigo.
+fresh	table	none	fr	Va à la table. Ne touche pas à la porte.
+fresh	door	none	en	Go to the door instead of the table.
+fresh	sofa	none	en	Go to the sofa, the one across from the fridge.
+fresh	fridge	none	en	Skip the sofa and go to the fridge.
+fresh	table	none	en	Go to the table. Don't touch the door.
+fresh	none	none	fr	Le canapé est plus confortable que la table.
+fresh	none	none	en	Which is bigger, the fridge or the door?
+# `fresh2`: written after the first-of-two question was added (the `fresh` rows had been seen by then), run once.
+fresh2	door	fridge	fr	Fais un arrêt à la porte, puis rejoins le frigo.
+fresh2	sofa	table	fr	D'abord le canapé, et la table pour finir.
+fresh2	fridge	door	fr	Va au frigo avant d'aller à la porte.
+fresh2	table	sofa	fr	Tu vas à la table, et après tu vas au canapé.
+fresh2	door	table	fr	Rends-toi à la porte, ensuite direction la table.
+fresh2	fridge	sofa	fr	Commence par aller au frigo, termine au canapé.
+fresh2	sofa	door	en	Make a stop at the sofa, then head to the door.
+fresh2	fridge	table	en	First the fridge, and the table to finish.
+fresh2	door	sofa	en	Go to the door before going to the sofa.
+fresh2	table	door	en	You go to the table, and after that you go to the door.
+fresh2	fridge	sofa	en	Visit the fridge, then the sofa.
+fresh2	door	fridge	en	Begin with the door and finish at the fridge.
+fresh2	table	none	fr	Va à la table, surtout pas au frigo.
+fresh2	sofa	none	fr	Va au canapé qui est en face de la porte.
+fresh2	fridge	none	fr	Laisse la porte, va au frigo.
+fresh2	door	none	fr	Va à la porte. La table est sale.
+fresh2	fridge	none	en	Go to the fridge, never mind the sofa.
+fresh2	table	none	en	Go to the table that is beside the fridge.
+fresh2	sofa	none	en	Forget the door, go to the sofa.
+fresh2	sofa	none	en	Go to the sofa. The door is locked.
+# `fresh3`: written after the design was settled (a gate on the destination request, then a request against a
+# bare state); every row above had been seen by then. Run once.
+fresh3	table	door	fr	Va d'abord à la table, et ensuite rejoins la porte.
+fresh3	fridge	sofa	fr	Il faut aller au frigo, puis revenir au canapé.
+fresh3	door	table	fr	Dirige-toi vers la porte, après ça va à la table.
+fresh3	sofa	fridge	fr	Va au canapé et, une fois arrivé, repars vers le frigo.
+fresh3	fridge	door	en	Go to the fridge first and the door second.
+fresh3	sofa	table	en	Walk to the sofa, then on to the table.
+fresh3	door	fridge	en	Please go to the door and then come over to the fridge.
+fresh3	table	sofa	en	Head to the table, and from there to the sofa.
+fresh3	door	none	fr	Va à la porte, pas besoin d'aller au canapé.
+fresh3	fridge	none	fr	Va au frigo qui se trouve derrière la table.
+fresh3	door	none	fr	Ne passe pas par la table, va à la porte.
+fresh3	sofa	none	en	Go to the sofa rather than the door.
+fresh3	table	none	en	Go to the table in front of the sofa.
+fresh3	fridge	none	en	Go to the fridge. Is the door open?
+fresh3	none	none	fr	La porte est à côté du frigo.
+fresh3	none	none	en	The table is closer than the sofa.

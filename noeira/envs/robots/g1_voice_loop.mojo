@@ -87,6 +87,8 @@ from noeira.envs.robots.g1_command_language import (
     g1_command_questions, g1_decide, g1_decide_chain, g1_command_state,
     g1_since_word, G1Context, G1LangPick, G1_Q_EXTENT,
     g1_destination_questions, g1_route_destination,
+    g1_add_two_places_gate, g1_two_places_questions, g1_two_places_state, g1_route_two_places,
+    G1_Q_IS_TWO_PLACES,
     g1_add_memory_reference, g1_route_memory, g1_other_one,
     g1_add_triage, g1_route_triage, g1_trail_questions, g1_resolve_trail,
     g1_command_moves, G1Triage, G1_TRIAGE_OFF, G1_TRIAGE_FULL,
@@ -95,6 +97,7 @@ from noeira.envs.robots.g1_command_language import (
 from noeira.envs.robots.g1_reward_vocab import G1Term
 from noeira.envs.robots.g1_spec import (
     G1Pool, g1_spec_questions, g1_spec_prompt, g1_spec_from_answers,
+    g1_add_miss_kind, g1_miss_movement_p, G1_Q_MISS_KIND, G1_MISS_MOVE_P,
     g1_spec_admit, g1_spec_bank_baseline, g1_spec_describe, g1_spec_record,
     G1_SPEC_D,
 )
@@ -110,6 +113,8 @@ comptime VL_ST_DEST: Int = 6
 """The first of the two requests `request_wording` makes: destination only."""
 comptime VL_ST_TRAIL: Int = 7
 """`triage`: the trail request, after the triage said `remembered`."""
+comptime VL_ST_CHAIN: Int = 8
+"""`dest_chain`: the two-place request, after the gate said two places."""
 
 comptime _VL_Q_CMD: Int = 0
 comptime _VL_Q_DEST: Int = 1
@@ -231,6 +236,8 @@ struct G1VoiceEvent(Copyable, Movable):
     turns it into metres or seconds, because only the caller knows whether the
     row it is about to run is locomotion."""
     var chain: List[String]
+    """A `VL_COMMAND`'s further steps (bank rows). For a `VL_WORLD` with
+    `cfg.dest_chain`: the place to go on to after `destination`, if any."""
     var chain_conf: List[Float64]
 
     @staticmethod
@@ -327,6 +334,21 @@ struct G1VoiceConfig(Copyable, Movable):
     (d1): unsafe and the speaker's side only, and no goto for a step.
     OFF (`G1_TRIAGE_OFF`) by default. The caller keeps the log, as for
     `memory_route`."""
+    var dest_chain: Bool
+    """`request_wording` only: "go to the table, then to the door". The
+    destination request gets one yes/no question (are two places asked for,
+    `g1_add_two_places_gate`); when it says yes for a routed place, one more
+    request asks which two and in which order (`g1_two_places_questions`),
+    and the `VL_WORLD` event carries the second in `chain`. OFF by default:
+    RB-1 and RB-2 measured the destination request without the gate.
+    Measured on d1 (`bench_brain_dest_chain_gpu`): +35 ms on the request,
+    ~0.5 s more for a two-place sentence only."""
+    var miss_kind: Bool
+    """The spec request also asks what KIND of thing a sentence that matched
+    no command wants (`g1_add_miss_kind`): a movement of the robot's own body
+    goes on to the reward sketch; a question, or an action on an object, gets
+    a spoken reply and no motion. OFF by default: the spec route's own
+    measurements (§12.58) were made without it."""
     var name_desc: Bool
     """Each option's description starts with its name, in the command
     request and the triage (d1 reads an option by its description alone:
@@ -375,6 +397,8 @@ struct G1VoiceConfig(Copyable, Movable):
         self.memory_route = False
         self.dest_words = List[String]()
         self.triage = G1_TRIAGE_OFF
+        self.dest_chain = False
+        self.miss_kind = False
         self.name_desc = False
         self.see = False
         self.see_max_age_s = 2.0
@@ -428,6 +452,10 @@ struct G1VoiceLoopOf[
     """The current decision's triage (the walk guard reads it in `_decide`)."""
     var trail_dest: String
     """The place the first request routed, for a trail answer `named`."""
+    var chain_q: JevQuestions
+    var chain_dest: String
+    """The place the destination request routed, kept if the two-place
+    request settles nothing."""
     var asked: String
     """The state the current decision was asked with, for its second
     request."""
@@ -531,12 +559,17 @@ struct G1VoiceLoopOf[
         self.trail_q = JevQuestions()
         self.tri = G1Triage()
         self.trail_dest = String("")
+        self.chain_q = JevQuestions()
+        self.chain_dest = String("")
         if self.cfg.request_wording and len(self.cfg.destinations) > 0:
             # two requests: the destination first, then the commands WITHOUT it
             self.dest_q = g1_destination_questions(self.cfg.destinations)
             if self.cfg.triage != G1_TRIAGE_OFF:
                 g1_add_triage(self.dest_q, self.cfg.name_desc)
                 self.trail_q = g1_trail_questions(self.cfg.destinations, self.cfg.name_desc)
+            if self.cfg.dest_chain:
+                g1_add_two_places_gate(self.dest_q)
+                self.chain_q = g1_two_places_questions(self.cfg.destinations, self.cfg.name_desc)
             self.quest = g1_command_questions(
                 bank, True, List[String](), List[String](), self.cfg.chain,
                 name_desc=self.cfg.name_desc,
@@ -555,6 +588,8 @@ struct G1VoiceLoopOf[
         self.asked = String("")
         self.dest_ms = 0.0
         self.spec_q = g1_spec_questions(True)
+        if self.cfg.miss_kind:
+            g1_add_miss_kind(self.spec_q, self.cfg.name_desc)
         self.has_pool = self.cfg.pool_path != ""
         # ⚠ A ONE-ROW PLACEHOLDER when there is no pool: `G1Pool` is not
         # Optional-friendly at this size and a field must be initialised.
@@ -617,6 +652,8 @@ struct G1VoiceLoopOf[
         self.trail_q = move.trail_q^
         self.tri = move.tri^
         self.trail_dest = move.trail_dest^
+        self.chain_q = move.chain_q^
+        self.chain_dest = move.chain_dest^
         self.asked = move.asked^
         self.dest_ms = move.dest_ms
         self.spec_q = move.spec_q^
@@ -1101,6 +1138,24 @@ struct G1VoiceLoopOf[
                 if ready:
                     ev = self._trail(ctx)
 
+        # ── deciding: which two places (`dest_chain`) ─────────────────
+        elif self.state == VL_ST_CHAIN:
+            var el = Float64(perf_counter_ns() - self.t_wait) / 1e9
+            if el > self.cfg.jev_dl:
+                try:
+                    self.jev.cancel()
+                except:
+                    pass
+                ev = self._chain(True)
+            else:
+                var ready: Bool
+                try:
+                    ready = self.jev.poll()
+                except:
+                    ready = True
+                if ready:
+                    ev = self._chain(False)
+
         # ── deciding ──────────────────────────────────────────────────
         elif self.state == VL_ST_JEV:
             var el = Float64(perf_counter_ns() - self.t_wait) / 1e9
@@ -1262,6 +1317,15 @@ struct G1VoiceLoopOf[
                 if self.tri.kind == "act_here":
                     dest = String("")   # a step or a turn is not a place
             if dest != "":
+                if self.cfg.dest_chain and ans.noul(String(G1_Q_IS_TWO_PLACES)) >= 0.5:
+                    # two places asked for: which two, in which order, is a request of
+                    # its own, against a state with nothing of the room in it
+                    self.chain_dest = dest
+                    self.dest_ms = ans.latency_ms
+                    self.jev.start(g1_two_places_state(self.heard), self.chain_q)
+                    self.t_wait = perf_counter_ns()
+                    self.state = VL_ST_CHAIN
+                    return ev^
                 ev.kind = VL_WORLD
                 ev.destination = dest
                 ev.text = self.heard
@@ -1282,6 +1346,36 @@ struct G1VoiceLoopOf[
             self.state = VL_ST_JEV
         except e:
             self.note = String("[jev] FAILED: ") + String(e)
+        return ev^
+
+    def _chain(mut self, timed_out: Bool) -> G1VoiceEvent:
+        """The two-place request's answer: the routed place and the one to go
+        on to. ⚠ A request that fails, is late or settles nothing still walks:
+        the destination request had routed a place, and that one is kept."""
+        var ev = G1VoiceEvent.none()
+        self.state = VL_ST_IDLE
+        var dest = self.chain_dest
+        var then = String("")
+        var tail = String("")
+        if timed_out:
+            tail = String("  (the two-place request was late: one place)")
+        else:
+            try:
+                var ans = self.jev.result()
+                var pair = g1_route_two_places(ans)
+                if pair[0] != "":
+                    dest = pair[0]
+                    then = pair[1]
+                tail = self._jev_ms(ans.latency_ms)
+            except e:
+                tail = String("  (the two-place request failed: one place) ") + String(e)
+        ev.kind = VL_WORLD
+        ev.destination = dest
+        ev.text = self.heard
+        if then != "":
+            ev.chain.append(then.copy())
+        self.note = (String("[world] ") + dest
+                     + (String(", then ") + then if then != "" else String(" (one place)")) + tail)
         return ev^
 
     def _trail(mut self, ref ctx: G1Context) -> G1VoiceEvent:
@@ -1475,6 +1569,16 @@ struct G1VoiceLoopOf[
         try:
             var sa = self.jev.result()
             var sterms = List[G1Term]()
+            if self.cfg.miss_kind:
+                # a question, or an action on an object: words, not a latent
+                var p_move = g1_miss_movement_p(sa)
+                if p_move < G1_MISS_MOVE_P:
+                    self._reply(
+                        String("If the request is not something you can do, say so kindly; otherwise answer it."),
+                        String("[spec] ") + sa.choice(String(G1_Q_MISS_KIND)) + String(", P(movement) ")
+                        + _vl_f2(p_move) + String(" -> reply, no motion"),
+                    )
+                    return ev^
             var n_scaf = g1_spec_from_answers(sa, self.pool, bank, sterms)
             if n_scaf < 0:
                 # ⚠ ADDRESSED, AND NOT A MOTION: "tell me a joke" came here (the
@@ -1542,6 +1646,9 @@ struct G1VoiceLoopOf[
                     + _vl_f2(self.cfg.jev_dl) + String("s"))
         if self.state == VL_ST_TRAIL:
             return (String("deciding: which place before? ") + _vl_f2(el)
+                    + String("s / ") + _vl_f2(self.cfg.jev_dl) + String("s"))
+        if self.state == VL_ST_CHAIN:
+            return (String("deciding: which two places? ") + _vl_f2(el)
                     + String("s / ") + _vl_f2(self.cfg.jev_dl) + String("s"))
         if self.state == VL_ST_JEV:
             return (String("deciding ") + _vl_f2(el) + String("s / ")
