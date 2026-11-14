@@ -41,7 +41,7 @@ from noeira.nn.constants import DT
 from noeira.io.json import load_json
 from noeira.text.bpe import ByteLevelBPE
 from .model import Lfm3Text, LF_INT8
-from .generate import Lfm3Cache, Lfm3CacheMark, forward_cached, last_logits
+from .generate import Lfm3Cache, Lfm3CacheMark, forward_cached, forward_cached_marks, last_logits
 
 
 comptime BOS = "<|startoftext|>"
@@ -49,6 +49,12 @@ comptime IM_START = "<|im_start|>"
 comptime IM_END = "<|im_end|>"
 comptime THINK_OFF = "<think></think>"
 comptime THINK_ON = "<think>"
+
+comptime MARK_STRIDE: Int = 32
+"""`keep_system`: a mark every this many tokens of the system prompt, and one
+at its end. A changed prompt is recomputed from the last mark before its first
+changed token, so at most this many unchanged tokens are computed again. A mark
+is the 13 conv histories, 1.9 MB."""
 
 
 @fieldwise_init
@@ -178,13 +184,38 @@ struct Lfm3Chat(Movable):
     var closed: Bool
     """The last assistant message ended with `<|im_end|>` (generated, or `assistant`)."""
     var keep_system: Bool
-    """Prefix cache: `reset` prefills the system prompt at once and marks the
-    cache there; a `reset` with the SAME prompt rewinds to the mark instead of
-    computing it again (a service answering one request at a time). Off by
-    default: `prompt_ids` then holds the whole prompt, as the gate reads it."""
-    var sys_text: String
-    var sys_ids: List[Int]
-    var sys_mark: Optional[Lfm3CacheMark]
+    """Prefix cache, matched by TOKENS (docs/NN_MODEL_PORTS_PLAN.md §12.8, S1):
+    the system prompt's tokens stay in the cache after a request, with marks
+    along them (`MARK_STRIDE`). The next `reset` keeps the part of its prompt
+    that is already there, up to the last mark before the first token that
+    differs, and only the rest is computed, in one chunk with the user's turn.
+    A prompt written from a robot's state every turn (`noeira.brain.reply_view`)
+    keeps its unchanged beginning; the same prompt again costs nothing.
+    `prepare` computes a prompt ahead of the request.
+
+    ⚠ A REUSED PREFIX IS NOT BIT-IDENTICAL TO A RECOMPUTED ONE: its rows were
+    computed in another chunk, and a GEMM's rounding depends on its shape. The
+    two agree within the gate's bound for cached chunks; a reply can differ
+    from the cold one at a near-tie. The same sequence of requests gives the
+    same replies.
+
+    Off by default: `prompt_ids` then holds the whole prompt, as the gate
+    reads it."""
+    var kept_ids: List[Int]
+    """The system prompt's tokens that are in the cache, from position 0."""
+    var marks: List[Lfm3CacheMark]
+    """Ascending, each at or before `len(kept_ids)`."""
+    var sys_left: Int
+    """How many of `pending`'s first tokens are the system prompt's (marks are
+    taken along them when they are fed)."""
+    var reused: Int
+    """The last `reset`: tokens of its system prompt found in the cache."""
+    var head_len: Int
+    """The last `reset`: its system prompt's tokens, template included."""
+    var debug_prefix: Int
+    """Falsification (the gate's mutants): 1 = rewind to the mark AFTER the
+    common prefix (tokens that differ are reused), 2 = a rewind keeps the
+    marks and tokens past it (a later prompt is answered on stale rows)."""
 
     def __init__(out self, var lm: Lfm3Text, var tok: ByteLevelBPE, var cache: Lfm3Cache, eos: Int, think_end: Int = -1):
         self.seen = List[Bool](length=lm.cfg.vocab, fill=False)
@@ -203,9 +234,12 @@ struct Lfm3Chat(Movable):
         self.last_logits = List[Float32]()
         self.closed = False
         self.keep_system = False
-        self.sys_text = String("")
-        self.sys_ids = List[Int]()
-        self.sys_mark = None
+        self.kept_ids = List[Int]()
+        self.marks = List[Lfm3CacheMark]()
+        self.sys_left = 0
+        self.reused = 0
+        self.head_len = 0
+        self.debug_prefix = 0
 
     @staticmethod
     def load(
@@ -227,7 +261,8 @@ struct Lfm3Chat(Movable):
 
     def reset(mut self, system: String) raises:
         """A new conversation: `system` (empty: none) and nothing else. With
-        `keep_system`, the system prompt is computed once and reused (above)."""
+        `keep_system`, the part of the prompt already in the cache is kept
+        (above); the rest is fed by the next `start`, or now by `prepare`."""
         self.pending = List[Int]()
         for i in range(len(self.seen)):
             self.seen[i] = False
@@ -235,24 +270,73 @@ struct Lfm3Chat(Movable):
         self.turns = 0
         self.done = True
         self.closed = False
-        if self.keep_system and self.sys_mark and system == self.sys_text:
-            self.cache.rewind(self.lm, self.sys_mark.value())
-            for id in self.sys_ids:
-                self.seen[id] = True
-            return
-        self.cache.reset()
-        self.sys_mark = None
         var head = String(BOS)
         if system.byte_length() > 0:
             head += IM_START + "system\n" + system + IM_END + "\n"
         var ids = self.tok.encode(head)
-        self._add(ids)
+        self.head_len = len(ids)
+        var at = 0
+        var best = -1
         if self.keep_system:
-            _ = forward_cached(self.lm, self.pending, self.cache)
-            self.pending = List[Int]()
-            self.sys_text = system
-            self.sys_ids = ids^
-            self.sys_mark = self.cache.mark(self.lm)
+            var common = 0
+            while common < len(ids) and common < len(self.kept_ids) and ids[common] == self.kept_ids[common]:
+                common += 1
+            for i in range(len(self.marks)):
+                if self.marks[i].pos <= common:
+                    best = i
+            if (self.debug_prefix & 1) != 0 and best + 1 < len(self.marks) and self.marks[best + 1].pos <= len(ids):
+                best += 1  # mutant 1: one mark too far
+        if best >= 0:
+            at = self.marks[best].pos
+            self.cache.rewind(self.lm, self.marks[best])
+            if (self.debug_prefix & 2) == 0:
+                while len(self.marks) > best + 1:
+                    _ = self.marks.pop()
+                while len(self.kept_ids) > at:
+                    _ = self.kept_ids.pop()
+        else:
+            self.cache.reset()
+            self.marks = List[Lfm3CacheMark]()
+            self.kept_ids = List[Int]()
+        self.reused = at
+        self.sys_left = len(ids) - at if self.keep_system else 0
+        for id in ids:
+            self.seen[id] = True
+        for i in range(at, len(ids)):
+            self.pending.append(ids[i])
+
+    def prepare(mut self, system: String) raises:
+        """`reset(system)`, and with `keep_system` the prompt computed NOW
+        rather than with the first reply: for a caller that knows its prompt
+        before it has a question (a robot, while the person is still speaking).
+        The `reset` of the request that follows then finds it in the cache."""
+        if not self.done:
+            raise Error("lfm3 chat: a reply is still being generated")
+        self.reset(system)
+        if self.sys_left == 0:
+            return
+        var feed = self.pending^
+        self.pending = List[Int]()
+        if self.cache.left() < len(feed) + 1:
+            raise Error("lfm3 chat: the system prompt is longer than the cache (" + String(self.cache.cap) + " tokens)")
+        _ = self._feed(feed)
+
+    def _feed(mut self, ref feed: List[Int]) raises -> DeviceBuffer[DT]:
+        """`feed` into the cache. While it starts with system-prompt tokens
+        (`sys_left`), marks are taken along them and at their end."""
+        if self.sys_left == 0:
+            return forward_cached(self.lm, feed, self.cache)
+        var offs = List[Int]()
+        var m = MARK_STRIDE - self.cache.pos % MARK_STRIDE
+        while m < self.sys_left:
+            offs.append(m)
+            m += MARK_STRIDE
+        offs.append(self.sys_left)
+        var h = forward_cached_marks(self.lm, feed, self.cache, offs, self.marks)
+        for i in range(self.sys_left):
+            self.kept_ids.append(feed[i])
+        self.sys_left = 0
+        return h^
 
     def user(mut self, text: String) raises:
         """The user's turn, and the assistant's header after it."""
@@ -310,7 +394,7 @@ struct Lfm3Chat(Movable):
         self.pending = List[Int]()
         if self.cache.left() < len(feed) + 1:
             raise Error("lfm3 chat: the conversation is longer than the cache (" + String(self.cache.cap) + " tokens)")
-        var h = forward_cached(self.lm, feed, self.cache)
+        var h = self._feed(feed)
         var logits = last_logits(self.lm, h, len(feed))
         self.last_logits = logits.copy()
         var t = choose(logits, self.seen, self.settings, self.rng)

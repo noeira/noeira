@@ -21,6 +21,11 @@ Per case (a system prompt naming the room, a user turn, 48 greedy tokens):
 5. (two-turn case) turn 2 appended on turn 1's cache: its tokens are the
    reference's, then 48 more greedy tokens and their logits.
 
+On the first case, the prefix cache (`Lfm3Chat.keep_system`, `prefix_checks`):
+a system prompt reused whole, reused up to the point where it changed, and
+computed ahead (`prepare`), each against the same request with the cache off;
+four mutants.
+
 Then, on one sequence longer than the sliding window (both cases' conversations,
 ~400 tokens): the cached path fed in uneven chunks (100, 1, 1, 60, 1, the rest)
 gives the rows one causal pass gives (`Lfm3Text.forward(causal_full=True)`, the
@@ -55,6 +60,12 @@ comptime CACHE_BOUND: Float64 = 0.1 if LF_INT8 else (6e-2 if LF_BF16 else 1e-4)
 bf16 computations, each ~2e-2 from the fp32 truth at the final norm (the prefill
 stage above), so up to twice that apart (4.5e-2 measured): the check is decisive
 in fp32 only, and the mutants run there."""
+comptime PREFIX_BOUND: Float64 = 3e-2 if (LF_INT8 or LF_BF16) else 1e-4
+"""A reply's first logits on a reused prompt prefix vs the same prompt computed
+whole, max |d| / max |logits| (`prefix_checks`). Tighter than CACHE_BOUND: both
+sides are chunks of eight tokens or more, on the same route. Measured on the
+Orin: 2.5e-6 fp32, 7.1e-3 bf16, 4.9e-3 int8; the four mutants move the logits by
+0.094 to 0.17 in every build."""
 comptime FALSIFY: Float64 = 10.0
 comptime KL_BOUND: Float64 = 0.01 if LF_INT8 else (5e-3 if LF_BF16 else 1e-6)
 """Mean KL(reference || ours) per teacher-forced step, nats, over the raw logits."""
@@ -244,56 +255,124 @@ def int8_mutant_kl(model_dir: String, dir: String) raises -> Float64:
     return tot / Float64(steps)
 
 
+def _first_logits(mut chat: Lfm3Chat, system: String, turn1: String) raises -> List[Float32]:
+    """One request: `reset`, the user's turn, six greedy tokens; the logits
+    that chose the first one."""
+    chat.reset(system)
+    chat.user(turn1)
+    chat.start(ChatSettings.greedy_with(1.0, 6))
+    var first = chat.last_logits.copy()
+    while chat.next():
+        pass
+    return first^
+
+
+def _differ(a: List[Float32], b: List[Float32]) -> Int:
+    var n = 0
+    for i in range(len(a)):
+        if a[i] != b[i]:
+            n += 1
+    return n
+
+
+def _changed_middle(system: String) -> String:
+    """`system` with a sentence put in at the first space past its middle: the
+    beginning is the same tokens, the rest moves."""
+    var b = system.as_bytes()
+    var at = len(b) // 2
+    while at < len(b) and b[at] != 32:
+        at += 1
+    return String(system[byte=0:at]) + " (Il pleut dehors ce matin.)" + String(system[byte=at:])
+
+
 def prefix_checks(mut chat: Lfm3Chat, system: String, turn1: String, mut fails: Int) raises -> Int:
-    """`keep_system`: (1) the first reply's first logits with the system prompt
-    prefilled on its own = with one prefill (two chunkings: CACHE_BOUND);
-    (2) after a reply, `reset` with the same prompt REWINDS and the next first
-    logits are bit-identical; (3) a rewind that leaves the conv histories
-    (`debug 8`) is not. Leaves `keep_system` off."""
-    var g = ChatSettings.greedy_with(1.0, 6)
+    """`keep_system`, the prefix cache matched by tokens (docs/NN_MODEL_PORTS_PLAN.md
+    §12.8, S1). Against the same request with the cache off (one chunk on an
+    empty cache):
+
+    1. cold, the prompt is still one chunk: bit-identical;
+    2. the same prompt again: all of it found in the cache, within PREFIX_BOUND
+       (its rows were computed in another chunk); a third time, bit-identical
+       to the second;
+    3. a prompt changed in its middle: its beginning kept up to a mark, the
+       rest computed, within PREFIX_BOUND of that prompt computed cold;
+    4. `prepare`, then the request: all of the prompt found, within PREFIX_BOUND;
+    5. four mutants, each over PREFIX_BOUND: a rewind that leaves the conv
+       histories, a mark holding the history of its chunk's end, a rewind one
+       mark too far (tokens that differ reused), a rewind that keeps the marks
+       past it (a later prompt answered on another prompt's rows).
+
+    Leaves `keep_system` off and the cache empty."""
+    var other = _changed_middle(system)
     chat.keep_system = False
-    chat.reset(system)
-    chat.user(turn1)
-    chat.start(g)
-    var one_pass = chat.last_logits.copy()
+    var one_pass = _first_logits(chat, system, turn1)
+    var other_cold = _first_logits(chat, other, turn1)
+
     chat.keep_system = True
-    chat.sys_mark = None
-    chat.reset(system)  # computes and marks the system prompt
-    var sys_pos = chat.cache.pos
-    chat.user(turn1)
-    chat.start(g)
-    var kept = chat.last_logits.copy()
-    while chat.next():
-        pass
-    chat.reset(system)  # rewinds
-    var rewound_pos = chat.cache.pos
-    chat.user(turn1)
-    chat.start(g)
-    var again = chat.last_logits.copy()
-    while chat.next():
-        pass
-    var e1 = rel_err32(kept, one_pass)
-    var bitwise = 0
-    for i in range(len(again)):
-        if again[i] != kept[i]:
-            bitwise += 1
-    check(fails, e1 <= CACHE_BOUND, "keep_system: the system prompt (" + String(sys_pos) + " tokens) prefilled alone = one prefill: "
-          + String(e1))
-    check(fails, bitwise == 0 and rewound_pos == sys_pos, "keep_system: rewound to the mark, the next reply's first logits bit-identical ("
-          + String(bitwise) + " differ)")
+    var cold = _first_logits(chat, system, turn1)
+    var cold_reused = chat.reused
+    var head = chat.head_len
+    check(fails, _differ(cold, one_pass) == 0 and cold_reused == 0 and len(chat.marks) == (head - 1) // 32 + 1,
+          "prefix cache, cold: the prompt (" + String(head) + " tokens) is one chunk, bit-identical to no cache; "
+          + String(len(chat.marks)) + " marks kept")
+
+    var again = _first_logits(chat, system, turn1)
+    var e2 = rel_err32(again, one_pass)
+    check(fails, chat.reused == head and e2 <= PREFIX_BOUND, "prefix cache, the same prompt: " + String(chat.reused) + " of "
+          + String(head) + " tokens found, logits within " + String(e2) + " of no cache (bound " + String(PREFIX_BOUND) + ")")
+    var third = _first_logits(chat, system, turn1)
+    var bitwise = _differ(third, again)
+    check(fails, bitwise == 0, "prefix cache, a third time: bit-identical to the second (" + String(bitwise) + " differ)")
+
+    var part = _first_logits(chat, other, turn1)
+    var kept = chat.reused
+    var e3 = rel_err32(part, other_cold)
+    check(fails, kept >= 32 and kept < head and kept % 32 == 0 and e3 <= PREFIX_BOUND,
+          "prefix cache, a prompt changed in its middle: " + String(kept) + " of " + String(chat.head_len)
+          + " tokens kept, logits within " + String(e3) + " of that prompt computed cold")
+
+    chat.prepare(system)
+    var prep_kept = chat.reused
+    var prep_pos = chat.cache.pos
+    var after = _first_logits(chat, system, turn1)
+    var e4 = rel_err32(after, one_pass)
+    check(fails, prep_kept == kept and prep_pos == head and chat.reused == head and e4 <= PREFIX_BOUND,
+          "prefix cache, prepare then the request: the prompt computed ahead from token " + String(prep_kept)
+          + ", then all " + String(chat.reused) + " found; logits within " + String(e4))
+
+    # mutants
     chat.cache.debug = 8
-    chat.reset(system)
-    chat.user(turn1)
-    chat.start(g)
-    var stale = chat.last_logits.copy()
-    while chat.next():
-        pass
+    var m8 = rel_err32(_first_logits(chat, system, turn1), again)
     chat.cache.debug = 0
-    var moved = rel_err32(stale, kept)
-    check(fails, moved > CACHE_BOUND, "mutant caught, a rewind that keeps the conv histories: logits moved by " + String(moved)
-          + " (> " + String(CACHE_BOUND) + ")")
+    check(fails, m8 > PREFIX_BOUND, "mutant caught, a rewind that keeps the conv histories: logits moved by " + String(m8)
+          + " (> " + String(PREFIX_BOUND) + ")")
+
+    chat.reset(String(""))  # nothing of the prompt left in the cache
+    chat.cache.debug = 16
+    _ = _first_logits(chat, system, turn1)  # its marks are taken wrongly
+    chat.cache.debug = 0
+    var m16 = rel_err32(_first_logits(chat, system, turn1), one_pass)
+    check(fails, m16 > PREFIX_BOUND, "mutant caught, a mark holding its chunk's last history: logits moved by " + String(m16))
+
+    chat.reset(String(""))
+    _ = _first_logits(chat, system, turn1)
+    chat.debug_prefix = 1
+    var mp1 = rel_err32(_first_logits(chat, other, turn1), other_cold)
+    var far = chat.reused
+    chat.debug_prefix = 0
+    check(fails, far > kept and mp1 > PREFIX_BOUND, "mutant caught, a rewind one mark too far (" + String(far)
+          + " tokens reused, " + String(kept) + " are the same): logits moved by " + String(mp1))
+
+    chat.reset(String(""))
+    _ = _first_logits(chat, system, turn1)
+    chat.debug_prefix = 2
+    _ = _first_logits(chat, other, turn1)
+    var mp2 = rel_err32(_first_logits(chat, system, turn1), one_pass)
+    chat.debug_prefix = 0
+    check(fails, mp2 > PREFIX_BOUND, "mutant caught, a rewind that keeps the marks past it: logits moved by " + String(mp2))
+
     chat.keep_system = False
-    chat.sys_mark = None
+    chat.reset(String(""))
     return bitwise
 
 

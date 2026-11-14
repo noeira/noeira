@@ -188,6 +188,9 @@ struct ChatResponse(Movable):
     var first_token_ms: Float64
     """Streamed calls: time to the first text delta — what a user perceives
     as the response time. 0 when not streamed."""
+    var cached_tokens: Int
+    """Of `input_tokens`, those the backend did not compute again (a prefix
+    cache: `noeira.llm.lfm3.service`). 0 when the backend does not say."""
     var message: ChatMessage
     """This turn as a message, ready to append to the history."""
 
@@ -200,6 +203,7 @@ struct ChatResponse(Movable):
         self.output_tokens = 0
         self.latency_ms = 0.0
         self.first_token_ms = 0.0
+        self.cached_tokens = 0
         self.message = ChatMessage.assistant(String(""))
 
     def __init__(out self, *, deinit move: Self):
@@ -211,6 +215,7 @@ struct ChatResponse(Movable):
         self.output_tokens = move.output_tokens
         self.latency_ms = move.latency_ms
         self.first_token_ms = move.first_token_ms
+        self.cached_tokens = move.cached_tokens
         self.message = move.message^
 
     def wants_tools(self) -> Bool:
@@ -375,6 +380,12 @@ trait ChatService(Movable & Deinitable):
 
     def warm_up(mut self):
         ...
+
+    def prepare(mut self, system: String) raises:
+        """The system prompt of the request to come, given ahead of it: a
+        backend with a prefix cache computes it now (never blocks), so the
+        reply starts sooner. Nothing to do for a backend without one."""
+        pass
 
     def start(
         mut self,

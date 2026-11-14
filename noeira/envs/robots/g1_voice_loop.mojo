@@ -426,6 +426,9 @@ struct G1VoiceLoopOf[
     var dest_ms: Float64
     """`request_wording`: how long the first request of the current decision
     took, 0 when it was the only one. Shown in the decision's note."""
+    var dest_tok: Int
+    """The tokens that first request read (the note shows them with the time:
+    a decision's wait is its tokens, docs/NN_MODEL_PORTS_PLAN.md §12.8)."""
     var spec_q: JevQuestions
     var has_pool: Bool
     var pool: G1Pool
@@ -466,6 +469,11 @@ struct G1VoiceLoopOf[
     var view_t: Int
     var view_due: Bool
     """A segment opened and no frame has come in since (`wants_view`)."""
+    var prep_due: Bool
+    """A segment opened: at the next poll the reply model is given the system
+    prompt to compute while the person speaks (`ChatService.prepare`). The NEXT
+    poll, so that a caller that writes the prompt from the robot's state
+    (`set_reply_system`, set once the loop is busy) has written this moment's."""
     var seg_t: Int
     """When the current segment opened (a frame's age is measured to it)."""
     var asked_view: List[Picture]
@@ -558,6 +566,7 @@ struct G1VoiceLoopOf[
             )
         self.asked = String("")
         self.dest_ms = 0.0
+        self.dest_tok = 0
         self.spec_q = g1_spec_questions(True)
         if self.cfg.miss_kind:
             g1_add_miss_kind(self.spec_q, self.cfg.name_desc)
@@ -598,6 +607,7 @@ struct G1VoiceLoopOf[
         self.view = List[Picture]()
         self.view_t = 0
         self.view_due = False
+        self.prep_due = False
         self.seg_t = 0
         self.asked_view = List[Picture]()
         self.view_blind = False
@@ -624,6 +634,7 @@ struct G1VoiceLoopOf[
         self.chain_dest = move.chain_dest^
         self.asked = move.asked^
         self.dest_ms = move.dest_ms
+        self.dest_tok = move.dest_tok
         self.spec_q = move.spec_q^
         self.has_pool = move.has_pool
         self.pool = move.pool^
@@ -649,6 +660,7 @@ struct G1VoiceLoopOf[
         self.view = move.view^
         self.view_t = move.view_t
         self.view_due = move.view_due
+        self.prep_due = move.prep_due
         self.seg_t = move.seg_t
         self.asked_view = move.asked_view^
         self.view_blind = move.view_blind
@@ -908,6 +920,18 @@ struct G1VoiceLoopOf[
         var ev = G1VoiceEvent.none()
         self._tts_step()
 
+        # ── the reply's prompt, computed while the person speaks ───────
+        # ⚠ ONLY WHILE A SEGMENT IS BEING RECORDED: the GPU has no decision
+        # and no reply to run then. Beside a decision it would only make the
+        # decision later.
+        if self.prep_due:
+            self.prep_due = False
+            if self.state == VL_ST_REC:
+                try:
+                    self.llm.prepare(self.cfg.chat_sys)
+                except:
+                    pass    # the prompt is then computed with its reply, as before
+
         # ── the microphone, every frame ───────────────────────────────
         # ⚠ READ EVEN WHILE THE ROBOT SPEAKS. The pipe is 64 KiB, about 2 s,
         # and past that ffmpeg blocks and the device drops audio. The samples
@@ -983,6 +1007,7 @@ struct G1VoiceLoopOf[
                     self.heard = String("")
                     self.pick = G1LangPick()
                     self.view_due = True
+                    self.prep_due = True
                     self.seg_t = perf_counter_ns()
                     self.state = VL_ST_REC
                 if ve.note != "":
@@ -1071,6 +1096,7 @@ struct G1VoiceLoopOf[
                             self.mem_asked = False
                             self.tri = G1Triage()
                             self.dest_ms = 0.0
+                            self.dest_tok = 0
                             if self._two_requests():
                                 self._ask(_VL_Q_DEST)
                                 self.state = VL_ST_DEST
@@ -1213,15 +1239,22 @@ struct G1VoiceLoopOf[
                 if done:
                     var rtxt = String("")
                     var rms_ = 0.0
+                    var rcost = String("")
                     try:
                         var rep = self.llm.result()
                         # what a voice can say: no emoji, no markup (`noeira.text.spoken`)
                         rtxt = spoken_text(rep.text)
                         rms_ = rep.latency_ms
+                        if rep.input_tokens > 0:
+                            # where the reply's time went: its first token (the prompt), then its tokens
+                            rcost = (String("; first token ") + String(Int(rep.first_token_ms)) + String(" ms, ")
+                                     + String(rep.input_tokens) + String(" tokens in, ") + String(rep.cached_tokens)
+                                     + String(" cached, ") + String(rep.output_tokens) + String(" out"))
                     except e:
                         self.note = String("[talk] FAILED: ") + String(e)
                     if rtxt != "":
-                        self.note = String("[said] ") + rtxt + String("  (reply ") + String(Int(rms_)) + String(" ms)")
+                        self.note = (String("[said] ") + rtxt + String("  (reply ") + String(Int(rms_)) + String(" ms")
+                                     + rcost + String(")"))
                         if not self.cfg.mute:
                             self.say(rtxt)
                         ev.kind = VL_TALK
@@ -1301,11 +1334,12 @@ struct G1VoiceLoopOf[
                         _vl_triage_hint(self.tri.kind),
                         String("[triage] ") + self.tri.kind + String(" ")
                         + _vl_f2(self.tri.p) + String(" -> reply, no motion")
-                        + self._jev_ms(ans.latency_ms),
+                        + self._jev_ms(ans.latency_ms, ans.input_tokens),
                     )
                     return ev^
                 if self.tri.kind == "remembered":
                     self.dest_ms = ans.latency_ms
+                    self.dest_tok = ans.input_tokens
                     self.trail_dest = dest
                     self._ask(_VL_Q_TRAIL)
                     self.t_wait = perf_counter_ns()
@@ -1319,6 +1353,7 @@ struct G1VoiceLoopOf[
                     # its own, against a state with nothing of the room in it
                     self.chain_dest = dest
                     self.dest_ms = ans.latency_ms
+                    self.dest_tok = ans.input_tokens
                     self.jev.start(g1_two_places_state(self.heard), self.chain_q)
                     self.t_wait = perf_counter_ns()
                     self.state = VL_ST_CHAIN
@@ -1328,9 +1363,10 @@ struct G1VoiceLoopOf[
                 ev.text = self.heard
                 self.note = (String("[world] ") + dest + String(" ")
                              + _vl_f2(ans.probability(String("destination"), dest))
-                             + self._jev_ms(ans.latency_ms))
+                             + self._jev_ms(ans.latency_ms, ans.input_tokens))
                 return ev^
             self.dest_ms = ans.latency_ms
+            self.dest_tok = ans.input_tokens
             # ⚠ THE SAME STATE, not a fresh one: the robot may have moved on
             # while the first request was answered, and the two answers must
             # be about the same moment.
@@ -1363,7 +1399,7 @@ struct G1VoiceLoopOf[
                 if pair[0] != "":
                     dest = pair[0]
                     then = pair[1]
-                tail = self._jev_ms(ans.latency_ms)
+                tail = self._jev_ms(ans.latency_ms, ans.input_tokens)
             except e:
                 tail = String("  (the two-place request failed: one place) ") + String(e)
         ev.kind = VL_WORLD
@@ -1392,13 +1428,13 @@ struct G1VoiceLoopOf[
                 ev.destination = place
                 ev.text = self.heard
                 self.note = (String("[trail] ") + rel + String(" (") + anc
-                             + String(") -> ") + place + self._jev_ms(ans.latency_ms))
+                             + String(") -> ") + place + self._jev_ms(ans.latency_ms, ans.input_tokens))
             else:
                 self._reply(
                     _vl_triage_hint(String("unsettled")),
                     String("[trail] ") + rel + String(" (") + anc
                     + String(") not settled by the log -> ask")
-                    + self._jev_ms(ans.latency_ms),
+                    + self._jev_ms(ans.latency_ms, ans.input_tokens),
                 )
         except e:
             self.note = String("[jev] FAILED: ") + String(e)
@@ -1434,13 +1470,20 @@ struct G1VoiceLoopOf[
             ctx, self.cfg.destinations, self.cfg.dest_words
         ) != ""
 
-    def _jev_ms(self, ms: Float64) -> String:
-        """`  (jev 3412 ms)`, or `  (jev 680 + 2290 ms)` after two requests:
-        the wait a listener sees between the transcript and the robot."""
+    def _jev_ms(self, ms: Float64, tokens: Int = 0) -> String:
+        """`  (jev 3412 ms, 512 tokens)`, or `  (jev 680 + 2290 ms, 512 + 890
+        tokens)` after two requests: the wait a listener sees between the
+        transcript and the robot, and the tokens the model read for it (0 = the
+        backend did not say)."""
         var s = String("  (jev ")
         if self.dest_ms > 0.0:
             s += String(Int(self.dest_ms)) + String(" + ")
         s += String(Int(ms)) + String(" ms")
+        if tokens > 0:
+            s += String(", ")
+            if self.dest_ms > 0.0:
+                s += String(self.dest_tok) + String(" + ")
+            s += String(tokens) + String(" tokens")
         if len(self.asked_view) > 0:
             s += String(", seeing ") + String(self.asked_view[0].width) + String("x") + String(self.asked_view[0].height)
         return s + String(")")
@@ -1477,13 +1520,13 @@ struct G1VoiceLoopOf[
                 self._reply(
                     _vl_triage_hint(String("unsettled")),
                     String("[triage] a place, none routed: ") + self.pick.name
-                    + String(" -> ask") + self._jev_ms(ans.latency_ms),
+                    + String(" -> ask") + self._jev_ms(ans.latency_ms, ans.input_tokens),
                 )
             elif mem != "":
                 ev.kind = VL_WORLD
                 ev.destination = mem
                 self.note = (String("[memory] other one -> ") + mem
-                             + self._jev_ms(ans.latency_ms))
+                             + self._jev_ms(ans.latency_ms, ans.input_tokens))
             elif self.pick.destination != "":
                 # ⚠ A DESTINATION IS A SUCCESS WITH A DIFFERENT HANDLER, and
                 # `g1_decide` has already cleared `name` so a stale bank row
@@ -1492,7 +1535,7 @@ struct G1VoiceLoopOf[
                 ev.destination = self.pick.destination
                 self.note = (String("[world] ") + self.pick.destination
                              + String(" ") + _vl_f2(self.pick.dest_conf)
-                             + self._jev_ms(ans.latency_ms))
+                             + self._jev_ms(ans.latency_ms, ans.input_tokens))
             elif self.pick.name != "":
                 ev.kind = VL_COMMAND
                 ev.name = self.pick.name
@@ -1506,7 +1549,7 @@ struct G1VoiceLoopOf[
                              + _vl_f2(self.pick.conf) + String("  P(none) ")
                              + _vl_f2(self.pick.p_none) + String("  world ")
                              + _vl_f2(self.pick.needs_world)
-                             + self._jev_ms(ans.latency_ms))
+                             + self._jev_ms(ans.latency_ms, ans.input_tokens))
             elif self.pick.talk:
                 # ⚠ Nothing about the robot's motion changes — it goes on
                 # doing whatever it was doing while it replies.
@@ -1521,7 +1564,7 @@ struct G1VoiceLoopOf[
                         )
                     self.t_wait = perf_counter_ns()
                     self.note = (String("[talk] ") + _vl_f2(self.pick.conf)
-                                 + self._jev_ms(ans.latency_ms))
+                                 + self._jev_ms(ans.latency_ms, ans.input_tokens))
                     self.state = VL_ST_CHAT
                 except e:
                     self.note = String("[talk] could not start: ") + String(e)
@@ -1542,7 +1585,7 @@ struct G1VoiceLoopOf[
                         self.t_wait = perf_counter_ns()
                         self.note = (String("[miss] P(none) ")
                                      + _vl_f2(self.pick.p_none)
-                                     + self._jev_ms(ans.latency_ms)
+                                     + self._jev_ms(ans.latency_ms, ans.input_tokens)
                                      + String(" — asking for a reward spec"))
                         self.state = VL_ST_SPEC
                         got = True
@@ -1561,7 +1604,7 @@ struct G1VoiceLoopOf[
                                  + _vl_f2(self.pick.addressed)
                                  + String("  world ")
                                  + _vl_f2(self.pick.needs_world)
-                                 + self._jev_ms(ans.latency_ms))
+                                 + self._jev_ms(ans.latency_ms, ans.input_tokens))
         except e:
             self.note = String("[jev] FAILED: ") + String(e)
         # ⚠ ONLY when the decision did not hand off. The talk and spec

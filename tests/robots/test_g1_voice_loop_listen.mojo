@@ -25,6 +25,9 @@ returns to idle without asking for a decision.
 3. The second utterance, half spoken when the loop is idle again: no segment
    made of its tail, and one line with its length.
 4. The third and fourth are heard whole.
+5. Each utterance listened to hands the reply's prompt to the reply model
+   once, while it is being recorded (`ChatService.prepare`), never the one the
+   loop was too busy for.
 
 ⚠ `-fflags nobuffer`, which the capture passes for a live device, makes ffmpeg
 DROP the first 3.2 s of a file input (102 400 bytes, measured on ffmpeg 8.1):
@@ -153,9 +156,18 @@ struct NoDecision(Movable, DecisionService):
 
 struct NoChat(Movable, ChatService):
     var asked: Int
+    var prepared: Int
+    """`prepare` calls: the loop hands the reply's prompt over ahead of the words."""
+    var prepared_sys: String
 
     def __init__(out self):
         self.asked = 0
+        self.prepared = 0
+        self.prepared_sys = String("")
+
+    def prepare(mut self, system: String) raises:
+        self.prepared += 1
+        self.prepared_sys = system
 
     @staticmethod
     def from_spec(spec: String) raises -> Self:
@@ -292,11 +304,15 @@ def main() raises:
     var at = List[Float64]()
     var opened_early = False
     var taken = List[Float64]()
+    var prep_at = List[Float64]()
     var t0 = perf_counter_ns()
     var run_s = LOAD_S + total_s - 3.2 + 2.0
     print("a", round(total_s, 1), "s recording, utterances of", UTT_S, "s at 6, 9, 14 and 18 s; running", round(run_s, 1), "s")
     while Float64(perf_counter_ns() - t0) / 1e9 < run_s:
+        var prepared = loop.llm.prepared
         _ = loop.poll(ctx, bank)
+        if loop.llm.prepared > prepared:
+            prep_at.append(Float64(perf_counter_ns() - t0) / 1e9)
         if loop.stt.loading() and loop.mic:
             opened_early = True
         var ms = loop.take_missed()
@@ -315,6 +331,7 @@ def main() raises:
     var listening = -1
     var missed = List[Int]()
     var sent = 0
+    var sent_at = List[Float64]()
     var heard = 0
     var dead = String("")
     for i in range(len(notes)):
@@ -326,6 +343,7 @@ def main() raises:
             missed.append(i)
         elif notes[i].startswith("[stt] "):
             sent += 1
+            sent_at.append(at[i])
         elif notes[i].startswith("[heard] n"):
             heard += 1
         elif notes[i].startswith("[mic] ") and notes[i].find("input live") < 0:
@@ -365,6 +383,19 @@ def main() raises:
             whole = False
     check(fails, whole, "utterance + pre-roll + closing quiet, 2.0 to 2.3 s each: " + lens)
     check(fails, loop.jev.asked == 0 and loop.llm.asked == 0, "no decision and no reply were asked for (one-letter transcripts)")
+
+    print("5. the reply's prompt is handed over while the person speaks")
+    # once per utterance listened to, after it began and before it was sent to the recogniser: the only stretch
+    # in which the robot's models have nothing to run (docs/NN_MODEL_PORTS_PLAN.md §12.8, S1)
+    var during = len(prep_at) == len(sent_at)
+    var when = String("")
+    for k in range(min(len(prep_at), len(sent_at))):
+        when += String(round(sent_at[k] - prep_at[k], 2)) + " s  "
+        if prep_at[k] >= sent_at[k] or sent_at[k] - prep_at[k] > UTT_S + 1.2 or (k > 0 and prep_at[k] <= sent_at[k - 1]):
+            during = False
+    check(fails, during and loop.llm.prepared == 3, String(loop.llm.prepared) + " prompts handed over (3 expected), each before its clip was sent: "
+          + when)
+    check(fails, loop.llm.prepared_sys == loop.cfg.chat_sys and loop.llm.prepared_sys != "", "and it is the loop's reply prompt")
 
     print("ALL PASS" if fails == 0 else String(fails) + " FAILED")
     if fails != 0:

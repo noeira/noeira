@@ -26,7 +26,17 @@ gives at `p..p+n-1` (`Lfm3Text.forward(..., causal_full=True)`, the gate's
 `Lfm3Cache.debug` (falsification, the gate's mutants): 1 = every chunk's RoPE
 positions from 0 (the offset forgotten; a uniform shift would be invisible, RoPE
 being relative), 2 = no sliding window on the cache, 4 = the conv history never
-rolled, 8 = `rewind` leaves the conv histories as they are.
+rolled, 8 = `rewind` leaves the conv histories as they are, 16 = a mark taken
+inside a chunk holds the history of the chunk's END.
+
+MARKS INSIDE A CHUNK (`forward_cached_marks`). A prefix cache wants to come back
+to a point in the MIDDLE of a prompt (`Lfm3Chat.keep_system`: the part of a
+system prompt that did not change). The keys and values are there already; what
+a rewind needs is the conv histories as they were at that point, and those are
+six rows of the chunk's own `[B | C | x]`. So a mark costs one small copy per
+conv layer while the chunk is computed, and the prompt stays ONE chunk (with
+int8 weights every chunk of five rows or more dequantizes each weight, ~45 ms
+on the Orin: cutting a prefill at the marks would cost that per piece).
 """
 
 from std.sys import default_accelerator
@@ -160,9 +170,30 @@ def forward_cached(
     """`[n, hidden]` after the final norm for the `n` new tokens `ids`, at
     positions `cache.pos..`; their keys, values and conv rows go into the cache.
     `taps` (with `keep_taps`): the embedding, then each layer's output."""
+    var marks = List[Lfm3CacheMark]()
+    return _forward_cached(lm, ids, cache, taps, keep_taps, List[Int](), marks)
+
+
+def forward_cached_marks(
+    mut lm: Lfm3Text, ids: List[Int], mut cache: Lfm3Cache, offsets: List[Int], mut marks: List[Lfm3CacheMark],
+) raises -> DeviceBuffer[DT]:
+    """`forward_cached`, and for each `m` of `offsets` (1..n, ascending) a mark
+    appended to `marks`: the cache as it is after the chunk's first `m` tokens
+    (`Lfm3Cache.rewind` comes back to it; module note)."""
+    var taps = List[DeviceBuffer[DT]]()
+    return _forward_cached(lm, ids, cache, taps, False, offsets, marks)
+
+
+def _forward_cached(
+    mut lm: Lfm3Text, ids: List[Int], mut cache: Lfm3Cache, mut taps: List[DeviceBuffer[DT]], keep_taps: Bool,
+    offsets: List[Int], mut marks: List[Lfm3CacheMark],
+) raises -> DeviceBuffer[DT]:
     var n = len(ids)
     if n == 0:
         raise Error("lfm3: an empty chunk")
+    for m in offsets:
+        if m < 1 or m > n:
+            raise Error("lfm3: a mark at offset " + String(m) + " of a chunk of " + String(n) + " tokens")
     if cache.pos + n > cache.cap:
         raise Error(
             "lfm3: the cache is full (" + String(cache.pos) + " + " + String(n) + " tokens > " + String(cache.cap) + ")"
@@ -174,6 +205,9 @@ def forward_cached(
     var nh = lm.cfg.heads
     var nkv = lm.cfg.kv_heads
     var kk = lm.cfg.conv_k
+    var first_mark = len(marks)
+    for m in offsets:
+        marks.append(Lfm3CacheMark(p + m, List[DeviceBuffer[DT]]()))
     var hid = lm.ctx.enqueue_create_host_buffer[DType.int32](n)
     for i in range(n):
         hid[i] = Int32(ids[i])
@@ -199,6 +233,15 @@ def forward_cached(
                 bcx, cache.hist[s], lm.w(pre + "conv.conv.weight"), z, Int64(dm), Int64(kk),
                 grid_dim=(_blocks(dm), n), block_dim=TPB,
             )
+            # the marks first: they read the history of BEFORE the chunk
+            for j in range(len(offsets)):
+                var upto = n if (cache.debug & 16) != 0 else offsets[j]  # mutant 16: the chunk's end
+                var mh = lm.new((kk - 1) * 3 * dm)
+                lm.ctx.enqueue_function[conv_history_kernel](
+                    bcx, cache.hist[s], mh, Int64(upto), Int64(3 * dm), Int64(kk),
+                    grid_dim=(_blocks(3 * dm), kk - 1), block_dim=TPB,
+                )
+                marks[first_mark + j].hist.append(mh^)
             if (cache.debug & 4) == 0:
                 lm.ctx.enqueue_function[conv_history_kernel](
                     bcx, cache.hist[s], cache.hist_next, Int64(n), Int64(3 * dm), Int64(kk),

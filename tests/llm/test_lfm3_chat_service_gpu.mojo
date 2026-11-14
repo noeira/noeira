@@ -13,7 +13,9 @@ the direct API it wraps (docs/NN_MODEL_PORTS_PLAN.md §12.7 step 4).
    framing, the template and the history replay are the service's only work,
    and this is where a mistake in them would show.
 2. A history (user, assistant, user) and a second request with the SAME system
-   prompt (the service rewinds to it) — both equal to the direct API's.
+   prompt (found whole in the model's cache) — both equal to the direct API's.
+   `prepare`: a prompt computed ahead, alone and with its request started at
+   once; the request finds all of it.
 3. What it refuses comes back from `result` (tools at `start`; a
    conversation ending with an assistant message from the worker), and the
    next request is served.
@@ -48,8 +50,9 @@ def check(mut fails: Int, ok: Bool, what: String):
         fails += 1
 
 
-def drive(mut svc: Lfm3ChatService, ref msgs: List[ChatMessage], system: String) raises -> String:
-    """As the voice loop does: start, then poll + done once a 'frame' (10 ms)."""
+def drive(mut svc: Lfm3ChatService, ref msgs: List[ChatMessage], system: String, mut cached: Int) raises -> String:
+    """As the voice loop does: start, then poll + done once a 'frame' (10 ms).
+    `cached`: the prompt tokens the service did not compute again."""
     var t0 = perf_counter_ns()
     svc.start(msgs, system, List[ToolSpec](), False)
     var frames = 0
@@ -60,8 +63,10 @@ def drive(mut svc: Lfm3ChatService, ref msgs: List[ChatMessage], system: String)
         _ = sleep_us(10_000)
         frames += 1
     var r = svc.result()
+    cached = r.cached_tokens
     print("        ", Int(Float64(perf_counter_ns() - t0) / 1e6), "ms wall,", frames, "frames,", r.input_tokens, "tokens in,",
-          r.output_tokens, "out, first token after", Int(r.first_token_ms), "ms,", r.stop_reason, ": '" + r.text + "'")
+          r.cached_tokens, "cached,", r.output_tokens, "out, first token after", Int(r.first_token_ms), "ms,", r.stop_reason,
+          ": '" + r.text + "'")
     return r.text
 
 
@@ -100,10 +105,11 @@ def main() raises:
     svc.set_reply_limits(120)
     var chat = Lfm3Chat.load(DeviceContext(), dir, 4096, True)
     chat.keep_system = True
+    var cached = 0
 
     var a = List[ChatMessage]()
     a.append(ChatMessage.user(String("Bonjour ! Qu'est-ce que tu peux faire pour moi ?")))
-    var got = drive(svc, a, SYSTEM)
+    var got = drive(svc, a, SYSTEM, cached)
     print("  service ready + first reply after", Int(Float64(perf_counter_ns() - t0) / 1e6), "ms (load", svc.load_ms(), "ms)")
     check(fails, got.byte_length() > 0 and got == direct(chat, a, SYSTEM, 120), "a reply, equal to the direct API's")
 
@@ -111,16 +117,39 @@ def main() raises:
     b.append(ChatMessage.user(String("Can you bring me a soda from the fridge?")))
     b.append(ChatMessage.assistant(String("I can't carry things, but I can walk to the fridge with you.")))
     b.append(ChatMessage.user(String("Okay, then where is the sofa?")))
-    got = drive(svc, b, SYSTEM)
+    got = drive(svc, b, SYSTEM, cached)
     check(fails, got.byte_length() > 0 and got == direct(chat, b, SYSTEM, 120), "a history (user, assistant, user), equal to the direct API's")
 
     var c = List[ChatMessage]()
     c.append(ChatMessage.user(String("Tu peux t'asseoir sur le canapé ?")))
-    got = drive(svc, c, SYSTEM)  # the same system prompt again: the service rewinds to it
-    check(fails, got.byte_length() > 0 and got == direct(chat, c, SYSTEM, 120), "the system prompt reused (rewound), equal to the direct API's")
+    got = drive(svc, c, SYSTEM, cached)  # the same system prompt again: the service rewinds to it
+    check(fails, got.byte_length() > 0 and got == direct(chat, c, SYSTEM, 120) and cached == chat.head_len and cached > 32,
+          "the system prompt reused (" + String(cached) + " tokens not computed again), equal to the direct API's")
+
+    # 2b. `prepare`: a prompt computed ahead of its request (the voice loop, while the person speaks)
+    var ahead = SYSTEM + " Today the fridge is empty and the door is locked."
+    svc.prepare(ahead)
+    var waited = 0
+    while svc.preparing and waited < 2000:
+        _ = svc.poll()
+        _ = sleep_us(10_000)
+        waited += 1
+    chat.prepare(ahead)
+    var part = chat.reused
+    got = drive(svc, c, ahead, cached)
+    check(fails, not svc.preparing and got.byte_length() > 0 and got == direct(chat, c, ahead, 120) and cached == chat.head_len
+          and part >= 32 and part < chat.head_len,
+          "prepare, then the request: the prompt kept from token " + String(part) + " and computed ahead, all " + String(cached)
+          + " tokens found by the request; equal to the direct API's")
+    # a request that does not wait for its `prepare`: the worker finishes the one, then serves the other
+    svc.prepare(SYSTEM)
+    got = drive(svc, a, SYSTEM, cached)
+    chat.prepare(SYSTEM)
+    check(fails, got.byte_length() > 0 and got == direct(chat, a, SYSTEM, 120) and cached == chat.head_len,
+          "a request started while its prepare still runs: served after it, equal to the direct API's")
 
     var other = String("You are a pirate. Answer in one short sentence.")
-    got = drive(svc, a, other)
+    got = drive(svc, a, other, cached)
     check(fails, got.byte_length() > 0 and got == direct(chat, a, other, 120), "another system prompt, equal to the direct API's")
 
     # refusals
@@ -145,7 +174,7 @@ def main() raises:
         raised = True
         print("        (refused: " + String(e) + ")")
     check(fails, raised, "a conversation ending with the assistant fails at result")
-    got = drive(svc, a, SYSTEM)
+    got = drive(svc, a, SYSTEM, cached)
     check(fails, got.byte_length() > 0, "and the next request is served")
 
     print("")

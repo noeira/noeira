@@ -30,9 +30,14 @@ costs its own messages, not the robot's persona.
 Not served: tools, pictures, streaming (`poll` returns "" and the text comes
 with `result`; a short spoken reply is ~0.5 s).
 
+`prepare(system)` computes a system prompt ahead of the request that will use
+it (`Lfm3Chat.prepare`); the request then keeps the part of its own prompt
+that is already in the cache, matched by tokens (`ChatResponse.cached_tokens`).
+
 The request, one message on the ring: `[u32 max_tokens] system \\0` then per
-message `role (u|a) text \\0`. The reply: `[u32 input tokens][u32 output
-tokens][u8 ended][u32 first token us] text`.
+message `role (u|a) text \\0`; no message and `max_tokens` 0 = `prepare`. The
+reply: `[u32 input tokens][u32 output tokens][u8 ended][u32 first token us]
+[u32 cached tokens] text`.
 """
 
 from std.os import getenv
@@ -50,6 +55,8 @@ comptime CS_REQ_SLOT: Int = 256 * 1024
 comptime CS_REP_SLOT: Int = 64 * 1024
 comptime CS_CAP: Int = 4096
 """The longest conversation one request may carry, in tokens."""
+comptime CS_HEAD: Int = 17
+"""The reply frame's bytes before its text."""
 
 
 def _put_u32(mut b: List[UInt8], v: Int):
@@ -113,7 +120,18 @@ struct Lfm3ChatModel(LocalModel):
         if cut < 0:
             raise Error("lfm3 chat: no end to the system prompt")
         ref c = self.chat.value()
+        if cut + 1 >= n and max_tokens == 0:
+            # `prepare`: the system prompt into the cache, nothing generated
+            c.prepare(_text(request, 4, cut))
+            var p = List[UInt8](capacity=CS_HEAD)
+            _put_u32(p, c.head_len)
+            _put_u32(p, 0)
+            p.append(UInt8(0))
+            _put_u32(p, 0)
+            _put_u32(p, c.reused)
+            return p^
         c.reset(_text(request, 4, cut))
+        var cached = c.reused
         var at = cut + 1
         var last = String("")
         while at < n:
@@ -144,11 +162,12 @@ struct Lfm3ChatModel(LocalModel):
         # ended by the model: at `<|im_end|>`, or at a stray `</think>` (`Lfm3Chat.think_end`)
         var ended = len(c.reply) > 0 and (c.reply[len(c.reply) - 1] == c.eos or c.reply[len(c.reply) - 1] == c.think_end)
         var text = c.answer_text()  # after a stray `</think>`, if the model wrote one
-        var b = List[UInt8](capacity=13 + text.byte_length())
+        var b = List[UInt8](capacity=CS_HEAD + text.byte_length())
         _put_u32(b, input_tokens)
         _put_u32(b, len(c.reply))
         b.append(UInt8(1) if ended else UInt8(0))
         _put_u32(b, first_us)
+        _put_u32(b, cached)
         for x in text.as_bytes():
             b.append(x)
         return b^
@@ -161,6 +180,8 @@ struct Lfm3ChatService(Movable, ChatService):
     var started: Bool
     var over: Bool
     """The call in flight has finished (`poll` saw it)."""
+    var preparing: Bool
+    """A `prepare` is in flight (its reply is read and dropped)."""
 
     def __init__(out self, var dir: String = String(""), int8: Bool = True) raises:
         if dir.byte_length() == 0:
@@ -172,6 +193,7 @@ struct Lfm3ChatService(Movable, ChatService):
         self.max_tokens = 256
         self.started = False
         self.over = False
+        self.preparing = False
 
     @staticmethod
     def from_spec(spec: String) raises -> Lfm3ChatService:
@@ -201,6 +223,43 @@ struct Lfm3ChatService(Movable, ChatService):
 
     def warm_up(mut self):
         pass  # the worker loads and warms itself up on its own thread
+
+    def prepare(mut self, system: String) raises:
+        """Compute `system` into the model's cache now (never blocks), so the
+        reply that uses it starts from there. Ignored while a reply is in
+        flight or waiting to be read, and while an earlier `prepare` runs.
+
+        ⚠ CALL IT WHEN THE GPU HAS NOTHING ELSE TO DO FOR THE ROBOT (while the
+        person speaks). Beside a decision it only makes the decision later."""
+        if self.started:
+            return
+        if self.preparing and not self.call.poll():
+            return
+        self._drop_prepare()
+        var b = List[UInt8](capacity=64 + system.byte_length())
+        _put_u32(b, 0)
+        for x in system.as_bytes():
+            if x == 0:
+                raise Error("chat (LFM3): a NUL byte in the system prompt")
+            b.append(x)
+        b.append(0)
+        self.call.begin(b, String("chat (LFM3)"))
+        self.preparing = True
+
+    def _drop_prepare(mut self):
+        """Forget a `prepare`'s call: finished, its reply is read and dropped;
+        still running, it is cancelled (the worker finishes it, and its reply
+        is skipped as stale)."""
+        if not self.preparing:
+            return
+        self.preparing = False
+        if self.call.poll():
+            try:
+                _ = self.call.take(String("chat (LFM3)"))
+            except:
+                pass  # a prompt that could not be prepared is computed with its reply
+        else:
+            self.call.cancel()
 
     def start(
         mut self,
@@ -234,11 +293,16 @@ struct Lfm3ChatService(Movable, ChatService):
                     raise Error("chat (LFM3): a NUL byte in a message")
                 b.append(x)
             b.append(0)
+        self._drop_prepare()
         self.call.begin(b, String("chat (LFM3)"))
         self.started = True
         self.over = False
 
     def poll(mut self, timeout_ms: Int = 0) raises -> String:
+        if not self.started:
+            if self.preparing and self.call.poll():
+                self._drop_prepare()
+            return String("")
         if self.call.poll():
             self.over = True
             return String("")
@@ -261,14 +325,15 @@ struct Lfm3ChatService(Movable, ChatService):
             _ = sleep_us(500)
         self.started = False
         var b = self.call.take(String("chat (LFM3)"))
-        if len(b) < 13:
+        if len(b) < CS_HEAD:
             raise Error("chat (LFM3): a short reply")
         var r = ChatResponse()
         r.input_tokens = _get_u32(b, 0)
         r.output_tokens = _get_u32(b, 4)
         r.stop_reason = String("stop") if b[8] == 1 else String("length")
         r.first_token_ms = Float64(_get_u32(b, 9)) / 1000.0
-        r.text = _text(b, 13, len(b))
+        r.cached_tokens = _get_u32(b, 13)
+        r.text = _text(b, CS_HEAD, len(b))
         r.model = String("LFM3-1.7B (in process)")
         r.latency_ms = self.call.latency_ms()
         r.message = ChatMessage.assistant(r.text.copy())
@@ -277,3 +342,4 @@ struct Lfm3ChatService(Movable, ChatService):
     def cancel(mut self) raises:
         self.call.cancel()
         self.started = False
+        self.preparing = False
