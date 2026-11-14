@@ -63,6 +63,7 @@ from linalg.matmul import matmul as max_matmul
 
 from noeira.nn.constants import DT
 from noeira.nn.core.cublas_gemm import cublas_gemm, cublas_gemm_lp
+from noeira.io.fileio import release_file_cache
 from noeira.io.json import load_json
 from noeira.io.safetensors import SafeTensors, ST_BF16
 from .kernels import (
@@ -91,6 +92,9 @@ comptime LT_CONV: Int = 0
 comptime LT_FULL: Int = 1
 comptime LT_SLIDING: Int = 2
 comptime _ALIGN: Int = 64
+comptime _STAGE: Int = 128 << 20
+"""bf16 values staged on the host at a time when the weights are loaded: 256 MB
+(a tensor larger than that is staged alone)."""
 
 
 def _blocks(n: Int) -> Int:
@@ -302,27 +306,46 @@ struct Lfm3Text(Movable):
             picked.append(i)
             total += (n + _ALIGN - 1) // _ALIGN * _ALIGN
         var arena = ctx.enqueue_create_buffer[DType.uint16](max(total, 1))
-        var staging = ctx.enqueue_create_host_buffer[DType.uint16](max(total, 1))
         ctx.synchronize()
         var index = Dict[String, Int]()
         var dev = List[DeviceBuffer[DType.uint16]]()
         var offs = List[Int]()
         var names = List[String]()
         var off = 0
-        for i in picked:
-            var name = st.names[i]
-            var raw = st.read_raw(name)
-            var n = len(raw) // 2
-            unsafe_memcpy(dest=staging.unsafe_ptr().unsafe_bitcast[UInt8]().unsafe_offset(off * 2), src=raw.unsafe_ptr(), count=len(raw))
-            var short = String(name[byte=prefix.byte_length():])
-            index[short] = len(dev)
-            dev.append(arena.create_sub_buffer[DType.uint16](off, n))
-            offs.append(off)
-            names.append(short)
-            off += (n + _ALIGN - 1) // _ALIGN * _ALIGN
-        ctx.enqueue_copy(arena, staging)
-        ctx.synchronize()
-        _ = staging^
+        # ⚠ STAGED IN PIECES (`_STAGE`), NOT IN ONE HOST BUFFER THE SIZE OF THE MODEL. On an Orin the host
+        # and the device share one memory: with a whole-model staging buffer each model held twice its
+        # size while it loaded, and two of them loading beside a recogniser ran the machine out of memory
+        # (3 GB swapped out in 5 s at the room demo's start, docs/ROBOT_BRAIN_PLAN.md §16).
+        var at = 0
+        while at < len(picked):
+            var end = at
+            var span = 0
+            while end < len(picked):
+                var a = (st.numel(st.names[picked[end]]) + _ALIGN - 1) // _ALIGN * _ALIGN
+                if end > at and span + a > _STAGE:
+                    break
+                span += a
+                end += 1
+            var staging = ctx.enqueue_create_host_buffer[DType.uint16](span)
+            ctx.synchronize()
+            var fill = 0
+            for j in range(at, end):
+                var name = st.names[picked[j]]
+                var raw = st.read_raw(name)
+                var n = len(raw) // 2
+                unsafe_memcpy(dest=staging.unsafe_ptr().unsafe_bitcast[UInt8]().unsafe_offset(fill * 2), src=raw.unsafe_ptr(), count=len(raw))
+                var short = String(name[byte=prefix.byte_length():])
+                index[short] = len(dev)
+                dev.append(arena.create_sub_buffer[DType.uint16](off + fill, n))
+                offs.append(off + fill)
+                names.append(short)
+                fill += (n + _ALIGN - 1) // _ALIGN * _ALIGN
+            ctx.enqueue_copy(arena.create_sub_buffer[DType.uint16](off, span), staging)
+            ctx.synchronize()
+            _ = staging^
+            release_file_cache(dir + "/model.safetensors")   # on the device now: not in the page cache too
+            off += span
+            at = end
         var scratch = ctx.enqueue_create_buffer[DT](largest)
         var lm = Lfm3Text(ctx^, cfg^, arena^, index^, dev^, offs^, names^, scratch^)
         if int8:
@@ -563,6 +586,7 @@ struct Lfm3Text(Movable):
             self.ctx.enqueue_copy(d, h)
             self._q8_from(self.q8_index.get(names[i]).value(), d, levels)
             self.ctx.synchronize()  # the staging buffers are reused / freed
+            release_file_cache(st.path.copy())   # quantized on the device: not in the page cache too
         self.q8_on = True
 
     def q8_bytes(self) -> Int:

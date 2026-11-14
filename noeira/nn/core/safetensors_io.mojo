@@ -43,6 +43,7 @@ framework has to reshape, and that case is `torch_names.mojo`: an export that a
 all three of which are per-architecture facts that no generic walk can know.
 """
 
+from std.memory import unsafe_memcpy
 from max.gpu.host import DeviceContext
 
 from noeira.io.safetensors import SafeTensors, SafeTensorsWriter
@@ -165,8 +166,17 @@ def fill_param(
     would hold the loaded weights, every device kernel would keep reading the
     old ones, and the run would look like the load simply did not matter."""
     param.ensure(len(vals))
-    for i in range(len(vals)):
-        param.data[i] = Scalar[DT](vals[i])
+    comptime if DT == DType.float32:
+        # one copy: element by element this was 2 s of a 600 M-weight load
+        if len(vals) > 0:
+            unsafe_memcpy(
+                dest=param.data.unsafe_ptr().unsafe_bitcast[UInt8](),
+                src=vals.unsafe_ptr().unsafe_bitcast[UInt8](),
+                count=len(vals) * 4,
+            )
+    else:
+        for i in range(len(vals)):
+            param.data[i] = Scalar[DT](vals[i])
     if ctx:
         param.upload_resident(ctx.value())
     # ⚠ A load is a write, so it advances `version`, as the checkpoint readers

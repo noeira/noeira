@@ -30,6 +30,7 @@ changed.
 from std.ffi import external_call
 from std.memory import unsafe_memcpy
 from std.os.path import exists
+from std.sys import CompilationTarget
 
 comptime _CHUNK = 1 << 30
 """1 GiB — comfortably below every single-syscall I/O cap."""
@@ -159,6 +160,33 @@ def read_file_range(path: String, offset: Int, count: Int) raises -> List[UInt8]
             )
             got += len(chunk)
     return out^
+
+
+def release_file_cache(var path: String):
+    """Tell the system it may drop the pages of `path` it keeps in memory
+    (`posix_fadvise(..., POSIX_FADV_DONTNEED)` over the whole file). Linux
+    only; nothing elsewhere, and nothing on a failure: it is advice.
+
+    For a loader that reads gigabytes ONCE and keeps its own copy. A file read
+    stays in the page cache until the system needs the memory back, and on a
+    machine whose host and device share one memory (a Jetson) that moment is
+    the device's next allocation: with 9.6 GB of weights read by four models
+    loading together, free memory fell to 112 MB and one start in six lost a
+    model to a cuBLAS INTERNAL_ERROR (docs/ROBOT_BRAIN_PLAN.md §16). Call it
+    after each piece is on the device; the pages another reader still needs
+    are simply read again.
+    """
+    comptime if CompilationTarget.is_linux():
+        var mode = String("rb")
+        var fp = external_call["fopen", Int](
+            path.as_c_string_span().ptr(), mode.as_c_string_span().ptr()
+        )
+        if fp == 0:
+            return
+        var fd = external_call["fileno", Int32](fp)
+        # (fd, offset, len, advice): len 0 = to the end of the file; DONTNEED = 4
+        _ = external_call["posix_fadvise", Int32](fd, Int(0), Int(0), Int32(4))
+        _ = external_call["fclose", Int32](fp)
 
 
 def file_size(path: String) raises -> Int:

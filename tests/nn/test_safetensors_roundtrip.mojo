@@ -42,6 +42,7 @@ from noeira.nn.core.torch_names import (
     LoadTorchNamed,
     SaveTorchNamed,
     TorchNameMap,
+    transpose_2d,
 )
 from noeira.nn.combinators.sequential import Sequential
 from noeira.nn.models.conv import Conv2DBatchNormReLU
@@ -421,6 +422,32 @@ def main() raises:
     )
     check(fails, "strict=False loads the rest and counts them",
           n_partial == 3, String(n_partial) + " of 4")
+
+    # ══════════════════════════════════════════════════════════════════════
+    print("")
+    print("transpose_2d against its definition")
+    # ⚠ Shapes that are not multiples of the block (32), on both sides: the
+    # transpose runs in blocks, and a block's edge is where it can go wrong.
+    var tshapes: List[List[Int]] = [[1, 1], [1, 7], [7, 1], [31, 33], [32, 32], [33, 64], [70, 45], [100, 257]]
+    var t_bad = 0
+    for sh in tshapes:
+        var tr = sh[0]
+        var tc = sh[1]
+        var tsrc = List[Float32](capacity=tr * tc)
+        for k in range(tr * tc):
+            tsrc.append(Float32(k) * 0.5 - 3.0)
+        var tout = transpose_2d(tsrc, tr, tc)
+        if len(tout) != tr * tc:
+            t_bad += 1
+            continue
+        for r in range(tr):
+            for c in range(tc):
+                if tout[c * tr + r] != tsrc[r * tc + c]:
+                    t_bad += 1
+    check(fails, "out[c, r] == src[r, c] for every element of 8 shapes", t_bad == 0, String(t_bad) + " wrong")
+    var tshort: List[Float32] = [1.0, 2.0, 3.0]
+    check(fails, "a source of the wrong size gives nothing (the caller's size check raises)",
+          len(transpose_2d(tshort, 2, 2)) == 0)
 
     print("")
     if fails == 0:

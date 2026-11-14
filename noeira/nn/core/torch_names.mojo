@@ -153,13 +153,32 @@ struct TorchNameMap(Movable):
         return n
 
 
+comptime _TR_BLOCK: Int = 32
+
+
 def transpose_2d(ref src: List[Float32], rows: Int, cols: Int) -> List[Float32]:
     """`src` is row-major `[rows, cols]`; the result is row-major
     `[cols, rows]`."""
+    # ⚠ IN BLOCKS. Row by row, each write lands `rows` floats after the last:
+    # for a [4096, 1024] weight that is a new cache line per element, and the
+    # 600 M weights of one speech model spent 4.4 s here on an Orin (0.6 s
+    # in blocks; docs/ROBOT_BRAIN_PLAN.md §16). Same values, same order.
+    if len(src) != rows * cols:
+        return List[Float32]()  # the caller's size check names the tensor
     var out = List[Float32](unsafe_uninit_length=rows * cols)
-    for r in range(rows):
-        for c in range(cols):
-            out[c * rows + r] = src[r * cols + c]
+    var s = src.unsafe_ptr()
+    var d = out.unsafe_ptr()
+    var r0 = 0
+    while r0 < rows:
+        var r1 = min(r0 + _TR_BLOCK, rows)
+        var c0 = 0
+        while c0 < cols:
+            var c1 = min(c0 + _TR_BLOCK, cols)
+            for r in range(r0, r1):
+                for c in range(c0, c1):
+                    d[unsafe_offset=c * rows + r] = s[unsafe_offset=r * cols + c]
+            c0 = c1
+        r0 = r1
     return out^
 
 

@@ -57,6 +57,7 @@ from linalg.matmul import matmul as max_matmul
 from noeira.ai.picture import Picture
 from noeira.nn.constants import DT
 from noeira.nn.core.cublas_gemm import cublas_gemm, cublas_gemm_lp
+from noeira.io.fileio import release_file_cache
 from noeira.io.json import load_json
 from noeira.io.safetensors import SafeTensors, ST_BF16
 from .kernels import (
@@ -253,6 +254,7 @@ struct Lfm3Vision(Movable):
         ctx.enqueue_copy(arena, staging)
         ctx.synchronize()
         _ = staging^
+        release_file_cache(dir + "/model.safetensors")   # on the device now: not in the page cache too
         var scratch = ctx.enqueue_create_buffer[DT](largest)
         return Lfm3Vision(ctx^, cfg^, arena^, index^, dev^, offs^, names^, scratch^)
 

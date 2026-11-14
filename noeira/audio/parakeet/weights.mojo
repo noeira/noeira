@@ -87,6 +87,7 @@ from noeira.nn.primitives.linear import Linear
 from noeira.nn.primitives.layer_norm import LayerNorm
 from noeira.nn.primitives.batch_norm_1d import BatchNorm1D
 from noeira.nn.primitives.embedding import Embedding
+from noeira.io.fileio import release_file_cache
 from noeira.io.safetensors import SafeTensors
 from .config import (
     PK_D, PK_FF, PK_LAYERS, PK_CONV_K, PK_SUB_CH, PK_SUB_FLAT, PK_DEC,
@@ -240,12 +241,17 @@ struct PkLoad(Movable, ParamVisitor, ParamVisitorRT):
             raise Error("parakeet: '" + name + "' does not fit its float16 arena")
         var hb = c.enqueue_create_host_buffer[PK_HALF](n)
         c.synchronize()
-        var limit = Float32(65504.0)
+        # the largest magnitude is taken on the way and judged once: a test and
+        # a raise per weight kept this loop scalar (1.7 s of the load on an Orin)
+        var src = param.data.unsafe_ptr()
+        var dst = hb.unsafe_ptr()
+        var top = Float32(0.0)
         for i in range(n):
-            var v = param.data[i]
-            if v > limit or v < -limit:
-                raise Error("parakeet: '" + name + "' has a weight beyond float16's range")
-            hb[i] = v.cast[PK_HALF]()
+            var v = src[unsafe_offset=i]
+            top = max(top, abs(v))
+            dst[unsafe_offset=i] = v.cast[PK_HALF]()
+        if top > Float32(65504.0):
+            raise Error("parakeet: '" + name + "' has a weight beyond float16's range")
         var slice = self.half_arena.value().create_sub_buffer[PK_HALF](self.half_offset, n)
         c.enqueue_copy(slice, hb)
         c.synchronize()
@@ -660,6 +666,9 @@ struct ParakeetTDT(ParamWalkable):
                         )
                     self.layers[i].half = w.half_out.copy()
                 self.arenas.append(ai)
+                # this block is on the device: its 100 MB of the file need not stay in the
+                # page cache as well (`release_file_cache`: a Jetson's one memory)
+                release_file_cache(path.copy())
             # The prediction network and the joint: one more arena.
             var cd = PkCount()
             self.walk_decoder["cpu"](cd, None, String(""))
