@@ -550,8 +550,9 @@ def main() raises:
     check(fails, pp.take_met(String("fr")) == "Enchanté, Denis." and pp.take_met(String("fr")) == "", "the introduction is acknowledged, once, with the name said back")
     check(fails, pw.speaker == "Denis" and pw.speaker_sure and len(pp.list) == 1 and len(pp.list[0].voices) == 1 and pw.speaker_said_name == ""
           and speaker_sentence(pw) == "You are talking with a person whose name is Denis: you recognise their voice.", "the voice is stored under the name")
-    check(fails, reply_view(pw).live.startswith("Facts, true right now:\n- You are talking with a person whose name is Denis: you recognise their voice.\n- You are standing"),
-          "the reply view starts with who is talking")
+    check(fails, reply_view(pw).live.find("- You know of no other place or object in this room.\n- You are talking with a person whose name is Denis: you recognise their voice.") >= 0
+          and reply_view(pw).live.startswith("Facts, true right now:\n- You are standing"),
+          "who is talking is the last of the facts (the line that changes most: a prefix cache keeps nothing after it)")
     pw.asked = String("Do you recognise me?")
     check(fails, asks_identity(pw.asked) and identity_answer(pw) == "Your name is Denis." and speaker_sentence(pw).endswith(
           "The person is asking who they are. Answer with exactly this sentence and nothing else: \"Your name is Denis.\""), "asked by Denis: the exact answer is in the view")

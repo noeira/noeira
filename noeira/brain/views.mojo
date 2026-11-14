@@ -23,10 +23,24 @@ written from the `WorldState` every turn (docs/ROBOT_BRAIN_PLAN.md §5.2).
     - The nearest place to you: table.
     - Before this you were at: sofa, then door.
     - You know of no other place or object in this room.
+    - You are talking with a person whose name is Denis: you recognise their voice.
 
 TWO PARTS, FOR THE PREFIX CACHE. `stable` (who the robot is, what it can do)
 changes when the body changes; `live` (the facts) changes every turn. The
 stable part comes first so that a model's cache can keep it.
+
+⚠ WHO IS SPEAKING IS THE LAST FACT, FOR THE SAME CACHE. A model's cache keeps a
+prompt up to its first changed token (`Lfm3Chat.keep_system`), and the voice
+loop computes the prompt while the person is still speaking
+(`ChatService.prepare`). The speaker's line reads "still being checked" until
+the voice has been compared, so it changes during most turns: as the FIRST
+fact it left 6 replies of 17 in the room demo with a third of their prompt in
+the cache (docs/NN_MODEL_PORTS_PLAN.md §12.8.5).
+
+⚠ AND THE OTHER LINES STAY WHERE THEY WERE. Ordering all of them by how often
+they change (names, task, position, places around, speaker) was tried and
+scored one item lower on each bench: BB-1's task questions 14 / 16 for 15,
+held out 25 / 26 for 26, the restart gate 11 / 14 for 12 on one scenario.
 
 ⚠ THE WORDING IS PART OF THE MODEL'S INPUT, AND THIS IS ITS ONE COPY. It is
 measured by `benchmarks/bench_brain_grounded_gpu.mojo` (BB-1); change a
@@ -229,8 +243,6 @@ def reply_live(ref ws: WorldState, style: Int = REPLY_VIEW_LINES) -> String:
         t += " You know of no other place or object in this room."
         return t + memory_section(ws)
     var t = String("Facts, true right now:\n")
-    if ws.people_on:
-        t += "- " + speaker_sentence(ws) + "\n"
     t += "- " + _now_line(ws) + "\n- " + task_sentences(ws) + "\n"
     if len(around) > 0:
         var items = List[String]()
@@ -252,6 +264,8 @@ def reply_live(ref ws: WorldState, style: Int = REPLY_VIEW_LINES) -> String:
     else:
         t += "- You have not been anywhere else yet.\n"
     t += "- You know of no other place or object in this room."
+    if ws.people_on:
+        t += "\n- " + speaker_sentence(ws)  # last: the line that changes most (module note)
     return t + memory_section(ws)
 
 
