@@ -16,6 +16,12 @@ what it gates).
 velocities. The store must be the one the interface trained on: z is not
 portable across pools.
 
+`-D SM_BHL=1 -D SM_LIGHT=1` (and the tracker's `-D BHL_EFFORT_PCT=`), as
+`supermimic_prompt_train.mojo`: Berkeley Humanoid Lite on the light tracker.
+The suite is the G1's (its heights and widths are metres on that body), so on
+BHL only the step test runs, on BHL's own ranges; it also prints what the
+robot did per commanded direction, which a median over 672 commands hides.
+
 ⚠ A SEED store is confidential: private compute only.
 """
 
@@ -36,17 +42,17 @@ from noeira.deep_agents.supermimic.kinematics import Q4, qapply
 from noeira.deep_agents.supermimic.lanes import talloc, tp
 from noeira.deep_agents.supermimic.motion_library import SMMotionLibrary
 from noeira.deep_agents.supermimic.prompt import SMSpec, sm_spec_velocity
-from noeira.deep_agents.supermimic.prompt_bank import sm_prompt_data
+from noeira.deep_agents.supermimic.prompt_bank import SMBankScale, sm_prompt_data
 from noeira.deep_agents.supermimic.prompt_eval import (
-    SM_E_SKIP, SM_E_STEP_STEPS, SM_E_STEP_TAIL, SM_E_SUITE_STEPS, SMEvalTally, SMEvalTask, sm_eval_tasks, sm_median, sm_stand_library,
-    sm_step_commands,
+    SM_E_SKIP, SM_E_STEP_STEPS, SM_E_STEP_TAIL, SM_E_SUITE_STEPS, SMEvalTally, SMEvalTask, SMStepCmd, sm_eval_tasks, sm_median,
+    sm_stand_library, sm_step_commands,
 )
 from noeira.deep_agents.supermimic.prompt_imagination import SMPromptBatch, sm_imagine_prompt
 from noeira.deep_agents.supermimic.prompt_policy import SMPromptConfig
 from noeira.deep_agents.supermimic.prompt_trainer import SMPromptTrainer
-from noeira.deep_agents.supermimic.robot import G1MjlabBatchedSim, G1MjlabRobot, SMDims
+from noeira.deep_agents.supermimic.robot import BhlBatchedSim, BhlRobot, G1MjlabBatchedSim, G1MjlabRobot, SMDims
 from noeira.deep_agents.supermimic.trainer import SuperMimicTrainer
-from noeira.envs.robots.unitree_g1_pd import G1_N_DOF
+from noeira.envs.robots.berkeley_humanoid_lite_config import BHL_EFFORT_PCT, BHL_SPEED_PCT
 from noeira.nn.constants import DT
 from noeira.nn.core.tensor import TensorImpl
 
@@ -55,20 +61,29 @@ comptime MODE = get_defined_int["SM_GPU", 0]()
 comptime TARGET: StaticString = "gpu" if MODE != 0 else "cpu"
 comptime PAPER = get_defined_int["SM_PAPER", 0]() != 0
 comptime VEL = get_defined_int["SM_PROMPT_VEL", 0]() != 0
-comptime LANES = get_defined_int["SM_LANES", 4096 if PAPER else 8]()
-comptime Robot = G1MjlabRobot
+comptime LIGHT = get_defined_int["SM_LIGHT", 0]() != 0 and not PAPER
+comptime BIG = PAPER or LIGHT
+comptime BHL = get_defined_int["SM_BHL", 0]() != 0
+comptime LANES = get_defined_int["SM_LANES", 4096 if BIG else 8]()
+comptime Robot = BhlRobot if BHL else G1MjlabRobot
 comptime D = SMDims[Robot]
 comptime H = 32
+# the training run's widths (`supermimic_prompt_train.mojo`)
 comptime C = SMConfig[
     TARGET, Robot,
-    2048 if PAPER else 128, 64 if PAPER else 64, 2048 if PAPER else 128, 1024 if PAPER else 64, 512 if PAPER else 64, 256 if PAPER else 32,
-    2048 if PAPER else 128, 1024 if PAPER else 64, 512 if PAPER else 64, 256 if PAPER else 32, 256 if PAPER else 64, 128 if PAPER else 32,
+    2048 if PAPER else (1024 if LIGHT else 128), 64,
+    2048 if PAPER else (1024 if LIGHT else 128), 1024 if PAPER else (512 if LIGHT else 64),
+    512 if PAPER else (256 if LIGHT else 64), 256 if PAPER else (128 if LIGHT else 32),
+    2048 if PAPER else (1024 if LIGHT else 128), 1024 if PAPER else (512 if LIGHT else 64),
+    512 if PAPER else (256 if LIGHT else 64), 256 if PAPER else (128 if LIGHT else 32),
+    256 if PAPER else (128 if LIGHT else 64), 128 if PAPER else (64 if LIGHT else 32),
     LANES, 16, LANES, H,
 ]
 comptime CMD = 3 if VEL else D.LATENT
-comptime P = SMPromptConfig[C, CMD, 256 if PAPER else 32, 256 if PAPER else 32, 256 if PAPER else 32, 128 if PAPER else 32]
+comptime P = SMPromptConfig[C, CMD, 256 if BIG else 32, 256 if BIG else 32, 256 if BIG else 32, 128 if BIG else 32]
 comptime Trainer = SMPromptTrainer[P]
-comptime Sim = G1MjlabBatchedSim[LANES]
+comptime Sim = BhlBatchedSim[LANES] if BHL else G1MjlabBatchedSim[LANES]
+comptime KB = SMBankScale[Robot]
 comptime NOISE_AMP = 0.1
 comptime STAND_CLIPS = 64
 comptime HONEST_T0 = 100
@@ -275,7 +290,7 @@ def suite[E: EvalEnv](mut e: E, mut tr: Trainer, tasks: List[SMEvalTask], frames
 
 def step_test[E: EvalEnv](mut e: E, mut tr: Trainer, cmd_of: List[Scalar[DT]], frames: List[Int]) raises:
     """Appendix G.2. `cmd_of` [672·CMD]: the interface's command for each."""
-    var cl = sm_step_commands()
+    var cl = sm_step_commands[Robot]()
     var nc = min(len(cl), LANES // 4)
     # host-filled: `step` uploads them (`talloc` on the device has no host list)
     var cmds = TensorImpl[DT].alloc(LANES * CMD)
@@ -284,7 +299,7 @@ def step_test[E: EvalEnv](mut e: E, mut tr: Trainer, cmd_of: List[Scalar[DT]], f
         var k = (l // 4) % nc
         for i in range(CMD):
             cmds.data[l * CMD + i] = cmd_of[k * CMD + i]
-        sm_spec_velocity[DT](
+        sm_spec_velocity[DT, Robot](
             specs.data.unsafe_ptr().unsafe_offset(l * SMSpec.SIZE).as_unsafe_any_origin(),
             Scalar[DT](cl[k].vx), Scalar[DT](cl[k].vy), Scalar[DT](cl[k].wz),
         )
@@ -328,6 +343,53 @@ def step_test[E: EvalEnv](mut e: E, mut tr: Trainer, cmd_of: List[Scalar[DT]], f
             per.append(sm_median(errs))
     print("median relative error", sm_median(per), "over", len(per), "commands (the paper: 0.16, distillation 0.49)")
     print("trials fallen", n_fall, "| commands fallen in every trial", all_fell)
+    _step_axes(cl, nc, mv, fell)
+
+
+def _step_axes(cl: List[SMStepCmd], nc: Int, mv: List[Float64], fell: List[Bool]):
+    """What the robot did against what one axis asked, the two others at zero:
+    the mean over the trials that stood, and how many fell. The median above
+    is over the whole grid, most of it large compound commands."""
+    print("--- single-axis commands: asked | did (vx vy wz), mean of the trials that stood | fell of 4")
+    for axis in range(3):
+        var ks = List[Int]()
+        for k in range(nc):
+            var c0 = cl[k].vx if axis == 0 else (cl[k].vy if axis == 1 else cl[k].wz)
+            var o1 = cl[k].vy if axis == 0 else cl[k].vx
+            var o2 = cl[k].wz if axis != 2 else cl[k].vy
+            if abs(c0) > 1e-6 and abs(o1) < 1e-6 and abs(o2) < 1e-6:
+                # the planes share their axes: keep the first lane block of each value
+                var seen = False
+                for q in range(len(ks)):
+                    var cq = cl[ks[q]].vx if axis == 0 else (cl[ks[q]].vy if axis == 1 else cl[ks[q]].wz)
+                    if abs(cq - c0) < 1e-9:
+                        seen = True
+                if not seen:
+                    ks.append(k)
+        for q in range(len(ks)):
+            var k = ks[q]
+            var m = List[Float64](length=3, fill=0.0)
+            var n = 0
+            var nf = 0
+            for tr_i in range(4):
+                var l = k * 4 + tr_i
+                if l >= LANES:
+                    continue
+                if fell[l]:
+                    nf += 1
+                    continue
+                for i in range(3):
+                    m[i] += mv[l * 3 + i]
+                n += 1
+            var d = Float64(max(n, 1))
+            var name = String("vx") if axis == 0 else (String("vy") if axis == 1 else String("wz"))
+            var c0 = cl[k].vx if axis == 0 else (cl[k].vy if axis == 1 else cl[k].wz)
+            print(" ", name, _r3(c0), "|", _r3(m[0] / d), _r3(m[1] / d), _r3(m[2] / d), "|", nf)
+
+
+def _r3(v: Float64) -> Float64:
+    """`v` to three decimals, for a table."""
+    return Float64(Int(v * 1000.0 + (0.5 if v >= 0.0 else -0.5))) / 1000.0
 
 
 def sm_step_velocity(s: Pointer[Scalar[DT], MutAnyOrigin]) -> Tuple[Float64, Float64, Float64]:
@@ -387,8 +449,8 @@ def _from_store(spec: String, max_clips: Int) raises -> SMMotionLibrary[Robot]:
         rows.resize(o + n_rows * D.S, 0)
         for i in range(n_rows * D.S):
             rows[o + i] = refc[i]
-    var q0 = List[Float64](length=G1_N_DOF, fill=0.0)
-    for j in range(G1_N_DOF):
+    var q0 = List[Float64](length=Robot.NDOF, fill=0.0)
+    for j in range(Robot.NDOF):
         q0[j] = Robot.default_joint_pos(j)
     return SMMotionLibrary[Robot](rows^, lens, q0)
 
@@ -410,13 +472,19 @@ def main() raises:
     var tracker = _opt(args, String("--tracker"), String(""))
     var prompt = _opt(args, String("--prompt"), String(""))
     var store = _opt(args, String("--store"), String(""))
-    var bank = Int(_opt(args, String("--bank"), String("4096" if PAPER else "64")))
+    var bank = Int(_opt(args, String("--bank"), String("4096" if BIG else "64")))
     var pool = Int(_opt(args, String("--pool"), String("131072")))
     var z_beta = Float64(_opt(args, String("--z-beta"), String("1")))
     var z_ess = Float64(_opt(args, String("--z-ess"), String("0")))
     var max_clips = Int(_opt(args, String("--max-clips"), String("0")))
     var do_suite = _flag(args, String("--suite")) or not _flag(args, String("--step-test"))
     var do_step = _flag(args, String("--step-test"))
+    comptime if BHL:
+        if _flag(args, String("--suite")):
+            raise Error("the suite is the G1's (its commands are metres on that body): on BHL only --step-test")
+        do_suite = False
+        do_step = True
+        print("Berkeley Humanoid Lite: effort", BHL_EFFORT_PCT, "% of BHL's, speed", BHL_SPEED_PCT, "% (the tracker must have trained at these)")
     if store == "":
         raise Error("give --store: z is computed over its frames")
     var lib = _from_store(store, max_clips)
@@ -432,18 +500,20 @@ def main() raises:
     var tr = Trainer(base^)
     if prompt != "":
         print("prompt interface at iteration", tr.load_state(prompt)[0])
-    var tasks = sm_eval_tasks[CMD](data)
+    var tasks = List[SMEvalTask]()
+    if do_suite:
+        tasks = sm_eval_tasks[CMD](data)
     # every step-test command as the interface reads it
-    var cl = sm_step_commands()
+    var cl = sm_step_commands[Robot]()
     var cmd_of = List[Scalar[DT]](length=len(cl) * CMD, fill=0)
     if do_step:
         var spec = List[Scalar[DT]](length=SMSpec.SIZE, fill=0)
         for k in range(len(cl)):
-            sm_spec_velocity[DT](spec.unsafe_ptr().as_unsafe_any_origin(), Scalar[DT](cl[k].vx), Scalar[DT](cl[k].vy), Scalar[DT](cl[k].wz))
+            sm_spec_velocity[DT, Robot](spec.unsafe_ptr().as_unsafe_any_origin(), Scalar[DT](cl[k].vx), Scalar[DT](cl[k].vy), Scalar[DT](cl[k].wz))
             comptime if VEL:
-                cmd_of[k * CMD] = Scalar[DT](cl[k].vx / 2.0)
-                cmd_of[k * CMD + 1] = Scalar[DT](cl[k].vy / 1.32)
-                cmd_of[k * CMD + 2] = Scalar[DT](cl[k].wz / 3.35)
+                cmd_of[k * CMD] = Scalar[DT](cl[k].vx / KB.VX_HI)
+                cmd_of[k * CMD + 1] = Scalar[DT](cl[k].vy / KB.VY)
+                cmd_of[k * CMD + 2] = Scalar[DT](cl[k].wz / KB.WZ)
             else:
                 _ = data.z_of(spec.unsafe_ptr().as_unsafe_any_origin(), cmd_of.unsafe_ptr().unsafe_offset(k * CMD).as_unsafe_any_origin())
     var stand = sm_stand_library[Robot](STAND_CLIPS, SM_E_SUITE_STEPS + 40, NOISE_AMP, root_z)

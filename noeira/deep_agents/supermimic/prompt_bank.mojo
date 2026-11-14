@@ -34,6 +34,10 @@ draw with too few matching frames (effective sample size below `SM_B_MIN_ESS`)
 has no z worth the name and is dropped. `sm_spec_held_out` keeps a whole region
 out of training for the zero-shot gate: walking with a hand placed.
 
+THE RANGES AND WIDTHS BELOW ARE THE G1'S; robot R's are `SMBankScale[R]`
+(`prompt.mojo`'s last note): speeds by `R.PROMPT_SPEED`, lengths by
+`R.PROMPT_LEN`, angles and yaw rates as they are.
+
 ⚠ SEED-derived when the library is: stays on private compute.
 """
 
@@ -47,7 +51,7 @@ from noeira.deep_agents.supermimic.config import SMConfigT
 from noeira.deep_agents.supermimic.kinematics import FP, sm_fk_lane
 from noeira.deep_agents.supermimic.lanes import sm_enc_in, talloc, tp
 from noeira.deep_agents.supermimic.motion_library import SMMotionLibrary
-from noeira.deep_agents.supermimic.prompt import SM_P_LEAN_DEFAULT, SMSpec, sm_prompt_atoms_lane, sm_spec_velocity
+from noeira.deep_agents.supermimic.prompt import SM_P_LEAN_DEFAULT, SMPromptScale, SMSpec, sm_prompt_atoms_lane, sm_spec_velocity
 from noeira.deep_agents.supermimic.robot import SMDims, TrackingRobot
 from noeira.deep_agents.supermimic.tables import SMTables
 from noeira.deep_agents.supermimic.trainer import SuperMimicTrainer
@@ -73,7 +77,24 @@ comptime SM_B_IW_H: Float64 = 156.25         # σ 0.08 m
 comptime SM_B_IW_TILT: Float64 = 44.44       # σ 0.15
 comptime SM_B_IW_HAND: Float64 = 44.44       # σ 0.15 m
 comptime SM_B_TASK_WEIGHT: Float64 = 4.0     # Σ w, Table A.6's
+comptime SM_B_H_LO: Float64 = 0.45           # the family's root heights: a deep crouch ..
+comptime SM_B_H_HI: Float64 = 0.82           # .. to just above the stand
+comptime SM_B_MOVING2: Float64 = 0.09        # above this squared speed (0.3 m/s) a held-out spec is "walking"
 comptime SM_POOL_MAGIC: StaticString = "SMPOOL01"   # `SMPromptData.save_pool`'s file
+
+
+struct SMBankScale[R: TrackingRobot]:
+    """The family's ranges and widths for robot R (the module's last note)."""
+    comptime VX_LO: Float64 = SM_B_VX_LO * Self.R.PROMPT_SPEED
+    comptime VX_HI: Float64 = SM_B_VX_HI * Self.R.PROMPT_SPEED
+    comptime VY: Float64 = SM_B_VY * Self.R.PROMPT_SPEED
+    comptime WZ: Float64 = SM_B_WZ
+    comptime H_LO: Float64 = SM_B_H_LO * Self.R.PROMPT_LEN
+    comptime H_HI: Float64 = SM_B_H_HI * Self.R.PROMPT_LEN
+    comptime IW_H: Float64 = SM_B_IW_H / (Self.R.PROMPT_LEN * Self.R.PROMPT_LEN)
+    comptime IW_HAND: Float64 = SM_B_IW_HAND / (Self.R.PROMPT_LEN * Self.R.PROMPT_LEN)
+    comptime IW_TILT: Float64 = SM_B_IW_TILT
+    comptime MOVING2: Float64 = SM_B_MOVING2 * (Self.R.PROMPT_SPEED * Self.R.PROMPT_SPEED)
 
 
 def _put_u64(mut b: List[UInt8], v: UInt64):
@@ -311,33 +332,34 @@ def _active(spec: FP[DT], g: Int) -> Bool:
     return spec[unsafe_offset=SMSpec.W + g] > 0
 
 
-def sm_spec_held_out(spec: FP[DT]) -> Bool:
+def sm_spec_held_out[R: TrackingRobot](spec: FP[DT]) -> Bool:
     """Walking with a hand placed: the region the zero-shot gate scores and
     training never sees."""
     var vx = spec[unsafe_offset=SMSpec.T + SMSpec.A_VX]
     var vy = spec[unsafe_offset=SMSpec.T + SMSpec.A_VY]
-    var moving = _active(spec, SMSpec.G_VEL) and vx * vx + vy * vy > Scalar[DT](0.09)
+    var moving = _active(spec, SMSpec.G_VEL) and vx * vx + vy * vy > Scalar[DT](SMBankScale[R].MOVING2)
     return moving and (_active(spec, SMSpec.G_LHAND) or _active(spec, SMSpec.G_RHAND))
 
 
-def _spec_velocity_part(spec: FP[DT]):
+def _spec_velocity_part[R: TrackingRobot](spec: FP[DT]):
+    comptime K = SMBankScale[R]
     var v = random_float64(0.0, 1.0)
-    var vx = 0.0 if v < 0.1 else random_float64(SM_B_VX_LO, SM_B_VX_HI)
-    var vy = 0.0 if v < 0.1 else random_float64(-SM_B_VY, SM_B_VY)
-    var wz = 0.0 if v < 0.1 else random_float64(-SM_B_WZ, SM_B_WZ)
+    var vx = 0.0 if v < 0.1 else random_float64(K.VX_LO, K.VX_HI)
+    var vy = 0.0 if v < 0.1 else random_float64(-K.VY, K.VY)
+    var wz = 0.0 if v < 0.1 else random_float64(-K.WZ, K.WZ)
     spec[unsafe_offset=SMSpec.T + SMSpec.A_VX] = Scalar[DT](vx)
     spec[unsafe_offset=SMSpec.T + SMSpec.A_VY] = Scalar[DT](vy)
     spec[unsafe_offset=SMSpec.T + SMSpec.A_WZ] = Scalar[DT](wz)
-    spec[unsafe_offset=SMSpec.IW + SMSpec.A_VX] = 4
-    spec[unsafe_offset=SMSpec.IW + SMSpec.A_VY] = 4
-    spec[unsafe_offset=SMSpec.IW + SMSpec.A_WZ] = 2
+    spec[unsafe_offset=SMSpec.IW + SMSpec.A_VX] = Scalar[DT](SMPromptScale[R].IW_V)
+    spec[unsafe_offset=SMSpec.IW + SMSpec.A_VY] = Scalar[DT](SMPromptScale[R].IW_V)
+    spec[unsafe_offset=SMSpec.IW + SMSpec.A_WZ] = Scalar[DT](SMPromptScale[R].IW_WZ)
     spec[unsafe_offset=SMSpec.W + SMSpec.G_VEL] = 1
     spec[unsafe_offset=SMSpec.W + SMSpec.G_YAW] = 1
 
 
-def _spec_height_part(spec: FP[DT]):
-    spec[unsafe_offset=SMSpec.T + SMSpec.A_H] = Scalar[DT](random_float64(0.45, 0.82))
-    spec[unsafe_offset=SMSpec.IW + SMSpec.A_H] = Scalar[DT](SM_B_IW_H)
+def _spec_height_part[R: TrackingRobot](spec: FP[DT]):
+    spec[unsafe_offset=SMSpec.T + SMSpec.A_H] = Scalar[DT](random_float64(SMBankScale[R].H_LO, SMBankScale[R].H_HI))
+    spec[unsafe_offset=SMSpec.IW + SMSpec.A_H] = Scalar[DT](SMBankScale[R].IW_H)
     spec[unsafe_offset=SMSpec.W + SMSpec.G_H] = 1
 
 
@@ -350,16 +372,16 @@ def _spec_tilt_part(spec: FP[DT]):
     spec[unsafe_offset=SMSpec.LEAN] = 0                       # it asks for what the lean price forbids
 
 
-def _spec_hand_part(spec: FP[DT], pool: FP[DT], f: Int, left: Bool):
+def _spec_hand_part[R: TrackingRobot](spec: FP[DT], pool: FP[DT], f: Int, left: Bool):
     var a0 = SMSpec.A_LX if left else SMSpec.A_RX
     var g = SMSpec.G_LHAND if left else SMSpec.G_RHAND
     for k in range(3):
         spec[unsafe_offset=SMSpec.T + a0 + k] = pool[unsafe_offset=f * SMSpec.ATOMS + a0 + k]
-        spec[unsafe_offset=SMSpec.IW + a0 + k] = Scalar[DT](SM_B_IW_HAND)
+        spec[unsafe_offset=SMSpec.IW + a0 + k] = Scalar[DT](SMBankScale[R].IW_HAND)
     spec[unsafe_offset=SMSpec.W + g] = 1
 
 
-def sm_draw_spec(spec: FP[DT], pool: FP[DT], n_pool: Int):
+def sm_draw_spec[R: TrackingRobot](spec: FP[DT], pool: FP[DT], n_pool: Int):
     """One reward from the family: velocity 35 %, posture 20 %, hands 20 %,
     compounds of two 25 %. Its group weights share `SM_B_TASK_WEIGHT`."""
     for k in range(SMSpec.SIZE):
@@ -368,30 +390,30 @@ def sm_draw_spec(spec: FP[DT], pool: FP[DT], n_pool: Int):
     var u = random_float64(0.0, 1.0)
     var f = Int(random_ui64(0, UInt64(n_pool - 1)))
     if u < 0.35:
-        _spec_velocity_part(spec)
+        _spec_velocity_part[R](spec)
     elif u < 0.55:
         var v = random_float64(0.0, 1.0)
         if v < 0.6:
-            _spec_height_part(spec)
+            _spec_height_part[R](spec)
         if v >= 0.4:
             _spec_tilt_part(spec)
     elif u < 0.75:
         var v = random_float64(0.0, 1.0)
         if v < 0.65:
-            _spec_hand_part(spec, pool, f, True)
+            _spec_hand_part[R](spec, pool, f, True)
         if v >= 0.35:
-            _spec_hand_part(spec, pool, f, False)
+            _spec_hand_part[R](spec, pool, f, False)
     else:
         var v = random_float64(0.0, 1.0)
         if v < 0.4:
-            _spec_velocity_part(spec)
-            _spec_height_part(spec)
+            _spec_velocity_part[R](spec)
+            _spec_height_part[R](spec)
         elif v < 0.7:
-            _spec_height_part(spec)
-            _spec_hand_part(spec, pool, f, random_float64(0.0, 1.0) < 0.5)
+            _spec_height_part[R](spec)
+            _spec_hand_part[R](spec, pool, f, random_float64(0.0, 1.0) < 0.5)
         else:
-            _spec_velocity_part(spec)
-            _spec_hand_part(spec, pool, f, random_float64(0.0, 1.0) < 0.5)
+            _spec_velocity_part[R](spec)
+            _spec_hand_part[R](spec, pool, f, random_float64(0.0, 1.0) < 0.5)
     var ng = 0
     for g in range(SMSpec.GROUPS):
         if _active(spec, g):
@@ -509,12 +531,13 @@ def _common[C: SMConfigT, CMD: Int](
     return d^
 
 
-def _fill_velocity[CMD: Int](mut d: SMPromptData[CMD], frames: Int, bank_n: Int):
+def _fill_velocity[R: TrackingRobot, CMD: Int](mut d: SMPromptData[CMD], frames: Int, bank_n: Int):
     """The paper's velocity interface (the positive control)."""
     comptime RW = CMD + SMSpec.SIZE
-    var sv = Scalar[DT](1.0 / SM_B_VX_HI)
-    var sy = Scalar[DT](1.0 / SM_B_VY)
-    var sw = Scalar[DT](1.0 / SM_B_WZ)
+    comptime K = SMBankScale[R]
+    var sv = Scalar[DT](1.0 / K.VX_HI)
+    var sy = Scalar[DT](1.0 / K.VY)
+    var sw = Scalar[DT](1.0 / K.WZ)
     for f in range(frames):
         d.cmd_ref.data[f * CMD] = d.vel_ref.data[f * 3] * sv
         d.cmd_ref.data[f * CMD + 1] = d.vel_ref.data[f * 3 + 1] * sy
@@ -522,13 +545,13 @@ def _fill_velocity[CMD: Int](mut d: SMPromptData[CMD], frames: Int, bank_n: Int)
     var bp = d.bank.data.unsafe_ptr().as_unsafe_any_origin()
     for k in range(bank_n):
         var u = random_float64(0.0, 1.0)
-        var vx = 0.0 if u < 0.1 else random_float64(SM_B_VX_LO, SM_B_VX_HI)
-        var vy = 0.0 if u < 0.1 else random_float64(-SM_B_VY, SM_B_VY)
-        var wz = 0.0 if u < 0.1 else random_float64(-SM_B_WZ, SM_B_WZ)
+        var vx = 0.0 if u < 0.1 else random_float64(K.VX_LO, K.VX_HI)
+        var vy = 0.0 if u < 0.1 else random_float64(-K.VY, K.VY)
+        var wz = 0.0 if u < 0.1 else random_float64(-K.WZ, K.WZ)
         d.bank.data[k * RW] = Scalar[DT](vx) * sv
         d.bank.data[k * RW + 1] = Scalar[DT](vy) * sy
         d.bank.data[k * RW + 2] = Scalar[DT](wz) * sw
-        sm_spec_velocity[DT](bp.unsafe_offset(k * RW + CMD), Scalar[DT](vx), Scalar[DT](vy), Scalar[DT](wz))
+        sm_spec_velocity[DT, R](bp.unsafe_offset(k * RW + CMD), Scalar[DT](vx), Scalar[DT](vy), Scalar[DT](wz))
 
 
 def _fill_z[R: TrackingRobot, CMD: Int](
@@ -578,8 +601,8 @@ def _fill_z[R: TrackingRobot, CMD: Int](
     var dropped_held = 0
     while k < bank_n:
         var row = bp.unsafe_offset(k * RW)
-        sm_draw_spec(row.unsafe_offset(CMD), pap, np)
-        if hold_out and sm_spec_held_out(row.unsafe_offset(CMD)):
+        sm_draw_spec[R](row.unsafe_offset(CMD), pap, np)
+        if hold_out and sm_spec_held_out[R](row.unsafe_offset(CMD)):
             dropped_held += 1
             continue
         var ess = d.z_of(row.unsafe_offset(CMD), row)
@@ -603,7 +626,7 @@ def sm_prompt_data[C: SMConfigT, CMD: Int](
     d.z_beta = z_beta
     d.z_ess = z_ess
     comptime if CMD == 3:
-        _fill_velocity[CMD](d, lib.num_frames, bank_n)
+        _fill_velocity[C.ROBOT, CMD](d, lib.num_frames, bank_n)
     else:
         comptime assert CMD == SMDims[C.ROBOT].LATENT, "CMD is 3 (velocity) or the latent's width (z)"
         _fill_z[C.ROBOT, CMD](d, lib, bank_n, pool_n, atoms, lat, hold_out)

@@ -208,7 +208,7 @@ def _batch() -> SMPromptBatch[R, CMD]:
     for t in range(H):
         for b in range(N):
             var sp = ib.specs.data.unsafe_ptr().unsafe_offset((t * N + b) * SMSpec.SIZE).as_unsafe_any_origin()
-            sm_spec_velocity[DT](sp, Scalar[DT](0.2 * Float64(b)), Scalar[DT](0.1), Scalar[DT](-0.2 + 0.1 * Float64(t)))
+            sm_spec_velocity[DT, R](sp, Scalar[DT](0.2 * Float64(b)), Scalar[DT](0.1), Scalar[DT](-0.2 + 0.1 * Float64(t)))
             sp[unsafe_offset=SMSpec.W + SMSpec.G_LHAND] = 0.5
             sp[unsafe_offset=SMSpec.T + SMSpec.A_LX + 2] = 0.3
             sp[unsafe_offset=SMSpec.IW + SMSpec.A_LX + 2] = 20
@@ -346,7 +346,7 @@ def main() raises:
     var hb = _ints(ctx, hold_h)
     var ocmd = talloc["gpu"](L * CMD, Optional(ctx))
     var ospec = talloc["gpu"](L * SMSpec.SIZE, Optional(ctx))
-    ctx.enqueue_function[_k_prompt_cmd[CMD]](
+    ctx.enqueue_function[_k_prompt_cmd[R, CMD]](
         Int64(L), Int64(2), Int64(250), Scalar[DT](0.5), UInt32(1234), Int64(KB),
         mptr(fb.unsafe_ptr()), mptr(eb.unsafe_ptr()), mptr(sb.unsafe_ptr()), mptr(hb.unsafe_ptr()),
         tp["gpu"](cmd_ref), tp["gpu"](vel_ref), tp["gpu"](bank), tp["gpu"](ocmd), tp["gpu"](ospec),

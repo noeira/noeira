@@ -187,7 +187,7 @@ def _k_post[R: TrackingRobot, QS: Int, VS: Int](
     var fl = flags[unsafe_offset=l]
     var terminated = abs(sc[unsafe_offset=SC.FEAT]) > Scalar[DT](SM_HEIGHT_TERM) or abs(sc[unsafe_offset=SC.FEAT + 1]) > Scalar[DT](SM_TILT_TERM)
     if l >= Int(prompt_from):
-        terminated = sm_prompt_fell[DT](sl)
+        terminated = sm_prompt_fell[DT, R](sl)
     var clip_end = (fl & LF_CLIP_END) != 0
     var ending = terminated or (max_steps > 0 and Int(el) >= Int(max_steps)) or clip_end
     for k in range(SM_N_TERMS):

@@ -354,7 +354,7 @@ def test_prompt_lanes(ctx: DeviceContext, stand: List[Scalar[DT]], mut tl: Tally
     _put_all(ctx, env, up)
     var specs = TensorImpl[DT].alloc(NL * SMSpec.SIZE)        # host-filled, then uploaded
     for l in range(NL):
-        sm_spec_velocity[DT](specs.data.unsafe_ptr().unsafe_offset(l * SMSpec.SIZE).as_unsafe_any_origin(), 0, 0, 0)
+        sm_spec_velocity[DT, R](specs.data.unsafe_ptr().unsafe_offset(l * SMSpec.SIZE).as_unsafe_any_origin(), 0, 0, 0)
     specs.upload_resident(ctx)
     var rb = SMReplayGpuOf[R](ctx, NL, 64)
     var a = _actions(ctx, _zeros())

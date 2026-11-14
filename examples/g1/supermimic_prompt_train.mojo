@@ -23,18 +23,28 @@ Three scales:
     pixi run -e nvidia mojo build -I . -D SM_GPU=2 -D SM_PAPER=1 examples/g1/supermimic_prompt_train.mojo -o smp_dev
     ./smp_dev --tracker final.ckpt --store stores/ --iters 100000 --out prompt.ckpt
 
+Another robot, another tracker size: `-D SM_BHL=1` is Berkeley Humanoid Lite
+(`-D BHL_EFFORT_PCT=` / `-D BHL_SPEED_PCT=` as the tracker was built), `-D
+SM_LIGHT=1` the light tracker's widths (`supermimic_train.mojo`). The build
+must be the tracker's: a checkpoint loads only into its own widths, and a
+tracker trained at 9 N·m is not the policy of a 6 N·m robot. The interface's
+lengths and speeds follow the robot (`prompt.mojo`'s `SMPromptScale`).
+
+    pixi run -e nvidia mojo build -I . -D SM_GPU=2 -D SM_BHL=1 -D SM_LIGHT=1 -D BHL_EFFORT_PCT=150 \\
+        examples/g1/supermimic_prompt_train.mojo -o smp_bhl
+
 Options
 -------
---tracker PATH  the tracker's checkpoint (paper widths; required with -D SM_PAPER=1)
+--tracker PATH  the tracker's checkpoint (required with -D SM_PAPER=1 or -D SM_LIGHT=1)
 --store PATH    a library store, a comma-separated list or a directory; none: synthetic
 --max-clips N   the first N clips (0 = all)
---bank K        command-bank rows (default 4096 at paper scale, 64 at smoke scale)
+--bank K        command-bank rows (default 4096 with a trained tracker, 64 at smoke scale)
 --pool P        frames of the pool z is computed over (default 131072)
 --z-beta B      z retrieves with r^B, the reward stays r (default 1); the eval must match
 --z-ess N       each reward sharpens as far as an effective sample size of N (default off)
 --no-hold-out   train on the held-out rewards too: G3's comparator, never a result
 --split S       lanes below S keep tracking (default half)
---align-warm U  updates at 100× the alignment's weight (default 2000 at paper scale)
+--align-warm U  updates at 100× the alignment's weight (default 2000 with a trained tracker)
 --resume PATH   go on from this run's checkpoint, up to --iters in all
 --iters N --log N --seed S --ckpt-every N --out PATH --no-noise
 
@@ -61,8 +71,9 @@ from noeira.deep_agents.supermimic.prompt_agent_gpu import SMPromptAgentGpu
 from noeira.deep_agents.supermimic.prompt_bank import sm_prompt_data
 from noeira.deep_agents.supermimic.prompt_policy import SMPromptConfig
 from noeira.deep_agents.supermimic.prompt_trainer import SMPromptTrainer
-from noeira.deep_agents.supermimic.robot import G1MjlabBatchedSim, G1MjlabRobot, SMDims
+from noeira.deep_agents.supermimic.robot import BhlBatchedSim, BhlRobot, G1MjlabBatchedSim, G1MjlabRobot, SMDims
 from noeira.deep_agents.supermimic.trainer import SuperMimicTrainer
+from noeira.envs.robots.berkeley_humanoid_lite_config import BHL_EFFORT_PCT, BHL_SPEED_PCT
 from noeira.envs.robots.unitree_g1_mjlab import UnitreeG1Mjlab
 from noeira.envs.robots.unitree_g1_pd import G1_N_DOF
 from noeira.nn.constants import DT
@@ -72,15 +83,29 @@ comptime MODE = get_defined_int["SM_GPU", 0]()       # 0 CPU, 2 all on the devic
 comptime TARGET: StaticString = "gpu" if MODE != 0 else "cpu"
 comptime PAPER = get_defined_int["SM_PAPER", 0]() != 0
 comptime VEL = get_defined_int["SM_PROMPT_VEL", 0]() != 0
-comptime Robot = G1MjlabRobot
+# the tracker's size: the paper's, the light one's (`supermimic_train.mojo`'s
+# -D SM_LIGHT=1: half-width networks), or the smoke scale
+comptime LIGHT = get_defined_int["SM_LIGHT", 0]() != 0 and not PAPER
+comptime BIG = PAPER or LIGHT
+comptime BHL = get_defined_int["SM_BHL", 0]() != 0
+comptime Robot = BhlRobot if BHL else G1MjlabRobot
+comptime RBatched[N: Int] = BhlBatchedSim[N] if BHL else G1MjlabBatchedSim[N]
+comptime NDOF = Robot.NDOF
 comptime C = SMConfig[
     TARGET, Robot,
-    2048 if PAPER else 128, 64 if PAPER else 64, 2048 if PAPER else 128, 1024 if PAPER else 64, 512 if PAPER else 64, 256 if PAPER else 32,
-    2048 if PAPER else 128, 1024 if PAPER else 64, 512 if PAPER else 64, 256 if PAPER else 32, 256 if PAPER else 64, 128 if PAPER else 32,
-    get_defined_int["SM_LANES", 4096 if PAPER else 8](), get_defined_int["SM_WM_BATCH", 2048 if PAPER else 16](), get_defined_int["SM_PI_BATCH", 2048 if PAPER else 16](), 32,
+    2048 if PAPER else (1024 if LIGHT else 128), 64,
+    2048 if PAPER else (1024 if LIGHT else 128), 1024 if PAPER else (512 if LIGHT else 64),
+    512 if PAPER else (256 if LIGHT else 64), 256 if PAPER else (128 if LIGHT else 32),
+    2048 if PAPER else (1024 if LIGHT else 128), 1024 if PAPER else (512 if LIGHT else 64),
+    512 if PAPER else (256 if LIGHT else 64), 256 if PAPER else (128 if LIGHT else 32),
+    256 if PAPER else (128 if LIGHT else 64), 128 if PAPER else (64 if LIGHT else 32),
+    get_defined_int["SM_LANES", 4096 if PAPER else (1024 if LIGHT else 8)](),
+    get_defined_int["SM_WM_BATCH", 2048 if PAPER else (1024 if LIGHT else 16)](),
+    get_defined_int["SM_PI_BATCH", 2048 if PAPER else (1024 if LIGHT else 16)](), 32,
 ]
 comptime CMD = 3 if VEL else SMDims[Robot].LATENT
-comptime P = SMPromptConfig[C, CMD, 256 if PAPER else 32, 256 if PAPER else 32, 256 if PAPER else 32, 128 if PAPER else 32]
+# the prompt encoder is the paper's at either tracker size: it is small beside the decoder
+comptime P = SMPromptConfig[C, CMD, 256 if BIG else 32, 256 if BIG else 32, 256 if BIG else 32, 128 if BIG else 32]
 
 
 def _opt(args: List[String], name: String, fallback: String) -> String:
@@ -98,13 +123,34 @@ def _flag(args: List[String], name: String) -> Bool:
 
 
 def _q0() -> List[Float64]:
-    var q0 = List[Float64](length=G1_N_DOF, fill=0.0)
-    for j in range(G1_N_DOF):
+    var q0 = List[Float64](length=NDOF, fill=0.0)
+    for j in range(NDOF):
         q0[j] = Robot.default_joint_pos(j)
     return q0^
 
 
-def _synthetic() raises -> SMMotionLibrary[Robot]:
+def _synthetic_bhl() raises -> SMMotionLibrary[Robot]:
+    """BHL at its stand, then two clips swaying its arms (joints 0..9) while it
+    drifts forward at its own speeds: smoke only, as `_synthetic_g1`."""
+    comptime S = SMDims[Robot].S
+    comptime QD = Robot.NQ + 6
+    var sim = Robot.SIM.create()
+    var lens: List[Int] = [300, 200]
+    var rows = List[Scalar[DT]](length=500 * S, fill=0)
+    for f in range(500):
+        var t = Float64(f) * 0.02
+        for k in range(Robot.NQ):
+            rows[f * S + k] = Scalar[DT](sim.qpos(k))
+        rows[f * S] += Scalar[DT](0.15 * t)
+        rows[f * S + Robot.NQ] = Scalar[DT](0.15 + 0.1 * sin(t))
+        for j in range(10):
+            var w = 1.5 + 0.1 * Float64(j)
+            rows[f * S + 7 + j] += Scalar[DT](0.3 * sin(w * t))
+            rows[f * S + QD + j] = Scalar[DT](0.3 * w * sin(w * t + 1.5707963267948966))
+    return SMMotionLibrary[Robot](rows^, lens, _q0())
+
+
+def _synthetic_g1() raises -> SMMotionLibrary[Robot]:
     """The G1 settled 0.2 s (mjlab's soft servos drop it by ~1.2 s under zero
     action), then two clips swaying arms and waist while it drifts forward:
     smoke only, but a library whose frames have some velocity."""
@@ -126,6 +172,13 @@ def _synthetic() raises -> SMMotionLibrary[Robot]:
             rows[f * 71 + 7 + j] += Scalar[DT](0.3 * sin(w * t))
             rows[f * 71 + 42 + j] = Scalar[DT](0.3 * w * sin(w * t + 1.5707963267948966))
     return SMMotionLibrary[Robot](rows^, lens, _q0())
+
+
+def _synthetic() raises -> SMMotionLibrary[Robot]:
+    comptime if BHL:
+        return _synthetic_bhl()
+    else:
+        return _synthetic_g1()
 
 
 def _store_paths(spec: String) raises -> List[String]:
@@ -180,19 +233,21 @@ def main() raises:
     var log_every = Int(_opt(args, String("--log"), String("10")))
     var seed_v = Int(_opt(args, String("--seed"), String("0")))
     var max_clips = Int(_opt(args, String("--max-clips"), String("0")))
-    var bank = Int(_opt(args, String("--bank"), String("4096" if PAPER else "64")))
+    var bank = Int(_opt(args, String("--bank"), String("4096" if BIG else "64")))
     var pool = Int(_opt(args, String("--pool"), String("131072")))
     var z_beta = Float64(_opt(args, String("--z-beta"), String("1")))
     var z_ess = Float64(_opt(args, String("--z-ess"), String("0")))
     var split = Int(_opt(args, String("--split"), String(C.LANES // 2)))
     var ckpt_every = Int(_opt(args, String("--ckpt-every"), String("0")))
-    var align_warm = Int(_opt(args, String("--align-warm"), String("2000" if PAPER else "0")))
+    var align_warm = Int(_opt(args, String("--align-warm"), String("2000" if BIG else "0")))
     var out_path = _opt(args, String("--out"), String(""))
     var resume = _opt(args, String("--resume"), String(""))
     var noise = not _flag(args, String("--no-noise"))
-    comptime if PAPER:
+    comptime if BIG:
         if tracker == "":
-            raise Error("paper widths need --tracker PATH")
+            raise Error("a trained tracker's widths need --tracker PATH")
+    comptime if BHL:
+        print("Berkeley Humanoid Lite: effort", BHL_EFFORT_PCT, "% of BHL's, speed", BHL_SPEED_PCT, "% (the tracker must have trained at these)")
 
     var lib = _from_store(store, max_clips) if store != "" else _synthetic()
     print("library:", lib.num_clips, "clips,", lib.num_frames, "frames")
@@ -217,7 +272,7 @@ def main() raises:
     var sched = sm_schedule[C](iters, noise, seed_v)
     print("prompt interface:", CMD, "-D command,", C.LANES - split, "of", C.LANES, "lanes, H =", C.HORIZON, ", batch", C.PI_BATCH)
     comptime if MODE == 2:
-        comptime Sim = G1MjlabBatchedSim[C.LANES]
+        comptime Sim = RBatched[C.LANES]
         var agent = SMPromptAgentGpu[P, Sim](ctx.value(), lib^, Sim.create(ctx.value()), tr^, data^, sched^, split)
         agent.align_warm = align_warm
         agent.resume(at_it, at_up)

@@ -27,6 +27,11 @@ fall. The paper reads 0.16 (RL encoder) and 0.49 (distillation).
 
 HONESTY (G1). The same lanes, the same commands, from the same states: H steps
 in the world model against H steps in the simulator.
+
+THE SUITE IS THE G1'S: its 22 commands, their heights and their widths are
+metres on that body, and the style reads the G1's arm joints. On another robot
+only the step test applies (`sm_step_commands[R]`, the grid over that robot's
+ranges); its falls are the env's (`sm_prompt_fell[R]`).
 """
 
 from std.builtin.sort import sort
@@ -40,7 +45,7 @@ from noeira.deep_agents.supermimic.kinematics import FP, sm_fk_lane
 from noeira.deep_agents.supermimic.motion_library import SMMotionLibrary
 from noeira.deep_agents.supermimic.prompt import SMSpec, SM_P_LEAN_DEFAULT, sm_prompt_atoms_lane, sm_spec_velocity
 from noeira.deep_agents.supermimic.prompt_bank import (
-    SM_B_IW_H, SM_B_IW_HAND, SM_B_IW_TILT, SM_B_TASK_WEIGHT, SM_B_VX_HI, SM_B_VX_LO, SM_B_VY, SM_B_WZ, SMPromptData,
+    SM_B_IW_H, SM_B_IW_HAND, SM_B_IW_TILT, SM_B_TASK_WEIGHT, SM_B_VX_HI, SM_B_VY, SM_B_WZ, SMBankScale, SMPromptData,
 )
 from noeira.deep_agents.supermimic.robot import SMDims, TrackingRobot
 from noeira.deep_agents.supermimic.tables import SMTables
@@ -355,18 +360,20 @@ struct SMStepCmd(Copyable, Movable):
     var wz: Float64
 
 
-def sm_step_commands() -> List[SMStepCmd]:
+def sm_step_commands[R: TrackingRobot]() -> List[SMStepCmd]:
     """Appendix G.2's 672: a 15 × 15 grid on each of three planes of the
-    uniform ranges, the third component zero, the standing command left out."""
+    uniform ranges (robot R's), the third component zero, the standing command
+    left out."""
+    comptime K = SMBankScale[R]
     var out = List[SMStepCmd]()
     for i in range(15):
         for j in range(15):
             var u = Float64(i) / 14.0
             var v = Float64(j) / 14.0
-            var vx = SM_B_VX_LO + u * (SM_B_VX_HI - SM_B_VX_LO)
-            var vy_v = -SM_B_VY + v * 2.0 * SM_B_VY
-            var vy_u = -SM_B_VY + u * 2.0 * SM_B_VY
-            var wz = -SM_B_WZ + v * 2.0 * SM_B_WZ
+            var vx = K.VX_LO + u * (K.VX_HI - K.VX_LO)
+            var vy_v = -K.VY + v * 2.0 * K.VY
+            var vy_u = -K.VY + u * 2.0 * K.VY
+            var wz = -K.WZ + v * 2.0 * K.WZ
             var plane: List[SMStepCmd] = [SMStepCmd(vx, vy_v, 0.0), SMStepCmd(vx, 0.0, wz), SMStepCmd(0.0, vy_u, wz)]
             for k in range(3):
                 ref c = plane[k]

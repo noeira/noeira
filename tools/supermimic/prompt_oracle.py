@@ -6,6 +6,7 @@
 
     uv run --no-project --python 3.12 --with mujoco==3.12.0 --with numpy \\
         python tools/supermimic/prompt_oracle.py --out /tmp/sm_prompt
+    ... --robot bhl --out /tmp/sm_prompt_bhl      # Berkeley Humanoid Lite (the test's -D TEST_BHL=1)
 
 An independent second implementation of `deep_agents/supermimic/prompt.mojo`:
 numpy for the formulas (transcribed from its docstring and the paper's Table
@@ -18,8 +19,13 @@ The reproduction has no prompt or velocity interface, so there is no reference
 to run verbatim: this oracle pins the DEFINITION. Its gradient is gated in the
 test against central differences of the forward this oracle checks.
 
-Written (float64, 2-D `.npy`, B rows):
-    p_s [B, 71], p_a [B, 29], p_ap [B, 29], p_xi [B, 33], p_spec [B, 31]
+THE FALL RULE IS PER ROBOT. Table A.6's 0.35 m is a height on the G1, whose
+root stands at 0.78 m; Berkeley Humanoid Lite's stands at 0.50 m, so its rule is
+0.64 of the G1's: 0.224 m, with a width of 0.0128 m instead of 0.02 m. Both
+pairs are written here as numbers, not derived from the port's scale.
+
+Written (float64, 2-D `.npy`, B rows; n joints: 29 on the G1, 22 on BHL):
+    p_s [B, 13 + 2n], p_a [B, n], p_ap [B, n], p_xi [B, n + 4], p_spec [B, 31]
     p_atoms [B, 12], p_r [B, 1], p_logit [B, 1]
     p_hands [1, 2]      the hands' FK rows (body id − 1)
 """
@@ -31,7 +37,12 @@ import mujoco
 import numpy as np
 
 REPO = Path(__file__).resolve().parents[2]
-XML = REPO / "noeira/envs/robots/assets/unitree_g1_mjlab.xml"
+# xml, left hand, right hand, the reward's anchor body, soft-limit factor,
+# fall height and its width (m), the root heights the lanes are drawn over
+ROBOTS = {
+    "g1": ("noeira/envs/robots/assets/unitree_g1_mjlab.xml", "left_wrist_yaw_link", "right_wrist_yaw_link", "torso_link", 0.9, 0.35, 0.02, (0.2, 1.0)),
+    "bhl": ("noeira/envs/robots/assets/berkeley_humanoid_lite.xml", "arm_left_hand_link", "arm_right_hand_link", "base", 0.9, 0.224, 0.0128, (0.1, 0.7)),
+}
 
 GROUPS = [(0, 2), (2, 3), (3, 4), (4, 6), (6, 9), (9, 12)]  # vel, yaw, height, tilt, left hand, right hand
 DT = 0.02
@@ -71,24 +82,29 @@ def main():
     ap.add_argument("--out", required=True)
     ap.add_argument("--lanes", type=int, default=256)
     ap.add_argument("--seed", type=int, default=7)
+    ap.add_argument("--robot", choices=sorted(ROBOTS), default="g1")
     a = ap.parse_args()
     out = Path(a.out)
     out.mkdir(parents=True, exist_ok=True)
-    m = mujoco.MjModel.from_xml_path(str(XML))
+    xml, left, right, anchor, soft, fall_h, fall_tau, heights = ROBOTS[a.robot]
+    m = mujoco.MjModel.from_xml_path(str(REPO / xml))
     d = mujoco.MjData(m)
-    hl = mujoco.mj_name2id(m, mujoco.mjtObj.mjOBJ_BODY, "left_wrist_yaw_link")
-    hr = mujoco.mj_name2id(m, mujoco.mjtObj.mjOBJ_BODY, "right_wrist_yaw_link")
-    tb = mujoco.mj_name2id(m, mujoco.mjtObj.mjOBJ_BODY, "torso_link")
+    hl = mujoco.mj_name2id(m, mujoco.mjtObj.mjOBJ_BODY, left)
+    hr = mujoco.mj_name2id(m, mujoco.mjtObj.mjOBJ_BODY, right)
+    tb = mujoco.mj_name2id(m, mujoco.mjtObj.mjOBJ_BODY, anchor)
+    assert min(hl, hr, tb) > 0, "a body name did not resolve"
+    n = m.nq - 7
+    assert m.nv == n + 6 and m.njnt == n + 1, "expected one free joint, then hinges"
     lo = m.jnt_range[1:, 0]
     hi = m.jnt_range[1:, 1]
-    mid, half = (lo + hi) / 2, (hi - lo) / 2 * 0.9
+    mid, half = (lo + hi) / 2, (hi - lo) / 2 * soft
     slo, shi = mid - half, mid + half
     rng = np.random.default_rng(a.seed)
     B = a.lanes
-    S = np.zeros((B, 71))
-    A = rng.normal(0, 0.5, (B, 29))
-    AP = rng.normal(0, 0.5, (B, 29))
-    XI = rng.normal(0, 0.05, (B, 33))
+    S = np.zeros((B, 13 + 2 * n))
+    A = rng.normal(0, 0.5, (B, n))
+    AP = rng.normal(0, 0.5, (B, n))
+    XI = rng.normal(0, 0.05, (B, n + 4))
     SPEC = np.zeros((B, 31))
     ATOMS = np.zeros((B, 12))
     R = np.zeros((B, 1))
@@ -102,11 +118,11 @@ def main():
         q = np.r_[np.cos(ang / 2), np.sin(ang / 2) * axis]
         yaw = rng.uniform(-3.1, 3.1)
         q = qmul(np.array([np.cos(yaw / 2), 0, 0, np.sin(yaw / 2)]), q)
-        p = np.r_[rng.uniform(-2, 2, 2), rng.uniform(0.2, 1.0)]
+        p = np.r_[rng.uniform(-2, 2, 2), rng.uniform(*heights)]
         qj = rng.uniform(lo - 0.05, hi + 0.05)          # some lanes past the soft limits
         v = rng.normal(0, 1.0, 3)
         w = rng.normal(0, 1.5, 3)                       # body frame
-        qd = rng.normal(0, 2.0, 29)
+        qd = rng.normal(0, 2.0, n)
         d.qpos[:] = np.r_[p, q, qj]
         d.qvel[:] = np.r_[v, w, qd]
         mujoco.mj_kinematics(m, d)
@@ -140,7 +156,7 @@ def main():
         SPEC[b] = spec
         ATOMS[b] = at
         R[b, 0] = reward
-        LG[b, 0] = max((0.35 - p[2]) / 0.02, (1 + g[2] - 0.7) / 0.05)
+        LG[b, 0] = max((fall_h - p[2]) / fall_tau, (1 + g[2] - 0.7) / 0.05)
     np.save(out / "p_s.npy", S)
     np.save(out / "p_a.npy", A)
     np.save(out / "p_ap.npy", AP)
@@ -150,7 +166,7 @@ def main():
     np.save(out / "p_r.npy", R)
     np.save(out / "p_logit.npy", LG)
     np.save(out / "p_hands.npy", np.array([[hl - 1, hr - 1]], dtype=np.float64))
-    print("wrote", B, "lanes to", out)
+    print("wrote", B, "lanes of", a.robot, "to", out)
 
 
 if __name__ == "__main__":

@@ -41,6 +41,13 @@ survival chain applies unchanged:
 
 At the stand it is about −21 and the survival is flat; at 0.45 m about −5.
 
+THE NUMBERS ABOVE ARE THE G1'S. A robot half its size falls at another height
+and walks at other speeds, and a kernel 0.5 m/s wide cannot tell its walk from
+its stand: `SMPromptScale[R]` scales the lengths (the fall height and its
+width) by `R.PROMPT_LEN` and the velocity kernel's width by `R.PROMPT_SPEED`.
+Both are 1 on the G1, where every number is Table A.6's bit for bit. The yaw
+kernel and the tilt rule are angles: they do not scale.
+
 Pointer-in / pointer-out, no allocation, no Float64 at runtime: the bodies of
 GPU kernels (`lanes.mojo`'s rules). Scratch sizes are `SMPromptScratch[R]`.
 """
@@ -64,6 +71,18 @@ comptime SM_P_FALL_H: Float64 = 0.35
 comptime SM_P_FALL_TILT: Float64 = 0.7
 comptime SM_P_FALL_TAU_H: Float64 = 0.02
 comptime SM_P_FALL_TAU_TILT: Float64 = 0.05
+comptime SM_P_IW_V: Float64 = 4.0            # Table A.6's velocity kernel, 1 / 0.5², on the G1
+comptime SM_P_IW_WZ: Float64 = 2.0           # its yaw kernel, 1 / 0.5
+
+
+struct SMPromptScale[R: TrackingRobot]:
+    """Table A.6's lengths and speeds for robot R (the module's last note)."""
+    comptime LEN: Float64 = Self.R.PROMPT_LEN
+    comptime SPEED: Float64 = Self.R.PROMPT_SPEED
+    comptime FALL_H: Float64 = SM_P_FALL_H * Self.R.PROMPT_LEN
+    comptime FALL_TAU_H: Float64 = SM_P_FALL_TAU_H * Self.R.PROMPT_LEN
+    comptime IW_V: Float64 = SM_P_IW_V / (Self.R.PROMPT_SPEED * Self.R.PROMPT_SPEED)
+    comptime IW_WZ: Float64 = SM_P_IW_WZ
 
 
 struct SMSpec:
@@ -104,16 +123,17 @@ def sm_spec_group(a: Int) -> Int:
 
 
 @always_inline
-def sm_spec_velocity[dt: DType](spec: FP[dt], vx: Scalar[dt], vy: Scalar[dt], wz: Scalar[dt]):
-    """Table A.6 for the command (vx, vy, wz): writes the whole spec."""
+def sm_spec_velocity[dt: DType, R: TrackingRobot](spec: FP[dt], vx: Scalar[dt], vy: Scalar[dt], wz: Scalar[dt]):
+    """Table A.6 for the command (vx, vy, wz) on robot R: writes the whole spec."""
+    comptime K = SMPromptScale[R]
     for k in range(SMSpec.SIZE):
         spec[unsafe_offset=k] = 0
     spec[unsafe_offset=SMSpec.T + SMSpec.A_VX] = vx
     spec[unsafe_offset=SMSpec.T + SMSpec.A_VY] = vy
     spec[unsafe_offset=SMSpec.T + SMSpec.A_WZ] = wz
-    spec[unsafe_offset=SMSpec.IW + SMSpec.A_VX] = 4         # 1 / 0.5²
-    spec[unsafe_offset=SMSpec.IW + SMSpec.A_VY] = 4
-    spec[unsafe_offset=SMSpec.IW + SMSpec.A_WZ] = 2         # 1 / 0.5
+    spec[unsafe_offset=SMSpec.IW + SMSpec.A_VX] = Scalar[dt](K.IW_V)     # 1 / 0.5² on the G1
+    spec[unsafe_offset=SMSpec.IW + SMSpec.A_VY] = Scalar[dt](K.IW_V)
+    spec[unsafe_offset=SMSpec.IW + SMSpec.A_WZ] = Scalar[dt](K.IW_WZ)    # 1 / 0.5
     spec[unsafe_offset=SMSpec.W + SMSpec.G_VEL] = 2
     spec[unsafe_offset=SMSpec.W + SMSpec.G_YAW] = 2
     spec[unsafe_offset=SMSpec.LEAN] = Scalar[dt](SM_P_LEAN_DEFAULT)
@@ -213,17 +233,18 @@ def _task[dt: DType](atoms: FP[dt], spec: FP[dt]) -> Scalar[dt] where dt.is_floa
 
 
 @always_inline
-def sm_prompt_fall_logit[dt: DType](s: FP[dt]) -> Scalar[dt] where dt.is_floating_point():
+def sm_prompt_fall_logit[dt: DType, R: TrackingRobot](s: FP[dt]) -> Scalar[dt] where dt.is_floating_point():
+    comptime K = SMPromptScale[R]
     var uz = qapply_inv(_q4(s, 3), _grav[dt]())[2]
-    var x0 = (Scalar[dt](SM_P_FALL_H) - _at(s, 2)) / Scalar[dt](SM_P_FALL_TAU_H)
+    var x0 = (Scalar[dt](K.FALL_H) - _at(s, 2)) / Scalar[dt](K.FALL_TAU_H)
     var x1 = (Scalar[dt](1) + uz - Scalar[dt](SM_P_FALL_TILT)) / Scalar[dt](SM_P_FALL_TAU_TILT)
     return max(x0, x1)
 
 
 @always_inline
-def sm_prompt_fell[dt: DType](s: FP[dt]) -> Bool where dt.is_floating_point():
+def sm_prompt_fell[dt: DType, R: TrackingRobot](s: FP[dt]) -> Bool where dt.is_floating_point():
     """Table A.6's termination: the sign of the fall logit."""
-    return sm_prompt_fall_logit[dt](s) > 0
+    return sm_prompt_fall_logit[dt, R](s) > 0
 
 
 # ── forward ─────────────────────────────────────────────────────────────────
@@ -283,6 +304,7 @@ def sm_prompt_reward_vjp_lane[dt: DType, R: TrackingRobot](
     comptime D = SMDims[R]
     comptime L = SMHeadLayout[R]
     comptime SC = SMPromptScratch[R]
+    comptime K = SMPromptScale[R]
     var pos = scratch
     var quat = scratch.unsafe_offset(D.NB * 3)
     var ang = scratch.unsafe_offset(D.NB * 10)
@@ -339,12 +361,12 @@ def sm_prompt_reward_vjp_lane[dt: DType, R: TrackingRobot](
 
     # the fall logit, whichever branch `max` took
     var uzr = qapply_inv(q, _grav[dt]())[2]
-    var x0 = (Scalar[dt](SM_P_FALL_H) - _at(s, 2)) / Scalar[dt](SM_P_FALL_TAU_H)
+    var x0 = (Scalar[dt](K.FALL_H) - _at(s, 2)) / Scalar[dt](K.FALL_TAU_H)
     var x1 = (Scalar[dt](1) + uzr - Scalar[dt](SM_P_FALL_TILT)) / Scalar[dt](SM_P_FALL_TAU_TILT)
     var gh = gat[unsafe_offset=SMSpec.A_H]
     var ggz = Scalar[dt](0)
     if x0 >= x1:
-        gh -= g_lg / Scalar[dt](SM_P_FALL_TAU_H)
+        gh -= g_lg / Scalar[dt](K.FALL_TAU_H)
     else:
         ggz = g_lg / Scalar[dt](SM_P_FALL_TAU_TILT)
 

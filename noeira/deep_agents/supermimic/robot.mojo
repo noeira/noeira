@@ -211,6 +211,12 @@ trait TrackingRobot:
     comptime NJOINT: Int
     comptime N_TRACKED: Int
     comptime SIM: TrackingSim
+    # The prompt interface's scale (`prompt.mojo`'s `SMPromptScale`), in the
+    # G1's units: its lengths (the root's height at the stand over the G1's
+    # 0.78 m) and its speeds (the fastest walking the robot has data for over
+    # the G1's 2 m/s). 1 and 1 leave every number of the G1's interface as it is.
+    comptime PROMPT_LEN: Float64
+    comptime PROMPT_SPEED: Float64
 
     @staticmethod
     def mjcf_path() -> String:
@@ -485,6 +491,8 @@ struct G1Robot(TrackingRobot):
     comptime NJOINT = UnitreeG1[DType.float64].NJOINT
     comptime N_TRACKED = 14
     comptime SIM = G1Sim
+    comptime PROMPT_LEN: Float64 = 1.0
+    comptime PROMPT_SPEED: Float64 = 1.0
 
     @staticmethod
     def mjcf_path() -> String:
@@ -722,6 +730,8 @@ struct G1MjlabRobot(TrackingRobot):
     comptime NJOINT = UnitreeG1Mjlab[DType.float64].NJOINT
     comptime N_TRACKED = 14
     comptime SIM = G1MjlabSim
+    comptime PROMPT_LEN: Float64 = 1.0
+    comptime PROMPT_SPEED: Float64 = 1.0
 
     @staticmethod
     def mjcf_path() -> String:
@@ -877,6 +887,8 @@ struct G1MjlabBoxRobot(TrackingRobot):
     comptime NJOINT = UnitreeG1Mjlab[DType.float64].NJOINT
     comptime N_TRACKED = 14
     comptime SIM = G1MjlabBoxSim
+    comptime PROMPT_LEN: Float64 = 1.0
+    comptime PROMPT_SPEED: Float64 = 1.0
 
     @staticmethod
     def mjcf_path() -> String:
@@ -1098,6 +1110,10 @@ struct BhlRobot(TrackingRobot):
     comptime NJOINT = BerkeleyHumanoidLite[DType.float64].NJOINT
     comptime N_TRACKED = 13
     comptime SIM = BhlSim
+    # the root stands at 0.50 m (the G1's at 0.78); the retargeted clips walk
+    # at about half the G1's speeds (2,000 SEED clips: 99 % of them under 1.05 m/s)
+    comptime PROMPT_LEN: Float64 = 0.64
+    comptime PROMPT_SPEED: Float64 = 0.5
 
     @staticmethod
     def mjcf_path() -> String:

@@ -48,7 +48,7 @@ comptime FPi = Pointer[Int32, MutAnyOrigin]
 comptime _TPB: Int = 64
 
 
-def _k_prompt_cmd[CMD: Int](
+def _k_prompt_cmd[R: TrackingRobot, CMD: Int](
     nl: Int64, split: Int64, hold_steps: Int64, ref_share: Scalar[DT], seed: UInt32, bank_n: Int64,
     frame: FPi, ep_len: FPi, src: FPi, hold: FPi,
     cmd_ref: FP[DT], vel_ref: FP[DT], bank: FP[DT], cmds: FP[DT], specs: FP[DT],
@@ -71,7 +71,7 @@ def _k_prompt_cmd[CMD: Int](
     if s < 0:
         for k in range(CMD):
             cmds[unsafe_offset=l * CMD + k] = cmd_ref[unsafe_offset=f * CMD + k]
-        sm_spec_velocity[DT](
+        sm_spec_velocity[DT, R](
             specs.unsafe_offset(l * SMSpec.SIZE), vel_ref[unsafe_offset=f * 3], vel_ref[unsafe_offset=f * 3 + 1], vel_ref[unsafe_offset=f * 3 + 2],
         )
     else:
@@ -117,7 +117,7 @@ def _k_prompt_start[R: TrackingRobot, CMD: Int](
             for k in range(CMD):
                 cmds[unsafe_offset=(t * N + b) * CMD + k] = cmd_ref[unsafe_offset=f * CMD + k]
             if t < H:
-                sm_spec_velocity[DT](
+                sm_spec_velocity[DT, R](
                     specs.unsafe_offset((t * N + b) * SMSpec.SIZE), vel_ref[unsafe_offset=f * 3], vel_ref[unsafe_offset=f * 3 + 1], vel_ref[unsafe_offset=f * 3 + 2],
                 )
                 for k in range(LAT):
@@ -253,7 +253,7 @@ struct SMPromptAgentGpu[P: SMPromptConfigT, BS: TrackingBatchedSim](Movable):
     def _commands(mut self) raises:
         comptime L = Self.P.BASE.LANES
         var ctx = self.ctx
-        ctx.enqueue_function[_k_prompt_cmd[Self.P.CMD]](
+        ctx.enqueue_function[_k_prompt_cmd[Self.P.BASE.ROBOT, Self.P.CMD]](
             Int64(L), Int64(self.split), Int64(Self.P.DEF_HOLD), Scalar[DT](Self.P.DEF_REF_SHARE),
             UInt32(random_ui64(1, 0xFFFFFFFF)), Int64(self.data.bank_n),
             mptr(self.env.frame.unsafe_ptr()), mptr(self.env.ep_len.unsafe_ptr()), mptr(self.src.unsafe_ptr()), mptr(self.hold.unsafe_ptr()),

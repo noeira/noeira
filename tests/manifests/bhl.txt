@@ -6,3 +6,8 @@ tests/robots/test_berkeley_humanoid_lite_vs_mujoco.mojo
 # hhtools trajectories -> SuperMimic's library rows. Fixtures first:
 #   pixi run python tools/supermimic/retarget_oracle.py --out /tmp/retarget_synth
 tests/data/test_retarget_csv.mojo /tmp/retarget_synth
+# The prompt interface's reward on BHL (its own fall height and velocity width,
+# `prompt.mojo`'s `SMPromptScale`). The manifest runner passes no -D, so this
+# leg is run by hand; the G1's leg is in g1.txt:
+#   pixi run python tools/supermimic/prompt_oracle.py --robot bhl --out /tmp/sm_prompt_bhl
+#   pixi run mojo run -I . -D TEST_BHL=1 tests/deep_agents/supermimic/test_supermimic_prompt.mojo /tmp/sm_prompt_bhl

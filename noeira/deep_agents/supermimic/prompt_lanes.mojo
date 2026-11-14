@@ -161,7 +161,7 @@ def _p_step_lane[R: TrackingRobot](
             if hw > 0:
                 var u = sm_hash_u01(seed, UInt32(((t * nb + b) * D.OBS + k)))
                 obs[unsafe_offset=k] += (Scalar[DT](2) * Scalar[DT](u) - 1) * hw
-    lg[unsafe_offset=b] = sm_prompt_fall_logit[DT](s1)
+    lg[unsafe_offset=b] = sm_prompt_fall_logit[DT, R](s1)
 
 
 def _k_p_step[R: TrackingRobot](

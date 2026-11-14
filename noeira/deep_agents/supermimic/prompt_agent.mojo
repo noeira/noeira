@@ -132,7 +132,7 @@ struct SMPromptAgent[P: SMPromptConfigT](Movable):
             if self.src[l] < 0:
                 for k in range(CMD):
                     cmds.data[l * CMD + k] = self.data.cmd_ref.data[f * CMD + k]
-                sm_spec_velocity[DT](
+                sm_spec_velocity[DT, Self.P.BASE.ROBOT](
                     sp.unsafe_offset(l * SMSpec.SIZE), self.data.vel_ref.data[f * 3], self.data.vel_ref.data[f * 3 + 1], self.data.vel_ref.data[f * 3 + 2],
                 )
             else:
@@ -210,7 +210,7 @@ struct SMPromptAgent[P: SMPromptConfigT](Movable):
                     for k in range(CMD):
                         ib.cmds.data[(t * BP + b) * CMD + k] = self.data.cmd_ref.data[f * CMD + k]
                     if t < H:
-                        sm_spec_velocity[DT](
+                        sm_spec_velocity[DT, Self.P.BASE.ROBOT](
                             sp.unsafe_offset((t * BP + b) * SMSpec.SIZE), self.data.vel_ref.data[f * 3],
                             self.data.vel_ref.data[f * 3 + 1], self.data.vel_ref.data[f * 3 + 2],
                         )

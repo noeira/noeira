@@ -491,7 +491,7 @@ struct SMTrackingEnv[R: TrackingRobot](Movable):
             var prompt_lane = i >= self.prompt_from
             var violated = abs(Float64(feat[0])) > SM_HEIGHT_TERM or abs(Float64(feat[1])) > SM_TILT_TERM
             if prompt_lane:
-                violated = sm_prompt_fell[DT](ln.s.unsafe_ptr().as_unsafe_any_origin())
+                violated = sm_prompt_fell[DT, Self.R](ln.s.unsafe_ptr().as_unsafe_any_origin())
                 if specs:
                     self.last_prompt_r[i] = Float64(sm_prompt_reward_lane[DT, Self.R](
                         self.tables.tree_ptr(), self.tables.head_ptr(), ln.s.unsafe_ptr().as_unsafe_any_origin(),

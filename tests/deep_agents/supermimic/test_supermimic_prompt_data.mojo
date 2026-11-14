@@ -229,7 +229,7 @@ def main() raises:
     var seen_held = 0
     var seen_kept = 0
     for _ in range(2000):
-        sm_draw_spec(sp, pa.unsafe_ptr().as_unsafe_any_origin(), NP)
+        sm_draw_spec[R](sp, pa.unsafe_ptr().as_unsafe_any_origin(), NP)
         var sw = 0.0
         for g in range(SMSpec.GROUPS):
             sw += Float64(spec[SMSpec.W + g])
@@ -238,7 +238,7 @@ def main() raises:
             lean_ok = lean_ok and spec[SMSpec.LEAN] == 0
         else:
             lean_ok = lean_ok and spec[SMSpec.LEAN] == 4
-        if sm_spec_held_out(sp):
+        if sm_spec_held_out[R](sp):
             seen_held += 1
         else:
             seen_kept += 1
@@ -251,9 +251,9 @@ def main() raises:
     spec[SMSpec.W + SMSpec.G_VEL] = 1
     spec[SMSpec.W + SMSpec.G_LHAND] = 1
     spec[SMSpec.T + SMSpec.A_VX] = 1
-    t.truth(sm_spec_held_out(sp), "walking with a hand placed is held out")
+    t.truth(sm_spec_held_out[R](sp), "walking with a hand placed is held out")
     spec[SMSpec.T + SMSpec.A_VX] = 0
-    t.truth(not sm_spec_held_out(sp), "standing with a hand placed is not")
+    t.truth(not sm_spec_held_out[R](sp), "standing with a hand placed is not")
 
     print("\n[5] a prompt lane on the CPU env")
     # the reference floats 0.5 m above the start pose: a tracking failure at once
@@ -275,7 +275,7 @@ def main() raises:
         env.lanes[l].read_state()
     var acts = List[Scalar[DT]](length=2 * D.NDOF, fill=0)
     var specs = List[Scalar[DT]](length=2 * SMSpec.SIZE, fill=0)
-    sm_spec_velocity[DT](specs.unsafe_ptr().unsafe_offset(SMSpec.SIZE).as_unsafe_any_origin(), 0, 0, 0)
+    sm_spec_velocity[DT, R](specs.unsafe_ptr().unsafe_offset(SMSpec.SIZE).as_unsafe_any_origin(), 0, 0, 0)
     var g0 = _g(env)
     _ = env.step(acts, rb, specs.unsafe_ptr().as_unsafe_any_origin())
     t.truth(env.last_terminated[0], "a tracking error ends a tracker lane")
@@ -381,7 +381,7 @@ def main() raises:
     var same_z = True
     var moved = False
     for c in range(3):
-        sm_spec_velocity[DT](spec8.unsafe_ptr().as_unsafe_any_origin(), Scalar[DT](asks[3 * c]), Scalar[DT](asks[3 * c + 1]), Scalar[DT](asks[3 * c + 2]))
+        sm_spec_velocity[DT, R](spec8.unsafe_ptr().as_unsafe_any_origin(), Scalar[DT](asks[3 * c]), Scalar[DT](asks[3 * c + 1]), Scalar[DT](asks[3 * c + 2]))
         for k in range(ZW):
             za[k] = 0
             zb[k] = 0

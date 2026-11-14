@@ -109,7 +109,7 @@ def _batch(mut tb: SMTables[DT]) -> SMPromptBatch[R, CMD]:
     for t in range(H):
         for b in range(N):
             var sp = ib.specs.data.unsafe_ptr().unsafe_offset((t * N + b) * SMSpec.SIZE).as_unsafe_any_origin()
-            sm_spec_velocity[DT](sp, Scalar[DT](0.3 * Float64(b)), Scalar[DT](0.1), Scalar[DT](-0.2 + 0.1 * Float64(t)))
+            sm_spec_velocity[DT, R](sp, Scalar[DT](0.3 * Float64(b)), Scalar[DT](0.1), Scalar[DT](-0.2 + 0.1 * Float64(t)))
             sp[unsafe_offset=SMSpec.W + SMSpec.G_H] = 1
             sp[unsafe_offset=SMSpec.T + SMSpec.A_H] = 0.7
             sp[unsafe_offset=SMSpec.IW + SMSpec.A_H] = 40
@@ -236,7 +236,7 @@ def main() raises:
             var spec = ib.specs.data.unsafe_ptr().unsafe_offset((st * N + b) * SMSpec.SIZE).as_unsafe_any_origin()
             var rew = sm_prompt_reward_lane[DT, R](tb.tree_ptr(), tb.head_ptr(), s1, tp["cpu"](a), tp["cpu"](ap), spec, spc)
             sm_observation_lane[DT, R](tb.head_ptr(), s1, tp["cpu"](a), tp["cpu"](xi), tp["cpu"](O).unsafe_offset((D.HIST + st) * D.OBS))
-            var lg = Float64(sm_prompt_fall_logit[DT](s1))
+            var lg = Float64(sm_prompt_fall_logit[DT, R](s1))
             var d = 1.0 / (1.0 + exp(-lg))
             j += gp * c * Float64(rew)
             worst_r = max(worst_r, abs(Float64(rew) - Float64(r.rewards.data[st * N + b])))

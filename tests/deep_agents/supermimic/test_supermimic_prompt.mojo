@@ -4,6 +4,10 @@
         python tools/supermimic/prompt_oracle.py --out /tmp/sm_prompt
     pixi run mojo run -I . tests/deep_agents/supermimic/test_supermimic_prompt.mojo /tmp/sm_prompt
 
+    # Berkeley Humanoid Lite: the same sections on its body and its fall rule
+    ... prompt_oracle.py --robot bhl --out /tmp/sm_prompt_bhl
+    pixi run mojo run -I . -D TEST_BHL=1 tests/deep_agents/supermimic/test_supermimic_prompt.mojo /tmp/sm_prompt_bhl
+
 The oracle is a second implementation: numpy formulas from the paper's Table
 A.6 and the module's docstring, MuJoCo 3.12.0 for the kinematics.
 
@@ -20,7 +24,10 @@ WHAT EACH SECTION CAN CATCH
     frame's point, and a property no fixed lane set shows by itself.
 [6] a spec whose targets are the state's own atoms pays exactly Σ w (the
     kernels are 1), and dropping a group's weight removes exactly its term.
-[7] `sm_prompt_fell` is Table A.6's rule on a sweep past both thresholds.
+[7] `sm_prompt_fell` is Table A.6's rule on a sweep past both thresholds: 0.35 m
+    on the G1, 0.224 m on BHL (`SMPromptScale`), the same tilt on both.
+[8] `sm_spec_velocity` writes Table A.6's widths: 0.5 m/s on the G1, 0.25 m/s
+    on BHL, and the same yaw width on both.
 
 Planted mutants this gate was run against are listed in the plan's progress
 notes: without them it says nothing about its own power.
@@ -28,20 +35,27 @@ notes: without them it says nothing about its own power.
 
 from std.math import cos, sin
 from std.random import random_float64, seed
-from std.sys import argv
+from std.sys import argv, get_defined_int
 
 from noeira.deep_agents.supermimic.heads import SMHeadLayout, sm_observation_lane
 from noeira.deep_agents.supermimic.kinematics import FP, Q4, sm_fk_lane
 from noeira.deep_agents.supermimic.prompt import (
     SMPromptScratch, SMSpec, sm_prompt_atoms_lane, sm_prompt_fall_logit, sm_prompt_fell, sm_prompt_reward_lane,
-    sm_prompt_reward_vjp_lane,
+    sm_prompt_reward_vjp_lane, sm_spec_velocity,
 )
-from noeira.deep_agents.supermimic.robot import G1MjlabRobot, G1MjlabSim, SMDims
+from noeira.deep_agents.supermimic.robot import BhlRobot, G1MjlabRobot, SMDims
 from noeira.deep_agents.supermimic.tables import SMTables, sm_tables
 from noeira.io.npy import load_npy_2d_f64
 
 
-comptime R = G1MjlabRobot
+comptime TEST_BHL = get_defined_int["TEST_BHL", 0]() != 0
+comptime R = BhlRobot if TEST_BHL else G1MjlabRobot
+# the fall rule's numbers, written here and not read from the port: the stand,
+# just under and just over the fall height, and the velocity kernel's 1 / σ²
+comptime STAND_H: Float64 = 0.50 if TEST_BHL else 0.78
+comptime FALL_UNDER: Float64 = 0.219 if TEST_BHL else 0.34
+comptime FALL_OVER: Float64 = 0.229 if TEST_BHL else 0.36
+comptime IW_V: Float64 = 16.0 if TEST_BHL else 4.0
 comptime D = SMDims[R]
 comptime SC = SMPromptScratch[R]
 comptime F64 = DType.float64
@@ -84,7 +98,7 @@ def _objective(
     """gr · reward + gl · logit + <go, observation>."""
     var r = sm_prompt_reward_lane[F64, R](tb.tree_ptr(), tb.head_ptr(), _p(s), _p(a), _p(ap), _p(spec), _p(sc))
     sm_observation_lane[F64, R](tb.head_ptr(), _p(s), _p(a), _p(xi), _p(obs))
-    var f = gr * Float64(r) + gl * Float64(sm_prompt_fall_logit[F64](_p(s)))
+    var f = gr * Float64(r) + gl * Float64(sm_prompt_fall_logit[F64, R](_p(s)))
     for k in range(D.OBS):
         f += go[k] * obs[k]
     return f
@@ -139,7 +153,7 @@ def main() raises:
         for k in range(SMSpec.ATOMS):
             e_a = max(e_a, abs(sc[SC.ATOMS + k] - w_atoms[b * SMSpec.ATOMS + k]))
         e_r = max(e_r, abs(Float64(r) - w_r[b]) / max(abs(w_r[b]), 1.0))
-        e_l = max(e_l, abs(Float64(sm_prompt_fall_logit[F64](_p(s))) - w_lg[b]) / max(abs(w_lg[b]), 1.0))
+        e_l = max(e_l, abs(Float64(sm_prompt_fall_logit[F64, R](_p(s))) - w_lg[b]) / max(abs(w_lg[b]), 1.0))
     print("  atoms", e_a, "reward", e_r, "logit", e_l)
     t.truth(e_a < 1e-9, "the 12 atoms against numpy + MuJoCo")
     t.truth(e_r < 1e-9, "the reward against Table A.6")
@@ -269,24 +283,41 @@ def main() raises:
     print("\n[7] the fall rule")
     var s7 = List[Float64](length=D.S, fill=0.0)
     s7[3] = 1.0
-    s7[2] = 0.78
-    var up_ok = not sm_prompt_fell[F64](_p(s7))
-    s7[2] = 0.34
-    var low_ok = sm_prompt_fell[F64](_p(s7))
-    s7[2] = 0.36
-    var above_ok = not sm_prompt_fell[F64](_p(s7))
+    s7[2] = STAND_H
+    var up_ok = not sm_prompt_fell[F64, R](_p(s7))
+    s7[2] = FALL_UNDER
+    var low_ok = sm_prompt_fell[F64, R](_p(s7))
+    s7[2] = FALL_OVER
+    var above_ok = not sm_prompt_fell[F64, R](_p(s7))
     # tilt about x: 1 + u_z = 1 − cos θ, the rule fires past acos(0.3) ≈ 72.5°
-    s7[2] = 0.78
+    s7[2] = STAND_H
     var a0 = 72.0 * 3.141592653589793 / 180.0
     s7[3] = cos(a0 / 2)
     s7[4] = sin(a0 / 2)
-    var t_in = not sm_prompt_fell[F64](_p(s7))
+    var t_in = not sm_prompt_fell[F64, R](_p(s7))
     var a1 = 73.0 * 3.141592653589793 / 180.0
     s7[3] = cos(a1 / 2)
     s7[4] = sin(a1 / 2)
-    var t_out = sm_prompt_fell[F64](_p(s7))
-    t.truth(up_ok and low_ok and above_ok, "height: 0.35 m")
+    var t_out = sm_prompt_fell[F64, R](_p(s7))
+    t.truth(up_ok and low_ok and above_ok, "height: between " + String(FALL_UNDER) + " and " + String(FALL_OVER) + " m, not at the stand")
     t.truth(t_in and t_out, "tilt: 1 + u_z = 0.7, between 72° and 73°")
+    # upright at the stand the height term is about −21.5 on either robot, so
+    # the logit is the tilt term's (1 − 1 − 0.7) / 0.05 = −14. A height rule
+    # left at the G1's 0.35 m reads −7.5 on BHL's 0.50 m stand.
+    s7[3] = 1.0
+    s7[4] = 0.0
+    var lg_stand = Float64(sm_prompt_fall_logit[F64, R](_p(s7)))
+    t.truth(abs(lg_stand + 14.0) < 1e-9, "the stand's logit is the tilt term's -14: " + String(lg_stand))
+
+    print("\n[8] the velocity spec's widths")
+    var spec8 = List[Float64](length=SMSpec.SIZE, fill=0.0)
+    sm_spec_velocity[F64, R](_p(spec8), 0.3, -0.1, 0.2)
+    t.truth(
+        abs(spec8[SMSpec.IW + SMSpec.A_VX] - IW_V) < 1e-12 and abs(spec8[SMSpec.IW + SMSpec.A_VY] - IW_V) < 1e-12,
+        "velocity: 1 / σ² = " + String(IW_V),
+    )
+    t.truth(spec8[SMSpec.IW + SMSpec.A_WZ] == 2.0, "yaw rate: 1 / 0.5 on every robot")
+    t.truth(spec8[SMSpec.T + SMSpec.A_VX] == 0.3 and spec8[SMSpec.T + SMSpec.A_VY] == -0.1 and spec8[SMSpec.T + SMSpec.A_WZ] == 0.2, "the targets are the command")
 
     print("\n===", t.checks - t.fails, "/", t.checks, "passed ===")
     if t.fails > 0:
